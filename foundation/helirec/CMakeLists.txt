@@ -200,7 +200,7 @@ if(HELIREC_TOOLS)
   # helirec-projections-zarr: reduced projection copies (helirec.download_projections) as one multiscale Zarr store
   add_executable(helirec-projections-zarr tools/helirec_projections_zarr.cpp)
   target_compile_features(helirec-projections-zarr PRIVATE cxx_std_20)
-  target_link_libraries(helirec-projections-zarr PRIVATE vc_reader::reader HDF5::HDF5)
+  target_link_libraries(helirec-projections-zarr PRIVATE helirec vc_reader::reader HDF5::HDF5)
   target_compile_options(helirec-projections-zarr PRIVATE -O2 -Wall -Wno-missing-field-initializers)
   install(TARGETS helirec-calibration helirec-reconstruct helirec-composite helirec-projections-zarr RUNTIME DESTINATION "${HELIREC_TOOLS_DESTINATION}")
   include(CTest)

@@ -16,6 +16,17 @@ def _stage(th):
     return np.array([[c, s, 0.0], [-s, c, 0.0], [0.0, 0.0, 1.0]])
 
 
+def _turned(w):
+    """The rotation by the vector w [rad] (its direction the axis, its length the angle), as a matrix."""
+    w = np.asarray(w, float)
+    a = np.linalg.norm(w)
+    if a == 0:
+        return np.eye(3)
+    k = w / a
+    K = np.array([[0.0, -k[2], k[1]], [k[2], 0.0, -k[0]], [-k[1], k[0], 0.0]])
+    return np.eye(3) + np.sin(a) * K + (1.0 - np.cos(a)) * (K @ K)
+
+
 def _about_beam(a):
     """The detector's (column, row) of a position (x, z) in the frame of the rotation axis: the axis is rolled by a
     against the detector's columns."""
@@ -31,8 +42,9 @@ class Scan:
         # starts or ends. index: the scan's place among the acquisition's scans. map: the detector's (as
         # G.empty_map gives it, with its coefficients): the pixel (c, v) looks along (c + Eu, v + Ev). pitch: of the
         # rotation axis towards the beam [rad]. moved: the sample sits elsewhere on the stage than in the anchor.
+        # rotation: the sample is turned by this vector [rad] about its origin at the height `about`.
         self.t = dict(axis=301.3, axis_slope=0.0, axial_scale=0.0, d=(0.0, 0.0), height=0.0, roll=0.0, row_time=0.0, stretch_height={},
-                      height_once=(0.0, 0.0), axis_twice=(0.0, 0.0), map=None, pitch=0.0, moved=False)
+                      height_once=(0.0, 0.0), axis_twice=(0.0, 0.0), map=None, pitch=0.0, moved=False, rotation=(0.0, 0.0, 0.0), about=0.0)
         self.t.update(truth)
         self.index = index
         self.stretches, H, angle0 = [], 0.0, 12.0
@@ -47,7 +59,7 @@ class Scan:
 
     def layout(self):
         # (the motors' places are the true ones here: on_stage is d)
-        return dict(name="scan", mid_height=self.mid_height, stretches=self.stretches, moved_on_stage=self.t["moved"], on_stage=list(self.t["d"]))
+        return dict(name="scan", mid_height=self.mid_height, stretches=self.stretches, moved_on_stage=self.t["moved"], on_stage=list(self.t["d"]), axis=self.t["axis"])
 
     def seen(self, stretch, p, t):
         """Where the point p of the sample is recorded at the time of frame t (fractions allowed) of a stretch:
@@ -55,7 +67,7 @@ class Scan:
         st, tr, mid = self.stretches[stretch], self.t, (ROWS - 1) / 2.0
         th = np.radians(np.interp(t, np.arange(len(st["angle_deg"])), st["angle_deg"]))
         H = np.interp(t, np.arange(len(st["rows"])), st["rows"])
-        on_stage = np.asarray(p, float) + [tr["d"][0], tr["d"][1], 0.0]            # the sample's place on the stage
+        on_stage = self.held(p) - [0.0, 0.0, tr["height"]]                         # the sample's place on the stage (its height below, with the record's)
         x, depth, z = _stage(th) @ on_stage                                        # the stage turned; parallel rays: the depth is dropped,
         z += tr["pitch"] * depth                                                   # but for an axis leaning towards the beam: a row higher per 1 / pitch of depth
         # what the stage does within a turn: it lifts the sample once per turn and moves its axis across the detector twice
@@ -65,6 +77,13 @@ class Scan:
         z += tr["height"] + tr["stretch_height"].get(st["name"], 0.0) + (1.0 + tr["axial_scale"]) * H   # and it travels further than the record says
         c, v = _about_beam(tr["roll"]) @ [x, z - mid]
         return tr["axis"] + c, mid + v
+
+    def held(self, p):
+        """Where this scan holds the point p of the sample: turned about the sample's origin at the height
+        `about`, then put at the scan's place and height. What the scan alone reconstructs it at."""
+        tr = self.t
+        about = np.array([0.0, 0.0, tr["about"]])
+        return _turned(tr["rotation"]) @ (np.asarray(p, float) - about) + about + [tr["d"][0], tr["d"][1], tr["height"]]
 
     def stored(self, X, Y):
         """The stored pixel that looks along the ideal position (X, Y): the map taken off, by going round until it
@@ -119,7 +138,7 @@ def _same_point(scan, kind, sa, sb, p, ta, tb, rng=None, noise=0.0, other=None):
     if rng is not None:
         b[3] += rng.normal(0, noise)
         b[4] += rng.normal(0, noise)
-    return dict(kind=kind, a=a, b=b, opposite=kind == "opposite")
+    return dict(kind=kind, a=a, b=b, opposite=kind.endswith("opposite"))
 
 
 TRUTH = dict(axis=310.4, axis_slope=4e-4, axial_scale=3.3e-3, d=(7.0, -4.0), height=2.5, roll=3e-4, row_time=2e-3, height_once=(0.21, -0.13), axis_twice=(0.11, 0.17))
@@ -396,6 +415,13 @@ def test_the_reconstructions_poses_are_the_models():
     # (the poses hold the stage's lift and its axis' move at the frame's own angle, the model at the row's: 0.2 px x
     # twice the 0.4 degrees a row here lies from its frame; a real scan's rows lie within 0.04 degrees)
     assert worst < 5e-3
+    # a calibration with the axis' pitch towards the beam: every frame's row holds pitch x the depth of the sample's origin
+    pitch = 3e-4
+    leaning, _ = G.frame_poses(dict(cal, parameters=dict(cal["parameters"], pitch=pitch)), angles, heights)
+    for k in (0, 1):
+        th, d = np.radians(poses[k]["angle_deg"]), truth["scans"][k]["d"]
+        assert np.allclose(leaning[k]["row"] - poses[k]["row"], pitch * (d[1] * np.cos(th) - d[0] * np.sin(th)), atol=1e-9)
+        assert np.array_equal(leaning[k]["axis"], poses[k]["axis"])
     # the helix of the first scan, and the merged frame laid out from the poses
     assert G.merged_layout(cal, poses, heights)["measured"]["axis_first_scan"] == pytest.approx(np.median(poses[0]["axis"][offsets[1]:offsets[2]]))
     with pytest.raises(ValueError, match="not of two scans"):
@@ -612,3 +638,382 @@ def test_plan_of_a_pair_moved_sideways():
         dict(name=name, axis=1684.8, moved_on_stage=m, stretches=[dict(name="helix", helix=True, angle_deg=np.arange(3 * N) * 360.0 / N, rows=-np.arange(3 * N) * 1053.0 / N)])
         for name, m in (("a", False), ("b", True))]))
     assert "pair" not in {p["kind"] for p in G.plan_comparisons(moved)}
+
+
+def test_plan_of_tiles_follows_their_places():
+    """Two tiles of a mosaic as Paris4's at a quarter: 1736 px apart, the axis 77 columns from the detector's edge.
+    At equal angle the second holds the first's rays (d_k - d_j) . (cos th, sin th) columns further on, which leaves
+    a window on both detectors only about the two angles at which the tiles line up along the beam; elsewhere the
+    second is taken half a turn on, mirrored."""
+    rows, cols, N, W, axis = 592, 1104, 10000, 64, 1027.6
+    f = np.arange(3 * N + 600)
+    stretch = lambda: dict(name="helix", helix=True, angle_deg=f * 360.0 / N, rows=-f * 575.8 / N, first=300, end=3 * N + 300)
+    d = (1500.0, -874.0)
+    acq = G.acquisition(dict(rows=rows, cols=cols, per_turn=N, row_sign=-1.0, fan=1e-5, width=W, scans=[
+        dict(name="T0", axis=axis, on_stage=[0.0, 0.0], stretches=[stretch()]), dict(name="T1", axis=axis + 0.4, on_stage=list(d), moved_on_stage=True, stretches=[stretch()])]))
+    places = dict(scans=[dict(axis=axis), dict(axis=axis + 0.4, d=list(d), height=5.0)])
+    plan = G.plan_tiles(acq, places, [(0, 1)])
+    kinds = {p["kind"] for p in plan}
+    assert kinds == {"tiles", "tiles_opposite"} and len(plan) > 200
+    apart, phase = np.hypot(*d), np.degrees(np.arctan2(d[1], d[0]))
+    offsets = {"tiles": [], "tiles_opposite": []}
+    for p in plan:
+        assert (p["scan_a"], p["scan_b"], p["request_scan_a"], p["request_scan_b"]) == (0, 1, 0, 1) and p["from_block"] and p["cols"] == W
+        assert p["sway_px"] == pytest.approx(apart) and p["sway_phase_deg"] == pytest.approx(phase) and p["sway_row_deg"] == 0.0
+        opposite = p["kind"] == "tiles_opposite"
+        assert p["mirror"] == opposite and p["angle_offset_deg"] == (180.0 if opposite else 0.0)
+        assert p["frame_hint"] == 0 if not opposite else p["frame_hint"] == (N // 2 if p["frame_a"] + N // 2 + 80 <= 3 * N + 300 else -N // 2)
+        # where B's block is read: its first column and the sway at the block's middle frame, of B's own angle
+        th_b = (p["frame_a"] + 16 + p["frame_hint"]) * 360.0 / N
+        first_b = p["col_b"] + apart * np.cos(np.radians(th_b - phase))
+        for c in (p["col_a"], first_b):
+            assert 13 <= c and c + W + 13 <= cols, p                                 # both windows on the detector, with the cut's margins
+        assert 300 <= p["frame_a"] and 300 <= p["frame_a"] + p["frame_hint"] and p["frame_a"] + p["frame_hint"] + 64 <= 3 * N + 300
+        assert 0 <= p["row_a"] and p["row_a"] + p["rows"] <= rows
+        th_a = np.radians((p["frame_a"] + 16) * 360.0 / N)
+        sway = d[0] * np.cos(th_a) + d[1] * np.sin(th_a)
+        if opposite:                                                                 # the two windows are mirror images about half the axes' sum less the sway
+            assert p["col_a"] + first_b + W - 1 == pytest.approx(2 * axis + 0.4 - sway, abs=1.5)
+        else:
+            assert first_b - p["col_a"] == pytest.approx(0.4 + sway, abs=1.5)
+        offsets[p["kind"]].append(sway)
+    # at equal angle only where the offset leaves both windows on the detector; that is both ways the tiles line up
+    same = np.array(offsets["tiles"])
+    assert np.abs(same).max() < cols - W and same.min() < -500 and same.max() > 500
+    # the axis lies 77 columns from the detector's edge: half a turn apart the tiles share rays over the half of the
+    # turn in which the second lies on the first's far side, and at about a third of the angles they share none
+    mirrored = np.array(offsets["tiles_opposite"])
+    assert mirrored.min() > -100 and mirrored.max() > 1500
+    frames = sorted({p["frame_a"] for p in plan})
+    assert 28 <= len(frames) <= 40 and len(np.unique(np.round(np.array(frames) % N / (N / 24)).astype(int) % 24)) >= 15
+    assert {p["frame_hint"] for p in plan} == {0, N // 2, -N // 2}                    # the last half turn's partners lie before it
+    # nothing where neither the columns nor the rows of the two blocks lie apart: the detector's own pattern would register
+    near = G.plan_tiles(acq, dict(scans=[dict(axis=axis), dict(axis=axis, d=[20.0, 10.0])]), [(0, 1)])
+    assert {p["kind"] for p in near} == {"tiles_opposite"}
+    with pytest.raises(ValueError, match="two of the acquisition's scans"):
+        G.plan_tiles(acq, places, [(0, 2)])
+
+
+def _tile_comparisons(rng, scans, pairs, n, noise=0.004, radius=260.0):
+    """Points of the sample seen by two tiles: at one angle ("tiles") and half a turn apart ("tiles_opposite")."""
+    out = []
+    for j, k in pairs:
+        a, b = scans[j], scans[k]
+        middle = -(np.array(a.t["d"]) + np.array(b.t["d"])) / 2                    # between the two axes, in the sample
+        st, got = a.stretches[0], {"tiles": 0, "tiles_opposite": 0}
+        for _ in range(40 * n):
+            if min(got.values()) >= n:
+                break
+            t = rng.uniform(2, len(st["rows"]) - 3 - PER_TURN / 2)
+            r, phi = radius * np.sqrt(rng.uniform()), rng.uniform(0, 2 * np.pi)
+            z = rng.uniform(30, ROWS - 30) - np.interp(t, np.arange(len(st["rows"])), st["rows"])
+            p = np.array([middle[0] + r * np.cos(phi), middle[1] + r * np.sin(phi), z])
+            for kind, later in (("tiles", 0.0), ("tiles_opposite", PER_TURN / 2)):
+                c = _same_point(a, kind, 0, 0, p, t, t + later, rng, noise, other=b) if got[kind] < n else None
+                if c is not None and b.on_detector(c["b"]):
+                    out.append(c)
+                    got[kind] += 1
+    return out
+
+
+def test_tiles_at_equal_angle_give_the_pitch():
+    """Three tiles about an axis pitched towards the beam, compared with each other in projections. At one angle
+    two tiles record the same rays, pitch x (d_k - d_j) . (-sin th, cos th) rows apart whatever the depth: that
+    gives the pitch, with the tiles' places and heights. Half a turn apart they are not the same rays (their rows
+    differ by twice the pitch x the depth), so those rows are left out of the solve and their columns kept."""
+    rng = np.random.default_rng(21)
+    pitch = 2e-4
+    places = [(0.0, 0.0), (330.0, 60.0), (-150.0, 290.0)]
+    shared = {k: TRUTH[k] for k in ("roll", "height_once", "axis_twice")}
+    scans = [Scan([("helix", 3 * PER_TURN)], index=k, axis=TRUTH["axis"] - 0.2 * k, axial_scale=TRUTH["axial_scale"] + 1e-4 * k, d=d, height=1.5 * k, pitch=pitch, moved=k > 0, **shared)
+             for k, d in enumerate(places)]
+    acq = _acquisition(*scans)
+    own = [c for sc in scans for c in _helix_comparisons(rng, sc, 0, 500, 0.004) if c["kind"] == "opposite"]
+    between = _tile_comparisons(rng, scans, [(0, 1), (0, 2), (1, 2)], 400)
+    assert {c["kind"] for c in between} == {"tiles", "tiles_opposite"} and len(between) == 6 * 400
+    comparisons = own + between
+    start = dict(roll=0.0, scans=[dict(axis=TRUTH["axis"] + 0.5, d=[d[0] + 2.0 * (k > 0), d[1] - 1.5 * (k > 0)]) for k, d in enumerate(places)])   # (the anchor's place is the origin)
+    got = G.solve_geometry(acq, comparisons, start=start)
+    assert "pitch" in got["free"] and got["solver"]["rank"] == len(got["free"]) == 2 + 4 + 3 * 3 + 2 * 3 + 2 * 2
+    assert got["pitch"] == pytest.approx(pitch, rel=0.03)
+    for k, (s, d) in enumerate(zip(got["scans"], places)):
+        assert s["d"] == pytest.approx(list(d), abs=0.01) and s["height"] == pytest.approx(1.5 * k, abs=0.05), k
+        assert s["axis"] == pytest.approx(TRUTH["axis"] - 0.2 * k, abs=5e-3) and s["axial_scale"] == pytest.approx(TRUTH["axial_scale"] + 1e-4 * k, abs=4e-5)
+    assert got["roll"] == pytest.approx(TRUTH["roll"], abs=3e-5)
+    tiles = np.array([c["kind"] == "tiles" for c in comparisons])
+    opposite = np.array([c["kind"] == "tiles_opposite" for c in comparisons])
+    assert np.sqrt(np.mean(got["residual"][tiles, 1:] ** 2)) < 0.01                # the same rays: rows and columns to the noise
+    assert np.sqrt(np.mean(got["residual"][opposite, 2] ** 2)) < 0.01              # half a turn apart: the columns too,
+    assert np.sqrt(np.mean(got["residual"][opposite, 1] ** 2)) > 0.03              # the rows not: twice the pitch x the depth
+    # those rows are not in the solve: spoiled by 4 rows, they move nothing (but through the roll, which takes a
+    # column from its row: 4 rows x 3e-4)
+    spoiled = [dict(c, b=[*c["b"][:3], c["b"][3] + 4.0, c["b"][4]]) if c["kind"] == "tiles_opposite" else c for c in comparisons]
+    again = G.solve_geometry(acq, spoiled, start=start)
+    assert again["pitch"] == pytest.approx(got["pitch"], rel=1e-5) and again["scans"][1]["height"] == pytest.approx(got["scans"][1]["height"], abs=1e-4)
+    # the pitch held at nothing: the tiles' rows at equal angle are left with pitch x their distance once per turn
+    told = G.report(acq, G.solve_geometry(acq, comparisons, start=start, held=["pitch"]), comparisons)
+    for pr in told["pairs"]:
+        if pr["kind"] != "tiles":
+            continue
+        apart = np.subtract(places[pr["scan_b"]], places[pr["scan_a"]])
+        assert np.hypot(*pr["left"]["rows"]["once"]) == pytest.approx(pitch * np.hypot(*apart), rel=0.25), pr
+    # solved, nothing of it is left; the report has each pair of tiles under both kinds
+    told = G.report(acq, got, comparisons)
+    assert sorted((pr["scan_a"], pr["scan_b"], pr["kind"]) for pr in told["pairs"]) == sorted((j, k, kind) for j, k in ((0, 1), (0, 2), (1, 2)) for kind in ("tiles", "tiles_opposite"))
+    for pr in told["pairs"]:
+        assert pr["n"] == 400 and pr["left"]["columns"]["rms"] < 0.01
+        if pr["kind"] == "tiles":
+            assert np.hypot(*pr["left"]["rows"]["once"]) < 0.005 and pr["left"]["rows"]["rms"] < 0.01
+    # no two scans apart compared at one angle: nothing gives the pitch, and it is not asked for; asked for, it is said
+    alone = G.solve_geometry(acq, own, start=start)
+    assert "pitch" not in alone["free"] and alone["pitch"] == 0.0
+    assert "pitch" in G.solve_geometry(acq, own, start=start, freed=["pitch"])["unused"]
+    mirrored = G.solve_geometry(acq, own + [c for c in between if c["kind"] == "tiles_opposite"], start=start)
+    assert "pitch" not in mirrored["free"] and mirrored["scans"][1]["d"] == pytest.approx(list(places[1]), abs=0.02)
+    assert "scan1.height" in mirrored["unused"]                                    # (their rows say nothing: no height either)
+
+
+def test_tiles_in_projections_give_their_tilts():
+    """Three tiles that hold the sample turned against each other, compared in projections. A projection holds of a
+    rotation what is the same at every depth: the tilt's part about the beam's direction moves the columns by it x
+    the height and the rows by it x the distance across the beam. So the tile pairs give the tilts; the spin is the
+    same view further on in angle (the frames', not fitted) and is not asked of them."""
+    rng = np.random.default_rng(31)
+    places = [(0.0, 0.0), (330.0, 60.0), (-150.0, 290.0)]
+    turns = [(0.0, 0.0, 0.0), (2.5e-4, -1.8e-4, 3e-4), (-2.2e-4, 3.1e-4, -2e-4)]
+    about = 60.0
+    scans = [Scan([("helix", 3 * PER_TURN)], index=k, d=d, height=1.5 * k, moved=k > 0, rotation=w, about=about) for k, (d, w) in enumerate(zip(places, turns))]
+    acq = _acquisition(*scans)
+    step = np.radians(360.0 / PER_TURN)
+    own = [c for sc in scans for c in _helix_comparisons(rng, sc, 0, 400, 0.004) if c["kind"] == "opposite"]
+    between = []
+    for j, k in ((0, 1), (0, 2), (1, 2)):
+        a, b = scans[j], scans[k]
+        later = (turns[k][2] - turns[j][2]) / step                 # tile k holds the same view of the sample this many frames later
+        st, n = a.stretches[0], 0
+        while n < 500:
+            t = rng.uniform(4, len(st["rows"]) - 6 - PER_TURN / 2)
+            r, phi = 250.0 * np.sqrt(rng.uniform()), rng.uniform(0, 2 * np.pi)   # about the sample's origin: no mean depth
+            z = rng.uniform(30, ROWS - 30) - np.interp(t, np.arange(len(st["rows"])), st["rows"])
+            p = np.array([r * np.cos(phi), r * np.sin(phi), z])
+            kind = "tiles" if n % 2 else "tiles_opposite"
+            c = _same_point(a, kind, 0, 0, p, t, t + later + (PER_TURN / 2 if n % 2 == 0 else 0.0), rng, 0.004, other=b)
+            if c is not None and b.on_detector(c["b"]):
+                between.append(c)
+                n += 1
+    comparisons = own + between
+    start = dict(roll=0.0, about_height=about, scans=[dict(axis=301.3, d=list(d)) for d in places])
+    tilts = [f"scan{k}.tilt_{c}" for k in (1, 2) for c in "xy"]
+    flat = G.solve_geometry(acq, comparisons, start=start, held=["pitch"])
+    got = G.solve_geometry(acq, comparisons, start=start, held=["pitch"], freed=tilts)
+    assert set(tilts) <= set(got["free"]) and got["solver"]["rank"] == len(got["free"])
+    for k in (1, 2):
+        assert got["scans"][k]["rotation"][:2] == pytest.approx(list(turns[k][:2]), abs=3e-5), k
+        assert got["scans"][k]["rotation"][2] == 0.0 and got["scans"][k]["d"] == pytest.approx(list(places[k]), abs=0.02)
+    assert got["scans"][0]["rotation"] == [0.0, 0.0, 0.0]
+    kinds = np.array([c["kind"] for c in comparisons])
+    cols = lambda sol, kind: np.sqrt(np.mean(sol["residual"][kinds == kind, 2] ** 2))
+    assert cols(got, "tiles") < 0.6 * cols(flat, "tiles") and cols(got, "tiles_opposite") < 0.6 * cols(flat, "tiles_opposite")
+    # the spin is not in a projection's rows or columns: asked of tile pairs alone, nothing gives it
+    assert "scan1.spin" in G.solve_geometry(acq, comparisons, start=start, held=["pitch"], freed=tilts + ["scan1.spin"])["unused"]
+    # a scan's own views do not see its rotation at all
+    assert set(tilts) <= set(G.solve_geometry(acq, own, start=start, freed=tilts)["unused"])
+
+
+def test_divergence_between_tiles_by_hand():
+    """The beam diverges: a tile that holds the sample nearer the source records it magnified about the detector's
+    middle. Paris4 by hand: a neighbour 6944 px along the beam, the pixel over the source's distance 6.34e-9, a
+    column 2208 from the middle: 0.097 px, and nothing at the angle at which the tiles lie side by side."""
+    per_depth, d = 1.129e-6 / 178.0, (0.0, 6944.0)                  # at the angle 0 the model's y lies along the beam
+    f = np.arange(200)
+    stretch = dict(name="helix", helix=True, angle_deg=f * 0.9, rows=np.zeros(200))
+    layout = lambda k: dict(rows=2368, cols=4416, per_depth=k, scans=[dict(name="a", axis=2207.5, stretches=[stretch]), dict(name="b", axis=2207.5, moved_on_stage=True, on_stage=list(d), stretches=[stretch])])
+    p = dict(scans=[dict(axis=2207.5), dict(axis=2207.5, d=list(d))])
+    sightings = [[1, 0, 0.0, 1183.5 + 500.0, 2207.5 + 2208.0], [1, 0, 100.0, 1183.5 + 500.0, 2207.5 + 2208.0], [0, 0, 0.0, 1183.5 + 500.0, 2207.5 + 2208.0]]
+    plain, magnified = G.rays(layout(0.0), p, sightings), G.rays(layout(per_depth), p, sightings)
+    nearer = 6944.0 * per_depth
+    assert nearer * 2208.0 == pytest.approx(0.0972, abs=1e-4)
+    assert magnified[0, 1] - plain[0, 1] == pytest.approx(-nearer * 2208.0, rel=1e-9) and magnified[0, 2] - plain[0, 2] == pytest.approx(-nearer * 500.0, rel=1e-9)
+    assert abs(magnified[1, 1] - plain[1, 1]) < 1e-12                 # a quarter turn on the tile lies beside the axis: no nearer
+    assert np.array_equal(magnified[2], plain[2])                     # the scan on the axis
+
+
+# ---------------------------------------------------------------- lens patches: two scans' volumes of one place
+
+HEX = [(0.0, 0.0)] + [(400.0 * np.cos(a), 400.0 * np.sin(a)) for a in np.radians(np.arange(0, 360, 60))]
+
+
+def _tiles(rng, about=120.0, rotations=True, own=None):
+    """Seven tiles of a mosaic, 400 px apart: each holds the sample at its own place and height, off the motors' by
+    a few pixels, and turned by up to 3e-4 rad; the first is the anchor. on_stage (the motors') is the place rounded."""
+    scans = []
+    for k, c in enumerate(HEX):
+        truth = dict(own or {})
+        if k:
+            truth.update(d=(c[0] + rng.uniform(-6, 6), c[1] + rng.uniform(-6, 6)), height=rng.uniform(-8, 8), moved=True,
+                         rotation=tuple(rng.uniform(-3e-4, 3e-4, 3)) if rotations else (0.0, 0.0, 0.0))
+        scans.append(Scan([("helix", 3 * PER_TURN)], index=k, about=about, **truth))
+    return scans
+
+
+def _lens_patches(rng, scans, edges, n=60, noise=0.02, about=120.0, sigma=None):
+    """Lens patches of the edges: places in the lens of the two tiles' discs (about the middle between their axes,
+    150 px along it and 60 across, 150 rows up and down), and where the second tile holds each against the first."""
+    out = []
+    for a, b in edges:
+        ca, cb = -np.array(scans[a].t["d"]), -np.array(scans[b].t["d"])          # the tiles' axes in the sample
+        mid, across = (ca + cb) / 2, (cb - ca) / np.linalg.norm(cb - ca)
+        along = np.array([-across[1], across[0]])
+        for _ in range(n):
+            p = np.array([*(mid + rng.uniform(-150, 150) * along + rng.uniform(-60, 60) * across), about + rng.uniform(-150, 150)])
+            moved = scans[b].held(p) - scans[a].held(p) + rng.normal(0, noise, 3)
+            out.append(dict(scan_a=a, scan_b=b, p=p.tolist(), moved=moved.tolist(), **({} if sigma is None else dict(sigma=sigma))))
+    return out
+
+
+def _edges(scans):
+    return G.neighbours(_acquisition(*scans))[0]
+
+
+def test_lens_patches_give_the_tiles_places_and_rotations():
+    """A mosaic's tiles, each reconstructed alone, hold the lens two neighbours share at their own places: the
+    patches' displacements give every tile's place, height and rotation against the anchor's."""
+    rng = np.random.default_rng(11)
+    scans = _tiles(rng)
+    acq = _acquisition(*scans)
+    edges = _edges(scans)
+    assert len(edges) == 12
+    lens = _lens_patches(rng, scans, edges, sigma=(0.02, 0.02, 0.02))
+    start = dict(about_height=120.0, scans=[dict(d=list(HEX[k])) for k in range(7)])
+    got = G.solve_geometry(acq, [], start=start, lens=lens)
+    names = [f"scan{k}.{n}" for k in range(1, 7) for n in ("d0", "d1", "height", "tilt_x", "tilt_y", "spin")]
+    assert got["free"] == names and got["unused"] == [] and got["solver"]["rank"] == 36 and got["about_height"] == 120.0
+    assert not any(n.startswith("scan0.") and n.split(".")[1] in ("d0", "d1", "height", "tilt_x", "tilt_y", "spin") for n in got["free"] + got["unused"])
+    for k, sc in enumerate(scans):
+        s = got["scans"][k]
+        assert s["d"] == pytest.approx(list(sc.t["d"]), abs=0.02) and s["height"] == pytest.approx(sc.t["height"], abs=0.02), k
+        assert s["rotation"] == pytest.approx(list(sc.t["rotation"]), abs=3e-5), k
+    assert got["lens_residual"].shape == (len(lens), 3) and np.allclose(got["lens_residual"], G.lens_residuals(acq, got, lens))
+    left = {(l["scan_a"], l["scan_b"]): l for l in got["left"] if l["kind"] == "lens"}
+    assert set(left) == {(-1, -1)} | set(edges) and left[(-1, -1)]["n"] == len(lens)
+    assert all(0.012 < r < 0.03 for l in left.values() for r in l["rms"])           # the noise, and no more
+    # under the truth the patches leave their noise (the model's cross product against the exact rotation: 1e-5 px)
+    truth = dict(about_height=120.0, scans=[dict(d=list(sc.t["d"]), height=sc.t["height"], rotation=list(sc.t["rotation"])) for sc in scans])
+    exact = _lens_patches(np.random.default_rng(0), scans, edges, n=5, noise=0.0)
+    assert np.abs(G.lens_residuals(acq, truth, exact)).max() < 1e-4
+    # the rotations held: what they would have explained is left on the edges
+    rigid = G.solve_geometry(acq, [], start=start, lens=lens, held=[f"scan{k}.{n}" for k in range(1, 7) for n in ("tilt_x", "tilt_y", "spin")])
+    assert max(l["rms"][j] for l in rigid["left"] for j in range(3)) > 0.03
+    # the anchor's rotation beside the others': only differences are seen, and the solve says so
+    with pytest.raises(ValueError, match="RANK_DEFICIENT"):
+        G.solve_geometry(acq, [], start=start, lens=lens, freed=["scan0.spin"])
+    # a tile no patch names keeps its place and has no rotation to ask for; nothing at all is an error
+    some = [l for l in lens if 6 not in (l["scan_a"], l["scan_b"])]
+    part = G.solve_geometry(acq, [], start=start, lens=some)
+    assert "scan6.d0" not in part["free"] and part["unused"] == ["scan6.d0", "scan6.d1", "scan6.height"] and part["scans"][6]["d"] == pytest.approx(list(HEX[6]))
+    with pytest.raises(ValueError, match="INSUFFICIENT_SUPPORT"):
+        G.solve_geometry(acq, [], start=start)
+    with pytest.raises(ValueError, match="with itself"):
+        G.solve_geometry(acq, [], start=start, lens=[dict(scan_a=1, scan_b=1, p=[0, 0, 0], moved=[0, 0, 0])])
+
+
+def test_a_mosaics_first_solve_is_two_that_share_no_unknown():
+    """Each tile's own views and the lens patches in one problem: a tile's own views do not see a rigid motion of
+    the sample, and a lens patch depends on places and rotations alone, so the places come out the same with the
+    tiles' own blocks free, held, or not in the problem at all."""
+    rng = np.random.default_rng(12)
+    own = dict(axis=TRUTH["axis"], axis_slope=TRUTH["axis_slope"], axial_scale=TRUTH["axial_scale"], roll=TRUTH["roll"], row_time=TRUTH["row_time"],
+               height_once=TRUTH["height_once"], axis_twice=TRUTH["axis_twice"])
+    scans = _tiles(rng, own=own)[:3]                                              # the anchor and two neighbours: a triangle
+    acq = _acquisition(*scans)
+    comparisons = []
+    for scan in scans:                                                             # points the tile's field holds: about its axis
+        st, n = scan.stretches[0], 0
+        while n < 300:
+            t = rng.uniform(2, len(st["rows"]) - 3 - PER_TURN / 2)
+            r, a = 250.0 * np.sqrt(rng.uniform()), rng.uniform(0, 2 * np.pi)
+            z = rng.uniform(30, ROWS - 30) - np.interp(t, np.arange(len(st["rows"])), st["rows"])
+            p = np.array([r * np.cos(a) - scan.t["d"][0], r * np.sin(a) - scan.t["d"][1], z])
+            c = _same_point(scan, "opposite", 0, 0, p, t, t + PER_TURN / 2, rng, 0.004)
+            if c is not None:
+                comparisons.append(c)
+                n += 1
+    lens = _lens_patches(rng, scans, [(0, 1), (0, 2), (1, 2)], n=200, sigma=(0.02, 0.02, 0.02))
+    start = dict(about_height=120.0, roll=0.0, scans=[dict(axis=TRUTH["axis"] + 1.0, d=list(HEX[k])) for k in range(3)])
+    both = G.solve_geometry(acq, comparisons, start=start, lens=lens)
+    places = [f"scan{k}.{n}" for k in (1, 2) for n in ("d0", "d1", "height", "tilt_x", "tilt_y", "spin")]
+    assert set(places) <= set(both["free"]) and both["unused"] == [] and both["solver"]["rank"] == len(both["free"]) == 1 + 4 + 3 * 3 + 4 + 12
+    # the tiles' own parameters are the ones their views give although the sample is turned in each (a rigid motion)
+    for k, s in enumerate(both["scans"]):
+        assert s["axis"] == pytest.approx(TRUTH["axis"], abs=3e-3) and s["axial_scale"] == pytest.approx(TRUTH["axial_scale"], abs=4e-5), k
+    assert both["roll"] == pytest.approx(TRUTH["roll"], abs=2e-5) and _stage_found(both, 4e-3)
+    alone = G.solve_geometry(acq, [], start=start, lens=lens)
+    held = G.solve_geometry(acq, comparisons, start=start, lens=lens, held=["roll", "stage"] + [f"scan{k}.{n}" for k in range(3) for n in ("axis", "axis_slope", "axial_scale", "height_once_cos", "height_once_sin")])
+    assert held["free"] == places
+    for k in range(3):
+        for other in (alone, held):
+            assert other["scans"][k]["d"] == pytest.approx(both["scans"][k]["d"], abs=1e-6) and other["scans"][k]["height"] == pytest.approx(both["scans"][k]["height"], abs=1e-6)
+            assert other["scans"][k]["rotation"] == pytest.approx(both["scans"][k]["rotation"], abs=1e-9)
+        assert both["scans"][k]["d"] == pytest.approx(list(scans[k].t["d"]), abs=0.02) and both["scans"][k]["rotation"] == pytest.approx(list(scans[k].t["rotation"]), abs=5e-5)
+    # no pair of a tile's own unknowns with a place is correlated: the two parts share no measurement
+    own_names = {n for n in both["free"] if n == "roll" or n.startswith("stage") or n.split(".")[1] in ("axis", "axis_slope", "axial_scale", "height_once_cos", "height_once_sin")}
+    assert not any((a in own_names) != (b in own_names) for a, b, _ in both["correlated"])
+
+
+def test_a_quadratic_row_map_reads_as_tilts_in_the_lens():
+    """What the lens can and cannot tell from a rigid motion: a height error of each tile that grows as the square
+    of the distance from the tile's axis (the quadratic part of a detector's row map) is, between two tiles at one
+    height, a tilt and a height: the solve returns tilts in proportion to the tiles' positions and heights as their
+    square, and nothing is left on any edge. Over a slab it is not: a real tilt also moves the lens in the plane by
+    the tilt x the height, which a row map does not, and that part is left."""
+    rng = np.random.default_rng(13)
+    scans = _tiles(rng, rotations=False)
+    acq = _acquisition(*scans)
+    a = 2e-6                                                                       # rows per px^2
+    start = dict(about_height=120.0, scans=[dict(d=list(HEX[k])) for k in range(7)])
+
+    def with_row_map(lens):
+        for l in lens:
+            ca, cb = -np.array(scans[l["scan_a"]].t["d"]), -np.array(scans[l["scan_b"]].t["d"])
+            p = np.array(l["p"][:2])
+            l["moved"][2] += a * (np.sum((p - cb) ** 2) - np.sum((p - ca) ** 2))
+        return lens
+
+    thin = _lens_patches(rng, scans, _edges(scans), noise=0.0)
+    for l in thin:
+        l["p"][2] = 120.0                                                          # every patch at the height the rotations are about
+    got = G.solve_geometry(acq, [], start=start, lens=with_row_map(thin))
+    assert max(l["rms"][j] for l in got["left"] for j in range(3)) < 1e-6
+    for k, sc in enumerate(scans):
+        d, s = np.array(sc.t["d"]), got["scans"][k]
+        # a |p + d|^2 - a |p|^2 = 2 a p . d + a |d|^2: as rotation x p, the tilt (2 a d_y, -2 a d_x)
+        assert s["rotation"] == pytest.approx([2 * a * d[1], -2 * a * d[0], 0.0], abs=1e-9), k
+        assert s["height"] == pytest.approx(sc.t["height"] + a * d @ d, abs=1e-6) and s["d"] == pytest.approx(list(d), abs=1e-6)
+    # a slab of 300 rows: the tilts that take the heights would move the lens' ends by 2 a x 400 px x 150 rows =
+    # 0.24 px in the plane, which is not there; the solve settles between the two and leaves it on the edges
+    tall = with_row_map(_lens_patches(rng, scans, _edges(scans), noise=0.0))
+    slab = G.solve_geometry(acq, [], start=start, lens=tall)
+    assert max(l["rms"][j] for l in slab["left"] for j in range(3)) > 0.03
+    z = np.array([l["p"][2] - 120.0 for l in tall])
+    on_edge = np.array([(l["scan_a"], l["scan_b"]) == (0, 1) for l in tall])
+    # tile 1 lies along x from the anchor: its false tilt is about y, and what is left in x on that edge grows with the height
+    assert abs(np.corrcoef(z[on_edge], slab["lens_residual"][on_edge, 0])[0, 1]) > 0.9
+
+
+def test_unknowns_the_lens_hardly_tells_apart_are_listed():
+    """One short lens far from the sample's origin: a spin of the tile and its place across the lens' direction
+    move the patches alike. The rank check passes them; the solution lists the pair."""
+    rng = np.random.default_rng(14)
+    scans = [Scan([("helix", 3 * PER_TURN)], index=0), Scan([("helix", 3 * PER_TURN)], index=1, d=(3000.0, 0.0), height=1.0, moved=True, rotation=(0.0, 0.0, 1e-4))]
+    acq = _acquisition(*scans)
+    lens = []
+    for _ in range(80):                                                             # 40 px of lens about (-1500, 0)
+        p = np.array([-1500.0 + rng.uniform(-20, 20), rng.uniform(-20, 20), rng.uniform(-20, 20)])
+        lens.append(dict(scan_a=0, scan_b=1, p=p.tolist(), moved=(scans[1].held(p) - scans[0].held(p) + rng.normal(0, 0.02, 3)).tolist(), sigma=[0.02] * 3))
+    got = G.solve_geometry(acq, [], start=dict(scans=[dict(), dict(d=[3000.0, 0.0])]), lens=lens)
+    pairs = {(a, b): r for a, b, r in got["correlated"]}
+    assert abs(pairs[("scan1.d1", "scan1.spin")]) > 0.99 and abs(pairs[("scan1.height", "scan1.tilt_y")]) > 0.99
+    # the well-spread lenses of a mosaic leave no such pair
+    scans = _tiles(rng)
+    wide = G.solve_geometry(_acquisition(*scans), [], start=dict(about_height=120.0, scans=[dict(d=list(HEX[k])) for k in range(7)]), lens=_lens_patches(rng, scans, _edges(scans)))
+    assert wide["correlated"] == []

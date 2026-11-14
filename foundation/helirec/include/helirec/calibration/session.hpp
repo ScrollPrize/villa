@@ -87,9 +87,15 @@ MeasureTiming measure_timing(bool reset = false);
 // scan/sample_pixel_size as that of a reduced pixel, so that what the record gives in millimetres (the heights,
 // the motors) comes out in reduced pixels wherever it is turned into pixels. The record's stretches keep the
 // stored frame size. The stored position (c, v) is the reduced position (c, v) / 2^reduce, nothing added.
+//
+// store: a projection store (helirec/projection_store.hpp, made by helirec-projections-zarr) to read the frames
+// from, STORE.zarr: scan k's frames are those of the tile group STORE.zarr/<the record's label>, at the level
+// `reduce`, which the store must hold; its dark and mean flat are the means of the store's own (float images
+// already through the frames' low-pass). A frame is on disk if the store holds its file. The masters are read as
+// always and may lie anywhere (the detector's files beside them are not opened).
 class Session {
   public:
-    explicit Session(const std::vector<std::string>& scans, int threads = 0, int reduce = 0);
+    explicit Session(const std::vector<std::string>& scans, int threads = 0, int reduce = 0, const std::string& store = "");
     int reduce() const;
     ~Session();
     Session(const Session&) = delete;

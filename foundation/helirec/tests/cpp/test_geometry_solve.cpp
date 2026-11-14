@@ -130,6 +130,47 @@ int main() {
     for (const auto& l : got.left)
         if (l.rms[1] > 0.006 || l.rms[2] > 0.006) return fail("more is left than the noise");
 
+    // A calibration made on frames read at a quarter, put into stored pixels (to_stored_pixels): the same detector
+    // seen through every fourth pixel has every position a quarter of the stored one, its middle row 1.5 stored
+    // rows above the stored middle; converted, it is the stored calibration, and its rays are the stored rays.
+    {
+        const int f = 4;
+        gc::Acquisition still = acq;      // (rows exposed at once: the rows' timing keeps the reduced frames' middle row)
+        still.row_time = 0;
+        gc::Acquisition quarter = still;
+        quarter.rows = kRows / f, quarter.cols = kCols / f;
+        quarter.scans[0].mid_height /= f;
+        for (gc::StretchLayout& st : quarter.scans[0].stretches)
+            for (double& v : st.course.rows) v /= f;
+        gc::GeometrySolution reduced;
+        reduced.parameters = truth;
+        gc::ScanParameters& r = reduced.parameters.scans[0];
+        r.axis = (sp.axis - truth.roll * (f - 1) / 2.0) / f, r.d[0] /= f, r.d[1] /= f, r.height /= f;
+        for (double& v : r.stretch_height) v /= f;
+        for (int i = 0; i < 2; ++i) reduced.parameters.stage.height_once[i] /= f, reduced.parameters.stage.axis_twice[i] /= f;
+        const gc::Sighting stored{0, 1, 500.25, 133.0, 402.0}, there{0, 1, 500.25, 133.0 / f, 402.0 / f};
+        const gc::Ray want = gc::ray_of(still, truth, stored), at_quarter = gc::ray_of(quarter, reduced.parameters, there);
+        if (std::fabs(at_quarter.s * f - want.s) > 1e-9 || std::fabs(at_quarter.z * f - want.z) > 1e-9 || std::fabs(at_quarter.angle_deg - want.angle_deg) > 1e-12)
+            return fail("a quarter's ray is not a quarter of the stored ray");
+        reduced.residual = {{0.5, 0.25, -0.5}};
+        gc::GeometryReport told;
+        told.scans.resize(1);
+        told.scans[0].rows_apart = 37.5, told.scans[0].row_time = 8e-3;
+        gc::to_stored_pixels(quarter, reduced, told, kRows, kCols, f);
+        const gc::ScanParameters& back = reduced.parameters.scans[0];
+        if (quarter.rows != kRows || quarter.cols != kCols || std::fabs(quarter.scans[0].mid_height - still.scans[0].mid_height) > 1e-9 ||
+            std::fabs(quarter.scans[0].stretches[1].course.rows[700] - still.scans[0].stretches[1].course.rows[700]) > 1e-9)
+            return fail("the layout was not put into stored pixels");
+        if (std::fabs(back.axis - sp.axis) > 1e-9 || std::fabs(back.d[0] - sp.d[0]) > 1e-12 || std::fabs(back.height - sp.height) > 1e-12 || back.axis_slope != sp.axis_slope ||
+            back.axial_scale != sp.axial_scale || reduced.parameters.roll != truth.roll || std::fabs(back.stretch_height[0] - sp.stretch_height[0]) > 1e-12 ||
+            std::fabs(reduced.parameters.stage.height_once[0] - tr.height_once[0]) > 1e-12 || std::fabs(reduced.parameters.stage.axis_twice[1] - tr.axis_twice[1]) > 1e-12)
+            return fail("the parameters were not put into stored pixels");
+        const gc::Ray again = gc::ray_of(quarter, reduced.parameters, stored);
+        if (std::fabs(again.s - want.s) > 1e-9 || std::fabs(again.z - want.z) > 1e-9) return fail("the converted calibration's ray is not the stored ray");
+        if (reduced.residual[0][0] != 0.5 || reduced.residual[0][1] != 1.0 || reduced.residual[0][2] != -2.0 || told.scans[0].rows_apart != 150.0 || told.scans[0].row_time != 2e-3)
+            return fail("the residuals and the report were not put into stored pixels");
+    }
+
     gc::GeometryOptions both;
     both.freed = {"scan0.helix.height"};
     try {

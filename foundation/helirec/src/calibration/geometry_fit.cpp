@@ -2,6 +2,7 @@
 // sightings, one Ceres problem with a block per owner, the refusal of dependent unknowns, and what is left.
 #include <ceres/dynamic_autodiff_cost_function.h>
 
+#include <Eigen/Dense>
 #include <map>
 #include <set>
 
@@ -33,7 +34,7 @@ double time_of(const Acquisition& acq, const Sighting& g) { return exposure_fram
 model::At at_of(const Acquisition& acq, const Sighting& g) {
     const StretchLayout& st = stretch_of(acq, g);
     const double t = time_of(acq, g);
-    return {at_frame(st.course.angle_deg, t) * (kPi / 180.0), at_frame(st.course.rows, t), acq.scans[static_cast<std::size_t>(g.scan)].mid_height, mid_row(acq)};
+    return {at_frame(st.course.angle_deg, t) * (kPi / 180.0), at_frame(st.course.rows, t), acq.scans[static_cast<std::size_t>(g.scan)].mid_height, mid_row(acq), (acq.cols - 1) / 2.0, acq.per_depth};
 }
 
 // the angle [deg] by which the ray recorded at the sighting's column is further on than the stage: the beam
@@ -56,9 +57,12 @@ int terms_of(const geometry::Map& m) {
 struct Blocks {
     double detector[1] = {0};
     double stage[4] = {0, 0, 0, 0};
+    double pitch[1] = {0};
     geometry::Map shape;      // the map's terms and normalisation
     std::vector<double> map;  // Eu's coefficients, then Ev's (empty: no map)
     std::vector<std::array<double, 3>> own, place;       // per scan
+    std::vector<std::array<double, 3>> turn;             // per scan: the sample's rotation against the anchor's (x, y, z)
+    double about_height = 0;                             // (not an unknown)
     std::vector<std::array<double, 2>> once;             // per scan: the height once per turn of its own views
     std::vector<std::vector<std::array<double, 1>>> stretch;  // per scan, per stretch
     int terms() const { return static_cast<int>(shape.i.size()); }
@@ -71,12 +75,15 @@ Blocks blocks_of(const Acquisition& acq, const Parameters& p) {
     b.map = p.map.eu;
     b.map.insert(b.map.end(), p.map.ev.begin(), p.map.ev.end());
     b.detector[0] = p.roll;
+    b.pitch[0] = p.pitch;
+    b.about_height = p.about_height;
     b.stage[0] = p.stage.height_once[0], b.stage[1] = p.stage.height_once[1], b.stage[2] = p.stage.axis_twice[0], b.stage[3] = p.stage.axis_twice[1];
     for (std::size_t k = 0; k < p.scans.size(); ++k) {
         const ScanParameters& s = p.scans[k];
         if (s.stretch_height.size() != acq.scans[k].stretches.size()) throw Error("geometry: the parameters of scan " + acq.scans[k].name + " do not hold one height per stretch");
         b.own.push_back({s.axis, s.axis_slope, s.axial_scale});
         b.place.push_back({s.d[0], s.d[1], s.height});
+        b.turn.push_back({s.rotation[0], s.rotation[1], s.rotation[2]});
         b.once.push_back({s.height_once[0], s.height_once[1]});
         b.stretch.emplace_back();
         for (double h : s.stretch_height) b.stretch.back().push_back({h});
@@ -89,11 +96,14 @@ Parameters parameters_of(const Blocks& b) {
     p.map.eu.assign(b.map.begin(), b.map.begin() + b.terms());
     p.map.ev.assign(b.map.begin() + b.terms(), b.map.end());
     p.roll = b.detector[0];
+    p.pitch = b.pitch[0];
+    p.about_height = b.about_height;
     p.stage.height_once[0] = b.stage[0], p.stage.height_once[1] = b.stage[1], p.stage.axis_twice[0] = b.stage[2], p.stage.axis_twice[1] = b.stage[3];
     for (std::size_t k = 0; k < b.own.size(); ++k) {
         ScanParameters s;
         s.axis = b.own[k][0], s.axis_slope = b.own[k][1], s.axial_scale = b.own[k][2];
         s.d[0] = b.place[k][0], s.d[1] = b.place[k][1], s.height = b.place[k][2];
+        for (int i = 0; i < 3; ++i) s.rotation[i] = b.turn[k][static_cast<std::size_t>(i)];
         s.height_once[0] = b.once[k][0], s.height_once[1] = b.once[k][1];
         for (const auto& h : b.stretch[k]) s.stretch_height.push_back(h[0]);
         p.scans.push_back(s);
@@ -108,12 +118,16 @@ struct Slot {
     int size = 0, index = 0;
     bool free = false;
     int place_of = -1;   // the scan whose place (d, height) it is part of; -1: none
+    bool of_volume = false;  // a place or a rotation: what lens patches give (the rest is the projections')
     bool gauge = false;  // never free: nothing can tell it from another unknown
 };
-std::vector<Slot> slots_of(const Acquisition& acq, Blocks& b) {
+// lensed: per scan, whether a lens patch names it. apart: whether two scans at different places on the rotation
+// stage are compared at equal angle (what gives the pitch)
+std::vector<Slot> slots_of(const Acquisition& acq, Blocks& b, const std::vector<std::uint8_t>& lensed, bool apart) {
     if (acq.anchor < 0 || acq.anchor >= static_cast<int>(acq.scans.size())) throw Error("geometry: the acquisition's anchor is not one of its scans");
     std::vector<Slot> out;
     out.push_back({"roll", b.detector, 1, 0, true});
+    out.push_back({"pitch", b.pitch, 1, 0, apart});
     const char* stage[4] = {"height_once_cos", "height_once_sin", "axis_twice_cos", "axis_twice_sin"};
     for (int i = 0; i < 4; ++i) out.push_back({std::string("stage.") + stage[i], b.stage, 4, i, true});
     const int nt = b.terms();
@@ -133,6 +147,14 @@ std::vector<Slot> slots_of(const Acquisition& acq, Blocks& b) {
         for (int i = 0; i < 3; ++i) {
             Slot s{scan + place[i], b.place[k].data(), 3, i, !anchor};
             s.place_of = static_cast<int>(k);
+            s.of_volume = true;
+            out.push_back(s);
+        }
+        // the sample's rotation against the anchor's: what lens patches give, and nothing else
+        const char* turn[3] = {"tilt_x", "tilt_y", "spin"};
+        for (int i = 0; i < 3; ++i) {
+            Slot s{scan + turn[i], b.turn[k].data(), 3, i, !anchor && lensed[k] != 0};
+            s.of_volume = true;
             out.push_back(s);
         }
         // a tile's own views beside the anchor's: the anchor's are the stage's
@@ -150,7 +172,10 @@ bool names(const std::string& given, const std::string& unknown) {
     return unknown == given || (unknown.size() > given.size() && unknown.compare(0, given.size(), given) == 0 && unknown[given.size()] == '.');
 }
 
-// One comparison's residual: the two rays' difference in the sample (columns, rows).
+// One comparison's residual: the two rays' difference in the sample (columns, rows). About an axis pitched towards
+// the beam the rows are those of the same rays only for two views at one angle: of two scans there, the pitch's
+// term is exact; of one scan half a turn apart, the scan's height_once stands for what the depth does; of two scans
+// half a turn apart nothing does, and the rows are left out of the solve (zero here; residuals() reports them).
 struct SameLines {
     model::At a, b;
     double ca = 0, va = 0, cb = 0, vb = 0;  // the stored pixels
@@ -158,7 +183,8 @@ struct SameLines {
     bool opposite = false;
     int at_map = -1;                               // where the residual's parameters hold the map; -1: none
     int at_once = -1;                              // and the scan's height once per turn in its own views; -1: two scans
-    int at_a[3] = {0, 0, 0}, at_b[3] = {0, 0, 0};  // and own, place, stretch of each side (0 is the detector, 1 the stage)
+    int at_a[4] = {0, 0, 0, 0}, at_b[4] = {0, 0, 0, 0};  // and own, place, stretch, turn of each side (0 is the detector, 1 the stage, 2 the pitch)
+    double about = 0;                              // the height the scans' rotations are about
 
     template <class T>
     bool operator()(T const* const* p, T* r) const {
@@ -169,12 +195,45 @@ struct SameLines {
         model::ideal_position(map, phi_b.data(), terms, cb, vb, xb, yb);
         model::ray_of(p[0], p[1], p[at_a[0]], p[at_a[1]], p[at_a[2]], a, xa, ya, sa, za);
         model::ray_of(p[0], p[1], p[at_b[0]], p[at_b[1]], p[at_b[2]], b, xb, yb, sb, zb);
+        if (at_once < 0) {  // two scans: each one's rays as the sample's (a scan's own views do not see its rotation)
+            model::turned_back(p[at_a[3]], a, about, sa, za);
+            model::turned_back(p[at_b[3]], b, about, sb, zb);
+        }
         r[0] = opposite ? sb + sa : sb - sa;
         r[1] = zb - za;
         if (at_once >= 0) r[1] -= model::own_lift(p[at_once], a, b);
+        else if (!opposite) r[1] -= model::pitch_lift(p[2], p[at_b[1]], b) - model::pitch_lift(p[2], p[at_a[1]], a);
+        else r[1] = T(0.0);
         return true;
     }
 };
+
+// One lens patch's residual: where scan b alone reconstructs the place against where scan a does, less what was
+// measured, each component over its sigma. Blocks: place a, turn a, place b, turn b.
+struct LensLines {
+    double q[3] = {0, 0, 0};      // the place, z from the height the rotations are about
+    double moved[3] = {0, 0, 0}, sigma[3] = {1, 1, 1};
+
+    template <class T>
+    bool operator()(const T* place_a, const T* turn_a, const T* place_b, const T* turn_b, T* r) const {
+        T d[3];
+        model::lens_displacement(place_a, turn_a, place_b, turn_b, q, d);
+        for (int i = 0; i < 3; ++i) r[i] = (d[i] - moved[i]) / sigma[i];
+        return true;
+    }
+};
+LensLines lens_lines(const Acquisition& acq, double about_height, const LensPatch& l) {
+    const int S = static_cast<int>(acq.scans.size());
+    if (l.scan_a < 0 || l.scan_a >= S || l.scan_b < 0 || l.scan_b >= S) throw Error("geometry: a lens patch names a scan the acquisition does not hold");
+    if (l.scan_a == l.scan_b) throw Error("geometry: a lens patch of scan " + acq.scans[static_cast<std::size_t>(l.scan_a)].name + " with itself says nothing of a place");
+    LensLines f;
+    f.q[0] = l.p[0], f.q[1] = l.p[1], f.q[2] = l.p[2] - about_height;
+    for (int i = 0; i < 3; ++i) {
+        if (!(l.sigma[i] > 0) || !std::isfinite(l.moved[i]) || !std::isfinite(l.p[i])) throw Error("geometry: a lens patch is not finite, or its sigma is not above zero");
+        f.moved[i] = l.moved[i], f.sigma[i] = l.sigma[i];
+    }
+    return f;
+}
 
 // the problem's blocks of one comparison, each once, and where the residual finds them
 struct Wiring {
@@ -189,6 +248,7 @@ Wiring wire(const Acquisition& acq, Blocks& b, const Comparison& c) {
     w.f.opposite = c.opposite;
     w.blocks.push_back(b.detector), w.sizes.push_back(1);
     w.blocks.push_back(b.stage), w.sizes.push_back(4);
+    w.blocks.push_back(b.pitch), w.sizes.push_back(1);
     if (const int nt = b.terms()) {
         w.f.phi_a.resize(static_cast<std::size_t>(nt)), w.f.phi_b.resize(static_cast<std::size_t>(nt));
         geometry::map_basis(b.shape, c.a.col, c.a.row, w.f.phi_a.data());
@@ -208,11 +268,19 @@ Wiring wire(const Acquisition& acq, Blocks& b, const Comparison& c) {
     };
     side(c.a, w.f.at_a), side(c.b, w.f.at_b);
     if (c.a.scan == c.b.scan) w.f.at_once = place(b.once[static_cast<std::size_t>(c.a.scan)].data(), 2);
+    else {
+        w.f.at_a[3] = place(b.turn[static_cast<std::size_t>(c.a.scan)].data(), 3), w.f.at_b[3] = place(b.turn[static_cast<std::size_t>(c.b.scan)].data(), 3);
+        w.f.about = b.about_height;
+    }
     return w;
 }
 
 std::array<double, 3> residual_of(const Acquisition& acq, const Parameters& p, const Comparison& c) {
-    const Ray a = ray_of(acq, p, c.a), b = ray_of(acq, p, c.b);
+    Ray a = ray_of(acq, p, c.a), b = ray_of(acq, p, c.b);
+    if (c.a.scan != c.b.scan) {  // two scans: each one's rays as the sample's
+        model::turned_back(p.scans[static_cast<std::size_t>(c.a.scan)].rotation, at_of(acq, c.a), p.about_height, a.s, a.z);
+        model::turned_back(p.scans[static_cast<std::size_t>(c.b.scan)].rotation, at_of(acq, c.b), p.about_height, b.s, b.z);
+    }
     const StretchLayout& sb = stretch_of(acq, c.b);
     // B's angle per frame around the sighting
     const double t = time_of(acq, c.b);
@@ -221,6 +289,8 @@ std::array<double, 3> residual_of(const Acquisition& acq, const Parameters& p, c
     dth -= 360.0 * std::round(dth / 360.0);
     double rows = b.z - a.z;
     if (c.a.scan == c.b.scan) rows -= model::own_lift(p.scans[static_cast<std::size_t>(c.a.scan)].height_once, at_of(acq, c.a), at_of(acq, c.b));
+    else if (!c.opposite)  // two scans at one angle: the pitch's term (opposite views of two scans: the rows as they are, which the solve leaves out)
+        rows -= model::pitch_lift(&p.pitch, p.scans[static_cast<std::size_t>(c.b.scan)].d, at_of(acq, c.b)) - model::pitch_lift(&p.pitch, p.scans[static_cast<std::size_t>(c.a.scan)].d, at_of(acq, c.a));
     return {step != 0 ? dth / step : 0.0, rows, c.opposite ? b.s + a.s : b.s - a.s};
 }
 
@@ -258,6 +328,22 @@ Ray ray_of(const Acquisition& acq, const Parameters& p, const Sighting& g) {
     return r;
 }
 
+std::vector<std::array<double, 3>> lens_residuals(const Acquisition& acq, const Parameters& p, const std::vector<LensPatch>& lens) {
+    if (p.scans.size() != acq.scans.size()) throw Error("geometry: the parameters and the acquisition differ in their scans");
+    std::vector<std::array<double, 3>> out;
+    out.reserve(lens.size());
+    for (const LensPatch& l : lens) {
+        const LensLines f = lens_lines(acq, p.about_height, l);
+        const ScanParameters& a = p.scans[static_cast<std::size_t>(l.scan_a)];
+        const ScanParameters& b = p.scans[static_cast<std::size_t>(l.scan_b)];
+        const double pa[3] = {a.d[0], a.d[1], a.height}, pb[3] = {b.d[0], b.d[1], b.height};
+        double d[3];
+        model::lens_displacement(pa, a.rotation, pb, b.rotation, f.q, d);
+        out.push_back({d[0] - l.moved[0], d[1] - l.moved[1], d[2] - l.moved[2]});
+    }
+    return out;
+}
+
 std::vector<std::array<double, 3>> residuals(const Acquisition& acq, const Parameters& p, const std::vector<Comparison>& comparisons) {
     std::vector<std::array<double, 3>> out;
     out.reserve(comparisons.size());
@@ -291,12 +377,30 @@ Comparison comparison_of(const Acquisition& acq, const std::string& kind, int sc
     return c;
 }
 
-GeometrySolution solve_geometry(const Acquisition& acq, const std::vector<Comparison>& comparisons, const Parameters& start, const GeometryOptions& options) {
+GeometrySolution solve_geometry(const Acquisition& acq, const std::vector<Comparison>& comparisons, const std::vector<LensPatch>& lens, const Parameters& start,
+                                const GeometryOptions& options) {
     SolveOptions so;
     so.huber = options.huber, so.max_iterations = options.max_iterations;
     fitting::validate(so);
+    if (!std::isfinite(options.lens_huber) || options.lens_huber < 0) throw Error("geometry: the lens patches' Huber scale is not a number from zero up");
     Blocks blocks = blocks_of(acq, start);
-    std::vector<Slot> slots = slots_of(acq, blocks);
+    std::vector<LensLines> lines;
+    std::vector<std::uint8_t> lensed(acq.scans.size(), 0);
+    lines.reserve(lens.size());
+    for (const LensPatch& l : lens) {
+        lines.push_back(lens_lines(acq, blocks.about_height, l));
+        lensed[static_cast<std::size_t>(l.scan_a)] = lensed[static_cast<std::size_t>(l.scan_b)] = 1;
+    }
+    bool apart = false;
+    for (const Comparison& c : comparisons) {
+        stretch_of(acq, c.a), stretch_of(acq, c.b);
+        apart = apart || (!c.opposite && c.a.scan != c.b.scan && (acq.scans[static_cast<std::size_t>(c.a.scan)].moved_on_stage || acq.scans[static_cast<std::size_t>(c.b.scan)].moved_on_stage));
+    }
+    std::vector<Slot> slots = slots_of(acq, blocks, lensed, apart);
+    // lens patches alone (the small solves: an edge by itself, an edge left out) ask for places and rotations only
+    if (comparisons.empty())
+        for (Slot& s : slots)
+            if (!s.of_volume) s.free = false;
     {
         for (const auto* list : {&options.held, &options.freed})
             for (const std::string& name : *list)
@@ -334,6 +438,12 @@ GeometrySolution solve_geometry(const Acquisition& acq, const std::vector<Compar
             problem.AddResidualBlock(cost, loss, w.blocks);
         }
         if (wiring.empty() && loss) delete loss;
+        ceres::LossFunction* lens_loss = options.lens_huber > 0 && !lens.empty() ? new ceres::HuberLoss(options.lens_huber) : nullptr;
+        for (std::size_t i = 0; i < lens.size(); ++i) {
+            const std::size_t a = static_cast<std::size_t>(lens[i].scan_a), b = static_cast<std::size_t>(lens[i].scan_b);
+            problem.AddResidualBlock(new ceres::AutoDiffCostFunction<LensLines, 3, 3, 3, 3, 3>(new LensLines(lines[i])), lens_loss, blocks.place[a].data(), blocks.turn[a].data(),
+                                     blocks.place[b].data(), blocks.turn[b].data());
+        }
         // each block that the problem holds: constant, or with a part of it held
         std::map<double*, std::vector<std::size_t>> by_block;
         std::vector<double*> order;
@@ -383,9 +493,9 @@ GeometrySolution solve_geometry(const Acquisition& acq, const std::vector<Compar
     GeometrySolution out;
     out.solver.solver_version = CERES_VERSION_STRING;
     // unknowns asked free that no comparison depends on are held where they started, and said: first a scan's place,
-    // which only comparisons with another scan give
+    // which only comparisons with another scan and lens patches give
     {
-        std::vector<std::uint8_t> joined(acq.scans.size(), 0);
+        std::vector<std::uint8_t> joined = lensed;
         for (const Comparison& c : comparisons)
             if (c.a.scan != c.b.scan) joined[static_cast<std::size_t>(c.a.scan)] = joined[static_cast<std::size_t>(c.b.scan)] = 1;
         for (Slot& s : slots)
@@ -403,7 +513,9 @@ GeometrySolution solve_geometry(const Acquisition& acq, const std::vector<Compar
     }
     Built built = build();
     for (std::size_t i : built.column_slot) out.free.push_back(slots[i].name);
-    if (comparisons.empty() || out.free.empty()) throw Error("INSUFFICIENT_SUPPORT: the geometry's solve has " + std::to_string(comparisons.size()) + " comparisons for " + std::to_string(out.free.size()) + " unknowns");
+    if ((comparisons.empty() && lens.empty()) || out.free.empty())
+        throw Error("INSUFFICIENT_SUPPORT: the geometry's solve has " + std::to_string(comparisons.size()) + " comparisons and " + std::to_string(lens.size()) + " lens patches for " +
+                    std::to_string(out.free.size()) + " unknowns");
     ceres::Solver::Summary summary;
     ceres::Solve(fitting::options(static_cast<int>(out.free.size()), so), built.problem.get(), &summary);
     out.solver = fitting::summary(summary);
@@ -418,6 +530,14 @@ GeometrySolution solve_geometry(const Acquisition& acq, const std::vector<Compar
             throw Error("RANK_DEFICIENT: the geometry's free unknowns depend on each other (rank " + std::to_string(out.rank) + " of " + std::to_string(out.free.size()) +
                         "); hold one of each dependent set, among them: " + names);
         }
+        // unknowns the measurements hardly tell apart: the correlations of their estimates, (J^T J)^-1 scaled
+        const Eigen::MatrixXd dense = Eigen::MatrixXd(d);
+        const Eigen::MatrixXd cov = (dense.transpose() * dense).ldlt().solve(Eigen::MatrixXd::Identity(d.cols(), d.cols()));
+        for (int i = 0; i < cov.rows(); ++i)
+            for (int j = i + 1; j < cov.cols(); ++j) {
+                const double r = cov(i, j) / std::sqrt(cov(i, i) * cov(j, j));
+                if (std::isfinite(r) && std::fabs(r) > 0.9) out.correlated.push_back({out.free[static_cast<std::size_t>(i)], out.free[static_cast<std::size_t>(j)], r});
+            }
     }
     if (!out.solver.usable) throw Error(out.solver.termination + ": " + out.solver.message);
     out.parameters = parameters_of(blocks);
@@ -436,6 +556,19 @@ GeometrySolution solve_geometry(const Acquisition& acq, const std::vector<Compar
         for (int j = 0; j < 3; ++j) {
             std::vector<double> v;
             for (std::size_t i : members) v.push_back(out.residual[i][static_cast<std::size_t>(j)]);
+            l.rms[j] = rms_of(v), l.median[j] = median(v);
+        }
+        out.left.push_back(l);
+    }
+    out.lens_residual = lens_residuals(acq, out.parameters, lens);
+    std::map<std::pair<int, int>, std::vector<std::size_t>> edges;
+    for (std::size_t i = 0; i < lens.size(); ++i) edges[{-1, -1}].push_back(i), edges[{lens[i].scan_a, lens[i].scan_b}].push_back(i);
+    for (const auto& [key, members] : edges) {
+        GeometrySolution::Left l;
+        l.kind = "lens", l.scan_a = key.first, l.scan_b = key.second, l.n = members.size();
+        for (int j = 0; j < 3; ++j) {
+            std::vector<double> v;
+            for (std::size_t i : members) v.push_back(out.lens_residual[i][static_cast<std::size_t>(j)]);
             l.rms[j] = rms_of(v), l.median[j] = median(v);
         }
         out.left.push_back(l);
@@ -462,11 +595,12 @@ void parameters_json(const Acquisition& acq, const Parameters& p, Json& out, Jso
         d.set("name", Json::of(acq.scans[k].name)).set("axis", num(q.axis)).set("axis_slope", num(q.axis_slope)).set("axial_scale", num(q.axial_scale));
         d.set("d", Json::list().add(num(q.d[0])).add(num(q.d[1]))).set("height", num(q.height)).set("stretch_height", heights).set("mid_height", num(acq.scans[k].mid_height));
         d.set("height_once", Json::list().add(num(q.height_once[0])).add(num(q.height_once[1])));
+        d.set("rotation", Json::list().add(num(q.rotation[0])).add(num(q.rotation[1])).add(num(q.rotation[2])));
         scans.add(d);
     }
     Json stage = Json::dict();
     stage.set("height_once", Json::list().add(num(p.stage.height_once[0])).add(num(p.stage.height_once[1]))).set("axis_twice", Json::list().add(num(p.stage.axis_twice[0])).add(num(p.stage.axis_twice[1])));
-    out.set("roll", num(p.roll)).set("stage", stage).set("scans", scans);
+    out.set("roll", num(p.roll)).set("pitch", num(p.pitch)).set("stage", stage).set("about_height", num(p.about_height)).set("scans", scans);
     Json mi = Json::list(), mj = Json::list();
     for (const int v : p.map.i) mi.add(Json::whole_number(v));
     for (const int v : p.map.j) mj.add(Json::whole_number(v));
@@ -501,7 +635,9 @@ std::string solution_json(const Acquisition& acq, const GeometrySolution& s) {
     solver.set("solver_version", Json::of(s.solver.solver_version)).set("rank", Json::whole_number(s.rank));
     Json out = Json::dict(), map;
     parameters_json(acq, s.parameters, out, map);
-    out.set("map", map).set("free", names(s.free)).set("unused", names(s.unused)).set("solver", solver).set("left", left);
+    Json correlated = Json::list();
+    for (const GeometrySolution::Correlated& c : s.correlated) correlated.add(Json::list().add(Json::of(c.a)).add(Json::of(c.b)).add(num(c.correlation)));
+    out.set("map", map).set("free", names(s.free)).set("unused", names(s.unused)).set("correlated", correlated).set("solver", solver).set("left", left);
     return out.text();
 }
 

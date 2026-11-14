@@ -16,8 +16,8 @@
 // "multiscales" attribute declares scales and no translation.
 //
 // Arrays: blosc (bitshuffle, lz4), chunks of one frame by 128 rows by all columns, a shard per 100 frames, values
-// as stored in the files (uint16 projections, float32 reduced darks and flats). Writing is vc_reader's
-// (zarr::Writer); each file is one shard, written once and, unless --no_verify, read back and compared. Running it
+// as stored in the files (uint16 projections, float32 reduced darks and flats). The store's layout and writing
+// are the library's (helirec/projection_store.hpp, on vc_reader's zarr::Writer); each file is one shard, written once and, unless --no_verify, read back and compared. Running it
 // again skips the files already stored.
 #include <hdf5.h>
 
@@ -39,7 +39,7 @@
 #include <thread>
 #include <vector>
 
-#include "vc_reader/array.hpp"
+#include "helirec/projection_store.hpp"
 #include "vc_reader/zarr_write.hpp"
 
 namespace fs = std::filesystem;
@@ -48,7 +48,7 @@ using vcr::zarr::Json;
 
 namespace {
 
-constexpr int kLevels = 4, kChunkRows = 128, kShardFrames = 100;
+constexpr int kLevels = 4;
 
 struct Job {
     fs::path file;
@@ -113,31 +113,6 @@ bool read_file(const Job& job, const Index& shape, std::vector<std::uint8_t>& ou
     return ok;
 }
 
-vcr::zarr::CreateOptions array_options(const Index& shape, const std::string& dtype, int level) {
-    vcr::zarr::CreateOptions o;
-    o.version = 3;
-    o.shape = shape;
-    o.dtype = dtype;
-    o.separator = "/";
-    o.compressor = "blosc";
-    o.cname = "lz4";
-    o.shuffle = 2;
-    o.level = level;
-    const std::int64_t rows = std::min<std::int64_t>(kChunkRows, shape[1]);
-    o.chunks = {1, rows, shape[2]};
-    o.shardShape = {kShardFrames, (shape[1] + rows - 1) / rows * rows, shape[2]};
-    return o;
-}
-
-// an existing array must be the one this run would create
-vcr::zarr::Writer open_or_create(const fs::path& path, const vcr::zarr::CreateOptions& o) {
-    if (!fs::exists(path / "zarr.json")) return vcr::zarr::Writer::create(path, o);
-    auto w = vcr::zarr::Writer::open(path);
-    if (w.meta().shape != o.shape || w.meta().chunks != o.chunks || w.meta().dtype.substr(1) != o.dtype.substr(1))
-        throw std::runtime_error(path.string() + " exists with another shape, chunking or dtype");
-    return w;
-}
-
 void read_plan(const fs::path& dir, const std::set<std::string>& only, std::map<std::string, Scan>& scans, std::map<std::string, Json>& tiles) {
     std::ifstream in(dir / "plan.json");
     if (!in) throw std::runtime_error("no plan.json in " + dir.string());
@@ -181,30 +156,24 @@ void read_plan(const fs::path& dir, const std::set<std::string>& only, std::map<
     }
 }
 
-// one value per frame of the scan, from the plans' records of the files (the same at every scale)
-void write_frame_arrays(const fs::path& group, const Scan& s) {
+// what the library declares a scan group from (helirec/projection_store.hpp)
+std::string spec_of(const Scan& s, const Json& tile) {
     const std::size_t n = std::size_t(s.frames());
-    std::map<std::string, std::vector<double>> values;
-    std::vector<std::int64_t> original(n, -1);
+    std::map<std::int64_t, Json> sources;
+    Json values = Json::object();
     for (const auto& [reduce, jobs] : s.levels)
         for (const auto& job : jobs) {
-            for (std::int64_t i = 0; i < job.count; ++i) original[std::size_t(job.first - s.base + i)] = job.first + i;
+            sources.emplace(job.first, Json{{"file", job.source}, {"source_first", job.source_first}, {"first", job.first}, {"count", job.count}});
             for (const auto& [key, list] : job.metadata.items()) {
                 if (!list.is_array() || std::int64_t(list.size()) != job.count) continue;
-                auto& v = values.try_emplace(key, n, std::numeric_limits<double>::quiet_NaN()).first->second;
-                for (std::int64_t i = 0; i < job.count; ++i)
-                    if (list[std::size_t(i)].is_number()) v[std::size_t(job.first - s.base + i)] = list[std::size_t(i)].get<double>();
+                if (!values.contains(key)) values[key] = Json::array_t(n);  // n nulls
+                for (std::int64_t i = 0; i < job.count; ++i) values[key][std::size_t(job.first - s.base + i)] = list[std::size_t(i)];
             }
         }
-    auto write = [&](const std::string& name, const std::string& dtype, const void* data, const Json& fill) {
-        vcr::zarr::CreateOptions o;
-        o.version = 3, o.shape = {std::int64_t(n)}, o.chunks = {std::int64_t(n)}, o.dtype = dtype, o.separator = "/";
-        o.compressor = "blosc", o.cname = "lz4", o.shuffle = 1, o.fillValue = fill, o.overwrite = true;
-        auto w = vcr::zarr::Writer::create(group / name, o);
-        w.writeChunk({0}, static_cast<const std::uint8_t*>(data), n * 8);
-    };
-    write("original_frame_index", "<i8", original.data(), -1);
-    for (const auto& [key, v] : values) write(key, "<f8", v.data(), "NaN");
+    Json files = Json::array();
+    for (auto& [first, entry] : sources) files.push_back(std::move(entry));
+    return Json{{"tile", s.tile}, {"scan", s.name}, {"role", s.role}, {"rows", s.rows}, {"cols", s.cols}, {"frame_first", s.base}, {"frames", s.frames()},
+                {"tile_attributes", tile}, {"files", files}, {"frame_values", values}}.dump();
 }
 
 }  // namespace
@@ -245,54 +214,25 @@ int main(int argc, char** argv) try {
     if (scans.empty()) throw std::runtime_error("the plans list no files for these tiles");
 
     // groups, arrays and attributes first: a reader can open the store while it fills
-    vcr::zarr::createGroup(root, Json{{"helirec_projections", {{"format_version", 1}}}}, 3);
     struct Work {
         const Scan* scan;
         const Job* job;
-        vcr::zarr::Writer* writer;
+        helirec::ProjectionStoreWriter* writer;
         Index shape;
     };
-    std::vector<std::unique_ptr<vcr::zarr::Writer>> writers;
+    std::vector<std::unique_ptr<helirec::ProjectionStoreWriter>> writers;
     std::vector<Work> work;
-    std::set<std::string> tile_groups;
     for (const auto& [key, s] : scans) {
-        if (tile_groups.insert(s.tile).second) vcr::zarr::createGroup(root / s.tile, Json{{"helirec_tile", tiles.at(s.tile)}}, 3);
-        const fs::path group = root / s.tile / s.name;
-        Json stored = Json::array();
-        for (int l = 0; l < kLevels; ++l) {
-            const Index shape{s.frames(), s.rows >> l, s.cols >> l};
-            const auto found = s.levels.find(l);
-            // an absent level is declared as its files would be: the detector's uint16, or a reduced dark's float32
-            const std::string dtype = found != s.levels.end() ? found->second.front().dtype : (s.role == "projection" || l == 0 ? "<u2" : "<f4");
-            auto writer = std::make_unique<vcr::zarr::Writer>(open_or_create(group / std::to_string(l), array_options(shape, dtype, level)));
-            Json entry{{"path", std::to_string(l)}, {"reduce", l}, {"stored", found != s.levels.end()}};
-            if (found != s.levels.end()) {
-                entry["source"] = s.source.at(l);
-                for (const auto& job : found->second) {
-                    if (job.dtype != dtype) throw std::runtime_error(key + ": files of one level differ in dtype");
-                    work.push_back({&s, &job, writer.get(), {job.count, shape[1], shape[2]}});
-                }
+        const std::string spec = spec_of(s, tiles.at(s.tile));
+        for (const auto& [l, jobs] : s.levels) {
+            const std::string dtype = jobs.front().dtype == "<u2" ? "uint16" : "float32";
+            helirec::declare_projection_store_scan(root.string(), spec, l, s.source.at(l), dtype, level);
+            writers.push_back(std::make_unique<helirec::ProjectionStoreWriter>((root / s.tile / s.name).string(), l));
+            for (const auto& job : jobs) {
+                if (job.dtype != jobs.front().dtype) throw std::runtime_error(key + ": files of one level differ in dtype");
+                work.push_back({&s, &job, writers.back().get(), {job.count, s.rows >> l, s.cols >> l}});
             }
-            stored.push_back(std::move(entry));
-            writers.push_back(std::move(writer));
         }
-        // which frames of the detector's files the store's frames are (the same at every scale)
-        std::map<std::int64_t, Json> sources;
-        for (const auto& [reduce, jobs] : s.levels)
-            for (const auto& job : jobs)
-                sources.emplace(job.first, Json{{"file", job.source}, {"source_first", job.source_first}, {"first", job.first}, {"count", job.count}});
-        Json files = Json::array();
-        for (auto& [first, entry] : sources) files.push_back(std::move(entry));
-        vcr::zarr::MultiscalesOptions m;
-        m.name = s.tile + "/" + s.name, m.levels = kLevels - 1, m.factors = {1, 2, 2}, m.axes = {"frame", "row", "col"};
-        m.reduction = vcr::zarr::Reduction::Nearest;  // no translation: level values sit at stored pixels (j, k) 2^l
-        Json multiscales = vcr::zarr::omeMultiscales(m);
-        multiscales["metadata"] = {{"downsampling_method", "JPEG 2000 9/7 wavelet low band"}};
-        vcr::zarr::createGroup(group,
-                               Json{{"multiscales", Json::array({multiscales})},
-                                    {"helirec", {{"role", s.role}, {"tile", s.tile}, {"scan", s.name}, {"frame_first", s.base}, {"frames", s.frames()}, {"levels", stored}, {"files", files}}}},
-                               3);
-        write_frame_arrays(group, s);
     }
 
     std::atomic<std::size_t> next{0}, finished{0}, written{0}, skipped{0}, incomplete{0}, bytes{0};
@@ -300,18 +240,14 @@ int main(int argc, char** argv) try {
     std::string failure;
     const auto t0 = std::chrono::steady_clock::now();
     auto run = [&] {
-        std::vector<std::uint8_t> data, back;
+        std::vector<std::uint8_t> data;
         for (std::size_t i; (i = next++) < work.size();) {
             const Work& w = work[i];
             try {
-                const Index start{w.job->first - w.scan->base, 0, 0};
-                const auto& chunks = w.writer->meta().chunks;
-                const Index first_chunk{start[0], 0, 0}, last_chunk{start[0] + w.shape[0] - 1, (w.shape[1] - 1) / chunks[1], 0};
-                // a file is one rewrite of its shard, so its first and last chunks are stored together
-                if (w.writer->chunkExists(first_chunk) && w.writer->chunkExists(last_chunk)) {
+                if (w.writer->holds(w.job->first, w.job->count)) {
                     ++skipped;
                 } else {
-                    const std::size_t size = std::size_t(w.shape[0] * w.shape[1] * w.shape[2]) * w.writer->meta().itemsize();
+                    const std::size_t size = std::size_t(w.shape[0] * w.shape[1] * w.shape[2]) * (w.job->dtype == "<u2" ? 2 : 4);
                     data.resize(size);
                     if (!read_file(*w.job, w.shape, data)) {
                         ++incomplete;
@@ -320,12 +256,7 @@ int main(int argc, char** argv) try {
                         std::fprintf(stderr, "not complete, left out: %s\n", w.job->file.c_str());
                         continue;
                     }
-                    w.writer->writeRegion(start, w.shape, data.data());
-                    if (verify) {
-                        back.resize(size);
-                        w.writer->reader().read_many({start}, {w.shape}, {back.data()});
-                        if (std::memcmp(data.data(), back.data(), size) != 0) throw std::runtime_error("stored values differ from the file");
-                    }
+                    w.writer->write(w.job->first, w.job->count, data.data(), verify);
                     bytes += size;
                     ++written;
                 }

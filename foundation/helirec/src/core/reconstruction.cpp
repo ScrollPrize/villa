@@ -537,18 +537,29 @@ std::string Reconstruction::provenance() const {
 TileReconstruction tile_reconstructor(const std::string& master, const std::string& description, const std::string& label, const TileOptions& o) {
     const Json cal = Json::parse(description);
     const Json& L = member(cal, "layout");
-    const auto& tiles = member(L, "tiles").array;
-    std::size_t k = 0;
-    while (k < tiles.size() && tiles[k].string != label) ++k;
-    if (k == tiles.size()) throw Error("the description has no tile '" + label + "'");
-    const auto& range = member(L, "frames_on_disk").array.at(k).array;
+    // a joint geometry calibration (helirec-calibration geometry), of which `label` names a scan; or the tiles' description
+    const Json* model = cal.find("model");
+    const bool joint = model && model->is(Json::String) && model->string == "joint";
     TileReconstruction out;
-    out.first_frame = static_cast<std::int64_t>(range.at(0).number);
-    out.end_frame = static_cast<std::int64_t>(range.at(1).number);
     out.reduce = o.reduce;
     out.scan = calibration::open_scan(master);
     const calibration::Scan& scan = out.scan;
     const int rows_full = scan.rows, cols_full = scan.cols;
+    std::optional<geometry::Calibration> joined;
+    std::size_t joint_scan = 0;
+    if (!joint) {
+        const auto& tiles = member(L, "tiles").array;
+        std::size_t k = 0;
+        while (k < tiles.size() && tiles[k].string != label) ++k;
+        if (k == tiles.size()) throw Error("the description has no tile '" + label + "'");
+        const auto& range = member(L, "frames_on_disk").array.at(k).array;
+        out.first_frame = static_cast<std::int64_t>(range.at(0).number);
+        out.end_frame = static_cast<std::int64_t>(range.at(1).number);
+    } else {
+        joined = geometry::Calibration::parse(description);
+        joint_scan = joined->scan_named(label);
+        if (joined->rows() != rows_full || joined->cols() != cols_full) throw Error("the geometry calibration is of frames of another size than " + scan.name + "'s");
+    }
     // the helix among the scan's projections (they are kept one stretch after the other)
     std::int64_t before = 0;
     {
@@ -564,10 +575,16 @@ TileReconstruction tile_reconstructor(const std::string& master, const std::stri
         }
         if (!found) throw Error(scan.name + ": no helix among the projections");
     }
+    if (joint) {  // the helix' frames the calibration was made on
+        const std::array<std::size_t, 2> on_disk = joined->frames_on_disk(joint_scan);
+        if (static_cast<std::int64_t>(on_disk[0]) < before) throw Error("the geometry calibration's helix does not start where " + scan.name + "'s does: it was made from another scan");
+        out.first_frame = static_cast<std::int64_t>(on_disk[0]) - before, out.end_frame = static_cast<std::int64_t>(on_disk[1]) - before;
+    }
     std::vector<std::int64_t> idx;
     std::vector<double> frame, angle, z, height_rows, control;
     std::vector<std::int32_t> file_index, frame_index;
     const double row_sign = member(L, "row_sign").number;
+    if (before + out.end_frame > static_cast<std::int64_t>(scan.unwrapped_angles_deg.size()) || out.first_frame < 0) throw Error("tile " + label + ": the frames named are not among the scan's");
     for (std::int64_t f = out.first_frame; f < out.end_frame; ++f) {
         const std::size_t i = static_cast<std::size_t>(before + f);
         frame.push_back(static_cast<double>(f));
@@ -588,29 +605,108 @@ TileReconstruction tile_reconstructor(const std::string& master, const std::stri
         file_index = source.file_index, frame_index = source.frame_index;
         say(o.log, "[" + label + "] projections from " + o.projections);
     }
-    const Json& t = member(member(cal, "tiles"), label);
-    const double axis_column = member(t, "axis_column").number;
+    const double axis_column = joint ? joined->axis_column(joint_scan) : member(member(member(cal, "tiles"), label), "axis_column").number;
     const int f = 1 << o.reduce;
     // The slice's grid has its centre on a pixel or between two, and the reconstruction puts the axis there: the axis'
     // column is rounded to half a pixel of the reconstruction (the rest goes into every frame's column offset), so
     // that rot_center is where the axis lies in the slice.
     double rot_center = f * std::nearbyint(2 * axis_column / f) / 2.0;
-    if (!o.reduced) say(o.log, "[" + label + "] darks and flats ...");
-    out.reduced = o.reduced ? *o.reduced : calibration::reduced_darks_flats(scan, o.cache_dir, o.log);
-    const calibration::DarksFlats& red = out.reduced;
+    // The darks and flats: the detector's files reduced at full resolution; or, where a projection store is given
+    // and the detector's dark files are not on disk (a tile kept in the store alone), the store's float images at
+    // the level `reduce`, which were taken through the frames' low-pass when the store was made.
+    const bool store_flats = !o.projections.empty() && !o.reduced && (scan.darks.files.empty() || !std::filesystem::exists(scan.darks.files[0]));
     const std::size_t px_full = static_cast<std::size_t>(rows_full) * static_cast<std::size_t>(cols_full);
-    std::vector<const float*> stacks;
-    for (std::size_t s = 0; s < red.series(); ++s) stacks.push_back(red.flats.data() + s * px_full);
-    const std::vector<float> wm = calibration::weight_map(stacks, rows_full, cols_full);
     const bool right = axis_column > (cols_full - 1) / 2.0;
     const double far = right ? 50.0 : std::min(2000.0, axis_column), near = right ? std::min(2000.0, cols_full - axis_column) : 50.0;
-    const std::vector<float> mask = calibration::apodisation_mask(cols_full, static_cast<float>(far), static_cast<float>(near), 1e-8f);
-    std::vector<float> w(px_full);
-    for (std::size_t r = 0; r < static_cast<std::size_t>(rows_full); ++r)
-        for (std::size_t c = 0; c < static_cast<std::size_t>(cols_full); ++c) w[r * cols_full + c] = wm[r * cols_full + c] * mask[c];
-    if (o.weight) o.weight(w, rows_full, cols_full);
-    out.row_origin = o.row_origin ? *o.row_origin : -(1.0 + member(cal, "axial_scale").number) * height_rows[height_rows.size() / 2];
-    out.terms = geometry::TileGeometry::parse(description).reconstruction_terms(label, angle, height_rows, frame, rot_center, out.row_origin);
+    std::vector<float> w, store_dark, store_flat_series;
+    if (store_flats) {
+        if (o.weight) throw Error("tile " + label + ": a weight function takes the stored frames' weight map, and the darks and flats are a projection store's");
+        say(o.log, "[" + label + "] darks and flats from " + o.projections);
+        int rr = 0, rc = 0;
+        const auto mean_of = [&](const calibration::FrameList& list, const float* dark, const std::vector<double>* control) {
+            if (!list.size()) throw Error(scan.name + ": no dark or flat frames");
+            const calibration::FrameList in_store = frames_in_projection_store(list, o.projections);
+            std::vector<double> sum;
+            std::size_t i0 = 0;
+            while (i0 < in_store.size()) {  // the frames of one scan group at a time
+                std::size_t i1 = i0;
+                std::vector<std::int64_t> frames;
+                std::vector<double> weight;
+                while (i1 < in_store.size() && in_store.file_index[i1] == in_store.file_index[i0]) {
+                    frames.push_back(in_store.frame_index[i1]);
+                    if (control) weight.push_back(calibration::kNominalCurrentA / control->at(i1));
+                    ++i1;
+                }
+                const std::vector<double> part = projection_store_sum(in_store.files[static_cast<std::size_t>(in_store.file_index[i0])], o.reduce, frames.data(), frames.size(), dark,
+                                                                      control ? weight.data() : nullptr, &rr, &rc);
+                if (sum.empty()) sum = part;
+                else
+                    for (std::size_t i = 0; i < sum.size(); ++i) sum[i] += part[i];
+                i0 = i1;
+            }
+            std::vector<float> mean(sum.size());
+            for (std::size_t i = 0; i < sum.size(); ++i) mean[i] = static_cast<float>(sum[i] / static_cast<double>(in_store.size()));
+            return mean;
+        };
+        store_dark = mean_of(scan.darks, nullptr, nullptr);
+        for (std::size_t k = 0; k < scan.flats.size(); ++k) {
+            const std::vector<float> flat = mean_of(scan.flats[k], store_dark.data(), &scan.flats_control_A[k]);
+            store_flat_series.insert(store_flat_series.end(), flat.begin(), flat.end());
+        }
+        if (rr != rows_full / f || rc != cols_full / f) throw Error("tile " + label + ": the store's darks and flats are not of the level's size");
+        // the weight map formed on the level's grid, its widths divided with the pixels
+        const std::size_t px = static_cast<std::size_t>(rr) * static_cast<std::size_t>(rc);
+        std::vector<const float*> stacks;
+        for (std::size_t s = 0; s < scan.flats.size(); ++s) stacks.push_back(store_flat_series.data() + s * px);
+        const std::vector<float> wm = calibration::weight_map(stacks, rr, rc, 15.0 / f, 10.0 / f);
+        const std::vector<float> mask = calibration::apodisation_mask(rc, static_cast<float>(far / f), static_cast<float>(near / f), 1e-8f);
+        w.resize(px);
+        for (std::size_t r = 0; r < static_cast<std::size_t>(rr); ++r)
+            for (std::size_t c = 0; c < static_cast<std::size_t>(rc); ++c) w[r * rc + c] = wm[r * rc + c] * mask[c];
+    } else {
+        if (!o.reduced) say(o.log, "[" + label + "] darks and flats ...");
+        out.reduced = o.reduced ? *o.reduced : calibration::reduced_darks_flats(scan, o.cache_dir, o.log);
+        std::vector<const float*> stacks;
+        for (std::size_t s = 0; s < out.reduced.series(); ++s) stacks.push_back(out.reduced.flats.data() + s * px_full);
+        const std::vector<float> wm = calibration::weight_map(stacks, rows_full, cols_full);
+        const std::vector<float> mask = calibration::apodisation_mask(cols_full, static_cast<float>(far), static_cast<float>(near), 1e-8f);
+        w.resize(px_full);
+        for (std::size_t r = 0; r < static_cast<std::size_t>(rows_full); ++r)
+            for (std::size_t c = 0; c < static_cast<std::size_t>(cols_full); ++c) w[r * cols_full + c] = wm[r * cols_full + c] * mask[c];
+        if (o.weight) o.weight(w, rows_full, cols_full);
+    }
+    const calibration::DarksFlats& red = out.reduced;
+    double step_deg = 0, rad_per_row = 0;  // the angle per frame; the angle between the exposure of one stored row and the next
+    if (joint) {
+        // the scan's own frame: its poses under the calibration with its place and height left out (geometry.hpp)
+        const std::size_t n_all = scan.unwrapped_angles_deg.size();
+        std::vector<double> all_angle(scan.unwrapped_angles_deg.begin(), scan.unwrapped_angles_deg.end()), all_height(n_all);
+        for (std::size_t i = 0; i < n_all; ++i) all_height[i] = row_sign * scan.z_translation_m[i] / scan.pixel_size_m;
+        const geometry::Poses all = joined->own_poses(joint_scan, all_angle, all_height);
+        geometry::Poses own;
+        const auto part = [&](const std::vector<double>& v) {
+            return std::vector<double>(v.begin() + static_cast<std::ptrdiff_t>(before + out.first_frame), v.begin() + static_cast<std::ptrdiff_t>(before + out.end_frame));
+        };
+        own.row = part(all.row), own.row_per_col = part(all.row_per_col), own.axis = part(all.axis), own.col_per_row = part(all.col_per_row);
+        own.col_scale = part(all.col_scale), own.row_scale = part(all.row_scale), own.angle_deg = part(all.angle_deg), own.angle_deg_per_row = part(all.angle_deg_per_row);
+        own.scale_col = all.scale_col;
+        // the slices are numbered by the model's height of the sample as this scan holds it, less row_origin; none
+        // given: the slice h is about what the row h saw at the middle frame on disk
+        out.row_origin = o.row_origin ? *o.row_origin : -own.row[own.row.size() / 2];
+        // (row_origin: reconstruction_terms adds it to the poses' rows, and the slice h is read at the row h + row + origin)
+        out.terms = geometry::reconstruction_terms(own, height_rows, row_sign, rows_full, rot_center, 0.0, 0.0, out.row_origin);
+        std::vector<double> steps(angle.size() > 1 ? angle.size() - 1 : 0);
+        for (std::size_t i = 0; i + 1 < angle.size(); ++i) steps[i] = std::fabs(angle[i + 1] - angle[i]);
+        if (steps.empty()) throw Error("tile " + label + ": one frame on disk");
+        std::nth_element(steps.begin(), steps.begin() + static_cast<std::ptrdiff_t>(steps.size() / 2), steps.end());
+        step_deg = steps[steps.size() / 2];
+        rad_per_row = member(member(cal, "row_time"), "frames_per_row").number * step_deg * (M_PI / 180.0);
+    } else {
+        out.row_origin = o.row_origin ? *o.row_origin : -(1.0 + member(cal, "axial_scale").number) * height_rows[height_rows.size() / 2];
+        out.terms = geometry::TileGeometry::parse(description).reconstruction_terms(label, angle, height_rows, frame, rot_center, out.row_origin);
+        step_deg = std::fabs(member(L, "step_deg").number);
+        rad_per_row = member(member(cal, "row_time"), "rad_per_row").number;
+    }
     geometry::Terms& T = out.terms;
     const Json& m = member(cal, "map");
     std::vector<double> eu, ev;
@@ -620,24 +716,26 @@ TileReconstruction tile_reconstructor(const std::string& master, const std::stri
     for (const Json& v : member(m, "i").array) mi.push_back(static_cast<std::int32_t>(v.number));
     for (const Json& v : member(m, "j").array) mj.push_back(static_cast<std::int32_t>(v.number));
     double c0 = member(m, "c0").number, cs = member(m, "cs").number, v0 = member(m, "v0").number, vs = member(m, "vs").number;
-    double rad_per_row = member(member(cal, "row_time"), "rad_per_row").number;
     double pixel_size_m = scan.pixel_size_m * f;
-    std::vector<float> dark = red.dark, flats = red.flats;
+    std::vector<float> dark = store_flats ? store_dark : red.dark, flats = store_flats ? store_flat_series : red.flats;
     int rows = rows_full, cols = cols_full;
     if (o.reduce) {
         // every position of the stored detector and of the full reconstruction over f; slopes and scales are ratios
-        RawReader probe(source.files, source.dataset, rows_full, cols_full);
-        const int chunk_rows = probe.storage(file_index[0]).chunk_rows;
-        const std::vector<double> d64(dark.begin(), dark.end()), f64(flats.begin(), flats.end());
-        int ry = 0, rx = 0;
-        dark = calibration::at_resolution(d64.data(), 1, rows_full, cols_full, o.reduce, chunk_rows, &ry, &rx);
-        flats = calibration::at_resolution(f64.data(), red.series(), rows_full, cols_full, o.reduce, chunk_rows, &ry, &rx);
         const int rows_r = rows_full / f, cols_r = cols_full / f;
-        std::vector<float> wr(static_cast<std::size_t>((rows_full + f - 1) / f) * ((cols_full + f - 1) / f));
-        const int wy = (rows_full + f - 1) / f, wx = (cols_full + f - 1) / f;
-        for (int y = 0; y < wy; ++y)
-            for (int x = 0; x < wx; ++x) wr[static_cast<std::size_t>(y) * wx + x] = w[static_cast<std::size_t>(y * f) * cols_full + x * f];  // the weight of the stored pixel a reduced value sits at
-        w = std::move(wr);
+        const int wx = (cols_full + f - 1) / f;
+        if (!store_flats) {  // (a store's are of the level already)
+            RawReader probe(source.files, source.dataset, rows_full, cols_full);
+            const int chunk_rows = probe.storage(file_index[0]).chunk_rows;
+            const std::vector<double> d64(dark.begin(), dark.end()), f64(flats.begin(), flats.end());
+            int ry = 0, rx = 0;
+            dark = calibration::at_resolution(d64.data(), 1, rows_full, cols_full, o.reduce, chunk_rows, &ry, &rx);
+            flats = calibration::at_resolution(f64.data(), red.series(), rows_full, cols_full, o.reduce, chunk_rows, &ry, &rx);
+            std::vector<float> wr(static_cast<std::size_t>((rows_full + f - 1) / f) * ((cols_full + f - 1) / f));
+            const int wy = (rows_full + f - 1) / f;
+            for (int y = 0; y < wy; ++y)
+                for (int x = 0; x < wx; ++x) wr[static_cast<std::size_t>(y) * wx + x] = w[static_cast<std::size_t>(y * f) * cols_full + x * f];  // the weight of the stored pixel a reduced value sits at
+            w = std::move(wr);
+        }
         // the reconstruction counts the rows' timing from its middle row, which is the stored row f (rows_r - 1) / 2 and
         // not the stored middle (rows - 1) / 2 the description's angles are for
         const double shift = (rad_per_row * (f * (rows_r - 1) / 2.0 - (rows_full - 1) / 2.0)) * (180.0 / M_PI);
@@ -723,7 +821,7 @@ TileReconstruction tile_reconstructor(const std::string& master, const std::stri
     if (!cfg.grid_size) cfg.grid_size = static_cast<int>(std::nearbyint(2.0 * rot_center)) + 1;
     cfg.exposure_arc = 0.0;
     cfg.sharpness_weighting.clear();
-    cfg.rolling_shutter = rad_per_row / (std::fabs(member(L, "step_deg").number) * (M_PI / 180.0)) * (rows - 1);
+    cfg.rolling_shutter = rad_per_row / (step_deg * (M_PI / 180.0)) * (rows - 1);
     std::vector<ScanData> scans;
     scans.push_back(std::move(d));
     out.reconstructor = std::make_shared<SliceReconstructor>(std::move(scans), cfg);

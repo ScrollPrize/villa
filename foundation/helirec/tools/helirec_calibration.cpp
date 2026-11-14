@@ -3,7 +3,7 @@
 //   helirec-calibration check-record <scan.h5> [<more scans.h5> ...] [--no-frames] [--checks LIST] [--out DIR]
 //                                    [--inventory DIR] [--json FILE] [--threads N] [--frames N] [--rows N] [--blocks N]
 //                                    [--position-target PX] [--radius PX] [--device cpu|cuda|auto]
-//   helirec-calibration geometry <scan.h5> [<more scans.h5> ...] --out FILE [--row-time-us US] [--order N] [--patch N]
+//   helirec-calibration geometry <scan.h5> [<more scans.h5> ...] --out FILE [--row-time-us US] [--order N] [--patch N] [--reduce N] [--projections STORE.zarr]
 //                                [--threads N] [--device cpu|cuda|auto]
 //   helirec-calibration intensity <scan> <companion> --geometry FILE --out DIR [--no-progress]
 //   helirec-calibration selftest [--device cpu|cuda|auto]
@@ -60,7 +60,7 @@ int usage() {
                  "                                   [--out DIR] [--inventory DIR] [--json FILE] [--threads N] [--frames N] [--rows N] [--blocks N]\n"
                  "                                   [--columns N (0: full)] [--column-fraction F (0..1)]\n"
                  "                                   [--position-target PX (default 0.01)] [--radius PX] [--inventory-step N] [--device cpu|cuda|auto]\n"
-                 "  helirec-calibration geometry <scan.h5> [<more scans.h5> ...] --out FILE [--row-time-us US] [--order N] [--patch N]\n"
+                 "  helirec-calibration geometry <scan.h5> [<more scans.h5> ...] --out FILE [--row-time-us US] [--order N] [--patch N] [--reduce N] [--projections STORE.zarr]\n"
                  "                               [--threads N] [--device cpu|cuda|auto]\n"
                  "  helirec-calibration intensity <scan> <companion> --geometry FILE --out DIR [--no-progress]\n"
                  "  helirec-calibration selftest [--device cpu|cuda|auto]\n");
@@ -83,6 +83,8 @@ int run_geometry_calibration(int argc, char** argv) {
         else if (a == "--row-time-us") opt.row_time = std::stod(value()) * 1e-6;
         else if (a == "--order") opt.order = std::stoi(value());
         else if (a == "--patch") opt.patch = std::stoi(value());
+        else if (a == "--reduce") opt.reduce = std::stoi(value());
+        else if (a == "--projections") opt.projections = value();
         else if (a == "--threads") opt.threads = std::stoi(value());
         else if (a == "--device") device = value();
         else if (!a.empty() && a[0] == '-') throw Error("unknown option " + a);

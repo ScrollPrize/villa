@@ -1,7 +1,8 @@
-"""Download a physical Paris4 slab as uncompressed, reduced detector frames.
+"""Download a physical BLISS slab as reduced detector frames: uncompressed HDF5 files in the
+output folder, or (``--zarr STORE``) straight into a level of a projection store, compressed.
 
 Run with ``python -m helirec.download_projections --help``. Image reads, HTJ2K
-resolution selection, slab planning and HDF5 frame writes use the C++ core.
+resolution selection, slab planning and the HDF5 and Zarr frame writes use the C++ core.
 Python schedules files, preserves metadata and handles logging and restart.
 """
 from __future__ import annotations
@@ -83,10 +84,28 @@ def _source(job):
     raise FileNotFoundError(f"No source file for {job['tile']} {job['relative_file']}: {job['sources']}")
 
 
+def _levels(job):
+    return job.get("reductions", [job["reduce"]])
+
+
+def _level_job(job, reduce):
+    level = {k: v for k, v in job.items() if k != "reductions"}
+    level["reduce"] = reduce
+    level["bytes"] = job["count"] * (job["rows"] >> reduce) * (job["cols"] >> reduce) * np.dtype(job["dtype"]).itemsize
+    return level
+
+
 def build_plan(args, log):
     settings = dict(format_version=FORMAT, tiles=args.tiles, slices=args.slices, reduce=args.reduce,
                     center_mm=args.center_mm, context_turns=args.context_turns,
                     source_root=str(args.source_root), local_root=str(args.local_root))
+    reductions = getattr(args, "reductions", [args.reduce])
+    if len(reductions) > 1:
+        settings["reductions"] = reductions
+    if getattr(args, "scans", None):
+        settings["scans"] = args.scans
+    if getattr(args, "zarr", None):
+        settings["zarr"] = str(args.zarr)
     plan_path = args.output / "plan.json"
     if plan_path.exists():
         plan = json.loads(plan_path.read_text())
@@ -95,11 +114,11 @@ def build_plan(args, log):
         log.info("Resuming existing plan: %d files", len(plan["jobs"]))
         return plan
     jobs, tiles = [], []
-    factor = 1 << args.reduce
+    factor = 1 << max(reductions)
     link = _remote(args)
     for number, tile in enumerate(args.tiles, 1):
         log.info("Planning tile %d/%d: %s", number, len(args.tiles), tile)
-        label = f"1.129um_mosaic_PHerc_Paris4_ROI-1_{tile}"
+        label = tile if getattr(args, "scans", None) else f"1.129um_mosaic_PHerc_Paris4_ROI-1_{tile}"
         relative = Path(label) / (label + "_0001")
         local, remote = args.local_root / relative, args.source_root / relative
         master_name = label + "_0001.h5"
@@ -130,7 +149,7 @@ def build_plan(args, log):
             raise ValueError(f"{tile}: unsupported wavelet chunk height {chunk_rows}")
         summary = {k: v for k, v in p.items() if k not in ("series", "master")}
         summary.update(tile=tile, source_master=str(source_master), source_master_sha256=master_sha,
-                       stored_shape=[p["rows"], p["cols"]], output_shape=[p["rows"] // factor, p["cols"] // factor],
+                       stored_shape=[p["rows"], p["cols"]], output_shape=[p["rows"] >> args.reduce, p["cols"] >> args.reduce],
                        projection_first=projection["first"], projection_count=projection["count"], chunk_rows=chunk_rows)
         tiles.append(summary)
         for series in p["series"]:
@@ -147,7 +166,9 @@ def build_plan(args, log):
                            first=piece["first"], source_first=piece["source_first"], count=piece["count"],
                            rows=p["rows"], cols=p["cols"], reduce=args.reduce, chunk_rows=chunk_rows,
                            dtype=dtype, source_master_sha256=master_sha, metadata=metadata)
-                job["bytes"] = job["count"] * (job["rows"] // factor) * (job["cols"] // factor) * np.dtype(dtype).itemsize
+                if len(reductions) > 1:
+                    job["reductions"] = reductions
+                job["bytes"] = sum(_level_job(job, r)["bytes"] for r in reductions)
                 job["id"] = hashlib.sha256(_json_bytes(job)).hexdigest()
                 jobs.append(job)
         log.info("%s: projection frames [%d, %d), %.6f mm slab, %.4f mm context each side",
@@ -162,7 +183,38 @@ def build_plan(args, log):
     return plan
 
 
-def _complete(path, job):
+def _scan_group(store, job):
+    return str(Path(store) / job["tile"] / Path(job["relative_file"]).parent.name)
+
+
+def _declare_store(plan, args, log):
+    """The scan groups of the plan in the store, with this plan's level recorded as stored. The frames must be the
+    ones the store already holds for a scan (the C++ side refuses others). Done here, once, before the workers."""
+    tiles = {t["tile"]: t for t in plan["tiles"]}
+    scans = {}
+    for job in plan["jobs"]:
+        scans.setdefault(_scan_group(args.zarr, job), []).append(job)
+    for group, jobs in scans.items():
+        jobs = sorted(jobs, key=lambda j: j["first"])
+        first, end = jobs[0]["first"], jobs[-1]["first"] + jobs[-1]["count"]
+        values = {}
+        for job in jobs:
+            for key, v in job["metadata"].items():
+                values.setdefault(key, [None] * (end - first))[job["first"] - first:job["first"] - first + job["count"]] = v
+        tile = tiles[jobs[0]["tile"]]
+        spec = dict(tile=jobs[0]["tile"], scan=Path(group).name, role=jobs[0]["role"], rows=jobs[0]["rows"], cols=jobs[0]["cols"],
+                    frame_first=first, frames=end - first,
+                    tile_attributes={k: v for k, v in tile.items() if k not in ("source_master", "output_shape", "slices")},
+                    files=[dict(file=Path(j["relative_file"]).name, source_first=j["source_first"], first=j["first"], count=j["count"]) for j in jobs],
+                    frame_values=values)
+        for reduce in getattr(args, "reductions", [args.reduce]):
+            _core.declare_projection_store_scan(str(args.zarr), json.dumps(spec), reduce, args.remote or str(args.source_root), jobs[0]["dtype"])
+    log.info("Store %s: %d scan groups declare levels %s", args.zarr, len(scans), getattr(args, "reductions", [args.reduce]))
+
+
+def _complete(path, job, store=None):
+    if store is not None:  # a file is one write of its shard
+        return all(_core.ProjectionStoreWriter(_scan_group(store, job), r).holds(job["first"], job["count"]) for r in _levels(job))
     if not path.exists():
         return False
     try:
@@ -179,15 +231,62 @@ def _complete(path, job):
     raise ValueError(f"Existing output is invalid or belongs to another plan; refusing to overwrite {path}")
 
 
-def _download_once(job, output, threads, batch, events, local=None, fetched=None, origin=None):
-    """local: a (partial) local copy of the source to read instead; fetched: its byte ranges that hold data."""
+class _StoreFrames:
+    """The frames of one file, held until they are all there and then written as one shard of the store."""
+
+    def __init__(self, store, job, rows, cols):
+        self.writer, self.first = _core.ProjectionStoreWriter(_scan_group(store, job), job["reduce"]), job["first"]
+        self.data = np.empty((job["count"], rows, cols), job["dtype"])
+
+    def write(self, first, data):
+        self.data[first:first + len(data)] = data
+
+    def close(self):
+        pass
+
+
+class _LevelEvents:
+    """Report a level's progress against the total output bytes of its source-file job."""
+    def __init__(self, events, job, before, size):
+        self.events, self.job, self.before, self.size = events, job, before, size
+
+    def put(self, event):
+        kind, jid, count, read = event
+        if kind == "progress":
+            count = (self.before * self.job["count"] + self.size * count) // self.job["bytes"]
+        self.events.put((kind, jid, count, read))
+
+
+def _download_once(job, output, threads, batch, events, local=None, fetched=None, origin=None, store=None):
+    if len(_levels(job)) == 1:
+        return _download_level(job, output, threads, batch, events, local, fetched, origin, store)
+    if store is None:
+        raise ValueError("multiple reductions require --zarr")
+    pending = [j for r in _levels(job) if not _complete(Path(output) / job["output"], j := _level_job(job, r), store)]
+    if not pending:
+        return dict(bytes_requested=0, resumed=True)
+    source = local if local is not None else _source(job)
+    before = job["bytes"] - sum(j["bytes"] for j in pending)
+    requested, start = 0, time.monotonic()
+    for level in pending:
+        progress = _LevelEvents(events, job, before, level["bytes"])
+        result = _download_level(level, output, threads, batch, progress, source, fetched, origin, store)
+        requested += result["bytes_requested"]
+        before += level["bytes"]
+    return dict(bytes_requested=requested, seconds=time.monotonic() - start, resumed=False)
+
+
+def _download_level(job, output, threads, batch, events, local=None, fetched=None, origin=None, store=None):
+    """local: a (partial) local copy of the source to read instead; fetched: its byte ranges that hold data;
+    store: the projection store the frames go into instead of an HDF5 file."""
     from .calibration import at_resolution
     path = Path(output) / job["output"]
-    if _complete(path, job):
+    if _complete(path, job, store):
         return dict(bytes_requested=0, resumed=True)
-    path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".partial")
-    tmp.unlink(missing_ok=True)  # only this downloader's unpublished temporary file
+    if store is None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp.unlink(missing_ok=True)  # only this downloader's unpublished temporary file
     source = local if local is not None else _source(job)
     projection = job["role"] == "projection"
     reader = _core.RawReader([source], job["dataset"], job["rows"], job["cols"],
@@ -200,7 +299,8 @@ def _download_once(job, output, threads, batch, events, local=None, fetched=None
     if job["source_first"] + job["count"] > storage["frames"]:
         raise ValueError(f"Source has fewer frames than the master records: {source}")
     rows, cols = job["rows"] >> job["reduce"], job["cols"] >> job["reduce"]
-    writer = _core.UncompressedFrameWriter(str(tmp), job["dataset"], job["count"], rows, cols, job["dtype"])
+    writer = (_core.UncompressedFrameWriter(str(tmp), job["dataset"], job["count"], rows, cols, job["dtype"]) if store is None
+              else _StoreFrames(store, job, rows, cols))
     digest, start, last = hashlib.sha256(), time.monotonic(), 0.0
     try:
         for first in range(0, job["count"], batch if projection else 1):
@@ -217,6 +317,9 @@ def _download_once(job, output, threads, batch, events, local=None, fetched=None
                 last = now
     finally:
         writer.close()
+    if store is not None:  # the whole shard at once, read back and compared
+        writer.writer.write(writer.first, writer.data)
+        return dict(bytes_requested=reader.bytes_read, seconds=time.monotonic() - start, resumed=False)
     with h5py.File(tmp, "r+") as f:
         f.attrs.update(complete=True, job_sha256=job["id"], data_sha256=digest.hexdigest(), source=origin or source,
                        source_master_sha256=job["source_master_sha256"], original_frame_first=job["first"],
@@ -364,34 +467,37 @@ def _fetch(sftp, remote_path, local_path, dataset, head):
             os.close(out)
 
 
-def _download_remote(job, output, threads, batch, events, remote):
-    if _complete(Path(output) / job["output"], job):
+def _download_remote(job, output, threads, batch, events, remote, store=None):
+    if _complete(Path(output) / job["output"], job, store):
         return dict(bytes_requested=0, resumed=True)
     remote_path, origin = _remote_path(remote, job["sources"][-1])
     work = Path(output) / ".remote"
     work.mkdir(parents=True, exist_ok=True)
-    for head in (_HEADS[job["reduce"]] if job["role"] == "projection" else (None,)):
+    pending = [r for r in _levels(job) if not _complete(Path(output) / job["output"], _level_job(job, r), store)]
+    transferred_total = 0
+    for head in (_HEADS[min(pending)] if job["role"] == "projection" else (None,)):
         with tempfile.TemporaryDirectory(prefix="source-", dir=work) as tmp:
             local = str(Path(tmp) / "source.h5")
             fetched, transferred = _fetch(_connect(remote["spec"]), remote_path, local, job["dataset"], head)
+            transferred_total += transferred
             try:
-                result = _download_once(job, output, threads, batch, events, local=local, fetched=fetched, origin=origin)
+                result = _download_once(job, output, threads, batch, events, local=local, fetched=fetched, origin=origin, store=store)
             except Exception as e:
                 if head is None:
                     raise
                 # bytes beyond the fetched ones (or unread metadata): fetch more of each chunk
                 events.put(("retry", job["id"], 0, f"{head} bytes per chunk were not enough ({e}); fetching more"))
                 continue
-            result["bytes_transferred"] = transferred
+            result["bytes_transferred"] = transferred_total
             return result
 
 
-def _download(job, output, threads, batch, retries, events, remote=None):
+def _download(job, output, threads, batch, retries, events, remote=None, store=None):
     for attempt in range(retries + 1):
         try:
             if remote is not None and not Path(job["sources"][0]).is_file():
-                return _download_remote(job, output, threads, batch, events, remote)
-            return _download_once(job, output, threads, batch, events)
+                return _download_remote(job, output, threads, batch, events, remote, store)
+            return _download_once(job, output, threads, batch, events, store=store)
         except Exception as e:
             if attempt == retries:
                 raise
@@ -440,17 +546,26 @@ def _duration(seconds):
 
 def run_download(plan, args, log):
     jobs = plan["jobs"]
-    done, todo = [], []
+    store = str(args.zarr) if getattr(args, "zarr", None) else None
+    if store:
+        _declare_store(plan, args, log)
+    done, todo, missing_bytes = [], [], {}
     for k, job in enumerate(jobs):
-        (done if _complete(args.output / job["output"], job) else todo).append(job)
+        missing_bytes[job["id"]] = sum(level["bytes"] for r in _levels(job)
+            if not _complete(args.output / job["output"], level := _level_job(job, r), store))
+        (todo if missing_bytes[job["id"]] else done).append(job)
         if k and k % 500 == 0:
             log.info("Checking existing outputs: %d/%d files", k, len(jobs))
-    completed = sum(j["bytes"] for j in done)
+    completed = plan["total_bytes"] - sum(missing_bytes.values())
     initial = completed
     remaining = plan["total_bytes"] - completed
-    free = shutil.disk_usage(args.output).free
-    if free < remaining + (5 << 30):
-        raise OSError(f"Need {remaining / 2**30:.1f} GiB plus 5 GiB free; available {free / 2**30:.1f} GiB")
+    if args.max_files:  # only what this run writes
+        remaining = sum(missing_bytes[j["id"]] for j in todo[:args.max_files])
+    free = shutil.disk_usage(args.zarr if store else args.output).free
+    # in the store the frames are compressed: 1.3x on Paris4 frames (bitshuffle + lz4), darks and flats less
+    needed = remaining / 1.25 if store else remaining
+    if free < needed + (5 << 30):
+        raise OSError(f"Need {needed / 2**30:.1f} GiB plus 5 GiB free; available {free / 2**30:.1f} GiB")
     total_done, failed = len(done), []
     log.info("Plan: %d tiles, %d files, %.2f GiB output; already complete %d files (%.2f GiB)",
              len(plan["tiles"]), len(jobs), plan["total_bytes"] / 2**30, total_done, completed / 2**30)
@@ -467,7 +582,7 @@ def run_download(plan, args, log):
         def submit():
             job = next(iterator, None)
             if job is not None:
-                active[pool.submit(_download, job, str(args.output), args.threads, args.batch_frames, args.retries, events, remote)] = job
+                active[pool.submit(_download, job, str(args.output), args.threads, args.batch_frames, args.retries, events, remote, store)] = job
                 status[job["id"]] = (0, 0)
                 log.info("START %s %s (%s, %d frames)", job["tile"], job["relative_file"], job["role"], job["count"])
         for _ in range(args.workers):
@@ -496,13 +611,14 @@ def run_download(plan, args, log):
                     log.error("FAILED %s: %s", job["output"], e)
                 else:
                     total_done += 1
-                    completed += job["bytes"]
+                    completed += missing_bytes[job["id"]]
                     read_bytes += result["bytes_requested"]
                     log.info("DONE %s %s — %d/%d files", job["tile"], job["relative_file"], total_done, len(jobs))
                 submit()
             now = time.monotonic()
             if now - last_log >= args.log_interval or not active:
-                in_flight = sum(j["bytes"] * status[j["id"]][0] / j["count"] for j in active.values())
+                in_flight = sum(max(0, j["bytes"] * status[j["id"]][0] / j["count"]
+                                   - (j["bytes"] - missing_bytes[j["id"]])) for j in active.values())
                 held = completed + in_flight
                 rate = (held - initial) / max(now - start, 1e-6)
                 eta = (plan["total_bytes"] - held) / rate if rate else float("inf")
@@ -514,7 +630,7 @@ def run_download(plan, args, log):
                              output_bytes=completed, planned_bytes=plan["total_bytes"], requested_bytes_this_run=read_bytes,
                              elapsed_seconds=now-start, failed=failed, finished=False))
                 last_log = now
-    for tile in args.tiles:
+    for tile in ([] if store else args.tiles):  # (the store needs no index: its scan groups are whole arrays)
         pieces = [j for j in jobs if j["tile"] == tile]
         if all(_complete(args.output / j["output"], j) for j in pieces):
             _index_tile(args.output, tile, pieces)
@@ -533,21 +649,38 @@ def main(argv=None):
     parser.add_argument("--source-root", type=Path, default=SOURCE)
     parser.add_argument("--local-root", type=Path, default=BASE / "RAW_DATA")
     parser.add_argument("--slices", type=int, default=256, help="slab thickness in original-resolution Z slices")
-    parser.add_argument("--reduce", type=int, choices=[1, 2, 3], default=3)
+    parser.add_argument("--reduce", type=int, nargs="+", choices=[1, 2, 3], default=[3],
+                        help="resolution levels: 1=half, 2=quarter, 3=eighth; with --zarr, multiple levels share each source transfer")
     parser.add_argument("--center-mm", type=float, default=-256.0385, help="recorded motor-Z centre of the existing Paris4 ROI")
     parser.add_argument("--context-turns", type=float, default=1.5)
-    parser.add_argument("--tiles", nargs="+", choices=TILES, default=TILES)
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument("--tiles", nargs="+", choices=TILES, default=TILES)
+    selection.add_argument("--scans", nargs="+", help="acquisition folder names under the source root, instead of mosaic tiles; "
+                           "each must contain NAME_0001/NAME_0001.h5. Names also identify groups in the output store.")
     parser.add_argument("--workers", type=int, default=4, help="concurrent files, separate processes")
     parser.add_argument("--threads", type=int, default=2, help="C++ decoding threads per file")
     parser.add_argument("--batch-frames", type=int, default=8)
     parser.add_argument("--remote", help="rclone SFTP remote:path matching --source-root (e.g. esrf:/data/.../RAW_DATA): "
                         "read sources missing locally over SFTP, fetching only the bytes the reduced decode reads; "
                         "host, user and password come from the rclone config. Nothing under --source-root is then read: it only names the files.")
+    parser.add_argument("--zarr", type=Path, help="a projection store (helirec-projections-zarr): write the frames into its level "
+                        "--reduce, compressed, instead of HDF5 files; --output then holds only the plan, the masters and the logs. "
+                        "A scan already in the store must cover the same frames (same --center-mm, --slices, --context-turns).")
     parser.add_argument("--retries", type=int, default=3)
     parser.add_argument("--log-interval", type=float, default=5)
     parser.add_argument("--plan-only", action="store_true", help="copy metadata and report the plan without reading projection pixels")
     parser.add_argument("--max-files", type=int, default=0, help="stop after this many pending files; 0 means all")
     args = parser.parse_args(argv)
+    if len(set(args.reduce)) != len(args.reduce):
+        parser.error("duplicate reduction levels")
+    args.reductions = sorted(args.reduce)
+    args.reduce = args.reductions[0]
+    if len(args.reductions) > 1 and not args.zarr:
+        parser.error("multiple reduction levels require --zarr")
+    if args.scans:
+        if any(name in (".", "..") or "/" in name or "\\" in name for name in args.scans):
+            parser.error("--scans requires folder names, not paths")
+        args.tiles = args.scans
     if args.remote:
         try:
             import paramiko  # noqa: F401
@@ -564,6 +697,8 @@ def main(argv=None):
     args.output = args.output.resolve()
     args.local_root = args.local_root.resolve()
     args.source_root = args.source_root.resolve()
+    if args.zarr:
+        args.zarr = args.zarr.resolve()
     args.output.mkdir(parents=True, exist_ok=True)
     import fcntl  # supported on the project's Ubuntu and macOS platforms
     with (args.output / ".download.lock").open("a") as lock:
@@ -578,8 +713,8 @@ def main(argv=None):
             handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
             log.addHandler(handler)
         try:
-            log.info("Starting slab: %d original Z slices (%.6f mm at 1.129 µm), detector scale %.3f",
-                     args.slices, args.slices * 0.001129, 2.0 ** -args.reduce)
+            log.info("Starting slab: %d original Z slices, detector scales %s; physical thickness comes from each scan's pixel size",
+                     args.slices, [2.0 ** -r for r in args.reductions])
             plan = build_plan(args, log)
             log.info("Plan ready: %d tiles, %d files, %.2f GB (%.2f GiB) uncompressed payload",
                      len(plan["tiles"]), len(plan["jobs"]), plan["total_bytes"] / 1e9, plan["total_bytes"] / 2**30)

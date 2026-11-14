@@ -1,5 +1,6 @@
 """Slab selection, uncompressed exports, restart safety and frame metadata."""
 import hashlib
+import json
 import logging
 import os
 import queue
@@ -140,6 +141,49 @@ def test_export_resume_checksum_and_index(tmp_path, role):
         download._download_once(job, out, 1, 1, events)
 
 
+@pytest.mark.skipif(not _core.htj2k_float_frames_supported(), reason="HELIREC_OPENJPH=OFF")
+@pytest.mark.parametrize("role", ["projection", "flat"])
+def test_export_into_a_projection_store(tmp_path, role):
+    """--zarr: the same frames, as a level of the store instead of an HDF5 file, and no file is left behind"""
+    source, job = _job(tmp_path, role)
+    if role == "projection":
+        _write(source, _chunk((DATA / "unsigned16_97.j2k").read_bytes(), 256, 256, sample_bytes=2),
+               rows=256, cols=256, frames=3, dtype="uint16")
+        rd = _core.RawReader([str(source)], "data", 256, 256, reduce=3, decoder="openjph", selective=False)
+        want = rd.read_frames(np.zeros(2, np.int32), np.array([1, 2], np.int32), n_threads=1)
+    else:
+        full = np.random.default_rng(10).integers(20000, 50000, (3, job["rows"], 256), dtype=np.uint16)
+        with h5py.File(source, "w") as f:
+            f.create_dataset("data", data=full, chunks=(1, job["rows"], 256))
+        want = at_resolution(full[1:], 3, 256)
+    out, store = tmp_path / "output", tmp_path / "projections.zarr"
+    plan = dict(jobs=[job], tiles=[dict(tile="T0-01", label="T0-01", rows=job["rows"], cols=256, chunk_rows=256, source_master="/somewhere")])
+    args = SimpleNamespace(zarr=store, reduce=3, remote=None, source_root=tmp_path)
+    log = logging.getLogger("test")
+    download._declare_store(plan, args, log)
+    assert not download._complete(out / job["output"], job, str(store))
+    events = queue.Queue()
+    result = download._download_once(job, out, 1, 1, events, store=str(store))
+    assert result["bytes_requested"] > 0 and not result["resumed"] and not out.exists()
+    group = str(store / "T0-01" / "scan0005")
+    reader = _core.RawReader([group], "", job["rows"], 256, 3, dtype=job["dtype"])
+    np.testing.assert_array_equal(reader.read_frames(np.zeros(2, np.int32), np.arange(2, dtype=np.int32)), want)
+    attributes = json.loads((store / "T0-01" / "scan0005" / "zarr.json").read_text())["attributes"]["helirec"]
+    assert attributes["frame_first"] == 1200 and attributes["files"] == [dict(file="file.h5", source_first=1, first=1200, count=2)]
+    assert [level["stored"] for level in attributes["levels"]] == [False, False, False, True]
+    source.unlink()  # resuming needs no source reads, and declaring again keeps what is stored
+    download._declare_store(plan, args, log)
+    assert download._download_once(job, out, 1, 1, events, store=str(store)) == dict(bytes_requested=0, resumed=True)
+    # another level of the same frames joins; other frames of the scan are refused
+    half = dict(job, reduce=2)
+    download._declare_store(dict(plan, jobs=[half]), SimpleNamespace(zarr=store, reduce=2, remote=None, source_root=tmp_path), log)
+    attributes = json.loads((store / "T0-01" / "scan0005" / "zarr.json").read_text())["attributes"]["helirec"]
+    assert [level["stored"] for level in attributes["levels"]] == [False, False, True, True]
+    assert download._complete(out / job["output"], job, str(store)) and not download._complete(out / job["output"], half, str(store))
+    with pytest.raises(Exception, match="the store holds frames"):
+        download._declare_store(dict(plan, jobs=[dict(job, first=1300)]), args, log)
+
+
 def test_plan_settings_cannot_change_on_resume(tmp_path):
     args = SimpleNamespace(output=tmp_path, tiles=["T0-01"], slices=256, reduce=3, center_mm=-256.0385,
                            context_turns=1.5, source_root=tmp_path / "remote", local_root=tmp_path / "local")
@@ -152,8 +196,10 @@ class _FakeSFTP:
     """paramiko's SFTPClient as far as --remote uses it, over local files; counts bytes served."""
     def __init__(self):
         self.served = 0
+        self.opens = 0
 
     def open(self, path, mode):
+        self.opens += 1
         fake = self
         class File:
             def __init__(self):
@@ -224,9 +270,11 @@ def test_remote_export_equals_local_export(tmp_path, monkeypatch, role, heads):
     assert download._download(job, out, 1, 1, 0, events, remote)["resumed"]
 
 
-def test_plan_reads_master_and_sample_over_sftp(tmp_path, monkeypatch):
+@pytest.mark.parametrize("scan", [None, "2.4um_PHerc-Paris4_B_TA"])
+def test_plan_reads_master_and_sample_over_sftp(tmp_path, monkeypatch, scan):
     """--remote: the plan needs nothing under --source-root (an SFTP mount that is down must not stop it)."""
-    label = "1.129um_mosaic_PHerc_Paris4_ROI-1_T0-01"
+    label = scan or "1.129um_mosaic_PHerc_Paris4_ROI-1_T0-01"
+    tile = scan or "T0-01"
     served = tmp_path / "served" / label / (label + "_0001")
     served.mkdir(parents=True)
     master = _write_record(served, np.random.default_rng(0), name=label)
@@ -235,12 +283,111 @@ def test_plan_reads_master_and_sample_over_sftp(tmp_path, monkeypatch):
     monkeypatch.setattr(download, "_rclone_remote", lambda spec: ({}, str(tmp_path / "served")))
     out = tmp_path / "out"
     out.mkdir()
-    args = SimpleNamespace(output=out, tiles=["T0-01"], slices=4, reduce=1, center_mm=-11.6, context_turns=0,
+    args = SimpleNamespace(output=out, tiles=[tile], scans=[scan] if scan else None, slices=4, reduce=1, center_mm=-11.6, context_turns=0,
                            source_root=tmp_path / "mount_that_is_down", local_root=tmp_path / "local",
                            remote="esrf:/raw")
     # the synthetic frames are plain: the plan gets as far as refusing what the fetched sample file stores
     with pytest.raises(ValueError, match="expects the irreversible HTJ2K"):
         download.build_plan(args, logging.getLogger(__name__))
-    assert (out / "metadata/T0-01" / master.name).read_bytes() == master.read_bytes()
+    assert (out / "metadata" / tile / master.name).read_bytes() == master.read_bytes()
     assert sftp.served > master.stat().st_size  # the master and part of one sample file
     assert not list(out.glob("plan-*")) and not (tmp_path / "mount_that_is_down").exists()
+
+
+@pytest.mark.parametrize("options", [
+    ["--scans", "../scan"], ["--scans", "/scan"], ["--scans", ".."],
+    ["--scans", "scan", "scan"], ["--scans", "scan", "--tiles", "T0-01"],
+])
+def test_explicit_scan_selection_rejects_unsafe_or_ambiguous_names(options, tmp_path):
+    with pytest.raises(SystemExit) as error:
+        download.main(["--output", str(tmp_path / "output"), *options])
+    assert error.value.code == 2
+    assert not (tmp_path / "output").exists()
+
+
+@pytest.mark.parametrize("role", ["projection", "flat"])
+@pytest.mark.parametrize("existing", [None, 1, 2])
+def test_multiple_levels_share_remote_transfer_and_resume(tmp_path, monkeypatch, role, existing):
+    source, original = _job(tmp_path, role)
+    if role == "projection":
+        _projection_source(source)
+    else:
+        full = np.random.default_rng(10).integers(20000, 50000, (3, original["rows"], 256), dtype=np.uint16)
+        with h5py.File(source, "w") as f:
+            f.create_dataset("data", data=full, chunks=(1, original["rows"], 256))
+    job = dict(original, reduce=1, reductions=[1, 2])
+    job["bytes"] = sum(download._level_job(job, r)["bytes"] for r in job["reductions"])
+    out, store = tmp_path / "output", tmp_path / "projections.zarr"
+    plan = dict(jobs=[job], tiles=[dict(tile=job["tile"], chunk_rows=job["chunk_rows"])])
+    args = SimpleNamespace(zarr=store, reduce=1, reductions=[1, 2], remote=None, source_root=tmp_path)
+    download._declare_store(plan, args, logging.getLogger(__name__))
+    if existing:
+        download._download_once(download._level_job(job, existing), out, 1, 1, queue.Queue(), store=str(store))
+    sftp = _FakeSFTP()
+    monkeypatch.setattr(download, "_connect", lambda spec: sftp)
+    fetched_heads = []
+    fetch = download._fetch
+    def track_fetch(*args):
+        fetched_heads.append(args[-1])
+        return fetch(*args)
+    monkeypatch.setattr(download, "_fetch", track_fetch)
+    events = queue.Queue()
+    remote = dict(spec="esrf:/raw", path=str(tmp_path), source_root=str(tmp_path))
+    result = download._download(job, out, 1, 1, 0, events, remote, str(store))
+    assert not result["resumed"] and sftp.opens == 1
+    assert result["bytes_transferred"] == sftp.served
+    finest_missing = 2 if existing == 1 else 1
+    assert fetched_heads == [download._HEADS[finest_missing][0] if role == "projection" else None]
+    for reduce in [1, 2]:
+        if role == "projection":
+            reader = _core.RawReader([str(source)], "data", job["rows"], job["cols"], reduce, decoder="openjph")
+            want = reader.read_frames(np.zeros(2, np.int32), np.array([1, 2], np.int32), n_threads=1)
+        else:
+            want = at_resolution(full[1:], reduce, job["chunk_rows"])
+        reader = _core.RawReader([download._scan_group(store, job)], "", job["rows"], job["cols"], reduce, dtype=job["dtype"])
+        got = reader.read_frames(np.zeros(2, np.int32), np.arange(2, dtype=np.int32), n_threads=1)
+        np.testing.assert_array_equal(got, want)
+    progress = [event[2] for event in list(events.queue) if event[0] == "progress"]
+    assert progress == sorted(progress) and progress[-1] == job["count"]
+    source.unlink()
+    assert download._download(job, out, 1, 1, 0, events, remote, str(store))["resumed"]
+    assert sftp.opens == 1
+
+
+@pytest.mark.parametrize("options", [["--reduce", "1", "2"], ["--reduce", "1", "1", "--zarr", "unused"]])
+def test_multiple_level_cli_validation(options, tmp_path):
+    with pytest.raises(SystemExit) as error:
+        download.main(["--output", str(tmp_path / "output"), *options])
+    assert error.value.code == 2
+    assert not (tmp_path / "output").exists()
+
+
+def test_multilevel_plan_uses_native_pixel_size_and_counts_both_levels(tmp_path, monkeypatch):
+    label = "2.4um_PHerc-Paris4_B_TA"
+    source = tmp_path / "local" / label / (label + "_0001")
+    source.mkdir(parents=True)
+    master = _write_record(source, np.random.default_rng(0), name=label)
+    with h5py.File(master, "r+") as f:
+        f["1.1/technique/scan/sample_pixel_size"][()] = 2.4
+    # The synthetic record supplies real angles/heights and frame mappings; its plain pixels are irrelevant
+    # to planning. Codec/decoded-value coverage is in the multilevel transfer test above.
+    class Probe:
+        def __init__(self, *args, **kwargs): pass
+        def storage(self):
+            return dict(compressed=True, codec="JPEG 2000 (HTJ2K)", reversible=False, chunk_rows=16)
+    monkeypatch.setattr(download._core, "RawReader", Probe)
+    out = tmp_path / "output"
+    out.mkdir()
+    args = SimpleNamespace(output=out, tiles=[label], scans=[label], slices=4, reduce=1, reductions=[1, 2],
+                           center_mm=-11.6, context_turns=0, source_root=tmp_path / "missing",
+                           local_root=tmp_path / "local", remote=None, zarr=tmp_path / "projections.zarr")
+    plan = download.build_plan(args, logging.getLogger(__name__))
+    assert plan["tiles"][0]["thickness_mm"] == pytest.approx(4 * 0.0024)
+    assert plan["settings"]["reductions"] == [1, 2]
+    assert all(j["reductions"] == [1, 2] for j in plan["jobs"])
+    assert plan["total_bytes"] == sum(j["count"] * ((ROWS//2)*(COLS//2) + (ROWS//4)*(COLS//4))
+                                    * (2 if j["role"] == "projection" else 4) for j in plan["jobs"])
+    assert download.build_plan(args, logging.getLogger(__name__)) == plan
+    args.reductions = [1, 3]
+    with pytest.raises(ValueError, match="different plan"):
+        download.build_plan(args, logging.getLogger(__name__))

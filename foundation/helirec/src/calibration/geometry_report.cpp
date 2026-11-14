@@ -1,6 +1,8 @@
 // helirec/calibration/geometry_calibration.hpp: what a solution of the joint geometry model says beyond its
 // parameters (report), and which scans' reconstructions overlap (neighbours).
 #include <limits>
+#include <map>
+#include <tuple>
 
 #include "calibration/geometry_model.hpp"
 #include "calibration/util.hpp"
@@ -51,6 +53,10 @@ Json pair_of(const double* v) { return Json::list().add(num(v[0])).add(num(v[1])
 ScanReport::ScanReport() {
     for (int j = 0; j < 3; ++j) mean[j] = left[j] = once[j][0] = once[j][1] = twice[j][0] = twice[j][1] = kNaN;
     row_time = rows_apart = departure = departure_between_views = height_slope = height_slope_error = from_anchor = pitch = pitch_phase_deg = kNaN;
+}
+
+PairReport::PairReport() {
+    for (int j = 0; j < 3; ++j) mean[j] = left[j] = once[j][0] = once[j][1] = rms[j] = median[j] = kNaN;
 }
 
 Neighbours neighbours(const Acquisition& acq) {
@@ -164,6 +170,31 @@ GeometryReport report(const Acquisition& acq, const GeometrySolution& solution, 
         return o;
     };
     out.axis = over(axes), out.axis_slope = over(slopes), out.axial_scale = over(scales);
+    // one scan against another, per kind: what is left as a course of the angle
+    {
+        std::map<std::tuple<int, int, std::string>, std::vector<std::size_t>> groups;
+        for (std::size_t i = 0; i < comparisons.size(); ++i)
+            if (comparisons[i].a.scan != comparisons[i].b.scan) groups[{comparisons[i].a.scan, comparisons[i].b.scan, comparisons[i].kind}].push_back(i);
+        for (const auto& [key, members] : groups) {
+            PairReport r;
+            r.scan_a = std::get<0>(key), r.scan_b = std::get<1>(key), r.kind = std::get<2>(key);
+            r.n = members.size();
+            std::vector<double> one(r.n, 1.0), c1(r.n), s1(r.n), res[3];
+            for (std::size_t m = 0; m < r.n; ++m) {
+                const double th = ray_of(acq, solution.parameters, comparisons[members[m]].a).angle_deg * (kPi / 180.0);
+                c1[m] = std::cos(th), s1[m] = std::sin(th);
+                for (int j = 0; j < 3; ++j) res[j].push_back(solution.residual[members[m]][static_cast<std::size_t>(j)]);
+            }
+            for (int j = 0; j < 3; ++j) {
+                r.rms[j] = rms_of(res[j]), r.median[j] = median_of(res[j]);
+                std::vector<double> left;
+                const std::vector<double> x = regress({one, c1, s1}, res[j], &left);
+                if (x.empty()) continue;
+                r.mean[j] = x[0], r.once[j][0] = x[1], r.once[j][1] = x[2], r.left[j] = rms_of(left);
+            }
+            out.pairs.push_back(r);
+        }
+    }
     return out;
 }
 
@@ -193,8 +224,16 @@ std::string report_json(const Acquisition& acq, const GeometryReport& r) {
     Json edges = Json::list(), triangles = Json::list();
     for (const auto& e : r.neighbours.edges) edges.add(Json::list().add(Json::whole_number(e[0])).add(Json::whole_number(e[1])));
     for (const auto& t : r.neighbours.triangles) triangles.add(Json::list().add(Json::whole_number(t[0])).add(Json::whole_number(t[1])).add(Json::whole_number(t[2])));
+    Json pairs = Json::list();
+    for (const PairReport& p : r.pairs) {
+        const char* component[3] = {"frames", "rows", "columns"};
+        Json left = Json::dict();
+        for (int j = 0; j < 3; ++j)
+            left.set(component[j], Json::dict().set("rms", num(p.rms[j])).set("median", num(p.median[j])).set("mean", num(p.mean[j])).set("once", pair_of(p.once[j])).set("rms_after", num(p.left[j])));
+        pairs.add(Json::dict().set("kind", Json::of(p.kind)).set("scan_a", Json::whole_number(p.scan_a)).set("scan_b", Json::whole_number(p.scan_b)).set("n", Json::whole_number(static_cast<long long>(p.n))).set("left", left));
+    }
     Json out = Json::dict();
-    out.set("scans", scans);
+    out.set("scans", scans).set("pairs", pairs);
     out.set("over_scans", Json::dict().set("axis", over(r.axis)).set("axis_slope", over(r.axis_slope)).set("axial_scale", over(r.axial_scale)));
     out.set("edges", edges).set("triangles", triangles);
     return out.text();

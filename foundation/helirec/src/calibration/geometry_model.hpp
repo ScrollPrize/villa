@@ -22,8 +22,10 @@ inline double at_frame(const std::vector<double>& v, double f) {
 
 // What a sighting takes from the record: the stage's angle [rad] and height [rows] at the time its row was
 // exposed, the height the scan's axis column is counted from, and the detector's middle row.
+// per_depth: what the beam's divergence does between scans (Acquisition::per_depth; 0: left out), about the
+// detector's middle (mid_col, mid_row).
 struct At {
-    double th = 0, H = 0, H_mid = 0, mid_row = 0;
+    double th = 0, H = 0, H_mid = 0, mid_row = 0, mid_col = 0, per_depth = 0;
 };
 
 // The ideal position (X, Y) the stored pixel (c, v) looks along: the detector's map added, X = c + Eu(c, v),
@@ -40,9 +42,17 @@ void ideal_position(const T* map, const double* phi, int terms, double c, double
 //     detector [roll]        own [axis, axis_slope, axial_scale]        place [d0, d1, height]        stretch [height]
 //     stage [height once per turn: cos, sin; axis column twice per turn: cos, sin]        map [Eu's terms, Ev's terms]
 // (and per scan once [cos, sin], which is not of a ray: own_lift below)
+// The beam diverges: a scan whose sample sits at d on the rotation stage holds it d . (-sin th, cos th) px nearer
+// the source than the rotation axis, and what it records is magnified by that x per_depth about the detector's
+// middle against a sample on the axis. The position is taken back to that of the sample on the axis first.
 template <class T>
-void ray_of(const T* detector, const T* stage, const T* own, const T* place, const T* stretch, const At& at, const T& X, const T& Y, T& s, T& z) {
+void ray_of(const T* detector, const T* stage, const T* own, const T* place, const T* stretch, const At& at, const T& X_seen, const T& Y_seen, T& s, T& z) {
     const double c = std::cos(at.th), sn = std::sin(at.th);
+    T X = X_seen, Y = Y_seen;
+    if (at.per_depth != 0.0) {
+        const T nearer = at.per_depth * (place[1] * c - place[0] * sn);
+        X -= nearer * (X_seen - at.mid_col), Y -= nearer * (Y_seen - at.mid_row);
+    }
     const T axis = own[0] + own[1] * (at.H - at.H_mid) + stage[2] * (c * c - sn * sn) + stage[3] * (2.0 * sn * c);
     const T u = X - axis - detector[0] * (Y - at.mid_row);  // columns from the axis, the roll taken out
     s = u - (place[0] * c + place[1] * sn);
@@ -57,6 +67,42 @@ void ray_of(const T* detector, const T* stage, const T* own, const T* place, con
 template <class T>
 T own_lift(const T* once, const At& a, const At& b) {
     return once[0] * (std::cos(b.th) - std::cos(a.th)) + once[1] * (std::sin(b.th) - std::sin(a.th));
+}
+
+// What the pitch of the rotation axis towards the beam does to a ray: it climbs by the pitch per pixel of depth, so
+// a scan whose sample sits at d on the rotation stage records the ray through the sample's origin pitch x the
+// origin's depth higher, the depth being d . (-sin th, cos th). The rows by which the scan's sighting lies higher
+// for it. Between two scans at one angle the difference of the two is exact, at every depth of the sample; between
+// views half a turn apart it is not (own_lift above, and the note at the residual).
+template <class T>
+T pitch_lift(const T* pitch, const T* place, const At& at) {
+    return pitch[0] * (place[1] * std::cos(at.th) - place[0] * std::sin(at.th));
+}
+
+// A scan holds the sample turned by `turn` (x, y, z [rad], small) about the sample's origin at the height `about`:
+// the point p lies at p + turn x (p - origin). Of that a projection at the angle th holds exactly what is the same
+// at every depth along the ray: with along = turn . (-sin th, cos th), the tilt's part about the beam's direction
+// (the sample leaning across the beam), the ray recorded at (s, z) is the sample's ray at
+//     s - along (z - about),        z + along s.
+// The tilt's part about the direction across the beam moves the rows by the depth, which no ray holds, and the
+// spin is the same view further on in angle (the frames', which are not fitted): neither is here.
+template <class T>
+void turned_back(const T* turn, const At& at, double about, T& s, T& z) {
+    const T along = turn[1] * std::cos(at.th) - turn[0] * std::sin(at.th);
+    const T s_seen = s;
+    s -= along * (z - about);
+    z += along * s_seen;
+}
+
+// Where scan b alone reconstructs the point q of the sample against where scan a does: the difference of the two
+// scans' rigid motions there, D_b - D_a with D = (d, height) + rotation x q. q: x, y from the sample's origin, z
+// from the height the rotations are about. place [d0, d1, height], turn [x, y, z] (rad), as the solver holds them.
+template <class T>
+void lens_displacement(const T* place_a, const T* turn_a, const T* place_b, const T* turn_b, const double* q, T* moved) {
+    const T w[3] = {turn_b[0] - turn_a[0], turn_b[1] - turn_a[1], turn_b[2] - turn_a[2]};
+    moved[0] = place_b[0] - place_a[0] + w[1] * q[2] - w[2] * q[1];
+    moved[1] = place_b[1] - place_a[1] + w[2] * q[0] - w[0] * q[2];
+    moved[2] = place_b[2] - place_a[2] + w[0] * q[1] - w[1] * q[0];
 }
 
 }  // namespace helirec::calibration::geometry_calibration::model

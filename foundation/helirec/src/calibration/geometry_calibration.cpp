@@ -72,6 +72,10 @@ void add_lag(const std::vector<double>& a, const std::vector<double>& b, std::ve
     }
 }
 
+// the columns two profiles must have in common for a lag to count: 256 on a detector as stored, an eighth of the
+// width on a narrower one (frames read at a quarter leave the opposite views of a tile 150 columns)
+long least_in_common(int cols) { return cols >= 2048 ? 256 : std::max(32, cols / 8); }
+
 std::size_t argmax(const std::vector<double>& v) { return static_cast<std::size_t>(std::max_element(v.begin(), v.end()) - v.begin()); }
 
 std::vector<std::int64_t> whole(const std::vector<double>& v) {
@@ -205,7 +209,7 @@ CoarseAxis coarse_axis(Session& session, int scan, const StretchLayout& st, int 
         const std::vector<double> a = profile(session, scan, st.index, p, r0, band, cols);
         std::vector<double> b = profile(session, scan, st.index, p + N / 2, r0 + D, band, cols);
         std::reverse(b.begin(), b.end());
-        add_lag(a, b, cc, 256);
+        add_lag(a, b, cc, least_in_common(cols));
         ++pairs;
     }
     if (!pairs) return {};
@@ -213,12 +217,13 @@ CoarseAxis coarse_axis(Session& session, int scan, const StretchLayout& st, int 
     return {(cols - 1 - (static_cast<double>(k) - cols)) / 2.0, cc[k] / pairs};
 }
 
-// the widest window of a scan with its axis at `axis`: a power of two up to 512 inside the strip its opposite
-// views share, with room for the cut's margins; 0: none
+// the widest window of a scan with its axis at `axis`: a power of two from 32 to 512 inside the strip its opposite
+// views share, with room for the cut's margins (B's block takes up to 32 columns on either side, and the windows
+// keep 40 from the strip's ends); 0: none
 int window_width(double axis, int cols) {
     const double strip = 2.0 * std::min(axis, cols - 1 - axis);
-    if (strip < 128 + 96) return 0;
-    return std::min(512, static_cast<int>(std::pow(2.0, std::floor(std::log2(strip - 96)))));
+    if (strip < 32 + 84) return 0;
+    return std::min(512, static_cast<int>(std::pow(2.0, std::floor(std::log2(strip - 84)))));
 }
 
 // the first columns of A's windows of width W whose mirror image about `axis` lies on the detector with a margin:
@@ -275,7 +280,7 @@ CoarseMove coarse_move(Session& session, const Acquisition& acq, int j, int k) {
                 (r0 < 0 || std::abs(r - (rows - band) / 2) < std::abs(r0 - (rows - band) / 2)))
                 r0 = r;
         if (r0 < 0) continue;
-        add_lag(profile(session, j, sa->index, p, r0, band, cols), profile(session, k, sb->index, p, r0, band, cols), cc, 256);
+        add_lag(profile(session, j, sa->index, p, r0, band, cols), profile(session, k, sb->index, p, r0, band, cols), cc, least_in_common(cols));
         ++pairs;
     }
     if (!pairs) return {};
@@ -402,7 +407,7 @@ Acquisition read_acquisition(Session& session, Device device, const Log& log) {
             std::vector<ViewRequest> reqs;
             if (!windows.empty() && helix->end - helix->first > N / 2 + 256)
                 for (const std::int64_t p : whole(linspace(static_cast<double>(helix->first + 64), static_cast<double>(helix->end - N / 2 - 128), 3)))
-                    reqs.push_back(opposite_request(*helix, k, p, N, likely.axis, W, windows[windows.size() / 2], 256, -1, acq.fan));
+                    reqs.push_back(opposite_request(*helix, k, p, N, likely.axis, W, windows[windows.size() / 2], std::min(256, rows / 4), -1, acq.fan));
             if (!reqs.empty()) {
                 found = row_sense(session, reqs, device);
                 sense = found.sign;
@@ -515,7 +520,8 @@ std::string acquisition_json(const Acquisition& acq) {
     }
     Json out = Json::dict();
     out.set("rows", count(acq.rows)).set("cols", count(acq.cols)).set("frames_per_turn", count(acq.per_turn)).set("pixel_um", num(acq.pixel_um)).set("row_sign", num(acq.row_sign));
-    out.set("row_time", num(acq.row_time)).set("frame_period_s", num(acq.period_s)).set("fan", num(acq.fan)).set("window_columns", count(acq.width)).set("anchor", count(acq.anchor)).set("scans", scans);
+    out.set("row_time", num(acq.row_time)).set("frame_period_s", num(acq.period_s)).set("fan", num(acq.fan)).set("per_depth", num(acq.per_depth)).set("window_columns", count(acq.width));
+    out.set("anchor", count(acq.anchor)).set("scans", scans);
     return out.text();
 }
 
@@ -659,6 +665,130 @@ std::vector<Planned> plan(const Acquisition& acq, const PlanCounts& n) {
     return out;
 }
 
+std::vector<Planned> plan_tiles(const Acquisition& acq, const Parameters& places, const std::vector<std::array<int, 2>>& pairs, const PlanCounts& n) {
+    const int R = acq.rows, C = acq.cols, N = acq.per_turn, W = acq.width, S = static_cast<int>(acq.scans.size());
+    const int nrows = std::min(256, R / 4);
+    if (places.scans.size() != acq.scans.size()) throw Error("geometry calibration: the places and the acquisition differ in their scans");
+    if (n.tile_positions < 2 || n.tile_angles < 1 || n.tile_bands < 1 || n.tile_windows < 1) throw Error("geometry calibration: a plan of tiles needs two positions, an angle per turn, a band and a window");
+    std::vector<Planned> out;
+    for (const auto& pair : pairs) {
+        const int j = pair[0], k = pair[1];
+        if (j < 0 || k < 0 || j >= S || k >= S || j == k) throw Error("geometry calibration: a pair of tiles names two of the acquisition's scans");
+        const ScanLayout& A = acq.scans[static_cast<std::size_t>(j)];
+        const ScanLayout& B = acq.scans[static_cast<std::size_t>(k)];
+        const ScanParameters& pa = places.scans[static_cast<std::size_t>(j)];
+        const ScanParameters& pb = places.scans[static_cast<std::size_t>(k)];
+        int ha = -1, hb = -1;
+        for (int a = 0; a < static_cast<int>(A.stretches.size()); ++a)
+            if (A.stretches[static_cast<std::size_t>(a)].helix) ha = a;
+        for (int b = 0; b < static_cast<int>(B.stretches.size()); ++b)
+            if (B.stretches[static_cast<std::size_t>(b)].helix) hb = b;
+        if (ha < 0 || hb < 0) continue;
+        const StretchLayout& sa = A.stretches[static_cast<std::size_t>(ha)];
+        const StretchLayout& sb = B.stretches[static_cast<std::size_t>(hb)];
+        // where B holds A's content: d_k - d_j as a length and a direction, the heights' difference beyond the record's
+        const double d0 = pb.d[0] - pa.d[0], d1 = pb.d[1] - pa.d[1], apart = std::hypot(d0, d1);
+        const double phase_deg = std::atan2(d1, d0) * (180.0 / kPi);
+        // the rows by which B holds, in its frame q, what A holds in its frame p: the model's, without what a turn does
+        const auto higher = [&](std::int64_t q, std::size_t p) {
+            return static_cast<int>(std::lround(pb.height + (1.0 + pb.axial_scale) * sb.course.rows[static_cast<std::size_t>(q)] - pa.height - (1.0 + pa.axial_scale) * sa.course.rows[p]));
+        };
+        // the offset's course over a block's frames (32 and the registration's margins), which the cut must hold
+        const double step_deg = sa.course.angle_deg[static_cast<std::size_t>(sa.first + 1)] - sa.course.angle_deg[static_cast<std::size_t>(sa.first)];
+        if (step_deg == 0.0) continue;
+        const double step = std::fabs(step_deg) * (kPi / 180.0);
+        const int edge = 13 + static_cast<int>(std::ceil(apart * step * 30.0));
+        // B's frame less A's at equal angle, by the records (Session::measure finds the frames themselves from them)
+        const std::int64_t shift = static_cast<std::int64_t>(std::llround((sa.course.angle_deg[static_cast<std::size_t>(sa.first)] - sb.course.angle_deg[static_cast<std::size_t>(sb.first)]) / step_deg)) +
+                                   (sb.first - sa.first);
+        const std::int64_t p_lo = sa.first + 16, p_hi = sa.end - 80;
+        if (p_hi < p_lo) continue;
+        // positions evenly around the turn, as the opposite views' (the angles in turn along the helix)
+        std::vector<std::int64_t> positions;
+        {
+            const double base = static_cast<double>(N) / n.tile_angles, span = static_cast<double>(p_hi - p_lo);
+            const int count = std::max(n.tile_angles, n.tile_positions - n.tile_positions % n.tile_angles);
+            for (int i = 0; i < count; ++i) {
+                const double at_angle = (i % n.tile_angles) * base;
+                double at = N * std::round((i * span / std::max(1, count - 1) - at_angle) / N) + at_angle;
+                if (at < 0) at += N;
+                if (at > span) at -= N;
+                if (at >= 0 && at <= span) positions.push_back(p_lo + static_cast<std::int64_t>(std::llround(at)));
+            }
+            std::sort(positions.begin(), positions.end());
+            positions.erase(std::unique(positions.begin(), positions.end()), positions.end());
+        }
+        const auto bands = [&](int Nr) {
+            const int m = 40, a0 = std::max(0, m - Nr), a1 = std::min(R - nrows, R - nrows - m - Nr);
+            if (a1 < a0) return std::vector<std::int64_t>();
+            const int count = std::clamp(1 + (a1 - a0) / nrows, 1, n.tile_bands);
+            if (count == 1) return std::vector<std::int64_t>{(a0 + a1) / 2};
+            return whole(linspace(a0, a1, count));
+        };
+        const auto windows = [&](int lo, int hi) {
+            if (hi < lo) return std::vector<std::int64_t>();
+            const int count = std::clamp((hi - lo + 2 * W - 1) / W, 1, n.tile_windows);
+            if (count == 1) return std::vector<std::int64_t>{(lo + hi) / 2};
+            return whole(linspace(lo, hi, count));
+        };
+        for (const std::int64_t p : positions) {
+            const std::size_t mid = static_cast<std::size_t>(p + 16);
+            const double th = sa.course.angle_deg[mid] * (kPi / 180.0);
+            const double sway = d0 * std::cos(th) + d1 * std::sin(th);  // (d_k - d_j) . n(th)
+            // at equal angle
+            const std::int64_t q_same = p + shift;
+            if (q_same - 16 >= sb.first && q_same + 80 <= sb.end) {
+                const int move = static_cast<int>(std::lround(pb.axis - pa.axis + sway));
+                const int Nr = higher(q_same + 16, mid);
+                if (std::abs(move) >= 48 || std::abs(Nr) >= 48)  // (else a pattern fixed to the detector would register)
+                    for (const std::int64_t row_a : bands(Nr))
+                        for (const std::int64_t ca : windows(std::max(0, -move) + edge, std::min(C - W, C - W - move) - edge)) {
+                            Planned t;
+                            t.kind = "tiles", t.scan_a = j, t.scan_b = k, t.a = ha, t.b = hb, t.from_block = true;
+                            ViewRequest& q = t.request;
+                            q.label = t.kind;
+                            q.scan_a = j, q.scan_b = k, q.stretch_a = sa.index, q.stretch_b = sb.index;
+                            q.frame_a = p, q.frame_hint = shift;
+                            q.frames = 32, q.rows = nrows, q.cols = W;
+                            q.row_a = static_cast<int>(row_a), q.col_a = static_cast<int>(ca);
+                            q.col_b = static_cast<int>(ca) + static_cast<int>(std::lround(pb.axis - pa.axis));
+                            q.sway_px = apart, q.sway_phase_deg = phase_deg;
+                            q.sway_row_deg = acq.row_time * step_deg;
+                            out.push_back(t);
+                        }
+            }
+            // half a turn on, mirrored: B's columns (before the reversal) are sum - A's, sum = axis_j + axis_k - (d_k - d_j) . n(th_a)
+            // (half a turn later; where B's frames end before that, half a turn earlier)
+            std::int64_t half = N / 2;
+            if (p + shift + half + 80 > sb.end) half = -half;
+            const std::int64_t q_opp = p + shift + half;
+            if (q_opp - 16 >= sb.first && q_opp + 80 <= sb.end) {
+                const int sum = static_cast<int>(std::lround(pa.axis + pb.axis - sway));
+                const int Nr = higher(q_opp + 16, mid);
+                for (const std::int64_t row_a : bands(Nr))
+                    for (const std::int64_t ca : windows(std::max(0, sum - (W - 1) - (C - W)) + edge, std::min(C - W, sum - (W - 1)) - edge)) {
+                        Planned t;
+                        t.kind = "tiles_opposite", t.scan_a = j, t.scan_b = k, t.a = ha, t.b = hb, t.from_block = true;
+                        ViewRequest& q = t.request;
+                        q.label = t.kind;
+                        q.scan_a = j, q.scan_b = k, q.stretch_a = sa.index, q.stretch_b = sb.index;
+                        q.frame_a = p, q.frame_hint = shift + half;
+                        q.angle_offset_deg = 180.0, q.mirror = true;
+                        q.frames = 32, q.rows = nrows, q.cols = W;
+                        q.row_a = static_cast<int>(row_a), q.col_a = static_cast<int>(ca);
+                        // (the sway is of B's own angle, half a turn on: there it is +(d_k - d_j) . n, the same statement)
+                        q.col_b = static_cast<int>(std::lround(pa.axis + pb.axis)) - (W - 1) - static_cast<int>(ca);
+                        q.sway_px = apart, q.sway_phase_deg = phase_deg;
+                        q.sway_row_deg = acq.row_time * step_deg;
+                        q.frame_shear = 2 * acq.fan;
+                        out.push_back(t);
+                    }
+            }
+        }
+    }
+    return out;
+}
+
 std::vector<Comparison> measure(Session& session, const Acquisition& acq, const std::vector<Planned>& planned, Device device, int patch, std::vector<int>* kept) {
     session.set_detector_map(DetectorMap{});  // the frames as stored: the map is the model's
     // the blocks in the order of their frames (neighbours read the same part of the files), those whose patches
@@ -711,6 +841,44 @@ std::vector<Comparison> measure(Session& session, const Acquisition& acq, const 
 
 // ---------------------------------------------------------------- the step
 
+void to_stored_pixels(Acquisition& acq, GeometrySolution& solution, GeometryReport& told, int rows, int cols, int f) {
+    if (f < 1) throw Error("geometry: a calibration is at 1 / f of the stored frames, f at least 1");
+    if (solution.parameters.scans.size() != acq.scans.size() || told.scans.size() != acq.scans.size()) throw Error("geometry: the solution, the report and the acquisition differ in their scans");
+    const double F = f;
+    acq.rows = rows, acq.cols = cols;
+    acq.pixel_um /= F, acq.row_time /= F, acq.fan /= F, acq.per_depth /= F, acq.width *= f;
+    for (ScanLayout& sc : acq.scans) {
+        sc.mid_height *= F, sc.axis *= F, sc.on_stage[0] *= F, sc.on_stage[1] *= F, sc.across_beam *= F;
+        for (StretchLayout& st : sc.stretches) {
+            for (double& v : st.course.rows) v *= F;
+            st.blocked = Blocked{};  // (its rows were the reduced frames')
+        }
+    }
+    Parameters& p = solution.parameters;
+    for (double& v : p.stage.height_once) v *= F;
+    for (double& v : p.stage.axis_twice) v *= F;
+    p.map.c0 *= F, p.map.cs *= F, p.map.v0 *= F, p.map.vs *= F;
+    p.about_height *= F;
+    for (double& v : p.map.eu) v *= F;
+    for (double& v : p.map.ev) v *= F;
+    for (ScanParameters& q : p.scans) {
+        q.axis = q.axis * F + p.roll * (F - 1.0) / 2.0;
+        q.d[0] *= F, q.d[1] *= F, q.height *= F, q.height_once[0] *= F, q.height_once[1] *= F;
+        for (double& v : q.stretch_height) v *= F;
+    }
+    for (std::array<double, 3>& r : solution.residual) r[1] *= F, r[2] *= F;
+    for (std::array<double, 3>& r : solution.lens_residual) r[0] *= F, r[1] *= F, r[2] *= F;
+    for (GeometrySolution::Left& l : solution.left)
+        for (int j = l.kind == "lens" ? 0 : 1; j < 3; ++j) l.rms[j] *= F, l.median[j] *= F;  // (a comparison's first is its frames)
+    for (ScanReport& r : told.scans) {
+        for (int j = 1; j < 3; ++j) r.mean[j] *= F, r.left[j] *= F, r.once[j][0] *= F, r.once[j][1] *= F, r.twice[j][0] *= F, r.twice[j][1] *= F;
+        r.row_time /= F, r.rows_apart *= F, r.departure *= F, r.departure_between_views *= F, r.from_anchor *= F;
+    }
+    for (PairReport& r : told.pairs)
+        for (int j = 1; j < 3; ++j) r.mean[j] *= F, r.left[j] *= F, r.rms[j] *= F, r.median[j] *= F, r.once[j][0] *= F, r.once[j][1] *= F;
+    told.axis.range *= F, told.axis.sd *= F, told.axis.mean = told.axis.mean * F + p.roll * (F - 1.0) / 2.0;
+}
+
 void save_text(const std::string& text, const std::string& path) {
     const std::string tmp = path + ".tmp" + std::to_string(static_cast<long>(::getpid()));
     {
@@ -727,7 +895,12 @@ std::string calibrate_geometry(const std::vector<std::string>& scans, const Opti
     const Log& log = options.log;
     const auto t_start = std::chrono::steady_clock::now();
     const auto seconds_since = [](std::chrono::steady_clock::time_point t) { return std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count(); };
-    Session session(scans, options.threads);
+    if (options.reduce < 0 || options.reduce > 3) throw Error("geometry calibration: reduce is 0, 1, 2 or 3");
+    Session session(scans, options.threads, options.reduce, options.projections);
+    const int reduced_by = 1 << options.reduce;
+    if (options.reduce || !options.projections.empty())
+        say(log, fmt("frames at 1/%d of the stored ones%s; the lines below up to the solve are in those frames' pixels, what is found and written in stored pixels", reduced_by,
+                     options.projections.empty() ? "" : (", from " + options.projections).c_str()));
     say(log, "layout");
     Acquisition acq = read_acquisition(session, options.device, log);
     if (!(acq.period_s > 0)) throw Error("geometry calibration: the record does not hold the frames' period");
@@ -743,9 +916,11 @@ std::string calibrate_geometry(const std::vector<std::string>& scans, const Opti
     acq.row_time = row_time / acq.period_s;
     say(log, "comparisons");
     auto t = std::chrono::steady_clock::now();
-    const std::vector<Planned> planned = plan(acq);
-    const int patch = options.patch;
-    if (patch < 32) throw Error("geometry calibration: patches of at least 32 x 32");
+    PlanCounts how_many;
+    how_many.angles_per_turn = std::min(48, how_many.angles_per_turn * reduced_by), how_many.max_positions *= reduced_by;
+    const std::vector<Planned> planned = plan(acq, how_many);
+    if (options.patch < 32) throw Error("geometry calibration: patches of at least 32 x 32");
+    const int patch = std::max(32, options.patch / reduced_by);
     measure_timing(true);
     const std::vector<Comparison> comparisons = measure(session, acq, planned, options.device, patch);
     const MeasureTiming spent = measure_timing();
@@ -764,7 +939,13 @@ std::string calibrate_geometry(const std::vector<std::string>& scans, const Opti
         start.map = geometry::empty_map(acq.rows, acq.cols, options.order);
         how.freed.push_back("map");
     }
-    const GeometrySolution solution = solve_geometry(acq, comparisons, start, how);
+    GeometrySolution solution = solve_geometry(acq, comparisons, start, how);
+    GeometryReport told = report(acq, solution, comparisons);
+    if (options.reduce) {
+        const Stretch& first = session.record(0).stretches.at(static_cast<std::size_t>(acq.scans[0].stretches.at(0).index));
+        to_stored_pixels(acq, solution, told, first.rows, first.cols, reduced_by);
+        row_time = acq.row_time * acq.period_s;  // (the same seconds per stored row)
+    }
     for (const GeometrySolution::Left& l : solution.left)
         if (l.scan_a >= 0)
             say(log, fmt("  %-9s scan %d%s: %5zu left %.3f frames, %.3f rows, %.3f px rms", l.kind.c_str(), l.scan_a, l.scan_b == l.scan_a ? "" : fmt(" against %d", l.scan_b).c_str(), l.n, l.rms[0], l.rms[1],
@@ -778,7 +959,6 @@ std::string calibrate_geometry(const std::vector<std::string>& scans, const Opti
         for (const std::string& n : solution.unused) names += (names.empty() ? "" : ", ") + n;
         say(log, "  no comparison gives: " + names);
     }
-    const GeometryReport told = report(acq, solution, comparisons);
     say(log, "report");
     const auto polar = [](const double* v) { return std::hypot(v[0], v[1]); };
     for (std::size_t k = 0; k < acq.scans.size(); ++k) {
@@ -810,15 +990,17 @@ std::string calibrate_geometry(const std::vector<std::string>& scans, const Opti
     Json parameters = Json::dict(), solve = Json::dict(), map;
     for (const auto& [key, value] : found.object) {
         if (key == "map") map = value;
-        else if (key == "roll" || key == "stage" || key == "scans") parameters.set(key, value);
+        else if (key == "roll" || key == "pitch" || key == "stage" || key == "about_height" || key == "scans") parameters.set(key, value);
         else solve.set(key, value);
     }
     Json cal = Json::dict();
     cal.set("step", Json::of(std::string("geometry"))).set("model", Json::of(std::string("joint"))).set("scans", names).set("seconds", num(std::nearbyint(seconds_since(t_start) * 10) / 10));
+    // what the frames were that it was measured on (the values below are in stored pixels whatever they were)
+    cal.set("frames", Json::dict().set("reduce", count(options.reduce)).set("projections", Json::of(options.projections)));
     cal.set("layout", Json::parse(acquisition_json(acq)));
     cal.set("row_time", Json::dict().set("seconds_per_row", num(row_time)).set("frame_period_s", num(acq.period_s)).set("frames_per_row", num(acq.row_time)).set("measured", timing));
     cal.set("map", map).set("parameters", parameters).set("solution", solve).set("report", Json::parse(report_json(acq, told)));
-    cal.set("comparisons", Json::dict().set("blocks", count(static_cast<long long>(planned.size()))).set("patch", count(patch)).set("accepted", counts));
+    cal.set("comparisons", Json::dict().set("blocks", count(static_cast<long long>(planned.size()))).set("patch", count(patch * reduced_by)).set("accepted", counts));
     return cal.text();
 }
 

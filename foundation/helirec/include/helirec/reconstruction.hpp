@@ -172,10 +172,14 @@ std::pair<std::string, std::string> geometry_calibration_file(const std::string&
                                                               const std::function<void(const std::string&)>& log = nullptr, const GeometryMaker& make = nullptr);
 
 // ---------------------------------------------------------------- one tile of a mosaic
-// A reconstructor of one tile alone (python/helirec/mosaic.py describes the tiles' description, geometry.hpp
-// TileGeometry reads it): the detector map, the pose and the angle of every frame, the rows' timing, in the tile's
-// own frame (the slice's centre is the tile's rotation axis, rounded to half a pixel of the reconstruction); only the
-// helix frames on disk the description names are used. The intensity side is the pair's: the scan's own darks and
+// A reconstructor of one tile alone: the detector map, the pose and the angle of every frame, the rows' timing, in the
+// tile's own frame (the slice's centre is the tile's rotation axis, rounded to half a pixel of the reconstruction);
+// only the helix frames on disk the description names are used. `description` is a geometry calibration of the
+// tiles (helirec-calibration geometry's file, "model": "joint"), of which `tile` names a scan as its layout does:
+// the scan is then reconstructed under its own parameters, its place, height and rotation against the anchor left
+// out (geometry::Calibration::own_poses), and the slice h holds the model's height z = h + row_origin of the sample
+// as this scan holds it. Or it is the tiles' description of python/helirec/mosaic.py (geometry.hpp, TileGeometry),
+// which nothing makes any more. The intensity side is the pair's: the scan's own darks and
 // flats taken to the nominal ring current, a weight map from the flats with a taper at the detector's far edge and
 // across the axis.
 struct TileOptions {
@@ -194,7 +198,8 @@ struct TileOptions {
     // The tile's group of a projection store (STORE.zarr/<tile>, helirec/projection_store.hpp): the helix frames
     // are read from its level `reduce` instead of the detector's files, which then need not be on disk. The values
     // are the OpenJPH decoder's, which differ from this reader's default decoder by at most one count. Darks and
-    // flats are still read from the detector's files.
+    // flats are read from the detector's files where those are on disk; otherwise they are the store's float images
+    // at the level (each flat taken to the nominal ring current), and the weight map is formed on that level's grid.
     std::string projections;
     std::function<void(const std::string&)> log;
     ExternalBackprojectorFactory external_backprojector;

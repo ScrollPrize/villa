@@ -101,6 +101,19 @@ def test_levels_the_store_does_not_hold_are_refused(stored):
         _core.RawReader([f"{tile}/scan0004"], "", ROWS + 8, COLS, 2).read_frames(np.zeros(1, np.int32), np.zeros(1, np.int32))
 
 
+def test_frames_not_yet_written_are_an_error_not_zeros(stored, tmp_path):
+    _, tile, frames, _ = stored
+    copy = tmp_path / "T"
+    shutil.copytree(tile, copy)
+    shards = sorted(p for p in (copy / "scan0004" / "3" / "c").rglob("*") if p.is_file())
+    assert len(shards) == 2
+    shards[1].unlink()
+    reader = _core.RawReader([str(copy / "scan0004")], "", ROWS, COLS, 3)
+    assert np.array_equal(np.asarray(reader.read_frames(np.zeros(1, np.int32), np.array([99], np.int32)))[0], frames[FIRST + 99][::8, ::8])
+    with pytest.raises(Exception, match="frame 100 of .* is not stored"):
+        reader.read_frames(np.zeros(1, np.int32), np.array([100], np.int32))
+
+
 def test_a_scans_frames_are_found_in_the_store(stored):
     scan, tile, frames, _ = stored
     picked = [FIRST, FIRST + 99, FIRST + 100, N - 1, FIRST + 3]

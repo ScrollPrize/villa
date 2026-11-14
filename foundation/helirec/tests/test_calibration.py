@@ -353,6 +353,36 @@ def _blocks_of_deep_content(rng, depth_lo, depth_hi, later, moved, n=(32, 128, 1
     return a + rng.normal(0, noise, a.shape).astype(np.float32), b + rng.normal(0, noise, b.shape).astype(np.float32)
 
 
+def test_patches_of_two_volumes():
+    """The registration on patches of volume (slices, rows, columns), as two scans' reconstructions of one place
+    are compared: a patch against the same volume displaced by a known fraction of a voxel, cut at another whole
+    offset, returns the displacement and the cut's difference. a(x) ~ b(x + margin + shift)."""
+    rng = np.random.default_rng(21)
+    n = (48, 160, 160)
+    k = [np.fft.fftfreq(m) for m in n]
+    K = np.sqrt(k[0][:, None, None] ** 2 + k[1][None, :, None] ** 2 + k[2][None, None, :] ** 2)
+    spectrum = np.fft.fftn(rng.standard_normal(n)) * np.exp(-(K / 0.08) ** 2)          # detail of about 4 voxels, along the slices too
+    moved = (0.31, -0.42, 0.27)
+    ramp = np.exp(-2j * np.pi * (k[0][:, None, None] * moved[0] + k[1][None, :, None] * moved[1] + k[2][None, None, :] * moved[2]))
+    A, B = np.fft.ifftn(spectrum).real.astype(np.float32), np.fft.ifftn(spectrum * ramp).real.astype(np.float32)      # B(x) = A(x - moved)
+    shape, margin = (16, 64, 64), (4, 8, 8)
+    reg = _core.CalibrationRegistrar(list(shape), list(margin), 0.01, 0.15, 0, [2, 4, 4], "cpu")
+    at = np.array([14, 40, 44])
+    a = np.ascontiguousarray(A[at[0]:at[0] + 16, at[1]:at[1] + 64, at[2]:at[2] + 64])
+    for start in ((0, 0, 0), (1, -2, 3)):                                                 # where b is cut against a, whole voxels
+        cut, cuts = np.array(start), 0
+        while True:
+            lo = at + cut - margin
+            r = reg.run(a, np.ascontiguousarray(B[lo[0]:lo[0] + 24, lo[1]:lo[1] + 80, lo[2]:lo[2] + 80]))
+            if not any(r["whole"]):
+                break
+            cut, cuts = cut + r["whole"], cuts + 1                                         # the content lies whole voxels on: b is cut again there
+            assert cuts < 4
+        assert cuts == (1 if any(start) else 0)
+        assert r["converged"] and not r["at_edge"] and r["correlation"] > 0.99
+        assert np.add(r["shift"], cut) == pytest.approx(moved, abs=0.01), start
+
+
 def test_a_fraction_of_a_frame_on_deep_content():
     """Whether the registration measures a fraction of a frame where the sample is deep (a mosaic: material
     16 000 px from the axis crosses 10 columns per frame, more than the band samples along the frames). It does
@@ -632,6 +662,61 @@ def test_session_at_reduced_resolution(tmp_path, monkeypatch):
         _core.CalibrationSession([str(mp)], reduce=1).dark(0)
     with pytest.raises(Exception, match="reduce is 0, 1, 2 or 3"):
         _core.CalibrationSession([str(ma)], reduce=4)
+
+
+def test_session_on_a_projection_store(tmp_path, monkeypatch):
+    """CalibrationSession(reduce=, store=): the frames, darks and flats of a scan read from a projection store
+    (helirec-projections-zarr) at one of its levels, the scan's master as always. A frame is on disk if the store
+    holds its file. The store is made up here: its level keeps every second pixel of made-up detector files."""
+    import shutil
+    import subprocess
+    import sys
+    from pathlib import Path
+    here = Path(_core.__file__).resolve().parent
+    tool = next((str(d / "helirec-projections-zarr") for d in (here, *here.parents[:2]) if (d / "helirec-projections-zarr").exists()), None) or shutil.which("helirec-projections-zarr")
+    if tool is None:
+        pytest.skip("helirec-projections-zarr is not built")
+    module = sys.modules[__name__]
+    monkeypatch.setattr(module, "ROWS", 48)
+    monkeypatch.setattr(module, "COLS", 80)
+    monkeypatch.setattr(module, "PER_TURN", 40)
+    master = _write_record(tmp_path, np.random.default_rng(61))
+    dataset, held = "/entry_0000/instrument/det3/data", {}
+    scale, jobs = tmp_path / "scale", []
+    # darks, flats, the first rest turn and the helix from its frame 8 on; the second rest turn is not stored
+    for scan_dir, entry, role, first in (("scan0002", "2.1", "dark", 0), ("scan0003", "3.1", "flat", 0), ("scan0004", "4.1", "projection", 0), ("scan0005", "5.1", "projection", 8),
+                                         ("scan0007", "7.1", "flat", 0)):
+        with h5py.File(tmp_path / scan_dir / "det3_0000.h5") as f:
+            data = f[dataset][first:, ::2, ::2]
+        if role != "projection":
+            data = data.astype(np.float32) + 0.25
+        held[entry] = data
+        output = f"XX/{scan_dir}/det3_0000.h5"
+        (scale / output).parent.mkdir(parents=True)
+        with h5py.File(scale / output, "w") as f:
+            f.create_dataset(dataset, data=data, chunks=(1, ROWS // 2, COLS // 2))
+            f.attrs["complete"] = True
+        jobs.append(dict(tile="XX", output=output, relative_file=f"{scan_dir}/det3_0000.h5", source_first=first, role=role, rows=ROWS, cols=COLS, first=first, count=len(data),
+                         dtype="uint16", dataset=dataset, reduce=1, metadata={}))
+    (scale / "plan.json").write_text(json.dumps(dict(settings=dict(reduce=1), tiles=[dict(label="XX", rows=ROWS, cols=COLS, chunk_rows=64)], jobs=jobs)))
+    store = tmp_path / "projections.zarr"
+    made = subprocess.run([tool, str(store), str(scale)], capture_output=True, text=True)
+    assert made.returncode == 0, made.stderr
+    s = _core.CalibrationSession([str(master)], reduce=1, store=str(store))
+    info = s.info(0)
+    assert (info["label"], info["rows"], info["cols"], info["pixel_um"]) == ("XX", ROWS // 2, COLS // 2, 16.0)
+    on_disk = {x["entry"]: x["on_disk"] for x in s.stretches(0)}
+    assert on_disk["4.1"] == [(0, 40)] and on_disk["5.1"] == [(8, 80)] and on_disk["6.1"] == []
+    frames = np.array([8, 30, 79], dtype=np.int64)
+    assert np.array_equal(s.read_rows(0, 3, frames, 0, ROWS // 2), held["5.1"][frames - 8])
+    assert np.array_equal(s.read_rows(0, 2, frames[:2], 3, 7), held["4.1"][frames[:2], 3:10])
+    dark = held["2.1"].mean(0)
+    flat = np.concatenate([held["3.1"], held["7.1"]]).mean(0)
+    assert np.allclose(s.dark(0), dark, atol=1e-3) and np.allclose(s.gain(0), flat - dark, atol=1e-2)
+    with pytest.raises(Exception, match="not on disk"):
+        s.read_rows(0, 3, np.array([3], dtype=np.int64), 0, 4)                 # the helix' first frames are not in the store
+    with pytest.raises(Exception, match="1/4|does not hold|no level"):
+        _core.CalibrationSession([str(master)], reduce=2, store=str(store)).read_rows(0, 2, frames[:1], 0, 4)
 
 
 def test_images_at_reduced_resolution():

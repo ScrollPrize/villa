@@ -1,16 +1,20 @@
 """One tile of a mosaic, reconstructed alone.
 
 A mosaic is scans of one sample at several places on the rotation stage (tiles), each a helix with the rotation
-axis inside the detector. `tile_reconstructor` makes a helirec reconstructor of one tile from a description of
-the tiles' geometry.
+axis inside the detector. `tile_reconstructor` makes a helirec reconstructor of one tile.
 
-Nothing in helirec makes such a description at present. The mosaic's geometry calibration that was here (its
-fits, and its check of two tiles' overlap in the volume) was removed in November 2026 and is to be done anew;
-until then a mosaic cannot be calibrated, and it cannot be reconstructed as one volume. The form of the
-description below is what this reconstructor reads. It is not a statement of how a mosaic's geometry should be
-modelled or measured.
+`cal` is a geometry calibration of the tiles (`geometry.calibrate_geometry`, `helirec-calibration geometry`:
+"model": "joint") and `label` the tile as that calibration's layout names it: the tile is reconstructed under its
+own parameters (axis column and its slope, axial scale, the roll, the rotation stage's motion within a turn, the
+map, the rows' timing), its place, height and rotation against the anchor left out, and the slice h holds the
+model's height z = h + row_origin of the sample as the tile holds it. The pixel at (x, y) from the slice's centre
+is the model's (x, -y) from the tile's rotation axis.
 
-The description is a dict (JSON as `geometry.save` writes it):
+Or `cal` is the description that the mosaic's geometry calibration removed in November 2026 wrote. Nothing makes
+one any more; its form below is what this reconstructor reads of it, not a statement of how a mosaic's geometry
+should be modelled or measured. A mosaic cannot be reconstructed as one volume yet.
+
+That description is a dict (JSON as `geometry.save` writes it):
 
     layout               rows, tiles (the labels), frames_on_disk (per tile, [first, end) of the helix' frames
                          used), row_sign, step_deg, knot_frames (the frame numbers a course is given at)
@@ -67,8 +71,9 @@ def reconstruction_terms(cal, label, angle_deg, height_rows, frame, rot_center, 
 
 
 def tile_reconstructor(master, cal, label, device="cuda", params=None, row_origin=None, weight=None, cache_gb=0.0, reduced=None, log=print, cache_dir=None, reduce=0, projections=None):
-    """A reconstructor (helirec SliceReconstructor) of one tile alone, on a description `cal` of the tiles' geometry
-    (the module's description): the detector map, the pose and the angle of every frame, the rows' timing. The tile's own frame (see
+    """A reconstructor (helirec SliceReconstructor) of one tile alone, on a geometry calibration `cal` of the tiles
+    ("model": "joint"; label: the tile's name in its layout) or on the earlier description of the tiles' geometry
+    (the module's docstring): the detector map, the pose and the angle of every frame, the rows' timing. The tile's own frame (see
     reconstruction_terms); only the helix frames on disk are used. The first step towards reconstructing a mosaic; the intensity side is the pair pipeline's (the scan's own
     darks and flats by the ring current, a weight map from the flats with a taper at the detector's far edge and
     across the axis), and nothing knows yet that every ray passes through sample the tile does not see.
@@ -89,7 +94,7 @@ def tile_reconstructor(master, cal, label, device="cuda", params=None, row_origi
     the slice, is in reduced pixels. row_origin stays in stored rows.
     projections: the tile's group of a projection store (STORE.zarr/<tile>, made by helirec-projections-zarr): the
     helix frames are read from its level `reduce` instead of the detector's files (values within one count of those). Darks
-    and flats are still read from the detector's files.
+    and flats are read from the detector's files where those are on disk, and otherwise from the store's level.
     Returns (reconstructor, dict(rot_center, frames, scan, terms, row_origin, reduced, reduce, params)).
     (helirec::tile_reconstructor, helirec/reconstruction.hpp)"""
     import json

@@ -88,7 +88,8 @@ def fit_refill_shots(x, n_rows, T, E, pre):
 
 def acquisition(acq):
     """The scans' layout for the joint model as the C++ side holds it (_core.GeometryAcquisition), from a dict:
-    rows, cols, row_time [frames per row], and optionally per_turn, pixel_um, row_sign, fan, width, anchor (the
+    rows, cols, row_time [frames per row], and optionally per_turn, pixel_um, row_sign, fan, per_depth (what the
+    beam's divergence magnifies a sample by per pixel it sits nearer the source; 0: left out), width, anchor (the
     scan whose place is the origin); scans = [dict(name, mid_height, axis (the coarse axis column), moved_on_stage
     (the sample sits elsewhere on the rotation stage than in the anchor), on_stage (where, by the motors [px]),
     stretches=[dict(name, helix, angle_deg, rows, and optionally index, first, end (the frames on disk))])]. A
@@ -110,7 +111,7 @@ def acquisition(acq):
         if s.get("on_stage") is not None:
             d["on_stage"] = [float(v) for v in s["on_stage"]]
         scans.append(d)
-    top = {key: acq[key] for key in ("per_turn", "pixel_um", "row_sign", "fan", "width", "anchor", "period_s") if key in acq}
+    top = {key: acq[key] for key in ("per_turn", "pixel_um", "row_sign", "fan", "per_depth", "width", "anchor", "period_s") if key in acq}
     return _core.GeometryAcquisition(json.dumps(dict(top, rows=int(acq["rows"]), cols=int(acq["cols"]), row_time=float(acq.get("row_time", 0.0)), scans=scans)))
 
 
@@ -131,17 +132,44 @@ def measure_comparisons(session, acquisition_, device="auto", patch=128, **count
     block: the plan's block it came from), and the number of blocks planned.
     (helirec::calibration::geometry_calibration::measure)"""
     from . import _core
-    got = _core.geometry_measure(session, acquisition(acquisition_), device, int(patch), **{k: int(v) for k, v in counts.items()})
+    return _measured(_core.geometry_measure(session, acquisition(acquisition_), device, int(patch), **{k: int(v) for k, v in counts.items()}))
+
+
+def _measured(got):
     out = [dict(kind=k, a=a, b=b, opposite=o, correlation=float(c), curvature=cu, block=int(bl))
            for k, a, b, o, c, cu, bl in zip(got["kinds"], got["a"], got["b"], got["opposite"], got["correlation"], got["curvature"], got["block"])]
     return out, int(got["blocks"])
+
+
+def plan_tiles(acquisition_, places, pairs, positions=48, angles=24, bands=3, windows=4):
+    """The comparisons of scans that sit at different places on the rotation stage (a mosaic's tiles) with each
+    other, placed from `places` (the joint model's parameters: each scan's axis column, d and height). pairs: (j, k)
+    of the scans to compare (neighbours(acq)[0]: those whose discs overlap). At `positions` positions along the
+    helix, at `angles` angles a turn: "tiles" at equal angle where the two detectors hold the same rays, and
+    "tiles_opposite" with the second scan half a turn on, mirrored; up to `bands` bands of rows and `windows` windows
+    of columns each. A list of dicts as plan_comparisons gives, with the request's sway.
+    (helirec::calibration::geometry_calibration::plan_tiles)"""
+    from . import _core
+    try:
+        return json.loads(_core.geometry_plan_tiles(acquisition(acquisition_), _parameters_text(places), [[int(j), int(k)] for j, k in pairs], int(positions), int(angles), int(bands), int(windows)))
+    except RuntimeError as e:
+        raise ValueError(str(e)) from None
+
+
+def measure_tiles(session, acquisition_, places, pairs, device="auto", patch=128, positions=48, angles=24, bands=3, windows=4):
+    """plan_tiles measured once on a CalibrationSession, in patches of patch x patch: the accepted comparisons and
+    the number of blocks planned, as measure_comparisons returns them.
+    (helirec::calibration::geometry_calibration::plan_tiles, measure)"""
+    from . import _core
+    return _measured(_core.geometry_measure_tiles(session, acquisition(acquisition_), _parameters_text(places), [[int(j), int(k)] for j, k in pairs], device, int(patch), int(positions),
+                                                  int(angles), int(bands), int(windows)))
 
 
 def _parameters_text(p):
     """The joint model's parameters (a start, or a solution with whatever else it holds) as the C++ side reads them."""
     if p is None:
         return ""
-    out = dict(roll=p.get("roll", 0.0), stage=p.get("stage", {}), scans=p["scans"])  # (a scan's height_once with it)
+    out = dict(roll=p.get("roll", 0.0), pitch=p.get("pitch", 0.0), stage=p.get("stage", {}), about_height=p.get("about_height", 0.0), scans=p["scans"])  # (a scan's height_once and rotation with it)
     if p.get("map") and len(p["map"].get("i", ())):
         out["map"] = {k: (v.tolist() if hasattr(v, "tolist") else v) for k, v in p["map"].items()}
     return json.dumps(out, default=float)
@@ -173,10 +201,14 @@ def report(acquisition_, parameters, comparisons):
     would give; whether the recorded height's departure from a straight line is the sample's motion: height_slope 1)
     and, for a scan elsewhere on the rotation stage than the anchor, the pitch its own views' height_once says the
     rotation axis has at least; "over_scans" (the spread of the axis column, its slope and the axial scale);
-    "edges" and "triangles" (neighbours). (helirec::calibration::geometry_calibration::report)"""
+    "edges" and "triangles" (neighbours); "pairs": per pair of scans compared with each other and per kind, what is
+    left of frames, rows and columns as an rms, a median, and a mean with a once per turn of the angle (for a
+    mosaic's tiles the rows' once per turn at equal angle is what the pitch left, in opposite views what the pitch
+    does over the depth of what was registered). (helirec::calibration::geometry_calibration::report)"""
     from . import _core
     return json.loads(_core.geometry_report(acquisition(acquisition_), _parameters_text(parameters), _sightings([c["a"] for c in comparisons]),
-                                            _sightings([c["b"] for c in comparisons]), [bool(c.get("opposite", False)) for c in comparisons]))
+                                            _sightings([c["b"] for c in comparisons]), [bool(c.get("opposite", False)) for c in comparisons],
+                                            [str(c.get("kind", "")) for c in comparisons]))
 
 
 def neighbours(acquisition_):
@@ -188,7 +220,20 @@ def neighbours(acquisition_):
     return list(edges), list(triangles)
 
 
-def solve_geometry(acquisition_, comparisons, start=None, huber=0.03, max_iterations=100, held=(), freed=()):
+def _lens(lens):
+    """Lens patches as the table the C++ side takes: scan a, scan b, the place, the displacement, its sigma."""
+    rows = [[float(l["scan_a"]), float(l["scan_b"]), *map(float, l["p"]), *map(float, l["moved"]), *map(float, l.get("sigma", (1.0, 1.0, 1.0)))] for l in (lens or ())]
+    return np.ascontiguousarray(np.asarray(rows, np.float64).reshape(-1, 11))
+
+
+def lens_residuals(acquisition_, parameters, lens):
+    """What the parameters leave of each lens patch: (n, 3) x, y, z [px], the difference of the two scans' rigid
+    motions at the patch's place less what was measured. (helirec::calibration::geometry_calibration::lens_residuals)"""
+    from . import _core
+    return _core.geometry_lens_residuals(acquisition(acquisition_), _parameters_text(parameters), _lens(lens))
+
+
+def solve_geometry(acquisition_, comparisons, start=None, huber=0.03, max_iterations=100, held=(), freed=(), lens=None, lens_huber=1.5):
     """The joint geometry model solved on comparisons (helirec/calibration/geometry_calibration.hpp states the model).
 
     acquisition_: the scans' layout (a dict as `acquisition` takes it, or a GeometryAcquisition): what the records
@@ -200,21 +245,46 @@ def solve_geometry(acquisition_, comparisons, start=None, huber=0.03, max_iterat
     per turn and axis column twice per turn, the rest turns' heights, of every scan but the anchor its d and
     height, and of every scan elsewhere on the rotation stage than the anchor (a mosaic's tile) its height_once (the
     height once per turn its own views show beyond the stage's: what an axis pitched towards the beam does to
-    opposite views); held are the anchor's d, height and height_once, a helix' height and the map.
+    opposite views); held are the anchor's d, height and height_once, a helix' height and the map. "pitch" (the
+    rotation axis' lean towards the beam; in comparisons of two scans at one angle) is free where such comparisons
+    join scans at different places on the rotation stage. A scan's tilt_x, tilt_y are in comparisons of two scans
+    too (the part about the beam's direction) and free there only by name; the spin is not in them. The rows of
+    two scans' opposite views ("tiles_opposite") are not fitted, their columns are.
 
-    Returns the solution (roll, stage, scans, map, free, unused, solver, left) with "residual": (n, 3) frames, rows, columns.
-    It is an error if the free unknowns depend on each other.
+    lens: lens patches, the other kind of measurement: two scans' reconstructions of one place of the sample
+    registered in 3D. Dicts with scan_a, scan_b, p (the place of the sample: x, y from its origin, z its height),
+    moved (where scan b's volume has it against where scan a's has it: x, y, z) and sigma (what the measurement is
+    good to per component; 1 if left out). Scan k holds the point p moved by (d_k, height_k) + rotation_k x (p -
+    (0, 0, about_height)) against the anchor, about_height taken from `start`. A scan's rotation (tilt_x, tilt_y,
+    spin) is free where lens patches name the scan and it is not the anchor. lens_huber: the Huber scale of a lens
+    patch's residual, in sigmas.
+
+    Returns the solution (roll, pitch, stage, about_height, scans, map, free, unused, correlated, solver, left) with
+    "residual": (n, 3) frames, rows, columns, and "lens_residual": (n, 3) x, y, z. "correlated" lists pairs of free
+    unknowns the measurements hardly tell apart (correlation above 0.9 in size). It is an error if the free
+    unknowns depend on each other.
     (helirec::calibration::geometry_calibration::solve_geometry)"""
     from . import _core
     try:
-        text, residual = _core.geometry_solve(acquisition(acquisition_), [str(c["kind"]) for c in comparisons], _sightings([c["a"] for c in comparisons]),
-                                              _sightings([c["b"] for c in comparisons]), [bool(c.get("opposite", False)) for c in comparisons],
-                                              _parameters_text(start), float(huber), int(max_iterations), list(held), list(freed))
+        text, residual, lens_residual = _core.geometry_solve(acquisition(acquisition_), [str(c["kind"]) for c in comparisons], _sightings([c["a"] for c in comparisons]),
+                                                             _sightings([c["b"] for c in comparisons]), [bool(c.get("opposite", False)) for c in comparisons], _lens(lens),
+                                                             _parameters_text(start), float(huber), int(max_iterations), list(held), list(freed), float(lens_huber))
     except RuntimeError as e:
         raise ValueError(str(e)) from None
     out = json.loads(text)
     out["residual"] = residual
+    out["lens_residual"] = lens_residual
     return out
+
+
+def to_stored_pixels(acquisition_, parameters, rows, cols, f):
+    """The joint model's parameters, found on frames read at 1 / f (a session with reduce), in the pixels of the
+    frames as stored (rows x cols): positions times f, ratios as they are, each axis column moved along the roll to
+    the stored frames' middle row. Returns (the parameters, the layout without its per-frame series) as dicts.
+    (helirec::calibration::geometry_calibration::to_stored_pixels)"""
+    from . import _core
+    p, layout = _core.geometry_to_stored_pixels(acquisition(acquisition_), _parameters_text(parameters), int(rows), int(cols), int(f))
+    return json.loads(p), json.loads(layout)
 
 
 # ---------------------------------------------------------------- the pose of every frame
@@ -299,17 +369,20 @@ def overlap_centre_of(cal):
 
 # ---------------------------------------------------------------- the step
 
-def calibrate_geometry(scans, row_time=None, device="auto", order=3, threads=8, log=print, patch=128):
+def calibrate_geometry(scans, row_time=None, device="auto", order=3, threads=8, log=print, patch=128, reduce=0, projections=""):
     """The geometry calibration of the scans of one sample. scans: their master files, a scan with the rotation
     axis inside the detector's field first (a pair: the main scan, then the one moved sideways). row_time: seconds
     per stored row (signed), if it is known for this camera configuration (0: not known, done without); otherwise
     it is measured from a refill, and it is an error if no stretch on disk holds one. order: of the detector map's
     polynomial (0: no map). patch: the plan's blocks are cut into patches of patch x patch, each registered once.
+    reduce: 1, 2, 3 to measure on the frames read at a half, a quarter, an eighth (the result is in stored pixels
+    all the same; the C++ Options say by how much it then differs from the stored frames'). projections: a projection
+    store (STORE.zarr of helirec-projections-zarr) to read the frames, darks and flats from, at the level `reduce`.
     Returns a dict (see `save`): layout, row_time, map, parameters, solution (what is left per kind), report, comparisons.
     (helirec::calibration::geometry_calibration::calibrate_geometry; the same as `helirec-calibration geometry`)"""
     from . import _core
     try:
-        text = _core.calibrate_geometry([str(x) for x in scans], None if row_time is None else float(row_time), device, int(order), int(threads), int(patch), log)
+        text = _core.calibrate_geometry([str(x) for x in scans], None if row_time is None else float(row_time), device, int(order), int(threads), int(patch), log, int(reduce), str(projections))
     except RuntimeError as e:
         raise ValueError(str(e)) from None
     return json.loads(text)

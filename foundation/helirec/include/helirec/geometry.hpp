@@ -111,7 +111,9 @@ class Calibration {
     // not_applied: receives, as JSON, the terms the step measured and this does not use.
     //
     // A joint calibration's poses are its model's, frame by frame (th and H the record's angle and height):
-    //     row         height + the stretch's height + (1 + axial_scale) H + the stage's lift once per turn - roll d . n(th),
+    //     row         height + the stretch's height + (1 + axial_scale) H + the stage's lift once per turn - roll d . n(th)
+    //                 + pitch d . (-sin th, cos th) (the pitch of the axis towards the beam, where the calibration has
+    //                 one: the row of the rays through the sample's origin),
     //                 counted from the first scan's row at its helix' first frame (the slices are numbered from there)
     //     axis        axis + axis_slope (H - H_mid) + the stage's axis column twice per turn + d . n(th)
     //     the slopes  col_per_row = roll, row_per_col = -roll
@@ -121,6 +123,22 @@ class Calibration {
     std::array<Poses, 2> frame_poses(const std::array<std::vector<double>, 2>& angles_deg,
                                      const std::array<std::vector<double>, 2>& heights_rows,
                                      std::string* not_applied = nullptr) const;
+
+    // ---- one scan of a joint calibration of any number of scans (a mosaic's tile), reconstructed alone
+    // the scan the calibration's layout names so
+    std::size_t scan_named(const std::string& name) const;
+    // the frames of its helix the calibration was made on, among the scan's projection frames: [first, end)
+    std::array<std::size_t, 2> frames_on_disk(std::size_t scan) const;
+    double axis_column(std::size_t scan) const;  // at the middle row, at the middle of the helix' frames on disk
+    // The scan's poses in its own frame: as frame_poses' of a joint calibration with the scan's place d and its
+    // height left out, so that u counts from the scan's own rotation axis and the slice h is the model's height z
+    // of the sample as this scan holds it (z of the sample + the scan's height). What a scan alone reconstructs
+    // depends on its own parameters only (axis column and its slope, axial scale, the roll, the stage's motion,
+    // the map, the rows' timing); its place, height and rotation are a rigid motion of that volume. One term of
+    // the place stays: the pitch's row, pitch d . (-sin th, cos th), which is no rigid motion of the volume (it
+    // puts the rows right for the sample's origin and not for the scan's own axis). The frames of stretches the
+    // calibration does not hold stay at zero.
+    Poses own_poses(std::size_t scan, const std::vector<double>& angles_deg, const std::vector<double>& heights_rows) const;
 
     // The medians over the helix of the axis' column in each scan and of the second scan's rows against the
     // first's at equal frames. The frame is a nominal one: every projection's own axis and row are in its terms,

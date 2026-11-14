@@ -53,4 +53,23 @@ void bind_projection(nb::module_& m) {
             nb::gil_scoped_release nogil; w.write(first, data.shape(0), data.data());
         }, "first"_a, "data"_a.noconvert())
         .def("close", &UncompressedFrameWriter::close, nb::call_guard<nb::gil_scoped_release>());
+
+    m.def("declare_projection_store_scan", &declare_projection_store_scan, "root"_a, "spec"_a, "reduce"_a, "source"_a, "dtype"_a, "clevel"_a = 1,
+          "Create what is missing of ROOT/<tile>/<scan> of a projection store and record level `reduce` as stored; spec is JSON text "
+          "(helirec/projection_store.hpp). One caller at a time. (helirec::declare_projection_store_scan)");
+    nb::class_<ProjectionStoreWriter>(m, "ProjectionStoreWriter", "Frames into one level of a declared scan group of a projection store; frames are "
+                                                                     "numbered as in the detector's scan (helirec::ProjectionStoreWriter)")
+        .def(nb::init<const std::string&, int>(), "scan_group"_a, "reduce"_a)
+        .def_prop_ro("rows", &ProjectionStoreWriter::rows)
+        .def_prop_ro("cols", &ProjectionStoreWriter::cols)
+        .def_prop_ro("dtype", &ProjectionStoreWriter::dtype)
+        .def("holds", &ProjectionStoreWriter::holds, "first"_a, "count"_a, "whether frames [first, first + count) are stored")
+        .def("write", [](ProjectionStoreWriter& w, std::int64_t first, nb::ndarray<const std::uint16_t, nb::ndim<3>, nb::c_contig, nb::device::cpu> data, bool verify) {
+            require(w.dtype() == "uint16" && data.shape(1) == static_cast<std::size_t>(w.rows()) && data.shape(2) == static_cast<std::size_t>(w.cols()), "writer shape or dtype mismatch");
+            nb::gil_scoped_release nogil; w.write(first, static_cast<std::int64_t>(data.shape(0)), data.data(), verify);
+        }, "first"_a, "data"_a.noconvert(), "verify"_a = true)
+        .def("write", [](ProjectionStoreWriter& w, std::int64_t first, nb::ndarray<const float, nb::ndim<3>, nb::c_contig, nb::device::cpu> data, bool verify) {
+            require(w.dtype() == "float32" && data.shape(1) == static_cast<std::size_t>(w.rows()) && data.shape(2) == static_cast<std::size_t>(w.cols()), "writer shape or dtype mismatch");
+            nb::gil_scoped_release nogil; w.write(first, static_cast<std::int64_t>(data.shape(0)), data.data(), verify);
+        }, "first"_a, "data"_a.noconvert(), "verify"_a = true);
 }

@@ -23,6 +23,8 @@ class Frames {
     // reduce = 1, 2, 3: every frame at a half, a quarter, an eighth, from the lower resolutions its JPEG 2000
     // codestream holds (helirec/raw_reader.hpp: value (j, k) sits at the stored pixel (j, k) 2^reduce; plain frames
     // have none and are refused when read). rows(), cols() and every row below are then the reduced frame's.
+    // The record's pieces may name scan groups of a projection store where they would name files
+    // (helirec/projection_store.hpp; Session does that): `reduce` is then the store's level.
     explicit Frames(const Record& rec, int n_threads = 0, int reduce = 0);
     ~Frames();
     const Record& record() const { return *rec_; }

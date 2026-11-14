@@ -10,6 +10,7 @@
 
 #include "calibration/util.hpp"
 #include "helirec/calibration/intensity.hpp"
+#include "helirec/projection_store.hpp"
 
 namespace helirec::calibration {
 
@@ -200,6 +201,7 @@ bool measure(const Pairing& P, const BlockPlan& first_plan, Cut cut, const Regis
 
 struct Session::Impl {
     int threads = 0, reduce = 0;
+    std::string store;  // a projection store the frames are read from; "": the detector's files
     std::vector<std::unique_ptr<Record>> records;
     std::vector<std::unique_ptr<Frames>> frames;
     std::vector<std::unique_ptr<FlatField>> flats;
@@ -269,13 +271,92 @@ void fill(ViewMeasurement& res, const Measured& m, const Trajectory& ta) {
 
 }  // namespace
 
-Session::Session(const std::vector<std::string>& scans, int threads, int reduce) : impl_(std::make_unique<Impl>()) {
+namespace {
+
+// The record's frames as a projection store holds them (helirec/projection_store.hpp): the pieces of every
+// stretch become the runs of frames the scan groups of `tile_group` hold of their files, each naming its group
+// where it named a file and the frame's index in it. What the store does not hold is not on disk.
+void frames_from_store(Record& rec, const std::string& tile_group) {
+    std::map<std::string, std::map<std::string, std::vector<ProjectionStoreRun>>> held;  // by scan directory, by file name
+    for (Stretch& s : rec.stretches) {
+        std::vector<FramePiece> pieces;
+        for (const FramePiece& p : s.pieces) {
+            const std::size_t cut = p.file.find_last_of('/'), up = cut == std::string::npos ? cut : p.file.find_last_of('/', cut - 1);
+            const std::string scan = cut == std::string::npos ? std::string() : p.file.substr(up == std::string::npos ? 0 : up + 1, cut - (up == std::string::npos ? 0 : up + 1));
+            const std::string group = tile_group + "/" + scan;
+            if (!held.count(scan)) {
+                held[scan];
+                if (is_projection_store_scan(group))
+                    for (const ProjectionStoreRun& r : projection_store_runs(group)) held[scan][r.file].push_back(r);
+            }
+            std::vector<FramePiece> parts;
+            const auto runs = held[scan].find(p.file.substr(cut == std::string::npos ? 0 : cut + 1));
+            if (runs != held[scan].end())
+                for (const ProjectionStoreRun& r : runs->second) {  // the piece's frames that the run holds
+                    const std::int64_t lo = std::max(p.source_first, r.source_first), hi = std::min(p.source_first + p.count, r.source_first + r.count);
+                    if (hi <= lo) continue;
+                    parts.push_back({group, p.dataset, p.first + (lo - p.source_first), hi - lo, r.index + (lo - r.source_first), true});
+                }
+            // what of the piece no run holds stays a piece of the detector's file, not on disk
+            std::sort(parts.begin(), parts.end(), [](const FramePiece& x, const FramePiece& y) { return x.first < y.first; });
+            std::int64_t at = p.first;
+            const std::size_t held_parts = parts.size();
+            for (std::size_t i = 0; i <= held_parts; ++i) {
+                const std::int64_t next = i < held_parts ? parts[i].first : p.first + p.count;
+                if (next > at) parts.push_back({p.file, p.dataset, at, next - at, p.source_first + (at - p.first), false});
+                if (i < held_parts) at = std::max(at, parts[i].first + parts[i].count);
+            }
+            pieces.insert(pieces.end(), parts.begin(), parts.end());
+        }
+        std::sort(pieces.begin(), pieces.end(), [](const FramePiece& x, const FramePiece& y) { return x.first < y.first; });
+        s.pieces = std::move(pieces);
+    }
+}
+
+// The dark and the mean flat of a scan whose frames are a projection store's: its dark and flat groups hold float
+// images at the level, already taken through the frames' low-pass (helirec-projections-zarr), of which the means
+// are formed. No statistics per series.
+FlatField store_flat_field(const Record& rec, int reduce, int rows, int cols) {
+    FlatField ff;
+    ff.rows = rows, ff.cols = cols;
+    const std::size_t np = static_cast<std::size_t>(rows) * static_cast<std::size_t>(cols);
+    std::vector<double> dark(np, 0.0), flat(np, 0.0);
+    double n_dark = 0, n_flat = 0;
+    for (const Stretch& s : rec.stretches) {
+        if (s.role != Role::Dark && s.role != Role::Flat) continue;
+        std::vector<double>& sum = s.role == Role::Dark ? dark : flat;
+        for (const FramePiece& p : s.pieces) {
+            if (!p.present) continue;
+            std::vector<std::int64_t> frames(static_cast<std::size_t>(p.count));
+            for (std::int64_t k = 0; k < p.count; ++k) frames[static_cast<std::size_t>(k)] = p.source_first + k;
+            int got_rows = 0, got_cols = 0;
+            const std::vector<double> part = projection_store_sum(p.file, reduce, frames.data(), frames.size(), nullptr, nullptr, &got_rows, &got_cols);
+            if (got_rows != rows || got_cols != cols) throw Error(p.file + ": the store's darks and flats are float images of the level's size");
+            for (std::size_t i = 0; i < np; ++i) sum[i] += part[i];
+            (s.role == Role::Dark ? n_dark : n_flat) += static_cast<double>(p.count);
+        }
+    }
+    if (n_dark == 0 || n_flat == 0) throw Error("the projection store holds no dark or no flat frames of " + rec.path);
+    ff.dark.resize(np), ff.gain.resize(np);
+    for (std::size_t i = 0; i < np; ++i) {
+        ff.dark[i] = static_cast<float>(dark[i] / n_dark);
+        ff.gain[i] = static_cast<float>(std::max(1.0, flat[i] / n_flat - dark[i] / n_dark));
+    }
+    return ff;
+}
+
+}  // namespace
+
+Session::Session(const std::vector<std::string>& scans, int threads, int reduce, const std::string& store) : impl_(std::make_unique<Impl>()) {
     if (scans.empty()) throw Error("calibration session: no scan");
     if (reduce < 0 || reduce > 3) throw Error("calibration session: reduce is 0, 1, 2 or 3");
-    impl_->threads = threads, impl_->reduce = reduce;
+    impl_->threads = threads, impl_->reduce = reduce, impl_->store = store;
     for (const std::string& path : scans) {
-        impl_->records.push_back(std::make_unique<Record>(read_record(path)));
+        // (frames taken from a store: the detector's files are not opened, which a master on a remote mount has
+        // by the thousand)
+        impl_->records.push_back(std::make_unique<Record>(read_record(path, store.empty())));
         Record& rec = *impl_->records.back();
+        if (!store.empty()) frames_from_store(rec, store + "/" + rec.label);
         impl_->frames.push_back(std::make_unique<Frames>(rec, threads, reduce));
         if (reduce) {  // the record of a detector whose pixels are 2^reduce times as large
             const auto size = rec.technique.items.find("scan/sample_pixel_size");
@@ -297,6 +378,10 @@ const FlatField& Session::flat_field(int scan) {
     if (ff) return *ff;
     if (!impl_->reduce) {
         ff = std::make_unique<FlatField>(make_flat_field(frames(scan)));
+        return *ff;
+    }
+    if (!impl_->store.empty()) {  // a projection store brings its own
+        ff = std::make_unique<FlatField>(store_flat_field(record(scan), impl_->reduce, frames(scan).rows(), frames(scan).cols()));
         return *ff;
     }
     // At a reduced resolution: the stored dark and mean flat through the low-pass the frames' codestreams have
