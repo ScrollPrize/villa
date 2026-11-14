@@ -68,7 +68,9 @@ dust_threshold = 400  # remove components smaller than this many voxels
 max_area_threshold = 640_000  # drop components larger than this many voxels
 path_mode = 'interjoint'  # 'interjoint' = every chain between branch/terminal nodes; 'maximal_chain' = greedy longest-path peel
 slab_workers = 1  # CPU backend: slabs processed at once by worker processes
-kimimaro_parallel = 8  # CPU backend: Kimimaro processes per slab
+# CPU backend: Kimimaro processes per slab. Kimimaro starts them anew for every slab, which on
+# Windows takes far longer than the work they share out.
+kimimaro_parallel = 1 if sys.platform == 'win32' else 8
 
 BACKENDS = ('auto', 'gpu', 'cpu')
 # An unfilled placeholder such as '<bucket>' in a configured path.
