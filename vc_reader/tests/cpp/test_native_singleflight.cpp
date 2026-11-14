@@ -80,6 +80,31 @@ void namespaces() {
     auto ready=second.wait_for(1s);release.set_value();
     require(ready==std::future_status::ready&&second.get()==99&&first.get()==11,"quality namespaces cannot exchange decoded values");
 }
+void offline_policies(bool channels,bool fill) {
+    auto onlineSpec=source(std::string("offline-policy-")+(channels?"selected":"whole")+(fill?"fill":"error"));
+    std::promise<void> entered,release;auto released=release.get_future().share();
+    onlineSpec.compute=[&](const auto&,auto* out){entered.set_value();released.wait();std::fill_n(out,32,42);return true;};
+    auto offlineSpec=onlineSpec;offlineSpec.offline=true;offlineSpec.offline_fill=fill;
+    vcr::Array online(onlineSpec,{}),offline(offlineSpec,{});
+    if(channels)online.request_channel_cache({2});
+    auto first=std::async(std::launch::async,[&]{return sample(online);});entered.get_future().wait();
+    auto second=std::async(std::launch::async,[&]{
+        try{return int(sample(offline));}catch(const vcr::CacheMiss&){return -1;}
+    });
+    const auto ready=second.wait_for(1s);release.set_value();
+    require(ready==std::future_status::ready&&second.get()==(fill?0:-1)&&first.get()==42,
+        "offline cache misses/fills cannot join an online producer");
+}
+void offline_fill_shared_cache(bool channels) {
+    auto spec=source(channels?"offline-shared-selected":"offline-shared-whole");
+    spec.compute=[](const auto&,auto* out){std::fill_n(out,32,42);return true;};
+    auto offlineSpec=spec;offlineSpec.offline=true;offlineSpec.offline_fill=true;
+    auto cache=std::make_shared<vcr::MemoryCache>(4096);
+    vcr::Array offline(offlineSpec,cache),online(spec,cache);
+    if(channels)offline.request_channel_cache({2});
+    require(sample(offline)==0,"offline fill on uncached source");
+    require(sample(online)==42,"offline fill must not poison shared decoded cache");
+}
 void independent_chunks(bool channels) {
     auto spec=source(channels?"independent-selected":"independent-whole");
     const auto stripe=std::hash<std::string>{}("0.0.0.0")%256;size_t other=1;
@@ -131,5 +156,5 @@ void partial_followers() {
     for(int c=0;c<4;++c)for(int i=0;i<8;++i)
         require((*result)[c*8+i]==40+c,"whole follower assembles correct channel positions");
 }
-int main(){try{primitive();for(bool selected:{false,true}){shared_computation(selected);local_loads_join(selected);independent_chunks(selected);failures(selected);}namespaces();caller_thread();partial_followers();}
+int main(){try{primitive();for(bool selected:{false,true}){shared_computation(selected);local_loads_join(selected);independent_chunks(selected);failures(selected);offline_fill_shared_cache(selected);for(bool fill:{false,true})offline_policies(selected,fill);}namespaces();caller_thread();partial_followers();}
     catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}

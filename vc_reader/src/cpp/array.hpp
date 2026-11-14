@@ -1647,7 +1647,7 @@ private:
             return chunk_result(false);
         if (!decoded && spec_.offline) {
             if (!spec_.offline_fill) throw CacheMiss("chunk "+k+" of "+spec_.identity+" is not cached (offline)");
-            offline_miss(idx,ck);
+            offline_miss(idx);
             decoded = split(nullptr);
         }
         if (!decoded) {
@@ -1679,7 +1679,7 @@ private:
             if (!decoded) decoded = split(nullptr);
         }
         for (auto& c : decoded->channels) {
-            if (cache_) cache_->put(ck+"|channel="+std::to_string(c.index),c.bytes);
+            if (cache_ && (c.bytes || !spec_.offline)) cache_->put(ck+"|channel="+std::to_string(c.index),c.bytes);
         }
         stats_.channel_read_bytes += decoded->bytesRead;
         stats_.channel_decoded_bytes += decoded->bytesDecoded;
@@ -1728,7 +1728,7 @@ private:
             std::shared_ptr<const ChunkLoad> loaded;
             if(spec_.caller_thread_only)loaded=produce();
             else {
-                auto claim=channel_policy_->reads.acquire(ck);
+                auto claim=channel_policy_->reads.acquire(flight_key(ck));
                 if(cached_only&&!claim.owner())return {false,nullptr};
                 loaded=claim.resolve(produce);
             }
@@ -1740,14 +1740,14 @@ private:
                 for(auto c:missing) {
                     channels[c]=loaded->whole?std::make_shared<const Chunk>(
                         loaded->whole->begin()+c*plane,loaded->whole->begin()+(c+1)*plane):nullptr;
-                    if(cache_)cache_->put(channel_key(c),channels[c]);
+                    if(cache_&&(channels[c]||!spec_.offline))cache_->put(channel_key(c),channels[c]);
                 }
                 if(cache_)cache_->erase(ck);
                 missing.clear();
             } else {
                 for(const auto& c:loaded->channels) {
                     channels[c.index]=c.bytes;
-                    if(cache_&&cache_.get()!=loaded->cache.get())cache_->put(channel_key(c.index),c.bytes);
+                    if(cache_&&cache_.get()!=loaded->cache.get()&&(c.bytes||!spec_.offline))cache_->put(channel_key(c.index),c.bytes);
                 }
                 std::erase_if(missing,[&](auto c){
                     return std::any_of(loaded->channels.begin(),loaded->channels.end(),
@@ -2093,12 +2093,9 @@ private:
         apply(chunk,w,out_strides,op,output);
     }
 
-    // offline_fill: records a chunk no layer holds, and remembers it as absent in the
-    // memory cache so later reads (and cache-only samples) take it as fill at once.
-    void offline_miss(const Index& idx, const std::string& ck)
+    // An offline miss is reader-local evidence, never shared source absence.
+    void offline_miss(const Index& idx)
     {
-        if (cache_)
-            cache_->put(ck, nullptr);
         std::lock_guard lock(miss_mutex_);
         if (misses_.insert(idx).second)
             ++stats_.offline_misses;
@@ -2113,6 +2110,10 @@ private:
             if(cache_) {
                 auto entry=cache_->get(ck);
                 if(entry.first){++stats_.memory_hits;return entry.second;}
+            }
+            if(spec_.offline){
+                std::lock_guard lock(miss_mutex_);
+                if(misses_.contains(idx))return ChunkPtr{};
             }
             if(writes_) {
                 auto entry=writes_->pending(k);
@@ -2136,7 +2137,7 @@ private:
                 if(cached_only&&(skipped_store||http_||source_||spec_.compute||spec_.offline))
                     return chunk_result(false);
                 if(spec_.offline) {
-                    if(spec_.offline_fill){offline_miss(idx,ck);return chunk_result(true);}
+                    if(spec_.offline_fill){offline_miss(idx);return chunk_result(true);}
                     throw CacheMiss("chunk "+k+" of "+spec_.identity+" is not in the disk cache (offline)");
                 }
                 if(!http_&&!source_&&!spec_.compute)return chunk_result(true);
@@ -2147,7 +2148,7 @@ private:
             std::shared_ptr<const ChunkLoad> loaded;
             if(spec_.caller_thread_only)loaded=produce();
             else {
-                auto claim=channel_policy_->reads.acquire(ck);
+                auto claim=channel_policy_->reads.acquire(flight_key(ck));
                 if(cached_only&&!claim.owner())return {false,nullptr};
                 loaded=claim.resolve(produce);
             }
@@ -2159,10 +2160,10 @@ private:
                 // Channel selection was enabled during an earlier whole read.
                 // Reuse the selected result and request only the missing planes.
                 if(cache_&&cache_.get()!=loaded->cache.get())
-                    for(const auto& c:loaded->channels)cache_->put(ck+"|channel="+std::to_string(c.index),c.bytes);
+                    for(const auto& c:loaded->channels)if(c.bytes||!spec_.offline)cache_->put(ck+"|channel="+std::to_string(c.index),c.bytes);
                 return selected_span(idx,all_channels(),cached_only,nullptr,loaded);
             }
-            if(cache_&&cache_.get()!=loaded->cache.get())cache_->put(ck,loaded->whole);
+            if(cache_&&cache_.get()!=loaded->cache.get()&&(loaded->whole||!spec_.offline))cache_->put(ck,loaded->whole);
             return {true,loaded->whole};
         }
     }
@@ -2287,6 +2288,11 @@ private:
 
     ArraySpec spec_;
     std::shared_ptr<ChannelPolicy> channel_policy_;
+    // Offline misses/fills describe this reader's cache layers, not the source.
+    // Never broadcast them to an online reader or a different offline cache.
+    std::string flight_key(const std::string& key) const {
+        return spec_.offline ? key+"|offline:"+std::to_string(reinterpret_cast<std::uintptr_t>(this)) : key;
+    }
     std::shared_ptr<MemoryCache> cache_;
     std::shared_ptr<ThreadPool> pool_;  // shared with arrays asking for as many workers
     MapCache maps_;
