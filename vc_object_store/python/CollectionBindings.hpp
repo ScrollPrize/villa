@@ -20,9 +20,11 @@ struct PyCollectionReader {
     std::unique_ptr<vo::ObjectCollection> collection;
     std::unique_ptr<vo::CollectionTxn> txn;
     PyCollectionReader(const std::filesystem::path& path,const std::vector<std::filesystem::path>& files,
-                       const std::vector<std::filesystem::path>& directories) {
+                       const std::vector<std::filesystem::path>& directories,const std::optional<nb::dict>& position) {
         vo::OpenOptions options;options.readOnly=true;
+        options.readPosition=vc::python::storePositionFromPy(position);
         options.storeReferenceFiles=files;options.storeReferenceDirectories=directories;
+        nb::gil_scoped_release release;
         collection=std::make_unique<vo::ObjectCollection>(vo::ObjectCollection::open(path,options));
         txn=std::make_unique<vo::CollectionTxn>(collection->read());
     }
@@ -45,10 +47,9 @@ inline void bindCollectionApi(nb::module_& module) {
     nb::class_<PyCollectionReader>(module,"CollectionReader",
         "Read one logical snapshot across plain, packed, sharded and referenced stores.")
     .def(nb::init<const std::filesystem::path&,const std::vector<std::filesystem::path>&,
-                 const std::vector<std::filesystem::path>&>(),"path"_a,
+                 const std::vector<std::filesystem::path>&,const std::optional<nb::dict>&>(),"path"_a,
          "store_reference_files"_a=std::vector<std::filesystem::path>{},
-         "store_reference_directories"_a=std::vector<std::filesystem::path>{},
-         nb::call_guard<nb::gil_scoped_release>())
+         "store_reference_directories"_a=std::vector<std::filesystem::path>{},"position"_a=std::nullopt)
     .def("close",&PyCollectionReader::close)
     .def("__enter__",[](PyCollectionReader& self)->PyCollectionReader&{self.check();return self;},nb::rv_policy::reference_internal)
     .def("__exit__",[](PyCollectionReader& self,nb::args){self.close();})
@@ -68,6 +69,9 @@ inline void bindCollectionApi(nb::module_& module) {
         nb::dict result;result["store_uuid"]=self.collection->uuid(*self.txn);
         result["generation"]=p.generation;result["commit_sequence"]=p.commitSequence;return result;
     })
+    .def_prop_ro("supports_trusted_geometry_reads",[](PyCollectionReader& self){
+        self.check();return self.collection->supportsTrustedGeometryReads(*self.txn);
+    },"Whether the complete pinned scope is sealed and history-off.")
     .def_prop_ro("members",[](PyCollectionReader& self){
         self.check();nb::list result;
         for(const auto& member:self.collection->members()) {
@@ -124,17 +128,7 @@ inline void bindCollectionApi(nb::module_& module) {
         const std::optional<nb::dict>& expected,size_t workers,bool profile,bool trustedImmutable){
         self.check();
         if(uuids.shape(1)!=16)throw std::invalid_argument("geometry object UUIDs must be a uint8 [N,16] column");
-        std::optional<vo::StoreStatus> position;
-        if(expected){
-            auto value=nlohmann::json::parse(jsonDumps(*expected));
-            // CollectionReader.source uses the extension-source spelling;
-            // ordinary store positions use the common `store` spelling.
-            if(value.contains("store_uuid")){
-                if(value.contains("store"))throw std::invalid_argument("geometry position has two store keys");
-                value["store"]=value.at("store_uuid");value.erase("store_uuid");
-            }
-            position=vo::detail::storePositionFrom(value);
-        }
+        const auto position=vc::python::storePositionFromPy(expected);
         auto columns=std::make_unique<vo::ObjectCollection::GeometryArrayColumns>();
         std::unique_ptr<uint8_t[]> text;
         {nb::gil_scoped_release release;
@@ -223,7 +217,7 @@ inline void bindCollectionApi(nb::module_& module) {
     module.def("import_initial_records",[](const std::filesystem::path& destination,const nb::sequence& objects,
             const nb::sequence& edges,const nb::sequence& definitions,const std::vector<std::filesystem::path>& dependencies,
             size_t workers,bool packed,bool edgeAdjacencyIndex,
-            const std::optional<std::vector<std::string>>& edgeColumns){
+            const std::optional<std::vector<std::string>>& edgeColumns,const nb::sequence& dependencyPins){
         if(!workers||workers>1024)throw std::invalid_argument("workers must be in 1..1024");
         std::vector<vo::InitialObjectRecord> records;records.reserve(nb::len(objects));
         for(const auto input:objects){const auto row=nb::cast<nb::dict>(input);vo::InitialObjectRecord record;
@@ -235,6 +229,7 @@ inline void bindCollectionApi(nb::module_& module) {
             edge.record=edgeFromPy(nb::cast<nb::dict>(row["record"]));edge.a={"",edge.record.aUuid};edge.b={"",edge.record.bUuid};
             edge.extensions=initialExtensions(row);relations.push_back(std::move(edge));}
         vo::InitialImportOptions options;options.shards.resize(workers);options.dependencies=dependencies;
+        options.dependencyPins=vo::extensionSourcesFromJson(jsonDumps(dependencyPins));
         const auto stride=INT64_MAX/static_cast<int64_t>(workers);
         for(size_t i=0;i<workers;++i){const std::array<int64_t,2> range{
             1+static_cast<int64_t>(i)*stride,static_cast<int64_t>(i+1)*stride};
@@ -264,7 +259,7 @@ inline void bindCollectionApi(nb::module_& module) {
         out["ingestion_seconds"]=result.ingestionSeconds;out["persistence_seconds"]=result.persistenceSeconds;return out;
     },"destination"_a,"objects"_a,"edges"_a=nb::list(),"extensions"_a=nb::list(),
       "dependencies"_a=std::vector<std::filesystem::path>{},"workers"_a=1,"packed"_a=false,
-      "edge_adjacency_index"_a=true,"edge_columns"_a=std::nullopt);
+      "edge_adjacency_index"_a=true,"edge_columns"_a=std::nullopt,"dependency_pins"_a=nb::list());
 
     module.def("write_extension_store",[](const std::filesystem::path& path,
             const std::vector<std::filesystem::path>& bases,const nb::sequence& definitions,const nb::dict& payload){

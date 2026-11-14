@@ -9,8 +9,10 @@ inline constexpr const char* immutableImportFeature="immutable-initial-v1";
 bool immutableInitial(sqlite3*);
 struct InitialCollectionAccess {
     static ObjectCollection create(const std::filesystem::path&,
-        const std::vector<std::filesystem::path>&,const OpenOptions&);
+        const std::vector<std::filesystem::path>&,const OpenOptions&,std::span<const ExtensionSource> pins={});
     static CollectionMember sealShard(ObjectCollection&,CollectionTxn&);
+    static std::vector<CollectionMember> mutableDependencyPins(const ObjectCollection&);
+    static void verifyMutableDependencyPins(std::span<const CollectionMember>);
     static sqlite3* connection(ObjectCollection&,CollectionTxn&);
     // Builder-owned private destination and already completed shard descriptors.
     // Writes routing directly; never opens or validates a collection/shard.

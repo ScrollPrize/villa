@@ -137,7 +137,7 @@ Json metadata(sqlite3* db, const ObjectRevisionKey& key)
     const auto& revision = std::get<std::string>(key);
     db=resolveReference(db,[&](sqlite3* source){
         if(!historyEnabled(source))return false;
-        Statement row(source,"SELECT 1 FROM object_revisions WHERE uuid=?",parseUuid(revision));return row.row();
+        Statement row(source,"SELECT 1 FROM main.object_revisions WHERE uuid=?",parseUuid(revision));return row.row();
     });
     if(!db)throw std::runtime_error("history: unavailable object revision");
     // Common case: the materialized head, without any history replay.
@@ -146,8 +146,8 @@ Json metadata(sqlite3* db, const ObjectRevisionKey& key)
     if (current.row()) return Json::parse(current.text(0));
     Statement chain(db,
         "WITH RECURSIVE chain(uuid,parent_uuid,seq,metadata_delta) AS ("
-        "SELECT uuid,parent_uuid,seq,metadata_delta FROM object_revisions WHERE uuid=? UNION ALL "
-        "SELECT r.uuid,r.parent_uuid,r.seq,r.metadata_delta FROM object_revisions r "
+        "SELECT uuid,parent_uuid,seq,metadata_delta FROM main.object_revisions WHERE uuid=? UNION ALL "
+        "SELECT r.uuid,r.parent_uuid,r.seq,r.metadata_delta FROM main.object_revisions r "
         "JOIN chain c ON r.uuid=c.parent_uuid) SELECT metadata_delta FROM chain ORDER BY seq", sqlKey);
     auto result = Json::object();
     while (chain.row()) {
@@ -172,8 +172,8 @@ std::map<std::string, std::string> members(sqlite3* db, const std::string& revis
     }
     Statement s(db,
         "WITH RECURSIVE chain(uuid,parent_uuid,seq) AS ("
-        "SELECT uuid,parent_uuid,seq FROM object_revisions WHERE uuid=? UNION ALL "
-        "SELECT r.uuid,r.parent_uuid,r.seq FROM object_revisions r JOIN chain c ON r.uuid=c.parent_uuid) "
+        "SELECT uuid,parent_uuid,seq FROM main.object_revisions WHERE uuid=? UNION ALL "
+        "SELECT r.uuid,r.parent_uuid,r.seq FROM main.object_revisions r JOIN chain c ON r.uuid=c.parent_uuid) "
         "SELECT d.edge_uuid,d.relationship_uuid FROM chain c JOIN object_relationship_deltas d "
         "ON d.revision_uuid=c.uuid ORDER BY c.seq", parseUuid(revision));
     while (s.row()) {
@@ -187,10 +187,10 @@ RelationshipRevision relationship(sqlite3* db, const std::string& uuid)
 {
     db=resolveReference(db,[&](sqlite3* source){
         if(!historyEnabled(source))return false;
-        Statement row(source,"SELECT 1 FROM relationship_revisions WHERE uuid=?",parseUuid(uuid));return row.row();
+        Statement row(source,"SELECT 1 FROM main.relationship_revisions WHERE uuid=?",parseUuid(uuid));return row.row();
     });
     if(!db)throw std::runtime_error("object history: unavailable relationship revision");
-    Statement s(db, "SELECT record,a_revision,b_revision,a_geometry,b_geometry FROM relationship_revisions WHERE uuid=?",
+    Statement s(db, "SELECT record,a_revision,b_revision,a_geometry,b_geometry FROM main.relationship_revisions WHERE uuid=?",
         parseUuid(uuid));
     if (!s.row()) throw std::runtime_error("object history: missing relationship revision");
     RelationshipRevision result;
@@ -202,7 +202,7 @@ RelationshipRevision relationship(sqlite3* db, const std::string& uuid)
     if (const auto* archive = std::get_if<std::string>(&aKey)) result.aRevision = *archive;
     if (const auto* archive = std::get_if<std::string>(&bKey)) result.bRevision = *archive;
     result.aGeometryRevision = optionalUuid(s,3); result.bGeometryRevision = optionalUuid(s,4);
-    Statement version(db, "SELECT version,generation FROM relationship_versions WHERE revision_uuid=?", parseUuid(uuid));
+    Statement version(db, "SELECT version,generation FROM main.relationship_versions WHERE revision_uuid=?", parseUuid(uuid));
     if (version.row()) { result.version=version.i64(0); result.generation=version.uuid(1); }
     result.record.version = result.version;
     result.record.versionGeneration = result.generation;
@@ -757,14 +757,14 @@ std::optional<ResolvedObjectVersion> detail::resolveObjectRevision(sqlite3* db,c
     const auto canonical=formatUuid(parseUuid(uuid));
     db=resolveReference(db,[&](sqlite3* source){
         if(!historyEnabled(source))return false;
-        Statement row(source,"SELECT 1 FROM object_revisions WHERE uuid=?",parseUuid(canonical));return row.row();
+        Statement row(source,"SELECT 1 FROM main.object_revisions WHERE uuid=?",parseUuid(canonical));return row.row();
     });
     if(!db)return std::nullopt;
-    Statement s(db,"SELECT object_uuid,parent_uuid,geometry_uuid,seq,metadata_complete,published_at_us,deleted FROM object_revisions WHERE uuid=?",parseUuid(canonical));
+    Statement s(db,"SELECT object_uuid,parent_uuid,geometry_uuid,seq,metadata_complete,published_at_us,deleted FROM main.object_revisions WHERE uuid=?",parseUuid(canonical));
     if(!s.row())return std::nullopt;
     auto result=revisionColumns(s,0,canonical);
     result.storeUuid=storeUuidText(db);
-    Statement version(db,"SELECT version,generation,commit_seq FROM object_versions WHERE revision_uuid=?",parseUuid(canonical));
+    Statement version(db,"SELECT version,generation,commit_seq FROM main.object_versions WHERE revision_uuid=?",parseUuid(canonical));
     if(version.row()){result.version=version.i64(0);result.generation=version.uuid(1);if(!version.isNull(2))result.commitSequence=version.i64(2);}
     setRecord(result,metadata(db,canonical));
     return ResolvedObjectVersion{db,std::move(result)};
@@ -789,7 +789,7 @@ std::optional<ResolvedObjectVersion> detail::resolveObjectVersion(sqlite3* db,co
             revision.record=std::move(record);
             result=ResolvedObjectVersion{source,std::move(revision)};return true;
         }
-        Statement row(source,"SELECT revision_uuid FROM object_versions WHERE object_uuid=? AND version=? AND generation=?",
+        Statement row(source,"SELECT revision_uuid FROM main.object_versions WHERE object_uuid=? AND version=? AND generation=?",
             parseUuid(reference.objectUuid),reference.version,parseUuid(generation));
         if(!row.row())return false;
         result=resolveObjectRevision(source,row.uuid(0));return bool(result);
@@ -882,7 +882,7 @@ RevisionSelection detail::revisionSelectionAt(sqlite3* db,const std::string& own
     Statement s(source,
         "SELECT object_uuid,uuid FROM (SELECT object_uuid,uuid,deleted,"
         "row_number() OVER (PARTITION BY object_uuid ORDER BY published_at_us DESC,seq DESC) AS position "
-        "FROM object_revisions WHERE published_at_us<=?) WHERE position=1 AND deleted=0 ORDER BY object_uuid",
+        "FROM main.object_revisions WHERE published_at_us<=?) WHERE position=1 AND deleted=0 ORDER BY object_uuid",
         publishedAtUs);
     while (s.row())
         if (includeRetired || !resolveObjectRevision(source,formatUuid(s.blob16(1)))->revision.record.retired)
@@ -1020,7 +1020,7 @@ std::optional<RelationshipRevision> ObjectStore::relationshipAtVersion(const Txn
             if(edge.version!=ref.version||edge.versionGeneration!=generation)return false;
             result=recordedRelationship(source,edge.uuid);return true;
         }
-        Statement row(source,"SELECT revision_uuid FROM relationship_versions WHERE edge_uuid=? AND version=? AND generation=? "
+        Statement row(source,"SELECT revision_uuid FROM main.relationship_versions WHERE edge_uuid=? AND version=? AND generation=? "
             "AND revision_uuid IS NOT NULL",parseUuid(ref.relationshipUuid),ref.version,parseUuid(generation));
         if(!row.row())return false;
         result=relationship(source,row.uuid(0));return true;

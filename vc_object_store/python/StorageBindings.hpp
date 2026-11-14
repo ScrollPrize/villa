@@ -21,6 +21,7 @@
 #include "internal/Anchors.hpp"
 #include "internal/JsonFields.hpp"
 #include "internal/RecordFields.hpp"
+#include "internal/ObjectVersionJson.hpp"
 
 namespace nb = nanobind;
 namespace vo = vc::objects;
@@ -283,6 +284,15 @@ std::vector<vo::GeometryEdgeEdit> edgeEditsFromPy(const nb::list& edits)
 
 }
 namespace vc::python {
+inline std::optional<vo::StoreStatus> storePositionFromPy(const std::optional<nb::dict>& input) {
+    if(!input)return std::nullopt;
+    auto value=nlohmann::json::parse(jsonDumps(*input));
+    if(value.contains("store_uuid")){
+        if(value.contains("store"))throw std::invalid_argument("store position has two store keys");
+        value["store"]=value.at("store_uuid");value.erase("store_uuid");
+    }
+    return vo::detail::storePositionFrom(value);
+}
 struct PyObjectStore {
     std::shared_ptr<vo::ObjectStore> db;
 
@@ -321,10 +331,12 @@ struct PyObjectStore {
 
     static PyObjectStore open(const std::string& path, const std::optional<std::string>& author,
                                            bool readOnly, const std::optional<std::string>& hostname,
-                                           int readerPoolSize, size_t geometryCacheBytes, size_t spatialCacheBytes, const nb::object& catalog)
+                                           int readerPoolSize, size_t geometryCacheBytes, size_t spatialCacheBytes, const nb::object& catalog,
+                                           const std::optional<nb::dict>& position)
     {
         vo::OpenOptions o;
         o.readOnly = readOnly;
+        o.readPosition=storePositionFromPy(position);
         o.author = author.value_or("");
         o.hostnameOverride = hostname;
         o.readerPoolSize = readerPoolSize;

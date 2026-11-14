@@ -190,7 +190,7 @@ void changeHistoryMode(const std::filesystem::path& input, HistoryMode mode)
     if (hasReceipts) exec(db, "INSERT INTO transaction_receipts SELECT * FROM _policy_receipts; DROP TABLE _policy_receipts;");
     execute(db,"UPDATE store_manifest SET history_enabled=?",int64_t(enabled));
     if (enabled) {
-        execute(db, "INSERT INTO history_generations VALUES(?,0,?,?)", policy.blob16(4),
+        execute(db, "INSERT INTO history_generations VALUES(?,?,?,?)", policy.blob16(4),policy.i64(3),
             std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count(),
             std::string("history enabled"));
         // A lineage restart does not republish untouched objects. Preserve

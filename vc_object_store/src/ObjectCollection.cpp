@@ -23,6 +23,7 @@
 #include "internal/Extensions.hpp"
 #include "internal/ExtensionHistory.hpp"
 #include "internal/DatabaseCopy.hpp"
+#include "internal/HistoricalSnapshot.hpp"
 #include <variant>
 #include <limits>
 #include <numeric>
@@ -103,6 +104,17 @@ std::array<int64_t,2> reservation(sqlite3* db,const char* name) {
     if(!s.row()) throw std::runtime_error("collection: missing key reservation");
     return {s.i64(0),s.i64(1)};
 }
+// A dependency pin selects its retained publication, not the owner's moving
+// head. Partitions and sources without history still require exact equality.
+void requireDependencySnapshot(sqlite3* db,const CollectionMember& expected) {
+    Statement pin(db,"SELECT s.uuid,d.uuid,m.generation,m.commit_sequence,m.sealed,m.history_enabled FROM main.store_identity s,main.database_identity d,main.store_manifest m");
+    if(!pin.row()||formatUuid(pin.blob16(0))!=expected.storeUuid||formatUuid(pin.blob16(1))!=expected.databaseUuid||
+       (!pin.i64(4)&&(expected.partition||!pin.i64(5)))||
+       (expected.partition&&(reservation(db,"objects")!=expected.objectIds||pin.i64(3)!=expected.commitSequence||pin.uuid(2)!=expected.generation)))
+        throw StoreBusy("collection: dependency snapshot changed, missing, or lacks sealed/history-enabled retention");
+    if(pin.i64(3)!=expected.commitSequence||pin.uuid(2)!=expected.generation)
+        requireRetainedPublication(db,{expected.storeUuid,expected.generation,expected.commitSequence});
+}
 void insertMember(sqlite3* db,int64_t ordinal,const CollectionMember& m,const std::string& ref) {
     const auto objects=m.partition?m.objectIds:std::array<int64_t,2>{0,0};
     execute(db,"INSERT INTO collection_members VALUES(?,?,?,?,?,?,?,?,?)",ordinal,parseUuid(m.databaseUuid),
@@ -181,6 +193,7 @@ struct ObjectCollection::Impl {
         // Immutable table-level facts, never per-object routing/cache entries.
         // Mutable stores remain conservative so later inserts stay visible.
         bool objectsMayExist=true,edgesMayExist=true;
+        bool mutableReference=false;
     };
     std::vector<Node> nodes;
     OpenOptions options;
@@ -357,11 +370,18 @@ struct CollectionTxn::Impl {
     const Txn& get(size_t n) const {
         const Txn* txn=nullptr;
         if(n==0)txn=&std::visit([](auto& x)->const Txn&{return x;},root);
-        else {auto& r=reads[n];if(!r)r=std::make_unique<ReadTxn>(owner->nodes[n].store->read());txn=r.get();}
+        else {auto& r=reads[n];if(!r){
+            auto read=std::make_unique<ReadTxn>(owner->nodes[n].store->read());
+            if(owner->nodes[n].mutableReference)
+                requireDependencySnapshot(ObjectStoreImplAccess::conn(*read),owner->nodes[n].member);
+            r=std::move(read);
+        }txn=r.get();}
         auto* db=ObjectStoreImplAccess::conn(*txn);
         auto* pool=activeStatementPools.at(db);
         if(configured.insert(pool).second){
-            try{owner->installCallbacks(db,n,[this](size_t i){return ObjectStoreImplAccess::conn(get(i));});}
+            try{owner->installCallbacks(db,n,[this](size_t i){return ObjectStoreImplAccess::conn(get(i));});
+                if(owner->nodes[n].mutableReference){const auto& pin=owner->nodes[n].member;
+                    pool->historicalSnapshot=historicalSnapshot(db,{pin.storeUuid,pin.generation,pin.commitSequence});}}
             catch(...){pool->referenceSource={};pool->objectSource={};pool->edgeSource={};pool->querySources={};pool->objectSelectionArguments={};configured.erase(pool);throw;}
         }
         return *txn;
@@ -399,6 +419,9 @@ WriteTxn& ObjectCollection::Impl::writer(CollectionTxn& t){check(t);if(!t.writab
 
 void ObjectCollection::Impl::load(const std::filesystem::path& input,bool root,const std::optional<CollectionMember>& expected,std::set<std::string>& visiting,sqlite3* existingRoot) {
     auto path=input;auto opt=root?options:readonlyOptions(options);opt.physicalPartitionOnly=true;
+    // Collection callbacks must be installed before reconstructing borrowed
+    // archive parents; this layer owns position selection for physical handles.
+    opt.readPosition.reset();
     std::unique_ptr<ObjectStore> store;std::unique_ptr<ReadTxn> read;
     if(expected&&!existingRoot){
         // Reuse the successful candidate's connection/snapshot. This is file
@@ -413,11 +436,7 @@ void ObjectCollection::Impl::load(const std::filesystem::path& input,bool root,c
                 if(!attempted.insert(selected).second)return false;
                 auto opened=std::make_unique<ObjectStore>(ObjectStore::open(selected,opt));
                 auto snapshot=std::make_unique<ReadTxn>(opened->read());auto* candidateSql=ObjectStoreImplAccess::conn(*snapshot);
-                Statement pin(candidateSql,"SELECT s.uuid,d.uuid,m.generation,m.commit_sequence,m.sealed FROM store_identity s,database_identity d,store_manifest m");
-                if(!pin.row()||formatUuid(pin.blob16(0))!=expected->storeUuid||formatUuid(pin.blob16(1))!=expected->databaseUuid||
-                   formatUuid(pin.blob16(2))!=expected->generation||pin.i64(3)!=expected->commitSequence||pin.i64(4)==0||
-                   (expected->partition&&reservation(candidateSql,"objects")!=expected->objectIds))
-                    throw std::runtime_error("dependency identity/lineage/commit sequence/sealed policy/reservation mismatch");
+                requireDependencySnapshot(candidateSql,*expected);
                 path=std::move(selected);store=std::move(opened);read=std::move(snapshot);return true;
             }catch(const std::bad_alloc&){throw;}
             catch(const std::exception& error){if(directError.empty())directError=error.what();return false;}
@@ -444,12 +463,21 @@ void ObjectCollection::Impl::load(const std::filesystem::path& input,bool root,c
     if(!header.row())throw std::runtime_error("collection: absent manifest identity");
     DatabaseIdentity id;id.uuid=formatUuid(header.blob16(1));
     CollectionMember member{id.uuid,formatUuid(header.blob16(0)),formatUuid(header.blob16(2)),header.i64(3),path,expected?expected->partition:false,reservation(sql,"objects")};
-    if(!root&&header.i64(4)==0)throw std::runtime_error("collection: dependency is not sealed: "+path.string());
-    if(expected&&(member.databaseUuid!=expected->databaseUuid||member.storeUuid!=expected->storeUuid||member.generation!=expected->generation||member.commitSequence!=expected->commitSequence||
-                  (expected->partition&&member.objectIds!=expected->objectIds)))
-        throw std::runtime_error("collection: dependency identity/lineage/commit sequence/reservation mismatch: "+path.string());
+    if(!root)requireDependencySnapshot(sql,*expected);
+    const bool historical=expected&&member.commitSequence!=expected->commitSequence;
+    if(expected){member.generation=expected->generation;member.commitSequence=expected->commitSequence;}
+    const bool rootHistorical=root&&options.readPosition&&header.i64(3)!=options.readPosition->commitSequence;
+    if(root&&options.readPosition){
+        requireRetainedPublication(sql,*options.readPosition);
+        member.generation=util::canonicalUuid(options.readPosition->generation);member.commitSequence=options.readPosition->commitSequence;
+    }
     if(visiting.contains(id.uuid))throw std::runtime_error("collection: cyclic database dependency");
-    if(byDatabase.contains(id.uuid))return;
+    if(const auto known=byDatabase.find(id.uuid);known!=byDatabase.end()){
+        const auto& previous=nodes[known->second].member;
+        if(previous.storeUuid!=member.storeUuid||previous.generation!=member.generation||previous.commitSequence!=member.commitSequence)
+            throw std::runtime_error("collection: conflicting retained publication pins for one database");
+        return;
+    }
     const auto statePin=std::pair{member.generation,member.commitSequence};
     if(auto it=pinned.find(member.storeUuid);it!=pinned.end()&&it->second!=statePin)
         throw std::runtime_error("collection: inconsistent repeated store lineage or commit sequence");
@@ -472,11 +500,12 @@ void ObjectCollection::Impl::load(const std::filesystem::path& input,bool root,c
     }
     if(read)read->commit();byDatabase[id.uuid]=nodes.size();std::vector<std::string> childIds;for(auto& c:children)childIds.push_back(c.databaseUuid);
     bool objectsMayExist=true,edgesMayExist=true;
-    if(header.i64(4)!=0){
+    if(header.i64(4)!=0&&!historical&&!rootHistorical){
         Statement present(sql,"SELECT EXISTS(SELECT 1 FROM objects),EXISTS(SELECT 1 FROM edges)");present.row();
         objectsMayExist=present.i64(0)!=0;edgesMayExist=present.i64(1)!=0;
     }
-    nodes.push_back({std::move(store),member,composed,routes,childIds,objectsMayExist,edgesMayExist});visiting.insert(id.uuid);
+    nodes.push_back({std::move(store),member,composed,routes,childIds,objectsMayExist,edgesMayExist,
+        (root&&options.readPosition.has_value())||(!root&&(header.i64(4)==0||historical))});visiting.insert(id.uuid);
     for(const auto& child:children)load(child.locator,false,child,visiting);
     visiting.erase(id.uuid);
 }
@@ -521,10 +550,17 @@ struct detail::CollectionReadContext {
     ~CollectionReadContext(){detach();}
     sqlite3* get(size_t n){
         sqlite3* sql=root;
-        if(n){auto& r=readers[n];if(!r)r=std::make_unique<ReadTxn>(collection.nodes[n].store->read());sql=ObjectStoreImplAccess::conn(*r);}
+        if(n){auto& r=readers[n];if(!r){
+            auto read=std::make_unique<ReadTxn>(collection.nodes[n].store->read());
+            if(collection.nodes[n].mutableReference)
+                requireDependencySnapshot(ObjectStoreImplAccess::conn(*read),collection.nodes[n].member);
+            r=std::move(read);
+        }sql=ObjectStoreImplAccess::conn(*r);}
         auto* pool=activeStatementPools.at(sql);
         if(configured.insert(pool).second){
-            try{collection.installCallbacks(sql,n,[this](size_t i){return get(i);});}
+            try{collection.installCallbacks(sql,n,[this](size_t i){return get(i);});
+                if(collection.nodes[n].mutableReference){const auto& pin=collection.nodes[n].member;
+                    pool->historicalSnapshot=historicalSnapshot(sql,{pin.storeUuid,pin.generation,pin.commitSequence});}}
             catch(...){pool->referenceSource={};pool->objectSource={};pool->edgeSource={};pool->querySources={};pool->objectSelectionArguments={};configured.erase(pool);throw;}
         }
         return sql;
@@ -564,15 +600,17 @@ ObjectCollection::ObjectCollection(std::unique_ptr<Impl> p):impl_(std::move(p)){
 ObjectCollection::ObjectCollection(ObjectCollection&&) noexcept=default;
 ObjectCollection::~ObjectCollection()=default;
 ObjectCollection ObjectCollection::open(const std::filesystem::path& path,const OpenOptions& options){
+    if(options.readPosition&&!options.readOnly)throw std::invalid_argument("a historical read position requires a read-only open");
     auto p=std::make_unique<Impl>();p->options=options;std::set<std::string> visiting;p->load(path,true,{},visiting);p->buildReadPlan();return ObjectCollection(std::move(p));
 }
 ObjectCollection ObjectCollection::create(const std::filesystem::path& path,const std::vector<std::filesystem::path>& bases,const OpenOptions& options){
     std::vector<CollectionMember> members;int64_t commitSequence=options.initialCommitSequence;
     const auto readOptions=readonlyOptions(options);
     for(const auto& base:bases){auto c=open(base,readOptions);auto t=c.read();auto p=c.provisioning(t);
-        if(!p.sealed)throw std::runtime_error("collection: base must be sealed");
+        if(!p.sealed&&p.history!=HistoryMode::On)throw std::runtime_error("collection: base must be sealed or history enabled");
         if(p.commitSequence>=INT64_MAX-1)throw std::runtime_error("collection: dependency commit sequence exhausted");
-        commitSequence=std::max(commitSequence,p.commitSequence);members.push_back(c.impl_->nodes[0].member);
+        commitSequence=std::max(commitSequence,p.commitSequence);auto member=c.impl_->nodes[0].member;
+        member.generation=p.generation;member.commitSequence=p.commitSequence;members.push_back(std::move(member));
     }
     auto opt=options;opt.initialCommitSequence=std::max(opt.initialCommitSequence,commitSequence);opt.physicalPartitionOnly=true;
     StagedDatabase staged(path,isBuildingPackedDatabasePath(path));
@@ -585,16 +623,25 @@ ObjectCollection ObjectCollection::create(const std::filesystem::path& path,cons
     return open(path,options);
 }
 ObjectCollection detail::InitialCollectionAccess::create(const std::filesystem::path& path,
-    const std::vector<std::filesystem::path>& bases,const OpenOptions& options)
+    const std::vector<std::filesystem::path>& bases,const OpenOptions& options,std::span<const ExtensionSource> pins)
 {
     // This path is private to the initial builder, which owns staging and
     // publication. No intermediate writable store is published or reopened.
     std::vector<CollectionMember> members;int64_t commitSequence=options.initialCommitSequence;
     const auto readOptions=readonlyOptions(options);
     for(const auto& base:bases){auto c=ObjectCollection::open(base,readOptions);auto r=c.read();
-        const auto p=c.provisioning(r);if(!p.sealed||p.commitSequence>=INT64_MAX-1)
-            throw std::runtime_error("initial collection needs sealed, non-exhausted dependencies");
-        commitSequence=std::max(commitSequence,p.commitSequence);members.push_back(c.impl_->nodes[0].member);}
+        const auto p=c.provisioning(r);if((!p.sealed&&p.history!=HistoryMode::On)||p.commitSequence>=INT64_MAX-1)
+            throw std::runtime_error("initial collection needs sealed or history-enabled, non-exhausted dependencies");
+        auto member=c.impl_->nodes[0].member;member.generation=p.generation;member.commitSequence=p.commitSequence;
+        for(const auto& pin:pins)if(util::canonicalUuid(pin.storeUuid)==member.storeUuid){
+            member.generation=util::canonicalUuid(pin.generation);member.commitSequence=pin.commitSequence;
+            requireDependencySnapshot(c.impl_->db(r,0),member);
+        }
+        commitSequence=std::max(commitSequence,member.commitSequence);members.push_back(std::move(member));}
+    std::set<std::string> specified;
+    for(const auto& pin:pins){const auto owner=util::canonicalUuid(pin.storeUuid);
+        if(!specified.insert(owner).second||std::none_of(members.begin(),members.end(),[&](const auto& m){return m.storeUuid==owner;}))
+            throw std::invalid_argument("initial dependency pins must name distinct direct source stores");}
     auto opt=options;opt.initialCommitSequence=commitSequence;opt.physicalPartitionOnly=true;
     auto store=std::make_unique<ObjectStore>(ObjectStoreImplAccess::createInitial(path,opt));
     auto p=std::make_unique<ObjectCollection::Impl>();p->options=opt;
@@ -622,6 +669,18 @@ CollectionMember detail::InitialCollectionAccess::sealShard(ObjectCollection& co
     member.partition=true;
     transaction.commit();collection.checkpoint();
     return member;
+}
+std::vector<CollectionMember> detail::InitialCollectionAccess::mutableDependencyPins(const ObjectCollection& collection) {
+    std::vector<CollectionMember> result;
+    for(const auto& node:collection.impl_->nodes)if(node.mutableReference)result.push_back(node.member);
+    return result;
+}
+void detail::InitialCollectionAccess::verifyMutableDependencyPins(std::span<const CollectionMember> members) {
+    OpenOptions options;options.readOnly=true;options.physicalPartitionOnly=true;options.readerPoolSize=1;
+    for(const auto& member:members){
+        auto source=ObjectStore::open(member.locator,options);auto read=source.read();
+        requireDependencySnapshot(ObjectStoreImplAccess::conn(read),member);
+    }
 }
 sqlite3* detail::InitialCollectionAccess::connection(ObjectCollection& collection,CollectionTxn& transaction) {
     collection.impl_->writer(transaction);return collection.impl_->db(transaction,0);
@@ -682,6 +741,14 @@ CollectionTxn ObjectCollection::write(){if(!impl_->nodes[0].collection)throw std
 std::string ObjectCollection::uuid(const CollectionTxn& t)const{impl_->check(t);return impl_->nodes[0].member.storeUuid;}
 StoreProvisioning ObjectCollection::provisioning(const CollectionTxn& t)const{return impl_->nodes[0].store->provisioning(impl_->txn(t,0));}
 
+bool ObjectCollection::supportsTrustedGeometryReads(const CollectionTxn& txn)const {
+    impl_->check(txn);
+    for(size_t i=0;i<impl_->nodes.size();++i){
+        const auto policy=impl_->nodes[i].store->provisioning(impl_->txn(txn,i));
+        if(!policy.sealed||policy.history!=HistoryMode::Off)return false;
+    }
+    return true;
+}
 ObjectCollection::GeometryArrayColumns ObjectCollection::readGeometryArrayColumns(const CollectionTxn& txn,
     std::span<const std::array<unsigned char,16>> requested,const std::string& name,
     const std::optional<std::string>& kind,const std::optional<std::string>& volume,
@@ -707,14 +774,12 @@ ObjectCollection::GeometryArrayColumns ObjectCollection::readGeometryArrayColumn
         // This explicit mode is only valid for a complete immutable scope.
         // Prove it once, before allowing internal readers to skip integrity
         // rechecks; never infer it from a read-only SQLite connection.
-        for(size_t i=0;i<impl_->nodes.size();++i){
-            const auto scope=impl_->nodes[i].store->provisioning(impl_->txn(txn,i));
-            if(!scope.sealed||scope.history!=HistoryMode::Off)
-                throw std::invalid_argument("trusted immutable geometry reads require sealed history-off stores throughout the collection");
-        }
+        if(!supportsTrustedGeometryReads(txn))
+            throw std::invalid_argument("trusted immutable geometry reads require sealed history-off stores throughout the collection");
     }
-    if(workers>1&&!provisioning(txn).sealed)
-        throw std::invalid_argument("parallel geometry reads require a sealed store; use one worker for a mutable snapshot");
+    const auto rootPolicy=provisioning(txn);
+    if(workers>1&&!rootPolicy.sealed&&rootPolicy.history!=HistoryMode::On)
+        throw std::invalid_argument("parallel geometry reads require a sealed store or history-enabled snapshot; use one worker otherwise");
     if(profile)result.timings["snapshot_validation_seconds"]=seconds(phase);
     phase=stamp();
     result.objectUuids.assign(requested.begin(),requested.end());

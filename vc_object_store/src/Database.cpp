@@ -37,6 +37,7 @@ std::unique_ptr<ObjectStore::Impl> ObjectStore::openImpl(const std::filesystem::
 {
     const int kApplicationId = 0x56434f42;
     if (create && options.readOnly) throw std::invalid_argument("create requires writable options");
+    if(options.readPosition&&(!options.readOnly||create))throw std::invalid_argument("a historical read position requires a read-only open");
     if (options.serviceOwner && options.readOnly) throw std::invalid_argument("hosting service requires writable access");
     if (create && (options.initialCommitSequence<0 || options.initialCommitSequence==INT64_MAX))
         throw std::invalid_argument("object store: invalid initial generation");

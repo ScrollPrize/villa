@@ -11,6 +11,7 @@
 #include <exception>
 #include <future>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <thread>
 
@@ -196,13 +197,15 @@ InitialImportResult importInitialCollection(const std::filesystem::path& target,
 
     Failure failure;
     std::vector<CollectionMember> completedMembers(paths.size());
+    std::vector<std::vector<CollectionMember>> mutableDependencies(paths.size());
     std::vector<std::future<InitialShardResult>> jobs;
     try {
         for(size_t i=0;i<paths.size();++i)jobs.push_back(std::async(std::launch::async,[&,i]{
             try {
                 failure.check();const auto creation=Clock::now();
                 auto opts=common;opts.objectIdRange=options.shards[i].objectIds;
-                auto collection=detail::InitialCollectionAccess::create(paths[i],options.dependencies,opts);
+                auto collection=detail::InitialCollectionAccess::create(paths[i],options.dependencies,opts,options.dependencyPins);
+                mutableDependencies[i]=detail::InitialCollectionAccess::mutableDependencyPins(collection);
                 auto transaction=collection.write();
                 for(const auto& extension:options.extensions)collection.createExtensionTable(transaction,extension);
                 auto state=std::make_unique<InitialShardImport::Impl>(InitialShardImport::Impl{
@@ -235,9 +238,22 @@ InitialImportResult importInitialCollection(const std::filesystem::path& target,
     } catch(...){failure.record(std::current_exception());}
     for(auto& job:jobs){try {result.shards.push_back(job.get());}catch(...){failure.record(std::current_exception());}}
     if(failure.error)std::rethrow_exception(failure.error);
+    // Table-level pins only; no finished-shard readback or per-object scan.
+    // Sealed-source imports take no additional I/O. Mutable history owners
+    // must have been observed at the same publication by every worker.
+    std::map<std::string,CollectionMember> pins;
+    for(const auto& sources:mutableDependencies)for(const auto& member:sources){
+        const auto [it,inserted]=pins.emplace(member.databaseUuid,member);
+        if(!inserted&&(it->second.storeUuid!=member.storeUuid||it->second.generation!=member.generation||
+                        it->second.commitSequence!=member.commitSequence))
+            throw StoreBusy("initial import: dependency changed between worker snapshots");
+    }
     result.generation=completedMembers.front().generation;
     result.commitSequence=completedMembers.front().commitSequence;
     if(options.beforePublish)options.beforePublish();
+    std::vector<CollectionMember> mutablePins;
+    for(const auto& [id,member]:pins)mutablePins.push_back(member);
+    detail::InitialCollectionAccess::verifyMutableDependencyPins(mutablePins);
     result.ingestionSeconds=elapsed(start);
     const auto manifestStart=Clock::now();
     if(paths.size()>1)detail::InitialCollectionAccess::writeManifest(manifest,completedMembers,common,options.uuidHashRouting);

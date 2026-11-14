@@ -65,7 +65,7 @@ def test_parallel_geometry_columns_match_mapping_and_survive_closed_reader(tmp_p
 
 
 @pytest.mark.parametrize('history',[False,True])
-def test_mutable_single_worker_uses_original_snapshot_and_parallel_is_rejected(tmp_path,history):
+def test_mutable_single_worker_keeps_snapshot_and_parallel_never_follows_newer_heads(tmp_path,history):
     path=tmp_path/'mutable.vcobj'
     before=np.array([[0.,-0.,2.],[6.,8.,4.]])
     with ObjectStore.create(str(path),author='test',history_enabled=history,spatial_index=False) as writer:
@@ -80,7 +80,9 @@ def test_mutable_single_worker_uses_original_snapshot_and_parallel_is_rejected(t
                                                  expected_position=pin,workers=1)
             np.testing.assert_array_equal(result['geometry'].values.view(np.uint64),before.view(np.uint64))
             assert result['source']==pin
-            with pytest.raises(ValueError,match='sealed store'):
+            error=StoreBusy if history else ValueError
+            message='source position changed' if history else 'sealed store'
+            with pytest.raises(error,match=message):
                 reader.geometry_array_columns(_keys([key]),'line_points',workers=4)
             with pytest.raises(ValueError,match='sealed history-off'):
                 reader.geometry_array_columns(_keys([key]),'line_points',workers=1,trusted_immutable=True)

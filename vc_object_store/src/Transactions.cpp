@@ -3,6 +3,7 @@
 #include "internal/Versions.hpp"
 #include "imports/SourceIdentityIndex.hpp"
 #include "internal/CollectionReads.hpp"
+#include "internal/HistoricalSnapshot.hpp"
 #include "vc_object_store/objects/StoreReader.hpp"
 
 namespace vc::objects {
@@ -51,6 +52,7 @@ void Txn::release(bool commit)
             pool->second->querySources = {};
             pool->second->objectSelectionArguments = {};
             pool->second->currentWrite.reset();
+            pool->second->historicalSnapshot.reset();
         }
         activeStatementPools.erase(conn);
         if (write_) db_->impl_->writerMutex.unlock();
@@ -116,6 +118,8 @@ ReadTxn ObjectStore::read() const
     ReadTxn txn(this,conn);
     if(impl_->composed&&!impl_->options.physicalPartitionOnly)
         txn.referenceContext_=attachCollectionReferenceResolver(conn,impl_->path,impl_->options);
+    else if(impl_->options.readPosition)
+        activeStatementPools.at(conn)->historicalSnapshot=historicalSnapshot(conn,*impl_->options.readPosition);
     return txn;
 }
 

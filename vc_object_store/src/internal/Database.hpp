@@ -67,6 +67,8 @@ struct StatementPool {
     int startSchemaVersion = 0;
     std::map<std::string,double> transformedLengths;
     bool readSnapshot = false;
+    std::shared_ptr<void> historicalSnapshot;
+    std::optional<int64_t> selectedSourceCommit;
     bool checkedAction = false, actionConflict = false;
     VersionSelection checkedObjects;
     // Attribution and request identity of the active write (see

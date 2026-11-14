@@ -43,7 +43,9 @@ std::vector<GeometryRevision> ObjectStore::geometryHistory(const Txn& txn, const
     auto* source=objectSource(static_cast<sqlite3*>(connection(txn)),objectUuid,false,true);
     if(!source)return {};
     requireHistory(source);
-    Statement s(source, std::string("SELECT ") + geometryColumns + " FROM geometry_revisions WHERE object_uuid=? ORDER BY rowid",
+    const auto selected=activeStatementPools.at(source)->selectedSourceCommit;
+    Statement s(source, std::string("SELECT ") + geometryColumns + " FROM geometry_revisions WHERE object_uuid=?"+
+        (selected?" AND object_version<=(SELECT version FROM objects WHERE uuid=geometry_revisions.object_uuid)":"")+" ORDER BY rowid",
         parseUuid(objectUuid));
     std::vector<GeometryRevision> result;
     while (s.row()) result.push_back(decodeGeometryRecord(s).revision);

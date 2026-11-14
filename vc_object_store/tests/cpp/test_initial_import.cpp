@@ -422,6 +422,32 @@ void stagedExtensionFailures(bool packed)
         require(std::filesystem::is_empty(dir.path),"staging/transform failure cleans all private data");
     }
 }
+void changedHistoryDependencyKeepsPublication(bool packed)
+{
+    TemporaryDirectory dir;auto opt=options(2,packed);
+    const auto base=dir.path/"mutable.vcobj",output=dir.path/"failed.vcobj";
+    OpenOptions sourceOptions;sourceOptions.author="source";sourceOptions.spatialIndex=false;
+    {auto source=ObjectStore::create(base,sourceOptions);auto write=source.write();
+        ObjectRecord record;record.kind="note";source.upsertObject(write,record);write.commit();}
+    opt.dependencies={base};
+    // Runs after the workers finish, before durable publication. The retained
+    // source is still readable, but its newer membership must not be followed.
+    opt.beforePublish=[&]{auto source=ObjectStore::open(base,sourceOptions);auto write=source.write();
+        ObjectRecord record;record.kind="note";source.upsertObject(write,record);write.commit();};
+    const auto result=importInitialCollection(output,opt,[](size_t,auto&){});
+    auto reader=ObjectCollection::open(result.path,OpenOptions{.readOnly=true});auto read=reader.read();size_t count=0;
+    reader.scanObjects(read,[&](const auto&){++count;return true;});
+    require(count==1,"source advancement preserves the original dependency membership");
+    read.commit();
+    for(int iteration=0;iteration<3;++iteration){
+        {auto source=ObjectStore::open(base,sourceOptions);auto write=source.write();
+            ObjectRecord record;record.kind="note";source.upsertObject(write,record);write.commit();}
+        auto again=reader.read();count=0;
+        reader.scanObjects(again,[&](const auto&){++count;return true;});
+        require(count==1,"pooled historical projections survive source changes without leaking lease state");
+        again.commit();
+    }
 }
-int main(){try{for(bool packed:{false,true}){for(size_t count:{1u,2u}){roundTrip(count,packed);sourceCompletion(count,packed);}phased(packed);directConnections(packed);dependencyReaderConnections(packed);stagedExtensionTransfer(packed);stagedExtensionFailures(packed);}failures();phaseFailures();
+}
+int main(){try{for(bool packed:{false,true}){for(size_t count:{1u,2u}){roundTrip(count,packed);sourceCompletion(count,packed);}phased(packed);directConnections(packed);dependencyReaderConnections(packed);stagedExtensionTransfer(packed);stagedExtensionFailures(packed);changedHistoryDependencyKeepsPublication(packed);}failures();phaseFailures();
     std::cout<<"initial import passed\n";return 0;}catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}

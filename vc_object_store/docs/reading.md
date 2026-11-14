@@ -20,8 +20,8 @@ store = ObjectStore.open("objects.vcobj", author="reader", read_only=True)
 
 | Form | Notes |
 | --- | --- |
-| Python | `ObjectStore.create(path, author=..., catalog=None)`, `ObjectStore.open(path, author=None, read_only=False, catalog=None)`; `catalog` is a `vc_reader.Catalog` (or its dict form) supplying registrations the store has not recorded — see [transforms](transforms.md#registrations-and-route-choices) |
-| C++ | `ObjectStore::create` / `::open` with `OpenOptions` (`author`, `readOnly`, `catalogTransforms`, `serviceOwner`) |
+| Python | `ObjectStore.create(path, author=..., catalog=None)`, `ObjectStore.open(path, author=None, read_only=False, catalog=None, position=None)`; `catalog` is a `vc_reader.Catalog` (or its dict form) supplying registrations the store has not recorded — see [transforms](transforms.md#registrations-and-route-choices) |
+| C++ | `ObjectStore::create` / `::open` with `OpenOptions` (`author`, `readOnly`, `catalogTransforms`, `serviceOwner`, `readPosition`) |
 | Hosted | Python `HostedStore(endpoint)`; C++ `vc::objects::HostedStore` or a session attachment — see [hosted](hosted.md) |
 
 A writable open takes a host-local ownership lock on `<path>-owner`, shared
@@ -32,6 +32,8 @@ convert it with `vc_object_convert` (see [Converting old stores](#converting-old
 
 Closing a store with live snapshots is an error in Python. Use the store as a
 context manager, or call `store.close()` after closing snapshots and graphs.
+
+To reopen a retained publication of a history-enabled source, pass its saved `{store, generation, commit_sequence}` position to `ObjectStore.open(path, read_only=True, position=position)` or `CollectionReader(path, position=position)`. C++ uses `OpenOptions::readPosition`. UUID-based reads then select that publication's metadata, geometry and membership, including after later source edits; explicit complete version references still select the exact version they name. This is read-only selection, not a rollback or a copy. Missing retained history fails explicitly. Referenced stores apply their recorded positions automatically. See [historical store references](collections.md).
 
 ## Listing and selecting records
 
@@ -49,9 +51,11 @@ For numeric setup that needs array sizes rather than lengths or bounds, `ObjectS
 
 For bulk coordinates, `CollectionReader.geometry_array_columns(object_uuid, array_name, object_kind=None, volume=None, expected_position=None, workers=32, profile=False, trusted_immutable=False)` accepts a binary `uint8[N,16]` UUID column and returns UUID-sorted unique `object_uuid`/`uuid_ascii` arrays, an owned `geometry` packed array, and its consumed `source` position. C++ callers use `ObjectCollection::readGeometryArrayColumns`. Buffers remain usable after closing the reader and pass directly to NumPy/PyTorch; no intermediate files are created. Unknown, deleted, ineligible or geometry-less requested objects fail rather than disappearing from the result. Dtype/trailing dimensions must agree across the packed arrays; the existing mapped-read contract supports float64 fiber `line_points` when `volume` is requested. `profile=True` adds coarse setup/selection/payload/copy timings without per-object instrumentation.
 
-With one worker the operation uses the caller's existing snapshot, including mutable stores. Multiple workers require a sealed root and use independent native transactions under the same complete source-position guard. One worker-capable collection is opened for the operation, not for every work block; routing, descriptor/hash validation and coordinate mapping reuse the ordinary store APIs. Worker transactions consume reader connections across the referenced scope, so provision process file-descriptor limits and memory for the chosen worker count. The library does not alter operating-system limits or reopen mutable current heads to simulate a parallel snapshot.
+With one worker the operation uses the caller's existing snapshot, including mutable stores. Multiple workers require a sealed or history-enabled root and use independent native transactions under the same complete source-position guard. Without an explicit root position, a history-enabled mutable root must still match the caller's source commit in every worker and at the final check; advancement raises `StoreBusy`. Open with `position` to select a retained historical root consistently across workers instead. Referenced sources always use their saved publication pins. One worker-capable collection is opened for the operation, not for every work block; routing, descriptor/hash validation and coordinate mapping reuse the ordinary store APIs. Worker transactions consume reader connections across the referenced scope, so provision process file-descriptor limits and memory for the chosen worker count. The library does not alter operating-system limits.
 
 `trusted_immutable=True` is an explicit throughput option for healthy, sealed, history-off snapshots. The operation checks that policy once across the scope, then skips redundant per-object history/descriptor audits and payload SHA checks. It is not an integrity audit: use the default checked mode for that. Requested-key existence, snapshot routing, array layout and byte bounds, and coordinate-frame mapping remain enforced. Ordinary read APIs retain their normal checks.
+
+`CollectionReader.supports_trusted_geometry_reads` checks that policy for the complete pinned scope. Consumers can select checked reads for history-enabled dependencies without catching failures or weakening integrity checks. The fiber workflow's `read_polyline_arrays(..., trusted_immutable="auto")` uses this capability; an explicit `True` still rejects an ineligible scope.
 
 Parallel batch applications can call `configure_sqlite_runtime(memory_statistics=False, pagecache_bulk_bytes=0)` once at process startup, before SQLite initializes. C++ uses `configureSqliteRuntime` from `SqliteRuntime.hpp`. This optional startup configuration disables SQLite's process-global allocator accounting (a contention source across otherwise independent connections); it does not alter transactions, values or read validation. A nonzero `pagecache_bulk_bytes` requests an initial allocation per connection's page cache. Unspecified options preserve SQLite defaults. Requests after initialization fail explicitly; the API never shuts down active SQLite connections. Ordinary store opens do not change process-global runtime options.
 

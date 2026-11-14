@@ -257,6 +257,9 @@ struct OpenOptions {
     bool physicalPartitionOnly = false;
     std::shared_ptr<const vcr::catalog::RegistrationGraph> catalogTransforms;
     bool readOnly = false;
+    // Read-only root selection. UUID reads use this retained publication;
+    // explicit complete version references retain their own exact identity.
+    std::optional<StoreStatus> readPosition;
     int readerPoolSize = 4;
     int busyTimeoutMs = 5000;
     std::string author;  // required for read-write opens

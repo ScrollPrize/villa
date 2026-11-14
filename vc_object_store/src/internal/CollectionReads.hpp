@@ -17,7 +17,7 @@ struct CollectionScanAccess {
     static std::vector<CollectionScanPartition> partitions(const ObjectCollection&, const CollectionTxn&);
 };
 // Offline maintenance already holds the root connection exclusively. Reuse
-// its snapshot, open only sealed dependencies, and install the common verified
+// its snapshot, open only policy-eligible pinned dependencies, and install the common verified
 // reference resolver until this guard is destroyed.
 std::shared_ptr<void> attachCollectionReferenceResolver(sqlite3*, const std::filesystem::path&);
 std::shared_ptr<void> attachCollectionReferenceResolver(sqlite3*, const std::filesystem::path&,const OpenOptions&);

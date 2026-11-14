@@ -68,7 +68,8 @@ private:
 
 // Composed vcobj API over independent SQLite connections, without ATTACH's
 // database limit. The local ObjectStore is one atomic writable overlay; every
-// dependency/partition is sealed and verified by store/lineage UUID and commit sequence on open.
+// dependency is sealed or history-enabled and verified by store/lineage UUID
+// and exact commit sequence. Physical partitions remain sealed-only.
 class ObjectCollection {
 public:
     static ObjectCollection create(const std::filesystem::path&, const std::vector<std::filesystem::path>& bases, const OpenOptions&);
@@ -83,6 +84,8 @@ public:
     CollectionTxn write();
     std::string uuid(const CollectionTxn&) const;
     StoreProvisioning provisioning(const CollectionTxn&) const;
+    // True only when every database in the consumed scope is sealed/history-off.
+    bool supportsTrustedGeometryReads(const CollectionTxn&) const;
     struct GeometryArrayColumns {
         StoreStatus source;
         std::vector<std::array<unsigned char,16>> objectUuids;
@@ -91,7 +94,7 @@ public:
     };
     // Owned current geometry, sorted and deduplicated by requested UUID.
     // Uses the caller's snapshot with one worker. Parallel reads require a
-    // sealed root (dependencies are sealed on collection admission), and use
+    // sealed or history-enabled root and exact dependency pins, and use
     // independent guarded native snapshots over one shared routing topology.
     // No geometry/history/mapping rules are replaced by this batch API.
     GeometryArrayColumns readGeometryArrayColumns(const CollectionTxn&,

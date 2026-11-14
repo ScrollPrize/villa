@@ -527,7 +527,13 @@ ObjectStore::GeometryArrayCounts ObjectStore::geometryArrayCounts(const Txn& txn
             if(records[i]->revision.objectUuid!=expected[i].first||
                records[i]->revision.contentHash!=expected[i].second)
                 throw std::runtime_error("geometry: current descriptor disagrees with its reference");
-            const auto& arrays=records[i]->descriptor.at("arrays");
+            // Archived delta descriptors omit chunk lists. Resolve their
+            // manifest through the shared reader before checking its layout;
+            // this reconstructs metadata only, never coordinate payloads.
+            std::optional<GeometryReader> delta;
+            if(records[i]->descriptor.contains("delta"))
+                delta.emplace(db,revisions[i],false,false);
+            const auto& arrays=(delta?delta->manifest():records[i]->descriptor).at("arrays");
             if(arrays.contains(name)) {
                 const auto layout=geometryLayout(arrays.at(name));
                 (void)layout;

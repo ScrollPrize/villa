@@ -16,6 +16,9 @@ struct InitialImportOptions {
     // then fan out instead of claiming a routing contract they cannot honor.
     bool uuidHashRouting = true;
     std::vector<std::filesystem::path> dependencies;
+    // Optional exact source publications already consumed by the producer.
+    // Unspecified dependencies are captured at construction time.
+    std::vector<ExtensionSource> dependencyPins;
     std::optional<PackedStoreOptions> packed;
     InitialEdgeImportOptions edges;
     // Optional extension definitions instantiated independently on each shard.

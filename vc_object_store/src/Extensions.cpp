@@ -181,6 +181,9 @@ std::optional<ExtensionTableInfo> detail::extensionTable(sqlite3* db,const std::
     info.formatVersion=row.i64(3);info.basedOn=extensionSourcesFromJson(row.text(4));info.provisioning=row.text(5);
     info.keySpace=row.text(6);info.lastModifiedCommit=row.i64(7);
     info.versioned=row.i64(8)!=0;
+    if(const auto pool=activeStatementPools.find(db);pool!=activeStatementPools.end()&&pool->second->selectedSourceCommit&&
+       !info.versioned&&info.lastModifiedCommit>*pool->second->selectedSourceCommit)
+        throw std::runtime_error("extension: requested historical rows were not retained: "+name);
     std::map<int64_t,std::string> keys;
     Statement columns(db,"SELECT name,type,\"notnull\",pk FROM pragma_table_info(?) ORDER BY cid",name);
     while(columns.row()){info.columns.push_back({columns.text(0),columnType(columns.text(1)),columns.i64(2)==0});

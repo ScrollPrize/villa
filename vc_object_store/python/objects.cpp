@@ -1179,6 +1179,7 @@ NB_MODULE(_native, m)
                     nb::arg("reader_pool_size") = 4,
                     nb::arg("geometry_cache_bytes") = 16 * 1024 * 1024,
                     nb::arg("spatial_cache_bytes") = 16 * 1024 * 1024, nb::arg("catalog") = nb::none(),
+                    nb::arg("position") = std::nullopt,
                     "Open an existing object database. author is required unless read_only.")
         .def("geometry_snapshot", [](PyObjectStore& self) {
             self.require();
