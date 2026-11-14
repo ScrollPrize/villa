@@ -6,6 +6,10 @@
   ignored on older systems). Without it, a path with non-ASCII characters,
   such as a user profile named with an umlaut, fails with "filesystem error:
   Cannot convert character sequence: Illegal byte sequence" (villa#1979).
+  longPathAware lets paths longer than 260 characters work when Windows has
+  long paths enabled (LongPathsEnabled = 1); without it, the remote cache
+  fails with "create ...\.zattrs.tmp...: No such file or directory" for some
+  predictions, such as the PHercParis4 and PHerc0139 recto 2um surfaces.
   Embedded into every executable by cmake/WindowsUtf8Manifest.cmake.
 -->
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
@@ -29,6 +33,7 @@
   <application xmlns="urn:schemas-microsoft-com:asm.v3">
     <windowsSettings>
       <activeCodePage xmlns="http://schemas.microsoft.com/SMI/2019/WindowsSettings">UTF-8</activeCodePage>
+      <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>
     </windowsSettings>
   </application>
 </assembly>
