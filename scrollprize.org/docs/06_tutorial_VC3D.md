@@ -67,10 +67,14 @@ Downloads for all operating systems are available on the [releases page](https:/
 </TabItem>
   <TabItem value="windows" label="Windows">
 
-  - Download the windows installer .zip file from the [releases page](https://github.com/ScrollPrize/villa/releases) of the villa repository.
-  - Extract the contents of the .zip file to a folder of your choice.
-  - Double click the install file, click "show more details" and then "run anyway"
-  - Follow the prompts, clicking yes or next where necessary
+  Each VC3D release on the [releases page](https://github.com/ScrollPrize/villa/releases) of the villa repository has two Windows downloads:
+
+  - **Installer (`VC3D-*-win64.exe`, needs administrator rights):** download it and double click it. Follow the prompts, clicking yes or next where necessary. VC3D is then in the Start menu.
+  - **Portable (`VC3D-*-win64.zip`):** download it, extract its contents to a folder of your choice, and double click `VC3D.exe` in the `bin` folder. There is nothing to install.
+
+  Both contain VC3D together with the `vc_*` command-line tools, in the `bin` folder (by default `C:\Program Files\VC3D\bin` with the installer). That folder is not added to `PATH`.
+
+  If Windows shows a warning when you double click the installer or `VC3D.exe`, click "show more details" and then "run anyway".
   
   </TabItem>
   <TabItem value="linux" label="Linux">
@@ -109,7 +113,7 @@ Downloads for all operating systems are available on the [releases page](https:/
 
 Depending on your install method or operating system, the application may be launched in different ways.
 - **Mac:** Open the application from the Applications folder
-- **Windows:** Open the application from the Start menu
+- **Windows:** Open the application from the Start menu. With the portable .zip, double click `VC3D.exe` in the `bin` folder instead
 - **Linux:** With the AppImage, run `./VC3D-*-linux-x86_64.AppImage VC3D`. With a source build, navigate to the build folder and run the VC3D app. example: `cd build/bin && ./VC3D`
 
 ## Using VC3D
