@@ -15,6 +15,9 @@ public:
 
     int lowValue() const { return _lowValue; }
     int highValue() const { return _highValue; }
+    // The ring of the handles: the palette's highlight color, read when
+    // painting so a theme change applies.
+    QColor handleBorderColor() const;
 
     void setMinimumSeparation(int separation);
 
@@ -52,5 +55,4 @@ private:
 
     DragTarget _dragTarget;
     int _dragOffset{}; // pixel delta between cursor and handle center
-    QColor _handleBorderColor;
 };
