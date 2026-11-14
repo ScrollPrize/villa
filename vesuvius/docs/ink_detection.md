@@ -492,9 +492,12 @@ tiles and writes the TIFF; inkrs normalizes, runs the model and blends on the
 GPU. The default engine is PyTorch, and villa does not import inkrs unless
 `--engine inkrs` is given.
 
-inkrs is an optional dependency, installed by the `inkrs` extra. inkrs loads
-cuDNN 9 and cuBLAS 12; PyTorch's CUDA 13 build provides the cuDNN, and on
-Linux the extra adds cuBLAS 12 (`nvidia-cublas-cu12`). inkrs runs from a
+inkrs is an optional dependency, installed by the `inkrs` extra, which is
+supported on Linux x86-64, macOS and Windows. inkrs publishes no Linux ARM64
+wheel, so on Linux ARM64 villa runs on PyTorch: without inkrs installed,
+`--engine inkrs` logs why and falls back. inkrs loads cuDNN 9 and cuBLAS 12;
+PyTorch's CUDA 13 build provides the cuDNN, and on Linux x86-64 the extra adds
+cuBLAS 12 (`nvidia-cublas-cu12`). inkrs runs from a
 safetensors export of the checkpoint. The first run with a `.pth` exports it
 into inkrs's cache (`~/.cache/inkrs/weights/` unless `INKRS_CACHE_DIR` or
 `XDG_CACHE_HOME` is set), and later runs reuse it:

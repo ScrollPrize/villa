@@ -2170,7 +2170,11 @@ def run(
     device = resolve_inference_device(gpu_ids=args.gpu_ids, device_type=args.device)
     window_cache = WindowCache()
     if engine_requested and engine_window_wanted(args, configured, device, engine_factory):
-        # the zarr read runs while the engine loads, which releases the GIL
+        # the zarr read runs while the engine loads, which releases the GIL; it
+        # starts before inkrs has accepted the checkpoint and GPU, so when inkrs
+        # refuses at load (a key mismatch, an unsupported GPU), which is rare, the
+        # fallback waits for an unused read: time, not extra memory, since inkrs
+        # would hold the same window
         prefetch_engine_window(args, configured, window_cache)
     try:
         run_inputs(args, configured, device, engine_factory, window_cache)
