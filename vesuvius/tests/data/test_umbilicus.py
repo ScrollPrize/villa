@@ -66,6 +66,8 @@ def hub(tmp_path, monkeypatch):
         ],
     }
     files["index.json"] = json.dumps(index).encode()
+    monkeypatch.setattr(umbilicus, "DEFAULT_INDEX_SHA256", hashlib.sha256(files["index.json"]).hexdigest())
+    monkeypatch.delenv(umbilicus.MIRROR_ENV, raising=False)
     calls = []
 
     def fake_download(filename, revision, cache_dir):
@@ -147,6 +149,81 @@ def test_list_lines(hub):
     assert len(umbilicus.list_umbilicus_lines()) == 7
 
 
+def test_pinned_index_is_checked(hub):
+    hub["files"]["index.json"] = hub["files"]["index.json"].replace(b"ScrollC", b"ScrollD")
+    with pytest.raises(ValueError, match="index.json: sha256"):
+        umbilicus.fetch_umbilicus("ScrollA")
+
+
+COMMIT = "a" * 40
+
+
+@pytest.fixture
+def mirrored(hub, monkeypatch):
+    """The stub dataset copied by mirror_umbilicus into a local folder, served as a file:// mirror."""
+    monkeypatch.setattr(umbilicus, "_resolve", lambda revision: COMMIT if revision == "main" else revision)
+    dest = hub["tmp"] / "mirror"
+    folder = umbilicus.mirror_umbilicus(dest, revision="main")
+    hub["calls"].clear()
+    return {**hub, "dest": dest, "folder": folder, "url": dest.as_uri(), "cache": hub["tmp"] / "mirror-cache"}
+
+
+def test_mirror_layout(mirrored):
+    dest = mirrored["dest"]
+    assert mirrored["folder"] == dest / COMMIT
+    assert (dest / "refs" / "main").read_text() == COMMIT + "\n"
+    for name, content in mirrored["files"].items():
+        assert (dest / COMMIT / name).read_bytes() == content
+    assert sorted(p.name for p in dest.iterdir()) == [COMMIT, "refs"]
+
+
+def test_fetch_from_mirror_matches_and_skips_hugging_face(mirrored):
+    path, row = umbilicus.fetch_umbilicus(
+        "ScrollA", revision="main", mirror=mirrored["url"], cache_dir=mirrored["cache"]
+    )
+    assert row["source"] == "bucket"
+    assert path.read_bytes() == mirrored["files"]["lines/ScrollA/ScrollA_100_bucket_umbilicus.json"]
+    assert mirrored["calls"] == []
+    rows = umbilicus.list_umbilicus_lines(
+        "ScrollA", revision=COMMIT, mirror=mirrored["url"], cache_dir=mirrored["cache"]
+    )
+    assert [r["source"] for r in rows] == ["bucket", "finder", "bucket-mapped"]
+
+
+def test_mirror_from_environment(mirrored, monkeypatch):
+    monkeypatch.setenv(umbilicus.MIRROR_ENV, mirrored["url"] + "/")
+    path, _ = umbilicus.fetch_umbilicus("ScrollA", scan="101", revision="main", cache_dir=mirrored["cache"])
+    assert path.read_bytes() == mirrored["files"]["other-scans/ScrollA/ScrollA_101_bucket-mapped_umbilicus.json"]
+    assert mirrored["calls"] == []
+
+
+def test_tampered_mirror_file_is_refused(mirrored):
+    target = mirrored["folder"] / "lines/ScrollA/ScrollA_100_bucket_umbilicus.json"
+    target.write_bytes(b'{"control_points": []}')
+    with pytest.raises(ValueError, match="does not match the index"):
+        umbilicus.fetch_umbilicus("ScrollA", revision=COMMIT, mirror=mirrored["url"], cache_dir=mirrored["cache"])
+
+
+def test_mirror_keeps_old_commits_and_moves_the_ref(mirrored, monkeypatch):
+    dest = mirrored["dest"]
+    assert umbilicus.mirror_umbilicus(dest, revision="main") == dest / COMMIT
+    assert mirrored["calls"] == []
+    newer = "b" * 40
+    monkeypatch.setattr(umbilicus, "_resolve", lambda revision: newer)
+    umbilicus.mirror_umbilicus(dest, revision="main")
+    assert (dest / "refs" / "main").read_text() == newer + "\n"
+    assert (dest / COMMIT / "index.json").exists() and (dest / newer / "index.json").exists()
+
+
+def test_mirror_refuses_a_bad_download(hub, monkeypatch):
+    monkeypatch.setattr(umbilicus, "_resolve", lambda revision: COMMIT)
+    hub["files"]["lines/ScrollB/ScrollB_200_tauil_umbilicus.json"] = b"{}"
+    dest = hub["tmp"] / "mirror"
+    with pytest.raises(ValueError, match="does not match the index"):
+        umbilicus.mirror_umbilicus(dest, revision="main")
+    assert not (dest / COMMIT).exists() and not (dest / "refs").exists()
+
+
 def test_missing_huggingface_hub_gives_install_hint(monkeypatch):
     import builtins
 
@@ -158,6 +235,7 @@ def test_missing_huggingface_hub_gives_install_hint(monkeypatch):
         return real_import(name, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "__import__", no_hub)
+    monkeypatch.delenv(umbilicus.MIRROR_ENV, raising=False)
     with pytest.raises(ImportError, match="pip install huggingface_hub"):
         umbilicus.fetch_umbilicus("PHerc0139")
 
@@ -169,3 +247,16 @@ def test_published_paris4_line(tmp_path):
     points = json.loads(Path(path).read_text())["control_points"]
     assert len(points) == row["points"]
     assert [min(p["z"] for p in points), max(p["z"] for p in points)] == row["z"]
+
+
+@pytest.mark.network
+def test_mirror_of_pinned_revision_serves_the_same_paris4_line(tmp_path):
+    folder = umbilicus.mirror_umbilicus(
+        tmp_path / "mirror", revision=umbilicus.DEFAULT_REVISION, cache_dir=tmp_path / "hf"
+    )
+    hub_path, hub_row = umbilicus.fetch_umbilicus("PHercParis4", cache_dir=tmp_path / "hf")
+    path, row = umbilicus.fetch_umbilicus(
+        "PHercParis4", mirror=folder.parent.as_uri(), cache_dir=tmp_path / "mirror-cache"
+    )
+    assert row == hub_row
+    assert Path(path).read_bytes() == Path(hub_path).read_bytes()
