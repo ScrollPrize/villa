@@ -230,6 +230,27 @@ void local(const fs::path& root, const std::vector<uint16_t>& v)
     require(vcr::zarr::Group::open(group.string(), {}).levels().size() == 2, "plain numbered levels");
 }
 
+// A local unsharded Zarr v3 array is read in place through an "array" layer, by piece of its
+// raw chunk files, like a v2 array: not whole chunk files through the object source.
+void localV3InPlace(const fs::path& root)
+{
+    vcr::zarr::CreateOptions o;
+    o.shape = {8, 8, 8}; o.chunks = {4, 4, 4}; o.dtype = "|u1"; o.compressor = "none"; o.version = 3; o.separator = "/";
+    auto writer = vcr::zarr::Writer::create(root / "v3", o);
+    std::vector<std::uint8_t> chunk(64, 9);
+    writer.writeChunk({1, 1, 1}, chunk.data(), chunk.size());
+    vcr::zarr::OpenOptions options; options.threads = 1;
+    auto opened = vcr::zarr::openArray((root / "v3").string(), options);
+    const auto& spec = opened.array->spec();
+    require(spec.layers.size() == 1 && spec.layers[0].kind == "array", "a local unsharded v3 array has an in-place array layer");
+    require(spec.layers[0].root == fs::absolute(root / "v3" / "c").lexically_normal().string(), "the layer's root is the chunk prefix directory");
+    require(spec.source_root.empty(), "an in-place array has no v3 object source");
+    std::vector<std::uint8_t> out(8);
+    opened.array->read_many({vcr::Index{5, 5, 2}}, {vcr::Index{1, 1, 8}}, {out.data()});
+    for (std::size_t i = 0; i < 8; ++i)
+        require(out[i] == (i + 2 >= 4 && i + 2 < 8 ? 9 : 0), "voxels read in place match the stored chunk, the unstored chunk and the outside");
+}
+
 void sparseLevels(const fs::path& root)
 {
     const auto path = root / "sparse.zarr";
@@ -602,6 +623,7 @@ int main(int argc, char** argv)
         metadata();
         localShards(root);
         local(root, v);
+        localV3InPlace(root);
         vc3dRoot(root);
         declaredOmePlacement();
         sparseLevels(root);

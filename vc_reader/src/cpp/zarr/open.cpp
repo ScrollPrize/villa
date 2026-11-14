@@ -271,11 +271,17 @@ OpenedArray openArray(const std::string& input, const OpenOptions& options, Arra
             root.pop_back();
         if (!out.meta.v3)
             spec.layers.push_back(LayerSpec{"array", root, codec, "", false});
+        else if (out.meta.v3->shards.empty() && (out.meta.v3->prefix.empty() || out.meta.v3->prefix.ends_with('/'))) {
+            // Unsharded chunk files under root/c/ (or root/ with v2 keys): read in place, by piece, like a v2 array.
+            const auto& prefix = out.meta.v3->prefix;
+            spec.layers.push_back(LayerSpec{"array", prefix.empty() ? root : root + "/" + prefix.substr(0, prefix.size() - 1), codec, "", false});
+        }
         spec.identity = "file://" + root;
     }
+    const bool inPlace = !spec.layers.empty() && spec.layers.back().kind == "array";
     if (remote || out.meta.v3)
         spec.remote_codec = codec;
-    if (out.meta.v3) {
+    if (out.meta.v3 && !inPlace) {
         spec.source_root = remote ? spec.remote_url : root;
         spec.source_prefix = out.meta.v3->prefix;
         spec.shard_chunks = out.meta.v3->shards;
