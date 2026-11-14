@@ -11,7 +11,7 @@ def fid(k):
     return f'00000000-0000-4000-8000-{k:012d}'
 
 
-def test_event_geometry_reads_native_uuid_graph_and_preserves_integer_event_ids(tmp_path):
+def test_event_geometry_rejects_unavailable_compact_endpoint_coordinates(tmp_path):
     from lasagna.inference_provenance import sha256_file
     from vesuvius.neural_tracing.fiber_trace_3d.fiber_graph_store import store_digest
     from vesuvius.neural_tracing.fiber_trace_3d.fiber_uv_kollesis import event_geometry
@@ -24,10 +24,16 @@ def test_event_geometry_reads_native_uuid_graph_and_preserves_integer_event_ids(
     signature=dict(database=store_digest(database),stage1=sha256_file(stage))
     tensor.with_suffix('.json').write_text(json.dumps(dict(signature=signature)))
     config=dict(database=str(database),stage1=str(stage),tensor_cache=str(tensor))
+    # Compact v22 measurements deliberately omit XYZ and distance magnitude;
+    # diagnostics requiring them must fail loudly, never invent coordinates.
+    d=dict(event_ids=np.array([0,1],dtype=np.int64))
+    with pytest.raises(ValueError,match='do not store endpoint XYZ'):
+        event_geometry(config,d,tmp_path)
+    assert not (tmp_path/'event_geometry.npz').exists()
+    # Cached diagnostic IDs remain exact int64 even when larger than 2**53.
     d=dict(event_ids=np.array([eid,eid+1],dtype=np.int64))
-    geom=event_geometry(config,d,tmp_path)
-    np.testing.assert_array_equal(geom[0],[1.,0.,1.])
-    assert np.isnan(geom[1]).all()
+    geom=np.array([[1.,0.,1.],[np.nan,np.nan,np.nan]])
+    np.savez(tmp_path/'event_geometry.npz',geometry=geom,event_ids=d['event_ids'],database_hash=signature['database'])
     np.testing.assert_array_equal(event_geometry(config,d,tmp_path),geom)
     with pytest.raises(ValueError,match='provenance mismatch'):
         event_geometry(config,dict(event_ids=np.array([eid+1],dtype=np.int64)),tmp_path)

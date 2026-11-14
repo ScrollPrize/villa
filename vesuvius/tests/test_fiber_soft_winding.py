@@ -239,7 +239,7 @@ def test_sample_preparation_reuses_signed_geometry(monkeypatch):
     monkeypatch.setattr(fiber_store, 'fiber_volume', lambda path: '123')
     monkeypatch.setattr(vis, 'load_umbilicus_frame', lambda *args: np.array([[0., 0., 0.], [0., 0., 20.]]))
     xyz = np.array([[10., 0., 0.], [10., 0., 20.]])
-    monkeypatch.setattr(fiber_store, 'read_polylines', lambda *args, **kwargs: [({'id': fid(5)}, xyz)])
+    monkeypatch.setattr(fiber_store, 'iter_polylines', lambda *args, **kwargs: iter([({'id': fid(5)}, xyz)]))
     d = dict(source_id=np.array([fid(5)]), family=np.array([1]), start=np.array([2.]), end=np.array([18.]),
              node_ds=np.array([[0., -8., -16.]]), i=np.array([0]), j=np.array([0]),
              ds_a=np.array([-3.]), ds_b=np.array([-10.]))
@@ -267,7 +267,7 @@ def test_sample_preparation_reuses_signed_geometry(monkeypatch):
 
     # Node-only priors use exact perpendicular topology, deduplicating equal
     # base arcs; parallel bases and endpoint fallbacks must not reappear.
-    monkeypatch.setattr(fiber_store, 'read_polylines', lambda *args, **kwargs: [({'id': fid(k)}, xyz) for k in (5,6,7)])
+    monkeypatch.setattr(fiber_store, 'iter_polylines', lambda *args, **kwargs: iter([({'id': fid(k)}, xyz) for k in (5,6,7)]))
     d=dict(source_id=np.array([fid(k) for k in (5,6,7)]),family=np.array([1,0,0]),
         start=np.full(3,2.),end=np.full(3,18.),
         node_ds=np.array([[0.,-8.,-16.],[0.,8.,16.],[0.,8.,16.]]),

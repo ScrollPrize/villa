@@ -80,7 +80,7 @@ def test_refined_curve_interpolation_and_source_boundaries():
 def test_initialize_filtered_links_and_nonzero_parent_offsets(tmp_path):
     d,s,w,c=graph([0,0,0,1],[0,0,0,0],[1,1,1,2],[0,2],[3,3],[0,0],[1,1])
     d.update(start=np.array([0.,10.,20.,0.]),end=np.array([10.,20.,30.,30.]),
-        event_ids=np.array([100,101]),ds_a=np.array([5.,5.]),ds_b=np.array([5.,25.]),
+        event_ids=np.array([0,1]),ds_a=np.array([5.,5.]),ds_b=np.array([5.,25.]),
         links=np.array([[0,1,10,0],[1,2,10,0]],dtype=float))
     db=measured_store(tmp_path,[(100,1,2,False,.5),(101,1,2,False,.5)],
         curves={i:np.array([[0.,0,0],[30.,0,0]]) for i in [1,2]},
@@ -93,7 +93,7 @@ def test_initialize_filtered_links_and_nonzero_parent_offsets(tmp_path):
     s[0,:4]=np.log([.49,.005,.005,.5])
     result=ref.initialize(d,parent,c,{})
     assert result['links'].tolist()==[1] and result['edges'].tolist()==[1]
-    assert result['meta']['constraint_id'].tolist()==[101,101,1,1]
+    assert result['meta']['constraint_id'].tolist()==[1,1,1,1]
     np.testing.assert_allclose(result['seed'],[[.25,.5],[.25,.5],[.2,.4],[.2,.4]])
     assert result['meta']['piece'].tolist()==[1,2,0,1]
 

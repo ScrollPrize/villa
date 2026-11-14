@@ -102,7 +102,7 @@ def test_prepare_reads_true_arcs_and_serializes(tmp_path):
     path=measured_store(tmp_path,[(7,10,20,False,.5),(8,10,20,False,.5)],
         curves={i:np.array([[0.,0,0],[100.,0,0]]) for i in [10,20]},
         field_overrides={7:dict(arc_a=40.,arc_b=90.),8:dict(arc_a=60.,arc_b=70.)})
-    d=dict(event_ids=np.array([7,8]),i=np.array([0,1]),j=np.array([2,2]),
+    d=dict(event_ids=np.array([0,1]),i=np.array([0,1]),j=np.array([2,2]),
            source_id=np.array([f,f,g]),family=np.array([0,0,1]),
            start=np.array([0,50,0]),end=np.array([50,100,100]))
     m=eo.prepare(d,dict(database=str(path)))

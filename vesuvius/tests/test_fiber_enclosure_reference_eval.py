@@ -34,6 +34,6 @@ def test_cross_graph_uses_uuid_membership_not_dense_remapping(tmp_path):
     graph.arc_a=np.array([3.,4.])
     graph.arc_b=np.array([5.,6.])
     rows=cross_rows(graph,np.array([uid(10),uid(20)]),np.array([uid(30),uid(40)]),np.ones(2,bool))
-    assert rows[:,:4].tolist()==[[0,0,3,5],[1,1,6,4]]
+    assert rows[:,:4].tolist()==[[0,0,3,5],[1,1,4,6]]
     assert rows[:,6].tolist()==[.5,2.]
     assert cross_rows(graph,np.array([uid(10),uid(20)]),np.array([uid(30),uid(40)]),np.array([False,True])).shape==(1,8)

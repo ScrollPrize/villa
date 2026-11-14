@@ -3,7 +3,7 @@ import numpy as np
 import pytest
 
 
-def test_curve_bank_actual_polyline_and_normal_invalidity(tmp_path):
+def test_curve_bank_actual_polyline_and_normal_invalidity(tmp_path,monkeypatch):
     from vesuvius.neural_tracing.fiber_trace_3d import fiber_curve_bank as m
     from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import write_fibers, fiber_source_version
     from vc_object_store import ObjectStore
@@ -29,7 +29,7 @@ def test_curve_bank_actual_polyline_and_normal_invalidity(tmp_path):
     sampled,valid=normal_bank.sample_normals(np.array([0,0,0]),np.array([5.,15.,20.]))
     np.testing.assert_array_equal(sampled,n)
     np.testing.assert_array_equal(valid,ok)
-    monkeypatch.setattr(m,'read_polylines',lambda _,ids:[({'id':str(i)},xyz) for i in ids])
+    monkeypatch.setattr(m,'read_polylines',lambda _,ids,**kwargs:[({'id':str(i)},xyz) for i in ids])
     with pytest.raises(ValueError,match='outside'):bank.sample(np.array([0]),np.array([21.]))
     del bank
     normals[1,4]=0;normals.tofile(tmp_path/'normals.bin')
@@ -39,4 +39,4 @@ def test_curve_bank_actual_polyline_and_normal_invalidity(tmp_path):
     with pytest.raises(ValueError,match='Missing normal'):m.CurveBank(source,[other],tmp_path,sign)
     with ObjectStore.open(str(source),author='edit') as store:
         store.set_meta(fid,'coordinates',dict(volume_uuid='vol',scale_factor=2))
-    with pytest.raises(ValueError,match='source changed'):m.CurveBank(source,[fid],tmp_path,sign)
+    with pytest.raises(ValueError,match='recorded snapshot'):m.CurveBank(source,[fid],tmp_path,sign)

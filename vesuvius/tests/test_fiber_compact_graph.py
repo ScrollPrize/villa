@@ -37,7 +37,8 @@ def test_winding_event_preparation_uses_connector_not_xyz(tmp_path,fiber_sign,ex
     from vesuvius.neural_tracing.fiber_trace_3d.fiber_min_flow_full import event_batches
     path=measured_store(tmp_path,[(120,10,20,False,.5)])
     graph=FiberGraph(path)
-    paths=SimpleNamespace(ids=graph.ids,catalog=dict(family=np.array([0,1]),normal_sign=np.array(fiber_sign)))
+    paths=SimpleNamespace(ids=graph.ids,graph_index=np.arange(len(graph.ids)),
+        catalog=dict(family=np.array([0,1]),normal_sign=np.array(fiber_sign)))
     batches=list(event_batches({},paths,graph,0,len(graph.event_ids)))
     assert len(batches)==1
     count,data=batches[0]

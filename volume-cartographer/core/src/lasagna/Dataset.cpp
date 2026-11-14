@@ -272,8 +272,7 @@ LasagnaDataset LasagnaDataset::open(const std::filesystem::path& manifestPath,
                                     LasagnaDatasetOpenOptions options)
 {
     validateOpenOptions(options);
-    auto manifest = LasagnaDatasetManifest::parseFile(
-        std::filesystem::is_directory(manifestPath) ? manifestPath/".zattrs" : manifestPath);
+    auto manifest = LasagnaDatasetManifest::parseFile(manifestPath);
     manifest.manifestLocation = manifest.manifestPath.string();
     manifest.manifestIsRemote = false;
     manifest.workingToBaseScale = options.workingToBaseScale;

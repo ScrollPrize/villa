@@ -82,6 +82,10 @@ jobs:
       - name: Reset compiler cache statistics
         run: '"${SCCACHE_PATH}" --zero-stats'
 
+      - name: Install additional reader dependencies
+        # These dependencies are not included in the pinned prebuilt bundle.
+        run: pacman -S --needed --noconfirm mingw-w64-ucrt-x86_64-concurrentqueue mingw-w64-ucrt-x86_64-blosc2
+
       - name: Configure
         run: >-
           cmake --preset ci-windows-mingw

@@ -111,7 +111,7 @@ def test_measurement_audit_verifies_sources_and_detects_wrong_cache(tmp_path):
     np.savez(stage, ids=np.array([uid(10),uid(20)]), normal_sign=np.ones(2), normal_convention=np.array('inward'))
     cache = tmp_path/'cache.npz'
     np.savez(cache, unused=np.zeros(1))
-    d = dict(event_ids=np.array([8]),source_id=np.array([uid(10),uid(20)]),i=np.array([0]),j=np.array([1]),
+    d = dict(event_ids=np.array([0]),source_id=np.array([uid(10),uid(20)]),i=np.array([0]),j=np.array([1]),
              parallel=np.ones(1,bool),sign=np.array([-1]),distance=np.array([2.]))
     sources=dict(database=str(db),stage1=str(stage))
     r = audit_measurements(dict(tensor_cache=str(cache)), d, sources)

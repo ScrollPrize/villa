@@ -256,7 +256,6 @@ LasagnaDatasetManifest LasagnaDatasetManifest::parseFile(const std::filesystem::
         if (!found) throw std::runtime_error("invalid embedded validity_channel");
     }
     LasagnaDatasetManifest manifest = parseText(root.dump(), compact ? manifestPath / ".zattrs" : manifestPath);
-    manifest.raw = std::move(root);
     return manifest;
 }
 
