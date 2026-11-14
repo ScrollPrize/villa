@@ -495,14 +495,14 @@ GPU. The default engine is PyTorch, and villa does not import inkrs unless
 inkrs is an optional dependency, installed by the `inkrs` extra, which is
 supported on Linux x86-64 and macOS. On Windows, villa's locked PyTorch is the
 CPU-only build, so `--engine inkrs` finds no CUDA device and falls back to
-PyTorch (or stops under `--engine-fallback error`). inkrs publishes no Linux
-ARM64 wheel, so on Linux ARM64 villa runs on PyTorch: without inkrs installed,
-`--engine inkrs` logs why and falls back. inkrs loads cuDNN 9 and cuBLAS 12;
-PyTorch's CUDA 13 build provides the cuDNN, and on Linux x86-64 the extra adds
-cuBLAS 12 (`nvidia-cublas-cu12`). inkrs runs from a
-safetensors export of the checkpoint. The first run with a `.pth` exports it
-into inkrs's cache (`~/.cache/inkrs/weights/` unless `INKRS_CACHE_DIR` or
-`XDG_CACHE_HOME` is set), and later runs reuse it:
+PyTorch (or stops under `--engine-fallback error`). On Linux ARM64 the extra
+installs nothing, because inkrs publishes no wheel there, and villa runs on
+PyTorch: without inkrs installed, `--engine inkrs` logs why and falls back.
+inkrs loads cuDNN 9 and cuBLAS 12; PyTorch's CUDA 13 build provides the cuDNN,
+and on Linux x86-64 the extra adds cuBLAS 12 (`nvidia-cublas-cu12`). inkrs runs
+from a safetensors export of the checkpoint. The first run with a `.pth`
+exports it into inkrs's cache (`~/.cache/inkrs/weights/` unless
+`INKRS_CACHE_DIR` or `XDG_CACHE_HOME` is set), and later runs reuse it:
 
 ```bash
 uv run --extra models --extra inkrs python -m vesuvius.ink_detection.inference.infer \

@@ -3693,7 +3693,7 @@ gui = [
     { name = "pyqt6" },
 ]
 inkrs = [
-    { name = "inkrs" },
+    { name = "inkrs", marker = "platform_machine == 'x86_64' or sys_platform != 'linux'" },
     { name = "nvidia-cublas-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
 ]
 label-transfer = [
@@ -3764,7 +3764,7 @@ requires-dist = [
     { name = "fastremap", marker = "extra == 'models'", specifier = ">=1.15" },
     { name = "huggingface-hub", marker = "extra == 'all'", specifier = ">=0.35.0" },
     { name = "huggingface-hub", marker = "extra == 'models'", specifier = ">=0.35.0" },
-    { name = "inkrs", marker = "extra == 'inkrs'", specifier = ">=0.2.1" },
+    { name = "inkrs", marker = "(platform_machine == 'x86_64' and extra == 'inkrs') or (sys_platform != 'linux' and extra == 'inkrs')", specifier = ">=0.2.1" },
     { name = "ipykernel", marker = "extra == 'notebooks'", specifier = ">=6" },
     { name = "jupyterlab", marker = "extra == 'notebooks'", specifier = ">=4" },
     { name = "magicgui", marker = "extra == 'all'", specifier = ">=0.10.1" },
