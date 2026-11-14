@@ -100,6 +100,17 @@ blending = [
 # tifffile checks written TIFFs independently of vc_reader.
 tests = ["pytest>=8.4.2", "tifffile>=2024.8.30"]
 
+# Optional native engine for flat ink inference (`infer --engine inkrs`), used
+# with `models`. inkrs loads cuDNN 9 and cuBLAS 12: torch's CUDA 13 build ships
+# the cuDNN but only cuBLAS 13. inkrs's own cu12 extra is left out because its
+# nvidia-cudnn-cu12 writes the same files as torch's nvidia-cudnn-cu13. inkrs
+# publishes no Linux ARM64 wheel, so the extra installs nothing there rather
+# than building inkrs from source
+inkrs = [
+    "inkrs>=0.2.1; sys_platform != 'linux' or platform_machine == 'x86_64'",
+    "nvidia-cublas-cu12>=12.1,<13; sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
+
 # Geometry-driven TIFXYZ label production (no torch/GUI dependency)
 label-transfer = [
     "vc-reader",
