@@ -64,6 +64,7 @@ def decoded_cache_path(cache_dir: str | os.PathLike[str], url: str) -> str:
 
     That is the layout of vesuvius' ``RemoteChunkedArray`` caches, so they are
     found and reused, and the https and s3 spellings of a URL share one cache.
+    On Windows ``:`` is written ``%3A`` (``host%3Aport``), as file names cannot hold it.
     """
     return _reader.decoded_cache_path(os.fspath(cache_dir), url)
 
