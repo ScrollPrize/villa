@@ -976,6 +976,18 @@ def patch_sampling_factors(patches, config):
     return factors
 
 
+
+def open_scroll_zarr(location):
+    """The scroll volume array at a path or URL. A public open-data s3://
+    location (vc_reader's anonymous channel) is read without credentials;
+    zarr's s3 store otherwise asks for AWS keys and fails without them."""
+    location = str(location)
+    if location.startswith('s3://'):
+        from vc_reader.reader.auth import resolve_access
+        if resolve_access(location).kind == 'anonymous':
+            return zarr.open(location, mode='r', storage_options={'anon': True})
+    return zarr.open(location, mode='r')
+
 class FitContext:
     """Owner of all mutable state and resources for one spiral fit.
 
@@ -1400,7 +1412,7 @@ class FitContext:
         if self.scroll_zarr_path:
             progress.begin('loading', 'Opening scroll volume')
             print('loading volume zarr')
-            scroll_zarr = zarr.open(self.scroll_zarr_path, mode='r')
+            scroll_zarr = open_scroll_zarr(self.scroll_zarr_path)
         else:
             scroll_zarr = None
 
