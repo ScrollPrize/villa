@@ -91,7 +91,7 @@ Kimimaro skeletonization. The local `vc-reader` dependency requires its native
 build prerequisites (see [vc_reader](../vc_reader/README.md)).
 
 Use `--slab-workers N --kimimaro-parallel 1` to process multiple slabs concurrently
-on Linux with local predictions. Each worker holds a slab in RAM; the default is
+with local predictions. Each worker holds a slab in RAM; the default is
 one worker and eight Kimimaro processes per slab.
 
 ```sh

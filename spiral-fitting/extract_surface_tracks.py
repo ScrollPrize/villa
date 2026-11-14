@@ -47,6 +47,7 @@ import importlib.util
 import os
 import pickle
 import re
+import sys
 
 import numpy as np
 
@@ -66,7 +67,7 @@ yx_stride_v = 64  # stride between successive vertical slabs
 dust_threshold = 400  # remove components smaller than this many voxels
 max_area_threshold = 640_000  # drop components larger than this many voxels
 path_mode = 'interjoint'  # 'interjoint' = every chain between branch/terminal nodes; 'maximal_chain' = greedy longest-path peel
-slab_workers = 1  # CPU backend: slabs processed at once by forked workers
+slab_workers = 1  # CPU backend: slabs processed at once by worker processes
 kimimaro_parallel = 8  # CPU backend: Kimimaro processes per slab
 
 BACKENDS = ('auto', 'gpu', 'cpu')
@@ -234,6 +235,16 @@ def _slab_tracks(predictions_zarr_array, index, offset_zyx):
 
 
 _worker_array = None  # the opened array, inherited by forked workers
+# Module settings the slab workers read. Spawned workers re-import this file, so they get
+# the parent's values (possibly set from the command line) through _worker_init.
+_WORKER_SETTINGS = ('downsample_factor', 'dust_threshold', 'max_area_threshold', 'path_mode',
+                    'kimimaro_parallel')
+
+
+def _worker_init(array, settings):
+    global _worker_array
+    _worker_array = array
+    globals().update(settings)
 
 
 def _worker_slab(job):
@@ -255,8 +266,17 @@ def _run_slabs(predictions_zarr_array, tracks_db, jobs, desc):
     import multiprocessing
     from concurrent.futures import ProcessPoolExecutor
     global _worker_array
-    _worker_array = predictions_zarr_array
-    pool = ProcessPoolExecutor(slab_workers, mp_context=multiprocessing.get_context('fork'))
+    if sys.platform.startswith('linux'):
+        # Forked workers inherit the opened array and the module settings.
+        _worker_array = predictions_zarr_array
+        pool = ProcessPoolExecutor(slab_workers, mp_context=multiprocessing.get_context('fork'))
+    else:
+        # Windows and macOS: spawned workers receive the array (a zarr array pickles as its
+        # path) and the settings once, when they start.
+        settings = {k: globals()[k] for k in _WORKER_SETTINGS}
+        pool = ProcessPoolExecutor(
+            slab_workers, mp_context=multiprocessing.get_context('spawn'),
+            initializer=_worker_init, initargs=(predictions_zarr_array, settings))
     try:
         for key, data in tqdm(pool.map(_worker_slab, jobs), total=len(jobs), desc=desc):
             tracks_db[key] = data
@@ -520,8 +540,8 @@ def parse_args(argv=None):
     )
     parser.add_argument(
         '--slab-workers', metavar='N', type=int, default=slab_workers,
-        help='CPU backend: slabs processed at once in forked workers, each holding its own '
-             'slab in memory; Linux and local predictions only (default: %(default)s)',
+        help='CPU backend: slabs processed at once in worker processes, each holding its own '
+             'slab in memory; local predictions only (default: %(default)s)',
     )
     parser.add_argument(
         '--kimimaro-parallel', metavar='N', type=int, default=kimimaro_parallel,
@@ -558,10 +578,8 @@ def parse_args(argv=None):
         parser.error('--slab-workers and --kimimaro-parallel apply to --backend cpu only')
     if args.slab_workers < 1 or args.kimimaro_parallel < 1:
         parser.error('--slab-workers and --kimimaro-parallel must be at least 1')
-    if args.slab_workers > 1 and not sys.platform.startswith('linux'):
-        parser.error('--slab-workers > 1 needs Linux (forked workers)')
     if args.slab_workers > 1 and '://' in args.predictions:
-        parser.error('--slab-workers > 1 needs local predictions; forked workers cannot share a remote store')
+        parser.error('--slab-workers > 1 needs local predictions; workers cannot share a remote store')
     return args
 
 
