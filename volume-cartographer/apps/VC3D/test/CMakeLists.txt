@@ -296,6 +296,27 @@ add_test(NAME spiral_updated_drafts COMMAND test_spiral_updated_drafts)
 vc_register_test_target(test_spiral_updated_drafts)
 vc_register_ctest(spiral_updated_drafts test_spiral_updated_drafts)
 
+add_executable(test_coordinate_copy
+    test_coordinate_copy.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/Keybinds.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/Keybinds.hpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/CoordinateCopy.hpp)
+set_target_properties(test_coordinate_copy PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+target_include_directories(test_coordinate_copy PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+target_link_libraries(test_coordinate_copy PRIVATE
+    opencv_core
+    Qt6::Core
+    Qt6::Gui
+    Qt6::Widgets
+    Qt6::Test)
+add_test(NAME coordinate_copy COMMAND test_coordinate_copy)
+set_tests_properties(coordinate_copy PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+vc_register_test_target(test_coordinate_copy)
+vc_register_ctest(coordinate_copy test_coordinate_copy)
+
 add_executable(test_seeding_batch_tracker
     test_seeding_batch_tracker.cpp
     ${PROJECT_SOURCE_DIR}/apps/VC3D/SeedingBatchTracker.cpp)
