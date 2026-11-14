@@ -185,3 +185,11 @@ def test_receipt_canonical_keys_null_values_and_exact_reference_consistency(rece
         receipt_object_reference(dict(receipt, object_references={}), uid)
     with pytest.raises(ReceiptDecodeError, match='inconsistent'):
         receipt_object_reference(dict(receipt, object_references={uid: dict(reference, object=absent)}), uid)
+
+
+def test_receipt_object_references_matches_the_single_lookup(receipt_case):
+    from vc_object_store import receipt_object_reference, receipt_object_references
+    receipt, uid, reference, absent = receipt_case
+    assert receipt_object_references(receipt, [uid, absent, uid.upper()]) == {
+        uid: reference, absent: None, uid.upper(): receipt_object_reference(receipt, uid.upper())}
+    assert receipt_object_references(receipt, []) == {}

@@ -269,6 +269,17 @@ version they read: a commit touching one of them in between is an ordinary
 interfere. The writer is held only for the publication, as with the
 standalone detectors. An identical retry replays the saved receipt.
 
+The publication is all or nothing for its transaction. `submit` owns the
+transaction: a failure while applying the prepared operation or publishing
+it, before the commit, rolls it back and nothing is written. (A response lost
+after the commit is a different case: recover the receipt or retry the
+identical request, as for any transaction.) A C++ caller that applies a
+prepared operation in its own write transaction
+(`PreparedOperation::apply(store, txn)`) gets the same rule: when `apply`
+throws, `txn` is failed as a whole, its `commit()` throws, and every write in
+it is rolled back, including writes made before `apply`. Start a new
+transaction rather than catching the error and committing.
+
 ```python
 plan = {"detectors": [
             {"detector": "point-collection-surface", "params": {"tolerance": 2.5}},
