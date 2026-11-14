@@ -40,6 +40,9 @@ def _parse_args(argv=None):
     p.add_argument("--windings", type=int, nargs=2, metavar=("FIRST", "LAST"),
                    help="windings to correct (default: the windings the fit reports)")
     p.add_argument("--threads", type=int, default=1, help="worker processes (default: 1)")
+    p.add_argument("--method", choices=stage.METHODS, default="tracking",
+                   help="tracking (default): follow each ridge from confident nodes to agreeing neighbours; "
+                        "nearest: move every confident node to its nearest ridge")
     p.add_argument("--field-scale", type=float, default=1.0,
                    help="fraction of the estimated shift to write (default 1.0; see README)")
     return p.parse_args(argv)
@@ -76,11 +79,9 @@ def run(args, log=stage.log_line, slab_rows=4, stop_after_slabs=None):
 
     t_est = time.time()
     e = stage.estimate(fit, ct, band, windings=windings, work_dir=work_dir, threads=args.threads,
-                       slab_rows=slab_rows, log=log, stop_after_slabs=stop_after_slabs)
+                       slab_rows=slab_rows, log=log, stop_after_slabs=stop_after_slabs, method=args.method)
     t_est = time.time() - t_est
-    conf = e["confidence"]
-    U, field_stats = stage.field(fit, e["offset"], conf, band=band, windings=windings, rows=e["plan"].rows,
-                                 scale=args.field_scale)
+    U, field_stats = stage.field(fit, e, band=band, windings=windings, rows=e["plan"].rows, scale=args.field_scale)
     report = {
         "tool": "ridge_correct_checkpoint",
         "input": str(fit.path), "output": str(output),
@@ -98,7 +99,7 @@ def run(args, log=stage.log_line, slab_rows=4, stop_after_slabs=None):
     try:
         rep_write, Ueff = stage.write(fit, U, output, band=band, windings=windings,
                                       extra={"band": list(band), "windings": list(windings),
-                                             "field_scale": args.field_scale})
+                                             "method": args.method, "field_scale": args.field_scale})
     except stage.FidelityError as err:
         report["write"] = getattr(err, "report", None)
         report["refused"] = str(err)

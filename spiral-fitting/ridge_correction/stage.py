@@ -30,6 +30,7 @@ from . import estimate as est
 from . import field as fld
 from . import gapmap as WB
 from . import profiles as prof
+from . import tracking as trk
 from . import writer as W3
 
 # Settings of the method. They are part of the method, not tuning knobs, so
@@ -43,7 +44,12 @@ SETTINGS = {
     "cap": 0.35,  # largest move, windings
     "taper": 150.0,  # cosine taper at the z-band ends, voxels
     "gfloor": 3.0,  # no gap is written below min(old gap, gfloor) voxels
+    # ridge tracking (the default method): tracker parameters (tracking.DEF unless overridden here), field
+    # smoothing sigma (nodes; 0 = none), the distance taper D (nodes) toward unassigned nodes, and the block
+    # size (gap rows, counted from the first extracted row) in which any profile leaving the CT stills every node
+    "tracking": {"P": {}, "sigma": 0.0, "D": 3.0, "edge_block_rows": 8},
 }
+METHODS = ("tracking", "nearest")
 TAG = "C"  # profile-module key of the one checkpoint handled here
 PROVENANCE_KEY = "post_fit_ridge_correction"
 # Write-back fidelity bar, between nodes in the moved region (field.between_node_fidelity): the shift the
@@ -275,7 +281,9 @@ def _slab_name(ra, rb):
 def _slab_done(work_dir, ra, rb, fingerprint):
     meta = work_dir / f"{_slab_name(ra, rb)}.json"
     data = work_dir / f"{_slab_name(ra, rb)}.npy"
-    if not (meta.is_file() and data.is_file()):
+    nan = work_dir / f"{_slab_name(ra, rb)}.nan.npy"
+    rows = work_dir / f"{_slab_name(ra, rb)}.nanrows.npy"
+    if not (meta.is_file() and data.is_file() and nan.is_file() and rows.is_file()):
         return False
     try:
         return json.loads(meta.read_text()).get("fingerprint") == fingerprint
@@ -293,6 +301,8 @@ def _run_slab(fit, ct, plan, ra, rb, threads):
     k0, k1 = plan.windings
     C0, C1 = plan.columns
     out = np.full((rb - ra, C1 - C0, 41), np.nan, np.float32)
+    nan_nodes = np.ones((rb - ra, C1 - C0), bool)
+    nan_fine = np.zeros(3 * (rb - ra) + 2, bool)
     items = [(TAG, k, ra, rb) for k in range(k1, k0 - 1, -1)]
     nan_profiles = 0
     cpu = 0.0
@@ -300,8 +310,10 @@ def _run_slab(fit, ct, plan, ra, rb, threads):
 
     def take(result):
         nonlocal nan_profiles, cpu
-        _tag, _k, _ra, _rb, c0, c1, stacks, nnan, dt = result
+        _tag, _k, _ra, _rb, c0, c1, (stacks, nan_k, nan_fine_k), nnan, dt = result
         out[:, c0 - C0:c1 - C0] = stacks
+        nan_nodes[:, c0 - C0:c1 - C0] = nan_k
+        nan_fine[:] |= nan_fine_k
         nan_profiles += int(nnan)
         cpu += dt
 
@@ -317,7 +329,7 @@ def _run_slab(fit, ct, plan, ra, rb, threads):
             for result in pool.imap_unordered(_work_counted, items):
                 on_demand += result[1]
                 take(result[0])
-    return out, {"nan_profiles": nan_profiles, "work_cpu_s": cpu, "on_demand_chunks": on_demand}
+    return out, nan_nodes, nan_fine, {"nan_profiles": nan_profiles, "work_cpu_s": cpu, "on_demand_chunks": on_demand}
 
 
 def _work_counted(item):
@@ -327,11 +339,11 @@ def _work_counted(item):
 
 
 def extract(fit, ct, plan, work_dir, threads=1, log=None, stop_after_slabs=None):
-    log = log or log_line
     """Profile stacks of every node of the plan, one z slab at a time.
 
     A finished slab is written to ``work_dir`` (data first, then its marker,
     each atomically), so a re-run with the same plan skips it."""
+    log = log or log_line
     work_dir = Path(work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
     plan_file = work_dir / "plan.json"
@@ -358,11 +370,12 @@ def extract(fit, ct, plan, work_dir, threads=1, log=None, stop_after_slabs=None)
         ct.retain(plan.keys[i])
         t_load = time.time() - t0
         resident = ct.resident_bytes()
-        out, st = _run_slab(fit, ct, plan, ra, rb, threads)
-        tmp = work_dir / f".{name}.npy.tmp-{os.getpid()}"
-        with open(tmp, "wb") as fh:
-            np.save(fh, out)
-        os.replace(tmp, work_dir / f"{name}.npy")
+        out, nan_nodes, nan_fine, st = _run_slab(fit, ct, plan, ra, rb, threads)
+        for suffix, arr in ((".npy", out), (".nan.npy", nan_nodes), (".nanrows.npy", nan_fine)):
+            tmp = work_dir / f".{name}{suffix}.tmp-{os.getpid()}"
+            with open(tmp, "wb") as fh:
+                np.save(fh, arr)
+            os.replace(tmp, work_dir / f"{name}{suffix}")
         st.update(rows=[ra, rb], fingerprint=plan.fingerprint, ct_load_s=t_load, ct_resident_bytes=resident,
                   wall_s=time.time() - t0)
         _atomic_json(work_dir / f"{name}.json", st)
@@ -373,6 +386,67 @@ def extract(fit, ct, plan, work_dir, threads=1, log=None, stop_after_slabs=None)
             f"on-demand chunks {st['on_demand_chunks']}, wall {st['wall_s']:.0f}s, total {time.time() - t_start:.0f}s")
     ct.retain([])
     return stats
+
+
+def _nan_nodes(work_dir, plan):
+    """(rows, C1 - C0) bool: nodes whose box stack or either half of the 3 x 3 lattice is NaN."""
+    return np.concatenate([np.load(work_dir / f"{_slab_name(ra, rb)}.nan.npy") for ra, rb in plan.slabs], 0)
+
+
+def _candidates_job(job):
+    work_dir, plan, k, c0, c1 = job
+    nr = plan.rows[1] - plan.rows[0]
+    cu, cr, u1, c1v = trk.winding_candidates(_sheet_stack(work_dir, plan, c0, c1).reshape(-1, 41))
+    return k, c0, c1, cu.reshape(nr, c1 - c0, -1), cr.reshape(nr, c1 - c0, -1), u1.reshape(nr, -1), c1v.reshape(nr, -1)
+
+
+def tracking_inputs(work_dir, plan, idx, threads=1):
+    """Per-node ridge candidates (cu, cr: (rows, W, NC)), the plain estimate (u1, c1: (rows, W)) and the
+    validity mask (rows, W) of the plan's windings, W = idx[last winding]. A node is invalid if its box stack
+    or either half of its 3 x 3 lattice is NaN. In addition the gap rows are grouped in blocks of
+    SETTINGS["tracking"]["edge_block_rows"] from the first extracted row, and a block in which any lattice
+    profile (including the 1/3-row margin sampled around it) leaves the CT is invalid as a whole."""
+    k0, k1 = plan.windings
+    nr = plan.rows[1] - plan.rows[0]
+    W = int(idx[k1])
+    C0 = plan.columns[0]
+    cu = np.full((nr, W, trk.NC), np.nan, np.float32)
+    cr = np.full((nr, W, trk.NC), np.nan, np.float32)
+    u1 = np.zeros((nr, W), np.float32)
+    c1 = np.zeros((nr, W), np.float32)
+    jobs = [(work_dir, plan, k, int(idx[k - 1]), int(idx[k])) for k in range(k0, k1 + 1)]
+    jobs.sort(key=lambda j: -(j[4] - j[3]))
+    if threads <= 1:
+        results = map(_candidates_job, jobs)
+        pool = None
+    else:
+        import multiprocessing as mp
+
+        pool = mp.get_context("fork").Pool(threads, initializer=_worker_init)
+        results = pool.imap_unordered(_candidates_job, jobs)
+    try:
+        for _k, a, b, cu_k, cr_k, u1_k, c1_k in results:
+            cu[:, a:b] = cu_k
+            cr[:, a:b] = cr_k
+            u1[:, a:b] = u1_k
+            c1[:, a:b] = c1_k
+    finally:
+        if pool is not None:
+            pool.close()
+            pool.join()
+    nan = np.zeros((nr, W), bool)
+    nan[:, C0:W] = _nan_nodes(work_dir, plan)[:, :W - C0]
+    r0, r1 = plan.rows
+    nan_fine = set()  # NaN fine-row positions, in thirds of a gap row
+    for ra, rb in plan.slabs:
+        flags = np.load(work_dir / f"{_slab_name(ra, rb)}.nanrows.npy")
+        nan_fine.update(int(3 * ra - 2 + i) for i in np.flatnonzero(flags))
+    block = int(SETTINGS["tracking"]["edge_block_rows"])
+    for a in range(r0, r1, block):
+        b = min(a + block, r1)
+        if any(3 * a - 2 <= q <= 3 * (b - 1) + 2 for q in nan_fine):
+            nan[a - r0:b - r0] = True
+    return {"cu": cu, "cr": cr, "u1": u1, "c1": c1, "valid": ~nan}
 
 
 def _sheet_stack(work_dir, plan, c0, c1):
@@ -396,13 +470,16 @@ def memory_limit_gib():
 
 
 def estimate(fit, ct, band, *, windings=None, work_dir, threads=1, slab_rows=4, max_memory_gb=None,
-             log=None, stop_after_slabs=None):
-    """Per-node ridge offset u* (windings) and confidence for the band's rows.
+             log=None, stop_after_slabs=None, method="tracking"):
+    """Per-node ridge estimates for the band's rows: ridge candidates and a validity mask for
+    ``method="tracking"``, or the single best offset u* (windings) and its confidence for "nearest".
 
     The CT is read in slabs of ``slab_rows`` gap rows, fewer if the memory plan
     for that size is above ``max_memory_gb`` (default: memory_limit_gib()).
-    Returns a dict with ``offset`` and ``confidence`` ((rows, Wc) arrays, rows =
-    the plan's gap rows), ``plan`` and per-slab ``slabs`` statistics."""
+    Returns a dict with the method's arrays (rows = the plan's gap rows), ``plan``
+    and per-slab ``slabs`` statistics."""
+    if method not in METHODS:
+        raise ValueError(f"unknown method {method!r}; choose from {METHODS}")
     log = log or log_line
     limit = memory_limit_gib() if max_memory_gb is None else max_memory_gb
     windings = tuple(windings) if windings else default_windings(fit)
@@ -420,6 +497,10 @@ def estimate(fit, ct, band, *, windings=None, work_dir, threads=1, slab_rows=4, 
         f"(CT per slab <= {plan.memory['ct_slab_max'] / 2**30:.1f} GiB; limit {limit:.1f} GiB)")
     work_dir = Path(work_dir)
     slab_stats = extract(fit, ct, plan, work_dir, threads, log, stop_after_slabs)
+    out = {"method": method, "plan": plan, "slabs": slab_stats, "windings": windings, "band": tuple(band)}
+    if method == "tracking":
+        out.update(tracking_inputs(work_dir, plan, fit.geo["idx"], threads))
+        return out
     # Per winding: template, then offsets (the reference estimator's loop).
     E = est.Est(tmax=SETTINGS["tmax"], win=SETTINGS["win"])
     idx = fit.geo["idx"]
@@ -435,17 +516,46 @@ def estimate(fit, ct, band, *, windings=None, work_dir, threads=1, slab_rows=4, 
         uu, cc = E.estimate(P, T)
         u[:, c0:c1] = uu.reshape(nr, c1 - c0)
         c[:, c0:c1] = cc.reshape(nr, c1 - c0)
-    return {"offset": u, "confidence": c, "plan": plan, "slabs": slab_stats, "windings": windings, "band": tuple(band)}
+    out.update(offset=u, confidence=c)
+    return out
 
 
-def field(fit, offset, confidence, *, band, windings, rows, scale=1.0):
-    """Displacement field u (Z, Wc) in windings from the offsets and confidences.
+def tracking_field(fit, e, band):
+    """Ridge-tracking move field (Z, Wc), float32-rounded as it is stored, plus the tracker's statistics."""
+    g = fit.geo
+    idx = np.asarray(g["idx"]).astype(int)
+    k1 = e["windings"][1]
+    r0w, r1w = e["plan"].rows
+    Z = int(g["Z"])
+    zrow = g["zmin"] + np.arange(Z) * (g["zmax"] - g["zmin"]) / (Z - 1)
+    tw = fld.taper_rows(zrow, tuple(band), SETTINGS["taper"])[r0w:r1w]
+    t = SETTINGS["tracking"]
+    T = trk.track(e["cu"], e["cr"], e["u1"], e["c1"], e["valid"], idx, k1, t["P"])
+    F = trk.field(T, t["sigma"], t["D"], tw)
+    U = np.zeros((Z, int(g["Wc"])))
+    U[r0w:r1w, :F.shape[1]] = F
+    U[:, 0] = 0.0
+    U = U.astype(np.float32).astype(np.float64)
+    st = T["state"]
+    names = ["invalid", "unreached", "ambiguous", "nofit", "assigned", "anchor"]
+    stats = dict(T["info"], states={n: float((st == i).mean()) for i, n in enumerate(names)},
+                 share_moved=float((np.abs(F) > 1e-6).mean()), mean_abs_F=float(np.abs(F).mean()),
+                 max_abs_F=float(np.abs(F).max()))
+    return U, stats
+
+
+def field(fit, e, *, band, windings, rows, scale=1.0):
+    """Displacement field u (Z, Wc) in windings from the estimate ``e``.
 
     ``scale`` multiplies the field. A scaled field passes through float32 (as
     in the method's reference runs, where the field is stored as float32);
     scale 1 leaves the field untouched."""
-    U, stats = fld.field(offset, confidence, fit.geo, rows, tuple(band), tuple(windings), r0=SETTINGS["r0"],
-                         r1=SETTINGS["r1"], cap=SETTINGS["cap"], taper=SETTINGS["taper"])
+    if e["method"] == "tracking":
+        U, stats = tracking_field(fit, e, band)
+    else:
+        U, stats = fld.field(e["offset"], e["confidence"], fit.geo, rows, tuple(band), tuple(windings),
+                             r0=SETTINGS["r0"], r1=SETTINGS["r1"], cap=SETTINGS["cap"], taper=SETTINGS["taper"])
+    stats["method"] = e["method"]
     stats["field_scale"] = float(scale)
     if scale != 1.0:
         U = (float(scale) * U.astype(np.float32).astype(np.float64)).astype(np.float32).astype(np.float64)

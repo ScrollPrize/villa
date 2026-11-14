@@ -120,14 +120,13 @@ class ZarrChunkStore:
 
     # -- sampling -------------------------------------------------------------
     def sample_int(self, zi, yi, xi):
-        """Integer voxel lookups -> float32. A z outside the array's chunk rows
-        gives NaN; y or x outside the array gives 0; an absent chunk gives the
+        """Integer voxel lookups -> float32. A z outside the array gives NaN; y or x outside the array gives 0; an absent chunk gives the
         array's fill value."""
         zi = np.asarray(zi, np.int64)
         yi = np.asarray(yi, np.int64)
         xi = np.asarray(xi, np.int64)
         out = np.zeros(len(zi), np.float32)
-        inz = (zi >= 0) & (zi < self.grid[0] * self.chunks[0])
+        inz = (zi >= 0) & (zi < self.shape[0])
         out[~inz] = np.nan
         ok = inz & (yi >= 0) & (yi < self.shape[1]) & (xi >= 0) & (xi < self.shape[2])
         sel = np.flatnonzero(ok)

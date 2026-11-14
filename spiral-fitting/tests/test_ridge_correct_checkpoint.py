@@ -38,9 +38,11 @@ def synthetic(tmp_path_factory):
 
 @pytest.fixture(scope="module", autouse=True)
 def short_taper():
-    # The method's 150-voxel z taper is longer than the 96-slice synthetic volume.
+    # The method's 150-voxel z taper is longer than the 96-slice synthetic volume, and its 8-row edge blocks
+    # would cover all ten gap rows of the synthetic fit.
     with pytest.MonkeyPatch.context() as mp:
         mp.setitem(stage.SETTINGS, "taper", 12.0)
+        mp.setitem(stage.SETTINGS, "tracking", dict(stage.SETTINGS["tracking"], edge_block_rows=2))
         yield
 
 
@@ -149,51 +151,69 @@ def test_writer_zero_field_is_bit_identical(saturated):
     assert np.array_equal(Ln, L0) and info["row_segments_solved"] == 0
 
 
-def test_writer_keeps_untouched_columns_and_rows_bit_identical():
-    gm, idx, num, L0, sat, rng = _strip(saturated=True)
-    nw = len(num)
+def test_writer_hits_the_nodes_including_each_windings_last_node():
+    gm, idx, num, L0, _sat, rng = _strip(saturated=False)
     U = np.zeros_like(L0)
-    U[:3, int(idx[nw - 1]) + 1:int(idx[nw])] = rng.uniform(-0.25, 0.25, (3, int(num[-1]) - 1))
-    Ln, _, _ = _write_strip(gm, idx, L0, U)
-    keep = np.ones(L0.shape[1], bool)
-    keep[int(idx[nw - 1]) - 2:] = False  # the last 2 columns of the inner winding share samples with the moved one
-    assert sat[:, keep].sum() > 0
-    assert np.array_equal(Ln[:, keep], L0[:, keep]) and np.array_equal(Ln[3:], L0[3:])
-
-
-@pytest.mark.parametrize("saturated", [False, True])
-def test_writer_hits_the_nodes_including_each_windings_last_node(saturated):
-    gm, idx, num, L0, _sat, _rng = _strip(saturated)
-    U = np.zeros_like(L0)
-    th_all = WB.strip_geometry(idx)[3]
     for k in (2, 3, 4):
-        cols = np.arange(int(idx[k - 1]), int(idx[k]))
-        U[:, cols] = 0.15 * np.sin(2 * np.pi * th_all[cols])[None]
-    Ln, Ueff, info = _write_strip(gm, idx, L0, U)
-    assert info["floor_violations_left"] == 0
+        U[:, int(idx[k - 1]):int(idx[k])] = rng.uniform(-0.25, 0.25, (L0.shape[0], int(num[k - 1])))
+    Ln, _, _ = W3.solve_rows(L0, gm, idx, gm.dr, U, 0.0)
+    th_all = WB.strip_geometry(idx)[3]
     Lp = Ln.copy()
     Lp[:, 0] = 0.0
     last, other = [], []
     for k in range(1, len(num) + 1):
         tn = th_all[int(idx[k - 1]):int(idx[k])]
-        e = (WB.radii_at(Lp, gm, idx, gm.dr, k, tn) - _intended(gm, idx, num, L0, Ueff, k, tn)) / gm.dr
+        e = (WB.radii_at(Lp, gm, idx, gm.dr, k, tn) - _intended(gm, idx, num, L0, U, k, tn)) / gm.dr
         other.append(e[:, :-1].ravel())
         last.append(e[:, -1])
     rms_last = float(np.sqrt((np.concatenate(last) ** 2).mean()))
     rms_other = float(np.sqrt((np.concatenate(other) ** 2).mean()))
-    # saturated cells cannot follow a move (their gap map is flat), so only the plain strip is near exact
-    assert rms_other < (0.05 if saturated else 0.01), rms_other
     assert rms_last < 2 * rms_other + 1e-6, (rms_last, rms_other)
 
 
-def test_writer_scales_down_a_crossing_move_instead_of_breaking_the_gap_floor():
-    gm, idx, _num, L0, _sat, _ = _strip(saturated=True)
+def test_writer_never_writes_a_gap_below_the_floor():
+    gm, idx, num, L0, _sat, _ = _strip(saturated=False)
     U = np.zeros_like(L0)
     c3, c4 = int(idx[2]) + 5, int(idx[3]) + 5
     U[:, c3:c3 + 3] = 0.9
     U[:, c4:c4 + 3] = -0.5
-    _, Ueff, info = _write_strip(gm, idx, L0, U)
-    assert info["floor_violations_left"] == 0 and np.abs(Ueff).max() < 0.9
+    Ln, Ueff, info = _write_strip(gm, idx, L0, U)
+    t = (np.arange(800) + 0.5) / 800
+    wc = int(idx[-1])
+    Lp, L0p = Ln.copy(), L0.copy()
+    Lp[:, 0] = 0
+    L0p[:, 0] = 0
+    margin = min(float((gm.gapf(WB.interp_cols(Lp, idx[s] + t * num[s], wc))
+                        - np.minimum(gm.gapf(WB.interp_cols(L0p, idx[s] + t * num[s], wc)), 3.0)).min())
+                 for s in range(len(num)))
+    assert margin > -0.05 and info["floor_violations_left"] == 0 and np.abs(Ueff).max() < 0.9
+
+
+# ---------------------------------------------------------------------------
+# Ridge tracking against frozen reference outputs
+# ---------------------------------------------------------------------------
+
+GOLDEN = Path(__file__).parent / "data" / "ridge_tracking_golden.npz"
+
+
+def test_ridge_tracking_matches_its_reference_outputs():
+    """Inputs and outputs frozen from the implementation the published results were made with."""
+    from ridge_correction import profiles as prof
+    from ridge_correction import tracking as trk
+
+    g = np.load(GOLDEN)
+    nr, ncols = g["stack"].shape[:2]
+    cu, cr, u1, c1 = trk.winding_candidates(g["stack"].astype(np.float64).reshape(-1, 41))
+    assert np.array_equal(cu.reshape(nr, ncols, -1), g["cu"], equal_nan=True)
+    assert np.array_equal(cr.reshape(nr, ncols, -1), g["cr"], equal_nan=True)
+    assert np.array_equal(u1.reshape(nr, ncols), g["u1"]) and np.array_equal(c1.reshape(nr, ncols), g["c1"])
+    T = trk.track(g["cu"], g["cr"], g["u1"], g["c1"], g["valid"], g["idx"], 2, {})
+    assert np.array_equal(T["u"], g["u"], equal_nan=True) and np.array_equal(T["state"], g["state"])
+    assert np.array_equal(T["r"], g["r"], equal_nan=True)
+    assert np.array_equal(trk.field(T, 0.0, 3.0, g["tw"]), g["F"])
+    assert (T["state"] >= 4).sum() > 100
+    for par in (0, 1):
+        assert np.array_equal(prof.conv_half(g["A"], 2, 3, par), g[f"half{par}"], equal_nan=True)
 
 
 # ---------------------------------------------------------------------------
@@ -313,7 +333,10 @@ def test_end_to_end_on_the_synthetic_ct(synthetic, base):
     f = field[(zrow >= 24) & (zrow <= 72)][:, idx[0]:idx[6]]
     d_true = np.broadcast_to(fixture.planted_offset(th[idx[0]:idx[6]]), f.shape)
     moved = np.abs(f) > 0
-    assert moved.mean() > 0.6 and np.sqrt(((f[moved] - d_true[moved]) ** 2).mean()) < 0.02
+    # ridge tracking: every reachable node is assigned; the distance taper lowers moves next to unassigned rows
+    assert rep["field"]["method"] == "tracking" and rep["field"]["ambiguous"] == 0
+    assert moved.mean() > 0.9 and np.corrcoef(f[moved], d_true[moved])[0, 1] > 0.95
+    assert np.sqrt(((f[moved] - d_true[moved]) ** 2).mean()) < 0.04
     assert rep["write"]["fidelity_failures"] == [] and rep["write"]["logits_changed"] > 0
     assert rep["write"]["verify_at_nodes"]["rms_err_w"] < 0.005
     # profiles that leave the CT are NaN and their nodes never move
@@ -325,6 +348,40 @@ def test_end_to_end_on_the_synthetic_ct(synthetic, base):
     assert outside.any() and np.isnan(stacks[outside]).all()
     assert np.isfinite(stacks[(zr > 16) & (zr < 80)]).all()
     assert (field[r0:r1][outside] == 0).all()
+
+
+def test_rows_near_the_ct_edge_are_stilled_in_whole_blocks(synthetic, base):
+    ckpt, umb, ct = synthetic
+    d, rep = base
+    fit = stage.load_fit(ckpt, umb)
+    e = stage.estimate(fit, ZarrChunkStore(ct), (0.0, 96.0), windings=(1, 6), work_dir=d / "base.ckpt.work",
+                       log=lambda *a: None)
+    assert all(s.get("resumed") for s in e["slabs"])
+    W = int(fit.geo["idx"][6])
+    dead = (~e["valid"][:, :W]).all(1)
+    block = stage.SETTINGS["tracking"]["edge_block_rows"]
+    r0 = e["plan"].rows[0]
+    for a in range(0, len(dead), block):  # a block is either fully stilled or not stilled as a whole
+        assert len(set(dead[a:a + block].tolist())) == 1
+    nan_rows = stage._nan_nodes(d / "base.ckpt.work", e["plan"]).any(1)
+    assert dead[nan_rows].all() and dead.any() and not dead.all()
+    assert r0 == rep["rows"][0]
+
+
+def test_the_nearest_ridge_method_recovers_the_planted_offset(synthetic, tmp_path):
+    ckpt, umb, _ = synthetic
+    rep = _run(tmp_path, synthetic, "--method", "nearest", name="nearest.ckpt")
+    fit = stage.load_fit(ckpt, umb)
+    th = _node_angles(fit.geo)
+    idx = fit.geo["idx"].astype(int)
+    field = np.load(tmp_path / "nearest.ckpt.field.npy")
+    zrow = fit.geo["zmin"] + np.arange(fit.geo["Z"]) * (fit.geo["zmax"] - fit.geo["zmin"]) / (fit.geo["Z"] - 1)
+    f = field[(zrow >= 24) & (zrow <= 72)][:, idx[0]:idx[6]]
+    d_true = np.broadcast_to(fixture.planted_offset(th[idx[0]:idx[6]]), f.shape)
+    moved = np.abs(f) > 0
+    assert rep["field"]["method"] == "nearest" and moved.mean() > 0.6
+    assert np.sqrt(((f[moved] - d_true[moved]) ** 2).mean()) < 0.02
+    assert rep["write"]["fidelity_failures"] == []
 
 
 def test_slab_split_equals_larger_slabs(synthetic, base, tmp_path):

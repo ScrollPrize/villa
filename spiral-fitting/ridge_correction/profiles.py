@@ -90,8 +90,29 @@ def conv_nodes(A, nr, nc):
     return out.astype(np.float32)
 
 
+def conv_half(A, nr, nc, par):
+    """Unweighted mean over the 3x3 box lattice points with (a + b) % 2 == par (A: 5 points, B: 4); nan if < half valid."""
+    ok = np.isfinite(A).all(-1)
+    A0 = np.where(ok[..., None], A, 0.0)
+    num = np.zeros((nr, nc) + A.shape[2:]); den = np.zeros((nr, nc)); cnt = 0
+    ri = 2 + 3 * np.arange(nr); ci = 2 + 3 * np.arange(nc)
+    for a in (-1, 0, 1):
+        for b in (-1, 0, 1):
+            if (a + b) % 2 != par:
+                continue
+            cnt += 1
+            num += A0[np.ix_(ri + a, ci + b)]
+            den += ok[np.ix_(ri + a, ci + b)]
+    with np.errstate(invalid='ignore', divide='ignore'):
+        out = num / den[..., None]
+    out[den < cnt / 2] = np.nan
+    return out.astype(np.float32)
+
+
 def work(item):
-    """Box profile stacks of winding k for gap rows [ra, rb): (tag, k, ra, rb, c0, c1, stacks, nan count, seconds)."""
+    """Box profile stacks of winding k for gap rows [ra, rb) and the nodes whose box stack or either half of
+    the 3 x 3 lattice is NaN: (tag, k, ra, rb, c0, c1, (stacks, nan_nodes, nan_fine_rows), nan count, seconds).
+    nan_fine_rows flags the fine lattice rows (gap row ra - 2/3 + i/3) holding any NaN profile."""
     tag, k, ra, rb = item
     t0 = time.time()
     g = G["geo"][tag]
@@ -109,9 +130,15 @@ def work(item):
     w = np.repeat(float(k) + TK[None, :], n, 0)
     knots = inv(tag, np.repeat(ZZ, 5), np.repeat(TT, 5), w.ravel()).reshape(n, 5, 3)
     P = profiles(knots)
-    nnan = int(np.isnan(P).any(1).sum())
-    stacks = conv_nodes(P.reshape((len(fr), len(fc), NU)), nr, nc)
-    return tag, k, ra, rb, c0, c1, stacks, nnan, time.time() - t0
+    nan_profile = np.isnan(P).any(1)
+    nnan = int(nan_profile.sum())
+    nan_fine_rows = nan_profile.reshape(len(fr), len(fc)).any(1)
+    A = P.reshape((len(fr), len(fc), NU))
+    stacks = conv_nodes(A, nr, nc)
+    nan_nodes = np.isnan(stacks).any(-1)
+    for par in (0, 1):
+        nan_nodes |= np.isnan(conv_half(A, nr, nc, par)).any(-1)
+    return tag, k, ra, rb, c0, c1, (stacks, nan_nodes, nan_fine_rows), nnan, time.time() - t0
 
 
 def sample_int(zi, yi, xi):

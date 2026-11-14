@@ -673,17 +673,30 @@ An existing output path is never overwritten.
 
 `ridge_correct_checkpoint.py` is an optional post-fit step. For every node of
 a fitted checkpoint's gap grid (one per gap-logit cell, about 24 voxels
-apart) it reads raw-CT intensity profiles across the fitted winding,
-estimates how far the winding sits from the nearest bright papyrus ridge
-(cross-correlation with a per-winding template; no labels), and writes that
-shift into the gap parameters. It is a separate command: no fit changes
-unless it is run on that fit's checkpoint.
+apart) it reads raw-CT intensity profiles across the fitted winding, finds
+the candidate papyrus ridges near it (cross-correlation with a per-winding
+template; no labels), follows each ridge from confident nodes to neighbours
+that agree with it, and writes the resulting shift into the gap parameters.
+It is a separate command: no fit changes unless it is run on that fit's
+checkpoint.
 
 ```sh
 python ridge_correct_checkpoint.py checkpoint_fitted.ckpt corrected.ckpt \
-    --ct https://.../volume.zarr/2 [--z-range Z0 Z1] [--windings FIRST LAST] \
-    [--threads N] [--field-scale S]
+    --ct https://.../volume.zarr/2 [--z-range Z0 Z1] [--windings FIRST LAST] [--threads N]
 ```
+
+Example on a public PHerc0332 reference fit (M8, seed 1, from the dataset's
+`repro/runs/M8/s1/Vb/`, with the dataset's `umbilicus/umbilicus.json`):
+
+```sh
+python ridge_correct_checkpoint.py checkpoint_fitted.ckpt corrected.ckpt \
+    --umbilicus umbilicus.json --windings 1 67 --threads 8 \
+    --ct https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0332/volumes/20251211183505-2.399um-0.2m-78keV-masked.zarr/2
+```
+
+Windings 1-67 are the setting the published comparisons used; their
+measured gain comes from windings 46-57, and editing the other windings
+alone changed the slice-line score by -0.08 / -0.03 points (two seeds).
 
 - **Input.** A fitted checkpoint, its `umbilicus.json` (found as for the
   flattener, or `--umbilicus`), and the CT level the fit was made in: a Zarr
@@ -695,13 +708,21 @@ python ridge_correct_checkpoint.py checkpoint_fitted.ckpt corrected.ckpt \
   plus a `post_fit_ridge_correction` entry with the settings. The exporter and
   the flattener read it unchanged. `corrected.ckpt.json` is a report;
   `corrected.ckpt.field.npy` the per-node shift in windings.
-- **What changes.** shift = scale x taper(z) x ramp(confidence, 0.70-0.90) x
-  clip(offset, +-0.35 winding), with a 150-voxel cosine taper at the band
-  ends. `--field-scale` is the scale (default 1.0, the full estimated shift).
-  The gap writer re-solves only the columns next to a changed target, keeps
-  every other stored logit bit for bit (a zero field leaves the model state
-  and its digest identical), and halves a move locally rather than push a gap
-  below min(old gap, 3 voxels).
+- **What changes.** Each node lists up to three candidate ridges within
+  +-0.65 winding. Starting from confident nodes, a node takes the candidate
+  closest to its already-assigned neighbours, if it is within 0.2 winding of
+  them and clearly closer than the next candidate; nodes where no candidate
+  fits, or two fit about equally well, are not moved, and moves fade to zero
+  within three nodes of them and in a 150-voxel cosine taper at the band
+  ends. Near the CT's top and bottom, gap rows are taken in blocks of eight
+  (counted from the first extracted row): a block in which any profile
+  reaches past the CT is not moved at all, nor is any node whose own
+  profiles are mostly outside the CT. `--method
+  nearest` instead moves every confident node to its single best ridge
+  (shift = ramp(confidence, 0.70-0.90) x clip(offset, +-0.35 winding)). The
+  gap writer keeps every stored logit it does not need to change bit for bit
+  (a zero field leaves the model state and its digest identical) and halves a
+  move locally rather than push a gap below min(old gap, 3 voxels).
 - **Write-back check.** Before saving, the command compares the shift the
   edited model realises with the shift it was asked to write, at 20,000
   random points between nodes where the field moves: the correlation must be
@@ -714,21 +735,20 @@ python ridge_correct_checkpoint.py checkpoint_fitted.ckpt corrected.ckpt \
   and never stored on disk; slab size is chosen so the memory plan stays
   under 32 GiB or 80% of the machine's memory. Each slab's profiles are kept
   in `corrected.ckpt.work`, so re-running the same command after an
-  interruption resumes (delete that directory afterwards; it holds about
-  0.4 GB per 1,000 z for 126 windings).
-- **Cost (one measured run).** PHercParis4 generation 19, whole fit (z
-  4000-17750, windings 10-135), 8 vCPU / 15 GB, 6 worker processes: 7.1 h
-  wall, 34 CPU-h, 280 GB of CT streamed, 10.6 GB largest process.
-- **Limits.** Experimental; not proposed for merging as is. The shift is
-  toward the nearest consistent CT ridge, which is not always the right
-  sheet. On PHercParis4 generation 19 (whole fit, scale 0.5) the write-back
-  check fails (correlation between nodes 0.876, error ratio 0.55); the moves
-  there are small (mean 0.06 winding where moved), so the writer's residual
-  is a large share of them, and the command refuses that fit today. On a
-  published PHerc0332 fit (M8 s1, z 3000-3500, scale 1.0) it passes
-  (0.940, 0.37). Tests
-  (`tests/test_ridge_correct_checkpoint.py`) use a synthetic fit and CT: they
-  check correctness, not usefulness.
+  interruption resumes (delete that directory afterwards).
+- **Limits.** Experimental; not proposed for merging as is. The method
+  follows the nearest consistent CT ridge, which is not always the right
+  sheet: at one checked place (PHerc0332 M8, winding 50) it moved the surface
+  8-18 voxels outward onto the next layer, away from the hand-traced sheet.
+  The measured gain is on 51 slice lines that all lie on windings 47-55 of
+  one fit family. On PHercParis4, two window fits that were never given 55
+  human lines (311 points) show no gain on those lines (-0.02 / -0.04 voxel
+  against a bar of -0.3). On the fitter team's ink metric
+  (`total_fg_pixels`, three PHercParis4 fits, 9 winding surfaces) the edit
+  changes recovered ink by -21.9 %, within what a rigid 0.15-0.6 voxel
+  jitter of the original surface does (24.1 %): no gain and no loss
+  detectable at this size. Tests (`tests/test_ridge_correct_checkpoint.py`)
+  use a synthetic fit and CT: they check correctness, not usefulness.
 
 ## Hover descriptions (descriptions.json)
 

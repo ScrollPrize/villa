@@ -1,33 +1,25 @@
 """Write a per-node winding displacement field into the gap logits.
 
-For winding k the gap g_(k-1)(theta) is solved per z row so that the winding's
-radius follows R_k + u g (u > 0: the gap outside, u < 0: the gap inside) on
-four samples per column plus every node. Rows are independent; three
-Gauss-Seidel sweeps over the strip segments make each winding's last node
-exact as well. Built for fits where many gap cells sit at the minimum gap
-(the gap map is flat there and a gap cannot be inverted to a logit):
-- inside a re-solved row-segment only the columns next to a sample whose
-  target gap changes are free; every other column keeps its stored logit;
-- free columns start node-exact (the target gap at the node, inverted) and
-  are refined by Levenberg-Marquardt with per-row damping, a step being kept
-  only if the row's dense residual falls;
-- a move whose INTENDED gap falls more than FLOOR_TOL voxels below
-  min(old gap, floor) is halved locally (up to eight times, then dropped).
-A zero field leaves the logits bit-identical; column 0 stays pinned.
+For sheet k the gap g_(k-1)(theta) is solved per z row so that the sheet's
+radius follows R_k + u g (u > 0: the gap outside, u < 0: the gap inside)
+on four samples per column plus every node (Gauss-Newton on the softplus gap
+map, tridiagonal normal equations). Three Gauss-Seidel sweeps over the
+segments make each sheet's last node exact as well (the inner segment's
+interpolation reaches into the next segment's first column). A row-segment
+whose target equals its current gap is not solved, so a zero field leaves
+the logits bit-identical. A move that would take a gap below
+min(old gap, floor) is halved locally (up to eight times, then dropped)
+instead of clipped. Column 0 stays pinned.
 """
 
+# Kept in its original form so that it can be compared line by line with the
+# implementation the published results were made with; style-only lint
+# findings are therefore not fixed here.
+# ruff: noqa: C408, RUF059
 
 import numpy as np
 
 from . import gapmap as WB
-
-TOL = 1e-9
-
-STEP_CLIP = 0.05  # largest logit step per iteration (~15 units of softplus argument)
-
-LM_ITER = 8  # Levenberg-Marquardt iterations per segment and sweep
-
-FLOOR_TOL = 0.02  # vx: a sample counts as a floor violation (-> shrink) only if its target gap is this far below the floor;
 
 
 def dgap(gm, Lv):
@@ -38,6 +30,7 @@ def dgap(gm, Lv):
 
 
 def thomas(a, b, c, d):
+    """batched tridiagonal solve over rows: a sub (n), b diag (n), c super (n), d rhs (n); all (rows, n)."""
     n = b.shape[1]
     cp = np.zeros_like(b)
     dp = np.zeros_like(b)
@@ -55,6 +48,8 @@ def thomas(a, b, c, d):
 
 
 class Seg:
+    """sample geometry of strip segment s."""
+
     def __init__(self, idx, s, Wc, per=4):
         num = np.diff(idx)
         self.s = s
@@ -71,85 +66,25 @@ class Seg:
         self.th = (p * Wc / (Wc - 1) - idx[s]) / num[s]
         self.i0 = np.minimum(np.floor(p).astype(int), Wc - 2)
         self.f = p - self.i0
-        self.c0, self.c1 = int(idx[s]), int(idx[s + 1])
+        self.c0, self.c1 = int(idx[s]), int(idx[s + 1])  # own (free) columns [c0, c1)
         if s == 0:
-            self.c0 = 1
-        self.M = M  # samples [M:] are the integer node positions idx[s] .. idx[s+1]-1
+            self.c0 = 1  # column 0 is pinned
 
 
-def interp_at(A, sg):
-    return A[:, sg.i0] * (1 - sg.f) + A[:, sg.i0 + 1] * sg.f
+def interp_at(A, seg):
+    return A[:, seg.i0] * (1 - seg.f) + A[:, seg.i0 + 1] * seg.f
 
 
-def _free_mask(chg, sg, n):
-    """chg (rows, samples) bool: sample's target differs. -> (rows, n) bool: local column influenced by a changed sample."""
-    F = np.zeros((chg.shape[0], n), bool)
-    for col, w in ((sg.i0, 1 - sg.f), (sg.i0 + 1, sg.f)):
-        ok = (col >= sg.c0) & (col < sg.c0 + n) & (w > 0)
-        lc = col[ok] - sg.c0
-        rr, mm = np.nonzero(chg[:, ok])
-        F[rr, lc[mm]] = True
-    return F
-
-
-def _lm(Lr, Gr, F, sg, gm, n_iter):
-    """Levenberg-Marquardt on the free columns of each row; returns the refined rows and the final per-row cost."""
-    c0 = sg.c0
-    n = F.shape[1]
-    R = Lr.shape[0]
-    cost = lambda L: ((Gr - gm.gapf(interp_at(L, sg))) ** 2).sum(1)
-    mu = np.full(R, 1e-3)
-    cur = cost(Lr)
-    okA = (sg.i0 >= c0) & (sg.i0 + 1 < c0 + n)
-    lcA = sg.i0[okA] - c0
-    for it in range(n_iter):
-        lv = interp_at(Lr, sg)
-        g = gm.gapf(lv)
-        J = dgap(gm, lv)
-        res = Gr - g
-        A = np.zeros((R, n))
-        Bd = np.zeros((R, n))
-        Cd = np.zeros((R, n))
-        D = np.zeros((R, n))
-        for col, wgt in ((sg.i0, 1 - sg.f), (sg.i0 + 1, sg.f)):
-            ok = (col >= c0) & (col < c0 + n)
-            lc = col[ok] - c0
-            Jw = J[:, ok] * wgt[ok]
-            np.add.at(Bd.T, lc, (Jw**2).T)
-            np.add.at(D.T, lc, (Jw * res[:, ok]).T)
-        off = (J[:, okA] ** 2) * ((1 - sg.f[okA]) * sg.f[okA])
-        np.add.at(Cd.T, lcA, off.T)
-        np.add.at(A.T, lcA + 1, off.T)
-        # fixed columns: identity rows, no coupling
-        A[:, 1:] *= F[:, 1:] & F[:, :-1]
-        A[:, 0] = 0
-        Cd[:, :-1] *= F[:, :-1] & F[:, 1:]
-        Cd[:, -1] = 0
-        tiny = 1e-9 * (Bd.max(1, keepdims=True) + 1e-30)
-        Bdd = Bd + mu[:, None] * (Bd + tiny)
-        Bdd = np.where(F, Bdd, 1.0)
-        D = np.where(F, D, 0.0)
-        dx = thomas(A, Bdd, Cd, D)
-        dx = np.clip(dx, -STEP_CLIP, STEP_CLIP)  # at most ~15 units of softplus argument per step
-        Ltry = Lr.copy()
-        Ltry[:, c0 : c0 + n] += dx
-        new = cost(Ltry)
-        acc = new < cur
-        Lr[acc] = Ltry[acc]
-        cur = np.where(acc, new, cur)
-        mu = np.where(acc, np.maximum(mu / 3, 1e-9), mu * 10)
-    return Lr, cur
-
-
-def solve_rows(Lold, gm, idx, dr, U, gfloor=3.0, sweeps=3, lm_iter=None):
-    lm_iter = lm_iter or LM_ITER
-    Wc, num, _j, _th = WB.strip_geometry(idx)
+def solve_rows(Lold, gm, idx, dr, U, gfloor=3.0, sweeps=3, gn_iter=4):
+    """Lold (rows, Wc) float64 stored logits; U (rows, Wc). Returns Lnew (float64, col 0 = stored), info, viol (rows, Wc) bool."""
+    Wc, num, j, th = WB.strip_geometry(idx)
     nw = len(num)
     L = Lold.copy()
     L[:, 0] = 0.0
     out = L.copy()
     segs = [Seg(idx, s, Wc) for s in range(nw)]
     R = Lold.shape[0]
+    # targets depend only on the OLD model and U: precompute per segment
     tgt = []
     for s, sg in enumerate(segs):
         k = s + 1
@@ -157,32 +92,20 @@ def solve_rows(Lold, gm, idx, dr, U, gfloor=3.0, sweeps=3, lm_iter=None):
         g_in = gm.gapf(interp_at(L, sg))
         g_out = gm.gapf(WB.interp_cols(L, idx[k] + sg.th * num[k], Wc)) if k < nw else g_in
         ub = interp_at(U, sg)
-        Rt = Rold + np.where(ub > 0, ub * g_out, ub * g_in)
-        # intended radius of the inner sheet k-1 at the same angles (for the floor test on the INTENT, not on writer residuals)
-        if k > 1:
-            coord = idx[s - 1] + sg.th * num[s - 1]
-            ub_in = WB.interp_cols(U, coord, Wc)
-            gi_in = gm.gapf(WB.interp_cols(L, coord, Wc))
-            Rt_in = WB.radii_at(L, gm, idx, dr, k - 1, sg.th) + np.where(
-                ub_in > 0, ub_in * g_in, ub_in * gi_in
-            )
-        else:
-            Rt_in = dr * sg.th
-        tgt.append((Rt, np.minimum(g_in, gfloor), Rt - Rt_in))
+        tgt.append((Rold + np.where(ub > 0, ub * g_out, ub * g_in), np.minimum(g_in, gfloor)))
     viol = np.zeros(Lold.shape, bool)
     solved = np.zeros((R, nw), bool)
     nviol = 0
-    nfree = 0
     hist = []
     for sw in range(sweeps):
         maxchg = 0.0
         for s, sg in enumerate(segs):
             k = s + 1
-            Rt, fl, Gint = tgt[s]
+            Rt, fl = tgt[s]
             Rin = WB.radii_at(out, gm, idx, dr, k - 1, sg.th) if k > 1 else dr * sg.th
             G = Rt - Rin
             if sw == sweeps - 1:
-                low = Gint < fl - FLOOR_TOL
+                low = G < fl - 1e-9
                 if low.any():
                     rr, mm = np.nonzero(low)
                     viol[rr, sg.i0[mm]] = True
@@ -190,43 +113,48 @@ def solve_rows(Lold, gm, idx, dr, U, gfloor=3.0, sweeps=3, lm_iter=None):
                     nviol += int(low.sum())
             G = np.maximum(G, fl)
             gcur = gm.gapf(interp_at(out, sg))
-            chg = np.abs(G - gcur) > TOL
-            act = chg.any(1)
+            act = np.abs(G - gcur).max(1) > 1e-9
             if not act.any():
                 continue
             solved[act, s] = True
             c0, c1 = sg.c0, sg.c1
             n = c1 - c0
-            Lr = out[act].copy()
+            # sample -> local column weights (free columns only); fixed contributions stay in b
+            Lr = out[act]
             Gr = G[act]
-            F = _free_mask(chg[act], sg, n)
-            if sw == 0:
-                nfree += int(F.sum())
-                # node-exact start on the free columns: gap AT node column c = target at that node sample
-                Gn = Gr[:, sg.M :]
-                cols = np.arange(int(idx[s]), int(idx[s + 1]))
-                okc = cols >= c0
-                lc = cols[okc] - c0
-                init = gm.gapinv(np.maximum(Gn[:, okc], gm.min_gap + 1e-9))
-                nodechg = (
-                    np.abs(Gn[:, okc] - gcur[act][:, sg.M :][:, okc]) > TOL
-                )  # node gap unchanged -> keep stored logit
-                blk = Lr[:, c0:c1]
-                blk[:, lc] = np.where(F[:, lc] & nodechg, init, blk[:, lc])
-                Lr[:, c0:c1] = blk
-            Lr, _ = _lm(Lr, Gr, F, sg, gm, lm_iter)
-            maxchg = max(maxchg, float(np.abs(Lr[:, c0:c1] - out[act, c0:c1]).max()))
+            for it in range(gn_iter):
+                lv = interp_at(Lr, sg)
+                g = gm.gapf(lv)
+                J = dgap(gm, lv)
+                res = Gr - g
+                A = np.zeros((Lr.shape[0], n))
+                Bd = np.zeros((Lr.shape[0], n))
+                Cd = np.zeros((Lr.shape[0], n))
+                D = np.zeros((Lr.shape[0], n))
+                for col, wgt in ((sg.i0, 1 - sg.f), (sg.i0 + 1, sg.f)):
+                    ok = (col >= c0) & (col < c1)
+                    lc = col[ok] - c0
+                    w_ = wgt[ok]
+                    Jw = J[:, ok] * w_
+                    np.add.at(Bd.T, lc, (Jw**2).T)
+                    np.add.at(D.T, lc, (Jw * res[:, ok]).T)
+                # off-diagonals: samples touching (i0, i0+1) both free
+                ok = (sg.i0 >= c0) & (sg.i0 + 1 < c1)
+                lc = sg.i0[ok] - c0
+                off = (J[:, ok] ** 2) * ((1 - sg.f[ok]) * sg.f[ok])
+                np.add.at(Cd.T, lc, off.T)
+                np.add.at(A.T, lc + 1, off.T)
+                Bd += 1e-12 * (Bd.max(1, keepdims=True) + 1e-30)
+                dx = thomas(A, Bd, Cd, D)
+                Lr[:, c0:c1] += dx
+            old = out[act, c0:c1]
+            maxchg = max(maxchg, float(np.abs(Lr[:, c0:c1] - old).max()))
             out[act, c0:c1] = Lr[:, c0:c1]
-        hist.append({"sweep": sw, "max_logit_change": maxchg})
+        hist.append(dict(sweep=sw, max_logit_change=maxchg))
     out[:, 0] = Lold[:, 0]
     return (
         out,
-        {
-            "sweeps": hist,
-            "floor_violations_samples": nviol,
-            "row_segments_solved": int(solved.sum()),
-            "free_cells_sweep0": nfree,
-        },
+        dict(sweeps=hist, floor_violations_samples=nviol, row_segments_solved=int(solved.sum())),
         viol,
     )
 
@@ -242,6 +170,7 @@ def write_field(Lold_rows, gm, idx, dr, U, gfloor=3.0, sweeps=3, max_shrink=8):
             break
         rows = np.flatnonzero(viol.any(1))
         cols = viol.copy()
+        # also the inner sheet's two nodes at the same angle
         rr, cc = np.nonzero(viol)
         s = j[cc]
         ok = s >= 1
@@ -250,7 +179,7 @@ def write_field(Lold_rows, gm, idx, dr, U, gfloor=3.0, sweeps=3, max_shrink=8):
         cols[rr[ok], c0] = True
         cols[rr[ok], np.minimum(c0 + 1, Wc - 1)] = True
         U[cols] = U[cols] * (0.5 if it < max_shrink else 0.0)
-        shr.append({"iter": it, "rows": len(rows), "nodes_scaled": int(cols.sum())})
+        shr.append(dict(iter=it, rows=len(rows), nodes_scaled=int(cols.sum())))
         Ln, inf2, v2 = solve_rows(Lold_rows[rows], gm, idx, dr, U[rows], gfloor, sweeps)
         Lnew[rows] = Ln
         viol = np.zeros_like(viol)
