@@ -2765,6 +2765,25 @@ class FitContext:
             if os.path.exists(temporary):
                 os.unlink(temporary)
 
+
+    def _free_fit_state_for_export(self):
+        """Export-OOM prevention. The final checkpoint is already on disk, so everything only the optimisation steps need is released before the
+        mesh export, whose transform and torch.cat allocate several GiB more (+4 to 10.5 GiB measured; PHerc0343 16-voxel died there with
+        1.42 GiB free): the AdamW moments, the parameter gradients and the allocator's cached blocks.  FIT_SPIRAL_EXPORT_FREE=0 disables it."""
+        if os.environ.get('FIT_SPIRAL_EXPORT_FREE', '1') != '1':
+            return
+        before = torch.cuda.memory_allocated() / 2**30 if torch.cuda.is_available() else 0.0
+        try:
+            self.optimiser.state.clear()
+            self.optimiser.zero_grad(set_to_none=True)
+        except Exception as e:
+            print(f'export free: optimiser state not released ({type(e).__name__}: {e})', flush=True)
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            print(f'export free: allocated {before:.2f} -> {torch.cuda.memory_allocated() / 2**30:.2f} GiB '
+                  f'(reserved {torch.cuda.memory_reserved() / 2**30:.2f} GiB) before the mesh export', flush=True)
+
     def _save_model(self, suffix, completed_iterations=None):
         if completed_iterations is None:
             completed_iterations = self._initial_num_training_steps
@@ -4268,6 +4287,7 @@ class FitContext:
                 'saving_checkpoint', 'Saving final checkpoint',
                 detail=f'checkpoint_{suffix}.ckpt')
             self._save_model(suffix, self.num_training_steps)
+            self._free_fit_state_for_export()
             if self.config.get('output_save_png_visualizations', False):
                 progress.begin(
                     'finalizing', 'Preparing final visualizations')
