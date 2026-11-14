@@ -536,6 +536,7 @@ struct ScoredDirection {
 {
     return config.smoothnessNormalWeight > 0.0 ||
            config.smoothnessTangentWeight > 0.0 ||
+           config.sheetPlaneWeight > 0.0 ||
            config.cumulativeSmoothnessTangentWeight > 0.0;
 }
 
@@ -605,6 +606,7 @@ void validateTraceConfig(const FiberTraceConfig& config)
     requireFinite(config.smoothnessWeight, "smoothness weight");
     requireFinite(config.smoothnessNormalWeight, "smoothness normal weight");
     requireFinite(config.smoothnessTangentWeight, "smoothness tangent weight");
+    requireFinite(config.sheetPlaneWeight, "sheet plane weight");
     requireFinite(config.smoothnessFreeAngleDegrees, "smoothness free angle");
     requireFinite(
         config.cumulativeSmoothnessTangentWeight,
@@ -634,6 +636,7 @@ void validateTraceConfig(const FiberTraceConfig& config)
     if (config.smoothnessWeight < 0.0 ||
         config.smoothnessNormalWeight < 0.0 ||
         config.smoothnessTangentWeight < 0.0 ||
+        config.sheetPlaneWeight < 0.0 ||
         config.cumulativeSmoothnessTangentWeight < 0.0) {
         throw std::invalid_argument("smoothness weights must be non-negative");
     }
@@ -708,8 +711,10 @@ void validateTraceConfig(const FiberTraceConfig& config)
     const float normalAngle = std::abs(std::asin(candN) - std::asin(prevN));
     const float freeAngle =
         static_cast<float>(config.smoothnessFreeAngleDegrees) * kTracePi / 180.0f;
+    const float sheetAngle = std::asin(std::abs(candN));
     return tangentWeight * traceExcessAngleSquared(tangentAngle, freeAngle) +
-           normalWeight * traceExcessAngleSquared(normalAngle, freeAngle);
+           normalWeight * traceExcessAngleSquared(normalAngle, freeAngle) +
+           static_cast<float>(config.sheetPlaneWeight) * sheetAngle * sheetAngle;
 }
 
 [[nodiscard]] float cumulativeTangentSmoothnessLoss(
