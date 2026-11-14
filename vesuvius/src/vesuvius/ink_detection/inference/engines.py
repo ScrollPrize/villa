@@ -147,11 +147,11 @@ class InkrsEngine:
         return cls(module, handle)
 
     def begin_input(self, input_key: tuple) -> None:
-        """Release a span read for another input.
+        """Release a span read for another input key.
 
-        Only the two directions of one input share a span, so a new input
-        releases it before anything else runs, including an input that never
-        reaches inkrs.
+        The key names one layer window of one input. Only that window's two
+        directions share a span, so a new key releases it before anything
+        else runs, including a run that never reaches inkrs.
         """
 
         if self._span is not None and self._span.input_key != input_key:

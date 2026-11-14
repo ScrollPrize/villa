@@ -1342,10 +1342,13 @@ def infer_single_zarr(
     root = open_volume_root(input_zarr)
     resolution = "0" if hasattr(root, "shape") else str(args.resolution)
     engine = configured_model.engine
-    input_key = (str(input_zarr), resolution)
+    # the layer window is part of the key so a --layer-starts sweep frees one
+    # window's span before the next window's occupancy scan; both directions
+    # of a window share these bounds, so the reverse run still reuses the read
+    input_key = (str(input_zarr), resolution, args.layer_start, args.layer_end)
     if engine is not None:
-        # release the last input's span before this input's occupancy scan,
-        # also when this input never reaches inkrs
+        # release the last run's span before this run's occupancy scan, also
+        # when this run never reaches inkrs
         engine.begin_input(input_key)
     volume = select_volume_level(root, resolution, source=str(input_zarr))
     depth_first, depth, height, width, chunk_h, chunk_w = _volume_axes(volume)
@@ -1572,6 +1575,66 @@ def infer_single_zarr(
             }, indent=2) + "\n", encoding="utf-8")
     finally:
         shutil.rmtree(temporary, ignore_errors=True)
+
+
+def parse_layer_starts(value: str) -> list[int]:
+    """Parse ``--layer-starts``: ``START:STOP`` (half-open) or a comma list.
+
+    The starts must be distinct, since each one names its own output, and
+    not negative: ``--layer-end`` is ``S+DEPTH``, which for a negative S can
+    cross zero and select a different window than S names.
+    """
+
+    if ":" in value:
+        start, stop = (int(part) for part in value.split(":"))
+        starts = list(range(start, stop))
+    else:
+        starts = [int(part) for part in value.split(",")]
+    if not starts:
+        raise ValueError(f"--layer-starts {value!r} selects no window")
+    if len(set(starts)) != len(starts):
+        raise ValueError(f"--layer-starts {value!r} repeats a start")
+    if min(starts) < 0:
+        raise ValueError(f"--layer-starts {value!r} has a negative start")
+    return starts
+
+
+def resolve_layer_runs(args: argparse.Namespace, input_depth: int) -> list[tuple[argparse.Namespace, Path]]:
+    """The single-mode runs: one per ``--layer-starts`` window, else ``args``.
+
+    Window S runs exactly as ``--layer-start S --layer-end S+input_depth``
+    would, into ``<stem>_L<S><suffix>``. Every window must lie inside the
+    input's depth: a single ``--layer-start`` run falls back to the full
+    depth when its window is empty, which here would write a map under a
+    start it did not read, so the whole list is refused before any map.
+    """
+
+    if args.layer_starts is None:
+        return [(args, args.output_tiff)]
+    root = open_volume_root(args.input_zarr)
+    resolution = "0" if hasattr(root, "shape") else str(args.resolution)
+    _, depth, *_ = _volume_axes(select_volume_level(root, resolution, source=str(args.input_zarr)))
+    outside = [start for start in args.layer_starts if start + input_depth > depth]
+    if outside:
+        raise ValueError(
+            f"--layer-starts: windows {outside} of {input_depth} layers end past the "
+            f"input's {depth} layers; the last start that fits is {depth - input_depth}"
+        )
+
+    output = args.output_tiff
+    return [
+        (
+            replace_namespace(args, layer_start=start, layer_end=start + input_depth, layer_starts=None),
+            output.with_name(f"{output.stem}_L{start}{output.suffix}"),
+        )
+        for start in args.layer_starts
+    ]
+
+
+def replace_namespace(args: argparse.Namespace, **changes: Any) -> argparse.Namespace:
+    """A copy of ``args`` with ``changes`` applied."""
+
+    return argparse.Namespace(**{**vars(args), **changes})
 
 
 def resolve_run_directions(direction: str) -> tuple[str, ...]:
@@ -1802,6 +1865,15 @@ def parse_args(argv: Sequence[str] | None = None):
     )
     parser.add_argument("--layer-start", type=int)
     parser.add_argument("--layer-end", type=int)
+    parser.add_argument(
+        "--layer-starts",
+        help=(
+            "Several source-Z windows in one run, as START:STOP (half-open) or "
+            "a comma list. Window S runs as --layer-start S --layer-end "
+            "S+DEPTH (the model's input depth) and writes <stem>_L<S><suffix>; "
+            "the model or engine loads once for all of them. Single mode only."
+        ),
+    )
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument(
         "--direction", choices=("forward", "reverse", "both"), default="forward"
@@ -1837,6 +1909,15 @@ def parse_args(argv: Sequence[str] | None = None):
         parser.error("--batch-size must be positive")
     if args.tta_batch_size is not None and args.tta_batch_size <= 0:
         parser.error("--tta-batch-size must be positive")
+    if args.layer_starts is not None:
+        if args.layer_start is not None or args.layer_end is not None:
+            parser.error("--layer-starts replaces --layer-start and --layer-end")
+        if args.folder is not None:
+            parser.error("--layer-starts is for single mode, not --folder")
+        try:
+            args.layer_starts = parse_layer_starts(args.layer_starts)
+        except ValueError as exc:
+            parser.error(str(exc))
     try:
         args.gpu_ids = parse_gpu_ids(args.gpus)
     except ValueError as exc:
@@ -1854,8 +1935,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     if hasattr(torch, "set_float32_matmul_precision"):
         torch.set_float32_matmul_precision("high")
-    # with --engine inkrs, PyTorch builds its model only for an input inkrs declines
-    configured = configure_model(args, build_model=args.engine == "torch")
+    # with --engine inkrs, PyTorch builds its model only for an input inkrs
+    # declines, and --layer-starts windows are checked before any model loads
+    build_now = args.engine == "torch" and args.layer_starts is None
+    configured = configure_model(args, build_model=build_now)
+    runs = resolve_layer_runs(args, configured.input_depth)
     device = resolve_inference_device(gpu_ids=args.gpu_ids, device_type=args.device)
     engine = None
     if args.engine == "inkrs":
@@ -1881,15 +1965,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         configured = replace(configured, engine=engine, prepare_model=functools.cache(prepare_model))
     if args.folder is not None:
         infer_folder(args, configured, device=device)
-    else:
+        return 0
+    # window by window, both directions of each together, so the reverse run
+    # reuses the forward run's read
+    for window, output in runs:
         for direction in resolve_run_directions(args.direction):
             infer_single_zarr(
-                args=args,
+                args=window,
                 input_zarr=args.input_zarr,
                 configured_model=configured,
                 device=device,
                 output_tiff=resolve_single_output_path(
-                    args.output_tiff,
+                    output,
                     direction=direction,
                     requested_direction=args.direction,
                 ),
