@@ -220,6 +220,28 @@ void testResample()
         }
         require(error[1] < 0.1f * error[0] && error[1] < 1e-3f, "bicubic normals follow a cylinder");
         require(step[1] < 0.1f * step[0], "bicubic normals are continuous across cells");
+
+        // The border cells and the cells next to a hole: their one sided derivatives must
+        // keep the bicubic normals within the interior error, not fall back to the linear one.
+        std::vector<std::uint8_t> valid(std::size_t(rows) * cols, 1);
+        valid[std::size_t(2) * cols + 12] = 0;
+        vcr::grid::Surface holed({cylinder.data(), rows, cols, std::size_t(cols) * 3, nullptr, valid.data()},
+                                 {vcr::grid::Interpolation::Bicubic});
+        const auto worst = [&](double x0, int n, double row) {
+            std::vector<float> p(std::size_t(n) * 3), m(p.size());
+            holed.resample({x0, row, 0.01, 1.0, n, 1}, p.data(), m.data());
+            float e = 0;
+            for (int i = 0; i < n; ++i) {
+                const float a = 0.05f * float(x0 + 0.01 * i), *q = &m[std::size_t(i) * 3];
+                if (std::isfinite(q[0]))
+                    e = std::max(e, std::acos(std::min(1.0f, std::abs(q[0] * std::sin(a) + q[2] * std::cos(a)))));
+            }
+            return e;
+        };
+        const float interior = worst(4.0, 601, 4.5), first = worst(0.0, 101, 4.5), last = worst(22.0, 101, 4.5);
+        const float nearHole = worst(10.0, 401, 2.5);  // cells 10 and 13 beside the hole's cells
+        require(first < 2 * interior && last < 2 * interior, "bicubic normals in border cells");
+        require(nearHole < 2 * interior, "bicubic normals in cells next to a hole");
     }
 }
 
