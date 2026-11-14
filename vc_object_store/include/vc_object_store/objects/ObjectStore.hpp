@@ -19,6 +19,7 @@
 #include <memory>
 #include <map>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -213,7 +214,7 @@ struct JournalEntry {
 enum class HistoryMode { Off, On };
 
 struct StoreProvisioning {
-    int schemaVersion = 21;
+    int schemaVersion = 22;
     int64_t commitSequence = 0;
     std::string generation; // Publication lineage UUID.
     HistoryMode history = HistoryMode::On;
@@ -240,18 +241,25 @@ struct OpenOptions {
     // Creation only. Omit bounds/R-tree storage; spatial queries then throw.
     // Ordinary geometry, metadata and graph operations remain available.
     bool spatialIndex = true;
+    // Creation only: optional adjacency accelerators and explicit edge layout.
+    bool edgeAdjacencyIndex = true;
+    // nullopt selects all columns; a list selects optional columns in addition
+    // to uuid/a_uuid/b_uuid/kind/commit_sequence. Unsupported writes fail.
+    std::optional<std::vector<std::string>> edgeColumns;
     // Creation-only provisioning for independently built shards. Integer key
     // ranges are reservations, not counts of currently populated records.
     std::optional<std::string> creationStoreUuid;
     int64_t initialCommitSequence = 0;
     std::optional<std::string> creationGeneration;
     std::array<int64_t,2> objectIdRange{1,INT64_MAX};
-    std::array<int64_t,2> edgeIdRange{1,INT64_MAX};
     // Explicit low-level access to one physical partition. Ordinary opens of
     // collections fail rather than silently return only locally stored data.
     bool physicalPartitionOnly = false;
     std::shared_ptr<const vcr::catalog::RegistrationGraph> catalogTransforms;
     bool readOnly = false;
+    // Read-only root selection. UUID reads use this retained publication;
+    // explicit complete version references retain their own exact identity.
+    std::optional<StoreStatus> readPosition;
     int readerPoolSize = 4;
     int busyTimeoutMs = 5000;
     std::string author;  // required for read-write opens
@@ -294,6 +302,9 @@ struct OpenOptions {
 // Validate projected top-level field names without selecting data. Exact graph
 // materializers and SQL selections use the same native field policy.
 void validateObjectFields(const std::optional<std::vector<std::string>>&);
+// SHA-256 over domain + newline, followed by UUID-ordered complete owning
+// references as "store generation object version\n". No geometry is read.
+std::string objectReferencesDigest(std::span<const ObjectVersion>, const std::string& domain);
 void validateEdgeFields(const std::optional<std::vector<std::string>>&);
 
 struct ObjectSelection {
@@ -482,7 +493,8 @@ public:
     void appendExtensionRows(WriteTxn&, const std::string& table, std::span<const ExtensionRow>);
     // Stream in primary-key order; optional equality prefix uses the PK index.
     void scanExtensionRows(const Txn&, const std::string& table,
-        const std::function<bool(const ExtensionRow&)>&, std::span<const ExtensionValue> keyPrefix = {}) const;
+        const std::function<bool(const ExtensionRow&)>&, std::span<const ExtensionValue> keyPrefix = {},
+        const ExtensionKeyFilter& keyFilter = {}) const;
     void replaceExtensionRows(WriteTxn&, const std::string& table, const std::string& ownerUuid, std::span<const ExtensionRow>);
     void scanExtensionRowsAtVersion(const Txn&, const std::string& table, const ObjectVersion&,
         const std::function<bool(const ExtensionRow&)>&) const;
@@ -678,10 +690,29 @@ public:
     std::vector<std::vector<uint8_t>> readGeometryRanges(const Txn&, const std::string& revisionUuid,
         const std::string& arrayName, const std::vector<std::array<int64_t, 2>>& ranges) const;
 
+    // Descriptor-only catalog in selection order. No coordinate chunks are read.
+    // The UUID/count columns belong to this transaction, not edit references.
+    struct GeometryArrayCounts {
+        std::vector<std::array<unsigned char,16>> uuids;
+        std::vector<int64_t> counts; // first dimension; zero for absent arrays
+    };
+    GeometryArrayCounts geometryArrayCounts(const Txn&, const std::string& objectKind,
+                                           const std::string& arrayName,
+                                           const std::optional<int64_t>& limit=std::nullopt) const;
+    // Streaming current visible-reference digest in one snapshot, including
+    // source ownership across overlays/shards. Explicit UUID requests must all
+    // exist in the selection. Selection ordering must be UUID ascending.
+    std::string selectedReferenceDigest(const Txn&, const ObjectSelection&,
+                                        const std::string& domain) const;
+
     // One packed buffer, caller revision order (including duplicates).
     // Dtype and trailing dimensions must match. All chunks remain verified.
     PackedGeometryArray readGeometryArrays(const Txn&, const std::vector<std::string>& revisionUuids,
         const std::string& arrayName) const;
+    // Captured selected metadata and payload identities stay paired. Optional
+    // mapping currently supports fiber line_points and returns float64 XYZ.
+    PackedGeometryArray readSelectedGeometryArrays(const Txn&, std::span<const ObjectRevision>,
+        const std::string& arrayName, const std::optional<std::string>& volume = std::nullopt) const;
 
     // Owned pinned payload with an explicit aggregate byte bound. Reads are
     // chunked; callers needing larger objects should use ranges/rectangles.
@@ -765,9 +796,6 @@ public:
     // Edges. addEdge normalises endpoint order (swapping anchors to
     // match) and enforces uniqueness of the edge's own UUID.
     std::string addEdge(WriteTxn& txn, const EdgeRecord& record);
-    // Import-only explicit edge ID within the reserved edge key range. Uses
-    // the same current-endpoint validation and history as addEdge.
-    std::string insertEdgeWithId(WriteTxn&, const EdgeRecord&, int64_t id);
     // Refresh anchors/tags/meta while retaining UUID, endpoints, kind and history.
     // Changes reset approval and validate the resulting current endpoint dependencies.
     void updateEdge(WriteTxn& txn, const EdgeRecord& record);
@@ -789,6 +817,13 @@ public:
     // object versions and geometry heads from the caller's consistent snapshot.
     GraphReadView graphReadView(const Txn&, const ObjectSelection& = {},
                                const EdgeSelection& = {}) const;
+    // Current geometry-only selection: captures selected records and their
+    // geometry heads together in one read snapshot, without history or edges.
+    // Supports UUID/kind/tag/family/coordinate filters and UUID pagination;
+    // volume eligibility uses the same snapshot's native transform context.
+    // Measured-length, bounds and connection filters are not accepted here.
+    GraphReadView geometryReadView(const Txn&, const ObjectSelection& = {},
+                                  const std::optional<StoreStatus>& expectedPosition = std::nullopt) const;
     // Requires a ReadTxn. Closed selection of exact recorded versions (one per
     // object; deleted versions and unknown references fail).
     // Always includes only applicable relationships. Retains isolated objects,
@@ -875,6 +910,13 @@ public:
 private:
     // Lookups by internal revision UUID (storage keys, not public history
     // references); src/ reaches them through ObjectStoreImplAccess.
+    // Only the collection bulk reader may choose trusted current reads, after
+    // proving that its entire scope is sealed and history-free. Public APIs
+    // always retain full reference/archive/payload validation.
+    GraphReadView geometryReadViewImpl(const Txn&,const ObjectSelection&,
+        const std::optional<StoreStatus>&,bool trustedCurrent) const;
+    PackedGeometryArray readSelectedGeometryArraysImpl(const Txn&,std::span<const ObjectRevision>,
+        const std::string&,const std::optional<std::string>&,bool trustedCurrent) const;
     std::optional<ObjectRevision> objectRevision(const Txn&, const std::string& revisionUuid) const;
     RevisionSelection revisionSelectionAt(const Txn&, int64_t publishedAtUs, bool includeRetired) const;
     // Explicit, closed selection: omitted endpoints are not selected. null

@@ -101,30 +101,32 @@ def test_repair_reads_store_geometry(tmp_path):
     assert (tmp_path/'signed_normals.ply').read_bytes()==b'unchanged'
     with ObjectStore.open(str(path),author='edit') as store:
         store.set_meta(ids[1],'coordinates',dict(volume_uuid='123',scale_factor=2))
-    with pytest.raises(ValueError,match='source changed'):
-        repair_obj_lines(dict(output_root=str(tmp_path)))
+    # Historical source pins replay the original preview, not the newer head.
+    repair_obj_lines(dict(output_root=str(tmp_path)))
+    assert 'v 7.000000000 0.000000000 0.000000000' in (tmp_path/'fibers.obj').read_text()
 
 
 def test_normal_export_rejects_same_store_uuid_after_geometry_change(tmp_path):
-    import sqlite3
     import pytest
     from vc_object_store import ObjectStore
-    from vesuvius.neural_tracing.fiber_trace_3d.fiber_normal_sign_visualization import export, sha256_file
+    from vesuvius.neural_tracing.fiber_trace_3d.fiber_normal_sign_visualization import export
+    from vesuvius.neural_tracing.fiber_trace_3d.fiber_graph_store import store_digest
+    from vc_object_store import write_extension_store, fiber_constraint_extension
     path=tmp_path/'source.vcobj'
     fid='00000000-0000-4000-8000-000000000001'
     write_fibers(path,[(dict(id=fid),np.array([[0.,0,10],[1.,0,10]]))],volume='123')
     expected=fiber_source_version(path)
-    database=tmp_path/'constraints.sqlite'
-    with sqlite3.connect(database) as db:
-        db.execute('CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT)')
-        db.execute('INSERT INTO metadata VALUES(?,?)',('provenance',json.dumps(dict(fiber_source=expected))))
+    database=tmp_path/'constraints.vcobj'
+    table=fiber_constraint_extension('',coordinate_space='fixture/123')
+    table['provisioning']['fiber_source']=expected
+    write_extension_store(database,[path],[table],{})
     solution=tmp_path/'solution.npz'
     np.savez(solution,ids=[fid],normal_sign=[1],sign_logit=[1.],sign_probability=[.8],broken=[False])
-    (tmp_path/'summary.json').write_text(json.dumps(dict(input=dict(signature=dict(database_sha256=sha256_file(database))))))
+    (tmp_path/'summary.json').write_text(json.dumps(dict(input=dict(signature=dict(database_sha256=store_digest(database))))))
     with ObjectStore.open(str(path),author='edit') as store:
         store.edit_geometry(fid,[dict(array='line_points',element_offset=0,data=np.array([0.,1.,10.]).tobytes())],
                             store.current_version(fid))
-    with pytest.raises(ValueError,match='source changed'):
+    with pytest.raises(ValueError,match='Wrong source fiber snapshot'):
         export(dict(output_root=str(tmp_path/'vis'),solution=str(solution),database=str(database),
                     fibers=str(path),fiber_ids=[fid]))
     assert not (tmp_path/'vis').exists()

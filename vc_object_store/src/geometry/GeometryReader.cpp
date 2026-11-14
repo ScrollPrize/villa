@@ -2,8 +2,11 @@
 #include "geometry/GeometryDelta.hpp"
 #include "geometry/SharedGeometry.hpp"
 #include "internal/ReferenceResolver.hpp"
+#include "internal/ObjectScan.hpp"
+#include "internal/VisibleRows.hpp"
 #include "vc_object_store/geometry/ArrayBytes.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
+#include "vc_object_store/objects/GeometryCoordinates.hpp"
 
 namespace vc::objects {
 using namespace detail;
@@ -506,14 +509,82 @@ std::vector<uint8_t> ObjectStore::readGeometryArray(const Txn& txn, const std::s
     return detail::GeometryReader(txn, revisionUuid, false).read(arrayName, byteOffset, byteCount);
 }
 
-PackedGeometryArray ObjectStore::readGeometryArrays(const Txn& txn,
-    const std::vector<std::string>& revisions, const std::string& name) const
+ObjectStore::GeometryArrayCounts ObjectStore::geometryArrayCounts(const Txn& txn,
+    const std::string& kind, const std::string& name, const std::optional<int64_t>& limit) const
 {
-    auto* db = static_cast<sqlite3*>(connection(txn));
+    auto* db=static_cast<sqlite3*>(connection(txn));
+    GeometryArrayCounts result;
+    std::vector<std::string> revisions;
+    std::vector<size_t> positions;
+    std::vector<std::pair<std::string,std::string>> expected;
+    const auto sources=querySources(db);
+    const bool hasArchive=std::any_of(sources.begin(),sources.end(),[](auto* source){return historyEnabled(source);});
+    const auto flush=[&]{
+        if(revisions.empty())return;
+        auto records=resolveGeometryRecords(db,revisions);
+        for(size_t i=0;i<records.size();++i){
+            if(!records[i])throw std::invalid_argument("geometry: revision not found");
+            if(records[i]->revision.objectUuid!=expected[i].first||
+               records[i]->revision.contentHash!=expected[i].second)
+                throw std::runtime_error("geometry: current descriptor disagrees with its reference");
+            // Archived delta descriptors omit chunk lists. Resolve their
+            // manifest through the shared reader before checking its layout;
+            // this reconstructs metadata only, never coordinate payloads.
+            std::optional<GeometryReader> delta;
+            if(records[i]->descriptor.contains("delta"))
+                delta.emplace(db,revisions[i],false,false);
+            const auto& arrays=(delta?delta->manifest():records[i]->descriptor).at("arrays");
+            if(arrays.contains(name)) {
+                const auto layout=geometryLayout(arrays.at(name));
+                (void)layout;
+                const auto shape=arrays.at(name).at("shape").get<std::vector<int64_t>>();
+                if(shape.empty())throw std::invalid_argument("geometry: array has no leading dimension");
+                result.counts[positions[i]]=shape[0];
+            }
+        }
+        revisions.clear();positions.clear();expected.clear();
+    };
+    if(limit&&*limit<0)throw std::invalid_argument("geometry catalog limit must be nonnegative");
+    ObjectSelection selection;selection.kind=kind;
+    // The common composed cursor supplies visibility and UUID ordering. Read
+    // the current descriptor in that SAME selected row, not another lookup per
+    // fiber or even another lookup per payload batch. An absent selected head
+    // remains absent, even if an older archive/base still retains its payload.
+    VisibleObjectRows rows(db,[&](auto* source){return objectSelectionQuery(source,selection,
+        "id,uuid,storage_kind,storage_ref,uuid,NULL,data_checksum,geometry_manifest,version,changed_by,changed_at,changed_host");},1);
+    while((!limit||result.counts.size()<size_t(*limit))&&rows.row()){
+        auto& row=rows.values();
+        result.uuids.push_back(row.blob16(1));result.counts.push_back(0);
+        if(row.text(2)!="sqlite"||row.isNull(3)||row.isNull(7))continue;
+        const auto record=decodeGeometryRecord(row,3);
+        for(const auto& array:record.revision.arrays)if(array.name==name){
+            (void)geometryLayout(record.descriptor.at("arrays").at(name));
+            if(array.shape.empty())throw std::invalid_argument("geometry: array has no leading dimension");
+            result.counts.back()=array.shape[0];break;
+        }
+        // Current descriptors are authoritative, but retained archives must
+        // agree just as in currentGeometry(). Resolve those checks in bulk;
+        // history-free imports need no second descriptor lookup.
+        if(hasArchive){
+            positions.push_back(result.counts.size()-1);revisions.push_back(record.revision.uuid);
+            expected.emplace_back(record.revision.objectUuid,record.revision.contentHash);
+        }
+        if(revisions.size()==1024)flush();
+    }
+    flush();return result;
+}
+
+namespace {
+PackedGeometryArray readPackedGeometryArrays(sqlite3* db,
+    const std::vector<std::string>& revisions, const std::string& name,
+    std::span<const ObjectRevision> selected={},bool trustedCurrent=false)
+{
+    if(!selected.empty()&&selected.size()!=revisions.size())throw std::invalid_argument("geometry: selected payload count differs");
     PackedGeometryArray result;
     struct ArrayPlan {
         GeometryLayout layout;
         std::vector<std::string> hashes;
+        sqlite3* source;
         size_t offset;
         std::unique_ptr<GeometryReader> reader;
     };
@@ -525,9 +596,15 @@ PackedGeometryArray ObjectStore::readGeometryArrays(const Txn& txn,
     // batched payload I/O for full snapshots; deltas use their normal reader.
     for(size_t begin=0;begin<revisions.size();begin+=window) {
         const auto count=std::min(window,revisions.size()-begin);
-        auto records=resolveGeometryRecords(db,std::span(revisions).subspan(begin,count));
+        auto records=resolveGeometryRecords(db,std::span(revisions).subspan(begin,count),trustedCurrent);
         for(size_t i=0;i<count;++i) {
             if(!records[i])throw std::invalid_argument("geometry: revision not found");
+            if(!selected.empty()&&!trustedCurrent){
+                const auto& expected=selected[begin+i];
+                if(records[i]->revision.objectUuid!=expected.objectUuid||
+                   (expected.record.dataChecksum&&records[i]->revision.contentHash!=*expected.record.dataChecksum))
+                    throw std::runtime_error("geometry: selected descriptor disagrees with its reference");
+            }
             auto manifest=std::move(records[i]->descriptor);
             std::unique_ptr<GeometryReader> reader;
             if(manifest.contains("delta") || (manifest.at("arrays").contains(name) &&
@@ -538,10 +615,11 @@ PackedGeometryArray ObjectStore::readGeometryArrays(const Txn& txn,
             const auto& descriptors=manifest.at("arrays");
             if(!descriptors.contains(name))throw std::invalid_argument("geometry: array not found: "+name);
             GeometryLayout layout;
-            for(const auto& [key,array]:descriptors.items()) {
-                const auto validated=geometryLayout(array);
-                if(key==name)layout=validated;
-            }
+            if(trustedCurrent)layout=geometryLayout(descriptors.at(name));
+            else for(const auto& [key,array]:descriptors.items()) {
+                    const auto validated=geometryLayout(array);
+                    if(key==name)layout=validated;
+                }
             const auto& array=descriptors.at(name);
             const auto shape=array.at("shape").get<std::vector<int64_t>>();
             const auto dtype=array.at("dtype").get<std::string>();
@@ -553,7 +631,7 @@ PackedGeometryArray ObjectStore::readGeometryArrays(const Txn& txn,
                 uint64_t(layout.length)>result.data.max_size()-totalBytes)
                 throw std::overflow_error("geometry: packed array size overflow");
             result.shape[0]+=shape[0];result.offsets.push_back(uint64_t(result.shape[0]));
-            plan.push_back({layout,array.at("chunks").get<std::vector<std::string>>(),totalBytes,std::move(reader)});
+            plan.push_back({layout,array.at("chunks").get<std::vector<std::string>>(),records[i]->source,totalBytes,std::move(reader)});
             totalBytes+=size_t(layout.length);
         }
     }
@@ -562,17 +640,26 @@ PackedGeometryArray ObjectStore::readGeometryArrays(const Txn& txn,
     std::vector<ChunkRequest> requested;
     const auto flush=[&]{
         if(requested.empty())return;
-        std::vector<std::string> hashes;
-        hashes.reserve(requested.size());
-        for(const auto& q:requested)hashes.push_back(plan[q.array].hashes.at(q.index));
-        visitGeometryPayloads(db,hashes,[&](size_t i,std::span<const uint8_t> bytes){
-            const auto& q=requested.at(i);
-            const auto& array=plan[q.array];
-            const auto& hash=hashes[i];
-            if(geometryWork)geometryWork->readBytes[name]+=bytes.size();
-            verifyGeometryChunk(bytes,hash,hash,array.layout.chunkBytes(q.index),name);
-            copyGeometryChunk(array.layout,q.index,bytes,result.data.data()+array.offset);
-        });
+        // A descriptor already resolved its physical owner. As in the scalar
+        // GeometryReader, resolve payload hashes inside that owner's pinned
+        // scope, not every unrelated sibling shard of the outer collection.
+        // Borrowed payloads still follow the shared source-reference resolver.
+        std::map<sqlite3*,std::vector<size_t>> groups;
+        for(size_t i=0;i<requested.size();++i)groups[plan[requested[i].array].source].push_back(i);
+        for(const auto& [source,positions]:groups){
+            std::vector<std::string> hashes;hashes.reserve(positions.size());
+            for(const auto at:positions){const auto& q=requested[at];hashes.push_back(plan[q.array].hashes.at(q.index));}
+            visitGeometryPayloads(source,hashes,[&](size_t i,std::span<const uint8_t> bytes){
+                const auto& q=requested.at(positions.at(i));
+                const auto& array=plan[q.array];
+                const auto& hash=hashes[i];
+                if(geometryWork)geometryWork->readBytes[name]+=bytes.size();
+                if(!trustedCurrent)verifyGeometryChunk(bytes,hash,hash,array.layout.chunkBytes(q.index),name);
+                else if(bytes.size()!=size_t(array.layout.chunkBytes(q.index)))
+                    throw std::runtime_error("geometry: payload chunk byte length differs");
+                copyGeometryChunk(array.layout,q.index,bytes,result.data.data()+array.offset);
+            });
+        }
         requested.clear();
     };
     for(size_t i=0;i<plan.size();++i) {
@@ -588,6 +675,57 @@ PackedGeometryArray ObjectStore::readGeometryArrays(const Txn& txn,
     }
     flush();
     return result;
+}
+}
+
+PackedGeometryArray ObjectStore::readGeometryArrays(const Txn& txn,
+    const std::vector<std::string>& revisions, const std::string& name) const
+{
+    return readPackedGeometryArrays(static_cast<sqlite3*>(connection(txn)),revisions,name);
+}
+
+PackedGeometryArray ObjectStore::readSelectedGeometryArrays(const Txn& txn,
+    std::span<const ObjectRevision> selected,const std::string& name,const std::optional<std::string>& volume) const
+{
+    return readSelectedGeometryArraysImpl(txn,selected,name,volume,false);
+}
+
+PackedGeometryArray ObjectStore::readSelectedGeometryArraysImpl(const Txn& txn,
+    std::span<const ObjectRevision> selected,const std::string& name,const std::optional<std::string>& volume,bool trustedCurrent) const
+{
+    std::vector<std::string> revisions;revisions.reserve(selected.size());
+    for(const auto& object:selected){
+        if(object.deleted||!object.geometryRevision)throw std::invalid_argument("geometry: selected object has no stored geometry");
+        revisions.push_back(*object.geometryRevision);
+    }
+    auto packed=readPackedGeometryArrays(static_cast<sqlite3*>(connection(txn)),revisions,name,selected,trustedCurrent);
+    if(!volume)return packed;
+    if(name!="line_points"||std::any_of(selected.begin(),selected.end(),[](const auto& o){return o.record.kind!="fiber";}))
+        throw std::invalid_argument("mapped packed geometry currently supports float64 fiber line_points only");
+    if(selected.empty()){packed.dtype="<f8";packed.shape={0,3};return packed;}
+    if(packed.dtype!="<f8"||packed.shape.size()!=2||packed.shape[1]!=3)
+        throw std::invalid_argument("mapped packed geometry currently supports float64 fiber line_points only");
+    std::optional<VolumeTransforms> transforms;
+    for(size_t item=0;item<selected.size();++item){
+        const auto meta=nlohmann::json::parse(selected[item].record.meta);
+        const auto scale=geometryScaleToVolume(meta,*volume);
+        std::optional<VolumeAffine> mapping;
+        if(!scale){
+            if(!transforms)transforms=volumeTransforms(txn);
+            mapping=transforms->toVolume(meta,*volume);
+            if(!mapping)throw std::invalid_argument("selected geometry has no unambiguous mapping to target volume");
+        }
+        for(uint64_t point=packed.offsets[item];point<packed.offsets[item+1];++point){
+            const auto offset=size_t(point)*3*sizeof(double);
+            std::array<double,3> value;
+            detail::copyScalars<double>(std::span<const uint8_t>(packed.data).subspan(offset,3*sizeof(double)),value);
+            if(scale){for(auto& x:value)x*=*scale;}else value=mapping->apply(value);
+            // Keep little-endian packed bytes and the same scalar arithmetic as
+            // the prior NumPy scale / native transformed-view paths.
+            detail::copyScalarBytes<double>(value,std::span<uint8_t>(packed.data).subspan(offset,3*sizeof(double)));
+        }
+    }
+    return packed;
 }
 
 std::vector<std::vector<uint8_t>> ObjectStore::readGeometryRanges(const Txn& txn, const std::string& revisionUuid,

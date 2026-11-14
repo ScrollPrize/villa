@@ -1,13 +1,14 @@
 """Second-stage whole-fiber H/V assignment after fixed normal-stage exclusions."""
 import argparse
+from dataclasses import dataclass
 import json
 from pathlib import Path
-import sqlite3
 import time
 import numpy as np
 from lasagna.inference_provenance import atomic_write, sha256_file
 from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fiber_catalog, fibers_digest
 from .fiber_normal_sign import launch_tensor_solve
+from .fiber_graph_store import FiberGraph, store_digest, write_results
 
 
 def probabilities(h,b):
@@ -46,85 +47,157 @@ def hard_metrics(probs,a,i,j,relation,lengths):
 
 def run_features(config):
     from .constraint_extraction import run_native_constraints
-    native=json.loads(Path(config['native_config']).read_text())
-    identity=lambda:dict(fibers_digest=fibers_digest(native['fibers']),umbilicus_sha256=sha256_file(native['umbilicus']))
+    native=(dict(config['native_config']) if isinstance(config['native_config'],dict)
+            else json.loads(Path(config['native_config']).read_text()))
+    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fiber_source_version
+    def identity():
+        pin=fiber_source_version(native['fibers'])
+        return dict(fibers_digest=fibers_digest(native['fibers'],source_version=pin),
+                    fiber_source=pin,umbilicus_sha256=sha256_file(native['umbilicus']))
     native.update(identity())
     root=Path(config['output_root']);root.mkdir(parents=True,exist_ok=True)
     frozen=root/'native_config.json';atomic_write(frozen,native,durable=False)
     run_native_constraints(frozen, config)
-    if identity()!={key:native[key] for key in ('fibers_digest','umbilicus_sha256')}:
+    if identity()!={key:native[key] for key in ('fibers_digest','fiber_source','umbilicus_sha256')}:
         target=Path(native['axial_prior_output']);target.rename(target.with_suffix('.invalid'))
         raise RuntimeError('Feature input changed during export')
 
 
-def verify_feature_source(database,feature):
+@dataclass(frozen=True)
+class AxialEvidence:
+    """In-process scores for the exact immutable graph snapshot consumed."""
+    source: dict
+    ids: np.ndarray
+    agreement: np.ndarray
+    umbilicus_sha256: str
+
+
+def axial_evidence(config, *, graph):
+    """Evaluate current graph geometry, not an external evidence-file artifact."""
+    from vc_object_store import fiber_axial_prior_columns
+    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import read_polyline_arrays
+    native=config.get('native_config',{})
+    if not isinstance(native,dict):native=json.loads(Path(native).read_text())
+    umbilicus=config.get('umbilicus',native.get('umbilicus'))
+    if not umbilicus:raise ValueError('Native axial priors require an umbilicus input')
+    before=sha256_file(umbilicus);started=time.monotonic()
+    ids,geometry=read_polyline_arrays(config['database'],graph.ids,volume=graph.volume,source_version=graph.source,
+                                    workers=int(config.get('workers',32)),trusted_immutable='auto')
+    if not np.array_equal(ids,graph.ids):raise ValueError('Axial geometry identity differs')
+    print(json.dumps(dict(stage='axial_geometry_read',seconds=time.monotonic()-started,
+        fibers=len(ids),points=len(geometry.values))),flush=True)
+    phase=time.monotonic()
+    agreement=fiber_axial_prior_columns(geometry.offsets,geometry.values,str(umbilicus),graph.volume,
+        config.get('base_shape_zyx',native.get('base_shape_zyx')),float(native.get('axial_sample_spacing',16.)),
+        int(config.get('workers',32)))
+    # No point arrays survive this function. Only N scalar priors are needed
+    # by the graph solve; all geometry and quadrature stay in native code.
+    del geometry
+    if sha256_file(umbilicus)!=before:raise ValueError('Umbilicus changed during axial prior computation')
+    print(json.dumps(dict(stage='axial_priors_computed',seconds=time.monotonic()-phase,fibers=len(ids))),flush=True)
+    return AxialEvidence(dict(graph.source),ids,agreement,before)
+
+
+def verify_feature_source(database,feature, *, graph=None):
     """Bind cached scores to the actual fiber store used by the immutable constraint DB."""
-    with sqlite3.connect(Path(database).resolve().as_uri()+'?mode=ro',uri=True) as db:
-        provenance=json.loads(db.execute("SELECT value FROM metadata WHERE key='provenance'").fetchone()[0])
-        source=provenance['config']['fibers']
-        if fibers_digest(source)!=feature['fibers_digest']:raise ValueError('Axial/source fiber store content mismatch')
-        # Measure selected geometry, guarded by the snapshot used for extraction.
-        source_rows=[(row['id'],row['length']) for row in fiber_catalog(source,
-            provenance['config']['coordinate_space'].split('/')[-1],source_version=provenance.get('fiber_source',{}))]
-        rows=db.execute('SELECT id,length_base FROM fibers ORDER BY source_index').fetchall()
-        if [r[0] for r in rows]!=[r[0] for r in source_rows]:raise ValueError('Constraint/store IDs differ')
-        if not np.allclose([r[1] for r in rows],[r[1] for r in source_rows],rtol=1e-10,atol=1e-6):
-            raise ValueError('Constraint/store geometry lengths differ')
-    return dict(fibers_digest=feature['fibers_digest'],fiber_lengths_checked=len(rows),
-                fiber_source=provenance['fiber_source'])
+    graph = FiberGraph(database) if graph is None else graph
+    from .fiber_graph_store import snapshot_digest
+    if snapshot_digest(graph.source) != store_digest(database):
+        raise ValueError('Prepared graph belongs to another snapshot')
+    from .fiber_graph_store import original_fiber_source
+    source,pin=original_fiber_source(database)
+    original_digest=fibers_digest(source,source_version=pin)
+    if fibers_digest(database) != original_digest or original_digest != feature['fibers_digest']:
+        raise ValueError('Axial/source fiber store content mismatch')
+    if feature.get('fiber_source')!=pin:
+        raise ValueError('Axial/source fiber source version differs or is missing; regenerate frozen evidence')
+    if not np.array_equal(graph.ids, feature['source_ids']):
+        raise ValueError('Constraint/feature IDs differ')
+    return dict(fibers_digest=original_digest, fibers_checked=len(graph.ids),
+                fiber_lengths_checked=len(graph.ids),fiber_source=pin,fiber_source_path=str(source))
 
 
-def prepare(config):
-    start=time.monotonic();database=Path(config['database']);features=Path(config['features']);stage1=Path(config['stage1'])
-    signature=dict(version=1,database=sha256_file(database),features=sha256_file(features),stage1=sha256_file(stage1))
-    cache=Path(config['tensor_cache']);stamp=cache.with_suffix('.json')
-    feature=json.loads(features.read_text())
+def prepare(config, *, graph=None, return_arrays=False, feature=None):
+    start=time.monotonic();database=Path(config['database'])
+    features=Path(config['features']) if config.get('features') else None
+    stage1=Path(config['stage1']) if config.get('stage1') else None
+    signature=dict(version=1,database=store_digest(database),features=sha256_file(features) if features else None,stage1=sha256_file(stage1) if stage1 else None)
+    cache=Path(config.get('tensor_cache',Path(config.get('output_root','.'))/'tensors.npz'));stamp=cache.with_suffix('.json')
+    feature=json.loads(features.read_text()) if feature is None else feature
     if feature['format']!='fiber-axial-priors' or feature['version']!=1:raise ValueError('Wrong axial features')
-    verify_feature_source(database,feature)
-    if cache.exists() and stamp.exists() and json.loads(stamp.read_text())['signature']==signature:return
-    with sqlite3.connect(database.resolve().as_uri()+'?mode=ro',uri=True) as db:
-        meta={k:json.loads(v) for k,v in db.execute('SELECT key,value FROM metadata')}
-        if not meta['complete'] or meta['provenance']['fibers_store_uuid']!=feature['fibers_store_uuid']:raise ValueError('Feature/DB identity mismatch')
+    if not return_arrays and cache.exists() and stamp.exists() and json.loads(stamp.read_text())['signature']==signature:return
+    graph = FiberGraph(database) if graph is None else graph
+    verify_feature_source(database,feature,graph=graph)
+    if stage1:
         prior_summary=json.loads((stage1.parent/'summary.json').read_text())
         if prior_summary['input']['signature']['database_sha256']!=signature['database']:raise ValueError('Stage1/DB mismatch')
-        rows=db.execute('SELECT id,length_base FROM fibers ORDER BY source_index').fetchall()
-        ids=np.asarray([r[0] for r in rows],dtype=str);lengths=np.asarray([r[1] for r in rows],dtype=float)
-        if not len(ids) or not np.all(ids[1:]>ids[:-1]):raise ValueError('Expected nonempty ascending source IDs')
+    inherited=np.zeros(len(graph.ids),dtype=bool)
+    if stage1:
         with np.load(stage1,allow_pickle=False) as initial:
-            if not np.array_equal(ids,initial['ids']):raise ValueError('Stage1 IDs mismatch')
+            if not np.array_equal(graph.ids,initial['ids']):raise ValueError('Stage1 IDs mismatch')
             inherited=initial['broken'].copy()
-        if not np.array_equal(ids,feature['source_ids']):raise ValueError('Axial IDs mismatch')
-        a=np.asarray(feature['agreement'],np.float32)
-        if a.shape!=ids.shape or not np.isfinite(a).all() or np.any(abs(a)>1.00001):raise ValueError('Invalid axial scores')
-        cursor=db.execute('SELECT fiber_a,fiber_b,parallel_score,perpendicular_score FROM constraints ORDER BY id')
-        chunks=[];original_parallel=original_perp=ties=0
-        while batch:=cursor.fetchmany(65536):
-            ends=np.asarray([r[:2] for r in batch],dtype=str);x=np.asarray([r[2:] for r in batch],dtype=float)
-            relation=np.sign(x[:,0]-x[:,1]);ties+=int((relation==0).sum())
-            original_parallel+=int((relation>0).sum());original_perp+=int((relation<0).sum())
-            idx=np.searchsorted(ids,ends)
-            if np.any(idx>=len(ids)) or not np.array_equal(ids[idx],ends):raise ValueError('Bad endpoint IDs')
-            keep=~inherited[idx].any(1)&(relation!=0)
-            chunks.append(np.column_stack([idx[keep],relation[keep]]))
-    edges=np.concatenate(chunks) if chunks else np.empty((0,3))
-    active=np.flatnonzero(~inherited)
-    if not len(active):raise ValueError('No active fibers remain after stage1')
-    remap=np.full(len(ids),-1,np.int64);remap[active]=np.arange(len(active))
-    i=remap[edges[:,0].astype(np.int64)];j=remap[edges[:,1].astype(np.int64)]
-    degree=np.bincount(np.concatenate([i,j]),minlength=len(active)).astype(np.float32)
+    data,stats=_prepare_columns(graph,feature['source_ids'],feature['agreement'],inherited,
+        signature,dict(fibers_digest=feature['fibers_digest'],umbilicus_sha256=feature['umbilicus_sha256']),start)
+    if return_arrays:return data,stats
     cache.parent.mkdir(parents=True,exist_ok=True)
     temporary=cache.with_suffix('.partial.npz')
-    np.savez(temporary,ids=ids,active=active,inherited=inherited,a=a[active],lengths=lengths[active],i=i,j=j,
-             relation=edges[:,2].astype(np.float32),degree=degree)
-    temporary.replace(cache)
-    stats=dict(signature=signature,feature_identity=dict(fibers_digest=feature['fibers_digest'],umbilicus_sha256=feature['umbilicus_sha256']),
-               all_fibers=len(ids),inherited_broken=int(inherited.sum()),active_fibers=len(active),active_events=len(i),
-               original_parallel=original_parallel,original_perpendicular=original_perp,tied_events_skipped=ties,
-               isolated_active_fibers=int((degree==0).sum()),seconds=time.monotonic()-start)
+    np.savez(temporary,**data);temporary.replace(cache)
     atomic_write(stamp,stats,durable=False);print('H/V preparation '+json.dumps(stats),flush=True)
 
 
+def prepare_evidence(config, evidence, *, graph):
+    """Admit native in-process evidence with snapshot and ordered-ID checks."""
+    from vc_object_store import CollectionReader
+    if not isinstance(evidence,AxialEvidence):raise TypeError('Expected in-process AxialEvidence')
+    start=time.monotonic()
+    with CollectionReader(str(config['database'])) as store:
+        if store.source!=graph.source or evidence.source!=graph.source:
+            raise ValueError('Axial evidence belongs to another graph snapshot')
+    if config.get('stage1'):raise ValueError('In-process H/V evidence precedes normal-sign alignment')
+    from .fiber_graph_store import snapshot_digest
+    signature=dict(version=1,database=snapshot_digest(graph.source),features=None,stage1=None)
+    return _prepare_columns(graph,evidence.ids,evidence.agreement,np.zeros(len(graph.ids),bool),
+        signature,dict(source=evidence.source,umbilicus_sha256=evidence.umbilicus_sha256),start)
+
+
+def _prepare_columns(graph, evidence_ids, agreement, inherited, signature, feature_identity, start):
+    """Shared numerical preparation for validated file and in-process evidence."""
+    ids,lengths=graph.ids,graph.lengths
+    if not len(ids) or not np.all(ids[1:]>ids[:-1]):raise ValueError('Expected nonempty ascending source IDs')
+    if not np.array_equal(ids,evidence_ids):raise ValueError('Axial IDs mismatch')
+    a=np.asarray(agreement,np.float32)
+    if a.shape!=ids.shape or not np.isfinite(a).all() or np.any(abs(a)>1.00001):raise ValueError('Invalid axial scores')
+    relation=np.where(graph.parallel,1.,-1.)
+    ties=int((relation==0).sum());original_parallel=int((relation>0).sum());original_perp=int((relation<0).sum())
+    keep=~inherited[graph.i]&~inherited[graph.j]&(relation!=0)
+    active=np.flatnonzero(~inherited)
+    if not len(active):raise ValueError('No active fibers remain after stage1')
+    remap=np.full(len(ids),-1,np.int64);remap[active]=np.arange(len(active))
+    i=remap[graph.i[keep]];j=remap[graph.j[keep]]
+    degree=(np.bincount(i,minlength=len(active))+np.bincount(j,minlength=len(active))).astype(np.float32)
+    data=dict(ids=ids,active=active,inherited=inherited,a=a[active],lengths=lengths[active],i=i,j=j,
+              relation=relation[keep].astype(np.float32),degree=degree)
+    stats=dict(signature=signature,feature_identity=feature_identity,
+               all_fibers=len(ids),inherited_broken=int(inherited.sum()),active_fibers=len(active),active_events=len(i),
+               original_parallel=original_parallel,original_perpendicular=original_perp,tied_events_skipped=ties,
+               isolated_active_fibers=int((degree==0).sum()),seconds=time.monotonic()-start)
+    return data,stats
+
+
+def readout_metrics(probs,data,stats):
+    m=hard_metrics(probs,data['a'],data['i'],data['j'],data['relation'],data['lengths'])
+    m['total_broken']=stats['inherited_broken']+m['newly_broken']
+    m['total_broken_percent']=100*m['total_broken']/stats['all_fibers']
+    for name in ('parallel','perpendicular'):
+        original=stats['original_'+name]
+        m[name]['retained_of_pre_stage1_percent']=100*m[name]['retained']/original if original else None
+    return m
+
+
 def solve(config):
+    if config.get('optimizer')=='wrapped_irls':
+        from .fiber_wrapped_stages import solve_stage
+        return solve_stage(config,'classification')
     import torch
     if not torch.cuda.is_available():raise RuntimeError('Production H/V optimization requires CUDA')
     torch.set_num_threads(4);torch.manual_seed(config.get('seed',0));torch.use_deterministic_algorithms(True)
@@ -135,12 +208,7 @@ def solve(config):
     initial=torch.where(a==0,torch.full_like(a,.001),2*a)
     stats=json.loads(Path(config['tensor_cache']).with_suffix('.json').read_text())
     def readout(p):
-        m=hard_metrics(p,d['a'],d['i'],d['j'],d['relation'],d['lengths'])
-        m['total_broken']=stats['inherited_broken']+m['newly_broken'];m['total_broken_percent']=100*m['total_broken']/stats['all_fibers']
-        for name in ('parallel','perpendicular'):
-            original=stats['original_'+name]
-            m[name]['retained_of_pre_stage1_percent']=100*m[name]['retained']/original if original else None
-        return m
+        return readout_metrics(p,d,stats)
     baseline=readout(probabilities(initial,torch.full_like(a,-30)).cpu().numpy())
     runs=[];steps=int(config.get('steps',10000));every=int(config.get('log_every',1000))
     for cost_mode in config.get('cost_modes',['uniform','degree_mix']):
@@ -169,6 +237,12 @@ def solve(config):
         labels=np.argmax(full,axis=1).astype(np.uint8)
         np.savez(root/f'solution_{name}.npz',ids=d['ids'],probabilities=full,labels=labels,
                  inherited_broken=d['inherited'],hv_logit=h.detach().cpu().numpy(),broken_logit=b.detach().cpu().numpy(),active=d['active'])
+        if config.get('write_result_store',True):
+            write_results(root/f'solution_{name}.vcobj',[config['database']], 'classification', 'adam',
+                {'fibers':[dict(fiber_uuid=str(fid),family=int(label),enabled=int(label!=2),
+                                p_h=float(p[0]),p_v=float(p[1]),p_broken=float(p[2]))
+                           for fid,label,p in zip(d['ids'],labels,full)]},
+                settings=dict(broken_penalty=float(penalty),entropy_weight=float(entropy_max),steps=steps))
         runs.append(dict(name=name,cost_mode=cost_mode,penalty=penalty,entropy_max=entropy_max,final=history[-1]))
     summary=dict(config=config,input=stats,baseline=baseline,runs=runs,gpu=torch.cuda.get_device_name(),
                  peak_allocated_bytes=torch.cuda.max_memory_allocated(),labels=['H','V','broken'],

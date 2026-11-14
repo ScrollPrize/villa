@@ -377,6 +377,10 @@ public:
 
 struct PreparedOperation {
     RecordSelection expectedObjects, readDependencies;
+    // Publishes the preparation in the caller's write transaction. A
+    // preparer may fail the whole transaction when apply throws (link_objects
+    // does: see object_links::prepareLinkObjects), so a caller must not catch
+    // the error and commit: the commit throws and rolls every write back.
     std::function<void(ObjectStore&, WriteTxn&)> apply;
 };
 

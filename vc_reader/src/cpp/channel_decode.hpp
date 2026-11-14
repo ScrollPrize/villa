@@ -1,6 +1,9 @@
 // Select contiguous channel planes without retaining another encoded-byte cache.
 #pragma once
 #include "codecs.hpp"
+#include "coordination_trace.hpp"
+#include "scratch_pool.hpp"
+#include "chunk_buffer.hpp"
 #include <functional>
 #include <numeric>
 
@@ -13,7 +16,7 @@ public:
 
 struct DecodedChannel {
     std::size_t index;
-    std::shared_ptr<const std::vector<std::uint8_t>> bytes;
+    ChunkPtr bytes;
 };
 
 struct ChannelDecodeResult {
@@ -60,18 +63,21 @@ ChannelDecodeResult decode_channels(const ChunkCodec& codec, std::size_t decoded
     const auto tagged = checked(relevant, count);
     ChannelDecodeResult result;
     if (selected.empty()) return result;
+    auto scratch=workerScratch().lease();
     const auto read = [&](std::size_t offset, std::size_t length, std::uint8_t* dst) {
         if (offset > encodedBytes || length > encodedBytes-offset)
             throw ChannelDecodeError("truncated channel payload");
-        if (length) readRange(offset, length, dst);
+        if (length) {diagnostics::schedulerRecord(diagnostics::SchedulerMetric::SourceRead,length);
+            diagnostics::Scope io(diagnostics::Io);readRange(offset, length, dst);}
         result.bytesRead += length;
     };
     const auto allocate = [&] {
+        diagnostics::Scope allocation(diagnostics::Allocate);
         for (auto c : selected)
-            result.channels.push_back({c, std::make_shared<std::vector<std::uint8_t>>(channelBytes)});
+            result.channels.push_back({c, std::make_shared<Chunk>(Chunk::Overwrite{},channelBytes)});
     };
     const auto writable = [](DecodedChannel& c) {
-        return std::const_pointer_cast<std::vector<std::uint8_t>>(c.bytes)->data();
+        return std::const_pointer_cast<Chunk>(c.bytes)->data();
     };
     const auto direct = [&](std::size_t offset) {
         allocate();
@@ -81,7 +87,7 @@ ChannelDecodeResult decode_channels(const ChunkCodec& codec, std::size_t decoded
             const auto size = (end-begin)*channelBytes;
             if (end == begin+1) read(offset+selected[begin]*channelBytes, size, writable(result.channels[begin]));
             else {
-                std::vector<std::uint8_t> bytes(size);
+                auto bytes=scratch.bytes(0,size);
                 read(offset+selected[begin]*channelBytes, size, bytes.data());
                 for (auto i = begin; i < end; ++i)
                     std::memcpy(writable(result.channels[i]), bytes.data()+(i-begin)*channelBytes, channelBytes);
@@ -116,7 +122,7 @@ ChannelDecodeResult decode_channels(const ChunkCodec& codec, std::size_t decoded
         if (blocks > (cbytes-headerSize)/4)
             throw ChannelDecodeError("truncated Blosc block directory");
         const auto payloadStart = headerSize+blocks*4;
-        std::vector<std::uint8_t> directory(blocks*4);
+        auto directory=scratch.bytes(3,blocks*4);
         read(headerSize, directory.size(), directory.data());
         std::vector<std::size_t> starts(blocks), ends(blocks), physical(blocks);
         for (std::size_t b = 0; b < blocks; ++b) {
@@ -146,7 +152,6 @@ ChannelDecodeResult decode_channels(const ChunkCodec& codec, std::size_t decoded
         std::sort(selected.begin(), selected.end());
         selected.erase(std::unique(selected.begin(), selected.end()), selected.end());
         allocate();
-        std::vector<std::uint8_t> frame, decoded;
         // Physical block order may differ from logical order (parallel encoders).
         // Coalesce adjacent selected blocks into one I/O operation.
         for (std::size_t i = 0; i < blocks;) {
@@ -154,8 +159,10 @@ ChannelDecodeResult decode_channels(const ChunkCodec& codec, std::size_t decoded
             auto end = i+1;
             while (end < blocks && needed[physical[end]]) ++end;
             const auto firstByte = starts[physical[i]], lastByte = ends[physical[end-1]];
-            std::vector<std::uint8_t> compressed(lastByte-firstByte);
-            read(firstByte, compressed.size(), compressed.data());
+            std::span<uint8_t> compressed;
+            const auto prefix=headerSize+4;
+            {diagnostics::Scope allocation(diagnostics::Allocate);compressed=scratch.bytes(0,prefix+lastByte-firstByte);}
+            read(firstByte,lastByte-firstByte,compressed.data()+prefix);
             for (auto j = i; j < end; ++j) {
                 const auto b = physical[j], plainStart = b*blockSize,
                            plainSize = std::min(blockSize, nbytes-plainStart),
@@ -163,21 +170,42 @@ ChannelDecodeResult decode_channels(const ChunkCodec& codec, std::size_t decoded
                 // A one-block frame preserves the original typesize, filters,
                 // compressor and blocksize (including a short final block).
                 // The existing bounded decoder handles all split codecs safely.
-                frame.resize(headerSize+4+compressedSize);
-                std::copy(header.begin(), header.end(), frame.begin());
-                put32(frame.data()+4, plainSize);
-                put32(frame.data()+12, frame.size());
-                put32(frame.data()+headerSize, headerSize+4);
-                std::memcpy(frame.data()+headerSize+4, compressed.data()+starts[b]-firstByte, compressedSize);
-                decoded.resize(blockSize);
-                if (blosc_decompress_ctx(frame.data(), decoded.data(), decoded.size(), 1) != int(plainSize))
-                    throw ChannelDecodeError("Blosc channel block decode failed");
+                // Process physical order. The prefix for this block can reuse
+                // the tail of an already-decoded block; no future payload is
+                // overwritten. The coalesced source read stays a single read.
+                auto* frame=compressed.data()+starts[b]-firstByte;
+                std::copy(header.begin(),header.end(),frame);
+                put32(frame+4,plainSize);put32(frame+12,prefix+compressedSize);
+                put32(frame+headerSize,prefix);
+                if(plainSize<blockSize) {
+                    // A short final block was encoded without type splitting.
+                    // Express that explicitly when it becomes its own frame.
+                    put32(frame+8,plainSize);frame[2]|=0x10;
+                }
+                uint8_t* destination=nullptr;
+                for(auto& channel:result.channels)if(plainStart>=channel.index*channelBytes &&
+                    plainStart+plainSize<=(channel.index+1)*channelBytes) {
+                    destination=writable(channel)+plainStart-channel.index*channelBytes;break;
+                }
+                const bool directOutput=destination!=nullptr;
+                if(!directOutput) {
+                    diagnostics::Scope allocation(diagnostics::Allocate);
+                    destination=scratch.bytes(2,blockSize).data();
+                }
+                int decodedSize;
+                {diagnostics::schedulerRecord(diagnostics::SchedulerMetric::DecodeBlock,blockSize);
+                diagnostics::Scope decompress(diagnostics::Decode);
+                    decodedSize=scratch.resource<DecoderContexts>().decodeBlosc(frame,prefix+compressedSize,destination,directOutput?plainSize:blockSize);}
+                if (decodedSize != int(plainSize))
+                    throw ChannelDecodeError("Blosc channel block decode failed: status "+std::to_string(decodedSize)+
+                        ", expected "+std::to_string(plainSize));
                 result.bytesDecoded += plainSize;
-                for (auto& channel : result.channels) {
+                if(!directOutput)for (auto& channel : result.channels) {
                     const auto lo = std::max(plainStart, channel.index*channelBytes),
                                hi = std::min(plainStart+plainSize, (channel.index+1)*channelBytes);
-                    if (lo < hi) std::memcpy(writable(channel)+lo-channel.index*channelBytes,
-                                             decoded.data()+lo-plainStart, hi-lo);
+                    if (lo < hi) {diagnostics::Scope copying(diagnostics::Copy);
+                        std::memcpy(writable(channel)+lo-channel.index*channelBytes,
+                                    destination+lo-plainStart, hi-lo);}
                 }
             }
             i = end;
@@ -188,7 +216,7 @@ ChannelDecodeResult decode_channels(const ChunkCodec& codec, std::size_t decoded
     selected.insert(selected.end(), tagged.begin(), tagged.end());
     std::sort(selected.begin(), selected.end());
     selected.erase(std::unique(selected.begin(), selected.end()), selected.end());
-    std::vector<std::uint8_t> encoded(encodedBytes), decoded(decodedBytes);
+    auto encoded=scratch.bytes(0,encodedBytes),decoded=scratch.bytes(2,decodedBytes);
     read(0, encoded.size(), encoded.data());
     try { decode(codec, encoded.data(), encoded.size(), decoded.data(), decoded.size()); }
     catch (const std::runtime_error& error) { throw ChannelDecodeError(error.what()); }

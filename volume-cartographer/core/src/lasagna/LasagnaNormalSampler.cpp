@@ -1,14 +1,19 @@
 #include <vc_reader/sampling.hpp>
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
 #include "vc/lasagna/ChannelSampler.hpp"
+#include "vc/lasagna/NormalInterpolation.hpp"
+#include "vc/core/util/SpatialBatches.hpp"
 
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <cstdlib>
+#include <iostream>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <utility>
@@ -108,10 +113,10 @@ void validateLasagnaNormalDatasetStructure(const LasagnaDataset& dataset)
     const auto gradMag = bindLasagnaChannel(manifest, "grad_mag", arrays);
     const auto validate = [&](const LasagnaChannelBinding& binding,
                               std::string_view channel) {
-        if (binding.group == nullptr || (manifest.version != 3 && binding.group->channels.size() != 1)) {
+        if (binding.group == nullptr) {
             throw std::invalid_argument(
                 "normal channel '" + std::string(channel) +
-                "' must use its own 3D Lasagna group");
+                "' must have a channel group");
         }
         const double baseSpacing =
             static_cast<double>(binding.group->scaleFactor()) *
@@ -146,17 +151,28 @@ public:
     std::array<LasagnaChannelBinding,3> regionChannels() const {return {gradMag_,nx_,ny_};}
     Impl(const LasagnaDataset& dataset, const LasagnaNormalSamplerOptions& options)
         : arrays_(options.memoryCache ? options.memoryCache
-                                      : std::make_shared<vcr::MemoryCache>(options.maxCachedBytes)),
+                    : options.autoCacheFraction ? vcr::MemoryCache::automatic(*options.autoCacheFraction)
+                    : std::make_shared<vcr::MemoryCache>(options.maxCachedBytes), options.channelCache),
           gradMagDecodeScale_(
               requiredPositiveManifestDouble(dataset.manifest(), "grad_mag_encode_scale") /
               requiredPositiveManifestDouble(dataset.manifest(), "grad_mag_factor"))
     {
+        arrays_.readerThreads=options.readerThreads;
         const LasagnaDatasetManifest& manifest = dataset.manifest();
         maskInvalidCorners_ = manifest.raw.value("mask_invalid_normal_corners", false);
         nx_ = bindLasagnaChannel(manifest, "nx", arrays_);
         ny_ = bindLasagnaChannel(manifest, "ny", arrays_);
         gradMag_ = bindLasagnaChannel(manifest, "grad_mag", arrays_);
         sharedGrid_ = sameLasagnaSamplingGrid(gradMag_, nx_) && sameLasagnaSamplingGrid(gradMag_, ny_);
+        windingPointInterpolation_=options.windingPointInterpolation && !gradMag_.cuda && !nx_.cuda && !ny_.cuda;
+        if(!(options.windingRegionBaseVoxels>0.)||!std::isfinite(options.windingRegionBaseVoxels)||!options.windingBatchPoints)
+            throw std::invalid_argument("Invalid winding ROI/batch settings");
+        windingRegionBaseVoxels_=options.windingRegionBaseVoxels;
+        windingBatchPoints_=options.windingBatchPoints;
+        pointInterpolation_=options.pointInterpolation && sharedGrid_ &&
+            gradMag_.packed && nx_.packed && ny_.packed &&
+            !gradMag_.cuda && !nx_.cuda && !ny_.cuda &&
+            gradMag_.array==nx_.array && gradMag_.array==ny_.array;
         if (maskInvalidCorners_ && !sharedGrid_) {
             throw std::invalid_argument("masked normal channels must share the validity sampling grid");
         }
@@ -226,6 +242,9 @@ public:
             connectors.size(), std::numeric_limits<double>::infinity());
         if (connectors.empty())
             return result;
+        const bool profile=std::getenv("VC_FIBER_WINDING_PROFILE")!=nullptr;
+        using Clock=std::chrono::steady_clock;
+        const auto profileStart=Clock::now();
         const bool sharedGrid = sharedGrid_;
 
         struct Layout {
@@ -282,25 +301,40 @@ public:
 
         const int workers = static_cast<int>(normalBatchWorkerCount(
             points.size(), parallelThreads));
+        const auto pointsReady=Clock::now();
         std::vector<double> alignedDensity(points.size(), 0.0);
         std::vector<uint8_t> valid(points.size(), uint8_t{0});
-        constexpr size_t kBatchPoints = 262144;
-        for (size_t begin = 0; begin < points.size(); begin += kBatchPoints) {
-            const size_t end = std::min(points.size(), begin + kBatchPoints);
-            std::vector<cv::Vec3f> batchPoints(
-                points.begin() + static_cast<std::ptrdiff_t>(begin),
-                points.begin() + static_cast<std::ptrdiff_t>(end));
+        const auto spatial=vc::core::util::spatialBatches(points.size(),windingRegionBaseVoxels_,
+            windingBatchPoints_,workers,[&](size_t i){return points[i];});
+        const auto planReady=Clock::now();double readSeconds=0.,materializeSeconds=0.;
+        for (const auto& batch:spatial.batches) {
+            const auto begin=batch.begin,end=batch.end;
+            std::vector<cv::Vec3f> batchPoints(end-begin);
+            for(size_t i=begin;i<end;++i)batchPoints[i-begin]=points[spatial.order[i]];
             LasagnaCornerBatch groupedCorners;
             LasagnaCornerBatch densityCorners;
             LasagnaCornerBatch normalCorners;
-            if (sharedGrid) {
+            std::vector<InterpolatedWindingSample> interpolated;
+            const auto readStart=Clock::now();
+            if(windingPointInterpolation_) {
+                sampleLasagnaInterpolatedWindingSamples(regionChannels(),batchPoints,interpolated);
+            } else if (sharedGrid) {
                 sampleLasagnaChannelCornerBatch(
                     {&gradMag_, &nx_, &ny_}, batchPoints, groupedCorners);
             } else {
                 sampleLasagnaChannelCornerBatch({&gradMag_}, batchPoints, densityCorners);
                 sampleLasagnaChannelCornerBatch({&nx_, &ny_}, batchPoints, normalCorners);
             }
+            const auto readEnd=Clock::now();
+            readSeconds+=std::chrono::duration<double>(readEnd-readStart).count();
             const auto materialize = [&](size_t local) {
+                double encodedDensity;
+                cv::Vec3f normal;
+                if(windingPointInterpolation_) {
+                    if(!interpolated[local].valid)return;
+                    encodedDensity=interpolated[local].encodedDensity;
+                    normal=interpolated[local].normal;
+                } else {
                 const auto& densityBatch = sharedGrid
                     ? groupedCorners
                     : densityCorners;
@@ -314,26 +348,27 @@ public:
                     densityBatch.fractionsXYZ[local]);
                 const auto normalWeights = vcr::sampling::cornerWeights(
                     normalBatch.fractionsXYZ[local]);
-                const double encodedDensity = vcr::sampling::weightedCorners(
+                encodedDensity = vcr::sampling::weightedCorners(
                     densityBatch.values[0][local], densityWeights);
                 if (!(encodedDensity >= 0.0))
                     return;
                 const size_t normalOffset = sharedGrid ? 1 : 0;
-                const cv::Vec3f normal = interpolateLasagnaCompactAxisCorners(
+                normal = interpolateLasagnaCompactAxisCorners(
                     normalBatch.values[normalOffset][local],
                     normalBatch.values[normalOffset + 1][local],
                     normalWeights);
+                }
                 const double magnitude = std::sqrt(
                     static_cast<double>(normal.dot(normal)));
                 if (!(magnitude > kEpsilon))
                     return;
                 const cv::Vec3d normalDouble{normal[0], normal[1], normal[2]};
                 const cv::Vec3d& direction =
-                    layouts[pointConnectors[begin + local]].direction;
-                alignedDensity[begin + local] =
+                    layouts[pointConnectors[spatial.order[begin + local]]].direction;
+                alignedDensity[spatial.order[begin + local]] =
                     encodedDensity / gradMagDecodeScale_ *
                     std::abs(direction.dot(normalDouble) / magnitude);
-                valid[begin + local] = uint8_t{1};
+                valid[spatial.order[begin + local]] = uint8_t{1};
             };
 #ifdef _OPENMP
             if (workers > 1) {
@@ -347,8 +382,10 @@ public:
                 for (size_t local = 0; local < end - begin; ++local)
                     materialize(local);
             }
+            materializeSeconds+=std::chrono::duration<double>(Clock::now()-readEnd).count();
         }
 
+        const auto integrationStart=Clock::now();
         const auto integrate = [&](size_t connector) {
             const auto& layout = layouts[connector];
             if (layout.intervals == 0)
@@ -375,6 +412,15 @@ public:
         {
             for (size_t connector = 0; connector < connectors.size(); ++connector)
                 integrate(connector);
+        }
+        if(profile){
+            static std::mutex profileMutex;std::lock_guard lock(profileMutex);
+            std::cerr<<"WINDING_PROFILE {\"connectors\":"<<connectors.size()
+            <<",\"points\":"<<points.size()<<",\"workers\":"<<workers<<",\"read_batches\":"<<spatial.batches.size()
+            <<",\"prepare_seconds\":"<<std::chrono::duration<double>(pointsReady-profileStart).count()
+            <<",\"plan_seconds\":"<<std::chrono::duration<double>(planReady-pointsReady).count()
+            <<",\"read_seconds\":"<<readSeconds<<",\"materialize_seconds\":"<<materializeSeconds
+            <<",\"integrate_seconds\":"<<std::chrono::duration<double>(Clock::now()-integrationStart).count()<<"}\n";
         }
         return result;
     }
@@ -510,6 +556,12 @@ public:
         }
 
         const auto start = Clock::now();
+        if(pointInterpolation_) {
+            sampleLasagnaInterpolatedNormals(regionChannels(),volumePoints,maskInvalidCorners_,
+                [&](size_t i,const auto& value){samples[i]={value.normal,value.status==NormalInterpolationStatus::Valid};});
+            report.materializeMs=std::chrono::duration<double,std::milli>(Clock::now()-start).count();
+            return report;
+        }
         LasagnaCornerBatch corners;
         sampleLasagnaChannelCornerBatch({&gradMag_, &nx_, &ny_}, volumePoints, corners);
         materializeGroupedCorners(corners, 0, parallelThreads, samples);
@@ -535,6 +587,20 @@ public:
         }
         const size_t workers = normalBatchWorkerCount(volumePoints.size(), parallelThreads);
         const auto start = Clock::now();
+        if(pointInterpolation_ && !scalarEquivalent) {
+            const std::vector<cv::Vec3f> points(volumePoints.begin(),volumePoints.end());
+            sampleLasagnaInterpolatedNormals(regionChannels(),points,maskInvalidCorners_,[&](size_t i,const auto& value){
+                switch(value.status) {
+                case NormalInterpolationStatus::Missing:samples[i]=invalidNormal("missing Lasagna grad_mag sample");break;
+                case NormalInterpolationStatus::ZeroDensity:samples[i]=invalidNormal("Lasagna grad_mag sample is zero");break;
+                case NormalInterpolationStatus::Degenerate:samples[i]=invalidNormal("degenerate Lasagna normal sample");break;
+                case NormalInterpolationStatus::Valid:
+                    samples[i]={{{value.normal[0],value.normal[1],value.normal[2]},true,{}},cv::Matx33d::zeros(),false};break;
+                }
+            });
+            report.materializeMs=std::chrono::duration<double,std::milli>(Clock::now()-start).count();
+            return report;
+        }
         // Float corners only when the caller did not ask for sampleNormal's arithmetic.
         if (sharedGrid_ && !scalarEquivalent) {
             const std::vector<cv::Vec3f> floatPoints(volumePoints.begin(), volumePoints.end());
@@ -600,6 +666,10 @@ private:
     LasagnaChannelBinding ny_;
     LasagnaChannelBinding gradMag_;
     bool sharedGrid_ = false;
+    bool pointInterpolation_ = false;
+    bool windingPointInterpolation_ = false;
+    double windingRegionBaseVoxels_=4096.;
+    size_t windingBatchPoints_=262144;
     bool maskInvalidCorners_ = false;
     double gradMagDecodeScale_ = 1000.0;
 };

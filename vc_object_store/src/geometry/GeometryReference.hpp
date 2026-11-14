@@ -14,7 +14,7 @@ struct GeometryRecord {
 };
 inline constexpr const char* geometryColumns =
     "uuid,object_uuid,parent_uuid,content_hash,manifest,object_version,created_by,created_at,created_host";
-GeometryRecord decodeGeometryRecord(const Statement&,int column=0);
+GeometryRecord decodeGeometryRecord(const Statement&,int column=0,bool verify=true);
 std::optional<GeometryRecord> resolveGeometryRecord(sqlite3*, const std::string& reference);
-std::vector<std::optional<GeometryRecord>> resolveGeometryRecords(sqlite3*, std::span<const std::string>);
+std::vector<std::optional<GeometryRecord>> resolveGeometryRecords(sqlite3*, std::span<const std::string>,bool trustedCurrent=false);
 }

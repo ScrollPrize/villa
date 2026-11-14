@@ -99,7 +99,7 @@ void adjacencyCandidates()
     const auto geometry=vc::geometry::encode(vc::geometry::Fiber{{{1,2,3},{4,5,6}},{{1,2,3},{4,5,6}},{7,9}});
     auto txn=store.write();for(const auto& r:{a,b}){store.upsertObject(txn,r);store.putGeometry(txn,r.uuid,geometry);}
     auto add=[&](const std::string& key,Anchor anchor,bool reverse=false){
-        EdgeRecord edge;edge.kind="test";edge.aUuid=a.uuid;edge.bUuid=b.uuid;
+        EdgeRecord edge;edge.kind="declared_reference";edge.aUuid=a.uuid;edge.bUuid=b.uuid;
         edge.aAnchor=std::move(anchor);edge.bAnchor.wholeGeometry=true;
         if(reverse){std::swap(edge.aUuid,edge.bUuid);std::swap(edge.aAnchor,edge.bAnchor);}
         return store.addEdge(txn,edge);
@@ -122,13 +122,13 @@ void lifecycle(HistoryMode history)
 {
     TemporaryDirectory dir;OpenOptions options;options.history=history;options.spatialIndex=false;options.author="test";
     auto store=ObjectStore::create(dir.path/"lifecycle",options);auto a=object(),b=object();std::string relation;
-    auto edge=[&]{EdgeRecord e;e.kind="test";e.aUuid=a.uuid;e.bUuid=b.uuid;e.aAnchor.wholeGeometry=true;e.bAnchor.wholeGeometry=true;return e;};
+    auto edge=[&]{EdgeRecord e;e.kind="declared_reference";e.aUuid=a.uuid;e.bUuid=b.uuid;e.aAnchor.wholeGeometry=true;e.bAnchor.wholeGeometry=true;return e;};
     {auto txn=store.write();store.upsertObject(txn,a);store.upsertObject(txn,b);relation=store.addEdge(txn,edge());txn.commit();}
     std::optional<ObjectVersion> original;
     if(history==HistoryMode::On){auto read=store.read();original=store.currentObjectRevision(read,a.uuid)->reference();}
     auto write=[&]{
-        VersionSelection selected;if(history==HistoryMode::On){auto read=store.read();for(const auto& r:{a,b})selected[r.uuid]=store.currentVersion(read,r.uuid);}
-        return history==HistoryMode::On?store.writeNumbered(selected):store.write();
+        RecordSelection selected;if(history==HistoryMode::On){auto read=store.read();for(const auto& r:{a,b})selected[r.uuid]=store.currentObjectRevision(read,r.uuid)->reference();}
+        return history==HistoryMode::On?store.write(selected):store.write();
     };
     {auto txn=write();store.retireObject(txn,a.uuid);require(!store.edgeByUuid(txn,relation),"retire removes current edge");}
     {auto read=store.read();require(store.edgeByUuid(read,relation).has_value()&&!store.objectByUuid(read,a.uuid)->retired,"retire rollback restores relationships and state");}

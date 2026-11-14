@@ -7,7 +7,7 @@ summary, then the operations for one kind of use, with Python, C++, and CLI
 forms where they exist. Python examples assume
 `from vc_object_store import ObjectStore` and an open `store`.
 
-Current schema 21 also supports history-off stores, immutable store_references and overlays, independent shards and optional packed SQLite containers. Current versions and the store commit sequence remain available without archival history. See [store format](store-format.md) for version semantics and the [shared API contract](store-api-contract.md) for implementation rules.
+Current schema 22 also supports history-off stores, immutable store_references and overlays, independent shards and optional packed SQLite containers. Current versions and the store commit sequence remain available without archival history. See [store format](store-format.md) for version semantics and the [shared API contract](store-api-contract.md) for implementation rules.
 
 | Document | Covers |
 | --- | --- |
@@ -58,7 +58,7 @@ formats), or `vc_object_links` (detectors). Build and test commands are in the
 
 ## Immutable and large-scale stores
 
-- [Store format and policies](store-format.md): schema 21, history retention, sealing and database identities.
+- [Store format and policies](store-format.md): schema 22, history retention, sealing and database identities.
 - [Offline schema conversion](schema-conversion.md): supported upstream inputs, validation and history maintenance.
 - [Collections](collections.md): direct-key store_references and overlays, immutable dependencies and sharding.
 - [Initial batch import](initial-import.md): shared source-independent, parallel ingestion.

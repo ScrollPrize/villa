@@ -207,7 +207,8 @@ def test_end_to_end_and_projection_cache(tmp_path,monkeypatch):
     with tifffile.TiffFile(out/'toy'/'reference_fit_detail.tif') as detail:
         assert detail.pages[0].compression.name=='LZW'
     assert not list(out.rglob('*.png'))
-    monkeypatch.setattr(module,'samples',lambda *args: (_ for _ in ()).throw(AssertionError('cache not used')))
+    original_samples=module.samples
+    monkeypatch.setattr(module,'samples',lambda *args,**kwargs: (_ for _ in ()).throw(AssertionError('cache not used')))
     module.run(settings)
     settings['projection_cache_root']=str(out)
     settings['output_root']=str(tmp_path/'second')
@@ -223,8 +224,10 @@ def test_end_to_end_and_projection_cache(tmp_path,monkeypatch):
                          db.current_version(fid))
     settings.pop('projection_cache_root')
     settings['output_root']=str(tmp_path/'after-move')
-    with pytest.raises(ValueError,match='Fiber source changed'):
-        module.run(settings)
+    monkeypatch.setattr(module,'samples',original_samples)
+    module.run(settings)
+    with np.load(tmp_path/'after-move'/'projection.npz') as projection:
+        np.testing.assert_array_equal(projection['xyz'][:,1],20.)
 
 
 def test_detail_migration(tmp_path):

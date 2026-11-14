@@ -2,6 +2,7 @@
 #include "vc_object_store/Uuid.hpp"
 #include "internal/Publication.hpp"
 #include "internal/ImmutableImport.hpp"
+#include "internal/Extensions.hpp"
 #include "geometry/GeometryInternal.hpp"
 #include "vc_reader/publication.hpp"
 #include <algorithm>
@@ -10,6 +11,7 @@
 #include <exception>
 #include <future>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <thread>
 
@@ -42,11 +44,11 @@ struct PrivateDirectory {
     }
     ~PrivateDirectory(){std::error_code ignored;std::filesystem::remove_all(path,ignored);}
 };
-void validateRanges(const std::vector<InitialShardSpec>& shards,bool objects)
+void validateRanges(const std::vector<InitialShardSpec>& shards)
 {
     std::vector<std::array<int64_t,2>> ranges;
     for(const auto& shard:shards){
-        const auto range=objects?shard.objectIds:shard.edgeIds;
+        const auto range=shard.objectIds;
         if(range[0]<1 || range[1]<range[0])throw std::invalid_argument("initial import invalid shard ID range");
         ranges.push_back(range);
     }
@@ -123,6 +125,19 @@ int64_t InitialShardImport::importEdges(const std::function<bool(std::vector<Ini
     } catch(...){p.failure.record(std::current_exception());throw;}
 }
 
+void InitialShardImport::appendExtensionRows(const std::string& table,std::span<const ExtensionRow> rows)
+{
+    auto& p=*impl_;p.check();
+    try {p.store.appendExtensionRows(p.transaction,table,rows);}
+    catch(...){p.failure.record(std::current_exception());throw;}
+}
+int64_t InitialShardImport::transferStagedExtensionRows(const std::string& table,
+    const std::function<void(ExtensionRow&)>& transform,size_t batchRows) {
+    auto& p=*impl_;p.check();
+    try{return detail::transferInitialExtensionStage(detail::InitialCollectionAccess::connection(p.store,p.transaction),table,transform,batchRows);}
+    catch(...){p.failure.record(std::current_exception());throw;}
+}
+
 InitialImportResult importInitialCollection(const std::filesystem::path& target,
     const InitialImportOptions& options,const std::function<void(size_t,InitialShardImport&)>& producer)
 {
@@ -142,7 +157,7 @@ InitialImportResult importInitialCollection(const std::filesystem::path& target,
         throw std::invalid_argument("initial import owns its fresh store and lineage UUIDs");
     if(!options.edges.sqlBatchRows)
         throw std::invalid_argument("initial import SQL batch size must be positive");
-    validateRanges(options.shards,true);validateRanges(options.shards,false);
+    validateRanges(options.shards);
     const auto destination=std::filesystem::absolute(target).lexically_normal();
     if(std::filesystem::exists(destination) || std::filesystem::is_symlink(destination))
         throw std::runtime_error("initial import destination already exists");
@@ -154,6 +169,10 @@ InitialImportResult importInitialCollection(const std::filesystem::path& target,
     result.storeUuid=util::newUuid();
     auto common=options.store;common.creationStoreUuid=result.storeUuid;
     common.creationGeneration=util::newUuid();
+    // Each worker owns its collection and accesses dependencies on that same
+    // thread. Extra pooled readers are unused and multiply open files by both
+    // input and output shard counts (32 x 33 x 4 exceeds common FD limits).
+    common.readerPoolSize=1;
     std::unique_ptr<PrivateDirectory> directory;
     std::unique_ptr<detail::StagedDatabase> single;
     std::unique_ptr<PackedStoreBuilder> packed;
@@ -178,13 +197,15 @@ InitialImportResult importInitialCollection(const std::filesystem::path& target,
 
     Failure failure;
     std::vector<CollectionMember> completedMembers(paths.size());
+    std::vector<std::vector<CollectionMember>> mutableDependencies(paths.size());
     std::vector<std::future<InitialShardResult>> jobs;
     try {
         for(size_t i=0;i<paths.size();++i)jobs.push_back(std::async(std::launch::async,[&,i]{
             try {
                 failure.check();const auto creation=Clock::now();
-                auto opts=common;opts.objectIdRange=options.shards[i].objectIds;opts.edgeIdRange=options.shards[i].edgeIds;
-                auto collection=detail::InitialCollectionAccess::create(paths[i],options.dependencies,opts);
+                auto opts=common;opts.objectIdRange=options.shards[i].objectIds;
+                auto collection=detail::InitialCollectionAccess::create(paths[i],options.dependencies,opts,options.dependencyPins);
+                mutableDependencies[i]=detail::InitialCollectionAccess::mutableDependencyPins(collection);
                 auto transaction=collection.write();
                 for(const auto& extension:options.extensions)collection.createExtensionTable(transaction,extension);
                 auto state=std::make_unique<InitialShardImport::Impl>(InitialShardImport::Impl{
@@ -217,7 +238,22 @@ InitialImportResult importInitialCollection(const std::filesystem::path& target,
     } catch(...){failure.record(std::current_exception());}
     for(auto& job:jobs){try {result.shards.push_back(job.get());}catch(...){failure.record(std::current_exception());}}
     if(failure.error)std::rethrow_exception(failure.error);
+    // Table-level pins only; no finished-shard readback or per-object scan.
+    // Sealed-source imports take no additional I/O. Mutable history owners
+    // must have been observed at the same publication by every worker.
+    std::map<std::string,CollectionMember> pins;
+    for(const auto& sources:mutableDependencies)for(const auto& member:sources){
+        const auto [it,inserted]=pins.emplace(member.databaseUuid,member);
+        if(!inserted&&(it->second.storeUuid!=member.storeUuid||it->second.generation!=member.generation||
+                        it->second.commitSequence!=member.commitSequence))
+            throw StoreBusy("initial import: dependency changed between worker snapshots");
+    }
+    result.generation=completedMembers.front().generation;
+    result.commitSequence=completedMembers.front().commitSequence;
     if(options.beforePublish)options.beforePublish();
+    std::vector<CollectionMember> mutablePins;
+    for(const auto& [id,member]:pins)mutablePins.push_back(member);
+    detail::InitialCollectionAccess::verifyMutableDependencyPins(mutablePins);
     result.ingestionSeconds=elapsed(start);
     const auto manifestStart=Clock::now();
     if(paths.size()>1)detail::InitialCollectionAccess::writeManifest(manifest,completedMembers,common,options.uuidHashRouting);
