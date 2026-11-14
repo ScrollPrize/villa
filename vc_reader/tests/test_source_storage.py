@@ -971,5 +971,19 @@ class RemoteTests(RemoteFixtureCase):
         self.assertEqual(list(self.cache.rglob('*.tmp.*')), [])
 
 
+class OpenDataUrlTests(unittest.TestCase):
+    def test_region_less_open_data_https_is_the_public_channel(self):
+        import vc_reader
+        from vc_reader.reader.auth import resolve_access
+        s3 = 's3://vesuvius-challenge-open-data/PHerc0139/volumes/a.zarr'
+        regional = 'https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHerc0139/volumes/a.zarr'
+        # The form the data browser and the ink_9um model card publish.
+        region_less = 'https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0139/volumes/a.zarr'
+        self.assertEqual(vc_reader.to_s3(region_less), s3)
+        self.assertEqual(vc_reader.to_s3(regional), s3)
+        self.assertEqual(vc_reader.to_https(s3), regional)
+        self.assertEqual(resolve_access(region_less, 'aws').kind, 'anonymous')
+
+
 if __name__ == '__main__':
     unittest.main()
