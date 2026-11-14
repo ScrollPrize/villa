@@ -92,7 +92,8 @@ build prerequisites (see [vc_reader](../vc_reader/README.md)).
 
 Use `--slab-workers N --kimimaro-parallel 1` to process multiple slabs concurrently
 with local predictions. Each worker holds a slab in RAM; the default is
-one worker and eight Kimimaro processes per slab.
+one worker and eight Kimimaro processes per slab (one on Windows, where starting
+eight processes for every slab is much slower than using one).
 
 ```sh
 python extract_surface_tracks.py --backend cpu --predictions /data/predictions.zarr \
