@@ -1451,7 +1451,9 @@ def infer_single_zarr(
     LOGGER.info("Selected %d patches for inference", len(blocks))
     output_blocks = blocks if roi_bounds is None else [clip_block_to_roi(block, roi_bounds) for block in blocks]
     LOGGER.info("Output bounds=(%d, %d, %d, %d) shape=%s; parent patch grid retained", *output_bounds, output_shape)
-    slot = configured_model.engine_slot
+    # with no tile scheduled the map is all zero, which the PyTorch path writes
+    # without reading the window or building a model, so the engine is kept
+    slot = configured_model.engine_slot if blocks else None
     if slot is not None and slot.engine is not None and run_with_engine(
         slot.engine,
         FlatEngineRequest(

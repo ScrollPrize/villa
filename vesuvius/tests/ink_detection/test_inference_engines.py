@@ -725,6 +725,32 @@ def test_a_fallback_frees_the_engine_before_pytorch_builds_and_later_inputs_stay
         np.testing.assert_array_equal(tifffile.imread(forward), tifffile.imread(tmp_path / f"torch_{segment}.tif"))
 
 
+def test_an_input_with_no_scheduled_tile_is_written_without_the_engine_or_a_fallback(tmp_path, caplog):
+    # an empty level-3 mask schedules nothing; PyTorch writes the zero map without reading the window, so the
+    # engine must not read and run it either, nor be released as if the input had fallen back
+    _, volume = _write_surface(tmp_path / "bare.zarr")
+    empty = _write_group(tmp_path / "empty.zarr", volume, np.zeros((5, 6), dtype=np.uint8))
+    level3 = np.zeros((5, 6), dtype=np.uint8)
+    level3[1:4, 2:5] = 1
+    full = _write_group(tmp_path / "full.zarr", volume, level3)
+    checkpoint = _save_checkpoint(tmp_path / "model.pth")
+    handle = _RecordingHandle()
+    engine = InkrsEngine(_fake_inkrs(None), handle, device_index=0)
+
+    def run_on(surface, output):
+        args = normalize_inference_paths(parse_args([str(surface), str(checkpoint), str(tmp_path / output), *COMMON]))
+        assert run(args, engine_factory=lambda *_: engine) == 0
+
+    with caplog.at_level("INFO"):
+        run_on(empty, "empty.tif")
+    assert handle.calls == []
+    assert not tifffile.imread(tmp_path / "empty.tif").any()
+    assert "Releasing" not in caplog.text
+    # the engine still runs the next input that has tiles
+    run_on(full, "full.tif")
+    assert len(handle.calls) == 1
+
+
 def test_window_cache_keeps_one_span_and_never_a_failed_read():
     cache = WindowCache()
     calls = []
