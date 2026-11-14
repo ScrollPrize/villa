@@ -127,7 +127,7 @@ TransformedGeometryView GeometryView::viewTransformedAt(const std::string& targe
         throw std::invalid_argument("object revision does not name this geometry and its coordinate metadata");
     const auto local=context?VolumeTransforms{}:reader.volumeTransforms();
     const auto mapping=(context?*context:local).toVolume(nlohmann::json::parse(record->record.meta),target,scale);
-    if(!mapping)throw std::runtime_error("object has no unambiguous transform to volume "+target);
+    if(!mapping)throw MappingUnavailable("object has no unambiguous transform to volume "+target);
     return TransformedGeometryView(GeometrySnapshot(state_->read).typed(state_),*mapping,target,scale);
 }
 

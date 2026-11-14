@@ -12,7 +12,7 @@ find_package(TIFF REQUIRED)
 find_package(PNG REQUIRED)
 find_package(JPEG REQUIRED)
 if(NOT TARGET vc_delta3d::vc_delta3d)
-    find_package(vc_delta3d 0.3 CONFIG QUIET)
+    find_package(vc_delta3d 0.3.2 CONFIG QUIET)
 endif()
 if(NOT TARGET vc_delta3d::vc_delta3d)
     include(FetchContent)
@@ -21,7 +21,7 @@ if(NOT TARGET vc_delta3d::vc_delta3d)
     set(VC_DELTA3D_INSTALL_CPP ON CACHE BOOL "" FORCE)
     FetchContent_Declare(vc_delta3d
         GIT_REPOSITORY https://github.com/ScrollPrize/vc-delta3d.git
-        GIT_TAG 45339743b450ff707d21fb742dc1b3b2bf99306d) # ScrollPrize/vc-delta3d#7
+        GIT_TAG v0.3.2)
     include("${CMAKE_CURRENT_LIST_DIR}/FetchDelta3D.cmake")
     vc_fetch_delta3d()
 endif()

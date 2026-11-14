@@ -21,6 +21,9 @@
 #include "fibers3d/Fiber3DSliceControls.hpp"
 #include <QCheckBox>
 #include <QToolButton>
+#include <QProcess>
+#include <QRegularExpression>
+#include <random>
 // Built only with VC_TESTING. Runs the actual controller publication path.
 namespace {
 // Open a store as the state's project, as VC3D opens one.
@@ -43,6 +46,9 @@ int runObjectStoreControllerTests()
     using namespace vc::objects;
     auto require = [](bool value, const char* message) { if (!value) throw std::runtime_error(message); };
     const auto path = std::filesystem::temp_directory_path() / ("vc3d-store-test-"+vc::objects::util::newUuid()+".vcobj");
+    // These tests exercise validation against the store's status; the
+    // event-driven store view has its own section (which turns it on).
+    Controller::s_fiberStoreViewDefault = false;
     try {
 #include "LineAnnotationNearbyBenchmark.inc"
         if (const char* endpoint = std::getenv("VC3D_SSH_STORE_TEST")) {
@@ -107,6 +113,7 @@ int runObjectStoreControllerTests()
             require(state.storeFor("fiber") && state.vpkg()->document().data() == data, "reopening uses the upgraded store without another conversion");
             state.closeProject();
         }
+#include "LineAnnotationHostedReadTest.inc"
 #include "LineAnnotationCompoundTest.inc"
 #include "LineAnnotationFiberCacheTest.inc"
         if (const char* source = std::getenv("VC3D_OBJECT_STORE_READ_ONLY_BENCH")) {
@@ -879,7 +886,7 @@ int runObjectStoreControllerTests()
             require(controller._fiberSaveFailureCount==failures,"completed manual interaction commits without solver");
             require(live->storePin->reference().version!=merged.storePin->reference().version,"interaction advances pin immediately");
             const auto savedPin=live->storePin;
-            controller.saveOpenFibers();
+            (void)controller.saveOpenFibers();
             require(live->storePin==savedPin,"Save barrier does not create another revision");
             {
                 // Split and merge plan from session snapshots; new fibers must keep the stored frame.
