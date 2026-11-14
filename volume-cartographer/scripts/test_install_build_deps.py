@@ -40,6 +40,8 @@ esac
                 result, log = self.run_profile(distro, 'minimal-build')
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn('libceres-dev', log)
+                self.assertIn('libblosc2-dev', log)
+                self.assertIn('libconcurrentqueue-dev', log)
                 self.assertEqual('add-apt-repository -y universe' in log, distro == 'ubuntu')
                 self.assertNotIn('curl ', log)
                 self.assertNotIn('flang-21', log)

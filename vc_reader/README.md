@@ -1751,7 +1751,9 @@ browse its samples, scans, volumes, segments and artifacts, or build a
 `RegistrationGraph`. `loadCatalog` accepts a cache file and refresh policy;
 its result reports cached fallback and a warning when refresh fails.
 
-Native builds require Boost headers (Ubuntu: `libboost-dev`; Homebrew: `boost`) and the header-only concurrentqueue CMake package for shared scheduling (Ubuntu: `libconcurrentqueue-dev`). Neither dependency needs a queue runtime library. On other platforms, install upstream concurrentqueue with its CMake package available through `CMAKE_PREFIX_PATH`.
+Native builds require Boost headers (Ubuntu: `libboost-dev`; Homebrew: `boost`) and the header-only concurrentqueue CMake package for shared scheduling (Ubuntu: `libconcurrentqueue-dev`; Homebrew: `concurrentqueue`). Neither dependency needs a queue runtime library. On other platforms, install upstream concurrentqueue with its CMake package available through `CMAKE_PREFIX_PATH`.
+
+Volume-reader builds also require Blosc2 2.13 or newer in addition to Blosc1, for reusable decompression contexts. Ubuntu 24.04 provides `libblosc2-dev`; Homebrew provides `c-blosc2`. Its `blosc2.pc` must be discoverable by pkg-config (set `PKG_CONFIG_PATH` for a nonstandard installation). The shared VC3D Ubuntu/macOS dependency scripts install these prerequisites; catalog-only builds do not require Blosc2.
 
 The catalog target requires nlohmann_json, libcurl and zlib; it does not require
 Python, Qt, OpenCV, CUDA or the volume reader. Configure with
