@@ -299,6 +299,10 @@ Poses joint_scan_poses(const Json& cal, int rows, std::size_t s, const std::vect
     const double sway[2] = {two_numbers(stage, "axis_twice", "the stage", 0), two_numbers(stage, "axis_twice", "the stage", 1)};
     const Json& p = scans.array[s];
     const double axis = number(p, "axis", "a scan"), axis_slope = number(p, "axis_slope", "a scan"), axial = 1.0 + number(p, "axial_scale", "a scan");
+    // the scale of the scan's image across the beam, where the calibration has one: what the scan records u columns
+    // from its rotation axis lies u (1 + column_scale) from it
+    const Json* widens = p.find("column_scale");
+    const double column_scale = widens && widens->is(Json::Number) ? widens->number : 0.0;
     const double at[2] = {two_numbers(p, "d", "a scan", 0), two_numbers(p, "d", "a scan", 1)};  // where the sample sits on the rotation stage
     const double d[2] = {own ? 0.0 : at[0], own ? 0.0 : at[1]};
     const double height = own ? 0.0 : number(p, "height", "a scan"), H_mid = number(p, "mid_height", "a scan");
@@ -335,7 +339,11 @@ Poses joint_scan_poses(const Json& cal, int rows, std::size_t s, const std::vect
         q.row_per_col[k] = -roll, q.col_per_row[k] = roll;
         q.angle_deg[k] = ang[k];
         q.angle_deg_per_row[k] = step[k] * per_row;
+        q.col_scale[k] = column_scale;
     }
+    // about the rotation axis' column (its course over the frames and the map's part there are under a pixel, which
+    // times the scale is nothing)
+    q.scale_col = axis;
     return q;
 }
 

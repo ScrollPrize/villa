@@ -53,7 +53,7 @@ void ideal_position(const T* map, const double* phi, int terms, double c, double
 
 // The ray recorded at the ideal position (X, Y): its distance s from the sample's origin across the beam and its
 // height z in the sample. The blocks, as the solver holds them:
-//     detector [roll]        own [axis, axis_slope, axial_scale]        place [d0, d1, height]        stretch [height]
+//     detector [roll]        own [axis, axis_slope, axial_scale, column_scale]        place [d0, d1, height]        stretch [height]
 //     stage [height once per turn: cos, sin; axis column twice per turn: cos, sin]        map [Eu's terms, Ev's terms]
 //     timing [the rows' timing]: it is in `when`, the angle and height at the time the sighting's row was exposed
 // (and per scan once [cos, sin], which is not of a ray: own_lift below)
@@ -72,7 +72,9 @@ void ray_of(const T* detector, const T* stage, const T* own, const T* place, con
     }
     const T axis = own[0] + own[1] * (when.H - at.H_mid) + stage[2] * (c * c - sn * sn) + stage[3] * (2.0 * sn * c);
     const T u = X - axis - detector[0] * (Y - at.mid_row);  // columns from the axis, the roll taken out
-    s = u - (place[0] * c + place[1] * sn);
+    // the scan's image across the beam is smaller by own[3] than the anchor's (ScanParameters::column_scale): what
+    // it records u columns from its axis lies u (1 + column_scale) from the axis
+    s = u * (T(1.0) + own[3]) - (place[0] * c + place[1] * sn);
     z = Y + detector[0] * u - place[2] - stretch[0] - (T(1.0) + own[2]) * when.H - (stage[0] * c + stage[1] * sn);
 }
 

@@ -255,7 +255,10 @@ def solve_geometry(acquisition_, comparisons, start=None, huber=0.03, max_iterat
     frames per row: `start`'s, else the acquisition's) is held unless freed by name; scans at different places on
     the rotation stage give it (their column offset at one angle is sheared along the rows by it, and a scan off
     the origin sees its own opposite views that much off half a turn); one scan about its own axis hardly tells it
-    from its axial scale ("correlated" lists the two).
+    from its axial scale ("correlated" lists the two). "scan<k>.column_scale" (the scale of a scan's image across the
+    beam against the anchor's: what it records u columns from its axis lies u (1 + column_scale) from it) is held
+    unless freed by name; a scan's own views do not see it, its comparisons with another scan do, and the anchor's
+    stays at nothing.
 
     lens: lens patches, the other kind of measurement: two scans' reconstructions of one place of the sample
     registered in 3D. Dicts with scan_a, scan_b, p (the place of the sample: x, y from its origin, z its height),

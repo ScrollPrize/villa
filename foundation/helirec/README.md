@@ -1241,6 +1241,13 @@ model has no term for (0.09 to 0.17 slices rms along the axis).
   registered): of one scan they have the scan's `height_once`, of two scans their rows are left out of the solve
   and reported (their columns are fitted). `report` gives, per pair of scans and kind, what is left of frames, rows
   and columns as an rms, a median and a once per turn of the angle (`pairs`).
+* The scale of a scan's image across the beam (`ScanParameters::column_scale`, `"scan<k>.column_scale"`): what the
+  scan records `u` columns from its rotation axis lies `u (1 + column_scale)` from the axis, so its image is
+  smaller by that than the anchor's. A scan's own opposite views do not see it (their sightings lie at `u` and
+  `-u`); its comparisons with another scan do. Held unless freed by name, and the anchor's stays at nothing (one
+  scale for every scan is a dilation of their places). The reconstruction takes it from the calibration file in
+  the scan's poses (`Poses::col_scale` about the axis column), so a tile is reconstructed in the anchor's scale.
+  On Paris4 it grows with the order in which the tiles were taken, 18 ppm per tile, to 330 ppm on the last.
 * The rows' timing as an unknown (`Parameters::row_time`, `"row_time"`, frames per stored row): typed or from a
   refill (`Acquisition::row_time`) and held unless freed by name. Scans at different places on the rotation stage
   give it: the column offset of two tiles at one angle, `(d_k - d_j) . (cos th, sin th)`, is of the angle at which
@@ -1324,7 +1331,7 @@ taken off by iteration, the direction the model does not have), which is what fi
 the line through its point, a solve finds the parameters again (a scan alone; a pair moved sideways with the
 detector's map; three tiles about an axis pitched towards the beam, whose own views give the pitch and an axial
 scale free of it; three tiles compared with each other at equal angle and half a turn apart, which give the pitch,
-their places and, turned against each other, their tilts, and from a start at zero the rows' timing), dependent unknowns are refused, the plan of two tiles
+their places and, turned against each other, their tilts, from a start at zero the rows' timing, and the scales of their images across the beam), dependent unknowns are refused, the plan of two tiles
 follows their places onto both detectors, the plan stays inside the strip for a helix alone with its axis at
 the detector's edge and covers the columns two scans share, a pixel put through the poses the reconstruction
 reads from a joint calibration is the ray the model gives it, and the report tells a recorded height that is the

@@ -43,7 +43,9 @@ class Scan:
         # G.empty_map gives it, with its coefficients): the pixel (c, v) looks along (c + Eu, v + Ev). pitch: of the
         # rotation axis towards the beam [rad]. moved: the sample sits elsewhere on the stage than in the anchor.
         # rotation: the sample is turned by this vector [rad] about its origin at the height `about`.
-        self.t = dict(axis=301.3, axis_slope=0.0, axial_scale=0.0, d=(0.0, 0.0), height=0.0, roll=0.0, row_time=0.0, stretch_height={},
+        # column_scale: the scan's image across the beam is smaller by this (what lies x from the axis is recorded
+        # x / (1 + column_scale) from it).
+        self.t = dict(axis=301.3, axis_slope=0.0, axial_scale=0.0, d=(0.0, 0.0), height=0.0, roll=0.0, row_time=0.0, stretch_height={}, column_scale=0.0,
                       height_once=(0.0, 0.0), axis_twice=(0.0, 0.0), map=None, pitch=0.0, moved=False, rotation=(0.0, 0.0, 0.0), about=0.0)
         self.t.update(truth)
         self.index = index
@@ -69,6 +71,7 @@ class Scan:
         H = np.interp(t, np.arange(len(st["rows"])), st["rows"])
         on_stage = self.held(p) - [0.0, 0.0, tr["height"]]                         # the sample's place on the stage (its height below, with the record's)
         x, depth, z = _stage(th) @ on_stage                                        # the stage turned; parallel rays: the depth is dropped,
+        x /= 1.0 + tr["column_scale"]                                              # this scan's image is smaller across the beam, about the axis
         z += tr["pitch"] * depth                                                   # but for an axis leaning towards the beam: a row higher per 1 / pitch of depth
         # what the stage does within a turn: it lifts the sample once per turn and moves its axis across the detector twice
         z += tr["height_once"][0] * np.cos(th) + tr["height_once"][1] * np.sin(th)
@@ -109,7 +112,7 @@ class Scan:
     def parameters(self):
         t = self.t
         return dict(roll=t["roll"], stage=dict(height_once=list(t["height_once"]), axis_twice=list(t["axis_twice"])), scans=[dict(axis=t["axis"], axis_slope=t["axis_slope"], axial_scale=t["axial_scale"], d=list(t["d"]), height=t["height"],
-                                                 stretch_height=dict(t["stretch_height"]))])
+                                                 stretch_height=dict(t["stretch_height"]), column_scale=t["column_scale"])])
 
 
 def _acquisition(*scans):
@@ -422,6 +425,26 @@ def test_the_reconstructions_poses_are_the_models():
         th, d = np.radians(poses[k]["angle_deg"]), truth["scans"][k]["d"]
         assert np.allclose(leaning[k]["row"] - poses[k]["row"], pitch * (d[1] * np.cos(th) - d[0] * np.sin(th)), atol=1e-9)
         assert np.array_equal(leaning[k]["axis"], poses[k]["axis"])
+    # a calibration that holds a scale of the second scan's image across the beam: the poses scale its columns about
+    # its rotation axis' column, and a pixel put through them is still the model's ray
+    wider = dict(truth, scans=[truth["scans"][0], dict(truth["scans"][1], column_scale=3e-4)])
+    scaled, _ = G.frame_poses(dict(cal, parameters={k: wider[k] for k in ("roll", "stage", "scans")}), angles, heights)
+    assert np.all(scaled[1]["col_scale"] == 3e-4) and scaled[1]["scale_col"] == pytest.approx(truth["scans"][1]["axis"]) and np.all(scaled[0]["col_scale"] == 0)
+    worst, moved = 0.0, 0.0
+    for _ in range(300):
+        stretch = int(rng.integers(0, 3))
+        f = int(rng.integers(3, len(second.stretches[stretch]["rows"]) - 3))
+        c, v = rng.uniform(20, COLS - 20), rng.uniform(20, ROWS - 20)
+        ray, plain = G.rays(acq, wider, [[1, stretch, f, v, c]])[0], G.rays(acq, truth, [[1, stretch, f, v, c]])[0]
+        P, k = scaled[1], int(offsets[stretch]) + f
+        eu, ev = G.map_displacement(truth["map"], c, v)
+        X, Y = c + eu + P["col_scale"][k] * (c - P["scale_col"]), v + ev + P["row_scale"][k] * v
+        u = X - P["axis"][k] - P["col_per_row"][k] * (Y - mid)
+        th = np.radians(P["angle_deg"][k] + P["angle_deg_per_row"][k] * (v - mid))
+        dn = TRUTH["d"][0] * np.cos(np.radians(P["angle_deg"][k])) + TRUTH["d"][1] * np.sin(np.radians(P["angle_deg"][k]))
+        dn_row = TRUTH["d"][0] * np.cos(th) + TRUTH["d"][1] * np.sin(th)
+        worst, moved = max(worst, abs(u - (ray[1] + dn_row - dn))), max(moved, abs(ray[1] - plain[1]))
+    assert worst < 6e-3 < 0.05 < moved                                              # (the scale itself moves a ray by up to 3e-4 x the columns from the axis)
     # the helix of the first scan, and the merged frame laid out from the poses
     assert G.merged_layout(cal, poses, heights)["measured"]["axis_first_scan"] == pytest.approx(np.median(poses[0]["axis"][offsets[1]:offsets[2]]))
     with pytest.raises(ValueError, match="not of two scans"):
@@ -810,6 +833,45 @@ def test_tiles_give_the_rows_timing():
     alone = G.solve_geometry(unknown, [c for c in own if c["a"][0] == 0], start=start, freed=["row_time"], held=["scan1", "scan2"])
     assert any({a, b} == {"row_time", "scan0.axial_scale"} and abs(r) > 0.999 for a, b, r in alone["correlated"])
     assert not any("row_time" in (a, b) for a, b, r in got["correlated"])
+
+
+def test_tiles_give_the_scales_of_their_images():
+    """Three tiles whose images differ in scale across the beam (the sample a little wider in one, narrower in
+    another, than when the anchor was taken). A tile's own opposite views lie at u and -u from its axis and do not
+    see the scale; the tiles' comparisons with each other do. Freed by name, the scales come back with the places
+    and the axis columns; held, the tiles' columns are left with the scale x their distance from the axes."""
+    rng = np.random.default_rng(41)
+    scales = [0.0, 2e-4, -1.5e-4]
+    places = [(0.0, 0.0), (330.0, 60.0), (-150.0, 290.0)]
+    shared = {k: TRUTH[k] for k in ("roll", "height_once", "axis_twice")}
+    scans = [Scan([("helix", 3 * PER_TURN)], index=k, axis=TRUTH["axis"] - 0.2 * k, axial_scale=TRUTH["axial_scale"] + 1e-4 * k, d=d, height=1.5 * k, moved=k > 0, column_scale=scales[k], **shared)
+             for k, d in enumerate(places)]
+    acq = _acquisition(*scans)
+    own = [c for sc in scans for c in _helix_comparisons(rng, sc, 0, 500, 0.004) if c["kind"] == "opposite"]
+    comparisons = own + _tile_comparisons(rng, scans, [(0, 1), (0, 2), (1, 2)], 400)
+    start = dict(roll=0.0, scans=[dict(axis=TRUTH["axis"] + 0.5, d=[d[0] + 2.0 * (k > 0), d[1] - 1.5 * (k > 0)]) for k, d in enumerate(places)])
+    names = ["scan1.column_scale", "scan2.column_scale"]
+    held = G.solve_geometry(acq, comparisons, start=start)
+    assert not any(n in held["free"] for n in names) and all(s["column_scale"] == 0.0 for s in held["scans"])
+    got = G.solve_geometry(acq, comparisons, start=start, freed=names)
+    assert all(n in got["free"] for n in names) and got["solver"]["rank"] == len(got["free"]) == len(held["free"]) + 2
+    for k, (s, d) in enumerate(zip(got["scans"], places)):
+        assert s["column_scale"] == pytest.approx(scales[k], abs=1e-5), k
+        assert s["d"] == pytest.approx(list(d), abs=0.01) and s["axis"] == pytest.approx(TRUTH["axis"] - 0.2 * k, abs=5e-3), k
+    between = np.array([c["kind"] != "opposite" for c in comparisons])
+    columns = lambda sol, m: float(np.sqrt(np.mean(sol["residual"][m, 2] ** 2)))
+    assert columns(got, between) < 0.01 < 0.02 < columns(held, between)
+    # the tiles' own views alone say nothing of it worth having: freed there, the scales stay where they started
+    # within what the noise of a few hundred px of lever gives, and the axis columns are the same either way
+    alone = G.solve_geometry(acq, own, start=start)
+    assert alone["scans"][1]["axis"] == pytest.approx(got["scans"][1]["axis"], abs=5e-3)
+    # one scale for every tile is a dilation of their places: the anchor's freed beside the others is refused or
+    # said to be one with them
+    try:
+        every = G.solve_geometry(acq, comparisons, start=start, freed=names + ["scan0.column_scale"])
+        assert any("scan0.column_scale" in (a, b) and abs(r) > 0.99 for a, b, r in every["correlated"])
+    except ValueError as e:
+        assert "RANK_DEFICIENT" in str(e)
 
 
 def test_tiles_in_projections_give_their_tilts():

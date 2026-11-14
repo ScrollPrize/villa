@@ -65,7 +65,8 @@ struct Blocks {
     double timing[1] = {0};   // the rows' timing [frames per row]
     geometry::Map shape;      // the map's terms and normalisation
     std::vector<double> map;  // Eu's coefficients, then Ev's (empty: no map)
-    std::vector<std::array<double, 3>> own, place;       // per scan
+    std::vector<std::array<double, 4>> own;              // per scan: axis, axis_slope, axial_scale, column_scale
+    std::vector<std::array<double, 3>> place;            // per scan
     std::vector<std::array<double, 3>> turn;             // per scan: the sample's rotation against the anchor's (x, y, z)
     double about_height = 0;                             // (not an unknown)
     std::vector<std::array<double, 2>> once;             // per scan: the height once per turn of its own views
@@ -87,7 +88,7 @@ Blocks blocks_of(const Acquisition& acq, const Parameters& p) {
     for (std::size_t k = 0; k < p.scans.size(); ++k) {
         const ScanParameters& s = p.scans[k];
         if (s.stretch_height.size() != acq.scans[k].stretches.size()) throw Error("geometry: the parameters of scan " + acq.scans[k].name + " do not hold one height per stretch");
-        b.own.push_back({s.axis, s.axis_slope, s.axial_scale});
+        b.own.push_back({s.axis, s.axis_slope, s.axial_scale, s.column_scale});
         b.place.push_back({s.d[0], s.d[1], s.height});
         b.turn.push_back({s.rotation[0], s.rotation[1], s.rotation[2]});
         b.once.push_back({s.height_once[0], s.height_once[1]});
@@ -108,7 +109,7 @@ Parameters parameters_of(const Blocks& b) {
     p.stage.height_once[0] = b.stage[0], p.stage.height_once[1] = b.stage[1], p.stage.axis_twice[0] = b.stage[2], p.stage.axis_twice[1] = b.stage[3];
     for (std::size_t k = 0; k < b.own.size(); ++k) {
         ScanParameters s;
-        s.axis = b.own[k][0], s.axis_slope = b.own[k][1], s.axial_scale = b.own[k][2];
+        s.axis = b.own[k][0], s.axis_slope = b.own[k][1], s.axial_scale = b.own[k][2], s.column_scale = b.own[k][3];
         s.d[0] = b.place[k][0], s.d[1] = b.place[k][1], s.height = b.place[k][2];
         for (int i = 0; i < 3; ++i) s.rotation[i] = b.turn[k][static_cast<std::size_t>(i)];
         s.height_once[0] = b.once[k][0], s.height_once[1] = b.once[k][1];
@@ -150,7 +151,10 @@ std::vector<Slot> slots_of(const Acquisition& acq, Blocks& b, const std::vector<
         const std::string scan = "scan" + std::to_string(k) + ".";
         const bool anchor = static_cast<int>(k) == acq.anchor;
         const char* own[3] = {"axis", "axis_slope", "axial_scale"};
-        for (int i = 0; i < 3; ++i) out.push_back({scan + own[i], b.own[k].data(), 3, i, true});
+        for (int i = 0; i < 3; ++i) out.push_back({scan + own[i], b.own[k].data(), 4, i, true});
+        // the scale of the scan's image across the beam: a scan's own views do not see it (their sightings lie at u
+        // and -u from the axis), comparisons with another scan do; held unless freed by name
+        out.push_back({scan + "column_scale", b.own[k].data(), 4, 3, false});
         const char* place[3] = {"d0", "d1", "height"};
         for (int i = 0; i < 3; ++i) {
             Slot s{scan + place[i], b.place[k].data(), 3, i, !anchor};
@@ -277,7 +281,7 @@ Wiring wire(const Acquisition& acq, Blocks& b, const Comparison& c) {
     };
     const auto side = [&](const Sighting& g, int* at) {
         const std::size_t k = static_cast<std::size_t>(g.scan), a = static_cast<std::size_t>(g.stretch);
-        at[0] = place(b.own[k].data(), 3), at[1] = place(b.place[k].data(), 3), at[2] = place(b.stretch[k][a].data(), 1);
+        at[0] = place(b.own[k].data(), 4), at[1] = place(b.place[k].data(), 3), at[2] = place(b.stretch[k][a].data(), 1);
     };
     side(c.a, w.f.at_a), side(c.b, w.f.at_b);
     if (c.a.scan == c.b.scan) w.f.at_once = place(b.once[static_cast<std::size_t>(c.a.scan)].data(), 2);
@@ -329,7 +333,7 @@ Ray ray_of(const Acquisition& acq, const Parameters& p, const Sighting& g) {
     const ScanParameters& sp = p.scans[static_cast<std::size_t>(g.scan)];
     const double row_time = row_time_of(acq, p);
     const model::At at = at_of(acq, row_time, g);
-    const double detector[1] = {p.roll}, own[3] = {sp.axis, sp.axis_slope, sp.axial_scale}, place[3] = {sp.d[0], sp.d[1], sp.height};
+    const double detector[1] = {p.roll}, own[4] = {sp.axis, sp.axis_slope, sp.axial_scale, sp.column_scale}, place[3] = {sp.d[0], sp.d[1], sp.height};
     const double stage[4] = {p.stage.height_once[0], p.stage.height_once[1], p.stage.axis_twice[0], p.stage.axis_twice[1]};
     const double stretch[1] = {sp.stretch_height.at(static_cast<std::size_t>(g.stretch))};
     const int nt = terms_of(p.map);
@@ -610,7 +614,7 @@ void parameters_json(const Acquisition& acq, const Parameters& p, Json& out, Jso
         Json d = Json::dict();
         d.set("name", Json::of(acq.scans[k].name)).set("axis", num(q.axis)).set("axis_slope", num(q.axis_slope)).set("axial_scale", num(q.axial_scale));
         d.set("d", Json::list().add(num(q.d[0])).add(num(q.d[1]))).set("height", num(q.height)).set("stretch_height", heights).set("mid_height", num(acq.scans[k].mid_height));
-        d.set("height_once", Json::list().add(num(q.height_once[0])).add(num(q.height_once[1])));
+        d.set("height_once", Json::list().add(num(q.height_once[0])).add(num(q.height_once[1]))).set("column_scale", num(q.column_scale));
         d.set("rotation", Json::list().add(num(q.rotation[0])).add(num(q.rotation[1])).add(num(q.rotation[2])));
         scans.add(d);
     }

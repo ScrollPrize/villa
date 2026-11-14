@@ -79,7 +79,7 @@ struct Planned {
 // ideal position (X, Y) = (c + Eu(c, v), v + Ev(c, v)), Eu and Ev the detector's map (helirec/geometry.hpp; the
 // same for every scan on the detector, none unless Parameters::map has terms). Scan k records the ray at the ideal
 // position
-//     X = axis_k + axis_slope_k (H - H_mid_k) + A(2 th) + u + roll (Y - middle row),        u = s + d_k . (cos th, sin th)
+//     X = axis_k + axis_slope_k (H - H_mid_k) + A(2 th) + u + roll (Y - middle row),        u (1 + column_scale_k) = s + d_k . (cos th, sin th)
 //     Y = z + height_k + stretch height + (1 + axial_scale_k) H + B(th) - roll u
 // with th and H the record's angle and height [rows] at the time the row was exposed: row v of frame f at the time
 // of frame f + row_time (v - middle row). A and B are what the rotation stage does within a turn, the same for
@@ -223,7 +223,7 @@ struct PlanCounts {
 std::vector<Planned> plan(const Acquisition& acq, const PlanCounts& counts = {});
 
 // The model's unknowns. The names the solver knows them by: "roll", "pitch", "row_time", "stage.height_once_cos", "stage.height_once_sin",
-// "stage.axis_twice_cos", "stage.axis_twice_sin", "scan<k>.axis", "scan<k>.axis_slope", "scan<k>.axial_scale",
+// "stage.axis_twice_cos", "stage.axis_twice_sin", "scan<k>.axis", "scan<k>.axis_slope", "scan<k>.axial_scale", "scan<k>.column_scale",
 // "scan<k>.d0", "scan<k>.d1", "scan<k>.height", "scan<k>.tilt_x", "scan<k>.tilt_y", "scan<k>.spin",
 // "scan<k>.height_once_cos", "scan<k>.height_once_sin",
 // "scan<k>.<stretch name>.height", and per term of the map "map.eu.i<i>j<j>", "map.ev.i<i>j<j>". A name's
@@ -232,6 +232,13 @@ struct ScanParameters {
     double axis = 0;         // the axis column at the middle row, at the height H_mid
     double axis_slope = 0;   // columns the axis moves per row of the axis stage's travel
     double axial_scale = 0;  // the sample travels (1 + axial_scale) rows per row of the record
+    // The scale of this scan's image across the beam against the anchor's: what the scan records u columns from its
+    // rotation axis lies u (1 + column_scale) from the axis, so its image is smaller by column_scale. A scan's own
+    // opposite views do not see it (their two sightings lie at u and -u); its comparisons with another scan do, and
+    // so do lens patches of a scan reconstructed without it. Held unless freed by name; one scale for every scan is
+    // a dilation of the places, so the anchor's stays at nothing. The reconstruction takes it in the scan's poses
+    // (Poses::col_scale about the axis column). Paris4's tiles: it grows with the order of acquisition, to 3e-4.
+    double column_scale = 0;
     double d[2] = {0, 0};    // where the sample's origin sits on the rotation stage [px]
     double height = 0;       // rows
     // (cos, sin) [rows]: the height once per turn that the scan's own views show beyond the stage's (the model's
@@ -350,7 +357,7 @@ struct GeometryOptions {
     // every stretch that is not a helix, of every scan but the anchor its d and height, and of every scan that
     // sits elsewhere on the rotation stage than the anchor (a mosaic's tile) its height_once. Held unless freed:
     // the anchor's d, height and height_once, the height_once of a scan at the anchor's place, the helix' height,
-    // the map, the rows' timing. A scan's rotation is free if lens patches name the scan and it is not the anchor. The pitch is free
+    // the map, the rows' timing, every scan's column_scale. A scan's rotation is free if lens patches name the scan and it is not the anchor. The pitch is free
     // if two scans at different places on the rotation stage are compared at equal angle. Where no comparison is
     // given (lens patches alone), only places and rotations are free.
     // A stage of the calibration is these two lists (names or their beginnings, as above; `held` wins).

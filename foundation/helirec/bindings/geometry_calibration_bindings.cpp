@@ -113,7 +113,7 @@ gc::Parameters parameters_of(const gc::Acquisition& acq, const std::string& text
         const Json& sj = scans.array[k];
         gc::ScanParameters& q = p.scans[k];
         q.axis = number(sj, "axis", 0.0), q.axis_slope = number(sj, "axis_slope", 0.0), q.axial_scale = number(sj, "axial_scale", 0.0);
-        q.height = number(sj, "height", 0.0);
+        q.height = number(sj, "height", 0.0), q.column_scale = number(sj, "column_scale", 0.0);
         if (const Json* d = sj.find("d"))
             for (std::size_t i = 0; i < 2 && i < d->array.size(); ++i) q.d[i] = d->array[i].number;
         if (const Json* d = sj.find("height_once"))
