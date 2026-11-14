@@ -19,7 +19,7 @@ SURFACE_MASK_MAX_DISTANCE_LEVEL0_VOXELS = 10.0
 # are -t(1-t)^2/2 and -t^2(1-t)/2, which sum to t(1-t)/2 <= 1/8, so in 2D the
 # negative weights sum to at most 1/8 + 1/8 + 2/64. An interpolated coordinate
 # therefore lies within this fraction of the 16 points' range of their extremes.
-# One-sided derivatives at borders and holes (vc_reader's smooth patches) are at
+# One-sided derivatives at borders and holes (vc_reader's bicubic patches) are at
 # most twice as large, so the bound doubles.
 SMOOTH_PATCH_NEGATIVE_WEIGHT = 0.5625
 
