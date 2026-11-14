@@ -691,6 +691,13 @@ foreach(_dir IN LISTS _vc_install_dirs)
     get_property(_dir_targets DIRECTORY "${_dir}"
                  PROPERTY BUILDSYSTEM_TARGETS)
     foreach(_tgt IN LISTS _dir_targets)
+        # A target left out of the default build (EXCLUDE_FROM_ALL, e.g. a
+        # benchmark) is not built before packaging: installing it would make
+        # cpack fail on the missing file.
+        get_target_property(_tgt_excluded ${_tgt} EXCLUDE_FROM_ALL)
+        if(_tgt_excluded)
+            continue()
+        endif()
         get_target_property(_tgt_type ${_tgt} TYPE)
         if(_tgt_type STREQUAL "EXECUTABLE" OR _tgt_type STREQUAL "SHARED_LIBRARY")
             if(WIN32)
