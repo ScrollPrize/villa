@@ -140,6 +140,7 @@ private slots:
     void toggleConsoleOutput();
     void toggleDrawBBox(bool enabled);
     void toggleCursorMirroring(bool enabled);
+    void applyMeasurementOverlays();
     void surfaceFromSelection();
     void clearSelection();
     void beginRotateSurfaceTransform();
@@ -205,6 +206,7 @@ private:
     QMenu* _selectionMenu{nullptr};
     QMenu* _helpMenu{nullptr};
     QMenu* _recentMenu{nullptr};
+    QMenu* _measurementMenu{nullptr};
     QMenu* _storesMenu{nullptr};
 
     QAction* _newProjectAct{nullptr};
@@ -228,6 +230,10 @@ private:
     QAction* _showConsoleAct{nullptr};
     QAction* _drawBBoxAct{nullptr};
     QAction* _mirrorCursorAct{nullptr};
+    QAction* _hudHistogramAct{nullptr};
+    QAction* _hudLineProfileAct{nullptr};
+    QAction* _hudGridAct{nullptr};
+    QAction* _hudLoupeAct{nullptr};
     QAction* _surfaceFromSelectionAct{nullptr};
     QAction* _selectionClearAct{nullptr};
     QAction* _rotateSurfaceAct{nullptr};
