@@ -1,6 +1,6 @@
-"""Host-RAM offload of fit_spiral's lasagna resident brick pools (routeb_offload_2026-11-07; docs/experiments/routeb_offload_2026-11-07/README.md).
+"""Host-RAM offload of fit_spiral's lasagna resident brick pools (see POOL_OFFLOAD.md).
 
-FIT_SPIRAL_POOL_OFFLOAD=1 (default OFF): sparse_cuda_cache.ResidentBrickPool is replaced, at import time, by OffloadBrickPool.
+FIT_SPIRAL_POOL_OFFLOAD=1 (default OFF): lasagna_data builds its brick pools with OffloadBrickPool instead of ResidentBrickPool (sparse_cuda_cache.resident_brick_pool_class()).
 - The brick table, the index arithmetic and the output stay ON THE CARD, exactly as in ResidentBrickPool.gather.
 - The uint8 pool (channels x bricks x 32^3) lives in host RAM that is page-locked and mapped into the card's address space
   (cuMemHostRegister DEVICEMAP).
@@ -31,15 +31,14 @@ _MODS = {}
 
 def _module(dev_index):
     if dev_index not in _MODS:
-        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-        from cuda_rt import Module
+        from host_pool_cuda import Module
         _MODS[dev_index] = Module(_KSRC, device=dev_index)
     return _MODS[dev_index]
 
 
 def _register(arr, dev_index):
     """page-lock + map a numpy array; returns its device pointer (int)"""
-    from cuda_rt import _libs, _chk
+    from host_pool_cuda import _libs, _chk
     _, cuda = _libs(); torch.cuda.set_device(dev_index); torch.zeros(1, device=f"cuda:{dev_index}")
     p = ctypes.c_void_p(arr.ctypes.data)
     _chk(cuda.cuMemHostRegister_v2(p, ctypes.c_size_t(arr.nbytes), ctypes.c_uint(0x02)), "cuMemHostRegister(DEVICEMAP)")
@@ -48,8 +47,8 @@ def _register(arr, dev_index):
     return int(dptr.value)
 
 
-def install(scc):
-    """replace scc.ResidentBrickPool (scc = the imported sparse_cuda_cache module)"""
+def offload_class(scc):
+    """The host-RAM subclass of scc.ResidentBrickPool (scc = the sparse_cuda_cache module); see sparse_cuda_cache.resident_brick_pool_class()."""
     Base = scc.ResidentBrickPool
     open_pool = scc.open_pool
     min_gib = float(os.environ.get("FIT_SPIRAL_POOL_OFFLOAD_MIN_GIB", "0"))
@@ -135,12 +134,11 @@ def install(scc):
         def close(self):
             if getattr(self, "_offloaded", False) and getattr(self, "host_pool", None) is not None:
                 try:
-                    from cuda_rt import _libs
+                    from host_pool_cuda import _libs
                     _libs()[1].cuMemHostUnregister(ctypes.c_void_p(self.host_pool.ctypes.data))
                 except Exception: pass
                 self.host_pool = None
             self.pool = None; self.table = None
 
-    scc.ResidentBrickPool = OffloadBrickPool
-    print(f"rb_offload: sparse_cuda_cache.ResidentBrickPool -> OffloadBrickPool (pools >= {min_gib} GiB in mapped host RAM)", flush=True)
+    print(f"brick_pool_offload: lasagna brick pools of at least {min_gib} GiB go to mapped host RAM (FIT_SPIRAL_POOL_OFFLOAD=1)", flush=True)
     return OffloadBrickPool

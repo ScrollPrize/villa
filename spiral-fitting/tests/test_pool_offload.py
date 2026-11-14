@@ -14,8 +14,8 @@ if not torch.cuda.is_available():
     pytest.skip("pool offload needs a CUDA device", allow_module_level=True)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(os.path.dirname(HERE), "pool_offload"))
-import rb_offload                                      # noqa: E402
+sys.path.insert(0, os.path.dirname(HERE))
+import brick_pool_offload                              # noqa: E402
 import sparse_cuda_cache as scc                       # noqa: E402
 from pack_resident_pools import pack_arrays   # noqa: E402
 
@@ -41,7 +41,7 @@ def sidecar(tmp_path_factory):
 def pools(sidecar):
     out = sidecar[0]
     Base = scc.ResidentBrickPool
-    Off = rb_offload.install(scc)
+    Off = brick_pool_offload.offload_class(scc)
     return Base(out, device="cuda", label="resident"), Off(out, device="cuda", label="offload")
 
 
@@ -79,3 +79,11 @@ def test_empty_gather_and_pool_lives_in_host_memory(pools):
     free0, _ = torch.cuda.mem_get_info()
     assert getattr(offload, "pool_bytes", 0) > 0
     assert not (isinstance(getattr(offload, "pool", None), torch.Tensor) and offload.pool.is_cuda), "pool bytes are on the card"
+
+
+def test_factory_default_is_resident_and_env_selects_offload(monkeypatch):
+    monkeypatch.delenv("FIT_SPIRAL_POOL_OFFLOAD", raising=False)
+    assert scc.resident_brick_pool_class() is scc.ResidentBrickPool
+    monkeypatch.setenv("FIT_SPIRAL_POOL_OFFLOAD", "1")
+    cls = scc.resident_brick_pool_class()
+    assert cls is not scc.ResidentBrickPool and issubclass(cls, scc.ResidentBrickPool)
