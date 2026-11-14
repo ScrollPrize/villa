@@ -31,6 +31,11 @@ allows `cuMemHostRegister` (the pool maps its page-locked memory into the card's
   with this branch's `fit_spiral.py`, because the current upstream fitter needs the object-store input format.
 * **This branch's code** is tested with `tests/test_pool_offload.py` (bit-identical gather versus the resident pool, factory selection;
   4 passed, 1 skipped, run on the hub with a V100 visible). The hand-ported freeze policy and the in-tree offload are the same logic as the hook versions.
+* **Upstream test suite on this branch** (2026-11-14, hub, CPU only, `tests/` without `test_interactive_e2e.py` and without
+  `test_mps_track_sampling.py`, which cannot be collected on upstream `main` either: it imports `load_tracks_from_dbm`, which `tracks.py` lacks):
+  1062 passed, 90 skipped, 2 failed in 126 s. The two failures (`test_service_commits.py::test_only_a_preview_of_this_session_is_committed`,
+  `test_service_object_store.py::test_clients_cannot_choose_the_binding_or_host_input_paths`) fail identically on unmodified upstream `main`
+  (`2d3fb38d3`, same environment), so they are not caused by this branch; whether they depend on this machine is not established.
 * **Export guard** (`FIT_SPIRAL_EXPORT_FREE`): one end-to-end observation. A 16-voxel fit of one scroll that had finished all 30,000 iterations
   failed twice in `save_mesh` (torch.cat of 1.79 GiB with 1.42 GiB, then 362 MiB, free). With the guard on, allocated memory before the export dropped
   from 21.73 to 16.78 GiB and the export wrote 500 of 500 windings (480 tifxyz folders, 3.6 GB) on the same shared card. One scroll, one run, on the
