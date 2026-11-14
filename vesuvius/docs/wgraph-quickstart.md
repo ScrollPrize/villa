@@ -4,10 +4,13 @@ Use `vc_wgraph` to run each stage separately. In a configured development enviro
 
 ## Stages and commands
 
-Run these in order, using a workflow profile such as `settings.json`:
+Choose one input option, then run the shared stages in order using a workflow profile such as `settings.json`:
 
 ```sh
+# Option A: import an AFV source into fibers.vcobj.
 vc_wgraph import settings.json -i input.afv -o fibers.vcobj
+# Option B: skip import and use the neural tracer's existing fibers.vcobj.
+# On the next line, replace fibers.vcobj with tracing-output/fibers.vcobj.
 vc_wgraph extract settings.json -i fibers.vcobj -o constraints.vcobj
 vc_wgraph hvb settings.json -i constraints.vcobj -o classes.vcobj
 vc_wgraph sign settings.json -i classes.vcobj -o signs.vcobj
@@ -43,14 +46,10 @@ The two tracer adapters are Python modules under `vesuvius.neural_tracing.fiber_
 
 ### Neural tracer vcobj workflow (skip import)
 
-The neural full-volume tracer's native `fibers.vcobj` is already the fiber geometry store. Start at extraction, then use the same downstream commands:
+The neural full-volume tracer's native `fibers.vcobj` is already the fiber geometry store. Select option B above by changing only the extraction input:
 
 ```sh
 vc_wgraph extract settings.json -i tracing-output/fibers.vcobj -o constraints.vcobj
-vc_wgraph hvb settings.json -i constraints.vcobj -o classes.vcobj
-vc_wgraph sign settings.json -i classes.vcobj -o signs.vcobj
-vc_wgraph winding settings.json -i signs.vcobj -o windings.vcobj
-vc_wgraph uv settings.json -i windings.vcobj -o uv.vcobj
 ```
 
 This does not change the tracer output or run AFV import. The source may be sealed, or unsealed with history enabled. Extraction captures one coherent source publication and publishes its actual consumed pin. Later source commits do not alter the derived result: downstream reads resolve the retained older metadata, geometry and membership. Missing required history fails explicitly. Parallel geometry loading still rejects mixed source publications during capture; it never combines old and new fibers. Unsealed history-off sources are rejected because their consumed versions are not retained. History-enabled scopes use checked geometry reads rather than the history-off trusted fast path.
