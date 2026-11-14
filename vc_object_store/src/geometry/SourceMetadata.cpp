@@ -6,7 +6,11 @@ namespace vc::objects::detail {
 using Json = nlohmann::json;
 Json nativeMetadata(const StoreReader& reader, const ObjectRecord& object, const GeometryRevision& revision, const std::vector<ObjectVersion>& selection)
 {
-    const auto metadata = Json::parse(object.meta);
+    auto metadata = Json::parse(object.meta);
+    // Store-mode tools (vc_grow_seg_from_seed, ...) record "source" as their
+    // name, as in a tifxyz meta.json; export it there instead of failing.
+    if (const auto source = metadata.find("source"); source != metadata.end() && !source->is_object())
+        *source = source->is_string() ? Json{{"source", *source}} : Json::object();
     auto result = geometryTransferMetadata(metadata);
     if (object.kind == "surface") result["scale"] = Json::parse(revision.attributes).at("scale");
     result.erase("origin");
