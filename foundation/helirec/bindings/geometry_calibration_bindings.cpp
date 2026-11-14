@@ -97,6 +97,7 @@ gc::Parameters parameters_of(const gc::Acquisition& acq, const std::string& text
     const Json j = Json::parse(text);
     p.roll = number(j, "roll", 0.0);
     p.pitch = number(j, "pitch", 0.0);
+    p.row_time = number(j, "row_time", std::nan(""));
     p.about_height = number(j, "about_height", 0.0);
     if (const Json* map = j.find("map"); map && map->is(Json::Object)) p.map = map_of(*map);
     if (const Json* st = j.find("stage")) {

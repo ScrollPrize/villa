@@ -90,6 +90,7 @@ GeometryReport report(const Acquisition& acq, const GeometrySolution& solution, 
     if (solution.parameters.scans.size() != acq.scans.size()) throw Error("geometry: the solution and the acquisition differ in their scans");
     GeometryReport out;
     out.neighbours = neighbours(acq);
+    const double row_time = row_time_of(acq, solution.parameters);  // the rows' timing the solution was solved under
     const int S = static_cast<int>(acq.scans.size());
     out.scans.resize(static_cast<std::size_t>(S));
     std::vector<double> axes, slopes, scales;
@@ -123,7 +124,7 @@ GeometryReport report(const Acquisition& acq, const GeometrySolution& solution, 
                 if (!(c.opposite && c.a.scan == k && c.b.scan == k && c.a.stretch == r.stretch && c.b.stretch == r.stretch)) continue;
                 th.push_back(ray_of(acq, solution.parameters, c.a).angle_deg * (kPi / 180.0));
                 for (int j = 0; j < 3; ++j) res[j].push_back(solution.residual[i][static_cast<std::size_t>(j)]);
-                between.push_back(model::at_frame(departure, exposure_frame(acq, c.b)) - model::at_frame(departure, exposure_frame(acq, c.a)));
+                between.push_back(model::at_frame(departure, exposure_frame(acq, row_time, c.b)) - model::at_frame(departure, exposure_frame(acq, row_time, c.a)));
                 const double rows = c.b.row - c.a.row;
                 apart.push_back(rows);
                 if (std::fabs(rows) >= 16) timing.push_back(solution.residual[i][0] / rows);
@@ -139,7 +140,7 @@ GeometryReport report(const Acquisition& acq, const GeometrySolution& solution, 
                 r.left[j] = rms_of(left);
             }
             r.rows_apart = median_of(apart);
-            if (timing.size() >= 8) r.row_time = acq.row_time - median_of(timing);
+            if (timing.size() >= 8) r.row_time = row_time - median_of(timing);
             // whose the record's departure from the line is: the rows left against its difference between the views
             if (std::isfinite(r.departure)) {
                 r.departure_between_views = sd_of(between);

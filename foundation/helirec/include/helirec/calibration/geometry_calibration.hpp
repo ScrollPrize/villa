@@ -222,7 +222,7 @@ struct PlanCounts {
 };
 std::vector<Planned> plan(const Acquisition& acq, const PlanCounts& counts = {});
 
-// The model's unknowns. The names the solver knows them by: "roll", "pitch", "stage.height_once_cos", "stage.height_once_sin",
+// The model's unknowns. The names the solver knows them by: "roll", "pitch", "row_time", "stage.height_once_cos", "stage.height_once_sin",
 // "stage.axis_twice_cos", "stage.axis_twice_sin", "scan<k>.axis", "scan<k>.axis_slope", "scan<k>.axial_scale",
 // "scan<k>.d0", "scan<k>.d1", "scan<k>.height", "scan<k>.tilt_x", "scan<k>.tilt_y", "scan<k>.spin",
 // "scan<k>.height_once_cos", "scan<k>.height_once_sin",
@@ -253,6 +253,15 @@ struct Parameters {
     // of the rotation axis towards the beam [rad]: a ray climbs by it per pixel of depth. Scans at different places
     // on the rotation stage, compared at equal angle, give it; nothing else does (the model's note, above).
     double pitch = 0;
+    // The rows' timing [frames per stored row, signed]: row v of a frame is exposed row_time (v - middle row) frames
+    // after the frame's own time. NaN: the acquisition's (Acquisition::row_time: typed, or from a refill), and a
+    // solution holds the value it was solved under. It is held unless freed by name ("row_time"). What gives it:
+    // scans at different places on the rotation stage. The column offset of two such scans at one angle,
+    // (d_k - d_j) . (cos th, sin th), is of the angle at which each row was exposed, so it is sheared along the rows
+    // by the timing; and a scan at d whose opposite views lie rows apart sees them that much off half a turn, a
+    // sinusoid of |d| x that angle in their columns. In one scan's own views about its own axis it is all but one
+    // with the axial scale (GeometrySolution::correlated lists the two: -0.99998 on a synthetic helix).
+    double row_time = std::nan("");
     StageParameters stage;
     // The detector's map (geometry::empty_map gives its terms). No terms: none. Eu's line in the column is a
     // scale of the columns, which nothing tells from the pixel size: it stays what it is given as.
@@ -269,8 +278,10 @@ struct Sighting {
     int scan = 0, stretch = 0;  // stretch: index into ScanLayout::stretches
     double frame = 0, row = 0, col = 0;
 };
-// the frame at whose time the sighting's row was exposed: the rows' timing counts from the middle row
-inline double exposure_frame(const Acquisition& acq, const Sighting& g) { return g.frame + acq.row_time * (g.row - (acq.rows - 1) / 2.0); }
+// the frame at whose time the sighting's row was exposed under a rows' timing [frames per row], which counts from
+// the middle row; and the rows' timing the parameters hold, or the acquisition's where they hold none
+inline double exposure_frame(const Acquisition& acq, double row_time, const Sighting& g) { return g.frame + row_time * (g.row - (acq.rows - 1) / 2.0); }
+inline double row_time_of(const Acquisition& acq, const Parameters& p) { return std::isfinite(p.row_time) ? p.row_time : acq.row_time; }
 struct Comparison {
     std::string kind;       // "opposite", "turn", "resthelix", "pair", "tiles", "tiles_opposite": what the report groups by
     Sighting a, b;
@@ -339,7 +350,7 @@ struct GeometryOptions {
     // every stretch that is not a helix, of every scan but the anchor its d and height, and of every scan that
     // sits elsewhere on the rotation stage than the anchor (a mosaic's tile) its height_once. Held unless freed:
     // the anchor's d, height and height_once, the height_once of a scan at the anchor's place, the helix' height,
-    // the map. A scan's rotation is free if lens patches name the scan and it is not the anchor. The pitch is free
+    // the map, the rows' timing. A scan's rotation is free if lens patches name the scan and it is not the anchor. The pitch is free
     // if two scans at different places on the rotation stage are compared at equal angle. Where no comparison is
     // given (lens patches alone), only places and rotations are free.
     // A stage of the calibration is these two lists (names or their beginnings, as above; `held` wins).
@@ -413,7 +424,7 @@ struct ScanReport {
     double mean[3], once[3][2], twice[3][2], left[3];
     // The rows' timing these views would give [frames per stored row]: their two blocks lie rows_apart rows from
     // each other (half a turn's travel), so the same lines were exposed that many rows' time further apart than
-    // half a turn, and the frames the registration finds them at say it: the acquisition's row_time less the median
+    // half a turn, and the frames the registration finds them at say it: the solution's rows' timing less the median
     // of (frames left / rows between the two views). It stands only where a fraction of a frame is measured on
     // content as deep as the sample (registration.hpp samples the frames; content far from the axis crosses
     // several columns per frame).

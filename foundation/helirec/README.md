@@ -1134,11 +1134,15 @@ parameters only. Paris4's seven tiles on disk (3 of 25 turns each; `--order 0 --
 18 s: 6944 patches from 868 blocks measured in 168 s, 38 unknowns; the rows are left at 0.38 to 0.41 rms and the
 columns at 0.36 to 0.47 px, which belong to the frame position and not to a place on the detector.
 
-Paris4's rows' timing is not in its record and is taken as zero. What the data say of it: the frames of each
-tile's opposite views lie 0.20 to 0.24 frames from half a turn, -2.2 to -2.9 us per stored row (0.36 to 0.47 of the
-frame period from the first row to the last), and the dips of the one refill on disk gave -3.9 us. Unapplied, that
-is a turn of 0.9 to 1.6 px at the edge of a tile's disc between the first and the last row, which shows where two
-tiles' reconstructions overlap as a displacement in the plane that is a sawtooth along the height.
+Paris4's rows' timing is not in its record, so it is typed: `--row-time-us -3.5` (the value a mosaic's tiles
+compared with each other give, below; the step itself solves a mosaic's tiles one by one and does not find it).
+What else the data say of it: the frames of each tile's opposite views lie 0.20 to 0.24 frames from half a turn,
+-2.2 to -2.9 us per stored row (0.36 to 0.47 of the frame period from the first row to the last; such a reading is
+low by up to a seventh), the dips of the one refill on disk gave -3.9 us, and with the rows' timing freed in a
+solve of the tile pairs (`"row_time"`) it is -3.34 us. Left at zero, that is a turn of 0.9 to 1.6 px at the edge
+of a tile's disc between the first and the last row. Where two tiles' reconstructions overlap, an error of one
+microsecond moves the one against the other by 0.06 px in the plane, as a sinusoid of half a turn's travel along
+the height (measured by reconstructing every tile with the timing changed), so the overlaps do not measure it.
 
 **At a reduced resolution** (`--reduce 1 | 2`, `calibrate_geometry(..., reduce=, projections=)`). The step runs on
 the frames read at a half or a quarter: from their own JPEG 2000 resolutions, or with `--projections STORE.zarr`
@@ -1237,6 +1241,13 @@ model has no term for (0.09 to 0.17 slices rms along the axis).
   registered): of one scan they have the scan's `height_once`, of two scans their rows are left out of the solve
   and reported (their columns are fitted). `report` gives, per pair of scans and kind, what is left of frames, rows
   and columns as an rms, a median and a once per turn of the angle (`pairs`).
+* The rows' timing as an unknown (`Parameters::row_time`, `"row_time"`, frames per stored row): typed or from a
+  refill (`Acquisition::row_time`) and held unless freed by name. Scans at different places on the rotation stage
+  give it: the column offset of two tiles at one angle, `(d_k - d_j) . (cos th, sin th)`, is of the angle at which
+  each row was exposed, so it is sheared along the rows by the timing, and a tile at `d` sees its own opposite
+  views, which lie half a turn's travel of rows apart, that much off half a turn (a sinusoid of `|d|` x that angle
+  in their columns). One scan about its own axis hardly tells it from its axial scale (`correlated` lists the
+  two, -0.99998 on a synthetic helix). A solution holds the timing it was solved under, and `residuals`, `rays` and `report` use it.
 * `GeometrySolution::correlated` lists the pairs of free unknowns whose estimates are correlated by more than 0.9
   (from the Jacobian at the solution): the rank check passes them, and only their combination is known. One
   short lens far from the sample's origin gives a tile's spin with its place; a mosaic's lenses give none.
@@ -1313,7 +1324,7 @@ taken off by iteration, the direction the model does not have), which is what fi
 the line through its point, a solve finds the parameters again (a scan alone; a pair moved sideways with the
 detector's map; three tiles about an axis pitched towards the beam, whose own views give the pitch and an axial
 scale free of it; three tiles compared with each other at equal angle and half a turn apart, which give the pitch,
-their places and, turned against each other, their tilts), dependent unknowns are refused, the plan of two tiles
+their places and, turned against each other, their tilts, and from a start at zero the rows' timing), dependent unknowns are refused, the plan of two tiles
 follows their places onto both detectors, the plan stays inside the strip for a helix alone with its axis at
 the detector's edge and covers the columns two scans share, a pixel put through the poses the reconstruction
 reads from a joint calibration is the ray the model gives it, and the report tells a recorded height that is the

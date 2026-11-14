@@ -172,6 +172,8 @@ def _parameters_text(p):
     out = dict(roll=p.get("roll", 0.0), pitch=p.get("pitch", 0.0), stage=p.get("stage", {}), about_height=p.get("about_height", 0.0), scans=p["scans"])  # (a scan's height_once and rotation with it)
     if p.get("map") and len(p["map"].get("i", ())):
         out["map"] = {k: (v.tolist() if hasattr(v, "tolist") else v) for k, v in p["map"].items()}
+    if isinstance(p.get("row_time"), (int, float)):   # frames per row (a solution's); without it, the acquisition's
+        out["row_time"] = float(p["row_time"])
     return json.dumps(out, default=float)
 
 
@@ -249,7 +251,11 @@ def solve_geometry(acquisition_, comparisons, start=None, huber=0.03, max_iterat
     rotation axis' lean towards the beam; in comparisons of two scans at one angle) is free where such comparisons
     join scans at different places on the rotation stage. A scan's tilt_x, tilt_y are in comparisons of two scans
     too (the part about the beam's direction) and free there only by name; the spin is not in them. The rows of
-    two scans' opposite views ("tiles_opposite") are not fitted, their columns are.
+    two scans' opposite views ("tiles_opposite") are not fitted, their columns are. "row_time" (the rows' timing in
+    frames per row: `start`'s, else the acquisition's) is held unless freed by name; scans at different places on
+    the rotation stage give it (their column offset at one angle is sheared along the rows by it, and a scan off
+    the origin sees its own opposite views that much off half a turn); one scan about its own axis hardly tells it
+    from its axial scale ("correlated" lists the two).
 
     lens: lens patches, the other kind of measurement: two scans' reconstructions of one place of the sample
     registered in 3D. Dicts with scan_a, scan_b, p (the place of the sample: x, y from its origin, z its height),
@@ -259,7 +265,7 @@ def solve_geometry(acquisition_, comparisons, start=None, huber=0.03, max_iterat
     spin) is free where lens patches name the scan and it is not the anchor. lens_huber: the Huber scale of a lens
     patch's residual, in sigmas.
 
-    Returns the solution (roll, pitch, stage, about_height, scans, map, free, unused, correlated, solver, left) with
+    Returns the solution (roll, pitch, row_time, stage, about_height, scans, map, free, unused, correlated, solver, left) with
     "residual": (n, 3) frames, rows, columns, and "lens_residual": (n, 3) x, y, z. "correlated" lists pairs of free
     unknowns the measurements hardly tell apart (correlation above 0.9 in size). It is an error if the free
     unknowns depend on each other.

@@ -859,6 +859,7 @@ void to_stored_pixels(Acquisition& acq, GeometrySolution& solution, GeometryRepo
     for (double& v : p.stage.axis_twice) v *= F;
     p.map.c0 *= F, p.map.cs *= F, p.map.v0 *= F, p.map.vs *= F;
     p.about_height *= F;
+    p.row_time /= F;
     for (double& v : p.map.eu) v *= F;
     for (double& v : p.map.ev) v *= F;
     for (ScanParameters& q : p.scans) {

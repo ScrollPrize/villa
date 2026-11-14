@@ -773,6 +773,45 @@ def test_tiles_at_equal_angle_give_the_pitch():
     assert "scan1.height" in mirrored["unused"]                                    # (their rows say nothing: no height either)
 
 
+def test_tiles_give_the_rows_timing():
+    """Three tiles on a detector whose rows are exposed one after the other, the timing not known. Two tiles at one
+    angle lie (d_k - d_j) . (cos th, sin th) columns apart, th the angle at which the row was exposed: their offset
+    is sheared along the rows by the timing. And a tile at d sees its own opposite views, which lie rows apart,
+    that much off half a turn. Freed by name, the rows' timing comes back from zero with the places; held at zero,
+    the columns are left with it. One scan about its own axis hardly tells it from its axial scale: the two are
+    listed as correlated."""
+    rng = np.random.default_rng(33)
+    timing = TRUTH["row_time"]
+    places = [(0.0, 0.0), (330.0, 60.0), (-150.0, 290.0)]
+    shared = {k: TRUTH[k] for k in ("roll", "height_once", "axis_twice")}
+    scans = [Scan([("helix", 3 * PER_TURN)], index=k, axis=TRUTH["axis"] - 0.2 * k, axial_scale=TRUTH["axial_scale"] + 1e-4 * k, d=d, height=1.5 * k, moved=k > 0, row_time=timing, **shared)
+             for k, d in enumerate(places)]
+    unknown = G.acquisition(dict(rows=ROWS, cols=COLS, row_time=0.0, scans=[sc.layout() for sc in scans]))
+    own = [c for sc in scans for c in _helix_comparisons(rng, sc, 0, 500, 0.004) if c["kind"] == "opposite"]
+    comparisons = own + _tile_comparisons(rng, scans, [(0, 1), (0, 2), (1, 2)], 400)
+    start = dict(roll=0.0, scans=[dict(axis=TRUTH["axis"] + 0.5, d=[d[0] + 2.0 * (k > 0), d[1] - 1.5 * (k > 0)]) for k, d in enumerate(places)])
+    held = G.solve_geometry(unknown, comparisons, start=start)
+    assert "row_time" not in held["free"] and held["row_time"] == 0.0             # held unless freed: the acquisition's
+    got = G.solve_geometry(unknown, comparisons, start=start, freed=["row_time"])
+    assert "row_time" in got["free"] and got["solver"]["rank"] == len(got["free"]) == len(held["free"]) + 1
+    assert got["row_time"] == pytest.approx(timing, rel=0.01)
+    for k, (s, d) in enumerate(zip(got["scans"], places)):
+        assert s["d"] == pytest.approx(list(d), abs=0.01) and s["height"] == pytest.approx(1.5 * k, abs=0.05), k
+        assert s["axis"] == pytest.approx(TRUTH["axis"] - 0.2 * k, abs=5e-3) and s["axial_scale"] == pytest.approx(TRUTH["axial_scale"] + 1e-4 * k, abs=4e-5)
+    columns = lambda sol: float(np.sqrt(np.mean(sol["residual"][:, 2] ** 2)))
+    assert columns(got) < 0.01 < 0.05 < columns(held)                             # to the noise; without it, the timing x the tiles' distance
+    # the residuals and the rays are those of the timing the parameters hold, whatever the acquisition's
+    assert np.allclose(G.residuals(unknown, got, comparisons), got["residual"])
+    known = G.acquisition(dict(rows=ROWS, cols=COLS, row_time=timing, scans=[sc.layout() for sc in scans]))
+    typed = G.solve_geometry(known, comparisons, start=start)
+    assert typed["row_time"] == timing and typed["scans"][1]["d"] == pytest.approx(got["scans"][1]["d"], abs=5e-3)
+    # one tile's own views alone, about its own axis (no place): the timing moves their rows as the axial scale
+    # does, and the solve says that only the two together are known
+    alone = G.solve_geometry(unknown, [c for c in own if c["a"][0] == 0], start=start, freed=["row_time"], held=["scan1", "scan2"])
+    assert any({a, b} == {"row_time", "scan0.axial_scale"} and abs(r) > 0.999 for a, b, r in alone["correlated"])
+    assert not any("row_time" in (a, b) for a, b, r in got["correlated"])
+
+
 def test_tiles_in_projections_give_their_tilts():
     """Three tiles that hold the sample turned against each other, compared in projections. A projection holds of a
     rotation what is the same at every depth: the tilt's part about the beam's direction moves the columns by it x

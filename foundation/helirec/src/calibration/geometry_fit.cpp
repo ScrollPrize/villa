@@ -29,20 +29,24 @@ const StretchLayout& stretch_of(const Acquisition& acq, const Sighting& g) {
 
 double mid_row(const Acquisition& acq) { return (acq.rows - 1) / 2.0; }
 
-double time_of(const Acquisition& acq, const Sighting& g) { return exposure_frame(acq, g); }
+double time_of(const Acquisition& acq, double row_time, const Sighting& g) { return exposure_frame(acq, row_time, g); }
 
-model::At at_of(const Acquisition& acq, const Sighting& g) {
+// the record at a sighting under a rows' timing, and what a change of that timing moves it by (model::now)
+model::At at_of(const Acquisition& acq, double row_time, const Sighting& g) {
     const StretchLayout& st = stretch_of(acq, g);
-    const double t = time_of(acq, g);
-    return {at_frame(st.course.angle_deg, t) * (kPi / 180.0), at_frame(st.course.rows, t), acq.scans[static_cast<std::size_t>(g.scan)].mid_height, mid_row(acq), (acq.cols - 1) / 2.0, acq.per_depth};
+    const double t = time_of(acq, row_time, g), lever = g.row - mid_row(acq);
+    model::At at{at_frame(st.course.angle_deg, t) * (kPi / 180.0), at_frame(st.course.rows, t), acq.scans[static_cast<std::size_t>(g.scan)].mid_height, mid_row(acq), (acq.cols - 1) / 2.0, acq.per_depth};
+    at.th_per_timing = lever * (at_frame(st.course.angle_deg, t + 0.5) - at_frame(st.course.angle_deg, t - 0.5)) * (kPi / 180.0);
+    at.H_per_timing = lever * (at_frame(st.course.rows, t + 0.5) - at_frame(st.course.rows, t - 0.5));
+    return at;
 }
 
 // the angle [deg] by which the ray recorded at the sighting's column is further on than the stage: the beam
 // diverges, and the ray of a column further on is that of a parallel beam further on in angle
-double fan_angle(const Acquisition& acq, const Sighting& g) {
+double fan_angle(const Acquisition& acq, double row_time, const Sighting& g) {
     if (acq.fan == 0.0) return 0.0;
     const StretchLayout& st = stretch_of(acq, g);
-    const double t = time_of(acq, g);
+    const double t = time_of(acq, row_time, g);
     const double step = at_frame(st.course.angle_deg, t + 0.5) - at_frame(st.course.angle_deg, t - 0.5);
     return acq.fan * std::fabs(step) * (g.col - (acq.cols - 1) / 2.0);
 }
@@ -58,6 +62,7 @@ struct Blocks {
     double detector[1] = {0};
     double stage[4] = {0, 0, 0, 0};
     double pitch[1] = {0};
+    double timing[1] = {0};   // the rows' timing [frames per row]
     geometry::Map shape;      // the map's terms and normalisation
     std::vector<double> map;  // Eu's coefficients, then Ev's (empty: no map)
     std::vector<std::array<double, 3>> own, place;       // per scan
@@ -76,6 +81,7 @@ Blocks blocks_of(const Acquisition& acq, const Parameters& p) {
     b.map.insert(b.map.end(), p.map.ev.begin(), p.map.ev.end());
     b.detector[0] = p.roll;
     b.pitch[0] = p.pitch;
+    b.timing[0] = row_time_of(acq, p);
     b.about_height = p.about_height;
     b.stage[0] = p.stage.height_once[0], b.stage[1] = p.stage.height_once[1], b.stage[2] = p.stage.axis_twice[0], b.stage[3] = p.stage.axis_twice[1];
     for (std::size_t k = 0; k < p.scans.size(); ++k) {
@@ -97,6 +103,7 @@ Parameters parameters_of(const Blocks& b) {
     p.map.ev.assign(b.map.begin() + b.terms(), b.map.end());
     p.roll = b.detector[0];
     p.pitch = b.pitch[0];
+    p.row_time = b.timing[0];
     p.about_height = b.about_height;
     p.stage.height_once[0] = b.stage[0], p.stage.height_once[1] = b.stage[1], p.stage.axis_twice[0] = b.stage[2], p.stage.axis_twice[1] = b.stage[3];
     for (std::size_t k = 0; k < b.own.size(); ++k) {
@@ -128,6 +135,7 @@ std::vector<Slot> slots_of(const Acquisition& acq, Blocks& b, const std::vector<
     std::vector<Slot> out;
     out.push_back({"roll", b.detector, 1, 0, true});
     out.push_back({"pitch", b.pitch, 1, 0, apart});
+    out.push_back({"row_time", b.timing, 1, 0, false});  // typed or from a refill unless freed by name
     const char* stage[4] = {"height_once_cos", "height_once_sin", "axis_twice_cos", "axis_twice_sin"};
     for (int i = 0; i < 4; ++i) out.push_back({std::string("stage.") + stage[i], b.stage, 4, i, true});
     const int nt = b.terms();
@@ -183,8 +191,9 @@ struct SameLines {
     bool opposite = false;
     int at_map = -1;                               // where the residual's parameters hold the map; -1: none
     int at_once = -1;                              // and the scan's height once per turn in its own views; -1: two scans
-    int at_a[4] = {0, 0, 0, 0}, at_b[4] = {0, 0, 0, 0};  // and own, place, stretch, turn of each side (0 is the detector, 1 the stage, 2 the pitch)
+    int at_a[4] = {0, 0, 0, 0}, at_b[4] = {0, 0, 0, 0};  // and own, place, stretch, turn of each side (0 is the detector, 1 the stage, 2 the pitch, 3 the rows' timing)
     double about = 0;                              // the height the scans' rotations are about
+    double timing = 0;                             // the rows' timing a and b were read at [frames per row]
 
     template <class T>
     bool operator()(T const* const* p, T* r) const {
@@ -193,16 +202,18 @@ struct SameLines {
         T xa, ya, xb, yb, sa, za, sb, zb;
         model::ideal_position(map, phi_a.data(), terms, ca, va, xa, ya);
         model::ideal_position(map, phi_b.data(), terms, cb, vb, xb, yb);
-        model::ray_of(p[0], p[1], p[at_a[0]], p[at_a[1]], p[at_a[2]], a, xa, ya, sa, za);
-        model::ray_of(p[0], p[1], p[at_b[0]], p[at_b[1]], p[at_b[2]], b, xb, yb, sb, zb);
+        const T beyond = p[3][0] - timing;  // the rows' timing as it stands, beyond the one the record was read at
+        const model::Now<T> when_a = model::now(a, beyond), when_b = model::now(b, beyond);
+        model::ray_of(p[0], p[1], p[at_a[0]], p[at_a[1]], p[at_a[2]], a, when_a, xa, ya, sa, za);
+        model::ray_of(p[0], p[1], p[at_b[0]], p[at_b[1]], p[at_b[2]], b, when_b, xb, yb, sb, zb);
         if (at_once < 0) {  // two scans: each one's rays as the sample's (a scan's own views do not see its rotation)
-            model::turned_back(p[at_a[3]], a, about, sa, za);
-            model::turned_back(p[at_b[3]], b, about, sb, zb);
+            model::turned_back(p[at_a[3]], when_a, about, sa, za);
+            model::turned_back(p[at_b[3]], when_b, about, sb, zb);
         }
         r[0] = opposite ? sb + sa : sb - sa;
         r[1] = zb - za;
-        if (at_once >= 0) r[1] -= model::own_lift(p[at_once], a, b);
-        else if (!opposite) r[1] -= model::pitch_lift(p[2], p[at_b[1]], b) - model::pitch_lift(p[2], p[at_a[1]], a);
+        if (at_once >= 0) r[1] -= model::own_lift(p[at_once], when_a, when_b);
+        else if (!opposite) r[1] -= model::pitch_lift(p[2], p[at_b[1]], when_b) - model::pitch_lift(p[2], p[at_a[1]], when_a);
         else r[1] = T(0.0);
         return true;
     }
@@ -243,12 +254,14 @@ struct Wiring {
 };
 Wiring wire(const Acquisition& acq, Blocks& b, const Comparison& c) {
     Wiring w;
-    w.f.a = at_of(acq, c.a), w.f.b = at_of(acq, c.b);
+    w.f.timing = b.timing[0];
+    w.f.a = at_of(acq, w.f.timing, c.a), w.f.b = at_of(acq, w.f.timing, c.b);
     w.f.ca = c.a.col, w.f.va = c.a.row, w.f.cb = c.b.col, w.f.vb = c.b.row;
     w.f.opposite = c.opposite;
     w.blocks.push_back(b.detector), w.sizes.push_back(1);
     w.blocks.push_back(b.stage), w.sizes.push_back(4);
     w.blocks.push_back(b.pitch), w.sizes.push_back(1);
+    w.blocks.push_back(b.timing), w.sizes.push_back(1);
     if (const int nt = b.terms()) {
         w.f.phi_a.resize(static_cast<std::size_t>(nt)), w.f.phi_b.resize(static_cast<std::size_t>(nt));
         geometry::map_basis(b.shape, c.a.col, c.a.row, w.f.phi_a.data());
@@ -277,20 +290,22 @@ Wiring wire(const Acquisition& acq, Blocks& b, const Comparison& c) {
 
 std::array<double, 3> residual_of(const Acquisition& acq, const Parameters& p, const Comparison& c) {
     Ray a = ray_of(acq, p, c.a), b = ray_of(acq, p, c.b);
+    const double row_time = row_time_of(acq, p);
+    const model::Now<double> when_a = model::now(at_of(acq, row_time, c.a), 0.0), when_b = model::now(at_of(acq, row_time, c.b), 0.0);
     if (c.a.scan != c.b.scan) {  // two scans: each one's rays as the sample's
-        model::turned_back(p.scans[static_cast<std::size_t>(c.a.scan)].rotation, at_of(acq, c.a), p.about_height, a.s, a.z);
-        model::turned_back(p.scans[static_cast<std::size_t>(c.b.scan)].rotation, at_of(acq, c.b), p.about_height, b.s, b.z);
+        model::turned_back(p.scans[static_cast<std::size_t>(c.a.scan)].rotation, when_a, p.about_height, a.s, a.z);
+        model::turned_back(p.scans[static_cast<std::size_t>(c.b.scan)].rotation, when_b, p.about_height, b.s, b.z);
     }
     const StretchLayout& sb = stretch_of(acq, c.b);
     // B's angle per frame around the sighting
-    const double t = time_of(acq, c.b);
+    const double t = time_of(acq, row_time, c.b);
     const double step = at_frame(sb.course.angle_deg, t + 0.5) - at_frame(sb.course.angle_deg, t - 0.5);
     double dth = b.angle_deg - a.angle_deg - (c.opposite ? 180.0 : 0.0);
     dth -= 360.0 * std::round(dth / 360.0);
     double rows = b.z - a.z;
-    if (c.a.scan == c.b.scan) rows -= model::own_lift(p.scans[static_cast<std::size_t>(c.a.scan)].height_once, at_of(acq, c.a), at_of(acq, c.b));
+    if (c.a.scan == c.b.scan) rows -= model::own_lift(p.scans[static_cast<std::size_t>(c.a.scan)].height_once, when_a, when_b);
     else if (!c.opposite)  // two scans at one angle: the pitch's term (opposite views of two scans: the rows as they are, which the solve leaves out)
-        rows -= model::pitch_lift(&p.pitch, p.scans[static_cast<std::size_t>(c.b.scan)].d, at_of(acq, c.b)) - model::pitch_lift(&p.pitch, p.scans[static_cast<std::size_t>(c.a.scan)].d, at_of(acq, c.a));
+        rows -= model::pitch_lift(&p.pitch, p.scans[static_cast<std::size_t>(c.b.scan)].d, when_b) - model::pitch_lift(&p.pitch, p.scans[static_cast<std::size_t>(c.a.scan)].d, when_a);
     return {step != 0 ? dth / step : 0.0, rows, c.opposite ? b.s + a.s : b.s - a.s};
 }
 
@@ -312,7 +327,8 @@ Ray ray_of(const Acquisition& acq, const Parameters& p, const Sighting& g) {
     stretch_of(acq, g);
     if (p.scans.size() != acq.scans.size()) throw Error("geometry: the parameters and the acquisition differ in their scans");
     const ScanParameters& sp = p.scans[static_cast<std::size_t>(g.scan)];
-    const model::At at = at_of(acq, g);
+    const double row_time = row_time_of(acq, p);
+    const model::At at = at_of(acq, row_time, g);
     const double detector[1] = {p.roll}, own[3] = {sp.axis, sp.axis_slope, sp.axial_scale}, place[3] = {sp.d[0], sp.d[1], sp.height};
     const double stage[4] = {p.stage.height_once[0], p.stage.height_once[1], p.stage.axis_twice[0], p.stage.axis_twice[1]};
     const double stretch[1] = {sp.stretch_height.at(static_cast<std::size_t>(g.stretch))};
@@ -323,8 +339,8 @@ Ray ray_of(const Acquisition& acq, const Parameters& p, const Sighting& g) {
     double X, Y;
     model::ideal_position(map.data(), phi.data(), nt, g.col, g.row, X, Y);
     Ray r;
-    r.angle_deg = at.th * (180.0 / kPi) + fan_angle(acq, g);
-    model::ray_of(detector, stage, own, place, stretch, at, X, Y, r.s, r.z);
+    r.angle_deg = at.th * (180.0 / kPi) + fan_angle(acq, row_time, g);
+    model::ray_of(detector, stage, own, place, stretch, at, model::now(at, 0.0), X, Y, r.s, r.z);
     return r;
 }
 
@@ -600,7 +616,7 @@ void parameters_json(const Acquisition& acq, const Parameters& p, Json& out, Jso
     }
     Json stage = Json::dict();
     stage.set("height_once", Json::list().add(num(p.stage.height_once[0])).add(num(p.stage.height_once[1]))).set("axis_twice", Json::list().add(num(p.stage.axis_twice[0])).add(num(p.stage.axis_twice[1])));
-    out.set("roll", num(p.roll)).set("pitch", num(p.pitch)).set("stage", stage).set("about_height", num(p.about_height)).set("scans", scans);
+    out.set("roll", num(p.roll)).set("pitch", num(p.pitch)).set("row_time", num(row_time_of(acq, p))).set("stage", stage).set("about_height", num(p.about_height)).set("scans", scans);
     Json mi = Json::list(), mj = Json::list();
     for (const int v : p.map.i) mi.add(Json::whole_number(v));
     for (const int v : p.map.j) mj.add(Json::whole_number(v));
