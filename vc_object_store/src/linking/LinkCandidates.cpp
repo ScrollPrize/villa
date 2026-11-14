@@ -5,6 +5,7 @@
 #include "vc_object_store/Uuid.hpp"
 
 #include <algorithm>
+#include <exception>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -41,6 +42,26 @@ bool isDetectorsOwnEdge(const EdgeRecord& e, const std::string& detectorName)
     }
 }
 
+// Marks the write transaction failed when the scope is left by an
+// exception: its commit then throws and rolls everything back.
+class FailTransactionOnError {
+public:
+    explicit FailTransactionOnError(sqlite3* db) : db_(db) {}
+    FailTransactionOnError(const FailTransactionOnError&) = delete;
+    FailTransactionOnError& operator=(const FailTransactionOnError&) = delete;
+    ~FailTransactionOnError()
+    {
+        if (std::uncaught_exceptions() <= exceptions_) return;
+        if (const auto pool = objects::activeStatementPools.find(db_);
+            pool != objects::activeStatementPools.end())
+            pool->second->actionConflict = true;
+    }
+
+private:
+    sqlite3* db_;
+    int exceptions_ = std::uncaught_exceptions();
+};
+
 }  // namespace
 
 std::map<std::string, int> detectorVersions()
@@ -60,13 +81,17 @@ static DetectorReport commitCandidatesImpl(objects::ObjectStore& db, objects::Wr
         throw std::runtime_error("object links: detector name must be non-empty");
     // The savepoint makes a failed commit leave the caller's transaction as
     // it was. A caller whose transaction is rolled back by any failure here
-    // does not need it, and must not pay for it: while a savepoint stays
-    // open SQLite keeps its statement journal (in memory under
-    // temp_store=MEMORY) and walks it from the start whenever a statement or
-    // nested savepoint that journalled a page ends, so writing N links under
-    // one savepoint costs O(N^2).
+    // must not pay for it: while a savepoint stays open SQLite keeps its
+    // statement journal (in memory under temp_store=MEMORY) and walks it
+    // from the start whenever a statement or nested savepoint that
+    // journalled a page ends, so writing N links under one savepoint costs
+    // O(N^2). Without the savepoint a failure instead marks the transaction
+    // failed, so a caller that catches the error still cannot commit the
+    // links written before it.
     std::optional<objects::detail::Savepoint> operation;
-    if (!transactionRollsBack) operation.emplace(objects::ObjectStoreImplAccess::conn(txn));
+    std::optional<FailTransactionOnError> failTransaction;
+    if (transactionRollsBack) failTransaction.emplace(objects::ObjectStoreImplAccess::conn(txn));
+    else operation.emplace(objects::ObjectStoreImplAccess::conn(txn));
     DetectorReport report;
     report.candidatesFound = int64_t(candidates.size());
 

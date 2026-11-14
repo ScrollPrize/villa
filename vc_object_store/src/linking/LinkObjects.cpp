@@ -366,7 +366,8 @@ objects::PreparedOperation prepareLinkObjects(objects::ObjectStore& store, const
         auto steps = Json::array();
         for (std::size_t i = 0; i < prepared->detections.size(); ++i) {
             const auto& detection = prepared->detections[i];
-            // submit() owns txn and rolls it back when apply throws.
+            // No savepoint per detection: a failure fails txn as a whole
+            // (submit() rolls it back; any other caller cannot commit it).
             const auto report = detail::commitDetection(db, *prepared->inputs, txn, detection,
                                                         stepProgress(progress, detection.detector), true);
             Json step{{"detector", prepared->plan.steps[i].detector}, {"params", prepared->plan.steps[i].params},
