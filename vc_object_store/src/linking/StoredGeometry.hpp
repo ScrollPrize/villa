@@ -108,11 +108,12 @@ DetectorReport commitStoredCandidates(objects::ObjectStore& db, const StoredGeom
     bool transactionRollsBack = false);
 // Commit a detection in the caller's write transaction (commitStoredCandidates
 // with its scope); the counts join detection.report, which is returned.
-// transactionRollsBack: a failure here costs the whole of txn, not only this
-// detection: the commit takes no savepoint of its own, and when it throws it
-// marks txn failed, so txn's commit throws and rolls back. Stored results of
-// a successful run are the same either way; the savepoint makes large commits
-// quadratic (see commitCandidatesImpl).
+// transactionRollsBack: the caller ensures that txn is rolled back as a whole
+// when this throws (it owns txn, or holds a FailTransactionOnError), so the
+// commit takes no savepoint of its own. Writing the candidates also marks txn
+// failed when it throws; the input validation before it does not. Stored
+// results of a successful run are the same either way; the savepoint makes
+// large commits quadratic (see commitCandidatesImpl).
 DetectorReport commitDetection(objects::ObjectStore& db, const StoredGeometry& inputs, objects::WriteTxn& txn,
     const Detection& detection, const objects::util::ProgressCallback& progress,
     bool transactionRollsBack = false);
