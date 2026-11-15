@@ -145,7 +145,7 @@ try {
 
     // A relationship versions itself and both endpoints in one commit.
     const auto edge = util::newUuid();
-    EdgeRecord link; link.uuid = edge; link.kind = "test_link"; link.aUuid = a; link.bUuid = b;
+    EdgeRecord link; link.uuid = edge; link.kind = "declared_reference"; link.aUuid = a; link.bUuid = b;
     link.aAnchor.wholeGeometry = link.bAnchor.wholeGeometry = true;
     const auto linked = db.submit(request({{a, 3}, {b, 1}}, {AddEdgeOp{edgeRecordJson(link)}}));
     require(linked.objects.at(a) == 4 && linked.objects.at(b) == 2 && linked.relationships.at(edge) == 1, "relationship commit");
@@ -317,7 +317,7 @@ try {
                                                   vc::geometry::encode(grid));
         operations.push_back(CreateObjectOp{objectRecordJson(trackRecord(other))});
         edits.submit(make(testNumberedGuards(edits, {{surface, std::nullopt}, {other, std::nullopt}}), operations));
-        EdgeRecord link; link.uuid = relation; link.kind = "test_link"; link.aUuid = surface; link.bUuid = other;
+        EdgeRecord link; link.uuid = relation; link.kind = "declared_reference"; link.aUuid = surface; link.bUuid = other;
         link.aAnchor.wholeGeometry = link.bAnchor.wholeGeometry = true;
         edits.submit(make(testNumberedGuards(edits, {{surface, 1}, {other, 1}}), {AddEdgeOp{edgeRecordJson(link)}}));
         {
@@ -377,7 +377,7 @@ try {
         edits.submit(make({{collection, std::nullopt}, {marker, std::nullopt}},
             {CreateObjectOp{objectRecordJson(pc)}, PutGeometryOp{collection, vc::geometry::encode(points), {}, false},
              CreateObjectOp{objectRecordJson(trackRecord(marker))}}));
-        EdgeRecord pointLink; pointLink.uuid = anchored; pointLink.kind = "test_link"; pointLink.aUuid = collection;
+        EdgeRecord pointLink; pointLink.uuid = anchored; pointLink.kind = "declared_reference"; pointLink.aUuid = collection;
         pointLink.bUuid = marker; pointLink.aAnchor.points = {{"point_ids", {0}}}; pointLink.bAnchor.wholeGeometry = true;
         edits.submit(make(testNumberedGuards(edits, {{collection, 1}, {marker, 1}}), {AddEdgeOp{edgeRecordJson(pointLink)}}));
         points.points[0] = {1, 1, 3};

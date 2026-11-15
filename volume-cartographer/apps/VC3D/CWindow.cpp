@@ -1123,7 +1123,10 @@ CWindow::CWindow(size_t cacheSizeGB) :
             });
 
     // The Project tab drives the File menu's project actions.
-    _state->prepareStoreSwitch = [this]() {
+    // Saves what an editor holds before stores or routes change. Line
+    // annotation is prepared (its sessions saved and closed) only when the
+    // change touches what it reads.
+    const auto prepareEditors = [this](bool annotation) {
         try { _state->savePointCollections(); }
         catch (const std::exception&) { return false; }
         if (_segmentationModule) {
@@ -1134,7 +1137,14 @@ CWindow::CWindow(size_t cacheSizeGB) :
                 if (!active || !_segmentationModule->saveSurface(active.get())) return false;
             }
         }
-        return !_lineAnnotationController || _lineAnnotationController->prepareForPackageSwitch();
+        return !annotation || !_lineAnnotationController || _lineAnnotationController->prepareForPackageSwitch();
+    };
+    _state->prepareStoreSwitch = [prepareEditors]() { return prepareEditors(true); };
+    // A change to some kinds' routes only (selection change, a referenced
+    // store removed or replaced): nothing to prepare when no kind selects it.
+    _state->prepareStoreKindsSwitch = [prepareEditors](const std::set<std::string>& kinds) {
+        if (kinds.empty()) return true;
+        return prepareEditors(kinds.contains("fiber") || kinds.contains("umbilicus"));
     };
     _projectWorkspace = new ProjectWorkspace(_state, _menuController.get(), this);
     _projectWorkspace->setProperty("workspaceId", QStringLiteral("project"));
@@ -1403,7 +1413,9 @@ CWindow::CWindow(size_t cacheSizeGB) :
             QString path = files[0];
             scheduledStartupAction = true;
             QTimer::singleShot(0, this, [this, path]() {
-                if (_menuController) {
+                // A project opened before the event loop started (--project)
+                // wins over the remembered one.
+                if (_menuController && !_state->hasVpkg()) {
                     _menuController->openVolpkgAt(path);
                 }
             });
@@ -1612,7 +1624,7 @@ CWindow::~CWindow()
     setStatusBar(nullptr);
 
     if (_lineAnnotationController) {
-        _lineAnnotationController->saveOpenFibers();
+        (void)_lineAnnotationController->saveOpenFibers();
     }
     CloseVolume();
 }
@@ -3982,8 +3994,21 @@ void CWindow::closeEvent(QCloseEvent* event)
         return;
     }
     _destroyingWindow = true;
-    if (_lineAnnotationController) {
-        _lineAnnotationController->saveOpenFibers();
+    if (_lineAnnotationController && !_lineAnnotationController->saveOpenFibers()) {
+        // Quitting abandons what could not be stored (a save the object
+        // store has not confirmed and the edits behind it): only on request.
+        const auto answer = QMessageBox::warning(
+            this, tr("Fiber edits not saved"),
+            tr("Some fiber edits could not be saved to the object store. Quitting now loses them.\n\n"
+               "Cancel to keep VC3D open and try again once the store answers."),
+            QMessageBox::Discard | QMessageBox::Cancel, QMessageBox::Cancel);
+        if (answer != QMessageBox::Discard) {
+            // The close is off: a later one asks about Spiral work again.
+            _destroyingWindow = false;
+            _spiralCloseGuardBypass = false;
+            event->ignore();
+            return;
+        }
     }
     saveWindowState();
     event->accept();

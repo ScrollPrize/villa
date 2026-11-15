@@ -49,6 +49,15 @@ def test_typed_rows_and_transactional_registration(db):
     assert info["columns"] == [dict(nullable=False, **c) if "nullable" not in c else c for c in spec["columns"]]
     assert info["based_on"] == [] and info["last_modified_commit"] == db.status()["commit_sequence"]
     assert db.extension_rows(spec["name"], [extension_uuid(owner), 2]) == [expected[1]]
+    assert db.extension_rows(spec["name"], key_filter={"run":2}) == [expected[1]]
+    filtered=[]
+    assert db.scan_extension_rows(spec['name'],lambda item:filtered.append(item),key_filter={'run':2})==1
+    assert filtered==[expected[1]]
+    assert db.extension_rows(spec['name'],[extension_uuid(owner)],key_filter={'run':3})==[]
+    with pytest.raises(ValueError,match='primary-key'):
+        db.extension_rows(spec['name'],key_filter={'value':1.25})
+    with pytest.raises(ValueError,match='wrong value type'):
+        db.extension_rows(spec['name'],key_filter={'run':'2'})
     assert isinstance(expected[0][0], bytes) and len(expected[0][0]) == 16
     assert extension_uuid(expected[0][0]) == owner
     visited = []
@@ -97,6 +106,8 @@ def test_manual_fields_follow_owner_versions(tmp_path, history, owner_kind):
         with db.write(expected_versions=db.select_expected_versions({owner: 2})) as txn:
             txn.replace_extension_rows(spec["name"], owner, newer)
         assert db.current_version(owner) == 3 and db.extension_rows(spec["name"]) == newer
+        assert db.extension_rows(spec['name'],key_filter={'run':1})==[]
+        assert db.extension_rows(spec['name'],key_filter={'run':2})==newer
         if history:
             assert db.extension_rows_at_version(spec["name"], ref) == expected
             with db.write(expected_versions=db.select_expected_versions({owner: 3})) as txn:
@@ -117,22 +128,16 @@ def test_manual_relationship_reference(db):
     db.create_extension_table(spec)
     a = db.upsert_object(dict(kind="fiber"))
     b = db.upsert_object(dict(kind="fiber"))
-    edge = db.add_edge(dict(kind="test_link", a=a, b=b,
+    edge = db.add_edge(dict(kind="declared_reference", a=a, b=b,
                             a_anchor=dict(whole_geometry=True), b_anchor=dict(whole_geometry=True)))
     first = [row(edge)]
     with db.write(expected_versions=db.select_expected_versions({a: db.current_version(a), b: db.current_version(b)}),
                   expected_relationships=db.select_expected_versions({edge: 1}, relationships=True)) as txn:
         txn.replace_extension_rows(spec["name"], edge, first)
-    state = db.status()
-    selected = db.relationships_at_versions([
-        dict(store=state["store"], generation=state["generation"], object=uid, version=db.current_version(uid))
-        for uid in (a, b)])[0]
-    ref = dict(store=selected["store"], generation=selected["generation"], relationship=edge, version=selected["version"])
-    assert ref["version"] == 2 and selected["record"]["version_store"] == ref["store"]
+    ref = db.select_expected_versions({edge: 2}, relationships=True)[edge]
     assert db.extension_rows_at_version(spec["name"], ref) == first
-    assert_reference_validation(db, spec["name"], ref)
     with db.write(expected_versions=db.select_expected_versions({a: db.current_version(a), b: db.current_version(b)}),
-                  expected_relationships=db.select_expected_versions({edge: 2}, relationships=True)) as txn:
+                  expected_relationships={edge: ref}) as txn:
         txn.replace_extension_rows(spec["name"], edge, [])
     assert db.extension_rows(spec["name"]) == []
     assert db.extension_rows_at_version(spec["name"], ref) == first

@@ -3,7 +3,7 @@
 #include "internal/ReferenceResolver.hpp"
 
 namespace vc::objects::detail {
-GeometryRecord decodeGeometryRecord(const Statement& s,int c)
+GeometryRecord decodeGeometryRecord(const Statement& s,int c,bool verify)
 {
     GeometryRecord record;
     record.source = sqlite3_db_handle(s.value);
@@ -12,7 +12,8 @@ GeometryRecord decodeGeometryRecord(const Statement& s,int c)
     if (!s.isNull(c+2)) r.parentUuid = readGeometryTokenColumn(s,c+2);
     r.contentHash = sqlite3_column_type(s.value,c+3)==SQLITE_TEXT ? s.text(c+3) : readDigest(s,c+3);
     record.manifest = s.text(c+4);
-    record.descriptor = loadGeometryManifest(record.source,r.uuid,record.manifest,r.contentHash);
+    record.descriptor = verify?loadGeometryManifest(record.source,r.uuid,record.manifest,r.contentHash):nlohmann::json::parse(record.manifest);
+    if(!verify)return record;
     const auto& manifest = record.descriptor;
     r.gridOrigin = manifest.value("grid_origin",std::array<int64_t,2>{0,0});
     r.kind = manifest.at("kind"); r.formatVersion = manifest.at("format_version");
@@ -29,13 +30,14 @@ std::optional<GeometryRecord> resolveGeometryRecord(sqlite3* db,const std::strin
     const std::array<std::string,1> references{reference};
     return resolveGeometryRecords(db,references).front();
 }
-std::vector<std::optional<GeometryRecord>> resolveGeometryRecords(sqlite3* db,std::span<const std::string> references)
+std::vector<std::optional<GeometryRecord>> resolveGeometryRecords(sqlite3* db,std::span<const std::string> references,bool trustedCurrent)
 {
     std::vector<std::optional<GeometryRecord>> result(references.size());
     size_t missing=references.size();
     // Archives retain parent/delta information. Prefer them throughout the
     // pinned scope; an overlay may hold only a verbatim current descriptor.
     for(bool archived:{true,false}) {
+        if(archived&&trustedCurrent)continue;
         if(!missing)break;
         resolveReference(db,[&](sqlite3* source){
             if(archived&&!historyEnabled(source))return false;
@@ -58,7 +60,7 @@ std::vector<std::optional<GeometryRecord>> resolveGeometryRecords(sqlite3* db,st
                 while(rows.row()) {
                     const auto index=size_t(rows.i64(0));
                     if(result[index])throw std::runtime_error("geometry: duplicate revision identity");
-                    result[index]=decodeGeometryRecord(rows,1);
+                    result[index]=decodeGeometryRecord(rows,1,!trustedCurrent);
                     result[index]->archived=archived;
                     --missing;
                 }

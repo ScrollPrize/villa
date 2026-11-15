@@ -7,8 +7,17 @@
 #include <random>
 #include <string>
 #include <string_view>
+#include <cstdint>
 
 namespace vc::objects::util {
+
+// Stable FNV-1a over the canonical UUID bytes, shared by routing and bulk joins.
+inline std::uint64_t uuidHash64(const std::array<unsigned char,16>& bytes)
+{
+    std::uint64_t hash=UINT64_C(14695981039346656037);
+    for(const auto byte:bytes){hash^=byte;hash*=UINT64_C(1099511628211);}
+    return hash;
+}
 
 inline bool isUuid(const std::string& value)
 {

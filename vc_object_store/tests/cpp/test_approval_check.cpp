@@ -21,7 +21,7 @@ void check(HistoryMode mode)
     auto* db=ObjectStoreImplAccess::conn(txn);
     ObjectRecord a,b;a.uuid=util::newUuid();a.kind="note";b=a;b.uuid=util::newUuid();
     store.upsertObject(txn,a);store.upsertObject(txn,b);
-    EdgeRecord edge;edge.aUuid=a.uuid;edge.bUuid=b.uuid;edge.kind="test";store.addEdge(txn,edge);
+    EdgeRecord edge;edge.aUuid=a.uuid;edge.bUuid=b.uuid;edge.kind="declared_reference";store.addEdge(txn,edge);
     exec(db,"CREATE TEMP TABLE old_approval(value TEXT NOT NULL CHECK(value IN ('pending','approved','rejected')));"
         "CREATE TEMP TABLE new_approval(value TEXT NOT NULL CHECK(value='pending' OR value='approved' OR value='rejected')); ");
     const std::vector<std::pair<std::string,bool>> cases={
@@ -39,16 +39,33 @@ void check(HistoryMode mode)
         const auto legacy=accepts(db,"INSERT INTO old_approval VALUES("+value+")");
         const auto replacement=accepts(db,"INSERT INTO new_approval VALUES("+value+")");
         require(legacy==expected&&replacement==legacy,"approval CHECK accepts exactly the old domain");
-        for(const auto* table:{"objects","edges"})
+        for(const auto* table:{"objects"})
             require(accepts(db,std::string("UPDATE ")+table+" SET approval_state="+value)==legacy,
                 "native approval checks agree with legacy CHECK including affinity and NOT NULL");
     }
+    const std::vector<std::pair<std::string,bool>> edgeCases={
+        {"0",true},{"1",true},{"2",true},{"TRUE",true},{"FALSE",true},
+        {"'0'",true},{"'1'",true},{"'2'",true},
+        {"NULL",false},{"''",false},{"'pending'",false},{"-1",false},{"3",false},
+        {"0.5",false},{"1.25",false},{"X'00'",false},{"X'31'",false}
+    };
+    for(const auto& [value,expected]:edgeCases){Savepoint trial(db);
+        require(accepts(db,"UPDATE edges SET approval_state="+value)==expected,
+            "schema-22 edge approval accepts only integer enum codes, including affinity");}
+    const std::vector<std::pair<std::string,bool>> kindCases={
+        {"0",true},{"1",true},{"9",true},{"'1'",true},
+        {"NULL",false},{"-1",false},{"10",false},{"1.25",false},
+        {"'parallel'",false},{"X'01'",false}
+    };
+    for(const auto& [value,expected]:kindCases){Savepoint trial(db);
+        require(accepts(db,"UPDATE edges SET kind="+value)==expected,
+            "schema-22 kind accepts only known integer enum codes");}
     // Isolate the CHECK from all object/edge indexes and foreign-key programs.
     // Do not assume the legacy IN implementation always uses an ephemeral
     // table: a future SQLite release may optimize that too.
     Statement program(db,"EXPLAIN INSERT INTO new_approval VALUES(?)");
     while(program.row()) require(program.text(1)!="OpenEphemeral","OR approval CHECK must not construct a per-row temporary B-tree");
-    for(const auto* table:{"objects","edges"}) {
+    for(const auto* table:{"objects"}) {
         Statement schema(db,"SELECT sql FROM sqlite_schema WHERE name=?",std::string(table));
         require(schema.row()&&schema.text(0).find("approval_state='pending' OR")!=std::string::npos,
             "new native tables use direct comparisons");

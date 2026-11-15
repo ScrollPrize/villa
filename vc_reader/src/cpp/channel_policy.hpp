@@ -9,8 +9,17 @@
 #include <unordered_map>
 #include <vector>
 #include "platform_io.hpp"
+#include "single_flight.hpp"
+#include "memory_cache.hpp"
+#include "channel_decode.hpp"
 
 namespace vcr {
+struct ChunkLoad {
+    bool available=true,complete=false;
+    ChunkPtr whole;
+    std::vector<DecodedChannel> channels;
+    std::shared_ptr<MemoryCache> cache;
+};
 struct ChannelPolicy {
     std::atomic<bool> enabled{false};
     std::mutex mutex;
@@ -20,8 +29,9 @@ struct ChannelPolicy {
     using Channels = std::vector<std::int64_t>;
     std::vector<std::unique_ptr<const Channels>> registrations;
     std::atomic<const Channels*> registration{nullptr};
-    // Coalesce concurrent reads of the same physical chunk, not unrelated I/O.
-    std::unique_ptr<std::array<std::mutex, 256>> reads;
+    // Shared by whole/selected readers. Keys include the decoded-cache namespace
+    // so different cache quality/encoding views cannot exchange wrong values.
+    SingleFlight<std::shared_ptr<const ChunkLoad>> reads;
     static std::shared_ptr<ChannelPolicy> for_array(const std::string& identity)
     {
         struct Registry {

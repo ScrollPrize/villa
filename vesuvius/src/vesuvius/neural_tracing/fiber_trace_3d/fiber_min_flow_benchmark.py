@@ -4,15 +4,29 @@ import numpy as np
 from .fiber_min_flow import Seam, corrected_targets, integer_targets, fractional_targets, split_fractional_edges
 
 
+def subset_minimal(d, keep):
+    """Induce a whole-fiber minimal graph without inventing solver geometry."""
+    remap=np.cumsum(keep)-1;edge=keep[d['i']] & keep[d['j']]
+    out={k:d[k][keep] for k in ('source_id','family','start','end','node_ds')}
+    out.update({k:d[k][edge] for k in ('ds_a','ds_b','distance','sign','parallel')})
+    out.update(i=remap[d['i'][edge]],j=remap[d['j'][edge]],links=np.empty((0,4)))
+    return out
+
+
 
 class Paths:
-    def __init__(self, config, data, angle=-np.pi/2):
+    def __init__(self, config, data, angle=-np.pi/2, *, curves=None, cache=None):
         from .fiber_normal_sign_visualization import load_umbilicus_frame
-        from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fiber_volume, read_polylines
-        volume = fiber_volume(config['fibers'])
+        from .fiber_graph_store import workflow_volume
+        from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import read_polylines
+        volume = workflow_volume(config)
+        self.volume = volume
         self.seam = Seam(load_umbilicus_frame(config['umbilicus'], volume), angle)
-        self.paths = {}
-        for row, points in read_polylines(config['fibers'], data['source_id'], volume=volume):
+        self.paths = {} if cache is None else cache
+        if curves is None:
+            curves = read_polylines(config['fibers'], [s for s in data['source_id'] if str(s) not in self.paths], volume=volume)
+        for row, points in curves:
+            if str(row['id']) in self.paths: continue
             arc = np.r_[0., np.cumsum(np.linalg.norm(np.diff(points, axis=0), axis=1))]
             transport = self.seam.polyline(points)
             self.paths[row['id']] = (arc, points, transport)
@@ -32,6 +46,24 @@ class Paths:
         p = points[j]+(points[j+1]-points[j])*(arc-s[j])/max(s[j+1]-s[j], 1e-300)
         return p, int(transport[j])+self.seam.segment(points[j], p)
 
+    def at_many(self, source, arc):
+        source, arc = np.asarray(source), np.asarray(arc)
+        result = np.empty((len(arc), 3)); turns = np.empty(len(arc), np.int64)
+        order = np.argsort(source, kind='stable')
+        ordered = source[order]
+        for selected in np.split(order, np.flatnonzero(ordered[1:] != ordered[:-1])+1):
+            if not len(selected): continue
+            s, points, transport = self.paths[str(source[selected[0]])]
+            values = arc[selected]
+            if np.any(values < -1e-4) or np.any(values > s[-1]+max(1e-4, 2e-7*s[-1])):
+                raise ValueError('Endpoint outside fiber')
+            values = np.clip(values, 0, s[-1])
+            j = np.minimum(np.searchsorted(s, values, side='right')-1, len(s)-2)
+            p = points[j]+(points[j+1]-points[j])*((values-s[j])/np.maximum(s[j+1]-s[j], 1e-300))[:, None]
+            result[selected] = p
+            turns[selected] = transport[j]+self.seam.segments(points[j], p)
+        return result, turns
+
     def ends(self, side):
         d = self.data
         picks = d['i' if side == 'a' else 'j']
@@ -39,8 +71,7 @@ class Paths:
         if np.any(direction == 0):
             raise ValueError('Missing aligned arc direction')
         arcs = d['start'][picks]+d['ds_'+side]*direction
-        samples = [self.at(d['source_id'][p], arc) for p, arc in zip(picks, arcs)]
-        return np.array([s[0] for s in samples]), np.array([s[1] for s in samples])
+        return self.at_many(d['source_id'][picks], arcs)
 
 
 def graph(config, d, paths, sign_only=False, target_mode="fractional"):
@@ -48,8 +79,10 @@ def graph(config, d, paths, sign_only=False, target_mode="fractional"):
         raise ValueError("Unknown target mode: "+target_mode)
     a, ta = paths.ends('a')
     b, tb = paths.ends('b')
-    c = np.array([paths.seam.segment(x, y) for x, y in zip(a, b)])
-    fd = d['family'][d['j']]-d['family'][d['i']]
+    c = paths.seam.segments(a, b)
+    # Comparison exports may store H/V as uint8; V->H must be -1, not 255.
+    family=np.asarray(d['family'],dtype=np.int64)
+    fd = family[d['j']]-family[d['i']]
     target_function = fractional_targets if target_mode == 'fractional' and not sign_only else integer_targets
     measured, valid = target_function(d['distance']*config.get('lasagna_winding_scale', 1.),
         d['sign'], fd, d['parallel'], config.get('perpendicular_offset', .5))

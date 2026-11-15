@@ -221,7 +221,7 @@ try {
         both(p, "read dependency parity");
     }
     const auto edge = util::newUuid();
-    EdgeRecord link; link.uuid = edge; link.kind = "test_link"; link.aUuid = a; link.bUuid = b;
+    EdgeRecord link; link.uuid = edge; link.kind = "declared_reference"; link.aUuid = a; link.bUuid = b;
     link.aAnchor.wholeGeometry = link.bAnchor.wholeGeometry = true;
     const auto linked = both(request({{a, 3}, {b, 1}}, {AddEdgeOp{edgeRecordJson(link)}}), "relationship parity");
     require(linked.relationships.at(edge) == 1, "relationship version");
@@ -298,6 +298,67 @@ try {
                     hosted.readGeometryArray(hg->uuid, array.name), "geometry bytes parity");
         }
         require(!hosted.geometryRevision(util::newUuid()), "unknown geometry");
+
+        // Bounded annotation reads check each value's packed size before
+        // loading it: one large (chunked) value and the per-row defaults.
+        {
+            auto local = ObjectStore::create(directory.path / "annotations.vcobj", options);
+            const auto annotated = util::newUuid();
+            vc::geometry::Fiber geometry; geometry.controlPoints = {{0, 0, 0}, {1, 1, 1}, {2, 2, 2}};
+            ObjectRecord record; record.uuid = annotated; record.kind = "fiber";
+            const auto status = [&] { auto t = local.read(); return local.status(t); }();
+            TransactionRequest create;
+            create.requestUuid = util::newUuid(); create.storeUuid = status.storeUuid; create.generation = status.generation;
+            create.author = "alice"; create.expectedObjects = {{annotated, std::nullopt}};
+            create.operations = {CreateObjectOp{objectRecordJson(record)}, PutGeometryOp{annotated, vc::geometry::encode(geometry), {}}};
+            local.submit(create);
+            const nlohmann::json values = nlohmann::json::array({nlohmann::json{{"note", std::string(5000, 'x')}},
+                                                                  nlohmann::json::object(), nlohmann::json{{"tag", 1}}});
+            TransactionRequest annotate;
+            annotate.requestUuid = util::newUuid(); annotate.storeUuid = status.storeUuid; annotate.generation = status.generation;
+            annotate.author = "alice";
+            { auto t = local.read(); annotate.expectedObjects[annotated] = local.currentObjectRevision(t, annotated)->reference(); }
+            annotate.operations = {UpdateGeometryArraysOp{annotated, vc::geometry::encode(geometry), {{"control_points", values.dump()}}}};
+            local.submit(annotate);
+            auto txn = local.read();
+            const auto revision = local.currentObjectRevision(txn, annotated)->geometryRevision.value();
+            const auto full = local.geometryPointAnnotations(txn, revision, "control_points");
+            require(full.size() == 3 && full[0].at("note").get<std::string>().size() == 5000, "annotated fixture");
+            require(local.geometryPointAnnotationsWithin(txn, revision, "control_points", 1 << 20) == full,
+                    "a bounded read within its budget returns every value");
+            require(!local.geometryPointAnnotationsWithin(txn, revision, "control_points", 4000),
+                    "a chunked value larger than the budget is refused before it is loaded");
+            require(!local.geometryPointAnnotationsWithin(txn, revision, "control_points", 8),
+                    "the per-row defaults count against the budget");
+        }
+
+        // The batched geometry query answers the same descriptors and bytes as
+        // the per-revision reads, in request order, with unknown revisions null.
+        {
+            std::vector<std::string> revisions;
+            for (int64_t version : {1, 5})
+                revisions.push_back(*hosted.objectAtVersion({hostedInitial.storeUuid, hostedInitial.generation, a, version})->geometryRevision);
+            const auto unknown = util::newUuid();
+            revisions.push_back(unknown);
+            std::vector<std::string> names;
+            // Held in a variable: a range-for over a member of the temporary would outlive it before C++23.
+            const auto firstRevision = hosted.geometryRevision(revisions[0]);
+            for (const auto& array : firstRevision->arrays) names.push_back(array.name);
+            names.push_back("no-such-array");
+            const auto batch = hosted.geometryBatch(revisions, names, {});
+            require(batch && batch->size() == revisions.size(), "geometry batch answers every revision");
+            for (size_t i = 0; i < 2; ++i) {
+                const auto& entry = (*batch)[i];
+                const auto single = hosted.geometryRevision(revisions[i]);
+                require(entry.descriptor && entry.descriptor->uuid == single->uuid &&
+                        entry.descriptor->contentHash == single->contentHash, "geometry batch descriptor parity");
+                require(!entry.arrays.contains("no-such-array"), "geometry batch skips absent arrays");
+                for (const auto& array : single->arrays)
+                    require(entry.arrays.at(array.name) == hosted.readGeometryArray(single->uuid, array.name),
+                            "geometry batch bytes parity");
+            }
+            require(!(*batch)[2].descriptor && (*batch)[2].uuid == unknown, "geometry batch unknown revision");
+        }
     }
 
     // Queries answer from one server snapshot and match the local store.
@@ -370,7 +431,7 @@ try {
             mustFail([&] { (void)hosted.selectObjects(withTransforms); }); // the store's recorded transforms apply
         }
 
-        EdgeSelection links; links.kind = "test_link";
+        EdgeSelection links; links.kind = "declared_reference";
         require(ids(hosted.selectAllEdges(links, std::nullopt, 1)) == ids(local.selectEdges(txn, links)) &&
             ids(local.selectEdges(txn, links)) == std::vector<std::string>{edge}, "edge listing parity");
         {
@@ -381,13 +442,15 @@ try {
 
         // Graph traversal, counts and tags run on the host.
         auto sorted = [](std::vector<std::string> v) { std::sort(v.begin(), v.end()); return v; };
-        for (const std::vector<std::string>& kinds : {std::vector<std::string>{}, {"test_link"}, {"other"}})
+        for (const std::vector<std::string>& kinds : {std::vector<std::string>{}, {"declared_reference"}, {"parallel"}})
             require(sorted(hosted.traverse({GraphQuery::Kind::Component, a, kinds})) ==
                     sorted(local.componentOf(txn, a, kinds)), "component parity");
-        require(sorted(hosted.traverse({GraphQuery::Kind::Component, a, {"test_link"}})).size() == 2, "component reaches b");
-        require(hosted.traverse({GraphQuery::Kind::Neighbours, b, {"test_link"}, std::string("track")}) ==
-                local.neighbours(txn, b, std::string("test_link"), std::string("track")) &&
-                hosted.traverse({GraphQuery::Kind::Neighbours, b, {"test_link"}, std::string("track")}) ==
+        mustFail([&]{local.componentOf(txn,a,{"unsupported_kind"});});
+        mustFail([&]{hosted.traverse({GraphQuery::Kind::Component,a,{"unsupported_kind"}});});
+        require(sorted(hosted.traverse({GraphQuery::Kind::Component, a, {"declared_reference"}})).size() == 2, "component reaches b");
+        require(hosted.traverse({GraphQuery::Kind::Neighbours, b, {"declared_reference"}, std::string("track")}) ==
+                local.neighbours(txn, b, std::string("declared_reference"), std::string("track")) &&
+                hosted.traverse({GraphQuery::Kind::Neighbours, b, {"declared_reference"}, std::string("track")}) ==
                 std::vector<std::string>{a}, "neighbour parity");
         mustFail([&] { (void)hosted.traverse({GraphQuery::Kind::Neighbours, b, {"x", "y"}}); });
         require(hosted.objectCount("track") == local.objectCount(txn, "track") &&

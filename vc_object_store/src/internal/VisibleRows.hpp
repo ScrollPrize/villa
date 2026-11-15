@@ -1,6 +1,7 @@
 #pragma once
 #include "internal/RecordResolver.hpp"
 #include <algorithm>
+#include <queue>
 
 namespace vc::objects::detail {
 // Physical readers retain their indexed execution plans. Logical visibility
@@ -19,7 +20,7 @@ auto selectVisibleRecords(sqlite3* db,Read read,Visible visible,Less less,
     result.erase(result.begin(),result.begin()+begin);
     return result;
 }
-// Merge indexed physical queries in UUID order. Column zero is the object
+// Merge indexed physical queries in UUID order. The selected key column is the object
 // UUID; rows within each object retain their physical query's ordering. All
 // shadowing/deletion decisions use the same resolver as point lookups.
 class VisibleObjectRows {
@@ -29,33 +30,52 @@ class VisibleObjectRows {
         std::optional<std::string> key;
     };
     sqlite3* root_;
+    int keyColumn_;
     std::vector<Cursor> cursors_;
+    struct Next {
+        const std::string* key;
+        size_t cursor;
+    };
+    struct Later {
+        bool operator()(const Next& a,const Next& b)const{
+            return *a.key==*b.key?a.cursor>b.cursor:*a.key>*b.key;
+        }
+    };
+    std::priority_queue<Next,std::vector<Next>,Later> next_;
     std::optional<size_t> current_;
     void advance(Cursor& cursor) {
         cursor.key.reset();
-        while(cursor.rows->row()) {
-            auto key=cursor.rows->uuid(0);
-            if(objectSource(root_,key)==cursor.source){cursor.key=std::move(key);break;}
-        }
+        if(cursor.rows->row())cursor.key=cursor.rows->uuid(keyColumn_);
+    }
+    void advance(size_t cursor){
+        advance(cursors_[cursor]);
+        if(cursors_[cursor].key)next_.push({&*cursors_[cursor].key,cursor});
     }
 public:
-    template<class Query> VisibleObjectRows(sqlite3* root,Query query):root_(root) {
+    template<class Query> VisibleObjectRows(sqlite3* root,Query query,int keyColumn=0):root_(root),keyColumn_(keyColumn) {
         for(auto* source:querySources(root)){
             auto rows=query(source);
             if(!rows)continue;
             cursors_.push_back({source,std::move(rows),{}});
-            advance(cursors_.back());
         }
+        // Finish growing cursors_ before storing pointers to its keys. Each
+        // indexed cursor then owns at most one heap entry until advanced.
+        for(size_t i=0;i<cursors_.size();++i)advance(i);
     }
     bool row() {
-        if(current_)advance(cursors_[*current_]);
-        current_.reset();
-        for(size_t i=0;i<cursors_.size();++i)
-            if(cursors_[i].key&&(!current_||*cursors_[i].key<*cursors_[*current_].key))current_=i;
-        return current_.has_value();
+        if(current_)advance(*current_);
+        for(;;) {
+            current_.reset();
+            if(next_.empty())return false;
+            current_=next_.top().cursor;next_.pop();
+            auto& cursor=cursors_[*current_];
+            if(objectSource(root_,*cursor.key,false,false,cursor.source)==cursor.source)return true;
+            advance(*current_);
+        }
     }
     Statement& values(){return *cursors_.at(current_.value()).rows;}
     sqlite3* source()const{return cursors_.at(current_.value()).source;}
+    const std::string& key()const{return *cursors_.at(current_.value()).key;}
 };
 
 inline std::optional<std::string> objectUuidFilter(const std::optional<std::vector<std::string>>& uuids)

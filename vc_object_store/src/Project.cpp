@@ -1,10 +1,12 @@
 #include "vc_object_store/objects/Project.hpp"
 #include "vc_object_store/Uuid.hpp"
 #include "vc_object_store/objects/TransactionJson.hpp"
+#include "internal/JsonFields.hpp"
 #include "vc_object_store/objects/ObjectCollection.hpp"
 #include "internal/Sqlite.hpp"
 #include <algorithm>
 #include <map>
+#include <limits>
 #include <tuple>
 
 namespace vc::objects {
@@ -55,7 +57,7 @@ struct ResourceWrite {
     std::optional<ObjectRecord> existing;
     bool unchanged() const {
         return existing && !existing->retired && existing->tags == record.tags &&
-            Json::parse(existing->meta) == Json::parse(record.meta);
+            detail::parseObjectJson(existing->meta) == detail::parseObjectJson(record.meta);
     }
     bool restore() const { return existing && existing->retired; }
 };
@@ -66,8 +68,8 @@ ResourceWrite prepareResourceWrite(const StoreReader& reader, ObjectRecord recor
     if (existing && (existing->record.kind != record.kind ||
         existing->record.storageKind != record.storageKind ||
         existing->record.storageRef != record.storageRef ||
-        Json::parse(existing->record.meta).value("owner", std::string{}) !=
-            Json::parse(record.meta).value("owner", std::string{})))
+        detail::parseObjectJson(existing->record.meta).value("owner", std::string{}) !=
+            detail::parseObjectJson(record.meta).value("owner", std::string{})))
         throw std::invalid_argument("project resource UUID belongs to a different object");
     return {std::move(record), existing ? std::optional(std::move(existing->record)) : std::nullopt};
 }
@@ -169,7 +171,7 @@ std::vector<ProjectResource> projectResources(const StoreReader& reader, const s
     std::vector<ProjectResource> resources;
     for (auto& record : records) {
         if (record.storageKind != kDatasetStorage) continue;
-        auto meta = Json::parse(record.meta);
+        auto meta = detail::parseObjectJson(record.meta);
         if (!meta.is_object()) meta = Json::object();
         auto owner = meta.value("owner", std::string{});
         if (viewer && !owner.empty() && owner != *viewer) continue;
@@ -247,7 +249,7 @@ void updateProjectResourceMeta(ObjectStoreSession& session, const AttachmentIden
     auto record = selected ? std::optional(selected->record) : std::nullopt;
     if (!record || record->retired || !isProjectResourceKind(record->kind))
         throw std::runtime_error("not a project resource: " + uuid);
-    auto merged = Json::parse(record->meta);
+    auto merged = detail::parseObjectJson(record->meta);
     const auto before = merged;
     merged.update(meta);
     if (merged.value("owner", std::string{}) != before.value("owner", std::string{}))
@@ -273,7 +275,7 @@ Json projectView(const StoreReader& reader, const std::string& author)
 {
     const auto head = reader.currentObject(projectViewUuid(author));
     if (!head || head->record.retired) return Json::object();
-    auto view = Json::parse(head->record.meta);
+    auto view = detail::parseObjectJson(head->record.meta);
     return view.is_object() ? view : Json::object();
 }
 
@@ -288,7 +290,7 @@ void setProjectView(ObjectStoreSession& session, const AttachmentIdentity& attac
     record.meta = (view.is_object() ? view : Json::object()).dump();
     std::optional<ObjectRecord> existing;
     const auto revision = selectedExpectation(session, attachment, record.uuid, &existing);
-    if (existing && Json::parse(existing->meta) == Json::parse(record.meta)) return;
+    if (existing && detail::parseObjectJson(existing->meta) == detail::parseObjectJson(record.meta)) return;
     writeRecord(session, attachment, record, revision, existing);
 }
 

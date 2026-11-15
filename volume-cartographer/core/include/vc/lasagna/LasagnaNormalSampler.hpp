@@ -19,10 +19,18 @@ namespace vc::lasagna
 void validateLasagnaNormalDatasetStructure(const LasagnaDataset& dataset);
 
 // The memory cache of the sampler's channel arrays: `memoryCache` when set (one
-// cache shared with other readers), else a new cache of maxCachedBytes.
+// cache shared with other readers), else an auto-sized cache when requested,
+// else a new fixed cache of maxCachedBytes.
 struct LasagnaNormalSamplerOptions {
     size_t maxCachedBytes = 512ULL * 1024ULL * 1024ULL;
     std::shared_ptr<vcr::MemoryCache> memoryCache;
+    std::optional<double> autoCacheFraction;
+    bool channelCache = false;
+    bool pointInterpolation = true;
+    bool windingPointInterpolation = true;
+    std::size_t readerThreads=0;
+    double windingRegionBaseVoxels = 4096.;
+    std::size_t windingBatchPoints = 262144;
 };
 
 class LasagnaNormalSampler final : public NormalSampler

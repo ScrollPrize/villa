@@ -88,6 +88,13 @@ public:
     // IDs respecting retained history. Call under a checked edit's read snapshot.
     std::vector<int64_t> assignGeometryPointIds(const std::string& objectUuid, const std::string& arrayName,
                                                std::vector<int64_t> ids) const;
+    // A hint: these revisions' descriptors, arrays and point annotations are
+    // about to be read. A hosted reader fetches what it has not cached in a
+    // few batched requests; a local reader does nothing. Never changes what
+    // the reads return.
+    virtual void prefetchGeometry(const std::vector<std::string>& /*revisionUuids*/,
+                                  const std::vector<std::string>& /*arrays*/,
+                                  const std::vector<std::string>& /*annotations*/) const {}
     virtual VolumeTransforms volumeTransforms() const = 0;
     // Complete listings (every page when the selection has no limit), with
     // the projections of ObjectStore::selectObjects/selectEdges.

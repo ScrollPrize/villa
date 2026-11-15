@@ -30,7 +30,10 @@ nlohmann::json loadGeometryManifest(sqlite3* db, const std::string& revision,
                                     const std::string& text, const std::string& contentHash) {
     if (geometryWork) geometryWork->manifestBytesRead += text.size();
     auto manifest = nlohmann::json::parse(text);
-    if (!manifest.contains("delta")) return verifiedGeometryManifest(text, contentHash);
+    if (!manifest.contains("delta")) {
+        verifyGeometryManifestHash(text,contentHash);
+        return manifest;
+    }
     jsonArrayField(manifest.at("delta"), "chunks");
     Statement checksum(db, "SELECT manifest_hash FROM geometry_deltas WHERE revision_uuid=?", parseUuid(revision));
     if (!checksum.row() || hashText(text) != readDigest(checksum,0) ||

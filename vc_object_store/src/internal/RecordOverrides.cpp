@@ -75,9 +75,9 @@ bool createRecordOverride(sqlite3* db,const char* table,const std::string& uuid)
     auto* source=object?objectSource(db,uuid):edgeSource(db,uuid);
     if(!source||source==db)return false;
     Savepoint save(db);
-    const auto id=allocateRecordId(db,table);
     RecordCommon common;
     if(object){
+        const auto id=allocateRecordId(db,table);
         auto record=resolveObject(db,uuid)->record;common=record;
         if (record.createdAt.size() == 20 && preciseObjectTimestamp(record.kind))
             record.createdAt = refineCreationStamp(record.createdAt, retainedCreationPublication(source, uuid));
@@ -91,10 +91,11 @@ bool createRecordOverride(sqlite3* db,const char* table,const std::string& uuid)
     }else{
         const auto record=resolveEdge(db,uuid)->record;common=record;
         referenceExtensionSchemas(source,db,table,record.meta);
-        insertEdgeRow(db,record,id,record.commitSequence,record.createdBy,record.createdHost,record.createdAt,true);
+        insertEdgeRow(db,record,record.commitSequence,record.createdBy,record.createdHost,record.createdAt,true);
     }
     // Copying a before-state is not a publication. Keep its stamps and
     // version; the ordinary mutation advances them once in this transaction.
+    if(!object)requireEdgeColumns(db,{"version","version_generation","changed_by","changed_at","changed_host"});
     execute(db,std::string("UPDATE ")+table+" SET version=?,version_generation=?,changed_by=?,changed_at=?,changed_host=? WHERE uuid=?",
         common.version.value_or(1),parseUuid(common.versionGeneration),common.changedBy,common.changedAt,common.changedHost,parseUuid(uuid));
     save.release();return true;

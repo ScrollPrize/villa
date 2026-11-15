@@ -3,6 +3,9 @@
 #include "internal/RecordFields.hpp"
 #include "internal/ImmutableImport.hpp"
 #include "internal/Versions.hpp"
+#include "internal/EdgeLayout.hpp"
+#include "internal/JsonFields.hpp"
+#include "vc_object_store/objects/EdgeKinds.hpp"
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
 #include "geometry/GeometryToken.hpp"
 #include "internal/RecordResolver.hpp"
@@ -62,7 +65,9 @@ std::string projectedObjectColumns(const ObjectFields& fields)
     std::string sql = "id";
     for (const auto& [name, fallback] : columns) {
         valid.insert(name);
-        sql += "," + (wants(fields, name) ? name : fallback);
+        // Publication identity accompanies every listing, independently of
+        // the requested content projection, in the same indexed row read.
+        sql += "," + ((wants(fields, name)||name=="version"||name=="version_generation") ? name : fallback);
     }
     for (const auto& field : *fields)
         if (!valid.contains(field)) throw std::invalid_argument("unknown object projection field: " + field);
@@ -78,19 +83,20 @@ void appendJournal(sqlite3* db, const std::string& author, const std::string& ho
         return;
     }
     commit_sequence = writeCommitSequence(db);
-    Statement state(db, "SELECT kind,approval_state,approved_by,approved_at,approved_host,approved_version FROM objects WHERE uuid=? AND state<>2 "
-        "UNION ALL SELECT kind,approval_state,approved_by,approved_at,approved_host,approved_version FROM edges WHERE uuid=? AND state=0",
+    Statement state(db, "SELECT kind,approval_state,approved_by,approved_at,approved_host,approved_version,0 FROM objects WHERE uuid=? AND state<>2 "
+        "UNION ALL SELECT kind,approval_state,approved_by,approved_at,approved_host,approved_version,1 FROM "+edgeReadSource(db)+" WHERE uuid=? AND state=0",
         uuid, uuid);
     const bool hasState = state.row();
     // Deleted entries have no current approval state. Their caller supplies
     // the record kind even though the UUID row remains as a tombstone.
-    const std::string kind = hasState ? state.text(0) : deletedKind;
+    const bool edge=hasState&&state.i64(6);
+    const std::string kind = hasState ? (edge?edgeKindName(state.i64(0)):state.text(0)) : deletedKind;
     if (kind.empty()) throw std::logic_error("object store: journal entry without record kind");
     Statement s(db, "INSERT INTO journal(record_uuid,record_kind,commit_sequence,author,hostname,timestamp,change_kind,"
                     "approval_state,approved_by,approved_at,approved_host,approved_version) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
         uuid, kind, commit_sequence, author, hostname, nowIsoUtc(), std::string(changeKind));
     for (int i = 0; i < 4; ++i) {
-        if (hasState && !state.isNull(1 + i)) s.bind(8 + i, state.text(1 + i));
+        if (hasState && !state.isNull(1 + i)) s.bind(8 + i, edge&&i==0?edgeApprovalName(state.i64(1)):state.text(1 + i));
         else s.bindNull(8 + i);
     }
     if (hasState && !state.isNull(5)) s.bind(12, state.i64(5));
@@ -168,25 +174,38 @@ template<class Visit> void detailTables(Visit visit)
 }
 }
 
-ObjectRecord readObjectRow(sqlite3* db, const Statement& s, bool details)
+namespace {
+std::string readObjectVersionGeneration(sqlite3* db,const Statement& s,int generationColumn,const std::string* initialGeneration)
+{
+    if(!s.isNull(generationColumn))return s.uuid(generationColumn);
+    if(initialGeneration)return *initialGeneration;
+    Statement lineage(db,"SELECT initial_generation FROM store_manifest WHERE singleton=1");
+    return lineage.row()?lineage.uuid(0):std::string{};
+}
+}
+ObjectVersion readObjectReferenceColumns(sqlite3* db,const Statement& s,int uuidColumn,int versionColumn,int generationColumn,
+    const std::string* initialGeneration,const std::string* ownerStore,const std::string* selectedUuid)
+{
+    return {ownerStore?*ownerStore:storeUuidText(db),readObjectVersionGeneration(db,s,generationColumn,initialGeneration),
+            selectedUuid?*selectedUuid:s.uuid(uuidColumn),s.i64(versionColumn)};
+}
+
+ObjectRecord readObjectRow(sqlite3* db, const Statement& s, bool details,
+                           const std::string* initialGeneration, bool lifecycle, const std::string* ownerStore)
 {
     ObjectRecord rec;
-    rec.versionStoreUuid=storeUuidText(db);
+    rec.versionStoreUuid=ownerStore?*ownerStore:storeUuidText(db);
     const int64_t id = s.i64(0);
     readCommon(rec, s, 1, 2, 4);
     rec.name = s.text(3);
     rec.formatVersion = s.i64(16);
     rec.storageKind = s.text(17);
     rec.storageRef = s.text(18);
-    rec.version = s.i64(19);
+    rec.version=s.i64(19);
+    rec.versionGeneration=readObjectVersionGeneration(db,s,22,initialGeneration);
     rec.dataChecksum = s.optText(20);
-    rec.meta = s.text(21);
-    if (!s.isNull(22)) rec.versionGeneration = s.uuid(22);
-    else {
-        Statement lineage(db, "SELECT initial_generation FROM store_manifest WHERE singleton=1");
-        if (lineage.row()) rec.versionGeneration = lineage.uuid(0);
-    }
-    readLifecycle(db, id, rec);
+    rec.meta = canonicalObjectJson(s.text(21));
+    if (lifecycle) readLifecycle(db, id, rec);
 
     if (!details) return rec;
     {
@@ -205,19 +224,48 @@ ObjectRecord readObjectRow(sqlite3* db, const Statement& s, bool details)
 std::vector<ObjectRecord> readObjectRows(sqlite3* db, Statement& rows, const ObjectFields& fields)
 {
     const bool hydrate = wants(fields, "tags") || wants(fields, "fiber") || wants(fields, "surface") || wants(fields, "track");
+    const bool lifecycle = wants(fields, "retired") || wants(fields, "lifecycle_epoch");
+    std::string initialGeneration,ownerStore;
+    Statement lineage(db, "SELECT m.initial_generation,i.uuid FROM store_manifest m CROSS JOIN store_identity i WHERE m.singleton=1");
+    if (!lineage.row()) throw std::runtime_error("object store: missing publication identity");
+    initialGeneration = lineage.uuid(0);ownerStore = lineage.uuid(1);
     std::vector<ObjectRecord> result;
-    nlohmann::json ids = nlohmann::json::array();
-    std::unordered_map<int64_t, size_t> positions;
-    std::set<std::string> kinds;
+    std::vector<int64_t> ids;
     while (rows.row()) {
-        if (hydrate) { positions.emplace(rows.i64(0), result.size()); ids.push_back(rows.i64(0)); }
-        result.push_back(readObjectRow(db, rows, false));
-        if (!wants(fields, "retired")) result.back().retired = false;
-        if (!wants(fields, "lifecycle_epoch")) result.back().lifecycleEpoch.clear();
-        if (hydrate) kinds.insert(result.back().kind);
+        if (hydrate || lifecycle) ids.push_back(rows.i64(0));
+        result.push_back(readObjectRow(db, rows, false, &initialGeneration, false, &ownerStore));
     }
-    if (result.empty() || !hydrate) return result;
-    const auto selection = ids.dump();
+    hydrateObjectRows(db,result,ids,fields);
+    return result;
+}
+
+void hydrateObjectRows(sqlite3* db,std::vector<ObjectRecord>& result,std::span<const int64_t> ids,
+                       const ObjectFields& fields)
+{
+    const bool hydrate = wants(fields, "tags") || wants(fields, "fiber") || wants(fields, "surface") || wants(fields, "track");
+    const bool lifecycle = wants(fields, "retired") || wants(fields, "lifecycle_epoch");
+    for(auto& record:result){
+        if(!wants(fields,"retired"))record.retired=false;
+        if(!wants(fields,"lifecycle_epoch"))record.lifecycleEpoch.clear();
+    }
+    if (result.empty() || (!hydrate && !lifecycle)) return;
+    if(result.size()!=ids.size())throw std::invalid_argument("object row hydration needs one ID per row");
+    std::unordered_map<int64_t,size_t> positions;
+    positions.reserve(ids.size());
+    std::set<std::string> kinds;
+    for(size_t i=0;i<ids.size();++i){
+        positions.emplace(ids[i],i);
+        if(hydrate)kinds.insert(result[i].kind);
+    }
+    const auto selection = nlohmann::json(std::vector<int64_t>(ids.begin(),ids.end())).dump();
+    if (lifecycle) {
+        Statement states(db, "SELECT id,state,lifecycle_epoch FROM objects WHERE id IN (SELECT value FROM json_each(?))", selection);
+        while (states.row()) {
+            auto& record = result.at(positions.at(states.i64(0)));
+            if (wants(fields, "retired")) record.retired = states.i64(1) == 1;
+            if (wants(fields, "lifecycle_epoch")) record.lifecycleEpoch = states.text(2);
+        }
+    }
     if (wants(fields, "tags")) {
         Statement tags(db, "SELECT object_id,tag FROM object_tags WHERE object_id IN (SELECT value FROM json_each(?)) ORDER BY object_id,tag",
             selection);
@@ -230,7 +278,6 @@ std::vector<ObjectRecord> readObjectRows(sqlite3* db, Statement& rows, const Obj
         Statement detail(db, sql, selection);
         while (detail.row()) result.at(positions.at(detail.i64(idColumn))).*member = read(detail);
     });
-    return result;
 }
 
 std::optional<int64_t> objectIdByUuid(sqlite3* db, const std::array<unsigned char, 16>& uuid)
@@ -317,11 +364,13 @@ void restoreCommon(sqlite3* db, const char* table, const RecordCommon& rec)
     // counter. The imported state is published here by this transaction.
     const auto commit_sequence = writeCommitSequence(db);
     const auto version = writeRecordVersion(db, table, rec.uuid);
-    execute(db, std::string("UPDATE ") + table + " SET commit_sequence=?,created_by=?,created_at=?,created_host=?,"
+    Statement update(db, std::string("UPDATE ") + table + " SET commit_sequence=?,created_by=?,created_at=?,created_host=?,"
         "changed_by=?,changed_at=?,changed_host=?,approval_state=?,approved_by=?,approved_at=?,approved_host=?,approved_version=? WHERE uuid=?",
         commit_sequence, rec.createdBy, rec.createdAt, rec.createdHost, rec.changedBy, rec.changedAt,
-        rec.changedHost, rec.approvalState, rec.approvedBy, rec.approvedAt, rec.approvedHost,
-        rec.approvedVersion ? std::optional<int64_t>(version) : std::nullopt, parseUuid(rec.uuid));
+        rec.changedHost);
+    if(std::string_view(table)=="edges")update.bind(8,edgeApprovalCode(rec.approvalState));else update.bind(8,rec.approvalState);
+    update.bind(9,rec.approvedBy);update.bind(10,rec.approvedAt);update.bind(11,rec.approvedHost);
+    update.bind(12,rec.approvedVersion?std::optional<int64_t>(version):std::nullopt);update.bind(13,parseUuid(rec.uuid));update.stepDone();
 }
 
 void validateGeometrySourceMetadata(sqlite3* db, const std::string& uuid, const nlohmann::json& source)
@@ -343,8 +392,7 @@ ObjectRecord prepareObjectRecord(const ObjectRecord& input)
     ObjectRecord rec = input;
     if (rec.uuid.empty())
         rec.uuid = util::newUuid();
-    if (rec.meta.empty())
-        rec.meta = "{}";
+    rec.meta=canonicalObjectJson(rec.meta);
     (void)parseUuid(rec.uuid);
     if(const auto bounds=recordBounds(rec))validateBounds(*bounds);
     return rec;
@@ -382,7 +430,7 @@ void insertObjectRow(sqlite3* db,const ObjectRecord& rec,int64_t id,int64_t comm
     if (preserveRecord && rec.approvedHost) s.bind(14, *rec.approvedHost); else s.bindNull(14);
     if (preserveRecord && rec.approvedVersion) s.bind(15, *rec.approvedVersion); else s.bindNull(15);
     s.bind(16, rec.formatVersion); s.bind(17, rec.storageKind); s.bind(18, rec.storageRef); s.bind(19, int64_t(1));
-    s.bind(20, rec.dataChecksum);s.bind(21, rec.meta);s.bind(22, id);
+    s.bind(20, rec.dataChecksum);if(rec.meta=="{}"||rec.meta.empty())s.bindNull(21);else s.bind(21,rec.meta);s.bind(22,id);
     if(geometryManifest)s.bindBorrowedText(23,*geometryManifest);else s.bindNull(23);
     s.stepDone();
     if (!immutableInitial(db)) execute(db,
@@ -459,7 +507,7 @@ std::string upsertObjectImpl(sqlite3* db, const std::string& author, const std::
         const auto version = writeObjectVersion(db, rec.uuid);
         execute(db, "UPDATE objects SET state=CASE WHEN state=2 THEN 0 ELSE state END,name=?,commit_sequence=?,changed_by=?,changed_at=?,changed_host=?,"
                         "approval_state='pending',approved_by=NULL,approved_at=NULL,approved_host=NULL,approved_version=NULL,"
-                        "format_version=?,storage_kind=?,storage_ref=?,version=?,data_checksum=?,meta=? WHERE id=?",
+                        "format_version=?,storage_kind=?,storage_ref=?,version=?,data_checksum=?,meta=nullif(?,'{}') WHERE id=?",
             rec.name, commit_sequence, author, now, host, rec.formatVersion, rec.storageKind, rec.storageRef,
             version, rec.dataChecksum, rec.meta, id);
     } else {
@@ -481,22 +529,18 @@ std::string upsertObjectImpl(sqlite3* db, const std::string& author, const std::
     return rec.uuid;
 }
 
-std::optional<int64_t> edgeIdByUuid(sqlite3* db, const std::array<unsigned char, 16>& uuid)
-{
-    Statement s(db, "SELECT id FROM edges WHERE uuid=?", uuid);
-    if (!s.row()) return std::nullopt;
-    return s.i64(0);
-}
-
 void stampContentChange(sqlite3* db, const std::string& author, const std::string& host, const char* table,
                         int64_t id, const std::array<unsigned char, 16>& uuid, const char* changeKind)
 {
+    const bool edge=std::string_view(table)=="edges";
+    if(edge)requireEdgeColumns(db,{"version","version_generation","changed_by","changed_at","changed_host","approval_state",
+                                 "approved_by","approved_at","approved_host","approved_version"});
     writeRecordVersion(db, table, formatUuid(uuid));
     const int64_t commit_sequence = writeCommitSequence(db);
     execute(db, std::string("UPDATE ") + table +
-                        " SET commit_sequence=?,changed_by=?,changed_at=?,changed_host=?,approval_state='pending',"
-                        "approved_by=NULL,approved_at=NULL,approved_host=NULL,approved_version=NULL WHERE id=?",
-        commit_sequence, author, nowIsoUtc(), host, id);
+                        " SET commit_sequence=?,changed_by=?,changed_at=?,changed_host=?,approval_state="+(edge?"0":"'pending'")+","
+                        "approved_by=NULL,approved_at=NULL,approved_host=NULL,approved_version=NULL WHERE uuid=?",
+        commit_sequence, author, nowIsoUtc(), host, uuid);
     appendJournal(db, author, host, uuid, commit_sequence, changeKind);
 }
 

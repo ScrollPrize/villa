@@ -41,9 +41,9 @@ without copies.
 
 ## Immutable and large-scale stores
 
-Schema 21 supports current-only storage (`history_enabled=False`), optional spatial indexing, sealing, [store_references, overlays and independent shards](docs/collections.md), and optional [packed SQLite containers](docs/packed-stores.md). Current record versions and the store commit sequence remain available with history disabled; requests for unavailable history fail explicitly. A lineage UUID is not a numeric change counter. Spatial queries require the spatial index.
+Schema 22 supports current-only storage (`history_enabled=False`), optional spatial indexing, sealing, [store_references, overlays and independent shards](docs/collections.md), and optional [packed SQLite containers](docs/packed-stores.md). Current record versions and the store commit sequence remain available with history disabled; requests for unavailable history fail explicitly. A lineage UUID is not a numeric change counter. Spatial queries require the spatial index.
 
-For large immutable datasets, the C++ [initial batch construction API](docs/initial-import.md) accepts objects, geometry and relationships from a shared parallel streaming source. See the [format and policy reference](docs/store-format.md) and [shared API contract](docs/store-api-contract.md).
+For large immutable datasets, the C++ [initial batch construction API](docs/initial-import.md) accepts objects, geometry and relationships from a shared parallel streaming source. See the [format and policy reference](docs/store-format.md), [schema integration contract](docs/schema-integration.md) and [shared API contract](docs/store-api-contract.md). The redesigned lazy/delta history layout remains deferred.
 
 ## Examples
 
@@ -137,7 +137,7 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 VC_OBJECT_STORE_BUILD_PYTHON_PATH=build/python 
   /path/to/python -m pytest vc_object_store/tests/python -q
 ```
 
-Older upstream stores (schema 16–20; the runtime opens schema 21) convert with
+Older upstream stores (schema 16–21; the runtime opens schema 22) convert with
 `vc_object_convert old.vcobj new.vcobj`, which also writes a revision mapping
 and a report beside the destination. Native directory export currently
 requires Linux `renameat2` or macOS `renamex_np`.

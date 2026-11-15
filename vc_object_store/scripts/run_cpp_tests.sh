@@ -20,6 +20,21 @@ case "$output_dir" in
         exit 2
         ;;
 esac
+build_dir=${VC_OBJECT_STORE_BUILD_DIR:-"$output_dir/build"}
+build_type=${VC_OBJECT_STORE_BUILD_TYPE:-RelWithDebInfo}
+if [[ "$build_dir" != /* || "$build_dir" == / ]]; then
+    echo 'VC_OBJECT_STORE_BUILD_DIR must be an absolute non-root path.' >&2
+    exit 2
+fi
+case "$build_dir" in
+    /tmp|/tmp/*|/var/tmp|/var/tmp/*|/private/tmp|/private/tmp/*)
+        echo 'Persistent builds must not be placed in a temporary directory.' >&2
+        exit 2 ;;
+esac
+case "$build_type" in
+    Debug|Release|RelWithDebInfo|MinSizeRel) ;;
+    *) echo 'Unsupported VC_OBJECT_STORE_BUILD_TYPE.' >&2; exit 2 ;;
+esac
 build_jobs=${VC_OBJECT_STORE_BUILD_JOBS:-8}
 test_jobs=${VC_OBJECT_STORE_TEST_JOBS:-8}
 for count in "$build_jobs" "$test_jobs"; do
@@ -28,7 +43,7 @@ for count in "$build_jobs" "$test_jobs"; do
         exit 2
     fi
 done
-mkdir -p -- "$output_dir/build" "$output_dir/logs" "$output_dir/tmp"
+mkdir -p -- "$build_dir" "$output_dir/logs" "$output_dir/tmp"
 fixture_root=${VC_OBJECT_STORE_FIXTURE_ROOT:-"$output_dir/tmp"}
 if [[ "$fixture_root" != /* || ! -d "$fixture_root" ]]; then
     echo 'VC_OBJECT_STORE_FIXTURE_ROOT must be an existing absolute directory.' >&2
@@ -52,15 +67,15 @@ export TMPDIR="$fixture_dir" TMP="$fixture_dir" TEMP="$fixture_dir"
 export AGENTS_AGENT_MODE=1
 log="$output_dir/logs/$(date -u +%Y%m%dT%H%M%SZ)-$$.log"
 {
-    printf 'Source: %s\nBuild: %s\nLog: %s\n' "$source_dir" "$output_dir/build" "$log"
+    printf 'Source: %s\nBuild: %s\nLog: %s\n' "$source_dir" "$build_dir" "$log"
     df -h "$output_dir"
     df -i "$output_dir"
-    cmake -S "$source_dir" -B "$output_dir/build" -G Ninja \
-        -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+    cmake -S "$source_dir" -B "$build_dir" -G Ninja \
+        -DCMAKE_BUILD_TYPE="$build_type" \
         -DVC_OBJECT_STORE_BUILD_ADAPTERS=OFF \
         -DVC_OBJECT_STORE_BUILD_LINKING=OFF \
         -DVC_OBJECT_STORE_BUILD_TOOLS=OFF \
         -DVC_OBJECT_STORE_BUILD_TESTS=ON
-    cmake --build "$output_dir/build" --parallel "$build_jobs"
-    ctest --test-dir "$output_dir/build" --output-on-failure --parallel "$test_jobs"
+    cmake --build "$build_dir" --parallel "$build_jobs"
+    ctest --test-dir "$build_dir" --output-on-failure --parallel "$test_jobs"
 } 2>&1 | tee "$log"

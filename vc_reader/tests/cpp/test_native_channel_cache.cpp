@@ -13,6 +13,26 @@
 #endif
 
 namespace fs = std::filesystem;
+
+// Exercise a domain policy without importing any domain-specific reader code.
+struct MaskedPolicy {
+    static constexpr bool custom=true,clamp_boundary=true;
+    static constexpr std::size_t components=2;
+    using real_type=float;
+    std::vector<float>& output;
+    std::int64_t offset(std::size_t c,std::size_t a) const {return a==0?2*std::int64_t(c):0;}
+    template<class Cell> void prepare_cell(Cell& cell) const {
+        cell.k=3;cell.axes[0]=3;cell.axes[1]=2;cell.axes[2]=1;
+    }
+    template<class Cell,class Read> float evaluate(const Cell& cell,Read read) const {
+        const auto weights=vcr::sampling::cornerWeights(std::array<float,3>{cell.frac[3],cell.frac[2],cell.frac[1]});
+        float sum=0.f,total=0.f;
+        for(std::size_t k=0;k<8;++k)if(read(k,0)>0) {sum+=weights[k]*read(k,1);total+=weights[k];}
+        return total>0?sum/total:-1.f;
+    }
+    void store(std::size_t p,float v)const{output[p]=v;}
+    void outside(std::size_t p)const{output[p]=-1.f;}
+};
 void require(bool condition, const char* message)
 {
     if (!condition) throw std::runtime_error(message);
@@ -82,6 +102,39 @@ void check_codec(const fs::path& path, const std::string& codec)
     unrelated.identity += "-baseline";
     vcr::Array baseline(unrelated,std::make_shared<vcr::MemoryCache>(1<<20));
     reader.request_channel_cache({0,2,4});
+    for(int baseChannel:{0,2}) {
+        const std::vector<float> xyz{0,0,0,1.25f,2.5f,3.75f,7,7,7,7.1f,0,0,-1,0,0,NAN,0,0};
+        const vcr::PointCoordinates<float> coordinates{xyz.data(),3};
+        const vcr::ChannelCoordinates selected{coordinates,baseChannel};
+        std::vector<float> actual(6),expected(6,-1.f);
+        const MaskedPolicy policy{actual};
+        reader.sample_interpolated_coordinates(selected,actual.size(),vcr::ElementType{'u',1,false},policy);
+        for(size_t p=0;p<3;++p) {
+            // PointCoordinates uses the array's ZYX axis order.
+            const float z=xyz[3*p],y=xyz[3*p+1],x=xyz[3*p+2];
+            vcr::sampling::Cell<4,float> cell;
+            const float c[]{float(baseChannel),z,y,x};
+            vcr::sampling::cellOf(c,4,cell,[](auto){return int64_t(0);});policy.prepare_cell(cell);
+            expected[p]=policy.evaluate(cell,[&](size_t k,size_t component){
+                const auto xx=std::min(7,int(std::floor(x))+int(k&1));
+                const auto yy=std::min(7,int(std::floor(y))+int(k>>1&1));
+                const auto zz=std::min(7,int(std::floor(z))+int(k>>2&1));
+                return float(Fixture::value(baseChannel+2*component,zz,yy,xx));
+            });
+        }
+        require(actual==expected,"custom policy uses direct and split interpolation with masked channels");
+        memory->clear();
+        actual.assign(6,123.f);
+        std::array<uint8_t,6> missing{};
+        const auto readsBefore=reader.stats().disk_hits.load();
+        reader.sample_interpolated_coordinates(selected,actual.size(),vcr::ElementType{'u',1,false},policy,missing.data());
+        for(size_t p=0;p<3;++p)
+            require(missing[p]==1&&actual[p]==123.f,"cache-only policy miss preserves interior and split outputs");
+        for(size_t p=3;p<6;++p)
+            require(missing[p]==0&&actual[p]==-1.f,"policy handles invalid coordinates without source misses");
+        require(reader.stats().disk_hits.load()==readsBefore,"cache-only policies perform no source reads");
+        memory->clear();
+    }
     Fixture::read_channel(reader,0);
     const auto one_read_bytes = memory->nbytes();
     if (one_read_bytes != f.first_channel_cached_planes*Fixture::plane)
@@ -182,9 +235,11 @@ int main()
             std::promise<void> locked,release;
             auto released = release.get_future().share();
             auto holder = std::async(std::launch::async,[&] {
-                std::lock_guard hold((*policy->reads)[std::hash<std::string>{}("0.0.0.0")%policy->reads->size()]);
-                locked.set_value();
-                released.wait();
+                auto claim=policy->reads.acquire(migration.spec.identity+"|0.0.0.0");
+                claim.resolve([&] {
+                    locked.set_value();released.wait();
+                    return std::shared_ptr<const vcr::ChunkLoad>(std::make_shared<vcr::ChunkLoad>());
+                });
             });
             locked.get_future().wait();
             auto reads = std::async(std::launch::async,[&] {
@@ -198,7 +253,7 @@ int main()
             release.set_value(); // release even if a regression blocked the reader
             holder.get();
             reads.get();
-            require(ready == std::future_status::ready,"resident/cache-only reads waited on source-I/O stripe");
+            require(ready == std::future_status::ready,"resident/cache-only reads waited on in-flight source I/O");
 #ifndef _WIN32
             std::lock_guard parent_hold(policy->mutex);
             const auto child = fork();

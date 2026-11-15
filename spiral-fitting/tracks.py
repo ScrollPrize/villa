@@ -632,78 +632,90 @@ def _track_tortuosities(tracks, arclengths):
     return result
 
 
+def _filter_tracks_by_endpoints(
+        tracks, keep_endpoints, track_families, max_points_per_chunk,
+        return_indices, label):
+    """Keep the tracks for which ``keep_endpoints`` (float32 (N, 2, 3) first
+    and last points -> bool (N,)) is true; packed or list tracks."""
+    if track_families is not None and len(track_families) != len(tracks):
+        raise ValueError('track_families must be parallel to tracks')
+    keep = np.zeros(len(tracks), dtype=bool)
+    tracks_per_chunk = max(1, int(max_points_per_chunk) // 2)
+    packed = isinstance(tracks, PackedTrackCollection)
+    if packed:
+        candidates = np.arange(len(tracks), dtype=np.int64)
+    else:
+        candidates = np.asarray(
+            [index for index, track in enumerate(tracks) if len(track)], dtype=np.int64)
+    for start in range(0, len(candidates), tracks_per_chunk):
+        batch = candidates[start:start + tracks_per_chunk]
+        if packed:
+            rows = tracks.rows[batch]
+            endpoints = np.stack((
+                tracks.coordinates[tracks.offsets[rows]],
+                tracks.coordinates[tracks.offsets[rows + 1] - 1]), axis=1)
+        else:
+            endpoints = np.stack([
+                np.stack([tracks[index][0], tracks[index][-1]]) for index in batch])
+        keep[batch] = keep_endpoints(endpoints.astype(np.float32, copy=False))
+    kept_indices = np.flatnonzero(keep)
+    if packed:
+        filtered_tracks = tracks.subset(kept_indices)
+    else:
+        filtered_tracks = [tracks[index] for index in kept_indices]
+    filtered_families = None
+    if track_families is not None:
+        filtered_families = (np.asarray(track_families)[kept_indices] if packed
+                             else [track_families[index] for index in kept_indices])
+    print(f'{label}: kept {len(filtered_tracks)} / {len(tracks)} tracks; '
+          f'excluded {len(tracks) - len(filtered_tracks)}')
+    result = (filtered_tracks, filtered_families)
+    if return_indices:
+        return (*result, kept_indices)
+    return result
+
+
+def _unfiltered(tracks, track_families, return_indices):
+    result = (tracks, track_families)
+    if return_indices:
+        return (*result, np.arange(len(tracks), dtype=np.int64))
+    return result
+
+
 def filter_tracks_to_outer_shell(
         tracks, shell_envelope, track_families=None, max_points_per_chunk=500_000,
         return_indices=False):
     """Drop tracks whose two endpoints are outside the shell envelope."""
     if shell_envelope is None or not tracks:
-        result = (tracks, track_families)
-        if return_indices:
-            return (*result, np.arange(len(tracks), dtype=np.int64))
-        return result
-    if track_families is not None and len(track_families) != len(tracks):
-        raise ValueError('track_families must be parallel to tracks')
+        return _unfiltered(tracks, track_families, return_indices)
 
-    if isinstance(tracks, PackedTrackCollection):
-        keep = np.zeros(len(tracks), dtype=bool)
-        tracks_per_chunk = max(1, int(max_points_per_chunk) // 2)
-        for start in range(0, len(tracks), tracks_per_chunk):
-            local_rows = np.arange(
-                start, min(start + tracks_per_chunk, len(tracks)),
-                dtype=np.int64)
-            rows = tracks.rows[local_rows]
-            begin = tracks.offsets[rows]
-            end = tracks.offsets[rows + 1] - 1
-            endpoints = np.stack((
-                tracks.coordinates[begin], tracks.coordinates[end]), axis=1)
-            with torch.no_grad():
-                target_radius, radius, _confidence, _valid = shell_envelope.lookup(
-                    torch.from_numpy(endpoints.reshape(-1, 3)))
-                endpoint_inside = (radius <= target_radius).view(-1, 2).any(dim=1)
-            keep[local_rows] = endpoint_inside.cpu().numpy()
-        kept_indices = np.flatnonzero(keep)
-        filtered_tracks = tracks.subset(kept_indices)
-        filtered_families = (
-            np.asarray(track_families)[kept_indices]
-            if track_families is not None else None)
-        print(
-            f'outer-shell track filter: kept {len(filtered_tracks)} / {len(tracks)} '
-            f'tracks; excluded {len(tracks) - len(filtered_tracks)} entirely '
-            'outside tracks (packed)')
-        result = (filtered_tracks, filtered_families)
-        if return_indices:
-            return (*result, kept_indices)
-        return result
-
-    keep = np.zeros(len(tracks), dtype=bool)
-    nonempty = np.asarray(
-        [index for index, track in enumerate(tracks) if len(track)], dtype=np.int64)
-    tracks_per_chunk = max(1, int(max_points_per_chunk) // 2)
-    for start in range(0, len(nonempty), tracks_per_chunk):
-        batch_indices = nonempty[start:start + tracks_per_chunk]
-        endpoints = np.stack([
-            np.stack([tracks[index][0], tracks[index][-1]])
-            for index in batch_indices
-        ]).astype(np.float32, copy=False)
+    def inside(endpoints):
         with torch.no_grad():
             target_radius, radius, _confidence, _valid = shell_envelope.lookup(
                 torch.from_numpy(endpoints.reshape(-1, 3)))
-            endpoint_inside = (radius <= target_radius).view(-1, 2).any(dim=1)
-        keep[batch_indices] = endpoint_inside.cpu().numpy()
+            return (radius <= target_radius).view(-1, 2).any(dim=1).cpu().numpy()
+    return _filter_tracks_by_endpoints(
+        tracks, inside, track_families, max_points_per_chunk, return_indices,
+        'outer-shell track filter (entirely outside tracks excluded)')
 
-    kept_indices = np.flatnonzero(keep)
-    filtered_tracks = [tracks[index] for index in kept_indices]
-    filtered_families = (
-        [track_families[index] for index in kept_indices]
-        if track_families is not None else None)
-    print(
-        f'outer-shell track filter: kept {len(filtered_tracks)} / {len(tracks)} tracks; '
-        f'excluded {len(tracks) - len(filtered_tracks)} entirely outside tracks'
-    )
-    result = (filtered_tracks, filtered_families)
-    if return_indices:
-        return (*result, kept_indices)
-    return result
+
+def filter_tracks_inside_umbilicus_radius(
+        tracks, umbilicus_z_to_yx, min_radius, track_families=None,
+        max_points_per_chunk=500_000, return_indices=False):
+    """Drop tracks whose two endpoints both lie within ``min_radius`` voxels
+    of the umbilicus axis (``umbilicus_z_to_yx``: z -> (y, x)), so a crushed
+    core does not supervise the innermost windings."""
+    if min_radius <= 0 or not tracks:
+        return _unfiltered(tracks, track_families, return_indices)
+
+    def outside(endpoints):
+        points = endpoints.reshape(-1, 3).astype(np.float64)
+        centre = np.asarray(umbilicus_z_to_yx(points[:, 0]), dtype=np.float64)
+        radius = np.hypot(points[:, 1] - centre[:, 0], points[:, 2] - centre[:, 1])
+        return (radius >= min_radius).reshape(-1, 2).any(axis=1)
+    return _filter_tracks_by_endpoints(
+        tracks, outside, track_families, max_points_per_chunk, return_indices,
+        f'inner-radius track filter (both endpoints within {min_radius:g} of the umbilicus)')
 
 
 def _length_bin_probabilities(arclengths, weights, device):

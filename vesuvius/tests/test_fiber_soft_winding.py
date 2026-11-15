@@ -239,7 +239,7 @@ def test_sample_preparation_reuses_signed_geometry(monkeypatch):
     monkeypatch.setattr(fiber_store, 'fiber_volume', lambda path: '123')
     monkeypatch.setattr(vis, 'load_umbilicus_frame', lambda *args: np.array([[0., 0., 0.], [0., 0., 20.]]))
     xyz = np.array([[10., 0., 0.], [10., 0., 20.]])
-    monkeypatch.setattr(fiber_store, 'read_polylines', lambda *args, **kwargs: [({'id': fid(5)}, xyz)])
+    monkeypatch.setattr(fiber_store, 'iter_polylines', lambda *args, **kwargs: iter([({'id': fid(5)}, xyz)]))
     d = dict(source_id=np.array([fid(5)]), family=np.array([1]), start=np.array([2.]), end=np.array([18.]),
              node_ds=np.array([[0., -8., -16.]]), i=np.array([0]), j=np.array([0]),
              ds_a=np.array([-3.]), ds_b=np.array([-10.]))
@@ -267,7 +267,7 @@ def test_sample_preparation_reuses_signed_geometry(monkeypatch):
 
     # Node-only priors use exact perpendicular topology, deduplicating equal
     # base arcs; parallel bases and endpoint fallbacks must not reappear.
-    monkeypatch.setattr(fiber_store, 'read_polylines', lambda *args, **kwargs: [({'id': fid(k)}, xyz) for k in (5,6,7)])
+    monkeypatch.setattr(fiber_store, 'iter_polylines', lambda *args, **kwargs: iter([({'id': fid(k)}, xyz) for k in (5,6,7)]))
     d=dict(source_id=np.array([fid(k) for k in (5,6,7)]),family=np.array([1,0,0]),
         start=np.full(3,2.),end=np.full(3,18.),
         node_ds=np.array([[0.,-8.,-16.],[0.,8.,16.],[0.,8.,16.]]),
@@ -287,6 +287,29 @@ def test_sample_preparation_reuses_signed_geometry(monkeypatch):
     d['parallel'][:]=True
     empty=soft.prepare_samples(cfg,d)
     assert all(v.shape==(0,) for v in empty.values())
+
+
+@pytest.mark.parametrize('family', [0, 1])
+@pytest.mark.parametrize('direction', [-1, 1])
+def test_parallel_prior_samples_identical(family, direction):
+    axis=np.array([[0.,0.,0.],[0.,0.,20.]])
+    xyz=np.array([[10.,0.,0.],[9.,4.,4.],[7.,7.,9.],[4.,9.,14.]])
+    length=np.linalg.norm(np.diff(xyz,axis=0),axis=1).sum()
+    n=9
+    d=dict(source_id=np.arange(n),family=np.full(n,family),start=np.zeros(n),
+        end=np.full(n,length),node_ds=np.tile([0.,direction*length],(n,1)),
+        i=np.arange(n),j=np.arange(n),ds_a=np.full(n,direction*2.),ds_b=np.full(n,direction*8.))
+    geometry=[(dict(id=i),xyz) for i in range(n)]
+    cfg=dict(arc_prior_spacing_vx=3.,prior_sample_batch=2)
+    serial=soft.prepare_samples_geometry(cfg,d,geometry,axis)
+    parallel=soft.prepare_samples_geometry(dict(cfg,prior_sample_workers=2),d,geometry,axis)
+    for key in serial:np.testing.assert_array_equal(serial[key],parallel[key])
+    # Scalar interpolation oracle, including signed-arc direction and ordering.
+    arc,_,angle,_=soft.uv.fiber_geometry(xyz,family,axis)
+    for ds,z in zip(serial['v_ds'],serial['v_z']):
+        assert z == np.interp(direction*ds,arc,xyz[:,2])
+    for ds,phase in zip(serial['ds'],serial['phase']):
+        assert phase == np.interp(direction*ds,arc,angle)
 
 
 def test_full_combination_keeps_shared_priors_once():
