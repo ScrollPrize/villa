@@ -889,6 +889,18 @@ def read_snapshot(store, request, selected=None):
         outer_shell=shell_object)
 
 
+def _retained_versions(store, refs):
+    """objects_at_versions as the store answers it now. A served store's
+    handle answers numbered records from its cache, which still holds a
+    version the store no longer retains (a history-off edit); the selection's
+    retention check therefore asks the service itself."""
+    endpoint = getattr(store, 'endpoint', None)
+    if endpoint and hasattr(store, 'session'):
+        from vc_object_store import HostedStore
+        return HostedStore(endpoint).objects_at_versions(refs)
+    return store.objects_at_versions(refs)
+
+
 def _selected_tracks(store, pins, uuids):
     """{UUID: revision} of the selected tracks at their pinned versions,
     read as objects alone, under the guard the store applies to
@@ -901,7 +913,7 @@ def _selected_tracks(store, pins, uuids):
         return {}
     revisions = {}
     refs = pins.refs(uuids)
-    for ref, revision in zip(refs, store.objects_at_versions(refs)):
+    for ref, revision in zip(refs, _retained_versions(store, refs)):
         if revision is None or revision.get('deleted'):
             raise ObjectStoreInputError([f'selected object is not retained: {ref["object"]}'])
         revisions[revision['object_uuid']] = revision

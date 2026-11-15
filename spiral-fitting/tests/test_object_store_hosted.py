@@ -296,6 +296,22 @@ def test_tracks_and_their_crossings_through_the_endpoint(tmp_path):
     with serving(path, tmp_path) as endpoint:
         hosted = osi.load_fit_inputs(fit_config(endpoint, 'service', input_use_tracks=True),
                                      log=quiet, cache_directory=str(cache))
+        # The retention check of the track versions asks the service, not
+        # the handle's record cache (warm after the read above).
+        import vc_object_store
+        asked = []
+
+        class Recording(vc_object_store.HostedStore):
+            def objects_at_versions(self, refs, *args):
+                asked.append(len(refs))
+                return super().objects_at_versions(refs, *args)
+        original, vc_object_store.HostedStore = vc_object_store.HostedStore, Recording
+        try:
+            again = osi.load_fit_inputs(fit_config(endpoint, 'service', input_use_tracks=True),
+                                        log=quiet, cache_directory=str(cache))
+        finally:
+            vc_object_store.HostedStore = original
+        assert asked and set(asked) == {3} and again.digest == hosted.digest
     assert hosted.counts['tracks'] == 3 and hosted.counts['track crossings'] == 2
     assert len(hosted.snapshot.objects_of('track')) == 3
     local = osi.load_fit_inputs(
