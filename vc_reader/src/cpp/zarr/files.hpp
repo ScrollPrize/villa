@@ -9,6 +9,8 @@
 #include <vector>
 
 namespace vcr::zarr::detail {
+void releaseDiskBudget(const std::string& root);
+
 // Writes beside the destination and publishes only after the complete file closes.
 void atomicWriteFile(const std::filesystem::path& path, const std::function<void(std::ostream&)>& write);
 
