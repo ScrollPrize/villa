@@ -704,8 +704,13 @@ files differ only in the provenance entry). It took 1 h 01 min on 8 vCPU with 7
 worker processes, 6.2 CPU-hours and 5.7 GB peak memory for the whole job,
 and streamed 35.4 GB of CT. On PHercParis4 generation 19, z 8000-9000,
 windings 15-44, it took 7 min 51 s, 0.33 CPU-hours and 9.1 GB, and passed
-the write-back check below (correlation 0.983, error ratio 0.177); that
-says the write is faithful, not that the fit improved there.
+the write-back check below (correlation 0.983, error ratio 0.177). On the
+whole generation-19 fit (z 4000-17750, windings 10-135) it took 7 h 31 min
+on the same machine, 43.0 CPU-hours, and streamed 279.7 GB of CT; it peaked
+at 23.3 GB for the whole job although its own plan said 15.1 GB, so allow
+24 GB for a fit of this size. It passed the check (0.972 / 0.243) and moved
+6,888,291 of 22,115,072 nodes (median 1.21 voxel). Passing says the write
+is faithful, not that the fit improved there.
 
 - **Input.** A fitted checkpoint, its `umbilicus.json` (found as for the
   flattener, or `--umbilicus`), and the CT level the fit was made in: a Zarr
@@ -757,7 +762,7 @@ says the write is faithful, not that the fit improved there.
   it is move size, not node choice: a plain half-size version of the
   nearest-ridge field gives the same score on M8. Winding jumps per 1,000
   line points rise slightly on 7 of the 8 reference rows. On PHercParis4 the
-  stage itself has run on one band only; an earlier nearest-ridge field
+  stage itself has only been run, not scored; an earlier nearest-ridge field
   applied to the mesh (not this code) showed no gain on 55 human lines that
   two window fits were never given (311 points: -0.02 / -0.04 voxel against
   a bar of -0.3). Moves are about a voxel (median node move 0.93 voxel on
@@ -766,7 +771,15 @@ says the write is faithful, not that the fit improved there.
   voxels, where one winding spans a long path in the CT). The writer halves
   a move locally rather than push a gap below min(old gap, 3 voxels); some
   cells still end below that floor (5,010 on the example, 16,362 on the
-  PHercParis4 band). Tests (`tests/test_ridge_correct_checkpoint.py`) use a
+  PHercParis4 band, 340,294 on the whole PHercParis4 fit). A whole winding
+  can be skipped: on the whole PHercParis4 fit no node of winding 104 moves,
+  although its neighbours move 30% and 25% of theirs. The step that centres
+  each winding's reference profile on its peak can land far outside its
+  +-0.3 winding search window; the reference is then constant and no node on
+  that winding gets a candidate ridge. Windings 125 and 126 of that fit end
+  0.50 and 0.38 winding off centre and are edited anyway; the effect on
+  their moves has not been measured. The command does not warn about either
+  case. Tests (`tests/test_ridge_correct_checkpoint.py`) use a
   synthetic fit and CT: they check correctness, not usefulness.
 
 ## Hover descriptions (descriptions.json)
