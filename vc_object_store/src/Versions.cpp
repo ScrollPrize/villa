@@ -5,6 +5,7 @@
 #include "internal/EdgeLayout.hpp"
 #include "internal/RecordResolver.hpp"
 #include "internal/ObjectVersionJson.hpp"
+#include "internal/ReadTiming.hpp"
 
 #include <limits>
 
@@ -541,6 +542,7 @@ std::vector<SelectedRelationship> ObjectStore::relationshipsAt(const Txn& txn, c
 {
     std::vector<ObjectRevision> selection;
     std::set<std::string> selected;
+    detail::ScopedReadTimer timer(detail::readTiming().relationshipResolve);
     for (const auto& reference : versions) {
         const auto revision = objectAtVersion(txn, reference);
         if (!revision)

@@ -13,6 +13,7 @@
 #include "internal/ObjectVersionJson.hpp"
 #include "internal/RecordOverrides.hpp"
 #include "internal/ReferenceResolver.hpp"
+#include "internal/ReadTiming.hpp"
 #include <limits>
 
 namespace vc::objects {
@@ -946,21 +947,29 @@ std::vector<SelectedRelationship> ObjectStore::relationshipsAtSelected(const Txn
         if(found==revisions.end())return true; // Incident bindings still expose off-screen endpoints.
         return reference==found->second.reference();
     };
+    auto& timing = readTiming();
     for (const auto& revision : selection) {
         const auto& uuid=revision.objectUuid;
         const auto* value=&revisions.at(uuid);
-        const auto archived=value->uuid.empty()?std::map<std::string,std::string>{}:members(db,value->uuid);
+        std::map<std::string,std::string> archived;
+        { ScopedReadTimer timer(timing.members); if(!value->uuid.empty()) archived=members(db,value->uuid); }
         Membership selected;
         // Include bindings created in overlays or other shards only when they
         // actually record this exact endpoint. Never replace archived membership
         // using a newer endpoint merely because the attachment has no history.
-        const auto source=resolveObjectVersion(db,value->reference());
+        std::optional<ResolvedObjectVersion> source;
+        { ScopedReadTimer timer(timing.scopeResolve); source=resolveObjectVersion(db,value->reference()); }
         std::vector<sqlite3*> scopes{db};
         if(source->source!=db&&!historyEnabled(source->source))scopes.push_back(source->source);
         std::set<std::string> seenBindings;
         for(auto* scope:scopes){
-            for(const auto& visible:incidentEdges(scope,uuid)){
-                const auto binding=recordedRelationship(scope,visible.uuid);
+            std::vector<EdgeRecord> visibleEdges;
+            { ScopedReadTimer timer(timing.incident); visibleEdges=incidentEdges(scope,uuid); }
+            timing.incidentEdges += long(visibleEdges.size());
+            for(const auto& visible:visibleEdges){
+                std::optional<RelationshipRevision> binding;
+                { ScopedReadTimer timer(timing.recorded); binding=recordedRelationship(scope,visible.uuid); }
+                ++timing.recordedCalls;
                 if(!binding)continue;
                 if(!matchesSelectedEndpoint(binding->record.aUuid,binding->aReference)||
                    !matchesSelectedEndpoint(binding->record.bUuid,binding->bReference))continue;
@@ -972,10 +981,12 @@ std::vector<SelectedRelationship> ObjectStore::relationshipsAtSelected(const Txn
         }
         // Resolve only surviving physical memberships, after current bindings
         // have taken precedence. Each distinct archive is decoded once.
+        ScopedReadTimer archiveTimer(timing.archives);
         for(const auto& [edge,archive]:archived)if(!selected.contains(edge)){
             auto known=archives.find(archive);
             if(known==archives.end()){
                 auto binding=relationship(db,archive);
+                ++timing.archiveDecodes;
                 known=archives.emplace(archive,binding.reference()).first;
                 bindings.try_emplace(known->second,std::move(binding));
             }
@@ -985,6 +996,7 @@ std::vector<SelectedRelationship> ObjectStore::relationshipsAtSelected(const Txn
         memberships.emplace(uuid, std::move(selected));
     }
     std::vector<SelectedRelationship> result;
+    ScopedReadTimer appliesTimer(timing.applies);
     for (const auto& version : versions) {
         auto edge = bindings.at(version);
         auto endpoint = [&](const std::string& object, const Anchor& anchor, const std::optional<std::string>& geometry,
@@ -993,15 +1005,16 @@ std::vector<SelectedRelationship> ObjectStore::relationshipsAtSelected(const Txn
             if (found == revisions.end()) return false;
             const auto& membership = memberships.at(object);
             const auto member = membership.find(edge.record.uuid);
-            return ((member != membership.end() && member->second == version) ||
-                    (member == membership.end() && matchesSelectedEndpoint(object,pinned))) &&
-                endpointApplies(*this, txn, anchor, geometry, pinned, found->second);
+            if (!((member != membership.end() && member->second == version) ||
+                  (member == membership.end() && matchesSelectedEndpoint(object,pinned)))) return false;
+            ++timing.appliesCalls;
+            return endpointApplies(*this, txn, anchor, geometry, pinned, found->second);
         };
         const bool applicable = endpoint(edge.record.aUuid, edge.record.aAnchor, edge.aGeometryRevision, edge.aReference) &&
                                 endpoint(edge.record.bUuid, edge.record.bAnchor, edge.bGeometryRevision, edge.bReference);
         result.push_back({std::move(edge), applicable});
     }
-    orderRelationships(result);
+    { ScopedReadTimer timer(timing.order); orderRelationships(result); }
     return result;
 }
 

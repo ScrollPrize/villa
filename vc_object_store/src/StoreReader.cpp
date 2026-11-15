@@ -4,6 +4,7 @@
 #include "vc_object_store/objects/TransactionJson.hpp"
 #include "internal/TransformedLength.hpp"
 #include "internal/ObjectVersionJson.hpp"
+#include "internal/ReadTiming.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -21,12 +22,18 @@ SelectedInputs LocalStoreReader::selectedInputs(const std::vector<ObjectVersion>
         (inherited && before.commitSequence != position.commitSequence))
         throw StoreBusy("selected inputs: requested graph position is no longer available");
     SelectedInputs result;
-    const auto records = objectsAtVersions(refs);
-    for (size_t i = 0; i < refs.size(); ++i) {
-        if (!records[i] || records[i]->deleted) throw std::invalid_argument("selected object is not retained: " + refs[i].objectUuid);
-        result.objects.push_back(*records[i]);
+    auto& timing = detail::readTiming();
+    timing.reset();
+    {
+        detail::ScopedReadTimer timer(timing.objects);
+        const auto records = objectsAtVersions(refs);
+        for (size_t i = 0; i < refs.size(); ++i) {
+            if (!records[i] || records[i]->deleted) throw std::invalid_argument("selected object is not retained: " + refs[i].objectUuid);
+            result.objects.push_back(*records[i]);
+        }
     }
     result.relationships = relationshipsAt(refs);
+    timing.report("selectedInputs", result.objects.size(), result.relationships.size());
     return result;
 }
 
