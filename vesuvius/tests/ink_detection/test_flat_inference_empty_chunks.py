@@ -107,7 +107,7 @@ def test_inference_completes_skipped_tiles_without_adding_weights(
         metadata[:, 1] += roi_bounds[2]
     model = _ZeroLogits()
     run_block_inference(
-        loader=DataLoader(TensorDataset(images, metadata), batch_size=batch_size),
+        loader=DataLoader(TensorDataset(images, metadata, torch.ones((2, 2, 2), dtype=torch.bool)), batch_size=batch_size),
         model=model, accumulator=accumulator,
         weight_map=np.ones((2, 2), dtype=np.float32), mask=None,
         device=torch.device("cpu"), amp_dtype=None, tta_axes=(),
@@ -128,7 +128,7 @@ def test_all_raw_empty_batch_finishes_without_model_forward():
     metadata = torch.tensor([[0, 0, 2, 2, 0], [0, 1, 2, 2, 0]])
     model = _ZeroLogits()
     run_block_inference(
-        loader=DataLoader(TensorDataset(images, metadata), batch_size=2),
+        loader=DataLoader(TensorDataset(images, metadata, torch.zeros((2, 2, 2), dtype=torch.bool)), batch_size=2),
         model=model, accumulator=accumulator,
         weight_map=np.ones((2, 2), dtype=np.float32), mask=None,
         device=torch.device("cpu"), amp_dtype=None, tta_axes=(),

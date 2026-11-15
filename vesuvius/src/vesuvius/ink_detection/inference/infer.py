@@ -652,7 +652,8 @@ class FlatBlockDataset(Dataset):
         )
         # Measure occupancy before normalization because robust normalization
         # maps an all-zero patch to nonzero values.
-        nonempty = int(patch_HWZ.any())
+        valid_HW = patch_HWZ.any(axis=-1)
+        nonempty = int(valid_HW.any())
         patch_ZYX = np.moveaxis(patch_HWZ, -1, 0)
         patch_ZYX = normalize_flat_patch(patch_ZYX, self.preprocessing)
         image_CZYX = torch.from_numpy(patch_ZYX).unsqueeze(0)
@@ -660,7 +661,7 @@ class FlatBlockDataset(Dataset):
             [block.y0, block.x0, block.valid_h, block.valid_w, nonempty],
             dtype=torch.int64,
         )
-        return image_CZYX, metadata
+        return image_CZYX, metadata, torch.from_numpy(valid_HW)
 
 
 def unflip_spatial_output_for_patch_axes(
@@ -904,11 +905,11 @@ class ThreadedBatchLoader:
             self.dataset[index]
             for index in range(start, min(len(self.dataset), start + self.batch_size))
         ]
-        images, metadata = zip(*items)
+        images, metadata, validity = zip(*items)
         images_BCZYX = torch.stack(images)
         if torch.cuda.is_available():
             images_BCZYX = images_BCZYX.pin_memory()
-        return images_BCZYX, torch.stack(metadata)
+        return images_BCZYX, torch.stack(metadata), torch.stack(validity)
 
     def __iter__(self):
         starts = iter(range(0, len(self.dataset), self.batch_size))
@@ -948,7 +949,7 @@ def run_block_inference(
         else nullcontext()
     )
     with torch.inference_mode(), autocast:
-        for images_BCZYX, metadata in loader:
+        for images_BCZYX, metadata, validity in loader:
             # The dataset records occupancy on raw patches; normalized all-zero
             # input is not a valid signal for this skip.
             keep = metadata[:, 4] > 0
@@ -974,6 +975,7 @@ def run_block_inference(
                 device, non_blocking=device.type == "cuda"
             )
             metadata = metadata[keep]
+            validity = validity[keep].numpy()
             if tta_axes:
                 probabilities = predict_with_mirror_tta(
                     model,
@@ -987,10 +989,10 @@ def run_block_inference(
                     image_hw=tuple(int(value) for value in images_BCZYX.shape[-2:]),
                 )
             probabilities_np = probabilities.cpu().numpy()[:, 0]
-            for probability, values in zip(probabilities_np, metadata.numpy()):
+            for probability, values, valid in zip(probabilities_np, metadata.numpy(), validity):
                 y0, x0, valid_h, valid_w = (int(value) for value in values[:4])
                 tile = probability[:valid_h, :valid_w]
-                weights = weight_map[:valid_h, :valid_w]
+                weights = weight_map[:valid_h, :valid_w] * valid[:valid_h, :valid_w]
                 if mask_f32 is not None:
                     weights = weights * mask_f32[
                         y0 : y0 + valid_h, x0 : x0 + valid_w

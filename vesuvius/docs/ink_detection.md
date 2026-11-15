@@ -475,6 +475,11 @@ crop. It prefers `ema_model`, then common flat state-dict aliases, then
 `model`. The output is a tiled LZW uint8 BigTIFF. Probabilities are clipped to
 `[0,1]`, multiplied by 255, and truncated to uint8.
 
+Pixels that are zero in every selected raw CT layer receive zero output,
+including empty areas inside partially occupied patches. This check runs before
+normalization and combines with `--mask-path` when supplied. Normalization and
+model execution still use the complete input patches.
+
 Flat inference has a narrower preprocessing contract than training. It accepts
 `robust_mad` only with the default 1st and 99th percentiles, and `divide` only
 with `divisor: 255`. Other normalization modes are rejected rather than being

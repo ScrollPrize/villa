@@ -31,16 +31,20 @@ SENTINEL = -7777.0
 class _IndexedPatches(Dataset):
     """Patch i is filled with i + 1, so any foreign value is detectable."""
 
-    def __init__(self, count, shape, metadata):
+    def __init__(self, count, shape, metadata, *, validity=False):
         self.count = count
         self.shape = shape
         self.metadata = metadata
+        self.validity = validity
 
     def __len__(self):
         return self.count
 
     def __getitem__(self, index):
-        return torch.full(self.shape, float(index + 1)), self.metadata(index)
+        sample = torch.full(self.shape, float(index + 1)), self.metadata(index)
+        if self.validity:
+            return *sample, torch.ones(self.shape[-2:], dtype=torch.bool)
+        return sample
 
 
 class _HostOverwritingModel(nn.Module):
@@ -80,6 +84,7 @@ def test_flat_block_inference_keeps_mps_inputs_intact():
         count,
         (1, 17, patch, patch),
         lambda index: torch.tensor([0, 0, patch, patch, 1]),
+        validity=True,
     )
     model = _HostOverwritingModel((1, patch, patch))
     run_block_inference(

@@ -1,0 +1,24 @@
+{
+  "sample": "PHerc0800",
+  "segment": "20251029010146-auto_grown_20251029010146642",
+  "volume": "s3://vesuvius-challenge-open-data/PHerc0800/volumes/20250521135224-8.640um-1.2m-116keV-masked.zarr/",
+  "render": "--scale 1 --group-idx 0 --num-slices 21 --flip-normals",
+  "crop_zyx": [
+    [
+      2,
+      19
+    ],
+    [
+      256,
+      384
+    ],
+    [
+      64,
+      192
+    ]
+  ],
+  "checkpoint": "scrollprize/ink_9um hybrid_3d2d-seed42/step-075000.pth",
+  "checkpoint_sha256": "e635558ae6a1a807a7e5ec1e83adfd45bc3c0ac53883ea43f1d4e085d62a9cab",
+  "fixture_sha256": "9be2d2058942b2ea0d84d4afea1d5623d286c16b1ead045fbc87ec9d06bfc631",
+  "contents": "Rendered CT and unmodified CPU model logits for one patch crossing the segment boundary."
+}
