@@ -2,6 +2,7 @@
 #include "internal/Anchors.hpp"
 #include "internal/Database.hpp"
 #include "geometry/GeometryInternal.hpp"
+#include "geometry/Dependencies.hpp"
 #include "vc_object_store/object_links/ObjectLinks.hpp"
 #include "vc_object_store/Uuid.hpp"
 
@@ -146,6 +147,10 @@ static DetectorReport commitCandidatesImpl(objects::ObjectStore& db, objects::Wr
     size_t processed = 0;
     objects::util::reportProgress(progress, "writing links", 0, candidates.size());
     phase.reset(); phase.emplace("links.write");
+    // One dependency-geometry cache for the whole batch: each addEdge opens its
+    // own scope, which inherits this one instead of starting empty, so the
+    // (bounded) cache serves consecutive links that share an endpoint.
+    objects::detail::DependencyScope dependencies;
     for (const auto& c : candidates) {
         objects::util::reportProgress(progress, "writing links", processed++, candidates.size());
         const std::string key = candidateKey(c);

@@ -878,17 +878,30 @@ void detail::publishHistory(sqlite3* db, bool baseline)
         return row.uuid(0);
     };
     step.reset(); step.emplace("history.edge_revisions");
+    // Within this commit an endpoint's pinned revision for a geometry and the
+    // lifecycle epoch of a pinned revision do not change: look each up once.
+    std::map<std::pair<std::string, std::optional<std::string>>, ObjectRevisionKey> pins;
+    std::map<ObjectRevisionKey, std::string> epochs;
+    const auto pinOf = [&](const std::string& object, const std::optional<std::string>& geometry) {
+        const auto key = std::pair{object, geometry};
+        auto found = pins.find(key);
+        if (found == pins.end()) found = pins.emplace(key, pin(object, geometry)).first;
+        return found->second;
+    };
+    const auto epochOf = [&](const ObjectRevisionKey& reference) -> const std::string& {
+        auto found = epochs.find(reference);
+        if (found == epochs.end()) found = epochs.emplace(reference, metadata(db, reference).value("lifecycle_epoch", "")).first;
+        return found->second;
+    };
     for (const auto& edge : edges) {
         if (edge.record) {
-            const auto aPin = edge.aPin ? *edge.aPin : pin(edge.record->aUuid, edge.aGeometry);
-            const auto bPin = edge.bPin ? *edge.bPin : pin(edge.record->bUuid, edge.bGeometry);
+            const auto aPin = edge.aPin ? *edge.aPin : pinOf(edge.record->aUuid, edge.aGeometry);
+            const auto bPin = edge.bPin ? *edge.bPin : pinOf(edge.record->bUuid, edge.bGeometry);
             if (!baseline) writeRecordVersion(db,"edges",edge.uuid);
             Statement currentEdge(db, "SELECT "+projectedEdgeColumns(db)+" FROM "+edgeReadSource(db)+" AS edges WHERE uuid=?",parseUuid(edge.uuid)); currentEdge.row();
             execute(db, "INSERT INTO relationship_revisions VALUES(?,?,?,?,?,?,?)", parseUuid(edge.version), parseUuid(edge.uuid),
                 edgeToJson(readEdgeRow(db,currentEdge), nullptr, false).dump(), sqlReference(aPin), sqlReference(bPin), sqlReference(edge.aGeometry), sqlReference(edge.bGeometry));
-            const auto a = metadata(db, aPin);
-            const auto b = metadata(db, bPin);
-            bindLifecycle(db, *edge.record, a.value("lifecycle_epoch", ""), b.value("lifecycle_epoch", ""));
+            bindLifecycle(db, *edge.record, epochOf(aPin), epochOf(bPin));
             commit.relationship(edge.uuid, edge.version);
         } else {
             commit.relationship(edge.uuid, std::nullopt);
