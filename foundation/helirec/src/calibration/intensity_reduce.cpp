@@ -73,15 +73,40 @@ std::vector<float> weight_map(const std::vector<const float*>& flats, int rows, 
     return g;
 }
 
+std::array<int, 2> lit_rows(const float* flat_less_dark, int rows, int cols, double share) {
+    if (rows < 1 || cols < 1) throw Error("lit_rows: no image");
+    std::vector<double> level(static_cast<std::size_t>(rows), 0.0);
+#pragma omp parallel for schedule(static)
+    for (int r = 0; r < rows; ++r) {
+        double s = 0;
+        for (int c = 0; c < cols; ++c) s += flat_less_dark[static_cast<std::size_t>(r) * static_cast<std::size_t>(cols) + static_cast<std::size_t>(c)];
+        level[static_cast<std::size_t>(r)] = s / cols;
+    }
+    const int brightest = static_cast<int>(std::max_element(level.begin(), level.end()) - level.begin());
+    const double least = share * level[static_cast<std::size_t>(brightest)];
+    int lo = brightest, hi = brightest + 1;
+    while (lo > 0 && level[static_cast<std::size_t>(lo - 1)] >= least) --lo;
+    while (hi < rows && level[static_cast<std::size_t>(hi)] >= least) ++hi;
+    return {lo, hi};
+}
+
 ApodisationWidths apodisation_widths(int n_cols, double est_cor_main_offset, double companion_dx, double transition_width_horizontal,
                                      double transition_width_borders) {
     const double r = (n_cols - 1) / 2.0 + est_cor_main_offset;
-    if (r < (n_cols - 1) / 2.0) throw Error("rotation axis in the left half of the main scan is not supported yet");
-    const double pente = std::min(2 * transition_width_horizontal, n_cols - r);
-    if (!(companion_dx < 0)) throw Error("companion on the right of the main scan is not supported yet");
-    ApodisationWidths w;  // companion on the left of the main scan
-    w.main_left = transition_width_borders, w.main_right = pente;
-    w.companion_left = 0.0, w.companion_right = transition_width_borders;
+    ApodisationWidths w;
+    if (companion_dx < 0) {  // companion on the left of the main scan (the reference's)
+        if (r < (n_cols - 1) / 2.0) throw Error("the rotation axis lies in the main scan's left half and the companion on its left: the axis is taken to lie in the half away from the companion");
+        const double pente = std::min(2 * transition_width_horizontal, n_cols - r);
+        w.main_left = transition_width_borders, w.main_right = pente;
+        w.companion_left = 0.0, w.companion_right = transition_width_borders;
+    } else if (companion_dx > 0) {  // on its right: the same, mirrored
+        if (r > (n_cols - 1) / 2.0) throw Error("the rotation axis lies in the main scan's right half and the companion on its right: the axis is taken to lie in the half away from the companion");
+        const double pente = std::min(2 * transition_width_horizontal, r + 1.0);
+        w.main_left = pente, w.main_right = transition_width_borders;
+        w.companion_left = transition_width_borders, w.companion_right = 0.0;
+    } else {
+        throw Error("a companion at the main scan's own columns has no side");
+    }
     return w;
 }
 

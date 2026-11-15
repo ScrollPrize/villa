@@ -34,7 +34,7 @@ double time_of(const Acquisition& acq, double row_time, const Sighting& g) { ret
 // the record at a sighting under a rows' timing, and what a change of that timing moves it by (model::now)
 model::At at_of(const Acquisition& acq, double row_time, const Sighting& g) {
     const StretchLayout& st = stretch_of(acq, g);
-    const double t = time_of(acq, row_time, g), lever = g.row - mid_row(acq);
+    const double t = time_of(acq, row_time, g), lever = timing_rows(acq, g.row);
     model::At at{at_frame(st.course.angle_deg, t) * (kPi / 180.0), at_frame(st.course.rows, t), acq.scans[static_cast<std::size_t>(g.scan)].mid_height, mid_row(acq), (acq.cols - 1) / 2.0, acq.per_depth};
     at.th_per_timing = lever * (at_frame(st.course.angle_deg, t + 0.5) - at_frame(st.course.angle_deg, t - 0.5)) * (kPi / 180.0);
     at.H_per_timing = lever * (at_frame(st.course.rows, t + 0.5) - at_frame(st.course.rows, t - 0.5));
@@ -65,6 +65,12 @@ struct Blocks {
     double timing[1] = {0};   // the rows' timing [frames per row]
     geometry::Map shape;      // the map's terms and normalisation
     std::vector<double> map;  // Eu's coefficients, then Ev's (empty: no map)
+    // The map's four terms of a radial displacement as one unknown (GeometryOptions::radial_map): the unknown, and
+    // what a unit of it is in each of the coefficients above (tie; nothing but for those four, which stand at
+    // nothing in `map` and are not unknowns of their own).
+    bool radial = false;
+    double radial_map[1] = {0};
+    std::vector<double> tie;
     std::vector<std::array<double, 4>> own;              // per scan: axis, axis_slope, axial_scale, column_scale
     std::vector<std::array<double, 3>> place;            // per scan
     std::vector<std::array<double, 3>> turn;             // per scan: the sample's rotation against the anchor's (x, y, z)
@@ -73,13 +79,36 @@ struct Blocks {
     std::vector<std::vector<std::array<double, 1>>> stretch;  // per scan, per stretch
     int terms() const { return static_cast<int>(shape.i.size()); }
 };
-Blocks blocks_of(const Acquisition& acq, const Parameters& p) {
+// The map's terms of a radial displacement tied into one unknown (GeometryOptions::radial_map states it): what a
+// unit of it is in the map's coefficients, and its value in a map (its Eu's term in the column cubed; the four
+// coefficients are then the unknown's, and stand at nothing in the block of coefficients). It is an error if the
+// map lacks one of the four terms (a map of the third order has them: geometry::empty_map(rows, cols, 3)).
+void tie_radially(Blocks& b) {
+    const int nt = b.terms();
+    const auto term = [&](int i, int j) {
+        for (int k = 0; k < nt; ++k)
+            if (b.shape.i[static_cast<std::size_t>(k)] == i && b.shape.j[static_cast<std::size_t>(k)] == j) return static_cast<std::size_t>(k);
+        throw Error(fmt("geometry: the radial form of the map needs its term of the column's power %d and the row's %d (a map of the third order)", i, j));
+    };
+    // rows over columns of the map's two scales: the form is of pixels, the same along both
+    const double rho = b.shape.vs / b.shape.cs;
+    const std::size_t n = static_cast<std::size_t>(nt);
+    b.tie.assign(2 * n, 0.0);
+    b.tie[term(3, 0)] = 1.0, b.tie[term(1, 2)] = rho * rho, b.tie[n + term(2, 1)] = rho, b.tie[n + term(0, 3)] = rho * rho * rho;  // K (x, y) (x^2 + y^2)
+    b.radial = true;
+    b.radial_map[0] = b.map[term(3, 0)];
+    for (std::size_t k = 0; k < 2 * n; ++k)
+        if (b.tie[k] != 0.0) b.map[k] = 0.0;
+}
+
+Blocks blocks_of(const Acquisition& acq, const Parameters& p, bool radial_map = false) {
     if (p.scans.size() != acq.scans.size()) throw Error("geometry: the parameters hold " + std::to_string(p.scans.size()) + " scans, the acquisition " + std::to_string(acq.scans.size()));
     Blocks b;
     terms_of(p.map);
     b.shape = p.map;
     b.map = p.map.eu;
     b.map.insert(b.map.end(), p.map.ev.begin(), p.map.ev.end());
+    if (radial_map) tie_radially(b);
     b.detector[0] = p.roll;
     b.pitch[0] = p.pitch;
     b.timing[0] = row_time_of(acq, p);
@@ -100,8 +129,11 @@ Blocks blocks_of(const Acquisition& acq, const Parameters& p) {
 Parameters parameters_of(const Blocks& b) {
     Parameters p;
     p.map = b.shape;
-    p.map.eu.assign(b.map.begin(), b.map.begin() + b.terms());
-    p.map.ev.assign(b.map.begin() + b.terms(), b.map.end());
+    std::vector<double> map = b.map;
+    if (b.radial)  // the four tied coefficients are the radial unknown's
+        for (std::size_t k = 0; k < map.size(); ++k) map[k] += b.tie[k] * b.radial_map[0];
+    p.map.eu.assign(map.begin(), map.begin() + b.terms());
+    p.map.ev.assign(map.begin() + b.terms(), map.end());
     p.roll = b.detector[0];
     p.pitch = b.pitch[0];
     p.row_time = b.timing[0];
@@ -128,6 +160,7 @@ struct Slot {
     int place_of = -1;   // the scan whose place (d, height) it is part of; -1: none
     bool of_volume = false;  // a place or a rotation: what lens patches give (the rest is the projections')
     bool gauge = false;  // never free: nothing can tell it from another unknown
+    bool tied = false;   // never free: one of the map's four radial terms, which are the one unknown "map.radial"
 };
 // lensed: per scan, whether a lens patch names it. apart: whether two scans at different places on the rotation
 // stage are compared at equal angle (what gives the pitch)
@@ -140,11 +173,14 @@ std::vector<Slot> slots_of(const Acquisition& acq, Blocks& b, const std::vector<
     const char* stage[4] = {"height_once_cos", "height_once_sin", "axis_twice_cos", "axis_twice_sin"};
     for (int i = 0; i < 4; ++i) out.push_back({std::string("stage.") + stage[i], b.stage, 4, i, true});
     const int nt = b.terms();
+    // the map's four terms of a radial displacement as one unknown (held unless freed, as the coefficients)
+    if (b.radial) out.push_back({"map.radial", b.radial_map, 1, 0, false});
     for (int half = 0; half < 2; ++half)
         for (int k = 0; k < nt; ++k) {
             const std::size_t t = static_cast<std::size_t>(k);
             Slot s{fmt("map.%s.i%dj%d", half ? "ev" : "eu", b.shape.i[t], b.shape.j[t]), b.map.data(), 2 * nt, half * nt + k, false};
             s.gauge = !half && b.shape.i[t] == 1 && b.shape.j[t] == 0;  // Eu's line in the column: a scale of the columns
+            s.tied = b.radial && b.tie[static_cast<std::size_t>(half * nt + k)] != 0.0;
             out.push_back(s);
         }
     for (std::size_t k = 0; k < acq.scans.size(); ++k) {
@@ -196,6 +232,8 @@ struct SameLines {
     model::At a, b;
     double ca = 0, va = 0, cb = 0, vb = 0;  // the stored pixels
     std::vector<double> phi_a, phi_b;       // the map's terms there
+    double radial_a[2] = {0, 0}, radial_b[2] = {0, 0};  // what a unit of the map's radial unknown moves the columns and the rows by there
+    int at_radial = -1;                            // where the residual's parameters hold that unknown; -1: none
     bool opposite = false;
     int at_map = -1;                               // where the residual's parameters hold the map; -1: none
     int at_once = -1;                              // and the scan's height once per turn in its own views; -1: two scans
@@ -207,9 +245,10 @@ struct SameLines {
     bool operator()(T const* const* p, T* r) const {
         const int terms = static_cast<int>(phi_a.size());
         const T* map = at_map < 0 ? nullptr : p[at_map];
+        const T* radial = at_radial < 0 ? nullptr : p[at_radial];
         T xa, ya, xb, yb, sa, za, sb, zb;
-        model::ideal_position(map, phi_a.data(), terms, ca, va, xa, ya);
-        model::ideal_position(map, phi_b.data(), terms, cb, vb, xb, yb);
+        model::ideal_position(map, phi_a.data(), terms, radial, radial_a[0], radial_a[1], ca, va, xa, ya);
+        model::ideal_position(map, phi_b.data(), terms, radial, radial_b[0], radial_b[1], cb, vb, xb, yb);
         const T beyond = p[3][0] - timing;  // the rows' timing as it stands, beyond the one the record was read at
         const model::Now<T> when_a = model::now(a, beyond), when_b = model::now(b, beyond);
         model::ray_of(p[0], p[1], p[at_a[0]], p[at_a[1]], p[at_a[2]], a, when_a, xa, ya, sa, za);
@@ -276,6 +315,15 @@ Wiring wire(const Acquisition& acq, Blocks& b, const Comparison& c) {
         geometry::map_basis(b.shape, c.b.col, c.b.row, w.f.phi_b.data());
         w.f.at_map = static_cast<int>(w.blocks.size());
         w.blocks.push_back(b.map.data()), w.sizes.push_back(2 * nt);
+        if (b.radial) {  // a unit of the radial unknown: the four coefficients it stands for, at the sighting
+            for (int k = 0; k < nt; ++k) {
+                const std::size_t t = static_cast<std::size_t>(k), n = static_cast<std::size_t>(nt);
+                w.f.radial_a[0] += b.tie[t] * w.f.phi_a[t], w.f.radial_a[1] += b.tie[n + t] * w.f.phi_a[t];
+                w.f.radial_b[0] += b.tie[t] * w.f.phi_b[t], w.f.radial_b[1] += b.tie[n + t] * w.f.phi_b[t];
+            }
+            w.f.at_radial = static_cast<int>(w.blocks.size());
+            w.blocks.push_back(b.radial_map), w.sizes.push_back(1);
+        }
     }
     const auto place = [&](double* block, int size) {
         for (std::size_t i = 0; i < w.blocks.size(); ++i)
@@ -345,7 +393,7 @@ Ray ray_of(const Acquisition& acq, const Parameters& p, const Sighting& g) {
     map.insert(map.end(), p.map.ev.begin(), p.map.ev.end());
     geometry::map_basis(p.map, g.col, g.row, phi.data());
     double X, Y;
-    model::ideal_position(map.data(), phi.data(), nt, g.col, g.row, X, Y);
+    model::ideal_position<double>(map.data(), phi.data(), nt, nullptr, 0.0, 0.0, g.col, g.row, X, Y);
     Ray r;
     r.angle_deg = at.th * (180.0 / kPi) + fan_angle(acq, row_time, g);
     model::ray_of(detector, stage, own, place, stretch, at, model::now(at, 0.0), X, Y, r.s, r.z);
@@ -395,7 +443,8 @@ Comparison comparison_of(const Acquisition& acq, const std::string& kind, int sc
     c.b.row = c.a.row + m.dv + at_frame(tb.rows, c.b.frame) - at_frame(ta.rows, c.a.frame + m.dq);
     c.b.col = q.mirror ? m.col_b + across - m.du : m.col_b + across + m.du;
     if (q.sway_px != 0.0) {  // B was read that much further on (session.hpp)
-        const double angle = at_frame(tb.angle_deg, c.b.frame) + q.sway_row_deg * (c.b.row - mid_row(acq)) - q.sway_phase_deg;
+        const double from_middle = c.b.row - mid_row(acq);
+        const double angle = at_frame(tb.angle_deg, c.b.frame) + q.sway_row_deg * (q.sway_rows_from_middle ? std::fabs(from_middle) : from_middle) - q.sway_phase_deg;
         c.b.col += q.sway_px * std::cos(angle * (kPi / 180.0));
     }
     return c;
@@ -419,8 +468,9 @@ GeometrySolution solve_determined(const Acquisition& acq, const std::vector<Comp
         std::vector<std::string> more;
         for (const GeometrySolution::Correlated& c : solution.correlated) {
             if (std::fabs(c.correlation) <= options.undetermined_map) continue;
+            // (not the radial unknown: it is what stands for the terms that the comparisons do not give one by one)
             for (const std::string* name : {&c.a, &c.b})
-                if (name->rfind("map.", 0) == 0 && std::find(more.begin(), more.end(), *name) == more.end()) more.push_back(*name);
+                if (name->rfind("map.", 0) == 0 && *name != "map.radial" && std::find(more.begin(), more.end(), *name) == more.end()) more.push_back(*name);
         }
         if (more.empty()) break;
         for (const std::string& n : more) how.held.push_back(n), held.push_back(n);
@@ -464,7 +514,7 @@ GeometrySolution solve_once(const Acquisition& acq, const std::vector<Comparison
     so.huber = options.huber, so.max_iterations = options.max_iterations;
     fitting::validate(so);
     if (!std::isfinite(options.lens_huber) || options.lens_huber < 0) throw Error("geometry: the lens patches' Huber scale is not a number from zero up");
-    Blocks blocks = blocks_of(acq, start);
+    Blocks blocks = blocks_of(acq, start, options.radial_map);
     std::vector<LensLines> lines;
     std::vector<std::uint8_t> lensed(acq.scans.size(), 0);
     lines.reserve(lens.size());
@@ -492,6 +542,10 @@ GeometrySolution solve_once(const Acquisition& acq, const std::vector<Comparison
             if (among(options.held, s)) s.free = false;
             if (s.gauge && s.free) {
                 if (std::count(options.freed.begin(), options.freed.end(), s.name)) throw Error("geometry: " + s.name + " cannot be told from the pixel size and is not solved for");
+                s.free = false;
+            }
+            if (s.tied && s.free) {
+                if (std::count(options.freed.begin(), options.freed.end(), s.name)) throw Error("geometry: " + s.name + " is one of the map's four radial terms, which are solved as one (map.radial)");
                 s.free = false;
             }
         }
@@ -622,6 +676,11 @@ GeometrySolution solve_once(const Acquisition& acq, const std::vector<Comparison
     }
     if (!out.solver.usable) throw Error(out.solver.termination + ": " + out.solver.message);
     out.parameters = parameters_of(blocks);
+    if (blocks.radial) {
+        const double R = blocks.shape.cs;
+        out.radial_map.solved = true;
+        out.radial_map.cubic = blocks.radial_map[0], out.radial_map.k = blocks.radial_map[0] / (R * R * R);
+    }
 
     out.residual = residuals(acq, out.parameters, comparisons);
     std::map<std::tuple<std::string, int, int>, std::vector<std::size_t>> groups;
@@ -721,6 +780,8 @@ std::string solution_json(const Acquisition& acq, const GeometrySolution& s) {
     Json correlated = Json::list();
     for (const GeometrySolution::Correlated& c : s.correlated) correlated.add(Json::list().add(Json::of(c.a)).add(Json::of(c.b)).add(num(c.correlation)));
     out.set("map", map).set("free", names(s.free)).set("unused", names(s.unused));
+    if (const GeometrySolution::RadialMap& r = s.radial_map; r.solved)  // (the map above is this, written out in its terms)
+        out.set("radial_map", Json::dict().set("cubic", num(r.cubic)).set("k_per_px2", num(r.k)));
     if (!s.undetermined.empty()) out.set("undetermined", names(s.undetermined));  // (the map's terms held: GeometryOptions::undetermined_map)
     out.set("correlated", correlated).set("solver", solver).set("left", left);
     return out.text();

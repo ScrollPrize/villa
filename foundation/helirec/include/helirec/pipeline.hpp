@@ -91,7 +91,21 @@ struct ReconConfig {
     // A slice lies at one row of every projection, so the correction is an angle per slice and bin: applied with
     // the angles of each slice (angle_interp "nearest" and a backprojector that takes them; not ghbp, not the
     // legacy reference mode: SliceReconstructor::rolling_shutter() tells what is in use). 0: one angle per frame.
+    // rolling_shutter_from_middle: the two halves of the detector are read at once, the rows counted from the middle
+    // row to both ends: the row v was recorded rolling_shutter x (the angular step) x |v - middle row| / (rows - 1)
+    // from the projection's angle (above nothing: the middle row first; below: the first and last row first).
     double rolling_shutter = 0;
+    bool rolling_shutter_from_middle = false;
+    // The beam's divergence (a source at a finite distance) [rad per detector column, signed]: the ray a scan records
+    // at its column c is the parallel beam's at the projection's angle + fan_per_column x (c - the middle column).
+    // Two things follow, both taken by the exact backprojector (fbp, bands) as one table of the merged columns
+    // (BackprojectParams::fan): a scan that stands elsewhere across the beam sees the sample turned by the fan of
+    // the columns between, and within a frame a point nearer the source is recorded further from the axis. Where
+    // scans share a merged column (the blend between two columns of a grid) the table holds the mean of their
+    // fans by their weights. The filter stays the parallel beam's; the divergence along the axis (rows) is not
+    // taken. 0: a parallel beam. Not with ghbp (its own: axis_source_meters), the whole-slice methods or the legacy
+    // reference mode: SliceReconstructor::fan_per_column() tells what is in use.
+    double fan_per_column = 0;
     // Split reconstructions: with angle_subsets > 1 only subset number angle_subset of that many interleaved subsets
     // of the projections is used (helical.hpp angle_subset: by angle, the same angles in every scan), on a grid of
     // 1 / angle_subsets of the angles (unless n_grid says otherwise). The subsets of a scan have independent noise
@@ -219,6 +233,9 @@ class SliceReconstructor {
     std::pair<int, int> mend_domain() const;   // [x0, x1) merged columns the mending works on
     double exposure_arc_bins() const;          // the deconvolved exposure arc in grid angles (0: none)
     double rolling_shutter() const;            // the rolling shutter in use (frame periods over the rows; 0: none)
+    double fan_per_column() const;             // the beam's divergence in use [rad per column] (0: a parallel beam)
+    // the fan of every merged column [rad] as the backprojector takes it (empty: a parallel beam)
+    const std::vector<float>& fan_of_columns() const;
     std::string angle_interp() const;          // the angular gridding in use: "views", "nearest" or "linear"
     std::string z_interp() const;              // the vertical kernel in use
     std::vector<int> projection_counts() const;   // projections in use, per scan (a subset: fewer than recorded)

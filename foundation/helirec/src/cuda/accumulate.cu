@@ -67,6 +67,11 @@ __global__ void lum_apply_kernel(float* R, const float* RW, const float* Wp, con
     R[o] = __fadd_rn(R[o], __fsub_rn(__fmul_rn(d, Wp[o]), __fmul_rn(dfin, RW[o])));
 }
 
+__global__ void add_into_kernel(float* R, const float* A, size_t n) {
+    for (size_t i = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x; i < n; i += static_cast<size_t>(gridDim.x) * blockDim.x)
+        R[i] = __fadd_rn(R[i], A[i]);
+}
+
 __global__ void divide_kernel(float* R, const float* RW, size_t n) {
     for (size_t i = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x; i < n; i += static_cast<size_t>(gridDim.x) * blockDim.x)
         R[i] = RW[i] > 0 ? __fdiv_rn(R[i], RW[i]) : 0.f;
@@ -184,6 +189,11 @@ void luminosity_apply(float* R, const float* RW, const float* W_prev, const floa
     const int LH = L * H;
     dim3 grid((NX + 255) / 256, std::min(LH, 65535), (LH + 65534) / 65535);
     lum_apply_kernel<<<grid, 256, 0, as_stream(stream)>>>(R, RW, W_prev, A_ha, B_ha, A_tot, B_tot, L * H, NX, rep);
+    HELIREC_CUDA_CHECK(cudaGetLastError());
+}
+
+void add_into(float* R, const float* A, std::size_t n, void* stream) {
+    add_into_kernel<<<static_cast<unsigned>(std::min<size_t>((n + 255) / 256, 65535u * 16u)), 256, 0, as_stream(stream)>>>(R, A, n);
     HELIREC_CUDA_CHECK(cudaGetLastError());
 }
 

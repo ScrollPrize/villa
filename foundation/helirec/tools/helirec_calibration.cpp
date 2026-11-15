@@ -3,7 +3,7 @@
 //   helirec-calibration check-record <scan.h5> [<more scans.h5> ...] [--no-frames] [--checks LIST] [--out DIR]
 //                                    [--inventory DIR] [--json FILE] [--threads N] [--frames N] [--rows N] [--blocks N]
 //                                    [--position-target PX] [--radius PX] [--device cpu|cuda|auto]
-//   helirec-calibration geometry <scan.h5> [<more scans.h5> ...] --out FILE [--row-time-us US] [--order N] [--patch N] [--reduce N] [--projections STORE.zarr]
+//   helirec-calibration geometry <scan.h5> [<more scans.h5> ...] --out FILE [--row-time-us US] [--rows-from-middle] [--order N | --radial-map] [--patch N] [--reduce N] [--projections STORE.zarr]
 //                                [--threads N] [--device cpu|cuda|auto]
 //   helirec-calibration intensity <scan> <companion> --geometry FILE --out DIR [--no-progress]
 //   helirec-calibration selftest [--device cpu|cuda|auto]
@@ -19,7 +19,11 @@
 // alone, a pair moved sideways, the tiles of a mosaic; a scan with the rotation axis inside the detector's field
 // first) and writes them as JSON, which the reconstruction reads for a pair (helirec/geometry.hpp). --row-time-us:
 // the time of a stored row within the frame, signed, if known for this camera configuration (0: not known, done
-// without); measured from a refill otherwise. --order N: of the detector map's polynomial (default 3; 0: no map).
+// without); measured from a refill otherwise. --rows-from-middle: the camera's two halves are read at once, the row
+// time counted from the middle row to both ends; a row time not given is then measured from the frames between
+// scans at different heights where no refill gives it. --order N: of the detector map's polynomial (default 3; 0: no map). --radial-map: the map's
+// four terms of a lens' radial distortion solved as one unknown (a map of the third order): for scans compared
+// along the frames' edges alone.
 // --patch N: the plan's blocks are cut into patches of N x N (default 128), each registered once. It is
 // helirec::calibration::geometry_calibration::calibrate_geometry (helirec/calibration/geometry_calibration.hpp).
 //
@@ -60,7 +64,7 @@ int usage() {
                  "                                   [--out DIR] [--inventory DIR] [--json FILE] [--threads N] [--frames N] [--rows N] [--blocks N]\n"
                  "                                   [--columns N (0: full)] [--column-fraction F (0..1)]\n"
                  "                                   [--position-target PX (default 0.01)] [--radius PX] [--inventory-step N] [--device cpu|cuda|auto]\n"
-                 "  helirec-calibration geometry <scan.h5> [<more scans.h5> ...] --out FILE [--row-time-us US] [--order N] [--patch N] [--reduce N] [--projections STORE.zarr]\n"
+                 "  helirec-calibration geometry <scan.h5> [<more scans.h5> ...] --out FILE [--row-time-us US] [--rows-from-middle] [--order N | --radial-map] [--patch N] [--reduce N] [--projections STORE.zarr]\n"
                  "                               [--threads N] [--device cpu|cuda|auto]\n"
                  "  helirec-calibration intensity <scan> <companion> --geometry FILE --out DIR [--no-progress]\n"
                  "  helirec-calibration selftest [--device cpu|cuda|auto]\n");
@@ -81,7 +85,9 @@ int run_geometry_calibration(int argc, char** argv) {
         };
         if (a == "--out") out = value();
         else if (a == "--row-time-us") opt.row_time = std::stod(value()) * 1e-6;
+        else if (a == "--rows-from-middle") opt.rows_from_middle = true;
         else if (a == "--order") opt.order = std::stoi(value());
+        else if (a == "--radial-map") opt.radial_map = true;
         else if (a == "--patch") opt.patch = std::stoi(value());
         else if (a == "--reduce") opt.reduce = std::stoi(value());
         else if (a == "--projections") opt.projections = value();

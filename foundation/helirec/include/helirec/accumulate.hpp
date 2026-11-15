@@ -197,6 +197,8 @@ void luminosity_apply(float* R, const float* RW, const float* W_prev, const floa
                       const float* A_tot, const float* B_tot, int L, int H, int NX, float repartition);
 // R = RW > 0 ? R / RW : 0
 void divide(float* R, const float* RW, std::size_t n);
+// R += A (the sums of one row of scans added to those of the rows before)
+void add_into(float* R, const float* A, std::size_t n);
 // nabuxx mend_null_weights (row-wise nearest valid replacement) on the usable merged columns [x0, x1)
 void mend_null_weights(float* R, const float* RW, int L, int H, int NX, float threshold, int x0, int x1);
 // Remove unreliable measured support; optionally fill only unsupported values for filter context.
@@ -211,6 +213,7 @@ void luminosity_apply(float* R, const float* RW, const float* W_prev, const floa
                       const float* A_tot, const float* B_tot, int L, int H, int NX, float repartition,
                       void* stream = nullptr);
 void divide(float* R, const float* RW, std::size_t n, void* stream = nullptr);
+void add_into(float* R, const float* A, std::size_t n, void* stream = nullptr);
 void mend_null_weights(float* R, const float* RW, int L, int H, int NX, float threshold, int x0, int x1,
                        void* stream = nullptr);
 void prepare_measured(float* R, float* RW, int L, int H, int NX, float threshold, bool fill, float empty,

@@ -45,10 +45,14 @@ Now<T> now(const At& at, const T& beyond) {
 // The ideal position (X, Y) the stored pixel (c, v) looks along: the detector's map added, X = c + Eu(c, v),
 // Y = v + Ev(c, v). map: the coefficients of Eu, then those of Ev, `terms` each; phi: the terms' values at (c, v)
 // (helirec/geometry.hpp states the polynomial). terms = 0: no map, the pixel itself.
+// radial, radial_u, radial_v: where the map's four terms of a radial displacement are one unknown
+// (GeometryOptions::radial_map), that unknown and what a unit of it moves the columns and the rows by at (c, v);
+// none: nullptr.
 template <class T>
-void ideal_position(const T* map, const double* phi, int terms, double c, double v, T& X, T& Y) {
+void ideal_position(const T* map, const double* phi, int terms, const T* radial, double radial_u, double radial_v, double c, double v, T& X, T& Y) {
     X = T(c), Y = T(v);
     for (int k = 0; k < terms; ++k) X += map[k] * phi[k], Y += map[terms + k] * phi[k];
+    if (radial) X += radial[0] * radial_u, Y += radial[0] * radial_v;
 }
 
 // The ray recorded at the ideal position (X, Y): its distance s from the sample's origin across the beam and its

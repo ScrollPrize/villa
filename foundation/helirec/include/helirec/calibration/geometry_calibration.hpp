@@ -29,8 +29,16 @@ struct Options {
     // seconds per stored row (signed) if known for this camera configuration; 0: not known, and done without;
     // NaN: measured from a refill
     double row_time = std::nan("");
+    // The rows' timing counts the rows from the middle row to both ends (Acquisition::rows_from_middle): a camera
+    // whose two halves are read at once. Not in any record: said here. With it, a row time that is not given (NaN)
+    // and that no refill gives is measured from the frames between scans at different heights
+    // (row_time_between_scans), and it is an error if the scans are all at one height.
+    bool rows_from_middle = false;
     Device device = Device::CPU;
     int order = 3;    // of the map's polynomial; 0: no map
+    // the map's four terms of a lens' radial distortion solved as one unknown (GeometryOptions::radial_map), the
+    // map then of the third order whatever `order` is: for scans compared along the frames' edges alone
+    bool radial_map = false;
     int threads = 8;  // reading threads
     int patch = 128;  // the plan's blocks are cut into patches of patch x patch, each registered once
     // 1, 2, 3: measured on the frames read at a half, a quarter, an eighth (calibration::Session: from the frames'
@@ -50,7 +58,7 @@ struct Options {
 // scans: the master files of the scans of one sample, a scan with the rotation axis inside its field first: the
 // layout, the rows' timing, every comparison of the plan measured once, one solve. Returns the calibration as
 // JSON text ("model": "joint"; helirec/geometry.hpp reads a pair's); it is an error if the rows' timing is not
-// given and no stretch on disk holds a refill to measure it from.
+// given and nothing measures it (a refill in a stretch on disk; with Options::rows_from_middle, scans at two heights).
 std::string calibrate_geometry(const std::vector<std::string>& scans, const Options& options = {});
 // The text written whole or not at all (a reconstruction may be reading the file).
 void save_text(const std::string& text, const std::string& path);
@@ -82,7 +90,8 @@ struct Planned {
 //     X = axis_k + axis_slope_k (H - H_mid_k) + A(2 th) + u + roll (Y - middle row),        u (1 + column_scale_k) = s + d_k . (cos th, sin th)
 //     Y = z + height_k + stretch height + (1 + axial_scale_k) H + B(th) - roll u
 // with th and H the record's angle and height [rows] at the time the row was exposed: row v of frame f at the time
-// of frame f + row_time (v - middle row). A and B are what the rotation stage does within a turn, the same for
+// of frame f + row_time (v - middle row), or f + row_time |v - middle row| for a camera whose two halves are read
+// at once (Acquisition::rows_from_middle). A and B are what the rotation stage does within a turn, the same for
 // every scan on it: B(th) = b_c cos th + b_s sin th lifts the sample once per turn, A(2 th) = a_c cos 2 th +
 // a_s sin 2 th moves the axis across the detector twice per turn. Those are the parts opposite views see (the
 // height at odd multiples of the turn, the axis column at even ones: PHerc0343P 0.03 rows and 0.02 px, Paris4
@@ -172,8 +181,20 @@ struct Acquisition {
     double pixel_um = 0;
     double row_sign = -1;   // +1 if a larger axis-stage position puts the sample on higher rows
     double row_time = 0;    // frames per stored row, signed
+    // How the rows' timing counts the rows. false: from the first stored row to the last, row v exposed
+    // row_time (v - middle row) frames after the frame's own time. true: from the middle row to both ends, row v
+    // exposed row_time |v - middle row| frames after it: a camera whose upper and lower half are read at once (an
+    // sCMOS with a rolling shutter, as the PCO.edge). row_time above nothing: the middle row first; below: the
+    // first and last row first, the middle row last (Diamond I12 at PHerc. 172: -25.9 us per row, measured from
+    // the frames between scans at two heights). The record does not say it: the caller sets it.
+    bool rows_from_middle = false;
     double period_s = 0;    // of a frame (the median of the first scan's helix, or of its first stretch); 0: not known
-    double fan = 0;         // the beam's divergence: frames of angle per column (pixel / source distance / angle per frame)
+    // The beam's divergence: frames of angle per column (pixel / source distance / angle per frame), signed. Above
+    // nothing the ray recorded at a higher column is a parallel beam's further on in angle (ESRF BM18: PHerc0343P's
+    // opposite views); below nothing further back: the sample turns the other way against the columns for the same
+    // recorded angle (Diamond I12 at PHerc. 172: the frames between scans moved across the beam). The sign is the
+    // record's scan/fan_sense (an NXtomo scan's supplement file states it; without it +).
+    double fan = 0;
     // What the divergence does between scans at different places on the rotation stage: a sample that sits t px
     // nearer the source is recorded magnified by t x per_depth about the detector's middle (per_depth: the pixel
     // over the source's distance, 6.3e-9 for Paris4; + if the source lies along (-sin th, cos th) of the model,
@@ -201,7 +222,8 @@ bool axis_in_field(const ScanLayout& scan, int cols);
 // places and the anchor. The rows' timing is left at zero: the caller sets it.
 // Where no scan has a helix (circular scans), the sense of the rows is that in which two scans at one place across
 // the beam and different heights register at equal frames; scans all at one height have no sense to find, and it
-// is left at -1. A record that states no source distance gives no fan (Acquisition::fan 0).
+// is left at -1. A record that states no source distance gives no fan (Acquisition::fan 0); one that states
+// scan/fan_sense -1 gives the fan the other sign.
 Acquisition read_acquisition(Session& session, Device device, const Log& log = {});
 // Seconds per stored row from a refill in one of the acquisition's stretches, as the step saves it (JSON text;
 // "null" if no stretch on disk holds one): the frames around the refill are found and reduced to the rows' levels
@@ -271,7 +293,7 @@ struct Parameters {
     // on the rotation stage, compared at equal angle, give it; nothing else does (the model's note, above).
     double pitch = 0;
     // The rows' timing [frames per stored row, signed]: row v of a frame is exposed row_time (v - middle row) frames
-    // after the frame's own time. NaN: the acquisition's (Acquisition::row_time: typed, or from a refill), and a
+    // after the frame's own time (row_time |v - middle row| with Acquisition::rows_from_middle). NaN: the acquisition's (Acquisition::row_time: typed, or from a refill), and a
     // solution holds the value it was solved under. It is held unless freed by name ("row_time"). What gives it:
     // scans at different places on the rotation stage. The column offset of two such scans at one angle,
     // (d_k - d_j) . (cos th, sin th), is of the angle at which each row was exposed, so it is sheared along the rows
@@ -295,9 +317,15 @@ struct Sighting {
     int scan = 0, stretch = 0;  // stretch: index into ScanLayout::stretches
     double frame = 0, row = 0, col = 0;
 };
+// the rows the rows' timing counts for the stored row v: from the middle row, to one side below nothing, or to both
+// sides above it (Acquisition::rows_from_middle)
+inline double timing_rows(const Acquisition& acq, double row) {
+    const double from_middle = row - (acq.rows - 1) / 2.0;
+    return acq.rows_from_middle ? std::fabs(from_middle) : from_middle;
+}
 // the frame at whose time the sighting's row was exposed under a rows' timing [frames per row], which counts from
 // the middle row; and the rows' timing the parameters hold, or the acquisition's where they hold none
-inline double exposure_frame(const Acquisition& acq, double row_time, const Sighting& g) { return g.frame + row_time * (g.row - (acq.rows - 1) / 2.0); }
+inline double exposure_frame(const Acquisition& acq, double row_time, const Sighting& g) { return g.frame + row_time * timing_rows(acq, g.row); }
 inline double row_time_of(const Acquisition& acq, const Parameters& p) { return std::isfinite(p.row_time) ? p.row_time : acq.row_time; }
 struct Comparison {
     std::string kind;       // "opposite", "turn", "resthelix", "pair", "tiles", "tiles_opposite": what the report groups by
@@ -385,6 +413,23 @@ struct GeometryOptions {
     // is held is not measured: it is in neither the map nor the residuals. The step solves with 0.95 (PHerc0343P's
     // largest such correlation is 0.91, the roll's with two terms: nothing of it is held).
     double undetermined_map = 0;
+    // The map's four terms of a lens' radial distortion as one unknown, "map.radial", in place of the four
+    // coefficients: the pixel x columns and y rows from the detector's middle is displaced by k (x, y) (x^2 + y^2),
+    //     Eu = k (x^3 + x y^2),        Ev = k (x^2 y + y^3),
+    // "map.radial" = k R^3 [px: the displacement R pixels from the middle along the columns, R the map's column
+    // scale, half the detector's width]. The map's other terms stay unknowns of their own; all are held unless
+    // freed ("map" names them all). The four coefficients (map.eu.i3j0, .eu.i1j2, .ev.i2j1, .ev.i0j3) are then not
+    // unknowns, and freeing one by name is an error. The start's map must hold the terms of the third order
+    // (geometry::empty_map(rows, cols, 3)); its radial unknown is read from its Eu's term in the column cubed. The
+    // solution's map holds the four coefficients written out, so everything that reads a map reads it;
+    // GeometrySolution::radial_map says the unknown and k.
+    // For scans compared along the frames' edges alone (scans moved sideways or along the axis by nearly a frame: a
+    // grid of circular scans). Two such scans compare the detector's one edge with its other, so they give the
+    // terms that are odd across the seam and change along it (x y^2 at a seam between columns, x^2 y between rows)
+    // and not the course of the columns along the columns or of the rows along the rows (x^3, y^3), which is all
+    // that the inside of a frame is displaced by against its edges. A lens' distortion ties the two: the four terms
+    // are one. The unknown is not among what GeometryOptions::undetermined_map holds.
+    bool radial_map = false;
     // The sample's tilt between scans, solved after the rest: two scans compared at one angle hold the part of it
     // about the beam's direction (rows by the tilt x the distance across the beam, once per turn), so every scan
     // compared so with another, but the anchor, gets its tilt_x and tilt_y in a second solve that starts from the
@@ -406,6 +451,12 @@ struct GeometrySolution {
     std::vector<std::string> unused;
     // terms of the map held because the comparisons do not tell them from another unknown (GeometryOptions::undetermined_map)
     std::vector<std::string> undetermined;
+    // The map's radial unknown as solved (GeometryOptions::radial_map): "map.radial" [px], and k [1 / px^2]
+    struct RadialMap {
+        bool solved = false;
+        double cubic = 0, k = 0;
+    };
+    RadialMap radial_map;
     int rank = 0;
     std::vector<std::array<double, 3>> residual;       // per comparison: frames, rows, columns
     std::vector<std::array<double, 3>> lens_residual;  // per lens patch: x, y, z [px] (lens_residuals)
@@ -467,7 +518,8 @@ struct ScanReport {
     // half a turn, and the frames the registration finds them at say it: the solution's rows' timing less the median
     // of (frames left / rows between the two views). It stands only where a fraction of a frame is measured on
     // content as deep as the sample (registration.hpp samples the frames; content far from the axis crosses
-    // several columns per frame).
+    // several columns per frame). Where the timing counts the rows from the middle to both ends, the rows between
+    // the views are those it counts (timing_rows).
     double row_time, rows_apart;
     // The record's height against a straight line over the stretch's frames on disk [rows, rms], how much that
     // departure differs between a comparison's two views [rows, rms], and whose it is: the rows left, regressed on
@@ -495,11 +547,33 @@ struct PairReport {
     double mean[3], once[3][2], left[3];
     // the rms of the residuals as they are (frames, rows, columns), and their median
     double rms[3], median[3];
+    // The rows' timing the pair's frames give [frames per stored row], +- row_time_error: the two views of a patch
+    // lie at different rows, so the same lines were exposed (the rows the timing counts between them) x the row
+    // time apart, and the frames left follow those rows: the solution's rows' timing less the slope of the frames
+    // left against them (beside a constant: the two scans' angles are not known against each other to a fraction
+    // of a frame). NaN where the rows between the views are all but the same in every patch (their spread under
+    // 16): scans at two heights under a timing that counts from the first row to the last lie the same rows apart
+    // everywhere. Under one that counts from the middle to both ends they do not, and this is what measures it.
+    double row_time, row_time_error, timing_rows_spread;
     PairReport();
 };
+// The rows' timing the frames between scans give, over every pair of scans compared at equal angle whose views lie
+// at rows the timing counts differently from patch to patch (PairReport::row_time states why that measures it, and
+// when it does: scans at two heights under a timing that counts the rows from the middle to both ends): one slope
+// of the frames left against those rows, a constant per pair of scans. row_time [frames per stored row]: the
+// parameters' rows' timing less that slope, +- error; n: the patches it is of (0: no pair gives it, the rest NaN).
+// The frames are those of the record's angles alone, so no parameter but the rows' timing enters.
+// It stands as far as a fraction of a frame is measured on content as deep as the sample (ScanReport::row_time).
+struct RowTimeBetweenScans {
+    std::size_t n = 0, pairs = 0;
+    double row_time = std::nan(""), error = std::nan("");
+};
+RowTimeBetweenScans row_time_between_scans(const Acquisition& acq, const Parameters& p, const std::vector<Comparison>& comparisons);
+
 struct GeometryReport {
     std::vector<ScanReport> scans;
     std::vector<PairReport> pairs;
+    RowTimeBetweenScans row_time_between_scans;
     // over the scans that have opposite views of their own: the largest less the smallest, the standard deviation,
     // the mean. One rotation stage and one axis stage say they should agree.
     struct Over {
@@ -518,7 +592,8 @@ std::string report_json(const Acquisition& acq, const GeometryReport& r);
 // reduced frames' middle row is the stored row f (reduced rows - 1) / 2, (f - 1) / 2 rows above the stored
 // frames' middle, so each scan's axis column is moved along the roll to the stored middle row; and the rows'
 // timing, counted from the reduced middle row, is left counting from there (a common time of (f - 1) / 2 rows,
-// nothing where the row time is zero). The solution's residuals and the report are converted with it.
+// nothing where the row time is zero; where it counts to both ends, the rows within (f - 1) / 2 of the middle are
+// off by up to that many rows' time). The solution's residuals and the report are converted with it.
 void to_stored_pixels(Acquisition& acq, GeometrySolution& solution, GeometryReport& told, int rows, int cols, int f);
 
 // ---- small numerics the stages share (as numpy does them)

@@ -131,7 +131,7 @@ struct Master {
     std::string command;
     std::map<std::string, std::string> arguments; // of the command
     std::string rotation = "rotation_angle", translation, height_stage, on_rotation[2];
-    double pixel_um = kNaN, energy_kev = kNaN, propagation_m = kNaN, source_m = kNaN;
+    double pixel_um = kNaN, energy_kev = kNaN, propagation_m = kNaN, source_m = kNaN, fan_sense = kNaN;
 
     // the translation stage's position during the frames of a role: the command's, else the snapshot's
     double across_beam(Role role) const {
@@ -216,6 +216,8 @@ void read_supplement(Master& m) {
         number("energy_kev", m.energy_kev);
         number("propagation_distance_m", m.propagation_m);
         number("source_sample_distance_m", m.source_m);
+        number("fan_sense", m.fan_sense);
+        if (std::isfinite(m.fan_sense) && m.fan_sense != 1.0 && m.fan_sense != -1.0) throw Error(path + ": 'fan_sense' is 1 or -1");
         if (const Json* v = doc.find("height_stage"); v && v->is(Json::String)) m.height_stage = v->string;
         if (const Json* v = doc.find("stages_on_rotation"); v && v->is(Json::Array))
             for (const Json& name : v->array)
@@ -412,6 +414,7 @@ Record read_record(const std::string& path, bool frame_files) {
     if (std::isfinite(per_turn)) tech["scan/tomo_n"] = numbers({per_turn}), tech["scan/scan_range"] = numbers({per_turn * m.step_deg});
     if (std::isfinite(m.energy_kev)) tech["scan/energy"] = numbers({m.energy_kev});
     if (std::isfinite(m.source_m)) tech["scan/source_sample_distance"] = numbers({m.source_m * 1e3});
+    if (std::isfinite(m.fan_sense)) tech["scan/fan_sense"] = numbers({m.fan_sense});
     if (std::isfinite(m.propagation_m)) tech["scan/sample_detector_distance"] = numbers({m.propagation_m * 1e3});
     if (std::isfinite(m.count_time_s)) tech["scan/exposure_time"] = numbers({m.count_time_s * 1e3});
     if (m.rows > 0) tech["detector/" + m.detector + "/size"] = numbers({static_cast<double>(m.cols), static_cast<double>(m.rows)});

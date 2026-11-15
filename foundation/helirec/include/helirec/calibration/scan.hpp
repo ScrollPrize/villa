@@ -115,8 +115,11 @@ std::optional<TetraName> parse_tetra_name(const std::string& name);
 // The families of an extended field of view among `scans` (indices into it), each the main scan first.
 // Scans whose names carry a kind (HA, TA, ...) are grouped by base and number and ordered HA, TA, TA2, ...
 // (crash-postfixed names are left out). Scans without one are grouped by geometry: the same frame, pixel size,
-// energy, number of projections and angular range, another lateral position of the stage; the main scan is the
-// one with its axis nearest the detector's centre (smallest |estimated_cor_from_motor_pix|).
+// energy and angular range, the projections the same number or one apart, another lateral position of the stage;
+// the main scan is the one with its axis nearest the detector's centre (smallest |estimated_cor_from_motor_pix|).
+// Scans that each stay at one height (circular scans) are one family at several heights too, a grid: such a family
+// comes row by row, the rows in the order their first scans are given in (discover_scans: by name, the order of
+// acquisition), each row from the scan with its axis nearest the detector's centre outwards.
 std::vector<std::vector<int>> group_companions(const std::vector<Scan>& scans);
 
 // The one family among `scans` (throws when there are none or several, or when its members are not compatible):

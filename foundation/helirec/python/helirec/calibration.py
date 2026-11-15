@@ -66,6 +66,8 @@ def apodisation_widths(n_cols, est_cor_main_offset, companion_dx, transition_wid
     """(w_left, w_right) for (main, companion) as prepare_weights_double --is_tetra writes them.
     Main scan: 'pente' beyond the rotation axis (min(2 tw, distance axis->edge)) on the axis side and a
     border taper towards the companion; companion: border taper on the side facing the main scan.
+    companion_dx below nothing: the companion on the left, the axis in the main scan's right half (the reference's);
+    above: on the right, the axis in its left half, the same widths mirrored.
     (helirec::calibration::apodisation_widths)"""
     try:
         return _core.apodisation_widths(int(n_cols), float(est_cor_main_offset), float(companion_dx), float(transition_width_horizontal), float(transition_width_borders))
@@ -109,6 +111,26 @@ def calibrate(main, companion, layout, cache_dir=None, log=print, progress=None)
     cal = _core.calibrate_intensity(main, companion, float(layout["cor_main_detector"]), tuple(float(v) for v in layout["vector"]),
                                     dict(layout.get("measured") or {}), str(cache_dir or ""), log, bool(progress))
     return cal, cal.arrays()
+
+
+def calibrate_scans(scans, layout, cache_dir=None, log=print, progress=None, projection_store="", reduce=0):
+    """The intensity calibration of any number of scans, the main scan (the rotation axis in its field) first, in
+    the merged frame of `layout`: dict(cor_main_detector, vectors = [(rows, columns), ..] from the main scan to every
+    scan after it (geometry.merged_layout)). The other scans lie beside the main scan, all on one side of it, or at
+    the columns of one of those at another height (a grid of circular scans). Returns (Calibration, arrays dict:
+    main_*, companion_*, companion2_*, .., weight_map). Calibration.lit_rows: the rows the beam lights in every scan,
+    which the weights are cropped to. (helirec::calibration::calibrate_intensity)"""
+    if progress is None:
+        progress = log is print
+    cal = _core.calibrate_intensity_of_scans(list(scans), float(layout["cor_main_detector"]), [tuple(float(x) for x in v) for v in layout["vectors"]], str(cache_dir or ""), log,
+                                             bool(progress), str(projection_store), int(reduce))
+    return cal, cal.arrays()
+
+
+def lit_rows(flat_less_dark, share=0.12):
+    """The rows the beam lights, (first, end): around the brightest row of a flat less its dark (each row's mean over
+    the columns), the rows that reach `share` of it. (helirec::calibration::lit_rows)"""
+    return _core.lit_rows(np.ascontiguousarray(flat_less_dark, np.float32), float(share))
 
 
 BLUR_TILE = 128

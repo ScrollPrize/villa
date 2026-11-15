@@ -165,7 +165,7 @@ bool measure(const Pairing& P, const BlockPlan& first_plan, Cut cut, const Regis
                 t0 = std::chrono::steady_clock::now();
                 line_integrals(*P.B.ff, raw.data(), row0.data(), L[0], L[1], col_b - pad, nw, false, wide.data());
             }
-            shift_columns(wide.data(), L[0], L[1], L[2], pad, sway.data(), P.mirror, b, P.sway_row_deg != 0.0 ? sway_per_row.data() : nullptr, row_b - row_ref);
+            shift_columns(wide.data(), L[0], L[1], L[2], pad, sway.data(), P.mirror, b, P.sway_row_deg != 0.0 ? sway_per_row.data() : nullptr, row_b - row_ref, P.sway_rows_from_middle);
         } else if (modelled_b) {
             line_integrals_mapped(*P.B.frames, *P.B.ff, *map_b, P.sb, frame.data(), row_b, L[0], L[1], col_b, L[2], P.mirror, b);
         } else {
@@ -477,7 +477,7 @@ std::vector<ViewMeasurement> Session::measure(const std::vector<ViewRequest>& re
         const Pairing P{{&record(q.scan_a), &frames(q.scan_a), &flat_field(q.scan_a)},
                         {&record(q.scan_b), &frames(q.scan_b), &flat_field(q.scan_b)},
                         q.stretch_a, q.stretch_b, &ta, &tb, q.angle_offset_deg, q.mirror, &impl_->maps[static_cast<std::size_t>(q.scan_a)],
-                        &impl_->maps[static_cast<std::size_t>(q.scan_b)], q.frame_shear, q.sway_px, q.sway_phase_deg, q.sway_row_deg};
+                        &impl_->maps[static_cast<std::size_t>(q.scan_b)], q.frame_shear, q.sway_px, q.sway_phase_deg, q.sway_row_deg, q.sway_rows_from_middle};
         res.planned = true;
         Measured m;
         calibration::measure(P, placed[i].plan, placed[i].cut, ropt, vopt, m);
@@ -567,7 +567,7 @@ std::vector<PatchMeasurement> Session::measure_patches(const std::vector<ViewReq
         const Pairing P{{&record(q.scan_a), &frames(q.scan_a), &flat_field(q.scan_a)},
                         {&record(q.scan_b), &frames(q.scan_b), &flat_field(q.scan_b)},
                         q.stretch_a, q.stretch_b, &ta, &tb, q.angle_offset_deg, q.mirror, &impl_->maps[static_cast<std::size_t>(q.scan_a)],
-                        &impl_->maps[static_cast<std::size_t>(q.scan_b)], q.frame_shear, q.sway_px, q.sway_phase_deg, q.sway_row_deg};
+                        &impl_->maps[static_cast<std::size_t>(q.scan_b)], q.frame_shear, q.sway_px, q.sway_phase_deg, q.sway_row_deg, q.sway_rows_from_middle};
         calibration::measure_patches(P, placed[i].plan, placed[i].cuts, ropt, device, measured, placed[i].has_whole ? &placed[i].whole : nullptr);
         for (std::size_t k = 0; k < measured.size(); ++k) {
             PatchMeasurement r;

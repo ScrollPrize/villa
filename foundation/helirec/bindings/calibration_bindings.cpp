@@ -291,6 +291,7 @@ struct PySession {
             q.sway_px = d.contains("sway_px") ? nb::cast<double>(d["sway_px"]) : 0.0;
             q.sway_phase_deg = d.contains("sway_phase_deg") ? nb::cast<double>(d["sway_phase_deg"]) : 0.0;
             q.sway_row_deg = d.contains("sway_row_deg") ? nb::cast<double>(d["sway_row_deg"]) : 0.0;
+            q.sway_rows_from_middle = d.contains("sway_rows_from_middle") && nb::cast<bool>(d["sway_rows_from_middle"]);
             req.push_back(q);
         }
         return req;
@@ -449,7 +450,8 @@ void bind_calibration(nb::module_& m) {
              "Register pairs of blocks placed by the caller, exactly as the view checks cut and register theirs. Each request is a dict: stretch_a, frame_a, and "
              "optionally label, scan_a, scan_b, stretch_b, frame_hint, angle_offset_deg, mirror, frames, rows, cols, row_a (-1: centred), col_a, col_b, frame_shear, "
              "sway_px, sway_phase_deg (B's frames read sway_px cos(angle_b - sway_phase_deg) columns further on: a sample displaced on the rotation stage, tile against tile), "
-             "sway_row_deg (each row of B at its own angle, that many degrees per row from the frame's: the rows' timing). "
+             "sway_row_deg (each row of B at its own angle, that many degrees per row from the frame's: the rows' timing; "
+             "with sway_rows_from_middle the rows counted from the middle row to both ends). "
              "Returns one dict per request with the columns of views.tsv, `planned` and `ok`. row_sign: +1 if a larger axis-stage position puts the sample on higher rows.")
         .def("measure_patches", &PySession::measure_patches, "requests"_a, "row_sign"_a, "patch_rows"_a = 128, "patch_cols"_a = 128, "device"_a = "auto", "from_block"_a = false,
              "The block of each request (as for measure) cut into patches of patch_rows x patch_cols, every patch measured as measure() measures a request of that "

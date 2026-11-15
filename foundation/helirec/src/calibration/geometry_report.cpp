@@ -43,6 +43,16 @@ std::vector<double> regress(const std::vector<std::vector<double>>& columns, con
     }
 }
 
+// the spread of what a robust fit leaves, as the standard deviation of its bulk: 1.4826 x the median distance from
+// the median (the patches registered on something else do not count, as they did not in the fit)
+double bulk_spread(const std::vector<double>& left) {
+    if (left.empty()) return kNaN;
+    const double middle = median_of(left);
+    std::vector<double> off(left.size());
+    for (std::size_t i = 0; i < left.size(); ++i) off[i] = std::fabs(left[i] - middle);
+    return 1.4826 * median_of(off);
+}
+
 double wrapped_deg(double a) { return a - 360.0 * std::round(a / 360.0); }
 
 Json num(double v) { return std::isfinite(v) ? Json::of(v) : Json(); }
@@ -57,6 +67,7 @@ ScanReport::ScanReport() {
 
 PairReport::PairReport() {
     for (int j = 0; j < 3; ++j) mean[j] = left[j] = once[j][0] = once[j][1] = rms[j] = median[j] = kNaN;
+    row_time = row_time_error = timing_rows_spread = kNaN;
 }
 
 Neighbours neighbours(const Acquisition& acq) {
@@ -85,11 +96,44 @@ Neighbours neighbours(const Acquisition& acq) {
     return out;
 }
 
+RowTimeBetweenScans row_time_between_scans(const Acquisition& acq, const Parameters& p, const std::vector<Comparison>& comparisons) {
+    RowTimeBetweenScans out;
+    std::map<std::pair<int, int>, std::vector<std::size_t>> groups;
+    for (std::size_t i = 0; i < comparisons.size(); ++i)
+        if (comparisons[i].kind == "pair" && comparisons[i].a.scan != comparisons[i].b.scan) groups[{comparisons[i].a.scan, comparisons[i].b.scan}].push_back(i);
+    const std::vector<std::array<double, 3>> left_by = residuals(acq, p, comparisons);
+    // the frames left against the rows the timing counts between the two views, a constant per pair of scans
+    std::vector<std::vector<double>> columns(1);
+    std::vector<double> frames;
+    double spread2 = 0;
+    for (const auto& [key, members] : groups) {
+        std::vector<double> between;
+        for (const std::size_t i : members) between.push_back(timing_rows(acq, comparisons[i].b.row) - timing_rows(acq, comparisons[i].a.row));
+        const double sd = sd_of(between);
+        if (members.size() < 16 || sd < 16) continue;
+        for (std::vector<double>& c : columns) c.resize(frames.size() + members.size(), 0.0);
+        columns.emplace_back(frames.size() + members.size(), 0.0);
+        for (std::size_t m = 0; m < members.size(); ++m) columns[0][frames.size() + m] = between[m], columns.back()[frames.size() + m] = 1.0;
+        for (const std::size_t i : members) frames.push_back(left_by[i][0]);
+        spread2 += sd * sd * static_cast<double>(members.size());
+        ++out.pairs;
+    }
+    if (!out.pairs) return out;
+    std::vector<double> left;
+    const std::vector<double> x = regress(columns, frames, &left);
+    if (x.empty()) return RowTimeBetweenScans{};
+    out.n = frames.size();
+    out.row_time = row_time_of(acq, p) - x[0];
+    out.error = bulk_spread(left) / std::sqrt(spread2);
+    return out;
+}
+
 GeometryReport report(const Acquisition& acq, const GeometrySolution& solution, const std::vector<Comparison>& comparisons) {
     if (solution.residual.size() != comparisons.size()) throw Error("geometry: a report needs the solution's residual of every comparison");
     if (solution.parameters.scans.size() != acq.scans.size()) throw Error("geometry: the solution and the acquisition differ in their scans");
     GeometryReport out;
     out.neighbours = neighbours(acq);
+    out.row_time_between_scans = row_time_between_scans(acq, solution.parameters, comparisons);
     const double row_time = row_time_of(acq, solution.parameters);  // the rows' timing the solution was solved under
     const int S = static_cast<int>(acq.scans.size());
     out.scans.resize(static_cast<std::size_t>(S));
@@ -125,8 +169,8 @@ GeometryReport report(const Acquisition& acq, const GeometrySolution& solution, 
                 th.push_back(ray_of(acq, solution.parameters, c.a).angle_deg * (kPi / 180.0));
                 for (int j = 0; j < 3; ++j) res[j].push_back(solution.residual[i][static_cast<std::size_t>(j)]);
                 between.push_back(model::at_frame(departure, exposure_frame(acq, row_time, c.b)) - model::at_frame(departure, exposure_frame(acq, row_time, c.a)));
-                const double rows = c.b.row - c.a.row;
-                apart.push_back(rows);
+                apart.push_back(c.b.row - c.a.row);
+                const double rows = timing_rows(acq, c.b.row) - timing_rows(acq, c.a.row);  // the rows the timing counts between the views
                 if (std::fabs(rows) >= 16) timing.push_back(solution.residual[i][0] / rows);
             }
             r.n = th.size();
@@ -180,11 +224,24 @@ GeometryReport report(const Acquisition& acq, const GeometrySolution& solution, 
             PairReport r;
             r.scan_a = std::get<0>(key), r.scan_b = std::get<1>(key), r.kind = std::get<2>(key);
             r.n = members.size();
-            std::vector<double> one(r.n, 1.0), c1(r.n), s1(r.n), res[3];
+            std::vector<double> one(r.n, 1.0), c1(r.n), s1(r.n), between(r.n), res[3];
             for (std::size_t m = 0; m < r.n; ++m) {
-                const double th = ray_of(acq, solution.parameters, comparisons[members[m]].a).angle_deg * (kPi / 180.0);
+                const Comparison& c = comparisons[members[m]];
+                const double th = ray_of(acq, solution.parameters, c.a).angle_deg * (kPi / 180.0);
                 c1[m] = std::cos(th), s1[m] = std::sin(th);
+                between[m] = timing_rows(acq, c.b.row) - timing_rows(acq, c.a.row);
                 for (int j = 0; j < 3; ++j) res[j].push_back(solution.residual[members[m]][static_cast<std::size_t>(j)]);
+            }
+            // the rows' timing the pair's frames give: the frames left against the rows the timing counts between
+            // the two views, where those differ from patch to patch
+            r.timing_rows_spread = sd_of(between);
+            if (r.kind == "pair" && r.n >= 16 && r.timing_rows_spread >= 16) {
+                std::vector<double> left;
+                const std::vector<double> x = regress({one, between}, res[0], &left);
+                if (!x.empty()) {
+                    r.row_time = row_time - x[1];
+                    r.row_time_error = bulk_spread(left) / (r.timing_rows_spread * std::sqrt(static_cast<double>(r.n)));
+                }
             }
             for (int j = 0; j < 3; ++j) {
                 r.rms[j] = rms_of(res[j]), r.median[j] = median_of(res[j]);
@@ -231,12 +288,21 @@ std::string report_json(const Acquisition& acq, const GeometryReport& r) {
         Json left = Json::dict();
         for (int j = 0; j < 3; ++j)
             left.set(component[j], Json::dict().set("rms", num(p.rms[j])).set("median", num(p.median[j])).set("mean", num(p.mean[j])).set("once", pair_of(p.once[j])).set("rms_after", num(p.left[j])));
-        pairs.add(Json::dict().set("kind", Json::of(p.kind)).set("scan_a", Json::whole_number(p.scan_a)).set("scan_b", Json::whole_number(p.scan_b)).set("n", Json::whole_number(static_cast<long long>(p.n))).set("left", left));
+        Json d = Json::dict().set("kind", Json::of(p.kind)).set("scan_a", Json::whole_number(p.scan_a)).set("scan_b", Json::whole_number(p.scan_b)).set("n", Json::whole_number(static_cast<long long>(p.n))).set("left", left);
+        if (std::isfinite(p.row_time))
+            d.set("row_time_frames_per_row", num(p.row_time)).set("row_time_error_frames_per_row", num(p.row_time_error)).set("row_time_seconds_per_row", num(acq.period_s > 0 ? p.row_time * acq.period_s : kNaN))
+                .set("timing_rows_spread", num(p.timing_rows_spread));
+        pairs.add(d);
     }
     Json out = Json::dict();
     out.set("scans", scans).set("pairs", pairs);
     out.set("over_scans", Json::dict().set("axis", over(r.axis)).set("axis_slope", over(r.axis_slope)).set("axial_scale", over(r.axial_scale)));
     out.set("edges", edges).set("triangles", triangles);
+    if (const RowTimeBetweenScans& t = r.row_time_between_scans; t.n)
+        out.set("row_time_between_scans", Json::dict().set("patches", Json::whole_number(static_cast<long long>(t.n))).set("pairs", Json::whole_number(static_cast<long long>(t.pairs)))
+                                              .set("frames_per_row", num(t.row_time)).set("error_frames_per_row", num(t.error))
+                                              .set("seconds_per_row", num(acq.period_s > 0 ? t.row_time * acq.period_s : kNaN))
+                                              .set("error_seconds_per_row", num(acq.period_s > 0 ? t.error * acq.period_s : kNaN)));
     return out.text();
 }
 

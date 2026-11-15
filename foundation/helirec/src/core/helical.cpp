@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <tuple>
 
 namespace helirec {
 
@@ -43,14 +44,18 @@ SpanInfo make_span_info(const ScanTrajectory& t, double tol_steps) {
     s.sunshine_end.assign(nh, -1);
     const double avg_step = (t.angles_deg[n - 1] - t.angles_deg[0]) / (n - 1);
     const float bonus = static_cast<float>(std::fabs(avg_step * tol_steps));
+    // the detector's rows that hold data (ScanTrajectory::row_first, row_end; every row if none are named)
+    const bool some_rows = t.row_end > t.row_first;
+    if (some_rows && (t.row_first < 0 || t.row_end > t.det_rows)) throw Error("make_span_info: the rows that hold data lie outside the detector");
+    const int row_lo = some_rows ? t.row_first : 0, row_hi = some_rows ? t.row_end : t.det_rows;
 #pragma omp parallel for schedule(dynamic, 16)
     for (int ih = 0; ih < nh; ++ih) {
         const int h = bottom + ih;
         int first = -1, last = -1;
         for (int i = 0; i < n; ++i) {
             const int pos = h - s.integer_shift_v[i];
-            const int lim = t.det_rows - (std::fabs(s.fract_complement[i]) > 1e-6f ? 1 : 0);
-            if (pos >= 0 && pos < lim) {
+            const int lim = row_hi - (std::fabs(s.fract_complement[i]) > 1e-6f ? 1 : 0);
+            if (pos >= row_lo && pos < lim) {
                 if (first < 0) first = i;
                 last = i;
             }
@@ -86,6 +91,38 @@ std::pair<int, int> doable_span(const std::vector<SpanInfo>& spans) {
         hi = std::min(hi, s.doable_hi);
     }
     if (hi <= lo) throw Error("doable_span: empty intersection");
+    return {lo, hi};  // used half-open, as the reference
+}
+
+std::pair<int, int> doable_span(const std::vector<SpanInfo>& spans, const std::vector<int>& place) {
+    if (spans.empty()) throw Error("doable_span: no scans");
+    if (place.size() != spans.size()) throw Error("doable_span: one place per scan");
+    std::vector<int> places = place;
+    std::sort(places.begin(), places.end());
+    places.erase(std::unique(places.begin(), places.end()), places.end());
+    if (places.size() == spans.size()) return doable_span(spans);  // one scan per place
+    int first = spans[0].doable_lo, last = spans[0].doable_hi;
+    for (const SpanInfo& s : spans) first = std::min(first, s.doable_lo), last = std::max(last, s.doable_hi);
+    const auto sees = [](const SpanInfo& s, int h) {
+        const int ih = h - s.h_first;
+        return ih >= 0 && ih < static_cast<int>(s.sunshine_start.size()) && s.sunshine_start[static_cast<std::size_t>(ih)] >= 0;
+    };
+    int lo = 0, hi = -1, run_lo = 0;  // the longest run of heights every place sees: [lo, hi]
+    bool in_run = false;
+    for (int h = first; h <= last + 1; ++h) {
+        bool all = h <= last;
+        for (std::size_t p = 0; all && p < places.size(); ++p) {
+            bool some = false;
+            for (std::size_t k = 0; k < spans.size(); ++k) some = some || (place[k] == places[p] && sees(spans[k], h));
+            all = some;
+        }
+        if (all && !in_run) run_lo = h, in_run = true;
+        if (!all && in_run) {
+            in_run = false;
+            if (h - 1 - run_lo > hi - lo) lo = run_lo, hi = h - 1;
+        }
+    }
+    if (hi <= lo) throw Error("doable_span: no height that every place across the beam sees");
     return {lo, hi};  // used half-open, as the reference
 }
 
@@ -152,9 +189,22 @@ FlatInterpolation interpolate_flats(const FlatSeriesInfo& flats, float ang) {
 }
 
 std::pair<int, int> chunk_projections(const ScanTrajectory& t, const SpanInfo& s, int h_lo, int h_hi, int margin,
-                                      bool full_context, bool padded_rows) {
+                                      bool full_context, bool padded_rows, bool may_miss) {
     // the reference includes the height h_hi itself (inclusive end of span_v) when selecting projections
-    auto [p0, p1] = chunk_projection_span(s, h_lo, h_hi);
+    int p0 = 0, p1 = 0;
+    if (!may_miss) {
+        std::tie(p0, p1) = chunk_projection_span(s, h_lo, h_hi);
+    } else {  // the heights of the chunk this scan sees (the others are another scan's at its place)
+        int first = -1, last = -1;
+        for (int h = h_lo; h <= h_hi; ++h) {
+            const int ih = h - s.h_first;
+            if (ih < 0 || ih >= static_cast<int>(s.sunshine_start.size()) || s.sunshine_start[static_cast<std::size_t>(ih)] < 0) continue;
+            first = first < 0 ? s.sunshine_start[static_cast<std::size_t>(ih)] : std::min(first, s.sunshine_start[static_cast<std::size_t>(ih)]);
+            last = std::max(last, s.sunshine_end[static_cast<std::size_t>(ih)] - 1);
+        }
+        if (first < 0 && !full_context) return {0, 0};
+        if (first >= 0) p0 = first, p1 = last + 1;
+    }
     if (full_context) {
         // All observations contributing to the central slices AND their filter/luminosity
         // context. Selecting only the central heights makes the context depend on chunking.
@@ -168,18 +218,21 @@ std::pair<int, int> chunk_projections(const ScanTrajectory& t, const SpanInfo& s
                 p1 = p + 1;
             }
         }
-        if (p1 <= p0) throw Error("prepare_chunk_scan: no projection sees the chunk");
+        if (p1 <= p0) {
+            if (may_miss) return {0, 0};
+            throw Error("prepare_chunk_scan: no projection sees the chunk");
+        }
     }
     return {p0, p1};
 }
 
 int max_chunk_projections(const ScanTrajectory& t, const SpanInfo& s, int lo, int hi, int rows, int margin,
-                          bool full_context, bool padded_rows) {
+                          bool full_context, bool padded_rows, bool may_miss) {
     int most = 0;
 #pragma omp parallel for schedule(static) reduction(max : most)
     for (int h = lo; h < hi; ++h) {
         try {
-            const auto [p0, p1] = chunk_projections(t, s, h, std::min(hi, h + rows), margin, full_context, padded_rows);
+            const auto [p0, p1] = chunk_projections(t, s, h, std::min(hi, h + rows), margin, full_context, padded_rows, may_miss);
             most = std::max(most, p1 - p0);
         } catch (const Error&) {   // (not a chunk that can be reconstructed)
         }
@@ -189,9 +242,9 @@ int max_chunk_projections(const ScanTrajectory& t, const SpanInfo& s, int lo, in
 
 ChunkScan prepare_chunk_scan(const ScanTrajectory& t, const SpanInfo& s, const std::vector<double>& control_A,
                              const FlatSeriesInfo& flats, int h_lo, int h_hi, int margin, int n_grid,
-                             double nominal_current, bool full_context, bool padded_rows) {
+                             double nominal_current, bool full_context, bool padded_rows, bool may_miss) {
     ChunkScan c;
-    const auto [p0, p1] = chunk_projections(t, s, h_lo, h_hi, margin, full_context, padded_rows);
+    const auto [p0, p1] = chunk_projections(t, s, h_lo, h_hi, margin, full_context, padded_rows, may_miss);
     c.p0 = p0;
     c.p1 = p1;
     const int n = p1 - p0;
@@ -232,6 +285,7 @@ ChunkScan prepare_chunk_scan(const ScanTrajectory& t, const SpanInfo& s, const s
         c.flat_i0[k]=flat.i0; c.flat_i1[k]=flat.i1; c.flat_frac[k]=flat.fraction;
     }
     // horizontal placement: merged column of source column cc = sx + floor(x_shift) + cc (+ fract)
+    // (p0 is a projection of the scan also where the chunk holds none of it)
     const float x_shift = -s.x_pix_per_proj[p0];  // constant here (no lateral correction drift assumed)
     for (int k = 1; k < n; ++k)
         if (s.x_pix_per_proj[p0 + k] != s.x_pix_per_proj[p0])

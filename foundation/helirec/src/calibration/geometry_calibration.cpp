@@ -10,6 +10,7 @@
 #include <set>
 
 #include "calibration/util.hpp"
+#include "helirec/calibration/intensity.hpp"
 #include "helirec/calibration/solve.hpp"
 #include "io/json.hpp"
 
@@ -102,9 +103,6 @@ bool Blocked::holds(double frame, int row_lo, int row_hi) const {
 }
 
 namespace {
-
-// the share of the flats' brightest row that a row the beam lights reaches (Acquisition::lit_rows)
-constexpr double kLitShare = 0.12;
 
 // Rows that hold something across the whole width in frames [first, end) of a stretch, sampled 16 times a turn:
 // the mean of the lowest columns of a row is not air there. Nothing found: no frames. label: the stretch, for the log.
@@ -387,8 +385,14 @@ Acquisition read_acquisition(Session& session, Device device, const Log& log) {
     const int N = acq.per_turn;
     {
         const double source_mm = session.record(0).technique.number("scan/source_sample_distance", std::nan(""));
-        if (std::isfinite(source_mm) && source_mm > 0) acq.fan = acq.pixel_um * 1e-3 / source_mm / (std::fabs(step_deg) * (kPi / 180.0));
-        else say(log, "  the record states no source distance: the beam's divergence is left out of the comparisons (no fan)");
+        // the sense of the divergence against the recorded angle: a record may state it (scan/fan_sense, -1: the other
+        // sense than PHerc0343P's opposite views show); a BLISS record states none
+        const double sense = session.record(0).technique.number("scan/fan_sense", 1.0) < 0 ? -1.0 : 1.0;
+        if (std::isfinite(source_mm) && source_mm > 0) {
+            acq.fan = sense * acq.pixel_um * 1e-3 / source_mm / (std::fabs(step_deg) * (kPi / 180.0));
+            if (sense < 0) say(log, "  the record states the beam's divergence in the other sense: a ray at a higher column is a parallel beam's further back in angle");
+        } else
+            say(log, "  the record states no source distance: the beam's divergence is left out of the comparisons (no fan)");
     }
     {
         const StretchLayout* st = &acq.scans[0].stretches.front();
@@ -400,20 +404,8 @@ Acquisition read_acquisition(Session& session, Device device, const Log& log) {
     // the rows the beam lights, in every scan
     acq.lit_rows[0] = 0, acq.lit_rows[1] = rows;
     for (int k = 0; k < S; ++k) {
-        const FlatField& ff = session.flat_field(k);
-        std::vector<double> level(static_cast<std::size_t>(rows), 0.0);
-#pragma omp parallel for schedule(static)
-        for (int r = 0; r < rows; ++r) {
-            double s = 0;
-            for (int c = 0; c < cols; ++c) s += ff.gain[static_cast<std::size_t>(r) * static_cast<std::size_t>(cols) + static_cast<std::size_t>(c)];
-            level[static_cast<std::size_t>(r)] = s / cols;
-        }
-        const int brightest = static_cast<int>(std::max_element(level.begin(), level.end()) - level.begin());
-        const double least = kLitShare * level[static_cast<std::size_t>(brightest)];
-        int lo = brightest, hi = brightest + 1;
-        while (lo > 0 && level[static_cast<std::size_t>(lo - 1)] >= least) --lo;
-        while (hi < rows && level[static_cast<std::size_t>(hi)] >= least) ++hi;
-        acq.lit_rows[0] = std::max(acq.lit_rows[0], lo), acq.lit_rows[1] = std::min(acq.lit_rows[1], hi);
+        const std::array<int, 2> lit = lit_rows(session.flat_field(k).gain.data(), rows, cols);
+        acq.lit_rows[0] = std::max(acq.lit_rows[0], lit[0]), acq.lit_rows[1] = std::min(acq.lit_rows[1], lit[1]);
     }
     if (acq.lit_rows[1] - acq.lit_rows[0] < rows) {
         if (acq.lit_rows[1] - acq.lit_rows[0] < 128) throw Error("geometry calibration: the scans' flats light fewer than 128 rows in common");
@@ -659,7 +651,7 @@ std::string acquisition_json(const Acquisition& acq) {
     }
     Json out = Json::dict();
     out.set("rows", count(acq.rows)).set("cols", count(acq.cols)).set("frames_per_turn", count(acq.per_turn)).set("pixel_um", num(acq.pixel_um)).set("row_sign", num(acq.row_sign));
-    out.set("row_time", num(acq.row_time)).set("frame_period_s", num(acq.period_s)).set("fan", num(acq.fan)).set("per_depth", num(acq.per_depth)).set("window_columns", count(acq.width));
+    out.set("row_time", num(acq.row_time)).set("rows_from_middle", Json::of_bool(acq.rows_from_middle)).set("frame_period_s", num(acq.period_s)).set("fan", num(acq.fan)).set("per_depth", num(acq.per_depth)).set("window_columns", count(acq.width));
     if (acq.lit_rows[1] > acq.lit_rows[0]) out.set("lit_rows", Json::list().add(count(acq.lit_rows[0])).add(count(acq.lit_rows[1])));
     out.set("anchor", count(acq.anchor)).set("scans", scans);
     return out.text();
@@ -895,7 +887,7 @@ std::vector<Planned> plan_tiles(const Acquisition& acq, const Parameters& places
                             q.row_a = static_cast<int>(row_a), q.col_a = static_cast<int>(ca);
                             q.col_b = static_cast<int>(ca) + static_cast<int>(std::lround(pb.axis - pa.axis));
                             q.sway_px = apart, q.sway_phase_deg = phase_deg;
-                            q.sway_row_deg = acq.row_time * step_deg;
+                            q.sway_row_deg = acq.row_time * step_deg, q.sway_rows_from_middle = acq.rows_from_middle;
                             out.push_back(t);
                         }
             }
@@ -921,7 +913,7 @@ std::vector<Planned> plan_tiles(const Acquisition& acq, const Parameters& places
                         // (the sway is of B's own angle, half a turn on: there it is +(d_k - d_j) . n, the same statement)
                         q.col_b = static_cast<int>(std::lround(pa.axis + pb.axis)) - (W - 1) - static_cast<int>(ca);
                         q.sway_px = apart, q.sway_phase_deg = phase_deg;
-                        q.sway_row_deg = acq.row_time * step_deg;
+                        q.sway_row_deg = acq.row_time * step_deg, q.sway_rows_from_middle = acq.rows_from_middle;
                         q.frame_shear = 2 * acq.fan;
                         out.push_back(t);
                     }
@@ -1000,6 +992,10 @@ void to_stored_pixels(Acquisition& acq, GeometrySolution& solution, GeometryRepo
     for (double& v : p.stage.height_once) v *= F;
     for (double& v : p.stage.axis_twice) v *= F;
     p.map.c0 *= F, p.map.cs *= F, p.map.v0 *= F, p.map.vs *= F;
+    {
+        GeometrySolution::RadialMap& r = solution.radial_map;
+        r.cubic *= F, r.k /= F * F;
+    }
     p.about_height *= F;
     p.row_time /= F;
     for (double& v : p.map.eu) v *= F;
@@ -1017,8 +1013,11 @@ void to_stored_pixels(Acquisition& acq, GeometrySolution& solution, GeometryRepo
         for (int j = 1; j < 3; ++j) r.mean[j] *= F, r.left[j] *= F, r.once[j][0] *= F, r.once[j][1] *= F, r.twice[j][0] *= F, r.twice[j][1] *= F;
         r.row_time /= F, r.rows_apart *= F, r.departure *= F, r.departure_between_views *= F, r.from_anchor *= F;
     }
-    for (PairReport& r : told.pairs)
+    for (PairReport& r : told.pairs) {
         for (int j = 1; j < 3; ++j) r.mean[j] *= F, r.left[j] *= F, r.rms[j] *= F, r.median[j] *= F, r.once[j][0] *= F, r.once[j][1] *= F;
+        r.row_time /= F, r.row_time_error /= F, r.timing_rows_spread *= F;
+    }
+    told.row_time_between_scans.row_time /= F, told.row_time_between_scans.error /= F;
     told.axis.range *= F, told.axis.sd *= F, told.axis.mean = told.axis.mean * F + p.roll * (F - 1.0) / 2.0;
 }
 
@@ -1049,16 +1048,19 @@ std::string calibrate_geometry(const std::vector<std::string>& scans, const Opti
     if (!(acq.period_s > 0)) throw Error("geometry calibration: the record does not hold the frames' period");
     double row_time = options.row_time;
     Json timing;
+    bool from_the_scans = false;  // the rows' timing is measured from the frames between scans, once they are compared
     if (std::isnan(row_time)) {
         say(log, "rows' timing");
         timing = Json::parse(row_time_from_refill(session, acq, log));
-        if (!timing.is(Json::Object))
+        if (timing.is(Json::Object)) row_time = timing.find("seconds_per_row")->number;
+        else if (options.rows_from_middle) from_the_scans = true, row_time = 0;
+        else
             throw Error("no stretch on disk holds a refill to measure the rows' timing from: give the row time (seconds per stored row; 0 if it is not known) for this camera configuration");
-        row_time = timing.find("seconds_per_row")->number;
     } else {
         row_time *= reduced_by;  // given per stored row: a row of the frames read holds that many
     }
     acq.row_time = row_time / acq.period_s;
+    acq.rows_from_middle = options.rows_from_middle;
     say(log, "comparisons");
     auto t = std::chrono::steady_clock::now();
     PlanCounts how_many;
@@ -1076,13 +1078,30 @@ std::string calibrate_geometry(const std::vector<std::string>& scans, const Opti
     for (const auto& [kind, n] : accepted) said += fmt("%s%s %lld", said.empty() ? "" : ", ", kind.c_str(), n);
     say(log, fmt("  %zu blocks planned, %zu patches of %d accepted (%s) in %.0f s (reading %.0f, converting %.0f, registering %.0f)", planned.size(), comparisons.size(), patch, said.c_str(),
                  seconds_since(t), spent.read, spent.integrals, spent.registration));
+    if (from_the_scans) {
+        // (scans at one place on the rotation stage are cut and registered without the rows' timing, so the
+        // comparisons stand as measured)
+        const RowTimeBetweenScans found = row_time_between_scans(acq, empty_parameters(acq), comparisons);
+        if (!found.n)
+            throw Error("the rows' timing is not given, no stretch on disk holds a refill, and no two scans at different heights were compared: give the row time (seconds per stored row; 0 if it is not "
+                        "known) for this camera configuration");
+        acq.row_time = found.row_time, row_time = found.row_time * acq.period_s;
+        timing = Json::dict().set("from", Json::of(std::string("the frames between scans at different heights"))).set("patches", count(static_cast<long long>(found.n)))
+                     .set("pairs", count(static_cast<long long>(found.pairs))).set("seconds_per_row", num(row_time / reduced_by)).set("error_seconds_per_row", num(found.error * acq.period_s / reduced_by));
+        say(log, fmt("  rows' timing from the frames between scans at different heights (%zu patches of %zu pairs of scans): %+.3f +- %.3f us per stored row", found.n, found.pairs, row_time * 1e6 / reduced_by,
+                     found.error * acq.period_s * 1e6 / reduced_by));
+    }
+    if (acq.rows_from_middle)
+        say(log, fmt("  the rows' timing counts the rows from the middle row to both ends (%+.3f us per stored row: %s)", row_time * 1e6 / reduced_by,
+                     row_time < 0 ? "the first and last row are exposed first" : "the middle row is exposed first"));
     say(log, "solve");
     Parameters start = empty_parameters(acq);
     for (std::size_t k = 0; k < acq.scans.size(); ++k)
         if (!std::isnan(acq.scans[k].axis)) start.scans[k].axis = acq.scans[k].axis;
     GeometryOptions how;
-    if (options.order > 0) {
-        start.map = geometry::empty_map(acq.rows, acq.cols, options.order);
+    if (options.radial_map || options.order > 0) {
+        start.map = geometry::empty_map(acq.rows, acq.cols, options.radial_map ? 3 : options.order);
+        how.radial_map = options.radial_map;
         how.freed.push_back("map");
         how.undetermined_map = 0.95;  // (a term the comparisons cannot tell from a scan's place is not solved for)
     }
@@ -1096,6 +1115,8 @@ std::string calibrate_geometry(const std::vector<std::string>& scans, const Opti
         for (const std::string& n : solution.undetermined) names += (names.empty() ? "" : ", ") + n;
         say(log, "  the comparisons do not tell these terms of the map from other unknowns (correlated beyond 0.95): held at nothing, the rest solved without them: " + names);
     }
+    if (const GeometrySolution::RadialMap& r = solution.radial_map; r.solved)
+        say(log, fmt("  the map's radial terms as one: %+.3f px at %.0f px from the detector's middle (k = %+.3e per px^2)", r.cubic, start.map.cs, r.k));
     if (std::any_of(solution.free.begin(), solution.free.end(), [](const std::string& n) { return n.find(".tilt_") != std::string::npos; }))
         say(log, "  the scans' tilts against the first solved after that, every scan's axial scale kept");
     GeometryReport told = report(acq, solution, comparisons);
@@ -1137,6 +1158,13 @@ std::string calibrate_geometry(const std::vector<std::string>& scans, const Opti
             say(log, fmt("  scan %zu (%s): %.0f px from the anchor; its own views' height once per turn %.3f rows: the axis leans at least %.0f urad towards the beam (its direction less the scan's: %+.0f deg)", k,
                          acq.scans[k].name.c_str(), r.from_anchor, polar(p.height_once), r.pitch * 1e6, r.pitch_phase_deg));
     }
+    for (const PairReport& r : told.pairs)
+        if (std::isfinite(r.row_time))
+            say(log, fmt("  scans %d and %d: the rows the timing counts between their views differ by %.0f rms over %zu patches: by their frames a row is exposed %+.3f +- %.3f us after the one %s (the model has %+.3f)",
+                         r.scan_a, r.scan_b, r.timing_rows_spread, r.n, r.row_time * acq.period_s * 1e6, r.row_time_error * acq.period_s * 1e6, acq.rows_from_middle ? "nearer the middle row" : "before", row_time * 1e6));
+    if (const RowTimeBetweenScans& t = told.row_time_between_scans; t.n)
+        say(log, fmt("  over those %zu pairs (%zu patches): a row is exposed %+.3f +- %.3f us after the one %s", t.pairs, t.n, t.row_time * acq.period_s * 1e6, t.error * acq.period_s * 1e6,
+                     acq.rows_from_middle ? "nearer the middle row" : "before"));
     if (told.axis.n > 1)
         say(log, fmt("  over the %d scans with opposite views: axis column %.3f px (%.3f rms), its slope %.2e per row (%.2e rms), axial scale %.0f ppm (%.0f rms, mean %.0f)", told.axis.n, told.axis.range, told.axis.sd,
                      told.axis_slope.range, told.axis_slope.sd, told.axial_scale.range * 1e6, told.axial_scale.sd * 1e6, told.axial_scale.mean * 1e6));
@@ -1146,10 +1174,11 @@ std::string calibrate_geometry(const std::vector<std::string>& scans, const Opti
     Json counts = Json::dict();
     for (const auto& [kind, n] : accepted) counts.set(kind, count(n));
     Json found = Json::parse(solution_json(acq, solution));
-    Json parameters = Json::dict(), solve = Json::dict(), map;
+    Json parameters = Json::dict(), solve = Json::dict(), map, radial;
     for (const auto& [key, value] : found.object) {
         if (key == "map") map = value;
         else if (key == "roll" || key == "pitch" || key == "stage" || key == "about_height" || key == "scans") parameters.set(key, value);
+        else if (key == "radial_map") radial = value;
         else solve.set(key, value);
     }
     Json cal = Json::dict();
@@ -1157,7 +1186,8 @@ std::string calibrate_geometry(const std::vector<std::string>& scans, const Opti
     // what the frames were that it was measured on (the values below are in stored pixels whatever they were)
     cal.set("frames", Json::dict().set("reduce", count(options.reduce)).set("projections", Json::of(options.projections)));
     cal.set("layout", Json::parse(acquisition_json(acq)));
-    cal.set("row_time", Json::dict().set("seconds_per_row", num(row_time)).set("frame_period_s", num(acq.period_s)).set("frames_per_row", num(acq.row_time)).set("measured", timing));
+    cal.set("row_time", Json::dict().set("seconds_per_row", num(row_time)).set("frame_period_s", num(acq.period_s)).set("frames_per_row", num(acq.row_time)).set("from_middle", Json::of_bool(acq.rows_from_middle)).set("measured", timing));
+    if (radial.is(Json::Object)) cal.set("map_radial", radial);  // (what the map below is the terms of)
     cal.set("map", map).set("parameters", parameters).set("solution", solve).set("report", Json::parse(report_json(acq, told)));
     cal.set("comparisons", Json::dict().set("blocks", count(static_cast<long long>(planned.size()))).set("patch", count(patch * reduced_by)).set("accepted", counts));
     return cal.text();

@@ -18,6 +18,11 @@
 //                                            not renormalised: DC < 1, chunk-height dependent)
 //   unsharp  sigma, coeff, method=gaussian   (1 + c) - c G   (method log: 1 + c Lap G)
 //   gaussian sigma                           Gaussian blur (periodic, as unsharp's G)
+//   butterworth cutoff, order=4              low-pass 1 / (1 + (f / cutoff)^(2 order)), f the frequency's length in
+//                                            cycles per pixel, the same along the columns and the rows: keeps the
+//                                            reconstruction from carrying frequencies beyond those the detector holds
+//                                            an image at (white noise, band-limited image). Margin: the rows to where
+//                                            the kernel's envelope is 1e-4, at most 64
 //   median   radius (1..3)                   (2r+1)^2 median per frame, edges clamped
 //   epr      delta_beta, iters=3,            eikonal phase retrieval (local second-order closure, src/common/
 //            relax=0.75, max_shift=12.5      epr_core.hpp), in place of paganin: starts from the Paganin result

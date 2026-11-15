@@ -52,6 +52,7 @@ class DeviceBuffer {
     }
     void upload(const T* host, std::size_t n, cudaStream_t s = nullptr) {
         resize(n);
+        if (!n) return;  // (nothing to copy, and no memory to copy it to)
         HELIREC_CUDA_CHECK(cudaMemcpyAsync(ptr_, host, n * sizeof(T), cudaMemcpyHostToDevice, s));
     }
     void download(T* host, cudaStream_t s = nullptr) const {

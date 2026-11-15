@@ -245,7 +245,7 @@ MergedPlacement placement_from_vector(const std::array<double, 2>& vector, int c
 
 // ---------------------------------------------------------------- the detector's blur
 
-FlatNoise flat_noise_spectra(const Scan& scan, const float* dark, int n_flats, int tile) {
+FlatNoise flat_noise_spectra(const Scan& scan, const float* dark, int n_flats, int tile, std::array<int, 2> lit) {
     if (scan.flats.empty()) throw Error("the detector's blur needs flats");
     const FrameList& refs = scan.flats[0];
     const int n = static_cast<int>(std::min<std::size_t>(static_cast<std::size_t>(n_flats), refs.size())) / 2 * 2;
@@ -253,7 +253,9 @@ FlatNoise flat_noise_spectra(const Scan& scan, const float* dark, int n_flats, i
     const int rows = scan.rows, cols = scan.cols;
     FlatNoise out;
     out.n_flats = n;
-    for (int y = (rows % tile) / 2; y <= rows - tile; y += tile) out.ys.push_back(y);
+    if (lit[1] <= lit[0]) lit = {0, rows};
+    if (lit[0] < 0 || lit[1] > rows) throw Error("the detector's blur: the lit rows lie outside the detector");
+    for (int y = lit[0] + ((lit[1] - lit[0]) % tile) / 2; y <= lit[1] - tile; y += tile) out.ys.push_back(y);
     for (int x = (cols % tile) / 2; x <= cols - tile; x += tile) out.xs.push_back(x);
     const std::size_t per = static_cast<std::size_t>(tile) * static_cast<std::size_t>(tile / 2 + 1);
     const std::size_t cells = out.ys.size() * out.xs.size() * per;
@@ -289,19 +291,20 @@ FlatNoise flat_noise_spectra(const Scan& scan, const float* dark, int n_flats, i
     return out;
 }
 
-DetectorBlur measure_detector_blur(const Scan& scan, const float* dark, int n_flats, const Log& log) {
+DetectorBlur measure_detector_blur(const Scan& scan, const float* dark, int n_flats, const Log& log, std::array<int, 2> lit) {
     const auto t0 = std::chrono::steady_clock::now();
     const int rows = scan.rows, cols = scan.cols;
+    if (lit[1] <= lit[0]) lit = {0, rows};
     DetectorBlur res;
     res.scan = scan.name;
     const int n_have = scan.flats.empty() ? 0 : static_cast<int>(std::min<std::size_t>(static_cast<std::size_t>(n_flats), scan.flats[0].size()));
-    if (n_have < kBlurMinFlats || (rows / kBlurTile) * (cols / kBlurTile) < 6) {
+    if (n_have < kBlurMinFlats || ((lit[1] - lit[0]) / kBlurTile) * (cols / kBlurTile) < 6) {
         res.reason = n_have < kBlurMinFlats ? std::to_string(n_have) + " flats in the first series"
-                                            : "a detector of " + std::to_string(rows) + " x " + std::to_string(cols) + " holds too few tiles of " + std::to_string(kBlurTile);
+                                            : "a detector of " + std::to_string(lit[1] - lit[0]) + " x " + std::to_string(cols) + " holds too few tiles of " + std::to_string(kBlurTile);
         say(log, "detector blur: not measured (" + res.reason + ")");
         return res;
     }
-    const FlatNoise noise = flat_noise_spectra(scan, dark, n_flats);
+    const FlatNoise noise = flat_noise_spectra(scan, dark, n_flats, kBlurTile, lit);
     const DetectorBlurField fit = detector_blur_field_fit(noise.power.data(), static_cast<int>(noise.ys.size()), static_cast<int>(noise.xs.size()), kBlurTile,
                                                           noise.ys.data(), noise.xs.data(), static_cast<std::size_t>(rows), static_cast<std::size_t>(cols));
     const double* th = fit.field;
@@ -428,6 +431,7 @@ std::string IntensityCalibration::json() const {
         motors.set(scans[k], num(estimated_cor_from_motor_pix[k]));
     }
     d.set("placement", placed).set("apodisation", widths).set("estimated_cor_from_motor_pix", motors);
+    d.set("lit_rows", Json::list().add(count(lit[0])).add(count(lit[1])));
     d.set("details", Json::dict().set("layout", measured).set("detector_blur", blur_json(detector_blur)));
     d.set("detector_blur_field", numbers(detector_blur.field));
     d.set("fingerprint", Json::of(fingerprint)).set("version", count(version));
@@ -519,12 +523,30 @@ IntensityCalibration calibrate_intensity(const std::vector<const Scan*>& scans, 
             cal.reduced[k] = reduce_darks_flats(sc, bar ? std::function<void(std::size_t)>([&](std::size_t n) { bar->update(n); }) : nullptr);
         }
     }
+    // the rows the beam lights, in every scan: of each scan's flats (their mean) less its dark
+    cal.lit = {0, cal.rows};
+    for (std::size_t k = 0; k < S; ++k) {
+        const DarksFlats& d = cal.reduced[k];
+        const std::size_t n = d.series();
+        if (!n) throw Error("the scan " + scans[k]->name + " has no flats");
+        std::vector<float> flat(R * C, 0.f);
+        for (std::size_t i = 0; i < n; ++i)
+            for (std::size_t p = 0; p < R * C; ++p) flat[p] += d.flats[i * R * C + p];
+        for (std::size_t p = 0; p < R * C; ++p) flat[p] = flat[p] / static_cast<float>(n) - d.dark[p];
+        const std::array<int, 2> lit = lit_rows(flat.data(), cal.rows, cal.cols);
+        cal.lit = {std::max(cal.lit[0], lit[0]), std::min(cal.lit[1], lit[1])};
+    }
+    if (cal.lit[1] <= cal.lit[0]) throw Error("the scans' flats light no row in common");
+    if (cal.lit[1] - cal.lit[0] < cal.rows)
+        say(log, "the beam lights rows " + std::to_string(cal.lit[0]) + ".." + std::to_string(cal.lit[1] - 1) + " of " + std::to_string(cal.rows) + ": the weights are cropped to them");
     if (cal.weight_map.empty()) {
         // the weight map from all the flats, the last scan's first (the reference's --scan_files order: the companion's, then the main scan's)
         std::vector<const float*> flats;
         for (std::size_t k = S; k-- > 0;)
             for (std::size_t i = 0; i < cal.reduced[k].series(); ++i) flats.push_back(cal.reduced[k].flats.data() + i * R * C);
-        cal.weight_map = store ? weight_map(flats, cal.rows, cal.cols, 15.0 / f, 10.0 / f) : weight_map(flats, cal.rows, cal.cols);
+        // (cropped to the rows the beam lights: where it lights them all, nothing is cropped)
+        const int top = cal.lit[0], bottom = cal.rows - cal.lit[1];
+        cal.weight_map = store ? weight_map(flats, cal.rows, cal.cols, 15.0 / f, 10.0 / f, top, bottom) : weight_map(flats, cal.rows, cal.cols, 15.0, 10.0, top, bottom);
         if (!cache_dir.empty()) {
             make_dirs(cache_dir);
             std::vector<NamedArray> arrays;
@@ -551,17 +573,33 @@ IntensityCalibration calibrate_intensity(const std::vector<const Scan*>& scans, 
     // other scan a border taper on the side facing the main scan, and one on its far side if a scan lies beyond it.
     for (const Scan* sc : scans) cal.estimated_cor_from_motor_pix.push_back(sc->estimated_cor_from_motor_pix);
     cal.apodisation.resize(S);
-    if (S == 1) {
-        cal.apodisation[0] = {0.0, 0.0};
-    } else {
-        const double borders = 50.0 / f;
-        const ApodisationWidths aw = apodisation_widths(cal.cols, main.estimated_cor_from_motor_pix / f, cal.vectors[0][1], 1000.0 / f, borders);
-        cal.apodisation[0] = {aw.main_left, aw.main_right};
+    // A scan at the main scan's own columns and another height (above or below it: a grid's first column) is
+    // apodised as the main scan: within a quarter of the detector's width of it and more than a quarter of its
+    // height from it. Every other scan is beside the main scan.
+    {
+        const double apart = cal.cols / 4.0, borders = 50.0 / f;
+        const auto columns = [&](std::size_t k) { return k == 0 ? 0.0 : cal.vectors[k - 1][1]; };
+        const auto over_main = [&](std::size_t k) { return k > 0 && std::fabs(cal.vectors[k - 1][1]) < apart && std::fabs(cal.vectors[k - 1][0]) > cal.rows / 4.0; };
+        double side = 0;  // where the scans beside the main scan lie: below nothing on its left, above on its right
         for (std::size_t k = 1; k < S; ++k) {
-            if (!(cal.vectors[k - 1][1] < 0)) throw Error("a companion on the right of the main scan is not supported yet");
-            bool beyond = false;
-            for (std::size_t j = 1; j < S; ++j) beyond = beyond || cal.vectors[j - 1][1] < cal.vectors[k - 1][1];
-            cal.apodisation[k] = {beyond ? borders : aw.companion_left, aw.companion_right};
+            if (over_main(k)) continue;
+            if (side != 0 && (columns(k) < 0) != (side < 0)) throw Error("scans on both sides of the main scan are not supported");
+            side = columns(k);
+        }
+        if (side == 0) {  // a scan alone, or scans above each other alone: no apodisation across the beam
+            for (std::size_t k = 0; k < S; ++k) cal.apodisation[k] = {0.0, 0.0};
+        } else {
+            const ApodisationWidths aw = apodisation_widths(cal.cols, main.estimated_cor_from_motor_pix / f, side, 1000.0 / f, borders);
+            for (std::size_t k = 0; k < S; ++k) {
+                if (k == 0 || over_main(k)) {
+                    cal.apodisation[k] = {aw.main_left, aw.main_right};
+                    continue;
+                }
+                bool beyond = false;  // a scan lies further out
+                for (std::size_t j = 1; j < S; ++j) beyond = beyond || std::fabs(columns(j)) > std::fabs(columns(k)) + apart;
+                cal.apodisation[k] = side < 0 ? std::array<double, 2>{beyond ? borders : aw.companion_left, aw.companion_right}
+                                              : std::array<double, 2>{aw.companion_left, beyond ? borders : aw.companion_right};
+            }
         }
     }
 
@@ -574,7 +612,7 @@ IntensityCalibration calibrate_intensity(const std::vector<const Scan*>& scans, 
         cal.detector_blur = blur_of(*cached);
         say(log, "calibration loaded from " + cache_dir);
     } else {
-        cal.detector_blur = measure_detector_blur(main, cal.reduced[0].dark.data(), 200, log);
+        cal.detector_blur = measure_detector_blur(main, cal.reduced[0].dark.data(), 200, log, cal.lit);
         if (!cache_dir.empty()) {
             make_dirs(cache_dir);
             const std::string tmp = json_path + ".tmp" + std::to_string(static_cast<long>(::getpid()));

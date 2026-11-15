@@ -35,6 +35,8 @@
 //    "energy_kev": 53,                       optional
 //    "propagation_distance_m": 0.5,          optional: sample to detector
 //    "source_sample_distance_m": 51,         optional
+//    "fan_sense": -1,                        optional, 1 or -1 (default 1): the sense of the beam's divergence against
+//                                            the recorded angle (Acquisition::fan); -1 at Diamond I12
 //    "height_stage": "ss1_y1",               optional: the motor that sets the height of the sample in the beam
 //    "stages_on_rotation": ["ss1_tx", "ss1_tz"]}   optional: the two stages that move the sample on the rotation
 //

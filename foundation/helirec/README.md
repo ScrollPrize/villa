@@ -233,13 +233,24 @@ on its own from Python (`helirec._core`, re-exported in `helirec`) on NumPy arra
   is `filters.REFERENCE_CHAIN` (Paganin δ/β 1000 + unsharp σ 1.2, coefficient 4), also used by the standard
   Paganin baseline recipes. Explicit chains are literal: omit `unsharp` for Paganin alone, or set
   `unsharp.coeff=0` to disable sharpening. Built-in types: `paganin`,
-  `epr`, `mtf_paganin`, `wiener`, `unsharp`, `gaussian`, `median`, `python`; register more in C++ (`register_filter`, `filters.hpp`) or Python
+  `epr`, `mtf_paganin`, `wiener`, `unsharp`, `gaussian`, `butterworth`, `median`, `python`; register more in C++ (`register_filter`, `filters.hpp`) or Python
   (`helirec.filters.register`). Each filter runs at `stage=intensity` (before −log, default) or `stage=log` and
   declares the margin rows it needs. Consecutive linear shift-invariant filters of one stage fuse into one FFT
   filter. Command line: `--set "filters=paganin(delta_beta=2000)+median(radius=1,stage=log)"`, or override one
   parameter of the current chain with `--set paganin.delta_beta=500`. Sweeps take the same keys
   (`--sweep paganin.delta_beta=250,500`, or `filters=CHAIN1;CHAIN2`); a sweep of one intensity-stage FFT step shares
   the forward FFT.
+* **Low-pass of the projections** (`butterworth(cutoff=0.22, order=6)`): `1 / (1 + (f / cutoff)^(2 order))` of the
+  frequency's length in cycles per pixel, the same along the columns and the rows; a Fourier filter, so it joins the
+  FFT step of `paganin` and `unsharp` at no cost. For a detector whose noise is white while its image is not (the
+  light's quanta are counted at the sensor, the image is blurred before it): beyond the frequency the image ends at
+  there is noise alone, which the ramp and a sharpening step amplify. Along the columns it does what a window on the
+  ramp does (`fbp(filter_name=butterworth, ..)`); along the rows nothing else does it. Find the cutoff from
+  reconstructions of the even and the odd projections (`angle_subset=0/2`, `1/2`): the frequency beyond which the
+  two share nothing. On Diamond I12's PHerc. 172 (7.91 um, 53 keV) the two halves share nothing beyond 0.2 cycles per
+  pixel; `paganin(delta_beta=120)+unsharp(sigma=1.2,coeff=4)+butterworth(cutoff=0.22,order=6)` leaves 0.53 of the
+  noise's variance of the same chain with a ramp window at 0.35, and the sample's power as it was up to 0.12 cycles
+  per pixel (0.90 of it between 0.12 and 0.20).
 * **Fused MTF / Paganin filter** (`mtf_paganin(delta_beta=…, sigma=… | mtf=…, target=0.5, gain=12 | nsr=…)`, in
   place of `paganin + unsharp`): phase retrieval and detector deblurring as one filter. The detector records the
   propagated intensity blurred by its point spread, `Î_det = (M / P) Î` (`P`: the Paganin response, `M`: the
@@ -1073,14 +1084,50 @@ so the calibration session and everything built on a `Scan` take such a scan unc
 
 * The file holds no pixel size, energy or distances: they come from `helirec_acquisition.json` beside the masters,
   `{"pixel_size_um": 7.91, "energy_kev": 53, "propagation_distance_m": null, "source_sample_distance_m": null,
-  "height_stage": "ss1_y1"}`. Only the pixel size is required.
+  "fan_sense": -1, "height_stage": "ss1_y1"}`. Only the pixel size is required. `fan_sense` (1 or -1, default 1)
+  is the sense of the beam's divergence against the recorded angle (below, "Circular scans").
 * The stage across the beam is taken from the fly scan's command (`inBeamPosition`, `outOfBeamPosition` for the
   flats), not from the motors' snapshot before the scan, which can be taken while the stage still moves.
 * The angle is the Zebra's capture at the trigger plus half the arc swept during the exposure; the scan's one ring
   current stands for each of its frames; a record a frame shorter than its frame file gives the frames it describes.
 * `helirec-calibration check-record` does not take such a record: its checks are of what BLISS latches.
+* A grid of circular scans (places across the beam at several heights) is one family (`group_companions`,
+  `pair_companions`): scans that each stay at one height are grouped by geometry at other heights too, and come row
+  by row, the rows in the order of acquisition, each row from the scan with its axis nearest the detector's centre
+  outwards. The scans of a family may differ by one projection (a record a frame short).
 
 ## Intensity calibration step (`helirec-calibration intensity`)
+
+**Rows of scans above each other (a grid of circular scans) in the reconstruction.** The calibration's poses and
+merged frame place scans without a helix (each by the medians over its own frames; a second row lies a row's step
+from the first in its vector). `SliceReconstructor` groups the scans by their place across the beam (within a
+quarter of the detector's width and more than a quarter of its height apart: one place); a height is reconstructed
+where every place has a scan that sees it (`doable_span` with places: the union over the rows), each chunk from the
+scans that see it, and where two rows hold a height both enter by their weights. A height is seen through the lit
+rows alone (`ScanTrajectory::row_first`, `row_end`, set from the intensity calibration's lit rows). The slice grid
+reaches as far as the columns do on either side of the axis. `mode=legacy_reference` refuses rows of scans.
+
+The luminosity equalisation (`luminosity_repartition`) compares a scan with the earlier scans at its own height (the
+scans of its row; within a quarter of the detector's rows), in the window at its seam with the nearest of them. With
+rows of scans each row is summed apart, its scans are taken to each other's level, and the row is added to those
+before it (`add_into`): around a height another row holds other rows of the detector, so its sums in the window are
+of another part of the sample. The first scan of a row is taken to no one's level, and nothing compares one row with
+another (they share heights in their overlap alone, which most chunks do not hold). The scans of a row must follow
+each other in the list of scans. The step subtracts one level per angle and slice row from the whole scan, read in
+25 rows at one seam: where something dense crosses the seam in those rows (a case's base plate) it is not to be
+trusted; `--set luminosity_repartition=0` leaves it out.
+
+```bash
+helirec-reconstruct PROJ --heights 1200 1201 --format tiff --set geometry=geometry.json --set luminosity_repartition=0   # PROJ: the folder of <n>.nxs masters and their frame files
+```
+
+Layouts the library's `calibrate_intensity` takes (`calibration.calibrate_scans` in Python): the main scan with the
+rotation axis in its right half and the other scans on its left (the reference's), or the axis in its left half and
+the other scans on its right (the same apodisation mirrored: Diamond I12); and, of circular scans, scans at the
+columns of one of those at another height (a grid), each apodised as the scan it stands above. Where slits light a
+part of the detector's rows, the weight map is cropped to the rows every scan's flats light (`lit_rows`, the rule the
+geometry step uses; `IntensityCalibration::lit`), so the unlit rows and what a camera writes into them carry no
+weight, and the weight map's vertical border is where two rows of scans hand over to each other.
 
 The darks and flats of both scans reduced as the reference (nx2etf) reduces them (each flat taken to the nominal
 ring current of 0.2 A), the weight map and each scan's horizontal apodisation (prepare_weights_double), the
@@ -1123,6 +1170,8 @@ helirec-calibration geometry <tile.h5> [<tile.h5> ..] --out geometry.json --orde
 helirec-calibration geometry <tile.h5> [..] --out geometry.json --order 0 --row-time-us 0 --reduce 2 --projections projections.zarr   # the same on the store's quarter
 helirec-calibration geometry <HA.h5> <TA.h5> <TA2.h5> <TA3.h5> --out geometry.json --row-time-us -6.46 --reduce 2 --projections projections.zarr   # four scans side by side
 helirec-calibration geometry <r1c1.nxs> <r1c2.nxs> <r1c3.nxs> <r2c1.nxs> .. --out geometry.json --row-time-us 0 --order 0   # a grid of circular scans (NXtomo)
+helirec-calibration geometry <r1c1.nxs> .. <r2c3.nxs> --out geometry.json --rows-from-middle --order 0   # the same, the camera's two halves read at once: the row time measured
+helirec-calibration geometry <r1c1.nxs> .. <r2c3.nxs> --out geometry.json --rows-from-middle --radial-map   # and the detector's map, its radial terms as one unknown
 ```
 
 **Circular scans (no helix), in a grid of places across the beam and heights.** A scan that is one turn at rest is
@@ -1135,6 +1184,43 @@ slits light a part of the detector's rows, the layout finds the lit rows from th
 rows above 0.12 of the brightest row's mean flat) and the plan keeps every block inside them; the rows that hold
 something across the whole width are looked for among them. A record without a source distance gives no fan, and
 with no beam monitor per frame there is no refill to take the rows' timing from: give `--row-time-us`.
+
+**The sense of the beam's divergence.** `Acquisition::fan` is signed. At ESRF BM18 the ray recorded at a higher
+column is a parallel beam's further on in the recorded angle (PHerc0343P's opposite views lie `2 fan (c - axis)`
+frames beyond half a turn); at Diamond I12 it is further back: scans moved 2275 columns across the beam hold the
+same view 0.19 frames apart, the other way round. The sample turns the other way against the detector's columns
+there for the same recorded angle. A record states it as `scan/fan_sense` (-1; the supplement file's `fan_sense`
+for an NXtomo scan), and `read_acquisition` then gives the fan the other sign. The recorded angle is not reversed:
+the volume keeps the handedness the recorded angle gives it.
+
+**A camera whose two halves are read at once** (an sCMOS with a rolling shutter, as the PCO.edge):
+`--rows-from-middle` (`Options::rows_from_middle`, `Acquisition::rows_from_middle`; no record states it). The rows'
+timing then counts the rows from the middle row to both ends: row v is exposed `row_time x |v - middle row|` after
+the frame's own time, above nothing with the middle row first, below it with the first and last row first. The
+same form is in the model's sightings, in the requests of tiles (`ViewRequest::sway_rows_from_middle`), in the
+file (`row_time.from_middle`), in the poses (`Poses::rows_from_middle`) and in the reconstruction's angle per slice
+(`ReconConfig::rolling_shutter_from_middle`). With it, a row time that is not given and that no refill gives is
+measured from the frames between scans at different heights (`row_time_between_scans`): such scans hold the same
+lines at rows the timing counts differently from patch to patch, and the frames between them follow those rows
+(under a timing that counts from the first row to the last they lie the same rows apart everywhere, and nothing
+reads it). The report gives that timing per pair of scans and over all of them (`report.pairs[..].row_time_*`,
+`report.row_time_between_scans`), whatever the timing solved under. It is not an unknown the solve finds here:
+scans at one place on the rotation stage hardly move a row or a column with it, and freed it runs away. The poses
+hold the form for scans at rest while a frame is read (circular scans); with a travel along the axis they refuse it.
+
+**The map of scans compared along the frames' edges alone**: `--radial-map` (`Options::radial_map`,
+`GeometryOptions::radial_map`, `solve_geometry(.., radial_map=True)`). Scans moved by nearly a frame, sideways or
+along the axis, compare one edge of the detector with the other. That gives the terms of the map that change along
+a seam (of a lens' distortion `k (x, y) (x^2 + y^2)`: `x y^2` at a seam between columns, `x^2 y` between rows) and
+not the columns' course along the columns (`x^3`), which is one with the scans' axis columns there and is what the
+inside of a frame is displaced by against its edges. The polynomial solved term by term holds that term at nothing
+(`undetermined`). With `--radial-map` the four terms of the radial displacement (`map.eu.i3j0`, `.eu.i1j2`,
+`.ev.i2j1`, `.ev.i0j3`) are one unknown, `map.radial` (the displacement in pixels half the detector's width from
+its middle), and the map's other terms stay unknowns of their own, held where the comparisons do not tell them
+from another unknown as before. The file's `map` holds the four terms written out (nothing downstream changes) and
+`map_radial` the unknown and `k`. That the distortion is a lens' is an assumption about the inside of the frame
+that the seams cannot check: they fit as well without the `x^3` term. PHerc. 172 at Diamond I12: 7.1 px at the
+detector's edge (`k` = 3.4e-9 per px^2); the two seams' terms taken one by one give 7.2 and 6.9.
 
 ```python
 from helirec import geometry

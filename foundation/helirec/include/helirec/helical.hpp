@@ -23,6 +23,10 @@ struct ScanTrajectory {
     // detector see of a slice by e x (rows between them) along z: a blur along z that grows with the pitch.
     double z_translation_scale = 1.0;
     int det_rows = 0, det_cols = 0;
+    // The detector's rows that hold data, [row_first, row_end): where slits light a part of the detector, the rows
+    // the beam lights. A height counts as seen by a projection only through them (make_span_info). None
+    // (row_end <= row_first): every row.
+    int row_first = 0, row_end = 0;
     // placement in the merged (extended field of view) frame
     int shift_x = 0;           // integer column offset of this scan in the merged frame
     float x_readjustment = 0;  // shift_x - desired offset (e.g. -0.5)
@@ -76,6 +80,11 @@ SpanInfo make_span_info(const ScanTrajectory& t, double angular_tolerance_steps)
 // intersection over scans (same z direction assumed): [lo, hi) with hi EXCLUSIVE,
 // i.e. heights lo..hi-1 can be reconstructed (the reference never uses the last valid height)
 std::pair<int, int> doable_span(const std::vector<SpanInfo>& spans);
+// The same where several scans stand at one place across the beam, at different heights (a grid of circular
+// scans: rows of scans above each other). place[s]: the place of scan s (any labels). A height can be
+// reconstructed where every place has a scan that sees it; the span is the longest run of such heights, [lo, hi)
+// with hi exclusive and the last valid height left out as above. With one scan per place it is the intersection.
+std::pair<int, int> doable_span(const std::vector<SpanInfo>& spans, const std::vector<int>& place);
 
 // projection index interval [first, last+1) whose union covers heights h0..h1 (inclusive)
 std::pair<int, int> chunk_projection_span(const SpanInfo& s, int h0, int h1_inclusive);
@@ -110,16 +119,19 @@ FlatInterpolation interpolate_flats(const FlatSeriesInfo&, float angle);
 // [h_lo - margin, h_hi + margin), so that the context rows do not depend on the chunking. padded_rows (with
 // full_context): the gridding that pads rows beyond the detector from its last interpolable row needs that row
 // inside the window.
+// may_miss: the scan need not see every height of the chunk (another scan at its place across the beam does:
+// doable_span with places). Its projections are then those that see the heights it does see, and none (p0 = p1)
+// if it sees none; without it a height the scan does not see is an error.
 ChunkScan prepare_chunk_scan(const ScanTrajectory& t, const SpanInfo& s, const std::vector<double>& control_A,
                              const FlatSeriesInfo& flats, int h_lo, int h_hi, int margin, int n_grid,
-                             double nominal_current = 0.2, bool full_context = false, bool padded_rows = false);
+                             double nominal_current = 0.2, bool full_context = false, bool padded_rows = false, bool may_miss = false);
 // the projections [p0, p1) of that chunk
 std::pair<int, int> chunk_projections(const ScanTrajectory& t, const SpanInfo& s, int h_lo, int h_hi, int margin,
-                                      bool full_context = false, bool padded_rows = false);
+                                      bool full_context = false, bool padded_rows = false, bool may_miss = false);
 // the most projections a chunk of `rows` slices (fewer at the end) starting anywhere in [lo, hi) has: what buffers
 // that serve one chunk after another need to hold
 int max_chunk_projections(const ScanTrajectory& t, const SpanInfo& s, int lo, int hi, int rows, int margin,
-                          bool full_context = false, bool padded_rows = false);
+                          bool full_context = false, bool padded_rows = false, bool may_miss = false);
 
 // number of grid angles: round(360 / |mean step|) over the whole scan
 int grid_angle_count(const std::vector<double>& angles_deg);

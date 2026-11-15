@@ -43,6 +43,7 @@ struct Pairing {
     double frame_shear = 0;            // B's frames are read at an angle that changes by this many frames per column
     double sway_px = 0, sway_phase_deg = 0;  // B's frames are read sway_px cos(angle - phase) columns further on (session.hpp)
     double sway_row_deg = 0;                 // ... each row at its own angle, this many degrees per row from the frame's
+    bool sway_rows_from_middle = false;      // ... the rows counted from the middle row to both ends
 };
 
 struct Cut {

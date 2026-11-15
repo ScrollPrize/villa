@@ -543,12 +543,23 @@ bool is_tomo_master(const std::string& path) {
     return false;
 }
 
+// (the projections may differ by one: a fly scan's record can end a frame short, as Diamond I12's 146080 does)
 bool compatible(const Scan& a, const Scan& b) {
     const double ra = a.unwrapped_angles_deg.back() - a.unwrapped_angles_deg.front();
     const double rb = b.unwrapped_angles_deg.back() - b.unwrapped_angles_deg.front();
-    return a.rows == b.rows && a.cols == b.cols && a.projections.size() == b.projections.size() &&
+    const std::size_t na = a.projections.size(), nb = b.projections.size();
+    // (the one frame more is one step more of angular range)
+    const double one_more = na == nb || na < 2 || nb < 2 ? 0.0 : std::max(std::fabs(ra) / static_cast<double>(na - 1), std::fabs(rb) / static_cast<double>(nb - 1));
+    return a.rows == b.rows && a.cols == b.cols && (na > nb ? na - nb : nb - na) <= 1 &&
            is_close(a.pixel_size_m, b.pixel_size_m, 1e-6, 1e-8) && is_close(a.energy_kev, b.energy_kev, 1e-6, 1e-8) &&
-           std::fabs(ra - rb) < 1.0;
+           std::fabs(ra - rb) < 1.0 + one_more;
+}
+
+// whether the scan stays at one height (a circular scan; a helix travels), and that height
+bool at_one_height(const Scan& s) {
+    for (const double z : s.z_translation_m)
+        if (!is_close(z, s.z_translation_m.front(), 1e-5, 1e-6)) return false;
+    return !s.z_translation_m.empty();
 }
 
 }  // namespace
@@ -939,7 +950,14 @@ std::vector<std::vector<int>> group_companions(const std::vector<Scan>& scans) {
             out.push_back(std::move(g));
         }
     }
-    // scans without a kind in their name: grouped by geometry
+    // scans without a kind in their name: grouped by geometry. Another place is another lateral position of the
+    // stage; of scans that each stay at one height (circular scans), also another height: a grid.
+    const auto same_row = [&](const Scan& a, const Scan& b) { return is_close(a.z_translation_m.front(), b.z_translation_m.front(), 1e-5, 1e-6); };
+    const auto same_place = [&](const Scan& a, const Scan& b) {
+        const bool beside = !is_close(a.y_translation_m, b.y_translation_m, 1e-5, 1e-6);
+        if (at_one_height(a) && at_one_height(b)) return !beside && same_row(a, b);
+        return !beside;
+    };
     std::set<std::size_t> used;
     for (std::size_t i = 0; i < untagged.size(); ++i) {
         if (used.count(i)) continue;
@@ -947,19 +965,34 @@ std::vector<std::vector<int>> group_companions(const std::vector<Scan>& scans) {
         std::vector<int> g = {untagged[i]};
         for (std::size_t j = i + 1; j < untagged.size(); ++j) {
             const Scan& b = scans[static_cast<std::size_t>(untagged[j])];
-            if (used.count(j) || !compatible(a, b) || is_close(a.y_translation_m, b.y_translation_m, 1e-5, 1e-6)) continue;
+            if (used.count(j) || !compatible(a, b)) continue;
             bool distinct = true;
-            for (int c : g) distinct = distinct && !is_close(scans[static_cast<std::size_t>(c)].y_translation_m, b.y_translation_m, 1e-5, 1e-6);
+            for (int c : g) distinct = distinct && !same_place(scans[static_cast<std::size_t>(c)], b);
             if (!distinct) continue;
             g.push_back(untagged[j]);
             used.insert(j);
         }
         if (g.size() >= 2) {
-            std::stable_sort(g.begin(), g.end(), [&](int x, int y) {
-                return std::fabs(scans[static_cast<std::size_t>(x)].estimated_cor_from_motor_pix) <
-                       std::fabs(scans[static_cast<std::size_t>(y)].estimated_cor_from_motor_pix);
+            // The scan with its axis nearest the detector's centre first. A grid: row by row, the rows in the
+            // order their first scans were given in (by name: the order of acquisition), each row so ordered.
+            std::vector<int> row(g.size(), 0);
+            bool grid = true;
+            for (const int c : g) grid = grid && at_one_height(scans[static_cast<std::size_t>(c)]);
+            for (std::size_t k = 0, rows = 0; grid && k < g.size(); ++k) {
+                row[k] = static_cast<int>(rows);
+                for (std::size_t q = 0; q < k; ++q)
+                    if (same_row(scans[static_cast<std::size_t>(g[q])], scans[static_cast<std::size_t>(g[k])])) row[k] = row[q];
+                if (row[k] == static_cast<int>(rows)) ++rows;
+            }
+            std::vector<std::size_t> order(g.size());
+            for (std::size_t k = 0; k < order.size(); ++k) order[k] = k;
+            std::stable_sort(order.begin(), order.end(), [&](std::size_t x, std::size_t y) {
+                if (row[x] != row[y]) return row[x] < row[y];
+                return std::fabs(scans[static_cast<std::size_t>(g[x])].estimated_cor_from_motor_pix) < std::fabs(scans[static_cast<std::size_t>(g[y])].estimated_cor_from_motor_pix);
             });
-            out.push_back(std::move(g));
+            std::vector<int> sorted;
+            for (const std::size_t k : order) sorted.push_back(g[k]);
+            out.push_back(std::move(sorted));
         }
     }
     return out;

@@ -63,6 +63,26 @@ def test_cpu_cuda_agree(chain):
     np.testing.assert_allclose(g, c, rtol=0, atol=2e-5)
 
 
+def test_butterworth_low_pass_of_the_projection():
+    """1 / (1 + (f / cutoff)^(2 order)) of the frequency's length, along the rows and the columns alike: a wave keeps
+    that share of its amplitude whichever way it runs, a constant stays, and the chain is one Fourier step."""
+    H, W = 96, 128
+    y, x = np.mgrid[:H, :W]
+    chain = [{"type": "butterworth", "cutoff": 0.25, "order": 4}]
+    assert helirec.filter_margin(chain, **PH) == 16 and helirec.filter_margin([{"type": "butterworth", "cutoff": 0.05, "order": 8}], **PH) == 64
+    np.testing.assert_allclose(helirec.apply_filters(np.full((1, H, W), 3.0, np.float32), chain, 0), 3.0, rtol=1e-5)
+    for f0, f1 in ((0.0, 0.125), (0.125, 0.0), (0.0, 0.25), (0.25, 0.0), (0.1875, 0.1875), (0.0, 0.375), (0.375, 0.0)):   # cycles per pixel along the rows, the columns
+        wave = (1.0 + 0.5 * np.cos(2 * np.pi * (f0 * y + f1 * x)))[None].astype(np.float32)
+        out = helirec.apply_filters(wave, chain, 0)[0]
+        expect = 1.0 / (1.0 + (np.hypot(f0, f1) / 0.25) ** 8)
+        # (away from the frame's edges: the frame is padded, and the wave does not close on the padded grid)
+        np.testing.assert_allclose(out[28:-28, 28:-28], (1.0 + expect * (wave[0] - 1.0))[28:-28, 28:-28], atol=2e-3, err_msg=str((f0, f1)))
+    described = helirec.filter_describe([{"type": "paganin", "delta_beta": 120}, {"type": "unsharp", "sigma": 1.2, "coeff": 4}] + chain, **PH)
+    assert described.startswith("fft[paganin*unsharp*butterworth]@intensity"), described
+    with pytest.raises(RuntimeError, match="cutoff"):
+        helirec.apply_filters(np.ones((1, 8, 8), np.float32), [{"type": "butterworth", "cutoff": 0}], 0)
+
+
 def test_gaussian_preserves_constant():
     a = np.full((2, 40, 60), 3.0, np.float32)
     out = helirec.apply_filters(a, [{"type": "gaussian", "sigma": 3}], 0)

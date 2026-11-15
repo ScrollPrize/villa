@@ -57,6 +57,15 @@ struct BackprojectParams {
                               // compute attenuation themselves, e.g. iterative ones, multiply by it)
     const std::int32_t* tiles = nullptr;   // (n_tiles) host: the tiles to compute, each once; null: the whole slice
     int n_tiles = 0;
+    // A beam that diverges (a source at a finite distance): the ray recorded at the column m of a row (m = u /
+    // u_scale, the columns the rotation axis is counted in) is not the parallel beam's of the row's angle a but that
+    // ray turned about its own point nearest the axis by fan[m] radians, towards a - fan[m]. A pixel (x, y) from the
+    // axis, at t = x cos a + y sin a + rot_center, is then read at the column t + fan[t] (x sin a - y cos a): fan at
+    // the nearest column to t, the ends' values beyond them. The filter along the rows is the parallel beam's: what
+    // the exact fan-beam formula adds (a weight by the depth, the rows' cosine) differs from 1 by the fan itself and
+    // is left out, as is the fan's square. (n_fan) host; null: a parallel beam.
+    const float* fan = nullptr;
+    int n_fan = 0;
 };
 // interpolation name <-> BackprojectParams::interp
 int interp_from_name(const std::string& name);

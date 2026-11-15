@@ -25,10 +25,18 @@ void backproject_k(const float* sino, const std::vector<float>& cs, const std::v
     auto pixel = [&](int iy, int ix) {
         const float y = static_cast<float>(iy + p.y0) - c, x = static_cast<float>(ix + p.x0) - c;
         float acc = 0.f;
-        if (!p.clip_outer_circle || x * x + y * y <= r * r)
+        if (p.clip_outer_circle && x * x + y * y > r * r) {
+        } else if (p.fan) {   // a diverging beam (BackprojectParams::fan)
+            for (int a = 0; a < n_angles; ++a) {
+                const float t = x * cs[a] + y * sn[a] + p.rot_center;
+                const float g = p.fan[interp_core::fan_column(t, p.n_fan)];
+                acc += interp_core::sample_row<K>(sino + static_cast<std::size_t>(a) * n_det, n_det, (t + g * (x * sn[a] - y * cs[a])) * p.u_scale);
+            }
+        } else {
             for (int a = 0; a < n_angles; ++a)
                 acc += interp_core::sample_row<K>(sino + static_cast<std::size_t>(a) * n_det, n_det,
                                                   (x * cs[a] + y * sn[a] + p.rot_center) * p.u_scale);
+        }
         slice[static_cast<std::size_t>(iy) * nx + ix] = acc * p.scale;
     };
     if (p.tiles) {   // the listed tiles; the rest of the slice is 0
@@ -50,6 +58,7 @@ void backproject_k(const float* sino, const std::vector<float>& cs, const std::v
 
 void backproject(const float* sino, const float* angles, float* slice, int n_angles, int n_det,
                  int ny, int nx, const BackprojectParams& p) {
+    if (p.fan && p.n_fan < 1) throw Error("backproject: a fan without columns");
     const float c = p.center >= 0.f ? p.center : 0.5f * static_cast<float>(std::max(nx, ny) - 1);
     const float r = p.clip_radius >= 0.f ? p.clip_radius : c;
     std::vector<float> cs(n_angles), sn(n_angles);

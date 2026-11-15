@@ -47,10 +47,12 @@ void map_displacement(const Map& m, const double* c, const double* v, std::size_
 //     Y = h + row[k] + row_per_col[k] u,        X = axis[k] + u + col_per_row[k] (Y - middle row),
 // which is the detector pixel (c, v) with
 //     c + Eu(c, v) + col_scale[k] (c - scale_col) = X,        v + Ev(c, v) + row_scale[k] v = Y,
-// recorded at the angle angle_deg[k] + angle_deg_per_row[k] (v - middle row).
+// recorded at the angle angle_deg[k] + angle_deg_per_row[k] (v - middle row); with rows_from_middle (a camera whose
+// two halves are read at once) at angle_deg[k] + angle_deg_per_row[k] |v - middle row|.
 struct Poses {
     std::vector<double> row, row_per_col, axis, col_per_row, col_scale, row_scale, angle_deg, angle_deg_per_row;
     double scale_col = 0;
+    bool rows_from_middle = false;
 };
 
 // One scan's poses as the reconstruction's per-projection terms (ScanTrajectory). The reconstruction puts the
@@ -98,11 +100,21 @@ class Calibration {
     // The record's height of every frame in rows, as the calibration counts them: row_sign x height / pixel size.
     std::vector<double> heights_rows(const std::vector<double>& z_translation_m, double pixel_size_m) const;
     Map map() const;
-    // The rows' timing as the reconstruction takes it: the time from the first stored row to the last, in frame periods.
+    // The rows' timing as the reconstruction takes it: the time from the first stored row to the last, in frame periods
+    // (the row time x (rows - 1)); and whether it counts the rows from the middle row to both ends (a camera whose two
+    // halves are read at once: geometry_calibration.hpp, Acquisition::rows_from_middle), the row v then exposed
+    // rolling_shutter x |v - middle row| / (rows - 1) frames after the frame's own time.
     double rolling_shutter() const;
+    bool rows_from_middle() const;
+    // The beam's divergence [rad per stored column, signed]: the ray recorded at the column c of a frame is a
+    // parallel beam's at the frame's angle + fan x (c - the middle column) (geometry_calibration.hpp,
+    // Acquisition::fan, there in frames per column). 0: the record stated no source distance, or the calibration is
+    // of the earlier two-scan step.
+    double fan() const;
     // The middle of the columns both scans hold, in the first scan's columns.
     double overlap_centre() const;
     // The first scan's helix among its projection frames (all its projection stretches one after the other): [first, end).
+    // Of a joint calibration of scans without a helix (circular scans): the first scan's first stretch.
     std::array<std::size_t, 2> helix_frames() const;
 
     // angles_deg[s], heights_rows[s]: the record's angle (unwrapped) and height (rows: row_sign x height / pixel)
@@ -118,7 +130,8 @@ class Calibration {
     //     row         height + the stretch's height + (1 + axial_scale) H + the stage's lift once per turn - roll d . n(th)
     //                 + pitch d . (-sin th, cos th) (the pitch of the axis towards the beam, where the calibration has
     //                 one: the row of the rays through the sample's origin),
-    //                 counted from the first scan's row at its helix' first frame (the slices are numbered from there)
+    //                 counted from the first scan's row at its helix' first frame (the slices are numbered from there;
+    //                 of scans without a helix, from the first scan's row at its first frame)
     //     axis        axis + axis_slope (H - H_mid) + the stage's axis column twice per turn + d . n(th)
     //     the slopes  col_per_row = roll, row_per_col = -roll
     //     a scan's tilt against the first (its rotation's x and y, about the sample's origin at about_height): with
@@ -128,7 +141,9 @@ class Calibration {
     //                 are not in the poses.
     //     the rows' timing: angle_deg_per_row the angle's step x the frames per row, and row_scale minus the
     //                 travel per frame x the frames per row about the middle row (the sample travels while the
-    //                 rows are read)
+    //                 rows are read). A timing that counts the rows from the middle to both ends is held for
+    //                 scans that do not travel while a frame is read (circular scans); with a travel it is an
+    //                 error (the rows would be scaled about the middle row in two senses, which poses do not hold)
     std::array<Poses, 2> frame_poses(const std::array<std::vector<double>, 2>& angles_deg,
                                      const std::array<std::vector<double>, 2>& heights_rows,
                                      std::string* not_applied = nullptr) const;
@@ -147,7 +162,8 @@ class Calibration {
     // ---- one scan of a joint calibration of any number of scans (a mosaic's tile), reconstructed alone
     // the scan the calibration's layout names so
     std::size_t scan_named(const std::string& name) const;
-    // the frames of its helix the calibration was made on, among the scan's projection frames: [first, end)
+    // the frames of its helix (without one: of its first stretch) the calibration was made on, among the scan's
+    // projection frames: [first, end)
     std::array<std::size_t, 2> frames_on_disk(std::size_t scan) const;
     double axis_column(std::size_t scan) const;  // at the middle row, at the middle of the helix' frames on disk
     // The scan's poses in its own frame: as frame_poses' of a joint calibration with the scan's place d and its
@@ -167,7 +183,9 @@ class Calibration {
                                double quantum = 0.25) const;
     // The same of any number of scans (scan_poses): the medians over the frames of the first scan's helix the
     // calibration was made on. first_frame[s]: the first frame of scan s the reconstruction is given, from which
-    // its record's heights count there (none: every scan's first).
+    // its record's heights count there (none: every scan's first). Scans without a helix (circular scans, which may
+    // differ by a frame) are each placed by the medians over their own frames: a scan at another height has its
+    // rows in its vector (a grid's second row lies a row's step from the first).
     MergedLayout merged_layout(const std::vector<Poses>& poses, const std::vector<std::vector<double>>& heights_rows,
                                const std::vector<std::size_t>& first_frame = {}, double quantum = 0.25) const;
 

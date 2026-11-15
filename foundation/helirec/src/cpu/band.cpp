@@ -37,10 +37,18 @@ void backproject_list_k(const float* sino, const std::vector<float>& cs, const s
         const float x = static_cast<float>(li % box.w + box.x0) - c;
         const float y = static_cast<float>(li / box.w + box.y0) - c;
         float acc = 0.f;
-        if (!p.clip_outer_circle || x * x + y * y <= r * r)
+        if (p.clip_outer_circle && x * x + y * y > r * r) {
+        } else if (p.fan) {   // a diverging beam (BackprojectParams::fan)
+            for (int a = 0; a < n_angles; ++a) {
+                const float t = x * cs[a] + y * sn[a] + p.rot_center;
+                const float g = p.fan[interp_core::fan_column(t, p.n_fan)];
+                acc += interp_core::sample_row<K>(sino + static_cast<std::size_t>(a) * n_det, n_det, (t + g * (x * sn[a] - y * cs[a])) * p.u_scale);
+            }
+        } else {
             for (int a = 0; a < n_angles; ++a)
                 acc += interp_core::sample_row<K>(sino + static_cast<std::size_t>(a) * n_det, n_det,
                                                   (x * cs[a] + y * sn[a] + p.rot_center) * p.u_scale);
+        }
         img[li] = acc * p.scale;
     }
 }

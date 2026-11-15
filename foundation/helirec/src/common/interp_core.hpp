@@ -25,6 +25,12 @@ HR_HD int spline_degree(int interp) { return interp == BSpline3 ? 3 : (interp ==
 
 HR_HD float tap(const float* row, int n, int i) { return (i >= 0 && i < n) ? row[i] : 0.f; }
 
+// the entry of a table of n columns (BackprojectParams::fan) for the position t: the nearest column, the ends' beyond them
+HR_HD int fan_column(float t, int n) {
+    const int i = static_cast<int>(floorf(t + 0.5f));
+    return i < 0 ? 0 : (i >= n ? n - 1 : i);
+}
+
 HR_HD float keys(float t) {  // a = -0.5
     t = fabsf(t);
     if (t < 1.f) return (1.5f * t - 2.5f) * t * t + 1.f;

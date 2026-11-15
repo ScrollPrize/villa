@@ -53,11 +53,21 @@ std::vector<float> mean_frames(RawReader& reader, const int32_t* file_index, con
 std::vector<float> weight_map(const std::vector<const float*>& flats, int rows, int cols, double transition_width_vertical = 15.0,
                               double sigma = 10.0, int crop_top = 0, int crop_bottom = 0);
 
+// The rows the beam lights, [first, end): around the brightest row of a flat less its dark (each row's mean over
+// the columns), the rows that reach `share` of it. A beam cut by slits along the axis lights a part of the
+// detector (Diamond I12 at PHerc. 172: rows 252 to 1905 of 2160, the rows beyond reading 5 to 8 % of the
+// brightest); where every row is lit (BM18: the first and last row at half the brightest) it is every row.
+// The geometry calibration keeps its comparisons inside them, the intensity calibration its weights.
+inline constexpr double kLitShare = 0.12;
+std::array<int, 2> lit_rows(const float* flat_less_dark, int rows, int cols, double share = kLitShare);
+
 // The horizontal apodisation widths (left, right) of the main scan and of the companion, as
 // prepare_weights_double --is_tetra writes them: on the main scan a slope beyond the rotation axis
 // (min(2 transition_width_horizontal, distance from the axis to the edge)) on the axis' side and a border taper
 // towards the companion; on the companion a border taper on the side facing the main scan.
-// est_cor_main_offset: the axis' column from the middle of the main scan; companion_dx: where the companion lies.
+// est_cor_main_offset: the axis' column from the middle of the main scan; companion_dx: where the companion lies
+// (below nothing: on the left, the axis then in the main scan's right half, as the reference has it; above: on
+// the right, the axis in its left half, the same widths mirrored).
 struct ApodisationWidths {
     double main_left = 0, main_right = 0, companion_left = 0, companion_right = 0;
 };
@@ -164,9 +174,11 @@ struct FlatNoise {
     std::vector<int> ys, xs;
     int n_flats = 0;
 };
-FlatNoise flat_noise_spectra(const Scan& scan, const float* dark, int n_flats = 200, int tile = kBlurTile);
+// lit: the rows the beam lights, [first, end) (lit_rows): the tiles lie inside them, since a tile the beam does not
+// light holds no noise of the beam's (nothing named, end <= first: every row).
+FlatNoise flat_noise_spectra(const Scan& scan, const float* dark, int n_flats = 200, int tile = kBlurTile, std::array<int, 2> lit = {0, 0});
 DetectorBlur measure_detector_blur(const Scan& scan, const float* dark, int n_flats = 200,
-                                   const std::function<void(const std::string&)>& log = nullptr);
+                                   const std::function<void(const std::string&)>& log = nullptr, std::array<int, 2> lit = {0, 0});
 
 // sha256 over what the calibration of a pair depends on: its version, the scans' identities, metadata, frame
 // geometry and trajectories, and the raw files they read (path, size, time of change). A replaced acquisition (even
@@ -181,7 +193,9 @@ std::string acquisition_fingerprint(const std::vector<const Scan*>& scans);  // 
 DarksFlats store_darks_flats(const Scan& scan, const std::string& tile_group, int reduce);
 
 // The scans in the order of the geometry calibration: the first (the main scan) has the rotation axis in its field,
-// the others (companions) lie beside it, each further from the axis.
+// the others (companions) lie beside it, each further from the axis, all on one side of it; or at the columns of
+// one of those and another height (a grid of circular scans: the rows of scans overlap along the axis, and where
+// two hold a height both enter by their weights, which the weight map's vertical border tapers).
 struct IntensityCalibration {
     std::string main, companion;           // the names of the first two scans (companion: "" for a scan alone)
     std::vector<std::string> scans;        // every scan's name
@@ -202,6 +216,9 @@ struct IntensityCalibration {
     int version = kIntensityCalibrationVersion;
 
     std::vector<DarksFlats> reduced;                  // per scan
+    // The rows the beam lights in every scan, [first, end) (lit_rows of each scan's flats less its dark): the
+    // weight map is cropped to them (weight_map's crop_top, crop_bottom). Every row where every row is lit.
+    std::array<int, 2> lit{0, 0};
     std::vector<float> weight_map;                    // of all the flats (the last scan's first, as the reference orders a pair's)
     std::vector<std::vector<float>> weight;           // per scan: the weight map times the scan's horizontal apodisation
 

@@ -164,10 +164,18 @@ std::vector<JointStretch> joint_stretches(const Json& cal, std::size_t scan) {
     }
     return out;
 }
+// The stretch a scan is placed by: its helix; of a scan without one (a circular scan: turns at rest alone) its
+// first stretch. main_stretch: which of the scan's stretches that is.
+std::size_t main_stretch(const std::vector<JointStretch>& stretches) {
+    for (std::size_t k = 0; k < stretches.size(); ++k)
+        if (stretches[k].helix) return k;
+    if (stretches.empty()) throw Error("geometry: a scan of the calibration has no stretch");
+    return 0;
+}
 std::array<std::size_t, 2> joint_helix(const Json& cal, std::size_t scan) {
-    for (const JointStretch& st : joint_stretches(cal, scan))
-        if (st.helix) return {st.offset, st.offset + st.frames};
-    throw Error("geometry: scan " + std::to_string(scan) + " of the calibration has no helix");
+    const std::vector<JointStretch> stretches = joint_stretches(cal, scan);
+    const JointStretch& st = stretches[main_stretch(stretches)];
+    return {st.offset, st.offset + st.frames};
 }
 // the frames of a stretch (as a joint calibration's layout lists it) that were on disk, among the scan's projection
 // frames: [first, end); a stretch that does not say is whole
@@ -271,6 +279,16 @@ std::vector<double> Calibration::heights_rows(const std::vector<double>& z_trans
 double Calibration::rolling_shutter() const {
     return number(member(*doc_, "row_time", "the geometry"), "seconds_per_row", "the rows' timing") * (rows() - 1) / period_of(*doc_);
 }
+double Calibration::fan() const {
+    const Json& lay = member(*doc_, "layout", "the geometry");
+    const Json* v = lay.find("fan");
+    if (!is_joint(*doc_) || !v || !v->is(Json::Number) || v->number == 0.0) return 0.0;
+    return v->number * (2 * kPi / number(lay, "frames_per_turn", "the layout"));
+}
+bool Calibration::rows_from_middle() const {
+    const Json* v = member(*doc_, "row_time", "the geometry").find("from_middle");
+    return v && v->is(Json::Bool) && v->boolean;
+}
 double Calibration::overlap_centre() const {
     const Json& lay = member(*doc_, "layout", "the geometry");
     if (!is_joint(*doc_)) return overlap_centre_of(lay);
@@ -299,6 +317,9 @@ Poses joint_scan_poses(const Json& cal, int rows, std::size_t s, const std::vect
     if (!scans.is(Json::Array) || s >= scans.array.size()) throw Error("geometry: the calibration does not hold scan " + std::to_string(s));
     const double mid = (rows - 1) / 2.0;
     const double per_row = number(member(cal, "row_time", "the geometry"), "frames_per_row", "the rows' timing");
+    // the rows counted from the middle row to both ends (a camera whose two halves are read at once)
+    const Json* two_sided = member(cal, "row_time", "the geometry").find("from_middle");
+    const bool from_middle = two_sided && two_sided->is(Json::Bool) && two_sided->boolean;
     const double roll = number(par, "roll", "the parameters");
     // the pitch of the rotation axis towards the beam, where the calibration has it (a mosaic's tiles give it)
     const Json* leans = par.find("pitch");
@@ -349,7 +370,13 @@ Poses joint_scan_poses(const Json& cal, int rows, std::size_t s, const std::vect
         if (!placed[k]) continue;
         const double th = radians(ang[k]), c = std::cos(th), sn = std::sin(th);
         const double dn = d[0] * c + d[1] * sn;
-        const double while_read = axial * travel[k] * per_row;  // rows the sample travels per row read
+        double while_read = axial * travel[k] * per_row;  // rows the sample travels per row read
+        if (from_middle) {
+            // (a travel of under a millionth of a row over the frame is the rounding of a height that stands)
+            if (std::fabs(while_read) * rows > 1e-6)
+                throw Error("geometry: the rows' timing counts the rows from the middle row to both ends and the scan travels along the axis while a frame is read: the poses hold that for scans at rest only");
+            while_read = 0.0;
+        }
         // About a pitched axis a ray climbs by the pitch per pixel of depth, and the sample's origin lies
         // at . (-sin th, cos th) deep from the axis: the row at which this frame holds the rays through the origin's
         // depth. It is not part of a rigid motion of the scan's volume, so the scan's own frame has it too: with it
@@ -369,6 +396,7 @@ Poses joint_scan_poses(const Json& cal, int rows, std::size_t s, const std::vect
     // about the rotation axis' column (its course over the frames and the map's part there are under a pixel, which
     // times the scale is nothing)
     q.scale_col = axis;
+    q.rows_from_middle = from_middle;
     return q;
 }
 
@@ -385,14 +413,14 @@ std::vector<Poses> joint_poses(const Json& cal, int rows, const std::vector<std:
     const std::array<std::size_t, 2> first_helix = joint_helix(cal, 0);
     if (H[0].size() <= first_helix[0]) throw Error("geometry: the record holds fewer frames than the calibration's first scan");
     std::vector<Poses> out(S);
-    // the slices are numbered from the first scan's row at its helix' first frame: its height, its helix' and the record's
+    // the slices are numbered from the first scan's row at its helix' first frame (without a helix: its first
+    // stretch's): its height, that stretch's and the record's
     double origin = 0;
     {
         const Json& p = scans.array[0];
         double extra = 0;
-        for (const JointStretch& st : joint_stretches(cal, 0))
-            if (st.helix)
-                if (const Json* given = member(p, "stretch_height", "a scan").find(st.name)) extra = number_of(*given, "a stretch's height");
+        const std::vector<JointStretch> stretches = joint_stretches(cal, 0);
+        if (const Json* given = member(p, "stretch_height", "a scan").find(stretches[main_stretch(stretches)].name)) extra = number_of(*given, "a stretch's height");
         origin = number(p, "height", "a scan") + extra + (1.0 + number(p, "axial_scale", "a scan")) * H[0][first_helix[0]];
     }
     for (std::size_t s = 0; s < S; ++s) {
@@ -445,12 +473,9 @@ std::array<std::size_t, 2> Calibration::frames_on_disk(std::size_t scan) const {
     if (!is_joint(*doc_)) throw Error("geometry: the frames a calibration was made on are a joint calibration's");
     const Json& scans = member(member(*doc_, "layout", "the geometry"), "scans", "the layout");
     if (!scans.is(Json::Array) || scan >= scans.array.size()) throw Error("geometry: the layout does not hold scan " + std::to_string(scan));
-    for (const Json& s : member(scans.array[scan], "stretches", "a scan of the layout").array) {
-        const Json* helix = s.find("helix");
-        if (!helix || !helix->is(Json::Bool) || !helix->boolean) continue;
-        return stretch_on_disk(s);
-    }
-    throw Error("geometry: scan " + std::to_string(scan) + " of the calibration has no helix");
+    const Json& list = member(scans.array[scan], "stretches", "a scan of the layout");
+    if (!list.is(Json::Array) || list.array.empty()) throw Error("geometry: scan " + std::to_string(scan) + " of the calibration has no stretch");
+    return stretch_on_disk(list.array[main_stretch(joint_stretches(*doc_, scan))]);
 }
 
 double Calibration::axis_column(std::size_t scan) const {
@@ -711,22 +736,44 @@ MergedLayout Calibration::merged_layout(const std::vector<Poses>& poses, const s
     const std::size_t a = helix[0], b = helix[1], S = poses.size();
     const double sign = number(lay, "row_sign", "the layout");
     if (!S || H.size() != S || (!first_frame.empty() && first_frame.size() != S)) throw Error("geometry: the poses, the heights and the first frames are not of the same scans");
+    // Scans without a helix (circular scans) do not travel, and their frames are not one another's (a scan may be
+    // a frame short): each is placed by the medians over its own stretch's frames on disk.
+    bool travels = true;
+    if (is_joint(*doc_)) {
+        const std::vector<JointStretch> stretches = joint_stretches(*doc_, 0);
+        travels = stretches[main_stretch(stretches)].helix;
+    }
+    const auto frames_of = [&](std::size_t s) { return travels || s == 0 ? helix : frames_on_disk(s); };
     for (std::size_t s = 0; s < S; ++s)
-        if (poses[s].axis.size() < b || H[s].size() < b) throw Error("geometry: the poses do not reach the helix' end");
+        if (poses[s].axis.size() < frames_of(s)[1] || H[s].size() < frames_of(s)[1]) throw Error("geometry: the poses do not reach the helix' end");
     const auto from = [&](std::size_t s) { return first_frame.empty() ? std::size_t{0} : first_frame[s]; };
     const auto q = [&](double v) { return std::nearbyint(v / quantum) * quantum; };  // halves to the even one, as the step always rounded
-    const auto axis_of = [&](std::size_t s) { return median(std::vector<double>(poses[s].axis.begin() + static_cast<std::ptrdiff_t>(a), poses[s].axis.begin() + static_cast<std::ptrdiff_t>(b))); };
+    const auto axis_of = [&](std::size_t s) {
+        const std::array<std::size_t, 2> f = frames_of(s);
+        return median(std::vector<double>(poses[s].axis.begin() + static_cast<std::ptrdiff_t>(f[0]), poses[s].axis.begin() + static_cast<std::ptrdiff_t>(f[1])));
+    };
+    // the row a slice is read at beyond what the record alone gives (z_pix: the record's height from the scan's first frame)
+    const auto row_of = [&](std::size_t s, std::size_t k) { return poses[s].row[k] + sign * (H[s][k] - H[s][from(s)]); };
     MergedLayout out;
     const double axis0 = axis_of(0);
     out.cor_main_detector = q(axis0);
     out.axis_first_scan = axis0, out.quantum = quantum;
     for (std::size_t s = 1; s < S; ++s) {
         const double axis = axis_of(s);
-        // the row a slice is read at beyond what the record alone gives (z_pix: the record's height from the scan's first frame)
-        std::vector<double> diff(b - a);
-        for (std::size_t k = a; k < b; ++k)
-            diff[k - a] = (poses[s].row[k] + sign * (H[s][k] - H[s][from(s)])) - (poses[0].row[k] + sign * (H[0][k] - H[0][from(0)]));
-        const double rows_ = median(diff);
+        double rows_ = 0;
+        if (travels) {  // at equal frames: the two scans travel alike
+            std::vector<double> diff(b - a);
+            for (std::size_t k = a; k < b; ++k) diff[k - a] = row_of(s, k) - row_of(0, k);
+            rows_ = median(diff);
+        } else {
+            const auto rows_over = [&](std::size_t scan) {
+                const std::array<std::size_t, 2> f = frames_of(scan);
+                std::vector<double> v(f[1] - f[0]);
+                for (std::size_t k = f[0]; k < f[1]; ++k) v[k - f[0]] = row_of(scan, k);
+                return median(v);
+            };
+            rows_ = rows_over(s) - rows_over(0);
+        }
         out.vectors.push_back({q(-rows_), q(axis0 - axis)});
         out.measured.push_back({axis, rows_});
     }

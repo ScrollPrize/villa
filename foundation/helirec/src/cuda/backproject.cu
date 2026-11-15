@@ -13,11 +13,13 @@ static_assert(2 * kTile == kBackprojectTile, "a block computes one tile");
 constexpr int kPix = 4;             // (kTile apart on each axis)
 constexpr int kAngleChunk = 512;    // angles staged in shared memory per pass
 
-template <int K>
+// FAN: a diverging beam (BackprojectParams::fan; `fan` its n_fan columns on the device)
+template <int K, bool FAN>
 __global__ void backproject_kernel(const float* __restrict__ sino, const float2* __restrict__ cs_sn,
                                    float* __restrict__ slice, int n_angles, int n_det, int ny, int nx,
                                    float rot_center, float scale, float c, int x0, int y0, bool clip,
-                                   float r2, float us, const int32_t* __restrict__ tiles, int ntx) {
+                                   float r2, float us, const int32_t* __restrict__ tiles, int ntx,
+                                   const float* __restrict__ fan, int n_fan) {
     __shared__ float2 s_cs[kAngleChunk];
     // the block's tile: (blockIdx.x, blockIdx.y), or entry blockIdx.x of the tile list
     const int bx = tiles ? tiles[blockIdx.x] % ntx : blockIdx.x, by = tiles ? tiles[blockIdx.x] / ntx : blockIdx.y;
@@ -47,8 +49,14 @@ __global__ void backproject_kernel(const float* __restrict__ sino, const float2*
                 const float2 t = s_cs[k];
 #pragma unroll
                 for (int j = 0; j < kPix; ++j) {
-                    // (the contraction nvcc applies to (x cos + y sin + rot) us, spelled out)
-                    const float u = __fmul_rn(__fadd_rn(__fmaf_rn(x[j], t.x, __fmul_rn(y[j], t.y)), rot_center), us);
+                    float u;
+                    if (FAN) {
+                        const float at = x[j] * t.x + y[j] * t.y + rot_center;
+                        u = (at + fan[interp_core::fan_column(at, n_fan)] * (x[j] * t.y - y[j] * t.x)) * us;
+                    } else {
+                        // (the contraction nvcc applies to (x cos + y sin + rot) us, spelled out)
+                        u = __fmul_rn(__fadd_rn(__fmaf_rn(x[j], t.x, __fmul_rn(y[j], t.y)), rot_center), us);
+                    }
                     if (u >= interp_core::reach_lo<K>() && u < umax[j]) acc[j] += interp_core::sample_row_reach<K>(row, n_det, u);
                 }
             }
@@ -73,6 +81,12 @@ void backproject(const float* sino, const float* angles_host, float* slice, int 
     // (kept between calls: one slice after another on the calling thread, each finished before it returns)
     thread_local DeviceBuffer<float2> d_cs;
     thread_local DeviceBuffer<int32_t> d_tiles;
+    thread_local DeviceBuffer<float> d_fan;
+    if (p.fan && p.n_fan < 1) throw Error("backproject: a fan without columns");
+    if (p.fan) {
+        d_fan.ensure(static_cast<size_t>(p.n_fan));
+        HELIREC_CUDA_CHECK(cudaMemcpyAsync(d_fan.data(), p.fan, p.n_fan * sizeof(float), cudaMemcpyHostToDevice, s));
+    }
     d_cs.ensure(cs.size());
     HELIREC_CUDA_CHECK(cudaMemcpyAsync(d_cs.data(), cs.data(), cs.size() * sizeof(float2), cudaMemcpyHostToDevice, s));
     const int ntx = (nx + 2 * kTile - 1) / (2 * kTile), nty = (ny + 2 * kTile - 1) / (2 * kTile);
@@ -89,9 +103,14 @@ void backproject(const float* sino, const float* angles_host, float* slice, int 
         tiles = d_tiles.data();
         grid = dim3(p.n_tiles, 1);
     }
-#define HELIREC_BP(K) backproject_kernel<K><<<grid, block, 0, s>>>(sino, d_cs.data(), slice, n_angles, n_det, ny, nx, \
+#define HELIREC_BP_OF(K, FAN) backproject_kernel<K, FAN><<<grid, block, 0, s>>>(sino, d_cs.data(), slice, n_angles, n_det, ny, nx, \
                                            p.rot_center, p.scale, c, p.x0, p.y0, p.clip_outer_circle, r * r, p.u_scale, \
-                                           tiles, ntx)
+                                           tiles, ntx, p.fan ? d_fan.data() : nullptr, p.n_fan)
+#define HELIREC_BP(K) \
+    do { \
+        if (p.fan) HELIREC_BP_OF(K, true); \
+        else HELIREC_BP_OF(K, false); \
+    } while (0)
     switch (p.interp) {
         case interp_core::Linear: HELIREC_BP(interp_core::Linear); break;
         case interp_core::Cubic: HELIREC_BP(interp_core::Cubic); break;
@@ -101,6 +120,7 @@ void backproject(const float* sino, const float* angles_host, float* slice, int 
         default: throw Error("backproject: unknown interpolation");
     }
 #undef HELIREC_BP
+#undef HELIREC_BP_OF
     HELIREC_CUDA_CHECK(cudaGetLastError());
     HELIREC_CUDA_CHECK(cudaStreamSynchronize(s));  // the slice is complete on return
 }

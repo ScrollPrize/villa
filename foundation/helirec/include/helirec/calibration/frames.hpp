@@ -133,8 +133,9 @@ void shear_frames(float* block, std::size_t n, int nrows, int ncols, double shea
 // read `shift[q]` columns further on. What a sample displaced on the rotation stage does to a tile of a mosaic
 // against another: its content sways along the columns once per turn; and with rows exposed one after another,
 // each row at its own angle, by an amount that is a line in the row (per_row, with row0 the block's first row
-// counted from the row the frame's angle belongs to). |s| must stay below pad - 2.
+// counted from the row the frame's angle belongs to; rows_from_middle: per_row[q] |row0 + r|, the rows counted to
+// both sides of that row). |s| must stay below pad - 2.
 void shift_columns(const float* wide, std::size_t n, int nrows, int ncols, int pad, const double* shift, bool flip_cols, float* out,
-                   const double* per_row = nullptr, double row0 = 0);
+                   const double* per_row = nullptr, double row0 = 0, bool rows_from_middle = false);
 
 }  // namespace helirec::calibration

@@ -629,8 +629,9 @@ ScanData make_scan_data(DIn angles_deg, DIn z_translation_m, double pixel_size_m
                         std::vector<float> col_slope, float slope_row, std::vector<int32_t> map_i, std::vector<int32_t> map_j,
                         std::vector<double> map_eu, std::vector<double> map_ev, double map_c0, double map_cs, double map_v0,
                         double map_vs, std::vector<float> col_scale, float scale_col, std::vector<float> row_scale,
-                        float scale_row) {
+                        float scale_row, int row_first, int row_end) {
     ScanData d;
+    d.traj.row_first = row_first, d.traj.row_end = row_end;
     d.traj.map_i = std::move(map_i);
     d.traj.map_j = std::move(map_j);
     d.traj.map_eu = std::move(map_eu);
@@ -916,6 +917,7 @@ class PySliceReconstructor {
         f("angle_interp", cfg.angle_interp);
         f("exposure_arc", cfg.exposure_arc);
         f("rolling_shutter", cfg.rolling_shutter);
+        f("rolling_shutter_from_middle", cfg.rolling_shutter_from_middle);
         f("angle_subsets", cfg.angle_subsets);
         f("angle_subset", cfg.angle_subset);
         f("mend_threshold", cfg.mend_threshold);
@@ -1549,7 +1551,9 @@ NB_MODULE(_core, m) {
           "map_i"_a = std::vector<int32_t>{}, "map_j"_a = std::vector<int32_t>{}, "map_eu"_a = std::vector<double>{},
           "map_ev"_a = std::vector<double>{}, "map_c0"_a = 0.0, "map_cs"_a = 1.0, "map_v0"_a = 0.0, "map_vs"_a = 1.0,
           "col_scale"_a = std::vector<float>{}, "scale_col"_a = 0.f, "row_scale"_a = std::vector<float>{}, "scale_row"_a = 0.f,
-          "row_offset, row_slope, slope_col: registration of the scan's frames per projection (helical.hpp): rows added "
+          "row_first"_a = 0, "row_end"_a = 0,
+          "row_first, row_end: the detector's rows that hold data, [row_first, row_end) (where slits light a part of it; none: every row): "
+          "a height counts as seen through them alone. row_offset, row_slope, slope_col: registration of the scan's frames per projection (helical.hpp): rows added "
           "to the vertical position, and a row offset of row_slope (column - slope_col); col_offset, col_slope, "
           "slope_row: the lateral counterpart, a column offset of col_offset + col_slope (row - slope_row), applied "
           "where columns are shifted exactly (x_interp=sinc). map_*: the scan's detector map (detector_map.hpp): pixel "

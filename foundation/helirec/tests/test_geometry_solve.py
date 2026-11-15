@@ -44,8 +44,9 @@ class Scan:
         # rotation axis towards the beam [rad]. moved: the sample sits elsewhere on the stage than in the anchor.
         # rotation: the sample is turned by this vector [rad] about its origin at the height `about`.
         # column_scale: the scan's image across the beam is smaller by this (what lies x from the axis is recorded
-        # x / (1 + column_scale) from it).
-        self.t = dict(axis=301.3, axis_slope=0.0, axial_scale=0.0, d=(0.0, 0.0), height=0.0, roll=0.0, row_time=0.0, stretch_height={}, column_scale=0.0,
+        # x / (1 + column_scale) from it). rows_from_middle: the two halves of the detector are read at once, the row
+        # v exposed row_time |v - middle row| frames after the frame's own time (else row_time (v - middle row)).
+        self.t = dict(axis=301.3, axis_slope=0.0, axial_scale=0.0, d=(0.0, 0.0), height=0.0, roll=0.0, row_time=0.0, rows_from_middle=False, stretch_height={}, column_scale=0.0,
                       height_once=(0.0, 0.0), axis_twice=(0.0, 0.0), map=None, pitch=0.0, moved=False, rotation=(0.0, 0.0, 0.0), about=0.0)
         self.t.update(truth)
         self.index = index
@@ -102,9 +103,10 @@ class Scan:
 
     def sighting(self, stretch, p, t):
         """The sighting (frame, row, column) of p whose row was exposed at the time of frame t: the frame's own
-        time is t - row_time (row - middle row)."""
+        time is t - row_time (row - middle row), or t - row_time |row - middle row| with rows_from_middle."""
         c, v = self.stored(*self.seen(stretch, p, t))
-        return [self.index, stretch, t - self.t["row_time"] * (v - (ROWS - 1) / 2.0), v, c]
+        from_middle = v - (ROWS - 1) / 2.0
+        return [self.index, stretch, t - self.t["row_time"] * (abs(from_middle) if self.t["rows_from_middle"] else from_middle), v, c]
 
     def on_detector(self, g, margin=20):
         return margin < g[3] < ROWS - margin and margin < g[4] < COLS - margin
@@ -116,7 +118,7 @@ class Scan:
 
 
 def _acquisition(*scans):
-    return G.acquisition(dict(rows=ROWS, cols=COLS, row_time=scans[0].t["row_time"], scans=[s.layout() for s in scans]))
+    return G.acquisition(dict(rows=ROWS, cols=COLS, row_time=scans[0].t["row_time"], rows_from_middle=scans[0].t["rows_from_middle"], scans=[s.layout() for s in scans]))
 
 
 def _points(rng, scan, stretch, n, radius=250.0):
@@ -191,6 +193,9 @@ def test_rays_are_the_points_lines():
     fanned = G.rays(acq, scan.parameters(), sightings)
     cols = np.array(sightings)[:, 4]
     assert np.allclose(fanned[:, 0] - got[:, 0], 2e-4 * (360.0 / PER_TURN) * (cols - (COLS - 1) / 2), atol=1e-12) and np.array_equal(fanned[:, 1:], got[:, 1:])
+    # in the other sense (a sample that turns the other way against the columns): the same, backwards
+    back = G.rays(dict(acq, fan=-2e-4), scan.parameters(), sightings)
+    assert np.allclose(back[:, 0] - got[:, 0], -(fanned[:, 0] - got[:, 0]), atol=1e-12) and np.array_equal(back[:, 1:], got[:, 1:])
 
 
 def _helix_comparisons(rng, scan, stretch, n, noise):
@@ -324,6 +329,82 @@ def test_circular_scans_give_their_places_and_nothing_of_a_travel():
     assert all(s["axial_scale"] == 0.0 and s["axis_slope"] == 0.0 and s["stretch_height"]["rest1"] == 0.0 for s in got["scans"])
 
 
+def test_scans_at_two_heights_give_a_rows_timing_counted_from_the_middle():
+    """A camera whose two halves are read at once: the row v is exposed row_time |v - middle row| after the frame's
+    own time (here below nothing: the first and last row first). Two circular scans at different heights hold the
+    same lines at rows the timing counts differently from patch to patch, so the frames between them follow those
+    rows, and the report reads the timing from them; scans beside each other hold them at the same rows and say
+    nothing of it. Under the timing the frames no longer depend on the row; counted from the first row to the last,
+    the same number leaves them."""
+    rng = np.random.default_rng(12)
+    timing = -TRUTH["row_time"]
+    turn = [("rest1", PER_TURN + 40)]
+    shared = dict(roll=TRUTH["roll"], row_time=timing, rows_from_middle=True, height_once=TRUTH["height_once"], axis_twice=TRUTH["axis_twice"], d=(0.0, 0.0), axis_slope=0.0, axial_scale=0.0)
+    first = Scan(turn, index=0, axis=TRUTH["axis"], height=0.0, **shared)
+    beside = Scan(turn, index=1, axis=TRUTH["axis"] + 230.0, height=-1.3, **shared)
+    above = Scan(turn, index=2, axis=TRUTH["axis"] + 0.4, height=2.2, **shared)
+    for st in above.stretches:                                                    # recorded 150 rows from the first
+        st["rows"] = st["rows"] + 150.0
+    above.mid_height = 150.0
+    comparisons = []
+    for other in (beside, above):
+        for p, t in _points(rng, first, 0, 2500):
+            c = _same_point(first, "pair", 0, 0, p, t, t, rng, 0.004, other=other)
+            if c is not None:
+                c["b"][2] += rng.normal(0, 0.01)                                  # a registration's frames
+                comparisons.append(c)
+    truth = dict(roll=TRUTH["roll"], stage=dict(height_once=list(TRUTH["height_once"]), axis_twice=list(TRUTH["axis_twice"])),
+                 scans=[dict(sc.parameters()["scans"][0]) for sc in (first, beside, above)])
+    layouts = [s.layout() for s in (first, beside, above)]
+    acquisition = lambda row_time, from_middle: G.acquisition(dict(rows=ROWS, cols=COLS, row_time=row_time, rows_from_middle=from_middle, scans=layouts))
+    frames = lambda acq, k: np.asarray(G.residuals(acq, truth, comparisons))[[c["b"][0] == k for c in comparisons], 0]
+    # the timing not known: the frames between the scans above each other hold it, and the report reads it
+    unknown = acquisition(0.0, True)
+    assert np.std(frames(unknown, 2)) > 0.1 > 0.02 > np.std(frames(unknown, 1))
+    told = G.report(unknown, truth, comparisons)
+    by_pair = {(p["scan_a"], p["scan_b"]): p for p in told["pairs"]}
+    assert by_pair[(0, 2)]["row_time_frames_per_row"] == pytest.approx(timing, rel=0.01) and "row_time_frames_per_row" not in by_pair[(0, 1)]
+    over = told["row_time_between_scans"]
+    assert over["pairs"] == 1 and over["frames_per_row"] == pytest.approx(timing, rel=0.01) and 0 < over["error_frames_per_row"] < 0.01 * abs(timing)
+    # under it nothing of the frames is left but their noise, and the report finds the same timing
+    known = acquisition(timing, True)
+    assert np.std(frames(known, 2)) < 0.012 and abs(np.mean(frames(known, 2))) < 2e-3
+    assert G.report(known, truth, comparisons)["row_time_between_scans"]["frames_per_row"] == pytest.approx(timing, rel=0.01)
+    # counted from the first row to the last, the two views lie the same rows apart in every patch: nothing reads it
+    down = acquisition(timing, False)
+    assert np.std(frames(down, 2)) > 0.1 and "row_time_between_scans" not in G.report(down, truth, comparisons)
+    # the places are found as without a timing (scans at one place on the rotation stage: the rows and columns hardly depend on it;
+    # no opposite views here, so the first scan's axis column is held)
+    start = dict(roll=0.0, scans=[dict(axis=TRUTH["axis"]), dict(axis=TRUTH["axis"] + 229.0), dict(axis=TRUTH["axis"] - 0.5)])
+    got = G.solve_geometry(known, comparisons, start=start, held=["stage", "scan0.axis"])
+    assert got["row_time"] == timing and [s["height"] for s in got["scans"]] == pytest.approx([0.0, -1.3, 2.2], abs=0.02)
+
+
+def test_poses_under_a_rows_timing_counted_from_the_middle():
+    """The reconstruction's poses say when the rows' timing counts the rows from the middle row to both ends, and
+    refuse a scan that travels along the axis while a frame is read under it (the rows would be scaled about the
+    middle row in two senses, which poses do not hold)."""
+    rng = np.random.default_rng(6)
+    first, second, _, _ = _pair(rng)
+    scans = (first, second)
+    offsets = np.cumsum([0] + [len(st["rows"]) for st in first.stretches])
+    layout = dict(rows=ROWS, cols=COLS, row_sign=-1.0, scans=[dict(name=str(k), coarse_axis=sc.t["axis"], stretches=[
+        dict(name=st["name"], helix=st["helix"], frames=len(st["rows"]), offset=int(o)) for st, o in zip(sc.stretches, offsets)]) for k, sc in enumerate(scans)])
+    parameters = dict(roll=TRUTH["roll"], stage=dict(height_once=list(TRUTH["height_once"]), axis_twice=list(TRUTH["axis_twice"])),
+                      scans=[dict(sc.parameters()["scans"][0], mid_height=sc.mid_height) for sc in scans])
+    angles = [np.concatenate([st["angle_deg"] for st in sc.stretches]) for sc in scans]
+    heights = [np.concatenate([st["rows"] for st in sc.stretches]) for sc in scans]
+    cal = lambda per_row, from_middle: dict(step="geometry", model="joint", layout=layout, parameters=parameters, map=G.empty_map(ROWS, COLS, 0),
+                                            row_time=dict(seconds_per_row=per_row * 0.03, frame_period_s=0.03, frames_per_row=per_row, from_middle=from_middle))
+    down, _ = G.frame_poses(cal(TRUTH["row_time"], False), angles, heights)
+    assert not down[0]["rows_from_middle"] and np.allclose(down[0]["angle_deg_per_row"], TRUTH["row_time"] * 360.0 / PER_TURN)
+    with pytest.raises(ValueError, match="from the middle row"):
+        G.frame_poses(cal(TRUTH["row_time"], True), angles, heights)
+    # at rest while a frame is read (here: no time between the rows), the poses carry the form
+    still, _ = G.frame_poses(cal(0.0, True), angles, heights)
+    assert still[0]["rows_from_middle"] and still[1]["rows_from_middle"]
+
+
 def _pair(rng, with_map=True):
     """Two scans of one sample, the second with the rotation stage moved 230 columns across the beam: its axis lies
     60 columns from the detector's edge, and it holds the first's content in the columns both record."""
@@ -432,6 +513,62 @@ def test_map_terms_not_told_from_another_unknown_are_held():
     k = [(i, j) for i, j in zip(held["map"]["i"], held["map"]["j"])].index((0, 3))
     assert held["map"]["eu"][k] == 0.0 and plain["map"]["eu"][k] != 0.0 and held["map"]["ev"][k] != 0.0
     assert all(abs(c) <= 0.93 for a, b, c in held["correlated"] if a.startswith("map.") or b.startswith("map."))
+
+
+def test_scans_compared_along_their_edges_give_the_maps_radial_terms_as_one():
+    """A grid of circular scans that overlap by a strip: beside the first, a scan that holds its last 80 columns in
+    its first 80; above it, one that holds its last 100 rows in its first. Two such scans compare one edge of the
+    detector with the other, so of a lens' distortion k (x, y) (x^2 + y^2) they give the terms that change along a
+    seam (x y^2 between columns, x^2 y between rows) and not the columns' cubic along the columns, which is what the
+    inside of a frame is displaced by. radial_map solves the four terms as one unknown and finds it; the polynomial
+    alone cannot tell its x^3 term from the scans' axis columns, and holds it at nothing."""
+    rng = np.random.default_rng(21)
+    turn = [("rest1", PER_TURN + 40)]
+    m = dict(G.empty_map(ROWS, COLS, 3))
+    rho, K = m["vs"] / m["cs"], 2.0
+    truth = {(3, 0): (K, 0.0), (1, 2): (K * rho ** 2, 0.0), (2, 1): (0.0, K * rho), (0, 3): (0.0, K * rho ** 3), (1, 1): (0.0, 0.3), (2, 0): (-0.1, 0.0)}
+    m["eu"] = [truth.get((i, j), (0.0, 0.0))[0] for i, j in zip(m["i"], m["j"])]
+    m["ev"] = [truth.get((i, j), (0.0, 0.0))[1] for i, j in zip(m["i"], m["j"])]
+    shared = dict(roll=TRUTH["roll"], row_time=0.0, d=(0.0, 0.0), axis_slope=0.0, axial_scale=0.0, map=m)
+    first = Scan(turn, index=0, axis=60.3, height=0.0, **shared)
+    beside = Scan(turn, index=1, axis=60.3 - 520.0, height=-1.3, **shared)
+    above = Scan(turn, index=2, axis=60.7, height=2.2, **shared)
+    for st in above.stretches:                                                    # recorded 300 rows from the first
+        st["rows"] = st["rows"] + 300.0
+    above.mid_height = 300.0
+    comparisons = []
+    for scan in (first, above):                                                   # their own opposite views, in the strip about the axis
+        for p, t in _points(rng, scan, 0, 4000, radius=38.0):
+            if t + PER_TURN / 2 < PER_TURN + 36:
+                comparisons.append(_same_point(scan, "opposite", 0, 0, p, t, t + PER_TURN / 2, rng, 0.004))
+    for other, n in ((beside, 30000), (above, 6000)):
+        for p, t in _points(rng, first, 0, n, radius=560.0):
+            comparisons.append(_same_point(first, "pair", 0, 0, p, t, t, rng, 0.004, other=other))
+    comparisons = [c for c in comparisons if c is not None]
+    count = lambda kind, k: sum(c["kind"] == kind and c["b"][0] == k for c in comparisons)
+    assert min(count("pair", 1), count("pair", 2), count("opposite", 0), count("opposite", 2)) > 200
+    acq = _acquisition(first, beside, above)
+    start = dict(roll=0.0, scans=[dict(axis=61.0), dict(axis=-459.0), dict(axis=60.0)], map=G.empty_map(ROWS, COLS, 3))
+    term = lambda sol, i, j: [(a, b) for a, b in zip(sol["map"]["i"], sol["map"]["j"])].index((i, j))
+    got = G.solve_geometry(acq, comparisons, start=start, freed=["map"], radial_map=True, undetermined_map=0.95)
+    assert "map.radial" in got["free"] and not {"map.eu.i3j0", "map.eu.i1j2", "map.ev.i2j1", "map.ev.i0j3"} & set(got["free"])
+    assert "map.radial" not in got.get("undetermined", [])
+    assert got["radial_map"]["cubic"] == pytest.approx(K, rel=0.03) and got["radial_map"]["k_per_px2"] == pytest.approx(got["radial_map"]["cubic"] / m["cs"] ** 3)
+    # the map holds the four terms written out, and the others as found
+    assert got["map"]["eu"][term(got, 3, 0)] == got["radial_map"]["cubic"] and got["map"]["eu"][term(got, 1, 2)] == pytest.approx(got["radial_map"]["cubic"] * rho ** 2)
+    assert got["map"]["ev"][term(got, 2, 1)] == pytest.approx(got["radial_map"]["cubic"] * rho) and got["map"]["ev"][term(got, 0, 3)] == pytest.approx(got["radial_map"]["cubic"] * rho ** 3)
+    assert got["map"]["ev"][term(got, 1, 1)] == pytest.approx(0.3, abs=0.03)
+    assert np.sqrt(np.mean(got["residual"][:, 1:] ** 2)) < 0.01
+    assert [s["axis"] for s in got["scans"]] == pytest.approx([60.3, 60.3 - 520.0, 60.7], abs=0.05)
+    # the polynomial's terms one by one: the columns' cubic along the columns is one with the scans' axis columns
+    poly = G.solve_geometry(acq, comparisons, start=start, freed=["map"], undetermined_map=0.95)
+    assert "map.eu.i3j0" in poly["undetermined"] and poly["map"]["eu"][term(poly, 3, 0)] == 0.0
+    assert poly["map"]["eu"][term(poly, 1, 2)] == pytest.approx(K * rho ** 2, rel=0.05)     # (the term along the seam is found either way)
+    # one of the four is not an unknown of its own
+    with pytest.raises(ValueError, match="solved as one"):
+        G.solve_geometry(acq, comparisons, start=start, freed=["map.eu.i3j0"], radial_map=True)
+    with pytest.raises(ValueError, match="third order"):
+        G.solve_geometry(acq, comparisons, start=dict(start, map=G.empty_map(ROWS, COLS, 2)), freed=["map"], radial_map=True)
 
 
 def test_the_reconstructions_poses_are_the_models():

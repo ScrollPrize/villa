@@ -207,6 +207,11 @@ void luminosity_apply(float* R, const float* RW, const float* W_prev, const floa
         }
 }
 
+void add_into(float* R, const float* A, std::size_t n) {
+#pragma omp parallel for schedule(static)
+    for (std::ptrdiff_t i = 0; i < static_cast<std::ptrdiff_t>(n); ++i) R[i] += A[i];
+}
+
 void divide(float* R, const float* RW, std::size_t n) {
 #pragma omp parallel for schedule(static)
     for (std::ptrdiff_t i = 0; i < static_cast<std::ptrdiff_t>(n); ++i) R[i] = RW[i] > 0 ? R[i] / RW[i] : 0.f;

@@ -133,10 +133,11 @@ Json numbers(const std::vector<double>& v) {
 // position of the stored detector and of the full reconstruction over f; slopes and scales are ratios. The
 // reconstruction counts the rows' timing from its middle row, which is the stored row f (rows / f - 1) / 2 and not
 // the stored middle (rows - 1) / 2 the terms' angles are for (rad_per_row: the angle between the exposure of one
-// stored row and the next).
-void terms_of_reduced_frames(geometry::Terms& T, int f, int rows_full, double rad_per_row) {
+// stored row and the next). from_middle: the timing counts the rows to both sides of the middle row, and moving the
+// middle is no shift of the angle: it is left, the rows within (f - 1) / 2 of the middle off by that many rows' time.
+void terms_of_reduced_frames(geometry::Terms& T, int f, int rows_full, double rad_per_row, bool from_middle = false) {
     const int rows_r = rows_full / f;
-    const double shift = (rad_per_row * (f * (rows_r - 1) / 2.0 - (rows_full - 1) / 2.0)) * (180.0 / M_PI);
+    const double shift = from_middle ? 0.0 : (rad_per_row * (f * (rows_r - 1) / 2.0 - (rows_full - 1) / 2.0)) * (180.0 / M_PI);
     for (double& a : T.angles_deg) a += shift;
     const float ff = static_cast<float>(f);
     for (float& v : T.row_offset) v /= ff;
@@ -256,6 +257,7 @@ struct Reconstruction::Impl {
     std::vector<geometry::Terms> terms;                  // of the frames given, in the pixels of the frames read
     geometry::Map map;                                   // in the pixels of the frames read
     double rolling_shutter = 0;
+    bool rolling_shutter_from_middle = false;
     std::tuple<std::string, double, std::string> geometry_key;
 
     calibration::IntensityCalibration intensity;
@@ -347,7 +349,7 @@ struct Reconstruction::Impl {
                     *v = part_of(*v, used[k]);
             terms[k] = geometry::reconstruction_terms(given, whole ? H[k] : part_of(H[k], used[k]), member(lay, "row_sign").number, rows_stored, intensity.rot_center * f,
                                                       (pl.shift_x - pl.x_readjustment) * f, pl.z_readjustment * f, origin);
-            if (f > 1) terms_of_reduced_frames(terms[k], f, rows_stored, frames_per_row * angle_step(part_of(angles[k], used[k])) * (M_PI / 180.0));
+            if (f > 1) terms_of_reduced_frames(terms[k], f, rows_stored, frames_per_row * angle_step(part_of(angles[k], used[k])) * (M_PI / 180.0), geometry->rows_from_middle());
         }
         map = geometry->map();
         if (f > 1) {
@@ -357,6 +359,7 @@ struct Reconstruction::Impl {
         }
         // the time from the first row to the last of the frames read, in frame periods
         rolling_shutter = f > 1 ? frames_per_row * f * (rows_stored / f - 1) : geometry->rolling_shutter();
+        rolling_shutter_from_middle = geometry->rows_from_middle();
         geometry_key = geometry_request();
     }
 
@@ -376,6 +379,9 @@ struct Reconstruction::Impl {
         t.shift_x = pl.shift_x;
         t.x_readjustment = static_cast<float>(pl.x_readjustment);
         t.z_readjustment = static_cast<float>(pl.z_readjustment);
+        // where slits light a part of the detector, a height is seen through the lit rows alone (the weights are
+        // cropped to them: calibrate_intensity)
+        if (intensity.lit[1] > intensity.lit[0] && intensity.lit[1] - intensity.lit[0] < t.det_rows) t.row_first = intensity.lit[0], t.row_end = intensity.lit[1];
         d.control_A = whole ? scan.control_A : part_of(scan.control_A, run);
         d.flat_info.angles_deg.assign(scan.flats_unwrapped_angles_deg.begin(), scan.flats_unwrapped_angles_deg.end());
         d.dark = reduced.dark;
@@ -479,6 +485,7 @@ struct Reconstruction::Impl {
         apply_parameters(params, cfg, options.external_backprojector, &resolved_sld);
         std::vector<ScanData> data;
         double axis = intensity.rot_center;
+        double width = intensity.merged_width;  // the columns the slices are made of
         const std::string only = lower(strip(text_of(member(params, "only_scan"))));
         if (only.empty()) {
             for (std::size_t k = 0; k < scans.size(); ++k) data.push_back(scan_data(k));
@@ -489,12 +496,18 @@ struct Reconstruction::Impl {
             axis -= static_cast<double>(d.traj.shift_x) - d.traj.x_readjustment;
             d.traj.shift_x = 0, d.traj.x_readjustment = 0;
             cfg.rot_center = static_cast<float>(axis);
+            width = d.traj.det_cols;
             data.push_back(std::move(d));
         }
-        if (!cfg.grid_size) cfg.grid_size = static_cast<int>(std::nearbyint(2.0 * axis)) + 1;  // 2 x axis rounded to even, + 1
+        // The slice reaches as far from the axis as the columns do: 2 x axis rounded to even, + 1 where the columns
+        // lie on the axis' left (the reference's layout); where they lie on its right (the axis in the first
+        // scan's left half), twice their reach on that side.
+        const double reach = std::max(axis, width - 1.0 - axis);
+        if (!cfg.grid_size) cfg.grid_size = static_cast<int>(std::nearbyint(2.0 * reach)) + 1;
         cfg.exposure_arc = exposure_arc();
         cfg.sharpness_weighting = legacy_mode ? std::string() : sharpness_weighting();
         cfg.rolling_shutter = legacy_mode ? 0.0 : rolling_shutter;
+        cfg.rolling_shutter_from_middle = rolling_shutter_from_middle;
         rec = std::make_shared<SliceReconstructor>(std::move(data), cfg);
         std::tie(lo, hi) = rec->doable();
         if (rec->angle_interp() == "views" && exposure_arc() != 0)
@@ -515,6 +528,7 @@ struct Reconstruction::Impl {
             .set("legacy_reference", Json::of_bool(rec->config().legacy_reference))
             .set("exposure_arc_bins", Json::of(rec->exposure_arc_bins()))
             .set("rolling_shutter", Json::of(rec->rolling_shutter()))
+            .set("rolling_shutter_from_middle", Json::of_bool(rec->rolling_shutter() != 0.0 && rec->config().rolling_shutter_from_middle))
             .set("angle_interp", Json::of(rec->angle_interp()))
             .set("z_interp", Json::of(rec->z_interp()))
             .set("angle_subsets", Json::whole_number(rec->config().angle_subsets))
@@ -650,6 +664,7 @@ std::string Reconstruction::provenance() const {
                               .set("scans", member(I.geometry_doc, "scans"))
                               .set("map", map)
                               .set("row_time_s_per_row", member(member(I.geometry_doc, "row_time"), "seconds_per_row"))
+                              .set("rows_from_middle", Json::of_bool(I.rolling_shutter_from_middle))
                               .set("merged_frame", layout)
                               .set("applied", Json::of(legacy ? "the merged frame alone (mode legacy_reference)" : "the detector map and every projection's pose and row timing"))
                               .set("measured_not_applied", I.not_applied.empty() ? Json() : Json::parse(I.not_applied));
@@ -796,6 +811,7 @@ TileReconstruction tile_reconstructor(const std::string& master, const std::stri
     }
     const calibration::DarksFlats& red = out.reduced;
     double step_deg = 0, rad_per_row = 0;  // the angle per frame; the angle between the exposure of one stored row and the next
+    bool rows_from_middle = false;         // ... the rows counted from the middle row to both ends
     if (joint) {
         // the scan's own frame: its poses under the calibration with its place and height left out (geometry.hpp)
         const std::size_t n_all = scan.unwrapped_angles_deg.size();
@@ -817,6 +833,7 @@ TileReconstruction tile_reconstructor(const std::string& master, const std::stri
         if (angle.size() < 2) throw Error("tile " + label + ": one frame on disk");
         step_deg = angle_step(angle);
         rad_per_row = member(member(cal, "row_time"), "frames_per_row").number * step_deg * (M_PI / 180.0);
+        rows_from_middle = own.rows_from_middle = all.rows_from_middle;
     } else {
         out.row_origin = o.row_origin ? *o.row_origin : -(1.0 + member(cal, "axial_scale").number) * height_rows[height_rows.size() / 2];
         out.terms = geometry::TileGeometry::parse(description).reconstruction_terms(label, angle, height_rows, frame, rot_center, out.row_origin);
@@ -852,7 +869,7 @@ TileReconstruction tile_reconstructor(const std::string& master, const std::stri
                 for (int x = 0; x < wx; ++x) wr[static_cast<std::size_t>(y) * wx + x] = w[static_cast<std::size_t>(y * f) * cols_full + x * f];  // the weight of the stored pixel a reduced value sits at
             w = std::move(wr);
         }
-        terms_of_reduced_frames(T, f, rows_full, rad_per_row);
+        terms_of_reduced_frames(T, f, rows_full, rad_per_row, rows_from_middle);
         for (double& v : eu) v /= f;
         for (double& v : ev) v /= f;
         c0 /= f, cs /= f, v0 /= f, vs /= f;
@@ -931,6 +948,7 @@ TileReconstruction tile_reconstructor(const std::string& master, const std::stri
     cfg.exposure_arc = 0.0;
     cfg.sharpness_weighting.clear();
     cfg.rolling_shutter = rad_per_row / (step_deg * (M_PI / 180.0)) * (rows - 1);
+    cfg.rolling_shutter_from_middle = rows_from_middle;
     std::vector<ScanData> scans;
     scans.push_back(std::move(d));
     out.reconstructor = std::make_shared<SliceReconstructor>(std::move(scans), cfg);

@@ -96,6 +96,7 @@ void bind_intensity(nb::module_& m) {
         .def_prop_ro("vector", [](const IC& c) { return nb::make_tuple(c.vector[0], c.vector[1]); })
         .def_ro("rot_center", &IC::rot_center)
         .def_ro("merged_width", &IC::merged_width)
+        .def_prop_ro("lit_rows", [](const IC& c) { return nb::make_tuple(c.lit[0], c.lit[1]); }, "The rows the beam lights in every scan, (first, end): the weights are cropped to them.")
         .def_prop_ro("placement", [](const IC& c) {
             nb::dict d;
             for (std::size_t k = 0; k < c.scans.size(); ++k) d[nb::str(c.scans[k].c_str())] = nb::cast(c.placement[k]);
@@ -154,6 +155,35 @@ void bind_intensity(nb::module_& m) {
         "main"_a, "companion"_a, "cor_main_detector"_a, "vector"_a, "measured"_a = nb::dict(), "cache_dir"_a = "", "log"_a = nb::none(), "progress"_a = false,
         "The intensity calibration of a scan pair in the merged frame of one axis (in the main scan's columns) and one vector (rows, columns) to the "
         "companion; cache_dir: calibration_arrays.bin and calibration.json kept there. (helirec::calibration::calibrate_intensity)");
+    m.def(
+        "calibrate_intensity_of_scans",
+        [](const nb::list& scans, double cor_main_detector, const std::vector<std::array<double, 2>>& vectors, const std::string& cache_dir,
+           std::optional<std::function<void(const std::string&)>> log, bool progress, const std::string& projection_store, int reduce) {
+            std::vector<calibration::Scan> held;
+            for (nb::handle s : scans) held.push_back(scan_of(s));
+            std::vector<const calibration::Scan*> all;
+            for (const calibration::Scan& s : held) all.push_back(&s);
+            geometry::MergedLayout layout;
+            layout.cor_main_detector = cor_main_detector;
+            layout.vectors = vectors;
+            if (!vectors.empty()) layout.vector = vectors[0];
+            const auto say = python_log(log);
+            nb::gil_scoped_release nogil;
+            return calibration::calibrate_intensity(all, layout, cache_dir, say, progress, projection_store, reduce);
+        },
+        "scans"_a, "cor_main_detector"_a, "vectors"_a, "cache_dir"_a = "", "log"_a = nb::none(), "progress"_a = false, "projection_store"_a = "", "reduce"_a = 0,
+        "The intensity calibration of any number of scans (the main scan first) in the merged frame of one axis (in the main scan's columns) and a "
+        "vector (rows, columns) to every scan after the first: scans beside the main scan on one side of it, and scans at the columns of one of "
+        "those at another height (a grid). (helirec::calibration::calibrate_intensity)");
+    m.def(
+        "lit_rows",
+        [](nb::ndarray<const float, nb::ndim<2>, nb::c_contig, nb::device::cpu> image, double share) {
+            const std::array<int, 2> lit = calibration::lit_rows(image.data(), static_cast<int>(image.shape(0)), static_cast<int>(image.shape(1)), share);
+            return nb::make_tuple(lit[0], lit[1]);
+        },
+        "flat_less_dark"_a, "share"_a = calibration::kLitShare,
+        "The rows the beam lights, (first, end): around the brightest row of a flat less its dark, the rows whose mean reaches `share` of it. "
+        "(helirec::calibration::lit_rows)");
     m.def(
         "reduce_darks_flats",
         [](nb::handle scan, std::optional<std::function<void(std::size_t)>> progress) {

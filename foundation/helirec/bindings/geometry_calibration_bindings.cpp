@@ -51,7 +51,7 @@ Json whole(long long v) { return Json::whole_number(v); }
 
 using Table = nb::ndarray<const double, nb::ndim<2>, nb::c_contig, nb::device::cpu>;
 
-// {rows, cols, per_turn, pixel_um, row_sign, row_time, fan, width, anchor, period_s, lit_rows: [first, end], scans: [{name, mid_height, axis,
+// {rows, cols, per_turn, pixel_um, row_sign, row_time, rows_from_middle, fan, width, anchor, period_s, lit_rows: [first, end], scans: [{name, mid_height, axis,
 //  moved_on_stage, on_stage: [px, px], stretches: [{name, index, helix, first, end, angle_deg: [..], rows: [..]}]}]}; what is left out
 //  keeps its default (a stretch's frames on disk: all of them)
 gc::Acquisition acquisition_of(const std::string& text) {
@@ -60,6 +60,7 @@ gc::Acquisition acquisition_of(const std::string& text) {
     acq.rows = static_cast<int>(number(j, "rows")), acq.cols = static_cast<int>(number(j, "cols"));
     acq.per_turn = static_cast<int>(number(j, "per_turn", 0.0)), acq.pixel_um = number(j, "pixel_um", 0.0);
     acq.row_sign = number(j, "row_sign", -1.0), acq.row_time = number(j, "row_time", 0.0), acq.fan = number(j, "fan", 0.0), acq.per_depth = number(j, "per_depth", 0.0);
+    if (const Json* v = j.find("rows_from_middle"); v && v->is(Json::Bool)) acq.rows_from_middle = v->boolean;
     acq.width = static_cast<int>(number(j, "width", 512.0));
     acq.anchor = static_cast<int>(number(j, "anchor", 0.0)), acq.period_s = number(j, "period_s", 0.0);
     if (const Json* lit = j.find("lit_rows"); lit && lit->is(Json::Array) && lit->array.size() == 2)
@@ -154,7 +155,7 @@ std::string plan_text(const std::vector<gc::Planned>& planned) {
         d.set("stretch_a", whole(q.stretch_a)).set("stretch_b", whole(q.stretch_b)).set("frame_a", whole(q.frame_a)).set("frame_hint", whole(q.frame_hint));
         d.set("angle_offset_deg", Json::of(q.angle_offset_deg)).set("mirror", Json::of_bool(q.mirror)).set("frames", whole(q.frames)).set("rows", whole(q.rows)).set("cols", whole(q.cols));
         d.set("row_a", whole(q.row_a)).set("col_a", whole(q.col_a)).set("col_b", whole(q.col_b)).set("frame_shear", Json::of(q.frame_shear));
-        d.set("sway_px", Json::of(q.sway_px)).set("sway_phase_deg", Json::of(q.sway_phase_deg)).set("sway_row_deg", Json::of(q.sway_row_deg));
+        d.set("sway_px", Json::of(q.sway_px)).set("sway_phase_deg", Json::of(q.sway_phase_deg)).set("sway_row_deg", Json::of(q.sway_row_deg)).set("sway_rows_from_middle", Json::of_bool(q.sway_rows_from_middle));
         out.add(d);
     }
     return out.text();
@@ -209,6 +210,8 @@ void bind_geometry_calibration(nb::module_& m) {
                                 "Made from JSON text (see python/helirec/geometry.py) or read from a session (geometry_read_acquisition).")
         .def("__init__", [](gc::Acquisition* self, const std::string& text) { new (self) gc::Acquisition(acquisition_of(text)); }, "text"_a)
         .def_rw("row_time", &gc::Acquisition::row_time, "The rows' timing in frames per stored row (signed).")
+        .def_rw("rows_from_middle", &gc::Acquisition::rows_from_middle,
+                "The rows' timing counts the rows from the middle row to both ends (a camera whose two halves are read at once); False: from the first row to the last.")
         .def_rw("per_depth", &gc::Acquisition::per_depth, "What the beam's divergence magnifies a sample by per pixel it sits nearer the source (pixel / source distance); 0: left out.")
         .def_prop_ro("summary", [](const gc::Acquisition& a) { return gc::acquisition_json(a); }, "The layout without the per-frame series, as JSON text.")
         .def("course",
@@ -323,7 +326,8 @@ void bind_geometry_calibration(nb::module_& m) {
     m.def(
         "geometry_solve",
         [](const gc::Acquisition& acq, const std::vector<std::string>& kinds, Table a, Table b, const std::vector<bool>& opposite, Table lens_table, const std::string& start, double huber,
-           int max_iterations, const std::vector<std::string>& held, const std::vector<std::string>& freed, double lens_huber, double undetermined_map, bool tilts_after) {
+           int max_iterations, const std::vector<std::string>& held, const std::vector<std::string>& freed, double lens_huber, double undetermined_map, bool tilts_after,
+           bool radial_map) {
             const std::size_t n = kinds.size();
             if (a.shape(0) != n || b.shape(0) != n || opposite.size() != n || a.shape(1) != 5 || b.shape(1) != 5)
                 throw Error("geometry_solve: one kind, two sightings (scan, stretch, frame, row, column) and one flag per comparison");
@@ -336,7 +340,7 @@ void bind_geometry_calibration(nb::module_& m) {
             const std::vector<gc::LensPatch> lens = lens_of(lens_table);
             gc::GeometryOptions opt;
             opt.huber = huber, opt.max_iterations = max_iterations, opt.held = held, opt.freed = freed, opt.lens_huber = lens_huber, opt.tilts_after = tilts_after;
-            opt.undetermined_map = undetermined_map;
+            opt.undetermined_map = undetermined_map, opt.radial_map = radial_map;
             gc::GeometrySolution s;
             {
                 const gc::Parameters p0 = parameters_of(acq, start);
@@ -350,7 +354,7 @@ void bind_geometry_calibration(nb::module_& m) {
             return nb::make_tuple(gc::solution_json(acq, s), residual, lens_residual);
         },
         "acquisition"_a, "kinds"_a, "a"_a, "b"_a, "opposite"_a, "lens"_a, "start"_a = "", "huber"_a = 0.03, "max_iterations"_a = 100, "held"_a = std::vector<std::string>(),
-        "freed"_a = std::vector<std::string>(), "lens_huber"_a = 1.5, "undetermined_map"_a = 0.0, "tilts_after"_a = false,
+        "freed"_a = std::vector<std::string>(), "lens_huber"_a = 1.5, "undetermined_map"_a = 0.0, "tilts_after"_a = false, "radial_map"_a = false,
         "The places of the scans that best explain comparisons of their frames and lens patches of their volumes (lens: (n, 11)\n"
         "scan a, scan b, the place, the displacement, its sigma): (the solution as JSON text, the comparisons' residuals (n, 3):\n"
         "frames, rows, columns, the lens patches' (n, 3): x, y, z). (helirec::calibration::geometry_calibration::solve_geometry)");
@@ -431,9 +435,10 @@ void bind_geometry_calibration(nb::module_& m) {
     m.def(
         "calibrate_geometry",
         [](const std::vector<std::string>& scans, std::optional<double> row_time, const std::string& device, int order, int threads, int patch,
-           std::optional<std::function<void(const std::string&)>> log, int reduce, const std::string& projections) {
+           std::optional<std::function<void(const std::string&)>> log, int reduce, const std::string& projections, bool rows_from_middle, bool radial_map) {
             gc::Options opt;
             opt.row_time = row_time ? *row_time : std::nan("");
+            opt.rows_from_middle = rows_from_middle, opt.radial_map = radial_map;
             if (device != "cpu" && device != "cuda" && device != "auto") throw Error("device is cpu, cuda or auto");
             opt.device = device == "cuda" || (device == "auto" && cuda_available()) ? Device::CUDA : Device::CPU;
             opt.order = order, opt.threads = threads, opt.patch = patch, opt.reduce = reduce, opt.projections = projections;
@@ -446,6 +451,7 @@ void bind_geometry_calibration(nb::module_& m) {
             return gc::calibrate_geometry(scans, opt);
         },
         "scans"_a, "row_time"_a = nb::none(), "device"_a = "auto", "order"_a = 3, "threads"_a = 8, "patch"_a = 128, "log"_a = nb::none(), "reduce"_a = 0, "projections"_a = "",
+        "rows_from_middle"_a = false, "radial_map"_a = false,
         "The geometry calibration of the scans of one sample (a scan with the rotation axis inside its field first), as JSON text\n"
         "(helirec::calibration::geometry_calibration::calibrate_geometry; helirec-calibration geometry).");
     m.def(

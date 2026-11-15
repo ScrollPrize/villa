@@ -197,9 +197,18 @@ struct SliceReconstructor::Impl {
     // context rows gridded from every projection that sees them (prepare_chunk_scan); the legacy reference grids
     // them from the projections of the chunk's own heights, as the reference does
     bool full_context = false, measured = false;
+    // Per scan, the place across the beam it stands at (scans within a quarter of the detector's width of each other
+    // in the merged frame and more than a quarter of its height apart stand at one), and whether some place holds
+    // several scans: rows of scans above each other (a grid of circular scans). A height is then reconstructed from the scans that see it, one at each place at
+    // least (doable_span with places), and a chunk may hold none of a scan's projections.
+    std::vector<int> place;
+    bool rows_of_scans = false;
+    // per scan, the row of scans it belongs to (the first scan within a quarter of the detector's rows of its height)
+    std::vector<int> scan_row;
     int mend_x0 = 0, mend_x1 = 0;   // mending domain [mend_x0, mend_x1) of the merged row
-    // per scan after the first: the merged column of its luminosity seam with the scans before it (the middle of
-    // the columns it shares with the nearest of them); [0] is not used
+    // per scan: the merged column of its luminosity seam with the scans before it (the middle of the columns it
+    // shares with the nearest earlier scan at its own height); -1: no earlier scan at its height (the first scan,
+    // and the first of every further row of a grid), which is not taken to anyone's level
     std::vector<int> seam;
     LuminosityKernel lum = luminosity_kernel();
     // per-chunk invariants (built on first use)
@@ -263,7 +272,7 @@ struct SliceReconstructor::Impl {
             cap_proj.assign(scans.size(), 0);
             for (std::size_t i = 0; i < scans.size(); ++i)
                 cap_proj[i] = static_cast<std::size_t>(max_chunk_projections(scans[i].traj, spans[i], doable.first, doable.second,
-                                                                             rows, m, full_context, !measured));
+                                                                             rows, m, full_context, !measured, rows_of_scans));
             cap_rows = rows;
             cap_m = m;
         }
@@ -279,6 +288,7 @@ struct SliceReconstructor::Impl {
     }
     cuda::DeviceBuffer<float> R, RW, Wp, Aha, Bha, Atot, Btot, S, W, row, wrow, pad, slice, arc_d;
     cuda::DeviceBuffer<float> R2, RW2, Wp2, Aha2, Bha2, Atot2, Btot2, W2, w2row, brow;   // (band-dependent weights)
+    cuda::DeviceBuffer<float> Rr, RWr, R2r, RW2r;   // one row of scans' sums (rows of scans with the luminosity step)
     cuda::PinnedBuffer<float> slice_host;   // staging of the slices' download
     cuda::DeviceBuffer<std::uint8_t> slice_u8, slice_mask;
     cuda::PinnedBuffer<std::uint8_t> slice_u8_host;
@@ -362,6 +372,23 @@ SliceReconstructor::SliceReconstructor(std::vector<ScanData> scans, ReconConfig 
         std::nth_element(steps.begin(), steps.begin() + steps.size() / 2, steps.end());
         I.recorded_step = steps[steps.size() / 2];
     }
+    // the scans' places across the beam: one per scan, or several scans above each other at one
+    I.place.assign(I.scans.size(), 0);
+    for (std::size_t s = 0, places = 0; s < I.scans.size(); ++s) {
+        const auto column = [&](std::size_t k) { return static_cast<double>(I.scans[k].traj.shift_x) - I.scans[k].traj.x_readjustment; };
+        const auto above = [&](std::size_t q, std::size_t k) {  // at one place across the beam, at another height
+            return std::fabs(column(q) - column(k)) < I.scans[k].traj.det_cols / 4.0 &&
+                   std::fabs(I.scans[q].traj.z_readjustment - I.scans[k].traj.z_readjustment) > I.scans[k].traj.det_rows / 4.0;
+        };
+        I.place[s] = static_cast<int>(places);
+        for (std::size_t q = 0; q < s; ++q)
+            if (above(q, s)) I.place[s] = I.place[q];
+        if (I.place[s] == static_cast<int>(places)) ++places;
+        else I.rows_of_scans = true;
+    }
+    if (I.rows_of_scans) {
+        if (I.cfg.legacy_reference) throw Error("legacy reference mode merges scans side by side, not scans above each other");
+    }
     std::pair<int, int> whole_doable{0, 0};
     if (I.cfg.angle_subsets != 1) {
         if (I.cfg.legacy_reference) throw Error("legacy reference mode has no projection subsets");
@@ -369,7 +396,7 @@ SliceReconstructor::SliceReconstructor(std::vector<ScanData> scans, ReconConfig 
             throw Error("angle_subset must be in [0, angle_subsets)");
         std::vector<SpanInfo> whole;
         for (const auto& s : I.scans) whole.push_back(make_span_info(s.traj, I.cfg.angular_tolerance_steps));
-        whole_doable = doable_span(whole);
+        whole_doable = doable_span(whole, I.place);
         const int full = grid_angle_count(I.scans[0].traj.angles_deg);
         const double phase = angle_grid_phase(I.scans[0].traj.angles_deg, full);
         for (auto& s : I.scans) {
@@ -401,7 +428,7 @@ SliceReconstructor::SliceReconstructor(std::vector<ScanData> scans, ReconConfig 
             throw Error("ScanData: calibration arrays have wrong sizes");
         I.spans.push_back(make_span_info(s.traj, I.cfg.angular_tolerance_steps));
     }
-    I.doable = doable_span(I.spans);
+    I.doable = doable_span(I.spans, I.place);
     if (I.cfg.angle_subsets != 1) {   // (a subset's wider angular tolerance may reach a few heights further)
         I.doable = {std::max(I.doable.first, whole_doable.first), std::min(I.doable.second, whole_doable.second)};
         if (I.doable != whole_doable) throw Error("angle_subset: the subset cannot reconstruct every height of the scan");
@@ -571,15 +598,26 @@ SliceReconstructor::SliceReconstructor(std::vector<ScanData> scans, ReconConfig 
         I.mend_x1 = std::min(I.NX, I.mend_x1);
     }
     // luminosity seams: det_cols/2 + lround(mean of (shift_x - x_readjustment)) of a scan and the nearest before it
-    I.seam.assign(I.scans.size(), 0);
+    // at its own height (within a quarter of the detector's rows: the scans of one row of a grid; every scan where
+    // there are no rows of scans). The first scan of a row has none: the rows' levels against each other are left
+    // to the weights' crossfade over the heights two rows share.
+    I.seam.assign(I.scans.size(), -1);
+    I.scan_row.assign(I.scans.size(), 0);
     for (std::size_t s = 1; s < I.scans.size(); ++s) {
         const double p1 = I.scans[s].traj.shift_x - I.scans[s].traj.x_readjustment;
-        double p0 = I.scans[0].traj.shift_x - I.scans[0].traj.x_readjustment;
-        for (std::size_t j = 1; j < s; ++j) {
+        double p0 = 0;
+        bool found = false;
+        I.scan_row[s] = static_cast<int>(s);
+        for (std::size_t j = 0; j < s; ++j) {
+            if (std::fabs(I.scans[j].traj.z_readjustment - I.scans[s].traj.z_readjustment) > I.scans[s].traj.det_rows / 4.0) continue;
             const double pj = I.scans[j].traj.shift_x - I.scans[j].traj.x_readjustment;
-            if (std::fabs(pj - p1) < std::fabs(p0 - p1)) p0 = pj;
+            if (!found) I.scan_row[s] = I.scan_row[j];
+            if (!found || std::fabs(pj - p1) < std::fabs(p0 - p1)) p0 = pj, found = true;
         }
-        I.seam[s] = m.det_cols / 2 + static_cast<int>(std::lround(0.5 * (p0 + p1)));
+        if (found) I.seam[s] = m.det_cols / 2 + static_cast<int>(std::lround(0.5 * (p0 + p1)));
+        // (a row's scans are summed apart and then added to the rows before: they must follow each other)
+        if (I.rows_of_scans && I.cfg.luminosity_repartition != 0.f && I.scan_row[s] != I.scan_row[s - 1] && found)
+            throw Error("scans above each other (a grid) with the luminosity step: the scans of one row must follow each other in the list of scans");
     }
     if (I.cfg.sld.enabled()) {
         if (I.cfg.legacy_reference) throw Error("legacy reference mode has no scintillator diffusion correction");
@@ -648,7 +686,8 @@ std::string SliceReconstructor::z_interp() const {
 // detector weight of the rows it is interpolated from, times its current factor). A bin no projection reaches takes
 // the residual of the nearest filled bin before it (the first filled one's, for those ahead of it).
 // Rolling shutter (ReconConfig::rolling_shutter): the row a slice is read at was recorded at another angle than the
-// projection's by shutter_bins x (row - middle row), which is added to the projection's residual.
+// projection's by shutter_bins x (row - middle row), which is added to the projection's residual (the row's distance
+// from the middle row, to either side, with ReconConfig::rolling_shutter_from_middle).
 // With a row per view (views) the rows are the unwrapped bins row_base + r: the same per row, the angle taken modulo
 // the turn, and for each row the opposite row for the ramp's padding (slice_opposite): of the rows an odd number of
 // half turns away, the one that weighs most in the slice (the nearest, if several or none do).
@@ -674,7 +713,8 @@ void SliceReconstructor::Impl::set_slice_angles(const std::vector<ChunkScan*>& c
                 const double w = ((1 - a) * prof[r] + (a > 0 ? a * prof[r + 1] : 0.0)) * c.weight_factor[k];
                 if (!(w > 0)) continue;
                 sw[c.j0[k]] += w;
-                sd[c.j0[k]] += w * (bins[s].residual[c.p0 + k] + (rows > 1 ? shutter_bins * (r + a - 0.5 * (rows - 1)) / (rows - 1) : 0.0));
+                const double from_middle = r + a - 0.5 * (rows - 1);
+                sd[c.j0[k]] += w * (bins[s].residual[c.p0 + k] + (rows > 1 ? shutter_bins * (cfg.rolling_shutter_from_middle ? std::fabs(from_middle) : from_middle) / (rows - 1) : 0.0));
             }
         }
         int first = -1;
@@ -907,7 +947,7 @@ void SliceReconstructor::Impl::start_prefetch(int lo, int hi, int m) {
             for (std::size_t s = 0; s < scans.size(); ++s) {
                 const auto& sd = scans[s];
                 const ChunkScan c = prepare_chunk_scan(sd.traj, spans[s], sd.control_A, sd.flat_info, lo, hi, m, n_grid,
-                                                       0.2, full_context, !measured);
+                                                       0.2, full_context, !measured, rows_of_scans);
                 const int n = c.p1 - c.p0, win = hi - lo + 2 * m + 1 + 2 * z_pad, cols = sd.traj.det_cols;
                 const std::vector<int32_t> win0 = window_rows(c, z_pad);
                 const std::size_t per = static_cast<std::size_t>(win) * cols;
@@ -994,7 +1034,7 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
     std::vector<ScanChunk> chunks(I.scans.size());
     for (std::size_t s = 0; s < I.scans.size(); ++s) {
         chunks[s].cs = prepare_chunk_scan(I.scans[s].traj, I.spans[s], I.scans[s].control_A, I.scans[s].flat_info,
-                                          h_lo, h_hi, m, NG, 0.2, I.full_context, !measured_only);
+                                          h_lo, h_hi, m, NG, 0.2, I.full_context, !measured_only, I.rows_of_scans);
         chunks[s].win_rows = H + 1 + 2 * I.z_pad;
         chunks[s].win0 = window_rows(chunks[s].cs, I.z_pad);
         chunks[s].z_w = z_kernel_weights(chunks[s].cs.fract_v, I.z_kernel);
@@ -1061,7 +1101,8 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
     tick("prepare");
     std::vector<ChunkGlare> cg(I.scans.size());
     if (cfg.sld.enabled()) {
-        for (std::size_t s = 0; s < I.scans.size(); ++s) cg[s] = chunk_glare(s, chunks[s]);
+        for (std::size_t s = 0; s < I.scans.size(); ++s)
+            if (chunks[s].cs.p1 > chunks[s].cs.p0) cg[s] = chunk_glare(s, chunks[s]);
         tick("glare");
     }
 
@@ -1102,6 +1143,7 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
             auto& ch = chunks[s];
             const int n = ch.cs.p1 - ch.cs.p0;
             ch.raw.resize(static_cast<std::size_t>(n) * ch.win_rows * sd.traj.det_cols);
+            if (!n) continue;  // (a scan at another height: the chunk holds none of it)
             sd.reader->read_rows(sd.file_index.data() + ch.cs.p0, sd.frame_index.data() + ch.cs.p0, ch.win0.data(),
                                  n, ch.win_rows, ch.raw.data());
         }
@@ -1110,6 +1152,14 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
         std::vector<float> S(sino_n), Wc(sino_n);
         std::vector<float> R(blk), RW(blk), Wp, Aha, Bha, Atot, Btot;
         std::vector<float> Wc2(sharp ? sino_n : 0), R2(sharp ? blk : 0), RW2(sharp ? blk : 0), Wp2, Aha2, Bha2, Atot2, Btot2;
+        // Rows of scans with the luminosity step: a row's scans are summed apart (their luminosity is compared among
+        // themselves: another row holds other rows of the detector around a height), then added to the rows before.
+        const bool by_row = I.rows_of_scans && cfg.luminosity_repartition != 0.f;
+        std::vector<float> Rr(by_row ? blk : 0), RWr(by_row ? blk : 0), R2r(by_row && sharp ? blk : 0), RW2r(by_row && sharp ? blk : 0);
+        float* const aR = by_row ? Rr.data() : R.data();
+        float* const aRW = by_row ? RWr.data() : RW.data();
+        float* const aR2 = by_row ? R2r.data() : R2.data();
+        float* const aRW2 = by_row ? RW2r.data() : RW2.data();
         for (int g0 = 0; g0 < NR; g0 += BL) {
             const int g1 = std::min(NR, g0 + BL), L = g1 - g0;
             const std::size_t n_el = static_cast<std::size_t>(L) * H * NX;
@@ -1119,11 +1169,41 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
             }
             std::fill(R.begin(), R.begin() + n_el, 0.f);
             std::fill(RW.begin(), RW.begin() + n_el, 0.f);
+            // Each scan that has an earlier scan at its height is taken to the luminosity of the scans before it at
+            // its seam with them: the sums there before and after it is added.
+            const bool lum = cfg.luminosity_repartition != 0.f && chunks.size() >= 2;
+            bool before = false;   // a scan of this chunk (of this row of scans) has been added
+            int row_now = -1;
+            const auto add_row = [&] {
+                cpu::add_into(R.data(), Rr.data(), n_el);
+                cpu::add_into(RW.data(), RWr.data(), n_el);
+                if (sharp) cpu::add_into(R2.data(), R2r.data(), n_el), cpu::add_into(RW2.data(), RW2r.data(), n_el);
+            };
             for (std::size_t s = 0; s < chunks.size(); ++s) {
                 const auto& sd = I.scans[s];
                 const auto& ch = chunks[s];
                 const auto& c = ch.cs;
                 const int n = c.p1 - c.p0;
+                if (!n) continue;  // (a scan at another height)
+                if (by_row && I.scan_row[s] != row_now) {   // another row of scans begins
+                    if (row_now >= 0) add_row();
+                    std::fill(Rr.begin(), Rr.begin() + n_el, 0.f);
+                    std::fill(RWr.begin(), RWr.begin() + n_el, 0.f);
+                    if (sharp) std::fill(R2r.begin(), R2r.begin() + n_el, 0.f), std::fill(RW2r.begin(), RW2r.begin() + n_el, 0.f);
+                    row_now = I.scan_row[s], before = false;
+                }
+                const bool joins = lum && before && I.seam[s] >= 0;
+                if (joins) {
+                    Aha.resize(static_cast<std::size_t>(L) * H); Bha.resize(Aha.size());
+                    cpu::luminosity_sums(aR, aRW, L, H, NX, I.seam[s], I.lum, Aha.data(), Bha.data());
+                    Wp.assign(aRW, aRW + n_el);
+                    if (sharp) {
+                        Aha2.resize(static_cast<std::size_t>(L) * H); Bha2.resize(Aha2.size());
+                        cpu::luminosity_sums(aR2, aRW2, L, H, NX, I.seam[s], I.lum, Aha2.data(), Bha2.data());
+                        Wp2.assign(aRW2, aRW2 + n_el);
+                    }
+                    tick("luminosity");
+                }
                 const auto contrib = make_contributors(c.j0.data(), n, NR, g0, g1, !I.nearest);
                 auto view = make_view(sd, ch, ch.raw.data(), sd.dark.data(), sd.flats.data(), sd.weight.data(),
                                       c.row0.data(), c.fract_v.data(), c.alpha.data(), c.current_div.data(),
@@ -1136,37 +1216,25 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
                 if (cfg.sld.enabled())
                     set_glare(view, *I.glare[s], cg[s].maps.data(), cg[s].i0.data(), cg[s].i1.data(), cg[s].frac.data(),
                               cg[s].rows, cg[s].row0.empty() ? nullptr : cg[s].row0.data());
-                cpu::accumulate(view, contrib, ap, R.data(), RW.data(), sharp ? I.weight2[s].data() : nullptr,
-                                sharp ? R2.data() : nullptr, sharp ? RW2.data() : nullptr);
+                cpu::accumulate(view, contrib, ap, aR, aRW, sharp ? I.weight2[s].data() : nullptr,
+                                sharp ? aR2 : nullptr, sharp ? aRW2 : nullptr);
                 tick("accumulate");
-                // Each scan after the first is taken to the luminosity of the scans before it at its seam with
-                // them (the sums before and after it is added), then the sums at the next scan's seam are kept.
-                const bool lum = cfg.luminosity_repartition != 0.f && chunks.size() >= 2;
-                const bool joins = lum && s >= 1, joined = lum && s + 1 < chunks.size();
                 if (joins) {
                     Atot.resize(Aha.size()); Btot.resize(Aha.size());
-                    cpu::luminosity_sums(R.data(), RW.data(), L, H, NX, I.seam[s], I.lum, Atot.data(), Btot.data());
-                    cpu::luminosity_apply(R.data(), RW.data(), Wp.data(), Aha.data(), Bha.data(), Atot.data(),
+                    cpu::luminosity_sums(aR, aRW, L, H, NX, I.seam[s], I.lum, Atot.data(), Btot.data());
+                    cpu::luminosity_apply(aR, aRW, Wp.data(), Aha.data(), Bha.data(), Atot.data(),
                                           Btot.data(), L, H, NX, cfg.luminosity_repartition);
-                }
-                if (joined) {
-                    Aha.resize(static_cast<std::size_t>(L) * H); Bha.resize(Aha.size());
-                    cpu::luminosity_sums(R.data(), RW.data(), L, H, NX, I.seam[s + 1], I.lum, Aha.data(), Bha.data());
-                    Wp.assign(RW.begin(), RW.begin() + n_el);
                 }
                 if (sharp && joins) {
                     Atot2.resize(Aha2.size()); Btot2.resize(Aha2.size());
-                    cpu::luminosity_sums(R2.data(), RW2.data(), L, H, NX, I.seam[s], I.lum, Atot2.data(), Btot2.data());
-                    cpu::luminosity_apply(R2.data(), RW2.data(), Wp2.data(), Aha2.data(), Bha2.data(), Atot2.data(),
+                    cpu::luminosity_sums(aR2, aRW2, L, H, NX, I.seam[s], I.lum, Atot2.data(), Btot2.data());
+                    cpu::luminosity_apply(aR2, aRW2, Wp2.data(), Aha2.data(), Bha2.data(), Atot2.data(),
                                           Btot2.data(), L, H, NX, cfg.luminosity_repartition);
                 }
-                if (sharp && joined) {
-                    Aha2.resize(static_cast<std::size_t>(L) * H); Bha2.resize(Aha2.size());
-                    cpu::luminosity_sums(R2.data(), RW2.data(), L, H, NX, I.seam[s + 1], I.lum, Aha2.data(), Bha2.data());
-                    Wp2.assign(RW2.begin(), RW2.begin() + n_el);
-                }
                 tick("luminosity");
+                before = true;
             }
+            if (by_row && row_now >= 0) add_row();
             cpu::divide(R.data(), RW.data(), n_el);
             if (ap.measured_only)
                 cpu::prepare_measured(R.data(), RW.data(), L, H, NX, cfg.mend_threshold, filter_context, ap.log_values ? 0.f : 1.f);
@@ -1419,8 +1487,9 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
                                                    q * per[s] * sizeof(uint16_t), cudaMemcpyHostToDevice, cs));
                 off += q;
             }
-            HELIREC_CUDA_CHECK(cudaMemcpyAsync(d_slot[r][s].data(), plans[b].slot[s].data(),
-                                               plans[b].slot[s].size() * sizeof(int32_t), cudaMemcpyHostToDevice, cs));
+            if (!plans[b].slot[s].empty())  // (a scan at another height: the chunk holds none of it)
+                HELIREC_CUDA_CHECK(cudaMemcpyAsync(d_slot[r][s].data(), plans[b].slot[s].data(),
+                                                   plans[b].slot[s].size() * sizeof(int32_t), cudaMemcpyHostToDevice, cs));
         }
         HELIREC_CUDA_CHECK(cudaEventRecord(ev_up[r], cs));
     };
@@ -1431,6 +1500,16 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
         Aha2.ensure(static_cast<std::size_t>(BL) * H); Bha2.ensure(Aha2.size()); Atot2.ensure(Aha2.size()); Btot2.ensure(Aha2.size());
     }
     Aha.ensure(static_cast<std::size_t>(BL) * H); Bha.ensure(Aha.size()); Atot.ensure(Aha.size()); Btot.ensure(Aha.size());
+    // (as on the CPU: rows of scans with the luminosity step are summed row by row)
+    const bool by_row = I.rows_of_scans && cfg.luminosity_repartition != 0.f;
+    if (by_row) {
+        Rr.ensure(blk); RWr.ensure(blk);
+        if (sharp) R2r.ensure(blk), RW2r.ensure(blk);
+    }
+    float* const aR = by_row ? Rr.data() : R.data();
+    float* const aRW = by_row ? RWr.data() : RW.data();
+    float* const aR2 = by_row ? R2r.data() : R2.data();
+    float* const aRW2 = by_row ? RW2r.data() : RW2.data();
     S.ensure(sino_n); W.ensure(sino_n);
     // sweeps: one Fourier step per chain -> cache the spectra (filter + inverse per chain); else the intensity
     bool spectral = K > 1;
@@ -1456,9 +1535,43 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
         HELIREC_CUDA_CHECK(cudaMemsetAsync(RW.data(), 0, n_el * sizeof(float)));
         HELIREC_CUDA_CHECK(cudaStreamWaitEvent(nullptr, ev_up[r], 0));
         tick("upload_wait");
+        // (as on the CPU: each scan with an earlier scan at its height taken to the luminosity of those before it at
+        // its seam with them)
+        const bool lum = cfg.luminosity_repartition != 0.f && nsc >= 2;
+        bool before = false;
+        int row_now = -1;
+        const auto add_row = [&] {
+            cuda::add_into(R.data(), Rr.data(), n_el);
+            cuda::add_into(RW.data(), RWr.data(), n_el);
+            if (sharp) cuda::add_into(R2.data(), R2r.data(), n_el), cuda::add_into(RW2.data(), RW2r.data(), n_el);
+        };
         for (std::size_t s = 0; s < nsc; ++s) {
             const auto& sd = I.scans[s];
             const auto& ch = chunks[s];
+            if (ch.cs.p1 == ch.cs.p0) {  // a scan at another height
+                if (s + 1 == nsc) HELIREC_CUDA_CHECK(cudaEventRecord(ev_done[r], nullptr));
+                continue;
+            }
+            if (by_row && I.scan_row[s] != row_now) {   // another row of scans begins
+                if (row_now >= 0) add_row();
+                HELIREC_CUDA_CHECK(cudaMemsetAsync(Rr.data(), 0, n_el * sizeof(float)));
+                HELIREC_CUDA_CHECK(cudaMemsetAsync(RWr.data(), 0, n_el * sizeof(float)));
+                if (sharp) {
+                    HELIREC_CUDA_CHECK(cudaMemsetAsync(R2r.data(), 0, n_el * sizeof(float)));
+                    HELIREC_CUDA_CHECK(cudaMemsetAsync(RW2r.data(), 0, n_el * sizeof(float)));
+                }
+                row_now = I.scan_row[s], before = false;
+            }
+            const bool joins = lum && before && I.seam[s] >= 0;
+            if (joins) {
+                cuda::luminosity_sums(aR, aRW, L, H, NX, I.seam[s], I.lum, Aha.data(), Bha.data());
+                HELIREC_CUDA_CHECK(cudaMemcpyAsync(Wp.data(), aRW, n_el * sizeof(float), cudaMemcpyDeviceToDevice));
+                if (sharp) {
+                    cuda::luminosity_sums(aR2, aRW2, L, H, NX, I.seam[s], I.lum, Aha2.data(), Bha2.data());
+                    HELIREC_CUDA_CHECK(cudaMemcpyAsync(Wp2.data(), aRW2, n_el * sizeof(float), cudaMemcpyDeviceToDevice));
+                }
+                tick("luminosity");
+            }
             auto view = make_view(sd, ch, d_raw[r][s].data(), I.dev[s].dark.data(), I.dev[s].flats.data(),
                                   I.dev[s].weight.data(), dc[s].row0.data(), dc[s].fract_v.data(),
                                   dc[s].alpha.data(), dc[s].cdiv.data(), dc[s].wfac.data(), dc[s].ffrac.data(),
@@ -1471,33 +1584,24 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
             if (cfg.sld.enabled())
                 set_glare(view, *I.glare[s], dc[s].glare.data(), dc[s].gi0.data(), dc[s].gi1.data(), dc[s].gfrac.data(),
                           cg[s].rows, cg[s].row0.empty() ? nullptr : dc[s].grow0.data());
-            cuda::accumulate(view, plans[b].contrib[s], ap, R.data(), RW.data(), nullptr,
-                             sharp ? I.dev[s].weight2.data() : nullptr, sharp ? R2.data() : nullptr, sharp ? RW2.data() : nullptr);
+            cuda::accumulate(view, plans[b].contrib[s], ap, aR, aRW, nullptr,
+                             sharp ? I.dev[s].weight2.data() : nullptr, sharp ? aR2 : nullptr, sharp ? aRW2 : nullptr);
             if (s + 1 == nsc) HELIREC_CUDA_CHECK(cudaEventRecord(ev_done[r], nullptr));
             tick("accumulate");
-            // (as on the CPU: each scan after the first taken to the luminosity of those before it at its seam)
-            const bool lum = cfg.luminosity_repartition != 0.f && nsc >= 2;
-            const bool joins = lum && s >= 1, joined = lum && s + 1 < nsc;
             if (joins) {
-                cuda::luminosity_sums(R.data(), RW.data(), L, H, NX, I.seam[s], I.lum, Atot.data(), Btot.data());
-                cuda::luminosity_apply(R.data(), RW.data(), Wp.data(), Aha.data(), Bha.data(), Atot.data(),
+                cuda::luminosity_sums(aR, aRW, L, H, NX, I.seam[s], I.lum, Atot.data(), Btot.data());
+                cuda::luminosity_apply(aR, aRW, Wp.data(), Aha.data(), Bha.data(), Atot.data(),
                                        Btot.data(), L, H, NX, cfg.luminosity_repartition);
             }
-            if (joined) {
-                cuda::luminosity_sums(R.data(), RW.data(), L, H, NX, I.seam[s + 1], I.lum, Aha.data(), Bha.data());
-                HELIREC_CUDA_CHECK(cudaMemcpyAsync(Wp.data(), RW.data(), n_el * sizeof(float), cudaMemcpyDeviceToDevice));
-            }
             if (sharp && joins) {
-                cuda::luminosity_sums(R2.data(), RW2.data(), L, H, NX, I.seam[s], I.lum, Atot2.data(), Btot2.data());
-                cuda::luminosity_apply(R2.data(), RW2.data(), Wp2.data(), Aha2.data(), Bha2.data(), Atot2.data(),
+                cuda::luminosity_sums(aR2, aRW2, L, H, NX, I.seam[s], I.lum, Atot2.data(), Btot2.data());
+                cuda::luminosity_apply(aR2, aRW2, Wp2.data(), Aha2.data(), Bha2.data(), Atot2.data(),
                                        Btot2.data(), L, H, NX, cfg.luminosity_repartition);
             }
-            if (sharp && joined) {
-                cuda::luminosity_sums(R2.data(), RW2.data(), L, H, NX, I.seam[s + 1], I.lum, Aha2.data(), Bha2.data());
-                HELIREC_CUDA_CHECK(cudaMemcpyAsync(Wp2.data(), RW2.data(), n_el * sizeof(float), cudaMemcpyDeviceToDevice));
-            }
             tick("luminosity");
+            before = true;
         }
+        if (by_row && row_now >= 0) add_row();
         cuda::divide(R.data(), RW.data(), n_el);
         if (ap.measured_only)
             cuda::prepare_measured(R.data(), RW.data(), L, H, NX, cfg.mend_threshold, filter_context, ap.log_values ? 0.f : 1.f);

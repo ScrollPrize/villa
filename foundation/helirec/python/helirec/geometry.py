@@ -88,7 +88,8 @@ def fit_refill_shots(x, n_rows, T, E, pre):
 
 def acquisition(acq):
     """The scans' layout for the joint model as the C++ side holds it (_core.GeometryAcquisition), from a dict:
-    rows, cols, row_time [frames per row], and optionally per_turn, pixel_um, row_sign, fan, per_depth (what the
+    rows, cols, row_time [frames per row], and optionally rows_from_middle (the rows' timing counts the rows from
+    the middle row to both ends: a camera whose two halves are read at once), per_turn, pixel_um, row_sign, fan, per_depth (what the
     beam's divergence magnifies a sample by per pixel it sits nearer the source; 0: left out), width, anchor (the
     scan whose place is the origin), lit_rows ((first, end): the rows the beam lights, which the plan keeps its
     blocks inside; none: every row); scans = [dict(name, mid_height, axis (the coarse axis column), moved_on_stage
@@ -113,6 +114,7 @@ def acquisition(acq):
             d["on_stage"] = [float(v) for v in s["on_stage"]]
         scans.append(d)
     top = {key: acq[key] for key in ("per_turn", "pixel_um", "row_sign", "fan", "per_depth", "width", "anchor", "period_s") if key in acq}
+    top["rows_from_middle"] = bool(acq.get("rows_from_middle", False))
     if acq.get("lit_rows") is not None:
         top["lit_rows"] = [int(v) for v in acq["lit_rows"]]
     return _core.GeometryAcquisition(json.dumps(dict(top, rows=int(acq["rows"]), cols=int(acq["cols"]), row_time=float(acq.get("row_time", 0.0)), scans=scans)))
@@ -241,7 +243,8 @@ def lens_residuals(acquisition_, parameters, lens):
     return _core.geometry_lens_residuals(acquisition(acquisition_), _parameters_text(parameters), _lens(lens))
 
 
-def solve_geometry(acquisition_, comparisons, start=None, huber=0.03, max_iterations=100, held=(), freed=(), lens=None, lens_huber=1.5, undetermined_map=0.0, tilts_after=False):
+def solve_geometry(acquisition_, comparisons, start=None, huber=0.03, max_iterations=100, held=(), freed=(), lens=None, lens_huber=1.5, undetermined_map=0.0, tilts_after=False,
+                   radial_map=False):
     """The joint geometry model solved on comparisons (helirec/calibration/geometry_calibration.hpp states the model).
 
     acquisition_: the scans' layout (a dict as `acquisition` takes it, or a GeometryAcquisition): what the records
@@ -288,13 +291,21 @@ def solve_geometry(acquisition_, comparisons, start=None, huber=0.03, max_iterat
     second solve, from the first, with every scan's axial scale and the map's terms held above kept where the first
     has them (a scan's axial scale is its own views', which are few beside the comparisons of two scans). The step
     solves so, the tilts about start's about_height.
+
+    radial_map: the map's four terms of a lens' radial distortion, k (x, y) (x^2 + y^2) from the detector's middle,
+    as one unknown "map.radial" (the displacement [px] half the detector's width from the middle) in place of the
+    four coefficients (eu.i3j0, eu.i1j2, ev.i2j1, ev.i0j3); the map's other terms stay unknowns of their own, and
+    "map" frees them all. start's map must be of the third order (empty_map). The solution's "map" holds the four
+    coefficients written out, and "radial_map" the unknown and k [1 / px^2]. For scans compared along the frames'
+    edges alone (a grid of circular scans), which give the terms that change along a seam and not the course of the
+    columns along the columns.
     (helirec::calibration::geometry_calibration::solve_geometry)"""
     from . import _core
     try:
         text, residual, lens_residual = _core.geometry_solve(acquisition(acquisition_), [str(c["kind"]) for c in comparisons], _sightings([c["a"] for c in comparisons]),
                                                              _sightings([c["b"] for c in comparisons]), [bool(c.get("opposite", False)) for c in comparisons], _lens(lens),
                                                              _parameters_text(start), float(huber), int(max_iterations), list(held), list(freed), float(lens_huber),
-                                                             float(undetermined_map), bool(tilts_after))
+                                                             float(undetermined_map), bool(tilts_after), bool(radial_map))
     except RuntimeError as e:
         raise ValueError(str(e)) from None
     out = json.loads(text)
@@ -424,11 +435,14 @@ def overlap_centre_of(cal):
 
 # ---------------------------------------------------------------- the step
 
-def calibrate_geometry(scans, row_time=None, device="auto", order=3, threads=8, log=print, patch=128, reduce=0, projections=""):
+def calibrate_geometry(scans, row_time=None, device="auto", order=3, threads=8, log=print, patch=128, reduce=0, projections="", rows_from_middle=False, radial_map=False):
     """The geometry calibration of the scans of one sample. scans: their master files, a scan with the rotation
     axis inside the detector's field first (a pair: the main scan, then the one moved sideways). row_time: seconds
     per stored row (signed), if it is known for this camera configuration (0: not known, done without); otherwise
-    it is measured from a refill, and it is an error if no stretch on disk holds one. order: of the detector map's
+    it is measured from a refill, and it is an error if no stretch on disk holds one. rows_from_middle: the row
+    time counts the rows from the middle row to both ends (a camera whose two halves are read at once; above nothing
+    the middle row is exposed first, below it the first and last). radial_map: the detector's map with its
+    four terms of a lens' radial distortion solved as one unknown (solve_geometry), of the third order whatever `order` is. order: of the detector map's
     polynomial (0: no map). patch: the plan's blocks are cut into patches of patch x patch, each registered once.
     reduce: 1, 2, 3 to measure on the frames read at a half, a quarter, an eighth (the result is in stored pixels
     all the same; the C++ Options say by how much it then differs from the stored frames'). projections: a projection
@@ -437,7 +451,7 @@ def calibrate_geometry(scans, row_time=None, device="auto", order=3, threads=8, 
     (helirec::calibration::geometry_calibration::calibrate_geometry; the same as `helirec-calibration geometry`)"""
     from . import _core
     try:
-        text = _core.calibrate_geometry([str(x) for x in scans], None if row_time is None else float(row_time), device, int(order), int(threads), int(patch), log, int(reduce), str(projections))
+        text = _core.calibrate_geometry([str(x) for x in scans], None if row_time is None else float(row_time), device, int(order), int(threads), int(patch), log, int(reduce), str(projections), bool(rows_from_middle), bool(radial_map))
     except RuntimeError as e:
         raise ValueError(str(e)) from None
     return json.loads(text)

@@ -33,6 +33,7 @@ nb::dict poses_dict(const hg::Poses& p) {
     d["row"] = arr(p.row), d["row_per_col"] = arr(p.row_per_col), d["axis"] = arr(p.axis), d["col_per_row"] = arr(p.col_per_row);
     d["col_scale"] = arr(p.col_scale), d["row_scale"] = arr(p.row_scale), d["angle_deg"] = arr(p.angle_deg), d["angle_deg_per_row"] = arr(p.angle_deg_per_row);
     d["scale_col"] = p.scale_col;
+    d["rows_from_middle"] = p.rows_from_middle;
     return d;
 }
 
@@ -95,6 +96,7 @@ void bind_geometry(nb::module_& m) {
         .def_prop_ro("cols", &hg::Calibration::cols)
         .def_prop_ro("row_sign", &hg::Calibration::row_sign)
         .def_prop_ro("rolling_shutter", &hg::Calibration::rolling_shutter)
+        .def_prop_ro("rows_from_middle", &hg::Calibration::rows_from_middle)
         .def_prop_ro("overlap_centre", &hg::Calibration::overlap_centre)
         .def("map", [](const hg::Calibration& c) { return map_dict(c.map()); })
         .def("frame_poses",

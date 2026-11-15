@@ -355,12 +355,12 @@ void shear_frames(float* block, std::size_t n, int nrows, int ncols, double shea
 }
 
 void shift_columns(const float* wide, std::size_t n, int nrows, int ncols, int pad, const double* shift, bool flip_cols, float* out,
-                   const double* per_row, double row0) {
+                   const double* per_row, double row0, bool rows_from_middle) {
     const int nw = ncols + 2 * pad;
 #pragma omp parallel for collapse(2) schedule(static)
     for (std::ptrdiff_t q = 0; q < static_cast<std::ptrdiff_t>(n); ++q)
         for (int r = 0; r < nrows; ++r) {
-            const double s = shift[q] + (per_row ? per_row[q] * (row0 + r) : 0.0);
+            const double s = shift[q] + (per_row ? per_row[q] * (rows_from_middle ? std::fabs(row0 + r) : row0 + r) : 0.0);
             const double whole = std::floor(s);
             float w[4];
             cubic_weights(static_cast<float>(s - whole), w);

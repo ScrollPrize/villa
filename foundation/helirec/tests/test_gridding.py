@@ -230,6 +230,11 @@ def test_rolling_shutter_turns_the_slices_angles(tmp_path, device):
     for s in (0.5, -1.0):
         expect = s * (2 * np.pi / ngrid) * (mean_row - 0.5 * (rows - 1)) / (rows - 1)
         np.testing.assert_allclose(angles(s) - base, expect, atol=2e-5)
+    # the two halves of the detector read at once (rolling_shutter_from_middle): the row's distance from the middle row, to either side
+    from_middle = np.array([np.abs(row[ok & (p % ngrid == b)] - 0.5 * (rows - 1)).mean() for b in range(ngrid)])
+    assert np.abs(from_middle - np.abs(mean_row - 0.5 * (rows - 1))).max() > 0.5   # (some bins hold rows on both sides of the middle)
+    for s in (0.5, -1.0):
+        np.testing.assert_allclose(angles(s, rolling_shutter_from_middle=True) - base, s * (2 * np.pi / ngrid) * from_middle / (rows - 1), atol=2e-5)
     # gridding that takes one angle per bin: nothing is applied, and the reconstructor says so
     for kw in (dict(backprojector="ghbp", grid_size=0, rot_center=11.5), dict(backprojector="fbp", angle_interp="linear")):
         r = recon(pattern_scan(tmp_path, 0.0), device, **{"rolling_shutter": 0.5, **kw})

@@ -283,7 +283,7 @@ void measure_patches(const Pairing& P, const BlockPlan& plan, const std::vector<
                 t0 = std::chrono::steady_clock::now();
                 line_integrals(*P.B.ff, raw.data(), row0.data(), FB, RB, cb_lo - pad, nw, pad ? false : P.mirror, first);
             }
-            if (pad) shift_columns(wide.data(), FB, RB, CB, pad, window.part.data(), P.mirror, b_block.data(), P.sway_row_deg != 0.0 ? window.per_row.data() : nullptr, rb_lo - row_ref);
+            if (pad) shift_columns(wide.data(), FB, RB, CB, pad, window.part.data(), P.mirror, b_block.data(), P.sway_row_deg != 0.0 ? window.per_row.data() : nullptr, rb_lo - row_ref, P.sway_rows_from_middle);
             view_timing().integrals += seconds_since(t0);
         }
         }

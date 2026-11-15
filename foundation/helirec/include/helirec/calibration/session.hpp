@@ -40,8 +40,10 @@ struct ViewRequest {
     // same lines at equal angle on columns n(angle).(d_j - d_k) apart. The measured du is what is left of it.
     double sway_px = 0, sway_phase_deg = 0;
     // The angle at which a row is exposed, in degrees per row from the frame's (the rows' timing times the
-    // angular speed): row v of B is then read at the sway of angle_b + sway_row_deg (v - middle row).
+    // angular speed): row v of B is then read at the sway of angle_b + sway_row_deg (v - middle row), or, with
+    // sway_rows_from_middle (a camera whose two halves are read at once), of angle_b + sway_row_deg |v - middle row|.
     double sway_row_deg = 0;
+    bool sway_rows_from_middle = false;
 };
 // What view.tsv holds per registration (same meaning), and the plan behind it. planned: the record holds such a
 // pair and the blocks fit the detector; ok: the registration converged inside its search window.

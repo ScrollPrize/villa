@@ -692,6 +692,37 @@ class Gaussian final : public ProjectionFilter {
     double sigma_;
 };
 
+// A low-pass of the projection, the same along the columns and the rows: 1 / (1 + (f / cutoff)^(2 order)), f the
+// frequency's length in cycles per pixel (half the amplitude at `cutoff`). For a detector whose noise is white while
+// its image is not (the light's quanta counted at the sensor, the image blurred before it): beyond the frequency the
+// image ends at there is noise alone, which the ramp filter and a sharpening step amplify. Along the columns it
+// does what a window on the ramp does; along the rows nothing else does it.
+class Butterworth final : public ProjectionFilter {
+  public:
+    explicit Butterworth(const FilterParams& p) : cutoff_(p.num("cutoff")), order_(p.num("order", 4)) {
+        if (!(cutoff_ > 0)) throw Error("butterworth: cutoff must be > 0 (cycles per pixel)");
+        if (!(order_ >= 1)) throw Error("butterworth: order must be >= 1");
+    }
+    bool fourier() const override { return true; }
+    // the kernel's envelope falls as exp(-2 pi cutoff sin(pi / (2 order)) x): the rows to where it is 1e-4, at most 64
+    int margin_rows() const override {
+        const double rate = 2 * M_PI * cutoff_ * std::sin(M_PI / (2 * order_));
+        return static_cast<int>(std::min(64.0, std::ceil(std::log(1e4) / rate)));
+    }
+    void multiply_response(std::vector<cplx>& K, int n0, int n1, int) const override {
+        for (int i = 0; i < n0; ++i) {
+            const double f0 = static_cast<double>(signed_index(i, n0)) / n0;
+            for (int j = 0; j < n1; ++j) {
+                const double f1 = static_cast<double>(signed_index(j, n1)) / n1;
+                K[static_cast<std::size_t>(i) * n1 + j] *= 1.0 / (1.0 + std::pow(std::sqrt(f0 * f0 + f1 * f1) / cutoff_, 2 * order_));
+            }
+        }
+    }
+
+  private:
+    double cutoff_, order_;
+};
+
 // ------------------------------------------------------------------ median
 class Median final : public ProjectionFilter {
   public:
@@ -738,6 +769,10 @@ std::map<std::string, FilterFactory>& registry() {
         {"gaussian", [](const FilterParams& p, const FilterContext&) -> std::unique_ptr<ProjectionFilter> {
              check_keys("gaussian", p, {"sigma"});
              return std::make_unique<Gaussian>(p);
+         }},
+        {"butterworth", [](const FilterParams& p, const FilterContext&) -> std::unique_ptr<ProjectionFilter> {
+             check_keys("butterworth", p, {"cutoff", "order"});
+             return std::make_unique<Butterworth>(p);
          }},
         {"median", [](const FilterParams& p, const FilterContext&) -> std::unique_ptr<ProjectionFilter> {
              check_keys("median", p, {"radius"});
