@@ -37,6 +37,37 @@ nb::object jsonLoads(const std::string& text)
     return nb::cast<nb::object>(nb::module_::import_("json").attr("loads")(text));
 }
 
+// A parsed JSON value as the Python object json.loads gives for its text: dicts
+// in key order, lists, str, bool, int (any magnitude), float, None. Built
+// directly, without the interpreter's json module: a selected-graph read
+// converts about one million records and anchors this way.
+template<class BasicJson> nb::object jsonToPy(const BasicJson& j)
+{
+    switch (j.type()) {
+    case BasicJson::value_t::object: {
+        nb::dict d;
+        for (const auto& [key, value] : j.items()) d[nb::str(key.data(), key.size())] = jsonToPy(value);
+        return d;
+    }
+    case BasicJson::value_t::array: {
+        nb::list l;
+        for (const auto& value : j) l.append(jsonToPy(value));
+        return l;
+    }
+    case BasicJson::value_t::string: { const auto& s = j.template get_ref<const typename BasicJson::string_t&>(); return nb::str(s.data(), s.size()); }
+    case BasicJson::value_t::boolean: return nb::bool_(j.template get<bool>());
+    case BasicJson::value_t::number_integer: return nb::int_(j.template get<int64_t>());
+    case BasicJson::value_t::number_unsigned: return nb::int_(j.template get<uint64_t>());
+    case BasicJson::value_t::number_float: return nb::float_(j.template get<double>());
+    default: return nb::none();
+    }
+}
+// JSON text as json.loads would read it (object keys in the text's order).
+nb::object jsonTextToPy(const std::string& text)
+{
+    return jsonToPy(nlohmann::ordered_json::parse(text));
+}
+
 bool has(const nb::dict& d, const char* key) { return d.contains(key) && !d[key].is_none(); }
 
 std::string getStr(const nb::dict& d, const char* key, const std::string& fallback = "")
@@ -85,11 +116,11 @@ vo::Anchor anchorFromPy(const nb::handle& obj)
 
 nb::dict anchorToPy(const vo::Anchor& a)
 {
-    auto result = nb::cast<nb::dict>(jsonLoads(vo::detail::anchorToJson(a).dump()));
+    auto result = nb::cast<nb::dict>(jsonToPy(vo::detail::anchorToJson(a)));
     // Preserve the Python API's tuple representation of fixed-size vectors.
     for (const auto* key : {"position", "direction"})
         if (result.contains(key))
-            result[key] = nb::module_::import_("builtins").attr("tuple")(result[key]);
+            result[key] = nb::steal<nb::object>(PySequence_Tuple(result[key].ptr()));
     return result;
 }
 
@@ -103,7 +134,7 @@ void commonToPy(nb::dict& d, const vo::RecordCommon& r, const std::set<std::stri
     vo::detail::commonFields(r, [&](const char* key, const auto& value) {
         if (include(key)) d[key] = value;
     });
-    if (include("meta")) d["meta"] = jsonLoads(r.meta);
+    if (include("meta")) d["meta"] = jsonTextToPy(r.meta);
     // Inline numbered version (including pending edits inside a write).
     if (r.version) { d["version"] = *r.version; d["version_generation"] = r.versionGeneration;
         d["version_store"] = r.versionStoreUuid; }

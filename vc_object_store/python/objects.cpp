@@ -76,8 +76,8 @@ nb::dict relationshipRevisionToPy(const vo::RelationshipRevision& revision)
     d["version"] = revision.version; d["generation"] = revision.generation;
     d["a_version"] = revision.aReference.version; d["b_version"] = revision.bReference.version;
     d["store"] = revision.record.versionStoreUuid;
-    const auto refs = nb::cast<nb::list>(jsonLoads(vo::objectVersionsRequestToJson({revision.aReference, revision.bReference}))["versions"]);
-    d["a_reference"] = refs[0]; d["b_reference"] = refs[1];
+    d["a_reference"] = jsonToPy(vo::detail::objectVersionJson(revision.aReference));
+    d["b_reference"] = jsonToPy(vo::detail::objectVersionJson(revision.bReference));
     return d;
 }
 
