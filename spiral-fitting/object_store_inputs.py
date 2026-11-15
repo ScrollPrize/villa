@@ -1716,9 +1716,21 @@ def _compute_track_crossings(tracks, points, rows, workers=None):
                 f'{error}']) from error
         del flat
         parts.append((begin, csr))
+    # Groups are consecutive rows and the kernel orders each group's records
+    # by row, then partner row: the merged CSR is their concatenation.
     merged = _empty_crossings(len(tracks))
     if not parts:
         return merged
+    counts = np.zeros(len(tracks), dtype=np.int64)
+    for begin, csr in parts:
+        counts[begin:begin + len(csr['offsets']) - 1] = np.diff(csr['offsets'])
+    np.cumsum(counts, out=merged['offsets'][1:])
+    for name in ('partners', 'self_local', 'partner_local', 'positions', 'clearances'):
+        columns = [csr[name] + begin if name == 'partners' and begin else csr[name]
+                   for begin, csr in parts]
+        merged[name] = (columns[0] if len(columns) == 1 else np.concatenate(columns)).astype(
+            merged[name].dtype, copy=False)
+    return merged
     owners = np.concatenate([
         begin + np.repeat(np.arange(len(csr['offsets']) - 1, dtype=np.int64),
                           np.diff(csr['offsets'])) for begin, csr in parts])
@@ -1788,18 +1800,17 @@ def _store_track_crossings(path, key, csr, sha256):
         print(f'WARNING: cannot write the track crossing cache {path}: {error}')
 
 
-def _track_crossing_provenance(source, csr=None, sha256=None):
+def _track_crossing_provenance(csr, sha256):
     """The manifest's ``derived_inputs.track_crossing``: the crossings are
-    'computed' from the selected tracks (their count and the checksum of the
-    CSR in stored voxels identify them), or 'skipped' (the fit prepares no
-    crossing partners)."""
+    computed from the selected tracks; their count and the checksum of the
+    CSR in stored voxels identify them."""
     from tracks import TRACK_CROSSING_ALGORITHM, TRACK_CROSSING_PARAMETERS
-    return {'source': source, 'algorithm': TRACK_CROSSING_ALGORITHM,
+    return {'source': 'computed', 'algorithm': TRACK_CROSSING_ALGORITHM,
             'parameters': dict(TRACK_CROSSING_PARAMETERS),
-            'count': 0 if csr is None else len(csr['partners']) // 2, 'sha256': sha256}
+            'count': len(csr['partners']) // 2, 'sha256': sha256}
 
 
-def materialize_tracks(store, snapshot, *, z_begin, z_end, crossings=True,
+def materialize_tracks(store, snapshot, *, z_begin, z_end,
                        cache_directory=None, workers=None):
     """The snapshot's tracks and crossings (TrackInputs), or None without
     tracks; and counts.
@@ -1816,8 +1827,8 @@ def materialize_tracks(store, snapshot, *, z_begin, z_end, crossings=True,
     _compute_track_crossings). Crossing relationships a store holds are not
     read. ``cache_directory`` (the fit's cache) keeps them, in stored
     voxels, for the next fit of the same track revisions; ``workers`` bounds
-    the kernel's threads. ``crossings`` False (a fit that prepares no
-    crossing partners) computes none and neither reads nor writes the cache.
+    the kernel's threads. They are computed whatever the fit's crossing
+    limits, so a fit's inputs do not depend on its run settings.
     """
     from tracks import PackedTrackCollection, crossing_csr_sha256
 
@@ -1825,15 +1836,14 @@ def materialize_tracks(store, snapshot, *, z_begin, z_end, crossings=True,
     counts = Counter()
     if not tracks:
         return None, counts
-    rows = cached = cache_path = key = None
-    if crossings:
-        rows = _track_crossing_rows(tracks)
-        if cache_directory:
-            key = _track_crossing_key(tracks, rows)
-            cache_path = _track_crossing_cache_path(cache_directory, key)
-            cached = _load_track_crossings(cache_path, key, len(tracks))
+    cached = cache_path = key = None
+    rows = _track_crossing_rows(tracks)
+    if cache_directory:
+        key = _track_crossing_key(tracks, rows)
+        cache_path = _track_crossing_cache_path(cache_directory, key)
+        cached = _load_track_crossings(cache_path, key, len(tracks))
     # Every selected track's stored points, when the crossings are computed.
-    selection = [None] * len(tracks) if crossings and cached is None else None
+    selection = [None] * len(tracks) if cached is None else None
     problems = []
     kept, stored, fit, families, scales = [], [], [], [], []
     for index, obj in enumerate(tracks):
@@ -1865,22 +1875,19 @@ def materialize_tracks(store, snapshot, *, z_begin, z_end, crossings=True,
         scales.append(obj.frame.to_fit)
     if problems:
         raise ObjectStoreInputError(problems)
-    if not crossings:
-        csr, derived = _empty_crossings(len(tracks)), _track_crossing_provenance('skipped')
+    if cached is None:
+        csr = _compute_track_crossings(tracks, selection, rows, workers)
+        sha256 = crossing_csr_sha256(csr)
+        if cache_path is not None:
+            _store_track_crossings(cache_path, key, csr, sha256)
     else:
-        if cached is None:
-            csr = _compute_track_crossings(tracks, selection, rows, workers)
-            sha256 = crossing_csr_sha256(csr)
-            if cache_path is not None:
-                _store_track_crossings(cache_path, key, csr, sha256)
-        else:
-            csr, sha256 = cached
-        del selection
-        derived = _track_crossing_provenance('computed', csr, sha256)
-        # Stored voxels -> fit voxels, by each row's (its group's) frame.
-        scale = np.repeat(rows.to_fit, np.diff(csr['offsets']))
-        csr = {**csr, 'positions': csr['positions'] * scale,
-               'clearances': csr['clearances'] * scale}
+        csr, sha256 = cached
+    del selection
+    derived = _track_crossing_provenance(csr, sha256)
+    # Stored voxels -> fit voxels, by each row's (its group's) frame.
+    scale = np.repeat(rows.to_fit, np.diff(csr['offsets']))
+    csr = {**csr, 'positions': csr['positions'] * scale,
+           'clearances': csr['clearances'] * scale}
 
     track_lengths = np.array([len(points) for points in stored], dtype=np.int64)
     offsets = np.zeros(len(stored) + 1, dtype=np.int64)
@@ -1915,7 +1922,7 @@ def materialize_tracks(store, snapshot, *, z_begin, z_end, crossings=True,
 def materialize(store, snapshot, *, z_begin, z_end, z_margin,
                 erode_cells_default, fiber_min_point_spacing=0.0,
                 overlap_pair_spacing=8.0, overlap_max_pairs=16, patch_overlaps=True,
-                exclude_patch_uuids=(), track_crossings=True, cache_directory=None):
+                exclude_patch_uuids=(), cache_directory=None):
     """Every runtime input of a frozen snapshot.
 
     Fibers are decimated to ``fiber_min_point_spacing`` (the fitter's
@@ -1923,8 +1930,7 @@ def materialize(store, snapshot, *, z_begin, z_end, z_margin,
     ``overlap_max_pairs`` pairs ``overlap_pair_spacing`` voxels apart.
     Resident ids number PCLs, then fibers, then overlap pairs;
     ``patch_overlaps`` False (input_use_patch_overlaps off) makes none.
-    ``track_crossings`` and ``cache_directory`` are materialize_tracks'
-    ``crossings`` and cache.
+    ``cache_directory`` is materialize_tracks' cache.
     """
     patches, counts = materialize_patches(
         store, snapshot, z_begin=z_begin, z_end=z_end, z_margin=z_margin,
@@ -1948,7 +1954,7 @@ def materialize(store, snapshot, *, z_begin, z_end, z_margin,
         counts['patch overlaps unused (input_use_patch_overlaps off)'] = len(
             snapshot.relationships_of('patch_overlap'))
     tracks, track_counts = materialize_tracks(
-        store, snapshot, z_begin=z_begin, z_end=z_end, crossings=track_crossings,
+        store, snapshot, z_begin=z_begin, z_end=z_end,
         cache_directory=cache_directory)
     counts.update(track_counts)
     return FitInputs(snapshot, patches, point_collections, fibers,
@@ -1960,15 +1966,7 @@ def materialize(store, snapshot, *, z_begin, z_end, z_margin,
 
 def materialize_from_config(store, snapshot, config, cache_directory=None):
     """materialize() with the fit configuration's window and settings.
-    Track crossings are computed unless the fit prepares no crossing
-    partners: the effective ceiling (validate_track_sampling_config, the
-    larger of track_crossing_precompute_max and
-    track_max_track_crossing_per_step) is 0. ``cache_directory`` is the
-    fit's cache."""
-    track_crossings = True
-    if snapshot.objects_of('track'):
-        from tracks import validate_track_sampling_config
-        track_crossings = validate_track_sampling_config(config)['crossing_precompute_max'] > 0
+    ``cache_directory`` is the fit's cache."""
     return materialize(
         store, snapshot, z_begin=config['z_begin'], z_end=config['z_end'],
         z_margin=config['patch_loss_z_margin'],
@@ -1978,7 +1976,7 @@ def materialize_from_config(store, snapshot, config, cache_directory=None):
         overlap_max_pairs=config['pcl_patch_overlap_max_pairs'],
         patch_overlaps=bool(config['input_use_patch_overlaps']),
         exclude_patch_uuids=config['object_store_patch_exclude_uuids'] or (),
-        track_crossings=track_crossings, cache_directory=cache_directory)
+        cache_directory=cache_directory)
 
 
 @dataclasses.dataclass

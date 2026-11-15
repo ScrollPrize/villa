@@ -466,9 +466,8 @@ indices, one representative per pair), the implementation the store's
 or repeats within its dataset, a family other than `horizontal`, `vertical` or
 blank (blank: no crossings), coordinates outside `[0, 2^20)` and a dataset
 whose tracks declare different frame scales are input errors; nothing is
-dropped silently. Crossings are computed automatically at startup unless the
-fit prepares no crossing partners (`track_crossing_precompute_max` and
-`track_max_track_crossing_per_step` both 0), and cached under the fit's cache
+dropped silently. Crossings are computed automatically at startup, whatever the
+fit's crossing limits, and cached under the fit's cache
 directory as `track_crossings/v1/<key>.npz`, keyed by the track revisions (not
 by the store's commit, the fit level or a frame scale), so the next fit of the
 same tracks loads them. The input manifest records them as

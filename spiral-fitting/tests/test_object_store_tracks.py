@@ -43,11 +43,11 @@ def _lattice(db, z=10, **options):
     return tracks
 
 
-def _materialize_tracks(db, z_begin=0, z_end=64, crossings=True, cache_directory=None,
+def _materialize_tracks(db, z_begin=0, z_end=64, cache_directory=None,
                         workers=None, **request):
     snapshot = osi.read_snapshot(db, osi.InputRequest(**request))
     return osi.materialize_tracks(db, snapshot, z_begin=z_begin, z_end=z_end,
-                                  crossings=crossings, cache_directory=cache_directory,
+                                  cache_directory=cache_directory,
                                   workers=workers)
 
 
@@ -365,9 +365,6 @@ def test_track_metadata_crossings_cannot_use_is_refused(db, second, problem):
     with pytest.raises(osi.ObjectStoreInputError) as error:
         _materialize_tracks(db)
     assert problem in str(error.value) and (uuid in str(error.value) or 'dataset' in problem)
-    # A fit that prepares no crossings reads the tracks as they are.
-    inputs, counts = _materialize_tracks(db, crossings=False)
-    assert counts['tracks'] == 2 and counts['track crossings'] == 0
 
 
 def test_a_source_key_is_one_track_of_its_dataset(db):
@@ -542,34 +539,23 @@ def test_a_warm_cache_serves_another_fit_level_and_frame_scale(db, tmp_path, com
             np.testing.assert_array_equal(scaled.crossings[name], full.crossings[name] * factor)
 
 
-def test_crossings_follow_the_effective_crossing_ceiling(db, tmp_path, computes):
-    """Crossings are computed unless the fit prepares no crossing partners:
-    the larger of track_crossing_precompute_max and
-    track_max_track_crossing_per_step is 0."""
+def test_crossings_do_not_depend_on_the_crossing_limits(db, tmp_path, computes):
+    """The crossings are inputs of the fit, not of its run settings: with
+    both crossing limits 0 they are computed and recorded all the same, so
+    changing the limits later leaves the fit's inputs as they were."""
     cache = tmp_path / 'cache'
     _lattice(db, z=40)
     config = {**reference.fit_config(), 'input_use_tracks': True}
     snapshot = osi.read_snapshot(db, osi.request_from_config(config))
 
-    def tracks(precompute, per_step, cache_directory=str(cache)):
+    def tracks(precompute, per_step):
         return osi.materialize_from_config(db, snapshot, {
             **config, 'track_crossing_precompute_max': precompute,
-            'track_max_track_crossing_per_step': per_step}, cache_directory)
-    off = tracks(0, 0)
-    assert off.counts['tracks'] == 6 and off.counts['track crossings'] == 0
-    assert off.tracks.derived['source'] == 'skipped' and off.tracks.derived['sha256'] is None
-    assert off.tracks.crossings['offsets'].tolist() == [0] * 7
-    assert not computes and not cache.exists()
-    # A per-step maximum alone raises the ceiling (validate_track_sampling_config).
-    raised = tracks(0, 2)
-    assert raised.counts['track crossings'] == 9 and len(computes) == 1
-    assert raised.tracks.derived['source'] == 'computed'
-    [cached] = _cache_files(cache)
-    intact = cached.read_bytes()
-    assert tracks(0, 0).counts['track crossings'] == 0
-    assert len(computes) == 1 and cached.read_bytes() == intact
-    again = tracks(8, 0)
-    assert again.tracks.derived == raised.tracks.derived and len(computes) == 1
+            'track_max_track_crossing_per_step': per_step}, str(cache))
+    off, on = tracks(0, 0), tracks(8, 2)
+    assert off.counts['track crossings'] == on.counts['track crossings'] == 9
+    assert len(computes) == 1
+    assert off.tracks.derived == on.tracks.derived and off.tracks.derived['source'] == 'computed'
 
 
 # ---------------------------------------------------------------------------
@@ -638,9 +624,8 @@ def test_derived_crossings_identify_the_tracks_of_a_fit(tmp_path):
     assert osi.track_identity(changed) != osi.track_identity(inputs.manifest)
     assert osi.manifest_digest(changed) != inputs.digest
     assert osi.manifest_differences(inputs.manifest, changed) == ['derived_inputs.track_crossing']
-    skipped = _load(path, track_crossing_precompute_max=0, track_max_track_crossing_per_step=0)
-    assert skipped.manifest['derived_inputs']['track_crossing']['source'] == 'skipped'
-    assert osi.track_identity(skipped.manifest) != osi.track_identity(inputs.manifest)
+    limits = _load(path, track_crossing_precompute_max=0, track_max_track_crossing_per_step=0)
+    assert osi.track_identity(limits.manifest) == osi.track_identity(inputs.manifest)
 
 
 def test_a_checkpoint_with_crossing_relationships_reports_changed_inputs(tmp_path):
