@@ -367,6 +367,11 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(
             "the Lasagna bootstrap requires the sibling vc_reader checkout"
         )
+    gpu_manager = project.parent / "gpu_manager"
+    if not (gpu_manager / "pyproject.toml").is_file():
+        raise SystemExit(
+            "the Lasagna bootstrap requires the sibling gpu_manager checkout"
+        )
     print(f"PyTorch backend: {backend} ({reason})", flush=True)
     if hint is not None:
         print(hint, flush=True)
@@ -418,6 +423,10 @@ def main(argv: list[str] | None = None) -> int:
         [uv, "pip", "install", "--python", str(venv_python), "-e", str(object_store)],
         dry_run=args.dry_run,
         environment=volume_cartographer_build_environment(),
+    )
+    run(
+        [uv, "pip", "install", "--python", str(venv_python), "-e", str(gpu_manager)],
+        dry_run=args.dry_run,
     )
     run(
         [uv, "pip", "install", "--python", str(venv_python), "-e", str(project)],
