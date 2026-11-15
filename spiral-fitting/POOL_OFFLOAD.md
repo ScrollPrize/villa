@@ -60,3 +60,19 @@ allows `cuMemHostRegister` (the pool maps its page-locked memory into the card's
 `brick_pool_offload.py`, `host_pool_cuda.py` (the pool), `sparse_cuda_cache.resident_brick_pool_class()` (the switch), `lasagna_data.py`
 (uses it), `fit_spiral.py` (GC policy hook, `_free_fit_state_for_export`), `GC_CYCLE_LEAK.md`, `tests/test_pool_offload.py`,
 `pool_offload/` (model, chart script, measured points, public table and chart).
+
+## Every claim this branch makes, and its evidence
+
+| # | claim | evidence | strength |
+|---|---|---|---|
+| 1 | `FIT_SPIRAL_GC_POLICY=freeze` (default) bounds the device-memory growth of a long fit | torch peak 2.81 GiB against 8.44 GiB with `off` (one scroll, z 9000-10500, 16-voxel, 600 steps, V100-32); without it a whole-height fit died at iteration 18 | one scroll, older fitter copy |
+| 2 | the freeze policy costs nothing measurable | 13.71 against 13.56 it/s on an idle card; a collection after the freeze takes 0.2-0.3 ms against 0.4-2 s for a full collection every step | one scroll, older fitter copy |
+| 3 | `FIT_SPIRAL_POOL_OFFLOAD=1` (opt-in) returns exactly what the resident pool returns | 4,101,001 random and edge lookups on the real pool of the smoke fit: 0 differences; `tests/test_pool_offload.py` 4 passed | strong, on this branch's code |
+| 4 | the offload takes the pool off the card | card median 20,582 against 9,522 MiB (whole-height, 32-voxel, one scroll); whole-height fits of the two largest scrolls ran on one V100-32 | one run per arm, older fitter copy |
+| 5 | the offload costs about 1 % per iteration | 0.754 against 0.747 it/s (one scroll) | one scroll, older fitter copy |
+| 6 | `FIT_SPIRAL_EXPORT_FREE` (default on) lets the final mesh export finish | 21.73 -> 16.78 GiB allocated before the export; 500 of 500 windings written where the same step died twice; without it the largest scroll's export peaked at 30.75 of 31.73 GiB | one observation with the guard |
+| 7 | the per-scroll memory model predicts what a fit needs | calibrated on one scroll at full height within 2 %; 21 scrolls predicted, 5 measured points | a model, not a measurement, for most scrolls |
+| 8 | the three switches work on upstream's current object-store input path | this branch's own `fit_spiral.py` ran to completion (exit 0) with all switches on, all off, and on again, on an ingested store; same structure, parameter differences inside the run-to-run noise | one window, one run each |
+| 9 | nothing else in upstream's behaviour is changed | the upstream spiral-fitting suite: 1062 passed, 2 failed identically on unmodified main | strong |
+
+**What this branch does NOT do:** it does not speed up upstream. In particular it does nothing about upstream's slow start of a fit on an ingested store (reading the inputs and the track-crossing link refresh took about 95 minutes for a 557 k-track window; a second fit on the same store skips the refresh but still read inputs for about 55 minutes). The only time costs it adds are the about 1 % of the offload and the 0.2-0.3 ms per step of the freeze policy. A separate change to `vc_object_ingest` (a bulk mode) speeds up building the store (557 k tracks in 19-46 s instead of 23 min), not the fit's own startup.
