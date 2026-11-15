@@ -690,13 +690,21 @@ Example on a public PHerc0332 reference fit (M8, seed 1, from the dataset's
 
 ```sh
 python ridge_correct_checkpoint.py checkpoint_fitted.ckpt corrected.ckpt \
-    --umbilicus umbilicus.json --windings 1 67 --threads 8 \
+    --umbilicus umbilicus.json --windings 1 67 --threads 7 \
     --ct https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0332/volumes/20251211183505-2.399um-0.2m-78keV-masked.zarr/2
 ```
 
 Windings 1-67 are the setting the published comparisons used; their
 measured gain comes from windings 46-57, and editing the other windings
 alone changed the slice-line score by -0.08 / -0.03 points (two seeds).
+On this example the command's output is bit-identical to the research
+pipeline the published comparisons were made with (0 gap-logit cells
+differ; same `model_state_sha256`). It took 1 h 01 min on 8 vCPU with 7
+worker processes, 6.2 CPU-hours and 5.7 GB peak memory for the whole job,
+and streamed 35.4 GB of CT. On PHercParis4 generation 19, z 8000-9000,
+windings 15-44, it took 7 min 51 s, 0.33 CPU-hours and 9.1 GB, and passed
+the write-back check below (correlation 0.983, error ratio 0.177); that
+says the write is faithful, not that the fit improved there.
 
 - **Input.** A fitted checkpoint, its `umbilicus.json` (found as for the
   flattener, or `--umbilicus`), and the CT level the fit was made in: a Zarr
@@ -714,10 +722,10 @@ alone changed the slice-line score by -0.08 / -0.03 points (two seeds).
   them and clearly closer than the next candidate; nodes where no candidate
   fits, or two fit about equally well, are not moved, and moves fade to zero
   within three nodes of them and in a 150-voxel cosine taper at the band
-  ends. Near the CT's top and bottom, gap rows are taken in blocks of eight
-  (counted from the first extracted row): a block in which any profile
-  reaches past the CT is not moved at all, nor is any node whose own
-  profiles are mostly outside the CT. `--method
+  ends. Near the CT's top and bottom, whole blocks of eight gap rows are
+  left unedited if any profile in the block leaves the CT (gap rows 318-327
+  on the example), as are nodes whose own profiles are mostly outside the
+  CT. `--method
   nearest` instead moves every confident node to its single best ridge
   (shift = ramp(confidence, 0.70-0.90) x clip(offset, +-0.35 winding)). The
   gap writer keeps every stored logit it does not need to change bit for bit
@@ -743,12 +751,14 @@ alone changed the slice-line score by -0.08 / -0.03 points (two seeds).
   The measured gain is on 51 slice lines that all lie on windings 47-55 of
   one fit family. On PHercParis4, two window fits that were never given 55
   human lines (311 points) show no gain on those lines (-0.02 / -0.04 voxel
-  against a bar of -0.3). On the fitter team's ink metric
-  (`total_fg_pixels`, three PHercParis4 fits, 9 winding surfaces) the edit
-  changes recovered ink by -21.9 %, within what a rigid 0.15-0.6 voxel
-  jitter of the original surface does (24.1 %): no gain and no loss
-  detectable at this size. Tests (`tests/test_ridge_correct_checkpoint.py`)
-  use a synthetic fit and CT: they check correctness, not usefulness.
+  against a bar of -0.3); the stage itself has run there on one band only.
+  Moves are about a voxel (median node move 0.93 voxel on the example), so
+  the edit is not visible by eye in cross-sections; a small tail is large
+  (303 of 1,257,977 moved nodes move more than 20 voxels, where one winding
+  spans a long path in the CT). The writer leaves some cells below its gap
+  floor after its shrink rounds (5,010 on the example, 16,362 on the
+  PHercParis4 band). Tests (`tests/test_ridge_correct_checkpoint.py`) use a
+  synthetic fit and CT: they check correctness, not usefulness.
 
 ## Hover descriptions (descriptions.json)
 
