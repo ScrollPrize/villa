@@ -697,9 +697,10 @@ python ridge_correct_checkpoint.py checkpoint_fitted.ckpt corrected.ckpt \
 Windings 1-67 are the setting the published comparisons used; their
 measured gain comes from windings 46-57, and editing the other windings
 alone changed the slice-line score by -0.08 / -0.03 points (two seeds).
-On this example the command's output is bit-identical to the research
-pipeline the published comparisons were made with (0 gap-logit cells
-differ; same `model_state_sha256`). It took 1 h 01 min on 8 vCPU with 7
+On this example the command's model state is bit-identical to that of the
+research pipeline the published comparisons were made with (0 gap-logit
+cells differ, every other tensor equal, same `model_state_sha256`; the
+files differ only in the provenance entry). It took 1 h 01 min on 8 vCPU with 7
 worker processes, 6.2 CPU-hours and 5.7 GB peak memory for the whole job,
 and streamed 35.4 GB of CT. On PHercParis4 generation 19, z 8000-9000,
 windings 15-44, it took 7 min 51 s, 0.33 CPU-hours and 9.1 GB, and passed
@@ -729,8 +730,9 @@ says the write is faithful, not that the fit improved there.
   nearest` instead moves every confident node to its single best ridge
   (shift = ramp(confidence, 0.70-0.90) x clip(offset, +-0.35 winding)). The
   gap writer keeps every stored logit it does not need to change bit for bit
-  (a zero field leaves the model state and its digest identical) and halves a
-  move locally rather than push a gap below min(old gap, 3 voxels).
+  (a zero field leaves the model state and its `model_state_sha256`
+  unchanged; the file gains only a provenance entry) and halves a move
+  locally rather than push a gap below min(old gap, 3 voxels).
 - **Write-back check.** Before saving, the command compares the shift the
   edited model realises with the shift it was asked to write, at 20,000
   random points between nodes where the field moves: the correlation must be
@@ -746,17 +748,24 @@ says the write is faithful, not that the fit improved there.
   interruption resumes (delete that directory afterwards).
 - **Limits.** Experimental; not proposed for merging as is. The method
   follows the nearest consistent CT ridge, which is not always the right
-  sheet: at one checked place (PHerc0332 M8, winding 50) it moved the surface
-  8-18 voxels outward onto the next layer, away from the hand-traced sheet.
-  The measured gain is on 51 slice lines that all lie on windings 47-55 of
-  one fit family. On PHercParis4, two window fits that were never given 55
-  human lines (311 points) show no gain on those lines (-0.02 / -0.04 voxel
-  against a bar of -0.3); the stage itself has run there on one band only.
-  Moves are about a voxel (median node move 0.93 voxel on the example), so
-  the edit is not visible by eye in cross-sections; a small tail is large
-  (303 of 1,257,977 moved nodes move more than 20 voxels, where one winding
-  spans a long path in the CT). The writer leaves some cells below its gap
-  floor after its shrink rounds (5,010 on the example, 16,362 on the
+  sheet. The worst known wrong move: on PHerc0332 M8, winding 50
+  (z 3220-3800), the edit moves the surface 8-18 voxels outward, off the
+  hand-traced layer. Two smaller places with hand-traced points also move
+  away from them (winding 51, z 4138-4194; winding 47, z 3975-4039); a
+  similar place on winding 48 moves toward them. The measured gain is on 51
+  slice lines that all lie on windings 47-55 of one fit family, and most of
+  it is move size, not node choice: a plain half-size version of the
+  nearest-ridge field gives the same score on M8. Winding jumps per 1,000
+  line points rise slightly on 7 of the 8 reference rows. On PHercParis4 the
+  stage itself has run on one band only; an earlier nearest-ridge field
+  applied to the mesh (not this code) showed no gain on 55 human lines that
+  two window fits were never given (311 points: -0.02 / -0.04 voxel against
+  a bar of -0.3). Moves are about a voxel (median node move 0.93 voxel on
+  the example), so the edit is not visible by eye in cross-sections; a small
+  tail is large (303 of 1,257,977 moved nodes on M8 s1 move more than 20
+  voxels, where one winding spans a long path in the CT). The writer halves
+  a move locally rather than push a gap below min(old gap, 3 voxels); some
+  cells still end below that floor (5,010 on the example, 16,362 on the
   PHercParis4 band). Tests (`tests/test_ridge_correct_checkpoint.py`) use a
   synthetic fit and CT: they check correctness, not usefulness.
 
