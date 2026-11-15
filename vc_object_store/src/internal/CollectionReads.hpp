@@ -12,6 +12,8 @@ namespace vc::objects::detail {
 struct CollectionScanPartition {
     sqlite3* db;
     std::vector<KeyRoute> uuidRoutes;
+    // Which database this is: the collection's root or one of its partitions.
+    CollectionMember member;
 };
 struct CollectionScanAccess {
     static std::vector<CollectionScanPartition> partitions(const ObjectCollection&, const CollectionTxn&);

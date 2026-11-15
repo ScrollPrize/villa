@@ -555,6 +555,56 @@ def test_cached_pairs_find_their_rows_by_the_whole_uuid():
             osi._crossings_from_columns(foreign, uuids)
 
 
+def test_a_track_known_only_by_half_its_uuid_is_not_selected():
+    """Distinct upper halves find the row by themselves; the lower half
+    still has to be the track's."""
+    names = [bytes([10 * (row + 1)] * 8) + bytes([row + 1] * 8) for row in range(4)]
+    uuids = np.frombuffer(b''.join(names), dtype=np.uint8).reshape(-1, 16)
+    columns = {'a': uuids[[0, 1]], 'b': uuids[[2, 3]],
+               'local_a': np.array([1, 2], dtype=np.int32), 'local_b': np.array([3, 4], dtype=np.int32),
+               'position_a': np.array([1.0, 2.0]), 'position_b': np.array([3.0, 4.0]),
+               'clearance': np.array([0.5, 0.25])}
+    csr = osi._crossings_from_columns(columns, uuids[[3, 1, 0, 2]])  # rows in another order
+    np.testing.assert_array_equal(csr['partners'], [1, 0, 3, 2])
+    np.testing.assert_array_equal(csr['self_local'], [4, 2, 1, 3])
+    for half in (slice(0, 8), slice(8, 16)):
+        foreign = {**columns, 'b': columns['b'].copy()}
+        foreign['b'][1, half] = 7
+        with pytest.raises(ValueError, match='not selected'):
+            osi._crossings_from_columns(foreign, uuids)
+
+
+def test_rows_are_found_quickly_among_uuids_sharing_a_prefix():
+    """Sequential UUIDs under one fixed prefix (every track shares the upper
+    half): each lookup is still one binary search, not a walk through them."""
+    import time
+    count = 300_000
+    uuids = np.zeros((count, 16), dtype=np.uint8)
+    uuids[:, :8] = np.frombuffer(bytes(range(16, 24)), dtype=np.uint8)
+    uuids[:, 8:] = np.arange(count, dtype='>u8').view(np.uint8).reshape(count, 8)
+    rows = np.random.default_rng(0).permutation(count)
+    uuids = uuids[rows]  # row order is not UUID order
+    a = np.arange(0, count - 1, dtype=np.int64)
+    first, second = uuids[a], uuids[a + 1]
+    swap = (first.view('S16').ravel() > second.view('S16').ravel())
+    columns = {'a': np.where(swap[:, None], second, first), 'b': np.where(swap[:, None], first, second),
+               'local_a': np.zeros(len(a), dtype=np.int32), 'local_b': np.zeros(len(a), dtype=np.int32),
+               'position_a': np.zeros(len(a)), 'position_b': np.zeros(len(a)),
+               'clearance': np.zeros(len(a))}
+    started = time.monotonic()
+    csr = osi._crossings_from_columns(columns, uuids)
+    assert time.monotonic() - started < 20  # the walk took minutes here
+    degree = np.diff(csr['offsets'])
+    assert degree.sum() == 2 * len(a) and degree.min() == 1 and degree.max() == 2
+    found = set(zip(np.repeat(np.arange(count), degree).tolist(), csr['partners'].tolist()))
+    assert all((row, row + 1) in found and (row + 1, row) in found for row in range(0, count - 1, 997))
+    columns['b'] = columns['b'].copy()
+    columns['b'][12345, 15] ^= 0xff
+    columns['b'][12345, 9] = 0xee  # a low half no track has, under the shared prefix
+    with pytest.raises(ValueError, match='not selected'):
+        osi._crossings_from_columns(columns, uuids)
+
+
 def test_isolated_tracks_keep_their_empty_rows(db, tmp_path, computes):
     """Tracks without a crossing are rows all the same, from a cache too."""
     _lattice(db)
@@ -661,6 +711,93 @@ def test_an_unusable_cache_does_not_fail_the_fit(db, tmp_path, computes, capsys,
     assert len(computes) == 3 and not cached.exists()
     assert 'cannot write the track crossing cache' in capsys.readouterr().out
     _assert_same_crossings(third.crossings, first.crossings)
+
+
+@pytest.mark.parametrize('stage', ['columns', 'write'])
+def test_a_failed_allocation_while_caching_keeps_the_computed_crossings(
+        db, tmp_path, computes, capsys, monkeypatch, stage):
+    cache = tmp_path / 'cache'
+    _lattice(db)
+    reference_inputs, _ = _materialize_tracks(db)
+
+    def exhausted(*args, **kwargs):
+        raise MemoryError('std::bad_alloc')
+    import vc_object_store
+    with monkeypatch.context() as patch:
+        if stage == 'columns':
+            patch.setattr(osi, '_crossing_columns', exhausted)
+        else:
+            patch.setattr(vc_object_store, 'write_track_crossing_store', exhausted)
+        inputs, _ = _materialize_tracks(db, cache_directory=str(cache))
+    assert len(computes) == 2 and not _cache_files(cache)
+    assert 'cannot write the track crossing cache' in capsys.readouterr().out
+    assert inputs.derived == reference_inputs.derived
+    _assert_same_crossings(inputs.crossings, reference_inputs.crossings)
+
+
+@pytest.mark.parametrize('stage', ['columns', 'rebuild'])
+def test_a_failed_allocation_while_reading_the_cache_is_a_miss(
+        db, tmp_path, computes, capsys, monkeypatch, stage):
+    cache = tmp_path / 'cache'
+    _lattice(db)
+    first, _ = _materialize_tracks(db, cache_directory=str(cache))
+    [cached] = _cache_files(cache)
+    kept = cached.stat().st_ino
+    calls = []
+
+    def exhausted(*args, **kwargs):
+        calls.append(1)
+        raise MemoryError('std::bad_alloc')
+    from vc_object_store import CollectionReader
+    with monkeypatch.context() as patch:
+        if stage == 'columns':
+            patch.setattr(CollectionReader, 'track_crossing_columns', exhausted)
+        else:
+            patch.setattr(osi, '_crossings_from_columns', exhausted)
+        again, _ = _materialize_tracks(db, cache_directory=str(cache))
+    # Both reads of the fit and the one before replacement failed: the fit
+    # computed its crossings, and the store nobody could read was replaced.
+    assert len(computes) == 2 and len(calls) == 3
+    assert 'ignoring invalid track crossing cache' in capsys.readouterr().out
+    _assert_same_crossings(again.crossings, first.crossings)
+    assert _cache_files(cache) == [cached] and cached.stat().st_ino != kept
+    third, _ = _materialize_tracks(db, cache_directory=str(cache))
+    assert len(computes) == 2
+    _assert_same_crossings(third.crossings, first.crossings)
+
+
+def test_a_good_store_published_meanwhile_is_not_replaced(db, tmp_path, computes, monkeypatch, capsys):
+    """The process holding the lock found a bad store and computed; a
+    process that could not lock published a good one in the meantime. The
+    replacement re-reads the destination first and keeps it."""
+    cache = tmp_path / 'cache'
+    _lattice(db)
+    first, _ = _materialize_tracks(db, cache_directory=str(tmp_path / 'first'))
+    [good] = _cache_files(tmp_path / 'first')
+    tracks, key = _cached_selection(db)
+    csr, sha256 = osi._load_track_crossings(str(good), key, tracks)
+    path = cache / osi.TRACK_CROSSING_CACHE_DIRECTORY / good.name
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b'not a store at all')
+    compute = osi._compute_track_crossings
+
+    def published_meanwhile(*args, **kwargs):
+        result = compute(*args, **kwargs)
+        path.write_bytes(good.read_bytes())  # the competitor's valid store
+        return result
+    monkeypatch.setattr(osi, '_compute_track_crossings', published_meanwhile)
+    again, _ = _materialize_tracks(db, cache_directory=str(cache))
+    monkeypatch.undo()
+    assert path.read_bytes() == good.read_bytes()  # kept, not rebuilt
+    assert 'cannot write' not in capsys.readouterr().out
+    _assert_same_crossings(again.crossings, first.crossings)
+    # The replace path itself: a bad destination goes, a good one stays.
+    osi._store_track_crossings(str(path), key, csr, sha256, tracks, replace=True)
+    assert path.read_bytes() == good.read_bytes()
+    path.write_bytes(b'not a store at all')
+    osi._store_track_crossings(str(path), key, csr, sha256, tracks, replace=True)
+    assert path.read_bytes() != b'not a store at all'
+    assert osi._load_track_crossings(str(path), key, tracks)[1] == sha256
 
 
 def test_a_process_that_waited_for_the_crossings_reads_them(db, tmp_path, computes, monkeypatch):

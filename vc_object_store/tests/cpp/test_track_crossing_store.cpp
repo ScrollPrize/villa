@@ -133,7 +133,8 @@ RawEdge rawEdge(uint32_t a, uint32_t b, int64_t localA = 1, int64_t localB = 2)
     return edge;
 }
 void rawImport(const fs::path& path, size_t shards, bool packed, std::vector<RawEdge> edges,
-               std::optional<ExtensionTable> table = trackCrossingExtension(info()), bool slim = true)
+               std::optional<ExtensionTable> table = trackCrossingExtension(info()), bool slim = true,
+               bool everyShard = false)
 {
     InitialImportOptions options;
     options.store.author = "test";
@@ -144,13 +145,15 @@ void rawImport(const fs::path& path, size_t shards, bool packed, std::vector<Raw
     for (size_t i = 0; i < shards; ++i) options.shards[i].objectIds = {1 + int64_t(i) * stride, int64_t(i + 1) * stride};
     if (table) options.extensions = {*table};
     if (packed) options.packed = PackedStoreOptions{};
+    // Every shard holds every edge: only possible without UUID routing.
+    options.uuidHashRouting = !everyShard;
     importInitialCollection(path, options, [](size_t, InitialShardImport&) {}, [&](size_t shard, InitialShardImport& writer) {
         bool done = false;
         writer.importEdges([&](std::vector<InitialCollectionEdge>& batch) {
             if (done) return false;
             done = true;
             for (const auto& edge : edges) {
-                if (uuidShardIndex(edge.uuid, shards) != shard) continue;
+                if (!everyShard && uuidShardIndex(edge.uuid, shards) != shard) continue;
                 InitialCollectionEdge out;
                 out.record.uuid = edge.uuid; out.record.kind = edge.kind;
                 out.record.aUuid = detail::formatUuid(edge.a); out.record.bUuid = detail::formatUuid(edge.b);
@@ -334,6 +337,52 @@ void readerScope(const fs::path& directory)
         sqlite3_close(db);
         require(rc == SQLITE_OK, "edit one shard's descriptor");
         requireFailure([&] { read(directory / "disagree" / "collection.vcobj"); }, "disagree");
+    }
+    // Shards that are not routed by edge UUID could each hold the same pair:
+    // one edge and its measurement in both shards, declared as two crossings.
+    {
+        const std::vector<RawEdge> one{rawEdge(1, 2)};
+        auto description = info(); description.crossings = 2;
+        rawImport(directory / "unrouted.vcobj", 2, true, one, trackCrossingExtension(description), true, true);
+        requireFailure([&] { read(directory / "unrouted.vcobj"); }, "routed by edge UUID");
+    }
+    // The root of several shards is a manifest: it is not taken for a data
+    // shard when it carries the table, and a data shard may not lack it.
+    {
+        auto description = info(); description.crossings = int64_t(good.size());
+        const auto raw = [&](const fs::path& file, const std::string& sql) {
+            sqlite3* db = nullptr;
+            require(sqlite3_open(file.string().c_str(), &db) == SQLITE_OK, "open a member database");
+            char* message = nullptr;
+            const auto rc = sqlite3_exec(db, sql.c_str(), nullptr, nullptr, &message);
+            const std::string what = message ? message : "";
+            sqlite3_free(message); sqlite3_close(db);
+            if (rc != SQLITE_OK) throw std::runtime_error("test SQL failed: " + what);
+        };
+        rawImport(directory / "bare-shard", 3, false, good, trackCrossingExtension(description));
+        raw(directory / "bare-shard" / "part-2.vcobj",
+            std::string("DELETE FROM edges; DROP TABLE ") + kTrackCrossingTable + "; DELETE FROM extension_tables");
+        requireFailure([&] { read(directory / "bare-shard" / "collection.vcobj"); }, "every data shard");
+        rawImport(directory / "full-root", 3, false, good, trackCrossingExtension(description));
+        const auto shard = (directory / "full-root" / "part-0.vcobj").string();
+        std::string definition; // the shard's own CREATE TABLE statement
+        {
+            sqlite3* db = nullptr;
+            require(sqlite3_open(shard.c_str(), &db) == SQLITE_OK, "open a shard");
+            {
+                detail::Statement sql(db, std::string("SELECT sql FROM sqlite_schema WHERE name='") + kTrackCrossingTable + "'");
+                require(sql.row(), "the shard has the table");
+                definition = sql.text(0);
+            }
+            sqlite3_close(db);
+        }
+        raw(directory / "full-root" / "collection.vcobj",
+            "ATTACH '" + shard + "' AS shard;"
+            "CREATE TABLE IF NOT EXISTS main.extension_tables AS SELECT * FROM shard.extension_tables;"
+            "INSERT INTO main.extension_tables SELECT * FROM shard.extension_tables WHERE NOT EXISTS (SELECT 1 FROM main.extension_tables);"
+            "INSERT OR IGNORE INTO main.table_directory SELECT * FROM shard.table_directory;"
+            + definition + ";");
+        requireFailure([&] { read(directory / "full-root" / "collection.vcobj"); }, "manifest-only root");
     }
     // Not a crossing cache at all: an editable, history-on store, and an overlay over a cache.
     {

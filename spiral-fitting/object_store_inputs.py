@@ -1577,7 +1577,8 @@ TRACK_CROSSING_CACHE_DIRECTORY = os.path.join('track_crossings', 'v2')
 TRACK_CROSSING_CACHE_FORMAT = 2
 # What reading or writing a crossing cache store raises, the store's native
 # errors included: a miss, or a cache left unwritten; never a failed fit.
-TRACK_CROSSING_STORE_ERRORS = (OSError, RuntimeError, ValueError, KeyError, TypeError)
+TRACK_CROSSING_STORE_ERRORS = (OSError, RuntimeError, ValueError, KeyError, TypeError,
+                               MemoryError)  # a failed allocation, the store's included
 # Stored track coordinates the crossing kernel can index: [0, 2**20).
 TRACK_COORDINATE_LIMIT = 1 << 20
 
@@ -1793,23 +1794,37 @@ def _crossings_from_columns(columns, uuids):
         pair = np.ascontiguousarray(column, dtype=np.uint8).reshape(-1, 16).view('>u8')
         return pair[:, 0].astype(np.uint64), pair[:, 1].astype(np.uint64)
     high, low = halves(uuids)
-    order = np.lexsort((low, high))
-    high, low = high[order], low[order]
-    # Rows are found by the high half; tracks sharing one (not seen in
-    # random UUIDs) are told apart by walking on while the low half is behind.
-    shared = int(np.count_nonzero(high[1:] == high[:-1]))
+    # Every lookup is a binary search of whole UUIDs. Halves are ranked
+    # among the tracks' own, so a (high, low) pair is one integer key that
+    # orders like the UUID; UUIDs sharing a half cost nothing extra.
+    highs, high_rank = np.unique(high, return_inverse=True)
+    lows, low_rank = np.unique(low, return_inverse=True)
+    names = high_rank.astype(np.int64) * len(lows) + low_rank
+    order = np.argsort(names, kind='stable')
+    names = names[order]
+
+    def rank(values, wanted):
+        found = np.searchsorted(values, wanted)
+        known = found < len(values)
+        known[known] = values[found[known]] == wanted[known]
+        return found, known
+
+    distinct = len(highs) == count  # the usual case: no two tracks share a high half
+    high_order = np.argsort(high, kind='stable') if distinct else None
 
     def rows_of(column):
         wanted_high, wanted_low = halves(column)
-        found = np.searchsorted(high, wanted_high)
-        for _ in range(shared):
-            behind = (found < count - 1) & (high[np.minimum(found, count - 1)] == wanted_high) \
-                & (low[np.minimum(found, count - 1)] < wanted_low)
-            if not behind.any():
-                break
-            found = found + behind
-        if len(found) and (found.max() >= count or not np.array_equal(high[found], wanted_high)
-                           or not np.array_equal(low[found], wanted_low)):
+        if distinct:  # the high half finds the row; the low half confirms it
+            found, known = rank(highs, wanted_high)
+            rows = high_order[np.minimum(found, count - 1)] if count else found
+            if not (known.all() and np.array_equal(low[rows], wanted_low)):
+                raise ValueError('it names a track that is not selected')
+            return rows
+        (high_rank, high_known), (low_rank, low_known) = rank(highs, wanted_high), rank(lows, wanted_low)
+        known = high_known & low_known
+        wanted = np.where(known, high_rank.astype(np.int64) * len(lows) + low_rank, -1)
+        found, named = rank(names, wanted)
+        if not (known & named).all():
             raise ValueError('it names a track that is not selected')
         return order[found]
     a, b = rows_of(columns['a']), rows_of(columns['b'])
@@ -1831,7 +1846,7 @@ def _crossing_store_workers(workers, limit=32):
     return max(1, min(limit, int(workers or os.cpu_count() or 1)))
 
 
-def _load_track_crossings(path, key, tracks, workers=None):
+def _load_track_crossings(path, key, tracks, workers=None, *, warn=True):
     """``(CSR in stored voxels, its sha256)`` the crossing store at ``path``
     holds for ``key`` over ``tracks`` (ordered), or None. A missing store is
     a miss; so is one that cannot be read, is of another key, algorithm or
@@ -1857,7 +1872,8 @@ def _load_track_crossings(path, key, tracks, workers=None):
         if sha256 != info['checksum']:
             raise ValueError('its crossings do not match its checksum')
     except TRACK_CROSSING_STORE_ERRORS as error:
-        print(f'WARNING: ignoring invalid track crossing cache {path}: {error}')
+        if warn:
+            print(f'WARNING: ignoring invalid track crossing cache {path}: {error}')
         return None
     return csr, sha256
 
@@ -1869,14 +1885,19 @@ def _store_track_crossings(path, key, csr, sha256, tracks, position=None, *, rep
     row per pair, built with the sharded streaming importer), recording
     ``key``, the CSR's checksum and the store ``position`` the tracks were
     read at. A store already there is left alone, unless ``replace``: the
-    caller holds the cache's lock and found that store unusable. Nothing a
-    cache cannot do fails the fit: the computed crossings stay in use."""
+    caller holds the cache's lock and found that store unusable. It is then
+    read once more, here, immediately before it would be deleted: a process
+    that could not take the lock may have published a good one since, which
+    is kept. Nothing a cache cannot do fails the fit: the computed crossings
+    stay in use."""
     from tracks import TRACK_CROSSING_ALGORITHM, TRACK_CROSSING_PARAMETERS
+    absent = False  # the destination was ours to write
     try:
         if os.path.lexists(path):
-            if not replace:
+            if not replace or _load_track_crossings(path, key, tracks, workers, warn=False):
                 return
             os.remove(path)
+        absent = True
         columns = _crossing_columns(csr, _track_uuid_bytes(tracks))
         if columns is None:
             print(f'WARNING: not caching the track crossings at {path}: they are not one '
@@ -1893,7 +1914,7 @@ def _store_track_crossings(path, key, csr, sha256, tracks, position=None, *, rep
         write_track_crossing_store(path, *columns, info,
                                    workers=_crossing_store_workers(workers, limit=8))
     except TRACK_CROSSING_STORE_ERRORS as error:
-        if not os.path.lexists(path):  # else another process published it meanwhile
+        if not (absent and os.path.lexists(path)):  # else another process published it meanwhile
             print(f'WARNING: cannot write the track crossing cache {path}: {error}')
 
 

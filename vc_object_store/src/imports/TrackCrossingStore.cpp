@@ -69,20 +69,34 @@ std::vector<std::optional<ExtensionTableInfo>> cacheShape(const ObjectCollection
     }
     if (roots != 1 || parts.size() != members.size())
         throw std::invalid_argument("track crossing store must be one root with its own partitions");
+    // A store of several shards has a manifest-only root, which holds no
+    // table and no rows; a store of one shard is its own root. Every data
+    // shard carries the table, and in a store of several each owns exactly
+    // the edges whose UUID hashes to it: the importer's routing, which is
+    // what makes an edge found in its shard the only one of that UUID.
+    const size_t shards = parts.size() == 1 ? 1 : parts.size() - 1;
     std::vector<std::optional<ExtensionTableInfo>> tables(parts.size());
     const ExtensionTableInfo* first = nullptr;
-    size_t manifests = 0;
+    std::vector<unsigned char> owned(shards, 0);
     for (size_t n = 0; n < parts.size(); ++n) {
         tables[n] = detail::extensionTable(parts[n].db, kTrackCrossingTable);
-        if (!tables[n]) {
-            // Only the manifest of several shards may lack the table, and it holds no edges.
+        if (parts.size() > 1 && !parts[n].member.partition) {
             detail::Statement count(parts[n].db, "SELECT count(*) FROM edges");
             count.row();
-            if (parts.size() == 1 || ++manifests > 1 || count.i64(0) != 0)
-                throw std::invalid_argument("store has no track crossing table in every data shard");
+            if (tables[n] || count.i64(0) != 0)
+                throw std::invalid_argument("track crossing store of several shards must have a manifest-only root");
             continue;
         }
+        if (!tables[n]) throw std::invalid_argument("store has no track crossing table in every data shard");
         requireShape(*tables[n]);
+        if (parts.size() > 1) {
+            const KeyRoute* route = nullptr;
+            size_t routes = 0;
+            for (const auto& candidate : parts[n].uuidRoutes)
+                if (candidate.keySpace == "edges.uuid") { route = &candidate; ++routes; }
+            if (routes != 1 || route->divisor != shards || route->remainder >= shards || owned[route->remainder]++)
+                throw std::invalid_argument("track crossing shards must be routed by edge UUID, each owning one residue");
+        }
         if (first && (Json::parse(first->provisioning) != Json::parse(tables[n]->provisioning) || first->basedOn != tables[n]->basedOn))
             throw std::invalid_argument("track crossing shards disagree on their provisioning");
         if (!first) first = &*tables[n];
