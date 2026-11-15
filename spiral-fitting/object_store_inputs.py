@@ -1888,12 +1888,17 @@ def materialize_tracks(store, snapshot, *, z_begin, z_end,
     if problems:
         raise ObjectStoreInputError(problems)
     if cached is None:
+        started = time.monotonic()
         csr = _compute_track_crossings(tracks, selection, rows, workers)
         sha256 = crossing_csr_sha256(csr)
         if cache_path is not None:
             _store_track_crossings(cache_path, key, csr, sha256)
+        print(f'track crossings: {len(csr["partners"]) // 2} computed from '
+              f'{len(tracks)} tracks in {time.monotonic() - started:.1f} s')
     else:
         csr, sha256 = cached
+        print(f'track crossings: {len(csr["partners"]) // 2} read from the cache '
+              f'{cache_path}')
     del selection
     derived = _track_crossing_provenance(csr, sha256)
     # Stored voxels -> fit voxels, by each row's (its group's) frame.
