@@ -773,6 +773,7 @@ def load_or_build_volume_meshes(
                 if isinstance(rep, Mapping) and rep.get("type") == "tifxyz-normalized":
                     tif_url = _extract_s3_url(rep)
                     if tif_url:
+                        coord_scale = float((seg.get("properties") or {}).get("original_volume_downscale", 1.0))
                         break
             if tif_url is None:
                 for rep in reps:
