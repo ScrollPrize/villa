@@ -6,6 +6,7 @@
 
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -526,6 +527,34 @@ int main()
             vcr::grid::load(more);
             r = vcr::grid::sampleCached(along, view, nullptr);
             require(r.level[0] == 0 && near(r.values[0], value(1, 1.5f, 10), 1e-3f), "a surface frame completes too");
+        }
+
+        // Many layers at once give each layer the bits it has alone: eight or more layers
+        // of a pixel may be sampled together, fewer are sampled one by one. A tilted plane
+        // through and beside the volume, so groups lie inside one chunk, across chunks
+        // and outside the volume.
+        {
+            const vcr::grid::Plane tilted{{3.3f, 1.2f, 2.1f}, {0.8f, 0.6f, 0}, {-0.36f, 0.48f, 0.8f}, {0.48f, -0.64f, 0.6f}, 24, 24};
+            vcr::grid::Request together;
+            together.levels = {L0};
+            together.offsets.clear();
+            for (int k = 0; k < 21; ++k)
+                together.offsets.push_back(-2.75f + 0.25f * float(k));
+            together.offsets[11] = 0.0f;
+            const auto all = vcr::grid::sample(tilted, together);
+            require(all.layers == 21 && all.values.size() == std::size_t(21 * 24 * 24), "many-layer result shape");
+            std::size_t inside = 0;
+            for (std::size_t k = 0; k < together.offsets.size(); ++k) {
+                vcr::grid::Request alone;
+                alone.levels = {L0};
+                alone.offsets = {together.offsets[k]};
+                const auto one = vcr::grid::sample(tilted, alone);
+                require(std::memcmp(one.values.data(), all.values.data() + k * 24 * 24, 24 * 24 * sizeof(float)) == 0,
+                        "a layer sampled with others has the bits it has alone");
+                for (const float v : one.values)
+                    inside += v > 0;
+            }
+            require(inside > 1000, "the many-layer case samples inside the volume");
         }
 
         // Placement maps: scale form when axis aligned, otherwise general.
