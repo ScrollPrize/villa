@@ -1011,6 +1011,103 @@ void trackDatasetGroups()
     refused({{"u0", "/d", "7", "diagonal"}}, "invalid stored track family");
 }
 
+// A relationship subset enumerates exactly its objects' links; every object
+// is selected once; a track that declares no dataset is still selectable.
+void selectedRelationshipSubset(HistoryMode mode)
+{
+    TemporaryDirectory dir;
+    auto store = ObjectStore::create(dir.path / "store.vcobj", options(mode));
+    const std::string a = util::newUuid(), b = util::newUuid(), c = util::newUuid(), d = util::newUuid(),
+                      placeholder = util::newUuid();
+    std::string ab, cd;
+    {
+        auto w = store.write();
+        for (const auto& id : {a, b, c, d}) { store.upsertObject(w, track(id)); store.putGeometry(w, id, shape()); }
+        ObjectRecord bare; bare.uuid = placeholder; bare.kind = "track";
+        store.upsertObject(w, bare);
+        const auto link = [&](const std::string& from, const std::string& to) {
+            EdgeRecord e; e.kind = "declared_reference"; e.aUuid = from; e.bUuid = to;
+            e.aAnchor.wholeGeometry = e.bAnchor.wholeGeometry = true;
+            return store.addEdge(w, e);
+        };
+        ab = link(a, b); cd = link(c, d);
+        w.commit();
+    }
+    ObjectVersion first;
+    {
+        auto r = store.read(); LocalStoreReader reader(store, r);
+        const auto position = reader.status();
+        std::vector<ObjectVersion> refs;
+        for (const auto& id : {a, b, c, d, placeholder}) refs.push_back(store.currentObjectRevision(r, id)->reference());
+        first = refs[0];
+        const auto links = [&](const std::optional<std::vector<ObjectVersion>>& subset) {
+            std::set<std::string> uuids;
+            const auto selected = reader.selectedInputs(refs, position, subset);
+            require(selected.objects.size() == refs.size(), "a relationship subset returns every selected object");
+            for (const auto& link : selected.relationships) uuids.insert(link.relationship.record.uuid);
+            return uuids;
+        };
+        require(links(std::nullopt) == std::set{ab, cd} && links(std::vector<ObjectVersion>{}).empty()
+                    && links(std::vector{refs[0]}) == std::set{ab} && links(std::vector{refs[3], refs[2]}) == std::set{cd}
+                    && links(std::vector{refs[4]}).empty(),
+                "a relationship subset enumerates its objects' links, and no link among the others");
+        const auto selected = reader.selectedInputs(refs, position);
+        require(selected.trackDatasets.objects.size() == refs.size() && selected.trackDatasets.of(0)
+                    && !selected.trackDatasets.of(4),
+                "a track that declares no dataset is selected, without one");
+    }
+    { auto w = store.write(); store.setMeta(w, a, "quality", "8"); w.commit(); }
+    {
+        auto r = store.read(); LocalStoreReader reader(store, r);
+        const auto second = store.currentObjectRevision(r, a)->reference();
+        require(second.version != first.version, "the edit numbered another version");
+        // History-off stores do not retain the first; either way one
+        // selection never holds two states of an object.
+        mustFail([&] { reader.selectedInputs({first, second}, reader.status(), std::vector<ObjectVersion>{}); });
+        mustFail([&] { reader.selectedInputs({second, second}, reader.status(), std::vector<ObjectVersion>{}); });
+    }
+}
+
+// A partition of a store resolves its tracks' datasets beside itself, as the
+// track-track detector (resolveStoragePath) does, not beside the manifest.
+void selectedTrackDatasetsOfPartitions()
+{
+    TemporaryDirectory dir;
+    auto opt = options(HistoryMode::Off);
+    const auto owner = util::newUuid(), lineage = util::newUuid();
+    std::vector<std::filesystem::path> shards;
+    std::vector<std::string> ids;
+    for (int i = 0; i < 2; ++i) {
+        auto shard = opt; shard.creationStoreUuid = owner; shard.creationGeneration = lineage;
+        shard.objectIdRange = {1 + i * 100, 100 + i * 100};
+        const auto directory = dir.path / (i ? "b" : "a");
+        std::filesystem::create_directories(directory);
+        shards.push_back(directory / "part.vcobj");
+        auto store = ObjectStore::create(shards.back(), shard);
+        auto w = store.write();
+        ids.push_back(util::newUuid());
+        auto record = track(ids.back()); record.track->datasetRef = "tracks.vctracks";
+        store.upsertObject(w, record); store.putGeometry(w, ids.back(), shape()); w.commit();
+        auto seal = store.write(); store.seal(seal); seal.commit();
+    }
+    std::filesystem::create_directories(dir.path / "root");
+    const auto manifest = dir.path / "root" / "index.vcobj";
+    { auto collection = ObjectCollection::publishShards(manifest, shards, opt); }
+    auto readOnly = opt; readOnly.readOnly = true;
+    auto store = ObjectStore::open(manifest, readOnly);
+    auto r = store.read(); LocalStoreReader reader(store, r);
+    std::vector<ObjectVersion> refs;
+    for (const auto& id : ids) refs.push_back(store.currentObjectRevision(r, id)->reference());
+    require(refs[0].storeUuid == refs[1].storeUuid, "the partitions are one logical store");
+    const auto selected = reader.selectedInputs(refs, reader.status());
+    const auto& datasets = selected.trackDatasets;
+    require(datasets.of(0) && datasets.of(1) && *datasets.of(0) != *datasets.of(1)
+                && *datasets.of(0) == trackDatasetIdentity(*store.resolveStoragePath(r, ids[0]))
+                && *datasets.of(1) == trackDatasetIdentity(*store.resolveStoragePath(r, ids[1]))
+                && *datasets.of(0) == std::filesystem::weakly_canonical(dir.path / "a" / "tracks.vctracks").generic_string(),
+            "a selection resolves each partition's dataset as the detector does");
+}
+
 void selectedGraphCapture(HistoryMode mode)
 {
     Fixture f(mode, mode);
@@ -1047,15 +1144,22 @@ void selectedGraphCapture(HistoryMode mode)
             // The inherited tracks' dataset is beside the store that owns
             // them, as the detector resolves it; it travels with the answer.
             const auto dataset = trackDatasetIdentity(*store.resolveStoragePath(r, f.a));
-            require(selected.trackDatasets == std::map<std::string, std::string>{
-                            {f.a, dataset}, {f.b, trackDatasetIdentity(*store.resolveStoragePath(r, f.b))}}
+            const auto& datasets = selected.trackDatasets;
+            require(datasets.objects.size() == 2 && datasets.of(0) && datasets.of(1) && *datasets.of(0) == dataset
+                        && *datasets.of(1) == trackDatasetIdentity(*store.resolveStoragePath(r, f.b))
                         && dataset == std::filesystem::weakly_canonical(f.base.parent_path() / f.a).generic_string()
-                        && none.trackDatasets == selected.trackDatasets,
+                        && none.trackDatasets == datasets,
                     "selected tracks come with the dataset their owning store resolves");
-            require(selectedInputsFromJson(selectedInputsToJson(status, selected)).trackDatasets == selected.trackDatasets
+            require(selectedInputsFromJson(selectedInputsToJson(status, selected)).trackDatasets == datasets
                         && !nlohmann::json::parse(selectedInputsToJson(status, SelectedInputs{}))["inputs"].contains("track_datasets")
-                        && selectedInputsFromJson(selectedInputsToJson(status, SelectedInputs{})).trackDatasets.empty(),
+                        && selectedInputsFromJson(selectedInputsToJson(status, SelectedInputs{})).trackDatasets == TrackDatasets{},
                     "track datasets travel with the selection, and are absent without tracks");
+            for (const char* bad : {"index", "count"}) {
+                auto malformed = nlohmann::json::parse(selectedInputsToJson(status, selected));
+                auto& indices = malformed["inputs"]["track_datasets"]["objects"];
+                if (std::string_view(bad) == "index") indices[0] = 7; else indices.push_back(0);
+                mustFail([&] { selectedInputsFromJson(malformed.dump()); });
+            }
         }
         auto obsolete = nlohmann::json::parse(request);
         obsolete["position"]["sequence"] = status.commitSequence;
@@ -1174,6 +1278,8 @@ int main()try{
     }
     for(const auto mode:{HistoryMode::Off,HistoryMode::On})postFusionSelectedState(mode);
     trackDatasetGroups();
+    selectedRelationshipSubset(HistoryMode::On); selectedRelationshipSubset(HistoryMode::Off);
+    selectedTrackDatasetsOfPartitions();
     selectedGraphCapture(HistoryMode::On); selectedGraphCapture(HistoryMode::Off);
     fittingRelationshipPolicy();
     for (const auto mode : {HistoryMode::Off, HistoryMode::On}) unifiedExpectations(mode);

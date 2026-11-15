@@ -22,9 +22,13 @@ SelectedInputs LocalStoreReader::selectedInputs(const std::vector<ObjectVersion>
         (inherited && before.commitSequence != position.commitSequence))
         throw StoreBusy("selected inputs: requested graph position is no longer available");
     SelectedInputs result;
-    const auto records = objectsAtVersions(refs);
+    const auto records = store_->objectsAtVersions(*txn_, refs, result.trackDatasets);
+    std::set<std::string> objects;
     for (size_t i = 0; i < refs.size(); ++i) {
         if (!records[i] || records[i]->deleted) throw std::invalid_argument("selected object is not retained: " + refs[i].objectUuid);
+        // Whichever relationships are read: one state of an object.
+        if (!objects.insert(records[i]->objectUuid).second)
+            throw std::invalid_argument("object history: object selected twice: " + records[i]->objectUuid);
         result.objects.push_back(*records[i]);
     }
     if (relationshipVersions) {
@@ -39,7 +43,6 @@ SelectedInputs LocalStoreReader::selectedInputs(const std::vector<ObjectVersion>
                 throw std::invalid_argument("selected inputs: relationships requested of an unselected object: " + ref.objectUuid);
     }
     result.relationships = relationshipsAt(relationshipVersions ? *relationshipVersions : refs);
-    result.trackDatasets = store_->trackDatasets(*txn_, result.objects);
     return result;
 }
 

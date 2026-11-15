@@ -8,15 +8,18 @@
 #include <cstdint>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace vc::objects {
 
+// Views of the caller's strings (millions of tracks share a few dataset
+// names): they must outlive the call.
 struct TrackDatasetRow {
-    std::string uuid;
-    std::string dataset;      // trackDatasetIdentity (ObjectStore::trackDatasets)
-    std::string externalKey;  // the track's canonical decimal source ID
-    std::string family;       // "horizontal", "vertical" or "" (no crossings)
+    std::string_view uuid;
+    std::string_view dataset;      // trackDatasetIdentity (SelectedInputs::trackDatasets)
+    std::string_view externalKey;  // the track's canonical decimal source ID
+    std::string_view family;       // "horizontal", "vertical" or "" (no crossings)
 };
 
 struct TrackDatasetGroup {

@@ -194,13 +194,28 @@ struct SelectedRelationship {
     bool applicable = false;
 };
 
+// The datasets of selected objects, interned: millions of tracks name a
+// handful of datasets. A dataset is a trackDatasetIdentity.
+struct TrackDatasets {
+    std::vector<std::string> datasets;  // the distinct datasets, in first-use order
+    // Per selected object, in selection order: its dataset's index, or -1 for
+    // an object that names none (not a track, or a track that declares no
+    // dataset_ref). Empty when no selected object names one.
+    std::vector<int32_t> objects;
+    // The dataset of selected object `index`, or nullptr.
+    const std::string* of(size_t index) const
+    {
+        return index < objects.size() && objects[index] >= 0 ? &datasets[size_t(objects[index])] : nullptr;
+    }
+    bool operator==(const TrackDatasets&) const = default;
+};
+
 // One selected graph input: exact records plus the relationships between them.
 struct SelectedInputs {
     std::vector<ObjectRevision> objects;
     std::vector<SelectedRelationship> relationships;
-    // The dataset of each selected track, by object UUID
-    // (ObjectStore::trackDatasets): what its crossings are grouped by.
-    std::map<std::string, std::string> trackDatasets;
+    // The dataset of each selected track: what its crossings are grouped by.
+    TrackDatasets trackDatasets;
 };
 
 // The identity of a track dataset at a resolved path: the path with its
@@ -884,11 +899,14 @@ public:
     std::optional<std::filesystem::path> resolveStoragePath(
         const Txn& txn, const std::string& objectUuid,
         const std::optional<std::filesystem::path>& datasetRoot = std::nullopt) const;
-    // The dataset (trackDatasetIdentity) of every track among these exact
-    // states, by object UUID: the directory of the store that owns the state
-    // / the dataset_ref it records there. Other kinds are skipped; a track
-    // without a dataset_ref, or whose owning store is not open, throws.
-    std::map<std::string, std::string> trackDatasets(const Txn&, const std::vector<ObjectRevision>&) const;
+    // objectsAtVersions, with the dataset (trackDatasetIdentity) of every
+    // track among the answers: the directory of the physical store (of a
+    // partitioned store, the partition) that holds that exact state / the
+    // dataset_ref the state records. As resolveStoragePath resolves a
+    // track's current state, so the track-track detector and a selection
+    // agree on what one dataset is.
+    std::vector<std::optional<ObjectRevision>> objectsAtVersions(const Txn&, const std::vector<ObjectVersion>&,
+                                                                 TrackDatasets& datasets) const;
     void validateExportDestination(const Txn&, const std::filesystem::path&) const;
 
     // Flush the WAL into the main DB file (safe copying). Must not be

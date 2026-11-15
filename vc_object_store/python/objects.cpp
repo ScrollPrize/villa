@@ -97,13 +97,12 @@ nb::dict selectedInputsToPy(const vo::SelectedInputs& selected)
     for (const auto& object : selected.objects) objects.append(objectRevisionToPy(object));
     nb::dict result; result["objects"] = objects; result["relationships"] = relationshipsToPy(selected.relationships);
     // Millions of tracks name a handful of datasets: one str per dataset.
+    std::vector<nb::str> names;
+    for (const auto& dataset : selected.trackDatasets.datasets) names.emplace_back(dataset.c_str(), dataset.size());
     nb::dict datasets;
-    std::map<std::string, nb::str> names;
-    for (const auto& [uuid, dataset] : selected.trackDatasets) {
-        auto name = names.find(dataset);
-        if (name == names.end()) name = names.emplace(dataset, nb::str(dataset.c_str(), dataset.size())).first;
-        datasets[uuid.c_str()] = name->second;
-    }
+    for (size_t index = 0; index < selected.trackDatasets.objects.size(); ++index)
+        if (const auto dataset = selected.trackDatasets.objects[index]; dataset >= 0)
+            datasets[selected.objects[index].objectUuid.c_str()] = names[size_t(dataset)];
     result["track_datasets"] = datasets;
     return result;
 }
@@ -1036,13 +1035,20 @@ NB_MODULE(_native, m)
         }
         return nb::make_tuple(selected, exclusions);
     }, nb::arg("relationships"), nb::arg("endpoint_kinds"), nb::arg("approved_only") = false);
-    m.def("group_track_datasets", [](const std::vector<std::string>& uuids, const std::vector<std::string>& datasets,
+    m.def("group_track_datasets", [](const std::vector<std::string>& uuids, const nb::list& datasets,
                                      const std::vector<std::string>& externalKeys, const std::vector<std::string>& families) {
         if (datasets.size() != uuids.size() || externalKeys.size() != uuids.size() || families.size() != uuids.size())
             throw std::invalid_argument("group_track_datasets: the columns differ in length");
+        // Tracks share their dataset's str (selected_inputs' track_datasets):
+        // each distinct one is converted once.
+        std::map<PyObject*, std::string> names;
         std::vector<vo::TrackDatasetRow> rows(uuids.size());
-        for (size_t row = 0; row < rows.size(); ++row)
-            rows[row] = {uuids[row], datasets[row], externalKeys[row], families[row]};
+        for (size_t row = 0; row < rows.size(); ++row) {
+            const nb::handle dataset = datasets[row];
+            auto name = names.find(dataset.ptr());
+            if (name == names.end()) name = names.emplace(dataset.ptr(), nb::cast<std::string>(dataset)).first;
+            rows[row] = {uuids[row], name->second, externalKeys[row], families[row]};
+        }
         std::vector<vo::TrackDatasetGroup> groups;
         { nb::gil_scoped_release release; groups = vo::groupTrackDatasets(rows); }
         const auto bytes = [](const auto& values) {

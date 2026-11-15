@@ -30,14 +30,6 @@ void ObjectStore::validateExportDestination(const Txn& txn, const std::filesyste
 }
 
 namespace {
-// Where a store's relative source locators start: the directory of its file.
-std::filesystem::path storeDirectory(sqlite3* source)
-{
-    namespace fs = std::filesystem;
-    fs::path ownerPath = sqlite3_db_filename(source, "main");
-    if (isPackedDatabasePath(ownerPath)) ownerPath = packedContainerPath(ownerPath);
-    return fs::absolute(ownerPath).parent_path();
-}
 // A track's dataset: its dataset_ref below the root its owning store resolves
 // source locators from.
 std::filesystem::path trackDatasetPath(const std::filesystem::path& root, const std::string& datasetRef)
@@ -46,39 +38,43 @@ std::filesystem::path trackDatasetPath(const std::filesystem::path& root, const 
 }
 }
 
+std::filesystem::path detail::storeDirectory(sqlite3* source)
+{
+    namespace fs = std::filesystem;
+    fs::path ownerPath = sqlite3_db_filename(source, "main");
+    if (isPackedDatabasePath(ownerPath)) ownerPath = packedContainerPath(ownerPath);
+    return fs::absolute(ownerPath).parent_path();
+}
+
 std::string trackDatasetIdentity(const std::filesystem::path& resolved)
 {
     return std::filesystem::weakly_canonical(resolved).generic_string();
 }
 
-std::map<std::string, std::string> ObjectStore::trackDatasets(const Txn& txn, const std::vector<ObjectRevision>& revisions) const
+void detail::TrackDatasetResolver::append(const std::optional<ResolvedObjectVersion>& resolved)
 {
-    auto* db = static_cast<sqlite3*>(connection(txn));
-    std::map<std::string, std::filesystem::path> roots;  // by owning store
-    bool listed = false;
-    // One filesystem resolution per (owning store, dataset_ref), not per track.
-    std::map<std::pair<std::string, std::string>, std::string> resolved;
-    std::map<std::string, std::string> result;
-    for (const auto& revision : revisions) {
-        const auto& record = revision.record;
-        if (record.kind != "track") continue;
-        if (!record.track || record.track->datasetRef.empty())
-            throw std::runtime_error("track has no dataset_ref: " + record.uuid);
-        const std::pair key{revision.storeUuid, record.track->datasetRef};
-        auto found = resolved.find(key);
-        if (found == resolved.end()) {
-            if (!listed) {
-                for (auto* source : querySources(db)) roots.emplace(storeUuidText(source), storeDirectory(source));
-                listed = true;
+    int32_t index = -1;
+    if (resolved && resolved->revision.record.kind == "track" && resolved->revision.record.track
+        && !resolved->revision.record.track->datasetRef.empty()) {
+        const std::pair key{resolved->source, resolved->revision.record.track->datasetRef};
+        auto found = resolved_.find(key);
+        if (found == resolved_.end()) {
+            const auto identity = trackDatasetIdentity(trackDatasetPath(storeDirectory(key.first), key.second));
+            auto known = identities_.find(identity);
+            if (known == identities_.end()) {
+                known = identities_.emplace(identity, int32_t(out_.datasets.size())).first;
+                out_.datasets.push_back(identity);
             }
-            const auto root = roots.find(revision.storeUuid);
-            if (root == roots.end())
-                throw std::runtime_error("track's owning store is not open: " + record.uuid);
-            found = resolved.emplace(key, trackDatasetIdentity(trackDatasetPath(root->second, key.second))).first;
+            found = resolved_.emplace(key, known->second).first;
         }
-        result[record.uuid] = found->second;
+        index = found->second;
     }
-    return result;
+    out_.objects.push_back(index);
+}
+
+void detail::TrackDatasetResolver::finish()
+{
+    if (out_.datasets.empty()) out_.objects.clear();
 }
 
 std::optional<std::filesystem::path> ObjectStore::resolveStoragePath(

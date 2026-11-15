@@ -44,36 +44,42 @@ detail::Detection detail::detectTracksToTracks(StoredGeometry& inputs, const Tra
         checkCancelled(cancel);
         // The registered tracks, with the dataset each belongs to.
         auto selected = inputs.select("track", params.trackUuids);
-        std::vector<objects::TrackDatasetRow> registered;
-        registered.reserve(selected.size());
+        std::set<std::string> datasetNames;
+        std::vector<const std::string*> datasetOf;
+        datasetOf.reserve(selected.size());
         for (const auto& object : selected) {
             if (!object.track || object.track->datasetRef.empty())
                 throw std::runtime_error("track has no dataset_ref: " + object.uuid);
-            registered.push_back({object.uuid, inputs.sourcePath(object).generic_string(),
-                                  object.track->externalKey, object.track->family});
+            datasetOf.push_back(&*datasetNames.insert(inputs.sourcePath(object).generic_string()).first);
         }
         if (!params.datasetRef.empty()) {
             const auto requested = std::filesystem::weakly_canonical(params.datasetRef).generic_string();
             // A raw spelling identifies its whole resolved group, including
             // inherited/overridden peers whose locators were rebased.
-            std::set<std::string> matching;
+            std::set<const std::string*> matching;
             for (size_t row = 0; row < selected.size(); ++row)
-                if (registered[row].dataset == requested || selected[row].track->datasetRef == params.datasetRef)
-                    matching.insert(registered[row].dataset);
+                if (*datasetOf[row] == requested || selected[row].track->datasetRef == params.datasetRef)
+                    matching.insert(datasetOf[row]);
             std::vector<objects::ObjectRecord> keptObjects;
-            std::vector<objects::TrackDatasetRow> keptRows;
+            std::vector<const std::string*> keptDatasets;
             for (size_t row = 0; row < selected.size(); ++row) {
-                if (matching.contains(registered[row].dataset)) {
+                if (matching.contains(datasetOf[row])) {
                     keptObjects.push_back(std::move(selected[row]));
-                    keptRows.push_back(std::move(registered[row]));
+                    keptDatasets.push_back(datasetOf[row]);
                 } else if (!params.trackUuids.empty()) {
                     throw std::runtime_error("selected track is outside dataset_ref");
                 }
             }
             if (keptObjects.empty()) throw std::runtime_error("no registered tracks for dataset_ref: " + params.datasetRef);
             selected = std::move(keptObjects);
-            registered = std::move(keptRows);
+            datasetOf = std::move(keptDatasets);
         }
+        // Views of the records that stay in `selected` from here on.
+        std::vector<objects::TrackDatasetRow> registered;
+        registered.reserve(selected.size());
+        for (size_t row = 0; row < selected.size(); ++row)
+            registered.push_back({selected[row].uuid, *datasetOf[row], selected[row].track->externalKey,
+                                  selected[row].track->family});
 
         // Grouping, source-ID order and their validation are the shared
         // preparation (objects::groupTrackDatasets).

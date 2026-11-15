@@ -626,7 +626,9 @@ std::string selectedInputsToJson(const StoreStatus& status, const SelectedInputs
         relationships.push_back({{"relationship", relationshipJson(edge.relationship)}, {"applicable", edge.applicable}});
     auto inputs_ = Json{{"objects", records}, {"relationships", relationships}};
     // Absent without selected tracks, as from a server that predates it.
-    if (!inputs.trackDatasets.empty()) inputs_["track_datasets"] = inputs.trackDatasets;
+    // A table and, per object, an index into it (-1: none).
+    if (!inputs.trackDatasets.datasets.empty())
+        inputs_["track_datasets"] = {{"datasets", inputs.trackDatasets.datasets}, {"objects", inputs.trackDatasets.objects}};
     return envelope(status, "inputs", inputs_).dump();
 }
 std::string selectedInputsRequestToJson(const std::vector<ObjectVersion>& refs, const StoreStatus& position,
@@ -655,8 +657,20 @@ SelectedInputs selectedInputsFromJson(const std::string& text)
     for (const auto& edge : jsonArrayField(data, "relationships"))
         result.relationships.push_back({relationshipFrom(edge.at("relationship")), edge.at("applicable").get<bool>()});
     orderRelationships(result.relationships);
-    if (data.contains("track_datasets"))
-        result.trackDatasets = data.at("track_datasets").get<std::map<std::string, std::string>>();
+    if (data.contains("track_datasets")) {
+        const auto& datasets = data.at("track_datasets");
+        requireKeys(datasets, {"datasets", "objects"}, "selected inputs track datasets");
+        for (const auto& dataset : jsonArrayField(datasets, "datasets"))
+            result.trackDatasets.datasets.push_back(dataset.get<std::string>());
+        for (const auto& index : jsonArrayField(datasets, "objects")) {
+            const auto value = index.get<int64_t>();
+            if (value < -1 || value >= int64_t(result.trackDatasets.datasets.size()))
+                throw std::invalid_argument("selected inputs track datasets: index outside the table");
+            result.trackDatasets.objects.push_back(int32_t(value));
+        }
+        if (result.trackDatasets.objects.size() != result.objects.size())
+            throw std::invalid_argument("selected inputs track datasets: one index per object");
+    }
     return result;
 }
 
