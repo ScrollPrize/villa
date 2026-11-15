@@ -6,6 +6,7 @@
 
 #include "vc/core/util/QuadSurface.hpp"
 
+#include <algorithm>
 #include <vc_object_store/Uuid.hpp>
 #include <vc_object_store/objects/GeometryCoordinates.hpp>
 #include <vc_object_store/objects/ObjectStoreSession.hpp>
@@ -256,6 +257,9 @@ Json describe(const vc3d::spiral::FitInputs& inputs)
         result["objects"][entry.pin.uuid] = {{"state", vc3d::spiral::inputStateName(entry.state)},
                                              {"problem", entry.problem}, {"family", entry.family},
                                              {"line", points(entry.line)}};
+    for (const auto& entry : inputs.tracks)
+        result["objects"][entry.pin.uuid] = {{"state", vc3d::spiral::inputStateName(entry.state)},
+                                             {"problem", entry.problem}};
     for (const auto& link : inputs.relationships)
         result["links"][link.uuid] = vc3d::spiral::linkStateName(link.state);
     return result;
@@ -393,6 +397,15 @@ void trackCrossingsAreNeverReadOrCompared(const fs::path& directory)
     fixture.act(fixture.pins({fixture.surface, fixture.pcl}), [&](auto& db, auto& txn) { db.removeEdge(txn, fixture.link); });
     inputs = incremental(fixture, legacy, inputs, {}, {fixture.link}, "a fitted link's removal");
     require(inputs.relationships.at(0).state == LinkState::Dropped, "a removed fitted link is dropped");
+
+    // A track's own edit is still found, by the incremental read as by a full one.
+    fixture.act(fixture.pins({a}), [&](auto& db, auto& txn) {
+        db.setMeta(txn, a, "coordinates", volumeCoordinates(kVolume, 2).dump());
+    });
+    inputs = incremental(fixture, legacy, inputs, {a}, {}, "a track's frame edit");
+    require(std::ranges::count_if(inputs.tracks, [](const auto& track) {
+                return track.state == vc3d::spiral::InputState::MetadataChanged; }) == 1,
+            "a track's frame edit is detected");
 }
 
 void readsCurrentInputsAndTheirDifferences(const fs::path& directory)

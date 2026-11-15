@@ -1898,6 +1898,12 @@ void SpiralWorkspace::updateInputFreshness()
                                    int(std::min<std::size_t>(inputs.crossingsNotCompared,
                                                              std::numeric_limits<int>::max())))
         : QString();
+    if (notes.isEmpty() && !inputs.problems.empty()) {
+        // A read that failed compared nothing: it does not say "as fitted".
+        _panel->setInputFreshness(tr("The fit's inputs could not be compared with the attached store: %1")
+                                      .arg(QString::fromStdString(inputs.problems.front())) + uncompared);
+        return;
+    }
     if (notes.isEmpty()) {
         _panel->setInputFreshness(inputs.crossingsNotCompared
             ? tr("The attached store holds the fit's other inputs as fitted.") + uncompared

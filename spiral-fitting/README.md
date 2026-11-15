@@ -470,7 +470,9 @@ dropped silently. Crossings are computed automatically at startup, whatever the
 fit's crossing limits, and cached under the fit's cache
 directory as `track_crossings/v1/<key>.npz`, keyed by the track revisions (not
 by the store's commit, the fit level or a frame scale), so the next fit of the
-same tracks loads them. The input manifest records them as
+same tracks loads them. Processes that miss one file together (the ranks of a
+distributed fit) take its `.lock`: one computes, the others wait and load its
+file. The input manifest records them as
 `derived_inputs.track_crossing` (`source`, `algorithm`, `parameters`, `count`,
 `sha256`), which a resume and an input update compare. `crossing`
 relationships a store holds, and approvals, rejections or edits of them, no

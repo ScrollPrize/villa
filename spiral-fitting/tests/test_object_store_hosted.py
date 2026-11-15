@@ -322,4 +322,4 @@ def test_tracks_and_their_crossings_through_the_endpoint(tmp_path):
     for name in ('offsets', 'partners', 'self_local', 'partner_local', 'positions', 'clearances'):
         np.testing.assert_array_equal(hosted.tracks.crossings[name], local.tracks.crossings[name])
     # One cache file serves both: its key holds no store location.
-    assert len(list((cache / osi.TRACK_CROSSING_CACHE_DIRECTORY).iterdir())) == 1
+    assert len(list((cache / osi.TRACK_CROSSING_CACHE_DIRECTORY).glob('*.npz'))) == 1

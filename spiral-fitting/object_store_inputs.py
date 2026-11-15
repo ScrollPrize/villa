@@ -1812,6 +1812,36 @@ def _store_track_crossings(path, key, csr, sha256):
         print(f'WARNING: cannot write the track crossing cache {path}: {error}')
 
 
+@contextlib.contextmanager
+def _track_crossing_lock(path):
+    """Holds the cache file's lock: of the processes that miss one cache
+    file at once (the ranks of a distributed fit), one computes the
+    crossings and the others wait for its file instead of each holding the
+    kernel's buffers. Without file locks, or a writable cache, nothing is
+    held and each computes."""
+    try:
+        import fcntl
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        stream = open(f'{path}.lock', 'a')
+    except (ImportError, OSError):
+        yield
+        return
+    with stream:
+        try:
+            try:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                print('track crossings: waiting for another process that computes them')
+                fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        except OSError:
+            yield
+            return
+        try:
+            yield
+        finally:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
 def _track_crossing_provenance(csr, sha256):
     """The manifest's ``derived_inputs.track_crossing``: the crossings are
     computed from the selected tracks; their count and the checksum of the
@@ -1854,51 +1884,56 @@ def materialize_tracks(store, snapshot, *, z_begin, z_end,
         key = _track_crossing_key(tracks, rows)
         cache_path = _track_crossing_cache_path(cache_directory, key)
         cached = _load_track_crossings(cache_path, key, len(tracks))
-    # Every selected track's stored points, when the crossings are computed.
-    selection = [None] * len(tracks) if cached is None else None
-    problems = []
-    kept, stored, fit, families, scales = [], [], [], [], []
-    for index, obj in enumerate(tracks):
-        arrays, _ = read_geometry(store, obj.geometry_revision, ['points'])
-        xyz = arrays['points']
-        if xyz.ndim != 2 or xyz.shape[1] != 3:
-            problems.append(f'track {obj.uuid} points have shape {xyz.shape}')
-            continue
-        zyx = np.ascontiguousarray(xyz[:, ::-1], dtype=np.int32)
-        if selection is not None:
-            if len(xyz) and not (xyz.min() >= 0 and xyz.max() < TRACK_COORDINATE_LIMIT):
-                problems.append(f'track {obj.uuid} has coordinates outside '
-                                f'[0, {TRACK_COORDINATE_LIMIT}), which crossings cannot index')
-            if len(xyz) > np.iinfo(np.int32).max:
-                problems.append(f'track {obj.uuid} has {len(xyz)} points, more than '
-                                'crossings can index')
-            selection[index] = zyx
-        if not len(xyz):
-            continue
-        z = xyz[:, 2].astype(np.float64) * obj.frame.to_fit
-        if z.min() < z_begin or z.max() >= z_end:
-            counts['tracks outside the z window'] += 1
-            continue
-        family = (obj.track or {}).get('family') or ''
-        kept.append(index)
-        stored.append(zyx)
-        fit.append(obj.frame.xyz_to_fit_zyx(xyz))
-        families.append(TRACK_FAMILY_CODES.get(family, -1))
-        scales.append(obj.frame.to_fit)
-    if problems:
-        raise ObjectStoreInputError(problems)
-    if cached is None:
-        started = time.monotonic()
-        csr = _compute_track_crossings(tracks, selection, rows, workers)
-        sha256 = crossing_csr_sha256(csr)
-        if cache_path is not None:
-            _store_track_crossings(cache_path, key, csr, sha256)
-        print(f'track crossings: {len(csr["partners"]) // 2} computed from '
-              f'{len(tracks)} tracks in {time.monotonic() - started:.1f} s')
-    else:
-        csr, sha256 = cached
-        print(f'track crossings: {len(csr["partners"]) // 2} read from the cache '
-              f'{cache_path}')
+    with contextlib.ExitStack() as computing:
+        if cache_path is not None and cached is None:
+            # One process computes a missing file; one that waited reads it.
+            computing.enter_context(_track_crossing_lock(cache_path))
+            cached = _load_track_crossings(cache_path, key, len(tracks))
+        # Every selected track's stored points, when the crossings are computed.
+        selection = [None] * len(tracks) if cached is None else None
+        problems = []
+        kept, stored, fit, families, scales = [], [], [], [], []
+        for index, obj in enumerate(tracks):
+            arrays, _ = read_geometry(store, obj.geometry_revision, ['points'])
+            xyz = arrays['points']
+            if xyz.ndim != 2 or xyz.shape[1] != 3:
+                problems.append(f'track {obj.uuid} points have shape {xyz.shape}')
+                continue
+            zyx = np.ascontiguousarray(xyz[:, ::-1], dtype=np.int32)
+            if selection is not None:
+                if len(xyz) and not (xyz.min() >= 0 and xyz.max() < TRACK_COORDINATE_LIMIT):
+                    problems.append(f'track {obj.uuid} has coordinates outside '
+                                    f'[0, {TRACK_COORDINATE_LIMIT}), which crossings cannot index')
+                if len(xyz) > np.iinfo(np.int32).max:
+                    problems.append(f'track {obj.uuid} has {len(xyz)} points, more than '
+                                    'crossings can index')
+                selection[index] = zyx
+            if not len(xyz):
+                continue
+            z = xyz[:, 2].astype(np.float64) * obj.frame.to_fit
+            if z.min() < z_begin or z.max() >= z_end:
+                counts['tracks outside the z window'] += 1
+                continue
+            family = (obj.track or {}).get('family') or ''
+            kept.append(index)
+            stored.append(zyx)
+            fit.append(obj.frame.xyz_to_fit_zyx(xyz))
+            families.append(TRACK_FAMILY_CODES.get(family, -1))
+            scales.append(obj.frame.to_fit)
+        if problems:
+            raise ObjectStoreInputError(problems)
+        if cached is None:
+            started = time.monotonic()
+            csr = _compute_track_crossings(tracks, selection, rows, workers)
+            sha256 = crossing_csr_sha256(csr)
+            if cache_path is not None:
+                _store_track_crossings(cache_path, key, csr, sha256)
+            print(f'track crossings: {len(csr["partners"]) // 2} computed from '
+                  f'{len(tracks)} tracks in {time.monotonic() - started:.1f} s')
+        else:
+            csr, sha256 = cached
+            print(f'track crossings: {len(csr["partners"]) // 2} read from the cache '
+                  f'{cache_path}')
     del selection
     derived = _track_crossing_provenance(csr, sha256)
     # Stored voxels -> fit voxels, by each row's (its group's) frame.

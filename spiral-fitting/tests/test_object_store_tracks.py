@@ -423,7 +423,7 @@ def computes(monkeypatch):
 
 def _cache_files(cache):
     directory = cache / osi.TRACK_CROSSING_CACHE_DIRECTORY
-    return sorted(directory.iterdir()) if directory.is_dir() else []
+    return sorted(directory.glob('*.npz')) if directory.is_dir() else []
 
 
 def test_crossings_are_cached_by_the_track_revisions(db, tmp_path, computes):
@@ -492,6 +492,32 @@ def test_a_damaged_cache_file_is_a_miss_and_is_rebuilt(db, tmp_path, computes, c
     assert again.derived == first.derived
     _assert_same_crossings(again.crossings, first.crossings)
     assert _cache_files(cache) == [cached] and cached.read_bytes() == intact
+
+
+def test_a_process_that_waited_for_the_crossings_reads_them(db, tmp_path, computes, capsys):
+    """Ranks that miss one cache file together: one computes, the rest wait
+    for its file."""
+    fcntl = pytest.importorskip('fcntl')
+    _lattice(db)
+    first, _ = _materialize_tracks(db, cache_directory=str(tmp_path / 'first'))
+    [written] = _cache_files(tmp_path / 'first')
+    path = tmp_path / 'cache' / osi.TRACK_CROSSING_CACHE_DIRECTORY / written.name
+    path.parent.mkdir(parents=True)
+    snapshot = osi.read_snapshot(db, osi.InputRequest())
+    result = []
+    with open(f'{path}.lock', 'a') as other:
+        fcntl.flock(other.fileno(), fcntl.LOCK_EX)  # another process computes
+        waiter = threading.Thread(target=lambda: result.append(osi.materialize_tracks(
+            db, snapshot, z_begin=0, z_end=64, cache_directory=str(tmp_path / 'cache'))))
+        waiter.start()
+        waiter.join(1.0)
+        assert waiter.is_alive() and not result
+        path.write_bytes(written.read_bytes())  # ... and publishes its file
+        fcntl.flock(other.fileno(), fcntl.LOCK_UN)
+    waiter.join(30)
+    assert not waiter.is_alive() and len(computes) == 1
+    assert result[0][0].derived == first.derived
+    assert 'waiting for another process' in capsys.readouterr().out
 
 
 def test_concurrent_writers_leave_one_complete_cache_file(db, tmp_path):
