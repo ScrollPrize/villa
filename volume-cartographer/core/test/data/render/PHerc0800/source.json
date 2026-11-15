@@ -1,0 +1,11 @@
+{
+  "sample": "PHerc0800",
+  "segment": "20251029010146-auto_grown_20251029010146642",
+  "volume": "s3://vesuvius-challenge-open-data/PHerc0800/volumes/20250521135224-8.640um-1.2m-116keV-masked.zarr/",
+  "render": "--scale 1 --group-idx 1 --num-slices 8 --flip-normals --num-parts 2",
+  "slice": 0,
+  "sha256": {
+    "00.part0.tif": "7f8d66b4d4157de46163d0453b80136b59d9c1f959993fd719a772e0efac281f",
+    "00.part1.tif": "b5322c0d63de536a256f10871defc6cd913a0fe5c8495a0c1615587e0f58284f"
+  }
+}
