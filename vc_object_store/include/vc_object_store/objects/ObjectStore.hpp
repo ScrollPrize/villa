@@ -597,6 +597,9 @@ public:
     // not selected; deleted versions and unknown references fail). Results are
     // ordered by relationship UUID, then complete publication reference.
     std::vector<SelectedRelationship> relationshipsAt(const Txn&, const std::vector<ObjectVersion>&) const;
+    // The same selected graph, for revisions the caller has already read at
+    // their versions (objectsAtVersions): the objects are not resolved again.
+    std::vector<SelectedRelationship> relationshipsAt(const Txn&, const std::vector<ObjectRevision>& selection) const;
     // After endpoint edits, validate anchors/metadataKeys and retain the relationship.
     // The caller decides domain meaning.
     void retainRelationship(WriteTxn&, const std::string& edgeUuid);

@@ -12,8 +12,12 @@ struct ReadTiming {
     // seconds
     double objects = 0, relationshipResolve = 0, members = 0, scopeResolve = 0, incident = 0, recorded = 0,
            archives = 0, applies = 0, order = 0;
+    // inside the relationship row decoder
+    double rowJsonParse = 0, rowEdgeFromJson = 0, rowStoreUuid = 0, rowReferences = 0;
+    // inside the batch builders
+    double incidentBuild = 0, recordedHeads = 0, recordedRows = 0, recordedEmplace = 0;
     // counts
-    long incidentEdges = 0, recordedCalls = 0, appliesCalls = 0, archiveDecodes = 0;
+    long incidentEdges = 0, recordedCalls = 0, appliesCalls = 0, archiveDecodes = 0, referenceMemoHits = 0, referenceMemoMisses = 0;
     void reset() { *this = ReadTiming{}; }
     void report(const char* what, size_t objectCount, size_t relationshipCount) const
     {
@@ -21,9 +25,13 @@ struct ReadTiming {
         std::fprintf(stderr,
             "VC_OBJECT_STORE_TIMING %s: objects=%zu relationships=%zu | objectsAtVersions %.1fs | relationshipsAt resolve %.1fs"
             " | members %.1fs | scope resolve %.1fs | incidentEdges %.1fs (%ld edges seen) | recordedRelationship %.1fs (%ld calls)"
-            " | archives %.1fs (%ld decodes) | endpointApplies %.1fs (%ld calls) | order %.1fs\n",
+            " | archives %.1fs (%ld decodes) | endpointApplies %.1fs (%ld calls) | order %.1fs"
+            " | row decode: json parse %.1fs, edgeFromJson %.1fs, store uuid %.1fs, references %.1fs (memo hits %ld, misses %ld)"
+            " | batches: incidence build %.1fs, heads %.1fs (incl. rows), row fetch %.1fs, emplace %.1fs\n",
             what, objectCount, relationshipCount, objects, relationshipResolve, members, scopeResolve, incident,
-            incidentEdges, recorded, recordedCalls, archives, archiveDecodes, applies, appliesCalls, order);
+            incidentEdges, recorded, recordedCalls, archives, archiveDecodes, applies, appliesCalls, order,
+            rowJsonParse, rowEdgeFromJson, rowStoreUuid, rowReferences, referenceMemoHits, referenceMemoMisses,
+            incidentBuild, recordedHeads, recordedRows, recordedEmplace);
         std::fflush(stderr);
     }
 };

@@ -5,6 +5,7 @@
 #include "internal/TransformedLength.hpp"
 #include "internal/ObjectVersionJson.hpp"
 #include "internal/ReadTiming.hpp"
+#include "internal/SelectedRead.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -24,6 +25,9 @@ SelectedInputs LocalStoreReader::selectedInputs(const std::vector<ObjectVersion>
     SelectedInputs result;
     auto& timing = detail::readTiming();
     timing.reset();
+    // One memo for the whole read: the objects resolved here serve the
+    // relationship read below instead of being resolved again.
+    detail::SelectedReadScope memo;
     {
         detail::ScopedReadTimer timer(timing.objects);
         const auto records = objectsAtVersions(refs);
@@ -32,7 +36,7 @@ SelectedInputs LocalStoreReader::selectedInputs(const std::vector<ObjectVersion>
             result.objects.push_back(*records[i]);
         }
     }
-    result.relationships = relationshipsAt(refs);
+    result.relationships = store_->relationshipsAt(*txn_, result.objects);
     timing.report("selectedInputs", result.objects.size(), result.relationships.size());
     return result;
 }
