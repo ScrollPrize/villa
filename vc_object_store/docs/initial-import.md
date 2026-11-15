@@ -115,21 +115,22 @@ Relationship anchors are supplied by the producer without owner-geometry reads d
 
 ## Bulk tracks: `vc_object_ingest --bulk`
 
-`vc_object_ingest --tracks` normally commits one transaction per track. For millions of small tracks that is hours: each track costs about
-2 to 3 ms of store work (measured on 557,248 tracks: 1.0 ms writing the geometry, 0.4 ms the object row, 0.3 ms the commit, one core),
-and batching the commits does not help because the cost is per object. `--bulk` builds the tracks through `importInitialCollection`
-instead (`ingestTracksBulk`):
+`vc_object_ingest --tracks` commits one transaction per track: every track is its own object with its own identity, revision and geometry,
+so the store does the same fixed amount of work per track however small the track is. For millions of small tracks use `--bulk`, which
+builds the tracks through `importInitialCollection` (`ingestTracksBulk`):
 
 ```
 vc_object_ingest --bulk --bulk-shards 8 --db scroll.vcobj --author NAME --tracks tracks.dbm --volume-uuid ID --scale-factor 1
 ```
 
-* `--db scroll.vcobj.tracks` is the new **sealed, history-off** collection (one shard: one SQLite file; N shards: a directory with
-  `collection.vcobj`). `--db scroll.vcobj` (must not exist) is an **editable overlay root** over it (`ObjectCollection::create`), which is
-  what a fit opens: it opens read-write and reads every track through the overlay. The sealed collection cannot be opened writable.
-* Objects carry the same records, coordinate frame and geometry as the per-track path; identities are fresh random UUIDs, as there.
-  `scripts/compare_track_stores.py` checks equivalence of a per-track store and a bulk store (names, metadata, geometry attributes,
-  points bytes). On 4,000 random tracks of a 557,248-track window: 0 mismatches.
-* Measured (hub CPU, window of 557,248 tracks, tracks on a 99 %-full RAID): per-track path about 23 min (about 400 tracks/s); `--bulk`
-  1 shard 46 s, 8 shards 19 s. The bulk store is also smaller (1.0 GB against about 3 GB).
-* The per-track path is unchanged and remains the default.
+* `scroll.vcobj.tracks` is the new **sealed, history-off** collection (one shard: one SQLite file; N shards: a directory whose root
+  locator is `collection.vcobj`). `scroll.vcobj` (must not exist) is an **editable, history-on overlay root** over it
+  (`ObjectCollection::create`), which is what a consumer opens: it opens writable, reads every track through the shared collection reader,
+  and keeps its own writes (links, metadata edits) local. The sealed collection cannot be opened writable and is never modified.
+* The objects have the same records, coordinate frame (`--volume-uuid` and `--scale-factor` are required together, as for the per-track path)
+  and geometry as the per-track path; identities are fresh UUIDs, as there, so the two paths are not interchangeable for one store
+  (a re-run of either on the same source creates new objects). `tests/cpp/test_bulk_tracks.cpp` checks that a per-track store and the bulk
+  collection (one file and sharded, alone and under the overlay root) expose identical tracks, and that an overlay write leaves the base unchanged.
+* Capability limits: bulk mode is a command-line feature for new, whole datasets of tracks (one `--tracks` source per run, nothing else in the
+  same run). It is not available through the Python `ingest_geometry_source`, and it does not add tracks to an existing store. The
+  per-track path is unchanged and remains the default.
