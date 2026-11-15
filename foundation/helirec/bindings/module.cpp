@@ -147,7 +147,8 @@ int projector_id(const std::string& p) {
 
 HostOut backproject_py(HostIn sino, HostIn angles, int ny, int nx, float rot_center, float scale,
                        float center, int x0, int y0, bool clip_outer_circle, float clip_radius,
-                       const std::string& device, int interp, float u_scale, std::optional<std::vector<std::int32_t>> tiles) {
+                       const std::string& device, int interp, float u_scale, std::optional<std::vector<std::int32_t>> tiles,
+                       std::optional<std::vector<float>> fan) {
     require(sino.ndim() == 2, "sino must be (n_angles, n_det)");
     const int n_angles = static_cast<int>(sino.shape(0)), n_det = static_cast<int>(sino.shape(1));
     require(angles.size() == static_cast<std::size_t>(n_angles), "angles length != sino rows");
@@ -156,6 +157,11 @@ HostOut backproject_py(HostIn sino, HostIn angles, int ny, int nx, float rot_cen
     p.rot_center = rot_center; p.scale = scale; p.center = center; p.x0 = x0; p.y0 = y0;
     p.clip_outer_circle = clip_outer_circle; p.clip_radius = clip_radius;
     p.interp = interp; p.u_scale = u_scale;
+    if (fan) {
+        require(!fan->empty(), "fan: the fan [rad] of every column, at least one");
+        p.fan = fan->data();
+        p.n_fan = static_cast<int>(fan->size());
+    }
     if (tiles) {
         const int T = kBackprojectTile, n_tiles = ((nx + T - 1) / T) * ((ny + T - 1) / T);
         std::vector<char> seen(static_cast<std::size_t>(std::max(n_tiles, 0)), 0);
@@ -918,6 +924,7 @@ class PySliceReconstructor {
         f("exposure_arc", cfg.exposure_arc);
         f("rolling_shutter", cfg.rolling_shutter);
         f("rolling_shutter_from_middle", cfg.rolling_shutter_from_middle);
+        f("fan_per_column", cfg.fan_per_column);
         f("angle_subsets", cfg.angle_subsets);
         f("angle_subset", cfg.angle_subset);
         f("mend_threshold", cfg.mend_threshold);
@@ -944,6 +951,7 @@ class PySliceReconstructor {
         nb::gil_scoped_release nogil;
         impl_ = std::make_shared<SliceReconstructor>(std::move(scans), cfg);
     }
+    std::vector<float> fan_of_columns() const { return impl_->fan_of_columns(); }
     nb::dict info() const {
         nb::dict d;
         auto [lo, hi] = impl_->doable();
@@ -957,6 +965,7 @@ class PySliceReconstructor {
         d["legacy_reference"] = impl_->config().legacy_reference;
         d["exposure_arc_bins"] = impl_->exposure_arc_bins();
         d["rolling_shutter"] = impl_->rolling_shutter();
+        d["fan_per_column"] = impl_->fan_per_column();
         d["angle_interp"] = impl_->angle_interp();
         d["z_interp"] = impl_->z_interp();
         d["angle_subsets"] = impl_->config().angle_subsets;
@@ -1140,8 +1149,9 @@ NB_MODULE(_core, m) {
           "-log(max((raw - dark) / (flat - dark), threshold)) per frame");
     m.def("backproject", &backproject_py, "sino"_a, "angles"_a, "ny"_a, "nx"_a, "rot_center"_a,
           "scale"_a = 1.f, "center"_a = -1.f, "x0"_a = 0, "y0"_a = 0, "clip_outer_circle"_a = false,
-          "clip_radius"_a = -1.f, "device"_a = "cpu", "interp"_a = 0, "u_scale"_a = 1.f, "tiles"_a = nb::none(),
-          "Exact pixel-driven parallel-beam backprojection; interp 0 linear, 1 cubic (Keys), 2 lanczos3, 3 bspline3, 4 bspline5 "
+          "clip_radius"_a = -1.f, "device"_a = "cpu", "interp"_a = 0, "u_scale"_a = 1.f, "tiles"_a = nb::none(), "fan"_a = nb::none(),
+          "Exact pixel-driven backprojection of a parallel beam, or with fan (the fan [rad] of every column: the ray recorded at "
+          "column m is the parallel beam's turned by fan[m] towards the angle less fan[m]) of a diverging one; interp 0 linear, 1 cubic (Keys), 2 lanczos3, 3 bspline3, 4 bspline5 "
           "(B-spline: pass bspline_prefilter'd rows); rows "
           "sampled u_scale times per bin. tiles: only these 32 x 32 pixel tiles of the slice (index ty * ceil(nx / 32) + "
           "tx) are computed, the others are 0");
@@ -1564,6 +1574,8 @@ NB_MODULE(_core, m) {
     nb::class_<PySliceReconstructor>(m, "SliceReconstructor")
         .def(nb::init<std::vector<ScanData>, const nb::dict&>(), "scans"_a, "config"_a)
         .def_prop_ro("info", &PySliceReconstructor::info)
+        .def_prop_ro("fan_of_columns", &PySliceReconstructor::fan_of_columns,
+                     "the beam's divergence as the backprojector takes it: the fan [rad] of every merged column (empty: a parallel beam)")
         .def("reconstruct", &PySliceReconstructor::reconstruct, "h_lo"_a, "h_hi"_a, "debug"_a = false,
              "timing"_a = false, "roi"_a = nb::none(), "next"_a = nb::none(), "uint8"_a = nb::none(), "float32"_a = true,
              nb::arg("progress").none() = nb::none(), "mask"_a = nb::none(), "region"_a = nb::none(),
@@ -1751,6 +1763,7 @@ NB_MODULE(_core, m) {
         .def_prop_ro("mode", &Reconstruction::mode)
         .def("rot_center", &Reconstruction::rot_center)
         .def("rolling_shutter", &Reconstruction::rolling_shutter)
+        .def("beam_divergence", &Reconstruction::beam_divergence)
         .def("exposure_arc", &Reconstruction::exposure_arc)
         .def("sharpness_weighting", &Reconstruction::sharpness_weighting)
         .def("resolved_sld", &Reconstruction::resolved_sld)

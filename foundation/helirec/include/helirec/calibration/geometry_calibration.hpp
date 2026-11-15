@@ -115,7 +115,8 @@ struct Planned {
 // The beam's divergence is in the reported angle alone (Ray::angle_deg, the frames' residual): the ray recorded at
 // column c is a parallel beam's at th + fan (c - middle column) frames (Acquisition::fan; the sign as PHerc0343P's
 // opposite views show it: their frames lie 2 fan (c - axis) further on than half a turn). No row or column of
-// the model takes it: s and z above are formed with the stage's angle.
+// the model takes it: s and z above are formed with the stage's angle. The reconstruction takes it in the
+// backprojection (geometry::Calibration::fan, ReconConfig::fan_per_column).
 //
 // A comparison is two sightings of the same lines, in one scan or in two (one scan against another at equal angle:
 // "pair"). Each is taken back to the ray it records, and the residual is the difference of the two rays in the

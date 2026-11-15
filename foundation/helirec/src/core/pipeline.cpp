@@ -176,6 +176,9 @@ struct SliceReconstructor::Impl {
     std::vector<AngleBins> bins;
     std::vector<std::vector<double>> row_weight;
     std::vector<float> slice_fbp_angles;
+    // The beam's divergence as the exact backprojector takes it (ReconConfig::fan_per_column): the fan [rad] of
+    // every merged column; empty: a parallel beam.
+    std::vector<float> fan;
     // One row per view (angle_interp "views": nearest-bin gridding without the wrap to one turn). The chunk's sinogram
     // has chunk_rows >= n_grid rows, row r holding the projections of the (unwrapped) bin row_base + r, so that views
     // a turn apart, which share a grid angle but were not recorded at the same angle, stay apart and are each
@@ -597,6 +600,44 @@ SliceReconstructor::SliceReconstructor(std::vector<ScanData> scans, ReconConfig 
         I.mend_x0 = std::max(0, I.mend_x0);
         I.mend_x1 = std::min(I.NX, I.mend_x1);
     }
+    // The beam's divergence: the fan of every merged column, fan_per_column x (the scan's column there - its middle
+    // column). Where several scans hold a merged column, the mean by the weight of their columns (the sums of their
+    // weight maps' columns, each over its largest); a column none holds takes the nearest scan's line on.
+    if (I.cfg.fan_per_column != 0 && !I.cfg.legacy_reference && I.cfg.backprojector == "fbp") {
+        std::vector<double> sum(I.NX, 0.0), wsum(I.NX, 0.0);
+        for (const auto& s : I.scans) {
+            const int R = s.traj.det_rows, C = s.traj.det_cols;
+            std::vector<double> col(C, 0.0);
+            for (int r = 0; r < R; ++r)
+                for (int c = 0; c < C; ++c) col[c] += s.weight[static_cast<std::size_t>(r) * C + c];
+            const double top = *std::max_element(col.begin(), col.end());
+            const double off = static_cast<double>(s.traj.shift_x) - s.traj.x_readjustment;
+            for (int x = 0; x < I.NX; ++x) {
+                const double c = x - off;
+                if (c < 0 || c > C - 1) continue;
+                const int i = std::min(static_cast<int>(c), C - 1);
+                const double a = c - i;
+                const double w = top > 0 ? std::max(((1 - a) * col[i] + (a > 0 ? a * col[i + 1] : 0.0)) / top, 1e-6) : 1e-6;
+                sum[x] += w * (c - 0.5 * (C - 1));
+                wsum[x] += w;
+            }
+        }
+        I.fan.resize(I.NX);
+        for (int x = 0; x < I.NX; ++x) {
+            double from_middle = 0;
+            if (wsum[x] > 0) {
+                from_middle = sum[x] / wsum[x];
+            } else {
+                double nearest = 1e300;
+                for (const auto& s : I.scans) {
+                    const double c = x - (static_cast<double>(s.traj.shift_x) - s.traj.x_readjustment);
+                    const double away = c < 0 ? -c : std::max(0.0, c - (s.traj.det_cols - 1));
+                    if (away < nearest) nearest = away, from_middle = c - 0.5 * (s.traj.det_cols - 1);
+                }
+            }
+            I.fan[x] = static_cast<float>(I.cfg.fan_per_column * from_middle);
+        }
+    }
     // luminosity seams: det_cols/2 + lround(mean of (shift_x - x_readjustment)) of a scan and the nearest before it
     // at its own height (within a quarter of the detector's rows: the scans of one row of a grid; every scan where
     // there are no rows of scans). The first scan of a row has none: the rows' levels against each other are left
@@ -676,6 +717,8 @@ std::pair<int, int> SliceReconstructor::mend_domain() const { return {impl_->men
 const ReconConfig& SliceReconstructor::config() const { return impl_->cfg; }
 double SliceReconstructor::exposure_arc_bins() const { return impl_->arc_bins; }
 double SliceReconstructor::rolling_shutter() const { return impl_->nearest ? impl_->cfg.rolling_shutter : 0.0; }
+double SliceReconstructor::fan_per_column() const { return impl_->fan.empty() ? 0.0 : impl_->cfg.fan_per_column; }
+const std::vector<float>& SliceReconstructor::fan_of_columns() const { return impl_->fan; }
 std::string SliceReconstructor::angle_interp() const { return impl_->views ? "views" : impl_->nearest ? "nearest" : "linear"; }
 std::string SliceReconstructor::z_interp() const {
     return z_kernel_name(impl_->z_kernel);
@@ -778,6 +821,8 @@ void SliceReconstructor::Impl::setup_invariants() {
     bp.clip_radius = static_cast<float>(grid_size / 2);
     bp.interp = interp_from_name(cfg.bp_interp);
     bp.u_scale = static_cast<float>(cfg.bp_oversample);
+    bp.fan = fan.empty() ? nullptr : fan.data();
+    bp.n_fan = static_cast<int>(fan.size());
     // output units: the ramp's angular weight 2 pi / NG with pair-balanced full-turn weights gives attenuation; the
     // reference's pi / NG gives attenuation / (angular span / pi) = half of it
     bp.unit_gain = legacy ? static_cast<float>(M_PI / (std::fabs(static_cast<double>(fbp_angles[1]) - fbp_angles[0]) * NG)) : 1.f;

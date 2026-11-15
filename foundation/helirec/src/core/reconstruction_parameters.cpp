@@ -44,7 +44,7 @@ Json reference_chain() {
 }
 
 // the parameters every mode shares the values of, in order (mode, filters and the calibration keys aside)
-Json shared(const char* backprojector, const char* x_interp, const char* z_interp, const char* angle_interp, const char* sharpness_weighting) {
+Json shared(const char* backprojector, const char* x_interp, const char* z_interp, const char* angle_interp, const char* sharpness_weighting, bool beam_divergence) {
     return Json::dict()
         .set("margin", whole(-1))
         .set("n_grid", whole(0))
@@ -60,6 +60,7 @@ Json shared(const char* backprojector, const char* x_interp, const char* z_inter
         .set("ghbp_reduction_steps", whole(2))
         .set("clip_outer_circle", Json::of_bool(true))
         .set("axis_source_meters", num(1e9))
+        .set("beam_divergence", Json::of_bool(beam_divergence))
         .set("sld", text(""))
         .set("x_interp", text(x_interp))
         .set("z_interp", text(z_interp))
@@ -74,13 +75,13 @@ Json shared(const char* backprojector, const char* x_interp, const char* z_inter
 
 Json defaults_json() {
     Json d = Json::dict().set("mode", text("corrected")).set("filters", Json::list());
-    for (auto& kv : shared("fbp", "sinc", "lanczos8", "views", "auto").object) d.object.push_back(kv);
+    for (auto& kv : shared("fbp", "sinc", "lanczos8", "views", "auto", true).object) d.object.push_back(kv);
     return d.set("geometry", text("")).set("row_time_us", text(""));
 }
 
 Json legacy_json() {
     Json d = Json::dict().set("filters", reference_chain());
-    for (auto& kv : shared("ghbp", "linear", "linear", "linear", "").object) d.object.push_back(kv);
+    for (auto& kv : shared("ghbp", "linear", "linear", "linear", "", false).object) d.object.push_back(kv);
     return d;
 }
 
@@ -358,6 +359,7 @@ std::string mode_conventions(const std::string& mode) {
             .set("row_position", text("linear"))
             .set("angular_gridding", text("two-bin splat"))
             .set("exposure_arc", text("none"))
+            .set("beam", text("parallel"))
             .text();
     if (mode != "corrected") throw Error("mode must be one of ('corrected', 'legacy_reference'), not '" + mode + "'");
     return Json::dict()
@@ -373,6 +375,8 @@ std::string mode_conventions(const std::string& mode) {
         .set("angular_gridding", text("angle_interp (views by default: a sinogram row per projection, each at its measured angle; nearest: one bin of one turn, the "
                                       "bin's mean measured angle; ghbp and linear: two-bin splat)"))
         .set("exposure_arc", text("as recorded by default; exposure_arc=auto deconvolves the scan's recorded arc along the angle (disabled with angle_interp=views)"))
+        .set("beam", text("beam_divergence (on by default): fbp backprojects along the diverging rays of the geometry calibration's fan, in the slice (not along "
+                          "the axis); a calibration without a source distance, the other backprojectors and beam_divergence=off: parallel"))
         .text();
 }
 

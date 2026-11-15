@@ -118,6 +118,43 @@ def test_three_scans_from_the_detectors_files(tmp_path, acquisition):
         r.set_params(only_scan="ta3")
 
 
+def test_the_calibrations_fan_reaches_the_backprojector(tmp_path, acquisition):
+    """A calibration that states the beam's divergence (its layout's fan, frames of angle per column): the
+    reconstruction hands it to the exact backprojector in radians per column, every merged column counted from the
+    middle column of the scan that holds it; beam_divergence=false and the other backprojectors take a parallel beam."""
+    root, masters, n = acquisition
+    cal = _geometry(masters, n)
+    cal["layout"]["fan"] = -2e-3
+    path = tmp_path / "geometry.json"
+    path.write_text(json.dumps(cal, default=float))
+    r = HelicalRecon(root / "projections", cache_dir=str(tmp_path / "cache"), device="cpu", params=dict(geometry=str(path), sharpness_weighting="off"), log=lambda *a: None)
+    k = -2e-3 * 2 * np.pi / PER_TURN
+    assert r.params["beam_divergence"] is True and r.beam_divergence() == pytest.approx(k, rel=1e-12) and r.info["fan_per_column"] == pytest.approx(k, rel=1e-12)
+    assert r.provenance()["resolved_beam_divergence"] == pytest.approx(k, rel=1e-12)
+    fan = np.array(r._r.reconstructor.fan_of_columns)
+    assert fan.shape == (COLS + 140,)
+    # the scans' column 0 lies at the merged columns 140, 70 and 0 (the third scan alone holds the first columns, the first the last)
+    np.testing.assert_allclose(fan[:40], k * (np.arange(40) - (COLS - 1) / 2), rtol=1e-5, atol=1e-9)
+    np.testing.assert_allclose(fan[-40:], k * (np.arange(COLS + 100, COLS + 140) - 140 - (COLS - 1) / 2), rtol=1e-5, atol=1e-9)
+    h = (r.lo + r.hi) // 2
+    with_fan = r.reconstruct_heights(h, h + 1)[0]
+    r.set_params(beam_divergence=False)
+    assert r.beam_divergence() == 0 and r.info["fan_per_column"] == 0 and len(r._r.reconstructor.fan_of_columns) == 0
+    parallel = r.reconstruct_heights(h, h + 1)[0]
+    assert np.abs(with_fan - parallel).max() > 0.005 * np.abs(parallel).max()        # (smooth Gaussians, turned by under a pixel)
+    # a calibration without a fan: the same slices whatever the parameter says
+    del cal["layout"]["fan"]
+    path.write_text(json.dumps(cal, default=float))
+    none = HelicalRecon(root / "projections", cache_dir=str(tmp_path / "cache"), device="cpu", params=dict(geometry=str(path), sharpness_weighting="off"), log=lambda *a: None)
+    assert none.beam_divergence() == 0 and none.info["fan_per_column"] == 0
+    np.testing.assert_array_equal(none.reconstruct_heights(h, h + 1)[0], parallel)
+    # another backprojector takes the beam as parallel
+    cal["layout"]["fan"] = -2e-3
+    path.write_text(json.dumps(cal, default=float))
+    other = HelicalRecon(root / "projections", cache_dir=str(tmp_path / "cache"), device="cpu", params=dict(geometry=str(path), sharpness_weighting="off", backprojector="ghbp", angle_interp="linear"), log=lambda *a: None)
+    assert other.beam_divergence() == pytest.approx(k, rel=1e-12) and other.info["fan_per_column"] == 0
+
+
 @pytest.mark.skipif(ZARR_TOOL is None, reason="helirec-projections-zarr is not built")
 def test_three_scans_from_a_projection_store_at_a_half(tmp_path, acquisition):
     """The store holds the middle of each helix, the darks and the flats at level 1; the masters lie in a folder of

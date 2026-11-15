@@ -258,6 +258,7 @@ struct Reconstruction::Impl {
     geometry::Map map;                                   // in the pixels of the frames read
     double rolling_shutter = 0;
     bool rolling_shutter_from_middle = false;
+    double fan = 0;                                      // the calibration's, per column of the frames read
     std::tuple<std::string, double, std::string> geometry_key;
 
     calibration::IntensityCalibration intensity;
@@ -360,6 +361,7 @@ struct Reconstruction::Impl {
         // the time from the first row to the last of the frames read, in frame periods
         rolling_shutter = f > 1 ? frames_per_row * f * (rows_stored / f - 1) : geometry->rolling_shutter();
         rolling_shutter_from_middle = geometry->rows_from_middle();
+        fan = geometry->fan() * f;
         geometry_key = geometry_request();
     }
 
@@ -442,6 +444,7 @@ struct Reconstruction::Impl {
         throw Error("only_scan must be '', " + names + " or the kind a scan's name ends in (HA, TA, TA2, ..)");
     }
 
+    double beam_divergence() const { return legacy() || !truth(member(params, "beam_divergence")) ? 0.0 : fan; }
     double exposure_arc() const {
         const Json& v = member(params, "exposure_arc");
         if (v.is(Json::String) && lower(strip(v.string)) == "auto") return main().exposure_arc.value_or(0.0);
@@ -508,6 +511,7 @@ struct Reconstruction::Impl {
         cfg.sharpness_weighting = legacy_mode ? std::string() : sharpness_weighting();
         cfg.rolling_shutter = legacy_mode ? 0.0 : rolling_shutter;
         cfg.rolling_shutter_from_middle = rolling_shutter_from_middle;
+        cfg.fan_per_column = beam_divergence();
         rec = std::make_shared<SliceReconstructor>(std::move(data), cfg);
         std::tie(lo, hi) = rec->doable();
         if (rec->angle_interp() == "views" && exposure_arc() != 0)
@@ -529,6 +533,7 @@ struct Reconstruction::Impl {
             .set("exposure_arc_bins", Json::of(rec->exposure_arc_bins()))
             .set("rolling_shutter", Json::of(rec->rolling_shutter()))
             .set("rolling_shutter_from_middle", Json::of_bool(rec->rolling_shutter() != 0.0 && rec->config().rolling_shutter_from_middle))
+            .set("fan_per_column", Json::of(rec->fan_per_column()))
             .set("angle_interp", Json::of(rec->angle_interp()))
             .set("z_interp", Json::of(rec->z_interp()))
             .set("angle_subsets", Json::whole_number(rec->config().angle_subsets))
@@ -591,6 +596,7 @@ FilterChain filter_chain(const std::string& chain) {
 std::string Reconstruction::mode() const { return member(impl_->params, "mode").string; }
 double Reconstruction::rot_center() const { return impl_->intensity.rot_center; }
 double Reconstruction::rolling_shutter() const { return impl_->legacy() ? 0.0 : impl_->rolling_shutter; }
+double Reconstruction::beam_divergence() const { return impl_->beam_divergence(); }
 double Reconstruction::exposure_arc() const { return impl_->exposure_arc(); }
 std::string Reconstruction::sharpness_weighting() const { return impl_->sharpness_weighting(); }
 std::string Reconstruction::resolved_sld() const { return impl_->resolved_sld; }
@@ -666,7 +672,7 @@ std::string Reconstruction::provenance() const {
                               .set("row_time_s_per_row", member(member(I.geometry_doc, "row_time"), "seconds_per_row"))
                               .set("rows_from_middle", Json::of_bool(I.rolling_shutter_from_middle))
                               .set("merged_frame", layout)
-                              .set("applied", Json::of(legacy ? "the merged frame alone (mode legacy_reference)" : "the detector map and every projection's pose and row timing"))
+                              .set("applied", Json::of(legacy ? "the merged frame alone (mode legacy_reference)" : "the detector map and every projection's pose and row timing; the beam's divergence where resolved_beam_divergence is not 0 and the backprojector is fbp"))
                               .set("measured_not_applied", I.not_applied.empty() ? Json() : Json::parse(I.not_applied));
     Json out = Json::dict()
         .set("mode", Json::of(m))
@@ -684,6 +690,7 @@ std::string Reconstruction::provenance() const {
         .set("resolved_sharpness_weighting", Json::of(sharpness_weighting()))
         .set("resolved_rot_center", Json::of(rot_center()))
         .set("resolved_rolling_shutter", Json::of(rolling_shutter()))
+        .set("resolved_beam_divergence", Json::of(beam_divergence()))
         .set("geometry", geometry)
         .set("reconstructor", I.info_json())
         .set("pixel_size_m", Json::of(I.main().pixel_size_m * I.factor()))
@@ -949,6 +956,8 @@ TileReconstruction tile_reconstructor(const std::string& master, const std::stri
     cfg.sharpness_weighting.clear();
     cfg.rolling_shutter = rad_per_row / (step_deg * (M_PI / 180.0)) * (rows - 1);
     cfg.rolling_shutter_from_middle = rows_from_middle;
+    // (a joint calibration states the beam's divergence; the earlier description of a mosaic's tiles has none)
+    cfg.fan_per_column = joint && truth(member(p, "beam_divergence")) ? joined->fan() * f : 0.0;
     std::vector<ScanData> scans;
     scans.push_back(std::move(d));
     out.reconstructor = std::make_shared<SliceReconstructor>(std::move(scans), cfg);

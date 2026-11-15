@@ -20,11 +20,12 @@ __global__ void mark_kernel(const float* y, const float* x, size_t a, size_t b, 
     m[0] = 1; m[1] = 1; m[box.w] = 1; m[box.w + 1] = 1;
 }
 
+// fan: a diverging beam (BackprojectParams::fan, its n_fan columns on the device); null: a parallel beam
 template <int K>
 __global__ void backproject_list_kernel(const float* __restrict__ sino, const float2* __restrict__ cs_sn, int n_angles,
                                         int n_det, const int32_t* __restrict__ list, int count, BandBox box,
                                         float rot_center, float scale, float c, bool clip, float r2, float us,
-                                        float* __restrict__ img) {
+                                        float* __restrict__ img, const float* __restrict__ fan, int n_fan) {
     __shared__ float2 s_cs[kAngleChunk];
     const int k = blockIdx.x * blockDim.x + threadIdx.x;
     int li = 0;
@@ -44,8 +45,15 @@ __global__ void backproject_list_kernel(const float* __restrict__ sino, const fl
         __syncthreads();
         if (inside) {
             const float* row = sino + static_cast<size_t>(a0) * n_det;
-            for (int t = 0; t < na; ++t, row += n_det)
-                acc += interp_core::sample_row<K>(row, n_det, (x * s_cs[t].x + y * s_cs[t].y + rot_center) * us);
+            if (fan) {
+                for (int t = 0; t < na; ++t, row += n_det) {
+                    const float at = x * s_cs[t].x + y * s_cs[t].y + rot_center;
+                    acc += interp_core::sample_row<K>(row, n_det, (at + fan[interp_core::fan_column(at, n_fan)] * (x * s_cs[t].y - y * s_cs[t].x)) * us);
+                }
+            } else {
+                for (int t = 0; t < na; ++t, row += n_det)
+                    acc += interp_core::sample_row<K>(row, n_det, (x * s_cs[t].x + y * s_cs[t].y + rot_center) * us);
+            }
         }
     }
     if (k < count) img[li] = inside ? acc * scale : 0.f;
@@ -102,9 +110,16 @@ void backproject_list(const float* sino, const void* cs_sn, int n_angles, int n_
     if (!count) return;
     const float c = p.center >= 0.f ? p.center : 0.5f * static_cast<float>(box.n_grid - 1);
     const float r = p.clip_radius >= 0.f ? p.clip_radius : c;
+    // (kept between calls; the host table is the caller's and outlives the call)
+    thread_local DeviceBuffer<float> d_fan;
+    if (p.fan && p.n_fan < 1) throw Error("backproject_list: a fan without columns");
+    if (p.fan) {
+        d_fan.ensure(static_cast<size_t>(p.n_fan));
+        HELIREC_CUDA_CHECK(cudaMemcpyAsync(d_fan.data(), p.fan, p.n_fan * sizeof(float), cudaMemcpyHostToDevice, as_stream(stream)));
+    }
 #define HELIREC_BPL(K) backproject_list_kernel<K><<<grid_1d(count, 128), 128, 0, as_stream(stream)>>>( \
         sino, static_cast<const float2*>(cs_sn), n_angles, n_det, list, static_cast<int>(count), box, p.rot_center, \
-        p.scale, c, p.clip_outer_circle, r * r, p.u_scale, img)
+        p.scale, c, p.clip_outer_circle, r * r, p.u_scale, img, p.fan ? d_fan.data() : nullptr, p.n_fan)
     switch (p.interp) {
         case interp_core::Linear: HELIREC_BPL(interp_core::Linear); break;
         case interp_core::Cubic: HELIREC_BPL(interp_core::Cubic); break;

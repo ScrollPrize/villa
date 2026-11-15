@@ -25,6 +25,13 @@
 //                        "off" | "a11:a12:a21:a22:c1:c2"
 //   exposure_arc         0 (default) | "auto" (the scan's recorded fraction) | a fraction; disabled with
 //                        angle_interp=views
+//   beam_divergence      true (default) | false. The geometry calibration states the beam's divergence where the
+//                        record gives the source's distance (its layout's fan). With it the exact backprojector
+//                        (fbp) follows the diverging rays in the slice (ReconConfig::fan_per_column): scans at
+//                        different places across the beam are turned against each other by the fan between them,
+//                        and a point nearer the source is read further from the axis. false, a calibration
+//                        without a fan, another backprojector, mode legacy_reference: a parallel beam
+//                        (info["fan_per_column"] tells what is in use)
 //   angle_subset         "" | "I/N": subset I of N interleaved subsets of the projections
 //   only_scan            "" (default: every scan, merged) | "main" | "companion" (the second scan) | "companion2", ..
 //                        | the kind a scan's name ends in ("HA", "TA", "TA2", ..): that scan's projections alone, at
@@ -161,6 +168,9 @@ class Reconstruction {
     Device device() const;
     double rot_center() const;
     double rolling_shutter() const;       // the geometry calibration's row timing (0 in mode legacy_reference)
+    // the beam's divergence handed to the reconstructor [rad per column of the frames read] (0: beam_divergence
+    // false, a calibration without a fan, mode legacy_reference)
+    double beam_divergence() const;
     double exposure_arc() const;          // the parameter resolved
     std::string sharpness_weighting() const;  // the parameter resolved: "a11:...:c2" or "" (off)
     std::string resolved_sld() const;     // the scintillator model as the reconstructor's keys (JSON object text)

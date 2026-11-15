@@ -450,6 +450,25 @@ on its own from Python (`helirec._core`, re-exported in `helirec`) on NumPy arra
     device). `nearest` itself is unchanged: the slab is the same bytes as before. It needs the exact backprojector
     (FBP, bands; at most 16 turns of rows); the whole-slice methods use `nearest`. The exposure arc is not
     deconvolved with it (below).
+  * `beam_divergence=true|false` (default `true`): the beam comes from a source at a finite distance, so the ray
+    recorded at a detector column is not the parallel beam's of the frame's angle but one turned by the pixel over
+    the source's distance per column from the detector's middle (the geometry calibration's `layout.fan`, there
+    where the record states the distance; its sign: "The sense of the beam's divergence" below). FBP then
+    backprojects along those rays, in the slice: every merged column carries the fan of the detector column that
+    holds it (one table, `BackprojectParams::fan`; where two scans share a column, the mean by their weights), and
+    a pixel at `t` columns from the axis is read at `t + fan(t) x (x sin a - y cos a)`. Two things come right with
+    it: scans at different places across the beam (a grid's columns, a mosaic's tiles) are turned against each
+    other by the fan between them, and a point nearer the source is read further from the axis. The ramp filter
+    stays the parallel beam's (the exact fan-beam weights differ from 1 by the fan itself, 1e-3 at most); the
+    divergence along the axis is not taken (rays leave the slice by up to the fan x the depth; slice by slice
+    there is no room for it). `info["fan_per_column"]` is what is in use [rad per column]: 0 with
+    `beam_divergence=false`, a calibration without a fan, another backprojector than FBP (ghbp has its own
+    `axis_source_meters`) and in mode `legacy_reference`.
+    On PHerc. 172 at Diamond I12 (source 51 m, 7.91 um: 1.55e-7 rad per column): the columns of the grid, 2285
+    merged columns apart, lay 0.72 and 1.06 px apart along the tangent on the ring they share (the two rows of
+    scans; expected 0.79) and lie -0.03 and +0.31 px apart with it; with the fan's sign reversed 1.47 and 1.82.
+    The kernel takes 0.096 s against 0.080 s for a block of 4096 x 4096 px over 3600 views (RTX 5090, 5 runs each,
+    medians), under a second per whole slice of 13 861 px.
   * `exposure_arc=auto|F` (default `0`: off): in a continuous scan the detector integrates while the sample turns, a
     box blur along the angle of F angular steps (tangential, growing with the radius: 0.7 px at r = 1000 px for
     PHerc0343P). `auto` takes F from the scan (the recorded rotation swept per exposure / per period, 0.91 here;
@@ -1191,7 +1210,8 @@ frames beyond half a turn); at Diamond I12 it is further back: scans moved 2275 
 same view 0.19 frames apart, the other way round. The sample turns the other way against the detector's columns
 there for the same recorded angle. A record states it as `scan/fan_sense` (-1; the supplement file's `fan_sense`
 for an NXtomo scan), and `read_acquisition` then gives the fan the other sign. The recorded angle is not reversed:
-the volume keeps the handedness the recorded angle gives it.
+the volume keeps the handedness the recorded angle gives it. The reconstruction takes the same signed fan
+(`beam_divergence`, above).
 
 **A camera whose two halves are read at once** (an sCMOS with a rolling shutter, as the PCO.edge):
 `--rows-from-middle` (`Options::rows_from_middle`, `Acquisition::rows_from_middle`; no record states it). The rows'
@@ -1491,8 +1511,8 @@ every projection's own axis and row being in its terms. It needs `x_interp=sinc`
 frame and what the calibration measured that the reconstruction cannot express. `mode=legacy_reference` takes the
 merged frame alone. On PHerc0343P, without projection filters it costs
 no time (7.5 s per 32 slices against 7.3–8.4 s); with Paganin and unsharp a slab of 256 slices takes 53 s against
-32–33 s. What the reconstruction still does not do exactly (the beam's divergence, the six-row kernel along the
-rows; views a turn apart are backprojected each at its own angle since `angle_interp=views`, section 34) is listed
+32–33 s. What the reconstruction still does not do exactly (the beam's divergence along the axis, the six-row kernel along the
+rows; in the slice the divergence is applied by FBP since `beam_divergence`; views a turn apart are backprojected each at its own angle since `angle_interp=views`, section 34) is listed
 in `development_notes/calibration/05_experiments.md`, section 33.
 
 ## Tests
@@ -1586,7 +1606,8 @@ These raise explicit errors:
 * xz slices are not implemented.
 
 The intensity calibration's kernels are CPU-only (they are cheap); the geometry calibration step registers on
-the CPU or on CUDA. The reconstruction is parallel-beam and slice by slice: what depends on the depth along the
-ray (the beam's divergence, the axis' tilt, and of a scan's tilt against the first the part about the direction
-across the beam) is measured by the geometry calibration and not applied
+the CPU or on CUDA. The reconstruction is slice by slice: FBP follows the beam's divergence within the slice
+(`beam_divergence`); what takes a ray out of its slice by the depth along it (the divergence along the axis, the
+axis' tilt, and of a scan's tilt against the first the part about the direction across the beam) is measured by
+the geometry calibration and not applied
 (`provenance()["geometry"]["measured_not_applied"]`).

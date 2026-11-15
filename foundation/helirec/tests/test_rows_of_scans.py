@@ -113,3 +113,33 @@ def test_rows_the_beam_does_not_light_are_not_seen_through(tmp_path, device):
     apart[4:10] = 1.0
     assert recon(grid(tmp_path, lit=(4, 10), weight=apart), device, **kw).info["doable"] == (-4, 1) or \
         recon(grid(tmp_path, lit=(4, 10), weight=apart), device, **kw).info["doable"] == (4, 9)
+
+
+@pytest.mark.parametrize("device", helirec.devices())
+def test_the_fan_of_a_grids_columns(tmp_path, device):
+    """A beam that diverges (fan_per_column): every merged column takes the fan of the detector column that holds
+    it, counted from that scan's middle column, so the fan starts again at each place across the beam; over the
+    columns two places share it goes from one's to the other's by their weights. Rows of scans at one place share
+    their columns' fan. Only the exact backprojector takes it."""
+    kw = dict(backprojector="fbp", grid_size=0, rot_center=11.5, luminosity_repartition=0.)
+    k = 1e-3
+    r = recon(grid(tmp_path), device, fan_per_column=k, **kw)
+    fan = np.array(r.fan_of_columns)
+    m = np.arange(ND + 16)
+    first, second = k * (m - 0.5 * (ND - 1)), k * (m - 16 - 0.5 * (ND - 1))
+    assert r.info["fan_per_column"] == k and fan.shape == (ND + 16,)
+    np.testing.assert_allclose(fan[:16], first[:16], atol=1e-7)          # the first place alone
+    np.testing.assert_allclose(fan[ND:], second[ND:], atol=1e-7)         # the second alone
+    np.testing.assert_allclose(fan[16:ND], 0.5 * (first + second)[16:ND], atol=1e-7)   # both, at equal weights
+    # weights that fall towards a scan's last columns: the shared columns go from the first's fan to the second's
+    w = np.ones((NR, ND), np.float32)
+    w[:, 16:] = np.linspace(1, 0, ND - 16, dtype=np.float32)
+    ramped = np.array(recon([circular_scan(tmp_path, "a", 0, 0, weight=w), circular_scan(tmp_path, "b", 16, 0, weight=w[:, ::-1].copy())], device, fan_per_column=k, **kw).fan_of_columns)
+    share = np.linspace(0, 1, ND - 16)
+    np.testing.assert_allclose(ramped[17:ND - 1], ((1 - share) * first[16:ND] + share * second[16:ND])[1:-1], atol=1e-6)
+    # the slices change with it, and a parallel beam's are as before
+    off = recon(grid(tmp_path), device, **kw)
+    assert off.info["fan_per_column"] == 0 and len(off.fan_of_columns) == 0
+    np.testing.assert_array_equal(recon(grid(tmp_path), device, fan_per_column=0.0, **kw).reconstruct(0, 2), off.reconstruct(0, 2))
+    # another backprojector takes the beam as parallel
+    assert recon(grid(tmp_path), device, fan_per_column=k, **dict(kw, backprojector="ghbp", angle_interp="linear")).info["fan_per_column"] == 0

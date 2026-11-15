@@ -147,6 +147,12 @@ class HelicalRecon:
         (0 in mode legacy_reference: one angle per frame)"""
         return self._r.rolling_shutter()
 
+    def beam_divergence(self) -> float:
+        """the beam's divergence handed to the reconstructor [rad per column of the frames read]: the geometry
+        calibration's fan, or 0 (params["beam_divergence"] false, a calibration without a fan, mode legacy_reference).
+        info["fan_per_column"] is what the backprojector in use takes of it (fbp: all; the others: 0)"""
+        return self._r.beam_divergence()
+
     def exposure_arc(self) -> float:
         """params["exposure_arc"] resolved: a number, or "auto" = the main scan's recorded fraction (0 if unknown)"""
         return self._r.exposure_arc()
