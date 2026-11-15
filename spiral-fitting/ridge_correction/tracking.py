@@ -101,14 +101,15 @@ def candidates(R, rmin=RMIN, nc=NC):
     return cu.astype(np.float32), cr.astype(np.float32)
 
 
-def winding_candidates(P):
+def winding_candidates(P, history=False):
     """Candidates of one winding's node profiles P (n, 41) float64.
 
     Returns cu, cr (n, NC) float32 (candidate offsets in windings and their
     correlation, best first, NaN padded) and u1, c1 (n,) float32 (the single
-    best offset and its confidence, as the plain estimator gives them)."""
+    best offset and its confidence, as the plain estimator gives them); with
+    ``history`` also the template history of estimate.sheet_template."""
     ok = np.isfinite(P).all(1)
-    T, _ = sheet_template(E, P)
+    T, hist = sheet_template(E, P)
     cu = np.full((len(P), NC), np.nan, np.float32)
     cr = np.full((len(P), NC), np.nan, np.float32)
     u1 = np.zeros(len(P), np.float32)
@@ -121,7 +122,7 @@ def winding_candidates(P):
         uu, cc = E.estimate(P[ok], T)
         u1[ok] = uu
         c1v[ok] = cc
-    return cu, cr, u1, c1v
+    return (cu, cr, u1, c1v, hist) if history else (cu, cr, u1, c1v)
 
 
 DEF = dict(CMIN=0.60, CA=0.80, UA=0.25, DMAX=0.20, MARGIN=0.30, JMAX=0.30, WX=0.0)

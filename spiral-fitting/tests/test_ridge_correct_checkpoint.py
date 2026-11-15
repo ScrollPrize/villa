@@ -111,6 +111,31 @@ def test_estimator_recovers_known_shifts_of_synthetic_profiles():
     assert 0.95 < slope < 1.05
 
 
+def test_template_centre_outside_the_window_falls_back_to_the_grid_maximum():
+    U = est.U
+    window = U[np.abs(U) <= est.CENTRE_WINDOW + 1e-9]
+    # concave slope: the smoothed template rises through the window, its vertex lies far outside
+    T = U - 0.5 * U ** 2
+    old = est.peak_zero(T, clip=False)
+    z, vertex, grid, clipped = est.peak_zero_info(T)
+    assert abs(old - grid) > est.DU and abs(old) > 0.3 and vertex == old
+    assert z == grid == window[-1] and clipped
+    # convex slope: the vertex is a minimum far away on the other side
+    T = -U + 0.05 * U ** 2
+    assert abs(est.peak_zero(T, clip=False)) > 0.3
+    assert abs(est.peak_zero(T) - (-0.3)) < 1e-12
+
+
+def test_template_centre_of_an_interior_peak_is_unchanged_bit_for_bit():
+    rng = np.random.default_rng(0)
+    U = est.U
+    for c in list(np.linspace(-0.27, 0.27, 55)) + list(rng.uniform(-0.25, 0.25, 200)):
+        T = 80 + 10 * np.exp(-0.5 * ((U - c) / 0.12) ** 2) + rng.normal(0, 0.05, len(U))
+        z, vertex, _, clipped = est.peak_zero_info(T)
+        assert not clipped
+        assert np.float64(z).tobytes() == np.float64(est.peak_zero(T, clip=False)).tobytes() == np.float64(vertex).tobytes()
+
+
 def _strip(saturated):
     """A gap strip with a steep softplus (like real fits); optionally ~15% of the cells
     saturated at the minimum gap, where the gap map is flat and gap -> logit does not invert."""
@@ -339,6 +364,10 @@ def test_end_to_end_on_the_synthetic_ct(synthetic, base):
     assert np.sqrt(((f[moved] - d_true[moved]) ** 2).mean()) < 0.04
     assert rep["write"]["fidelity_failures"] == [] and rep["write"]["logits_changed"] > 0
     assert rep["write"]["verify_at_nodes"]["rms_err_w"] < 0.005
+    # every winding reports its template centre, inside the window
+    cen = rep["template_centres"]
+    assert set(cen) == {str(k) for k in range(rep["windings"][0], rep["windings"][1] + 1)}
+    assert all(abs(v["centre"]) <= est.CENTRE_WINDOW + 1e-9 for v in cen.values() if v)
     # profiles that leave the CT are NaN and their nodes never move
     assert rep["extraction"]["nan_profiles"] > 0
     stacks = _stacks(d, "base.ckpt")

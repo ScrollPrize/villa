@@ -94,7 +94,12 @@ def run(args, log=stage.log_line, slab_rows=4, stop_after_slabs=None):
                        "work_cpu_s": float(sum(s["work_cpu_s"] for s in e["slabs"])),
                        "slabs_resumed": int(sum(bool(s.get("resumed")) for s in e["slabs"]))},
         "field": field_stats,
+        "template_centres": {str(k): v for k, v in e["centres"].items()},
     }
+    edge = [k for k, v in e["centres"].items() if v and v["on_window_edge"]]
+    if edge:
+        log(f"[ridge] warning: template centre on the edge of its +-{stage.est.CENTRE_WINDOW:g} winding window "
+            f"(ridge peak outside it) for windings {', '.join(map(str, edge))}")
     t_write = time.time()
     try:
         rep_write, Ueff = stage.write(fit, U, output, band=band, windings=windings,

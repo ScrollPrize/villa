@@ -396,8 +396,20 @@ def _nan_nodes(work_dir, plan):
 def _candidates_job(job):
     work_dir, plan, k, c0, c1 = job
     nr = plan.rows[1] - plan.rows[0]
-    cu, cr, u1, c1v = trk.winding_candidates(_sheet_stack(work_dir, plan, c0, c1).reshape(-1, 41))
-    return k, c0, c1, cu.reshape(nr, c1 - c0, -1), cr.reshape(nr, c1 - c0, -1), u1.reshape(nr, -1), c1v.reshape(nr, -1)
+    cu, cr, u1, c1v, hist = trk.winding_candidates(_sheet_stack(work_dir, plan, c0, c1).reshape(-1, 41), history=True)
+    return (k, c0, c1, cu.reshape(nr, c1 - c0, -1), cr.reshape(nr, c1 - c0, -1), u1.reshape(nr, -1), c1v.reshape(nr, -1),
+            template_centre(hist))
+
+
+def template_centre(hist):
+    """Final template centre of one winding (windings) from estimate.sheet_template's history: the centre,
+    whether its last step fell back to the grid maximum, whether any step did, and whether it sits on the
+    edge of the centre window. None when the winding had too few finite profiles for a template."""
+    if not hist:
+        return None
+    z = hist[-1]["final_z0"]
+    return {"centre": z, "clipped": bool(hist[-1]["clipped"]), "clipped_any_step": any(h["clipped"] for h in hist),
+            "on_window_edge": bool(abs(z) >= est.CENTRE_WINDOW - 1e-9)}
 
 
 def tracking_inputs(work_dir, plan, idx, threads=1):
@@ -416,6 +428,7 @@ def tracking_inputs(work_dir, plan, idx, threads=1):
     c1 = np.zeros((nr, W), np.float32)
     jobs = [(work_dir, plan, k, int(idx[k - 1]), int(idx[k])) for k in range(k0, k1 + 1)]
     jobs.sort(key=lambda j: -(j[4] - j[3]))
+    centres = {}
     if threads <= 1:
         results = map(_candidates_job, jobs)
         pool = None
@@ -425,7 +438,8 @@ def tracking_inputs(work_dir, plan, idx, threads=1):
         pool = mp.get_context("fork").Pool(threads, initializer=_worker_init)
         results = pool.imap_unordered(_candidates_job, jobs)
     try:
-        for _k, a, b, cu_k, cr_k, u1_k, c1_k in results:
+        for k, a, b, cu_k, cr_k, u1_k, c1_k, centre in results:
+            centres[k] = centre
             cu[:, a:b] = cu_k
             cr[:, a:b] = cr_k
             u1[:, a:b] = u1_k
@@ -446,7 +460,7 @@ def tracking_inputs(work_dir, plan, idx, threads=1):
         b = min(a + block, r1)
         if any(3 * a - 2 <= q <= 3 * (b - 1) + 2 for q in nan_fine):
             nan[a - r0:b - r0] = True
-    return {"cu": cu, "cr": cr, "u1": u1, "c1": c1, "valid": ~nan}
+    return {"cu": cu, "cr": cr, "u1": u1, "c1": c1, "valid": ~nan, "centres": dict(sorted(centres.items()))}
 
 
 def _sheet_stack(work_dir, plan, c0, c1):
@@ -507,16 +521,18 @@ def estimate(fit, ct, band, *, windings=None, work_dir, threads=1, slab_rows=4, 
     nr = plan.rows[1] - plan.rows[0]
     u = np.zeros((nr, fit.geo["Wc"]), np.float32)
     c = np.zeros((nr, fit.geo["Wc"]), np.float32)
+    centres = {}
     for k in range(windings[0], windings[1] + 1):
         c0, c1 = int(idx[k - 1]), int(idx[k])
         P = _sheet_stack(work_dir, plan, c0, c1).reshape(-1, 41)
-        T, _ = est.sheet_template(E, P, iters=SETTINGS["iters"])
+        T, hist = est.sheet_template(E, P, iters=SETTINGS["iters"])
+        centres[k] = template_centre(hist)
         if T is None:
             continue
         uu, cc = E.estimate(P, T)
         u[:, c0:c1] = uu.reshape(nr, c1 - c0)
         c[:, c0:c1] = cc.reshape(nr, c1 - c0)
-    out.update(offset=u, confidence=c)
+    out.update(offset=u, confidence=c, centres=centres)
     return out
 
 
