@@ -472,11 +472,22 @@ blank (blank: no crossings), coordinates outside `[0, 2^20)` and a dataset
 whose tracks declare different frame scales are input errors; nothing is
 dropped silently. Crossings are computed automatically at startup, whatever the
 fit's crossing limits, and cached under the fit's cache
-directory as `track_crossings/v1/<key>.npz`, keyed by the track revisions (not
-by the store's commit, the fit level or a frame scale), so the next fit of the
-same tracks loads them. Processes that miss one file together (the ranks of a
-distributed fit) take its `.lock`: one computes, the others wait and load its
-file. The input manifest records them as
+directory as `track_crossings/v2/<key>.vcobj`, keyed by the track revisions
+(not by the store's commit, the fit level or a frame scale), so the next fit of
+the same tracks loads them. That file is itself a small object store, local to
+the cache and never served: a sealed, history-off collection with one
+`crossing` edge per pair of crossing tracks and one row of the
+`ext_track_crossings` table (point index and arclength on each track, and the
+clearance, in stored voxels), written with the store's sharded streaming
+importer and read back as columns (`vc_object_store/docs/extensions.md`). It
+names the tracks by UUID and records the store position they were read at; it
+holds no tracks. A cache that cannot be read is recomputed and replaced, and
+one that cannot be written (a read-only cache directory, a filesystem without
+hard links) only costs the computation again: neither fails a fit. Processes
+that miss one cache together (the ranks of a distributed fit) take its
+`.lock`: one computes, the others wait and load its store. A crashed write can
+leave `.building-*` or `.compact-*` files beside it, which are safe to delete.
+The input manifest records the crossings as
 `derived_inputs.track_crossing` (`source`, `algorithm`, `parameters`, `count`,
 `sha256`), which a resume and an input update compare. `crossing`
 relationships a store holds, and approvals, rejections or edits of them, no
@@ -1622,7 +1633,7 @@ bypassing DBM and pickle decoding.
 
 A fit computes its track crossings automatically from the tracks it selects
 in the object store, with the same exact-crossing kernel, and caches them
-under its cache directory (`track_crossings/v1/<key>.npz`; see **Track
+under its cache directory (`track_crossings/v2/<key>.vcobj`; see **Track
 crossings** under the object-store inputs). It does not read the store's
 `crossing` relationships, so approving, rejecting or editing stored crossings
 no longer affects fitting, and no build step is needed for it.

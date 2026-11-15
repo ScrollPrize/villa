@@ -1,9 +1,11 @@
 """Tracks read from an object store, and the crossings the fit computes from
 them."""
+import contextlib
 import dataclasses
 import json
 import pathlib
 import threading
+import types
 
 import numpy as np
 import pytest
@@ -455,7 +457,14 @@ def computes(monkeypatch):
 
 def _cache_files(cache):
     directory = cache / osi.TRACK_CROSSING_CACHE_DIRECTORY
-    return sorted(directory.glob('*.npz')) if directory.is_dir() else []
+    return sorted(directory.glob('*.vcobj')) if directory.is_dir() else []
+
+
+def _cached_selection(db):
+    """(ordered tracks, the crossing key) of the store's current selection."""
+    snapshot = osi.read_snapshot(db, osi.InputRequest())
+    tracks, rows = osi._ordered_tracks(snapshot.objects_of('track'))
+    return tracks, osi._track_crossing_key(tracks, rows)
 
 
 def test_crossings_are_cached_by_the_track_revisions(db, tmp_path, computes):
@@ -463,7 +472,7 @@ def test_crossings_are_cached_by_the_track_revisions(db, tmp_path, computes):
     tracks = _lattice(db)
     first, _ = _materialize_tracks(db, cache_directory=str(cache))
     [cached] = _cache_files(cache)
-    assert cached.suffix == '.npz' and len(computes) == 1
+    assert cached.suffix == '.vcobj' and cached.is_file() and len(computes) == 1
     again, _ = _materialize_tracks(db, cache_directory=str(cache))
     assert len(computes) == 1 and again.derived == first.derived
     _assert_same_crossings(again.crossings, first.crossings)
@@ -480,55 +489,183 @@ def test_crossings_are_cached_by_the_track_revisions(db, tmp_path, computes):
     assert changed.derived['count'] == first.derived['count']
 
 
-def _damage(path, damage):
+def test_the_cache_is_a_sealed_store_of_the_crossing_pairs(db, tmp_path):
+    """What the cache holds: one row per crossing pair, keyed by track
+    UUIDs, with the selection's key, the CSR's checksum and the store
+    position the tracks were read at."""
+    from vc_object_store import CollectionReader
+    _lattice(db)
+    inputs, _ = _materialize_tracks(db, cache_directory=str(tmp_path / 'cache'))
+    [cached] = _cache_files(tmp_path / 'cache')
+    tracks, key = _cached_selection(db)
+    status = db.status()
+    with CollectionReader(str(cached)) as reader:
+        info = reader.track_crossing_info()
+        columns = reader.track_crossing_columns()
+        tables = reader.extension_tables()  # one per shard
+    assert info['key'] == key and info['checksum'] == inputs.derived['sha256']
+    assert info['algorithm'] == tracks_module.TRACK_CROSSING_ALGORITHM
+    assert info['parameters'] == tracks_module.TRACK_CROSSING_PARAMETERS
+    assert info['tracks'] == len(tracks) == 6 and info['crossings'] == inputs.derived['count'] == 9
+    assert info['based_on'] == [{'store_uuid': str(status['store']), 'generation': str(status['generation']),
+                                 'commit_sequence': int(status['commit_sequence'])}]
+    assert tables and all(table['name'] == 'ext_track_crossings' and not table['versioned']
+                          and table['format_version'] == 1 for table in tables)
+    assert len(columns['a']) == 9 and columns['a'].shape == (9, 16)
+    uuids = {bytes.fromhex(obj.uuid.replace('-', '')) for obj in tracks}
+    assert all(bytes(a) < bytes(b) and {bytes(a), bytes(b)} <= uuids
+               for a, b in zip(columns['a'], columns['b']))
+    # The pairs are the computed table, whatever row order the tracks have.
+    rebuilt = osi._crossings_from_columns(columns, osi._track_uuid_bytes(tracks))
+    assert tracks_module.crossing_csr_sha256(rebuilt) == inputs.derived['sha256']
+
+
+def test_cached_pairs_find_their_rows_by_the_whole_uuid():
+    """Rows are looked up by UUID halves: tracks whose UUIDs share the first
+    half are still told apart, and an unknown track is refused."""
+    high = bytes(range(8))
+    names = [high + bytes([0] * 7 + [low]) for low in (9, 3, 250, 4)] + [bytes([200 + i] * 16) for i in range(3)]
+    uuids = np.frombuffer(b''.join(names), dtype=np.uint8).reshape(-1, 16)
+    pairs = [(1, 0), (3, 2), (1, 2), (5, 0), (4, 6)]  # rows; a < b by UUID bytes below
+
+    def columns(pairs):
+        ordered = [sorted(pair, key=lambda row: names[row]) for pair in pairs]
+        return {'a': uuids[[a for a, _ in ordered]], 'b': uuids[[b for _, b in ordered]],
+                'local_a': np.array([10 * a for a, _ in ordered], dtype=np.int32),
+                'local_b': np.array([10 * b for _, b in ordered], dtype=np.int32),
+                'position_a': np.array([a + 0.5 for a, _ in ordered]),
+                'position_b': np.array([b + 0.5 for _, b in ordered]),
+                'clearance': np.arange(len(ordered), dtype=np.float64)}
+    csr = osi._crossings_from_columns(columns(pairs), uuids)
+    tracks_module._validate_crossing_partner_csr(csr)
+    rows = np.repeat(np.arange(len(names)), np.diff(csr['offsets']))
+    assert sorted(zip(rows.tolist(), csr['partners'].tolist())) == sorted(
+        pair for a, b in pairs for pair in ((a, b), (b, a)))
+    np.testing.assert_array_equal(csr['self_local'], 10 * rows)
+    np.testing.assert_array_equal(csr['partner_local'], 10 * csr['partners'])
+    np.testing.assert_array_equal(csr['positions'], rows + 0.5)
+    back = osi._crossing_columns(csr, uuids)
+    again = osi._crossings_from_columns(dict(zip(
+        ('a', 'b', 'local_a', 'local_b', 'position_a', 'position_b', 'clearance'), back)), uuids)
+    assert tracks_module.crossing_csr_sha256(again) == tracks_module.crossing_csr_sha256(csr)
+    for unknown in (high + bytes([0] * 7 + [5]), high + bytes([0] * 7 + [251]), bytes(16), bytes([255] * 16)):
+        foreign = columns(pairs[:1])
+        foreign['b'] = np.frombuffer(unknown, dtype=np.uint8).reshape(1, 16)
+        with pytest.raises(ValueError, match='not selected'):
+            osi._crossings_from_columns(foreign, uuids)
+
+
+def test_isolated_tracks_keep_their_empty_rows(db, tmp_path, computes):
+    """Tracks without a crossing are rows all the same, from a cache too."""
+    _lattice(db)
+    put_track(db, _line((50, 5, 5), 2, 20), 99, 'horizontal')
+    first, _ = _materialize_tracks(db, cache_directory=str(tmp_path / 'cache'))
+    again, _ = _materialize_tracks(db, cache_directory=str(tmp_path / 'cache'))
+    assert len(computes) == 1 and len(first.crossings['offsets']) == 8
+    assert 0 in np.diff(first.crossings['offsets'])
+    _assert_same_crossings(again.crossings, first.crossings)
+
+
+def _rewrite(db, path, change):
+    """Replaces the cache store by one of a changed CSR, checksum, key or
+    selection: a store that is whole but not this selection's crossings."""
+    tracks, key = _cached_selection(db)
+    csr, sha256 = osi._load_track_crossings(str(path), key, tracks)
+    csr = {name: values.copy() for name, values in csr.items()}
+    if change == 'checksum':
+        csr['positions'] = csr['positions'] + 1.0
+    elif change == 'rows':
+        tracks = tracks[:2]
+        csr = osi._empty_crossings(2)
+    elif change == 'key':
+        key = '0' * 64
+    elif change == 'foreign':
+        # The same crossings between tracks of which one is not selected.
+        tracks = [types.SimpleNamespace(uuid='00000000-0000-4000-8000-000000000001'), *tracks[1:]]
+    path.unlink()
+    osi._store_track_crossings(str(path), key, csr, sha256, tracks)
+    assert path.is_file()
+
+
+def _damage(db, path, damage):
     data = path.read_bytes()
     if damage == 'garbage':
-        path.write_bytes(b'not a zip archive')
+        path.write_bytes(b'not a store at all')
     elif damage == 'empty':
         path.write_bytes(b'')
     elif damage == 'truncated':
         path.write_bytes(data[:len(data) // 2])
-    elif damage == 'crc':
-        # One byte of an array's data: the archive's CRC no longer matches.
-        _, csr = tracks_module.read_crossing_csr_file(path)
-        byte = data.index(csr['positions'].tobytes()) + 3
-        path.write_bytes(data[:byte] + bytes([data[byte] ^ 0xff]) + data[byte + 1:])
+    elif damage == 'directory':
+        path.unlink()
+        path.mkdir()
+        (path / 'collection.vcobj').write_bytes(b'')
     else:
-        metadata, csr = tracks_module.read_crossing_csr_file(path)
-        if damage == 'checksum':
-            csr['positions'] = csr['positions'] + 1.0
-        elif damage == 'dtype':
-            csr['partners'] = csr['partners'].astype(np.int64)
-            np.savez(path, metadata=np.asarray(json.dumps(metadata)), **csr)
-            return
-        elif damage == 'rows':
-            csr = osi._empty_crossings(2)
-            metadata['sha256'] = tracks_module.crossing_csr_sha256(csr)
-        elif damage == 'key':
-            metadata['key'] = '0' * 64
-        tracks_module.write_crossing_csr_file(path, csr, metadata)
+        _rewrite(db, path, damage)
 
 
-@pytest.mark.parametrize('damage', ['garbage', 'empty', 'truncated', 'crc', 'checksum', 'dtype',
-                                    'rows', 'key'])
-def test_a_damaged_cache_file_is_a_miss_and_is_rebuilt(db, tmp_path, computes, capsys, damage):
+@pytest.mark.parametrize('damage', ['garbage', 'empty', 'truncated', 'checksum', 'rows', 'key',
+                                    'foreign'])
+def test_a_damaged_cache_store_is_a_miss_and_is_rebuilt(db, tmp_path, computes, capsys, damage):
     cache = tmp_path / 'cache'
     _lattice(db)
     first, _ = _materialize_tracks(db, cache_directory=str(cache))
     [cached] = _cache_files(cache)
-    intact = cached.read_bytes()
-    _damage(cached, damage)
-    assert cached.read_bytes() != intact
+    _damage(db, cached, damage)
     again, _ = _materialize_tracks(db, cache_directory=str(cache))
     assert len(computes) == 2 and 'ignoring invalid track crossing cache' in capsys.readouterr().out
     assert again.derived == first.derived
     _assert_same_crossings(again.crossings, first.crossings)
-    assert _cache_files(cache) == [cached] and cached.read_bytes() == intact
+    # The bad store was replaced by a good one: the next fit reads it.
+    assert _cache_files(cache) == [cached]
+    third, _ = _materialize_tracks(db, cache_directory=str(cache))
+    assert len(computes) == 2 and 'ignoring' not in capsys.readouterr().out
+    _assert_same_crossings(third.crossings, first.crossings)
+
+
+def test_crossings_that_are_no_table_of_pairs_are_not_cached(db, tmp_path, capsys):
+    _lattice(db)
+    _materialize_tracks(db, cache_directory=str(tmp_path / 'cache'))
+    [cached] = _cache_files(tmp_path / 'cache')
+    tracks, key = _cached_selection(db)
+    csr, sha256 = osi._load_track_crossings(str(cached), key, tracks)
+    lopsided = {**csr, 'clearances': csr['clearances'] + np.arange(len(csr['clearances']))}
+    cached.unlink()
+    osi._store_track_crossings(str(cached), key, lopsided, sha256, tracks)
+    assert not cached.exists() and 'not caching the track crossings' in capsys.readouterr().out
+
+
+def test_an_unusable_cache_does_not_fail_the_fit(db, tmp_path, computes, capsys, monkeypatch):
+    """A cache that cannot be read or written leaves the computed crossings
+    in use; a bad store is deleted only by the process holding the lock."""
+    cache = tmp_path / 'cache'
+    _lattice(db)
+    first, _ = _materialize_tracks(db, cache_directory=str(cache))
+    [cached] = _cache_files(cache)
+    cached.write_bytes(b'not a store at all')
+
+    @contextlib.contextmanager
+    def unlocked(path):
+        yield False
+    with monkeypatch.context() as patch:
+        patch.setattr(osi, '_track_crossing_lock', unlocked)
+        again, _ = _materialize_tracks(db, cache_directory=str(cache))
+    assert len(computes) == 2 and cached.read_bytes() == b'not a store at all'
+    _assert_same_crossings(again.crossings, first.crossings)
+
+    def refuse(*args, **kwargs):
+        raise RuntimeError('the store cannot publish here')
+    import vc_object_store
+    with monkeypatch.context() as patch:
+        patch.setattr(vc_object_store, 'write_track_crossing_store', refuse)
+        third, _ = _materialize_tracks(db, cache_directory=str(cache))
+    assert len(computes) == 3 and not cached.exists()
+    assert 'cannot write the track crossing cache' in capsys.readouterr().out
+    _assert_same_crossings(third.crossings, first.crossings)
 
 
 def test_a_process_that_waited_for_the_crossings_reads_them(db, tmp_path, computes, monkeypatch):
-    """Ranks that miss one cache file together: one computes, the rest wait
-    for its file."""
+    """Ranks that miss one cache store together: one computes, the rest wait
+    for its store."""
     from service_files import ExclusiveFileLock
     _lattice(db)
     first, _ = _materialize_tracks(db, cache_directory=str(tmp_path / 'first'))
@@ -547,35 +684,36 @@ def test_a_process_that_waited_for_the_crossings_reads_them(db, tmp_path, comput
             db, snapshot, z_begin=0, z_end=64, cache_directory=str(tmp_path / 'cache'))))
         waiter.start()
         assert waiting.wait(30) and not result  # it found the lock held
-        path.write_bytes(written.read_bytes())  # ... and publishes its file
+        path.write_bytes(written.read_bytes())  # ... and publishes its store
     waiter.join(30)
     assert not waiter.is_alive() and len(computes) == 1
     assert result[0][0].derived == first.derived
+    _assert_same_crossings(result[0][0].crossings, first.crossings)
 
 
-def test_concurrent_writers_leave_one_complete_cache_file(db, tmp_path):
+def test_concurrent_writers_leave_one_complete_cache_store(db, tmp_path):
     _lattice(db)
-    snapshot = osi.read_snapshot(db, osi.InputRequest())
-    inputs, _ = osi.materialize_tracks(db, snapshot, z_begin=0, z_end=64,
-                                       cache_directory=str(tmp_path / 'first'))
+    inputs, _ = _materialize_tracks(db, cache_directory=str(tmp_path / 'first'))
     [written] = _cache_files(tmp_path / 'first')
-    metadata, csr = tracks_module.read_crossing_csr_file(written)
+    tracks, key = _cached_selection(db)
+    csr, sha256 = osi._load_track_crossings(str(written), key, tracks)
     path = tmp_path / 'cache' / osi.TRACK_CROSSING_CACHE_DIRECTORY / written.name
     start = threading.Barrier(8)
 
     def write():
         start.wait()
         for _ in range(5):
-            osi._store_track_crossings(str(path), metadata['key'], csr, metadata['sha256'])
+            osi._store_track_crossings(str(path), key, csr, sha256, tracks)
     writers = [threading.Thread(target=write) for _ in range(8)]
     for writer in writers:
         writer.start()
     for writer in writers:
         writer.join()
     assert _cache_files(tmp_path / 'cache') == [path]
-    assert path.read_bytes() == written.read_bytes()
-    loaded, sha256 = osi._load_track_crossings(str(path), metadata['key'], 6)
-    assert sha256 == inputs.derived['sha256']
+    loaded, loaded_sha256 = osi._load_track_crossings(str(path), key, tracks)
+    assert loaded_sha256 == sha256 == inputs.derived['sha256']
+    for name in CSR_ARRAYS:
+        np.testing.assert_array_equal(loaded[name], csr[name], err_msg=name)
 
 
 def test_a_warm_cache_serves_another_fit_level_and_frame_scale(db, tmp_path, computes):

@@ -154,7 +154,7 @@
     "patch_sampling_core_weight": "Extra draw-chance factor for inner-core patches (see patch_sampling_core_radius), applied on top of the name weights.",
     "patch_erode_patches": "Number of grid cells to trim from the edges of each patch's valid region when patches are loaded, removing their often less reliable borders. A patch that erodes to nothing is dropped. 0 disables trimming. A patch can override this in its own metadata.",
     "input_use_verified_patches": "Read patches from the object store and allow their radius/DT supervision.",
-    "input_use_tracks": "Read tracks from the object store and allow track sampling and losses. Their crossings are computed automatically from the selected tracks at startup and cached under the fit's cache directory (track_crossings/v1); crossing relationships stored in the object store, and approvals or edits of them, do not affect the fit.",
+    "input_use_tracks": "Read tracks from the object store and allow track sampling and losses. Their crossings are computed automatically from the selected tracks at startup and cached under the fit's cache directory (track_crossings/v2); crossing relationships stored in the object store, and approvals or edits of them, do not affect the fit.",
     "input_use_fibers": "Read fibers from the object store into the point-collection supervision pools.",
     "input_use_fiber_directions": "Load packed fiber-direction samples and allow their orientation loss.",
     "input_use_pcl_absolute": "Read absolute-winding point collections from the object store. The PCL role toggles must agree: roles are read from each collection's metadata, so all three select every PCL or none.",
