@@ -20,8 +20,9 @@
 #     -f volume-cartographer/scripts/Dockerfile.appimage \
 #     --build-arg BUILDER_IMAGE=vc-builder:dev .
 
-# Published builder with deps recipe hash 675836fc3d478d17 (also used by PR CI).
-ARG BUILDER_IMAGE=ghcr.io/scrollprize/villa/volume-cartographer@sha256:1bebf104edbd6c290ddbaf8036c919635259f3722e8eddb31340b240baf1ed68
+# Published builder with deps recipe hash 6309e96d71462b0a (amd64 image of
+# builder-ubuntu-26.04-294ac4cf2, the first with libconcurrentqueue-dev).
+ARG BUILDER_IMAGE=ghcr.io/scrollprize/villa/volume-cartographer@sha256:e1c9abfd3f89cdb24fa0c4330d907408035669630f6450643d9055f486daab9b
 
 FROM ${BUILDER_IMAGE} AS build
 ARG DEBIAN_FRONTEND=noninteractive
