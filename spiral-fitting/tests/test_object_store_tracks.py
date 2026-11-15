@@ -2,6 +2,7 @@
 them."""
 import dataclasses
 import json
+import pathlib
 import threading
 
 import numpy as np
@@ -176,20 +177,50 @@ def test_tracks_pair_only_within_their_dataset(db):
     assert inputs.tracks.selected_source_ids.tolist() == [0, 1, 2, 3]
 
 
-def test_the_owning_store_does_not_group_tracks(db):
-    """The group is the dataset_ref string: tracks read from another owner
-    (an overlay's override) pair, and are cached, as before."""
-    _lattice(db)
+def test_spellings_of_one_dataset_are_one_group(db):
+    """The store resolves a track's dataset (its owning store's directory /
+    its dataset_ref), as its track-track detector does: two spellings of one
+    path are one dataset, and their tracks cross."""
+    put_track(db, _line((10, 60, 50), 2, 40), 0, 'horizontal', dataset='tracks.vctracks')
+    put_track(db, _line((10, 55, 55), 1, 32), 1, 'vertical', dataset='./tracks.vctracks')
     snapshot = osi.read_snapshot(db, osi.InputRequest())
-    tracks = sorted(snapshot.objects_of('track'), key=osi._track_order)
-    rows = osi._track_crossing_rows(tracks)
-    key = osi._track_crossing_key(tracks, rows)
-    for obj in tracks[::2]:
-        obj.record['version_store'] = '0b0f3c1e-8d2a-4c57-9f10-6a5e4d3c2b1a'
-        assert obj.reference['store'] == '0b0f3c1e-8d2a-4c57-9f10-6a5e4d3c2b1a'
-    overridden = osi._track_crossing_rows(tracks)
-    assert overridden.groups == rows.groups == [('tracks.vctracks', 0, 6)]
-    assert osi._track_crossing_key(tracks, overridden) == key
+    [dataset] = {obj.dataset for obj in snapshot.objects_of('track')}
+    assert dataset.endswith('/tracks.vctracks') and '/./' not in dataset
+    inputs, counts = _materialize_tracks(db)
+    assert counts['track crossings'] == 1
+    assert inputs.crossings['partners'].tolist() == [1, 0]
+    # The store's own detector pairs them too.
+    assert db.link_tracks_to_tracks()['edges_created'] == 1
+
+
+def test_one_file_name_in_two_source_stores_is_two_datasets(tmp_path):
+    """Tracks an overlay inherits from two stores that each name
+    ``tracks.vctracks`` beside themselves belong to two datasets: they do
+    not cross, and the stores may reuse source IDs."""
+    from vc_object_store import write_extension_store
+    owners = {}
+    for name, families in (('one', ('horizontal', 'vertical')), ('two', ('vertical', 'horizontal'))):
+        (tmp_path / name).mkdir()
+        with ObjectStore.create(str(tmp_path / name / 'base.vcobj'), author='ingest') as base:
+            # Source ID 0 is the same line in both stores, in opposite
+            # families: one dataset would cross them at every voxel.
+            owners[put_track(base, _line((10, 60, 50), 2, 40), 0, families[0])] = name
+            owners[put_track(base, _line((10, 55, 55), 1, 32), 1, families[1])] = name
+            base.seal()
+    (tmp_path / 'top').mkdir()
+    overlay = tmp_path / 'top' / 'overlay.vcobj'
+    write_extension_store(str(overlay), [str(tmp_path / name / 'base.vcobj') for name in ('one', 'two')],
+                          [], {})
+    with ObjectStore.open(str(overlay), read_only=True) as db:
+        snapshot = osi.read_snapshot(db, osi.InputRequest())
+        datasets = {obj.uuid: obj.dataset for obj in snapshot.objects_of('track')}
+        assert {uuid: pathlib.Path(dataset).parent.name for uuid, dataset in datasets.items()} == owners
+        inputs, counts = osi.materialize_tracks(db, snapshot, z_begin=0, z_end=64)
+    assert counts['tracks'] == 4 and counts['track crossings'] == 2
+    crossings = inputs.crossings
+    # Each store's two tracks cross each other, and nothing else.
+    assert crossings['offsets'].tolist() == [0, 1, 2, 3, 4]
+    assert crossings['partners'].tolist() == [1, 0, 3, 2]
 
 
 def test_tracks_keep_their_window_order_and_frame(db):
@@ -256,9 +287,10 @@ class _Recording:
     def __getattr__(self, name):
         return getattr(self._store, name)
 
-    def selected_inputs(self, refs, position):
-        self.endpoints.update(ref['object'] for ref in refs)
-        return self._store.selected_inputs(refs, position)
+    def selected_inputs(self, refs, position, relationship_refs=None):
+        self.endpoints.update(
+            ref['object'] for ref in (refs if relationship_refs is None else relationship_refs))
+        return self._store.selected_inputs(refs, position, relationship_refs)
 
     def relationships_at_versions(self, refs):
         self.endpoints.update(ref['object'] for ref in refs)
@@ -299,47 +331,30 @@ def test_crossing_links_of_a_store_change_nothing_and_are_never_read(db):
 
 
 def test_tracks_are_read_under_the_selected_inputs_guard(db):
-    """Tracks are read as objects alone, under the store's guard of a
+    """Tracks are validated with the other inputs by the store's one
     selected read: retained versions, at a position the store still has."""
+    from vc_object_store import StoreBusy
     tracks = _lattice(db)
     request = osi.InputRequest()
     selected = osi.resolve_selection(db, request)
     assert osi.read_snapshot(db, request, selected).objects.keys() == set(tracks)
     uuid = next(iter(tracks))
-
-    def reading(**status):
-        class Store:
-            def __getattr__(self, name):
-                return getattr(db, name)
-
-            def status(self):
-                return {**db.status(), **status}
-
-            def selected_inputs(self, refs, position):
-                return db.selected_inputs(refs, position)
-        return osi.read_snapshot(Store(), request, selected)
     gone = 'requested graph position is no longer available'
-    with pytest.raises(osi.ObjectStoreInputError, match=gone):
-        reading(generation='0b0f3c1e-8d2a-4c57-9f10-6a5e4d3c2b1a')
-    with pytest.raises(osi.ObjectStoreInputError, match=gone):
-        reading(commit_sequence=selected.position.commit_sequence - 1)
-    # A later head still holds the versions, unless one of them is another
-    # store's (an overlay's inherited object), whose membership may move.
-    assert reading(commit_sequence=selected.position.commit_sequence + 1).objects.keys() == set(tracks)
-    inherited = dataclasses.replace(selected, references={
-        **selected.references, uuid: dict(selected.references[uuid], store=uuid)})
-    with pytest.raises(osi.ObjectStoreInputError, match=gone):
-        osi._selected_tracks(type('Moved', (), {
-            'objects_at_versions': lambda self, refs: db.objects_at_versions(
-                [selected.references[ref['object']] for ref in refs]),
-            'status': lambda self: {**db.status(),
-                                    'commit_sequence': selected.position.commit_sequence + 1}})(),
-            inherited.pins(), inherited['track'])
-    # A version the store does not retain is refused, as the store refuses it.
+    for moved in (dataclasses.replace(selected.position,
+                                      generation='0b0f3c1e-8d2a-4c57-9f10-6a5e4d3c2b1a'),
+                  dataclasses.replace(selected.position,
+                                      commit_sequence=selected.position.commit_sequence + 1)):
+        with pytest.raises(StoreBusy, match=gone):
+            osi.read_snapshot(db, request, dataclasses.replace(selected, position=moved))
+    # A version the store does not retain is refused.
     missing = dataclasses.replace(selected, references={
         **selected.references, uuid: dict(selected.references[uuid], version=99)})
-    with pytest.raises(osi.ObjectStoreInputError, match=f'selected object is not retained: {uuid}'):
+    with pytest.raises(ValueError, match=f'selected object is not retained: {uuid}'):
         osi.read_snapshot(db, request, missing)
+    # A later head still holds the selected versions.
+    db.set_meta(uuid, 'review_note', 'seen')
+    assert db.status()['commit_sequence'] > selected.position.commit_sequence
+    assert osi.read_snapshot(db, request, selected).objects.keys() == set(tracks)
 
 
 # ---------------------------------------------------------------------------
@@ -354,17 +369,17 @@ def _crossing_pair(db, **second):
 
 
 @pytest.mark.parametrize('second, problem', [
-    ({'family': 'diagonal'}, "unknown family 'diagonal'"),
-    ({'key': '07'}, "external_key '07' is not a canonical decimal source ID"),
-    ({'key': 'seven'}, "external_key 'seven' is not a canonical decimal source ID"),
-    ({'key': str(1 << 64)}, 'is not a canonical decimal source ID'),
-    ({'coordinates': frame(2)}, "dataset 'tracks.vctracks' are in different frames"),
+    ({'family': 'diagonal'}, "invalid stored track family 'diagonal'"),
+    ({'key': '07'}, 'must be a canonical decimal source ID: 07'),
+    ({'key': 'seven'}, 'must be a canonical decimal source ID: seven'),
+    ({'key': str(1 << 64)}, 'must be a canonical decimal source ID'),
+    ({'coordinates': frame(2)}, "tracks.vctracks' are in different frames"),
 ])
 def test_track_metadata_crossings_cannot_use_is_refused(db, second, problem):
     uuid = _crossing_pair(db, **second)
     with pytest.raises(osi.ObjectStoreInputError) as error:
         _materialize_tracks(db)
-    assert problem in str(error.value) and (uuid in str(error.value) or 'dataset' in problem)
+    assert problem in str(error.value) and (uuid in str(error.value) or 'frames' in problem)
 
 
 def test_a_source_key_is_one_track_of_its_dataset(db):
@@ -373,13 +388,13 @@ def test_a_source_key_is_one_track_of_its_dataset(db):
     assert counts['tracks'] == 2 and counts['track crossings'] == 0
     # One store refuses the same key twice in a dataset; tracks of several
     # owners could still bring it.
-    tracks = sorted(osi.read_snapshot(db, osi.InputRequest()).objects_of('track'),
-                    key=osi._track_order)
+    tracks = osi.read_snapshot(db, osi.InputRequest()).objects_of('track')
+    assert len({obj.dataset for obj in tracks}) == 2
     for obj in tracks:
-        obj.record['track']['dataset_ref'] = 'tracks.vctracks'
+        obj.dataset = '/data/tracks.vctracks'
     with pytest.raises(osi.ObjectStoreInputError,
-                       match="share the external_key '0' in dataset 'tracks.vctracks'"):
-        osi._track_crossing_rows(sorted(tracks, key=osi._track_order))
+                       match='duplicate registered track source ID 0 in dataset /data/tracks.vctracks'):
+        osi._ordered_tracks(tracks)
 
 
 def test_track_points_crossings_cannot_index_are_refused(db, monkeypatch):

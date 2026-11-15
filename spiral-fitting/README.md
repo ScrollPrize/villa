@@ -460,9 +460,13 @@ revisions alone: exact shared voxels of opposite-family tracks, found with the
 native kernel `vc_spiral.track_crossings` (required for store tracks) and its
 fixed parameters (30 degrees, tangent radius 12 voxels, cluster radius 4 point
 indices, one representative per pair), the implementation the store's
-`track-track` detector shares. Tracks pair only within their dataset (the
-`dataset_ref` string; the owning store is not part of it), in numeric
-`external_key` order. An `external_key` that is no canonical decimal source ID
+`track-track` detector shares. Tracks pair only within their dataset, in
+numeric `external_key` order; the dataset of a track (its owning store's
+directory / its `dataset_ref`, resolved), the grouping, the order and their
+checks are the store's, shared with that detector (`selected_inputs`'
+`track_datasets`, `vc_object_store.group_track_datasets`), so two spellings of
+one path are one dataset and one file name beside two source stores is two. An
+`external_key` that is no canonical decimal source ID
 or repeats within its dataset, a family other than `horizontal`, `vertical` or
 blank (blank: no crossings), coordinates outside `[0, 2^20)` and a dataset
 whose tracks declare different frame scales are input errors; nothing is

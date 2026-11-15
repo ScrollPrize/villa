@@ -343,6 +343,10 @@ def adapter_metadata(kind, meta, fiber=None, track=None):
 @dataclasses.dataclass
 class StoredObject(SelectedObject):
     frame: ObjectFrame = None
+    # A track's dataset as its owning store resolves it (selected_inputs'
+    # track_datasets): what its crossings are grouped by. Not an input of
+    # its own: the track's reference and dataset_ref determine it.
+    dataset: str = None
 
     @property
     def metadata_sha256(self):
@@ -809,8 +813,10 @@ def read_snapshot(store, request, selected=None):
     object is read at the version the selection resolved it at
     (objects_at_versions), and the relationships between those versions
     (relationships_at_versions) are guarded against moving overlay membership.
-    Tracks are read as objects only (_selected_tracks): no relationship of a
-    track is read, since the fit computes their crossings itself.
+    One native read (selected_inputs) validates and returns every object; of
+    the tracks it enumerates no relationship (``relationship_refs``), since
+    the fit computes their crossings itself, and it reports each track's
+    dataset as the store resolves it.
     Every selected object must declare a frame in the fit volume; all frame
     problems are reported together. The selected outer shell is
     read alongside, in the same volume, but is not among ``objects``.
@@ -824,11 +830,16 @@ def read_snapshot(store, request, selected=None):
     position = selected.position
     pins = selected.pins()
     tracks = frozenset(selected['track'])
-    captured = store.selected_inputs(
-        [ref for ref in pins.refs() if ref['object'] not in tracks], position.provenance())
+    refs = pins.refs()
+    if tracks:
+        captured = store.selected_inputs(
+            refs, position.provenance(),
+            relationship_refs=[ref for ref in refs if ref['object'] not in tracks])
+    else:
+        captured = store.selected_inputs(refs, position.provenance())
     revisions = {revision['object_uuid']: revision for revision in captured['objects']}
     relationships_read = captured['relationships']
-    revisions.update(_selected_tracks(store, pins, selected['track']))
+    track_datasets = captured.get('track_datasets') or {}
 
     notes, problems = [], []
     usable = []
@@ -867,7 +878,7 @@ def read_snapshot(store, request, selected=None):
             problems.append(f'{record["kind"]} {record["uuid"]} '
                             f'({record["name"]!r}): {error}')
             return None
-        return StoredObject(revision, frame)
+        return StoredObject(revision, frame, track_datasets.get(record['uuid']))
 
     objects = {}
     for revision in usable:
@@ -887,43 +898,6 @@ def read_snapshot(store, request, selected=None):
         volume_source=volume_source, request=pinned_request, objects=objects,
         relationships=relationships, exclusions=exclusions, notes=notes,
         outer_shell=shell_object)
-
-
-def _retained_versions(store, refs):
-    """objects_at_versions as the store answers it now. A served store's
-    handle answers numbered records from its cache, which still holds a
-    version the store no longer retains (a history-off edit); the selection's
-    retention check therefore asks the service itself."""
-    endpoint = getattr(store, 'endpoint', None)
-    if endpoint and hasattr(store, 'session'):
-        from vc_object_store import HostedStore
-        return HostedStore(endpoint).objects_at_versions(refs)
-    return store.objects_at_versions(refs)
-
-
-def _selected_tracks(store, pins, uuids):
-    """{UUID: revision} of the selected tracks at their pinned versions,
-    read as objects alone, under the guard the store applies to
-    selected_inputs: every version must be retained, and the store must
-    still be the pins' store and generation at or after their position (at
-    exactly it when a pinned object is owned by another store, whose
-    membership a later commit may change). The store is checked after the
-    read, so one that moved meanwhile is refused."""
-    if not uuids:
-        return {}
-    revisions = {}
-    refs = pins.refs(uuids)
-    for ref, revision in zip(refs, _retained_versions(store, refs)):
-        if revision is None or revision.get('deleted'):
-            raise ObjectStoreInputError([f'selected object is not retained: {ref["object"]}'])
-        revisions[revision['object_uuid']] = revision
-    position, status = pins.position, store.status()
-    inherited = any(str(ref['store']) != str(status['store']) for ref in pins.refs())
-    if (not position.same_store(status) or status['commit_sequence'] < position.commit_sequence
-            or (inherited and status['commit_sequence'] != position.commit_sequence)):
-        raise ObjectStoreInputError([
-            'selected inputs: requested graph position is no longer available'])
-    return revisions
 
 
 def store_location(store):
@@ -1605,73 +1579,64 @@ TRACK_CROSSING_CACHE_FORMAT = 1
 TRACK_COORDINATE_LIMIT = 1 << 20
 
 
-def _track_order(obj):
-    """Tracks sort by dataset, then numeric source key, then UUID."""
-    track = obj.track or {}
-    key = str(track.get('external_key') or '')
-    return (str(track.get('dataset_ref') or ''), not key.isdigit(),
-            int(key) if key.isdigit() else 0, key, obj.uuid)
-
-
 @dataclasses.dataclass
 class _CrossingRows:
-    """What the crossings of ordered tracks (_track_order) depend on besides
-    their points: per row the kernel's family code, the numeric source key
-    and the stored -> fit scale, and the groups (``(dataset, first row, end
-    row)``) tracks pair within."""
+    """What the crossings of ordered tracks (_ordered_tracks) depend on
+    besides their points: per row the kernel's family code, the numeric
+    source key and the stored -> fit scale, and the groups (``(dataset,
+    first row, end row)``) tracks pair within."""
     families: np.ndarray
     keys: np.ndarray
     to_fit: np.ndarray
     groups: list
 
 
-def _track_crossing_rows(tracks):
-    """The _CrossingRows of ordered tracks.
+def _ordered_tracks(tracks):
+    """``(tracks in crossing order, their _CrossingRows)``.
 
-    Tracks pair only within a group: the tracks of one ``dataset_ref``
-    string, which are consecutive rows in numeric ``external_key`` order (as
-    the store's detector orders them by source id). A key that is no
-    canonical decimal uint64 or repeats in its group, a family other than
-    horizontal, vertical or blank, and a group in more than one frame scale
-    are input errors."""
-    problems = []
-    families = np.full(len(tracks), -1, dtype=np.int8)
-    keys = np.zeros(len(tracks), dtype=np.uint64)
-    to_fit = np.array([obj.frame.to_fit for obj in tracks], dtype=np.float64)
-    groups = []
-    previous = None  # the last canonical key of the group, and its track
-    for row, obj in enumerate(tracks):
-        track = obj.track or {}
-        dataset = str(track.get('dataset_ref') or '')
-        if not groups or groups[-1][0] != dataset:
-            groups.append([dataset, row, row])
-            previous = None
-        groups[-1][2] = row + 1
-        family = track.get('family')
-        if family in TRACK_FAMILY_CODES:
-            families[row] = TRACK_FAMILY_CODES[family]
-        elif family not in (None, ''):
-            problems.append(f'track {obj.uuid} has the unknown family {family!r} '
-                            f'(expected {sorted(TRACK_FAMILY_CODES)} or none)')
-        key = track.get('external_key')
-        if (isinstance(key, str) and key.isascii() and key.isdigit()
-                and str(int(key)) == key and int(key) < 1 << 64):
-            keys[row] = int(key)
-            if previous is not None and previous[0] == key:
-                problems.append(f'tracks {previous[1]} and {obj.uuid} share the '
-                                f'external_key {key!r} in dataset {dataset!r}')
-            previous = (key, obj.uuid)
-        else:
-            problems.append(f'track {obj.uuid} external_key {key!r} is not a canonical '
-                            'decimal source ID')
-    for dataset, begin, end in groups:
+    Tracks pair only within a dataset, and are consecutive rows of it in
+    source-ID order. The grouping, the order and their validation are the
+    store's (vc_object_store.group_track_datasets, which its track-track
+    detector uses; the dataset of a track is the one the store resolved for
+    the selection): a track without a dataset, an ``external_key`` that is
+    no canonical decimal uint64 or repeats in its dataset and a family
+    other than horizontal, vertical or blank are input errors. So is a
+    dataset in more than one frame scale, which only a fit can tell."""
+    from vc_object_store import group_track_datasets
+    tracks = list(tracks)
+    unresolved = [obj.uuid for obj in tracks if not obj.dataset]
+    if unresolved:
+        raise ObjectStoreInputError([
+            f'the store did not resolve the dataset of {len(unresolved)} selected track(s) '
+            f'(first: {unresolved[0]}); a served store needs a vc_object_server of this version'])
+    try:
+        groups = group_track_datasets(
+            [obj.uuid for obj in tracks], [obj.dataset for obj in tracks],
+            [str((obj.track or {}).get('external_key') or '') for obj in tracks],
+            [str((obj.track or {}).get('family') or '') for obj in tracks])
+    except RuntimeError as error:
+        raise ObjectStoreInputError([str(error)]) from error
+    order = [np.frombuffer(group['rows'], dtype=np.int64) for group in groups]
+    ordered = [tracks[row] for rows in order for row in rows.tolist()]
+    families = np.concatenate(
+        [np.frombuffer(group['families'], dtype=np.int8) for group in groups]
+        or [np.empty(0, dtype=np.int8)]).astype(np.int8)
+    keys = np.concatenate(
+        [np.frombuffer(group['source_ids'], dtype=np.uint64) for group in groups]
+        or [np.empty(0, dtype=np.uint64)]).astype(np.uint64)
+    to_fit = np.array([obj.frame.to_fit for obj in ordered], dtype=np.float64)
+    bounds, begin, problems = [], 0, []
+    for group, rows in zip(groups, order):
+        end = begin + len(rows)
+        bounds.append((group['dataset'], begin, end))
         scales = sorted(set(to_fit[begin:end].tolist()))
         if len(scales) > 1:
-            problems.append(f'the tracks of dataset {dataset!r} are in different frames '
+            problems.append(f'the tracks of dataset {group["dataset"]!r} are in different frames '
                             f'(stored -> fit scales {scales}); their crossings need one')
+        begin = end
     if problems:
         raise ObjectStoreInputError(problems)
-    return _CrossingRows(families, keys, to_fit, [tuple(group) for group in groups])
+    return ordered, _CrossingRows(families, keys, to_fit, bounds)
 
 
 def _empty_crossings(rows):
@@ -1859,7 +1824,7 @@ def materialize_tracks(store, snapshot, *, z_begin, z_end,
     The crossings are computed here, from the stored points of every
     selected track (those outside the z window included), and are a function
     of the selected track revisions alone: exact shared voxels of
-    opposite-family tracks of one dataset (_track_crossing_rows,
+    opposite-family tracks of one dataset (_ordered_tracks,
     _compute_track_crossings). Crossing relationships a store holds are not
     read. ``cache_directory`` (the fit's cache) keeps them, in stored
     voxels, for the next fit of the same track revisions; ``workers`` bounds
@@ -1868,12 +1833,11 @@ def materialize_tracks(store, snapshot, *, z_begin, z_end,
     """
     from tracks import PackedTrackCollection, crossing_csr_sha256
 
-    tracks = sorted(snapshot.objects_of('track'), key=_track_order)
     counts = Counter()
-    if not tracks:
+    if not snapshot.objects_of('track'):
         return None, counts
     cached = cache_path = key = None
-    rows = _track_crossing_rows(tracks)
+    tracks, rows = _ordered_tracks(snapshot.objects_of('track'))
     if cache_directory:
         key = _track_crossing_key(tracks, rows)
         cache_path = _track_crossing_cache_path(cache_directory, key)
