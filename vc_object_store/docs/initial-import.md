@@ -112,3 +112,24 @@ Coordinate/source metadata is parsed and serialized once. The initial object INS
 Initial geometry uses the ordinary manifest encoder, sequence identity/annotation format, current-descriptor writer and chunk writer. Preparation consumes per-point source annotations into shared metadata and computes managed object fields before the single initial object insertion; surfaces also derive their grid dimensions and area before inserting the detail row. It does not call `putGeometry`, mutate metadata afterward, stamp an existing record, scan incident edges or repair an existing geometry. Preparation and publication share the caller's rollback boundary. Newly inserted chunks need no redundant byte readback: SQLite has stored the supplied payload. When a hash already exists, its bytes are still compared, including pinned external payloads, so corrupt or colliding hashes are rejected.
 
 Relationship anchors are supplied by the producer without owner-geometry reads during batch construction. Neither local nor sibling/external endpoints create a descriptor copy, subtype row, geometry copy or registration entry. Current relations refer to the current endpoints, with later ordinary edits checked transactionally. Historical relationships retain endpoint version references only when history is enabled.
+
+## Bulk tracks: `vc_object_ingest --bulk`
+
+`vc_object_ingest --tracks` normally commits one transaction per track. For millions of small tracks that is hours: each track costs about
+2 to 3 ms of store work (measured on 557,248 tracks: 1.0 ms writing the geometry, 0.4 ms the object row, 0.3 ms the commit, one core),
+and batching the commits does not help because the cost is per object. `--bulk` builds the tracks through `importInitialCollection`
+instead (`ingestTracksBulk`):
+
+```
+vc_object_ingest --bulk --bulk-shards 8 --db scroll.vcobj --author NAME --tracks tracks.dbm --volume-uuid ID --scale-factor 1
+```
+
+* `--db scroll.vcobj.tracks` is the new **sealed, history-off** collection (one shard: one SQLite file; N shards: a directory with
+  `collection.vcobj`). `--db scroll.vcobj` (must not exist) is an **editable overlay root** over it (`ObjectCollection::create`), which is
+  what a fit opens: it opens read-write and reads every track through the overlay. The sealed collection cannot be opened writable.
+* Objects carry the same records, coordinate frame and geometry as the per-track path; identities are fresh random UUIDs, as there.
+  `scripts/compare_track_stores.py` checks equivalence of a per-track store and a bulk store (names, metadata, geometry attributes,
+  points bytes). On 4,000 random tracks of a 557,248-track window: 0 mismatches.
+* Measured (hub CPU, window of 557,248 tracks, tracks on a 99 %-full RAID): per-track path about 23 min (about 400 tracks/s); `--bulk`
+  1 shard 46 s, 8 shards 19 s. The bulk store is also smaller (1.0 GB against about 3 GB).
+* The per-track path is unchanged and remains the default.

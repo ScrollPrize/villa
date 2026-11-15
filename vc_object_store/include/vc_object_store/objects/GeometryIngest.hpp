@@ -108,6 +108,15 @@ GeometryIngestReport ingestRegisteredGeometry(ObjectStore& db,
     const std::vector<std::string>& objectUuids = {}, const util::ProgressCallback& progress = {},
     const std::string& coordinateContext = "{}");
 
+// Bulk mode for packed tracks. The per-track path commits one transaction per track (about 2-3 ms of store work each: 11.4 M tracks
+// take hours). This builds a NEW sealed, history-off collection at `destination` (must not exist) through importInitialCollection,
+// with `shards` parallel writers (UUID-hash routed; 1 shard = one ordinary SQLite file, more = a directory with collection.vcobj).
+// Objects get the same records and metadata as the per-track path (identities are fresh random UUIDs, as there). The result is
+// insertion-only and cannot be opened writable: put an editable ObjectCollection root over it (vc_object_ingest --bulk does).
+// Throws on any failure and leaves no destination.
+GeometryIngestReport ingestTracksBulk(const std::filesystem::path& source, const std::filesystem::path& destination,
+    const std::string& author, const std::string& coordinateContext, const std::vector<std::string>& tags, std::size_t shards);
+
 // Create new objects and ingest one source: a tifxyz surface directory or a
 // folder of them, vc3d_fiber JSON, collection or directory, vc_pointcollections
 // JSON (all collections), or packed tracks (.vctracks directory or DBM path with

@@ -41,6 +41,7 @@ void normalizeMetadata(GeometrySource& p, const std::string& coordinateContext)
     p.object.meta = metadata.dump();
 }
 }
+void detail::normalizeIngestMetadata(GeometrySource& p, const std::string& coordinateContext) { normalizeMetadata(p, coordinateContext); }
 std::string detail::sourceUuid(const std::string& uuid)
 {
     try { return util::canonicalUuid(uuid); }
