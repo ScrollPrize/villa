@@ -231,7 +231,8 @@ struct Fixture {
 // Everything the workspace displays or reports of a read.
 Json describe(const vc3d::spiral::FitInputs& inputs)
 {
-    Json result = {{"problems", inputs.problems}, {"added", Json::array()}};
+    Json result = {{"problems", inputs.problems}, {"added", Json::array()},
+                   {"crossings_not_compared", inputs.crossingsNotCompared}};
     for (const auto& link : inputs.addedRelationships) result["added"].push_back({link.uuid, link.a, link.b});
     const auto points = [](const std::vector<cv::Vec3d>& values) {
         Json list = Json::array();
@@ -271,6 +272,127 @@ vc3d::spiral::FitInputs incremental(Fixture& fixture, const Json& document, vc3d
     require(describe(previous) == describe(full), "incremental read differs from a full read after " + what
                 + ":\n" + describe(previous).dump() + "\n" + describe(full).dump());
     return full;
+}
+
+// A fit computes its track crossings from its tracks: no read takes a track
+// as a relationship endpoint, so a store's crossings are neither read nor
+// reported, while the other families are compared as before. A manifest of
+// an older fit, which lists its crossings as relationships, keeps a "not
+// compared" state instead of an unqualified "as fitted".
+void trackCrossingsAreNeverReadOrCompared(const fs::path& directory)
+{
+    using vc3d::spiral::LinkState;
+    Fixture fixture(directory / "crossings.vcobj");
+    const std::string a = util::newUuid(), b = util::newUuid();
+    std::string crossing;
+    fixture.act({{a, std::nullopt}, {b, std::nullopt}}, [&](auto& db, auto& txn) {
+        for (const auto& uuid : {a, b}) {
+            ObjectRecord record; record.uuid = uuid; record.kind = "track"; record.name = "track";
+            record.meta = Json{{"coordinates", volumeCoordinates(kVolume, 1)}}.dump();
+            record.track = TrackDetail{"tracks.vctracks", uuid == a ? "7" : "8", uuid == a ? "horizontal" : "vertical"};
+            db.upsertObject(txn, record);
+            GeometryData data{"track", 1, "source_xyz", "{}",
+                              {array("points", "<i4", {3, 3}, std::vector<int32_t>{1, 1, 20, 8, 8, 20, 16, 16, 20})}};
+            db.putGeometry(txn, uuid, data);
+        }
+    });
+    fixture.act(fixture.pins({a, b}), [&](auto& db, auto& txn) {
+        EdgeRecord edge; edge.kind = "crossing"; edge.aUuid = a; edge.bUuid = b;
+        edge.aAnchor.points = {{"points", {1}}}; edge.bAnchor.points = {{"points", {1}}};
+        crossing = db.addEdge(txn, edge);
+    });
+    // The manifest of a fit of every object: its tracks, and the crossings
+    // it derived from them.
+    auto document = fixture.manifest();
+    Json crossingEntry;
+    fixture.session->readStore(fixture.attachment, [&](const StoreReader& reader, const auto&) {
+        std::vector<ObjectVersion> heads;
+        for (const auto& uuid : {a, b}) {
+            const auto current = reader.currentObject(uuid);
+            heads.push_back(current->reference());
+            document["manifest"]["objects"].push_back(
+                {{"uuid", uuid}, {"kind", "track"}, {"name", current->record.name},
+                 {"reference", Json::parse(objectVersionToJson(current->reference()))},
+                 {"generation", current->generation}, {"version", current->version},
+                 {"geometry_revision", *current->geometryRevision},
+                 {"metadata", vc3d::spiral::adapterMetadata("track", Json::parse(current->record.meta),
+                                                            std::nullopt, current->record.track)},
+                 {"scale_factor", 1.0}});
+        }
+        // The crossing as a fit that read it as a relationship recorded it.
+        for (const auto& selected : reader.relationshipsAt(heads)) {
+            const auto& version = selected.relationship;
+            crossingEntry = {{"reference", Json::parse(relationshipVersionToJson(version.reference()))},
+                             {"uuid", version.record.uuid}, {"kind", "crossing"}, {"family", "track_crossing"},
+                             {"approval_state", version.record.approvalState}, {"version", version.version},
+                             {"a", a}, {"b", b}};
+        }
+    });
+    require(crossingEntry.value("uuid", std::string()) == crossing, "the fixture's crossing is stored");
+    document["manifest"]["derived_inputs"] = {{"track_crossing", {
+        {"source", "computed"}, {"algorithm", "vc_spiral.track_crossings/1"}, {"count", 1},
+        {"sha256", std::string(64, 'a')}}}};
+
+    const auto noTrackRead = [&](const vc3d::spiral::FitInputs& read, const char* what) {
+        require(!read.relationshipEndpoints.contains(a) && !read.relationshipEndpoints.contains(b), what);
+    };
+    auto inputs = fixture.read(document);
+    require(inputs.unchanged() && inputs.tracks.size() == 2 && inputs.relationships.size() == 1
+                && inputs.addedRelationships.empty() && inputs.crossingsNotCompared == 0
+                && vc3d::spiral::uncomparedTrackCrossings(document) == 0,
+            "a store's crossing among the fitted tracks is no link of the fit");
+    noTrackRead(inputs, "a full read takes no track as a relationship endpoint");
+    require(inputs.relationshipEndpoints == std::set<std::string>{fixture.surface, fixture.pcl, fixture.fiber},
+            "the other fitted objects are endpoints");
+    noTrackRead(fixture.changes(document, {}, {crossing}).inputs, "a crossing notification reads no track's relationships");
+    noTrackRead(fixture.changes(document, {a, b}, {crossing}).inputs, "a track edit reads no track's relationships");
+    require(fixture.changes(document, {fixture.surface, a}, {}).inputs.relationshipEndpoints
+                == std::set<std::string>{fixture.surface, fixture.pcl},
+            "another object's relationships are read, with their endpoints");
+    // A change notification naming only the crossing, then a track's edit.
+    inputs = incremental(fixture, document, inputs, {}, {crossing}, "a crossing notification");
+    require(inputs.unchanged(), "a crossing notification changes nothing");
+    fixture.act(fixture.pins({a}), [&](auto& db, auto& txn) { db.setMeta(txn, a, "review_note", "\"seen\""); });
+    inputs = incremental(fixture, document, inputs, {a}, {}, "a track edit");
+    require(inputs.unchanged() && inputs.addedRelationships.empty(), "a track's crossings stay unread");
+    fixture.act(fixture.pins({a, b}), [&](auto& db, auto& txn) { db.removeEdge(txn, crossing); });
+    inputs = incremental(fixture, document, inputs, {a, b}, {crossing}, "a crossing's removal");
+    require(inputs.unchanged(), "removing a store's crossing changes nothing");
+
+    // A fit made before fits computed their crossings lists them: they are
+    // not compared (the removed one is not reported dropped), and the fit is
+    // never reported unchanged, through incremental and failed reads alike.
+    auto legacy = document;
+    legacy["manifest"].erase("derived_inputs");
+    legacy["manifest"]["relationships"].push_back(crossingEntry);
+    require(vc3d::spiral::uncomparedTrackCrossings(legacy) == 1
+                && vc3d::spiral::uncomparedTrackCrossings(Json::object()) == 0
+                && vc3d::spiral::uncomparedTrackCrossings(Json{{"manifest", {{"relationships", 3}}}}) == 0,
+            "listed crossings are counted from the manifest alone");
+    inputs = fixture.read(legacy);
+    require(inputs.crossingsNotCompared == 1 && !inputs.unchanged() && inputs.problems.empty()
+                && inputs.relationships.size() == 1 && inputs.count(LinkState::Dropped) == 0
+                && inputs.count(LinkState::Fitted) == 1 && inputs.addedRelationships.empty(),
+            "listed crossings are not compared, and not reported as fitted");
+    noTrackRead(inputs, "a legacy manifest's tracks are no relationship endpoints either");
+    noTrackRead(fixture.changes(legacy, {a, b}, {crossing}).inputs,
+                "a legacy manifest's crossings are not read after a track edit");
+    inputs = incremental(fixture, legacy, inputs, {a}, {crossing}, "a legacy track edit");
+    require(inputs.crossingsNotCompared == 1 && !inputs.unchanged(), "the caveat survives an incremental read");
+    {
+        auto previous = inputs;
+        vc3d::spiral::applyFitInputChanges(previous, vc3d::spiral::FitInputChanges{});
+        require(previous.crossingsNotCompared == 1 && !previous.unchanged(),
+                "a failed incremental read keeps the caveat");
+    }
+    auto other = legacy;
+    other["manifest"]["store"]["uuid"] = util::newUuid();
+    require(fixture.read(other).crossingsNotCompared == 1, "a refused read keeps the caveat");
+
+    // The other families still follow notifications that name only the link.
+    fixture.act(fixture.pins({fixture.surface, fixture.pcl}), [&](auto& db, auto& txn) { db.removeEdge(txn, fixture.link); });
+    inputs = incremental(fixture, legacy, inputs, {}, {fixture.link}, "a fitted link's removal");
+    require(inputs.relationships.at(0).state == LinkState::Dropped, "a removed fitted link is dropped");
 }
 
 void readsCurrentInputsAndTheirDifferences(const fs::path& directory)
@@ -484,6 +606,7 @@ int main(int argc, char** argv)
         adapterMetadataMatchesThePythonAdapter();
         QTemporaryDir directory;
         readsCurrentInputsAndTheirDifferences(directory.path().toStdString());
+        trackCrossingsAreNeverReadOrCompared(directory.path().toStdString());
         for (auto source : {HistoryMode::Off, HistoryMode::On})
             for (auto overlay : {std::optional<HistoryMode>{}, std::optional{HistoryMode::Off}, std::optional{HistoryMode::On}}) {
                 QTemporaryDir shellDirectory;

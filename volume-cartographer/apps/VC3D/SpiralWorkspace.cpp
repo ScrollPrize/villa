@@ -1823,7 +1823,7 @@ void SpiralWorkspace::noteStoreChanges(const vc::objects::StoreSessionEvent& eve
 {
     if (!_fitDocument || event.kind != vc::objects::StoreSessionEvent::Kind::Committed
         || !event.touches({"surface", "point_collection", "fiber", "track", "point-surface",
-                           "same-surface", "fiber_branch", "crossing"}))
+                           "same-surface", "fiber_branch"}))
         return;
     const auto before = _changedOtherInputs.size();
     std::vector<std::string> otherSurfaces;
@@ -1832,11 +1832,12 @@ void SpiralWorkspace::noteStoreChanges(const vc::objects::StoreSessionEvent& eve
         const bool object = change.kind == "surface" || change.kind == "point_collection" || change.kind == "fiber"
             || change.kind == "track";
         // A fitted input, or a link that may involve one, is read again by
-        // itself. Other inputs only matter to a rebuild.
+        // itself. Other inputs only matter to a rebuild. Track crossings are
+        // no links of a fit (it computes them from its tracks): a crossing
+        // relationship's change is not read.
         if (object && _fitRecords.contains(uuid))
             _pendingObjectChanges.insert(change.recordUuid);
-        else if (change.kind == "point-surface" || change.kind == "same-surface" || change.kind == "fiber_branch"
-                 || change.kind == "crossing")
+        else if (change.kind == "point-surface" || change.kind == "same-surface" || change.kind == "fiber_branch")
             _pendingLinkChanges.insert(change.recordUuid);
         else if (change.kind == "surface")
             otherSurfaces.push_back(change.recordUuid);
@@ -1888,14 +1889,25 @@ void SpiralWorkspace::updateInputFreshness()
     if (!_changedOtherInputs.isEmpty())
         notes << tr("%n other surface(s), collection(s) or fiber(s) changed, which a "
                     "rebuild's selection may include", "", int(_changedOtherInputs.size()));
+    // A fit computes its track crossings from its tracks. One made before
+    // that read them as relationships, which are not compared: say so rather
+    // than imply they were checked.
+    const QString uncompared = inputs.crossingsNotCompared
+        ? QStringLiteral(" ") + tr("The %n track crossing(s) this fit read as store relationships are not "
+                                   "compared; a rebuild computes its crossings from its tracks.", "",
+                                   int(std::min<std::size_t>(inputs.crossingsNotCompared,
+                                                             std::numeric_limits<int>::max())))
+        : QString();
     if (notes.isEmpty()) {
-        _panel->setInputFreshness(tr("The attached store holds the fit's inputs as fitted"));
+        _panel->setInputFreshness(inputs.crossingsNotCompared
+            ? tr("The attached store holds the fit's other inputs as fitted.") + uncompared
+            : tr("The attached store holds the fit's inputs as fitted"));
         return;
     }
     // The overlays follow the store; the resident fit does not.
     _panel->setInputFreshness(tr("Stale: %1. The overlays show the store as it is now; "
                                  "Rebuild Fit reads it.")
-                                  .arg(notes.join(QStringLiteral("; "))));
+                                  .arg(notes.join(QStringLiteral("; "))) + uncompared);
 }
 
 void SpiralWorkspace::clearFitInputs(const QString& reason)
@@ -1975,6 +1987,8 @@ void SpiralWorkspace::loadFitInputs()
             });
         } catch (const std::exception& error) {
             inputs->problems.push_back(error.what());
+            // A failed read still says what the manifest cannot be compared on.
+            inputs->crossingsNotCompared = vc3d::spiral::uncomparedTrackCrossings(document);
         }
         return inputs;
     }));
