@@ -1840,7 +1840,18 @@ QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const nlo
     // Opt-in only. Existing jobs and unsupported editing/scaling modes retain
     // their old behavior unless an anchor is explicitly requested.
     const bool anchor_requested = params.contains("seed_anchor_xyz");
-    if (resume_surf && resume_surf->meta.contains("seed_anchor") && !anchor_requested)
+    const nlohmann::json* saved_anchor = nullptr;
+    if (resume_surf) {
+        const auto& metadata = resume_surf->meta;
+        if (const auto anchor = metadata.find("seed_anchor"); anchor != metadata.end()) {
+            saved_anchor = &*anchor;
+        } else if (const auto source = metadata.find("source"); source != metadata.end() && source->is_object()) {
+            // TIFXYZ import keeps the original file metadata under source.
+            if (const auto imported_anchor = source->find("seed_anchor"); imported_anchor != source->end())
+                saved_anchor = &*imported_anchor;
+        }
+    }
+    if (saved_anchor && !anchor_requested)
         throw std::runtime_error("anchored resume requires seed_anchor_xyz");
     if (anchor_requested && (scale != 1.0f ||
             params.value("growth_scale", 0) != 0 || params.contains("neural_socket") ||
@@ -1917,9 +1928,9 @@ QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const nlo
             if (!trace_data.seed_anchor.matches(seed))
                 throw std::runtime_error("explicit seed differs from seed_anchor_xyz");
         } else {
-            if (!resume_surf->meta.contains("seed_anchor"))
+            if (!saved_anchor)
                 throw std::runtime_error("resume has no seed anchor provenance");
-            const auto& saved = resume_surf->meta["seed_anchor"];
+            const auto& saved = *saved_anchor;
             if (saved.value("version", 0) != 1 || saved.value("mode", std::string()) != "fixed-vertex")
                 throw std::runtime_error("unsupported seed anchor provenance");
             const auto old = saved.at("xyz").get<std::vector<double>>();

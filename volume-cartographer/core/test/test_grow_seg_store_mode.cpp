@@ -5,6 +5,7 @@
 // neighbor copy projects and refines in one run, creating one surface.
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+#include <vc_object_store/objects/GeometryIngest.hpp>
 #include <vc_object_store/objects/StoreReader.hpp>
 #include <doctest/doctest.h>
 
@@ -128,6 +129,49 @@ TEST_CASE("A neighbor copy projects and refines in one run and creates one surfa
     CHECK(meta.at("vc_gsfs_mode") == "resume");  // the projection was refined in the same run
     // The source's vertices outside this small volume are invalid, which leaves one quad to copy.
     CHECK(load_quad_from_store(vc::objects::LocalStoreReader(store, txn), copied)->countValidPoints() >= 4);
+    std::error_code ignored;
+    fs::remove_all(dir, ignored);
+}
+
+TEST_CASE("A TIFXYZ import keeps the GrowPatch anchor when resumed")
+{
+    const char* tool = std::getenv("VC_GROW_SEG_FROM_SEED_BIN");
+    REQUIRE(tool);
+    const fs::path dir = fs::temp_directory_path() / ("vc-grow-import-anchor-" + util::newUuid());
+    writeSheets(dir, {64});
+    const nlohmann::json anchor = {64, 64, 64};
+    nlohmann::json params{{"generations", 4}, {"thread_limit", 1}, {"min_area_cm", 0},
+                         {"seed_anchor_xyz", anchor}};
+    std::ofstream(dir / "grow.json") << params;
+    const std::string common = std::string("\"") + tool + "\" --volume \"" + (dir / "volume.zarr").string() +
+        "\" --rng-seed 1";
+    REQUIRE(std::system((common + " --params \"" + (dir / "grow.json").string() + "\" --seed 64 64 64 --target-dir \"" +
+                         (dir / "tifxyz").string() + "\" --segment-name anchored > \"" +
+                         (dir / "grow.log").string() + "\" 2>&1").c_str()) == 0);
+
+    OpenOptions options; options.author = "grow-store-test";
+    const auto dbPath = dir / "objects.vcobj";
+    std::string imported;
+    {
+        auto store = ObjectStore::create(dbPath, options);
+        const auto report = ingestGeometrySource(store, "surface", dir / "tifxyz", {},
+            R"({"volume_uuid":"test-volume","scale_factor":1})");
+        REQUIRE(report.problems.empty());
+        REQUIRE(report.uuids.size() == 1);
+        imported = report.uuids.front();
+    }
+
+    params["generations"] = 5;
+    std::ofstream(dir / "resume.json") << params;
+    const auto resumed = run(common + " --params \"" + (dir / "resume.json").string() + "\" --store \"" +
+        dbPath.string() + "\" --volume-uuid test-volume --resume-opt skip --surface " + imported, dir / "resume.log");
+    {
+        auto store = ObjectStore::open(dbPath, options);
+        auto txn = store.read();
+        const auto object = store.objectByUuid(txn, resumed);
+        REQUIRE(object.has_value());
+        CHECK(nlohmann::json::parse(object->meta).at("seed_anchor").at("xyz") == anchor);
+    }
     std::error_code ignored;
     fs::remove_all(dir, ignored);
 }
