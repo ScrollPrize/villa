@@ -667,6 +667,8 @@ void detail::publishHistory(sqlite3* db, bool baseline)
                 throw std::runtime_error("object history: missing expected validation endpoint " + formatUuid(required.blob16(0)));
         }
     }
+    std::optional<GeometryPhase> step;
+    step.emplace("history.dirty_objects");
     while (dirty.row()) {
         const auto object = formatUuid(dirty.blob16(0));
         if(borrowedObject(db,object))continue;
@@ -702,6 +704,7 @@ void detail::publishHistory(sqlite3* db, bool baseline)
     }
     // Ordinary metadata is independent unless the relationship declares a
     // dependency. Check the final state, not the order of earlier API calls.
+    step.reset(); step.emplace("history.metadata_dependencies");
     for (const auto& [object, p] : objects) {
         if (!p.exists || p.delta.empty()) continue;
         // A promoted external endpoint has no fabricated local predecessor.
@@ -737,6 +740,7 @@ void detail::publishHistory(sqlite3* db, bool baseline)
     };
     std::vector<ChangedEdge> edges;
     Statement dirtyEdges(db, "SELECT uuid FROM history_dirty_edges ORDER BY uuid");
+    step.reset(); step.emplace("history.changed_edges");
     while (dirtyEdges.row()) {
         ChangedEdge e;
         e.uuid = formatUuid(dirtyEdges.blob16(0));
@@ -818,6 +822,7 @@ void detail::publishHistory(sqlite3* db, bool baseline)
     CommitPublisher commit(db, publishedAtUs, baseline);
     // Allocate all identities first: shared records may pin both revisions
     // published by this action, including cycles and self relationships.
+    step.reset(); step.emplace("history.object_revisions");
     for (auto& [object, p] : objects) {
         if (!p.exists) {
             if (const auto before = publicationBase(db, object)) {
@@ -872,6 +877,7 @@ void detail::publishHistory(sqlite3* db, bool baseline)
         if(!row.row())throw std::runtime_error("history: endpoint version unavailable");
         return row.uuid(0);
     };
+    step.reset(); step.emplace("history.edge_revisions");
     for (const auto& edge : edges) {
         if (edge.record) {
             const auto aPin = edge.aPin ? *edge.aPin : pin(edge.record->aUuid, edge.aGeometry);

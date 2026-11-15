@@ -1,6 +1,7 @@
 #include "linking/StoredGeometry.hpp"
 #include "internal/Anchors.hpp"
 #include "internal/Database.hpp"
+#include "geometry/GeometryInternal.hpp"
 #include "vc_object_store/object_links/ObjectLinks.hpp"
 #include "vc_object_store/Uuid.hpp"
 
@@ -96,6 +97,8 @@ static DetectorReport commitCandidatesImpl(objects::ObjectStore& db, objects::Wr
     }
 
     objects::util::reportProgress(progress, "reading existing links");
+    std::optional<objects::detail::GeometryPhase> phase;
+    phase.emplace("links.existing");
     std::unordered_map<std::string, EdgeRecord> existing;
     // A scoped rerun only needs links within its stale scope plus candidate
     // endpoints. Keep unscoped stale replacement's dataset-wide semantics.
@@ -142,6 +145,7 @@ static DetectorReport commitCandidatesImpl(objects::ObjectStore& db, objects::Wr
     std::set<std::string> seen;
     size_t processed = 0;
     objects::util::reportProgress(progress, "writing links", 0, candidates.size());
+    phase.reset(); phase.emplace("links.write");
     for (const auto& c : candidates) {
         objects::util::reportProgress(progress, "writing links", processed++, candidates.size());
         const std::string key = candidateKey(c);
