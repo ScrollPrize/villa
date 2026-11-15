@@ -529,32 +529,79 @@ int main()
             require(r.level[0] == 0 && near(r.values[0], value(1, 1.5f, 10), 1e-3f), "a surface frame completes too");
         }
 
-        // Many layers at once give each layer the bits it has alone: eight or more layers
-        // of a pixel may be sampled together, fewer are sampled one by one. A tilted plane
-        // through and beside the volume, so groups lie inside one chunk, across chunks
-        // and outside the volume.
+        // Rows of eight or more pixels may be sampled eight pixels at a time; narrower
+        // rasters are sampled one by one. Both give the same bits. A tilted plane through
+        // and beside the volume with two holes, so groups of eight lie inside one chunk,
+        // across chunks, outside the volume and over points that are not there; 21 columns,
+        // so each row's last group overlaps the one before it.
         {
-            const vcr::grid::Plane tilted{{3.3f, 1.2f, 2.1f}, {0.8f, 0.6f, 0}, {-0.36f, 0.48f, 0.8f}, {0.48f, -0.64f, 0.6f}, 24, 24};
-            vcr::grid::Request together;
-            together.levels = {L0};
-            together.offsets.clear();
-            for (int k = 0; k < 21; ++k)
-                together.offsets.push_back(-2.75f + 0.25f * float(k));
-            together.offsets[11] = 0.0f;
-            const auto all = vcr::grid::sample(tilted, together);
-            require(all.layers == 21 && all.values.size() == std::size_t(21 * 24 * 24), "many-layer result shape");
+            const int W = 21, H = 24, strip = 7;
+            const float origin[3]{3.3f, 1.2f, 2.1f}, dx[3]{0.8f, 0.6f, 0}, dy[3]{-0.36f, 0.48f, 0.8f}, normal[3]{0.48f, -0.64f, 0.6f};
+            std::vector<float> at(std::size_t(W * H * 3)), normals(at.size());
+            for (int j = 0; j < H; ++j)
+                for (int i = 0; i < W; ++i)
+                    for (int b = 0; b < 3; ++b) {
+                        at[std::size_t((j * W + i) * 3 + b)] = origin[b] + dx[b] * float(i) + dy[b] * float(j);
+                        normals[std::size_t((j * W + i) * 3 + b)] = normal[b];
+                    }
+            at[std::size_t((3 * W + 5) * 3)] = NAN;
+            at[std::size_t((9 * W + 20) * 3 + 2)] = NAN;
+            vcr::grid::Request request;
+            request.levels = {L0};
+            request.offsets = {-2.75f, -1.0f, 0.0f, 0.5f, 2.25f};
+            const std::size_t layers = request.offsets.size();
+            const auto wide = vcr::grid::sample(vcr::grid::Points{at.data(), normals.data(), W, H}, request);
+            require(wide.layers == int(layers) && wide.values.size() == layers * W * H, "wide raster result shape");
             std::size_t inside = 0;
-            for (std::size_t k = 0; k < together.offsets.size(); ++k) {
-                vcr::grid::Request alone;
-                alone.levels = {L0};
-                alone.offsets = {together.offsets[k]};
-                const auto one = vcr::grid::sample(tilted, alone);
-                require(std::memcmp(one.values.data(), all.values.data() + k * 24 * 24, 24 * 24 * sizeof(float)) == 0,
-                        "a layer sampled with others has the bits it has alone");
-                for (const float v : one.values)
-                    inside += v > 0;
+            for (const float v : wide.values)
+                inside += v > 0;
+            require(inside > 1000, "the wide raster samples inside the volume");
+            for (int s = 0; s < W / strip; ++s) {
+                std::vector<float> a(std::size_t(strip * H * 3)), n(a.size());
+                for (int j = 0; j < H; ++j) {
+                    std::memcpy(&a[std::size_t(j * strip * 3)], &at[std::size_t((j * W + s * strip) * 3)], strip * 3 * sizeof(float));
+                    std::memcpy(&n[std::size_t(j * strip * 3)], &normals[std::size_t((j * W + s * strip) * 3)], strip * 3 * sizeof(float));
+                }
+                const auto narrow = vcr::grid::sample(vcr::grid::Points{a.data(), n.data(), strip, H}, request);
+                for (int j = 0; j < H; ++j) {
+                    for (std::size_t k = 0; k < layers; ++k)
+                        require(std::memcmp(&narrow.values[k * strip * H + std::size_t(j * strip)],
+                                            &wide.values[k * W * H + std::size_t(j * W + s * strip)], strip * sizeof(float)) == 0,
+                                "pixels sampled eight at a time have the bits they have one by one");
+                    require(std::memcmp(&narrow.level[std::size_t(j * strip)], &wide.level[std::size_t(j * W + s * strip)], strip) == 0,
+                            "pixels sampled eight at a time report the level they report one by one");
+                }
             }
-            require(inside > 1000, "the many-layer case samples inside the volume");
+            // A pixel mask: the pixels it keeps are unchanged, the others are not sampled.
+            std::vector<std::uint8_t> mask(std::size_t(W * H));
+            for (std::size_t q = 0; q < mask.size(); ++q)
+                mask[q] = q % 3 != 0 && q / std::size_t(W) != 7;
+            request.pixels = mask.data();
+            const auto masked = vcr::grid::sample(vcr::grid::Points{at.data(), normals.data(), W, H}, request);
+            for (std::size_t q = 0; q < mask.size(); ++q) {
+                require(masked.level[q] == (mask[q] ? wide.level[q] : vcr::grid::Result::kNone), "a masked raster's levels");
+                for (std::size_t k = 0; k < layers; ++k)
+                    require(mask[q] ? std::memcmp(&masked.values[k * W * H + q], &wide.values[k * W * H + q], sizeof(float)) == 0
+                                    : std::isnan(masked.values[k * W * H + q]),
+                            "a masked raster's values");
+            }
+            // Pixels the mask leaves out read no chunk: one column kept in the wide raster
+            // reads what that column reads as a raster one pixel wide.
+            auto kept = open(fine, 16), column = open(fine, 16);
+            std::vector<float> a(std::size_t(H * 3)), n(a.size());
+            for (int j = 0; j < H; ++j) {
+                std::memcpy(&a[std::size_t(j * 3)], &at[std::size_t((j * W + 3) * 3)], 3 * sizeof(float));
+                std::memcpy(&n[std::size_t(j * 3)], &normals[std::size_t((j * W + 3) * 3)], 3 * sizeof(float));
+            }
+            for (std::size_t q = 0; q < mask.size(); ++q)
+                mask[q] = q % std::size_t(W) == 3;
+            request.levels = {{kept.get(), u8, L0.scale, L0.offset}};
+            vcr::grid::sample(vcr::grid::Points{at.data(), normals.data(), W, H}, request);
+            request.levels = {{column.get(), u8, L0.scale, L0.offset}};
+            request.pixels = nullptr;
+            vcr::grid::sample(vcr::grid::Points{a.data(), n.data(), 1, H}, request);
+            require(column->stats().disk_hits.load() > 0 && kept->stats().disk_hits.load() == column->stats().disk_hits.load(),
+                    "pixels a mask leaves out read no chunk");
         }
 
         // Placement maps: scale form when axis aligned, otherwise general.
