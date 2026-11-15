@@ -1,0 +1,11 @@
+{
+  "volume": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0800/volumes/20250521135224-8.640um-1.2m-116keV-masked.zarr/",
+  "segment": "20251029010146-auto_grown_20251029010146642",
+  "mesh": "20251029010146-on-20250521135224-8.64um.tifxyz",
+  "contents": "Public TIFXYZ surface and volume metadata, without CT chunks.",
+  "sha256": {
+    "surface.tifxyz/x.tif": "6ca11758b24635a5acabf5b5a30560988cdaa418eb69b5055ac18f937dc59541",
+    "surface.tifxyz/y.tif": "298a6737c82a02e8813bac39272d9200718433a3838c679f6e22432bb90c8dd4",
+    "surface.tifxyz/z.tif": "bf1c81820105b5eebcc97cc306711c09f5accc49f5c82eb09ed913eb9f1afaa5"
+  }
+}
