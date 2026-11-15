@@ -77,12 +77,14 @@ CatalogLoadResult loadCatalog(const std::string& source,const CatalogLoadOptions
         auto [body,response]=request(source,cached?info.value("etag",std::string{}):std::string{},options.timeoutSeconds);
         if(response.status==304&&!cached)throw std::runtime_error("catalog returned 304 without cached content");
         auto manifest=response.status==304?*cached:parseOpenDataManifest(body,source);
-        if(!options.cacheFile.empty()) {
+        std::string warning;
+        // A cache folder that cannot be written does not make the downloaded catalog unusable.
+        if(!options.cacheFile.empty())try {
             if(response.status!=304)atomic_write(options.cacheFile.string(), reinterpret_cast<const std::uint8_t*>(body.data()), body.size());
             const auto infoText = nlohmann::json{{"source",source},{"checked_at",now},{"etag",response.etag.empty()?info.value("etag",std::string{}):response.etag}}.dump();
             atomic_write(infoPath, reinterpret_cast<const std::uint8_t*>(infoText.data()), infoText.size());
-        }
-        return {std::move(manifest),response.status==304,{}};
+        }catch(const std::exception& e){warning=std::string("catalog not cached: ")+e.what();}
+        return {std::move(manifest),response.status==304,std::move(warning)};
     }catch(const std::exception& e){if(cached)return {*cached,true,e.what()};throw;}
 }
 }
