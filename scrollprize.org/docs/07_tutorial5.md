@@ -170,10 +170,17 @@ The ink detection pipeline lives in the [villa repository](https://github.com/Sc
 ```bash
 git clone https://github.com/ScrollPrize/villa.git
 cd villa/vesuvius
+sudo bash ../volume-cartographer/scripts/install_build_deps.sh minimal-build  # Debian/Ubuntu
 uv sync --extra models
 ```
 
-`uv sync --extra models` creates a virtual environment and installs the exact locked dependencies (PyTorch, zarr, and friends). The `models` extra is the machine-learning stack; every command below passes it too. Verify that PyTorch sees your GPU:
+`uv sync --extra models` creates a virtual environment and installs the exact locked dependencies (PyTorch, zarr, and friends). It also compiles the repository's C++ packages (`volume-cartographer`, `vc_object_store` and `vc_reader`), and `uv` does not install the C++ compiler or the system libraries they need. The `install_build_deps.sh` line does that on Debian and Ubuntu, so don't skip it on a fresh system such as a new WSL2 distribution; elsewhere, install the [native build prerequisites](https://github.com/ScrollPrize/villa/blob/main/volume-cartographer/README.md#python-source-builds) first. The `models` extra is the machine-learning stack; every command below passes it too.
+
+:::tip
+The C++ build needs a lot of memory. By default `uv` builds the three packages at once, each using every CPU core, and single source files take up to 4.7 GB to compile. If the compiler gets killed or the machine starts swapping (likely under WSL2, which gives Linux half of the host's RAM by default), build one package at a time with fewer jobs: `UV_CONCURRENT_BUILDS=1 CMAKE_BUILD_PARALLEL_LEVEL=1 uv sync --extra models`. One job fits in 8 GB but takes a few hours; allow roughly 2.5 GB more for each additional job.
+:::
+
+Verify that PyTorch sees your GPU:
 
 ```bash
 uv run --extra models python -c "import torch; print(torch.__version__, '| cuda:', torch.cuda.is_available())"
