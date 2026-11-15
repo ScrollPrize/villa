@@ -17,6 +17,7 @@
 #include "vc_object_store/objects/ToolObjects.hpp"
 #include "vc_object_store/objects/VolumeUmbilicus.hpp"
 #include "vc_object_store/objects/RelationshipInputs.hpp"
+#include "vc_object_store/objects/TrackDatasets.hpp"
 #include "vc_object_store/geometry/PointMap.hpp"
 #include "vc_object_store/objects/ManifestReferences.hpp"
 #include "vc_object_store/objects/SurfaceCreate.hpp"
@@ -984,6 +985,32 @@ void fittingRelationshipPolicy()
     require(fittingRelationshipInput(edge, true, kinds, false).exclusion == "unused kind same-surface", "unsupported endpoint pair excluded");
 }
 
+// Tracks are prepared for crossing detection by dataset, then source ID.
+void trackDatasetGroups()
+{
+    using Rows = std::vector<TrackDatasetRow>;
+    const Rows rows{{"u0", "/data/b", "10", "vertical"}, {"u1", "/data/a", "7", ""}, {"u2", "/data/b", "9", "horizontal"},
+                    {"u3", "/data/a", "10", "horizontal"}};
+    const auto groups = groupTrackDatasets(rows);
+    require(groups.size() == 2 && groups[0].dataset == "/data/a" && groups[0].rows == std::vector<size_t>{1, 3}
+                && groups[0].sourceIds == std::vector<uint64_t>{7, 10} && groups[0].families == std::vector<int8_t>{-1, 0}
+                && groups[1].dataset == "/data/b" && groups[1].rows == std::vector<size_t>{2, 0}
+                && groups[1].sourceIds == std::vector<uint64_t>{9, 10} && groups[1].families == std::vector<int8_t>{0, 1},
+            "tracks group by dataset in source-ID order; an ID may repeat across datasets");
+    require(groupTrackDatasets(Rows{}).empty(), "no tracks, no groups");
+    const auto refused = [](Rows bad, const char* text) {
+        try { groupTrackDatasets(bad); } catch (const std::runtime_error& error) {
+            require(std::string(error.what()).find(text) != std::string::npos, text);
+            return;
+        }
+        require(false, text);
+    };
+    refused({{"u0", "", "1", ""}}, "track has no dataset_ref: u0");
+    refused({{"u0", "/d", "07", ""}}, "canonical decimal source ID");
+    refused({{"u0", "/d", "7", ""}, {"u1", "/d", "7", ""}}, "duplicate registered track source ID");
+    refused({{"u0", "/d", "7", "diagonal"}}, "invalid stored track family");
+}
+
 void selectedGraphCapture(HistoryMode mode)
 {
     Fixture f(mode, mode);
@@ -994,9 +1021,42 @@ void selectedGraphCapture(HistoryMode mode)
         const auto status = reader.status(); position = status;
         const auto selected = reader.selectedInputs({f.av, f.bv}, position);
         const auto request = selectedInputsRequestToJson({f.av, f.bv}, position);
-        const auto [references, decodedPosition] = selectedInputsRequestFromJson(request);
-        require(references == std::vector{f.av, f.bv} && decodedPosition.commitSequence == status.commitSequence,
+        const auto decodedRequest = selectedInputsRequestFromJson(request);
+        require(decodedRequest.versions == std::vector{f.av, f.bv}
+                    && decodedRequest.position.commitSequence == status.commitSequence
+                    && !decodedRequest.relationshipVersions
+                    && !nlohmann::json::parse(request).contains("relationship_versions"),
                 "capture uses one snapshot position, not a feed cursor");
+        // Relationships of a subset: every object is still returned, and
+        // only the subset's links are enumerated.
+        const auto none = reader.selectedInputs({f.av, f.bv}, position, std::vector<ObjectVersion>{});
+        const auto one = reader.selectedInputs({f.av, f.bv}, position, std::vector{f.av});
+        const auto both = reader.selectedInputs({f.av, f.bv}, position, std::vector{f.bv, f.av});
+        require(none.objects.size() == 2 && none.relationships.empty() && one.objects.size() == 2
+                    && one.relationships.size() == reader.relationshipsAt({f.av}).size()
+                    && both.relationships.size() == selected.relationships.size(),
+                "a relationship subset limits the links, not the objects");
+        mustFail([&] { reader.selectedInputs({f.av}, position, std::vector{f.bv}); });
+        const auto subset = selectedInputsRequestFromJson(
+            selectedInputsRequestToJson({f.av, f.bv}, position, std::vector{f.bv}));
+        require(subset.versions == std::vector{f.av, f.bv} && subset.relationshipVersions == std::vector{f.bv}
+                    && selectedInputsRequestFromJson(selectedInputsRequestToJson({f.av}, position, std::vector<ObjectVersion>{}))
+                           .relationshipVersions->empty(),
+                "the relationship subset travels with the request, an empty one included");
+        {
+            // The inherited tracks' dataset is beside the store that owns
+            // them, as the detector resolves it; it travels with the answer.
+            const auto dataset = trackDatasetIdentity(*store.resolveStoragePath(r, f.a));
+            require(selected.trackDatasets == std::map<std::string, std::string>{
+                            {f.a, dataset}, {f.b, trackDatasetIdentity(*store.resolveStoragePath(r, f.b))}}
+                        && dataset == std::filesystem::weakly_canonical(f.base.parent_path() / f.a).generic_string()
+                        && none.trackDatasets == selected.trackDatasets,
+                    "selected tracks come with the dataset their owning store resolves");
+            require(selectedInputsFromJson(selectedInputsToJson(status, selected)).trackDatasets == selected.trackDatasets
+                        && !nlohmann::json::parse(selectedInputsToJson(status, SelectedInputs{}))["inputs"].contains("track_datasets")
+                        && selectedInputsFromJson(selectedInputsToJson(status, SelectedInputs{})).trackDatasets.empty(),
+                    "track datasets travel with the selection, and are absent without tracks");
+        }
         auto obsolete = nlohmann::json::parse(request);
         obsolete["position"]["sequence"] = status.commitSequence;
         mustFail([&] { selectedInputsRequestFromJson(obsolete.dump()); });
@@ -1113,6 +1173,7 @@ int main()try{
             mustFail([&]{vc::geometry::decodePointMap(nlohmann::json::parse(json));});
     }
     for(const auto mode:{HistoryMode::Off,HistoryMode::On})postFusionSelectedState(mode);
+    trackDatasetGroups();
     selectedGraphCapture(HistoryMode::On); selectedGraphCapture(HistoryMode::Off);
     fittingRelationshipPolicy();
     for (const auto mode : {HistoryMode::Off, HistoryMode::On}) unifiedExpectations(mode);

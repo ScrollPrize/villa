@@ -624,19 +624,28 @@ std::string selectedInputsToJson(const StoreStatus& status, const SelectedInputs
     for (const auto& object : inputs.objects) records.push_back(revisionJson(object));
     for (const auto& edge : inputs.relationships)
         relationships.push_back({{"relationship", relationshipJson(edge.relationship)}, {"applicable", edge.applicable}});
-    return envelope(status, "inputs", Json{{"objects", records}, {"relationships", relationships}}).dump();
+    auto inputs_ = Json{{"objects", records}, {"relationships", relationships}};
+    // Absent without selected tracks, as from a server that predates it.
+    if (!inputs.trackDatasets.empty()) inputs_["track_datasets"] = inputs.trackDatasets;
+    return envelope(status, "inputs", inputs_).dump();
 }
-std::string selectedInputsRequestToJson(const std::vector<ObjectVersion>& refs, const StoreStatus& position)
+std::string selectedInputsRequestToJson(const std::vector<ObjectVersion>& refs, const StoreStatus& position,
+    const std::optional<std::vector<ObjectVersion>>& relationshipVersions)
 {
-    return Json{{"versions", objectVersionsJson(refs)}, {"position", storePositionJson(position)}}.dump();
+    auto request = Json{{"versions", objectVersionsJson(refs)}, {"position", storePositionJson(position)}};
+    if (relationshipVersions) request["relationship_versions"] = objectVersionsJson(*relationshipVersions);
+    return request.dump();
 }
-std::pair<std::vector<ObjectVersion>, StoreStatus> selectedInputsRequestFromJson(const std::string& text)
+SelectedInputsRequest selectedInputsRequestFromJson(const std::string& text)
 {
     auto request = Json::parse(text);
-    requireKeys(request, {"versions", "position"}, "selected inputs request");
+    requireKeys(request, {"versions", "position", "relationship_versions"}, "selected inputs request");
     const auto position = request.at("position");
     requireKeys(position, {"store", "generation", "commit_sequence"}, "selected inputs position");
-    return {objectVersionsFrom(request.at("versions")), storePositionFrom(position)};
+    SelectedInputsRequest result{objectVersionsFrom(request.at("versions")), storePositionFrom(position), std::nullopt};
+    if (request.contains("relationship_versions"))
+        result.relationshipVersions = objectVersionsFrom(request.at("relationship_versions"));
+    return result;
 }
 SelectedInputs selectedInputsFromJson(const std::string& text)
 {
@@ -646,6 +655,8 @@ SelectedInputs selectedInputsFromJson(const std::string& text)
     for (const auto& edge : jsonArrayField(data, "relationships"))
         result.relationships.push_back({relationshipFrom(edge.at("relationship")), edge.at("applicable").get<bool>()});
     orderRelationships(result.relationships);
+    if (data.contains("track_datasets"))
+        result.trackDatasets = data.at("track_datasets").get<std::map<std::string, std::string>>();
     return result;
 }
 

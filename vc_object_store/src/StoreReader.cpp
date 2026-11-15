@@ -12,7 +12,8 @@
 #include <set>
 
 namespace vc::objects {
-SelectedInputs LocalStoreReader::selectedInputs(const std::vector<ObjectVersion>& refs, const StoreStatus& position) const
+SelectedInputs LocalStoreReader::selectedInputs(const std::vector<ObjectVersion>& refs, const StoreStatus& position,
+    const std::optional<std::vector<ObjectVersion>>& relationshipVersions) const
 {
     const auto before = status();
     const bool inherited = std::any_of(refs.begin(), refs.end(), [&](const auto& ref) { return util::canonicalUuid(ref.storeUuid) != before.storeUuid; });
@@ -26,7 +27,19 @@ SelectedInputs LocalStoreReader::selectedInputs(const std::vector<ObjectVersion>
         if (!records[i] || records[i]->deleted) throw std::invalid_argument("selected object is not retained: " + refs[i].objectUuid);
         result.objects.push_back(*records[i]);
     }
-    result.relationships = relationshipsAt(refs);
+    if (relationshipVersions) {
+        std::set<std::tuple<std::string, std::string, std::string, int64_t>> selected;
+        const auto key = [](const ObjectVersion& ref) {
+            return std::tuple(util::canonicalUuid(ref.storeUuid), util::canonicalUuid(ref.generation),
+                              util::canonicalUuid(ref.objectUuid), ref.version);
+        };
+        for (const auto& ref : refs) selected.insert(key(ref));
+        for (const auto& ref : *relationshipVersions)
+            if (!selected.contains(key(ref)))
+                throw std::invalid_argument("selected inputs: relationships requested of an unselected object: " + ref.objectUuid);
+    }
+    result.relationships = relationshipsAt(relationshipVersions ? *relationshipVersions : refs);
+    result.trackDatasets = store_->trackDatasets(*txn_, result.objects);
     return result;
 }
 

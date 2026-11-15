@@ -29,6 +29,58 @@ void ObjectStore::validateExportDestination(const Txn& txn, const std::filesyste
     }
 }
 
+namespace {
+// Where a store's relative source locators start: the directory of its file.
+std::filesystem::path storeDirectory(sqlite3* source)
+{
+    namespace fs = std::filesystem;
+    fs::path ownerPath = sqlite3_db_filename(source, "main");
+    if (isPackedDatabasePath(ownerPath)) ownerPath = packedContainerPath(ownerPath);
+    return fs::absolute(ownerPath).parent_path();
+}
+// A track's dataset: its dataset_ref below the root its owning store resolves
+// source locators from.
+std::filesystem::path trackDatasetPath(const std::filesystem::path& root, const std::string& datasetRef)
+{
+    return (std::filesystem::absolute(root).lexically_normal() / datasetRef).lexically_normal();
+}
+}
+
+std::string trackDatasetIdentity(const std::filesystem::path& resolved)
+{
+    return std::filesystem::weakly_canonical(resolved).generic_string();
+}
+
+std::map<std::string, std::string> ObjectStore::trackDatasets(const Txn& txn, const std::vector<ObjectRevision>& revisions) const
+{
+    auto* db = static_cast<sqlite3*>(connection(txn));
+    std::map<std::string, std::filesystem::path> roots;  // by owning store
+    bool listed = false;
+    // One filesystem resolution per (owning store, dataset_ref), not per track.
+    std::map<std::pair<std::string, std::string>, std::string> resolved;
+    std::map<std::string, std::string> result;
+    for (const auto& revision : revisions) {
+        const auto& record = revision.record;
+        if (record.kind != "track") continue;
+        if (!record.track || record.track->datasetRef.empty())
+            throw std::runtime_error("track has no dataset_ref: " + record.uuid);
+        const std::pair key{revision.storeUuid, record.track->datasetRef};
+        auto found = resolved.find(key);
+        if (found == resolved.end()) {
+            if (!listed) {
+                for (auto* source : querySources(db)) roots.emplace(storeUuidText(source), storeDirectory(source));
+                listed = true;
+            }
+            const auto root = roots.find(revision.storeUuid);
+            if (root == roots.end())
+                throw std::runtime_error("track's owning store is not open: " + record.uuid);
+            found = resolved.emplace(key, trackDatasetIdentity(trackDatasetPath(root->second, key.second))).first;
+        }
+        result[record.uuid] = found->second;
+    }
+    return result;
+}
+
 std::optional<std::filesystem::path> ObjectStore::resolveStoragePath(
     const Txn& txn, const std::string& objectUuid,
     const std::optional<std::filesystem::path>& datasetRoot) const
@@ -37,11 +89,9 @@ std::optional<std::filesystem::path> ObjectStore::resolveStoragePath(
     const auto resolved = resolveObject(static_cast<sqlite3*>(connection(txn)), objectUuid);
     if (!resolved) return std::nullopt;
     const auto* object = &resolved->record;
-    fs::path ownerPath = sqlite3_db_filename(resolved->source, "main");
-    if (isPackedDatabasePath(ownerPath)) ownerPath = packedContainerPath(ownerPath);
-    const auto root = fs::absolute(datasetRoot.value_or(fs::absolute(ownerPath).parent_path())).lexically_normal();
+    const auto root = fs::absolute(datasetRoot.value_or(storeDirectory(resolved->source))).lexically_normal();
     if (object->track && !object->track->datasetRef.empty())
-        return (root / object->track->datasetRef).lexically_normal();
+        return trackDatasetPath(root, object->track->datasetRef);
     if ((object->storageKind != "file" && object->storageKind != "sqlite") ||
         (object->kind != "surface" && object->kind != "fiber" && object->kind != "point_collection"))
         return std::nullopt;

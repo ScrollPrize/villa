@@ -198,7 +198,15 @@ struct SelectedRelationship {
 struct SelectedInputs {
     std::vector<ObjectRevision> objects;
     std::vector<SelectedRelationship> relationships;
+    // The dataset of each selected track, by object UUID
+    // (ObjectStore::trackDatasets): what its crossings are grouped by.
+    std::map<std::string, std::string> trackDatasets;
 };
+
+// The identity of a track dataset at a resolved path: the path with its
+// symlinks and relative parts resolved, in generic form. Two tracks belong to
+// one dataset, and are compared for crossings, exactly when these are equal.
+std::string trackDatasetIdentity(const std::filesystem::path& resolved);
 
 struct JournalEntry {
     int64_t seq = 0;
@@ -876,6 +884,11 @@ public:
     std::optional<std::filesystem::path> resolveStoragePath(
         const Txn& txn, const std::string& objectUuid,
         const std::optional<std::filesystem::path>& datasetRoot = std::nullopt) const;
+    // The dataset (trackDatasetIdentity) of every track among these exact
+    // states, by object UUID: the directory of the store that owns the state
+    // / the dataset_ref it records there. Other kinds are skipped; a track
+    // without a dataset_ref, or whose owning store is not open, throws.
+    std::map<std::string, std::string> trackDatasets(const Txn&, const std::vector<ObjectRevision>&) const;
     void validateExportDestination(const Txn&, const std::filesystem::path&) const;
 
     // Flush the WAL into the main DB file (safe copying). Must not be
