@@ -15,7 +15,7 @@ import object_store_inputs as osi  # noqa: E402
 import object_store_reference as reference  # noqa: E402
 import tracks as tracks_module  # noqa: E402
 from object_store_fixture import (  # noqa: E402
-    crossing_edge, fit_config, frame, put_patch, put_track, shared_edit,
+    array, crossing_edge, fit_config, frame, put_patch, put_track, shared_edit,
     write_reference_store, write_walk_store)
 
 
@@ -191,6 +191,23 @@ def test_spellings_of_one_dataset_are_one_group(db):
     assert inputs.crossings['partners'].tolist() == [1, 0]
     # The store's own detector pairs them too.
     assert db.link_tracks_to_tracks()['edges_created'] == 1
+
+
+def test_a_track_placeholder_does_not_stop_a_selection(db):
+    """A track registered without details or geometry is skipped by a
+    default selection, as before; one a fit would consume is refused for
+    what it lacks."""
+    _lattice(db)
+    placeholder = db.upsert_object({'kind': 'track', 'meta': {'coordinates': frame()}})
+    snapshot = osi.read_snapshot(db, osi.InputRequest())
+    assert placeholder not in snapshot.objects and len(snapshot.objects_of('track')) == 6
+    assert any('without geometry' in note for note in snapshot.notes)
+    _, counts = _materialize_tracks(db)
+    assert counts['track crossings'] == 9
+    db.put_geometry(placeholder, {'kind': 'track', 'attributes': {}, 'arrays': [
+        array('points', np.asarray(_line((10, 60, 50), 2, 4))[:, ::-1], '<i4')]})
+    with pytest.raises(osi.ObjectStoreInputError, match=f'track {placeholder} has no dataset_ref'):
+        _materialize_tracks(db)
 
 
 def test_one_file_name_in_two_source_stores_is_two_datasets(tmp_path):

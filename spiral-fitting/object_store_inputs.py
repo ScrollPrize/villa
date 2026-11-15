@@ -1604,6 +1604,10 @@ def _ordered_tracks(tracks):
     dataset in more than one frame scale, which only a fit can tell."""
     from vc_object_store import group_track_datasets
     tracks = list(tracks)
+    undeclared = [obj.uuid for obj in tracks
+                  if not obj.dataset and not (obj.track or {}).get('dataset_ref')]
+    if undeclared:
+        raise ObjectStoreInputError([f'track {uuid} has no dataset_ref' for uuid in undeclared])
     unresolved = [obj.uuid for obj in tracks if not obj.dataset]
     if unresolved:
         raise ObjectStoreInputError([

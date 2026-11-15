@@ -314,3 +314,29 @@ def test_tracks_and_their_crossings_through_the_endpoint(tmp_path):
         np.testing.assert_array_equal(hosted.tracks.crossings[name], local.tracks.crossings[name])
     # One cache file serves both: its key holds no store location.
     assert len(list((cache / osi.TRACK_CROSSING_CACHE_DIRECTORY).glob('*.npz'))) == 1
+
+
+def test_a_pinned_track_a_history_off_store_no_longer_retains_is_refused(tmp_path):
+    """Pins of a history-off served store: once a pinned track is edited its
+    old version is gone, and the pinned read fails although the handle's
+    record cache still holds it."""
+    from object_store_fixture import put_track
+    path = tmp_path / 'tracks.vcobj'
+    with ObjectStore.create(str(path), author='ingest', history_enabled=False) as db:
+        tracks = []
+        for key, (start, axis, family) in enumerate((
+                ((40, 60, 50), 2, 'horizontal'), ((40, 55, 55), 1, 'vertical'))):
+            points = np.tile(np.asarray(start), (31, 1))
+            points[:, axis] += np.arange(31)
+            tracks.append(put_track(db, points, key, family))
+    config = fit_config(path, 'service', input_use_tracks=True, object_store_refresh_links=False)
+    with serving(path, tmp_path) as endpoint:
+        config = dict(config, object_store_location=endpoint)
+        with osi.open_store(config, cache_directory=str(tmp_path / 'cache')) as store:
+            request = osi.request_from_config(config)
+            pins = osi.read_snapshot(store, request).pins()
+            pinned = dataclasses.replace(request, pins=pins)
+            assert len(osi.read_snapshot(store, pinned).objects_of('track')) == 2  # warm
+            set_meta(store, tracks[0], 'review_note', 'seen')
+            with pytest.raises(Exception, match='not retained|no longer available'):
+                osi.read_snapshot(store, pinned)
