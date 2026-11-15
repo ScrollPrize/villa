@@ -1814,32 +1814,26 @@ def _store_track_crossings(path, key, csr, sha256):
 
 @contextlib.contextmanager
 def _track_crossing_lock(path):
-    """Holds the cache file's lock: of the processes that miss one cache
-    file at once (the ranks of a distributed fit), one computes the
-    crossings and the others wait for its file instead of each holding the
-    kernel's buffers. Without file locks, or a writable cache, nothing is
-    held and each computes."""
+    """Holds the cache file's lock (service_files.ExclusiveFileLock): of the
+    processes that miss one cache file at once (the ranks of a distributed
+    fit), one computes the crossings and the others wait for its file
+    instead of each holding the kernel's buffers. Where the cache cannot be
+    written nothing is held and each computes."""
+    from service_files import ExclusiveFileLock, FileLockUnavailable
+    lock = ExclusiveFileLock(f'{path}.lock')
     try:
-        import fcntl
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        stream = open(f'{path}.lock', 'a')
-    except (ImportError, OSError):
+        try:
+            lock.acquire()
+        except FileLockUnavailable:
+            print('track crossings: waiting for another process that computes them')
+            lock.acquire(timeout=None)
+    except OSError:
         yield
         return
-    with stream:
-        try:
-            try:
-                fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                print('track crossings: waiting for another process that computes them')
-                fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
-        except OSError:
-            yield
-            return
-        try:
-            yield
-        finally:
-            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+    try:
+        yield
+    finally:
+        lock.release()
 
 
 def _track_crossing_provenance(csr, sha256):
