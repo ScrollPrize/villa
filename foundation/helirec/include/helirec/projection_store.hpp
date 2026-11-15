@@ -20,6 +20,11 @@ namespace helirec {
 // true when `path` is a scan group of such a store (a directory with a zarr.json whose attributes say so)
 bool is_projection_store_scan(const std::string& path);
 
+// The tile group of `store` (STORE.zarr/<tile>) that holds the scan of the dataset named `sample_name`: the group of
+// that whole name ("2.4um_PHerc-Paris4_B_HA": several scans of one sample may end alike), or of its last "_" field
+// (a mosaic's tile, "T0-01"). Throws when the store has neither.
+std::string projection_store_tile_group(const std::string& store, const std::string& sample_name);
+
 // One level of a scan group, open for reading
 struct ProjectionStoreLevel {
     struct Impl;

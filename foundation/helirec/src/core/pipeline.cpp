@@ -197,7 +197,10 @@ struct SliceReconstructor::Impl {
     // context rows gridded from every projection that sees them (prepare_chunk_scan); the legacy reference grids
     // them from the projections of the chunk's own heights, as the reference does
     bool full_context = false, measured = false;
-    int mend_x0 = 0, mend_x1 = 0, seam_cx = 0;   // mending domain [mend_x0, mend_x1) of the merged row
+    int mend_x0 = 0, mend_x1 = 0;   // mending domain [mend_x0, mend_x1) of the merged row
+    // per scan after the first: the merged column of its luminosity seam with the scans before it (the middle of
+    // the columns it shares with the nearest of them); [0] is not used
+    std::vector<int> seam;
     LuminosityKernel lum = luminosity_kernel();
     // per-chunk invariants (built on first use)
     std::vector<float> angles;             // grid angles (radians)
@@ -411,7 +414,7 @@ SliceReconstructor::SliceReconstructor(std::vector<ScanData> scans, ReconConfig 
     // have a full luminosity window. Keep this separate from each filter's kernel support.
     // (The legacy reference clips the luminosity window to the chunk, as the reference does.)
     if (!I.cfg.legacy_reference || (I.cfg.external && I.cfg.external->measured_only())) {
-        I.lum_margin = I.scans.size() == 2 && I.cfg.luminosity_repartition != 0.f ? I.lum.radius : 0;
+        I.lum_margin = I.scans.size() >= 2 && I.cfg.luminosity_repartition != 0.f ? I.lum.radius : 0;
         I.margin = std::max(I.margin, I.pipeline(I.cfg.filters)->margin_rows() + I.lum_margin);
     }
     I.measured = I.cfg.external && I.cfg.external->measured_only();
@@ -567,13 +570,17 @@ SliceReconstructor::SliceReconstructor(std::vector<ScanData> scans, ReconConfig 
         I.mend_x0 = std::max(0, I.mend_x0);
         I.mend_x1 = std::min(I.NX, I.mend_x1);
     }
-    // luminosity seam: det_cols/2 + lround(mean of (shift_x - x_readjustment))
-    if (I.scans.size() == 2) {
-        const double p0 = I.scans[0].traj.shift_x - I.scans[0].traj.x_readjustment;
-        const double p1 = I.scans[1].traj.shift_x - I.scans[1].traj.x_readjustment;
-        I.seam_cx = m.det_cols / 2 + static_cast<int>(std::lround(0.5 * (p0 + p1)));
+    // luminosity seams: det_cols/2 + lround(mean of (shift_x - x_readjustment)) of a scan and the nearest before it
+    I.seam.assign(I.scans.size(), 0);
+    for (std::size_t s = 1; s < I.scans.size(); ++s) {
+        const double p1 = I.scans[s].traj.shift_x - I.scans[s].traj.x_readjustment;
+        double p0 = I.scans[0].traj.shift_x - I.scans[0].traj.x_readjustment;
+        for (std::size_t j = 1; j < s; ++j) {
+            const double pj = I.scans[j].traj.shift_x - I.scans[j].traj.x_readjustment;
+            if (std::fabs(pj - p1) < std::fabs(p0 - p1)) p0 = pj;
+        }
+        I.seam[s] = m.det_cols / 2 + static_cast<int>(std::lround(0.5 * (p0 + p1)));
     }
-    if (I.scans.size() > 2) throw Error("SliceReconstructor: more than one companion scan is not supported yet");
     if (I.cfg.sld.enabled()) {
         if (I.cfg.legacy_reference) throw Error("legacy reference mode has no scintillator diffusion correction");
         if (I.cfg.sld.stride < 1) throw Error("sld: stride must be >= 1");
@@ -1132,28 +1139,31 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
                 cpu::accumulate(view, contrib, ap, R.data(), RW.data(), sharp ? I.weight2[s].data() : nullptr,
                                 sharp ? R2.data() : nullptr, sharp ? RW2.data() : nullptr);
                 tick("accumulate");
-                const bool lum = cfg.luminosity_repartition != 0.f && chunks.size() == 2;
-                if (lum && s == 0) {
-                    Aha.resize(static_cast<std::size_t>(L) * H); Bha.resize(Aha.size());
-                    cpu::luminosity_sums(R.data(), RW.data(), L, H, NX, I.seam_cx, I.lum, Aha.data(), Bha.data());
-                    Wp.assign(RW.begin(), RW.begin() + n_el);
-                }
-                if (lum && s == 1) {
+                // Each scan after the first is taken to the luminosity of the scans before it at its seam with
+                // them (the sums before and after it is added), then the sums at the next scan's seam are kept.
+                const bool lum = cfg.luminosity_repartition != 0.f && chunks.size() >= 2;
+                const bool joins = lum && s >= 1, joined = lum && s + 1 < chunks.size();
+                if (joins) {
                     Atot.resize(Aha.size()); Btot.resize(Aha.size());
-                    cpu::luminosity_sums(R.data(), RW.data(), L, H, NX, I.seam_cx, I.lum, Atot.data(), Btot.data());
+                    cpu::luminosity_sums(R.data(), RW.data(), L, H, NX, I.seam[s], I.lum, Atot.data(), Btot.data());
                     cpu::luminosity_apply(R.data(), RW.data(), Wp.data(), Aha.data(), Bha.data(), Atot.data(),
                                           Btot.data(), L, H, NX, cfg.luminosity_repartition);
                 }
-                if (sharp && lum && s == 0) {
-                    Aha2.resize(static_cast<std::size_t>(L) * H); Bha2.resize(Aha2.size());
-                    cpu::luminosity_sums(R2.data(), RW2.data(), L, H, NX, I.seam_cx, I.lum, Aha2.data(), Bha2.data());
-                    Wp2.assign(RW2.begin(), RW2.begin() + n_el);
+                if (joined) {
+                    Aha.resize(static_cast<std::size_t>(L) * H); Bha.resize(Aha.size());
+                    cpu::luminosity_sums(R.data(), RW.data(), L, H, NX, I.seam[s + 1], I.lum, Aha.data(), Bha.data());
+                    Wp.assign(RW.begin(), RW.begin() + n_el);
                 }
-                if (sharp && lum && s == 1) {
+                if (sharp && joins) {
                     Atot2.resize(Aha2.size()); Btot2.resize(Aha2.size());
-                    cpu::luminosity_sums(R2.data(), RW2.data(), L, H, NX, I.seam_cx, I.lum, Atot2.data(), Btot2.data());
+                    cpu::luminosity_sums(R2.data(), RW2.data(), L, H, NX, I.seam[s], I.lum, Atot2.data(), Btot2.data());
                     cpu::luminosity_apply(R2.data(), RW2.data(), Wp2.data(), Aha2.data(), Bha2.data(), Atot2.data(),
                                           Btot2.data(), L, H, NX, cfg.luminosity_repartition);
+                }
+                if (sharp && joined) {
+                    Aha2.resize(static_cast<std::size_t>(L) * H); Bha2.resize(Aha2.size());
+                    cpu::luminosity_sums(R2.data(), RW2.data(), L, H, NX, I.seam[s + 1], I.lum, Aha2.data(), Bha2.data());
+                    Wp2.assign(RW2.begin(), RW2.begin() + n_el);
                 }
                 tick("luminosity");
             }
@@ -1465,24 +1475,26 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
                              sharp ? I.dev[s].weight2.data() : nullptr, sharp ? R2.data() : nullptr, sharp ? RW2.data() : nullptr);
             if (s + 1 == nsc) HELIREC_CUDA_CHECK(cudaEventRecord(ev_done[r], nullptr));
             tick("accumulate");
-            const bool lum = cfg.luminosity_repartition != 0.f && nsc == 2;
-            if (lum && s == 0) {
-                cuda::luminosity_sums(R.data(), RW.data(), L, H, NX, I.seam_cx, I.lum, Aha.data(), Bha.data());
-                HELIREC_CUDA_CHECK(cudaMemcpyAsync(Wp.data(), RW.data(), n_el * sizeof(float), cudaMemcpyDeviceToDevice));
-            }
-            if (lum && s == 1) {
-                cuda::luminosity_sums(R.data(), RW.data(), L, H, NX, I.seam_cx, I.lum, Atot.data(), Btot.data());
+            // (as on the CPU: each scan after the first taken to the luminosity of those before it at its seam)
+            const bool lum = cfg.luminosity_repartition != 0.f && nsc >= 2;
+            const bool joins = lum && s >= 1, joined = lum && s + 1 < nsc;
+            if (joins) {
+                cuda::luminosity_sums(R.data(), RW.data(), L, H, NX, I.seam[s], I.lum, Atot.data(), Btot.data());
                 cuda::luminosity_apply(R.data(), RW.data(), Wp.data(), Aha.data(), Bha.data(), Atot.data(),
                                        Btot.data(), L, H, NX, cfg.luminosity_repartition);
             }
-            if (sharp && lum && s == 0) {
-                cuda::luminosity_sums(R2.data(), RW2.data(), L, H, NX, I.seam_cx, I.lum, Aha2.data(), Bha2.data());
-                HELIREC_CUDA_CHECK(cudaMemcpyAsync(Wp2.data(), RW2.data(), n_el * sizeof(float), cudaMemcpyDeviceToDevice));
+            if (joined) {
+                cuda::luminosity_sums(R.data(), RW.data(), L, H, NX, I.seam[s + 1], I.lum, Aha.data(), Bha.data());
+                HELIREC_CUDA_CHECK(cudaMemcpyAsync(Wp.data(), RW.data(), n_el * sizeof(float), cudaMemcpyDeviceToDevice));
             }
-            if (sharp && lum && s == 1) {
-                cuda::luminosity_sums(R2.data(), RW2.data(), L, H, NX, I.seam_cx, I.lum, Atot2.data(), Btot2.data());
+            if (sharp && joins) {
+                cuda::luminosity_sums(R2.data(), RW2.data(), L, H, NX, I.seam[s], I.lum, Atot2.data(), Btot2.data());
                 cuda::luminosity_apply(R2.data(), RW2.data(), Wp2.data(), Aha2.data(), Bha2.data(), Atot2.data(),
                                        Btot2.data(), L, H, NX, cfg.luminosity_repartition);
+            }
+            if (sharp && joined) {
+                cuda::luminosity_sums(R2.data(), RW2.data(), L, H, NX, I.seam[s + 1], I.lum, Aha2.data(), Bha2.data());
+                HELIREC_CUDA_CHECK(cudaMemcpyAsync(Wp2.data(), RW2.data(), n_el * sizeof(float), cudaMemcpyDeviceToDevice));
             }
             tick("luminosity");
         }

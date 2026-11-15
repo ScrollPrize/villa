@@ -356,7 +356,7 @@ Session::Session(const std::vector<std::string>& scans, int threads, int reduce,
         // by the thousand)
         impl_->records.push_back(std::make_unique<Record>(read_record(path, store.empty())));
         Record& rec = *impl_->records.back();
-        if (!store.empty()) frames_from_store(rec, store + "/" + rec.label);
+        if (!store.empty()) frames_from_store(rec, projection_store_tile_group(store, rec.sample_name));
         impl_->frames.push_back(std::make_unique<Frames>(rec, threads, reduce));
         if (reduce) {  // the record of a detector whose pixels are 2^reduce times as large
             const auto size = rec.technique.items.find("scan/sample_pixel_size");

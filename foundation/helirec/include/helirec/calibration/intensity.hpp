@@ -1,9 +1,9 @@
 #pragma once
-// The intensity calibration of a two-scan helical acquisition (helirec-calibration intensity; python/helirec/calibration.py
-// binds it): the darks and flats reduced as the reference (nx2etf) reduces them, the weight map and its horizontal
-// apodisation (prepare_weights_double), the detector's blur field from the noise of the flats, and the placement of
-// both scans in the frame they are merged in, from one axis and one vector (the geometry calibration's merged
-// layout: helirec/geometry.hpp). Below it, its kernels: the scipy-compatible Gaussian filter and the borders of the
+// The intensity calibration of a helical acquisition of scans moved sideways (two, or more; helirec-calibration
+// intensity; python/helirec/calibration.py binds a pair's): the darks and flats reduced as the reference (nx2etf)
+// reduces them, the weight map and its horizontal apodisation (prepare_weights_double), the detector's blur field
+// from the noise of the flats, and the placement of the scans in the frame they are merged in, from one axis and a
+// vector per scan after the first (the geometry calibration's merged layout: helirec/geometry.hpp). Below it, its kernels: the scipy-compatible Gaussian filter and the borders of the
 // weight maps, the mean of frames, detector images at reduced resolution, the noise spectra of tiles and the blur
 // field's fit. CPU (OpenMP); the data sizes are small. (The geometry itself is the geometry calibration's.)
 #include <array>
@@ -127,14 +127,15 @@ struct ScanPlacement {
     int shift_x = 0;
     double x_readjustment = 0, z_readjustment = 0;
 };
-// nabuxx check_companion: the first scan and the second at `vector` (rows, columns) from it, the outermost scan at
-// column 0 of the merged frame. anchor: where the first scan's column 0 lies; width: the merged frame's columns.
+// nabuxx check_companion: the first scan and every other at its vector (rows, columns) from it, the outermost scan
+// at column 0 of the merged frame. anchor: where the first scan's column 0 lies; width: the merged frame's columns.
 struct MergedPlacement {
-    std::array<ScanPlacement, 2> scans;
+    std::vector<ScanPlacement> scans;
     int width = 0;
     double anchor = 0;
 };
-MergedPlacement placement_from_vector(const std::array<double, 2>& vector, int cols);
+MergedPlacement placement_from_vectors(const std::vector<std::array<double, 2>>& vectors, int cols);
+MergedPlacement placement_from_vector(const std::array<double, 2>& vector, int cols);  // a pair
 
 // The detector's blur field of a scan, from the noise of its first flat series (flat_noise_spectra, then
 // detector_blur_field_fit). It is kept (`field`) only if it explains the noise spectra (a residual below
@@ -171,25 +172,38 @@ DetectorBlur measure_detector_blur(const Scan& scan, const float* dark, int n_fl
 // geometry and trajectories, and the raw files they read (path, size, time of change). A replaced acquisition (even
 // under the same name) or another pair gives another fingerprint.
 std::string acquisition_fingerprint(const Scan& main, const Scan& companion);
+std::string acquisition_fingerprint(const std::vector<const Scan*>& scans);  // the same of any number of scans
 
+// A scan's darks and flats as a projection store holds them at the level `reduce` (helirec/projection_store.hpp:
+// float images, taken through the frames' low-pass when the store was made), reduced as reduce_darks_flats reduces
+// the detector's: the mean of the darks, and per flat series the mean of its frames each taken to the nominal ring
+// current. tile_group: STORE.zarr/<tile>. rows, cols of the result: the level's.
+DarksFlats store_darks_flats(const Scan& scan, const std::string& tile_group, int reduce);
+
+// The scans in the order of the geometry calibration: the first (the main scan) has the rotation axis in its field,
+// the others (companions) lie beside it, each further from the axis.
 struct IntensityCalibration {
-    std::string main, companion;           // the scans' names
-    int rows = 0, cols = 0;
+    std::string main, companion;           // the names of the first two scans (companion: "" for a scan alone)
+    std::vector<std::string> scans;        // every scan's name
+    int rows = 0, cols = 0;                // of the frames it is of (a projection store's level: that level's)
+    std::string projection_store;          // the store its darks and flats are from ("": the detector's files)
+    int reduce = 0;                        // and the level
     double cor_main_detector = 0;          // the rotation axis in the main scan's columns
-    std::array<double, 2> vector{};        // (rows, columns) from the main scan to the companion
+    std::array<double, 2> vector{};        // (rows, columns) from the main scan to the second
+    std::vector<std::array<double, 2>> vectors;             // from the main scan to every scan after it
     double rot_center = 0;                 // the rotation axis in the merged frame
     int merged_width = 0;
-    std::array<ScanPlacement, 2> placement;                 // main, companion
-    std::array<std::array<double, 2>, 2> apodisation{};     // (left, right) widths of main, companion
-    std::array<double, 2> estimated_cor_from_motor_pix{};   // main, companion
+    std::vector<ScanPlacement> placement;                   // per scan
+    std::vector<std::array<double, 2>> apodisation;         // (left, right) widths, per scan
+    std::vector<double> estimated_cor_from_motor_pix;       // per scan
     geometry::MergedLayout layout;         // what the frame was laid out from
     DetectorBlur detector_blur;
-    std::string fingerprint;               // acquisition_fingerprint of the pair
+    std::string fingerprint;               // acquisition_fingerprint of the scans
     int version = kIntensityCalibrationVersion;
 
-    DarksFlats main_reduced, companion_reduced;
-    std::vector<float> weight_map;                    // of all the flats (companion's first, as the reference orders them)
-    std::vector<float> main_weight, companion_weight; // the weight map times each scan's horizontal apodisation
+    std::vector<DarksFlats> reduced;                  // per scan
+    std::vector<float> weight_map;                    // of all the flats (the last scan's first, as the reference orders a pair's)
+    std::vector<std::vector<float>> weight;           // per scan: the weight map times the scan's horizontal apodisation
 
     // calibration.json: everything but the arrays
     std::string json() const;
@@ -200,7 +214,14 @@ struct IntensityCalibration {
 // rest, the blur field among it), both keyed by acquisition_fingerprint; a cache of another acquisition or version
 // is ignored and replaced. The blur field is the detector's and is kept whatever the merged frame. progress: show
 // progress bars for the reduction.
+// projection_store, reduce: the darks and flats are a projection store's at the level `reduce` (store_darks_flats;
+// each scan's group is projection_store_tile_group of its sample name), and everything is of that level's frames:
+// `layout` is then given in the level's pixels, the weight map's and the apodisation's widths are divided with the
+// pixels, nothing is kept in cache_dir, and no blur field is measured (the noise of reduced flats does not hold it).
+IntensityCalibration calibrate_intensity(const std::vector<const Scan*>& scans, const geometry::MergedLayout& layout, const std::string& cache_dir,
+                                         const std::function<void(const std::string&)>& log = nullptr, bool progress = false,
+                                         const std::string& projection_store = "", int reduce = 0);
 IntensityCalibration calibrate_intensity(const Scan& main, const Scan& companion, const geometry::MergedLayout& layout, const std::string& cache_dir,
-                                         const std::function<void(const std::string&)>& log = nullptr, bool progress = false);
+                                         const std::function<void(const std::string&)>& log = nullptr, bool progress = false);  // a pair
 
 }  // namespace helirec::calibration

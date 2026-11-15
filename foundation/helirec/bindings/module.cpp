@@ -1706,16 +1706,18 @@ NB_MODULE(_core, m) {
         "geometry calibration step) when absent or of other scans (helirec::geometry_calibration_file)");
 
     nb::class_<Reconstruction>(m, "Reconstruction",
-                               "The reconstruction of a scan pair from its raw folders: the scans, the geometry and intensity calibrations, "
-                               "and a SliceReconstructor of the parameters (helirec::Reconstruction, reconstruction.hpp)")
+                               "The reconstruction of an acquisition (a scan pair, or more scans moved sideways) from its raw folders or a "
+                               "projection store: the scans, the geometry and intensity calibrations, and a SliceReconstructor of the parameters "
+                               "(helirec::Reconstruction, reconstruction.hpp)")
         .def(
             "__init__",
             [](Reconstruction* self, const std::string& projections, const std::string& params, const std::string& cache_dir, const std::string& device,
-               std::optional<std::function<void(const std::string&)>> log, bool progress) {
+               std::optional<std::function<void(const std::string&)>> log, bool progress, const std::string& projection_store, int reduce) {
                 Reconstruction::Options o;
                 o.cache_dir = cache_dir;
                 o.device = parse_device(device);
                 o.progress = progress;
+                o.projection_store = projection_store, o.reduce = reduce;
                 if (log)
                     o.log = [log](const std::string& line) {
                         nb::gil_scoped_acquire gil;
@@ -1725,7 +1727,8 @@ NB_MODULE(_core, m) {
                 nb::gil_scoped_release nogil;
                 new (self) Reconstruction(projections, params, std::move(o));
             },
-            "projections"_a, "params"_a = "{}", "cache_dir"_a = "", "device"_a = "cuda", "log"_a = nb::none(), "progress"_a = false)
+            "projections"_a, "params"_a = "{}", "cache_dir"_a = "", "device"_a = "cuda", "log"_a = nb::none(), "progress"_a = false, "projection_store"_a = "",
+            "reduce"_a = 0)
         .def("set_parameters", [](Reconstruction& r, const std::string& changes) {
             nb::gil_scoped_release nogil;
             r.set_parameters(changes);
@@ -1733,6 +1736,11 @@ NB_MODULE(_core, m) {
         .def_prop_ro("parameters", &Reconstruction::parameters)
         .def_prop_ro("main", [](Reconstruction& r) -> const calibration::Scan& { return r.main(); }, nb::rv_policy::reference_internal)
         .def_prop_ro("companion", [](Reconstruction& r) -> const calibration::Scan& { return r.companion(); }, nb::rv_policy::reference_internal)
+        .def_prop_ro("scan_count", [](Reconstruction& r) { return r.scans().size(); })
+        .def("scan", [](Reconstruction& r, std::size_t k) -> const calibration::Scan& { return r.scans().at(k); }, "k"_a, nb::rv_policy::reference_internal,
+             "scan k of the acquisition, the main scan first")
+        .def("frames", &Reconstruction::frames, "scan"_a, "[first, end) of a scan's projections the reconstruction is given")
+        .def_prop_ro("reduce", &Reconstruction::reduce)
         .def_prop_ro("intensity", [](Reconstruction& r) -> const calibration::IntensityCalibration& { return r.intensity(); }, nb::rv_policy::reference_internal)
         .def_prop_ro("reconstructor", [](Reconstruction& r) { return PySliceReconstructor(r.reconstructor()); })
         .def_prop_ro("doable", &Reconstruction::doable)

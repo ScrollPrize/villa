@@ -79,6 +79,12 @@ def placement_from_vector(vector, n_cols):
     return _core.placement_from_vector(tuple(float(v) for v in vector), int(n_cols))
 
 
+def placement_from_vectors(vectors, n_cols):
+    """placement_from_vector of any number of scans: `vectors` holds (rows, columns) of every scan after the first,
+    from the first. (helirec::calibration::placement_from_vectors)"""
+    return _core.placement_from_vectors([tuple(float(x) for x in v) for v in vectors], int(n_cols))
+
+
 def acquisition_fingerprint(main, companion) -> str:
     """sha256 over everything the calibration depends on: calibration version, scan identities, metadata, frame
     geometry, trajectories and the referenced raw files (path, size, mtime). A replaced acquisition (even under the

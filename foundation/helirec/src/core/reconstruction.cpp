@@ -129,6 +129,35 @@ Json numbers(const std::vector<double>& v) {
     return j;
 }
 
+// A scan's terms, made for the frames as stored (rows_full of them), as those of the frames read at 1 / f: every
+// position of the stored detector and of the full reconstruction over f; slopes and scales are ratios. The
+// reconstruction counts the rows' timing from its middle row, which is the stored row f (rows / f - 1) / 2 and not
+// the stored middle (rows - 1) / 2 the terms' angles are for (rad_per_row: the angle between the exposure of one
+// stored row and the next).
+void terms_of_reduced_frames(geometry::Terms& T, int f, int rows_full, double rad_per_row) {
+    const int rows_r = rows_full / f;
+    const double shift = (rad_per_row * (f * (rows_r - 1) / 2.0 - (rows_full - 1) / 2.0)) * (180.0 / M_PI);
+    for (double& a : T.angles_deg) a += shift;
+    const float ff = static_cast<float>(f);
+    for (float& v : T.row_offset) v /= ff;
+    for (float& v : T.col_offset) v /= ff;
+    T.slope_col /= f, T.slope_row /= f, T.scale_col /= f, T.scale_row /= f;
+}
+
+// the angle per frame of a run of frames: the median of the steps' sizes [deg]
+double angle_step(const std::vector<double>& angle) {
+    std::vector<double> steps(angle.size() > 1 ? angle.size() - 1 : 0);
+    for (std::size_t i = 0; i + 1 < angle.size(); ++i) steps[i] = std::fabs(angle[i + 1] - angle[i]);
+    if (steps.empty()) throw Error("a scan of one frame has no angle per frame");
+    std::nth_element(steps.begin(), steps.begin() + static_cast<std::ptrdiff_t>(steps.size() / 2), steps.end());
+    return steps[steps.size() / 2];
+}
+
+template <class T>
+std::vector<T> part_of(const std::vector<T>& v, const std::array<std::size_t, 2>& run) {
+    return std::vector<T>(v.begin() + static_cast<std::ptrdiff_t>(run[0]), v.begin() + static_cast<std::ptrdiff_t>(run[1]));
+}
+
 }  // namespace
 
 std::string build_revision() {
@@ -173,7 +202,8 @@ void apply_parameters(const Json& params, ReconConfig& cfg, const ExternalBackpr
 }
 
 std::pair<std::string, std::string> geometry_calibration_file(const std::string& given, const std::string& cache_dir, const std::vector<std::string>& masters,
-                                                              const std::string& row_time_us, Device device, const Log& log, const GeometryMaker& make) {
+                                                              const std::string& row_time_us, Device device, const Log& log, const GeometryMaker& make,
+                                                              const std::string& projection_store, int reduce) {
     if (!given.empty()) return {absolute(given), read_text(given)};
     if (cache_dir.empty())
         throw Error("no geometry calibration: give geometry=PATH (made by helirec-calibration geometry), or a cache directory to make it in and keep it");
@@ -201,6 +231,7 @@ std::pair<std::string, std::string> geometry_calibration_file(const std::string&
     if (!row_time_us.empty()) opt.row_time = number_of(Json::of(row_time_us), "row_time_us") * 1e-6;
     opt.device = device;
     opt.log = log;
+    opt.projections = projection_store, opt.reduce = reduce;
     const std::string text = make ? make(masters, opt) : calibration::geometry_calibration::calibrate_geometry(masters, opt);
     std::filesystem::create_directories(cache_dir);
     calibration::geometry_calibration::save_text(text, path);
@@ -211,16 +242,19 @@ struct Reconstruction::Impl {
     std::string projections;
     Options options;
     Json params;
-    calibration::Scan main, companion;
+    std::vector<calibration::Scan> scans;   // the first (the main scan) has the rotation axis in its field
+    std::vector<std::string> store_groups;  // per scan: its group of the projection store ("" each: the detector's files)
 
     // the geometry calibration in use
     std::string geometry_path, geometry_text, geometry_sha256;
     std::unique_ptr<geometry::Calibration> geometry;
     Json geometry_doc;
-    std::array<geometry::Poses, 2> poses;
+    std::vector<geometry::Poses> poses;                  // of every frame of each scan's record
+    std::vector<std::array<std::size_t, 2>> used;        // per scan: the frames [first, end) the reconstruction is given
     std::string not_applied;
-    geometry::MergedLayout layout;
-    std::array<geometry::Terms, 2> terms;
+    geometry::MergedLayout layout;                       // in stored pixels
+    std::vector<geometry::Terms> terms;                  // of the frames given, in the pixels of the frames read
+    geometry::Map map;                                   // in the pixels of the frames read
     double rolling_shutter = 0;
     std::tuple<std::string, double, std::string> geometry_key;
 
@@ -229,6 +263,8 @@ struct Reconstruction::Impl {
     std::string resolved_sld = "{}";
     int lo = 0, hi = 0;
 
+    const calibration::Scan& main() const { return scans[0]; }
+    int factor() const { return 1 << options.reduce; }  // stored pixels per pixel of the frames read
     bool legacy() const { return member(params, "mode").string == "legacy_reference"; }
 
     std::tuple<std::string, double, std::string> geometry_request() const {
@@ -237,71 +273,133 @@ struct Reconstruction::Impl {
     }
 
     void geometry_file() {
+        std::vector<std::string> masters;
+        for (const calibration::Scan& sc : scans) masters.push_back(sc.master);
         std::tie(geometry_path, geometry_text) =
-            geometry_calibration_file(strip(text_of(member(params, "geometry"))), options.cache_dir, {main.master, companion.master},
-                                      strip(text_of(member(params, "row_time_us"))), options.device, options.log);
+            geometry_calibration_file(strip(text_of(member(params, "geometry"))), options.cache_dir, masters, strip(text_of(member(params, "row_time_us"))), options.device,
+                                      options.log, nullptr, options.projection_store, options.reduce);
     }
 
     // the geometry calibration, the poses it gives the frames, the merged frame laid out from them, the intensity
-    // calibration in that frame and both scans' terms
+    // calibration in that frame and every scan's terms
     void calibrate() {
+        if (legacy() && (options.reduce || !options.projection_store.empty()))
+            throw Error("mode legacy_reference reconstructs the detector's frames as stored, not a projection store's or reduced ones");
         geometry_file();
         geometry_sha256 = Sha256().update(geometry_text).hex();
         geometry_doc = Json::parse(geometry_text);
         geometry = std::make_unique<geometry::Calibration>(geometry::Calibration::parse(geometry_text));
         const std::vector<std::string> made = geometry->scans();
-        const calibration::Scan* scans[2] = {&main, &companion};
-        for (int k = 0; k < 2; ++k)
-            if (made.size() != 2 || base_name(made[static_cast<std::size_t>(k)]) != base_name(scans[k]->master))
-                throw Error("geometry " + geometry_path + " was made from " + (made.size() > static_cast<std::size_t>(k) ? made[static_cast<std::size_t>(k)] : "other scans") +
-                            ", not from " + scans[k]->master + " (first scan: the one with the rotation axis in its field)");
-        const std::array<std::vector<double>, 2> H = {geometry->heights_rows(main.z_translation_m, main.pixel_size_m),
-                                                      geometry->heights_rows(companion.z_translation_m, companion.pixel_size_m)};
-        poses = geometry->frame_poses({main.unwrapped_angles_deg, companion.unwrapped_angles_deg}, H, &not_applied);
-        layout = geometry->merged_layout(poses, H);
-        intensity = calibration::calibrate_intensity(main, companion, layout, options.cache_dir, options.log, options.progress);
-        const Json& lay = member(geometry_doc, "layout");
-        const double origin = H[0].at(geometry->helix_frames()[0]) - H[0][0];  // the helix's first frame lies where the record puts it
-        for (int k = 0; k < 2; ++k) {
-            const calibration::ScanPlacement& pl = intensity.placement[static_cast<std::size_t>(k)];
-            terms[static_cast<std::size_t>(k)] =
-                geometry::reconstruction_terms(poses[static_cast<std::size_t>(k)], H[static_cast<std::size_t>(k)], member(lay, "row_sign").number,
-                                               static_cast<int>(member(lay, "rows").number), intensity.rot_center, pl.shift_x - pl.x_readjustment,
-                                               pl.z_readjustment, origin);
+        const std::size_t S = scans.size();
+        for (std::size_t k = 0; k < S; ++k)
+            if (made.size() != S || base_name(made[k]) != base_name(scans[k].master))
+                throw Error("geometry " + geometry_path + " was made from " + (made.size() > k ? made[k] : "other scans") + ", not from " + scans[k].master +
+                            " (first scan: the one with the rotation axis in its field)");
+        std::vector<std::vector<double>> angles(S), H(S);
+        for (std::size_t k = 0; k < S; ++k) angles[k] = scans[k].unwrapped_angles_deg, H[k] = geometry->heights_rows(scans[k].z_translation_m, scans[k].pixel_size_m);
+        const Json* model = geometry_doc.find("model");
+        used.assign(S, {0, 0});
+        if (model && model->is(Json::String) && model->string == "joint") {
+            poses = geometry->scan_poses(angles, H, &not_applied);
+            for (std::size_t k = 0; k < S; ++k) {
+                // the frames the calibration was made on: those are the frames it places, and the frames on disk
+                const auto runs = geometry->frames_placed(k);
+                if (runs.size() != 1 || runs[0][1] > angles[k].size())
+                    throw Error("the geometry calibration holds " + std::to_string(runs.size()) + " separate runs of frames of " + scans[k].name +
+                                " (stretches that do not follow one another were on disk): the reconstruction takes one run of frames per scan");
+                used[k] = runs[0];
+            }
+        } else {  // a file of the earlier two-scan step
+            if (S != 2) throw Error("geometry " + geometry_path + " is of the earlier two-scan step: it places two scans");
+            std::array<geometry::Poses, 2> pair = geometry->frame_poses({angles[0], angles[1]}, {H[0], H[1]}, &not_applied);
+            poses = {std::move(pair[0]), std::move(pair[1])};
+            for (std::size_t k = 0; k < S; ++k) used[k] = {0, angles[k].size()};
         }
-        rolling_shutter = geometry->rolling_shutter();
+        if (legacy())
+            for (std::size_t k = 0; k < S; ++k)
+                if (used[k][0] != 0 || used[k][1] != angles[k].size()) throw Error("mode legacy_reference takes every frame of the scans, and the geometry calibration was made on a part of them");
+        std::vector<std::size_t> first;
+        for (std::size_t k = 0; k < S; ++k) first.push_back(used[k][0]);
+        layout = geometry->merged_layout(poses, H, first);
+        // the merged frame in the pixels of the frames read
+        const int f = factor();
+        geometry::MergedLayout in_frames = layout;
+        if (f > 1) {
+            in_frames.cor_main_detector /= f;
+            in_frames.vector = {layout.vector[0] / f, layout.vector[1] / f};
+            for (auto& v : in_frames.vectors) v = {v[0] / f, v[1] / f};
+        }
+        std::vector<const calibration::Scan*> all;
+        for (const calibration::Scan& sc : scans) all.push_back(&sc);
+        intensity = calibration::calibrate_intensity(all, in_frames, options.cache_dir, options.log, options.progress, options.projection_store, options.reduce);
+        const Json& lay = member(geometry_doc, "layout");
+        const int rows_stored = static_cast<int>(member(lay, "rows").number);
+        // the helix's first frame lies where the record puts it, counted from the first frame given
+        const double origin = H[0].at(geometry->helix_frames()[0]) - H[0][used[0][0]];
+        const double frames_per_row = geometry->rolling_shutter() / (rows_stored - 1);  // the rows' timing, per stored row
+        terms.assign(S, {});
+        for (std::size_t k = 0; k < S; ++k) {
+            const calibration::ScanPlacement& pl = intensity.placement[k];
+            const bool whole = used[k][0] == 0 && used[k][1] == angles[k].size();
+            geometry::Poses given = poses[k];
+            if (!whole)
+                for (auto* v : {&given.row, &given.row_per_col, &given.axis, &given.col_per_row, &given.col_scale, &given.row_scale, &given.angle_deg, &given.angle_deg_per_row})
+                    *v = part_of(*v, used[k]);
+            terms[k] = geometry::reconstruction_terms(given, whole ? H[k] : part_of(H[k], used[k]), member(lay, "row_sign").number, rows_stored, intensity.rot_center * f,
+                                                      (pl.shift_x - pl.x_readjustment) * f, pl.z_readjustment * f, origin);
+            if (f > 1) terms_of_reduced_frames(terms[k], f, rows_stored, frames_per_row * angle_step(part_of(angles[k], used[k])) * (M_PI / 180.0));
+        }
+        map = geometry->map();
+        if (f > 1) {
+            for (double& v : map.eu) v /= f;
+            for (double& v : map.ev) v /= f;
+            map.c0 /= f, map.cs /= f, map.v0 /= f, map.vs /= f;
+        }
+        // the time from the first row to the last of the frames read, in frame periods
+        rolling_shutter = f > 1 ? frames_per_row * f * (rows_stored / f - 1) : geometry->rolling_shutter();
         geometry_key = geometry_request();
     }
 
-    ScanData scan_data(int k) const {
-        const calibration::Scan& scan = k ? companion : main;
-        const calibration::DarksFlats& reduced = k ? intensity.companion_reduced : intensity.main_reduced;
-        const calibration::ScanPlacement& pl = intensity.placement[static_cast<std::size_t>(k)];
+    ScanData scan_data(std::size_t k) const {
+        const calibration::Scan& scan = scans[k];
+        const calibration::DarksFlats& reduced = intensity.reduced[k];
+        const calibration::ScanPlacement& pl = intensity.placement[k];
+        const std::array<std::size_t, 2>& run = used[k];
+        const bool whole = run[0] == 0 && run[1] == scan.unwrapped_angles_deg.size();
+        const int f = factor();
         ScanData d;
         ScanTrajectory& t = d.traj;
-        t.z_translation_m = scan.z_translation_m;
-        t.pixel_size_m = scan.pixel_size_m;
-        t.det_rows = scan.rows;
-        t.det_cols = scan.cols;
+        t.z_translation_m = whole ? scan.z_translation_m : part_of(scan.z_translation_m, run);
+        t.pixel_size_m = scan.pixel_size_m * f;
+        t.det_rows = scan.rows / f;
+        t.det_cols = scan.cols / f;
         t.shift_x = pl.shift_x;
         t.x_readjustment = static_cast<float>(pl.x_readjustment);
         t.z_readjustment = static_cast<float>(pl.z_readjustment);
-        d.control_A = scan.control_A;
+        d.control_A = whole ? scan.control_A : part_of(scan.control_A, run);
         d.flat_info.angles_deg.assign(scan.flats_unwrapped_angles_deg.begin(), scan.flats_unwrapped_angles_deg.end());
         d.dark = reduced.dark;
         const std::size_t px = reduced.dark.size();
         d.flats.resize(reduced.flats.size());
         for (std::size_t i = 0; i < d.flats.size(); ++i) d.flats[i] = reduced.flats[i] - reduced.dark[i % px];
-        d.weight = k ? intensity.companion_weight : intensity.main_weight;
-        d.reader = std::make_shared<RawReader>(scan.projections.files, scan.projections.dataset, scan.rows, scan.cols);
-        d.file_index = scan.projections.file_index;
-        d.frame_index = scan.projections.frame_index;
+        d.weight = intensity.weight[k];
+        // where the frames are read: the detector's files, or the same frames of the projection store
+        calibration::FrameList source = scan.projections;
+        if (!whole) {
+            std::vector<std::int64_t> index(run[1] - run[0]);
+            for (std::size_t i = 0; i < index.size(); ++i) index[i] = static_cast<std::int64_t>(run[0] + i);
+            source = scan.projections.subset(index);
+        }
+        if (!store_groups[k].empty()) source = frames_in_projection_store(source, store_groups[k]);
+        d.reader = std::make_shared<RawReader>(source.files, source.dataset, scan.rows, scan.cols, options.reduce);
+        d.file_index = source.file_index;
+        d.frame_index = source.frame_index;
         if (legacy()) {  // the reference: the recorded angles and heights, one axis and one vector (the merged frame)
             t.angles_deg = scan.unwrapped_angles_deg;
             t.z_translation_scale = 1.0;
             return d;
         }
-        const geometry::Terms& g = terms[static_cast<std::size_t>(k)];
+        const geometry::Terms& g = terms[k];
         t.angles_deg = g.angles_deg;
         t.z_translation_scale = g.z_translation_scale;
         t.row_offset = g.row_offset;
@@ -314,21 +412,33 @@ struct Reconstruction::Impl {
         t.scale_col = static_cast<float>(g.scale_col);
         t.row_scale = g.row_scale;
         t.scale_row = static_cast<float>(g.scale_row);
-        const geometry::Map m = geometry->map();
-        t.map_i.assign(m.i.begin(), m.i.end());
-        t.map_j.assign(m.j.begin(), m.j.end());
-        t.map_eu = m.eu;
-        t.map_ev = m.ev;
-        t.map_c0 = m.c0;
-        t.map_cs = m.cs;
-        t.map_v0 = m.v0;
-        t.map_vs = m.vs;
+        t.map_i.assign(map.i.begin(), map.i.end());
+        t.map_j.assign(map.j.begin(), map.j.end());
+        t.map_eu = map.eu;
+        t.map_ev = map.ev;
+        t.map_c0 = map.c0;
+        t.map_cs = map.cs;
+        t.map_v0 = map.v0;
+        t.map_vs = map.vs;
         return d;
+    }
+
+    // which scan `only_scan` names: "main", "companion" (the second), "companion2", .., or the kind a scan's name
+    // ends in ("HA", "TA", "TA2", ..)
+    std::size_t scan_named(const std::string& only) const {
+        if (only == "main") return 0;
+        for (std::size_t k = 1; k < scans.size(); ++k)
+            if (only == (k == 1 ? std::string("companion") : "companion" + std::to_string(k))) return k;
+        for (std::size_t k = 0; k < scans.size(); ++k)
+            if (const auto t = calibration::parse_tetra_name(scans[k].name); t && lower(t->kind) == only) return k;
+        std::string names = "'main'";
+        for (std::size_t k = 1; k < scans.size(); ++k) names += k == 1 ? ", 'companion'" : ", 'companion" + std::to_string(k) + "'";
+        throw Error("only_scan must be '', " + names + " or the kind a scan's name ends in (HA, TA, TA2, ..)");
     }
 
     double exposure_arc() const {
         const Json& v = member(params, "exposure_arc");
-        if (v.is(Json::String) && lower(strip(v.string)) == "auto") return main.exposure_arc.value_or(0.0);
+        if (v.is(Json::String) && lower(strip(v.string)) == "auto") return main().exposure_arc.value_or(0.0);
         return number_of(v, "exposure_arc");
     }
 
@@ -361,32 +471,31 @@ struct Reconstruction::Impl {
         const bool legacy_mode = legacy();
         ReconConfig cfg;
         cfg.device = options.device;
-        cfg.energy_kev = main.energy_kev;
-        cfg.distance_m = main.distance_m;
-        cfg.pixel_size_m = main.pixel_size_m;
+        cfg.energy_kev = main().energy_kev;
+        cfg.distance_m = main().distance_m;
+        cfg.pixel_size_m = main().pixel_size_m * factor();
         cfg.rot_center = static_cast<float>(intensity.rot_center);
         cfg.legacy_reference = legacy_mode;
         apply_parameters(params, cfg, options.external_backprojector, &resolved_sld);
-        std::vector<ScanData> scans;
+        std::vector<ScanData> data;
         double axis = intensity.rot_center;
         const std::string only = lower(strip(text_of(member(params, "only_scan"))));
         if (only.empty()) {
-            scans = {scan_data(0), scan_data(1)};
+            for (std::size_t k = 0; k < scans.size(); ++k) data.push_back(scan_data(k));
         } else {
-            if (only != "main" && only != "companion") throw Error("only_scan must be '', 'main' or 'companion'");
             // The scan alone in its own columns, the axis where the merged frame has it against them. Every
             // projection's terms are counted from the axis, so they stay as they are.
-            ScanData d = scan_data(only == "companion" ? 1 : 0);
+            ScanData d = scan_data(scan_named(only));
             axis -= static_cast<double>(d.traj.shift_x) - d.traj.x_readjustment;
             d.traj.shift_x = 0, d.traj.x_readjustment = 0;
             cfg.rot_center = static_cast<float>(axis);
-            scans.push_back(std::move(d));
+            data.push_back(std::move(d));
         }
         if (!cfg.grid_size) cfg.grid_size = static_cast<int>(std::nearbyint(2.0 * axis)) + 1;  // 2 x axis rounded to even, + 1
         cfg.exposure_arc = exposure_arc();
         cfg.sharpness_weighting = legacy_mode ? std::string() : sharpness_weighting();
         cfg.rolling_shutter = legacy_mode ? 0.0 : rolling_shutter;
-        rec = std::make_shared<SliceReconstructor>(std::move(scans), cfg);
+        rec = std::make_shared<SliceReconstructor>(std::move(data), cfg);
         std::tie(lo, hi) = rec->doable();
         if (rec->angle_interp() == "views" && exposure_arc() != 0)
             say(options.log, "note: exposure_arc is disabled with angle_interp=views (not deconvolved; angle_interp=nearest applies it)");
@@ -418,14 +527,22 @@ Reconstruction::Reconstruction(const std::string& projections, const std::string
     Impl& I = *impl_;
     I.projections = projections;
     I.options = std::move(options);
-    std::vector<calibration::Scan> scans = calibration::discover_scans(projections);
-    const std::vector<int> pair = calibration::pair_companions(scans);
-    I.main = std::move(scans[static_cast<std::size_t>(pair[0])]);
-    I.companion = std::move(scans[static_cast<std::size_t>(pair[1])]);
-    say(I.options.log, "scans: " + I.main.name + " (" + std::to_string(I.main.unwrapped_angles_deg.size()) + " projections) + " + I.companion.name + " (" +
-                           std::to_string(I.companion.unwrapped_angles_deg.size()) + ")");
-    I.main.check_files();
-    I.companion.check_files();
+    if (I.options.reduce < 0 || I.options.reduce > 3) throw Error("reduce is 0, 1, 2 or 3");
+    if (I.options.reduce && I.options.projection_store.empty()) throw Error("frames read reduced are a projection store's: give the store (helirec-projections-zarr, or the downloader's --zarr)");
+    std::vector<calibration::Scan> found = calibration::discover_scans(projections);
+    std::string said;
+    for (const int k : calibration::pair_companions(found)) {  // the family: the scan with the axis in its field first
+        I.scans.push_back(std::move(found[static_cast<std::size_t>(k)]));
+        said += (said.empty() ? "" : " + ") + I.scans.back().name + " (" + std::to_string(I.scans.back().unwrapped_angles_deg.size()) + (said.empty() ? " projections)" : ")");
+    }
+    say(I.options.log, "scans: " + said);
+    I.store_groups.assign(I.scans.size(), std::string());
+    for (std::size_t k = 0; k < I.scans.size(); ++k) {
+        if (I.options.projection_store.empty()) I.scans[k].check_files();
+        else I.store_groups[k] = projection_store_tile_group(I.options.projection_store, I.scans[k].sample_name.empty() ? I.scans[k].name : I.scans[k].sample_name);
+    }
+    if (!I.options.projection_store.empty())
+        say(I.options.log, "frames from " + I.options.projection_store + " at 1/" + std::to_string(I.factor()) + ", those the geometry calibration was made on");
     I.params = Json::parse(update_parameters(default_parameters(), params.empty() ? "{}" : params));  // (the mode is checked before the calibration)
     I.calibrate();
     I.build();
@@ -440,8 +557,14 @@ void Reconstruction::set_parameters(const std::string& changes) {
 }
 
 std::string Reconstruction::parameters() const { return impl_->params.text(); }
-const calibration::Scan& Reconstruction::main() const { return impl_->main; }
-const calibration::Scan& Reconstruction::companion() const { return impl_->companion; }
+const calibration::Scan& Reconstruction::main() const { return impl_->scans[0]; }
+const calibration::Scan& Reconstruction::companion() const {
+    if (impl_->scans.size() < 2) throw Error("the acquisition is of one scan: it has no companion");
+    return impl_->scans[1];
+}
+const std::vector<calibration::Scan>& Reconstruction::scans() const { return impl_->scans; }
+std::pair<std::size_t, std::size_t> Reconstruction::frames(std::size_t scan) const { return {impl_->used.at(scan)[0], impl_->used.at(scan)[1]}; }
+int Reconstruction::reduce() const { return impl_->options.reduce; }
 const calibration::IntensityCalibration& Reconstruction::intensity() const { return impl_->intensity; }
 std::shared_ptr<SliceReconstructor> Reconstruction::reconstructor() const { return impl_->rec; }
 std::pair<int, int> Reconstruction::doable() const { return {impl_->lo, impl_->hi}; }
@@ -464,13 +587,14 @@ SliceInfo Reconstruction::slice_info(double fraction) const {
     const Impl& I = *impl_;
     const int k = static_cast<int>(std::nearbyint(fraction * (I.hi - I.lo)));  // half to even (the reference's)
     const int h = I.hi - 1 - k;
-    const double z0 = I.main.z_translation_m.at(0);
-    const double px_mm = I.main.pixel_size_m * 1e3;
+    // (of the frames read, counted from the first frame given)
+    const double z0 = I.main().z_translation_m.at(I.used[0][0]);
+    const double px_mm = I.main().pixel_size_m * I.factor() * 1e3;
     SliceInfo s;
     s.fraction = fraction;
     s.view_height = h;
     s.nabu_index = 999999 - (I.hi - h);
-    s.height_mm = px_mm * ((I.main.rows - 1) / 2.0 - h) - z0 * 1e3;
+    s.height_mm = px_mm * ((I.main().rows / I.factor() - 1) / 2.0 - h) - z0 * 1e3;
     return s;
 }
 
@@ -490,14 +614,36 @@ std::string Reconstruction::provenance() const {
     Json map = Json::dict();
     const Json& doc_map = member(I.geometry_doc, "map");
     for (const char* k : {"c0", "cs", "v0", "vs", "i", "j", "eu", "ev"}) map.set(k, member(doc_map, k));
-    const Json layout = Json::dict()
-                            .set("cor_main_detector", Json::of(I.layout.cor_main_detector))
-                            .set("vector", numbers({I.layout.vector[0], I.layout.vector[1]}))
-                            .set("measured", Json::dict()
-                                                 .set("axis_first_scan", Json::of(I.layout.axis_first_scan))
-                                                 .set("axis_second_scan", Json::of(I.layout.axis_second_scan))
-                                                 .set("second_scan_rows", Json::of(I.layout.second_scan_rows))
-                                                 .set("quantum", Json::of(I.layout.quantum)));
+    Json layout = Json::dict()
+                      .set("cor_main_detector", Json::of(I.layout.cor_main_detector))
+                      .set("vector", numbers({I.layout.vector[0], I.layout.vector[1]}))
+                      .set("measured", Json::dict()
+                                           .set("axis_first_scan", Json::of(I.layout.axis_first_scan))
+                                           .set("axis_second_scan", Json::of(I.layout.axis_second_scan))
+                                           .set("second_scan_rows", Json::of(I.layout.second_scan_rows))
+                                           .set("quantum", Json::of(I.layout.quantum)));
+    if (I.scans.size() != 2) {  // (a pair's is its one vector, as it always was)
+        Json vectors = Json::list(), measured = Json::list();
+        for (const auto& v : I.layout.vectors) vectors.add(numbers({v[0], v[1]}));
+        for (const auto& v : I.layout.measured) measured.add(numbers({v[0], v[1]}));
+        layout.set("vectors", vectors).set("measured_axis_and_rows", measured);
+    }
+    // the frames read, where they are not the detector's own, whole: the store and its level, each scan's frames
+    Json frames = Json();
+    if (!I.options.projection_store.empty()) {
+        Json per_scan = Json::list();
+        for (std::size_t k = 0; k < I.scans.size(); ++k)
+            per_scan.add(Json::dict()
+                             .set("scan", Json::of(I.scans[k].name))
+                             .set("group", Json::of(I.store_groups[k]))
+                             .set("first", Json::whole_number(static_cast<long long>(I.used[k][0])))
+                             .set("end", Json::whole_number(static_cast<long long>(I.used[k][1]))));
+        frames = Json::dict()
+                     .set("projection_store", Json::of(I.options.projection_store))
+                     .set("reduce", Json::whole_number(I.options.reduce))
+                     .set("pixels", Json::of("positions below the geometry's entry are of the frames read (1/" + std::to_string(I.factor()) + " of the stored ones); the geometry's own are stored pixels"))
+                     .set("scans", per_scan);
+    }
     const Json geometry = Json::dict()
                               .set("path", Json::of(I.geometry_path))
                               .set("sha256", Json::of(I.geometry_sha256))
@@ -507,7 +653,7 @@ std::string Reconstruction::provenance() const {
                               .set("merged_frame", layout)
                               .set("applied", Json::of(legacy ? "the merged frame alone (mode legacy_reference)" : "the detector map and every projection's pose and row timing"))
                               .set("measured_not_applied", I.not_applied.empty() ? Json() : Json::parse(I.not_applied));
-    return Json::dict()
+    Json out = Json::dict()
         .set("mode", Json::of(m))
         .set("conventions", conventions)
         .set("params", I.params)
@@ -525,11 +671,12 @@ std::string Reconstruction::provenance() const {
         .set("resolved_rolling_shutter", Json::of(rolling_shutter()))
         .set("geometry", geometry)
         .set("reconstructor", I.info_json())
-        .set("pixel_size_m", Json::of(I.main.pixel_size_m))
-        .set("energy_kev", Json::of(I.main.energy_kev))
-        .set("distance_m", Json::of(I.main.distance_m))
-        .set("helirec", Json::dict().set("git", Json::of(build_revision())))
-        .text();
+        .set("pixel_size_m", Json::of(I.main().pixel_size_m * I.factor()))
+        .set("energy_kev", Json::of(I.main().energy_kev))
+        .set("distance_m", Json::of(I.main().distance_m))
+        .set("helirec", Json::dict().set("git", Json::of(build_revision())));
+    if (!frames.is(Json::Null)) out.set("frames", frames);
+    return out.text();
 }
 
 // ---------------------------------------------------------------- one tile of a mosaic
@@ -622,37 +769,9 @@ TileReconstruction tile_reconstructor(const std::string& master, const std::stri
     if (store_flats) {
         if (o.weight) throw Error("tile " + label + ": a weight function takes the stored frames' weight map, and the darks and flats are a projection store's");
         say(o.log, "[" + label + "] darks and flats from " + o.projections);
-        int rr = 0, rc = 0;
-        const auto mean_of = [&](const calibration::FrameList& list, const float* dark, const std::vector<double>* control) {
-            if (!list.size()) throw Error(scan.name + ": no dark or flat frames");
-            const calibration::FrameList in_store = frames_in_projection_store(list, o.projections);
-            std::vector<double> sum;
-            std::size_t i0 = 0;
-            while (i0 < in_store.size()) {  // the frames of one scan group at a time
-                std::size_t i1 = i0;
-                std::vector<std::int64_t> frames;
-                std::vector<double> weight;
-                while (i1 < in_store.size() && in_store.file_index[i1] == in_store.file_index[i0]) {
-                    frames.push_back(in_store.frame_index[i1]);
-                    if (control) weight.push_back(calibration::kNominalCurrentA / control->at(i1));
-                    ++i1;
-                }
-                const std::vector<double> part = projection_store_sum(in_store.files[static_cast<std::size_t>(in_store.file_index[i0])], o.reduce, frames.data(), frames.size(), dark,
-                                                                      control ? weight.data() : nullptr, &rr, &rc);
-                if (sum.empty()) sum = part;
-                else
-                    for (std::size_t i = 0; i < sum.size(); ++i) sum[i] += part[i];
-                i0 = i1;
-            }
-            std::vector<float> mean(sum.size());
-            for (std::size_t i = 0; i < sum.size(); ++i) mean[i] = static_cast<float>(sum[i] / static_cast<double>(in_store.size()));
-            return mean;
-        };
-        store_dark = mean_of(scan.darks, nullptr, nullptr);
-        for (std::size_t k = 0; k < scan.flats.size(); ++k) {
-            const std::vector<float> flat = mean_of(scan.flats[k], store_dark.data(), &scan.flats_control_A[k]);
-            store_flat_series.insert(store_flat_series.end(), flat.begin(), flat.end());
-        }
+        const calibration::DarksFlats held = calibration::store_darks_flats(scan, o.projections, o.reduce);
+        store_dark = held.dark, store_flat_series = held.flats;
+        const int rr = held.rows, rc = held.cols;
         if (rr != rows_full / f || rc != cols_full / f) throw Error("tile " + label + ": the store's darks and flats are not of the level's size");
         // the weight map formed on the level's grid, its widths divided with the pixels
         const std::size_t px = static_cast<std::size_t>(rr) * static_cast<std::size_t>(rc);
@@ -695,11 +814,8 @@ TileReconstruction tile_reconstructor(const std::string& master, const std::stri
         out.row_origin = o.row_origin ? *o.row_origin : -own.row[own.row.size() / 2];
         // (row_origin: reconstruction_terms adds it to the poses' rows, and the slice h is read at the row h + row + origin)
         out.terms = geometry::reconstruction_terms(own, height_rows, row_sign, rows_full, rot_center, 0.0, 0.0, out.row_origin);
-        std::vector<double> steps(angle.size() > 1 ? angle.size() - 1 : 0);
-        for (std::size_t i = 0; i + 1 < angle.size(); ++i) steps[i] = std::fabs(angle[i + 1] - angle[i]);
-        if (steps.empty()) throw Error("tile " + label + ": one frame on disk");
-        std::nth_element(steps.begin(), steps.begin() + static_cast<std::ptrdiff_t>(steps.size() / 2), steps.end());
-        step_deg = steps[steps.size() / 2];
+        if (angle.size() < 2) throw Error("tile " + label + ": one frame on disk");
+        step_deg = angle_step(angle);
         rad_per_row = member(member(cal, "row_time"), "frames_per_row").number * step_deg * (M_PI / 180.0);
     } else {
         out.row_origin = o.row_origin ? *o.row_origin : -(1.0 + member(cal, "axial_scale").number) * height_rows[height_rows.size() / 2];
@@ -736,14 +852,7 @@ TileReconstruction tile_reconstructor(const std::string& master, const std::stri
                 for (int x = 0; x < wx; ++x) wr[static_cast<std::size_t>(y) * wx + x] = w[static_cast<std::size_t>(y * f) * cols_full + x * f];  // the weight of the stored pixel a reduced value sits at
             w = std::move(wr);
         }
-        // the reconstruction counts the rows' timing from its middle row, which is the stored row f (rows_r - 1) / 2 and
-        // not the stored middle (rows - 1) / 2 the description's angles are for
-        const double shift = (rad_per_row * (f * (rows_r - 1) / 2.0 - (rows_full - 1) / 2.0)) * (180.0 / M_PI);
-        for (double& a : T.angles_deg) a += shift;
-        const float ff = static_cast<float>(f);
-        for (float& v : T.row_offset) v /= ff;
-        for (float& v : T.col_offset) v /= ff;
-        T.slope_col /= f, T.slope_row /= f, T.scale_col /= f, T.scale_row /= f;
+        terms_of_reduced_frames(T, f, rows_full, rad_per_row);
         for (double& v : eu) v /= f;
         for (double& v : ev) v /= f;
         c0 /= f, cs /= f, v0 /= f, vs /= f;

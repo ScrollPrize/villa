@@ -18,6 +18,9 @@
 #include <set>
 
 #include "calibration/h5_read.hpp"
+#include "calibration/iso_time.hpp"
+#include "calibration/nxtomo.hpp"
+#include "calibration/unwrap.hpp"
 #include "helirec/common.hpp"
 
 namespace helirec::calibration {
@@ -99,90 +102,7 @@ std::vector<std::string> list_dir(const std::string& d) {
     return names;
 }
 
-// ------------------------------------------------------------------ time stamps
-
-std::int64_t days_from_civil(std::int64_t y, unsigned m, unsigned d) {
-    y -= m <= 2;
-    const std::int64_t era = (y >= 0 ? y : y - 399) / 400;
-    const unsigned yoe = static_cast<unsigned>(y - era * 400);
-    const unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
-    const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    return era * 146097 + static_cast<std::int64_t>(doe) - 719468;
-}
-
-// datetime.fromisoformat(s), in UTC when it carries an offset, as numpy datetime64[ms]: milliseconds since the
-// epoch (the microseconds rounded down)
-std::int64_t iso_ms(const std::string& s) {
-    const auto bad = [&]() { return Error("invalid isoformat string: '" + s + "'"); };
-    std::size_t i = 0;
-    const auto digits = [&](int n) {
-        if (i + n > s.size()) throw bad();
-        int v = 0;
-        for (int k = 0; k < n; ++k) {
-            if (!std::isdigit(static_cast<unsigned char>(s[i]))) throw bad();
-            v = v * 10 + (s[i++] - '0');
-        }
-        return v;
-    };
-    const auto expect = [&](char c) {
-        if (i >= s.size() || s[i] != c) throw bad();
-        ++i;
-    };
-    const int year = digits(4);
-    expect('-');
-    const int month = digits(2);
-    expect('-');
-    const int day = digits(2);
-    int hour = 0, minute = 0, second = 0;
-    std::int64_t micro = 0, offset_us = 0;
-    if (i < s.size()) {
-        ++i;  // the separator (any one character)
-        hour = digits(2);
-        if (i < s.size() && s[i] == ':') {
-            ++i;
-            minute = digits(2);
-            if (i < s.size() && s[i] == ':') {
-                ++i;
-                second = digits(2);
-                if (i < s.size() && (s[i] == '.' || s[i] == ',')) {
-                    ++i;
-                    int n = 0;
-                    while (i < s.size() && std::isdigit(static_cast<unsigned char>(s[i]))) {
-                        if (n < 6) micro = micro * 10 + (s[i] - '0');
-                        ++n, ++i;
-                    }
-                    if (n == 0) throw bad();
-                    for (; n < 6; ++n) micro *= 10;
-                }
-            }
-        }
-        if (i < s.size()) {
-            const char c = s[i++];
-            if (c == 'Z' && i == s.size()) {
-            } else if (c == '+' || c == '-') {
-                const int oh = digits(2);
-                int om = 0, os = 0;
-                std::int64_t ou = 0;
-                if (i < s.size() && s[i] == ':') ++i;
-                if (i < s.size()) om = digits(2);
-                if (i < s.size() && s[i] == ':') ++i;
-                if (i < s.size()) os = digits(2);
-                if (i < s.size() && s[i] == '.') {
-                    ++i;
-                    ou = digits(6);
-                }
-                if (i != s.size()) throw bad();
-                offset_us = (((oh * 60LL + om) * 60 + os) * 1000000 + ou) * (c == '-' ? -1 : 1);
-            } else {
-                throw bad();
-            }
-        }
-    }
-    if (month < 1 || month > 12 || day < 1 || day > 31 || hour > 23 || minute > 59 || second > 59) throw bad();
-    const std::int64_t us = ((days_from_civil(year, month, day) * 24 + hour) * 60 + minute) * 60000000LL +
-                            second * 1000000LL + micro - offset_us;
-    return us >= 0 ? us / 1000 : -((-us + 999) / 1000);
-}
+// ------------------------------------------------------------------ time stamps (iso_ms: calibration/iso_time.hpp)
 
 // numpy.linspace(float128(t0), float128(t1), n, dtype='<M8[ms]'): the times spread in long double, truncated
 std::vector<std::int64_t> linspace_ms(std::int64_t t0, std::int64_t t1, std::size_t n) {
@@ -228,34 +148,6 @@ double interp(double x, const std::vector<double>& xp, const std::vector<double>
         if (std::isnan(r) && fp[j] == fp[j + 1]) r = fp[j];
     }
     return r;
-}
-
-// numpy.remainder for doubles
-double py_mod(double a, double b) {
-    double mod = std::fmod(a, b);
-    if (b == 0) return mod;
-    if (mod != 0) {
-        if ((b < 0) != (mod < 0)) mod += b;
-    } else {
-        mod = std::copysign(0.0, b);
-    }
-    return mod;
-}
-
-// numpy.unwrap(p, period=360)
-std::vector<double> unwrap_360(const std::vector<double>& p) {
-    std::vector<double> up(p);
-    double sum = 0;
-    for (std::size_t i = 1; i < p.size(); ++i) {
-        const double dd = p[i] - p[i - 1];
-        double ddmod = py_mod(dd - (-180.0), 360.0) + (-180.0);
-        if (ddmod == -180.0 && dd > 0) ddmod = 180.0;
-        double correct = ddmod - dd;
-        if (std::fabs(dd) < 180.0) correct = 0;
-        sum += correct;
-        up[i] = p[i] + sum;
-    }
-    return up;
 }
 
 double median(std::vector<double> v) {
@@ -733,6 +625,7 @@ void Scan::check_files() const {
 Scan open_scan(const std::string& path) {
     Scan scan;
     scan.master = resolve_master(path);
+    if (nxtomo::is_master(scan.master)) return nxtomo::open_scan(scan.master);  // a NeXus NXtomo master (GDA)
     scan.directory = dirname(scan.master);
     {
         const std::string b = basename(scan.master);
@@ -933,6 +826,23 @@ std::vector<Scan> discover_scans(const std::string& root_given, int max_depth, b
             if (is_tomo_master(master)) found.push_back(master);
             return;
         }
+        // a folder named as a dataset that holds the dataset's masters themselves, <dataset>_NNNN.h5 (masters copied
+        // without their scan folders: the projection downloader's metadata)
+        {
+            static const std::regex numbered(R"(_\d{4}\.h5$)");
+            bool any = false;
+            for (const std::string& n : names)
+                if (n.size() == base.size() + 8 && n.compare(0, base.size(), base) == 0 && std::regex_search(n, numbered) && is_file(join(d, n)) && is_tomo_master(join(d, n)))
+                    found.push_back(join(d, n)), any = true;
+            if (any) return;
+        }
+        // a folder of NeXus NXtomo masters, <n>.nxs (GDA: one master and one frame file per scan)
+        {
+            bool any = false;
+            for (const std::string& n : names)
+                if (n.size() > 4 && n.compare(n.size() - 4, 4, ".nxs") == 0 && is_file(join(d, n)) && nxtomo::is_master(join(d, n))) found.push_back(join(d, n)), any = true;
+            if (any) return;
+        }
         if (depth >= max_depth) return;
         for (const std::string& n : names) {
             const std::string p = join(d, n);
@@ -976,6 +886,47 @@ std::vector<std::vector<int>> group_companions(const std::vector<Scan>& scans) {
         const auto t = parse_tetra_name(scans[i].name);
         if (!t) untagged.push_back(i);
         else if (!t->crash) families[{t->base, t->suffix}].push_back({t->rank, i});
+    }
+    // A family without an HA joins the one family that has an HA, the same suffix, none of its kinds, and scans it
+    // is compatible with at other places across the beam: a column recorded under another sample name (BM18's
+    // PHercParis4 at 2.4 um: .._B_HA, .._B_TA, .._B_TA2 and .._C_TA3).
+    {
+        const auto has_kind = [](const std::vector<std::pair<int, int>>& m, int rank) {
+            return std::any_of(m.begin(), m.end(), [&](const auto& x) { return x.first == rank; });
+        };
+        std::vector<std::pair<std::pair<std::string, std::string>, std::pair<std::string, std::string>>> joins;  // (orphan, host)
+        for (const auto& [key, members] : families) {
+            if (has_kind(members, 0)) continue;
+            const std::pair<std::string, std::string>* host = nullptr;
+            int hosts = 0;
+            for (const auto& [other, theirs] : families) {
+                if (other == key || other.second != key.second || !has_kind(theirs, 0)) continue;
+                bool fits = true;
+                for (const auto& mine : members)
+                    for (const auto& their : theirs) {
+                        const Scan& a = scans[static_cast<std::size_t>(mine.second)];
+                        const Scan& b = scans[static_cast<std::size_t>(their.second)];
+                        fits = fits && mine.first != their.first && compatible(a, b) && !is_close(a.y_translation_m, b.y_translation_m, 1e-5, 1e-6);
+                    }
+                if (fits) host = &other, ++hosts;
+            }
+            if (hosts == 1) joins.push_back({key, *host});
+        }
+        for (const auto& [orphan, host] : joins) {
+            // (two such families that would bring one host the same kind: which belongs to it is not known, neither joins)
+            bool twice = false;
+            for (const auto& [other, theirs] : joins)
+                if (other != orphan && theirs == host)
+                    for (const auto& mine : families[orphan]) twice = twice || has_kind(families[other], mine.first);
+            if (twice) continue;
+            auto& into = families[host];
+            for (const auto& m : families[orphan]) into.push_back(m);
+        }
+        for (const auto& [orphan, host] : joins) {
+            bool joined = false;
+            for (const auto& mine : families[orphan]) joined = joined || std::any_of(families[host].begin(), families[host].end(), [&](const auto& x) { return x.second == mine.second; });
+            if (joined) families.erase(orphan);
+        }
     }
     std::vector<std::vector<int>> out;
     for (auto& [key, members] : families) {

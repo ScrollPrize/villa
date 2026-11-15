@@ -88,7 +88,8 @@ void bind_geometry(nb::module_& m) {
           "row"_a, "row_per_col"_a, "axis"_a, "col_per_row"_a, "col_scale"_a, "row_scale"_a, "angle_deg"_a, "scale_col"_a, "heights_rows"_a, "row_sign"_a, "rows"_a,
           "rot_center"_a, "column_offset"_a, "z_readjustment"_a = 0.0, "row_origin"_a = 0.0);
 
-    nb::class_<hg::Calibration>(m, "GeometryCalibration", "A two-scan geometry calibration (helirec/geometry.hpp), from its JSON text.")
+    nb::class_<hg::Calibration>(m, "GeometryCalibration",
+                                "A geometry calibration of scans that share their place on the rotation stage (helirec/geometry.hpp), from its JSON text.")
         .def("__init__", [](hg::Calibration* self, const std::string& json_text) { new (self) hg::Calibration(hg::Calibration::parse(json_text)); }, "json_text"_a)
         .def_prop_ro("rows", &hg::Calibration::rows)
         .def_prop_ro("cols", &hg::Calibration::cols)
@@ -112,6 +113,48 @@ void bind_geometry(nb::module_& m) {
              },
              "angles_deg_0"_a, "angles_deg_1"_a, "heights_rows_0"_a, "heights_rows_1"_a,
              "(the poses of both scans, the terms measured and not applied as JSON text)")
+        .def_prop_ro("scan_count", &hg::Calibration::scan_count)
+        .def("scan_poses",
+             [](const hg::Calibration& c, const std::vector<std::vector<double>>& angles_deg, const std::vector<std::vector<double>>& heights_rows) {
+                 std::string not_applied;
+                 std::vector<hg::Poses> p;
+                 {
+                     nb::gil_scoped_release release;
+                     p = c.scan_poses(angles_deg, heights_rows, &not_applied);
+                 }
+                 nb::list poses;
+                 for (const hg::Poses& q : p) poses.append(poses_dict(q));
+                 return nb::make_tuple(poses, not_applied);
+             },
+             "angles_deg"_a, "heights_rows"_a, "a joint calibration of any number of scans: (the poses of every scan, the terms measured and not applied as JSON text)")
+        .def("frames_placed",
+             [](const hg::Calibration& c, std::size_t scan) {
+                 nb::list runs;
+                 for (const auto& r : c.frames_placed(scan)) runs.append(nb::make_tuple(r[0], r[1]));
+                 return runs;
+             },
+             "scan"_a, "[first, end) of each run of a scan's projection frames the calibration was made on")
+        .def("merged_layout_of",
+             [](const hg::Calibration& c, const std::vector<std::vector<double>>& axis, const std::vector<std::vector<double>>& row, const std::vector<std::vector<double>>& heights_rows,
+                const std::vector<std::size_t>& first_frame, double quantum) {
+                 if (row.size() != axis.size()) throw helirec::Error("merged_layout: the axes and the rows are not of the same scans");
+                 std::vector<hg::Poses> p(axis.size());
+                 for (std::size_t s = 0; s < p.size(); ++s) p[s].axis = axis[s], p[s].row = row[s];
+                 const hg::MergedLayout l = c.merged_layout(p, heights_rows, first_frame, quantum);
+                 nb::list vectors, measured;
+                 for (const auto& v : l.vectors) vectors.append(nb::make_tuple(v[0], v[1]));
+                 for (const auto& v : l.measured) measured.append(nb::make_tuple(v[0], v[1]));
+                 nb::dict d;
+                 d["cor_main_detector"] = l.cor_main_detector;
+                 d["vectors"] = vectors;
+                 d["measured"] = measured;
+                 d["axis_first_scan"] = l.axis_first_scan;
+                 d["quantum"] = l.quantum;
+                 return d;
+             },
+             "axis"_a, "row"_a, "heights_rows"_a, "first_frame"_a = std::vector<std::size_t>(), "quantum"_a = 0.25,
+             "the merged frame of any number of scans: the axis in the first scan's columns, every other scan's (rows, columns) from it, and per other scan its "
+             "(axis column, rows) unrounded")
         .def("merged_layout",
              [](const hg::Calibration& c, DoubleIn axis0, DoubleIn row0, DoubleIn axis1, DoubleIn row1, DoubleIn h0, DoubleIn h1, double quantum) {
                  std::array<hg::Poses, 2> p;

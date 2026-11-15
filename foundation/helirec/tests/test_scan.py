@@ -173,6 +173,26 @@ def test_discover_and_pair(tmp_path):
         bliss.pair_companions(scans[:1])
 
 
+def test_discover_masters_copied_without_their_scan_folders_and_a_column_under_another_name(tmp_path):
+    """The projection downloader's metadata: <dataset>/<dataset>_0001.h5; and a family whose last column was recorded
+    under another sample name (PHercParis4 at 2.4 um: .._B_HA, .._B_TA, .._B_TA2, .._C_TA3)."""
+    import shutil
+    for name, yrot in (("p_B_HA", 4.8), ("p_B_TA", 14.5), ("p_B_TA2", 24.2), ("p_C_TA3", 33.9)):
+        master = _write_scan(tmp_path / "raw", name, yrot_mm=yrot)
+        (tmp_path / "metadata" / name).mkdir(parents=True)
+        shutil.copy(master, tmp_path / "metadata" / name / f"{name}_0001.h5")
+    scans = bliss.discover_scans(str(tmp_path / "metadata"))
+    assert sorted(s.name for s in scans) == ["p_B_HA_0001", "p_B_TA2_0001", "p_B_TA_0001", "p_C_TA3_0001"]
+    family = bliss.pair_companions(scans)
+    assert family["main"].name == "p_B_HA_0001" and [s.name for s in family["companions"]] == ["p_B_TA_0001", "p_B_TA2_0001", "p_C_TA3_0001"]
+    # a column of another base name at a place the family already holds does not join it
+    master = _write_scan(tmp_path / "raw", "p_D_TA3", yrot_mm=33.9)
+    (tmp_path / "metadata" / "p_D_TA3").mkdir()
+    shutil.copy(master, tmp_path / "metadata" / "p_D_TA3" / "p_D_TA3_0001.h5")
+    family = bliss.pair_companions(bliss.discover_scans(str(tmp_path / "metadata")))
+    assert [s.name for s in family["companions"]] == ["p_B_TA_0001", "p_B_TA2_0001"]
+
+
 def test_parse_tetra_name():
     assert bliss.parse_tetra_name("SCROLLS_PHerc0343P_HA_0001") == dict(base="SCROLLS_PHerc0343P", kind="HA", rank=0, suffix="_0001", crash=False)
     assert bliss.parse_tetra_name("x_TA2_fc__0003_0002") == dict(base="x", kind="TA2", rank=2, suffix="_0003_0002", crash=True)

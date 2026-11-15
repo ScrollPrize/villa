@@ -58,6 +58,14 @@ Json scan_attribute(const std::string& path) {
 
 bool is_projection_store_scan(const std::string& path) { return !scan_attribute(path).is_null(); }
 
+std::string projection_store_tile_group(const std::string& store, const std::string& sample_name) {
+    const std::size_t cut = sample_name.find_last_of('_');
+    const std::string label = cut == std::string::npos ? sample_name : sample_name.substr(cut + 1);
+    for (const std::string& name : {sample_name, label})
+        if (!name.empty() && fs::exists(fs::path(store) / name / "zarr.json")) return (fs::path(store) / name).string();
+    throw Error("the projection store " + store + " holds no group '" + sample_name + "'" + (label != sample_name ? " or '" + label + "'" : ""));
+}
+
 ProjectionStoreLevel open_projection_store(const std::string& scan_group, int reduce) {
     const Json h = scan_attribute(scan_group);
     if (h.is_null()) throw Error(scan_group + ": not a scan group of a projection store");

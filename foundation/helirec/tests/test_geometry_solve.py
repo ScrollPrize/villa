@@ -286,6 +286,44 @@ def test_rest_turns_and_the_refusal_of_dependent_unknowns():
     assert alone["scans"][0]["axis"] == pytest.approx(there, abs=2e-3)
 
 
+def test_circular_scans_give_their_places_and_nothing_of_a_travel():
+    """Scans without a helix (a grid of circular scans): a scan does not travel along the axis, so nothing gives its
+    axial scale, the slope of its axis column or a height of its one stretch beside its own. They are held, and the
+    scans beside and above the first are placed by their comparisons with it."""
+    rng = np.random.default_rng(11)
+    turn = [("rest1", PER_TURN + 40)]
+    shared = dict(roll=TRUTH["roll"], row_time=0.0, height_once=TRUTH["height_once"], axis_twice=TRUTH["axis_twice"], d=(0.0, 0.0), axis_slope=0.0, axial_scale=0.0)
+    first = Scan(turn, index=0, axis=TRUTH["axis"], height=0.0, **shared)
+    beside = Scan(turn, index=1, axis=TRUTH["axis"] + 230.0, height=-1.3, **shared)
+    above = Scan(turn, index=2, axis=TRUTH["axis"] + 0.4, height=2.2, **shared)
+    for st in above.stretches:                                                    # recorded 150 rows from the first
+        st["rows"] = st["rows"] + 150.0
+    above.mid_height = 150.0
+    comparisons = []
+    for scan in (first, above):
+        for p, t in _points(rng, scan, 0, 900):
+            if t + PER_TURN / 2 < PER_TURN + 36:
+                comparisons.append(_same_point(scan, "opposite", 0, 0, p, t, t + PER_TURN / 2, rng, 0.004))
+    for other in (beside, above):
+        for p, t in _points(rng, first, 0, 2500):
+            comparisons.append(_same_point(first, "pair", 0, 0, p, t, t, rng, 0.004, other=other))
+    comparisons = [c for c in comparisons if c is not None]
+    assert min(sum(c["kind"] == "pair" and c["b"][0] == k for c in comparisons) for k in (1, 2)) > 300
+    acq = _acquisition(first, beside, above)
+    start = dict(roll=0.0, scans=[dict(axis=TRUTH["axis"] + 1.0), dict(axis=TRUTH["axis"] + 229.0), dict(axis=TRUTH["axis"] - 0.5)])
+    got = G.solve_geometry(acq, comparisons, start=start)
+    for k in range(3):
+        assert not {f"scan{k}.axial_scale", f"scan{k}.axis_slope", f"scan{k}.rest1.height"} & set(got["free"]) and f"scan{k}.axis" in got["free"]
+    assert {"scan1.height", "scan2.height", "scan1.d0", "scan2.d1"} <= set(got["free"]) and got["unused"] == []
+    assert got["solver"]["rank"] == len(got["free"]) == 1 + 4 + 3 + 2 * 3
+    a, b, c = got["scans"]
+    assert [a["axis"], b["axis"], c["axis"]] == pytest.approx([TRUTH["axis"], TRUTH["axis"] + 230.0, TRUTH["axis"] + 0.4], abs=5e-3)
+    assert [a["height"], b["height"], c["height"]] == pytest.approx([0.0, -1.3, 2.2], abs=5e-3)
+    assert b["d"] == pytest.approx([0.0, 0.0], abs=5e-3) and c["d"] == pytest.approx([0.0, 0.0], abs=5e-3)
+    assert got["roll"] == pytest.approx(TRUTH["roll"], abs=2e-5) and _stage_found(got, 3e-3)
+    assert all(s["axial_scale"] == 0.0 and s["axis_slope"] == 0.0 and s["stretch_height"]["rest1"] == 0.0 for s in got["scans"])
+
+
 def _pair(rng, with_map=True):
     """Two scans of one sample, the second with the rotation stage moved 230 columns across the beam: its axis lies
     60 columns from the detector's edge, and it holds the first's content in the columns both record."""
@@ -376,6 +414,26 @@ def test_a_pair_moved_sideways_gives_the_second_scans_place_and_the_map():
     assert alone["unused"][:3] == ["scan1.d0", "scan1.d1", "scan1.height"] and "scan1.axis" in alone["unused"] and alone["scans"][1]["axis"] == TRUTH["axis"] + 228.0
 
 
+def test_map_terms_not_told_from_another_unknown_are_held():
+    """undetermined_map: a free term of the map whose estimate is correlated beyond the limit with another unknown's
+    is held where it started, and the rest solved again. In this pair the roll and the columns' cubic along the rows
+    are correlated 0.94 (the largest of a map term): nothing is held at 0.95, that term at 0.93."""
+    rng = np.random.default_rng(5)
+    first, second, own, pairs = _pair(rng)
+    acq = _acquisition(first, second)
+    start = dict(roll=0.0, scans=[dict(axis=TRUTH["axis"] + 1.6), dict(axis=TRUTH["axis"] + 228.0)], map=G.empty_map(ROWS, COLS, 3))
+    plain = G.solve_geometry(acq, own + pairs, start=start, freed=["map"])
+    of_map = {(a, b): c for a, b, c in plain["correlated"] if a.startswith("map.") or b.startswith("map.")}
+    assert of_map[("roll", "map.eu.i0j3")] == pytest.approx(0.942, abs=0.005) and max(abs(c) for c in of_map.values()) < 0.95
+    same = G.solve_geometry(acq, own + pairs, start=start, freed=["map"], undetermined_map=0.95)
+    assert "undetermined" not in same and same["scans"] == plain["scans"] and same["map"] == plain["map"]
+    held = G.solve_geometry(acq, own + pairs, start=start, freed=["map"], undetermined_map=0.93)
+    assert held["undetermined"] == ["map.eu.i0j3"] and "map.eu.i0j3" not in held["free"] and len(held["free"]) == len(plain["free"]) - 1
+    k = [(i, j) for i, j in zip(held["map"]["i"], held["map"]["j"])].index((0, 3))
+    assert held["map"]["eu"][k] == 0.0 and plain["map"]["eu"][k] != 0.0 and held["map"]["ev"][k] != 0.0
+    assert all(abs(c) <= 0.93 for a, b, c in held["correlated"] if a.startswith("map.") or b.startswith("map."))
+
+
 def test_the_reconstructions_poses_are_the_models():
     """A joint calibration as the reconstruction reads it (helirec/geometry.hpp, Calibration::frame_poses): a pixel
     put through the poses' formula is the ray the model gives it, the slices counted from the first scan's helix."""
@@ -449,6 +507,61 @@ def test_the_reconstructions_poses_are_the_models():
     assert G.merged_layout(cal, poses, heights)["measured"]["axis_first_scan"] == pytest.approx(np.median(poses[0]["axis"][offsets[1]:offsets[2]]))
     with pytest.raises(ValueError, match="not of two scans"):
         G.frame_poses(dict(cal, parameters=dict(cal["parameters"], scans=cal["parameters"]["scans"][:1])), angles, heights)
+
+
+def test_the_poses_hold_a_scans_tilt_about_the_beam():
+    """A scan that holds the sample tilted against the first (its rotation's x and y, about the sample's origin at
+    about_height). A point of the sample is put through the independent projection of the tilted scan, and the pixel
+    through the calibration's poses: it is the point's own distance across the beam and its own slice, but for the
+    tilt's part about the direction across the beam, which moves the rows by the point's depth along the ray (no
+    pose holds that). Without the tilt in the poses both are off."""
+    rng = np.random.default_rng(16)
+    stretches = [("rest1", PER_TURN), ("helix", 4 * PER_TURN), ("rest2", PER_TURN)]
+    shared = dict(roll=TRUTH["roll"], height_once=TRUTH["height_once"], axis_twice=TRUTH["axis_twice"])
+    tilt, about = (4e-4, -3e-4, 0.0), -350.0
+    first = Scan(stretches, index=0, axis=TRUTH["axis"], axial_scale=TRUTH["axial_scale"], height=TRUTH["height"], **shared)
+    second = Scan(stretches, index=1, axis=TRUTH["axis"] + 230.0, axis_slope=-2e-4, axial_scale=3.1e-3, height=TRUTH["height"] - 1.3, d=(7.0, -4.0), rotation=tilt, about=about, **shared)
+    scans = (first, second)
+    offsets = np.cumsum([0] + [len(st["rows"]) for st in first.stretches])
+    layout = dict(rows=ROWS, cols=COLS, row_sign=-1.0, scans=[dict(name=str(k), coarse_axis=sc.t["axis"], stretches=[
+        dict(name=st["name"], helix=st["helix"], frames=len(st["rows"]), offset=int(o)) for st, o in zip(sc.stretches, offsets)]) for k, sc in enumerate(scans)])
+    held = [dict(sc.parameters()["scans"][0], mid_height=sc.mid_height, rotation=list(sc.t["rotation"])) for sc in scans]
+    cal = dict(step="geometry", model="joint", layout=layout, row_time=dict(seconds_per_row=0.0, frame_period_s=0.03, frames_per_row=0.0),
+               map={k: (v.tolist() if hasattr(v, "tolist") else v) for k, v in G.empty_map(ROWS, COLS, 3).items()},
+               parameters=dict(roll=TRUTH["roll"], stage=dict(height_once=list(TRUTH["height_once"]), axis_twice=list(TRUTH["axis_twice"])), about_height=about, scans=held))
+    angles = [np.concatenate([st["angle_deg"] for st in sc.stretches]) for sc in scans]
+    heights = [np.concatenate([st["rows"] for st in sc.stretches]) for sc in scans]
+    poses, left_out = G.frame_poses(cal, angles, heights)
+    level = dict(cal, parameters=dict(cal["parameters"], scans=[held[0], dict(held[1], rotation=[0.0, 0.0, 0.0])]))
+    plain, nothing = G.frame_poses(level, angles, heights)
+    # what the poses do not hold of the rotations is named with what else the calibration measured and the reconstruction does not apply
+    named = [k for k in left_out if "rotations" in k]
+    assert len(named) == 1 and left_out[named[0]][1] == list(tilt) and not any("rotations" in k for k in nothing)
+    assert all(np.array_equal(poses[0][k], plain[0][k]) for k in ("row", "axis", "row_per_col", "col_per_row"))   # the first scan is the frame
+    mid = (ROWS - 1) / 2.0
+    origin = TRUTH["height"] + (1.0 + TRUTH["axial_scale"]) * heights[0][int(offsets[1])]
+    worst, deep, without, n = 0.0, 0.0, 0.0, 0
+    while n < 400:
+        stretch = int(rng.integers(0, 3))
+        f = int(rng.integers(3, len(second.stretches[stretch]["rows"]) - 3))
+        r, a = 250.0 * np.sqrt(rng.uniform()), rng.uniform(0, 2 * np.pi)
+        p = np.array([r * np.cos(a), r * np.sin(a), rng.uniform(30, ROWS - 30) - second.stretches[stretch]["rows"][f]])
+        c, v = second.seen(stretch, p, f)
+        if not (20 < c < COLS - 20 and 20 < v < ROWS - 20):
+            continue
+        n += 1
+        k = int(offsets[stretch]) + f
+        th = np.radians(angles[1][k])
+        s, depth = p[0] * np.cos(th) + p[1] * np.sin(th), -p[0] * np.sin(th) + p[1] * np.cos(th)
+        across = tilt[0] * np.cos(th) + tilt[1] * np.sin(th)
+        for P, tilted in ((poses[1], True), (plain[1], False)):
+            u = c - P["axis"][k] - P["col_per_row"][k] * (v - mid)
+            h = v - P["row"][k] - P["row_per_col"][k] * u
+            if tilted:
+                worst, deep = max(worst, abs(u - s), abs(h - (p[2] + origin) - across * depth)), max(deep, abs(across * depth))
+            else:
+                without = max(without, abs(u - s), abs(h - (p[2] + origin)))
+    assert worst < 2e-3 < 0.05 < deep and without > 0.15
 
 
 def test_a_tiles_own_views_under_a_pitched_axis():
@@ -615,6 +728,33 @@ def test_plan_of_a_helix_alone_stays_in_the_strip():
     assert len(np.unique(np.round(angles / (N / 12)).astype(int) % 12)) == 12
 
 
+def test_plan_of_scans_side_by_side_in_narrow_strips():
+    """PHercParis4 at 2.4 um read at a quarter: the first scan's axis 45 columns from the detector's edge, each further
+    scan moved by all but 94 columns of the width, a turn's travel 59 rows short of the detector's height."""
+    rows, cols, N, move = 592, 1104, 2000, 1010
+    f = np.arange(3 * N + 400)
+    helix = dict(name="helix", helix=True, angle_deg=f * (360.0 / N), rows=-f * (533.0 / N), first=0, end=len(f))
+    axes = [1058.4 + k * move for k in range(3)]
+    acq = G.acquisition(dict(rows=rows, cols=cols, per_turn=N, row_sign=-1.0, fan=1e-5, width=32, scans=[dict(name=str(k), axis=a, stretches=[helix]) for k, a in enumerate(axes)]))
+    plan = G.plan_comparisons(acq, turn_least=56)
+    assert {p["kind"] for p in plan} == {"opposite", "turn", "pair"}
+    strip = (2 * axes[0] - (cols - 1), cols - 1)
+    opposite = [p for p in plan if p["kind"] == "opposite"]
+    assert len(opposite) > 50 and {p["scan_a"] for p in opposite} == {0}                 # the scan with its axis in the field alone
+    for p in opposite:
+        assert p["cols"] == 32 and p["mirror"] and p["col_a"] + p["col_b"] + p["cols"] - 1 == round(2 * axes[0])
+        for c in (p["col_a"], p["col_b"]):
+            assert strip[0] + 8 <= c and c + p["cols"] + 8 <= cols                       # inside the strip, with the margins of a cut of 32 columns
+    pairs = [p for p in plan if p["kind"] == "pair"]
+    assert {(p["scan_a"], p["scan_b"]) for p in pairs} == {(0, 1), (1, 2)}               # neighbours; the first and the third share no column
+    for p in pairs:
+        assert p["cols"] == 32 and p["col_b"] - p["col_a"] == move and 13 <= p["col_a"] and p["col_b"] + 32 + 13 <= cols
+    turns = [p for p in plan if p["kind"] == "turn"]
+    assert {p["scan_a"] for p in turns} == {0, 1, 2} and all(p["rows"] == 48 and p["frame_hint"] == N for p in turns)
+    # as stored (a patch of 128 rows), 59 rows in common are too few
+    assert "turn" not in {p["kind"] for p in G.plan_comparisons(acq)}
+
+
 def test_plan_with_rest_turns():
     """343P's layout: a rest turn, a helix, a rest turn; the axis well inside the field."""
     rows, cols, N = 1200, 2528, 8000
@@ -661,6 +801,32 @@ def test_plan_of_a_pair_moved_sideways():
         dict(name=name, axis=1684.8, moved_on_stage=m, stretches=[dict(name="helix", helix=True, angle_deg=np.arange(3 * N) * 360.0 / N, rows=-np.arange(3 * N) * 1053.0 / N)])
         for name, m in (("a", False), ("b", True))]))
     assert "pair" not in {p["kind"] for p in G.plan_comparisons(moved)}
+
+
+def test_plan_of_a_grid_of_circular_scans_stays_in_the_lit_rows():
+    """Diamond I12's grid of PHerc. 172: circular scans (a turn at rest each) at three places across the beam and two
+    heights, the beam lighting rows 254 to 1903 of 2160. The scans beside each other are compared across the columns
+    both hold, those above each other across the rows both hold, and every block lies in the lit rows."""
+    rows, cols, N, move, up, lit = 2160, 2560, 3600, -2275, 1264, (254, 1904)
+    turn = lambda height: [dict(name="rest1", angle_deg=np.arange(N + 1) * 360.0 / N, rows=np.full(N + 1, float(height)))]
+    scans = [dict(name=f"r{r + 1}c{c + 1}", axis=205.0 + c * move, stretches=turn(r * up)) for r in range(2) for c in range(3)]
+    acq = dict(rows=rows, cols=cols, per_turn=N, row_sign=-1.0, width=256, scans=scans)
+    plan = G.plan_comparisons(dict(acq, lit_rows=lit))
+    assert {(p["kind"], p["scan_a"], p["scan_b"]) for p in plan} == {
+        ("opposite", 0, 0), ("opposite", 3, 3),                                    # the axis is in the first column's field alone
+        ("pair", 0, 1), ("pair", 1, 2), ("pair", 3, 4), ("pair", 4, 5),            # beside each other
+        ("pair", 0, 3), ("pair", 1, 4), ("pair", 2, 5),                            # above each other
+        ("pair", 0, 4), ("pair", 1, 3), ("pair", 1, 5), ("pair", 2, 4)}            # and across the corner
+    for p in plan:
+        a, b = p["scan_a"], p["scan_b"]
+        higher = (b // 3 - a // 3) * up                                            # the second scan holds the content that many rows higher
+        assert lit[0] <= p["row_a"] and p["row_a"] + p["rows"] <= lit[1] and lit[0] <= p["row_a"] + higher - 40 and p["row_a"] + higher + p["rows"] + 40 <= lit[1]
+        if p["kind"] == "pair":
+            assert p["col_b"] - p["col_a"] == (b % 3 - a % 3) * move and 0 <= min(p["col_a"], p["col_b"]) and max(p["col_a"], p["col_b"]) + p["cols"] <= cols
+    above = [p for p in plan if (p["scan_a"], p["scan_b"]) == (0, 3)]
+    assert len({p["frame_a"] for p in above}) == 12 and len({p["col_a"] for p in above}) == 6 and {p["row_a"] for p in above} == {(254 + 1904 - 256 - 40 - up) // 2}
+    # without the lit rows the blocks of scans above each other reach into rows the beam does not light
+    assert min(p["row_a"] for p in G.plan_comparisons(acq) if (p["scan_a"], p["scan_b"]) == (0, 3)) < lit[0]
 
 
 def test_plan_of_tiles_follows_their_places():
@@ -872,6 +1038,41 @@ def test_tiles_give_the_scales_of_their_images():
         assert any("scan0.column_scale" in (a, b) and abs(r) > 0.99 for a, b, r in every["correlated"])
     except ValueError as e:
         assert "RANK_DEFICIENT" in str(e)
+
+
+def test_the_tilt_of_a_scan_moved_sideways_is_solved_after_the_rest():
+    """Two scans of one sample, the second moved sideways and holding the sample tilted against the first. Asked
+    for (tilts_after: what the step does), the tilt comes from the two scans' comparisons at equal frames, in a
+    second solve that keeps both axial scales where the solve without tilts has them. Without it the model has no
+    tilt, and those comparisons' rows are left with it."""
+    rng = np.random.default_rng(41)
+    stretches = [("helix", 4 * PER_TURN)]
+    tilt, about = (3e-4, -2e-4, 0.0), -300.0
+    first = Scan(stretches, index=0, axis=TRUTH["axis"], axial_scale=TRUTH["axial_scale"])
+    second = Scan(stretches, index=1, axis=TRUTH["axis"] + 230.0, axial_scale=3.1e-3, height=-1.3, d=(1.5, -0.8), rotation=tilt, about=about)
+    acq = _acquisition(first, second)
+    own = [c for sc in (first, second) for c in _helix_comparisons(rng, sc, 0, 500, 0.004) if sc is first or c["kind"] == "turn"]
+    pairs = [c for c in (_same_point(first, "pair", 0, 0, p, t, t, rng, 0.004, other=second) for p, t in _points(rng, first, 0, 1500)) if c is not None]
+    assert len(pairs) > 300 and sum(c["a"][0] == 1 for c in own) > 50
+    comparisons = own + pairs
+    start = dict(roll=0.0, about_height=about, scans=[dict(axis=TRUTH["axis"] + 1.0), dict(axis=TRUTH["axis"] + 229.0)])
+    plain = G.solve_geometry(acq, comparisons, start=start)
+    got = G.solve_geometry(acq, comparisons, start=start, tilts_after=True)
+    names = {"scan1.tilt_x", "scan1.tilt_y"}
+    assert names <= set(got["free"]) and not names & set(plain["free"]) and "scan0.tilt_x" not in got["free"]
+    assert got["scans"][1]["rotation"][:2] == pytest.approx(list(tilt[:2]), abs=3e-5) and got["scans"][0]["rotation"] == [0.0, 0.0, 0.0]
+    assert [s["axial_scale"] for s in got["scans"]] == [s["axial_scale"] for s in plain["scans"]]      # kept, to the last digit
+    assert got["scans"][1]["axial_scale"] == pytest.approx(3.1e-3, abs=3e-5) and got["scans"][1]["d"] == pytest.approx([1.5, -0.8], abs=0.02)
+    between = np.array([c["kind"] == "pair" for c in comparisons])
+    left = lambda sol, what: np.sqrt(np.mean(sol["residual"][between, what] ** 2))
+    # the columns are left with the noise; the rows keep the tilt's part about the direction across the beam, which
+    # moves them by a point's depth along the ray (3.6e-4 x up to 250 px here) and is in no ray
+    assert left(got, 2) < 0.006 < 0.05 < left(plain, 2) and 0.02 < left(got, 1) < 0.85 * left(plain, 1)
+    # one scan alone has no tilt to ask for: the solve is the plain one
+    mine = [c for c in own if c["a"][0] == 0]
+    one, alone = _acquisition(first), dict(roll=0.0, scans=[dict(axis=TRUTH["axis"] + 1.0)])
+    again = G.solve_geometry(one, mine, start=alone, tilts_after=True)
+    assert again["scans"] == G.solve_geometry(one, mine, start=alone)["scans"] and not any("tilt" in n for n in again["free"])
 
 
 def test_tiles_in_projections_give_their_tilts():

@@ -182,6 +182,11 @@ struct Acquisition {
     // neighbours. 0: left out (read_acquisition leaves it so; the caller sets it).
     double per_depth = 0;
     int width = 512;        // columns of a window, the same for every kind of comparison
+    // The rows the beam lights, [first, end): around the brightest row of the scans' mean flats (each row's mean
+    // over the columns), the rows that reach 0.12 of it, in every scan. A beam cut by slits along the axis lights
+    // a part of the detector (Diamond I12 at PHerc. 172: rows 254 to 1903 of 2160, the rows beyond reading 5 to 8 %
+    // of the brightest), and the plan keeps its blocks inside it. Nothing (end <= first): every row.
+    int lit_rows[2] = {0, 0};
     // The scan whose place (d, height) is the origin: zero, and held. Of scans that share their place on the
     // rotation stage the first with the axis inside its field; of a mosaic's tiles the one nearest their middle.
     int anchor = 0;
@@ -194,6 +199,9 @@ bool axis_in_field(const ScanLayout& scan, int cols);
 // against the axis stage (helix views a turn apart where they overlap by a patch, opposite views otherwise; the
 // same in every scan or it is an error), the rows that hold the mount, a coarse axis column per scan, the motors'
 // places and the anchor. The rows' timing is left at zero: the caller sets it.
+// Where no scan has a helix (circular scans), the sense of the rows is that in which two scans at one place across
+// the beam and different heights register at equal frames; scans all at one height have no sense to find, and it
+// is left at -1. A record that states no source distance gives no fan (Acquisition::fan 0).
 Acquisition read_acquisition(Session& session, Device device, const Log& log = {});
 // Seconds per stored row from a refill in one of the acquisition's stretches, as the step saves it (JSON text;
 // "null" if no stretch on disk holds one): the frames around the refill are found and reduced to the rows' levels
@@ -206,7 +214,8 @@ std::string acquisition_json(const Acquisition& acq);
 //   opposite    a stretch against itself half a turn on, mirrored about the coarse axis column; in a helix the rows
 //               offset by the travel of half a turn, at angles_per_turn angles evenly around the turn and at most
 //               max_positions positions along the helix; the patches started from the block registered whole
-//   turn        the helix against itself a turn on, where a turn's travel leaves a patch of rows in common
+//   turn        the helix against itself a turn on, where a turn's travel leaves a patch of rows in common (128;
+//               turn_least rows in frames read reduced, where a patch is smaller)
 //   resthelix   a rest turn against the helix at equal angle, in the turn of the helix nearest its height
 // and one scan against another with the same place on the rotation stage (a pair moved sideways):
 //   pair        the stretches of the same name at equal angle, the second scan's window where the coarse axis
@@ -216,6 +225,7 @@ std::string acquisition_json(const Acquisition& acq);
 //               detector would register).
 struct PlanCounts {
     int angles_per_turn = 12, max_positions = 48, n_rest = 16, n_turn = 12, pair_positions = 24, n_pair_rest = 12;
+    int turn_least = 128;  // the rows a turn's travel must leave in common for the helix to be compared a turn on
     // plan_tiles: positions along the helix per pair of scans (at tile_angles angles a turn), and at each the
     // most bands of rows and windows of columns
     int tile_positions = 48, tile_angles = 24, tile_bands = 3, tile_windows = 4;
@@ -357,6 +367,8 @@ struct GeometryOptions {
     // every stretch that is not a helix, of every scan but the anchor its d and height, and of every scan that
     // sits elsewhere on the rotation stage than the anchor (a mosaic's tile) its height_once. Held unless freed:
     // the anchor's d, height and height_once, the height_once of a scan at the anchor's place, the helix' height,
+    // of a scan without a helix (it does not travel: a circular scan) its axis_slope, its axial_scale and its
+    // first stretch's height,
     // the map, the rows' timing, every scan's column_scale. A scan's rotation is free if lens patches name the scan and it is not the anchor. The pitch is free
     // if two scans at different places on the rotation stage are compared at equal angle. Where no comparison is
     // given (lens patches alone), only places and rotations are free.
@@ -364,6 +376,25 @@ struct GeometryOptions {
     std::vector<std::string> held, freed;
     // on the length of a lens patch's residual, each component over its sigma (so: in sigmas)
     double lens_huber = 1.5;
+    // Above 0: a free term of the map whose estimate is correlated beyond this with another unknown's
+    // (GeometrySolution::correlated) is held where it started and the rest solved again, up to four times;
+    // GeometrySolution::undetermined lists what was held so. The comparisons cannot tell such a term from the other
+    // unknown: where the scans are compared along the frames' edges alone (scans moved sideways by nearly the
+    // detector's width, a helix that travels nearly its height per turn), the map's course along the columns alone is
+    // one with the scans' axis columns and heights, and its course along the rows alone with the axial scales. What
+    // is held is not measured: it is in neither the map nor the residuals. The step solves with 0.95 (PHerc0343P's
+    // largest such correlation is 0.91, the roll's with two terms: nothing of it is held).
+    double undetermined_map = 0;
+    // The sample's tilt between scans, solved after the rest: two scans compared at one angle hold the part of it
+    // about the beam's direction (rows by the tilt x the distance across the beam, once per turn), so every scan
+    // compared so with another, but the anchor, gets its tilt_x and tilt_y in a second solve that starts from the
+    // first and keeps every scan's axial scale and the map's terms held above where the first has them. A scan's
+    // axial scale is what its own views give (a turn or half a turn apart), which are few beside the comparisons
+    // of two scans: solved together with the tilts those pull it away (PHercParis4's four scans at 2.4 um: one
+    // scan's by 4e-4, a row per turn against its own views, and its seam with its neighbour 0.8 quarter-pixels off
+    // along the axis at the end of the slab on disk; kept, the seam is 0.13). The tilts are about the sample's
+    // origin at the start's about_height. The step solves so.
+    bool tilts_after = false;
 };
 struct GeometrySolution {
     Parameters parameters;
@@ -373,6 +404,8 @@ struct GeometrySolution {
     // depended on only by comparisons of that scan with another and by lens patches (its own views cancel them
     // but for what an error of their frames leaves).
     std::vector<std::string> unused;
+    // terms of the map held because the comparisons do not tell them from another unknown (GeometryOptions::undetermined_map)
+    std::vector<std::string> undetermined;
     int rank = 0;
     std::vector<std::array<double, 3>> residual;       // per comparison: frames, rows, columns
     std::vector<std::array<double, 3>> lens_residual;  // per lens patch: x, y, z [px] (lens_residuals)

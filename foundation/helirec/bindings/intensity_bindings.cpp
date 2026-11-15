@@ -78,29 +78,37 @@ void bind_intensity(nb::module_& m) {
         });
     using IC = calibration::IntensityCalibration;
     nb::class_<IC>(m, "IntensityCalibration",
-                   "The intensity calibration of a scan pair in its merged frame (helirec::calibration::calibrate_intensity)")
+                   "The intensity calibration of the scans of an acquisition (a pair, or more scans moved sideways) in their merged frame "
+                   "(helirec::calibration::calibrate_intensity)")
         .def_ro("main", &IC::main)
         .def_ro("companion", &IC::companion)
+        .def_ro("scans", &IC::scans, "every scan's name, the main scan first")
+        .def_prop_ro("vectors", [](const IC& c) {
+            nb::list v;
+            for (const auto& x : c.vectors) v.append(nb::make_tuple(x[0], x[1]));
+            return v;
+        })
+        .def_ro("rows", &IC::rows)
+        .def_ro("cols", &IC::cols)
+        .def_ro("projection_store", &IC::projection_store)
+        .def_ro("reduce", &IC::reduce)
         .def_ro("cor_main_detector", &IC::cor_main_detector)
         .def_prop_ro("vector", [](const IC& c) { return nb::make_tuple(c.vector[0], c.vector[1]); })
         .def_ro("rot_center", &IC::rot_center)
         .def_ro("merged_width", &IC::merged_width)
         .def_prop_ro("placement", [](const IC& c) {
             nb::dict d;
-            d[nb::str(c.main.c_str())] = nb::cast(c.placement[0]);
-            d[nb::str(c.companion.c_str())] = nb::cast(c.placement[1]);
+            for (std::size_t k = 0; k < c.scans.size(); ++k) d[nb::str(c.scans[k].c_str())] = nb::cast(c.placement[k]);
             return d;
         })
         .def_prop_ro("apodisation", [](const IC& c) {
             nb::dict d;
-            d[nb::str(c.main.c_str())] = nb::make_tuple(c.apodisation[0][0], c.apodisation[0][1]);
-            d[nb::str(c.companion.c_str())] = nb::make_tuple(c.apodisation[1][0], c.apodisation[1][1]);
+            for (std::size_t k = 0; k < c.scans.size(); ++k) d[nb::str(c.scans[k].c_str())] = nb::make_tuple(c.apodisation[k][0], c.apodisation[k][1]);
             return d;
         })
         .def_prop_ro("estimated_cor_from_motor_pix", [](const IC& c) {
             nb::dict d;
-            d[nb::str(c.main.c_str())] = c.estimated_cor_from_motor_pix[0];
-            d[nb::str(c.companion.c_str())] = c.estimated_cor_from_motor_pix[1];
+            for (std::size_t k = 0; k < c.scans.size(); ++k) d[nb::str(c.scans[k].c_str())] = c.estimated_cor_from_motor_pix[k];
             return d;
         })
         .def_prop_ro("detector_blur_field", [](const IC& c) { return c.detector_blur.field; })
@@ -116,16 +124,17 @@ void bind_intensity(nb::module_& m) {
             [](const IC& c) {
                 const std::size_t r = static_cast<std::size_t>(c.rows), k = static_cast<std::size_t>(c.cols);
                 nb::dict d;
-                d["main_dark"] = array_of(c.main_reduced.dark, {r, k});
-                d["main_flats"] = array_of(c.main_reduced.flats, {c.main_reduced.series(), r, k});
-                d["companion_dark"] = array_of(c.companion_reduced.dark, {r, k});
-                d["companion_flats"] = array_of(c.companion_reduced.flats, {c.companion_reduced.series(), r, k});
                 d["weight_map"] = array_of(c.weight_map, {r, k});
-                d["main_weight"] = array_of(c.main_weight, {r, k});
-                d["companion_weight"] = array_of(c.companion_weight, {r, k});
+                for (std::size_t s = 0; s < c.scans.size(); ++s) {  // main, companion, companion2, ..
+                    const std::string tag = s == 0 ? "main" : s == 1 ? "companion" : "companion" + std::to_string(s);
+                    d[nb::str((tag + "_dark").c_str())] = array_of(c.reduced[s].dark, {r, k});
+                    d[nb::str((tag + "_flats").c_str())] = array_of(c.reduced[s].flats, {c.reduced[s].series(), r, k});
+                    d[nb::str((tag + "_weight").c_str())] = array_of(c.weight[s], {r, k});
+                }
                 return d;
             },
-            "the darks and flats reduced, the weight map and each scan's weights (the weight map times its apodisation)");
+            "the darks and flats reduced, the weight map and each scan's weights (the weight map times its apodisation): main_*, companion_*, "
+            "companion2_*, ..");
 
     m.def(
         "calibrate_intensity",
@@ -188,6 +197,17 @@ void bind_intensity(nb::module_& m) {
         },
         "vector"_a, "cols"_a,
         "nabuxx check_companion: ([main, companion] placements, merged width, anchor) (helirec::calibration::placement_from_vector)");
+    m.def(
+        "placement_from_vectors",
+        [](const std::vector<std::array<double, 2>>& vectors, int cols) {
+            const calibration::MergedPlacement p = calibration::placement_from_vectors(vectors, cols);
+            nb::list scans;
+            for (const auto& s : p.scans) scans.append(nb::cast(s));
+            return nb::make_tuple(scans, p.width, p.anchor);
+        },
+        "vectors"_a, "cols"_a,
+        "the same of any number of scans, each after the first at its (rows, columns) from it: (placements, merged width, anchor) "
+        "(helirec::calibration::placement_from_vectors)");
     m.def(
         "acquisition_fingerprint", [](nb::handle main, nb::handle companion) { return calibration::acquisition_fingerprint(scan_of(main), scan_of(companion)); },
         "main"_a, "companion"_a, "sha256 over what the calibration of a pair depends on (helirec::calibration::acquisition_fingerprint)");

@@ -4,9 +4,10 @@
 //
 // Two kinds of description are read, both JSON as the calibration steps save them:
 //
-//   Calibration   a two-scan helical acquisition: helirec-calibration geometry's file ("model": "joint";
-//                 geometry_calibration.hpp states the model), of which the two scans of a pair are read here; and
-//                 still a file of the earlier two-scan step (with its motion stage), which nothing writes any more
+//   Calibration   a helical acquisition of scans that share their place on the rotation stage (one scan, or
+//                 several moved sideways): helirec-calibration geometry's file ("model": "joint";
+//                 geometry_calibration.hpp states the model), any number of scans; and still a file of the earlier
+//                 two-scan step (with its motion stage), which nothing writes any more
 //   TileGeometry  the tiles of a mosaic (python/helirec/mosaic.py states its form; nothing makes one at present)
 //
 // Nothing here reads frames: the record's angle and height of every frame are given by the caller.
@@ -63,12 +64,15 @@ struct Terms {
     double slope_col = 0, slope_row = 0, scale_col = 0, scale_row = 0;
 };
 
-// The frame two scans are merged in: one rotation axis in the first scan's columns and the second scan's place
+// The frame the scans are merged in: one rotation axis in the first scan's columns and every other scan's place
 // against the first (rows, columns), rounded to `quantum` pixels; `measured`: the unrounded medians.
 struct MergedLayout {
     double cor_main_detector = 0;
-    std::array<double, 2> vector{};
+    std::array<double, 2> vector{};  // the second scan's place (vectors[0]; nothing for a scan alone)
     double axis_first_scan = 0, axis_second_scan = 0, second_scan_rows = 0, quantum = 0;
+    // every scan after the first, in the calibration's order: its place against the first (rows, columns), rounded;
+    // and, unrounded, the axis' column in its own columns and its rows against the first's
+    std::vector<std::array<double, 2>> vectors, measured;
 };
 
 // The middle of the columns two scans both hold, in the first scan's columns: the second scan lies `move` columns
@@ -80,7 +84,7 @@ double overlap_centre(int cols, double move);
 Terms reconstruction_terms(const Poses& pose, const std::vector<double>& heights_rows, double row_sign, int rows,
                            double rot_center, double column_offset, double z_readjustment = 0, double row_origin = 0);
 
-// The geometry calibration of a two-scan helical acquisition (rest turn, helix, rest turn in each scan).
+// The geometry calibration of a helical acquisition of scans that share their place on the rotation stage.
 class Calibration {
   public:
     static Calibration parse(const std::string& json_text);
@@ -117,12 +121,28 @@ class Calibration {
     //                 counted from the first scan's row at its helix' first frame (the slices are numbered from there)
     //     axis        axis + axis_slope (H - H_mid) + the stage's axis column twice per turn + d . n(th)
     //     the slopes  col_per_row = roll, row_per_col = -roll
+    //     a scan's tilt against the first (its rotation's x and y, about the sample's origin at about_height): with
+    //                 along = tilt . (-sin th, cos th), the part about the beam's direction at the frame,
+    //                 col_per_row + along, row_per_col - along, axis + along x (the middle row's height - about_height).
+    //                 The part about the direction across the beam (rows by the depth along the ray) and the spin
+    //                 are not in the poses.
     //     the rows' timing: angle_deg_per_row the angle's step x the frames per row, and row_scale minus the
     //                 travel per frame x the frames per row about the middle row (the sample travels while the
     //                 rows are read)
     std::array<Poses, 2> frame_poses(const std::array<std::vector<double>, 2>& angles_deg,
                                      const std::array<std::vector<double>, 2>& heights_rows,
                                      std::string* not_applied = nullptr) const;
+
+    // ---- a joint calibration of any number of scans that share their place on the rotation stage, merged
+    std::size_t scan_count() const;
+    // The poses of every scan of a joint calibration, as frame_poses gives a pair's: one entry per scan, in the
+    // calibration's order (the first: the one with the rotation axis in its field). The frames of stretches the
+    // calibration does not hold (they were not on disk) stay at zero: frames_placed says which it holds.
+    std::vector<Poses> scan_poses(const std::vector<std::vector<double>>& angles_deg, const std::vector<std::vector<double>>& heights_rows,
+                                  std::string* not_applied = nullptr) const;
+    // The frames of a scan the calibration was made on, among the scan's projection frames: [first, end) of each
+    // of its stretches, in order, those that follow one another joined.
+    std::vector<std::array<std::size_t, 2>> frames_placed(std::size_t scan) const;
 
     // ---- one scan of a joint calibration of any number of scans (a mosaic's tile), reconstructed alone
     // the scan the calibration's layout names so
@@ -145,6 +165,11 @@ class Calibration {
     // which are counted from it, so the rounding moves nothing; it fixes the slices' grid.
     MergedLayout merged_layout(const std::array<Poses, 2>& poses, const std::array<std::vector<double>, 2>& heights_rows,
                                double quantum = 0.25) const;
+    // The same of any number of scans (scan_poses): the medians over the frames of the first scan's helix the
+    // calibration was made on. first_frame[s]: the first frame of scan s the reconstruction is given, from which
+    // its record's heights count there (none: every scan's first).
+    MergedLayout merged_layout(const std::vector<Poses>& poses, const std::vector<std::vector<double>>& heights_rows,
+                               const std::vector<std::size_t>& first_frame = {}, double quantum = 0.25) const;
 
   private:
     std::shared_ptr<const Json> doc_;

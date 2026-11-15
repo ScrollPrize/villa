@@ -106,16 +106,21 @@ class SliceInfo:
 
 
 class HelicalRecon:
-    """The reconstruction of the scan pair in `projections_dir` (helirec::Reconstruction). params: changes over
-    DEFAULTS; cache_dir: the calibration cache (geometry.json, calibration_arrays.bin, calibration.json)."""
+    """The reconstruction of the scans in `projections_dir` (helirec::Reconstruction): a pair, or the scan with the
+    rotation axis in its field and several moved sideways beside it. params: changes over DEFAULTS; cache_dir: the
+    calibration cache (geometry.json, calibration_arrays.bin, calibration.json). projection_store, reduce: read the
+    frames, darks and flats from a projection store (STORE.zarr) at the level `reduce` (1, 2, 3: a half, a quarter,
+    an eighth) instead of the detector's files; the slices are then of those frames."""
 
-    def __init__(self, projections_dir, cache_dir=None, device="cuda", params=None, log=print):
+    def __init__(self, projections_dir, cache_dir=None, device="cuda", params=None, log=print, projection_store=None, reduce=0):
         self.projections_dir, self.cache_dir, self.device, self.log = projections_dir, cache_dir, device, log
         try:
-            self._r = _core.Reconstruction(str(projections_dir), _json(dict(params or {})), str(cache_dir or ""), device, log, log is print)
+            self._r = _core.Reconstruction(str(projections_dir), _json(dict(params or {})), str(cache_dir or ""), device, log, log is print,
+                                           str(projection_store or ""), int(reduce))
         except RuntimeError as e:
             raise _raise(e) from None
-        self.main, self.companion = self._r.main, self._r.companion
+        self.scans = [self._r.scan(k) for k in range(self._r.scan_count)]
+        self.main, self.companion = self.scans[0], (self.scans[1] if len(self.scans) > 1 else None)
         self._built()
 
     def _built(self):

@@ -18,6 +18,7 @@
 
 #include "helirec/calibration/intensity.hpp"
 #include "helirec/progress.hpp"
+#include "helirec/projection_store.hpp"
 #include "helirec/raw_reader.hpp"
 #include "io/array_file.hpp"
 #include "io/json.hpp"
@@ -173,8 +174,6 @@ std::array<double, 2> solve_2x2(double a11, double a12, double a21, double a22, 
     return {x1, x2};
 }
 
-const char* const kReductionKeys[] = {"main_dark", "main_flats", "companion_dark", "companion_flats", "weight_map"};
-
 }  // namespace
 
 // ---------------------------------------------------------------- darks and flats
@@ -225,21 +224,24 @@ DarksFlats reduced_darks_flats(const Scan& scan, const std::string& cache_dir, c
 
 // ---------------------------------------------------------------- the merged frame
 
-MergedPlacement placement_from_vector(const std::array<double, 2>& vector, int cols) {
-    const double dy = vector[0], dx = vector[1];
+MergedPlacement placement_from_vectors(const std::vector<std::array<double, 2>>& vectors, int cols) {
+    double lowest = 0, highest = 0;  // of the scans' columns against the first scan's
+    for (const auto& v : vectors) lowest = std::min(lowest, v[1]), highest = std::max(highest, v[1]);
     MergedPlacement out;
-    out.anchor = dx < 0 ? -dx : 0.0;
-    const double cum[2][2] = {{0.0, 0.0}, {dy, dx}};
-    for (int j = 0; j < 2; ++j) {
-        const double d = out.anchor + cum[j][1];
+    out.anchor = -lowest;
+    out.scans.resize(vectors.size() + 1);
+    for (std::size_t j = 0; j < out.scans.size(); ++j) {
+        const double d = out.anchor + (j > 0 ? vectors[j - 1][1] : 0.0);
         const int sx = static_cast<int>(std::floor(d));
         out.scans[j].shift_x = sx;
         out.scans[j].x_readjustment = static_cast<double>(static_cast<float>(sx - d));
-        out.scans[j].z_readjustment = j > 0 ? cum[j][0] : 0.0;
+        out.scans[j].z_readjustment = j > 0 ? vectors[j - 1][0] : 0.0;
     }
-    out.width = cols + static_cast<int>(std::ceil(std::fabs(dx)));
+    out.width = cols + static_cast<int>(std::ceil(highest - lowest));
     return out;
 }
+
+MergedPlacement placement_from_vector(const std::array<double, 2>& vector, int cols) { return placement_from_vectors({vector}, cols); }
 
 // ---------------------------------------------------------------- the detector's blur
 
@@ -333,10 +335,12 @@ DetectorBlur measure_detector_blur(const Scan& scan, const float* dark, int n_fl
 
 // ---------------------------------------------------------------- the pair
 
-std::string acquisition_fingerprint(const Scan& main, const Scan& companion) {
+std::string acquisition_fingerprint(const Scan& main, const Scan& companion) { return acquisition_fingerprint(std::vector<const Scan*>{&main, &companion}); }
+
+std::string acquisition_fingerprint(const std::vector<const Scan*>& scans) {
     Sha256 h;
     h.update("helirec-calibration-v" + std::to_string(kIntensityCalibrationVersion));
-    for (const Scan* sc : {&main, &companion}) {
+    for (const Scan* sc : scans) {
         Json flats = Json::list();
         for (const FrameList& f : sc->flats) flats.add(count(static_cast<long long>(f.size())));
         const Json meta = Json::dict()
@@ -359,6 +363,44 @@ std::string acquisition_fingerprint(const Scan& main, const Scan& companion) {
     return h.hex();
 }
 
+DarksFlats store_darks_flats(const Scan& scan, const std::string& tile_group, int reduce) {
+    int rows = 0, cols = 0;
+    // the mean of a list's frames, the frames of one scan group at a time
+    const auto mean_of = [&](const FrameList& list, const float* dark, const std::vector<double>* control) {
+        if (!list.size()) throw Error(scan.name + ": no dark or flat frames");
+        const FrameList in_store = frames_in_projection_store(list, tile_group);
+        std::vector<double> sum;
+        std::size_t i0 = 0;
+        while (i0 < in_store.size()) {
+            std::size_t i1 = i0;
+            std::vector<std::int64_t> frames;
+            std::vector<double> weight;
+            while (i1 < in_store.size() && in_store.file_index[i1] == in_store.file_index[i0]) {
+                frames.push_back(in_store.frame_index[i1]);
+                if (control) weight.push_back(kNominalCurrentA / control->at(i1));
+                ++i1;
+            }
+            const std::vector<double> part = projection_store_sum(in_store.files[static_cast<std::size_t>(in_store.file_index[i0])], reduce, frames.data(), frames.size(), dark,
+                                                                  control ? weight.data() : nullptr, &rows, &cols);
+            if (sum.empty()) sum = part;
+            else
+                for (std::size_t i = 0; i < sum.size(); ++i) sum[i] += part[i];
+            i0 = i1;
+        }
+        std::vector<float> mean(sum.size());
+        for (std::size_t i = 0; i < sum.size(); ++i) mean[i] = static_cast<float>(sum[i] / static_cast<double>(in_store.size()));
+        return mean;
+    };
+    DarksFlats out;
+    out.dark = mean_of(scan.darks, nullptr, nullptr);
+    for (std::size_t k = 0; k < scan.flats.size(); ++k) {
+        const std::vector<float> flat = mean_of(scan.flats[k], out.dark.data(), &scan.flats_control_A[k]);
+        out.flats.insert(out.flats.end(), flat.begin(), flat.end());
+    }
+    out.rows = rows, out.cols = cols;
+    return out;
+}
+
 std::string IntensityCalibration::json() const {
     const auto placement_json = [](const ScanPlacement& p) {
         return Json::dict().set("shift_x", count(p.shift_x)).set("x_readjustment", num(p.x_readjustment)).set("z_readjustment", num(p.z_readjustment));
@@ -370,40 +412,83 @@ std::string IntensityCalibration::json() const {
                               .set("quantum", num(layout.quantum));
     Json d = Json::dict();
     d.set("main", Json::of(main)).set("companion", Json::of(companion));
+    if (scans.size() != 2) {  // (a pair's file names its two scans as it always did)
+        Json names = Json::list(), places = Json::list();
+        for (const std::string& n : scans) names.add(Json::of(n));
+        for (const auto& v : vectors) places.add(numbers({v[0], v[1]}));
+        d.set("scans", names).set("vectors", places);
+    }
+    if (!projection_store.empty()) d.set("projection_store", Json::of(projection_store)).set("reduce", count(reduce));
     d.set("cor_main_detector", num(cor_main_detector)).set("vector", numbers({vector[0], vector[1]}));
     d.set("rot_center", num(rot_center)).set("merged_width", count(merged_width));
-    d.set("placement", Json::dict().set(main, placement_json(placement[0])).set(companion, placement_json(placement[1])));
-    d.set("apodisation", Json::dict().set(main, numbers({apodisation[0][0], apodisation[0][1]})).set(companion, numbers({apodisation[1][0], apodisation[1][1]})));
-    d.set("estimated_cor_from_motor_pix", Json::dict().set(main, num(estimated_cor_from_motor_pix[0])).set(companion, num(estimated_cor_from_motor_pix[1])));
+    Json placed = Json::dict(), widths = Json::dict(), motors = Json::dict();
+    for (std::size_t k = 0; k < scans.size(); ++k) {
+        placed.set(scans[k], placement_json(placement[k]));
+        widths.set(scans[k], numbers({apodisation[k][0], apodisation[k][1]}));
+        motors.set(scans[k], num(estimated_cor_from_motor_pix[k]));
+    }
+    d.set("placement", placed).set("apodisation", widths).set("estimated_cor_from_motor_pix", motors);
     d.set("details", Json::dict().set("layout", measured).set("detector_blur", blur_json(detector_blur)));
     d.set("detector_blur_field", numbers(detector_blur.field));
     d.set("fingerprint", Json::of(fingerprint)).set("version", count(version));
     return d.text();
 }
 
-IntensityCalibration calibrate_intensity(const Scan& main, const Scan& companion, const geometry::MergedLayout& layout, const std::string& cache_dir,
-                                         const Log& log, bool progress) {
-    if (main.rows != companion.rows || main.cols != companion.cols) throw Error("the two scans' frames differ in shape");
+IntensityCalibration calibrate_intensity(const Scan& main, const Scan& companion, const geometry::MergedLayout& layout, const std::string& cache_dir, const Log& log,
+                                         bool progress) {
+    return calibrate_intensity(std::vector<const Scan*>{&main, &companion}, layout, cache_dir, log, progress);
+}
+
+IntensityCalibration calibrate_intensity(const std::vector<const Scan*>& scans, const geometry::MergedLayout& layout, const std::string& cache_dir_given, const Log& log,
+                                         bool progress, const std::string& projection_store, int reduce) {
+    if (scans.empty()) throw Error("the intensity calibration takes the scans of one acquisition");
+    const Scan& main = *scans[0];
+    const std::size_t S = scans.size();
+    for (const Scan* sc : scans)
+        if (sc->rows != main.rows || sc->cols != main.cols) throw Error("the scans' frames differ in shape");
+    if (layout.vectors.size() + 1 != S && !(S == 2 && layout.vectors.empty())) throw Error("the merged frame's layout is of another number of scans");
+    const bool store = !projection_store.empty();
+    if (reduce && !store) throw Error("the intensity calibration of frames read reduced takes its darks and flats from a projection store");
+    if (reduce < 0 || reduce > 3) throw Error("the intensity calibration: reduce is 0, 1, 2 or 3");
+    const int f = 1 << reduce;
+    const std::string cache_dir = store ? std::string() : cache_dir_given;  // (a store's are read in a moment)
     IntensityCalibration cal;
+    for (const Scan* sc : scans) cal.scans.push_back(sc->name);
     cal.main = main.name;
-    cal.companion = companion.name;
-    cal.rows = main.rows;
-    cal.cols = main.cols;
-    cal.fingerprint = acquisition_fingerprint(main, companion);
-    const std::size_t R = static_cast<std::size_t>(main.rows), C = static_cast<std::size_t>(main.cols);
+    cal.companion = S > 1 ? scans[1]->name : std::string();
+    cal.projection_store = projection_store, cal.reduce = reduce;
+    // the cache's names of the scans' arrays: the pair's, and companion2, companion3, .. beyond
+    const auto tag = [](std::size_t k) { return k == 0 ? std::string("main") : k == 1 ? std::string("companion") : "companion" + std::to_string(k); };
+    cal.reduced.resize(S);
+    if (store) {
+        Sha256 h;
+        h.update("helirec-calibration-v" + std::to_string(kIntensityCalibrationVersion) + "|store|" + projection_store + "|" + std::to_string(reduce));
+        for (const Scan* sc : scans) h.update(sc->name + "|" + file_state(sc->master));
+        cal.fingerprint = h.hex();
+        for (std::size_t k = 0; k < S; ++k) {
+            const std::string group = projection_store_tile_group(projection_store, scans[k]->sample_name.empty() ? scans[k]->name : scans[k]->sample_name);
+            say(log, "[" + tag(k) + "] darks and flats of " + scans[k]->name + " from " + group + " at 1/" + std::to_string(f));
+            cal.reduced[k] = store_darks_flats(*scans[k], group, reduce);
+            if (cal.reduced[k].rows != main.rows / f || cal.reduced[k].cols != main.cols / f) throw Error(group + ": the store's darks and flats are not of the level's size");
+        }
+        cal.rows = main.rows / f, cal.cols = main.cols / f;
+    } else {
+        cal.fingerprint = acquisition_fingerprint(scans);
+        cal.rows = main.rows, cal.cols = main.cols;
+    }
+    const std::size_t R = static_cast<std::size_t>(cal.rows), C = static_cast<std::size_t>(cal.cols);
 
     // the caches, each only if it is of this acquisition and version
     const std::string arrays_path = cache_dir.empty() ? std::string() : join(cache_dir, "calibration_arrays.bin");
     const std::string json_path = cache_dir.empty() ? std::string() : join(cache_dir, "calibration.json");
-    bool have_arrays = false;
+    bool have_arrays = store;
     if (!arrays_path.empty() && exists(arrays_path)) {
         try {
             const ArrayFile a = read_array_file(arrays_path);
-            bool all = text_of(a.header.find("fingerprint")) == cal.fingerprint;
-            for (const char* k : kReductionKeys) all = all && a.find(k);
+            bool all = text_of(a.header.find("fingerprint")) == cal.fingerprint && a.find("weight_map");
+            for (std::size_t k = 0; k < S; ++k) all = all && a.find(tag(k) + "_dark") && a.find(tag(k) + "_flats");
             if (all) {
-                cal.main_reduced = {main.rows, main.cols, a.find("main_dark")->values, a.find("main_flats")->values};
-                cal.companion_reduced = {main.rows, main.cols, a.find("companion_dark")->values, a.find("companion_flats")->values};
+                for (std::size_t k = 0; k < S; ++k) cal.reduced[k] = {main.rows, main.cols, a.find(tag(k) + "_dark")->values, a.find(tag(k) + "_flats")->values};
                 cal.weight_map = a.find("weight_map")->values;
                 have_arrays = true;
             }
@@ -412,7 +497,7 @@ IntensityCalibration calibrate_intensity(const Scan& main, const Scan& companion
         if (!have_arrays) say(log, "calibration cache " + arrays_path + ": other acquisition / version, ignored");
     }
     std::optional<Json> cached;
-    if (have_arrays && exists(json_path)) {
+    if (have_arrays && !json_path.empty() && exists(json_path)) {
         try {
             std::ifstream in(json_path);
             const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
@@ -424,52 +509,72 @@ IntensityCalibration calibrate_intensity(const Scan& main, const Scan& companion
     }
 
     if (!have_arrays) {
-        for (int s = 0; s < 2; ++s) {
-            const Scan& sc = s ? companion : main;
-            const std::string tag = s ? "companion" : "main";
-            say(log, "[" + tag + "] reducing darks/flats of " + sc.name + " ...");
+        for (std::size_t k = 0; k < S; ++k) {
+            const Scan& sc = *scans[k];
+            say(log, "[" + tag(k) + "] reducing darks/flats of " + sc.name + " ...");
             std::size_t frames = sc.darks.size();
-            for (const FrameList& f : sc.flats) frames += f.size();
+            for (const FrameList& fl : sc.flats) frames += fl.size();
             std::unique_ptr<ProgressBar> bar;
-            if (progress) bar = std::make_unique<ProgressBar>(frames, "darks/flats (" + tag + ")", "frame");
-            DarksFlats r = reduce_darks_flats(sc, bar ? std::function<void(std::size_t)>([&](std::size_t k) { bar->update(k); }) : nullptr);
-            (s ? cal.companion_reduced : cal.main_reduced) = std::move(r);
+            if (progress) bar = std::make_unique<ProgressBar>(frames, "darks/flats (" + tag(k) + ")", "frame");
+            cal.reduced[k] = reduce_darks_flats(sc, bar ? std::function<void(std::size_t)>([&](std::size_t n) { bar->update(n); }) : nullptr);
         }
-        // the weight map from all the flats, the companion's first (the reference's --scan_files order)
+    }
+    if (cal.weight_map.empty()) {
+        // the weight map from all the flats, the last scan's first (the reference's --scan_files order: the companion's, then the main scan's)
         std::vector<const float*> flats;
-        for (const DarksFlats* d : {&cal.companion_reduced, &cal.main_reduced})
-            for (std::size_t k = 0; k < d->series(); ++k) flats.push_back(d->flats.data() + k * R * C);
-        cal.weight_map = weight_map(flats, main.rows, main.cols);
+        for (std::size_t k = S; k-- > 0;)
+            for (std::size_t i = 0; i < cal.reduced[k].series(); ++i) flats.push_back(cal.reduced[k].flats.data() + i * R * C);
+        cal.weight_map = store ? weight_map(flats, cal.rows, cal.cols, 15.0 / f, 10.0 / f) : weight_map(flats, cal.rows, cal.cols);
         if (!cache_dir.empty()) {
             make_dirs(cache_dir);
-            write_array_file(arrays_path, Json::dict().set("fingerprint", Json::of(cal.fingerprint)),
-                             {{"main_dark", {R, C}, cal.main_reduced.dark},
-                              {"main_flats", {cal.main_reduced.series(), R, C}, cal.main_reduced.flats},
-                              {"companion_dark", {R, C}, cal.companion_reduced.dark},
-                              {"companion_flats", {cal.companion_reduced.series(), R, C}, cal.companion_reduced.flats},
-                              {"weight_map", {R, C}, cal.weight_map}});
+            std::vector<NamedArray> arrays;
+            for (std::size_t k = 0; k < S; ++k) {
+                arrays.push_back({tag(k) + "_dark", {R, C}, cal.reduced[k].dark});
+                arrays.push_back({tag(k) + "_flats", {cal.reduced[k].series(), R, C}, cal.reduced[k].flats});
+            }
+            arrays.push_back({"weight_map", {R, C}, cal.weight_map});
+            write_array_file(arrays_path, Json::dict().set("fingerprint", Json::of(cal.fingerprint)), arrays);
         }
     }
 
     // the merged frame
     cal.layout = layout;
     cal.cor_main_detector = layout.cor_main_detector;
-    cal.vector = layout.vector;
-    const MergedPlacement pl = placement_from_vector(cal.vector, main.cols);
+    cal.vectors = layout.vectors;
+    if (S == 2 && cal.vectors.empty()) cal.vectors = {layout.vector};  // (a pair's layout given by its one vector)
+    cal.vector = cal.vectors.empty() ? std::array<double, 2>{} : cal.vectors[0];
+    const MergedPlacement pl = placement_from_vectors(cal.vectors, cal.cols);
     cal.placement = pl.scans;
     cal.merged_width = pl.width;
     cal.rot_center = cal.cor_main_detector + pl.anchor;
-    const ApodisationWidths aw = apodisation_widths(main.cols, main.estimated_cor_from_motor_pix, cal.vector[1]);
-    cal.apodisation = {{{aw.main_left, aw.main_right}, {aw.companion_left, aw.companion_right}}};
-    cal.estimated_cor_from_motor_pix = {main.estimated_cor_from_motor_pix, companion.estimated_cor_from_motor_pix};
+    // The apodisation: the main scan's slope beyond the rotation axis and its taper towards the next scan; of every
+    // other scan a border taper on the side facing the main scan, and one on its far side if a scan lies beyond it.
+    for (const Scan* sc : scans) cal.estimated_cor_from_motor_pix.push_back(sc->estimated_cor_from_motor_pix);
+    cal.apodisation.resize(S);
+    if (S == 1) {
+        cal.apodisation[0] = {0.0, 0.0};
+    } else {
+        const double borders = 50.0 / f;
+        const ApodisationWidths aw = apodisation_widths(cal.cols, main.estimated_cor_from_motor_pix / f, cal.vectors[0][1], 1000.0 / f, borders);
+        cal.apodisation[0] = {aw.main_left, aw.main_right};
+        for (std::size_t k = 1; k < S; ++k) {
+            if (!(cal.vectors[k - 1][1] < 0)) throw Error("a companion on the right of the main scan is not supported yet");
+            bool beyond = false;
+            for (std::size_t j = 1; j < S; ++j) beyond = beyond || cal.vectors[j - 1][1] < cal.vectors[k - 1][1];
+            cal.apodisation[k] = {beyond ? borders : aw.companion_left, aw.companion_right};
+        }
+    }
 
     // the detector's blur: the cached measurement (the detector does not change with the merged frame), or measured
     const Json* cached_field = cached ? cached->find("detector_blur_field") : nullptr;
-    if (cached_field && cached_field->is(Json::Array)) {
+    if (store) {
+        cal.detector_blur.scan = main.name;
+        cal.detector_blur.reason = "the frames are a projection store's at 1/" + std::to_string(f) + ": the noise of its flats does not hold the detector's blur";
+    } else if (cached_field && cached_field->is(Json::Array)) {
         cal.detector_blur = blur_of(*cached);
         say(log, "calibration loaded from " + cache_dir);
     } else {
-        cal.detector_blur = measure_detector_blur(main, cal.main_reduced.dark.data(), 200, log);
+        cal.detector_blur = measure_detector_blur(main, cal.reduced[0].dark.data(), 200, log);
         if (!cache_dir.empty()) {
             make_dirs(cache_dir);
             const std::string tmp = json_path + ".tmp" + std::to_string(static_cast<long>(::getpid()));
@@ -481,13 +586,21 @@ IntensityCalibration calibrate_intensity(const Scan& main, const Scan& companion
             if (std::rename(tmp.c_str(), json_path.c_str()) != 0) throw Error("cannot write " + json_path);
         }
     }
-    say(log, "merged frame: rotation axis " + fmt("%.3f", cal.cor_main_detector) + " in the main scan's columns, companion at (" + python_repr(cal.vector[0]) + ", " +
-                 python_repr(cal.vector[1]) + ") (rows, columns): axis " + fmt("%.3f", cal.rot_center) + " of " + std::to_string(cal.merged_width) + " merged columns");
+    if (S == 2)
+        say(log, "merged frame: rotation axis " + fmt("%.3f", cal.cor_main_detector) + " in the main scan's columns, companion at (" + python_repr(cal.vector[0]) + ", " +
+                     python_repr(cal.vector[1]) + ") (rows, columns): axis " + fmt("%.3f", cal.rot_center) + " of " + std::to_string(cal.merged_width) + " merged columns");
+    else {
+        std::string places;
+        for (const auto& v : cal.vectors) places += (places.empty() ? "" : ", ") + ("(" + python_repr(v[0]) + ", " + python_repr(v[1]) + ")");
+        say(log, "merged frame: rotation axis " + fmt("%.3f", cal.cor_main_detector) + " in the main scan's columns, the other scans at " + places + " (rows, columns): axis " +
+                     fmt("%.3f", cal.rot_center) + " of " + std::to_string(cal.merged_width) + " merged columns");
+    }
 
     // per scan: the weight map times its horizontal apodisation
-    for (int s = 0; s < 2; ++s) {
-        const auto mask = apodisation_mask(main.cols, static_cast<float>(cal.apodisation[s][0]), static_cast<float>(cal.apodisation[s][1]), 1e-8f);
-        std::vector<float>& w = s ? cal.companion_weight : cal.main_weight;
+    cal.weight.resize(S);
+    for (std::size_t k = 0; k < S; ++k) {
+        const auto mask = apodisation_mask(cal.cols, static_cast<float>(cal.apodisation[k][0]), static_cast<float>(cal.apodisation[k][1]), 1e-8f);
+        std::vector<float>& w = cal.weight[k];
         w.resize(R * C);
         for (std::size_t r = 0; r < R; ++r)
             for (std::size_t c = 0; c < C; ++c) w[r * C + c] = cal.weight_map[r * C + c] * mask[c];

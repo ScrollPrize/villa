@@ -1,5 +1,6 @@
 #pragma once
-// The reconstruction of an extended-field-of-view helical scan pair from its raw folders (helirec-reconstruct;
+// The reconstruction of an extended-field-of-view helical acquisition from its raw folders: the scan with the
+// rotation axis in its field and one or more scans moved sideways beside it, merged (helirec-reconstruct;
 // Python helirec.recon.HelicalRecon binds it): the scans (calibration/scan.hpp), the geometry calibration (given,
 // cached or made: calibration/geometry_calibration.hpp), the intensity calibration in the frame it merges the scans
 // in (calibration/intensity.hpp), every projection's terms (geometry.hpp), and a SliceReconstructor of the
@@ -25,7 +26,8 @@
 //   exposure_arc         0 (default) | "auto" (the scan's recorded fraction) | a fraction; disabled with
 //                        angle_interp=views
 //   angle_subset         "" | "I/N": subset I of N interleaved subsets of the projections
-//   only_scan            "" (default: both scans, merged) | "main" | "companion": that scan's projections alone, at
+//   only_scan            "" (default: every scan, merged) | "main" | "companion" (the second scan) | "companion2", ..
+//                        | the kind a scan's name ends in ("HA", "TA", "TA2", ..): that scan's projections alone, at
 //                        the poses the geometry calibration gives them, on a slice grid centred on the rotation
 //                        axis as that scan's columns hold it (2 x axis + 1 across unless grid_size says otherwise).
 //                        Two scans reconstructed apart show where a calibration puts them against each other.
@@ -127,8 +129,18 @@ class Reconstruction {
         std::function<void(const std::string&)> log;
         bool progress = false;  // progress bars for the intensity calibration's reduction
         ExternalBackprojectorFactory external_backprojector;
+        // A projection store (STORE.zarr of helirec-projections-zarr or the downloader's --zarr) to read the frames,
+        // darks and flats from at the level `reduce` (0: as stored; 1, 2, 3: at a half, a quarter, an eighth), which
+        // it must hold; "": the detector's files beside the masters, as stored. Each scan's group of the store is
+        // the one named as its dataset. The frames of a scan need not all be there: the reconstruction takes the
+        // frames the geometry calibration was made on, and the heights that can be reconstructed follow from them.
+        // The geometry calibration stays in stored pixels and is divided here; the slices are of the frames read
+        // (their pixel 2^reduce times the stored one). Not with mode legacy_reference.
+        std::string projection_store;
+        int reduce = 0;
     };
-    // projections: the folder holding the two scans' folders; params: changes over the defaults (JSON object text)
+    // projections: the folder holding the scans' folders (two scans, or more: the scan with the rotation axis in
+    // its field and the scans moved sideways beside it); params: changes over the defaults (JSON object text)
     Reconstruction(const std::string& projections, const std::string& params, Options options);
     ~Reconstruction();
 
@@ -137,8 +149,11 @@ class Reconstruction {
     void set_parameters(const std::string& changes);
     std::string parameters() const;  // JSON object text
 
-    const calibration::Scan& main() const;
-    const calibration::Scan& companion() const;
+    const calibration::Scan& main() const;       // the scan with the rotation axis in its field
+    const calibration::Scan& companion() const;  // the second scan
+    const std::vector<calibration::Scan>& scans() const;  // all of them, the main scan first
+    std::pair<std::size_t, std::size_t> frames(std::size_t scan) const;  // [first, end) of a scan's projections it is given
+    int reduce() const;
     const calibration::IntensityCalibration& intensity() const;
     std::shared_ptr<SliceReconstructor> reconstructor() const;
     std::pair<int, int> doable() const;  // [lo, hi) view heights
@@ -166,10 +181,12 @@ class Reconstruction {
 // (path, text) of the geometry calibration a reconstruction uses: `given` (a path) as it is; else geometry.json of
 // cache_dir, made there by the geometry calibration step (`make`, by default calibration::geometry_calibration::
 // calibrate_geometry, with row_time_us if not "") when it is not there or names other scans than `masters`.
+// projection_store, reduce: where the step reads the frames when it makes the file (its Options::projections, reduce).
 using GeometryMaker = std::function<std::string(const std::vector<std::string>& masters, const calibration::geometry_calibration::Options&)>;
 std::pair<std::string, std::string> geometry_calibration_file(const std::string& given, const std::string& cache_dir, const std::vector<std::string>& masters,
                                                               const std::string& row_time_us, Device device,
-                                                              const std::function<void(const std::string&)>& log = nullptr, const GeometryMaker& make = nullptr);
+                                                              const std::function<void(const std::string&)>& log = nullptr, const GeometryMaker& make = nullptr,
+                                                              const std::string& projection_store = "", int reduce = 0);
 
 // ---------------------------------------------------------------- one tile of a mosaic
 // A reconstructor of one tile alone: the detector map, the pose and the angle of every frame, the rows' timing, in the

@@ -25,8 +25,9 @@ pytestmark = pytest.mark.skipif(TOOL is None, reason="helirec-reconstruct is not
 ROWS, COLS, PIXEL_UM = 200, 240, 8.64
 
 
-def _write(root, name, angles, heights_rows, axis_offset_px):
-    """root/name/name_0001/name_0001.h5 and its detector files: 20 darks, 20 flats, the projections, 20 flats"""
+def _write(root, name, angles, heights_rows, axis_offset_px, outer=None):
+    """root/name/name_0001/name_0001.h5 and its detector files: 20 darks, 20 flats, the projections, 20 flats.
+    outer: (radius, direction in degrees, amplitude, sigma) of a third Gaussian of the sample, off the axis"""
     d = root / name / f"{name}_0001"
     d.mkdir(parents=True)
     n = len(angles)
@@ -36,6 +37,9 @@ def _write(root, name, angles, heights_rows, axis_offset_px):
                ("3.1", "flat images 1", 1, (20100 + rng.integers(0, 50, (20, ROWS, COLS))).astype(np.uint16))]
     th = np.deg2rad(angles)[:, None]
     line = 0.6 * np.exp(-0.5 * ((col[None] - 30 * np.cos(th)) / 9.0) ** 2) + 0.4 * np.exp(-0.5 * ((col[None] + 20 * np.sin(th)) / 6.0) ** 2)
+    if outer is not None:
+        radius, direction, amplitude, sigma = outer
+        line = line + amplitude * np.exp(-0.5 * ((col[None] - radius * np.cos(th - np.deg2rad(direction))) / sigma) ** 2)
     proj = (100 + 20000 * np.exp(-line))[:, None, :] * np.ones((1, ROWS, 1))
     entries.append(("4.1", "projections 0 - 600", 0, proj.astype(np.uint16)))
     entries.append(("5.1", "flat images 600", 1, (20100 + rng.integers(0, 50, (20, ROWS, COLS))).astype(np.uint16)))

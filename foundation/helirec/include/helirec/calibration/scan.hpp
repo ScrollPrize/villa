@@ -92,11 +92,14 @@ struct Scan {
 };
 
 // `path`: the master file, the scan directory <name>_0001 (holding <name>_0001.h5), or a directory holding exactly
-// one such scan directory.
+// one such scan directory. The master may also be a NeXus scan file with an NXtomo subentry (GDA, Diamond I12:
+// <n>.nxs and its frame file): src/calibration/nxtomo.hpp states what the fields are then, and the supplement
+// file beside the master that gives what such a file does not hold (the pixel size at least).
 Scan open_scan(const std::string& path);
 
-// The tomo scans below `root` (the directories D holding D.h5 whose master starts a tomo sequence; the walk does
-// not enter a scan's directory and goes `max_depth` levels down), sorted by name. Masters that cannot be read
+// The tomo scans below `root` (the directories D holding D.h5 whose master starts a tomo sequence, and the NeXus
+// NXtomo masters <n>.nxs of a directory; the walk does not enter a scan's directory and goes `max_depth` levels
+// down), sorted by name. Masters that cannot be read
 // as a scan are left out, and, with require_files, so are scans whose detector files are not all on disk.
 std::vector<Scan> discover_scans(const std::string& root, int max_depth = 3, bool require_files = false);
 

@@ -150,8 +150,12 @@ std::vector<Slot> slots_of(const Acquisition& acq, Blocks& b, const std::vector<
     for (std::size_t k = 0; k < acq.scans.size(); ++k) {
         const std::string scan = "scan" + std::to_string(k) + ".";
         const bool anchor = static_cast<int>(k) == acq.anchor;
+        // A scan without a helix does not travel along the axis (a circular scan, or rest turns alone): nothing
+        // gives the axis column's slope or the axial scale, and its first stretch stands for the scan's height.
+        bool travels = false;
+        for (const StretchLayout& st : acq.scans[k].stretches) travels = travels || st.helix;
         const char* own[3] = {"axis", "axis_slope", "axial_scale"};
-        for (int i = 0; i < 3; ++i) out.push_back({scan + own[i], b.own[k].data(), 4, i, true});
+        for (int i = 0; i < 3; ++i) out.push_back({scan + own[i], b.own[k].data(), 4, i, i == 0 || travels});
         // the scale of the scan's image across the beam: a scan's own views do not see it (their sightings lie at u
         // and -u from the axis), comparisons with another scan do; held unless freed by name
         out.push_back({scan + "column_scale", b.own[k].data(), 4, 3, false});
@@ -174,7 +178,7 @@ std::vector<Slot> slots_of(const Acquisition& acq, Blocks& b, const std::vector<
         for (int i = 0; i < 2; ++i) out.push_back({scan + once[i], b.once[k].data(), 2, i, !anchor && acq.scans[k].moved_on_stage});
         for (std::size_t a = 0; a < acq.scans[k].stretches.size(); ++a) {
             const StretchLayout& st = acq.scans[k].stretches[a];
-            out.push_back({scan + st.name + ".height", b.stretch[k][a].data(), 1, 0, !st.helix});
+            out.push_back({scan + st.name + ".height", b.stretch[k][a].data(), 1, 0, travels ? !st.helix : a > 0});
         }
     }
     return out;
@@ -397,8 +401,65 @@ Comparison comparison_of(const Acquisition& acq, const std::string& kind, int sc
     return c;
 }
 
+namespace {
+GeometrySolution solve_once(const Acquisition& acq, const std::vector<Comparison>& comparisons, const std::vector<LensPatch>& lens, const Parameters& start,
+                            const GeometryOptions& options);
+}
+
+namespace {
+// one solve, the map's undetermined terms held (GeometryOptions::undetermined_map)
+GeometrySolution solve_determined(const Acquisition& acq, const std::vector<Comparison>& comparisons, const std::vector<LensPatch>& lens, const Parameters& start,
+                                  const GeometryOptions& options) {
+    GeometrySolution solution = solve_once(acq, comparisons, lens, start, options);
+    if (!(options.undetermined_map > 0)) return solution;
+    // the map's terms that cannot be told from another unknown: held, and the rest solved again
+    GeometryOptions how = options;
+    std::vector<std::string> held;
+    for (int pass = 0; pass < 4; ++pass) {
+        std::vector<std::string> more;
+        for (const GeometrySolution::Correlated& c : solution.correlated) {
+            if (std::fabs(c.correlation) <= options.undetermined_map) continue;
+            for (const std::string* name : {&c.a, &c.b})
+                if (name->rfind("map.", 0) == 0 && std::find(more.begin(), more.end(), *name) == more.end()) more.push_back(*name);
+        }
+        if (more.empty()) break;
+        for (const std::string& n : more) how.held.push_back(n), held.push_back(n);
+        solution = solve_once(acq, comparisons, lens, start, how);
+    }
+    solution.undetermined = held;
+    return solution;
+}
+}  // namespace
+
 GeometrySolution solve_geometry(const Acquisition& acq, const std::vector<Comparison>& comparisons, const std::vector<LensPatch>& lens, const Parameters& start,
                                 const GeometryOptions& options) {
+    GeometrySolution solution = solve_determined(acq, comparisons, lens, start, options);
+    if (!options.tilts_after) return solution;
+    // the tilts of the scans compared with another at one angle, from that solution (GeometryOptions::tilts_after)
+    std::vector<std::uint8_t> paired(acq.scans.size(), 0);
+    for (const Comparison& c : comparisons)
+        if (!c.opposite && c.a.scan != c.b.scan) paired[static_cast<std::size_t>(c.a.scan)] = paired[static_cast<std::size_t>(c.b.scan)] = 1;
+    GeometryOptions tilted = options;
+    bool any = false;
+    for (std::size_t k = 0; k < acq.scans.size(); ++k) {
+        tilted.held.push_back(fmt("scan%zu.axial_scale", k));
+        if (static_cast<int>(k) == acq.anchor || !paired[k]) continue;
+        tilted.freed.push_back(fmt("scan%zu.tilt_x", k)), tilted.freed.push_back(fmt("scan%zu.tilt_y", k));
+        any = true;
+    }
+    if (!any) return solution;
+    const std::vector<std::string> undetermined = solution.undetermined;
+    for (const std::string& n : undetermined) tilted.held.push_back(n);
+    solution = solve_determined(acq, comparisons, lens, solution.parameters, tilted);
+    for (const std::string& n : undetermined)
+        if (!std::count(solution.undetermined.begin(), solution.undetermined.end(), n)) solution.undetermined.push_back(n);
+    return solution;
+}
+
+namespace {
+
+GeometrySolution solve_once(const Acquisition& acq, const std::vector<Comparison>& comparisons, const std::vector<LensPatch>& lens, const Parameters& start,
+                            const GeometryOptions& options) {
     SolveOptions so;
     so.huber = options.huber, so.max_iterations = options.max_iterations;
     fitting::validate(so);
@@ -596,6 +657,8 @@ GeometrySolution solve_geometry(const Acquisition& acq, const std::vector<Compar
     return out;
 }
 
+}  // namespace
+
 namespace {
 Json num(double v) { return Json::of(v); }
 Json numbers(const std::vector<double>& v) {
@@ -657,7 +720,9 @@ std::string solution_json(const Acquisition& acq, const GeometrySolution& s) {
     parameters_json(acq, s.parameters, out, map);
     Json correlated = Json::list();
     for (const GeometrySolution::Correlated& c : s.correlated) correlated.add(Json::list().add(Json::of(c.a)).add(Json::of(c.b)).add(num(c.correlation)));
-    out.set("map", map).set("free", names(s.free)).set("unused", names(s.unused)).set("correlated", correlated).set("solver", solver).set("left", left);
+    out.set("map", map).set("free", names(s.free)).set("unused", names(s.unused));
+    if (!s.undetermined.empty()) out.set("undetermined", names(s.undetermined));  // (the map's terms held: GeometryOptions::undetermined_map)
+    out.set("correlated", correlated).set("solver", solver).set("left", left);
     return out.text();
 }
 

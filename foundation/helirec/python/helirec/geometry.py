@@ -90,7 +90,8 @@ def acquisition(acq):
     """The scans' layout for the joint model as the C++ side holds it (_core.GeometryAcquisition), from a dict:
     rows, cols, row_time [frames per row], and optionally per_turn, pixel_um, row_sign, fan, per_depth (what the
     beam's divergence magnifies a sample by per pixel it sits nearer the source; 0: left out), width, anchor (the
-    scan whose place is the origin); scans = [dict(name, mid_height, axis (the coarse axis column), moved_on_stage
+    scan whose place is the origin), lit_rows ((first, end): the rows the beam lights, which the plan keeps its
+    blocks inside; none: every row); scans = [dict(name, mid_height, axis (the coarse axis column), moved_on_stage
     (the sample sits elsewhere on the rotation stage than in the anchor), on_stage (where, by the motors [px]),
     stretches=[dict(name, helix, angle_deg, rows, and optionally index, first, end (the frames on disk))])]. A
     GeometryAcquisition is returned as it is."""
@@ -112,16 +113,20 @@ def acquisition(acq):
             d["on_stage"] = [float(v) for v in s["on_stage"]]
         scans.append(d)
     top = {key: acq[key] for key in ("per_turn", "pixel_um", "row_sign", "fan", "per_depth", "width", "anchor", "period_s") if key in acq}
+    if acq.get("lit_rows") is not None:
+        top["lit_rows"] = [int(v) for v in acq["lit_rows"]]
     return _core.GeometryAcquisition(json.dumps(dict(top, rows=int(acq["rows"]), cols=int(acq["cols"]), row_time=float(acq.get("row_time", 0.0)), scans=scans)))
 
 
-def plan_comparisons(acquisition_, angles_per_turn=12, max_positions=48, n_rest=16, n_turn=12):
-    """The comparisons of each scan with itself, placed from the layout alone: a list of dicts (kind, scan_a, a, b
-    (the stretches in the layout), from_block, and the request's fields).
+def plan_comparisons(acquisition_, angles_per_turn=12, max_positions=48, n_rest=16, n_turn=12, turn_least=128):
+    """The comparisons of each scan with itself and with the scans that share its place on the rotation stage,
+    placed from the layout alone: a list of dicts (kind, scan_a, scan_b, a, b (the stretches in the layout),
+    from_block, and the request's fields). turn_least: the rows a turn's travel must leave in common for a helix
+    to be compared with itself a turn on (128; the step takes a patch and its margins in frames read reduced).
     (helirec::calibration::geometry_calibration::plan for an Acquisition)"""
     from . import _core
     try:
-        return json.loads(_core.geometry_plan(acquisition(acquisition_), int(angles_per_turn), int(max_positions), int(n_rest), int(n_turn)))
+        return json.loads(_core.geometry_plan(acquisition(acquisition_), int(angles_per_turn), int(max_positions), int(n_rest), int(n_turn), int(turn_least)))
     except RuntimeError as e:
         raise ValueError(str(e)) from None
 
@@ -129,7 +134,8 @@ def plan_comparisons(acquisition_, angles_per_turn=12, max_positions=48, n_rest=
 def measure_comparisons(session, acquisition_, device="auto", patch=128, **counts):
     """The plan of each scan's comparisons with itself (plan_comparisons) measured once on a CalibrationSession, in
     patches of patch x patch: the accepted ones as a list of dicts (kind, a, b, opposite, correlation, curvature,
-    block: the plan's block it came from), and the number of blocks planned.
+    block: the plan's block it came from), and the number of blocks planned. counts: plan_comparisons' (angles_per_turn,
+    max_positions, n_rest, n_turn, turn_least).
     (helirec::calibration::geometry_calibration::measure)"""
     from . import _core
     return _measured(_core.geometry_measure(session, acquisition(acquisition_), device, int(patch), **{k: int(v) for k, v in counts.items()}))
@@ -235,7 +241,7 @@ def lens_residuals(acquisition_, parameters, lens):
     return _core.geometry_lens_residuals(acquisition(acquisition_), _parameters_text(parameters), _lens(lens))
 
 
-def solve_geometry(acquisition_, comparisons, start=None, huber=0.03, max_iterations=100, held=(), freed=(), lens=None, lens_huber=1.5):
+def solve_geometry(acquisition_, comparisons, start=None, huber=0.03, max_iterations=100, held=(), freed=(), lens=None, lens_huber=1.5, undetermined_map=0.0, tilts_after=False):
     """The joint geometry model solved on comparisons (helirec/calibration/geometry_calibration.hpp states the model).
 
     acquisition_: the scans' layout (a dict as `acquisition` takes it, or a GeometryAcquisition): what the records
@@ -272,12 +278,23 @@ def solve_geometry(acquisition_, comparisons, start=None, huber=0.03, max_iterat
     "residual": (n, 3) frames, rows, columns, and "lens_residual": (n, 3) x, y, z. "correlated" lists pairs of free
     unknowns the measurements hardly tell apart (correlation above 0.9 in size). It is an error if the free
     unknowns depend on each other.
+
+    undetermined_map above 0: a free term of the map whose estimate is correlated beyond it with another unknown's is
+    held where it started and the rest solved again; "undetermined" lists the terms held so (the step uses 0.95:
+    scans compared along the frames' edges alone do not tell the map's course along the columns from their axis
+    columns and heights).
+
+    tilts_after: every scan compared with another at one angle (but the anchor) gets its tilt_x and tilt_y in a
+    second solve, from the first, with every scan's axial scale and the map's terms held above kept where the first
+    has them (a scan's axial scale is its own views', which are few beside the comparisons of two scans). The step
+    solves so, the tilts about start's about_height.
     (helirec::calibration::geometry_calibration::solve_geometry)"""
     from . import _core
     try:
         text, residual, lens_residual = _core.geometry_solve(acquisition(acquisition_), [str(c["kind"]) for c in comparisons], _sightings([c["a"] for c in comparisons]),
                                                              _sightings([c["b"] for c in comparisons]), [bool(c.get("opposite", False)) for c in comparisons], _lens(lens),
-                                                             _parameters_text(start), float(huber), int(max_iterations), list(held), list(freed), float(lens_huber))
+                                                             _parameters_text(start), float(huber), int(max_iterations), list(held), list(freed), float(lens_huber),
+                                                             float(undetermined_map), bool(tilts_after))
     except RuntimeError as e:
         raise ValueError(str(e)) from None
     out = json.loads(text)
@@ -333,6 +350,27 @@ def frame_poses(cal, angles_deg, heights_rows):
     return poses, json.loads(not_applied)
 
 
+def scan_poses(cal, angles_deg, heights_rows):
+    """frame_poses of a joint calibration of any number of scans that share their place on the rotation stage (the
+    scan with the rotation axis in its field, and the scans moved sideways beside it): one dict per scan, in the
+    calibration's order. Frames of stretches the calibration was made without (they were not on disk) stay at zero;
+    frames_placed says which frames it holds. (helirec::geometry::Calibration::scan_poses)"""
+    from . import _core
+    try:
+        poses, not_applied = _core.GeometryCalibration(_text(cal)).scan_poses([np.asarray(a_, np.float64).tolist() for a_ in angles_deg],
+                                                                               [np.asarray(h_, np.float64).tolist() for h_ in heights_rows])
+    except RuntimeError as e:
+        raise ValueError(str(e)) from None
+    return poses, json.loads(not_applied)
+
+
+def frames_placed(cal, scan):
+    """[(first, end), ..] of a scan's projection frames a joint calibration was made on: each of its stretches'
+    frames that were on disk, those that follow one another joined. (helirec::geometry::Calibration::frames_placed)"""
+    from . import _core
+    return [tuple(r) for r in _core.GeometryCalibration(_text(cal)).frames_placed(int(scan))]
+
+
 def reconstruction_terms(pose, heights_rows, layout, rot_center, column_offset, z_readjustment=0.0, row_origin=0.0):
     """One scan's poses (frame_poses) as the reconstruction's per-projection terms (helical.hpp, ScanTrajectory).
 
@@ -348,10 +386,15 @@ def reconstruction_terms(pose, heights_rows, layout, rot_center, column_offset, 
                                                float(column_offset), float(z_readjustment), float(row_origin))
 
 
-def merged_layout(cal, poses, heights_rows, quantum=0.25):
+def merged_layout(cal, poses, heights_rows, quantum=0.25, first_frame=None):
     """The frame the two scans are merged in, from the poses (frame_poses): one rotation axis in the first scan's
     columns and the second scan's place against the first, as the reconstruction lays its merged frame out
     (calibration.placement_from_vector) -> dict(cor_main_detector, vector=(rows, columns), measured=...).
+
+    Of more scans than two (scan_poses), or with first_frame (per scan: the first frame the reconstruction is
+    given, from which its record's heights count): dict(cor_main_detector, vectors=[(rows, columns) of every scan
+    after the first], measured=[(axis column, rows) of each, unrounded], axis_first_scan, quantum), the medians
+    taken over the frames of the first scan's helix the calibration was made on.
 
     They are the medians over the helix of the axis' column in each scan and of the second scan's rows against the
     first's at equal frames, rounded to `quantum` pixels. The frame is a nominal one: every projection's own axis
@@ -360,6 +403,9 @@ def merged_layout(cal, poses, heights_rows, quantum=0.25):
     places the scans by (one axis and one vector, on the grid the reference's searches had)."""
     from . import _core
     f = lambda x: np.ascontiguousarray(x, np.float64)
+    if len(poses) != 2 or first_frame is not None:
+        return _core.GeometryCalibration(_text(cal)).merged_layout_of([f(p["axis"]).tolist() for p in poses], [f(p["row"]).tolist() for p in poses],
+                                                                      [f(h).tolist() for h in heights_rows], [int(k) for k in (first_frame or [])], float(quantum))
     return _core.GeometryCalibration(_text(cal)).merged_layout(f(poses[0]["axis"]), f(poses[0]["row"]), f(poses[1]["axis"]), f(poses[1]["row"]),
                                                                f(heights_rows[0]), f(heights_rows[1]), float(quantum))
 

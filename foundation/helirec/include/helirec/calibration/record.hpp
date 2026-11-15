@@ -124,6 +124,13 @@ struct Record {
 
 // `frame_files`: also open every frame file that is on disk and read what Lima wrote there (a few hundred small
 // reads). Frame files that are absent are marked in the pieces (FramePiece::present), not an error.
+//
+// A NeXus scan file with an NXtomo subentry (GDA, Diamond I12) is read too, into the same fields
+// (src/calibration/nxtomo.hpp says how): its stretches are the runs of equal image_key in its one frame file, named
+// "darks", "flats", "projections"; the projections' angles are in rot_trig and rot_delta, their timing in
+// timer_delta and timer_period, no height is latched (a circular scan); the motors before the scan are every
+// stretch's positioners; and the technique holds what the calibration asks under BLISS's names (scan/sample_pixel_size,
+// scan/tomo_n, scan/scan_range, scan/source_sample_distance where it is given, tomoconfig/..).
 Record read_record(const std::string& h5_path, bool frame_files = true);
 
 // ---- what the record states per frame

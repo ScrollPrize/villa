@@ -1,5 +1,6 @@
-// helirec-reconstruct: slices of an extended-FOV helical scan pair from the raw projection folders
-// (helirec::Reconstruction, helirec/reconstruction.hpp).
+// helirec-reconstruct: slices of an extended-FOV helical acquisition (a scan pair, or the scan with the rotation
+// axis in its field and several moved sideways beside it) from the raw projection folders, or from a projection
+// store of them (helirec::Reconstruction, helirec/reconstruction.hpp).
 //
 // Two modes:
 //
@@ -21,6 +22,10 @@
 // it) and conventions. The default uint8 window is the reference one in the run's units.
 // Calibration is computed once and cached (--cache_dir): the geometry calibration (geometry.json; --set
 // geometry=PATH names one made before) and the intensity calibration (calibration_arrays.bin, calibration.json).
+// --projection_store STORE.zarr --reduce R: the frames, darks and flats are read from a projection store at its
+// level R (1, 2, 3: a half, a quarter, an eighth of the detector), PROJECTIONS then holding the scans' master files
+// alone; the slices are of those frames (pixels 2^R times the stored ones), and of each scan the frames the
+// geometry calibration was made on are used.
 // --config FILE: a JSON object of options (keys = option names without the dashes); the command line wins. Each run
 // saves its config.json, which reruns it.
 #include <algorithm>
@@ -68,6 +73,7 @@ const Spec& option_spec() {
                                {"u8_compression", 1, 's'}, {"u8_delta3d_preset", 1, 's'}, {"tag", 1, 's'},          {"out_root", 1, 's'},
                                {"previews", 0, 'b'},       {"no_preview", 0, 'b'},     {"overwrite", 0, 'b'},       {"set", -2, 's'},
                                {"device", 1, 's'},         {"cache_dir", 1, 's'},      {"projections", 1, 's'},
+                               {"projection_store", 1, 's'}, {"reduce", 1, 'i'},
                            },
                            {{"-n", "n_slices"}},
                            "projections",
@@ -83,7 +89,7 @@ int usage() {
                  "                           [--reference_cache DIR] [--chunk N] [--zarr_chunks CZ CY CX] [--levels N] [--compression none|zlib]\n"
                  "                           [--u8_compression vc-delta3d|none|zlib] [--u8_delta3d_preset fast|medium|slow|slower|delta]\n"
                  "                           [--tag TAG] [--out_root DIR] [--previews] [--overwrite] [--set KEY=VALUE ...] [--device cuda|cpu]\n"
-                 "                           [--cache_dir DIR]\n"
+                 "                           [--cache_dir DIR] [--projection_store STORE.zarr] [--reduce 0|1|2|3]\n"
                  "(see the head of tools/helirec_reconstruct.cpp and README.md)\n");
     return 2;
 }
@@ -501,6 +507,8 @@ int run(int argc, char** argv) {
     opt.device = device == "cuda" ? Device::CUDA : Device::CPU;
     opt.log = say;
     opt.progress = true;
+    if (a.get("projection_store")) opt.projection_store = fs::absolute(a.text("projection_store")).lexically_normal().string();
+    if (a.get("reduce")) opt.reduce = static_cast<int>(a.number("reduce"));
     Reconstruction r(a.text("projections"), parse_settings(sets), opt);
     Run run;
     run.a = a;

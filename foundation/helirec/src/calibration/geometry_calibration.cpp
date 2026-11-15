@@ -72,9 +72,10 @@ void add_lag(const std::vector<double>& a, const std::vector<double>& b, std::ve
     }
 }
 
-// the columns two profiles must have in common for a lag to count: 256 on a detector as stored, an eighth of the
-// width on a narrower one (frames read at a quarter leave the opposite views of a tile 150 columns)
-long least_in_common(int cols) { return cols >= 2048 ? 256 : std::max(32, cols / 8); }
+// the columns two profiles must have in common for a lag to count: 256 on a detector as stored, a sixteenth of the
+// width on a narrower one (frames read at a quarter leave the opposite views of a Paris4 tile 150 columns, and
+// two scans moved sideways by all but 378 columns of 4416 leave each other 94)
+long least_in_common(int cols) { return cols >= 2048 ? 256 : std::max(32, cols / 16); }
 
 std::size_t argmax(const std::vector<double>& v) { return static_cast<std::size_t>(std::max_element(v.begin(), v.end()) - v.begin()); }
 
@@ -102,9 +103,13 @@ bool Blocked::holds(double frame, int row_lo, int row_hi) const {
 
 namespace {
 
+// the share of the flats' brightest row that a row the beam lights reaches (Acquisition::lit_rows)
+constexpr double kLitShare = 0.12;
+
 // Rows that hold something across the whole width in frames [first, end) of a stretch, sampled 16 times a turn:
 // the mean of the lowest columns of a row is not air there. Nothing found: no frames. label: the stretch, for the log.
-Blocked blocked_rows(Session& session, int scan, int stretch, std::int64_t first, std::int64_t end, int per_turn, const std::string& label, const Log& log) {
+// lit: the rows the beam lights, [first, end) (Acquisition::lit_rows): the others are neither looked at nor marked.
+Blocked blocked_rows(Session& session, int scan, int stretch, std::int64_t first, std::int64_t end, int per_turn, const int lit[2], const std::string& label, const Log& log) {
     const int rows = session.frames(scan).rows(), cols = session.frames(scan).cols();
     const int few = std::max(8, cols / 50);
     const std::int64_t n = end - first;
@@ -126,15 +131,15 @@ Blocked blocked_rows(Session& session, int scan, int stretch, std::int64_t first
             for (int c = 0; c < few; ++c) s += line[static_cast<std::size_t>(c)];
             q[static_cast<std::size_t>(r)] = s / static_cast<float>(few);
         }
-        std::vector<float> sorted = q;
+        std::vector<float> sorted(q.begin() + lit[0], q.begin() + lit[1]);
         std::sort(sorted.begin(), sorted.end());
         const std::size_t m = sorted.size() / 2;
         const float med = sorted.size() % 2 ? sorted[m] : (sorted[m - 1] + sorted[m]) / 2.0f;
         const float limit = med + 0.1f;
         int lo = -1, hi = -1;
-        for (int r = 0; r < rows; ++r) {
+        for (int r = lit[0]; r < lit[1]; ++r) {
             bool hit = false;  // with 24 rows around a row that holds something
-            for (int j = std::max(0, r - 24); j <= std::min(rows - 1, r + 24) && !hit; ++j) hit = q[static_cast<std::size_t>(j)] > limit;
+            for (int j = std::max(lit[0], r - 24); j <= std::min(lit[1] - 1, r + 24) && !hit; ++j) hit = q[static_cast<std::size_t>(j)] > limit;
             if (!hit) continue;
             b.mask[i * static_cast<std::size_t>(rows) + static_cast<std::size_t>(r)] = 1;
             if (lo < 0) lo = r;
@@ -182,10 +187,11 @@ namespace {
 // The axis column of a scan, coarsely: the column profiles of frames half a turn apart in one stretch, the second
 // reversed and its rows `sense` x the record's travel further on, correlated over all lags that leave 256 columns
 // in common. score: their mean correlation at the lag found. (course.rows as the record has them, sense +1.)
+// near, within: only axis columns within `within` of `near` are looked at (where the record's motors put the axis).
 struct CoarseAxis {
     double axis = std::nan(""), score = 0;
 };
-CoarseAxis coarse_axis(Session& session, int scan, const StretchLayout& st, int per_turn, double sense) {
+CoarseAxis coarse_axis(Session& session, int scan, const StretchLayout& st, int per_turn, double sense, double near = std::nan(""), double within = 0) {
     const int rows = session.frames(scan).rows(), cols = session.frames(scan).cols(), N = per_turn, band = 256;
     if (rows < band) throw Error("geometry calibration: the detector has fewer than 256 rows");
     std::vector<double> cc(2 * static_cast<std::size_t>(cols), 0.0);
@@ -213,23 +219,44 @@ CoarseAxis coarse_axis(Session& session, int scan, const StretchLayout& st, int 
         ++pairs;
     }
     if (!pairs) return {};
-    const std::size_t k = argmax(cc);
-    return {(cols - 1 - (static_cast<double>(k) - cols)) / 2.0, cc[k] / pairs};
+    const auto axis_at = [&](std::size_t k) { return (cols - 1 - (static_cast<double>(k) - cols)) / 2.0; };
+    std::size_t k = argmax(cc);
+    if (std::isfinite(near)) {
+        bool any = false;
+        for (std::size_t j = 0; j < cc.size(); ++j)
+            if (std::fabs(axis_at(j) - near) <= within && (!any || cc[j] > cc[k])) k = j, any = true;
+        if (!any) return {};
+    }
+    return {axis_at(k), cc[k] / pairs};
 }
 
+// How far the windows of a scan with its axis at `axis` keep from the ends of the strip its opposite views share.
+// 40 where the strip has the room: B's block takes up to 32 columns on either side (pick_size: a quick transform
+// size). A strip narrower than that leaves room for windows of 32 columns alone, whose block takes 8 on either
+// side: they keep 12 (a rotation axis near the detector's edge, in frames read reduced).
+int window_edge(double axis, int cols) { return 2.0 * std::min(axis, cols - 1 - axis) >= 32 + 84 ? 40 : 12; }
+
+// The rows asked of a block of a helix compared with itself a turn on, where a turn's travel leaves `rows - travel`
+// rows in common: 128 where there are as many; 48 where there are `least` (PlanCounts::turn_least: a helix that
+// travels nearly the detector's height per turn, in frames read reduced; the cut then takes what fits beside its
+// margins, 32 rows of 56); 0: none.
+int turn_rows(int rows, double travel, int least) { return rows - travel >= 128 ? 128 : rows - travel >= least ? 48 : 0; }
+// PlanCounts::turn_least of frames read at 1 / 2^reduce: a patch of the registration (128 stored pixels, at least
+// 32 samples) and the margins of its cut
+int turn_least(int reduce) { return reduce ? std::max(32, 128 >> reduce) + 24 : 128; }
+
 // the widest window of a scan with its axis at `axis`: a power of two from 32 to 512 inside the strip its opposite
-// views share, with room for the cut's margins (B's block takes up to 32 columns on either side, and the windows
-// keep 40 from the strip's ends); 0: none
+// views share, with room for the cut's margins (window_edge); 0: none
 int window_width(double axis, int cols) {
     const double strip = 2.0 * std::min(axis, cols - 1 - axis);
-    if (strip < 32 + 84) return 0;
+    if (strip < 32 + 84) return strip >= 32 + 2 * 12 ? 32 : 0;
     return std::min(512, static_cast<int>(std::pow(2.0, std::floor(std::log2(strip - 84)))));
 }
 
 // the first columns of A's windows of width W whose mirror image about `axis` lies on the detector with a margin:
 // up to three, or none
 std::vector<std::int64_t> mirrored_windows(double axis, int cols, int W) {
-    const int axis2 = static_cast<int>(std::nearbyint(2 * axis)), edge = 40;
+    const int axis2 = static_cast<int>(std::nearbyint(2 * axis)), edge = window_edge(axis, cols);
     const int lo = std::max(0, axis2 - (W - 1) - (cols - W)) + edge, hi = std::min(cols - W, axis2 - (W - 1)) - edge;
     if (hi < lo) return {};
     const int count = std::clamp(1 + (hi - lo) / W, 1, 3);
@@ -258,7 +285,8 @@ struct CoarseMove {
     int move = 0;
     double score = 0;
 };
-CoarseMove coarse_move(Session& session, const Acquisition& acq, int j, int k) {
+// near, within: only moves within `within` of `near` are looked at (what the record's motors say the stage moved).
+CoarseMove coarse_move(Session& session, const Acquisition& acq, int j, int k, double near = std::nan(""), double within = 0) {
     const ScanLayout& A = acq.scans[static_cast<std::size_t>(j)];
     const ScanLayout& B = acq.scans[static_cast<std::size_t>(k)];
     const int rows = acq.rows, cols = acq.cols, band = 256;
@@ -284,7 +312,13 @@ CoarseMove coarse_move(Session& session, const Acquisition& acq, int j, int k) {
         ++pairs;
     }
     if (!pairs) return {};
-    const std::size_t at = argmax(cc);
+    std::size_t at = argmax(cc);
+    if (std::isfinite(near)) {
+        bool any = false;
+        for (std::size_t i = 0; i < cc.size(); ++i)
+            if (std::fabs(static_cast<double>(i) - cols - near) <= within && (!any || cc[i] > cc[at])) at = i, any = true;
+        if (!any) return {};
+    }
     return {static_cast<int>(at) - cols, cc[at] / pairs};
 }
 
@@ -351,7 +385,11 @@ Acquisition read_acquisition(Session& session, Device device, const Log& log) {
         else if (per_turn != acq.per_turn) throw Error("geometry calibration: scan " + sc.name + " has another number of frames per turn than the first");
     }
     const int N = acq.per_turn;
-    acq.fan = acq.pixel_um * 1e-3 / session.record(0).technique.number("scan/source_sample_distance") / (std::fabs(step_deg) * (kPi / 180.0));
+    {
+        const double source_mm = session.record(0).technique.number("scan/source_sample_distance", std::nan(""));
+        if (std::isfinite(source_mm) && source_mm > 0) acq.fan = acq.pixel_um * 1e-3 / source_mm / (std::fabs(step_deg) * (kPi / 180.0));
+        else say(log, "  the record states no source distance: the beam's divergence is left out of the comparisons (no fan)");
+    }
     {
         const StretchLayout* st = &acq.scans[0].stretches.front();
         for (const StretchLayout& t : acq.scans[0].stretches)
@@ -359,10 +397,50 @@ Acquisition read_acquisition(Session& session, Device device, const Log& log) {
         const std::vector<double>& period = session.record(0).stretches[static_cast<std::size_t>(st->index)].timer_period;
         if (!period.empty()) acq.period_s = median_of(period);
     }
-    // rows that hold something across the whole width
+    // the rows the beam lights, in every scan
+    acq.lit_rows[0] = 0, acq.lit_rows[1] = rows;
+    for (int k = 0; k < S; ++k) {
+        const FlatField& ff = session.flat_field(k);
+        std::vector<double> level(static_cast<std::size_t>(rows), 0.0);
+#pragma omp parallel for schedule(static)
+        for (int r = 0; r < rows; ++r) {
+            double s = 0;
+            for (int c = 0; c < cols; ++c) s += ff.gain[static_cast<std::size_t>(r) * static_cast<std::size_t>(cols) + static_cast<std::size_t>(c)];
+            level[static_cast<std::size_t>(r)] = s / cols;
+        }
+        const int brightest = static_cast<int>(std::max_element(level.begin(), level.end()) - level.begin());
+        const double least = kLitShare * level[static_cast<std::size_t>(brightest)];
+        int lo = brightest, hi = brightest + 1;
+        while (lo > 0 && level[static_cast<std::size_t>(lo - 1)] >= least) --lo;
+        while (hi < rows && level[static_cast<std::size_t>(hi)] >= least) ++hi;
+        acq.lit_rows[0] = std::max(acq.lit_rows[0], lo), acq.lit_rows[1] = std::min(acq.lit_rows[1], hi);
+    }
+    if (acq.lit_rows[1] - acq.lit_rows[0] < rows) {
+        if (acq.lit_rows[1] - acq.lit_rows[0] < 128) throw Error("geometry calibration: the scans' flats light fewer than 128 rows in common");
+        say(log, fmt("  the beam lights rows %d..%d of %d (the flats' rows above %.2f of the brightest): the comparisons are kept inside them", acq.lit_rows[0], acq.lit_rows[1] - 1, rows, kLitShare));
+    }
+    // rows that hold something across the whole width, among those the beam lights
     for (int k = 0; k < S; ++k)
         for (StretchLayout& st : acq.scans[static_cast<std::size_t>(k)].stretches)
-            st.blocked = blocked_rows(session, k, st.index, st.first, st.end, N, fmt("scan %d %s", k, st.name.c_str()), log);
+            st.blocked = blocked_rows(session, k, st.index, st.first, st.end, N, acq.lit_rows, fmt("scan %d %s", k, st.name.c_str()), log);
+    // what the motors say of each scan's place
+    const double px_mm = acq.pixel_um * 1e-3;
+    for (int k = 0; k < S; ++k) {
+        const Record& rec = session.record(k);
+        ScanLayout& sc = acq.scans[static_cast<std::size_t>(k)];
+        const auto& at_start = rec.stretches[static_cast<std::size_t>(sc.stretches.front().index)].positioners_start;
+        const auto place = [&](const std::string& motor) {
+            const auto it = at_start.find(motor);
+            return motor.empty() || it == at_start.end() ? std::nan("") : it->second / px_mm;
+        };
+        sc.on_stage[0] = place(tomo_motor(rec, "sample_u")), sc.on_stage[1] = place(tomo_motor(rec, "sample_v"));
+        sc.across_beam = place(rec.translation_y[1]);
+    }
+    // Where profiles alone do not find a scan's content (a strip of a few dozen columns: frames read reduced, of
+    // scans that overlap little), it is looked for where the record's motors put it, within 64 stored pixels (the
+    // stage across the beam at nothing puts the axis on the detector's middle column: PHerc0343P to 0.5 px,
+    // Paris4's tiles to 5, PHercParis4's four scans at 2.4 um to 16), and taken at half the correlation.
+    const double near_motors = std::max(8.0, 64.0 / (1 << session.reduce()));
     // per scan the coarse axis column and, from its helix, the sense of the rows
     double sense_sum = 0;
     int senses = 0;
@@ -379,13 +457,21 @@ Acquisition read_acquisition(Session& session, Device device, const Log& log) {
         CoarseAxis axis[2];  // by the sense: -1, +1
         if (rest) axis[0] = axis[1] = coarse_axis(session, k, *rest, N, 1.0);
         else if (helix) axis[0] = coarse_axis(session, k, *helix, N, -1.0), axis[1] = coarse_axis(session, k, *helix, N, 1.0);
+        double bar = 0.2;  // the correlation an axis column is taken at
+        const double motors = (cols - 1) / 2.0 + sc.across_beam;
+        if (!(std::max(axis[0].score, axis[1].score) >= bar && window_width((axis[1].score > axis[0].score ? axis[1] : axis[0]).axis, cols) > 0) && std::isfinite(motors) &&
+            window_width(motors, cols) > 0) {
+            bar = 0.1;
+            if (rest) axis[0] = axis[1] = coarse_axis(session, k, *rest, N, 1.0, motors, near_motors);
+            else if (helix) axis[0] = coarse_axis(session, k, *helix, N, -1.0, motors, near_motors), axis[1] = coarse_axis(session, k, *helix, N, 1.0, motors, near_motors);
+        }
         const CoarseAxis& likely = axis[1].score > axis[0].score ? axis[1] : axis[0];
-        const bool in_field = likely.score >= 0.2 && window_width(likely.axis, cols) > 0;
+        const bool in_field = likely.score >= bar && window_width(likely.axis, cols) > 0;
         double sense = 0;
         RowSense found;
         if (helix && helix->end - helix->first > 2 * N + 200) {
             const double travel = std::fabs(helix->course.rows[static_cast<std::size_t>(helix->first + N)] - helix->course.rows[static_cast<std::size_t>(helix->first)]);
-            if (rows - travel >= 128) {  // the helix a turn apart shares a patch of rows
+            if (const int shared = turn_rows(rows, travel, turn_least(session.reduce()))) {  // the helix a turn apart shares a patch of rows
                 std::vector<ViewRequest> reqs;
                 const int W = 512 <= cols - 64 ? 512 : 256;
                 for (const std::int64_t p : whole(linspace(static_cast<double>(helix->first + 64), static_cast<double>(helix->end - N - 128), 3))) {
@@ -393,7 +479,7 @@ Acquisition read_acquisition(Session& session, Device device, const Log& log) {
                     q.scan_a = q.scan_b = k;
                     q.stretch_a = q.stretch_b = helix->index;
                     q.frame_a = p, q.frame_hint = N;
-                    q.frames = 32, q.rows = 128, q.cols = W, q.row_a = -1;
+                    q.frames = 32, q.rows = shared, q.cols = W, q.row_a = -1;
                     q.col_a = q.col_b = (cols - W) / 2;
                     reqs.push_back(q);
                 }
@@ -419,26 +505,60 @@ Acquisition read_acquisition(Session& session, Device device, const Log& log) {
             said += fmt("%s%s %+.0f (%.2f, the other sense %.2f)", said.empty() ? "" : ", ", sc.name.c_str(), sense, found.score, found.other);
         }
         const CoarseAxis& chosen = sense > 0 ? axis[1] : sense < 0 ? axis[0] : likely;
-        if (chosen.score >= 0.2 && window_width(chosen.axis, cols) > 0) sc.axis = chosen.axis;
-        say(log, fmt("  scan %d (%s): axis column about %.1f (profiles half a turn apart correlate %.2f)%s", k, sc.name.c_str(), chosen.axis, chosen.score,
-                     std::isnan(sc.axis) ? ": not taken as inside the field" : ""));
+        if (chosen.score >= bar && window_width(chosen.axis, cols) > 0) sc.axis = chosen.axis;
+        say(log, fmt("  scan %d (%s): axis column about %.1f (profiles half a turn apart correlate %.2f%s)%s", k, sc.name.c_str(), chosen.axis, chosen.score,
+                     bar < 0.2 ? fmt("; looked for within %.0f px of the motors' %.1f", near_motors, motors).c_str() : "", std::isnan(sc.axis) ? ": not taken as inside the field" : ""));
     }
-    if (!senses) throw Error("geometry calibration: no scan has a helix whose views register with each other: the sense of the rows is not known");
+    bool has_helix = false;
+    for (const ScanLayout& sc : acq.scans)
+        for (const StretchLayout& t : sc.stretches) has_helix = has_helix || t.helix;
+    if (!senses && has_helix) throw Error("geometry calibration: no scan has a helix whose views register with each other: the sense of the rows is not known");
+    if (!senses) {
+        // Circular scans: two scans at one place (on the rotation stage and across the beam) and different heights
+        // hold the same content at equal frames on rows the heights' difference apart, in one sense or the other.
+        const auto first_height = [&](int k) { return acq.scans[static_cast<std::size_t>(k)].stretches.front().course.rows[static_cast<std::size_t>(acq.scans[static_cast<std::size_t>(k)].stretches.front().first)]; };
+        std::vector<ViewRequest> reqs;
+        const int W = 512 <= cols - 64 ? 512 : 256, lit = acq.lit_rows[1] - acq.lit_rows[0];
+        bool heights_differ = false;
+        for (int j = 0; j < S; ++j)
+            for (int k = j + 1; k < S; ++k) {
+                const ScanLayout& a = acq.scans[static_cast<std::size_t>(j)];
+                const ScanLayout& b = acq.scans[static_cast<std::size_t>(k)];
+                const double apart = std::fabs(first_height(k) - first_height(j));
+                heights_differ = heights_differ || apart >= 1.0;
+                const double beside = std::fabs(a.across_beam - b.across_beam), on_stage = std::hypot(a.on_stage[0] - b.on_stage[0], a.on_stage[1] - b.on_stage[1]);
+                if ((std::isfinite(beside) && beside > 1.0) || (std::isfinite(on_stage) && on_stage > 1.0)) continue;
+                const int shared = static_cast<int>(lit - apart);  // lit rows both hold
+                if (apart < 48 || shared < 128 + 80) continue;
+                const StretchLayout& sa = a.stretches.front();
+                const StretchLayout& sb = b.stretches.front();
+                const std::int64_t first = std::max(sa.first, sb.first) + 16, last = std::min(sa.end, sb.end) - 80;
+                if (last < first) continue;
+                for (const std::int64_t p : whole(linspace(static_cast<double>(first), static_cast<double>(last), 3))) {
+                    ViewRequest q;
+                    q.scan_a = j, q.scan_b = k;
+                    q.stretch_a = sa.index, q.stretch_b = sb.index;
+                    q.frame_a = p, q.frame_hint = 0;
+                    q.frames = 32, q.rows = std::min(256, shared - 80), q.cols = W, q.row_a = -1;
+                    q.col_a = q.col_b = (cols - W) / 2;
+                    reqs.push_back(q);
+                }
+            }
+        if (!reqs.empty()) {
+            const RowSense found = row_sense(session, reqs, device);
+            if (found.score < 0.3) throw Error("geometry calibration: scans at different heights register with each other in neither sense of the rows");
+            sense_sum = found.sign, senses = 1;
+            said = fmt("%+.0f from scans at different heights (%.2f, the other sense %.2f)", found.sign, found.score, found.other);
+        } else if (heights_differ) {
+            throw Error("geometry calibration: no scan has a helix, and no two scans at one place across the beam share rows at different heights: the sense of the rows is not known");
+        } else {
+            sense_sum = -1, senses = 1;
+            said = "-1, not measured: no scan has a helix and all lie at one height, so nothing depends on it";
+        }
+    }
     if (std::fabs(sense_sum) != senses) throw Error("geometry calibration: the scans disagree about the sense of the rows against the axis stage: " + said);
     acq.row_sign = sense_sum > 0 ? 1.0 : -1.0;
-    // what the motors say of each scan's place, and the anchor
-    const double px_mm = acq.pixel_um * 1e-3;
-    for (int k = 0; k < S; ++k) {
-        const Record& rec = session.record(k);
-        ScanLayout& sc = acq.scans[static_cast<std::size_t>(k)];
-        const auto& at_start = rec.stretches[static_cast<std::size_t>(sc.stretches.front().index)].positioners_start;
-        const auto place = [&](const std::string& motor) {
-            const auto it = at_start.find(motor);
-            return motor.empty() || it == at_start.end() ? std::nan("") : it->second / px_mm;
-        };
-        sc.on_stage[0] = place(tomo_motor(rec, "sample_u")), sc.on_stage[1] = place(tomo_motor(rec, "sample_v"));
-        sc.across_beam = place(rec.translation_y[1]);
-    }
+    // the anchor, from what the motors say of each scan's place
     // (a record that does not name the stages on the rotation says nothing against the same place)
     const auto apart = [&](int j, int k) {
         const ScanLayout& a = acq.scans[static_cast<std::size_t>(j)];
@@ -466,27 +586,46 @@ Acquisition read_acquisition(Session& session, Device device, const Log& log) {
         if (acq.anchor < 0) throw Error("geometry calibration: no scan has its rotation axis inside the detector's field");
         for (int k = 0; k < S; ++k) acq.scans[static_cast<std::size_t>(k)].moved_on_stage = apart(acq.anchor, k) > 1.0;
     }
-    // a scan whose axis is not in its field: from where its content lies against a scan at the same place
-    for (int k = 0; k < S; ++k) {
+    // A scan whose axis is not in its field: from where its content lies against a scan at the same place whose
+    // axis is known, the one nearest across the beam by the motors (of several scans moved sideways one after the
+    // other, each holds content of its neighbour alone). The scans nearest the anchor across the beam first.
+    std::vector<int> outward;
+    for (int k = 0; k < S; ++k)
+        if (std::isnan(acq.scans[static_cast<std::size_t>(k)].axis)) outward.push_back(k);
+    const auto across = [&](int j, int k) {
+        const double d = std::fabs(acq.scans[static_cast<std::size_t>(j)].across_beam - acq.scans[static_cast<std::size_t>(k)].across_beam);
+        return std::isnan(d) ? 0.0 : d;
+    };
+    std::stable_sort(outward.begin(), outward.end(), [&](int a, int b) { return across(acq.anchor, a) < across(acq.anchor, b); });
+    for (const int k : outward) {
         ScanLayout& sc = acq.scans[static_cast<std::size_t>(k)];
-        if (!std::isnan(sc.axis)) continue;
+        // (of scans at several heights, one at this scan's own: profiles at equal frames hold the same content there)
+        const auto other_height = [&](int j) {
+            const StretchLayout& a = acq.scans[static_cast<std::size_t>(j)].stretches.front();
+            const StretchLayout& b = sc.stretches.front();
+            return std::fabs(a.course.rows[static_cast<std::size_t>(a.first)] - b.course.rows[static_cast<std::size_t>(b.first)]) > rows / 4.0;
+        };
         int ref = -1;
-        for (int j = 0; j < S && ref < 0; ++j)
-            if (j != k && axis_in_field(acq.scans[static_cast<std::size_t>(j)], cols) && apart(j, k) <= 1.0) ref = j;
+        for (int j = 0; j < S; ++j)
+            if (j != k && !std::isnan(acq.scans[static_cast<std::size_t>(j)].axis) && apart(j, k) <= 1.0 &&
+                (ref < 0 || std::make_pair(other_height(j), across(j, k)) < std::make_pair(other_height(ref), across(ref, k))))
+                ref = j;
         if (ref < 0) {
-            say(log, fmt("  scan %d (%s): no scan with its axis in the field shares its place on the rotation stage: its axis column is not known", k, sc.name.c_str()));
+            say(log, fmt("  scan %d (%s): no scan whose axis column is known shares its place on the rotation stage: its axis column is not known", k, sc.name.c_str()));
             continue;
         }
         const ScanLayout& other = acq.scans[static_cast<std::size_t>(ref)];
-        const CoarseMove found = coarse_move(session, acq, ref, k);
         const double motors = sc.across_beam - other.across_beam;
-        if (found.score < 0.2) {
+        CoarseMove found = coarse_move(session, acq, ref, k);
+        double bar = 0.2;
+        if (found.score < bar && std::isfinite(motors)) bar = 0.1, found = coarse_move(session, acq, ref, k, motors, near_motors);
+        if (found.score < bar) {
             say(log, fmt("  scan %d (%s): its content was not found in scan %d (profiles at equal frames correlate %.2f): its axis column is not known", k, sc.name.c_str(), ref, found.score));
             continue;
         }
         sc.axis = other.axis + found.move;
-        say(log, fmt("  scan %d (%s): its content lies %+d columns from scan %d's (profiles at equal frames correlate %.2f; the stage across the beam moved %+.1f px by its motor): axis column about %.1f",
-                     k, sc.name.c_str(), found.move, ref, found.score, motors, sc.axis));
+        say(log, fmt("  scan %d (%s): its content lies %+d columns from scan %d's (profiles at equal frames correlate %.2f%s; the stage across the beam moved %+.1f px by its motor): axis column about %.1f",
+                     k, sc.name.c_str(), found.move, ref, found.score, bar < 0.2 ? ", looked for near the motors'" : "", motors, sc.axis));
     }
     acq.width = 512;
     for (ScanLayout& sc : acq.scans) {
@@ -521,6 +660,7 @@ std::string acquisition_json(const Acquisition& acq) {
     Json out = Json::dict();
     out.set("rows", count(acq.rows)).set("cols", count(acq.cols)).set("frames_per_turn", count(acq.per_turn)).set("pixel_um", num(acq.pixel_um)).set("row_sign", num(acq.row_sign));
     out.set("row_time", num(acq.row_time)).set("frame_period_s", num(acq.period_s)).set("fan", num(acq.fan)).set("per_depth", num(acq.per_depth)).set("window_columns", count(acq.width));
+    if (acq.lit_rows[1] > acq.lit_rows[0]) out.set("lit_rows", Json::list().add(count(acq.lit_rows[0])).add(count(acq.lit_rows[1])));
     out.set("anchor", count(acq.anchor)).set("scans", scans);
     return out.text();
 }
@@ -562,8 +702,10 @@ std::vector<Planned> plan(const Acquisition& acq, const PlanCounts& n) {
     };
     // First rows of A's block for which it and B's, Nr rows higher and with its margins, lie on the detector: as
     // many bands as fit side by side, up to five.
+    // (inside the rows the beam lights, where it lights a part of the detector: L0, L1)
+    const int L0 = acq.lit_rows[1] > acq.lit_rows[0] ? acq.lit_rows[0] : 0, L1 = acq.lit_rows[1] > acq.lit_rows[0] ? acq.lit_rows[1] : R;
     const auto bands = [&](int Nr, int nr) {
-        const int m = 40, a0 = std::max(0, m - Nr), a1 = std::min(R - nr, R - nr - m - Nr);
+        const int m = 40, a0 = std::max(L0, L0 + m - Nr), a1 = std::min(L1 - nr, L1 - nr - m - Nr);
         if (a1 < a0) return std::vector<std::int64_t>();
         const int count = std::clamp(1 + (a1 - a0) / nr, 1, 5);
         if (count == 1) return std::vector<std::int64_t>{(a0 + a1) / 2};
@@ -604,9 +746,9 @@ std::vector<Planned> plan(const Acquisition& acq, const PlanCounts& n) {
         // the helix a turn apart, where a turn's travel leaves a patch of rows in common
         if (hx.end - hx.first > N + 200) {
             const double travel = std::fabs(hx.course.rows[static_cast<std::size_t>(hx.first + N)] - hx.course.rows[static_cast<std::size_t>(hx.first)]);
-            if (R - travel >= 128)
+            if (const int shared = turn_rows(R, travel, n.turn_least))
                 for (const std::int64_t p : whole(linspace(static_cast<double>(hx.first + 16), static_cast<double>(hx.end - N - 100), n.n_turn)))
-                    for (const std::int64_t ca : across) add("turn", k, helix, helix, same_columns(hx, hx, k, p, N, ca, 128, -1));
+                    for (const std::int64_t ca : across) add("turn", k, helix, helix, same_columns(hx, hx, k, p, N, ca, shared, -1));
         }
         // each rest turn against the helix at equal angle, in the turn of the helix nearest the rest turn's height
         for (int a = 0; a < static_cast<int>(sc.stretches.size()); ++a) {
@@ -913,12 +1055,15 @@ std::string calibrate_geometry(const std::vector<std::string>& scans, const Opti
         if (!timing.is(Json::Object))
             throw Error("no stretch on disk holds a refill to measure the rows' timing from: give the row time (seconds per stored row; 0 if it is not known) for this camera configuration");
         row_time = timing.find("seconds_per_row")->number;
+    } else {
+        row_time *= reduced_by;  // given per stored row: a row of the frames read holds that many
     }
     acq.row_time = row_time / acq.period_s;
     say(log, "comparisons");
     auto t = std::chrono::steady_clock::now();
     PlanCounts how_many;
     how_many.angles_per_turn = std::min(48, how_many.angles_per_turn * reduced_by), how_many.max_positions *= reduced_by;
+    how_many.turn_least = turn_least(options.reduce);
     const std::vector<Planned> planned = plan(acq, how_many);
     if (options.patch < 32) throw Error("geometry calibration: patches of at least 32 x 32");
     const int patch = std::max(32, options.patch / reduced_by);
@@ -939,8 +1084,20 @@ std::string calibrate_geometry(const std::vector<std::string>& scans, const Opti
     if (options.order > 0) {
         start.map = geometry::empty_map(acq.rows, acq.cols, options.order);
         how.freed.push_back("map");
+        how.undetermined_map = 0.95;  // (a term the comparisons cannot tell from a scan's place is not solved for)
     }
+    // the scans' tilts against the anchor (GeometryOptions::tilts_after), about the sample's origin at the middle of the
+    // anchor's frames on disk
+    how.tilts_after = true;
+    start.about_height = (acq.rows - 1) / 2.0 - acq.scans[static_cast<std::size_t>(acq.anchor)].mid_height;
     GeometrySolution solution = solve_geometry(acq, comparisons, start, how);
+    if (!solution.undetermined.empty()) {
+        std::string names;
+        for (const std::string& n : solution.undetermined) names += (names.empty() ? "" : ", ") + n;
+        say(log, "  the comparisons do not tell these terms of the map from other unknowns (correlated beyond 0.95): held at nothing, the rest solved without them: " + names);
+    }
+    if (std::any_of(solution.free.begin(), solution.free.end(), [](const std::string& n) { return n.find(".tilt_") != std::string::npos; }))
+        say(log, "  the scans' tilts against the first solved after that, every scan's axial scale kept");
     GeometryReport told = report(acq, solution, comparisons);
     if (options.reduce) {
         const Stretch& first = session.record(0).stretches.at(static_cast<std::size_t>(acq.scans[0].stretches.at(0).index));
@@ -953,7 +1110,8 @@ std::string calibrate_geometry(const std::vector<std::string>& scans, const Opti
                          l.rms[2]));
     for (std::size_t k = 0; k < acq.scans.size(); ++k) {
         const ScanParameters& p = solution.parameters.scans[k];
-        say(log, fmt("  scan %zu (%s): axis column %.3f, %+.2e per row of travel; axial scale %+.5f; height %+.3f rows", k, acq.scans[k].name.c_str(), p.axis, p.axis_slope, p.axial_scale, p.height));
+        say(log, fmt("  scan %zu (%s): axis column %.3f, %+.2e per row of travel; axial scale %+.5f; height %+.3f rows%s", k, acq.scans[k].name.c_str(), p.axis, p.axis_slope, p.axial_scale, p.height,
+                     p.rotation[0] != 0 || p.rotation[1] != 0 ? fmt("; tilt %+.1f, %+.1f urad", 1e6 * p.rotation[0], 1e6 * p.rotation[1]).c_str() : ""));
     }
     if (!solution.unused.empty()) {
         std::string names;

@@ -6,6 +6,7 @@
 #include <cstdlib>
 
 #include "calibration/h5_read.hpp"
+#include "calibration/nxtomo.hpp"
 
 namespace helirec::calibration {
 
@@ -201,6 +202,7 @@ std::pair<int, int> entry_number(const std::string& name) {
 }  // namespace
 
 Record read_record(const std::string& h5_path, bool frame_files) {
+    if (nxtomo::is_master(h5_path)) return nxtomo::read_record(h5_path, frame_files);  // a NeXus NXtomo master (GDA)
     h5::Id f = h5::open_file(h5_path);
     Record rec;
     rec.path = h5_path;
