@@ -87,3 +87,16 @@ allows `cuMemHostRegister` (the pool maps its page-locked memory into the card's
 | 12 | (measured before upstream #2564; NOT claimed for current `main`, whose link refresh no longer runs the track-track detector) the first link write was faster with identical links | 678,404 crossings, two concurrent pairs on the same unlinked store: submit 3,338.6 s (default 8,000 KiB page cache) -> 1,996.2 s (`VC_OBJECT_STORE_SQLITE_CACHE_MB=4096`) -> 1,586.1 s (+ edge SQL text cached per connection); the same multiset of 678,404 relationship contents and the same object versions in every pair | one window, one run per arm |
 
 **Time:** besides the memory switches, the branch builds an ingested store in seconds to minutes (`--bulk`, claim 10). The time the switches cost: about 1 % per iteration for the offload, and for `freeze` a sub-millisecond collection per step (claim 2).
+
+## Measured on a 16 GB card, this branch's own `fit_spiral.py` (2026-11-16)
+PHerc0343 at full height (z 0-17,998, shell 250, 32-voxel flow grid), its real 10.81 GiB lasagna pool, hub V100-SXM2-16GB (15.77 GiB; a 1.77 GiB desktop process also sits on the card), 60 iterations and then the mesh export.
+Inputs: 45,007 tracks (0.24 % of the scroll's tracks, so the input read takes minutes, not hours) plus a 3.65 GiB tensor held on the card for the device memory of the other tracks (the whole-store track term was measured at 3.66 GiB on this scroll), so the card sees the
+full-store footprint. One run per arm.
+| arm | outcome |
+|---|---|
+| `FIT_SPIRAL_GC_POLICY=freeze` + `FIT_SPIRAL_POOL_OFFLOAD=1` + export guard (all on) | completed 60 iterations and wrote 492 of 492 windings; torch peak 12.31 GiB, nvidia-smi peak 15,072 MiB |
+| all off | `torch.OutOfMemoryError` while loading the pool: 10.81 GiB requested, 10.08 GiB free |
+| `freeze`, no offload | the same error at pool load (the pool is resident) |
+| offload on, GC off | completed; the same peaks as the all-on arm: at this heap size the GC policy made no difference |
+So on a 16 GB card it is the offload that makes the fit start and run. The last row is why the GC claim needs its own evidence (next section of `GC_CYCLE_LEAK.md`).
+Not shown: a 4060 Ti run (staged, not finished at the time of writing), the full-store input, the 16-voxel grid, more than 60 iterations.

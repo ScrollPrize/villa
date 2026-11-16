@@ -48,3 +48,13 @@ integrator and sampler at the end of `step()`, or hold the transform weakly in t
 
 ## Reproduce
 Run any 1500-slice window with `FIT_SPIRAL_GC_POLICY=off` and with the default and compare `torch.cuda.max_memory_allocated()` at iteration ~600.
+
+## Synthetic reproduction and what the growth depends on (2026-11-16)
+`GC_CYCLE_LEAK` can be reproduced without the fit: a heap of N small objects, then per step a reference cycle that holds a 64 MiB tensor and survives long enough to reach the oldest generation, then is dropped (40 steps, V100):
+| interpreter | heap | default collector | `freeze` (gc.freeze once, then a full collection every step) |
+|---|---|---|---|
+| Python 3.11 | 1e5 and 2e7 objects | 2,560 MiB (all 40 steps kept) | 64 MiB |
+| Python 3.14 (incremental collector) | 1e5 objects | 256 MiB (no growth) | 64 MiB |
+| Python 3.14 | 2e7 objects | 2,560 MiB | 64 MiB (1.2 s of collector time in total; collecting every step with no freeze: 49 s) |
+With CPU tensors the same test keeps 1,964 MiB (default) against 0 (freeze): the effect is the Python collector's, not the GPU's. So the growth appears when the heap is large (the fit's is tens of millions of objects once the tracks are loaded)
+or on interpreters before 3.14; a small-heap fit on 3.14 (45 k tracks, 60 iterations, `off`) showed none, with the same torch peak as `freeze`.
