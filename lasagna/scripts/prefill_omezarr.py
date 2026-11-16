@@ -14,20 +14,20 @@ Examples::
     lasagna-prefill s3://bucket/vol.zarr /cache --scales 0 --center 500,600,700 --radius 256
     lasagna-prefill s3://bucket/vol.zarr /cache --scales 0 --zrange 1000,1200
 
-Regions are given in base (scale 0) voxels and are mapped to each level with
-the multiscale scale factors of the group's ``.zattrs``.
+Regions are given in level-0 voxels and are mapped to each level through the
+group's level placement (:meth:`~vc_reader.reader.ZarrGroup.placement`), so
+physical multiscale metadata is handled the same as unit level-0 spacing.
 """
 from __future__ import annotations
 
 import argparse
-import json
 import math
 import sys
 import time
 from typing import Any, Callable, Iterable, Sequence
 
 from vc_reader._reader import PrefillStatus
-from vc_reader.reader import ObjectStore, ZarrReader
+from vc_reader.reader import ZarrGroup, ZarrReader
 
 BoundsZYX = tuple[int, int, int, int, int, int]
 DEFAULT_CONNECTIONS = 64
@@ -45,51 +45,37 @@ def store_auth(anon: bool) -> Any:
     return None if anon else "auto"
 
 
-def read_group_attributes(location: str, *, anon: bool) -> dict[str, Any]:
-    """The OME-Zarr group's ``.zattrs`` (empty when the store has none)."""
-    raw = ObjectStore(location.rstrip("/"), auth=store_auth(anon)).read(".zattrs")
-    if raw is None:
-        return {}
-    attrs = json.loads(raw)
-    return attrs if isinstance(attrs, dict) else {}
-
-
-def multiscale_factors(attrs: dict[str, Any]) -> dict[int, tuple[float, float, float]]:
-    """Per-level ZYX scale factors from OME-NGFF ``multiscales`` metadata."""
-    factors: dict[int, tuple[float, float, float]] = {}
-    for multiscale in attrs.get("multiscales") or []:
-        for dataset in multiscale.get("datasets") or []:
-            path = str(dataset.get("path", ""))
-            if not path.isdigit():
-                continue
-            scale = None
-            for transform in dataset.get("coordinateTransformations") or []:
-                if transform.get("type") == "scale":
-                    values = [float(v) for v in transform.get("scale", [])]
-                    scale = tuple(values[-3:]) if len(values) >= 3 else None
-            if scale is not None:
-                factors[int(path)] = scale  # type: ignore[assignment]
-    return factors
+def level_placement(location: str, scale: int, *, anon: bool) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+    """Where level ``scale`` sits in level-0 voxels: ``level0 = factor * index + offset`` (ZYX)."""
+    group = ZarrGroup.open(location.rstrip("/"), auth=store_auth(anon))
+    try:
+        return group.placement(str(int(scale)))
+    finally:
+        group.close()
 
 
 def level_chunks_in_region(
     shape_zyx: Sequence[int],
     chunks_zyx: Sequence[int],
-    region_base_zyx: BoundsZYX,
-    factor_zyx: Sequence[float],
+    region_level0_zyx: BoundsZYX,
+    placement: tuple[Sequence[float], Sequence[float]],
 ) -> list[tuple[int, int, int]]:
-    """Chunk-grid indices of a level intersecting a base-voxel region (z0,y0,x0,z1,y1,x1)."""
-    z0, y0, x0, z1, y1, x1 = (int(v) for v in region_base_zyx)
+    """Chunk-grid indices of a level intersecting a level-0 voxel region (z0,y0,x0,z1,y1,x1).
+
+    ``placement`` is the level's ``(factor, offset)`` in level-0 voxels per level index.
+    """
+    factor_zyx, offset_zyx = placement
+    z0, y0, x0, z1, y1, x1 = (int(v) for v in region_level0_zyx)
     lows = (z0, y0, x0)
     highs = (z1, y1, x1)
     ranges = []
     for axis in range(3):
-        factor = float(factor_zyx[axis])
+        factor, offset = float(factor_zyx[axis]), float(offset_zyx[axis])
         if not factor > 0:
-            raise ValueError("multiscale factor must be positive")
+            raise ValueError("level placement factor must be positive")
         n, c = int(shape_zyx[axis]), int(chunks_zyx[axis])
-        lo = max(0, int(math.floor(lows[axis] / factor)))
-        hi = min(n, int(math.ceil(highs[axis] / factor)))
+        lo = max(0, int(math.floor((lows[axis] - offset) / factor)))
+        hi = min(n, int(math.ceil((highs[axis] - offset) / factor)))
         if hi <= lo:
             return []
         ranges.append(range(lo // c, (hi + c - 1) // c))
@@ -186,10 +172,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--anon", action="store_true", help="Read anonymously (public data)")
     parser.add_argument("--connections", type=int, default=DEFAULT_CONNECTIONS,
                         help=f"Parallel remote reads (default: {DEFAULT_CONNECTIONS})")
-    parser.add_argument("--bbox", help="x0,y0,z0,x1,y1,z1 in base voxels (half-open)")
-    parser.add_argument("--center", help="x,y,z in base voxels, with --radius")
-    parser.add_argument("--radius", type=int, help="Half extent in base voxels around --center")
-    parser.add_argument("--zrange", help="z0,z1 in base voxels")
+    parser.add_argument("--bbox", help="x0,y0,z0,x1,y1,z1 in level-0 voxels (half-open)")
+    parser.add_argument("--center", help="x,y,z in level-0 voxels, with --radius")
+    parser.add_argument("--radius", type=int, help="Half extent in level-0 voxels around --center")
+    parser.add_argument("--zrange", help="z0,z1 in level-0 voxels")
     return parser
 
 
@@ -202,18 +188,15 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("--scales must be non-negative")
     region = parse_region(args)
     source = args.source.rstrip("/")
-    factors = multiscale_factors(read_group_attributes(source, anon=args.anon)) if region else {}
     print(f"Source: {source}\nCache:  {args.cache_dir}\nLevels: {scales}", file=sys.stderr, flush=True)
     for scale in scales:
         location = level_location(source, scale)
         chunks = None
         if region is not None:
-            factor = factors.get(scale)
-            if factor is None:
-                raise SystemExit(f"level {scale} has no multiscale scale factor in {source}/.zattrs")
+            placement = level_placement(source, scale, anon=args.anon)
             reader = ZarrReader.open(location, auth=store_auth(args.anon))
             try:
-                chunks = level_chunks_in_region(reader.shape, reader.chunks, region, factor)
+                chunks = level_chunks_in_region(reader.shape, reader.chunks, region, placement)
             finally:
                 reader.close()
             print(f"Level {scale}: {len(chunks)} chunks in region", file=sys.stderr, flush=True)

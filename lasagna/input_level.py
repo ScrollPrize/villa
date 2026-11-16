@@ -4,9 +4,10 @@ The level is a local directory or a remote ``s3://`` / ``https://`` URL; both go
 through the same :class:`~vc_reader.reader.ZarrReader`, so a remote level needs
 no separate download step. Remote chunks are cached decoded in ``cache_dir``
 (bounded by ``cache_max_bytes``), and tiles can be read ahead into that cache
-before the GPU needs them. A per-z-plane chunk inventory, listed through
-:class:`~vc_reader.reader.writer.ObjectStore`, tells sparse volumes' empty
-regions apart without reading them.
+before the GPU needs them. The level's stored-chunk inventory
+(:meth:`~vc_reader.reader.ZarrWriter.stored_chunks`, one store listing that
+knows the array's key layout, Zarr v3 prefixes and shards included) tells
+sparse volumes' empty regions apart without reading them.
 """
 from __future__ import annotations
 
@@ -17,8 +18,7 @@ import threading
 import time
 from typing import Any
 
-from vc_reader.reader import ZarrReader
-from vc_reader.reader.writer import ObjectStore
+from vc_reader.reader import ZarrReader, ZarrWriter
 
 DEFAULT_READ_AHEAD_TILES = 10_000
 DEFAULT_INPUT_CONNECTIONS = 64
@@ -48,10 +48,10 @@ def split_level_location(location: str | os.PathLike[str]) -> tuple[str, int | N
 class InputLevel:
     """A 3-D Zarr level opened for tiled inference.
 
-    ``region_has_chunks`` answers from a chunk listing of the level (one listing
-    per z-chunk plane, cached), so empty regions of a sparse volume are skipped
-    without reading. ``request_region`` reads a region into the reader's caches
-    on a thread pool; the tiled loop uses it for read-ahead on remote levels.
+    ``region_has_chunks`` answers from the level's stored-chunk inventory (one
+    store listing, taken on first use), so empty regions of a sparse volume are
+    skipped without reading. ``request_region`` reads a region into the reader's
+    caches on a thread pool; the tiled loop uses it for read-ahead on remote levels.
     """
 
     def __init__(
@@ -95,31 +95,20 @@ class InputLevel:
                 f"tiled inference input must be a 3-D array with positive chunks, "
                 f"got shape={self.shape} chunks={self.chunks}: {self.location}"
             )
-        raw = self.reader.meta.raw
-        if int(raw.get("zarr_format", 2)) == 3:
-            self._chunk_prefix, self._separator = "c/", "/"
-        else:
-            self._chunk_prefix, self._separator = "", str(raw.get("dimension_separator", "."))
-        # Listing needs the same credentials as reading on S3; other stores list anonymously
-        # (a local directory) or not at all (a plain HTTP server, handled in region_has_chunks).
-        self._store = ObjectStore(
-            self.location,
-            auth=auth if self.location.startswith("s3://") else None,
-            connections=self.connections,
-        )
+        # Listing needs the same credentials as reading on S3; a local directory lists
+        # anonymously; a plain HTTP server cannot be listed (handled in region_has_chunks).
+        self._inventory_auth = auth if self.location.startswith("s3://") else None
         self._listable: bool | None = None
-        self._planes: dict[int, Future[set[tuple[int, int]]]] = {}
+        self._inventory: Future[frozenset[tuple[int, int, int]]] | None = None
         self._lock = threading.RLock()
         self._closed = False
         self._final_stats: dict[str, Any] | None = None
         self._stats = {
             "requested_regions": 0, "materialized_regions": 0,
-            "listed_planes": 0, "listed_chunks": 0, "missing_chunks": 0,
+            "listed_chunks": 0, "missing_chunks": 0,
         }
         self._started_at = time.monotonic()
-        self._list_pool = ThreadPoolExecutor(
-            max_workers=min(16, self.connections), thread_name_prefix="input-level-list",
-        )
+        self._list_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="input-level-list")
         self._read_pool = ThreadPoolExecutor(
             max_workers=self.connections, thread_name_prefix="input-level-read",
         )
@@ -139,33 +128,21 @@ class InputLevel:
 
     # ---- chunk inventory -------------------------------------------------
 
-    def _plane_prefix(self, iz: int) -> str:
-        return f"{self._chunk_prefix}{int(iz)}{self._separator}"
-
-    def _list_plane(self, iz: int) -> set[tuple[int, int]]:
-        prefix = self._plane_prefix(iz)
-        y_chunks = math.ceil(self.shape[1] / self.chunks[1])
-        x_chunks = math.ceil(self.shape[2] / self.chunks[2])
-        present: set[tuple[int, int]] = set()
-        for key in self._store.keys(prefix):
-            parts = key[len(self._chunk_prefix):].split(self._separator)
-            if len(parts) != 3 or not all(part.isdigit() for part in parts):
-                continue
-            cz, cy, cx = (int(part) for part in parts)
-            if cz == int(iz) and 0 <= cy < y_chunks and 0 <= cx < x_chunks:
-                present.add((cy, cx))
+    def _list_inventory(self) -> frozenset[tuple[int, int, int]]:
+        """The level's stored chunk indices, from vc_reader's listing of the store."""
+        stored = ZarrWriter.open(self.location, auth=self._inventory_auth).stored_chunks()
+        present = frozenset(tuple(int(v) for v in index[-3:]) for index in stored)
+        grid = math.prod(math.ceil(n / c) for n, c in zip(self.shape, self.chunks))
         with self._lock:
-            self._stats["listed_planes"] += 1
-            self._stats["listed_chunks"] += len(present)
-            self._stats["missing_chunks"] += max(0, y_chunks * x_chunks - len(present))
+            self._stats["listed_chunks"] = len(present)
+            self._stats["missing_chunks"] = max(0, grid - len(present))
         return present
 
-    def _plane(self, iz: int) -> Future[set[tuple[int, int]]]:
+    def _stored_chunks(self) -> Future[frozenset[tuple[int, int, int]]]:
         with self._lock:
-            future = self._planes.get(int(iz))
-            if future is None:
-                future = self._planes[int(iz)] = self._list_pool.submit(self._list_plane, int(iz))
-            return future
+            if self._inventory is None:
+                self._inventory = self._list_pool.submit(self._list_inventory)
+            return self._inventory
 
     def _chunk_ranges(self, bounds: BoundsZYX) -> tuple[range, range, range]:
         z0, z1, y0, y1, x0, x1 = bounds
@@ -187,25 +164,20 @@ class InputLevel:
             return False
         if self._listable is False:
             return True
-        planes = {iz: self._plane(iz) for iz in z_values}
-        for task in planes.values():
-            try:
-                present = task.result()
-            except Exception as error:
-                with self._lock:
-                    if self._listable is None:
-                        print(
-                            f"[input] chunk listing unavailable ({type(error).__name__}: {error}); "
-                            "reading every region",
-                            flush=True,
-                        )
-                        self._listable = False
-                return True
-            if any((iy, ix) in present for iy in y_values for ix in x_values):
-                self._listable = True
-                return True
+        try:
+            present = self._stored_chunks().result()
+        except Exception as error:
+            with self._lock:
+                if self._listable is None:
+                    print(
+                        f"[input] chunk listing unavailable ({type(error).__name__}: {error}); "
+                        "reading every region",
+                        flush=True,
+                    )
+                    self._listable = False
+            return True
         self._listable = True
-        return False
+        return any((iz, iy, ix) in present for iz in z_values for iy in y_values for ix in x_values)
 
     # ---- read-ahead --------------------------------------------------------
 

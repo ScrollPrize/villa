@@ -20,12 +20,17 @@ class _Quiet(http.server.SimpleHTTPRequestHandler):
 
 @pytest.fixture
 def served(tmp_path):
-    """An OME-Zarr group with levels 0 (8³, chunks 4³, sparse) and 1 (4³), served over HTTP."""
+    """An OME-Zarr group with levels 0 (8³, chunks 4³, sparse) and 1 (4³), served over HTTP.
+
+    The multiscale metadata states physical voxel spacing (2.4 µm at level 0), as
+    the open-data volumes do; placement normalizes it to level-0 voxels.
+    """
     remote = tmp_path / "remote"
     group = remote / "volume.zarr"
-    create_group(group).attrs["multiscales"] = [{"version": "0.4", "datasets": [
-        {"path": "0", "coordinateTransformations": [{"type": "scale", "scale": [1, 1, 1]}]},
-        {"path": "1", "coordinateTransformations": [{"type": "scale", "scale": [2, 2, 2]}]},
+    create_group(group).attrs["multiscales"] = [{"version": "0.4", "axes": [
+        {"name": a, "type": "space", "unit": "micrometer"} for a in "zyx"], "datasets": [
+        {"path": "0", "coordinateTransformations": [{"type": "scale", "scale": [2.4, 2.4, 2.4]}]},
+        {"path": "1", "coordinateTransformations": [{"type": "scale", "scale": [4.8, 4.8, 4.8]}]},
     ]}]
     data = np.arange(8 * 8 * 8, dtype=np.uint8).reshape(8, 8, 8)
     level0 = ZarrWriter.create(group / "0", shape=(8, 8, 8), chunks=(4, 4, 4), dtype="|u1", compressor=None, separator="/")
@@ -72,21 +77,19 @@ def test_prefill_level_rejects_bad_connections(served, tmp_path):
         prefill.level_location(url, -1)
 
 
-def test_region_maps_base_voxels_to_each_level():
-    factors = prefill.multiscale_factors({"multiscales": [{"datasets": [
-        {"path": "0", "coordinateTransformations": [{"type": "scale", "scale": [1.0, 1.0, 1.0]}]},
-        {"path": "2", "coordinateTransformations": [{"type": "scale", "scale": [1, 4.0, 4.0, 4.0]}]},
-        {"path": "labels", "coordinateTransformations": [{"type": "scale", "scale": [1, 1, 1]}]},
-    ]}]})
-    assert factors == {0: (1.0, 1.0, 1.0), 2: (4.0, 4.0, 4.0)}
-    assert prefill.multiscale_factors({}) == {}
-    region = (0, 5, 9, 4, 8, 16)  # z0,y0,x0,z1,y1,x1 in base voxels
-    assert prefill.level_chunks_in_region((8, 8, 16), (4, 4, 4), region, (1, 1, 1)) == [
-        (0, 1, 2), (0, 1, 3)]
-    assert prefill.level_chunks_in_region((2, 2, 4), (2, 2, 2), region, (4, 4, 4)) == [(0, 0, 1)]
-    assert prefill.level_chunks_in_region((8, 8, 8), (4, 4, 4), (0, 0, 20, 8, 8, 24), (1, 1, 1)) == []
+def test_region_maps_level0_voxels_to_each_level(served):
+    url, _data = served
+    # Physical 2.4/4.8 µm metadata places level 1 at factor 2 in level-0 voxels.
+    assert prefill.level_placement(url, 0, anon=True) == ((1.0, 1.0, 1.0), (0.0, 0.0, 0.0))
+    factor, offset = prefill.level_placement(url, 1, anon=True)
+    assert factor == (2.0, 2.0, 2.0) and all(abs(v) < 1 for v in offset)
+    unit = ((1.0, 1.0, 1.0), (0.0, 0.0, 0.0))
+    region = (0, 5, 9, 4, 8, 16)  # z0,y0,x0,z1,y1,x1 in level-0 voxels
+    assert prefill.level_chunks_in_region((8, 8, 16), (4, 4, 4), region, unit) == [(0, 1, 2), (0, 1, 3)]
+    assert prefill.level_chunks_in_region((2, 2, 4), (2, 2, 2), region, ((4, 4, 4), (0, 0, 0))) == [(0, 0, 1)]
+    assert prefill.level_chunks_in_region((8, 8, 8), (4, 4, 4), (0, 0, 20, 8, 8, 24), unit) == []
     with pytest.raises(ValueError, match="factor"):
-        prefill.level_chunks_in_region((8, 8, 8), (4, 4, 4), region, (0, 1, 1))
+        prefill.level_chunks_in_region((8, 8, 8), (4, 4, 4), region, ((0, 1, 1), (0, 0, 0)))
 
 
 def test_main_prefills_a_region_of_the_requested_levels(served, tmp_path, capsys):
@@ -147,9 +150,3 @@ def test_volume_list_parses_and_dry_runs(tmp_path, capsys, monkeypatch):
     assert len(calls) == 3
 
 
-def test_group_attributes_are_read_from_the_store(tmp_path):
-    group = tmp_path / "g.zarr"
-    create_group(group).attrs["multiscales"] = [{"datasets": []}]
-    attrs = prefill.read_group_attributes(str(group), anon=True)
-    assert json.dumps(attrs["multiscales"]) == '[{"datasets": []}]'
-    assert prefill.read_group_attributes(str(tmp_path / "missing"), anon=True) == {}

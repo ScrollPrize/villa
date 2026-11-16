@@ -55,7 +55,6 @@ def test_local_level_lists_its_chunks_and_reads_nothing_for_empty_regions(served
         assert source.request_region((0, 4, 0, 8, 0, 8)).result() is True
         np.testing.assert_array_equal(source.reader[0:4, 0:8, 0:8], data[:4])
     snapshot = source.snapshot()
-    assert snapshot["listed_planes"] == 2
     assert snapshot["listed_chunks"] == 4 and snapshot["missing_chunks"] == 4
     assert snapshot["materialized_regions"] == 2
 
@@ -89,6 +88,21 @@ def test_closed_level_refuses_requests_and_keeps_its_counters(served):
     assert source.snapshot()["requested_regions"] == 0
     with pytest.raises(RuntimeError, match="closed"):
         source.request_region((0, 4, 0, 4, 0, 4))
+
+
+def test_zarr_v3_level_inventory_uses_the_stores_key_layout(tmp_path):
+    """A v3 array keys its chunks ``c.z.y.x`` (or ``c/z/y/x``); the inventory must still see them."""
+    data = np.arange(8 * 8 * 8, dtype=np.uint8).reshape(8, 8, 8)
+    array = ZarrWriter.create(tmp_path / "v3.zarr", shape=(8, 8, 8), chunks=(4, 4, 4), dtype="|u1",
+                              compressor=None, version=3)
+    array[0:4, 0:8, 0:8] = data[:4]
+    assert (tmp_path / "v3.zarr" / "zarr.json").is_file()
+    assert any(p.name.startswith("c") and p.name != "zarr.json" for p in (tmp_path / "v3.zarr").iterdir())
+    with InputLevel(tmp_path / "v3.zarr", read_ahead_tiles=2, connections=2) as source:
+        assert source.region_has_chunks((0, 4, 0, 8, 0, 8)) is True
+        assert source.region_has_chunks((4, 8, 0, 8, 0, 8)) is False
+        np.testing.assert_array_equal(source.reader[0:4, 0:8, 0:8], data[:4])
+    assert source.snapshot()["listed_chunks"] == 4
 
 
 def test_rejects_non_3d_input(tmp_path):
