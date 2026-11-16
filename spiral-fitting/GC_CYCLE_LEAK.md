@@ -50,7 +50,7 @@ integrator and sampler at the end of `step()`, or hold the transform weakly in t
 Run any 1500-slice window with `FIT_SPIRAL_GC_POLICY=off` and with the default and compare `torch.cuda.max_memory_allocated()` at iteration ~600.
 
 ## Synthetic reproduction and what the growth depends on (2026-11-16)
-`GC_CYCLE_LEAK` can be reproduced without the fit: a heap of N small objects, then per step a reference cycle that holds a 64 MiB tensor and survives long enough to reach the oldest generation, then is dropped (40 steps, V100):
+The growth can be reproduced without the fit (`pool_offload/gc_cycle_synthetic.py DEVICE HEAP STEPS TENSOR_MiB POLICIES`): a heap of N small objects, then per step a reference cycle that holds a 64 MiB tensor and survives long enough to reach the oldest generation, then is dropped (40 steps, V100):
 | interpreter | heap | default collector | `freeze` (gc.freeze once, then a full collection every step) |
 |---|---|---|---|
 | Python 3.11 | 1e5 and 2e7 objects | 2,560 MiB (all 40 steps kept) | 64 MiB |

@@ -88,15 +88,24 @@ allows `cuMemHostRegister` (the pool maps its page-locked memory into the card's
 
 **Time:** besides the memory switches, the branch builds an ingested store in seconds to minutes (`--bulk`, claim 10). The time the switches cost: about 1 % per iteration for the offload, and for `freeze` a sub-millisecond collection per step (claim 2).
 
-## Measured on a 16 GB card, this branch's own `fit_spiral.py` (2026-11-16)
-PHerc0343 at full height (z 0-17,998, shell 250, 32-voxel flow grid), its real 10.81 GiB lasagna pool, hub V100-SXM2-16GB (15.77 GiB; a 1.77 GiB desktop process also sits on the card), 60 iterations and then the mesh export.
-Inputs: 45,007 tracks (0.24 % of the scroll's tracks, so the input read takes minutes, not hours) plus a 3.65 GiB tensor held on the card for the device memory of the other tracks (the whole-store track term was measured at 3.66 GiB on this scroll), so the card sees the
-full-store footprint. One run per arm.
-| arm | outcome |
-|---|---|
-| `FIT_SPIRAL_GC_POLICY=freeze` + `FIT_SPIRAL_POOL_OFFLOAD=1` + export guard (all on) | completed 60 iterations and wrote 492 of 492 windings; torch peak 12.31 GiB, nvidia-smi peak 15,072 MiB |
-| all off | `torch.OutOfMemoryError` while loading the pool: 10.81 GiB requested, 10.08 GiB free |
-| `freeze`, no offload | the same error at pool load (the pool is resident) |
-| offload on, GC off | completed; the same peaks as the all-on arm: at this heap size the GC policy made no difference |
-So on a 16 GB card it is the offload that makes the fit start and run. The last row is why the GC claim needs its own evidence (next section of `GC_CYCLE_LEAK.md`).
-Not shown: a 4060 Ti run (staged, not finished at the time of writing), the full-store input, the 16-voxel grid, more than 60 iterations.
+## Measured on 16 GB cards, this branch's `fit_spiral.py` (2026-11-16)
+Configuration: PHerc0343 at full height (z 0-17,998, shell 250, 32-voxel flow grid), its real 10.81 GiB lasagna pool, 60 iterations followed by the mesh export. Inputs: 45,007 tracks (0.24 % of the scroll's tracks) plus a 3.65 GiB tensor held on the card in place of the device memory of the remaining tracks (the full-store track term was measured at 3.66 GiB on this scroll), so the card sees the full-store footprint. One run per row.
+
+| card | switches | outcome |
+|---|---|---|
+| V100-SXM2-16GB (15.77 GiB; 1.77 GiB used by a desktop process) | `FIT_SPIRAL_GC_POLICY=freeze`, `FIT_SPIRAL_POOL_OFFLOAD=1`, `FIT_SPIRAL_EXPORT_FREE=1` | completed 60 iterations, wrote 492 of 492 windings; torch peak 12.31 GiB, nvidia-smi peak 15,072 MiB |
+| V100-SXM2-16GB | all off | `torch.OutOfMemoryError` while loading the pool (10.81 GiB requested, 10.08 GiB free) |
+| V100-SXM2-16GB | `freeze` only | the same error at pool load (the pool is resident) |
+| V100-SXM2-16GB | offload on, GC policy off | completed; same peaks as the first row (with this heap size the GC policy made no difference) |
+| RTX 4060 Ti (16,380 MiB) | `freeze`, offload, export guard | completed and wrote 490 of 490 windings; torch peak 12.25 GiB, nvidia-smi peak 14,069 MiB; 63 full collections, 2.07 s in total; the freeze was released at exit |
+
+On a 16 GB card the offload is what allows the pool to load and the fit to run. The GC policy matters when the Python heap is large; see `GC_CYCLE_LEAK.md`.
+Not covered: the full-store input read, the 16-voxel grid, and runs longer than 60 iterations.
+
+## Runtime requirements
+- A CUDA-capable NVIDIA driver and a PyTorch build that matches the card (for example the cu126 wheel for V100).
+- A C compiler (`gcc`) and the Python development headers for the interpreter in use, including the architecture-specific `pyconfig.h`: Triton compiles a small C helper at the first CUDA call. On Debian and Ubuntu: `apt install gcc python3-dev` (or `libpython3.X-dev` for a non-system interpreter). If the headers live outside the default search path, set `C_INCLUDE_PATH`.
+- The native `vc_object_store` module and its shared libraries; `ldd` on the built `_native*.so` should report none as `not found`. Build prerequisites are in `vc_reader/README.md`.
+- 16 GB of GPU memory is enough for the configuration above with `FIT_SPIRAL_POOL_OFFLOAD=1`; without it the 10.81 GiB pool must fit on the card next to the model.
+
+A host can be checked before a fit with a short script: import `torch`, run one CUDA kernel, and import `vc_object_store`, `vc_spiral`, `vc_reader` and `fit_spiral`. Failures at these steps name the missing component.
