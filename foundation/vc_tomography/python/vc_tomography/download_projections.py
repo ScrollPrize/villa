@@ -409,9 +409,10 @@ def _drop_connection():
         _CONNECTION = None
 
 
-def _fetch(sftp, remote_path, local_path, dataset, head):
+def _fetch(sftp, remote_path, local_path, dataset, head, select=None):
     """Copy the HDF5 metadata and the first `head` + last _TAIL bytes of each chunk of `dataset` into a sparse
-    local file (None: the whole file). Returns the chunk ranges fetched (None if whole) and bytes transferred."""
+    local file (None: the whole file). Returns the chunk ranges fetched (None if whole) and bytes transferred.
+    select(chunk_offset, chunk_shape), when given, instead names the chunks to fetch whole (head is ignored)."""
     import io
     block = 1 << 16
     with sftp.open(remote_path, "rb") as f:
@@ -419,7 +420,7 @@ def _fetch(sftp, remote_path, local_path, dataset, head):
         out = os.open(local_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
             os.ftruncate(out, size)
-            if head is None:
+            if head is None and select is None:
                 pieces = [(o, min(1 << 20, size - o)) for o in range(0, size, 1 << 20)]
                 for (o, _), data in zip(pieces, f.readv(pieces)):
                     os.pwrite(out, data, o)
@@ -449,10 +450,15 @@ def _fetch(sftp, remote_path, local_path, dataset, head):
             with h5py.File(Metadata(), "r") as h:
                 d = h[dataset].id
                 chunks = [d.get_chunk_info(i) for i in range(d.get_num_chunks())]
+                shape = d.get_create_plist().get_chunk()
             for k, data in blocks.items():
                 os.pwrite(out, data, k * block)
             ranges = []
             for c in chunks:
+                if select is not None:
+                    if select(c.chunk_offset, shape):
+                        ranges.append((c.byte_offset, c.size))
+                    continue
                 ranges.append((c.byte_offset, min(head, c.size)))
                 if c.size > head:
                     tail = min(_TAIL, c.size - head)
