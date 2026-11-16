@@ -164,7 +164,7 @@ def check(args):
     for record in records(args.records):
         final = record.read(rec.FINAL_REVIEW) if record.exists(rec.FINAL_REVIEW) else {}
         decision = final.get("decision")
-        if not decision or not record.exists(rec.FIT):
+        if not decision or decision["publish"] == "nothing" or not record.exists(rec.FIT):
             continue
         pair, fit = record.read(rec.PAIR), record.read(rec.FIT)
         result = score(record.read(rec.TRANSFORM), record.read(rec.HOLDOUT),
