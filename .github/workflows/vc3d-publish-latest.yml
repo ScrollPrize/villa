@@ -164,8 +164,20 @@ jobs:
           git fetch --no-tags origin refs/tags/latest
           old_oid="$(git rev-parse FETCH_HEAD)"
           archive_tag="vc3d-archive-latest-$release_id"
-          # A non-forced push accepts an identical alias but never overwrites one.
-          git push origin "$old_oid:refs/tags/$archive_tag"
+          # Create the alias through the REST API, not git push: a GITHUB_TOKEN
+          # push of a tag at an older commit can be refused ("refusing to allow
+          # a GitHub App to create or update workflow ... without `workflows`
+          # permission") once workflow files have changed on main since, and
+          # that token cannot be granted the workflows permission.
+          # Accept an identical existing alias; never overwrite a different one.
+          if ! gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+              -f "ref=refs/tags/$archive_tag" -f "sha=$old_oid" >/dev/null; then
+            existing="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$archive_tag" --jq '.object.sha')"
+            if [[ "$existing" != "$old_oid" ]]; then
+              echo "::error::$archive_tag exists at $existing, expected $old_oid"
+              exit 1
+            fi
+          fi
           gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$release_id" \
             -f "tag_name=$archive_tag" >/dev/null
 
