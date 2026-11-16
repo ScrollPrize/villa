@@ -189,10 +189,12 @@ def _gc_freeze_acquire(owner):
 
 
 def _gc_freeze_release(owner):
-    """End the freeze for every context when `owner` held it; idempotent, and a no-op for a context that never froze."""
+    """End any fitter-owned freeze on a context's teardown or rebuild, for every context. `owner` need not be registered: its heap may have been
+    frozen by another session before its first step, or after a release cleared the registrations while it stayed alive. A no-op only when no freeze
+    is active."""
     global _GC_FREEZE_EPOCH
     with _GC_FREEZE_LOCK:
-        if id(owner) not in _GC_FREEZE_OWNERS:
+        if not _GC_FREEZE_OWNERS:
             return
         _GC_FREEZE_OWNERS.clear()
         _GC_FREEZE_EPOCH += 1

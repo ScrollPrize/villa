@@ -123,8 +123,9 @@ def test_the_gather_stays_on_the_pools_card_when_another_device_becomes_current(
     if torch.cuda.device_count() < 2:
         pytest.skip("needs two CUDA devices")
     Off = brick_pool_offload.offload_class(scc)
-    pool = Off(sidecar[0], device="cuda:1", label="card1")
     torch.cuda.set_device(0)
+    pool = Off(sidecar[0], device="cuda:1", label="card1")
+    assert torch.cuda.current_device() == 0, "building an offloaded pool must not change the caller's current device"
     idx = torch.tensor([[0, 0, 0], [15, 63, 79], [16, 0, 0], [47, 63, 79], [30, 31, 40]], device="cuda:1")
     out = pool.gather(idx)
     torch.cuda.synchronize(1)

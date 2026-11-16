@@ -43,13 +43,43 @@ def test_any_release_ends_the_freeze_for_everybody_and_the_others_refreeze_at_th
     assert gc.get_freeze_count() > 0 and b._gc_epoch == fs._gc_freeze_epoch()
 
 
-def test_release_is_idempotent_and_ignores_strangers():
-    owner = _context()
-    fs._gc_freeze_release(owner)           # never froze
+def test_release_is_a_no_op_only_when_no_freeze_is_active_and_a_stranger_ends_an_active_one():
+    owner, stranger = _context(), _context()
     epoch = fs._gc_freeze_epoch()
+    fs._gc_freeze_release(stranger)                  # nothing frozen: nothing to do
+    assert fs._gc_freeze_epoch() == epoch and gc.get_freeze_count() == 0
     _step(owner)
-    fs._gc_freeze_release(owner); fs._gc_freeze_release(owner)
+    fs._gc_freeze_release(stranger)                  # a context that never stepped still thaws an active freeze (its heap may be inside it)
     assert gc.get_freeze_count() == 0 and fs._gc_freeze_epoch() == epoch + 1
+    fs._gc_freeze_release(owner)                     # already thawed: idempotent
+    assert fs._gc_freeze_epoch() == epoch + 1
+
+
+def test_a_context_frozen_by_another_session_before_its_first_step_still_thaws_its_cycles_on_close():
+    """Review: C froze while B was alive but had not stepped; closing B must free B's discarded cycles."""
+    b_cycle = _Cycle()
+    ref = weakref.ref(b_cycle)
+    b, c = _context(), _context()                    # B exists (heap alive) but never steps
+    _step(c)                                         # C's first step freezes everything alive, including B's cycle
+    del b_cycle
+    gc.collect()
+    assert ref() is not None
+    fs._gc_freeze_release(b)                         # B is not a registered owner, yet its teardown must end the freeze
+    assert ref() is None
+
+
+def test_a_context_whose_registration_was_cleared_while_alive_still_thaws_on_close():
+    """Review: after another context's release cleared the owners, a session that was re-frozen by a third one must still thaw."""
+    a, b, c = _context(), _context(), _context()
+    _step(a); _step(b)
+    fs._gc_freeze_release(a)                         # clears every registration, bumps the epoch
+    b_cycle = _Cycle(); ref = weakref.ref(b_cycle)   # B's discarded stage, alive when C freezes
+    _step(c)                                         # C re-freezes (B has not stepped since)
+    del b_cycle
+    gc.collect()
+    assert ref() is not None
+    fs._gc_freeze_release(b)
+    assert ref() is None
 
 
 def test_a_rebuilt_context_frees_its_discarded_cycles_while_another_context_is_active():

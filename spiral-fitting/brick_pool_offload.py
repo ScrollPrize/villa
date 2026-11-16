@@ -106,10 +106,13 @@ def offload_class(scc):
                     ids = kept_ids[lo:lo + slab]; self.host_pool[channel, lo:lo + len(ids)] = mm[ids]; done += len(ids)
                     if progress_callback is not None: progress_callback(done, total, f"channel {channel + 1}/{self.channels} (host RAM)")
             di = dev.index if dev.index is not None else torch.cuda.current_device()
-            self._dptr = _register(self.host_pool, di)
+            with torch.cuda.device(di):                                  # _register() sets the device: leave the caller's current device as it was
+                self._dptr = _register(self.host_pool, di)
             self._finalizer = weakref.finalize(self, _unregister, self.host_pool)   # ownership of the registration starts here and ends in close(), a failed construction or garbage collection
             try:
-                self._mod = _module(di); self._dev_index = di
+                with torch.cuda.device(di):
+                    self._mod = _module(di)
+                self._dev_index = di
                 self.pool = None                                             # nothing of the pool on the card
                 self._verify_left = int(os.environ.get("FIT_SPIRAL_POOL_OFFLOAD_VERIFY", "0")); self._verify = dict(gathers=0, lookups=0, mismatched_values=0)
                 if self._verify_left:                                        # VERIFY mode (identity test only): a resident copy on the card, every offloaded gather compared with it

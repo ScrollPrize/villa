@@ -541,24 +541,29 @@ RelationshipVersion EdgeRecord::reference() const
 std::vector<SelectedRelationship> ObjectStore::relationshipsAt(const Txn& txn, const std::vector<ObjectVersion>& versions) const
 {
     std::vector<ObjectRevision> selection;
-    detail::ScopedReadTimer timer(detail::readTiming().relationshipResolve);
-    for (const auto& reference : versions) {
-        const auto revision = objectAtVersion(txn, reference);
-        if (!revision)
-            throw std::invalid_argument("object history: version " + std::to_string(reference.version) + " of " +
-                                        reference.objectUuid + " is not recorded in this store and generation");
-        selection.push_back(*revision);
+    {
+        // The timer covers the resolution only: the traversal below is timed by the revision overload (and its own phases), never twice.
+        detail::ScopedReadTimer timer(detail::readTiming().relationshipResolve);
+        for (const auto& reference : versions) {
+            const auto revision = objectAtVersion(txn, reference);
+            if (!revision)
+                throw std::invalid_argument("object history: version " + std::to_string(reference.version) + " of " +
+                                            reference.objectUuid + " is not recorded in this store and generation");
+            selection.push_back(*revision);
+        }
     }
     return relationshipsAt(txn, selection);
 }
 
 std::vector<SelectedRelationship> ObjectStore::relationshipsAt(const Txn& txn, const std::vector<ObjectRevision>& selection) const
 {
-    std::set<std::string> selected;
-    detail::ScopedReadTimer timer(detail::readTiming().relationshipResolve);
-    for (const auto& revision : selection)
-        if (!selected.insert(revision.objectUuid).second)
-            throw std::invalid_argument("object history: object selected twice: " + revision.objectUuid);
+    {
+        std::set<std::string> selected;
+        detail::ScopedReadTimer timer(detail::readTiming().relationshipResolve);          // the duplicate check only, not the traversal
+        for (const auto& revision : selection)
+            if (!selected.insert(revision.objectUuid).second)
+                throw std::invalid_argument("object history: object selected twice: " + revision.objectUuid);
+    }
     return relationshipsAtSelected(txn, selection);
 }
 
