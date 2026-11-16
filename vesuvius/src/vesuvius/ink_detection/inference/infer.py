@@ -8,6 +8,7 @@ import argparse
 import json
 import logging
 import math
+import os
 import shutil
 import tempfile
 import threading
@@ -882,6 +883,29 @@ class ChunkAccumulator:
             self._flush(key)
 
 
+def keep_worker_descriptors_private(_worker_id: int) -> None:
+    """Stop a spawned worker's helper processes from inheriting its descriptors.
+
+    With torch's file_system sharing strategy (the only one on macOS) each
+    worker starts a torch_shm_manager. It inherits the pipe the parent watches
+    to see the worker exit and outlives the worker, so every join in the
+    DataLoader shutdown waits its full 5 s timeout after the worker has gone.
+    """
+
+    if torch.multiprocessing.get_sharing_strategy() != "file_system":
+        return
+    try:
+        descriptors = [int(name) for name in os.listdir("/dev/fd")]
+    except (OSError, ValueError):
+        return
+    for descriptor in descriptors:
+        if descriptor > 2:
+            try:
+                os.set_inheritable(descriptor, False)
+            except OSError:
+                pass
+
+
 class ThreadedBatchLoader:
     """Ordered batches read by a thread pool, avoiding spawn-worker startup.
 
@@ -1374,6 +1398,7 @@ def infer_single_zarr(
             persistent_workers=True,
             prefetch_factor=args.prefetch_factor,
             multiprocessing_context="spawn",
+            worker_init_fn=keep_worker_descriptors_private,
         )
     if args.loader_threads > 0:
         loader = ThreadedBatchLoader(
