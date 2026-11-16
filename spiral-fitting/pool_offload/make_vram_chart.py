@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""VRAM per Route B spiral fit, per scroll, per flow-voxel grid, with GC and GC + pool offload (user 2026-11-13).
+"""VRAM per spiral fit, per scroll, per flow-voxel grid, with GC and GC + pool offload (user 2026-11-13).
 Model = rb_mem_table.py (this folder) (calibrated on PHerc0343 full height: 20.5 / 28.8 GiB predicted vs 20.1 / 28.2 measured, 32- / 16-voxel grid).
 Measured diamonds = measured.json (+ proof.json when the 16-voxel proof runs have a sampler CSV).
 usage: make_vram_chart.py OUTDIR   -> vram_chart.png, vram_table.csv, vram_table.md"""
@@ -31,7 +31,7 @@ BG, FG, GR = "#faf7f2", "#232323", "#8a857c"
 plt.rcParams.update({"font.family": "DejaVu Sans", "text.color": FG, "axes.edgecolor": GR, "axes.labelcolor": FG, "xtick.color": FG, "ytick.color": FG})
 fig = plt.figure(figsize=(21, 18), dpi=150, facecolor=BG)
 gs = fig.add_gridspec(1, 2, left=0.158, right=0.99, top=0.80, bottom=0.145, wspace=0.10)
-fig.text(0.015, 0.968, "How much GPU memory does one whole-height Route B spiral fit need?", fontsize=26, fontweight="bold", va="top")
+fig.text(0.015, 0.968, "How much GPU memory does one whole-height spiral fit need?", fontsize=26, fontweight="bold", va="top")
 fig.text(0.015, 0.935, "Per scroll and per flow-voxel grid, as predicted by the calibrated memory model: what the Python garbage-collection hook saves, and what moving the lasagna brick pool\n"
          "to pinned host RAM saves on top. Dashed red line = the 31.7 GiB of one V100-32; dotted = a 23.6 GiB RTX 3090. Diamonds = nvidia-smi measurements on real fits.", fontsize=13.5, va="top", color="#4a463f", linespacing=1.5)
 res_rows = []

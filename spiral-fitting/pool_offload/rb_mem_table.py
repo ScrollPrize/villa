@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Route B (fit_spiral) GPU-memory model and tables for docs/ROUTEB_MEMORY.md (sheetgeom study 2026-10-29).
+"""Spiral-fit (fit_spiral) GPU-memory model and tables, see ../POOL_OFFLOAD.md.
 
 peak_GiB(H, shell, r) = pool(H) + tracks(H) + flow_r * (H + 320)/1000 + N_GAP * gap(H, shell) + act_r * H/1000
   H      fit height in L0 slices (z_end - z_begin);  shell = shell_outer_winding_idx;  cap = shell + 14 (gap-expander capacity, arm142.sh)
@@ -11,7 +11,7 @@ peak_GiB(H, shell, r) = pool(H) + tracks(H) + flow_r * (H + 320)/1000 + N_GAP * 
   N_GAP  live copies WITH the periodic garbage-collection fix (measured 5-7 at z 16,300, shell 250; 11-17 at z 1,500); WITHOUT it the
          copies accumulate ~2 per iteration until Python's cyclic GC runs (up to ~200 measured), which is what OOMed every long fit
   act_r  transient per-step tensors (peak - live census) per 1000 slices (sample counts scale with H): measured 0.213 GiB (r=32, full 343)
-All coefficients are disclosed parameters (D33) with their measurement in docs/ROUTEB_MEMORY.md.  usage: rb_mem_table.py [--json OUT]"""
+All coefficients are disclosed parameters (D33) with their measurement in ../POOL_OFFLOAD.md.  usage: rb_mem_table.py [--json OUT]"""
 import json, math, sys
 
 FLOW = {8: 8 * 0.555, 16: 0.555, 32: 0.0698}
