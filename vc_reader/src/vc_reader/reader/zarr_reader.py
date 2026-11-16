@@ -386,6 +386,26 @@ class ZarrReader:
             raise ValueError("reader is closed")
         return self._array.stats()
 
+    def prefill(self, *, cancel=None, progress=None):
+        """Fetch every chunk of the array into the disk cache (``cache_dir`` at open).
+
+        ``progress(done, total)`` is called as chunks resolve; ``cancel`` is a
+        :class:`vc_reader._reader.CacheCancellation`. Returns the native
+        ``PrefillResult`` (``status``, ``total_chunks``, ``fetched_chunks``,
+        ``empty_chunks``, ``error_chunks``, ``message``).
+        """
+        self._check_process()
+        if self._array is None:
+            raise ValueError("reader is closed")
+        return _reader.prefill(self._array, cancel, progress)
+
+    def prefill_chunks(self, chunks: Sequence[Sequence[int]], *, cancel=None, progress=None):
+        """As :meth:`prefill`, for the listed chunk-grid indices only (for example a crop's)."""
+        self._check_process()
+        if self._array is None:
+            raise ValueError("reader is closed")
+        return _reader.prefill_chunks(self._array, [[int(v) for v in chunk] for chunk in chunks], cancel, progress)
+
     # -- reads ---------------------------------------------------------------------
 
     def read(self, selection, *, out=None, dtype=None):
