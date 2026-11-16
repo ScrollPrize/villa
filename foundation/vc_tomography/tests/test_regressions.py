@@ -7,11 +7,11 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-import helirec
-from helirec import _core, calibration
-from helirec.recon import CALIBRATION_KEYS, DEFAULTS, LEGACY_REFERENCE, HelicalRecon, legacy_reference_config
+import vc_tomography
+from vc_tomography import _core, calibration
+from vc_tomography.recon import CALIBRATION_KEYS, DEFAULTS, LEGACY_REFERENCE, HelicalRecon, legacy_reference_config
 
-DEVICES = helirec.devices()
+DEVICES = vc_tomography.devices()
 
 
 # ---------------------------------------------------------------- gridrec bounds and even-grid centring
@@ -88,7 +88,7 @@ def test_projector_transpose_on_boundaries(device, projector):
 def test_merged_frame_from_the_geometry_calibration():
     """the frame the scans are merged in: one axis and one vector from the poses (medians over the helix, on a
     quarter-pixel grid), and the placement that follows"""
-    from helirec import geometry
+    from vc_tomography import geometry
     n = 40
     cal = dict(layout=dict(frames=[dict(rest1=10, helix=20, rest2=10)] * 2, row_sign=-1.0))
     H = [np.linspace(0, 30, n), np.linspace(0, 30, n) + 0.5]                 # (the record: the second scan half a row on)
@@ -129,7 +129,7 @@ def test_calibration_parameters():
 def test_geometry_calibration_is_made_once_and_kept(tmp_path):
     """no geometry given: geometry.json of the cache directory, made by the geometry calibration step when it is not
     there or is other scans', and read from then on; a given file is used as it is and nothing is made
-    (helirec::geometry_calibration_file)"""
+    (vc_tomography::geometry_calibration_file)"""
     made = []
 
     def step(scans, row_time, device):
@@ -180,15 +180,15 @@ PAG = [{"type": "paganin", "delta_beta": 1000}, {"type": "unsharp", "sigma": 1.2
 
 @pytest.mark.parametrize("device", DEVICES)
 def test_paganin_constant_and_chunk_invariance(device):
-    assert helirec.filter_margin(PAG, legacy_reference=True, **PH) == 20       # the reference's margin
-    m = helirec.filter_margin(PAG, **PH)
+    assert vc_tomography.filter_margin(PAG, legacy_reference=True, **PH) == 20       # the reference's margin
+    m = vc_tomography.filter_margin(PAG, **PH)
     assert m == 20 + 11                  # fused Paganin + unsharp: the sum of the kernels' supports
     W = 400
     gains = {}
     for legacy, mm in ((False, m), (True, 20)):
         for h in (1, 2, 8, 64):
             a = np.ones((1, h + 2 * mm, W), np.float32)
-            out = helirec.apply_filters(a, PAG, mm, device=device, legacy_reference=legacy, **PH)[0, mm:mm + h]
+            out = vc_tomography.apply_filters(a, PAG, mm, device=device, legacy_reference=legacy, **PH)[0, mm:mm + h]
             gains[legacy, h] = float(out[:, W // 2].mean())
     for h in (1, 2, 8, 64):
         assert abs(gains[False, h] - 1) < 2e-6, gains
@@ -196,10 +196,10 @@ def test_paganin_constant_and_chunk_invariance(device):
     # chunk invariance: rows of one frame, filtered in chunks of different heights, agree
     rng = np.random.default_rng(0)
     frame = (1 + 0.05 * rng.standard_normal((80 + 2 * m, W))).astype(np.float32)
-    big = helirec.apply_filters(frame[None], PAG, m, device=device, **PH)[0, m:m + 80]
+    big = vc_tomography.apply_filters(frame[None], PAG, m, device=device, **PH)[0, m:m + 80]
     for h in (1, 4, 16):
         for r0 in (0, 33):
-            part = helirec.apply_filters(frame[None, r0:r0 + h + 2 * m].copy(), PAG, m, device=device, **PH)[0, m:m + h]
+            part = vc_tomography.apply_filters(frame[None, r0:r0 + h + 2 * m].copy(), PAG, m, device=device, **PH)[0, m:m + h]
             assert np.abs(part - big[r0:r0 + h]).max() < 1e-6, (h, r0)
 
 

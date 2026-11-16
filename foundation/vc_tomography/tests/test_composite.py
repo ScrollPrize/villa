@@ -1,4 +1,4 @@
-"""helirec-composite (tools/helirec_composite.cpp) and BandComposite (helirec/surface_composite.hpp): a flat synthetic
+"""vc_tomography_composite (tools/vc_tomography_composite.cpp) and BandComposite (vc_tomography/surface_composite.hpp): a flat synthetic
 surface over a synthetic OME-Zarr volume whose values rise along z (volume mode, through the tool), and the layers of
 a surface reconstructed straight from the projections of the synthetic acquisition of test_reconstruct_tool.py, against
 the same points of whole reconstructed slices."""
@@ -11,15 +11,15 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from helirec import _core
-from helirec.band import BandComposite
-from helirec.recon import HelicalRecon
+from vc_tomography import _core
+from vc_tomography.band import BandComposite
+from vc_tomography.recon import HelicalRecon
 
 tifxyz = pytest.importorskip("vc_reader.tifxyz")
 tifffile = pytest.importorskip("tifffile")
 from test_reconstruct_tool import acquisition  # noqa: E402,F401  (the fixture)
 
-TOOL = next((str(t) for t in (Path(_core.__file__).resolve().parent / "helirec-composite",) if t.exists()), None) or shutil.which("helirec-composite")
+TOOL = next((str(t) for t in (Path(_core.__file__).resolve().parent / "vc_tomography_composite",) if t.exists()), None) or shutil.which("vc_tomography_composite")
 
 
 def _plane(path, z, rows=40, cols=60, x0=10.0, y0=12.0):
@@ -30,7 +30,7 @@ def _plane(path, z, rows=40, cols=60, x0=10.0, y0=12.0):
     return str(path)
 
 
-@pytest.mark.skipif(TOOL is None, reason="helirec-composite is not built")
+@pytest.mark.skipif(TOOL is None, reason="vc_tomography_composite is not built")
 def test_volume_composites(tmp_path):
     vol = (np.arange(64, dtype=np.float32)[:, None, None] * 2 + np.zeros((64, 80, 96), np.float32)).astype(np.uint8)  # 2 z
     w = _core.OmeZarrWriter(str(tmp_path / "v.zarr"), vol.shape, np.uint8, chunks=(32, 32, 32))

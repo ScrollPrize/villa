@@ -15,10 +15,10 @@
 #include <string>
 #include <vector>
 
-#include "helirec/tomo.hpp"
+#include "vc_tomography/tomo.hpp"
 #include "tomo_core.hpp"
 
-namespace helirec::tomo_algos {
+namespace vc_tomography::tomo_algos {
 
 enum Slot { kMask, kTmp, kUpd, kWrows, kSd, kInitWeights };
 
@@ -120,4 +120,4 @@ void run(B& b, const TomoArgs& a, const float* rows, const float* weights, float
     }
 }
 
-}  // namespace helirec::tomo_algos
+}  // namespace vc_tomography::tomo_algos

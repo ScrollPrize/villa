@@ -21,7 +21,7 @@
 #define HR_SIMD
 #endif
 
-namespace helirec::hd {
+namespace vc_tomography::hd {
 
 HR_HD float fma(float a, float b, float c) {
 #if defined(__CUDA_ARCH__)
@@ -138,4 +138,4 @@ HR_HD bool is_finite(float x) {
 HR_HD int imin(int a, int b) { return a < b ? a : b; }
 HR_HD int imax(int a, int b) { return a > b ? a : b; }
 
-}  // namespace helirec::hd
+}  // namespace vc_tomography::hd

@@ -106,7 +106,7 @@ wheels = [
 ]
 
 [[package]]
-name = "helirec"
+name = "vc-tomography"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [

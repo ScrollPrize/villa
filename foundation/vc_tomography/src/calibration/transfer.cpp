@@ -1,10 +1,10 @@
-#include "helirec/calibration/transfer.hpp"
+#include "vc_tomography/calibration/transfer.hpp"
 #include "calibration/ceres_support.hpp"
 #include "calibration/model_math.hpp"
 #include <array>
 #include <set>
 
-namespace helirec::calibration {
+namespace vc_tomography::calibration {
 namespace {
 template <class T> T gain(const T* p, double frequency) {
     using std::exp;

@@ -1,6 +1,6 @@
 #pragma once
 #include <cmath>
-namespace helirec::calibration::fitting {
+namespace vc_tomography::calibration::fitting {
 template <class S> S sinc_pi(const S& a) {
     using std::sin;
     const S z = S(M_PI)*a;

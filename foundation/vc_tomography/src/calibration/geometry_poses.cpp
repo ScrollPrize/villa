@@ -1,6 +1,6 @@
-// helirec/geometry.hpp: the detector's map, the poses of every frame from a geometry calibration, and the
+// vc_tomography/geometry.hpp: the detector's map, the poses of every frame from a geometry calibration, and the
 // reconstruction's per-projection terms.
-#include "helirec/geometry.hpp"
+#include "vc_tomography/geometry.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -13,7 +13,7 @@
 #include "calibration/util.hpp"
 #include "io/json.hpp"
 
-namespace helirec::geometry {
+namespace vc_tomography::geometry {
 
 namespace {
 
@@ -134,7 +134,7 @@ double overlap_centre_of(const Json& lay) {
     return overlap_centre(static_cast<int>(number(lay, "cols", "the layout")), number(lay, "coarse_move", "the layout"));
 }
 
-// whether the calibration is the joint model's (helirec/calibration/geometry_calibration.hpp)
+// whether the calibration is the joint model's (vc_tomography/calibration/geometry_calibration.hpp)
 bool is_joint(const Json& cal) {
     const Json* m = cal.find("model");
     return m && m->is(Json::String) && m->string == "joint";
@@ -307,7 +307,7 @@ std::array<std::size_t, 2> Calibration::helix_frames() const {
 
 namespace {
 
-// One scan's poses under a joint calibration (helirec/geometry.hpp states what the poses are), frame by frame of
+// One scan's poses under a joint calibration (vc_tomography/geometry.hpp states what the poses are), frame by frame of
 // the stretches the calibration holds of it; `placed`: per frame whether it is of one (the others stay at zero).
 // own: in the scan's own frame, its place d and height left out. The rows are the model's (not counted from any
 // origin).
@@ -498,7 +498,7 @@ std::size_t Calibration::scan_count() const {
 }
 
 std::vector<Poses> Calibration::scan_poses(const std::vector<std::vector<double>>& ang, const std::vector<std::vector<double>>& H, std::string* not_applied) const {
-    if (!is_joint(*doc_)) throw Error("geometry: the poses of any number of scans are a joint calibration's (helirec-calibration geometry)");
+    if (!is_joint(*doc_)) throw Error("geometry: the poses of any number of scans are a joint calibration's (vc_tomography_calibration geometry)");
     return joint_poses(*doc_, rows(), ang, H, false, not_applied);
 }
 
@@ -874,4 +874,4 @@ Terms TileGeometry::reconstruction_terms(const std::string& tile, const std::vec
     return out;
 }
 
-}  // namespace helirec::geometry
+}  // namespace vc_tomography::geometry

@@ -4,9 +4,9 @@
 #include <cstdint>
 #include <string>
 
-#include "helirec/common.hpp"
+#include "vc_tomography/common.hpp"
 
-namespace helirec::calibration {
+namespace vc_tomography::calibration {
 
 inline std::int64_t days_from_civil(std::int64_t y, unsigned m, unsigned d) {
     y -= m <= 2;
@@ -91,4 +91,4 @@ inline std::int64_t iso_ms(const std::string& s) {
     return us >= 0 ? us / 1000 : -((-us + 999) / 1000);
 }
 
-}  // namespace helirec::calibration
+}  // namespace vc_tomography::calibration

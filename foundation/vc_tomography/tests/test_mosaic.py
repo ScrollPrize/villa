@@ -1,8 +1,8 @@
-"""helirec.mosaic: what a description of the tiles' geometry says of a frame (frame_pose), and the per-projection
+"""vc_tomography.mosaic: what a description of the tiles' geometry says of a frame (frame_pose), and the per-projection
 terms the reconstruction of one tile is given (reconstruction_terms). No frames are read."""
 import numpy as np
 
-from helirec import mosaic as M
+from vc_tomography import mosaic as M
 
 ROWS, COLS, N = 2368, 4416, 10000
 

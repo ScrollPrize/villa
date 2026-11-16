@@ -3,11 +3,11 @@ import h5py
 import numpy as np
 import pytest
 
-import helirec
-from helirec import _core
+import vc_tomography
+from vc_tomography import _core
 
 
-@pytest.mark.parametrize("device", helirec.devices())
+@pytest.mark.parametrize("device", vc_tomography.devices())
 @pytest.mark.parametrize("projector", ["sf", "chord"])
 @pytest.mark.parametrize("weighting", ["mask", "confidence"])
 def test_sirt_explicit_matrix(device, projector, weighting):
@@ -32,7 +32,7 @@ def test_sirt_explicit_matrix(device, projector, weighting):
     np.testing.assert_allclose(actual.ravel(), x, atol=3e-6, rtol=3e-5)
 
 
-@pytest.mark.parametrize("device", helirec.devices())
+@pytest.mark.parametrize("device", vc_tomography.devices())
 @pytest.mark.parametrize("init", ["constant", "gridrec"])
 def test_unmeasured_values_never_enter_solver_or_initialization(device, init):
     n, nd = 17, 24
@@ -105,7 +105,7 @@ def recon(scan, device, **kw):
     return _core.SliceReconstructor(scan if isinstance(scan, list) else [scan], cfg)
 
 
-@pytest.mark.parametrize("device", helirec.devices())
+@pytest.mark.parametrize("device", vc_tomography.devices())
 @pytest.mark.parametrize("filters", [[], [{"type": "paganin", "delta_beta": 1000.}]])
 def test_helical_mask_and_chunk_invariance(tmp_path, device, filters):
     scan, *_ = helical_scan(tmp_path, holes=True)
@@ -128,7 +128,7 @@ def test_helical_mask_and_chunk_invariance(tmp_path, device, filters):
         np.testing.assert_allclose(chunk["slices"] * units, cpu["slices"] * units, atol=2e-6, rtol=2e-4)
 
 
-@pytest.mark.parametrize("device", helirec.devices())
+@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_next_chunk_read_ahead(tmp_path, device):
     # reading the next chunk in the background (reusing the rows it shares with this one) changes nothing
     scan, *_ = helical_scan(tmp_path)
@@ -140,10 +140,10 @@ def test_next_chunk_read_ahead(tmp_path, device):
     np.testing.assert_array_equal(np.concatenate(ahead), np.concatenate(plain))
     assert np.abs(plain[1]).max() > 0
     del r
-    helirec.release_pinned_memory()
+    vc_tomography.release_pinned_memory()
 
 
-@pytest.mark.parametrize("device", helirec.devices())
+@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_log_before_fractional_vertical_rebinning(tmp_path, device):
     scan, angles, z, raw = helical_scan(tmp_path, row_pattern=True)
     h = 7
@@ -164,7 +164,7 @@ def test_log_before_fractional_vertical_rebinning(tmp_path, device):
     np.testing.assert_allclose(actual["sino"][:, 0, 10], expected, atol=3e-6)
 
 
-@pytest.mark.parametrize("device", helirec.devices())
+@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_helical_analytic_phantom(tmp_path, device):
     scan, *_ = helical_scan(tmp_path)
     h = 7
@@ -176,7 +176,7 @@ def test_helical_analytic_phantom(tmp_path, device):
     assert relative_error < .12, relative_error
 
 
-@pytest.mark.parametrize("device", helirec.devices())
+@pytest.mark.parametrize("device", vc_tomography.devices())
 @pytest.mark.parametrize("filters", [[], [{"type": "paganin", "delta_beta": 1000.}]])
 def test_iterative_luminosity_has_full_context(tmp_path, device, filters):
     scan, *_ = helical_scan(tmp_path)
@@ -189,7 +189,7 @@ def test_iterative_luminosity_has_full_context(tmp_path, device, filters):
     np.testing.assert_allclose(chunk["sino"], np.concatenate([s["sino"] for s in single], axis=1), atol=2e-6)
 
 
-@pytest.mark.parametrize("device", helirec.devices())
+@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_sirt_from_a_given_start(device):
     """init=fbp: the iterations start from the image given (the pipeline's FBP of the slice in a reconstruction)"""
     n, nd, rot = 9, 14, 6.8
@@ -214,7 +214,7 @@ def test_sirt_from_a_given_start(device):
             _core.tomo_reconstruct(b, None, angles, n, rot, "sirt", bad, device=device, start=start)
 
 
-@pytest.mark.parametrize("device", helirec.devices())
+@pytest.mark.parametrize("device", vc_tomography.devices())
 @pytest.mark.parametrize("method", ["sirt", "mlem"])
 def test_whole_slice_method_starts_from_the_pipelines_fbp(tmp_path, device, method):
     """init=fbp in a reconstruction: before any iteration the slice is the exact FBP's of the same rows (a copy mended

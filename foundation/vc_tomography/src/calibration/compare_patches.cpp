@@ -11,7 +11,7 @@
 
 #include "calibration/compare_blocks.hpp"
 
-namespace helirec::calibration {
+namespace vc_tomography::calibration {
 
 namespace {
 
@@ -395,4 +395,4 @@ void measure_patches(const Pairing& P, const BlockPlan& plan, const std::vector<
     finish();
 }
 
-}  // namespace helirec::calibration
+}  // namespace vc_tomography::calibration

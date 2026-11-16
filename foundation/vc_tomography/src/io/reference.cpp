@@ -1,4 +1,4 @@
-#include "helirec/reference.hpp"
+#include "vc_tomography/reference.hpp"
 
 #include <algorithm>
 #include <climits>
@@ -7,10 +7,10 @@
 #include <map>
 #include <vector>
 
-#include "helirec/block_spectra.hpp"
-#include "helirec/zarr.hpp"
+#include "vc_tomography/block_spectra.hpp"
+#include "vc_tomography/zarr.hpp"
 
-namespace helirec {
+namespace vc_tomography {
 
 struct ReferenceMask::Impl {
     std::string location;
@@ -213,7 +213,7 @@ double RegisteredVolume::read(const std::array<double, 3>& origin, double step, 
     if (device == Device::CPU) {
         cpu::resample_affine(src.data(), sz, sy, sx, m.data(), out, shape[0], shape[1], shape[2], interp);
     } else {
-#ifdef HELIREC_WITH_CUDA
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
         cuda::resample_affine_host(src.data(), sz, sy, sx, m.data(), out, shape[0], shape[1], shape[2], interp);
 #else
         throw Error("built without CUDA");
@@ -222,4 +222,4 @@ double RegisteredVolume::read(const std::array<double, 3>& origin, double step, 
     return static_cast<double>(nonzero) / static_cast<double>(voxels);
 }
 
-}  // namespace helirec
+}  // namespace vc_tomography

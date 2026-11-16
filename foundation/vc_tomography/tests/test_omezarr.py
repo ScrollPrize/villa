@@ -3,14 +3,14 @@ import os
 import numpy as np
 import pytest
 
-from helirec.omezarr import OmeZarrWriter, to_uint8
+from vc_tomography.omezarr import OmeZarrWriter, to_uint8
 
 
 @pytest.mark.parametrize("compression,dtype", [("none", np.float32), ("zlib", np.float32), ("none", np.uint8),
                                                ("vc-delta3d", np.uint8)])
 def test_roundtrip_any_slab_order(tmp_path, compression, dtype):
     if compression == "vc-delta3d":
-        from helirec import _core
+        from vc_tomography import _core
         if not _core.delta3d_available():
             pytest.skip("built without vc-delta3d")
     rng = np.random.default_rng(0)

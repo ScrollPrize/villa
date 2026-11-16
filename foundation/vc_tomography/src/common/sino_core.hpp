@@ -4,11 +4,11 @@
 #include <cstddef>
 
 #include "hd_math.hpp"
-#include "helirec/sino.hpp"
+#include "vc_tomography/sino.hpp"
 
-namespace helirec::sino_core {
+namespace vc_tomography::sino_core {
 
-using namespace helirec::hd;
+using namespace vc_tomography::hd;
 
 HR_HD float minus_log(float v, float lo, float hi) {
     v = v < lo ? lo : v;
@@ -197,4 +197,4 @@ HR_HD void resample_values(const double* g, int M, const double* p, const double
     }
 }
 
-}  // namespace helirec::sino_core
+}  // namespace vc_tomography::sino_core

@@ -1,8 +1,8 @@
 """Known answers and independent objectives for the Ceres named-equation interface."""
 import numpy as np
 import pytest
-from helirec import _core
-from helirec.solve import Problem, fit_line
+from vc_tomography import _core
+from vc_tomography.solve import Problem, fit_line
 
 
 def _lstsq(A, y):

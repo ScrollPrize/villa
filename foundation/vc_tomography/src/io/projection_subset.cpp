@@ -1,11 +1,11 @@
-#include "helirec/projection_subset.hpp"
-#include "helirec/common.hpp"
+#include "vc_tomography/projection_subset.hpp"
+#include "vc_tomography/common.hpp"
 #include <hdf5.h>
 #include <algorithm>
 #include <cmath>
 #include <filesystem>
 
-namespace helirec {
+namespace vc_tomography {
 ProjectionSubset plan_projection_subset(const std::string& master, double center_mm, int slices, double context_turns) {
     if (!std::isfinite(center_mm) || slices < 1 || !std::isfinite(context_turns) || context_turns < 0)
         throw Error("projection subset: invalid slab or context");
@@ -126,4 +126,4 @@ void UncompressedFrameWriter::close() {
     if (p.file >= 0) { ok = H5Fclose(p.file) >= 0 && ok; p.file = -1; }
     if (!ok) throw Error("uncompressed frame writer: closing HDF5 output failed");
 }
-} // namespace helirec
+} // namespace vc_tomography

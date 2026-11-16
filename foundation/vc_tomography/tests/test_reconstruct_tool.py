@@ -1,4 +1,4 @@
-"""helirec-reconstruct (tools/helirec_reconstruct.cpp) and helirec::Reconstruction end to end, on a small synthetic
+"""vc_tomography_reconstruct (tools/vc_tomography_reconstruct.cpp) and vc_tomography::Reconstruction end to end, on a small synthetic
 two-scan helical acquisition written the way BLISS / Lima write one (a rest turn, a helix of four turns, a rest
 turn; 200 x 240 frames) with a geometry calibration made up for it (tests/test_geometry.py): the outputs of both
 modes and formats, uint8 alone, the reference volume's mask, previews, the config file, and what is refused."""
@@ -11,17 +11,17 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from helirec import _core
-from helirec import geometry as G
-from helirec.recon import HelicalRecon
+from vc_tomography import _core
+from vc_tomography import geometry as G
+from vc_tomography.recon import HelicalRecon
 
 h5py = pytest.importorskip("h5py")
 tifffile = pytest.importorskip("tifffile")
 from test_geometry import _synthetic_geometry  # noqa: E402
 
 # the executable: beside the extension in a build tree, else on the PATH (an installed package)
-TOOL = next((str(t) for t in (Path(_core.__file__).resolve().parent / "helirec-reconstruct",) if t.exists()), None) or shutil.which("helirec-reconstruct")
-pytestmark = pytest.mark.skipif(TOOL is None, reason="helirec-reconstruct is not built")
+TOOL = next((str(t) for t in (Path(_core.__file__).resolve().parent / "vc_tomography_reconstruct",) if t.exists()), None) or shutil.which("vc_tomography_reconstruct")
+pytestmark = pytest.mark.skipif(TOOL is None, reason="vc_tomography_reconstruct is not built")
 ROWS, COLS, PIXEL_UM = 200, 240, 8.64
 
 

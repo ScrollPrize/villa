@@ -1,4 +1,4 @@
-#include "helirec/sld.hpp"
+#include "vc_tomography/sld.hpp"
 
 #include <fftw3.h>
 
@@ -11,10 +11,10 @@
 #include <vector>
 
 #include "common/sld_core.hpp"
-#include "helirec/filters.hpp"
-#include "helirec/fourier.hpp"
+#include "vc_tomography/filters.hpp"
+#include "vc_tomography/fourier.hpp"
 
-namespace helirec {
+namespace vc_tomography {
 
 namespace {
 std::vector<std::complex<double>> real_fft(std::vector<double>& data, int h, int w) {
@@ -259,4 +259,4 @@ void ScintillatorGlare::correct(float* frames, int n) {
     }
 }
 
-}  // namespace helirec
+}  // namespace vc_tomography

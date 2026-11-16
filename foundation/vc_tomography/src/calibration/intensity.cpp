@@ -1,6 +1,6 @@
 #include "calibration/blur_model.hpp"
 #include "calibration/ceres_support.hpp"
-#include "helirec/calibration/intensity.hpp"
+#include "vc_tomography/calibration/intensity.hpp"
 
 #include <fftw3.h>
 
@@ -11,9 +11,9 @@
 #include <limits>
 #include <mutex>
 
-#include "helirec/fourier.hpp"
+#include "vc_tomography/fourier.hpp"
 
-namespace helirec::calibration {
+namespace vc_tomography::calibration {
 
 namespace {
 
@@ -274,4 +274,4 @@ DetectorBlurField detector_blur_field_fit(const double* power, int ny, int nx, i
     return out;
 }
 
-}  // namespace helirec::calibration
+}  // namespace vc_tomography::calibration

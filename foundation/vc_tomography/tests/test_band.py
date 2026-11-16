@@ -3,10 +3,10 @@ backprojection + trilinear interpolation; CPU vs CUDA band sampler."""
 import numpy as np
 import pytest
 
-import helirec
-from helirec import _core
+import vc_tomography
+from vc_tomography import _core
 
-cuda_only = pytest.mark.skipif(not helirec.cuda_available(), reason="no CUDA")
+cuda_only = pytest.mark.skipif(not vc_tomography.cuda_available(), reason="no CUDA")
 
 
 @cuda_only
@@ -39,7 +39,7 @@ def trilinear(vol, z, y, x):
     return out
 
 
-@pytest.mark.parametrize("device", helirec.devices())
+@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_band_matches_full_backprojection(device):
     rng = np.random.default_rng(7)
     N, n_angles, n_det, nz = 96, 180, 140, 6
@@ -47,7 +47,7 @@ def test_band_matches_full_backprojection(device):
     angles = np.linspace(0, 2 * np.pi, n_angles, endpoint=False).astype(np.float32)
     sinos = rng.standard_normal((nz, n_angles, n_det)).astype(np.float32)
     kw = dict(rot_center=70.4, scale=0.01, center=(N - 1) / 2, clip_outer_circle=True, clip_radius=N // 2)
-    vol = np.stack([helirec.backproject(s, angles, N, N, device="cpu", **kw) for s in sinos])
+    vol = np.stack([vc_tomography.backproject(s, angles, N, N, device="cpu", **kw) for s in sinos])
     # points along a tilted band, including the last slice / last column edge cases
     n = 4000
     z = rng.uniform(0, nz - 1, n); y = rng.uniform(20, 70, n); x = rng.uniform(5, N - 1, n)

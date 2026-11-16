@@ -1,5 +1,5 @@
-// The robust linear least squares of the geometry steps (helirec/calibration/solve.hpp).
-#include "helirec/calibration/solve.hpp"
+// The robust linear least squares of the geometry steps (vc_tomography/calibration/solve.hpp).
+#include "vc_tomography/calibration/solve.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -11,7 +11,7 @@
 #include "calibration/ceres_support.hpp"
 #include <string>
 
-namespace helirec::calibration {
+namespace vc_tomography::calibration {
 
 namespace {
 
@@ -332,4 +332,4 @@ LineFit fit_line(const std::vector<double>& x, const std::vector<double>& y, con
     out.rms = std::sqrt(ss / x.size());
     return out;
 }
-}  // namespace helirec::calibration
+}  // namespace vc_tomography::calibration

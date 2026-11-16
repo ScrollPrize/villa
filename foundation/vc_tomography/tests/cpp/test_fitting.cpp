@@ -8,8 +8,8 @@ int main() {
     // Acquisition diagnostics report invalid observations as an unavailable fit.
     const std::vector<double> time = {1e12,1e12+1,1e12+2};
     const std::vector<double> invalid = {1,std::numeric_limits<double>::quiet_NaN(),3};
-    if (helirec::calibration::fit_line(time,invalid,0,time.size()).usable) return 1;
-    using helirec::calibration::fitting::BlurFieldProblem;
+    if (vc_tomography::calibration::fit_line(time,invalid,0,time.size()).usable) return 1;
+    using vc_tomography::calibration::fitting::BlurFieldProblem;
     BlurFieldProblem model;
     model.tiles = 9; model.bins = 8;
     model.FX = {.06,.08,.12,.15,.18,.22,.26,.29};
@@ -20,7 +20,7 @@ int main() {
         model.X.push_back(x*.7); model.Yr.push_back(y*.5);
         for (int b = 0; b < 8; ++b) model.Y.push_back(1.+.1*std::sin(2*x+3*y+b));
     }
-    helirec::calibration::fitting::BlurFieldCost cost(model);
+    vc_tomography::calibration::fitting::BlurFieldCost cost(model);
     for (auto q : {std::array<double,6>{2.,.2,-.1,1.,.3,-.2},std::array<double,6>{0,0,0,0,0,0}}) {
         double r[72], jac[72*6], *j[] = {jac};
         const double* parameters[] = {q.data()};

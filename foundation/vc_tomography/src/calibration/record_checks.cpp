@@ -3,10 +3,10 @@
 #include <fstream>
 #include <memory>
 
-#include "helirec/calibration/record_checks.hpp"
-#include "helirec/calibration/session.hpp"
+#include "vc_tomography/calibration/record_checks.hpp"
+#include "vc_tomography/calibration/session.hpp"
 
-namespace helirec::calibration {
+namespace vc_tomography::calibration {
 
 namespace {
 
@@ -111,4 +111,4 @@ Report run_record_checks(const std::vector<std::string>& scans, const RecordChec
     return report;
 }
 
-}  // namespace helirec::calibration
+}  // namespace vc_tomography::calibration

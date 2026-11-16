@@ -1,8 +1,8 @@
 """Exposure-integrated refill shots, including the two row-time signs."""
 import numpy as np
 import pytest
-from helirec import _core
-from helirec.geometry import fit_refill_shots
+from vc_tomography import _core
+from vc_tomography.geometry import fit_refill_shots
 
 
 def refill(sign=1, missing=False, noise=2e-5, shots=18):

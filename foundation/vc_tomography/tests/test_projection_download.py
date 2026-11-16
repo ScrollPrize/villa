@@ -10,9 +10,9 @@ import h5py
 import numpy as np
 import pytest
 
-from helirec import _core
-from helirec.calibration import at_resolution
-from helirec import download_projections as download
+from vc_tomography import _core
+from vc_tomography.calibration import at_resolution
+from vc_tomography import download_projections as download
 from test_calibration import _write_record, _write_frames, ROWS, COLS
 from test_htj2k_reader import DATA, _chunk, _write
 
@@ -97,7 +97,7 @@ def _job(tmp_path, role):
     return source, job
 
 
-@pytest.mark.skipif(not _core.htj2k_float_frames_supported(), reason="HELIREC_OPENJPH=OFF")
+@pytest.mark.skipif(not _core.htj2k_float_frames_supported(), reason="VC_TOMOGRAPHY_OPENJPH=OFF")
 @pytest.mark.parametrize("role", ["projection", "flat"])
 def test_export_resume_checksum_and_index(tmp_path, role):
     source, job = _job(tmp_path, role)
@@ -123,8 +123,8 @@ def test_export_resume_checksum_and_index(tmp_path, role):
         assert got.dtype == np.dtype(job["dtype"])
         assert f["data"].id.get_create_plist().get_nfilters() == 0
         assert f.attrs["data_sha256"] == hashlib.sha256(got.tobytes()).hexdigest()
-        np.testing.assert_array_equal(f["helirec_metadata/original_frame_index"][:], [1200, 1201])
-        np.testing.assert_array_equal(f["helirec_metadata/angle_deg"][:], [1, 2])
+        np.testing.assert_array_equal(f["vc_tomography_metadata/original_frame_index"][:], [1200, 1201])
+        np.testing.assert_array_equal(f["vc_tomography_metadata/angle_deg"][:], [1, 2])
     assert not path.with_suffix(".h5.partial").exists()
     assert download._complete(path, job)
     before = path.stat().st_mtime_ns
@@ -141,7 +141,7 @@ def test_export_resume_checksum_and_index(tmp_path, role):
         download._download_once(job, out, 1, 1, events)
 
 
-@pytest.mark.skipif(not _core.htj2k_float_frames_supported(), reason="HELIREC_OPENJPH=OFF")
+@pytest.mark.skipif(not _core.htj2k_float_frames_supported(), reason="VC_TOMOGRAPHY_OPENJPH=OFF")
 @pytest.mark.parametrize("role", ["projection", "flat"])
 def test_export_into_a_projection_store(tmp_path, role):
     """--zarr: the same frames, as a level of the store instead of an HDF5 file, and no file is left behind"""
@@ -168,7 +168,7 @@ def test_export_into_a_projection_store(tmp_path, role):
     group = str(store / "T0-01" / "scan0005")
     reader = _core.RawReader([group], "", job["rows"], 256, 3, dtype=job["dtype"])
     np.testing.assert_array_equal(reader.read_frames(np.zeros(2, np.int32), np.arange(2, dtype=np.int32)), want)
-    attributes = json.loads((store / "T0-01" / "scan0005" / "zarr.json").read_text())["attributes"]["helirec"]
+    attributes = json.loads((store / "T0-01" / "scan0005" / "zarr.json").read_text())["attributes"]["vc_tomography"]
     assert attributes["frame_first"] == 1200 and attributes["files"] == [dict(file="file.h5", source_first=1, first=1200, count=2)]
     assert [level["stored"] for level in attributes["levels"]] == [False, False, False, True]
     source.unlink()  # resuming needs no source reads, and declaring again keeps what is stored
@@ -177,7 +177,7 @@ def test_export_into_a_projection_store(tmp_path, role):
     # another level of the same frames joins; other frames of the scan are refused
     half = dict(job, reduce=2)
     download._declare_store(dict(plan, jobs=[half]), SimpleNamespace(zarr=store, reduce=2, remote=None, source_root=tmp_path), log)
-    attributes = json.loads((store / "T0-01" / "scan0005" / "zarr.json").read_text())["attributes"]["helirec"]
+    attributes = json.loads((store / "T0-01" / "scan0005" / "zarr.json").read_text())["attributes"]["vc_tomography"]
     assert [level["stored"] for level in attributes["levels"]] == [False, False, True, True]
     assert download._complete(out / job["output"], job, str(store)) and not download._complete(out / job["output"], half, str(store))
     with pytest.raises(Exception, match="the store holds frames"):
@@ -223,7 +223,7 @@ def _projection_source(source):
            rows=256, cols=256, frames=3, dtype="uint16")
 
 
-@pytest.mark.skipif(not _core.htj2k_float_frames_supported(), reason="HELIREC_OPENJPH=OFF")
+@pytest.mark.skipif(not _core.htj2k_float_frames_supported(), reason="VC_TOMOGRAPHY_OPENJPH=OFF")
 def test_reader_refuses_bytes_that_were_not_fetched(tmp_path):
     source = tmp_path / "source.h5"
     _projection_source(source)
@@ -240,7 +240,7 @@ def test_reader_refuses_bytes_that_were_not_fetched(tmp_path):
         partial.read_frames(np.zeros(1, np.int32), np.array([1], np.int32), n_threads=1)
 
 
-@pytest.mark.skipif(not _core.htj2k_float_frames_supported(), reason="HELIREC_OPENJPH=OFF")
+@pytest.mark.skipif(not _core.htj2k_float_frames_supported(), reason="VC_TOMOGRAPHY_OPENJPH=OFF")
 @pytest.mark.parametrize("role,heads", [("projection", download._HEADS[3]), ("projection", (64, None)), ("flat", None)])
 def test_remote_export_equals_local_export(tmp_path, monkeypatch, role, heads):
     source, job = _job(tmp_path, role)

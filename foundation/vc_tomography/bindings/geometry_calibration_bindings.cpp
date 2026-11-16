@@ -1,5 +1,5 @@
-// Python bindings of helirec/calibration/geometry_calibration.hpp: the geometry calibration of a two-scan
-// acquisition and its stages. Layouts, comparisons and results cross as JSON text (python/helirec/geometry.py
+// Python bindings of vc_tomography/calibration/geometry_calibration.hpp: the geometry calibration of a two-scan
+// acquisition and its stages. Layouts, comparisons and results cross as JSON text (python/vc_tomography/geometry.py
 // turns them into the dicts its callers know).
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
@@ -11,15 +11,15 @@
 #include <cmath>
 
 #include "../src/io/json.hpp"
-#include "helirec/calibration/geometry_calibration.hpp"
+#include "vc_tomography/calibration/geometry_calibration.hpp"
 #include "ndarray_utils.hpp"
 
 namespace nb = nanobind;
 using namespace nb::literals;
-using namespace helirec;
-namespace gc = helirec::calibration::geometry_calibration;
+using namespace vc_tomography;
+namespace gc = vc_tomography::calibration::geometry_calibration;
 
-helirec::calibration::Session& bound_session(nb::handle h);  // bindings/calibration_bindings.cpp
+vc_tomography::calibration::Session& bound_session(nb::handle h);  // bindings/calibration_bindings.cpp
 
 namespace {
 
@@ -164,10 +164,10 @@ std::string plan_text(const std::vector<gc::Planned>& planned) {
 // the accepted comparisons of a measured plan, as Python takes them
 nb::dict measured(const std::vector<gc::Comparison>& got, const std::vector<int>& kept, std::size_t blocks) {
     const std::size_t n = got.size();
-    auto a = helirec::py::new_array_t<double>({n, std::size_t(5)});
-    auto b = helirec::py::new_array_t<double>({n, std::size_t(5)});
-    auto correlation = helirec::py::new_array_t<double>({n});
-    auto curvature = helirec::py::new_array_t<double>({n, std::size_t(6)});
+    auto a = vc_tomography::py::new_array_t<double>({n, std::size_t(5)});
+    auto b = vc_tomography::py::new_array_t<double>({n, std::size_t(5)});
+    auto correlation = vc_tomography::py::new_array_t<double>({n});
+    auto curvature = vc_tomography::py::new_array_t<double>({n, std::size_t(6)});
     nb::list kinds, opposite, block;
     for (std::size_t i = 0; i < n; ++i) {
         const gc::Comparison& c = got[i];
@@ -206,8 +206,8 @@ gc::PlanCounts tile_counts(int positions, int angles, int bands, int windows) {
 void bind_geometry_calibration(nb::module_& m) {
     nb::class_<gc::Acquisition>(m, "GeometryAcquisition",
                                 "The layout of the scans of one acquisition as the joint geometry model takes it: what the records state per frame, the\n"
-                                "frames on disk, the sense of the rows, a coarse axis column per scan (helirec::calibration::geometry_calibration::Acquisition).\n"
-                                "Made from JSON text (see python/helirec/geometry.py) or read from a session (geometry_read_acquisition).")
+                                "frames on disk, the sense of the rows, a coarse axis column per scan (vc_tomography::calibration::geometry_calibration::Acquisition).\n"
+                                "Made from JSON text (see python/vc_tomography/geometry.py) or read from a session (geometry_read_acquisition).")
         .def("__init__", [](gc::Acquisition* self, const std::string& text) { new (self) gc::Acquisition(acquisition_of(text)); }, "text"_a)
         .def_rw("row_time", &gc::Acquisition::row_time, "The rows' timing in frames per stored row (signed).")
         .def_rw("rows_from_middle", &gc::Acquisition::rows_from_middle,
@@ -217,8 +217,8 @@ void bind_geometry_calibration(nb::module_& m) {
         .def("course",
              [](const gc::Acquisition& a, int scan, int stretch) {
                  const calibration::Trajectory& t = a.scans.at(static_cast<std::size_t>(scan)).stretches.at(static_cast<std::size_t>(stretch)).course;
-                 auto angle = helirec::py::new_array_t<double>({t.angle_deg.size()});
-                 auto rows = helirec::py::new_array_t<double>({t.rows.size()});
+                 auto angle = vc_tomography::py::new_array_t<double>({t.angle_deg.size()});
+                 auto rows = vc_tomography::py::new_array_t<double>({t.rows.size()});
                  std::copy(t.angle_deg.begin(), t.angle_deg.end(), static_cast<double*>(angle.data()));
                  std::copy(t.rows.begin(), t.rows.end(), static_cast<double*>(rows.data()));
                  return nb::make_tuple(angle, rows);
@@ -241,7 +241,7 @@ void bind_geometry_calibration(nb::module_& m) {
         },
         "session"_a, "device"_a = "auto", "log"_a = nb::none(),
         "The layout of a CalibrationSession's scans, each with whatever projection stretches it has on disk\n"
-        "(helirec::calibration::geometry_calibration::read_acquisition).");
+        "(vc_tomography::calibration::geometry_calibration::read_acquisition).");
     m.def(
         "geometry_row_time_from_refill",
         [](nb::handle session, const gc::Acquisition& acq, std::optional<std::function<void(const std::string&)>> log) {
@@ -257,7 +257,7 @@ void bind_geometry_calibration(nb::module_& m) {
         },
         "session"_a, "acquisition"_a, "log"_a = nb::none(),
         "Seconds per stored row from a refill in one of the acquisition's stretches, as JSON text (\"null\": none holds one)\n"
-        "(helirec::calibration::geometry_calibration::row_time_from_refill).");
+        "(vc_tomography::calibration::geometry_calibration::row_time_from_refill).");
     m.def(
         "geometry_plan",
         [](const gc::Acquisition& acq, int angles_per_turn, int max_positions, int n_rest, int n_turn, int turn_least) {
@@ -267,7 +267,7 @@ void bind_geometry_calibration(nb::module_& m) {
         },
         "acquisition"_a, "angles_per_turn"_a = 12, "max_positions"_a = 48, "n_rest"_a = 16, "n_turn"_a = 12, "turn_least"_a = 128,
         "The comparisons of each scan with itself, placed from the layout alone, as JSON text\n"
-        "(helirec::calibration::geometry_calibration::plan).");
+        "(vc_tomography::calibration::geometry_calibration::plan).");
     m.def(
         "geometry_measure",
         [](nb::handle session, const gc::Acquisition& acq, const std::string& device, int patch, int angles_per_turn, int max_positions, int n_rest, int n_turn, int turn_least) {
@@ -291,7 +291,7 @@ void bind_geometry_calibration(nb::module_& m) {
         "turn_least"_a = 128,
         "The plan of each scan's comparisons with itself measured once, in patches: the accepted ones as kinds, sightings a and b\n"
         "(n, 5: scan, stretch, frame, row, column), opposite, correlation, curvature (n, 6) and the block each came from\n"
-        "(helirec::calibration::geometry_calibration::plan, measure).");
+        "(vc_tomography::calibration::geometry_calibration::plan, measure).");
     m.def(
         "geometry_plan_tiles",
         [](const gc::Acquisition& acq, const std::string& places, const std::vector<std::vector<int>>& pairs, int positions, int angles, int bands, int windows) {
@@ -299,7 +299,7 @@ void bind_geometry_calibration(nb::module_& m) {
         },
         "acquisition"_a, "places"_a, "pairs"_a, "positions"_a = 48, "angles"_a = 24, "bands"_a = 3, "windows"_a = 4,
         "The comparisons of scans at different places on the rotation stage (a mosaic's tiles), placed from the parameters'\n"
-        "axis columns, places and heights, as JSON text (helirec::calibration::geometry_calibration::plan_tiles).");
+        "axis columns, places and heights, as JSON text (vc_tomography::calibration::geometry_calibration::plan_tiles).");
     m.def(
         "geometry_measure_tiles",
         [](nb::handle session, const gc::Acquisition& acq, const std::string& places, const std::vector<std::vector<int>>& pairs, const std::string& device, int patch, int positions, int angles,
@@ -322,7 +322,7 @@ void bind_geometry_calibration(nb::module_& m) {
         },
         "session"_a, "acquisition"_a, "places"_a, "pairs"_a, "device"_a = "auto", "patch"_a = 128, "positions"_a = 48, "angles"_a = 24, "bands"_a = 3, "windows"_a = 4,
         "The plan of the tiles' comparisons with each other (geometry_plan_tiles) measured once, in patches: as geometry_measure\n"
-        "returns them (helirec::calibration::geometry_calibration::plan_tiles, measure).");
+        "returns them (vc_tomography::calibration::geometry_calibration::plan_tiles, measure).");
     m.def(
         "geometry_solve",
         [](const gc::Acquisition& acq, const std::vector<std::string>& kinds, Table a, Table b, const std::vector<bool>& opposite, Table lens_table, const std::string& start, double huber,
@@ -347,9 +347,9 @@ void bind_geometry_calibration(nb::module_& m) {
                 nb::gil_scoped_release nogil;
                 s = gc::solve_geometry(acq, comparisons, lens, p0, opt);
             }
-            auto residual = helirec::py::new_array_t<double>({n, std::size_t(3)});
+            auto residual = vc_tomography::py::new_array_t<double>({n, std::size_t(3)});
             for (std::size_t i = 0; i < n; ++i) std::copy(s.residual[i].begin(), s.residual[i].end(), static_cast<double*>(residual.data()) + 3 * i);
-            auto lens_residual = helirec::py::new_array_t<double>({lens.size(), std::size_t(3)});
+            auto lens_residual = vc_tomography::py::new_array_t<double>({lens.size(), std::size_t(3)});
             for (std::size_t i = 0; i < lens.size(); ++i) std::copy(s.lens_residual[i].begin(), s.lens_residual[i].end(), static_cast<double*>(lens_residual.data()) + 3 * i);
             return nb::make_tuple(gc::solution_json(acq, s), residual, lens_residual);
         },
@@ -357,18 +357,18 @@ void bind_geometry_calibration(nb::module_& m) {
         "freed"_a = std::vector<std::string>(), "lens_huber"_a = 1.5, "undetermined_map"_a = 0.0, "tilts_after"_a = false, "radial_map"_a = false,
         "The places of the scans that best explain comparisons of their frames and lens patches of their volumes (lens: (n, 11)\n"
         "scan a, scan b, the place, the displacement, its sigma): (the solution as JSON text, the comparisons' residuals (n, 3):\n"
-        "frames, rows, columns, the lens patches' (n, 3): x, y, z). (helirec::calibration::geometry_calibration::solve_geometry)");
+        "frames, rows, columns, the lens patches' (n, 3): x, y, z). (vc_tomography::calibration::geometry_calibration::solve_geometry)");
     m.def(
         "geometry_lens_residuals",
         [](const gc::Acquisition& acq, const std::string& parameters, Table lens_table) {
             const std::vector<gc::LensPatch> lens = lens_of(lens_table);
             const std::vector<std::array<double, 3>> r = gc::lens_residuals(acq, parameters_of(acq, parameters), lens);
-            auto out = helirec::py::new_array_t<double>({lens.size(), std::size_t(3)});
+            auto out = vc_tomography::py::new_array_t<double>({lens.size(), std::size_t(3)});
             for (std::size_t i = 0; i < lens.size(); ++i) std::copy(r[i].begin(), r[i].end(), static_cast<double*>(out.data()) + 3 * i);
             return out;
         },
         "acquisition"_a, "parameters"_a, "lens"_a,
-        "What the parameters leave of each lens patch: (n, 3) x, y, z [px]. (helirec::calibration::geometry_calibration::lens_residuals)");
+        "What the parameters leave of each lens patch: (n, 3) x, y, z [px]. (vc_tomography::calibration::geometry_calibration::lens_residuals)");
     m.def(
         "geometry_residuals",
         [](const gc::Acquisition& acq, const std::string& parameters, Table a, Table b, const std::vector<bool>& opposite) {
@@ -377,13 +377,13 @@ void bind_geometry_calibration(nb::module_& m) {
             std::vector<gc::Comparison> comparisons(n);
             for (std::size_t i = 0; i < n; ++i) comparisons[i].a = sighting_of(a.data() + 5 * i), comparisons[i].b = sighting_of(b.data() + 5 * i), comparisons[i].opposite = opposite[i];
             const std::vector<std::array<double, 3>> r = gc::residuals(acq, parameters_of(acq, parameters), comparisons);
-            auto out = helirec::py::new_array_t<double>({n, std::size_t(3)});
+            auto out = vc_tomography::py::new_array_t<double>({n, std::size_t(3)});
             for (std::size_t i = 0; i < n; ++i) std::copy(r[i].begin(), r[i].end(), static_cast<double*>(out.data()) + 3 * i);
             return out;
         },
         "acquisition"_a, "parameters"_a, "a"_a, "b"_a, "opposite"_a,
         "What the parameters leave of each comparison: (n, 3) frames, rows, columns.\n"
-        "(helirec::calibration::geometry_calibration::residuals)");
+        "(vc_tomography::calibration::geometry_calibration::residuals)");
     m.def(
         "geometry_report",
         [](const gc::Acquisition& acq, const std::string& parameters, Table a, Table b, const std::vector<bool>& opposite, const std::vector<std::string>& kinds) {
@@ -404,7 +404,7 @@ void bind_geometry_calibration(nb::module_& m) {
         "acquisition"_a, "parameters"_a, "a"_a, "b"_a, "opposite"_a, "kinds"_a = std::vector<std::string>(),
         "What the parameters leave of each scan's opposite views and what that says (the rows' timing, whose the recorded\n"
         "height's departure is, the pitch a tile's own views bound), the spread over the scans, and which scans overlap,\n"
-        "as JSON text. (helirec::calibration::geometry_calibration::report)");
+        "as JSON text. (vc_tomography::calibration::geometry_calibration::report)");
     m.def(
         "geometry_neighbours", [](const gc::Acquisition& acq) {
             const gc::Neighbours n = gc::neighbours(acq);
@@ -414,14 +414,14 @@ void bind_geometry_calibration(nb::module_& m) {
             return nb::make_tuple(edges, triangles);
         },
         "acquisition"_a, "The scans whose reconstructions overlap, and the triangles of them: (edges, triangles) as tuples of scan indices.\n"
-                         "(helirec::calibration::geometry_calibration::neighbours)");
+                         "(vc_tomography::calibration::geometry_calibration::neighbours)");
     m.def(
         "geometry_rays",
         [](const gc::Acquisition& acq, const std::string& parameters, Table sightings) {
             if (sightings.shape(1) != 5) throw Error("geometry_rays: a sighting is scan, stretch, frame, row, column");
             const gc::Parameters p = parameters_of(acq, parameters);
             const std::size_t n = sightings.shape(0);
-            auto out = helirec::py::new_array_t<double>({n, std::size_t(3)});
+            auto out = vc_tomography::py::new_array_t<double>({n, std::size_t(3)});
             double* o = static_cast<double*>(out.data());
             for (std::size_t i = 0; i < n; ++i) {
                 const gc::Ray r = gc::ray_of(acq, p, sighting_of(sightings.data() + 5 * i));
@@ -431,7 +431,7 @@ void bind_geometry_calibration(nb::module_& m) {
         },
         "acquisition"_a, "parameters"_a, "sightings"_a,
         "The ray each sighting records under the parameters: (n, 3) angle [deg], s [px], z [rows].\n"
-        "(helirec::calibration::geometry_calibration::ray_of)");
+        "(vc_tomography::calibration::geometry_calibration::ray_of)");
     m.def(
         "calibrate_geometry",
         [](const std::vector<std::string>& scans, std::optional<double> row_time, const std::string& device, int order, int threads, int patch,
@@ -453,7 +453,7 @@ void bind_geometry_calibration(nb::module_& m) {
         "scans"_a, "row_time"_a = nb::none(), "device"_a = "auto", "order"_a = 3, "threads"_a = 8, "patch"_a = 128, "log"_a = nb::none(), "reduce"_a = 0, "projections"_a = "",
         "rows_from_middle"_a = false, "radial_map"_a = false,
         "The geometry calibration of the scans of one sample (a scan with the rotation axis inside its field first), as JSON text\n"
-        "(helirec::calibration::geometry_calibration::calibrate_geometry; helirec-calibration geometry).");
+        "(vc_tomography::calibration::geometry_calibration::calibrate_geometry; vc_tomography_calibration geometry).");
     m.def(
         "geometry_to_stored_pixels",
         [](const gc::Acquisition& acq, const std::string& parameters, int rows, int cols, int f) {
@@ -467,6 +467,6 @@ void bind_geometry_calibration(nb::module_& m) {
         },
         "acquisition"_a, "parameters"_a, "rows"_a, "cols"_a, "f"_a,
         "Parameters found on frames read at 1 / f, in the pixels of the frames as stored (rows x cols): (the parameters, the\n"
-        "layout without its per-frame series), each as JSON text. (helirec::calibration::geometry_calibration::to_stored_pixels)");
+        "layout without its per-frame series), each as JSON text. (vc_tomography::calibration::geometry_calibration::to_stored_pixels)");
     m.def("geometry_calibration_save", &gc::save_text, "text"_a, "path"_a, "The text written whole or not at all.");
 }

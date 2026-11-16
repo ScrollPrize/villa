@@ -3,9 +3,9 @@
 #include <vector>
 
 #include "common/interp_core.hpp"
-#include "helirec/band.hpp"
+#include "vc_tomography/band.hpp"
 
-namespace helirec::cpu {
+namespace vc_tomography::cpu {
 
 namespace {
 inline int lower(float v, int n) { return std::min(static_cast<int>(std::floor(v)), n - 2); }
@@ -90,4 +90,4 @@ void band_sample(const float* img_lo, const float* img_hi, const float* fz, cons
     }
 }
 
-}  // namespace helirec::cpu
+}  // namespace vc_tomography::cpu

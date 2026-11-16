@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-import helirec
+import vc_tomography
 
 MODES = {"zero": "constant", "edge": "edge", "reflect": "reflect", "symmetric": "symmetric", "wrap": "wrap"}
 
@@ -21,7 +21,7 @@ def numpy_reference(stack, ndim, ph, pw, top, left, mode, filt):
     return out
 
 
-@pytest.mark.parametrize("device", helirec.devices())
+@pytest.mark.parametrize("device", vc_tomography.devices())
 @pytest.mark.parametrize("mode", list(MODES))
 @pytest.mark.parametrize("ndim", [1, 2])
 def test_fourier_filter_matches_numpy(device, mode, ndim):
@@ -30,7 +30,7 @@ def test_fourier_filter_matches_numpy(device, mode, ndim):
     stack = rng.standard_normal((3, h, w)).astype(np.float32)
     shape = (ph, pw // 2 + 1) if ndim == 2 else (pw // 2 + 1,)
     filt = rng.uniform(0, 2, shape).astype(np.float32)
-    f = helirec.FourierFilter(ndim, h, w, ph, pw, top, left, mode, filt, device=device)
+    f = vc_tomography.FourierFilter(ndim, h, w, ph, pw, top, left, mode, filt, device=device)
     out = f.apply(stack)
     ref = numpy_reference(stack.astype(np.float64), ndim, ph, pw, top, left, mode, filt)
     np.testing.assert_allclose(out, ref, rtol=1e-4, atol=1e-4)
@@ -38,4 +38,4 @@ def test_fourier_filter_matches_numpy(device, mode, ndim):
 
 def test_bad_filter_size():
     with pytest.raises(RuntimeError, match="filter has"):
-        helirec.FourierFilter(2, 4, 4, 8, 8, 0, 0, "edge", np.ones(3, np.float32))
+        vc_tomography.FourierFilter(2, 4, 4, 8, 8, 0, 0, "edge", np.ones(3, np.float32))

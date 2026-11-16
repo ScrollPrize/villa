@@ -30,8 +30,8 @@ import time
 
 import numpy as np
 
-from helirec.filters import parse_chain
-from helirec.recon import HelicalRecon
+from vc_tomography.filters import parse_chain
+from vc_tomography.recon import HelicalRecon
 
 try:
     from .levels import BANDS, air_bands, band_levels, box_bin

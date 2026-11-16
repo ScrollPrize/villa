@@ -7,9 +7,9 @@
 #include <ceres/ceres.h>
 #include <ceres/gradient_problem_solver.h>
 #include <ceres/version.h>
-#include "helirec/calibration/solve.hpp"
+#include "vc_tomography/calibration/solve.hpp"
 
-namespace helirec::calibration::fitting {
+namespace vc_tomography::calibration::fitting {
 inline void validate(const SolveOptions& o) {
     if (o.max_iterations < 1 || !std::isfinite(o.huber) || o.huber < 0 ||
         !std::isfinite(o.rcond) || o.rcond <= 0 || o.rcond >= 1 ||
@@ -70,4 +70,4 @@ inline FitSummary summary(const ceres::GradientProblemSolver::Summary& s) {
     r.solver_version = CERES_VERSION_STRING;
     return r;
 }
-}  // namespace helirec::calibration::fitting
+}  // namespace vc_tomography::calibration::fitting

@@ -8,10 +8,10 @@
 #include <vector>
 
 #include "common/block_spectra_core.hpp"
-#include "helirec/block_spectra.hpp"
-#include "helirec/fourier.hpp"
+#include "vc_tomography/block_spectra.hpp"
+#include "vc_tomography/fourier.hpp"
 
-namespace helirec::cpu {
+namespace vc_tomography::cpu {
 
 namespace core = block_spectra_core;
 
@@ -218,4 +218,4 @@ void resample_affine(const float* src, int sz, int sy, int sx, const double* m, 
         }
 }
 
-}  // namespace helirec::cpu
+}  // namespace vc_tomography::cpu

@@ -4,8 +4,8 @@ import h5py
 import numpy as np
 import pytest
 
-import helirec
-from helirec import _core
+import vc_tomography
+from vc_tomography import _core
 from test_sirt_pipeline import helical_scan, recon
 
 NU = 0.25   # cycles / pixel of the column pattern
@@ -36,7 +36,7 @@ def amplitude(sino, nu=NU, lo=4, hi=20):
     return 2 * abs(((s - s.mean()) * np.exp(-2j * np.pi * nu * x)).mean())
 
 
-@pytest.mark.parametrize("device", helirec.devices())
+@pytest.mark.parametrize("device", vc_tomography.devices())
 @pytest.mark.parametrize("backprojector", ["fbp", "sirt"])   # padded / measured-only gridding
 def test_fractional_column_offset_kernel(tmp_path, device, backprojector):
     kw = dict(backprojector=backprojector, tomo_params={"num_iter": "1"} if backprojector == "sirt" else {})
@@ -62,7 +62,7 @@ def test_fractional_column_offset_kernel(tmp_path, device, backprojector):
         recon(pattern_scan(tmp_path, 0.5), device, x_interp="bspline3", **kw)
 
 
-@pytest.mark.parametrize("device", helirec.devices())
+@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_fractional_column_offset_exact(tmp_path, device):
     """x_interp=sinc keeps the whole band of a scan placed at a fractional column offset: at 0.45 cycles / pixel and
     half a pixel the lanczos3 kernel passes 0.35, the two-column splat 0.16."""
@@ -84,7 +84,7 @@ def test_fractional_column_offset_exact(tmp_path, device):
     np.testing.assert_array_equal(sino(1.0, x_interp="sinc"), sino(1.0, x_interp="lanczos3"))
 
 
-@pytest.mark.parametrize("device", helirec.devices())
+@pytest.mark.parametrize("device", vc_tomography.devices())
 @pytest.mark.parametrize("backprojector", ["fbp", "ghbp"])
 def test_luminosity_window_is_chunk_independent(tmp_path, device, backprojector):
     scan, *_ = helical_scan(tmp_path)
@@ -100,7 +100,7 @@ def test_luminosity_window_is_chunk_independent(tmp_path, device, backprojector)
                  legacy_reference=True).info["margin"] == 0
 
 
-@pytest.mark.parametrize("device", helirec.devices())
+@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_angle_subsets(tmp_path, device):
     """the two halves of a scan: half the projections each, on half the angles, the same object"""
     scan, *_ = helical_scan(tmp_path)
@@ -145,7 +145,7 @@ def rolled_scan(tmp_path, offset, slope, nu=0.2, nr=40, nd=48, c0=20.25):
     return make
 
 
-@pytest.mark.parametrize("device", helirec.devices())
+@pytest.mark.parametrize("device", vc_tomography.devices())
 @pytest.mark.parametrize("backprojector", ["fbp", "sirt"])   # padded / measured-only gridding
 def test_frame_registration_undoes_offset_and_roll(tmp_path, device, backprojector):
     """frames displaced by 0.3 rows and sheared by 0.08 rows per column (up to 2.2 rows) grid like the plain ones when
@@ -169,7 +169,7 @@ def test_frame_registration_undoes_offset_and_roll(tmp_path, device, backproject
                              np.arange(4, dtype=np.int32), row_slope=[0.1, 0.1]) and recon(None, device)
 
 
-@pytest.mark.parametrize("device", helirec.devices())
+@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_sharpness_weighting_with_zero_blur_changes_nothing(tmp_path, device):
     """sharpness_weighting: a zero field gives both weight sets the same weights, and the result of the usual ones bit for
     bit; a field leaves every ray an average of its recordings (weights that sum to one)"""
@@ -184,7 +184,7 @@ def test_sharpness_weighting_with_zero_blur_changes_nothing(tmp_path, device):
             run(**bad)
 
 
-@pytest.mark.parametrize("device", helirec.devices())
+@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_frame_registration_lateral(tmp_path, device):
     """a scan whose frames are displaced along the columns by 0.3 px and by 0.02 px per row grids like the plain one
     when its lateral registration is given (ScanTrajectory::col_offset, col_slope; exact column shifts)"""
@@ -214,7 +214,7 @@ def test_frame_registration_lateral(tmp_path, device):
     np.testing.assert_array_equal(sino(scan(True, True), x_interp="lanczos3"), sino(scan(True, False), x_interp="lanczos3"))
 
 
-@pytest.mark.parametrize("device", helirec.devices())
+@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_rolling_shutter_turns_the_slices_angles(tmp_path, device):
     """rolling_shutter = s: a slice read at row v of a projection lies s x (the angular step) x (v - middle row) /
     (rows - 1) from the projection's angle; a bin holding several projections takes their mean"""
@@ -242,7 +242,7 @@ def test_rolling_shutter_turns_the_slices_angles(tmp_path, device):
     assert recon(pattern_scan(tmp_path, 0.0), device, backprojector="fbp", rolling_shutter=0.5).info["rolling_shutter"] == 0.5
 
 
-@pytest.mark.parametrize("device", helirec.devices())
+@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_noise_split_gives_pairs_with_independent_noise(tmp_path, device):
     """noise_split: every raw sample takes scale x sqrt(gain x (counts above the dark) + floor) x a standard normal
     number that the seed, the scan, the projection and the pixel fix. Runs with the scales a and -1 / a carry the same
@@ -316,7 +316,7 @@ def test_noise_split_gives_pairs_with_independent_noise(tmp_path, device):
             _core.noise_split_config(bad)
 
 
-@pytest.mark.parametrize("device", helirec.devices())
+@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_pixels_whose_flat_is_zero_do_not_spoil_the_sinogram(tmp_path, device):
     """A pixel whose flat equals its dark (a detector's time stamp, a dead pixel) has no finite value. In rows without
     weight, and in the rows that pad the detector's first row, it must add nothing: zero times infinity is not zero,

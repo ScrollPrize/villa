@@ -1,7 +1,7 @@
-// A BLISS tomo scan as the reconstruction reads it (helirec/calibration/scan.hpp), derived as nxtomomill h52nx and
+// A BLISS tomo scan as the reconstruction reads it (vc_tomography/calibration/scan.hpp), derived as nxtomomill h52nx and
 // nx2etf derive it. The arithmetic follows numpy's where the reference uses it (numpy.linspace in long double for
 // time stamps, numpy.interp, numpy.unwrap, numpy.median), so that the values agree bit for bit.
-#include "helirec/calibration/scan.hpp"
+#include "vc_tomography/calibration/scan.hpp"
 
 #include <sys/stat.h>
 #include <unistd.h>
@@ -21,9 +21,9 @@
 #include "calibration/iso_time.hpp"
 #include "calibration/nxtomo.hpp"
 #include "calibration/unwrap.hpp"
-#include "helirec/common.hpp"
+#include "vc_tomography/common.hpp"
 
-namespace helirec::calibration {
+namespace vc_tomography::calibration {
 
 namespace {
 
@@ -1016,4 +1016,4 @@ std::vector<int> pair_companions(const std::vector<Scan>& scans) {
     return g;
 }
 
-}  // namespace helirec::calibration
+}  // namespace vc_tomography::calibration

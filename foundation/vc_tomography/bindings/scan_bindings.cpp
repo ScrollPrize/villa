@@ -1,18 +1,18 @@
-// Python bindings of helirec/calibration/scan.hpp: a BLISS tomo scan as the reconstruction reads it, the scans
-// below a directory and the families of an extended field of view (python/helirec/bliss.py names them).
+// Python bindings of vc_tomography/calibration/scan.hpp: a BLISS tomo scan as the reconstruction reads it, the scans
+// below a directory and the families of an extended field of view (python/vc_tomography/bliss.py names them).
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
 
-#include "helirec/calibration/scan.hpp"
+#include "vc_tomography/calibration/scan.hpp"
 #include "ndarray_utils.hpp"
 
 namespace nb = nanobind;
 using namespace nb::literals;
-using helirec::py::new_array_t;
-namespace hc = helirec::calibration;
+using vc_tomography::py::new_array_t;
+namespace hc = vc_tomography::calibration;
 
 namespace {
 
@@ -35,7 +35,7 @@ std::vector<hc::Scan> scans_of(const nb::list& scans) {
 void bind_scan(nb::module_& m) {
     nb::class_<hc::FrameList>(m, "FrameList",
                               "Where a sequence of frames is stored: frame i is frame frame_index[i] of `dataset` in files[file_index[i]] "
-                              "(helirec::calibration::FrameList)")
+                              "(vc_tomography::calibration::FrameList)")
         .def_ro("files", &hc::FrameList::files)
         .def_ro("dataset", &hc::FrameList::dataset)
         .def_prop_ro("file_index", [](const hc::FrameList& f) { return arr(f.file_index); })
@@ -46,7 +46,7 @@ void bind_scan(nb::module_& m) {
 
     nb::class_<hc::Scan>(m, "Scan",
                          "A BLISS tomo scan as the reconstruction reads it, derived as nxtomomill h52nx and nx2etf derive it "
-                         "(helirec::calibration::Scan)")
+                         "(vc_tomography::calibration::Scan)")
         .def_ro("name", &hc::Scan::name)
         .def_ro("master", &hc::Scan::master)
         .def_ro("directory", &hc::Scan::directory)

@@ -1,19 +1,19 @@
-// helirec/calibration/geometry_calibration.hpp: the time of a detector row from the beam dips of a refill.
+// vc_tomography/calibration/geometry_calibration.hpp: the time of a detector row from the beam dips of a refill.
 //
 // Each injection shot dips the beam for a few milliseconds, the shots sit on a raster, and which rows of which
 // frame record a shot depends on the row time through the frame period and the gate only. Here the stretch
 // with a refill is found, the columns in air around it, and every row's level in the frames around it; the
-// dips are fitted by calibration::fit_refill_shots (helirec/calibration/refill.hpp).
+// dips are fitted by calibration::fit_refill_shots (vc_tomography/calibration/refill.hpp).
 #include <algorithm>
 #include <cmath>
 #include <limits>
 
 #include "calibration/util.hpp"
-#include "helirec/calibration/geometry_calibration.hpp"
-#include "helirec/calibration/refill.hpp"
+#include "vc_tomography/calibration/geometry_calibration.hpp"
+#include "vc_tomography/calibration/refill.hpp"
 #include "io/json.hpp"
 
-namespace helirec::calibration::geometry_calibration {
+namespace vc_tomography::calibration::geometry_calibration {
 
 namespace {
 
@@ -146,4 +146,4 @@ std::string row_time_from_refill(Session& session, const Acquisition& acq, const
     return row_time_of(session, acq.rows, acq.cols, candidates, log);
 }
 
-}  // namespace helirec::calibration::geometry_calibration
+}  // namespace vc_tomography::calibration::geometry_calibration

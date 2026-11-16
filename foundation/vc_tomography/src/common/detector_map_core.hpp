@@ -1,11 +1,11 @@
 #pragma once
-// Inversion of a detector map (helirec/detector_map.hpp), shared by CPU and CUDA: the same operations in the same
+// Inversion of a detector map (vc_tomography/detector_map.hpp), shared by CPU and CUDA: the same operations in the same
 // order on both. In double precision the sums of the terms are contracted under CUDA (hd::dmuladd), so that the two
 // backends' positions differ by roundings of double precision; in single precision nothing is contracted.
 #include "hd_math.hpp"
-#include "helirec/detector_map.hpp"
+#include "vc_tomography/detector_map.hpp"
 
-namespace helirec::map_core {
+namespace vc_tomography::map_core {
 
 // the operations of either precision
 HR_HD float o_add(float a, float b) { return hd::add(a, b); }
@@ -183,7 +183,7 @@ HR_HD void source(const DetectorMapView& m, double y0, double row_slope, double 
 // about 1e-3 rows per row, so that the rounding of v (6e-5 rows at row 1000) and of the terms leaves about 1e-7 rows.
 // Without a scale and without terms the result is `pos` itself.
 HR_HD float source_row(const DetectorMapView& m, float row_scale, float scale_row, int c, int base, float pos) {
-    using namespace helirec::hd;
+    using namespace vc_tomography::hd;
     const float g = div(1.0f, add(1.0f, row_scale));
     const float lin = sub(pos, mul(row_scale, sub(static_cast<float>(base), scale_row)));
     float out = mul(lin, g);
@@ -209,4 +209,4 @@ HR_HD float source_row(const DetectorMapView& m, float row_scale, float scale_ro
     return out;
 }
 
-}  // namespace helirec::map_core
+}  // namespace vc_tomography::map_core

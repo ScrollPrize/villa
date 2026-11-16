@@ -3,12 +3,12 @@
 
 #include "common/accumulate_core.hpp"
 #include "cuda_utils.cuh"
-#include "helirec/accumulate.hpp"
-#include "helirec/sino.hpp"
+#include "vc_tomography/accumulate.hpp"
+#include "vc_tomography/sino.hpp"
 
-namespace helirec::cuda {
+namespace vc_tomography::cuda {
 
-using namespace helirec::accum_core;
+using namespace vc_tomography::accum_core;
 
 namespace {
 
@@ -125,7 +125,7 @@ DeviceBuffer<T> upload(const std::vector<T>& v, cudaStream_t s) {
 template <class T>
 const T* load(DeviceBuffer<T>& d, const std::vector<T>& v, cudaStream_t s) {
     d.ensure(std::max<std::size_t>(1, v.size()));
-    if (!v.empty()) HELIREC_CUDA_CHECK(cudaMemcpyAsync(d.data(), v.data(), v.size() * sizeof(T), cudaMemcpyHostToDevice, s));
+    if (!v.empty()) VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpyAsync(d.data(), v.data(), v.size() * sizeof(T), cudaMemcpyHostToDevice, s));
     return d.data();
 }
 
@@ -159,16 +159,16 @@ void accumulate(const AccumScanView& view, const ContributorList& c, const Accum
         if (measured_exact) {
             d_col_wt.ensure(n_slots * p.H * stride);
             measured_values_kernel<<<grid, block, 0, st>>>(s, sp, p.H, stride, p, d_col.data(), d_col_wt.data());
-            HELIREC_CUDA_CHECK(cudaGetLastError());
+            VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
             measured_rows_kernel<<<(n_rows + 63) / 64, 64, 0, st>>>(d_col.data(), d_col_wt.data(), n_rows, s.det_cols, stride, s.col_guard);
         } else {
             column_values_kernel<<<grid, block, 0, st>>>(s, sp, p.H, stride, shift, d_col.data());
         }
-        HELIREC_CUDA_CHECK(cudaGetLastError());
+        VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
         if (shift && s.map_cols) {   // each ideal column from its detector column: the detector map, the frames' scale
             d_row.ensure(n_rows);
             resample_row_kernel<<<(n_rows + 255) / 256, 256, 0, st>>>(s, sp, static_cast<int>(n_slots), p.H, d_row.data());
-            HELIREC_CUDA_CHECK(cudaGetLastError());
+            VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
             ResampleGeometry g;
             g.map = s.map;
             g.slope_col = s.slope_col;
@@ -178,7 +178,7 @@ void accumulate(const AccumScanView& view, const ContributorList& c, const Accum
         } else if (shift && s.col_offset) {   // each row by its own amount: the frames' lateral registration
             d_delay.ensure(n_rows);
             column_delay_kernel<<<(n_rows + 255) / 256, 256, 0, st>>>(s, sp, static_cast<int>(n_slots), p.H, d_delay.data());
-            HELIREC_CUDA_CHECK(cudaGetLastError());
+            VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
             shift_rows(d_col.data(), n_rows, s.det_cols, s.fract_x, st, d_delay.data());
         } else if (shift) {
             shift_rows(d_col.data(), n_rows, s.det_cols, s.fract_x, st);
@@ -194,13 +194,13 @@ void accumulate(const AccumScanView& view, const ContributorList& c, const Accum
     const int8_t* role = load(d_role, c.role, st);
     dim3 block(128, 1, 1), grid((p.NX + 127) / 128, p.H, L);
     accumulate_kernel<<<grid, block, 0, st>>>(s, off, proj, role, L, p.H, p.NX, p, R, RW);
-    HELIREC_CUDA_CHECK(cudaGetLastError());
+    VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
     if (weight2) {   // the same contributions with the second weight map
         s.weight = weight2;
         accumulate_kernel<<<grid, block, 0, st>>>(s, off, proj, role, L, p.H, p.NX, p, R2, RW2);
-        HELIREC_CUDA_CHECK(cudaGetLastError());
+        VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
     }
-    HELIREC_CUDA_CHECK(cudaStreamSynchronize(st));
+    VC_TOMOGRAPHY_CUDA_CHECK(cudaStreamSynchronize(st));
 }
 
 void luminosity_sums(const float* R, const float* RW, int L, int H, int NX, int cx, const LuminosityKernel& k,
@@ -209,8 +209,8 @@ void luminosity_sums(const float* R, const float* RW, int L, int H, int NX, int 
     auto gx = upload(k.gx, st);
     auto gz = upload(k.gz, st);
     lum_sums_kernel<<<(L * H + 127) / 128, 128, 0, st>>>(R, RW, L, H, NX, cx, gx.data(), gz.data(), k.radius, A, B);
-    HELIREC_CUDA_CHECK(cudaGetLastError());
-    HELIREC_CUDA_CHECK(cudaStreamSynchronize(st));
+    VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
+    VC_TOMOGRAPHY_CUDA_CHECK(cudaStreamSynchronize(st));
 }
 
 void luminosity_apply(float* R, const float* RW, const float* W_prev, const float* A_ha, const float* B_ha,
@@ -218,31 +218,31 @@ void luminosity_apply(float* R, const float* RW, const float* W_prev, const floa
     const int LH = L * H;
     dim3 grid((NX + 255) / 256, std::min(LH, 65535), (LH + 65534) / 65535);
     lum_apply_kernel<<<grid, 256, 0, as_stream(stream)>>>(R, RW, W_prev, A_ha, B_ha, A_tot, B_tot, L * H, NX, rep);
-    HELIREC_CUDA_CHECK(cudaGetLastError());
+    VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
 }
 
 void add_into(float* R, const float* A, std::size_t n, void* stream) {
     add_into_kernel<<<static_cast<unsigned>(std::min<size_t>((n + 255) / 256, 65535u * 16u)), 256, 0, as_stream(stream)>>>(R, A, n);
-    HELIREC_CUDA_CHECK(cudaGetLastError());
+    VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
 }
 
 void divide(float* R, const float* RW, std::size_t n, void* stream) {
     divide_kernel<<<static_cast<unsigned>(std::min<size_t>((n + 255) / 256, 65535u * 16u)), 256, 0, as_stream(stream)>>>(R, RW, n);
-    HELIREC_CUDA_CHECK(cudaGetLastError());
+    VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
 }
 
 void mend_null_weights(float* R, const float* RW, int L, int H, int NX, float thr, int x0, int x1, void* stream) {
     mend_kernel<<<(L * H + 127) / 128, 128, 0, as_stream(stream)>>>(R, RW, L * H, NX, thr, x0, x1);
-    HELIREC_CUDA_CHECK(cudaGetLastError());
+    VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
 }
 
 void prepare_measured(float* R, float* RW, int L, int H, int NX, float thr, bool fill, float empty, void* stream) {
     support_kernel<<<(L * H + 127) / 128, 128, 0, as_stream(stream)>>>(R, RW, L * H, NX, thr);
-    HELIREC_CUDA_CHECK(cudaGetLastError());
+    VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
     if (fill) {
         fill_measured_kernel<<<(L * H + 127) / 128, 128, 0, as_stream(stream)>>>(R, RW, L, H, NX, empty);
-        HELIREC_CUDA_CHECK(cudaGetLastError());
+        VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
     }
 }
 
-}  // namespace helirec::cuda
+}  // namespace vc_tomography::cuda

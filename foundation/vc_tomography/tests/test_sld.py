@@ -3,9 +3,9 @@ import h5py
 import numpy as np
 import pytest
 
-import helirec
-from helirec import _core
-from helirec.recon import sld_config
+import vc_tomography
+from vc_tomography import _core
+from vc_tomography.recon import sld_config
 
 
 def psf_fft(shape, length, fraction):
@@ -87,7 +87,7 @@ def scan(tmp_path, name, raw, flat, dark, angles, z, current):
                                np.zeros(n, np.int32), np.arange(n, dtype=np.int32))
 
 
-@pytest.mark.parametrize("device", helirec.devices())
+@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_reconstructor_removes_the_glare(tmp_path, device):
     """A helical scan recorded through the scintillator, corrected, grids to the sinogram of the same scan recorded
     without it (varying beam current, non-uniform flat, glare maps every third projection)."""

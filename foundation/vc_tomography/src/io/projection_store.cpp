@@ -1,4 +1,4 @@
-#include "helirec/projection_store.hpp"
+#include "vc_tomography/projection_store.hpp"
 
 #include <cmath>
 #include <cstring>
@@ -9,12 +9,12 @@
 #include <optional>
 #include <unordered_set>
 
-#include "helirec/common.hpp"
+#include "vc_tomography/common.hpp"
 #include "vc_reader/array.hpp"
 #include "vc_reader/zarr.hpp"
 #include "vc_reader/zarr_write.hpp"
 
-namespace helirec {
+namespace vc_tomography {
 namespace fs = std::filesystem;
 using vcr::zarr::Json;
 
@@ -41,13 +41,13 @@ struct ProjectionStoreLevel::Impl {
 
 namespace {
 
-// the "helirec" attribute of a scan group, or null
+// the "vc_tomography" attribute of a scan group, or null
 Json scan_attribute(const std::string& path) {
     std::error_code ec;
     if (!fs::is_directory(path, ec) || !fs::exists(fs::path(path) / "zarr.json", ec)) return nullptr;
     try {
         const Json a = vcr::zarr::readAttributes(path);
-        const auto h = a.find("helirec");
+        const auto h = a.find("vc_tomography");
         if (h != a.end() && h->is_object() && h->contains("levels") && h->contains("frame_first")) return *h;
     } catch (const std::exception&) {
     }
@@ -73,7 +73,7 @@ ProjectionStoreLevel open_projection_store(const std::string& scan_group, int re
     out.frames = h.at("frames").get<std::int64_t>();
     out.dtype = "uint16";
     try {
-        const Json tile = vcr::zarr::readAttributes(fs::path(scan_group).parent_path()).value("helirec_tile", Json::object());
+        const Json tile = vcr::zarr::readAttributes(fs::path(scan_group).parent_path()).value("vc_tomography_tile", Json::object());
         out.stored_rows = tile.value("rows", 0), out.stored_cols = tile.value("cols", 0), out.source_chunk_rows = tile.value("chunk_rows", 0);
     } catch (const std::exception&) {
     }
@@ -83,7 +83,7 @@ ProjectionStoreLevel open_projection_store(const std::string& scan_group, int re
         if (l.value("reduce", -1) == reduce) level = &l;
     if (!level) throw Error(scan_group + ": the store has no level at 1/" + std::to_string(1 << reduce));
     if (!level->value("stored", false))
-        throw Error(scan_group + ": the store declares 1/" + std::to_string(1 << reduce) + " of the detector and does not hold it (helirec-projections-zarr was given no copy at that scale)");
+        throw Error(scan_group + ": the store declares 1/" + std::to_string(1 << reduce) + " of the detector and does not hold it (vc_tomography_projections_zarr was given no copy at that scale)");
     out.impl = std::make_shared<ProjectionStoreLevel::Impl>();
     try {
         const std::string path = (fs::path(scan_group) / level->at("path").get<std::string>()).string();
@@ -117,7 +117,7 @@ void ProjectionStoreLevel::read_chunk(std::int64_t frame, int chunk, void* out) 
 std::vector<ProjectionStoreRun> projection_store_runs(const std::string& scan_group) {
     const Json h = scan_attribute(scan_group);
     if (h.is_null()) throw Error(scan_group + ": not a scan group of a projection store");
-    if (!h.contains("files")) throw Error(scan_group + ": the store does not record its source files; run helirec-projections-zarr on it again");
+    if (!h.contains("files")) throw Error(scan_group + ": the store does not record its source files; run vc_tomography_projections_zarr on it again");
     const std::int64_t frame_first = h.at("frame_first").get<std::int64_t>();
     std::vector<ProjectionStoreRun> out;
     for (const Json& f : h.at("files"))
@@ -244,8 +244,8 @@ void declare_projection_store_scan(const std::string& root, const std::string& s
         if (!before.is_null() && (before.at("frame_first").get<std::int64_t>() != frame_first || before.at("frames").get<std::int64_t>() != frames))
             throw Error("the store holds frames [" + std::to_string(before.at("frame_first").get<std::int64_t>()) + ", +" + std::to_string(before.at("frames").get<std::int64_t>()) +
                         ") of this scan, not [" + std::to_string(frame_first) + ", +" + std::to_string(frames) + ")");
-        vcr::zarr::createGroup(root, Json{{"helirec_projections", {{"format_version", 1}}}}, 3);
-        vcr::zarr::createGroup(fs::path(root) / tile, Json{{"helirec_tile", spec.value("tile_attributes", Json::object())}}, 3);
+        vcr::zarr::createGroup(root, Json{{"vc_tomography_projections", {{"format_version", 1}}}}, 3);
+        vcr::zarr::createGroup(fs::path(root) / tile, Json{{"vc_tomography_tile", spec.value("tile_attributes", Json::object())}}, 3);
         Json levels = Json::array();
         for (int l = 0; l < kLevels; ++l) {
             Json entry{{"path", std::to_string(l)}, {"reduce", l}, {"stored", false}};
@@ -280,7 +280,7 @@ void declare_projection_store_scan(const std::string& root, const std::string& s
         multiscales["metadata"] = {{"downsampling_method", "JPEG 2000 9/7 wavelet low band"}};
         vcr::zarr::createGroup(group,
                                Json{{"multiscales", Json::array({multiscales})},
-                                    {"helirec", {{"role", role}, {"tile", tile}, {"scan", scan}, {"frame_first", frame_first}, {"frames", frames}, {"levels", levels}, {"files", files}}}},
+                                    {"vc_tomography", {{"role", role}, {"tile", tile}, {"scan", scan}, {"frame_first", frame_first}, {"frames", frames}, {"levels", levels}, {"files", files}}}},
                                3);
         // one value per frame
         const std::size_t n = static_cast<std::size_t>(frames);
@@ -377,4 +377,4 @@ void ProjectionStoreWriter::write(std::int64_t first, std::int64_t count, const 
     }
 }
 
-}  // namespace helirec
+}  // namespace vc_tomography

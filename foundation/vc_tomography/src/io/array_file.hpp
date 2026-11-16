@@ -11,10 +11,10 @@
 #include <string>
 #include <vector>
 
-#include "helirec/common.hpp"
+#include "vc_tomography/common.hpp"
 #include "io/json.hpp"
 
-namespace helirec {
+namespace vc_tomography {
 
 struct NamedArray {
     std::string name;
@@ -121,4 +121,4 @@ inline ArrayFile read_array_file(const std::string& path, bool values = true) {
     return out;
 }
 
-}  // namespace helirec
+}  // namespace vc_tomography

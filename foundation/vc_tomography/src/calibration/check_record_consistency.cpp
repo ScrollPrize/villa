@@ -6,9 +6,9 @@
 #include <set>
 
 #include "calibration/util.hpp"
-#include "helirec/calibration/record_checks.hpp"
+#include "vc_tomography/calibration/record_checks.hpp"
 
-namespace helirec::calibration {
+namespace vc_tomography::calibration {
 
 namespace {
 
@@ -982,4 +982,4 @@ void check_record_tiles(const std::vector<Record>& recs, Report& rep, double eps
     }
 }
 
-}  // namespace helirec::calibration
+}  // namespace vc_tomography::calibration

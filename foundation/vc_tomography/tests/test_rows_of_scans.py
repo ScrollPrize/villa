@@ -6,8 +6,8 @@ import h5py
 import numpy as np
 import pytest
 
-import helirec
-from helirec import _core
+import vc_tomography
+from vc_tomography import _core
 from test_sirt_pipeline import recon
 
 NR, ND, NGRID = 12, 24, 64
@@ -41,7 +41,7 @@ def grid(tmp_path, lit=None, weight=None, gains=(1.0, 1.0)):
     return [circular_scan(tmp_path, f"r{r}c{c}", 16 * c, 8 * r, lit, weight, gains[r] if c else 1.0) for r in range(2) for c in range(2)]
 
 
-@pytest.mark.parametrize("device", helirec.devices())
+@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_heights_are_the_union_over_the_rows(tmp_path, device):
     kw = dict(backprojector="fbp", grid_size=0, rot_center=11.5, luminosity_repartition=0.)
     r = recon(grid(tmp_path), device, **kw)
@@ -61,7 +61,7 @@ def test_heights_are_the_union_over_the_rows(tmp_path, device):
     assert recon(grid(tmp_path)[:2] + grid(tmp_path)[3:], device, **kw).info["doable"] == (0, 11)
 
 
-@pytest.mark.parametrize("device", helirec.devices())
+@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_the_luminosity_step_joins_the_scans_of_each_row(tmp_path, device):
     """The second scan of the first row reads 3 % above its neighbour and that of the second row 2 % below. The step
     compares a scan with the earlier scans of its own row at their seam (another row holds other rows of the detector
@@ -97,7 +97,7 @@ def test_the_luminosity_step_joins_the_scans_of_each_row(tmp_path, device):
         recon([g[0], g[2], g[1], g[3]], device, **dict(kw, luminosity_repartition=100.))
 
 
-@pytest.mark.parametrize("device", helirec.devices())
+@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_rows_the_beam_does_not_light_are_not_seen_through(tmp_path, device):
     kw = dict(backprojector="fbp", grid_size=0, rot_center=11.5, luminosity_repartition=0.)
     weight = np.zeros((NR, ND), np.float32)
@@ -115,7 +115,7 @@ def test_rows_the_beam_does_not_light_are_not_seen_through(tmp_path, device):
         recon(grid(tmp_path, lit=(4, 10), weight=apart), device, **kw).info["doable"] == (4, 9)
 
 
-@pytest.mark.parametrize("device", helirec.devices())
+@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_the_fan_of_a_grids_columns(tmp_path, device):
     """A beam that diverges (fan_per_column): every merged column takes the fan of the detector column that holds
     it, counted from that scan's middle column, so the fan starts again at each place across the beam; over the

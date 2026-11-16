@@ -39,7 +39,7 @@ import os
 
 import numpy as np
 from scipy.interpolate import PchipInterpolator
-from helirec import _core
+from vc_tomography import _core
 
 
 def model(p, nu):

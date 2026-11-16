@@ -1,14 +1,14 @@
 #pragma once
-// The joint geometry model for one sighting (helirec/calibration/geometry_calibration.hpp states the model): the
+// The joint geometry model for one sighting (vc_tomography/calibration/geometry_calibration.hpp states the model): the
 // ray of the sample that an ideal detector position records. Templated on the scalar, so that the solver's
 // residuals (automatic derivatives) and the report go through the same lines.
 #include <algorithm>
 #include <cmath>
 #include <vector>
 
-#include "helirec/common.hpp"
+#include "vc_tomography/common.hpp"
 
-namespace helirec::calibration::geometry_calibration::model {
+namespace vc_tomography::calibration::geometry_calibration::model {
 
 // a per-frame series of the record at a fraction of a frame: a line between frames, continued beyond the ends
 inline double at_frame(const std::vector<double>& v, double f) {
@@ -44,7 +44,7 @@ Now<T> now(const At& at, const T& beyond) {
 
 // The ideal position (X, Y) the stored pixel (c, v) looks along: the detector's map added, X = c + Eu(c, v),
 // Y = v + Ev(c, v). map: the coefficients of Eu, then those of Ev, `terms` each; phi: the terms' values at (c, v)
-// (helirec/geometry.hpp states the polynomial). terms = 0: no map, the pixel itself.
+// (vc_tomography/geometry.hpp states the polynomial). terms = 0: no map, the pixel itself.
 // radial, radial_u, radial_v: where the map's four terms of a radial displacement are one unknown
 // (GeometryOptions::radial_map), that unknown and what a unit of it moves the columns and the rows by at (c, v);
 // none: nullptr.
@@ -134,4 +134,4 @@ void lens_displacement(const T* place_a, const T* turn_a, const T* place_b, cons
     moved[2] = place_b[2] - place_a[2] + w[0] * q[1] - w[1] * q[0];
 }
 
-}  // namespace helirec::calibration::geometry_calibration::model
+}  // namespace vc_tomography::calibration::geometry_calibration::model

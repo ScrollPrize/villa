@@ -3,9 +3,9 @@
 
 #include "common/interp_core.hpp"
 #include "cuda_utils.cuh"
-#include "helirec/kernels.hpp"
+#include "vc_tomography/kernels.hpp"
 
-namespace helirec::cuda {
+namespace vc_tomography::cuda {
 
 namespace {
 constexpr int kTile = 16;           // 16x16 threads per block; a block takes a tile of 32x32 pixels, four per thread
@@ -85,44 +85,44 @@ void backproject(const float* sino, const float* angles_host, float* slice, int 
     if (p.fan && p.n_fan < 1) throw Error("backproject: a fan without columns");
     if (p.fan) {
         d_fan.ensure(static_cast<size_t>(p.n_fan));
-        HELIREC_CUDA_CHECK(cudaMemcpyAsync(d_fan.data(), p.fan, p.n_fan * sizeof(float), cudaMemcpyHostToDevice, s));
+        VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpyAsync(d_fan.data(), p.fan, p.n_fan * sizeof(float), cudaMemcpyHostToDevice, s));
     }
     d_cs.ensure(cs.size());
-    HELIREC_CUDA_CHECK(cudaMemcpyAsync(d_cs.data(), cs.data(), cs.size() * sizeof(float2), cudaMemcpyHostToDevice, s));
+    VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpyAsync(d_cs.data(), cs.data(), cs.size() * sizeof(float2), cudaMemcpyHostToDevice, s));
     const int ntx = (nx + 2 * kTile - 1) / (2 * kTile), nty = (ny + 2 * kTile - 1) / (2 * kTile);
     dim3 block(kTile, kTile), grid(ntx, nty);
     const int32_t* tiles = nullptr;
     if (p.tiles) {   // the listed tiles alone; the others are 0
-        HELIREC_CUDA_CHECK(cudaMemsetAsync(slice, 0, static_cast<size_t>(ny) * nx * sizeof(float), s));
+        VC_TOMOGRAPHY_CUDA_CHECK(cudaMemsetAsync(slice, 0, static_cast<size_t>(ny) * nx * sizeof(float), s));
         if (p.n_tiles <= 0) {
-            HELIREC_CUDA_CHECK(cudaStreamSynchronize(s));
+            VC_TOMOGRAPHY_CUDA_CHECK(cudaStreamSynchronize(s));
             return;
         }
         d_tiles.ensure(static_cast<size_t>(p.n_tiles));
-        HELIREC_CUDA_CHECK(cudaMemcpyAsync(d_tiles.data(), p.tiles, p.n_tiles * sizeof(int32_t), cudaMemcpyHostToDevice, s));
+        VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpyAsync(d_tiles.data(), p.tiles, p.n_tiles * sizeof(int32_t), cudaMemcpyHostToDevice, s));
         tiles = d_tiles.data();
         grid = dim3(p.n_tiles, 1);
     }
-#define HELIREC_BP_OF(K, FAN) backproject_kernel<K, FAN><<<grid, block, 0, s>>>(sino, d_cs.data(), slice, n_angles, n_det, ny, nx, \
+#define VC_TOMOGRAPHY_BP_OF(K, FAN) backproject_kernel<K, FAN><<<grid, block, 0, s>>>(sino, d_cs.data(), slice, n_angles, n_det, ny, nx, \
                                            p.rot_center, p.scale, c, p.x0, p.y0, p.clip_outer_circle, r * r, p.u_scale, \
                                            tiles, ntx, p.fan ? d_fan.data() : nullptr, p.n_fan)
-#define HELIREC_BP(K) \
+#define VC_TOMOGRAPHY_BP(K) \
     do { \
-        if (p.fan) HELIREC_BP_OF(K, true); \
-        else HELIREC_BP_OF(K, false); \
+        if (p.fan) VC_TOMOGRAPHY_BP_OF(K, true); \
+        else VC_TOMOGRAPHY_BP_OF(K, false); \
     } while (0)
     switch (p.interp) {
-        case interp_core::Linear: HELIREC_BP(interp_core::Linear); break;
-        case interp_core::Cubic: HELIREC_BP(interp_core::Cubic); break;
-        case interp_core::Lanczos3: HELIREC_BP(interp_core::Lanczos3); break;
-        case interp_core::BSpline3: HELIREC_BP(interp_core::BSpline3); break;
-        case interp_core::BSpline5: HELIREC_BP(interp_core::BSpline5); break;
+        case interp_core::Linear: VC_TOMOGRAPHY_BP(interp_core::Linear); break;
+        case interp_core::Cubic: VC_TOMOGRAPHY_BP(interp_core::Cubic); break;
+        case interp_core::Lanczos3: VC_TOMOGRAPHY_BP(interp_core::Lanczos3); break;
+        case interp_core::BSpline3: VC_TOMOGRAPHY_BP(interp_core::BSpline3); break;
+        case interp_core::BSpline5: VC_TOMOGRAPHY_BP(interp_core::BSpline5); break;
         default: throw Error("backproject: unknown interpolation");
     }
-#undef HELIREC_BP
-#undef HELIREC_BP_OF
-    HELIREC_CUDA_CHECK(cudaGetLastError());
-    HELIREC_CUDA_CHECK(cudaStreamSynchronize(s));  // the slice is complete on return
+#undef VC_TOMOGRAPHY_BP
+#undef VC_TOMOGRAPHY_BP_OF
+    VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
+    VC_TOMOGRAPHY_CUDA_CHECK(cudaStreamSynchronize(s));  // the slice is complete on return
 }
 
-}  // namespace helirec::cuda
+}  // namespace vc_tomography::cuda

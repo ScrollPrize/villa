@@ -1,8 +1,8 @@
 #include "cuda_utils.cuh"
 #include "common/output_core.hpp"
-#include "helirec/kernels.hpp"
+#include "vc_tomography/kernels.hpp"
 
-namespace helirec::cuda {
+namespace vc_tomography::cuda {
 
 namespace {
 __global__ void to_uint8_kernel(const float* __restrict__ src, std::size_t src_pitch, std::uint8_t* __restrict__ out,
@@ -30,7 +30,7 @@ void to_uint8(const float* src, std::size_t src_pitch, std::uint8_t* out, int ny
                                                            static_cast<float>(w.hi - w.lo), w.disk_n, w.x0, w.y0,
                                                            w.mask, w.mask_ny, w.mask_nx, w.mask_fy, w.mask_fx,
                                                            w.mask_oy, w.mask_ox);
-    HELIREC_CUDA_CHECK(cudaGetLastError());
+    VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
 }
 
-}  // namespace helirec::cuda
+}  // namespace vc_tomography::cuda

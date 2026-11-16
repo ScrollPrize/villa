@@ -1,4 +1,4 @@
-#include "helirec/calibration/record.hpp"
+#include "vc_tomography/calibration/record.hpp"
 
 #include <sys/stat.h>
 
@@ -8,7 +8,7 @@
 #include "calibration/h5_read.hpp"
 #include "calibration/nxtomo.hpp"
 
-namespace helirec::calibration {
+namespace vc_tomography::calibration {
 
 const char* role_name(Role r) {
     switch (r) {
@@ -319,4 +319,4 @@ Record read_record(const std::string& h5_path, bool frame_files) {
     return rec;
 }
 
-}  // namespace helirec::calibration
+}  // namespace vc_tomography::calibration

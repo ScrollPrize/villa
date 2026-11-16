@@ -12,10 +12,10 @@
 #include "common/tomo_algorithms.hpp"
 #include "common/tomo_core.hpp"
 #include "cuda_utils.cuh"
-#include "helirec/tomo.hpp"
-#include "helirec/sino.hpp"
+#include "vc_tomography/tomo.hpp"
+#include "vc_tomography/sino.hpp"
 
-namespace helirec::cuda {
+namespace vc_tomography::cuda {
 
 namespace {
 using tomo_core::AngleC;
@@ -188,7 +188,7 @@ __global__ void transpose_kernel(const float* __restrict__ in, float* out, int W
 }
 void transpose(const float* in, float* out, int W, int H) {
     transpose_kernel<<<dim3((W + 31) / 32, (H + 31) / 32), dim3(32, 8)>>>(in, out, W, H);
-    HELIREC_CUDA_CHECK(cudaGetLastError());
+    VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
 }
 
 template <class F>
@@ -329,15 +329,15 @@ struct CudaBackend final : TomoWorkspace {
             if (sf_rows.size() != nr || sf_cols.size() != nc) {
                 sf_rows.resize(nr);
                 sf_cols.resize(nc);
-                HELIREC_CUDA_CHECK(cudaMemsetAsync(sf_rows.data(), 0, nr * sizeof(float)));
-                HELIREC_CUDA_CHECK(cudaMemsetAsync(sf_cols.data(), 0, nc * sizeof(float)));
+                VC_TOMOGRAPHY_CUDA_CHECK(cudaMemsetAsync(sf_rows.data(), 0, nr * sizeof(float)));
+                VC_TOMOGRAPHY_CUDA_CHECK(cudaMemsetAsync(sf_cols.data(), 0, nc * sizeof(float)));
             }
             sf_image_kernel<<<dim3((g.W + 31) / 32, (g.H + 31) / 32), dim3(32, 8)>>>(x, sf_rows.data(), sf_cols.data(), g);
             const int wpa = g.n_det / kSfCells + 1;   // boundaries 0 .. n_det
             const std::size_t work = static_cast<std::size_t>((n_sel + kSfGroup - 1) / kSfGroup) * wpa;
             sf_project_kernel<<<static_cast<unsigned>(std::min<std::size_t>(work, 1u << 20)), 32 * kSfGroup>>>(
                 tomo_core::SfImage{sf_rows.data(), sf_cols.data()}, sel, n_sel, ak.data(), sfa.data(), g, wpa, epi);
-            HELIREC_CUDA_CHECK(cudaGetLastError());
+            VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
             return;
         }
         const float* xt = nullptr;
@@ -349,7 +349,7 @@ struct CudaBackend final : TomoWorkspace {
         const std::size_t rays = static_cast<std::size_t>(n_sel) * g.n_det;
         if (rays < (1u << 16)) project_warp_kernel<<<grid_for(rays * 32), 256>>>(x, xt, sel, n_sel, ak.data(), g, epi);
         else project_kernel<<<grid_for(rays), 256>>>(x, xt, sel, n_sel, ak.data(), g, epi);
-        HELIREC_CUDA_CHECK(cudaGetLastError());
+        VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
     }
     // ray norms over the disk; SF row sums: the projection of the all-ones image
     const float* len2() {
@@ -363,14 +363,14 @@ struct CudaBackend final : TomoWorkspace {
                 std::vector<int32_t> all(n_angles);
                 for (int i = 0; i < n_angles; ++i) all[i] = i;
                 project(ones.data(), ints(all), n_angles, tomo_algos::StoreEpi{l2.data()});
-                HELIREC_CUDA_CHECK(cudaDeviceSynchronize());
+                VC_TOMOGRAPHY_CUDA_CHECK(cudaDeviceSynchronize());
                 ones.reset();
             } else if (norm == 2) {
                 len2_kernel<2><<<grid_for(rays), 256>>>(ak.data(), n_angles, gfull, l2.data());
             } else {
                 len2_kernel<1><<<grid_for(rays), 256>>>(ak.data(), n_angles, gfull, l2.data());
             }
-            HELIREC_CUDA_CHECK(cudaGetLastError());
+            VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
             have_l2 = pj * 4 + norm;
         }
         return l2.data();
@@ -379,12 +379,12 @@ struct CudaBackend final : TomoWorkspace {
         dim3 block(kTile, kTile), grid((g.W + 2 * kTile - 1) / (2 * kTile), (g.H + 2 * kTile - 1) / (2 * kTile));
         if (pj == tomo_core::SF) backproject_kernel<tomo_core::SF><<<grid, block>>>(y, x, sel, n_sel, ak.data(), g, accumulate);
         else backproject_kernel<tomo_core::Chord><<<grid, block>>>(y, x, sel, n_sel, ak.data(), g, accumulate);
-        HELIREC_CUDA_CHECK(cudaGetLastError());
+        VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
     }
     template <class F>
     void each(std::size_t n, const F& f) {
         each_kernel<<<grid_for(n), 256>>>(n, f);
-        HELIREC_CUDA_CHECK(cudaGetLastError());
+        VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
     }
     void fill(float* d, float v, std::size_t n) { each(n, FillF{d, v}); }
     void weighted_rows(const float* rows, const float* w, float* out, std::size_t n) { each(n, WeightF{rows, w, out}); }
@@ -420,7 +420,7 @@ struct CudaBackend final : TomoWorkspace {
             gr_have_fp = true;
         }
         const std::size_t H_n = static_cast<std::size_t>(pdim) * pdim;
-        HELIREC_CUDA_CHECK(cudaMemsetAsync(gr_H.data(), 0, H_n * sizeof(cufftComplex)));
+        VC_TOMOGRAPHY_CUDA_CHECK(cudaMemsetAsync(gr_H.data(), 0, H_n * sizeof(cufftComplex)));
         const float L2 = static_cast<float>(static_cast<int>(kC / M_PI));
         const int L = kernel_cells();
         const float tblspcg = 2.f * kLtbl / L;
@@ -439,11 +439,11 @@ struct CudaBackend final : TomoWorkspace {
             spread_kernel<<<grid_for(static_cast<std::size_t>(n) * (pd2 - 1)), 256>>>(
                 gr_rows.data(), n, pdim, gr_fp.data(), cs_of_angles(), p0, gr_wtbl.data(), L2, tblspcg,
                 -2.f * static_cast<float>(M_PI) * grid_shift(N) / pdim, reinterpret_cast<float*>(gr_H.data()));
-            HELIREC_CUDA_CHECK(cudaGetLastError());
+            VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
         }
         cufft_check(cufftExecC2C(gr_plan2, gr_H.data(), gr_H.data(), CUFFT_FORWARD), "2d");
         extract_kernel<<<grid_for(static_cast<std::size_t>(N) * N), 256>>>(gr_H.data(), gr_winv.data(), pdim, N, out);
-        HELIREC_CUDA_CHECK(cudaGetLastError());
+        VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
     }
     DeviceBuffer<float2> cs;
     const float2* cs_of_angles() {
@@ -480,7 +480,7 @@ void tomo_reconstruct(const TomoArgs& a, const TomoGeom& t, const float* rows, c
                       const float* angles_host, float* out, std::unique_ptr<TomoWorkspace>* ws, const float* start) {
     std::unique_ptr<TomoWorkspace> local;
     tomo_algos::run(backend_for(t, angles_host, ws, local), a, rows, weights, out, start);
-    HELIREC_CUDA_CHECK(cudaDeviceSynchronize());
+    VC_TOMOGRAPHY_CUDA_CHECK(cudaDeviceSynchronize());
 }
 
 void chord_project(const float* img, float* sino, const float* angles_host, int n_angles, int n_det, int N, float rot, int projector) {
@@ -490,7 +490,7 @@ void chord_project(const float* img, float* sino, const float* angles_host, int 
     std::vector<int32_t> all(n_angles);
     for (int i = 0; i < n_angles; ++i) all[i] = i;
     b.project(img, b.ints(all), n_angles, tomo_algos::StoreEpi{sino});
-    HELIREC_CUDA_CHECK(cudaDeviceSynchronize());
+    VC_TOMOGRAPHY_CUDA_CHECK(cudaDeviceSynchronize());
 }
 
 void chord_backproject(const float* sino, float* img, const float* angles_host, int n_angles, int n_det, int N, float rot, int projector) {
@@ -500,7 +500,7 @@ void chord_backproject(const float* sino, float* img, const float* angles_host, 
     std::vector<int32_t> all(n_angles);
     for (int i = 0; i < n_angles; ++i) all[i] = i;
     b.backproject(sino, img, b.ints(all), n_angles, false);
-    HELIREC_CUDA_CHECK(cudaDeviceSynchronize());
+    VC_TOMOGRAPHY_CUDA_CHECK(cudaDeviceSynchronize());
 }
 
-}  // namespace helirec::cuda
+}  // namespace vc_tomography::cuda

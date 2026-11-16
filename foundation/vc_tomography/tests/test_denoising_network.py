@@ -1,4 +1,4 @@
-"""networks/denoising: the network's tiling and the spool's bookkeeping. Needs PyTorch (helirec's environment has
+"""networks/denoising: the network's tiling and the spool's bookkeeping. Needs PyTorch (vc_tomography's environment has
 none: the tests are skipped there); on the host, small sizes."""
 import importlib.util
 from pathlib import Path

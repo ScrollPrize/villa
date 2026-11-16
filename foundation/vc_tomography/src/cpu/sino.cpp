@@ -8,12 +8,12 @@
 
 #include "common/rebalance_core.hpp"
 #include "common/sino_core.hpp"
-#include "helirec/filters.hpp"
-#include "helirec/sino.hpp"
+#include "vc_tomography/filters.hpp"
+#include "vc_tomography/sino.hpp"
 
-namespace helirec {
+namespace vc_tomography {
 
-using namespace helirec::sino_core;
+using namespace vc_tomography::sino_core;
 
 namespace {
 
@@ -417,4 +417,4 @@ int rebalance_turns(float* R, float* W, int n_proj, int n_rows, int n_cols, int 
 }
 
 }  // namespace cpu
-}  // namespace helirec
+}  // namespace vc_tomography

@@ -29,7 +29,7 @@
 //                 where the command states none
 //   ring current  the one value of the scan stands for each of its frames
 //
-// What the file does not hold is read from a supplement file beside the master, helirec_acquisition.json:
+// What the file does not hold is read from a supplement file beside the master, vc_tomography_acquisition.json:
 //
 //   {"pixel_size_um": 7.91,                  the sample's pixel (required: nothing can be placed without it)
 //    "energy_kev": 53,                       optional
@@ -44,12 +44,12 @@
 // <prefix> the translation stage's name up to its last "_" ("ss1_x" -> "ss1"), where the file holds such motors.
 #include <string>
 
-#include "helirec/calibration/record.hpp"
-#include "helirec/calibration/scan.hpp"
+#include "vc_tomography/calibration/record.hpp"
+#include "vc_tomography/calibration/scan.hpp"
 
-namespace helirec::calibration::nxtomo {
+namespace vc_tomography::calibration::nxtomo {
 
-inline constexpr const char* kSupplement = "helirec_acquisition.json";
+inline constexpr const char* kSupplement = "vc_tomography_acquisition.json";
 
 // whether the HDF5 file at `path` holds an entry with an NXtomo subentry (false for anything else, unreadable files included)
 bool is_master(const std::string& path);
@@ -60,4 +60,4 @@ Record read_record(const std::string& path, bool frame_files);
 // master: the absolute path of the file
 Scan open_scan(const std::string& master);
 
-}  // namespace helirec::calibration::nxtomo
+}  // namespace vc_tomography::calibration::nxtomo

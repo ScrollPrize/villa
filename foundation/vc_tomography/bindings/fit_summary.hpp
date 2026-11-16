@@ -1,8 +1,8 @@
 #pragma once
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/string.h>
-#include "helirec/calibration/solve.hpp"
-inline nanobind::dict fit_summary_dict(const helirec::calibration::FitSummary& s) {
+#include "vc_tomography/calibration/solve.hpp"
+inline nanobind::dict fit_summary_dict(const vc_tomography::calibration::FitSummary& s) {
     nanobind::dict d;
     d["cost"] = s.cost;
     d["iterations"] = s.iterations;

@@ -5,7 +5,7 @@
 #include "hd_math.hpp"
 #include "interp_core.hpp"
 
-namespace helirec::block_spectra_core {
+namespace vc_tomography::block_spectra_core {
 
 // signed frequency index of transform index i of an even n: [-n / 2, n / 2)
 HR_HD int signed_index(int i, int n) { return i < n / 2 ? i : i - n; }
@@ -86,4 +86,4 @@ HR_HD float sample_volume(const float* v, int nz, int ny, int nx, double pz, dou
     return acc;
 }
 
-}  // namespace helirec::block_spectra_core
+}  // namespace vc_tomography::block_spectra_core

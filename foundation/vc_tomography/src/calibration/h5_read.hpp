@@ -11,9 +11,9 @@
 #include <string>
 #include <vector>
 
-#include "helirec/common.hpp"
+#include "vc_tomography/common.hpp"
 
-namespace helirec::calibration::h5 {
+namespace vc_tomography::calibration::h5 {
 
 struct Id {
     hid_t id = -1;
@@ -304,4 +304,4 @@ inline FrameDataset frame_dataset(hid_t loc, const std::string& dataset) {
     return out;
 }
 
-}  // namespace helirec::calibration::h5
+}  // namespace vc_tomography::calibration::h5

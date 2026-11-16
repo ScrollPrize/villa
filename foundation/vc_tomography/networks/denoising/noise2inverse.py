@@ -1,5 +1,5 @@
-"""Noise2Inverse for helirec's reconstructions: a 3D U-Net trained on pairs of reconstructions of the same slices
-with independent noise, and applied to a reconstruction. Not in the helirec package: it needs PyTorch.
+"""Noise2Inverse for vc_tomography's reconstructions: a 3D U-Net trained on pairs of reconstructions of the same slices
+with independent noise, and applied to a reconstruction. Not in the vc_tomography package: it needs PyTorch.
 
 Hendriksen, Pelt & Batenburg, "Noise2Inverse: self-supervised deep convolutional denoising for tomography" (2020).
 The frames' noise is independent from frame to frame, so the reconstructions of the even and of the odd projections
@@ -17,7 +17,7 @@ The halves leave out every second angle, and on a scan with too few angles what 
 signs in the two halves: the network learns it, and loses detail with it (measured on PHerc. 172). A slab given as
 A.npz+B.npz is instead a pair of independent recordings of the same slices, each from all its angles (`full` of each
 file: the two rows of scans where both record a height, each reconstructed alone): Noise2Noise, nothing left out.
-A.npz>B.npz is a pair of which A is always the input: two runs of helirec's noise_split on the same projections
+A.npz>B.npz is a pair of which A is always the input: two runs of vc_tomography's noise_split on the same projections
 (scales a and -1 / a: A with (1 + a^2) of the noise variance, close to the data's, B with (1 + 1 / a^2) of it).
 
 apply writes, for the block's region: even, odd (the network on each half: neither has seen the other half), full

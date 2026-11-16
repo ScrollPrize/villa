@@ -15,7 +15,7 @@
 #include <string>
 #include <vector>
 
-namespace helirec::j2k {
+namespace vc_tomography::j2k {
 
 inline constexpr unsigned kBlosc2FilterId = 32026;
 
@@ -75,4 +75,4 @@ void decode_htj2k(const ReadAt& read, std::size_t size, std::size_t nbytes, int 
 // them, with a reversible (exact) codestream.
 std::vector<std::uint8_t> encode_chunk(const std::uint16_t* values, int width, int height);
 
-}  // namespace helirec::j2k
+}  // namespace vc_tomography::j2k

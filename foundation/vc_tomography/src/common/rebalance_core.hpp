@@ -6,9 +6,9 @@
 #include <utility>
 #include <vector>
 
-#include "helirec/sino.hpp"
+#include "vc_tomography/sino.hpp"
 
-namespace helirec::rebalance_core {
+namespace vc_tomography::rebalance_core {
 
 struct Contribution {
     int k0, k1;
@@ -156,4 +156,4 @@ inline TurnHoles turn_holes_from(const std::vector<float>& peak, int turn) {
     return out;
 }
 
-}  // namespace helirec::rebalance_core
+}  // namespace vc_tomography::rebalance_core

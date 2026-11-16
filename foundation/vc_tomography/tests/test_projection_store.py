@@ -1,4 +1,4 @@
-"""Frames read from a projection store (helirec/projection_store.hpp; made by helirec-projections-zarr): RawReader
+"""Frames read from a projection store (vc_tomography/projection_store.hpp; made by vc_tomography_projections_zarr): RawReader
 takes a scan group where it takes a file, at the levels the store holds, and frames_in_projection_store finds a
 scan's frames in it. The detector's files and the store are made up here; the store's values are the ones a
 reduced read would give only by this test's construction (every level keeps the stored pixels (j, k) 2^l)."""
@@ -10,15 +10,15 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from helirec import _core
+from vc_tomography import _core
 
 h5py = pytest.importorskip("h5py")
 from test_reconstruct_tool import COLS, ROWS, _write  # noqa: E402
 
 _HERE = Path(_core.__file__).resolve().parent
-TOOL = next((str(d / "helirec-projections-zarr") for d in (_HERE, *_HERE.parents[:2]) if (d / "helirec-projections-zarr").exists()),
-            None) or shutil.which("helirec-projections-zarr")
-pytestmark = pytest.mark.skipif(TOOL is None, reason="helirec-projections-zarr is not built")
+TOOL = next((str(d / "vc_tomography_projections_zarr") for d in (_HERE, *_HERE.parents[:2]) if (d / "vc_tomography_projections_zarr").exists()),
+            None) or shutil.which("vc_tomography_projections_zarr")
+pytestmark = pytest.mark.skipif(TOOL is None, reason="vc_tomography_projections_zarr is not built")
 N, FIRST = 240, 40           # projections of the scan; the store holds [FIRST, N)
 DATASET = "/entry_0000/instrument/det3/data"
 

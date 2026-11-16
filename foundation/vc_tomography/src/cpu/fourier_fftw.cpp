@@ -8,16 +8,16 @@
 #include <algorithm>
 #include <vector>
 
-#include "helirec/fourier.hpp"
+#include "vc_tomography/fourier.hpp"
 
-namespace helirec {
+namespace vc_tomography {
 std::mutex& fftw_planner_mutex() {
     static std::mutex m;
     return m;
 }
-}  // namespace helirec
+}  // namespace vc_tomography
 
-namespace helirec::cpu {
+namespace vc_tomography::cpu {
 
 namespace {
 
@@ -129,4 +129,4 @@ std::unique_ptr<FourierFilter> make_fourier_filter(const FourierFilterSpec& spec
     return std::make_unique<FftwFourierFilter>(spec);
 }
 
-}  // namespace helirec::cpu
+}  // namespace vc_tomography::cpu

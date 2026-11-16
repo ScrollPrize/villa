@@ -1,5 +1,5 @@
 // Detector map of the reconstruction: checks, the bounds its inversion is planned with, and host entry points.
-#include "helirec/detector_map.hpp"
+#include "vc_tomography/detector_map.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -7,7 +7,7 @@
 
 #include "common/detector_map_core.hpp"
 
-namespace helirec {
+namespace vc_tomography {
 
 namespace {
 
@@ -98,4 +98,4 @@ void detector_map_source_row(const DetectorMapView& map, const int32_t* c, const
     for (std::size_t q = 0; q < n; ++q) out[q] = map_core::source_row(map, row_scale, scale_row, c[q], base[q], pos[q]);
 }
 
-}  // namespace helirec
+}  // namespace vc_tomography

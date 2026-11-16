@@ -4,9 +4,9 @@
 #include <vector>
 
 #include "common/epr_core.hpp"
-#include "helirec/filters.hpp"
+#include "vc_tomography/filters.hpp"
 
-namespace helirec::cpu {
+namespace vc_tomography::cpu {
 
 void epr_frames(float* frames, int n_frames, int H, int W, const EprParams& p, FourierFilter& paganin) {
     using namespace epr_core;
@@ -68,4 +68,4 @@ void epr_frames(float* frames, int n_frames, int H, int W, const EprParams& p, F
     }
 }
 
-}  // namespace helirec::cpu
+}  // namespace vc_tomography::cpu

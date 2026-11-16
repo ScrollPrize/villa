@@ -1,4 +1,4 @@
-#include "helirec/calibration/frames.hpp"
+#include "vc_tomography/calibration/frames.hpp"
 
 #include <omp.h>
 
@@ -6,9 +6,9 @@
 #include <cmath>
 #include <map>
 
-#include "helirec/raw_reader.hpp"
+#include "vc_tomography/raw_reader.hpp"
 
-namespace helirec::calibration {
+namespace vc_tomography::calibration {
 
 Frames::Frames(const Record& rec, int n_threads, int reduce) : rec_(&rec), n_threads_(n_threads), reduce_(reduce) {
     std::vector<std::string> files;
@@ -376,4 +376,4 @@ void shift_columns(const float* wide, std::size_t n, int nrows, int ncols, int p
         }
 }
 
-}  // namespace helirec::calibration
+}  // namespace vc_tomography::calibration

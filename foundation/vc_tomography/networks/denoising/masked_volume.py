@@ -1,14 +1,14 @@
-"""A scan reconstructed with helirec, denoised by a trained network (noise2inverse.py) and written as a uint8
+"""A scan reconstructed with vc_tomography, denoised by a trained network (noise2inverse.py) and written as a uint8
 OME-Zarr under a mask, where the reconstruction needs the device to itself.
 
     python masked_volume.py DATA --cache DIR --geometry CAL.json --filters CHAIN [--set KEY=VALUE ..]
                             --window LO HI --voxel_um UM --mask MASK.npy --model model.pt --torch_python PYTHON
                             --zarr OUT.zarr [--zarr_not_denoised RAW.zarr] --spool DIR [--slices J0 J1]
 
-Run with helirec's environment; --torch_python is the Python of an environment that has PyTorch. The reconstruction's
+Run with vc_tomography's environment; --torch_python is the Python of an environment that has PyTorch. The reconstruction's
 parameters are those of reconstruct_block.py (`pinned_params`: the same recipe as the network's training blocks).
 
-The volume is helirec's slice grid (grid x grid) over every height the scan can give: slice j is view height
+The volume is vc_tomography's slice grid (grid x grid) over every height the scan can give: slice j is view height
 (first doable height) + j. It is made in segments along the axis, each inside the box the mask keeps over the
 segment (plus a margin for the network's halo):
 
@@ -22,7 +22,7 @@ A segment whose reconstruction fails (the device's memory) goes on in a new proc
 A finished segment's files are kept in the spool, so a run that stops is taken up where it was.
 
 The mask is a .npy (z, y, x) at a quarter of the volume's resolution, not 0 where the volume is kept: each of its
-voxels decides the 4 x 4 x 4 voxels it covers (as helirec's --reference_volume at --reference_scale 2 does).
+voxels decides the 4 x 4 x 4 voxels it covers (as vc_tomography's --reference_volume at --reference_scale 2 does).
 """
 import argparse
 import gc
@@ -51,7 +51,7 @@ MARGIN = 48                                # pixels of real slice around the mas
 
 def launcher():
     """the command this script was started with, up to the script itself (python, or python through a runner that
-    sets up the build): a process started with it sees the same helirec"""
+    sets up the build): a process started with it sees the same vc_tomography"""
     me = Path(__file__).resolve()
     for i, v in enumerate(sys.orig_argv):
         if i and Path(v).resolve() == me:
@@ -62,7 +62,7 @@ def launcher():
 def reconstruct_segment(a, pinned):
     """A process of its own (the device is clean when it starts, and whatever a failure leaves behind goes with it):
     slices [a0, a0 + n) of the volume inside a box, BLOCK to a spool file; files that are there already are kept."""
-    from helirec.recon import HelicalRecon
+    from vc_tomography.recon import HelicalRecon
     spool = Path(a.spool)
     x0, x1, y0, y1 = a.roi
     r = HelicalRecon(a.data, device="cuda", params=pinned, cache_dir=a.cache, log=lambda s: None)
@@ -109,8 +109,8 @@ def main():
     missing = [k for k in ("window", "voxel_um", "zarr", "model", "torch_python", "mask") if not getattr(a, k)]
     if missing:
         ap.error("needed: " + ", ".join("--" + k for k in missing))
-    from helirec.omezarr import OmeZarrWriter
-    from helirec.recon import HelicalRecon
+    from vc_tomography.omezarr import OmeZarrWriter
+    from vc_tomography.recon import HelicalRecon
     window = tuple(a.window)
     spool = Path(a.spool)
     spool.mkdir(parents=True, exist_ok=True)
@@ -127,14 +127,14 @@ def main():
     if abs(mask.shape[0] * 4 - n_all) > 4 or abs(mask.shape[1] * 4 - grid) > 4:
         raise SystemExit("the mask %s is not the 4x level of %d slices of %d px" % (mask.shape, n_all, grid))
     j0, j1 = a.slices if a.slices else (0, n_all)
-    attrs = dict(helirec_denoised_volume=dict(
+    attrs = dict(vc_tomography_denoised_volume=dict(
         scans=a.data, view_heights=[lo + j0, lo + j1], z_of_height="height - %d" % lo, parameters=pinned, resolved_sharpness_weighting=resolved,
         denoiser=str(a.model), uint8_window_per_cm=list(window), mask=str(a.mask), script=str(Path(__file__).resolve())))
     w = OmeZarrWriter(a.zarr, (n_all, grid, grid), np.uint8, chunks=(128, 128, 128), voxel_size_um=a.voxel_um, levels=a.levels, compression="vc-delta3d",
                       name=Path(a.zarr).stem, attrs=attrs, overwrite=a.overwrite)
     w_raw = None
     if a.zarr_not_denoised:
-        attrs_raw = dict(helirec_volume=dict(attrs["helirec_denoised_volume"], denoiser="none (the reconstruction as it is; the twin of %s)" % a.zarr))
+        attrs_raw = dict(vc_tomography_volume=dict(attrs["vc_tomography_denoised_volume"], denoiser="none (the reconstruction as it is; the twin of %s)" % a.zarr))
         w_raw = OmeZarrWriter(a.zarr_not_denoised, (n_all, grid, grid), np.uint8, chunks=(128, 128, 128), voxel_size_um=a.voxel_um, levels=a.levels,
                               compression="vc-delta3d", name=Path(a.zarr_not_denoised).stem, attrs=attrs_raw, overwrite=a.overwrite)
     print("slices [%d, %d) of %d (view heights [%d, %d)) on a grid of %d px; sharpness weighting %s; %s" % (j0, j1, n_all, lo + j0, lo + j1, grid, resolved, a.zarr), flush=True)

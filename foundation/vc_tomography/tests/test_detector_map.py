@@ -5,11 +5,11 @@ import h5py
 import numpy as np
 import pytest
 
-import helirec
-from helirec import _core
+import vc_tomography
+from vc_tomography import _core
 from test_sirt_pipeline import recon
 
-DEVICES = helirec.devices()
+DEVICES = vc_tomography.devices()
 
 
 def fft_length(n):

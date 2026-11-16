@@ -1,5 +1,5 @@
-// nanobind bindings of helirec::calibration (helirec._core.calibration_*): the bottom-up verification of an
-// acquisition record against itself and against the raw frames. The work is in C++ (helirec/calibration/*.hpp).
+// nanobind bindings of vc_tomography::calibration (vc_tomography._core.calibration_*): the bottom-up verification of an
+// acquisition record against itself and against the raw frames. The work is in C++ (vc_tomography/calibration/*.hpp).
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
 #include <nanobind/stl/string.h>
@@ -8,17 +8,17 @@
 #include "fit_summary.hpp"
 #include <memory>
 
-#include "helirec/calibration/registration.hpp"
-#include "helirec/calibration/solve.hpp"
-#include "helirec/calibration/record_checks.hpp"
-#include "helirec/calibration/session.hpp"
-#include "helirec/calibration/refill.hpp"
-#include "helirec/raw_reader.hpp"
+#include "vc_tomography/calibration/registration.hpp"
+#include "vc_tomography/calibration/solve.hpp"
+#include "vc_tomography/calibration/record_checks.hpp"
+#include "vc_tomography/calibration/session.hpp"
+#include "vc_tomography/calibration/refill.hpp"
+#include "vc_tomography/raw_reader.hpp"
 
 namespace nb = nanobind;
 using namespace nb::literals;
-using namespace helirec;
-using namespace helirec::calibration;
+using namespace vc_tomography;
+using namespace vc_tomography::calibration;
 
 namespace {
 
@@ -386,7 +386,7 @@ nb::dict register_py(Block a, Block b, const std::vector<int>& margin, const std
 
 // The session a CalibrationSession object holds, for the bindings of what measures on one
 // (geometry_calibration_bindings.cpp).
-helirec::calibration::Session& bound_session(nb::handle h) { return *nb::cast<PySession&>(h).s; }
+vc_tomography::calibration::Session& bound_session(nb::handle h) { return *nb::cast<PySession&>(h).s; }
 
 void bind_calibration(nb::module_& m) {
     m.def("calibration_check_record", &check_record_json, "scans"_a, "checks"_a = "record,inventory,series,beam,views", "out_dir"_a = "", "inventory_dir"_a = "",
@@ -422,7 +422,7 @@ void bind_calibration(nb::module_& m) {
         .def(nb::init<const std::vector<std::string>&, int, int, const std::string&>(), "scans"_a, "threads"_a = 0, "reduce"_a = 0, "store"_a = "",
              "reduce = 1, 2, 3: the same acquisition on a detector with pixels 2^reduce times as large, the frames read at a half, a quarter, an eighth from their "
              "JPEG 2000 codestreams: rows, columns, the dark and gain, the pixel size and every measurement are then in reduced pixels (stored position / 2^reduce). "
-             "store: a projection store (STORE.zarr of helirec-projections-zarr) to read the frames, darks and flats from, each scan's from the tile group named by its label, at the level `reduce`.")
+             "store: a projection store (STORE.zarr of vc_tomography_projections_zarr) to read the frames, darks and flats from, each scan's from the tile group named by its label, at the level `reduce`.")
         .def("info", &PySession::info, "scan"_a)
         .def("stretches", &PySession::stretches, "scan"_a)
         .def("series", &PySession::series, "scan"_a, "stretch"_a, "name"_a,

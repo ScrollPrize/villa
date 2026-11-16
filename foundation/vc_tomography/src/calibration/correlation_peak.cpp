@@ -2,7 +2,7 @@
 #include "calibration/ceres_support.hpp"
 #include <Eigen/Cholesky>
 
-namespace helirec::calibration::fitting {
+namespace vc_tomography::calibration::fitting {
 namespace {
 class Objective final : public ceres::FirstOrderFunction {
   public:

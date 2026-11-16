@@ -1,5 +1,5 @@
 """The denoiser (noise2inverse.py) on a run of slices that another process reconstructs: the two pass blocks of slices
-through a spool folder, because helirec and PyTorch live in two environments.
+through a spool folder, because vc_tomography and PyTorch live in two environments.
 
     python denoise_spool.py --model model.pt --spool DIR --slices N --window LO HI --shape ROWS COLUMNS
 

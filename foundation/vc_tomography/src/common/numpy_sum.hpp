@@ -3,7 +3,7 @@
 // including a reduction over axes numpy coalesces into one): for reproducing numpy results bit for bit.
 #include <cstddef>
 
-namespace helirec {
+namespace vc_tomography {
 
 inline float pairwise_sum(const float* a, std::size_t n) {
     if (n < 8) {
@@ -26,4 +26,4 @@ inline float pairwise_sum(const float* a, std::size_t n) {
     return pairwise_sum(a, n2) + pairwise_sum(a + n2, n - n2);
 }
 
-}  // namespace helirec
+}  // namespace vc_tomography

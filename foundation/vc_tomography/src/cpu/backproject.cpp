@@ -3,9 +3,9 @@
 #include <vector>
 
 #include "common/interp_core.hpp"
-#include "helirec/kernels.hpp"
+#include "vc_tomography/kernels.hpp"
 
-namespace helirec {
+namespace vc_tomography {
 
 int interp_from_name(const std::string& name) {
     if (name == "linear") return interp_core::Linear;
@@ -77,4 +77,4 @@ void backproject(const float* sino, const float* angles, float* slice, int n_ang
 }
 
 }  // namespace cpu
-}  // namespace helirec
+}  // namespace vc_tomography

@@ -5,9 +5,9 @@
 
 #include "hd_math.hpp"
 
-namespace helirec::sld_core {
+namespace vc_tomography::sld_core {
 
-using namespace helirec::hd;
+using namespace vc_tomography::hd;
 
 HR_HD float glare_sample(const float* g, int rows, int cols, float inv_bin, int r, int c) {
     float y = sub(mul(add(static_cast<float>(r), 0.5f), inv_bin), 0.5f);
@@ -25,4 +25,4 @@ HR_HD float glare_sample(const float* g, int rows, int cols, float inv_bin, int 
     return add(mul(sub(1.f, fy), top), mul(fy, bot));
 }
 
-}  // namespace helirec::sld_core
+}  // namespace vc_tomography::sld_core

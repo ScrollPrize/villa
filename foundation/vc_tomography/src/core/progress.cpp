@@ -1,4 +1,4 @@
-#include "helirec/progress.hpp"
+#include "vc_tomography/progress.hpp"
 
 #include <sys/ioctl.h>
 #include <unistd.h>
@@ -16,7 +16,7 @@
 #include <thread>
 #include <utility>
 
-namespace helirec {
+namespace vc_tomography {
 
 namespace {
 
@@ -227,4 +227,4 @@ void ProgressBar::close() {
 std::uint64_t ProgressBar::count() const { return impl_->n.load(); }
 std::uint64_t ProgressBar::total() const { return impl_->total; }
 
-}  // namespace helirec
+}  // namespace vc_tomography

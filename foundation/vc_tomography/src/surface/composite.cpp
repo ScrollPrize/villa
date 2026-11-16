@@ -1,4 +1,4 @@
-// helirec/surface_composite.hpp: layers along a surface from a volume block, the material side, and the outputs.
+// vc_tomography/surface_composite.hpp: layers along a surface from a volume block, the material side, and the outputs.
 #include <algorithm>
 #include <cmath>
 #include <filesystem>
@@ -8,15 +8,15 @@
 #include <set>
 
 #include <map>
-#include "helirec/kernels.hpp"
-#include "helirec/surface_composite.hpp"
-#include "helirec/zarr.hpp"
+#include "vc_tomography/kernels.hpp"
+#include "vc_tomography/surface_composite.hpp"
+#include "vc_tomography/zarr.hpp"
 #include "io/json.hpp"
 #include "vc_reader/array.hpp"
 #include "vc_reader/composite.hpp"
 #include "vc_reader/image_write.hpp"
 
-namespace helirec::surface {
+namespace vc_tomography::surface {
 
 namespace {
 
@@ -357,7 +357,7 @@ void write_set(const std::string& out, const std::vector<float>& layers, int H, 
         o.overwrite = true;
         o.name = "surface volume";
         o.attrs_json = Json::dict()
-                           .set("helirec_surface_volume", Json::dict().set("u8_window", Json::list().add(Json::of(u8_window[0])).add(Json::of(u8_window[1]))))
+                           .set("vc_tomography_surface_volume", Json::dict().set("u8_window", Json::list().add(Json::of(u8_window[0])).add(Json::of(u8_window[1]))))
                            .text();
         OmeZarrWriter writer(out + "/surface_volume.zarr", o);
         writer.write(0, static_cast<std::int64_t>(L), u8.data());
@@ -434,4 +434,4 @@ std::string set_name(const std::string& changes) {
     return out;
 }
 
-}  // namespace helirec::surface
+}  // namespace vc_tomography::surface

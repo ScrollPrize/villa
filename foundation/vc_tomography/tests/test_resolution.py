@@ -6,8 +6,8 @@ import h5py
 import numpy as np
 import pytest
 
-import helirec
-from helirec import _core
+import vc_tomography
+from vc_tomography import _core
 from test_sirt_pipeline import helical_scan, recon
 
 PH = dict(energy_kev=116.0, distance_m=1.19, pixel_size_m=8.64e-6, det_rows=1200, det_cols=2528)
@@ -19,14 +19,14 @@ def response(chain, shape=(151, 192), device="cpu"):
     """frequency response of a chain, from its impulse response"""
     a = np.zeros((1, *shape), np.float32)
     a[0, shape[0] // 2, shape[1] // 2] = 1
-    out = helirec.apply_filters(a, chain, helirec.filter_margin(chain, **PH), device=device, **PH)[0]
+    out = vc_tomography.apply_filters(a, chain, vc_tomography.filter_margin(chain, **PH), device=device, **PH)[0]
     return np.abs(np.fft.fft2(np.fft.ifftshift(out)))
 
 
 def test_mtf_paganin_response_and_fusion():
-    assert helirec.filter_describe([MTF], **PH).startswith("fft[mtf_paganin]@intensity m")
-    m_pag = helirec.filter_margin([{"type": "paganin", "delta_beta": 1000}], **PH)
-    assert m_pag < helirec.filter_margin([MTF], **PH) <= m_pag + 64
+    assert vc_tomography.filter_describe([MTF], **PH).startswith("fft[mtf_paganin]@intensity m")
+    m_pag = vc_tomography.filter_margin([{"type": "paganin", "delta_beta": 1000}], **PH)
+    assert m_pag < vc_tomography.filter_margin([MTF], **PH) <= m_pag + 64
     # without phase retrieval: the Wiener inverse of the Gaussian MTF, (1 + nsr) M / (M^2 + nsr)
     sigma, nsr = 1.06, 0.01
     R = response([dict(MTF, delta_beta=0)])
@@ -39,7 +39,7 @@ def test_mtf_paganin_response_and_fusion():
     P = response([{"type": "paganin", "delta_beta": 1000}])
     np.testing.assert_allclose(response([MTF]), P * D, atol=0.035)
     # a constant stays a constant
-    flat = helirec.apply_filters(np.full((2, 151, 192), 3.0, np.float32), [MTF], helirec.filter_margin([MTF], **PH), **PH)
+    flat = vc_tomography.apply_filters(np.full((2, 151, 192), 3.0, np.float32), [MTF], vc_tomography.filter_margin([MTF], **PH), **PH)
     np.testing.assert_allclose(flat, 3.0, rtol=2e-6)
     # a tabulated MTF: the Gaussian sampled
     nu = np.linspace(0, 0.75, 76)
@@ -49,7 +49,7 @@ def test_mtf_paganin_response_and_fusion():
     for bad in (dict(MTF, sigma=0), dict(MTF, nsr=0), dict(MTF, mtf="0.1:0.5"), dict(tab, mtf="0.2:0.5/0.1:0.6"),
                 dict(tab, mtf="0.1:1.5")):
         with pytest.raises(Exception, match="mtf_paganin"):
-            helirec.filter_margin([bad], **PH)
+            vc_tomography.filter_margin([bad], **PH)
 
 
 def test_mtf_paganin_target_form():
@@ -77,20 +77,20 @@ def test_mtf_paganin_target_form():
     # fused with Paganin, constants, and the parameter checks
     full = dict(base, delta_beta=1000)
     np.testing.assert_allclose(response([full]), response([{"type": "paganin", "delta_beta": 1000}]) * D(target, gain), atol=0.035)
-    flat = helirec.apply_filters(np.full((2, 151, 192), 3.0, np.float32), [full], helirec.filter_margin([full], **PH), **PH)
+    flat = vc_tomography.apply_filters(np.full((2, 151, 192), 3.0, np.float32), [full], vc_tomography.filter_margin([full], **PH), **PH)
     np.testing.assert_allclose(flat, 3.0, rtol=2e-6)
     for bad in (dict(full, target=-1), dict(full, gain=1), dict(full, nsr=0.01, target=0.5), dict(full, nsr=0.01, gain=8)):
         with pytest.raises(Exception, match="mtf_paganin"):
-            helirec.filter_margin([bad], **PH)
+            vc_tomography.filter_margin([bad], **PH)
 
 
-@pytest.mark.skipif(not helirec.cuda_available(), reason="no CUDA")
+@pytest.mark.skipif(not vc_tomography.cuda_available(), reason="no CUDA")
 @pytest.mark.parametrize("chain", [MTF, {"type": "mtf_paganin", "delta_beta": 1000, "sigma": 1.06}], ids=["wiener", "target"])
 def test_mtf_paganin_cpu_cuda_agree(chain):
     a = np.random.default_rng(0).uniform(0.5, 1.5, (3, 151, 200)).astype(np.float32)
-    m = helirec.filter_margin([chain], **PH)
-    np.testing.assert_allclose(helirec.apply_filters(a, [chain], m, device="cuda", **PH),
-                               helirec.apply_filters(a, [chain], m, device="cpu", **PH), rtol=0, atol=5e-5)
+    m = vc_tomography.filter_margin([chain], **PH)
+    np.testing.assert_allclose(vc_tomography.apply_filters(a, [chain], m, device="cuda", **PH),
+                               vc_tomography.apply_filters(a, [chain], m, device="cpu", **PH), rtol=0, atol=5e-5)
 
 
 # ------------------------------------------------------------------ wiener (measured tables)
@@ -107,7 +107,7 @@ def test_wiener_table_filter(tmp_path):
     M = np.exp(-2 * np.pi ** 2 * sigma ** 2 * nu ** 2)
     # a Gaussian MTF and white noise as tables: mtf_paganin's Wiener form without phase retrieval
     w = wiener_table(tmp_path / "radial.json", nu, M, snr=M ** 2 / nsr, half=M ** 2 / (2 * nsr))
-    assert helirec.filter_describe([w], **PH).startswith("fft[wiener]@intensity m")
+    assert vc_tomography.filter_describe([w], **PH).startswith("fft[wiener]@intensity m")
     R = response([w])
     f0, f1 = np.meshgrid(np.fft.fftfreq(R.shape[0]), np.fft.fftfreq(R.shape[1]), indexing="ij")
     Mg = np.exp(-2 * np.pi ** 2 * sigma ** 2 * (f0 ** 2 + f1 ** 2))
@@ -116,7 +116,7 @@ def test_wiener_table_filter(tmp_path):
     np.testing.assert_allclose(R, D, atol=tol)
     np.testing.assert_allclose(R, response([dict(MTF, delta_beta=0)]), atol=tol)
     # (unit DC; this table's gain is 0.99 from the first frequency on, a step the impulse's small frame cuts short)
-    assert abs(R[0, 0] - 1) < 2e-4 and 1 <= helirec.filter_margin([w], **PH) <= 64
+    assert abs(R[0, 0] - 1) < 2e-4 and 1 <= vc_tomography.filter_margin([w], **PH) <= 64
     # weight scales the noise; snr=NAME picks another table of the file; target is a Gaussian on top
     np.testing.assert_allclose(response([dict(w, weight=2)]), (1 + 2 * nsr) * Mg / (Mg ** 2 + 2 * nsr), atol=tol)
     np.testing.assert_allclose(response([dict(w, snr="half")]), response([dict(w, weight=2)]), atol=1e-6)
@@ -146,19 +146,19 @@ def test_wiener_table_filter(tmp_path):
     np.testing.assert_allclose(R2[0, 1:], along_cols, atol=0.08)
     assert abs(along_rows.max() - along_cols.max()) > 0.1 and abs(R2[0, 0] - 1) < 1e-5    # (the two axes do differ)
     # a constant stays a constant
-    flat = helirec.apply_filters(np.full((2, 151, 192), 3.0, np.float32), [w2], helirec.filter_margin([w2], **PH), **PH)
+    flat = vc_tomography.apply_filters(np.full((2, 151, 192), 3.0, np.float32), [w2], vc_tomography.filter_margin([w2], **PH), **PH)
     np.testing.assert_allclose(flat, 3.0, rtol=2e-6)
     bad = tmp_path / "bad.json"
     bad.write_text(json.dumps(dict(nu=[0.2, 0.1], transfer=[1, 1], snr=[1, 1])))
     for chain in (dict(w, weight=-1), dict(w, target=-1), dict(w, snr="none"), {"type": "wiener"},
                   {"type": "wiener", "table": str(tmp_path / "missing.json")}, {"type": "wiener", "table": str(bad)}):
         with pytest.raises(Exception, match="wiener"):
-            helirec.filter_margin([chain], **PH)
-    if helirec.cuda_available():
+            vc_tomography.filter_margin([chain], **PH)
+    if vc_tomography.cuda_available():
         a = np.random.default_rng(0).uniform(0.5, 1.5, (3, 151, 200)).astype(np.float32)
-        m = helirec.filter_margin([w2], **PH)
-        np.testing.assert_allclose(helirec.apply_filters(a, [w2], m, device="cuda", **PH),
-                                   helirec.apply_filters(a, [w2], m, device="cpu", **PH), rtol=0, atol=5e-5)
+        m = vc_tomography.filter_margin([w2], **PH)
+        np.testing.assert_allclose(vc_tomography.apply_filters(a, [w2], m, device="cuda", **PH),
+                                   vc_tomography.apply_filters(a, [w2], m, device="cpu", **PH), rtol=0, atol=5e-5)
 
 
 # ------------------------------------------------------------------ z_interp
@@ -225,7 +225,7 @@ def vertical_reference(raw, z, h, kind, log_first, nr):
     return np.array(out) if log_first else -np.log(out)
 
 
-@pytest.mark.parametrize("device", helirec.devices())
+@pytest.mark.parametrize("device", vc_tomography.devices())
 @pytest.mark.parametrize("backprojector", ["fbp", "sirt"])   # padded intensity / measured-only line integrals
 def test_vertical_kernel(tmp_path, device, backprojector):
     kw = dict(backprojector=backprojector, tomo_params={"num_iter": "1"} if backprojector == "sirt" else {})
@@ -254,7 +254,7 @@ def test_vertical_kernel(tmp_path, device, backprojector):
         recon(scan, device, z_interp="bspline3", **kw)
 
 
-@pytest.mark.parametrize("device", helirec.devices())
+@pytest.mark.parametrize("device", vc_tomography.devices())
 @pytest.mark.parametrize("backprojector", ["fbp", "sirt"])
 def test_vertical_kernel_lanczos8(tmp_path, device, backprojector):
     """z_interp=lanczos8: 16 rows, the given weights; at 0.4 cycles per row, where lanczos3 loses a fifth of the
@@ -275,7 +275,7 @@ def test_vertical_kernel_lanczos8(tmp_path, device, backprojector):
     assert err["lanczos3"] > 3e-3 and err["lanczos8"] < 0.4 * err["lanczos3"], err   # (measured: 4.95e-3, 1.25e-3)
 
 
-@pytest.mark.parametrize("device", helirec.devices())
+@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_vertical_kernel_chunks_and_read_ahead(tmp_path, device):
     scan, *_ = helical_scan(tmp_path)
     kw = dict(backprojector="fbp", z_interp="lanczos3", filters=[{"type": "paganin", "delta_beta": 1000.}], pixel_size_m=1e-5)
@@ -290,11 +290,11 @@ def test_vertical_kernel_chunks_and_read_ahead(tmp_path, device):
     if device == "cuda":
         np.testing.assert_allclose(chunk * .001, recon(scan, "cpu", **kw).reconstruct(7, 10) * .001, atol=2e-6, rtol=2e-4)
         del r
-        helirec.release_pinned_memory()
+        vc_tomography.release_pinned_memory()
 
 
 # ------------------------------------------------------------------ angle_interp
-@pytest.mark.parametrize("device", helirec.devices())
+@pytest.mark.parametrize("device", vc_tomography.devices())
 @pytest.mark.parametrize("backprojector", ["fbp", "sirt"])
 def test_nearest_angle_bins(tmp_path, device, backprojector):
     """angles off the grid and slowly drifting, one projection missing: each projection lands whole in its bin, and
@@ -329,7 +329,7 @@ def test_nearest_angle_bins(tmp_path, device, backprojector):
         recon(scan, device, angle_interp="cubic", **kw)
 
 
-@pytest.mark.parametrize("device", helirec.devices())
+@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_nearest_angles_reconstruct_the_phantom(tmp_path, device):
     scan, *_ = helical_scan(tmp_path)      # angles 0.17 of a step off the grid
     yy, xx = np.mgrid[:17, :17] - 8
@@ -366,7 +366,7 @@ def test_arc_deblur_taps():
         _core.arc_deblur_taps(2.0)
 
 
-@pytest.mark.parametrize("device", helirec.devices())
+@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_angular_fir(device):
     rng = np.random.default_rng(5)
     s = rng.standard_normal((40, 9)).astype(np.float32)
@@ -382,7 +382,7 @@ def test_angular_fir(device):
     np.testing.assert_allclose(out[~touched], ref[~touched], atol=2e-6)
 
 
-@pytest.mark.parametrize("device", helirec.devices())
+@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_exposure_arc_in_the_pipeline(tmp_path, device):
     scan, *_ = helical_scan(tmp_path, holes=True)
     g = np.asarray(_core.arc_deblur_taps(0.9), np.float32)
@@ -402,7 +402,7 @@ def test_exposure_arc_in_the_pipeline(tmp_path, device):
             recon(scan, device, backprojector="fbp", **bad)
 
 
-@pytest.mark.parametrize("device", helirec.devices())
+@pytest.mark.parametrize("device", vc_tomography.devices())
 @pytest.mark.parametrize("backprojector", ["fbp", "ghbp"])
 def test_pipeline_ramp_filter(tmp_path, device, backprojector):
     # the reconstructor's ramp is ramp_filter with the configured window; the default is the Ram-Lak ramp

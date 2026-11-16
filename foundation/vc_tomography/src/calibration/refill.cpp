@@ -1,11 +1,11 @@
-#include "helirec/calibration/refill.hpp"
+#include "vc_tomography/calibration/refill.hpp"
 #include "calibration/ceres_support.hpp"
 #include <ceres/covariance.h>
 #include <algorithm>
 #include <array>
 #include <numeric>
 
-namespace helirec::calibration {
+namespace vc_tomography::calibration {
 namespace {
 struct Dip {
     double time, row, u, index, raster, exposure, observed, noise;

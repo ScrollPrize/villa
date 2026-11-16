@@ -16,7 +16,7 @@
 
 #include "hd_math.hpp"
 
-namespace helirec::tomo_core {
+namespace vc_tomography::tomo_core {
 
 // chord(tau): length of the line  X cos a + Y sin a = t  inside the unit square centred at the origin, tau = |t|:
 // a trapezoid in tau with plateau 1 / max(|cos|, |sin|) (chord_k with the per-angle constants AngleC)
@@ -397,4 +397,4 @@ inline float legendre(int n, const float* coefs, float x) {
     return y;
 }
 
-}  // namespace helirec::tomo_core
+}  // namespace vc_tomography::tomo_core

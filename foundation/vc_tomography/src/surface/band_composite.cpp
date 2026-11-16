@@ -1,4 +1,4 @@
-// helirec/surface_composite.hpp: BandComposite, surface layers reconstructed where their points lie.
+// vc_tomography/surface_composite.hpp: BandComposite, surface layers reconstructed where their points lie.
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -6,12 +6,12 @@
 #include <map>
 #include <numeric>
 
-#include "helirec/surface_composite.hpp"
+#include "vc_tomography/surface_composite.hpp"
 #include "io/json.hpp"
 #include "vc_reader/composite.hpp"
 #include "vc_reader/resident_sampling.hpp"
 
-namespace helirec::surface {
+namespace vc_tomography::surface {
 
 BandComposite::BandComposite(Reconstruction& recon, const float* pts, int L, int H, int W, const std::uint8_t* valid, std::optional<std::array<int, 2>> h_range,
                              int n_sets)
@@ -183,4 +183,4 @@ std::array<std::vector<float>, 2> BandComposite::composites(int set) const {
     return out;
 }
 
-}  // namespace helirec::surface
+}  // namespace vc_tomography::surface

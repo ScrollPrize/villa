@@ -4,7 +4,7 @@
 #include <cstddef>
 #include <vector>
 
-namespace helirec::calibration {
+namespace vc_tomography::calibration {
 
 // numpy.remainder for doubles
 inline double py_mod(double a, double b) {
@@ -34,4 +34,4 @@ inline std::vector<double> unwrap_360(const std::vector<double>& p) {
     return up;
 }
 
-}  // namespace helirec::calibration
+}  // namespace vc_tomography::calibration

@@ -1,4 +1,4 @@
-// helirec/calibration/geometry_calibration.hpp: what a solution of the joint geometry model says beyond its
+// vc_tomography/calibration/geometry_calibration.hpp: what a solution of the joint geometry model says beyond its
 // parameters (report), and which scans' reconstructions overlap (neighbours).
 #include <limits>
 #include <map>
@@ -6,10 +6,10 @@
 
 #include "calibration/geometry_model.hpp"
 #include "calibration/util.hpp"
-#include "helirec/calibration/geometry_calibration.hpp"
+#include "vc_tomography/calibration/geometry_calibration.hpp"
 #include "io/json.hpp"
 
-namespace helirec::calibration::geometry_calibration {
+namespace vc_tomography::calibration::geometry_calibration {
 
 namespace {
 
@@ -306,4 +306,4 @@ std::string report_json(const Acquisition& acq, const GeometryReport& r) {
     return out.text();
 }
 
-}  // namespace helirec::calibration::geometry_calibration
+}  // namespace vc_tomography::calibration::geometry_calibration

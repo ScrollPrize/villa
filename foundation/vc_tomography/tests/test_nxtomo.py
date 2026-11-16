@@ -8,7 +8,7 @@ import json
 import numpy as np
 import pytest
 
-from helirec import _core, bliss
+from vc_tomography import _core, bliss
 
 h5py = pytest.importorskip("h5py")
 
@@ -71,7 +71,7 @@ def _write(root, number, title, in_beam=-8.0, snapshot_x=None, height=48.5, flat
         b["flyscan_cfg/tomography_cmd"] = (f"i12tomoFlyScan(closeShutterAfterScan=False, description={title}, exposureTime={EXPOSURE}, helical_axis_stage=None, "
                                            f"imagesPerDark={N_DARK}, imagesPerFlat={N_FLAT}, inBeamPosition={in_beam:g}, outOfBeamPosition=-100, start=0, step={STEP}, stop=360)")
     if supplement is not None:
-        (root / "helirec_acquisition.json").write_text(json.dumps(supplement))
+        (root / "vc_tomography_acquisition.json").write_text(json.dumps(supplement))
     return master, angle[proj], frames, proj
 
 
@@ -121,10 +121,10 @@ def test_a_record_shorter_than_its_frame_file_and_flats_at_both_ends(tmp_path):
 
 def test_the_pixel_size_must_be_given(tmp_path):
     master, *_ = _write(tmp_path, 146079, "sample_r1c1", supplement=None)
-    with pytest.raises(RuntimeError, match="states no pixel size.*helirec_acquisition.json"):
+    with pytest.raises(RuntimeError, match="states no pixel size.*vc_tomography_acquisition.json"):
         bliss.open_scan(str(master))
     assert bliss.discover_scans(str(tmp_path)) == []                               # left out, as any master that cannot be read
-    (tmp_path / "helirec_acquisition.json").write_text('{"pixel_size_um": 3.24, "source_sample_distance_m": 51, "propagation_distance_m": 0.5}')
+    (tmp_path / "vc_tomography_acquisition.json").write_text('{"pixel_size_um": 3.24, "source_sample_distance_m": 51, "propagation_distance_m": 0.5}')
     s = bliss.open_scan(str(master))
     assert s.pixel_size_m == 3.24 * 1e-6 and s.distance_m == 0.5 and np.isnan(s.energy_kev)
 
@@ -165,7 +165,7 @@ def test_the_intensity_calibration_of_a_grid(tmp_path):
     second row above the first; slits light the rows 1 to 4. The weights are cropped to the lit rows; a scan above
     the main scan is apodised as the main scan; the columns taper towards their neighbours, mirrored against the
     reference's layout (the axis in the right half, the companions on the left)."""
-    from helirec import calibration
+    from vc_tomography import calibration
     places = {146079: (-0.010, 48.5), 146080: (-0.060, 48.5), 146081: (-0.110, 48.5), 146082: (-0.010, 38.5), 146083: (-0.060, 38.5), 146084: (-0.110, 38.5)}
     for number, (x, height) in places.items():
         _write(tmp_path, number, f"grid_{number}", in_beam=x, height=height, lit=(1, 5))
@@ -202,10 +202,10 @@ def test_the_intensity_calibration_of_a_grid(tmp_path):
 
 def test_the_record_of_a_calibration_session(tmp_path):
     master, angle, frames, proj = _write(tmp_path, 146083, "PHerc.172_grid_01_53keV_r2c2", in_beam=-26.0, snapshot_x=-99.285, height=38.5, short_record=True)
-    (tmp_path / "helirec_acquisition.json").write_text('{"pixel_size_um": 7.91, "source_sample_distance_m": 51, "fan_sense": 2}')
+    (tmp_path / "vc_tomography_acquisition.json").write_text('{"pixel_size_um": 7.91, "source_sample_distance_m": 51, "fan_sense": 2}')
     with pytest.raises(RuntimeError, match="'fan_sense' is 1 or -1"):
         _core.CalibrationSession([str(master)], 2)
-    (tmp_path / "helirec_acquisition.json").write_text('{"pixel_size_um": 7.91, "source_sample_distance_m": 51, "fan_sense": -1}')
+    (tmp_path / "vc_tomography_acquisition.json").write_text('{"pixel_size_um": 7.91, "source_sample_distance_m": 51, "fan_sense": -1}')
     sess = _core.CalibrationSession([str(master)], 2)
     info = sess.info(0)
     assert info["label"] == "r2c2" and (info["rows"], info["cols"]) == (ROWS, COLS) and info["pixel_um"] == 7.91 and info["frames_per_turn"] == 72

@@ -5,9 +5,9 @@
 #include <vector>
 #include <ceres/cost_function.h>
 #include "calibration/model_math.hpp"
-#include "helirec/common.hpp"
+#include "vc_tomography/common.hpp"
 
-namespace helirec::calibration::fitting {
+namespace vc_tomography::calibration::fitting {
 // Complete derivative, including low-frequency normalization and the eliminated
 // nuisance spectrum. Each tile depends on only its two smear components; carry
 // those two derivatives through normalization before mapping to the six field

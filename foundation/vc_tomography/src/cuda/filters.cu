@@ -1,7 +1,7 @@
 #include "cuda_utils.cuh"
-#include "helirec/filters.hpp"
+#include "vc_tomography/filters.hpp"
 
-namespace helirec::cuda {
+namespace vc_tomography::cuda {
 
 namespace {
 template <int R>
@@ -35,7 +35,7 @@ void median_frames(float* frames, int n_frames, int H, int W, int radius, void* 
     const size_t n = static_cast<size_t>(n_frames) * H * W;
     thread_local DeviceBuffer<float> tmp;
     tmp.ensure(n);
-    HELIREC_CUDA_CHECK(cudaMemcpyAsync(tmp.data(), frames, n * sizeof(float), cudaMemcpyDeviceToDevice, s));
+    VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpyAsync(tmp.data(), frames, n * sizeof(float), cudaMemcpyDeviceToDevice, s));
     const unsigned grid = static_cast<unsigned>(std::min<size_t>((n + 255) / 256, 65535u * 16u));
     switch (radius) {
         case 1: median_kernel<1><<<grid, 256, 0, s>>>(tmp.data(), frames, n_frames, H, W); break;
@@ -43,7 +43,7 @@ void median_frames(float* frames, int n_frames, int H, int W, int radius, void* 
         case 3: median_kernel<3><<<grid, 256, 0, s>>>(tmp.data(), frames, n_frames, H, W); break;
         default: throw Error("median: radius must be 1..3");
     }
-    HELIREC_CUDA_CHECK(cudaGetLastError());
+    VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
 }
 
-}  // namespace helirec::cuda
+}  // namespace vc_tomography::cuda

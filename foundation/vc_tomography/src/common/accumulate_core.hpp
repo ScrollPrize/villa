@@ -6,14 +6,14 @@
 
 #include "detector_map_core.hpp"
 #include "hd_math.hpp"
-#include "helirec/accumulate.hpp"
-#include "helirec/sino.hpp"
+#include "vc_tomography/accumulate.hpp"
+#include "vc_tomography/sino.hpp"
 #include "sino_core.hpp"
 #include "sld_core.hpp"
 
-namespace helirec::accum_core {
+namespace vc_tomography::accum_core {
 
-using namespace helirec::hd;
+using namespace vc_tomography::hd;
 
 // a well mixed 32-bit number of x (lowbias32)
 HR_HD std::uint32_t mix32(std::uint32_t x) {
@@ -551,4 +551,4 @@ HR_HD void measured_value(const AccumScanView& s, int k, int t, int c, AccumPara
     wt = w;
 }
 
-}  // namespace helirec::accum_core
+}  // namespace vc_tomography::accum_core

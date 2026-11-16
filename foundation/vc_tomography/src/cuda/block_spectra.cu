@@ -7,9 +7,9 @@
 
 #include "common/block_spectra_core.hpp"
 #include "cuda_utils.cuh"
-#include "helirec/block_spectra.hpp"
+#include "vc_tomography/block_spectra.hpp"
 
-namespace helirec::cuda {
+namespace vc_tomography::cuda {
 
 namespace core = block_spectra_core;
 
@@ -144,7 +144,7 @@ class CufftBlockCorrelator final : public BlockCorrelator {
         d_wa_.upload(wa_.data(), wa_.size());
         d_wb_.upload(wb_.data(), wb_.size());
         d_tan2_.upload(tan2.data(), tan2.size());
-        HELIREC_CUDA_CHECK(cudaDeviceSynchronize());
+        VC_TOMOGRAPHY_CUDA_CHECK(cudaDeviceSynchronize());
         const size_t na = static_cast<size_t>(n_) * n_ * nc_;
         d_real_.resize(static_cast<size_t>(m_) * m_ * m_);
         d_A_.resize(na);
@@ -175,7 +175,7 @@ class CufftBlockCorrelator final : public BlockCorrelator {
             cufft_check(cufftExecR2C(fwd_b_, d_real_.data(), d_Bfull_.data()), "R2C");
             const int f = spec_.oversample;
             crop_kernel<<<grid_for(d_B_.size()), 256>>>(d_Bfull_.data(), d_B_.data(), n_, m_, 1.f / static_cast<float>(f * f * f));
-            HELIREC_CUDA_CHECK(cudaGetLastError());
+            VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
         }
         out.shift = {0, 0, 0};
         out.peak = 0;
@@ -187,7 +187,7 @@ class CufftBlockCorrelator final : public BlockCorrelator {
             d_box_.resize(nbox * 2);
             box_.resize(nbox * 2);
             box_kernel<<<grid_for(nbox), 256>>>(d_A_.data(), d_B_.data(), n_, kb, norm_, d_box_.data());
-            HELIREC_CUDA_CHECK(cudaGetLastError());
+            VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
             d_box_.download(box_.data());
             block_spectra::align(spec_, box_.data(), out.aa, out.bb, out.shift, out.peak);
             table(out);
@@ -199,8 +199,8 @@ class CufftBlockCorrelator final : public BlockCorrelator {
                 double& var) {
         const size_t rows = static_cast<size_t>(e) * e;
         row_sums_kernel<<<grid_for(rows), 256>>>(v, d_w.data(), e, d_rows_.data());
-        HELIREC_CUDA_CHECK(cudaGetLastError());
-        HELIREC_CUDA_CHECK(cudaMemcpy(rows_.data(), d_rows_.data(), rows * 2 * sizeof(double), cudaMemcpyDeviceToHost));
+        VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
+        VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpy(rows_.data(), d_rows_.data(), rows * 2 * sizeof(double), cudaMemcpyDeviceToHost));
         double t0 = 0, t1 = 0, t2 = 0, ws = 0;
         for (int x = 0; x < e; ++x) ws += w[x];
         for (int z = 0; z < e; ++z) {   // as the CPU: rows of a plane, then the planes, in order
@@ -216,18 +216,18 @@ class CufftBlockCorrelator final : public BlockCorrelator {
         mean = t1 / t0;
         var = t2 / t0 - mean * mean;
         window_kernel<<<grid_for(rows * e), 256>>>(v, d_w.data(), e, static_cast<float>(mean), d_real_.data());
-        HELIREC_CUDA_CHECK(cudaGetLastError());
+        VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
     }
 
     void table(BlockSpectra& out) {
         const int nb = spec_.n_bins();
-        HELIREC_CUDA_CHECK(cudaMemset(d_part_.data(), 0, d_part_.size() * sizeof(double)));
+        VC_TOMOGRAPHY_CUDA_CHECK(cudaMemset(d_part_.data(), 0, d_part_.size() * sizeof(double)));
         table_kernel<<<grid_1d(parts_, 64), 64>>>(d_A_.data(), d_B_.data(), n_, per_, parts_, nb, spec_.thetas,
                                                    2.0 * spec_.shells / n_, d_tan2_.data(), out.shift[0], out.shift[1],
                                                    out.shift[2], d_part_.data());
-        HELIREC_CUDA_CHECK(cudaGetLastError());
+        VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
         reduce_kernel<<<grid_1d(nb * 3, 64), 64>>>(d_part_.data(), parts_, nb * 3, d_table_.data());
-        HELIREC_CUDA_CHECK(cudaGetLastError());
+        VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
         d_table_.download(table_.data());
         out.aa.resize(nb);
         out.bb.resize(nb);
@@ -263,8 +263,8 @@ void resample_affine(const float* src, int sz, int sy, int sx, const double* m, 
     d_m.upload(m, 12, s);
     const size_t total = static_cast<size_t>(nz) * ny * nx;
     resample_kernel<<<grid_for(total), 256, 0, s>>>(src, sz, sy, sx, d_m.data(), out, nz, ny, nx, interp);
-    HELIREC_CUDA_CHECK(cudaGetLastError());
-    HELIREC_CUDA_CHECK(cudaStreamSynchronize(s));
+    VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
+    VC_TOMOGRAPHY_CUDA_CHECK(cudaStreamSynchronize(s));
 }
 
 void resample_affine_host(const float* src, int sz, int sy, int sx, const double* m, float* out, int nz, int ny, int nx,
@@ -274,4 +274,4 @@ void resample_affine_host(const float* src, int sz, int sy, int sx, const double
     resample_affine(d_src.data(), sz, sy, sx, m, out, nz, ny, nx, interp, nullptr);
 }
 
-}  // namespace helirec::cuda
+}  // namespace vc_tomography::cuda

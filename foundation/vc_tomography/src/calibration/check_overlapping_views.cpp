@@ -12,11 +12,11 @@
 #include "calibration/util.hpp"
 #include "calibration/compare_blocks.hpp"
 #include "calibration/view_plan.hpp"
-#include "helirec/calibration/registration.hpp"
-#include "helirec/calibration/record_checks.hpp"
-#include "helirec/calibration/session.hpp"
+#include "vc_tomography/calibration/registration.hpp"
+#include "vc_tomography/calibration/record_checks.hpp"
+#include "vc_tomography/calibration/session.hpp"
 
-namespace helirec::calibration {
+namespace vc_tomography::calibration {
 
 namespace {
 
@@ -627,4 +627,4 @@ void check_views(const Record& first, Frames& first_frames, const FlatField& fir
     }
 }
 
-}  // namespace helirec::calibration
+}  // namespace vc_tomography::calibration

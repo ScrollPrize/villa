@@ -5,20 +5,20 @@
 #include <array>
 #include <cmath>
 
-#include "helirec/common.hpp"
+#include "vc_tomography/common.hpp"
 
-#if HELIREC_WITH_OPENJPEG
+#if VC_TOMOGRAPHY_WITH_OPENJPEG
 #include <openjpeg.h>
 #endif
 
-#if HELIREC_WITH_OPENJPH
+#if VC_TOMOGRAPHY_WITH_OPENJPH
 #include <ojph_codestream.h>
 #include <ojph_file.h>
 #include <ojph_mem.h>
 #include <ojph_params.h>
 #endif
 
-namespace helirec::j2k {
+namespace vc_tomography::j2k {
 
 namespace {
 
@@ -168,7 +168,7 @@ Info info(const ReadAt& read, const ChunkHeader& chunk) {
 }
 
 bool available() {
-#if HELIREC_WITH_OPENJPEG
+#if VC_TOMOGRAPHY_WITH_OPENJPEG
     return true;
 #else
     return false;
@@ -176,14 +176,14 @@ bool available() {
 }
 
 bool openjph_available() {
-#if HELIREC_WITH_OPENJPH
+#if VC_TOMOGRAPHY_WITH_OPENJPH
     return true;
 #else
     return false;
 #endif
 }
 
-#if HELIREC_WITH_OPENJPH
+#if VC_TOMOGRAPHY_WITH_OPENJPH
 namespace {
 // A bounded, buffered codestream view. A seek changes the cursor without reading
 // the skipped bytes. In RPCL/RLCP streams, this omits the high-resolution packets.
@@ -235,7 +235,7 @@ class SeekableInput final : public ojph::infile_base {
 
 void decode_htj2k(const ReadAt& read, std::size_t size, std::size_t nbytes, int sample_bytes,
                   int stored_width, int stored_height, int reduce, void* out, bool selective) try {
-#if HELIREC_WITH_OPENJPH
+#if VC_TOMOGRAPHY_WITH_OPENJPH
     if (reduce < 0 || reduce > 3 || stored_width < 1 || stored_height < 1) bad("invalid shape or resolution");
     const auto h = chunk_header(read, size, nbytes, sample_bytes);
     const int width = 1 + ((stored_width - 1) >> reduce), height = 1 + ((stored_height - 1) >> reduce);
@@ -281,13 +281,13 @@ void decode_htj2k(const ReadAt& read, std::size_t size, std::size_t nbytes, int 
     }
 #else
     (void)read; (void)size; (void)nbytes; (void)sample_bytes; (void)stored_width; (void)stored_height; (void)reduce; (void)out; (void)selective;
-    bad("float32 HTJ2K needs a build with HELIREC_OPENJPH=ON");
+    bad("float32 HTJ2K needs a build with VC_TOMOGRAPHY_OPENJPH=ON");
 #endif
 } catch (const char* error) {
     bad(std::string("OpenJPH: ") + error);
 }
 
-#if HELIREC_WITH_OPENJPEG
+#if VC_TOMOGRAPHY_WITH_OPENJPEG
 
 namespace {
 
@@ -457,12 +457,12 @@ std::vector<std::uint8_t> encode_chunk(const std::uint16_t* values, int width, i
 #else
 
 void decode(const Codestream&, int, int, std::uint16_t*, int) {
-    throw Error("frames stored as JPEG 2000 need helirec built with OpenJPEG (libopenjp2 >= 2.5: apt install libopenjp2-7-dev, brew install openjpeg)");
+    throw Error("frames stored as JPEG 2000 need vc_tomography built with OpenJPEG (libopenjp2 >= 2.5: apt install libopenjp2-7-dev, brew install openjpeg)");
 }
 std::vector<std::uint8_t> encode_chunk(const std::uint16_t*, int, int) {
-    throw Error("making JPEG 2000 chunks needs helirec built with OpenJPEG (libopenjp2 >= 2.5)");
+    throw Error("making JPEG 2000 chunks needs vc_tomography built with OpenJPEG (libopenjp2 >= 2.5)");
 }
 
 #endif
 
-}  // namespace helirec::j2k
+}  // namespace vc_tomography::j2k

@@ -4,13 +4,13 @@
 
 #include "common/ghbp_core.hpp"
 #include "cuda_utils.cuh"
-#include "helirec/ghbp.hpp"
+#include "vc_tomography/ghbp.hpp"
 
-namespace helirec::cuda {
+namespace vc_tomography::cuda {
 
 namespace {
 
-using namespace helirec::ghbp_core;
+using namespace vc_tomography::ghbp_core;
 
 // threads: x over grid HEIGHT, y over WIDTH, z over grids (as nabuxx)
 __global__ void level0_kernel(const float* __restrict__ setups, const float* __restrict__ T6, int rf, int gw,
@@ -76,7 +76,7 @@ Ghbp::Ghbp(const GhbpPlan& plan) : impl_(std::make_unique<Impl>()) {
     }
     I.ping.resize(max_elems);
     I.pong.resize(max_elems);
-    HELIREC_CUDA_CHECK(cudaDeviceSynchronize());
+    VC_TOMOGRAPHY_CUDA_CHECK(cudaDeviceSynchronize());
 }
 
 Ghbp::~Ghbp() = default;
@@ -96,7 +96,7 @@ void Ghbp::run(const float* sino, float* out, void* stream) {
             level0_kernel<<<grid, block, 0, s>>>(I.setups.data(), I.T[0].data() + 6 * leg * L.g, L.red, L.w, L.h,
                                                  L.g, I.ping.data(), I.plan.n_bins, I.plan.n_angles,
                                                  P.scale_factor, sino, leg * L.g * L.red);
-            HELIREC_CUDA_CHECK(cudaGetLastError());
+            VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
         }
         float* prev = I.ping.data();
         float* next = I.pong.data();
@@ -111,7 +111,7 @@ void Ghbp::run(const float* sino, float* out, void* stream) {
             aggregate_kernel<<<grid, block, 0, s>>>(last && leg > 0, I.T[l].data() + 6 * leg * L.g,
                                                     I.Tinv[l - 1].data() + 6 * leg * Lp.g, L.red, L.w, L.h, L.g,
                                                     dst, Lp.w, Lp.h, Lp.g, prev);
-            HELIREC_CUDA_CHECK(cudaGetLastError());
+            VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
             std::swap(prev, next);
         }
     }
@@ -119,9 +119,9 @@ void Ghbp::run(const float* sino, float* out, void* stream) {
         const int N = P.grid_size;
         dim3 block(16, 16), grid(div_up(N, 16), div_up(N, 16));
         clip_kernel<<<grid, block, 0, s>>>(out, N);
-        HELIREC_CUDA_CHECK(cudaGetLastError());
+        VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
     }
-    HELIREC_CUDA_CHECK(cudaStreamSynchronize(s));
+    VC_TOMOGRAPHY_CUDA_CHECK(cudaStreamSynchronize(s));
 }
 
-}  // namespace helirec::cuda
+}  // namespace vc_tomography::cuda

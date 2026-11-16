@@ -1,7 +1,7 @@
 #include "cuda_utils.cuh"
-#include "helirec/kernels.hpp"
+#include "vc_tomography/kernels.hpp"
 
-namespace helirec::cuda {
+namespace vc_tomography::cuda {
 
 namespace {
 __global__ void flatfield_kernel(const float* __restrict__ raw, const float* __restrict__ dark,
@@ -25,7 +25,7 @@ void flatfield(const float* raw, const float* dark, const float* flat, float* ou
     const unsigned grid = std::min<unsigned>(grid_1d(total, block), 65535u * 8u);
     flatfield_kernel<<<grid, block, 0, as_stream(stream)>>>(raw, dark, flat, out, total, n_pix,
                                                             p.threshold, p.take_log);
-    HELIREC_CUDA_CHECK(cudaGetLastError());
+    VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
 }
 
-}  // namespace helirec::cuda
+}  // namespace vc_tomography::cuda

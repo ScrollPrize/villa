@@ -1,4 +1,4 @@
-"""helirec::Reconstruction of more scans than two: the scan with the rotation axis in its field and two moved
+"""vc_tomography::Reconstruction of more scans than two: the scan with the rotation axis in its field and two moved
 sideways beside it (HA, TA, TA2), merged; from the detector's files, and from a projection store at half the
 resolution that holds a part of each helix. A small synthetic acquisition written the way BLISS / Lima write one
 (tests/test_reconstruct_tool.py), of a sample of three Gaussians: two near the axis, one 150 px from it, which the
@@ -11,17 +11,17 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from helirec import _core
-from helirec import calibration as C
-from helirec import geometry as G
-from helirec.recon import HelicalRecon
+from vc_tomography import _core
+from vc_tomography import calibration as C
+from vc_tomography import geometry as G
+from vc_tomography.recon import HelicalRecon
 
 h5py = pytest.importorskip("h5py")
 from test_reconstruct_tool import COLS, PIXEL_UM, ROWS, _write  # noqa: E402
 
 _HERE = Path(_core.__file__).resolve().parent
-ZARR_TOOL = next((str(d / "helirec-projections-zarr") for d in (_HERE, *_HERE.parents[:2]) if (d / "helirec-projections-zarr").exists()),
-                 None) or shutil.which("helirec-projections-zarr")
+ZARR_TOOL = next((str(d / "vc_tomography_projections_zarr") for d in (_HERE, *_HERE.parents[:2]) if (d / "vc_tomography_projections_zarr").exists()),
+                 None) or shutil.which("vc_tomography_projections_zarr")
 DATASET = "/entry_0000/instrument/det3/data"
 PER_TURN, TURNS, TRAVEL = 300, 3, 40.0          # frames per turn, turns, rows the helix travels per turn
 OFFSETS = (20.5, 90.5, 160.5)                   # each scan's rotation axis from the detector's middle column
@@ -155,7 +155,7 @@ def test_the_calibrations_fan_reaches_the_backprojector(tmp_path, acquisition):
     assert other.beam_divergence() == pytest.approx(k, rel=1e-12) and other.info["fan_per_column"] == 0
 
 
-@pytest.mark.skipif(ZARR_TOOL is None, reason="helirec-projections-zarr is not built")
+@pytest.mark.skipif(ZARR_TOOL is None, reason="vc_tomography_projections_zarr is not built")
 def test_three_scans_from_a_projection_store_at_a_half(tmp_path, acquisition):
     """The store holds the middle of each helix, the darks and the flats at level 1; the masters lie in a folder of
     their own, without the detector's files. Every level keeps the stored pixels (j, k) 2^l, as a reduced read does."""

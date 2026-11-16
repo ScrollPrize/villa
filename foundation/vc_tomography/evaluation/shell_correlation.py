@@ -5,10 +5,10 @@
         --volume base=RUN/base/volume.zarr --volume unsharp=RUN/unsharp/volume.zarr --out OUT
     python evaluation/shell_correlation.py --volume even=A/volume.zarr --volume odd=B/volume.zarr --pair even odd --out OUT
 
-Volumes are OME-Zarr outputs of helirec-reconstruct (float32 or uint8; their place in the scan's full volume is read from
+Volumes are OME-Zarr outputs of vc_tomography_reconstruct (float32 or uint8; their place in the scan's full volume is read from
 their metadata) or any Zarr of the full volume (NAME=LOCATION@Z0,Y0,X0 gives an origin; remote ones use --cache).
 Everything is computed on cubic blocks (--block, a lattice of step --step) of the region the volumes share, with
-helirec.BlockCorrelator (C++ / CUDA): sums of |A|^2, |B|^2, Re(A conj B) in bins of |k| (shells) and of the angle of k
+vc_tomography.BlockCorrelator (C++ / CUDA): sums of |A|^2, |B|^2, Re(A conj B) in bins of |k| (shells) and of the angle of k
 from the z axis. Reported per shell, for every direction ("shell"), within 30 degrees of the xy plane ("inplane")
 and within 30 degrees of the z axis ("axial"):
 
@@ -51,7 +51,7 @@ import time
 
 import numpy as np
 
-import helirec
+import vc_tomography
 
 PARTS = {"shell": (0.0, 90.0), "inplane": (60.0, 90.0), "axial": (0.0, 30.0)}
 
@@ -76,14 +76,14 @@ class Volume:
             sys.exit(f"--volume takes NAME=LOCATION[@Z0,Y0,X0], not '{spec}'")
         loc, _, origin = loc.partition("@")
         self.name, self.cache = name, cache or ""
-        level = helirec.zarr_levels(loc, self.cache)[0]
+        level = vc_tomography.zarr_levels(loc, self.cache)[0]
         self.location, self.shape, self.dtype = level["location"], tuple(level["shape"]), level["dtype"]
         if origin:
             self.origin = tuple(int(v) for v in origin.split(","))
         else:
             self.origin = (0, 0, 0)
             attrs = os.path.join(loc, ".zattrs")
-            if os.path.exists(attrs):   # helirec's writer: translation = origin * voxel size
+            if os.path.exists(attrs):   # vc_tomography's writer: translation = origin * voxel size
                 ct = json.load(open(attrs))["multiscales"][0]["datasets"][0]["coordinateTransformations"]
                 scale = next(c["scale"] for c in ct if c["type"] == "scale")
                 tr = next((c["translation"] for c in ct if c["type"] == "translation"), [0, 0, 0])
@@ -96,7 +96,7 @@ class Volume:
     def load(self, region):
         start = [lo - o for (lo, _), o in zip(region, self.origin)]
         shape = [hi - lo for lo, hi in region]
-        self.data = np.ascontiguousarray(helirec.zarr_read(self.location, start, shape, self.cache), np.float32)
+        self.data = np.ascontiguousarray(vc_tomography.zarr_read(self.location, start, shape, self.cache), np.float32)
         self.region = region
 
     def block(self, z, y, x, n):
@@ -142,7 +142,7 @@ def main(argv=None):
     p.add_argument("--max_shift", type=int, default=4)
     p.add_argument("--baseline", default=None, help="volume the others are compared with (unconfirmed power index)")
     p.add_argument("--cache", default=None, help="disk cache for remote Zarr (default: the reference JSON's cache_dir)")
-    p.add_argument("--device", default="cuda" if helirec.cuda_available() else "cpu", choices=["cuda", "cpu"])
+    p.add_argument("--device", default="cuda" if vc_tomography.cuda_available() else "cpu", choices=["cuda", "cpu"])
     a = p.parse_args(argv)
 
     ref_cfg = json.load(open(a.ref)) if a.ref else None
@@ -177,14 +177,14 @@ def main(argv=None):
         level = a.level if a.level is not None else int(ref_cfg.get("level", 1))
         M = affine_zyx(ref_cfg["affine_xyz"])
         M[:, 3] += M[:, :3] @ np.asarray(a.content_shift, np.float64)
-        ref = helirec.RegisteredVolume(ref_cfg["location"], level, M, cache)
+        ref = vc_tomography.RegisteredVolume(ref_cfg["location"], level, M, cache)
         # the reference's mask, from a coarse level: which blocks lie inside it
-        levels = helirec.zarr_levels(ref_cfg["location"], cache)
+        levels = vc_tomography.zarr_levels(ref_cfg["location"], cache)
         scale0 = float(np.cbrt(abs(np.linalg.det(M[:, :3]))))   # reference level-0 voxels per voxel of the grid
         coarse = max((l["level"] for l in levels if l["scale"][0] <= 4 * scale0), default=level)
         ms = 4
         mshape = [-(-(hi - lo) // ms) for lo, hi in region]
-        mask, _ = helirec.RegisteredVolume(ref_cfg["location"], coarse, M, cache).read(
+        mask, _ = vc_tomography.RegisteredVolume(ref_cfg["location"], coarse, M, cache).read(
             [float(lo) + (ms - 1) / 2 for lo, _ in region], float(ms), mshape, "linear", "cpu")
         mask = mask > 0
 
@@ -200,9 +200,9 @@ def main(argv=None):
         sys.exit("no block to measure")
 
     spec = dict(shells=a.shells, thetas=a.thetas, device=a.device)
-    corr_ref = helirec.BlockCorrelator(n, oversample=a.oversample, align=not a.no_align, align_band=a.align_band,
+    corr_ref = vc_tomography.BlockCorrelator(n, oversample=a.oversample, align=not a.no_align, align_band=a.align_band,
                                        max_shift=a.max_shift, **spec) if ref else None
-    corr_pair = helirec.BlockCorrelator(n, oversample=1, align=False, **spec) if a.pair else None
+    corr_pair = vc_tomography.BlockCorrelator(n, oversample=1, align=False, **spec) if a.pair else None
     any_corr = corr_ref or corr_pair
     register = a.register or names[0]
     order = [register] + [x for x in names if x != register]

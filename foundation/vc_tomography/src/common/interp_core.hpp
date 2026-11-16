@@ -16,7 +16,7 @@
 
 #include "hd_math.hpp"
 
-namespace helirec::interp_core {
+namespace vc_tomography::interp_core {
 
 enum Interp : int { Linear = 0, Cubic = 1, Lanczos3 = 2, BSpline3 = 3, BSpline5 = 4, Lanczos8 = 5 };
 
@@ -146,4 +146,4 @@ HR_HD float sample_row(const float* row, int n, float u) {
     return u >= reach_lo<K>() && u < static_cast<float>(n) + reach_hi<K>() ? sample_row_reach<K>(row, n, u) : 0.f;
 }
 
-}  // namespace helirec::interp_core
+}  // namespace vc_tomography::interp_core

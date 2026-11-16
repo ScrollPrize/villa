@@ -1,4 +1,4 @@
-#include "helirec/zarr.hpp"
+#include "vc_tomography/zarr.hpp"
 
 #include <zlib.h>
 
@@ -17,11 +17,11 @@
 #include <thread>
 #include <unordered_map>
 
-#include "helirec/delta3d.hpp"
+#include "vc_tomography/delta3d.hpp"
 #include "json.hpp"
 #include "remote.hpp"
 
-namespace helirec {
+namespace vc_tomography {
 
 namespace fs = std::filesystem;
 
@@ -111,7 +111,7 @@ void check_meta(const ZarrArrayMeta& m, const std::string& path) {
         throw Error("zarr: " + path + ": compression must be 'none', 'zlib' or 'vc-delta3d'");
     if (m.compression == "vc-delta3d") {
         if (m.dtype != "|u1") throw Error("vc-delta3d output is uint8 only");
-        if (!delta3d_available()) throw Error("helirec was built without vc-delta3d (HELIREC_DELTA3D=OFF)");
+        if (!delta3d_available()) throw Error("vc_tomography was built without vc-delta3d (VC_TOMOGRAPHY_DELTA3D=OFF)");
     }
     for (int a = 0; a < 3; ++a)
         if (m.shape[a] < 1 || m.chunks[a] < 1) throw Error("zarr: " + path + ": empty shape or chunks");
@@ -403,7 +403,7 @@ void ZarrArray::read(const ZarrIndex& start, const ZarrIndex& shape, void* out) 
                 const auto& c = chunks[i];
                 if (read_chunk(c[0], c[1], c[2], chunk.data())) place_chunk(meta_, c, chunk.data(), start, shape, o);
             } catch (const std::exception& e) {
-#pragma omp critical(helirec_zarr_read)
+#pragma omp critical(vc_tomography_zarr_read)
                 if (error.empty()) error = e.what();
             }
         }
@@ -715,4 +715,4 @@ void OmeZarrWriter::read(int level, std::int64_t z0, std::int64_t z1, void* out)
     I.arrays[level].read({z0, 0, 0}, {z1 - z0, s[1], s[2]}, out);
 }
 
-}  // namespace helirec
+}  // namespace vc_tomography

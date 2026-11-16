@@ -10,9 +10,9 @@
 #include <mutex>
 #include <thread>
 
-#include "helirec/common.hpp"
+#include "vc_tomography/common.hpp"
 
-namespace helirec::remote {
+namespace vc_tomography::remote {
 
 namespace fs = std::filesystem;
 
@@ -27,12 +27,12 @@ std::string url_of(const std::string& location) {
     return "https://" + bucket + ".s3.amazonaws.com" + (slash == std::string::npos ? "/" : location.substr(slash));
 }
 
-// <cache_dir>/helirec_zarr/<host>/<path>: an object as it was served; an empty file: the object does not exist
+// <cache_dir>/vc_tomography_zarr/<host>/<path>: an object as it was served; an empty file: the object does not exist
 std::string cache_path(const std::string& cache_dir, const std::string& url) {
     std::string rest = url.substr(url.find("://") + 3);
     for (char& c : rest)
         if (c == '?' || c == '#' || c == ':') c = '_';
-    return cache_dir + "/helirec_zarr/" + rest;
+    return cache_dir + "/vc_tomography_zarr/" + rest;
 }
 
 bool read_file(const std::string& path, std::vector<std::uint8_t>& out) {
@@ -54,7 +54,7 @@ void write_cache(const std::string& cache_dir, const std::string& path, const st
     const auto space = fs::space(cache_dir, ec);
     if (ec || space.available < kMinFreeBytes + data.size()) {
         if (!warned.exchange(true))
-            std::fprintf(stderr, "helirec: little free space in %s: remote data is no longer cached there\n", cache_dir.c_str());
+            std::fprintf(stderr, "vc_tomography: little free space in %s: remote data is no longer cached there\n", cache_dir.c_str());
         return;
     }
     // whole or not at all: a temporary beside it, renamed into place
@@ -103,7 +103,7 @@ Result http_get(const std::string& url, std::vector<std::uint8_t>& out, std::str
         curl_easy_setopt(h.curl, CURLOPT_CONNECTTIMEOUT, 20L);
         curl_easy_setopt(h.curl, CURLOPT_LOW_SPEED_LIMIT, 1024L);   // stalled for a minute: give up
         curl_easy_setopt(h.curl, CURLOPT_LOW_SPEED_TIME, 60L);
-        curl_easy_setopt(h.curl, CURLOPT_USERAGENT, "helirec");
+        curl_easy_setopt(h.curl, CURLOPT_USERAGENT, "vc_tomography");
         curl_easy_setopt(h.curl, CURLOPT_WRITEFUNCTION, append);
         curl_easy_setopt(h.curl, CURLOPT_WRITEDATA, &out);
         const CURLcode code = curl_easy_perform(h.curl);
@@ -140,4 +140,4 @@ bool fetch(const std::string& location, std::vector<std::uint8_t>& out, const st
     return r == Result::Found;
 }
 
-}  // namespace helirec::remote
+}  // namespace vc_tomography::remote

@@ -4,7 +4,7 @@
 #include <string>
 #include <vector>
 
-namespace helirec::remote {
+namespace vc_tomography::remote {
 
 // http://, https:// or s3://
 bool is_remote(const std::string& location);
@@ -17,4 +17,4 @@ bool is_remote(const std::string& location);
 bool fetch(const std::string& location, std::vector<std::uint8_t>& out, const std::string& cache_dir = {},
            bool refresh = false);
 
-}  // namespace helirec::remote
+}  // namespace vc_tomography::remote

@@ -10,10 +10,10 @@
 #include <memory>
 #include <vector>
 
-#include "helirec/calibration/registration.hpp"
-#include "helirec/common.hpp"
+#include "vc_tomography/calibration/registration.hpp"
+#include "vc_tomography/common.hpp"
 
-namespace helirec::calibration {
+namespace vc_tomography::calibration {
 
 // signed frequency of bin k of an axis of length n, in cycles per sample
 inline double frequency(int k, int n) { return static_cast<double>(k <= n / 2 ? k : k - n) / n; }
@@ -130,8 +130,8 @@ struct RegistrationBackend {
 
 // weights: the band weights of geom (band_weights), which outlive the backend
 std::unique_ptr<RegistrationBackend> make_cpu_registration(const RegistrationGeometry& geom, const RegistrationOptions& opt, const float* weights);
-#ifdef HELIREC_WITH_CUDA
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
 std::unique_ptr<RegistrationBackend> make_cuda_registration(const RegistrationGeometry& geom, const RegistrationOptions& opt, const float* weights);
 #endif
 
-}  // namespace helirec::calibration
+}  // namespace vc_tomography::calibration

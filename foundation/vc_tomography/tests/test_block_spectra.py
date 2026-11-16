@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-import helirec
+import vc_tomography
 
 
 def field(n, rng, band=0.5, slope=0.0):
@@ -55,11 +55,11 @@ def numpy_tables(c, a, b):
     return out + [np.bincount(idx, weight.ravel(), size).reshape(c.n_shells, T)]
 
 
-@pytest.mark.parametrize("device", helirec.devices())
+@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_tables_match_numpy(device):
     rng = np.random.default_rng(1)
     n = 32
-    c = helirec.BlockCorrelator(n, shells=8, thetas=6, align=False, device=device)
+    c = vc_tomography.BlockCorrelator(n, shells=8, thetas=6, align=False, device=device)
     a = rng.standard_normal((n, n, n)).astype(np.float32) + 3
     b = (0.5 * a + rng.standard_normal((n, n, n))).astype(np.float32)
     r = c.compute(a, b)
@@ -70,7 +70,7 @@ def test_tables_match_numpy(device):
     assert r["shift"] == (0, 0, 0) and abs(r["mean_a"] - 3) < 0.05
 
 
-@pytest.mark.parametrize("device", helirec.devices())
+@pytest.mark.parametrize("device", vc_tomography.devices())
 @pytest.mark.parametrize("oversample", [1, 2])
 def test_registration_and_oversampling(device, oversample):
     """b: the same band-limited field displaced by a sub-voxel shift, sampled `oversample` times finer"""
@@ -79,7 +79,7 @@ def test_registration_and_oversampling(device, oversample):
     v, spec = field(n, rng, band=0.4, slope=2.0)
     a = v.astype(np.float32)
     b = shifted(spec, n, d) if oversample == 1 else upsampled(spec * np.fft.rfftn(shifted(spec, n, d)) / np.where(spec == 0, 1, spec), n, oversample)
-    c = helirec.BlockCorrelator(n, oversample=oversample, shells=12, device=device)
+    c = vc_tomography.BlockCorrelator(n, oversample=oversample, shells=12, device=device)
     r = c.compute(a, b)
     # (the window, common to both, pulls the shift towards 0 by about (1 / (n align_band))^2 of it)
     np.testing.assert_allclose(r["shift"], d, atol=0.02)
@@ -94,12 +94,12 @@ def test_registration_and_oversampling(device, oversample):
     assert c.curves(r0["aa"], r0["bb"], r0["ab"])["correlation"][inside][-1] < 0.5
 
 
-@pytest.mark.parametrize("device", helirec.devices())
+@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_correlation_measures_snr_and_direction(device):
     rng = np.random.default_rng(3)
     n = 64
     v, _ = field(n, rng, band=0.6)
-    c = helirec.BlockCorrelator(n, shells=8, thetas=3, align=False, device=device)
+    c = vc_tomography.BlockCorrelator(n, shells=8, thetas=3, align=False, device=device)
     tot = None
     for _ in range(4):   # two noisy copies of one signal, noise power = signal power: correlation 1 / 2
         v, _ = field(n, rng, band=1.0)
@@ -133,7 +133,7 @@ def test_correlation_measures_snr_and_direction(device):
         assert np.nanargmax(part["power_a"]) == 3   # 0.2 cycles per voxel: shell 3 of width 1/16
 
 
-@pytest.mark.parametrize("device", helirec.devices())
+@pytest.mark.parametrize("device", vc_tomography.devices())
 @pytest.mark.parametrize("interp", ["linear", "cubic", "lanczos3"])
 def test_resample_affine(device, interp):
     z, y, x = np.meshgrid(np.arange(20.0), np.arange(24.0), np.arange(28.0), indexing="ij")
@@ -141,26 +141,26 @@ def test_resample_affine(device, interp):
     src = fn(z, y, x).astype(np.float32)
     m = np.array([[0.5, 0.02, 0.0, 5.3], [0.0, 0.45, 0.03, 6.1], [-0.02, 0.0, 0.55, 7.7]])
     shape = (13, 17, 19)
-    out = helirec.resample_affine(src, m, shape, interp, device)
+    out = vc_tomography.resample_affine(src, m, shape, interp, device)
     k, j, i = np.meshgrid(*[np.arange(float(s)) for s in shape], indexing="ij")
     p = np.einsum("rc,c...->r...", m, np.stack([k, j, i, np.ones_like(k)]))
     tol = {"linear": 2e-2, "cubic": 2e-3, "lanczos3": 1e-2}[interp]   # (lanczos3: ~0.5 % passband ripple per axis)
     np.testing.assert_allclose(out, fn(*p), atol=tol)
     # whole voxels of a translation are the voxels themselves; outside the volume: 0
     t = np.array([[1.0, 0, 0, 2], [0, 1.0, 0, 3], [0, 0, 1.0, -4]])
-    out = helirec.resample_affine(src, t, (4, 5, 8), interp, device)
+    out = vc_tomography.resample_affine(src, t, (4, 5, 8), interp, device)
     np.testing.assert_allclose(out[:, :, 4:], src[2:6, 3:8, :4], atol=1e-6)
     if interp == "linear":
         assert np.all(out[:, :, :3] == 0)
     if device != "cpu":
-        np.testing.assert_allclose(helirec.resample_affine(src, m, shape, interp, device),
-                                   helirec.resample_affine(src, m, shape, interp, "cpu"), atol=1e-5)
+        np.testing.assert_allclose(vc_tomography.resample_affine(src, m, shape, interp, device),
+                                   vc_tomography.resample_affine(src, m, shape, interp, "cpu"), atol=1e-5)
 
 
-@pytest.mark.parametrize("device", helirec.devices())
+@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_registered_volume(tmp_path, device):
     """a pyramid twice finer than the grid, offset, read from two of its levels"""
-    from helirec.omezarr import OmeZarrWriter
+    from vc_tomography.omezarr import OmeZarrWriter
     z, y, x = np.meshgrid(np.arange(64.0), np.arange(72.0), np.arange(80.0), indexing="ij")
     fn = lambda z, y, x: 120 + 60 * np.sin(0.11 * z + 0.3) * np.cos(0.09 * y) + 40 * np.sin(0.07 * x)
     vol = fn(z, y, x).astype(np.float32)
@@ -172,7 +172,7 @@ def test_registered_volume(tmp_path, device):
     grid = np.stack([5 + k / 2, 6 + j / 2, 7 + i / 2, np.ones_like(k)])
     truth = fn(*np.einsum("rc,c...->r...", affine, grid))
     for level, tol in ((0, 0.05), (1, 1.0)):
-        ref = helirec.RegisteredVolume(str(tmp_path / "ref.zarr"), level, affine)
+        ref = vc_tomography.RegisteredVolume(str(tmp_path / "ref.zarr"), level, affine)
         out, coverage = ref.read((5, 6, 7), 0.5, (8, 9, 10), "lanczos3", device)
         np.testing.assert_allclose(out, truth, atol=tol)
         assert coverage == 1.0

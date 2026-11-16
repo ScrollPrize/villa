@@ -5,9 +5,9 @@
 #include <algorithm>
 
 #include "cuda_utils.cuh"
-#include "helirec/fourier.hpp"
+#include "vc_tomography/fourier.hpp"
 
-namespace helirec::cuda {
+namespace vc_tomography::cuda {
 
 namespace {
 
@@ -87,7 +87,7 @@ class CufftFourierFilter final : public FourierFilter {
         nc_ = static_cast<size_t>(spec_.pw / 2 + 1);
         d_filter_.upload(spec_.filter.data(), spec_.filter.size());
         if (!spec_.filter_imag.empty()) d_filter_imag_.upload(spec_.filter_imag.data(), spec_.filter_imag.size());
-        HELIREC_CUDA_CHECK(cudaDeviceSynchronize());
+        VC_TOMOGRAPHY_CUDA_CHECK(cudaDeviceSynchronize());
         // batch: ~256 MB of padded real data per pass
         const size_t item_bytes = static_cast<size_t>(rows_) * spec_.pw * sizeof(float);
         batch_ = static_cast<int>(std::max<size_t>(1, (256u << 20) / item_bytes));
@@ -99,7 +99,7 @@ class CufftFourierFilter final : public FourierFilter {
     void on_filter_changed() override {
         d_filter_.upload(spec_.filter.data(), spec_.filter.size());
         if (!spec_.filter_imag.empty()) d_filter_imag_.upload(spec_.filter_imag.data(), spec_.filter_imag.size());
-        HELIREC_CUDA_CHECK(cudaDeviceSynchronize());
+        VC_TOMOGRAPHY_CUDA_CHECK(cudaDeviceSynchronize());
     }
 
   public:
@@ -118,20 +118,20 @@ class CufftFourierFilter final : public FourierFilter {
             d_cplx_.resize(std::max(d_cplx_.size(), n_cplx));
             pad_kernel<<<grid_for(n_real), 256, 0, s>>>(in + i0 * in_item, d_real_.data(), n, rows_, p.pw,
                                                         p.h, p.w, p.pad_top, p.pad_left, p.mode, p.ndim == 2);
-            HELIREC_CUDA_CHECK(cudaGetLastError());
+            VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
             cufft_check(cufftExecR2C(fwd_, d_real_.data(), d_cplx_.data()), "R2C");
             multiply_kernel<<<grid_for(n_cplx), 256, 0, s>>>(d_cplx_.data(), d_filter_.data(),
                                                              spec_.filter_imag.empty() ? nullptr : d_filter_imag_.data(),
                                                              rows_ * nc_, n_cplx, norm_);
-            HELIREC_CUDA_CHECK(cudaGetLastError());
+            VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
             cufft_check(cufftExecC2R(inv_, d_cplx_.data(), d_real_.data()), "C2R");
             const int out_rows = p.ndim == 2 ? p.h : 1;
             const size_t n_out = static_cast<size_t>(n) * out_rows * p.w;
             crop_kernel<<<grid_for(n_out), 256, 0, s>>>(d_real_.data(), out + i0 * in_item, n, rows_, p.pw,
                                                          out_rows, p.w, p.ndim == 2 ? p.pad_top : 0, p.pad_left);
-            HELIREC_CUDA_CHECK(cudaGetLastError());
+            VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
         }
-        HELIREC_CUDA_CHECK(cudaStreamSynchronize(s));
+        VC_TOMOGRAPHY_CUDA_CHECK(cudaStreamSynchronize(s));
     }
 
     std::size_t spectrum_floats() const override {
@@ -151,7 +151,7 @@ class CufftFourierFilter final : public FourierFilter {
             d_real_.resize(std::max(d_real_.size(), n_real));
             pad_kernel<<<grid_for(n_real), 256, 0, s>>>(in + i0 * in_item, d_real_.data(), n, rows_, p.pw, p.h, p.w,
                                                         p.pad_top, p.pad_left, p.mode, true);
-            HELIREC_CUDA_CHECK(cudaGetLastError());
+            VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
             cufft_check(cufftExecR2C(fwd_, d_real_.data(), spec + i0 * per), "R2C");
         }
     }
@@ -170,12 +170,12 @@ class CufftFourierFilter final : public FourierFilter {
             multiply_copy_kernel<<<grid_for(n_cplx), 256, 0, s>>>(
                 spec + i0 * per, d_cplx_.data(), d_filter_.data(),
                 spec_.filter_imag.empty() ? nullptr : d_filter_imag_.data(), per, n_cplx, norm_);
-            HELIREC_CUDA_CHECK(cudaGetLastError());
+            VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
             cufft_check(cufftExecC2R(inv_, d_cplx_.data(), d_real_.data()), "C2R");
             const size_t n_out = static_cast<size_t>(n) * out_item;
             crop_kernel<<<grid_for(n_out), 256, 0, s>>>(d_real_.data(), out + i0 * out_item, n, rows_, p.pw, p.h, p.w,
                                                          p.pad_top, p.pad_left);
-            HELIREC_CUDA_CHECK(cudaGetLastError());
+            VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
         }
     }
 
@@ -234,4 +234,4 @@ std::unique_ptr<FourierFilter> make_fourier_filter(const FourierFilterSpec& spec
     return std::make_unique<CufftFourierFilter>(spec);
 }
 
-}  // namespace helirec::cuda
+}  // namespace vc_tomography::cuda

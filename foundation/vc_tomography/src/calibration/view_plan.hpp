@@ -11,9 +11,9 @@
 #include <cstdint>
 #include <vector>
 
-#include "helirec/calibration/record.hpp"
+#include "vc_tomography/calibration/record.hpp"
 
-namespace helirec::calibration {
+namespace vc_tomography::calibration {
 
 // Origins of corresponding subwindows. For mirrored B the crop moves in the opposite
 // direction, so a + b + width - 1 (twice the nominal mirror axis) is invariant.
@@ -108,4 +108,4 @@ inline double measured_D(const BlockPlan& plan, double d_q, double d_v) {
     return plan.stated_D + (d_v - plan.slope_a * d_q) + plan.slope_b * (d_q - plan.stated_dq);
 }
 
-}  // namespace helirec::calibration
+}  // namespace vc_tomography::calibration

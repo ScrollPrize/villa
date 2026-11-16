@@ -6,10 +6,10 @@ import h5py
 import numpy as np
 import pytest
 
-import helirec
-from helirec import _core
+import vc_tomography
+from vc_tomography import _core
 
-cuda_only = pytest.mark.skipif(not helirec.cuda_available(), reason="no CUDA")
+cuda_only = pytest.mark.skipif(not vc_tomography.cuda_available(), reason="no CUDA")
 
 
 # ------------------------------------------------------------------ kernels
@@ -25,7 +25,7 @@ def mirror(w, rot):
     return out
 
 
-@pytest.mark.parametrize("device", helirec.devices())
+@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_rebalance_turns(device):
     rng = np.random.default_rng(1)
     turn, n_proj, rows, cols, rot = 8, 21, 3, 11, 6.0
@@ -87,7 +87,7 @@ def test_rebalance_turns(device):
         np.testing.assert_allclose(w, w0, rtol=2e-6, atol=1e-7)
 
 
-@pytest.mark.parametrize("device", helirec.devices())
+@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_ramp_filter_with_named_opposite_rows(device):
     rng = np.random.default_rng(9)
     n, nd, rot = 16, 40, 27.3                    # (an axis off the middle: the rows are padded from their opposite rows)
@@ -158,7 +158,7 @@ def error(sl, truth):
     return float(np.abs(sl - truth).max())
 
 
-@pytest.mark.parametrize("device", helirec.devices())
+@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_views_are_the_bins_when_the_turns_agree(tmp_path, device):
     """a whole number of projections per turn and no shutter: the views a turn apart are at one angle, and a row per
     view gives what a row per grid angle gives"""
@@ -188,7 +188,7 @@ def test_views_are_the_bins_when_the_turns_agree(tmp_path, device):
         np.testing.assert_allclose(a["slices"], recon(scan, "cpu").reconstruct(h, h + 3), atol=2e-6, rtol=2e-4)
 
 
-@pytest.mark.parametrize("device", helirec.devices())
+@pytest.mark.parametrize("device", vc_tomography.devices())
 @pytest.mark.parametrize("per_turn, shutter", [(NG + 0.4, 0.0), (NG, -0.6), (NG + 0.27, 0.72)])
 def test_views_a_turn_apart_keep_their_angles(tmp_path, device, per_turn, shutter):
     """a turn that is not a whole number of steps, or rows read one after another: the two views of a slice in one
@@ -210,7 +210,7 @@ def test_views_a_turn_apart_keep_their_angles(tmp_path, device, per_turn, shutte
         np.testing.assert_allclose(chunk, r.reconstruct(h, h + 2), atol=2e-6, rtol=2e-4)
 
 
-@pytest.mark.parametrize("device", helirec.devices())
+@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_views_with_the_other_corrections(tmp_path, device):
     scan, truth = blob_scan(tmp_path, NG + 0.4)
     base = recon(scan, device)
@@ -269,7 +269,7 @@ def test_views_with_the_other_corrections(tmp_path, device):
     assert np.isfinite(recon(many, device, angle_interp="nearest").reconstruct(middle(r), middle(r) + 1)).all()
 
 
-@pytest.mark.parametrize("device", helirec.devices())
+@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_views_in_a_band(tmp_path, device):
     """the band reconstruction samples the slices of a row per view"""
     scan, _ = blob_scan(tmp_path, NG + 0.4)

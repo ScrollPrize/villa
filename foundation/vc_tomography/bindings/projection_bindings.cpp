@@ -1,18 +1,18 @@
 #include "ndarray_utils.hpp"
-#include "helirec/projection_subset.hpp"
-#include "helirec/projection_store.hpp"
+#include "vc_tomography/projection_subset.hpp"
+#include "vc_tomography/projection_store.hpp"
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
 namespace nb = nanobind;
 using namespace nb::literals;
-using namespace helirec;
-using namespace helirec::py;
+using namespace vc_tomography;
+using namespace vc_tomography::py;
 void bind_projection(nb::module_& m) {
     m.def("is_projection_store_scan", &is_projection_store_scan, "path"_a,
-          "True when path is a scan group of a projection store (helirec/projection_store.hpp)");
+          "True when path is a scan group of a projection store (vc_tomography/projection_store.hpp)");
     m.def("frames_in_projection_store", &frames_in_projection_store, "frames"_a, "tile_group"_a,
           "The frames of a FrameList (detector files .../scanNNNN/<file>) as frames of the scan groups of STORE.zarr/<tile>: "
-          "read them with RawReader(list(f.files), f.dataset, rows, cols, reduce). (helirec::frames_in_projection_store)");
+          "read them with RawReader(list(f.files), f.dataset, rows, cols, reduce). (vc_tomography::frames_in_projection_store)");
     m.def("plan_projection_subset", [](const std::string& master, double center, int slices, double turns) {
         ProjectionSubset p;
         { nb::gil_scoped_release nogil; p = plan_projection_subset(master, center, slices, turns); }
@@ -56,9 +56,9 @@ void bind_projection(nb::module_& m) {
 
     m.def("declare_projection_store_scan", &declare_projection_store_scan, "root"_a, "spec"_a, "reduce"_a, "source"_a, "dtype"_a, "clevel"_a = 1,
           "Create what is missing of ROOT/<tile>/<scan> of a projection store and record level `reduce` as stored; spec is JSON text "
-          "(helirec/projection_store.hpp). One caller at a time. (helirec::declare_projection_store_scan)");
+          "(vc_tomography/projection_store.hpp). One caller at a time. (vc_tomography::declare_projection_store_scan)");
     nb::class_<ProjectionStoreWriter>(m, "ProjectionStoreWriter", "Frames into one level of a declared scan group of a projection store; frames are "
-                                                                     "numbered as in the detector's scan (helirec::ProjectionStoreWriter)")
+                                                                     "numbered as in the detector's scan (vc_tomography::ProjectionStoreWriter)")
         .def(nb::init<const std::string&, int>(), "scan_group"_a, "reduce"_a)
         .def_prop_ro("rows", &ProjectionStoreWriter::rows)
         .def_prop_ro("cols", &ProjectionStoreWriter::cols)

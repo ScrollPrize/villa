@@ -1,5 +1,5 @@
-"""helirec-projections-zarr (tools/helirec_projections_zarr.cpp): two reduced copies of a small made-up tile, written
-the way helirec.download_projections writes them, become one multiscale Zarr store whose stored levels hold the
+"""vc_tomography_projections_zarr (tools/vc_tomography_projections_zarr.cpp): two reduced copies of a small made-up tile, written
+the way vc_tomography.download_projections writes them, become one multiscale Zarr store whose stored levels hold the
 files' values, whose other levels are declared and empty, and which a second run leaves as it is."""
 import json
 import shutil
@@ -9,15 +9,15 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from helirec import _core
+from vc_tomography import _core
 
 h5py = pytest.importorskip("h5py")
 open_zarr = pytest.importorskip("vc_reader.reader").open_zarr
 
 _HERE = Path(_core.__file__).resolve().parent
-TOOL = next((str(d / "helirec-projections-zarr") for d in (_HERE, *_HERE.parents[:2]) if (d / "helirec-projections-zarr").exists()),
-            None) or shutil.which("helirec-projections-zarr")
-pytestmark = pytest.mark.skipif(TOOL is None, reason="helirec-projections-zarr is not built")
+TOOL = next((str(d / "vc_tomography_projections_zarr") for d in (_HERE, *_HERE.parents[:2]) if (d / "vc_tomography_projections_zarr").exists()),
+            None) or shutil.which("vc_tomography_projections_zarr")
+pytestmark = pytest.mark.skipif(TOOL is None, reason="vc_tomography_projections_zarr is not built")
 ROWS, COLS, FIRST = 1040, 64, 500
 DATASET = "/entry_0000/instrument/det1/data"
 
@@ -55,12 +55,12 @@ def test_two_scales_become_one_store(tmp_path):
     assert "6 files written and verified, 0 already stored" in run.stdout
 
     group = json.loads((out / "T1-01" / "scan0005" / "zarr.json").read_text())["attributes"]
-    assert [(level["path"], level["stored"]) for level in group["helirec"]["levels"]] == [("0", False), ("1", False), ("2", True), ("3", True)]
-    assert group["helirec"]["frame_first"] == FIRST and group["helirec"]["frames"] == 130 and group["helirec"]["role"] == "projection"
+    assert [(level["path"], level["stored"]) for level in group["vc_tomography"]["levels"]] == [("0", False), ("1", False), ("2", True), ("3", True)]
+    assert group["vc_tomography"]["frame_first"] == FIRST and group["vc_tomography"]["frames"] == 130 and group["vc_tomography"]["role"] == "projection"
     datasets = group["multiscales"][0]["datasets"]
     assert [d["coordinateTransformations"][0]["scale"] for d in datasets] == [[1, 1, 1], [1, 2, 2], [1, 4, 4], [1, 8, 8]]
     assert all(d["coordinateTransformations"][1]["translation"] == [0, 0, 0] for d in datasets)
-    tile = json.loads((out / "T1-01" / "zarr.json").read_text())["attributes"]["helirec_tile"]
+    tile = json.loads((out / "T1-01" / "zarr.json").read_text())["attributes"]["vc_tomography_tile"]
     assert tile["pixel_um"] == 1.129 and "source_master" not in tile
 
     for reduce in (2, 3):

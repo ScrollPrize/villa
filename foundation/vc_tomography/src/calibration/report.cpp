@@ -2,9 +2,9 @@
 #include <sstream>
 
 #include "calibration/util.hpp"
-#include "helirec/calibration/record_checks.hpp"
+#include "vc_tomography/calibration/record_checks.hpp"
 
-namespace helirec::calibration {
+namespace vc_tomography::calibration {
 
 void assess_residuals(Finding& f, const std::vector<double>& residuals, double target, const std::string& unit) {
     if (!std::isfinite(target) || target <= 0) throw Error("residual target must be finite and positive");
@@ -129,4 +129,4 @@ Tolerances tolerances(const Record& rec, double eps, double radius_px) {
     return t;
 }
 
-}  // namespace helirec::calibration
+}  // namespace vc_tomography::calibration

@@ -5,9 +5,9 @@ import os
 import numpy as np
 import pytest
 
-import helirec
-from helirec import OutputMask, ProgressBar, ReferenceMask, _core, to_uint8
-from helirec.omezarr import OmeZarrWriter
+import vc_tomography
+from vc_tomography import OutputMask, ProgressBar, ReferenceMask, _core, to_uint8
+from vc_tomography.omezarr import OmeZarrWriter
 from test_sirt_pipeline import helical_scan, recon
 
 
@@ -29,7 +29,7 @@ def coarse_lookup(mask, shape, scale, offset):
     return mask[np.ix_(*idx)]
 
 
-@pytest.mark.parametrize("device", helirec.devices())
+@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_to_uint8_with_a_coarser_mask(device):
     rng = np.random.default_rng(3)
     img = rng.random((7, 37, 53), dtype=np.float32)
@@ -104,7 +104,7 @@ def test_reference_mask_with_a_few_more_slices(tmp_path):
         assert abs(first - (edge[10] + 0.5) * n / ref_n) <= 1 + f
 
 
-@pytest.mark.parametrize("device", helirec.devices())
+@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_to_uint8_matches_numpy(device):
     rng = np.random.default_rng(0)
     img = rng.random((3, 37, 53), dtype=np.float32) * 0.6 - 0.15
@@ -125,7 +125,7 @@ def test_to_uint8_matches_numpy(device):
         _core.to_uint8(img, 0.0, 1.0, device=device, mask=np.ascontiguousarray(mask[:2]))
 
 
-@pytest.mark.parametrize("device", helirec.devices())
+@pytest.mark.parametrize("device", vc_tomography.devices())
 @pytest.mark.parametrize("backprojector", ["fbp", "ghbp"])
 @pytest.mark.parametrize("roi", [None, (3, 14, 2, 17)])
 def test_reconstruct_uint8_is_the_window_of_the_float_slices(tmp_path, device, backprojector, roi):
@@ -160,7 +160,7 @@ def test_reconstruct_uint8_is_the_window_of_the_float_slices(tmp_path, device, b
         r.reconstruct(h0, h1, roi=roi, mask=mask)
 
 
-@pytest.mark.parametrize("device", helirec.devices())
+@pytest.mark.parametrize("device", vc_tomography.devices())
 @pytest.mark.parametrize("backprojector", ["fbp", "ghbp"])
 def test_reconstruct_only_the_pixels_needed(tmp_path, device, backprojector):
     scan, *_ = helical_scan(tmp_path)
@@ -208,7 +208,7 @@ def test_reconstruct_only_the_pixels_needed(tmp_path, device, backprojector):
         r.reconstruct(h0, h1, region=(3, 3, 0, 4))
 
 
-@pytest.mark.parametrize("device", helirec.devices())
+@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_reconstruct_into_a_writer(tmp_path, device):
     """a writer takes the slices as the blocks computed: what it stores is what the arrays hold"""
     scan, *_ = helical_scan(tmp_path)
@@ -354,7 +354,7 @@ def test_progress_redraws_in_place_on_a_terminal():
     assert text.startswith("\rdemo:   0%|") and "\n" not in text and text.endswith("\r\x1b[K")
 
 
-@pytest.mark.parametrize("device", helirec.devices())
+@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_reconstruct_advances_the_bar_per_slice(tmp_path, device):
     scan, *_ = helical_scan(tmp_path)
     r = recon(scan, device, backprojector="fbp")

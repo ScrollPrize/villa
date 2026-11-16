@@ -10,14 +10,14 @@ import struct
 import numpy as np
 import pytest
 
-from helirec import _core
+from vc_tomography import _core
 from test_calibration import _low_band_53
 
 h5py = pytest.importorskip("h5py")
 ROWS, COLS = 257, 259
 DATA = Path(__file__).parent / "reference" / "htj2k"
 ZERO = np.zeros(1, np.int32)
-pytestmark = pytest.mark.skipif(not _core.htj2k_float_frames_supported(), reason="HELIREC_OPENJPH=OFF")
+pytestmark = pytest.mark.skipif(not _core.htj2k_float_frames_supported(), reason="VC_TOMOGRAPHY_OPENJPH=OFF")
 
 
 def _chunk(stream, rows=ROWS, cols=COLS, constant=False, sample_bytes=4):

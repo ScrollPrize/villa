@@ -1,8 +1,8 @@
 #pragma once
 #include <functional>
-#include "helirec/calibration/solve.hpp"
+#include "vc_tomography/calibration/solve.hpp"
 
-namespace helirec::calibration::fitting {
+namespace vc_tomography::calibration::fitting {
 // The evaluator retains its CPU/CUDA image buffers; only value, gradient and
 // curvature cross this interface. The maximum is independently validated using
 // the exact final Hessian, including when Ceres reports convergence.

@@ -1,4 +1,4 @@
-// helirec/reconstruction.hpp: the reconstruction of a scan pair from its raw folders.
+// vc_tomography/reconstruction.hpp: the reconstruction of a scan pair from its raw folders.
 #include <sys/stat.h>
 
 #include <algorithm>
@@ -11,19 +11,19 @@
 #include <string_view>
 #include <tuple>
 
-#include "helirec/calibration/geometry_calibration.hpp"
-#include "helirec/calibration/record.hpp"
-#include "helirec/raw_reader.hpp"
-#include "helirec/reconstruction.hpp"
-#include "helirec/projection_store.hpp"
+#include "vc_tomography/calibration/geometry_calibration.hpp"
+#include "vc_tomography/calibration/record.hpp"
+#include "vc_tomography/raw_reader.hpp"
+#include "vc_tomography/reconstruction.hpp"
+#include "vc_tomography/projection_store.hpp"
 #include "io/json.hpp"
 #include "io/sha256.hpp"
 
-#ifndef HELIREC_SOURCE_DIR
-#define HELIREC_SOURCE_DIR ""
+#ifndef VC_TOMOGRAPHY_SOURCE_DIR
+#define VC_TOMOGRAPHY_SOURCE_DIR ""
 #endif
 
-namespace helirec {
+namespace vc_tomography {
 
 namespace {
 
@@ -162,7 +162,7 @@ std::vector<T> part_of(const std::vector<T>& v, const std::array<std::size_t, 2>
 }  // namespace
 
 std::string build_revision() {
-    const std::string dir = HELIREC_SOURCE_DIR;
+    const std::string dir = VC_TOMOGRAPHY_SOURCE_DIR;
     if (dir.empty() || !exists(dir)) return std::string();
     const std::string command = "git -C '" + dir + "' describe --always --dirty 2>/dev/null";
     FILE* p = ::popen(command.c_str(), "r");
@@ -217,7 +217,7 @@ std::pair<std::string, std::string> geometry_calibration_file(const std::string&
                                                               const std::string& projection_store, int reduce) {
     if (!given.empty()) return {absolute(given), read_text(given)};
     if (cache_dir.empty())
-        throw Error("no geometry calibration: give geometry=PATH (made by helirec-calibration geometry), or a cache directory to make it in and keep it");
+        throw Error("no geometry calibration: give geometry=PATH (made by vc_tomography_calibration geometry), or a cache directory to make it in and keep it");
     const std::string path = cache_dir + "/geometry.json";
     if (exists(path)) {
         const std::string raw = read_text(path);
@@ -237,7 +237,7 @@ std::pair<std::string, std::string> geometry_calibration_file(const std::string&
         }
         say(log, "geometry calibration " + path + ": other scans or unreadable, made again");
     }
-    say(log, "geometry calibration of the scans (helirec-calibration geometry: layout, rows' timing, comparisons, solve) ...");
+    say(log, "geometry calibration of the scans (vc_tomography_calibration geometry: layout, rows' timing, comparisons, solve) ...");
     calibration::geometry_calibration::Options opt;
     if (!row_time_us.empty()) opt.row_time = number_of(Json::of(row_time_us), "row_time_us") * 1e-6;
     opt.device = device;
@@ -557,7 +557,7 @@ Reconstruction::Reconstruction(const std::string& projections, const std::string
     I.projections = projections;
     I.options = std::move(options);
     if (I.options.reduce < 0 || I.options.reduce > 3) throw Error("reduce is 0, 1, 2 or 3");
-    if (I.options.reduce && I.options.projection_store.empty()) throw Error("frames read reduced are a projection store's: give the store (helirec-projections-zarr, or the downloader's --zarr)");
+    if (I.options.reduce && I.options.projection_store.empty()) throw Error("frames read reduced are a projection store's: give the store (vc_tomography_projections_zarr, or the downloader's --zarr)");
     std::vector<calibration::Scan> found = calibration::discover_scans(projections);
     std::string said;
     for (const int k : calibration::pair_companions(found)) {  // the family: the scan with the axis in its field first
@@ -706,7 +706,7 @@ std::string Reconstruction::provenance() const {
         .set("pixel_size_m", Json::of(I.main().pixel_size_m * I.factor()))
         .set("energy_kev", Json::of(I.main().energy_kev))
         .set("distance_m", Json::of(I.main().distance_m))
-        .set("helirec", Json::dict().set("git", Json::of(build_revision())));
+        .set("vc_tomography", Json::dict().set("git", Json::of(build_revision())));
     if (!frames.is(Json::Null)) out.set("frames", frames);
     return out.text();
 }
@@ -716,7 +716,7 @@ std::string Reconstruction::provenance() const {
 TileReconstruction tile_reconstructor(const std::string& master, const std::string& description, const std::string& label, const TileOptions& o) {
     const Json cal = Json::parse(description);
     const Json& L = member(cal, "layout");
-    // a joint geometry calibration (helirec-calibration geometry), of which `label` names a scan; or the tiles' description
+    // a joint geometry calibration (vc_tomography_calibration geometry), of which `label` names a scan; or the tiles' description
     const Json* model = cal.find("model");
     const bool joint = model && model->is(Json::String) && model->string == "joint";
     TileReconstruction out;
@@ -975,4 +975,4 @@ TileReconstruction tile_reconstructor(const std::string& master, const std::stri
     return out;
 }
 
-}  // namespace helirec
+}  // namespace vc_tomography

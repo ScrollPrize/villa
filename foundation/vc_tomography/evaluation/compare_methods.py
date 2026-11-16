@@ -5,7 +5,7 @@
     python evaluation/compare_methods.py --projections PROJ --out OUT --roi 1700 2700 1700 2700 --z 1300 1400
 
 Config (JSON):
-  projections, cache_dir, device       the scan pair (as for helirec-reconstruct; or --projections / --cache_dir)
+  projections, cache_dir, device       the scan pair (as for vc_tomography_reconstruct; or --projections / --cache_dir)
   params                               HelicalRecon parameters shared by all methods, e.g. {"filters": []}
                                        (filters: a list of dicts or chain text, e.g. "paganin(delta_beta=1000)")
   slices                               one of {"z": [...]}, {"heights": [...]}, {"fractions": [...]},
@@ -21,7 +21,7 @@ Config (JSON):
   sheet_columns                        tiles per sheet row (default: every method in one row)
   tile                                 longest side of a contact-sheet tile (pixels; slices are box-downsampled)
   methods                              [{"name", "backprojector", "desc"?, "params"?}, ...]; backprojector is a
-                                       helirec spec (fbp(...), sirt(...), gridrec(...), ghbp); params override the
+                                       vc_tomography spec (fbp(...), sirt(...), gridrec(...), ghbp); params override the
                                        shared ones for this method
                                        mode=legacy_reference on a method uses its pinned settings, ignoring shared
                                        corrected-mode parameters. TIFFs retain the method's native output units.
@@ -46,13 +46,13 @@ import numpy as np
 
 from vc_reader import write_image
 
-DEFAULT_OBJECT_EXTENT = (0.0, 1.0)   # (helirec-reconstruct's --object_extent default)
+DEFAULT_OBJECT_EXTENT = (0.0, 1.0)   # (vc_tomography_reconstruct's --object_extent default)
 
 
 def write_png_gray(path, img):
     write_image(path, np.ascontiguousarray(img, np.uint8))
-from helirec.filters import parse_chain
-from helirec.recon import HelicalRecon, DEFAULTS
+from vc_tomography.filters import parse_chain
+from vc_tomography.recon import HelicalRecon, DEFAULTS
 
 def fingerprint(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, default=str).encode()).hexdigest()
@@ -123,7 +123,7 @@ def slice_heights(r, spec):
         if "z_range" in spec:
             z0, z1 = spec["z_range"]
             zs = [int(round(0.5 * (z0 + z1 - 1)))] if n == 1 else [int(round(z0 + (z1 - 1 - z0) * i / (n - 1))) for i in range(n)]
-        else:   # as helirec-reconstruct: the middle 2/3 of the object extent
+        else:   # as vc_tomography_reconstruct: the middle 2/3 of the object extent
             A, B = DEFAULT_OBJECT_EXTENT
             f0, f1 = A + (B - A) / 6, A + (B - A) * 5 / 6
             fr = [0.5 * (f0 + f1)] if n == 1 else [f0 + (f1 - f0) * i / (n - 1) for i in range(n)]

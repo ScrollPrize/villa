@@ -1,4 +1,4 @@
-"""helirec::calibration::Scan (helirec/calibration/scan.hpp) through its bindings, on a small synthetic BLISS master
+"""vc_tomography::calibration::Scan (vc_tomography/calibration/scan.hpp) through its bindings, on a small synthetic BLISS master
 written the way BLISS / Lima write one: a virtual frame dataset per entry over the detector's files, the projections'
 monitors in a frame-less companion entry, wrapped angles, two flat series. The expectations are the reference
 conversion's rules (nxtomomill h52nx, nx2etf) written out with numpy."""
@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 import numpy as np
 import pytest
 
-from helirec import _core, bliss
+from vc_tomography import _core, bliss
 
 h5py = pytest.importorskip("h5py")
 

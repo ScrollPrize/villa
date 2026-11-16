@@ -1,6 +1,6 @@
 import numpy as np
 import pytest
-from helirec import _core
+from vc_tomography import _core
 
 
 def test_wiener_transfer_and_smear_known_answers():

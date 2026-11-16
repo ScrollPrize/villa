@@ -8,11 +8,11 @@
 #include <vector>
 
 #include "calibration/view_plan.hpp"
-#include "helirec/calibration/registration.hpp"
-#include "helirec/calibration/record_checks.hpp"
-#include "helirec/calibration/session.hpp"
+#include "vc_tomography/calibration/registration.hpp"
+#include "vc_tomography/calibration/record_checks.hpp"
+#include "vc_tomography/calibration/session.hpp"
 
-namespace helirec::calibration {
+namespace vc_tomography::calibration {
 
 struct ViewScan {
     const Record* rec;
@@ -97,4 +97,4 @@ bool measure(const Pairing& P, const BlockPlan& first_plan, Cut cut, const Regis
 void measure_patches(const Pairing& P, const BlockPlan& plan, const std::vector<Cut>& cuts, const RegistrationOptions& ropt, Device device, std::vector<Measured>& out,
                      const Cut* whole = nullptr);
 
-}  // namespace helirec::calibration
+}  // namespace vc_tomography::calibration

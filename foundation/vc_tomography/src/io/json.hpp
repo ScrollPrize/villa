@@ -8,9 +8,9 @@
 #include <utility>
 #include <vector>
 
-#include "helirec/common.hpp"
+#include "vc_tomography/common.hpp"
 
-namespace helirec {
+namespace vc_tomography {
 
 struct Json {
     enum Type { Null, Bool, Number, String, Array, Object };
@@ -211,4 +211,4 @@ inline std::string python_repr(double v) {
     return s;
 }
 
-}  // namespace helirec
+}  // namespace vc_tomography

@@ -5,9 +5,9 @@
 
 #include "hd_math.hpp"
 
-namespace helirec::ghbp_core {
+namespace vc_tomography::ghbp_core {
 
-using namespace helirec::hd;
+using namespace vc_tomography::hd;
 
 // grid pixel (a = row along H, b = col along W) -> image coordinates (Y, X)
 // nabuxx: T0*a + T1*b + T2
@@ -79,4 +79,4 @@ HR_HD bool in_circle(int i, int j, int N) {
     return fma(dx, dx, mul(dy, dy)) <= static_cast<float>(r * r);
 }
 
-}  // namespace helirec::ghbp_core
+}  // namespace vc_tomography::ghbp_core

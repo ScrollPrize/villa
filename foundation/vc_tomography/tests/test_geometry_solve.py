@@ -1,10 +1,10 @@
-"""The joint geometry model (helirec.geometry.solve_geometry, rays) against a projection written apart from it:
+"""The joint geometry model (vc_tomography.geometry.solve_geometry, rays) against a projection written apart from it:
 points in 3D carried by explicit rotation matrices and projected along parallel rays. The projection here fixes
 the model's signs and handedness; nothing in it uses the model's formulas."""
 import numpy as np
 import pytest
 
-from helirec import geometry as G
+from vc_tomography import geometry as G
 
 ROWS, COLS, PER_TURN = 400, 600, 360
 
@@ -572,7 +572,7 @@ def test_scans_compared_along_their_edges_give_the_maps_radial_terms_as_one():
 
 
 def test_the_reconstructions_poses_are_the_models():
-    """A joint calibration as the reconstruction reads it (helirec/geometry.hpp, Calibration::frame_poses): a pixel
+    """A joint calibration as the reconstruction reads it (vc_tomography/geometry.hpp, Calibration::frame_poses): a pixel
     put through the poses' formula is the ray the model gives it, the slices counted from the first scan's helix."""
     rng = np.random.default_rng(6)
     first, second, _, _ = _pair(rng)

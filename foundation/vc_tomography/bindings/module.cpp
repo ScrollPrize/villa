@@ -1,4 +1,4 @@
-// nanobind module `helirec._core`.
+// nanobind module `vc_tomography._core`.
 // Every kernel takes host NumPy arrays and a `device` ("cpu" | "cuda"); the CUDA
 // path uploads, runs and downloads, so the two backends can be compared 1:1.
 #include <nanobind/stl/string.h>
@@ -6,31 +6,31 @@
 #include <nanobind/stl/vector.h>
 #include <nanobind/stl/shared_ptr.h>
 
-#include "helirec/fourier.hpp"
-#include "helirec/ghbp.hpp"
-#include "helirec/filters.hpp"
-#include "helirec/tomo.hpp"
+#include "vc_tomography/fourier.hpp"
+#include "vc_tomography/ghbp.hpp"
+#include "vc_tomography/filters.hpp"
+#include "vc_tomography/tomo.hpp"
 #include <nanobind/stl/function.h>
-#include "helirec/sino.hpp"
-#include "helirec/raw_reader.hpp"
-#include "helirec/delta3d.hpp"
-#include "helirec/pipeline.hpp"
-#include "helirec/accumulate.hpp"
-#include "helirec/band.hpp"
+#include "vc_tomography/sino.hpp"
+#include "vc_tomography/raw_reader.hpp"
+#include "vc_tomography/delta3d.hpp"
+#include "vc_tomography/pipeline.hpp"
+#include "vc_tomography/accumulate.hpp"
+#include "vc_tomography/band.hpp"
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/array.h>
 #include <nanobind/stl/tuple.h>
-#include "helirec/helical.hpp"
-#include "helirec/kernels.hpp"
-#include "helirec/progress.hpp"
-#include "helirec/reference.hpp"
-#include "helirec/zarr.hpp"
-#include "helirec/reconstruction.hpp"
-#include "helirec/calibration/scan.hpp"
-#include "helirec/calibration/intensity.hpp"
+#include "vc_tomography/helical.hpp"
+#include "vc_tomography/kernels.hpp"
+#include "vc_tomography/progress.hpp"
+#include "vc_tomography/reference.hpp"
+#include "vc_tomography/zarr.hpp"
+#include "vc_tomography/reconstruction.hpp"
+#include "vc_tomography/calibration/scan.hpp"
+#include "vc_tomography/calibration/intensity.hpp"
 #include "ndarray_utils.hpp"
 
-#ifdef HELIREC_WITH_CUDA
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
 #include "../src/cuda/cuda_utils.cuh"
 #endif
 
@@ -40,8 +40,8 @@
 
 namespace nb = nanobind;
 using namespace nb::literals;
-using namespace helirec;
-using namespace helirec::py;
+using namespace vc_tomography;
+using namespace vc_tomography::py;
 
 namespace {
 
@@ -94,17 +94,17 @@ nb::ndarray<nb::numpy, std::uint8_t> to_uint8_py(HostIn img, double lo, double h
         }
         return out;
     }
-#ifdef HELIREC_WITH_CUDA
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
     cuda::DeviceBuffer<float> d_in(plane);
     cuda::DeviceBuffer<std::uint8_t> d_out(plane), d_mask(k.data ? mask_plane : 0);
     for (std::size_t f = 0; f < frames; ++f) {
-        HELIREC_CUDA_CHECK(cudaMemcpy(d_in.data(), img.data() + f * plane, plane * sizeof(float), cudaMemcpyHostToDevice));
+        VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpy(d_in.data(), img.data() + f * plane, plane * sizeof(float), cudaMemcpyHostToDevice));
         if (k.data) {
-            HELIREC_CUDA_CHECK(cudaMemcpy(d_mask.data(), k.data + mask_slice(f) * mask_plane, mask_plane, cudaMemcpyHostToDevice));
+            VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpy(d_mask.data(), k.data + mask_slice(f) * mask_plane, mask_plane, cudaMemcpyHostToDevice));
             w.mask = d_mask.data();
         }
         cuda::to_uint8(d_in.data(), nx, d_out.data(), static_cast<int>(ny), static_cast<int>(nx), w);
-        HELIREC_CUDA_CHECK(cudaMemcpy(o + f * plane, d_out.data(), plane, cudaMemcpyDeviceToHost));
+        VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpy(o + f * plane, d_out.data(), plane, cudaMemcpyDeviceToHost));
     }
 #endif
     return out;
@@ -125,7 +125,7 @@ HostOut flatfield_py(HostIn raw, HostIn dark, HostIn flat, float threshold, bool
         cpu::flatfield(raw.data(), dark.data(), flat.data(), data(out), n_proj, n_pix, p);
         return out;
     }
-#ifdef HELIREC_WITH_CUDA
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
     {
         nb::gil_scoped_release nogil;
         cuda::DeviceBuffer<float> d_raw, d_dark, d_flat, d_out(raw.size());
@@ -178,7 +178,7 @@ HostOut backproject_py(HostIn sino, HostIn angles, int ny, int nx, float rot_cen
         cpu::backproject(sino.data(), angles.data(), data(out), n_angles, n_det, ny, nx, p);
         return out;
     }
-#ifdef HELIREC_WITH_CUDA
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
     {
         nb::gil_scoped_release nogil;
         cuda::DeviceBuffer<float> d_sino, d_out(static_cast<std::size_t>(ny) * nx);
@@ -201,7 +201,7 @@ class PyFourierFilter {
         s.pad_top = pad_top; s.pad_left = pad_left; s.mode = pad_mode_from_string(mode);
         s.filter.assign(filter.data(), filter.data() + filter.size());
         if (device_ == Device::CPU) impl_ = cpu::make_fourier_filter(s);
-#ifdef HELIREC_WITH_CUDA
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
         else impl_ = cuda::make_fourier_filter(s);
 #endif
     }
@@ -218,7 +218,7 @@ class PyFourierFilter {
         if (device_ == Device::CPU) {
             impl_->apply(stack.data(), data(out), n);
         }
-#ifdef HELIREC_WITH_CUDA
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
         else {
             cuda::DeviceBuffer<float> d(stack.size());
             d.upload(stack.data(), stack.size());
@@ -231,7 +231,7 @@ class PyFourierFilter {
 
     PyFourierFilter(const FourierFilterSpec& s, const std::string& device) : device_(parse_device(device)) {
         if (device_ == Device::CPU) impl_ = cpu::make_fourier_filter(s);
-#ifdef HELIREC_WITH_CUDA
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
         else impl_ = cuda::make_fourier_filter(s);
 #endif
     }
@@ -273,15 +273,15 @@ FilterChain chain_from(nb::handle obj) {
     return chain;
 }
 
-// "python" filters: a function registered in helirec.filters (frames (n, H, W) float32, modified in place or
+// "python" filters: a function registered in vc_tomography.filters (frames (n, H, W) float32, modified in place or
 // returned); on CUDA with host=1 (default) it gets a NumPy copy, with host=0 the device array (DLPack: cupy / torch)
 class PythonFilter final : public ProjectionFilter {
   public:
     PythonFilter(const FilterParams& p) : margin_(static_cast<int>(p.num("margin", 0))), host_(p.num("host", 1) != 0) {
         nb::gil_scoped_acquire gil;
         const std::string name = p.str("fn", "");
-        nb::dict reg = nb::cast<nb::dict>(nb::module_::import_("helirec.filters").attr("_python_filters"));
-        if (!reg.contains(name.c_str())) throw Error("python filter: '" + name + "' is not registered (helirec.filters.register)");
+        nb::dict reg = nb::cast<nb::dict>(nb::module_::import_("vc_tomography.filters").attr("_python_filters"));
+        if (!reg.contains(name.c_str())) throw Error("python filter: '" + name + "' is not registered (vc_tomography.filters.register)");
         fn_ = reg[name.c_str()];
         nb::dict kw;
         kwargs_ = kw;
@@ -315,11 +315,11 @@ class PythonFilter final : public ProjectionFilter {
             }
             return;
         }
-#ifdef HELIREC_WITH_CUDA
-        HELIREC_CUDA_CHECK(cudaDeviceSynchronize());
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
+        VC_TOMOGRAPHY_CUDA_CHECK(cudaDeviceSynchronize());
         if (host_) {
             std::vector<float> buf(count);
-            HELIREC_CUDA_CHECK(cudaMemcpy(buf.data(), frames, count * sizeof(float), cudaMemcpyDeviceToHost));
+            VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpy(buf.data(), frames, count * sizeof(float), cudaMemcpyDeviceToHost));
             nb::object arr = nb::cast(nb::ndarray<nb::numpy, float, nb::ndim<3>>(buf.data(), 3, shape, nb::handle()),
                                       nb::rv_policy::reference);
             nb::object r = call(arr);
@@ -330,17 +330,17 @@ class PythonFilter final : public ProjectionFilter {
                 if (out.size() != count) throw Error("python filter returned a different shape");
                 src = out.data();
             }
-            HELIREC_CUDA_CHECK(cudaMemcpy(frames, src, count * sizeof(float), cudaMemcpyHostToDevice));
+            VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpy(frames, src, count * sizeof(float), cudaMemcpyHostToDevice));
         } else {
             int dev = 0;
-            HELIREC_CUDA_CHECK(cudaGetDevice(&dev));
+            VC_TOMOGRAPHY_CUDA_CHECK(cudaGetDevice(&dev));
             nb::object arr = nb::cast(nb::ndarray<float, nb::ndim<3>, nb::device::cuda>(frames, 3, shape, nb::handle(),
                                                                                         nullptr, nb::dtype<float>(),
                                                                                         nb::device::cuda::value, dev),
                                       nb::rv_policy::reference);
             nb::object r = call(arr);
             if (!r.is_none() && !r.is(arr)) throw Error("python filter (host=0): modify the device array in place");
-            HELIREC_CUDA_CHECK(cudaDeviceSynchronize());
+            VC_TOMOGRAPHY_CUDA_CHECK(cudaDeviceSynchronize());
         }
 #endif
     }
@@ -351,13 +351,13 @@ class PythonFilter final : public ProjectionFilter {
     nb::object fn_, kwargs_;  // null until the constructor holds the GIL (it may run with the GIL released)
 };
 
-// external backprojectors implemented in Python (helirec.backprojectors.register)
+// external backprojectors implemented in Python (vc_tomography.backprojectors.register)
 class PyExternalBackprojector final : public ExternalBackprojector {
   public:
     explicit PyExternalBackprojector(nb::dict spec) {
         nb::gil_scoped_acquire gil;
         const std::string name = nb::cast<std::string>(spec["fn"]);
-        nb::dict reg = nb::cast<nb::dict>(nb::module_::import_("helirec.backprojectors").attr("_registry"));
+        nb::dict reg = nb::cast<nb::dict>(nb::module_::import_("vc_tomography.backprojectors").attr("_registry"));
         if (!reg.contains(name.c_str())) throw Error("python backprojector '" + name + "' is not registered");
         nb::object entry = reg[name.c_str()];
         fn_ = entry.attr("fn");
@@ -391,18 +391,18 @@ class PyExternalBackprojector final : public ExternalBackprojector {
             r_arr = host_view(rows);
             w_arr = host_view(weights);
         }
-#ifdef HELIREC_WITH_CUDA
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
         else if (host_) {
-            HELIREC_CUDA_CHECK(cudaDeviceSynchronize());
+            VC_TOMOGRAPHY_CUDA_CHECK(cudaDeviceSynchronize());
             hr.resize(count); hw.resize(count);
-            HELIREC_CUDA_CHECK(cudaMemcpy(hr.data(), rows, count * sizeof(float), cudaMemcpyDeviceToHost));
-            HELIREC_CUDA_CHECK(cudaMemcpy(hw.data(), weights, count * sizeof(float), cudaMemcpyDeviceToHost));
+            VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpy(hr.data(), rows, count * sizeof(float), cudaMemcpyDeviceToHost));
+            VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpy(hw.data(), weights, count * sizeof(float), cudaMemcpyDeviceToHost));
             r_arr = host_view(hr.data());
             w_arr = host_view(hw.data());
         } else {
-            HELIREC_CUDA_CHECK(cudaDeviceSynchronize());
+            VC_TOMOGRAPHY_CUDA_CHECK(cudaDeviceSynchronize());
             int dev = 0;
-            HELIREC_CUDA_CHECK(cudaGetDevice(&dev));
+            VC_TOMOGRAPHY_CUDA_CHECK(cudaGetDevice(&dev));
             auto dview = [&](const float* ptr) {
                 return nb::cast(nb::ndarray<const float, nb::ndim<2>, nb::device::cuda>(ptr, 2, shape, nb::handle(), nullptr,
                                                                                          nb::dtype<float>(), nb::device::cuda::value, dev),
@@ -435,10 +435,10 @@ class PyExternalBackprojector final : public ExternalBackprojector {
             return;
         } catch (const nb::cast_error&) {
         }
-#ifdef HELIREC_WITH_CUDA
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
         auto a = nb::cast<nb::ndarray<const float, nb::c_contig, nb::device::cuda>>(res);
         if (a.size() != ry * rx) throw Error("python backprojector returned a wrong shape");
-        HELIREC_CUDA_CHECK(cudaMemcpy(out, a.data(), ry * rx * sizeof(float), cudaMemcpyDeviceToHost));
+        VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpy(out, a.data(), ry * rx * sizeof(float), cudaMemcpyDeviceToHost));
 #else
         throw Error("python backprojector must return a float32 NumPy array");
 #endif
@@ -463,7 +463,7 @@ HostOut minus_log_py(HostIn x, float clip_min, float clip_max, const std::string
         cpu::minus_log(data(out), x.size(), clip_min, clip_max);
         return out;
     }
-#ifdef HELIREC_WITH_CUDA
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
     cuda::DeviceBuffer<float> d;
     d.upload(data(out), x.size());
     cuda::minus_log(d.data(), x.size(), clip_min, clip_max);
@@ -486,7 +486,7 @@ HostOut angular_fir_py(HostIn sino, const std::vector<float>& taps, std::optiona
         cpu::angular_fir(in, data(out), np, nc, taps.data(), radius, sup);
         return out;
     }
-#ifdef HELIREC_WITH_CUDA
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
     cuda::DeviceBuffer<float> d_in, d_out(sino.size()), d_sup;
     d_in.upload(in, sino.size());
     if (sup) d_sup.upload(sup, sino.size());
@@ -505,7 +505,7 @@ std::pair<HostOut, HostOut> rebalance_py(HostIn R, HostIn W, float rot_center, b
         cpu::rebalance(data(r), data(w), np, nr, nc, rot_center, legacy);
         return {r, w};
     }
-#ifdef HELIREC_WITH_CUDA
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
     {
         nb::gil_scoped_release nogil;
         cuda::DeviceBuffer<float> dr, dw;
@@ -528,7 +528,7 @@ std::pair<HostOut, HostOut> rebalance_turns_py(HostIn R, HostIn W, int turn, flo
         cpu::rebalance_turns(data(r), data(w), np, nr, nc, turn, rot_center);
         return {r, w};
     }
-#ifdef HELIREC_WITH_CUDA
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
     {
         nb::gil_scoped_release nogil;
         cuda::DeviceBuffer<float> dr, dw;
@@ -565,7 +565,7 @@ HostOut ramp_filter_py(HostIn sino, float rot_center, int pad_factor, bool norma
         cpu::ramp_crop(padded.data(), data(out), g);
         return out;
     }
-#ifdef HELIREC_WITH_CUDA
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
     cuda::DeviceBuffer<float> d_sino, d_pad(static_cast<std::size_t>(n_proj) * g.npad), d_out(sino.size());
     d_sino.upload(sino.data(), sino.size());
     cuda::DeviceBuffer<int32_t> d_opp;
@@ -597,7 +597,7 @@ HostOut ghbp_py(HostIn sino, HostIn angles, int grid_size, float rot_center, flo
         cpu::ghbp(plan, sino.data(), data(out));
         return out;
     }
-#ifdef HELIREC_WITH_CUDA
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
     cuda::Ghbp g(plan);
     cuda::DeviceBuffer<float> d_sino, d_out(static_cast<std::size_t>(grid_size) * grid_size);
     d_sino.upload(sino.data(), sino.size());
@@ -749,7 +749,7 @@ HostOut resample_rows_py(HostIn rows, std::optional<DoubleIn> positions, float s
         if (positions) cpu::resample_rows(work.data(), nr, n, positions->data());
         else cpu::resample_rows(work.data(), nr, n, row.data(), g);
     } else {
-#ifdef HELIREC_WITH_CUDA
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
         cuda::DeviceBuffer<float> d;
         d.upload(work.data(), work.size());
         if (positions) {
@@ -837,7 +837,7 @@ std::vector<double> time_rows_py(const std::string& what, int n_rows, int n, int
             else cpu::resample_rows(work.data(), n_rows, n, row.data(), g);
         }, [] {});
     } else {
-#ifdef HELIREC_WITH_CUDA
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
         cuda::DeviceBuffer<float> d;
         cuda::DeviceBuffer<double> dp, d_eu, d_ev;
         cuda::DeviceBuffer<ResampleRow> d_row;
@@ -857,7 +857,7 @@ std::vector<double> time_rows_py(const std::string& what, int n_rows, int n, int
             if (what == "shift") cuda::shift_rows(d.data(), n_rows, n, shift);
             else if (what == "positions") cuda::resample_rows(d.data(), n_rows, n, dp.data());
             else cuda::resample_rows(d.data(), n_rows, n, d_row.data(), g);
-        }, [] { HELIREC_CUDA_CHECK(cudaDeviceSynchronize()); });
+        }, [] { VC_TOMOGRAPHY_CUDA_CHECK(cudaDeviceSynchronize()); });
 #endif
     }
     return seconds;
@@ -1142,11 +1142,11 @@ NB_MODULE(_core, m) {
     bind_geometry_calibration(m);
     bind_scan(m);
     bind_surface(m);
-    m.doc() = "helirec C++/CUDA kernels";
+    m.doc() = "vc_tomography C++/CUDA kernels";
     nb::register_exception_translator([](const std::exception_ptr& p, void*) {
         try {
             std::rethrow_exception(p);
-        } catch (const helirec::Error& e) {
+        } catch (const vc_tomography::Error& e) {
             PyErr_SetString(PyExc_RuntimeError, e.what());
         }
     });
@@ -1154,7 +1154,7 @@ NB_MODULE(_core, m) {
     m.def("cuda_available", &cuda_available, "True if built with CUDA and a GPU is usable");
     m.def("release_pinned_memory", &release_pinned_memory,
           "free the page-locked host buffers kept for reuse by later reconstructors (CUDA; up to 24 GB)");
-#ifdef HELIREC_WITH_CUDA
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
     m.attr("built_with_cuda") = true;
 #else
     m.attr("built_with_cuda") = false;
@@ -1181,7 +1181,7 @@ NB_MODULE(_core, m) {
                   cpu::upsample_rows(rows.data(), data(out), nr, n, os);
                   return out;
               }
-#ifdef HELIREC_WITH_CUDA
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
               cuda::DeviceBuffer<float> di, dout(static_cast<std::size_t>(nr) * n * os);
               di.upload(rows.data(), rows.size());
               cuda::upsample_rows(di.data(), dout.data(), nr, n, os);
@@ -1204,7 +1204,7 @@ NB_MODULE(_core, m) {
               if (parse_device(device) == Device::CPU) {
                   cpu::shift_rows(work.data(), nr, n, shift);
               } else {
-#ifdef HELIREC_WITH_CUDA
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
                   cuda::DeviceBuffer<float> d;
                   d.upload(work.data(), work.size());
                   cuda::shift_rows(d.data(), nr, n, shift);
@@ -1301,7 +1301,7 @@ NB_MODULE(_core, m) {
                   cpu::bspline_prefilter(rows.data(), data(out), nr, n, degree);
                   return out;
               }
-#ifdef HELIREC_WITH_CUDA
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
               cuda::DeviceBuffer<float> d;
               d.upload(rows.data(), rows.size());
               cuda::bspline_prefilter(d.data(), d.data(), nr, n, degree);
@@ -1331,7 +1331,7 @@ NB_MODULE(_core, m) {
                   cpu::chord_project(img.data(), data(out), angles.data(), na, n_det, N, rot, pj);
                   return out;
               }
-#ifdef HELIREC_WITH_CUDA
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
               cuda::DeviceBuffer<float> di, ds(static_cast<std::size_t>(na) * n_det);
               di.upload(img.data(), img.size());
               cuda::chord_project(di.data(), ds.data(), angles.data(), na, n_det, N, rot, pj);
@@ -1353,7 +1353,7 @@ NB_MODULE(_core, m) {
                   cpu::chord_backproject(sino.data(), data(out), angles.data(), na, nd, N, rot, pj);
                   return out;
               }
-#ifdef HELIREC_WITH_CUDA
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
               cuda::DeviceBuffer<float> ds, di(static_cast<std::size_t>(N) * N);
               ds.upload(sino.data(), sino.size());
               cuda::chord_backproject(ds.data(), di.data(), angles.data(), na, nd, N, rot, pj);
@@ -1392,7 +1392,7 @@ NB_MODULE(_core, m) {
                   cpu::tomo_reconstruct(a, t, rows.data(), w.data(), angles.data(), data(out), nullptr, start_host);
                   return out;
               }
-#ifdef HELIREC_WITH_CUDA
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
               cuda::DeviceBuffer<float> dr, dw, dx(W * H), ds;
               dr.upload(rows.data(), rows.size());
               dw.upload(w.data(), w.size());
@@ -1417,12 +1417,12 @@ NB_MODULE(_core, m) {
                   cpu::mend_null_weights(data(out), RW.data(), 1, H, NX, threshold, x0, x1);
                   return out;
               }
-#ifdef HELIREC_WITH_CUDA
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
               cuda::DeviceBuffer<float> dr, dw;
               dr.upload(data(out), R.size());
               dw.upload(RW.data(), RW.size());
               cuda::mend_null_weights(dr.data(), dw.data(), 1, H, NX, threshold, x0, x1);
-              HELIREC_CUDA_CHECK(cudaDeviceSynchronize());
+              VC_TOMOGRAPHY_CUDA_CHECK(cudaDeviceSynchronize());
               dr.download(data(out));
 #endif
               return out;
@@ -1461,7 +1461,7 @@ NB_MODULE(_core, m) {
               const auto& steps = P.steps();
               float* host = data(out);
               float* buf = host;
-#ifdef HELIREC_WITH_CUDA
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
               cuda::DeviceBuffer<float> d;
               if (dev == Device::CUDA) { d.upload(host, stack.size()); buf = d.data(); }
 #endif
@@ -1469,7 +1469,7 @@ NB_MODULE(_core, m) {
                   if (steps[s].stage != st) continue;
                   if (steps[s].fourier) {
                       const auto& spec = P.step_spec(s, H, W, steps.size() == 1 ? margin : -1);
-#ifdef HELIREC_WITH_CUDA
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
                       auto f = dev == Device::CUDA ? cuda::make_fourier_filter(spec) : cpu::make_fourier_filter(spec);
 #else
                       auto f = cpu::make_fourier_filter(spec);
@@ -1479,7 +1479,7 @@ NB_MODULE(_core, m) {
                       for (auto* fl : steps[s].members) fl->apply(buf, n, H, W, dev);
                   }
               }
-#ifdef HELIREC_WITH_CUDA
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
               if (dev == Device::CUDA) d.download(host);
 #endif
               return out;
@@ -1516,7 +1516,7 @@ NB_MODULE(_core, m) {
             g.correct(data(out), static_cast<int>(frames.shape(0)));
         }
         return out;
-    }, "frames"_a, "config"_a, "Correct frames with a resolved SLD configuration (helirec.sld.sld_config)");
+    }, "frames"_a, "config"_a, "Correct frames with a resolved SLD configuration (vc_tomography.sld.sld_config)");
 
     m.def("delta3d_available", &delta3d_available, "True if built with the vc-delta3d codec");
     m.def(
@@ -1576,7 +1576,7 @@ NB_MODULE(_core, m) {
           },
           "angles_deg"_a, "z_translation_m"_a, "pixel_size_m"_a, "det_rows"_a, "z_readjustment"_a = 0.f,
           "angular_tolerance_steps"_a = 5.0);
-    nb::class_<ScanData>(m, "ScanData", "one scan (raw access + calibration), see helirec.scan_data()");
+    nb::class_<ScanData>(m, "ScanData", "one scan (raw access + calibration), see vc_tomography.scan_data()");
     m.def("make_scan_data", &make_scan_data, "angles_deg"_a, "z_translation_m"_a, "pixel_size_m"_a, "det_rows"_a,
           "det_cols"_a, "shift_x"_a, "x_readjustment"_a, "z_readjustment"_a, "control_A"_a, "flat_angles_deg"_a,
           "dark"_a, "flats"_a, "weight"_a, "reader"_a, "file_index"_a, "frame_index"_a, "z_translation_scale"_a = 1.0,
@@ -1734,7 +1734,7 @@ NB_MODULE(_core, m) {
         "master"_a, "description"_a, "tile"_a, "device"_a = "cuda", "params"_a = "{}", "row_origin"_a = nb::none(), "weight"_a = nb::none(), "cache_gb"_a = 0.0,
         "reduced"_a = nb::none(), "cache_dir"_a = "", "reduce"_a = 0, "log"_a = nb::none(), "projections"_a = "",
         "A reconstructor of one tile of a mosaic alone -> (SliceReconstructor, dict(rot_center, frames, scan, terms, row_origin, reduced, reduce, params)) "
-        "(helirec::tile_reconstructor)");
+        "(vc_tomography::tile_reconstructor)");
     m.def(
         "geometry_calibration_file",
         [](const std::string& given, const std::string& cache_dir, const std::vector<std::string>& masters, const std::string& row_time_us, const std::string& device,
@@ -1752,12 +1752,12 @@ NB_MODULE(_core, m) {
         },
         "given"_a, "cache_dir"_a, "masters"_a, "row_time_us"_a = "", "device"_a = "cpu", "log"_a = nb::none(), "make"_a = nb::none(),
         "(path, text) of the geometry calibration: given, or geometry.json of cache_dir made by make(masters, row_time_s, device) (default: the "
-        "geometry calibration step) when absent or of other scans (helirec::geometry_calibration_file)");
+        "geometry calibration step) when absent or of other scans (vc_tomography::geometry_calibration_file)");
 
     nb::class_<Reconstruction>(m, "Reconstruction",
                                "The reconstruction of an acquisition (a scan pair, or more scans moved sideways) from its raw folders or a "
                                "projection store: the scans, the geometry and intensity calibrations, and a SliceReconstructor of the parameters "
-                               "(helirec::Reconstruction, reconstruction.hpp)")
+                               "(vc_tomography::Reconstruction, reconstruction.hpp)")
         .def(
             "__init__",
             [](Reconstruction* self, const std::string& projections, const std::string& params, const std::string& cache_dir, const std::string& device,
@@ -1842,11 +1842,11 @@ NB_MODULE(_core, m) {
                  const int na = static_cast<int>(filtered.shape(0)), nd = static_cast<int>(filtered.shape(1));
                  nb::gil_scoped_release nogil;
                  if (b.device() == Device::CPU) { b.slice(h, filtered.data(), na, nd, angles.data(), p, set); return; }
-#ifdef HELIREC_WITH_CUDA
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
                  cuda::DeviceBuffer<float> d;
                  d.upload(filtered.data(), filtered.size());
                  b.slice(h, d.data(), na, nd, angles.data(), p, set);
-                 HELIREC_CUDA_CHECK(cudaDeviceSynchronize());
+                 VC_TOMOGRAPHY_CUDA_CHECK(cudaDeviceSynchronize());
 #endif
              }, "h"_a, "filtered"_a, "angles"_a, "rot_center"_a, "scale"_a = 1.f, "center"_a = -1.f,
              "clip_outer_circle"_a = false, "clip_radius"_a = -1.f, "set"_a = 0,

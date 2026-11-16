@@ -1,4 +1,4 @@
-// helirec/calibration/intensity.hpp: the intensity calibration of a scan pair (darks and flats, the weight maps, the
+// vc_tomography/calibration/intensity.hpp: the intensity calibration of a scan pair (darks and flats, the weight maps, the
 // detector's blur field, the merged frame's placement) and its caches.
 #include <sys/stat.h>
 
@@ -16,16 +16,16 @@
 #include <optional>
 #include <set>
 
-#include "helirec/calibration/intensity.hpp"
-#include "helirec/progress.hpp"
-#include "helirec/projection_store.hpp"
-#include "helirec/raw_reader.hpp"
+#include "vc_tomography/calibration/intensity.hpp"
+#include "vc_tomography/progress.hpp"
+#include "vc_tomography/projection_store.hpp"
+#include "vc_tomography/raw_reader.hpp"
 #include "io/array_file.hpp"
 #include "io/json.hpp"
 #include "io/sha256.hpp"
 #include "common/numpy_sum.hpp"
 
-namespace helirec::calibration {
+namespace vc_tomography::calibration {
 
 namespace {
 
@@ -149,7 +149,7 @@ DetectorBlur blur_of(const Json& cal) {
 
 std::string darks_flats_fingerprint(const Scan& scan) {
     Sha256 h;
-    h.update("helirec-darks-flats-v" + std::to_string(kIntensityCalibrationVersion) + "|" + std::to_string(scan.rows) + "," + std::to_string(scan.cols));
+    h.update("vc_tomography_darks_flats_v" + std::to_string(kIntensityCalibrationVersion) + "|" + std::to_string(scan.rows) + "," + std::to_string(scan.cols));
     std::vector<const FrameList*> lists = {&scan.darks};
     for (const FrameList& f : scan.flats) lists.push_back(&f);
     for (const FrameList* r : lists) {
@@ -342,7 +342,7 @@ std::string acquisition_fingerprint(const Scan& main, const Scan& companion) { r
 
 std::string acquisition_fingerprint(const std::vector<const Scan*>& scans) {
     Sha256 h;
-    h.update("helirec-calibration-v" + std::to_string(kIntensityCalibrationVersion));
+    h.update("vc_tomography_calibration_v" + std::to_string(kIntensityCalibrationVersion));
     for (const Scan* sc : scans) {
         Json flats = Json::list();
         for (const FrameList& f : sc->flats) flats.add(count(static_cast<long long>(f.size())));
@@ -466,7 +466,7 @@ IntensityCalibration calibrate_intensity(const std::vector<const Scan*>& scans, 
     cal.reduced.resize(S);
     if (store) {
         Sha256 h;
-        h.update("helirec-calibration-v" + std::to_string(kIntensityCalibrationVersion) + "|store|" + projection_store + "|" + std::to_string(reduce));
+        h.update("vc_tomography_calibration_v" + std::to_string(kIntensityCalibrationVersion) + "|store|" + projection_store + "|" + std::to_string(reduce));
         for (const Scan* sc : scans) h.update(sc->name + "|" + file_state(sc->master));
         cal.fingerprint = h.hex();
         for (std::size_t k = 0; k < S; ++k) {
@@ -646,4 +646,4 @@ IntensityCalibration calibrate_intensity(const std::vector<const Scan*>& scans, 
     return cal;
 }
 
-}  // namespace helirec::calibration
+}  // namespace vc_tomography::calibration

@@ -1,4 +1,4 @@
-#include "helirec/raw_reader.hpp"
+#include "vc_tomography/raw_reader.hpp"
 
 #include <fcntl.h>
 #include <hdf5.h>
@@ -20,10 +20,10 @@
 #include <unordered_map>
 #include <unordered_set>
 
-#include "helirec/projection_store.hpp"
+#include "vc_tomography/projection_store.hpp"
 #include "io/j2k_chunk.hpp"
 
-namespace helirec {
+namespace vc_tomography {
 
 struct RawReader::FileInfo {
     std::vector<std::int64_t> frame_offset;  // byte offset of each frame in the file (plain values)
@@ -33,7 +33,7 @@ struct RawReader::FileInfo {
     int chunks_per_frame = 0;
     std::vector<std::int64_t> chunk_offset;  // (frame, chunk)
     std::vector<std::uint32_t> chunk_bytes;
-    // A scan group of a projection store (helirec/projection_store.hpp): chunks of chunk_rows rows of its level
+    // A scan group of a projection store (vc_tomography/projection_store.hpp): chunks of chunk_rows rows of its level
     ProjectionStoreLevel store;
     std::size_t frames() const { return store.impl ? static_cast<std::size_t>(store.frames) : chunk_rows ? chunk_offset.size() / static_cast<std::size_t>(chunks_per_frame) : frame_offset.size(); }
 };
@@ -235,9 +235,9 @@ const RawReader::FileInfo& RawReader::info(int file) {
         if (cdims[1] % (1u << reduce_) && (sample_bytes_ == 2 || cdims[1] != dims[1]))
             throw Error("RawReader: " + path + ": chunks of " + std::to_string(cdims[1]) + " rows cannot be read at 1/" + std::to_string(1 << reduce_));
         if (use_openjph_ && !j2k::openjph_available())
-            throw Error("RawReader: HTJ2K with OpenJPH needs a build with HELIREC_OPENJPH=ON");
+            throw Error("RawReader: HTJ2K with OpenJPH needs a build with VC_TOMOGRAPHY_OPENJPH=ON");
         if (!use_openjph_ && !j2k::available())
-            throw Error("RawReader: " + path + ": the frames are stored as JPEG 2000; build helirec with OpenJPEG (libopenjp2 >= 2.5: apt install libopenjp2-7-dev, brew install openjpeg)");
+            throw Error("RawReader: " + path + ": the frames are stored as JPEG 2000; build vc_tomography with OpenJPEG (libopenjp2 >= 2.5: apt install libopenjp2-7-dev, brew install openjpeg)");
         fi->stored_chunk_rows = static_cast<int>(cdims[1]);
         fi->chunk_rows = 1 + ((fi->stored_chunk_rows - 1) >> reduce_);
         fi->chunks_per_frame = (stored_rows_ + fi->stored_chunk_rows - 1) / fi->stored_chunk_rows;
@@ -567,7 +567,7 @@ void RawReader::read_rows_impl(const int32_t* file_index, const int32_t* frame_i
                         std::memcpy(out + i * out_stride + static_cast<std::size_t>(a - row0[i]) * row_bytes,
                                     static_cast<const std::uint8_t*>(tile->data()) + static_cast<std::size_t>(a - c * fi.chunk_rows) * row_bytes, static_cast<std::size_t>(b - a) * row_bytes);
                 } catch (const std::exception& e) {
-#pragma omp critical(helirec_reader_error)
+#pragma omp critical(vc_tomography_reader_error)
                     if (error.empty()) error = e.what();
                 }
             }
@@ -604,7 +604,7 @@ void RawReader::read_rows_impl(const int32_t* file_index, const int32_t* frame_i
             }
             ::close(fd);
         } catch (const std::exception& e) {
-#pragma omp critical(helirec_reader_error)
+#pragma omp critical(vc_tomography_reader_error)
             if (error.empty()) error = e.what();
         }
     }
@@ -653,7 +653,7 @@ void RawReader::visit_frames(const int32_t* file_index, const int32_t* frame_ind
                     }
                     for (int r0 = 0; r0 < rows_; r0 += nrows) visit(i, r0, std::min(nrows, rows_ - r0), frame.data() + static_cast<std::size_t>(r0) * cols_);
                 } catch (const std::exception& e) {
-#pragma omp critical(helirec_reader_error)
+#pragma omp critical(vc_tomography_reader_error)
                     if (error.empty()) error = e.what();
                 }
             }
@@ -691,7 +691,7 @@ void RawReader::visit_frames(const int32_t* file_index, const int32_t* frame_ind
                 }
                 ::close(fd);
             } catch (const std::exception& e) {
-#pragma omp critical(helirec_reader_error)
+#pragma omp critical(vc_tomography_reader_error)
                 if (error.empty()) error = e.what();
             }
         }
@@ -710,4 +710,4 @@ void RawReader::read_frames(const int32_t* files, const int32_t* frames, std::si
     read_rows(files, frames, row0.data(), n, rows_, out, threads);
 }
 
-}  // namespace helirec
+}  // namespace vc_tomography

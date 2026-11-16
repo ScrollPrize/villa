@@ -4,9 +4,9 @@
 #include "common/detector_map_core.hpp"
 #include "common/interp_core.hpp"
 #include "common/sino_core.hpp"
-#include "helirec/sino.hpp"
+#include "vc_tomography/sino.hpp"
 
-namespace helirec::cuda {
+namespace vc_tomography::cuda {
 
 namespace {
 __global__ void pad_rows_kernel(const float* in, float* out, int n_rows, int n, int L) {
@@ -98,7 +98,7 @@ struct RowShifter {
         check(cufftPlanMany(&fwd, 1, &n, &real, 1, real, &cplx, 1, cplx, CUFFT_R2C, batch), "plan R2C (shift)");
         check(cufftPlanMany(&inv, 1, &n, &cplx, 1, cplx, &real, 1, real, CUFFT_C2R, batch), "plan C2R (shift)");
         tail.ensure(static_cast<size_t>(batch) * real);
-        HELIREC_CUDA_CHECK(cudaMemset(tail.data(), 0, static_cast<size_t>(batch) * real * sizeof(float)));
+        VC_TOMOGRAPHY_CUDA_CHECK(cudaMemset(tail.data(), 0, static_cast<size_t>(batch) * real * sizeof(float)));
     }
 };
 }  // namespace
@@ -118,7 +118,7 @@ void shift_rows(float* rows, int n_rows, int n, float shift, void* stream, const
         float* w = a;
         if (nr < U.batch) {   // (the rows of the buffer beyond nr are zero or earlier rows: finite either way)
             w = U.tail.data();
-            HELIREC_CUDA_CHECK(cudaMemcpyAsync(w, a, static_cast<size_t>(nr) * S * sizeof(float), cudaMemcpyDeviceToDevice, s));
+            VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpyAsync(w, a, static_cast<size_t>(nr) * S * sizeof(float), cudaMemcpyDeviceToDevice, s));
         }
         check(cufftExecR2C(U.fwd, w, reinterpret_cast<cufftComplex*>(w)), "R2C (shift)");
         const int np = w == a ? nr : U.batch;   // (every row of `tail`: its spare rows must stay bounded)
@@ -126,9 +126,9 @@ void shift_rows(float* rows, int n_rows, int n, float shift, void* stream, const
                                                                                     shifts ? shifts + r0 : nullptr, nr);
         check(cufftExecC2R(U.inv, reinterpret_cast<cufftComplex*>(w), w), "C2R (shift)");
         if (w != a)
-            HELIREC_CUDA_CHECK(cudaMemcpyAsync(a, w, static_cast<size_t>(nr) * S * sizeof(float), cudaMemcpyDeviceToDevice, s));
+            VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpyAsync(a, w, static_cast<size_t>(nr) * S * sizeof(float), cudaMemcpyDeviceToDevice, s));
     }
-    HELIREC_CUDA_CHECK(cudaGetLastError());
+    VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
 }
 
 namespace {
@@ -189,7 +189,7 @@ struct RowResampler {
         const std::vector<double> f = resample_deconvolution(n);
         factor.upload(f.data(), f.size());
         kernel.upload(resample_kernel().data(), resample_kernel().size());
-        HELIREC_CUDA_CHECK(cudaStreamSynchronize(nullptr));
+        VC_TOMOGRAPHY_CUDA_CHECK(cudaStreamSynchronize(nullptr));
     }
 };
 
@@ -212,8 +212,8 @@ void resample_rows_at(float* rows, int n_rows, int n, const double* positions, c
         float* w = a;
         if (nr < U.batch) {   // (the spare rows of the buffer: zero, so that every transform stays finite)
             w = U.tail.data();
-            HELIREC_CUDA_CHECK(cudaMemcpyAsync(w, a, static_cast<size_t>(nr) * S * sizeof(float), cudaMemcpyDeviceToDevice, s));
-            HELIREC_CUDA_CHECK(cudaMemsetAsync(w + static_cast<size_t>(nr) * S, 0, static_cast<size_t>(U.batch - nr) * S * sizeof(float), s));
+            VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpyAsync(w, a, static_cast<size_t>(nr) * S * sizeof(float), cudaMemcpyDeviceToDevice, s));
+            VC_TOMOGRAPHY_CUDA_CHECK(cudaMemsetAsync(w + static_cast<size_t>(nr) * S, 0, static_cast<size_t>(U.batch - nr) * S * sizeof(float), s));
         }
         check(cufftExecR2C(U.fwd, w, reinterpret_cast<cufftComplex*>(w)), "R2C (resample)");
         cufftDoubleComplex* B = reinterpret_cast<cufftDoubleComplex*>(V.grid.data());
@@ -224,7 +224,7 @@ void resample_rows_at(float* rows, int n_rows, int n, const double* positions, c
             V.grid.data(), a, nr, n, S, So, M, positions ? positions + static_cast<size_t>(r0) * n : nullptr, row ? row + r0 : nullptr, geo,
             V.kernel.data());
     }
-    HELIREC_CUDA_CHECK(cudaGetLastError());
+    VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
 }
 }  // namespace
 
@@ -248,13 +248,13 @@ __global__ void bspline_prefilter_kernel(const float* in, float* out, int n_rows
 
 void bspline_prefilter(const float* in, float* out, int n_rows, int n, int degree, void* stream) {
     bspline_prefilter_kernel<<<(n_rows + 63) / 64, 64, 0, as_stream(stream)>>>(in, out, n_rows, n, degree);
-    HELIREC_CUDA_CHECK(cudaGetLastError());
+    VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
 }
 
 void upsample_rows(const float* in, float* out, int n_rows, int n, int os, void* stream) {
     cudaStream_t s = as_stream(stream);
     if (os == 1) {
-        HELIREC_CUDA_CHECK(cudaMemcpyAsync(out, in, sizeof(float) * n_rows * n, cudaMemcpyDeviceToDevice, s));
+        VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpyAsync(out, in, sizeof(float) * n_rows * n, cudaMemcpyDeviceToDevice, s));
         return;
     }
     thread_local Upsampler U;
@@ -269,7 +269,7 @@ void upsample_rows(const float* in, float* out, int n_rows, int n, int os, void*
     check(cufftExecC2R(U.inv, U.B.data(), U.b.data()), "C2R");
     crop_scale_kernel<<<grid_for(static_cast<size_t>(n_rows) * n * os), 256, 0, s>>>(U.b.data(), out, n_rows, n * os, L * os,
                                                                                   1.f / static_cast<float>(L));
-    HELIREC_CUDA_CHECK(cudaGetLastError());
+    VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
 }
 
-}  // namespace helirec::cuda
+}  // namespace vc_tomography::cuda

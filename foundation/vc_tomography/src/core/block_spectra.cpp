@@ -1,5 +1,5 @@
 // Block cross-spectra: what the CPU and CUDA implementations share (bins, window, registration, curves).
-#include "helirec/block_spectra.hpp"
+#include "vc_tomography/block_spectra.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -8,7 +8,7 @@
 #include "common/block_spectra_core.hpp"
 #include "calibration/correlation_peak.hpp"
 
-namespace helirec {
+namespace vc_tomography {
 
 namespace core = block_spectra_core;
 
@@ -212,4 +212,4 @@ ShellCurves shell_curves(const BlockSpectraSpec& spec, const std::vector<double>
     return c;
 }
 
-}  // namespace helirec
+}  // namespace vc_tomography

@@ -7,8 +7,8 @@ import numpy as np
 import pytest
 
 from evaluation import compare_methods as compare
-from helirec import to_uint8
-from helirec.recon import CALIBRATION_KEYS, DEFAULTS, HelicalRecon, LEGACY_REFERENCE
+from vc_tomography import to_uint8
+from vc_tomography.recon import CALIBRATION_KEYS, DEFAULTS, HelicalRecon, LEGACY_REFERENCE
 
 
 @pytest.mark.parametrize("recipe", ["343p_baselines.json", "343p_corrected_baselines.json"])

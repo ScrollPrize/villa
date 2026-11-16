@@ -1,4 +1,4 @@
-"""helirec::calibration through its bindings: the registration estimator, and the record and inventory checks on
+"""vc_tomography::calibration through its bindings: the registration estimator, and the record and inventory checks on
 a small synthetic acquisition record written the way BLISS / Lima write one (virtual frame dataset, one chunk
 per frame, per-frame statistics, latched encoders)."""
 import json
@@ -6,7 +6,7 @@ import json
 import numpy as np
 import pytest
 
-from helirec import _core
+from vc_tomography import _core
 
 h5py = pytest.importorskip("h5py")
 
@@ -666,16 +666,16 @@ def test_session_at_reduced_resolution(tmp_path, monkeypatch):
 
 def test_session_on_a_projection_store(tmp_path, monkeypatch):
     """CalibrationSession(reduce=, store=): the frames, darks and flats of a scan read from a projection store
-    (helirec-projections-zarr) at one of its levels, the scan's master as always. A frame is on disk if the store
+    (vc_tomography_projections_zarr) at one of its levels, the scan's master as always. A frame is on disk if the store
     holds its file. The store is made up here: its level keeps every second pixel of made-up detector files."""
     import shutil
     import subprocess
     import sys
     from pathlib import Path
     here = Path(_core.__file__).resolve().parent
-    tool = next((str(d / "helirec-projections-zarr") for d in (here, *here.parents[:2]) if (d / "helirec-projections-zarr").exists()), None) or shutil.which("helirec-projections-zarr")
+    tool = next((str(d / "vc_tomography_projections_zarr") for d in (here, *here.parents[:2]) if (d / "vc_tomography_projections_zarr").exists()), None) or shutil.which("vc_tomography_projections_zarr")
     if tool is None:
-        pytest.skip("helirec-projections-zarr is not built")
+        pytest.skip("vc_tomography_projections_zarr is not built")
     module = sys.modules[__name__]
     monkeypatch.setattr(module, "ROWS", 48)
     monkeypatch.setattr(module, "COLS", 80)
@@ -723,7 +723,7 @@ def test_images_at_reduced_resolution():
     """calibration.at_resolution: a dark or flat on the grid of RawReader(reduce=) for irreversibly coded frames.
     Unit gain, a ramp kept at every 2^reduce-th pixel (the low band's sample sits on the stored pixel, not between
     pixels), each chunk of rows filtered alone, zeros beyond the frame in a last chunk that is not whole."""
-    from helirec import calibration
+    from vc_tomography import calibration
     jj, kk = np.mgrid[0:512, 0:160].astype(np.float64)
     ramp = 500.0 + 7.0 * jj + 3.0 * kk
     for r in (1, 2, 3):

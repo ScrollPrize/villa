@@ -1,5 +1,5 @@
-// Python bindings of helirec/geometry.hpp: the detector's map, the poses of every frame from a geometry
-// calibration and the reconstruction's per-projection terms (python/helirec/geometry.py and mosaic.py call these;
+// Python bindings of vc_tomography/geometry.hpp: the detector's map, the poses of every frame from a geometry
+// calibration and the reconstruction's per-projection terms (python/vc_tomography/geometry.py and mosaic.py call these;
 // a calibration crosses as the JSON text it is saved as).
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
@@ -7,13 +7,13 @@
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
 
-#include "helirec/geometry.hpp"
+#include "vc_tomography/geometry.hpp"
 #include "ndarray_utils.hpp"
 
 namespace nb = nanobind;
 using namespace nb::literals;
-using helirec::py::new_array_t;
-namespace hg = helirec::geometry;
+using vc_tomography::py::new_array_t;
+namespace hg = vc_tomography::geometry;
 
 namespace {
 
@@ -58,7 +58,7 @@ hg::Map map_of(const std::vector<int>& i, const std::vector<int>& j, const std::
                double v0, double vs) {
     hg::Map m;
     m.i = i, m.j = j, m.eu = eu, m.ev = ev, m.c0 = c0, m.cs = cs, m.v0 = v0, m.vs = vs;
-    if (j.size() != i.size() || eu.size() != i.size() || ev.size() != i.size()) throw helirec::Error("the map's lists differ in length");
+    if (j.size() != i.size() || eu.size() != i.size() || ev.size() != i.size()) throw vc_tomography::Error("the map's lists differ in length");
     return m;
 }
 
@@ -70,7 +70,7 @@ void bind_geometry(nb::module_& m) {
     m.def("geometry_map_displacement",
           [](const std::vector<int>& i, const std::vector<int>& j, const std::vector<double>& eu, const std::vector<double>& ev, double c0, double cs, double v0, double vs,
              DoubleIn c, DoubleIn v) {
-              if (c.shape(0) != v.shape(0)) throw helirec::Error("map_displacement: the columns and the rows differ in length");
+              if (c.shape(0) != v.shape(0)) throw vc_tomography::Error("map_displacement: the columns and the rows differ in length");
               const hg::Map map = map_of(i, j, eu, ev, c0, cs, v0, vs);
               auto u = new_array_t<double>({c.shape(0)}), w = new_array_t<double>({c.shape(0)});
               hg::map_displacement(map, c.data(), v.data(), c.shape(0), static_cast<double*>(u.data()), static_cast<double*>(w.data()));
@@ -90,7 +90,7 @@ void bind_geometry(nb::module_& m) {
           "rot_center"_a, "column_offset"_a, "z_readjustment"_a = 0.0, "row_origin"_a = 0.0);
 
     nb::class_<hg::Calibration>(m, "GeometryCalibration",
-                                "A geometry calibration of scans that share their place on the rotation stage (helirec/geometry.hpp), from its JSON text.")
+                                "A geometry calibration of scans that share their place on the rotation stage (vc_tomography/geometry.hpp), from its JSON text.")
         .def("__init__", [](hg::Calibration* self, const std::string& json_text) { new (self) hg::Calibration(hg::Calibration::parse(json_text)); }, "json_text"_a)
         .def_prop_ro("rows", &hg::Calibration::rows)
         .def_prop_ro("cols", &hg::Calibration::cols)
@@ -139,7 +139,7 @@ void bind_geometry(nb::module_& m) {
         .def("merged_layout_of",
              [](const hg::Calibration& c, const std::vector<std::vector<double>>& axis, const std::vector<std::vector<double>>& row, const std::vector<std::vector<double>>& heights_rows,
                 const std::vector<std::size_t>& first_frame, double quantum) {
-                 if (row.size() != axis.size()) throw helirec::Error("merged_layout: the axes and the rows are not of the same scans");
+                 if (row.size() != axis.size()) throw vc_tomography::Error("merged_layout: the axes and the rows are not of the same scans");
                  std::vector<hg::Poses> p(axis.size());
                  for (std::size_t s = 0; s < p.size(); ++s) p[s].axis = axis[s], p[s].row = row[s];
                  const hg::MergedLayout l = c.merged_layout(p, heights_rows, first_frame, quantum);
@@ -173,7 +173,7 @@ void bind_geometry(nb::module_& m) {
              },
              "axis_0"_a, "row_0"_a, "axis_1"_a, "row_1"_a, "heights_rows_0"_a, "heights_rows_1"_a, "quantum"_a = 0.25);
 
-    nb::class_<hg::TileGeometry>(m, "TileGeometry", "The geometry of a mosaic's tiles (helirec/geometry.hpp), from its JSON text.")
+    nb::class_<hg::TileGeometry>(m, "TileGeometry", "The geometry of a mosaic's tiles (vc_tomography/geometry.hpp), from its JSON text.")
         .def("__init__", [](hg::TileGeometry* self, const std::string& json_text) { new (self) hg::TileGeometry(hg::TileGeometry::parse(json_text)); }, "json_text"_a)
         .def("frame_pose",
              [](const hg::TileGeometry& g, const std::string& tile, DoubleIn angle_deg, DoubleIn frame, double row) {

@@ -1,4 +1,4 @@
-#include "helirec/pipeline.hpp"
+#include "vc_tomography/pipeline.hpp"
 
 #include "common/interp_core.hpp"
 #include "common/output_core.hpp"
@@ -15,18 +15,18 @@
 #include <cmath>
 #include <cstring>
 
-#include "helirec/accumulate.hpp"
-#include "helirec/band.hpp"
-#include "helirec/tomo.hpp"
-#include "helirec/fourier.hpp"
-#include "helirec/kernels.hpp"
-#include "helirec/sino.hpp"
+#include "vc_tomography/accumulate.hpp"
+#include "vc_tomography/band.hpp"
+#include "vc_tomography/tomo.hpp"
+#include "vc_tomography/fourier.hpp"
+#include "vc_tomography/kernels.hpp"
+#include "vc_tomography/sino.hpp"
 
-#ifdef HELIREC_WITH_CUDA
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
 #include "../cuda/cuda_utils.cuh"
 #endif
 
-namespace helirec {
+namespace vc_tomography {
 
 namespace {
 
@@ -267,7 +267,7 @@ struct SliceReconstructor::Impl {
         std::vector<float> frac;
     };
     ChunkGlare chunk_glare(std::size_t s, const ScanChunk& chunk);
-#ifdef HELIREC_WITH_CUDA
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
     struct DevScan {
         cuda::DeviceBuffer<float> dark, flats, weight, weight2, map_ev_f;
         cuda::DeviceBuffer<int32_t> map_i, map_j;
@@ -336,7 +336,7 @@ struct SliceReconstructor::Impl {
     const float* start_rows = nullptr;
     std::vector<std::uint32_t> split_salt;   // noise splitting: a number of each scan (of its first file's name)
     std::vector<float> start_h, start_wh, start_img_h;
-#ifdef HELIREC_WITH_CUDA
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
     cuda::DeviceBuffer<float> start_d, start_wd, start_img_d;
 #endif
     ProgressBar* progress = nullptr;   // of the chunk in hand: run() names its steps
@@ -344,7 +344,7 @@ struct SliceReconstructor::Impl {
         if (progress) progress->set_postfix(name);
     }
     std::vector<float> up_h;
-#ifdef HELIREC_WITH_CUDA
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
     cuda::DeviceBuffer<float> up_d;
 #endif
     // rows for the exact backprojector: upsampled by bp_oversample, then B-spline coefficients for bspline3/5 (else the
@@ -353,7 +353,7 @@ struct SliceReconstructor::Impl {
         const int os = cfg.bp_oversample, deg = interp_core::spline_degree(bp.interp);
         if (os <= 1 && !deg) return row;
         const std::size_t n = static_cast<std::size_t>(chunk_rows) * NX * os;
-#ifdef HELIREC_WITH_CUDA
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
         if (cfg.device == Device::CUDA) {
             up_d.ensure(n);
             if (os > 1) cuda::upsample_rows(row, up_d.data(), chunk_rows, NX, os);
@@ -366,7 +366,7 @@ struct SliceReconstructor::Impl {
         if (deg) cpu::bspline_prefilter(os > 1 ? up_h.data() : row, up_h.data(), chunk_rows, NX * os, deg);
         return up_h.data();
     }
-#ifdef HELIREC_WITH_CUDA
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
     cuda::DeviceBuffer<float> Icache;   // sweeps: pre-filter intensity of the chunk, or (one Fourier step) its spectra
     cuda::DeviceBuffer<float> d_z_lut;
     cuda::DeviceBuffer<int32_t> d_opposite;   // slice_opposite
@@ -742,7 +742,7 @@ SliceReconstructor::SliceReconstructor(std::vector<ScanData> scans, ReconConfig 
         }
         I.glare_maps.resize(I.scans.size());
     }
-#ifdef HELIREC_WITH_CUDA
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
     if (I.cfg.device == Device::CUDA) {
         for (const auto& s : I.scans) {
             Impl::DevScan d;
@@ -767,7 +767,7 @@ SliceReconstructor::SliceReconstructor(std::vector<ScanData> scans, ReconConfig 
             }
             I.dev.push_back(std::move(d));
         }
-        HELIREC_CUDA_CHECK(cudaDeviceSynchronize());
+        VC_TOMOGRAPHY_CUDA_CHECK(cudaDeviceSynchronize());
     }
 #else
     if (I.cfg.device == Device::CUDA) throw Error("built without CUDA");
@@ -900,13 +900,13 @@ void SliceReconstructor::Impl::setup_invariants() {
     // reference's pi / NG gives attenuation / (angular span / pi) = half of it
     bp.unit_gain = legacy ? static_cast<float>(M_PI / (std::fabs(static_cast<double>(fbp_angles[1]) - fbp_angles[0]) * NG)) : 1.f;
     const FourierFilterSpec rspec = ramp_filter_spec(rg, ramp_scale(NG, legacy), cfg.ramp_filter_name, cfg.ramp_filter_par);
-#ifdef HELIREC_WITH_CUDA
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
     if (cfg.device == Device::CUDA) {
         ramp_filter = cuda::make_fourier_filter(rspec);
         copy = std::make_unique<cuda::Stream>();
         for (int r = 0; r < 2; ++r) {
-            HELIREC_CUDA_CHECK(cudaEventCreateWithFlags(&ev_up[r], cudaEventDisableTiming));
-            HELIREC_CUDA_CHECK(cudaEventCreateWithFlags(&ev_done[r], cudaEventDisableTiming));
+            VC_TOMOGRAPHY_CUDA_CHECK(cudaEventCreateWithFlags(&ev_up[r], cudaEventDisableTiming));
+            VC_TOMOGRAPHY_CUDA_CHECK(cudaEventCreateWithFlags(&ev_done[r], cudaEventDisableTiming));
         }
         return;
     }
@@ -942,7 +942,7 @@ FourierFilter* SliceReconstructor::Impl::fft_for(int slot, const FourierFilterSp
         }
     if (fft_cache.size() >= 4) fft_cache.erase(fft_cache.begin());  // e.g. full chunks + the last one
     FftEntry e{slot, spec.ph, spec.pw, spec.h, spec.w, spec.pad_top, spec.pad_left, nullptr, spec.id};
-#ifdef HELIREC_WITH_CUDA
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
     if (cfg.device == Device::CUDA) e.f = cuda::make_fourier_filter(spec);
     else
 #endif
@@ -1052,7 +1052,7 @@ SliceReconstructor::Impl::ChunkGlare SliceReconstructor::Impl::chunk_glare(std::
     return cg;
 }
 
-#ifdef HELIREC_WITH_CUDA
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
 void SliceReconstructor::Impl::start_prefetch(int lo, int hi, int m) {
     if (pf_thread.joinable()) pf_thread.join();
     pf_lo = lo; pf_hi = hi; pf_m = m; pf_err = nullptr;
@@ -1135,8 +1135,8 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
     auto t_last = std::chrono::steady_clock::now();
     auto tick = [&](const char* stage) {  // adds the time since the previous tick to `stage`
         if (!timing) return;
-#ifdef HELIREC_WITH_CUDA
-        if (gpu) HELIREC_CUDA_CHECK(cudaDeviceSynchronize());
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
+        if (gpu) VC_TOMOGRAPHY_CUDA_CHECK(cudaDeviceSynchronize());
 #endif
         const auto now = std::chrono::steady_clock::now();
         dbg->seconds[stage] += std::chrono::duration<double>(now - t_last).count();
@@ -1231,7 +1231,7 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
     const bool sharp = I.sharp && !measured_only;
     if (sharp) {
         auto make = [&](const FourierFilterSpec& sp) {
-#ifdef HELIREC_WITH_CUDA
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
             if (gpu) return cuda::make_fourier_filter(sp);
 #endif
             return cpu::make_fourier_filter(sp);
@@ -1450,7 +1450,7 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
         }
         return;
     }
-#ifdef HELIREC_WITH_CUDA
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
     // ================================================================ CUDA
     // raw windows of the whole chunk -> pinned host memory; then, per block of grid angles, only the projections
     // contributing to that block go to the GPU (ring of two buffers: block b + 1 uploads while block b computes)
@@ -1610,20 +1610,20 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
             raw_read.wait(b);
             tick("read_raw");
         }
-        HELIREC_CUDA_CHECK(cudaStreamWaitEvent(cs, ev_done[r], 0));  // ring slot free (block b - 2 done)
+        VC_TOMOGRAPHY_CUDA_CHECK(cudaStreamWaitEvent(cs, ev_done[r], 0));  // ring slot free (block b - 2 done)
         for (std::size_t s = 0; s < nsc; ++s) {
             std::size_t off = 0;
             for (auto [a0, e0] : plans[b].ranges[s]) {
                 const std::size_t q = static_cast<std::size_t>(e0 - a0);
-                HELIREC_CUDA_CHECK(cudaMemcpyAsync(d_raw[r][s].data() + off * per[s], pinned[s].data() + a0 * per[s],
+                VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpyAsync(d_raw[r][s].data() + off * per[s], pinned[s].data() + a0 * per[s],
                                                    q * per[s] * sizeof(uint16_t), cudaMemcpyHostToDevice, cs));
                 off += q;
             }
             if (!plans[b].slot[s].empty())  // (a scan at another height: the chunk holds none of it)
-                HELIREC_CUDA_CHECK(cudaMemcpyAsync(d_slot[r][s].data(), plans[b].slot[s].data(),
+                VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpyAsync(d_slot[r][s].data(), plans[b].slot[s].data(),
                                                    plans[b].slot[s].size() * sizeof(int32_t), cudaMemcpyHostToDevice, cs));
         }
-        HELIREC_CUDA_CHECK(cudaEventRecord(ev_up[r], cs));
+        VC_TOMOGRAPHY_CUDA_CHECK(cudaEventRecord(ev_up[r], cs));
     };
     tick("upload_issue");
     R.ensure(blk); RW.ensure(blk); Wp.ensure(blk);
@@ -1660,12 +1660,12 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
         const std::size_t n_el = static_cast<std::size_t>(L) * H * NX;
         if (b + 1 < plans.size()) issue_upload(b + 1);
         if (sharp) {
-            HELIREC_CUDA_CHECK(cudaMemsetAsync(R2.data(), 0, n_el * sizeof(float)));
-            HELIREC_CUDA_CHECK(cudaMemsetAsync(RW2.data(), 0, n_el * sizeof(float)));
+            VC_TOMOGRAPHY_CUDA_CHECK(cudaMemsetAsync(R2.data(), 0, n_el * sizeof(float)));
+            VC_TOMOGRAPHY_CUDA_CHECK(cudaMemsetAsync(RW2.data(), 0, n_el * sizeof(float)));
         }
-        HELIREC_CUDA_CHECK(cudaMemsetAsync(R.data(), 0, n_el * sizeof(float)));
-        HELIREC_CUDA_CHECK(cudaMemsetAsync(RW.data(), 0, n_el * sizeof(float)));
-        HELIREC_CUDA_CHECK(cudaStreamWaitEvent(nullptr, ev_up[r], 0));
+        VC_TOMOGRAPHY_CUDA_CHECK(cudaMemsetAsync(R.data(), 0, n_el * sizeof(float)));
+        VC_TOMOGRAPHY_CUDA_CHECK(cudaMemsetAsync(RW.data(), 0, n_el * sizeof(float)));
+        VC_TOMOGRAPHY_CUDA_CHECK(cudaStreamWaitEvent(nullptr, ev_up[r], 0));
         tick("upload_wait");
         // (as on the CPU: each scan with an earlier scan at its height taken to the luminosity of those before it at
         // its seam with them)
@@ -1681,26 +1681,26 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
             const auto& sd = I.scans[s];
             const auto& ch = chunks[s];
             if (ch.cs.p1 == ch.cs.p0) {  // a scan at another height
-                if (s + 1 == nsc) HELIREC_CUDA_CHECK(cudaEventRecord(ev_done[r], nullptr));
+                if (s + 1 == nsc) VC_TOMOGRAPHY_CUDA_CHECK(cudaEventRecord(ev_done[r], nullptr));
                 continue;
             }
             if (by_row && I.scan_row[s] != row_now) {   // another row of scans begins
                 if (row_now >= 0) add_row();
-                HELIREC_CUDA_CHECK(cudaMemsetAsync(Rr.data(), 0, n_el * sizeof(float)));
-                HELIREC_CUDA_CHECK(cudaMemsetAsync(RWr.data(), 0, n_el * sizeof(float)));
+                VC_TOMOGRAPHY_CUDA_CHECK(cudaMemsetAsync(Rr.data(), 0, n_el * sizeof(float)));
+                VC_TOMOGRAPHY_CUDA_CHECK(cudaMemsetAsync(RWr.data(), 0, n_el * sizeof(float)));
                 if (sharp) {
-                    HELIREC_CUDA_CHECK(cudaMemsetAsync(R2r.data(), 0, n_el * sizeof(float)));
-                    HELIREC_CUDA_CHECK(cudaMemsetAsync(RW2r.data(), 0, n_el * sizeof(float)));
+                    VC_TOMOGRAPHY_CUDA_CHECK(cudaMemsetAsync(R2r.data(), 0, n_el * sizeof(float)));
+                    VC_TOMOGRAPHY_CUDA_CHECK(cudaMemsetAsync(RW2r.data(), 0, n_el * sizeof(float)));
                 }
                 row_now = I.scan_row[s], before = false;
             }
             const bool joins = lum && before && I.seam[s] >= 0;
             if (joins) {
                 cuda::luminosity_sums(aR, aRW, L, H, NX, I.seam[s], I.lum, Aha.data(), Bha.data());
-                HELIREC_CUDA_CHECK(cudaMemcpyAsync(Wp.data(), aRW, n_el * sizeof(float), cudaMemcpyDeviceToDevice));
+                VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpyAsync(Wp.data(), aRW, n_el * sizeof(float), cudaMemcpyDeviceToDevice));
                 if (sharp) {
                     cuda::luminosity_sums(aR2, aRW2, L, H, NX, I.seam[s], I.lum, Aha2.data(), Bha2.data());
-                    HELIREC_CUDA_CHECK(cudaMemcpyAsync(Wp2.data(), aRW2, n_el * sizeof(float), cudaMemcpyDeviceToDevice));
+                    VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpyAsync(Wp2.data(), aRW2, n_el * sizeof(float), cudaMemcpyDeviceToDevice));
                 }
                 tick("luminosity");
             }
@@ -1719,7 +1719,7 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
                           cg[s].rows, cg[s].row0.empty() ? nullptr : dc[s].grow0.data());
             cuda::accumulate(view, plans[b].contrib[s], ap, aR, aRW, nullptr,
                              sharp ? I.dev[s].weight2.data() : nullptr, sharp ? aR2 : nullptr, sharp ? aRW2 : nullptr);
-            if (s + 1 == nsc) HELIREC_CUDA_CHECK(cudaEventRecord(ev_done[r], nullptr));
+            if (s + 1 == nsc) VC_TOMOGRAPHY_CUDA_CHECK(cudaEventRecord(ev_done[r], nullptr));
             tick("accumulate");
             if (joins) {
                 cuda::luminosity_sums(aR, aRW, L, H, NX, I.seam[s], I.lum, Atot.data(), Btot.data());
@@ -1754,7 +1754,7 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
             fwd->forward(R.data(), Icache.data() + static_cast<std::size_t>(g0) * fwd->spectrum_floats(), L);
             tick("filters");
         } else if (K > 1) {  // sweep: keep the intensity; the whole chain runs per chain below
-            HELIREC_CUDA_CHECK(cudaMemcpyAsync(Icache.data() + static_cast<std::size_t>(g0) * H * NX, R.data(),
+            VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpyAsync(Icache.data() + static_cast<std::size_t>(g0) * H * NX, R.data(),
                                                n_el * sizeof(float), cudaMemcpyDeviceToDevice));
         } else {
             apply_filters(*sets[0], FilterStage::Intensity, R.data(), L, H, fm);
@@ -1763,15 +1763,15 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
             apply_filters(*sets[0], FilterStage::Log, R.data(), L, H, fm);
             tick("log");
             // rows [m, m + DY) of each grid angle -> device sinogram (NR, DY, NX)
-            HELIREC_CUDA_CHECK(cudaMemcpy2DAsync(S.data() + static_cast<std::size_t>(g0) * DY * NX, DY * NX * sizeof(float),
+            VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpy2DAsync(S.data() + static_cast<std::size_t>(g0) * DY * NX, DY * NX * sizeof(float),
                                                  R.data() + static_cast<std::size_t>(m) * NX, static_cast<std::size_t>(H) * NX * sizeof(float),
                                                  static_cast<std::size_t>(DY) * NX * sizeof(float), L, cudaMemcpyDeviceToDevice));
         }
-        HELIREC_CUDA_CHECK(cudaMemcpy2DAsync(W.data() + static_cast<std::size_t>(g0) * DY * NX, DY * NX * sizeof(float),
+        VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpy2DAsync(W.data() + static_cast<std::size_t>(g0) * DY * NX, DY * NX * sizeof(float),
                                              RW.data() + static_cast<std::size_t>(m) * NX, static_cast<std::size_t>(H) * NX * sizeof(float),
                                              static_cast<std::size_t>(DY) * NX * sizeof(float), L, cudaMemcpyDeviceToDevice));
         if (sharp)
-            HELIREC_CUDA_CHECK(cudaMemcpy2DAsync(W2.data() + static_cast<std::size_t>(g0) * DY * NX, DY * NX * sizeof(float),
+            VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpy2DAsync(W2.data() + static_cast<std::size_t>(g0) * DY * NX, DY * NX * sizeof(float),
                                                  RW2.data() + static_cast<std::size_t>(m) * NX, static_cast<std::size_t>(H) * NX * sizeof(float),
                                                  static_cast<std::size_t>(DY) * NX * sizeof(float), L, cudaMemcpyDeviceToDevice));
         tick("sino_crop");
@@ -1785,7 +1785,7 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
         // the gridding and filtering queued above finish here rather than inside the first slice's download, so
         // that the step shown is the one running
         step("grid");
-        HELIREC_CUDA_CHECK(cudaDeviceSynchronize());
+        VC_TOMOGRAPHY_CUDA_CHECK(cudaDeviceSynchronize());
         step("backproject");
     }
     const std::size_t rown = static_cast<std::size_t>(NR) * NX;
@@ -1794,14 +1794,14 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
     if (sharp) { w2row.ensure(rown); brow.ensure(rown); }
     auto slices = [&](int k) {  // ramp filter x balanced weights per slice -> sink
         for (int y = 0; y < DY; ++y) {
-            HELIREC_CUDA_CHECK(cudaMemcpy2DAsync(row.data(), NX * sizeof(float), S.data() + static_cast<std::size_t>(y) * NX,
+            VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpy2DAsync(row.data(), NX * sizeof(float), S.data() + static_cast<std::size_t>(y) * NX,
                                                  static_cast<std::size_t>(DY) * NX * sizeof(float), NX * sizeof(float), NR,
                                                  cudaMemcpyDeviceToDevice));
-            HELIREC_CUDA_CHECK(cudaMemcpy2DAsync(wrow.data(), NX * sizeof(float), W.data() + static_cast<std::size_t>(y) * NX,
+            VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpy2DAsync(wrow.data(), NX * sizeof(float), W.data() + static_cast<std::size_t>(y) * NX,
                                                  static_cast<std::size_t>(DY) * NX * sizeof(float), NX * sizeof(float), NR,
                                                  cudaMemcpyDeviceToDevice));
             if (sharp)
-                HELIREC_CUDA_CHECK(cudaMemcpy2DAsync(w2row.data(), NX * sizeof(float), W2.data() + static_cast<std::size_t>(y) * NX,
+                VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpy2DAsync(w2row.data(), NX * sizeof(float), W2.data() + static_cast<std::size_t>(y) * NX,
                                                      static_cast<std::size_t>(DY) * NX * sizeof(float), NX * sizeof(float), NR,
                                                      cudaMemcpyDeviceToDevice));
             tick("ramp_gather");
@@ -1809,7 +1809,7 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
                 arc_d.ensure(rown);
                 cuda::angular_fir(row.data(), arc_d.data(), NR, NX, arc_taps.data(), static_cast<int>(arc_taps.size()) - 1,
                                   ap.measured_only ? wrow.data() : nullptr);
-                HELIREC_CUDA_CHECK(cudaMemcpyAsync(row.data(), arc_d.data(), rown * sizeof(float), cudaMemcpyDeviceToDevice));
+                VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpyAsync(row.data(), arc_d.data(), rown * sizeof(float), cudaMemcpyDeviceToDevice));
                 tick("arc");
             }
             if (!raw_rows) {
@@ -1825,12 +1825,12 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
                 }
             }
             if (dbg && dbg->keep && K == 1)
-                HELIREC_CUDA_CHECK(cudaMemcpy(&dbg->filtered[static_cast<std::size_t>(y) * rown], row.data(), rown * sizeof(float),
+                VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpy(&dbg->filtered[static_cast<std::size_t>(y) * rown], row.data(), rown * sizeof(float),
                                               cudaMemcpyDeviceToHost));
             if (I.fbp_start && raw_rows) {   // the method's start: this slice's rows as the exact backprojector takes them
                 I.start_d.ensure(rown); I.start_wd.ensure(rown);
-                HELIREC_CUDA_CHECK(cudaMemcpyAsync(I.start_d.data(), row.data(), rown * sizeof(float), cudaMemcpyDeviceToDevice));
-                HELIREC_CUDA_CHECK(cudaMemcpyAsync(I.start_wd.data(), wrow.data(), rown * sizeof(float), cudaMemcpyDeviceToDevice));
+                VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpyAsync(I.start_d.data(), row.data(), rown * sizeof(float), cudaMemcpyDeviceToDevice));
+                VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpyAsync(I.start_wd.data(), wrow.data(), rown * sizeof(float), cudaMemcpyDeviceToDevice));
                 if (cfg.mend_threshold > 0)
                     cuda::mend_null_weights(I.start_d.data(), I.start_wd.data(), NR, 1, NX, cfg.mend_threshold, I.mend_x0, I.mend_x1);
                 cuda::rebalance(I.start_d.data(), I.start_wd.data(), NR, 1, NX, cfg.rot_center, false);
@@ -1849,8 +1849,8 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
     if (K == 1) {
         if (dbg && dbg->keep) {
             dbg->sino.resize(sino_n); dbg->weights.resize(sino_n);
-            HELIREC_CUDA_CHECK(cudaMemcpy(dbg->sino.data(), S.data(), sino_n * sizeof(float), cudaMemcpyDeviceToHost));
-            HELIREC_CUDA_CHECK(cudaMemcpy(dbg->weights.data(), W.data(), sino_n * sizeof(float), cudaMemcpyDeviceToHost));
+            VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpy(dbg->sino.data(), S.data(), sino_n * sizeof(float), cudaMemcpyDeviceToHost));
+            VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpy(dbg->weights.data(), W.data(), sino_n * sizeof(float), cudaMemcpyDeviceToHost));
         }
         if (views) cuda::rebalance_turns(S.data(), W.data(), NR, DY, NX, NG, cfg.rot_center);
         else if (!ap.measured_only) cuda::rebalance(S.data(), W.data(), NR, DY, NX, cfg.rot_center, cfg.legacy_reference);
@@ -1867,7 +1867,7 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
         }
         if (dbg && dbg->keep) {
             dbg->wbal.resize(sino_n);
-            HELIREC_CUDA_CHECK(cudaMemcpy(dbg->wbal.data(), W.data(), sino_n * sizeof(float), cudaMemcpyDeviceToHost));
+            VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpy(dbg->wbal.data(), W.data(), sino_n * sizeof(float), cudaMemcpyDeviceToHost));
             dbg->filtered.resize(sino_n);
         }
         tick("rebalance");
@@ -1910,14 +1910,14 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
                 FourierFilter* f = fft_for(0, sets[k]->step_spec(0, H, NX, fm));
                 f->inverse(Icache.data() + static_cast<std::size_t>(g0) * f->spectrum_floats(), R.data(), L);
             } else {
-                HELIREC_CUDA_CHECK(cudaMemcpyAsync(R.data(), Icache.data() + static_cast<std::size_t>(g0) * H * NX,
+                VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpyAsync(R.data(), Icache.data() + static_cast<std::size_t>(g0) * H * NX,
                                                    n_el * sizeof(float), cudaMemcpyDeviceToDevice));
                 apply_filters(*sets[k], FilterStage::Intensity, R.data(), L, H, fm);
             }
             tick("filters");
             cuda::minus_log(R.data(), n_el, cfg.log_clip_min, cfg.log_clip_max);
             apply_filters(*sets[k], FilterStage::Log, R.data(), L, H, fm);
-            HELIREC_CUDA_CHECK(cudaMemcpy2DAsync(S.data() + static_cast<std::size_t>(g0) * DY * NX, DY * NX * sizeof(float),
+            VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpy2DAsync(S.data() + static_cast<std::size_t>(g0) * DY * NX, DY * NX * sizeof(float),
                                                  R.data() + static_cast<std::size_t>(m) * NX, static_cast<std::size_t>(H) * NX * sizeof(float),
                                                  static_cast<std::size_t>(DY) * NX * sizeof(float), L, cudaMemcpyDeviceToDevice));
             tick("log");
@@ -2148,7 +2148,7 @@ void SliceReconstructor::reconstruct(int h_lo, int h_hi, const SliceOutput& out,
             cpu::backproject(I.fbp_rows(I.start_rows), I.fbp_angles_of(y), I.start_img_h.data(), I.chunk_rows, nd, N, N, sp);
             image = I.start_img_h.data();
         }
-#ifdef HELIREC_WITH_CUDA
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
         else {
             I.start_img_d.ensure(N2);
             cuda::backproject(I.fbp_rows(I.start_rows), I.fbp_angles_of(y), I.start_img_d.data(), I.chunk_rows, nd, N, N, sp);
@@ -2181,7 +2181,7 @@ void SliceReconstructor::reconstruct(int h_lo, int h_hi, const SliceOutput& out,
         });
         return;
     }
-#ifdef HELIREC_WITH_CUDA
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
     if (use_ghbp && !I.ghbp) I.ghbp = std::make_unique<cuda::Ghbp>(I.plan);
     if (!external) I.slice.ensure(use_ghbp ? N2 : block_plane);
     if (!external && want_u8) I.slice_u8.ensure(block_plane);
@@ -2216,7 +2216,7 @@ void SliceReconstructor::reconstruct(int h_lo, int h_hi, const SliceOutput& out,
         if (want_u8) {   // converted before the float download, which then overlaps it
             if (mask.data && mask_slice(y) != mask_loaded) {
                 mask_loaded = mask_slice(y);
-                HELIREC_CUDA_CHECK(cudaMemcpyAsync(I.slice_mask.data(), mask.data + mask_loaded * mask_plane, mask_plane,
+                VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpyAsync(I.slice_mask.data(), mask.data + mask_loaded * mask_plane, mask_plane,
                                                    cudaMemcpyHostToDevice));
             }
             cuda::to_uint8(dev, pitch, I.slice_u8.data(), bh, bw, window(mask.data ? I.slice_mask.data() : nullptr));
@@ -2285,4 +2285,4 @@ int SliceReconstructor::sweep_margin(const std::vector<FilterChain>& chains) con
 
 std::string SliceReconstructor::describe(const FilterChain& chain) const { return impl_->pipeline(chain)->describe(); }
 
-}  // namespace helirec
+}  // namespace vc_tomography

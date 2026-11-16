@@ -5,9 +5,9 @@
 #include <cmath>
 #include <limits>
 
-#include "helirec/ghbp.hpp"
+#include "vc_tomography/ghbp.hpp"
 
-namespace helirec {
+namespace vc_tomography {
 
 namespace {
 
@@ -147,4 +147,4 @@ GhbpPlan make_ghbp_plan(const float* angles, int n_angles, int n_bins, const Ghb
     return plan;
 }
 
-}  // namespace helirec
+}  // namespace vc_tomography

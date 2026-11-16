@@ -3,9 +3,9 @@
 
 #include "common/interp_core.hpp"
 #include "cuda_utils.cuh"
-#include "helirec/band.hpp"
+#include "vc_tomography/band.hpp"
 
-namespace helirec::cuda {
+namespace vc_tomography::cuda {
 
 namespace {
 constexpr int kAngleChunk = 1024;  // angles staged in shared memory per pass
@@ -87,7 +87,7 @@ Compactor& compactor() {
 void band_mark(const float* y, const float* x, size_t a, size_t b, const BandBox& box, uint8_t* mask, void* stream) {
     if (b <= a) return;
     mark_kernel<<<grid_1d(b - a, 256), 256, 0, as_stream(stream)>>>(y, x, a, b, box, mask);
-    HELIREC_CUDA_CHECK(cudaGetLastError());
+    VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
 }
 
 size_t band_compact(const uint8_t* mask, size_t n, int32_t* list, void* stream) {
@@ -96,12 +96,12 @@ size_t band_compact(const uint8_t* mask, size_t n, int32_t* list, void* stream) 
     C.count.ensure(1);
     thrust::counting_iterator<int32_t> it(0);
     size_t bytes = 0;
-    HELIREC_CUDA_CHECK(cub::DeviceSelect::Flagged(nullptr, bytes, it, mask, list, C.count.data(), static_cast<int>(n), s));
+    VC_TOMOGRAPHY_CUDA_CHECK(cub::DeviceSelect::Flagged(nullptr, bytes, it, mask, list, C.count.data(), static_cast<int>(n), s));
     C.temp.ensure(bytes);
-    HELIREC_CUDA_CHECK(cub::DeviceSelect::Flagged(C.temp.data(), bytes, it, mask, list, C.count.data(), static_cast<int>(n), s));
+    VC_TOMOGRAPHY_CUDA_CHECK(cub::DeviceSelect::Flagged(C.temp.data(), bytes, it, mask, list, C.count.data(), static_cast<int>(n), s));
     int count = 0;
-    HELIREC_CUDA_CHECK(cudaMemcpyAsync(&count, C.count.data(), sizeof(int), cudaMemcpyDeviceToHost, s));
-    HELIREC_CUDA_CHECK(cudaStreamSynchronize(s));
+    VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpyAsync(&count, C.count.data(), sizeof(int), cudaMemcpyDeviceToHost, s));
+    VC_TOMOGRAPHY_CUDA_CHECK(cudaStreamSynchronize(s));
     return static_cast<size_t>(count);
 }
 
@@ -115,28 +115,28 @@ void backproject_list(const float* sino, const void* cs_sn, int n_angles, int n_
     if (p.fan && p.n_fan < 1) throw Error("backproject_list: a fan without columns");
     if (p.fan) {
         d_fan.ensure(static_cast<size_t>(p.n_fan));
-        HELIREC_CUDA_CHECK(cudaMemcpyAsync(d_fan.data(), p.fan, p.n_fan * sizeof(float), cudaMemcpyHostToDevice, as_stream(stream)));
+        VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpyAsync(d_fan.data(), p.fan, p.n_fan * sizeof(float), cudaMemcpyHostToDevice, as_stream(stream)));
     }
-#define HELIREC_BPL(K) backproject_list_kernel<K><<<grid_1d(count, 128), 128, 0, as_stream(stream)>>>( \
+#define VC_TOMOGRAPHY_BPL(K) backproject_list_kernel<K><<<grid_1d(count, 128), 128, 0, as_stream(stream)>>>( \
         sino, static_cast<const float2*>(cs_sn), n_angles, n_det, list, static_cast<int>(count), box, p.rot_center, \
         p.scale, c, p.clip_outer_circle, r * r, p.u_scale, img, p.fan ? d_fan.data() : nullptr, p.n_fan)
     switch (p.interp) {
-        case interp_core::Linear: HELIREC_BPL(interp_core::Linear); break;
-        case interp_core::Cubic: HELIREC_BPL(interp_core::Cubic); break;
-        case interp_core::Lanczos3: HELIREC_BPL(interp_core::Lanczos3); break;
-        case interp_core::BSpline3: HELIREC_BPL(interp_core::BSpline3); break;
-        case interp_core::BSpline5: HELIREC_BPL(interp_core::BSpline5); break;
+        case interp_core::Linear: VC_TOMOGRAPHY_BPL(interp_core::Linear); break;
+        case interp_core::Cubic: VC_TOMOGRAPHY_BPL(interp_core::Cubic); break;
+        case interp_core::Lanczos3: VC_TOMOGRAPHY_BPL(interp_core::Lanczos3); break;
+        case interp_core::BSpline3: VC_TOMOGRAPHY_BPL(interp_core::BSpline3); break;
+        case interp_core::BSpline5: VC_TOMOGRAPHY_BPL(interp_core::BSpline5); break;
         default: throw Error("backproject_list: unknown interpolation");
     }
-#undef HELIREC_BPL
-    HELIREC_CUDA_CHECK(cudaGetLastError());
+#undef VC_TOMOGRAPHY_BPL
+    VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
 }
 
 void band_sample(const float* img_lo, const float* img_hi, const float* fz, const float* y, const float* x, size_t a,
                  size_t b, const BandBox& box, float* out, void* stream) {
     if (b <= a) return;
     sample_kernel<<<grid_1d(b - a, 256), 256, 0, as_stream(stream)>>>(img_lo, img_hi, fz, y, x, a, b, box, out);
-    HELIREC_CUDA_CHECK(cudaGetLastError());
+    VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
 }
 
-}  // namespace helirec::cuda
+}  // namespace vc_tomography::cuda

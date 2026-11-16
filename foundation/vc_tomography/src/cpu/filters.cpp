@@ -1,9 +1,9 @@
 #include <algorithm>
 #include <vector>
 
-#include "helirec/filters.hpp"
+#include "vc_tomography/filters.hpp"
 
-namespace helirec::cpu {
+namespace vc_tomography::cpu {
 
 // (2r+1)^2 median per frame, coordinates clamped at the edges
 void median_frames(float* frames, int n_frames, int H, int W, int r) {
@@ -29,4 +29,4 @@ void median_frames(float* frames, int n_frames, int H, int W, int r) {
     }
 }
 
-}  // namespace helirec::cpu
+}  // namespace vc_tomography::cpu

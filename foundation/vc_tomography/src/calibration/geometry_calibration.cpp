@@ -1,6 +1,6 @@
-// helirec/calibration/geometry_calibration.hpp: the layout of the scans, the plan of their comparisons, their
+// vc_tomography/calibration/geometry_calibration.hpp: the layout of the scans, the plan of their comparisons, their
 // measurement, and the step that runs them with the solve (calibrate_geometry; the solve is geometry_fit.cpp).
-#include "helirec/calibration/geometry_calibration.hpp"
+#include "vc_tomography/calibration/geometry_calibration.hpp"
 
 #include <unistd.h>
 
@@ -10,11 +10,11 @@
 #include <set>
 
 #include "calibration/util.hpp"
-#include "helirec/calibration/intensity.hpp"
-#include "helirec/calibration/solve.hpp"
+#include "vc_tomography/calibration/intensity.hpp"
+#include "vc_tomography/calibration/solve.hpp"
 #include "io/json.hpp"
 
-namespace helirec::calibration::geometry_calibration {
+namespace vc_tomography::calibration::geometry_calibration {
 
 namespace {
 
@@ -1193,4 +1193,4 @@ std::string calibrate_geometry(const std::vector<std::string>& scans, const Opti
     return cal.text();
 }
 
-}  // namespace helirec::calibration::geometry_calibration
+}  // namespace vc_tomography::calibration::geometry_calibration

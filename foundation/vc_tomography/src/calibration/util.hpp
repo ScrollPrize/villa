@@ -9,10 +9,10 @@
 #include <string>
 #include <vector>
 
-#include "helirec/calibration/record.hpp"
-#include "helirec/calibration/solve.hpp"
+#include "vc_tomography/calibration/record.hpp"
+#include "vc_tomography/calibration/solve.hpp"
 
-namespace helirec::calibration {
+namespace vc_tomography::calibration {
 
 inline std::string fmt(const char* format, ...) __attribute__((format(printf, 1, 2)));
 inline std::string fmt(const char* format, ...) {
@@ -71,4 +71,4 @@ Spread spread(const V& v) {
     return spread(v, 0, v.size());
 }
 
-}  // namespace helirec::calibration
+}  // namespace vc_tomography::calibration

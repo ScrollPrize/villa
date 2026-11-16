@@ -3,11 +3,11 @@
 #include <vector>
 
 #include "common/ghbp_core.hpp"
-#include "helirec/ghbp.hpp"
+#include "vc_tomography/ghbp.hpp"
 
-namespace helirec::cpu {
+namespace vc_tomography::cpu {
 
-using namespace helirec::ghbp_core;
+using namespace vc_tomography::ghbp_core;
 
 void ghbp(const GhbpPlan& plan, const float* sino, float* out) {
     const auto& P = plan.p;
@@ -67,4 +67,4 @@ void ghbp(const GhbpPlan& plan, const float* sino, float* out) {
     }
 }
 
-}  // namespace helirec::cpu
+}  // namespace vc_tomography::cpu

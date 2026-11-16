@@ -1,4 +1,4 @@
-// The joint geometry model from C++ (helirec/calibration/geometry_calibration.hpp): sightings of points in 3D,
+// The joint geometry model from C++ (vc_tomography/calibration/geometry_calibration.hpp): sightings of points in 3D,
 // made here by explicit rotation matrices and a parallel projection (nothing of the model's formulas), are the
 // lines through those points under the true parameters; a solve from elsewhere finds the parameters again; and
 // unknowns that depend on each other are refused. tests/test_geometry_solve.py does the same through the bindings,
@@ -7,9 +7,9 @@
 #include <iostream>
 #include <random>
 
-#include "helirec/calibration/geometry_calibration.hpp"
+#include "vc_tomography/calibration/geometry_calibration.hpp"
 
-namespace gc = helirec::calibration::geometry_calibration;
+namespace gc = vc_tomography::calibration::geometry_calibration;
 
 namespace {
 
@@ -176,7 +176,7 @@ int main() {
     try {
         gc::solve_geometry(acq, comparisons, start, both);
         return fail("every stretch's height free was not refused");
-    } catch (const helirec::Error& e) {
+    } catch (const vc_tomography::Error& e) {
         if (std::string(e.what()).find("RANK_DEFICIENT") == std::string::npos) return fail(e.what());
     }
     return 0;

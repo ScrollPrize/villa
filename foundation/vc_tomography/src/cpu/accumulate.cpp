@@ -4,10 +4,10 @@
 
 #include "common/accumulate_core.hpp"
 #include "common/interp_core.hpp"
-#include "helirec/accumulate.hpp"
-#include "helirec/sino.hpp"
+#include "vc_tomography/accumulate.hpp"
+#include "vc_tomography/sino.hpp"
 
-namespace helirec {
+namespace vc_tomography {
 
 ContributorList make_contributors(const int32_t* j0, int n_proj, int n_grid, int g0, int g1, bool upper_bin) {
     ContributorList c;
@@ -119,7 +119,7 @@ LuminosityKernel luminosity_kernel() {
 
 namespace cpu {
 
-using namespace helirec::accum_core;
+using namespace vc_tomography::accum_core;
 
 void accumulate(const AccumScanView& view, const ContributorList& c, const AccumParams& p, float* R, float* RW,
                 const float* weight2, float* R2, float* RW2) {
@@ -259,4 +259,4 @@ void prepare_measured(float* R, float* RW, int L, int H, int NX, float thr, bool
 }
 
 }  // namespace cpu
-}  // namespace helirec
+}  // namespace vc_tomography

@@ -4,19 +4,19 @@
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
 
-#include "helirec/block_spectra.hpp"
-#include "helirec/reference.hpp"
-#include "helirec/zarr.hpp"
+#include "vc_tomography/block_spectra.hpp"
+#include "vc_tomography/reference.hpp"
+#include "vc_tomography/zarr.hpp"
 #include "ndarray_utils.hpp"
 
-#ifdef HELIREC_WITH_CUDA
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
 #include "../src/cuda/cuda_utils.cuh"
 #endif
 
 namespace nb = nanobind;
 using namespace nb::literals;
-using namespace helirec;
-using namespace helirec::py;
+using namespace vc_tomography;
+using namespace vc_tomography::py;
 
 namespace {
 
@@ -52,7 +52,7 @@ class PyBlockCorrelator {
         s.n = n; s.oversample = oversample; s.shells = shells; s.thetas = thetas;
         s.align = align; s.align_band = align_band; s.max_shift = max_shift;
         if (device_ == Device::CPU) impl_ = cpu::make_block_correlator(s);
-#ifdef HELIREC_WITH_CUDA
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
         else impl_ = cuda::make_block_correlator(s);
 #endif
     }
@@ -71,7 +71,7 @@ class PyBlockCorrelator {
             if (device_ == Device::CPU) {
                 impl_->compute(a.data(), b.data(), out, sh);
             }
-#ifdef HELIREC_WITH_CUDA
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
             else {
                 da_.upload(a.data(), a.size());
                 db_.upload(b.data(), b.size());
@@ -112,7 +112,7 @@ class PyBlockCorrelator {
   private:
     Device device_;
     std::unique_ptr<BlockCorrelator> impl_;
-#ifdef HELIREC_WITH_CUDA
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
     cuda::DeviceBuffer<float> da_, db_;
 #endif
 };
@@ -129,7 +129,7 @@ HostOut resample_py(Vol src, Mat m, std::array<int, 3> shape, const std::string&
         cpu::resample_affine(src.data(), sz, sy, sx, a.data(), data(out), shape[0], shape[1], shape[2], k);
         return out;
     }
-#ifdef HELIREC_WITH_CUDA
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
     cuda::DeviceBuffer<float> d_out(static_cast<std::size_t>(shape[0]) * shape[1] * shape[2]);
     cuda::resample_affine_host(src.data(), sz, sy, sx, a.data(), d_out.data(), shape[0], shape[1], shape[2], k);
     d_out.download(data(out));
@@ -250,7 +250,7 @@ void bind_spectra(nb::module_& m) {
                      if (dev == Device::CPU) {
                          coverage = v.read(origin, step, shape, data(out), k, Device::CPU);
                      }
-#ifdef HELIREC_WITH_CUDA
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
                      else {
                          cuda::DeviceBuffer<float> d(static_cast<std::size_t>(shape[0]) * shape[1] * shape[2]);
                          coverage = v.read(origin, step, shape, d.data(), k, Device::CUDA);

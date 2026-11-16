@@ -7,7 +7,7 @@
 #include <cstring>
 #include <string>
 
-namespace helirec {
+namespace vc_tomography {
 
 class Sha256 {
   public:
@@ -81,4 +81,4 @@ class Sha256 {
     std::uint64_t length_ = 0;
 };
 
-}  // namespace helirec
+}  // namespace vc_tomography

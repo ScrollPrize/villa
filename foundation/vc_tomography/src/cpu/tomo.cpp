@@ -13,10 +13,10 @@
 #include "common/gridrec_tables.hpp"
 #include "common/tomo_algorithms.hpp"
 #include "common/tomo_core.hpp"
-#include "helirec/tomo.hpp"
-#include "helirec/sino.hpp"
+#include "vc_tomography/tomo.hpp"
+#include "vc_tomography/sino.hpp"
 
-namespace helirec {
+namespace vc_tomography {
 
 namespace tomo_gridrec {
 // prolate spheroidal wave function: Legendre coefficients
@@ -341,4 +341,4 @@ void chord_backproject(const float* sino, float* img, const float* angles, int n
 }
 
 }  // namespace cpu
-}  // namespace helirec
+}  // namespace vc_tomography

@@ -1,17 +1,17 @@
-#include "helirec/tomo.hpp"
+#include "vc_tomography/tomo.hpp"
 
-#include "helirec/sino.hpp"
+#include "vc_tomography/sino.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <sstream>
 
-#ifdef HELIREC_WITH_CUDA
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
 #include "../cuda/cuda_utils.cuh"
 #endif
 
-namespace helirec {
+namespace vc_tomography {
 
 std::vector<std::string> tomo_algorithms() { return {"gridrec", "mlem", "sirt"}; }
 
@@ -95,11 +95,11 @@ class TomoBackprojector final : public ExternalBackprojector {
             crop = img_host_.data() + static_cast<std::size_t>(roi.y0) * N + roi.x0;
             pitch = N;
         } else {
-#ifdef HELIREC_WITH_CUDA
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
             img_.ensure(static_cast<std::size_t>(N) * N);
             cuda::tomo_reconstruct(a_, t, rows, weights, angles, img_.data(), &ws_cuda_, start_);
             crop_.ensure(static_cast<std::size_t>(rx) * ry);
-            HELIREC_CUDA_CHECK(cudaMemcpy2D(crop_.data(), rx * sizeof(float),
+            VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpy2D(crop_.data(), rx * sizeof(float),
                                             img_.data() + static_cast<std::size_t>(roi.y0) * N + roi.x0,
                                             N * sizeof(float), rx * sizeof(float), ry, cudaMemcpyDeviceToHost));
             crop = crop_.data();
@@ -124,7 +124,7 @@ class TomoBackprojector final : public ExternalBackprojector {
     const float* start_ = nullptr;   // set_start
     std::vector<float> img_host_;
     std::unique_ptr<TomoWorkspace> ws_cpu_, ws_cuda_;
-#ifdef HELIREC_WITH_CUDA
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
     cuda::DeviceBuffer<float> img_;
     cuda::PinnedBuffer<float> crop_;   // staging of the ROI's download
 #endif
@@ -135,4 +135,4 @@ std::shared_ptr<ExternalBackprojector> make_tomo_backprojector(const std::string
     return std::make_shared<TomoBackprojector>(tomo_args(algorithm, p));
 }
 
-}  // namespace helirec
+}  // namespace vc_tomography

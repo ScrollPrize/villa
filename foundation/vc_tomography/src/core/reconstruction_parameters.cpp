@@ -1,4 +1,4 @@
-// helirec/reconstruction.hpp: the reconstruction's parameters (defaults, mode legacy_reference, --set, filter chains,
+// vc_tomography/reconstruction.hpp: the reconstruction's parameters (defaults, mode legacy_reference, --set, filter chains,
 // the scintillator model, the backprojector).
 #include <algorithm>
 #include <cctype>
@@ -9,11 +9,11 @@
 #include <regex>
 #include <set>
 
-#include "helirec/reconstruction.hpp"
-#include "helirec/sino.hpp"
+#include "vc_tomography/reconstruction.hpp"
+#include "vc_tomography/sino.hpp"
 #include "io/json.hpp"
 
-namespace helirec {
+namespace vc_tomography {
 
 namespace {
 
@@ -442,7 +442,7 @@ std::string update_parameters(const std::string& params_text, const std::string&
         std::sort(gone.begin(), gone.end());
         std::string list;
         for (const auto& g : gone) list += (list.empty() ? "" : ", ") + g;
-        throw Error("[" + list + "]: removed with the calibration they belonged to; the geometry calibration (the parameter geometry, helirec-calibration "
+        throw Error("[" + list + "]: removed with the calibration they belonged to; the geometry calibration (the parameter geometry, vc_tomography_calibration "
                     "geometry) holds what they stood for");
     }
     const Json defaults = defaults_json(), legacy = legacy_json();
@@ -763,11 +763,11 @@ void apply_backprojector(const std::string& spec, ReconConfig& cfg, const Extern
     if (const Json* v = member(c, "tomo_params"))
         for (const auto& [k, x] : v->object) cfg.tomo_params.values[k] = x.string;
     if (const Json* v = member(c, "external_bp")) {
-        if (!external) throw Error("backprojector python(...) is a function of the Python session (helirec.backprojectors): not available here");
+        if (!external) throw Error("backprojector python(...) is a function of the Python session (vc_tomography.backprojectors): not available here");
         FilterParams fp;
         for (const auto& [k, x] : v->object) fp.values[k] = x.is(Json::String) ? x.string : x.whole ? x.text() : python_repr(x.number);
         cfg.external = external(fp);
     }
 }
 
-}  // namespace helirec
+}  // namespace vc_tomography

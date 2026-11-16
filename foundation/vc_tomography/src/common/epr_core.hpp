@@ -20,7 +20,7 @@
 
 #include "hd_math.hpp"
 
-namespace helirec::epr_core {
+namespace vc_tomography::epr_core {
 
 struct Coef {
     float A;        // delta_beta lambda L / (4 pi px^2)
@@ -79,4 +79,4 @@ HR_HD float forward(const float* I, const float* gx, const float* gy, const floa
     return ic - c.A * lap + c.half_A2 * (a + 0.5f * cg) - c.press * b;
 }
 
-}  // namespace helirec::epr_core
+}  // namespace vc_tomography::epr_core

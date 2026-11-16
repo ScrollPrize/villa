@@ -1,0 +1,296 @@
+#pragma once
+// End-to-end reconstruction of a chunk of xy slices from raw scan data:
+//   read raw row windows -> grid (flat-field, weights, angular/vertical/horizontal splat)
+//   -> luminosity equalisation -> divide -> mend -> filter chain (filters.hpp; before / after -log) -> -log
+//   -> rebalance (half acquisition) -> ramp filter -> x balanced weights -> backprojection
+// Every stage is a separate kernel call with a CPU and a CUDA implementation.
+#include <map>
+#include <memory>
+#include <optional>
+#include <string>
+#include <vector>
+
+#include "vc_tomography/block_sink.hpp"
+#include "vc_tomography/ghbp.hpp"
+#include "vc_tomography/helical.hpp"
+#include "vc_tomography/filters.hpp"
+#include "vc_tomography/kernels.hpp"
+#include "vc_tomography/progress.hpp"
+#include "vc_tomography/raw_reader.hpp"
+#include "vc_tomography/sld.hpp"
+
+namespace vc_tomography {
+
+// One scan (main = index 0, then companions), with its calibration.
+struct ScanData {
+    ScanTrajectory traj;
+    std::vector<double> control_A;      // per projection machine current
+    FlatSeriesInfo flat_info;           // float32 angle of each flat series
+    std::vector<float> dark;            // (rows, cols)
+    std::vector<float> flats;           // (n_flats, rows, cols): (flat - dark) / (I_flat / 0.2)
+    std::vector<float> weight;          // (rows, cols): weight map x horizontal apodisation
+    std::shared_ptr<RawReader> reader;  // raw frames
+    std::vector<int32_t> file_index, frame_index;  // per projection
+};
+
+struct ReconConfig {
+    Device device = Device::CPU;
+    // projection filters (filters.hpp), e.g. paganin + unsharp; physics for filters that need it
+    FilterChain filters;
+    double energy_kev = 0, distance_m = 0;
+    int margin = -1;                    // <0: the chain's margin (filters' context rows)
+    // scintillator light diffusion correction of the raw frames (sld.hpp); fraction 0: none
+    SldParams sld;
+    // gridding
+    int n_grid = 0;                     // <=0: round(360 / mean step) of the main scan
+    double angular_tolerance_steps = 5;
+    float luminosity_repartition = 100.f;
+    // fractional column offset of a scan in the merged frame: "sinc" (default) = each projection row delayed by the
+    // offset exactly (a phase ramp on its transform; the gridding of measured pixels only, for the iterative methods,
+    // uses lanczos3, and reads exactly a scan with a lateral registration or the lateral part of a detector map:
+    // AccumScanView::col_wt); "lanczos3" / "cubic" = a kernel of 6 / 4 columns, which loses the top of the band (lanczos3 at
+    // half a pixel: 0.82 at 0.36 cycles per pixel, 0.35 at 0.45); "linear" = the reference's two-column splat, which
+    // averages neighbouring columns (cos(pi nu) at half a pixel). The legacy reference mode always uses the splat.
+    std::string x_interp = "sinc";
+    // Band-dependent redundancy weights (sino.hpp), for a detector whose sharpness depends on the place: "" = off, or
+    // the detector's blur field "a11:a12:a21:a22:c1:c2" (a uniform blur of A r + c pixels at r = (column, row) from
+    // the detector's centre in units of 1000 pixels; only its component along the columns, a11 a12 c1, is used).
+    // Below sharp_band = "f1:f2" (cycles per pixel) the recordings of a ray are combined with the usual weights,
+    // above it with those weights times the detector's squared response at sharp_f; raised-cosine crossover. On the
+    // frames before the phase filter the band is taken on the frequency magnitude (columns and rows), between
+    // opposite views along the columns. Not in the legacy reference mode or for measured-only gridding.
+    std::string sharpness_weighting;
+    double sharp_f = 0.35;
+    std::string sharp_band = "0.15:0.30";
+    // vertical position of a slice in a projection (a fractional detector row): "lanczos8" (default), "lanczos3" or
+    // "cubic" (16 / 6 / 4 rows; accumulate.hpp), or "linear" = the reference's two rows, a triangle kernel along z
+    // (sinc^2). lanczos8 keeps the top of the band along the axis that lanczos3 loses (above 0.3 cycles per row) and
+    // reads 10 more rows of every projection per chunk. The legacy reference mode always interpolates linearly.
+    std::string z_interp = "lanczos8";
+    // angular gridding: "nearest" (default) = each projection whole in one bin and every slice backprojected at the
+    // measured mean angle of each bin (helical.hpp nearest_angle_bins): no angular averaging; "linear" = the
+    // reference's splat of each projection over the two grid angles around its own. Nearest needs a backprojector that
+    // takes the angles of each slice (fbp, the whole-slice methods, bands): ghbp, whose plan fixes its angles, and the
+    // legacy reference mode keep the splat (SliceReconstructor::angle_interp() tells which is in use).
+    // "views" = nearest without the wrap to one turn: every bin of every turn is a row of the sinogram, so that the
+    // views of a slice that share a grid angle (a turn apart where the detector is taller than the travel per turn,
+    // or a turn at rest and the helix) are not averaged at their mean angle but each filtered and backprojected at
+    // its own, with its share of the weight (sino.hpp rebalance_turns). They differ in angle by the turn's excess
+    // over a whole number of steps and, with a rolling shutter, by the rows between them. The sinogram then has as
+    // many rows as bins the chunk's projections span (at most 16 turns), and gridding, filters and backprojection
+    // cost in proportion. It needs the exact backprojector (fbp, bands): the others use nearest. The exposure arc
+    // (exposure_arc below) is not deconvolved with it: disabled for now.
+    std::string angle_interp = "nearest";
+    // continuous rotation: fraction of the angular step between projections swept during one exposure (0: none, or
+    // step scans). > 0: that box blur along the angle is deconvolved in every sinogram (sino.hpp angular_fir).
+    // Not with angle_interp "views", where it is disabled for now (SliceReconstructor::exposure_arc_bins() is then 0).
+    double exposure_arc = 0;
+    // Rolling shutter: the detector's rows are read one after another while the sample turns, so the angle of a
+    // recording depends on its row. rolling_shutter = the time from the read-out of the first row to that of the
+    // last, in frame periods (signed: negative when the last row is read first): the row v of a projection was
+    // recorded rolling_shutter x (the angular step) x (v - middle row) / (rows - 1) from the projection's angle.
+    // A slice lies at one row of every projection, so the correction is an angle per slice and bin: applied with
+    // the angles of each slice (angle_interp "nearest" and a backprojector that takes them; not ghbp, not the
+    // legacy reference mode: SliceReconstructor::rolling_shutter() tells what is in use). 0: one angle per frame.
+    // rolling_shutter_from_middle: the two halves of the detector are read at once, the rows counted from the middle
+    // row to both ends: the row v was recorded rolling_shutter x (the angular step) x |v - middle row| / (rows - 1)
+    // from the projection's angle (above nothing: the middle row first; below: the first and last row first).
+    double rolling_shutter = 0;
+    bool rolling_shutter_from_middle = false;
+    // The beam's divergence (a source at a finite distance) [rad per detector column, signed]: the ray a scan records
+    // at its column c is the parallel beam's at the projection's angle + fan_per_column x (c - the middle column).
+    // Two things follow, both taken by the exact backprojector (fbp, bands) as one table of the merged columns
+    // (BackprojectParams::fan): a scan that stands elsewhere across the beam sees the sample turned by the fan of
+    // the columns between, and within a frame a point nearer the source is recorded further from the axis. Where
+    // scans share a merged column (the blend between two columns of a grid) the table holds the mean of their
+    // fans by their weights. The filter stays the parallel beam's; the divergence along the axis (rows) is not
+    // taken. 0: a parallel beam. Not with ghbp (its own: axis_source_meters), the whole-slice methods or the legacy
+    // reference mode: SliceReconstructor::fan_per_column() tells what is in use.
+    double fan_per_column = 0;
+    // Split reconstructions: with angle_subsets > 1 only subset number angle_subset of that many interleaved subsets
+    // of the projections is used (helical.hpp angle_subset: by angle, the same angles in every scan), on a grid of
+    // 1 / angle_subsets of the angles (unless n_grid says otherwise). The subsets of a scan have independent noise
+    // and share everything else (flats, calibration, geometry); exposure_arc stays the fraction of the recorded
+    // step. The doable heights are those of the whole scan.
+    int angle_subsets = 1, angle_subset = 0;
+    // Noise splitting (0: none): two reconstructions with independent noise from every projection. The frames' noise
+    // is independent from pixel to pixel and frame to frame with a variance that follows the level, gain x (counts
+    // above the dark) + floor [counts^2]. A run adds to every raw sample noise_split_scale x that standard deviation
+    // (of the sample itself) x a standard normal number z fixed by the seed, the scan's file, the projection and the
+    // pixel. Two runs with one seed and the scales a and -1 / a hold the sample's noise n as n + a z and n - z / a,
+    // which do not correlate (recorrupted-to-recorrupted, Pang et al. 2021), with (1 + a^2) and (1 + 1 / a^2) times
+    // the variance: a pair to train a denoiser on with no projection left out. Not for reduced frames (their noise is
+    // another) and not in the legacy reference mode.
+    // noise_split_smooth_share, _spacing (up to two; share 0: none): the part of the noise that neighbouring pixels
+    // share (a scintillator spreads its quanta), as smooth fields of `share` times the white part's variance each,
+    // on lattices of `spacing` pixels (AccumScanView::split_amp); the variance model is of the whole noise.
+    float noise_split_scale = 0, noise_split_gain = 0, noise_split_floor = 0;
+    float noise_split_smooth_share[2] = {0, 0}, noise_split_smooth_spacing[2] = {0, 0};
+    float noise_split_flat_frames = 0;   // the frames a flat is the mean of (0: the flats are not split)
+    std::uint32_t noise_split_seed = 0;
+    float mend_threshold = 1e-4f;       // mending domain: the merged columns the scans' weight maps cover
+    float log_clip_min = 1e-6f, log_clip_max = 10.f;
+    int block_angles = 500;
+    // reconstruction
+    float rot_center = 0.f;             // in the merged frame
+    // backprojector: "fbp" (default; exact pixel-driven: bp_interp, bp_oversample), "ghbp" (the reference's), "sirt" /
+    // "mlem" / "gridrec" (tomo_params: whole-slice methods, tomo.hpp) or "external"
+    std::string backprojector = "fbp";
+    // fbp row interpolation: linear | cubic | lanczos3 | bspline3 | bspline5; rows upsampled (band-limited, FFT) by
+    // bp_oversample first. Default oversample 2 + bspline3: within 0.1 % of ideal (sinc) interpolation for ~7 % more
+    // time (linear alone loses ~10 % of the high-frequency contrast)
+    std::string bp_interp = "bspline3";
+    int bp_oversample = 2;
+    // ramp filter of "ghbp", "fbp" and filtered "external": ramlak, or a windowed ramp (sino.hpp ramp_windowed)
+    std::string ramp_filter_name = "ramlak";
+    std::vector<float> ramp_filter_par;  // {p0, p1}; empty: 0.5, 8
+    std::shared_ptr<class ExternalBackprojector> external;  // backprojector "external" (e.g. Python)
+    FilterParams tomo_params;            // backprojectors "sirt", "mlem", "gridrec" (tomo.hpp)
+    int grid_size = 0;                  // <=0: as the reference (2 * rot_center + 1 rounding rule)
+    int ghbp_legs = 8, ghbp_reduction_steps = 2;
+    bool clip_outer_circle = true;
+    double pixel_size_m = 0;            // voxel size (scale = 1 / voxel_cm)
+    double axis_source_meters = 1e9;
+    // Legacy reference mode: the inherited reference (Nabu / nabuxx) conventions, to reproduce existing
+    // reconstructions: half-attenuation output scale (ramp pi / n_angles over pair-balanced full-turn weights),
+    // nabuxx rebalance endpoints, integer ramp-padding reflection lround(2 rot_center), mending bounds = the main
+    // weight map's first / last column read as left / right widths of the merged row, the chunk-truncated
+    // Paganin kernel, the two-column splat of fractional column offsets, the luminosity window clipped to the
+    // chunk and context rows gridded only from the projections of the chunk's own heights (the default reads the
+    // window's 12 context rows either side and grids context rows from every projection that sees them). Default (false): attenuation in cm^-1, periodic opposite-view rebalance, reflection about
+    // 2 rot_center, mending over the merged columns the scans cover, the fixed unit-DC Paganin kernel.
+    // (vc_tomography.recon pins every other parameter of the reference when this mode is selected.)
+    bool legacy_reference = false;
+};
+
+// Optional intermediate outputs (filled when requested)
+struct ChunkDebug {
+    bool keep = false;
+    // n_rows: the rows of the chunk's sinogram: n_grid, or with a row per view (angle_interp "views") the bins its
+    // projections span, at least n_grid (row r: bin first_bin + r, at the grid angle of that bin modulo n_grid)
+    int n_rows = 0;
+    long first_bin = 0;
+    std::vector<float> sino;      // (n_rows, DY, NX) -log sinogram before rebalance
+    std::vector<float> weights;   // (n_rows, DY, NX) accumulated weights (cropped)
+    std::vector<float> wbal;      // backprojector weights: balanced for FBP/gridrec, measured support for SIRT/MLEM
+    std::vector<float> filtered;  // (DY, n_rows, NX) backprojector input
+    std::vector<float> angles;    // (DY, n_rows) angle of each row in each slice (radians)
+    // per-stage wall time (seconds); with timing on, the GPU is synchronised at stage boundaries
+    bool timing = false;
+    std::map<std::string, double> seconds;
+    std::map<std::string, double> stats;  // sizes of the chunk (with timing on)
+};
+
+struct SliceRoi {   // [x0, x1) x [y0, y1) of the (N, N) slice
+    int x0 = 0, x1 = 0, y0 = 0, y1 = 0;
+};
+
+// A mask of a chunk's uint8 slices, possibly coarser than them (e.g. a pyramid level of a masked reference volume,
+// reference.hpp): output voxel (s, y, x) (slice of the chunk, row and column of the ROI) is 0 where
+// data[(s + oz) / fz, (y + oy) / fy, (x + ox) / fx] is 0, indices clamped to the mask.
+struct OutputMask {
+    const std::uint8_t* data = nullptr;   // (nz, ny, nx), host
+    int nz = 0, ny = 0, nx = 0;
+    int fz = 1, fy = 1, fx = 1;
+    int oz = 0, oy = 0, ox = 0;
+};
+
+// Where the slices of a chunk go, float32 and / or uint8: host arrays (n, y1 - y0, x1 - x0), or sinks (block_sink.hpp,
+// e.g. an OmeZarrWriter) that take each slice as the block of it that was computed, so that no whole slice is built:
+// slice y of the chunk is the sink's slice sink_z + y, the block in the coordinates of the ROI. The uint8 version is
+// to_uint8 (kernels.hpp) of each slice with the window [u8_lo, u8_hi], 0 outside the reconstruction disk with
+// u8_zero_outside and where u8_mask is 0; on CUDA it is converted on the device, so a uint8-only chunk downloads
+// one byte per pixel.
+// Only the pixels that are needed are backprojected: those of `region` (slice coordinates; the rest of the output is
+// 0), and with uint8 slices alone, those within the bounds of what u8_mask keeps, and for the exact backprojector
+// only its tiles that hold a kept pixel (the others are 0 either way). The exact backprojector computes each pixel on
+// its own, so the pixels computed are those of a whole-slice run; a chunk with none is not reconstructed at all.
+struct SliceOutput {
+    float* f32 = nullptr;
+    std::uint8_t* u8 = nullptr;
+    BlockSink* f32_sink = nullptr;
+    BlockSink* u8_sink = nullptr;
+    std::int64_t sink_z = 0;
+    double u8_lo = 0.0, u8_hi = 1.0;
+    bool u8_zero_outside = false;
+    OutputMask u8_mask;
+    std::optional<SliceRoi> region;
+};
+
+// A backprojector outside the library (bindings: Python functions). Per slice it gets the rows on the
+// reconstructor's device: ramp-filtered x balanced weights (filtered() == true), or the -log rows and the balanced
+// weights (filtered() == false, for methods that filter / model the data themselves); measured_only() instead
+// requests measured support and values before hole filling / balancing. Writes the ROI slice to
+// `out` (host, (y1 - y0, x1 - x0)). `p`: the exact backprojector's geometry (angles: u = x cos a + y sin a + rot).
+class ExternalBackprojector {
+  public:
+    virtual ~ExternalBackprojector() = default;
+    virtual bool filtered() const = 0;
+    // Request measured-only gridding, with support preserved before any hole filling or rebalance.
+    virtual bool measured_only() const { return false; }
+    // The image the method starts from, asked of the pipeline: 0 none; 1 the exact FBP of the slice with a parallel
+    // beam (the plain ramp; a copy of the slice's rows mended and balanced as for backprojector "fbp", the exact
+    // backprojector with bp_interp and bp_oversample); 2 the same with the beam's divergence where the reconstruction
+    // has one (ReconConfig::fan_per_column). Not in the legacy reference mode.
+    virtual int fbp_start() const { return 0; }
+    // That image, given before every slice() of a method whose fbp_start() is not 0 and taken back (null) after it:
+    // the whole grid (grid_size x grid_size, row-major) in attenuation per pixel, on the reconstructor's device.
+    virtual void set_start(const float*) {}
+    virtual void slice(int view_height, const float* rows, const float* weights, int n_angles, int n_det,
+                       const float* angles, const BackprojectParams& p, int grid_size, const SliceRoi& roi, Device device,
+                       float* out) = 0;
+};
+
+class BandSampler;
+
+class SliceReconstructor {
+  public:
+    SliceReconstructor(std::vector<ScanData> scans, ReconConfig cfg);
+    ~SliceReconstructor();
+
+    // reconstructable view heights [lo, hi) and info
+    std::pair<int, int> doable() const;
+    int margin() const;
+    int n_grid() const;
+    int grid_size() const;
+    int merged_width() const;
+    std::pair<int, int> mend_domain() const;   // [x0, x1) merged columns the mending works on
+    double exposure_arc_bins() const;          // the deconvolved exposure arc in grid angles (0: none)
+    double rolling_shutter() const;            // the rolling shutter in use (frame periods over the rows; 0: none)
+    double fan_per_column() const;             // the beam's divergence in use [rad per column] (0: a parallel beam)
+    // the fan of every merged column [rad] as the backprojector takes it (empty: a parallel beam)
+    const std::vector<float>& fan_of_columns() const;
+    std::string angle_interp() const;          // the angular gridding in use: "views", "nearest" or "linear"
+    std::string z_interp() const;              // the vertical kernel in use
+    std::vector<int> projection_counts() const;   // projections in use, per scan (a subset: fewer than recorded)
+    const ReconConfig& config() const;
+
+    // slices for view heights h_lo .. h_hi-1 -> out (h_hi - h_lo, N, N), or (n, y1 - y0, x1 - x0) with an ROI
+    // (GHBP computes whole slices and crops; FBP computes only the ROI)
+    // [next_lo, next_hi): the chunk that will follow; its raw windows are read in the background (CUDA)
+    // progress: advanced by one per slice, with the step in hand ("read", "grid", "backproject") as its postfix
+    void reconstruct(int h_lo, int h_hi, const SliceOutput& out, ChunkDebug* debug = nullptr, const SliceRoi* roi = nullptr,
+                     int next_lo = 0, int next_hi = 0, ProgressBar* progress = nullptr);
+    void reconstruct(int h_lo, int h_hi, float* out, ChunkDebug* debug = nullptr, const SliceRoi* roi = nullptr,
+                     int next_lo = 0, int next_hi = 0) {
+        SliceOutput o;
+        o.f32 = out;
+        reconstruct(h_lo, h_hi, o, debug, roi, next_lo, next_hi);
+    }
+    // same chunk, but only the band of pixels the sampler's points need, with the exact backprojector; the
+    // sampler accumulates its point samples (call with contiguous, increasing chunks)
+    // `sweep`: several filter chains (CUDA): everything before the filters is computed once per chunk and the
+    // sampler's value set k receives chain k; the margin is the largest any chain needs (sweep_margin). Chains that
+    // are one Fourier step at the intensity stage (e.g. paganin + unsharp) also share the forward FFT.
+    void reconstruct_band(int h_lo, int h_hi, BandSampler& band, ChunkDebug* debug = nullptr,
+                          const std::vector<FilterChain>* sweep = nullptr, int next_lo = 0, int next_hi = 0);
+    int sweep_margin(const std::vector<FilterChain>& chains) const;  // margin rows used for a sweep
+    std::string describe(const FilterChain& chain) const;            // compiled steps, e.g. fft[paganin*unsharp]@intensity m20
+
+    struct Impl;
+
+  private:
+    std::unique_ptr<Impl> impl_;
+};
+
+}  // namespace vc_tomography

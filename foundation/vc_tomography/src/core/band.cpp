@@ -1,14 +1,14 @@
-#include "helirec/band.hpp"
+#include "vc_tomography/band.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstring>
 
-#ifdef HELIREC_WITH_CUDA
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
 #include "../cuda/cuda_utils.cuh"
 #endif
 
-namespace helirec {
+namespace vc_tomography {
 
 struct BandSampler::Impl {
     Device dev = Device::CPU;
@@ -28,7 +28,7 @@ struct BandSampler::Impl {
     std::vector<std::vector<float>> img; // 2 per set
     std::vector<uint8_t> mask;
     std::vector<int32_t> list;
-#ifdef HELIREC_WITH_CUDA
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
     cuda::DeviceBuffer<float> d_fz, d_y, d_x, d_vals;
     std::vector<cuda::DeviceBuffer<float>> d_img;
     cuda::DeviceBuffer<uint8_t> d_mask;
@@ -78,7 +78,7 @@ BandSampler::BandSampler(Device device, const int32_t* zlo, const float* fz, con
         I.mask.assign(npx, 0);
         I.list.resize(npx);
     } else {
-#ifdef HELIREC_WITH_CUDA
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
         I.d_fz.upload(fz, n); I.d_y.upload(y, n); I.d_x.upload(x, n);
         std::vector<float> nan(n * n_sets, std::nanf(""));
         I.d_vals.upload(nan.data(), nan.size());
@@ -86,7 +86,7 @@ BandSampler::BandSampler(Device device, const int32_t* zlo, const float* fz, con
         for (auto& b : I.d_img) b.resize(npx);
         I.d_mask.resize(npx);
         I.d_list.resize(npx);
-        HELIREC_CUDA_CHECK(cudaDeviceSynchronize());
+        VC_TOMOGRAPHY_CUDA_CHECK(cudaDeviceSynchronize());
 #else
         throw Error("built without CUDA");
 #endif
@@ -110,11 +110,11 @@ void BandSampler::reset() {
     I.prepared = false;
     I.n_bp = I.n_sampled = 0;
     if (I.dev == Device::CPU) std::fill(I.vals.begin(), I.vals.end(), std::nanf(""));
-#ifdef HELIREC_WITH_CUDA
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
     else {
         std::vector<float> nan(I.n * I.K, std::nanf(""));
         I.d_vals.upload(nan.data(), nan.size());
-        HELIREC_CUDA_CHECK(cudaDeviceSynchronize());
+        VC_TOMOGRAPHY_CUDA_CHECK(cudaDeviceSynchronize());
     }
 #endif
 }
@@ -152,16 +152,16 @@ void BandSampler::slice(int h, const float* filtered, int n_angles, int n_det, c
         }
         return;
     }
-#ifdef HELIREC_WITH_CUDA
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
     if (static_cast<int>(I.cs_src.size()) != n_angles || !std::equal(I.cs_src.begin(), I.cs_src.end(), angles_host)) {
         std::vector<float2> cs(n_angles);
         for (int a = 0; a < n_angles; ++a) cs[a] = make_float2(std::cos(angles_host[a]), std::sin(angles_host[a]));
         I.d_cs.upload(cs.data(), cs.size());
-        HELIREC_CUDA_CHECK(cudaStreamSynchronize(nullptr));   // (cs is local)
+        VC_TOMOGRAPHY_CUDA_CHECK(cudaStreamSynchronize(nullptr));   // (cs is local)
         I.cs_src.assign(angles_host, angles_host + n_angles);
     }
     if (!I.prepared || I.prepared_h != h) {
-        HELIREC_CUDA_CHECK(cudaMemsetAsync(I.d_mask.data(), 0, npx));
+        VC_TOMOGRAPHY_CUDA_CHECK(cudaMemsetAsync(I.d_mask.data(), 0, npx));
         cuda::band_mark(I.d_y.data(), I.d_x.data(), rp.first, rp.second, I.box, I.d_mask.data());
         cuda::band_mark(I.d_y.data(), I.d_x.data(), rc.first, rc.second, I.box, I.d_mask.data());
         I.list_count = cuda::band_compact(I.d_mask.data(), npx, I.d_list.data());
@@ -186,11 +186,11 @@ void BandSampler::values(float* out, int set) const {
         std::memcpy(out, I.vals.data() + static_cast<std::size_t>(set) * I.n, I.n * sizeof(float));
         return;
     }
-#ifdef HELIREC_WITH_CUDA
-    HELIREC_CUDA_CHECK(cudaDeviceSynchronize());
-    HELIREC_CUDA_CHECK(cudaMemcpy(out, I.d_vals.data() + static_cast<std::size_t>(set) * I.n, I.n * sizeof(float),
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
+    VC_TOMOGRAPHY_CUDA_CHECK(cudaDeviceSynchronize());
+    VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpy(out, I.d_vals.data() + static_cast<std::size_t>(set) * I.n, I.n * sizeof(float),
                                   cudaMemcpyDeviceToHost));
 #endif
 }
 
-}  // namespace helirec
+}  // namespace vc_tomography

@@ -1,4 +1,4 @@
-// nanobind bindings of the intensity calibration's kernels (helirec/calibration/intensity.hpp)
+// nanobind bindings of the intensity calibration's kernels (vc_tomography/calibration/intensity.hpp)
 #include <nanobind/stl/function.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/string.h>
@@ -6,15 +6,15 @@
 #include <nanobind/stl/array.h>
 
 #include "fit_summary.hpp"
-#include "helirec/calibration/intensity.hpp"
-#include "helirec/calibration/transfer.hpp"
-#include "helirec/raw_reader.hpp"
+#include "vc_tomography/calibration/intensity.hpp"
+#include "vc_tomography/calibration/transfer.hpp"
+#include "vc_tomography/raw_reader.hpp"
 #include "ndarray_utils.hpp"
 
 namespace nb = nanobind;
 using namespace nb::literals;
-using namespace helirec;
-using namespace helirec::py;
+using namespace vc_tomography;
+using namespace vc_tomography::py;
 
 namespace {
 
@@ -68,7 +68,7 @@ calibration::Scan scan_of(nb::handle h) { return nb::cast<calibration::Scan>(h);
 void bind_intensity(nb::module_& m) {
     nb::class_<calibration::ScanPlacement>(m, "ScanPlacement",
                                            "Where a scan lies in the merged frame: its column 0 at merged column shift_x - x_readjustment, its rows "
-                                           "z_readjustment rows from the first scan's (helirec::calibration::ScanPlacement)")
+                                           "z_readjustment rows from the first scan's (vc_tomography::calibration::ScanPlacement)")
         .def_ro("shift_x", &calibration::ScanPlacement::shift_x)
         .def_ro("x_readjustment", &calibration::ScanPlacement::x_readjustment)
         .def_ro("z_readjustment", &calibration::ScanPlacement::z_readjustment)
@@ -79,7 +79,7 @@ void bind_intensity(nb::module_& m) {
     using IC = calibration::IntensityCalibration;
     nb::class_<IC>(m, "IntensityCalibration",
                    "The intensity calibration of the scans of an acquisition (a pair, or more scans moved sideways) in their merged frame "
-                   "(helirec::calibration::calibrate_intensity)")
+                   "(vc_tomography::calibration::calibrate_intensity)")
         .def_ro("main", &IC::main)
         .def_ro("companion", &IC::companion)
         .def_ro("scans", &IC::scans, "every scan's name, the main scan first")
@@ -154,7 +154,7 @@ void bind_intensity(nb::module_& m) {
         },
         "main"_a, "companion"_a, "cor_main_detector"_a, "vector"_a, "measured"_a = nb::dict(), "cache_dir"_a = "", "log"_a = nb::none(), "progress"_a = false,
         "The intensity calibration of a scan pair in the merged frame of one axis (in the main scan's columns) and one vector (rows, columns) to the "
-        "companion; cache_dir: calibration_arrays.bin and calibration.json kept there. (helirec::calibration::calibrate_intensity)");
+        "companion; cache_dir: calibration_arrays.bin and calibration.json kept there. (vc_tomography::calibration::calibrate_intensity)");
     m.def(
         "calibrate_intensity_of_scans",
         [](const nb::list& scans, double cor_main_detector, const std::vector<std::array<double, 2>>& vectors, const std::string& cache_dir,
@@ -174,7 +174,7 @@ void bind_intensity(nb::module_& m) {
         "scans"_a, "cor_main_detector"_a, "vectors"_a, "cache_dir"_a = "", "log"_a = nb::none(), "progress"_a = false, "projection_store"_a = "", "reduce"_a = 0,
         "The intensity calibration of any number of scans (the main scan first) in the merged frame of one axis (in the main scan's columns) and a "
         "vector (rows, columns) to every scan after the first: scans beside the main scan on one side of it, and scans at the columns of one of "
-        "those at another height (a grid). (helirec::calibration::calibrate_intensity)");
+        "those at another height (a grid). (vc_tomography::calibration::calibrate_intensity)");
     m.def(
         "lit_rows",
         [](nb::ndarray<const float, nb::ndim<2>, nb::c_contig, nb::device::cpu> image, double share) {
@@ -183,7 +183,7 @@ void bind_intensity(nb::module_& m) {
         },
         "flat_less_dark"_a, "share"_a = calibration::kLitShare,
         "The rows the beam lights, (first, end): around the brightest row of a flat less its dark, the rows whose mean reaches `share` of it. "
-        "(helirec::calibration::lit_rows)");
+        "(vc_tomography::calibration::lit_rows)");
     m.def(
         "reduce_darks_flats",
         [](nb::handle scan, std::optional<std::function<void(std::size_t)>> progress) {
@@ -202,7 +202,7 @@ void bind_intensity(nb::module_& m) {
             return darks_flats_tuple(d);
         },
         "scan"_a, "progress"_a = nb::none(),
-        "(dark (rows, cols), flats (series, rows, cols)) of a scan exactly as nx2etf stores them (helirec::calibration::reduce_darks_flats)");
+        "(dark (rows, cols), flats (series, rows, cols)) of a scan exactly as nx2etf stores them (vc_tomography::calibration::reduce_darks_flats)");
     m.def(
         "reduced_darks_flats",
         [](nb::handle scan, const std::string& cache_dir, std::optional<std::function<void(const std::string&)>> log) {
@@ -216,7 +216,7 @@ void bind_intensity(nb::module_& m) {
             return darks_flats_tuple(d);
         },
         "scan"_a, "cache_dir"_a = "", "log"_a = nb::none(),
-        "reduce_darks_flats(scan), kept in cache_dir as darks_flats_<scan>.bin (helirec::calibration::reduced_darks_flats)");
+        "reduce_darks_flats(scan), kept in cache_dir as darks_flats_<scan>.bin (vc_tomography::calibration::reduced_darks_flats)");
     m.def(
         "placement_from_vector",
         [](std::array<double, 2> vector, int cols) {
@@ -226,7 +226,7 @@ void bind_intensity(nb::module_& m) {
             return nb::make_tuple(scans, p.width, p.anchor);
         },
         "vector"_a, "cols"_a,
-        "nabuxx check_companion: ([main, companion] placements, merged width, anchor) (helirec::calibration::placement_from_vector)");
+        "nabuxx check_companion: ([main, companion] placements, merged width, anchor) (vc_tomography::calibration::placement_from_vector)");
     m.def(
         "placement_from_vectors",
         [](const std::vector<std::array<double, 2>>& vectors, int cols) {
@@ -237,10 +237,10 @@ void bind_intensity(nb::module_& m) {
         },
         "vectors"_a, "cols"_a,
         "the same of any number of scans, each after the first at its (rows, columns) from it: (placements, merged width, anchor) "
-        "(helirec::calibration::placement_from_vectors)");
+        "(vc_tomography::calibration::placement_from_vectors)");
     m.def(
         "acquisition_fingerprint", [](nb::handle main, nb::handle companion) { return calibration::acquisition_fingerprint(scan_of(main), scan_of(companion)); },
-        "main"_a, "companion"_a, "sha256 over what the calibration of a pair depends on (helirec::calibration::acquisition_fingerprint)");
+        "main"_a, "companion"_a, "sha256 over what the calibration of a pair depends on (vc_tomography::calibration::acquisition_fingerprint)");
     m.def(
         "flat_noise_spectra",
         [](nb::handle scan, Arr<float> dark, int n_flats, int tile) {
@@ -255,7 +255,7 @@ void bind_intensity(nb::module_& m) {
                                   f.n_flats);
         },
         "scan"_a, "dark"_a, "n_flats"_a = 200, "tile"_a = calibration::kBlurTile,
-        "Noise power spectra of the scan's first flat series on tiles -> (power, ys, xs, flats used) (helirec::calibration::flat_noise_spectra)");
+        "Noise power spectra of the scan's first flat series on tiles -> (power, ys, xs, flats used) (vc_tomography::calibration::flat_noise_spectra)");
     m.def(
         "measure_detector_blur",
         [](nb::handle scan, Arr<float> dark, int n_flats, std::optional<std::function<void(const std::string&)>> log) -> nb::object {
@@ -272,7 +272,7 @@ void bind_intensity(nb::module_& m) {
             return nb::object(details["detector_blur"]);
         },
         "scan"_a, "dark"_a, "n_flats"_a = 200, "log"_a = nb::none(),
-        "The detector's blur field of a scan from the noise of its flats, as a dict (helirec::calibration::measure_detector_blur)");
+        "The detector's blur field of a scan from the noise of its flats, as a dict (vc_tomography::calibration::measure_detector_blur)");
     m.attr("INTENSITY_CALIBRATION_VERSION") = calibration::kIntensityCalibrationVersion;
     m.attr("NOMINAL_CURRENT_A") = calibration::kNominalCurrentA;
 
@@ -322,7 +322,7 @@ void bind_intensity(nb::module_& m) {
         },
         "reader"_a, "file_index"_a, "frame_index"_a, "dark"_a = nb::none(), "control_A"_a = nb::none(), "nominal_A"_a = 0.0, "progress"_a = nb::none(),
         "The mean of frames as nx2etf reduces them (float32, added in order); with dark and control_A each frame F enters as\n"
-        "dark + (F - dark) nominal_A / control_A. (helirec::calibration::mean_frames)");
+        "dark + (F - dark) nominal_A / control_A. (vc_tomography::calibration::mean_frames)");
     m.def(
         "weight_map",
         [](const std::vector<Arr<float>>& stacks, double transition_width_vertical, double sigma, int crop_top, int crop_bottom) {
@@ -341,7 +341,7 @@ void bind_intensity(nb::module_& m) {
             return out;
         },
         "flat_stacks"_a, "transition_width_vertical"_a = 15.0, "sigma"_a = 10.0, "crop_top"_a = 0, "crop_bottom"_a = 0,
-        "prepare_weights_double: gaussian_filter(mean(all flats) / max, sigma) * vertical erf border. (helirec::calibration::weight_map)");
+        "prepare_weights_double: gaussian_filter(mean(all flats) / max, sigma) * vertical erf border. (vc_tomography::calibration::weight_map)");
     m.def(
         "apodisation_widths",
         [](int n_cols, double est_cor_main_offset, double companion_dx, double transition_width_horizontal, double transition_width_borders) {
@@ -364,7 +364,7 @@ void bind_intensity(nb::module_& m) {
             return out;
         },
         "images"_a, "reduce"_a, "chunk_rows"_a,
-        "Detector images on the grid of RawReader(reduce=) for frames stored as JPEG 2000. (helirec::calibration::at_resolution)");
+        "Detector images on the grid of RawReader(reduce=) for frames stored as JPEG 2000. (vc_tomography::calibration::at_resolution)");
     m.def("gaussian_filter1d", &gauss<float>, "a"_a, "axis"_a, "sigma"_a, "mode"_a = "reflect", "truncate"_a = 4.0,
           "scipy.ndimage.gaussian_filter1d semantics (reflect | nearest), double accumulation");
     m.def("gaussian_filter1d", &gauss<double>, "a"_a, "axis"_a, "sigma"_a, "mode"_a = "reflect", "truncate"_a = 4.0);

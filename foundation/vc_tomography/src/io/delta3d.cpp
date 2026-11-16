@@ -1,14 +1,14 @@
-#include "helirec/delta3d.hpp"
+#include "vc_tomography/delta3d.hpp"
 
-#include "helirec/common.hpp"
+#include "vc_tomography/common.hpp"
 
-#ifdef HELIREC_WITH_DELTA3D
+#ifdef VC_TOMOGRAPHY_WITH_DELTA3D
 #include <vc_delta3d/codec.hpp>
 #endif
 
-namespace helirec {
+namespace vc_tomography {
 
-#ifdef HELIREC_WITH_DELTA3D
+#ifdef VC_TOMOGRAPHY_WITH_DELTA3D
 bool delta3d_available() { return true; }
 
 std::vector<uint8_t> delta3d_compress_u8(const uint8_t* data, int z, int y, int x, const char* preset) {
@@ -40,4 +40,4 @@ std::vector<uint8_t> delta3d_compress_u8(const uint8_t*, int, int, int, const ch
 void delta3d_decompress(const uint8_t*, std::size_t, uint8_t*, std::size_t) { throw Error("built without vc-delta3d"); }
 #endif
 
-}  // namespace helirec
+}  // namespace vc_tomography

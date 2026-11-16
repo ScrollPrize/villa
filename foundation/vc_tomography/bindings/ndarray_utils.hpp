@@ -1,5 +1,5 @@
 #pragma once
-// Helpers to move between NumPy (host) arrays and helirec kernels.
+// Helpers to move between NumPy (host) arrays and vc_tomography kernels.
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
 
@@ -8,9 +8,9 @@
 #include <string>
 #include <vector>
 
-#include "helirec/common.hpp"
+#include "vc_tomography/common.hpp"
 
-namespace helirec::py {
+namespace vc_tomography::py {
 
 namespace nb = nanobind;
 
@@ -58,4 +58,4 @@ inline void require(bool ok, const std::string& msg) {
     if (!ok) throw Error(msg);
 }
 
-}  // namespace helirec::py
+}  // namespace vc_tomography::py

@@ -5,9 +5,9 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-import helirec
-from helirec import _core
-from helirec.sld import correct, sld_config
+import vc_tomography
+from vc_tomography import _core
+from vc_tomography.sld import correct, sld_config
 from test_sld import scan
 
 
@@ -70,7 +70,7 @@ def test_native_validation_and_disabled():
         correct(frames, dict(profile="bm18", fraction=10, length=.001, border_x=0, border_y=0))
 
 
-@pytest.mark.parametrize("device", helirec.devices())
+@pytest.mark.parametrize("device", vc_tomography.devices())
 @pytest.mark.parametrize("stride", [1, 3])
 def test_bm18_pipeline_against_corrected_input(tmp_path, device, stride):
     """Reference frames are corrected independently, then gridded with SLD off.

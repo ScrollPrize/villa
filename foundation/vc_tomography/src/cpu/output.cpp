@@ -3,9 +3,9 @@
 #include <cstring>
 
 #include "common/output_core.hpp"
-#include "helirec/kernels.hpp"
+#include "vc_tomography/kernels.hpp"
 
-namespace helirec::cpu {
+namespace vc_tomography::cpu {
 
 void to_uint8(const float* src, std::size_t src_pitch, std::uint8_t* out, int ny, int nx, const Uint8Window& w) {
     if (!(w.hi > w.lo)) throw Error("to_uint8: the window needs hi > lo");
@@ -45,4 +45,4 @@ void to_uint8(const float* src, std::size_t src_pitch, std::uint8_t* out, int ny
     }
 }
 
-}  // namespace helirec::cpu
+}  // namespace vc_tomography::cpu

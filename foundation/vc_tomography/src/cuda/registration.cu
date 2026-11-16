@@ -1,4 +1,4 @@
-// The array work of helirec::calibration's registration on CUDA: cuFFT transforms and kernels for the windows,
+// The array work of vc_tomography::calibration's registration on CUDA: cuFFT transforms and kernels for the windows,
 // the displacement of the padded block and the sums over the cross spectrum. The estimator that drives it is
 // the same code as on the CPU (src/calibration/registration.cpp, registration_core.hpp); every step here has
 // its counterpart in CpuBackend there and follows the same arithmetic. Blocks arrive from the host.
@@ -11,12 +11,12 @@
 #include "calibration/registration_core.hpp"
 #include "cuda_utils.cuh"
 
-namespace helirec::calibration {
+namespace vc_tomography::calibration {
 
 namespace {
 
-using helirec::cuda::DeviceBuffer;
-using helirec::cuda::PinnedBuffer;
+using vc_tomography::cuda::DeviceBuffer;
+using vc_tomography::cuda::PinnedBuffer;
 
 void cufft_check(cufftResult r, const char* what) {
     if (r != CUFFT_SUCCESS) throw Error(std::string("cuFFT error ") + std::to_string(r) + " in " + what);
@@ -241,7 +241,7 @@ class CudaBackend final : public RegistrationBackend {
         work_.resize(work);
         for (cufftHandle h : {forward_, inverse_, big_forward_, big_inverse_, frames_forward_, frames_inverse_})
             cufft_check(cufftSetWorkArea(h, work_.data()), "cufftSetWorkArea");
-        HELIREC_CUDA_CHECK(cudaDeviceSynchronize());
+        VC_TOMOGRAPHY_CUDA_CHECK(cudaDeviceSynchronize());
     }
 
     ~CudaBackend() override {
@@ -260,7 +260,7 @@ class CudaBackend final : public RegistrationBackend {
     double set_a(const float* a) override {
         const int* n = g_.n;
         // the padded block's buffer is free until set_b: the raw block goes there
-        HELIREC_CUDA_CHECK(cudaMemcpy(rbig_.data(), a, g_.N * sizeof(float), cudaMemcpyHostToDevice));
+        VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpy(rbig_.data(), a, g_.N * sizeof(float), cudaMemcpyHostToDevice));
         prepare(rbig_.data(), static_cast<std::size_t>(n[1]) * n[2], n[2]);
         cufft_check(cufftExecR2C(forward_, r_.data(), aw_.data()), "cufftExecR2C");
         const int lines = n[0] * n[1];
@@ -278,7 +278,7 @@ class CudaBackend final : public RegistrationBackend {
         t0_.upload(t0.data(), t0.size());
         t1_.upload(t1.data(), t1.size());
         t2_.upload(t2.data(), t2.size());
-        HELIREC_CUDA_CHECK(cudaMemcpy(rbig_.data(), b, g_.NB * sizeof(float), cudaMemcpyHostToDevice));
+        VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpy(rbig_.data(), b, g_.NB * sizeof(float), cudaMemcpyHostToDevice));
         // per frame: the mean removed and the row taper
         const std::size_t frame = static_cast<std::size_t>(L[1]) * L[2];
         const int rows = L[0] * L[1];
@@ -319,14 +319,14 @@ class CudaBackend final : public RegistrationBackend {
     bool peak(const int s[3], int best[3]) override {
         const int* n = g_.n;
         // the transform may overwrite its input: a copy of the cross spectrum
-        HELIREC_CUDA_CHECK(cudaMemcpy(cs_.data(), c_.data(), g_.NC * sizeof(cufftComplex), cudaMemcpyDeviceToDevice));
+        VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpy(cs_.data(), c_.data(), g_.NC * sizeof(cufftComplex), cudaMemcpyDeviceToDevice));
         cufft_check(cufftExecC2R(inverse_, cs_.data(), r_.data()), "cufftExecC2R");
         const int w0 = 2 * s[0] + 1, w1 = 2 * s[1] + 1, w2 = 2 * s[2] + 1;
         const std::size_t total = static_cast<std::size_t>(w0) * w1 * w2;
         window_.ensure(total);
         host_window_.resize(total);
         gather_kernel<<<grid_for(total), kBlock>>>(r_.data(), n[0], n[1], n[2], s[0], s[1], s[2], window_.data());
-        HELIREC_CUDA_CHECK(cudaMemcpy(host_window_.data(), window_.data(), total * sizeof(float), cudaMemcpyDeviceToHost));
+        VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpy(host_window_.data(), window_.data(), total * sizeof(float), cudaMemcpyDeviceToHost));
         float top = -INFINITY;
         best[0] = best[1] = best[2] = 0;
         std::size_t idx = 0;
@@ -351,7 +351,7 @@ class CudaBackend final : public RegistrationBackend {
         correlation_kernel<<<cuda::grid_1d(lines, 64), 64>>>(c_.data(), n[0], n[1], n[2], g_.nc, e0_.data(), e1_.data(), e2_.data(), partial_.data());
         evaluation_sum_kernel<<<10,256>>>(partial_.data(),lines,10,evaluation_.data());
         double s[10];
-        HELIREC_CUDA_CHECK(cudaMemcpy(s,evaluation_.data(),sizeof(s),cudaMemcpyDeviceToHost));
+        VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpy(s,evaluation_.data(),sizeof(s),cudaMemcpyDeviceToHost));
         value = s[0];
         g[0] = s[1], g[1] = s[2], g[2] = s[3];
         H[0][0] = s[4], H[0][1] = H[1][0] = s[5], H[0][2] = H[2][0] = s[6], H[1][1] = s[7], H[1][2] = H[2][1] = s[8], H[2][2] = s[9];
@@ -383,7 +383,7 @@ class CudaBackend final : public RegistrationBackend {
     double sum_partial(int lines) {
         evaluation_sum_kernel<<<1,256>>>(partial_.data(),lines,1,evaluation_.data());
         double e;
-        HELIREC_CUDA_CHECK(cudaMemcpy(&e,evaluation_.data(),sizeof(e),cudaMemcpyDeviceToHost));
+        VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpy(&e,evaluation_.data(),sizeof(e),cudaMemcpyDeviceToHost));
         return e;
     }
 
@@ -392,9 +392,9 @@ class CudaBackend final : public RegistrationBackend {
         e0_.ensure(d0.size());
         e1_.ensure(d1.size());
         e2_.ensure(d2.size());
-        HELIREC_CUDA_CHECK(cudaMemcpy(e0_.data(), d0.data(), d0.size() * sizeof(cufftDoubleComplex), cudaMemcpyHostToDevice));
-        HELIREC_CUDA_CHECK(cudaMemcpy(e1_.data(), d1.data(), d1.size() * sizeof(cufftDoubleComplex), cudaMemcpyHostToDevice));
-        HELIREC_CUDA_CHECK(cudaMemcpy(e2_.data(), d2.data(), d2.size() * sizeof(cufftDoubleComplex), cudaMemcpyHostToDevice));
+        VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpy(e0_.data(), d0.data(), d0.size() * sizeof(cufftDoubleComplex), cudaMemcpyHostToDevice));
+        VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpy(e1_.data(), d1.data(), d1.size() * sizeof(cufftDoubleComplex), cudaMemcpyHostToDevice));
+        VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpy(e2_.data(), d2.data(), d2.size() * sizeof(cufftDoubleComplex), cudaMemcpyHostToDevice));
     }
 
     RegistrationGeometry g_;
@@ -416,4 +416,4 @@ std::unique_ptr<RegistrationBackend> make_cuda_registration(const RegistrationGe
     return std::make_unique<CudaBackend>(geom, opt, weights);
 }
 
-}  // namespace helirec::calibration
+}  // namespace vc_tomography::calibration

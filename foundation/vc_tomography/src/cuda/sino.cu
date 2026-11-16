@@ -5,7 +5,7 @@
 #include "common/sino_core.hpp"
 #include "cuda_utils.cuh"
 
-namespace helirec::cuda {
+namespace vc_tomography::cuda {
 
 namespace {
 
@@ -177,7 +177,7 @@ std::vector<char> nonempty_rows(const float* W, int n_proj, int n_rows, int n_co
     const size_t plane = static_cast<size_t>(n_rows) * n_cols;
     DeviceBuffer<char> d_ne(n_proj);
     nonempty_kernel<<<n_proj, 256, 0, s>>>(W, plane, static_cast<size_t>(n_rows / 2) * n_cols, n_cols, n_proj, d_ne.data());
-    HELIREC_CUDA_CHECK(cudaGetLastError());
+    VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
     std::vector<char> nonempty(n_proj);
     d_ne.download(nonempty.data(), s);
     return nonempty;
@@ -209,11 +209,11 @@ void fill_holes(float* X, const std::vector<std::pair<int, int>>& holes, int n_p
     for (auto [a, e] : holes) {
         const int left = (a + n_proj - 1) % n_proj, right = e % n_proj;
         average_planes_kernel<<<grid_for(plane), 256, 0, s>>>(X + left * plane, X + right * plane, f.data(), plane);
-        HELIREC_CUDA_CHECK(cudaGetLastError());
+        VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
         for (int idx = a; idx < e; ++idx)
-            HELIREC_CUDA_CHECK(cudaMemcpyAsync(X + (idx % n_proj) * plane, f.data(), plane * sizeof(float), cudaMemcpyDeviceToDevice, s));
+            VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpyAsync(X + (idx % n_proj) * plane, f.data(), plane * sizeof(float), cudaMemcpyDeviceToDevice, s));
     }
-    HELIREC_CUDA_CHECK(cudaStreamSynchronize(s));
+    VC_TOMOGRAPHY_CUDA_CHECK(cudaStreamSynchronize(s));
 }
 
 void balance_weights(float* W, int n_proj, int n_rows, int n_cols, float rot_center, bool legacy, void* stream) {
@@ -253,14 +253,14 @@ void balance_with_table(float* W, int n_proj, int n_rows, int n_cols, const std:
     DeviceBuffer<float> Wsrc(static_cast<size_t>(n_proj) * n_cols);
     for (int row = 0; row < n_rows; ++row) {
         const size_t row_off = static_cast<size_t>(row) * n_cols;
-        HELIREC_CUDA_CHECK(cudaMemcpy2DAsync(Wsrc.data(), n_cols * sizeof(float), W + row_off, plane * sizeof(float),
+        VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpy2DAsync(Wsrc.data(), n_cols * sizeof(float), W + row_off, plane * sizeof(float),
                                              n_cols * sizeof(float), n_proj, cudaMemcpyDeviceToDevice, s));
         dim3 grid((n_cols + 255) / 256, n_proj);
         rebalance_row_kernel<<<grid, 256, 0, s>>>(Wsrc.data(), W, plane, row_off, n_proj, n_cols, d_tab.data(),
                                                   d_cnt.data(), d_osrc.data(), d_ow.data());
-        HELIREC_CUDA_CHECK(cudaGetLastError());
+        VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
     }
-    HELIREC_CUDA_CHECK(cudaStreamSynchronize(s));
+    VC_TOMOGRAPHY_CUDA_CHECK(cudaStreamSynchronize(s));
 }
 }  // namespace
 
@@ -271,7 +271,7 @@ TurnHoles turn_holes(const float* W, int n_proj, int n_rows, int n_cols, int tur
     const size_t plane = static_cast<size_t>(n_rows) * n_cols;
     DeviceBuffer<float> d_peak(n_proj);
     peak_kernel<<<n_proj, 256, 0, s>>>(W, plane, static_cast<size_t>(n_rows / 2) * n_cols, n_cols, n_proj, d_peak.data());
-    HELIREC_CUDA_CHECK(cudaGetLastError());
+    VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
     std::vector<float> peak(n_proj);
     d_peak.download(peak.data(), s);
     return rebalance_core::turn_holes_from(peak, turn);
@@ -283,7 +283,7 @@ void fill_turn_holes(float* X, const TurnHoles& holes, int n_rows, int n_cols, v
     for (size_t h = 0; h < holes.dst.size(); ++h) {
         average_planes_kernel<<<grid_for(plane), 256, 0, s>>>(X + holes.left[h] * plane, X + holes.right[h] * plane,
                                                               X + holes.dst[h] * plane, plane);
-        HELIREC_CUDA_CHECK(cudaGetLastError());
+        VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
     }
 }
 
@@ -291,7 +291,7 @@ void fill_from_turns(float* R, const float* W, int n_proj, int n_rows, int n_col
     check_turns(n_proj, turn);
     const size_t plane = static_cast<size_t>(n_rows) * n_cols;
     fill_from_turns_kernel<<<grid_for(static_cast<size_t>(n_proj) * plane), 256, 0, as_stream(stream)>>>(R, W, plane, n_proj, turn);
-    HELIREC_CUDA_CHECK(cudaGetLastError());
+    VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
 }
 
 void balance_weights_turns(float* W, int n_proj, int n_rows, int n_cols, int turn, float rot_center, void* stream) {
@@ -321,27 +321,27 @@ int rebalance(float* R, float* W, int n_proj, int n_rows, int n_cols, float rot_
 
 void minus_log(float* x, std::size_t n, float lo, float hi, void* stream) {
     minus_log_kernel<<<grid_for(n), 256, 0, as_stream(stream)>>>(x, n, lo, hi);
-    HELIREC_CUDA_CHECK(cudaGetLastError());
+    VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
 }
 
 void multiply(float* x, const float* w, std::size_t n, void* stream) {
     multiply_kernel<<<grid_for(n), 256, 0, as_stream(stream)>>>(x, w, n);
-    HELIREC_CUDA_CHECK(cudaGetLastError());
+    VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
 }
 
 void add_scaled(float* x, const float* y, float s, std::size_t n, void* stream) {
     add_scaled_kernel<<<grid_for(n), 256, 0, as_stream(stream)>>>(x, y, s, n);
-    HELIREC_CUDA_CHECK(cudaGetLastError());
+    VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
 }
 
 void weight_difference(const float* x, const float* w, const float* w2, float* t, std::size_t n, void* stream) {
     weight_difference_kernel<<<grid_for(n), 256, 0, as_stream(stream)>>>(x, w, w2, t, n);
-    HELIREC_CUDA_CHECK(cudaGetLastError());
+    VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
 }
 
 void multiply_add(float* x, const float* w, const float* t, std::size_t n, void* stream) {
     multiply_add_kernel<<<grid_for(n), 256, 0, as_stream(stream)>>>(x, w, t, n);
-    HELIREC_CUDA_CHECK(cudaGetLastError());
+    VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
 }
 
 void angular_fir(const float* in, float* out, int n_proj, int n_cols, const float* g, int radius, const float* support,
@@ -351,8 +351,8 @@ void angular_fir(const float* in, float* out, int n_proj, int n_cols, const floa
     DeviceBuffer<float> d_g;
     d_g.upload(g, static_cast<std::size_t>(radius) + 1, s);
     angular_fir_kernel<<<grid_for(static_cast<size_t>(n_proj) * n_cols), 256, 0, s>>>(in, out, n_proj, n_cols, d_g.data(), radius, support);
-    HELIREC_CUDA_CHECK(cudaGetLastError());
-    HELIREC_CUDA_CHECK(cudaStreamSynchronize(s));  // d_g is freed on return
+    VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
+    VC_TOMOGRAPHY_CUDA_CHECK(cudaStreamSynchronize(s));  // d_g is freed on return
 }
 
 void ramp_pad(const float* sino, float* padded, const RampGeometry& g, void* stream, const int32_t* opposite) {
@@ -360,14 +360,14 @@ void ramp_pad(const float* sino, float* padded, const RampGeometry& g, void* str
     thread_local DeviceBuffer<float> adj;  // reused: no allocation / synchronisation per call
     adj.ensure(g.n_proj);
     ramp_adj_kernel<<<g.n_proj, 32, 0, s>>>(sino, adj.data(), g, opposite);
-    HELIREC_CUDA_CHECK(cudaGetLastError());
+    VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
     ramp_pad_kernel<<<grid_for(static_cast<size_t>(g.n_proj) * g.npad), 256, 0, s>>>(sino, adj.data(), padded, g, opposite);
-    HELIREC_CUDA_CHECK(cudaGetLastError());
+    VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
 }
 
 void ramp_crop(const float* padded, float* out, const RampGeometry& g, void* stream) {
     ramp_crop_kernel<<<grid_for(static_cast<size_t>(g.n_proj) * g.n_bins), 256, 0, as_stream(stream)>>>(padded, out, g);
-    HELIREC_CUDA_CHECK(cudaGetLastError());
+    VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
 }
 
-}  // namespace helirec::cuda
+}  // namespace vc_tomography::cuda

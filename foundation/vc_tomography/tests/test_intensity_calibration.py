@@ -1,12 +1,12 @@
-"""helirec::calibration::calibrate_intensity (helirec/calibration/intensity.hpp) through its bindings, on a pair of
+"""vc_tomography::calibration::calibrate_intensity (vc_tomography/calibration/intensity.hpp) through its bindings, on a pair of
 small synthetic BLISS scans (tests/test_scan.py writes them): the reduction against nx2etf's arithmetic, the merged
-frame, the caches (helirec's array files) and what invalidates them."""
+frame, the caches (vc_tomography's array files) and what invalidates them."""
 import json
 
 import numpy as np
 import pytest
 
-from helirec import _core, bliss, calibration
+from vc_tomography import _core, bliss, calibration
 
 h5py = pytest.importorskip("h5py")
 from test_scan import COLS, ENTRIES, ROWS, _expected_current, _write_scan  # noqa: E402

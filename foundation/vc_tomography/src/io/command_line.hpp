@@ -1,5 +1,5 @@
 #pragma once
-// The command lines of helirec's tools: options named as Python's argparse names them (--name, dashes or underscores),
+// The command lines of vc_tomography's tools: options named as Python's argparse names them (--name, dashes or underscores),
 // typed values, a positional argument, and a --config JSON file of options that the command line overrides.
 #include <algorithm>
 #include <cctype>
@@ -12,7 +12,7 @@
 
 #include "io/json.hpp"
 
-namespace helirec::command_line {
+namespace vc_tomography::command_line {
 
 // a reason to stop with a message ("help": print the usage)
 struct Exit {
@@ -190,4 +190,4 @@ struct Args {
     }
 };
 
-}  // namespace helirec::command_line
+}  // namespace vc_tomography::command_line

@@ -1,22 +1,22 @@
-"""A block of slices reconstructed with helirec, as the .npz the denoiser trains on and is tried on (noise2inverse.py).
+"""A block of slices reconstructed with vc_tomography, as the .npz the denoiser trains on and is tried on (noise2inverse.py).
 
     python reconstruct_block.py DATA --cache DIR --geometry CAL.json --out FILE.npz --heights H0 H1 --roi X0 X1 Y0 Y1
                                 [--filters CHAIN] [--backprojector SPEC] [--set KEY=VALUE ..] [--subsets NAME=I/N ..]
                                 [--info]
 
-Run with helirec's environment. The file holds one volume (float32, per cm) per subset of the angles, by default
+Run with vc_tomography's environment. The file holds one volume (float32, per cm) per subset of the angles, by default
 `full` (every projection), `even` and `odd` (every second one), with `heights`, `roi`, `filters` and `backprojector`.
 
 Two ways to a training pair, the same sample with independent noise:
 
     - `even` and `odd` of one file (Noise2Inverse as published). Each leaves out every second angle; on a scan with
       too few angles what that leaves in a slice has opposite signs in the two, and the network learns to remove it.
-    - two runs with helirec's `noise_split` (README, "Slices and volumes"), each from every angle:
+    - two runs with vc_tomography's `noise_split` (README, "Slices and volumes"), each from every angle:
           --subsets full=0/1 --set noise_split=A,gain=..,floor=..,smooth=..,flats=..
       once with the scale a and once with -1 / a. This is the way the trained networks were made.
 
 Every parameter that decides the picture is pinned here (`pinned_params`), so that a block does not change with
-helirec's defaults; --set changes or adds one.
+vc_tomography's defaults; --set changes or adds one.
 """
 import argparse
 import sys
@@ -39,7 +39,7 @@ def value(text):
 
 
 def pinned_params(geometry, filters="none", backprojector="fbp", sets=()):
-    """helirec's parameters of a block or a volume: the pinned ones, then `sets` (KEY=VALUE ..) over them"""
+    """vc_tomography's parameters of a block or a volume: the pinned ones, then `sets` (KEY=VALUE ..) over them"""
     pinned = dict(geometry=str(Path(geometry).resolve()), sharpness_weighting="off", angle_interp="views", z_interp="lanczos8", x_interp="sinc",
                   backprojector=backprojector, filters=filters, luminosity_repartition=0.0, exposure_arc=0.0)
     for item in sets:
@@ -63,7 +63,7 @@ def main():
     ap.add_argument("--info", action="store_true")
     ap.add_argument("--device", default="cuda")
     a = ap.parse_args()
-    from helirec.recon import HelicalRecon
+    from vc_tomography.recon import HelicalRecon
     pinned = pinned_params(a.geometry, a.filters, a.backprojector, a.set)
     t = time.time()
     r = HelicalRecon(a.data, device=a.device, params=pinned, cache_dir=a.cache, log=lambda s: None)

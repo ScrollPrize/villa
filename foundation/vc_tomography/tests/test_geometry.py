@@ -1,10 +1,10 @@
-"""helirec.geometry: the pose of every frame, the reconstruction's terms and the merged frame from a calibration of
-the earlier two-scan step (a file with a motion stage, which helirec/geometry.hpp still reads; nothing writes one
+"""vc_tomography.geometry: the pose of every frame, the reconstruction's terms and the merged frame from a calibration of
+the earlier two-scan step (a file with a motion stage, which vc_tomography/geometry.hpp still reads; nothing writes one
 any more). tests/test_geometry_solve.py covers the step that makes calibrations now, and its file."""
 import numpy as np
 import pytest
 
-from helirec import geometry as G
+from vc_tomography import geometry as G
 
 
 def _synthetic_geometry(rng):

@@ -1,11 +1,11 @@
 // Port of nabuxx span_info.cpp / etfscan.cpp geometry (float/double choices kept).
-#include "helirec/helical.hpp"
+#include "vc_tomography/helical.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <tuple>
 
-namespace helirec {
+namespace vc_tomography {
 
 SpanInfo make_span_info(const ScanTrajectory& t, double tol_steps) {
     const int n = static_cast<int>(t.n());
@@ -296,4 +296,4 @@ ChunkScan prepare_chunk_scan(const ScanTrajectory& t, const SpanInfo& s, const s
     return c;
 }
 
-}  // namespace helirec
+}  // namespace vc_tomography

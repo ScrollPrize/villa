@@ -1,8 +1,8 @@
 #include <string>
 
-#include "helirec/fourier.hpp"
+#include "vc_tomography/fourier.hpp"
 
-namespace helirec {
+namespace vc_tomography {
 
 PadMode pad_mode_from_string(const std::string& s) {
     if (s == "zero" || s == "constant" || s == "zeros") return PadMode::Zero;
@@ -29,4 +29,4 @@ void validate(const FourierFilterSpec& s) {
         throw Error("FourierFilterSpec: filter_imag must be empty or match filter");
 }
 
-}  // namespace helirec
+}  // namespace vc_tomography

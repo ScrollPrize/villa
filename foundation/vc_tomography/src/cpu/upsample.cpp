@@ -11,10 +11,10 @@
 #include "common/detector_map_core.hpp"
 #include "common/interp_core.hpp"
 #include "common/sino_core.hpp"
-#include "helirec/filters.hpp"
-#include "helirec/sino.hpp"
+#include "vc_tomography/filters.hpp"
+#include "vc_tomography/sino.hpp"
 
-namespace helirec {
+namespace vc_tomography {
 
 int upsample_fft_length(int n) { return next_smooth_power(n + 64); }
 int shift_row_stride(int n) { return 2 * (upsample_fft_length(n) / 2 + 1); }
@@ -265,4 +265,4 @@ void bspline_prefilter(const float* in, float* out, int n_rows, int n, int degre
 }
 
 }  // namespace cpu
-}  // namespace helirec
+}  // namespace vc_tomography

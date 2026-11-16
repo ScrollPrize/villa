@@ -18,7 +18,7 @@
 #include "calibration/unwrap.hpp"
 #include "io/json.hpp"
 
-namespace helirec::calibration::nxtomo {
+namespace vc_tomography::calibration::nxtomo {
 
 namespace {
 
@@ -521,4 +521,4 @@ Scan open_scan(const std::string& master) {
     return scan;
 }
 
-}  // namespace helirec::calibration::nxtomo
+}  // namespace vc_tomography::calibration::nxtomo

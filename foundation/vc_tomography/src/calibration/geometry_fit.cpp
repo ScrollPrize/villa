@@ -1,4 +1,4 @@
-// The joint geometry model's solver (helirec/calibration/geometry_calibration.hpp): comparisons as pairs of
+// The joint geometry model's solver (vc_tomography/calibration/geometry_calibration.hpp): comparisons as pairs of
 // sightings, one Ceres problem with a block per owner, the refusal of dependent unknowns, and what is left.
 #include <ceres/dynamic_autodiff_cost_function.h>
 
@@ -9,10 +9,10 @@
 #include "calibration/ceres_support.hpp"
 #include "calibration/geometry_model.hpp"
 #include "calibration/util.hpp"
-#include "helirec/calibration/geometry_calibration.hpp"
+#include "vc_tomography/calibration/geometry_calibration.hpp"
 #include "io/json.hpp"
 
-namespace helirec::calibration::geometry_calibration {
+namespace vc_tomography::calibration::geometry_calibration {
 
 namespace {
 
@@ -787,4 +787,4 @@ std::string solution_json(const Acquisition& acq, const GeometrySolution& s) {
     return out.text();
 }
 
-}  // namespace helirec::calibration::geometry_calibration
+}  // namespace vc_tomography::calibration::geometry_calibration

@@ -4,7 +4,7 @@
 
 #include "hd_math.hpp"
 
-namespace helirec::output_core {
+namespace vc_tomography::output_core {
 
 // rint(clamp((v - lo) / range, 0, 1) * 255): every operation rounded once, ties to even; NaN -> 0
 HR_HD std::uint8_t window_u8(float v, float lo, float range) {
@@ -28,4 +28,4 @@ HR_HD bool outside_disk(int X, int Y, int n) {
 // elements, shifted by o: (v + o) / f, clamped to the mask.
 HR_HD int mask_index(int v, int o, int f, int n) { return hd::imin(hd::imax(v + o, 0) / f, n - 1); }
 
-}  // namespace helirec::output_core
+}  // namespace vc_tomography::output_core

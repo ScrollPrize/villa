@@ -31,7 +31,7 @@ import os
 
 import numpy as np
 
-from helirec import _core, bliss
+from vc_tomography import _core, bliss
 
 
 def tiles(a, t):

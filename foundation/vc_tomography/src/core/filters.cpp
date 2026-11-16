@@ -1,4 +1,4 @@
-#include "helirec/filters.hpp"
+#include "vc_tomography/filters.hpp"
 
 #include <fftw3.h>
 
@@ -14,7 +14,7 @@
 
 #include "../io/json.hpp"
 
-namespace helirec {
+namespace vc_tomography {
 
 namespace {
 
@@ -329,7 +329,7 @@ class Epr final : public ProjectionFilter {
         ep.max_shift = static_cast<float>(max_shift_);
         FourierFilter& f = paganin_for(H, W, device);
         if (device == Device::CPU) { cpu::epr_frames(frames, n, H, W, ep, f); return; }
-#ifdef HELIREC_WITH_CUDA
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
         cuda::epr_frames(frames, n, H, W, ep, f);
 #else
         throw Error("built without CUDA");
@@ -352,7 +352,7 @@ class Epr final : public ProjectionFilter {
         if (filters_.size() >= 4) filters_.erase(filters_.begin());  // e.g. full chunks + the last one
         const FourierFilterSpec spec = fourier_step_spec({&pag_}, H, W, pag_.own_margin());
         Entry e{H, W, device, nullptr};
-#ifdef HELIREC_WITH_CUDA
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
         if (device == Device::CUDA) e.f = cuda::make_fourier_filter(spec);
         else
 #endif
@@ -732,7 +732,7 @@ class Median final : public ProjectionFilter {
     int margin_rows() const override { return r_; }
     void apply(float* frames, int n, int H, int W, Device device) override {
         if (device == Device::CPU) { cpu::median_frames(frames, n, H, W, r_); return; }
-#ifdef HELIREC_WITH_CUDA
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
         cuda::median_frames(frames, n, H, W, r_);
 #else
         throw Error("built without CUDA");
@@ -865,4 +865,4 @@ std::string FilterPipeline::describe() const {
     return o.str();
 }
 
-}  // namespace helirec
+}  // namespace vc_tomography

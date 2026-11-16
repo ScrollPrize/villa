@@ -8,15 +8,15 @@
 #include <utility>
 #include <vector>
 
-#include "helirec/common.hpp"
+#include "vc_tomography/common.hpp"
 
-namespace helirec::cuda {
+namespace vc_tomography::cuda {
 
 inline void check(cudaError_t e, const char* what) {
     if (e != cudaSuccess)
         throw Error(std::string("CUDA error in ") + what + ": " + cudaGetErrorString(e));
 }
-#define HELIREC_CUDA_CHECK(x) ::helirec::cuda::check((x), #x)
+#define VC_TOMOGRAPHY_CUDA_CHECK(x) ::vc_tomography::cuda::check((x), #x)
 
 inline cudaStream_t as_stream(void* s) { return static_cast<cudaStream_t>(s); }
 
@@ -38,7 +38,7 @@ class DeviceBuffer {
     void resize(std::size_t n) {
         if (n == n_) return;
         reset();
-        if (n) HELIREC_CUDA_CHECK(cudaMalloc(&ptr_, n * sizeof(T)));
+        if (n) VC_TOMOGRAPHY_CUDA_CHECK(cudaMalloc(&ptr_, n * sizeof(T)));
         n_ = n;
     }
     // grow-only: keeps the allocation when it is large enough (size() is then the capacity)
@@ -53,11 +53,11 @@ class DeviceBuffer {
     void upload(const T* host, std::size_t n, cudaStream_t s = nullptr) {
         resize(n);
         if (!n) return;  // (nothing to copy, and no memory to copy it to)
-        HELIREC_CUDA_CHECK(cudaMemcpyAsync(ptr_, host, n * sizeof(T), cudaMemcpyHostToDevice, s));
+        VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpyAsync(ptr_, host, n * sizeof(T), cudaMemcpyHostToDevice, s));
     }
     void download(T* host, cudaStream_t s = nullptr) const {
-        HELIREC_CUDA_CHECK(cudaMemcpyAsync(host, ptr_, n_ * sizeof(T), cudaMemcpyDeviceToHost, s));
-        HELIREC_CUDA_CHECK(cudaStreamSynchronize(s));
+        VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpyAsync(host, ptr_, n_ * sizeof(T), cudaMemcpyDeviceToHost, s));
+        VC_TOMOGRAPHY_CUDA_CHECK(cudaStreamSynchronize(s));
     }
     T* data() { return ptr_; }
     const T* data() const { return ptr_; }
@@ -96,7 +96,7 @@ class PinnedPool {
             }
         }
         void* p = nullptr;
-        HELIREC_CUDA_CHECK(cudaHostAlloc(&p, bytes, cudaHostAllocDefault));
+        VC_TOMOGRAPHY_CUDA_CHECK(cudaHostAlloc(&p, bytes, cudaHostAllocDefault));
         got = bytes;
         return p;
     }
@@ -169,7 +169,7 @@ class PinnedBuffer {
 template <class T>
 const T* download_block(const T* src, std::size_t src_pitch, std::size_t width, std::size_t rows, PinnedBuffer<T>& stage) {
     stage.ensure(width * rows);
-    HELIREC_CUDA_CHECK(cudaMemcpy2D(stage.data(), width * sizeof(T), src, src_pitch * sizeof(T), width * sizeof(T), rows,
+    VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpy2D(stage.data(), width * sizeof(T), src, src_pitch * sizeof(T), width * sizeof(T), rows,
                                     cudaMemcpyDeviceToHost));
     return stage.data();
 }
@@ -203,15 +203,15 @@ void download_rows(T* dst, const T* src, std::size_t src_pitch, std::size_t widt
 // RAII stream
 class Stream {
   public:
-    Stream() { HELIREC_CUDA_CHECK(cudaStreamCreateWithFlags(&s_, cudaStreamNonBlocking)); }
+    Stream() { VC_TOMOGRAPHY_CUDA_CHECK(cudaStreamCreateWithFlags(&s_, cudaStreamNonBlocking)); }
     ~Stream() { if (s_) cudaStreamDestroy(s_); }
     Stream(const Stream&) = delete;
     Stream& operator=(const Stream&) = delete;
     cudaStream_t get() const { return s_; }
-    void sync() const { HELIREC_CUDA_CHECK(cudaStreamSynchronize(s_)); }
+    void sync() const { VC_TOMOGRAPHY_CUDA_CHECK(cudaStreamSynchronize(s_)); }
 
   private:
     cudaStream_t s_ = nullptr;
 };
 
-}  // namespace helirec::cuda
+}  // namespace vc_tomography::cuda

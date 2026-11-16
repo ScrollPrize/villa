@@ -6,9 +6,9 @@
 
 #include "calibration/util.hpp"
 #include "calibration/ceres_support.hpp"
-#include "helirec/calibration/record_checks.hpp"
+#include "vc_tomography/calibration/record_checks.hpp"
 
-namespace helirec::calibration {
+namespace vc_tomography::calibration {
 
 namespace {
 
@@ -665,4 +665,4 @@ void check_beam(const Record& rec, const Inventory& inv, const FlatField& ff, Re
     }
 }
 
-}  // namespace helirec::calibration
+}  // namespace vc_tomography::calibration

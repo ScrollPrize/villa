@@ -9,10 +9,10 @@
 #include <thread>
 
 #include "calibration/util.hpp"
-#include "helirec/calibration/intensity.hpp"
-#include "helirec/projection_store.hpp"
+#include "vc_tomography/calibration/intensity.hpp"
+#include "vc_tomography/projection_store.hpp"
 
-namespace helirec::calibration {
+namespace vc_tomography::calibration {
 
 namespace {
 
@@ -273,7 +273,7 @@ void fill(ViewMeasurement& res, const Measured& m, const Trajectory& ta) {
 
 namespace {
 
-// The record's frames as a projection store holds them (helirec/projection_store.hpp): the pieces of every
+// The record's frames as a projection store holds them (vc_tomography/projection_store.hpp): the pieces of every
 // stretch become the runs of frames the scan groups of `tile_group` hold of their files, each naming its group
 // where it named a file and the frame's index in it. What the store does not hold is not on disk.
 void frames_from_store(Record& rec, const std::string& tile_group) {
@@ -314,7 +314,7 @@ void frames_from_store(Record& rec, const std::string& tile_group) {
 }
 
 // The dark and the mean flat of a scan whose frames are a projection store's: its dark and flat groups hold float
-// images at the level, already taken through the frames' low-pass (helirec-projections-zarr), of which the means
+// images at the level, already taken through the frames' low-pass (vc_tomography_projections_zarr), of which the means
 // are formed. No statistics per series.
 FlatField store_flat_field(const Record& rec, int reduce, int rows, int cols) {
     FlatField ff;
@@ -591,4 +591,4 @@ MeasureTiming measure_timing(bool reset) {
     return out;
 }
 
-}  // namespace helirec::calibration
+}  // namespace vc_tomography::calibration

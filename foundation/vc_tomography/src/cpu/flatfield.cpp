@@ -1,9 +1,9 @@
 #include <algorithm>
 #include <cmath>
 
-#include "helirec/kernels.hpp"
+#include "vc_tomography/kernels.hpp"
 
-namespace helirec::cpu {
+namespace vc_tomography::cpu {
 
 void flatfield(const float* raw, const float* dark, const float* flat, float* out,
                std::size_t n_proj, std::size_t n_pix, const FlatFieldParams& p) {
@@ -17,4 +17,4 @@ void flatfield(const float* raw, const float* dark, const float* flat, float* ou
     }
 }
 
-}  // namespace helirec::cpu
+}  // namespace vc_tomography::cpu

@@ -1,5 +1,5 @@
 #include "calibration/correlation_peak.hpp"
-#include "helirec/calibration/registration.hpp"
+#include "vc_tomography/calibration/registration.hpp"
 
 #include <fftw3.h>
 #include <omp.h>
@@ -15,10 +15,10 @@
 
 #include "calibration/registration_core.hpp"
 #include "calibration/view_plan.hpp"
-#include "helirec/common.hpp"
-#include "helirec/fourier.hpp"  // fftw_planner_mutex(): the one lock around FFTW's planner
+#include "vc_tomography/common.hpp"
+#include "vc_tomography/fourier.hpp"  // fftw_planner_mutex(): the one lock around FFTW's planner
 
-namespace helirec::calibration {
+namespace vc_tomography::calibration {
 
 namespace {
 
@@ -339,7 +339,7 @@ struct Registrar::Impl {
     Impl(const int n[3], const int margin[3], const RegistrationOptions& o, Device dev) : geom(n, margin, o), opt(o), device(dev), weights(geom.NC) {
         geom.band_weights(opt, weights.data());
         if (dev == Device::CUDA) {
-#ifdef HELIREC_WITH_CUDA
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
             be = make_cuda_registration(geom, opt, weights.data());
 #else
             throw Error("register_blocks: built without CUDA");
@@ -673,4 +673,4 @@ bool registration_selftest(bool verbose, Device device) {
     return all;
 }
 
-}  // namespace helirec::calibration
+}  // namespace vc_tomography::calibration
