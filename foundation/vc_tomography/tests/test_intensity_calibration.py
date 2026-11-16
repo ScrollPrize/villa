@@ -11,7 +11,7 @@ from vc_tomography import _core, bliss, calibration
 h5py = pytest.importorskip("h5py")
 from test_scan import COLS, ENTRIES, ROWS, _expected_current, _write_scan  # noqa: E402
 
-LAYOUT = dict(cor_main_detector=3.25, vector=(1.0, -2.5), measured=dict(axis_first_scan=3.3, axis_second_scan=5.8, second_scan_rows=-0.97, quantum=0.25))
+LAYOUT = dict(cor_main_detector=3.25, vectors=[(1.0, -2.5)], measured=[(5.8, -0.97)], axis_first_scan=3.3, quantum=0.25)
 
 
 def _pair(tmp_path):
@@ -39,17 +39,17 @@ def test_calibrate_and_its_caches(tmp_path):
     main, comp = _pair(tmp_path)
     cache = tmp_path / "cache"
     lines = []
-    cal, arrays = calibration.calibrate(main, comp, LAYOUT, cache_dir=str(cache), log=lines.append)
+    cal, arrays = calibration.calibrate([main, comp], LAYOUT, cache_dir=str(cache), log=lines.append)
     assert cal.main == main.name and cal.companion == comp.name and cal.version == calibration.CALIBRATION_VERSION
-    pl, width, anchor = calibration.placement_from_vector(LAYOUT["vector"], COLS)
+    pl, width, anchor = calibration.placement_from_vectors(LAYOUT["vectors"], COLS)
     assert cal.rot_center == 3.25 + anchor == 5.75 and cal.merged_width == width == COLS + 3
     assert (cal.placement[main.name].shift_x, cal.placement[main.name].x_readjustment) == (pl[0].shift_x, pl[0].x_readjustment) == (2, -0.5)
     assert cal.placement[comp.name].z_readjustment == 1.0
     assert cal.detector_blur_field == [] and cal.details["detector_blur"]["reason"] == "4 flats in the first series"
     assert any("detector blur: not measured" in line for line in lines)
-    assert cal.details["layout"] == LAYOUT["measured"]
+    assert cal.details["layout"] == dict(axis_first_scan=3.3, axis_second_scan=5.8, second_scan_rows=-0.97, quantum=0.25)
     np.testing.assert_array_equal(arrays["weight_map"], calibration.weight_map([arrays["companion_flats"], arrays["main_flats"]]))
-    (aw_m, aw_c) = calibration.apodisation_widths(COLS, main.estimated_cor_from_motor_pix, LAYOUT["vector"][1])
+    (aw_m, aw_c) = calibration.apodisation_widths(COLS, main.estimated_cor_from_motor_pix, LAYOUT["vectors"][0][1])
     np.testing.assert_array_equal(arrays["main_weight"], arrays["weight_map"] * _core.apodisation_mask(COLS, aw_m[0], aw_m[1], 1e-8)[None, :])
 
     # the caches: an array file whose first line names its arrays, and calibration.json
@@ -65,14 +65,14 @@ def test_calibrate_and_its_caches(tmp_path):
     assert json.loads((cache / "calibration.json").read_text())["fingerprint"] == cal.fingerprint
 
     lines.clear()
-    again, arrays2 = calibration.calibrate(main, comp, LAYOUT, cache_dir=str(cache), log=lines.append)
+    again, arrays2 = calibration.calibrate([main, comp], LAYOUT, cache_dir=str(cache), log=lines.append)
     assert any("calibration loaded from" in line for line in lines) and not any("reducing" in line for line in lines)
     for k in arrays:
         np.testing.assert_array_equal(arrays2[k], arrays[k])
 
     # another merged frame keeps the cached reduction and blur, and places the scans anew
-    other = dict(LAYOUT, vector=(0.0, -3.0))
-    moved, _ = calibration.calibrate(main, comp, other, cache_dir=str(cache), log=lines.append)
+    other = dict(LAYOUT, vectors=[(0.0, -3.0)])
+    moved, _ = calibration.calibrate([main, comp], other, cache_dir=str(cache), log=lines.append)
     assert moved.vector == (0.0, -3.0) and moved.rot_center == 6.25
 
     # replaced data under the same name: another fingerprint, the caches are ignored and made again
@@ -82,7 +82,7 @@ def test_calibrate_and_its_caches(tmp_path):
     main = bliss.open_scan(main.master)
     assert calibration.acquisition_fingerprint(main, comp) != cal.fingerprint
     lines.clear()
-    calibration.calibrate(main, comp, LAYOUT, cache_dir=str(cache), log=lines.append)
+    calibration.calibrate([main, comp], LAYOUT, cache_dir=str(cache), log=lines.append)
     assert any("other acquisition / version, ignored" in line for line in lines) and any("reducing" in line for line in lines)
 
 

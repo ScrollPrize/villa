@@ -28,6 +28,6 @@ def test_files_of_the_two_scan_step_are_refused():
     old = dict(layout=dict(rows=200, cols=240, frames=[dict(rest1=10, helix=20, rest2=10)] * 2, row_sign=-1.0, coarse_move=70),
                row_time=dict(seconds_per_row=-2e-5, frame_period_s=0.033), poses=dict(motion={}))
     with pytest.raises((ValueError, RuntimeError), match="joint"):
-        G.frame_poses(old, [np.zeros(40)] * 2, [np.zeros(40)] * 2)
+        G.scan_poses(old, [np.zeros(40)] * 2, [np.zeros(40)] * 2)
     with pytest.raises((ValueError, RuntimeError), match="joint"):
         G.rolling_shutter_of(old)

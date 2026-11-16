@@ -111,10 +111,13 @@ class Calibration {
     // Of a joint calibration of scans without a helix (circular scans): the first scan's first stretch.
     std::array<std::size_t, 2> helix_frames() const;
 
-    // The poses of the two scans of a calibration of a pair. angles_deg[s], heights_rows[s]: the record's angle
-    // (unwrapped) and height (rows: row_sign x height / pixel) of every frame of scan s, the stretches one after the
-    // other. not_applied: receives, as JSON, what the model leaves and the poses do not hold. It is an error if the
-    // calibration does not place every frame given.
+    // ---- the scans that share their place on the rotation stage, merged
+    std::size_t scan_count() const;
+    // The poses of every scan, one entry per scan in the calibration's order (the first: the one with the rotation
+    // axis in its field). angles_deg[s], heights_rows[s]: the record's angle (unwrapped) and height (rows: row_sign x
+    // height / pixel) of every frame of scan s, the stretches one after the other. not_applied: receives, as JSON,
+    // what the model leaves and the poses do not hold. The frames of stretches the calibration does not hold (they
+    // were not on disk) stay at zero: frames_placed says which it holds.
     //
     // The poses are the joint model's, frame by frame (th and H the record's angle and height):
     //     row         height + the stretch's height + (1 + axial_scale) H + the stage's lift once per turn - roll d . n(th)
@@ -134,15 +137,6 @@ class Calibration {
     //                 rows are read). A timing that counts the rows from the middle to both ends is held for
     //                 scans that do not travel while a frame is read (circular scans); with a travel it is an
     //                 error (the rows would be scaled about the middle row in two senses, which poses do not hold)
-    std::array<Poses, 2> frame_poses(const std::array<std::vector<double>, 2>& angles_deg,
-                                     const std::array<std::vector<double>, 2>& heights_rows,
-                                     std::string* not_applied = nullptr) const;
-
-    // ---- a joint calibration of any number of scans that share their place on the rotation stage, merged
-    std::size_t scan_count() const;
-    // The poses of every scan of a joint calibration, as frame_poses gives a pair's: one entry per scan, in the
-    // calibration's order (the first: the one with the rotation axis in its field). The frames of stretches the
-    // calibration does not hold (they were not on disk) stay at zero: frames_placed says which it holds.
     std::vector<Poses> scan_poses(const std::vector<std::vector<double>>& angles_deg, const std::vector<std::vector<double>>& heights_rows,
                                   std::string* not_applied = nullptr) const;
     // The frames of a scan the calibration was made on, among the scan's projection frames: [first, end) of each
@@ -156,7 +150,7 @@ class Calibration {
     // projection frames: [first, end)
     std::array<std::size_t, 2> frames_on_disk(std::size_t scan) const;
     double axis_column(std::size_t scan) const;  // at the middle row, at the middle of the helix' frames on disk
-    // The scan's poses in its own frame: as frame_poses' of a joint calibration with the scan's place d and its
+    // The scan's poses in its own frame: as scan_poses' with the scan's place d and its
     // height left out, so that u counts from the scan's own rotation axis and the slice h is the model's height z
     // of the sample as this scan holds it (z of the sample + the scan's height). What a scan alone reconstructs
     // depends on its own parameters only (axis column and its slope, axial scale, the roll, the stage's motion,
@@ -166,13 +160,10 @@ class Calibration {
     // calibration does not hold stay at zero.
     Poses own_poses(std::size_t scan, const std::vector<double>& angles_deg, const std::vector<double>& heights_rows) const;
 
-    // The medians over the helix of the axis' column in each scan and of the second scan's rows against the
-    // first's at equal frames. The frame is a nominal one: every projection's own axis and row are in its terms,
-    // which are counted from it, so the rounding moves nothing; it fixes the slices' grid.
-    MergedLayout merged_layout(const std::array<Poses, 2>& poses, const std::array<std::vector<double>, 2>& heights_rows,
-                               double quantum = 0.25) const;
-    // The same of any number of scans (scan_poses): the medians over the frames of the first scan's helix the
-    // calibration was made on. first_frame[s]: the first frame of scan s the reconstruction is given, from which
+    // The frame the scans are merged in (scan_poses): the medians over the frames of the first scan's helix the
+    // calibration was made on of the axis' column in each scan and of every other scan's rows against the first's at
+    // equal frames. The frame is a nominal one: every projection's own axis and row are in its terms, which are
+    // counted from it, so the rounding moves nothing; it fixes the slices' grid. first_frame[s]: the first frame of scan s the reconstruction is given, from which
     // its record's heights count there (none: every scan's first). Scans without a helix (circular scans, which may
     // differ by a frame) are each placed by the medians over their own frames: a scan at another height has its
     // rows in its vector (a grid's second row lies a row's step from the first).

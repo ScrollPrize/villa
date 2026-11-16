@@ -26,9 +26,9 @@ What it finds, in this order:
   report   what the solution leaves of each scan's opposite views and what that says (report), and which scans
            overlap (neighbours).
 
-The step writes what it found; the reconstruction (recon.py) takes its geometry from that alone: frame_poses,
+The step writes what it found; the reconstruction (recon.py) takes its geometry from that alone: scan_poses,
 reconstruction_terms and merged_layout turn the result into the pose of every frame, the reconstruction's terms
-per projection and the frame the two scans are merged in. The step uses vc_tomography::calibration's session (raw
+per projection and the frame the scans are merged in. The step uses vc_tomography::calibration's session (raw
 frames, the scan's own dark and mean flat, the registration) and nothing of the reconstruction's intensity
 calibration (calibration.py).
 """
@@ -326,12 +326,14 @@ def to_stored_pixels(acquisition_, parameters, rows, cols, f):
 
 # ---------------------------------------------------------------- the pose of every frame
 
-def frame_poses(cal, angles_deg, heights_rows):
-    """Where every frame of the two scans of a pair holds the sample, from the step's result `cal` (a joint
-    calibration; files of the earlier two-scan step, with a motion stage, are refused).
+def scan_poses(cal, angles_deg, heights_rows):
+    """Where every frame of the scans of the step's result `cal` holds the sample (scans that share their place on
+    the rotation stage: the scan with the rotation axis in its field, and the scans moved sideways beside it): one
+    dict per scan, in the calibration's order, and (dict) what the model leaves. Frames of stretches the calibration
+    was made without (they were not on disk) stay at zero; frames_placed says which frames it holds.
 
     angles_deg[s], heights_rows[s]: the record's angle (unwrapped) and height (rows: the layout's row_sign x height
-    / pixel) of every frame of scan s, the stretches one after the other (rest1, helix, rest2).
+    / pixel) of every frame of scan s, the stretches one after the other.
 
     Returns per scan a dict of arrays with one value per frame. The ray at u columns from the rotation axis (towards
     higher columns) in the slice at height h (rows) is recorded by frame k at the position (X, Y) of the scan's grid,
@@ -343,23 +345,8 @@ def frame_poses(cal, angles_deg, heights_rows):
     The step's poses are its model's, frame by frame (vc_tomography/geometry.hpp lists them): the row from the scan's
     height, its stretch's, the axial scale and the stage's lift once per turn; the axis from the scan's axis
     column, its slope along the travel, the stage's move twice per turn and the scan's place; the slopes from the
-    roll; the rows' timing in angle_deg_per_row and row_scale. What the solve left is under "not_applied"."""
-    from . import _core
-    C = _core.GeometryCalibration(_text(cal))          # vc_tomography::geometry::Calibration::frame_poses
-    ang = [np.ascontiguousarray(a_, np.float64) for a_ in angles_deg]
-    H = [np.ascontiguousarray(h_, np.float64) for h_ in heights_rows]
-    try:
-        poses, not_applied = C.frame_poses(ang[0], ang[1], H[0], H[1])
-    except RuntimeError as e:
-        raise ValueError(str(e)) from None
-    return poses, json.loads(not_applied)
-
-
-def scan_poses(cal, angles_deg, heights_rows):
-    """frame_poses of a joint calibration of any number of scans that share their place on the rotation stage (the
-    scan with the rotation axis in its field, and the scans moved sideways beside it): one dict per scan, in the
-    calibration's order. Frames of stretches the calibration was made without (they were not on disk) stay at zero;
-    frames_placed says which frames it holds. (vc_tomography::geometry::Calibration::scan_poses)"""
+    roll; the rows' timing in angle_deg_per_row and row_scale. What the solve left is under "not_applied".
+    (vc_tomography::geometry::Calibration::scan_poses)"""
     from . import _core
     try:
         poses, not_applied = _core.GeometryCalibration(_text(cal)).scan_poses([np.asarray(a_, np.float64).tolist() for a_ in angles_deg],
@@ -377,7 +364,7 @@ def frames_placed(cal, scan):
 
 
 def reconstruction_terms(pose, heights_rows, layout, rot_center, column_offset, z_readjustment=0.0, row_origin=0.0):
-    """One scan's poses (frame_poses) as the reconstruction's per-projection terms (helical.hpp, ScanTrajectory).
+    """One scan's poses (scan_poses) as the reconstruction's per-projection terms (helical.hpp, ScanTrajectory).
 
     The reconstruction puts the merged column m at m - rot_center columns from the axis and at the scan's column
     m - column_offset, and the slice h at the row h - (z_pix[k] z_translation_scale + z_readjustment +
@@ -392,27 +379,22 @@ def reconstruction_terms(pose, heights_rows, layout, rot_center, column_offset, 
 
 
 def merged_layout(cal, poses, heights_rows, quantum=0.25, first_frame=None):
-    """The frame the two scans are merged in, from the poses (frame_poses): one rotation axis in the first scan's
-    columns and the second scan's place against the first, as the reconstruction lays its merged frame out
-    (calibration.placement_from_vector) -> dict(cor_main_detector, vector=(rows, columns), measured=...).
+    """The frame the scans are merged in, from their poses (scan_poses): one rotation axis in the first scan's columns
+    and every other scan's place against the first, as the reconstruction lays its merged frame out
+    (calibration.placement_from_vectors) -> dict(cor_main_detector, vectors=[(rows, columns) of every scan after the
+    first], measured=[(axis column, rows) of each, unrounded], axis_first_scan, quantum). first_frame: per scan, the
+    first frame the reconstruction is given, from which its record's heights count.
 
-    Of more scans than two (scan_poses), or with first_frame (per scan: the first frame the reconstruction is
-    given, from which its record's heights count): dict(cor_main_detector, vectors=[(rows, columns) of every scan
-    after the first], measured=[(axis column, rows) of each, unrounded], axis_first_scan, quantum), the medians
-    taken over the frames of the first scan's helix the calibration was made on.
-
-    They are the medians over the helix of the axis' column in each scan and of the second scan's rows against the
-    first's at equal frames, rounded to `quantum` pixels. The frame is a nominal one: every projection's own axis
-    and row are in its terms (reconstruction_terms), which are counted from this frame, so the rounding moves
-    nothing; it fixes the slices' grid, and it is what mode legacy_reference, which has no terms per projection,
-    places the scans by (one axis and one vector, on the grid the reference's searches had)."""
+    They are the medians over the frames of the first scan's helix the calibration was made on, of the axis' column
+    in each scan and of every other scan's rows against the first's at equal frames, rounded to `quantum` pixels. The
+    frame is a nominal one: every projection's own axis and row are in its terms (reconstruction_terms), which are
+    counted from this frame, so the rounding moves nothing; it fixes the slices' grid, and it is what mode
+    legacy_reference, which has no terms per projection, places the scans by (one axis and one vector, on the grid
+    the reference's searches had)."""
     from . import _core
     f = lambda x: np.ascontiguousarray(x, np.float64)
-    if len(poses) != 2 or first_frame is not None:
-        return _core.GeometryCalibration(_text(cal)).merged_layout_of([f(p["axis"]).tolist() for p in poses], [f(p["row"]).tolist() for p in poses],
-                                                                      [f(h).tolist() for h in heights_rows], [int(k) for k in (first_frame or [])], float(quantum))
-    return _core.GeometryCalibration(_text(cal)).merged_layout(f(poses[0]["axis"]), f(poses[0]["row"]), f(poses[1]["axis"]), f(poses[1]["row"]),
-                                                               f(heights_rows[0]), f(heights_rows[1]), float(quantum))
+    return _core.GeometryCalibration(_text(cal)).merged_layout([f(p["axis"]).tolist() for p in poses], [f(p["row"]).tolist() for p in poses],
+                                                               [f(h).tolist() for h in heights_rows], [int(k) for k in (first_frame or [])], float(quantum))
 
 
 def rolling_shutter_of(cal):

@@ -145,7 +145,6 @@ struct MergedPlacement {
     double anchor = 0;
 };
 MergedPlacement placement_from_vectors(const std::vector<std::array<double, 2>>& vectors, int cols);
-MergedPlacement placement_from_vector(const std::array<double, 2>& vector, int cols);  // a pair
 
 // The detector's blur field of a scan, from the noise of its first flat series (flat_noise_spectra, then
 // detector_blur_field_fit). It is kept (`field`) only if it explains the noise spectra (a residual below
@@ -238,7 +237,5 @@ struct IntensityCalibration {
 IntensityCalibration calibrate_intensity(const std::vector<const Scan*>& scans, const geometry::MergedLayout& layout, const std::string& cache_dir,
                                          const std::function<void(const std::string&)>& log = nullptr, bool progress = false,
                                          const std::string& projection_store = "", int reduce = 0);
-IntensityCalibration calibrate_intensity(const Scan& main, const Scan& companion, const geometry::MergedLayout& layout, const std::string& cache_dir,
-                                         const std::function<void(const std::string&)>& log = nullptr, bool progress = false);  // a pair
 
 }  // namespace vc_tomography::calibration

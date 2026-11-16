@@ -467,19 +467,6 @@ std::vector<std::array<std::size_t, 2>> Calibration::frames_placed(std::size_t s
     return runs;
 }
 
-std::array<Poses, 2> Calibration::frame_poses(const std::array<std::vector<double>, 2>& ang, const std::array<std::vector<double>, 2>& H,
-                                              std::string* not_applied) const {
-    const Json& solved = member(member(*doc_, "parameters", "the geometry"), "scans", "the parameters");
-    if (scan_count() != 2 || !solved.is(Json::Array) || solved.array.size() != 2)
-        throw Error("geometry: the calibration is not of two scans (the poses of a pair are read here; of any number of scans by scan_poses, and a mosaic's tiles one at a time, own_poses)");
-    std::vector<Poses> both = joint_poses(*doc_, rows(), {ang[0], ang[1]}, {H[0], H[1]}, true, not_applied);
-    return {std::move(both[0]), std::move(both[1])};
-}
-
-MergedLayout Calibration::merged_layout(const std::array<Poses, 2>& poses, const std::array<std::vector<double>, 2>& H, double quantum) const {
-    return merged_layout(std::vector<Poses>{poses[0], poses[1]}, std::vector<std::vector<double>>{H[0], H[1]}, {}, quantum);
-}
-
 MergedLayout Calibration::merged_layout(const std::vector<Poses>& poses, const std::vector<std::vector<double>>& H, const std::vector<std::size_t>& first_frame, double quantum) const {
     const Json& lay = member(*doc_, "layout", "the geometry");
     // the frames of the first scan's helix that were on disk

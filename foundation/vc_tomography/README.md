@@ -1175,7 +1175,7 @@ trusted; `--set luminosity_repartition=0` leaves it out.
 vc_tomography_reconstruct PROJ --heights 1200 1201 --format tiff --set geometry=geometry.json --set luminosity_repartition=0   # PROJ: the folder of <n>.nxs masters and their frame files
 ```
 
-Layouts the library's `calibrate_intensity` takes (`calibration.calibrate_scans` in Python): the main scan with the
+Layouts the library's `calibrate_intensity` takes (`calibration.calibrate` in Python): the main scan with the
 rotation axis in its right half and the other scans on its left (the reference's), or the axis in its left half and
 the other scans on its right (the same apodisation mirrored: Diamond I12); and, of circular scans, scans at the
 columns of one of those at another height (a grid), each apodised as the scan it stands above. Where slits light a
@@ -1194,12 +1194,12 @@ directory, which the reconstruction takes as its cache directory (`--cache_dir`)
 is of the same acquisition (the blur field does not depend on the merged frame and is kept when only that changes).
 
 ```bash
-vc_tomography_calibration intensity <main> <companion> --geometry geometry.json --out CACHE_DIR   # scan directories or masters
+vc_tomography_calibration intensity <main> <companion> [<more> ...] --geometry geometry.json --out CACHE_DIR   # scan directories or masters, the order of the geometry
 ```
 
 ```python
 from vc_tomography import calibration
-cal, arrays = calibration.calibrate(main, companion, layout, cache_dir="CACHE_DIR")   # layout: geometry.merged_layout(...)
+cal, arrays = calibration.calibrate([main, companion], layout, cache_dir="CACHE_DIR")   # layout: geometry.merged_layout(...)
 ```
 
 It is `vc_tomography::calibration::calibrate_intensity` (`vc_tomography/calibration/intensity.hpp`); the scans are
@@ -1534,7 +1534,7 @@ origin; `joint_scan_poses`), which `vc_tomography_calibration geometry` does not
 there), or `--set geometry=OUT/geometry.json` (`params["geometry"]`). Every
 projection is read on the grid of the calibration's detector map (the rows at the mapped row by the row
 kernel, the columns resampled exactly: `resample_rows`, a non-uniform transform of the interpolant the exact shift
-uses, within 1e-6 of the direct sum), at the pose `geometry.frame_poses` gives its frame, and at the angle of its
+uses, within 1e-6 of the direct sum), at the pose `geometry.scan_poses` gives its frame, and at the angle of its
 rows. `vc_tomography/geometry.hpp` reads a pair's calibration (a joint one: files of the earlier two-scan step are
 refused); the poses are the model's, frame by frame, and the slices are numbered from the first
 scan's row at its helix' first frame. The frame the two scans are merged in is laid out from the same poses (`geometry.merged_layout`: the medians

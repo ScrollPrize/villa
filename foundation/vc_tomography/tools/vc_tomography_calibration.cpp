@@ -5,12 +5,13 @@
 //                                    [--position-target PX] [--radius PX] [--device cpu|cuda|auto]
 //   vc_tomography_calibration geometry <scan.h5> [<more scans.h5> ...] --out FILE [--row-time-us US] [--rows-from-middle] [--order N | --radial-map] [--patch N] [--reduce N] [--projections STORE.zarr]
 //                                [--threads N] [--device cpu|cuda|auto]
-//   vc_tomography_calibration intensity <scan> <companion> --geometry FILE --out DIR [--no-progress]
+//   vc_tomography_calibration intensity <scan> <scan> [<more scans> ...] --geometry FILE --out DIR [--no-progress]
 //   vc_tomography_calibration selftest [--device cpu|cuda|auto]
 //
-// intensity makes the intensity calibration of a two-scan acquisition in the frame its geometry calibration (FILE,
+// intensity makes the intensity calibration of scans moved sideways (the scan with the rotation axis in its field
+// first) in the frame its geometry calibration (FILE,
 // made by `geometry`) merges the scans in: the darks and flats reduced, the weight maps, the detector's blur field
-// and the placement of both scans. It writes calibration_arrays.bin and calibration.json to DIR, which the
+// and every scan's placement. It writes calibration_arrays.bin and calibration.json to DIR, which the
 // reconstruction takes as its cache directory, and reuses what is there when it is of the same acquisition. The
 // scans: master files or scan directories, in the order the geometry calibration has them. It is
 // vc_tomography::calibration::calibrate_intensity (vc_tomography/calibration/intensity.hpp).
@@ -70,7 +71,7 @@ int usage() {
                  "                                   [--position-target PX (default 0.01)] [--radius PX] [--inventory-step N] [--device cpu|cuda|auto]\n"
                  "  vc_tomography_calibration geometry <scan.h5> [<more scans.h5> ...] --out FILE [--row-time-us US] [--rows-from-middle] [--order N | --radial-map] [--patch N] [--reduce N] [--projections STORE.zarr]\n"
                  "                               [--threads N] [--device cpu|cuda|auto]\n"
-                 "  vc_tomography_calibration intensity <scan> <companion> --geometry FILE --out DIR [--no-progress]\n"
+                 "  vc_tomography_calibration intensity <scan> <scan> [<more scans> ...] --geometry FILE --out DIR [--no-progress]\n"
                  "  vc_tomography_calibration selftest [--device cpu|cuda|auto]\n");
     return 2;
 }
@@ -111,20 +112,25 @@ int run_intensity_calibration(int argc, char** argv) {
     const std::vector<std::string> paths = a.texts("scans");
     const std::string geometry_path = a.text("geometry"), out = a.text("out");
     const bool progress = !a.flag("no_progress");
-    if (paths.size() != 2 || geometry_path.empty() || out.empty()) return usage();
+    if (paths.size() < 2 || geometry_path.empty() || out.empty()) return usage();
     const auto log = say;
-    const Scan main = open_scan(paths[0]), companion = open_scan(paths[1]);
+    std::vector<Scan> scans;
+    for (const std::string& path : paths) scans.push_back(open_scan(path));
     const geometry::Calibration geo = geometry::Calibration::load(geometry_path);
     const std::vector<std::string> made = geo.scans();
-    if (made.size() != 2 || base_name(made[0]) != base_name(main.master) || base_name(made[1]) != base_name(companion.master))
-        throw Error("the geometry calibration " + geometry_path + " was made from other scans (or in the other order)");
-    const std::array<std::vector<double>, 2> heights = {geo.heights_rows(main.z_translation_m, main.pixel_size_m),
-                                                        geo.heights_rows(companion.z_translation_m, companion.pixel_size_m)};
-    const auto poses = geo.frame_poses({main.unwrapped_angles_deg, companion.unwrapped_angles_deg}, heights);
-    const geometry::MergedLayout layout = geo.merged_layout(poses, heights);
-    const IntensityCalibration cal = calibrate_intensity(main, companion, layout, out, log, progress);
+    bool same = made.size() == scans.size();
+    for (std::size_t k = 0; same && k < scans.size(); ++k) same = base_name(made[k]) == base_name(scans[k].master);
+    if (!same) throw Error("the geometry calibration " + geometry_path + " was made from other scans (or in another order)");
+    std::vector<std::vector<double>> angles, heights;
+    std::vector<const Scan*> all;
+    for (const Scan& sc : scans) {
+        angles.push_back(sc.unwrapped_angles_deg);
+        heights.push_back(geo.heights_rows(sc.z_translation_m, sc.pixel_size_m));
+        all.push_back(&sc);
+    }
+    const geometry::MergedLayout layout = geo.merged_layout(geo.scan_poses(angles, heights), heights);
+    calibrate_intensity(all, layout, out, log, progress);
     std::printf("written to %s (calibration_arrays.bin, calibration.json)\n", out.c_str());
-    (void)cal;
     return 0;
 }
 

@@ -239,7 +239,6 @@ MergedPlacement placement_from_vectors(const std::vector<std::array<double, 2>>&
     return out;
 }
 
-MergedPlacement placement_from_vector(const std::array<double, 2>& vector, int cols) { return placement_from_vectors({vector}, cols); }
 
 // ---------------------------------------------------------------- the detector's blur
 
@@ -434,11 +433,6 @@ std::string IntensityCalibration::json() const {
     d.set("detector_blur_field", numbers(detector_blur.field));
     d.set("fingerprint", Json::of(fingerprint)).set("version", count(version));
     return d.text();
-}
-
-IntensityCalibration calibrate_intensity(const Scan& main, const Scan& companion, const geometry::MergedLayout& layout, const std::string& cache_dir, const Log& log,
-                                         bool progress) {
-    return calibrate_intensity(std::vector<const Scan*>{&main, &companion}, layout, cache_dir, log, progress);
 }
 
 IntensityCalibration calibrate_intensity(const std::vector<const Scan*>& scans, const geometry::MergedLayout& layout, const std::string& cache_dir_given, const Log& log,

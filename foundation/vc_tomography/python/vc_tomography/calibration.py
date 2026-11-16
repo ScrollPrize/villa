@@ -75,15 +75,10 @@ def apodisation_widths(n_cols, est_cor_main_offset, companion_dx, transition_wid
         raise NotImplementedError(str(e)) from None
 
 
-def placement_from_vector(vector, n_cols):
-    """nabuxx check_companion: outermost companion anchored at x = 0 of the merged frame -> ([main, companion]
-    ScanPlacement, merged width, anchor). (vc_tomography::calibration::placement_from_vector)"""
-    return _core.placement_from_vector(tuple(float(v) for v in vector), int(n_cols))
-
-
 def placement_from_vectors(vectors, n_cols):
-    """placement_from_vector of any number of scans: `vectors` holds (rows, columns) of every scan after the first,
-    from the first. (vc_tomography::calibration::placement_from_vectors)"""
+    """The placement of every scan in the merged frame (nabuxx check_companion for a pair): `vectors` holds (rows,
+    columns) of every scan after the first, from the first -> (ScanPlacements, merged width, anchor).
+    (vc_tomography::calibration::placement_from_vectors)"""
     return _core.placement_from_vectors([tuple(float(x) for x in v) for v in vectors], int(n_cols))
 
 
@@ -94,36 +89,23 @@ def acquisition_fingerprint(main, companion) -> str:
     return _core.acquisition_fingerprint(main, companion)
 
 
-def calibrate(main, companion, layout, cache_dir=None, log=print, progress=None):
-    """The intensity calibration from raw data, in the merged frame of `layout`. Returns (Calibration, arrays dict:
-    main_dark, main_flats, companion_dark, companion_flats, weight_map, main_weight, companion_weight).
-
-    layout: dict(cor_main_detector, vector = (dy, dx) main -> companion[, measured]): the rotation axis in the main
-    scan's columns and the companion's place against the main scan, from the geometry calibration
-    (geometry.merged_layout). The placement of both scans, the merged width, the axis in the merged frame and the
-    horizontal apodisation follow from it.
+def calibrate(scans, layout, cache_dir=None, log=print, progress=None, projection_store="", reduce=0):
+    """The intensity calibration of the scans, the main scan (the rotation axis in its field) first, in the merged
+    frame of `layout` (geometry.merged_layout: cor_main_detector, vectors = [(rows, columns), ..] from the main scan
+    to every scan after it, and what it measured). The other scans lie beside the main scan, all on one side of it,
+    or at the columns of one of those at another height (a grid of circular scans). Returns (Calibration, arrays
+    dict: main_*, companion_*, companion2_*, .., weight_map). Calibration.lit_rows: the rows the beam lights in
+    every scan, which the weights are cropped to.
     cache_dir: the darks / flats reduction and the detector's blur field are cached there, keyed by
     acquisition_fingerprint(); a cache of another acquisition or calibration version is ignored and replaced.
     progress: progress bars for the reduction (default: whenever the log is print).
     (vc_tomography::calibration::calibrate_intensity)"""
     if progress is None:
         progress = log is print
-    cal = _core.calibrate_intensity(main, companion, float(layout["cor_main_detector"]), tuple(float(v) for v in layout["vector"]),
-                                    dict(layout.get("measured") or {}), str(cache_dir or ""), log, bool(progress))
-    return cal, cal.arrays()
-
-
-def calibrate_scans(scans, layout, cache_dir=None, log=print, progress=None, projection_store="", reduce=0):
-    """The intensity calibration of any number of scans, the main scan (the rotation axis in its field) first, in
-    the merged frame of `layout`: dict(cor_main_detector, vectors = [(rows, columns), ..] from the main scan to every
-    scan after it (geometry.merged_layout)). The other scans lie beside the main scan, all on one side of it, or at
-    the columns of one of those at another height (a grid of circular scans). Returns (Calibration, arrays dict:
-    main_*, companion_*, companion2_*, .., weight_map). Calibration.lit_rows: the rows the beam lights in every scan,
-    which the weights are cropped to. (vc_tomography::calibration::calibrate_intensity)"""
-    if progress is None:
-        progress = log is print
-    cal = _core.calibrate_intensity_of_scans(list(scans), float(layout["cor_main_detector"]), [tuple(float(x) for x in v) for v in layout["vectors"]], str(cache_dir or ""), log,
-                                             bool(progress), str(projection_store), int(reduce))
+    cal = _core.calibrate_intensity(list(scans), float(layout["cor_main_detector"]), [tuple(float(x) for x in v) for v in layout["vectors"]],
+                                    str(cache_dir or ""), log, bool(progress), str(projection_store), int(reduce),
+                                    float(layout.get("axis_first_scan", 0.0)), [tuple(float(x) for x in v) for v in layout.get("measured") or []],
+                                    float(layout.get("quantum", 0.0)))
     return cal, cal.arrays()
 
 

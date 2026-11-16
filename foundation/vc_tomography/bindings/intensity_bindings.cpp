@@ -123,26 +123,9 @@ void bind_intensity(nb::module_& m) {
 
     m.def(
         "calibrate_intensity",
-        [](nb::handle main, nb::handle companion, double cor_main_detector, std::array<double, 2> vector, nb::dict measured, const std::string& cache_dir,
-           std::optional<std::function<void(const std::string&)>> log, bool progress) {
-            const calibration::Scan a = scan_of(main), b = scan_of(companion);
-            geometry::MergedLayout layout;
-            layout.cor_main_detector = cor_main_detector;
-            layout.vector = vector;
-            const auto get = [&](const char* k) { return measured.contains(k) ? nb::cast<double>(measured[k]) : 0.0; };
-            layout.axis_first_scan = get("axis_first_scan"), layout.axis_second_scan = get("axis_second_scan");
-            layout.second_scan_rows = get("second_scan_rows"), layout.quantum = get("quantum");
-            const auto say = python_log(log);
-            nb::gil_scoped_release nogil;
-            return calibration::calibrate_intensity(a, b, layout, cache_dir, say, progress);
-        },
-        "main"_a, "companion"_a, "cor_main_detector"_a, "vector"_a, "measured"_a = nb::dict(), "cache_dir"_a = "", "log"_a = nb::none(), "progress"_a = false,
-        "The intensity calibration of a scan pair in the merged frame of one axis (in the main scan's columns) and one vector (rows, columns) to the "
-        "companion; cache_dir: calibration_arrays.bin and calibration.json kept there. (vc_tomography::calibration::calibrate_intensity)");
-    m.def(
-        "calibrate_intensity_of_scans",
         [](const nb::list& scans, double cor_main_detector, const std::vector<std::array<double, 2>>& vectors, const std::string& cache_dir,
-           std::optional<std::function<void(const std::string&)>> log, bool progress, const std::string& projection_store, int reduce) {
+           std::optional<std::function<void(const std::string&)>> log, bool progress, const std::string& projection_store, int reduce,
+           double axis_first_scan, const std::vector<std::array<double, 2>>& measured, double quantum) {
             std::vector<calibration::Scan> held;
             for (nb::handle s : scans) held.push_back(scan_of(s));
             std::vector<const calibration::Scan*> all;
@@ -151,11 +134,15 @@ void bind_intensity(nb::module_& m) {
             layout.cor_main_detector = cor_main_detector;
             layout.vectors = vectors;
             if (!vectors.empty()) layout.vector = vectors[0];
+            // (what geometry's merged_layout measured, recorded in the calibration's file)
+            layout.axis_first_scan = axis_first_scan, layout.measured = measured, layout.quantum = quantum;
+            if (!measured.empty()) layout.axis_second_scan = measured[0][0], layout.second_scan_rows = measured[0][1];
             const auto say = python_log(log);
             nb::gil_scoped_release nogil;
             return calibration::calibrate_intensity(all, layout, cache_dir, say, progress, projection_store, reduce);
         },
         "scans"_a, "cor_main_detector"_a, "vectors"_a, "cache_dir"_a = "", "log"_a = nb::none(), "progress"_a = false, "projection_store"_a = "", "reduce"_a = 0,
+        "axis_first_scan"_a = 0.0, "measured"_a = std::vector<std::array<double, 2>>(), "quantum"_a = 0.0,
         "The intensity calibration of any number of scans (the main scan first) in the merged frame of one axis (in the main scan's columns) and a "
         "vector (rows, columns) to every scan after the first: scans beside the main scan on one side of it, and scans at the columns of one of "
         "those at another height (a grid). (vc_tomography::calibration::calibrate_intensity)");
@@ -196,16 +183,6 @@ void bind_intensity(nb::module_& m) {
         },
         "scan"_a, "cache_dir"_a = "", "log"_a = nb::none(),
         "reduce_darks_flats(scan), kept in cache_dir as darks_flats_<scan>.bin (vc_tomography::calibration::reduced_darks_flats)");
-    m.def(
-        "placement_from_vector",
-        [](std::array<double, 2> vector, int cols) {
-            const calibration::MergedPlacement p = calibration::placement_from_vector(vector, cols);
-            nb::list scans;
-            for (const auto& s : p.scans) scans.append(nb::cast(s));
-            return nb::make_tuple(scans, p.width, p.anchor);
-        },
-        "vector"_a, "cols"_a,
-        "nabuxx check_companion: ([main, companion] placements, merged width, anchor) (vc_tomography::calibration::placement_from_vector)");
     m.def(
         "placement_from_vectors",
         [](const std::vector<std::array<double, 2>>& vectors, int cols) {

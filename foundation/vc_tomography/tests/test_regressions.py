@@ -96,13 +96,13 @@ def test_merged_frame_from_the_geometry_calibration():
         p_["axis"][:10] += 3.0
         p_["row"][30:] -= 2.0
     lay = geometry.merged_layout(cal, poses, H)
-    assert lay["cor_main_detector"] == 1684.75 and lay["vector"] == (1.0, -843.5)
-    assert abs(lay["measured"]["second_scan_rows"] + 0.97) < 1e-9 and abs(lay["measured"]["axis_second_scan"] - 2528.28) < 1e-9
-    pl, width, anchor = calibration.placement_from_vector(lay["vector"], 2528)
+    assert lay["cor_main_detector"] == 1684.75 and lay["vectors"] == [(1.0, -843.5)]
+    assert abs(lay["measured"][0][1] + 0.97) < 1e-9 and abs(lay["measured"][0][0] - 2528.28) < 1e-9
+    pl, width, anchor = calibration.placement_from_vectors(lay["vectors"], 2528)
     assert (pl[0].shift_x, pl[0].x_readjustment, pl[0].z_readjustment) == (843, -0.5, 0.0)
     assert (pl[1].shift_x, pl[1].x_readjustment, pl[1].z_readjustment) == (0, 0.0, 1.0)
     assert width == 3372 and lay["cor_main_detector"] + anchor == 2528.25
-    assert geometry.merged_layout(cal, poses, H, quantum=0.5)["vector"] == (1.0, -843.5)
+    assert geometry.merged_layout(cal, poses, H, quantum=0.5)["vectors"] == [(1.0, -843.5)]
 
 
 def test_calibration_parameters():

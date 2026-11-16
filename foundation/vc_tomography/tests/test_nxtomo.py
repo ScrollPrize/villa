@@ -174,7 +174,7 @@ def test_the_intensity_calibration_of_a_grid(tmp_path):
     assert [s.name for s in scans] == [str(n) for n in places]
     layout = dict(cor_main_detector=2.25, vectors=[(0.0, 6.0), (0.5, 12.0), (3.0, 0.25), (3.0, 6.25), (3.5, 12.0)])
     lines = []
-    cal, arrays = calibration.calibrate_scans(scans, layout, log=lines.append)
+    cal, arrays = calibration.calibrate(scans, layout, log=lines.append)
     assert cal.lit_rows == (1, 5) and any("the beam lights rows 1..4 of 6" in line for line in lines)
     flat = arrays["main_flats"].mean(0) - arrays["main_dark"]
     assert calibration.lit_rows(flat) == (1, 5) and calibration.lit_rows(np.full((ROWS, COLS), 7.0, np.float32)) == (0, ROWS)
@@ -196,7 +196,7 @@ def test_the_intensity_calibration_of_a_grid(tmp_path):
     with pytest.raises(NotImplementedError, match="half away from the companion"):
         calibration.apodisation_widths(COLS, scans[0].estimated_cor_from_motor_pix, -6.0)
     # scans above each other alone: no apodisation across the beam
-    column, _ = calibration.calibrate_scans([scans[0], scans[3]], dict(cor_main_detector=2.25, vectors=[(3.0, 0.25)]), log=lines.append)
+    column, _ = calibration.calibrate([scans[0], scans[3]], dict(cor_main_detector=2.25, vectors=[(3.0, 0.25)]), log=lines.append)
     assert column.apodisation == {"146079": (0.0, 0.0), "146082": (0.0, 0.0)}
 
 

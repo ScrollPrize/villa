@@ -83,22 +83,6 @@ void bind_geometry(nb::module_& m) {
         .def_prop_ro("rows_from_middle", &hg::Calibration::rows_from_middle)
         .def_prop_ro("overlap_centre", &hg::Calibration::overlap_centre)
         .def("map", [](const hg::Calibration& c) { return map_dict(c.map()); })
-        .def("frame_poses",
-             [](const hg::Calibration& c, DoubleIn a0, DoubleIn a1, DoubleIn h0, DoubleIn h1) {
-                 std::string not_applied;
-                 std::array<hg::Poses, 2> p;
-                 {
-                     const std::array<std::vector<double>, 2> ang{vec(a0), vec(a1)}, H{vec(h0), vec(h1)};
-                     nb::gil_scoped_release release;
-                     p = c.frame_poses(ang, H, &not_applied);
-                 }
-                 nb::list poses;
-                 poses.append(poses_dict(p[0]));
-                 poses.append(poses_dict(p[1]));
-                 return nb::make_tuple(poses, not_applied);
-             },
-             "angles_deg_0"_a, "angles_deg_1"_a, "heights_rows_0"_a, "heights_rows_1"_a,
-             "(the poses of both scans, the terms measured and not applied as JSON text)")
         .def_prop_ro("scan_count", &hg::Calibration::scan_count)
         .def("scan_poses",
              [](const hg::Calibration& c, const std::vector<std::vector<double>>& angles_deg, const std::vector<std::vector<double>>& heights_rows) {
@@ -120,7 +104,7 @@ void bind_geometry(nb::module_& m) {
                  return runs;
              },
              "scan"_a, "[first, end) of each run of a scan's projection frames the calibration was made on")
-        .def("merged_layout_of",
+        .def("merged_layout",
              [](const hg::Calibration& c, const std::vector<std::vector<double>>& axis, const std::vector<std::vector<double>>& row, const std::vector<std::vector<double>>& heights_rows,
                 const std::vector<std::size_t>& first_frame, double quantum) {
                  if (row.size() != axis.size()) throw vc_tomography::Error("merged_layout: the axes and the rows are not of the same scans");
@@ -140,22 +124,7 @@ void bind_geometry(nb::module_& m) {
              },
              "axis"_a, "row"_a, "heights_rows"_a, "first_frame"_a = std::vector<std::size_t>(), "quantum"_a = 0.25,
              "the merged frame of any number of scans: the axis in the first scan's columns, every other scan's (rows, columns) from it, and per other scan its "
-             "(axis column, rows) unrounded")
-        .def("merged_layout",
-             [](const hg::Calibration& c, DoubleIn axis0, DoubleIn row0, DoubleIn axis1, DoubleIn row1, DoubleIn h0, DoubleIn h1, double quantum) {
-                 std::array<hg::Poses, 2> p;
-                 p[0].axis = vec(axis0), p[0].row = vec(row0), p[1].axis = vec(axis1), p[1].row = vec(row1);
-                 const hg::MergedLayout l = c.merged_layout(p, {vec(h0), vec(h1)}, quantum);
-                 nb::dict measured;
-                 measured["axis_first_scan"] = l.axis_first_scan, measured["axis_second_scan"] = l.axis_second_scan;
-                 measured["second_scan_rows"] = l.second_scan_rows, measured["quantum"] = l.quantum;
-                 nb::dict d;
-                 d["cor_main_detector"] = l.cor_main_detector;
-                 d["vector"] = nb::make_tuple(l.vector[0], l.vector[1]);
-                 d["measured"] = measured;
-                 return d;
-             },
-             "axis_0"_a, "row_0"_a, "axis_1"_a, "row_1"_a, "heights_rows_0"_a, "heights_rows_1"_a, "quantum"_a = 0.25);
+             "(axis column, rows) unrounded");
 
     nb::class_<hg::TileGeometry>(m, "TileGeometry", "The geometry of a mosaic's tiles (vc_tomography/geometry.hpp), from its JSON text.")
         .def("__init__", [](hg::TileGeometry* self, const std::string& json_text) { new (self) hg::TileGeometry(hg::TileGeometry::parse(json_text)); }, "json_text"_a)

@@ -396,12 +396,12 @@ def test_poses_under_a_rows_timing_counted_from_the_middle():
     heights = [np.concatenate([st["rows"] for st in sc.stretches]) for sc in scans]
     cal = lambda per_row, from_middle: dict(step="geometry", model="joint", layout=layout, parameters=parameters, map=G.empty_map(ROWS, COLS, 0),
                                             row_time=dict(seconds_per_row=per_row * 0.03, frame_period_s=0.03, frames_per_row=per_row, from_middle=from_middle))
-    down, _ = G.frame_poses(cal(TRUTH["row_time"], False), angles, heights)
+    down, _ = G.scan_poses(cal(TRUTH["row_time"], False), angles, heights)
     assert not down[0]["rows_from_middle"] and np.allclose(down[0]["angle_deg_per_row"], TRUTH["row_time"] * 360.0 / PER_TURN)
     with pytest.raises(ValueError, match="from the middle row"):
-        G.frame_poses(cal(TRUTH["row_time"], True), angles, heights)
+        G.scan_poses(cal(TRUTH["row_time"], True), angles, heights)
     # at rest while a frame is read (here: no time between the rows), the poses carry the form
-    still, _ = G.frame_poses(cal(0.0, True), angles, heights)
+    still, _ = G.scan_poses(cal(0.0, True), angles, heights)
     assert still[0]["rows_from_middle"] and still[1]["rows_from_middle"]
 
 
@@ -572,7 +572,7 @@ def test_scans_compared_along_their_edges_give_the_maps_radial_terms_as_one():
 
 
 def test_the_reconstructions_poses_are_the_models():
-    """A joint calibration as the reconstruction reads it (vc_tomography/geometry.hpp, Calibration::frame_poses): a pixel
+    """A joint calibration as the reconstruction reads it (vc_tomography/geometry.hpp, Calibration::scan_poses): a pixel
     put through the poses' formula is the ray the model gives it, the slices counted from the first scan's helix."""
     rng = np.random.default_rng(6)
     first, second, _, _ = _pair(rng)
@@ -587,7 +587,7 @@ def test_the_reconstructions_poses_are_the_models():
                map={k: (v.tolist() if hasattr(v, "tolist") else v) for k, v in truth["map"].items()}, parameters={k: truth[k] for k in ("roll", "stage", "scans")})
     angles = [np.concatenate([st["angle_deg"] for st in sc.stretches]) for sc in scans]
     heights = [np.concatenate([st["rows"] for st in sc.stretches]) for sc in scans]
-    poses, _ = G.frame_poses(cal, angles, heights)
+    poses, _ = G.scan_poses(cal, angles, heights)
     mid = (ROWS - 1) / 2.0
     helix_first = int(offsets[1])
     origin = TRUTH["height"] + (1.0 + TRUTH["axial_scale"]) * heights[0][helix_first]            # the first scan's row at its helix' first frame
@@ -615,7 +615,7 @@ def test_the_reconstructions_poses_are_the_models():
     assert worst < 5e-3
     # a calibration with the axis' pitch towards the beam: every frame's row holds pitch x the depth of the sample's origin
     pitch = 3e-4
-    leaning, _ = G.frame_poses(dict(cal, parameters=dict(cal["parameters"], pitch=pitch)), angles, heights)
+    leaning, _ = G.scan_poses(dict(cal, parameters=dict(cal["parameters"], pitch=pitch)), angles, heights)
     for k in (0, 1):
         th, d = np.radians(poses[k]["angle_deg"]), truth["scans"][k]["d"]
         assert np.allclose(leaning[k]["row"] - poses[k]["row"], pitch * (d[1] * np.cos(th) - d[0] * np.sin(th)), atol=1e-9)
@@ -623,7 +623,7 @@ def test_the_reconstructions_poses_are_the_models():
     # a calibration that holds a scale of the second scan's image across the beam: the poses scale its columns about
     # its rotation axis' column, and a pixel put through them is still the model's ray
     wider = dict(truth, scans=[truth["scans"][0], dict(truth["scans"][1], column_scale=3e-4)])
-    scaled, _ = G.frame_poses(dict(cal, parameters={k: wider[k] for k in ("roll", "stage", "scans")}), angles, heights)
+    scaled, _ = G.scan_poses(dict(cal, parameters={k: wider[k] for k in ("roll", "stage", "scans")}), angles, heights)
     assert np.all(scaled[1]["col_scale"] == 3e-4) and scaled[1]["scale_col"] == pytest.approx(truth["scans"][1]["axis"]) and np.all(scaled[0]["col_scale"] == 0)
     worst, moved = 0.0, 0.0
     for _ in range(300):
@@ -641,9 +641,9 @@ def test_the_reconstructions_poses_are_the_models():
         worst, moved = max(worst, abs(u - (ray[1] + dn_row - dn))), max(moved, abs(ray[1] - plain[1]))
     assert worst < 6e-3 < 0.05 < moved                                              # (the scale itself moves a ray by up to 3e-4 x the columns from the axis)
     # the helix of the first scan, and the merged frame laid out from the poses
-    assert G.merged_layout(cal, poses, heights)["measured"]["axis_first_scan"] == pytest.approx(np.median(poses[0]["axis"][offsets[1]:offsets[2]]))
-    with pytest.raises(ValueError, match="not of two scans"):
-        G.frame_poses(dict(cal, parameters=dict(cal["parameters"], scans=cal["parameters"]["scans"][:1])), angles, heights)
+    assert G.merged_layout(cal, poses, heights)["axis_first_scan"] == pytest.approx(np.median(poses[0]["axis"][offsets[1]:offsets[2]]))
+    with pytest.raises(ValueError, match="same scans"):
+        G.scan_poses(dict(cal, parameters=dict(cal["parameters"], scans=cal["parameters"]["scans"][:1])), angles, heights)
 
 
 def test_the_poses_hold_a_scans_tilt_about_the_beam():
@@ -668,9 +668,9 @@ def test_the_poses_hold_a_scans_tilt_about_the_beam():
                parameters=dict(roll=TRUTH["roll"], stage=dict(height_once=list(TRUTH["height_once"]), axis_twice=list(TRUTH["axis_twice"])), about_height=about, scans=held))
     angles = [np.concatenate([st["angle_deg"] for st in sc.stretches]) for sc in scans]
     heights = [np.concatenate([st["rows"] for st in sc.stretches]) for sc in scans]
-    poses, left_out = G.frame_poses(cal, angles, heights)
+    poses, left_out = G.scan_poses(cal, angles, heights)
     level = dict(cal, parameters=dict(cal["parameters"], scans=[held[0], dict(held[1], rotation=[0.0, 0.0, 0.0])]))
-    plain, nothing = G.frame_poses(level, angles, heights)
+    plain, nothing = G.scan_poses(level, angles, heights)
     # what the poses do not hold of the rotations is named with what else the calibration measured and the reconstruction does not apply
     named = [k for k in left_out if "rotations" in k]
     assert len(named) == 1 and left_out[named[0]][1] == list(tilt) and not any("rotations" in k for k in nothing)
