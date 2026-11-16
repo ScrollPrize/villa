@@ -742,13 +742,19 @@ def test_a_failed_allocation_while_reading_the_cache_is_a_miss(
     _lattice(db)
     first, _ = _materialize_tracks(db, cache_directory=str(cache))
     [cached] = _cache_files(cache)
-    kept = cached.stat().st_ino
+    from vc_object_store import CollectionReader
+
+    def store_uuid():
+        # Every import is a new store: its identity, not the file's inode
+        # (which a filesystem may reuse), says the store was replaced.
+        with CollectionReader(str(cached)) as reader:
+            return reader.source['store_uuid']
+    kept = store_uuid()
     calls = []
 
     def exhausted(*args, **kwargs):
         calls.append(1)
         raise MemoryError('std::bad_alloc')
-    from vc_object_store import CollectionReader
     with monkeypatch.context() as patch:
         if stage == 'columns':
             patch.setattr(CollectionReader, 'track_crossing_columns', exhausted)
@@ -760,7 +766,7 @@ def test_a_failed_allocation_while_reading_the_cache_is_a_miss(
     assert len(computes) == 2 and len(calls) == 3
     assert 'ignoring invalid track crossing cache' in capsys.readouterr().out
     _assert_same_crossings(again.crossings, first.crossings)
-    assert _cache_files(cache) == [cached] and cached.stat().st_ino != kept
+    assert _cache_files(cache) == [cached] and store_uuid() != kept
     third, _ = _materialize_tracks(db, cache_directory=str(cache))
     assert len(computes) == 2
     _assert_same_crossings(third.crossings, first.crossings)
