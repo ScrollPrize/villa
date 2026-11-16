@@ -51,7 +51,7 @@ using vcr::zarr::Json;
 
 namespace {
 
-constexpr int kLevels = 4;
+constexpr int kLevels = vc_tomography::kProjectionStoreLevels;
 
 struct Job {
     fs::path file;
@@ -70,11 +70,7 @@ struct Scan {
 
 std::mutex h5_mutex;  // libhdf5's serial build is not thread safe
 
-std::string typestr(const std::string& dtype) {
-    if (dtype == "uint16") return "<u2";
-    if (dtype == "float32") return "<f4";
-    throw std::runtime_error("unsupported dtype " + dtype);
-}
+using vc_tomography::projection_store_typestr;
 
 // the whole dataset, whose shape must be `shape`, as `dtype`; false when the file is not marked complete
 bool read_file(const Job& job, const Index& shape, std::vector<std::uint8_t>& out) {
@@ -134,7 +130,7 @@ void read_plan(const fs::path& dir, const std::set<std::string>& only, std::map<
         } else if (s.rows != rows || s.cols != cols || s.role != role) {
             throw std::runtime_error(dir.string() + ": " + tile + "/" + name + " differs between plans");
         }
-        if (rows % (1 << (kLevels - 1)) || cols % (1 << (kLevels - 1))) throw std::runtime_error("detector size is not a multiple of 8");
+        vc_tomography::check_projection_store_detector(rows, cols);
         if (s.source.count(reduce) && s.source[reduce] != dir.string()) throw std::runtime_error("two folders give reduce " + std::to_string(reduce));
         s.source[reduce] = dir.string();
         Job job;
@@ -145,7 +141,7 @@ void read_plan(const fs::path& dir, const std::set<std::string>& only, std::map<
         job.source = fs::path(j.value("relative_file", output.string())).filename().string();
         job.source_first = j.value("source_first", std::int64_t{0});
         // reduced darks and flats are float32 (calibration.at_resolution); the projections keep the source's dtype
-        job.dtype = role == "projection" ? typestr(j.at("dtype").get<std::string>()) : "<f4";
+        job.dtype = role == "projection" ? projection_store_typestr(j.at("dtype").get<std::string>()) : "<f4";
         job.metadata = j.value("metadata", Json::object());
         s.base = std::min(s.base, job.first);
         s.end = std::max(s.end, job.first + job.count);

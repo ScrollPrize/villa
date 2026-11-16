@@ -75,6 +75,12 @@ std::vector<double> projection_store_sum(const std::string& scan_group, int redu
 // one process at a time; the writers below may then work in parallel.
 void declare_projection_store_scan(const std::string& root, const std::string& spec, int reduce, const std::string& source,
                                    const std::string& dtype, int clevel = 1);
+// A store holds the levels reduce 0 .. kProjectionStoreLevels - 1 of a detector whose rows and columns are multiples of
+// 2^(levels - 1) (check_projection_store_detector throws otherwise); the values' numpy typestr ("uint16" -> "<u2",
+// "float32" -> "<f4"; anything else an Error).
+constexpr int kProjectionStoreLevels = 4;
+void check_projection_store_detector(std::int64_t rows, std::int64_t cols);
+std::string projection_store_typestr(const std::string& dtype);
 
 // Frames into one level of a declared scan group. Frames are numbered as in the detector's scan (the `first` of
 // the files table). Writers of different shards (different hundreds of frames) may run in parallel, in threads

@@ -209,15 +209,21 @@ std::vector<double> projection_store_sum(const std::string& scan_group, int redu
 
 // ---------------------------------------------------------------- writing
 
-namespace {
-
-constexpr int kLevels = 4, kChunkRows = 128, kShardFrames = 100;
-
-std::string typestr(const std::string& dtype) {
+std::string projection_store_typestr(const std::string& dtype) {
     if (dtype == "uint16") return "<u2";
     if (dtype == "float32") return "<f4";
     throw Error("projection store: values are uint16 or float32, not " + dtype);
 }
+
+void check_projection_store_detector(std::int64_t rows, std::int64_t cols) {
+    const int m = 1 << (kProjectionStoreLevels - 1);
+    if (rows < 1 || cols < 1 || rows % m || cols % m) throw Error("the detector's size must be a multiple of " + std::to_string(m));
+}
+
+namespace {
+
+constexpr int kLevels = kProjectionStoreLevels, kChunkRows = 128, kShardFrames = 100;
+std::string typestr(const std::string& dtype) { return projection_store_typestr(dtype); }
 
 vcr::zarr::CreateOptions level_options(const vcr::Index& shape, const std::string& type, int clevel) {
     vcr::zarr::CreateOptions o;
@@ -245,7 +251,8 @@ void declare_projection_store_scan(const std::string& root, const std::string& s
         const std::int64_t rows = spec.at("rows").get<std::int64_t>(), cols = spec.at("cols").get<std::int64_t>();
         const std::int64_t frame_first = spec.at("frame_first").get<std::int64_t>(), frames = spec.at("frames").get<std::int64_t>();
         if (reduce < 0 || reduce >= kLevels) throw Error("reduce must be 0, 1, 2 or 3");
-        if (frames < 1 || rows < 1 || cols < 1 || rows % (1 << (kLevels - 1)) || cols % (1 << (kLevels - 1))) throw Error("the detector's size must be a multiple of 8");
+        if (frames < 1) throw Error("no frames");
+        check_projection_store_detector(rows, cols);
         const std::string type = typestr(dtype);
         const fs::path group = fs::path(root) / tile / scan;
         const Json before = scan_attribute(group.string());
