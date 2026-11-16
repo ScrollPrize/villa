@@ -141,7 +141,7 @@ target_link_libraries(vc_tomography
   PUBLIC OpenMP::OpenMP_CXX Ceres::ceres
   PRIVATE PkgConfig::FFTW3F PkgConfig::FFTW3 ${FFTW3F_OMP_LIB} HDF5::HDF5 ZLIB::ZLIB CURL::libcurl vc_reader::reader)
 # (vc_reader's headers are not written for -Wextra)
-set_source_files_properties(src/io/projection_store.cpp PROPERTIES COMPILE_OPTIONS "-Wno-extra;-Wno-missing-field-initializers")
+set_source_files_properties(src/io/projection_store.cpp src/io/reference.cpp PROPERTIES COMPILE_OPTIONS "-Wno-extra;-Wno-missing-field-initializers")
 if(VC_TOMOGRAPHY_DELTA3D)
   target_link_libraries(vc_tomography PRIVATE vc_delta3d::vc_delta3d)
   target_compile_definitions(vc_tomography PRIVATE VC_TOMOGRAPHY_WITH_DELTA3D=1)

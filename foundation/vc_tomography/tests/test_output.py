@@ -289,14 +289,14 @@ def test_remote_reference_reads_through_a_cache(tmp_path):
             np.testing.assert_array_equal(read(ReferenceMask(str(root / "plain.zarr"), scale, vol.shape)), want)
             np.testing.assert_array_equal(read(ReferenceMask(f"{url}/ref.zarr", scale, vol.shape)), want)           # no cache
             np.testing.assert_array_equal(read(ReferenceMask(f"{url}/plain.zarr", scale, vol.shape, cache)), want)
-        with pytest.raises(RuntimeError, match="no Zarr v2 array or OME-Zarr group"):
+        with pytest.raises(RuntimeError, match="no Zarr"):
             ReferenceMask(f"{url}/nothing.zarr", 0, vol.shape)
     finally:
         server.shutdown()
         server.server_close()
     # the server gone: chunks, the fact that others do not exist, and the metadata all come from the cache
     np.testing.assert_array_equal(read(ReferenceMask(f"{url}/plain.zarr", 2, vol.shape, cache)), want)
-    with pytest.raises(RuntimeError, match="cannot read"):
+    with pytest.raises(RuntimeError, match="connect"):                        # (read before without the cache: not in it)
         ReferenceMask(f"{url}/ref.zarr", 2, vol.shape, cache)
 
 

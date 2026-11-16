@@ -6,7 +6,7 @@
 
 #include "vc_tomography/block_spectra.hpp"
 #include "vc_tomography/reference.hpp"
-#include "vc_tomography/zarr.hpp"
+#include "../src/io/volume_levels.hpp"
 #include "ndarray_utils.hpp"
 
 #ifdef VC_TOMOGRAPHY_WITH_CUDA
@@ -166,22 +166,20 @@ void bind_spectra(nb::module_& m) {
           "cubic or lanczos3; 0 outside the volume");
 
     m.def("zarr_levels", [](const std::string& location, const std::string& cache_dir) {
-              std::vector<OmeZarrLevel> levels;
-              std::vector<ZarrArrayMeta> metas;
+              std::vector<io::VolumeLevel> levels;
               {
                   nb::gil_scoped_release nogil;
-                  levels = ome_zarr_levels(location, cache_dir);
-                  for (const auto& l : levels) metas.push_back(ZarrArray::open(l.location, cache_dir).meta());
+                  levels = io::volume_levels(location, cache_dir);
               }
               nb::list out;
-              for (std::size_t i = 0; i < levels.size(); ++i) {
+              for (const io::VolumeLevel& l : levels) {
                   nb::dict d;
-                  d["level"] = levels[i].level;
-                  d["location"] = levels[i].location;
-                  d["scale"] = nb::make_tuple(levels[i].scale[0], levels[i].scale[1], levels[i].scale[2]);
-                  d["offset"] = nb::make_tuple(levels[i].offset[0], levels[i].offset[1], levels[i].offset[2]);
-                  d["shape"] = nb::make_tuple(metas[i].shape[0], metas[i].shape[1], metas[i].shape[2]);
-                  d["dtype"] = metas[i].dtype;
+                  d["level"] = l.level;
+                  d["location"] = l.location;
+                  d["scale"] = nb::make_tuple(l.scale[0], l.scale[1], l.scale[2]);
+                  d["offset"] = nb::make_tuple(l.offset[0], l.offset[1], l.offset[2]);
+                  d["shape"] = nb::make_tuple(l.shape[0], l.shape[1], l.shape[2]);
+                  d["dtype"] = l.dtype;
                   out.append(d);
               }
               return out;
@@ -192,12 +190,18 @@ void bind_spectra(nb::module_& m) {
     m.def("zarr_read", [](const std::string& location, std::array<std::int64_t, 3> start, std::array<std::int64_t, 3> shape,
                           const std::string& cache_dir) -> nb::object {
               require(shape[0] > 0 && shape[1] > 0 && shape[2] > 0, "shape must be positive");
-              const ZarrArray a = ZarrArray::open(location, cache_dir);
+              std::unique_ptr<io::VolumeArray> opened;
+              {
+                  nb::gil_scoped_release nogil;
+                  opened = std::make_unique<io::VolumeArray>(location, cache_dir);
+              }
+              const io::VolumeArray& a = *opened;
+              require(a.dtype() == "<f4" || a.dtype() == "|u1", "zarr_read reads uint8 or float32 arrays, not " + a.dtype());
               for (int i = 0; i < 3; ++i)
-                  require(start[i] >= 0 && start[i] + shape[i] <= a.meta().shape[i], "region outside the array");
+                  require(start[i] >= 0 && start[i] + shape[i] <= a.shape()[i], "region outside the array");
               const std::vector<std::size_t> dims{static_cast<std::size_t>(shape[0]), static_cast<std::size_t>(shape[1]),
                                                   static_cast<std::size_t>(shape[2])};
-              if (a.meta().dtype == "<f4") {
+              if (a.dtype() == "<f4") {
                   HostOut out = new_array(dims);
                   {
                       nb::gil_scoped_release nogil;

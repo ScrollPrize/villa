@@ -8,14 +8,14 @@
 #include <vector>
 
 #include "vc_tomography/block_spectra.hpp"
-#include "vc_tomography/zarr.hpp"
+#include "io/volume_levels.hpp"
 
 namespace vc_tomography {
 
 struct ReferenceMask::Impl {
     std::string location;
     int scale = 0;
-    std::unique_ptr<ZarrArray> level;
+    std::unique_ptr<io::VolumeArray> level;
     std::array<int, 3> f{1, 1, 1}, shift{0, 0, 0};
     std::array<std::int64_t, 3> n{0, 0, 0};          // the level's shape
     std::map<int, std::vector<std::uint8_t>> buffers;
@@ -30,8 +30,8 @@ ReferenceMask::ReferenceMask(const std::string& location, int scale, const std::
     auto& I = *impl_;
     I.location = location;
     I.scale = scale;
-    const auto levels = ome_zarr_levels(location, cache_dir);
-    const OmeZarrLevel* chosen = nullptr;
+    const auto levels = io::volume_levels(location, cache_dir);
+    const io::VolumeLevel* chosen = nullptr;
     for (const auto& l : levels)
         if (l.level == scale) chosen = &l;
     if (!chosen) throw Error("reference volume " + location + ": no pyramid level " + std::to_string(scale));
@@ -40,8 +40,7 @@ ReferenceMask::ReferenceMask(const std::string& location, int scale, const std::
         for (std::size_t i = 0; i < s.size(); ++i) t += (i ? ", " : "") + std::to_string(s[i]);
         return t + ")";
     };
-    const ZarrArray full = ZarrArray::open(levels.front().location, cache_dir);
-    const ZarrIndex fs = full.meta().shape;
+    const std::array<std::int64_t, 3> fs = levels.front().shape;
     const bool slices_close = shape[0] > 0 && std::abs(static_cast<double>(fs[0] - shape[0])) <= kMaxSliceMismatch * static_cast<double>(shape[0]);
     if (fs[1] != shape[1] || fs[2] != shape[2] || !slices_close)
         throw Error("reference volume " + location + " has shape " + text(fs) + ", the reconstruction " + text(shape) +
@@ -50,8 +49,8 @@ ReferenceMask::ReferenceMask(const std::string& location, int scale, const std::
     if (fs[0] != shape[0]) I.slice_ratio = static_cast<double>(fs[0]) / static_cast<double>(shape[0]);
     I.z_scale = chosen->scale[0];
     I.z_offset = chosen->offset[0];
-    I.level = std::make_unique<ZarrArray>(scale == 0 ? full : ZarrArray::open(chosen->location, cache_dir));
-    if (I.level->meta().dtype != "|u1") throw Error("reference volume " + location + " is " + I.level->meta().dtype + ", not uint8");
+    I.level = std::make_unique<io::VolumeArray>(chosen->location, cache_dir);
+    if (I.level->dtype() != "|u1") throw Error("reference volume " + location + " is " + I.level->dtype() + ", not uint8");
     for (int a = 0; a < 3; ++a) {
         // level0 = scale * index + offset: volume voxel v belongs to the level voxel nearest (v - offset) / scale,
         // which is (v + shift) / f for a whole factor f
@@ -61,7 +60,7 @@ ReferenceMask::ReferenceMask(const std::string& location, int scale, const std::
             throw Error("reference volume " + location + ": level " + std::to_string(scale) + " is not a whole number of "
                         "level-0 voxels per voxel");
         I.shift[a] = static_cast<int>(std::floor((I.f[a] - 1) / 2.0 - chosen->offset[a] + 1e-9));
-        I.n[a] = I.level->meta().shape[a];
+        I.n[a] = I.level->shape()[a];
     }
 }
 
@@ -122,7 +121,7 @@ OutputMask ReferenceMask::read(int z0, int z1, const SliceRoi& roi, int slot) {
 struct RegisteredVolume::Impl {
     std::string location;
     int level = 0;
-    std::unique_ptr<ZarrArray> array;
+    std::unique_ptr<io::VolumeArray> array;
     std::array<double, 12> to_level{};   // reconstruction voxel index (z, y, x, 1) -> level voxel index
     bool u8 = true;
 };
@@ -133,13 +132,13 @@ RegisteredVolume::RegisteredVolume(const std::string& location, int level, const
     auto& I = *impl_;
     I.location = location;
     I.level = level;
-    const auto levels = ome_zarr_levels(location, cache_dir);
-    const OmeZarrLevel* chosen = nullptr;
+    const auto levels = io::volume_levels(location, cache_dir);
+    const io::VolumeLevel* chosen = nullptr;
     for (const auto& l : levels)
         if (l.level == level) chosen = &l;
     if (!chosen) throw Error("reference volume " + location + ": no pyramid level " + std::to_string(level));
-    I.array = std::make_unique<ZarrArray>(ZarrArray::open(chosen->location, cache_dir));
-    I.u8 = I.array->meta().dtype == "|u1";
+    I.array = std::make_unique<io::VolumeArray>(chosen->location, cache_dir);
+    I.u8 = I.array->dtype() == "|u1";
     // level 0 index = scale * level index + offset
     for (int r = 0; r < 3; ++r)
         for (int c = 0; c < 4; ++c)
@@ -150,7 +149,7 @@ RegisteredVolume::~RegisteredVolume() = default;
 
 const std::string& RegisteredVolume::location() const { return impl_->location; }
 int RegisteredVolume::level() const { return impl_->level; }
-std::array<std::int64_t, 3> RegisteredVolume::level_shape() const { return impl_->array->meta().shape; }
+std::array<std::int64_t, 3> RegisteredVolume::level_shape() const { return impl_->array->shape(); }
 
 std::array<double, 12> RegisteredVolume::block_affine(const std::array<double, 3>& origin, double step) const {
     const auto& t = impl_->to_level;
@@ -168,8 +167,8 @@ double RegisteredVolume::read(const std::array<double, 3>& origin, double step, 
     if (shape[0] < 1 || shape[1] < 1 || shape[2] < 1) throw Error("RegisteredVolume::read: empty block");
     std::array<double, 12> m = block_affine(origin, step);
     // the level's voxels the block's samples need: the bounds of its corners, plus the interpolation's reach
-    const ZarrIndex full = I.array->meta().shape;
-    ZarrIndex lo{}, n{};
+    const std::array<std::int64_t, 3> full = I.array->shape();
+    std::array<std::int64_t, 3> lo{}, n{};
     bool empty = false;
     for (int r = 0; r < 3; ++r) {
         double a = 1e300, b = -1e300;
