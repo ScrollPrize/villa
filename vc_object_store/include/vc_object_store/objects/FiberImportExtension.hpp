@@ -13,6 +13,10 @@ double decodeFiberArc(std::span<const uint8_t>);
 std::vector<uint8_t> encodeFiberDirection(const std::array<double,3>&);
 std::array<double,3> decodeFiberDirection(std::span<const uint8_t>);
 // nullopt means the constraint must be skipped, not saturated to the maximum.
+// NaN encodes as kFiberWindingDistanceUnknown (byte 0): a measured relation
+// without a winding distance (geometry/normal-only extraction); it decodes
+// back to NaN.
+inline constexpr uint8_t kFiberWindingDistanceUnknown=0;
 std::optional<uint8_t> encodeFiberWindingDistance(double);
 double decodeFiberWindingDistance(std::span<const uint8_t>);
 // Deliberately compact typed provisioning. Do not accept full source metadata,

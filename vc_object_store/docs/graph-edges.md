@@ -52,7 +52,7 @@ The API uses names, while schema 22 stores stable built-in integer codes. Unknow
 | `same-surface` | Two objects lie on the same winding/sheet: surface↔surface overlaps, fiber/track↔surface contacts. The detector default | Detectors (below), PCL ingestion |
 | `point-surface` | Point-collection points lying on a surface. Anchors retain point IDs and source XYZ | Point-collection–surface detector, PCL source links |
 | `crossing` | Two opposite-family tracks in one dataset share voxels; anchors use raw point indices and source XYZ | Track–track detector |
-| `fiber_branch` | A fiber branches into another at anchored control points. `meta.adjacent=True` marks an **adjacent** (next-winding) branch; absent/false is an **ordinary** (same-winding) branch | Fiber JSON import/export |
+| `fiber_branch` | A fiber branches into another at anchored control points. `meta.adjacent=True` marks an **adjacent** (next-winding) branch; absent/false is an **ordinary** (same-winding) branch. An adjacent branch between one H and one V fiber means the V fiber sits one winding inside the H fiber (`W_V = W_H - 1` with windings increasing outward, as VC3D's winding solver and the `vc_wgraph` manual-link arcs both read it); an adjacent branch between two fibers of the same family is an annotation error that constrains nothing. The stored H/V tags decide this; the umbilicus does not | Fiber JSON import/export |
 | `attachment` | A data object describes another object (growth corrections, fit results on a surface). **Not a graph link** — see below | `attachmentEdge`, document attachment |
 | `declared_reference` | An application-declared reference between objects | Application code |
 

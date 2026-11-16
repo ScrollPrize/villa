@@ -155,8 +155,11 @@ class Seam:
     making crossing computation exact for these polylines. Positive transport
     is increasing atan2(Y-cY,X-cX). The seam belongs to its positive-angle side.
     """
-    def __init__(self, axis, angle=-np.pi/2):
+    def __init__(self, axis, angle=-np.pi/2, handedness=1):
         from vc_object_store import NativeWindingSeam
+        if handedness not in (1, -1):
+            raise ValueError('Winding handedness must be +1 or -1')
+        self.handedness = int(handedness)
         self.axis = np.asarray(axis, float)
         self.axis = self.axis[np.argsort(self.axis[:, 2])]
         if len(self.axis) < 2 or not np.isfinite(self.axis).all() or np.any(np.diff(self.axis[:, 2]) <= 0):
@@ -164,7 +167,7 @@ class Seam:
         self.ray = np.array([np.cos(angle), np.sin(angle)])
         self.ray[abs(self.ray) < 1e-15] = 0
         self.angle = angle
-        self._native=NativeWindingSeam(np.ascontiguousarray(self.axis),float(angle))
+        self._native=NativeWindingSeam(np.ascontiguousarray(self.axis),float(angle),self.handedness)
 
     def relative(self, points):
         return self._native.relative(np.ascontiguousarray(points,dtype=np.float64),1)

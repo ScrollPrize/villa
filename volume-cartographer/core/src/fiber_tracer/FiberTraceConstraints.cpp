@@ -1233,7 +1233,9 @@ void measureCandidates(
     for(auto index:acceptedIndices)connectors.insert(connectors.end(),
         scored[index].parallelConnectors.begin(),scored[index].parallelConnectors.end());
     std::vector<double> windings;
-    if (!connectors.empty() && windingDistanceBatch) {
+    if (!config.measureWindingDistances) {
+        windings.assign(connectors.size(), std::numeric_limits<double>::quiet_NaN());
+    } else if (!connectors.empty() && windingDistanceBatch) {
         windings = windingDistanceBatch(
             connectors,
             config.windingIntegrationStepBaseVoxels,
@@ -1273,6 +1275,12 @@ void measureCandidates(
         const std::size_t allEnd = connectorOffsets[index + 1];
         const std::size_t end = result.legacyConnectorCount ? begin+result.legacyConnectorCount : allEnd;
         const double closestWinding = windings[begin];
+        if (!config.measureWindingDistances) {
+            // Geometry-only evidence: no distance, no winding rejections.
+            result.constraint->windingDistance = closestWinding;
+            result.constraint->parallelWindingDistance = closestWinding;
+            continue;
+        }
         if (!std::isfinite(closestWinding)) {
             result.failureCheck="invalid_central_winding";
             result.constraint=nullptr;
@@ -1976,7 +1984,7 @@ FiberTraceConstraintReport extractFiberTraceConstraints(
     report.searchSeconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - searchStarted).count();
 
-    if (!candidates.empty() && !windingDistance && !windingDistanceBatch)
+    if (!candidates.empty() && !windingDistance && !windingDistanceBatch && config.measureWindingDistances)
         throw std::invalid_argument("Fiber trace constraint winding sampler is missing");
     const auto scoreStarted = std::chrono::steady_clock::now();
     const int poolWorkers = static_cast<int>(std::min<std::size_t>(

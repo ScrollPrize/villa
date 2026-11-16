@@ -54,6 +54,7 @@ jobs:
             libopencv-dev \
             libsuitesparse-dev \
             libjpeg-dev \
+            liblemon-dev \
             libpng-dev \
             libtiff-dev \
             libzstd-dev \

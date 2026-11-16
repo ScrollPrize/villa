@@ -149,6 +149,9 @@ def parser() -> argparse.ArgumentParser:
         subcommand.add_argument('-o', '--output', dest='output_path', metavar='FILE', help='override the new output vcobj store')
         subcommand.add_argument('--print-config', action='store_true', help='print resolved settings without running the stage')
     subcommands.add_parser('profiles', help='list available named profiles and their source files')
+    handed = subcommands.add_parser('handedness', help="show or tag the scroll's winding direction on a store's umbilicus object")
+    handed.add_argument('-i', '--input', dest='input_path', metavar='FILE', required=True, help='vcobj store with an umbilicus object')
+    handed.add_argument('--set', dest='value', type=int, choices=(1, -1), help='tag the umbilicus with this winding handedness')
     return command
 
 
@@ -158,6 +161,12 @@ def main(argv=None) -> int:
     if args.stage == 'profiles':
         for name, path in sorted(available_profiles(args.profile_dir).items()):
             print(f'{name}\t{path}')
+        return 0
+    if args.stage == 'handedness':
+        from vesuvius.neural_tracing.fiber_trace_3d.fiber_graph_store import tag_store_handedness, store_handedness
+        if args.value is not None:
+            tag_store_handedness(args.input_path, args.value)
+        print(json.dumps(dict(store=args.input_path, winding_handedness=store_handedness(args.input_path, None))))
         return 0
     try:
         config = stage_config(args.stage, args.profile, input_path=args.input_path,

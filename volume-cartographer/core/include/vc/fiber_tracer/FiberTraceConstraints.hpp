@@ -52,6 +52,11 @@ struct FiberTraceConstraintConfig {
     double correspondenceGridLengthWeight = 0.0;
     bool collectParallelCorrespondenceDiagnostics = false;
     double windingIntegrationStepBaseVoxels = 8.0;
+    // When false no winding sampler is consulted: accepted constraints keep
+    // NaN winding distances (the signed delta stays unset) and the
+    // winding-based rejections do not apply. For evidence whose consumers
+    // only need geometry and normals (enclosures, manual scaffolds).
+    bool measureWindingDistances = true;
     double maximumWindingDistance = 1.5;
     bool enforceMaximumWindingDistance = true;
     bool preserveInputLinesAsPieces = false;

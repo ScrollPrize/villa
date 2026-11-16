@@ -130,6 +130,8 @@ Full-source comparisons can use `fiber_wrapped_full --config FILE`. It calls the
 
 Native extraction optionally accepts `winding_manifest` and `winding_provenance` separately from `normal_manifest`/`normal_provenance`. Both must name the same scan and base dimensions. With `normal_source: "fiber"`, the compound `sheet_nx`, `sheet_ny` channels provide sheet normals masked by the volume's declared validity (chunk existence for current inference output); a separate Lasagna winding source is required for extraction because the compound volume carries no winding density. Winding-distance integration continues to use the Lasagna sampler and unchanged thresholds. No missing compound normal is filled from Lasagna. Both source identities are recorded. Omitting the separate source preserves the existing Lasagna-only behavior.
 
+`winding_distances: false` runs the extractor without any winding-distance measurement: candidates are found, refined and given normals exactly as before, but no winding sampler is consulted, so `normal_source: "fiber"` needs no `winding_manifest`, and the winding-based rejections (`invalid_central_winding`, `winding_cutoff`) do not apply. The stored measurements carry the no-distance code (winding-distance byte 0, read back as NaN). Such a store supports sign alignment, enclosure relations and manual links, but no parallel/perpendicular winding arcs, UV layouts or winding-distance diagnostics; the extraction report records `winding_distances`.
+
 Constraint export uses the shared `ParallelImportStream` and `importInitialCollection` APIs. Normal sampling uses spatial ROI jobs before arc-ordered sign propagation and typed record preparation. Prepared batches emit directly to bounded UUID-routed shard queues; independent SQLite writers are controlled by `import_workers`. Materialized-report export uses `import_readers` and `import_batch_rows` for preparation. Native records go directly to the typed extension encoder without a JSON round-trip. Exact measurements, invalid normals and endpoint ordering are unchanged. Live source event IDs encode `(job << 32) + eventWithinJob`, leaving gaps while preserving deterministic source ordering independently of scheduling; they are not dense array indices. Rebuild graph caches when replacing an earlier extraction.
 
 Scoring volume reads partition actual constraint positions into Z/Y/X ROIs (`scoring_region_base_voxels`, default 4096), with at most `candidate_batch_size` candidates per spatial batch (default 65536). Fiber identity never selects a read job. Pure geometry reads no volume data and keeps cache-friendly source order. CPU-only deduplication and refinement use coarse blocks that retain complete pair evidence. Winding integration independently groups its actual sample points into spatial batches (`winding_region_base_voxels`, default the scoring ROI; `winding_batch_points`, default 262144), then integrates in the original connector order. ROI planning counts points per coarse source block and uses stable region prefixes, sorting only distinct region keys. This is scheduling, not clipped tile extraction: complete geometry remains available, and probes crossing ROI boundaries are neither clipped nor dropped. Compound sheet-normal aliases retain one runtime group per source packed array. Diagnostics expose encoded channel bytes read and decoded bytes separately from remote network traffic.
@@ -547,11 +549,11 @@ log are retained separately; it never overwrites the source graph or old logs.
 ### Optional specialized integer-capacity flow benchmark
 
 `fiber_lemon_benchmark` compares LEMON network simplex and cost-scaling on an
-already solved dataset. It requires the optional system LEMON development package,
-`pkg-config`, and a C++17 compiler; it never installs these automatically. The
-explicit benchmark builds its small native adapter in the output directory with
-Release optimization and records source hash, compiler and LEMON versions.
-No GPU is required. Configure, for example:
+already solved dataset. The solver is the LEMON circulation built into
+`vc_object_store` (`solve_winding_min_cost_flow`, see
+[`vc_wgraph`](wgraph.md#lemon-backend)); the store must be built with
+`VC_OBJECT_STORE_WITH_LEMON` (default ON, needs `liblemon-dev`). Nothing is
+compiled at run time. No GPU is required. Configure, for example:
 
 ```json
 {
@@ -595,7 +597,7 @@ Run the optional native regression tests with:
 python -m pytest -q vesuvius/tests/test_fiber_lemon.py
 ```
 
-They skip if the optional compiler/package is unavailable; no setup is performed.
+They skip when the `vc_object_store` build lacks LEMON; no setup is performed.
 
 ### Full cached-graph LEMON solve
 
@@ -630,8 +632,7 @@ full-volume preparation. It does not repeat extraction or run HiGHS first.
   "source_root": "/results/full-preparation",
   "output_root": "/results/cost-scaling",
   "scale": 1,
-  "reference_mean": 0.27,
-  "progress_interval": 20
+  "reference_mean": 0.27
 }}
 ```
 
@@ -639,20 +640,13 @@ Choose `reference_mean` from the actual small reference report, not the example
 above. Capacity quantization is explicit and reported, including discarded arc
 weight. Progress and final L1 use **all original arc weights**, including arcs
 discarded by quantization. `factor_vs_small` divides that normalized L1 by the
-supplied reference mean. Intermediate snapshots evaluate rounded current node
-potentials: they are not the intermediate flow objective printed by HiGHS and
-are not a convergence percentage. Excess imbalance is separately recorded in
-quantized capacity units. Final output requires the ordinary primal/dual,
+supplied reference mean. Final output requires the ordinary primal/dual,
 conservation and capacity certificate for the quantized problem.
 
-The optional progress build generates a local instrumented copy of the installed
-LEMON header, preserving its license and algorithm. It inserts read-only hooks
-at cost-scaling phase starts and periodically within partial augmentation; it
-does not edit system headers or change solver arithmetic. Header source hashes
-are recorded, and incompatible layouts fail closed. Reporting is same-thread
-and time-throttled, so no unsynchronized access to solver state occurs. A long
-internal heuristic may delay a snapshot. Scanning the original graph has some
-overhead; no per-arc Python callbacks are used. The backend remains single-core.
+The former runtime-compiled adapter and its instrumented-header progress
+snapshots (`progress_interval`) were removed with the move of the solver into
+`vc_object_store`; `progress.json` now only records the setup and completion
+stages. The backend remains single-core and is intended for small graphs.
 
 ### Reference evaluation of cached whole-fiber flow solutions
 

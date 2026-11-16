@@ -120,7 +120,30 @@ def tube_mesh(points, radius=80., sides=12):
 def umbilicus_frame(path, volume):
     """Shared volume-voxel frame validation for geometry export and layout priors: the umbilicus document must name
     the fibers' volume (``fiber_volume``). Returns (control points XYZ, voxel size mm) from the document itself."""
-    document=json.loads(Path(path).read_text());metadata=document['metadata']
+    return _validated_umbilicus(json.loads(Path(path).read_text()),volume)
+
+
+def store_umbilicus_frame(store_path, volume):
+    """The store's one umbilicus object as the same validated frame as ``umbilicus_frame``.
+
+    Imported legacy umbilicus documents keep their metadata under
+    ``source.provenance.legacy_metadata``; the points are the stored geometry."""
+    from vc_object_store import CollectionReader
+    with CollectionReader(str(store_path)) as store:
+        objects=store.objects('umbilicus')
+        if len(objects)!=1:raise ValueError('Store must contain exactly one umbilicus object, found %d'%len(objects))
+        record=objects[0]
+        row=store.geometry_arrays([record['uuid']],'points')[0]
+    metadata=(((record.get('meta') or {}).get('source') or {}).get('provenance') or {}).get('legacy_metadata')
+    if not metadata:raise ValueError('Store umbilicus lacks the legacy document metadata needed for frame validation')
+    if row['dtype']!='<f8' or len(row['shape'])!=2 or row['shape'][1]!=3:raise ValueError('Umbilicus points must be float64 XYZ')
+    points=np.frombuffer(row['data'],dtype='<f8').reshape(row['shape']).astype(float)
+    document=dict(metadata=metadata,control_points=[dict(x=p[0],y=p[1],z=p[2]) for p in points])
+    return _validated_umbilicus(document,volume)
+
+
+def _validated_umbilicus(document, volume):
+    metadata=document['metadata']
     shape=[metadata['volume_slices'],metadata['volume_height'],metadata['volume_width']]
     if not metadata['volume'].startswith(str(volume)+'-'):
         raise ValueError('Umbilicus/fiber volume coordinate frame mismatch')
@@ -131,7 +154,11 @@ def umbilicus_frame(path, volume):
     return points,float(metadata['voxelsize_um'])/1000
 
 
-def load_umbilicus_frame(path, volume):
+def load_umbilicus_frame(path, volume, store=None):
+    """``path`` is a legacy umbilicus JSON, or ``"store"`` to use ``store``'s umbilicus object."""
+    if path=='store':
+        if store is None:raise ValueError('umbilicus "store" needs the input store')
+        return store_umbilicus_frame(store,volume)[0]
     return umbilicus_frame(path,volume)[0]
 
 

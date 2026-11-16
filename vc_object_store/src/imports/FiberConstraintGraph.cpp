@@ -174,7 +174,8 @@ static std::vector<CompactFiberConstraint> readCompactFiberConstraintGraphImpl(c
             const auto a=blob(scan,3,3),b=blob(scan,4,3),c=blob(scan,5,3);
             r.normalA=decodeFiberDirection(a);r.normalB=decodeFiberDirection(b);r.connector=decodeFiberDirection(c);
             r.validA=a[2]!=0;r.validB=b[2]!=0;r.validConnector=c[2]!=0;
-            const auto distance=blob(scan,6,1);if(distance[0]){r.windingDistance=decodeFiberWindingDistance(distance);rows.push_back(r);}
+            // Byte 0 is a relation without a winding distance (NaN), still a graph edge.
+            const auto distance=blob(scan,6,1);r.windingDistance=decodeFiberWindingDistance(distance);rows.push_back(r);
             if(++local%1000000==0)report("measurements",readRows.fetch_add(1000000)+1000000,n);
         }report("measurements",readRows.fetch_add(local%1000000)+local%1000000,n);
     });

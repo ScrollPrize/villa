@@ -30,14 +30,22 @@ struct FiberWindingGraphInput {
     std::span<const bool> parallel,validA,validB,validConnector;
     std::span<const double> normalA,normalB,connector; // XYZ triples, unexpanded
 };
+// Per-type constraint weights. A zero weight omits that type's arcs; the
+// enclosure pass derives exact H->V relations from signed perpendicular
+// events regardless of the perpendicular weight.
 struct FiberWindingGraphOptions {
-    double windingScale=1,perpendicularOffset=.5,perpendicularWeight=1;
+    double windingScale=1,perpendicularOffset=.5,perpendicularWeight=1,parallelWeight=1;
+    bool enclosures=false;
     size_t constraintBatch=500000,readBatch=32768,workers=32;
 };
 struct FiberWindingL1Columns {
     std::unique_ptr<int64_t[]> a,b,target;
     std::unique_ptr<double[]> weight;
-    size_t arcs{},read{},used{},expanded{};
+    size_t arcs{},read{},used{},expanded{},withoutDistance{};
+    // Enclosure relations (unweighted, H node -> V node, exact integer step),
+    // present when FiberWindingGraphOptions::enclosures is set.
+    std::unique_ptr<int64_t[]> enclosureA,enclosureB,enclosureTarget;
+    size_t enclosureArcs{},enclosurePairs{},enclosureOneSided{},enclosureContradictory{},enclosureNonunique{};
 };
 
 namespace winding_graph_detail {
@@ -57,6 +65,17 @@ inline void aggregate(std::vector<Arc>& arcs){
         else arcs[++out]=arcs[i];
     }
     arcs.resize(out+1);
+}
+// One signed perpendicular bound on the H->V step of a pair, as
+// fiber_enclosure_graph.extract_relations defines it: outward evidence
+// (sign>0 from H towards V) bounds the step from below, inward evidence
+// from above (step-1), with the seam/connector transport already applied.
+struct EnclosureBound {int64_t h,v;int sign;int64_t bound;};
+inline bool enclosureBefore(const EnclosureBound& x,const EnclosureBound& y){
+    if(x.h!=y.h)return x.h<y.h;
+    if(x.v!=y.v)return x.v<y.v;
+    if(x.sign!=y.sign)return x.sign<y.sign;
+    return x.bound<y.bound;
 }
 inline int64_t integerTarget(double distance,int sign,int familyDelta,bool parallel,double offset){
     const double outward=distance-sign*(parallel?0.:offset*familyDelta);
@@ -78,8 +97,11 @@ inline FiberWindingL1Columns prepareFiberWindingGraph(const PackedFiberGeometry&
     const size_t m=in.a.count,n=in.family.size();
     if(!options.workers||!options.constraintBatch||!options.readBatch||
        !std::isfinite(options.windingScale)||options.windingScale<0||
-       !std::isfinite(options.perpendicularOffset)||!std::isfinite(options.perpendicularWeight)||options.perpendicularWeight<=0)
+       !std::isfinite(options.perpendicularOffset)||!std::isfinite(options.perpendicularWeight)||options.perpendicularWeight<0||
+       !std::isfinite(options.parallelWeight)||options.parallelWeight<0)
         throw std::invalid_argument("invalid winding graph preparation settings");
+    if(options.perpendicularWeight<=0&&options.parallelWeight<=0&&!options.enclosures)
+        throw std::invalid_argument("winding graph preparation needs a positive parallel or perpendicular weight, or enclosures");
     if(in.b.count!=m||in.arcA.count!=m||in.arcB.count!=m||in.distance.count!=m||
        in.parallel.size()!=m||in.validA.size()!=m||in.validB.size()!=m||in.validConnector.size()!=m||
        in.normalA.size()!=m*3||in.normalB.size()!=m*3||in.connector.size()!=m*3||in.normalSign.size()!=n||
@@ -97,7 +119,7 @@ inline FiberWindingL1Columns prepareFiberWindingGraph(const PackedFiberGeometry&
         if(owner<-1||(owner>=0&&uint64_t(owner)>=n))throw std::invalid_argument("winding node outside catalog");
         return owner;
     };
-    struct Job {std::vector<Arc> arcs;size_t used{},expanded{};};
+    struct Job {std::vector<Arc> arcs;std::vector<EnclosureBound> enclosures;size_t used{},expanded{},withoutDistance{};};
     const size_t jobs=(m+options.constraintBatch-1)/options.constraintBatch;
     std::vector<Job> parts(jobs);
     vc::objects::parallelFor(jobs,options.workers,[&](size_t job){
@@ -113,21 +135,37 @@ inline FiberWindingL1Columns prepareFiberWindingGraph(const PackedFiberGeometry&
                 const auto connector=point(in.connector,k);
                 const int sign=int(fiberSignedOrder(connector,point(in.normalA,k,in.normalSign[a]),point(in.normalB,k,in.normalSign[b])));
                 const int delta=int(in.family[b]-in.family[a]);const bool parallel=in.parallel[k];
+                const double weight=parallel?options.parallelWeight:options.perpendicularWeight;
+                const bool enclosure=options.enclosures&&!parallel&&sign!=0;
+                if(weight<=0&&!enclosure)continue;
                 const double distance=in.distance[k]*options.windingScale;
-                if(!std::isfinite(distance)||distance<0)throw std::invalid_argument("invalid measured winding separation");
-                const auto plus=integerTarget(distance,1,delta,parallel,options.perpendicularOffset);
-                const auto minus=integerTarget(distance,-1,delta,parallel,options.perpendicularOffset);
-                if(sign==0&&plus!=minus)continue;
+                // NaN is a measured relation without a winding distance: it
+                // yields no automatic arc but still witnesses enclosures.
+                const bool hasDistance=!std::isnan(distance);
+                if(hasDistance&&(!std::isfinite(distance)||distance<0))throw std::invalid_argument("invalid measured winding separation");
+                if(!hasDistance&&weight>0)++part.withoutDistance;
+                const auto plus=hasDistance?integerTarget(distance,1,delta,parallel,options.perpendicularOffset):0;
+                const auto minus=hasDistance?integerTarget(distance,-1,delta,parallel,options.perpendicularOffset):0;
+                const bool usable=hasDistance&&weight>0&&!(sign==0&&plus!=minus);
+                if(!usable&&!enclosure)continue;
+                const auto start=geometry.sample(a,in.arcA[k]),finish=geometry.sample(b,in.arcB[k]);
+                const auto c=geometry.seam().transport(start.point,finish.point);
+                if(enclosure){
+                    // Transport-only shift of the a->b step; oriented from the H fiber.
+                    const bool forward=in.family[a]==0;
+                    const int64_t shift=(int64_t(c)-finish.turn)+start.turn;
+                    const int oriented=forward?sign:-sign;
+                    const int64_t step=forward?shift:-shift;
+                    part.enclosures.push_back({forward?a:b,forward?b:a,oriented,oriented>0?step:step-1});
+                }
+                if(!usable)continue;
                 const double outward=distance-sign*(parallel?0.:options.perpendicularOffset*delta);
                 const double minimum=!parallel&&sign*delta<0?1.:0.;
                 const double measured=sign==0?double(plus):sign*std::max(outward,minimum);
-                const auto start=geometry.sample(a,in.arcA[k]),finish=geometry.sample(b,in.arcB[k]);
-                const auto c=geometry.seam().transport(start.point,finish.point);
                 const double corrected=((measured+double(c))-double(finish.turn))+double(start.turn);
                 const double floor=std::floor(corrected),fraction=corrected-floor;
                 constexpr double safe=double(std::numeric_limits<int64_t>::max()/4);
                 if(!std::isfinite(corrected)||floor>safe||floor<-safe)throw std::invalid_argument("winding target outside supported integer range");
-                const double weight=parallel?1.:options.perpendicularWeight;
                 const auto append=[&](std::vector<Arc>& rows,int64_t target,double value){
                     rows.push_back(a>b?Arc{b,a,-target,value}:Arc{a,b,target,value});
                 };
@@ -141,8 +179,35 @@ inline FiberWindingL1Columns prepareFiberWindingGraph(const PackedFiberGeometry&
         aggregate(part.arcs);
     });
     FiberWindingL1Columns out;out.read=m;
-    for(const auto& part:parts){out.used+=part.used;out.expanded+=part.expanded;}
-    if(!out.used)throw std::invalid_argument("no usable winding constraints");
+    for(const auto& part:parts){out.used+=part.used;out.expanded+=part.expanded;out.withoutDistance+=part.withoutDistance;}
+    if(options.enclosures){
+        // Exact relations need every bound of a pair: gather, sort by pair,
+        // then accept pairs whose largest lower bound equals the smallest
+        // upper bound. Rejections are counted, never silently dropped arcs.
+        std::vector<EnclosureBound> bounds;
+        for(auto& part:parts){bounds.insert(bounds.end(),part.enclosures.begin(),part.enclosures.end());std::vector<EnclosureBound>().swap(part.enclosures);}
+        std::sort(bounds.begin(),bounds.end(),enclosureBefore);
+        std::vector<Arc> relations;
+        for(size_t i=0;i<bounds.size();){
+            size_t j=i;bool lowerSeen=false,upperSeen=false;int64_t lower=0,upper=0;
+            for(;j<bounds.size()&&bounds[j].h==bounds[i].h&&bounds[j].v==bounds[i].v;++j){
+                if(bounds[j].sign>0){lower=lowerSeen?std::max(lower,bounds[j].bound):bounds[j].bound;lowerSeen=true;}
+                else{upper=upperSeen?std::min(upper,bounds[j].bound):bounds[j].bound;upperSeen=true;}
+            }
+            ++out.enclosurePairs;
+            if(!lowerSeen||!upperSeen)++out.enclosureOneSided;
+            else if(lower>upper)++out.enclosureContradictory;
+            else if(lower<upper)++out.enclosureNonunique;
+            else relations.push_back(Arc{bounds[i].h,bounds[i].v,lower,1.});
+            i=j;
+        }
+        out.enclosureArcs=relations.size();
+        out.enclosureA=std::make_unique_for_overwrite<int64_t[]>(out.enclosureArcs);
+        out.enclosureB=std::make_unique_for_overwrite<int64_t[]>(out.enclosureArcs);
+        out.enclosureTarget=std::make_unique_for_overwrite<int64_t[]>(out.enclosureArcs);
+        for(size_t i=0;i<out.enclosureArcs;++i){out.enclosureA[i]=relations[i].a;out.enclosureB[i]=relations[i].b;out.enclosureTarget[i]=relations[i].target;}
+    }
+    if(!out.used&&!out.enclosureArcs)throw std::invalid_argument("no usable winding constraints");
     // Merge independent sorted job outputs in disjoint A-node ranges. Equal
     // keys are summed in the same job order as concatenation+stable lexsort.
     const size_t ranges=std::min(std::max(size_t(1),n),options.workers);

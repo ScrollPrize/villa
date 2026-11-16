@@ -198,13 +198,24 @@ def _run_direct_stage(stage, config):
                      p_h=probabilities[:,0],p_v=probabilities[:,1],p_broken=probabilities[:,2])
         result_stage='classification'
     else:
-        selected=_selected_run(config['database'],'classification',config.get('input_run_uuid'))
         prior=json.loads(Path(config['priors']).read_text())
         base=_base_database(config,prior['source_store'])
         graph=_graph(config,base)
-        classifications=_fiber_columns(config['database'],selected,graph.ids,required=('enabled',),exact=True)
-        keep=np.asarray(classifications['enabled'],np.float32)
+        classifications=None
+        if config.get('classification','run')=='record':
+            # Stored annotation tags select the H/V fibers; no classification run is pinned.
+            from .fiber_graph_store import fiber_families_from_record
+            if config.get('input_run_uuid') is not None:raise ValueError('classification record takes no input run selector')
+            family,tag_counts=fiber_families_from_record(base,graph.ids,config.get('record_family','any'))
+            keep=(family>=0).astype(np.float32)
+            print(json.dumps(dict(stage='sign_record_family',record_family=tag_counts)),flush=True)
+        elif config.get('classification','run')=='run':
+            selected=_selected_run(config['database'],'classification',config.get('input_run_uuid'))
+            classifications=_fiber_columns(config['database'],selected,graph.ids,required=('enabled',),exact=True)
+            keep=np.asarray(classifications['enabled'],np.float32)
+        else:raise ValueError('classification must be run or record')
         if not np.isin(keep,[0,1]).all():raise ValueError('Classification enabled mask is not binary')
+        if not keep.any():raise ValueError('No enabled H/V fibers for sign alignment')
         settings.update(database=str(base),fixed_keep=True)
         data,stats=normal.prepare(settings,graph=graph,return_arrays=True,prior=prior)
         data['keep']=keep

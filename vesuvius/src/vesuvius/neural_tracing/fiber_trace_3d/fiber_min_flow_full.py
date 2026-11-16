@@ -37,7 +37,8 @@ class PackedPaths:
         self.keys=np.load(self.root/'keys.npy',mmap_mode=mode)
         self.xyz=np.load(self.root/'xyz.npy',mmap_mode=mode)
         self.turns=np.load(self.root/'turns.npy',mmap_mode=mode)
-        self.seam=Seam(self.catalog['axis'])
+        # Legacy caches predate the stated handedness; they were built with +1.
+        self.seam=Seam(self.catalog['axis'],handedness=int(self.catalog['handedness']) if 'handedness' in self.catalog else 1)
         self._initialize_index()
 
     def _initialize_index(self):
@@ -65,13 +66,15 @@ class PackedPaths:
         result=cls.__new__(cls);result.root=None;result.data=None
         result.ids=selected;result.offset=np.asarray(packed.offsets,dtype=np.int64)
         result.xyz=packed.values
-        axis=load_umbilicus_frame(config['umbilicus'],volume)
-        result.seam=Seam(axis)
-        columns=pack_winding_geometry(result.offset,result.xyz,axis,result.seam.angle,
+        axis=load_umbilicus_frame(config['umbilicus'],volume,store=source)
+        from .fiber_graph_store import winding_handedness
+        handedness=winding_handedness(config,source,volume)
+        result.seam=Seam(axis,handedness=handedness)
+        columns=pack_winding_geometry(result.offset,result.xyz,axis,result.seam.angle,handedness,
                                       workers=int(config.get('workers',32)))
         result.keys=dict(arc=columns['arc'],source=columns['source'])
         result.turns=columns['turns'];result.volume=volume
-        result.catalog=dict(source_id=selected,point_offset=result.offset,axis=axis,volume=np.array(volume))
+        result.catalog=dict(source_id=selected,point_offset=result.offset,axis=axis,volume=np.array(volume),handedness=handedness)
         result._initialize_index()
         return result
 

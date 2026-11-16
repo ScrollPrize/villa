@@ -250,9 +250,12 @@ def solve_tensor_matrix(config,module):
     return summary
 
 
-def launch_tensor_solve(config,module,source):
-    """Shared managed CUDA launch for fixed-evidence optimization stages."""
-    from .managed_evaluation import launch_managed
+def freeze_solver_config(config,source):
+    """Record code provenance and freeze the stage configuration under output_root.
+
+    Shared by the managed CUDA launcher and in-process CPU solves so both
+    leave the same ``config.json``/``summary.json`` artifacts.
+    """
     repo=Path(__file__).resolve().parents[5]
     config=dict(config,code_provenance=dict(
         revision=subprocess.check_output(['git','rev-parse','HEAD'],cwd=repo,text=True).strip(),
@@ -264,6 +267,14 @@ def launch_tensor_solve(config,module,source):
     frozen=root/'config.json'
     if (root/'summary.json').exists(): raise FileExistsError('Completed output exists')
     atomic_write(frozen,config,durable=False)
+    return config,frozen
+
+
+def launch_tensor_solve(config,module,source):
+    """Shared managed CUDA launch for fixed-evidence optimization stages."""
+    from .managed_evaluation import launch_managed
+    config,frozen=freeze_solver_config(config,source)
+    root=Path(config['output_root'])
     command=[sys.executable,'-m',module,'--config',str(frozen)]
     rc=launch_managed(command,devices=config.get('devices','0'),settings=config['gpu_manager'])
     if rc: raise RuntimeError(f'Managed sign solver exited {rc}')

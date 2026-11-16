@@ -20,7 +20,7 @@ Each stage accepts an optional profile name or arbitrary JSON configuration file
 
 The `import` subcommand accepts AFV databases through the native parallel/sharded importer. An existing compatible vcobj fiber store, including the neural full-volume tracer's `fibers.vcobj`, starts at `extract`; no AFV conversion, reimport or producer changes are required. Independent Python adapters also accept completed compound stream-tracer tiles and reduced route pages, but those formats are not yet selectable backends of the `import` subcommand. See [accepted inputs](wgraph-quickstart.md#accepted-fiber-inputs) for their entry points and preparation limitations.
 
-The current winding command consumes extracted measurements and saved classification/sign runs, not arbitrary pre-existing `fiber_branch` annotation links. H/V/broken and normal signs use wrapped IRLS; winding uses linear GPU IRLS; UV uses the fixed-assignment optimizer described below. The separate LEMON comparison implementation is not a selectable `vc_wgraph winding` backend. There is no `vc_wgraph compare` subcommand. Existing application reference-evaluation helpers do not change these command-line capabilities.
+The winding command consumes extracted measurements with saved classification/sign runs, or the fibers' stored H/V tags, and optionally the scaffold's `fiber_branch` annotation links (see [winding inputs and weights](#winding-inputs-and-weights)). H/V/broken and normal signs use wrapped IRLS; winding uses linear GPU IRLS or the CPU LEMON min-cost-flow backend (see [LEMON backend](#lemon-backend)); UV uses the fixed-assignment optimizer described below. There is no `vc_wgraph compare` subcommand. Existing application reference-evaluation helpers do not change these command-line capabilities.
 
 | Stage | Input configuration key | Output store key | Other outputs |
 |---|---|---|---|
@@ -67,6 +67,39 @@ Packaged stage defaults are merged first, then the selected common and stage set
 Stages produce new stores rather than mutating inputs. Derived result stores reference their chosen upstream stores; classification, sign, winding and UV results can therefore be rerun independently of extraction. The native extraction stage publishes normal-aligned standard measurement data; staging internals are not a public graph format. See [fiber workflows](fiber_workflows.md) for the graph schemas and detailed stage output fields.
 
 The store chain is `import → extract → hvb → sign → winding → uv`. `winding` consumes typed classification and normal-sign runs from its input store references, builds the existing fractional-target L1 graph, and runs the historic linear GPU IRLS solver (15 reweighting rounds, 500 CG iterations, epsilon .05 unless explicitly overridden). It records integer readout, continuous potential, connected component and residual metrics. These are point estimates, not calibrated winding probabilities. No GT labels, spiral reference solution or external solver-source file is required. The measured geometry and umbilicus working-coordinate binding remain required inputs for seam transport.
+
+### Winding inputs and weights
+
+`winding` assembles one weighted integer L1 arc list from up to three constraint types and solves it with the selected backend:
+
+| Setting | Values | Meaning |
+|---|---|---|
+| `weights.parallel`, `weights.perpendicular` | `>= 0`, default 1 | Automatic measured constraints from extraction (same-family and H/V), per expanded fractional-target arc. Zero omits the type. |
+| `weights.enclosure` | `>= 0`, default 0 | Exact H->V relations derived from signed perpendicular events of one pair (largest lower bound equal to smallest upper bound, after seam and connector transport); one extra arc per accepted pair, the witnessing perpendicular arcs remain. Pairs that are one-sided, contradictory or non-unique are counted, not used. |
+| `weights.manual` | `>= 0`, default 0 | The scaffold's `fiber_branch` links read from the resolved geometry store. Ordinary links assert the same winding at their anchors; adjacent links assert the V fiber one winding inside the H fiber (`W_V = W_H - 1`, from the stored tags only). Same-family adjacent links, links to disabled fibers and links outside the selected approval states are skipped and counted. |
+| `manual_links.approval_states` | list, default `["approved"]` | Approval states of links to use. |
+| `manual_links.include_auto` | bool, default false | Also use pending automatic (`meta.auto`) links. |
+| `manual_links.max_anchor_distance` | voxels, default 5 | Anchors farther from their fiber polyline fail the run (coordinate-frame guard). |
+| `classification` | `run` (default), `record` | Families from the pinned classification run, or from the fiber records' `family` column (`record_family`: `any`, `manual`, `automatic` selects by `manual_family`). With `record` no `hvb` run is needed. |
+| `normal_sign` | `run` (default), `none` | A pinned normal-sign run, or none. `none` is only valid with zero automatic weights (manual links only) and `classification: record`; such a run pins no input run. |
+| `umbilicus` | path or `store` | The legacy umbilicus document, or the input store's own umbilicus object (which retains that document's metadata). |
+| `handedness` | `+1`, `-1` | The scroll's winding direction for seam transport: `+1` when the winding index grows with increasing angle around the umbilicus, `-1` otherwise. Normally not set here: the stage reads it from the store umbilicus object's `winding_handedness` meta (`vc_wgraph handedness -i store.vcobj --set -1`), else from the open-data catalog orientation (`-1` when exactly one of `z_direction_is_top_to_bottom` and `left_handed_coordinates` holds, as VC3D reads it). A volume whose handedness is stated nowhere is an error, never a guess. The run records the value used. |
+
+Extraction with `winding_distances: false` (no winding manifest, see [fiber workflows](fiber_workflows.md)) yields measurements without distances: they contribute no parallel/perpendicular arcs (counted as `without_distance`) but still witness enclosures and feed the sign stage.
+
+The anchor relation of a manual link is converted to a whole-fiber step with the same seam and connector transport the automatic constraints use (`target = step + connector - turns_b + turns_a`). Arcs of all types are aggregated by (a, b, target) before solving, so the weights add up per identical relation. Each run records the weights, link counts and enclosure counts in its settings; the former single `perpendicular_relative_weight` is rejected. Without automatic constraints no extraction is needed: the nodes are the store's active H/V fibers, and the geometry is read from the fibers' bound volume. The `sign` stage accepts `classification: record` the same way.
+
+### LEMON backend
+
+`optimizer: lemon` solves the assembled arc list exactly as a capacitated minimum-cost circulation with LEMON (`lemon.backend`: `network_simplex` (default) or `cost_scaling`), built into `vc_object_store` (`VC_OBJECT_STORE_WITH_LEMON`, `liblemon-dev`). Weights become integer capacities `round(weight * lemon.capacity_scale)` (default 1000); arcs rounding to zero are dropped and reported. The result is an exact integer optimum of the quantized objective: `selected_winding` holds the integer windings directly, `winding_mean` repeats them, and the run metrics report the original-weight L1 residuals. It runs on the CPU in the calling process with no GPU-manager grant, torch or `devices` setting, and writes the same frozen `config.json` (with code provenance) and `summary.json` under `output_root`. It is intended for small problems such as manual scaffolds: LEMON's int indices bound nodes and arcs below about 500 million, the solver is single-threaded, and memory grows with the arc count; full-volume graphs stay with `optimizer: irls`.
+
+Manual scaffold solve from a store that holds fibers, tags, links and an umbilicus:
+
+```sh
+vc_wgraph winding lemon-scaffold -i scaffold.vcobj -o windings.vcobj
+```
+
+The packaged `lemon-scaffold` profile selects the LEMON backend, tags, no sign run, the store umbilicus, manual links (approved and pending, no automatic links) and zero automatic weights; add a `sign` run and nonzero automatic weights in a local profile to combine scaffold links with extracted constraints.
 
 `uv` consumes a selected saved winding run, fixes those integer assignments, and invokes the existing straight fixed-length UV optimizer. It records evaluated sampled UV positions, widths and fiber assignments in a referenced result store, without copying geometry. Generic `vc_wgraph` UV uses `component_selection: "all"`; explicitly choose `"largest"` to reproduce the historical largest-component experiment. Fibers without perpendicular support are excluded by the existing fixed-length model rather than assigned fallback geometry. Exact packed-path prior preparation uses the measured geometry and interpolation; solver weights and GPU-manager settings can be provided under `parameters` and `gpu_manager` respectively.
 

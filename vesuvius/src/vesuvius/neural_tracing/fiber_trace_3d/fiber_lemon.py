@@ -1,12 +1,11 @@
-"""Optional native network-simplex/cost-scaling comparison on cached flow graphs."""
-import ctypes
+"""Native network-simplex/cost-scaling comparison on cached flow graphs.
+
+The solver is the LEMON circulation built into ``vc_object_store``
+(``solve_winding_min_cost_flow``); quantization here is the explicit
+reference the experiments report against.
+"""
 import json
-import os
 from pathlib import Path
-import shlex
-import subprocess
-import sys
-import tempfile
 import time
 
 import numpy as np
@@ -15,63 +14,6 @@ from .fiber_min_flow import aggregate_l1_edges, certify_flow, solve
 from .fiber_min_flow_experiment import arrays, digest, write
 from .fiber_min_flow_benchmark import Paths, graph
 from .fiber_min_flow_evaluation import sign_counts
-
-
-def instrument_header(text):
-    """Insert read-only hooks; fail closed if the installed algorithm changes."""
-    start=text.index('    void startAugment(int max_length) {')
-    end=text.index('    void startPush() {',start)
-    section=text[start:end]
-    phase='        ++eps_phase_cnt;'
-    loop='        while (true) {'
-    if section.count(phase)!=1 or section.count(loop)!=1:
-        raise ValueError('Unsupported LEMON cost-scaling header for progress instrumentation')
-    hook='::fiber_lemon_progress(*this, double(_res_node_num) * _alpha, _epsilon, _excess);'
-    section=section.replace('      int eps_phase_cnt = 0;', '      int eps_phase_cnt = 0;\n      unsigned long long report_tick = 0;')
-    section=section.replace(phase,phase+'\n        '+hook)
-    section=section.replace(loop,loop+'\n          if ((++report_tick & 65535) == 0) '+hook)
-    return text[:start]+section+text[end:]
-
-
-def build_native(output, compiler=None, *, progress=False):
-    """Explicit optional build; never installs packages or modifies environment."""
-    output = Path(output).resolve(); output.parent.mkdir(parents=True, exist_ok=True)
-    source = Path(__file__).with_name('fiber_lemon.cpp')
-    cxx = shlex.split(compiler or os.environ.get('CXX', 'c++'))
-    flags = shlex.split(subprocess.check_output(['pkg-config','--cflags','--libs','lemon'], text=True))
-    # Ubuntu's 1.3.1 lemon.pc incorrectly emits -lemon (libemon), although
-    # the installed library is liblemon. Preserve all other package flags.
-    flags = ['-llemon' if flag=='-lemon' else flag for flag in flags]
-    header_hash=None
-    if progress:
-        include=Path(subprocess.check_output(['pkg-config','--variable=includedir','lemon'],text=True).strip())
-        header=include/'lemon/cost_scaling.h'
-        header_hash=digest(header)
-        generated=output.parent/'instrumented/lemon/cost_scaling.h'
-        generated.parent.mkdir(parents=True,exist_ok=True)
-        generated.write_text(instrument_header(header.read_text()))
-        header_hash+=':'+digest(generated)
-        flags=['-I'+str(generated.parent.parent),*flags]
-    version = subprocess.check_output([*cxx, '--version'], text=True).splitlines()[0]
-    build = dict(source_sha256=digest(source), compiler=version, compiler_command=cxx, flags=flags,
-                 mode='Release -O3 -DNDEBUG -std=c++17; no fast-math',
-                 lemon=subprocess.check_output(['pkg-config','--modversion','lemon'],text=True).strip(),
-                 progress_header_sha256=header_hash)
-    metadata = output.with_suffix('.build.json')
-    if output.exists() and metadata.exists() and json.loads(metadata.read_text()) == build:
-        return output
-    with tempfile.NamedTemporaryFile(dir=output.parent, prefix='lemon-build-', delete=False) as f:
-        temporary = Path(f.name)
-    try:
-        command = [*cxx, '-O3', '-DNDEBUG', '-std=c++17', '-fPIC',
-                   '-dynamiclib' if sys.platform=='darwin' else '-shared',
-                   str(source), '-o', str(temporary), *flags]
-        subprocess.run(command, check=True)
-        os.replace(temporary, output)
-        write(metadata, build)
-    finally:
-        temporary.unlink(missing_ok=True)
-    return output
 
 
 def quantize(g, scale):
@@ -99,46 +41,32 @@ def quantize(g, scale):
                    capacity_absolute_error=float(np.abs(capacity/scale-w).sum()))
 
 
-def native_solve(library, nodes, q, backend, *, progress_path=None, original_graph=None,
-                 reference_mean=1., progress_interval=20.):
+def native_solve(nodes, q, backend):
+    """Exact integer solve of a quantized graph through the native LEMON binding."""
+    from vc_object_store import solve_winding_min_cost_flow, winding_min_cost_flow_available
     if backend not in ('network_simplex','cost_scaling'):
         raise ValueError('Unknown LEMON backend')
+    if not winding_min_cost_flow_available():
+        raise RuntimeError('vc_object_store was built without LEMON (VC_OBJECT_STORE_WITH_LEMON)')
     shape=np.shape(q['a'])
     if len(shape)!=1 or any(np.shape(q[k])!=shape for k in ('b','target','capacity')):
         raise ValueError('Graph arrays must have matching one-dimensional shapes')
     if nodes < 1 or nodes!=int(nodes):raise ValueError('Positive integer node count required')
     if np.any(q['target'] != np.rint(q['target'])):
         raise ValueError('Integer arc targets required')
-    if int(np.max(abs(q['target']), initial=0))*(nodes+1)**2 > 2**60:
-        raise ValueError('Potential cost-scaling overflow')
-    lib = ctypes.CDLL(str(library)); fn = lib.fiber_lemon_solve
-    vec = np.ctypeslib.ndpointer(dtype=np.int64,ndim=1,flags='C_CONTIGUOUS')
-    if progress_path is not None:
-        if original_graph is None or reference_mean<=0 or progress_interval<0:
-            raise ValueError('Progress requires original graph and positive reference mean')
-        original={k:np.ascontiguousarray(original_graph[k],dtype=np.int64) for k in ('a','b','target')}
-        original['weight']=np.ascontiguousarray(original_graph['weight'],dtype=np.float64)
-        setter=lib.fiber_lemon_set_progress
-        setter.argtypes=[ctypes.c_char_p,ctypes.c_int64,ctypes.c_int64,vec,vec,vec,
-                         np.ctypeslib.ndpointer(dtype=np.float64,ndim=1,flags='C_CONTIGUOUS'),
-                         ctypes.c_double,ctypes.c_double,ctypes.c_double]
-        setter.restype=None
-        setter(os.fsencode(progress_path),nodes,len(original['a']),original['a'],original['b'],original['target'],
-               original['weight'],float(original['weight'].sum()),reference_mean,progress_interval)
-    fn.argtypes = [ctypes.c_int,ctypes.c_int64,ctypes.c_int64,vec,vec,vec,vec,vec,vec,
-                  np.ctypeslib.ndpointer(dtype=np.float64,ndim=1,flags='C_CONTIGUOUS'),
-                  ctypes.c_char_p,ctypes.c_size_t]
-    fn.restype = ctypes.c_int
-    winding = np.empty(nodes,np.int64); flow = np.empty(len(q['a']),np.int64)
-    timing = np.zeros(5); error = ctypes.create_string_buffer(2048)
-    status = fn(0 if backend=='network_simplex' else 1,nodes,len(flow),q['a'],q['b'],q['target'],
-                q['capacity'],winding,flow,timing,error,len(error))
-    if status: raise RuntimeError(error.value.decode())
-    result = certify_flow(nodes,q['a'],q['b'],q['target'],q['capacity'].astype(float),
-        np.zeros(len(flow),bool),winding,flow.astype(float),seconds=float(timing[-1]),iterations=0)
+    capacity=np.ascontiguousarray(q['capacity'],dtype=np.int64)
+    if np.any(capacity<=0):raise ValueError('Quantized capacities must be positive')
+    # Capacities are already integers: scale 1 keeps them exactly.
+    native=solve_winding_min_cost_flow(int(nodes),np.ascontiguousarray(q['a'],dtype=np.int64),
+        np.ascontiguousarray(q['b'],dtype=np.int64),np.ascontiguousarray(q['target'],dtype=np.int64),
+        capacity.astype(np.float64),backend=backend,capacity_scale=1)
+    winding=np.asarray(native['winding'],np.int64);flow=np.asarray(native['flow'],np.int64)
+    timing=native['timing']
+    result = certify_flow(nodes,q['a'],q['b'],q['target'],capacity.astype(float),
+        np.zeros(len(flow),bool),winding,flow.astype(float),seconds=float(timing['total']),iterations=0)
     result['certificate']['backend'] = 'LEMON '+backend
     result['certificate']['iterations'] = None  # library does not expose iteration count
-    result['native_timing'] = dict(zip(('graph','setup','solve','export','total'),map(float,timing)))
+    result['native_timing'] = dict(graph=float(timing['graph']),setup=0.,solve=float(timing['solve']),export=0.,total=float(timing['total']))
     return result
 
 
@@ -169,7 +97,6 @@ def run(config):
     root = Path(config['output_root']); root.mkdir(parents=True,exist_ok=True)
     if (root/'request.json').exists():raise ValueError('Choose a fresh benchmark output directory')
     write(root/'request.json',config)
-    library = build_native(root/('fiber_lemon.dylib' if sys.platform=='darwin' else 'fiber_lemon.so'))
     dataset = config['dataset']; d=arrays(dataset['tensor_cache'])
     paths=Paths(dataset,d); raw,transport=graph(dataset,d,paths)
     g=aggregate_l1_edges(raw['a'],raw['b'],raw['target'],raw['weight'])
@@ -200,7 +127,7 @@ def run(config):
             timings=[]; totals=[]
             for repeat in range(repeats):
                 write(root/'progress.json',dict(stage='solve',scale=scale,backend=backend,repeat=repeat+1))
-                t=time.monotonic(); result=native_solve(library,len(d['source_id']),q,backend)
+                t=time.monotonic(); result=native_solve(len(d['source_id']),q,backend)
                 totals.append(time.monotonic()-t);timings.append(result['native_timing'])
                 np.testing.assert_allclose(result['certificate']['primal'],lp['certificate']['primal'],rtol=1e-12)
             samples=np.array([x['total'] for x in timings]); kernel=np.array([x['solve'] for x in timings])
@@ -234,10 +161,10 @@ def run_full(config):
     nodes=len(catalog['source_id']);scale=config.get('scale',1)
     q,quantization=quantize(g,scale)
     write(root/'quantization.json',quantization)
-    library=build_native(root/('fiber_lemon.dylib' if sys.platform=='darwin' else 'fiber_lemon.so'),progress=True)
+    if 'progress_interval' in config:
+        raise ValueError('progress_interval was removed with the runtime-compiled adapter; the native solve reports no mid-solve snapshots')
     write(root/'progress.json',dict(stage='native_setup',nodes=nodes,arcs=len(q['a']),scale=scale))
-    result=native_solve(library,nodes,q,'cost_scaling',progress_path=root/'progress.json',
-        original_graph=g,reference_mean=config['reference_mean'],progress_interval=config.get('progress_interval',20.))
+    result=native_solve(nodes,q,'cost_scaling')
     k=result['winding'];objective=0.
     for start in range(0,len(g['a']),1000000):
         sl=slice(start,start+1000000)

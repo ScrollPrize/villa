@@ -12,12 +12,16 @@ namespace vc::geometry {
 
 // Half-surface from a piecewise-linear umbilicus toward a fixed XY ray.
 // Transport belongs to the positive-angle side; axis intersections are invalid.
+// handedness (+1/-1) is the scroll's winding direction: +1 when the winding
+// index grows with increasing atan2 around the axis, -1 when it grows the
+// other way. It is a property of the scroll and must be stated, never guessed.
 class WindingSeam {
 public:
-    explicit WindingSeam(std::span<const Point> axis,double angle=-std::numbers::pi/2)
-        :axis_(axis.begin(),axis.end()),angle_(angle),ray_{std::cos(angle),std::sin(angle)}
+    explicit WindingSeam(std::span<const Point> axis,double angle=-std::numbers::pi/2,int handedness=1)
+        :axis_(axis.begin(),axis.end()),angle_(angle),handedness_(handedness),ray_{std::cos(angle),std::sin(angle)}
     {
         if(!std::isfinite(angle))throw std::invalid_argument("nonfinite seam angle");
+        if(handedness!=1&&handedness!=-1)throw std::invalid_argument("winding handedness must be +1 or -1");
         std::sort(axis_.begin(),axis_.end(),[](const auto& a,const auto& b){return a[2]<b[2];});
         if(axis_.size()<2)throw std::invalid_argument("axis needs distinct increasing Z coordinates");
         for(size_t i=0;i<axis_.size();++i){
@@ -28,6 +32,7 @@ public:
     }
     const std::vector<Point>& axis()const{return axis_;}
     double angle()const{return angle_;}
+    int handedness()const{return handedness_;}
     std::array<double,2> ray()const{return ray_;}
     std::array<double,2> relative(const Point& p)const{
         for(const auto value:p)if(!std::isfinite(value))throw std::invalid_argument("nonfinite path");
@@ -48,10 +53,12 @@ public:
     int64_t transport(const Point& a,const Point& b)const{
         const auto interval=[&](double z){return std::upper_bound(axis_.begin(),axis_.end(),z,
             [](double value,const auto& point){return value<point[2];})-axis_.begin();};
-        if(interval(a[2])==interval(b[2]))return crossing(relative(a),relative(b));
+        if(interval(a[2])==interval(b[2]))return handedness_*crossing(relative(a),relative(b));
         return segment(a,b);
     }
-    int64_t segment(const Point& a,const Point& b)const{
+    int64_t segment(const Point& a,const Point& b)const{return handedness_*segmentRaw(a,b);}
+private:
+    int64_t segmentRaw(const Point& a,const Point& b)const{
         const auto at=[&](double t){Point p;for(size_t k=0;k<3;++k)p[k]=a[k]+t*(b[k]-a[k]);return relative(p);};
         auto previous=at(0.);int64_t winding=0;
         const auto step=[&](double z){
@@ -68,7 +75,6 @@ public:
         winding+=crossing(previous,at(1.));
         return winding;
     }
-private:
     int64_t crossing(const std::array<double,2>& a,const std::array<double,2>& b)const{
         const double dx=b[0]-a[0],dy=b[1]-a[1];
         const double t=std::clamp(-(a[0]*dx+a[1]*dy)/std::max(dx*dx+dy*dy,1e-300),0.,1.);
@@ -83,6 +89,7 @@ private:
     }
     std::vector<Point> axis_;
     double angle_;
+    int handedness_=1;
     std::array<double,2> ray_;
 };
 

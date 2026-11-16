@@ -7409,3 +7409,31 @@ TEST_CASE("Spatial chunk ownership retains original arc grid and emits boundary 
 }
 
 }  // namespace
+
+TEST_CASE("Geometry-only extraction keeps every relation without a winding distance") {
+    using namespace vc::fiber_tracer;
+    std::vector<FiberletCropTraceLine> lines(16);
+    for(int i=0;i<8;++i) {
+        lines[i].pointsBaseXYZ={{0.,64.*i,0.},{512.,64.*i,0.}};
+        lines[8+i].pointsBaseXYZ={{64.*i,0.,20.},{64.*i,512.,20.}};
+    }
+    FiberTraceConstraintConfig cfg;
+    cfg.localEvents=true;cfg.localKeepWholeFibers=true;cfg.parallelThreads=4;
+    cfg.certifyWinding=false;cfg.enforceMaximumWindingDistance=false;cfg.candidateBatchSize=64;
+    const auto sampler=[](const auto&,const auto&,double){return .5;};
+    const auto measured=extractFiberTraceConstraints(lines,cfg,sampler);
+    // Without a sampler the measured mode refuses; the geometry-only mode does not need one.
+    CHECK_THROWS(extractFiberTraceConstraints(lines,cfg,{}));
+    FiberTraceConstraintConfig geometryOnly=cfg;geometryOnly.measureWindingDistances=false;
+    const auto unmeasured=extractFiberTraceConstraints(lines,geometryOnly,{});
+    CHECK(unmeasured.constraints.size()==measured.constraints.size());
+    CHECK(unmeasured.rejectedWinding==0);
+    for(size_t i=0;i<unmeasured.constraints.size();++i) {
+        const auto& a=measured.constraints[i];const auto& b=unmeasured.constraints[i];
+        CHECK(a.pieceA==b.pieceA);CHECK(a.pieceB==b.pieceB);
+        CHECK(a.arcABaseVoxels==b.arcABaseVoxels);CHECK(a.arcBBaseVoxels==b.arcBBaseVoxels);
+        CHECK(a.parallelScore==b.parallelScore);CHECK(a.perpendicularScore==b.perpendicularScore);
+        CHECK(std::isnan(b.windingDistance));CHECK(std::isnan(b.parallelWindingDistance));
+        CHECK_FALSE(b.signedWindingDelta.has_value());
+    }
+}

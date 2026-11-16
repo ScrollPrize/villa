@@ -24,7 +24,7 @@ vc_wgraph uv settings.json -i windings.vcobj -o uv.vcobj
 | `extract` | Finds/refines parallel and perpendicular candidates, samples prediction data, and stitches piece-local normal orientations. | Standard measured constraints and outward-normal prior report. |
 | `hvb` | Classifies fibers as horizontal, vertical, or broken using wrapped IRLS. | Per-fiber classification and relation-consistency metrics. |
 | `sign` | Aligns whole-fiber normal signs with classification fixed, using wrapped IRLS. | Per-fiber signs and disagreement metrics. |
-| `winding` | Solves the fractional-target L1 graph using GPU IRLS/CG. | Continuous winding potentials, integer readout, components, and residual metrics. |
+| `winding` | Solves the weighted integer L1 graph (automatic, enclosure and manual-link arcs) with GPU IRLS/CG or the exact CPU LEMON min-cost-flow backend. | Winding potentials or exact integers, integer readout, components, and residual metrics. |
 | `uv` | Fixes winding assignments and fits straight, fixed-length fiber layouts and winding widths using Gauss–Newton/CG. | Sampled UV positions, fitted widths, assignments, and meeting-error metrics. |
 
 These are separate commands, not one automatic pipeline invocation. A stage creates a new output store; it does not modify its input. Derived stores reference upstream stores rather than copying their geometry. Keep those referenced stores accessible. To rerun a later stage, reuse the existing upstream output and choose a new output path; there is no need to repeat import or extraction.
@@ -43,6 +43,17 @@ These are separate commands, not one automatic pipeline invocation. A stage crea
 | Application-owned polylines/records | Shared initial-fiber / native initial-import APIs | Requires a source adapter; not an additional auto-detected CLI file format. |
 
 The two tracer adapters are Python modules under `vesuvius.neural_tracing.fiber_trace_3d`, not selectable input backends of `vc_wgraph import`. They use the shared native bulk writer but currently materialize records in Python first; their preparation cost is not covered by the AFV runtime below. Both preserve source-derived UUIDs and import unknown family labels for subsequent H/V classification. See [tracer adapter settings](fiber_workflows.md#route-page-import) and the [source-independent native construction API](../../vc_object_store/docs/initial-import.md). Coordinate frames must match; a file containing polylines alone is not sufficient to infer the volume binding.
+
+### Manual scaffold workflow (record families and links only)
+
+A manual scaffold store (fibers with H/V families in their records, `fiber_branch` links and an umbilicus object) needs neither extraction nor a GPU:
+
+```sh
+vc_object_convert scaffold-v21.vcobj scaffold.vcobj   # only for stores older than schema 22
+vc_wgraph winding lemon-scaffold -i scaffold.vcobj -o windings.vcobj
+```
+
+The packaged `lemon-scaffold` profile reads families from the fiber records, uses approved and pending manual links with the LEMON backend, and takes the umbilicus from the store. To add extracted constraints, run `extract` and `sign` (with `classification: record`) and set nonzero `weights.parallel`/`weights.perpendicular`/`weights.enclosure` in a local profile; see the [full guide](wgraph.md#winding-inputs-and-weights).
 
 ### Neural tracer vcobj workflow (skip import)
 

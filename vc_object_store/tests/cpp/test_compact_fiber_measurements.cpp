@@ -18,7 +18,11 @@ void codec(){
     require(!encodeFiberWindingDistance(std::nextafter(15.875,16.)),"skip before rounding above maximum");
     for(int i=0;i<=254;++i){const auto code=encodeFiberWindingDistance(i/16.);
         require(code&&decodeFiberWindingDistance(std::array<uint8_t,1>{*code})==i/16.,"distance grid round trip");}
-    mustFail([]{decodeFiberWindingDistance(std::array<uint8_t,1>{0});});
+    require(*encodeFiberWindingDistance(std::numeric_limits<double>::quiet_NaN())==kFiberWindingDistanceUnknown,"NaN is the no-distance code");
+    require(std::isnan(decodeFiberWindingDistance(std::array<uint8_t,1>{kFiberWindingDistanceUnknown})),"no-distance code reads back as NaN");
+    mustFail([]{encodeFiberWindingDistance(-1.);});
+    mustFail([]{encodeFiberWindingDistance(std::numeric_limits<double>::infinity());});
+    mustFail([]{decodeFiberWindingDistance(std::array<uint8_t,2>{0,0});});  // byte 0 is now the no-distance code; only the size is invalid
     for(const std::array<double,3> n:std::array<std::array<double,3>,7>{{{0,0,1},{0,0,-1},{1,0,0},{1,0,1e-10},{1,0,-1e-10},{.3,.4,.5},{-.3,.4,-.5}}}){
         const auto bytes=encodeFiberDirection(n);const auto shared=vcr::normal::encodeCompactAxis(n);
         require(bytes.size()==3&&shared&&bytes[0]==(*shared)[0]&&bytes[1]==(*shared)[1],"shared normal encoder bytes");

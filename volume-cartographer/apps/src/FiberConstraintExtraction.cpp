@@ -59,6 +59,9 @@ vc::fiber_tracer::FiberTraceConstraintConfig extractionOptions(
     options.crossQueryPrefix=crossQueryPrefix;
     if(crossQueryPrefix>=lineCount&&crossQueryPrefix)throw std::invalid_argument("Cross query prefix must leave reference lines");
     options.certifyWinding=cfg.value("certify_winding",false);
+    // winding_distances:false measures geometry and normals only; the
+    // stored constraints carry no winding distance (byte 0).
+    options.measureWindingDistances=cfg.value("winding_distances",true);
     options.enforceMaximumWindingDistance=cfg.value("enforce_maximum_winding",false);
     options.closestParallelEstimator=cfg.value("closest_parallel_estimator",false);
     options.localParallelReciprocal=cfg.value("parallel_reciprocal",false);
@@ -198,10 +201,16 @@ int runFiberConstraintExtraction(int argc, char** argv)
     if(normalSource=="fiber"){
         // Compound sheet normals carry no winding density: their validity is
         // the prediction's (chunk existence or a channel), not a measurement.
-        if(!cfg.contains("orient_database") && !cfg.value("axial_prior_only",false) && !cfg.contains("winding_manifest"))
-            throw std::invalid_argument("Fiber sheet normals require an independent Lasagna winding_manifest for extraction");
+        if(!cfg.contains("orient_database") && !cfg.value("axial_prior_only",false) && !cfg.contains("winding_manifest") &&
+           cfg.value("winding_distances",true))
+            throw std::invalid_argument("Fiber sheet normals require an independent Lasagna winding_manifest for extraction, or winding_distances:false");
         dataset=vc::lasagna::fiberSheetNormalDataset(dataset);
-    }else if(normalSource!="lasagna")throw std::invalid_argument("normal_source must be lasagna or fiber");
+    }else if(normalSource=="geometry"){
+        // Strip normals from the fiber geometry (chunk pipeline). The manifest
+        // still supplies the base shape and, unless winding_distances is
+        // false, the winding density.
+        if(!cfg.value("chunk_pipeline",true))throw std::invalid_argument("normal_source geometry requires the chunk pipeline");
+    }else if(normalSource!="lasagna")throw std::invalid_argument("normal_source must be lasagna, fiber or geometry");
     if (!dataset.manifest().baseShapeZYX)
         throw std::invalid_argument("Lasagna manifest has no base shape");
     const auto baseShapeZYX=*dataset.manifest().baseShapeZYX;
@@ -421,7 +430,7 @@ int runFiberConstraintExtraction(int argc, char** argv)
         {"geometry_maximum_xyz",{hi[0],hi[1],hi[2]}},
         {"settings",{{"local_events",true},{"keep_whole_fibers",true},
             {"load_threads",loadThreads},{"threads",threads},
-            {"certify_winding",*options.certifyWinding},
+            {"certify_winding",*options.certifyWinding},{"winding_distances",options.measureWindingDistances},{"normal_source",normalSource},
             {"enforce_maximum_winding",options.enforceMaximumWindingDistance},
             {"closest_parallel_estimator",*options.closestParallelEstimator},
             {"parallel_reciprocal",options.localParallelReciprocal},{"perpendicular_iterations",options.localPerpendicularProjectionIterations},

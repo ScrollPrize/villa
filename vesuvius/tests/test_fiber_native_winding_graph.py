@@ -74,9 +74,10 @@ def test_native_winding_graph_matches_existing_partitioned_preparation(workers,s
     config=dict(constraint_batch=97,read_batch=19,lasagna_winding_scale=scale,
                 perpendicular_offset=offset,perpendicular_relative_weight=weight)
     expected,used,expanded=reference(paths,data,mapping,family,signs,config)
+    native_config=dict(config,perpendicular_weight=weight);native_config.pop('perpendicular_relative_weight')
     actual=native.prepare_winding_graph(data.i,data.j,mapping,family,signs,
         data.arc_a,data.arc_b,data.distance,data.parallel,data.normal_a,data.normal_b,data.connector,
-        data.valid_a,data.valid_b,data.valid_connector,workers=workers,**config)
+        data.valid_a,data.valid_b,data.valid_connector,workers=workers,**native_config)
     for key in ('a','b','target'):np.testing.assert_array_equal(actual[key],expected[key])
     np.testing.assert_allclose(actual['weight'],expected['weight'],rtol=2e-15,atol=2e-15)
     if scale==1:np.testing.assert_array_equal(actual['weight'],expected['weight'])
@@ -88,3 +89,87 @@ def test_shared_native_signed_order_matches_numpy():
     _,_,data,_,_,_=fixture()
     np.testing.assert_array_equal(fiber_signed_order(data.connector,data.normal_a,data.normal_b),
                                   signed_reference(data.connector,data.normal_a,data.normal_b))
+
+
+def filtered_events(data,mapping,family,signs):
+    """The native builder's event filters, applied to the whole fixture."""
+    a=mapping[data.i];b=mapping[data.j]
+    keep=(a>=0)&(b>=0)&data.valid_a&data.valid_b&data.valid_connector
+    keep&=data.parallel==(family[a.clip(0)]==family[b.clip(0)])
+    a=a[keep];b=b[keep]
+    return dict(i=a,j=b,ds_a=data.arc_a[keep],ds_b=data.arc_b[keep],family=family,parallel=data.parallel[keep],
+                distance=data.distance[keep],sign=signed_reference(data.connector[keep],data.normal_a[keep]*signs[a,None],
+                                                                  data.normal_b[keep]*signs[b,None]))
+
+
+@pytest.mark.parametrize('workers',[1,4])
+def test_native_enclosure_relations_match_python_reference(workers):
+    from vesuvius.neural_tracing.fiber_trace_3d.fiber_enclosure_graph import extract_relations
+    paths,native,data,mapping,family,signs=fixture()
+    d=filtered_events(data,mapping,family,signs);paths.data=d
+    relations,rejected=extract_relations(d,paths)
+    actual=native.prepare_winding_graph(data.i,data.j,mapping,family,signs,
+        data.arc_a,data.arc_b,data.distance,data.parallel,data.normal_a,data.normal_b,data.connector,
+        data.valid_a,data.valid_b,data.valid_connector,workers=workers,constraint_batch=97,read_batch=19,enclosures=True)
+    expected=sorted((r['h'],r['v'],r['anchor_step']) for r in relations)
+    assert list(zip(actual['enclosure_a'],actual['enclosure_b'],actual['enclosure_target']))==expected
+    counts=actual['enclosure_counts']
+    reasons=[r['reason'] for r in rejected]
+    assert counts['accepted']==len(relations) and counts['pairs']==len(relations)+len(rejected)
+    assert counts['one_sided']==reasons.count('one_sided') and counts['contradictory']==reasons.count('contradictory')
+    assert counts['nonunique']==reasons.count('nonunique')
+    assert counts['pairs']>0 and len(rejected)>0  # random evidence is mostly rejected; acceptance is tested below
+    with pytest.raises(ValueError):  # no arc type at all is a configuration error
+        native.prepare_winding_graph(data.i,data.j,mapping,family,signs,
+            data.arc_a,data.arc_b,data.distance,data.parallel,data.normal_a,data.normal_b,data.connector,
+            data.valid_a,data.valid_b,data.valid_connector,parallel_weight=0.,perpendicular_weight=0.)
+
+
+def test_native_enclosure_accepts_exact_pair_with_one_turn_apart_witnesses():
+    """One outward and one inward witness whose anchors coincide one turn apart give an exact H->V step."""
+    from vesuvius.neural_tracing.fiber_trace_3d.fiber_enclosure_graph import extract_relations
+    paths,native,data,mapping,family,signs=fixture()
+    turn=2*np.pi*10.  # the H fixture fiber is a circle of radius 10: one turn returns to the same point
+    data=SimpleNamespace(i=np.array([0,0]),j=np.array([2,2]),arc_a=np.array([1.,1.+turn]),arc_b=np.array([2.5,2.5]),
+        distance=np.array([.3,.3]),parallel=np.array([False,False]),
+        normal_a=np.array([[-1.,0,0],[1.,0,0]]),normal_b=np.array([[-1.,0,0],[1.,0,0]]),connector=np.array([[1.,0,0],[1.,0,0]]),
+        valid_a=np.array([True,True]),valid_b=np.array([True,True]),valid_connector=np.array([True,True]))
+    d=filtered_events(data,mapping,family,signs);paths.data=d
+    assert d['sign'].tolist()==[1,-1]
+    relations,rejected=extract_relations(d,paths)
+    assert len(relations)==1 and not rejected and relations[0]['h']==0 and relations[0]['v']==2
+    actual=native.prepare_winding_graph(data.i,data.j,mapping,family,signs,
+        data.arc_a,data.arc_b,data.distance,data.parallel,data.normal_a,data.normal_b,data.connector,
+        data.valid_a,data.valid_b,data.valid_connector,workers=1,enclosures=True)
+    assert actual['enclosure_counts']=={'pairs':1,'accepted':1,'one_sided':0,'contradictory':0,'nonunique':0}
+    assert actual['enclosure_a'].tolist()==[0] and actual['enclosure_b'].tolist()==[2]
+    assert actual['enclosure_target'].tolist()==[relations[0]['anchor_step']]
+    # Enclosures do not depend on the perpendicular weight: zero drops those arcs but keeps the relation.
+    only=native.prepare_winding_graph(data.i,data.j,mapping,family,signs,
+        data.arc_a,data.arc_b,data.distance,data.parallel,data.normal_a,data.normal_b,data.connector,
+        data.valid_a,data.valid_b,data.valid_connector,workers=1,parallel_weight=0.,perpendicular_weight=0.,enclosures=True)
+    assert only['used']==0 and len(only['a'])==0 and only['enclosure_target'].tolist()==actual['enclosure_target'].tolist()
+
+
+def test_events_without_winding_distance_witness_enclosures_but_emit_no_arcs():
+    """NaN distances (geometry-only extraction) give no automatic arc, still exact enclosure bounds."""
+    from vesuvius.neural_tracing.fiber_trace_3d.fiber_enclosure_graph import extract_relations
+    paths,native,data,mapping,family,signs=fixture()
+    turn=2*np.pi*10.
+    data=SimpleNamespace(i=np.array([0,0,0]),j=np.array([2,2,1]),arc_a=np.array([1.,1.+turn,3.]),arc_b=np.array([2.5,2.5,4.]),
+        distance=np.array([np.nan,np.nan,np.nan]),parallel=np.array([False,False,True]),
+        normal_a=np.array([[-1.,0,0],[1.,0,0],[0,1.,0]]),normal_b=np.array([[-1.,0,0],[1.,0,0],[0,1.,0]]),
+        connector=np.array([[1.,0,0],[1.,0,0],[1.,0,0]]),
+        valid_a=np.array([True]*3),valid_b=np.array([True]*3),valid_connector=np.array([True]*3))
+    actual=native.prepare_winding_graph(data.i,data.j,mapping,family,signs,
+        data.arc_a,data.arc_b,data.distance,data.parallel,data.normal_a,data.normal_b,data.connector,
+        data.valid_a,data.valid_b,data.valid_connector,workers=1,enclosures=True)
+    assert len(actual['a'])==0 and actual['used']==0 and actual['without_distance']==3
+    assert actual['enclosure_counts']['accepted']==1 and actual['enclosure_a'].tolist()==[0] and actual['enclosure_b'].tolist()==[2]
+    d=filtered_events(data,mapping,family,signs);paths.data=d
+    relations,_=extract_relations(d,paths)
+    assert actual['enclosure_target'].tolist()==[relations[0]['anchor_step']]
+    with pytest.raises(ValueError):  # a negative distance is still an error
+        bad=np.array([-1.,np.nan,np.nan])
+        native.prepare_winding_graph(data.i,data.j,mapping,family,signs,data.arc_a,data.arc_b,bad,data.parallel,
+            data.normal_a,data.normal_b,data.connector,data.valid_a,data.valid_b,data.valid_connector,workers=1)

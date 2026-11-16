@@ -48,6 +48,7 @@ packages=(
     nlohmann-json3-dev libavahi-client-dev libsqlite3-dev libssl-dev
     liblz4-dev libtiff-dev libpng-dev libjpeg-dev zlib1g-dev
     libopenblas-dev liblapack-dev liblapacke-dev libomp-dev
+    liblemon-dev
     libscotch-dev libscotchmetis-dev libhwloc-dev python3
 )
 if [[ "$profile" == ci-tooling ]]; then

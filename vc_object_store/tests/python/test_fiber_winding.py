@@ -96,3 +96,61 @@ def test_native_geometry_pack_matches_per_fiber_arc_and_transport(workers):
     assert not columns['arc'].flags.writeable
     with pytest.raises(ValueError,match='at least two'):
         pack_winding_geometry(np.array([0,1,2],np.int64),xyz[:2],axis)
+
+
+def _brute_force(nodes, a, b, target, weight, span=4):
+    """Exact minimum of sum w|k_b-k_a-t| over small integer windings (node 0 fixed)."""
+    import itertools
+    best=np.inf
+    for rest in itertools.product(range(-span,span+1),repeat=nodes-1):
+        k=np.r_[0,rest]
+        best=min(best,float(np.sum(weight*np.abs(k[b]-k[a]-target))))
+    return best
+
+
+@pytest.mark.parametrize('backend',['network_simplex','cost_scaling'])
+def test_native_min_cost_flow_matches_brute_force_and_reports_quantization(backend):
+    from vc_object_store import solve_winding_min_cost_flow, winding_min_cost_flow_available
+    if not winding_min_cost_flow_available():
+        pytest.skip('vc_object_store built without LEMON')
+    rng=np.random.default_rng(7)
+    for _ in range(12):
+        a=rng.integers(0,5,8);b=(a+rng.integers(1,5,8))%5
+        target=rng.integers(-2,3,8);weight=rng.integers(1,4,8).astype(float)
+        result=solve_winding_min_cost_flow(5,a,b,target,weight,backend=backend,capacity_scale=1)
+        expected=_brute_force(5,a,b,target,weight)
+        assert result['objective']==expected and result['quantized_objective']==expected
+        assert result['backend']==backend and result['winding'].dtype==np.int64
+        assert np.all(np.abs(result['flow'])<=result['capacity'])
+    # Unsorted arcs, an isolated node, and fractional weights quantized explicitly.
+    result=solve_winding_min_cost_flow(4,np.array([2,0,1]),np.array([0,1,2]),np.array([-5,2,3]),np.array([.49,.5,.51]),
+                                       backend=backend,capacity_scale=1)
+    assert result['capacity'].tolist()==[0,1,1] and result['winding'][3]==0
+    q=result['quantization']
+    assert q['dropped_arcs']==1 and q['dropped_original_weight']==.49 and q['retained_arcs']==2
+    fine=solve_winding_min_cost_flow(4,np.array([2,0,1]),np.array([0,1,2]),np.array([-5,2,3]),np.array([.49,.5,.51]),
+                                     backend=backend,capacity_scale=1000)
+    assert fine['capacity'].tolist()==[490,500,510] and fine['quantization']['capacity_absolute_error']==0
+    k=fine['winding'];assert k[1]-k[0]==2 and k[2]-k[1]==3 and k[0]-k[2]==-5
+    with pytest.raises(ValueError):
+        solve_winding_min_cost_flow(2,np.array([0]),np.array([3]),np.array([0]),np.array([1.]),backend=backend)
+    with pytest.raises(ValueError):
+        solve_winding_min_cost_flow(2,np.array([0]),np.array([1]),np.array([0]),np.array([1.]),backend='simplex')
+
+
+def test_seam_handedness_negates_transport_and_rejects_other_values():
+    axis=np.array([[0.,0.,-50.],[0.,0.,50.]])
+    start=np.array([[1.,-10.,0.]]);end=np.array([[-1.,-10.,0.]])   # crosses the -Y seam ray once
+    forward=NativeWindingSeam(axis,-np.pi/2,1).segments(start,end,1)
+    backward=NativeWindingSeam(axis,-np.pi/2,-1).segments(start,end,1)
+    assert abs(int(forward[0]))==1 and int(backward[0])==-int(forward[0])
+    assert NativeWindingSeam(axis,-np.pi/2,-1).handedness==-1
+    with pytest.raises(ValueError):
+        NativeWindingSeam(axis,-np.pi/2,0)
+    theta=np.linspace(0,4*np.pi,65);xyz=np.column_stack((10*np.cos(theta),10*np.sin(theta),np.zeros(65)))
+    offsets=np.array([0,65],np.int64)
+    plus=pack_winding_geometry(offsets,xyz,axis,-np.pi/2,1,workers=1)['turns']
+    minus=pack_winding_geometry(offsets,xyz,axis,-np.pi/2,-1,workers=1)['turns']
+    np.testing.assert_array_equal(np.asarray(minus),-np.asarray(plus))
+    assert int(np.asarray(plus)[-1])==2
+

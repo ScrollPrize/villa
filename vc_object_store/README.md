@@ -119,7 +119,11 @@ C++ callers link `vc_object_store::vc_objects` for storage,
 ## Build and test
 
 Tests are self-contained; they do not need a volume-cartographer checkout or
-its fixture data. A standalone build and regression run:
+its fixture data. The LEMON min-cost-flow winding solver
+(`VC_OBJECT_STORE_WITH_LEMON`, default ON) needs the `liblemon-dev` headers;
+`volume-cartographer/scripts/install_build_deps.sh` installs them. Set the
+option OFF to build without it (the Python `winding_min_cost_flow_available()`
+then reports false). A standalone build and regression run:
 
 ```sh
 cmake -S vc_object_store -B /tmp/vc-object-store-build -G Ninja \

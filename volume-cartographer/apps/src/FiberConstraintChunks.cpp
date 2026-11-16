@@ -1,4 +1,5 @@
 #include "FiberConstraintChunks.hpp"
+#include "vc/fiber_tracer/FiberStripNormals.hpp"
 #include "ChunkSaturationWindow.hpp"
 #include "vc/fiber_tracer/PolylineGeometry.hpp"
 #include "vc/fiber_tracer/FiberNormalOrientation.hpp"
@@ -57,11 +58,32 @@ struct ChunkBenchmarkComplete:std::exception {
 // jobs referencing the same piece obtain the same frame independently of which
 // attachments they own. Spatial cuts add identical boundary references, not
 // scientific fiber endpoints or independent resampled curve geometries.
+// Geometry-only strip normals per original fiber vertex (normal_source
+// "geometry"): the sampled normal at an arc is the unit interpolation of the
+// two vertex normals of its segment. The fiber's whole-fiber sign is left to
+// the later sign stage, exactly like a Lasagna normal's.
+using StripNormals=std::vector<std::vector<cv::Vec3d>>;
+vc::lasagna::NormalSample stripNormalAt(const StripNormals& strips,size_t source,const PolylineArcGeometry& g,double arc)
+{
+    vc::lasagna::NormalSample sample;
+    const auto& normals=strips[source];
+    if(normals.size()!=g.points.size()||normals.size()<2){sample.reason="fiber too short for strip normals";return sample;}
+    const auto at=samplePolylineArc(g,arc);
+    const size_t s=std::min(at.segmentIndex,normals.size()-2);
+    const double span=g.vertexArcs[s+1]-g.vertexArcs[s];
+    const double f=span>0?std::clamp((arc-g.vertexArcs[s])/span,0.,1.):0.;
+    cv::Vec3d n=normals[s]*(1.-f)+normals[s+1]*f;
+    const double length=cv::norm(n);
+    if(!(length>1e-9)){n=normals[f<.5?s:s+1];}
+    else n/=length;
+    sample.normal=n;sample.valid=true;return sample;
+}
+
 void sampleJob(Job& job,const std::vector<size_t>& owned,
     const std::vector<Frame>& frames,const std::vector<size_t>& offsets,
     const std::vector<PolylineArcGeometry>& geometries,
     const std::vector<PolylineGridPartition>& partitions,
-    const vc::lasagna::LasagnaNormalSampler& reader,double spacing,
+    const vc::lasagna::LasagnaNormalSampler& reader,const StripNormals* strips,double spacing,
     const vc::core::util::Umbilicus& axis,
     std::vector<std::pair<size_t,Frame>>& completed)
 {
@@ -116,7 +138,13 @@ void sampleJob(Job& job,const std::vector<size_t>& owned,
     std::vector<cv::Vec3d> points;points.reserve(samples.size());
     for(const auto& sample:samples)points.push_back(sample.point);
     std::vector<vc::lasagna::NormalSampleWithDerivative> values;
-    (void)reader.sampleNormalBatch(points,false,1,values);
+    if(strips){
+        values.resize(samples.size());
+        for(const auto& piece:pieces){
+            const auto source=frames[piece.id].source;
+            for(size_t i=piece.first;i<piece.last;++i)values[i].sample=stripNormalAt(*strips,source,geometries[source],samples[i].arc);
+        }
+    } else (void)reader.sampleNormalBatch(points,false,1,values);
     if(values.size()!=samples.size())throw std::runtime_error("Chunk normal sample count differs");
     job.normals.endpoints.resize(2*job.events.size());job.normals.valid.resize(2*job.events.size());
     size_t invalid=0;
@@ -187,6 +215,27 @@ Json extractFiberConstraintChunks(const Json& cfg,Json& metadata,
     std::exception_ptr preparationFailure;
     for(auto& task:preparation)try{task.get();}catch(...){if(!preparationFailure)preparationFailure=std::current_exception();}
     if(preparationFailure)std::rethrow_exception(preparationFailure);
+    std::unique_ptr<StripNormals> strips;
+    if(cfg.value("normal_source",std::string("lasagna"))=="geometry"){
+        const auto stripStarted=Clock::now();
+        vc::fiber_tracer::FiberStripNormalOptions options;
+        options.twistWeight=cfg.value("strip_twist_weight",options.twistWeight);
+        options.lateralWeight=cfg.value("strip_lateral_weight",options.lateralWeight);
+        options.maxIterations=cfg.value("strip_iterations",options.maxIterations);
+        options.smoothingSigma=cfg.value("strip_smoothing_sigma",options.smoothingSigma);
+        options.resampleSpacing=cfg.value("strip_resample_spacing",options.resampleSpacing);
+        std::vector<std::vector<cv::Vec3d>> polylines(lines.size());
+        for(size_t i=0;i<lines.size();++i)polylines[i]=lines[i].pointsBaseXYZ;
+        const auto solved=vc::fiber_tracer::solveFiberStripNormals(polylines,options,int(workers));
+        strips=std::make_unique<StripNormals>(lines.size());
+        size_t degenerate=0,unconverged=0;double cost=0;
+        for(size_t i=0;i<lines.size();++i){(*strips)[i]=solved[i].normals;degenerate+=solved[i].normals.empty();unconverged+=!solved[i].normals.empty()&&!solved[i].converged;cost+=solved[i].finalCost;}
+        metadata["strip_normals"]=Json{{"twist_weight",options.twistWeight},{"lateral_weight",options.lateralWeight},
+            {"smoothing_sigma",options.smoothingSigma},{"resample_spacing",options.resampleSpacing},
+            {"max_iterations",options.maxIterations},{"fibers",lines.size()},{"degenerate_fibers",degenerate},
+            {"unconverged_fibers",unconverged},{"final_cost",cost},{"seconds",elapsed(stripStarted)}};
+        std::cout<<"strip normals "<<metadata["strip_normals"].dump()<<std::endl;
+    }
     std::map<Cell,size_t> cells;
     for(const auto& p:partitions)for(const auto& piece:p.pieces)cells.try_emplace(piece.cell,0);
     std::vector<Job> jobs(cells.size());size_t ordinal=0;
@@ -350,7 +399,7 @@ Json extractFiberConstraintChunks(const Json& cfg,Json& metadata,
                     c.pieceB=sourcePieces[c.pieceB].traceIndex;
                 }
                 std::vector<std::pair<size_t,Frame>> completed;
-                sampleJob(job,job.ownedFrames,frames,offsets,geometries,partitions,normals,spacing,axis,completed);
+                sampleJob(job,job.ownedFrames,frames,offsets,geometries,partitions,normals,strips.get(),spacing,axis,completed);
                 if(benchmark)throughput[1].fetch_add(job.metrics.at("normal_samples").get<uint64_t>());
                 if(benchmark&&window.done()){liveJobs.fetch_sub(1);activeChunks.fetch_sub(1);break;}
                 job.metrics["compute_seconds"]=elapsed(jobStarted);

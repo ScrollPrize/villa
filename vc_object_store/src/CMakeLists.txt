@@ -19,11 +19,20 @@ else()
 endif()
 
 # Shared owned geometry and operations; no SQLite, OpenCV or application types.
-add_library(vc_geometry ${_vc_store_library_type} geometry/TypedGeometry.cpp geometry/PointMap.cpp)
+add_library(vc_geometry ${_vc_store_library_type} geometry/TypedGeometry.cpp geometry/PointMap.cpp geometry/FiberWindingFlow.cpp)
 target_include_directories(vc_geometry PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>" "$<INSTALL_INTERFACE:include>"
     PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(vc_geometry PUBLIC nlohmann_json::nlohmann_json PRIVATE vc_reader::catalog)
 target_compile_features(vc_geometry PUBLIC cxx_std_20)
+if(VC_OBJECT_STORE_WITH_LEMON)
+    # LEMON 1.3.1 uses std::allocator members removed in C++20: keep it in a C++17 unit.
+    add_library(vc_winding_lemon STATIC geometry/FiberWindingFlowLemon.cpp)
+    set_target_properties(vc_winding_lemon PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
+    target_include_directories(vc_winding_lemon SYSTEM PRIVATE ${LEMON_INCLUDE_DIRS})
+    target_include_directories(vc_winding_lemon PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    target_link_libraries(vc_geometry PRIVATE vc_winding_lemon)
+    target_compile_definitions(vc_geometry PRIVATE VC_OBJECT_STORE_HAS_LEMON=1)
+endif()
 
 # Primary SQLite object database; no dependency on vc_core or Qt.
 add_library(vc_objects ${_vc_store_library_type}

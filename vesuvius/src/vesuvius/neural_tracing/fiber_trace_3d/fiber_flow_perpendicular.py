@@ -90,7 +90,7 @@ def run(config):
     write(root/'selection.json',report);print(json.dumps(report),flush=True)
     del g,filtered,valid,mapping,catalog
     result=run_full(dict(source_root=str(root),output_root=str(root/'solve'),
-        scale=config.get('scale',1),reference_mean=config['reference_mean'],progress_interval=config.get('progress_interval',20)))
+        scale=config.get('scale',1),reference_mean=config['reference_mean']))
     write(root/'progress.json',dict(stage='complete',selection=report,solve=result))
     return dict(selection=report,solve=result)
 

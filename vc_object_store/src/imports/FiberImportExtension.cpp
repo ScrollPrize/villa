@@ -55,12 +55,16 @@ std::array<double,3> decodeFiberDirection(std::span<const uint8_t> bytes){
     return vcr::normal::decodeSignedCompact({bytes[0],bytes[1],bytes[2]});
 }
 std::optional<uint8_t> encodeFiberWindingDistance(double distance){
+    // NaN is the explicit "no winding distance" measurement (byte 0); other
+    // non-finite or negative values are errors, and too-large ones are skipped.
+    if(std::isnan(distance))return kFiberWindingDistanceUnknown;
     if(!std::isfinite(distance)||distance<0.)throw std::invalid_argument("fiber winding distance must be finite and nonnegative");
     if(distance>kMaximumCompactWindingDistance)return {};
     return uint8_t(std::lround(distance*16.)+1);
 }
 double decodeFiberWindingDistance(std::span<const uint8_t> bytes){
-    if(bytes.size()!=1||bytes[0]==0)throw std::invalid_argument("invalid encoded fiber winding distance");
+    if(bytes.size()!=1)throw std::invalid_argument("invalid encoded fiber winding distance");
+    if(bytes[0]==kFiberWindingDistanceUnknown)return std::numeric_limits<double>::quiet_NaN();
     return (unsigned(bytes[0])-1)/16.;
 }
 ExtensionTable fiberSourceExtension(const FiberSourceInfo& source){

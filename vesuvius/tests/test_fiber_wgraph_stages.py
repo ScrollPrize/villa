@@ -183,3 +183,38 @@ def test_actual_cuda_hvb_and_sign_write_native_result_stores_without_tensor_file
     with CollectionReader(str(signed)) as store:
         assert len(store.objects('fiber'))==2
         assert len(store.fiber_constraints()['edge_uuid'])==1
+
+
+def test_sign_stage_from_record_family_pins_no_classification_run(tmp_path,monkeypatch):
+    """`classification: record` selects the H/V fibers from the store; no hvb run exists or is pinned."""
+    graph=measured_store(tmp_path,[(0,10,20,False,.5)],isolated_ids=[30])
+    ids=np.asarray(list(map(uid,[10,20,30])))
+    with CollectionReader(str(graph)) as store:source=store.source
+    priors=tmp_path/'priors.json'
+    priors.write_text(json.dumps(dict(format='fiber-outward-priors',source_store=source,
+                                      source_ids=ids.tolist(),agreement=[1,1,1])))
+    seen={}
+    def managed(config,module,source_file):
+        return stages._run_direct_stage(config['workflow_stage'],config)
+    def existing_solver(config,stage,*,data,stats,return_solution):
+        assert stage=='normal_sign' and config['fixed_keep']
+        seen['keep']=data['keep'].tolist()
+        return dict(runs=[dict(converged=True)]),dict(ids=ids,broken=data['keep']<=.5,
+            normal_sign=np.array([-1,1,1]),sign_probability=np.array([.1,.9,.8]))
+    from vesuvius.neural_tracing.fiber_trace_3d import fiber_wrapped_stages as wrapped
+    monkeypatch.setattr(normal,'launch_tensor_solve',managed)
+    monkeypatch.setattr(wrapped,'solve_stage',existing_solver)
+    sign=tmp_path/'sign.vcobj'
+    result=stages.run_stage('sign',dict(database=str(graph),result_store=str(sign),priors=str(priors),
+                                        classification='record',record_family='any'))
+    assert result['input_run_uuid'] is None and seen['keep']==[1.,1.,1.]  # fixture fibers are all tagged
+    signs=stages._fiber_rows(sign,result['run_uuid'])
+    assert [signs[fid]['normal_sign'] for fid in ids]==[-1,1,1]
+    with CollectionReader(str(sign)) as store:
+        definition=next(t for t in store.extension_tables() if t['name']==stages.PREFIX+'inputs')
+        columns=[c['name'] for c in definition['columns']]
+        inputs=[dict(zip(columns,row)) for row in store.extension_rows(definition['name'])]
+    assert all(row['input_run_uuid'] is None for row in inputs)
+    with pytest.raises(ValueError,match='no input run selector'):
+        stages.run_stage('sign',dict(database=str(graph),result_store=str(tmp_path/'other.vcobj'),priors=str(priors),
+                                     classification='record',input_run_uuid=result['run_uuid']))

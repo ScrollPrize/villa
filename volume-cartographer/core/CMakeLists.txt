@@ -158,6 +158,7 @@ add_library(vc_fiber_tracer
     src/fiber_tracer/FiberTraceSeed.cpp
     src/fiber_tracer/FiberTraceBeliefPropagation.cpp
     src/fiber_tracer/FiberTraceConstraints.cpp
+    src/fiber_tracer/FiberStripNormals.cpp
     src/fiber_tracer/FiberTraceWindingBeliefPropagation.cpp
     src/fiber_tracer/FiberTraceWindingLeastSquares.cpp
     src/fiber_tracer/FiberTraceWindingOrderedCuts.cpp

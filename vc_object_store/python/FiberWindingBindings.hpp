@@ -1,6 +1,7 @@
 #pragma once
 #include "vc_object_store/geometry/FiberWinding.hpp"
 #include "vc_object_store/geometry/FiberWindingGraph.hpp"
+#include "vc_object_store/geometry/FiberWindingFlow.hpp"
 #include "FiberUvEventBindings.hpp"
 #include <nanobind/ndarray.h>
 #include <memory>
@@ -37,11 +38,11 @@ struct PyPackedWindingGeometry {
     WindingXYZ xyz;
     WindingI64 turns;
     vc::geometry::PackedFiberGeometry geometry;
-    PyPackedWindingGeometry(WindingI64 offsets_,WindingArc arcs_,WindingXYZ xyz_,WindingI64 turns_,WindingXYZ axis,double angle)
+    PyPackedWindingGeometry(WindingI64 offsets_,WindingArc arcs_,WindingXYZ xyz_,WindingI64 turns_,WindingXYZ axis,double angle,int handedness)
         :offsets(offsets_),arcs(arcs_),xyz(xyz_),turns(turns_),
          geometry(windingSpan(offsets),arcs.data(),arcs.shape(0),arcs.stride(0),
              std::span(xyz.data(),xyz.shape(0)*xyz.shape(1)),windingSpan(turns),
-             vc::geometry::WindingSeam(windingAxis(axis),angle))
+             vc::geometry::WindingSeam(windingAxis(axis),angle,handedness))
     {if(xyz.shape(1)!=3)throw std::invalid_argument("expected packed XYZ triples");}
 };
 
@@ -66,20 +67,21 @@ void bindFiberWinding(nb::module_& module){
     using namespace nb::literals;
     using Seam=vc::geometry::WindingSeam;
     module.def("pack_winding_geometry",[](WindingI64 offsets,WindingXYZ xyz,WindingXYZ axis,
-                                         double angle,int64_t firstOwner,size_t workers){
+                                         double angle,int handedness,int64_t firstOwner,size_t workers){
         if(xyz.shape(1)!=3)throw std::invalid_argument("expected packed XYZ triples");
         auto values=std::make_unique<vc::geometry::PackedWindingColumns>();
-        const Seam seam(windingAxis(axis),angle);
+        const Seam seam(windingAxis(axis),angle,handedness);
         {nb::gil_scoped_release release;
             *values=vc::geometry::packWindingGeometry(windingSpan(offsets),
                 std::span(xyz.data(),xyz.shape(0)*3),seam,firstOwner,workers);}
         auto* raw=values.get();auto owner=windingOwner(values);nb::dict result;
         result["source"]=windingColumn(raw->source,owner);result["arc"]=windingColumn(raw->arc,owner);
         result["turns"]=windingColumn(raw->turns,owner);return result;
-    },"offsets"_a,"xyz"_a,"axis"_a,"angle"_a=-std::numbers::pi/2,"first_owner"_a=0,"workers"_a=1);
+    },"offsets"_a,"xyz"_a,"axis"_a,"angle"_a=-std::numbers::pi/2,"handedness"_a=1,"first_owner"_a=0,"workers"_a=1);
     nb::class_<Seam>(module,"NativeWindingSeam")
-        .def("__init__",[](Seam* self,WindingXYZ axis,double angle){new(self) Seam(windingAxis(axis),angle);},
-             "axis"_a,"angle"_a=-std::numbers::pi/2)
+        .def("__init__",[](Seam* self,WindingXYZ axis,double angle,int handedness){new(self) Seam(windingAxis(axis),angle,handedness);},
+             "axis"_a,"angle"_a=-std::numbers::pi/2,"handedness"_a=1)
+        .def_prop_ro("handedness",&Seam::handedness)
         .def("relative",[](const Seam& self,WindingXYZ input,size_t workers){
             if(input.shape(1)!=3)throw std::invalid_argument("expected XYZ columns");
             const auto count=input.shape(0);auto values=std::make_unique<std::vector<double>>(count*2);
@@ -102,8 +104,8 @@ void bindFiberWinding(nb::module_& module){
         },"start"_a,"end"_a,"workers"_a=32);
     nb::class_<PyPackedWindingGeometry>(module,"PackedWindingGeometry",
         "Shared packed measured geometry; input buffers are retained and native operations release the GIL.")
-        .def(nb::init<WindingI64,WindingArc,WindingXYZ,WindingI64,WindingXYZ,double>(),
-             "offsets"_a,"arc"_a,"xyz"_a,"turns"_a,"axis"_a,"angle"_a=-std::numbers::pi/2)
+        .def(nb::init<WindingI64,WindingArc,WindingXYZ,WindingI64,WindingXYZ,double,int>(),
+             "offsets"_a,"arc"_a,"xyz"_a,"turns"_a,"axis"_a,"angle"_a=-std::numbers::pi/2,"handedness"_a=1)
         .def("geometry_priors",[](const PyPackedWindingGeometry& self,WindingI64 owners,WindingI64 family,double spacing,size_t workers){
             auto values=std::make_unique<vc::geometry::FiberGeometryPriors>();
             {nb::gil_scoped_release release;
@@ -124,7 +126,8 @@ void bindFiberWinding(nb::module_& module){
             WindingI64 graphToCatalog,WindingI64 family,WindingI64 signs,WindingArc arcA,WindingArc arcB,
             WindingArc distance,WindingFlag parallel,WindingXYZ normalA,WindingXYZ normalB,WindingXYZ connector,
             WindingFlag validA,WindingFlag validB,WindingFlag validConnector,
-            double scale,double offset,double weight,size_t constraintBatch,size_t readBatch,size_t workers){
+            double scale,double offset,double parallelWeight,double perpendicularWeight,bool enclosures,
+            size_t constraintBatch,size_t readBatch,size_t workers){
             if(normalA.shape(1)!=3||normalB.shape(1)!=3||connector.shape(1)!=3)
                 throw std::invalid_argument("winding graph normals require XYZ triples");
             vc::geometry::FiberWindingGraphInput input{
@@ -135,7 +138,7 @@ void bindFiberWinding(nb::module_& module){
                 windingSpan(parallel),windingSpan(validA),windingSpan(validB),windingSpan(validConnector),
                 std::span(normalA.data(),normalA.shape(0)*3),std::span(normalB.data(),normalB.shape(0)*3),
                 std::span(connector.data(),connector.shape(0)*3)};
-            vc::geometry::FiberWindingGraphOptions options{scale,offset,weight,constraintBatch,readBatch,workers};
+            vc::geometry::FiberWindingGraphOptions options{scale,offset,perpendicularWeight,parallelWeight,enclosures,constraintBatch,readBatch,workers};
             vc::geometry::FiberWindingL1Columns output;
             {nb::gil_scoped_release release;output=vc::geometry::prepareFiberWindingGraph(self.geometry,input,options);}
             nb::dict result;
@@ -144,12 +147,21 @@ void bindFiberWinding(nb::module_& module){
             result["target"]=uvOwnedColumn(std::move(output.target),output.arcs);
             result["weight"]=uvOwnedColumn(std::move(output.weight),output.arcs);
             result["read"]=output.read;result["used"]=output.used;result["expanded"]=output.expanded;
+            result["without_distance"]=output.withoutDistance;
+            if(enclosures){
+                result["enclosure_a"]=uvOwnedColumn(std::move(output.enclosureA),output.enclosureArcs);
+                result["enclosure_b"]=uvOwnedColumn(std::move(output.enclosureB),output.enclosureArcs);
+                result["enclosure_target"]=uvOwnedColumn(std::move(output.enclosureTarget),output.enclosureArcs);
+                nb::dict counts;counts["pairs"]=output.enclosurePairs;counts["accepted"]=output.enclosureArcs;
+                counts["one_sided"]=output.enclosureOneSided;counts["contradictory"]=output.enclosureContradictory;
+                counts["nonunique"]=output.enclosureNonunique;result["enclosure_counts"]=counts;
+            }
             return result;
         },"i"_a,"j"_a,"graph_to_catalog"_a,"family"_a,"normal_sign"_a,"arc_a"_a,"arc_b"_a,
           "distance"_a,"parallel"_a,"normal_a"_a,"normal_b"_a,"connector"_a,
           "valid_a"_a,"valid_b"_a,"valid_connector"_a,
-          "lasagna_winding_scale"_a=1.,"perpendicular_offset"_a=.5,"perpendicular_relative_weight"_a=1.,
-          "constraint_batch"_a=500000,"read_batch"_a=32768,"workers"_a=32);
+          "lasagna_winding_scale"_a=1.,"perpendicular_offset"_a=.5,"parallel_weight"_a=1.,"perpendicular_weight"_a=1.,
+          "enclosures"_a=false,"constraint_batch"_a=500000,"read_batch"_a=32768,"workers"_a=32);
     module.def("fiber_signed_order",[](WindingXYZ connector,WindingXYZ a,WindingXYZ b,double minimum,size_t workers){
         const size_t n=connector.shape(0);
         if(connector.shape(1)!=3||a.shape(1)!=3||b.shape(1)!=3||a.shape(0)!=n||b.shape(0)!=n||!std::isfinite(minimum))
@@ -162,6 +174,31 @@ void bindFiberWinding(nb::module_& module){
             });}
         return uvOwnedColumn(std::move(output),n);
     },"connector"_a,"inward_a"_a,"inward_b"_a,"cosine_min"_a=.1,"workers"_a=1);
+    module.def("winding_min_cost_flow_available",&vc::geometry::windingMinCostFlowAvailable,
+        "True when the native library was built with LEMON (VC_OBJECT_STORE_WITH_LEMON).");
+    module.def("solve_winding_min_cost_flow",[](int64_t nodes,WindingI64 a,WindingI64 b,WindingI64 target,WindingF64 weight,
+                                                 const std::string& backend,int64_t capacityScale){
+        vc::geometry::WindingFlowOptions options;
+        options.backend=vc::geometry::parseWindingFlowBackend(backend);options.capacityScale=capacityScale;
+        vc::geometry::WindingFlowResult output;
+        {nb::gil_scoped_release release;
+            output=vc::geometry::solveWindingMinCostFlow(nodes,windingSpan(a),windingSpan(b),windingSpan(target),windingSpan(weight),options);}
+        nb::dict result;
+        result["winding"]=uvOwnedColumn(std::move(output.winding),output.nodes);
+        result["flow"]=uvOwnedColumn(std::move(output.flow),output.arcs);
+        result["capacity"]=uvOwnedColumn(std::move(output.capacity),output.arcs);
+        nb::dict quantization;const auto& q=output.quantization;
+        quantization["scale"]=q.scale;quantization["original_arcs"]=q.originalArcs;quantization["retained_arcs"]=q.retainedArcs;
+        quantization["dropped_arcs"]=q.droppedArcs;quantization["original_weight"]=q.originalWeight;
+        quantization["dropped_original_weight"]=q.droppedWeight;quantization["capacity_absolute_error"]=q.capacityAbsoluteError;
+        result["quantization"]=quantization;
+        result["backend"]=vc::geometry::windingFlowBackendName(options.backend);
+        result["quantized_objective"]=output.quantizedObjective;result["objective"]=output.objective;
+        nb::dict timing;timing["graph"]=output.graphSeconds;timing["solve"]=output.solveSeconds;timing["total"]=output.totalSeconds;
+        result["timing"]=timing;
+        return result;
+    },"nodes"_a,"a"_a,"b"_a,"target"_a,"weight"_a,"backend"_a="network_simplex","capacity_scale"_a=1000,
+      "Exact integer winding assignment of an aggregated L1 arc list via a LEMON min-cost circulation (CPU, small graphs).");
     module.def("winding_grouped_medians",[](WindingI64 groups,WindingF64 input,size_t workers){
         auto values=std::make_unique<vc::geometry::GroupedMedians>();
         {nb::gil_scoped_release release;*values=vc::geometry::groupedMedians(windingSpan(groups),windingSpan(input),workers);}

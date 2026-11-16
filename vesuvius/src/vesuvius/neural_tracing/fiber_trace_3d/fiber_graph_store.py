@@ -51,6 +51,95 @@ def workflow_volume(config):
     return volume if volume is not None else fiber_volume(config['fibers'])
 
 
+HANDEDNESS_META_KEY='winding_handedness'
+
+
+def catalog_handedness(volume):
+    """The open-data catalog's winding sense for ``volume``, or None when it does not orient it.
+
+    Same reading as VC3D's fiber map: the catalog describes one spiral seen
+    from the top, so the sense is -1 when exactly one of
+    ``z_direction_is_top_to_bottom`` and ``left_handed_coordinates`` holds."""
+    try:
+        from vc_reader import Catalog
+        catalog=Catalog.load()
+        record=catalog.volumes.get(str(volume)) if hasattr(catalog.volumes,'get') else None
+        if record is None:
+            matches=[v for v in catalog.volumes if getattr(v,'id',None)==str(volume)]
+            record=matches[0] if len(matches)==1 else None
+    except Exception as error:  # offline or unknown volume: the catalog states nothing
+        print(json.dumps(dict(stage='catalog_handedness_unavailable',volume=str(volume),error=str(error)[:200])),flush=True)
+        return None
+    if record is None:return None
+    top=record.z_direction_is_top_to_bottom;left=record.left_handed_coordinates
+    if top is None or left is None:return None
+    return -1 if bool(top)!=bool(left) else 1
+
+
+def store_handedness(path, volume):
+    """``winding_handedness`` stated on the store's umbilicus object for ``volume``, or None."""
+    with CollectionReader(str(path)) as store:
+        objects=[r for r in store.objects('umbilicus')
+                 if volume is None or ((r.get('meta') or {}).get('coordinates') or {}).get('volume_uuid') in (None,str(volume))]
+    values={int((r.get('meta') or {})[HANDEDNESS_META_KEY]) for r in objects if HANDEDNESS_META_KEY in (r.get('meta') or {})}
+    if len(values)>1:raise ValueError('Store umbilicus objects state different winding handedness values')
+    return values.pop() if values else None
+
+
+def tag_store_handedness(path, value):
+    """Record the scroll's winding direction on the store's umbilicus object (a writable, unsealed store)."""
+    if value not in (1,-1):raise ValueError('handedness must be +1 or -1')
+    from vc_object_store import ObjectStore
+    with CollectionReader(str(path)) as reader:objects=reader.objects('umbilicus')
+    if len(objects)!=1:raise ValueError('Store must contain exactly one umbilicus object to tag, found %d'%len(objects))
+    with ObjectStore.open(str(path),author='vc_wgraph') as store:
+        store.set_meta(objects[0]['uuid'],HANDEDNESS_META_KEY,int(value))
+
+
+def winding_handedness(config, path, volume):
+    """The scroll's winding direction (+1/-1) for seam transport; never inferred.
+
+    Precedence: explicit ``handedness`` setting, the store umbilicus object's
+    ``winding_handedness`` meta, the open-data catalog orientation. A missing
+    value is an error so that mirrored solves cannot happen silently."""
+    explicit=config.get('handedness')
+    if explicit is not None:
+        if explicit not in (1,-1):raise ValueError('handedness must be +1 or -1')
+        return int(explicit)
+    stated=store_handedness(path,volume)
+    if stated is not None:
+        if stated not in (1,-1):raise ValueError('Store winding_handedness must be +1 or -1')
+        return stated
+    catalog=catalog_handedness(volume)
+    if catalog is not None:return catalog
+    raise ValueError(f'Winding handedness unknown for volume {volume}: set handedness in the stage settings, '
+                     f'tag the store umbilicus with {HANDEDNESS_META_KEY} (vc_wgraph handedness --set), '
+                     'or orient the volume in the open-data catalog')
+
+
+def fiber_families_from_record(path, ids, mode='any'):
+    """H(0)/V(1) families from the fibers' stored annotation tags, -1 otherwise.
+
+    ``mode`` selects ``any`` tag, only ``manual`` tags or only ``automatic``
+    tags (the store's ``manual_family`` flag). Returns the family column
+    aligned with ``ids`` and tag-source counts.
+    """
+    if mode not in ('any','manual','automatic'):raise ValueError('tags must be any, manual or automatic')
+    with CollectionReader(str(path)) as store:
+        records={record['uuid']:record.get('fiber') or {} for record in store.objects('fiber')}
+    ids=np.asarray(ids,dtype=str)
+    family=np.full(len(ids),-1,np.int64);counts=dict(manual=0,automatic=0,untagged=0,unknown=0,filtered=0)
+    for i,fiber in enumerate(ids):
+        detail=records.get(str(fiber))
+        if detail is None:counts['unknown']+=1;continue
+        label=detail.get('family') or '';manual=bool(detail.get('manual_family',False))
+        if label not in ('H','V'):counts['untagged']+=1;continue
+        if (mode=='manual' and not manual) or (mode=='automatic' and manual):counts['filtered']+=1;continue
+        counts['manual' if manual else 'automatic']+=1
+        family[i]=0 if label=='H' else 1
+    return family,counts
+
+
 def store_digest(path):
     with CollectionReader(str(path)) as store:
         source = store.source

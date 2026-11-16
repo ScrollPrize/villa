@@ -9,7 +9,8 @@ def _geometry(paths):
     if not hasattr(paths,'_native_winding_geometry'):
         paths._native_winding_geometry=PackedWindingGeometry(
             paths.offset,paths.keys['arc'],paths.xyz,paths.turns,
-            np.ascontiguousarray(paths.seam.axis,dtype=np.float64),float(paths.seam.angle))
+            np.ascontiguousarray(paths.seam.axis,dtype=np.float64),float(paths.seam.angle),
+            int(getattr(paths.seam,'handedness',1)))
     return paths._native_winding_geometry
 
 

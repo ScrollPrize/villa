@@ -55,7 +55,7 @@ def solve(config):
     from scipy.sparse.csgraph import connected_components
     from .fiber_min_flow import aggregate_l1_edges, solve as lp_solve
     from .fiber_min_flow_benchmark import Paths, graph
-    from .fiber_lemon import build_native, quantize, native_solve
+    from .fiber_lemon import quantize, native_solve
     from .fiber_shared_curve import saved_points
     from .fiber_uv_arc_phase import event_arc_points, event_signed_arcs
     from .fiber_uv_layout import hard_assignment
@@ -104,11 +104,10 @@ def solve(config):
         times['exact_lp'] = time.monotonic()-started
         solutions['exact_lp'] = lp['winding']; certificates['exact_lp'] = lp['certificate']
     capacity_scales = config.get('capacity_scales',[1000,1])
-    library = build_native(root/('lemon.dylib' if sys.platform=='darwin' else 'lemon.so')) if capacity_scales else None
     for scale in capacity_scales:
         q, quantization = quantize(g, scale)
         started = time.monotonic()
-        result = native_solve(library, n, q, 'cost_scaling')
+        result = native_solve(n, q, 'cost_scaling')
         key = 'lemon_'+str(scale)
         times[key] = time.monotonic()-started
         certificates[key] = dict(certificate=result['certificate'], quantization=quantization)

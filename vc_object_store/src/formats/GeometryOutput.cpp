@@ -71,6 +71,14 @@ void umbilicus(const Snapshot& s, Json attributes, const fs::path& path)
     attributes["uuid"] = s.revision.objectUuid;
     attributes["vc_umbilicus_json_version"] = "1";
     attributes["points"] = std::move(points);
+    // Legacy umbilicus imports keep the document's frame statement (volume,
+    // dimensions, voxel size) under provenance.legacy_metadata. Restore it as
+    // the document's metadata so readers that need a stated frame, such as
+    // the constraint extractor's readUmbilicusFile, accept the export.
+    if (!attributes.contains("metadata")) {
+        const auto legacy = attributes.value("provenance", Json::object()).value("legacy_metadata", Json());
+        if (legacy.is_object()) attributes["metadata"] = legacy;
+    }
     writeJson(path, attributes);
 }
 void surface(const Snapshot& s, Json attributes, const fs::path& path, bool validOnly)

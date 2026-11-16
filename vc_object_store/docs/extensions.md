@@ -186,7 +186,7 @@ Fiber line geometry and source identity remain in the core objects and source ex
 | `arc_a`, `arc_b` | Separate little-endian float32 BLOBs, base voxels | 4 each |
 | `normal_a`, `normal_b` | Lasagna compact XY plus hemisphere sign | 3 each |
 | `connector` | Compact signed unit direction from canonical A to B | 3 |
-| `winding_distance` | Unsigned byte; code 0 invalid, otherwise (code−1)/16 turns | 1 |
+| `winding_distance` | Unsigned byte; code 0 means no winding distance (a geometry/normal-only measurement, read back as NaN), otherwise (code−1)/16 turns | 1 |
 | `extra` | Explicitly supplied optional JSON | NULL normally |
 
 The maximum winding distance is 15.875 turns. Extraction/import skips larger measurements before quantization; it never clamps them into range. Endpoint arcs use the canonical core A/B order. A normal blob is two unsigned Lasagna hemisphere coordinates plus an int8 sign: 0 undefined, +1 positive Z, −1 negative Z. The shared `vc_reader/compact_normal.hpp` implementation is also used by the Lasagna sampler. The connector supplies ordering direction only, not physical connector length. Coincident endpoints have an undefined connector.

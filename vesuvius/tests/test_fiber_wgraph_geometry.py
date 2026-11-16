@@ -195,7 +195,7 @@ def test_winding_stage_uses_typed_inputs_and_writes_referenced_results(tmp_path,
         distance=np.array([.5]),parallel=np.array([False]),normal_a=np.ones((1,3)),normal_b=np.ones((1,3)),
         connector=np.ones((1,3)),valid_a=np.array([True]),valid_b=np.array([True]),valid_connector=np.array([True]))
     paths=SimpleNamespace(graph_index=np.array([0,1]))
-    def inputs(settings,source,selected,*,stage):
+    def inputs(settings,source,selected,*,stage,**kwargs):
         assert settings['database']==str(signed)
         assert settings['graph_cache']==str(tmp_path/'graph-cache')
         assert selected==dict(classification=classification_run,normal_sign=sign_run)
@@ -207,7 +207,7 @@ def test_winding_stage_uses_typed_inputs_and_writes_referenced_results(tmp_path,
             np.testing.assert_array_equal(args[2],[0,1])
             np.testing.assert_array_equal(args[3],[0,1])
             np.testing.assert_array_equal(args[4],[-1,-1])
-            return dict(a=np.array([0]),b=np.array([1]),target=np.array([0.]),weight=np.array([1.]))
+            return dict(a=np.array([0]),b=np.array([1]),target=np.array([0.]),weight=np.array([1.]),read=1,used=1,expanded=1)
     def managed(settings,module,source):
         assert settings['devices']==devices
         assert settings['gpu_manager']['exclusive'] is exclusive
