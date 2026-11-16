@@ -204,28 +204,15 @@ class CpuBackend final : public RegistrationBackend {
         const cfloat* C = reinterpret_cast<const cfloat*>(c_.get());
         std::copy(C, C + g_.NC, reinterpret_cast<cfloat*>(copy_.get()));
         fftwf_execute_dft_c2r(inverse_, copy_.get(), r_.get());
-        float top = -INFINITY;
-        best[0] = best[1] = best[2] = 0;
-        for (int d0 = -s[0]; d0 <= s[0]; ++d0)
-            for (int d1 = -s[1]; d1 <= s[1]; ++d1) {
-                const float* row = r_.get() + (static_cast<std::size_t>((d0 + n[0]) % n[0]) * n[1] + (d1 + n[1]) % n[1]) * n[2];
-                for (int d2 = -s[2]; d2 <= s[2]; ++d2) {
-                    const float v = row[(d2 + n[2]) % n[2]];
-                    if (v > top) top = v, best[0] = d0, best[1] = d1, best[2] = d2;
-                }
-            }
-        bool at_edge = false;
-        for (int j = 0; j < 3; ++j)
-            if (s[j] > 0 && std::abs(best[j]) == s[j]) at_edge = true;
-        return at_edge;
+        const float* r = r_.get();
+        return peak_in_window(s, best, [&](int d0, int d1, int d2) {
+            return r[(static_cast<std::size_t>((d0 + n[0]) % n[0]) * n[1] + (d1 + n[1]) % n[1]) * n[2] + (d2 + n[2]) % n[2]];
+        });
     }
 
     void correlation(const double at[3], double& value, double g[3], double H[3][3]) override {
         const int n0 = g_.n[0], n1 = g_.n[1], n2 = g_.n[2], nc = g_.nc;
-        std::vector<cdouble> e0(n0), e1(n1), e2(nc);
-        for (int k = 0; k < n0; ++k) e0[k] = std::polar(1.0, 2 * M_PI * frequency(k, n0) * at[0]);
-        for (int k = 0; k < n1; ++k) e1[k] = std::polar(1.0, 2 * M_PI * frequency(k, n1) * at[1]);
-        for (int k = 0; k < nc; ++k) e2[k] = std::polar(1.0, 2 * M_PI * frequency(k, n2) * at[2]);
+        const std::vector<cdouble> e0 = correlation_phasors(n0, n0, at[0]), e1 = correlation_phasors(n1, n1, at[1]), e2 = correlation_phasors(n2, nc, at[2]);
         const cfloat* C = reinterpret_cast<const cfloat*>(c_.get());
         // per line (k0, k1) its ten terms, then the lines in order: the same sums on any number of threads
         std::vector<std::array<double, 10>> part(static_cast<std::size_t>(n0) * n1);
@@ -282,14 +269,10 @@ class CpuBackend final : public RegistrationBackend {
         for (int i = 0; i < n0; ++i) {
             const float* s = src + static_cast<std::size_t>(i) * stride1 * stride2;
             float* d = dst_all + static_cast<std::size_t>(i) * n1 * n2;
-            double sum = 0, weight = 0;
+            double sum = 0;
             for (int j = 0; j < n1; ++j)
-                for (int k = 0; k < n2; ++k) {
-                    const double w = static_cast<double>(w1[j]) * w2[k];
-                    sum += w * s[static_cast<std::size_t>(j) * stride2 + k];
-                    weight += w;
-                }
-            const float mean = static_cast<float>(sum / weight);
+                for (int k = 0; k < n2; ++k) sum += static_cast<double>(w1[j]) * w2[k] * s[static_cast<std::size_t>(j) * stride2 + k];
+            const float mean = static_cast<float>(sum / window_norm_);
             for (int j = 0; j < n1; ++j) {
                 const float wj = w0[i] * w1[j];
                 for (int k = 0; k < n2; ++k) d[static_cast<std::size_t>(j) * n2 + k] = (s[static_cast<std::size_t>(j) * stride2 + k] - mean) * wj * w2[k];
@@ -299,6 +282,7 @@ class CpuBackend final : public RegistrationBackend {
 
     RegistrationGeometry g_;
     RegistrationOptions opt_;
+    double window_norm_ = window_weight(g_);   // (after g_)
     RealBuffer r_, rbig_, stage_a_, stage_b_;
     ComplexBuffer aw_, c_, copy_, cbig_, cwork_;
     const float* weight_;

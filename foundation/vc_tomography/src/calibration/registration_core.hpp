@@ -10,13 +10,14 @@
 #include <memory>
 #include <vector>
 
+#include "common/hd_math.hpp"
 #include "vc_tomography/calibration/registration.hpp"
 #include "vc_tomography/common.hpp"
 
 namespace vc_tomography::calibration {
 
 // signed frequency of bin k of an axis of length n, in cycles per sample
-inline double frequency(int k, int n) { return static_cast<double>(k <= n / 2 ? k : k - n) / n; }
+HR_HD double frequency(int k, int n) { return static_cast<double>(k <= n / 2 ? k : k - n) / n; }
 
 // 1 on [lo, hi], raised-cosine ramps to 0 just outside the ends of the axis
 inline std::vector<float> flat_taper(int L, int lo, int hi) {
@@ -45,9 +46,35 @@ inline std::vector<std::complex<double>> phasors(int L, int bins, double d) {
     return e;
 }
 
+// exp(2 pi i f d) per bin of an axis of length n, `bins` of them (the evaluation of the correlation at d)
+inline std::vector<std::complex<double>> correlation_phasors(int n, int bins, double d) {
+    std::vector<std::complex<double>> e(static_cast<std::size_t>(bins));
+    for (int k = 0; k < bins; ++k) e[k] = std::polar(1.0, 2 * M_PI * frequency(k, n) * d);
+    return e;
+}
+
+// The largest of value(d0, d1, d2) over |dj| <= s[j], in that order of loops (the first of equal ones) -> best;
+// whether it lies at the window's edge along an axis that has one
+template <class Value>
+bool peak_in_window(const int s[3], int best[3], Value&& value) {
+    float top = -INFINITY;
+    best[0] = best[1] = best[2] = 0;
+    for (int d0 = -s[0]; d0 <= s[0]; ++d0)
+        for (int d1 = -s[1]; d1 <= s[1]; ++d1)
+            for (int d2 = -s[2]; d2 <= s[2]; ++d2) {
+                const float v = value(d0, d1, d2);
+                if (v > top) top = v, best[0] = d0, best[1] = d1, best[2] = d2;
+            }
+    bool at_edge = false;
+    for (int j = 0; j < 3; ++j)
+        if (s[j] > 0 && std::abs(best[j]) == s[j]) at_edge = true;
+    return at_edge;
+}
+
 // Sizes of one registration: block a is n, block b is L = n + 2 m; spectra keep nc and Lc bins along axis 2.
 struct RegistrationGeometry {
     int n[3] = {0, 0, 0}, m[3] = {0, 0, 0}, L[3] = {0, 0, 0};
+
     int nc = 0, Lc = 0;
     bool active[3] = {false, false, false};
     std::size_t N = 0, NC = 0, NB = 0, NBC = 0;
@@ -108,6 +135,14 @@ struct RegistrationGeometry {
             }
     }
 };
+
+// the weight of a frame under the analysis window (rows x columns of the inner block), summed row by row
+inline double window_weight(const RegistrationGeometry& g) {
+    double weight = 0;
+    for (int j = 0; j < g.n[1]; ++j)
+        for (int k = 0; k < g.n[2]; ++k) weight += static_cast<double>(g.w1[j]) * g.w2[k];
+    return weight;
+}
 
 // The array work of a registration on one device. Blocks are host arrays; staging() gives host memory the device
 // takes fastest (page-locked for CUDA): a caller that fills those and passes them to set_a / set_b saves a copy.

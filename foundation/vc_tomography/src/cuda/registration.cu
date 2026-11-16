@@ -32,7 +32,6 @@ __device__ inline cufftComplex cmul(cufftComplex a, cufftComplex b) {
 __device__ inline cufftDoubleComplex cmul(cufftDoubleComplex a, cufftDoubleComplex b) {
     return make_cuDoubleComplex(__dsub_rn(__dmul_rn(a.x, b.x), __dmul_rn(a.y, b.y)), __dadd_rn(__dmul_rn(a.x, b.y), __dmul_rn(a.y, b.x)));
 }
-__device__ inline double bin_frequency(int k, int n) { return static_cast<double>(k <= n / 2 ? k : k - n) / n; }
 
 // out[frame * n1 + row] = sum over the row's columns of w2[col] * src (w2 null: plain sum); one thread per row
 __global__ void row_sums_kernel(const float* __restrict__ src, size_t frame_stride, size_t row_stride, int n0, int n1, int n2,
@@ -139,13 +138,13 @@ __global__ void correlation_kernel(const cufftComplex* __restrict__ C, int n0, i
     if (line >= n0 * n1) return;
     const int k0 = line / n1, k1 = line % n1;
     const double two_pi = 6.283185307179586476925286766559;
-    const double q0 = two_pi * bin_frequency(k0, n0), q1 = two_pi * bin_frequency(k1, n1);
+    const double q0 = two_pi * frequency(k0, n0), q1 = two_pi * frequency(k1, n1);
     const cufftDoubleComplex e01 = cmul(e0[k0], e1[k1]);
     const cufftComplex* pc = C + static_cast<size_t>(line) * nc;
     double sr = 0, si = 0, sr2 = 0, si2 = 0, sr22 = 0, si22 = 0;
     for (int k2 = 0; k2 < nc; ++k2) {
         const double mult = (k2 == 0) ? 1.0 : 2.0;
-        const double q2 = two_pi * bin_frequency(k2, n2);
+        const double q2 = two_pi * frequency(k2, n2);
         const cufftDoubleComplex t = cmul(make_cuDoubleComplex(pc[k2].x, pc[k2].y), e2[k2]);
         sr += mult * t.x;
         si += mult * t.y;
@@ -224,10 +223,7 @@ class CudaBackend final : public RegistrationBackend {
         partial_.resize(static_cast<std::size_t>(g_.n[0]) * g_.n[1] * 10);
         evaluation_.resize(10);
         // the weighted number of samples of a frame under the analysis window, summed as on the CPU
-        double weight = 0;
-        for (int j = 0; j < g_.n[1]; ++j)
-            for (int k = 0; k < g_.n[2]; ++k) weight += static_cast<double>(g_.w1[j]) * g_.w2[k];
-        window_norm_ = weight;
+        window_norm_ = window_weight(g_);
         // transforms: the inner block and the padded block (3D, or 2D for a single frame), and the padded
         // block's frames one by one (2D, batched) for the displacement of rows. One work area serves all.
         std::size_t work = 0;
@@ -327,25 +323,14 @@ class CudaBackend final : public RegistrationBackend {
         host_window_.resize(total);
         gather_kernel<<<grid_for(total), kBlock>>>(r_.data(), n[0], n[1], n[2], s[0], s[1], s[2], window_.data());
         VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpy(host_window_.data(), window_.data(), total * sizeof(float), cudaMemcpyDeviceToHost));
-        float top = -INFINITY;
-        best[0] = best[1] = best[2] = 0;
-        std::size_t idx = 0;
-        for (int d0 = -s[0]; d0 <= s[0]; ++d0)
-            for (int d1 = -s[1]; d1 <= s[1]; ++d1)
-                for (int d2 = -s[2]; d2 <= s[2]; ++d2, ++idx)
-                    if (host_window_[idx] > top) top = host_window_[idx], best[0] = d0, best[1] = d1, best[2] = d2;
-        bool at_edge = false;
-        for (int j = 0; j < 3; ++j)
-            if (s[j] > 0 && std::abs(best[j]) == s[j]) at_edge = true;
-        return at_edge;
+        return peak_in_window(s, best, [&](int d0, int d1, int d2) {
+            return host_window_[(static_cast<std::size_t>(d0 + s[0]) * w1 + (d1 + s[1])) * w2 + (d2 + s[2])];
+        });
     }
 
     void correlation(const double at[3], double& value, double g[3], double H[3][3]) override {
         const int* n = g_.n;
-        std::vector<std::complex<double>> e0(n[0]), e1(n[1]), e2(g_.nc);
-        for (int k = 0; k < n[0]; ++k) e0[k] = std::polar(1.0, 2 * M_PI * frequency(k, n[0]) * at[0]);
-        for (int k = 0; k < n[1]; ++k) e1[k] = std::polar(1.0, 2 * M_PI * frequency(k, n[1]) * at[1]);
-        for (int k = 0; k < g_.nc; ++k) e2[k] = std::polar(1.0, 2 * M_PI * frequency(k, n[2]) * at[2]);
+        const auto e0 = correlation_phasors(n[0], n[0], at[0]), e1 = correlation_phasors(n[1], n[1], at[1]), e2 = correlation_phasors(n[2], g_.nc, at[2]);
         upload_phasors(e0, e1, e2);
         const int lines = n[0] * n[1];
         correlation_kernel<<<cuda::grid_1d(lines, 64), 64>>>(c_.data(), n[0], n[1], n[2], g_.nc, e0_.data(), e1_.data(), e2_.data(), partial_.data());
