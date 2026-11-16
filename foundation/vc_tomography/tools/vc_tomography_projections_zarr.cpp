@@ -21,6 +21,8 @@
 // again skips the files already stored.
 #include <hdf5.h>
 
+#include "io/h5.hpp"
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -76,39 +78,33 @@ std::string typestr(const std::string& dtype) {
 // the whole dataset, whose shape must be `shape`, as `dtype`; false when the file is not marked complete
 bool read_file(const Job& job, const Index& shape, std::vector<std::uint8_t>& out) {
     std::lock_guard lock(h5_mutex);
-    const hid_t file = H5Fopen(job.file.c_str(), H5F_ACC_RDONLY, H5P_DEFAULT);
-    if (file < 0) return false;
+    const vc_tomography::h5::Id file(H5Fopen(job.file.c_str(), H5F_ACC_RDONLY, H5P_DEFAULT), H5Fclose);
+    if (!file) return false;
     bool ok = false;
     std::string error;
     hbool_t complete = 0;
-    if (H5Aexists(file, "complete") > 0) {
-        const hid_t a = H5Aopen(file, "complete", H5P_DEFAULT);
-        H5Aread(a, H5T_NATIVE_HBOOL, &complete);
-        H5Aclose(a);
+    if (H5Aexists(file.id, "complete") > 0) {
+        const vc_tomography::h5::Id a(H5Aopen(file.id, "complete", H5P_DEFAULT), H5Aclose);
+        if (a) H5Aread(a.id, H5T_NATIVE_HBOOL, &complete);
     }
     if (complete) {
-        const hid_t data = H5Dopen2(file, job.dataset.c_str(), H5P_DEFAULT);
-        if (data < 0) {
+        const vc_tomography::h5::Id data(H5Dopen2(file.id, job.dataset.c_str(), H5P_DEFAULT), H5Dclose);
+        if (!data) {
             error = "no dataset " + job.dataset;
         } else {
-            const hid_t space = H5Dget_space(data);
+            const vc_tomography::h5::Id space(H5Dget_space(data.id), H5Sclose), type(H5Dget_type(data.id), H5Tclose);
             hsize_t dims[3] = {0, 0, 0};
-            const hid_t type = H5Dget_type(data);
             const hid_t want = job.dtype == "<u2" ? H5T_NATIVE_UINT16 : H5T_NATIVE_FLOAT;
-            if (H5Sget_simple_extent_ndims(space) != 3 || H5Sget_simple_extent_dims(space, dims, nullptr) != 3 ||
+            if (H5Sget_simple_extent_ndims(space.id) != 3 || H5Sget_simple_extent_dims(space.id, dims, nullptr) != 3 ||
                 std::int64_t(dims[0]) != shape[0] || std::int64_t(dims[1]) != shape[1] || std::int64_t(dims[2]) != shape[2])
                 error = "unexpected shape";
-            else if (H5Tequal(type, want) <= 0)
+            else if (H5Tequal(type.id, want) <= 0)
                 error = "values are not " + job.dtype;  // no conversion: the store holds the file's values
             else
-                ok = H5Dread(data, want, H5S_ALL, H5S_ALL, H5P_DEFAULT, out.data()) >= 0;
+                ok = H5Dread(data.id, want, H5S_ALL, H5S_ALL, H5P_DEFAULT, out.data()) >= 0;
             if (!ok && error.empty()) error = "cannot read " + job.dataset;
-            H5Tclose(type);
-            H5Sclose(space);
-            H5Dclose(data);
         }
     }
-    H5Fclose(file);
     if (!error.empty()) throw std::runtime_error(job.file.string() + ": " + error);
     return ok;
 }
@@ -206,7 +202,7 @@ int main(int argc, char** argv) try {
                              "(see the head of tools/vc_tomography_projections_zarr.cpp and README.md)\n");
         return 2;
     }
-    H5Eset_auto2(H5E_DEFAULT, nullptr, nullptr);
+    vc_tomography::h5::quiet();
     const fs::path root = positional[0];
     std::map<std::string, Scan> scans;
     std::map<std::string, Json> tiles;

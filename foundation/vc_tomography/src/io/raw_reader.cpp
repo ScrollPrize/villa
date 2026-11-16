@@ -2,6 +2,8 @@
 
 #include <fcntl.h>
 #include <hdf5.h>
+
+#include "io/h5.hpp"
 #include <omp.h>
 #include <unistd.h>
 
@@ -102,16 +104,7 @@ struct RawReader::Ahead {
 
 namespace {
 
-struct H5Handle {
-    hid_t id;
-    herr_t (*close)(hid_t);
-    H5Handle(hid_t i, herr_t (*c)(hid_t)) : id(i), close(c) {}
-    ~H5Handle() {
-        if (id >= 0) close(id);
-    }
-    H5Handle(const H5Handle&) = delete;
-    H5Handle& operator=(const H5Handle&) = delete;
-};
+using H5Handle = h5::Id;
 
 }  // namespace
 
@@ -130,8 +123,7 @@ RawReader::RawReader(std::vector<std::string> files, std::string dataset, int ro
         throw Error("RawReader: frames of " + std::to_string(rows) + " x " + std::to_string(cols) + " cannot be read at 1/" + std::to_string(1 << reduce) + " (not multiples of it)");
     rows_ = 1 + ((rows - 1) >> reduce), cols_ = 1 + ((cols - 1) >> reduce);
     infos_.resize(files_.size());
-    static std::once_flag quiet;
-    std::call_once(quiet, [] { H5Eset_auto2(H5E_DEFAULT, nullptr, nullptr); });
+    h5::quiet();
 }
 
 RawReader::~RawReader() { set_prefetch_threads(0); }

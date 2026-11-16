@@ -14,7 +14,7 @@
 #include <map>
 #include <sstream>
 
-#include "calibration/h5_read.hpp"
+#include "io/h5.hpp"
 #include "calibration/iso_time.hpp"
 #include "calibration/unwrap.hpp"
 #include "io/json.hpp"
@@ -29,11 +29,7 @@ constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
 
 using io::is_file;
 
-bool is_group(hid_t f, const std::string& path) {
-    if (!h5::exists(f, path)) return false;
-    H5O_info2_t info;
-    return H5Oget_info_by_name3(f, path.c_str(), &info, H5O_INFO_BASIC, H5P_DEFAULT) >= 0 && info.type == H5O_TYPE_GROUP;
-}
+using h5::is_group;
 
 std::string text_if(hid_t f, const std::string& path) {
     if (!h5::is_dataset(f, path) || h5::shape(f, path).type_class != H5T_STRING) return std::string();
@@ -177,11 +173,7 @@ void locate_frames(hid_t f, Master& m, const std::string& path) {
     const h5::FrameDataset fd = h5::frame_dataset(file.id, m.frame_dataset);
     if (fd.is_virtual) throw Error(m.frame_file + ": the frames of an NXtomo master are read from one dataset, not a virtual one");
     m.frames_in_file = fd.frames, m.rows = fd.rows, m.cols = fd.cols;
-    h5::Id d(H5Dopen2(file.id, m.frame_dataset.c_str(), H5P_DEFAULT), H5Dclose);
-    h5::Id t(H5Dget_type(d.id), H5Tclose);
-    const H5T_class_t cls = H5Tget_class(t.id);
-    const std::string bits = std::to_string(8 * H5Tget_size(t.id));
-    m.dtype = cls == H5T_FLOAT ? "float" + bits : cls == H5T_INTEGER ? (H5Tget_sign(t.id) == H5T_SGN_NONE ? "uint" : "int") + bits : "unknown";
+    m.dtype = h5::dtype_name(file.id, m.frame_dataset);
 }
 
 void read_supplement(Master& m) {

@@ -17,7 +17,7 @@
 #include <regex>
 #include <set>
 
-#include "calibration/h5_read.hpp"
+#include "io/h5.hpp"
 #include "calibration/iso_time.hpp"
 #include "calibration/nxtomo.hpp"
 #include "calibration/unwrap.hpp"
@@ -192,12 +192,7 @@ double to_si(double v, const std::string& unit, const std::map<std::string, doub
 
 // ------------------------------------------------------------------ reading the master
 
-bool is_group(hid_t f, const std::string& path) {
-    if (!h5::exists(f, path)) return false;
-    H5O_info2_t info;
-    if (H5Oget_info_by_name3(f, path.c_str(), &info, H5O_INFO_BASIC, H5P_DEFAULT) < 0) return false;
-    return info.type == H5O_TYPE_GROUP;
-}
+using h5::is_group;
 
 using io::strip;
 
@@ -304,14 +299,9 @@ std::string frame_dataset_path(hid_t f, const std::string& e, const std::string&
 }
 
 std::string dtype_name(hid_t f, const std::string& path) {
-    h5::Id d(H5Dopen2(f, path.c_str(), H5P_DEFAULT), H5Dclose);
-    h5::Id t(H5Dget_type(d.id), H5Tclose);
-    const std::size_t bits = H5Tget_size(t.id) * 8;
-    switch (H5Tget_class(t.id)) {
-        case H5T_INTEGER: return (H5Tget_sign(t.id) == H5T_SGN_NONE ? "uint" : "int") + std::to_string(bits);
-        case H5T_FLOAT: return "float" + std::to_string(bits);
-        default: throw Error(path + ": frames of a type that is neither integer nor float");
-    }
+    const std::string name = h5::dtype_name(f, path);
+    if (name == "unknown") throw Error(path + ": frames of a type that is neither integer nor float");
+    return name;
 }
 
 // Lima's naming of its files, for frames not mapped by a virtual dataset: scanNNNN/<prefix>XXXX.h5, a given number

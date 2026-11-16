@@ -5,7 +5,7 @@
 #include <algorithm>
 #include <cstdlib>
 
-#include "calibration/h5_read.hpp"
+#include "io/h5.hpp"
 #include "calibration/nxtomo.hpp"
 #include "io/text_file.hpp"
 

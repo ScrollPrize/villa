@@ -177,6 +177,7 @@ if(VC_TOMOGRAPHY_TOOLS)
   # vc_tomography_projections_zarr: reduced projection copies (vc_tomography.download_projections) as one multiscale Zarr store
   add_executable(vc_tomography_projections_zarr tools/vc_tomography_projections_zarr.cpp)
   target_compile_features(vc_tomography_projections_zarr PRIVATE cxx_std_20)
+  target_include_directories(vc_tomography_projections_zarr PRIVATE src)
   target_link_libraries(vc_tomography_projections_zarr PRIVATE vc_tomography vc_reader::reader HDF5::HDF5)
   target_compile_options(vc_tomography_projections_zarr PRIVATE -O2 -Wall -Wno-missing-field-initializers)
   install(TARGETS vc_tomography_calibration vc_tomography_reconstruct vc_tomography_composite vc_tomography_projections_zarr RUNTIME DESTINATION "${VC_TOMOGRAPHY_TOOLS_DESTINATION}")

@@ -1,6 +1,7 @@
 #pragma once
-// Reading values out of an HDF5 file with the C library: what the acquisition record needs (record.cpp).
-// libhdf5 (serial build) is not thread safe: everything here is called from one thread.
+// HDF5 with the C library: handles that close themselves, the error stack silenced once, and reading values out of
+// a file (the acquisition record, the scan readers, the raw frames). libhdf5 (serial build) is not thread safe: the
+// callers serialise their HDF5 calls.
 #include <hdf5.h>
 #include <sys/types.h>
 
@@ -13,7 +14,7 @@
 
 #include "vc_tomography/common.hpp"
 
-namespace vc_tomography::calibration::h5 {
+namespace vc_tomography::h5 {
 
 struct Id {
     hid_t id = -1;
@@ -65,6 +66,12 @@ inline bool exists(hid_t loc, const std::string& path) {
         i = j + 1;
     }
     return H5Oexists_by_name(loc, path.c_str(), H5P_DEFAULT) > 0;
+}
+
+inline bool is_group(hid_t loc, const std::string& path) {
+    if (!exists(loc, path)) return false;
+    H5O_info2_t info;
+    return H5Oget_info_by_name3(loc, path.c_str(), &info, H5O_INFO_BASIC, H5P_DEFAULT) >= 0 && info.type == H5O_TYPE_GROUP;
 }
 
 inline bool is_dataset(hid_t loc, const std::string& path) {
@@ -238,6 +245,18 @@ inline std::string attribute_text(hid_t loc, const std::string& path, const std:
 // `dataset` in the file `file_name` (as the mapping names it: ".", relative to the master's directory, or
 // absolute). spans_frames: the bounds of the piece in the dataset span whole frames; whole_frames: also, both
 // sides select every pixel of their frames (no strides or gaps).
+// a dataset's element type as numpy names it ("uint16", "int32", "float32", ...); "unknown" for other classes
+inline std::string dtype_name(hid_t loc, const std::string& path) {
+    const Id d(H5Dopen2(loc, path.c_str(), H5P_DEFAULT), H5Dclose);
+    if (!d) throw Error("no dataset " + path);
+    const Id t(H5Dget_type(d.id), H5Tclose);
+    const H5T_class_t cls = H5Tget_class(t.id);
+    const std::string bits = std::to_string(8 * H5Tget_size(t.id));
+    if (cls == H5T_FLOAT) return "float" + bits;
+    if (cls == H5T_INTEGER) return (H5Tget_sign(t.id) == H5T_SGN_NONE ? "uint" : "int") + bits;
+    return "unknown";
+}
+
 struct VirtualPiece {
     std::string file_name, dataset;
     std::int64_t first = 0, count = 0, source_first = 0, source_count = 0;
@@ -304,4 +323,4 @@ inline FrameDataset frame_dataset(hid_t loc, const std::string& dataset) {
     return out;
 }
 
-}  // namespace vc_tomography::calibration::h5
+}  // namespace vc_tomography::h5
