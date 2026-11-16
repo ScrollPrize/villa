@@ -32,7 +32,7 @@ target_include_directories(vc_reader_headers INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/include>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
-target_link_libraries(vc_reader_headers INTERFACE Threads::Threads Boost::headers concurrentqueue::concurrentqueue)
+target_link_libraries(vc_reader_headers INTERFACE Threads::Threads Boost::headers concurrentqueue::concurrentqueue nlohmann_json::nlohmann_json)
 
 add_library(vc_reader_thinning STATIC
     src/cpp/thinning/trace.cpp src/cpp/thinning/history.cpp src/cpp/thinning/distance.cpp src/cpp/thinning/skeleton.cpp
