@@ -291,6 +291,65 @@ class SlidingWindowDataset(Dataset):
             tens = torch.from_numpy(image.transpose(2, 0, 1)).unsqueeze(0)  # -> (1,C,H,W) so C becomes frames
             return tens, self.xyxys[idx], valid
 
+    def __getitems__(self, indices):
+        """A batch's tiles, read as a few regions instead of one read per tile.
+
+        With stride 16 and 64-pixel tiles each pixel is in 16 tiles, so reading per tile fetches and
+        converts the same voxels 16 times. Reversal, the validity test, clipping and the float
+        conversion act on each spatial pixel independently, so applying them once to a region and
+        slicing the tiles out returns exactly what __getitem__ returns.
+
+        The batch is walked in the order given and split into runs of tiles that sit side by side
+        in one row of the tile grid: a new run starts when a tile's y1 differs from the previous
+        tile's, when its x1 is not to the right of the previous one (a wrap to the next row, a
+        duplicate or an unordered index), or when it is more than one tile width away (tiles
+        dropped by the fragment mask, or scattered indices from a partition or a sampler). Each run
+        is read as one region and sliced; the samples come back in the order of `indices`. A run
+        whose region would be larger than the area of its tiles is read tile by tile, and so is the
+        whole batch when its tiles need resizing, because they cannot be sliced from a region.
+
+        The region path serves spatially contiguous runs. It bounds the allocation and the work to
+        the area of the tiles; it says nothing about how the region lines up with remote chunks.
+        """
+        indices = list(indices)
+        if not indices:
+            return []
+        boxes = np.asarray(self.xyxys[indices])
+        if ((boxes[:, 2] - boxes[:, 0]) != self.size).any() or ((boxes[:, 3] - boxes[:, 1]) != self.size).any():
+            return [self[i] for i in indices]  # tiles need resizing: keep the per-tile path
+        xs, ys = boxes[:, 0].tolist(), boxes[:, 1].tolist()
+        starts = [0] + [k for k in range(1, len(indices))
+                        if ys[k] != ys[k - 1] or not 0 < xs[k] - xs[k - 1] <= self.size] + [len(indices)]
+        samples = []
+        for lo, hi in zip(starts, starts[1:]):
+            samples.extend(self._read_run(indices[lo:hi], boxes[lo:hi]))
+        return samples
+
+    def _read_run(self, indices, boxes):
+        bx1, by1 = int(boxes[:, 0].min()), int(boxes[:, 1].min())
+        bx2, by2 = int(boxes[:, 2].max()), int(boxes[:, 3].max())
+        if (bx2 - bx1) * (by2 - by1) > len(indices) * self.size * self.size:
+            return [self[i] for i in indices]  # the region would be larger than its tiles
+        worker_profiler = get_worker_profiler()
+        with scoped_timer(worker_profiler, "preprocess_seconds", flag="approximate"):
+            read_metric = "local_read_seconds"
+            if self.source.storage_kind == "remote_zarr":
+                read_metric = "remote_read_seconds"
+            with scoped_timer(worker_profiler, read_metric, flag="approximate"):
+                region = self.source.read_roi(by1, by2, bx1, bx2)  # (h, w, C), uint8
+            if self.source.storage_kind != "remote_zarr" and worker_profiler is not None:
+                worker_profiler.increment_counter("local_read_bytes", int(region.nbytes), flag="approximate")
+            if self.reverse:
+                region = region[:, :, ::-1]
+            valid = np.any(region != 0, axis=-1).astype(np.uint8)
+            np.clip(region, 0, CFG.max_clip_value, out=region)
+            image = (region.astype(np.float32) / self.max_value).transpose(2, 0, 1)  # (C, h, w)
+            samples = []
+            for box, (x1, y1, x2, y2) in zip(boxes, boxes.tolist()):
+                ys, xs = slice(y1 - by1, y2 - by1), slice(x1 - bx1, x2 - bx1)
+                samples.append((torch.from_numpy(image[:, ys, xs]).unsqueeze(0), box, valid[ys, xs]))
+            return samples
+
 def create_inference_dataloader(
     source: LayersSource,
     fragment_mask: Optional[np.ndarray],
