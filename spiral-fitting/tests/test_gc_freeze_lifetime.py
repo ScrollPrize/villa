@@ -202,3 +202,14 @@ def test_a_non_cuda_fit_never_touches_cuda_counters(monkeypatch):
     optimiser = Optimiser()
     fs.FitContext._free_fit_state_for_export(types.SimpleNamespace(optimiser=optimiser))
     assert optimiser.state == {} and optimiser.cleared
+
+
+def test_rebuild_and_close_forget_the_pressure_watermark_together_with_the_freeze_epoch():
+    """Review: after a rebuild to a smaller model the pressure policy must establish a fresh baseline, not wait for the old model's watermark."""
+    import inspect
+    import types
+    ctx = types.SimpleNamespace(_gc_epoch=3, _gc_floor_bytes=10 ** 9)
+    fs.FitContext._reset_gc_state(ctx)
+    assert ctx._gc_epoch is None and ctx._gc_floor_bytes == 0
+    for name in ("rebuild_model_state", "close"):
+        assert "_reset_gc_state" in inspect.getsource(getattr(fs.FitContext, name)), name

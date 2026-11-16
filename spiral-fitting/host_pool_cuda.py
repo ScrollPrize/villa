@@ -3,37 +3,46 @@
 Compiles CUDA C++ at runtime and launches kernels into the context PyTorch
 already created, using torch tensors for all device memory.
 """
-import ctypes, glob, os
+import ctypes, glob, os, threading
 import torch
 
 _nvrtc = None
 _cuda = None
+_LIBS_LOCK = threading.Lock()
 
 
 def _libs():
     global _nvrtc, _cuda
-    if _nvrtc is None:
-        sp = os.path.dirname(os.path.dirname(torch.__file__))
-        cands = [c for c in glob.glob(os.path.join(sp, 'nvidia', 'cuda_nvrtc', 'lib', 'libnvrtc*.so*'))
-                 if 'builtins' not in c]
-        if not cands:
-            raise RuntimeError("libnvrtc not found")
-        # Sorted so the plain (non-`.alt.`) library is tried first -- deterministic either
-        # way, but the REAL fault this traced to (2026-09-23, .142, every V100, every
-        # render) was version, not which of the two: `nvidia-cuda-nvrtc-cu12` resolved to
-        # 12.9.86 alongside torch==2.13.0+cu126 (the package's own version drifts loose of
-        # torch's build tag), and NVRTC 12.9 emits PTX the 560.35.03 driver's JIT rejects
-        # with `cuModuleLoadData failed with 222` (CUDA_ERROR_UNSUPPORTED_PTX_VERSION) on
-        # BOTH the alt and non-alt library -- confirmed by reproducing the failure on each
-        # standalone before finding the version mismatch. Nothing else in this codebase
-        # calls nvrtcCompileProgram, so no other test caught it. `setup.py`'s grandprize
-        # env build now pins `nvidia-cuda-nvrtc-cu12==12.6.*` for exactly this reason; this
-        # sort is a smaller, secondary hedge in case a future box's toolchain differs
-        # between the two builds too.
-        cands.sort(key=lambda c: (".alt." in c, c))
-        _nvrtc = ctypes.CDLL(cands[0])
-        _cuda = ctypes.CDLL("libcuda.so.1")
+    if _nvrtc is None or _cuda is None:
+        with _LIBS_LOCK:
+            if _nvrtc is None or _cuda is None: _load_libs()
     return _nvrtc, _cuda
+
+
+def _load_libs():
+    """Load BOTH libraries before publishing either: a concurrent first caller (or a failed second load) must never see (handle, None)."""
+    global _nvrtc, _cuda
+    sp = os.path.dirname(os.path.dirname(torch.__file__))
+    cands = [c for c in glob.glob(os.path.join(sp, 'nvidia', 'cuda_nvrtc', 'lib', 'libnvrtc*.so*'))
+             if 'builtins' not in c]
+    if not cands:
+        raise RuntimeError("libnvrtc not found")
+    # Sorted so the plain (non-`.alt.`) library is tried first -- deterministic either
+    # way, but the REAL fault this traced to (2026-09-23, .142, every V100, every
+    # render) was version, not which of the two: `nvidia-cuda-nvrtc-cu12` resolved to
+    # 12.9.86 alongside torch==2.13.0+cu126 (the package's own version drifts loose of
+    # torch's build tag), and NVRTC 12.9 emits PTX the 560.35.03 driver's JIT rejects
+    # with `cuModuleLoadData failed with 222` (CUDA_ERROR_UNSUPPORTED_PTX_VERSION) on
+    # BOTH the alt and non-alt library -- confirmed by reproducing the failure on each
+    # standalone before finding the version mismatch. Nothing else in this codebase
+    # calls nvrtcCompileProgram, so no other test caught it. `setup.py`'s grandprize
+    # env build now pins `nvidia-cuda-nvrtc-cu12==12.6.*` for exactly this reason; this
+    # sort is a smaller, secondary hedge in case a future box's toolchain differs
+    # between the two builds too.
+    cands.sort(key=lambda c: (".alt." in c, c))
+    nvrtc = ctypes.CDLL(cands[0])
+    cuda = ctypes.CDLL("libcuda.so.1")
+    _cuda, _nvrtc = cuda, nvrtc            # published together, after both loaded
 
 
 def _chk(r, what):

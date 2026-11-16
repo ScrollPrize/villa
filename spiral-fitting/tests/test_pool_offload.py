@@ -132,3 +132,19 @@ def test_the_gather_stays_on_the_pools_card_when_another_device_becomes_current(
     assert out.device == torch.device("cuda:1")
     ii = idx.cpu().numpy().T
     np.testing.assert_array_equal(out.cpu().numpy(), np.stack([sidecar[1][tuple(ii)], sidecar[2][tuple(ii)]], -1))
+
+
+def test_verify_mirror_is_released_on_close_and_the_exit_callback_does_not_hold_the_pool(sidecar, monkeypatch):
+    """Review: with FIT_SPIRAL_POOL_OFFLOAD_VERIFY the card holds a full mirror of the pool; close() must free it, and the atexit callback must not keep the pool (and its registered host memory) alive."""
+    import gc
+    import weakref
+    monkeypatch.setenv("FIT_SPIRAL_POOL_OFFLOAD_VERIFY", "5")
+    Off = brick_pool_offload.offload_class(scc)
+    pool = Off(sidecar[0], device="cuda", label="verify_release")
+    assert pool._shadow is not None
+    ref = weakref.ref(pool)
+    pool.close()
+    assert pool._shadow is None and pool._verify_left == 0
+    del pool
+    gc.collect()
+    assert ref() is None, "something (the exit callback) still holds the closed pool"

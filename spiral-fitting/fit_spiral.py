@@ -2705,7 +2705,7 @@ class FitContext:
         # largest allocations; hand the arena back before asking for their
         # replacements rather than peaking at twice the model.
         _gc_freeze_release(self)
-        self._gc_epoch = None
+        self._reset_gc_state()
         gc.collect()
         torch.cuda.empty_cache()
         if self.device.type == 'mps':
@@ -4020,6 +4020,11 @@ class FitContext:
 
         return loss, losses, log_metrics, shell_metrics
 
+    def _reset_gc_state(self):
+        """Forget this context's share of the collector policy: the freeze epoch it took, and the pressure policy's watermark (it belongs to the old model; a smaller rebuilt model needs a fresh baseline)."""
+        self._gc_epoch = None
+        self._gc_floor_bytes = 0
+
     def _collect_garbage_after_step(self, iteration):
         """The FIT_SPIRAL_GC_POLICY collection that follows one optimiser step (see the policy block at the top of this module)."""
         if _GC_POLICY in ('freeze', 'every-step') and _GC_EVERY_STEPS > 0:
@@ -4395,7 +4400,7 @@ class FitContext:
         finally:
             # The freeze is process-wide: end this context's share of it even when releasing the store failed.
             _gc_freeze_release(self)
-            self._gc_epoch = None
+            self._reset_gc_state()
 
 
 def main(config, *, scroll, paths, progress=None, resume_path=None,

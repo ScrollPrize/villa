@@ -117,7 +117,8 @@ def offload_class(scc):
                 self._verify_left = int(os.environ.get("FIT_SPIRAL_POOL_OFFLOAD_VERIFY", "0")); self._verify = dict(gathers=0, lookups=0, mismatched_values=0)
                 if self._verify_left:                                        # VERIFY mode (identity test only): a resident copy on the card, every offloaded gather compared with it
                     self._shadow = torch.from_numpy(self.host_pool).to(self.device)
-                    import atexit; atexit.register(lambda s_=self: print(f"rb_offload VERIFY {s_.label} FINAL: {s_._verify['gathers']} gathers, {s_._verify['lookups']:,} lookups x {s_.channels} channels compared with the resident pool: {s_._verify['mismatched_values']} mismatched values", flush=True))
+                    import atexit; _v, _lab, _ch = self._verify, self.label, self.channels       # the exit callback holds the statistics dict and two plain values, never the pool (a callback that holds the pool keeps its registered host memory alive to process exit)
+                    atexit.register(lambda: print(f"rb_offload VERIFY {_lab} FINAL: {_v['gathers']} gathers, {_v['lookups']:,} lookups x {_ch} channels compared with the resident pool: {_v['mismatched_values']} mismatched values", flush=True))
                 self.table = torch.from_numpy(np.ascontiguousarray(remap[table_np])).to(self.device)
                 self._brick = torch.tensor(brick, dtype=torch.long, device=self.device); self._origin = torch.tensor(self.origin_zyx, dtype=torch.long, device=self.device)
                 self._shape = torch.tensor(self.shape_zyx, dtype=torch.long, device=self.device); self._stride_z = brick[1] * brick[2]; self._stride_y = brick[2]
@@ -162,6 +163,7 @@ def offload_class(scc):
             if finalizer is not None: finalizer()                        # unregisters once; later calls (and garbage collection) do nothing
             self.host_pool = None
             self.pool = None; self.table = None
+            self._shadow = None; self._verify_left = 0          # the VERIFY-mode resident mirror is a full copy of the pool on the card: a closed pool must not keep it
 
     print(f"brick_pool_offload: lasagna brick pools of at least {min_gib} GiB go to mapped host RAM (FIT_SPIRAL_POOL_OFFLOAD=1)", flush=True)
     return OffloadBrickPool
