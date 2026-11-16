@@ -452,6 +452,7 @@ the second output.
 | `--checkpoint-path` | Explicit checkpoint, useful in folder mode; overrides the positional checkpoint. |
 | `--output-prefix` | Folder-mode filename prefix, default empty. |
 | `--mask-path` | Optional 2D TIFF; nonzero pixels limit scheduled output. |
+| `--predict-off-surface` | Also write predictions on pixels that are zero in every selected layer. By default such pixels, which have no surface, stay empty. |
 | `--resolution` | Zarr pyramid key, default `0`; bare arrays require level 0. |
 | `--num-workers`, `--workers` | DataLoader workers, default `4`. |
 | `--prefetch-factor` | Per-worker prefetch factor, default `2`. |
