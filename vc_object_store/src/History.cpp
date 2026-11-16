@@ -102,7 +102,11 @@ const std::unordered_map<std::string, std::vector<std::string>>& incidenceOf(
     // once, sequentially, and each endpoint's rows arrive in edge uuid order.
     // A small selection in a large store probes the adjacency indexes instead.
     int64_t objectCount = 0;
-    { Statement count(source, "SELECT count(*) FROM objects"); if (count.row()) objectCount = count.i64(0); }
+    // Only "does the selection cover at least a tenth of the store" matters: count up to that threshold plus one, so a small selection never pays for a scan
+    // of a multi-million-object table.
+    { Statement count(source, "SELECT count(*) FROM (SELECT 1 FROM objects LIMIT ?1)");
+      count.bind(1, int64_t(keys.size()) * 10 + 1);
+      if (count.row()) objectCount = count.i64(0); }
     if (objectCount > 0 && keys.size() * 10 >= size_t(objectCount)) {
         std::unordered_set<std::string> selected;
         for (const auto& key : keys) selected.insert(formatUuid(key));

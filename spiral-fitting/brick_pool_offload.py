@@ -71,6 +71,7 @@ def offload_class(scc):
         def __init__(self, sidecar_dir, *, origin_zyx=(0, 0, 0), z_roi=None, device="cuda", label, expected_channels=None,
                      expected_shape_zyx=None, progress_callback=None):
             dev = torch.device(device)
+            if dev.type == "cuda" and dev.index is None: dev = torch.device("cuda", torch.cuda.current_device())   # resolve a bare 'cuda' now: a later current-device change must not move this pool
             meta, table_np, coords_np, memmaps = open_pool(sidecar_dir)
             rows = int(meta["rows"]); bvox = int(np.prod([int(v) for v in meta["brick_shape"]]))
             if z_roi is not None:
@@ -130,27 +131,28 @@ def offload_class(scc):
 
         def gather(self, indices_zyx):
             if not self._offloaded: return Base.gather(self, indices_zyx)
-            started = time.perf_counter(); original_shape = tuple(indices_zyx.shape[:-1]); flat = indices_zyx.detach().reshape(-1, 3)
-            if flat.shape[0] == 0: return torch.empty((*original_shape, self.channels), dtype=torch.uint8, device=self.device)
-            flat = flat.to(device=self.device, dtype=torch.long); source = flat + self._origin
-            if self._bounds_check and bool(((source < 0) | (source >= self._shape)).any()): raise IndexError(f"{self.label} gather received an out-of-bounds index")
-            brick_idx = torch.div(source, self._brick, rounding_mode="floor")
-            slots = self.table[brick_idx[:, 0], brick_idx[:, 1], brick_idx[:, 2]].to(torch.long).contiguous()
-            local = source - brick_idx * self._brick
-            linear = (local[:, 0] * self._stride_z + local[:, 1] * self._stride_y + local[:, 2]).contiguous()
-            n = int(slots.shape[0]); out = torch.empty((n, self.channels), dtype=torch.uint8, device=self.device)
-            st = torch.cuda.current_stream(self.device).cuda_stream
-            self._mod.launch("gather_host", ((n + 255) // 256,), (256,), [ctypes.c_uint64(self._dptr), slots, linear, ctypes.c_longlong(n), ctypes.c_int(self.channels),
-                                                                           ctypes.c_longlong(self._rows), ctypes.c_longlong(self._bvox), out], stream=st)
-            if getattr(self, "_verify_left", 0) > 0:
-                ref = self._shadow[:, slots, linear].transpose(0, 1); bad = int((ref != out).sum()); self._verify_left -= 1
-                v = self._verify; v["gathers"] += 1; v["lookups"] += n; v["mismatched_values"] += bad
-                if self._verify_left == 0 or bad or v["gathers"] % 100 == 0:
-                    print(f"rb_offload VERIFY {self.label}: {v['gathers']} gathers, {v['lookups']:,} lookups x {self.channels} channels compared with the resident pool: {v['mismatched_values']} mismatched values", flush=True)
-                if self._verify_left == 0: self._shadow = None; torch.cuda.empty_cache()
-            elapsed = time.perf_counter() - started; self._gather_seconds += elapsed; self._gathers += 1
-            self.last_timings = {"gather_seconds": elapsed, "resident_bricks": self.resident_bricks, "resident_mib": 0.0, "offloaded_mib": self.pool_bytes / 1024 ** 2}
-            return out.reshape(*original_shape, self.channels)
+            with torch.cuda.device(self.device):                              # allocations, stream and the raw driver launch all belong to the pool's own card
+                started = time.perf_counter(); original_shape = tuple(indices_zyx.shape[:-1]); flat = indices_zyx.detach().reshape(-1, 3)
+                if flat.shape[0] == 0: return torch.empty((*original_shape, self.channels), dtype=torch.uint8, device=self.device)
+                flat = flat.to(device=self.device, dtype=torch.long); source = flat + self._origin
+                if self._bounds_check and bool(((source < 0) | (source >= self._shape)).any()): raise IndexError(f"{self.label} gather received an out-of-bounds index")
+                brick_idx = torch.div(source, self._brick, rounding_mode="floor")
+                slots = self.table[brick_idx[:, 0], brick_idx[:, 1], brick_idx[:, 2]].to(torch.long).contiguous()
+                local = source - brick_idx * self._brick
+                linear = (local[:, 0] * self._stride_z + local[:, 1] * self._stride_y + local[:, 2]).contiguous()
+                n = int(slots.shape[0]); out = torch.empty((n, self.channels), dtype=torch.uint8, device=self.device)
+                st = torch.cuda.current_stream(self.device).cuda_stream
+                self._mod.launch("gather_host", ((n + 255) // 256,), (256,), [ctypes.c_uint64(self._dptr), slots, linear, ctypes.c_longlong(n), ctypes.c_int(self.channels),
+                                                                               ctypes.c_longlong(self._rows), ctypes.c_longlong(self._bvox), out], stream=st)
+                if getattr(self, "_verify_left", 0) > 0:
+                    ref = self._shadow[:, slots, linear].transpose(0, 1); bad = int((ref != out).sum()); self._verify_left -= 1
+                    v = self._verify; v["gathers"] += 1; v["lookups"] += n; v["mismatched_values"] += bad
+                    if self._verify_left == 0 or bad or v["gathers"] % 100 == 0:
+                        print(f"rb_offload VERIFY {self.label}: {v['gathers']} gathers, {v['lookups']:,} lookups x {self.channels} channels compared with the resident pool: {v['mismatched_values']} mismatched values", flush=True)
+                    if self._verify_left == 0: self._shadow = None; torch.cuda.empty_cache()
+                elapsed = time.perf_counter() - started; self._gather_seconds += elapsed; self._gathers += 1
+                self.last_timings = {"gather_seconds": elapsed, "resident_bricks": self.resident_bricks, "resident_mib": 0.0, "offloaded_mib": self.pool_bytes / 1024 ** 2}
+                return out.reshape(*original_shape, self.channels)
 
         def close(self):
             finalizer = getattr(self, "_finalizer", None)

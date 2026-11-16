@@ -166,30 +166,38 @@ if _GC_POLICY not in ('freeze', 'every-step', 'pressure', 'off'):
 _GC_EVERY_STEPS = int(os.environ.get('FIT_SPIRAL_GC_EVERY_STEPS', '1'))
 _GC_GARBAGE_FRACTION = float(os.environ.get('FIT_SPIRAL_GC_GARBAGE_FRACTION', '0.2'))
 
-# gc.freeze() is process-wide, and a resident service process runs many sessions one after another (and may run several at once). Each context that
-# freezes registers as an owner; the freeze ends, with one collection of what it hid, when the LAST owner lets go (a model rebuild, close(), or a failed
-# session): cyclic garbage frozen by a closed session would otherwise keep its model and optimiser tensors alive on the card.
+# gc.freeze() is process-wide, and a resident service process runs many sessions one after another and may run several at once. The freeze is therefore an
+# EPOCH: a context takes it (gc.collect(); gc.freeze(), which also freezes the setup heap of any session that started since the previous freeze) at its first
+# step of an epoch, and ANY context that lets go (model rebuild, close(), failed session) ends it for everybody: one gc.unfreeze() plus one collection frees
+# the cycles that context discarded (a frozen cycle keeps its model and optimiser tensors on the card), and the other contexts re-freeze at their next step.
 _GC_FREEZE_LOCK = threading.Lock()
 _GC_FREEZE_OWNERS = set()
+_GC_FREEZE_EPOCH = 0
+
+
+def _gc_freeze_epoch():
+    return _GC_FREEZE_EPOCH
 
 
 def _gc_freeze_acquire(owner):
+    """Freeze everything alive now; returns the epoch the owner froze in (compare with _gc_freeze_epoch())."""
     with _GC_FREEZE_LOCK:
-        if not _GC_FREEZE_OWNERS:
-            gc.collect()
-            gc.freeze()
+        gc.collect()
+        gc.freeze()
         _GC_FREEZE_OWNERS.add(id(owner))
+        return _GC_FREEZE_EPOCH
 
 
 def _gc_freeze_release(owner):
-    """Idempotent; safe when `owner` never froze."""
+    """End the freeze for every context when `owner` held it; idempotent, and a no-op for a context that never froze."""
+    global _GC_FREEZE_EPOCH
     with _GC_FREEZE_LOCK:
         if id(owner) not in _GC_FREEZE_OWNERS:
             return
-        _GC_FREEZE_OWNERS.discard(id(owner))
-        if not _GC_FREEZE_OWNERS:
-            gc.unfreeze()
-            gc.collect()
+        _GC_FREEZE_OWNERS.clear()
+        _GC_FREEZE_EPOCH += 1
+        gc.unfreeze()
+        gc.collect()
 
 
 class InputReplacementRefused(RuntimeError):
@@ -2695,7 +2703,7 @@ class FitContext:
         # largest allocations; hand the arena back before asking for their
         # replacements rather than peaking at twice the model.
         _gc_freeze_release(self)
-        self._gc_frozen = False
+        self._gc_epoch = None
         gc.collect()
         torch.cuda.empty_cache()
         if self.device.type == 'mps':
@@ -4013,9 +4021,8 @@ class FitContext:
     def _collect_garbage_after_step(self, iteration):
         """The FIT_SPIRAL_GC_POLICY collection that follows one optimiser step (see the policy block at the top of this module)."""
         if _GC_POLICY in ('freeze', 'every-step') and _GC_EVERY_STEPS > 0:
-            if _GC_POLICY == 'freeze' and not getattr(self, '_gc_frozen', False):
-                _gc_freeze_acquire(self)
-                self._gc_frozen = True
+            if _GC_POLICY == 'freeze' and getattr(self, '_gc_epoch', None) != _gc_freeze_epoch():
+                self._gc_epoch = _gc_freeze_acquire(self)
             if iteration % _GC_EVERY_STEPS == 0:
                 gc.collect()
         elif _GC_POLICY == 'pressure' and self.device.type == 'cuda':
@@ -4386,7 +4393,7 @@ class FitContext:
         finally:
             # The freeze is process-wide: end this context's share of it even when releasing the store failed.
             _gc_freeze_release(self)
-            self._gc_frozen = False
+            self._gc_epoch = None
 
 
 def main(config, *, scroll, paths, progress=None, resume_path=None,

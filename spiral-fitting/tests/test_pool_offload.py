@@ -116,3 +116,18 @@ def test_close_unregisters_once_and_an_abandoned_pool_is_unregistered_by_its_fin
     abandoned = Off(sidecar[0], device="cuda", label="abandoned")
     del abandoned; gc.collect()
     assert len(calls) == 2, "an abandoned pool kept its host memory registered"
+
+
+def test_the_gather_stays_on_the_pools_card_when_another_device_becomes_current(sidecar):
+    """Review: a pool built for cuda:1 must allocate, launch and return on cuda:1 whatever the current device is later."""
+    if torch.cuda.device_count() < 2:
+        pytest.skip("needs two CUDA devices")
+    Off = brick_pool_offload.offload_class(scc)
+    pool = Off(sidecar[0], device="cuda:1", label="card1")
+    torch.cuda.set_device(0)
+    idx = torch.tensor([[0, 0, 0], [15, 63, 79], [16, 0, 0], [47, 63, 79], [30, 31, 40]], device="cuda:1")
+    out = pool.gather(idx)
+    torch.cuda.synchronize(1)
+    assert out.device == torch.device("cuda:1")
+    ii = idx.cpu().numpy().T
+    np.testing.assert_array_equal(out.cpu().numpy(), np.stack([sidecar[1][tuple(ii)], sidecar[2][tuple(ii)]], -1))

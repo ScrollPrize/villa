@@ -8,9 +8,11 @@ import fit_spiral as fs
 
 
 @pytest.fixture(autouse=True)
-def _no_leaked_freeze():
+def _no_leaked_freeze(monkeypatch):
     gc.unfreeze()
     fs._GC_FREEZE_OWNERS.clear()
+    monkeypatch.setattr(fs, "_GC_POLICY", "freeze")
+    monkeypatch.setattr(fs, "_GC_EVERY_STEPS", 1)
     yield
     fs._GC_FREEZE_OWNERS.clear()
     gc.unfreeze()
@@ -21,36 +23,58 @@ class _Cycle:
         self.me = self                     # a reference cycle: only the cyclic collector can free it
 
 
-def test_the_freeze_ends_when_the_last_owner_lets_go():
-    a, b = object(), object()
-    fs._gc_freeze_acquire(a)
-    assert gc.get_freeze_count() > 0
-    fs._gc_freeze_acquire(b)
+def _context():
+    import types
+    import torch
+    return types.SimpleNamespace(device=torch.device("cpu"))
+
+
+def _step(context):
+    fs.FitContext._collect_garbage_after_step(context, 1)
+
+
+def test_any_release_ends_the_freeze_for_everybody_and_the_others_refreeze_at_their_next_step():
+    a, b = _context(), _context()
+    _step(a); _step(b)
+    assert gc.get_freeze_count() > 0 and a._gc_epoch == b._gc_epoch == fs._gc_freeze_epoch()
     fs._gc_freeze_release(a)
-    assert gc.get_freeze_count() > 0       # another session still holds the process-wide freeze
-    fs._gc_freeze_release(b)
-    assert gc.get_freeze_count() == 0
+    assert gc.get_freeze_count() == 0 and b._gc_epoch != fs._gc_freeze_epoch()
+    _step(b)                               # the other session notices the new epoch and freezes again
+    assert gc.get_freeze_count() > 0 and b._gc_epoch == fs._gc_freeze_epoch()
 
 
 def test_release_is_idempotent_and_ignores_strangers():
-    owner = object()
+    owner = _context()
     fs._gc_freeze_release(owner)           # never froze
-    fs._gc_freeze_acquire(owner)
-    fs._gc_freeze_release(owner)
-    fs._gc_freeze_release(owner)
-    assert gc.get_freeze_count() == 0
+    epoch = fs._gc_freeze_epoch()
+    _step(owner)
+    fs._gc_freeze_release(owner); fs._gc_freeze_release(owner)
+    assert gc.get_freeze_count() == 0 and fs._gc_freeze_epoch() == epoch + 1
 
 
-def test_garbage_frozen_by_a_closed_session_is_collected_at_the_end_of_the_freeze():
-    owner = object()
-    cycle = _Cycle()                       # alive when the freeze is taken, like the session <-> context cycle of a resident fit
-    ref = weakref.ref(cycle)
-    fs._gc_freeze_acquire(owner)
-    del cycle                              # the session closes: only the cycle keeps it now
+def test_a_rebuilt_context_frees_its_discarded_cycles_while_another_context_is_active():
+    """Review: two contexts' models alive at the first freeze; rebuilding one must not leave its discarded cycles frozen."""
+    discarded = _Cycle()                   # context A's old model stage, alive when the freeze is taken
+    ref = weakref.ref(discarded)
+    a, b = _context(), _context()
+    _step(a); _step(b)
+    del discarded
     gc.collect()
     assert ref() is not None               # frozen: the collector cannot see it
-    fs._gc_freeze_release(owner)
-    assert ref() is None                   # the release collects what the freeze hid
+    fs._gc_freeze_release(a)               # A rebuilds; B is still a live session
+    assert ref() is None                   # freed before A allocates its replacement
+
+
+def test_a_session_that_starts_after_the_first_freeze_is_frozen_at_its_first_step():
+    """Review: a second session's setup heap must not be scanned by every later per-step collection."""
+    first, late = _context(), _context()
+    _step(first)
+    setup_heap = _Cycle()                  # the late session's setup objects, allocated after the first freeze
+    ref = weakref.ref(setup_heap)
+    _step(late)                            # its first step freezes what exists now, including that heap
+    del setup_heap
+    gc.collect()
+    assert ref() is not None               # it was frozen, so the per-step collections do not scan it
 
 
 def _bare_context(store):
@@ -62,10 +86,10 @@ def _bare_context(store):
 
 def test_closing_a_context_ends_its_freeze():
     context = _bare_context(None)
-    fs._gc_freeze_acquire(context)
-    context._gc_frozen = True
+    context.device = None
+    context._gc_epoch = fs._gc_freeze_acquire(context)
     context.close()
-    assert gc.get_freeze_count() == 0 and context._gc_frozen is False
+    assert gc.get_freeze_count() == 0 and context._gc_epoch is None
 
 
 def test_a_failing_store_close_still_ends_the_freeze():
@@ -74,8 +98,7 @@ def test_a_failing_store_close_still_ends_the_freeze():
             raise RuntimeError("store close failed")
 
     context = _bare_context(Store())
-    fs._gc_freeze_acquire(context)
-    context._gc_frozen = True
+    context._gc_epoch = fs._gc_freeze_acquire(context)
     with pytest.raises(RuntimeError, match="store close failed"):
         context.close()
     assert gc.get_freeze_count() == 0
