@@ -314,3 +314,46 @@ def test_noise_split_gives_pairs_with_independent_noise(tmp_path, device):
                 "scale=0.5,gain=1.8,smooth=0.1", "scale=0.5,gain=1.8,smooth=0.1:0.5", "scale=0.5,gain=1.8,smooth=1:2+1:2+1:2"):
         with pytest.raises(Exception, match="noise_split"):
             _core.noise_split_config(bad)
+
+
+@pytest.mark.parametrize("device", helirec.devices())
+def test_pixels_whose_flat_is_zero_do_not_spoil_the_sinogram(tmp_path, device):
+    """A pixel whose flat equals its dark (a detector's time stamp, a dead pixel) has no finite value. In rows without
+    weight, and in the rows that pad the detector's first row, it must add nothing: zero times infinity is not zero,
+    and one such sample made every slice of a chunk NaN through the filters (PHerc. 172, view heights -35..36)."""
+    nr, nd, ngrid, level, flat, dark = 12, 24, 64, 30000, 50000, 100
+    path = tmp_path / "level.h5"
+    with h5py.File(path, "w") as f:
+        f.create_dataset("data", data=np.full((2 * ngrid, nr, nd), level + dark, np.uint16), chunks=(1, nr, nd))
+
+    def run(stamp, **kw):
+        flats = np.full((1, nr, nd), flat, np.float32)
+        weight = np.ones((nr, nd), np.float32)
+        weight[0] = 0                                  # the first row carries no weight (unlit), as a stamp's rows
+        if stamp == "pixels":
+            flats[0, 0, 3:9] = 0                       # and holds pixels whose flat is zero
+        elif stamp == "row":
+            flats[0, 0, :] = 0                         # or is blank altogether (the first row of PHerc. 172's camera)
+            weight[0] = 1                              # (whatever the weight map says of it)
+        p = np.arange(2 * ngrid)
+        scan = _core.make_scan_data(p * (360 / ngrid), np.zeros(len(p)), .01, nr, nd, 0, 0., 0., np.full(len(p), .2), np.array([0], np.float32),
+                                    np.full((nr, nd), dark, np.float32), flats, weight,
+                                    _core.RawReader([str(path)], "data", nr, nd), np.zeros(len(p), np.int32), np.arange(len(p), dtype=np.int32))
+        r = recon(scan, device, backprojector="fbp", tomo_params={}, **kw)
+        lo, _ = r.info["doable"]
+        return r.reconstruct(lo, lo + 4, debug=True)
+
+    cases = [dict(z_interp="linear"), dict(), dict(filters=[{"type": "paganin", "delta_beta": 100.}], pixel_size_m=1e-5)]
+    for kw, stamp in [(kw, stamp) for kw in cases for stamp in ("pixels", "row")]:
+        clean, stamped = run("", **kw), run(stamp, **kw)
+        for key in ("sino", "slices"):
+            assert np.isfinite(np.asarray(stamped[key])).all(), (kw, stamp, key)
+        # the rows that pad the detector's first row repeat it: with no flat signal there they add nothing, and no
+        # huge value either (the slices stay within the clean ones' range)
+        assert np.abs(np.asarray(stamped["slices"])).max() < 3 * np.abs(np.asarray(clean["slices"])).max() + 1e-6
+        if stamp == "row":      # (nothing then pads the detector's first row: a filter over the rows sees that the slices end)
+            continue
+        # and nothing changes where the sinogram has weight (rows that only pad the detector's first row have 1e-14)
+        held = np.asarray(clean["weights"]) > 1e-6
+        assert held.any() and (np.asarray(stamped["weights"]) > 1e-6)[held].all()
+        np.testing.assert_allclose(np.asarray(stamped["sino"])[held], np.asarray(clean["sino"])[held], atol=1e-6)

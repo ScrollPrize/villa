@@ -377,6 +377,15 @@ SliceReconstructor::SliceReconstructor(std::vector<ScanData> scans, ReconConfig 
     auto& I = *impl_;
     if (scans.empty()) throw Error("SliceReconstructor: no scans");
     I.scans = std::move(scans);
+    // A pixel without a flat signal (its flat is not above its dark: a detector's time stamp, a blank row, a dead
+    // pixel) has no flat-fielded value, so it carries no weight, whatever the weight map gave it.
+    for (auto& s : I.scans) {
+        const std::size_t plane = static_cast<std::size_t>(s.traj.det_rows) * s.traj.det_cols;
+        if (!plane || s.weight.size() != plane || s.flats.size() % plane) continue;   // (the sizes are checked below)
+        for (std::size_t f = 0; f < s.flats.size() / plane; ++f)
+            for (std::size_t i = 0; i < plane; ++i)
+                if (!(s.flats[f * plane + i] > 0.f) || !std::isfinite(s.flats[f * plane + i])) s.weight[i] = 0.f;
+    }
     I.cfg = std::move(cfg);
     if (is_tomo_method(I.cfg.backprojector)) {  // a whole-slice method, run as an external backprojector
         I.cfg.external = make_tomo_backprojector(I.cfg.backprojector, I.cfg.tomo_params);

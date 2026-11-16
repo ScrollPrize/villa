@@ -29,12 +29,14 @@ __global__ void accumulate_kernel(AccumScanView s, const int32_t* __restrict__ o
 
 // the vertically interpolated values of the block's projections: threads x over detector columns, y over rows t, z
 // over the projections (slots)
-__global__ void column_values_kernel(AccumScanView s, const int32_t* __restrict__ slot_proj, int H, int stride,
+// finite: the rows are to be read exactly (a value that is not finite becomes 0: see cpu::accumulate)
+__global__ void column_values_kernel(AccumScanView s, const int32_t* __restrict__ slot_proj, int H, int stride, bool finite,
                                      float* __restrict__ out) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     const int t = blockIdx.y;
     if (c >= s.det_cols || t >= H) return;
-    out[(static_cast<size_t>(blockIdx.z) * H + t) * stride + c] = column_interp(s, slot_proj[blockIdx.z], t, c);
+    const float v = column_interp(s, slot_proj[blockIdx.z], t, c);
+    out[(static_cast<size_t>(blockIdx.z) * H + t) * stride + c] = finite && !hd::is_finite(v) ? 0.f : v;
 }
 
 // the same for measured pixels only (measured_value): each detector column's measured value and its weight
@@ -160,7 +162,7 @@ void accumulate(const AccumScanView& view, const ContributorList& c, const Accum
             HELIREC_CUDA_CHECK(cudaGetLastError());
             measured_rows_kernel<<<(n_rows + 63) / 64, 64, 0, st>>>(d_col.data(), d_col_wt.data(), n_rows, s.det_cols, stride, s.col_guard);
         } else {
-            column_values_kernel<<<grid, block, 0, st>>>(s, sp, p.H, stride, d_col.data());
+            column_values_kernel<<<grid, block, 0, st>>>(s, sp, p.H, stride, shift, d_col.data());
         }
         HELIREC_CUDA_CHECK(cudaGetLastError());
         if (shift && s.map_cols) {   // each ideal column from its detector column: the detector map, the frames' scale

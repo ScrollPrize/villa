@@ -152,6 +152,11 @@ void accumulate(const AccumScanView& view, const ContributorList& c, const Accum
                     continue;
                 }
                 for (int x = 0; x < W; ++x) out[x] = column_interp(s, slot_proj[q], t, x);
+                // (a row to be read exactly must be finite: a pixel without a flat signal has no finite value and,
+                // by the reconstructor's weight maps and column_weight, no weight: 0 in its place)
+                if (shift)
+                    for (int x = 0; x < W; ++x)
+                        if (!hd::is_finite(out[x])) out[x] = 0.f;
             }
         if (shift && s.map_cols) {   // each ideal column from its detector column: the detector map, the frames' scale
             std::vector<ResampleRow> row(static_cast<std::size_t>(n_slots) * p.H);

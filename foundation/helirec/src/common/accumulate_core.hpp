@@ -210,7 +210,13 @@ HR_HD float column_interp(const AccumScanView& s, int k, int t0, int c) {
     float val, zw[z_max_taps];
     if (!(a != 0.0f && s.z_taps > 0 && !pad && z_kernel_value(s, k, t, z_weights(s, k, a, zw), c, false, false, 0.f, 0.f, val))) {
         val = flat_field(s, k, tv, c);
-        if (a != 0.0f) val = add(mul(sub(1.0f, a), val), mul(a, flat_field(s, k, tv + 1, c)));
+        if (a != 0.0f) {
+            const float next = flat_field(s, k, tv + 1, c);
+            const float both = add(mul(sub(1.0f, a), val), mul(a, next));
+            // (one of the two rows holds a pixel without a finite value, e.g. a row of a detector's time stamp beside
+            // the first lit row: the other row's value, which is the one that carries the weight)
+            val = hd::is_finite(both) || !(hd::is_finite(val) || hd::is_finite(next)) ? both : (hd::is_finite(val) ? val : next);
+        }
     }
     return val;
 }
@@ -227,8 +233,13 @@ HR_HD float column_weight(const AccumScanView& s, int k, int t0, int c, float no
     row_position(s, k, t0, c, t, a);
     bool pad;
     const int tv = padded_row(s, k, t, pad);
-    if (pad) return non_zero;
     const int rr = s.row0[k] + tv;
+    if (pad) {
+        // (a row that pads the detector repeats its first or last but one row: where that row's pixel has no flat
+        // signal there is no value to repeat, and the padding has no weight either)
+        const std::size_t pix = static_cast<std::size_t>(rr) * s.det_cols + c, plane = static_cast<std::size_t>(s.det_rows) * s.det_cols;
+        return s.flats[s.flat_i0[k] * plane + pix] > 0.f && s.flats[s.flat_i1[k] * plane + pix] > 0.f ? non_zero : 0.f;
+    }
     const float dw = s.weight_factor[k];
     const float w0 = mul(s.weight[static_cast<std::size_t>(rr) * s.det_cols + c], dw);
     if (a == 0.0f) return w0;
@@ -243,10 +254,17 @@ HR_HD void column_value(const AccumScanView& s, int k, int t, int c, float non_z
     wt = column_weight(s, k, t, c, non_zero);
 }
 
-// the same sample as the splat uses it: value x weight, weight
+// the same sample as the splat uses it: value x weight, weight. A sample without weight adds nothing, whatever its
+// value, and a value that is not finite (a pixel whose flat equals its dark: the detector's time stamp, a dead pixel)
+// is a sample without weight: zero times infinity would otherwise spoil the sum, and the filters after it the chunk.
 HR_HD void column_sample(const AccumScanView& s, int k, int t, int c, float non_zero, float& v, float& w) {
     float val, wt;
     column_value(s, k, t, c, non_zero, val, wt);
+    if (!(wt > 0.f) || !hd::is_finite(val)) {
+        v = 0.f;
+        w = 0.f;
+        return;
+    }
     v = mul(val, wt);
     w = wt;
 }
@@ -325,7 +343,11 @@ HR_HD bool exact_term(const AccumScanView& s, int k, int t, int c0, float A, con
     const float w0 = column_weight(s, k, t, c0 - 1, p.non_zero), w1 = column_weight(s, k, t, c0, p.non_zero);
     if (!(w0 > 0.f) || !(w1 > 0.f)) return false;
     const float wlin = add(mul(s.fract_x, w0), mul(sub(1.0f, s.fract_x), w1));
-    R = add(R, mul(mul(column_cached(s, k, t, c0), wlin), A));
+    const float val = column_cached(s, k, t, c0);
+    // (a row with a pixel that is not finite is not finite anywhere after its exact shift: the splat of the row's own
+    // values then, which leaves that pixel out; see column_sample)
+    if (!hd::is_finite(val)) return false;
+    R = add(R, mul(mul(val, wlin), A));
     RW = add(RW, mul(wlin, A));
     return true;
 }
