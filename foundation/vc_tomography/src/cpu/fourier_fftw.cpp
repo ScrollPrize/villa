@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <vector>
 
+#include "common/fourier_core.hpp"
 #include "vc_tomography/fourier.hpp"
 #include "cpu/fftw_plan.hpp"
 
@@ -82,20 +83,9 @@ class FftwFourierFilter final : public FourierFilter {
                 }
                 fftwf_execute_dft_r2c(fwd_, buf.real, buf.cplx);
                 const std::size_t nf = rows_ * nc_;
-                if (p.filter_imag.empty()) {
-                    for (std::size_t k = 0; k < nf; ++k) {
-                        const float f = p.filter[k] * norm_;
-                        buf.cplx[k][0] *= f;
-                        buf.cplx[k][1] *= f;
-                    }
-                } else {
-                    for (std::size_t k = 0; k < nf; ++k) {
-                        const float fr = p.filter[k] * norm_, fi = p.filter_imag[k] * norm_;
-                        const float re = buf.cplx[k][0], im = buf.cplx[k][1];
-                        buf.cplx[k][0] = re * fr - im * fi;
-                        buf.cplx[k][1] = re * fi + im * fr;
-                    }
-                }
+                const bool complex = !p.filter_imag.empty();
+                for (std::size_t k = 0; k < nf; ++k)
+                    fourier_core::filter_bin(buf.cplx[k][0], buf.cplx[k][1], p.filter[k] * norm_, complex ? p.filter_imag[k] * norm_ : 0.f, complex);
                 fftwf_execute_dft_c2r(inv_, buf.cplx, buf.real);
                 // crop
                 const int out_rows = p.ndim == 2 ? p.h : 1;

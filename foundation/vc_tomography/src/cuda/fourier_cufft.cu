@@ -4,6 +4,7 @@
 
 #include <algorithm>
 
+#include "common/fourier_core.hpp"
 #include "cuda_utils.cuh"
 #include "cufft_utils.cuh"
 #include "vc_tomography/fourier.hpp"
@@ -30,16 +31,8 @@ __global__ void pad_kernel(const float* __restrict__ in, float* __restrict__ out
 __global__ void multiply_kernel(cufftComplex* __restrict__ data, const float* __restrict__ filter,
                                 const float* __restrict__ filter_imag, size_t per_item, size_t total, float norm) {
     VC_TOMOGRAPHY_GRID_STRIDE(k, total) {
-        const float fr = filter[k % per_item] * norm;
-        if (!filter_imag) {
-            data[k].x *= fr;
-            data[k].y *= fr;
-        } else {
-            const float fi = filter_imag[k % per_item] * norm;
-            const float re = data[k].x, im = data[k].y;
-            data[k].x = __fsub_rn(__fmul_rn(re, fr), __fmul_rn(im, fi));
-            data[k].y = __fadd_rn(__fmul_rn(re, fi), __fmul_rn(im, fr));
-        }
+        const float fr = filter[k % per_item] * norm, fi = filter_imag ? filter_imag[k % per_item] * norm : 0.f;
+        fourier_core::filter_bin(data[k].x, data[k].y, fr, fi, filter_imag != nullptr);
     }
 }
 
@@ -47,15 +40,10 @@ __global__ void multiply_copy_kernel(const cufftComplex* __restrict__ src, cufft
                                      const float* __restrict__ filter, const float* __restrict__ filter_imag,
                                      size_t per_item, size_t total, float norm) {
     VC_TOMOGRAPHY_GRID_STRIDE(k, total) {
-        const float fr = filter[k % per_item] * norm;
-        const float re = src[k].x, im = src[k].y;
-        if (!filter_imag) {
-            dst[k] = make_cuFloatComplex(re * fr, im * fr);
-        } else {
-            const float fi = filter_imag[k % per_item] * norm;
-            dst[k] = make_cuFloatComplex(__fsub_rn(__fmul_rn(re, fr), __fmul_rn(im, fi)),
-                                         __fadd_rn(__fmul_rn(re, fi), __fmul_rn(im, fr)));
-        }
+        const float fr = filter[k % per_item] * norm, fi = filter_imag ? filter_imag[k % per_item] * norm : 0.f;
+        float re = src[k].x, im = src[k].y;
+        fourier_core::filter_bin(re, im, fr, fi, filter_imag != nullptr);
+        dst[k] = make_cuFloatComplex(re, im);
     }
 }
 
