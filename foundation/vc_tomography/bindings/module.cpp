@@ -28,6 +28,7 @@
 #include "vc_tomography/calibration/scan.hpp"
 #include "vc_tomography/calibration/intensity.hpp"
 #include "conversions.hpp"
+#include "../src/common/staged.hpp"
 
 #ifdef VC_TOMOGRAPHY_WITH_CUDA
 #include "../src/cuda/cuda_utils.cuh"
@@ -119,22 +120,10 @@ HostOut flatfield_py(HostIn raw, HostIn dark, HostIn flat, float threshold, bool
     HostOut out = new_array(shape_of(raw));
     FlatFieldParams p{threshold, take_log};
 
-    if (parse_device(device) == Device::CPU) {
-        nb::gil_scoped_release nogil;
-        cpu::flatfield(raw.data(), dark.data(), flat.data(), data(out), n_proj, n_pix, p);
-        return out;
-    }
-#ifdef VC_TOMOGRAPHY_WITH_CUDA
-    {
-        nb::gil_scoped_release nogil;
-        cuda::DeviceBuffer<float> d_raw, d_dark, d_flat, d_out(raw.size());
-        d_raw.upload(raw.data(), raw.size());
-        d_dark.upload(dark.data(), n_pix);
-        d_flat.upload(flat.data(), n_pix);
-        cuda::flatfield(d_raw.data(), d_dark.data(), d_flat.data(), d_out.data(), n_proj, n_pix, p);
-        d_out.download(data(out));
-    }
-#endif
+    const Device dev = parse_device(device);
+    nb::gil_scoped_release nogil;
+    staged(dev, [&](const float* r, const float* d, const float* f, float* o) { VC_TOMOGRAPHY_ON(dev, flatfield, r, d, f, o, n_proj, n_pix, p); },
+           to_device(raw.data(), raw.size()), to_device(dark.data(), n_pix), to_device(flat.data(), n_pix), from_device(data(out), raw.size()));
     return out;
 }
 
@@ -172,20 +161,11 @@ HostOut backproject_py(HostIn sino, HostIn angles, int ny, int nx, float rot_cen
         p.tiles = tiles->empty() ? &none : tiles->data();
         p.n_tiles = static_cast<int>(tiles->size());
     }
-    if (parse_device(device) == Device::CPU) {
-        nb::gil_scoped_release nogil;
-        cpu::backproject(sino.data(), angles.data(), data(out), n_angles, n_det, ny, nx, p);
-        return out;
-    }
-#ifdef VC_TOMOGRAPHY_WITH_CUDA
-    {
-        nb::gil_scoped_release nogil;
-        cuda::DeviceBuffer<float> d_sino, d_out(static_cast<std::size_t>(ny) * nx);
-        d_sino.upload(sino.data(), sino.size());
-        cuda::backproject(d_sino.data(), angles.data(), d_out.data(), n_angles, n_det, ny, nx, p);
-        d_out.download(data(out));
-    }
-#endif
+    const Device dev = parse_device(device);
+    nb::gil_scoped_release nogil;
+    // (the angles stay on the host: both backends take them there)
+    staged(dev, [&](const float* sn, float* o) { VC_TOMOGRAPHY_ON(dev, backproject, sn, angles.data(), o, n_angles, n_det, ny, nx, p); },
+           to_device(sino.data(), sino.size()), from_device(data(out), static_cast<std::size_t>(ny) * nx));
     return out;
 }
 
@@ -450,16 +430,7 @@ HostOut minus_log_py(HostIn x, float clip_min, float clip_max, const std::string
     HostOut out = copy_of(x);
     const Device dev = parse_device(device);
     nb::gil_scoped_release nogil;
-    if (dev == Device::CPU) {
-        cpu::minus_log(data(out), x.size(), clip_min, clip_max);
-        return out;
-    }
-#ifdef VC_TOMOGRAPHY_WITH_CUDA
-    cuda::DeviceBuffer<float> d;
-    d.upload(data(out), x.size());
-    cuda::minus_log(d.data(), x.size(), clip_min, clip_max);
-    d.download(data(out));
-#endif
+    staged(dev, [&](float* v) { VC_TOMOGRAPHY_ON(dev, minus_log, v, x.size(), clip_min, clip_max); }, through_device(data(out), x.size()));
     return out;
 }
 
@@ -473,17 +444,8 @@ HostOut angular_fir_py(HostIn sino, const std::vector<float>& taps, std::optiona
     const float* sup = support ? static_cast<const float*>(support->data()) : nullptr;
     const Device dev = parse_device(device);
     nb::gil_scoped_release nogil;
-    if (dev == Device::CPU) {
-        cpu::angular_fir(in, data(out), np, nc, taps.data(), radius, sup);
-        return out;
-    }
-#ifdef VC_TOMOGRAPHY_WITH_CUDA
-    cuda::DeviceBuffer<float> d_in, d_out(sino.size()), d_sup;
-    d_in.upload(in, sino.size());
-    if (sup) d_sup.upload(sup, sino.size());
-    cuda::angular_fir(d_in.data(), d_out.data(), np, nc, taps.data(), radius, sup ? d_sup.data() : nullptr);
-    d_out.download(data(out));
-#endif
+    staged(dev, [&](const float* i, float* o, const float* su) { VC_TOMOGRAPHY_ON(dev, angular_fir, i, o, np, nc, taps.data(), radius, sup ? su : nullptr); },
+           to_device(in, sino.size()), from_device(data(out), sino.size()), to_device(sup, sup ? sino.size() : 0));
     return out;
 }
 
@@ -491,22 +453,9 @@ std::pair<HostOut, HostOut> rebalance_py(HostIn R, HostIn W, float rot_center, b
     require(R.ndim() == 3 && W.ndim() == 3 && R.size() == W.size(), "R, W must be (n_proj, n_rows, n_cols)");
     HostOut r = copy_of(R), w = copy_of(W);
     const int np = static_cast<int>(R.shape(0)), nr = static_cast<int>(R.shape(1)), nc = static_cast<int>(R.shape(2));
-    if (parse_device(device) == Device::CPU) {
-        nb::gil_scoped_release nogil;
-        cpu::rebalance(data(r), data(w), np, nr, nc, rot_center, legacy);
-        return {r, w};
-    }
-#ifdef VC_TOMOGRAPHY_WITH_CUDA
-    {
-        nb::gil_scoped_release nogil;
-        cuda::DeviceBuffer<float> dr, dw;
-        dr.upload(data(r), R.size());
-        dw.upload(data(w), W.size());
-        cuda::rebalance(dr.data(), dw.data(), np, nr, nc, rot_center, legacy);
-        dr.download(data(r));
-        dw.download(data(w));
-    }
-#endif
+    const Device dev = parse_device(device);
+    nb::gil_scoped_release nogil;
+    staged(dev, [&](float* rr, float* ww) { VC_TOMOGRAPHY_ON(dev, rebalance, rr, ww, np, nr, nc, rot_center, legacy); }, through_device(data(r), R.size()), through_device(data(w), W.size()));
     return {r, w};
 }
 
@@ -514,22 +463,9 @@ std::pair<HostOut, HostOut> rebalance_turns_py(HostIn R, HostIn W, int turn, flo
     require(R.ndim() == 3 && W.ndim() == 3 && R.size() == W.size(), "R, W must be (n_proj, n_rows, n_cols)");
     HostOut r = copy_of(R), w = copy_of(W);
     const int np = static_cast<int>(R.shape(0)), nr = static_cast<int>(R.shape(1)), nc = static_cast<int>(R.shape(2));
-    if (parse_device(device) == Device::CPU) {
-        nb::gil_scoped_release nogil;
-        cpu::rebalance_turns(data(r), data(w), np, nr, nc, turn, rot_center);
-        return {r, w};
-    }
-#ifdef VC_TOMOGRAPHY_WITH_CUDA
-    {
-        nb::gil_scoped_release nogil;
-        cuda::DeviceBuffer<float> dr, dw;
-        dr.upload(data(r), R.size());
-        dw.upload(data(w), W.size());
-        cuda::rebalance_turns(dr.data(), dw.data(), np, nr, nc, turn, rot_center);
-        dr.download(data(r));
-        dw.download(data(w));
-    }
-#endif
+    const Device dev = parse_device(device);
+    nb::gil_scoped_release nogil;
+    staged(dev, [&](float* rr, float* ww) { VC_TOMOGRAPHY_ON(dev, rebalance_turns, rr, ww, np, nr, nc, turn, rot_center); }, through_device(data(r), R.size()), through_device(data(w), W.size()));
     return {r, w};
 }
 
@@ -1148,16 +1084,9 @@ NB_MODULE(_core, m) {
               const int nr = static_cast<int>(rows.shape(0)), n = static_cast<int>(rows.shape(1));
               HostOut out = new_array({static_cast<std::size_t>(nr), static_cast<std::size_t>(n) * os});
               nb::gil_scoped_release nogil;
-              if (parse_device(device) == Device::CPU) {
-                  cpu::upsample_rows(rows.data(), data(out), nr, n, os);
-                  return out;
-              }
-#ifdef VC_TOMOGRAPHY_WITH_CUDA
-              cuda::DeviceBuffer<float> di, dout(static_cast<std::size_t>(nr) * n * os);
-              di.upload(rows.data(), rows.size());
-              cuda::upsample_rows(di.data(), dout.data(), nr, n, os);
-              dout.download(data(out));
-#endif
+              const Device dev = parse_device(device);
+              staged(dev, [&](const float* i, float* o) { VC_TOMOGRAPHY_ON(dev, upsample_rows, i, o, nr, n, os); },
+                     to_device(rows.data(), rows.size()), from_device(data(out), out.size()));
               return out;
           },
           "rows"_a, "os"_a, "device"_a = "cpu", "band-limited (FFT) upsampling of rows by os");
@@ -1172,16 +1101,8 @@ NB_MODULE(_core, m) {
               for (int r = 0; r < nr; ++r)
                   std::copy(rows.data() + static_cast<std::size_t>(r) * n, rows.data() + static_cast<std::size_t>(r + 1) * n,
                             work.begin() + static_cast<std::size_t>(r) * S);
-              if (parse_device(device) == Device::CPU) {
-                  cpu::shift_rows(work.data(), nr, n, shift);
-              } else {
-#ifdef VC_TOMOGRAPHY_WITH_CUDA
-                  cuda::DeviceBuffer<float> d;
-                  d.upload(work.data(), work.size());
-                  cuda::shift_rows(d.data(), nr, n, shift);
-                  d.download(work.data());
-#endif
-              }
+              const Device dev = parse_device(device);
+              staged(dev, [&](float* w) { VC_TOMOGRAPHY_ON(dev, shift_rows, w, nr, n, shift); }, through_device(work.data(), work.size()));
               for (int r = 0; r < nr; ++r)
                   std::copy(work.begin() + static_cast<std::size_t>(r) * S, work.begin() + static_cast<std::size_t>(r) * S + n,
                             data(out) + static_cast<std::size_t>(r) * n);
@@ -1268,16 +1189,9 @@ NB_MODULE(_core, m) {
               const int nr = static_cast<int>(rows.shape(0)), n = static_cast<int>(rows.shape(1));
               HostOut out = new_array({static_cast<std::size_t>(nr), static_cast<std::size_t>(n)});
               nb::gil_scoped_release nogil;
-              if (parse_device(device) == Device::CPU) {
-                  cpu::bspline_prefilter(rows.data(), data(out), nr, n, degree);
-                  return out;
-              }
-#ifdef VC_TOMOGRAPHY_WITH_CUDA
-              cuda::DeviceBuffer<float> d;
-              d.upload(rows.data(), rows.size());
-              cuda::bspline_prefilter(d.data(), d.data(), nr, n, degree);
-              d.download(data(out));
-#endif
+              const Device dev = parse_device(device);
+              staged(dev, [&](const float* i, float* o) { VC_TOMOGRAPHY_ON(dev, bspline_prefilter, i, o, nr, n, degree); },
+                     to_device(rows.data(), rows.size()), from_device(data(out), out.size()));
               return out;
           },
           "rows"_a, "degree"_a, "device"_a = "cpu", "rows -> B-spline coefficients (degree 3 or 5, zero-extended rows)");
@@ -1298,16 +1212,9 @@ NB_MODULE(_core, m) {
               const int N = static_cast<int>(img.shape(0)), na = static_cast<int>(angles.size());
               HostOut out = new_array({static_cast<std::size_t>(na), static_cast<std::size_t>(n_det)});
               nb::gil_scoped_release nogil;
-              if (parse_device(device) == Device::CPU) {
-                  cpu::chord_project(img.data(), data(out), angles.data(), na, n_det, N, rot, pj);
-                  return out;
-              }
-#ifdef VC_TOMOGRAPHY_WITH_CUDA
-              cuda::DeviceBuffer<float> di, ds(static_cast<std::size_t>(na) * n_det);
-              di.upload(img.data(), img.size());
-              cuda::chord_project(di.data(), ds.data(), angles.data(), na, n_det, N, rot, pj);
-              ds.download(data(out));
-#endif
+              const Device dev = parse_device(device);
+              staged(dev, [&](const float* i, float* o) { VC_TOMOGRAPHY_ON(dev, chord_project, i, o, angles.data(), na, n_det, N, rot, pj); },
+                     to_device(img.data(), img.size()), from_device(data(out), out.size()));
               return out;
           },
           "img"_a, "angles"_a, "n_det"_a, "rot"_a, "device"_a = "cpu", "projector"_a = "chord",
@@ -1320,16 +1227,9 @@ NB_MODULE(_core, m) {
               const int na = static_cast<int>(sino.shape(0)), nd = static_cast<int>(sino.shape(1));
               HostOut out = new_array({static_cast<std::size_t>(N), static_cast<std::size_t>(N)});
               nb::gil_scoped_release nogil;
-              if (parse_device(device) == Device::CPU) {
-                  cpu::chord_backproject(sino.data(), data(out), angles.data(), na, nd, N, rot, pj);
-                  return out;
-              }
-#ifdef VC_TOMOGRAPHY_WITH_CUDA
-              cuda::DeviceBuffer<float> ds, di(static_cast<std::size_t>(N) * N);
-              ds.upload(sino.data(), sino.size());
-              cuda::chord_backproject(ds.data(), di.data(), angles.data(), na, nd, N, rot, pj);
-              di.download(data(out));
-#endif
+              const Device dev = parse_device(device);
+              staged(dev, [&](const float* sn, float* o) { VC_TOMOGRAPHY_ON(dev, chord_backproject, sn, o, angles.data(), na, nd, N, rot, pj); },
+                     to_device(sino.data(), sino.size()), from_device(data(out), out.size()));
               return out;
           },
           "sino"_a, "angles"_a, "N"_a, "rot"_a, "device"_a = "cpu", "projector"_a = "chord", "adjoint of chord_project");
@@ -1359,18 +1259,12 @@ NB_MODULE(_core, m) {
               const TomoArgs a = tomo_args(algorithm, fp);
               HostOut out = new_array({H, W});
               nb::gil_scoped_release nogil;
-              if (parse_device(device) == Device::CPU) {
-                  cpu::tomo_reconstruct(a, t, rows.data(), w.data(), angles.data(), data(out), nullptr, start_host);
-                  return out;
-              }
-#ifdef VC_TOMOGRAPHY_WITH_CUDA
-              cuda::DeviceBuffer<float> dr, dw, dx(W * H), ds;
-              dr.upload(rows.data(), rows.size());
-              dw.upload(w.data(), w.size());
-              if (start_host) ds.upload(start_host, start.size());
-              cuda::tomo_reconstruct(a, t, dr.data(), dw.data(), angles.data(), dx.data(), nullptr, start_host ? ds.data() : nullptr);
-              dx.download(data(out));
-#endif
+              const Device dev = parse_device(device);
+              staged(dev,
+                     [&](const float* r, const float* ww, float* o, const float* st) {
+                         VC_TOMOGRAPHY_ON(dev, tomo_reconstruct, a, t, r, ww, angles.data(), o, nullptr, start_host ? st : nullptr);
+                     },
+                     to_device(rows.data(), rows.size()), to_device(w.data(), w.size()), from_device(data(out), W * H), to_device(start_host, start.size()));
               return out;
           },
           "rows"_a, "weights"_a.none(), "angles"_a, "N"_a, "rot"_a, "algorithm"_a, "params"_a = nb::dict(), "device"_a = "cpu",
@@ -1384,18 +1278,9 @@ NB_MODULE(_core, m) {
               HostOut out = copy_of(R);
               const int H = static_cast<int>(R.shape(0)), NX = static_cast<int>(R.shape(1));
               nb::gil_scoped_release nogil;
-              if (parse_device(device) == Device::CPU) {
-                  cpu::mend_null_weights(data(out), RW.data(), 1, H, NX, threshold, x0, x1);
-                  return out;
-              }
-#ifdef VC_TOMOGRAPHY_WITH_CUDA
-              cuda::DeviceBuffer<float> dr, dw;
-              dr.upload(data(out), R.size());
-              dw.upload(RW.data(), RW.size());
-              cuda::mend_null_weights(dr.data(), dw.data(), 1, H, NX, threshold, x0, x1);
-              VC_TOMOGRAPHY_CUDA_CHECK(cudaDeviceSynchronize());
-              dr.download(data(out));
-#endif
+              const Device dev = parse_device(device);
+              staged(dev, [&](float* r, const float* w) { VC_TOMOGRAPHY_ON(dev, mend_null_weights, r, w, 1, H, NX, threshold, x0, x1); },
+                     through_device(data(out), R.size()), to_device(RW.data(), RW.size()));
               return out;
           },
           "R"_a, "RW"_a, "threshold"_a, "x0"_a, "x1"_a, "device"_a = "cpu",
