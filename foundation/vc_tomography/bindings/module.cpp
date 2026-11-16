@@ -958,25 +958,11 @@ class PySliceReconstructor {
         impl_ = std::make_shared<SliceReconstructor>(std::move(scans), cfg);
     }
     std::vector<float> fan_of_columns() const { return impl_->fan_of_columns(); }
+    // SliceReconstructor::info_json, with doable and mend_domain as tuples
     nb::dict info() const {
-        nb::dict d;
-        auto [lo, hi] = impl_->doable();
-        d["doable"] = nb::make_tuple(lo, hi);
-        d["margin"] = impl_->margin();
-        d["n_grid"] = impl_->n_grid();
-        d["grid_size"] = impl_->grid_size();
-        d["merged_width"] = impl_->merged_width();
-        const auto [mx0, mx1] = impl_->mend_domain();
-        d["mend_domain"] = nb::make_tuple(mx0, mx1);
-        d["legacy_reference"] = impl_->config().legacy_reference;
-        d["exposure_arc_bins"] = impl_->exposure_arc_bins();
-        d["rolling_shutter"] = impl_->rolling_shutter();
-        d["fan_per_column"] = impl_->fan_per_column();
-        d["angle_interp"] = impl_->angle_interp();
-        d["z_interp"] = impl_->z_interp();
-        d["angle_subsets"] = impl_->config().angle_subsets;
-        d["angle_subset"] = impl_->config().angle_subset;
-        d["projections"] = impl_->projection_counts();
+        nb::dict d = nb::cast<nb::dict>(json_loads(impl_->info_json()));
+        const nb::object tuple = nb::module_::import_("builtins").attr("tuple");
+        for (const char* k : {"doable", "mend_domain"}) d[k] = tuple(d[k]);
         return d;
     }
     nb::object reconstruct(int h_lo, int h_hi, bool debug, bool timing, std::optional<std::array<int, 4>> roi,

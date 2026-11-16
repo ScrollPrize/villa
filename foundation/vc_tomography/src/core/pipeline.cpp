@@ -21,6 +21,7 @@
 #include "vc_tomography/fourier.hpp"
 #include "vc_tomography/kernels.hpp"
 #include "vc_tomography/sino.hpp"
+#include "io/json.hpp"
 
 #ifdef VC_TOMOGRAPHY_WITH_CUDA
 #include "../cuda/cuda_utils.cuh"
@@ -773,6 +774,32 @@ SliceReconstructor::~SliceReconstructor() = default;
 std::pair<int, int> SliceReconstructor::doable() const { return impl_->doable; }
 int SliceReconstructor::margin() const { return impl_->margin; }
 int SliceReconstructor::n_grid() const { return impl_->n_grid; }
+std::string SliceReconstructor::info_json() const {
+    const auto [lo, hi] = doable();
+    const auto [mx0, mx1] = mend_domain();
+    Json counts = Json::list();
+    for (int n : projection_counts()) counts.add(Json::whole_number(n));
+    const ReconConfig& c = config();
+    return Json::dict()
+        .set("doable", Json::list().add(Json::whole_number(lo)).add(Json::whole_number(hi)))
+        .set("margin", Json::whole_number(margin()))
+        .set("n_grid", Json::whole_number(n_grid()))
+        .set("grid_size", Json::whole_number(grid_size()))
+        .set("merged_width", Json::whole_number(merged_width()))
+        .set("mend_domain", Json::list().add(Json::whole_number(mx0)).add(Json::whole_number(mx1)))
+        .set("legacy_reference", Json::of_bool(c.legacy_reference))
+        .set("exposure_arc_bins", Json::of(exposure_arc_bins()))
+        .set("rolling_shutter", Json::of(rolling_shutter()))
+        .set("rolling_shutter_from_middle", Json::of_bool(rolling_shutter() != 0.0 && c.rolling_shutter_from_middle))
+        .set("fan_per_column", Json::of(fan_per_column()))
+        .set("angle_interp", Json::of(angle_interp()))
+        .set("z_interp", Json::of(z_interp()))
+        .set("angle_subsets", Json::whole_number(c.angle_subsets))
+        .set("angle_subset", Json::whole_number(c.angle_subset))
+        .set("projections", counts)
+        .text();
+}
+
 std::vector<int> SliceReconstructor::projection_counts() const {
     std::vector<int> n;
     for (const auto& s : impl_->scans) n.push_back(static_cast<int>(s.traj.n()));

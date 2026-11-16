@@ -264,6 +264,10 @@ class SliceReconstructor {
     std::string z_interp() const;              // the vertical kernel in use
     std::vector<int> projection_counts() const;   // projections in use, per scan (a subset: fewer than recorded)
     const ReconConfig& config() const;
+    // all of the above as a JSON object (doable, margin, n_grid, grid_size, merged_width, mend_domain,
+    // legacy_reference, exposure_arc_bins, rolling_shutter, rolling_shutter_from_middle, fan_per_column, angle_interp,
+    // z_interp, angle_subsets, angle_subset, projections)
+    std::string info_json() const;
 
     // slices for view heights h_lo .. h_hi-1 -> out (h_hi - h_lo, N, N), or (n, y1 - y0, x1 - x0) with an ROI
     // (GHBP computes whole slices and crops; FBP computes only the ROI)

@@ -485,28 +485,7 @@ struct Reconstruction::Impl {
             say(options.log, "note: exposure_arc is disabled with angle_interp=views (not deconvolved; angle_interp=nearest applies it)");
     }
 
-    Json info_json() const {
-        const auto [mx0, mx1] = rec->mend_domain();
-        Json counts = Json::list();
-        for (int n : rec->projection_counts()) counts.add(Json::whole_number(n));
-        return Json::dict()
-            .set("doable", Json::list().add(Json::whole_number(lo)).add(Json::whole_number(hi)))
-            .set("margin", Json::whole_number(rec->margin()))
-            .set("n_grid", Json::whole_number(rec->n_grid()))
-            .set("grid_size", Json::whole_number(rec->grid_size()))
-            .set("merged_width", Json::whole_number(rec->merged_width()))
-            .set("mend_domain", Json::list().add(Json::whole_number(mx0)).add(Json::whole_number(mx1)))
-            .set("legacy_reference", Json::of_bool(rec->config().legacy_reference))
-            .set("exposure_arc_bins", Json::of(rec->exposure_arc_bins()))
-            .set("rolling_shutter", Json::of(rec->rolling_shutter()))
-            .set("rolling_shutter_from_middle", Json::of_bool(rec->rolling_shutter() != 0.0 && rec->config().rolling_shutter_from_middle))
-            .set("fan_per_column", Json::of(rec->fan_per_column()))
-            .set("angle_interp", Json::of(rec->angle_interp()))
-            .set("z_interp", Json::of(rec->z_interp()))
-            .set("angle_subsets", Json::whole_number(rec->config().angle_subsets))
-            .set("angle_subset", Json::whole_number(rec->config().angle_subset))
-            .set("projections", counts);
-    }
+    Json info_json() const { return Json::parse(rec->info_json()); }  // (doable: [lo, hi), as build() found them)
 };
 
 Reconstruction::Reconstruction(const std::string& projections, const std::string& params, Options options) : impl_(std::make_unique<Impl>()) {
@@ -894,17 +873,9 @@ TileReconstruction tile_reconstructor(const std::string& master, const std::stri
     p.put("angle_subset", Json::of(std::string("")));
     p.put("noise_split", Json::of(std::string("")));
     p.put("only_scan", Json::of(std::string("")));
-    Json filter_changes = Json::dict();
-    for (const auto& [key, v] : Json::parse(o.params.empty() ? "{}" : o.params).object) {
-        if (key == "mode") {
-            if (v.string != "corrected") throw Error("a tile is reconstructed in mode corrected");
-            continue;
-        }
-        if (is_filter_key(key) && key != "filters") filter_changes.set(key, v);
-        else if (!p.find(key)) throw Error("unknown parameter '" + key + "'");
-        else p.put(key, key == "filters" && v.is(Json::String) ? Json::parse(parse_filter_chain(v.string)) : v);
-    }
-    if (!filter_changes.object.empty()) p.put("filters", Json::parse(override_filter_chain(p.find("filters")->text(), filter_changes.text())));
+    // o.params as any reconstruction's are read (update_parameters: older names mapped, removed ones refused)
+    p = Json::parse(update_parameters(p.text(), o.params.empty() ? "{}" : o.params));
+    if (member(p, "mode").string != "corrected") throw Error("a tile is reconstructed in mode corrected");
     out.parameters = p.text();
     ReconConfig cfg;
     cfg.device = o.device;
