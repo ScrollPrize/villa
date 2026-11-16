@@ -27,7 +27,7 @@ int main() try
     }
     {
         auto txn = store.write();
-        store.setMeta(txn, uuid, "note", "update");       // history off: the saved version is not retained any more
+        store.setMeta(txn, uuid, "note", "true");       // history off: the saved version is not retained any more
         txn.commit();
     }
     {
