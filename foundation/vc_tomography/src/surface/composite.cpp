@@ -14,7 +14,7 @@
 #include "io/json.hpp"
 #include "vc_reader/array.hpp"
 #include "vc_reader/composite.hpp"
-#include "vc_reader/image_write.hpp"
+#include "io/images.hpp"
 #include "io/text_file.hpp"
 
 namespace vc_tomography::surface {
@@ -38,22 +38,12 @@ double percentile(std::vector<float> v, double q) {
 
 using io::write_text;
 
-void png(const std::string& path, const std::vector<std::uint8_t>& img, int ny, int nx) {
-    vcr::sources::writeImage(path, vcr::sources::ImageView{img.data(), "|u1", ny, nx});
-}
+void png(const std::string& path, const std::vector<std::uint8_t>& img, int ny, int nx) { io::write_png(path, img.data(), ny, nx); }
+using io::write_tiff;
 
-void tiff(const std::string& path, const void* data, const char* dtype, int ny, int nx, bool deflate) {
-    vcr::sources::TiffOptions o;
-    o.compression = deflate ? "deflate" : "none";
-    vcr::sources::writeTiff(path, data, dtype, ny, nx, 1, o);
-}
-
-// rint(clip((img - lo) / (hi - lo), 0, 1) 255) as uint8 in float32, 0 where the value is not finite
+// io::to_u8, and 0 where the value is not finite (an infinity too)
 std::vector<std::uint8_t> to_u8(const float* img, int ny, int nx, const std::array<double, 2>& window) {
-    std::vector<std::uint8_t> out(static_cast<std::size_t>(ny) * nx);
-    Uint8Window w;
-    w.lo = window[0], w.hi = window[1];
-    cpu::to_uint8(img, static_cast<std::size_t>(nx), out.data(), ny, nx, w);
+    std::vector<std::uint8_t> out = io::to_u8(img, ny, nx, window);
     for (std::size_t i = 0; i < out.size(); ++i)
         if (!std::isfinite(img[i])) out[i] = 0;
     return out;
@@ -301,9 +291,9 @@ void write_set(const std::string& out, const std::vector<float>& layers, int H, 
         comp[name] = std::move(v);
     }
     for (const auto& [k, img] : comp) {
-        tiff(out + "/" + k + ".tif", img.data(), "<f4", H, W, true);
+        write_tiff(out + "/" + k + ".tif", img.data(), "<f4", H, W, true);
         const auto u8 = to_u8(img.data(), H, W, u8_window);
-        tiff(out + "/" + k + "_u8.tif", u8.data(), "|u1", H, W, true);
+        write_tiff(out + "/" + k + "_u8.tif", u8.data(), "|u1", H, W, true);
         png(out + "/" + k + "_u8.png", u8, H, W);
     }
     std::vector<std::uint8_t> mask(px);
@@ -314,7 +304,7 @@ void write_set(const std::string& out, const std::vector<float>& layers, int H, 
         for (std::size_t p = 0; p < px; ++p) layer[p] = good[p] ? layers[l * px + p] : kNaNf;
         char name[32];
         std::snprintf(name, sizeof name, "%02zu", l);
-        tiff(out + "/layers/" + name + "_offset" + format_offset(offsets[l]) + ".tif", layer.data(), "<f4", H, W, true);
+        write_tiff(out + "/layers/" + name + "_offset" + format_offset(offsets[l]) + ".tif", layer.data(), "<f4", H, W, true);
     }
     Json meta = Json::parse(meta_text);
     if (!slices.empty()) {
@@ -323,7 +313,7 @@ void write_set(const std::string& out, const std::vector<float>& layers, int H, 
         for (const Slice& s : slices) {
             char name[32];
             std::snprintf(name, sizeof name, "/xy_slices/z%05lld", static_cast<long long>(s.z));
-            tiff(out + name + ".tif", s.values.data(), "<f4", s.ny, s.nx, false);
+            write_tiff(out + name + ".tif", s.values.data(), "<f4", s.ny, s.nx, false);
             png(out + name + ".png", to_u8(s.values.data(), s.ny, s.nx, u8_window), s.ny, s.nx);
             zs.add(Json::whole_number(s.z));
         }

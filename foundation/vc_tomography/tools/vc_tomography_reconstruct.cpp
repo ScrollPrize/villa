@@ -47,8 +47,8 @@
 #include "vc_tomography/reconstruction.hpp"
 #include "vc_tomography/reference.hpp"
 #include "vc_tomography/zarr.hpp"
-#include "vc_reader/image_write.hpp"
 #include "io/command_line.hpp"
+#include "io/images.hpp"
 #include "io/json.hpp"
 
 using namespace vc_tomography;
@@ -59,9 +59,10 @@ namespace {
 using namespace vc_tomography::command_line;
 
 // slices and previews as files (vc_reader's writers): TIFF uncompressed, as tifffile.imwrite writes them
-void write_tiff(const std::string& path, const float* data, int ny, int nx) { vcr::sources::writeTiff(path, data, "<f4", ny, nx); }
-void write_tiff(const std::string& path, const std::uint8_t* data, int ny, int nx) { vcr::sources::writeTiff(path, data, "|u1", ny, nx); }
-void write_png(const std::string& path, const std::uint8_t* data, int ny, int nx) { vcr::sources::writeImage(path, vcr::sources::ImageView{data, "|u1", ny, nx}); }
+void write_tiff(const std::string& path, const float* data, int ny, int nx) { io::write_tiff(path, data, "<f4", ny, nx); }
+void write_tiff(const std::string& path, const std::uint8_t* data, int ny, int nx) { io::write_tiff(path, data, "|u1", ny, nx); }
+using io::to_u8;
+using io::write_png;
 
 const Spec& option_spec() {
     static const Spec spec{{
@@ -105,13 +106,6 @@ std::string fmt(const char* f, double v) {
 }
 
 
-std::vector<std::uint8_t> to_u8(const float* img, int ny, int nx, const std::array<double, 2>& window) {
-    std::vector<std::uint8_t> out(static_cast<std::size_t>(ny) * nx);
-    Uint8Window w;
-    w.lo = window[0], w.hi = window[1];
-    cpu::to_uint8(img, static_cast<std::size_t>(nx), out.data(), ny, nx, w);
-    return out;
-}
 
 // the image's mean over blocks of f x f pixels, f = max(1, rows // size)
 std::vector<float> downsample(const float* img, int ny, int nx, int size, int& oy, int& ox) {
