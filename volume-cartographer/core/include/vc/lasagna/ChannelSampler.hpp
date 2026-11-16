@@ -23,6 +23,8 @@
 
 namespace vcr { class Array; }
 
+namespace vc::lasagna { class LasagnaChunkInventory; }
+
 namespace vcr::reader_cuda { class Reader; }
 
 namespace vc::lasagna {
@@ -62,9 +64,33 @@ struct LasagnaChannelBinding {
     vcr::reader_cuda::Reader* cuda = nullptr;
     bool packed = false;
     bool float32 = false;  // stored as float32; otherwise uint8
+    // A validity binding of a dataset whose validity_channel is "chunks": it reads
+    // 255 at every voxel whose chunk (of `array`, the channel chunk holding
+    // channelIndex) is stored and 0 elsewhere, through `inventory`. It shares the
+    // grid of the binding it was derived from and never has a GPU reader.
+    bool chunkValidity = false;
+    std::shared_ptr<LasagnaChunkInventory> inventory;
     std::array<size_t, 3> shapeZYX{0, 0, 0};
     std::array<size_t, 3> chunksZYX{0, 0, 0};
     double spacing = 1.0;
+};
+
+// Which chunks of an array are stored, asked once per chunk and remembered;
+// thread-safe. Packed arrays are addressed by their channel chunk and spatial
+// chunk; a chunk the array's caches and source do not hold is not stored.
+class LasagnaChunkInventory {
+public:
+    LasagnaChunkInventory(std::shared_ptr<vcr::Array> array, size_t channelIndex);
+    ~LasagnaChunkInventory();
+    // Whether the chunk holding voxel (x, y, z) of the spatial grid is stored.
+    [[nodiscard]] bool storedAt(int64_t x, int64_t y, int64_t z);
+    // Whether spatial chunk (cx, cy, cz) is stored.
+    [[nodiscard]] bool storedChunk(int64_t cx, int64_t cy, int64_t cz);
+    [[nodiscard]] const std::array<int64_t, 3>& chunkShapeXYZ() const noexcept { return chunkXYZ_; }
+private:
+    struct State;
+    std::unique_ptr<State> state_;
+    std::array<int64_t, 3> chunkXYZ_{1, 1, 1};
 };
 
 [[nodiscard]] LasagnaChannelBinding bindLasagnaChannel(
@@ -72,6 +98,22 @@ struct LasagnaChannelBinding {
     std::string_view channel,
     LasagnaGroupArrays& arrays,
     bool allowFloat32 = false);
+
+// The dataset's validity: its validity channel (on its own grid), or, with
+// validity_channel "chunks", a chunk-validity binding over `lattice`'s array and
+// grid. Throws when the manifest declares no validity.
+[[nodiscard]] LasagnaChannelBinding bindLasagnaValidity(
+    const LasagnaDatasetManifest& manifest,
+    const LasagnaChannelBinding& lattice,
+    LasagnaGroupArrays& arrays);
+
+// The validity bytes (255 stored, 0 not stored or outside the grid) of every voxel
+// of the box [originXYZ, originXYZ + shapeXYZ), [z][y][x], for a chunk-validity binding.
+void readLasagnaChunkValidityBox(
+    const LasagnaChannelBinding& binding,
+    const std::array<int64_t, 3>& originXYZ,
+    const std::array<int64_t, 3>& shapeXYZ,
+    std::vector<uint8_t>& out);
 
 [[nodiscard]] std::vector<LasagnaChannelBinding> bindLasagnaEmbeddingChannels(
     const LasagnaDatasetManifest& manifest, const LasagnaChannelBinding& lattice,
@@ -85,7 +127,8 @@ struct LasagnaChannelBinding {
 // and the seven above; corner k adds (k & 1, k >> 1 & 1, k >> 2) to (x, y, z),
 // clamped to the last voxel. Points that are not finite or lie outside
 // [0, n - 1] on an axis have none. CPU bindings sharing a packed array are read
-// together; chunks that are not stored read as the fill value.
+// together; chunks that are not stored read as the fill value. A chunk-validity
+// binding reads 255/0 corners from chunk existence.
 
 // Byte channels (uint8, or float32 holding integers in [0, 255]) in float
 // geometry (p / float(spacing)), for the tracer's hot paths. All bindings must

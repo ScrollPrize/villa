@@ -1,18 +1,36 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 from .catalog import VolumeRecord
 from .config import ManagerConfig
 
+PREFETCH_REQUEST_VERSION = 2
 
-PREFETCH_REQUEST_VERSION = 1
+
+def input_cache_dir(config: ManagerConfig) -> Path:
+    """The vc_reader disk cache every managed inference reads its input through."""
+    cache = config.resolved_path("cache_dir", required=True)
+    assert cache is not None
+    return cache / "volumes"
+
+
+def volume_input_location(volume: VolumeRecord, scale: int) -> str:
+    """The remote OME-Zarr level inference opens: ``<s3 volume url>/<scale>``."""
+    if scale < 0:
+        raise ValueError("scale must be a non-negative OME-Zarr group index")
+    if not volume.s3_url:
+        raise ValueError(f"volume {volume.selector!r} has no supported S3 origin")
+    return f"{volume.s3_url.rstrip('/')}/{int(scale)}"
 
 
 def volume_cache_root(config: ManagerConfig, volume: VolumeRecord) -> Path:
-    cache = config.resolved_path("cache_dir", required=True)
-    assert cache is not None
-    return cache / "volumes" / volume.sample_id / volume.long_id
+    """Where vc_reader keeps this volume's cached chunks: ``<cache>/s3/<bucket>/<key>``."""
+    if not volume.s3_url:
+        raise ValueError(f"volume {volume.selector!r} has no supported S3 origin")
+    bucket, _, key = volume.s3_url.removeprefix("s3://").strip("/").partition("/")
+    return input_cache_dir(config) / "s3" / bucket / key
 
 
 def prefetch_volume(
@@ -20,80 +38,59 @@ def prefetch_volume(
     volume: VolumeRecord,
     scale: int,
     *,
-    workers: int = 64,
-    remote_inventory: bool = True,
+    connections: int = 64,
 ) -> Path:
-    if scale < 0:
-        raise ValueError("scale must be a non-negative OME-Zarr group index")
-    if workers <= 0:
-        raise ValueError("workers must be a positive integer")
-    if not volume.s3_url:
-        raise ValueError(f"volume {volume.selector!r} has no supported S3 origin")
-    destination = volume_cache_root(config, volume)
-    request = build_prefetch_request(
-        volume, destination, scale, workers=workers,
-        remote_inventory=remote_inventory,
-    )
+    request = build_prefetch_request(config, volume, scale, connections=connections)
     return execute_prefetch_request(request)
 
 
 def build_prefetch_request(
+    config: ManagerConfig,
     volume: VolumeRecord,
-    destination: Path,
     scale: int,
     *,
-    workers: int = 64,
-    remote_inventory: bool = True,
-) -> dict[str, object]:
-    if scale < 0:
-        raise ValueError("scale must be a non-negative OME-Zarr group index")
-    if workers <= 0:
-        raise ValueError("workers must be a positive integer")
-    if not volume.s3_url:
-        raise ValueError(f"volume {volume.selector!r} has no supported S3 origin")
+    connections: int = 64,
+) -> dict[str, Any]:
+    if connections <= 0:
+        raise ValueError("connections must be a positive integer")
     return {
         "version": PREFETCH_REQUEST_VERSION,
-        "source": volume.s3_url,
-        "destination": str(destination),
-        "scale": int(scale),
-        "workers": int(workers),
-        "anon": True,
-        "remote_inventory": bool(remote_inventory),
+        "location": volume_input_location(volume, scale),
+        "cache_dir": str(input_cache_dir(config)),
+        "cached_level": str(volume_cache_root(config, volume) / str(int(scale))),
+        "connections": int(connections),
     }
 
 
-def execute_prefetch_request(request: dict[str, object]) -> Path:
+def execute_prefetch_request(request: dict[str, Any]) -> Path:
+    """Fill the vc_reader disk cache with every chunk of the requested level."""
     if request.get("version") != PREFETCH_REQUEST_VERSION:
         raise ValueError(f"unsupported prefetch request version: {request.get('version')!r}")
-    source = request.get("source")
-    destination_value = request.get("destination")
-    scale = request.get("scale")
-    workers = request.get("workers")
-    anon = request.get("anon")
-    remote_inventory = request.get("remote_inventory")
-    if not isinstance(source, str) or not source.startswith("s3://"):
-        raise ValueError("prefetch source must be an S3 URL")
-    if not isinstance(destination_value, str) or not destination_value:
-        raise ValueError("prefetch destination must be a non-empty path")
-    if not isinstance(scale, int) or isinstance(scale, bool) or scale < 0:
-        raise ValueError("prefetch scale must be a non-negative integer")
-    if not isinstance(workers, int) or isinstance(workers, bool) or workers <= 0:
-        raise ValueError("prefetch workers must be a positive integer")
-    if anon is not True:
-        raise ValueError("managed open-data prefetch must use anonymous S3 access")
-    if not isinstance(remote_inventory, bool):
-        raise ValueError("prefetch remote_inventory must be boolean")
-    destination = Path(destination_value)
-    from lasagna.scripts.download_omezarr import download
+    location = request.get("location")
+    cache_dir = request.get("cache_dir")
+    cached_level = request.get("cached_level")
+    connections = request.get("connections")
+    if not isinstance(location, str) or not location.startswith("s3://"):
+        raise ValueError("prefetch location must be an S3 URL")
+    if not isinstance(cache_dir, str) or not cache_dir:
+        raise ValueError("prefetch cache_dir must be a non-empty path")
+    if not isinstance(cached_level, str) or not cached_level:
+        raise ValueError("prefetch cached_level must be a non-empty path")
+    if not isinstance(connections, int) or isinstance(connections, bool) or connections <= 0:
+        raise ValueError("prefetch connections must be a positive integer")
+    from lasagna.scripts.prefill_omezarr import prefill_level
 
-    result = download(
-        source=source,
-        dest=str(destination),
-        scales=[scale],
-        workers=workers,
-        anon=anon,
-        remote_inventory=remote_inventory,
+    last = [-1]
+
+    def progress(done: int, total: int) -> None:
+        if total and (done == total or done // max(1, total // 100) != last[0]):
+            last[0] = done // max(1, total // 100)
+            print(f"[las_manager] prefetch {done}/{total} chunks", flush=True)
+
+    result = prefill_level(location, cache_dir, anon=True, connections=connections, progress=progress)
+    print(
+        f"[las_manager] prefetch fetched {result.fetched_chunks} chunks, "
+        f"{result.empty_chunks} empty, of {result.total_chunks}",
+        flush=True,
     )
-    if result != 0:
-        raise RuntimeError(f"volume download failed with exit status {result}")
-    return destination / str(scale)
+    return Path(cached_level)

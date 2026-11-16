@@ -104,13 +104,18 @@ void validateLasagnaNormalDatasetStructure(const LasagnaDataset& dataset)
     const auto& manifest = dataset.manifest();
     if (!manifest.baseShapeZYX.has_value())
         throw std::invalid_argument("normal manifest must declare base_shape_zyx");
-    requiredPositiveManifestDouble(manifest, "grad_mag_encode_scale");
-    requiredPositiveManifestDouble(manifest, "grad_mag_factor");
+    // Winding density is optional: a Lasagna normal volume has grad_mag, a
+    // predicted sheet-normal volume does not.
+    const bool hasDensity = manifest.groupForChannel("grad_mag") != nullptr;
+    if (hasDensity) {
+        requiredPositiveManifestDouble(manifest, "grad_mag_encode_scale");
+        requiredPositiveManifestDouble(manifest, "grad_mag_factor");
+    }
 
     LasagnaGroupArrays arrays(0);
     const auto nx = bindLasagnaChannel(manifest, "nx", arrays);
     const auto ny = bindLasagnaChannel(manifest, "ny", arrays);
-    const auto gradMag = bindLasagnaChannel(manifest, "grad_mag", arrays);
+    const auto validity = bindLasagnaValidity(manifest, nx, arrays);
     const auto validate = [&](const LasagnaChannelBinding& binding,
                               std::string_view channel) {
         if (binding.group == nullptr) {
@@ -133,7 +138,10 @@ void validateLasagnaNormalDatasetStructure(const LasagnaDataset& dataset)
     };
     validate(nx, "nx");
     validate(ny, "ny");
-    validate(gradMag, "grad_mag");
+    if (!validity.chunkValidity)
+        validate(validity, manifest.validityChannel);
+    if (hasDensity)
+        validate(bindLasagnaChannel(manifest, "grad_mag", arrays), "grad_mag");
     const double nxBaseSpacing = nx.spacing * manifest.workingToBaseScale;
     const double nyBaseSpacing = ny.spacing * manifest.workingToBaseScale;
     if (nx.shapeZYX != ny.shapeZYX ||
@@ -148,31 +156,36 @@ void validateLasagnaNormalDatasetStructure(const LasagnaDataset& dataset)
 class LasagnaNormalSampler::Impl {
 public:
     bool masksInvalidCorners() const noexcept { return maskInvalidCorners_; }
-    std::array<LasagnaChannelBinding,3> regionChannels() const {return {gradMag_,nx_,ny_};}
+    bool hasWindingDensity() const noexcept { return density_.has_value(); }
+    std::array<LasagnaChannelBinding,3> regionChannels() const {return {validity_,nx_,ny_};}
     Impl(const LasagnaDataset& dataset, const LasagnaNormalSamplerOptions& options)
         : arrays_(options.memoryCache ? options.memoryCache
                     : options.autoCacheFraction ? vcr::MemoryCache::automatic(*options.autoCacheFraction)
-                    : std::make_shared<vcr::MemoryCache>(options.maxCachedBytes), options.channelCache),
-          gradMagDecodeScale_(
-              requiredPositiveManifestDouble(dataset.manifest(), "grad_mag_encode_scale") /
-              requiredPositiveManifestDouble(dataset.manifest(), "grad_mag_factor"))
+                    : std::make_shared<vcr::MemoryCache>(options.maxCachedBytes), options.channelCache)
     {
         arrays_.readerThreads=options.readerThreads;
         const LasagnaDatasetManifest& manifest = dataset.manifest();
         maskInvalidCorners_ = manifest.raw.value("mask_invalid_normal_corners", false);
         nx_ = bindLasagnaChannel(manifest, "nx", arrays_);
         ny_ = bindLasagnaChannel(manifest, "ny", arrays_);
-        gradMag_ = bindLasagnaChannel(manifest, "grad_mag", arrays_);
-        sharedGrid_ = sameLasagnaSamplingGrid(gradMag_, nx_) && sameLasagnaSamplingGrid(gradMag_, ny_);
-        windingPointInterpolation_=options.windingPointInterpolation && !gradMag_.cuda && !nx_.cuda && !ny_.cuda;
+        validity_ = bindLasagnaValidity(manifest, nx_, arrays_);
+        if (manifest.groupForChannel("grad_mag") != nullptr) {
+            gradMagDecodeScale_ = requiredPositiveManifestDouble(manifest, "grad_mag_encode_scale") /
+                                  requiredPositiveManifestDouble(manifest, "grad_mag_factor");
+            density_ = bindLasagnaChannel(manifest, "grad_mag", arrays_);
+        }
+        sharedGrid_ = sameLasagnaSamplingGrid(validity_, nx_) && sameLasagnaSamplingGrid(validity_, ny_);
+        windingPointInterpolation_=options.windingPointInterpolation && density_ && !density_->cuda && !nx_.cuda && !ny_.cuda;
         if(!(options.windingRegionBaseVoxels>0.)||!std::isfinite(options.windingRegionBaseVoxels)||!options.windingBatchPoints)
             throw std::invalid_argument("Invalid winding ROI/batch settings");
         windingRegionBaseVoxels_=options.windingRegionBaseVoxels;
         windingBatchPoints_=options.windingBatchPoints;
-        pointInterpolation_=options.pointInterpolation && sharedGrid_ &&
-            gradMag_.packed && nx_.packed && ny_.packed &&
-            !gradMag_.cuda && !nx_.cuda && !ny_.cuda &&
-            gradMag_.array==nx_.array && gradMag_.array==ny_.array;
+        // The fused point policy reads validity as a channel of the normals' packed
+        // array; chunk validity has no such channel and takes the corner paths.
+        pointInterpolation_=options.pointInterpolation && sharedGrid_ && !validity_.chunkValidity &&
+            validity_.packed && nx_.packed && ny_.packed &&
+            !validity_.cuda && !nx_.cuda && !ny_.cuda &&
+            validity_.array==nx_.array && validity_.array==ny_.array;
         if (maskInvalidCorners_ && !sharedGrid_) {
             throw std::invalid_argument("masked normal channels must share the validity sampling grid");
         }
@@ -183,7 +196,9 @@ public:
 
     [[nodiscard]] std::optional<double> sampleWindingDensity(const cv::Vec3d& volumePoint) const
     {
-        const auto gradMag = sampleLasagnaChannel(gradMag_, volumePoint);
+        if (!density_)
+            return std::nullopt;
+        const auto gradMag = sampleLasagnaChannel(*density_, volumePoint);
         if (!gradMag.has_value() || *gradMag < 0.0) {
             return std::nullopt;
         }
@@ -238,6 +253,8 @@ public:
     {
         if (!(stepVx > 0.0) || !std::isfinite(stepVx))
             throw std::invalid_argument("winding integration step must be positive and finite");
+        if (!density_)
+            throw std::logic_error("normal dataset has no winding density channel (grad_mag)");
         std::vector<double> result(
             connectors.size(), std::numeric_limits<double>::infinity());
         if (connectors.empty())
@@ -245,7 +262,8 @@ public:
         const bool profile=std::getenv("VC_FIBER_WINDING_PROFILE")!=nullptr;
         using Clock=std::chrono::steady_clock;
         const auto profileStart=Clock::now();
-        const bool sharedGrid = sharedGrid_;
+        const LasagnaChannelBinding& density = *density_;
+        const bool sharedGrid = sameLasagnaSamplingGrid(density, nx_) && sameLasagnaSamplingGrid(density, ny_);
 
         struct Layout {
             size_t firstPoint = 0;
@@ -317,12 +335,12 @@ public:
             std::vector<InterpolatedWindingSample> interpolated;
             const auto readStart=Clock::now();
             if(windingPointInterpolation_) {
-                sampleLasagnaInterpolatedWindingSamples(regionChannels(),batchPoints,interpolated);
+                sampleLasagnaInterpolatedWindingSamples({density,nx_,ny_},batchPoints,interpolated);
             } else if (sharedGrid) {
                 sampleLasagnaChannelCornerBatch(
-                    {&gradMag_, &nx_, &ny_}, batchPoints, groupedCorners);
+                    {&density, &nx_, &ny_}, batchPoints, groupedCorners);
             } else {
-                sampleLasagnaChannelCornerBatch({&gradMag_}, batchPoints, densityCorners);
+                sampleLasagnaChannelCornerBatch({&density}, batchPoints, densityCorners);
                 sampleLasagnaChannelCornerBatch({&nx_, &ny_}, batchPoints, normalCorners);
             }
             const auto readEnd=Clock::now();
@@ -427,15 +445,15 @@ public:
 
     [[nodiscard]] NormalSample sampleNormal(const cv::Vec3d& volumePoint) const
     {
-        const auto gradMag = sampleLasagnaChannel(gradMag_, volumePoint);
-        if (!gradMag.has_value()) {
-            return {{0.0, 0.0, 0.0}, false, "missing Lasagna grad_mag sample"};
+        const auto validity = sampleLasagnaChannel(validity_, volumePoint);
+        if (!validity.has_value()) {
+            return {{0.0, 0.0, 0.0}, false, "missing Lasagna validity sample"};
         }
-        if (*gradMag <= 0.0) {
-            return {{0.0, 0.0, 0.0}, false, "Lasagna grad_mag sample is zero"};
+        if (*validity <= 0.0) {
+            return {{0.0, 0.0, 0.0}, false, "Lasagna validity sample is zero"};
         }
 
-        const auto normal = sampleLasagnaCompactAxisTensor(nx_, ny_, volumePoint, maskInvalidCorners_ ? &gradMag_ : nullptr);
+        const auto normal = sampleLasagnaCompactAxisTensor(nx_, ny_, volumePoint, maskInvalidCorners_ ? &validity_ : nullptr);
         if (!normal.has_value()) {
             return {{0.0, 0.0, 0.0}, false, "missing Lasagna nx/ny sample"};
         }
@@ -447,19 +465,19 @@ public:
 
     [[nodiscard]] NormalSampleWithDerivative sampleNormalWithDerivative(const cv::Vec3d& volumePoint) const
     {
-        const auto gradMag = sampleLasagnaChannel(gradMag_, volumePoint);
-        if (!gradMag.has_value()) {
-            return {{{0.0, 0.0, 0.0}, false, "missing Lasagna grad_mag sample"},
+        const auto validity = sampleLasagnaChannel(validity_, volumePoint);
+        if (!validity.has_value()) {
+            return {{{0.0, 0.0, 0.0}, false, "missing Lasagna validity sample"},
                     cv::Matx33d::zeros(),
                     false};
         }
-        if (*gradMag <= 0.0) {
-            return {{{0.0, 0.0, 0.0}, false, "Lasagna grad_mag sample is zero"},
+        if (*validity <= 0.0) {
+            return {{{0.0, 0.0, 0.0}, false, "Lasagna validity sample is zero"},
                     cv::Matx33d::zeros(),
                     false};
         }
 
-        const auto normal = sampleLasagnaCompactAxisTensor(nx_, ny_, volumePoint, maskInvalidCorners_ ? &gradMag_ : nullptr);
+        const auto normal = sampleLasagnaCompactAxisTensor(nx_, ny_, volumePoint, maskInvalidCorners_ ? &validity_ : nullptr);
         if (!normal.has_value()) {
             return {{{0.0, 0.0, 0.0}, false, "missing Lasagna nx/ny sample"},
                     cv::Matx33d::zeros(),
@@ -478,7 +496,7 @@ public:
     {
         if (!sharedGrid_)
             return {nullptr, nullptr, nullptr};
-        return {&gradMag_, &nx_, &ny_};
+        return {&validity_, &nx_, &ny_};
     }
 
     void materializeGroupedCorners(
@@ -505,14 +523,14 @@ public:
                 return;
             }
             const auto weights = vcr::sampling::cornerWeights(corners.fractionsXYZ[index]);
-            const auto& gradMag = corners.values[firstVolume][index];
-            if (!(vcr::sampling::weightedCorners(gradMag, weights.data()) > 0.0f)) {
+            const auto& validity = corners.values[firstVolume][index];
+            if (!(vcr::sampling::weightedCorners(validity, weights.data()) > 0.0f)) {
                 samples[index] = {};
                 return;
             }
             const cv::Vec3f normal = interpolateLasagnaCompactAxisCorners(
                 corners.values[firstVolume + 1][index], corners.values[firstVolume + 2][index],
-                maskInvalidCorners_ ? validLasagnaCornerWeights(weights, gradMag) : weights);
+                maskInvalidCorners_ ? validLasagnaCornerWeights(weights, validity) : weights);
             samples[index] = {normal, normal.dot(normal) > 1.0e-12f};
         };
 #ifdef _OPENMP
@@ -563,7 +581,7 @@ public:
             return report;
         }
         LasagnaCornerBatch corners;
-        sampleLasagnaChannelCornerBatch({&gradMag_, &nx_, &ny_}, volumePoints, corners);
+        sampleLasagnaChannelCornerBatch({&validity_, &nx_, &ny_}, volumePoints, corners);
         materializeGroupedCorners(corners, 0, parallelThreads, samples);
         report.materializeMs = std::chrono::duration<double, std::milli>(
             Clock::now() - start).count();
@@ -591,8 +609,8 @@ public:
             const std::vector<cv::Vec3f> points(volumePoints.begin(),volumePoints.end());
             sampleLasagnaInterpolatedNormals(regionChannels(),points,maskInvalidCorners_,[&](size_t i,const auto& value){
                 switch(value.status) {
-                case NormalInterpolationStatus::Missing:samples[i]=invalidNormal("missing Lasagna grad_mag sample");break;
-                case NormalInterpolationStatus::ZeroDensity:samples[i]=invalidNormal("Lasagna grad_mag sample is zero");break;
+                case NormalInterpolationStatus::Missing:samples[i]=invalidNormal("missing Lasagna validity sample");break;
+                case NormalInterpolationStatus::ZeroDensity:samples[i]=invalidNormal("Lasagna validity sample is zero");break;
                 case NormalInterpolationStatus::Degenerate:samples[i]=invalidNormal("degenerate Lasagna normal sample");break;
                 case NormalInterpolationStatus::Valid:
                     samples[i]={{{value.normal[0],value.normal[1],value.normal[2]},true,{}},cv::Matx33d::zeros(),false};break;
@@ -605,15 +623,15 @@ public:
         if (sharedGrid_ && !scalarEquivalent) {
             const std::vector<cv::Vec3f> floatPoints(volumePoints.begin(), volumePoints.end());
             LasagnaCornerBatch corners;
-            sampleLasagnaChannelCornerBatch({&gradMag_, &nx_, &ny_}, floatPoints, corners);
+            sampleLasagnaChannelCornerBatch({&validity_, &nx_, &ny_}, floatPoints, corners);
             parallelFor(volumePoints.size(), workers, [&](size_t index) {
                 if (!corners.valid[index]) {
-                    samples[index] = invalidNormal("missing Lasagna grad_mag sample");
+                    samples[index] = invalidNormal("missing Lasagna validity sample");
                     return;
                 }
                 const auto weights = vcr::sampling::cornerWeights(corners.fractionsXYZ[index]);
                 if (!(vcr::sampling::weightedCorners(corners.values[0][index], weights.data()) > 0.0f)) {
-                    samples[index] = invalidNormal("Lasagna grad_mag sample is zero");
+                    samples[index] = invalidNormal("Lasagna validity sample is zero");
                     return;
                 }
                 const cv::Vec3f normal = interpolateLasagnaCompactAxisCorners(
@@ -627,22 +645,22 @@ public:
                                   cv::Matx33d::zeros(), false};
             });
         } else {
-            LasagnaCubes gradMag, nx, ny;
-            readLasagnaCubes(gradMag_, volumePoints, gradMag);
+            LasagnaCubes validity, nx, ny;
+            readLasagnaCubes(validity_, volumePoints, validity);
             readLasagnaCubes(nx_, volumePoints, nx);
             readLasagnaCubes(ny_, volumePoints, ny);
             parallelFor(volumePoints.size(), workers, [&](size_t index) {
-                if (!gradMag.valid[index]) {
-                    samples[index] = invalidNormal("missing Lasagna grad_mag sample");
+                if (!validity.valid[index]) {
+                    samples[index] = invalidNormal("missing Lasagna validity sample");
                     return;
                 }
-                if (vcr::sampling::trilinear(gradMag.values[index], gradMag.fractionsXYZ[index]) <= 0.0) {
-                    samples[index] = invalidNormal("Lasagna grad_mag sample is zero");
+                if (vcr::sampling::trilinear(validity.values[index], validity.fractionsXYZ[index]) <= 0.0) {
+                    samples[index] = invalidNormal("Lasagna validity sample is zero");
                     return;
                 }
                 const auto normal = nx.valid[index] && ny.valid[index]
                     ? lasagnaCompactAxisCube(nx.values[index], ny.values[index], nx.fractionsXYZ[index],
-                                               maskInvalidCorners_ ? &gradMag.values[index] : nullptr)
+                                               maskInvalidCorners_ ? &validity.values[index] : nullptr)
                     : std::nullopt;
                 if (!normal.has_value()) {
                     samples[index] = invalidNormal("missing Lasagna nx/ny sample");
@@ -664,7 +682,8 @@ private:
     LasagnaGroupArrays arrays_;
     LasagnaChannelBinding nx_;
     LasagnaChannelBinding ny_;
-    LasagnaChannelBinding gradMag_;
+    LasagnaChannelBinding validity_;              // the manifest's validity on the normals' grid
+    std::optional<LasagnaChannelBinding> density_;  // grad_mag, when the volume has one
     bool sharedGrid_ = false;
     bool pointInterpolation_ = false;
     bool windingPointInterpolation_ = false;
@@ -773,6 +792,11 @@ NormalBatchReport LasagnaNormalSampler::sampleNormalBatchScalarEquivalent(
 bool LasagnaNormalSampler::masksInvalidCorners() const noexcept
 {
     return impl_->masksInvalidCorners();
+}
+
+bool LasagnaNormalSampler::hasWindingDensity() const noexcept
+{
+    return impl_->hasWindingDensity();
 }
 
 std::array<const LasagnaChannelBinding*, 3>
