@@ -61,17 +61,7 @@ int usage() {
     return 2;
 }
 
-void say(const std::string& line) {
-    std::printf("%s\n", line.c_str());
-    std::fflush(stdout);
-}
 
-std::string now(const char* format) {
-    const std::time_t t = std::time(nullptr);
-    char b[32];
-    std::strftime(b, sizeof b, format, std::localtime(&t));
-    return b;
-}
 
 std::string absolute(const std::string& p) { return fs::absolute(p).lexically_normal().string(); }
 
@@ -166,7 +156,7 @@ int run(int argc, char** argv) {
 
     const auto t0 = std::chrono::steady_clock::now();
     const auto seconds = [&] { return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); };
-    const std::string tag = a.get("tag") ? a.text("tag") : now("%Y%m%d_%H%M%S");
+    const std::string tag = a.get("tag") ? a.text("tag") : now(command_line::kTag);
     const std::string outdir = absolute(a.text("out_root")) + "/" + tag;
     if (fs::exists(outdir) && !a.flag("overwrite")) fail(outdir + " exists (use another --tag or --overwrite)");
     fs::create_directories(outdir);
@@ -197,7 +187,7 @@ int run(int argc, char** argv) {
     double reach = 0;
     for (double o : layer_offsets(1, start, step, n_layers)) reach = std::max(reach, std::fabs(o));
     const Json common = Json::dict()
-                            .set("created", Json::of(now("%Y-%m-%dT%H:%M:%S")))
+                            .set("created", Json::of(now(command_line::kIso)))
                             .set("surface", Json::of(absolute(surface_path)))
                             .set("surface_uuid", Json::of(surf.metadata().uuid))
                             .set("surface_full_shape", ints({full[0], full[1]}))
@@ -385,18 +375,4 @@ int run(int argc, char** argv) {
 
 }  // namespace
 
-int main(int argc, char** argv) {
-    try {
-        return run(argc, argv);
-    } catch (const Exit& e) {
-        if (e.message == "help") {
-            usage();
-            return 0;
-        }
-        std::fprintf(stderr, "vc_tomography_composite: %s\n", e.message.c_str());
-        return 2;
-    } catch (const std::exception& e) {
-        std::fprintf(stderr, "vc_tomography_composite: %s\n", e.what());
-        return 1;
-    }
-}
+int main(int argc, char** argv) { return command_line::tool_main("vc_tomography_composite", [&] { return run(argc, argv); }, usage); }

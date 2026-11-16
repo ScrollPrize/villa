@@ -3,6 +3,10 @@
 // typed values, a positional argument, and a --config JSON file of options that the command line overrides.
 #include <algorithm>
 #include <cctype>
+#include <chrono>
+#include <cstdio>
+#include <ctime>
+#include <exception>
 #include <fstream>
 #include <functional>
 #include <iterator>
@@ -175,5 +179,43 @@ struct Args {
         return v;
     }
 };
+
+// a line on stdout, at once (the tools' progress and results)
+inline void say(const std::string& line) {
+    std::printf("%s\n", line.c_str());
+    std::fflush(stdout);
+}
+
+// the local time as strftime formats it: kIso "2026-11-16T18:30:05", kTag "20261116_183005"
+constexpr const char* kIso = "%Y-%m-%dT%H:%M:%S";
+constexpr const char* kTag = "%Y%m%d_%H%M%S";
+inline std::string now(const char* format) {
+    const std::time_t t = std::time(nullptr);
+    char b[32];
+    std::strftime(b, sizeof b, format, std::localtime(&t));
+    return b;
+}
+inline double seconds_since(std::chrono::steady_clock::time_point t0) {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+}
+
+// A tool's main: what run() returns; Exit "help" prints the usage (0), another Exit its message (2), an error its
+// message (1), each after the tool's name on stderr.
+template <class Run, class Usage>
+int tool_main(const char* name, Run&& run, Usage&& usage) {
+    try {
+        return run();
+    } catch (const Exit& e) {
+        if (e.message == "help") {
+            usage();
+            return 0;
+        }
+        std::fprintf(stderr, "%s: %s\n", name, e.message.c_str());
+        return 2;
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "%s: %s\n", name, e.what());
+        return 1;
+    }
+}
 
 }  // namespace vc_tomography::command_line

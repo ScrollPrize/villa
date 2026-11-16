@@ -95,3 +95,19 @@ def test_an_incomplete_file_is_left_out_and_reported(tmp_path):
     assert "det1_0006.h5" in run.stderr
     stored = np.asarray(open_zarr(str(out / "T1-01" / "scan0005" / "3"))[:, :, :])
     assert stored[:100].any() and not stored[100:].any()
+
+
+@pytest.mark.parametrize("tool,args,said", [
+    ("vc_tomography_projections_zarr", ["out.zarr", "dir", "--bogus"], "unknown option --bogus"),       # (paths were dropped silently)
+    ("vc_tomography_projections_zarr", ["out.zarr", "dir", "--threads", "4x"], "invalid value '4x'"),
+    ("vc_tomography_calibration", ["geometry", "a.h5", "--out", "g.json", "--order", "3x"], "invalid value '3x'"),
+    ("vc_tomography_calibration", ["check-record", "a.h5", "--bogus"], "unknown option --bogus"),
+])
+def test_tools_refuse_unknown_options_and_bad_numbers(tmp_path, tool, args, said):
+    """the tools' command lines are read by src/io/command_line.hpp: exit 2 and a message, nothing done"""
+    exe = find_tool(tool)
+    if exe is None:
+        pytest.skip(f"{tool} is not built")
+    p = subprocess.run([exe, *args], capture_output=True, text=True, cwd=tmp_path)
+    assert p.returncode == 2 and said in p.stderr, (p.returncode, p.stderr)
+    assert not any(tmp_path.iterdir())

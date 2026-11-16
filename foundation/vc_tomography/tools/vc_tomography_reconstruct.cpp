@@ -94,21 +94,9 @@ int usage() {
     return 2;
 }
 
-std::string now_iso() {
-    const std::time_t t = std::time(nullptr);
-    char b[32];
-    std::strftime(b, sizeof b, "%Y-%m-%dT%H:%M:%S", std::localtime(&t));
-    return b;
-}
-
-std::string now_tag() {
-    const std::time_t t = std::time(nullptr);
-    char b[32];
-    std::strftime(b, sizeof b, "%Y%m%d_%H%M%S", std::localtime(&t));
-    return b;
-}
-
-double since(std::chrono::steady_clock::time_point t0) { return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); }
+std::string now_iso() { return command_line::now(command_line::kIso); }
+std::string now_tag() { return command_line::now(command_line::kTag); }
+double since(std::chrono::steady_clock::time_point t0) { return command_line::seconds_since(t0); }
 
 std::string fmt(const char* f, double v) {
     char b[64];
@@ -116,10 +104,6 @@ std::string fmt(const char* f, double v) {
     return b;
 }
 
-void say(const std::string& line) {
-    std::printf("%s\n", line.c_str());
-    std::fflush(stdout);
-}
 
 std::vector<std::uint8_t> to_u8(const float* img, int ny, int nx, const std::array<double, 2>& window) {
     std::vector<std::uint8_t> out(static_cast<std::size_t>(ny) * nx);
@@ -558,18 +542,4 @@ int run(int argc, char** argv) {
 
 }  // namespace
 
-int main(int argc, char** argv) {
-    try {
-        return run(argc, argv);
-    } catch (const Exit& e) {
-        if (e.message == "help") {
-            usage();
-            return 0;
-        }
-        std::fprintf(stderr, "vc_tomography_reconstruct: %s\n", e.message.c_str());
-        return 2;
-    } catch (const std::exception& e) {
-        std::fprintf(stderr, "vc_tomography_reconstruct: %s\n", e.what());
-        return 1;
-    }
-}
+int main(int argc, char** argv) { return command_line::tool_main("vc_tomography_reconstruct", [&] { return run(argc, argv); }, usage); }

@@ -156,6 +156,7 @@ target_link_libraries(vc_tomography_surfaces PUBLIC vc_tomography vc_reader::rea
 option(VC_TOMOGRAPHY_TOOLS "Build the command-line tools" ON)
 if(VC_TOMOGRAPHY_TOOLS)
   add_executable(vc_tomography_calibration tools/vc_tomography_calibration.cpp)
+  target_include_directories(vc_tomography_calibration PRIVATE src)
   target_link_libraries(vc_tomography_calibration PRIVATE vc_tomography)
   target_compile_options(vc_tomography_calibration PRIVATE -O2 -Wall -Wextra)
   # vc_tomography_reconstruct: slices and volumes of a scan pair from its raw folders (vc_tomography/reconstruction.hpp)

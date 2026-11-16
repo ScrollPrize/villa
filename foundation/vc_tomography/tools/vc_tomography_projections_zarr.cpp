@@ -21,6 +21,7 @@
 // again skips the files already stored.
 #include <hdf5.h>
 
+#include "io/command_line.hpp"
 #include "io/h5.hpp"
 
 #include <algorithm>
@@ -172,36 +173,24 @@ std::string spec_of(const Scan& s, const Json& tile) {
                 {"tile_attributes", tile}, {"files", files}, {"frame_values", values}}.dump();
 }
 
-}  // namespace
+int usage() {
+    std::fprintf(stderr, "usage: vc_tomography_projections_zarr OUT.zarr SCALE_DIR [SCALE_DIR ...] [--tiles T ...] [--threads N] [--level L] [--no_verify]\n"
+                         "(see the head of tools/vc_tomography_projections_zarr.cpp and README.md)\n");
+    return 2;
+}
 
-int main(int argc, char** argv) try {
+int run(int argc, char** argv) {
+    namespace cl = vc_tomography::command_line;
+    const cl::Spec spec{{{"tiles", -1, 's'}, {"threads", 1, 'i'}, {"level", 1, 'i'}, {"no_verify", 0, 'b'}}, {}, "paths", true};
+    const cl::Args a{cl::parse(argc, argv, spec)};
     std::vector<fs::path> positional;
-    std::set<std::string> only;
-    unsigned threads = std::max(1u, std::thread::hardware_concurrency());
-    int level = 1;
-    bool verify = true;
-    for (int i = 1; i < argc; ++i) {
-        const std::string a = argv[i];
-        if (a == "--tiles") {
-            while (i + 1 < argc && argv[i + 1][0] != '-') only.insert(argv[++i]);
-        } else if (a == "--threads" && i + 1 < argc) {
-            threads = unsigned(std::max(1, std::atoi(argv[++i])));
-        } else if (a == "--level" && i + 1 < argc) {
-            level = std::atoi(argv[++i]);
-        } else if (a == "--no_verify" || a == "--no-verify") {
-            verify = false;
-        } else if (a.rfind("--", 0) == 0) {
-            positional.clear();
-            break;
-        } else {
-            positional.emplace_back(a);
-        }
-    }
-    if (positional.size() < 2) {
-        std::fprintf(stderr, "usage: vc_tomography_projections_zarr OUT.zarr SCALE_DIR [SCALE_DIR ...] [--tiles T ...] [--threads N] [--level L] [--no_verify]\n"
-                             "(see the head of tools/vc_tomography_projections_zarr.cpp and README.md)\n");
-        return 2;
-    }
+    for (const std::string& p : a.texts("paths")) positional.emplace_back(p);
+    const std::vector<std::string> named = a.texts("tiles");
+    const std::set<std::string> only(named.begin(), named.end());
+    const unsigned threads = a.get("threads") ? unsigned(std::max(1, static_cast<int>(a.number("threads")))) : std::max(1u, std::thread::hardware_concurrency());
+    const int level = a.get("level") ? static_cast<int>(a.number("level")) : 1;
+    const bool verify = !a.flag("no_verify");
+    if (positional.size() < 2) return usage();
     vc_tomography::h5::quiet();
     const fs::path root = positional[0];
     std::map<std::string, Scan> scans;
@@ -278,7 +267,10 @@ int main(int argc, char** argv) try {
     std::printf("%s: %zu files written%s, %zu already stored, %zu not complete\n", root.c_str(), written.load(), verify ? " and verified" : "", skipped.load(),
                 incomplete.load());
     return incomplete ? 1 : 0;
-} catch (const std::exception& e) {
-    std::fprintf(stderr, "vc_tomography_projections_zarr: %s\n", e.what());
-    return 1;
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    return vc_tomography::command_line::tool_main("vc_tomography_projections_zarr", [&] { return run(argc, argv); }, usage);
 }

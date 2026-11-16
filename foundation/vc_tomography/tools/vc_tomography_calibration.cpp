@@ -51,9 +51,12 @@
 #include "vc_tomography/calibration/scan.hpp"
 #include "vc_tomography/calibration/registration.hpp"
 #include "vc_tomography/calibration/record_checks.hpp"
+#include "io/command_line.hpp"
 
 using namespace vc_tomography;
 using namespace vc_tomography::calibration;
+using command_line::Args;
+using command_line::say;
 
 namespace {
 
@@ -74,34 +77,24 @@ int usage() {
 // vc_tomography_calibration geometry: the arguments after the command
 int run_geometry_calibration(int argc, char** argv) {
     namespace gc = vc_tomography::calibration::geometry_calibration;
-    std::vector<std::string> scans;
-    std::string out, device = "auto";
-    gc::Options opt;
-    for (int i = 2; i < argc; ++i) {
-        const std::string a = argv[i];
-        const auto value = [&]() -> std::string {
-            if (i + 1 >= argc) throw Error("option " + a + " needs a value");
-            return argv[++i];
-        };
-        if (a == "--out") out = value();
-        else if (a == "--row-time-us") opt.row_time = std::stod(value()) * 1e-6;
-        else if (a == "--rows-from-middle") opt.rows_from_middle = true;
-        else if (a == "--order") opt.order = std::stoi(value());
-        else if (a == "--radial-map") opt.radial_map = true;
-        else if (a == "--patch") opt.patch = std::stoi(value());
-        else if (a == "--reduce") opt.reduce = std::stoi(value());
-        else if (a == "--projections") opt.projections = value();
-        else if (a == "--threads") opt.threads = std::stoi(value());
-        else if (a == "--device") device = value();
-        else if (!a.empty() && a[0] == '-') throw Error("unknown option " + a);
-        else scans.push_back(a);
-    }
+    const command_line::Spec spec{{{"out", 1, 's'}, {"row_time_us", 1, 'f'}, {"rows_from_middle", 0, 'b'}, {"order", 1, 'i'}, {"radial_map", 0, 'b'},
+                                   {"patch", 1, 'i'}, {"reduce", 1, 'i'}, {"projections", 1, 's'}, {"threads", 1, 'i'}, {"device", 1, 's'}},
+                                  {}, "scans", true};
+    const Args a{command_line::parse(argc - 1, argv + 1, spec)};
+    const std::vector<std::string> scans = a.texts("scans");
+    const std::string out = a.text("out");
     if (scans.empty() || out.empty()) return usage();
-    opt.device = parse_device(device, true);
-    opt.log = [](const std::string& line) {
-        std::printf("%s\n", line.c_str());
-        std::fflush(stdout);
-    };
+    gc::Options opt;
+    if (a.get("row_time_us")) opt.row_time = a.number("row_time_us") * 1e-6;
+    opt.rows_from_middle = a.flag("rows_from_middle");
+    if (a.get("order")) opt.order = static_cast<int>(a.number("order"));
+    opt.radial_map = a.flag("radial_map");
+    if (a.get("patch")) opt.patch = static_cast<int>(a.number("patch"));
+    if (a.get("reduce")) opt.reduce = static_cast<int>(a.number("reduce"));
+    if (a.get("projections")) opt.projections = a.text("projections");
+    if (a.get("threads")) opt.threads = static_cast<int>(a.number("threads"));
+    opt.device = parse_device(a.get("device") ? a.text("device") : "auto", true);
+    opt.log = say;
     const std::string cal = gc::calibrate_geometry(scans, opt);
     gc::save_text(cal, out);
     std::printf("written to %s\n", out.c_str());
@@ -115,26 +108,13 @@ std::string base_name(const std::string& p) {
 
 // vc_tomography_calibration intensity: the arguments after the command
 int run_intensity_calibration(int argc, char** argv) {
-    std::vector<std::string> paths;
-    std::string geometry_path, out;
-    bool progress = true;
-    for (int i = 2; i < argc; ++i) {
-        const std::string a = argv[i];
-        const auto value = [&]() -> std::string {
-            if (i + 1 >= argc) throw Error("option " + a + " needs a value");
-            return argv[++i];
-        };
-        if (a == "--geometry") geometry_path = value();
-        else if (a == "--out") out = value();
-        else if (a == "--no-progress") progress = false;
-        else if (!a.empty() && a[0] == '-') throw Error("unknown option " + a);
-        else paths.push_back(a);
-    }
+    const command_line::Spec spec{{{"geometry", 1, 's'}, {"out", 1, 's'}, {"no_progress", 0, 'b'}}, {}, "scans", true};
+    const Args a{command_line::parse(argc - 1, argv + 1, spec)};
+    const std::vector<std::string> paths = a.texts("scans");
+    const std::string geometry_path = a.text("geometry"), out = a.text("out");
+    const bool progress = !a.flag("no_progress");
     if (paths.size() != 2 || geometry_path.empty() || out.empty()) return usage();
-    const auto log = [](const std::string& line) {
-        std::printf("%s\n", line.c_str());
-        std::fflush(stdout);
-    };
+    const auto log = say;
     const Scan main = open_scan(paths[0]), companion = open_scan(paths[1]);
     const geometry::Calibration geo = geometry::Calibration::load(geometry_path);
     const std::vector<std::string> made = geo.scans();
@@ -150,61 +130,50 @@ int run_intensity_calibration(int argc, char** argv) {
     return 0;
 }
 
+// vc_tomography_calibration check-record / selftest: the arguments after the command
+int run_record_checks_command(const std::string& command, int argc, char** argv) {
+    const command_line::Spec spec{{{"json", 1, 's'}, {"no_frames", 0, 'b'}, {"out", 1, 's'}, {"checks", 1, 's'}, {"inventory", 1, 's'},
+                                   {"threads", 1, 'i'}, {"frames", 1, 'i'}, {"rows", 1, 'i'}, {"columns", 1, 'i'}, {"column_fraction", 1, 'f'},
+                                   {"blocks", 1, 'i'}, {"position_target", 1, 'f'}, {"radius", 1, 'f'}, {"inventory_step", 1, 'i'}, {"device", 1, 's'}},
+                                  {}, "scans", true};
+    const Args a{command_line::parse(argc - 1, argv + 1, spec)};
+    const auto whole = [&](const char* k, int& v) {
+        if (a.get(k)) v = static_cast<int>(a.number(k));
+    };
+    RecordCheckOptions opt;
+    opt.print = true;
+    if (a.flag("no_frames")) opt.checks = "record";
+    if (a.get("out")) opt.out_dir = a.text("out");
+    if (a.get("checks")) opt.checks = a.text("checks");
+    if (a.get("inventory")) opt.inventory_dir = a.text("inventory");
+    whole("threads", opt.threads);
+    whole("frames", opt.view.frames);
+    whole("rows", opt.view.rows);
+    whole("columns", opt.view.columns);
+    whole("blocks", opt.view.blocks);
+    whole("inventory_step", opt.inventory_step);
+    if (a.get("column_fraction")) opt.view.column_fraction = a.number("column_fraction");
+    if (a.get("position_target")) opt.view.eps = a.number("position_target");
+    if (a.get("radius")) opt.radius_px = a.number("radius");
+    opt.view.device = parse_device(a.get("device") ? a.text("device") : "auto", true);
+    if (command == "selftest") return registration_selftest(true, opt.view.device) ? 0 : 1;
+    const std::vector<std::string> scans = a.texts("scans");
+    if (scans.empty()) return usage();
+    const Report report = run_record_checks(scans, opt);
+    if (a.get("json")) io::write_text(a.text("json"), report.json(), false);
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     if (argc < 2) return usage();
     const std::string command = argv[1];
-    try {
+    return command_line::tool_main("vc_tomography_calibration", [&] {
         if (command == "geometry") return run_geometry_calibration(argc, argv);
         if (command == "intensity") return run_intensity_calibration(argc, argv);
-        if (command != "check-record" && command != "selftest") return usage();
-
-        std::vector<std::string> scans;
-        std::string json, device = "auto";
-        RecordCheckOptions opt;
-        opt.print = true;
-        for (int i = 2; i < argc; ++i) {
-            const std::string a = argv[i];
-            const auto value = [&]() -> std::string {
-                if (i + 1 >= argc) throw Error("option " + a + " needs a value");
-                return argv[++i];
-            };
-            if (a == "--json") json = value();
-            else if (a == "--no-frames") opt.checks = "record";
-            else if (a == "--out") opt.out_dir = value();
-            else if (a == "--checks") opt.checks = value();
-            else if (a == "--inventory") opt.inventory_dir = value();
-            else if (a == "--threads") opt.threads = std::atoi(value().c_str());
-            else if (a == "--frames") opt.view.frames = std::atoi(value().c_str());
-            else if (a == "--rows") opt.view.rows = std::atoi(value().c_str());
-            else if (a == "--columns") opt.view.columns = std::stoi(value());
-            else if (a == "--column-fraction") opt.view.column_fraction = std::stod(value());
-            else if (a == "--blocks") opt.view.blocks = std::atoi(value().c_str());
-            else if (a == "--position-target") {
-                const auto v = value();
-                std::size_t used = 0;
-                opt.view.eps = std::stod(v, &used);
-                if (used != v.size()) throw Error("--position-target must be a finite positive number");
-            }
-            else if (a == "--radius") opt.radius_px = std::stod(value());
-            else if (a == "--inventory-step") opt.inventory_step = std::stoi(value());
-            else if (a == "--device") device = value();
-            else if (!a.empty() && a[0] == '-') throw Error("unknown option " + a);
-            else scans.push_back(a);
-        }
-        opt.view.device = parse_device(device, true);
-        if (command == "selftest") return registration_selftest(true, opt.view.device) ? 0 : 1;
-        if (scans.empty()) return usage();
-        const Report report = run_record_checks(scans, opt);
-        if (!json.empty()) {
-            std::ofstream o(json);
-            if (!o) throw Error("cannot write " + json);
-            o << report.json();
-        }
-        return 0;
-    } catch (const std::exception& e) {
-        std::fprintf(stderr, "vc_tomography_calibration: %s\n", e.what());
-        return 1;
-    }
+        if (command == "check-record" || command == "selftest") return run_record_checks_command(command, argc, argv);
+        if (command == "-h" || command == "--help") throw command_line::Exit{"help"};
+        return usage();
+    }, usage);
 }
