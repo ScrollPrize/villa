@@ -102,6 +102,52 @@ void codecs(const fs::path& root, int version, bool sharded = false)
     }
 }
 
+// vc-delta3d's predictor is an encoding choice: each one round-trips, writes other payloads than the default,
+// stores the same metadata, and an unknown name is refused before anything is written.
+void delta3dPredictors(const fs::path& root)
+{
+    std::vector<uint8_t> chunk(32 * 32 * 32);
+    for (std::size_t i = 0; i < chunk.size(); ++i)
+        chunk[i] = uint8_t((i % 32) * 3 + (i / 1024) * 5 + (i * 2654435761u >> 28));
+    std::string fastBytes, fastMeta;
+    for (const std::string predictor : {"", "medium", "slow", "slower", "delta"}) {
+        vcr::zarr::CreateOptions options;
+        options.shape = options.chunks = {32, 32, 32};
+        options.compressor = "vc-delta3d";
+        options.delta3dPredictor = predictor;
+        const auto path = root / ("delta3d-" + (predictor.empty() ? std::string("fast") : predictor));
+        auto writer = vcr::zarr::Writer::create(path, options);
+        writer.writeChunk({0, 0, 0}, chunk.data(), chunk.size());
+        auto reopened = vcr::zarr::openArray(path.string(), {});
+        require(read(*reopened.array, {0, 0, 0}, {32, 32, 32}, 1) == chunk, "delta3d " + predictor + ": round trip");
+        std::ifstream f(writer.chunkPath({0, 0, 0}), std::ios::binary);
+        const std::string bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        std::ifstream m(path / ".zarray");
+        const std::string meta((std::istreambuf_iterator<char>(m)), std::istreambuf_iterator<char>());
+        if (predictor.empty()) fastBytes = bytes, fastMeta = meta;
+        else {
+            require(meta == fastMeta, "delta3d " + predictor + ": the metadata does not name the predictor");
+            if (predictor == "delta") require(bytes != fastBytes, "delta3d delta: another payload than fast's");
+        }
+        const Json config{{"id", "vc-delta3d"}, {"quant", 1}, {"predictor", predictor.empty() ? "fast" : predictor}};
+        const auto encoded = vcr::zarr::compressBytes(config, chunk, 1, {32, 32, 32});
+        std::vector<uint8_t> back(chunk.size());
+        vcr::zarr::decompressBytes(config, encoded, back);
+        require(back == chunk, "delta3d " + predictor + ": compressBytes round trip");
+    }
+    vcr::zarr::CreateOptions bad;
+    bad.shape = bad.chunks = {32, 32, 32};
+    bad.compressor = "vc-delta3d";
+    bad.delta3dPredictor = "fastest";
+    bool refused = false;
+    try {
+        vcr::zarr::Writer::create(root / "delta3d-bad", bad);
+    } catch (const std::invalid_argument&) {
+        refused = true;
+    }
+    require(refused && !fs::exists(root / "delta3d-bad" / ".zarray"), "delta3d: an unknown predictor is refused first");
+}
+
 void editing(const fs::path& root, int version)
 {
     vcr::zarr::CreateOptions options;
@@ -786,6 +832,7 @@ int main()
         pyramidReductions(root);
         packbitsFilter(root);
         bytesCodecs();
+        delta3dPredictors(root);
         for (int version : {2, 3}) {
             const auto dir = root / std::to_string(version);
             codecs(dir, version);

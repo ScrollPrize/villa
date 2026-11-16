@@ -74,6 +74,7 @@ void createObjectArray(const std::filesystem::path& path, const Index& shape, co
 
 // `data` encoded by a numcodecs compressor config ({"id": "blosc", "cname": ...}; null copies),
 // as a chunk of `itemsize`-byte elements. `shape` is only read by vc-delta3d and volcomp.
+// vc-delta3d reads an optional "predictor" (CreateOptions::delta3dPredictor).
 std::vector<std::uint8_t> compressBytes(const Json& compressor, std::span<const std::uint8_t> data, std::size_t itemsize = 1,
                                         const Index& shape = {});
 // The reverse, into exactly `out.size()` bytes; throws on any other decoded size.
@@ -100,6 +101,9 @@ struct CreateOptions {
     Index shardShape;               // v3 outer shape in elements; empty: unsharded
     bool shardIndexEnd = true, shardIndexCrc = true;
     bool packbits = false;          // bool only: elements stored as bits, before the compressor
+    // vc-delta3d: the encoder's predictor, "fast" (empty: the default), "medium", "slow", "slower" or "delta".
+    // An encoding choice only: the metadata does not store it, and every payload decodes alike.
+    std::string delta3dPredictor;
 };
 
 // What creates an array like `meta`: its shape, chunks, dtype, codec, separator, fill,
@@ -124,6 +128,9 @@ public:
 
     const ArrayMeta& meta() const;
     const std::filesystem::path& path() const;
+    // The vc-delta3d predictor chunks written from now on are encoded with (CreateOptions::delta3dPredictor);
+    // an opened writer encodes with "fast".
+    void setDelta3dPredictor(const std::string& name);
     // Reads the stored array (no memory cache: always what is stored).
     Array& reader();
 
@@ -188,6 +195,7 @@ struct PyramidOptions {
     std::array<int, 3> factors{2, 2, 2};
     std::size_t threads = 0;  // output-chunk workers; 0: all cores
     Reduction reduction = Reduction::Mean;
+    std::string delta3dPredictor;  // vc-delta3d levels: the encoder's predictor (CreateOptions::delta3dPredictor)
 };
 // Creates the arrays of levels 1..levels (metadata only) to go with a level 0 created
 // from `level0`: the same dtype, codec and chunks, chunks capped to each level's shape.

@@ -85,6 +85,9 @@ EncodeOptions encodeOptions(const Json& compressor)
     o.blocksize = compressor.value("blocksize", o.blocksize);
     o.q = compressor.value("q", o.q);
     o.checksum = compressor.value("checksum", false);
+    o.predictor = compressor.value("predictor", o.predictor);
+    if (compressor.value("id", "") == "vc-delta3d")
+        delta3d_predictor(o.predictor);  // an unknown name fails here, not at the first chunk
     return o;
 }
 
@@ -477,13 +480,18 @@ Writer Writer::create(const fs::path& path, const CreateOptions& options, const 
     }
     if (!store.remote())
         fs::create_directories(path);
+    if (!options.delta3dPredictor.empty())
+        delta3d_predictor(options.delta3dPredictor);  // checked before anything is written
     store.write(metadataName(meta), zarray.dump(2) + "\n");
     if (const auto parent = parentLocation(store)) {
         const Store above(*parent, access, 1);
         if (!above.exists(".zgroup") && !above.exists("zarr.json"))
             above.write(meta.v3 ? "zarr.json" : ".zgroup", groupMarker(meta.v3 ? 3 : 2));
     }
-    return open(path, access);
+    auto writer = open(path, access);
+    if (!options.delta3dPredictor.empty())
+        writer.setDelta3dPredictor(options.delta3dPredictor);
+    return writer;
 }
 
 Writer Writer::open(const fs::path& path, const Access& access)
@@ -512,6 +520,11 @@ Writer Writer::open(const fs::path& path, const Access& access)
 }
 
 const ArrayMeta& Writer::meta() const { return impl_->meta; }
+void Writer::setDelta3dPredictor(const std::string& name)
+{
+    delta3d_predictor(name);
+    impl_->encode.predictor = name;
+}
 const fs::path& Writer::path() const { return impl_->path; }
 Array& Writer::reader() { return *impl_->reader; }
 

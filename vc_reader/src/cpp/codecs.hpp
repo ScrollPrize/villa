@@ -161,11 +161,24 @@ inline bool delta3d_lossless(const std::uint8_t* p, std::size_t n)
     return quant && *quant == vc_delta3d::kQuantizationLossless;
 }
 
+// The encoder's predictor by name: "fast" (the default), "medium", "slow", "slower" (smaller payloads, slower
+// encoding), or "delta" (the older D3D1 frames). Decoding needs no name: the payload records it.
+inline vc_delta3d::Predictor delta3d_predictor(const std::string& name)
+{
+    if (name.empty() || name == "fast") return vc_delta3d::Predictor::Fast;
+    if (name == "medium") return vc_delta3d::Predictor::Medium;
+    if (name == "slow") return vc_delta3d::Predictor::Slow;
+    if (name == "slower") return vc_delta3d::Predictor::Slower;
+    if (name == "delta") return vc_delta3d::Predictor::Delta;
+    throw std::invalid_argument("vc-delta3d: unknown predictor '" + name + "' (fast, medium, slow, slower or delta)");
+}
+
 inline std::vector<std::uint8_t> encode_delta3d(const std::uint8_t* src, std::size_t n,
-                                                const std::array<int, 3>& shape, std::size_t itemsize)
+                                                const std::array<int, 3>& shape, std::size_t itemsize,
+                                                const std::string& predictor = "fast")
 {
     auto out = vc_delta3d::compress(std::span(reinterpret_cast<const std::byte*>(src), n), shape, itemsize,
-                                    vc_delta3d::kQuantizationLossless);
+                                    vc_delta3d::kQuantizationLossless, delta3d_predictor(predictor));
     std::vector<std::uint8_t> bytes(out.size());
     std::memcpy(bytes.data(), out.data(), out.size());
     return bytes;
@@ -179,6 +192,7 @@ struct EncodeOptions {
     int blocksize = 0;          // blosc
     float q = 8.0f;             // volcomp quantiser step (0: lossless)
     bool checksum = false;     // zstd frame checksum
+    std::string predictor = "fast";  // vc-delta3d encoder predictor (delta3d_predictor)
 };
 
 // Encodes one decoded chunk of `itemsize`-byte elements and C-order `shape`.
@@ -260,7 +274,7 @@ inline std::vector<std::uint8_t> encode(Codec codec, const EncodeOptions& o, con
     case Codec::Delta3d:
         if (shape.size() != 3 || (itemsize != 1 && itemsize != 2))
             throw std::invalid_argument("vc-delta3d stores 3-D uint8 or uint16 chunks");
-        return encode_delta3d(src, n, {int(shape[0]), int(shape[1]), int(shape[2])}, itemsize);
+        return encode_delta3d(src, n, {int(shape[0]), int(shape[1]), int(shape[2])}, itemsize, o.predictor);
     case Codec::Volcomp: {
         if (n != VOLCOMP_LIB_CHUNK_BYTES || itemsize != 1)
             throw std::invalid_argument("volcomp stores 128^3 uint8 chunks");

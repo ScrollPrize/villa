@@ -191,6 +191,8 @@ void writePyramidLevel(const fs::path& root, int level, const PyramidOptions& op
     readOptions.threads = 1;  // parallel across output chunks below
     auto src = openArray((root / std::to_string(level - 1)).string(), readOptions);
     auto dst = Writer::open(root / std::to_string(level));
+    if (!options.delta3dPredictor.empty())
+        dst.setDelta3dPredictor(options.delta3dPredictor);
     const auto& srcMeta = src.meta;
     const auto& meta = dst.meta();
     if (srcMeta.shape.size() != 3 || meta.shape.size() != 3 || srcMeta.dtype != meta.dtype)
