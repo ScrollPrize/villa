@@ -25,6 +25,7 @@ import hashlib
 import json
 import logging
 import math
+import multiprocessing as mp
 import os
 from pathlib import Path
 import shutil
@@ -178,7 +179,9 @@ def run(plan, args, log):
     log.info("%d of %d files to fetch with %d workers", len(todo), len(plan["jobs"]), args.workers)
     start, total, done, last = time.monotonic(), 0, 0, 0.0
     by_role = {}
-    with ProcessPoolExecutor(args.workers) as pool:
+    # spawn, not fork: a worker must not inherit the planner's SFTP connection (its transport thread does not
+    # survive a fork, and a forked worker waits on it forever)
+    with ProcessPoolExecutor(args.workers, mp_context=mp.get_context("spawn")) as pool:
         futures = [pool.submit(_run_job, j, str(args.output), args.remote, str(args.source_root), args.retries) for j in todo]
         roles = {f: j["role"] for f, j in zip(futures, todo)}
         for f in as_completed(futures):
