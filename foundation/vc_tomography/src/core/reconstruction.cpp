@@ -17,7 +17,7 @@
 #include "vc_tomography/reconstruction.hpp"
 #include "vc_tomography/projection_store.hpp"
 #include "io/json.hpp"
-#include "io/sha256.hpp"
+#include "vc_reader/native/sigv4.hpp"
 #include "io/text_file.hpp"
 #include "io/json_values.hpp"
 
@@ -264,7 +264,7 @@ struct Reconstruction::Impl {
         if (legacy() && (options.reduce || !options.projection_store.empty()))
             throw Error("mode legacy_reference reconstructs the detector's frames as stored, not a projection store's or reduced ones");
         geometry_file();
-        geometry_sha256 = Sha256().update(geometry_text).hex();
+        geometry_sha256 = vcr::to_hex(vcr::Sha256::of(geometry_text));
         geometry_doc = Json::parse(geometry_text);
         geometry = std::make_unique<geometry::Calibration>(geometry::Calibration::parse(geometry_text));
         const std::vector<std::string> made = geometry->scans();

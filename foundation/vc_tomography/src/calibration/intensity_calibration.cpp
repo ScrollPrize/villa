@@ -22,7 +22,7 @@
 #include "vc_tomography/raw_reader.hpp"
 #include "io/array_file.hpp"
 #include "io/json.hpp"
-#include "io/sha256.hpp"
+#include "vc_reader/native/sigv4.hpp"
 #include "common/numpy_sum.hpp"
 #include "io/text_file.hpp"
 
@@ -66,7 +66,7 @@ std::string file_state(const std::string& path) {
 }
 
 template <class T>
-void hash_values(Sha256& h, const std::vector<T>& v) {
+void hash_values(vcr::Sha256& h, const std::vector<T>& v) {
     h.update(v.data(), v.size() * sizeof(T));
 }
 
@@ -146,7 +146,7 @@ DetectorBlur blur_of(const Json& cal) {
 }
 
 std::string darks_flats_fingerprint(const Scan& scan) {
-    Sha256 h;
+    vcr::Sha256 h;
     h.update("vc_tomography_darks_flats_v" + std::to_string(kIntensityCalibrationVersion) + "|" + std::to_string(scan.rows) + "," + std::to_string(scan.cols));
     std::vector<const FrameList*> lists = {&scan.darks};
     for (const FrameList& f : scan.flats) lists.push_back(&f);
@@ -156,7 +156,7 @@ std::string darks_flats_fingerprint(const Scan& scan) {
         hash_values(h, r->frame_index);
     }
     for (const auto& c : scan.flats_control_A) hash_values(h, c);
-    return h.hex();
+    return vcr::to_hex(h.finish());
 }
 
 // 2 x 2 solve as LAPACK's dgesv does it (partial pivoting; throws when singular)
@@ -339,7 +339,7 @@ DetectorBlur measure_detector_blur(const Scan& scan, const float* dark, int n_fl
 std::string acquisition_fingerprint(const Scan& main, const Scan& companion) { return acquisition_fingerprint(std::vector<const Scan*>{&main, &companion}); }
 
 std::string acquisition_fingerprint(const std::vector<const Scan*>& scans) {
-    Sha256 h;
+    vcr::Sha256 h;
     h.update("vc_tomography_calibration_v" + std::to_string(kIntensityCalibrationVersion));
     for (const Scan* sc : scans) {
         Json flats = Json::list();
@@ -361,7 +361,7 @@ std::string acquisition_fingerprint(const std::vector<const Scan*>& scans) {
         h.update(file_state(sc->master));
         for (const std::string& f : sc->referenced_files()) h.update(file_state(f));
     }
-    return h.hex();
+    return vcr::to_hex(h.finish());
 }
 
 DarksFlats store_darks_flats(const Scan& scan, const std::string& tile_group, int reduce) {
@@ -463,10 +463,10 @@ IntensityCalibration calibrate_intensity(const std::vector<const Scan*>& scans, 
     const auto tag = [](std::size_t k) { return k == 0 ? std::string("main") : k == 1 ? std::string("companion") : "companion" + std::to_string(k); };
     cal.reduced.resize(S);
     if (store) {
-        Sha256 h;
+        vcr::Sha256 h;
         h.update("vc_tomography_calibration_v" + std::to_string(kIntensityCalibrationVersion) + "|store|" + projection_store + "|" + std::to_string(reduce));
         for (const Scan* sc : scans) h.update(sc->name + "|" + file_state(sc->master));
-        cal.fingerprint = h.hex();
+        cal.fingerprint = vcr::to_hex(h.finish());
         for (std::size_t k = 0; k < S; ++k) {
             const std::string group = projection_store_tile_group(projection_store, scans[k]->sample_name.empty() ? scans[k]->name : scans[k]->sample_name);
             say(log, "[" + tag(k) + "] darks and flats of " + scans[k]->name + " from " + group + " at 1/" + std::to_string(f));
