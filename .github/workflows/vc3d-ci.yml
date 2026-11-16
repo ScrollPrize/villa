@@ -98,6 +98,7 @@ jobs:
               - 'volume-cartographer/Dockerfile*'
               - 'volume-cartographer/cmake/**'
               - 'volume-cartographer/core/**'
+              - 'volume-cartographer/apps/CMakeLists.txt'
               - 'volume-cartographer/apps/VC3D/**'
               - 'volume-cartographer/utils/**'
               - 'volume-cartographer/libs/**'
@@ -146,16 +147,16 @@ jobs:
     if: needs.changes.outputs.test_core == 'true'
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 20
-    # Published by vc3d-publish-ghcr.yml; deps recipe hash: 675836fc3d478d17.
+    # Published by vc3d-publish-ghcr.yml; deps recipe hash: 6309e96d71462b0a.
     container:
-      image: ghcr.io/scrollprize/villa/volume-cartographer@sha256:1bebf104edbd6c290ddbaf8036c919635259f3722e8eddb31340b240baf1ed68
+      image: ghcr.io/scrollprize/villa/volume-cartographer@sha256:9407753393547c422c9689cb8da6b6f4415cc91ad8fa4d89eb476a3df540d7f8
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
     env:
       SCCACHE_GHA_ENABLED: 'true'
       SCCACHE_IGNORE_SERVER_IO_ERROR: '1'
-      SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-linux-ubuntu-26.04-deps-675836fc3d478d17-clang-quickbuild-o0
+      SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-linux-ubuntu-26.04-deps-6309e96d71462b0a-clang-quickbuild-o0
     steps:
       - name: Checkout Villa
         id: checkout
@@ -219,14 +220,14 @@ jobs:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 20
     container:
-      image: ghcr.io/scrollprize/villa/volume-cartographer@sha256:1bebf104edbd6c290ddbaf8036c919635259f3722e8eddb31340b240baf1ed68
+      image: ghcr.io/scrollprize/villa/volume-cartographer@sha256:9407753393547c422c9689cb8da6b6f4415cc91ad8fa4d89eb476a3df540d7f8
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
     env:
       SCCACHE_GHA_ENABLED: 'true'
       SCCACHE_IGNORE_SERVER_IO_ERROR: '1'
-      SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-linux-ubuntu-26.04-deps-675836fc3d478d17-clang-quickbuild-o0
+      SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-linux-ubuntu-26.04-deps-6309e96d71462b0a-clang-quickbuild-o0
     steps:
       - name: Checkout Villa
         id: checkout
@@ -278,14 +279,14 @@ jobs:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 20
     container:
-      image: ghcr.io/scrollprize/villa/volume-cartographer@sha256:1bebf104edbd6c290ddbaf8036c919635259f3722e8eddb31340b240baf1ed68
+      image: ghcr.io/scrollprize/villa/volume-cartographer@sha256:9407753393547c422c9689cb8da6b6f4415cc91ad8fa4d89eb476a3df540d7f8
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
     env:
       SCCACHE_GHA_ENABLED: 'true'
       SCCACHE_IGNORE_SERVER_IO_ERROR: '1'
-      SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-linux-ubuntu-26.04-deps-675836fc3d478d17-clang-quickbuild-o0
+      SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-linux-ubuntu-26.04-deps-6309e96d71462b0a-clang-quickbuild-o0
     steps:
       - name: Checkout Villa
         id: checkout
@@ -328,6 +329,9 @@ jobs:
             -DVC_QUICKBUILD_OPT_LEVEL=0 -DVC_USE_SCCACHE=ON \
             -DVC_TESTING=ON -DVC_BUILD_APPS=ON \
             -DVC_BUILD_FLATBOI=OFF
+          # Packaging only runs on main; catch install rules naming files the
+          # default build skips (cpack: "file INSTALL cannot find") here.
+          python3 scripts/check_install_rules.py build/ci-fast-vc3d
           # vc_object_server_app: the controller test's hosted part runs
           # against it (and fails without it).
           cmake --build build/ci-fast-vc3d --target VC3D vc_object_server_app --parallel 4
@@ -348,14 +352,14 @@ jobs:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 20
     container:
-      image: ghcr.io/scrollprize/villa/volume-cartographer@sha256:1bebf104edbd6c290ddbaf8036c919635259f3722e8eddb31340b240baf1ed68
+      image: ghcr.io/scrollprize/villa/volume-cartographer@sha256:9407753393547c422c9689cb8da6b6f4415cc91ad8fa4d89eb476a3df540d7f8
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
     env:
       SCCACHE_GHA_ENABLED: 'true'
       SCCACHE_IGNORE_SERVER_IO_ERROR: '1'
-      SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-linux-ubuntu-26.04-deps-675836fc3d478d17-clang-quickbuild-o0
+      SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-linux-ubuntu-26.04-deps-6309e96d71462b0a-clang-quickbuild-o0
     steps:
       - name: Checkout Villa
         id: checkout
@@ -409,14 +413,14 @@ jobs:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 20
     container:
-      image: ghcr.io/scrollprize/villa/volume-cartographer@sha256:1bebf104edbd6c290ddbaf8036c919635259f3722e8eddb31340b240baf1ed68
+      image: ghcr.io/scrollprize/villa/volume-cartographer@sha256:9407753393547c422c9689cb8da6b6f4415cc91ad8fa4d89eb476a3df540d7f8
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
     env:
       SCCACHE_GHA_ENABLED: 'true'
       SCCACHE_IGNORE_SERVER_IO_ERROR: '1'
-      SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-linux-ubuntu-26.04-deps-675836fc3d478d17-clang-quickbuild-o0
+      SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-linux-ubuntu-26.04-deps-6309e96d71462b0a-clang-quickbuild-o0
     steps:
       - name: Checkout Villa
         id: checkout
