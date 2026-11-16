@@ -109,6 +109,22 @@ Json numbers(const std::vector<double>& v) {
 // the stored middle (rows - 1) / 2 the terms' angles are for (rad_per_row: the angle between the exposure of one
 // stored row and the next). from_middle: the timing counts the rows to both sides of the middle row, and moving the
 // middle is no shift of the angle: it is left, the rows within (f - 1) / 2 of the middle off by that many rows' time.
+// a scan's per-projection terms and detector map (geometry.hpp) into its trajectory
+void set_terms(ScanTrajectory& t, const geometry::Terms& g, const geometry::Map& map) {
+    t.angles_deg = g.angles_deg;
+    t.row_offset = g.row_offset;
+    t.row_slope = g.row_slope;
+    t.slope_col = static_cast<float>(g.slope_col);
+    t.col_offset = g.col_offset;
+    t.col_slope = g.col_slope;
+    t.slope_row = static_cast<float>(g.slope_row);
+    t.col_scale = g.col_scale;
+    t.scale_col = static_cast<float>(g.scale_col);
+    t.row_scale = g.row_scale;
+    t.scale_row = static_cast<float>(g.scale_row);
+    t.map = map;
+}
+
 void terms_of_reduced_frames(geometry::Terms& T, int f, int rows_full, double rad_per_row, bool from_middle = false) {
     const int rows_r = rows_full / f;
     const double shift = from_middle ? 0.0 : (rad_per_row * (f * (rows_r - 1) / 2.0 - (rows_full - 1) / 2.0)) * (180.0 / M_PI);
@@ -319,12 +335,7 @@ struct Reconstruction::Impl {
                                                       (pl.shift_x - pl.x_readjustment) * f, pl.z_readjustment * f, origin);
             if (f > 1) terms_of_reduced_frames(terms[k], f, rows_stored, frames_per_row * recorded_angle_step(part_of(angles[k], used[k])) * (M_PI / 180.0), geometry->rows_from_middle());
         }
-        map = geometry->map();
-        if (f > 1) {
-            for (double& v : map.eu) v /= f;
-            for (double& v : map.ev) v /= f;
-            map.c0 /= f, map.cs /= f, map.v0 /= f, map.vs /= f;
-        }
+        map = f > 1 ? geometry->map().reduced(f) : geometry->map();
         // the time from the first row to the last of the frames read, in frame periods
         rolling_shutter = f > 1 ? frames_per_row * f * (rows_stored / f - 1) : geometry->rolling_shutter();
         rolling_shutter_from_middle = geometry->rows_from_middle();
@@ -374,27 +385,8 @@ struct Reconstruction::Impl {
             t.z_translation_scale = 1.0;
             return d;
         }
-        const geometry::Terms& g = terms[k];
-        t.angles_deg = g.angles_deg;
-        t.z_translation_scale = g.z_translation_scale;
-        t.row_offset = g.row_offset;
-        t.row_slope = g.row_slope;
-        t.slope_col = static_cast<float>(g.slope_col);
-        t.col_offset = g.col_offset;
-        t.col_slope = g.col_slope;
-        t.slope_row = static_cast<float>(g.slope_row);
-        t.col_scale = g.col_scale;
-        t.scale_col = static_cast<float>(g.scale_col);
-        t.row_scale = g.row_scale;
-        t.scale_row = static_cast<float>(g.scale_row);
-        t.map_i.assign(map.i.begin(), map.i.end());
-        t.map_j.assign(map.j.begin(), map.j.end());
-        t.map_eu = map.eu;
-        t.map_ev = map.ev;
-        t.map_c0 = map.c0;
-        t.map_cs = map.cs;
-        t.map_v0 = map.v0;
-        t.map_vs = map.vs;
+        set_terms(t, terms[k], map);
+        t.z_translation_scale = terms[k].z_translation_scale;
         return d;
     }
 
@@ -794,14 +786,7 @@ TileReconstruction tile_reconstructor(const std::string& master, const std::stri
         rad_per_row = member(member(cal, "row_time"), "rad_per_row").number;
     }
     geometry::Terms& T = out.terms;
-    const Json& m = member(cal, "map");
-    std::vector<double> eu, ev;
-    std::vector<std::int32_t> mi, mj;
-    for (const Json& v : member(m, "eu").array) eu.push_back(v.number);
-    for (const Json& v : member(m, "ev").array) ev.push_back(v.number);
-    for (const Json& v : member(m, "i").array) mi.push_back(static_cast<std::int32_t>(v.number));
-    for (const Json& v : member(m, "j").array) mj.push_back(static_cast<std::int32_t>(v.number));
-    double c0 = member(m, "c0").number, cs = member(m, "cs").number, v0 = member(m, "v0").number, vs = member(m, "vs").number;
+    geometry::Map map = geometry::parse_map(member(cal, "map").text());
     double pixel_size_m = scan.pixel_size_m * f;
     std::vector<float> dark = store_flats ? store_dark : red.dark, flats = store_flats ? store_flat_series : red.flats;
     int rows = rows_full, cols = cols_full;
@@ -823,9 +808,7 @@ TileReconstruction tile_reconstructor(const std::string& master, const std::stri
             w = std::move(wr);
         }
         terms_of_reduced_frames(T, f, rows_full, rad_per_row, rows_from_middle);
-        for (double& v : eu) v /= f;
-        for (double& v : ev) v /= f;
-        c0 /= f, cs /= f, v0 /= f, vs /= f;
+        map = map.reduced(f);
         rot_center /= f, rad_per_row *= f;
         rows = rows_r, cols = cols_r;
         (void)wx;
@@ -834,24 +817,12 @@ TileReconstruction tile_reconstructor(const std::string& master, const std::stri
 
     ScanData d;
     ScanTrajectory& tr = d.traj;
-    tr.angles_deg = T.angles_deg;
+    set_terms(tr, T, map);
     tr.z_translation_m = z;
     tr.pixel_size_m = pixel_size_m;
     tr.det_rows = rows;
     tr.det_cols = cols;
     tr.z_translation_scale = 1.0;
-    tr.row_offset = T.row_offset;
-    tr.row_slope = T.row_slope;
-    tr.slope_col = static_cast<float>(T.slope_col);
-    tr.col_offset = T.col_offset;
-    tr.col_slope = T.col_slope;
-    tr.slope_row = static_cast<float>(T.slope_row);
-    tr.col_scale = T.col_scale;
-    tr.scale_col = static_cast<float>(T.scale_col);
-    tr.row_scale = T.row_scale;
-    tr.scale_row = static_cast<float>(T.scale_row);
-    tr.map_i = mi, tr.map_j = mj, tr.map_eu = eu, tr.map_ev = ev;
-    tr.map_c0 = c0, tr.map_cs = cs, tr.map_v0 = v0, tr.map_vs = vs;
     d.control_A = control;
     d.flat_info.angles_deg.assign(scan.flats_unwrapped_angles_deg.begin(), scan.flats_unwrapped_angles_deg.end());
     d.dark = dark;

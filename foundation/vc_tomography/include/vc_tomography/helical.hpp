@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "vc_tomography/common.hpp"
+#include "vc_tomography/detector_map.hpp"
 
 namespace vc_tomography {
 
@@ -44,16 +45,13 @@ struct ScanTrajectory {
     std::vector<float> col_offset;
     std::vector<float> col_slope;
     float slope_row = 0;
-    // Detector map of this scan (detector_map.hpp; no terms: none): detector pixel (c, v) looks along the ray at the
-    // ideal position (c + Eu(c, v), v + Ev(c, v)), Eu = sum_k map_eu[k] x^map_i[k] y^map_j[k], Ev likewise with
-    // map_ev, x = (c - map_c0) / map_cs, y = (v - map_v0) / map_vs. Every projection is then read on the ideal
+    // Detector map of this scan (geometry::Map, detector_map.hpp; no terms: none): detector pixel (c, v) looks along
+    // the ray at the ideal position (c + Eu(c, v), v + Ev(c, v)). Every projection is then read on the ideal
     // grid: what the geometry (with the registration above) puts at the ideal position (X, Y) is read at the
     // detector position (c, v) with c + Eu(c, v) = X, v + Ev(c, v) = Y. The rows are solved wherever frames are
     // gridded; the columns where they are shifted exactly (x_interp = sinc), and a map with a lateral part is
     // refused elsewhere.
-    std::vector<int32_t> map_i, map_j;
-    std::vector<double> map_eu, map_ev;
-    double map_c0 = 0, map_cs = 1, map_v0 = 0, map_vs = 1;
+    geometry::Map map;
     // Scales of the projections' own, per projection (empty: none), in the map's convention and with or without a
     // map: pixel (c, v) of projection i looks at the ideal column c + Eu + col_scale[i] (c - scale_col) and at the
     // ideal row v + Ev + row_scale[i] (v - scale_row). col_scale is a lateral part (x_interp = sinc).

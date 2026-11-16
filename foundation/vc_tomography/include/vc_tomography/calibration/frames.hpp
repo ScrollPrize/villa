@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "vc_tomography/calibration/record.hpp"
+#include "vc_tomography/detector_map.hpp"
 
 namespace vc_tomography {
 class RawReader;
@@ -97,25 +98,9 @@ FlatField make_flat_field(Frames& frames);
 void line_integrals(const FlatField& ff, const std::uint16_t* raw, const std::int32_t* row0, std::size_t n, int nrows,
                     int col0, int ncols, bool flip_cols, float* out);
 
-// A detector map to be tested: pixel (c, v) looks along the ray at the ideal position (c + Eu(c, v), v + Ev(c, v)),
-// Eu = sum_k eu[k] x^i[k] y^j[k] and Ev likewise, x = (c - c0) / cs, y = (v - v0) / vs.
-struct DetectorMap {
-    double c0 = 0, cs = 1, v0 = 0, vs = 1;
-    std::vector<int> i, j;
-    std::vector<double> eu, ev;
-    // no term, or every coefficient zero: nothing is displaced, and blocks are cut from the frames as stored (a
-    // resampling at whole pixels returns the pixels: the same values, for the time of reading them)
-    bool empty() const {
-        for (double e : eu)
-            if (e != 0.0) return false;
-        for (double e : ev)
-            if (e != 0.0) return false;
-        return true;
-    }
-    void displacement(double c, double v, double& du, double& dv) const;
-    // the detector position (c, v) whose ray is the ideal position (x, y)
-    void source(double x, double y, double& c, double& v) const;
-};
+// A detector map to be tested (geometry::Map, detector_map.hpp): pixel (c, v) looks along the ray at the ideal
+// position (c + Eu(c, v), v + Ev(c, v)).
+using DetectorMap = geometry::Map;
 
 // The line integrals on the ideal grid of `map`: out(i, r, c) is the value at ideal row row0 + r and ideal column
 // col0 + c (col0 + ncols - 1 - c with flip_cols) of frame frame[i], read from the detector position the map puts

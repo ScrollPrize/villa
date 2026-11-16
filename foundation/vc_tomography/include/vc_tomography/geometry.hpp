@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "vc_tomography/common.hpp"
+#include "vc_tomography/detector_map.hpp"
 
 namespace vc_tomography {
 struct Json;
@@ -24,13 +25,9 @@ struct Json;
 
 namespace vc_tomography::geometry {
 
-// The detector's map: a polynomial in the column and the row,
-//     E(c, v) = sum_k e_k ((c - c0) / cs)^i_k ((v - v0) / vs)^j_k        for the columns (eu) and the rows (ev).
-struct Map {
-    std::vector<int> i, j;
-    std::vector<double> eu, ev;
-    double c0 = 0, cs = 1, v0 = 0, vs = 1;
-};
+// The detector's map: Map (detector_map.hpp). parse_map: from the JSON object a calibration stores it as
+// (keys i, j, eu, ev, c0, cs, v0, vs).
+Map parse_map(const std::string& json_object_text);
 
 // Powers (i, j) of the map: all of total order 2 to `order`, and (1, 0) (the rows' slope across the columns). The
 // other linear ones are a scale, a shear and a rotation of the grid, which cannot be told from the poses.

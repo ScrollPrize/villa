@@ -565,14 +565,7 @@ ScanData make_scan_data(DIn angles_deg, DIn z_translation_m, double pixel_size_m
                         float scale_row, int row_first, int row_end) {
     ScanData d;
     d.traj.row_first = row_first, d.traj.row_end = row_end;
-    d.traj.map_i = std::move(map_i);
-    d.traj.map_j = std::move(map_j);
-    d.traj.map_eu = std::move(map_eu);
-    d.traj.map_ev = std::move(map_ev);
-    d.traj.map_c0 = map_c0;
-    d.traj.map_cs = map_cs;
-    d.traj.map_v0 = map_v0;
-    d.traj.map_vs = map_vs;
+    d.traj.map = geometry::Map{std::move(map_i), std::move(map_j), std::move(map_eu), std::move(map_ev), map_c0, map_cs, map_v0, map_vs};
     d.traj.col_scale = std::move(col_scale);
     d.traj.scale_col = scale_col;
     d.traj.row_scale = std::move(row_scale);
@@ -605,19 +598,21 @@ ScanData make_scan_data(DIn angles_deg, DIn z_translation_m, double pixel_size_m
 
 // a detector map handed over from Python, planned for one detector (detector_map.hpp); `view` points into it
 struct PyDetectorMap {
-    std::vector<int32_t> i, j;
-    std::vector<double> eu, ev;
+    geometry::Map map;
+    std::vector<int32_t>& i = map.i;
+    std::vector<int32_t>& j = map.j;
+    std::vector<double>& eu = map.eu;
+    std::vector<double>& ev = map.ev;
     std::vector<float> ev_f;
     DetectorMapView view;
     DetectorMapPlan plan;
     PyDetectorMap(std::vector<int32_t> i_, std::vector<int32_t> j_, std::vector<double> eu_, std::vector<double> ev_, double c0,
                   double cs, double v0, double vs, int det_rows, int det_cols, double row_slope, double col_scale, double row_scale)
-        : i(std::move(i_)), j(std::move(j_)), eu(std::move(eu_)), ev(std::move(ev_)) {
+        : map{std::move(i_), std::move(j_), std::move(eu_), std::move(ev_), c0, cs, v0, vs} {
         require(j.size() == i.size() && eu.size() == i.size() && ev.size() == i.size(), "map_i, map_j, map_eu, map_ev: one value per term");
         ev_f.assign(ev.begin(), ev.end());
-        view.n = static_cast<int>(i.size());
-        view.i = i.data(); view.j = j.data(); view.eu = eu.data(); view.ev = ev.data(); view.ev_f = ev_f.data();
-        view.c0 = c0; view.cs = cs; view.v0 = v0; view.vs = vs;
+        view = map.view();
+        view.ev_f = ev_f.data();
         view.det_rows = det_rows; view.det_cols = det_cols;
         plan = detector_map_plan(view, row_slope, col_scale, row_scale);
         view.passes = plan.passes;

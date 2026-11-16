@@ -453,8 +453,8 @@ SliceReconstructor::SliceReconstructor(std::vector<ScanData> scans, ReconConfig 
             (!s.traj.row_scale.empty() && s.traj.row_scale.size() != s.traj.n()))
             throw Error("ScanData: per-projection arrays have inconsistent lengths");
     for (const auto& s : I.scans)
-        if (s.traj.map_j.size() != s.traj.map_i.size() || s.traj.map_eu.size() != s.traj.map_i.size() ||
-            s.traj.map_ev.size() != s.traj.map_i.size())
+        if (s.traj.map.j.size() != s.traj.map.i.size() || s.traj.map.eu.size() != s.traj.map.i.size() ||
+            s.traj.map.ev.size() != s.traj.map.i.size())
             throw Error("ScanData: the detector map's terms (map_i, map_j, map_eu, map_ev) have inconsistent lengths");
     if (I.scans.empty() || I.scans[0].traj.n() < 2) throw Error("SliceReconstructor: no scan");
     I.recorded_step = recorded_angle_step(I.scans[0].traj.angles_deg);
@@ -544,7 +544,7 @@ SliceReconstructor::SliceReconstructor(std::vector<ScanData> scans, ReconConfig 
         for (const auto& s : I.scans) {
             if (I.cfg.legacy_reference && (!s.traj.row_slope.empty() || !s.traj.col_offset.empty() || !s.traj.col_slope.empty()))
                 throw Error("legacy reference mode has no frame registration");
-            if (I.cfg.legacy_reference && (!s.traj.map_i.empty() || !s.traj.col_scale.empty() || !s.traj.row_scale.empty()))
+            if (I.cfg.legacy_reference && (!s.traj.map.i.empty() || !s.traj.col_scale.empty() || !s.traj.row_scale.empty()))
                 throw Error("legacy reference mode has no detector map and no frame scales");
             const float span = std::max(std::fabs(s.traj.slope_col), std::fabs(static_cast<float>(s.traj.det_cols - 1) - s.traj.slope_col));
             float roll = 0.f, slope = 0.f;
@@ -559,20 +559,15 @@ SliceReconstructor::SliceReconstructor(std::vector<ScanData> scans, ReconConfig 
             float col_scale = 0.f, row_scale = 0.f;
             for (float v : t.col_scale) col_scale = std::max(col_scale, std::fabs(v));
             for (float v : t.row_scale) row_scale = std::max(row_scale, std::fabs(v));
-            sm.host.n = static_cast<int>(t.map_i.size());
-            sm.host.i = t.map_i.data();
-            sm.host.j = t.map_j.data();
-            sm.host.eu = t.map_eu.data();
-            sm.host.ev = t.map_ev.data();
-            sm.host.c0 = t.map_c0; sm.host.cs = t.map_cs; sm.host.v0 = t.map_v0; sm.host.vs = t.map_vs;
+            sm.host = t.map.view();
             sm.host.det_rows = t.det_rows;
             sm.host.det_cols = t.det_cols;
             const DetectorMapPlan plan = detector_map_plan(sm.host, slope, col_scale, row_scale);
             sm.host.passes = plan.passes;
             sm.host.settle = plan.settle;
-            const bool ev = std::any_of(t.map_ev.begin(), t.map_ev.end(), [](double v) { return v != 0; });
-            const bool eu = std::any_of(t.map_eu.begin(), t.map_eu.end(), [](double v) { return v != 0; });
-            if (ev) sm.ev_f.assign(t.map_ev.begin(), t.map_ev.end());
+            const bool ev = std::any_of(t.map.ev.begin(), t.map.ev.end(), [](double v) { return v != 0; });
+            const bool eu = std::any_of(t.map.eu.begin(), t.map.eu.end(), [](double v) { return v != 0; });
+            if (ev) sm.ev_f.assign(t.map.ev.begin(), t.map.ev.end());
             sm.rows = ev || !t.row_scale.empty();
             sm.cols = eu || !t.col_scale.empty();
             if (sm.cols && !I.x_exact)
@@ -774,10 +769,10 @@ SliceReconstructor::SliceReconstructor(std::vector<ScanData> scans, ReconConfig 
             const ScanMap& sm = I.maps[I.dev.size()];
             d.map = sm.host;
             if (sm.host.n > 0) {
-                d.map_i.upload(s.traj.map_i.data(), s.traj.map_i.size());
-                d.map_j.upload(s.traj.map_j.data(), s.traj.map_j.size());
-                d.map_eu.upload(s.traj.map_eu.data(), s.traj.map_eu.size());
-                d.map_ev.upload(s.traj.map_ev.data(), s.traj.map_ev.size());
+                d.map_i.upload(s.traj.map.i.data(), s.traj.map.i.size());
+                d.map_j.upload(s.traj.map.j.data(), s.traj.map.j.size());
+                d.map_eu.upload(s.traj.map.eu.data(), s.traj.map.eu.size());
+                d.map_ev.upload(s.traj.map.ev.data(), s.traj.map.ev.size());
                 if (!sm.ev_f.empty()) d.map_ev_f.upload(sm.ev_f.data(), sm.ev_f.size());
                 d.map.i = d.map_i.data();
                 d.map.j = d.map_j.data();

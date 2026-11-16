@@ -1,7 +1,7 @@
 #pragma once
 // A detector map for the reconstruction: where on the detector the ray of an ideal position is recorded.
 //
-// The convention is vc_tomography::calibration::DetectorMap's (calibration/frames.hpp): detector pixel (c, v) looks along
+// The convention is geometry::Map's (below; also calibration::DetectorMap): detector pixel (c, v) looks along
 // the ray at the ideal position (c + Eu(c, v), v + Ev(c, v)), with
 //   Eu = sum_k eu[k] x^i[k] y^j[k],  Ev = sum_k ev[k] x^i[k] y^j[k],  x = (c - c0) / cs,  y = (v - v0) / vs.
 // The value wanted at the ideal position (X, Y) is therefore read at the detector position (c, v) that solves
@@ -30,6 +30,40 @@
 
 namespace vc_tomography {
 
+struct DetectorMapView;
+
+namespace geometry {
+
+// The detector's map: a polynomial in the column and the row,
+//     E(c, v) = sum_k e_k ((c - c0) / cs)^i_k ((v - v0) / vs)^j_k        for the columns (eu) and the rows (ev):
+// detector pixel (c, v) looks along the ray at the ideal position (c + Eu(c, v), v + Ev(c, v)). The geometry
+// calibration solves it (geometry.hpp), the calibration's measurements resample with it (calibration::DetectorMap)
+// and the reconstruction reads every projection on the ideal grid with it (ScanTrajectory::map).
+struct Map {
+    std::vector<std::int32_t> i, j;
+    std::vector<double> eu, ev;
+    double c0 = 0, cs = 1, v0 = 0, vs = 1;
+
+    // no term, or every coefficient zero: nothing is displaced
+    bool empty() const;
+    // (Eu, Ev) at (c, v), the powers formed by repeated products as the reconstruction forms them
+    void displacement(double c, double v, double& du, double& dv) const;
+    // the detector position (c, v) whose ray is the ideal position (x, y) (three fixed-point passes)
+    void source(double x, double y, double& c, double& v) const;
+    // a view of the terms in host memory (n, i, j, eu, ev, c0, cs, v0, vs; the rest as given)
+    DetectorMapView view() const;
+    // the same map in the pixels of frames read at 1/f (every position and displacement over f)
+    Map reduced(int f) const {
+        Map m = *this;
+        for (double& v : m.eu) v /= f;
+        for (double& v : m.ev) v /= f;
+        m.c0 /= f, m.cs /= f, m.v0 /= f, m.vs /= f;
+        return m;
+    }
+};
+
+}  // namespace geometry
+
 constexpr int detector_map_max_power = 8;       // largest power of x or y of a term
 constexpr int detector_map_max_terms = 64;
 constexpr int detector_map_col_margin = 32;     // columns beyond the detector over which the map is still evaluated
@@ -51,6 +85,14 @@ struct DetectorMapView {
     int passes = 0;                 // fixed-point passes (detector_map_plan)
     double settle = 0;              // a pass that changes (Eu, Ev) by no more leaves less than the tolerance
 };
+
+inline DetectorMapView geometry::Map::view() const {
+    DetectorMapView v;
+    v.n = static_cast<int>(i.size());
+    v.i = i.data(), v.j = j.data(), v.eu = eu.data(), v.ev = ev.data();
+    v.c0 = c0, v.cs = cs, v.v0 = v0, v.vs = vs;
+    return v;
+}
 
 struct DetectorMapPlan {
     int passes = 0;

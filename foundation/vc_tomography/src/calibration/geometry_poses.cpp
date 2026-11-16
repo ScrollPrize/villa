@@ -175,6 +175,11 @@ struct Knots {
 
 // ---------------------------------------------------------------- the map
 
+Map parse_map(const std::string& json_object_text) {
+    const Json doc = Json::dict().set("map", Json::parse(json_object_text));
+    return map_of(doc);
+}
+
 double overlap_centre(int cols, double move) {
     const double C = cols;
     return 0.5 * (std::max(0.0, -move) + std::min(C - 1, C - 1 - move));
