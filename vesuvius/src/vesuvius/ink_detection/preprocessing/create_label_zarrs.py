@@ -216,15 +216,29 @@ def write_label_pyramid(
         overwrite=overwrite,
     )
     datasets[0][DEFAULT_LABEL_SLICE] = image_2d
-    _write_levels_above_zero(output_path, levels, downsample_mode, chunk_workers)
+    _write_levels_above_zero(output_path, datasets, downsample_mode, chunk_workers)
 
 
 def _write_levels_above_zero(
-    output_path: Path, levels: int, downsample_mode: str, chunk_workers: int
+    output_path: Path,
+    datasets: Sequence[ZarrWriter],
+    downsample_mode: str,
+    chunk_workers: int,
 ) -> None:
-    for level in range(1, levels):
+    for level, dataset in enumerate(datasets[1:], start=1):
+        chunks = dataset.chunks
+        label_chunk = DEFAULT_LABEL_SLICE // chunks[0]
+        plane_chunks = tuple(
+            (size + chunk - 1) // chunk
+            for size, chunk in zip(dataset.shape[1:], chunks[1:])
+        )
         write_pyramid_level(
-            output_path, level, factors=(1, 2, 2), reduction=downsample_mode, threads=chunk_workers
+            output_path,
+            level,
+            factors=(1, 2, 2),
+            reduction=downsample_mode,
+            threads=chunk_workers,
+            chunk_range=((label_chunk, 0, 0), (label_chunk + 1, *plane_chunks)),
         )
 
 
@@ -289,7 +303,7 @@ def convert_image(
             overwrite=overwrite,
         )
         _write_streamed_tiff_level_zero(input_path, datasets[0])
-        _write_levels_above_zero(output_path, levels, downsample_mode, chunk_workers)
+        _write_levels_above_zero(output_path, datasets, downsample_mode, chunk_workers)
     else:
         write_label_pyramid(
             load_image(input_path),
