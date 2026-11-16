@@ -2,6 +2,8 @@
 // acquisition record against itself and against the raw frames. The work is in C++ (vc_tomography/calibration/*.hpp).
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
+
+#include "ndarray_utils.hpp"
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
 #include <limits>
@@ -25,12 +27,7 @@ namespace {
 using Block = nb::ndarray<const float, nb::ndim<3>, nb::c_contig, nb::device::cpu>;
 
 // "cpu", "cuda", or "auto": CUDA when the build has it and a GPU is usable
-Device device_from(const std::string& name) {
-    if (name == "cpu") return Device::CPU;
-    if (name == "cuda") return Device::CUDA;
-    if (name == "auto") return cuda_available() ? Device::CUDA : Device::CPU;
-    throw Error("device is 'cpu', 'cuda' or 'auto'");
-}
+Device device_from(const std::string& name) { return parse_device(name, true); }
 
 std::string check_record_json(const std::vector<std::string>& scans, const std::string& checks, const std::string& out_dir, const std::string& inventory_dir,
                         int frames, int rows, int blocks, int threads, const std::string& device, double position_target, int columns, double column_fraction) {
@@ -98,20 +95,6 @@ struct PyRegistrar {
     }
 };
 
-template <class T, class V>
-nb::ndarray<nb::numpy, T> array_from(const V& v, std::initializer_list<std::size_t> shape) {
-    std::size_t total = 1;
-    for (std::size_t s : shape) total *= s;
-    if (total != v.size()) throw Error("calibration: array size does not match its shape");
-    T* data = new T[total ? total : 1];
-    std::copy(v.begin(), v.end(), data);
-    nb::capsule owner(data, [](void* p) noexcept { delete[] static_cast<T*>(p); });
-    return nb::ndarray<nb::numpy, T>(data, shape.size(), shape.begin(), owner);
-}
-template <class V>
-nb::ndarray<nb::numpy, double> vector_array(const V& v) {
-    return array_from<double>(v, {v.size()});
-}
 
 using FrameList = nb::ndarray<const std::int64_t, nb::ndim<1>, nb::c_contig, nb::device::cpu>;
 using RowList = nb::ndarray<const std::int32_t, nb::ndim<1>, nb::c_contig, nb::device::cpu>;
@@ -151,22 +134,22 @@ struct PySession {
     // per-frame (or per-reading) series of a stretch, as the record states them
     nb::ndarray<nb::numpy, double> series(int scan, int index, const std::string& name) const {
         const Stretch& st = stretch(scan, index);
-        if (name == "angle_deg") return vector_array(stated_angle(st));
-        if (name == "height_mm") return vector_array(stated_height(s->record(scan), st));
-        if (name == "epoch_trig") return vector_array(st.epoch_trig);
-        if (name == "timer_trig") return vector_array(st.timer_trig);
-        if (name == "timer_delta") return vector_array(st.timer_delta);
-        if (name == "timer_period") return vector_array(st.timer_period);
-        if (name == "rot_trig") return vector_array(st.rot_trig);
-        if (name == "rot_delta") return vector_array(st.rot_delta);
-        if (name == "z_trig") return vector_array(st.z_trig);
-        if (name == "z_center") return vector_array(st.z_center);
-        if (name == "z_delta") return vector_array(st.z_delta);
-        if (name == "epoch") return vector_array(st.epoch);
-        if (name == "time_of_frame") return vector_array(st.files.time_of_frame);
-        if (name == "stat_avg") return vector_array(st.stat_avg);
-        if (name == "monitor_epoch") return vector_array(st.monitor.epoch);
-        if (name == "monitor_current") return vector_array(st.monitor.current);
+        if (name == "angle_deg") return vc_tomography::py::to_numpy(stated_angle(st));
+        if (name == "height_mm") return vc_tomography::py::to_numpy(stated_height(s->record(scan), st));
+        if (name == "epoch_trig") return vc_tomography::py::to_numpy(st.epoch_trig);
+        if (name == "timer_trig") return vc_tomography::py::to_numpy(st.timer_trig);
+        if (name == "timer_delta") return vc_tomography::py::to_numpy(st.timer_delta);
+        if (name == "timer_period") return vc_tomography::py::to_numpy(st.timer_period);
+        if (name == "rot_trig") return vc_tomography::py::to_numpy(st.rot_trig);
+        if (name == "rot_delta") return vc_tomography::py::to_numpy(st.rot_delta);
+        if (name == "z_trig") return vc_tomography::py::to_numpy(st.z_trig);
+        if (name == "z_center") return vc_tomography::py::to_numpy(st.z_center);
+        if (name == "z_delta") return vc_tomography::py::to_numpy(st.z_delta);
+        if (name == "epoch") return vc_tomography::py::to_numpy(st.epoch);
+        if (name == "time_of_frame") return vc_tomography::py::to_numpy(st.files.time_of_frame);
+        if (name == "stat_avg") return vc_tomography::py::to_numpy(st.stat_avg);
+        if (name == "monitor_epoch") return vc_tomography::py::to_numpy(st.monitor.epoch);
+        if (name == "monitor_current") return vc_tomography::py::to_numpy(st.monitor.current);
         throw Error("calibration session: no series named " + name);
     }
     double positioner_of(int scan, int index, const std::string& name, bool end) const { return positioner(stretch(scan, index), name, end); }
@@ -263,7 +246,7 @@ struct PySession {
             nb::gil_scoped_release nogil;
             ff = &s->flat_field(scan);
         }
-        return array_from<float>(dark ? ff->dark : ff->gain, {static_cast<std::size_t>(ff->rows), static_cast<std::size_t>(ff->cols)});
+        return vc_tomography::py::to_numpy(dark ? ff->dark : ff->gain, {static_cast<std::size_t>(ff->rows), static_cast<std::size_t>(ff->cols)});
     }
 
     static std::vector<ViewRequest> requests_from(const nb::list& requests) {
@@ -483,9 +466,9 @@ void bind_calibration(nb::module_& m) {
         nb::dict d = fit_summary_dict(s);
         d["active"] = s.active;
         d["unused"] = s.unused;
-        d["x"] = vector_array(s.x);
-        d["residual"] = vector_array(s.residual);
-        d["weight"] = vector_array(s.weight);
+        d["x"] = vc_tomography::py::to_numpy(s.x);
+        d["residual"] = vc_tomography::py::to_numpy(s.residual);
+        d["weight"] = vc_tomography::py::to_numpy(s.weight);
         d["spread"] = s.spread;
         d["rank"] = s.rank;
         return d;
@@ -499,7 +482,7 @@ void bind_calibration(nb::module_& m) {
         RefillSolution s;
         { nb::gil_scoped_release nogil; s = fit_refill_shots(x.data(), x.shape(0), static_cast<int>(x.shape(1)), T, E, pre); }
         auto d = fit_summary_dict(s);
-        d["x"] = vector_array(s.x); d["residual"] = vector_array(s.residual); d["shots"] = nb::cast(s.shots);
+        d["x"] = vc_tomography::py::to_numpy(s.x); d["residual"] = vc_tomography::py::to_numpy(s.residual); d["shots"] = nb::cast(s.shots);
         d["noise"] = s.noise; d["row_time_se"] = s.row_time_se; d["uncertainty_available"] = s.uncertainty_available;
         return d;
     }, "x"_a, "period"_a, "exposure"_a, "pre"_a, "Ceres exposure-integrated refill fit of (frames, rows) logarithmic levels, with covariance diagnostics.");

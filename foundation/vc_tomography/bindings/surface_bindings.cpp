@@ -15,14 +15,8 @@ using namespace nb::literals;
 using vc_tomography::py::new_array_t;
 namespace hs = vc_tomography::surface;
 
-namespace {
-nb::object array_of(const std::vector<float>& v, std::vector<std::size_t> shape) {
-    auto a = new_array_t<float>(shape);
-    std::copy(v.begin(), v.end(), static_cast<float*>(a.data()));
-    return nb::cast(a, nb::rv_policy::move);
-}
-nb::object json_loads(const std::string& t) { return nb::module_::import_("json").attr("loads")(t); }
-}  // namespace
+using vc_tomography::py::json_loads;
+using vc_tomography::py::to_numpy_object;
 
 void bind_surface(nb::module_& m) {
     nb::class_<hs::BandComposite>(m, "BandComposite",
@@ -49,12 +43,7 @@ void bind_surface(nb::module_& m) {
         .def(
             "run",
             [](hs::BandComposite& b, int chunk, bool timing, std::vector<std::string> sweep, bool prefetch, std::optional<std::function<void(int, int, double)>> progress) {
-                std::function<void(int, int, double)> p;
-                if (progress)
-                    p = [progress](int d, int n, double s) {
-                        nb::gil_scoped_acquire gil;
-                        (*progress)(d, n, s);
-                    };
+                std::function<void(int, int, double)> p = vc_tomography::py::py_callback(progress);
                 std::string r;
                 {
                     nb::gil_scoped_release nogil;
@@ -65,11 +54,11 @@ void bind_surface(nb::module_& m) {
             "chunk"_a = 64, "timing"_a = false, "sweep"_a = std::vector<std::string>{}, "prefetch"_a = true, "progress"_a = nb::none(),
             "Reconstruct h_range in chunks; sweep: one filter chain per value set (JSON text). Returns seconds per stage and 'wall'")
         .def("layers", [](const hs::BandComposite& b, int set) {
-            return array_of(b.layers(set), {static_cast<std::size_t>(b.L()), static_cast<std::size_t>(b.H()), static_cast<std::size_t>(b.W())});
+            return to_numpy_object(b.layers(set), {static_cast<std::size_t>(b.L()), static_cast<std::size_t>(b.H()), static_cast<std::size_t>(b.W())});
         }, "set"_a = 0)
         .def("composites", [](const hs::BandComposite& b, int set) {
             const auto c = b.composites(set);
             const std::vector<std::size_t> s{static_cast<std::size_t>(b.H()), static_cast<std::size_t>(b.W())};
-            return nb::make_tuple(array_of(c[0], s), array_of(c[1], s));
+            return nb::make_tuple(to_numpy_object(c[0], s), to_numpy_object(c[1], s));
         }, "set"_a = 0, "(max, mean) over the layers (vc_reader's composite::reduce)");
 }

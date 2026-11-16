@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "vc_tomography/fourier.hpp"
+#include "cpu/fftw_plan.hpp"
 
 namespace vc_tomography {
 std::mutex& fftw_planner_mutex() {
@@ -20,8 +21,6 @@ std::mutex& fftw_planner_mutex() {
 namespace vc_tomography::cpu {
 
 namespace {
-
-std::mutex& planner_mutex() { return fftw_planner_mutex(); }
 
 struct FftwBuf {
     float* real = nullptr;
@@ -43,21 +42,13 @@ class FftwFourierFilter final : public FourierFilter {
         rows_ = p.ndim == 2 ? p.ph : 1;
         nc_ = static_cast<std::size_t>(p.pw / 2 + 1);
         FftwBuf tmp(static_cast<std::size_t>(rows_) * p.pw, rows_ * nc_);
-        std::lock_guard<std::mutex> lock(planner_mutex());
-        if (p.ndim == 2) {
-            fwd_ = fftwf_plan_dft_r2c_2d(p.ph, p.pw, tmp.real, tmp.cplx, FFTW_ESTIMATE);
-            inv_ = fftwf_plan_dft_c2r_2d(p.ph, p.pw, tmp.cplx, tmp.real, FFTW_ESTIMATE);
-        } else {
-            fwd_ = fftwf_plan_dft_r2c_1d(p.pw, tmp.real, tmp.cplx, FFTW_ESTIMATE);
-            inv_ = fftwf_plan_dft_c2r_1d(p.pw, tmp.cplx, tmp.real, FFTW_ESTIMATE);
-        }
-        if (!fwd_ || !inv_) throw Error("fftw planning failed");
+        fwd_ = make_fftw_plan([&] {
+            return p.ndim == 2 ? fftwf_plan_dft_r2c_2d(p.ph, p.pw, tmp.real, tmp.cplx, FFTW_ESTIMATE) : fftwf_plan_dft_r2c_1d(p.pw, tmp.real, tmp.cplx, FFTW_ESTIMATE);
+        });
+        inv_ = make_fftw_plan([&] {
+            return p.ndim == 2 ? fftwf_plan_dft_c2r_2d(p.ph, p.pw, tmp.cplx, tmp.real, FFTW_ESTIMATE) : fftwf_plan_dft_c2r_1d(p.pw, tmp.cplx, tmp.real, FFTW_ESTIMATE);
+        });
         norm_ = 1.f / static_cast<float>(static_cast<std::size_t>(rows_) * p.pw);
-    }
-    ~FftwFourierFilter() override {
-        std::lock_guard<std::mutex> lock(planner_mutex());
-        fftwf_destroy_plan(fwd_);
-        fftwf_destroy_plan(inv_);
     }
 
     void apply(const float* in, float* out, int n_frames, void*) override {
@@ -117,7 +108,7 @@ class FftwFourierFilter final : public FourierFilter {
     }
 
   private:
-    fftwf_plan fwd_ = nullptr, inv_ = nullptr;
+    FftwfPlan fwd_, inv_;
     int rows_ = 1;
     std::size_t nc_ = 0;
     float norm_ = 1.f;

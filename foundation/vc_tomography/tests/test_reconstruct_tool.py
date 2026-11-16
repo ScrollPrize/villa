@@ -4,9 +4,7 @@ turn; 200 x 240 frames) with a geometry calibration made up for it (tests/test_g
 modes and formats, uint8 alone, the reference volume's mask, previews, the config file, and what is refused."""
 import json
 import os
-import shutil
 import subprocess
-from pathlib import Path
 
 import numpy as np
 import pytest
@@ -15,12 +13,14 @@ from vc_tomography import _core
 from vc_tomography import geometry as G
 from vc_tomography.recon import HelicalRecon
 
+from helpers import find_tool
+
 h5py = pytest.importorskip("h5py")
 tifffile = pytest.importorskip("tifffile")
 from test_geometry import _synthetic_geometry  # noqa: E402
 
 # the executable: beside the extension in a build tree, else on the PATH (an installed package)
-TOOL = next((str(t) for t in (Path(_core.__file__).resolve().parent / "vc_tomography_reconstruct",) if t.exists()), None) or shutil.which("vc_tomography_reconstruct")
+TOOL = find_tool("vc_tomography_reconstruct")
 pytestmark = pytest.mark.skipif(TOOL is None, reason="vc_tomography_reconstruct is not built")
 ROWS, COLS, PIXEL_UM = 200, 240, 8.64
 

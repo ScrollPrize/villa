@@ -4,7 +4,6 @@ a surface reconstructed straight from the projections of the synthetic acquisiti
 the same points of whole reconstructed slices."""
 import json
 import os
-import shutil
 import subprocess
 from pathlib import Path
 
@@ -15,11 +14,13 @@ from vc_tomography import _core
 from vc_tomography.band import BandComposite
 from vc_tomography.recon import HelicalRecon
 
+from helpers import find_tool
+
 tifxyz = pytest.importorskip("vc_reader.tifxyz")
 tifffile = pytest.importorskip("tifffile")
 from test_reconstruct_tool import acquisition  # noqa: E402,F401  (the fixture)
 
-TOOL = next((str(t) for t in (Path(_core.__file__).resolve().parent / "vc_tomography_composite",) if t.exists()), None) or shutil.which("vc_tomography_composite")
+TOOL = find_tool("vc_tomography_composite")
 
 
 def _plane(path, z, rows=40, cols=60, x0=10.0, y0=12.0):

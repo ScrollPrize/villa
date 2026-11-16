@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "io/json.hpp"
+#include "io/text_file.hpp"
 
 namespace vc_tomography::command_line {
 
@@ -37,12 +38,6 @@ struct Spec {
         return nullptr;
     }
 };
-
-inline void put(Json& j, const std::string& key, Json v) {
-    for (auto& kv : j.object)
-        if (kv.first == key) return void(kv.second = std::move(v));
-    j.object.emplace_back(key, std::move(v));
-}
 
 inline Json value_of(char kind, const std::string& t, const std::string& name) {
     try {
@@ -72,10 +67,10 @@ inline Json parse(int argc, char** argv, const Spec& spec) {
         if (arg.empty() || arg[0] != '-') {
             if (spec.positional_many) {
                 Json list = a.find(spec.positional) ? *a.find(spec.positional) : Json::list();
-                put(a, spec.positional, list.add(Json::of(arg)));
+                a.put(spec.positional, list.add(Json::of(arg)));
             } else {
                 if (a.find(spec.positional)) fail("unexpected argument '" + arg + "'");
-                put(a, spec.positional, Json::of(arg));
+                a.put(spec.positional, Json::of(arg));
             }
             continue;
         }
@@ -91,7 +86,7 @@ inline Json parse(int argc, char** argv, const Spec& spec) {
         const Option* s = spec.find(name);
         if (!s || name == spec.positional) fail("unknown option " + arg);
         if (s->nargs == 0) {
-            put(a, name, Json::of_bool(true));
+            a.put(name, Json::of_bool(true));
             continue;
         }
         std::vector<std::string> vals;
@@ -105,37 +100,28 @@ inline Json parse(int argc, char** argv, const Spec& spec) {
             while (i + 1 < argc && (argv[i + 1][0] != '-' || std::isdigit(static_cast<unsigned char>(argv[i + 1][1])) || argv[i + 1][1] == '.'))
                 vals.push_back(argv[++i]);
         if (s->nargs == 1) {
-            put(a, name, value_of(s->kind, vals[0], name));
+            a.put(name, value_of(s->kind, vals[0], name));
         } else if (s->nargs == -2) {
             Json list = a.find(name) ? *a.find(name) : Json::list();
-            put(a, name, list.add(Json::of(vals[0])));
+            a.put(name, list.add(Json::of(vals[0])));
         } else {
             Json list = Json::list();
             for (const auto& v : vals) list.add(value_of(s->kind, v, name));
-            put(a, name, list);
+            a.put(name, list);
         }
     }
     return a;
 }
 
-inline std::string read_text(const std::string& path) {
-    std::ifstream in(path);
-    if (!in) fail("cannot read " + path);
-    return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-}
-
-inline void write_text(const std::string& path, const std::string& text) {
-    std::ofstream o(path);
-    o << text << "\n";
-    if (!o) fail("cannot write " + path);
-}
+using io::read_text;
+using io::write_text;
 
 // The options in effect: `defaults`, then the --config file's (keys: option names; "_..." ignored; `adapt` may
 // rename or reinterpret a key and returns false for one it does not know), then the command line's
 inline Json in_effect(Json defaults, const Json& given, const Spec& spec, const std::function<bool(const std::string&, const Json&, Json&)>& adapt = nullptr) {
     const auto merge = [&](const Json& from) {
         for (const auto& [k, v] : from.object)
-            if (k != "config") put(defaults, k, v);
+            if (k != "config") defaults.put(k, v);
     };
     if (const Json* config = given.find("config")) {
         const Json file = Json::parse(read_text(config->string));
@@ -147,7 +133,7 @@ inline Json in_effect(Json defaults, const Json& given, const Spec& spec, const 
             std::replace(k.begin(), k.end(), '-', '_');
             if (adapt && adapt(k, v, clean)) continue;
             if (!spec.find(k)) unknown.push_back(k);
-            else put(clean, k, v);
+            else clean.put(k, v);
         }
         if (!unknown.empty()) {
             std::sort(unknown.begin(), unknown.end());

@@ -5,22 +5,18 @@
 #include <algorithm>
 
 #include "cuda_utils.cuh"
+#include "cufft_utils.cuh"
 #include "vc_tomography/fourier.hpp"
 
 namespace vc_tomography::cuda {
 
 namespace {
 
-void cufft_check(cufftResult r, const char* what) {
-    if (r != CUFFT_SUCCESS) throw Error(std::string("cuFFT error ") + std::to_string(r) + " in " + what);
-}
-
 // one thread per padded sample; `rows` = padded rows per item (ph, or 1 for 1D rows)
 __global__ void pad_kernel(const float* __restrict__ in, float* __restrict__ out, int n_items, int rows,
                            int pw, int h, int w, int pad_top, int pad_left, PadMode mode, bool two_d) {
     const size_t total = static_cast<size_t>(n_items) * rows * pw;
-    for (size_t k = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x; k < total;
-         k += static_cast<size_t>(gridDim.x) * blockDim.x) {
+    VC_TOMOGRAPHY_GRID_STRIDE(k, total) {
         const int c = static_cast<int>(k % pw);
         const int r = static_cast<int>((k / pw) % rows);
         const size_t item = k / (static_cast<size_t>(pw) * rows);
@@ -33,8 +29,7 @@ __global__ void pad_kernel(const float* __restrict__ in, float* __restrict__ out
 
 __global__ void multiply_kernel(cufftComplex* __restrict__ data, const float* __restrict__ filter,
                                 const float* __restrict__ filter_imag, size_t per_item, size_t total, float norm) {
-    for (size_t k = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x; k < total;
-         k += static_cast<size_t>(gridDim.x) * blockDim.x) {
+    VC_TOMOGRAPHY_GRID_STRIDE(k, total) {
         const float fr = filter[k % per_item] * norm;
         if (!filter_imag) {
             data[k].x *= fr;
@@ -51,8 +46,7 @@ __global__ void multiply_kernel(cufftComplex* __restrict__ data, const float* __
 __global__ void multiply_copy_kernel(const cufftComplex* __restrict__ src, cufftComplex* __restrict__ dst,
                                      const float* __restrict__ filter, const float* __restrict__ filter_imag,
                                      size_t per_item, size_t total, float norm) {
-    for (size_t k = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x; k < total;
-         k += static_cast<size_t>(gridDim.x) * blockDim.x) {
+    VC_TOMOGRAPHY_GRID_STRIDE(k, total) {
         const float fr = filter[k % per_item] * norm;
         const float re = src[k].x, im = src[k].y;
         if (!filter_imag) {
@@ -68,8 +62,7 @@ __global__ void multiply_copy_kernel(const cufftComplex* __restrict__ src, cufft
 __global__ void crop_kernel(const float* __restrict__ in, float* __restrict__ out, int n_items, int rows,
                             int pw, int out_rows, int w, int pad_top, int pad_left) {
     const size_t total = static_cast<size_t>(n_items) * out_rows * w;
-    for (size_t k = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x; k < total;
-         k += static_cast<size_t>(gridDim.x) * blockDim.x) {
+    VC_TOMOGRAPHY_GRID_STRIDE(k, total) {
         const int c = static_cast<int>(k % w);
         const int r = static_cast<int>((k / w) % out_rows);
         const size_t item = k / (static_cast<size_t>(w) * out_rows);
@@ -77,7 +70,6 @@ __global__ void crop_kernel(const float* __restrict__ in, float* __restrict__ ou
     }
 }
 
-unsigned grid_for(size_t n) { return static_cast<unsigned>(std::min<size_t>((n + 255) / 256, 65535u * 16u)); }
 
 class CufftFourierFilter final : public FourierFilter {
   public:

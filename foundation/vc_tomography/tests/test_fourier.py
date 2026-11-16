@@ -21,7 +21,6 @@ def numpy_reference(stack, ndim, ph, pw, top, left, mode, filt):
     return out
 
 
-@pytest.mark.parametrize("device", vc_tomography.devices())
 @pytest.mark.parametrize("mode", list(MODES))
 @pytest.mark.parametrize("ndim", [1, 2])
 def test_fourier_filter_matches_numpy(device, mode, ndim):

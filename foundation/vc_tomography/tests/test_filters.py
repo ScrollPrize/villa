@@ -5,8 +5,9 @@ import pytest
 import vc_tomography
 from vc_tomography import filters
 
+from helpers import cuda_only
+
 PH = dict(energy_kev=116.0, distance_m=1.19, pixel_size_m=8.64e-6, det_rows=1200, det_cols=2528)
-cuda_only = pytest.mark.skipif(not vc_tomography.cuda_available(), reason="no CUDA")
 
 
 def test_compile_fusion_and_margins():
@@ -40,7 +41,6 @@ def median_ref(a, r):
     return np.median(win.reshape(n, H, W, -1), -1)
 
 
-@pytest.mark.parametrize("device", vc_tomography.devices())
 @pytest.mark.parametrize("r", [1, 2, 3])
 def test_median(device, r):
     a = np.random.default_rng(r).standard_normal((3, 17, 23)).astype(np.float32)
@@ -89,7 +89,6 @@ def test_gaussian_preserves_constant():
     np.testing.assert_allclose(out, 3.0, rtol=1e-5)
 
 
-@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_python_filter(device):
     seen = {}
 

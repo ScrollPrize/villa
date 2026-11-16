@@ -357,7 +357,7 @@ std::array<double, 3> residual_of(const Acquisition& acq, const Parameters& p, c
     const double t = time_of(acq, row_time, c.b);
     const double step = at_frame(sb.course.angle_deg, t + 0.5) - at_frame(sb.course.angle_deg, t - 0.5);
     double dth = b.angle_deg - a.angle_deg - (c.opposite ? 180.0 : 0.0);
-    dth -= 360.0 * std::round(dth / 360.0);
+    dth = wrap180(dth);
     double rows = b.z - a.z;
     if (c.a.scan == c.b.scan) rows -= model::own_lift(p.scans[static_cast<std::size_t>(c.a.scan)].height_once, when_a, when_b);
     else if (!c.opposite)  // two scans at one angle: the pitch's term (opposite views of two scans: the rows as they are, which the solve leaves out)
@@ -365,7 +365,6 @@ std::array<double, 3> residual_of(const Acquisition& acq, const Parameters& p, c
     return {step != 0 ? dth / step : 0.0, rows, c.opposite ? b.s + a.s : b.s - a.s};
 }
 
-double median(std::vector<double> v) { return median_of(std::move(v)); }
 
 }  // namespace
 
@@ -696,7 +695,7 @@ GeometrySolution solve_once(const Acquisition& acq, const std::vector<Comparison
         for (int j = 0; j < 3; ++j) {
             std::vector<double> v;
             for (std::size_t i : members) v.push_back(out.residual[i][static_cast<std::size_t>(j)]);
-            l.rms[j] = rms_of(v), l.median[j] = median(v);
+            l.rms[j] = rms_of(v), l.median[j] = median_of(v);
         }
         out.left.push_back(l);
     }
@@ -709,7 +708,7 @@ GeometrySolution solve_once(const Acquisition& acq, const std::vector<Comparison
         for (int j = 0; j < 3; ++j) {
             std::vector<double> v;
             for (std::size_t i : members) v.push_back(out.lens_residual[i][static_cast<std::size_t>(j)]);
-            l.rms[j] = rms_of(v), l.median[j] = median(v);
+            l.rms[j] = rms_of(v), l.median[j] = median_of(v);
         }
         out.left.push_back(l);
     }

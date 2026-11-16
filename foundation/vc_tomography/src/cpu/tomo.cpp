@@ -15,6 +15,9 @@
 #include "common/tomo_core.hpp"
 #include "vc_tomography/tomo.hpp"
 #include "vc_tomography/sino.hpp"
+#include "cpu/fftw_plan.hpp"
+#include "../common/elementwise_core.hpp"
+#include "each.hpp"
 
 namespace vc_tomography {
 
@@ -90,7 +93,6 @@ float span_factor(const float* angles, int n) {
 namespace cpu {
 
 namespace {
-std::mutex& fftw_mutex() { return fftw_planner_mutex(); }
 
 // gridrec for one slice of (weighted) rows; out N x N per-pixel image, row-major [iy][ix]
 void gridrec_slice(const float* data, int NG, int ND, const float* angles, float center, int N, const TomoArgs& a,
@@ -107,14 +109,12 @@ void gridrec_slice(const float* data, int NG, int ND, const float* angles, float
     const float tblspcg = 2.f * kLtbl / L;
     std::vector<cf> H(static_cast<std::size_t>(pdim) * pdim, cf(0));
     std::vector<cf> sino(pdim);
-    fftwf_plan rev, fwd2;
-    {
-        std::lock_guard<std::mutex> lock(fftw_mutex());
-        rev = fftwf_plan_dft_1d(pdim, reinterpret_cast<fftwf_complex*>(sino.data()), reinterpret_cast<fftwf_complex*>(sino.data()),
-                                FFTW_BACKWARD, FFTW_ESTIMATE);
-        fwd2 = fftwf_plan_dft_2d(pdim, pdim, reinterpret_cast<fftwf_complex*>(H.data()), reinterpret_cast<fftwf_complex*>(H.data()),
-                                 FFTW_FORWARD, FFTW_ESTIMATE);
-    }
+    const FftwfPlan rev = make_fftw_plan([&] {
+        return fftwf_plan_dft_1d(pdim, reinterpret_cast<fftwf_complex*>(sino.data()), reinterpret_cast<fftwf_complex*>(sino.data()), FFTW_BACKWARD, FFTW_ESTIMATE);
+    });
+    const FftwfPlan fwd2 = make_fftw_plan([&] {
+        return fftwf_plan_dft_2d(pdim, pdim, reinterpret_cast<fftwf_complex*>(H.data()), reinterpret_cast<fftwf_complex*>(H.data()), FFTW_FORWARD, FFTW_ESTIMATE);
+    });
     std::vector<float> wu(8), wv(8);
     for (int p = 0; p < NG; ++p) {
         const float sp = std::sin(angles[p]), cp = std::cos(angles[p]);
@@ -140,11 +140,6 @@ void gridrec_slice(const float* data, int NG, int ND, const float* angles, float
         }
     }
     fftwf_execute(fwd2);
-    {
-        std::lock_guard<std::mutex> lock(fftw_mutex());
-        fftwf_destroy_plan(rev);
-        fftwf_destroy_plan(fwd2);
-    }
     // The image origin is the pipeline's centre (N - 1) / 2: pixel
     // o = (N - 1) / 2 for odd N; for even N the FFT origin is o = N / 2 and the half-pixel offset was applied as a
     // phase above (grid_shift). The de-apodisation table is centred on o, and H's U axis (cos) runs along x, V (sin)
@@ -278,15 +273,9 @@ struct CpuBackend final : TomoWorkspace {
             }
     }
     template <class F>
-    void each(std::size_t n, const F& f) {
-#pragma omp parallel for schedule(static)
-        for (long i = 0; i < static_cast<long>(n); ++i) f(static_cast<std::size_t>(i));
-    }
+    void each(std::size_t n, const F& f) { cpu::each(n, f); }
     void fill(float* d, float v, std::size_t n) { std::fill(d, d + n, v); }
-    void weighted_rows(const float* rows, const float* w, float* out, std::size_t n) {
-#pragma omp parallel for schedule(static)
-        for (long i = 0; i < static_cast<long>(n); ++i) out[i] = rows[i] * w[i];
-    }
+    void weighted_rows(const float* rows, const float* w, float* out, std::size_t n) { each(n, elementwise::Product{rows, w, out}); }
     void gridrec(const float* wrows, float* out, const TomoArgs& a) {
         gridrec_slice(wrows, n_angles, g.n_det, angles.data(), g.rot, g.N, a, out);
     }

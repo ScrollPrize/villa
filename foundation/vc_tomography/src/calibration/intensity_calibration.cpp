@@ -24,6 +24,7 @@
 #include "io/json.hpp"
 #include "io/sha256.hpp"
 #include "common/numpy_sum.hpp"
+#include "io/text_file.hpp"
 
 namespace vc_tomography::calibration {
 
@@ -42,10 +43,7 @@ std::string fmt(const char* format, double v) {
     return b;
 }
 
-bool exists(const std::string& path) {
-    struct stat st;
-    return ::stat(path.c_str(), &st) == 0;
-}
+using io::exists;
 
 std::string join(const std::string& dir, const std::string& name) { return dir.empty() || dir.back() == '/' ? dir + name : dir + "/" + name; }
 
@@ -503,8 +501,7 @@ IntensityCalibration calibrate_intensity(const std::vector<const Scan*>& scans, 
     std::optional<Json> cached;
     if (have_arrays && !json_path.empty() && exists(json_path)) {
         try {
-            std::ifstream in(json_path);
-            const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+            const std::string text = io::read_text(json_path);
             Json j = Json::parse(text);
             if (text_of(j.find("fingerprint")) == cal.fingerprint && number_of(j.find("version"), -1) == kIntensityCalibrationVersion) cached = std::move(j);
         } catch (const Error&) {
@@ -615,13 +612,7 @@ IntensityCalibration calibrate_intensity(const std::vector<const Scan*>& scans, 
         cal.detector_blur = measure_detector_blur(main, cal.reduced[0].dark.data(), 200, log, cal.lit);
         if (!cache_dir.empty()) {
             make_dirs(cache_dir);
-            const std::string tmp = json_path + ".tmp" + std::to_string(static_cast<long>(::getpid()));
-            {
-                std::ofstream o(tmp);
-                o << cal.json() << "\n";
-                if (!o) throw Error("cannot write " + tmp);
-            }
-            if (std::rename(tmp.c_str(), json_path.c_str()) != 0) throw Error("cannot write " + json_path);
+            io::write_text_atomic(json_path, cal.json());
         }
     }
     if (S == 2)

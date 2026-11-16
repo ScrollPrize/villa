@@ -3,9 +3,18 @@
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
 
+#include <nanobind/stl/function.h>
+#include <nanobind/stl/optional.h>
+#include <nanobind/stl/string.h>
+
+#include <algorithm>
 #include <cstring>
+#include <functional>
 #include <initializer_list>
+#include <iterator>
+#include <optional>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include "vc_tomography/common.hpp"
@@ -37,6 +46,39 @@ nb::ndarray<nb::numpy, T> new_array_t(const std::vector<std::size_t>& shape) {
     return nb::ndarray<nb::numpy, T>(p, shape.size(), shape.data(), owner);
 }
 
+// A NumPy copy of a container of numbers (shape: its length when not given), owning its memory
+template <class V, class T = std::decay_t<decltype(*std::begin(std::declval<const V&>()))>>
+nb::ndarray<nb::numpy, T> to_numpy(const V& v, std::vector<std::size_t> shape = {}) {
+    const std::size_t n = static_cast<std::size_t>(std::distance(std::begin(v), std::end(v)));
+    if (shape.empty()) shape = {n};
+    std::size_t total = 1;
+    for (std::size_t s : shape) total *= s;
+    if (total != n) throw Error("an array's values do not fill its shape");
+    auto a = new_array_t<T>(shape);
+    std::copy(std::begin(v), std::end(v), static_cast<T*>(a.data()));
+    return a;
+}
+// the same as an object: a property's reference_internal policy does not apply to an array that owns its memory
+template <class V>
+nb::object to_numpy_object(const V& v, std::vector<std::size_t> shape = {}) {
+    return nb::cast(to_numpy(v, std::move(shape)), nb::rv_policy::move);
+}
+
+inline nb::object json_loads(const std::string& text) { return nb::module_::import_("json").attr("loads")(text); }
+
+// a Python callable (None: nothing) to be called from C++ while the GIL is released: each call takes the GIL
+template <class... A>
+std::function<void(A...)> py_callback(const std::optional<std::function<void(A...)>>& f) {
+    if (!f) return nullptr;
+    return [f](A... a) {
+        nb::gil_scoped_acquire gil;
+        (*f)(a...);
+    };
+}
+using LogFn = std::function<void(const std::string&)>;
+// a log line handed to a Python callable (None: silent), with the GIL taken for it
+inline LogFn python_log(const std::optional<LogFn>& log) { return py_callback(log); }
+
 using IntIn = nb::ndarray<const int32_t, nb::ndim<1>, nb::c_contig, nb::device::cpu>;
 
 inline std::vector<std::size_t> shape_of(const HostIn& a) {
@@ -45,14 +87,7 @@ inline std::vector<std::size_t> shape_of(const HostIn& a) {
     return s;
 }
 
-inline Device parse_device(const std::string& d) {
-    if (d == "cpu") return Device::CPU;
-    if (d == "cuda") {
-        if (!cuda_available()) throw Error("device='cuda' requested but CUDA is not available");
-        return Device::CUDA;
-    }
-    throw Error("unknown device '" + d + "' (expected 'cpu' or 'cuda')");
-}
+using vc_tomography::parse_device;
 
 inline void require(bool ok, const std::string& msg) {
     if (!ok) throw Error(msg);

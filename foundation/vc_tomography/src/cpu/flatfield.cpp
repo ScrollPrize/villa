@@ -1,6 +1,4 @@
-#include <algorithm>
-#include <cmath>
-
+#include "../common/flatfield_core.hpp"
 #include "vc_tomography/kernels.hpp"
 
 namespace vc_tomography::cpu {
@@ -11,9 +9,7 @@ void flatfield(const float* raw, const float* dark, const float* flat, float* ou
 #pragma omp parallel for schedule(static)
     for (std::ptrdiff_t k = 0; k < total; ++k) {
         const std::size_t i = static_cast<std::size_t>(k) % n_pix;
-        float v = (raw[k] - dark[i]) / (flat[i] - dark[i]);
-        v = std::max(v, p.threshold);  // also maps NaN (0/0) to threshold
-        out[k] = p.take_log ? -std::log(v) : v;
+        out[k] = flatfield_core::value(raw[k], dark[i], flat[i], p.threshold, p.take_log);
     }
 }
 

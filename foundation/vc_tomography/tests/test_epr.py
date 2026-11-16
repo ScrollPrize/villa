@@ -4,10 +4,11 @@ import pytest
 
 import vc_tomography
 
+from helpers import cuda_only
+
 PH = dict(energy_kev=116.0, distance_m=1.19, pixel_size_m=8.64e-6, det_rows=1200, det_cols=2528)
 DB = 1000.0
 PAGANIN = [{"type": "paganin", "delta_beta": DB}]
-cuda_only = pytest.mark.skipif(not vc_tomography.cuda_available(), reason="no CUDA")
 
 
 def epr(**kw):
@@ -54,7 +55,6 @@ def test_no_iterations_is_paganin():
                                   vc_tomography.apply_filters(det[None], PAGANIN, 20, **PH))
 
 
-@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_closer_to_the_object_than_paganin(device):
     """Ray shifts of a fraction of a pixel (Paganin's estimate: up to ~0.8): the second-order model removes about
     half of Paganin's error; with shifts of a few hundredths of a pixel it changes next to nothing."""

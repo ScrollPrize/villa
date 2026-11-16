@@ -6,6 +6,8 @@
 #include "common/interp_core.hpp"
 #include "vc_tomography/accumulate.hpp"
 #include "vc_tomography/sino.hpp"
+#include "../common/elementwise_core.hpp"
+#include "each.hpp"
 
 namespace vc_tomography {
 
@@ -224,15 +226,8 @@ void luminosity_apply(float* R, const float* RW, const float* W_prev, const floa
         }
 }
 
-void add_into(float* R, const float* A, std::size_t n) {
-#pragma omp parallel for schedule(static)
-    for (std::ptrdiff_t i = 0; i < static_cast<std::ptrdiff_t>(n); ++i) R[i] += A[i];
-}
-
-void divide(float* R, const float* RW, std::size_t n) {
-#pragma omp parallel for schedule(static)
-    for (std::ptrdiff_t i = 0; i < static_cast<std::ptrdiff_t>(n); ++i) R[i] = RW[i] > 0 ? R[i] / RW[i] : 0.f;
-}
+void add_into(float* R, const float* A, std::size_t n) { each(n, elementwise::AddInto{R, A}); }
+void divide(float* R, const float* RW, std::size_t n) { each(n, elementwise::Divide{R, RW}); }
 
 void mend_null_weights(float* R, const float* RW, int L, int H, int NX, float thr, int x0, int x1) {
 #pragma omp parallel for collapse(2)

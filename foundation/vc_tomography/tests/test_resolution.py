@@ -2,13 +2,14 @@
 gridding at the measured angles (angle_interp) and the exposure-arc deconvolution."""
 import json
 
-import h5py
 import numpy as np
 import pytest
 
 import vc_tomography
 from vc_tomography import _core
 from test_sirt_pipeline import helical_scan, recon
+
+from helpers import raw_scan, cuda_only
 
 PH = dict(energy_kev=116.0, distance_m=1.19, pixel_size_m=8.64e-6, det_rows=1200, det_cols=2528)
 MTF = {"type": "mtf_paganin", "delta_beta": 1000, "sigma": 1.06, "nsr": 0.01}
@@ -84,7 +85,7 @@ def test_mtf_paganin_target_form():
             vc_tomography.filter_margin([bad], **PH)
 
 
-@pytest.mark.skipif(not vc_tomography.cuda_available(), reason="no CUDA")
+@cuda_only
 @pytest.mark.parametrize("chain", [MTF, {"type": "mtf_paganin", "delta_beta": 1000, "sigma": 1.06}], ids=["wiener", "target"])
 def test_mtf_paganin_cpu_cuda_agree(chain):
     a = np.random.default_rng(0).uniform(0.5, 1.5, (3, 151, 200)).astype(np.float32)
@@ -176,14 +177,7 @@ def row_scan(tmp_path, nr=32, values=None, angles=None, name="rows", nu=NU):
                               (len(z), nr, nd)).astype(np.uint16)
     else:
         raw = np.broadcast_to(np.asarray(values)[:, None, None], (len(z), nr, nd)).astype(np.uint16)
-    path = tmp_path / f"{name}.h5"
-    with h5py.File(path, "w") as f:
-        f.create_dataset("data", data=raw, chunks=(1, nr, nd))
-    reader = _core.RawReader([str(path)], "data", nr, nd)
-    scan = _core.make_scan_data(angles, z.astype(np.float64) * .01, .01, nr, nd, 0, 0., 0., np.full(len(z), .2),
-                                np.array([0], np.float32), np.zeros((nr, nd), np.float32),
-                                np.full((1, nr, nd), 50000, np.float32), np.ones((nr, nd), np.float32), reader,
-                                np.zeros(len(z), np.int32), np.arange(len(z), dtype=np.int32))
+    scan = raw_scan(tmp_path / f"{name}.h5", raw, angles, z * .01)
     return scan, angles, z, raw
 
 
@@ -225,7 +219,6 @@ def vertical_reference(raw, z, h, kind, log_first, nr):
     return np.array(out) if log_first else -np.log(out)
 
 
-@pytest.mark.parametrize("device", vc_tomography.devices())
 @pytest.mark.parametrize("backprojector", ["fbp", "sirt"])   # padded intensity / measured-only line integrals
 def test_vertical_kernel(tmp_path, device, backprojector):
     kw = dict(backprojector=backprojector, tomo_params={"num_iter": "1"} if backprojector == "sirt" else {})
@@ -254,7 +247,6 @@ def test_vertical_kernel(tmp_path, device, backprojector):
         recon(scan, device, z_interp="bspline3", **kw)
 
 
-@pytest.mark.parametrize("device", vc_tomography.devices())
 @pytest.mark.parametrize("backprojector", ["fbp", "sirt"])
 def test_vertical_kernel_lanczos8(tmp_path, device, backprojector):
     """z_interp=lanczos8: 16 rows, the given weights; at 0.4 cycles per row, where lanczos3 loses a fifth of the
@@ -275,7 +267,6 @@ def test_vertical_kernel_lanczos8(tmp_path, device, backprojector):
     assert err["lanczos3"] > 3e-3 and err["lanczos8"] < 0.4 * err["lanczos3"], err   # (measured: 4.95e-3, 1.25e-3)
 
 
-@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_vertical_kernel_chunks_and_read_ahead(tmp_path, device):
     scan, *_ = helical_scan(tmp_path)
     kw = dict(backprojector="fbp", z_interp="lanczos3", filters=[{"type": "paganin", "delta_beta": 1000.}], pixel_size_m=1e-5)
@@ -294,7 +285,6 @@ def test_vertical_kernel_chunks_and_read_ahead(tmp_path, device):
 
 
 # ------------------------------------------------------------------ angle_interp
-@pytest.mark.parametrize("device", vc_tomography.devices())
 @pytest.mark.parametrize("backprojector", ["fbp", "sirt"])
 def test_nearest_angle_bins(tmp_path, device, backprojector):
     """angles off the grid and slowly drifting, one projection missing: each projection lands whole in its bin, and
@@ -329,7 +319,6 @@ def test_nearest_angle_bins(tmp_path, device, backprojector):
         recon(scan, device, angle_interp="cubic", **kw)
 
 
-@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_nearest_angles_reconstruct_the_phantom(tmp_path, device):
     scan, *_ = helical_scan(tmp_path)      # angles 0.17 of a step off the grid
     yy, xx = np.mgrid[:17, :17] - 8
@@ -366,7 +355,6 @@ def test_arc_deblur_taps():
         _core.arc_deblur_taps(2.0)
 
 
-@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_angular_fir(device):
     rng = np.random.default_rng(5)
     s = rng.standard_normal((40, 9)).astype(np.float32)
@@ -382,7 +370,6 @@ def test_angular_fir(device):
     np.testing.assert_allclose(out[~touched], ref[~touched], atol=2e-6)
 
 
-@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_exposure_arc_in_the_pipeline(tmp_path, device):
     scan, *_ = helical_scan(tmp_path, holes=True)
     g = np.asarray(_core.arc_deblur_taps(0.9), np.float32)
@@ -402,7 +389,6 @@ def test_exposure_arc_in_the_pipeline(tmp_path, device):
             recon(scan, device, backprojector="fbp", **bad)
 
 
-@pytest.mark.parametrize("device", vc_tomography.devices())
 @pytest.mark.parametrize("backprojector", ["fbp", "ghbp"])
 def test_pipeline_ramp_filter(tmp_path, device, backprojector):
     # the reconstructor's ramp is ramp_filter with the configured window; the default is the Ram-Lak ramp

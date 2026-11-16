@@ -6,7 +6,8 @@ import pytest
 import vc_tomography
 from vc_tomography import _core
 
-cuda_only = pytest.mark.skipif(not vc_tomography.cuda_available(), reason="no CUDA")
+from helpers import cuda_only
+
 
 
 @cuda_only
@@ -39,7 +40,6 @@ def trilinear(vol, z, y, x):
     return out
 
 
-@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_band_matches_full_backprojection(device):
     rng = np.random.default_rng(7)
     N, n_angles, n_det, nz = 96, 180, 140, 6

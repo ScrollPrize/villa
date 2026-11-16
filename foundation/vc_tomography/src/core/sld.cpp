@@ -13,23 +13,15 @@
 #include "common/sld_core.hpp"
 #include "vc_tomography/filters.hpp"
 #include "vc_tomography/fourier.hpp"
+#include "cpu/fftw_plan.hpp"
 
 namespace vc_tomography {
 
 namespace {
 std::vector<std::complex<double>> real_fft(std::vector<double>& data, int h, int w) {
     std::vector<std::complex<double>> spectrum(static_cast<std::size_t>(h) * (w / 2 + 1));
-    fftw_plan plan;
-    {
-        std::lock_guard<std::mutex> lock(fftw_planner_mutex());
-        plan = fftw_plan_dft_r2c_2d(h, w, data.data(), reinterpret_cast<fftw_complex*>(spectrum.data()), FFTW_ESTIMATE);
-    }
-    if (!plan) throw Error("sld: FFT planning failed");
+    const FftwPlan plan = make_fftw_plan([&] { return fftw_plan_dft_r2c_2d(h, w, data.data(), reinterpret_cast<fftw_complex*>(spectrum.data()), FFTW_ESTIMATE); });
     fftw_execute(plan);
-    {
-        std::lock_guard<std::mutex> lock(fftw_planner_mutex());
-        fftw_destroy_plan(plan);
-    }
     return spectrum;
 }
 }  // namespace

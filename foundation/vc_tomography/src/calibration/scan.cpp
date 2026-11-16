@@ -22,6 +22,9 @@
 #include "calibration/nxtomo.hpp"
 #include "calibration/unwrap.hpp"
 #include "vc_tomography/common.hpp"
+#include "io/text_file.hpp"
+#include "calibration/stats.hpp"
+#include "io/json_values.hpp"
 
 namespace vc_tomography::calibration {
 
@@ -82,15 +85,8 @@ std::string dirname(const std::string& p) {
     return head;
 }
 
-bool is_file(const std::string& p) {
-    struct stat st;
-    return ::stat(p.c_str(), &st) == 0 && S_ISREG(st.st_mode);
-}
-
-bool is_dir(const std::string& p) {
-    struct stat st;
-    return ::stat(p.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
-}
+using io::is_dir;
+using io::is_file;
 
 std::vector<std::string> list_dir(const std::string& d) {
     std::vector<std::string> names;
@@ -150,15 +146,6 @@ double interp(double x, const std::vector<double>& xp, const std::vector<double>
     return r;
 }
 
-double median(std::vector<double> v) {
-    if (v.empty()) return kNaN;
-    for (double x : v)
-        if (std::isnan(x)) return kNaN;
-    std::sort(v.begin(), v.end());
-    const std::size_t n = v.size();
-    return n % 2 ? v[n / 2] : (v[n / 2 - 1] + v[n / 2]) / 2.0;
-}
-
 // numpy.isclose(a, b, rtol, atol)
 bool is_close(double a, double b, double rtol, double atol) {
     if (std::isnan(a) || std::isnan(b)) return false;
@@ -212,11 +199,7 @@ bool is_group(hid_t f, const std::string& path) {
     return info.type == H5O_TYPE_GROUP;
 }
 
-std::string strip(const std::string& s) {
-    const std::size_t a = s.find_first_not_of(" \t\n\r\f\v");
-    if (a == std::string::npos) return std::string();
-    return s.substr(a, s.find_last_not_of(" \t\n\r\f\v") - a + 1);
-}
+using io::strip;
 
 std::string units(hid_t f, const std::string& path) { return strip(h5::attribute_text(f, path, "units")); }
 

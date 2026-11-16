@@ -241,7 +241,7 @@ def slices(a):
     for i in a.slices:
         name = "h%+05d_%s" % (h0 + i, a.name)
         tifffile.imwrite(out / (name + ".tif"), res[i])
-        tifffile.imwrite(out / (name + "_uint8.tif"), np.clip((res[i] - lo) / (hi - lo) * 255, 0, 255).astype(np.uint8))
+        tifffile.imwrite(out / (name + "_uint8.tif"), np.clip(np.rint((res[i] - lo) / (hi - lo) * 255), 0, 255).astype(np.uint8))
         print("height %d: %s.tif; before sd %.4f, after %.4f; changed by %.4f rms" % (h0 + i, out / name, float(z[a.key][i].std()), float(res[i].std()), float((res[i] - z[a.key][i]).std())), flush=True)
 
 

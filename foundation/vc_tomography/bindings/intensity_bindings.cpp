@@ -9,7 +9,7 @@
 #include "vc_tomography/calibration/intensity.hpp"
 #include "vc_tomography/calibration/transfer.hpp"
 #include "vc_tomography/raw_reader.hpp"
-#include "ndarray_utils.hpp"
+#include "conversions.hpp"
 
 namespace nb = nanobind;
 using namespace nb::literals;
@@ -38,28 +38,12 @@ nb::ndarray<nb::numpy, T> gauss(Arr<T> a, int axis, double sigma, const std::str
     return out;
 }
 
-template <class T>
-nb::object array_of(const std::vector<T>& v, std::vector<std::size_t> shape) {
-    auto a = new_array_t<T>(shape);
-    std::copy(v.begin(), v.end(), static_cast<T*>(a.data()));
-    return nb::cast(a, nb::rv_policy::move);
-}
+using vc_tomography::py::json_loads;
+using vc_tomography::py::python_log;
+using vc_tomography::py::to_numpy_object;
 
-nb::object darks_flats_tuple(const calibration::DarksFlats& d) {
-    const std::size_t r = static_cast<std::size_t>(d.rows), c = static_cast<std::size_t>(d.cols);
-    return nb::make_tuple(array_of(d.dark, {r, c}), array_of(d.flats, {d.series(), r, c}));
-}
+using vc_tomography::py::darks_flats_tuple;
 
-// a log line handed to a Python callable (None: silent), with the GIL taken for it
-std::function<void(const std::string&)> python_log(const std::optional<std::function<void(const std::string&)>>& log) {
-    if (!log) return nullptr;
-    return [log](const std::string& line) {
-        nb::gil_scoped_acquire gil;
-        (*log)(line);
-    };
-}
-
-nb::object json_loads(const std::string& text) { return nb::module_::import_("json").attr("loads")(text); }
 
 calibration::Scan scan_of(nb::handle h) { return nb::cast<calibration::Scan>(h); }
 
@@ -125,12 +109,12 @@ void bind_intensity(nb::module_& m) {
             [](const IC& c) {
                 const std::size_t r = static_cast<std::size_t>(c.rows), k = static_cast<std::size_t>(c.cols);
                 nb::dict d;
-                d["weight_map"] = array_of(c.weight_map, {r, k});
+                d["weight_map"] = to_numpy_object(c.weight_map, {r, k});
                 for (std::size_t s = 0; s < c.scans.size(); ++s) {  // main, companion, companion2, ..
                     const std::string tag = s == 0 ? "main" : s == 1 ? "companion" : "companion" + std::to_string(s);
-                    d[nb::str((tag + "_dark").c_str())] = array_of(c.reduced[s].dark, {r, k});
-                    d[nb::str((tag + "_flats").c_str())] = array_of(c.reduced[s].flats, {c.reduced[s].series(), r, k});
-                    d[nb::str((tag + "_weight").c_str())] = array_of(c.weight[s], {r, k});
+                    d[nb::str((tag + "_dark").c_str())] = to_numpy_object(c.reduced[s].dark, {r, k});
+                    d[nb::str((tag + "_flats").c_str())] = to_numpy_object(c.reduced[s].flats, {c.reduced[s].series(), r, k});
+                    d[nb::str((tag + "_weight").c_str())] = to_numpy_object(c.weight[s], {r, k});
                 }
                 return d;
             },
@@ -188,12 +172,7 @@ void bind_intensity(nb::module_& m) {
         "reduce_darks_flats",
         [](nb::handle scan, std::optional<std::function<void(std::size_t)>> progress) {
             const calibration::Scan s = scan_of(scan);
-            std::function<void(std::size_t)> p;
-            if (progress)
-                p = [progress](std::size_t k) {
-                    nb::gil_scoped_acquire gil;
-                    (*progress)(k);
-                };
+            std::function<void(std::size_t)> p = vc_tomography::py::py_callback(progress);
             calibration::DarksFlats d;
             {
                 nb::gil_scoped_release nogil;
@@ -251,7 +230,7 @@ void bind_intensity(nb::module_& m) {
                 nb::gil_scoped_release nogil;
                 f = calibration::flat_noise_spectra(s, dark.data(), n_flats, tile);
             }
-            return nb::make_tuple(array_of(f.power, {f.ys.size(), f.xs.size(), static_cast<std::size_t>(tile), static_cast<std::size_t>(tile / 2 + 1)}), f.ys, f.xs,
+            return nb::make_tuple(to_numpy_object(f.power, {f.ys.size(), f.xs.size(), static_cast<std::size_t>(tile), static_cast<std::size_t>(tile / 2 + 1)}), f.ys, f.xs,
                                   f.n_flats);
         },
         "scan"_a, "dark"_a, "n_flats"_a = 200, "tile"_a = calibration::kBlurTile,
@@ -304,12 +283,7 @@ void bind_intensity(nb::module_& m) {
                 require(dark->ndim() == 2 && dark->shape(0) == rows && dark->shape(1) == cols, "mean_frames: the dark is not a frame");
                 require(control_A->ndim() == 1 && control_A->shape(0) == n, "mean_frames: one ring current per frame");
             }
-            std::function<void(std::size_t)> report;
-            if (progress)
-                report = [&](std::size_t k) {
-                    nb::gil_scoped_acquire gil;
-                    (*progress)(k);
-                };
+            std::function<void(std::size_t)> report = vc_tomography::py::py_callback(progress);
             auto out = new_array_t<float>({rows, cols});
             std::vector<float> mean;
             {
@@ -412,12 +386,4 @@ void bind_intensity(nb::module_& m) {
               return a;
           },
           "Lx"_a, "w_left"_a, "w_right"_a, "min_val"_a = 1e-8f, "sh_left"_a = 0, "sh_right"_a = 0);
-    m.def("weight_border_v",
-          [](int L, double tw, int crop_top, int crop_bottom) {
-              auto v = calibration::weight_border_v(L, tw, crop_top, crop_bottom);
-              HostOut a = new_array({v.size()});
-              std::copy(v.begin(), v.end(), data(a));
-              return a;
-          },
-          "L"_a, "transition_width"_a, "crop_top"_a = 0, "crop_bottom"_a = 0);
 }

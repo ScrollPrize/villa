@@ -2,14 +2,14 @@
 where the detector is taller than the travel per turn) are each filtered and backprojected at their own angle instead
 of being averaged at their mean. The sinogram kernels for rows over more than one turn (rebalance_turns, the arc
 filter and the ramp's padding without the wrap to one turn), and the pipeline."""
-import h5py
 import numpy as np
 import pytest
 
 import vc_tomography
 from vc_tomography import _core
 
-cuda_only = pytest.mark.skipif(not vc_tomography.cuda_available(), reason="no CUDA")
+from helpers import raw_scan, cuda_only
+
 
 
 # ------------------------------------------------------------------ kernels
@@ -25,7 +25,6 @@ def mirror(w, rot):
     return out
 
 
-@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_rebalance_turns(device):
     rng = np.random.default_rng(1)
     turn, n_proj, rows, cols, rot = 8, 21, 3, 11, 6.0
@@ -87,7 +86,6 @@ def test_rebalance_turns(device):
         np.testing.assert_allclose(w, w0, rtol=2e-6, atol=1e-7)
 
 
-@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_ramp_filter_with_named_opposite_rows(device):
     rng = np.random.default_rng(9)
     n, nd, rot = 16, 40, 27.3                    # (an axis off the middle: the rows are padded from their opposite rows)
@@ -129,14 +127,8 @@ def blob_scan(tmp_path, per_turn, shutter=0.0, travel=15.0, turns=4.0, skip=(), 
     for x0, y0, s, a in BLOBS:
         line += a * np.sqrt(2 * np.pi) * s * np.exp(-.5 * ((coord[None, None] - (x0 * np.cos(theta) + y0 * np.sin(theta))) / s) ** 2)
     raw = np.rint(50000 * gain * np.exp(-line)).astype(np.uint16)
-    path = tmp_path / f"{name}_{per_turn}_{shutter}_{travel}_{len(skip)}_{gain}_{nr}.h5"
-    with h5py.File(path, "w") as f:
-        f.create_dataset("data", data=raw, chunks=(1, nr, ND))
-    reader = _core.RawReader([str(path)], "data", nr, ND)
-    scan = _core.make_scan_data(angles.astype(np.float64), z.astype(np.float64) * .01, .01, nr, ND, 0, 0., 0., np.full(len(z), .2),
-                                np.array([0], np.float32), np.zeros((nr, ND), np.float32), np.full((1, nr, ND), 50000, np.float32),
-                                smooth_border(nr) if weight is None else weight, reader, np.zeros(len(z), np.int32),
-                                np.arange(len(z), dtype=np.int32))
+    scan = raw_scan(tmp_path / f"{name}_{per_turn}_{shutter}_{travel}_{len(skip)}_{gain}_{nr}.h5", raw, angles, z * .01,
+                    weight=smooth_border(nr) if weight is None else weight)
     yy, xx = np.mgrid[:ND, :ND] - (ND - 1) / 2
     truth = sum(a * np.exp(-.5 * ((xx - x0) ** 2 + (yy - y0) ** 2) / s ** 2) for x0, y0, s, a in BLOBS)
     return scan, truth
@@ -158,7 +150,6 @@ def error(sl, truth):
     return float(np.abs(sl - truth).max())
 
 
-@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_views_are_the_bins_when_the_turns_agree(tmp_path, device):
     """a whole number of projections per turn and no shutter: the views a turn apart are at one angle, and a row per
     view gives what a row per grid angle gives"""
@@ -188,7 +179,6 @@ def test_views_are_the_bins_when_the_turns_agree(tmp_path, device):
         np.testing.assert_allclose(a["slices"], recon(scan, "cpu").reconstruct(h, h + 3), atol=2e-6, rtol=2e-4)
 
 
-@pytest.mark.parametrize("device", vc_tomography.devices())
 @pytest.mark.parametrize("per_turn, shutter", [(NG + 0.4, 0.0), (NG, -0.6), (NG + 0.27, 0.72)])
 def test_views_a_turn_apart_keep_their_angles(tmp_path, device, per_turn, shutter):
     """a turn that is not a whole number of steps, or rows read one after another: the two views of a slice in one
@@ -210,7 +200,6 @@ def test_views_a_turn_apart_keep_their_angles(tmp_path, device, per_turn, shutte
         np.testing.assert_allclose(chunk, r.reconstruct(h, h + 2), atol=2e-6, rtol=2e-4)
 
 
-@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_views_with_the_other_corrections(tmp_path, device):
     scan, truth = blob_scan(tmp_path, NG + 0.4)
     base = recon(scan, device)
@@ -269,7 +258,6 @@ def test_views_with_the_other_corrections(tmp_path, device):
     assert np.isfinite(recon(many, device, angle_interp="nearest").reconstruct(middle(r), middle(r) + 1)).all()
 
 
-@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_views_in_a_band(tmp_path, device):
     """the band reconstruction samples the slices of a row per view"""
     scan, _ = blob_scan(tmp_path, NG + 0.4)

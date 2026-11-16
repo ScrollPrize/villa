@@ -18,6 +18,8 @@
 #include "vc_tomography/projection_store.hpp"
 #include "io/json.hpp"
 #include "io/sha256.hpp"
+#include "io/text_file.hpp"
+#include "io/json_values.hpp"
 
 #ifndef VC_TOMOGRAPHY_SOURCE_DIR
 #define VC_TOMOGRAPHY_SOURCE_DIR ""
@@ -32,16 +34,8 @@ void say(const Log& log, const std::string& line) {
     if (log) log(line);
 }
 
-std::string read_text(const std::string& path) {
-    std::ifstream in(path);
-    if (!in) throw Error("cannot read " + path);
-    return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-}
-
-bool exists(const std::string& p) {
-    struct stat st;
-    return ::stat(p.c_str(), &st) == 0;
-}
+using io::exists;
+using io::read_text;
 
 std::string base_name(const std::string& p) {
     const std::size_t i = p.find_last_of('/');
@@ -60,16 +54,9 @@ double mtime(const std::string& p) {
 #endif
 }
 
-std::string strip(const std::string& s) {
-    const std::size_t a = s.find_first_not_of(" \t\n\r");
-    if (a == std::string::npos) return std::string();
-    return s.substr(a, s.find_last_not_of(" \t\n\r") - a + 1);
-}
-
-std::string lower(std::string s) {
-    for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    return s;
-}
+using io::lower;
+using io::strip;
+using io::truth;
 
 // (the key by value: taken by reference, GCC's -Wdangling-reference supposes the result may refer to it)
 const Json& member(const Json& j, std::string_view key) {
@@ -90,22 +77,9 @@ std::string text_of(const Json& v) {
 }
 
 double number_of(const Json& v, const std::string& key) {
-    if (v.is(Json::Number)) return v.number;
-    if (v.is(Json::Bool)) return v.boolean ? 1 : 0;
-    if (v.is(Json::String)) {
-        char* end = nullptr;
-        const std::string s = strip(v.string);
-        const double x = std::strtod(s.c_str(), &end);
-        if (!s.empty() && end == s.c_str() + s.size()) return x;
-    }
-    throw Error("parameter " + key + ": a number, not " + v.text());
-}
-
-bool truth(const Json& v) {
-    if (v.is(Json::Bool)) return v.boolean;
-    if (v.is(Json::Number)) return v.number != 0;
-    if (v.is(Json::String)) return !v.string.empty();
-    return false;
+    double x = 0;
+    if (!io::number_of(v, x)) throw Error("parameter " + key + ": a number, not " + v.text());
+    return x;
 }
 
 FilterChain filter_chain_of(const Json& chain_in) {
@@ -143,15 +117,6 @@ void terms_of_reduced_frames(geometry::Terms& T, int f, int rows_full, double ra
     for (float& v : T.row_offset) v /= ff;
     for (float& v : T.col_offset) v /= ff;
     T.slope_col /= f, T.slope_row /= f, T.scale_col /= f, T.scale_row /= f;
-}
-
-// the angle per frame of a run of frames: the median of the steps' sizes [deg]
-double angle_step(const std::vector<double>& angle) {
-    std::vector<double> steps(angle.size() > 1 ? angle.size() - 1 : 0);
-    for (std::size_t i = 0; i + 1 < angle.size(); ++i) steps[i] = std::fabs(angle[i + 1] - angle[i]);
-    if (steps.empty()) throw Error("a scan of one frame has no angle per frame");
-    std::nth_element(steps.begin(), steps.begin() + static_cast<std::ptrdiff_t>(steps.size() / 2), steps.end());
-    return steps[steps.size() / 2];
 }
 
 template <class T>
@@ -360,7 +325,7 @@ struct Reconstruction::Impl {
                     *v = part_of(*v, used[k]);
             terms[k] = geometry::reconstruction_terms(given, whole ? H[k] : part_of(H[k], used[k]), member(lay, "row_sign").number, rows_stored, intensity.rot_center * f,
                                                       (pl.shift_x - pl.x_readjustment) * f, pl.z_readjustment * f, origin);
-            if (f > 1) terms_of_reduced_frames(terms[k], f, rows_stored, frames_per_row * angle_step(part_of(angles[k], used[k])) * (M_PI / 180.0), geometry->rows_from_middle());
+            if (f > 1) terms_of_reduced_frames(terms[k], f, rows_stored, frames_per_row * recorded_angle_step(part_of(angles[k], used[k])) * (M_PI / 180.0), geometry->rows_from_middle());
         }
         map = geometry->map();
         if (f > 1) {
@@ -848,7 +813,7 @@ TileReconstruction tile_reconstructor(const std::string& master, const std::stri
         // (row_origin: reconstruction_terms adds it to the poses' rows, and the slice h is read at the row h + row + origin)
         out.terms = geometry::reconstruction_terms(own, height_rows, row_sign, rows_full, rot_center, 0.0, 0.0, out.row_origin);
         if (angle.size() < 2) throw Error("tile " + label + ": one frame on disk");
-        step_deg = angle_step(angle);
+        step_deg = recorded_angle_step(angle);
         rad_per_row = member(member(cal, "row_time"), "frames_per_row").number * step_deg * (M_PI / 180.0);
         rows_from_middle = own.rows_from_middle = all.rows_from_middle;
     } else {
@@ -930,18 +895,13 @@ TileReconstruction tile_reconstructor(const std::string& master, const std::stri
 
     // the parameters: the defaults with fbp, the ramp filter alone, no sld, no sharpness weighting, then o.params
     Json p = Json::parse(default_parameters());
-    const auto put = [&](const std::string& key, Json v) {
-        for (auto& kv : p.object)
-            if (kv.first == key) return void(kv.second = std::move(v));
-        p.object.emplace_back(key, std::move(v));
-    };
-    put("backprojector", Json::of(std::string("fbp")));
-    put("filters", Json::list());
-    put("sld", Json::of(std::string("")));
-    put("sharpness_weighting", Json::of(std::string("off")));
-    put("angle_subset", Json::of(std::string("")));
-    put("noise_split", Json::of(std::string("")));
-    put("only_scan", Json::of(std::string("")));
+    p.put("backprojector", Json::of(std::string("fbp")));
+    p.put("filters", Json::list());
+    p.put("sld", Json::of(std::string("")));
+    p.put("sharpness_weighting", Json::of(std::string("off")));
+    p.put("angle_subset", Json::of(std::string("")));
+    p.put("noise_split", Json::of(std::string("")));
+    p.put("only_scan", Json::of(std::string("")));
     Json filter_changes = Json::dict();
     for (const auto& [key, v] : Json::parse(o.params.empty() ? "{}" : o.params).object) {
         if (key == "mode") {
@@ -950,9 +910,9 @@ TileReconstruction tile_reconstructor(const std::string& master, const std::stri
         }
         if (is_filter_key(key) && key != "filters") filter_changes.set(key, v);
         else if (!p.find(key)) throw Error("unknown parameter '" + key + "'");
-        else put(key, key == "filters" && v.is(Json::String) ? Json::parse(parse_filter_chain(v.string)) : v);
+        else p.put(key, key == "filters" && v.is(Json::String) ? Json::parse(parse_filter_chain(v.string)) : v);
     }
-    if (!filter_changes.object.empty()) put("filters", Json::parse(override_filter_chain(p.find("filters")->text(), filter_changes.text())));
+    if (!filter_changes.object.empty()) p.put("filters", Json::parse(override_filter_chain(p.find("filters")->text(), filter_changes.text())));
     out.parameters = p.text();
     ReconConfig cfg;
     cfg.device = o.device;

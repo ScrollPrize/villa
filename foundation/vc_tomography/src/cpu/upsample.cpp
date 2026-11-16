@@ -13,6 +13,7 @@
 #include "common/sino_core.hpp"
 #include "vc_tomography/filters.hpp"
 #include "vc_tomography/sino.hpp"
+#include "cpu/fftw_plan.hpp"
 
 namespace vc_tomography {
 
@@ -135,15 +136,10 @@ namespace cpu {
 void upsample_rows(const float* in, float* out, int n_rows, int n, int os) {
     if (os == 1) { std::memcpy(out, in, sizeof(float) * n_rows * n); return; }
     const int L = upsample_fft_length(n), Lo = L * os, nc = L / 2 + 1, nco = Lo / 2 + 1;
-    std::mutex& m = fftw_planner_mutex();
-    fftwf_plan fwd, inv;
     std::vector<float> a(L), b(Lo);
     std::vector<std::complex<float>> A(nc), B(nco);
-    {
-        std::lock_guard<std::mutex> lock(m);
-        fwd = fftwf_plan_dft_r2c_1d(L, a.data(), reinterpret_cast<fftwf_complex*>(A.data()), FFTW_ESTIMATE);
-        inv = fftwf_plan_dft_c2r_1d(Lo, reinterpret_cast<fftwf_complex*>(B.data()), b.data(), FFTW_ESTIMATE);
-    }
+    const FftwfPlan fwd = make_fftw_plan([&] { return fftwf_plan_dft_r2c_1d(L, a.data(), reinterpret_cast<fftwf_complex*>(A.data()), FFTW_ESTIMATE); });
+    const FftwfPlan inv = make_fftw_plan([&] { return fftwf_plan_dft_c2r_1d(Lo, reinterpret_cast<fftwf_complex*>(B.data()), b.data(), FFTW_ESTIMATE); });
     for (int r = 0; r < n_rows; ++r) {
         std::fill(a.begin(), a.end(), 0.f);
         std::copy(in + static_cast<std::size_t>(r) * n, in + static_cast<std::size_t>(r + 1) * n, a.begin());
@@ -155,23 +151,15 @@ void upsample_rows(const float* in, float* out, int n_rows, int n, int os) {
         const float s = 1.f / static_cast<float>(L);
         for (int i = 0; i < n * os; ++i) out[static_cast<std::size_t>(r) * n * os + i] = b[i] * s;
     }
-    std::lock_guard<std::mutex> lock(m);
-    fftwf_destroy_plan(fwd);
-    fftwf_destroy_plan(inv);
 }
 
 // rows delayed by `shift` samples in place (sino.hpp): each row's transform in its own storage (r2c in place)
 void shift_rows(float* rows, int n_rows, int n, float shift, const float* shifts) {
     if (n_rows <= 0 || n <= 1) return;
     const int L = upsample_fft_length(n), S = shift_row_stride(n);
-    std::mutex& m = fftw_planner_mutex();
-    fftwf_plan fwd, inv;
-    {
-        std::lock_guard<std::mutex> lock(m);
-        // (planned on the first row; FFTW_ESTIMATE leaves it untouched, FFTW_UNALIGNED lets every row use the plan)
-        fwd = fftwf_plan_dft_r2c_1d(L, rows, reinterpret_cast<fftwf_complex*>(rows), FFTW_ESTIMATE | FFTW_UNALIGNED);
-        inv = fftwf_plan_dft_c2r_1d(L, reinterpret_cast<fftwf_complex*>(rows), rows, FFTW_ESTIMATE | FFTW_UNALIGNED);
-    }
+    // (planned on the first row; FFTW_ESTIMATE leaves it untouched, FFTW_UNALIGNED lets every row use the plan)
+    const FftwfPlan fwd = make_fftw_plan([&] { return fftwf_plan_dft_r2c_1d(L, rows, reinterpret_cast<fftwf_complex*>(rows), FFTW_ESTIMATE | FFTW_UNALIGNED); });
+    const FftwfPlan inv = make_fftw_plan([&] { return fftwf_plan_dft_c2r_1d(L, reinterpret_cast<fftwf_complex*>(rows), rows, FFTW_ESTIMATE | FFTW_UNALIGNED); });
 #pragma omp parallel for schedule(static)
     for (int r = 0; r < n_rows; ++r) {
         float* a = rows + static_cast<std::size_t>(r) * S;
@@ -182,9 +170,6 @@ void shift_rows(float* rows, int n_rows, int n, float shift, const float* shifts
         for (int k = 0; k <= L / 2; ++k) sino_core::shift_bin(a[2 * k], a[2 * k + 1], k, L, sh);
         fftwf_execute_dft_c2r(inv, reinterpret_cast<fftwf_complex*>(a), a);
     }
-    std::lock_guard<std::mutex> lock(m);
-    fftwf_destroy_plan(fwd);
-    fftwf_destroy_plan(inv);
 }
 
 namespace {
@@ -197,15 +182,12 @@ void resample_rows_at(float* rows, int n_rows, int n, const Positions& positions
     const int M = resample_oversampling * L, nco = M / 2 + 1;
     const std::vector<double> factor = resample_deconvolution(n);
     const double* kernel = resample_kernel().data();
-    std::mutex& m = fftw_planner_mutex();
-    fftwf_plan fwd;
-    fftw_plan inv;
+    const FftwfPlan fwd = make_fftw_plan([&] { return fftwf_plan_dft_r2c_1d(L, rows, reinterpret_cast<fftwf_complex*>(rows), FFTW_ESTIMATE | FFTW_UNALIGNED); });
+    FftwPlan inv;
     {
         std::vector<std::complex<double>> spectrum(nco);
         std::vector<double> samples(M);
-        std::lock_guard<std::mutex> lock(m);
-        fwd = fftwf_plan_dft_r2c_1d(L, rows, reinterpret_cast<fftwf_complex*>(rows), FFTW_ESTIMATE | FFTW_UNALIGNED);
-        inv = fftw_plan_dft_c2r_1d(M, reinterpret_cast<fftw_complex*>(spectrum.data()), samples.data(), FFTW_ESTIMATE | FFTW_UNALIGNED);
+        inv = make_fftw_plan([&] { return fftw_plan_dft_c2r_1d(M, reinterpret_cast<fftw_complex*>(spectrum.data()), samples.data(), FFTW_ESTIMATE | FFTW_UNALIGNED); });
     }
 #pragma omp parallel
     {
@@ -230,9 +212,6 @@ void resample_rows_at(float* rows, int n_rows, int n, const Positions& positions
             }
         }
     }
-    std::lock_guard<std::mutex> lock(m);
-    fftwf_destroy_plan(fwd);
-    fftw_destroy_plan(inv);
 }
 
 }  // namespace

@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "vc_tomography/calibration/record.hpp"
+#include "calibration/stats.hpp"
 
 namespace vc_tomography::calibration {
 
@@ -39,8 +40,6 @@ struct BlockPlan {
     // what the registration along rows must return if the stated heights are right
     double stated_dv() const { return slope_a * stated_dq; }
 };
-
-inline double wrap180(double deg) { return deg - 360.0 * std::round(deg / 360.0); }
 
 // slope of v per index around i, over +- half frames (clipped to the series)
 inline double local_slope(const std::vector<double>& v, std::int64_t i, std::int64_t half) {

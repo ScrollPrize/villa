@@ -23,6 +23,29 @@ inline cudaStream_t as_stream(void* s) { return static_cast<cudaStream_t>(s); }
 inline unsigned grid_1d(std::size_t n, unsigned block) {
     return static_cast<unsigned>((n + block - 1) / block);
 }
+// blocks of a grid-stride loop over n elements: one per `block` elements, at most 65535 x 16
+inline unsigned grid_for(std::size_t n, unsigned block = 256) {
+    return static_cast<unsigned>(std::min<std::size_t>((n + block - 1) / block, std::size_t(65535) * 16));
+}
+#if defined(__CUDACC__)  // (this header is also read by host-only C++)
+// for (std::size_t k = ...; k < n; ...): k over [0, n) in a grid-stride loop
+#define VC_TOMOGRAPHY_GRID_STRIDE(k, n)                                                                        \
+    for (std::size_t k = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x; k < (n); \
+         k += static_cast<std::size_t>(gridDim.x) * blockDim.x)
+
+template <class F>
+__global__ void each_kernel(std::size_t n, F f) {
+    VC_TOMOGRAPHY_GRID_STRIDE(i, n)
+        f(i);
+}
+// f(i) for every i in [0, n), on the device (f a functor of device-side pointers)
+template <class F>
+void each(std::size_t n, const F& f, cudaStream_t stream = nullptr) {
+    if (!n) return;
+    each_kernel<<<grid_for(n), 256, 0, stream>>>(n, f);
+    VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
+}
+#endif
 
 // Minimal RAII device buffer.
 template <class T>

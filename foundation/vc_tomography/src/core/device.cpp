@@ -17,6 +17,16 @@ bool cuda_available() {
 #endif
 }
 
+Device parse_device(const std::string& name, bool allow_auto) {
+    if (name == "cpu") return Device::CPU;
+    if (name == "cuda") {
+        if (!cuda_available()) throw Error("device 'cuda' requested but CUDA is not available");
+        return Device::CUDA;
+    }
+    if (allow_auto && name == "auto") return cuda_available() ? Device::CUDA : Device::CPU;
+    throw Error("unknown device '" + name + (allow_auto ? "' (expected cpu, cuda or auto)" : "' (expected cpu or cuda)"));
+}
+
 void release_pinned_memory() {
 #ifdef VC_TOMOGRAPHY_WITH_CUDA
     cuda::PinnedPool::get().trim();

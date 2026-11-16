@@ -10,6 +10,8 @@
 #include "common/sino_core.hpp"
 #include "vc_tomography/filters.hpp"
 #include "vc_tomography/sino.hpp"
+#include "../common/elementwise_core.hpp"
+#include "each.hpp"
 
 namespace vc_tomography {
 
@@ -225,30 +227,11 @@ std::vector<float> arc_deblur_taps(double arc, int radius) {
 
 namespace cpu {
 
-void minus_log(float* x, std::size_t n, float lo, float hi) {
-#pragma omp parallel for schedule(static)
-    for (std::ptrdiff_t i = 0; i < static_cast<std::ptrdiff_t>(n); ++i) x[i] = sino_core::minus_log(x[i], lo, hi);
-}
-
-void multiply(float* x, const float* w, std::size_t n) {
-#pragma omp parallel for schedule(static)
-    for (std::ptrdiff_t i = 0; i < static_cast<std::ptrdiff_t>(n); ++i) x[i] = x[i] * w[i];
-}
-
-void add_scaled(float* x, const float* y, float s, std::size_t n) {
-#pragma omp parallel for schedule(static)
-    for (std::ptrdiff_t i = 0; i < static_cast<std::ptrdiff_t>(n); ++i) x[i] = x[i] + s * y[i];
-}
-
-void weight_difference(const float* x, const float* w, const float* w2, float* t, std::size_t n) {
-#pragma omp parallel for schedule(static)
-    for (std::ptrdiff_t i = 0; i < static_cast<std::ptrdiff_t>(n); ++i) t[i] = x[i] * (w2[i] - w[i]);
-}
-
-void multiply_add(float* x, const float* w, const float* t, std::size_t n) {
-#pragma omp parallel for schedule(static)
-    for (std::ptrdiff_t i = 0; i < static_cast<std::ptrdiff_t>(n); ++i) x[i] = x[i] * w[i] + t[i];
-}
+void minus_log(float* x, std::size_t n, float lo, float hi) { each(n, elementwise::MinusLog{x, lo, hi}); }
+void multiply(float* x, const float* w, std::size_t n) { each(n, elementwise::Multiply{x, w}); }
+void add_scaled(float* x, const float* y, float s, std::size_t n) { each(n, elementwise::AddScaled{x, y, s}); }
+void weight_difference(const float* x, const float* w, const float* w2, float* t, std::size_t n) { each(n, elementwise::WeightDifference{x, w, w2, t}); }
+void multiply_add(float* x, const float* w, const float* t, std::size_t n) { each(n, elementwise::MultiplyAdd{x, w, t}); }
 
 void angular_fir(const float* in, float* out, int n_proj, int n_cols, const float* g, int radius, const float* support) {
     if (radius < 0 || 2 * radius + 1 > n_proj) throw Error("angular_fir: bad radius");

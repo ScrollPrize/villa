@@ -15,6 +15,7 @@
 #include "vc_reader/array.hpp"
 #include "vc_reader/composite.hpp"
 #include "vc_reader/image_write.hpp"
+#include "io/text_file.hpp"
 
 namespace vc_tomography::surface {
 
@@ -35,11 +36,7 @@ double percentile(std::vector<float> v, double q) {
     return v[lo] + (rank - static_cast<double>(lo)) * (static_cast<double>(v[hi]) - v[lo]);
 }
 
-void write_text(const std::string& path, const std::string& text) {
-    std::ofstream o(path);
-    o << text << "\n";
-    if (!o) throw Error("cannot write " + path);
-}
+using io::write_text;
 
 void png(const std::string& path, const std::vector<std::uint8_t>& img, int ny, int nx) {
     vcr::sources::writeImage(path, vcr::sources::ImageView{img.data(), "|u1", ny, nx});
@@ -320,11 +317,6 @@ void write_set(const std::string& out, const std::vector<float>& layers, int H, 
         tiff(out + "/layers/" + name + "_offset" + format_offset(offsets[l]) + ".tif", layer.data(), "<f4", H, W, true);
     }
     Json meta = Json::parse(meta_text);
-    const auto put = [&](const std::string& key, Json v) {
-        for (auto& kv : meta.object)
-            if (kv.first == key) return void(kv.second = std::move(v));
-        meta.object.emplace_back(key, std::move(v));
-    };
     if (!slices.empty()) {
         fs::create_directories(fs::path(out) / "xy_slices");
         Json zs = Json::list();
@@ -335,7 +327,7 @@ void write_set(const std::string& out, const std::vector<float>& layers, int H, 
             png(out + name + ".png", to_u8(s.values.data(), s.ny, s.nx, u8_window), s.ny, s.nx);
             zs.add(Json::whole_number(s.z));
         }
-        put("xy_slices", zs);
+        meta.put("xy_slices", zs);
     }
     if (surface_zarr) {
         // the layer stack as a uint8 OME-Zarr surface volume (layers, H, W): depth first, the surface at the centre layer
@@ -364,7 +356,7 @@ void write_set(const std::string& out, const std::vector<float>& layers, int H, 
         writer.close();
         Json offs = Json::list();
         for (double x : offsets) offs.add(Json::of(x));
-        put("surface_volume", Json::dict()
+        meta.put("surface_volume", Json::dict()
                                   .set("path", Json::of(std::string("surface_volume.zarr")))
                                   .set("layers", Json::whole_number(static_cast<long long>(L)))
                                   .set("offsets", offs)
@@ -375,7 +367,7 @@ void write_set(const std::string& out, const std::vector<float>& layers, int H, 
     Json stats = Json::dict();
     for (const auto& [k, v] : comp)
         stats.set(k, Json::dict().set("p1", Json::of(percentile(v, 1))).set("p50", Json::of(percentile(v, 50))).set("p99", Json::of(percentile(v, 99))));
-    put("stats", stats);
+    meta.put("stats", stats);
     write_text(out + "/composite.json", meta.text());
 }
 

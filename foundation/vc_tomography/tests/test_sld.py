@@ -1,11 +1,12 @@
 """Scintillator light diffusion correction: frames against the exact point spread, and through the reconstructor."""
-import h5py
 import numpy as np
 import pytest
 
 import vc_tomography
 from vc_tomography import _core
 from vc_tomography.recon import sld_config
+
+from helpers import raw_scan
 
 
 def psf_fft(shape, length, fraction):
@@ -75,19 +76,9 @@ def test_spec():
 
 
 def scan(tmp_path, name, raw, flat, dark, angles, z, current):
-    nr, nd = raw.shape[1:]
-    path = tmp_path / f"{name}.h5"
-    with h5py.File(path, "w") as f:
-        f.create_dataset("data", data=raw, chunks=(1, nr, nd))
-    reader = _core.RawReader([str(path)], "data", nr, nd)
-    n = len(angles)
-    return _core.make_scan_data(angles.astype(np.float64), z.astype(np.float64) * .01, .01, nr, nd, 0, 0., 0.,
-                               current.astype(np.float64), np.array([0], np.float32), dark,
-                               (flat - dark)[None].astype(np.float32), np.ones((nr, nd), np.float32), reader,
-                               np.zeros(n, np.int32), np.arange(n, dtype=np.int32))
+    return raw_scan(tmp_path / f"{name}.h5", raw, angles, z * .01, control_A=current, dark=dark, flats=(flat - dark)[None])
 
 
-@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_reconstructor_removes_the_glare(tmp_path, device):
     """A helical scan recorded through the scintillator, corrected, grids to the sinogram of the same scan recorded
     without it (varying beam current, non-uniform flat, glare maps every third projection)."""

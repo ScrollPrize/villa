@@ -283,7 +283,8 @@ def test_plan_reads_master_and_sample_over_sftp(tmp_path, monkeypatch, scan):
     monkeypatch.setattr(download, "_rclone_remote", lambda spec: ({}, str(tmp_path / "served")))
     out = tmp_path / "out"
     out.mkdir()
-    args = SimpleNamespace(output=out, tiles=[tile], scans=[scan] if scan else None, slices=4, reduce=1, center_mm=-11.6, context_turns=0,
+    args = SimpleNamespace(output=out, tiles=[tile], scans=[scan] if scan else None, tile_folder="1.129um_mosaic_PHerc_Paris4_ROI-1_{tile}",
+                           slices=4, reduce=1, center_mm=-11.6, context_turns=0,
                            source_root=tmp_path / "mount_that_is_down", local_root=tmp_path / "local",
                            remote="esrf:/raw")
     # the synthetic frames are plain: the plan gets as far as refusing what the fetched sample file stores
@@ -300,7 +301,7 @@ def test_plan_reads_master_and_sample_over_sftp(tmp_path, monkeypatch, scan):
 ])
 def test_explicit_scan_selection_rejects_unsafe_or_ambiguous_names(options, tmp_path):
     with pytest.raises(SystemExit) as error:
-        download.main(["--output", str(tmp_path / "output"), *options])
+        download.main(["--output", str(tmp_path / "output"), "--source-root", str(tmp_path), "--center-mm", "0", *options])
     assert error.value.code == 2
     assert not (tmp_path / "output").exists()
 
@@ -357,7 +358,7 @@ def test_multiple_levels_share_remote_transfer_and_resume(tmp_path, monkeypatch,
 @pytest.mark.parametrize("options", [["--reduce", "1", "2"], ["--reduce", "1", "1", "--zarr", "unused"]])
 def test_multiple_level_cli_validation(options, tmp_path):
     with pytest.raises(SystemExit) as error:
-        download.main(["--output", str(tmp_path / "output"), *options])
+        download.main(["--output", str(tmp_path / "output"), "--source-root", str(tmp_path), "--center-mm", "0", *options])
     assert error.value.code == 2
     assert not (tmp_path / "output").exists()
 

@@ -13,40 +13,30 @@
 #include <vector>
 
 #include "../io/json.hpp"
+#include "io/text_file.hpp"
+#include "cpu/fftw_plan.hpp"
 
 namespace vc_tomography {
 
 namespace {
 
-std::mutex& planner_mutex() { return fftw_planner_mutex(); }
-
 using cplx = std::complex<double>;
 
 // in-place 2D complex DFT (double), sign = FFTW_FORWARD / FFTW_BACKWARD (unnormalised)
 void dft2(std::vector<cplx>& a, int n0, int n1, int sign) {
-    fftw_plan plan;
-    {
-        std::lock_guard<std::mutex> lock(planner_mutex());
-        plan = fftw_plan_dft_2d(n0, n1, reinterpret_cast<fftw_complex*>(a.data()),
-                                reinterpret_cast<fftw_complex*>(a.data()), sign, FFTW_ESTIMATE);
-    }
+    const FftwPlan plan = make_fftw_plan([&] {
+        return fftw_plan_dft_2d(n0, n1, reinterpret_cast<fftw_complex*>(a.data()), reinterpret_cast<fftw_complex*>(a.data()), sign, FFTW_ESTIMATE);
+    });
     fftw_execute(plan);
-    std::lock_guard<std::mutex> lock(planner_mutex());
-    fftw_destroy_plan(plan);
 }
 
 std::vector<cplx> dft1(const std::vector<double>& g) {
     const int n = static_cast<int>(g.size());
     std::vector<cplx> a(g.begin(), g.end());
-    fftw_plan plan;
-    {
-        std::lock_guard<std::mutex> lock(planner_mutex());
-        plan = fftw_plan_dft_1d(n, reinterpret_cast<fftw_complex*>(a.data()), reinterpret_cast<fftw_complex*>(a.data()),
-                                FFTW_FORWARD, FFTW_ESTIMATE);
-    }
+    const FftwPlan plan = make_fftw_plan([&] {
+        return fftw_plan_dft_1d(n, reinterpret_cast<fftw_complex*>(a.data()), reinterpret_cast<fftw_complex*>(a.data()), FFTW_FORWARD, FFTW_ESTIMATE);
+    });
     fftw_execute(plan);
-    std::lock_guard<std::mutex> lock(planner_mutex());
-    fftw_destroy_plan(plan);
     return a;
 }
 
@@ -245,15 +235,9 @@ class Paganin final : public ProjectionFilter {
             }
         }
         std::vector<double> k(static_cast<std::size_t>(nyp) * nxp);
-        fftw_plan plan;
         {
-            std::lock_guard<std::mutex> lock(planner_mutex());
-            plan = fftw_plan_dft_c2r_2d(nyp, nxp, reinterpret_cast<fftw_complex*>(F.data()), k.data(), FFTW_ESTIMATE);
-        }
-        fftw_execute(plan);
-        {
-            std::lock_guard<std::mutex> lock(planner_mutex());
-            fftw_destroy_plan(plan);
+            const FftwPlan plan = make_fftw_plan([&] { return fftw_plan_dft_c2r_2d(nyp, nxp, reinterpret_cast<fftw_complex*>(F.data()), k.data(), FFTW_ESTIMATE); });
+            fftw_execute(plan);
         }
         const double vmax = k[0];
         for (int r = 0; r < nyp; ++r)
@@ -351,12 +335,7 @@ class Epr final : public ProjectionFilter {
             if (e.H == H && e.W == W && e.device == device) return *e.f;
         if (filters_.size() >= 4) filters_.erase(filters_.begin());  // e.g. full chunks + the last one
         const FourierFilterSpec spec = fourier_step_spec({&pag_}, H, W, pag_.own_margin());
-        Entry e{H, W, device, nullptr};
-#ifdef VC_TOMOGRAPHY_WITH_CUDA
-        if (device == Device::CUDA) e.f = cuda::make_fourier_filter(spec);
-        else
-#endif
-            e.f = cpu::make_fourier_filter(spec);
+        Entry e{H, W, device, make_fourier_filter(device, spec)};
         filters_.push_back(std::move(e));
         return *filters_.back().f;
     }
@@ -519,11 +498,7 @@ class Wiener final : public ProjectionFilter {
         if (!(target_ >= 0)) throw Error("wiener: target must be >= 0");
         const std::string path = p.str("table", ""), snr_name = p.str("snr", "snr");
         if (path.empty()) throw Error("wiener: table=FILE (JSON: nu, [theta,] transfer, snr) is required");
-        std::ifstream in(path);
-        if (!in) throw Error("wiener: cannot read the table '" + path + "'");
-        std::stringstream text;
-        text << in.rdbuf();
-        const Json j = Json::parse(text.str());
+        const Json j = Json::parse(io::read_text(path));
         const auto numbers = [&](const Json* a, const std::string& what) {
             if (!a || !a->is(Json::Array)) throw Error("wiener: '" + what + "' (an array) is missing in " + path);
             std::vector<double> v;

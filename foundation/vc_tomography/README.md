@@ -944,24 +944,25 @@ can differ slightly between decoder implementations. The default uint16 projecti
 loads each touched compressed chunk in full. Set `decoder="openjph"` to enable selective HTJ2K reads of uint16
 projections too; this chooses OpenJPH's decoded values explicitly.
 
-**Download the Paris4 projection slab at 1/8 resolution.**
-`python -m vc_tomography.download_projections` (or `vc_tomography_download_projections` after installation) exports all
-19 tiles to `/mnt/raid_nvme/paris4_mosaic_recon/projections/scale_0.125`. The defaults select a 256-original-slice
-slab (0.289024 mm, 32 slices on an isotropic 1/8 grid), centred at motor Z = −256.0385 mm, matching the existing
-local ROI. Each tile keeps whole source files covering the slab plus 1.5 helix turns of context on either side
-(at least one detector height), and every angle in that interval. Frames become 296 × 552; angles are not subsampled.
+**Download a projection slab at reduced resolution.**
+`python -m vc_tomography.download_projections` (or `vc_tomography_download_projections` after installation) exports the
+frames of a slab of `--slices` original-resolution slices centred at recorded motor Z `--center-mm`. Each scan keeps
+whole source files covering the slab plus `--context-turns` (default 1.5) helix turns of context on either side (at
+least one detector height), and every angle in that interval; angles are not subsampled. For example, the 19 tiles of
+the Paris4 1.129 µm mosaic at 1/8 (256 slices, 0.289024 mm, frames of 296 × 552):
 
 ```bash
-python -m vc_tomography.download_projections --plan-only  # inspect selection and output size
-python -m vc_tomography.download_projections              # download; repeat this command to resume
-tail -f /mnt/raid_nvme/paris4_mosaic_recon/projections/scale_0.125/download.log
+python -m vc_tomography.download_projections --source-root RAW_DATA --output projections/scale_0.125 \
+    --tiles T0-01 T1-01 T1-02 ... --tile-folder '1.129um_mosaic_PHerc_Paris4_ROI-1_{tile}' \
+    --center-mm -256.0385 --reduce 3 --plan-only   # inspect selection and output size; drop --plan-only to download
+tail -f projections/scale_0.125/download.log       # repeat the same command to resume
 ```
 
-The source is the mounted `keep_it_for_replaying_20260311/RAW_DATA` directory; files already in the local
-`paris4_mosaic_recon/RAW_DATA` are preferred. `--source-root`, `--local-root`, `--output`, `--tiles`, `--slices`,
-and `--center-mm` can override these defaults. `--workers` controls concurrent files (default 4), `--threads`
-the decoder threads per file (default 2). `--max-files 1` runs one pending file as a smoke test. No SDK or HDF5
-codec plugin is required; build vc_tomography with `VC_TOMOGRAPHY_OPENJPH=ON` (the default).
+`--source-root` is the acquisitions' `RAW_DATA` folder; files already under `--local-root` (default: the source root)
+are preferred. `--tiles` names mosaic tiles, each the folder `--tile-folder` makes of it; `--scans` names acquisition
+folders directly. `--workers` controls concurrent files (default 4), `--threads` the decoder threads per file
+(default 2). `--max-files 1` runs one pending file as a smoke test. No SDK or HDF5 codec plugin is required; build
+vc_tomography with `VC_TOMOGRAPHY_OPENJPH=ON` (the default).
 
 `--remote esrf:/data/.../RAW_DATA` (an rclone SFTP remote and the path that `--source-root` stands for) reads
 whatever is not local over SFTP with paramiko instead of through the mount: the masters and one sample file per
@@ -973,8 +974,7 @@ Projection stacks are uncompressed uint16 HDF5. Darks and flats are read at full
 `calibration.at_resolution` on the same chunk boundaries, and saved uncompressed as float32 to preserve the
 fractional low-pass values. Their sources have no stored pyramid, so their full pixels must be read.
 
-For other acquisitions, `--scans` accepts folder names under `--source-root` instead of `--tiles`.
-Each folder must contain `NAME_0001/NAME_0001.h5`; its name also identifies its Zarr group.
+With `--scans`, each folder must contain `NAME_0001/NAME_0001.h5`; its name also identifies its Zarr group.
 The native planner reads pixel size and helical pitch from each master. For example, to store the Paris4
 2.4 µm acquisition's four lateral positions at half and quarter detector resolution in one Zarr:
 
@@ -983,9 +983,9 @@ python -m vc_tomography.download_projections \
   --scans 2.4um_PHerc-Paris4_B_HA 2.4um_PHerc-Paris4_B_TA \
           2.4um_PHerc-Paris4_B_TA2 2.4um_PHerc-Paris4_C_TA3 \
   --slices 128 --center-mm -256.0385 --reduce 1 2 \
-  --remote esrf:/data/visitor/in1215/bm18/keep_it_for_replaying_20260311/RAW_DATA \
-  --output /mnt/raid_nvme/paris4_2p4um_recon/download_multiscale \
-  --zarr /mnt/raid_nvme/paris4_2p4um_recon/projections/projections.zarr
+  --source-root RAW_DATA --remote esrf:/data/visitor/in1215/bm18/keep_it_for_replaying_20260311/RAW_DATA \
+  --output paris4_2p4um_recon/download_multiscale \
+  --zarr paris4_2p4um_recon/projections/projections.zarr
 ```
 
 This selects 128 **original-resolution** slices (0.3072 mm), with the default 1.5 turns of context on each side;
@@ -1029,8 +1029,9 @@ complete is left out and reported (exit status 1); running the command again wri
 ### Downloading straight into the store (`--zarr`)
 
 ```bash
-python -m vc_tomography.download_projections --reduce 1 --output projections/scale_0.5 \
-    --zarr projections/projections.zarr --remote esrf:/data/.../RAW_DATA --workers 40 --threads 4
+python -m vc_tomography.download_projections --reduce 1 --output projections/scale_0.5 --tiles ... --tile-folder ... \
+    --center-mm -256.0385 --zarr projections/projections.zarr --source-root RAW_DATA --remote esrf:/data/.../RAW_DATA \
+    --workers 40 --threads 4
 ```
 
 With `--zarr STORE` the downloader writes each file's frames into level `--reduce` of the store, compressed, as one

@@ -431,13 +431,7 @@ SliceReconstructor::SliceReconstructor(std::vector<ScanData> scans, ReconConfig 
             s.traj.map_ev.size() != s.traj.map_i.size())
             throw Error("ScanData: the detector map's terms (map_i, map_j, map_eu, map_ev) have inconsistent lengths");
     if (I.scans.empty() || I.scans[0].traj.n() < 2) throw Error("SliceReconstructor: no scan");
-    {   // the step between consecutive recorded projections: the median, which skipped projections do not stretch
-        const auto& a = I.scans[0].traj.angles_deg;
-        std::vector<double> steps(a.size() - 1);
-        for (std::size_t i = 1; i < a.size(); ++i) steps[i - 1] = std::fabs(a[i] - a[i - 1]);
-        std::nth_element(steps.begin(), steps.begin() + steps.size() / 2, steps.end());
-        I.recorded_step = steps[steps.size() / 2];
-    }
+    I.recorded_step = recorded_angle_step(I.scans[0].traj.angles_deg);
     // the scans' places across the beam: one per scan, or several scans above each other at one
     I.place.assign(I.scans.size(), 0);
     for (std::size_t s = 0, places = 0; s < I.scans.size(); ++s) {
@@ -900,9 +894,9 @@ void SliceReconstructor::Impl::setup_invariants() {
     // reference's pi / NG gives attenuation / (angular span / pi) = half of it
     bp.unit_gain = legacy ? static_cast<float>(M_PI / (std::fabs(static_cast<double>(fbp_angles[1]) - fbp_angles[0]) * NG)) : 1.f;
     const FourierFilterSpec rspec = ramp_filter_spec(rg, ramp_scale(NG, legacy), cfg.ramp_filter_name, cfg.ramp_filter_par);
+    ramp_filter = make_fourier_filter(cfg.device, rspec);
 #ifdef VC_TOMOGRAPHY_WITH_CUDA
     if (cfg.device == Device::CUDA) {
-        ramp_filter = cuda::make_fourier_filter(rspec);
         copy = std::make_unique<cuda::Stream>();
         for (int r = 0; r < 2; ++r) {
             VC_TOMOGRAPHY_CUDA_CHECK(cudaEventCreateWithFlags(&ev_up[r], cudaEventDisableTiming));
@@ -911,7 +905,6 @@ void SliceReconstructor::Impl::setup_invariants() {
         return;
     }
 #endif
-    ramp_filter = cpu::make_fourier_filter(rspec);
 }
 
 std::shared_ptr<const FilterPipeline> SliceReconstructor::Impl::pipeline(const FilterChain& chain) const {
@@ -941,12 +934,7 @@ FourierFilter* SliceReconstructor::Impl::fft_for(int slot, const FourierFilterSp
             return e.f.get();
         }
     if (fft_cache.size() >= 4) fft_cache.erase(fft_cache.begin());  // e.g. full chunks + the last one
-    FftEntry e{slot, spec.ph, spec.pw, spec.h, spec.w, spec.pad_top, spec.pad_left, nullptr, spec.id};
-#ifdef VC_TOMOGRAPHY_WITH_CUDA
-    if (cfg.device == Device::CUDA) e.f = cuda::make_fourier_filter(spec);
-    else
-#endif
-        e.f = cpu::make_fourier_filter(spec);
+    FftEntry e{slot, spec.ph, spec.pw, spec.h, spec.w, spec.pad_top, spec.pad_left, make_fourier_filter(cfg.device, spec), spec.id};
     fft_cache.push_back(std::move(e));
     return fft_cache.back().f.get();
 }
@@ -1230,12 +1218,7 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
     ap.measured_only = measured_only;
     const bool sharp = I.sharp && !measured_only;
     if (sharp) {
-        auto make = [&](const FourierFilterSpec& sp) {
-#ifdef VC_TOMOGRAPHY_WITH_CUDA
-            if (gpu) return cuda::make_fourier_filter(sp);
-#endif
-            return cpu::make_fourier_filter(sp);
-        };
+        auto make = [&](const FourierFilterSpec& sp) { return make_fourier_filter(gpu ? Device::CUDA : Device::CPU, sp); };
         if (!I.band2d || I.band2d_h != H) {
             I.band2d = make(band_filter_spec(2, H, NX, I.sharp_f1, I.sharp_f2));
             I.band2d_h = H;

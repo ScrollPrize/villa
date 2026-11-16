@@ -138,6 +138,14 @@ std::pair<int, int> chunk_projection_span(const SpanInfo& s, int h0, int h1) {
     return {first, last + 1};
 }
 
+double recorded_angle_step(const std::vector<double>& a) {
+    if (a.size() < 2) throw Error("a scan of one frame has no angle per frame");
+    std::vector<double> steps(a.size() - 1);
+    for (std::size_t i = 0; i + 1 < a.size(); ++i) steps[i] = std::fabs(a[i + 1] - a[i]);
+    std::nth_element(steps.begin(), steps.begin() + static_cast<std::ptrdiff_t>(steps.size() / 2), steps.end());
+    return steps[steps.size() / 2];
+}
+
 int grid_angle_count(const std::vector<double>& a) {
     double sum = 0;
     for (std::size_t i = 1; i < a.size(); ++i) sum += a[i] - a[i - 1];

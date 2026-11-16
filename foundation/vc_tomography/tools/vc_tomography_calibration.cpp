@@ -97,8 +97,7 @@ int run_geometry_calibration(int argc, char** argv) {
         else scans.push_back(a);
     }
     if (scans.empty() || out.empty()) return usage();
-    if (device != "cpu" && device != "cuda" && device != "auto") throw Error("--device is cpu, cuda or auto");
-    opt.device = device == "cuda" || (device == "auto" && cuda_available()) ? Device::CUDA : Device::CPU;
+    opt.device = parse_device(device, true);
     opt.log = [](const std::string& line) {
         std::printf("%s\n", line.c_str());
         std::fflush(stdout);
@@ -194,8 +193,7 @@ int main(int argc, char** argv) {
             else if (!a.empty() && a[0] == '-') throw Error("unknown option " + a);
             else scans.push_back(a);
         }
-        if (device != "cpu" && device != "cuda" && device != "auto") throw Error("--device is cpu, cuda or auto");
-        opt.view.device = device == "cuda" || (device == "auto" && cuda_available()) ? Device::CUDA : Device::CPU;
+        opt.view.device = parse_device(device, true);
         if (command == "selftest") return registration_selftest(true, opt.view.device) ? 0 : 1;
         if (scans.empty()) return usage();
         const Report report = run_record_checks(scans, opt);

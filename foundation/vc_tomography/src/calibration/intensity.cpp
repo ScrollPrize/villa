@@ -12,6 +12,7 @@
 #include <mutex>
 
 #include "vc_tomography/fourier.hpp"
+#include "cpu/fftw_plan.hpp"
 
 namespace vc_tomography::calibration {
 
@@ -126,14 +127,13 @@ void tile_power_spectra(const float* img, std::size_t n, std::size_t rows, std::
     const std::size_t per = static_cast<std::size_t>(tile) * nc;
     std::vector<float> win(tile);
     for (int i = 0; i < tile; ++i) win[i] = static_cast<float>(0.5 - 0.5 * std::cos(2.0 * M_PI * i / (tile - 1)));
-    std::mutex& m = fftw_planner_mutex();
-    fftwf_plan plan;
+    FftwfPlan plan;
     {
         std::vector<float> a(static_cast<std::size_t>(tile) * tile);
         std::vector<std::complex<float>> A(per);
-        std::lock_guard<std::mutex> lock(m);
-        plan = fftwf_plan_dft_r2c_2d(tile, tile, a.data(), reinterpret_cast<fftwf_complex*>(A.data()),
-                                     FFTW_ESTIMATE | FFTW_UNALIGNED);
+        plan = make_fftw_plan([&] {
+            return fftwf_plan_dft_r2c_2d(tile, tile, a.data(), reinterpret_cast<fftwf_complex*>(A.data()), FFTW_ESTIMATE | FFTW_UNALIGNED);
+        });
     }
 #pragma omp parallel
     {
@@ -155,8 +155,6 @@ void tile_power_spectra(const float* img, std::size_t n, std::size_t rows, std::
             }
         }
     }
-    std::lock_guard<std::mutex> lock(m);
-    fftwf_destroy_plan(plan);
 }
 
 namespace {

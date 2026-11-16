@@ -12,6 +12,7 @@
 
 #include "calibration/util.hpp"
 #include "io/json.hpp"
+#include "io/text_file.hpp"
 
 namespace vc_tomography::geometry {
 
@@ -55,13 +56,6 @@ std::vector<std::vector<double>> table(const Json& v, std::size_t width, const s
     return out;
 }
 
-std::string read_file(const std::string& path) {
-    std::ifstream f(path, std::ios::binary);
-    if (!f) throw Error("geometry: cannot read " + path);
-    std::ostringstream s;
-    s << f.rdbuf();
-    return s.str();
-}
 
 // The travel per frame [rows] as a line through the 33 frames around each (the registration's blocks are 32
 // frames; the encoder's own frame-to-frame differences are noise against a stage that moves steadily). The ends
@@ -87,16 +81,6 @@ void gradient(const double* a, std::size_t n, double* out) {
     out[0] = a[1] - a[0];
     out[n - 1] = a[n - 1] - a[n - 2];
     for (std::size_t i = 1; i + 1 < n; ++i) out[i] = (a[i + 1] - a[i - 1]) / 2.0;
-}
-
-double median(std::vector<double> v) {
-    if (v.empty()) throw Error("geometry: the median of nothing");
-    const std::size_t m = v.size() / 2;
-    std::nth_element(v.begin(), v.begin() + static_cast<std::ptrdiff_t>(m), v.end());
-    if (v.size() % 2) return v[m];
-    const double hi = v[m];
-    const double lo = *std::max_element(v.begin(), v.begin() + static_cast<std::ptrdiff_t>(m));
-    return (lo + hi) / 2.0;
 }
 
 template <class T>
@@ -257,7 +241,7 @@ Calibration Calibration::parse(const std::string& json_text) {
     if (!c.doc_->is(Json::Object)) throw Error("geometry: the calibration is not an object");
     return c;
 }
-Calibration Calibration::load(const std::string& path) { return parse(read_file(path)); }
+Calibration Calibration::load(const std::string& path) { return parse(io::read_text(path)); }
 
 int Calibration::rows() const { return static_cast<int>(number(member(*doc_, "layout", "the geometry"), "rows", "the layout")); }
 int Calibration::cols() const { return static_cast<int>(number(member(*doc_, "layout", "the geometry"), "cols", "the layout")); }
@@ -750,7 +734,7 @@ MergedLayout Calibration::merged_layout(const std::vector<Poses>& poses, const s
     const auto q = [&](double v) { return std::nearbyint(v / quantum) * quantum; };  // halves to the even one, as the step always rounded
     const auto axis_of = [&](std::size_t s) {
         const std::array<std::size_t, 2> f = frames_of(s);
-        return median(std::vector<double>(poses[s].axis.begin() + static_cast<std::ptrdiff_t>(f[0]), poses[s].axis.begin() + static_cast<std::ptrdiff_t>(f[1])));
+        return calibration::median_of(std::vector<double>(poses[s].axis.begin() + static_cast<std::ptrdiff_t>(f[0]), poses[s].axis.begin() + static_cast<std::ptrdiff_t>(f[1])));
     };
     // the row a slice is read at beyond what the record alone gives (z_pix: the record's height from the scan's first frame)
     const auto row_of = [&](std::size_t s, std::size_t k) { return poses[s].row[k] + sign * (H[s][k] - H[s][from(s)]); };
@@ -764,13 +748,13 @@ MergedLayout Calibration::merged_layout(const std::vector<Poses>& poses, const s
         if (travels) {  // at equal frames: the two scans travel alike
             std::vector<double> diff(b - a);
             for (std::size_t k = a; k < b; ++k) diff[k - a] = row_of(s, k) - row_of(0, k);
-            rows_ = median(diff);
+            rows_ = calibration::median_of(diff);
         } else {
             const auto rows_over = [&](std::size_t scan) {
                 const std::array<std::size_t, 2> f = frames_of(scan);
                 std::vector<double> v(f[1] - f[0]);
                 for (std::size_t k = f[0]; k < f[1]; ++k) v[k - f[0]] = row_of(scan, k);
-                return median(v);
+                return calibration::median_of(v);
             };
             rows_ = rows_over(s) - rows_over(0);
         }
@@ -809,7 +793,7 @@ TileGeometry TileGeometry::parse(const std::string& json_text) {
     if (!g.doc_->is(Json::Object)) throw Error("geometry: the tiles' description is not an object");
     return g;
 }
-TileGeometry TileGeometry::load(const std::string& path) { return parse(read_file(path)); }
+TileGeometry TileGeometry::load(const std::string& path) { return parse(io::read_text(path)); }
 
 TileGeometry::Pose TileGeometry::frame_pose(const std::string& tile, const std::vector<double>& angle_deg, const std::vector<double>& frame, double row) const {
     const Json& cal = *doc_;

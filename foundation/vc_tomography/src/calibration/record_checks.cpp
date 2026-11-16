@@ -5,6 +5,7 @@
 
 #include "vc_tomography/calibration/record_checks.hpp"
 #include "vc_tomography/calibration/session.hpp"
+#include "io/text_file.hpp"
 
 namespace vc_tomography::calibration {
 
@@ -21,11 +22,7 @@ bool has(const std::string& list, const char* name) {
     return false;
 }
 
-void write_file(const std::string& path, const std::string& text) {
-    std::ofstream o(path);
-    if (!o) throw Error("cannot write " + path);
-    o << text;
-}
+void write_file(const std::string& path, const std::string& text) { io::write_text(path, text, false); }
 
 }  // namespace
 

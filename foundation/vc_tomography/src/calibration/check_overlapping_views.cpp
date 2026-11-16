@@ -110,12 +110,6 @@ void progress(const char* what, const Measured& m) {
                  m.d[2], m.plan.stated_dq, m.plan.stated_dv(), m.correlation, m.evaluations, m.ok ? "" : "  (rejected)");
 }
 
-std::string joined(const std::vector<std::string>& v) {
-    std::string s;
-    for (std::size_t i = 0; i < v.size(); ++i) s += (i ? ", " : "") + v[i];
-    return s;
-}
-
 }  // namespace
 
 void check_views(const Record& first, Frames& first_frames, const FlatField& first_ff, const Record* second, Frames* second_frames,
@@ -276,7 +270,7 @@ void check_views(const Record& first, Frames& first_frames, const FlatField& fir
                     f.numbers.push_back({fmt("axis_at_row_%d", bands[bi] + cut.rows.n / 2), sb.mean});
                 }
             f.found = fmt("column %.3f +- %.3f (sd %.3f over %zu blocks of %d frames x %d rows x %d columns; %.3f to %.3f); nominal minus measured %+.2f px; target %.6g px; by row band: %s",
-                          sa.mean, sa.sem(), sa.sd, sa.n, nq, cut.rows.n, diagnostic_columns(cut.cols, opt).n, sa.min, sa.max, nominal - sa.mean, tol.axis_px(), joined(per_band).c_str());
+                          sa.mean, sa.sem(), sa.sd, sa.n, nq, cut.rows.n, diagnostic_columns(cut.cols, opt).n, sa.min, sa.max, nominal - sa.mean, tol.axis_px(), join(per_band, ", ").c_str());
             f.found += axis_trend.usable ? fmt("; along the stretch it changes by %+.4f px per 1000 frames", axis_trend.slope) : "; axis trend unavailable: " + axis_trend.message;
             f.numbers.push_back({"axis_px_per_1000_frames", axis_trend.slope});
             std::vector<double> residual(axis.size());
@@ -303,7 +297,7 @@ void check_views(const Record& first, Frames& first_frames, const FlatField& fir
             for (std::size_t bi = 0; bi < bands.size(); ++bi)
                 if (!D_by_band[bi].empty()) per_band.push_back(fmt("rows %d-%d: %+.3f", bands[bi], bands[bi] + cut.rows.n - 1, spread(D_by_band[bi]).mean));
             f.found = fmt("opposite views are displaced along the axis by %s; target %.6g rows; by row band: %s; along the stretch it changes by %+.4f rows per 1000 frames (%+.3f at the first pair, %+.3f at the last)",
-                          pm(sD, "rows").c_str(), tol.rows(), joined(per_band).c_str(), D_trend.slope, D_trend.intercept + D_trend.slope * at.front(), D_trend.intercept + D_trend.slope * at.back());
+                          pm(sD, "rows").c_str(), tol.rows(), join(per_band, ", ").c_str(), D_trend.slope, D_trend.intercept + D_trend.slope * at.front(), D_trend.intercept + D_trend.slope * at.back());
             if (!D_trend.usable) f.found += "; height trend unavailable: " + D_trend.message;
             f.numbers.push_back({"rows_per_1000_frames", D_trend.slope});
             assess_residuals(f, D, tol.rows(), "rows");
@@ -556,7 +550,7 @@ void check_views(const Record& first, Frames& first_frames, const FlatField& fir
                 Finding& f = rep.add("6.1.1 5.1.1", both, "lateral displacement of the second scan's content, stretch " + sa.entry);
                 f.stated = fmt("%s move %.4f mm = %.3f px at %.4g um", y.c_str(), positioner(sb, y) - positioner(sa, y), std::fabs(move_px), px_mm * 1e3);
                 f.found = fmt("%.4f +- %.4f columns (sd %.4f over %zu blocks of %d frames x %d rows x %d columns); measured minus stated %+.4f px; target %.6g px; by row band: %s",
-                              std::fabs(sm.mean), sm.sem(), sm.sd, sm.n, nq, cut.rows.n, diagnostic_columns(cut.cols, opt).n, sr.mean, tol.eps, joined(bands_move).c_str());
+                              std::fabs(sm.mean), sm.sem(), sm.sd, sm.n, nq, cut.rows.n, diagnostic_columns(cut.cols, opt).n, sr.mean, tol.eps, join(bands_move, ", ").c_str());
                 f.found += harmonics_text(hm, "px");
                 assess_residuals(f, res, tol.eps, "px");
                 f.note = fmt("measured is (lateral stage scale / pixel pitch along the rows): the difference is %+.2e of the move, i.e. a pitch of %.4f um if the stage's scale is exact. "
@@ -567,7 +561,7 @@ void check_views(const Record& first, Frames& first_frames, const FlatField& fir
             {
                 Finding& f = rep.add("6.1.2 6.2.3", both, "displacement along the axis of the second scan's content, stretch " + sa.entry);
                 f.stated = fmt("the two scans' heights: second minus first %+.3f rows at %.4g um (counted towards higher rows)", sDm.mean - sD.mean, px_mm * 1e3);
-                f.found = fmt("%+.4f rows; measured minus stated %s; target %.6g rows; by row band: %s", sDm.mean, pm(sD, "rows").c_str(), tol.rows(), joined(bands_D).c_str());
+                f.found = fmt("%+.4f rows; measured minus stated %s; target %.6g rows; by row band: %s", sDm.mean, pm(sD, "rows").c_str(), tol.rows(), join(bands_D, ", ").c_str());
                 f.found += harmonics_text(hD, "rows");
                 assess_residuals(f, Dres, tol.rows(), "rows");
                 f.numbers = {{"rows", sDm.mean}, {"measured_minus_stated", sD.mean}, {"sem", sD.sem()}};
@@ -576,7 +570,7 @@ void check_views(const Record& first, Frames& first_frames, const FlatField& fir
                 Finding& f = rep.add("6.2.1 6.1.6", both, "angle of the second scan against the first at equal projection index, stretch " + sa.entry);
                 f.stated = "the encoder angles of both scans";
                 f.found = fmt("measured minus stated %s = %+.5f deg (%.3f px at R); target %.6g frames (%.6g deg)", pm(sq, "frames").c_str(), sq.mean * tol.step_deg,
-                              std::fabs(sq.mean * tol.step_deg) / 57.29577951308232 * tol.R, tol.angle_frames(), tol.angle_deg());
+                              std::fabs(sq.mean * tol.step_deg) / kDegPerRad * tol.R, tol.angle_frames(), tol.angle_deg());
                 f.found += harmonics_text(hq, "frames");
                 assess_residuals(f, qres, tol.angle_frames(), "frames");
                 {
@@ -584,7 +578,7 @@ void check_views(const Record& first, Frames& first_frames, const FlatField& fir
                     const double fan = std::fabs(positioner(sb, y) - positioner(sa, y)) / ss;  // rad
                     f.note = fmt("An apparent angle difference can include sample rotation, detector geometry, timing and registration bias; it does not identify the cause. One geometric contribution is: moved %.4f mm sideways in a beam "
                                  "from a source %.0f mm away, the sample is crossed by rays turned by %.2e rad = %.3f frames (the record does not give the sign). Angle dependence alone does not distinguish motion from distortion: the same rays fall on detector columns a move apart, and a difference of scale between those columns (5.1.4) acts on a sample that is not round like a rotation that goes twice per turn",
-                                 std::fabs(positioner(sb, y) - positioner(sa, y)), ss, fan, fan * 57.29577951308232 / tol.step_deg);
+                                 std::fabs(positioner(sb, y) - positioner(sa, y)), ss, fan, fan * kDegPerRad / tol.step_deg);
                 }
                 f.numbers = {{"residual_frames", sq.mean}, {"residual_sem", sq.sem()}};
             }

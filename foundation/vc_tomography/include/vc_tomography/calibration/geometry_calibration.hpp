@@ -609,13 +609,6 @@ inline std::vector<double> linspace(double a, double b, int num) {
     y.back() = b;
     return y;
 }
-inline double median_of(std::vector<double> v) {
-    if (v.empty()) throw Error("geometry calibration: the median of nothing");
-    const std::size_t m = v.size() / 2;
-    std::nth_element(v.begin(), v.begin() + static_cast<std::ptrdiff_t>(m), v.end());
-    if (v.size() % 2) return v[m];
-    return (*std::max_element(v.begin(), v.begin() + static_cast<std::ptrdiff_t>(m)) + v[m]) / 2.0;
-}
 inline double mean_of(const std::vector<double>& v) {
     double s = 0;
     for (double x : v) s += x;

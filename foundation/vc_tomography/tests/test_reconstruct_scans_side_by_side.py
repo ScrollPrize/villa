@@ -16,12 +16,12 @@ from vc_tomography import calibration as C
 from vc_tomography import geometry as G
 from vc_tomography.recon import HelicalRecon
 
+from helpers import find_tool
+
 h5py = pytest.importorskip("h5py")
 from test_reconstruct_tool import COLS, PIXEL_UM, ROWS, _write  # noqa: E402
 
-_HERE = Path(_core.__file__).resolve().parent
-ZARR_TOOL = next((str(d / "vc_tomography_projections_zarr") for d in (_HERE, *_HERE.parents[:2]) if (d / "vc_tomography_projections_zarr").exists()),
-                 None) or shutil.which("vc_tomography_projections_zarr")
+ZARR_TOOL = find_tool("vc_tomography_projections_zarr")
 DATASET = "/entry_0000/instrument/det3/data"
 PER_TURN, TURNS, TRAVEL = 300, 3, 40.0          # frames per turn, turns, rows the helix travels per turn
 OFFSETS = (20.5, 90.5, 160.5)                   # each scan's rotation axis from the detector's middle column

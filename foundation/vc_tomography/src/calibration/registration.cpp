@@ -16,6 +16,7 @@
 #include "calibration/registration_core.hpp"
 #include "calibration/view_plan.hpp"
 #include "vc_tomography/common.hpp"
+#include "cpu/fftw_plan.hpp"
 #include "vc_tomography/fourier.hpp"  // fftw_planner_mutex(): the one lock around FFTW's planner
 
 namespace vc_tomography::calibration {
@@ -59,28 +60,24 @@ class CpuBackend final : public RegistrationBackend {
         cwork_ = alloc_complex(g_.NBC);
         const int threads = opt.threads > 0 ? opt.threads : std::min(8, omp_get_max_threads());
         init_fftw_threads();
-        {
-            std::lock_guard<std::mutex> lock(fftw_planner_mutex());
-            const int* n = g_.n;
-            const int* L = g_.L;
-            fftwf_plan_with_nthreads(threads);
-            forward_ = fftwf_plan_dft_r2c_3d(n[0], n[1], n[2], r_.get(), c_.get(), FFTW_ESTIMATE);
-            inverse_ = fftwf_plan_dft_c2r_3d(n[0], n[1], n[2], c_.get(), r_.get(), FFTW_ESTIMATE);
-            big_forward_ = fftwf_plan_dft_r2c_3d(L[0], L[1], L[2], rbig_.get(), cbig_.get(), FFTW_ESTIMATE);
-            big_inverse_ = fftwf_plan_dft_c2r_3d(L[0], L[1], L[2], cwork_.get(), rbig_.get(), FFTW_ESTIMATE);
-            fftwf_plan_with_nthreads(1);
-            // one frame's rows, every column: transforms along axis 1 of a (L1, L2) frame
-            rows_forward_ = fftwf_plan_many_dft_r2c(1, &L[1], L[2], rbig_.get(), nullptr, L[2], 1, cwork_.get(), nullptr, L[2], 1, FFTW_ESTIMATE | FFTW_UNALIGNED);
-            rows_inverse_ = fftwf_plan_many_dft_c2r(1, &L[1], L[2], cwork_.get(), nullptr, L[2], 1, rbig_.get(), nullptr, L[2], 1, FFTW_ESTIMATE | FFTW_UNALIGNED);
-        }
-        if (!forward_ || !inverse_ || !big_forward_ || !big_inverse_ || !rows_forward_ || !rows_inverse_)
-            throw Error("register_blocks: FFTW could not plan the transforms");
-    }
-
-    ~CpuBackend() override {
-        std::lock_guard<std::mutex> lock(fftw_planner_mutex());
-        for (fftwf_plan p : {forward_, inverse_, big_forward_, big_inverse_, rows_forward_, rows_inverse_})
-            if (p) fftwf_destroy_plan(p);
+        const int* n = g_.n;
+        const int* L = g_.L;
+        // the 3D transforms on `threads` threads
+        const auto threaded = [&](auto plan) {
+            return make_fftw_plan([&] {
+                fftwf_plan_with_nthreads(threads);
+                const fftwf_plan p = plan();
+                fftwf_plan_with_nthreads(1);
+                return p;
+            });
+        };
+        forward_ = threaded([&] { return fftwf_plan_dft_r2c_3d(n[0], n[1], n[2], r_.get(), c_.get(), FFTW_ESTIMATE); });
+        inverse_ = threaded([&] { return fftwf_plan_dft_c2r_3d(n[0], n[1], n[2], c_.get(), r_.get(), FFTW_ESTIMATE); });
+        big_forward_ = threaded([&] { return fftwf_plan_dft_r2c_3d(L[0], L[1], L[2], rbig_.get(), cbig_.get(), FFTW_ESTIMATE); });
+        big_inverse_ = threaded([&] { return fftwf_plan_dft_c2r_3d(L[0], L[1], L[2], cwork_.get(), rbig_.get(), FFTW_ESTIMATE); });
+        // one frame's rows, every column: transforms along axis 1 of a (L1, L2) frame
+        rows_forward_ = make_fftw_plan([&] { return fftwf_plan_many_dft_r2c(1, &L[1], L[2], rbig_.get(), nullptr, L[2], 1, cwork_.get(), nullptr, L[2], 1, FFTW_ESTIMATE | FFTW_UNALIGNED); });
+        rows_inverse_ = make_fftw_plan([&] { return fftwf_plan_many_dft_c2r(1, &L[1], L[2], cwork_.get(), nullptr, L[2], 1, rbig_.get(), nullptr, L[2], 1, FFTW_ESTIMATE | FFTW_UNALIGNED); });
     }
 
     float* staging_a() override {
@@ -287,7 +284,7 @@ class CpuBackend final : public RegistrationBackend {
     RealBuffer r_, rbig_, stage_a_, stage_b_;
     ComplexBuffer aw_, c_, copy_, cbig_, cwork_;
     const float* weight_;
-    fftwf_plan forward_ = nullptr, inverse_ = nullptr, big_forward_ = nullptr, big_inverse_ = nullptr, rows_forward_ = nullptr, rows_inverse_ = nullptr;
+    FftwfPlan forward_, inverse_, big_forward_, big_inverse_, rows_forward_, rows_inverse_;
 };
 
 struct Step {

@@ -13,6 +13,7 @@
 
 #include "vc_tomography/common.hpp"
 #include "io/json.hpp"
+#include "io/text_file.hpp"
 
 namespace vc_tomography {
 
@@ -63,10 +64,7 @@ inline void write_array_file(const std::string& path, Json header, const std::ve
         offset += 4 * n;
     }
     header.set("arrays", list);
-    const std::string tmp = path + ".tmp" + std::to_string(static_cast<long>(::getpid()));
-    {
-        std::ofstream o(tmp, std::ios::binary);
-        if (!o) throw Error("cannot write " + tmp);
+    io::write_atomic(path, [&](std::ofstream& o) {
         o << header.text() << "\n";
         for (const NamedArray& a : arrays) {
             if (array_file_detail::little_endian()) {
@@ -77,15 +75,7 @@ inline void write_array_file(const std::string& path, Json header, const std::ve
                 o.write(reinterpret_cast<const char*>(v.data()), static_cast<std::streamsize>(4 * v.size()));
             }
         }
-        if (!o) {
-            std::remove(tmp.c_str());
-            throw Error("cannot write " + tmp);
-        }
-    }
-    if (std::rename(tmp.c_str(), path.c_str()) != 0) {
-        std::remove(tmp.c_str());
-        throw Error("cannot write " + path);
-    }
+    });
 }
 
 // values: false reads the first line alone (the arrays come back without values)

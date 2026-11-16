@@ -133,6 +133,10 @@ std::pair<int, int> chunk_projections(const ScanTrajectory& t, const SpanInfo& s
 int max_chunk_projections(const ScanTrajectory& t, const SpanInfo& s, int lo, int hi, int rows, int margin,
                           bool full_context = false, bool padded_rows = false, bool may_miss = false);
 
+// the angle per recorded frame [deg]: the upper median of |a[i+1] - a[i]|, which skipped frames do not stretch;
+// throws for fewer than two frames
+double recorded_angle_step(const std::vector<double>& angles_deg);
+
 // number of grid angles: round(360 / |mean step|) over the whole scan
 int grid_angle_count(const std::vector<double>& angles_deg);
 

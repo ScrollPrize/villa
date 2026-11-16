@@ -11,7 +11,6 @@ import vc_tomography
 from vc_tomography import _core, calibration
 from vc_tomography.recon import CALIBRATION_KEYS, DEFAULTS, LEGACY_REFERENCE, HelicalRecon, legacy_reference_config
 
-DEVICES = vc_tomography.devices()
 
 
 # ---------------------------------------------------------------- gridrec bounds and even-grid centring
@@ -22,7 +21,6 @@ def gaussian_sino(nd, ang, x0, y0, s=2.0):
     return (np.sqrt(2 * np.pi) * s * np.exp(-(u - p) ** 2 / (2 * s * s))).astype(np.float32), rot
 
 
-@pytest.mark.parametrize("device", DEVICES)
 @pytest.mark.parametrize("N,nd", [(32, 32), (33, 32), (64, 64), (65, 65), (64, 40), (128, 100)])
 def test_gridrec_centre_and_bounds(device, N, nd):
     ang = np.linspace(0, 2 * np.pi, 180, endpoint=False).astype(np.float32)
@@ -38,7 +36,6 @@ def test_gridrec_centre_and_bounds(device, N, nd):
     assert np.any(g[0] != 0) and np.any(g[:, 0] != 0)
 
 
-@pytest.mark.parametrize("device", DEVICES)
 def test_gridrec_scale_is_uniform(device):
     """a small feature reconstructs at its true value at any radius: the de-apodisation is the transform of the
     gridding kernel in use (the closed form of the matched kernel gave 1.12 at the centre, 1.25 at radius 55 here)"""
@@ -67,7 +64,6 @@ def explicit_matrices(N, nd, rot, ang, device, projector):
     return A, B
 
 
-@pytest.mark.parametrize("device", DEVICES)
 @pytest.mark.parametrize("projector", ["chord", "sf"])
 def test_projector_transpose_on_boundaries(device, projector):
     zero = np.zeros(1, np.float32)
@@ -152,7 +148,6 @@ def test_geometry_calibration_is_made_once_and_kept(tmp_path):
 
 
 # ---------------------------------------------------------------- output scale (attenuation)
-@pytest.mark.parametrize("device", DEVICES)
 def test_ramp_scale_attenuation(device):
     n_proj, nb, R, mu = 720, 160, 50.0, 0.3
     rot = (nb - 1) / 2 + 0.25
@@ -178,7 +173,6 @@ PH = dict(energy_kev=116.0, distance_m=1.1919883738942316, pixel_size_m=8.64e-6,
 PAG = [{"type": "paganin", "delta_beta": 1000}, {"type": "unsharp", "sigma": 1.2, "coeff": 4}]
 
 
-@pytest.mark.parametrize("device", DEVICES)
 def test_paganin_constant_and_chunk_invariance(device):
     assert vc_tomography.filter_margin(PAG, legacy_reference=True, **PH) == 20       # the reference's margin
     m = vc_tomography.filter_margin(PAG, **PH)
@@ -204,7 +198,6 @@ def test_paganin_constant_and_chunk_invariance(device):
 
 
 # ---------------------------------------------------------------- rebalance partition of unity
-@pytest.mark.parametrize("device", DEVICES)
 @pytest.mark.parametrize("n", [16, 8000])
 def test_rebalance_partition_of_unity(device, n):
     cols, rot = 5, 2.0                                   # exact reflection: column 2 maps onto itself
@@ -267,7 +260,6 @@ def ramp_window(name, x, p0=0.5, p1=8.0):
                 "butterworth": lambda: 1 / (1 + (x / p0) ** (2 * p1))}[name]()
 
 
-@pytest.mark.parametrize("device", DEVICES)
 @pytest.mark.parametrize("par", [None, (0.3, 4.0), (1.0,)])
 def test_ramp_filter_windows(device, par):
     assert set(_core.ramp_filter_names()) == {"none", "shepp", "cosine", "hann", "hamming", "ramlak", "parzen", "butterworth"}
@@ -296,7 +288,6 @@ def test_ramp_filter_windows(device, par):
 
 
 # ---------------------------------------------------------------- mending domain
-@pytest.mark.parametrize("device", DEVICES)
 def test_mending_domain(device):
     NX = 3372
     R = np.ones((1, NX), np.float32)

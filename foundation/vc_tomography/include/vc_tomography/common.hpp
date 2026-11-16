@@ -22,6 +22,8 @@ inline const char* device_name(Device d) { return d == Device::CPU ? "cpu" : "cu
 
 // true when compiled with CUDA support and at least one device is usable
 bool cuda_available();
+// "cpu" or "cuda" (an Error when CUDA is not available); with allow_auto also "auto": CUDA when available, else CPU
+Device parse_device(const std::string& name, bool allow_auto = false);
 // Page-locked host buffers (raw windows, download staging) are kept for reuse when a reconstructor is destroyed
 // (page-locking costs ~0.2 s/GB); this frees the ones not in use. No-op without CUDA.
 void release_pinned_memory();

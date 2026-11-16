@@ -13,6 +13,7 @@
 #include "vc_tomography/calibration/intensity.hpp"
 #include "vc_tomography/calibration/solve.hpp"
 #include "io/json.hpp"
+#include "io/text_file.hpp"
 
 namespace vc_tomography::calibration::geometry_calibration {
 
@@ -1021,16 +1022,7 @@ void to_stored_pixels(Acquisition& acq, GeometrySolution& solution, GeometryRepo
     told.axis.range *= F, told.axis.sd *= F, told.axis.mean = told.axis.mean * F + p.roll * (F - 1.0) / 2.0;
 }
 
-void save_text(const std::string& text, const std::string& path) {
-    const std::string tmp = path + ".tmp" + std::to_string(static_cast<long>(::getpid()));
-    {
-        std::ofstream o(tmp);
-        if (!o) throw Error("cannot write " + tmp);
-        o << text << "\n";
-        if (!o) throw Error("cannot write " + tmp);
-    }
-    if (std::rename(tmp.c_str(), path.c_str()) != 0) throw Error("cannot write " + path);
-}
+void save_text(const std::string& text, const std::string& path) { io::write_text_atomic(path, text); }
 
 std::string calibrate_geometry(const std::vector<std::string>& scans, const Options& options) {
     if (scans.empty()) throw Error("the geometry calibration takes the master files of the scans of one sample");

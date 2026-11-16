@@ -672,8 +672,9 @@ def test_session_on_a_projection_store(tmp_path, monkeypatch):
     import subprocess
     import sys
     from pathlib import Path
+    from helpers import find_tool
     here = Path(_core.__file__).resolve().parent
-    tool = next((str(d / "vc_tomography_projections_zarr") for d in (here, *here.parents[:2]) if (d / "vc_tomography_projections_zarr").exists()), None) or shutil.which("vc_tomography_projections_zarr")
+    tool = find_tool("vc_tomography_projections_zarr")
     if tool is None:
         pytest.skip("vc_tomography_projections_zarr is not built")
     module = sys.modules[__name__]
@@ -717,6 +718,14 @@ def test_session_on_a_projection_store(tmp_path, monkeypatch):
         s.read_rows(0, 3, np.array([3], dtype=np.int64), 0, 4)                 # the helix' first frames are not in the store
     with pytest.raises(Exception, match="1/4|does not hold|no level"):
         _core.CalibrationSession([str(master)], reduce=2, store=str(store)).read_rows(0, 2, frames[:1], 0, 4)
+    # the store's darks and flats are summed in an order that does not depend on the number of threads
+    import os
+    probe = ("import sys, numpy as np, vc_tomography._core as c; s = c.CalibrationSession([sys.argv[1]], reduce=1, store=sys.argv[2]); "
+             "sys.stdout.buffer.write(np.ascontiguousarray(s.dark(0)).tobytes() + np.ascontiguousarray(s.gain(0)).tobytes())")
+    env = dict(os.environ, OMP_NUM_THREADS="1", PYTHONPATH=os.pathsep.join([str(here.parent), os.environ.get("PYTHONPATH", "")]))
+    one = subprocess.run([sys.executable, "-c", probe, str(master), str(store)], capture_output=True, env=env)
+    assert one.returncode == 0, one.stderr.decode()
+    assert one.stdout == np.ascontiguousarray(s.dark(0)).tobytes() + np.ascontiguousarray(s.gain(0)).tobytes()
 
 
 def test_images_at_reduced_resolution():
@@ -1026,10 +1035,7 @@ def test_measure_patches_equals_measure(tmp_path, monkeypatch):
         check(s, dict(base, mirror=True, **stated), "cuda")
 
 
-@pytest.mark.parametrize("device", ["cpu", "cuda"])
 def test_ceres_peak_curvature_inactive_axis_and_no_texture(device):
-    if device == "cuda" and not _core.cuda_available():
-        pytest.skip("no CUDA device")
     rng = np.random.default_rng(71)
     shape = (1, 128, 128)
     ky, kx = np.meshgrid(np.fft.fftfreq(128), np.fft.fftfreq(128), indexing="ij")

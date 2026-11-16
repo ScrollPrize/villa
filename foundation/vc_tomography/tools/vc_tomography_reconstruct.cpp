@@ -194,14 +194,8 @@ struct Run {
 
     void save_manifest() const { write_text(out + "/manifest.json", manifest.text()); }
     Json& slices() {
-        for (auto& kv : manifest.object)
-            if (kv.first == "slices") return kv.second;
+        if (Json* s = manifest.find("slices")) return *s;
         fail("manifest without slices");
-    }
-    void put(const std::string& k, Json v) {
-        for (auto& kv : manifest.object)
-            if (kv.first == k) return void(kv.second = std::move(v));
-        manifest.object.emplace_back(k, std::move(v));
     }
 
     void fractions_mode() {
@@ -294,14 +288,14 @@ struct Run {
         const int chunk = static_cast<int>(a.number("chunk"));
         const std::string format = a.text("format");
         const bool uint8 = a.flag("uint8"), uint8_only = a.flag("uint8_only");
-        put("view_heights", ints_json({h0, h1}));
-        put("z", ints_json({z0, z0 + n}));
-        put("roi_xyxy", ints_json({area.x0, area.x1, area.y0, area.y1}));
-        put("shape_zyx", ints_json({n, ny, nx}));
-        put("chunk", Json::whole_number(chunk));
-        put("format", Json::of(format));
-        if (reference) put("reference_volume", reference_description(*reference));
-        if (bbox) put("bbox_xyxy", ints_json({bbox->x0, bbox->x1, bbox->y0, bbox->y1}));
+        manifest.put("view_heights", ints_json({h0, h1}));
+        manifest.put("z", ints_json({z0, z0 + n}));
+        manifest.put("roi_xyxy", ints_json({area.x0, area.x1, area.y0, area.y1}));
+        manifest.put("shape_zyx", ints_json({n, ny, nx}));
+        manifest.put("chunk", Json::whole_number(chunk));
+        manifest.put("format", Json::of(format));
+        if (reference) manifest.put("reference_volume", reference_description(*reference));
+        if (bbox) manifest.put("bbox_xyxy", ints_json({bbox->x0, bbox->x1, bbox->y0, bbox->y1}));
         Json vc_tomography_attrs = Json::dict();
         for (const char* k : {"created", "projections", "mode", "params", "provenance", "view_heights", "z", "roi_xyxy", "chunk"}) vc_tomography_attrs.set(k, *manifest.find(k));
         const Json provenance = Json::dict().set("vc_tomography", vc_tomography_attrs).set("vc_tomography_calibration", *manifest.find("calibration"));
@@ -345,7 +339,7 @@ struct Run {
             if (uint8) outputs.set("uint8", Json::of(out + "/uint8"));
             for (const auto& kv : outputs.object) fs::create_directories(kv.second.string);
         }
-        put("outputs", outputs);
+        manifest.put("outputs", outputs);
         save_manifest();
         const auto t_all = std::chrono::steady_clock::now();
         auto rec = r->reconstructor();
@@ -424,7 +418,7 @@ struct Run {
             level_bar.reset();
             written.set(kind, Json::dict().set("written", Json::whole_number(w->n_written())).set("skipped_empty", Json::whole_number(w->n_skipped())));
         }
-        if (!writers.empty()) put("chunks_written", written);
+        if (!writers.empty()) manifest.put("chunks_written", written);
         if (!writers.empty() && a.flag("previews")) {  // the middle slice, as stored
             const int k = h_mid - h0;
             mid.ny = ny, mid.nx = nx;
@@ -439,7 +433,7 @@ struct Run {
             }
         }
         if (!mid.pixels.empty()) write_png(out + "/preview_mid.png", mid.pixels.data(), mid.ny, mid.nx);
-        put("seconds", Json::of(std::round(since(t_all) * 10) / 10));
+        manifest.put("seconds", Json::of(std::round(since(t_all) * 10) / 10));
         save_manifest();
     }
 };
@@ -447,7 +441,7 @@ struct Run {
 int run(int argc, char** argv) {
     Json given = parse(argc, argv, option_spec());
     if (const Json* np = given.find("no_preview"))  // (--no_preview: the default)
-        if (np->boolean) put(given, "previews", Json::of_bool(false));
+        if (np->boolean) given.put("previews", Json::of_bool(false));
     // the defaults, then the config file, then the command line
     Json all = in_effect(Json::dict()
                              .set("n_slices", Json::whole_number(5))
@@ -464,11 +458,11 @@ int run(int argc, char** argv) {
                              .set("device", Json::of("cuda")),
                          given, option_spec(), [](const std::string& k, const Json& v, Json& clean) {
                              if (k != "no_preview") return false;
-                             put(clean, "previews", Json::of_bool(!(v.is(Json::Bool) && v.boolean)));
+                             clean.put("previews", Json::of_bool(!(v.is(Json::Bool) && v.boolean)));
                              return true;
                          });
     const auto merge = [&](const Json& from) {
-        for (const auto& [k, v] : from.object) put(all, k, v);
+        for (const auto& [k, v] : from.object) all.put(k, v);
     };
     Args a{all};
     if (a.text("projections").empty()) fail("projections folder missing (positional argument or 'projections' in --config)");
@@ -486,7 +480,7 @@ int run(int argc, char** argv) {
     a.all = all;
     if (a.get("reference_volume") && !a.flag("uint8")) fail("--reference_volume masks the uint8 output: add --uint8 or --uint8_only");
     const std::string device = a.text("device");
-    if (device != "cuda" && device != "cpu") fail("--device is cuda or cpu");
+    const Device dev = parse_device(device);
 
     if (!a.get("tag")) merge(Json::dict().set("tag", Json::of(now_tag())));
     merge(Json::dict()
@@ -504,7 +498,7 @@ int run(int argc, char** argv) {
     const auto t0 = std::chrono::steady_clock::now();
     Reconstruction::Options opt;
     opt.cache_dir = cache;
-    opt.device = device == "cuda" ? Device::CUDA : Device::CPU;
+    opt.device = dev;
     opt.log = say;
     opt.progress = true;
     if (a.get("projection_store")) opt.projection_store = fs::absolute(a.text("projection_store")).lexically_normal().string();

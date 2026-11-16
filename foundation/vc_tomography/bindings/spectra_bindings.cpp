@@ -25,15 +25,7 @@ using Table = nb::ndarray<const double, nb::ndim<2>, nb::c_contig, nb::device::c
 using Mat = nb::ndarray<const double, nb::ndim<2>, nb::c_contig, nb::device::cpu>;
 
 nb::ndarray<nb::numpy, double> table_array(const std::vector<double>& v, const BlockSpectraSpec& s) {
-    auto out = new_array_t<double>({static_cast<std::size_t>(s.n_shells()), static_cast<std::size_t>(s.thetas)});
-    std::copy(v.begin(), v.end(), static_cast<double*>(out.data()));
-    return out;
-}
-
-nb::ndarray<nb::numpy, double> curve_array(const std::vector<double>& v) {
-    auto out = new_array_t<double>({v.size()});
-    std::copy(v.begin(), v.end(), static_cast<double*>(out.data()));
-    return out;
+    return vc_tomography::py::to_numpy(v, {static_cast<std::size_t>(s.n_shells()), static_cast<std::size_t>(s.thetas)});
 }
 
 std::array<double, 12> affine_of(const Mat& m) {
@@ -97,15 +89,15 @@ class PyBlockCorrelator {
         auto vec = [&](const Table& t) { return std::vector<double>(t.data(), t.data() + nb_); };
         const ShellCurves c = shell_curves(s, impl_->counts(), vec(aa), vec(bb), vec(ab), theta_lo, theta_hi);
         nb::dict d;
-        d["frequency"] = curve_array(c.frequency);
-        d["count"] = curve_array(c.count);
-        d["correlation"] = curve_array(c.correlation);
-        d["matched"] = curve_array(c.matched);
-        d["snr_split"] = curve_array(c.snr_split);
-        d["snr_reference"] = curve_array(c.snr_reference);
-        d["filter"] = curve_array(c.filter);
-        d["power_a"] = curve_array(c.power_a);
-        d["power_b"] = curve_array(c.power_b);
+        d["frequency"] = vc_tomography::py::to_numpy(c.frequency);
+        d["count"] = vc_tomography::py::to_numpy(c.count);
+        d["correlation"] = vc_tomography::py::to_numpy(c.correlation);
+        d["matched"] = vc_tomography::py::to_numpy(c.matched);
+        d["snr_split"] = vc_tomography::py::to_numpy(c.snr_split);
+        d["snr_reference"] = vc_tomography::py::to_numpy(c.snr_reference);
+        d["filter"] = vc_tomography::py::to_numpy(c.filter);
+        d["power_a"] = vc_tomography::py::to_numpy(c.power_a);
+        d["power_b"] = vc_tomography::py::to_numpy(c.power_b);
         return d;
     }
 

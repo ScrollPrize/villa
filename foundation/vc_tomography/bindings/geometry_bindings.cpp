@@ -8,7 +8,7 @@
 #include <nanobind/stl/vector.h>
 
 #include "vc_tomography/geometry.hpp"
-#include "ndarray_utils.hpp"
+#include "conversions.hpp"
 
 namespace nb = nanobind;
 using namespace nb::literals;
@@ -21,31 +21,16 @@ using DoubleIn = nb::ndarray<const double, nb::ndim<1>, nb::c_contig, nb::device
 
 std::vector<double> vec(const DoubleIn& a) { return std::vector<double>(a.data(), a.data() + a.shape(0)); }
 
-template <class T>
-nb::ndarray<nb::numpy, T> arr(const std::vector<T>& v) {
-    auto a = new_array_t<T>({v.size()});
-    std::copy(v.begin(), v.end(), static_cast<T*>(a.data()));
-    return a;
-}
-
 nb::dict poses_dict(const hg::Poses& p) {
     nb::dict d;
-    d["row"] = arr(p.row), d["row_per_col"] = arr(p.row_per_col), d["axis"] = arr(p.axis), d["col_per_row"] = arr(p.col_per_row);
-    d["col_scale"] = arr(p.col_scale), d["row_scale"] = arr(p.row_scale), d["angle_deg"] = arr(p.angle_deg), d["angle_deg_per_row"] = arr(p.angle_deg_per_row);
+    d["row"] = vc_tomography::py::to_numpy(p.row), d["row_per_col"] = vc_tomography::py::to_numpy(p.row_per_col), d["axis"] = vc_tomography::py::to_numpy(p.axis), d["col_per_row"] = vc_tomography::py::to_numpy(p.col_per_row);
+    d["col_scale"] = vc_tomography::py::to_numpy(p.col_scale), d["row_scale"] = vc_tomography::py::to_numpy(p.row_scale), d["angle_deg"] = vc_tomography::py::to_numpy(p.angle_deg), d["angle_deg_per_row"] = vc_tomography::py::to_numpy(p.angle_deg_per_row);
     d["scale_col"] = p.scale_col;
     d["rows_from_middle"] = p.rows_from_middle;
     return d;
 }
 
-nb::dict terms_dict(const hg::Terms& t) {
-    nb::dict d;
-    d["angles_deg"] = arr(t.angles_deg);
-    d["z_translation_scale"] = t.z_translation_scale;
-    d["row_offset"] = arr(t.row_offset), d["row_slope"] = arr(t.row_slope), d["slope_col"] = t.slope_col;
-    d["col_offset"] = arr(t.col_offset), d["col_slope"] = arr(t.col_slope), d["slope_row"] = t.slope_row;
-    d["col_scale"] = arr(t.col_scale), d["scale_col"] = t.scale_col, d["row_scale"] = arr(t.row_scale), d["scale_row"] = t.scale_row;
-    return d;
-}
+using vc_tomography::py::terms_dict;
 
 nb::dict map_dict(const hg::Map& m) {
     nb::dict d;
@@ -77,7 +62,6 @@ void bind_geometry(nb::module_& m) {
               return nb::make_tuple(u, w);
           },
           "i"_a, "j"_a, "eu"_a, "ev"_a, "c0"_a, "cs"_a, "v0"_a, "vs"_a, "c"_a, "v"_a);
-    m.def("geometry_overlap_centre", &hg::overlap_centre, "cols"_a, "move"_a);
     m.def("geometry_reconstruction_terms",
           [](DoubleIn row, DoubleIn row_per_col, DoubleIn axis, DoubleIn col_per_row, DoubleIn col_scale, DoubleIn row_scale, DoubleIn angle_deg, double scale_col,
              DoubleIn heights_rows, double row_sign, int rows, double rot_center, double column_offset, double z_readjustment, double row_origin) {
@@ -178,7 +162,7 @@ void bind_geometry(nb::module_& m) {
         .def("frame_pose",
              [](const hg::TileGeometry& g, const std::string& tile, DoubleIn angle_deg, DoubleIn frame, double row) {
                  const auto p = g.frame_pose(tile, vec(angle_deg), vec(frame), row);
-                 return nb::make_tuple(arr(p.angle_deg), arr(p.column), arr(p.height_rows));
+                 return nb::make_tuple(vc_tomography::py::to_numpy(p.angle_deg), vc_tomography::py::to_numpy(p.column), vc_tomography::py::to_numpy(p.height_rows));
              },
              "tile"_a, "angle_deg"_a, "frame"_a, "row"_a = -1.0)
         .def("reconstruction_terms",

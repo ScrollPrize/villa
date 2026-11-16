@@ -9,6 +9,7 @@
 #include <Eigen/QR>
 #include <Eigen/SparseQR>
 #include "calibration/ceres_support.hpp"
+#include "calibration/stats.hpp"
 #include <string>
 
 namespace vc_tomography::calibration {
@@ -63,19 +64,7 @@ Rows by_row(const LinearProblem& p) {
     return r;
 }
 
-double robust_spread(std::vector<double> v) {
-    if (v.empty()) return 0;
-    const auto median = [](std::vector<double>& a) {
-        const std::size_t h = a.size() / 2;
-        std::nth_element(a.begin(), a.begin() + static_cast<std::ptrdiff_t>(h), a.end());
-        double m = a[h];
-        if (a.size() % 2 == 0) m = 0.5 * (m + *std::max_element(a.begin(), a.begin() + static_cast<std::ptrdiff_t>(h)));
-        return m;
-    };
-    const double centre = median(v);
-    for (double& x : v) x = std::fabs(x - centre);
-    return 1.4826 * median(v);
-}
+double robust_spread(std::vector<double> v) { return v.empty() ? 0.0 : mad_sd(std::move(v)); }
 
 // Equations with identical dependencies share assembly, but each scalar residual
 // receives its own Huber loss. Encoding sign(r)*sqrt(rho(r*r)) lets Ceres batch the

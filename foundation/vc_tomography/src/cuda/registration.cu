@@ -10,6 +10,7 @@
 
 #include "calibration/registration_core.hpp"
 #include "cuda_utils.cuh"
+#include "cufft_utils.cuh"
 
 namespace vc_tomography::calibration {
 
@@ -17,13 +18,10 @@ namespace {
 
 using vc_tomography::cuda::DeviceBuffer;
 using vc_tomography::cuda::PinnedBuffer;
-
-void cufft_check(cufftResult r, const char* what) {
-    if (r != CUFFT_SUCCESS) throw Error(std::string("cuFFT error ") + std::to_string(r) + " in " + what);
-}
+using vc_tomography::cuda::cufft_check;
+using vc_tomography::cuda::grid_for;
 
 constexpr unsigned kBlock = 256;
-unsigned grid_for(size_t n) { return static_cast<unsigned>(std::min<size_t>((n + kBlock - 1) / kBlock, 65535u * 16u)); }
 
 // products without contraction into fused multiply-adds, as the CPU code is compiled
 __device__ inline cufftComplex cmul(cufftComplex a, cufftComplex b) {
@@ -63,7 +61,7 @@ __global__ void window_kernel(const float* __restrict__ src, size_t frame_stride
                               int n1, int n2, const float* __restrict__ mean, const float* __restrict__ w0, const float* __restrict__ w1,
                               const float* __restrict__ w2) {
     const size_t total = static_cast<size_t>(n0) * n1 * n2;
-    for (size_t idx = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x; idx < total; idx += static_cast<size_t>(gridDim.x) * blockDim.x) {
+    VC_TOMOGRAPHY_GRID_STRIDE(idx, total) {
         const int k = static_cast<int>(idx % n2);
         const int j = static_cast<int>((idx / n2) % n1);
         const size_t i = idx / (static_cast<size_t>(n1) * n2);
@@ -75,7 +73,7 @@ __global__ void window_kernel(const float* __restrict__ src, size_t frame_stride
 // in place: x = (x - mean[frame]) * t1[row]
 __global__ void centre_kernel(float* __restrict__ x, int n0, int n1, int n2, const float* __restrict__ mean, const float* __restrict__ t1) {
     const size_t total = static_cast<size_t>(n0) * n1 * n2;
-    for (size_t idx = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x; idx < total; idx += static_cast<size_t>(gridDim.x) * blockDim.x) {
+    VC_TOMOGRAPHY_GRID_STRIDE(idx, total) {
         const int j = static_cast<int>((idx / n2) % n1);
         const size_t i = idx / (static_cast<size_t>(n1) * n2);
         x[idx] = (x[idx] - mean[i]) * t1[j];
@@ -85,7 +83,7 @@ __global__ void centre_kernel(float* __restrict__ x, int n0, int n1, int n2, con
 // in place: x *= t0[frame] * t2[col]
 __global__ void taper_kernel(float* __restrict__ x, int n0, int n1, int n2, const float* __restrict__ t0, const float* __restrict__ t2) {
     const size_t total = static_cast<size_t>(n0) * n1 * n2;
-    for (size_t idx = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x; idx < total; idx += static_cast<size_t>(gridDim.x) * blockDim.x) {
+    VC_TOMOGRAPHY_GRID_STRIDE(idx, total) {
         const int k = static_cast<int>(idx % n2);
         const size_t i = idx / (static_cast<size_t>(n1) * n2);
         x[idx] *= t0[i] * t2[k];
@@ -95,7 +93,7 @@ __global__ void taper_kernel(float* __restrict__ x, int n0, int n1, int n2, cons
 // in place, spectra of the frames (n0, n1, nc): bin (frame, k1, k2) *= e[frame * n1 + k1]
 __global__ void row_phase_kernel(cufftComplex* __restrict__ spec, int n0, int n1, int nc, const cufftComplex* __restrict__ e) {
     const size_t total = static_cast<size_t>(n0) * n1 * nc;
-    for (size_t idx = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x; idx < total; idx += static_cast<size_t>(gridDim.x) * blockDim.x)
+    VC_TOMOGRAPHY_GRID_STRIDE(idx, total)
         spec[idx] = cmul(spec[idx], e[idx / nc]);
 }
 
@@ -104,7 +102,7 @@ __global__ void displace_kernel(const cufftComplex* __restrict__ src, cufftCompl
                                 const cufftDoubleComplex* __restrict__ e0, const cufftDoubleComplex* __restrict__ e1,
                                 const cufftDoubleComplex* __restrict__ e2) {
     const size_t total = static_cast<size_t>(n0) * n1 * nc;
-    for (size_t idx = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x; idx < total; idx += static_cast<size_t>(gridDim.x) * blockDim.x) {
+    VC_TOMOGRAPHY_GRID_STRIDE(idx, total) {
         const int k2 = static_cast<int>(idx % nc);
         const int k1 = static_cast<int>((idx / nc) % n1);
         const size_t k0 = idx / (static_cast<size_t>(n1) * nc);
@@ -190,7 +188,7 @@ __global__ void evaluation_sum_kernel(const double* input, int lines, int stride
 __global__ void gather_kernel(const float* __restrict__ r, int n0, int n1, int n2, int s0, int s1, int s2, float* __restrict__ out) {
     const int w0 = 2 * s0 + 1, w1 = 2 * s1 + 1, w2 = 2 * s2 + 1;
     const size_t total = static_cast<size_t>(w0) * w1 * w2;
-    for (size_t idx = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x; idx < total; idx += static_cast<size_t>(gridDim.x) * blockDim.x) {
+    VC_TOMOGRAPHY_GRID_STRIDE(idx, total) {
         const int d2 = static_cast<int>(idx % w2) - s2;
         const int d1 = static_cast<int>((idx / w2) % w1) - s1;
         const int d0 = static_cast<int>(idx / (static_cast<size_t>(w1) * w2)) - s0;
@@ -284,7 +282,7 @@ class CudaBackend final : public RegistrationBackend {
         const int rows = L[0] * L[1];
         row_sums_kernel<<<cuda::grid_1d(rows, 64), 64>>>(rbig_.data(), frame, L[2], L[0], L[1], L[2], nullptr, rowsum_.data());
         frame_means_kernel<<<cuda::grid_1d(L[0], 64), 64>>>(rowsum_.data(), L[0], L[1], nullptr, static_cast<double>(frame), mean_.data());
-        centre_kernel<<<grid_for(g_.NB), kBlock>>>(rbig_.data(), L[0], L[1], L[2], mean_.data(), t1_.data());
+        centre_kernel<<<grid_for(g_.NB, kBlock), kBlock>>>(rbig_.data(), L[0], L[1], L[2], mean_.data(), t1_.data());
         if (row_shift && largest > 0) {
             // each frame's rows displaced by its own amount: a phase along k1 of the frame's spectrum
             std::vector<cufftComplex> e(static_cast<std::size_t>(L[0]) * L[1]);
@@ -299,7 +297,7 @@ class CudaBackend final : public RegistrationBackend {
             row_phase_kernel<<<grid_for(g_.NBC), kBlock>>>(cwork_.data(), L[0], L[1], g_.Lc, row_phase_.data());
             cufft_check(cufftExecC2R(frames_inverse_, cwork_.data(), rbig_.data()), "cufftExecC2R");
         }
-        taper_kernel<<<grid_for(g_.NB), kBlock>>>(rbig_.data(), L[0], L[1], L[2], t0_.data(), t2_.data());
+        taper_kernel<<<grid_for(g_.NB, kBlock), kBlock>>>(rbig_.data(), L[0], L[1], L[2], t0_.data(), t2_.data());
         cufft_check(cufftExecR2C(big_forward_, rbig_.data(), cbig_.data()), "cufftExecR2C");
     }
 

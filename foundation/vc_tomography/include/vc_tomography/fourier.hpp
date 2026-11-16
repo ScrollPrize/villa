@@ -85,6 +85,8 @@ namespace cuda {
 std::unique_ptr<FourierFilter> make_fourier_filter(const FourierFilterSpec& spec);
 }
 #endif
+// the filter on `device` (an Error for CUDA in a build without it)
+std::unique_ptr<FourierFilter> make_fourier_filter(Device device, const FourierFilterSpec& spec);
 
 // Index of the source sample for padded coordinate i (may be outside [0, n)).
 // Returns -1 for zero padding. Shared by the CPU and CUDA paths.

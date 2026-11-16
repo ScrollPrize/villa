@@ -4,42 +4,17 @@
 #include "common/rebalance_core.hpp"
 #include "common/sino_core.hpp"
 #include "cuda_utils.cuh"
+#include "../common/elementwise_core.hpp"
 
 namespace vc_tomography::cuda {
 
 namespace {
 
-unsigned grid_for(size_t n) { return static_cast<unsigned>(std::min<size_t>((n + 255) / 256, 65535u * 16u)); }
-
-__global__ void minus_log_kernel(float* x, size_t n, float lo, float hi) {
-    for (size_t i = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x; i < n; i += static_cast<size_t>(gridDim.x) * blockDim.x)
-        x[i] = sino_core::minus_log(x[i], lo, hi);
-}
-
-__global__ void multiply_kernel(float* x, const float* w, size_t n) {
-    for (size_t i = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x; i < n; i += static_cast<size_t>(gridDim.x) * blockDim.x)
-        x[i] = __fmul_rn(x[i], w[i]);
-}
-
-__global__ void add_scaled_kernel(float* x, const float* y, float s, size_t n) {
-    for (size_t i = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x; i < n; i += static_cast<size_t>(gridDim.x) * blockDim.x)
-        x[i] = __fadd_rn(x[i], __fmul_rn(s, y[i]));
-}
-
-__global__ void weight_difference_kernel(const float* x, const float* w, const float* w2, float* t, size_t n) {
-    for (size_t i = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x; i < n; i += static_cast<size_t>(gridDim.x) * blockDim.x)
-        t[i] = __fmul_rn(x[i], __fsub_rn(w2[i], w[i]));
-}
-
-__global__ void multiply_add_kernel(float* x, const float* w, const float* t, size_t n) {
-    for (size_t i = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x; i < n; i += static_cast<size_t>(gridDim.x) * blockDim.x)
-        x[i] = __fadd_rn(__fmul_rn(x[i], w[i]), t[i]);
-}
 
 __global__ void angular_fir_kernel(const float* __restrict__ in, float* __restrict__ out, int n_proj, int n_cols,
                                    const float* __restrict__ g, int radius, const float* __restrict__ support) {
     const size_t n = static_cast<size_t>(n_proj) * n_cols;
-    for (size_t i = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x; i < n; i += static_cast<size_t>(gridDim.x) * blockDim.x)
+    VC_TOMOGRAPHY_GRID_STRIDE(i, n)
         out[i] = sino_core::angular_fir_at(in, support, n_proj, n_cols, static_cast<int>(i / n_cols), static_cast<int>(i % n_cols), g, radius);
 }
 
@@ -76,7 +51,7 @@ __global__ void ramp_adj_kernel(const float* sino, float* adj, RampGeometry g, c
 
 __global__ void ramp_pad_kernel(const float* sino, const float* adj, float* padded, RampGeometry g, const int32_t* opposite) {
     const size_t total = static_cast<size_t>(g.n_proj) * g.npad;
-    for (size_t k = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x; k < total; k += static_cast<size_t>(gridDim.x) * blockDim.x) {
+    VC_TOMOGRAPHY_GRID_STRIDE(k, total) {
         const int x = static_cast<int>(k % g.npad), y = static_cast<int>(k / g.npad);
         const int m = opposite ? opposite[y] : (y + g.n_proj / 2) % g.n_proj;
         padded[k] = sino_core::ramp_pad_value(sino + static_cast<size_t>(y) * g.n_bins, sino + static_cast<size_t>(m) * g.n_bins,
@@ -86,7 +61,7 @@ __global__ void ramp_pad_kernel(const float* sino, const float* adj, float* padd
 
 __global__ void ramp_crop_kernel(const float* padded, float* out, RampGeometry g) {
     const size_t total = static_cast<size_t>(g.n_proj) * g.n_bins;
-    for (size_t k = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x; k < total; k += static_cast<size_t>(gridDim.x) * blockDim.x)
+    VC_TOMOGRAPHY_GRID_STRIDE(k, total)
         out[k] = padded[(k / g.n_bins) * g.npad + k % g.n_bins];
 }
 
@@ -124,14 +99,14 @@ __global__ void peak_kernel(const float* W, size_t plane, size_t row_off, int n_
 }
 
 __global__ void average_planes_kernel(const float* a, const float* b, float* out, size_t n) {
-    for (size_t k = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x; k < n; k += static_cast<size_t>(gridDim.x) * blockDim.x)
+    VC_TOMOGRAPHY_GRID_STRIDE(k, n)
         out[k] = 0.5f * (a[k] + b[k]);
 }
 
 // fill_from_turns: samples without weight take the value of the nearest row a whole number of turns away that has one
 __global__ void fill_from_turns_kernel(float* R, const float* W, size_t plane, int n_proj, int turn) {
     const size_t n = static_cast<size_t>(n_proj) * plane;
-    for (size_t o = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x; o < n; o += static_cast<size_t>(gridDim.x) * blockDim.x) {
+    VC_TOMOGRAPHY_GRID_STRIDE(o, n) {
         if (W[o] != 0.0f) continue;
         const size_t k = o % plane;
         const int src = sino_core::turn_source(W, plane, k, n_proj, turn, static_cast<int>(o / plane));
@@ -319,30 +294,13 @@ int rebalance(float* R, float* W, int n_proj, int n_rows, int n_cols, float rot_
     return static_cast<int>(holes.size());
 }
 
-void minus_log(float* x, std::size_t n, float lo, float hi, void* stream) {
-    minus_log_kernel<<<grid_for(n), 256, 0, as_stream(stream)>>>(x, n, lo, hi);
-    VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
-}
-
-void multiply(float* x, const float* w, std::size_t n, void* stream) {
-    multiply_kernel<<<grid_for(n), 256, 0, as_stream(stream)>>>(x, w, n);
-    VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
-}
-
-void add_scaled(float* x, const float* y, float s, std::size_t n, void* stream) {
-    add_scaled_kernel<<<grid_for(n), 256, 0, as_stream(stream)>>>(x, y, s, n);
-    VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
-}
-
+void minus_log(float* x, std::size_t n, float lo, float hi, void* stream) { each(n, elementwise::MinusLog{x, lo, hi}, as_stream(stream)); }
+void multiply(float* x, const float* w, std::size_t n, void* stream) { each(n, elementwise::Multiply{x, w}, as_stream(stream)); }
+void add_scaled(float* x, const float* y, float s, std::size_t n, void* stream) { each(n, elementwise::AddScaled{x, y, s}, as_stream(stream)); }
 void weight_difference(const float* x, const float* w, const float* w2, float* t, std::size_t n, void* stream) {
-    weight_difference_kernel<<<grid_for(n), 256, 0, as_stream(stream)>>>(x, w, w2, t, n);
-    VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
+    each(n, elementwise::WeightDifference{x, w, w2, t}, as_stream(stream));
 }
-
-void multiply_add(float* x, const float* w, const float* t, std::size_t n, void* stream) {
-    multiply_add_kernel<<<grid_for(n), 256, 0, as_stream(stream)>>>(x, w, t, n);
-    VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
-}
+void multiply_add(float* x, const float* w, const float* t, std::size_t n, void* stream) { each(n, elementwise::MultiplyAdd{x, w, t}, as_stream(stream)); }
 
 void angular_fir(const float* in, float* out, int n_proj, int n_cols, const float* g, int radius, const float* support,
                  void* stream) {

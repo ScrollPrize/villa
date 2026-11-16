@@ -7,6 +7,7 @@
 
 #include "common/block_spectra_core.hpp"
 #include "cuda_utils.cuh"
+#include "cufft_utils.cuh"
 #include "vc_tomography/block_spectra.hpp"
 
 namespace vc_tomography::cuda {
@@ -15,15 +16,10 @@ namespace core = block_spectra_core;
 
 namespace {
 
-void cufft_check(cufftResult r, const char* what) {
-    if (r != CUFFT_SUCCESS) throw Error(std::string("cuFFT error ") + std::to_string(r) + " in " + what);
-}
-
 // per (z, y) row of a block of edge e: sums over x of w v and w v^2 (doubles; the host adds the rows in order)
 __global__ void row_sums_kernel(const float* __restrict__ v, const float* __restrict__ w, int e, double* __restrict__ out) {
     const size_t rows = static_cast<size_t>(e) * e;
-    for (size_t r = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x; r < rows;
-         r += static_cast<size_t>(gridDim.x) * blockDim.x) {
+    VC_TOMOGRAPHY_GRID_STRIDE(r, rows) {
         const float* row = v + r * e;
         double s1 = 0, s2 = 0;
         for (int x = 0; x < e; ++x) {
@@ -39,8 +35,7 @@ __global__ void row_sums_kernel(const float* __restrict__ v, const float* __rest
 __global__ void window_kernel(const float* __restrict__ v, const float* __restrict__ w, int e, float mean,
                               float* __restrict__ out) {
     const size_t total = static_cast<size_t>(e) * e * e;
-    for (size_t k = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x; k < total;
-         k += static_cast<size_t>(gridDim.x) * blockDim.x) {
+    VC_TOMOGRAPHY_GRID_STRIDE(k, total) {
         const int x = static_cast<int>(k % e), y = static_cast<int>((k / e) % e), z = static_cast<int>(k / (static_cast<size_t>(e) * e));
         out[k] = (v[k] - mean) * (w[z] * w[y] * w[x]);
     }
@@ -50,8 +45,7 @@ __global__ void window_kernel(const float* __restrict__ v, const float* __restri
 __global__ void crop_kernel(const cufftComplex* __restrict__ src, cufftComplex* __restrict__ dst, int n, int m, float scale) {
     const int nc = n / 2 + 1, mc = m / 2 + 1;
     const size_t total = static_cast<size_t>(n) * n * nc;
-    for (size_t k = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x; k < total;
-         k += static_cast<size_t>(gridDim.x) * blockDim.x) {
+    VC_TOMOGRAPHY_GRID_STRIDE(k, total) {
         const int c = static_cast<int>(k % nc), iy = static_cast<int>((k / nc) % n), iz = static_cast<int>(k / (static_cast<size_t>(nc) * n));
         const int kz = core::signed_index(iz, n), ky = core::signed_index(iy, n);
         const int jz = kz < 0 ? kz + m : kz, jy = ky < 0 ? ky + m : ky;
@@ -65,8 +59,7 @@ __global__ void box_kernel(const cufftComplex* __restrict__ A, const cufftComple
                            double norm, float* __restrict__ out) {
     const int side = 2 * kb + 1, nx = kb + 1, nc = n / 2 + 1;
     const size_t total = static_cast<size_t>(side) * side * nx;
-    for (size_t k = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x; k < total;
-         k += static_cast<size_t>(gridDim.x) * blockDim.x) {
+    VC_TOMOGRAPHY_GRID_STRIDE(k, total) {
         const int c = static_cast<int>(k % nx), v = static_cast<int>((k / nx) % side), u = static_cast<int>(k / (static_cast<size_t>(nx) * side));
         const int iz = (u - kb + n) % n, iy = (v - kb + n) % n;
         const size_t i = (static_cast<size_t>(iz) * n + iy) * nc + c;
@@ -118,8 +111,7 @@ __global__ void reduce_kernel(const double* __restrict__ part, int n_parts, int 
 __global__ void resample_kernel(const float* __restrict__ src, int sz, int sy, int sx, const double* __restrict__ m,
                                 float* __restrict__ out, int nz, int ny, int nx, int interp) {
     const size_t total = static_cast<size_t>(nz) * ny * nx;
-    for (size_t q = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x; q < total;
-         q += static_cast<size_t>(gridDim.x) * blockDim.x) {
+    VC_TOMOGRAPHY_GRID_STRIDE(q, total) {
         const int i = static_cast<int>(q % nx), j = static_cast<int>((q / nx) % ny), k = static_cast<int>(q / (static_cast<size_t>(nx) * ny));
         // (as the CPU: the row's base, then the step along x)
         const double bz = m[0] * k + m[1] * j + m[3], by = m[4] * k + m[5] * j + m[7], bx = m[8] * k + m[9] * j + m[11];
@@ -127,7 +119,6 @@ __global__ void resample_kernel(const float* __restrict__ src, int sz, int sy, i
     }
 }
 
-unsigned grid_for(size_t n) { return static_cast<unsigned>(std::min<size_t>((n + 255) / 256, 65535u * 16u)); }
 
 class CufftBlockCorrelator final : public BlockCorrelator {
   public:

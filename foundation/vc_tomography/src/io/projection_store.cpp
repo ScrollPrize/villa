@@ -174,28 +174,36 @@ std::vector<double> projection_store_sum(const std::string& scan_group, int redu
     if (cols_out) *cols_out = cols;
     const std::size_t np = static_cast<std::size_t>(rows) * static_cast<std::size_t>(cols);
     const int chunks = (rows + level.chunk_rows - 1) / level.chunk_rows;
-    std::vector<double> sum(np, 0.0);
+    // Deterministic whatever the thread count: the frames fall into a fixed number of runs, each run summed in frame
+    // order into its own partial (chunks of rows in parallel), and the partials added in run order.
+    constexpr std::size_t kRuns = 8;
+    const std::size_t runs = std::max<std::size_t>(1, std::min(kRuns, n));
+    std::vector<double> partial(runs * np, 0.0);
 #pragma omp parallel
     {
         std::vector<float> chunk(static_cast<std::size_t>(level.chunk_rows) * static_cast<std::size_t>(cols));
-        std::vector<double> mine(np, 0.0);
-#pragma omp for schedule(static) collapse(2)
-        for (std::int64_t k = 0; k < static_cast<std::int64_t>(n); ++k)
+#pragma omp for schedule(dynamic) collapse(2)
+        for (std::int64_t g = 0; g < static_cast<std::int64_t>(runs); ++g)
             for (int c = 0; c < chunks; ++c) {
-                level.read_chunk(frame[k], c, chunk.data());
                 const int r0 = c * level.chunk_rows, nr = std::min(level.chunk_rows, rows - r0);
                 const std::size_t at = static_cast<std::size_t>(r0) * static_cast<std::size_t>(cols), count = static_cast<std::size_t>(nr) * static_cast<std::size_t>(cols);
-                double* to = mine.data() + at;
-                if (dark && weight) {
-                    const double w = weight[k];
-                    for (std::size_t i = 0; i < count; ++i) to[i] += static_cast<double>(dark[at + i]) + (static_cast<double>(chunk[i]) - static_cast<double>(dark[at + i])) * w;
-                } else {
-                    for (std::size_t i = 0; i < count; ++i) to[i] += static_cast<double>(chunk[i]);
+                double* to = partial.data() + static_cast<std::size_t>(g) * np + at;
+                const std::size_t k0 = n * static_cast<std::size_t>(g) / runs, k1 = n * static_cast<std::size_t>(g + 1) / runs;
+                for (std::size_t k = k0; k < k1; ++k) {
+                    level.read_chunk(frame[k], c, chunk.data());
+                    if (dark && weight) {
+                        const double w = weight[k];
+                        for (std::size_t i = 0; i < count; ++i) to[i] += static_cast<double>(dark[at + i]) + (static_cast<double>(chunk[i]) - static_cast<double>(dark[at + i])) * w;
+                    } else {
+                        for (std::size_t i = 0; i < count; ++i) to[i] += static_cast<double>(chunk[i]);
+                    }
                 }
             }
-#pragma omp critical
-        for (std::size_t i = 0; i < np; ++i) sum[i] += mine[i];
     }
+    std::vector<double> sum(np, 0.0);
+#pragma omp parallel for schedule(static)
+    for (std::int64_t i = 0; i < static_cast<std::int64_t>(np); ++i)
+        for (std::size_t g = 0; g < runs; ++g) sum[static_cast<std::size_t>(i)] += partial[g * np + static_cast<std::size_t>(i)];
     return sum;
 }
 

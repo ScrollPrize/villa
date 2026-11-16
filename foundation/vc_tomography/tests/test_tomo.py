@@ -7,7 +7,8 @@ import vc_tomography
 from vc_tomography import _core
 from vc_tomography.recon import backprojector_config
 
-cuda_only = pytest.mark.skipif(not vc_tomography.cuda_available(), reason="no CUDA")
+from helpers import cuda_only
+
 N, ND = 65, 76
 ROT = (ND - 1) / 2 + 0.3
 ANG = np.linspace(0, 2 * np.pi, 160, endpoint=False).astype(np.float32)
@@ -36,7 +37,6 @@ def test_projector_line_integrals():
     np.testing.assert_allclose(s[:, d], expect, rtol=0.03 + abs(t) * 0)
 
 
-@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_projector_adjoint(device):
     rng = np.random.default_rng(1)
     x = rng.standard_normal((N, N)).astype(np.float32)
@@ -53,7 +53,6 @@ def test_projector_cpu_cuda():
     np.testing.assert_allclose(_core.chord_project(x, ANG, ND, ROT, device="cuda"), sino_of(x), atol=2e-4)
 
 
-@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_gridrec_position_and_scale(device):
     s = sino_of(PH)
     w = np.full_like(s, 0.5)      # 360 deg: every ray measured twice
@@ -65,7 +64,6 @@ def test_gridrec_position_and_scale(device):
     assert best[1:] == (0, 0)
 
 
-@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_gridrec_windows_cut_at_nyquist(device):
     # a detector-Nyquist pattern: the default hann (cutoff 0.5 cycles per pixel) removes it, hamming leaves 8 %
     s = np.tile(np.where(np.arange(ND) % 2, -1, 1) * np.hanning(ND), (len(ANG), 1)).astype(np.float32)
@@ -104,7 +102,6 @@ def test_tomo_errors():
         _core.tomo_reconstruct(s, None, ANG, N, ROT, "gridrec", {"num_iter": "3"})
 
 
-@pytest.mark.parametrize("device", vc_tomography.devices())
 @pytest.mark.parametrize("interp", [0, 1, 2])
 def test_backproject_interp_constant(device, interp):
     # a constant row backprojects to n_angles inside the detector reach, whatever the kernel
@@ -114,7 +111,6 @@ def test_backproject_interp_constant(device, interp):
     np.testing.assert_allclose(img, 40.0, rtol=1e-4)
 
 
-@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_upsample_rows_band_limited(device):
     n, os_ = 128, 4
     x = np.arange(n)
@@ -126,7 +122,6 @@ def test_upsample_rows_band_limited(device):
     np.testing.assert_allclose(up[:, mid], exact[:, mid], atol=0.05)
 
 
-@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_shift_rows_exact(device):
     """A delay by a fraction of a sample that keeps the whole band (a phase ramp on the row's transform)."""
     n = 512
@@ -177,7 +172,6 @@ def test_disk_domain():
     assert np.abs(x[~out]).max() > 0.1
 
 
-@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_bspline_interpolation(device):
     # B-spline coefficients interpolate the samples exactly, and smooth signals between them far better than
     # linear / Keys cubic
@@ -198,7 +192,6 @@ def test_bspline_interpolation(device):
     assert err["bspline5"] < err["bspline3"] / 5
 
 
-@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_sf_projector(device):
     # separable footprint: exact adjoint pair, each pixel deposits exactly its area (1) per angle
     rng = np.random.default_rng(3)
@@ -215,7 +208,6 @@ def test_sf_projector(device):
     np.testing.assert_allclose(ones[10:55, 10:55], len(ANG), rtol=1e-5)
 
 
-@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_sf_cells_off_the_image(device):
     # a detector much wider than the image: cells whose boundaries miss it take no step and are exactly 0
     n, nd, rot = 33, 160, 79.5
@@ -226,7 +218,6 @@ def test_sf_cells_off_the_image(device):
     np.testing.assert_allclose(s, _core.chord_project(np.ones((n, n), np.float32), ANG, nd, rot, projector="sf"), atol=1e-4)
 
 
-@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_sirt_noisy(device):
     # row-sum normalisation keeps SIRT stable with the sf projector on noisy data (|a_i|^2 does not)
     s0 = _core.chord_project(PH, ANG, ND, ROT, projector="sf")

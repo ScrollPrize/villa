@@ -28,9 +28,6 @@ import numpy as np
 
 from . import _core
 
-BASE = Path("/mnt/raid_nvme/paris4_mosaic_recon")
-SOURCE = Path("/home/sean/mnt/esrf-bm18/keep_it_for_replaying_20260311/RAW_DATA")
-TILES = ["T0-01"] + [f"T1-{i:02}" for i in range(1, 7)] + [f"T2-{i:02}" for i in range(1, 13)]
 FORMAT = 1
 
 
@@ -118,7 +115,7 @@ def build_plan(args, log):
     link = _remote(args)
     for number, tile in enumerate(args.tiles, 1):
         log.info("Planning tile %d/%d: %s", number, len(args.tiles), tile)
-        label = tile if getattr(args, "scans", None) else f"1.129um_mosaic_PHerc_Paris4_ROI-1_{tile}"
+        label = tile if getattr(args, "scans", None) else args.tile_folder.format(tile=tile)
         relative = Path(label) / (label + "_0001")
         local, remote = args.local_root / relative, args.source_root / relative
         master_name = label + "_0001.h5"
@@ -645,18 +642,20 @@ def run_download(plan, args, log):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--output", type=Path, default=BASE / "projections/scale_0.125")
-    parser.add_argument("--source-root", type=Path, default=SOURCE)
-    parser.add_argument("--local-root", type=Path, default=BASE / "RAW_DATA")
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--source-root", type=Path, required=True, help="the acquisitions' RAW_DATA folder (with --remote: the path it stands for)")
+    parser.add_argument("--local-root", type=Path, help="a local copy of part of the source root, read first (default: the source root)")
     parser.add_argument("--slices", type=int, default=256, help="slab thickness in original-resolution Z slices")
     parser.add_argument("--reduce", type=int, nargs="+", choices=[1, 2, 3], default=[3],
                         help="resolution levels: 1=half, 2=quarter, 3=eighth; with --zarr, multiple levels share each source transfer")
-    parser.add_argument("--center-mm", type=float, default=-256.0385, help="recorded motor-Z centre of the existing Paris4 ROI")
+    parser.add_argument("--center-mm", type=float, required=True, help="recorded motor-Z centre of the slab")
     parser.add_argument("--context-turns", type=float, default=1.5)
-    selection = parser.add_mutually_exclusive_group()
-    selection.add_argument("--tiles", nargs="+", choices=TILES, default=TILES)
+    selection = parser.add_mutually_exclusive_group(required=True)
+    selection.add_argument("--tiles", nargs="+", help="mosaic tiles, each the acquisition folder --tile-folder names")
     selection.add_argument("--scans", nargs="+", help="acquisition folder names under the source root, instead of mosaic tiles; "
                            "each must contain NAME_0001/NAME_0001.h5. Names also identify groups in the output store.")
+    parser.add_argument("--tile-folder", help="the acquisition folder of a tile, {tile} standing for its name "
+                        "(e.g. 1.129um_mosaic_PHerc_Paris4_ROI-1_{tile}); required with --tiles")
     parser.add_argument("--workers", type=int, default=4, help="concurrent files, separate processes")
     parser.add_argument("--threads", type=int, default=2, help="C++ decoding threads per file")
     parser.add_argument("--batch-frames", type=int, default=8)
@@ -681,6 +680,8 @@ def main(argv=None):
         if any(name in (".", "..") or "/" in name or "\\" in name for name in args.scans):
             parser.error("--scans requires folder names, not paths")
         args.tiles = args.scans
+    elif not args.tile_folder or "{tile}" not in args.tile_folder:
+        parser.error("--tiles requires --tile-folder naming the folder with {tile}")
     if args.remote:
         try:
             import paramiko  # noqa: F401
@@ -695,7 +696,7 @@ def main(argv=None):
     if not _core.htj2k_float_frames_supported():
         parser.error("this requires vc_tomography built with OpenJPH (VC_TOMOGRAPHY_OPENJPH=ON)")
     args.output = args.output.resolve()
-    args.local_root = args.local_root.resolve()
+    args.local_root = (args.local_root or args.source_root).resolve()
     args.source_root = args.source_root.resolve()
     if args.zarr:
         args.zarr = args.zarr.resolve()

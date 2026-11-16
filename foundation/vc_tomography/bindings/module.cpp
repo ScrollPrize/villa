@@ -28,7 +28,7 @@
 #include "vc_tomography/reconstruction.hpp"
 #include "vc_tomography/calibration/scan.hpp"
 #include "vc_tomography/calibration/intensity.hpp"
-#include "ndarray_utils.hpp"
+#include "conversions.hpp"
 
 #ifdef VC_TOMOGRAPHY_WITH_CUDA
 #include "../src/cuda/cuda_utils.cuh"
@@ -200,10 +200,7 @@ class PyFourierFilter {
         s.ndim = ndim; s.h = h; s.w = w; s.ph = ph; s.pw = pw;
         s.pad_top = pad_top; s.pad_left = pad_left; s.mode = pad_mode_from_string(mode);
         s.filter.assign(filter.data(), filter.data() + filter.size());
-        if (device_ == Device::CPU) impl_ = cpu::make_fourier_filter(s);
-#ifdef VC_TOMOGRAPHY_WITH_CUDA
-        else impl_ = cuda::make_fourier_filter(s);
-#endif
+        impl_ = make_fourier_filter(device_, s);
     }
     HostOut apply(HostIn stack) {
         const auto& s = impl_->spec();
@@ -229,12 +226,7 @@ class PyFourierFilter {
         return out;
     }
 
-    PyFourierFilter(const FourierFilterSpec& s, const std::string& device) : device_(parse_device(device)) {
-        if (device_ == Device::CPU) impl_ = cpu::make_fourier_filter(s);
-#ifdef VC_TOMOGRAPHY_WITH_CUDA
-        else impl_ = cuda::make_fourier_filter(s);
-#endif
-    }
+    PyFourierFilter(const FourierFilterSpec& s, const std::string& device) : device_(parse_device(device)), impl_(make_fourier_filter(device_, s)) {}
     nb::dict info() const {
         const auto& s = impl_->spec();
         nb::dict d;
@@ -890,7 +882,6 @@ std::shared_ptr<ExternalBackprojector> python_backprojector(const FilterParams& 
     return std::make_shared<PyExternalBackprojector>(d);
 }
 
-nb::object json_loads(const std::string& text) { return nb::module_::import_("json").attr("loads")(text); }
 
 class PySliceReconstructor {
   public:
@@ -1077,17 +1068,12 @@ class PySliceReconstructor {
         // row r being bin first_bin + r)
         const std::size_t DY = h_hi - h_lo, NG = dbg.n_rows > 0 ? dbg.n_rows : impl_->n_grid(), NX = impl_->merged_width();
         d["first_bin"] = dbg.first_bin;
-        auto mk = [&](const std::vector<float>& v, std::vector<std::size_t> shape) {
-            HostOut a = new_array(shape);
-            std::memcpy(data(a), v.data(), v.size() * sizeof(float));
-            return a;
-        };
-        d["sino"] = mk(dbg.sino, {NG, DY, NX});
-        d["weights"] = mk(dbg.weights, {NG, DY, NX});
-        d["wbal"] = mk(dbg.wbal, {NG, DY, NX});
-        d["filtered"] = mk(dbg.filtered, {DY, NG, NX});
+        d["sino"] = to_numpy(dbg.sino, {NG, DY, NX});
+        d["weights"] = to_numpy(dbg.weights, {NG, DY, NX});
+        d["wbal"] = to_numpy(dbg.wbal, {NG, DY, NX});
+        d["filtered"] = to_numpy(dbg.filtered, {DY, NG, NX});
         // the angles each slice is backprojected at (radians, GHBP / nabu sign: -the exact backprojector's)
-        d["angles"] = mk(dbg.angles, {DY, NG});
+        d["angles"] = to_numpy(dbg.angles, {DY, NG});
         return d;
     }
     static std::vector<FilterChain> chains_from(const nb::object& sweep) {
@@ -1469,11 +1455,7 @@ NB_MODULE(_core, m) {
                   if (steps[s].stage != st) continue;
                   if (steps[s].fourier) {
                       const auto& spec = P.step_spec(s, H, W, steps.size() == 1 ? margin : -1);
-#ifdef VC_TOMOGRAPHY_WITH_CUDA
-                      auto f = dev == Device::CUDA ? cuda::make_fourier_filter(spec) : cpu::make_fourier_filter(spec);
-#else
-                      auto f = cpu::make_fourier_filter(spec);
-#endif
+                      auto f = make_fourier_filter(dev, spec);
                       f->apply(buf, buf, n);
                   } else {
                       for (auto* fl : steps[s].members) fl->apply(buf, n, H, W, dev);
@@ -1519,31 +1501,6 @@ NB_MODULE(_core, m) {
     }, "frames"_a, "config"_a, "Correct frames with a resolved SLD configuration (vc_tomography.sld.sld_config)");
 
     m.def("delta3d_available", &delta3d_available, "True if built with the vc-delta3d codec");
-    m.def(
-        "delta3d_compress",
-        [](nb::ndarray<const uint8_t, nb::ndim<3>, nb::c_contig, nb::device::cpu> a, const std::string& preset) {
-            std::vector<uint8_t> enc;
-            {
-                nb::gil_scoped_release nogil;
-                enc = delta3d_compress_u8(a.data(), static_cast<int>(a.shape(0)), static_cast<int>(a.shape(1)),
-                                          static_cast<int>(a.shape(2)), preset.c_str());
-            }
-            return nb::bytes(reinterpret_cast<const char*>(enc.data()), enc.size());
-        },
-        "chunk"_a, "preset"_a = "fast", "lossless vc-delta3d payload of a (z, y, x) uint8 chunk");
-    m.def(
-        "delta3d_decompress",
-        [](nb::bytes payload, std::vector<std::size_t> shape) {
-            auto out = new_array_t<uint8_t>(shape);
-            const auto* src = reinterpret_cast<const uint8_t*>(payload.c_str());
-            const std::size_t n = payload.size(), size = out.size();
-            {
-                nb::gil_scoped_release nogil;
-                delta3d_decompress(src, n, static_cast<uint8_t*>(out.data()), size);
-            }
-            return out;
-        },
-        "payload"_a, "shape"_a, "decode a vc-delta3d payload into a uint8 array of `shape`");
 
     m.def("span_info",
           [](DIn angles_deg, DIn z_translation_m, double pixel_size_m, int det_rows, float z_readjustment, double tol) {
@@ -1554,23 +1511,13 @@ NB_MODULE(_core, m) {
               t.det_rows = det_rows;
               t.z_readjustment = z_readjustment;
               SpanInfo s = make_span_info(t, tol);
-              auto iarr = [](const std::vector<int32_t>& v) {
-                  auto a = new_array_t<int32_t>({v.size()});
-                  std::copy(v.begin(), v.end(), static_cast<int32_t*>(a.data()));
-                  return a;
-              };
-              auto farr = [](const std::vector<float>& v) {
-                  HostOut a = new_array({v.size()});
-                  std::copy(v.begin(), v.end(), data(a));
-                  return a;
-              };
               nb::dict d;
-              d["integer_shift_v"] = iarr(s.integer_shift_v);
-              d["fract_complement"] = farr(s.fract_complement);
-              d["z_pix_per_proj"] = farr(s.z_pix_per_proj);
+              d["integer_shift_v"] = to_numpy(s.integer_shift_v);
+              d["fract_complement"] = to_numpy(s.fract_complement);
+              d["z_pix_per_proj"] = to_numpy(s.z_pix_per_proj);
               d["h_first"] = s.h_first;
-              d["sunshine_start"] = iarr(s.sunshine_start);
-              d["sunshine_end"] = iarr(s.sunshine_end);
+              d["sunshine_start"] = to_numpy(s.sunshine_start);
+              d["sunshine_end"] = to_numpy(s.sunshine_end);
               d["doable"] = nb::make_tuple(s.doable_lo, s.doable_hi);
               return d;
           },
@@ -1655,7 +1602,6 @@ NB_MODULE(_core, m) {
               return std::make_tuple(n.scale, n.seed, n.gain, n.floor, smooth);
           },
           "spec"_a, "noise_split 'scale=S,seed=N,gain=G,floor=F[,smooth=SHARE:SPACING[+..]]' as (scale, seed, gain, floor, [(share, spacing)]); '' is scale 0");
-    m.def("build_revision", &build_revision);
     m.def(
         "tile_reconstructor",
         [](const std::string& master, const std::string& description, const std::string& tile, const std::string& device, const std::string& params,
@@ -1670,11 +1616,7 @@ NB_MODULE(_core, m) {
             o.cache_dir = cache_dir;
             o.reduce = reduce;
             o.external_backprojector = python_backprojector;
-            if (log)
-                o.log = [log](const std::string& line) {
-                    nb::gil_scoped_acquire gil;
-                    (*log)(line);
-                };
+            o.log = vc_tomography::py::python_log(log);
             if (!weight.is_none())
                 o.weight = [weight](std::vector<float>& w, int rows, int cols) {
                     nb::gil_scoped_acquire gil;
@@ -1699,34 +1641,13 @@ NB_MODULE(_core, m) {
                 nb::gil_scoped_release nogil;
                 t = tile_reconstructor(master, description, tile, o);
             }
-            const auto f32 = [](const std::vector<float>& v) {
-                auto a = new_array_t<float>({v.size()});
-                std::copy(v.begin(), v.end(), static_cast<float*>(a.data()));
-                return nb::cast(a, nb::rv_policy::move);
-            };
-            const auto f64 = [](const std::vector<double>& v) {
-                auto a = new_array_t<double>({v.size()});
-                std::copy(v.begin(), v.end(), static_cast<double*>(a.data()));
-                return nb::cast(a, nb::rv_policy::move);
-            };
-            const geometry::Terms& T = t.terms;
-            nb::dict terms;
-            terms["angles_deg"] = f64(T.angles_deg), terms["z_translation_scale"] = T.z_translation_scale;
-            terms["row_offset"] = f32(T.row_offset), terms["row_slope"] = f32(T.row_slope), terms["slope_col"] = T.slope_col;
-            terms["col_offset"] = f32(T.col_offset), terms["col_slope"] = f32(T.col_slope), terms["slope_row"] = T.slope_row;
-            terms["col_scale"] = f32(T.col_scale), terms["scale_col"] = T.scale_col, terms["row_scale"] = f32(T.row_scale), terms["scale_row"] = T.scale_row;
-            const std::size_t R = static_cast<std::size_t>(t.reduced.rows), C = static_cast<std::size_t>(t.reduced.cols);
-            auto dark = new_array_t<float>({R, C});
-            std::copy(t.reduced.dark.begin(), t.reduced.dark.end(), static_cast<float*>(dark.data()));
-            auto flats = new_array_t<float>({t.reduced.series(), R, C});
-            std::copy(t.reduced.flats.begin(), t.reduced.flats.end(), static_cast<float*>(flats.data()));
             nb::dict info;
             info["rot_center"] = t.rot_center;
             info["frames"] = nb::make_tuple(t.first_frame, t.end_frame);
             info["scan"] = nb::cast(std::move(t.scan));
-            info["terms"] = terms;
+            info["terms"] = terms_dict(t.terms);
             info["row_origin"] = t.row_origin;
-            info["reduced"] = nb::make_tuple(nb::cast(dark, nb::rv_policy::move), nb::cast(flats, nb::rv_policy::move));
+            info["reduced"] = darks_flats_tuple(t.reduced);
             info["reduce"] = t.reduce;
             info["params"] = json_loads(t.parameters);
             return nb::make_tuple(PySliceReconstructor(t.reconstructor), info);
@@ -1767,11 +1688,7 @@ NB_MODULE(_core, m) {
                 o.device = parse_device(device);
                 o.progress = progress;
                 o.projection_store = projection_store, o.reduce = reduce;
-                if (log)
-                    o.log = [log](const std::string& line) {
-                        nb::gil_scoped_acquire gil;
-                        (*log)(line);
-                    };
+                o.log = vc_tomography::py::python_log(log);
                 o.external_backprojector = python_backprojector;
                 nb::gil_scoped_release nogil;
                 new (self) Reconstruction(projections, params, std::move(o));

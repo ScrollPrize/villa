@@ -29,4 +29,13 @@ void validate(const FourierFilterSpec& s) {
         throw Error("FourierFilterSpec: filter_imag must be empty or match filter");
 }
 
+std::unique_ptr<FourierFilter> make_fourier_filter(Device device, const FourierFilterSpec& spec) {
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
+    if (device == Device::CUDA) return cuda::make_fourier_filter(spec);
+#else
+    if (device == Device::CUDA) throw Error("vc_tomography was built without CUDA");
+#endif
+    return cpu::make_fourier_filter(spec);
+}
+
 }  // namespace vc_tomography

@@ -12,12 +12,6 @@ namespace vc_tomography::calibration {
 
 namespace {
 
-std::string join(const std::vector<std::string>& v, const char* sep = "; ") {
-    std::string s;
-    for (std::size_t i = 0; i < v.size(); ++i) s += (i ? sep : "") + v[i];
-    return s;
-}
-
 int n_strips(const Inventory& inv, int cols) { return (cols + inv.strip_cols - 1) / inv.strip_cols; }
 
 // the rectangle of the recorded statistics; without one, the whole frame
@@ -151,7 +145,7 @@ Inventory check_inventory(const Record& rec, Frames& frames, Report& rep, int st
         Finding& f = rep.add("4.1", scan, "every frame on disk against the statistics recorded for it at acquisition");
         f.stated = "sum, min, max and mean of each frame over the statistics rectangle";
         f.found = fmt("%lld frames read, %lld compared, %lld differ", static_cast<long long>(frames_read), static_cast<long long>(compared), static_cast<long long>(mismatched));
-        if (!first_bad.empty()) f.found += ": " + join(first_bad);
+        if (!first_bad.empty()) f.found += ": " + join(first_bad, "; ");
         f.verdict = compared == 0 ? "unverified" : mismatched == 0 ? "verified" : "fails";
         f.note = "the sums are integers and are compared exactly: frame k of the record is the frame the detector software saw as k, unaltered. "
                  "This does not show that the camera delivered a frame for every trigger";
@@ -165,7 +159,7 @@ Inventory check_inventory(const Record& rec, Frames& frames, Report& rep, int st
             if (f.verdict == "verified") f.verdict = "unverified";
         }
         if (!sparse.empty()) {
-            f.found += "; not every frame was read: " + join(sparse) + fmt("; every chunk of the %lld frames of those stretches on disk was located in its file", static_cast<long long>(located));
+            f.found += "; not every frame was read: " + join(sparse, "; ") + fmt("; every chunk of the %lld frames of those stretches on disk was located in its file", static_cast<long long>(located));
             if (f.verdict == "verified") f.verdict = "unverified";
             f.numbers.push_back({"located", static_cast<double>(located)});
         }
@@ -174,7 +168,7 @@ Inventory check_inventory(const Record& rec, Frames& frames, Report& rep, int st
     if (!lossy.empty()) {
         Finding& f = rep.add("4.8 8.1", scan, "how the frames are stored");
         f.stated = "the dataset's filter and the header of the first chunk of each stretch";
-        f.found = join(lossy);
+        f.found = join(lossy, "; ");
         bool exact = true;
         for (const std::string& l : lossy) exact &= l.find("irreversible") == std::string::npos;
         f.verdict = exact ? "note" : "unverified";
@@ -233,7 +227,7 @@ Inventory check_inventory(const Record& rec, Frames& frames, Report& rep, int st
             (void)total;
         }
         f.stated = "16-bit values; the saturation flag of the detector software is off";
-        f.found = join(parts);
+        f.found = join(parts, "; ");
         f.note = "values outside the continuous distribution are isolated outliers (8.1.7). A value is the mean of binned sensor pixels: one saturated sensor pixel does not reach 65535";
     }
     return inv;
@@ -410,7 +404,7 @@ void check_series(const Record& rec, Frames& frames, const FlatField& ff, Report
         }
         Finding& f = rep.add("4.2 8.2.2 8.2.5", scan, "flat frames");
         f.stated = "the flat stretches, taken with the sample moved out sideways";
-        f.found = join(parts) + (proj_text.empty() ? "" : "; " + proj_text);
+        f.found = join(parts, "; ") + (proj_text.empty() ? "" : "; " + proj_text);
         f.verdict = "unverified";
         f.note = "These are 32x32 block averages, not bounds on every pixel. Differences between and within the series require a time-dependent beam/flat model and residual noise validation; a 10 percent agreement is not verification. Something present in every flat is not excluded";
     }
@@ -437,7 +431,7 @@ void check_series(const Record& rec, Frames& frames, const FlatField& ff, Report
         if (!recorded && !parts.empty()) {
             Finding& f = rep.add("8.2.3", scan, "flat level against the ring current (whole frames)");
             f.stated = "ring current read with every flat";
-            f.found = join(parts);
+            f.found = join(parts, "; ");
             f.verdict = "unverified";
             if (per_ma.size() > 1) {
                 const Spread p = spread(per_ma);

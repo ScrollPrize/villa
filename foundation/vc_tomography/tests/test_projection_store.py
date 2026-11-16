@@ -12,12 +12,13 @@ import pytest
 
 from vc_tomography import _core
 
+from helpers import find_tool
+
+
 h5py = pytest.importorskip("h5py")
 from test_reconstruct_tool import COLS, ROWS, _write  # noqa: E402
 
-_HERE = Path(_core.__file__).resolve().parent
-TOOL = next((str(d / "vc_tomography_projections_zarr") for d in (_HERE, *_HERE.parents[:2]) if (d / "vc_tomography_projections_zarr").exists()),
-            None) or shutil.which("vc_tomography_projections_zarr")
+TOOL = find_tool("vc_tomography_projections_zarr")
 pytestmark = pytest.mark.skipif(TOOL is None, reason="vc_tomography_projections_zarr is not built")
 N, FIRST = 240, 40           # projections of the scan; the store holds [FIRST, N)
 DATASET = "/entry_0000/instrument/det3/data"

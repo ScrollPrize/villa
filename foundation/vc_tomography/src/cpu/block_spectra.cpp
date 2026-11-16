@@ -10,6 +10,7 @@
 #include "common/block_spectra_core.hpp"
 #include "vc_tomography/block_spectra.hpp"
 #include "vc_tomography/fourier.hpp"
+#include "cpu/fftw_plan.hpp"
 
 namespace vc_tomography::cpu {
 
@@ -33,20 +34,21 @@ class FftwBlockCorrelator final : public BlockCorrelator {
         A_ = fftwf_alloc_complex(static_cast<std::size_t>(n_) * n_ * nc_);
         B_ = fftwf_alloc_complex(static_cast<std::size_t>(m_) * m_ * (m_ / 2 + 1));
         if (!real_ || !A_ || !B_) throw Error("fftw allocation failed");
-        std::lock_guard<std::mutex> lock(fftw_planner_mutex());
-        static const bool threads = fftwf_init_threads() != 0;
-        if (threads) fftwf_plan_with_nthreads(omp_get_max_threads());
-        fwd_a_ = fftwf_plan_dft_r2c_3d(n_, n_, n_, real_, A_, FFTW_ESTIMATE);
-        fwd_b_ = fftwf_plan_dft_r2c_3d(m_, m_, m_, real_, B_, FFTW_ESTIMATE);
-        if (threads) fftwf_plan_with_nthreads(1);   // (every other plan of the library is single-threaded)
-        if (!fwd_a_ || !fwd_b_) throw Error("fftw planning failed");
+        // multithreaded plans (every other plan of the library is single-threaded)
+        const auto threaded = [&](int n, fftwf_complex* to) {
+            return make_fftw_plan([&] {
+                static const bool threads = fftwf_init_threads() != 0;
+                if (threads) fftwf_plan_with_nthreads(omp_get_max_threads());
+                const fftwf_plan p = fftwf_plan_dft_r2c_3d(n, n, n, real_, to, FFTW_ESTIMATE);
+                if (threads) fftwf_plan_with_nthreads(1);
+                return p;
+            });
+        };
+        fwd_a_ = threaded(n_, A_);
+        fwd_b_ = threaded(m_, B_);
     }
     ~FftwBlockCorrelator() override {
-        {
-            std::lock_guard<std::mutex> lock(fftw_planner_mutex());
-            if (fwd_a_) fftwf_destroy_plan(fwd_a_);
-            if (fwd_b_) fftwf_destroy_plan(fwd_b_);
-        }
+        fwd_a_.reset(), fwd_b_.reset();
         fftwf_free(real_);
         fftwf_free(A_);
         fftwf_free(B_);
@@ -197,7 +199,7 @@ class FftwBlockCorrelator final : public BlockCorrelator {
     std::vector<double> tan2_;
     float* real_ = nullptr;
     fftwf_complex *A_ = nullptr, *B_ = nullptr;
-    fftwf_plan fwd_a_ = nullptr, fwd_b_ = nullptr;
+    FftwfPlan fwd_a_, fwd_b_;
 };
 
 }  // namespace

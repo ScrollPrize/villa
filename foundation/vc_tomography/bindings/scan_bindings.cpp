@@ -16,13 +16,6 @@ namespace hc = vc_tomography::calibration;
 
 namespace {
 
-// a NumPy copy (as an object: the properties' reference_internal policy does not apply to an array that owns its memory)
-template <class T>
-nb::object arr(const std::vector<T>& v) {
-    auto a = new_array_t<T>({v.size()});
-    std::copy(v.begin(), v.end(), static_cast<T*>(a.data()));
-    return nb::cast(a, nb::rv_policy::move);
-}
 
 std::vector<hc::Scan> scans_of(const nb::list& scans) {
     std::vector<hc::Scan> out;
@@ -38,8 +31,8 @@ void bind_scan(nb::module_& m) {
                               "(vc_tomography::calibration::FrameList)")
         .def_ro("files", &hc::FrameList::files)
         .def_ro("dataset", &hc::FrameList::dataset)
-        .def_prop_ro("file_index", [](const hc::FrameList& f) { return arr(f.file_index); })
-        .def_prop_ro("frame_index", [](const hc::FrameList& f) { return arr(f.frame_index); })
+        .def_prop_ro("file_index", [](const hc::FrameList& f) { return vc_tomography::py::to_numpy_object(f.file_index); })
+        .def_prop_ro("frame_index", [](const hc::FrameList& f) { return vc_tomography::py::to_numpy_object(f.frame_index); })
         .def("subset", [](const hc::FrameList& f, const std::vector<std::int64_t>& idx) { return f.subset(idx); }, "idx"_a,
              "the frames idx, with the same files")
         .def("__len__", &hc::FrameList::size);
@@ -56,17 +49,17 @@ void bind_scan(nb::module_& m) {
         .def_ro("darks", &hc::Scan::darks)
         .def_ro("flats", &hc::Scan::flats)
         .def_prop_ro("n_proj", [](const hc::Scan& s) { return s.projections.size(); })
-        .def_prop_ro("angles_deg", [](const hc::Scan& s) { return arr(s.angles_deg); })
-        .def_prop_ro("unwrapped_angles_deg", [](const hc::Scan& s) { return arr(s.unwrapped_angles_deg); })
-        .def_prop_ro("z_translation_m", [](const hc::Scan& s) { return arr(s.z_translation_m); })
-        .def_prop_ro("control_A", [](const hc::Scan& s) { return arr(s.control_A); })
+        .def_prop_ro("angles_deg", [](const hc::Scan& s) { return vc_tomography::py::to_numpy_object(s.angles_deg); })
+        .def_prop_ro("unwrapped_angles_deg", [](const hc::Scan& s) { return vc_tomography::py::to_numpy_object(s.unwrapped_angles_deg); })
+        .def_prop_ro("z_translation_m", [](const hc::Scan& s) { return vc_tomography::py::to_numpy_object(s.z_translation_m); })
+        .def_prop_ro("control_A", [](const hc::Scan& s) { return vc_tomography::py::to_numpy_object(s.control_A); })
         .def_prop_ro("flats_control_A", [](const hc::Scan& s) {
             nb::list out;
-            for (const auto& c : s.flats_control_A) out.append(arr(c));
+            for (const auto& c : s.flats_control_A) out.append(vc_tomography::py::to_numpy_object(c));
             return out;
         })
-        .def_prop_ro("flats_unwrapped_angles_deg", [](const hc::Scan& s) { return arr(s.flats_unwrapped_angles_deg); })
-        .def_prop_ro("darks_control_A", [](const hc::Scan& s) { return arr(s.darks_control_A); })
+        .def_prop_ro("flats_unwrapped_angles_deg", [](const hc::Scan& s) { return vc_tomography::py::to_numpy_object(s.flats_unwrapped_angles_deg); })
+        .def_prop_ro("darks_control_A", [](const hc::Scan& s) { return vc_tomography::py::to_numpy_object(s.darks_control_A); })
         .def_ro("y_translation_m", &hc::Scan::y_translation_m)
         .def_ro("estimated_cor_from_motor_pix", &hc::Scan::estimated_cor_from_motor_pix)
         .def_ro("energy_kev", &hc::Scan::energy_kev)

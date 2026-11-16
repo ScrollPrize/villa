@@ -12,8 +12,10 @@
 #include "common/tomo_algorithms.hpp"
 #include "common/tomo_core.hpp"
 #include "cuda_utils.cuh"
+#include "cufft_utils.cuh"
 #include "vc_tomography/tomo.hpp"
 #include "vc_tomography/sino.hpp"
+#include "../common/elementwise_core.hpp"
 
 namespace vc_tomography::cuda {
 
@@ -21,15 +23,13 @@ namespace {
 using tomo_core::AngleC;
 using tomo_core::Geom;
 constexpr int kTile = 16, kAngles = 256;
-unsigned grid_for(std::size_t n) { return static_cast<unsigned>(std::min<std::size_t>((n + 255) / 256, 65535u * 16u)); }
 
 // Chord model: one thread per ray (neighbouring threads: neighbouring rays of one angle)
 template <class E>
 __global__ void project_kernel(const float* __restrict__ x, const float* __restrict__ xT, const int32_t* sel, int n_sel,
                                const AngleC* __restrict__ ak, Geom g, E epi) {
     const std::size_t total = static_cast<std::size_t>(n_sel) * g.n_det;
-    for (std::size_t q = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x; q < total;
-         q += static_cast<std::size_t>(gridDim.x) * blockDim.x) {
+    VC_TOMOGRAPHY_GRID_STRIDE(q, total) {
         const int a = sel[q / g.n_det], d = static_cast<int>(q % g.n_det);
         const AngleC k = ak[a];
         const float t0 = static_cast<float>(d) - g.rot;
@@ -63,8 +63,7 @@ __global__ void project_warp_kernel(const float* __restrict__ x, const float* __
 template <int L2>
 __global__ void len2_kernel(const AngleC* __restrict__ ak, int n_angles, Geom g, float* l2) {
     const std::size_t total = static_cast<std::size_t>(n_angles) * g.n_det;
-    for (std::size_t q = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x; q < total;
-         q += static_cast<std::size_t>(gridDim.x) * blockDim.x)
+    VC_TOMOGRAPHY_GRID_STRIDE(q, total)
         tomo_core::project_ray<false, L2>(nullptr, nullptr, g, ak[q / g.n_det], static_cast<int>(q % g.n_det), &l2[q]);
 }
 
@@ -191,27 +190,11 @@ void transpose(const float* in, float* out, int W, int H) {
     VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
 }
 
-template <class F>
-__global__ void each_kernel(std::size_t n, F f) {
-    for (std::size_t i = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x; i < n;
-         i += static_cast<std::size_t>(gridDim.x) * blockDim.x)
-        f(i);
-}
-
-struct FillF {
-    float* d; float v;
-    HR_HD void operator()(std::size_t i) const { d[i] = v; }
-};
-struct WeightF {
-    const float *r, *w; float* o;
-    HR_HD void operator()(std::size_t i) const { o[i] = r[i] * w[i]; }
-};
 
 // ---------------------------------------------------------------- gridrec
 __global__ void pad_complex_kernel(const float* rows, cufftComplex* out, int n_rows, int nd, int pdim) {
     const std::size_t total = static_cast<std::size_t>(n_rows) * pdim;
-    for (std::size_t k = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x; k < total;
-         k += static_cast<std::size_t>(gridDim.x) * blockDim.x) {
+    VC_TOMOGRAPHY_GRID_STRIDE(k, total) {
         const int j = static_cast<int>(k % pdim);
         out[k] = make_cuFloatComplex(j < nd ? rows[(k / pdim) * nd + j] : 0.f, 0.f);
     }
@@ -222,8 +205,7 @@ __global__ void spread_kernel(const cufftComplex* sino, int n_rows, int pdim, co
                               int p0, const float* wtbl, float L2, float tblspcg, float w0, float* H) {
     const int pd2 = pdim / 2;
     const std::size_t total = static_cast<std::size_t>(n_rows) * (pd2 - 1);
-    for (std::size_t q = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x; q < total;
-         q += static_cast<std::size_t>(gridDim.x) * blockDim.x) {
+    VC_TOMOGRAPHY_GRID_STRIDE(q, total) {
         const int r = static_cast<int>(q / (pd2 - 1)), j = 1 + static_cast<int>(q % (pd2 - 1));
         const cufftComplex* s = sino + static_cast<std::size_t>(r) * pdim;
         const float2 t = cs[p0 + r];
@@ -257,16 +239,11 @@ __global__ void spread_kernel(const cufftComplex* sino, int n_rows, int pdim, co
 __global__ void extract_kernel(const cufftComplex* H, const float* winv, int pdim, int N, float* out) {
     const int o = N / 2, linv = pdim / 2 - 1;  // FFT origin (even N: + the half-pixel phase; see the CPU gridrec)
     const std::size_t total = static_cast<std::size_t>(N) * N;
-    for (std::size_t k = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x; k < total;
-         k += static_cast<std::size_t>(gridDim.x) * blockDim.x) {
+    VC_TOMOGRAPHY_GRID_STRIDE(k, total) {
         const int ix = static_cast<int>(k % N), iy = static_cast<int>(k / N);
         const int iu = ((ix - o) % pdim + pdim) % pdim, iv = ((iy - o) % pdim + pdim) % pdim;
         out[k] = winv[linv + ix - o] * winv[linv + iy - o] * H[static_cast<std::size_t>(iu) * pdim + iv].x;
     }
-}
-
-void cufft_check(cufftResult r, const char* w) {
-    if (r != CUFFT_SUCCESS) throw Error(std::string("cuFFT error in gridrec ") + w);
 }
 
 struct CudaBackend final : TomoWorkspace {
@@ -382,12 +359,9 @@ struct CudaBackend final : TomoWorkspace {
         VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
     }
     template <class F>
-    void each(std::size_t n, const F& f) {
-        each_kernel<<<grid_for(n), 256>>>(n, f);
-        VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
-    }
-    void fill(float* d, float v, std::size_t n) { each(n, FillF{d, v}); }
-    void weighted_rows(const float* rows, const float* w, float* out, std::size_t n) { each(n, WeightF{rows, w, out}); }
+    void each(std::size_t n, const F& f) { cuda::each(n, f); }
+    void fill(float* d, float v, std::size_t n) { each(n, elementwise::Fill{d, v}); }
+    void weighted_rows(const float* rows, const float* w, float* out, std::size_t n) { each(n, elementwise::Product{rows, w, out}); }
     void initial_rows(const float* rows, const float* weights, float* out, float* iw, std::size_t n) {
         each(n, tomo_algos::InitialCopyF{rows, weights, out, iw});
         cuda::rebalance(out, iw, n_angles, 1, g.n_det, g.rot, false);

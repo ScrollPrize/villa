@@ -6,6 +6,8 @@ import pytest
 
 import vc_tomography
 from vc_tomography import _core
+
+from helpers import raw_scan
 from test_sirt_pipeline import helical_scan, recon
 
 NU = 0.25   # cycles / pixel of the column pattern
@@ -18,15 +20,8 @@ def pattern_scan(tmp_path, offset, first=0, nd=24, nu=NU):
     p = np.arange(193)
     angles, z = (p + first) * (360 / ngrid), p * .06
     row = np.rint(40000 * (1 + .05 * np.cos(2 * np.pi * nu * np.arange(nd)))).astype(np.uint16)
-    raw = np.broadcast_to(row, (len(p), nr, nd)).copy()
-    path = tmp_path / f"pattern_{offset}_{first}_{nd}_{nu}.h5"
-    with h5py.File(path, "w") as f:
-        f.create_dataset("data", data=raw, chunks=(1, nr, nd))
-    reader = _core.RawReader([str(path)], "data", nr, nd)
-    return _core.make_scan_data(angles.astype(np.float64), z.astype(np.float64) * .01, .01, nr, nd, 0, -offset, 0.,
-                                np.full(len(z), .2), np.array([0], np.float32), np.zeros((nr, nd), np.float32),
-                                np.full((1, nr, nd), 50000, np.float32), np.ones((nr, nd), np.float32), reader,
-                                np.zeros(len(z), np.int32), np.arange(len(z), dtype=np.int32))
+    raw = np.broadcast_to(row, (len(p), nr, nd))
+    return raw_scan(tmp_path / f"pattern_{offset}_{first}_{nd}_{nu}.h5", raw, angles, z * .01, x_readjustment=-offset)
 
 
 def amplitude(sino, nu=NU, lo=4, hi=20):
@@ -36,7 +31,6 @@ def amplitude(sino, nu=NU, lo=4, hi=20):
     return 2 * abs(((s - s.mean()) * np.exp(-2j * np.pi * nu * x)).mean())
 
 
-@pytest.mark.parametrize("device", vc_tomography.devices())
 @pytest.mark.parametrize("backprojector", ["fbp", "sirt"])   # padded / measured-only gridding
 def test_fractional_column_offset_kernel(tmp_path, device, backprojector):
     kw = dict(backprojector=backprojector, tomo_params={"num_iter": "1"} if backprojector == "sirt" else {})
@@ -62,7 +56,6 @@ def test_fractional_column_offset_kernel(tmp_path, device, backprojector):
         recon(pattern_scan(tmp_path, 0.5), device, x_interp="bspline3", **kw)
 
 
-@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_fractional_column_offset_exact(tmp_path, device):
     """x_interp=sinc keeps the whole band of a scan placed at a fractional column offset: at 0.45 cycles / pixel and
     half a pixel the lanczos3 kernel passes 0.35, the two-column splat 0.16."""
@@ -84,7 +77,6 @@ def test_fractional_column_offset_exact(tmp_path, device):
     np.testing.assert_array_equal(sino(1.0, x_interp="sinc"), sino(1.0, x_interp="lanczos3"))
 
 
-@pytest.mark.parametrize("device", vc_tomography.devices())
 @pytest.mark.parametrize("backprojector", ["fbp", "ghbp"])
 def test_luminosity_window_is_chunk_independent(tmp_path, device, backprojector):
     scan, *_ = helical_scan(tmp_path)
@@ -100,7 +92,6 @@ def test_luminosity_window_is_chunk_independent(tmp_path, device, backprojector)
                  legacy_reference=True).info["margin"] == 0
 
 
-@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_angle_subsets(tmp_path, device):
     """the two halves of a scan: half the projections each, on half the angles, the same object"""
     scan, *_ = helical_scan(tmp_path)
@@ -133,19 +124,11 @@ def rolled_scan(tmp_path, offset, slope, nu=0.2, nr=40, nd=48, c0=20.25):
     def make(register):
         frame = np.rint(40000 * (1 + .05 * np.cos(2 * np.pi * nu * (r - offset - slope * (c - c0))))).astype(np.uint16)
         path = tmp_path / f"rolled_{offset}_{slope}.h5"
-        if not path.exists():
-            with h5py.File(path, "w") as f:
-                f.create_dataset("data", data=np.broadcast_to(frame, (len(p), nr, nd)).copy(), chunks=(1, nr, nd))
-        reader = _core.RawReader([str(path)], "data", nr, nd)
         reg = dict(row_offset=[-offset] * len(p), row_slope=[slope] * len(p), slope_col=c0) if register else {}
-        return _core.make_scan_data(p * (360 / 64), np.zeros(len(p)), .01, nr, nd, 0, 0., 0., np.full(len(p), .2),
-                                    np.array([0], np.float32), np.zeros((nr, nd), np.float32),
-                                    np.full((1, nr, nd), 50000, np.float32), np.ones((nr, nd), np.float32), reader,
-                                    np.zeros(len(p), np.int32), np.arange(len(p), dtype=np.int32), **reg)
+        return raw_scan(path, None if path.exists() else np.broadcast_to(frame, (len(p), nr, nd)), p * (360 / 64), **reg)
     return make
 
 
-@pytest.mark.parametrize("device", vc_tomography.devices())
 @pytest.mark.parametrize("backprojector", ["fbp", "sirt"])   # padded / measured-only gridding
 def test_frame_registration_undoes_offset_and_roll(tmp_path, device, backprojector):
     """frames displaced by 0.3 rows and sheared by 0.08 rows per column (up to 2.2 rows) grid like the plain ones when
@@ -169,7 +152,6 @@ def test_frame_registration_undoes_offset_and_roll(tmp_path, device, backproject
                              np.arange(4, dtype=np.int32), row_slope=[0.1, 0.1]) and recon(None, device)
 
 
-@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_sharpness_weighting_with_zero_blur_changes_nothing(tmp_path, device):
     """sharpness_weighting: a zero field gives both weight sets the same weights, and the result of the usual ones bit for
     bit; a field leaves every ray an average of its recordings (weights that sum to one)"""
@@ -184,7 +166,6 @@ def test_sharpness_weighting_with_zero_blur_changes_nothing(tmp_path, device):
             run(**bad)
 
 
-@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_frame_registration_lateral(tmp_path, device):
     """a scan whose frames are displaced along the columns by 0.3 px and by 0.02 px per row grids like the plain one
     when its lateral registration is given (ScanTrajectory::col_offset, col_slope; exact column shifts)"""
@@ -195,15 +176,8 @@ def test_frame_registration_lateral(tmp_path, device):
         e = off + slope * (r - v0) if displaced else 0.0          # what belongs at column c is at column c + e
         frame = np.rint(40000 * (1 + .05 * np.cos(2 * np.pi * nu * (c - e)))).astype(np.uint16)
         path = tmp_path / f"lateral_{displaced}.h5"
-        if not path.exists():
-            with h5py.File(path, "w") as f:
-                f.create_dataset("data", data=np.broadcast_to(frame, (n, nr, nd)).copy(), chunks=(1, nr, nd))
         reg = dict(col_offset=[off] * n, col_slope=[slope] * n, slope_row=v0) if register else {}
-        return _core.make_scan_data(np.arange(n) * (360 / 64), np.zeros(n), .01, nr, nd, 0, 0., 0., np.full(n, .2),
-                                    np.array([0], np.float32), np.zeros((nr, nd), np.float32),
-                                    np.full((1, nr, nd), 50000, np.float32), np.ones((nr, nd), np.float32),
-                                    _core.RawReader([str(path)], "data", nr, nd), np.zeros(n, np.int32),
-                                    np.arange(n, dtype=np.int32), **reg)
+        return raw_scan(path, None if path.exists() else np.broadcast_to(frame, (n, nr, nd)), np.arange(n) * (360 / 64), **reg)
     sino = lambda s, **k: recon(s, device, backprojector="fbp", rot_center=79.5, grid_size=33,
                                 **k).reconstruct(8, 32, debug=True)["sino"][:, :, 40:120]
     plain = sino(scan(False, False))
@@ -214,7 +188,6 @@ def test_frame_registration_lateral(tmp_path, device):
     np.testing.assert_array_equal(sino(scan(True, True), x_interp="lanczos3"), sino(scan(True, False), x_interp="lanczos3"))
 
 
-@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_rolling_shutter_turns_the_slices_angles(tmp_path, device):
     """rolling_shutter = s: a slice read at row v of a projection lies s x (the angular step) x (v - middle row) /
     (rows - 1) from the projection's angle; a bin holding several projections takes their mean"""
@@ -242,7 +215,6 @@ def test_rolling_shutter_turns_the_slices_angles(tmp_path, device):
     assert recon(pattern_scan(tmp_path, 0.0), device, backprojector="fbp", rolling_shutter=0.5).info["rolling_shutter"] == 0.5
 
 
-@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_noise_split_gives_pairs_with_independent_noise(tmp_path, device):
     """noise_split: every raw sample takes scale x sqrt(gain x (counts above the dark) + floor) x a standard normal
     number that the seed, the scan, the projection and the pixel fix. Runs with the scales a and -1 / a carry the same
@@ -254,9 +226,7 @@ def test_noise_split_gives_pairs_with_independent_noise(tmp_path, device):
 
     def sino(**kw):
         p = np.arange(2 * ngrid)   # two turns at rest: two projections in every grid angle, whole rows
-        scan = _core.make_scan_data(p * (360 / ngrid), np.zeros(len(p)), .01, nr, nd, 0, 0., 0., np.full(len(p), .2), np.array([0], np.float32),
-                                    np.full((nr, nd), dark, np.float32), np.full((1, nr, nd), flat, np.float32), np.ones((nr, nd), np.float32),
-                                    _core.RawReader([str(path)], "data", nr, nd), np.zeros(len(p), np.int32), np.arange(len(p), dtype=np.int32))
+        scan = raw_scan(path, None, p * (360 / ngrid), dark=dark, flats=flat)
         dev = kw.pop("device", device)
         rows = kw.pop("rows", (4, 8))
         return np.asarray(recon(scan, dev, backprojector="fbp", tomo_params={}, z_interp="linear", **kw).reconstruct(*rows, debug=True)["sino"], np.float64)
@@ -316,7 +286,6 @@ def test_noise_split_gives_pairs_with_independent_noise(tmp_path, device):
             _core.noise_split_config(bad)
 
 
-@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_pixels_whose_flat_is_zero_do_not_spoil_the_sinogram(tmp_path, device):
     """A pixel whose flat equals its dark (a detector's time stamp, a dead pixel) has no finite value. In rows without
     weight, and in the rows that pad the detector's first row, it must add nothing: zero times infinity is not zero,
@@ -336,9 +305,7 @@ def test_pixels_whose_flat_is_zero_do_not_spoil_the_sinogram(tmp_path, device):
             flats[0, 0, :] = 0                         # or is blank altogether (the first row of PHerc. 172's camera)
             weight[0] = 1                              # (whatever the weight map says of it)
         p = np.arange(2 * ngrid)
-        scan = _core.make_scan_data(p * (360 / ngrid), np.zeros(len(p)), .01, nr, nd, 0, 0., 0., np.full(len(p), .2), np.array([0], np.float32),
-                                    np.full((nr, nd), dark, np.float32), flats, weight,
-                                    _core.RawReader([str(path)], "data", nr, nd), np.zeros(len(p), np.int32), np.arange(len(p), dtype=np.int32))
+        scan = raw_scan(path, None, p * (360 / ngrid), dark=dark, flats=flats, weight=weight)
         r = recon(scan, device, backprojector="fbp", tomo_params={}, **kw)
         lo, _ = r.info["doable"]
         return r.reconstruct(lo, lo + 4, debug=True)

@@ -228,14 +228,8 @@ void bind_geometry_calibration(nb::module_& m) {
         "geometry_read_acquisition",
         [](nb::handle session, const std::string& device, std::optional<std::function<void(const std::string&)>> log) {
             calibration::Session& s = bound_session(session);
-            if (device != "cpu" && device != "cuda" && device != "auto") throw Error("device is cpu, cuda or auto");
-            const Device dev = device == "cuda" || (device == "auto" && cuda_available()) ? Device::CUDA : Device::CPU;
-            gc::Log say;
-            if (log)
-                say = [&](const std::string& line) {
-                    nb::gil_scoped_acquire gil;
-                    (*log)(line);
-                };
+            const Device dev = parse_device(device, true);
+            gc::Log say = vc_tomography::py::py_callback(log);
             nb::gil_scoped_release nogil;
             return gc::read_acquisition(s, dev, say);
         },
@@ -246,12 +240,7 @@ void bind_geometry_calibration(nb::module_& m) {
         "geometry_row_time_from_refill",
         [](nb::handle session, const gc::Acquisition& acq, std::optional<std::function<void(const std::string&)>> log) {
             calibration::Session& s = bound_session(session);
-            gc::Log say;
-            if (log)
-                say = [&](const std::string& line) {
-                    nb::gil_scoped_acquire gil;
-                    (*log)(line);
-                };
+            gc::Log say = vc_tomography::py::py_callback(log);
             nb::gil_scoped_release nogil;
             return gc::row_time_from_refill(s, acq, say);
         },
@@ -272,8 +261,7 @@ void bind_geometry_calibration(nb::module_& m) {
         "geometry_measure",
         [](nb::handle session, const gc::Acquisition& acq, const std::string& device, int patch, int angles_per_turn, int max_positions, int n_rest, int n_turn, int turn_least) {
             calibration::Session& s = bound_session(session);
-            if (device != "cpu" && device != "cuda" && device != "auto") throw Error("device is cpu, cuda or auto");
-            const Device dev = device == "cuda" || (device == "auto" && cuda_available()) ? Device::CUDA : Device::CPU;
+            const Device dev = parse_device(device, true);
             std::vector<gc::Comparison> got;
             std::vector<int> kept;
             std::size_t blocks = 0;
@@ -305,8 +293,7 @@ void bind_geometry_calibration(nb::module_& m) {
         [](nb::handle session, const gc::Acquisition& acq, const std::string& places, const std::vector<std::vector<int>>& pairs, const std::string& device, int patch, int positions, int angles,
            int bands, int windows) {
             calibration::Session& s = bound_session(session);
-            if (device != "cpu" && device != "cuda" && device != "auto") throw Error("device is cpu, cuda or auto");
-            const Device dev = device == "cuda" || (device == "auto" && cuda_available()) ? Device::CUDA : Device::CPU;
+            const Device dev = parse_device(device, true);
             std::vector<gc::Comparison> got;
             std::vector<int> kept;
             std::size_t blocks = 0;
@@ -439,14 +426,9 @@ void bind_geometry_calibration(nb::module_& m) {
             gc::Options opt;
             opt.row_time = row_time ? *row_time : std::nan("");
             opt.rows_from_middle = rows_from_middle, opt.radial_map = radial_map;
-            if (device != "cpu" && device != "cuda" && device != "auto") throw Error("device is cpu, cuda or auto");
-            opt.device = device == "cuda" || (device == "auto" && cuda_available()) ? Device::CUDA : Device::CPU;
+            opt.device = parse_device(device, true);
             opt.order = order, opt.threads = threads, opt.patch = patch, opt.reduce = reduce, opt.projections = projections;
-            if (log)
-                opt.log = [&](const std::string& line) {
-                    nb::gil_scoped_acquire gil;
-                    (*log)(line);
-                };
+            opt.log = vc_tomography::py::python_log(log);
             nb::gil_scoped_release nogil;
             return gc::calibrate_geometry(scans, opt);
         },

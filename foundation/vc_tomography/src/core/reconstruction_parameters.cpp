@@ -12,6 +12,8 @@
 #include "vc_tomography/reconstruction.hpp"
 #include "vc_tomography/sino.hpp"
 #include "io/json.hpp"
+#include "io/text_file.hpp"
+#include "io/json_values.hpp"
 
 namespace vc_tomography {
 
@@ -22,16 +24,6 @@ Json whole(long long v) { return Json::whole_number(v); }
 Json text(const std::string& v) { return Json::of(v); }
 
 const Json* member(const Json& j, const std::string& key) { return j.find(key); }
-
-// set `key` of an object, in place if it is there, else at its end
-void put(Json& j, const std::string& key, Json v) {
-    for (auto& [k, x] : j.object)
-        if (k == key) {
-            x = std::move(v);
-            return;
-        }
-    j.object.emplace_back(key, std::move(v));
-}
 
 void drop(Json& j, const std::string& key) {
     j.object.erase(std::remove_if(j.object.begin(), j.object.end(), [&](const auto& kv) { return kv.first == key; }), j.object.end());
@@ -88,20 +80,11 @@ Json legacy_json() {
 
 const std::vector<std::string> kRemoved = {"z_translation_scale", "companion_registration", "stationary_registration", "axis_refinement", "rolling_shutter"};
 
-std::string strip(const std::string& s) {
-    const std::size_t a = s.find_first_not_of(" \t\n\r");
-    if (a == std::string::npos) return std::string();
-    return s.substr(a, s.find_last_not_of(" \t\n\r") - a + 1);
-}
-
-// Python float(): the whole text a real number (also inf and nan), else nothing
-bool real_of(const std::string& t, double& v) {
-    const std::string s = strip(t);
-    if (s.empty() || s.find_first_of("xX") != std::string::npos) return false;
-    char* end = nullptr;
-    v = std::strtod(s.c_str(), &end);
-    return end == s.c_str() + s.size();
-}
+using io::lower;
+using io::number_of;
+using io::real_of;
+using io::strip;
+using io::truth;
 
 Json value_of(const std::string& t) {
     double v = 0;
@@ -109,11 +92,6 @@ Json value_of(const std::string& t) {
     static const std::regex integer(R"([+-]?\d+)");
     if (std::regex_match(strip(t), integer)) return whole(static_cast<long long>(v));
     return num(v);
-}
-
-std::string lower(std::string s) {
-    for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    return s;
 }
 
 Json chain_of(const std::string& text_in) {
@@ -139,7 +117,7 @@ Json chain_of(const std::string& text_in) {
             if (!kv.empty()) {
                 const std::size_t eq = kv.find('=');
                 if (eq == std::string::npos) throw Error("cannot parse filter parameter '" + kv + "' (expected name=value)");
-                put(f, strip(kv.substr(0, eq)), value_of(strip(kv.substr(eq + 1))));
+                f.put(strip(kv.substr(0, eq)), value_of(strip(kv.substr(eq + 1))));
             }
             a = b + 1;
         }
@@ -202,28 +180,9 @@ Json override_chain(Json chain, const std::vector<std::pair<std::string, Json>>&
         }
         const std::size_t dot = key.rfind('.');
         if (dot == std::string::npos || dot == 0) throw Error("'" + key + "' is not TYPE.param");
-        put(locate(chain, key.substr(0, dot)), key.substr(dot + 1), v);
+        locate(chain, key.substr(0, dot)).put(key.substr(dot + 1), v);
     }
     return chain;
-}
-
-// Python's float() of a value: numbers, booleans, and text that reads as one
-bool number_of(const Json& v, double& out) {
-    if (v.is(Json::Number)) return out = v.number, true;
-    if (v.is(Json::Bool)) return out = v.boolean ? 1.0 : 0.0, true;
-    if (v.is(Json::String)) return real_of(v.string, out);
-    return false;
-}
-
-bool truth(const Json& v) {
-    switch (v.type) {
-        case Json::Bool: return v.boolean;
-        case Json::Number: return v.number != 0;
-        case Json::String: return !v.string.empty();
-        case Json::Array: return !v.array.empty();
-        case Json::Object: return !v.object.empty();
-        default: return false;
-    }
 }
 
 bool json_equal(const Json& a, const Json& b) {
@@ -315,11 +274,7 @@ int positive_int(const Json& v, const std::string& name, int minimum) {
     return static_cast<int>(x);
 }
 
-std::string read_text(const std::string& path) {
-    std::ifstream in(path);
-    if (!in) throw Error("cannot read " + path);
-    return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-}
+using io::read_text;
 
 std::string expand_user(const std::string& p) {
     if (p.size() >= 1 && p[0] == '~' && (p.size() == 1 || p[1] == '/')) {
@@ -403,7 +358,7 @@ std::string parse_settings(const std::vector<std::string>& items) {
         if (eq == std::string::npos) throw Error("bad --set '" + it + "', expected KEY=VALUE");
         const std::string k = strip(it.substr(0, eq)), v = strip(it.substr(eq + 1));
         if (is_filter_key(k)) {
-            put(out, k, k == "filters" ? chain_of(v) : value_of(v));
+            out.put(k, k == "filters" ? chain_of(v) : value_of(v));
             continue;
         }
         const Json* d = member(defaults, k);
@@ -415,12 +370,12 @@ std::string parse_settings(const std::vector<std::string>& items) {
         double x = 0;
         if (d->is(Json::Bool)) {
             const std::string l = lower(v);
-            put(out, k, Json::of_bool(l == "1" || l == "true" || l == "yes" || l == "on"));
+            out.put(k, Json::of_bool(l == "1" || l == "true" || l == "yes" || l == "on"));
         } else if (d->is(Json::Number) && real_of(v, x)) {
             if (d->whole && x != std::floor(x)) throw Error("--set " + k + ": a whole number, not '" + v + "'");
-            put(out, k, d->whole ? whole(static_cast<long long>(x)) : num(x));
+            out.put(k, d->whole ? whole(static_cast<long long>(x)) : num(x));
         } else {
-            put(out, k, text(v));  // (exposure_arc=auto and the text parameters)
+            out.put(k, text(v));  // (exposure_arc=auto and the text parameters)
         }
     }
     return out.text();
@@ -433,7 +388,7 @@ std::string update_parameters(const std::string& params_text, const std::string&
     if (const Json* smear = member(kw, "detector_smear")) {  // (the name of sharpness_weighting until 2026-11-11)
         const Json v = *smear;
         drop(kw, "detector_smear");
-        if (!member(kw, "sharpness_weighting")) put(kw, "sharpness_weighting", v);
+        if (!member(kw, "sharpness_weighting")) kw.put("sharpness_weighting", v);
     }
     std::vector<std::string> gone;
     for (const auto& kv : kw.object)
@@ -499,12 +454,12 @@ std::string update_parameters(const std::string& params_text, const std::string&
     }
     if (mode_now && mode_now->string == "legacy_reference") {  // leaving the legacy mode: start again from the defaults
         params = defaults;
-        for (const auto& [k, v] : named.object) put(params, k, v);
+        for (const auto& [k, v] : named.object) params.put(k, v);
     }
-    for (const auto& [k, v] : regular.object) put(params, k, k == "filters" ? as_chain(v) : v);
+    for (const auto& [k, v] : regular.object) params.put(k, k == "filters" ? as_chain(v) : v);
     if (!filter_changes.empty()) {
         const Json* f = member(params, "filters");
-        put(params, "filters", override_chain(f ? as_chain(*f) : Json::list(), filter_changes));
+        params.put("filters", override_chain(f ? as_chain(*f) : Json::list(), filter_changes));
     }
     return params.text();
 }
@@ -546,7 +501,7 @@ SldParams sld_params(const std::string& spec_text, std::string* resolved) {
         for (const auto& [k, v] : payload.object)
             if (names.count(k)) d.set(k, v);
         for (const auto& [k, v] : spec.object)
-            if (k != "json") put(d, k, v);
+            if (k != "json") d.put(k, v);
         spec = d;
         loaded = true;
     }

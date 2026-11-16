@@ -55,7 +55,6 @@ def numpy_tables(c, a, b):
     return out + [np.bincount(idx, weight.ravel(), size).reshape(c.n_shells, T)]
 
 
-@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_tables_match_numpy(device):
     rng = np.random.default_rng(1)
     n = 32
@@ -70,7 +69,6 @@ def test_tables_match_numpy(device):
     assert r["shift"] == (0, 0, 0) and abs(r["mean_a"] - 3) < 0.05
 
 
-@pytest.mark.parametrize("device", vc_tomography.devices())
 @pytest.mark.parametrize("oversample", [1, 2])
 def test_registration_and_oversampling(device, oversample):
     """b: the same band-limited field displaced by a sub-voxel shift, sampled `oversample` times finer"""
@@ -94,7 +92,6 @@ def test_registration_and_oversampling(device, oversample):
     assert c.curves(r0["aa"], r0["bb"], r0["ab"])["correlation"][inside][-1] < 0.5
 
 
-@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_correlation_measures_snr_and_direction(device):
     rng = np.random.default_rng(3)
     n = 64
@@ -133,7 +130,6 @@ def test_correlation_measures_snr_and_direction(device):
         assert np.nanargmax(part["power_a"]) == 3   # 0.2 cycles per voxel: shell 3 of width 1/16
 
 
-@pytest.mark.parametrize("device", vc_tomography.devices())
 @pytest.mark.parametrize("interp", ["linear", "cubic", "lanczos3"])
 def test_resample_affine(device, interp):
     z, y, x = np.meshgrid(np.arange(20.0), np.arange(24.0), np.arange(28.0), indexing="ij")
@@ -157,7 +153,6 @@ def test_resample_affine(device, interp):
                                    vc_tomography.resample_affine(src, m, shape, interp, "cpu"), atol=1e-5)
 
 
-@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_registered_volume(tmp_path, device):
     """a pyramid twice finer than the grid, offset, read from two of its levels"""
     from vc_tomography.omezarr import OmeZarrWriter

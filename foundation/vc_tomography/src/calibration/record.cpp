@@ -7,6 +7,7 @@
 
 #include "calibration/h5_read.hpp"
 #include "calibration/nxtomo.hpp"
+#include "io/text_file.hpp"
 
 namespace vc_tomography::calibration {
 
@@ -155,8 +156,7 @@ void frame_pieces(hid_t file, const std::string& file_path, const std::string& d
         p.first = v.first;
         p.count = v.count;
         p.source_first = v.source_first;
-        struct stat st;
-        p.present = ::stat(p.file.c_str(), &st) == 0 && S_ISREG(st.st_mode);
+        p.present = io::is_file(p.file);
         s.pieces.push_back(std::move(p));
     }
     std::sort(s.pieces.begin(), s.pieces.end(), [](const FramePiece& x, const FramePiece& y) { return x.first < y.first; });

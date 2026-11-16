@@ -43,17 +43,7 @@ std::vector<double> regress(const std::vector<std::vector<double>>& columns, con
     }
 }
 
-// the spread of what a robust fit leaves, as the standard deviation of its bulk: 1.4826 x the median distance from
-// the median (the patches registered on something else do not count, as they did not in the fit)
-double bulk_spread(const std::vector<double>& left) {
-    if (left.empty()) return kNaN;
-    const double middle = median_of(left);
-    std::vector<double> off(left.size());
-    for (std::size_t i = 0; i < left.size(); ++i) off[i] = std::fabs(left[i] - middle);
-    return 1.4826 * median_of(off);
-}
 
-double wrapped_deg(double a) { return a - 360.0 * std::round(a / 360.0); }
 
 Json num(double v) { return std::isfinite(v) ? Json::of(v) : Json(); }
 Json pair_of(const double* v) { return Json::list().add(num(v[0])).add(num(v[1])); }
@@ -124,7 +114,7 @@ RowTimeBetweenScans row_time_between_scans(const Acquisition& acq, const Paramet
     if (x.empty()) return RowTimeBetweenScans{};
     out.n = frames.size();
     out.row_time = row_time_of(acq, p) - x[0];
-    out.error = bulk_spread(left) / std::sqrt(spread2);
+    out.error = mad_sd(left) / std::sqrt(spread2);
     return out;
 }
 
@@ -203,7 +193,7 @@ GeometryReport report(const Acquisition& acq, const GeometrySolution& solution, 
             r.from_anchor = std::hypot(dx, dy);
             const double amplitude = std::hypot(sp.height_once[0], sp.height_once[1]);
             r.pitch = amplitude / r.from_anchor;
-            if (amplitude > 0) r.pitch_phase_deg = wrapped_deg((std::atan2(sp.height_once[1], sp.height_once[0]) - std::atan2(dy, dx)) * (180.0 / kPi));
+            if (amplitude > 0) r.pitch_phase_deg = wrap180((std::atan2(sp.height_once[1], sp.height_once[0]) - std::atan2(dy, dx)) * (180.0 / kPi));
         }
     }
     const auto over = [](const std::vector<double>& v) {
@@ -240,7 +230,7 @@ GeometryReport report(const Acquisition& acq, const GeometrySolution& solution, 
                 const std::vector<double> x = regress({one, between}, res[0], &left);
                 if (!x.empty()) {
                     r.row_time = row_time - x[1];
-                    r.row_time_error = bulk_spread(left) / (r.timing_rows_spread * std::sqrt(static_cast<double>(r.n)));
+                    r.row_time_error = mad_sd(left) / (r.timing_rows_spread * std::sqrt(static_cast<double>(r.n)));
                 }
             }
             for (int j = 0; j < 3; ++j) {

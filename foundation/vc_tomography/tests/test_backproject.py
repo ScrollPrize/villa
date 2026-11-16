@@ -3,6 +3,8 @@ import pytest
 
 import vc_tomography
 
+from helpers import cuda_only
+
 
 def ramp_filtered_disk_sinogram(n, n_angles, radius, center):
     """Ram-Lak filtered sinogram of a centered unit disk (exact Radon transform)."""
@@ -17,7 +19,6 @@ def ramp_filtered_disk_sinogram(n, n_angles, radius, center):
     return np.tile(filtered, (n_angles, 1)).astype(np.float32)
 
 
-@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_disk_phantom(device):
     n, n_angles, radius = 256, 720, 70.0
     c = (n - 1) / 2
@@ -31,7 +32,7 @@ def test_disk_phantom(device):
     assert abs(outside.mean()) < 2e-3
 
 
-@pytest.mark.skipif(not vc_tomography.cuda_available(), reason="no CUDA")
+@cuda_only
 def test_cpu_cuda_agree_offcenter_roi_clip():
     rng = np.random.default_rng(1)
     sino = rng.standard_normal((333, 300)).astype(np.float32)
@@ -44,7 +45,6 @@ def test_cpu_cuda_agree_offcenter_roi_clip():
     assert (a == 0).any() and (a != 0).any()  # clip circle crosses the ROI
 
 
-@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_only_the_listed_tiles_are_computed(device):
     rng = np.random.default_rng(2)
     sino = rng.standard_normal((200, 180)).astype(np.float32)
@@ -103,7 +103,6 @@ def fan_tables():
     return {"one scan": line, "two scans": (1 - share) * first + share * second}
 
 
-@pytest.mark.parametrize("device", vc_tomography.devices())
 @pytest.mark.parametrize("which", ["one scan", "two scans"])
 def test_a_diverging_beam_is_backprojected_along_its_rays(device, which):
     """Blobs recorded by a diverging beam, filtered as a parallel beam's rows and backprojected with the beam's fan,
@@ -128,7 +127,7 @@ def test_a_diverging_beam_is_backprojected_along_its_rays(device, which):
     np.testing.assert_allclose(vc_tomography.backproject(recorded, angles, fan=[0.0] * FAN_N, **kw)[inside], without[inside], atol=2e-6)
 
 
-@pytest.mark.skipif(not vc_tomography.cuda_available(), reason="no CUDA")
+@cuda_only
 def test_cpu_cuda_agree_with_a_fan():
     rng = np.random.default_rng(3)
     sino = rng.standard_normal((333, 300)).astype(np.float32)

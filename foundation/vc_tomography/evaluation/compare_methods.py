@@ -51,6 +51,7 @@ DEFAULT_OBJECT_EXTENT = (0.0, 1.0)   # (vc_tomography_reconstruct's --object_ext
 
 def write_png_gray(path, img):
     write_image(path, np.ascontiguousarray(img, np.uint8))
+from vc_tomography import to_uint8
 from vc_tomography.filters import parse_chain
 from vc_tomography.recon import HelicalRecon, DEFAULTS
 
@@ -144,8 +145,7 @@ def window_of(ref, w):
 
 
 def to_u8(img, win):
-    lo, hi = win
-    return (np.clip((np.nan_to_num(img) - lo) / (hi - lo), 0, 1) * 255 + 0.5).astype(np.uint8)
+    return to_uint8(img, win[0], win[1])
 
 
 def thumb(img, tile):

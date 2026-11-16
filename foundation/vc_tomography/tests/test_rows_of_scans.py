@@ -2,12 +2,12 @@
 from the scans that see it, one at each place across the beam at least; where two rows hold a height both enter by
 their weights; a scan that sees nothing of a chunk is left out of it; rows the beam does not light are not seen
 through; the luminosity step takes the scans of each row to each other's level."""
-import h5py
 import numpy as np
 import pytest
 
 import vc_tomography
-from vc_tomography import _core
+
+from helpers import raw_scan
 from test_sirt_pipeline import recon
 
 NR, ND, NGRID = 12, 24, 64
@@ -24,15 +24,10 @@ def circular_scan(tmp_path, name, shift, rows_from_first, lit=None, weight=None,
     columns right of the merged origin; lit: (first, end), the rows that hold data; gain: its level against the others'"""
     p = np.arange(NGRID + 1)
     frame = np.broadcast_to(np.rint(gain * value(np.arange(NR) - rows_from_first)).astype(np.uint16)[:, None], (NR, ND))
-    path = tmp_path / f"{name}.h5"
-    with h5py.File(path, "w") as f:
-        f.create_dataset("data", data=np.broadcast_to(frame, (len(p), NR, ND)).copy(), chunks=(1, NR, ND))
-    reader = _core.RawReader([str(path)], "data", NR, ND)
-    w = np.ones((NR, ND), np.float32) if weight is None else weight
     more = {} if lit is None else dict(row_first=lit[0], row_end=lit[1])
     # (the slice h is read at the row h - z_readjustment)
-    return _core.make_scan_data(p * (360.0 / NGRID), np.zeros(len(p)), .01, NR, ND, shift, 0., float(-rows_from_first), np.full(len(p), .2), np.array([0], np.float32),
-                                np.zeros((NR, ND), np.float32), np.full((1, NR, ND), LEVEL, np.float32), w, reader, np.zeros(len(p), np.int32), np.arange(len(p), dtype=np.int32), **more)
+    return raw_scan(tmp_path / f"{name}.h5", np.broadcast_to(frame, (len(p), NR, ND)), p * (360.0 / NGRID), shift_x=shift,
+                    z_readjustment=float(-rows_from_first), flats=LEVEL, weight=weight, **more)
 
 
 def grid(tmp_path, lit=None, weight=None, gains=(1.0, 1.0)):
@@ -41,7 +36,6 @@ def grid(tmp_path, lit=None, weight=None, gains=(1.0, 1.0)):
     return [circular_scan(tmp_path, f"r{r}c{c}", 16 * c, 8 * r, lit, weight, gains[r] if c else 1.0) for r in range(2) for c in range(2)]
 
 
-@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_heights_are_the_union_over_the_rows(tmp_path, device):
     kw = dict(backprojector="fbp", grid_size=0, rot_center=11.5, luminosity_repartition=0.)
     r = recon(grid(tmp_path), device, **kw)
@@ -61,7 +55,6 @@ def test_heights_are_the_union_over_the_rows(tmp_path, device):
     assert recon(grid(tmp_path)[:2] + grid(tmp_path)[3:], device, **kw).info["doable"] == (0, 11)
 
 
-@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_the_luminosity_step_joins_the_scans_of_each_row(tmp_path, device):
     """The second scan of the first row reads 3 % above its neighbour and that of the second row 2 % below. The step
     compares a scan with the earlier scans of its own row at their seam (another row holds other rows of the detector
@@ -97,7 +90,6 @@ def test_the_luminosity_step_joins_the_scans_of_each_row(tmp_path, device):
         recon([g[0], g[2], g[1], g[3]], device, **dict(kw, luminosity_repartition=100.))
 
 
-@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_rows_the_beam_does_not_light_are_not_seen_through(tmp_path, device):
     kw = dict(backprojector="fbp", grid_size=0, rot_center=11.5, luminosity_repartition=0.)
     weight = np.zeros((NR, ND), np.float32)
@@ -115,7 +107,6 @@ def test_rows_the_beam_does_not_light_are_not_seen_through(tmp_path, device):
         recon(grid(tmp_path, lit=(4, 10), weight=apart), device, **kw).info["doable"] == (4, 9)
 
 
-@pytest.mark.parametrize("device", vc_tomography.devices())
 def test_the_fan_of_a_grids_columns(tmp_path, device):
     """A beam that diverges (fan_per_column): every merged column takes the fan of the detector column that holds
     it, counted from that scan's middle column, so the fan starts again at each place across the beam; over the

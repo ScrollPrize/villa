@@ -176,9 +176,9 @@ int run(int argc, char** argv) {
             if (k == "config" || k == "inputs" || k == "save_layers" || v.is(Json::Null)) continue;
             eff.set(k, (k == "volume" || k == "surface" || k == "projections" || k == "cache_dir" || k == "out_root") && v.is(Json::String) ? Json::of(absolute(v.string)) : v);
         }
-        if (!volume.empty()) put(eff, "volume", Json::of(absolute(volume)));
-        put(eff, "surface", Json::of(absolute(surface_path)));
-        put(eff, "tag", Json::of(tag));
+        if (!volume.empty()) eff.put("volume", Json::of(absolute(volume)));
+        eff.put("surface", Json::of(absolute(surface_path)));
+        eff.put("tag", Json::of(tag));
         write_text(outdir + "/config.json", eff.text());
     }
     const std::string settings = from_projections ? parse_settings(a.texts("set")) : "{}";
@@ -209,7 +209,7 @@ int run(int argc, char** argv) {
                             .set("u8_window", numbers({window8[0], window8[1]}));
     const auto meta_of = [&](const Json& extra) {
         Json m = common;
-        for (const auto& [k, v] : extra.object) put(m, k, v);
+        for (const auto& [k, v] : extra.object) m.put(k, v);
         return m;
     };
 
@@ -262,7 +262,7 @@ int run(int argc, char** argv) {
     // ================================================================ from the projections (band reconstruction)
     Reconstruction::Options opt;
     opt.cache_dir = a.text("cache_dir");
-    opt.device = a.text("device") == "cpu" ? Device::CPU : Device::CUDA;
+    opt.device = parse_device(a.text("device"));
     Reconstruction r(a.text("projections"), settings, opt);
     const int N = r.reconstructor()->grid_size();
     const auto [lo, hi] = r.doable();

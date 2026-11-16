@@ -11,6 +11,7 @@
 
 #include "vc_tomography/calibration/record.hpp"
 #include "vc_tomography/calibration/solve.hpp"
+#include "calibration/stats.hpp"
 
 namespace vc_tomography::calibration {
 

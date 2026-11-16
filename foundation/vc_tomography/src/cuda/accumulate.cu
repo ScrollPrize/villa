@@ -5,6 +5,7 @@
 #include "cuda_utils.cuh"
 #include "vc_tomography/accumulate.hpp"
 #include "vc_tomography/sino.hpp"
+#include "../common/elementwise_core.hpp"
 
 namespace vc_tomography::cuda {
 
@@ -85,16 +86,6 @@ __global__ void lum_apply_kernel(float* R, const float* RW, const float* Wp, con
     R[o] = __fadd_rn(R[o], __fsub_rn(__fmul_rn(d, Wp[o]), __fmul_rn(dfin, RW[o])));
 }
 
-__global__ void add_into_kernel(float* R, const float* A, size_t n) {
-    for (size_t i = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x; i < n; i += static_cast<size_t>(gridDim.x) * blockDim.x)
-        R[i] = __fadd_rn(R[i], A[i]);
-}
-
-__global__ void divide_kernel(float* R, const float* RW, size_t n) {
-    for (size_t i = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x; i < n; i += static_cast<size_t>(gridDim.x) * blockDim.x)
-        R[i] = RW[i] > 0 ? __fdiv_rn(R[i], RW[i]) : 0.f;
-}
-
 __global__ void mend_kernel(float* R, const float* RW, int LH, int NX, float thr, int x0, int x1) {
     const int q = blockIdx.x * blockDim.x + threadIdx.x;
     if (q >= LH) return;
@@ -153,7 +144,7 @@ void accumulate(const AccumScanView& view, const ContributorList& c, const Accum
         const int stride = shift ? shift_row_stride(s.det_cols) : s.det_cols;
         d_col.ensure(n_slots * p.H * stride);
         s.col_slot = load(d_slot, slot, st);
-        dim3 block(128, 1, 1), grid((s.det_cols + 127) / 128, p.H, static_cast<unsigned>(n_slots));
+        dim3 block(128, 1, 1), grid(grid_1d(s.det_cols, 128), p.H, static_cast<unsigned>(n_slots));
         const int32_t* sp = load(d_slot_proj, slot_proj, st);
         const int n_rows = static_cast<int>(n_slots) * p.H;
         if (measured_exact) {
@@ -192,7 +183,7 @@ void accumulate(const AccumScanView& view, const ContributorList& c, const Accum
     const int32_t* off = load(d_off, c.offsets, st);
     const int32_t* proj = load(d_proj, c.proj, st);
     const int8_t* role = load(d_role, c.role, st);
-    dim3 block(128, 1, 1), grid((p.NX + 127) / 128, p.H, L);
+    dim3 block(128, 1, 1), grid(grid_1d(p.NX, 128), p.H, L);
     accumulate_kernel<<<grid, block, 0, st>>>(s, off, proj, role, L, p.H, p.NX, p, R, RW);
     VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
     if (weight2) {   // the same contributions with the second weight map
@@ -208,7 +199,7 @@ void luminosity_sums(const float* R, const float* RW, int L, int H, int NX, int 
     cudaStream_t st = as_stream(stream);
     auto gx = upload(k.gx, st);
     auto gz = upload(k.gz, st);
-    lum_sums_kernel<<<(L * H + 127) / 128, 128, 0, st>>>(R, RW, L, H, NX, cx, gx.data(), gz.data(), k.radius, A, B);
+    lum_sums_kernel<<<grid_1d(L * H, 128), 128, 0, st>>>(R, RW, L, H, NX, cx, gx.data(), gz.data(), k.radius, A, B);
     VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
     VC_TOMOGRAPHY_CUDA_CHECK(cudaStreamSynchronize(st));
 }
@@ -221,26 +212,19 @@ void luminosity_apply(float* R, const float* RW, const float* W_prev, const floa
     VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
 }
 
-void add_into(float* R, const float* A, std::size_t n, void* stream) {
-    add_into_kernel<<<static_cast<unsigned>(std::min<size_t>((n + 255) / 256, 65535u * 16u)), 256, 0, as_stream(stream)>>>(R, A, n);
-    VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
-}
-
-void divide(float* R, const float* RW, std::size_t n, void* stream) {
-    divide_kernel<<<static_cast<unsigned>(std::min<size_t>((n + 255) / 256, 65535u * 16u)), 256, 0, as_stream(stream)>>>(R, RW, n);
-    VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
-}
+void add_into(float* R, const float* A, std::size_t n, void* stream) { each(n, elementwise::AddInto{R, A}, as_stream(stream)); }
+void divide(float* R, const float* RW, std::size_t n, void* stream) { each(n, elementwise::Divide{R, RW}, as_stream(stream)); }
 
 void mend_null_weights(float* R, const float* RW, int L, int H, int NX, float thr, int x0, int x1, void* stream) {
-    mend_kernel<<<(L * H + 127) / 128, 128, 0, as_stream(stream)>>>(R, RW, L * H, NX, thr, x0, x1);
+    mend_kernel<<<grid_1d(L * H, 128), 128, 0, as_stream(stream)>>>(R, RW, L * H, NX, thr, x0, x1);
     VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
 }
 
 void prepare_measured(float* R, float* RW, int L, int H, int NX, float thr, bool fill, float empty, void* stream) {
-    support_kernel<<<(L * H + 127) / 128, 128, 0, as_stream(stream)>>>(R, RW, L * H, NX, thr);
+    support_kernel<<<grid_1d(L * H, 128), 128, 0, as_stream(stream)>>>(R, RW, L * H, NX, thr);
     VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
     if (fill) {
-        fill_measured_kernel<<<(L * H + 127) / 128, 128, 0, as_stream(stream)>>>(R, RW, L, H, NX, empty);
+        fill_measured_kernel<<<grid_1d(L * H, 128), 128, 0, as_stream(stream)>>>(R, RW, L, H, NX, empty);
         VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
     }
 }

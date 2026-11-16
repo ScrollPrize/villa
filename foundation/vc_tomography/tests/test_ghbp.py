@@ -6,6 +6,8 @@ import pytest
 import vc_tomography
 from reference import ghbp_ref
 
+from helpers import cuda_only
+
 CASES = [  # (n_angles, N, n_bins, rot_center, legs, steps, clip, full_turn)
     (8000, 129, 90, 61.25, 8, 2, True, True),    # production-like hierarchy
     (8000, 129, 90, 61.25, 4, 3, False, True),   # with an intermediate level
@@ -31,7 +33,7 @@ def test_matches_numpy_port(case):
     assert rel < 2e-5, rel
 
 
-@pytest.mark.skipif(not vc_tomography.cuda_available(), reason="no CUDA")
+@cuda_only
 @pytest.mark.parametrize("case", CASES)
 def test_cpu_cuda_bitwise(case):
     n, N, nb, rc, legs, steps, clip, full = case

@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <optional>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -17,6 +18,8 @@
 #include "calibration/iso_time.hpp"
 #include "calibration/unwrap.hpp"
 #include "io/json.hpp"
+#include "io/text_file.hpp"
+#include "calibration/stats.hpp"
 
 namespace vc_tomography::calibration::nxtomo {
 
@@ -24,10 +27,7 @@ namespace {
 
 constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
 
-bool is_file(const std::string& p) {
-    struct stat st;
-    return ::stat(p.c_str(), &st) == 0 && S_ISREG(st.st_mode);
-}
+using io::is_file;
 
 bool is_group(hid_t f, const std::string& path) {
     if (!h5::exists(f, path)) return false;
@@ -52,14 +52,6 @@ std::string tomo_entry_of(hid_t f) {
     for (const std::string& e : h5::children(f, "/"))
         if (text_if(f, e + "/tomo_entry/definition") == "NXtomo") return e;
     return std::string();
-}
-
-double median(std::vector<double> v) {
-    if (v.empty()) return kNaN;
-    const std::size_t m = v.size() / 2;
-    std::nth_element(v.begin(), v.begin() + static_cast<std::ptrdiff_t>(m), v.end());
-    if (v.size() % 2) return v[m];
-    return (*std::max_element(v.begin(), v.begin() + static_cast<std::ptrdiff_t>(m)) + v[m]) / 2.0;
 }
 
 // metres per unit of a length; 0: not a length this reader knows
@@ -196,12 +188,9 @@ void read_supplement(Master& m) {
     const std::string path = m.directory + "/" + kSupplement;
     std::vector<std::string> on_rotation;
     if (is_file(path)) {
-        std::ifstream in(path, std::ios::binary);
-        std::stringstream text;
-        text << in.rdbuf();
         Json doc;
         try {
-            doc = Json::parse(text.str());
+            doc = Json::parse(io::read_text(path));
         } catch (const std::exception& e) {
             throw Error(path + ": " + e.what());
         }
@@ -378,6 +367,13 @@ FrameList frames_of(const Master& m, const std::vector<const Run*>& runs) {
     return out;
 }
 
+// the fraction of a frame's period the camera exposes, when the record gives both and it lies in (0, 1]
+std::optional<double> exposure_fraction(const Master& m) {
+    if (!(std::isfinite(m.period_s) && std::isfinite(m.count_time_s) && m.period_s > 0)) return std::nullopt;
+    const double f = m.count_time_s / m.period_s;
+    return f > 0 && f <= 1 ? std::optional<double>(f) : std::nullopt;
+}
+
 }  // namespace
 
 bool is_master(const std::string& path) {
@@ -427,7 +423,9 @@ Record read_record(const std::string& path, bool frame_files) {
     if (!m.command.empty()) inst["command"] = texts({m.command});
     for (const auto& [name, value] : m.arguments) inst["command/" + name] = texts({value});
 
-    const double arc = std::isfinite(m.period_s) && std::isfinite(m.count_time_s) && m.period_s > 0 ? m.step_deg * m.count_time_s / m.period_s : 0.0;
+    // the arc swept during an exposure and the angle at its middle, as open_scan places its angles
+    const std::optional<double> fraction = exposure_fraction(m);
+    const double arc = fraction ? *fraction * m.step_deg : 0.0, half_arc = fraction ? 0.5 * *fraction * m.step_deg : 0.0;
     int n_of[3] = {0, 0, 0};
     for (const Run& run : m.runs) {
         const Role role = role_of(run.key);
@@ -447,7 +445,7 @@ Record read_record(const std::string& path, bool frame_files) {
             s.rot_delta.assign(c, arc);
             s.rot_period.assign(c, m.step_deg);
             s.rot_center.resize(c);
-            for (std::size_t i = 0; i < c; ++i) s.rot_center[i] = s.rot_trig[i] + 0.5 * arc;
+            for (std::size_t i = 0; i < c; ++i) s.rot_center[i] = s.rot_trig[i] + half_arc;
             s.rot_center_name = m.rotation;
             if (std::isfinite(m.period_s)) s.timer_period.assign(c, m.period_s);
             if (std::isfinite(m.count_time_s)) s.timer_delta.assign(c, m.count_time_s);
@@ -500,10 +498,7 @@ Scan open_scan(const std::string& master) {
     scan.darks = frames_of(m, darks);
 
     // the arc swept during an exposure, and the angle at its middle
-    if (std::isfinite(m.period_s) && std::isfinite(m.count_time_s) && m.period_s > 0) {
-        const double arc = m.count_time_s / m.period_s;
-        if (arc > 0 && arc <= 1) scan.exposure_arc = arc;
-    }
+    scan.exposure_arc = exposure_fraction(m);
     const double half_arc = scan.exposure_arc ? 0.5 * *scan.exposure_arc * m.step_deg : 0.0;
     for (double& a : scan.angles_deg) a += half_arc;
     scan.unwrapped_angles_deg = unwrap_360(scan.angles_deg);

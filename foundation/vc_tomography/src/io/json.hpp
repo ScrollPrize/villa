@@ -29,6 +29,12 @@ struct Json {
                 if (k == key) return &v;
         return nullptr;
     }
+    Json* find(const std::string& key) {
+        if (type == Object)
+            for (auto& [k, v] : object)
+                if (k == key) return &v;
+        return nullptr;
+    }
     bool is(Type t) const { return type == t; }
 
     static Json of(double v) { Json j; j.type = Number; j.number = v; return j; }
@@ -38,6 +44,12 @@ struct Json {
     static Json list() { Json j; j.type = Array; return j; }
     static Json dict() { Json j; j.type = Object; return j; }
     Json& set(const std::string& key, Json v) { object.emplace_back(key, std::move(v)); return *this; }
+    // set `key` of an object: in place if it is there, else at its end
+    Json& put(const std::string& key, Json v) {
+        if (Json* x = find(key)) *x = std::move(v);
+        else object.emplace_back(key, std::move(v));
+        return *this;
+    }
     Json& add(Json v) { array.push_back(std::move(v)); return *this; }
 
     // The value as JSON text. Numbers are written with 17 significant digits (they read back as they are) and

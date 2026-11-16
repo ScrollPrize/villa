@@ -1,12 +1,13 @@
 """Detector map of the reconstruction (detector_map.hpp): the rows read at non-uniform positions without loss
 (resample_rows against the direct sum of the trigonometric interpolant), the inversion of the map and its sign
 conventions, the projections' own scales, and scans gridded through a map against the same data on the ideal grid."""
-import h5py
 import numpy as np
 import pytest
 
 import vc_tomography
 from vc_tomography import _core
+
+from helpers import raw_scan
 from test_sirt_pipeline import recon
 
 DEVICES = vc_tomography.devices()
@@ -105,7 +106,6 @@ def test_resample_rows_is_the_interpolant(n):
         assert (np.abs(_core.resample_rows(rows, far, device=d) - interpolant(rows, far)) / amp).max() <= 1e-6, d
 
 
-@pytest.mark.parametrize("device", DEVICES)
 def test_resample_rows_and_shift_rows(device):
     """at the positions shift_rows reads, resample_rows gives shift_rows' rows (both within rounding of the
     interpolant): no displacement, a constant one, and each row its own"""
@@ -235,7 +235,6 @@ def test_detector_map_inversion():
         _core.detector_map_plan(**m, det_cols=n, col_scale=0.6)
 
 
-@pytest.mark.parametrize("device", DEVICES)
 def test_resample_rows_through_a_map(device):
     """rows read through a detector map: the interpolant at the detector column of every ideal column, each row at
     its own height, delay and scales; whole pixels read the neighbouring samples"""
@@ -304,14 +303,8 @@ def frame_scan(tmp_path, name, eu=None, ev=None, offset=0.0, stretch_cols=0.0, s
     Y = v + (ev(c, v) if ev else 0.0) + stretch_rows * (v - V0)
     frame = np.rint(40000 * ideal(X, Y)).astype(np.uint16)
     path = tmp_path / f"{name}.h5"
-    if not path.exists():
-        with h5py.File(path, "w") as f:
-            f.create_dataset("data", data=np.broadcast_to(frame, (NPROJ, NR, ND)).copy(), chunks=(1, NR, ND))
-    return _core.make_scan_data(np.arange(NPROJ) * (360 / 64), np.zeros(NPROJ), .01, NR, ND, 0, -offset, 0., np.full(NPROJ, .2),
-                                np.array([0], np.float32), np.zeros((NR, ND), np.float32),
-                                np.full((1, NR, ND), 50000, np.float32), np.ones((NR, ND), np.float32) if weight is None else weight,
-                                _core.RawReader([str(path)], "data", NR, ND), np.zeros(NPROJ, np.int32),
-                                np.arange(NPROJ, dtype=np.int32), **kw)
+    return raw_scan(path, None if path.exists() else np.broadcast_to(frame, (NPROJ, NR, ND)), np.arange(NPROJ) * (360 / 64),
+                    x_readjustment=-offset, weight=weight, **kw)
 
 
 def gridded(scan, device, **k):
@@ -336,7 +329,6 @@ def map_terms(coefficients):
 BITS = 6e-5
 
 
-@pytest.mark.parametrize("device", DEVICES)
 def test_scan_through_a_detector_map(tmp_path, device):
     """a scan recorded through a detector map grids like the same scene recorded on the ideal grid, when the map is
     given: whole pixels to rounding, a smooth map to the frames' 16 bits; left out, the map's displacement shows"""
@@ -377,7 +369,6 @@ def test_scan_through_a_detector_map(tmp_path, device):
         assert np.abs(mapped - gridded(frame_scan(tmp_path, "smooth", eu, ev, **MAP), "cpu")).max() < 3e-6
 
 
-@pytest.mark.parametrize("device", DEVICES)
 def test_scan_with_frame_scales(tmp_path, device):
     """row_scale, col_scale: frames stretched along the rows (pixel (c, v) records the scene at row v + s (v - V0))
     or along the columns grid like the plain ones when their scale is given, with or without a detector map"""
@@ -406,7 +397,6 @@ def test_scan_with_frame_scales(tmp_path, device):
     assert np.abs(gridded(frame_scan(tmp_path, "row_scale", stretch_rows=rs), device, **it) - measured).max() > 2e-3
 
 
-@pytest.mark.parametrize("device", DEVICES)
 def test_measured_pixels_are_gridded_through_a_detector_map(tmp_path, device):
     """the gridding of measured pixels only (the iterative methods) reads a scan with the lateral part of a map, a
     column scale or a lateral registration exactly, as FBP's gridding does: the scene recorded on the ideal grid
@@ -453,7 +443,6 @@ def test_measured_pixels_are_gridded_through_a_detector_map(tmp_path, device):
         np.testing.assert_array_equal(np.asarray(mapped["weights"]) > 0, np.asarray(on_cpu["weights"]) > 0)
 
 
-@pytest.mark.parametrize("device", DEVICES)
 def test_detector_map_is_refused_where_it_cannot_be_applied(tmp_path, device):
     lateral = [dict(MAP), dict(col_scale=[0.01] * NPROJ, scale_col=C0)]
     vertical = [dict(MAP, map_eu=[0.0] * 5), dict(row_scale=[0.01] * NPROJ, scale_row=V0)]

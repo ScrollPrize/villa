@@ -2,21 +2,17 @@
 the way vc_tomography.download_projections writes them, become one multiscale Zarr store whose stored levels hold the
 files' values, whose other levels are declared and empty, and which a second run leaves as it is."""
 import json
-import shutil
 import subprocess
-from pathlib import Path
 
 import numpy as np
 import pytest
 
-from vc_tomography import _core
+from helpers import find_tool
 
 h5py = pytest.importorskip("h5py")
 open_zarr = pytest.importorskip("vc_reader.reader").open_zarr
 
-_HERE = Path(_core.__file__).resolve().parent
-TOOL = next((str(d / "vc_tomography_projections_zarr") for d in (_HERE, *_HERE.parents[:2]) if (d / "vc_tomography_projections_zarr").exists()),
-            None) or shutil.which("vc_tomography_projections_zarr")
+TOOL = find_tool("vc_tomography_projections_zarr")
 pytestmark = pytest.mark.skipif(TOOL is None, reason="vc_tomography_projections_zarr is not built")
 ROWS, COLS, FIRST = 1040, 64, 500
 DATASET = "/entry_0000/instrument/det1/data"
