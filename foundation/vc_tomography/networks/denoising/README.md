@@ -1,19 +1,19 @@
-# Denoising helirec's reconstructions (Noise2Inverse)
+# Denoising vc_tomography's reconstructions (Noise2Inverse)
 
 A 3D U-Net that takes the noise off reconstructed slices. It runs **after** the reconstruction, on the float
 slices, before they are windowed to uint8; nothing in the back projection changes. It is trained without clean
 data, on pairs of reconstructions of the same slices whose noise is independent (Hendriksen, Pelt & Batenburg,
 "Noise2Inverse", 2020).
 
-It is not part of the `helirec` Python package: it needs PyTorch, which helirec's environment does not have. The
+It is not part of the `vc_tomography` Python package: it needs PyTorch, which vc_tomography's environment does not have. The
 scripts are run as files, each with the environment it names. The trained weights are **not in the repository**.
 
 | File | Environment | What it does |
 |---|---|---|
-| `reconstruct_block.py` | helirec | A block of slices as `.npz`: the training pairs, and blocks to try a network on |
+| `reconstruct_block.py` | vc_tomography | A block of slices as `.npz`: the training pairs, and blocks to try a network on |
 | `noise2inverse.py` | PyTorch | The network; `train`, `apply` (a block), `slices` (pictures of a block) |
 | `denoise_spool.py` | PyTorch | The network on a run of slices another process reconstructs, through a spool folder, to uint8 |
-| `masked_volume.py` | helirec | A whole scan: reconstructed, denoised (it starts `denoise_spool.py`) and written as a uint8 OME-Zarr under a mask |
+| `masked_volume.py` | vc_tomography | A whole scan: reconstructed, denoised (it starts `denoise_spool.py`) and written as a uint8 OME-Zarr under a mask |
 
 In this repository the PyTorch environment is `vesuvius/.venv`.
 
@@ -21,8 +21,8 @@ In this repository the PyTorch environment is `vesuvius/.venv`.
 
 A pair is two reconstructions of the same slices with independent noise. Two ways:
 
-- **Noise splitting** (what the trained networks used): two runs of helirec's `noise_split` on the same projections,
-  with the scales `a` and `-1 / a` (README of helirec, "Slices and volumes"). No projection is left out. It needs the
+- **Noise splitting** (what the trained networks used): two runs of vc_tomography's `noise_split` on the same projections,
+  with the scales `a` and `-1 / a` (README of vc_tomography, "Slices and volumes"). No projection is left out. It needs the
   detector's noise model (`gain`, `floor`, and the `smooth` fields and `flats` where measured), from the scan's own
   flats.
 - **Even and odd projections** (Noise2Inverse as published): `reconstruct_block.py` writes `even` and `odd` by
@@ -75,7 +75,7 @@ python masked_volume.py SCANS --cache CACHE --geometry geometry.json \
     --zarr denoised.zarr --zarr_not_denoised not_denoised.zarr --spool SPOOL_DIR
 ```
 
-- The volume is helirec's slice grid over every height the scan can give: slice `j` is the first doable view
+- The volume is vc_tomography's slice grid over every height the scan can give: slice `j` is the first doable view
   height + `j`. uint8 in `--window` (per cm), chunks of 128, 6 levels, `vc-delta3d`.
 - `--mask`: a `.npy` (z, y, x) at a quarter of the volume's resolution, not 0 where the volume is kept; outside it
   the volume is 0 and nothing is stored. The reconstruction is only made inside the mask's box of each segment.
@@ -102,7 +102,7 @@ A network does not carry over between scans: the PHerc. 172 network rates 0.90 o
 
 ## Checks
 
-- `tests/test_denoising_network.py` (needs PyTorch; skipped in helirec's environment): a tile's kept part against the
+- `tests/test_denoising_network.py` (needs PyTorch; skipped in vc_tomography's environment): a tile's kept part against the
   whole volume, `denoise_spool`'s uint8 against `run_tiled`, a saved network loads again, the spool's bookkeeping.
 
   ```bash

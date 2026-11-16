@@ -1,10 +1,10 @@
-# helirec
+# vc_tomography
 
 Standalone reconstruction of **extended-field-of-view helical tomography** (ESRF BM18 "HA + TA" scan pairs), from
 the raw Bliss projection folders to xy slices and volumes. The core is C++17; every compute stage has a CPU
 (OpenMP / FFTW) and a CUDA (cuFFT) kernel with identical semantics, exposed to Python through nanobind.
 
-helirec reimplements the Night Rail BM18 + nabu-helical + nabuxx workflow. Two modes (`--set mode=...`, Python
+vc_tomography reimplements the Night Rail BM18 + nabu-helical + nabuxx workflow. Two modes (`--set mode=...`, Python
 `params={"mode": ...}`):
 
 * `corrected` (default): output in attenuation (cm⁻¹); every measured line counted once in the half-acquisition
@@ -28,20 +28,20 @@ helirec reimplements the Night Rail BM18 + nabu-helical + nabuxx workflow. Two m
 
 Outputs record the mode, its conventions and every resolved parameter (`manifest.json`, OME-Zarr attributes).
 
-## Slices and volumes (`helirec-reconstruct`)
+## Slices and volumes (`vc_tomography_reconstruct`)
 
-`helirec-reconstruct` is a C++ executable (`tools/helirec_reconstruct.cpp`; `cmake --build build/<tree> --target
-helirec-reconstruct`; installed into the environment's `bin` with the package). The reconstruction it runs is
-`helirec::Reconstruction` (`include/helirec/reconstruction.hpp`: the scans, both calibrations, the parameters and
-their rules, provenance), which Python's `helirec.recon.HelicalRecon` binds. `--config FILE` takes a JSON object of
+`vc_tomography_reconstruct` is a C++ executable (`tools/vc_tomography_reconstruct.cpp`; `cmake --build build/<tree> --target
+vc_tomography_reconstruct`; installed into the environment's `bin` with the package). The reconstruction it runs is
+`vc_tomography::Reconstruction` (`include/vc_tomography/reconstruction.hpp`: the scans, both calibrations, the parameters and
+their rules, provenance), which Python's `vc_tomography.recon.HelicalRecon` binds. `--config FILE` takes a JSON object of
 its options (names without the dashes); each run writes `config.json`, which reruns it.
 
 ```bash
-helirec-reconstruct PROJ -n 8 --tag unfiltered                                    # 8 slices, default mode
-helirec-reconstruct PROJ -n 8 --set mode=legacy_reference --tag reference         # the reference workflow
-helirec-reconstruct PROJ --fractions 0.4 0.5 --set "filters=paganin(delta_beta=500)+unsharp(sigma=1.2,coeff=4)" --tag db500
-helirec-reconstruct PROJ -n 4 --device cpu --tag cpu
-helirec-reconstruct PROJ -n 8 --set "filters=mtf_paganin(delta_beta=1000,sigma=1.06)" \
+vc_tomography_reconstruct PROJ -n 8 --tag unfiltered                                    # 8 slices, default mode
+vc_tomography_reconstruct PROJ -n 8 --set mode=legacy_reference --tag reference         # the reference workflow
+vc_tomography_reconstruct PROJ --fractions 0.4 0.5 --set "filters=paganin(delta_beta=500)+unsharp(sigma=1.2,coeff=4)" --tag db500
+vc_tomography_reconstruct PROJ -n 4 --device cpu --tag cpu
+vc_tomography_reconstruct PROJ -n 8 --set "filters=mtf_paganin(delta_beta=1000,sigma=1.06)" \
     --set sld=fraction=0.6,length=400 --tag mtf        # fused phase retrieval + detector deblur, calibrated glare
 ```
 
@@ -49,8 +49,8 @@ Range mode reconstructs contiguous slices in chunks (`--chunk`, default 32) and 
 Zarr v2) by default:
 
 ```bash
-helirec-reconstruct PROJ --z 900 1700 --roi X0 X1 Y0 Y1 --uint8 --levels 4 --tag block       # float32 + uint8 OME-Zarr
-helirec-reconstruct PROJ --heights H0 H1 --format tiff --uint8 --tag block_tif                 # TIFF stacks
+vc_tomography_reconstruct PROJ --z 900 1700 --roi X0 X1 Y0 Y1 --uint8 --levels 4 --tag block       # float32 + uint8 OME-Zarr
+vc_tomography_reconstruct PROJ --heights H0 H1 --format tiff --uint8 --tag block_tif                 # TIFF stacks
 ```
 
 **More scans than two, and frames from a projection store.** The acquisition is the scan with the rotation axis in
@@ -65,8 +65,8 @@ those frames see. The slices are of the frames read: pixels 2^R times the stored
 stored pixels) divided to match.
 
 ```bash
-helirec-calibration geometry META/*/*_0001.h5 --out geometry.json --row-time-us -6.46 --reduce 2 --projections projections.zarr   # the scan with the axis in its field first
-helirec-reconstruct META --projection_store projections.zarr --reduce 2 --set geometry=geometry.json \
+vc_tomography_calibration geometry META/*/*_0001.h5 --out geometry.json --row-time-us -6.46 --reduce 2 --projections projections.zarr   # the scan with the axis in its field first
+vc_tomography_reconstruct META --projection_store projections.zarr --reduce 2 --set geometry=geometry.json \
     --z 500 532 --chunk 4 --uint8 --tag quarter                                    # four scans of PHercParis4 at 2.4 um, at a quarter
 ```
 
@@ -94,20 +94,20 @@ after the first is matched to the scans before it at its seam with them.
   volume of 5398 slices on the 5411 of the measured pitch: within 0.1 slice mid-volume, about 2 at the two ends).
   `--reference_scale LEVEL` takes the mask from a coarser
   pyramid level instead (each of its voxels decides the block of output voxels it covers), which is a far smaller
-  read: an 8x level is 1/512 of the data. The reference is read in C++ with helirec's own Zarr reader
-  (`helirec::ReferenceMask` on `zarr.hpp`: a Zarr v2 array or OME-Zarr pyramid at a local path, or at an `http(s)://`
+  read: an 8x level is 1/512 of the data. The reference is read in C++ with vc_tomography's own Zarr reader
+  (`vc_tomography::ReferenceMask` on `zarr.hpp`: a Zarr v2 array or OME-Zarr pyramid at a local path, or at an `http(s)://`
   / `s3://` location (a public bucket, no credentials) with `--reference_cache DIR` as its disk cache: each chunk is
-  kept under `DIR/helirec_zarr/` once read). A pyramid level that declares no translation is taken as block-reduced.
+  kept under `DIR/vc_tomography_zarr/` once read). A pyramid level that declares no translation is taken as block-reduced.
   Under a mask the exact backprojector computes only its 32 x 32 pixel tiles that hold a kept pixel.
-* The volume is written in C++ (`helirec::OmeZarrWriter`): the reconstructor hands it each slice as the block it
+* The volume is written in C++ (`vc_tomography::OmeZarrWriter`): the reconstructor hands it each slice as the block it
   computed, so no whole slice is built on the host and only the chunks that hold data are buffered, encoded and stored.
 * Only the pixels that are needed are backprojected, and their values are those of a whole-slice run (the exact
   backprojector computes each pixel on its own): `--bbox X0 X1 Y0 Y1` reconstructs that box of each slice and leaves
   the rest of the output 0 (the output keeps its shape; `--roi` crops it), and a `--uint8_only` run with a
   `--reference_volume` computes only the bounds of what the mask keeps in each chunk; chunks it empties are skipped.
 * Progress is a bar per multi-part step (calibration reductions and searches, slices, pyramid levels) with the step
-  in hand after the rate; when the output is not a terminal it is one line every 10 s (`helirec.ProgressBar`, the
-  C++ `helirec::ProgressBar`).
+  in hand after the rate; when the output is not a terminal it is one line every 10 s (`vc_tomography.ProgressBar`, the
+  C++ `vc_tomography::ProgressBar`).
 * In `legacy_reference`, chunked slices inherit the reference Paganin kernel's chunk-height dependence (a small
   uniform offset compared with single-slice runs) and the luminosity window clipped to the chunk; the default mode
   has neither (it reads the window's 12 context rows either side of a chunk).
@@ -115,7 +115,7 @@ after the first is matched to the scans before it at its seam with them.
 Python:
 
 ```python
-from helirec.recon import HelicalRecon
+from vc_tomography.recon import HelicalRecon
 r = HelicalRecon("/path/to/projections", cache_dir="cache", device="cuda")
 img = r.reconstruct_fractions([0.5])[0]                  # N x N float32
 r.set_params(filters="paganin(delta_beta=500)+unsharp(sigma=1.2,coeff=4)")           # rebuilds the reconstructor, keeps the calibration
@@ -124,28 +124,28 @@ vol = r.reconstruct_heights(h, h + 32, next=(h + 32, h + 64))   # reads the next
 ```
 
 Page-locked host buffers (the chunk's raw windows, several GB) are kept when a reconstructor is replaced, e.g. by
-`set_params`, so the next one does not lock them again (~0.2 s/GB); `helirec.release_pinned_memory()` frees them.
+`set_params`, so the next one does not lock them again (~0.2 s/GB); `vc_tomography.release_pinned_memory()` frees them.
 
-## Surface composites (`helirec-composite`)
+## Surface composites (`vc_tomography_composite`)
 
 Renders layer composites (max and mean) along a tifxyz surface, plus `--xy_slices N` slices over its z range,
 from a reconstructed OME-Zarr or straight from the projections:
 
 ```bash
-helirec-composite VOLUME.zarr SURFACE_TIFXYZ --layers 15 --start -4 --direction auto --xy_slices 8 --tag s
-helirec-composite --projections PROJ --cache_dir CAL SURFACE_TIFXYZ --z Z0 Z1 --layers 15 --start -4 \
+vc_tomography_composite VOLUME.zarr SURFACE_TIFXYZ --layers 15 --start -4 --direction auto --xy_slices 8 --tag s
+vc_tomography_composite --projections PROJ --cache_dir CAL SURFACE_TIFXYZ --z Z0 Z1 --layers 15 --start -4 \
     [--set "filters=paganin(delta_beta=1000)+unsharp(sigma=1.2,coeff=4)" --sweep paganin.delta_beta=250,500,1000,2000] --tag s
 ```
 
-`helirec-composite` is a C++ executable (`tools/helirec_composite.cpp`, `include/helirec/surface_composite.hpp`,
-library `helirec_surfaces`). Surface geometry, sampling and the max/mean reductions are vc_reader's C++ (bicubic
+`vc_tomography_composite` is a C++ executable (`tools/vc_tomography_composite.cpp`, `include/vc_tomography/surface_composite.hpp`,
+library `vc_tomography_surfaces`). Surface geometry, sampling and the max/mean reductions are vc_reader's C++ (bicubic
 Hermite patches, normal dP/du × dP/dv, `grid::sample` with its defaults, `composite::reduce`; images through
 vc_reader's writers). Layer k sits at direction × (start + k·step) voxels along the normal; `--direction
 auto` steps toward the denser side. From a volume, a layer that falls beyond the block reads vc_reader's fill value
 (0) rather than nothing, so pixels near the block's top and bottom are kept with those zeros among their layers. Output: `max.tif`, `mean.tif` (float32), uint8 TIFF/PNG copies, `mask.png`,
 `composite.json`, `layers/`, `xy_slices/`; `--surface_zarr` also writes the layer stack as a uint8 OME-Zarr.
 
-From the projections, `helirec.band.BandComposite` (C++ `helirec::surface::BandComposite`) skips slices and volumes:
+From the projections, `vc_tomography.band.BandComposite` (C++ `vc_tomography::surface::BandComposite`) skips slices and volumes:
 it runs the exact backprojector only at the slice pixels the composite's sample points need, samples them on the
 reconstructor's device and returns max/mean (the whole-slice methods reconstruct the points' box slice by slice and
 sample it with vc_reader's `sampling::sampleDense`). Parameter sweeps need CUDA. Raw data
@@ -163,14 +163,14 @@ mx, mean = bc.composites(set=2)
 
 ## Pipeline
 
-| # | stage | module (C++ `include/helirec/…`) | backends |
+| # | stage | module (C++ `include/vc_tomography/…`) | backends |
 |---|---|---|---|
-| 0 | Bliss master parsing: entries, angles, z, machine current, frame→file map (as nxtomomill + nx2etf, bit for bit); or a NeXus NXtomo master (GDA) | `calibration/scan.hpp` (Python: `helirec.bliss`) | CPU |
+| 0 | Bliss master parsing: entries, angles, z, machine current, frame→file map (as nxtomomill + nx2etf, bit for bit); or a NeXus NXtomo master (GDA) | `calibration/scan.hpp` (Python: `vc_tomography.bliss`) | CPU |
 | 1 | raw row-window reads (`pread`, one HDF5 chunk per frame) | `raw_reader.hpp` | CPU (threads) |
-| 2 | intensity calibration: darks/flats, weight map + apodisation, the detector's blur field; the merged frame (`helirec-calibration intensity`) | `calibration/intensity.hpp` (Python: `helirec.calibration`) | CPU |
-| 2b | geometry calibration: layout, rows' timing, comparisons, one solve for the detector map and the scans' places (`helirec-calibration geometry`) | `calibration/geometry_calibration.hpp`, `python/helirec/geometry.py` | CPU, CUDA |
-| 2d | surface composites: layers along a tifxyz surface from a volume or the projections (`helirec-composite`) | `surface_composite.hpp` (Python: `helirec.band`) | CPU, CUDA |
-| 2c | the reconstruction of a pair: parameters (modes, filter chains, `--set`), scan data from both calibrations, provenance (`helirec-reconstruct`) | `reconstruction.hpp` (Python: `helirec.recon`) | CPU |
+| 2 | intensity calibration: darks/flats, weight map + apodisation, the detector's blur field; the merged frame (`vc_tomography_calibration intensity`) | `calibration/intensity.hpp` (Python: `vc_tomography.calibration`) | CPU |
+| 2b | geometry calibration: layout, rows' timing, comparisons, one solve for the detector map and the scans' places (`vc_tomography_calibration geometry`) | `calibration/geometry_calibration.hpp`, `python/vc_tomography/geometry.py` | CPU, CUDA |
+| 2d | surface composites: layers along a tifxyz surface from a volume or the projections (`vc_tomography_composite`) | `surface_composite.hpp` (Python: `vc_tomography.band`) | CPU, CUDA |
+| 2c | the reconstruction of a pair: parameters (modes, filter chains, `--set`), scan data from both calibrations, provenance (`vc_tomography_reconstruct`) | `reconstruction.hpp` (Python: `vc_tomography.recon`) | CPU |
 | 3 | helical geometry: span info, doable span, per-projection shifts and grid bins | `helical.hpp` | CPU |
 | 4 | gridding: flat-field, weights, vertical / horizontal kernels, angular bins (gather form) | `accumulate.hpp` | CPU, CUDA |
 | 5 | HA/TA luminosity equalisation, divide, mend | `accumulate.hpp` | CPU, CUDA |
@@ -181,7 +181,7 @@ mx, mean = bc.composites(set=2)
 | 10 | reconstruction: GHBP, exact FBP, SIRT, MLEM or gridrec | `ghbp.hpp`, `kernels.hpp`, `tomo.hpp` | CPU, CUDA |
 
 `SliceReconstructor` (`pipeline.hpp`) chains stages 3–10 for a chunk of view heights. Every stage is also callable
-on its own from Python (`helirec._core`, re-exported in `helirec`) on NumPy arrays with `device="cpu" | "cuda"`.
+on its own from Python (`vc_tomography._core`, re-exported in `vc_tomography`) on NumPy arrays with `device="cpu" | "cuda"`.
 
 ### Reconstruction methods (`--set backprojector=SPEC`)
 
@@ -234,7 +234,7 @@ on its own from Python (`helirec._core`, re-exported in `helirec`) on NumPy arra
     models**, not an exact raw-measurement forward model: fractional z/angle/x interpolation and phase retrieval
     remain approximations. The paired projectors are adjoints of the rebinned slice model. Iterative luminosity
     correction reads a full vertical context window so its central values do not depend on slice chunk height.
-* `python(fn=…)`: a function registered in `helirec.backprojectors`, for experiments.
+* `python(fn=…)`: a function registered in `vc_tomography.backprojectors`, for experiments.
 
 ### Other parameters
 
@@ -243,7 +243,7 @@ on its own from Python (`helirec._core`, re-exported in `helirec`) on NumPy arra
   Paganin baseline recipes. Explicit chains are literal: omit `unsharp` for Paganin alone, or set
   `unsharp.coeff=0` to disable sharpening. Built-in types: `paganin`,
   `epr`, `mtf_paganin`, `wiener`, `unsharp`, `gaussian`, `butterworth`, `median`, `python`; register more in C++ (`register_filter`, `filters.hpp`) or Python
-  (`helirec.filters.register`). Each filter runs at `stage=intensity` (before −log, default) or `stage=log` and
+  (`vc_tomography.filters.register`). Each filter runs at `stage=intensity` (before −log, default) or `stage=log` and
   declares the margin rows it needs. Consecutive linear shift-invariant filters of one stage fuse into one FFT
   filter. Command line: `--set "filters=paganin(delta_beta=2000)+median(radius=1,stage=log)"`, or override one
   parameter of the current chain with `--set paganin.delta_beta=500`. Sweeps take the same keys
@@ -316,7 +316,7 @@ on its own from Python (`helirec._core`, re-exported in `helirec`) on NumPy arra
   ```bash
   .venv/bin/python evaluation/wiener_table.py wiener.json --transfer film_transfer.json --sharp ta_nophase 1250 1400 \
       --curves RUN/fsc_halves --pair half0 half1 [--filtered base]
-  helirec-reconstruct PROJ --set backprojector=fbp --set "filters=wiener(table=wiener.json)" ...
+  vc_tomography_reconstruct PROJ --set backprojector=fbp --set "filters=wiener(table=wiener.json)" ...
   ```
   On PHerc0343P (8.64 µm, glare correction 0.6 / 400) the Teflon wrap is reproduced through 1.00 ± 0.03 up to
   0.28 cycles per pixel and through the designed `g` beyond (0.84 at 0.36, 0.56 at 0.45), where
@@ -343,7 +343,7 @@ on its own from Python (`helirec._core`, re-exported in `helirec`) on NumPy arra
   the correction of the same paper (section 3.6) for the detector's long-range glare. The recorded frame is the
   image convolved with `K = (δ + f·t) / (1 + f)`, `t(r) ∝ exp(−r/length) / r` (pixels); the glare `S ∗ M`,
   `Ŝ = f t̂ / (1 + f t̂)`, is computed on frames binned by `bin`, subtracted from `(raw − dark) / current` before the
-  flat division, and the flats are corrected the same way (`include/helirec/sld.hpp`). Each chunk reads the whole
+  flat division, and the flats are corrected the same way (`include/vc_tomography/sld.hpp`). Each chunk reads the whole
   frame of every `stride`-th projection for its glare map (kept across consecutive chunks) and interpolates in
   between. `fraction` and `length` are properties of the scintillator and optics and must be measured; 0.1 / 100
   are the Night Rail defaults, not a calibration of any particular scan. Not available in `legacy_reference`.
@@ -360,9 +360,9 @@ on its own from Python (`helirec._core`, re-exported in `helirec`) on NumPy arra
   For ESRF **BM18 calibration files**, use the new full-resolution profile:
 
   ```bash
-  helirec-reconstruct PROJ -n 4 --set "sld=json=/path/to/diffusion.json" --tag bm18_sld
+  vc_tomography_reconstruct PROJ -n 4 --set "sld=json=/path/to/diffusion.json" --tag bm18_sld
   # Explicit model, with two diffusion tails (illustrative values, not a calibration):
-  helirec-reconstruct PROJ -n 4 --set "sld=profile=bm18,fraction=0.06:0.03,length=40:200" --tag bm18_sld
+  vc_tomography_reconstruct PROJ -n 4 --set "sld=profile=bm18,fraction=0.06:0.03,length=40:200" --tag bm18_sld
   ```
 
   Night Rail JSON fields `fraction` and `scale_l` may be scalars or equal-length lists; lengths are in original
@@ -381,7 +381,7 @@ on its own from Python (`helirec._core`, re-exported in `helirec`) on NumPy arra
   JSONs fitted with `save_binning != 1` are rejected rather than silently misinterpreted. Use a full-resolution
   calibration for the detector/scintillator configuration in question; fitted legacy parameters below should be
   rechecked when changing the illuminated-border assumption. Existing scalar specs retain their old behavior,
-  and SLD remains disabled unless requested. Python frame checks use `helirec.sld.correct(frames, spec)`.
+  and SLD remains disabled unless requested. Python frame checks use `vc_tomography.sld.correct(frames, spec)`.
 
   Validation: `python -m pytest -q tests/test_sld.py tests/test_sld_bm18.py tests/test_fourier.py`.
   The small fixture `tests/reference/sld_bm18.json` is generated from Nabuxx commit
@@ -485,13 +485,13 @@ on its own from Python (`helirec._core`, re-exported in `helirec`) on NumPy arra
     0 for step scans); its inverse 1 / sinc(F f) is applied to every sinogram as a 9-tap kernel along the angle
     (`sino.hpp`), at most 1.43 at the angular Nyquist frequency. 0: off. **Disabled for now with
     `angle_interp=views`** (the default): the kernel runs along one turn of grid angles and has not been carried
-    over to a row per view; `info["exposure_arc_bins"]` is then 0 and `helirec-reconstruct` says so. `angle_interp=nearest`
+    over to a row per view; `info["exposure_arc_bins"]` is then 0 and `vc_tomography_reconstruct` says so. `angle_interp=nearest`
     applies it.
     On PHerc0343P `nearest` and the arc correction together sharpen the tangential edge of the wrap at r ≈ 1200 px by
     3 % (Paganin only) to 7 % (with the unsharp mask); as the removed blurs also averaged noise, the noise in the outer
     air rises by 16 % (Paganin) to 33 % (unsharp).
   * `geometry=PATH` (default: `geometry.json` in the calibration cache, made there on first use), `row_time_us`:
-    the geometry calibration (`helirec-calibration geometry`, below), the only one. Every projection is read on the grid of its
+    the geometry calibration (`vc_tomography_calibration geometry`, below), the only one. Every projection is read on the grid of its
     detector map, at the row, axis column, roll and scales it gives that frame and at the angle of each of its
     rows (the rows' timing), in a merged frame laid out from the same poses. It holds what the earlier calibration's
     options stood for, which are gone and refused by name: the helical pitch (`z_translation_scale`), the turns at
@@ -570,10 +570,10 @@ on its own from Python (`helirec._core`, re-exported in `helirec`) on NumPy arra
     per chunk on the PHerc0343P pair).
 * **Calibration cache** (`--cache_dir`): `calibration_arrays.bin` (the darks / flats reduction and the weight map)
   and `calibration.json` (the merged frame and the detector's blur field), keyed by a fingerprint of the
-  acquisition and the calibration version (`helirec-calibration intensity` writes the same two files), and
+  acquisition and the calibration version (`vc_tomography_calibration intensity` writes the same two files), and
   `geometry.json`, the geometry calibration of the two scans, made there by the geometry calibration step when it
   is missing or is other scans' (about 13 minutes on PHerc0343P; `--set geometry=PATH` uses one made before and
-  makes nothing). Written atomically. The `.bin` files are helirec's array files: a first line of JSON naming each
+  makes nothing). Written atomically. The `.bin` files are vc_tomography's array files: a first line of JSON naming each
   array, its shape and its byte offset, then the values as float32 little-endian (`src/io/array_file.hpp`;
   `numpy.frombuffer(data, "<f4", count, offset)` reads one). Caches of the `.npz` form (calibration version 2,
   before 13 November 2026) are not read: the reduction is made again (seconds) and the blur field measured again.
@@ -596,7 +596,7 @@ on its own from Python (`helirec._core`, re-exported in `helirec`) on NumPy arra
 Reconstructs the same slices with each method of a JSON config (default `evaluation/default_methods.json`: FBP,
 SIRT, MLEM and gridrec on unfiltered data) and writes float32 `slices/<method>/z<Z>.tif` and `manifest.json`
 (time, mean, std, fine-scale std). PNG contact and crop sheets are opt-in with `--previews` (the slice folders hold
-TIFFs only); `helirec-reconstruct --previews` writes PNG slices. Preview windows are shared in attenuation units; legacy TIFFs retain native reference units.
+TIFFs only); `vc_tomography_reconstruct --previews` writes PNG slices. Preview windows are shared in attenuation units; legacy TIFFs retain native reference units.
 Options: `--projections`, `--cache_dir`, `-n`, `--z Z0 Z1`, `--roi X0 X1 Y0 Y1` (`-1`: whole slices),
 `--methods NAME ...`, `--overwrite`; existing slices with matching provenance are reused.
 
@@ -605,7 +605,7 @@ filters and with Paganin δ/β 1000 + unsharp σ 1.2, coefficient 4, over the sa
 It uses the corrected mode and CUDA backend, requiring a CUDA-enabled build and host.
 The calibration cache lives under the output directory.
 
-Run from `foundation/helirec`:
+Run from `foundation/vc_tomography`:
 
 ```bash
 AGENTS_AGENT_MODE=1 .venv/bin/python -u evaluation/compare_methods.py evaluation/343p_baselines.json \
@@ -682,7 +682,7 @@ To rebuild the local package with CUDA required (adjust the compiler path for yo
 
 ```bash
 AGENTS_AGENT_MODE=1 AGENTS_ALLOW_INSTALL=1 uv pip install --python .venv/bin/python --no-deps --reinstall -e . \
-    -C cmake.define.HELIREC_CUDA=ON -C cmake.define.CMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc
+    -C cmake.define.VC_TOMOGRAPHY_CUDA=ON -C cmake.define.CMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc
 ```
 
 Run GPU commands on a host/session with NVIDIA device access. Use `--overwrite` to recompute every slice after
@@ -694,7 +694,7 @@ How much of a reconstruction is signal, per spatial frequency and direction: the
 volumes against a registered reference volume of the same sample (a finer scan: `--ref` JSON with its location and
 the affine from the volumes' grid, as the open-data catalogue's `volume_transforms`), and / or between two
 reconstructions of one scan (`--pair`, e.g. `angle_subset=0/2` and `1/2`). Computed on cubic blocks with
-`helirec.BlockCorrelator` (`block_spectra.hpp`, CPU and CUDA): the reference is resampled twice finer than the
+`vc_tomography.BlockCorrelator` (`block_spectra.hpp`, CPU and CUDA): the reference is resampled twice finer than the
 volumes' grid and band-limited to it in the Fourier domain, registered per block by a sub-voxel shift, and the
 cross-spectra are summed in bins of |k| and of the angle of k from the z axis, so that in-plane and axial
 frequencies are reported apart. `matched` is the number to compare reconstructions with (no linear filter that is
@@ -734,18 +734,18 @@ isolated slice uploads 8.7 GB of raw rows (0.4 s), and with SLD reads 12 GB of w
 disk rather than the page cache that read dominates. The first chunk of a process also page-locks its raw buffers
 (1.4 s).
 
-## Checking an acquisition record (`helirec-calibration`)
+## Checking an acquisition record (`vc_tomography_calibration`)
 
-`helirec::calibration` (`include/helirec/calibration/`, `src/calibration/`) checks what the acquisition record of
+`vc_tomography::calibration` (`include/vc_tomography/calibration/`, `src/calibration/`) checks what the acquisition record of
 a scan states, first against itself and then against the raw frames. It shares nothing with the calibration the
-reconstruction uses (`helirec/calibration/intensity.hpp`, `helirec.calibration`): it reads the BLISS master file and the frame
+reconstruction uses (`vc_tomography/calibration/intensity.hpp`, `vc_tomography.calibration`): it reads the BLISS master file and the frame
 files directly, and the only processing is a dark subtraction and a division by the mean flat of the scan.
 
 ```bash
-cmake --build build/<tree> --target helirec-calibration
-helirec-calibration selftest [--device cpu|cuda]          # the registration estimator on synthetic data
-helirec-calibration check-record <scan.h5> [<more scans.h5> ...] --no-frames   # the record against itself; no frame is read
-helirec-calibration check-record <scan.h5> [<more scans.h5> ...] --out DIR [--checks record,inventory,series,beam,views]
+cmake --build build/<tree> --target vc_tomography_calibration
+vc_tomography_calibration selftest [--device cpu|cuda]          # the registration estimator on synthetic data
+vc_tomography_calibration check-record <scan.h5> [<more scans.h5> ...] --no-frames   # the record against itself; no frame is read
+vc_tomography_calibration check-record <scan.h5> [<more scans.h5> ...] --out DIR [--checks record,inventory,series,beam,views]
 ```
 
 The scans are one scan; two scans of one acquisition that differ in the lateral stage of the rotation axis, the
@@ -764,7 +764,7 @@ These verdicts assess the evidence and model; they do not identify the physical 
 The report schema replaces the former `holds`/`open` labels; clients should use the new labels and follow-up flag.
 The CLI returns zero when it successfully writes a report, not when the acquisition meets every requirement.
 
-`helirec::calibration::assess_residuals` and Python `calibration_assess_residuals` expose the same per-sample
+`vc_tomography::calibration::assess_residuals` and Python `calibration_assess_residuals` expose the same per-sample
 assessment for other checks. They operate on small measurement summaries; the image registration and its
 CPU/CUDA arithmetic are unchanged by the reporting policy.
 
@@ -780,7 +780,7 @@ The checks:
   finding says what was read;
 * `series`: the dark and flat frames; `beam`: the level of the air beside the sample against the ring current;
 * `views`: blocks of frames that recorded the same lines are registered to a fraction of a pixel, row and frame
-  (`helirec/calibration/registration.hpp`): opposite views of a turn at rest (axis column, angle over half a
+  (`vc_tomography/calibration/registration.hpp`): opposite views of a turn at rest (axis column, angle over half a
   turn), a turn at rest against the helix and the helix a turn apart (travel per turn in rows, offsets between the
   stretches), and the second scan against the first (lateral move, height, angle).
 
@@ -790,14 +790,14 @@ there is one). On the 428 blocks of the 343P pair (32 frames × up to 256 rows �
 takes 0.151 s on the CPU (8 FFT threads) and 0.016 s on an RTX 5090, uploads included; the two agree to 1e-5 of a
 sample on every block.
 
-The same is available from Python as `helirec._core.calibration_check_record(...)` (the report as JSON),
+The same is available from Python as `vc_tomography._core.calibration_check_record(...)` (the report as JSON),
 `calibration_register_blocks` and `calibration_selftest`, each with a `device` argument.
 
-For measurements the fixed checks do not make, `helirec._core.CalibrationSession(scans)` keeps the scans of an
+For measurements the fixed checks do not make, `vc_tomography._core.CalibrationSession(scans)` keeps the scans of an
 acquisition open: `stretches`, `series` (the record's per-frame angles, heights and times), `read_rows` (raw
 frames as stored), `line_integrals` (the scan's own dark and mean flat, nothing else), and
 `measure(requests, row_sign, device)`, which registers pairs of blocks placed by the caller exactly as the view
-checks cut and register theirs (C++: `helirec::calibration::Session`, `ViewRequest`, `ViewMeasurement`).
+checks cut and register theirs (C++: `vc_tomography::calibration::Session`, `ViewRequest`, `ViewMeasurement`).
 `CalibrationRegistrar(shape, margin)` keeps one registration geometry for many pairs of blocks. The experiments
 under `development_notes/calibration/04_experiments/` are written on these; none of them uses the
 reconstruction's calibration.
@@ -824,7 +824,7 @@ it costs more than it saves (Paris4, 128 opposite-view blocks across tiles: 137 
 without, 76 ms for the blocks alone), so it is off unless asked for.
 
 **The solver.** Ceres is the sole parameter-fitting and continuous-optimization engine. The C++
-API (`helirec/calibration/solve.hpp`) and `helirec.solve.Problem` expose equations over named unknowns:
+API (`vc_tomography/calibration/solve.hpp`) and `vc_tomography.solve.Problem` expose equations over named unknowns:
 `unknowns("axis", n)`, `e = equations(measured, fit=...)`, `e.add("axis", tile, coefficient)`.
 Duplicate coefficients add; held-out equations are predicted without affecting the fit, rank or cost.
 Residuals are always measured minus predicted. `p.fix("axis", index, value)` chooses an explicit gauge.
@@ -868,7 +868,7 @@ Session measurements expose the final peak's `solver` diagnostics and total `fun
 recuts; `evaluations` retains its meaning as the number of outer window recenterings. A usable solver result
 still needs the measurement's curvature, search-window and correlation checks to set `ok`.
 
-The geometry calibration itself (`helirec/calibration/geometry_calibration.hpp`, `helirec-calibration geometry`)
+The geometry calibration itself (`vc_tomography/calibration/geometry_calibration.hpp`, `vc_tomography_calibration geometry`)
 solves on the same engine (`solve_geometry`, a Ceres problem with a block of unknowns per owner; its rank test is
 `solve_linear`'s) and takes the rows' timing from `fit_refill_shots`.
 
@@ -878,11 +878,11 @@ Reading such a frame through `CalibrationSession` or `Frames` is an error; `stre
 the ranges that can be read.
 
 **Frames stored as JPEG 2000.** Projections written as one JPEG 2000 (HTJ2K) codestream per chunk of rows through
-the blosc2 HDF5 filter (id 32026), as ESRF BM18 writes them, are read by `RawReader` when helirec is built with
+the blosc2 HDF5 filter (id 32026), as ESRF BM18 writes them, are read by `RawReader` when vc_tomography is built with
 OpenJPEG (see Build); only the chunks a request touches are decoded, in parallel (about 140 whole frames of
 2368 × 4416 per second on 24 cores; a block of 56 frames × 300 rows in 0.1 s). A chunk is always decoded whole:
 OpenJPEG 2.5.4 returns only the level shift for a decode area of an HTJ2K codestream. The container is parsed by
-helirec itself, so neither the blosc2 library nor the HDF5 filter plugin is needed. Where each chunk lies in a
+vc_tomography itself, so neither the blosc2 library nor the HDF5 filter plugin is needed. Where each chunk lies in a
 file is listed in one pass over the dataset's index (HDF5 1.14 and later; asked chunk by chunk before, which
 was 2 to 3 s of a reconstruction's first slab over a hundred files). `RawReader::set_cache_bytes`
 keeps decoded chunks between reads (off by default; the calibration's `Frames` keep 3 GB per scan,
@@ -901,11 +901,11 @@ every row index of the reader in reduced rows, decoded 3.4, 12 and 44 times fast
 chunk: 8.5, 2.5, 0.7, 0.2 ms) with nothing written to disk. A reduced value is not the mean of 2^reduce pixels:
 value (j, k) is the wavelet's low band at the stored pixel (j, k) 2^reduce, each chunk of rows an image of its
 own, so a geometry in stored pixels holds for the reduced frame with every position divided by 2^reduce and
-nothing added. Darks, flats and weights are taken to the same grid by `helirec::calibration::at_resolution`
-(`helirec.calibration.at_resolution(image, reduce, chunk_rows)` in Python) (the same low-pass; it reproduces a Paris4 frame read at reduce 1, 2, 3 to 0.3 counts rms,
+nothing added. Darks, flats and weights are taken to the same grid by `vc_tomography::calibration::at_resolution`
+(`vc_tomography.calibration.at_resolution(image, reduce, chunk_rows)` in Python) (the same low-pass; it reproduces a Paris4 frame read at reduce 1, 2, 3 to 0.3 counts rms,
 the rounding), so that a flat divides the fixed pattern out as at full resolution. Plain (uncompressed) frames
 have no such resolutions and are refused; rows, columns and rows per chunk must be multiples of 2^reduce.
-`helirec.mosaic.tile_reconstructor(..., reduce=)` reconstructs a tile on it (below), and the calibration session
+`vc_tomography.mosaic.tile_reconstructor(..., reduce=)` reconstructs a tile on it (below), and the calibration session
 reads on it (`CalibrationSession(scans, threads, reduce, store)`, `Session(scans, threads, reduce, store)`: the
 acquisition as a detector with pixels 2^reduce times as large would have recorded it, from the frames' own
 resolutions or from a projection store's level; the geometry step's section says what that measures); the pair
@@ -919,7 +919,7 @@ an HDF5 filter plugin is needed. The C++ API has the same constructor options an
 
 ```python
 import numpy as np
-from helirec import RawReader
+from vc_tomography import RawReader
 
 reader = RawReader(
     ["tile.hdf5"], "entry0000/reconstruction/results/data",
@@ -945,15 +945,15 @@ loads each touched compressed chunk in full. Set `decoder="openjph"` to enable s
 projections too; this chooses OpenJPH's decoded values explicitly.
 
 **Download the Paris4 projection slab at 1/8 resolution.**
-`python -m helirec.download_projections` (or `helirec-download-projections` after installation) exports all
+`python -m vc_tomography.download_projections` (or `vc_tomography_download_projections` after installation) exports all
 19 tiles to `/mnt/raid_nvme/paris4_mosaic_recon/projections/scale_0.125`. The defaults select a 256-original-slice
 slab (0.289024 mm, 32 slices on an isotropic 1/8 grid), centred at motor Z = −256.0385 mm, matching the existing
 local ROI. Each tile keeps whole source files covering the slab plus 1.5 helix turns of context on either side
 (at least one detector height), and every angle in that interval. Frames become 296 × 552; angles are not subsampled.
 
 ```bash
-python -m helirec.download_projections --plan-only  # inspect selection and output size
-python -m helirec.download_projections              # download; repeat this command to resume
+python -m vc_tomography.download_projections --plan-only  # inspect selection and output size
+python -m vc_tomography.download_projections              # download; repeat this command to resume
 tail -f /mnt/raid_nvme/paris4_mosaic_recon/projections/scale_0.125/download.log
 ```
 
@@ -961,7 +961,7 @@ The source is the mounted `keep_it_for_replaying_20260311/RAW_DATA` directory; f
 `paris4_mosaic_recon/RAW_DATA` are preferred. `--source-root`, `--local-root`, `--output`, `--tiles`, `--slices`,
 and `--center-mm` can override these defaults. `--workers` controls concurrent files (default 4), `--threads`
 the decoder threads per file (default 2). `--max-files 1` runs one pending file as a smoke test. No SDK or HDF5
-codec plugin is required; build helirec with `HELIREC_OPENJPH=ON` (the default).
+codec plugin is required; build vc_tomography with `VC_TOMOGRAPHY_OPENJPH=ON` (the default).
 
 `--remote esrf:/data/.../RAW_DATA` (an rclone SFTP remote and the path that `--source-root` stands for) reads
 whatever is not local over SFTP with paramiko instead of through the mount: the masters and one sample file per
@@ -979,7 +979,7 @@ The native planner reads pixel size and helical pitch from each master. For exam
 2.4 µm acquisition's four lateral positions at half and quarter detector resolution in one Zarr:
 
 ```bash
-python -m helirec.download_projections \
+python -m vc_tomography.download_projections \
   --scans 2.4um_PHerc-Paris4_B_HA 2.4um_PHerc-Paris4_B_TA \
           2.4um_PHerc-Paris4_B_TA2 2.4um_PHerc-Paris4_C_TA3 \
   --slices 128 --center-mm -256.0385 --reduce 1 2 \
@@ -1002,10 +1002,10 @@ aborted; C_TA3 is the completed acquisition at the same TA3 position.
 Re-running resumes completed shards. The downloader tests check one source open for multiple levels, exact
 agreement with separate-level decodes, and resuming either missing level without fetching completed ones again.
 
-### One multiscale Zarr store of the reduced copies (`helirec-projections-zarr`)
+### One multiscale Zarr store of the reduced copies (`vc_tomography_projections_zarr`)
 
 ```bash
-helirec-projections-zarr projections.zarr scale_0.125 scale_0.25 [--tiles T1-03 ...] [--threads N] [--no_verify]
+vc_tomography_projections_zarr projections.zarr scale_0.125 scale_0.25 [--tiles T1-03 ...] [--threads N] [--no_verify]
 ```
 
 Each folder is one output folder of the downloader (its `plan.json` and files). The store is Zarr v3:
@@ -1017,7 +1017,7 @@ projections.zarr/<tile>/<scan>/     darks (scan0002), flats (scan0003, scan0007)
 ```
 
 A level comes from the folder of its `reduce`; a level no folder gives is declared without chunks (it reads as
-zeros), and the scan group's `helirec` attribute says which levels are stored, the scan's role and the original
+zeros), and the scan group's `vc_tomography` attribute says which levels are stored, the scan's role and the original
 index of frame 0. Value (j, k) of level l is the low band at the stored pixel (j, k) 2^l, as `RawReader(reduce=)`
 gives it, so the `multiscales` attribute declares scales and no translation. Arrays are blosc (bitshuffle, lz4,
 level 1) in chunks of one frame by 128 rows by all columns, one shard per 100 frames, and hold the files' values
@@ -1029,7 +1029,7 @@ complete is left out and reported (exit status 1); running the command again wri
 ### Downloading straight into the store (`--zarr`)
 
 ```bash
-python -m helirec.download_projections --reduce 1 --output projections/scale_0.5 \
+python -m vc_tomography.download_projections --reduce 1 --output projections/scale_0.5 \
     --zarr projections/projections.zarr --remote esrf:/data/.../RAW_DATA --workers 40 --threads 4
 ```
 
@@ -1049,7 +1049,7 @@ it takes a file; the frame index counts the group's frames and `reduce` selects 
 declares and does not hold is refused, with a message that says so). The HDF5 files are read as before.
 
 ```python
-from helirec import _core
+from vc_tomography import _core
 scan = _core.open_scan(master)                                   # the BLISS master, as always
 frames = scan.projections.subset([120000, 120001])               # frames of the detector's files
 there = _core.frames_in_projection_store(frames, "projections.zarr/T1-03")     # the same frames, in the store
@@ -1057,7 +1057,7 @@ reader = _core.RawReader(list(there.files), there.dataset, *scan.frame_shape, re
 quarter = reader.read_frames(there.file_index, there.frame_index)              # (2, 592, 1104) uint16
 ```
 
-`frames_in_projection_store` uses the table of source files the store keeps (`helirec.files` of a scan group) and
+`frames_in_projection_store` uses the table of source files the store keeps (`vc_tomography.files` of a scan group) and
 throws for a frame the store does not hold. `mosaic.tile_reconstructor(..., reduce=2, projections="projections.zarr/T1-03")`
 (`TileOptions::projections`) reads the helix frames of a tile that way; its darks and flats still come from the
 detector's files. The store's values are those of `RawReader(reduce=, decoder="openjph")` on the JPEG 2000 files,
@@ -1076,7 +1076,7 @@ memory bounded by their batches (`--batch-frames`, default 8; calibration reads 
 tile receives `index.h5`, a relative-path virtual dataset per acquisition entry (`5.1/data` for projections,
 `2.1/data`, `3.1/data`, `7.1/data` for calibration), with matching metadata arrays. Original acquisition masters
 are copied into `metadata/` for reference; their original virtual datasets are not reduced-data entrypoints.
-The selection planner and uncompressed writer are also public C++ APIs in `helirec/projection_subset.hpp`,
+The selection planner and uncompressed writer are also public C++ APIs in `vc_tomography/projection_subset.hpp`,
 exposed through the Python bindings. Projection I/O skips unused HTJ2K packets; filesystem read-ahead can
 still transfer additional bytes from the mount.
 
@@ -1097,8 +1097,8 @@ takes each row of B at its own angle (rows exposed one after another: between tw
 tiles' distance times the angle per row).
 
 **A mosaic's tiles are calibrated each by its own views; their places against each other are not yet a step.**
-`helirec-calibration geometry TILE.h5 .. --order 0 --row-time-us 0` gives every tile's own parameters (below),
-and `helirec.mosaic.tile_reconstructor(master, cal, name)` reconstructs one tile alone from that file (`cal`: the
+`vc_tomography_calibration geometry TILE.h5 .. --order 0 --row-time-us 0` gives every tile's own parameters (below),
+and `vc_tomography.mosaic.tile_reconstructor(master, cal, name)` reconstructs one tile alone from that file (`cal`: the
 calibration, `"model": "joint"`; `name`: the scan as its layout names it): the tile under its own parameters, its
 place, height and rotation against the anchor left out (`geometry::Calibration::own_poses`), the slice `h`
 holding the model's height `z = h + row_origin` of the sample as the tile holds it (give all tiles one
@@ -1132,7 +1132,7 @@ scan, told apart by `image_key`); `discover_scans` finds a folder of them. The r
 (its header states the layout read and every derivation); it gives the same `Record` and `Scan` a BLISS master gives,
 so the calibration session and everything built on a `Scan` take such a scan unchanged.
 
-* The file holds no pixel size, energy or distances: they come from `helirec_acquisition.json` beside the masters,
+* The file holds no pixel size, energy or distances: they come from `vc_tomography_acquisition.json` beside the masters,
   `{"pixel_size_um": 7.91, "energy_kev": 53, "propagation_distance_m": null, "source_sample_distance_m": null,
   "fan_sense": -1, "height_stage": "ss1_y1"}`. Only the pixel size is required. `fan_sense` (1 or -1, default 1)
   is the sense of the beam's divergence against the recorded angle (below, "Circular scans").
@@ -1140,13 +1140,13 @@ so the calibration session and everything built on a `Scan` take such a scan unc
   flats), not from the motors' snapshot before the scan, which can be taken while the stage still moves.
 * The angle is the Zebra's capture at the trigger plus half the arc swept during the exposure; the scan's one ring
   current stands for each of its frames; a record a frame shorter than its frame file gives the frames it describes.
-* `helirec-calibration check-record` does not take such a record: its checks are of what BLISS latches.
+* `vc_tomography_calibration check-record` does not take such a record: its checks are of what BLISS latches.
 * A grid of circular scans (places across the beam at several heights) is one family (`group_companions`,
   `pair_companions`): scans that each stay at one height are grouped by geometry at other heights too, and come row
   by row, the rows in the order of acquisition, each row from the scan with its axis nearest the detector's centre
   outwards. The scans of a family may differ by one projection (a record a frame short).
 
-## Intensity calibration step (`helirec-calibration intensity`)
+## Intensity calibration step (`vc_tomography_calibration intensity`)
 
 **Rows of scans above each other (a grid of circular scans) in the reconstruction.** The calibration's poses and
 merged frame place scans without a helix (each by the medians over its own frames; a second row lies a row's step
@@ -1168,7 +1168,7 @@ each other in the list of scans. The step subtracts one level per angle and slic
 trusted; `--set luminosity_repartition=0` leaves it out.
 
 ```bash
-helirec-reconstruct PROJ --heights 1200 1201 --format tiff --set geometry=geometry.json --set luminosity_repartition=0   # PROJ: the folder of <n>.nxs masters and their frame files
+vc_tomography_reconstruct PROJ --heights 1200 1201 --format tiff --set geometry=geometry.json --set luminosity_repartition=0   # PROJ: the folder of <n>.nxs masters and their frame files
 ```
 
 Layouts the library's `calibrate_intensity` takes (`calibration.calibrate_scans` in Python): the main scan with the
@@ -1190,38 +1190,38 @@ directory, which the reconstruction takes as its cache directory (`--cache_dir`)
 is of the same acquisition (the blur field does not depend on the merged frame and is kept when only that changes).
 
 ```bash
-helirec-calibration intensity <main> <companion> --geometry geometry.json --out CACHE_DIR   # scan directories or masters
+vc_tomography_calibration intensity <main> <companion> --geometry geometry.json --out CACHE_DIR   # scan directories or masters
 ```
 
 ```python
-from helirec import calibration
+from vc_tomography import calibration
 cal, arrays = calibration.calibrate(main, companion, layout, cache_dir="CACHE_DIR")   # layout: geometry.merged_layout(...)
 ```
 
-It is `helirec::calibration::calibrate_intensity` (`helirec/calibration/intensity.hpp`); the scans are
-`helirec::calibration::Scan` (`helirec/calibration/scan.hpp`, Python `helirec.bliss`), read from the BLISS master
+It is `vc_tomography::calibration::calibrate_intensity` (`vc_tomography/calibration/intensity.hpp`); the scans are
+`vc_tomography::calibration::Scan` (`vc_tomography/calibration/scan.hpp`, Python `vc_tomography.bliss`), read from the BLISS master
 as nxtomomill and nx2etf read it. Both were checked bit for bit against the Python they replaced on PHerc0343P and
 Paris4 (13 November 2026).
 
-## Geometry calibration step (`helirec-calibration geometry`)
+## Geometry calibration step (`vc_tomography_calibration geometry`)
 
 Measures the geometry of the scans of one sample from their own frames, with nothing typed in: the detector's map
 and where every scan holds the sample, which a reconstruction needs before it can assign a raw value to the line it
 measured. One model for a scan alone, a pair moved sideways and the tiles of a mosaic, solved as one Ceres problem
-(`helirec/calibration/geometry_calibration.hpp` states it). It is a step that writes what it found (JSON), and it
-is the reconstruction's only geometry calibration: `helirec-reconstruct` makes it on first use and keeps it in its
+(`vc_tomography/calibration/geometry_calibration.hpp` states it). It is a step that writes what it found (JSON), and it
+is the reconstruction's only geometry calibration: `vc_tomography_reconstruct` makes it on first use and keeps it in its
 calibration cache, or takes the file it is given (`--set geometry=...`, below). The darks, flats, weights and the
-detector's blur field are the intensity calibration's (`helirec-calibration intensity`, above).
+detector's blur field are the intensity calibration's (`vc_tomography_calibration intensity`, above).
 
 ```bash
-helirec-calibration geometry <main.h5> <companion.h5> --out geometry.json            # main: a scan with the axis inside its field
-helirec-calibration geometry <main.h5> <companion.h5> --out geometry.json --row-time-us -19.87   # if no stretch holds a refill (0: not known)
-helirec-calibration geometry <tile.h5> [<tile.h5> ..] --out geometry.json --order 0 --row-time-us 0   # a mosaic's tiles: their own parameters
-helirec-calibration geometry <tile.h5> [..] --out geometry.json --order 0 --row-time-us 0 --reduce 2 --projections projections.zarr   # the same on the store's quarter
-helirec-calibration geometry <HA.h5> <TA.h5> <TA2.h5> <TA3.h5> --out geometry.json --row-time-us -6.46 --reduce 2 --projections projections.zarr   # four scans side by side
-helirec-calibration geometry <r1c1.nxs> <r1c2.nxs> <r1c3.nxs> <r2c1.nxs> .. --out geometry.json --row-time-us 0 --order 0   # a grid of circular scans (NXtomo)
-helirec-calibration geometry <r1c1.nxs> .. <r2c3.nxs> --out geometry.json --rows-from-middle --order 0   # the same, the camera's two halves read at once: the row time measured
-helirec-calibration geometry <r1c1.nxs> .. <r2c3.nxs> --out geometry.json --rows-from-middle --radial-map   # and the detector's map, its radial terms as one unknown
+vc_tomography_calibration geometry <main.h5> <companion.h5> --out geometry.json            # main: a scan with the axis inside its field
+vc_tomography_calibration geometry <main.h5> <companion.h5> --out geometry.json --row-time-us -19.87   # if no stretch holds a refill (0: not known)
+vc_tomography_calibration geometry <tile.h5> [<tile.h5> ..] --out geometry.json --order 0 --row-time-us 0   # a mosaic's tiles: their own parameters
+vc_tomography_calibration geometry <tile.h5> [..] --out geometry.json --order 0 --row-time-us 0 --reduce 2 --projections projections.zarr   # the same on the store's quarter
+vc_tomography_calibration geometry <HA.h5> <TA.h5> <TA2.h5> <TA3.h5> --out geometry.json --row-time-us -6.46 --reduce 2 --projections projections.zarr   # four scans side by side
+vc_tomography_calibration geometry <r1c1.nxs> <r1c2.nxs> <r1c3.nxs> <r2c1.nxs> .. --out geometry.json --row-time-us 0 --order 0   # a grid of circular scans (NXtomo)
+vc_tomography_calibration geometry <r1c1.nxs> .. <r2c3.nxs> --out geometry.json --rows-from-middle --order 0   # the same, the camera's two halves read at once: the row time measured
+vc_tomography_calibration geometry <r1c1.nxs> .. <r2c3.nxs> --out geometry.json --rows-from-middle --radial-map   # and the detector's map, its radial terms as one unknown
 ```
 
 **Circular scans (no helix), in a grid of places across the beam and heights.** A scan that is one turn at rest is
@@ -1274,7 +1274,7 @@ that the seams cannot check: they fit as well without the `x^3` term. PHerc. 172
 detector's edge (`k` = 3.4e-9 per px^2); the two seams' terms taken one by one give 7.2 and 6.9.
 
 ```python
-from helirec import geometry
+from vc_tomography import geometry
 cal = geometry.calibrate_geometry([main_h5, companion_h5])
 geometry.save(cal, "geometry.json")
 ```
@@ -1490,7 +1490,7 @@ left along the axis is not explained).
 
 
 ```python
-from helirec import _core, geometry
+from vc_tomography import _core, geometry
 session = _core.CalibrationSession([main_h5, companion_h5], 8)           # the step's stages
 acq = _core.geometry_read_acquisition(session, "auto", print)            # GeometryAcquisition
 acq.row_time = seconds_per_row / frame_period                            # frames per stored row; 0 if unknown
@@ -1505,7 +1505,7 @@ between PHerc0343P's two scans 0.07 to 0.12 rows once per turn before the step s
 second scan's is 53 urad; the pair's rows left go from 0.099 to 0.088 px rms with it).
 
 **A mosaic's tiles with each other, measured on Paris4** (all 19 tiles at a quarter from the projection store, the
-42 pairs of neighbours; run scripts on the functions above, since `helirec-calibration geometry` itself does a
+42 pairs of neighbours; run scripts on the functions above, since `vc_tomography_calibration geometry` itself does a
 mosaic's tiles one by one: `development_notes/calibration/11_joint_geometry_runs/tile_pairs.py`, 96 420 patches in
 145 s, a solve in 10 s):
 
@@ -1524,14 +1524,14 @@ the detector's at its middle. With the map and that roll in each tile's reconstr
 their lens to 0.50 px where they did to 1.00 (the median over the 42 edges of what an edge is off by when it is
 predicted from the others). The pitch is measured and not applied by default: a calibration whose parameters
 hold a `pitch` gives every frame's row `pitch d . (-sin th, cos th)` (the row of the rays through the sample's
-origin; `joint_scan_poses`), which `helirec-calibration geometry` does not write for a mosaic.
+origin; `joint_scan_poses`), which `vc_tomography_calibration geometry` does not write for a mosaic.
 
-**In the reconstruction:** `helirec-reconstruct ...` with nothing said (the cache's `geometry.json`, made if it is not
+**In the reconstruction:** `vc_tomography_reconstruct ...` with nothing said (the cache's `geometry.json`, made if it is not
 there), or `--set geometry=OUT/geometry.json` (`params["geometry"]`). Every
 projection is read on the grid of the calibration's detector map (the rows at the mapped row by the row
 kernel, the columns resampled exactly: `resample_rows`, a non-uniform transform of the interpolant the exact shift
 uses, within 1e-6 of the direct sum), at the pose `geometry.frame_poses` gives its frame, and at the angle of its
-rows. `helirec/geometry.hpp` reads a pair's calibration (and still a file of the earlier two-scan step, which
+rows. `vc_tomography/geometry.hpp` reads a pair's calibration (and still a file of the earlier two-scan step, which
 nothing writes any more); the poses are the model's, frame by frame, and the slices are numbered from the first
 scan's row at its helix' first frame. The frame the two scans are merged in is laid out from the same poses (`geometry.merged_layout`: the medians
 over the helix of the axis' column and of the second scan's place, on a quarter-pixel grid; PHerc0343P: axis
@@ -1585,7 +1585,7 @@ their scan folders and the family whose last column has another name.
 
 `pytest` runs the unit tests: CPU vs CUDA vs NumPy references for every kernel, projector adjointness, the
 whole-slice methods, and regression checks of the corrected conventions (`tests/test_regressions.py`).
-`tests/test_calibration.py` covers `helirec::calibration` on synthetic blocks and a synthetic acquisition record.
+`tests/test_calibration.py` covers `vc_tomography::calibration` on synthetic blocks and a synthetic acquisition record.
 `tests/test_geometry.py` covers the geometry step's fit (a known map, roll, rotation and lines recovered from
 comparisons made up from them) and its plan of comparisons; the step itself needs an acquisition (experiment 31).
 `tests/test_detector_map.py` covers a scan's detector map in the gridding (`ScanTrajectory::map_*`, `col_scale`,
@@ -1607,19 +1607,19 @@ and links `Ceres::ceres`. There is no bundled download or fallback solver. On Ub
 
 Requirements: CMake ≥ 3.24, a C++20 compiler, **Ceres ≥ 2.2 with EigenSparse**, FFTW3 (float + double), HDF5 (C), zlib, libcurl, Python ≥ 3.10, and
 optionally the CUDA toolkit and OpenJPEG ≥ 2.5 (`apt install libopenjp2-7-dev`, `brew install openjpeg`; found
-through pkg-config, `-DHELIREC_OPENJPEG=OFF` to build without). OpenJPEG is needed only for frames stored as
-uint16 JPEG 2000 (see `helirec-calibration`); without it such scans are refused with a message that names the package.
+through pkg-config, `-DVC_TOMOGRAPHY_OPENJPEG=OFF` to build without). OpenJPEG is needed only for frames stored as
+uint16 JPEG 2000 (see `vc_tomography_calibration`); without it such scans are refused with a message that names the package.
 For float32 HTJ2K, CMake FetchContent downloads OpenJPH 0.32.0 with a SHA-256 check and links it statically.
-Its BSD-2-Clause license is included with installed artifacts. Use `-DHELIREC_OPENJPH=OFF` to omit it, or
+Its BSD-2-Clause license is included with installed artifacts. Use `-DVC_TOMOGRAPHY_OPENJPH=OFF` to omit it, or
 `-DFETCHCONTENT_SOURCE_DIR_OPENJPH=<src>` for an offline build with existing sources. The vc-delta3d codec is fetched at configure time (offline:
 `-DFETCHCONTENT_SOURCE_DIR_VC_DELTA3D=<src>`). CUDA code is compiled for the build machine's GPU (`native`); override with
-`-DCMAKE_CUDA_ARCHITECTURES=...`. `HELIREC_CUDA=AUTO` (default) builds CUDA only if `nvcc` is found, so put it on
-`PATH` (or pass `-C cmake.define.HELIREC_CUDA=ON`); check with `helirec.devices()`.
+`-DCMAKE_CUDA_ARCHITECTURES=...`. `VC_TOMOGRAPHY_CUDA=AUTO` (default) builds CUDA only if `nvcc` is found, so put it on
+`PATH` (or pass `-C cmake.define.VC_TOMOGRAPHY_CUDA=ON`); check with `vc_tomography.devices()`.
 
-Run from `foundation/helirec` in a Villa checkout containing `vc_reader` at `../../vc_reader`: the build links
+Run from `foundation/vc_tomography` in a Villa checkout containing `vc_reader` at `../../vc_reader`: the build links
 vc_reader's native library (an installed `vc_reader` CMake package, else that checkout, built statically with its
-Python modules, C API and CUDA off; `-DVC_READER_SOURCE=` points elsewhere) into `helirec_surfaces`, the composite
-tool and `helirec-reconstruct` (image files); the core library `helirec` does not use it. vc-delta3d comes with it.
+Python modules, C API and CUDA off; `-DVC_READER_SOURCE=` points elsewhere) into `vc_tomography_surfaces`, the composite
+tool and `vc_tomography_reconstruct` (image files); the core library `vc_tomography` does not use it. vc-delta3d comes with it.
 `pyproject.toml` takes the vc_reader Python package from the same checkout; `uv sync` includes it.
 To also install the test dependencies:
 
@@ -1635,11 +1635,11 @@ These raise explicit errors:
 * both scans moving in the same z direction;
 * an acquisition the geometry calibration step can read: a helix whose travel per turn is less than the
   detector's height, a turn at rest before and after it, two scans of equally long stretches;
-* a mosaic (tiles that differ in the sample's place on the rotation stage) is checked by `helirec-calibration`,
-  and `helirec-calibration geometry` gives each tile's own parameters; the tiles with each other are planned,
+* a mosaic (tiles that differ in the sample's place on the rotation stage) is checked by `vc_tomography_calibration`,
+  and `vc_tomography_calibration geometry` gives each tile's own parameters; the tiles with each other are planned,
   measured and solved by the package's functions (`plan_tiles`, `measure`, `solve_geometry`) from run scripts, not
-  by the step; the tiles' volumes are compared (lens patches) by a notes script; `helirec-reconstruct` does not
-  take a mosaic, and a tile can only be reconstructed alone (`helirec.mosaic.tile_reconstructor`);
+  by the step; the tiles' volumes are compared (lens patches) by a notes script; `vc_tomography_reconstruct` does not
+  take a mosaic, and a tile can only be reconstructed alone (`vc_tomography.mosaic.tile_reconstructor`);
 * parameter sweeps (`reconstruct_band(..., sweep=...)`) run on CUDA only;
 * xz slices are not implemented.
 
