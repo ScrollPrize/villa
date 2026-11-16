@@ -270,9 +270,9 @@ void balance_with_table(float* W, int n_proj, int n_rows, int n_cols, const std:
                         const std::vector<OddMap>& omap);
 }  // namespace
 
-int rebalance(float* R, float* W, int n_proj, int n_rows, int n_cols, float rot_center, bool legacy) {
+// empty-angle runs (mid-row emptiness test, cyclic merge); {-1, -1} alone: every angle is empty
+std::vector<std::pair<int, int>> rebalance_holes(const float* W, int n_proj, int n_rows, int n_cols) {
     const std::size_t plane = static_cast<std::size_t>(n_rows) * n_cols;
-    // ---- hole filling (mid-row emptiness test, cyclic merge)
     const int mid = n_rows / 2;
     std::vector<char> nonempty(n_proj, 0);
     for (int i = 0; i < n_proj; ++i) {
@@ -282,22 +282,33 @@ int rebalance(float* R, float* W, int n_proj, int n_rows, int n_cols, float rot_
     }
     bool any = false;
     for (char v : nonempty) any |= v;
-    if (!any) return 0;
-    const auto holes = rebalance_core::holes_from(nonempty);
-    std::vector<float> rf(plane), wf(plane);
+    if (!any) return {{-1, -1}};
+    return rebalance_core::holes_from(nonempty);
+}
+
+// each hole's angles: the mean of the angles on either side of it
+void fill_holes(float* X, const std::vector<std::pair<int, int>>& holes, int n_proj, int n_rows, int n_cols) {
+    if (holes.empty() || holes.front().first < 0) return;
+    const std::size_t plane = static_cast<std::size_t>(n_rows) * n_cols;
+    std::vector<float> f(plane);
     for (auto [s, e] : holes) {
         const int left = (s + n_proj - 1) % n_proj, right = e % n_proj;
-        for (std::size_t k = 0; k < plane; ++k) {
-            rf[k] = 0.5f * (R[left * plane + k] + R[right * plane + k]);
-            wf[k] = 0.5f * (W[left * plane + k] + W[right * plane + k]);
-        }
-        for (int idx = s; idx < e; ++idx) {
-            std::memcpy(R + (idx % n_proj) * plane, rf.data(), plane * sizeof(float));
-            std::memcpy(W + (idx % n_proj) * plane, wf.data(), plane * sizeof(float));
-        }
+        for (std::size_t k = 0; k < plane; ++k) f[k] = 0.5f * (X[left * plane + k] + X[right * plane + k]);
+        for (int idx = s; idx < e; ++idx) std::memcpy(X + (idx % n_proj) * plane, f.data(), plane * sizeof(float));
     }
+}
+
+void balance_weights(float* W, int n_proj, int n_rows, int n_cols, float rot_center, bool legacy) {
     balance_with_table(W, n_proj, n_rows, n_cols, rebalance_core::contribution_table(n_proj, legacy),
                        rebalance_core::odd_shift_map(n_cols, rot_center));
+}
+
+int rebalance(float* R, float* W, int n_proj, int n_rows, int n_cols, float rot_center, bool legacy) {
+    const auto holes = rebalance_holes(W, n_proj, n_rows, n_cols);
+    if (!holes.empty() && holes.front().first < 0) return 0;   // (every angle empty: nothing to do)
+    fill_holes(R, holes, n_proj, n_rows, n_cols);
+    fill_holes(W, holes, n_proj, n_rows, n_cols);
+    balance_weights(W, n_proj, n_rows, n_cols, rot_center, legacy);
     return static_cast<int>(holes.size());
 }
 

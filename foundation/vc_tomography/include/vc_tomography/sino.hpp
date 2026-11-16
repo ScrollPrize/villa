@@ -60,6 +60,10 @@ std::vector<float> blur_response(const std::vector<double>& blur, double f, int 
 // Returns the number of filled hole runs.
 namespace cpu {
 int rebalance(float* R, float* W, int n_proj, int n_rows, int n_cols, float rot_center, bool legacy = false);
+// the three steps of rebalance, as cuda:: has them
+std::vector<std::pair<int, int>> rebalance_holes(const float* W, int n_proj, int n_rows, int n_cols);
+void fill_holes(float* X, const std::vector<std::pair<int, int>>& holes, int n_proj, int n_rows, int n_cols);
+void balance_weights(float* W, int n_proj, int n_rows, int n_cols, float rot_center, bool legacy = false);
 }
 #ifdef VC_TOMOGRAPHY_WITH_CUDA
 namespace cuda {

@@ -329,6 +329,31 @@ struct SliceReconstructor::Impl {
     // (their horizontal padding; <= margin_rows, which may add the luminosity window's rows)
     void run(int h_lo, int h_hi, ChunkDebug* dbg, const std::vector<const FilterPipeline*>& sets, int margin_rows,
              int filter_rows, const std::function<void(int, int, float*, float*)>& sink, int next_lo = 0, int next_hi = 0);
+    // The steps of run() written once for both backends (Ops: CpuOps or CudaOps below; pointers of its memory).
+    struct GridBuffers {   // a block of grid angles (L, H, NX): sums, weights, and the luminosity step's scratch
+        float *R, *RW, *R2, *RW2, *Rr, *RWr, *R2r, *RW2r, *Wp, *Wp2, *Aha, *Bha, *Atot, *Btot, *Aha2, *Bha2, *Atot2, *Btot2;
+    };
+    // grid angles [g0, g0 + L) of every scan into b.R / b.RW (and the second weighting's), the luminosity step, the
+    // division, mending and the band combination. accumulate(s, R, RW, R2, RW2): scan s's projections added;
+    // done(s): after scan s (skipped or added); ready(): after the sums are cleared, before any scan
+    template <class Ops, class Accumulate, class Done, class Ready, class Tick>
+    void grid_block(int L, int H, const std::vector<ScanChunk>& chunks, const GridBuffers& b, bool sharp, bool by_row,
+                    const AccumParams& ap, bool filter_context, Accumulate&& accumulate, Done&& done, Ready&& ready, Tick&& tick);
+    // the block's intensity filters, -log, the log filters
+    template <class Ops, class Tick>
+    void filter_block(const FilterPipeline& P, float* R, int L, int H, int fm, const AccumParams& ap, Tick&& tick);
+    // the chunk's sinogram (NR, DY, NX) and weights balanced: holes filled, opposite views weighted
+    template <class Ops>
+    void balance(float* S, float* W, float* W2, int NR, int DY, int NX, bool sharp, bool measured_only);
+    struct SliceBuffers {   // (NR, NX) rows of one slice, the padded rows, scratch
+        float *row, *wrow, *w2row, *brow, *pad, *arc, *start, *start_w;
+        const int32_t* opposite;   // slice_opposite in the backend's memory (views)
+    };
+    // the slices of the chunk for chain k: ramp filter x balanced weights per slice -> sink(k, y, row, wrow)
+    template <class Ops, class Tick>
+    void slices(int k, const float* S, const float* W, const float* W2, int NR, int DY, int NX, bool sharp, const RampGeometry& rg,
+                const SliceBuffers& b, ChunkDebug* keep_filtered, bool measured_only,
+                const std::function<void(int, int, float*, float*)>& sink, Tick&& tick);
     bool raw_rows = false;  // sinks get the unfiltered rows (external backprojectors that filter themselves)
     // An external backprojector that starts from the slice's FBP (ExternalBackprojector::fbp_start; 0: none). run()
     // then makes, beside the rows the sink gets, the rows the exact backprojector takes of that slice, from a copy
@@ -1135,6 +1160,223 @@ bool SliceReconstructor::Impl::take_prefetch(int lo, int hi, int m) {
 }
 #endif
 
+namespace {
+
+#define VC_TOMOGRAPHY_FORWARD(ns, name) \
+    template <class... A>              \
+    static decltype(auto) name(A&&... a) { return ns::name(std::forward<A>(a)...); }
+#define VC_TOMOGRAPHY_BACKEND_OPS(ns)                                                                              \
+    VC_TOMOGRAPHY_FORWARD(ns, add_into) VC_TOMOGRAPHY_FORWARD(ns, luminosity_sums)                                 \
+    VC_TOMOGRAPHY_FORWARD(ns, luminosity_apply) VC_TOMOGRAPHY_FORWARD(ns, divide)                                  \
+    VC_TOMOGRAPHY_FORWARD(ns, prepare_measured) VC_TOMOGRAPHY_FORWARD(ns, mend_null_weights)                       \
+    VC_TOMOGRAPHY_FORWARD(ns, add_scaled) VC_TOMOGRAPHY_FORWARD(ns, minus_log) VC_TOMOGRAPHY_FORWARD(ns, multiply) \
+    VC_TOMOGRAPHY_FORWARD(ns, multiply_add) VC_TOMOGRAPHY_FORWARD(ns, weight_difference)                           \
+    VC_TOMOGRAPHY_FORWARD(ns, angular_fir) VC_TOMOGRAPHY_FORWARD(ns, ramp_crop) VC_TOMOGRAPHY_FORWARD(ns, rebalance) \
+    VC_TOMOGRAPHY_FORWARD(ns, rebalance_turns) VC_TOMOGRAPHY_FORWARD(ns, turn_holes)                               \
+    VC_TOMOGRAPHY_FORWARD(ns, fill_turn_holes) VC_TOMOGRAPHY_FORWARD(ns, balance_weights_turns)                    \
+    VC_TOMOGRAPHY_FORWARD(ns, rebalance_holes) VC_TOMOGRAPHY_FORWARD(ns, fill_holes)                               \
+    VC_TOMOGRAPHY_FORWARD(ns, balance_weights)
+
+// run()'s array operations on host memory
+struct CpuOps {
+    VC_TOMOGRAPHY_BACKEND_OPS(cpu)
+    static void zero(float* p, std::size_t n) { std::fill(p, p + n, 0.f); }
+    static void copy(float* dst, const float* src, std::size_t n) { std::memcpy(dst, src, n * sizeof(float)); }
+    static void to_host(float* dst, const float* src, std::size_t n) { copy(dst, src, n); }
+    static void ramp_pad(const float* row, float* pad, const RampGeometry& g, const int32_t* opposite) { cpu::ramp_pad(row, pad, g, opposite); }
+    // rows [m, m + DY) of each of the block's L angles (L, H, NX) -> angles [g0, g0 + L) of the sinogram (NR, DY, NX)
+    static void crop(float* sino, const float* block, int g0, int L, int H, int DY, int m, int NX) {
+        for (int j = 0; j < L; ++j)
+            copy(sino + static_cast<std::size_t>(g0 + j) * DY * NX, block + (static_cast<std::size_t>(j) * H + m) * NX, static_cast<std::size_t>(DY) * NX);
+    }
+    // slice y of the sinogram (NR, DY, NX) -> rows (NR, NX)
+    static void gather(float* rows, const float* sino, int y, int NR, int DY, int NX) {
+        for (int i = 0; i < NR; ++i) copy(rows + static_cast<std::size_t>(i) * NX, sino + (static_cast<std::size_t>(i) * DY + y) * NX, NX);
+    }
+};
+
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
+// the same on the device (the default stream)
+struct CudaOps {
+    VC_TOMOGRAPHY_BACKEND_OPS(cuda)
+    static void zero(float* p, std::size_t n) { VC_TOMOGRAPHY_CUDA_CHECK(cudaMemsetAsync(p, 0, n * sizeof(float))); }
+    static void copy(float* dst, const float* src, std::size_t n) {
+        VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpyAsync(dst, src, n * sizeof(float), cudaMemcpyDeviceToDevice));
+    }
+    static void to_host(float* dst, const float* src, std::size_t n) { VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpy(dst, src, n * sizeof(float), cudaMemcpyDeviceToHost)); }
+    static void ramp_pad(const float* row, float* pad, const RampGeometry& g, const int32_t* opposite) { cuda::ramp_pad(row, pad, g, nullptr, opposite); }
+    static void crop(float* sino, const float* block, int g0, int L, int H, int DY, int m, int NX) {
+        VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpy2DAsync(sino + static_cast<std::size_t>(g0) * DY * NX, static_cast<std::size_t>(DY) * NX * sizeof(float),
+                                                   block + static_cast<std::size_t>(m) * NX, static_cast<std::size_t>(H) * NX * sizeof(float),
+                                                   static_cast<std::size_t>(DY) * NX * sizeof(float), L, cudaMemcpyDeviceToDevice));
+    }
+    static void gather(float* rows, const float* sino, int y, int NR, int DY, int NX) {
+        VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpy2DAsync(rows, NX * sizeof(float), sino + static_cast<std::size_t>(y) * NX,
+                                                   static_cast<std::size_t>(DY) * NX * sizeof(float), NX * sizeof(float), NR, cudaMemcpyDeviceToDevice));
+    }
+};
+#endif
+#undef VC_TOMOGRAPHY_BACKEND_OPS
+#undef VC_TOMOGRAPHY_FORWARD
+
+}  // namespace
+
+template <class Ops, class Accumulate, class Done, class Ready, class Tick>
+void SliceReconstructor::Impl::grid_block(int L, int H, const std::vector<ScanChunk>& chunks, const GridBuffers& b, bool sharp, bool by_row,
+                                          const AccumParams& ap, bool filter_context, Accumulate&& accumulate, Done&& done, Ready&& ready,
+                                          Tick&& tick) {
+    const std::size_t n_el = static_cast<std::size_t>(L) * H * NX;
+    if (sharp) {
+        Ops::zero(b.R2, n_el);
+        Ops::zero(b.RW2, n_el);
+    }
+    Ops::zero(b.R, n_el);
+    Ops::zero(b.RW, n_el);
+    ready();
+    // Rows of scans with the luminosity step: a row's scans are summed apart (their luminosity is compared among
+    // themselves: another row holds other rows of the detector around a height), then added to the rows before.
+    float* const aR = by_row ? b.Rr : b.R;
+    float* const aRW = by_row ? b.RWr : b.RW;
+    float* const aR2 = by_row ? b.R2r : b.R2;
+    float* const aRW2 = by_row ? b.RW2r : b.RW2;
+    // Each scan that has an earlier scan at its height is taken to the luminosity of the scans before it at its seam
+    // with them: the sums there before and after it is added.
+    const bool luminosity = cfg.luminosity_repartition != 0.f && chunks.size() >= 2;
+    bool before = false;   // a scan of this chunk (of this row of scans) has been added
+    int row_now = -1;
+    const auto add_row = [&] {
+        Ops::add_into(b.R, b.Rr, n_el);
+        Ops::add_into(b.RW, b.RWr, n_el);
+        if (sharp) Ops::add_into(b.R2, b.R2r, n_el), Ops::add_into(b.RW2, b.RW2r, n_el);
+    };
+    for (std::size_t s = 0; s < chunks.size(); ++s) {
+        if (chunks[s].cs.p1 == chunks[s].cs.p0) {  // (a scan at another height: the chunk holds none of it)
+            done(s);
+            continue;
+        }
+        if (by_row && scan_row[s] != row_now) {   // another row of scans begins
+            if (row_now >= 0) add_row();
+            Ops::zero(b.Rr, n_el);
+            Ops::zero(b.RWr, n_el);
+            if (sharp) Ops::zero(b.R2r, n_el), Ops::zero(b.RW2r, n_el);
+            row_now = scan_row[s], before = false;
+        }
+        const bool joins = luminosity && before && seam[s] >= 0;
+        if (joins) {
+            Ops::luminosity_sums(aR, aRW, L, H, NX, seam[s], this->lum, b.Aha, b.Bha);
+            Ops::copy(b.Wp, aRW, n_el);
+            if (sharp) {
+                Ops::luminosity_sums(aR2, aRW2, L, H, NX, seam[s], this->lum, b.Aha2, b.Bha2);
+                Ops::copy(b.Wp2, aRW2, n_el);
+            }
+            tick("luminosity");
+        }
+        accumulate(s, aR, aRW, sharp ? aR2 : nullptr, sharp ? aRW2 : nullptr);
+        done(s);
+        tick("accumulate");
+        if (joins) {
+            Ops::luminosity_sums(aR, aRW, L, H, NX, seam[s], this->lum, b.Atot, b.Btot);
+            Ops::luminosity_apply(aR, aRW, b.Wp, b.Aha, b.Bha, b.Atot, b.Btot, L, H, NX, cfg.luminosity_repartition);
+        }
+        if (sharp && joins) {
+            Ops::luminosity_sums(aR2, aRW2, L, H, NX, seam[s], this->lum, b.Atot2, b.Btot2);
+            Ops::luminosity_apply(aR2, aRW2, b.Wp2, b.Aha2, b.Bha2, b.Atot2, b.Btot2, L, H, NX, cfg.luminosity_repartition);
+        }
+        tick("luminosity");
+        before = true;
+    }
+    if (by_row && row_now >= 0) add_row();
+    Ops::divide(b.R, b.RW, n_el);
+    if (ap.measured_only)
+        Ops::prepare_measured(b.R, b.RW, L, H, NX, cfg.mend_threshold, filter_context, ap.log_values ? 0.f : 1.f);
+    else if (cfg.mend_threshold > 0)
+        Ops::mend_null_weights(b.R, b.RW, L, H, NX, cfg.mend_threshold, mend_x0, mend_x1);
+    if (sharp) {   // the two weightings' intensities, combined by band: R + HP (R2 - R)
+        Ops::divide(b.R2, b.RW2, n_el);
+        if (cfg.mend_threshold > 0) Ops::mend_null_weights(b.R2, b.RW2, L, H, NX, cfg.mend_threshold, mend_x0, mend_x1);
+        Ops::add_scaled(b.R2, b.R, -1.f, n_el);
+        band2d->apply(b.R2, b.R2, L);
+        Ops::add_scaled(b.R, b.R2, 1.f, n_el);
+    }
+    tick("divide_mend");
+}
+
+template <class Ops, class Tick>
+void SliceReconstructor::Impl::filter_block(const FilterPipeline& P, float* R, int L, int H, int fm, const AccumParams& ap, Tick&& tick) {
+    apply_filters(P, FilterStage::Intensity, R, L, H, fm);
+    tick("filters");
+    if (!ap.log_values) Ops::minus_log(R, static_cast<std::size_t>(L) * H * NX, cfg.log_clip_min, cfg.log_clip_max);
+    apply_filters(P, FilterStage::Log, R, L, H, fm);
+    tick("log");
+}
+
+template <class Ops>
+void SliceReconstructor::Impl::balance(float* S, float* W, float* W2, int NR, int DY, int NX, bool sharp, bool measured_only) {
+    if (views) Ops::rebalance_turns(S, W, NR, DY, NX, n_grid, cfg.rot_center);
+    else if (!measured_only) Ops::rebalance(S, W, NR, DY, NX, cfg.rot_center, cfg.legacy_reference);
+    if (!sharp) return;
+    // the balanced weights of the second set (the sinogram's holes are filled already)
+    if (views) {
+        const TurnHoles holes = Ops::turn_holes(W2, NR, DY, NX, n_grid);
+        if (!holes.all_empty) {
+            Ops::fill_turn_holes(W2, holes, DY, NX);
+            Ops::balance_weights_turns(W2, NR, DY, NX, n_grid, cfg.rot_center);
+        }
+    } else {
+        const auto holes = Ops::rebalance_holes(W2, NR, DY, NX);
+        if (holes.empty() || holes.front().first >= 0) {   // (every angle empty: nothing to do, as rebalance)
+            Ops::fill_holes(W2, holes, NR, DY, NX);
+            Ops::balance_weights(W2, NR, DY, NX, cfg.rot_center, cfg.legacy_reference);
+        }
+    }
+}
+
+template <class Ops, class Tick>
+void SliceReconstructor::Impl::slices(int k, const float* S, const float* W, const float* W2, int NR, int DY, int NX, bool sharp,
+                                      const RampGeometry& rg, const SliceBuffers& b, ChunkDebug* keep_filtered, bool measured_only,
+                                      const std::function<void(int, int, float*, float*)>& sink, Tick&& tick) {
+    const std::size_t rown = static_cast<std::size_t>(NR) * NX;
+    for (int y = 0; y < DY; ++y) {
+        Ops::gather(b.row, S, y, NR, DY, NX);
+        Ops::gather(b.wrow, W, y, NR, DY, NX);
+        if (sharp) Ops::gather(b.w2row, W2, y, NR, DY, NX);
+        tick("ramp_gather");
+        if (!arc_taps.empty()) {
+            Ops::angular_fir(b.row, b.arc, NR, NX, arc_taps.data(), static_cast<int>(arc_taps.size()) - 1, measured_only ? b.wrow : nullptr);
+            Ops::copy(b.row, b.arc, rown);
+            tick("arc");
+        }
+        if (!raw_rows) {
+            Ops::ramp_pad(b.row, b.pad, rg, views ? b.opposite + static_cast<std::size_t>(y) * NR : nullptr);
+            ramp_filter->apply(b.pad, b.pad, NR);
+            Ops::ramp_crop(b.pad, b.row, rg);
+            if (sharp) {   // usual pair weights, and above the band the second set's: row w + HP (row (w2 - w))
+                Ops::weight_difference(b.row, b.wrow, b.w2row, b.brow, rown);
+                band1d->apply(b.brow, b.brow, NR);
+                Ops::multiply_add(b.row, b.wrow, b.brow, rown);
+            } else {
+                Ops::multiply(b.row, b.wrow, rown);
+            }
+        }
+        if (keep_filtered) Ops::to_host(&keep_filtered->filtered[static_cast<std::size_t>(y) * rown], b.row, rown);
+        if (fbp_start && raw_rows) {   // the method's start: this slice's rows as the exact backprojector takes them
+            Ops::copy(b.start, b.row, rown);
+            Ops::copy(b.start_w, b.wrow, rown);
+            if (cfg.mend_threshold > 0) Ops::mend_null_weights(b.start, b.start_w, NR, 1, NX, cfg.mend_threshold, mend_x0, mend_x1);
+            Ops::rebalance(b.start, b.start_w, NR, 1, NX, cfg.rot_center, false);
+            Ops::ramp_pad(b.start, b.pad, rg, nullptr);
+            ramp_filter->apply(b.pad, b.pad, NR);
+            Ops::ramp_crop(b.pad, b.start, rg);
+            Ops::multiply(b.start, b.start_w, rown);
+            start_rows = b.start;
+        }
+        tick("ramp");
+        sink(k, y, b.row, b.wrow);
+        start_rows = nullptr;
+        tick("backproject");
+    }
+}
+
 void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const std::vector<const FilterPipeline*>& sets,
                                    int margin_rows, int filter_rows,
                                    const std::function<void(int, int, float*, float*)>& sink, int next_lo, int next_hi) {
@@ -1277,62 +1519,22 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
         }
         tick("read_raw");
         step("grid");
-        std::vector<float> S(sino_n), Wc(sino_n);
-        std::vector<float> R(blk), RW(blk), Wp, Aha, Bha, Atot, Btot;
-        std::vector<float> Wc2(sharp ? sino_n : 0), R2(sharp ? blk : 0), RW2(sharp ? blk : 0), Wp2, Aha2, Bha2, Atot2, Btot2;
-        // Rows of scans with the luminosity step: a row's scans are summed apart (their luminosity is compared among
-        // themselves: another row holds other rows of the detector around a height), then added to the rows before.
+        std::vector<float> S(sino_n), Wc(sino_n), Wc2(sharp ? sino_n : 0);
         const bool by_row = I.rows_of_scans && cfg.luminosity_repartition != 0.f;
+        const std::size_t lum_n = static_cast<std::size_t>(BL) * H;
+        std::vector<float> R(blk), RW(blk), Wp(blk), Aha(lum_n), Bha(lum_n), Atot(lum_n), Btot(lum_n);
+        std::vector<float> R2(sharp ? blk : 0), RW2(sharp ? blk : 0), Wp2(sharp ? blk : 0), Aha2(sharp ? lum_n : 0), Bha2(Aha2.size()),
+            Atot2(Aha2.size()), Btot2(Aha2.size());
         std::vector<float> Rr(by_row ? blk : 0), RWr(by_row ? blk : 0), R2r(by_row && sharp ? blk : 0), RW2r(by_row && sharp ? blk : 0);
-        float* const aR = by_row ? Rr.data() : R.data();
-        float* const aRW = by_row ? RWr.data() : RW.data();
-        float* const aR2 = by_row ? R2r.data() : R2.data();
-        float* const aRW2 = by_row ? RW2r.data() : RW2.data();
+        const GridBuffers gb{R.data(), RW.data(), R2.data(), RW2.data(), Rr.data(), RWr.data(), R2r.data(), RW2r.data(), Wp.data(), Wp2.data(),
+                             Aha.data(), Bha.data(), Atot.data(), Btot.data(), Aha2.data(), Bha2.data(), Atot2.data(), Btot2.data()};
         for (int g0 = 0; g0 < NR; g0 += BL) {
             const int g1 = std::min(NR, g0 + BL), L = g1 - g0;
-            const std::size_t n_el = static_cast<std::size_t>(L) * H * NX;
-            if (sharp) {
-                std::fill(R2.begin(), R2.begin() + n_el, 0.f);
-                std::fill(RW2.begin(), RW2.begin() + n_el, 0.f);
-            }
-            std::fill(R.begin(), R.begin() + n_el, 0.f);
-            std::fill(RW.begin(), RW.begin() + n_el, 0.f);
-            // Each scan that has an earlier scan at its height is taken to the luminosity of the scans before it at
-            // its seam with them: the sums there before and after it is added.
-            const bool lum = cfg.luminosity_repartition != 0.f && chunks.size() >= 2;
-            bool before = false;   // a scan of this chunk (of this row of scans) has been added
-            int row_now = -1;
-            const auto add_row = [&] {
-                cpu::add_into(R.data(), Rr.data(), n_el);
-                cpu::add_into(RW.data(), RWr.data(), n_el);
-                if (sharp) cpu::add_into(R2.data(), R2r.data(), n_el), cpu::add_into(RW2.data(), RW2r.data(), n_el);
-            };
-            for (std::size_t s = 0; s < chunks.size(); ++s) {
+            const auto accumulate = [&](std::size_t s, float* aR, float* aRW, float* aR2, float* aRW2) {
                 const auto& sd = I.scans[s];
                 const auto& ch = chunks[s];
                 const auto& c = ch.cs;
-                const int n = c.p1 - c.p0;
-                if (!n) continue;  // (a scan at another height)
-                if (by_row && I.scan_row[s] != row_now) {   // another row of scans begins
-                    if (row_now >= 0) add_row();
-                    std::fill(Rr.begin(), Rr.begin() + n_el, 0.f);
-                    std::fill(RWr.begin(), RWr.begin() + n_el, 0.f);
-                    if (sharp) std::fill(R2r.begin(), R2r.begin() + n_el, 0.f), std::fill(RW2r.begin(), RW2r.begin() + n_el, 0.f);
-                    row_now = I.scan_row[s], before = false;
-                }
-                const bool joins = lum && before && I.seam[s] >= 0;
-                if (joins) {
-                    Aha.resize(static_cast<std::size_t>(L) * H); Bha.resize(Aha.size());
-                    cpu::luminosity_sums(aR, aRW, L, H, NX, I.seam[s], I.lum, Aha.data(), Bha.data());
-                    Wp.assign(aRW, aRW + n_el);
-                    if (sharp) {
-                        Aha2.resize(static_cast<std::size_t>(L) * H); Bha2.resize(Aha2.size());
-                        cpu::luminosity_sums(aR2, aRW2, L, H, NX, I.seam[s], I.lum, Aha2.data(), Bha2.data());
-                        Wp2.assign(aRW2, aRW2 + n_el);
-                    }
-                    tick("luminosity");
-                }
-                const auto contrib = make_contributors(c.j0.data(), n, NR, g0, g1, !I.nearest);
+                const auto contrib = make_contributors(c.j0.data(), c.p1 - c.p0, NR, g0, g1, !I.nearest);
                 auto view = make_view(sd, ch, ch.raw.data(), sd.dark.data(), sd.flats.data(), sd.weight.data(),
                                       c.row0.data(), c.fract_v.data(), c.alpha.data(), c.current_div.data(),
                                       c.weight_factor.data(), c.flat_frac.data(), c.flat_i0.data(), c.flat_i1.data(),
@@ -1345,119 +1547,29 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
                 if (cfg.sld.enabled())
                     set_glare(view, *I.glare[s], cg[s].maps.data(), cg[s].i0.data(), cg[s].i1.data(), cg[s].frac.data(),
                               cg[s].rows, cg[s].row0.empty() ? nullptr : cg[s].row0.data());
-                cpu::accumulate(view, contrib, ap, aR, aRW, sharp ? I.weight2[s].data() : nullptr,
-                                sharp ? aR2 : nullptr, sharp ? aRW2 : nullptr);
-                tick("accumulate");
-                if (joins) {
-                    Atot.resize(Aha.size()); Btot.resize(Aha.size());
-                    cpu::luminosity_sums(aR, aRW, L, H, NX, I.seam[s], I.lum, Atot.data(), Btot.data());
-                    cpu::luminosity_apply(aR, aRW, Wp.data(), Aha.data(), Bha.data(), Atot.data(),
-                                          Btot.data(), L, H, NX, cfg.luminosity_repartition);
-                }
-                if (sharp && joins) {
-                    Atot2.resize(Aha2.size()); Btot2.resize(Aha2.size());
-                    cpu::luminosity_sums(aR2, aRW2, L, H, NX, I.seam[s], I.lum, Atot2.data(), Btot2.data());
-                    cpu::luminosity_apply(aR2, aRW2, Wp2.data(), Aha2.data(), Bha2.data(), Atot2.data(),
-                                          Btot2.data(), L, H, NX, cfg.luminosity_repartition);
-                }
-                tick("luminosity");
-                before = true;
-            }
-            if (by_row && row_now >= 0) add_row();
-            cpu::divide(R.data(), RW.data(), n_el);
-            if (ap.measured_only)
-                cpu::prepare_measured(R.data(), RW.data(), L, H, NX, cfg.mend_threshold, filter_context, ap.log_values ? 0.f : 1.f);
-            else if (cfg.mend_threshold > 0)
-                cpu::mend_null_weights(R.data(), RW.data(), L, H, NX, cfg.mend_threshold, I.mend_x0, I.mend_x1);
-            if (sharp) {   // the two weightings' intensities, combined by band: R + HP (R2 - R)
-                cpu::divide(R2.data(), RW2.data(), n_el);
-                if (cfg.mend_threshold > 0)
-                    cpu::mend_null_weights(R2.data(), RW2.data(), L, H, NX, cfg.mend_threshold, I.mend_x0, I.mend_x1);
-                cpu::add_scaled(R2.data(), R.data(), -1.f, n_el);
-                I.band2d->apply(R2.data(), R2.data(), L);
-                cpu::add_scaled(R.data(), R2.data(), 1.f, n_el);
-            }
-            tick("divide_mend");
-            apply_filters(*sets[0], FilterStage::Intensity, R.data(), L, H, fm);
-            tick("filters");
-            if (!ap.log_values) cpu::minus_log(R.data(), n_el, cfg.log_clip_min, cfg.log_clip_max);
-            apply_filters(*sets[0], FilterStage::Log, R.data(), L, H, fm);
-            tick("log");
-            for (int j = 0; j < L; ++j)
-                for (int y = 0; y < DY; ++y) {
-                    const std::size_t src = (static_cast<std::size_t>(j) * H + m + y) * NX;
-                    const std::size_t dst = (static_cast<std::size_t>(g0 + j) * DY + y) * NX;
-                    std::memcpy(&S[dst], &R[src], NX * sizeof(float));
-                    std::memcpy(&Wc[dst], &RW[src], NX * sizeof(float));
-                    if (sharp) std::memcpy(&Wc2[dst], &RW2[src], NX * sizeof(float));
-                }
+                cpu::accumulate(view, contrib, ap, aR, aRW, aR2 ? I.weight2[s].data() : nullptr, aR2, aRW2);
+            };
+            grid_block<CpuOps>(L, H, chunks, gb, sharp, by_row, ap, filter_context, accumulate, [](std::size_t) {}, [] {}, tick);
+            filter_block<CpuOps>(*sets[0], R.data(), L, H, fm, ap, tick);
+            CpuOps::crop(S.data(), R.data(), g0, L, H, DY, m, NX);
+            CpuOps::crop(Wc.data(), RW.data(), g0, L, H, DY, m, NX);
+            if (sharp) CpuOps::crop(Wc2.data(), RW2.data(), g0, L, H, DY, m, NX);
             tick("sino_crop");
         }
         for (auto& ch : chunks) std::vector<uint16_t>().swap(ch.raw);
         if (dbg && dbg->keep) { dbg->sino = S; dbg->weights = Wc; }
-        if (views) cpu::rebalance_turns(S.data(), Wc.data(), NR, DY, NX, NG, cfg.rot_center);
-        else if (!ap.measured_only) cpu::rebalance(S.data(), Wc.data(), NR, DY, NX, cfg.rot_center, cfg.legacy_reference);
-        if (sharp && views) {   // the balanced weights of the second set (the sinogram's holes are filled already)
-            const TurnHoles holes = cpu::turn_holes(Wc2.data(), NR, DY, NX, NG);
-            if (!holes.all_empty) {
-                cpu::fill_turn_holes(Wc2.data(), holes, DY, NX);
-                cpu::balance_weights_turns(Wc2.data(), NR, DY, NX, NG, cfg.rot_center);
-            }
-        } else if (sharp) {
-            std::vector<float> scratch(S);
-            cpu::rebalance(scratch.data(), Wc2.data(), NR, DY, NX, cfg.rot_center, cfg.legacy_reference);
-        }
+        balance<CpuOps>(S.data(), Wc.data(), Wc2.data(), NR, DY, NX, sharp, ap.measured_only);
         if (dbg && dbg->keep) { dbg->wbal = Wc; dbg->filtered.resize(static_cast<std::size_t>(DY) * NR * NX); }
         tick("rebalance");
-        std::vector<float> row(static_cast<std::size_t>(NR) * NX), wrow(row.size());
-        std::vector<float> w2row(sharp ? row.size() : 0), brow(sharp ? row.size() : 0);
-        std::vector<float> padded(static_cast<std::size_t>(NR) * rg.npad);
+        const std::size_t rown = static_cast<std::size_t>(NR) * NX;
+        std::vector<float> row(rown), wrow(rown), w2row(sharp ? rown : 0), brow(sharp ? rown : 0), padded(static_cast<std::size_t>(NR) * rg.npad);
+        arc_h.resize(arc_taps.empty() ? 0 : rown);
+        if (I.fbp_start && raw_rows) I.start_h.resize(rown), I.start_wh.resize(rown);
         step("backproject");
-        for (int y = 0; y < DY; ++y) {
-            for (int i = 0; i < NR; ++i) {
-                std::memcpy(&row[static_cast<std::size_t>(i) * NX], &S[(static_cast<std::size_t>(i) * DY + y) * NX], NX * sizeof(float));
-                std::memcpy(&wrow[static_cast<std::size_t>(i) * NX], &Wc[(static_cast<std::size_t>(i) * DY + y) * NX], NX * sizeof(float));
-                if (sharp)
-                    std::memcpy(&w2row[static_cast<std::size_t>(i) * NX], &Wc2[(static_cast<std::size_t>(i) * DY + y) * NX], NX * sizeof(float));
-            }
-            tick("ramp_gather");
-            if (!arc_taps.empty()) {
-                arc_h.resize(row.size());
-                cpu::angular_fir(row.data(), arc_h.data(), NR, NX, arc_taps.data(), static_cast<int>(arc_taps.size()) - 1,
-                                 ap.measured_only ? wrow.data() : nullptr);
-                std::memcpy(row.data(), arc_h.data(), row.size() * sizeof(float));
-                tick("arc");
-            }
-            if (!raw_rows) {
-                cpu::ramp_pad(row.data(), padded.data(), rg, views ? I.slice_opposite.data() + static_cast<std::size_t>(y) * NR : nullptr);
-                ramp_filter->apply(padded.data(), padded.data(), NR);
-                cpu::ramp_crop(padded.data(), row.data(), rg);
-                if (sharp) {   // usual pair weights, and above the band the second set's: row w + HP (row (w2 - w))
-                    cpu::weight_difference(row.data(), wrow.data(), w2row.data(), brow.data(), row.size());
-                    I.band1d->apply(brow.data(), brow.data(), NR);
-                    cpu::multiply_add(row.data(), wrow.data(), brow.data(), row.size());
-                } else {
-                    cpu::multiply(row.data(), wrow.data(), row.size());
-                }
-            }
-            if (dbg && dbg->keep) std::memcpy(&dbg->filtered[static_cast<std::size_t>(y) * NR * NX], row.data(), row.size() * sizeof(float));
-            if (I.fbp_start && raw_rows) {   // the method's start: this slice's rows as the exact backprojector takes them
-                I.start_h = row;
-                I.start_wh = wrow;
-                if (cfg.mend_threshold > 0)
-                    cpu::mend_null_weights(I.start_h.data(), I.start_wh.data(), NR, 1, NX, cfg.mend_threshold, I.mend_x0, I.mend_x1);
-                cpu::rebalance(I.start_h.data(), I.start_wh.data(), NR, 1, NX, cfg.rot_center, false);
-                cpu::ramp_pad(I.start_h.data(), padded.data(), rg, nullptr);
-                ramp_filter->apply(padded.data(), padded.data(), NR);
-                cpu::ramp_crop(padded.data(), I.start_h.data(), rg);
-                cpu::multiply(I.start_h.data(), I.start_wh.data(), I.start_h.size());
-                I.start_rows = I.start_h.data();
-            }
-            tick("ramp");
-            sink(0, y, row.data(), wrow.data());
-            I.start_rows = nullptr;
-            tick("backproject");
-        }
+        slices<CpuOps>(0, S.data(), Wc.data(), Wc2.data(), NR, DY, NX, sharp, rg,
+                       SliceBuffers{row.data(), wrow.data(), w2row.data(), brow.data(), padded.data(), arc_h.data(), I.start_h.data(),
+                                    I.start_wh.data(), I.slice_opposite.data()},
+                       dbg && dbg->keep ? dbg : nullptr, ap.measured_only, sink, tick);
         return;
     }
 #ifdef VC_TOMOGRAPHY_WITH_CUDA
@@ -1648,10 +1760,8 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
         Rr.ensure(blk); RWr.ensure(blk);
         if (sharp) R2r.ensure(blk), RW2r.ensure(blk);
     }
-    float* const aR = by_row ? Rr.data() : R.data();
-    float* const aRW = by_row ? RWr.data() : RW.data();
-    float* const aR2 = by_row ? R2r.data() : R2.data();
-    float* const aRW2 = by_row ? RW2r.data() : RW2.data();
+    const GridBuffers gb{R.data(), RW.data(), R2.data(), RW2.data(), Rr.data(), RWr.data(), R2r.data(), RW2r.data(), Wp.data(), Wp2.data(),
+                         Aha.data(), Bha.data(), Atot.data(), Btot.data(), Aha2.data(), Bha2.data(), Atot2.data(), Btot2.data()};
     S.ensure(sino_n); W.ensure(sino_n);
     // sweeps: one Fourier step per chain -> cache the spectra (filter + inverse per chain); else the intensity
     bool spectral = K > 1;
@@ -1669,51 +1779,9 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
         const int g0 = plans[b].g0, g1 = plans[b].g1, L = g1 - g0;
         const std::size_t n_el = static_cast<std::size_t>(L) * H * NX;
         if (b + 1 < plans.size()) issue_upload(b + 1);
-        if (sharp) {
-            VC_TOMOGRAPHY_CUDA_CHECK(cudaMemsetAsync(R2.data(), 0, n_el * sizeof(float)));
-            VC_TOMOGRAPHY_CUDA_CHECK(cudaMemsetAsync(RW2.data(), 0, n_el * sizeof(float)));
-        }
-        VC_TOMOGRAPHY_CUDA_CHECK(cudaMemsetAsync(R.data(), 0, n_el * sizeof(float)));
-        VC_TOMOGRAPHY_CUDA_CHECK(cudaMemsetAsync(RW.data(), 0, n_el * sizeof(float)));
-        VC_TOMOGRAPHY_CUDA_CHECK(cudaStreamWaitEvent(nullptr, ev_up[r], 0));
-        tick("upload_wait");
-        // (as on the CPU: each scan with an earlier scan at its height taken to the luminosity of those before it at
-        // its seam with them)
-        const bool lum = cfg.luminosity_repartition != 0.f && nsc >= 2;
-        bool before = false;
-        int row_now = -1;
-        const auto add_row = [&] {
-            cuda::add_into(R.data(), Rr.data(), n_el);
-            cuda::add_into(RW.data(), RWr.data(), n_el);
-            if (sharp) cuda::add_into(R2.data(), R2r.data(), n_el), cuda::add_into(RW2.data(), RW2r.data(), n_el);
-        };
-        for (std::size_t s = 0; s < nsc; ++s) {
+        const auto accumulate = [&](std::size_t s, float* aR, float* aRW, float* aR2, float* aRW2) {
             const auto& sd = I.scans[s];
             const auto& ch = chunks[s];
-            if (ch.cs.p1 == ch.cs.p0) {  // a scan at another height
-                if (s + 1 == nsc) VC_TOMOGRAPHY_CUDA_CHECK(cudaEventRecord(ev_done[r], nullptr));
-                continue;
-            }
-            if (by_row && I.scan_row[s] != row_now) {   // another row of scans begins
-                if (row_now >= 0) add_row();
-                VC_TOMOGRAPHY_CUDA_CHECK(cudaMemsetAsync(Rr.data(), 0, n_el * sizeof(float)));
-                VC_TOMOGRAPHY_CUDA_CHECK(cudaMemsetAsync(RWr.data(), 0, n_el * sizeof(float)));
-                if (sharp) {
-                    VC_TOMOGRAPHY_CUDA_CHECK(cudaMemsetAsync(R2r.data(), 0, n_el * sizeof(float)));
-                    VC_TOMOGRAPHY_CUDA_CHECK(cudaMemsetAsync(RW2r.data(), 0, n_el * sizeof(float)));
-                }
-                row_now = I.scan_row[s], before = false;
-            }
-            const bool joins = lum && before && I.seam[s] >= 0;
-            if (joins) {
-                cuda::luminosity_sums(aR, aRW, L, H, NX, I.seam[s], I.lum, Aha.data(), Bha.data());
-                VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpyAsync(Wp.data(), aRW, n_el * sizeof(float), cudaMemcpyDeviceToDevice));
-                if (sharp) {
-                    cuda::luminosity_sums(aR2, aRW2, L, H, NX, I.seam[s], I.lum, Aha2.data(), Bha2.data());
-                    VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpyAsync(Wp2.data(), aRW2, n_el * sizeof(float), cudaMemcpyDeviceToDevice));
-                }
-                tick("luminosity");
-            }
             auto view = make_view(sd, ch, d_raw[r][s].data(), I.dev[s].dark.data(), I.dev[s].flats.data(),
                                   I.dev[s].weight.data(), dc[s].row0.data(), dc[s].fract_v.data(),
                                   dc[s].alpha.data(), dc[s].cdiv.data(), dc[s].wfac.data(), dc[s].ffrac.data(),
@@ -1727,38 +1795,17 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
             if (cfg.sld.enabled())
                 set_glare(view, *I.glare[s], dc[s].glare.data(), dc[s].gi0.data(), dc[s].gi1.data(), dc[s].gfrac.data(),
                           cg[s].rows, cg[s].row0.empty() ? nullptr : dc[s].grow0.data());
-            cuda::accumulate(view, plans[b].contrib[s], ap, aR, aRW, nullptr,
-                             sharp ? I.dev[s].weight2.data() : nullptr, sharp ? aR2 : nullptr, sharp ? aRW2 : nullptr);
+            cuda::accumulate(view, plans[b].contrib[s], ap, aR, aRW, nullptr, aR2 ? I.dev[s].weight2.data() : nullptr, aR2, aRW2);
+        };
+        // (the ring slot is free once the last scan's gridding of this block is queued)
+        const auto done = [&](std::size_t s) {
             if (s + 1 == nsc) VC_TOMOGRAPHY_CUDA_CHECK(cudaEventRecord(ev_done[r], nullptr));
-            tick("accumulate");
-            if (joins) {
-                cuda::luminosity_sums(aR, aRW, L, H, NX, I.seam[s], I.lum, Atot.data(), Btot.data());
-                cuda::luminosity_apply(aR, aRW, Wp.data(), Aha.data(), Bha.data(), Atot.data(),
-                                       Btot.data(), L, H, NX, cfg.luminosity_repartition);
-            }
-            if (sharp && joins) {
-                cuda::luminosity_sums(aR2, aRW2, L, H, NX, I.seam[s], I.lum, Atot2.data(), Btot2.data());
-                cuda::luminosity_apply(aR2, aRW2, Wp2.data(), Aha2.data(), Bha2.data(), Atot2.data(),
-                                       Btot2.data(), L, H, NX, cfg.luminosity_repartition);
-            }
-            tick("luminosity");
-            before = true;
-        }
-        if (by_row && row_now >= 0) add_row();
-        cuda::divide(R.data(), RW.data(), n_el);
-        if (ap.measured_only)
-            cuda::prepare_measured(R.data(), RW.data(), L, H, NX, cfg.mend_threshold, filter_context, ap.log_values ? 0.f : 1.f);
-        else if (cfg.mend_threshold > 0)
-            cuda::mend_null_weights(R.data(), RW.data(), L, H, NX, cfg.mend_threshold, I.mend_x0, I.mend_x1);
-        if (sharp) {   // the two weightings' intensities, combined by band: R + HP (R2 - R)
-            cuda::divide(R2.data(), RW2.data(), n_el);
-            if (cfg.mend_threshold > 0)
-                cuda::mend_null_weights(R2.data(), RW2.data(), L, H, NX, cfg.mend_threshold, I.mend_x0, I.mend_x1);
-            cuda::add_scaled(R2.data(), R.data(), -1.f, n_el);
-            I.band2d->apply(R2.data(), R2.data(), L);
-            cuda::add_scaled(R.data(), R2.data(), 1.f, n_el);
-        }
-        tick("divide_mend");
+        };
+        const auto ready = [&] {   // (block b's projections uploaded)
+            VC_TOMOGRAPHY_CUDA_CHECK(cudaStreamWaitEvent(nullptr, ev_up[r], 0));
+            tick("upload_wait");
+        };
+        grid_block<CudaOps>(L, H, chunks, gb, sharp, by_row, ap, filter_context, accumulate, done, ready, tick);
         if (spectral) {  // sweep: keep the spectra of the padded intensity; filter / inverse / log / crop per chain below
             fwd = fft_for(0, sets[0]->step_spec(0, H, NX, fm));
             fwd->forward(R.data(), Icache.data() + static_cast<std::size_t>(g0) * fwd->spectrum_floats(), L);
@@ -1767,23 +1814,11 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
             VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpyAsync(Icache.data() + static_cast<std::size_t>(g0) * H * NX, R.data(),
                                                n_el * sizeof(float), cudaMemcpyDeviceToDevice));
         } else {
-            apply_filters(*sets[0], FilterStage::Intensity, R.data(), L, H, fm);
-            tick("filters");
-            if (!ap.log_values) cuda::minus_log(R.data(), n_el, cfg.log_clip_min, cfg.log_clip_max);
-            apply_filters(*sets[0], FilterStage::Log, R.data(), L, H, fm);
-            tick("log");
-            // rows [m, m + DY) of each grid angle -> device sinogram (NR, DY, NX)
-            VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpy2DAsync(S.data() + static_cast<std::size_t>(g0) * DY * NX, DY * NX * sizeof(float),
-                                                 R.data() + static_cast<std::size_t>(m) * NX, static_cast<std::size_t>(H) * NX * sizeof(float),
-                                                 static_cast<std::size_t>(DY) * NX * sizeof(float), L, cudaMemcpyDeviceToDevice));
+            filter_block<CudaOps>(*sets[0], R.data(), L, H, fm, ap, tick);
+            CudaOps::crop(S.data(), R.data(), g0, L, H, DY, m, NX);   // rows [m, m + DY) of each grid angle -> the sinogram
         }
-        VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpy2DAsync(W.data() + static_cast<std::size_t>(g0) * DY * NX, DY * NX * sizeof(float),
-                                             RW.data() + static_cast<std::size_t>(m) * NX, static_cast<std::size_t>(H) * NX * sizeof(float),
-                                             static_cast<std::size_t>(DY) * NX * sizeof(float), L, cudaMemcpyDeviceToDevice));
-        if (sharp)
-            VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpy2DAsync(W2.data() + static_cast<std::size_t>(g0) * DY * NX, DY * NX * sizeof(float),
-                                                 RW2.data() + static_cast<std::size_t>(m) * NX, static_cast<std::size_t>(H) * NX * sizeof(float),
-                                                 static_cast<std::size_t>(DY) * NX * sizeof(float), L, cudaMemcpyDeviceToDevice));
+        CudaOps::crop(W.data(), RW.data(), g0, L, H, DY, m, NX);
+        if (sharp) CudaOps::crop(W2.data(), RW2.data(), g0, L, H, DY, m, NX);
         tick("sino_crop");
     }
     if (!prefetched) {
@@ -1802,59 +1837,13 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
     row.ensure(rown); wrow.ensure(rown); pad.ensure(static_cast<std::size_t>(NR) * rg.npad);
     if (views) d_opposite.upload(I.slice_opposite.data(), I.slice_opposite.size());
     if (sharp) { w2row.ensure(rown); brow.ensure(rown); }
-    auto slices = [&](int k) {  // ramp filter x balanced weights per slice -> sink
-        for (int y = 0; y < DY; ++y) {
-            VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpy2DAsync(row.data(), NX * sizeof(float), S.data() + static_cast<std::size_t>(y) * NX,
-                                                 static_cast<std::size_t>(DY) * NX * sizeof(float), NX * sizeof(float), NR,
-                                                 cudaMemcpyDeviceToDevice));
-            VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpy2DAsync(wrow.data(), NX * sizeof(float), W.data() + static_cast<std::size_t>(y) * NX,
-                                                 static_cast<std::size_t>(DY) * NX * sizeof(float), NX * sizeof(float), NR,
-                                                 cudaMemcpyDeviceToDevice));
-            if (sharp)
-                VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpy2DAsync(w2row.data(), NX * sizeof(float), W2.data() + static_cast<std::size_t>(y) * NX,
-                                                     static_cast<std::size_t>(DY) * NX * sizeof(float), NX * sizeof(float), NR,
-                                                     cudaMemcpyDeviceToDevice));
-            tick("ramp_gather");
-            if (!arc_taps.empty()) {
-                arc_d.ensure(rown);
-                cuda::angular_fir(row.data(), arc_d.data(), NR, NX, arc_taps.data(), static_cast<int>(arc_taps.size()) - 1,
-                                  ap.measured_only ? wrow.data() : nullptr);
-                VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpyAsync(row.data(), arc_d.data(), rown * sizeof(float), cudaMemcpyDeviceToDevice));
-                tick("arc");
-            }
-            if (!raw_rows) {
-                cuda::ramp_pad(row.data(), pad.data(), rg, nullptr, views ? d_opposite.data() + static_cast<std::size_t>(y) * NR : nullptr);
-                ramp_filter->apply(pad.data(), pad.data(), NR);
-                cuda::ramp_crop(pad.data(), row.data(), rg);
-                if (sharp) {   // usual pair weights, and above the band the second set's: row w + HP (row (w2 - w))
-                    cuda::weight_difference(row.data(), wrow.data(), w2row.data(), brow.data(), rown);
-                    I.band1d->apply(brow.data(), brow.data(), NR);
-                    cuda::multiply_add(row.data(), wrow.data(), brow.data(), rown);
-                } else {
-                    cuda::multiply(row.data(), wrow.data(), rown);
-                }
-            }
-            if (dbg && dbg->keep && K == 1)
-                VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpy(&dbg->filtered[static_cast<std::size_t>(y) * rown], row.data(), rown * sizeof(float),
-                                              cudaMemcpyDeviceToHost));
-            if (I.fbp_start && raw_rows) {   // the method's start: this slice's rows as the exact backprojector takes them
-                I.start_d.ensure(rown); I.start_wd.ensure(rown);
-                VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpyAsync(I.start_d.data(), row.data(), rown * sizeof(float), cudaMemcpyDeviceToDevice));
-                VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpyAsync(I.start_wd.data(), wrow.data(), rown * sizeof(float), cudaMemcpyDeviceToDevice));
-                if (cfg.mend_threshold > 0)
-                    cuda::mend_null_weights(I.start_d.data(), I.start_wd.data(), NR, 1, NX, cfg.mend_threshold, I.mend_x0, I.mend_x1);
-                cuda::rebalance(I.start_d.data(), I.start_wd.data(), NR, 1, NX, cfg.rot_center, false);
-                cuda::ramp_pad(I.start_d.data(), pad.data(), rg, nullptr, nullptr);
-                ramp_filter->apply(pad.data(), pad.data(), NR);
-                cuda::ramp_crop(pad.data(), I.start_d.data(), rg);
-                cuda::multiply(I.start_d.data(), I.start_wd.data(), rown);
-                I.start_rows = I.start_d.data();
-            }
-            tick("ramp");
-            sink(k, y, row.data(), wrow.data());
-            I.start_rows = nullptr;
-            tick("backproject");
-        }
+    if (!arc_taps.empty()) arc_d.ensure(rown);
+    if (I.fbp_start && raw_rows) I.start_d.ensure(rown), I.start_wd.ensure(rown);
+    const SliceBuffers sb{row.data(), wrow.data(), w2row.data(), brow.data(), pad.data(), arc_d.data(), I.start_d.data(), I.start_wd.data(),
+                          d_opposite.data()};
+    const auto chain_slices = [&](int k) {
+        slices<CudaOps>(k, S.data(), W.data(), W2.data(), NR, DY, NX, sharp, rg, sb, dbg && dbg->keep && K == 1 ? dbg : nullptr,
+                        ap.measured_only, sink, tick);
     };
     if (K == 1) {
         if (dbg && dbg->keep) {
@@ -1862,26 +1851,14 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
             VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpy(dbg->sino.data(), S.data(), sino_n * sizeof(float), cudaMemcpyDeviceToHost));
             VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpy(dbg->weights.data(), W.data(), sino_n * sizeof(float), cudaMemcpyDeviceToHost));
         }
-        if (views) cuda::rebalance_turns(S.data(), W.data(), NR, DY, NX, NG, cfg.rot_center);
-        else if (!ap.measured_only) cuda::rebalance(S.data(), W.data(), NR, DY, NX, cfg.rot_center, cfg.legacy_reference);
-        if (sharp && views) {   // the balanced weights of the second set (the sinogram's holes are filled already)
-            const TurnHoles holes = cuda::turn_holes(W2.data(), NR, DY, NX, NG);
-            if (!holes.all_empty) {
-                cuda::fill_turn_holes(W2.data(), holes, DY, NX);
-                cuda::balance_weights_turns(W2.data(), NR, DY, NX, NG, cfg.rot_center);
-            }
-        } else if (sharp) {
-            const auto holes = cuda::rebalance_holes(W2.data(), NR, DY, NX);
-            cuda::fill_holes(W2.data(), holes, NR, DY, NX);
-            cuda::balance_weights(W2.data(), NR, DY, NX, cfg.rot_center, cfg.legacy_reference);
-        }
+        balance<CudaOps>(S.data(), W.data(), W2.data(), NR, DY, NX, sharp, ap.measured_only);
         if (dbg && dbg->keep) {
             dbg->wbal.resize(sino_n);
             VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpy(dbg->wbal.data(), W.data(), sino_n * sizeof(float), cudaMemcpyDeviceToHost));
             dbg->filtered.resize(sino_n);
         }
         tick("rebalance");
-        slices(0);
+        chain_slices(0);
         return;
     }
     // ---- sweep: shared weights, then per set: phase / log / crop from the cached intensity, slices
@@ -1939,7 +1916,7 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
             cuda::fill_holes(S.data(), holes, NR, DY, NX);
         }
         tick("rebalance");
-        slices(k);
+        chain_slices(k);
     }
 #endif
 }
