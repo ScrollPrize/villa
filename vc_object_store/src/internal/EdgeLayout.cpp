@@ -53,10 +53,20 @@ std::set<std::string> edgeColumns(sqlite3* db){
     if(auto p=activeStatementPools.find(db);p!=activeStatementPools.end())p->second->edgeColumnNames=names;
     return names;
 }
-bool hasEdgeColumn(sqlite3* db,const std::string& name){return edgeColumns(db).contains(name);}
+namespace {
+// The pool caches the column set for the connection's lifetime; checking a name against it must not copy
+// the whole set (edgeReadSource asked once per column: 36 set copies per call, called per written edge).
+template<class F> auto withEdgeColumns(sqlite3* db,F&& f){
+    if(auto p=activeStatementPools.find(db);p!=activeStatementPools.end()&&p->second->edgeColumnNames)
+        return f(*p->second->edgeColumnNames);
+    const auto names=edgeColumns(db);
+    return f(names);
+}
+}
+bool hasEdgeColumn(sqlite3* db,const std::string& name){return withEdgeColumns(db,[&](const std::set<std::string>& c){return c.contains(name);});}
 void requireEdgeColumns(sqlite3* db,std::initializer_list<const char*> names){
-    auto present=edgeColumns(db);for(const auto* name:names)if(!present.contains(name))
-        throw std::runtime_error("edge field is not supported by this table layout: "+std::string(name));
+    withEdgeColumns(db,[&](const std::set<std::string>& present){for(const auto* name:names)if(!present.contains(name))
+        throw std::runtime_error("edge field is not supported by this table layout: "+std::string(name));return 0;});
 }
 void requireAdjacencyIndex(sqlite3* db){
     Statement q(db,"SELECT count(*) FROM sqlite_schema WHERE type='index' AND name IN ('edges_a','edges_b')");q.row();
@@ -88,9 +98,14 @@ std::string edgeReadColumn(sqlite3* db,const std::string& name,const std::string
     return expression;
 }
 std::string edgeReadSource(sqlite3* db){
+    // Derived only from the pool's cached column set, so it is cached beside it.
+    auto pool=activeStatementPools.find(db);
+    if(pool!=activeStatementPools.end()&&pool->second->edgeReadSourceSql)return *pool->second->edgeReadSourceSql;
     std::string sql="(SELECT ";bool first=true;for(const auto& c:columns){
         if(!first)sql+=',';first=false;sql+=edgeReadColumn(db,c.name)+" AS "+c.name;
     }
-    return sql+" FROM edges)";
+    sql+=" FROM edges)";
+    if(pool!=activeStatementPools.end()&&pool->second->edgeColumnNames)pool->second->edgeReadSourceSql=sql;
+    return sql;
 }
 } // namespace vc::objects::detail

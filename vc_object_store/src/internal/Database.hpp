@@ -46,6 +46,7 @@ struct CurrentWriteState {
 struct StatementPool {
     using ObjectSelectionArguments=std::map<sqlite3*,std::vector<std::string>>;
     std::optional<std::set<std::string>> edgeColumnNames;
+    std::optional<std::string> edgeReadSourceSql, projectedEdgeColumnsSql;   // derived from edgeColumnNames only
     // Installed only by a collection transaction with pinned dependencies.
     // Shared lookup for immutable records and payloads. Owns no data, aliases
     // or per-record directories; returned connections live for the transaction.
