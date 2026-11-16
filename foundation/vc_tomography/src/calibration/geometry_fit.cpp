@@ -240,6 +240,7 @@ struct SameLines {
     int at_a[4] = {0, 0, 0, 0}, at_b[4] = {0, 0, 0, 0};  // and own, place, stretch, turn of each side (0 is the detector, 1 the stage, 2 the pitch, 3 the rows' timing)
     double about = 0;                              // the height the scans' rotations are about
     double timing = 0;                             // the rows' timing a and b were read at [frames per row]
+    bool report = false;                           // (residuals()) the rows of opposite views of two scans as they are
 
     template <class T>
     bool operator()(T const* const* p, T* r) const {
@@ -261,7 +262,7 @@ struct SameLines {
         r[1] = zb - za;
         if (at_once >= 0) r[1] -= model::own_lift(p[at_once], when_a, when_b);
         else if (!opposite) r[1] -= model::pitch_lift(p[2], p[at_b[1]], when_b) - model::pitch_lift(p[2], p[at_a[1]], when_a);
-        else r[1] = T(0.0);
+        else if (!report) r[1] = T(0.0);
         return true;
     }
 };
@@ -344,25 +345,21 @@ Wiring wire(const Acquisition& acq, Blocks& b, const Comparison& c) {
     return w;
 }
 
-std::array<double, 3> residual_of(const Acquisition& acq, const Parameters& p, const Comparison& c) {
-    Ray a = ray_of(acq, p, c.a), b = ray_of(acq, p, c.b);
+// the residual the solve minimises (SameLines, at the parameters b holds: columns, rows) and the angle the solve
+// does not fit, in frames of B
+std::array<double, 3> residual_of(const Acquisition& acq, const Parameters& p, Blocks& blocks, const Comparison& c) {
+    Wiring w = wire(acq, blocks, c);
+    w.f.report = true;
+    double r[2];
+    w.f(w.blocks.data(), r);
+    const Ray a = ray_of(acq, p, c.a), b = ray_of(acq, p, c.b);
     const double row_time = row_time_of(acq, p);
-    const model::Now<double> when_a = model::now(at_of(acq, row_time, c.a), 0.0), when_b = model::now(at_of(acq, row_time, c.b), 0.0);
-    if (c.a.scan != c.b.scan) {  // two scans: each one's rays as the sample's
-        model::turned_back(p.scans[static_cast<std::size_t>(c.a.scan)].rotation, when_a, p.about_height, a.s, a.z);
-        model::turned_back(p.scans[static_cast<std::size_t>(c.b.scan)].rotation, when_b, p.about_height, b.s, b.z);
-    }
     const StretchLayout& sb = stretch_of(acq, c.b);
     // B's angle per frame around the sighting
     const double t = time_of(acq, row_time, c.b);
     const double step = at_frame(sb.course.angle_deg, t + 0.5) - at_frame(sb.course.angle_deg, t - 0.5);
-    double dth = b.angle_deg - a.angle_deg - (c.opposite ? 180.0 : 0.0);
-    dth = wrap180(dth);
-    double rows = b.z - a.z;
-    if (c.a.scan == c.b.scan) rows -= model::own_lift(p.scans[static_cast<std::size_t>(c.a.scan)].height_once, when_a, when_b);
-    else if (!c.opposite)  // two scans at one angle: the pitch's term (opposite views of two scans: the rows as they are, which the solve leaves out)
-        rows -= model::pitch_lift(&p.pitch, p.scans[static_cast<std::size_t>(c.b.scan)].d, when_b) - model::pitch_lift(&p.pitch, p.scans[static_cast<std::size_t>(c.a.scan)].d, when_a);
-    return {step != 0 ? dth / step : 0.0, rows, c.opposite ? b.s + a.s : b.s - a.s};
+    const double dth = wrap180(b.angle_deg - a.angle_deg - (c.opposite ? 180.0 : 0.0));
+    return {step != 0 ? dth / step : 0.0, r[1], r[0]};
 }
 
 
@@ -418,7 +415,8 @@ std::vector<std::array<double, 3>> lens_residuals(const Acquisition& acq, const 
 std::vector<std::array<double, 3>> residuals(const Acquisition& acq, const Parameters& p, const std::vector<Comparison>& comparisons) {
     std::vector<std::array<double, 3>> out;
     out.reserve(comparisons.size());
-    for (const Comparison& c : comparisons) out.push_back(residual_of(acq, p, c));
+    Blocks blocks = blocks_of(acq, p);
+    for (const Comparison& c : comparisons) out.push_back(residual_of(acq, p, blocks, c));
     return out;
 }
 
