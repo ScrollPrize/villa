@@ -22,6 +22,22 @@ inline void validate(const SolveOptions& o) {
 // solve_linear and the geometry's solver both refuse dependent unknowns by. dependent: the columns the pivoting
 // left out, in rising order (which of a dependent set they are is the pivoting's choice).
 int design_rank(const Eigen::SparseMatrix<double>& design, double rcond, std::vector<int>* dependent = nullptr);
+// The L2 norm of each of n columns of a sparse matrix given as (column, value) entries, scaled by the column's
+// largest magnitude so that no square overflows: what both solvers normalise their designs by.
+template <class Col, class Value>
+std::vector<double> column_norms(std::size_t n, std::size_t entries, Col&& col, Value&& value) {
+    std::vector<double> norm(n, 0.0), largest(n, 0.0);
+    for (std::size_t e = 0; e < entries; ++e) largest[col(e)] = std::max(largest[col(e)], std::abs(value(e)));
+    for (std::size_t e = 0; e < entries; ++e) {
+        const std::size_t c = col(e);
+        if (largest[c] > 0) {
+            const double v = value(e) / largest[c];
+            norm[c] += v * v;
+        }
+    }
+    for (std::size_t c = 0; c < n; ++c) norm[c] = largest[c] * std::sqrt(norm[c]);
+    return norm;
+}
 inline ceres::Solver::Options options(int active, const SolveOptions& o = {}) {
     validate(o);
     ceres::Solver::Options s;

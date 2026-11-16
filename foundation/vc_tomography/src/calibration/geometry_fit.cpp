@@ -607,9 +607,8 @@ GeometrySolution solve_once(const Acquisition& acq, const std::vector<Comparison
         eo.apply_loss_function = false;
         ceres::CRSMatrix J;
         if (!b.problem->Evaluate(eo, nullptr, nullptr, nullptr, &J)) throw Error("geometry: the residuals could not be evaluated");
-        norm.assign(b.column_slot.size(), 0.0);
-        for (std::size_t e = 0; e < J.values.size(); ++e) norm[static_cast<std::size_t>(J.cols[e])] += J.values[e] * J.values[e];
-        for (double& v : norm) v = std::sqrt(v);
+        norm = fitting::column_norms(b.column_slot.size(), J.values.size(), [&](std::size_t e) { return static_cast<std::size_t>(J.cols[e]); },
+                                     [&](std::size_t e) { return J.values[e]; });
         std::vector<Eigen::Triplet<double>> entries;
         entries.reserve(J.values.size());
         for (int r = 0; r < J.num_rows; ++r)

@@ -164,16 +164,11 @@ LinearSolution solve_linear(const LinearProblem& problem, const SolveOptions& op
         fixed[c] = true;
         out.x[c] = problem.fixed_value[k];
     }
-    std::vector<double> norm(n, 0), largest(n, 0), x(n, 0);
-    for (std::size_t e = 0; e < A.value.size(); ++e) {
+    for (std::size_t e = 0; e < A.value.size(); ++e)
         if (!std::isfinite(A.value[e])) throw Error("solve_linear: coefficient sum is not finite");
-        largest[A.col[e]] = std::max(largest[A.col[e]],std::abs(A.value[e]));
-    }
-    for (std::size_t e = 0; e < A.value.size(); ++e) {
-        const int c = A.col[e];
-        if (largest[c] > 0) { const double v = A.value[e]/largest[c]; norm[c] += v*v; }
-    }
-    for (std::size_t c = 0; c < n; ++c) norm[c] = largest[c]*std::sqrt(norm[c]);
+    std::vector<double> x(n, 0);
+    std::vector<double> norm = fitting::column_norms(n, A.value.size(), [&](std::size_t e) { return static_cast<std::size_t>(A.col[e]); },
+                                                     [&](std::size_t e) { return A.value[e]; });
     std::vector<int> active(n, -1);
     for (std::size_t k = 0; k < n; ++k) {
         if (norm[k] == 0) { ++out.unused; fixed[k] = true; norm[k] = 1; }
