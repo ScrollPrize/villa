@@ -89,6 +89,62 @@ std::vector<std::int64_t> whole(const std::vector<double>& v) {
 
 Json num(double v) { return Json::of(v); }
 Json count(long long v) { return Json::whole_number(v); }
+
+// ---- the plans' shared pieces (plan, plan_tiles)
+
+// the scan's helix stretch (the last that is one), -1: none
+int helix_of(const ScanLayout& sc) {
+    int h = -1;
+    for (int a = 0; a < static_cast<int>(sc.stretches.size()); ++a)
+        if (sc.stretches[static_cast<std::size_t>(a)].helix) h = a;
+    return h;
+}
+
+// Frames from p_lo to p_hi at the angles a turn (N frames) / `angles` apart. Where that is more than `most` (or
+// always, without `all_if_few`), the positions are spread evenly over the span and each moved to the nearest frame
+// at its angle: the angles in turn, so that they stay evenly spread around the turn.
+std::vector<std::int64_t> around_the_turn(std::int64_t p_lo, std::int64_t p_hi, int N, int angles, int most, bool all_if_few) {
+    const double base = static_cast<double>(N) / angles, span = static_cast<double>(p_hi - p_lo);
+    std::vector<std::int64_t> positions;
+    if (all_if_few && std::floor(span / base) + 1 <= most) {
+        for (double at = 0; at <= span; at += base) positions.push_back(p_lo + static_cast<std::int64_t>(std::llround(at)));
+        return positions;
+    }
+    const int count = std::max(angles, most - most % angles);
+    for (int j = 0; j < count; ++j) {
+        const double phase = (j % angles) * base;
+        double at = N * std::round((j * span / std::max(1, count - 1) - phase) / N) + phase;
+        if (at < 0) at += N;
+        if (at > span) at -= N;
+        if (at >= 0 && at <= span) positions.push_back(p_lo + static_cast<std::int64_t>(std::llround(at)));
+    }
+    std::sort(positions.begin(), positions.end());
+    positions.erase(std::unique(positions.begin(), positions.end()), positions.end());
+    return positions;
+}
+
+// First rows of A's block (nr rows) for which it and B's, Nr rows higher and with margins of 40, lie inside the
+// rows [L0, L1): as many bands as fit side by side, up to `most`; one band: the middle of the room
+std::vector<std::int64_t> bands_of(int Nr, int nr, int L0, int L1, int most) {
+    const int m = 40, a0 = std::max(L0, L0 + m - Nr), a1 = std::min(L1 - nr, L1 - nr - m - Nr);
+    if (a1 < a0) return {};
+    const int count = std::clamp(1 + (a1 - a0) / nr, 1, most);
+    if (count == 1) return {(a0 + a1) / 2};
+    return whole(linspace(a0, a1, count));
+}
+
+// a block of `frames` frames, rows x cols, of scan_a's stretch_a at frame_a against scan_b's stretch_b (frame_a +
+// hint), at the rows row_a and the columns col_a, col_b
+ViewRequest block_request(int scan_a, int stretch_a, int scan_b, int stretch_b, std::int64_t frame_a, std::int64_t hint, int rows, int cols,
+                          int row_a, int col_a, int col_b) {
+    ViewRequest q;
+    q.scan_a = scan_a, q.scan_b = scan_b;
+    q.stretch_a = stretch_a, q.stretch_b = stretch_b;
+    q.frame_a = frame_a, q.frame_hint = hint;
+    q.frames = 32, q.rows = rows, q.cols = cols;
+    q.row_a = row_a, q.col_a = col_a, q.col_b = col_b;
+    return q;
+}
 }  // namespace
 
 bool Blocked::holds(double frame, int row_lo, int row_hi) const {
@@ -671,54 +727,19 @@ std::vector<Planned> plan(const Acquisition& acq, const PlanCounts& n) {
         out.push_back(p);
     };
     const auto add = [&](const char* kind, int scan, int a, int b, const ViewRequest& q, bool from_block = false) { add_between(kind, scan, a, scan, b, q, from_block); };
-    // Frames from p_lo to p_hi at the angles a turn / angles_per_turn apart. Where that is more than `most`, the
-    // positions are spread evenly over the span and each moved to the nearest frame at its angle: the angles in
-    // turn, so that they stay evenly spread around the turn.
-    const auto around_the_turn = [&](std::int64_t p_lo, std::int64_t p_hi, int most) {
-        const double base = static_cast<double>(N) / n.angles_per_turn, span = static_cast<double>(p_hi - p_lo);
-        std::vector<std::int64_t> positions;
-        if (std::floor(span / base) + 1 <= most) {
-            for (double at = 0; at <= span; at += base) positions.push_back(p_lo + static_cast<std::int64_t>(std::llround(at)));
-            return positions;
-        }
-        const int count = std::max(n.angles_per_turn, most - most % n.angles_per_turn);
-        for (int j = 0; j < count; ++j) {
-            const double phase = (j % n.angles_per_turn) * base;
-            double at = N * std::round((j * span / (count - 1) - phase) / N) + phase;
-            if (at < 0) at += N;
-            if (at > span) at -= N;
-            if (at >= 0 && at <= span) positions.push_back(p_lo + static_cast<std::int64_t>(std::llround(at)));
-        }
-        std::sort(positions.begin(), positions.end());
-        positions.erase(std::unique(positions.begin(), positions.end()), positions.end());
-        return positions;
-    };
+    const auto around = [&](std::int64_t p_lo, std::int64_t p_hi, int most) { return around_the_turn(p_lo, p_hi, N, n.angles_per_turn, most, true); };
     // First rows of A's block for which it and B's, Nr rows higher and with its margins, lie on the detector: as
     // many bands as fit side by side, up to five.
     // (inside the rows the beam lights, where it lights a part of the detector: L0, L1)
     const int L0 = acq.lit_rows[1] > acq.lit_rows[0] ? acq.lit_rows[0] : 0, L1 = acq.lit_rows[1] > acq.lit_rows[0] ? acq.lit_rows[1] : R;
-    const auto bands = [&](int Nr, int nr) {
-        const int m = 40, a0 = std::max(L0, L0 + m - Nr), a1 = std::min(L1 - nr, L1 - nr - m - Nr);
-        if (a1 < a0) return std::vector<std::int64_t>();
-        const int count = std::clamp(1 + (a1 - a0) / nr, 1, 5);
-        if (count == 1) return std::vector<std::int64_t>{(a0 + a1) / 2};
-        return whole(linspace(a0, a1, count));
-    };
+    const auto bands = [&](int Nr, int nr) { return bands_of(Nr, nr, L0, L1, 5); };
     const std::vector<std::int64_t> across = whole(linspace(13, C - W - 13, std::clamp((C - 26) / W, 1, 5)));
     const auto same_columns = [&](const StretchLayout& a, const StretchLayout& b, int scan, std::int64_t frame, std::int64_t hint, std::int64_t col, int rows_, int row_a) {
-        ViewRequest q;
-        q.scan_a = q.scan_b = scan;
-        q.stretch_a = a.index, q.stretch_b = b.index;
-        q.frame_a = frame, q.frame_hint = hint;
-        q.frames = 32, q.rows = rows_, q.cols = W;
-        q.row_a = row_a, q.col_a = q.col_b = static_cast<int>(col);
-        return q;
+        return block_request(scan, a.index, scan, b.index, frame, hint, rows_, W, row_a, static_cast<int>(col), static_cast<int>(col));
     };
     for (int k = 0; k < static_cast<int>(acq.scans.size()); ++k) {
         const ScanLayout& sc = acq.scans[static_cast<std::size_t>(k)];
-        int helix = -1;
-        for (int a = 0; a < static_cast<int>(sc.stretches.size()); ++a)
-            if (sc.stretches[static_cast<std::size_t>(a)].helix) helix = a;
+        const int helix = helix_of(sc);
         // opposite views
         if (axis_in_field(sc, C)) {
             const std::vector<std::int64_t> windows = mirrored_windows(sc.axis, C, W);
@@ -727,7 +748,7 @@ std::vector<Planned> plan(const Acquisition& acq, const PlanCounts& n) {
                 const StretchLayout& st = sc.stretches[static_cast<std::size_t>(a)];
                 const std::int64_t p_lo = st.first + 16, p_hi = st.end - N / 2 - 80;
                 if (p_hi < p_lo) continue;
-                for (const std::int64_t p : around_the_turn(p_lo, p_hi, n.max_positions)) {
+                for (const std::int64_t p : around(p_lo, p_hi, n.max_positions)) {
                     const int Nr = static_cast<int>(std::lround(st.course.rows[static_cast<std::size_t>(p + 16 + N / 2)] - st.course.rows[static_cast<std::size_t>(p + 16)]));
                     for (const std::int64_t row_a : bands(Nr, nrows))
                         for (const std::int64_t ca : windows) add("opposite", k, a, a, opposite_request(st, k, p, N, sc.axis, W, ca, nrows, static_cast<int>(row_a), acq.fan), st.helix);
@@ -780,20 +801,15 @@ std::vector<Planned> plan(const Acquisition& acq, const PlanCounts& n) {
                     const std::int64_t p_lo = std::max(sa.first, sb.first) + 16, p_hi = std::min(sa.end, sb.end) - 80;
                     if (p_hi < p_lo) continue;
                     const std::vector<std::int64_t> positions =
-                        sa.helix ? around_the_turn(p_lo, p_hi, n.pair_positions) : whole(linspace(static_cast<double>(p_lo), static_cast<double>(p_hi), n.n_pair_rest));
+                        sa.helix ? around(p_lo, p_hi, n.pair_positions) : whole(linspace(static_cast<double>(p_lo), static_cast<double>(p_hi), n.n_pair_rest));
                     for (const std::int64_t p : positions) {
                         const int Nr = static_cast<int>(std::lround(sb.course.rows[static_cast<std::size_t>(p + 16)] - sa.course.rows[static_cast<std::size_t>(p + 16)]));
                         if (std::abs(move) < 48 && std::abs(Nr) < 48) continue;  // a pattern fixed to the detector would register
                         for (const std::int64_t row_a : bands(Nr, nrows))
-                            for (const std::int64_t ca : windows) {
-                                ViewRequest q;
-                                q.scan_a = j, q.scan_b = k;
-                                q.stretch_a = sa.index, q.stretch_b = sb.index;
-                                q.frame_a = p, q.frame_hint = 0;
-                                q.frames = 32, q.rows = nrows, q.cols = W;
-                                q.row_a = static_cast<int>(row_a), q.col_a = static_cast<int>(ca), q.col_b = static_cast<int>(ca) + move;
-                                add_between("pair", j, a, k, b, q, true);
-                            }
+                            for (const std::int64_t ca : windows)
+                                add_between("pair", j, a, k, b,
+                                            block_request(j, sa.index, k, sb.index, p, 0, nrows, W, static_cast<int>(row_a), static_cast<int>(ca), static_cast<int>(ca) + move),
+                                            true);
                     }
                 }
         }
@@ -813,11 +829,7 @@ std::vector<Planned> plan_tiles(const Acquisition& acq, const Parameters& places
         const ScanLayout& B = acq.scans[static_cast<std::size_t>(k)];
         const ScanParameters& pa = places.scans[static_cast<std::size_t>(j)];
         const ScanParameters& pb = places.scans[static_cast<std::size_t>(k)];
-        int ha = -1, hb = -1;
-        for (int a = 0; a < static_cast<int>(A.stretches.size()); ++a)
-            if (A.stretches[static_cast<std::size_t>(a)].helix) ha = a;
-        for (int b = 0; b < static_cast<int>(B.stretches.size()); ++b)
-            if (B.stretches[static_cast<std::size_t>(b)].helix) hb = b;
+        const int ha = helix_of(A), hb = helix_of(B);
         if (ha < 0 || hb < 0) continue;
         const StretchLayout& sa = A.stretches[static_cast<std::size_t>(ha)];
         const StretchLayout& sb = B.stretches[static_cast<std::size_t>(hb)];
@@ -839,27 +851,8 @@ std::vector<Planned> plan_tiles(const Acquisition& acq, const Parameters& places
         const std::int64_t p_lo = sa.first + 16, p_hi = sa.end - 80;
         if (p_hi < p_lo) continue;
         // positions evenly around the turn, as the opposite views' (the angles in turn along the helix)
-        std::vector<std::int64_t> positions;
-        {
-            const double base = static_cast<double>(N) / n.tile_angles, span = static_cast<double>(p_hi - p_lo);
-            const int count = std::max(n.tile_angles, n.tile_positions - n.tile_positions % n.tile_angles);
-            for (int i = 0; i < count; ++i) {
-                const double at_angle = (i % n.tile_angles) * base;
-                double at = N * std::round((i * span / std::max(1, count - 1) - at_angle) / N) + at_angle;
-                if (at < 0) at += N;
-                if (at > span) at -= N;
-                if (at >= 0 && at <= span) positions.push_back(p_lo + static_cast<std::int64_t>(std::llround(at)));
-            }
-            std::sort(positions.begin(), positions.end());
-            positions.erase(std::unique(positions.begin(), positions.end()), positions.end());
-        }
-        const auto bands = [&](int Nr) {
-            const int m = 40, a0 = std::max(0, m - Nr), a1 = std::min(R - nrows, R - nrows - m - Nr);
-            if (a1 < a0) return std::vector<std::int64_t>();
-            const int count = std::clamp(1 + (a1 - a0) / nrows, 1, n.tile_bands);
-            if (count == 1) return std::vector<std::int64_t>{(a0 + a1) / 2};
-            return whole(linspace(a0, a1, count));
-        };
+        const std::vector<std::int64_t> positions = around_the_turn(p_lo, p_hi, N, n.tile_angles, n.tile_positions, false);
+        const auto bands = [&](int Nr) { return bands_of(Nr, nrows, 0, R, n.tile_bands); };
         const auto windows = [&](int lo, int hi) {
             if (hi < lo) return std::vector<std::int64_t>();
             const int count = std::clamp((hi - lo + 2 * W - 1) / W, 1, n.tile_windows);
@@ -880,13 +873,10 @@ std::vector<Planned> plan_tiles(const Acquisition& acq, const Parameters& places
                         for (const std::int64_t ca : windows(std::max(0, -move) + edge, std::min(C - W, C - W - move) - edge)) {
                             Planned t;
                             t.kind = "tiles", t.scan_a = j, t.scan_b = k, t.a = ha, t.b = hb, t.from_block = true;
+                            t.request = block_request(j, sa.index, k, sb.index, p, shift, nrows, W, static_cast<int>(row_a), static_cast<int>(ca),
+                                                      static_cast<int>(ca) + static_cast<int>(std::lround(pb.axis - pa.axis)));
                             ViewRequest& q = t.request;
                             q.label = t.kind;
-                            q.scan_a = j, q.scan_b = k, q.stretch_a = sa.index, q.stretch_b = sb.index;
-                            q.frame_a = p, q.frame_hint = shift;
-                            q.frames = 32, q.rows = nrows, q.cols = W;
-                            q.row_a = static_cast<int>(row_a), q.col_a = static_cast<int>(ca);
-                            q.col_b = static_cast<int>(ca) + static_cast<int>(std::lround(pb.axis - pa.axis));
                             q.sway_px = apart, q.sway_phase_deg = phase_deg;
                             q.sway_row_deg = acq.row_time * step_deg, q.sway_rows_from_middle = acq.rows_from_middle;
                             out.push_back(t);
@@ -904,15 +894,12 @@ std::vector<Planned> plan_tiles(const Acquisition& acq, const Parameters& places
                     for (const std::int64_t ca : windows(std::max(0, sum - (W - 1) - (C - W)) + edge, std::min(C - W, sum - (W - 1)) - edge)) {
                         Planned t;
                         t.kind = "tiles_opposite", t.scan_a = j, t.scan_b = k, t.a = ha, t.b = hb, t.from_block = true;
+                        // (the sway is of B's own angle, half a turn on: there it is +(d_k - d_j) . n, the same statement)
+                        t.request = block_request(j, sa.index, k, sb.index, p, shift + half, nrows, W, static_cast<int>(row_a), static_cast<int>(ca),
+                                                  static_cast<int>(std::lround(pa.axis + pb.axis)) - (W - 1) - static_cast<int>(ca));
                         ViewRequest& q = t.request;
                         q.label = t.kind;
-                        q.scan_a = j, q.scan_b = k, q.stretch_a = sa.index, q.stretch_b = sb.index;
-                        q.frame_a = p, q.frame_hint = shift + half;
                         q.angle_offset_deg = 180.0, q.mirror = true;
-                        q.frames = 32, q.rows = nrows, q.cols = W;
-                        q.row_a = static_cast<int>(row_a), q.col_a = static_cast<int>(ca);
-                        // (the sway is of B's own angle, half a turn on: there it is +(d_k - d_j) . n, the same statement)
-                        q.col_b = static_cast<int>(std::lround(pa.axis + pb.axis)) - (W - 1) - static_cast<int>(ca);
                         q.sway_px = apart, q.sway_phase_deg = phase_deg;
                         q.sway_row_deg = acq.row_time * step_deg, q.sway_rows_from_middle = acq.rows_from_middle;
                         q.frame_shear = 2 * acq.fan;
