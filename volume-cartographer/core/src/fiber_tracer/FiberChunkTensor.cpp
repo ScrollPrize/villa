@@ -30,11 +30,20 @@ struct StageTimer {
     }
 };
 
-// The box of one channel, C order; parts outside the volume read as fill.
+// The box of one channel, C order; parts outside the volume read as fill. A
+// chunk-validity binding reads 255 where the chunk is stored and 0 elsewhere.
 template<class T>
 void readChannelBox(const vc::lasagna::LasagnaChannelBinding& binding,const std::array<int,3>& originXYZ,
     const std::array<size_t,3>& dimsZYX,std::vector<T>& out)
 {
+    if(binding.chunkValidity){
+        if constexpr(std::is_same_v<T,uint8_t>){
+            vc::lasagna::readLasagnaChunkValidityBox(binding,{originXYZ[0],originXYZ[1],originXYZ[2]},
+                {int64_t(dimsZYX[2]),int64_t(dimsZYX[1]),int64_t(dimsZYX[0])},out);
+            return;
+        }
+        throw std::invalid_argument("chunk validity is a byte channel");
+    }
     vcr::Index start{originXYZ[2],originXYZ[1],originXYZ[0]};
     vcr::Index size{int64_t(dimsZYX[0]),int64_t(dimsZYX[1]),int64_t(dimsZYX[2])};
     if(binding.packed){

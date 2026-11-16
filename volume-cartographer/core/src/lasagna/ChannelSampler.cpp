@@ -8,8 +8,11 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <mutex>
+#include <shared_mutex>
 #include <stdexcept>
 #include <type_traits>
+#include <unordered_map>
 
 #include <opencv2/core.hpp>
 #include "vc_reader/array.hpp"
@@ -282,6 +285,17 @@ void readCorners(const LasagnaChannelBinding& binding,
         binding.packed ? int64_t(binding.channelIndex) : -1};
     const size_t n = lower.size() * 8;
     out.resize(n);
+    if (binding.chunkValidity) {
+        if (!binding.inventory)
+            throw std::logic_error("chunk-validity binding without a chunk inventory");
+        int64_t xyz[4];
+        for (size_t p = 0; p < n; ++p) {
+            const int64_t* zyx = coords(p, xyz);
+            if (coords.channel >= 0) ++zyx;
+            out[p] = binding.inventory->storedAt(zyx[2], zyx[1], zyx[0]) ? T(255) : T(0);
+        }
+        return;
+    }
     if (binding.float32) {
         std::vector<float> values(n);
         binding.array->sample_nearest_coordinates(coords, n, reinterpret_cast<uint8_t*>(values.data()));
@@ -399,6 +413,122 @@ LasagnaChannelBinding bindLasagnaChannel(
     return binding;
 }
 
+struct LasagnaChunkInventory::State {
+    std::shared_ptr<vcr::Array> array;
+    vcr::Index prefix;  // packed arrays: the channel chunk index
+    std::array<int64_t, 3> gridXYZ{1, 1, 1};
+    std::shared_mutex mutex;
+    std::unordered_map<uint64_t, bool> stored;
+};
+
+LasagnaChunkInventory::LasagnaChunkInventory(std::shared_ptr<vcr::Array> array, size_t channelIndex)
+    : state_(std::make_unique<State>())
+{
+    if (!array)
+        throw std::invalid_argument("chunk inventory requires an array");
+    const auto& spec = array->spec();
+    const size_t rank = spec.shape.size();
+    if (rank != 3 && rank != 4)
+        throw std::invalid_argument("chunk inventory requires a (Z,Y,X) or (C,Z,Y,X) array");
+    const size_t first = rank - 3;
+    if (rank == 4) {
+        if (spec.chunks[0] <= 0)
+            throw std::invalid_argument("packed array has an empty channel chunk");
+        state_->prefix = {int64_t(channelIndex) / spec.chunks[0]};
+    }
+    const auto& grid = array->chunk_grid();
+    for (size_t axis = 0; axis < 3; ++axis) {
+        chunkXYZ_[2 - axis] = spec.chunks[first + axis];
+        state_->gridXYZ[2 - axis] = grid[first + axis];
+    }
+    state_->array = std::move(array);
+}
+
+LasagnaChunkInventory::~LasagnaChunkInventory() = default;
+
+bool LasagnaChunkInventory::storedChunk(int64_t cx, int64_t cy, int64_t cz)
+{
+    auto& s = *state_;
+    if (cx < 0 || cy < 0 || cz < 0 || cx >= s.gridXYZ[0] || cy >= s.gridXYZ[1] || cz >= s.gridXYZ[2])
+        return false;
+    const uint64_t key = (uint64_t(cz) << 42) | (uint64_t(cy) << 21) | uint64_t(cx);
+    {
+        std::shared_lock lock(s.mutex);
+        if (const auto it = s.stored.find(key); it != s.stored.end())
+            return it->second;
+    }
+    vcr::Index index = s.prefix;
+    index.insert(index.end(), {cz, cy, cx});
+    // A chunk the caches and the source do not hold reads as fill: not stored.
+    const bool stored = bool(s.array->chunk(index));
+    std::unique_lock lock(s.mutex);
+    s.stored.emplace(key, stored);
+    return stored;
+}
+
+bool LasagnaChunkInventory::storedAt(int64_t x, int64_t y, int64_t z)
+{
+    if (x < 0 || y < 0 || z < 0)
+        return false;
+    return storedChunk(x / chunkXYZ_[0], y / chunkXYZ_[1], z / chunkXYZ_[2]);
+}
+
+LasagnaChannelBinding bindLasagnaValidity(
+    const LasagnaDatasetManifest& manifest,
+    const LasagnaChannelBinding& lattice,
+    LasagnaGroupArrays& arrays)
+{
+    if (manifest.validityChannel.empty())
+        throw std::runtime_error("Lasagna dataset declares no validity channel");
+    // A validity channel may lie on its own grid (Lasagna grad_mag at another
+    // scaledown); callers that need one grid check sameLasagnaSamplingGrid.
+    if (!manifest.validityByChunks())
+        return bindLasagnaChannel(manifest, manifest.validityChannel, arrays);
+    LasagnaChannelBinding binding = lattice;
+    binding.cuda = nullptr;
+    binding.float32 = false;
+    binding.chunkValidity = true;
+    binding.inventory = std::make_shared<LasagnaChunkInventory>(lattice.array, lattice.channelIndex);
+    return binding;
+}
+
+void readLasagnaChunkValidityBox(
+    const LasagnaChannelBinding& binding,
+    const std::array<int64_t, 3>& originXYZ,
+    const std::array<int64_t, 3>& shapeXYZ,
+    std::vector<uint8_t>& out)
+{
+    if (!binding.chunkValidity || !binding.inventory)
+        throw std::invalid_argument("chunk validity box requires a chunk-validity binding");
+    for (int axis = 0; axis < 3; ++axis)
+        if (shapeXYZ[axis] <= 0)
+            throw std::invalid_argument("chunk validity box must have positive shape");
+    const size_t voxels = size_t(shapeXYZ[0]) * size_t(shapeXYZ[1]) * size_t(shapeXYZ[2]);
+    out.assign(voxels, uint8_t{0});
+    const auto& chunk = binding.inventory->chunkShapeXYZ();
+    const std::array<int64_t, 3> last{int64_t(binding.shapeZYX[2]), int64_t(binding.shapeZYX[1]), int64_t(binding.shapeZYX[0])};
+    // Fill chunk by chunk: one inventory query per chunk the box touches.
+    const auto floorDiv = [](int64_t v, int64_t c) { return v >= 0 ? v / c : -((-v + c - 1) / c); };
+    for (int64_t cz = floorDiv(originXYZ[2], chunk[2]); cz * chunk[2] < originXYZ[2] + shapeXYZ[2]; ++cz)
+        for (int64_t cy = floorDiv(originXYZ[1], chunk[1]); cy * chunk[1] < originXYZ[1] + shapeXYZ[1]; ++cy)
+            for (int64_t cx = floorDiv(originXYZ[0], chunk[0]); cx * chunk[0] < originXYZ[0] + shapeXYZ[0]; ++cx) {
+                if (cx < 0 || cy < 0 || cz < 0 || !binding.inventory->storedChunk(cx, cy, cz))
+                    continue;
+                const int64_t x0 = std::max(originXYZ[0], cx * chunk[0]);
+                const int64_t x1 = std::min({originXYZ[0] + shapeXYZ[0], (cx + 1) * chunk[0], last[0]});
+                const int64_t y0 = std::max(originXYZ[1], cy * chunk[1]);
+                const int64_t y1 = std::min({originXYZ[1] + shapeXYZ[1], (cy + 1) * chunk[1], last[1]});
+                const int64_t z0 = std::max(originXYZ[2], cz * chunk[2]);
+                const int64_t z1 = std::min({originXYZ[2] + shapeXYZ[2], (cz + 1) * chunk[2], last[2]});
+                for (int64_t z = z0; z < z1; ++z)
+                    for (int64_t y = y0; y < y1; ++y) {
+                        if (x1 <= x0) continue;
+                        auto* row = out.data() + (size_t(z - originXYZ[2]) * size_t(shapeXYZ[1]) + size_t(y - originXYZ[1])) * size_t(shapeXYZ[0]);
+                        std::fill(row + (x0 - originXYZ[0]), row + (x1 - originXYZ[0]), uint8_t{255});
+                    }
+            }
+}
+
 std::vector<LasagnaChannelBinding> bindLasagnaEmbeddingChannels(
     const LasagnaDatasetManifest& manifest, const LasagnaChannelBinding& lattice,
     LasagnaGroupArrays& arrays)
@@ -467,11 +597,11 @@ void sampleLasagnaChannelCornerBatch(
     for (size_t b = 0; b < bindings.size(); ++b) {
         if (read[b]) continue;
         const auto& binding = *bindings[b];
-        if (binding.packed && !binding.cuda) {
+        if (binding.packed && !binding.cuda && !binding.chunkValidity) {
             std::vector<size_t> group;
             std::vector<int64_t> channels;
             for (size_t j = b; j < bindings.size(); ++j) {
-                if (!read[j] && !bindings[j]->cuda && bindings[j]->array == binding.array) {
+                if (!read[j] && !bindings[j]->cuda && !bindings[j]->chunkValidity && bindings[j]->array == binding.array) {
                     group.push_back(j);
                     channels.push_back(int64_t(bindings[j]->channelIndex));
                     read[j] = true;
@@ -528,6 +658,12 @@ void readLasagnaChannelBox(
     std::vector<float> floats;
     for (size_t b = 0; b < bindings.size(); ++b) {
         const auto& binding = *bindings[b];
+        if (binding.chunkValidity) {
+            readLasagnaChunkValidityBox(binding, originXYZ, shapeXYZ, bytes);
+            for (size_t i = 0; i < voxels; ++i)
+                interleaved[i * bindings.size() + b] = bytes[i];
+            continue;
+        }
         vcr::Index start{originXYZ[2], originXYZ[1], originXYZ[0]};
         vcr::Index size{shapeXYZ[2], shapeXYZ[1], shapeXYZ[0]};
         if (binding.packed) {
@@ -687,6 +823,11 @@ std::optional<double> sampleLasagnaChannel(
     const cv::Vec3d point = volumePoint / binding.spacing;
     if (!insideGrid(binding, point[0], point[1], point[2]))
         return std::nullopt;
+    if (binding.chunkValidity) {
+        LasagnaCubes cubes;
+        readLasagnaCubes(binding, std::span(&volumePoint, 1), cubes);
+        return vcr::sampling::trilinear(cubes.values[0], cubes.fractionsXYZ[0]);
+    }
     double coordinates[4];
     double* zyx = coordinates;
     if (binding.packed) *zyx++ = double(binding.channelIndex);

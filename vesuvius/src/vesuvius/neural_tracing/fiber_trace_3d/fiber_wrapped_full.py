@@ -101,12 +101,12 @@ def prepare_sources(config):
     if lasagna['base_shape_zyx']!=field['base_shape_zyx']:
         raise ValueError('Normal sources have different base shapes')
     channels={c for g in field['groups'].values() for c in g['channels']}
-    if not {'sheet_nx','sheet_ny','sheet_grad_mag'}<=channels:
+    if not {'sheet_nx','sheet_ny'}<=channels:
         raise ValueError('Compound prediction lacks sheet normal channels')
     report=dict(published_run=provenance.get('run_uuid'),base_shape_zyx=lasagna['base_shape_zyx'],
         lasagna_manifest_sha256=sha256_file(metadata/published['manifest']),
         compound_manifest_sha256=sha256_file(compound/'.zattrs'),
-        winding_source='published Lasagna in both variants; compound sheet_grad_mag is validity only',
+        winding_source='published Lasagna in both variants; compound sheet normals carry no winding density',
         lasagna_streamed=True)
     atomic_write(root/'sources.json',report,durable=False)
     print('SOURCES '+json.dumps(report),flush=True)
