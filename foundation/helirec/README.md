@@ -1546,6 +1546,13 @@ no time (7.5 s per 32 slices against 7.3–8.4 s); with Paganin and unsharp a sl
 rows; in the slice the divergence is applied by FBP since `beam_divergence`; views a turn apart are backprojected each at its own angle since `angle_interp=views`, section 34) is listed
 in `development_notes/calibration/05_experiments.md`, section 33.
 
+## Denoising the slices (`networks/denoising`)
+
+A 3D U-Net trained on pairs of reconstructions with independent noise (Noise2Inverse; the pairs come from
+`noise_split`) takes the noise off the reconstructed slices, after the reconstruction. It is not in the package (it
+needs PyTorch) and its trained weights are not in the repository. Training pairs, training, and a whole denoised
+volume under a mask: [`networks/denoising/README.md`](networks/denoising/README.md).
+
 ## Tests
 
 `tests/test_geometry_solve.py` and the native `geometry_solve` test check the model for any number of scans against
