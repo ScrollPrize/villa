@@ -692,6 +692,13 @@ foreach(_dir IN LISTS _vc_install_dirs)
                  PROPERTY BUILDSYSTEM_TARGETS)
     foreach(_tgt IN LISTS _dir_targets)
         get_target_property(_tgt_type ${_tgt} TYPE)
+        # EXCLUDE_FROM_ALL targets (developer benchmarks, ad-hoc tests) are not
+        # built by the default build, so installing them would make cpack fail
+        # on a missing file.
+        get_target_property(_tgt_excluded ${_tgt} EXCLUDE_FROM_ALL)
+        if(_tgt_excluded)
+            continue()
+        endif()
         if(_tgt_type STREQUAL "EXECUTABLE" OR _tgt_type STREQUAL "SHARED_LIBRARY")
             if(WIN32)
                 # Register each binary in a dependency set so the packaging
