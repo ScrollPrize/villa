@@ -1,5 +1,6 @@
 import colorsys
 import dbm
+import hashlib
 import importlib
 import itertools
 import json
@@ -11,6 +12,8 @@ import shutil
 import struct
 from pathlib import Path
 import tempfile
+import uuid
+import zipfile
 
 import kornia
 import numpy as np
@@ -35,6 +38,24 @@ from sample_spiral import (
 
 
 TRACK_CROSSING_CACHE_VERSION = 1
+# The exact-crossing kernel (vc_spiral.track_crossings, the implementation the
+# object store's track-track detector shares) and the parameters it runs
+# with. A change to either changes the crossings a fit computes.
+TRACK_CROSSING_ALGORITHM = 'vc_spiral.track_crossings/1'
+TRACK_CROSSING_PARAMETERS = {
+    'angle_degrees': 30.0,
+    'tangent_radius_voxels': 12.0,
+    'cluster_local_index_radius': 4,
+}
+# The crossing CSR's arrays, in their stored order and dtypes.
+CROSSING_CSR_ARRAYS = (
+    ('source_ids', '<u8'), ('offsets', '<i8'), ('partners', '<i4'),
+    ('self_local', '<i4'), ('partner_local', '<i4'),
+    ('positions', '<f8'), ('clearances', '<f8'),
+)
+# What reading a damaged or foreign crossing CSR file raises: a cache miss.
+CROSSING_CSR_FILE_ERRORS = (
+    OSError, EOFError, KeyError, TypeError, ValueError, zipfile.BadZipFile)
 TRACK_CROSSING_CACHE_SUFFIX = '.crossings.npz'
 TRACK_STORE_SUFFIX = '.vctracks'
 TRACK_STORE_VERSION = 1
@@ -1572,6 +1593,57 @@ def _validate_crossing_partner_csr(csr, require_sorted_source_ids=False):
         raise ValueError('crossing cache contains non-finite geometry')
 
 
+def crossing_csr_sha256(csr):
+    """SHA-256 of a crossing CSR in canonical encoding: its arrays in
+    CROSSING_CSR_ARRAYS order, each as its name, length and little-endian
+    bytes of the fixed dtype."""
+    digest = hashlib.sha256()
+    for name, dtype in CROSSING_CSR_ARRAYS:
+        values = np.ascontiguousarray(csr[name], dtype=dtype)
+        digest.update(f'{name}:{values.size}\n'.encode())
+        digest.update(values.data)
+    return digest.hexdigest()
+
+
+def write_crossing_csr_file(destination, csr, metadata):
+    """Atomically write a crossing CSR and its JSON ``metadata`` as an npz:
+    a uniquely named temporary beside ``destination``, then a rename, so
+    concurrent writers never expose a partial file."""
+    destination = Path(destination)
+    temporary = destination.with_name(
+        f'{destination.name}.tmp-{os.getpid()}-{uuid.uuid4().hex}')
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with temporary.open('xb') as stream:
+            np.savez(
+                stream,
+                metadata=np.asarray(json.dumps(metadata, sort_keys=True)),
+                **{name: np.asarray(csr[name], dtype=dtype)
+                   for name, dtype in CROSSING_CSR_ARRAYS})
+        os.replace(temporary, destination)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+    return destination
+
+
+def read_crossing_csr_file(path):
+    """``(metadata, csr)`` of a file write_crossing_csr_file wrote. Raises
+    one of CROSSING_CSR_FILE_ERRORS when it cannot be read or does not hold
+    the arrays in their dtypes."""
+    with np.load(path, allow_pickle=False) as stored:
+        metadata = json.loads(str(stored['metadata'].item()))
+        csr = {name: stored[name] for name, _ in CROSSING_CSR_ARRAYS}
+    if not isinstance(metadata, dict):
+        raise ValueError('crossing cache metadata is not an object')
+    for name, dtype in CROSSING_CSR_ARRAYS:
+        if csr[name].dtype != np.dtype(dtype):
+            raise ValueError(f'crossing cache {name} has dtype {csr[name].dtype}')
+    return metadata, csr
+
+
 def write_track_crossing_cache(
         path, csr, destination=None, source_signature=None,
         z_lo=None, z_hi=None):
@@ -1585,34 +1657,10 @@ def write_track_crossing_cache(
         'version': TRACK_CROSSING_CACHE_VERSION,
         'db_signature': [list(item) for item in signature],
         'db_digest': _tracks_db_digest(path, signature),
-        'angle_degrees': 30.0,
-        'tangent_radius_voxels': 12.0,
-        'cluster_local_index_radius': 4,
+        **TRACK_CROSSING_PARAMETERS,
         'z_range': [z_lo, z_hi],
     }
-    temporary = destination.with_name(
-        destination.name + f'.tmp-{os.getpid()}')
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        with temporary.open('wb') as stream:
-            np.savez(
-                stream,
-                metadata=np.asarray(json.dumps(metadata, sort_keys=True)),
-                source_ids=np.asarray(csr['source_ids'], dtype=np.uint64),
-                offsets=np.asarray(csr['offsets'], dtype=np.int64),
-                partners=np.asarray(csr['partners'], dtype=np.int32),
-                self_local=np.asarray(csr['self_local'], dtype=np.int32),
-                partner_local=np.asarray(csr['partner_local'], dtype=np.int32),
-                positions=np.asarray(csr['positions'], dtype=np.float64),
-                clearances=np.asarray(csr['clearances'], dtype=np.float64),
-            )
-        os.replace(temporary, destination)
-    finally:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
-    return destination
+    return write_crossing_csr_file(destination, csr, metadata)
 
 
 def load_track_crossing_cache(path, warn=True, expected_z_range=None):
@@ -1626,30 +1674,23 @@ def load_track_crossing_cache(path, warn=True, expected_z_range=None):
     if not cache_path.is_file():
         return None
     try:
-        with np.load(cache_path, allow_pickle=False) as stored:
-            metadata = json.loads(str(stored['metadata'].item()))
-            if metadata.get('version') != TRACK_CROSSING_CACHE_VERSION:
-                raise ValueError(
-                    f"unsupported version {metadata.get('version')!r}")
-            expected_signature = [list(item) for item in _tracks_db_signature(path)]
-            stored_signature = metadata.get('db_signature')
-            if not (_db_signatures_match(stored_signature, expected_signature)
-                    or _db_contents_match(stored_signature, metadata.get('db_digest'),
-                                          path, expected_signature)):
-                raise ValueError('tracks DBM has changed since the cache was built')
-            if (expected_z_range is not None
-                    and metadata.get('z_range', [None, None])
-                    != list(expected_z_range)):
-                raise ValueError(
-                    'crossing cache was built for a different z range')
-            csr = {
-                name: stored[name]
-                for name in (
-                    'source_ids', 'offsets', 'partners', 'self_local',
-                    'partner_local', 'positions', 'clearances')
-            }
+        metadata, csr = read_crossing_csr_file(cache_path)
+        if metadata.get('version') != TRACK_CROSSING_CACHE_VERSION:
+            raise ValueError(
+                f"unsupported version {metadata.get('version')!r}")
+        expected_signature = [list(item) for item in _tracks_db_signature(path)]
+        stored_signature = metadata.get('db_signature')
+        if not (_db_signatures_match(stored_signature, expected_signature)
+                or _db_contents_match(stored_signature, metadata.get('db_digest'),
+                                      path, expected_signature)):
+            raise ValueError('tracks DBM has changed since the cache was built')
+        if (expected_z_range is not None
+                and metadata.get('z_range', [None, None])
+                != list(expected_z_range)):
+            raise ValueError(
+                'crossing cache was built for a different z range')
         _validate_crossing_partner_csr(csr, require_sorted_source_ids=True)
-    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+    except CROSSING_CSR_FILE_ERRORS as error:
         if warn:
             print(f'WARNING: ignoring invalid track crossing cache '
                   f'{cache_path}: {error}')

@@ -7,7 +7,7 @@ the VC3D Spiral workspace; `fit_spiral.py` is the underlying fitter.
 ## Running the object-store workflow
 
 Use VC3D and the Spiral service from the same checkout: the store-location
-protocol is API **47**. Update the existing Spiral environment with `uv sync`
+protocol is API **48**. Update the existing Spiral environment with `uv sync`
 from this directory when deploying this checkout (native prerequisites must
 already be installed). This builds the Python bindings, not the standalone
 `vc_object_ingest`, `vc_object_server` and `vc_object_convert` tools; use
@@ -65,9 +65,11 @@ another host that VC3D should edit against needs its store served by
 `vc_object_server` and bound by endpoint; see **Object store, positions and
 input updates**.
 
-Startup normally writes refreshed relationships, including track crossings.
-`object_store_refresh_links: false` consumes existing relationships instead;
-there is no fallback crossing scan in the fitter. Track selection uses
+Startup normally writes refreshed relationships.
+`object_store_refresh_links: false` consumes existing relationships instead.
+Track crossings are no relationships of the fit: it computes them itself from
+the selected tracks' stored points (see **Object-store inputs**), whatever
+`object_store_refresh_links` says. Track selection uses
 `object_store_track_uuids` / `object_store_track_tags`, like the other kinds.
 Remove the retired `track_scale_factor` config setting; each stored track
 now declares its frame. Track databases are never input paths.
@@ -310,8 +312,9 @@ Migrating a dataset directory: write a manifest beside it naming its
 `fit_spiral.py` reads patches, fibers, point collections (PCLs) and tracks,
 and the relationships between them, from a `vc_object_store` database
 (`object_store_inputs.py`). It never reads patch directories, fiber JSONs,
-PCL documents or track databases, and never links points to patches or finds
-track crossings itself: the store's detectors do. The other inputs (umbilicus,
+PCL documents or track databases, and never links points to patches itself:
+the store's detectors do. Track crossings are the exception: the fit computes
+them from the selected tracks. The other inputs (umbilicus,
 lasagna normal/gradient stores, fiber directions, winding inference) are
 named by the input manifest (`--inputs`; see "Input manifest").
 
@@ -390,9 +393,10 @@ override that identity. The service keeps its `spiral-service@<host>` default.
 At startup rank 0 resolves the selection (`object_store_{patch,pcl,fiber,track}_{uuids,tags}`;
 unset selects every active object, an empty list none; `input_use_*` toggles
 off select none), validates every selected object's frame, then refreshes the
-PCL-patch, fiber-patch, patch-overlap and track-crossing links as
+PCL-patch, fiber-patch and patch-overlap links as
 `--object-store-author`,
-writing them back to the store. Detectors whose object kinds are not all
+writing them back to the store. Tracks are not linked: the store's
+`track-track` detector is not run and no `crossing` relationship is written. Detectors whose object kinds are not all
 selected are skipped. `input_use_patch_overlaps: false` skips the
 patch-overlap detector and adds no overlap pairs to the fit (a rebuild
 setting). The refresh is one `link_objects` request of the store: every
@@ -406,8 +410,12 @@ links' own commit (two concurrent refreshes conflict): the position, the fit
 volume, the link parameters, normal source and detector versions, and the
 selection. The next refresh skips the detectors when the marker's inputs
 match, the selection is the same or smaller, and nothing since its position
-touched a selected object, a detector relationship (point-surface,
-same-surface, crossing) or a volume registration. A service input update
+touched a selected surface, point collection or fiber, a detector relationship
+(point-surface, same-surface) or a volume registration. Changed tracks and
+live `crossing` relationships do not relink (no detector reads them); a
+deleted relationship, whose kind the store no longer tells, does. A marker
+written before API 48 (with a track selection) is replaced by one full
+refresh. A service input update
 links only objects added since (pairs with a new object, partners found by
 stored bounds); those links are approximate (an existing PCL keeps its old
 surface link alongside one to a new surface), and the next startup refreshes
@@ -438,12 +446,55 @@ patch grids, PCL points by stable ID with their `wind_a`, fibers trimmed and
 decimated with every patch contact and branch endpoint kept, branch links,
 patch overlaps as same-surface point pairs (`pcl_patch_overlap_*`, sampling
 group `patch_overlaps`), and the tracks lying entirely inside the z window
-with the crossing CSR of their `crossing` relationships, from which the fit
-builds its track crossing graph. Track-surface relationships are not used. Attachments on patch quads the losses do not sample
+with the crossing CSR the fit computes from every selected track, from which it
+builds its track crossing graph (see **Track crossings** below). No
+relationship of a track is read: `crossing` and track-surface relationships
+are not used. Attachments on patch quads the losses do not sample
 are dropped and reported. The ranks' input digests must agree. The log prints
 the selection, consumed relationships and constraint counts; `python
 object_store_inputs.py dataset.vcobj --z-begin Z0 --z-end Z1` prints the same
 report without training.
+
+**Track crossings.** A fit's crossings are a function of its selected track
+revisions alone: exact shared voxels of opposite-family tracks, found with the
+native kernel `vc_spiral.track_crossings` (required for store tracks) and its
+fixed parameters (30 degrees, tangent radius 12 voxels, cluster radius 4 point
+indices, one representative per pair), the implementation the store's
+`track-track` detector shares. Tracks pair only within their dataset, in
+numeric `external_key` order; the dataset of a track (its owning store's
+directory / its `dataset_ref`, resolved), the grouping, the order and their
+checks are the store's, shared with that detector (`selected_inputs`'
+`track_datasets`, `vc_object_store.group_track_datasets`), so two spellings of
+one path are one dataset and one file name beside two source stores is two. An
+`external_key` that is no canonical decimal source ID
+or repeats within its dataset, a family other than `horizontal`, `vertical` or
+blank (blank: no crossings), coordinates outside `[0, 2^20)` and a dataset
+whose tracks declare different frame scales are input errors; nothing is
+dropped silently. Crossings are computed automatically at startup, whatever the
+fit's crossing limits, and cached under the fit's cache
+directory as `track_crossings/v2/<key>.vcobj`, keyed by the track revisions
+(not by the store's commit, the fit level or a frame scale), so the next fit of
+the same tracks loads them. That file is itself a small object store, local to
+the cache and never served: a sealed, history-off collection with one
+`crossing` edge per pair of crossing tracks and one row of the
+`ext_track_crossings` table (point index and arclength on each track, and the
+clearance, in stored voxels), written with the store's sharded streaming
+importer and read back as columns (`vc_object_store/docs/extensions.md`). It
+names the tracks by UUID and records the store position they were read at; it
+holds no tracks. A cache that cannot be read is recomputed and replaced, and
+one that cannot be written (a read-only cache directory, a filesystem without
+hard links) only costs the computation again: neither fails a fit. Processes
+that miss one cache together (the ranks of a distributed fit) take its
+`.lock`: one computes, the others wait and load its store. A crashed write can
+leave `.building-*` or `.compact-*` files beside it, which are safe to delete.
+The input manifest records the crossings as
+`derived_inputs.track_crossing` (`source`, `algorithm`, `parameters`, `count`,
+`sha256`), which a resume and an input update compare. `crossing`
+relationships a store holds, and approvals, rejections or edits of them, no
+longer affect fitting, and `object_store_approved_links_only` does not apply
+to crossings. A checkpoint written before API 48, whose manifest lists its
+crossings as relationships, resumes only with
+`object_store_allow_changed_inputs`.
 
 The inputs are a **position** of the store, `{store, generation,
 commit_sequence}` (its UUID, its history generation and one of its commits,
@@ -536,8 +587,8 @@ incremental relinking, the same links, pins, service binding and commits
 through a `vc_object_server` endpoint (`test_object_store_hosted.py` runs a
 server subprocess when `VC_OBJECT_SERVER` names the binary and is skipped
 otherwise), tracks and
-their crossings (equal to the ones Spiral's own exact-crossing builder
-finds), and the runtime constraints against
+the crossings computed from them (equal to the links the store's `track-track`
+detector publishes for the same tracks), and the runtime constraints against
 `tests/data/object_store_reference.json`, which the removed file loader
 produced from the same fixture. An opt-in startup test refreshes and
 materializes a real store (give it a scratch copy: it writes links):
@@ -1580,9 +1631,13 @@ bypassing DBM and pickle decoding.
 
 ## Caching exact track crossings
 
-A fit takes its track crossings from the object store (its link refresh runs
-the store's track-crossing detector, which uses the same exact-crossing
-kernel). `grow_track_graph.py` instead reads them from a CSR sidecar beside
+A fit computes its track crossings automatically from the tracks it selects
+in the object store, with the same exact-crossing kernel, and caches them
+under its cache directory (`track_crossings/v2/<key>.vcobj`; see **Track
+crossings** under the object-store inputs). It does not read the store's
+`crossing` relationships, so approving, rejecting or editing stored crossings
+no longer affects fitting, and no build step is needed for it.
+`grow_track_graph.py` instead reads crossings from a CSR sidecar beside
 the DBM; build it once:
 
 ```sh

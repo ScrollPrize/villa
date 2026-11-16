@@ -153,9 +153,10 @@ public:
     {
         return attachment_->relationshipsAt(versions);
     }
-    SelectedInputs selectedInputs(const std::vector<ObjectVersion>& versions, const StoreStatus& position) const override
+    SelectedInputs selectedInputs(const std::vector<ObjectVersion>& versions, const StoreStatus& position,
+        const std::optional<std::vector<ObjectVersion>>& relationshipVersions = std::nullopt) const override
     {
-        return attachment_->client().selectedInputs(versions, position);
+        return attachment_->client().selectedInputs(versions, position, relationshipVersions);
     }
     std::vector<ObjectVersion> versionsAt(const ObjectVersion& anchor) const override
     { return attachment_->client().versionsAt(anchor); }
