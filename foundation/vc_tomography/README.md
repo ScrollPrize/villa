@@ -210,6 +210,9 @@ on its own from Python (`vc_tomography._core`, re-exported in `vc_tomography`) o
     scale is that of the exact FBP (peak values of small features within 0.1 % at any radius,
     `tests/test_tomo.py`). The closed form inherited from tomopy overestimated them by 12 % at the centre, rising
     to 44 % at 0.59 of the padded half width, and `init=gridrec` carried that into SIRT / MLEM.
+  * CUDA gridrec is not bit-reproducible: its gridding scatters into the Fourier grid with float `atomicAdd`, whose
+    order of addition varies from run to run, so repeated runs (and `init=gridrec`) differ in the last bits. The CPU
+    gridrec is deterministic.
   * `init=fbp`: the iterations start from the exact FBP of the slice, which the pipeline makes with what
     `backprojector=fbp` uses: a copy of the slice's measured rows is mended (`mend_threshold`) and balanced, filtered
     with the plain ramp and backprojected by the exact backprojector (`bp_interp`, `bp_oversample`) on the whole

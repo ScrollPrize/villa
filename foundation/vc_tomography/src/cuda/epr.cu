@@ -48,7 +48,7 @@ __global__ void residual_kernel(const float* __restrict__ det, const float* __re
 }
 
 __global__ void update_kernel(float* __restrict__ I, const float* __restrict__ r, size_t total, float relax, float eps) {
-    VC_TOMOGRAPHY_GRID_STRIDE(i, total) I[i] = epr_core::floor_eps(I[i] + relax * r[i], eps);
+    VC_TOMOGRAPHY_GRID_STRIDE(i, total) I[i] = epr_core::update(I[i], r[i], relax, eps);
 }
 
 }  // namespace

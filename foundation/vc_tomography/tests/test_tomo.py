@@ -208,6 +208,16 @@ def test_sf_projector(device):
     np.testing.assert_allclose(ones[10:55, 10:55], len(ANG), rtol=1e-5)
 
 
+@cuda_only
+def test_sf_backprojection_cuda_matches_cpu():
+    """the SF backprojector is spelled in unfused operations and adds the angles in the CPU's order: the same bits"""
+    rng = np.random.default_rng(1)
+    y = rng.random((len(ANG), ND), dtype=np.float32)
+    for rot in (ROT, ROT + 0.3):
+        np.testing.assert_array_equal(_core.chord_backproject(y, ANG, N, rot, device="cuda", projector="sf"),
+                                      _core.chord_backproject(y, ANG, N, rot, device="cpu", projector="sf"))
+
+
 def test_sf_cells_off_the_image(device):
     # a detector much wider than the image: cells whose boundaries miss it take no step and are exactly 0
     n, nd, rot = 33, 160, 79.5

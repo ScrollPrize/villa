@@ -117,10 +117,7 @@ __global__ void fill_from_turns_kernel(float* R, const float* W, size_t plane, i
 __device__ inline float mapped_dev(const float* row, int c, const int2* osrc, const float2* ow) {
     const int2 s = osrc[c];
     const float2 w = ow[c];
-    float v = 0.f;
-    if (s.x >= 0) v += w.x * row[s.x];
-    if (s.y >= 0) v += w.y * row[s.y];
-    return v;
+    return rebalance_core::mapped(row, s.x, s.y, w.x, w.y);
 }
 
 // Wsrc: (n_proj, n_cols) row `row` of W; writes the balanced weights into W
@@ -136,10 +133,9 @@ __global__ void rebalance_row_kernel(const float* __restrict__ Wsrc, float* W, s
         const DevContrib m = table[i * kMaxContrib + t];
         const float* r0 = Wsrc + static_cast<size_t>(m.k0) * n_cols;
         const float* r1 = (m.flags & 1) ? Wsrc + static_cast<size_t>(m.k1) * n_cols : nullptr;
-        const float beta = 1.0f - m.alpha, alpha = m.alpha;
-        if (!(m.flags & 2)) B += (m.flags & 1) ? beta * r0[c] + alpha * r1[c] : r0[c];
-        else B += (m.flags & 1) ? beta * mapped_dev(r0, c, osrc, ow) + alpha * mapped_dev(r1, c, osrc, ow)
-                                : mapped_dev(r0, c, osrc, ow);
+        using rebalance_core::between;
+        if (!(m.flags & 2)) B = __fadd_rn(B, (m.flags & 1) ? between(m.alpha, r0[c], r1[c]) : r0[c]);
+        else B = __fadd_rn(B, (m.flags & 1) ? between(m.alpha, mapped_dev(r0, c, osrc, ow), mapped_dev(r1, c, osrc, ow)) : mapped_dev(r0, c, osrc, ow));
     }
     W[i * plane + row_off + c] = wi == 0.0f ? 0.0f : wi / B;
 }

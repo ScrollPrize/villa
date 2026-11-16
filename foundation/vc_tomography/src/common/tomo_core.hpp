@@ -80,7 +80,8 @@ HR_HD float chord_k(float tau, const AngleC& k) {
     return (k.edge - tau) * k.inv_hilo;
 }  // (lo ~ 0: half = edge, so the slope branch is never taken)
 
-HR_HD bool in_disk(float X, float Y, const Geom& g) { return g.R >= 2.f * g.N || X * X + Y * Y <= g.R * g.R; }
+// (unfused: the same pixels on both backends)
+HR_HD bool in_disk(float X, float Y, const Geom& g) { return g.R >= 2.f * g.N || hd::add(hd::mul(X, X), hd::mul(Y, Y)) <= hd::mul(g.R, g.R); }
 
 // [lo, hi) of the major-axis indices whose pixels ray t0 may cross inside the box and the disk (empty: lo >= hi)
 HR_HD void ray_span(const Geom& g, const AngleC& k, float t0, int& lo, int& hi) {
@@ -338,24 +339,29 @@ HR_HD float chord_pixel_weight(const Geom& g, const AngleC& k, int d, float X, f
 // c1 = F(1/2 - fr) and 1 - t2 = F(3/2 - fr) (an upper tail); tails are hih (edge - distance)^2, and
 // F(s) = 1/2 + s / hi -+ hih (|s| - half)^2 beyond the plateau (|s| <= 1/2 <= edge).
 // -> weights t0, w0, w1, t2 of cells d - 1 .. d + 2
+// The SF backprojection is spelled in hd:: operations (no contraction), so the CPU and CUDA give the same bits.
 HR_HD void sf_pixel_weights(float fr, const AngleC& k, float& t0, float& w0, float& w1, float& t2) {
-    const float e5 = k.edge - 0.5f;
-    const float a0 = fmaxf(e5 - fr, 0.f), a2 = fmaxf(e5 + (fr - 1.f), 0.f);
-    t0 = a0 * a0 * k.hih;
-    t2 = a2 * a2 * k.hih;
-    const float s = 0.5f - fr, m = fmaxf(fabsf(s) - k.half, 0.f);
-    const float q = m * m * k.hih;
-    const float c1 = 0.5f + s * k.inv_hi - (s < 0.f ? -q : q);
-    w0 = c1 - t0;
-    w1 = (1.f - t2) - c1;
+    using namespace hd;
+    const float e5 = sub(k.edge, 0.5f);
+    const float a0 = fmaxf(sub(e5, fr), 0.f), a2 = fmaxf(add(e5, sub(fr, 1.f)), 0.f);
+    t0 = mul(mul(a0, a0), k.hih);
+    t2 = mul(mul(a2, a2), k.hih);
+    const float s = sub(0.5f, fr), m = fmaxf(sub(fabsf(s), k.half), 0.f);
+    const float q = mul(mul(m, m), k.hih);
+    const float c1 = sub(add(0.5f, mul(s, k.inv_hi)), s < 0.f ? -q : q);
+    w0 = sub(c1, t0);
+    w1 = sub(sub(1.f, t2), c1);
 }
+// the detector position of the pixel centre (X, Y) at the angle k
+HR_HD float detector_u(float X, float Y, const AngleC& k, float rot) { return hd::add(hd::add(hd::mul(X, k.ca), hd::mul(Y, k.sa)), rot); }
 // u0 in [1, n_det - 2): the four cells are on the detector
 HR_HD float sf_backproject_inner(const float* yrow, float u0, const AngleC& k, float acc) {
     const float f = floorf(u0);
     float t0, w0, w1, t2;
-    sf_pixel_weights(u0 - f, k, t0, w0, w1, t2);
+    sf_pixel_weights(hd::sub(u0, f), k, t0, w0, w1, t2);
     const float* p = yrow + static_cast<int>(f);
-    return acc + p[-1] * t0 + p[0] * w0 + p[1] * w1 + p[2] * t2;
+    using namespace hd;
+    return add(add(add(add(acc, mul(p[-1], t0)), mul(p[0], w0)), mul(p[1], w1)), mul(p[2], t2));
 }
 // u0 anywhere
 HR_HD float sf_backproject_edge(const float* yrow, int n_det, float u0, const AngleC& k, float acc) {
@@ -363,16 +369,17 @@ HR_HD float sf_backproject_edge(const float* yrow, int n_det, float u0, const An
     const float f = floorf(u0);
     const int d = static_cast<int>(f);
     float t0, w0, w1, t2;
-    sf_pixel_weights(u0 - f, k, t0, w0, w1, t2);
-    if (d - 1 >= 0 && d - 1 < n_det) acc += yrow[d - 1] * t0;
-    if (d >= 0 && d < n_det) acc += yrow[d] * w0;
-    if (d + 1 >= 0 && d + 1 < n_det) acc += yrow[d + 1] * w1;
-    if (d + 2 >= 0 && d + 2 < n_det) acc += yrow[d + 2] * t2;
+    sf_pixel_weights(hd::sub(u0, f), k, t0, w0, w1, t2);
+    using namespace hd;
+    if (d - 1 >= 0 && d - 1 < n_det) acc = add(acc, mul(yrow[d - 1], t0));
+    if (d >= 0 && d < n_det) acc = add(acc, mul(yrow[d], w0));
+    if (d + 1 >= 0 && d + 1 < n_det) acc = add(acc, mul(yrow[d + 1], w1));
+    if (d + 2 >= 0 && d + 2 < n_det) acc = add(acc, mul(yrow[d + 2], t2));
     return acc;
 }
 template <int PJ = Chord>
 HR_HD float backproject_pixel(const float* yrow, const Geom& g, float X, float Y, const AngleC& k) {
-    const float u0 = X * k.ca + Y * k.sa + g.rot;
+    const float u0 = PJ == SF ? detector_u(X, Y, k, g.rot) : X * k.ca + Y * k.sa + g.rot;
     if (PJ == SF)
         return u0 >= 1.f && u0 < static_cast<float>(g.n_det - 2) ? sf_backproject_inner(yrow, u0, k, 0.f)
                                                                 : sf_backproject_edge(yrow, g.n_det, u0, k, 0.f);

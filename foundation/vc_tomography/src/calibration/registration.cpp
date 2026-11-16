@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <array>
 #include <complex>
 #include <cstdio>
 #include <memory>
@@ -48,7 +49,14 @@ void init_fftw_threads() {
     std::call_once(once, [] { fftwf_init_threads(); });
 }
 
-// The array work on the CPU: FFTW transforms, OpenMP loops.
+double in_order(const std::vector<double>& v) {
+    double s = 0;
+    for (double x : v) s += x;
+    return s;
+}
+
+// The array work on the CPU: FFTW transforms, OpenMP loops. Every sum is taken per line and the lines added in
+// order, so the result does not depend on the number of threads.
 class CpuBackend final : public RegistrationBackend {
   public:
     CpuBackend(const RegistrationGeometry& g, const RegistrationOptions& opt, const float* weights) : g_(g), opt_(opt), weight_(weights) {
@@ -94,17 +102,20 @@ class CpuBackend final : public RegistrationBackend {
         fftwf_execute_dft_r2c(forward_, r_.get(), aw_.get());
         cfloat* A = reinterpret_cast<cfloat*>(aw_.get());
         const int nc = g_.nc;
-        double ea = 0;
-#pragma omp parallel for schedule(static) reduction(+ : ea)
-        for (std::ptrdiff_t line = 0; line < static_cast<std::ptrdiff_t>(g_.n[0]) * g_.n[1]; ++line) {
+        // per line, then the lines in order: the same sum on any number of threads
+        std::vector<double> part(static_cast<std::size_t>(g_.n[0]) * g_.n[1]);
+#pragma omp parallel for schedule(static)
+        for (std::ptrdiff_t line = 0; line < static_cast<std::ptrdiff_t>(part.size()); ++line) {
             cfloat* pa = A + static_cast<std::size_t>(line) * nc;
             const float* w = weight_ + static_cast<std::size_t>(line) * nc;
+            double ea = 0;
             for (int k2 = 0; k2 < nc; ++k2) {
                 ea += (k2 == 0 ? 1.0 : 2.0) * w[k2] * std::norm(pa[k2]);
                 pa[k2] = std::conj(pa[k2]) * w[k2];
             }
+            part[static_cast<std::size_t>(line)] = ea;
         }
-        return ea;
+        return in_order(part);
     }
 
     void set_b(const float* b, const double* row_shift) override {
@@ -170,18 +181,20 @@ class CpuBackend final : public RegistrationBackend {
         // C = conj(A) W B
         cfloat* C = reinterpret_cast<cfloat*>(c_.get());
         const cfloat* AW = reinterpret_cast<const cfloat*>(aw_.get());
-        double eb = 0;
-#pragma omp parallel for schedule(static) reduction(+ : eb)
-        for (std::ptrdiff_t line = 0; line < static_cast<std::ptrdiff_t>(g_.n[0]) * g_.n[1]; ++line) {
+        std::vector<double> part(static_cast<std::size_t>(g_.n[0]) * g_.n[1]);
+#pragma omp parallel for schedule(static)
+        for (std::ptrdiff_t line = 0; line < static_cast<std::ptrdiff_t>(part.size()); ++line) {
             cfloat* pc = C + static_cast<std::size_t>(line) * nc;
             const cfloat* pa = AW + static_cast<std::size_t>(line) * nc;
             const float* w = weight_ + static_cast<std::size_t>(line) * nc;
+            double eb = 0;
             for (int k2 = 0; k2 < nc; ++k2) {
                 eb += (k2 == 0 ? 1.0 : 2.0) * w[k2] * std::norm(pc[k2]);
                 pc[k2] = pa[k2] * pc[k2];
             }
+            part[static_cast<std::size_t>(line)] = eb;
         }
-        return eb;
+        return in_order(part);
     }
 
     bool peak(const int s[3], int best[3]) override {
@@ -214,8 +227,9 @@ class CpuBackend final : public RegistrationBackend {
         for (int k = 0; k < n1; ++k) e1[k] = std::polar(1.0, 2 * M_PI * frequency(k, n1) * at[1]);
         for (int k = 0; k < nc; ++k) e2[k] = std::polar(1.0, 2 * M_PI * frequency(k, n2) * at[2]);
         const cfloat* C = reinterpret_cast<const cfloat*>(c_.get());
-        double v = 0, g0 = 0, g1 = 0, g2 = 0, h00 = 0, h01 = 0, h02 = 0, h11 = 0, h12 = 0, h22 = 0;
-#pragma omp parallel for collapse(2) schedule(static) reduction(+ : v, g0, g1, g2, h00, h01, h02, h11, h12, h22)
+        // per line (k0, k1) its ten terms, then the lines in order: the same sums on any number of threads
+        std::vector<std::array<double, 10>> part(static_cast<std::size_t>(n0) * n1);
+#pragma omp parallel for collapse(2) schedule(static)
         for (int k0 = 0; k0 < n0; ++k0) {
             for (int k1 = 0; k1 < n1; ++k1) {
                 const double q0 = 2 * M_PI * frequency(k0, n0), q1 = 2 * M_PI * frequency(k1, n1);
@@ -236,17 +250,21 @@ class CpuBackend final : public RegistrationBackend {
                 const double re = sr * e01.real() - si * e01.imag(), im = sr * e01.imag() + si * e01.real();
                 const double re2 = sr2 * e01.real() - si2 * e01.imag(), im2 = sr2 * e01.imag() + si2 * e01.real();
                 const double re22 = sr22 * e01.real() - si22 * e01.imag();
-                v += re;
-                g0 -= q0 * im;
-                g1 -= q1 * im;
-                g2 -= im2;
-                h00 -= q0 * q0 * re;
-                h01 -= q0 * q1 * re;
-                h11 -= q1 * q1 * re;
-                h02 -= q0 * re2;
-                h12 -= q1 * re2;
-                h22 -= re22;
+                part[static_cast<std::size_t>(k0) * n1 + k1] = {re, q0 * im, q1 * im, im2, q0 * q0 * re, q0 * q1 * re, q1 * q1 * re, q0 * re2, q1 * re2, re22};
             }
+        }
+        double v = 0, g0 = 0, g1 = 0, g2 = 0, h00 = 0, h01 = 0, h02 = 0, h11 = 0, h12 = 0, h22 = 0;
+        for (const std::array<double, 10>& t : part) {
+            v += t[0];
+            g0 -= t[1];
+            g1 -= t[2];
+            g2 -= t[3];
+            h00 -= t[4];
+            h01 -= t[5];
+            h11 -= t[6];
+            h02 -= t[7];
+            h12 -= t[8];
+            h22 -= t[9];
         }
         value = v;
         g[0] = g0, g[1] = g1, g[2] = g2;

@@ -32,6 +32,8 @@ struct Coef {
 
 HR_HD int clampi(int i, int n) { return i < 0 ? 0 : (i >= n ? n - 1 : i); }
 HR_HD float floor_eps(float v, float eps) { return v > eps ? v : eps; }  // also maps NaN to eps
+// the step I + relax r, floored (unfused: the same bits on both backends)
+HR_HD float update(float I, float r, float relax, float eps) { return floor_eps(hd::add(I, hd::mul(relax, r)), eps); }
 
 HR_HD std::size_t at(int y, int x, int W) { return static_cast<std::size_t>(y) * W + x; }
 

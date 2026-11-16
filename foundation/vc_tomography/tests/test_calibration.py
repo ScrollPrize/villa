@@ -25,7 +25,7 @@ def test_selftest_cuda():
     assert _core.calibration_selftest(device="cuda")
 
 
-def test_register_blocks_fractional_shift():
+def test_register_blocks_fractional_shift(tmp_path):
     rng = np.random.default_rng(3)
     shape = (40, 160, 320)
     # a smooth periodic field, displaced exactly by a phase ramp
@@ -44,7 +44,18 @@ def test_register_blocks_fractional_shift():
     r = _core.calibration_register_blocks(a, b, list(m))
     assert r["converged"] and r["whole"] == (0, 0, 0)
     assert np.allclose(r["shift"], d, atol=0.01), r
-    # the CUDA registration is the same estimator on the same arithmetic: it differs by float rounding only
+    # the CPU's sums do not depend on the number of threads: one thread finds the same, bit for bit
+    import os
+    import subprocess
+    import sys
+    np.save(tmp_path / "a.npy", a), np.save(tmp_path / "b.npy", b)
+    probe = ("import sys, json, numpy as np, vc_tomography._core as c; d = sys.argv[1]; "
+             "r = c.calibration_register_blocks(np.load(d + '/a.npy'), np.load(d + '/b.npy'), [8, 12, 8]); "
+             "print(json.dumps([float(x) for x in r['shift']] + [float(r['correlation']), int(r['evaluations'])]))")
+    one = subprocess.run([sys.executable, "-c", probe, str(tmp_path)], capture_output=True, text=True, env=dict(os.environ, OMP_NUM_THREADS="1"))
+    assert one.returncode == 0, one.stderr
+    assert json.loads(one.stdout) == [float(x) for x in r["shift"]] + [float(r["correlation"]), int(r["evaluations"])]
+    # the CUDA registration is the same estimator: it differs by float rounding only
     if _core.cuda_available():
         g = _core.calibration_register_blocks(a, b, list(m), device="cuda")
         assert g["converged"] and g["evaluations"] == r["evaluations"]

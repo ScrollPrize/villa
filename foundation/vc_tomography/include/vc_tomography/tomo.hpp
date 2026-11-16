@@ -7,6 +7,7 @@
 //   mlem     maximum-likelihood EM: x *= A^T(b / Ax) / A^T 1                                     num_iter
 //   gridrec  Fourier gridding with a prolate spheroidal kernel; filters none, shepp, cosine, hann, hamming,
 //            ramlak, parzen, butterworth (filter_name, filter_par)
+//            (CUDA: scattered with float atomicAdd, so not bit-reproducible run to run; the CPU's is)
 //
 // Data: the -log rows (n_angles x n_det). SIRT / MLEM receive measured support before hole filling and balancing;
 // SIRT can optionally use that support as confidence instead of a binary mask. Gridrec receives balanced weights.

@@ -6,9 +6,20 @@
 #include <utility>
 #include <vector>
 
+#include "common/hd_math.hpp"
 #include "vc_tomography/sino.hpp"
 
 namespace vc_tomography::rebalance_core {
+
+// The per-column arithmetic of the balance, rounded alike on both backends (no contraction):
+// a row's value at the mirrored column (e: src -1 = none) and the interpolation between two rows.
+HR_HD float mapped(const float* row, int src0, int src1, float w0, float w1) {
+    float v = 0.f;
+    if (src0 >= 0) v = hd::add(v, hd::mul(w0, row[src0]));
+    if (src1 >= 0) v = hd::add(v, hd::mul(w1, row[src1]));
+    return v;
+}
+HR_HD float between(float alpha, float a, float b) { return hd::add(hd::mul(hd::sub(1.0f, alpha), a), hd::mul(alpha, b)); }
 
 struct Contribution {
     int k0, k1;

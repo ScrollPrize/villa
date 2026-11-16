@@ -153,9 +153,10 @@ __global__ void backproject_kernel(const float* __restrict__ y, float* x, const 
 #pragma unroll
                 for (int j = 0; j < kPix; ++j) {
                     if (PJ == tomo_core::SF) {
-                        const float u0 = X[j] * k.ca + Y[j] * k.sa + g.rot;
-                        if (u0 >= 1.f && u0 < inner[j]) s[j] = tomo_core::sf_backproject_inner(yr, u0, k, s[j]);
-                        else if (u0 < reach[j]) s[j] = tomo_core::sf_backproject_edge(yr, g.n_det, u0, k, s[j]);
+                        // each angle's part summed from 0, then added: the CPU's order (backproject_pixel)
+                        const float u0 = tomo_core::detector_u(X[j], Y[j], k, g.rot);
+                        if (u0 >= 1.f && u0 < inner[j]) s[j] = __fadd_rn(s[j], tomo_core::sf_backproject_inner(yr, u0, k, 0.f));
+                        else if (u0 < reach[j]) s[j] = __fadd_rn(s[j], tomo_core::sf_backproject_edge(yr, g.n_det, u0, k, 0.f));
                     } else if (in[j]) {
                         s[j] += tomo_core::backproject_pixel<PJ>(yr, g, X[j], Y[j], k);
                     }
@@ -227,6 +228,8 @@ __global__ void spread_kernel(const cufftComplex* sino, int n_rows, int pdim, co
                 const float w = wu * wtbl[static_cast<int>(roundf(fabsf(V - iv) * tblspcg))];
                 float* h1 = H + 2 * (static_cast<std::size_t>(iu) * pdim + iv);
                 float* h2 = H + 2 * (static_cast<std::size_t>(pdim - iu) * pdim + (pdim - iv));
+                // (float atomicAdd: the order of addition varies from run to run, so the grid, and gridrec, differs
+                // in the last bits between runs; README, whole-slice methods)
                 atomicAdd(h1, w * c1r);
                 atomicAdd(h1 + 1, w * c1i);
                 atomicAdd(h2, w * c2r);

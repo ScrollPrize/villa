@@ -62,7 +62,7 @@ void epr_frames(float* frames, int n_frames, int H, int W, const EprParams& p, F
                 }
             paganin.apply(r.data(), r.data(), nb);
 #pragma omp parallel for schedule(static)
-            for (std::ptrdiff_t k = 0; k < total; ++k) I[k] = floor_eps(I[k] + p.relax * r[k], c.eps);
+            for (std::ptrdiff_t k = 0; k < total; ++k) I[k] = epr_core::update(I[k], r[k], p.relax, c.eps);
         }
         std::copy(I.begin(), I.begin() + total, det);
     }

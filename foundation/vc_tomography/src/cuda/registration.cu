@@ -1,7 +1,9 @@
 // The array work of vc_tomography::calibration's registration on CUDA: cuFFT transforms and kernels for the windows,
 // the displacement of the padded block and the sums over the cross spectrum. The estimator that drives it is
 // the same code as on the CPU (src/calibration/registration.cpp, registration_core.hpp); every step here has
-// its counterpart in CpuBackend there and follows the same arithmetic. Blocks arrive from the host.
+// its counterpart in CpuBackend there, with products unfused as there. The sums over the spectrum are reduced in
+// another order than the CPU's (which adds lines in order), and cuFFT is not FFTW, so the two agree to rounding,
+// not bit for bit. Blocks arrive from the host.
 #include <cufft.h>
 
 #include <cmath>

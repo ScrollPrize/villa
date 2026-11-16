@@ -23,8 +23,7 @@ def test_rebalance_cuda_matches_cpu():
     for legacy in (False, True):
         r0, w0 = _core.rebalance(R, W, rc, legacy, device="cpu")
         r1, w1 = _core.rebalance(R, W, rc, legacy, device="cuda")
-        assert np.array_equal(r0, r1)
-        np.testing.assert_allclose(w1, w0, rtol=2e-6, atol=1e-7)
+        assert np.array_equal(r0, r1) and np.array_equal(w0, w1)        # the same rounding on both (rebalance_core)
 
 
 def trilinear(vol, z, y, x):

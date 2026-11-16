@@ -265,12 +265,7 @@ void ramp_crop(const float* padded, float* out, const RampGeometry& g) {
 namespace {
 using rebalance_core::Contribution;
 using rebalance_core::OddMap;
-inline float mapped(const float* row, const OddMap& e) {
-    float v = 0.f;
-    if (e.src0 >= 0) v += e.w0 * row[e.src0];
-    if (e.src1 >= 0) v += e.w1 * row[e.src1];
-    return v;
-}
+inline float mapped(const float* row, const OddMap& e) { return rebalance_core::mapped(row, e.src0, e.src1, e.w0, e.w1); }
 void balance_with_table(float* W, int n_proj, int n_rows, int n_cols, const std::vector<std::vector<Contribution>>& table,
                         const std::vector<OddMap>& omap);
 }  // namespace
@@ -326,10 +321,10 @@ void balance_with_table(float* W, int n_proj, int n_rows, int n_cols, const std:
                 for (const auto& m : table[i]) {
                     const float* r0 = Wsrc.data() + static_cast<std::size_t>(m.k0) * n_cols;
                     const float* r1 = m.has_two ? Wsrc.data() + static_cast<std::size_t>(m.k1) * n_cols : nullptr;
-                    const float beta = 1.0f - m.alpha, alpha = m.alpha;
+                    using rebalance_core::between;
                     for (int c = 0; c < n_cols; ++c) {
-                        if (!m.odd) B[c] += m.has_two ? beta * r0[c] + alpha * r1[c] : r0[c];
-                        else B[c] += m.has_two ? beta * mapped(r0, omap[c]) + alpha * mapped(r1, omap[c]) : mapped(r0, omap[c]);
+                        if (!m.odd) B[c] += m.has_two ? between(m.alpha, r0[c], r1[c]) : r0[c];
+                        else B[c] += m.has_two ? between(m.alpha, mapped(r0, omap[c]), mapped(r1, omap[c])) : mapped(r0, omap[c]);
                     }
                 }
                 float* dst = W + i * plane + static_cast<std::size_t>(row) * n_cols;
