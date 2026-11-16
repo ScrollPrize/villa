@@ -235,6 +235,10 @@ class ZarrReader:
                                          compress_cache=compress_cache, allow_lossy_cache=allow_lossy_cache,
                                          memory_cache=memory_cache, threads=threads, connections=connections,
                                          read_mode=read_mode, auth=auth, offline=offline)
+        if refresh and is_remote(settings["location"]) and not settings["offline"]:
+            # The array documents this process already read are dropped too, so the
+            # reader opens the array as published now.
+            _reader.forget_known_arrays(settings["location"], _open_options(settings, cache))
         reader = cls(settings, cache)
         reader._metadata = StoreMetadata.from_json(
             _reader.volume_metadata_json(reader._opened.store, reader._options, refresh))
