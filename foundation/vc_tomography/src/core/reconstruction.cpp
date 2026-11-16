@@ -18,6 +18,7 @@
 #include "vc_tomography/projection_store.hpp"
 #include "io/json.hpp"
 #include "vc_reader/native/sigv4.hpp"
+#include "io/paths.hpp"
 #include "io/text_file.hpp"
 #include "io/json_values.hpp"
 
@@ -37,10 +38,7 @@ void say(const Log& log, const std::string& line) {
 using io::exists;
 using io::read_text;
 
-std::string base_name(const std::string& p) {
-    const std::size_t i = p.find_last_of('/');
-    return i == std::string::npos ? p : p.substr(i + 1);
-}
+std::string base_name(const std::string& p) { return io::basename(p); }
 
 std::string absolute(const std::string& p) { return std::filesystem::absolute(p).lexically_normal().string(); }
 

@@ -52,6 +52,7 @@
 #include "vc_tomography/calibration/registration.hpp"
 #include "vc_tomography/calibration/record_checks.hpp"
 #include "io/command_line.hpp"
+#include "io/paths.hpp"
 
 using namespace vc_tomography;
 using namespace vc_tomography::calibration;
@@ -101,10 +102,7 @@ int run_geometry_calibration(int argc, char** argv) {
     return 0;
 }
 
-std::string base_name(const std::string& p) {
-    const std::size_t i = p.find_last_of('/');
-    return i == std::string::npos ? p : p.substr(i + 1);
-}
+std::string base_name(const std::string& p) { return io::basename(p); }
 
 // vc_tomography_calibration intensity: the arguments after the command
 int run_intensity_calibration(int argc, char** argv) {
