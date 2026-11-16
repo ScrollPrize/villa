@@ -50,27 +50,27 @@ def max_h(card, shell, r, pool_per_k, tracks_per_k):
 GiB = 2 ** 30
 SCROLLS = {
     # name: (H, shell, shell_source, pool_full_GiB, pool_source, cached_points_13000, it_per_s_box48)
-    "PHerc0175A": (12748, 200, "box default (not measured)", 142412 * 65536 / GiB * 12748 / 13000, "box packed x H/13000", 108880491, 3.9),
-    "PHerc0175B": (15897, 200, "box default (not measured)", 244005 * 65536 / GiB * 15897 / 13000, "box packed x H/13000", 128981872, 6.0),
+    "PHerc0175A": (12748, 200, "box default (not measured)", 9.79, "142 respool (measured file size)", 108880491, 3.9),
+    "PHerc0175B": (15897, 200, "box default (not measured)", 16.69, "142 respool (measured file size)", 128981872, 6.0),
     "PHerc0191": (18977, 146, "fits", 11.01, "142 respool", 117483137, 8.1),
     "PHerc0257": (18872, 214, "fits", 7.70, "142 respool", 77441982, 7.2),
     "PHerc0268": (14833, 408, "fits", 21.43, "142 respool", 159525449, 4.6),
     "PHerc0306B": (15898, 200, "box default (not measured)", 162412 * 65536 / GiB * 15898 / 13000, "box packed x H/13000", 110838913, 5.3),
     "PHerc0343": (17998, 250, "fits", 10.81, "142 respool (9.58 loaded for z 1200-17500)", None, None),
     "PHerc0358": (14744, 252, "fits", 7.09, "142 respool", 70785547, 5.6),
-    "PHerc0483A": (15898, 200, "box default (not measured)", 143172 * 65536 / GiB * 15898 / 13000, "box packed x H/13000", 90273138, 6.0),
-    "PHerc0483B": (11880, 200, "box default (not measured)", 120777 * 65536 / GiB * 11880 / 13000, "box packed x H/13000", 72811322, 7.2),
-    "PHerc0490A": (11698, 250, "fits (sense unknown)", None, "no store measured", None, None),
-    "PHerc0490B": (10648, 250, "fits (sense unknown)", 101238 * 65536 / GiB * 10648 / 13000, "box packed x H/13000", 47716502, 7.7),
+    "PHerc0483A": (15898, 200, "box default (not measured)", 10.13, "142 respool (measured file size)", 90273138, 6.0),
+    "PHerc0483B": (11880, 200, "box default (not measured)", 8.16, "142 respool (measured file size)", 72811322, 7.2),
+    "PHerc0490A": (11698, 250, "fits (sense unknown)", 0.29, "142 respool (measured file size)", None, None),
+    "PHerc0490B": (10648, 250, "fits (sense unknown)", 0.21, "142 respool (measured file size)", 47716502, 7.7),
     "PHerc0800": (24298, 275, "fits", 19.80, "142 respool", 155951965, 5.0),
     "PHerc0813": (16993, 197, "fits", 8.15, "142 respool", 98716648, 6.6),
     "PHerc0826": (16920, 217, "fits", 6.32, "142 respool", 64004220, 5.3),
-    "PHerc0846A": (14019, 250, "fits (sense unknown)", None, "no store measured", None, None),
-    "PHerc0846B": (13926, None, "none (no fit yet)", None, "no store measured", None, None),
-    "PHerc1203": (18977, 187, "queue", None, "no store measured", None, None),
-    "PHerc1218": (23247, 195, "queue (box used 200)", 72892 * 65536 / GiB * 23247 / 13000, "box packed x H/13000", 72842567, 6.5),
+    "PHerc0846A": (14019, 250, "fits (sense unknown)", 0.18, "142 respool (measured file size)", None, None),
+    "PHerc0846B": (13926, None, "none (no fit yet)", 7.53, "142 respool (measured file size)", None, None),
+    "PHerc1203": (18977, 187, "queue", 7.75, "142 respool (measured file size)", None, None),
+    "PHerc1218": (23247, 195, "queue (box used 200)", 7.98, "142 respool (measured file size)", 72842567, 6.5),
     "PHerc1447": (24297, None, "none (no fit yet)", None, "no store measured", None, None),
-    "PHerc1545": (20961, 204, "queue (box used 200)", 82097 * 65536 / GiB * 20961 / 13000, "box packed x H/13000", 75676636, 6.0),
+    "PHerc1545": (20961, 204, "queue (box used 200)", 7.09, "142 respool (measured file size)", 75676636, 6.0),
 }
 DEFAULT_POOL_PER_K = 9.58 / 16.3            # 343 measured, GiB per 1000 slices (used where no store was measured; announced)
 DEFAULT_TRACK_PER_K = 3.66 / 16.3

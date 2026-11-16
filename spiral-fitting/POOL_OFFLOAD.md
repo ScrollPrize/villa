@@ -20,6 +20,7 @@ allows `cuMemHostRegister` (the pool maps its page-locked memory into the card's
 
 ## What is measured, and where (provenance, stated plainly)
 
+* **What in the table is measured and what is modelled** (2026-11-16 audit): MEASURED are the lasagna brick pool sizes (the on-disk size of each scroll's respooled pool, `channel_0.u8` + `channel_1.u8`, 20 scrolls; an earlier version of this table used an estimate for 11 of them, which was off by up to 25x for PHerc0490B: 5.1 GiB estimated, 0.21 GiB measured), the scroll heights, and the five whole-height fits in `measured.json`. MODELLED are every per-scroll peak (the coefficients are calibrated on one scroll, PHerc0343), the track term of every scroll but PHerc0343 (cached points scaled from a 13,000-slice log; not re-measured), the shell index of the scrolls marked "not measured", and the number of iterations until a fit without the GC fix runs out of memory. Rows for scrolls without a measured pool (PHerc0306B, PHerc1447) are modelled from the PHerc0343 density and say so in `notes`.
 * **Per-scroll tables and chart** (`pool_offload/vram_table_public.md`, `vram_chart_public.png`): the memory model
   `peak = pool + tracks + flow*(H+320)/1000 + 7 gap copies + act*H/1000 + 1.5 GiB headroom`, calibrated on one scroll at full height
   (20.5 / 28.8 GiB predicted vs 20.1 / 28.2 GiB measured on a V100-32, 32- / 16-voxel flow grid, about 2 %). It is a model, not a
