@@ -201,6 +201,29 @@ TEST_CASE("query_nearest: empty store returns null for all planes")
     fs::remove_all(d);
 }
 
+TEST_CASE("nearest_slice_index: the slice query_nearest selects, without touching the cache")
+{
+    auto d = makeEmptyNgvDir("slice_index", 4);
+    NormalGridVolume v(d.string());
+    const cv::Point3f p(21, 9, 1);
+    // Rounded to the nearest multiple of sparse-volume along the plane's normal axis.
+    CHECK(v.nearest_slice_index(p, 0) == 0);    // XY plane: z = 1
+    CHECK(v.nearest_slice_index(p, 1) == 8);    // XZ plane: y = 9
+    CHECK(v.nearest_slice_index(p, 2) == 20);   // YZ plane: x = 21
+    CHECK(v.nearest_slice_index(cv::Point3f(0, 0, 6), 0) == 8);   // 1.5 slices: half rounds away from zero
+    CHECK_FALSE(v.nearest_slice_index(p, 99).has_value());
+    const auto stats = v.cacheStats();
+    CHECK(stats.gridHits == 0);
+    CHECK(stats.gridMisses == 0);
+    // query_nearest asks get_grid for exactly that index.
+    (void)v.query_nearest(p, 1);
+    (void)v.get_grid(1, *v.nearest_slice_index(p, 1));
+    const auto after = v.cacheStats();
+    CHECK(after.gridMisses == 1);
+    CHECK(after.gridHits == 1);
+    fs::remove_all(d);
+}
+
 TEST_CASE("resetCacheStats zeros hit/miss counters")
 {
     auto d = makeEmptyNgvDir("reset");

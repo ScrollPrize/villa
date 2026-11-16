@@ -433,19 +433,25 @@
             return GridQueryResult{grid1, grid2, weight};
         }
 
-        std::shared_ptr<const GridStore> query_nearest(const cv::Point3f& point, int plane_idx) const {
+        std::optional<int> nearest_slice_index(const cv::Point3f& point, int plane_idx) const {
 
             float coord;
             switch (plane_idx) {
                 case 0: coord = point.z * coordinate_scale; break; // XY plane
                 case 1: coord = point.y * coordinate_scale; break; // XZ plane
                 case 2: coord = point.x * coordinate_scale; break; // YZ plane
-                default: return nullptr;
+                default: return std::nullopt;
             }
 
-            int slice_idx = static_cast<int>(std::round(coord / sparse_volume)) * sparse_volume;
+            return static_cast<int>(std::round(coord / sparse_volume)) * sparse_volume;
+        }
 
-            return get_grid(plane_idx, slice_idx);
+        std::shared_ptr<const GridStore> query_nearest(const cv::Point3f& point, int plane_idx) const {
+            const std::optional<int> slice_idx = nearest_slice_index(point, plane_idx);
+            if (!slice_idx) {
+                return nullptr;
+            }
+            return get_grid(plane_idx, *slice_idx);
         }
 
         std::shared_ptr<const GridStore> get_grid(int plane_idx, int slice_idx) const {
@@ -697,6 +703,10 @@
 
     std::shared_ptr<const GridStore> NormalGridVolume::query_nearest(const cv::Point3f& point, int plane_idx) const {
         return pimpl_->query_nearest(point, plane_idx);
+    }
+
+    std::optional<int> NormalGridVolume::nearest_slice_index(const cv::Point3f& point, int plane_idx) const {
+        return pimpl_->nearest_slice_index(point, plane_idx);
     }
 
     std::shared_ptr<const GridStore> NormalGridVolume::get_grid(int plane_idx, int slice_idx) const {
