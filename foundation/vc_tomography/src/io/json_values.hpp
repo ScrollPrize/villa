@@ -4,6 +4,8 @@
 #include <cctype>
 #include <cstdlib>
 #include <string>
+#include <vector>
+#include <algorithm>
 
 #include "io/json.hpp"
 
@@ -28,6 +30,33 @@ inline bool real_of(const std::string& t, double& v) {
     char* end = nullptr;
     v = std::strtod(s.c_str(), &end);
     return end == s.c_str() + s.size();
+}
+
+// the reals of text separated by `sep` (each as real_of reads it); false at the first that is not one
+inline bool reals_of(const std::string& text, char sep, std::vector<double>& out) {
+    out.clear();
+    std::size_t i = 0;
+    while (i <= text.size()) {
+        const std::size_t j = std::min(text.find(sep, i), text.size());
+        double x = 0;
+        if (!real_of(text.substr(i, j - i), x)) return false;
+        out.push_back(x);
+        i = j + 1;
+    }
+    return true;
+}
+
+// an object's keys, sorted; joined: "a, b, c"
+inline std::vector<std::string> sorted_keys(const Json& object) {
+    std::vector<std::string> keys;
+    for (const auto& kv : object.object) keys.push_back(kv.first);
+    std::sort(keys.begin(), keys.end());
+    return keys;
+}
+inline std::string joined_keys(const Json& object) {
+    std::string list;
+    for (const auto& k : sorted_keys(object)) list += (list.empty() ? "" : ", ") + k;
+    return list;
 }
 
 // float(value): numbers, booleans, and text that reads as one

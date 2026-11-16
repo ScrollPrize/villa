@@ -243,15 +243,9 @@ std::vector<double> terms_of(const Json& v, const std::string& name, bool positi
     if (v.is(Json::String)) {
         std::string s = v.string;
         std::replace(s.begin(), s.end(), ';', ':');
-        std::size_t i = 0;
-        while (i <= s.size()) {
-            std::size_t j = s.find(':', i);
-            if (j == std::string::npos) j = s.size();
-            double x = 0;
-            if (!real_of(s.substr(i, j - i), x)) throw Error("sld: " + name + " must contain finite values");
-            add(x);
-            i = j + 1;
-        }
+        std::vector<double> xs;
+        if (!io::reals_of(s, ':', xs)) throw Error("sld: " + name + " must contain finite values");
+        for (double x : xs) add(x);
     } else if (v.is(Json::Array)) {
         for (const Json& e : v.array) {
             double x = 0;
@@ -509,14 +503,7 @@ SldParams sld_params(const std::string& spec_text, std::string* resolved) {
                                                 "replica_shift_x", "replica_shift_y", "replica_factor", "save_binning"};
     bool unknown = !member(spec, "fraction");
     for (const auto& kv : spec.object) unknown = unknown || !known.count(kv.first);
-    if (unknown) {
-        std::vector<std::string> keys;
-        for (const auto& kv : spec.object) keys.push_back(kv.first);
-        std::sort(keys.begin(), keys.end());
-        std::string list;
-        for (const auto& k : keys) list += (list.empty() ? "" : ", ") + k;
-        throw Error("sld: expected fraction and known model options, got [" + list + "]");
-    }
+    if (unknown) throw Error("sld: expected fraction and known model options, got [" + io::joined_keys(spec) + "]");
     if (member(spec, "length") && member(spec, "scale_l")) throw Error("sld: supply length or scale_l, not both");
     const std::vector<double> fractions = terms_of(*member(spec, "fraction"), "fraction", false);
     const Json* length = member(spec, "length");
@@ -698,12 +685,7 @@ std::string backprojector_config(const std::string& spec_text) {
         throw Error("unknown backprojector '" + type + "' (ghbp, fbp, sirt, mlem, gridrec, python)");
     }
     if (!s.object.empty()) {
-        std::vector<std::string> keys;
-        for (const auto& kv : s.object) keys.push_back(kv.first);
-        std::sort(keys.begin(), keys.end());
-        std::string list;
-        for (const auto& k : keys) list += (list.empty() ? "" : ", ") + k;
-        throw Error("backprojector " + type + ": unknown parameters [" + list + "]");
+        throw Error("backprojector " + type + ": unknown parameters [" + io::joined_keys(s) + "]");
     }
     return out.text();
 }

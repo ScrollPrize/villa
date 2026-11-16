@@ -560,10 +560,7 @@ std::string Reconstruction::provenance() const {
     const bool legacy = I.legacy();
     Json pinned = Json::list();
     if (legacy) {
-        std::vector<std::string> keys;
-        for (const auto& kv : Json::parse(legacy_reference_parameters()).object) keys.push_back(kv.first);
-        std::sort(keys.begin(), keys.end());
-        for (const auto& k : keys) pinned.add(Json::of(k));
+        for (const auto& k : io::sorted_keys(Json::parse(legacy_reference_parameters()))) pinned.add(Json::of(k));
     }
     const Json conventions = Json::parse(mode_conventions(m));
     const calibration::IntensityCalibration& cal = I.intensity;

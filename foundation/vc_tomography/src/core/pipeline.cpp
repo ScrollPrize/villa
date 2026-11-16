@@ -22,6 +22,7 @@
 #include "vc_tomography/kernels.hpp"
 #include "vc_tomography/sino.hpp"
 #include "io/json.hpp"
+#include "io/json_values.hpp"
 
 #ifdef VC_TOMOGRAPHY_WITH_CUDA
 #include "../cuda/cuda_utils.cuh"
@@ -603,16 +604,7 @@ SliceReconstructor::SliceReconstructor(std::vector<ScanData> scans, ReconConfig 
     if (!I.cfg.sharpness_weighting.empty() && !I.cfg.legacy_reference && !I.measured) {
         auto numbers = [](const std::string& text, const char* what) {
             std::vector<double> v;
-            std::size_t pos = 0;
-            while (pos <= text.size()) {
-                const std::size_t next = std::min(text.find(':', pos), text.size());
-                try {
-                    v.push_back(std::stod(text.substr(pos, next - pos)));
-                } catch (const std::exception&) {
-                    throw Error(std::string(what) + ": numbers separated by ':' are expected ('" + text + "')");
-                }
-                pos = next + 1;
-            }
+            if (!io::reals_of(text, ':', v)) throw Error(std::string(what) + ": numbers separated by ':' are expected ('" + text + "')");
             return v;
         };
         const auto blur = numbers(I.cfg.sharpness_weighting, "sharpness_weighting");
