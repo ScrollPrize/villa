@@ -30,7 +30,7 @@ struct SelectedReadMemo {
     std::map<std::pair<sqlite3*, std::string>, sqlite3*> edgeSources;
     // (scope, query source) -> object uuid -> its incident live edges, in edge
     // uuid order: the rows the per-object incidence query returns for it
-    std::map<std::pair<sqlite3*, sqlite3*>, std::unordered_map<std::string, std::vector<std::string>>> incidence;
+    std::map<sqlite3*, std::unordered_map<std::string, std::vector<std::string>>> incidence;
     // scopes whose incident edges' bindings were decoded in one batch already
     std::set<sqlite3*> prefilled;
 };

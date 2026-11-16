@@ -4000,17 +4000,7 @@ class FitContext:
         self.step_timer.start('opt')
         self.optimiser.step()
         self.step_timer.stop('opt')
-        if _GC_POLICY in ('freeze', 'every-step') and _GC_EVERY_STEPS > 0:
-            if _GC_POLICY == 'freeze' and not getattr(self, '_gc_frozen', False):
-                _gc_freeze_acquire(self)
-                self._gc_frozen = True
-            if iteration % _GC_EVERY_STEPS == 0:
-                gc.collect()
-        elif _GC_POLICY == 'pressure' and torch.cuda.is_available():
-            device = torch.cuda.current_device()
-            if torch.cuda.memory_allocated(device) - getattr(self, '_gc_floor_bytes', 0) > _GC_GARBAGE_FRACTION * torch.cuda.get_device_properties(device).total_memory:
-                gc.collect()
-                self._gc_floor_bytes = torch.cuda.memory_allocated(device)
+        self._collect_garbage_after_step(iteration)
         self.optimiser.zero_grad(set_to_none=True)
         self.lr_scheduler.step()
         self.step_timer.tick()
@@ -4019,6 +4009,22 @@ class FitContext:
             self.profiler.step()
 
         return loss, losses, log_metrics, shell_metrics
+
+    def _collect_garbage_after_step(self, iteration):
+        """The FIT_SPIRAL_GC_POLICY collection that follows one optimiser step (see the policy block at the top of this module)."""
+        if _GC_POLICY in ('freeze', 'every-step') and _GC_EVERY_STEPS > 0:
+            if _GC_POLICY == 'freeze' and not getattr(self, '_gc_frozen', False):
+                _gc_freeze_acquire(self)
+                self._gc_frozen = True
+            if iteration % _GC_EVERY_STEPS == 0:
+                gc.collect()
+        elif _GC_POLICY == 'pressure' and self.device.type == 'cuda':
+            # The fit's own device (FIT_SPIRAL_DEVICE=cuda:1), not the thread's current one: explicit allocations on another card do not change it.
+            device = self.device
+            allocated = torch.cuda.memory_allocated(device)
+            if allocated - getattr(self, '_gc_floor_bytes', 0) > _GC_GARBAGE_FRACTION * torch.cuda.get_device_properties(device).total_memory:
+                gc.collect()
+                self._gc_floor_bytes = torch.cuda.memory_allocated(device)
 
     def resolve_output_path(self):
         """Derive and create this run's output directory.
@@ -4394,7 +4400,7 @@ def main(config, *, scroll, paths, progress=None, resume_path=None,
     resolved SpiralInputPaths; the remaining keywords mirror the FitContext
     constructor's explicit fit controls.
     """
-    return FitContext(
+    context = FitContext(
         config,
         scroll=scroll,
         paths=paths,
@@ -4408,7 +4414,12 @@ def main(config, *, scroll, paths, progress=None, resume_path=None,
         storage_backend=storage_backend,
         render_volume_scale=render_volume_scale,
         dist_context=dist_context,
-    ).run()
+    )
+    try:
+        return context.run()
+    finally:
+        # Release the context on success and on failure: its share of the process-wide gc.freeze() and its volume stores.
+        context.close()
 
 
 def _wandb_init_kwargs(config, mode, environment):

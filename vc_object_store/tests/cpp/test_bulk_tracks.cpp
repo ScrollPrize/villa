@@ -3,6 +3,7 @@
 // source/destination history policies (history-off sealed base, history-on root), the failure cases, and a write through the
 // overlay that leaves the sealed base untouched.
 #include "TestSupport.hpp"
+#include <set>
 #include "vc_object_store/objects/GeometryIngest.hpp"
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
 #include "vc_object_store/objects/ObjectCollection.hpp"
@@ -107,6 +108,11 @@ int main()
         const auto root = dir.path / ("bulk" + std::to_string(shards) + ".vcobj");
         const auto report = ingestTracksBulk(packed, base, "bulk-test", frame, tags, shards);
         require(report.ingested == tracks && report.problems.empty(), "bulk ingest reports every track");
+        {
+            // The report names the objects created (as the per-track path does), so a caller can select or record them.
+            std::set<std::string> created(report.uuids.begin(), report.uuids.end());
+            require(report.uuids.size() == tracks && created.size() == tracks, "bulk ingest reports one distinct uuid per created track");
+        }
         // One shard is a file; several are a directory whose root locator is collection.vcobj.
         require(shards == 1 ? fs::is_regular_file(base) : fs::is_directory(base), "shard layout: file for one shard, directory for several");
         const auto baseRoot = shards == 1 ? base : base / "collection.vcobj";

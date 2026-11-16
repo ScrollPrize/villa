@@ -442,6 +442,7 @@ GeometryIngestReport ingestTracksBulk(const fs::path& source, const fs::path& de
         flush();
     });
     report.ingested = done.load();
+    report.uuids = std::move(uuids);        // the objects created, as the per-track path reports them
     return report;
 }
 }

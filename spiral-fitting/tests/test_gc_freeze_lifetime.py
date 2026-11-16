@@ -79,3 +79,73 @@ def test_a_failing_store_close_still_ends_the_freeze():
     with pytest.raises(RuntimeError, match="store close failed"):
         context.close()
     assert gc.get_freeze_count() == 0
+
+
+def test_main_closes_its_context_on_success_and_on_failure(monkeypatch):
+    """Review: the headless entry point must not leave the context (and its share of the process-wide freeze) behind."""
+    created = []
+
+    class Context:
+        def __init__(self, *args, fail=False, **kwargs):
+            self.fail, self.closed = fail, False
+            created.append(self)
+
+        def run(self):
+            if self.fail:
+                raise RuntimeError("fit failed")
+            return "ok"
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(fs, "FitContext", Context)
+    assert fs.main(None, scroll=None, paths=None) == "ok" and created[-1].closed
+    monkeypatch.setattr(fs, "FitContext", lambda *a, **k: Context(fail=True))
+    with pytest.raises(RuntimeError, match="fit failed"):
+        fs.main(None, scroll=None, paths=None)
+    assert created[-1].closed
+
+
+def test_the_pressure_policy_watches_the_fits_own_device(monkeypatch):
+    """Review: with FIT_SPIRAL_DEVICE=cuda:1 the counters of GPU 0 (the thread's current device) must not decide when to collect."""
+    import types
+    import torch
+    seen, collected = [], []
+    monkeypatch.setattr(fs, "_GC_POLICY", "pressure")
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda device=None: (seen.append(device), 90)[1])
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: types.SimpleNamespace(total_memory=100))
+    monkeypatch.setattr(fs.gc, "collect", lambda *a: collected.append(1))
+    on_card_1 = types.SimpleNamespace(device=torch.device("cuda:1"))
+    fs.FitContext._collect_garbage_after_step(on_card_1, 1)
+    assert seen and all(d == torch.device("cuda:1") for d in seen) and collected     # 90 allocated of 100, fraction 0.2: collect
+    seen.clear(); collected.clear()
+    fs.FitContext._collect_garbage_after_step(types.SimpleNamespace(device=torch.device("cpu")), 1)
+    assert not seen and not collected                                                 # a CPU fit never looks at a GPU
+
+
+def test_a_non_cuda_fit_never_touches_cuda_counters(monkeypatch):
+    """MPS / CPU fits (no CUDA): neither the pressure policy nor the export guard may call into torch.cuda."""
+    import types
+    import torch
+
+    def boom(*args, **kwargs):
+        raise AssertionError("torch.cuda was called by a non-CUDA fit")
+
+    monkeypatch.setattr(torch.cuda, "memory_allocated", boom)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", boom)
+    monkeypatch.setattr(torch.cuda, "empty_cache", boom)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(fs, "_GC_POLICY", "pressure")
+    for kind in ("mps", "cpu"):
+        fs.FitContext._collect_garbage_after_step(types.SimpleNamespace(device=torch.device(kind)), 1)
+
+    class Optimiser:
+        def __init__(self):
+            self.state, self.cleared = {"x": 1}, False
+
+        def zero_grad(self, set_to_none=True):
+            self.cleared = True
+
+    optimiser = Optimiser()
+    fs.FitContext._free_fit_state_for_export(types.SimpleNamespace(optimiser=optimiser))
+    assert optimiser.state == {} and optimiser.cleared

@@ -82,9 +82,11 @@ using Json = nlohmann::json;
 const std::unordered_map<std::string, std::vector<std::string>>& incidenceOf(
     SelectedReadMemo& memo, sqlite3* scope, sqlite3* source, const std::vector<std::string>& selectedUuids)
 {
-    const auto key = std::pair{scope, source};
-    if (const auto found = memo.incidence.find(key); found != memo.incidence.end()) return found->second;
-    auto& table = memo.incidence[key];
+    // The rows depend on the source connection and the fixed selection only; `scope` (a sharded collection's query scope) filters visibility later,
+    // so every scope shares one table instead of rescanning and retaining a copy per scope.
+    (void)scope;
+    if (const auto found = memo.incidence.find(source); found != memo.incidence.end()) return found->second;
+    auto& table = memo.incidence[source];
     ScopedReadTimer buildTimer(readTiming().incidentBuild);
     const auto capacity = std::min(size_t(500), size_t(sqlite3_limit(source, SQLITE_LIMIT_VARIABLE_NUMBER, -1)));
     if (!capacity) throw std::runtime_error("SQLite variable limit cannot hold a UUID");
