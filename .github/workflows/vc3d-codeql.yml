@@ -178,13 +178,24 @@ jobs:
           cmake -S . -B build -G Ninja \
                 -DVC_TESTING=OFF \
                 -DCMAKE_BUILD_TYPE=Debug \
+                -DVC_DEBUG_INFO=OFF \
                 -DCMAKE_C_COMPILER=gcc \
                 -DCMAKE_CXX_COMPILER=g++
 
+      # Since #2440 the heaviest translation units need 2-4.5 GB each to
+      # compile (Debug, gcc), and the CodeQL extractor runs per unit too. At
+      # ninja's default nproc+2 jobs the 16 GB runner ran out of memory and the
+      # job died with exit 137. Size the job count to memory instead.
       - name: Build (fast)
         if: needs.changes.outputs.vc == 'true'
         working-directory: ./volume-cartographer
-        run: ninja -C build
+        run: |
+          mem_gib=$(awk '/^MemTotal:/ {print int($2 / 1048576)}' /proc/meminfo)
+          jobs=$(( mem_gib / 4 ))
+          if [ "$jobs" -lt 1 ]; then jobs=1; fi
+          if [ "$jobs" -gt "$(nproc)" ]; then jobs=$(nproc); fi
+          echo "MemTotal ${mem_gib} GiB, $(nproc) CPUs: ninja -j${jobs}"
+          ninja -C build -j"${jobs}"
 
       - name: Analyze
         if: needs.changes.outputs.vc == 'true'
