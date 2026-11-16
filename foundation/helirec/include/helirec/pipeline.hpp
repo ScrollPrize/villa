@@ -47,7 +47,8 @@ struct ReconConfig {
     float luminosity_repartition = 100.f;
     // fractional column offset of a scan in the merged frame: "sinc" (default) = each projection row delayed by the
     // offset exactly (a phase ramp on its transform; the gridding of measured pixels only, for the iterative methods,
-    // uses lanczos3); "lanczos3" / "cubic" = a kernel of 6 / 4 columns, which loses the top of the band (lanczos3 at
+    // uses lanczos3, and reads exactly a scan with a lateral registration or the lateral part of a detector map:
+    // AccumScanView::col_wt); "lanczos3" / "cubic" = a kernel of 6 / 4 columns, which loses the top of the band (lanczos3 at
     // half a pixel: 0.82 at 0.36 cycles per pixel, 0.35 at 0.45); "linear" = the reference's two-column splat, which
     // averages neighbouring columns (cos(pi nu) at half a pixel). The legacy reference mode always uses the splat.
     std::string x_interp = "sinc";

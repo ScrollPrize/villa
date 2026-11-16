@@ -97,12 +97,14 @@ struct ScanMap {
     bool rows = false;             // a vertical part: terms with ev, or row_scale
     bool cols = false;             // a lateral part: terms with eu, or col_scale
     float reach = 0;               // the largest row displacement on the detector (rows)
+    int col_guard = 3;             // AccumScanView::col_guard: 3 + the largest lateral displacement (columns, rounded up)
 };
 
 // map: the view of the scan's map in the backend's pointer space; row_scale, col_scale, lut: host or device copies.
 // (after set_z_kernel)
 void set_map(AccumScanView& v, const ScanData& sd, const ScanMap& m, const DetectorMapView& map, const float* row_scale,
              const float* col_scale, const float* lut, int lut_n) {
+    v.col_guard = m.col_guard;
     if (!m.rows && !m.cols) return;
     v.map = map;
     v.map_rows = m.rows ? 1 : 0;
@@ -158,7 +160,7 @@ struct SliceReconstructor::Impl {
     int filter_margin = 0;   // margin of single-step filter chains (cfg.margin, or the chain's own)
     int lum_margin = 0;      // context rows of the luminosity window, added to the filters' in `margin`
     int x_kernel = 0;        // interp_core::Interp of fractional column offsets (legacy reference: Linear, the splat)
-    bool x_exact = false;    // x_interp=sinc: the exact shift (the lanczos3 kernel where measured pixels alone are gridded)
+    bool x_exact = false;    // x_interp=sinc: the exact shift (measured pixels alone: the lanczos3 kernel, or col_wt)
     // band-dependent redundancy weights (PipelineConfig::sharpness_weighting)
     bool sharp = false;
     double sharp_f1 = 0, sharp_f2 = 0;
@@ -495,9 +497,18 @@ SliceReconstructor::SliceReconstructor(std::vector<ScanData> scans, ReconConfig 
             if (sm.cols && !I.x_exact)
                 throw Error("detector map / col_scale: the lateral part is applied where the columns are read exactly "
                             "(x_interp = sinc), not with x_interp = " + I.cfg.x_interp);
-            if (sm.cols && I.measured)
-                throw Error("detector map / col_scale: the lateral part is applied where the columns are read exactly, "
-                            "which the gridding of measured pixels only (the iterative methods) does not do");
+            {   // how far a sample's detector column can lie from its ideal one: the map, the scale, the registration
+                const float cols = std::max(std::fabs(t.scale_col), std::fabs(static_cast<float>(t.det_cols - 1) - t.scale_col));
+                const float rows = std::max(std::fabs(t.slope_row), std::fabs(static_cast<float>(t.det_rows - 1) - t.slope_row));
+                float lateral = (eu ? static_cast<float>(plan.max_eu) : 0.f) + col_scale * cols, registration = 0.f;
+                for (std::size_t i = 0; i < t.col_offset.size(); ++i)
+                    registration = std::max(registration, std::fabs(t.col_offset[i]) + (i < t.col_slope.size() ? std::fabs(t.col_slope[i]) * rows : 0.f));
+                lateral += registration;
+                if (I.measured && !(lateral <= 256.f))
+                    throw Error("a lateral displacement of more than 256 columns (detector map, col_scale, col_offset, col_slope) "
+                                "is not a registration of the frames");
+                sm.col_guard = 3 + static_cast<int>(std::ceil(lateral));
+            }
             if (sm.rows) {
                 const float rows = std::max(std::fabs(t.scale_row), std::fabs(static_cast<float>(t.det_rows - 1) - t.scale_row));
                 sm.reach = (ev ? static_cast<float>(plan.max_ev) : 0.f) + row_scale * rows;

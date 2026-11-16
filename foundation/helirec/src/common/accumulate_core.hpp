@@ -250,6 +250,27 @@ HR_HD bool exact_term(const AccumScanView& s, int k, int t, int c0, float A, con
     return true;
 }
 
+// the measured weight kept with column_cached's value (AccumScanView::col_wt)
+HR_HD float cached_weight(const AccumScanView& s, int k, int t, int c) {
+    return s.col_wt[(static_cast<std::size_t>(s.col_slot[k]) * s.col_rows + t) * s.col_stride + c];
+}
+
+// Measured pixels only, from the block's exactly read rows (AccumScanView::col_wt): the row's value at source
+// position c0 - fract_x with the splat's weight of the two columns around it, where both carry a weight (measured,
+// and no unmeasured column or end of the row within col_guard columns); elsewhere nothing. The rows are intensities
+// (what the detector band-limits; their -log is not band-limited): with AccumParams::log_values the -log is taken
+// of the value read.
+HR_HD void measured_exact_term(const AccumScanView& s, int k, int t, int c0, float A, const AccumParams& p, float& R, float& RW) {
+    if (c0 - 1 < 0 || c0 >= s.det_cols || A <= 0.f) return;
+    const float w0 = cached_weight(s, k, t, c0 - 1), w1 = cached_weight(s, k, t, c0);
+    if (!(w0 > 0.f) || !(w1 > 0.f)) return;
+    const float wlin = add(mul(s.fract_x, w0), mul(sub(1.0f, s.fract_x), w1));
+    float val = column_cached(s, k, t, c0);
+    if (p.log_values) val = sino_core::minus_log(val, p.log_clip_min, p.log_clip_max);
+    R = add(R, mul(mul(val, wlin), A));
+    RW = add(RW, mul(wlin, A));
+}
+
 // all contributions of projection k (role: 0 lower bin, 1 upper bin) to merged column X, row t,
 // in project_radio order: [c-1 right share] [left border pad (c == 0)] [c left share] [right border pad]
 HR_HD void contribute(const AccumScanView& s, int k, int role, int t, int X, const AccumParams& p,
@@ -263,6 +284,10 @@ HR_HD void contribute(const AccumScanView& s, int k, int role, int t, int X, con
     const int c0 = rel - s.ixs;              // source column whose left share lands on X
     const int c1 = c0 - 1;                   // source column whose right share lands on X
     // (all taps inside the detector: no border pad lands on X either)
+    if (s.col_shifted && p.measured_only) {
+        measured_exact_term(s, k, t, c0, A, p, R, RW);
+        return;
+    }
     if (s.col_shifted) {
         if (exact_term(s, k, t, c0, A, p, R, RW)) return;
     } else if (s.x_taps > 0 && kernel_term(s, k, t, c0, A, p, R, RW)) {
@@ -354,18 +379,9 @@ HR_HD void fill_measured_row(float* frame, const float* w, int H, int NX, int t,
     }
 }
 
-// one row (length NX) of R / RW, nabuxx mend_null_weights semantics on the usable columns [x0, x1) of the merged row:
-// columns there whose weight is below thr x (mean weight over [x0, x1)) take the value of the nearest column (either
-// side, anywhere in the row) whose weight reaches that level (ties: the left one)
-HR_HD void mend_row(float* r, const float* w, int NX, float thr, int x0, int x1) {
-    x0 = x0 < 0 ? 0 : x0;
-    x1 = x1 > NX ? NX : x1;
-    const int n_valid = x1 - x0;
-    if (n_valid <= 0) return;
-    float s = 0.f;
-    for (int x = x0; x < x1; ++x) s = add(s, w[x]);
-    const float avg = div(s, static_cast<float>(n_valid));
-    const float lim = mul(avg, thr);
+// the columns of [x0, x1) whose weight is below lim take the value of the nearest column (either side, anywhere in
+// the row) whose weight reaches it (ties: the left one)
+HR_HD void fill_below(float* r, const float* w, int NX, float lim, int x0, int x1) {
     // (run by run: every column of a run of columns below the level has the same supported columns either side, and
     // nearest_supported for each of them is the nearer of the two, found once)
     for (int x = x0; x < x1;) {
@@ -383,6 +399,54 @@ HR_HD void mend_row(float* r, const float* w, int NX, float thr, int x0, int x1)
         }
         x = e;
     }
+}
+
+// one row (length NX) of R / RW, nabuxx mend_null_weights semantics on the usable columns [x0, x1) of the merged row:
+// columns there whose weight is below thr x (mean weight over [x0, x1)) take the value of the nearest column (either
+// side, anywhere in the row) whose weight reaches that level (ties: the left one)
+HR_HD void mend_row(float* r, const float* w, int NX, float thr, int x0, int x1) {
+    x0 = x0 < 0 ? 0 : x0;
+    x1 = x1 > NX ? NX : x1;
+    const int n_valid = x1 - x0;
+    if (n_valid <= 0) return;
+    float s = 0.f;
+    for (int x = x0; x < x1; ++x) s = add(s, w[x]);
+    const float avg = div(s, static_cast<float>(n_valid));
+    fill_below(r, w, NX, mul(avg, thr), x0, x1);
+}
+
+// One row of measured values and weights by detector column (measured_column: value over weight, weight; zero and
+// zero where unmeasured), made ready for an exact read (AccumScanView::col_wt): the unmeasured columns take the
+// value of the nearest measured one, and the weights within `guard` columns of an unmeasured column or of the row's
+// ends become zero.
+HR_HD void measured_row_for_exact_read(float* val, float* w, int n, int guard) {
+    fill_below(val, w, n, 1.17549435e-38f, 0, n);
+    // (a measured column to be dropped is negated first, so that the second pass still tells it from an unmeasured one)
+    int last = -1;
+    for (int x = 0; x < n; ++x) {
+        if (!(w[x] > 0.f)) { w[x] = 0.f; last = x; }
+        else if (x - last <= guard) w[x] = -w[x];
+    }
+    last = n;
+    for (int x = n - 1; x >= 0; --x) {
+        if (w[x] == 0.f) last = x;
+        else if (last - x <= guard && w[x] > 0.f) w[x] = -w[x];
+    }
+    for (int x = 0; x < n; ++x) if (w[x] < 0.f) w[x] = 0.f;
+}
+
+// the measured intensity of projection k at stack row t, detector column c (measured_column without the -log: see
+// measured_exact_term) as value and weight; zero and zero where unmeasured or not finite
+HR_HD void measured_value(const AccumScanView& s, int k, int t, int c, AccumParams p, float& val, float& wt) {
+    float v, w;
+    p.log_values = false;
+    measured_column(s, k, t, c, p, v, w);
+    val = wt = 0.f;
+    if (!(w > 0.f)) return;
+    const float q = div(v, w);
+    if (!hd::is_finite(q)) return;
+    val = q;
+    wt = w;
 }
 
 }  // namespace helirec::accum_core

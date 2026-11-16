@@ -296,7 +296,7 @@ def ideal(X, Y):
     return 1 + 0.05 * np.exp(-0.5 * ((X - C0) / 20) ** 2) * np.cos(2 * np.pi * 0.31 * X + 0.4) + 0.004 * (Y - V0)
 
 
-def frame_scan(tmp_path, name, eu=None, ev=None, offset=0.0, stretch_cols=0.0, stretch_rows=0.0, **kw):
+def frame_scan(tmp_path, name, eu=None, ev=None, offset=0.0, stretch_cols=0.0, stretch_rows=0.0, weight=None, **kw):
     """a stationary scan whose frames show `ideal` through a detector: pixel (c, v) records the scene at
     (c + eu(c, v) + stretch_cols (c - C0), v + ev(c, v) + stretch_rows (v - V0)); kw: what make_scan_data is told"""
     v, c = np.mgrid[:NR, :ND].astype(np.float64)
@@ -309,7 +309,7 @@ def frame_scan(tmp_path, name, eu=None, ev=None, offset=0.0, stretch_cols=0.0, s
             f.create_dataset("data", data=np.broadcast_to(frame, (NPROJ, NR, ND)).copy(), chunks=(1, NR, ND))
     return _core.make_scan_data(np.arange(NPROJ) * (360 / 64), np.zeros(NPROJ), .01, NR, ND, 0, -offset, 0., np.full(NPROJ, .2),
                                 np.array([0], np.float32), np.zeros((NR, ND), np.float32),
-                                np.full((1, NR, ND), 50000, np.float32), np.ones((NR, ND), np.float32),
+                                np.full((1, NR, ND), 50000, np.float32), np.ones((NR, ND), np.float32) if weight is None else weight,
                                 _core.RawReader([str(path)], "data", NR, ND), np.zeros(NPROJ, np.int32),
                                 np.arange(NPROJ, dtype=np.int32), **kw)
 
@@ -407,6 +407,53 @@ def test_scan_with_frame_scales(tmp_path, device):
 
 
 @pytest.mark.parametrize("device", DEVICES)
+def test_measured_pixels_are_gridded_through_a_detector_map(tmp_path, device):
+    """the gridding of measured pixels only (the iterative methods) reads a scan with the lateral part of a map, a
+    column scale or a lateral registration exactly, as FBP's gridding does: the scene recorded on the ideal grid
+    comes back where it is measured, and nothing is gridded next to the row's ends or to an unmeasured column"""
+    it = dict(backprojector="sirt", tomo_params={"num_iter": "1"})
+    full = lambda scan: recon(scan, device, rot_center=C0, grid_size=33, z_interp="linear", **it).reconstruct(8, 32, debug=True)
+    plain = gridded(frame_scan(tmp_path, "plain"), device, **it)
+    assert np.ptp(plain.mean((0, 1))) > 0.04                                   # the column pattern is there
+    eu, ev = map_terms(MAP["map_eu"]), map_terms(MAP["map_ev"])
+    assert np.abs(gridded(frame_scan(tmp_path, "smooth", eu, ev, **MAP), device, **it) - plain).max() < BITS
+    assert np.abs(gridded(frame_scan(tmp_path, "smooth", eu, ev), device, **it) - plain).max() > 0.03
+    cs = 0.01
+    assert np.abs(gridded(frame_scan(tmp_path, "col_scale", stretch_cols=cs, col_scale=[cs] * NPROJ, scale_col=C0), device, **it) - plain).max() < BITS
+    assert np.abs(gridded(frame_scan(tmp_path, "col_scale", stretch_cols=cs), device, **it) - plain).max() > 0.01
+    # a lateral registration: pixel c records the scene at c + 0.3, so what belongs at column c is read at c - 0.3
+    moved = dict(col_offset=[-0.3] * NPROJ, col_slope=[0.0] * NPROJ, slope_row=V0)
+    assert np.abs(gridded(frame_scan(tmp_path, "moved", lambda c, v: 0.3 + 0 * c, **moved), device, **it) - plain).max() < BITS
+    assert np.abs(gridded(frame_scan(tmp_path, "moved", lambda c, v: 0.3 + 0 * c), device, **it) - plain).max() > 0.01
+    # with a fractional column offset of the scan as well
+    shifted = gridded(frame_scan(tmp_path, "plain", offset=0.5), device)       # (FBP's gridding: the exact delay)
+    assert np.abs(gridded(frame_scan(tmp_path, "smooth", eu, ev, offset=0.5, **MAP), device, **it) - shifted).max() < BITS
+    # the rays that count: none within the guard of the row's ends (3 columns + the bound of the map's reach, 1.6 px
+    # here: 5 or 6 columns), and a sample needs the two columns around it
+    mapped, bare = full(frame_scan(tmp_path, "smooth", eu, ev, **MAP)), full(frame_scan(tmp_path, "plain"))
+    held = lambda r: np.flatnonzero((np.asarray(r["weights"]) > 0).any((0, 1)))
+    assert tuple(held(bare)[[0, -1]]) == (0, ND - 1)
+    guard = held(mapped)[0] - 1
+    assert guard in (5, 6) and held(mapped)[-1] == ND - 1 - guard
+    # an unmeasured column of the detector: the samples within the guard of it are left out, the others stay, with
+    # what the read takes of the filled column (its neighbour's value) from further off: under 1.5 % of the pattern's
+    # amplitude just outside the guard, falling as 1 / distance
+    weight = np.ones((NR, ND), np.float32)
+    weight[:, 100] = 0
+    holed = full(frame_scan(tmp_path, "smooth", eu, ev, weight=weight, **MAP))
+    w, w0 = np.asarray(holed["weights"]), np.asarray(mapped["weights"])
+    out = np.flatnonzero(((w > 0) != (w0 > 0)).any((0, 1)))
+    assert out.size == 2 * guard + 2 and out[0] + out[-1] == 201
+    keep = (w > 0).all((0, 1))
+    off = np.abs(np.asarray(holed["sino"]) - np.asarray(mapped["sino"]))[:, :, keep].max((0, 1))
+    assert off.max() < 1e-3 and off[np.abs(np.flatnonzero(keep) - 100.5) > 40].max() < 1.5e-4
+    if device == "cuda":
+        on_cpu = recon(frame_scan(tmp_path, "smooth", eu, ev, **MAP), "cpu", rot_center=C0, grid_size=33, z_interp="linear", **it).reconstruct(8, 32, debug=True)
+        assert np.abs(np.asarray(mapped["sino"]) - np.asarray(on_cpu["sino"])).max() < 3e-6
+        np.testing.assert_array_equal(np.asarray(mapped["weights"]) > 0, np.asarray(on_cpu["weights"]) > 0)
+
+
+@pytest.mark.parametrize("device", DEVICES)
 def test_detector_map_is_refused_where_it_cannot_be_applied(tmp_path, device):
     lateral = [dict(MAP), dict(col_scale=[0.01] * NPROJ, scale_col=C0)]
     vertical = [dict(MAP, map_eu=[0.0] * 5), dict(row_scale=[0.01] * NPROJ, scale_row=V0)]
@@ -416,8 +463,7 @@ def test_detector_map_is_refused_where_it_cannot_be_applied(tmp_path, device):
     for told in lateral:   # a lateral part needs the exact column shift: not dropped silently
         with pytest.raises(Exception, match="x_interp = sinc"):
             recon(frame_scan(tmp_path, "plain", **told), device, backprojector="fbp", x_interp="lanczos3")
-        with pytest.raises(Exception, match="measured pixels"):
-            recon(frame_scan(tmp_path, "plain", **told), device, backprojector="sirt", tomo_params={"num_iter": "1"})
+        recon(frame_scan(tmp_path, "plain", **told), device, backprojector="sirt", tomo_params={"num_iter": "1"})
     for told in vertical:  # the rows are solved wherever frames are gridded
         recon(frame_scan(tmp_path, "plain", **told), device, backprojector="fbp", x_interp="lanczos3")
         recon(frame_scan(tmp_path, "plain", **told), device, backprojector="sirt", tomo_params={"num_iter": "1"})

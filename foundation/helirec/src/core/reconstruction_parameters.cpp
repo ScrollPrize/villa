@@ -369,7 +369,7 @@ std::string mode_conventions(const std::string& mode) {
         .set("ramp_padding_reflection", text("2*rot_center (interpolated)"))
         .set("mending_domain", text("merged columns covered by the scans' weight maps"))
         .set("paganin_kernel", text("fixed, rows [-m, m], unit DC"))
-        .set("column_offset", text("x_interp (sinc by default: rows shifted exactly; lanczos3 for measured-only gridding); linear splat next to unmeasured columns"))
+        .set("column_offset", text("x_interp (sinc by default: rows shifted exactly; lanczos3 for measured-only gridding, exact there too for a scan with a lateral registration or detector map); linear splat next to unmeasured columns"))
         .set("luminosity_window", text("full 25 rows (12 context rows read either side of a chunk)"))
         .set("row_position", text("z_interp kernel (lanczos8 by default); linear next to unmeasured rows"))
         .set("angular_gridding", text("angle_interp (views by default: a sinogram row per projection, each at its measured angle; nearest: one bin of one turn, the "

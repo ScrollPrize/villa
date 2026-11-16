@@ -15,7 +15,8 @@
 // band (lanczos3 at half a pixel: 0.82 at 0.36 cycles per pixel, 0.35 at 0.45, 0 at Nyquist). With
 // AccumScanView::x_exact the rows of the block's projections are instead delayed by the offset exactly
 // (shift_rows, sino.hpp) before they are gathered; gridding of measured pixels only (iterative data) keeps the
-// kernel.
+// kernel, unless the scan has a lateral registration or the lateral part of a detector map, which a kernel of fixed
+// weights cannot apply: its rows are then read exactly as well (AccumScanView::col_wt).
 //
 // Vertically, a slice lies at a fractional detector row of each projection. The reference interpolates the two
 // neighbouring rows linearly; as the fraction sweeps all values along a helix, that is a triangle kernel along z
@@ -70,7 +71,8 @@ struct AccumScanView {
     int x_taps = 0;
     float x_w[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     // the fractional column offset by an exact band-limited shift of the block's rows instead (set_x_kernel), where
-    // accumulate computes them (col_val); the kernel above remains for the gridding of measured pixels only
+    // accumulate computes them (col_val); the kernel above remains for the gridding of measured pixels only (of a
+    // scan without a lateral registration or map: col_wt)
     int x_exact = 0;
     // optional kernel for the vertical position (z_taps > 0): the value at row t + fract_v[k] of projection k is
     // sum_i z_w[k * z_taps + i] value(t - (z_taps / 2 - 1) + i), wherever all those rows are on the detector with a
@@ -123,6 +125,19 @@ struct AccumScanView {
     int col_rows = 0;
     int col_stride = 0;
     int col_shifted = 0;
+    // Gridding of measured pixels only, of a scan with a lateral registration or the lateral part of a map (x_exact
+    // and col_offset or map_cols; accumulate sets col_wt for the block in hand, with col_val and col_shifted): the
+    // cached rows are the measured intensities of the detector's columns (measured_column: value over weight, the
+    // -log of AccumParams::log_values taken after the read; an unmeasured column takes the nearest measured one's
+    // of its row, so that the row has no step), read exactly as above. col_wt (col_val's layout, by detector column): each value's measured weight, zero for an unmeasured
+    // column and within col_guard columns of one or of the row's ends. A sample counts where the two columns around
+    // it have such a weight, with the splat's weight of them; elsewhere nothing is added (no splat of unshifted
+    // values, which would lie where the map does not put them).
+    // col_guard: the three columns either side that an exact read leans on most, plus the largest lateral
+    // displacement of the scan (map, col_scale, registration), since the weights are read by the ideal column and the
+    // values come from the detector column that looks at it.
+    const float* col_wt = nullptr;
+    int col_guard = 3;
 };
 
 // Kernel of the fractional column offset of a scan: `interp` linear (the reference splat; x_taps = 0), cubic (Keys,

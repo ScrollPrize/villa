@@ -37,6 +37,22 @@ __global__ void column_values_kernel(AccumScanView s, const int32_t* __restrict_
     out[(static_cast<size_t>(blockIdx.z) * H + t) * stride + c] = column_interp(s, slot_proj[blockIdx.z], t, c);
 }
 
+// the same for measured pixels only (measured_value): each detector column's measured value and its weight
+__global__ void measured_values_kernel(AccumScanView s, const int32_t* __restrict__ slot_proj, int H, int stride, AccumParams p,
+                                       float* __restrict__ out, float* __restrict__ wt) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    const int t = blockIdx.y;
+    if (c >= s.det_cols || t >= H) return;
+    const size_t o = (static_cast<size_t>(blockIdx.z) * H + t) * stride + c;
+    measured_value(s, slot_proj[blockIdx.z], t, c, p, out[o], wt[o]);
+}
+
+// every such row made ready for an exact read (measured_row_for_exact_read): a thread per row
+__global__ void measured_rows_kernel(float* __restrict__ val, float* __restrict__ wt, int n_rows, int n, int stride, int guard) {
+    const int q = blockIdx.x * blockDim.x + threadIdx.x;
+    if (q < n_rows) measured_row_for_exact_read(val + static_cast<size_t>(q) * stride, wt + static_cast<size_t>(q) * stride, n, guard);
+}
+
 // the delay of every cached row for the frames' lateral registration (column_delay): (n_slots, H)
 __global__ void column_delay_kernel(AccumScanView s, const int32_t* __restrict__ slot_proj, int n_slots, int H, float* __restrict__ out) {
     const int q = blockIdx.x * blockDim.x + threadIdx.x;
@@ -119,13 +135,16 @@ void accumulate(const AccumScanView& view, const ContributorList& c, const Accum
     // (work buffers of the calling thread, kept between blocks: every call finishes before it returns)
     thread_local DeviceBuffer<int32_t> d_off, d_proj, d_slot, d_slot_proj;
     thread_local DeviceBuffer<int8_t> d_role;
-    thread_local DeviceBuffer<float> d_col, d_delay;
+    thread_local DeviceBuffer<float> d_col, d_col_wt, d_delay;
     thread_local DeviceBuffer<ResampleRow> d_row;
     AccumScanView s = view;
     // the vertically interpolated values of the block's projections, once each (they are the same at every column
-    // tap of every pixel a sample lands on); measured-only gridding interpolates per corner instead
+    // tap of every pixel a sample lands on); measured-only gridding interpolates per corner instead, unless the scan
+    // has a lateral registration or the lateral part of a map: then its measured values are read exactly as well
+    // (AccumScanView::col_wt)
     std::vector<int32_t> slot, slot_proj;
-    if (!p.measured_only && !s.col_val) {
+    const bool measured_exact = p.measured_only && s.x_exact && (s.col_offset || s.map_cols);
+    if ((!p.measured_only || measured_exact) && !s.col_val) {
         contributor_slots(c, s.n_proj, slot, slot_proj);
         const std::size_t n_slots = slot_proj.size();
         const bool shift = s.x_exact && (s.fract_x != 0.f || s.col_offset || s.map_cols);
@@ -134,9 +153,16 @@ void accumulate(const AccumScanView& view, const ContributorList& c, const Accum
         s.col_slot = load(d_slot, slot, st);
         dim3 block(128, 1, 1), grid((s.det_cols + 127) / 128, p.H, static_cast<unsigned>(n_slots));
         const int32_t* sp = load(d_slot_proj, slot_proj, st);
-        column_values_kernel<<<grid, block, 0, st>>>(s, sp, p.H, stride, d_col.data());
-        HELIREC_CUDA_CHECK(cudaGetLastError());
         const int n_rows = static_cast<int>(n_slots) * p.H;
+        if (measured_exact) {
+            d_col_wt.ensure(n_slots * p.H * stride);
+            measured_values_kernel<<<grid, block, 0, st>>>(s, sp, p.H, stride, p, d_col.data(), d_col_wt.data());
+            HELIREC_CUDA_CHECK(cudaGetLastError());
+            measured_rows_kernel<<<(n_rows + 63) / 64, 64, 0, st>>>(d_col.data(), d_col_wt.data(), n_rows, s.det_cols, stride, s.col_guard);
+        } else {
+            column_values_kernel<<<grid, block, 0, st>>>(s, sp, p.H, stride, d_col.data());
+        }
+        HELIREC_CUDA_CHECK(cudaGetLastError());
         if (shift && s.map_cols) {   // each ideal column from its detector column: the detector map, the frames' scale
             d_row.ensure(n_rows);
             resample_row_kernel<<<(n_rows + 255) / 256, 256, 0, st>>>(s, sp, static_cast<int>(n_slots), p.H, d_row.data());
@@ -159,6 +185,7 @@ void accumulate(const AccumScanView& view, const ContributorList& c, const Accum
         s.col_rows = p.H;
         s.col_stride = stride;
         s.col_shifted = shift ? 1 : 0;
+        if (measured_exact) s.col_wt = d_col_wt.data();
     }
     const int32_t* off = load(d_off, c.offsets, st);
     const int32_t* proj = load(d_proj, c.proj, st);

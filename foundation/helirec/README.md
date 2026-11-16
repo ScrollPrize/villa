@@ -216,7 +216,8 @@ on its own from Python (`helirec._core`, re-exported in `helirec`) on NumPy arra
     forward projector walks one boundary per thread (two pixels per step, positions in 2⁻³² pixel fixed point) and a
     cell is the difference of its two boundaries; the backprojector reaches a pixel's four cells through three
     boundaries and skips pixels that project off the detector (`src/common/tomo_core.hpp`).
-  * SIRT and MLEM grid only measured detector pixels: no edge padding or invalid-pixel values enter their sums.
+  * SIRT and MLEM grid only measured detector pixels: no edge padding or invalid-pixel values enter their sums
+    (for a scan read through a detector map or a lateral registration see `x_interp`).
     `mend_threshold` removes weak support relative to each row's mean positive weight. Filter context can fill
     unsupported values, but their weights stay zero. Missing angles remain excluded. `init=gridrec` fills and
     balances a separate copy; gridrec as a standalone method still uses balance-weighted rows.
@@ -516,7 +517,12 @@ on its own from Python (`helirec._core`, re-exported in `helirec`) on NumPy arra
     32-slice chunk on an RTX 5090 (gridding 0.22 → 0.26 s). The accumulated weights are the splat's in every case.
     Next to the detector edges and to columns without weight the splat is used, so unmeasured values never enter.
     Notes: a row's two ends leak into a shifted row as 1 / distance (0.3 % of the high-frequency amplitude at the
-    end, 400 columns in); the gridding of measured pixels only (SIRT, MLEM) uses `lanczos3` under `sinc`.
+    end, 400 columns in); the gridding of measured pixels only (SIRT, MLEM) uses `lanczos3` under `sinc`, except
+    for a scan with a lateral registration (`col_offset`, `col_slope`) or the lateral part of a detector map
+    (`map_eu`, `col_scale`), which a kernel of fixed weights cannot apply: its measured values are then read
+    exactly as for FBP (an unmeasured column takes its nearest measured neighbour's value before the read, so the
+    row has no step), and a sample counts only where no unmeasured column and no end of the row lies within 3
+    columns plus the scan's largest lateral displacement; nothing is splatted there. The row's ends leak as above.
   * `sharpness_weighting=auto|off|a11:a12:a21:a22:c1:c2` (default `auto`), `sharp_f` (0.35), `sharp_band` (`0.15:0.30`):
     (named `detector_smear` until 2026-11-11; that key is still accepted, and calibration caches written with the
     old names still load.)

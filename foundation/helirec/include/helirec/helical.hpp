@@ -37,7 +37,7 @@ struct ScanTrajectory {
     // read at row v + row_slope[i] (c - slope_col): a roll of the detector against the rotation axis.
     // col_offset, col_slope: the lateral counterpart: what the geometry puts at column c of row v is read at column
     // c + col_offset[i] + col_slope[i] (v - slope_row). Applied where the columns are shifted exactly
-    // (x_interp = sinc, not in the gridding of measured pixels only).
+    // (x_interp = sinc; in the gridding of measured pixels only as well: AccumScanView::col_wt).
     std::vector<float> row_offset;
     std::vector<float> row_slope;
     float slope_col = 0;

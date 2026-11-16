@@ -126,20 +126,31 @@ void accumulate(const AccumScanView& view, const ContributorList& c, const Accum
     const int L = c.g1 - c.g0;
     AccumScanView s = view;
     // the vertically interpolated values of the block's projections, once each (they are the same at every column
-    // tap of every pixel a sample lands on); measured-only gridding interpolates per corner instead
-    thread_local std::vector<float> col;
+    // tap of every pixel a sample lands on); measured-only gridding interpolates per corner instead, unless the scan
+    // has a lateral registration or the lateral part of a map: then its measured values are read exactly as well
+    // (AccumScanView::col_wt)
+    thread_local std::vector<float> col, col_wt;
     std::vector<int32_t> slot, slot_proj;
-    if (!p.measured_only && !s.col_val && !c.proj.empty()) {
+    const bool measured_exact = p.measured_only && s.x_exact && (s.col_offset || s.map_cols);
+    if ((!p.measured_only || measured_exact) && !s.col_val && !c.proj.empty()) {
         contributor_slots(c, s.n_proj, slot, slot_proj);
         const int n_slots = static_cast<int>(slot_proj.size()), W = s.det_cols;
         const bool shift = s.x_exact && (s.fract_x != 0.f || s.col_offset || s.map_cols);
         const int stride = shift ? shift_row_stride(W) : W;
         col.resize(static_cast<std::size_t>(n_slots) * p.H * stride);
-        float* const values = col.data();   // (the calling thread's buffer: `col` names another in each worker)
+        if (measured_exact) col_wt.resize(col.size());
+        float* const values = col.data();   // (the calling thread's buffers: `col` names another in each worker)
+        float* const weights = col_wt.data();
 #pragma omp parallel for collapse(2) schedule(dynamic, 4)
         for (int q = 0; q < n_slots; ++q)
             for (int t = 0; t < p.H; ++t) {
                 float* out = values + (static_cast<std::size_t>(q) * p.H + t) * stride;
+                if (measured_exact) {
+                    float* wt = weights + (static_cast<std::size_t>(q) * p.H + t) * stride;
+                    for (int x = 0; x < W; ++x) measured_value(s, slot_proj[q], t, x, p, out[x], wt[x]);
+                    measured_row_for_exact_read(out, wt, W, s.col_guard);
+                    continue;
+                }
                 for (int x = 0; x < W; ++x) out[x] = column_interp(s, slot_proj[q], t, x);
             }
         if (shift && s.map_cols) {   // each ideal column from its detector column: the detector map, the frames' scale
@@ -165,6 +176,7 @@ void accumulate(const AccumScanView& view, const ContributorList& c, const Accum
         s.col_rows = p.H;
         s.col_stride = stride;
         s.col_shifted = shift ? 1 : 0;
+        if (measured_exact) s.col_wt = weights;
     }
     for (int pass = 0; pass < (weight2 ? 2 : 1); ++pass) {
         if (pass == 1) s.weight = weight2;
