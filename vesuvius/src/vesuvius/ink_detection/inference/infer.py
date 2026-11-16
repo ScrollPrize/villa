@@ -654,7 +654,12 @@ class FlatBlockDataset(Dataset):
         )
         # Measure occupancy before normalization because robust normalization
         # maps an all-zero patch to nonzero values.
-        nonempty = int(patch_HWZ.any())
+        if self.emit_surface_pixels:
+            # A rendered pixel off the surface is zero in every selected layer.
+            surface_pixels = patch_HWZ.any(axis=-1)
+            nonempty = int(surface_pixels.any())
+        else:
+            nonempty = int(patch_HWZ.any())
         patch_ZYX = np.moveaxis(patch_HWZ, -1, 0)
         patch_ZYX = normalize_flat_patch(patch_ZYX, self.preprocessing)
         image_CZYX = torch.from_numpy(patch_ZYX).unsqueeze(0)
@@ -663,10 +668,7 @@ class FlatBlockDataset(Dataset):
             dtype=torch.int64,
         )
         if self.emit_surface_pixels:
-            # A rendered pixel off the surface is zero in every selected layer.
-            # Taken on the raw patch, like nonempty above.
-            surface_pixels = torch.from_numpy(patch_HWZ.any(axis=-1))
-            return image_CZYX, metadata, surface_pixels
+            return image_CZYX, metadata, torch.from_numpy(surface_pixels)
         return image_CZYX, metadata
 
 
@@ -963,6 +965,14 @@ def run_block_inference(
         for batch in loader:
             images_BCZYX, metadata = batch[0], batch[1]
             surface_pixels = batch[2] if len(batch) > 2 else None
+            if surface_pixels is not None and (
+                surface_pixels.dtype != torch.bool
+                or surface_pixels.shape != images_BCZYX.shape[:1] + images_BCZYX.shape[-2:]
+            ):
+                raise TypeError(
+                    "The third loader column must be a boolean (B, H, W) surface "
+                    f"map, got {surface_pixels.dtype} {tuple(surface_pixels.shape)}"
+                )
             # The dataset records occupancy on raw patches; normalized all-zero
             # input is not a valid signal for this skip.
             keep = metadata[:, 4] > 0
@@ -1382,7 +1392,7 @@ def infer_single_zarr(
         blocks=blocks,
         patch_size=patch_size,
         preprocessing=configured_model.preprocessing,
-        emit_surface_pixels=not getattr(args, "predict_off_surface", False),
+        emit_surface_pixels=args.mask_off_surface,
     )
     effective_batch_size = args.batch_size * max(1, len(args.gpu_ids))
     loader_kwargs: dict[str, Any] = {
@@ -1674,10 +1684,10 @@ def parse_args(argv: Sequence[str] | None = None):
     parser.add_argument("--output-prefix", default="")
     parser.add_argument("--mask-path", type=Path)
     parser.add_argument(
-        "--predict-off-surface",
+        "--mask-off-surface",
         action="store_true",
-        help="Also write predictions on pixels that are zero in every selected "
-        "layer (no surface). By default those pixels stay empty.",
+        help="Leave empty the pixels that are zero in every selected layer (no "
+        "surface). By default a scheduled tile is written in full.",
     )
     parser.add_argument(
         "--roi", nargs=4, type=int,
