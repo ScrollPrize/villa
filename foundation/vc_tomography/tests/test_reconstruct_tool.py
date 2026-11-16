@@ -1,6 +1,6 @@
 """vc_tomography_reconstruct (tools/vc_tomography_reconstruct.cpp) and vc_tomography::Reconstruction end to end, on a small synthetic
 two-scan helical acquisition written the way BLISS / Lima write one (a rest turn, a helix of four turns, a rest
-turn; 200 x 240 frames) with a geometry calibration made up for it (tests/test_geometry.py): the outputs of both
+turn; 200 x 240 frames) with a joint geometry calibration made up for it (helpers.joint_calibration): the outputs of both
 modes and formats, uint8 alone, the reference volume's mask, previews, the config file, and what is refused."""
 import json
 import os
@@ -13,11 +13,10 @@ from vc_tomography import _core
 from vc_tomography import geometry as G
 from vc_tomography.recon import HelicalRecon
 
-from helpers import find_tool
+from helpers import find_tool, joint_calibration
 
 h5py = pytest.importorskip("h5py")
 tifffile = pytest.importorskip("tifffile")
-from test_geometry import _synthetic_geometry  # noqa: E402
 
 # the executable: beside the extension in a build tree, else on the PATH (an installed package)
 TOOL = find_tool("vc_tomography_reconstruct")
@@ -80,10 +79,15 @@ def _write(root, name, angles, heights_rows, axis_offset_px, outer=None):
 def acquisition(tmp_path_factory):
     """the projections folder, and the geometry calibration of its two scans"""
     root = tmp_path_factory.mktemp("acquisition")
-    cal, ang, H = _synthetic_geometry(np.random.default_rng(3))
-    masters = [_write(root / "projections", name, a, h, off) for name, a, h, off in (("s_HA", ang[0], H[0], 20.5), ("s_TA", ang[1], H[1], 90.5))]
-    cal["scans"] = masters
-    cal["map"] = G.empty_map(ROWS, COLS)
+    # 100 frames per turn at 3.6 deg + 0.3: a rest turn, a helix of four turns rising 150 rows a turn, a rest turn;
+    # the second scan half a row higher, 70 columns from the first
+    N = 100
+    ang = (np.arange(6 * N) * 3.6 + 0.3, ) * 2
+    H0 = np.concatenate([np.zeros(N), 0.5 + 150.0 * np.arange(4 * N) / N, np.full(N, 0.5 + 4 * 150.0)])
+    H = (H0, H0 + 0.5)
+    offsets = (20.5, 90.5)
+    masters = [_write(root / "projections", name, a, h, off) for name, a, h, off in zip(("s_HA", "s_TA"), ang, H, offsets)]
+    cal = joint_calibration(masters, [(COLS - 1) / 2 + off for off in offsets], H0, rows=ROWS, cols=COLS, frames_per_turn=N, pixel_um=PIXEL_UM)
     path = root / "geometry.json"
     path.write_text(json.dumps(cal, default=float))
     return root / "projections", str(path)
@@ -189,14 +193,14 @@ def test_one_scan_alone(tmp_path, acquisition):
     proj, geometry = acquisition
     r = HelicalRecon(proj, cache_dir=str(tmp_path / "cache"), device="cpu", params=dict(geometry=geometry), log=lambda *a: None)
     h = r.slice_info(0.5).view_height
-    axis = r.rot_center()                                                        # of the merged frame; the scans lie 70.5 columns apart in it
-    assert r.info["grid_size"] == 423 and r.info["merged_width"] == 311
+    axis = r.rot_center()                                                        # of the merged frame; the scans lie 70 columns apart in it
+    assert r.info["grid_size"] == 421 and r.info["merged_width"] == 310
     sizes = {}
     for which in ("main", "companion"):
         r.set_params(only_scan=which)
         assert r.info["merged_width"] == COLS and r.info["projections"] == [600]   # that scan's columns and frames, no others
         sizes[which] = r.info["grid_size"]
-    assert sizes == {"main": 2 * round(axis - 70.5) + 1, "companion": 423}        # twice each scan's own axis column, + 1
+    assert sizes == {"main": 2 * round(axis - 70) + 1, "companion": 421}        # twice each scan's own axis column, + 1
     slices = {}
     for which in ("main", "companion", ""):
         r.set_params(only_scan=which, grid_size=161)

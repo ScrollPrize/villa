@@ -275,23 +275,15 @@ struct Reconstruction::Impl {
                             " (first scan: the one with the rotation axis in its field)");
         std::vector<std::vector<double>> angles(S), H(S);
         for (std::size_t k = 0; k < S; ++k) angles[k] = scans[k].unwrapped_angles_deg, H[k] = geometry->heights_rows(scans[k].z_translation_m, scans[k].pixel_size_m);
-        const Json* model = geometry_doc.find("model");
         used.assign(S, {0, 0});
-        if (model && model->is(Json::String) && model->string == "joint") {
-            poses = geometry->scan_poses(angles, H, &not_applied);
-            for (std::size_t k = 0; k < S; ++k) {
-                // the frames the calibration was made on: those are the frames it places, and the frames on disk
-                const auto runs = geometry->frames_placed(k);
-                if (runs.size() != 1 || runs[0][1] > angles[k].size())
-                    throw Error("the geometry calibration holds " + std::to_string(runs.size()) + " separate runs of frames of " + scans[k].name +
-                                " (stretches that do not follow one another were on disk): the reconstruction takes one run of frames per scan");
-                used[k] = runs[0];
-            }
-        } else {  // a file of the earlier two-scan step
-            if (S != 2) throw Error("geometry " + geometry_path + " is of the earlier two-scan step: it places two scans");
-            std::array<geometry::Poses, 2> pair = geometry->frame_poses({angles[0], angles[1]}, {H[0], H[1]}, &not_applied);
-            poses = {std::move(pair[0]), std::move(pair[1])};
-            for (std::size_t k = 0; k < S; ++k) used[k] = {0, angles[k].size()};
+        poses = geometry->scan_poses(angles, H, &not_applied);
+        for (std::size_t k = 0; k < S; ++k) {
+            // the frames the calibration was made on: those are the frames it places, and the frames on disk
+            const auto runs = geometry->frames_placed(k);
+            if (runs.size() != 1 || runs[0][1] > angles[k].size())
+                throw Error("the geometry calibration holds " + std::to_string(runs.size()) + " separate runs of frames of " + scans[k].name +
+                            " (stretches that do not follow one another were on disk): the reconstruction takes one run of frames per scan");
+            used[k] = runs[0];
         }
         if (legacy())
             for (std::size_t k = 0; k < S; ++k)

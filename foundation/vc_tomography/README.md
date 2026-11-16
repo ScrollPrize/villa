@@ -1532,8 +1532,8 @@ there), or `--set geometry=OUT/geometry.json` (`params["geometry"]`). Every
 projection is read on the grid of the calibration's detector map (the rows at the mapped row by the row
 kernel, the columns resampled exactly: `resample_rows`, a non-uniform transform of the interpolant the exact shift
 uses, within 1e-6 of the direct sum), at the pose `geometry.frame_poses` gives its frame, and at the angle of its
-rows. `vc_tomography/geometry.hpp` reads a pair's calibration (and still a file of the earlier two-scan step, which
-nothing writes any more); the poses are the model's, frame by frame, and the slices are numbered from the first
+rows. `vc_tomography/geometry.hpp` reads a pair's calibration (a joint one: files of the earlier two-scan step are
+refused); the poses are the model's, frame by frame, and the slices are numbered from the first
 scan's row at its helix' first frame. The frame the two scans are merged in is laid out from the same poses (`geometry.merged_layout`: the medians
 over the helix of the axis' column and of the second scan's place, on a quarter-pixel grid; PHerc0343P: axis
 1684.75 in the first scan's columns, the second scan 843.5 columns and 1.0 rows from it, the axis at 2528.25 of

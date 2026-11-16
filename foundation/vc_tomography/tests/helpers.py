@@ -45,3 +45,26 @@ def raw_scan(path, raw, angles_deg, z_m=None, *, shift_x=0, x_readjustment=0.0, 
                                 np.array([0], np.float32), frame(dark), flats, frame(1.0) if weight is None else weight,
                                 _core.RawReader([str(path)], "data", nr, nd), np.zeros(n, np.int32), np.arange(n, dtype=np.int32),
                                 **terms)
+
+
+def joint_calibration(masters, axes, heights, *, rows, cols, frames_per_turn, pixel_um, first=0, end=None, frame_period_s=0.03):
+    """A geometry calibration in the step's own form ("model": "joint"; vc_tomography_calibration geometry) of scans
+    that each recorded one helix of len(heights) frames, of which [first, end) were on disk: scan k (its master
+    masters[k], named by the last "_" part before the scan number) has its rotation axis at the column axes[k], and nothing else
+    (no map, roll, stage motion, rows' timing or place)."""
+    import numpy as np
+
+    from vc_tomography import geometry as G
+    n = len(heights)
+    end = n if end is None else end
+    stretch = dict(name="helix", index=0, helix=True, frames=n, first=first, end=end, offset=0)
+    mid = float(np.asarray(heights)[(first + end) // 2])
+    names = [str(m).rsplit("/", 1)[-1].removesuffix(".h5").rsplit("_", 1)[0].split("_")[-1] for m in masters]   # s_B_HA_0001.h5: HA
+    return dict(step="geometry", model="joint", scans=[str(m) for m in masters],
+                layout=dict(rows=rows, cols=cols, frames_per_turn=frames_per_turn, pixel_um=pixel_um, row_sign=-1.0, anchor=0,
+                            scans=[dict(name=name, mid_height=mid, coarse_axis=a, stretches=[stretch]) for name, a in zip(names, axes)]),
+                row_time=dict(seconds_per_row=0.0, frame_period_s=frame_period_s, frames_per_row=0.0, measured=None), map=G.empty_map(rows, cols),
+                parameters=dict(roll=0.0, pitch=0.0, stage=dict(height_once=[0.0, 0.0], axis_twice=[0.0, 0.0]), about_height=0.0,
+                                scans=[dict(name=name, axis=a, axis_slope=0.0, axial_scale=0.0, column_scale=0.0, d=[0.0, 0.0], height=0.0,
+                                            stretch_height=dict(helix=0.0), mid_height=mid, height_once=[0.0, 0.0], rotation=[0.0, 0.0, 0.0])
+                                        for name, a in zip(names, axes)]))

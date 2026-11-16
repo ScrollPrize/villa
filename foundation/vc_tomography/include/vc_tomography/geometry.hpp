@@ -6,8 +6,8 @@
 //
 //   Calibration   a helical acquisition of scans that share their place on the rotation stage (one scan, or
 //                 several moved sideways): vc_tomography_calibration geometry's file ("model": "joint";
-//                 geometry_calibration.hpp states the model), any number of scans; and still a file of the earlier
-//                 two-scan step (with its motion stage), which nothing writes any more
+//                 geometry_calibration.hpp states the model), any number of scans. Files of the earlier
+//                 two-scan step (with a motion stage) are refused.
 //   TileGeometry  the tiles of a mosaic (python/vc_tomography/mosaic.py states its form; nothing makes one at present)
 //
 // Nothing here reads frames: the record's angle and height of every frame are given by the caller.
@@ -108,8 +108,7 @@ class Calibration {
     bool rows_from_middle() const;
     // The beam's divergence [rad per stored column, signed]: the ray recorded at the column c of a frame is a
     // parallel beam's at the frame's angle + fan x (c - the middle column) (geometry_calibration.hpp,
-    // Acquisition::fan, there in frames per column). 0: the record stated no source distance, or the calibration is
-    // of the earlier two-scan step.
+    // Acquisition::fan, there in frames per column). 0: the record stated no source distance.
     double fan() const;
     // The middle of the columns both scans hold, in the first scan's columns.
     double overlap_centre() const;
@@ -117,16 +116,12 @@ class Calibration {
     // Of a joint calibration of scans without a helix (circular scans): the first scan's first stretch.
     std::array<std::size_t, 2> helix_frames() const;
 
-    // angles_deg[s], heights_rows[s]: the record's angle (unwrapped) and height (rows: row_sign x height / pixel)
-    // of every frame of scan s, the stretches one after the other (rest1, helix, rest2).
+    // The poses of the two scans of a calibration of a pair. angles_deg[s], heights_rows[s]: the record's angle
+    // (unwrapped) and height (rows: row_sign x height / pixel) of every frame of scan s, the stretches one after the
+    // other. not_applied: receives, as JSON, what the model leaves and the poses do not hold. It is an error if the
+    // calibration does not place every frame given.
     //
-    // The first scan is placed by what its own redundant views measured: the helix against the encoder (a line in
-    // the turn, from views a turn apart), the rest turns against the helix at equal angle, the axis' column of
-    // each stretch with the rotating body's place against it, the height once per turn. The second scan is the
-    // first one's model at the same frame plus what the comparison of the two scans at equal frames measured.
-    // not_applied: receives, as JSON, the terms the step measured and this does not use.
-    //
-    // A joint calibration's poses are its model's, frame by frame (th and H the record's angle and height):
+    // The poses are the joint model's, frame by frame (th and H the record's angle and height):
     //     row         height + the stretch's height + (1 + axial_scale) H + the stage's lift once per turn - roll d . n(th)
     //                 + pitch d . (-sin th, cos th) (the pitch of the axis towards the beam, where the calibration has
     //                 one: the row of the rays through the sample's origin),

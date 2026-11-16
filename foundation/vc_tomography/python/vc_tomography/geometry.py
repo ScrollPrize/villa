@@ -327,8 +327,8 @@ def to_stored_pixels(acquisition_, parameters, rows, cols, f):
 # ---------------------------------------------------------------- the pose of every frame
 
 def frame_poses(cal, angles_deg, heights_rows):
-    """Where every frame of the two scans of a pair holds the sample, from the step's result `cal` (or from a file
-    of the earlier two-scan step, with its motion stage, which the last paragraph below describes).
+    """Where every frame of the two scans of a pair holds the sample, from the step's result `cal` (a joint
+    calibration; files of the earlier two-scan step, with a motion stage, are refused).
 
     angles_deg[s], heights_rows[s]: the record's angle (unwrapped) and height (rows: the layout's row_sign x height
     / pixel) of every frame of scan s, the stretches one after the other (rest1, helix, rest2).
@@ -343,13 +343,7 @@ def frame_poses(cal, angles_deg, heights_rows):
     The step's poses are its model's, frame by frame (vc_tomography/geometry.hpp lists them): the row from the scan's
     height, its stretch's, the axial scale and the stage's lift once per turn; the axis from the scan's axis
     column, its slope along the travel, the stage's move twice per turn and the scan's place; the slopes from the
-    roll; the rows' timing in angle_deg_per_row and row_scale. What the solve left is under "not_applied".
-
-    A file of the earlier two-scan step: the first scan is placed by what its own redundant views measured (the
-    helix against the encoder, the rest turns against the helix at equal angle, the axis' column of each stretch
-    with the rotating body's place against it, the height once per turn), the second scan is the first one's model
-    at the same frame plus what the comparison of the two scans at equal frames measured, and the terms that step
-    measured and this does not use are listed under "not_applied"."""
+    roll; the rows' timing in angle_deg_per_row and row_scale. What the solve left is under "not_applied"."""
     from . import _core
     C = _core.GeometryCalibration(_text(cal))          # vc_tomography::geometry::Calibration::frame_poses
     ang = [np.ascontiguousarray(a_, np.float64) for a_ in angles_deg]

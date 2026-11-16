@@ -16,7 +16,7 @@ from vc_tomography import calibration as C
 from vc_tomography import geometry as G
 from vc_tomography.recon import HelicalRecon
 
-from helpers import find_tool
+from helpers import find_tool, joint_calibration
 
 h5py = pytest.importorskip("h5py")
 from test_reconstruct_tool import COLS, PIXEL_UM, ROWS, _write  # noqa: E402
@@ -34,18 +34,8 @@ PEAK_OUTER = OUTER[2] / (OUTER[3] * np.sqrt(2 * np.pi)) / PIXEL_CM
 
 def _geometry(masters, n, first=0, end=None):
     """The step's file for the three scans: each one helix of n frames, of which [first, end) were on disk"""
-    end = n if end is None else end
-    heights = TRAVEL / PER_TURN * np.arange(n)
-    stretch = dict(name="helix", index=0, helix=True, frames=n, first=first, end=end, offset=0)
-    axes = [(COLS - 1) / 2 + off for off in OFFSETS]
-    mid = float(heights[(first + end) // 2])
-    return dict(step="geometry", model="joint", scans=masters,
-                layout=dict(rows=ROWS, cols=COLS, frames_per_turn=PER_TURN, pixel_um=PIXEL_UM, row_sign=-1.0, anchor=0,
-                            scans=[dict(name=name.split("_")[-1], mid_height=mid, coarse_axis=a, stretches=[stretch]) for name, a in zip(NAMES, axes)]),
-                row_time=dict(seconds_per_row=0.0, frame_period_s=0.03, frames_per_row=0.0, measured=None), map=G.empty_map(ROWS, COLS),
-                parameters=dict(roll=0.0, pitch=0.0, stage=dict(height_once=[0.0, 0.0], axis_twice=[0.0, 0.0]), about_height=0.0,
-                                scans=[dict(name=name.split("_")[-1], axis=a, axis_slope=0.0, axial_scale=0.0, column_scale=0.0, d=[0.0, 0.0], height=0.0,
-                                            stretch_height=dict(helix=0.0), mid_height=mid, height_once=[0.0, 0.0], rotation=[0.0, 0.0, 0.0]) for name, a in zip(NAMES, axes)]))
+    return joint_calibration(masters, [(COLS - 1) / 2 + off for off in OFFSETS], TRAVEL / PER_TURN * np.arange(n), rows=ROWS, cols=COLS,
+                             frames_per_turn=PER_TURN, pixel_um=PIXEL_UM, first=first, end=end)
 
 
 @pytest.fixture(scope="module")

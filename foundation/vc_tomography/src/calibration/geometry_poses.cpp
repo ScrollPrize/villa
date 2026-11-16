@@ -44,19 +44,6 @@ std::vector<double> numbers(const Json& v, const std::string& what) {
 std::vector<double> numbers(const Json& j, const std::string& key, const std::string& where) {
     return numbers(member(j, key, where), "\"" + key + "\" of " + where);
 }
-// a list of lists of numbers, each at least `width` long
-std::vector<std::vector<double>> table(const Json& v, std::size_t width, const std::string& what) {
-    if (!v.is(Json::Array)) throw Error("geometry: " + what + " is not a list");
-    std::vector<std::vector<double>> out;
-    out.reserve(v.array.size());
-    for (const Json& r : v.array) {
-        out.push_back(numbers(r, "a row of " + what));
-        if (out.back().size() < width) throw Error("geometry: a row of " + what + " is too short");
-    }
-    return out;
-}
-
-
 // The travel per frame [rows] as a line through the 33 frames around each (the registration's blocks are 32
 // frames; the encoder's own frame-to-frame differences are noise against a stage that moves steadily). The ends
 // are continued with the first and the last step.
@@ -112,10 +99,6 @@ Map map_of(const Json& cal) {
     if (out.j.size() != out.i.size() || out.eu.size() != out.i.size() || out.ev.size() != out.i.size())
         throw Error("geometry: the map's lists differ in length");
     return out;
-}
-
-double overlap_centre_of(const Json& lay) {
-    return overlap_centre(static_cast<int>(number(lay, "cols", "the layout")), number(lay, "coarse_move", "the layout"));
 }
 
 // whether the calibration is the joint model's (vc_tomography/calibration/geometry_calibration.hpp)
@@ -239,6 +222,9 @@ Calibration Calibration::parse(const std::string& json_text) {
     Calibration c;
     c.doc_ = std::make_shared<const Json>(Json::parse(json_text));
     if (!c.doc_->is(Json::Object)) throw Error("geometry: the calibration is not an object");
+    if (!is_joint(*c.doc_))
+        throw Error("geometry: the calibration is not a joint one (\"model\": \"joint\"); files of the earlier two-scan step are no longer read: "
+                    "make the calibration again with vc_tomography_calibration geometry");
     return c;
 }
 Calibration Calibration::load(const std::string& path) { return parse(io::read_text(path)); }
@@ -266,7 +252,7 @@ double Calibration::rolling_shutter() const {
 double Calibration::fan() const {
     const Json& lay = member(*doc_, "layout", "the geometry");
     const Json* v = lay.find("fan");
-    if (!is_joint(*doc_) || !v || !v->is(Json::Number) || v->number == 0.0) return 0.0;
+    if (!v || !v->is(Json::Number) || v->number == 0.0) return 0.0;
     return v->number * (2 * kPi / number(lay, "frames_per_turn", "the layout"));
 }
 bool Calibration::rows_from_middle() const {
@@ -275,18 +261,13 @@ bool Calibration::rows_from_middle() const {
 }
 double Calibration::overlap_centre() const {
     const Json& lay = member(*doc_, "layout", "the geometry");
-    if (!is_joint(*doc_)) return overlap_centre_of(lay);
     const Json& scans = member(lay, "scans", "the layout");
     if (!scans.is(Json::Array) || scans.array.size() < 2) throw Error("geometry: the calibration is not of two scans");
     const double move = std::nearbyint(number(scans.array[1], "coarse_axis", "the second scan") - number(scans.array[0], "coarse_axis", "the first scan"));
     return geometry::overlap_centre(cols(), move);
 }
 std::array<std::size_t, 2> Calibration::helix_frames() const {
-    if (is_joint(*doc_)) return joint_helix(*doc_, 0);
-    const Json& frames = member(member(*doc_, "layout", "the geometry"), "frames", "the layout");
-    if (!frames.is(Json::Array) || frames.array.empty()) throw Error("geometry: the layout's frames are not a list");
-    const std::size_t a = static_cast<std::size_t>(number(frames.array[0], "rest1", "the layout's frames"));
-    return {a, a + static_cast<std::size_t>(number(frames.array[0], "helix", "the layout's frames"))};
+    return joint_helix(*doc_, 0);
 }
 
 namespace {
@@ -441,7 +422,7 @@ std::vector<Poses> joint_poses(const Json& cal, int rows, const std::vector<std:
 
 std::size_t Calibration::scan_named(const std::string& name) const {
     const Json& placed = member(member(*doc_, "layout", "the geometry"), "scans", "the layout");
-    if (!is_joint(*doc_) || !placed.is(Json::Array)) throw Error("geometry: the calibration does not name its scans (it is not a joint calibration)");
+    if (!placed.is(Json::Array)) throw Error("geometry: the layout's scans are not a list");
     std::size_t found = placed.array.size();
     for (std::size_t k = 0; k < placed.array.size(); ++k) {
         const Json* n = placed.array[k].find("name");
@@ -454,7 +435,6 @@ std::size_t Calibration::scan_named(const std::string& name) const {
 }
 
 std::array<std::size_t, 2> Calibration::frames_on_disk(std::size_t scan) const {
-    if (!is_joint(*doc_)) throw Error("geometry: the frames a calibration was made on are a joint calibration's");
     const Json& scans = member(member(*doc_, "layout", "the geometry"), "scans", "the layout");
     if (!scans.is(Json::Array) || scan >= scans.array.size()) throw Error("geometry: the layout does not hold scan " + std::to_string(scan));
     const Json& list = member(scans.array[scan], "stretches", "a scan of the layout");
@@ -464,30 +444,26 @@ std::array<std::size_t, 2> Calibration::frames_on_disk(std::size_t scan) const {
 
 double Calibration::axis_column(std::size_t scan) const {
     const Json& scans = member(member(*doc_, "parameters", "the geometry"), "scans", "the parameters");
-    if (!is_joint(*doc_) || !scans.is(Json::Array) || scan >= scans.array.size()) throw Error("geometry: the calibration does not hold scan " + std::to_string(scan));
+    if (!scans.is(Json::Array) || scan >= scans.array.size()) throw Error("geometry: the calibration does not hold scan " + std::to_string(scan));
     return number(scans.array[scan], "axis", "a scan");
 }
 
 Poses Calibration::own_poses(std::size_t scan, const std::vector<double>& angles_deg, const std::vector<double>& heights_rows) const {
-    if (!is_joint(*doc_)) throw Error("geometry: a scan's own poses are a joint calibration's");
     std::vector<std::uint8_t> placed;
     return joint_scan_poses(*doc_, rows(), scan, angles_deg, heights_rows, true, placed);
 }
 
 std::size_t Calibration::scan_count() const {
-    if (!is_joint(*doc_)) return 2;
     const Json& placed = member(member(*doc_, "layout", "the geometry"), "scans", "the layout");
     if (!placed.is(Json::Array)) throw Error("geometry: the layout's scans are not a list");
     return placed.array.size();
 }
 
 std::vector<Poses> Calibration::scan_poses(const std::vector<std::vector<double>>& ang, const std::vector<std::vector<double>>& H, std::string* not_applied) const {
-    if (!is_joint(*doc_)) throw Error("geometry: the poses of any number of scans are a joint calibration's (vc_tomography_calibration geometry)");
     return joint_poses(*doc_, rows(), ang, H, false, not_applied);
 }
 
 std::vector<std::array<std::size_t, 2>> Calibration::frames_placed(std::size_t scan) const {
-    if (!is_joint(*doc_)) throw Error("geometry: the frames a calibration was made on are a joint calibration's");
     const Json& scans = member(member(*doc_, "layout", "the geometry"), "scans", "the layout");
     if (!scans.is(Json::Array) || scan >= scans.array.size()) throw Error("geometry: the layout does not hold scan " + std::to_string(scan));
     std::vector<std::array<std::size_t, 2>> runs;
@@ -502,211 +478,11 @@ std::vector<std::array<std::size_t, 2>> Calibration::frames_placed(std::size_t s
 
 std::array<Poses, 2> Calibration::frame_poses(const std::array<std::vector<double>, 2>& ang, const std::array<std::vector<double>, 2>& H,
                                               std::string* not_applied) const {
-    const Json& cal = *doc_;
-    if (is_joint(cal)) {
-        const Json& solved = member(member(cal, "parameters", "the geometry"), "scans", "the parameters");
-        if (scan_count() != 2 || !solved.is(Json::Array) || solved.array.size() != 2)
-            throw Error("geometry: the calibration is not of two scans (the poses of a pair are read here; of any number of scans by scan_poses, and a mosaic's tiles one at a time, own_poses)");
-        std::vector<Poses> both = joint_poses(cal, rows(), {ang[0], ang[1]}, {H[0], H[1]}, true, not_applied);
-        return {std::move(both[0]), std::move(both[1])};
-    }
-    const Json& lay = member(cal, "layout", "the geometry");
-    const Json& po = member(cal, "poses", "the geometry");
-    const Json* mo_ = po.find("motion");
-    if (!mo_ || !mo_->is(Json::Object) || !mo_->find("second_scan"))
-        throw Error("the geometry holds no motion stage with the second scan's place: run the step with motion");
-    const Json& mo = *mo_;
-    const int R = rows();
-    const double N = number(lay, "frames_per_turn", "the layout");
-    const double mid = (R - 1) / 2.0;
-    const double tau = number(member(cal, "row_time", "the geometry"), "seconds_per_row", "the rows' timing");
-    const double period = period_of(cal);
-
-    static const char* const names[3] = {"rest1", "helix", "rest2"};
-    const Json& frames = member(lay, "frames", "the layout");
-    if (!frames.is(Json::Array) || frames.array.size() != 2) throw Error("geometry: the layout's frames are not of two scans");
-    std::size_t len[3], first[3];
-    for (int a = 0; a < 3; ++a) {
-        const double l0 = number(frames.array[0], names[a], "the layout's frames"), l1 = number(frames.array[1], names[a], "the layout's frames");
-        if (l0 != l1) throw Error("the second scan is placed against the first at equal frames: the stretches must be equally long");
-        len[a] = static_cast<std::size_t>(l0);
-    }
-    first[0] = 0, first[1] = len[0], first[2] = len[0] + len[1];
-    const std::size_t n = len[0] + len[1] + len[2];
-    for (int s = 0; s < 2; ++s)
-        if (ang[s].size() != n || H[s].size() != n)
-            throw Error("the record holds " + std::to_string(ang[0].size()) + " and " + std::to_string(ang[1].size()) + " frames, the geometry " + std::to_string(n));
-    if (len[1] < len[0] || len[1] < len[2]) throw Error("geometry: a rest turn longer than the helix");
-
-    const Json& S0 = member(mo, "scan 0", "the motion stage");
-    const Json& S1 = member(mo, "scan 1", "the motion stage");
-    const Json& P2 = member(mo, "second_scan", "the motion stage");
-    const Json& starts = member(mo, "turns_at_start", "the motion stage");
-    if (!starts.is(Json::Array) || starts.array.empty()) throw Error("geometry: the motion stage's turns_at_start is not a list");
-    double start[3];
-    for (int a = 0; a < 3; ++a) start[a] = number(starts.array[0], names[a], "turns_at_start");
-    const double psi = number(po, "axis_roll_rad", "the poses");
-    const Json& side = member(S0, "sideways", "the first scan's motion");
-    const Json& mcj = member(side, "mirror_column", "the first scan's sideways motion");
-    double mc[3];
-    for (int a = 0; a < 3; ++a) mc[a] = number(mcj, names[a], "the mirror column");
-    const double mc_per_row = number(mcj, "per_row", "the mirror column");
-    const double tx = number(side, "travel_px_per_row", "the first scan's sideways motion");
-    const Json& A = member(mo, "along_axis", "the motion stage");
-    const double z_cos = number(A, "z_cos", "the motion along the axis"), z_sin = number(A, "z_sin", "the motion along the axis");
-    const auto body_nodes = table(member(side, "nodes_px", "the first scan's sideways motion"), 2, "nodes_px");
-    const double body_h = number(side, "node_spacing_turns", "the first scan's sideways motion");
-
-    // the helix of the first scan against its encoder: views a turn apart give e(t + 1) - e(t) as a line in t
-    const auto tb = table(member(member(S0, "helix", "the first scan's motion"), "table", "the first scan's helix"), 4, "the helix' table");
-    std::vector<double> tt(tb.size()), ty(tb.size()), tq(tb.size());
-    for (std::size_t k = 0; k < tb.size(); ++k) tt[k] = tb[k][0] / N, ty[k] = tb[k][2], tq[k] = tb[k][3];
-    if (tb.size() < 2) throw Error("geometry: the helix' table holds fewer than two views");
-    const calibration::Line ly = calibration::fit_line(tt, ty, 0, tt.size()), lq = calibration::fit_line(tt, tq, 0, tt.size());
-    const double c1 = ly.slope, c0 = ly.intercept, g1 = lq.slope, g0 = lq.intercept;
-    const auto e = [&](double t) { return (c0 - c1 / 2) * t + (c1 / 2) * (t * t); };  // rows beyond the encoder, 0 at the helix' first frame
-    const auto G = [&](double t) { return (g0 - g1 / 2) * t + (g1 / 2) * (t * t); };  // frames beyond the encoder's angle and the rows' timing
-    const double* H0 = H[0].data();
-    const double Hh0 = H0[first[1]];
-    const long hint[3] = {0, 0, static_cast<long>(len[1]) - static_cast<long>(len[2])};
-    // the rest turns against the helix: their own terms
-    double scale_error[3] = {0, 0, 0}, offset_rows[3] = {0, 0, 0}, angle_frames[3] = {0, 0, 0}, angle_frames_per_row[3] = {0, 0, 0};
-    for (int a : {0, 2}) {
-        const Json& r = member(S0, names[a], "the first scan's motion");
-        scale_error[a] = number(r, "scale_error", names[a]), offset_rows[a] = number(r, "offset_rows", names[a]);
-        angle_frames[a] = number(r, "angle_frames", names[a]), angle_frames_per_row[a] = number(r, "angle_frames_per_row", names[a]);
-    }
-    const auto body = [&](double t_abs, double th) {  // the rotating body's place against the axis, on the columns
-        const double last = static_cast<double>(body_nodes.size());  // nodes at h, 2h, ..; (0, 0) at 0
-        const double x = std::clamp(t_abs / body_h, 0.0, last - 1e-9);
-        const std::size_t k = static_cast<std::size_t>(std::floor(x));
-        const double f = x - static_cast<double>(k);
-        const double a0 = k ? body_nodes[k - 1][0] : 0.0, a1 = k ? body_nodes[k - 1][1] : 0.0;
-        const double v0 = a0 * (1 - f) + body_nodes[k][0] * f, v1 = a1 * (1 - f) + body_nodes[k][1] * f;
-        return v0 * std::cos(th) + v1 * std::sin(th);
-    };
-    // the first scan's model at frame kk of stretch a seen at the angle enc_deg: row, axis, G
-    const auto first_scan = [&](std::size_t kk, int a, double enc_deg, double& row, double& axis, double& Gk) {
-        const double th = radians(enc_deg);
-        const double z = z_cos * std::cos(th) + z_sin * std::sin(th);
-        const double t_abs = start[a] + (static_cast<double>(kk) + 0.5) / N;
-        const double b = body(t_abs, th);
-        const double* Hs = H0 + first[a];
-        if (a == 1) {
-            const double P = Hs[kk] - Hh0;
-            row = P + e((static_cast<double>(kk) + 0.5) / N) + z;
-            axis = mc[1] + (tx - mc_per_row) * P + b;
-            Gk = G((static_cast<double>(kk) + 0.5) / N);
-            return;
-        }
-        const std::size_t f = static_cast<std::size_t>(static_cast<long>(kk) + hint[a]);  // the helix frame at the same angle, in the next turn
-        const double Hf = H0[first[1] + f];
-        const double D = Hf - Hs[kk];
-        row = (Hf - Hh0) + e((static_cast<double>(f) + 0.5) / N) - D * (1 + scale_error[a]) - offset_rows[a] + z;
-        axis = mc[a] + b;
-        Gk = G((static_cast<double>(f) + 0.5) / N) - (angle_frames[a] + angle_frames_per_row[a] * D);
-    };
-
-    // what the comparison of the two scans at equal frames measured
-    const Json& Pc = member(P2, "columns", "the second scan's place");
-    const Json& Pr = member(P2, "rows", "the second scan's place");
-    const auto col_nodes = table(member(Pc, "once_per_turn_nodes", "the second scan's columns"), 2, "once_per_turn_nodes");
-    if (col_nodes.size() < 2) throw Error("geometry: the second scan's course once per turn has fewer than two nodes");
-    const auto row_once = numbers(Pr, "once_per_turn", "the second scan's rows");
-    if (row_once.size() < 2) throw Error("geometry: the second scan's rows once per turn are not two numbers");
-    const double col_travel = number(Pc, "per_turn_of_travel", "the second scan's columns"), row_travel = number(Pr, "per_turn_of_travel", "the second scan's rows");
-    const double move = number(lay, "coarse_move", "the layout");
-    const double centre = overlap_centre_of(lay);
-    const double helix_mid = start[1] + 0.5 * static_cast<double>(len[1]) / N;
-
-    std::array<Poses, 2> out;
-    std::vector<double> step(n), travel(n);
-    for (int s = 0; s < 2; ++s) {
-        Poses& d = out[static_cast<std::size_t>(s)];
-        for (auto* v : {&d.row, &d.row_per_col, &d.axis, &d.col_per_row, &d.col_scale, &d.row_scale, &d.angle_deg, &d.angle_deg_per_row}) v->assign(n, 0.0);
-        const double* an = ang[static_cast<std::size_t>(s)].data();
-        const double* Hsc = H[static_cast<std::size_t>(s)].data();
-        // per frame, within each stretch (the record steps between the stretches): the angular step and the travel
-        for (int a = 0; a < 3; ++a) {
-            if (!len[a]) continue;
-            gradient(an + first[a], len[a], step.data() + first[a]);
-            travel_per_frame(Hsc + first[a], len[a], travel.data() + first[a]);
-        }
-        for (std::size_t k = 0; k < n; ++k) {
-            d.row_scale[k] = -travel[k] * tau / period;  // the sample travels while the rows are read
-            d.angle_deg_per_row[k] = step[k] * tau / period;
-        }
-        for (int a = 0; a < 3; ++a) {
-            double rho = 0, la = 0, lb = 0, col_offset = 0, col_per_row = 0, row_offset = 0, bv = 0, u_ref = 0;
-            if (s == 1) {
-                rho = number(member(po, "rotation_about_beam_rad", "the poses"), names[a], "the rotation about the beam");
-                const auto line = numbers(member(member(po, "second_scan", "the poses"), names[a], "the second scan's lines"), "line", "the second scan's line");
-                if (line.size() < 2) throw Error("geometry: the second scan's line is not two numbers");
-                la = line[0], lb = line[1];
-                col_offset = number(member(Pc, "offset", "the second scan's columns"), names[a], "the columns' offset");
-                col_per_row = number(member(Pc, "per_row", "the second scan's columns"), names[a], "the columns per row");
-                row_offset = number(member(Pr, "offset", "the second scan's rows"), names[a], "the rows' offset");
-                bv = number(member(Pr, "per_row", "the second scan's rows"), names[a], "the rows per row");
-                u_ref = centre - mc[a];
-            }
-            for (std::size_t kk = 0; kk < len[a]; ++kk) {
-                const std::size_t k = first[a] + kk;
-                double row, axis, Gk;
-                first_scan(kk, a, an[k], row, axis, Gk);
-                double rpc = -psi, cpr = mc_per_row;
-                if (s == 1) {
-                    const double th = radians(an[k]);
-                    const double t_abs = start[a] + (static_cast<double>(kk) + 0.5) / N;
-                    const double trav = a == 1 ? t_abs - helix_mid : 0.0;
-                    // columns: the second scan's axis = the first's (with the first body's course) + the move + what
-                    // the comparison at equal frames holds: the stretch's offset and the course once per turn
-                    const double x = std::clamp(t_abs, 0.0, static_cast<double>(col_nodes.size()) - 1 - 1e-9);
-                    const std::size_t k0 = static_cast<std::size_t>(std::floor(x));
-                    const double f = x - static_cast<double>(k0);
-                    const double E0 = col_nodes[k0][0] * (1 - f) + col_nodes[k0 + 1][0] * f, E1 = col_nodes[k0][1] * (1 - f) + col_nodes[k0 + 1][1] * f;
-                    axis = axis + move + col_offset + col_travel * trav + E0 * std::cos(th) + E1 * std::sin(th);
-                    cpr = cpr + col_per_row;
-                    rpc = rpc + rho + lb;
-                    const double once = row_once[0] * std::cos(th) + row_once[1] * std::sin(th);
-                    row = row + (Hsc[k] - H0[k]) + row_offset + row_travel * trav + once - (rho + lb) * u_ref;
-                    // the comparison's line in the row: the second scan's rows lie b (Y - middle) further on, which
-                    // is a scale of its rows about the middle row (as a scale about row 0 and an offset)
-                    d.row_scale[k] -= bv;
-                    row = row - bv * mid;
-                    d.col_scale[k] = la;
-                }
-                d.row[k] = row, d.axis[k] = axis, d.row_per_col[k] = rpc, d.col_per_row[k] = cpr;
-                d.angle_deg[k] = an[k] - step[k] * Gk;
-            }
-        }
-        d.scale_col = s == 1 ? centre + move : 0.0;
-    }
-    if (not_applied) {
-        const auto copy = [](const Json& j, const char* key) {
-            const Json* v = j.find(key);
-            return v ? *v : Json();
-        };
-        Json na = Json::dict();
-        na.set("second scan, twice per turn [px, rows]", Json::list().add(copy(Pc, "twice_per_turn")).add(copy(Pr, "twice_per_turn")));
-        const Json* af = P2.find("angle_frames");
-        Json angle = Json::dict();
-        if (af) angle.set("offset", copy(*af, "offset")).set("per_turn_of_travel", copy(*af, "per_turn_of_travel")).set("once_per_turn", copy(*af, "once_per_turn"));
-        na.set("second scan, angle against the first at equal frames [frames] (the stage's angle repeats; the comparison's angle holds the beam's divergence, "
-               "which a detector-plane term cannot express)", angle);
-        na.set("first scan, drift at rest from opposite views [rows per turn] (the rest turns are placed by the helix instead)", copy(A, "drift_rows_per_turn"));
-        Json own = Json::dict();
-        for (const char* k : {"rest1", "rest2", "helix"}) {
-            const Json* v = S1.find(k);
-            if (!v || !v->is(Json::Object)) continue;
-            Json part = Json::dict();
-            for (const auto& [q, val] : v->object)
-                if (q != "table") part.set(q, val);
-            own.set(k, part);
-        }
-        na.set("second scan's own helix and rest turns (it is placed by the first's)", own);
-        *not_applied = na.text();
-    }
-    return out;
+    const Json& solved = member(member(*doc_, "parameters", "the geometry"), "scans", "the parameters");
+    if (scan_count() != 2 || !solved.is(Json::Array) || solved.array.size() != 2)
+        throw Error("geometry: the calibration is not of two scans (the poses of a pair are read here; of any number of scans by scan_poses, and a mosaic's tiles one at a time, own_poses)");
+    std::vector<Poses> both = joint_poses(*doc_, rows(), {ang[0], ang[1]}, {H[0], H[1]}, true, not_applied);
+    return {std::move(both[0]), std::move(both[1])};
 }
 
 MergedLayout Calibration::merged_layout(const std::array<Poses, 2>& poses, const std::array<std::vector<double>, 2>& H, double quantum) const {
@@ -715,18 +491,15 @@ MergedLayout Calibration::merged_layout(const std::array<Poses, 2>& poses, const
 
 MergedLayout Calibration::merged_layout(const std::vector<Poses>& poses, const std::vector<std::vector<double>>& H, const std::vector<std::size_t>& first_frame, double quantum) const {
     const Json& lay = member(*doc_, "layout", "the geometry");
-    // the frames of the first scan's helix: all of it, or of a joint calibration what was on disk
-    const std::array<std::size_t, 2> helix = is_joint(*doc_) ? frames_on_disk(0) : helix_frames();
+    // the frames of the first scan's helix that were on disk
+    const std::array<std::size_t, 2> helix = frames_on_disk(0);
     const std::size_t a = helix[0], b = helix[1], S = poses.size();
     const double sign = number(lay, "row_sign", "the layout");
     if (!S || H.size() != S || (!first_frame.empty() && first_frame.size() != S)) throw Error("geometry: the poses, the heights and the first frames are not of the same scans");
     // Scans without a helix (circular scans) do not travel, and their frames are not one another's (a scan may be
     // a frame short): each is placed by the medians over its own stretch's frames on disk.
-    bool travels = true;
-    if (is_joint(*doc_)) {
-        const std::vector<JointStretch> stretches = joint_stretches(*doc_, 0);
-        travels = stretches[main_stretch(stretches)].helix;
-    }
+    const std::vector<JointStretch> stretches = joint_stretches(*doc_, 0);
+    const bool travels = stretches[main_stretch(stretches)].helix;
     const auto frames_of = [&](std::size_t s) { return travels || s == 0 ? helix : frames_on_disk(s); };
     for (std::size_t s = 0; s < S; ++s)
         if (poses[s].axis.size() < frames_of(s)[1] || H[s].size() < frames_of(s)[1]) throw Error("geometry: the poses do not reach the helix' end");

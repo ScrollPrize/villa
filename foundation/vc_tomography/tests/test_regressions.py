@@ -86,7 +86,8 @@ def test_merged_frame_from_the_geometry_calibration():
     quarter-pixel grid), and the placement that follows"""
     from vc_tomography import geometry
     n = 40
-    cal = dict(layout=dict(frames=[dict(rest1=10, helix=20, rest2=10)] * 2, row_sign=-1.0))
+    stretches = [dict(name="rest1", frames=10, offset=0), dict(name="helix", helix=True, frames=20, offset=10), dict(name="rest2", frames=10, offset=30)]
+    cal = dict(model="joint", layout=dict(scans=[dict(stretches=stretches)] * 2, row_sign=-1.0))
     H = [np.linspace(0, 30, n), np.linspace(0, 30, n) + 0.5]                 # (the record: the second scan half a row on)
     z_pix = [-(h - h[0]) for h in H]
     poses = [dict(axis=np.full(n, 1684.81), row=-z_pix[0] + 0.02 * np.arange(n)),
