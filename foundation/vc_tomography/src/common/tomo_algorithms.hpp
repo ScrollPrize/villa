@@ -120,4 +120,46 @@ void run(B& b, const TomoArgs& a, const float* rows, const float* weights, float
     }
 }
 
+// The backend B (CpuBackend / CudaBackend) for the geometry t and these angles: the workspace's, when it is one of
+// them for both, else a new one put there (in `local` without a workspace)
+template <class B>
+B& backend_for(const TomoGeom& t, const float* angles, std::unique_ptr<TomoWorkspace>* ws, std::unique_ptr<TomoWorkspace>& local) {
+    std::unique_ptr<TomoWorkspace>& slot = ws ? *ws : local;
+    auto* b = dynamic_cast<B*>(slot.get());
+    if (!b || !b->matches(t, angles)) {
+        slot.reset();   // (the old workspace's memory before the new one's)
+        slot = std::make_unique<B>(t, angles);
+        b = static_cast<B*>(slot.get());
+    }
+    b->keep.clear();
+    return *b;
+}
+
+// the whole N x N grid (no box, no disk)
+inline TomoGeom whole_grid(int n_angles, int n_det, int N, float rot) {
+    TomoGeom t;
+    t.n_angles = n_angles, t.n_det = n_det, t.N = N, t.rot = rot;
+    return t;
+}
+
+// chord_project / chord_backproject (tomo.hpp) on the backend B, every angle
+template <class B>
+void project_all(const float* img, float* sino, const float* angles, int n_angles, int n_det, int N, float rot, int projector) {
+    std::unique_ptr<TomoWorkspace> local;
+    B& b = backend_for<B>(whole_grid(n_angles, n_det, N, rot), angles, nullptr, local);
+    b.pj = projector;
+    std::vector<int32_t> all(n_angles);
+    for (int i = 0; i < n_angles; ++i) all[i] = i;
+    b.project(img, b.ints(all), n_angles, StoreEpi{sino});
+}
+template <class B>
+void backproject_all(const float* sino, float* img, const float* angles, int n_angles, int n_det, int N, float rot, int projector) {
+    std::unique_ptr<TomoWorkspace> local;
+    B& b = backend_for<B>(whole_grid(n_angles, n_det, N, rot), angles, nullptr, local);
+    b.pj = projector;
+    std::vector<int32_t> all(n_angles);
+    for (int i = 0; i < n_angles; ++i) all[i] = i;
+    b.backproject(sino, img, b.ints(all), n_angles, false);
+}
+
 }  // namespace vc_tomography::tomo_algos

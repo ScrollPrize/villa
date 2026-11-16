@@ -433,50 +433,22 @@ struct CudaBackend final : TomoWorkspace {
     }
 };
 
-CudaBackend& backend_for(const TomoGeom& t, const float* angles, std::unique_ptr<TomoWorkspace>* ws,
-                         std::unique_ptr<TomoWorkspace>& local) {
-    std::unique_ptr<TomoWorkspace>& slot = ws ? *ws : local;
-    auto* b = dynamic_cast<CudaBackend*>(slot.get());
-    if (!b || !b->matches(t, angles)) {
-        slot.reset();
-        slot = std::make_unique<CudaBackend>(t, angles);
-        b = static_cast<CudaBackend*>(slot.get());
-    }
-    b->keep.clear();
-    return *b;
-}
-
-TomoGeom whole(int n_angles, int n_det, int N, float rot) {
-    TomoGeom t;
-    t.n_angles = n_angles; t.n_det = n_det; t.N = N; t.rot = rot;
-    return t;
-}
 }  // namespace
 
 void tomo_reconstruct(const TomoArgs& a, const TomoGeom& t, const float* rows, const float* weights,
                       const float* angles_host, float* out, std::unique_ptr<TomoWorkspace>* ws, const float* start) {
     std::unique_ptr<TomoWorkspace> local;
-    tomo_algos::run(backend_for(t, angles_host, ws, local), a, rows, weights, out, start);
+    tomo_algos::run(tomo_algos::backend_for<CudaBackend>(t, angles_host, ws, local), a, rows, weights, out, start);
     VC_TOMOGRAPHY_CUDA_CHECK(cudaDeviceSynchronize());
 }
 
 void chord_project(const float* img, float* sino, const float* angles_host, int n_angles, int n_det, int N, float rot, int projector) {
-    std::unique_ptr<TomoWorkspace> local;
-    auto& b = backend_for(whole(n_angles, n_det, N, rot), angles_host, nullptr, local);
-    b.pj = projector;
-    std::vector<int32_t> all(n_angles);
-    for (int i = 0; i < n_angles; ++i) all[i] = i;
-    b.project(img, b.ints(all), n_angles, tomo_algos::StoreEpi{sino});
+    tomo_algos::project_all<CudaBackend>(img, sino, angles_host, n_angles, n_det, N, rot, projector);
     VC_TOMOGRAPHY_CUDA_CHECK(cudaDeviceSynchronize());
 }
 
 void chord_backproject(const float* sino, float* img, const float* angles_host, int n_angles, int n_det, int N, float rot, int projector) {
-    std::unique_ptr<TomoWorkspace> local;
-    auto& b = backend_for(whole(n_angles, n_det, N, rot), angles_host, nullptr, local);
-    b.pj = projector;
-    std::vector<int32_t> all(n_angles);
-    for (int i = 0; i < n_angles; ++i) all[i] = i;
-    b.backproject(sino, img, b.ints(all), n_angles, false);
+    tomo_algos::backproject_all<CudaBackend>(sino, img, angles_host, n_angles, n_det, N, rot, projector);
     VC_TOMOGRAPHY_CUDA_CHECK(cudaDeviceSynchronize());
 }
 
