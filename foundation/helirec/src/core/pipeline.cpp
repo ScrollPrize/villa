@@ -137,6 +137,24 @@ AccumScanView make_view(const ScanData& sd, const ScanChunk& ch, const uint16_t*
     return v;
 }
 
+// noise splitting (ReconConfig::noise_split_scale): the view's share of it; salt: the scan's (Impl::split_salt)
+void set_noise_split(AccumScanView& v, const ReconConfig& cfg, std::uint32_t salt, int first_projection) {
+    if (cfg.noise_split_scale == 0.f) return;
+    v.split_scale = cfg.noise_split_scale;
+    v.split_gain = cfg.noise_split_gain;
+    v.split_floor = cfg.noise_split_floor;
+    v.split_key = cfg.noise_split_seed * 0x9e3779b1U ^ salt;
+    float total = 1.f;
+    for (int i = 0; i < 2; ++i) {
+        v.split_amp[i] = std::sqrt(cfg.noise_split_smooth_share[i]);
+        v.split_spacing[i] = cfg.noise_split_smooth_spacing[i];
+        total += cfg.noise_split_smooth_share[i];
+    }
+    v.split_norm = 1.f / std::sqrt(total);
+    v.split_flat_frames = cfg.noise_split_flat_frames;
+    v.split_proj0 = first_projection;
+}
+
 void set_glare(AccumScanView& v, const ScintillatorGlare& g, const float* maps, const int32_t* i0, const int32_t* i1,
                const float* frac, int rows, const int32_t* row0) {
     v.glare = maps;
@@ -316,6 +334,7 @@ struct SliceReconstructor::Impl {
     // mended and balanced as backprojector "fbp"'s are: start_rows, set for the sink's call (device pointer on CUDA).
     int fbp_start = 0;
     const float* start_rows = nullptr;
+    std::vector<std::uint32_t> split_salt;   // noise splitting: a number of each scan (of its first file's name)
     std::vector<float> start_h, start_wh, start_img_h;
 #ifdef HELIREC_WITH_CUDA
     cuda::DeviceBuffer<float> start_d, start_wd, start_img_d;
@@ -364,6 +383,28 @@ SliceReconstructor::SliceReconstructor(std::vector<ScanData> scans, ReconConfig 
         I.cfg.backprojector = "external";
     }
     I.fbp_start = I.cfg.external ? I.cfg.external->fbp_start() : 0;
+    if (I.cfg.noise_split_scale != 0.f) {
+        if (I.cfg.legacy_reference) throw Error("the legacy reference mode has no noise splitting");
+        if (!std::isfinite(I.cfg.noise_split_scale) || !(I.cfg.noise_split_gain >= 0.f) || !(I.cfg.noise_split_floor >= 0.f) ||
+            !(I.cfg.noise_split_gain + I.cfg.noise_split_floor > 0.f) || !std::isfinite(I.cfg.noise_split_gain + I.cfg.noise_split_floor))
+            throw Error("noise splitting: a finite scale and a noise variance gain x level + floor that is not zero");
+        if (!(I.cfg.noise_split_flat_frames >= 0.f) || !std::isfinite(I.cfg.noise_split_flat_frames))
+            throw Error("noise splitting: the frames of a flat must not be negative");
+        for (int i = 0; i < 2; ++i)
+            if (!(I.cfg.noise_split_smooth_share[i] >= 0.f) || !std::isfinite(I.cfg.noise_split_smooth_share[i]) ||
+                (I.cfg.noise_split_smooth_share[i] > 0.f && !(I.cfg.noise_split_smooth_spacing[i] >= 1.f && I.cfg.noise_split_smooth_spacing[i] <= 1024.f)))
+                throw Error("noise splitting: a smooth field has a share of the variance that is not negative and a lattice of 1 to 1024 pixels");
+        for (const auto& s : I.scans) {
+            if (s.reader && s.reader->reduce() != 0) throw Error("noise splitting is of the frames as stored, not of reduced ones");
+            std::uint32_t h = 2166136261U;   // FNV-1a of the first file's name without its folder
+            if (s.reader && s.reader->n_files()) {
+                const std::string& f = s.reader->file(0);
+                for (std::size_t i = f.find_last_of('/') == std::string::npos ? 0 : f.find_last_of('/') + 1; i < f.size(); ++i)
+                    h = (h ^ static_cast<unsigned char>(f[i])) * 16777619U;
+            }
+            I.split_salt.push_back(h);
+        }
+    }
     if (I.fbp_start && I.cfg.legacy_reference) throw Error("the legacy reference mode has no FBP start for a whole-slice method (init=fbp)");
     for (const auto& s : I.scans)
         if (s.traj.n() != s.control_A.size() || s.traj.n() != s.file_index.size() || s.traj.n() != s.frame_index.size() ||
@@ -1277,6 +1318,7 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
                                       c.row0.data(), c.fract_v.data(), c.alpha.data(), c.current_div.data(),
                                       c.weight_factor.data(), c.flat_frac.data(), c.flat_i0.data(), c.flat_i1.data(),
                                       I.x_kernel, I.x_exact);
+                set_noise_split(view, cfg, cfg.noise_split_scale != 0.f ? I.split_salt[s] : 0U, c.p0);
                 set_z_kernel(view, I.z_pad, I.z_ctx, ch.z_w.data());
                 set_roll(view, sd, c.row_slope.data(), I.z_lut.data(), Impl::z_lut_n);
                 set_lateral(view, sd, c, c.col_offset.data(), c.col_slope.data(), I.x_exact);
@@ -1658,6 +1700,7 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
                                   dc[s].alpha.data(), dc[s].cdiv.data(), dc[s].wfac.data(), dc[s].ffrac.data(),
                                   dc[s].fi0.data(), dc[s].fi1.data(), I.x_kernel, I.x_exact);
             view.raw_slot = d_slot[r][s].data();
+            set_noise_split(view, cfg, cfg.noise_split_scale != 0.f ? I.split_salt[s] : 0U, chunks[s].cs.p0);
             set_z_kernel(view, I.z_pad, I.z_ctx, dc[s].z_w.data());
             set_roll(view, sd, dc[s].slope.data(), I.d_z_lut.data(), Impl::z_lut_n);
             set_lateral(view, sd, chunks[s].cs, dc[s].col_offset.data(), dc[s].col_slope.data(), I.x_exact);

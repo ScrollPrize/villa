@@ -59,6 +59,7 @@ class RawReader {
     // HDF5 metadata and any read-ahead/caching performed by the filesystem.
     std::uint64_t bytes_read() const;
     std::size_t n_files() const { return files_.size(); }
+    const std::string& file(std::size_t i) const { return files_[i]; }
 
     // File `file` is a partial local copy of a remote source: only the byte ranges [offsets[i], offsets[i] +
     // lengths[i]) hold the source's bytes, the rest reads as zeros. A read of compressed chunk bytes outside

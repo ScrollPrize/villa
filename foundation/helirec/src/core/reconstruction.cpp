@@ -200,6 +200,16 @@ void apply_parameters(const Json& params, ReconConfig& cfg, const ExternalBackpr
     cfg.sharp_f = number_of(member(params, "sharp_f"), "sharp_f");
     cfg.sharp_band = text_of(member(params, "sharp_band"));
     std::tie(cfg.angle_subset, cfg.angle_subsets) = parse_angle_subset(text_of(member(params, "angle_subset")));
+    const NoiseSplit split = parse_noise_split(text_of(member(params, "noise_split")));
+    cfg.noise_split_scale = static_cast<float>(split.scale);
+    cfg.noise_split_gain = static_cast<float>(split.gain);
+    cfg.noise_split_floor = static_cast<float>(split.floor);
+    cfg.noise_split_seed = split.seed;
+    cfg.noise_split_flat_frames = static_cast<float>(split.flat_frames);
+    for (int i = 0; i < 2; ++i) {
+        cfg.noise_split_smooth_share[i] = static_cast<float>(split.smooth_share[i]);
+        cfg.noise_split_smooth_spacing[i] = static_cast<float>(split.smooth_spacing[i]);
+    }
 }
 
 std::pair<std::string, std::string> geometry_calibration_file(const std::string& given, const std::string& cache_dir, const std::vector<std::string>& masters,
@@ -930,6 +940,7 @@ TileReconstruction tile_reconstructor(const std::string& master, const std::stri
     put("sld", Json::of(std::string("")));
     put("sharpness_weighting", Json::of(std::string("off")));
     put("angle_subset", Json::of(std::string("")));
+    put("noise_split", Json::of(std::string("")));
     put("only_scan", Json::of(std::string("")));
     Json filter_changes = Json::dict();
     for (const auto& [key, v] : Json::parse(o.params.empty() ? "{}" : o.params).object) {

@@ -927,6 +927,22 @@ class PySliceReconstructor {
         f("fan_per_column", cfg.fan_per_column);
         f("angle_subsets", cfg.angle_subsets);
         f("angle_subset", cfg.angle_subset);
+        f("noise_split_scale", cfg.noise_split_scale);
+        f("noise_split_gain", cfg.noise_split_gain);
+        f("noise_split_floor", cfg.noise_split_floor);
+        f("noise_split_seed", cfg.noise_split_seed);
+        f("noise_split_flat_frames", cfg.noise_split_flat_frames);
+        {
+            nb::object o = get("noise_split_smooth");   // [(share, spacing), ..]: up to two smooth fields
+            if (o.is_valid() && !o.is_none()) {
+                const auto fields = nb::cast<std::vector<std::pair<float, float>>>(o);
+                if (fields.size() > 2) throw Error("noise_split_smooth: at most two fields");
+                for (std::size_t i = 0; i < fields.size(); ++i) {
+                    cfg.noise_split_smooth_share[i] = fields[i].first;
+                    cfg.noise_split_smooth_spacing[i] = fields[i].second;
+                }
+            }
+        }
         f("mend_threshold", cfg.mend_threshold);
         f("legacy_reference", cfg.legacy_reference);
         f("log_clip_min", cfg.log_clip_min);
@@ -1630,6 +1646,15 @@ NB_MODULE(_core, m) {
           "a scintillator light diffusion model resolved to the reconstructor's keys (JSON text)");
     m.def("backprojector_config", &backprojector_config, "spec"_a, "a backprojector spec as the reconstructor's settings (JSON text)");
     m.def("angle_subset_config", &parse_angle_subset, "spec"_a);
+    m.def("noise_split_config",
+          [](const std::string& spec) {
+              const NoiseSplit n = parse_noise_split(spec);
+              std::vector<std::pair<double, double>> smooth;
+              for (int i = 0; i < 2; ++i)
+                  if (n.smooth_share[i] > 0) smooth.emplace_back(n.smooth_share[i], n.smooth_spacing[i]);
+              return std::make_tuple(n.scale, n.seed, n.gain, n.floor, smooth);
+          },
+          "spec"_a, "noise_split 'scale=S,seed=N,gain=G,floor=F[,smooth=SHARE:SPACING[+..]]' as (scale, seed, gain, floor, [(share, spacing)]); '' is scale 0");
     m.def("build_revision", &build_revision);
     m.def(
         "tile_reconstructor",

@@ -35,6 +35,9 @@
 //                        without a fan, another backprojector, mode legacy_reference: a parallel beam
 //                        (info["fan_per_column"] tells what is in use)
 //   angle_subset         "" | "I/N": subset I of N interleaved subsets of the projections
+//   noise_split          "" | "scale=S,seed=N,gain=G,floor=F[,smooth=SHARE:SPACING[+SHARE:SPACING]]": the frames with S times their own noise's size added,
+//                        the same numbers for one seed; runs with S = a and S = -1 / a have independent noise
+//                        (ReconConfig::noise_split_scale)
 //   only_scan            "" (default: every scan, merged) | "main" | "companion" (the second scan) | "companion2", ..
 //                        | the kind a scan's name ends in ("HA", "TA", "TA2", ..): that scan's projections alone, at
 //                        the poses the geometry calibration gives them, on a slice grid centred on the rotation
@@ -111,6 +114,14 @@ SldParams sld_params(const std::string& spec, std::string* resolved = nullptr);
 
 // "" -> (0, 1); "I/N" -> (I, N)
 std::pair<int, int> parse_angle_subset(const std::string& spec);
+// "" (none: scale 0) | "scale=S,seed=N,gain=G,floor=F" (ReconConfig::noise_split_*; seed 0 and floor 0 when left out)
+struct NoiseSplit {
+    double scale = 0, gain = 0, floor = 0;
+    double smooth_share[2] = {0, 0}, smooth_spacing[2] = {0, 0};   // smooth=SHARE:SPACING[+SHARE:SPACING]
+    double flat_frames = 0;                                        // flats=N
+    std::uint32_t seed = 0;
+};
+NoiseSplit parse_noise_split(const std::string& spec);
 
 // A backprojector spec (text or a JSON object's text) as the reconstructor's settings it names (a JSON object's
 // text: backprojector, and bp_interp, bp_oversample, ramp_filter_name, ramp_filter_par, tomo_params or external_bp

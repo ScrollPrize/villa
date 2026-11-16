@@ -240,3 +240,77 @@ def test_rolling_shutter_turns_the_slices_angles(tmp_path, device):
         r = recon(pattern_scan(tmp_path, 0.0), device, **{"rolling_shutter": 0.5, **kw})
         assert r.info["rolling_shutter"] == 0.0
     assert recon(pattern_scan(tmp_path, 0.0), device, backprojector="fbp", rolling_shutter=0.5).info["rolling_shutter"] == 0.5
+
+
+@pytest.mark.parametrize("device", helirec.devices())
+def test_noise_split_gives_pairs_with_independent_noise(tmp_path, device):
+    """noise_split: every raw sample takes scale x sqrt(gain x (counts above the dark) + floor) x a standard normal
+    number that the seed, the scan, the projection and the pixel fix. Runs with the scales a and -1 / a carry the same
+    numbers, so that noise n of that variance in the frames would become n + a z and n - z / a, which do not correlate"""
+    nr, nd, ngrid, level, flat, dark = 12, 24, 64, 30000, 50000, 100
+    path = tmp_path / "level.h5"
+    with h5py.File(path, "w") as f:
+        f.create_dataset("data", data=np.full((2 * ngrid, nr, nd), level + dark, np.uint16), chunks=(1, nr, nd))
+
+    def sino(**kw):
+        p = np.arange(2 * ngrid)   # two turns at rest: two projections in every grid angle, whole rows
+        scan = _core.make_scan_data(p * (360 / ngrid), np.zeros(len(p)), .01, nr, nd, 0, 0., 0., np.full(len(p), .2), np.array([0], np.float32),
+                                    np.full((nr, nd), dark, np.float32), np.full((1, nr, nd), flat, np.float32), np.ones((nr, nd), np.float32),
+                                    _core.RawReader([str(path)], "data", nr, nd), np.zeros(len(p), np.int32), np.arange(len(p), dtype=np.int32))
+        dev = kw.pop("device", device)
+        rows = kw.pop("rows", (4, 8))
+        return np.asarray(recon(scan, dev, backprojector="fbp", tomo_params={}, z_interp="linear", **kw).reconstruct(*rows, debug=True)["sino"], np.float64)
+
+    gain, floor, a = 1.8, 2000.0, 0.5
+    split = lambda scale, seed=7, **kw: sino(noise_split_scale=scale, noise_split_seed=seed, noise_split_gain=gain, noise_split_floor=floor, **kw)
+    base = sino()
+    assert np.ptp(base) < 1e-6                                           # the frames hold one level: every difference below is the split's
+    plus, minus = split(a), split(-1 / a)
+    z1, z2 = (plus - base) / a, (minus - base) * -a                      # the numbers of each run, in units of the sinogram
+    # the same numbers in both runs (-log is not linear: they differ by (a + 1 / a) / 2 of a number's square, 1 % rms)
+    assert (z1 - z2).std() < 0.03 * z1.std()
+    # their size: a sample of the sinogram is the mean of two projections' intensities, -log of it
+    sigma = np.sqrt(gain * level + floor) / level / np.sqrt(2)
+    assert abs(z1.std() / sigma - 1) < 0.02 and abs(z1.mean()) < 0.02 * sigma
+    # normal, and independent from pixel to pixel, row to row and angle to angle
+    u = z1 / z1.std()
+    assert abs((u ** 4).mean() - 3) < 0.15
+    for axis in range(3):
+        assert abs((u * np.roll(u, 1, axis)).mean()) < 0.02
+    # what a pair is for: frames' noise n of that variance would be left as n + a z and n - z / a, which do not correlate
+    n = np.random.default_rng(3).normal(0, z1.std(), z1.shape)
+    assert abs(np.corrcoef((n + a * z1).ravel(), (n - z2 / a).ravel())[0, 1]) < 0.02
+    # one seed: the same numbers in every run, chunk and device; another seed: others
+    np.testing.assert_array_equal(split(a), plus)
+    np.testing.assert_allclose(np.concatenate([split(a, rows=(h, h + 1)) for h in range(4, 8)], 1), plus, atol=1e-7)
+    other = (split(a, seed=8) - base) / a
+    assert abs(np.corrcoef(other.ravel(), z1.ravel())[0, 1]) < 0.02 and abs(other.std() / z1.std() - 1) < 0.02
+    if device == "cuda":
+        assert np.abs(split(a, device="cpu") - plus).max() < 2e-6
+    # refusals, and the text form of the reconstruction's parameter
+    for bad in (dict(noise_split_gain=0.0, noise_split_floor=0.0), dict(noise_split_gain=-1.0), dict(legacy_reference=True)):
+        with pytest.raises(Exception):
+            sino(**dict(dict(noise_split_scale=a, noise_split_gain=gain, noise_split_floor=floor), **bad))
+    # smooth fields: the share of the noise neighbouring pixels have in common, the variance kept
+    smooth = (split(a, noise_split_smooth=[(1.0, 3.0)]) - base) / a
+    assert abs(smooth.std() / z1.std() - 1) < 0.03
+    us = smooth / smooth.std()
+    lag = lambda axis: float((us * np.roll(us, 1, axis)).mean())
+    assert 0.3 < lag(2) < 0.6 and 0.3 < lag(1) < 0.6 and abs(lag(0)) < 0.03       # columns and rows share it, projections do not
+    np.testing.assert_allclose(np.concatenate([(split(a, noise_split_smooth=[(1.0, 3.0)], rows=(h, h + 1)) - base[:, i:i + 1]) / a
+                                               for i, h in enumerate(range(4, 8))], 1), smooth, atol=1e-5)
+    if device == "cuda":
+        assert np.abs((split(a, noise_split_smooth=[(1.0, 3.0)], device="cpu") - base) / a - smooth).max() < 1e-3 * smooth.std()
+    # the flats: a flat's noise is one pattern for every projection of the scan
+    stripes = (split(a, noise_split_flat_frames=4.0) - plus) / a
+    per_angle = stripes.std(0).mean() / stripes.std()                      # the same at every angle: no spread along the angles
+    expect = np.sqrt(gain * flat + floor) / flat / np.sqrt(4.0)              # of the level: the flat's own noise, and -log's slope is 1
+    assert per_angle < 0.02 and abs(stripes.std() / expect - 1) < 0.2      # (96 pixels of the flat: 7 % of scatter)
+    assert _core.noise_split_config("") == (0.0, 0, 0.0, 0.0, [])
+    assert _core.noise_split_config("scale=-2, seed=7, gain=1.8, floor=2000") == (-2.0, 7, 1.8, 2000.0, [])
+    assert _core.noise_split_config("scale=0.5,gain=1.8") == (0.5, 0, 1.8, 0.0, [])
+    assert _core.noise_split_config("scale=0.5,gain=1.8,smooth=0.0013:10+0.009:2.3") == (0.5, 0, 1.8, 0.0, [(0.0013, 10.0), (0.009, 2.3)])
+    for bad in ("scale=0.5", "gain=1.8", "scale=0,gain=1.8", "scale=0.5,gain=1.8,seed=-1", "scale=0.5,gain=1.8,width=3", "scale=half,gain=1.8",
+                "scale=0.5,gain=1.8,smooth=0.1", "scale=0.5,gain=1.8,smooth=0.1:0.5", "scale=0.5,gain=1.8,smooth=1:2+1:2+1:2"):
+        with pytest.raises(Exception, match="noise_split"):
+            _core.noise_split_config(bad)

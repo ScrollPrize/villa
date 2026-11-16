@@ -67,6 +67,7 @@ Json shared(const char* backprojector, const char* x_interp, const char* z_inter
         .set("angle_interp", text(angle_interp))
         .set("exposure_arc", num(0.0))
         .set("angle_subset", text(""))
+        .set("noise_split", text(""))
         .set("only_scan", text(""))
         .set("sharpness_weighting", text(sharpness_weighting))
         .set("sharp_f", num(0.35))
@@ -637,6 +638,60 @@ std::pair<int, int> parse_angle_subset(const std::string& spec) {
         throw Error("angle_subset must be 'I/N' (subset I of N), not '" + spec + "'");
     if (!(0 <= i && i < n)) throw Error("angle_subset '" + spec + "': I must be in [0, N)");
     return {static_cast<int>(i), static_cast<int>(n)};
+}
+
+NoiseSplit parse_noise_split(const std::string& spec) {
+    NoiseSplit n;
+    const std::string t = strip(spec);
+    if (t.empty()) return n;
+    bool have_scale = false, have_model = false;
+    std::size_t pos = 0;
+    while (pos <= t.size()) {
+        const std::size_t comma = std::min(t.find(',', pos), t.size());
+        const std::string item = strip(t.substr(pos, comma - pos));
+        pos = comma + 1;
+        if (item.empty()) continue;
+        const std::size_t eq = item.find('=');
+        double v = 0;
+        if (eq != std::string::npos && strip(item.substr(0, eq)) == "smooth") {   // SHARE:SPACING[+SHARE:SPACING]
+            const std::string fields = strip(item.substr(eq + 1));
+            std::size_t at = 0;
+            int count = 0;
+            while (at <= fields.size()) {
+                const std::size_t plus = std::min(fields.find('+', at), fields.size());
+                const std::string one = fields.substr(at, plus - at);
+                at = plus + 1;
+                const std::size_t colon = one.find(':');
+                double share = 0, spacing = 0;
+                if (count >= 2 || colon == std::string::npos || !real_of(strip(one.substr(0, colon)), share) || !real_of(strip(one.substr(colon + 1)), spacing) ||
+                    !(share > 0) || !(spacing >= 1 && spacing <= 1024))
+                    throw Error("noise_split: smooth must be 'SHARE:SPACING' or two of them joined by '+' (a share of the white noise's variance above 0, "
+                                "a lattice of 1 to 1024 pixels), not '" + fields + "'");
+                n.smooth_share[count] = share;
+                n.smooth_spacing[count] = spacing;
+                ++count;
+            }
+            continue;
+        }
+        if (eq == std::string::npos || !real_of(strip(item.substr(eq + 1)), v))
+            throw Error("noise_split must be 'scale=S,seed=N,gain=G,floor=F[,smooth=SHARE:SPACING[+SHARE:SPACING]]', not '" + spec + "'");
+        const std::string key = strip(item.substr(0, eq));
+        if (key == "scale") n.scale = v, have_scale = true;
+        else if (key == "seed") {
+            if (v < 0 || v > 4294967295.0 || v != std::floor(v)) throw Error("noise_split: seed must be a whole number below 2^32");
+            n.seed = static_cast<std::uint32_t>(v);
+        } else if (key == "gain") n.gain = v, have_model = true;
+        else if (key == "floor") n.floor = v;
+        else if (key == "flats") {
+            if (!(v >= 0)) throw Error("noise_split: flats is the number of frames a flat is the mean of (0: the flats are not split)");
+            n.flat_frames = v;
+        }
+        else throw Error("noise_split: unknown key '" + key + "' (scale, seed, gain, floor, smooth, flats)");
+    }
+    if (!have_scale || n.scale == 0 || !have_model)
+        throw Error("noise_split needs scale (not 0) and gain: the frames' noise variance is gain x (counts above the dark) + floor");
+    if (!(n.gain >= 0) || !(n.floor >= 0) || !(n.gain + n.floor > 0)) throw Error("noise_split: gain and floor must not be negative, nor both zero");
+    return n;
 }
 
 std::string backprojector_config(const std::string& spec_text) {

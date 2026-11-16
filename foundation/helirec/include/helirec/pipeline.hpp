@@ -113,6 +113,21 @@ struct ReconConfig {
     // and share everything else (flats, calibration, geometry); exposure_arc stays the fraction of the recorded
     // step. The doable heights are those of the whole scan.
     int angle_subsets = 1, angle_subset = 0;
+    // Noise splitting (0: none): two reconstructions with independent noise from every projection. The frames' noise
+    // is independent from pixel to pixel and frame to frame with a variance that follows the level, gain x (counts
+    // above the dark) + floor [counts^2]. A run adds to every raw sample noise_split_scale x that standard deviation
+    // (of the sample itself) x a standard normal number z fixed by the seed, the scan's file, the projection and the
+    // pixel. Two runs with one seed and the scales a and -1 / a hold the sample's noise n as n + a z and n - z / a,
+    // which do not correlate (recorrupted-to-recorrupted, Pang et al. 2021), with (1 + a^2) and (1 + 1 / a^2) times
+    // the variance: a pair to train a denoiser on with no projection left out. Not for reduced frames (their noise is
+    // another) and not in the legacy reference mode.
+    // noise_split_smooth_share, _spacing (up to two; share 0: none): the part of the noise that neighbouring pixels
+    // share (a scintillator spreads its quanta), as smooth fields of `share` times the white part's variance each,
+    // on lattices of `spacing` pixels (AccumScanView::split_amp); the variance model is of the whole noise.
+    float noise_split_scale = 0, noise_split_gain = 0, noise_split_floor = 0;
+    float noise_split_smooth_share[2] = {0, 0}, noise_split_smooth_spacing[2] = {0, 0};
+    float noise_split_flat_frames = 0;   // the frames a flat is the mean of (0: the flats are not split)
+    std::uint32_t noise_split_seed = 0;
     float mend_threshold = 1e-4f;       // mending domain: the merged columns the scans' weight maps cover
     float log_clip_min = 1e-6f, log_clip_max = 10.f;
     int block_angles = 500;

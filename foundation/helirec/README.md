@@ -508,6 +508,22 @@ on its own from Python (`helirec._core`, re-exported in `helirec`) on NumPy arra
     by angle (the same angles in every scan) and reconstructed on a grid of 1 / N of the angles. `0/2` and `1/2`
     are two reconstructions of one scan with independent noise and everything else in common
     (`evaluation/shell_correlation.py --pair`).
+  * `noise_split=scale=S,seed=N,gain=G,floor=F` (default: none): noise splitting, for training a denoiser on pairs
+    with no projection left out. Every raw sample takes S times the standard deviation of its own noise,
+    `sqrt(G x (counts above the dark) + F)`, times a standard normal number fixed by the seed, the scan's file, the
+    projection and the pixel (the same in every run, chunk and device). Two runs with one seed and the scales `a`
+    and `-1 / a` hold the frames' noise n as n + a z and n - z / a: uncorrelated, with (1 + a^2) and (1 + 1 / a^2)
+    times its variance (recorrupted-to-recorrupted, Pang et al. 2021). `G` and `F` are the detector's and must be
+    measured (a flat's variance against its level; a wrong pair leaves the two runs' noise correlated by the error).
+    `smooth=SHARE:SPACING[+SHARE:SPACING]`: a detector's noise is not quite white (its scintillator spreads quanta
+    over neighbouring pixels), and white numbers then lack what the neighbours share. Each smooth field adds SHARE
+    times the white part's variance as standard normal numbers on a lattice of SPACING pixels joined by cubic
+    B-splines (power spectrum `sinc^8(f x SPACING)`, near `exp(-(f / f0)^2)` with `f0 = 0.276 / SPACING` cycles per
+    pixel); the whole keeps the variance `G` and `F` give. From a flat's noise spectrum over its white floor.
+    `flats=N`: a flat is the mean of N frames and its noise is the same in every projection of the scan (rings in a
+    slice), so the two runs would share it; with this each flat takes S times its own noise's size (a frame's at
+    the flat's level, over the root of N) times numbers of its own.
+    Not for reduced frames, not in mode `legacy_reference` (`tests/test_gridding.py`).
   * `x_interp=sinc|lanczos3|cubic|linear` (default `sinc`): how a scan at a fractional column offset in the merged
     frame is resampled (the PHerc0343P main scan sits at 843.5). `sinc` delays every projection row by the offset
     exactly, as a phase ramp on its Fourier transform (`shift_rows`, `sino.hpp`): no part of the band is lost. Any

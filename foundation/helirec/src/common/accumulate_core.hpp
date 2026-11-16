@@ -15,12 +15,80 @@ namespace helirec::accum_core {
 
 using namespace helirec::hd;
 
+// a well mixed 32-bit number of x (lowbias32)
+HR_HD std::uint32_t mix32(std::uint32_t x) {
+    x ^= x >> 16; x *= 0x7feb352dU;
+    x ^= x >> 15; x *= 0x846ca68bU;
+    x ^= x >> 16;
+    return x;
+}
+
+// a standard normal number from a well mixed one: two uniform numbers of it through Box and Muller
+HR_HD float normal_of(std::uint32_t h) {
+    const float u1 = static_cast<float>((mix32(h ^ 0x68bc21ebU) >> 8) + 1U) * (1.0f / 16777216.0f);   // (0, 1]
+    const float u2 = static_cast<float>(mix32(h ^ 0x02e5be93U) >> 8) * (1.0f / 16777216.0f);          // [0, 1)
+    return mul(sqrtf(mul(-2.0f, logf(u1))), cosf(mul(6.283185307f, u2)));
+}
+
+// The standard normal number of noise splitting for a pixel of a frame (AccumScanView::split_key): from the key, the
+// frame (a projection: its place in the scan, split_proj0 + k; a flat: kSplitFlat + its place) and the pixel.
+HR_HD float split_normal(const AccumScanView& s, std::uint32_t frame, std::size_t pix) {
+    const std::uint32_t h = mix32(mix32(s.split_key ^ mix32(frame + 0x9e3779b9U)) ^
+                                  mix32(static_cast<std::uint32_t>(pix) + 0x85ebca6bU));
+    return normal_of(h);
+}
+
+// A smooth field of noise splitting (AccumScanView::split_spacing) at detector row r, column c of a frame:
+// standard normal numbers on a lattice of `spacing` pixels, joined by cubic B-splines; of unit variance on average
+// (the mean over a cell of the sum of the squared weights is (151 / 315)^2).
+HR_HD float split_smooth(const AccumScanView& s, std::uint32_t frame, int r, int c, float spacing, std::uint32_t which) {
+    const float gy = static_cast<float>(r) / spacing, gx = static_cast<float>(c) / spacing;
+    const float fy = hd::floor(gy), fx = hd::floor(gx);
+    const float ty = gy - fy, tx = gx - fx;
+    const int iy = static_cast<int>(fy), ix = static_cast<int>(fx);
+    float wy[4], wx[4];
+    for (int axis = 0; axis < 2; ++axis) {
+        const float t = axis ? tx : ty;
+        float* w = axis ? wx : wy;
+        const float u = 1.0f - t;
+        w[0] = u * u * u * (1.0f / 6.0f);
+        w[1] = (3.0f * t * t * t - 6.0f * t * t + 4.0f) * (1.0f / 6.0f);
+        w[2] = (3.0f * u * u * u - 6.0f * u * u + 4.0f) * (1.0f / 6.0f);
+        w[3] = t * t * t * (1.0f / 6.0f);
+    }
+    const std::uint32_t base = mix32(s.split_key ^ mix32(frame + 0x9e3779b9U)) ^ mix32(which + 0x27d4eb2fU);
+    float v = 0.f;
+    for (int i = 0; i < 4; ++i)
+        for (int j = 0; j < 4; ++j) {
+            const std::uint32_t node = static_cast<std::uint32_t>(iy + i + 8) * 65536U + static_cast<std::uint32_t>(ix + j + 8);
+            v += wy[i] * wx[j] * normal_of(mix32(base ^ mix32(node + 0xc2b2ae35U)));
+        }
+    return v * (315.0f / 151.0f);
+}
+
+// the number of noise splitting for a pixel of a frame: the white one and the smooth fields, of unit variance
+HR_HD float split_number(const AccumScanView& s, std::uint32_t frame, int r, int c, std::size_t pix) {
+    float z = split_normal(s, frame, pix);
+    if (s.split_amp[0] != 0.f || s.split_amp[1] != 0.f) {   // the share of the noise that neighbouring pixels have in common
+        for (int i = 0; i < 2; ++i)
+            if (s.split_amp[i] != 0.f) z += s.split_amp[i] * split_smooth(s, frame, r, c, s.split_spacing[i], static_cast<std::uint32_t>(i));
+        z *= s.split_norm;
+    }
+    return z;
+}
+constexpr std::uint32_t kSplitFlat = 0xf1a70000U;   // the frame ids of a scan's flats (above any projection's place)
+
 // flat-fielded intensity of projection k at window row t, source column c
 HR_HD float flat_field(const AccumScanView& s, int k, int t, int c) {
     const int r = s.row0[k] + t;  // raw detector row
     const std::size_t pix = static_cast<std::size_t>(r) * s.det_cols + c;
     const std::size_t slot = s.raw_slot ? static_cast<std::size_t>(s.raw_slot[k]) : static_cast<std::size_t>(k);
-    const float u = static_cast<float>(s.raw[(slot * s.win_rows + (t + s.win_off)) * s.det_cols + c]);
+    float u = static_cast<float>(s.raw[(slot * s.win_rows + (t + s.win_off)) * s.det_cols + c]);
+    if (s.split_scale != 0.f) {   // noise splitting: the sample with a known share of its own noise's size added
+        const float var = add(mul(s.split_gain, sub(u, s.dark[pix])), s.split_floor);
+        const float z = split_number(s, static_cast<std::uint32_t>(s.split_proj0 + k), r, c, pix);
+        u = add(u, mul(mul(s.split_scale, sqrtf(var > 0.f ? var : 0.f)), z));
+    }
     float sig = div(sub(u, s.dark[pix]), s.current_div[k]);
     if (s.glare) {   // scintillator light diffusion: minus the glare, interpolated between its sampled projections
         const std::size_t cell = static_cast<std::size_t>(s.glare_rows) * s.glare_cols;
@@ -33,7 +101,19 @@ HR_HD float flat_field(const AccumScanView& s, int k, int t, int c) {
     }
     const std::size_t plane = static_cast<std::size_t>(s.det_rows) * s.det_cols;
     const float f = s.flat_frac[k];
-    const float flat = add(mul(sub(1.0f, f), s.flats[s.flat_i0[k] * plane + pix]), mul(f, s.flats[s.flat_i1[k] * plane + pix]));
+    float flat0 = s.flats[s.flat_i0[k] * plane + pix], flat1 = s.flats[s.flat_i1[k] * plane + pix];
+    if (s.split_scale != 0.f && s.split_flat_frames > 0.f) {
+        // noise splitting of the flats: a flat is the mean of split_flat_frames frames, so its noise is that much
+        // smaller than a frame's at its level (the flat's counts: its value x the projection's current divisor), and
+        // the same in every projection of the scan
+        const float cd = s.current_div[k];
+        const float v0 = add(mul(s.split_gain, mul(flat0, cd)), s.split_floor), v1 = add(mul(s.split_gain, mul(flat1, cd)), s.split_floor);
+        const float amp = s.split_scale / (cd * sqrtf(s.split_flat_frames));
+        flat0 += amp * sqrtf(v0 > 0.f ? v0 : 0.f) * split_number(s, kSplitFlat + static_cast<std::uint32_t>(s.flat_i0[k]), r, c, pix);
+        if (s.flat_i1[k] != s.flat_i0[k]) flat1 += amp * sqrtf(v1 > 0.f ? v1 : 0.f) * split_number(s, kSplitFlat + static_cast<std::uint32_t>(s.flat_i1[k]), r, c, pix);
+        else flat1 = flat0;
+    }
+    const float flat = add(mul(sub(1.0f, f), flat0), mul(f, flat1));
     return div(sig, flat);
 }
 

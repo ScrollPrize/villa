@@ -138,6 +138,25 @@ struct AccumScanView {
     // values come from the detector column that looks at it.
     const float* col_wt = nullptr;
     int col_guard = 3;
+    // Noise splitting (ReconConfig::noise_split_scale; 0: none): every raw sample u of the frames takes
+    //   u + split_scale x sqrt(max(split_gain x (u - dark) + split_floor, 0)) x z,
+    // z a standard normal number fixed by split_key (the seed and the scan), the projection's place in the scan
+    // (split_proj0 + k) and the pixel: the same in every run, chunk and device (to the rounding of its logarithm and
+    // cosine).
+    // Noise that is not quite white (a scintillator spreads its quanta over neighbouring pixels): z is then a white
+    // number plus up to two smooth fields, each of split_amp[i]^2 times the white number's variance and made of
+    // standard normal numbers on a lattice of split_spacing[i] pixels of the frame, joined by cubic B-splines (power
+    // spectrum sinc^8(f x spacing): near exp(-(f / f0)^2), f0 = 0.276 / spacing cycles per pixel); the sum times
+    // split_norm, so that z keeps a variance of 1 (to the 8 % by which a lattice field's own varies over a cell).
+    float split_scale = 0, split_gain = 0, split_floor = 0;
+    float split_amp[2] = {0, 0}, split_spacing[2] = {0, 0}, split_norm = 1;
+    // split_flat_frames (0: the flats are left as they are): the frames a flat is the mean of. A flat's noise is the
+    // same in every projection of the scan (rings in a slice); with this each flat takes split_scale x its own
+    // noise's size (a frame's at the flat's level, over the root of the frames) x numbers of its own as well, so
+    // that the two runs do not share it either.
+    float split_flat_frames = 0;
+    std::uint32_t split_key = 0;
+    int split_proj0 = 0;
 };
 
 // Kernel of the fractional column offset of a scan: `interp` linear (the reference splat; x_taps = 0), cubic (Keys,
