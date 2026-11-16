@@ -33,8 +33,6 @@ Map parse_map(const std::string& json_object_text);
 // other linear ones are a scale, a shear and a rotation of the grid, which cannot be told from the poses.
 std::vector<std::array<int, 2>> map_terms(int order);
 Map empty_map(int rows, int cols, int order = 3);
-// the value of each of the map's terms at the detector position (c, v): phi[k] = ((c - c0) / cs)^i_k ((v - v0) / vs)^j_k
-void map_basis(const Map& m, double c, double v, double* phi);
 // (Eu, Ev) at n detector positions (c, v)
 void map_displacement(const Map& m, const double* c, const double* v, std::size_t n, double* eu, double* ev);
 

@@ -311,8 +311,8 @@ Wiring wire(const Acquisition& acq, Blocks& b, const Comparison& c) {
     w.blocks.push_back(b.timing), w.sizes.push_back(1);
     if (const int nt = b.terms()) {
         w.f.phi_a.resize(static_cast<std::size_t>(nt)), w.f.phi_b.resize(static_cast<std::size_t>(nt));
-        geometry::map_basis(b.shape, c.a.col, c.a.row, w.f.phi_a.data());
-        geometry::map_basis(b.shape, c.b.col, c.b.row, w.f.phi_b.data());
+        b.shape.basis(c.a.col, c.a.row, w.f.phi_a.data());
+        b.shape.basis(c.b.col, c.b.row, w.f.phi_b.data());
         w.f.at_map = static_cast<int>(w.blocks.size());
         w.blocks.push_back(b.map.data()), w.sizes.push_back(2 * nt);
         if (b.radial) {  // a unit of the radial unknown: the four coefficients it stands for, at the sighting
@@ -390,7 +390,7 @@ Ray ray_of(const Acquisition& acq, const Parameters& p, const Sighting& g) {
     const int nt = terms_of(p.map);
     std::vector<double> map = p.map.eu, phi(static_cast<std::size_t>(nt));
     map.insert(map.end(), p.map.ev.begin(), p.map.ev.end());
-    geometry::map_basis(p.map, g.col, g.row, phi.data());
+    p.map.basis(g.col, g.row, phi.data());
     double X, Y;
     model::ideal_position<double>(map.data(), phi.data(), nt, nullptr, 0.0, 0.0, g.col, g.row, X, Y);
     Ray r;

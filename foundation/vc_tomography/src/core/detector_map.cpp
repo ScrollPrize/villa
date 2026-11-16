@@ -108,7 +108,7 @@ bool Map::empty() const {
     return true;
 }
 
-void Map::displacement(double c, double v, double& du, double& dv) const {
+void Map::basis(double c, double v, double* phi) const {
     const double x = (c - c0) / cs, y = (v - v0) / vs;
     // the powers of x and y by repeated multiplication, as the reconstruction forms them (detector_map_core.hpp):
     // a block's resampling asks for three displacements per sample, and std::pow was most of its time
@@ -116,11 +116,18 @@ void Map::displacement(double c, double v, double& du, double& dv) const {
     double xp[top + 1], yp[top + 1];
     xp[0] = yp[0] = 1.0;
     for (int d = 1; d <= top; ++d) xp[d] = xp[d - 1] * x, yp[d] = yp[d - 1] * y;
+    for (std::size_t k = 0; k < i.size(); ++k)
+        phi[k] = (i[k] >= 0 && i[k] <= top ? xp[i[k]] : std::pow(x, i[k])) * (j[k] >= 0 && j[k] <= top ? yp[j[k]] : std::pow(y, j[k]));
+}
+
+void Map::displacement(double c, double v, double& du, double& dv) const {
+    double phi[detector_map_max_terms];
+    if (i.size() > static_cast<std::size_t>(detector_map_max_terms)) throw Error("detector map: more than " + std::to_string(detector_map_max_terms) + " terms");
+    basis(c, v, phi);
     du = dv = 0;
     for (std::size_t k = 0; k < i.size(); ++k) {
-        const double m = (i[k] >= 0 && i[k] <= top ? xp[i[k]] : std::pow(x, i[k])) * (j[k] >= 0 && j[k] <= top ? yp[j[k]] : std::pow(y, j[k]));
-        du += eu[k] * m;
-        dv += ev[k] * m;
+        du += eu[k] * phi[k];
+        dv += ev[k] * phi[k];
     }
 }
 

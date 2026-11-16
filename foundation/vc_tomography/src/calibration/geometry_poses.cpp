@@ -203,22 +203,8 @@ Map empty_map(int rows, int cols, int order) {
     return m;
 }
 
-void map_basis(const Map& m, double c, double v, double* phi) {
-    const double x = (c - m.c0) / m.cs, y = (v - m.v0) / m.vs;
-    for (std::size_t k = 0; k < m.i.size(); ++k) phi[k] = std::pow(x, m.i[k]) * std::pow(y, m.j[k]);
-}
-
 void map_displacement(const Map& m, const double* c, const double* v, std::size_t n, double* eu, double* ev) {
-    std::vector<double> phi(m.i.size());
-    for (std::size_t q = 0; q < n; ++q) {
-        map_basis(m, c[q], v[q], phi.data());
-        double su = 0, sv = 0;
-        for (std::size_t k = 0; k < m.i.size(); ++k) {
-            su += m.eu[k] * phi[k];
-            sv += m.ev[k] * phi[k];
-        }
-        eu[q] = su, ev[q] = sv;
-    }
+    for (std::size_t q = 0; q < n; ++q) m.displacement(c[q], v[q], eu[q], ev[q]);
 }
 
 // ---------------------------------------------------------------- a two-scan acquisition

@@ -46,7 +46,9 @@ struct Map {
 
     // no term, or every coefficient zero: nothing is displaced
     bool empty() const;
-    // (Eu, Ev) at (c, v), the powers formed by repeated products as the reconstruction forms them
+    // the value of each term at (c, v): phi[k] = x^i_k y^j_k (the powers by repeated products, as the
+    // reconstruction forms them), and (Eu, Ev) there
+    void basis(double c, double v, double* phi) const;
     void displacement(double c, double v, double& du, double& dv) const;
     // the detector position (c, v) whose ray is the ideal position (x, y) (three fixed-point passes)
     void source(double x, double y, double& c, double& v) const;
