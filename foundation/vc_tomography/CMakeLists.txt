@@ -6,7 +6,7 @@ option(VC_TOMOGRAPHY_PYTHON "Build the nanobind Python module" ON)
 set(VC_TOMOGRAPHY_CUDA "AUTO" CACHE STRING "Build CUDA kernels: ON, OFF or AUTO")
 set_property(CACHE VC_TOMOGRAPHY_CUDA PROPERTY STRINGS ON OFF AUTO)
 
-set(CMAKE_CXX_STANDARD 20)  # vc-delta3d's C++ API uses std::span; CUDA code stays C++17
+set(CMAKE_CXX_STANDARD 20)  # (as vc_reader is); CUDA code stays C++17
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
@@ -108,25 +108,6 @@ if(VC_TOMOGRAPHY_OPENJPH)
   vc_tomography_add_openjph()
 endif()
 
-# vc-delta3d (lossless uint8 chunk codec of vc_reader / VC3D), pinned to the revision vc_reader uses
-# so that everything vc_tomography writes is readable there. Offline builds: -DFETCHCONTENT_SOURCE_DIR_VC_DELTA3D=<src>
-option(VC_TOMOGRAPHY_DELTA3D "Build the vc-delta3d chunk codec (uint8 OME-Zarr output)" ON)
-if(VC_TOMOGRAPHY_DELTA3D AND NOT TARGET vc_delta3d::vc_delta3d)   # (vc_reader brings it)
-  include(FetchContent)
-  set(VC_DELTA3D_BUILD_PYTHON OFF CACHE BOOL "" FORCE)
-  set(VC_DELTA3D_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-  set(VC_DELTA3D_INSTALL_CPP OFF CACHE BOOL "" FORCE)
-  FetchContent_Declare(vc_delta3d
-    GIT_REPOSITORY https://github.com/ScrollPrize/vc-delta3d.git
-    GIT_TAG 45339743b450ff707d21fb742dc1b3b2bf99306d)  # = vc_reader cmake/NativeReader.cmake pin
-  set(CMAKE_AUTOMOC OFF)
-  FetchContent_MakeAvailable(vc_delta3d)
-  set_target_properties(vc_delta3d PROPERTIES POSITION_INDEPENDENT_CODE ON)
-endif()
-if(VC_TOMOGRAPHY_DELTA3D AND TARGET vc_delta3d)
-  set_target_properties(vc_delta3d PROPERTIES POSITION_INDEPENDENT_CODE ON)
-endif()
-
 # ---------------------------------------------------------------- core library
 file(GLOB VC_TOMOGRAPHY_CPU_SOURCES CONFIGURE_DEPENDS src/core/*.cpp src/cpu/*.cpp src/io/*.cpp src/calibration/*.cpp)
 add_library(vc_tomography STATIC ${VC_TOMOGRAPHY_CPU_SOURCES})
@@ -141,11 +122,7 @@ target_link_libraries(vc_tomography
   PUBLIC OpenMP::OpenMP_CXX Ceres::ceres
   PRIVATE PkgConfig::FFTW3F PkgConfig::FFTW3 ${FFTW3F_OMP_LIB} HDF5::HDF5 ZLIB::ZLIB CURL::libcurl vc_reader::reader)
 # (vc_reader's headers are not written for -Wextra)
-set_source_files_properties(src/io/projection_store.cpp src/io/reference.cpp PROPERTIES COMPILE_OPTIONS "-Wno-extra;-Wno-missing-field-initializers")
-if(VC_TOMOGRAPHY_DELTA3D)
-  target_link_libraries(vc_tomography PRIVATE vc_delta3d::vc_delta3d)
-  target_compile_definitions(vc_tomography PRIVATE VC_TOMOGRAPHY_WITH_DELTA3D=1)
-endif()
+set_source_files_properties(src/io/projection_store.cpp src/io/reference.cpp src/io/zarr.cpp PROPERTIES COMPILE_OPTIONS "-Wno-extra;-Wno-missing-field-initializers")
 if(VC_TOMOGRAPHY_OPENJPEG AND OPENJP2_FOUND)
   target_link_libraries(vc_tomography PRIVATE PkgConfig::OPENJP2)
   target_compile_definitions(vc_tomography PRIVATE VC_TOMOGRAPHY_WITH_OPENJPEG=1)

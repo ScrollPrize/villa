@@ -1615,15 +1615,15 @@ through pkg-config, `-DVC_TOMOGRAPHY_OPENJPEG=OFF` to build without). OpenJPEG i
 uint16 JPEG 2000 (see `vc_tomography_calibration`); without it such scans are refused with a message that names the package.
 For float32 HTJ2K, CMake FetchContent downloads OpenJPH 0.32.0 with a SHA-256 check and links it statically.
 Its BSD-2-Clause license is included with installed artifacts. Use `-DVC_TOMOGRAPHY_OPENJPH=OFF` to omit it, or
-`-DFETCHCONTENT_SOURCE_DIR_OPENJPH=<src>` for an offline build with existing sources. The vc-delta3d codec is fetched at configure time (offline:
-`-DFETCHCONTENT_SOURCE_DIR_VC_DELTA3D=<src>`). CUDA code is compiled for the build machine's GPU (`native`); override with
+`-DFETCHCONTENT_SOURCE_DIR_OPENJPH=<src>` for an offline build with existing sources. CUDA code is compiled for the build machine's GPU (`native`); override with
 `-DCMAKE_CUDA_ARCHITECTURES=...`. `VC_TOMOGRAPHY_CUDA=AUTO` (default) builds CUDA only if `nvcc` is found, so put it on
 `PATH` (or pass `-C cmake.define.VC_TOMOGRAPHY_CUDA=ON`); check with `vc_tomography.devices()`.
 
 Run from `foundation/vc_tomography` in a Villa checkout containing `vc_reader` at `../../vc_reader`: the build links
 vc_reader's native library (an installed `vc_reader` CMake package, else that checkout, built statically with its
-Python modules, C API and CUDA off; `-DVC_READER_SOURCE=` points elsewhere) into `vc_tomography_surfaces`, the composite
-tool and `vc_tomography_reconstruct` (image files); the core library `vc_tomography` does not use it. vc-delta3d comes with it.
+Python modules, C API and CUDA off; `-DVC_READER_SOURCE=` points elsewhere) into the core library (Zarr reading and writing,
+the projection store, SHA-256), `vc_tomography_surfaces`, the composite tool and `vc_tomography_reconstruct`; the
+vc-delta3d codec comes with it.
 `pyproject.toml` takes the vc_reader Python package from the same checkout; `uv sync` includes it.
 To also install the test dependencies:
 

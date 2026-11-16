@@ -13,7 +13,6 @@
 #include <nanobind/stl/function.h>
 #include "vc_tomography/sino.hpp"
 #include "vc_tomography/raw_reader.hpp"
-#include "vc_tomography/delta3d.hpp"
 #include "vc_tomography/pipeline.hpp"
 #include "vc_tomography/accumulate.hpp"
 #include "vc_tomography/band.hpp"
@@ -1500,7 +1499,7 @@ NB_MODULE(_core, m) {
         return out;
     }, "frames"_a, "config"_a, "Correct frames with a resolved SLD configuration (vc_tomography.sld.sld_config)");
 
-    m.def("delta3d_available", &delta3d_available, "True if built with the vc-delta3d codec");
+    m.def("delta3d_available", [] { return true; }, "True: the vc-delta3d codec comes with vc_reader");
 
     m.def("span_info",
           [](DIn angles_deg, DIn z_translation_m, double pixel_size_m, int det_rows, float z_readjustment, double tol) {
