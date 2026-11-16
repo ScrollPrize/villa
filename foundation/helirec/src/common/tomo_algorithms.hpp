@@ -37,6 +37,10 @@ struct InitialCopyF {
         iw[i] = valid ? w[i] : 0.f;
     }
 };
+struct CopyF {
+    const float* from; float* to;
+    HR_HD void operator()(std::size_t i) const { to[i] = from[i]; }
+};
 struct SirtEpi {  // relax (b - Ax) / norm_i
     const float *b, *len2, *m; float* out; float relax;
     HR_HD void operator()(std::size_t k, float v) const {
@@ -69,7 +73,7 @@ struct EmApplyF {  // x *= upd / sum_dist
 };
 
 template <class B>
-void run(B& b, const TomoArgs& a, const float* rows, const float* weights, float* x) {
+void run(B& b, const TomoArgs& a, const float* rows, const float* weights, float* x, const float* start = nullptr) {
     const int NG = b.n_angles, N = b.g.N;
     const std::size_t NS = static_cast<std::size_t>(NG) * b.g.n_det, NP = static_cast<std::size_t>(N) * N;
     const std::string& alg = a.algorithm;
@@ -89,6 +93,10 @@ void run(B& b, const TomoArgs& a, const float* rows, const float* weights, float
         if (alg != "gridrec") g.filter_name = "ramlak";
         b.gridrec(wr, x, g);
         if (alg == "gridrec") return;
+    } else if (a.init == "fbp") {
+        if (!start)
+            throw Error(alg + ": init=fbp starts from the FBP of the slice that a reconstruction's pipeline makes; this call was given no start");
+        b.each(NP, CopyF{start, x});
     } else {
         b.fill(x, a.init_value, NP);
     }

@@ -317,9 +317,9 @@ TomoGeom whole(int n_angles, int n_det, int N, float rot) {
 }  // namespace
 
 void tomo_reconstruct(const TomoArgs& a, const TomoGeom& t, const float* rows, const float* weights, const float* angles,
-                      float* out, std::unique_ptr<TomoWorkspace>* ws) {
+                      float* out, std::unique_ptr<TomoWorkspace>* ws, const float* start) {
     std::unique_ptr<TomoWorkspace> local;
-    tomo_algos::run(backend_for(t, angles, ws, local), a, rows, weights, out);
+    tomo_algos::run(backend_for(t, angles, ws, local), a, rows, weights, out, start);
 }
 
 void chord_project(const float* img, float* sino, const float* angles, int n_angles, int n_det, int N, float rot, int projector) {

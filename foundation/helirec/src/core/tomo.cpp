@@ -26,8 +26,8 @@ TomoArgs tomo_args(const std::string& algorithm, const FilterParams& p) {
     if (!is_tomo_method(algorithm)) throw Error("unknown method '" + algorithm + "' (sirt, mlem, gridrec)");
     const bool gridrec = algorithm == "gridrec", sirt = algorithm == "sirt";
     const std::string known = gridrec ? "filter_name, filter_par"
-                              : sirt  ? "num_iter, relax, norm, weighting, projector, init, init_value"
-                                      : "num_iter, projector, init, init_value";
+                              : sirt  ? "num_iter, relax, norm, weighting, projector, init, init_value, init_divergence"
+                                      : "num_iter, projector, init, init_value, init_divergence";
     for (const auto& [k, v] : p.values) {
         const std::string err = algorithm + ": unknown parameter '" + k + "' (" + known + ")";
         if (gridrec) {
@@ -42,6 +42,10 @@ TomoArgs tomo_args(const std::string& algorithm, const FilterParams& p) {
         }
         else if (k == "init") a.init = v;
         else if (k == "init_value") a.init_value = static_cast<float>(p.num(k));
+        else if (k == "init_divergence") {
+            if (v != "on" && v != "off") throw Error(algorithm + ": init_divergence must be on or off");
+            a.init_divergence = v == "on";
+        }
         else if (k == "projector") {
             if (v == "chord") a.projector = 0;
             else if (v == "sf") a.projector = 1;
@@ -57,7 +61,8 @@ TomoArgs tomo_args(const std::string& algorithm, const FilterParams& p) {
         } else
             throw Error(err);
     }
-    if (a.init != "constant" && a.init != "gridrec") throw Error(algorithm + ": init must be constant or gridrec");
+    if (a.init != "constant" && a.init != "gridrec" && a.init != "fbp") throw Error(algorithm + ": init must be constant, gridrec or fbp");
+    if (a.init_divergence && a.init != "fbp") throw Error(algorithm + ": init_divergence is of init=fbp");
     if (a.num_iter < 0) throw Error(algorithm + ": num_iter >= 0");
     if (!std::isfinite(a.init_value)) throw Error(algorithm + ": init_value must be finite");
     if (sirt && (!std::isfinite(a.relax) || a.relax <= 0.f || a.relax >= 2.f))
@@ -73,6 +78,8 @@ class TomoBackprojector final : public ExternalBackprojector {
     explicit TomoBackprojector(TomoArgs a) : a_(std::move(a)) {}
     bool filtered() const override { return false; }
     bool measured_only() const override { return a_.algorithm != "gridrec"; }
+    int fbp_start() const override { return a_.algorithm != "gridrec" && a_.init == "fbp" ? (a_.init_divergence ? 2 : 1) : 0; }
+    void set_start(const float* image) override { start_ = image; }
     void slice(int, const float* rows, const float* weights, int n_angles, int n_det, const float* angles,
                const BackprojectParams& p, int N, const SliceRoi& roi, Device device, float* out) override {
         const float c = p.center >= 0 ? p.center : 0.5f * (N - 1), rad = p.clip_radius >= 0 ? p.clip_radius : c;
@@ -84,13 +91,13 @@ class TomoBackprojector final : public ExternalBackprojector {
         std::size_t pitch = rx;
         if (device == Device::CPU) {
             img_host_.resize(static_cast<std::size_t>(N) * N);
-            cpu::tomo_reconstruct(a_, t, rows, weights, angles, img_host_.data(), &ws_cpu_);
+            cpu::tomo_reconstruct(a_, t, rows, weights, angles, img_host_.data(), &ws_cpu_, start_);
             crop = img_host_.data() + static_cast<std::size_t>(roi.y0) * N + roi.x0;
             pitch = N;
         } else {
 #ifdef HELIREC_WITH_CUDA
             img_.ensure(static_cast<std::size_t>(N) * N);
-            cuda::tomo_reconstruct(a_, t, rows, weights, angles, img_.data(), &ws_cuda_);
+            cuda::tomo_reconstruct(a_, t, rows, weights, angles, img_.data(), &ws_cuda_, start_);
             crop_.ensure(static_cast<std::size_t>(rx) * ry);
             HELIREC_CUDA_CHECK(cudaMemcpy2D(crop_.data(), rx * sizeof(float),
                                             img_.data() + static_cast<std::size_t>(roi.y0) * N + roi.x0,
@@ -114,6 +121,7 @@ class TomoBackprojector final : public ExternalBackprojector {
 
   private:
     TomoArgs a_;
+    const float* start_ = nullptr;   // set_start
     std::vector<float> img_host_;
     std::unique_ptr<TomoWorkspace> ws_cpu_, ws_cuda_;
 #ifdef HELIREC_WITH_CUDA

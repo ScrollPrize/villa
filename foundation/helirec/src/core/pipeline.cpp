@@ -311,6 +311,15 @@ struct SliceReconstructor::Impl {
     void run(int h_lo, int h_hi, ChunkDebug* dbg, const std::vector<const FilterPipeline*>& sets, int margin_rows,
              int filter_rows, const std::function<void(int, int, float*, float*)>& sink, int next_lo = 0, int next_hi = 0);
     bool raw_rows = false;  // sinks get the unfiltered rows (external backprojectors that filter themselves)
+    // An external backprojector that starts from the slice's FBP (ExternalBackprojector::fbp_start; 0: none). run()
+    // then makes, beside the rows the sink gets, the rows the exact backprojector takes of that slice, from a copy
+    // mended and balanced as backprojector "fbp"'s are: start_rows, set for the sink's call (device pointer on CUDA).
+    int fbp_start = 0;
+    const float* start_rows = nullptr;
+    std::vector<float> start_h, start_wh, start_img_h;
+#ifdef HELIREC_WITH_CUDA
+    cuda::DeviceBuffer<float> start_d, start_wd, start_img_d;
+#endif
     ProgressBar* progress = nullptr;   // of the chunk in hand: run() names its steps
     void step(const char* name) {
         if (progress) progress->set_postfix(name);
@@ -354,6 +363,8 @@ SliceReconstructor::SliceReconstructor(std::vector<ScanData> scans, ReconConfig 
         I.cfg.external = make_tomo_backprojector(I.cfg.backprojector, I.cfg.tomo_params);
         I.cfg.backprojector = "external";
     }
+    I.fbp_start = I.cfg.external ? I.cfg.external->fbp_start() : 0;
+    if (I.fbp_start && I.cfg.legacy_reference) throw Error("the legacy reference mode has no FBP start for a whole-slice method (init=fbp)");
     for (const auto& s : I.scans)
         if (s.traj.n() != s.control_A.size() || s.traj.n() != s.file_index.size() || s.traj.n() != s.frame_index.size() ||
             s.traj.n() != s.traj.z_translation_m.size() ||
@@ -614,7 +625,8 @@ SliceReconstructor::SliceReconstructor(std::vector<ScanData> scans, ReconConfig 
     // The beam's divergence: the fan of every merged column, fan_per_column x (the scan's column there - its middle
     // column). Where several scans hold a merged column, the mean by the weight of their columns (the sums of their
     // weight maps' columns, each over its largest); a column none holds takes the nearest scan's line on.
-    if (I.cfg.fan_per_column != 0 && !I.cfg.legacy_reference && I.cfg.backprojector == "fbp") {
+    // (in the exact backprojector alone: backprojector "fbp", and the FBP start of a method that asks for it there)
+    if (I.cfg.fan_per_column != 0 && !I.cfg.legacy_reference && (I.cfg.backprojector == "fbp" || I.fbp_start == 2)) {
         std::vector<double> sum(I.NX, 0.0), wsum(I.NX, 0.0);
         for (const auto& s : I.scans) {
             const int R = s.traj.det_rows, C = s.traj.det_cols;
@@ -1368,8 +1380,21 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
                 }
             }
             if (dbg && dbg->keep) std::memcpy(&dbg->filtered[static_cast<std::size_t>(y) * NR * NX], row.data(), row.size() * sizeof(float));
+            if (I.fbp_start && raw_rows) {   // the method's start: this slice's rows as the exact backprojector takes them
+                I.start_h = row;
+                I.start_wh = wrow;
+                if (cfg.mend_threshold > 0)
+                    cpu::mend_null_weights(I.start_h.data(), I.start_wh.data(), NR, 1, NX, cfg.mend_threshold, I.mend_x0, I.mend_x1);
+                cpu::rebalance(I.start_h.data(), I.start_wh.data(), NR, 1, NX, cfg.rot_center, false);
+                cpu::ramp_pad(I.start_h.data(), padded.data(), rg, nullptr);
+                ramp_filter->apply(padded.data(), padded.data(), NR);
+                cpu::ramp_crop(padded.data(), I.start_h.data(), rg);
+                cpu::multiply(I.start_h.data(), I.start_wh.data(), I.start_h.size());
+                I.start_rows = I.start_h.data();
+            }
             tick("ramp");
             sink(0, y, row.data(), wrow.data());
+            I.start_rows = nullptr;
             tick("backproject");
         }
         return;
@@ -1750,8 +1775,22 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
             if (dbg && dbg->keep && K == 1)
                 HELIREC_CUDA_CHECK(cudaMemcpy(&dbg->filtered[static_cast<std::size_t>(y) * rown], row.data(), rown * sizeof(float),
                                               cudaMemcpyDeviceToHost));
+            if (I.fbp_start && raw_rows) {   // the method's start: this slice's rows as the exact backprojector takes them
+                I.start_d.ensure(rown); I.start_wd.ensure(rown);
+                HELIREC_CUDA_CHECK(cudaMemcpyAsync(I.start_d.data(), row.data(), rown * sizeof(float), cudaMemcpyDeviceToDevice));
+                HELIREC_CUDA_CHECK(cudaMemcpyAsync(I.start_wd.data(), wrow.data(), rown * sizeof(float), cudaMemcpyDeviceToDevice));
+                if (cfg.mend_threshold > 0)
+                    cuda::mend_null_weights(I.start_d.data(), I.start_wd.data(), NR, 1, NX, cfg.mend_threshold, I.mend_x0, I.mend_x1);
+                cuda::rebalance(I.start_d.data(), I.start_wd.data(), NR, 1, NX, cfg.rot_center, false);
+                cuda::ramp_pad(I.start_d.data(), pad.data(), rg, nullptr, nullptr);
+                ramp_filter->apply(pad.data(), pad.data(), NR);
+                cuda::ramp_crop(pad.data(), I.start_d.data(), rg);
+                cuda::multiply(I.start_d.data(), I.start_wd.data(), rown);
+                I.start_rows = I.start_d.data();
+            }
             tick("ramp");
             sink(k, y, row.data(), wrow.data());
+            I.start_rows = nullptr;
             tick("backproject");
         }
     };
@@ -2041,12 +2080,40 @@ void SliceReconstructor::reconstruct(int h_lo, int h_hi, const SliceOutput& out,
         to_sinks(y, blk, blk8);
         if (progress) progress->update(1);
     };
+    // An external method's start (ExternalBackprojector::fbp_start): the exact FBP of slice y on the whole grid, in
+    // attenuation per pixel, from the rows run() made of it (start_rows); given to the method for its slice() alone.
+    struct Start {
+        ExternalBackprojector* e = nullptr;
+        ~Start() { if (e) e->set_start(nullptr); }
+    };
+    auto give_start = [&](int y, Start& held) {
+        if (!I.start_rows) return;
+        BackprojectParams sp = I.bp;   // (the whole grid; its fan table is there where the start carries the divergence)
+        sp.scale = 1.f;
+        const float* image = nullptr;
+        if (I.cfg.device == Device::CPU) {
+            I.start_img_h.resize(N2);
+            cpu::backproject(I.fbp_rows(I.start_rows), I.fbp_angles_of(y), I.start_img_h.data(), I.chunk_rows, nd, N, N, sp);
+            image = I.start_img_h.data();
+        }
+#ifdef HELIREC_WITH_CUDA
+        else {
+            I.start_img_d.ensure(N2);
+            cuda::backproject(I.fbp_rows(I.start_rows), I.fbp_angles_of(y), I.start_img_d.data(), I.chunk_rows, nd, N, N, sp);
+            image = I.start_img_d.data();
+        }
+#endif
+        I.cfg.external->set_start(image);
+        held.e = I.cfg.external.get();
+    };
     if (I.cfg.device == Device::CPU) {
         std::vector<float> full(use_ghbp ? N2 : 0);
         const auto P = I.pipeline(I.cfg.filters);
         I.run(h_lo, h_hi, dbg, {P.get()}, I.margin, I.filter_margin, [&](int, int y, float* row, float* wrow) {
             host_sink(y, [&](float* dst) {
                 if (external) {
+                    Start held;
+                    give_start(y, held);
                     I.cfg.external->slice(h_lo + y, row, wrow, I.chunk_rows, I.NX, I.fbp_angles_of(y), bp, N, computed, Device::CPU, dst);
                 } else if (use_ghbp) {
                     cpu::ghbp(I.plan, row, full.data());
@@ -2073,6 +2140,8 @@ void SliceReconstructor::reconstruct(int h_lo, int h_hi, const SliceOutput& out,
     I.run(h_lo, h_hi, dbg, {P.get()}, I.margin, I.filter_margin, [&](int, int y, float* row, float* wrow) {
         if (external) {
             host_sink(y, [&](float* dst) {
+                Start held;
+                give_start(y, held);
                 I.cfg.external->slice(h_lo + y, row, wrow, I.chunk_rows, I.NX, I.fbp_angles_of(y), bp, N, computed, Device::CUDA, dst);
             });
             return;

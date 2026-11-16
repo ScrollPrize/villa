@@ -187,3 +187,57 @@ def test_iterative_luminosity_has_full_context(tmp_path, device, filters):
     single = [r.reconstruct(h, h + 1, debug=True) for h in range(7, 10)]
     np.testing.assert_allclose(chunk["slices"] * .001, np.concatenate([s["slices"] for s in single]) * .001, atol=2e-6, rtol=2e-5)
     np.testing.assert_allclose(chunk["sino"], np.concatenate([s["sino"] for s in single], axis=1), atol=2e-6)
+
+
+@pytest.mark.parametrize("device", helirec.devices())
+def test_sirt_from_a_given_start(device):
+    """init=fbp: the iterations start from the image given (the pipeline's FBP of the slice in a reconstruction)"""
+    n, nd, rot = 9, 14, 6.8
+    angles = np.linspace(0, 2 * np.pi, 16, endpoint=False).astype(np.float32)
+    basis = np.eye(n * n, dtype=np.float32).reshape(-1, n, n)
+    A = np.stack([_core.chord_project(x, angles, nd, rot, projector="sf").ravel() for x in basis], axis=1).astype(np.float64)
+    rng = np.random.default_rng(11)
+    b = rng.random((len(angles), nd)).astype(np.float32)
+    start = rng.random((n, n)).astype(np.float32)
+    run = lambda it, **kw: _core.tomo_reconstruct(b, None, angles, n, rot, "sirt", {"num_iter": str(it), "init": "fbp"}, device=device, **kw)
+    np.testing.assert_array_equal(run(0, start=start), start)
+    rows, cols = A.sum(1), A.sum(0)
+    x = start.astype(np.float64).ravel()
+    for _ in range(3):
+        residual = np.divide(b.ravel() - A @ x, rows, out=np.zeros_like(rows), where=rows > 0)
+        x += np.divide(A.T @ residual, cols, out=np.zeros_like(cols), where=cols > 0)
+    np.testing.assert_allclose(run(3, start=start).ravel(), x, atol=3e-6, rtol=3e-5)
+    with pytest.raises(Exception, match="no start"):
+        run(1)
+    for bad in ({"init": "gridrec", "init_divergence": "on"}, {"init": "fbp", "init_divergence": "yes"}, {"init": "ramp"}):
+        with pytest.raises(Exception):
+            _core.tomo_reconstruct(b, None, angles, n, rot, "sirt", bad, device=device, start=start)
+
+
+@pytest.mark.parametrize("device", helirec.devices())
+@pytest.mark.parametrize("method", ["sirt", "mlem"])
+def test_whole_slice_method_starts_from_the_pipelines_fbp(tmp_path, device, method):
+    """init=fbp in a reconstruction: before any iteration the slice is the exact FBP's of the same rows (a copy mended
+    and balanced as backprojector fbp's), with a parallel beam, or with the beam's divergence when asked"""
+    scan = lambda: helical_scan(tmp_path)[0]
+    slices = lambda **kw: np.asarray(recon(scan(), device, **kw).reconstruct(7, 9))
+    start = lambda it=0, **more: dict(backprojector=method, tomo_params=dict({"num_iter": str(it), "init": "fbp"}, **more))
+    fbp = slices(backprojector="fbp", tomo_params={})
+    assert fbp.max() > 0.1
+    # (what is left: the two griddings, measured pixels with the column kernel against the exact delay at 0.3 px,
+    # and the unmeasured column 5; the gridrec start is 2.8e-3 from FBP here)
+    assert np.abs(slices(**start()) - fbp).max() < 1.5e-3
+    moved = slices(**start(5))
+    assert 1e-4 < np.abs(moved - slices(**start())).max() < 0.05           # the iterations run from it
+    # the beam's divergence: in the start only where asked
+    k = 0.02
+    fan = slices(backprojector="fbp", tomo_params={}, fan_per_column=k)
+    effect = np.abs(fan - fbp).max()
+    assert effect > 2e-3
+    on, off = slices(fan_per_column=k, **start(init_divergence="on")), slices(fan_per_column=k, **start())
+    assert np.abs(on - fan).max() < 0.4 * effect and np.abs(off - fbp).max() < 0.4 * effect and np.abs(on - off).max() > 0.6 * effect
+    np.testing.assert_array_equal(off, slices(**start()))
+    info = lambda **more: recon(scan(), device, fan_per_column=k, **start(**more)).info["fan_per_column"]
+    assert info(init_divergence="on") == k and info() == 0 and info(init_divergence="off") == 0
+    with pytest.raises(Exception, match="legacy reference"):
+        recon(scan(), device, legacy_reference=True, **start())

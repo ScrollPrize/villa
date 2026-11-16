@@ -14,7 +14,10 @@
 // opposite rays sums to one full projection). Projector (tomo_core.hpp): exact chord lengths at the cell centre
 // (chord) or the separable footprint integrated over the cell (sf). Image: the pipeline's N x N grid; unknowns: the
 // pixels inside the reconstruction disk (radius R). Initial image (sirt / mlem): init_value, or init=gridrec;
-// gridrec initialization fills/balances a separate copy, never the iterative observations.
+// gridrec initialization fills/balances a separate copy, never the iterative observations. init=fbp: the image
+// given as `start` (N x N, attenuation per pixel), which the pipeline makes for its backprojectors: the exact FBP of
+// the slice (ExternalBackprojector::fbp_start; init_divergence=on: with the beam's divergence, which the methods'
+// own projectors do not have, so that the iterations then work against it).
 // The whole slice is always reconstructed; the pipeline crops the requested ROI afterwards.
 #include <memory>
 #include <string>
@@ -34,7 +37,8 @@ struct TomoArgs {
     bool confidence_weights = false;       // false: validity mask; true: nonnegative measurement confidence
     std::string filter_name = "shepp";       // gridrec
     std::vector<float> filter_par = {0.5f, 8.f};
-    std::string init = "constant";           // constant | gridrec
+    std::string init = "constant";           // constant | gridrec | fbp (the image given as `start`)
+    bool init_divergence = false;            // init=fbp in a pipeline: the start carries the beam's divergence
     float init_value = 1e-6f;
     int projector = 1;                       // 0 chord (line through the cell centre), 1 sf (separable footprint)
 };
@@ -56,10 +60,12 @@ std::vector<std::string> tomo_algorithms();
 // one slice: rows (n_angles, n_det) -log sinogram, weights (n_angles, n_det) measured support (iterative) or
 // balanced weights (gridrec); angles: the exact
 // backprojector's (u = x cos a + y sin a + rot); out: the N x N image (row-major) in per-pixel units.
-// ws (optional): workspace kept between calls with the same geometry.
+// ws (optional): workspace kept between calls with the same geometry. start: the initial image of init=fbp (N x N,
+// where rows are).
 namespace cpu {
 void tomo_reconstruct(const TomoArgs& a, const TomoGeom& g, const float* rows, const float* weights,
-                       const float* angles, float* out, std::unique_ptr<TomoWorkspace>* ws = nullptr);
+                       const float* angles, float* out, std::unique_ptr<TomoWorkspace>* ws = nullptr,
+                       const float* start = nullptr);
 void chord_project(const float* img, float* sino, const float* angles, int n_angles, int n_det, int N, float rot,
                    int projector = 0);
 void chord_backproject(const float* sino, float* img, const float* angles, int n_angles, int n_det, int N, float rot,
@@ -69,7 +75,8 @@ void chord_backproject(const float* sino, float* img, const float* angles, int n
 namespace cuda {
 // device rows / weights / out, host angles
 void tomo_reconstruct(const TomoArgs& a, const TomoGeom& g, const float* rows, const float* weights,
-                       const float* angles_host, float* out, std::unique_ptr<TomoWorkspace>* ws = nullptr);
+                       const float* angles_host, float* out, std::unique_ptr<TomoWorkspace>* ws = nullptr,
+                       const float* start = nullptr);
 void chord_project(const float* img, float* sino, const float* angles_host, int n_angles, int n_det, int N, float rot,
                    int projector = 0);
 void chord_backproject(const float* sino, float* img, const float* angles_host, int n_angles, int n_det, int N, float rot,

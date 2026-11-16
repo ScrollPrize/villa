@@ -196,8 +196,8 @@ on its own from Python (`helirec._core`, re-exported in `helirec`) on NumPy arra
   below Nyquist (tomopy's windows are not cut beyond `p0`); gridrec uses the same windows.
 * Whole-slice methods (`tomo.hpp`; CPU `src/cpu/tomo.cpp`, CUDA `src/cuda/tomo.cu`). SIRT, MLEM and gridrec began
   as ports of tomopy's libtomo implementations (https://github.com/tomopy/tomopy):
-  * `sirt(num_iter, relax, norm=rowsum, weighting=mask|confidence, projector=sf|chord, init=constant|gridrec, init_value)`
-  * `mlem(num_iter, projector, init, init_value)`
+  * `sirt(num_iter, relax, norm=rowsum, weighting=mask|confidence, projector=sf|chord, init=constant|gridrec|fbp, init_value, init_divergence=off|on)`
+  * `mlem(num_iter, projector, init, init_value, init_divergence)`
   * `gridrec(filter_name, filter_par=a:b)`, filters `none`, `shepp`, `cosine`, `hann`, `hamming`, `ramlak`,
     `parzen`, `butterworth`.
   * SIRT divides each ray's residual by its row sum (`norm=rowsum`, finite `0 < relax < 2`);
@@ -210,6 +210,14 @@ on its own from Python (`helirec._core`, re-exported in `helirec`) on NumPy arra
     scale is that of the exact FBP (peak values of small features within 0.1 % at any radius,
     `tests/test_tomo.py`). The closed form inherited from tomopy overestimated them by 12 % at the centre, rising
     to 44 % at 0.59 of the padded half width, and `init=gridrec` carried that into SIRT / MLEM.
+  * `init=fbp`: the iterations start from the exact FBP of the slice, which the pipeline makes with what
+    `backprojector=fbp` uses: a copy of the slice's measured rows is mended (`mend_threshold`) and balanced, filtered
+    with the plain ramp and backprojected by the exact backprojector (`bp_interp`, `bp_oversample`) on the whole
+    grid; the method's own rows and weights stay the measured ones. The start is a parallel beam's, as the methods'
+    projectors are. `init_divergence=on` gives the start the beam's divergence where the reconstruction has one
+    (`beam_divergence`; `info["fan_per_column"]` then states it, and is 0 otherwise): the iterations, whose
+    projectors do not have it, then work against it. With `num_iter=0` the slice is that FBP
+    (`tests/test_sirt_pipeline.py`). Not in mode `legacy_reference`; MLEM clips the start at `init_value`.
   * Projectors: `sf` (default), the separable footprint (Long, Fessler & Balter 2010), integrates the chord
     trapezoid over the detector cell; `chord` takes it at the cell centre. Both are exact transpose pairs.
     `sf` evaluates the footprint's cumulative integral at the cell boundaries, which neighbouring cells share: the
@@ -464,7 +472,8 @@ on its own from Python (`helirec._core`, re-exported in `helirec`) on NumPy arra
     divergence along the axis is not taken (rays leave the slice by up to the fan x the depth; slice by slice
     there is no room for it). `info["fan_per_column"]` is what is in use [rad per column]: 0 with
     `beam_divergence=false`, a calibration without a fan, another backprojector than FBP (ghbp has its own
-    `axis_source_meters`) and in mode `legacy_reference`.
+    `axis_source_meters`; SIRT and MLEM have it in their FBP start alone, with `init=fbp, init_divergence=on`) and
+    in mode `legacy_reference`.
     On PHerc. 172 at Diamond I12 (source 51 m, 7.91 um: 1.55e-7 rad per column): the columns of the grid, 2285
     merged columns apart, lay 0.72 and 1.06 px apart along the tangent on the ring they share (the two rows of
     scans; expected 0.79) and lie -0.03 and +0.31 px apart with it; with the fan's sign reversed 1.47 and 1.82.

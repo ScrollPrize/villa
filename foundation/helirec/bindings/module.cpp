@@ -1348,8 +1348,15 @@ NB_MODULE(_core, m) {
           "sino"_a, "angles"_a, "N"_a, "rot"_a, "device"_a = "cpu", "projector"_a = "chord", "adjoint of chord_project");
     m.def("tomo_reconstruct",
           [](HostIn rows, nb::object weights_obj, HostIn angles, int N, float rot, const std::string& algorithm,
-             nb::dict params, const std::string& device, float R) {
+             nb::dict params, const std::string& device, float R, nb::object start_obj) {
               require(rows.ndim() == 2 && rows.shape(0) == angles.size(), "rows must be (n_angles, n_det)");
+              std::vector<float> start;
+              if (!start_obj.is_none()) {
+                  auto sa = nb::cast<HostIn>(start_obj);
+                  require(sa.size() == static_cast<std::size_t>(N) * N, "start must be (N, N)");
+                  start.assign(sa.data(), sa.data() + sa.size());
+              }
+              const float* const start_host = start.empty() ? nullptr : start.data();
               TomoGeom t;
               t.n_angles = static_cast<int>(rows.shape(0)); t.n_det = static_cast<int>(rows.shape(1));
               t.N = N; t.rot = rot; t.R = R > 0 ? R : 1e30f;
@@ -1366,22 +1373,23 @@ NB_MODULE(_core, m) {
               HostOut out = new_array({H, W});
               nb::gil_scoped_release nogil;
               if (parse_device(device) == Device::CPU) {
-                  cpu::tomo_reconstruct(a, t, rows.data(), w.data(), angles.data(), data(out));
+                  cpu::tomo_reconstruct(a, t, rows.data(), w.data(), angles.data(), data(out), nullptr, start_host);
                   return out;
               }
 #ifdef HELIREC_WITH_CUDA
-              cuda::DeviceBuffer<float> dr, dw, dx(W * H);
+              cuda::DeviceBuffer<float> dr, dw, dx(W * H), ds;
               dr.upload(rows.data(), rows.size());
               dw.upload(w.data(), w.size());
-              cuda::tomo_reconstruct(a, t, dr.data(), dw.data(), angles.data(), dx.data());
+              if (start_host) ds.upload(start_host, start.size());
+              cuda::tomo_reconstruct(a, t, dr.data(), dw.data(), angles.data(), dx.data(), nullptr, start_host ? ds.data() : nullptr);
               dx.download(data(out));
 #endif
               return out;
           },
           "rows"_a, "weights"_a.none(), "angles"_a, "N"_a, "rot"_a, "algorithm"_a, "params"_a = nb::dict(), "device"_a = "cpu",
-          "R"_a = 0.f,
+          "R"_a = 0.f, "start"_a = nb::none(),
           "one whole slice (per-pixel units); weights: measured support for sirt/mlem, balanced weights for gridrec, "
-          "or None for ones; R: disk radius");
+          "or None for ones; R: disk radius; start: the initial image (N, N) of init=fbp");
     m.def("mend_null_weights",
           [](HostIn R, HostIn RW, float threshold, int x0, int x1, const std::string& device) {
               require(R.ndim() == 2 && RW.ndim() == 2 && R.shape(0) == RW.shape(0) && R.shape(1) == RW.shape(1),

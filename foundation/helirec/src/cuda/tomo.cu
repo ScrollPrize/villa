@@ -477,9 +477,9 @@ TomoGeom whole(int n_angles, int n_det, int N, float rot) {
 }  // namespace
 
 void tomo_reconstruct(const TomoArgs& a, const TomoGeom& t, const float* rows, const float* weights,
-                      const float* angles_host, float* out, std::unique_ptr<TomoWorkspace>* ws) {
+                      const float* angles_host, float* out, std::unique_ptr<TomoWorkspace>* ws, const float* start) {
     std::unique_ptr<TomoWorkspace> local;
-    tomo_algos::run(backend_for(t, angles_host, ws, local), a, rows, weights, out);
+    tomo_algos::run(backend_for(t, angles_host, ws, local), a, rows, weights, out, start);
     HELIREC_CUDA_CHECK(cudaDeviceSynchronize());
 }
 

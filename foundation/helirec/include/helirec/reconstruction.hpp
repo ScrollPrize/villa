@@ -17,7 +17,9 @@
 //   filters              projection filter chain ("paganin(delta_beta=1000)+unsharp(sigma=1.2,coeff=4)", JSON, or
 //                        "none"); TYPE[.k].param=VALUE changes one value of it (TYPE[k]: the k-th filter of the type)
 //   backprojector        fbp(interp=, oversample=, filter_name=, filter_par=) (default) | ghbp | sirt(...) | mlem(...)
-//                        | gridrec(...) | python(fn=...) (Python only)
+//                        | gridrec(...) | python(fn=...) (Python only). sirt and mlem start from init=constant |
+//                        gridrec | fbp (the pipeline's exact FBP of the slice; init_divergence=on: with the beam's
+//                        divergence): tomo.hpp
 //   geometry             "" (default): geometry.json in the cache directory, made there by the geometry calibration
 //                        on first use or when it is other scans' | the path of one made before
 //   row_time_us          for that step when no stretch holds a refill: the time of a stored row, microseconds (signed)

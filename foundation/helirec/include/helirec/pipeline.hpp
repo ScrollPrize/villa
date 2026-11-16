@@ -213,6 +213,14 @@ class ExternalBackprojector {
     virtual bool filtered() const = 0;
     // Request measured-only gridding, with support preserved before any hole filling or rebalance.
     virtual bool measured_only() const { return false; }
+    // The image the method starts from, asked of the pipeline: 0 none; 1 the exact FBP of the slice with a parallel
+    // beam (the plain ramp; a copy of the slice's rows mended and balanced as for backprojector "fbp", the exact
+    // backprojector with bp_interp and bp_oversample); 2 the same with the beam's divergence where the reconstruction
+    // has one (ReconConfig::fan_per_column). Not in the legacy reference mode.
+    virtual int fbp_start() const { return 0; }
+    // That image, given before every slice() of a method whose fbp_start() is not 0 and taken back (null) after it:
+    // the whole grid (grid_size x grid_size, row-major) in attenuation per pixel, on the reconstructor's device.
+    virtual void set_start(const float*) {}
     virtual void slice(int view_height, const float* rows, const float* weights, int n_angles, int n_det,
                        const float* angles, const BackprojectParams& p, int grid_size, const SliceRoi& roi, Device device,
                        float* out) = 0;
