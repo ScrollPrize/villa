@@ -22,7 +22,6 @@ from vesuvius.ink_detection.label_zarr import (
     DEFAULT_LEVELS,
     LABEL_CODEC,
     LABEL_SLICE as DEFAULT_LABEL_SLICE,
-    VOLUME_DEPTH as DEFAULT_DEPTH,
     pyramid_shapes,
 )
 from vesuvius.utils.cli import HyphenUnderscoreParser
@@ -154,21 +153,6 @@ def load_image(path: Path) -> np.ndarray:
     return _normalize_to_2d(images.read(path, page=0), path)
 
 
-def _embed_label_volume(
-    image_2d: np.ndarray,
-    *,
-    depth: int = DEFAULT_DEPTH,
-    label_slice: int = DEFAULT_LABEL_SLICE,
-) -> np.ndarray:
-    if not 0 <= label_slice < depth:
-        raise ValueError(f"label_slice must be within [0, {depth}), got {label_slice}")
-    volume_ZYX = np.zeros(
-        (depth, image_2d.shape[0], image_2d.shape[1]), dtype=image_2d.dtype
-    )
-    volume_ZYX[label_slice] = image_2d
-    return volume_ZYX
-
-
 def _create_ome_zarr_datasets(
     output_path: Path,
     *,
@@ -223,16 +207,15 @@ def write_label_pyramid(
     """Embed a label at Z=32 and write it with XY pyramid levels, without Z pooling."""
     if levels < 1:
         raise ValueError("levels must be at least 1")
-    level_zero = _embed_label_volume(image_2d)
     datasets = _create_ome_zarr_datasets(
         output_path,
-        image_shape=tuple(int(value) for value in level_zero.shape[1:]),
-        dtype=level_zero.dtype,
+        image_shape=tuple(int(value) for value in image_2d.shape),
+        dtype=image_2d.dtype,
         levels=levels,
         reduction=downsample_mode,
         overwrite=overwrite,
     )
-    datasets[0][...] = level_zero
+    datasets[0][DEFAULT_LABEL_SLICE] = image_2d
     _write_levels_above_zero(output_path, levels, downsample_mode, chunk_workers)
 
 
