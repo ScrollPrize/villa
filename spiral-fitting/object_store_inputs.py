@@ -1716,17 +1716,6 @@ def _compute_track_crossings(tracks, points, rows, workers=None):
         merged[name] = (columns[0] if len(columns) == 1 else np.concatenate(columns)).astype(
             merged[name].dtype, copy=False)
     return merged
-    owners = np.concatenate([
-        begin + np.repeat(np.arange(len(csr['offsets']) - 1, dtype=np.int64),
-                          np.diff(csr['offsets'])) for begin, csr in parts])
-    partners = np.concatenate([begin + csr['partners'].astype(np.int64) for begin, csr in parts])
-    order = np.lexsort((partners, owners))
-    np.cumsum(np.bincount(owners, minlength=len(tracks)), out=merged['offsets'][1:])
-    merged['partners'] = partners[order].astype(np.int32)
-    for name in ('self_local', 'partner_local', 'positions', 'clearances'):
-        merged[name] = np.concatenate([csr[name] for _, csr in parts])[order].astype(
-            merged[name].dtype, copy=False)
-    return merged
 
 
 def _track_crossing_key(tracks, rows):
