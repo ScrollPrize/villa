@@ -21,6 +21,12 @@ HR_HD float mapped(const float* row, int src0, int src1, float w0, float w1) {
 }
 HR_HD float between(float alpha, float a, float b) { return hd::add(hd::mul(hd::sub(1.0f, alpha), a), hd::mul(alpha, b)); }
 
+// a sinogram of `turn` rows per turn (one row per view): an even number of rows a turn, at least a turn of rows
+inline void check_turns(int n_proj, int turn) {
+    if (turn < 2 || turn % 2 != 0) throw Error("rebalance_turns: the rows of a turn must be an even number");
+    if (n_proj < turn) throw Error("rebalance_turns: fewer rows than a turn");
+}
+
 struct Contribution {
     int k0, k1;
     float alpha;

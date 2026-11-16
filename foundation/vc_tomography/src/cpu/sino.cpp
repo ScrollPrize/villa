@@ -21,32 +21,6 @@ namespace {
 
 long cround(double x) { return std::lround(x); }  // half away from zero (C lround)
 
-// adj = Gb - Ga for row y (mirror row m): Gaussian-weighted means near the axis
-float ramp_adj(const float* row, const float* mrow, const RampGeometry& g) {
-    if (!g.legacy) return ramp_adj_exact(row, mrow, g);
-    if (g.R <= 0) return 0.f;
-    const float sigma = static_cast<float>(g.R) / 3.0f;
-    const float inv2s2 = 1.0f / (2.0f * sigma * sigma);
-    const float my_rot_f = g.rot_center, two_rots_f = 2.0f * g.rot_center;
-    const float mirror_center = two_rots_f - my_rot_f;
-    const int i0 = std::max(0, g.my_rot - g.R), i1 = std::min(g.n_bins - 1, g.my_rot + g.R);
-    float sa = 0, wa = 0, sb = 0, wb = 0;
-    for (int ix = i0; ix <= i1; ++ix) {
-        const float dA = static_cast<float>(ix) - my_rot_f;
-        const float wA = std::exp(-(dA * dA) * inv2s2);
-        sa += row[ix] * wA;
-        wa += wA;
-        const int xm = g.two_rots - ix;
-        if (xm >= 0 && xm < g.n_bins) {
-            const float dB = static_cast<float>(xm) - mirror_center;
-            const float wB = std::exp(-(dB * dB) * inv2s2);
-            sb += mrow[xm] * wB;
-            wb += wB;
-        }
-    }
-    if (wa > 0 && wb > 0) return sb / wb - sa / wa;
-    return 0.f;
-}
 
 }  // namespace
 
@@ -345,10 +319,7 @@ void balance_with_table(float* W, int n_proj, int n_rows, int n_cols, const std:
     }
 }
 
-void check_turns(int n_proj, int turn) {
-    if (turn < 2 || turn % 2 != 0) throw Error("rebalance_turns: the rows of a turn must be an even number");
-    if (n_proj < turn) throw Error("rebalance_turns: fewer rows than a turn");
-}
+using rebalance_core::check_turns;
 }  // namespace
 
 // ------------------------------------------------------------------ rebalance, one row per view

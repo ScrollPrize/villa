@@ -26,27 +26,7 @@ __global__ void ramp_adj_kernel(const float* sino, float* adj, RampGeometry g, c
     const int m = opposite ? opposite[y] : (y + g.n_proj / 2) % g.n_proj;
     const float* row = sino + static_cast<size_t>(y) * g.n_bins;
     const float* mrow = sino + static_cast<size_t>(m) * g.n_bins;
-    if (!g.legacy) { adj[y] = sino_core::ramp_adj_exact(row, mrow, g); return; }
-    const float sigma = __fdiv_rn(static_cast<float>(g.R), 3.0f);
-    const float inv2s2 = __fdiv_rn(1.0f, __fmul_rn(__fmul_rn(2.0f, sigma), sigma));
-    const float my_rot_f = g.rot_center, two_rots_f = __fmul_rn(2.0f, g.rot_center);
-    const float mirror_center = __fsub_rn(two_rots_f, my_rot_f);
-    const int i0 = max(0, g.my_rot - g.R), i1 = min(g.n_bins - 1, g.my_rot + g.R);
-    float sa = 0, wa = 0, sb = 0, wb = 0;
-    for (int ix = i0; ix <= i1; ++ix) {
-        const float dA = __fsub_rn(static_cast<float>(ix), my_rot_f);
-        const float wA = expf(-__fmul_rn(__fmul_rn(dA, dA), inv2s2));
-        sa = __fadd_rn(sa, __fmul_rn(row[ix], wA));
-        wa = __fadd_rn(wa, wA);
-        const int xm = g.two_rots - ix;
-        if (xm >= 0 && xm < g.n_bins) {
-            const float dB = __fsub_rn(static_cast<float>(xm), mirror_center);
-            const float wB = expf(-__fmul_rn(__fmul_rn(dB, dB), inv2s2));
-            sb = __fadd_rn(sb, __fmul_rn(mrow[xm], wB));
-            wb = __fadd_rn(wb, wB);
-        }
-    }
-    adj[y] = (wa > 0 && wb > 0) ? __fsub_rn(__fdiv_rn(sb, wb), __fdiv_rn(sa, wa)) : 0.f;
+    adj[y] = sino_core::ramp_adj(row, mrow, g);
 }
 
 __global__ void ramp_pad_kernel(const float* sino, const float* adj, float* padded, RampGeometry g, const int32_t* opposite) {
@@ -154,10 +134,7 @@ std::vector<char> nonempty_rows(const float* W, int n_proj, int n_rows, int n_co
     return nonempty;
 }
 
-void check_turns(int n_proj, int turn) {
-    if (turn < 2 || turn % 2 != 0) throw Error("rebalance_turns: the rows of a turn must be an even number");
-    if (n_proj < turn) throw Error("rebalance_turns: fewer rows than a turn");
-}
+using rebalance_core::check_turns;
 
 void balance_with_table(float* W, int n_proj, int n_rows, int n_cols, const std::vector<std::vector<rebalance_core::Contribution>>& table,
                         const std::vector<rebalance_core::OddMap>& omap, cudaStream_t s);

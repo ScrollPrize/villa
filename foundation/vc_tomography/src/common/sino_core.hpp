@@ -87,6 +87,35 @@ HR_HD float ramp_adj_exact(const float* row, const float* mrow, const RampGeomet
     return (wa > 0 && wb > 0) ? sub(sb / wb, sa / wa) : 0.f;
 }
 
+// the legacy form (the reference's): integer reflection 2 rot - ix about my_rot, the mirror's weights about 2 rot - rot
+HR_HD float ramp_adj_legacy(const float* row, const float* mrow, const RampGeometry& g) {
+    if (g.R <= 0) return 0.f;
+    const float sigma = div(static_cast<float>(g.R), 3.0f);
+    const float inv2s2 = div(1.0f, mul(mul(2.0f, sigma), sigma));
+    const float my_rot_f = g.rot_center, two_rots_f = mul(2.0f, g.rot_center);
+    const float mirror_center = sub(two_rots_f, my_rot_f);
+    const int i0 = g.my_rot - g.R < 0 ? 0 : g.my_rot - g.R, i1 = g.my_rot + g.R > g.n_bins - 1 ? g.n_bins - 1 : g.my_rot + g.R;
+    float sa = 0, wa = 0, sb = 0, wb = 0;
+    for (int ix = i0; ix <= i1; ++ix) {
+        const float dA = sub(static_cast<float>(ix), my_rot_f);
+        const float wA = expf(-mul(mul(dA, dA), inv2s2));
+        sa = add(sa, mul(row[ix], wA));
+        wa = add(wa, wA);
+        const int xm = g.two_rots - ix;
+        if (xm >= 0 && xm < g.n_bins) {
+            const float dB = sub(static_cast<float>(xm), mirror_center);
+            const float wB = expf(-mul(mul(dB, dB), inv2s2));
+            sb = add(sb, mul(mrow[xm], wB));
+            wb = add(wb, wB);
+        }
+    }
+    return (wa > 0 && wb > 0) ? sub(div(sb, wb), div(sa, wa)) : 0.f;
+}
+// adj = mirror - own for row y (mirror row mrow): the exact form, or the reference's
+HR_HD float ramp_adj(const float* row, const float* mrow, const RampGeometry& g) {
+    return g.legacy ? ramp_adj_legacy(row, mrow, g) : ramp_adj_exact(row, mrow, g);
+}
+
 // one padded sample x of row `row` (mirror row `mrow`, offset adj) -- nabuxx pad_row_mirror_edges
 HR_HD float ramp_pad_value(const float* row, const float* mrow, float adj, int x, const RampGeometry& g) {
     const int nx = g.n_bins;
