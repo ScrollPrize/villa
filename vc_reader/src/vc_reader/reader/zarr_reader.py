@@ -29,6 +29,7 @@ reopened the same way.
 
 from __future__ import annotations
 
+from functools import partial
 import operator
 import os
 import warnings
@@ -56,6 +57,11 @@ def _open_options(settings: dict[str, Any], cache: MemoryCache | None):
         settings["compress_cache"], settings["allow_lossy_cache"], cache._engine if cache is not None else None,
         settings["threads"] or (1 if _loader_worker() else 0), settings["connections"], settings["read_mode"],
         settings["offline"])
+
+
+def _computed_chunk_bytes(compute, dtype, index):
+    result = compute(index)
+    return None if result is None else np.asarray(result, dtype).tobytes()
 
 
 class ZarrReader:
@@ -146,17 +152,13 @@ class ZarrReader:
         """
         element = np.dtype(dtype)
 
-        def chunk_bytes(index):
-            result = compute(index)
-            return None if result is None else np.asarray(result, element).tobytes()
-
         settings, cache = _make_settings(f"computed:{identity}", level=None, cache_dir=None, cache_writes=False,
                                          cache_max_bytes=None, compress_cache=False, allow_lossy_cache=False,
                                          memory_cache=memory_cache, threads=threads, connections=1,
                                          read_mode="mmap", auth=None, offline=False)
         settings["computed"] = {
             "shape": [int(n) for n in shape], "chunks": [int(n) for n in chunks], "dtype": element.str,
-            "fill_value": fill_value, "identity": identity, "compute": chunk_bytes,
+            "fill_value": fill_value, "identity": identity, "compute": partial(_computed_chunk_bytes, compute, element),
             "cache_dir": None if cache_dir is None else os.fspath(cache_dir),
             "cache_max_bytes": cache_max_bytes, "compress_cache": compress_cache,
         }
