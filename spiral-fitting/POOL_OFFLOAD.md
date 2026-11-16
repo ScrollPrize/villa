@@ -50,7 +50,7 @@ allows `cuMemHostRegister` (the pool maps its page-locked memory into the card's
   (2026-11-16; PHerc0490B z 7000-7200 from an ingested object store, 557,248 tracks, 32-voxel, 1,000-step configuration, one dedicated
   hub V100-16GB; collector timed with `gc.callbacks`): after startup the Python heap holds 50.8 M objects and one full collection of it
   costs 22-30 s. Seconds per iteration (it/s): `freeze` 0.058 / 0.060 (17.2 / 16.6, two runs); a collection every step (the old
-  hook) 28.9 (0.035; 62 collections of about 28 s); every 10 steps 2.81 (0.36); `pressure` 0.058 (17.4); `off` 0.050 / 0.052
+  hook) 28.9 / 27.2 (0.035 / 0.037, two runs; 75 collections of 27-30 s); every 10 steps 2.81 (0.36); `pressure` 0.058 (17.4); `off` 0.050 / 0.052
   (20.1 / 19.4, two runs). After `gc.freeze()` the 1,001 per-step collections took 0.06-0.18 s in total. Chart:
   `pool_offload/time_chart_public.png` (right panel; the other panels are production whole-height fits run with the old every-step hook
   on the older fitter copy, and the controlled pairs).
@@ -73,7 +73,7 @@ allows `cuMemHostRegister` (the pool maps its page-locked memory into the card's
 | # | claim | evidence | strength |
 |---|---|---|---|
 | 1 | `FIT_SPIRAL_GC_POLICY=freeze` (default) bounds the device-memory growth of a long fit | torch peak 2.81 GiB against 8.44 GiB with `off` (one scroll, z 9000-10500, 16-voxel, 600 steps, V100-32); without it a whole-height fit died at iteration 18 | one scroll, older fitter copy |
-| 2 | the freeze policy makes the per-step collection cheap | branch fitter, object-store inputs: 0.06-0.18 ms per collection after the freeze against 22-30 s for a full collection of the 50.8 M-object heap; 16.6-17.2 it/s against 0.035 it/s with a collection every step and 0.36 it/s every 10 steps; `off` (no explicit collection, runs out of memory on long z ranges) 19.4-20.1 it/s. Older fitter copy: 13.71 against 13.56 it/s (freeze / off, idle card) | two runs per arm for freeze and off, one for the others; one window |
+| 2 | the freeze policy makes the per-step collection cheap | branch fitter, object-store inputs: 0.06-0.18 ms per collection after the freeze against 22-30 s for a full collection of the 50.8 M-object heap; 16.6-17.2 it/s against 0.035-0.037 it/s with a collection every step and 0.36 it/s every 10 steps; `off` (no explicit collection, runs out of memory on long z ranges) 19.4-20.1 it/s. Older fitter copy: 13.71 against 13.56 it/s (freeze / off, idle card) | two runs per arm for freeze, off and every-step, one for the others; one window |
 | 3 | `FIT_SPIRAL_POOL_OFFLOAD=1` (opt-in) returns exactly what the resident pool returns | 4,101,001 random and edge lookups on the real pool of the smoke fit: 0 differences; `tests/test_pool_offload.py` 4 passed | strong, on this branch's code |
 | 4 | the offload takes the pool off the card | card median 20,582 against 9,522 MiB (whole-height, 32-voxel, one scroll); whole-height fits of the two largest scrolls ran on one V100-32 | one run per arm, older fitter copy |
 | 5 | the offload costs about 1 % per iteration | 0.754 against 0.747 it/s (one scroll) | one scroll, older fitter copy |

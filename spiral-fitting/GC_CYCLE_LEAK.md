@@ -29,7 +29,7 @@ a full collection costs 22-30 s (against about 0.3 s on the older fitter above),
 | policy | s/it (it/s) | runs |
 |---|---|---|
 | `freeze` | 0.058 / 0.060 (17.2 / 16.6); the 1,001 collections after the freeze: 0.06-0.18 s in total | 2 |
-| `every-step` | 28.9 (0.035): 62 collections of about 28 s | 1 (capped at 62 steps) |
+| `every-step` | 28.9 / 27.2 (0.035 / 0.037): collections of 27-30 s | 2 (capped at 62 and 15 steps) |
 | every 10 steps (`every-step`, `FIT_SPIRAL_GC_EVERY_STEPS=10`) | 2.81 (0.36) | 1 (capped at 151 steps) |
 | `pressure` (0.2) | 0.058 (17.4) | 1 |
 | `off` | 0.050 / 0.052 (20.1 / 19.4) | 2 |
