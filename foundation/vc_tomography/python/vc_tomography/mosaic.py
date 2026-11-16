@@ -100,9 +100,6 @@ def tile_reconstructor(master, cal, label, device="cuda", params=None, row_origi
     import json
 
     from . import _core
-    try:
-        return _core.tile_reconstructor(str(master), cal if isinstance(cal, str) else json.dumps(cal, default=float), str(label), device,
-                                        json.dumps(params or {}, default=float), row_origin, weight, float(cache_gb), reduced, str(cache_dir or ""),
-                                        int(reduce), log, str(projections or ""))     # vc_tomography::tile_reconstructor
-    except RuntimeError as e:
-        raise ValueError(str(e)) from None
+    return _core.tile_reconstructor(str(master), cal if isinstance(cal, str) else json.dumps(cal, default=float), str(label), device,
+                                    json.dumps(params or {}, default=float), row_origin, weight, float(cache_gb), reduced, str(cache_dir or ""),
+                                    int(reduce), log, str(projections or ""))     # vc_tomography::tile_reconstructor

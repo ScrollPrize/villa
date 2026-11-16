@@ -284,7 +284,7 @@ def test_small_or_missing_residuals_do_not_certify_geometry(values):
 
 @pytest.mark.parametrize("target", [0, -0.01, float('nan'), float('inf')])
 def test_invalid_position_target(target):
-    with pytest.raises(RuntimeError, match='finite and positive'):
+    with pytest.raises(ValueError, match='finite and positive'):
         _core.calibration_assess_residuals([0.1], target)
 
 

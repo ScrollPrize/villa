@@ -614,7 +614,7 @@ void check_views(const Record& first, Frames& first_frames, const FlatField& fir
     }
     if (!opt.table.empty()) {
         std::FILE* out = std::fopen(opt.table.c_str(), "w");
-        if (!out) throw Error("cannot write " + opt.table);
+        if (!out) throw IoError("cannot write " + opt.table);
         std::fputs("comparison\tframe_a\tframe_b\tframes\trow_a\trows\trow_offset\tcol_a\tcol_b\tstated_dq\tdq\tstated_dv\tdv\tstated_D\tD\tdu\tcorrelation\tevaluations\tok\tcolumns\n", out);
         for (const std::string& line : table_lines()) std::fprintf(out, "%s\n", line.c_str());
         std::fclose(out);

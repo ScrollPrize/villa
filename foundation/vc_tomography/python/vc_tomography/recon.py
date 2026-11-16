@@ -54,22 +54,11 @@ def _json(v):
     return json.dumps(v, default=lambda o: o.tolist() if hasattr(o, "tolist") else float(o))
 
 
-def _raise(e):
-    """a C++ error as the exception Python callers expect of it"""
-    msg = str(e)
-    if msg.startswith(("unknown parameter", "no filter '", "bad filter reference")) or "removed with the calibration" in msg or "is not TYPE.param" in msg:
-        return KeyError(msg)
-    return ValueError(msg)
-
-
 def update_params(params, changes):
     """The parameters changed: the rules of mode legacy_reference (pinned parameters; leaving it starts again from
     the defaults), filter keys (TYPE.param) applied to the chain, unknown and removed keys refused.
     (vc_tomography::update_parameters)"""
-    try:
-        return json.loads(_core.update_parameters(_json(params), _json(changes)))
-    except RuntimeError as e:
-        raise _raise(e) from None
+    return json.loads(_core.update_parameters(_json(params), _json(changes)))
 
 
 def legacy_reference_config():
@@ -83,18 +72,12 @@ def legacy_reference_config():
 def backprojector_config(spec):
     """Backprojector spec (text or dict) -> reconstructor config keys (vc_tomography::backprojector_config): ghbp | fbp(interp=,
     oversample=, filter_name=, filter_par=) | sirt(...) | mlem(...) | gridrec(...) | python(fn=NAME, ...)"""
-    try:
-        return json.loads(_core.backprojector_config(_json(spec) if isinstance(spec, dict) else str(spec)))
-    except RuntimeError as e:
-        raise ValueError(str(e)) from None
+    return json.loads(_core.backprojector_config(_json(spec) if isinstance(spec, dict) else str(spec)))
 
 
 def angle_subset_config(spec):
     """params["angle_subset"] ("" or "I/N") -> (subset, subsets)"""
-    try:
-        return tuple(_core.angle_subset_config(str(spec or "")))
-    except RuntimeError as e:
-        raise ValueError(str(e)) from None
+    return tuple(_core.angle_subset_config(str(spec or "")))
 
 
 @dataclass
@@ -114,11 +97,8 @@ class HelicalRecon:
 
     def __init__(self, projections_dir, cache_dir=None, device="cuda", params=None, log=print, projection_store=None, reduce=0):
         self.projections_dir, self.cache_dir, self.device, self.log = projections_dir, cache_dir, device, log
-        try:
-            self._r = _core.Reconstruction(str(projections_dir), _json(dict(params or {})), str(cache_dir or ""), device, log, log is print,
-                                           str(projection_store or ""), int(reduce))
-        except RuntimeError as e:
-            raise _raise(e) from None
+        self._r = _core.Reconstruction(str(projections_dir), _json(dict(params or {})), str(cache_dir or ""), device, log, log is print,
+                                       str(projection_store or ""), int(reduce))
         self.scans = [self._r.scan(k) for k in range(self._r.scan_count)]
         self.main, self.companion = self.scans[0], (self.scans[1] if len(self.scans) > 1 else None)
         self._built()
@@ -159,10 +139,7 @@ class HelicalRecon:
 
     def sharpness_weighting(self) -> str:
         """params["sharpness_weighting"] resolved to "a11:a12:a21:a22:c1:c2" or "" (off); "auto" = the calibration's"""
-        try:
-            return self._r.sharpness_weighting()
-        except RuntimeError as e:
-            raise ValueError(str(e)) from None
+        return self._r.sharpness_weighting()
 
     def _update(self, kw):
         """self.params changed by kw (update_params)"""
@@ -183,10 +160,7 @@ class HelicalRecon:
         """Change reconstruction parameters (rebuilds the reconstructor; calibration is kept). Filter chain:
         filters=[...] or dotted keys, e.g. set_params(**{"paganin.delta_beta": 500}). mode="legacy_reference" pins
         every other parameter (see the module docstring)."""
-        try:
-            self._r.set_parameters(_json(kw))
-        except RuntimeError as e:
-            raise _raise(e) from None
+        self._r.set_parameters(_json(kw))
         self._built()
 
     def chains(self, sweep):
@@ -198,10 +172,7 @@ class HelicalRecon:
 
     # ------------------------------------------------------------------ slice addressing
     def slice_info(self, fraction: float) -> SliceInfo:
-        try:
-            return SliceInfo(*self._r.slice_info(float(fraction)))
-        except RuntimeError as e:
-            raise ValueError(str(e)) from None
+        return SliceInfo(*self._r.slice_info(float(fraction)))
 
     def reconstruct_heights(self, h_lo: int, h_hi: int, debug=False, timing=False, roi=None, next=None, uint8=None,
                             float32=True, progress=None, mask=None, region=None, float32_to=None, uint8_to=None, z_to=0):

@@ -50,7 +50,7 @@ std::string join(const std::string& dir, const std::string& name) { return dir.e
 void make_dirs(const std::string& dir) {
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
-    if (ec) throw Error("cannot make the directory " + dir + ": " + ec.message());
+    if (ec) throw IoError("cannot make the directory " + dir + ": " + ec.message());
 }
 
 // "<absolute path>|<size>|<time of change in ns>" of a file

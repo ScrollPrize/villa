@@ -36,5 +36,5 @@ def test_fourier_filter_matches_numpy(device, mode, ndim):
 
 
 def test_bad_filter_size():
-    with pytest.raises(RuntimeError, match="filter has"):
+    with pytest.raises(ValueError, match="filter has"):
         vc_tomography.FourierFilter(2, 4, 4, 8, 8, 0, 0, "edge", np.ones(3, np.float32))

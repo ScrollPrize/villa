@@ -81,7 +81,7 @@ inline void write_array_file(const std::string& path, Json header, const std::ve
 // values: false reads the first line alone (the arrays come back without values)
 inline ArrayFile read_array_file(const std::string& path, bool values = true) {
     std::ifstream in(path, std::ios::binary);
-    if (!in) throw Error("cannot read " + path);
+    if (!in) throw IoError("cannot read " + path);
     std::string line;
     if (!std::getline(in, line)) throw Error(path + ": no header");
     ArrayFile out;

@@ -28,10 +28,7 @@ def sld_config(spec):
     if spec is None or spec == "" or spec == {}:
         return {}
     text = json.dumps(spec, default=lambda o: os.fspath(o) if isinstance(o, os.PathLike) else float(o)) if isinstance(spec, dict) else os.fspath(spec) if isinstance(spec, os.PathLike) else str(spec)
-    try:
-        return json.loads(_core.sld_config(text))
-    except RuntimeError as e:
-        raise ValueError(str(e)) from None
+    return json.loads(_core.sld_config(text))
 
 
 def correct(frames, spec):

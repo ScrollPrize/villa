@@ -121,7 +121,7 @@ def test_a_record_shorter_than_its_frame_file_and_flats_at_both_ends(tmp_path):
 
 def test_the_pixel_size_must_be_given(tmp_path):
     master, *_ = _write(tmp_path, 146079, "sample_r1c1", supplement=None)
-    with pytest.raises(RuntimeError, match="states no pixel size.*vc_tomography_acquisition.json"):
+    with pytest.raises(ValueError, match="states no pixel size.*vc_tomography_acquisition.json"):
         bliss.open_scan(str(master))
     assert bliss.discover_scans(str(tmp_path)) == []                               # left out, as any master that cannot be read
     (tmp_path / "vc_tomography_acquisition.json").write_text('{"pixel_size_um": 3.24, "source_sample_distance_m": 51, "propagation_distance_m": 0.5}')
@@ -203,7 +203,7 @@ def test_the_intensity_calibration_of_a_grid(tmp_path):
 def test_the_record_of_a_calibration_session(tmp_path):
     master, angle, frames, proj = _write(tmp_path, 146083, "PHerc.172_grid_01_53keV_r2c2", in_beam=-26.0, snapshot_x=-99.285, height=38.5, short_record=True)
     (tmp_path / "vc_tomography_acquisition.json").write_text('{"pixel_size_um": 7.91, "source_sample_distance_m": 51, "fan_sense": 2}')
-    with pytest.raises(RuntimeError, match="'fan_sense' is 1 or -1"):
+    with pytest.raises(ValueError, match="'fan_sense' is 1 or -1"):
         _core.CalibrationSession([str(master)], 2)
     (tmp_path / "vc_tomography_acquisition.json").write_text('{"pixel_size_um": 7.91, "source_sample_distance_m": 51, "fan_sense": -1}')
     sess = _core.CalibrationSession([str(master)], 2)

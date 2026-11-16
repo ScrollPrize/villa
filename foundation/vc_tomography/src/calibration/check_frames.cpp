@@ -236,7 +236,7 @@ Inventory check_inventory(const Record& rec, Frames& frames, Report& rep, int st
 void save_inventory(const Inventory& inv, const Record& rec, const std::string& path) {
     std::ofstream bin(path + ".bin", std::ios::binary);
     std::ofstream idx(path + ".json");
-    if (!bin || !idx) throw Error("cannot write " + path);
+    if (!bin || !idx) throw IoError("cannot write " + path);
     idx << "{\"strip_cols\": " << inv.strip_cols << ", \"layout\": \"per stretch: sum f64[n], min f64[n], max f64[n], frame_max u16[n], strips f32[n, n_strips], histogram i64[65536]\", \"stretches\": [";
     for (std::size_t i = 0; i < inv.stretches.size(); ++i) {
         const auto& s = inv.stretches[i];
@@ -255,7 +255,7 @@ void save_inventory(const Inventory& inv, const Record& rec, const std::string& 
 
 Inventory load_inventory(const Record& rec, int cols, const std::string& path) {
     std::ifstream bin(path + ".bin", std::ios::binary);
-    if (!bin) throw Error("cannot read " + path + ".bin");
+    if (!bin) throw IoError("cannot read " + path + ".bin");
     Inventory inv;
     const int ns = n_strips(inv, cols);
     inv.stretches.resize(rec.stretches.size());

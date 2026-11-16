@@ -86,7 +86,7 @@ def test_the_luminosity_step_joins_the_scans_of_each_row(tmp_path, device):
         np.testing.assert_allclose(whole[h + 6], on.reconstruct(h, h + 1)[0], atol=1e-5, err_msg=str(h))
     # the scans of a row must follow each other
     g = grid(tmp_path)
-    with pytest.raises(RuntimeError, match="must follow each other"):
+    with pytest.raises(ValueError, match="must follow each other"):
         recon([g[0], g[2], g[1], g[3]], device, **dict(kw, luminosity_repartition=100.))
 
 

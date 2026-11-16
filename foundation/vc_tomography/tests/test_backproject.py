@@ -59,7 +59,7 @@ def test_only_the_listed_tiles_are_computed(device):
             keep[(t // ntx) * T:(t // ntx + 1) * T, (t % ntx) * T:(t % ntx + 1) * T] = True
         np.testing.assert_array_equal(vc_tomography.backproject(sino, angles, tiles=tiles, **kw), np.where(keep, full, 0))
     for bad in ([ntx * nty], [1, 1]):
-        with pytest.raises(RuntimeError, match="tiles"):
+        with pytest.raises(ValueError, match="tiles"):
             vc_tomography.backproject(sino, angles, tiles=bad, **kw)
 
 
@@ -138,5 +138,5 @@ def test_cpu_cuda_agree_with_a_fan():
         a = vc_tomography.backproject(sino, angles, device="cpu", **kw)
         b = vc_tomography.backproject(sino, angles, device="cuda", **kw)
         np.testing.assert_allclose(a, b, rtol=1e-4, atol=2e-3 * np.abs(a).max())
-    with pytest.raises(RuntimeError, match="fan"):
+    with pytest.raises(ValueError, match="fan"):
         vc_tomography.backproject(sino, angles, ny=8, nx=8, rot_center=150.0, fan=[])

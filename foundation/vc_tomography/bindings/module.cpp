@@ -1048,8 +1048,14 @@ NB_MODULE(_core, m) {
     nb::register_exception_translator([](const std::exception_ptr& p, void*) {
         try {
             std::rethrow_exception(p);
-        } catch (const vc_tomography::Error& e) {
+        } catch (const vc_tomography::KeyError& e) {
+            PyErr_SetString(PyExc_KeyError, e.what());
+        } catch (const vc_tomography::Unsupported& e) {
+            PyErr_SetString(PyExc_NotImplementedError, e.what());
+        } catch (const vc_tomography::IoError& e) {
             PyErr_SetString(PyExc_RuntimeError, e.what());
+        } catch (const vc_tomography::Error& e) {   // (common.hpp states the mapping)
+            PyErr_SetString(PyExc_ValueError, e.what());
         }
     });
 

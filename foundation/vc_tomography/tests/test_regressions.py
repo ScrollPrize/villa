@@ -119,7 +119,7 @@ def test_calibration_parameters():
     for gone in ("z_translation_scale", "companion_registration", "stationary_registration", "axis_refinement", "rolling_shutter"):
         with pytest.raises(KeyError, match="geometry calibration"):
             bare_recon()._update({gone: "auto"})
-    with pytest.raises(RuntimeError, match="geometry"):      # neither given nor a cache directory to make it in
+    with pytest.raises(ValueError, match="geometry"):      # neither given nor a cache directory to make it in
         _core.geometry_calibration_file("", "", ["/data/HA/HA.h5", "/data/TA/TA.h5"])
 
 

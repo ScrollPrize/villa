@@ -155,7 +155,7 @@ def test_missing_detector_file(tmp_path):
     master = _write_scan(tmp_path, "sample_HA")
     (master.parent / "scan0004" / "det3_0001.h5").unlink()
     s = bliss.open_scan(str(master))           # a partial copy opens ...
-    with pytest.raises(RuntimeError, match="1 detector files missing"):
+    with pytest.raises(ValueError, match="1 detector files missing"):
         s.check_files()                        # ... and says what is missing
     assert bliss.discover_scans(str(tmp_path), require_files=True) == []
 
@@ -169,7 +169,7 @@ def test_discover_and_pair(tmp_path):
     pair = bliss.pair_companions(scans)
     assert pair["main"].name == "sample_HA_0001" and pair["companion"].name == "sample_TA_0001"
     assert [s.name for s in pair["companions"]] == ["sample_TA_0001"]
-    with pytest.raises(RuntimeError, match="expected one HA/TA family"):
+    with pytest.raises(ValueError, match="expected one HA/TA family"):
         bliss.pair_companions(scans[:1])
 
 

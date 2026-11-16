@@ -49,7 +49,7 @@ inline void quiet() {
 inline Id open_file(const std::string& path) {
     quiet();
     Id f(H5Fopen(path.c_str(), H5F_ACC_RDONLY, H5P_DEFAULT), H5Fclose);
-    if (!f) throw Error("cannot open HDF5 file " + path);
+    if (!f) throw IoError("cannot open HDF5 file " + path);
     return f;
 }
 
@@ -133,13 +133,13 @@ inline std::vector<double> read_doubles(hid_t loc, const std::string& path) {
     const H5T_class_t cls = H5Tget_class(t.id);
     if (cls == H5T_INTEGER || cls == H5T_FLOAT) {
         if (H5Dread(d.id, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, out.data()) < 0)
-            throw Error("cannot read " + path);
+            throw IoError("cannot read " + path);
     } else if (cls == H5T_ENUM) {
         // h5py stores bool as an enum over a one-byte integer: read the stored integers
         Id native(H5Tget_native_type(t.id, H5T_DIR_ASCEND), H5Tclose);
         const std::size_t size = H5Tget_size(native.id);
         std::vector<unsigned char> raw(out.size() * size);
-        if (H5Dread(d.id, native.id, H5S_ALL, H5S_ALL, H5P_DEFAULT, raw.data()) < 0) throw Error("cannot read " + path);
+        if (H5Dread(d.id, native.id, H5S_ALL, H5S_ALL, H5P_DEFAULT, raw.data()) < 0) throw IoError("cannot read " + path);
         for (std::size_t i = 0; i < out.size(); ++i) {
             const unsigned char* p = raw.data() + i * size;
             std::int64_t v = 0;
@@ -166,7 +166,7 @@ inline std::vector<std::int32_t> read_int32(hid_t loc, const std::string& path) 
     const hssize_t n = H5Sget_simple_extent_npoints(s.id);
     std::vector<std::int32_t> out(n > 0 ? static_cast<std::size_t>(n) : 0);
     if (!out.empty() && H5Dread(d.id, H5T_NATIVE_INT32, H5S_ALL, H5S_ALL, H5P_DEFAULT, out.data()) < 0)
-        throw Error("cannot read " + path);
+        throw IoError("cannot read " + path);
     return out;
 }
 
@@ -185,14 +185,14 @@ inline std::vector<std::string> read_strings(hid_t loc, const std::string& path)
         H5Tset_size(mem.id, H5T_VARIABLE);
         H5Tset_cset(mem.id, H5Tget_cset(t.id));
         std::vector<char*> ptr(out.size(), nullptr);
-        if (H5Dread(d.id, mem.id, H5S_ALL, H5S_ALL, H5P_DEFAULT, ptr.data()) < 0) throw Error("cannot read " + path);
+        if (H5Dread(d.id, mem.id, H5S_ALL, H5S_ALL, H5P_DEFAULT, ptr.data()) < 0) throw IoError("cannot read " + path);
         for (std::size_t i = 0; i < out.size(); ++i)
             if (ptr[i]) out[i] = ptr[i];
         H5Treclaim(mem.id, s.id, H5P_DEFAULT, ptr.data());
     } else {
         const std::size_t size = H5Tget_size(t.id);
         std::vector<char> raw(out.size() * size);
-        if (H5Dread(d.id, t.id, H5S_ALL, H5S_ALL, H5P_DEFAULT, raw.data()) < 0) throw Error("cannot read " + path);
+        if (H5Dread(d.id, t.id, H5S_ALL, H5S_ALL, H5P_DEFAULT, raw.data()) < 0) throw IoError("cannot read " + path);
         for (std::size_t i = 0; i < out.size(); ++i) {
             const char* p = raw.data() + i * size;
             out[i].assign(p, strnlen(p, size));
@@ -271,7 +271,7 @@ struct FrameDataset {
 
 inline std::string virtual_name(hid_t dcpl, std::size_t i, ssize_t (*get)(hid_t, size_t, char*, size_t)) {
     const ssize_t len = get(dcpl, i, nullptr, 0);
-    if (len < 0) throw Error("cannot read a virtual dataset mapping");
+    if (len < 0) throw IoError("cannot read a virtual dataset mapping");
     std::string s(static_cast<std::size_t>(len) + 1, '\0');
     get(dcpl, i, s.data(), s.size());
     s.resize(static_cast<std::size_t>(len));

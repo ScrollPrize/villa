@@ -42,7 +42,7 @@ def test_to_uint8_with_a_coarser_mask(device):
         got = _core.to_uint8(img, 0.0, 1.0, (64, 5, 9), device, OutputMask(mask, scale, offset))      # with the disk
         np.testing.assert_array_equal(got, np.where(coarse_lookup(mask, img.shape, scale, offset),
                                                     numpy_uint8(img, 0.0, 1.0, (64, 5, 9)), 0))
-    with pytest.raises(RuntimeError, match="scale < 1"):
+    with pytest.raises(ValueError, match="scale < 1"):
         OutputMask(mask, (0, 1, 1))
 
 
@@ -66,11 +66,11 @@ def test_reference_mask_reads_any_pyramid_level(tmp_path):
             mask = ref.read(z0, z1, roi, slot=scale)
             got = to_uint8(ones[z0:z1, roi[2]:roi[3], roi[0]:roi[1]], 0.0, 1.0, mask=mask)
             np.testing.assert_array_equal(got != 0, want[z0:z1, roi[2]:roi[3], roi[0]:roi[1]])
-    with pytest.raises(RuntimeError, match="same grid"):
+    with pytest.raises(ValueError, match="same grid"):
         ReferenceMask(str(tmp_path / "ref.zarr"), 0, (21, 34, 28))
-    with pytest.raises(RuntimeError, match="same grid"):
+    with pytest.raises(ValueError, match="same grid"):
         ReferenceMask(str(tmp_path / "ref.zarr"), 0, (23, 34, 27))    # 10 % more slices: not the same scan
-    with pytest.raises(RuntimeError, match="no pyramid level 5"):
+    with pytest.raises(ValueError, match="no pyramid level 5"):
         ReferenceMask(str(tmp_path / "ref.zarr"), 5, vol.shape)
 
 
@@ -117,9 +117,9 @@ def test_to_uint8_matches_numpy(device):
     for disk in [None, (64, 5, 9)]:
         np.testing.assert_array_equal(_core.to_uint8(img, -0.06, 0.29, disk, device, mask),
                                       np.where(mask, numpy_uint8(img, -0.06, 0.29, disk), 0))
-    with pytest.raises(RuntimeError, match="hi > lo"):
+    with pytest.raises(ValueError, match="hi > lo"):
         _core.to_uint8(img, 1.0, 1.0, device=device)
-    with pytest.raises(RuntimeError, match="shape of img"):
+    with pytest.raises(ValueError, match="shape of img"):
         _core.to_uint8(img, 0.0, 1.0, device=device, mask=np.ascontiguousarray(mask[:2]))
 
 
@@ -144,16 +144,16 @@ def test_reconstruct_uint8_is_the_window_of_the_float_slices(tmp_path, device, b
     mask = (np.random.default_rng(1).random(u.shape) > 0.5).astype(np.uint8)
     np.testing.assert_array_equal(r.reconstruct(h0, h1, roi=roi, uint8=(*window, True), float32=False, mask=mask),
                                   np.where(mask, u, 0))
-    with pytest.raises(RuntimeError, match="no output"):
+    with pytest.raises(ValueError, match="no output"):
         r.reconstruct(h0, h1, float32=False)
     coarse = (np.random.default_rng(2).random((2, 5, 4)) > 0.4).astype(np.uint8)
     scale, offset = (2, 4, 5), (1, 2, 3)
     np.testing.assert_array_equal(r.reconstruct(h0, h1, roi=roi, uint8=(*window, True), float32=False,
                                                 mask=OutputMask(coarse, scale, offset)),
                                   np.where(coarse_lookup(coarse, u.shape, scale, offset), u, 0))
-    with pytest.raises(RuntimeError, match="shape of the output"):
+    with pytest.raises(ValueError, match="shape of the output"):
         r.reconstruct(h0, h1, roi=roi, uint8=(*window, True), mask=mask[:1])
-    with pytest.raises(RuntimeError, match="uint8 output"):
+    with pytest.raises(ValueError, match="uint8 output"):
         r.reconstruct(h0, h1, roi=roi, mask=mask)
 
 
@@ -200,7 +200,7 @@ def test_reconstruct_only_the_pixels_needed(tmp_path, device, backprojector):
                 f, u = r.reconstruct(h0, h1, roi=roi, uint8=(*window, True), mask=OutputMask(coarse, scale, offset))
                 np.testing.assert_array_equal(u, want)
                 np.testing.assert_array_equal(f, whole[crop])                       # float slices are whole
-    with pytest.raises(RuntimeError, match="empty"):
+    with pytest.raises(ValueError, match="empty"):
         r.reconstruct(h0, h1, region=(3, 3, 0, 4))
 
 
@@ -243,11 +243,11 @@ def test_reconstruct_into_a_writer(tmp_path, device):
         np.testing.assert_array_equal(wu.read(0, 0, n + 3), pad(u))
         np.testing.assert_array_equal(only.read(0, 0, n), u)
         assert wu.read(1, 0, wu.level_shapes[1][0]).any()
-    with pytest.raises(RuntimeError, match="dtype"):
+    with pytest.raises(ValueError, match="dtype"):
         r.reconstruct(h0, h1, float32_to=only)
-    with pytest.raises(RuntimeError, match="does not hold"):
+    with pytest.raises(ValueError, match="does not hold"):
         r.reconstruct(h0, h1, uint8=(*window, True), float32=False, uint8_to=only, z_to=1)
-    with pytest.raises(RuntimeError, match="written twice"):
+    with pytest.raises(ValueError, match="written twice"):
         again = OmeZarrWriter(str(tmp_path / "again.zarr"), whole.shape, np.float32, chunks=(8, 16, 32))
         r.reconstruct(h0, h1, float32_to=again)
         r.reconstruct(h0, h1, float32_to=again)

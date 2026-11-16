@@ -161,7 +161,7 @@ std::string chain_text(const Json& chain) {
 Json& locate(Json& chain, const std::string& ref) {
     static const std::regex re(R"(([\w-]+)(?:\[(\d+)\])?)");
     std::smatch m;
-    if (!std::regex_match(ref, m, re)) throw Error("bad filter reference '" + ref + "'");
+    if (!std::regex_match(ref, m, re)) throw KeyError("bad filter reference '" + ref + "'");
     const std::string type = m[1].str();
     const int k = m[2].matched ? std::stoi(m[2].str()) : 0;
     int seen = 0;
@@ -169,7 +169,7 @@ Json& locate(Json& chain, const std::string& ref) {
         const Json* t = member(f, "type");
         if (t && t->is(Json::String) && t->string == type && seen++ == k) return f;
     }
-    throw Error("no filter '" + ref + "' in chain " + chain_text(chain));
+    throw KeyError("no filter '" + ref + "' in chain " + chain_text(chain));
 }
 
 Json override_chain(Json chain, const std::vector<std::pair<std::string, Json>>& changes) {
@@ -179,7 +179,7 @@ Json override_chain(Json chain, const std::vector<std::pair<std::string, Json>>&
             continue;
         }
         const std::size_t dot = key.rfind('.');
-        if (dot == std::string::npos || dot == 0) throw Error("'" + key + "' is not TYPE.param");
+        if (dot == std::string::npos || dot == 0) throw KeyError("'" + key + "' is not TYPE.param");
         locate(chain, key.substr(0, dot)).put(key.substr(dot + 1), v);
     }
     return chain;
@@ -359,7 +359,7 @@ std::string parse_settings(const std::vector<std::string>& items) {
         if (!d) {
             std::string known;
             for (const auto& kv : defaults.object) known += (known.empty() ? "" : ", ") + kv.first;
-            throw Error("unknown parameter '" + k + "'; known: " + known);
+            throw KeyError("unknown parameter '" + k + "'; known: " + known);
         }
         double x = 0;
         if (d->is(Json::Bool)) {
@@ -391,7 +391,7 @@ std::string update_parameters(const std::string& params_text, const std::string&
         std::sort(gone.begin(), gone.end());
         std::string list;
         for (const auto& g : gone) list += (list.empty() ? "" : ", ") + g;
-        throw Error("[" + list + "]: removed with the calibration they belonged to; the geometry calibration (the parameter geometry, vc_tomography_calibration "
+        throw KeyError("[" + list + "]: removed with the calibration they belonged to; the geometry calibration (the parameter geometry, vc_tomography_calibration "
                     "geometry) holds what they stood for");
     }
     const Json defaults = defaults_json(), legacy = legacy_json();
@@ -412,7 +412,7 @@ std::string update_parameters(const std::string& params_text, const std::string&
         std::string list, known;
         for (const auto& u : unknown) list += (list.empty() ? "" : ", ") + u;
         for (const auto& kv : defaults.object) known += (known.empty() ? "" : ", ") + kv.first;
-        throw Error("unknown parameters [" + list + "]; known: " + known + " and TYPE.param filter keys");
+        throw KeyError("unknown parameters [" + list + "]; known: " + known + " and TYPE.param filter keys");
     }
     const Json* mode_given = member(regular, "mode");
     const Json* mode_now = member(params, "mode");

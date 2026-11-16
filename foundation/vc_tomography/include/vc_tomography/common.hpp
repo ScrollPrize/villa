@@ -28,8 +28,20 @@ Device parse_device(const std::string& name, bool allow_auto = false);
 // (page-locking costs ~0.2 s/GB); this frees the ones not in use. No-op without CUDA.
 void release_pinned_memory();
 
+// What vc_tomography throws. In Python (the bindings translate them): Error a ValueError (a value, a parameter or
+// data that cannot be used), KeyError a KeyError (an unknown or removed name), Unsupported a NotImplementedError
+// (a case the code does not handle), IoError a RuntimeError (a file that cannot be read or written).
 struct Error : std::runtime_error {
     using std::runtime_error::runtime_error;
+};
+struct KeyError : Error {
+    using Error::Error;
+};
+struct Unsupported : Error {
+    using Error::Error;
+};
+struct IoError : Error {
+    using Error::Error;
 };
 
 }  // namespace vc_tomography

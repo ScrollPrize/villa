@@ -36,10 +36,6 @@ def register(name, fn):
     _python_filters[name] = fn
 
 
-def _err(e, kind=ValueError):
-    return kind(str(e))
-
-
 def _value(v):
     """a value as --set reads it: a whole number, a real, or the text (vc_tomography::parse_value)"""
     return json.loads(_core.parse_value(str(v)))
@@ -50,10 +46,7 @@ def parse_chain(text):
     (vc_tomography::parse_filter_chain)"""
     if isinstance(text, list):
         return copy.deepcopy(text)
-    try:
-        return json.loads(_core.parse_filter_chain(str(text)))
-    except RuntimeError as e:
-        raise _err(e) from None
+    return json.loads(_core.parse_filter_chain(str(text)))
 
 
 def chain_text(chain):
@@ -62,10 +55,7 @@ def chain_text(chain):
 
 def override(chain, changes):
     """New chain with {"TYPE[.k].param": value} changes ("filters": a whole chain). (vc_tomography::override_filter_chain)"""
-    try:
-        return json.loads(_core.override_filter_chain(json.dumps(chain), json.dumps(changes)))
-    except RuntimeError as e:
-        raise _err(e, KeyError) from None
+    return json.loads(_core.override_filter_chain(json.dumps(chain), json.dumps(changes)))
 
 
 def is_filter_key(key):

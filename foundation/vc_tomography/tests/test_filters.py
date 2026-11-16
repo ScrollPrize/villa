@@ -79,7 +79,7 @@ def test_butterworth_low_pass_of_the_projection():
         np.testing.assert_allclose(out[28:-28, 28:-28], (1.0 + expect * (wave[0] - 1.0))[28:-28, 28:-28], atol=2e-3, err_msg=str((f0, f1)))
     described = vc_tomography.filter_describe([{"type": "paganin", "delta_beta": 120}, {"type": "unsharp", "sigma": 1.2, "coeff": 4}] + chain, **PH)
     assert described.startswith("fft[paganin*unsharp*butterworth]@intensity"), described
-    with pytest.raises(RuntimeError, match="cutoff"):
+    with pytest.raises(ValueError, match="cutoff"):
         vc_tomography.apply_filters(np.ones((1, 8, 8), np.float32), [{"type": "butterworth", "cutoff": 0}], 0)
 
 

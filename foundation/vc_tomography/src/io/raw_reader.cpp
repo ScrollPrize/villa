@@ -191,7 +191,7 @@ const RawReader::FileInfo& RawReader::info(int file) {
         return *infos_[file];
     }
     H5Handle f(H5Fopen(path.c_str(), H5F_ACC_RDONLY, H5P_DEFAULT), H5Fclose);
-    if (f.id < 0) throw Error("RawReader: cannot open " + path);
+    if (f.id < 0) throw IoError("RawReader: cannot open " + path);
     H5Handle d(H5Dopen2(f.id, dataset_.c_str(), H5P_DEFAULT), H5Dclose);
     if (d.id < 0) throw Error("RawReader: no dataset " + dataset_ + " in " + path);
     H5Handle type(H5Dget_type(d.id), H5Tclose);
@@ -323,7 +323,7 @@ struct OpenFile {
         fd = ::open(path.c_str(), O_RDONLY);
         if (fd < 0) {
             file = -1;
-            throw Error("RawReader: cannot open " + path);
+            throw IoError("RawReader: cannot open " + path);
         }
         return fd;
     }
@@ -573,7 +573,7 @@ void RawReader::read_rows_impl(const int32_t* file_index, const int32_t* frame_i
         if (infos_[f]->chunk_rows) continue;  // done above
         try {
             const int fd = ::open(path.c_str(), O_RDONLY);
-            if (fd < 0) throw Error("RawReader: cannot open " + path);
+            if (fd < 0) throw IoError("RawReader: cannot open " + path);
             const FileInfo& fi = *infos_[f];
             try {
                 for (std::size_t i : *groups[g].second) {
@@ -662,7 +662,7 @@ void RawReader::visit_frames(const int32_t* file_index, const int32_t* frame_ind
             if (infos_[f]->chunk_rows) continue;  // done above
             try {
                 const int fd = ::open(path.c_str(), O_RDONLY);
-                if (fd < 0) throw Error("RawReader: cannot open " + path);
+                if (fd < 0) throw IoError("RawReader: cannot open " + path);
                 const FileInfo& fi = *infos_[f];
                 try {
                     for (std::size_t i : *groups[g].second) {

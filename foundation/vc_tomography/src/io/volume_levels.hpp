@@ -31,7 +31,7 @@ auto open_volume(const std::string& cache_dir, Open&& open) {
         try {
             return open(volume_open_options(cache_dir, true));
         } catch (const std::exception&) {
-            throw Error(online.what());
+            throw IoError(online.what());
         }
     }
 }

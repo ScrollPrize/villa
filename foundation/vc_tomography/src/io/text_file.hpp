@@ -27,17 +27,17 @@ inline bool is_dir(const std::string& path) {
 
 inline std::string read_text(const std::string& path) {
     std::ifstream in(path, std::ios::binary);
-    if (!in) throw Error("cannot read " + path);
+    if (!in) throw IoError("cannot read " + path);
     return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
 }
 
 // text, then a newline unless `newline` is false
 inline void write_text(const std::string& path, const std::string& text, bool newline = true) {
     std::ofstream o(path, std::ios::binary);
-    if (!o) throw Error("cannot write " + path);
+    if (!o) throw IoError("cannot write " + path);
     o << text;
     if (newline) o << "\n";
-    if (!o) throw Error("cannot write " + path);
+    if (!o) throw IoError("cannot write " + path);
 }
 
 // write(std::ofstream&) fills a temporary beside `path` (opened binary), which then replaces `path`: a reader sees the
@@ -47,17 +47,17 @@ void write_atomic(const std::string& path, Write&& write) {
     const std::string tmp = path + ".tmp" + std::to_string(static_cast<long>(::getpid()));
     {
         std::ofstream o(tmp, std::ios::binary);
-        if (!o) throw Error("cannot write " + tmp);
+        if (!o) throw IoError("cannot write " + tmp);
         write(o);
         if (!o) {
             o.close();
             std::remove(tmp.c_str());
-            throw Error("cannot write " + tmp);
+            throw IoError("cannot write " + tmp);
         }
     }
     if (std::rename(tmp.c_str(), path.c_str()) != 0) {
         std::remove(tmp.c_str());
-        throw Error("cannot write " + path);
+        throw IoError("cannot write " + path);
     }
 }
 

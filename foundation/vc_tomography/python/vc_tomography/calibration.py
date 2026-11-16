@@ -69,10 +69,7 @@ def apodisation_widths(n_cols, est_cor_main_offset, companion_dx, transition_wid
     companion_dx below nothing: the companion on the left, the axis in the main scan's right half (the reference's);
     above: on the right, the axis in its left half, the same widths mirrored.
     (vc_tomography::calibration::apodisation_widths)"""
-    try:
-        return _core.apodisation_widths(int(n_cols), float(est_cor_main_offset), float(companion_dx), float(transition_width_horizontal), float(transition_width_borders))
-    except RuntimeError as e:
-        raise NotImplementedError(str(e)) from None
+    return _core.apodisation_widths(int(n_cols), float(est_cor_main_offset), float(companion_dx), float(transition_width_horizontal), float(transition_width_borders))
 
 
 def placement_from_vectors(vectors, n_cols):

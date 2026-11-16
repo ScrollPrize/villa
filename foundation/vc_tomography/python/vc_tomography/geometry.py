@@ -127,10 +127,7 @@ def plan_comparisons(acquisition_, angles_per_turn=12, max_positions=48, n_rest=
     to be compared with itself a turn on (128; the step takes a patch and its margins in frames read reduced).
     (vc_tomography::calibration::geometry_calibration::plan for an Acquisition)"""
     from . import _core
-    try:
-        return json.loads(_core.geometry_plan(acquisition(acquisition_), int(angles_per_turn), int(max_positions), int(n_rest), int(n_turn), int(turn_least)))
-    except RuntimeError as e:
-        raise ValueError(str(e)) from None
+    return json.loads(_core.geometry_plan(acquisition(acquisition_), int(angles_per_turn), int(max_positions), int(n_rest), int(n_turn), int(turn_least)))
 
 
 def measure_comparisons(session, acquisition_, device="auto", patch=128, **counts):
@@ -158,10 +155,7 @@ def plan_tiles(acquisition_, places, pairs, positions=48, angles=24, bands=3, wi
     of columns each. A list of dicts as plan_comparisons gives, with the request's sway.
     (vc_tomography::calibration::geometry_calibration::plan_tiles)"""
     from . import _core
-    try:
-        return json.loads(_core.geometry_plan_tiles(acquisition(acquisition_), _parameters_text(places), [[int(j), int(k)] for j, k in pairs], int(positions), int(angles), int(bands), int(windows)))
-    except RuntimeError as e:
-        raise ValueError(str(e)) from None
+    return json.loads(_core.geometry_plan_tiles(acquisition(acquisition_), _parameters_text(places), [[int(j), int(k)] for j, k in pairs], int(positions), int(angles), int(bands), int(windows)))
 
 
 def measure_tiles(session, acquisition_, places, pairs, device="auto", patch=128, positions=48, angles=24, bands=3, windows=4):
@@ -301,13 +295,10 @@ def solve_geometry(acquisition_, comparisons, start=None, huber=0.03, max_iterat
     columns along the columns.
     (vc_tomography::calibration::geometry_calibration::solve_geometry)"""
     from . import _core
-    try:
-        text, residual, lens_residual = _core.geometry_solve(acquisition(acquisition_), [str(c["kind"]) for c in comparisons], _sightings([c["a"] for c in comparisons]),
-                                                             _sightings([c["b"] for c in comparisons]), [bool(c.get("opposite", False)) for c in comparisons], _lens(lens),
-                                                             _parameters_text(start), float(huber), int(max_iterations), list(held), list(freed), float(lens_huber),
-                                                             float(undetermined_map), bool(tilts_after), bool(radial_map))
-    except RuntimeError as e:
-        raise ValueError(str(e)) from None
+    text, residual, lens_residual = _core.geometry_solve(acquisition(acquisition_), [str(c["kind"]) for c in comparisons], _sightings([c["a"] for c in comparisons]),
+                                                         _sightings([c["b"] for c in comparisons]), [bool(c.get("opposite", False)) for c in comparisons], _lens(lens),
+                                                         _parameters_text(start), float(huber), int(max_iterations), list(held), list(freed), float(lens_huber),
+                                                         float(undetermined_map), bool(tilts_after), bool(radial_map))
     out = json.loads(text)
     out["residual"] = residual
     out["lens_residual"] = lens_residual
@@ -348,11 +339,8 @@ def scan_poses(cal, angles_deg, heights_rows):
     roll; the rows' timing in angle_deg_per_row and row_scale. What the solve left is under "not_applied".
     (vc_tomography::geometry::Calibration::scan_poses)"""
     from . import _core
-    try:
-        poses, not_applied = _core.GeometryCalibration(_text(cal)).scan_poses([np.asarray(a_, np.float64).tolist() for a_ in angles_deg],
-                                                                               [np.asarray(h_, np.float64).tolist() for h_ in heights_rows])
-    except RuntimeError as e:
-        raise ValueError(str(e)) from None
+    poses, not_applied = _core.GeometryCalibration(_text(cal)).scan_poses([np.asarray(a_, np.float64).tolist() for a_ in angles_deg],
+                                                                           [np.asarray(h_, np.float64).tolist() for h_ in heights_rows])
     return poses, json.loads(not_applied)
 
 
@@ -426,10 +414,7 @@ def calibrate_geometry(scans, row_time=None, device="auto", order=3, threads=8, 
     Returns a dict (see `save`): layout, row_time, map, parameters, solution (what is left per kind), report, comparisons.
     (vc_tomography::calibration::geometry_calibration::calibrate_geometry; the same as `vc_tomography_calibration geometry`)"""
     from . import _core
-    try:
-        text = _core.calibrate_geometry([str(x) for x in scans], None if row_time is None else float(row_time), device, int(order), int(threads), int(patch), log, int(reduce), str(projections), bool(rows_from_middle), bool(radial_map))
-    except RuntimeError as e:
-        raise ValueError(str(e)) from None
+    text = _core.calibrate_geometry([str(x) for x in scans], None if row_time is None else float(row_time), device, int(order), int(threads), int(patch), log, int(reduce), str(projections), bool(rows_from_middle), bool(radial_map))
     return json.loads(text)
 
 
