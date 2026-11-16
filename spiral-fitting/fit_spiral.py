@@ -10,6 +10,7 @@ os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
 
 import copy
 import gc
+import threading
 import json
 import math
 try:
@@ -164,6 +165,31 @@ if _GC_POLICY not in ('freeze', 'every-step', 'pressure', 'off'):
     raise SystemExit(f"FIT_SPIRAL_GC_POLICY must be freeze, every-step, pressure or off, got {_GC_POLICY!r}")
 _GC_EVERY_STEPS = int(os.environ.get('FIT_SPIRAL_GC_EVERY_STEPS', '1'))
 _GC_GARBAGE_FRACTION = float(os.environ.get('FIT_SPIRAL_GC_GARBAGE_FRACTION', '0.2'))
+
+# gc.freeze() is process-wide, and a resident service process runs many sessions one after another (and may run several at once). Each context that
+# freezes registers as an owner; the freeze ends, with one collection of what it hid, when the LAST owner lets go (a model rebuild, close(), or a failed
+# session): cyclic garbage frozen by a closed session would otherwise keep its model and optimiser tensors alive on the card.
+_GC_FREEZE_LOCK = threading.Lock()
+_GC_FREEZE_OWNERS = set()
+
+
+def _gc_freeze_acquire(owner):
+    with _GC_FREEZE_LOCK:
+        if not _GC_FREEZE_OWNERS:
+            gc.collect()
+            gc.freeze()
+        _GC_FREEZE_OWNERS.add(id(owner))
+
+
+def _gc_freeze_release(owner):
+    """Idempotent; safe when `owner` never froze."""
+    with _GC_FREEZE_LOCK:
+        if id(owner) not in _GC_FREEZE_OWNERS:
+            return
+        _GC_FREEZE_OWNERS.discard(id(owner))
+        if not _GC_FREEZE_OWNERS:
+            gc.unfreeze()
+            gc.collect()
 
 
 class InputReplacementRefused(RuntimeError):
@@ -2668,7 +2694,7 @@ class FitContext:
         # The optimiser state and the flow-field lattices are the session's
         # largest allocations; hand the arena back before asking for their
         # replacements rather than peaking at twice the model.
-        gc.unfreeze()
+        _gc_freeze_release(self)
         self._gc_frozen = False
         gc.collect()
         torch.cuda.empty_cache()
@@ -3976,8 +4002,7 @@ class FitContext:
         self.step_timer.stop('opt')
         if _GC_POLICY in ('freeze', 'every-step') and _GC_EVERY_STEPS > 0:
             if _GC_POLICY == 'freeze' and not getattr(self, '_gc_frozen', False):
-                gc.collect()
-                gc.freeze()
+                _gc_freeze_acquire(self)
                 self._gc_frozen = True
             if iteration % _GC_EVERY_STEPS == 0:
                 gc.collect()
@@ -4347,10 +4372,15 @@ class FitContext:
         this rank (the runtime calls it when its session ends; the CLI
         process simply exits).
         """
-        store, self._lasagna_store = self._lasagna_store, None
-        if store is not None:
-            store.close()
-        self.winding_inference = None
+        try:
+            store, self._lasagna_store = self._lasagna_store, None
+            if store is not None:
+                store.close()
+            self.winding_inference = None
+        finally:
+            # The freeze is process-wide: end this context's share of it even when releasing the store failed.
+            _gc_freeze_release(self)
+            self._gc_frozen = False
 
 
 def main(config, *, scroll, paths, progress=None, resume_path=None,

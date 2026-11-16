@@ -87,3 +87,32 @@ def test_factory_default_is_resident_and_env_selects_offload(monkeypatch):
     monkeypatch.setenv("FIT_SPIRAL_POOL_OFFLOAD", "1")
     cls = scc.resident_brick_pool_class()
     assert cls is not scc.ResidentBrickPool and issubclass(cls, scc.ResidentBrickPool)
+
+
+def _count_unregisters(monkeypatch):
+    calls = []
+    real = brick_pool_offload._unregister
+    monkeypatch.setattr(brick_pool_offload, "_unregister", lambda arr: (calls.append(arr.ctypes.data), real(arr))[1])
+    return calls
+
+
+def test_a_failed_construction_unregisters_the_host_memory(sidecar, monkeypatch):
+    """Review: a failure after cuMemHostRegister (kernel load, device allocation) must not leave the pool's pages registered."""
+    calls = _count_unregisters(monkeypatch)
+    monkeypatch.setattr(brick_pool_offload, "_module", lambda dev: (_ for _ in ()).throw(RuntimeError("kernel load failed")))
+    Off = brick_pool_offload.offload_class(scc)
+    with pytest.raises(RuntimeError, match="kernel load failed"):
+        Off(sidecar[0], device="cuda", label="failing")
+    assert len(calls) == 1, "the registered pool memory was not unregistered"
+
+
+def test_close_unregisters_once_and_an_abandoned_pool_is_unregistered_by_its_finalizer(sidecar, monkeypatch):
+    import gc
+    calls = _count_unregisters(monkeypatch)
+    Off = brick_pool_offload.offload_class(scc)
+    closed = Off(sidecar[0], device="cuda", label="closed")
+    closed.close(); closed.close()
+    assert len(calls) == 1
+    abandoned = Off(sidecar[0], device="cuda", label="abandoned")
+    del abandoned; gc.collect()
+    assert len(calls) == 2, "an abandoned pool kept its host memory registered"

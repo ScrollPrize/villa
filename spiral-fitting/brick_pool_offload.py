@@ -11,7 +11,7 @@ The pool load is the original one: the same sidecar memmaps and the same ROI bri
 Applies to every ResidentBrickPool the fit creates (normals, gradient magnitude, surface SDT). A pool built with device='cpu'
 (the unit tests) is left resident.
 FIT_SPIRAL_POOL_OFFLOAD_MIN_GIB (default 0): only pools at least this large are offloaded."""
-import ctypes, os, sys, time
+import ctypes, os, sys, time, weakref
 import numpy as np
 import torch
 
@@ -43,8 +43,22 @@ def _register(arr, dev_index):
     p = ctypes.c_void_p(arr.ctypes.data)
     _chk(cuda.cuMemHostRegister_v2(p, ctypes.c_size_t(arr.nbytes), ctypes.c_uint(0x02)), "cuMemHostRegister(DEVICEMAP)")
     dptr = ctypes.c_uint64()
-    _chk(cuda.cuMemHostGetDevicePointer_v2(ctypes.byref(dptr), p, ctypes.c_uint(0)), "cuMemHostGetDevicePointer")
+    try:
+        _chk(cuda.cuMemHostGetDevicePointer_v2(ctypes.byref(dptr), p, ctypes.c_uint(0)), "cuMemHostGetDevicePointer")
+    except BaseException:
+        _unregister(arr)                                                 # registered but unusable: do not leave the pages page-locked
+        raise
     return int(dptr.value)
+
+
+def _unregister(arr):
+    """Undo _register (idempotent enough: a second call is refused by the driver and ignored). Also the weakref finalizer of an offloaded pool: it holds `arr`
+    strongly, so the registered memory is only released after it was unregistered, whichever way the pool ends (close(), a failed construction, or garbage)."""
+    try:
+        from host_pool_cuda import _libs
+        _libs()[1].cuMemHostUnregister(ctypes.c_void_p(arr.ctypes.data))
+    except Exception:
+        pass
 
 
 def offload_class(scc):
@@ -91,21 +105,28 @@ def offload_class(scc):
                     ids = kept_ids[lo:lo + slab]; self.host_pool[channel, lo:lo + len(ids)] = mm[ids]; done += len(ids)
                     if progress_callback is not None: progress_callback(done, total, f"channel {channel + 1}/{self.channels} (host RAM)")
             di = dev.index if dev.index is not None else torch.cuda.current_device()
-            self._dptr = _register(self.host_pool, di); self._mod = _module(di); self._dev_index = di
-            self.pool = None                                             # nothing of the pool on the card
-            self._verify_left = int(os.environ.get("FIT_SPIRAL_POOL_OFFLOAD_VERIFY", "0")); self._verify = dict(gathers=0, lookups=0, mismatched_values=0)
-            if self._verify_left:                                        # VERIFY mode (identity test only): a resident copy on the card, every offloaded gather compared with it
-                self._shadow = torch.from_numpy(self.host_pool).to(self.device)
-                import atexit; atexit.register(lambda s_=self: print(f"rb_offload VERIFY {s_.label} FINAL: {s_._verify['gathers']} gathers, {s_._verify['lookups']:,} lookups x {s_.channels} channels compared with the resident pool: {s_._verify['mismatched_values']} mismatched values", flush=True))
-            self.table = torch.from_numpy(np.ascontiguousarray(remap[table_np])).to(self.device)
-            self._brick = torch.tensor(brick, dtype=torch.long, device=self.device); self._origin = torch.tensor(self.origin_zyx, dtype=torch.long, device=self.device)
-            self._shape = torch.tensor(self.shape_zyx, dtype=torch.long, device=self.device); self._stride_z = brick[1] * brick[2]; self._stride_y = brick[2]
-            self._bounds_check = os.environ.get("FIT_SPIRAL_RESIDENT_BOUNDS_CHECK") == "1"
-            self.resident_bricks = len(kept_ids); self.total_bricks = rows; self._gathers = 0; self._gather_seconds = 0.0
-            self._rows = len(kept_ids); self._bvox = bvox
-            self.load_seconds = time.perf_counter() - started; self.last_timings = {}
-            print(f"{self.label}: OFFLOADED pool {self.resident_bricks:,}/{rows:,} bricks of {brick} x{self.channels} channel(s) "
-                  f"({self.pool_bytes / 1024**3:.2f} GiB) in mapped host RAM (FIT_SPIRAL_POOL_OFFLOAD=1), loaded in {self.load_seconds:.1f}s", flush=True)
+            self._dptr = _register(self.host_pool, di)
+            self._finalizer = weakref.finalize(self, _unregister, self.host_pool)   # ownership of the registration starts here and ends in close(), a failed construction or garbage collection
+            try:
+                self._mod = _module(di); self._dev_index = di
+                self.pool = None                                             # nothing of the pool on the card
+                self._verify_left = int(os.environ.get("FIT_SPIRAL_POOL_OFFLOAD_VERIFY", "0")); self._verify = dict(gathers=0, lookups=0, mismatched_values=0)
+                if self._verify_left:                                        # VERIFY mode (identity test only): a resident copy on the card, every offloaded gather compared with it
+                    self._shadow = torch.from_numpy(self.host_pool).to(self.device)
+                    import atexit; atexit.register(lambda s_=self: print(f"rb_offload VERIFY {s_.label} FINAL: {s_._verify['gathers']} gathers, {s_._verify['lookups']:,} lookups x {s_.channels} channels compared with the resident pool: {s_._verify['mismatched_values']} mismatched values", flush=True))
+                self.table = torch.from_numpy(np.ascontiguousarray(remap[table_np])).to(self.device)
+                self._brick = torch.tensor(brick, dtype=torch.long, device=self.device); self._origin = torch.tensor(self.origin_zyx, dtype=torch.long, device=self.device)
+                self._shape = torch.tensor(self.shape_zyx, dtype=torch.long, device=self.device); self._stride_z = brick[1] * brick[2]; self._stride_y = brick[2]
+                self._bounds_check = os.environ.get("FIT_SPIRAL_RESIDENT_BOUNDS_CHECK") == "1"
+                self.resident_bricks = len(kept_ids); self.total_bricks = rows; self._gathers = 0; self._gather_seconds = 0.0
+                self._rows = len(kept_ids); self._bvox = bvox
+                self.load_seconds = time.perf_counter() - started; self.last_timings = {}
+                print(f"{self.label}: OFFLOADED pool {self.resident_bricks:,}/{rows:,} bricks of {brick} x{self.channels} channel(s) "
+                      f"({self.pool_bytes / 1024**3:.2f} GiB) in mapped host RAM (FIT_SPIRAL_POOL_OFFLOAD=1), loaded in {self.load_seconds:.1f}s", flush=True)
+            except BaseException:
+                self._finalizer()                                              # unregister before the host array is released
+                self.host_pool = None
+                raise
 
         def gather(self, indices_zyx):
             if not self._offloaded: return Base.gather(self, indices_zyx)
@@ -132,12 +153,9 @@ def offload_class(scc):
             return out.reshape(*original_shape, self.channels)
 
         def close(self):
-            if getattr(self, "_offloaded", False) and getattr(self, "host_pool", None) is not None:
-                try:
-                    from host_pool_cuda import _libs
-                    _libs()[1].cuMemHostUnregister(ctypes.c_void_p(self.host_pool.ctypes.data))
-                except Exception: pass
-                self.host_pool = None
+            finalizer = getattr(self, "_finalizer", None)
+            if finalizer is not None: finalizer()                        # unregisters once; later calls (and garbage collection) do nothing
+            self.host_pool = None
             self.pool = None; self.table = None
 
     print(f"brick_pool_offload: lasagna brick pools of at least {min_gib} GiB go to mapped host RAM (FIT_SPIRAL_POOL_OFFLOAD=1)", flush=True)

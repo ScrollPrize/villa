@@ -1192,7 +1192,9 @@ std::vector<SelectedRelationship> ObjectStore::relationshipsAtSelected(const Txn
         { ScopedReadTimer timer(timing.scopeResolve);
           // The source of this revision is known from its resolution in this read.
           if(const auto known=memo.versionSources.find(value->reference());known!=memo.versionSources.end())sourceDb=known->second;
-          else sourceDb=resolveObjectVersion(db,value->reference())->source; }
+          else if(const auto resolved=resolveObjectVersion(db,value->reference()))sourceDb=resolved->source;
+          // A revision saved before an update in a store without history may name a version that is no longer retained.
+          else throw std::invalid_argument("object history: selected version is not recorded in this store and generation: "+uuid); }
         std::vector<sqlite3*> scopes{db};
         if(sourceDb!=db&&!historyEnabled(sourceDb))scopes.push_back(sourceDb);
         std::set<std::string> seenBindings;
