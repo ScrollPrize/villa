@@ -767,10 +767,11 @@ std::vector<SelectedRelationship> HostedStore::relationshipsAt(const std::vector
     return relationshipQueryResultFromJson(expectOk(response, "relationship query").body, asOf);
 }
 
-SelectedInputs HostedStore::selectedInputs(const std::vector<ObjectVersion>& refs, const StoreStatus& position)
+SelectedInputs HostedStore::selectedInputs(const std::vector<ObjectVersion>& refs, const StoreStatus& position,
+    const std::optional<std::vector<ObjectVersion>>& relationshipVersions)
 {
     const auto response = impl_->http.request("POST", requestEndpoint_ + "/v1/query/selected-inputs",
-        selectedInputsRequestToJson(refs, position), {{"Content-Type", "application/json"}});
+        selectedInputsRequestToJson(refs, position, relationshipVersions), {{"Content-Type", "application/json"}});
     if (response.status == 409 && Json::parse(response.body).value("store_busy", false))
         throw StoreBusy(serverError(response));
     return selectedInputsFromJson(expectOk(response, "selected input query").body);

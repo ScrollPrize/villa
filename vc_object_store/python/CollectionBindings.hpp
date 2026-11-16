@@ -3,6 +3,7 @@
 #include "vc_object_store/objects/PackedStore.hpp"
 #include "vc_object_store/objects/imports/ParallelImportStream.hpp"
 #include "vc_object_store/objects/FiberConstraintGraph.hpp"
+#include "vc_object_store/objects/TrackCrossingStore.hpp"
 #include "vc_object_store/objects/VolumeTransforms.hpp"
 #include "vc_object_store/geometry/ArrayBytes.hpp"
 #include "FiberResultBindings.hpp"
@@ -38,6 +39,38 @@ std::vector<vo::InitialExtensionRow> initialExtensions(const nb::dict& row) {
         const auto value=nb::cast<nb::dict>(input);
         result.push_back({getStr(value,"table"),extensionRowFromPy(value["values"])});
     }
+    return result;
+}
+}
+
+namespace {
+nb::dict trackCrossingInfoToPy(const vo::TrackCrossingStoreInfo& info) {
+    nb::dict result;result["algorithm"]=info.algorithm;result["parameters"]=jsonLoads(info.parameters);
+    result["key"]=info.key;result["checksum"]=info.checksum;result["tracks"]=info.tracks;
+    result["crossings"]=info.crossings;result["based_on"]=jsonLoads(vo::extensionSourcesJson(info.basedOn));
+    return result;
+}
+vo::TrackCrossingStoreInfo trackCrossingInfoFromPy(const nb::dict& input) {
+    vo::TrackCrossingStoreInfo info;
+    info.algorithm=getStr(input,"algorithm");info.key=getStr(input,"key");
+    if(has(input,"parameters"))info.parameters=jsonDumps(input["parameters"]);
+    if(has(input,"checksum"))info.checksum=getStr(input,"checksum");
+    if(has(input,"tracks"))info.tracks=nb::cast<int64_t>(input["tracks"]);
+    if(has(input,"based_on"))info.basedOn=vo::extensionSourcesFromJson(jsonDumps(input["based_on"]));
+    return info;
+}
+// Owned NumPy columns; UUID bytes stay binary (uint8[N,16]).
+nb::dict trackCrossingColumnsToPy(vo::TrackCrossingColumns columns) {
+    auto* raw=new vo::TrackCrossingColumns(std::move(columns));
+    nb::capsule owner(raw,[](void* p)noexcept{delete static_cast<vo::TrackCrossingColumns*>(p);});
+    const size_t rows=raw->rows;nb::dict result;
+    result["a"]=nb::ndarray<const uint8_t,nb::numpy,nb::ndim<2>>(raw->a.data(),{rows,size_t(16)},owner);
+    result["b"]=nb::ndarray<const uint8_t,nb::numpy,nb::ndim<2>>(raw->b.data(),{rows,size_t(16)},owner);
+    result["local_a"]=nb::ndarray<const int32_t,nb::numpy,nb::ndim<1>>(raw->localA.data(),{rows},owner);
+    result["local_b"]=nb::ndarray<const int32_t,nb::numpy,nb::ndim<1>>(raw->localB.data(),{rows},owner);
+    result["position_a"]=nb::ndarray<const double,nb::numpy,nb::ndim<1>>(raw->positionA.data(),{rows},owner);
+    result["position_b"]=nb::ndarray<const double,nb::numpy,nb::ndim<1>>(raw->positionB.data(),{rows},owner);
+    result["clearance"]=nb::ndarray<const double,nb::numpy,nb::ndim<1>>(raw->clearance.data(),{rows},owner);
     return result;
 }
 }
@@ -199,6 +232,14 @@ inline void bindCollectionApi(nb::module_& module) {
         result["values"]=nb::bytes(reinterpret_cast<const char*>(values.data()),values.size()*sizeof(double));
         return result;
     },"Bulk UUID-ordered compact graph buffers (host int64 runtime indices/float64 decoded values). No stored endpoint XYZ.")
+    .def("track_crossing_columns",[](PyCollectionReader& self,size_t workers){
+        self.check();vo::TrackCrossingColumns columns;
+        {nb::gil_scoped_release release;columns=vo::readTrackCrossingColumns(*self.collection,*self.txn,workers);}
+        return trackCrossingColumnsToPy(std::move(columns));
+    },"workers"_a=8,"The crossings of a track-crossing cache store as owned NumPy columns (pairs with a < b by binary UUID).")
+    .def("track_crossing_info",[](PyCollectionReader& self){
+        self.check();return trackCrossingInfoToPy(vo::trackCrossingStoreInfo(*self.collection,*self.txn));
+    },"What a track-crossing cache store was computed with and from.")
     .def("extension_tables",[](PyCollectionReader& self){
         self.check();nb::list result;for(const auto& table:self.collection->extensionTables(*self.txn))result.append(extensionTableToPy(table));return result;
     })
@@ -260,6 +301,37 @@ inline void bindCollectionApi(nb::module_& module) {
     },"destination"_a,"objects"_a,"edges"_a=nb::list(),"extensions"_a=nb::list(),
       "dependencies"_a=std::vector<std::filesystem::path>{},"workers"_a=1,"packed"_a=false,
       "edge_adjacency_index"_a=true,"edge_columns"_a=std::nullopt,"dependency_pins"_a=nb::list());
+
+    module.def("write_track_crossing_store",[](const std::filesystem::path& destination,
+            nb::ndarray<const uint8_t,nb::ndim<2>,nb::c_contig,nb::device::cpu> a,
+            nb::ndarray<const uint8_t,nb::ndim<2>,nb::c_contig,nb::device::cpu> b,
+            nb::ndarray<const int32_t,nb::ndim<1>,nb::c_contig,nb::device::cpu> localA,
+            nb::ndarray<const int32_t,nb::ndim<1>,nb::c_contig,nb::device::cpu> localB,
+            nb::ndarray<const double,nb::ndim<1>,nb::c_contig,nb::device::cpu> positionA,
+            nb::ndarray<const double,nb::ndim<1>,nb::c_contig,nb::device::cpu> positionB,
+            nb::ndarray<const double,nb::ndim<1>,nb::c_contig,nb::device::cpu> clearance,
+            const nb::dict& info,size_t workers,size_t sqlBatchRows,bool memoryFirst){
+        if(a.shape(1)!=16||b.shape(1)!=16)throw std::invalid_argument("track UUID columns must be uint8[N,16]");
+        // The arrays are borrowed for the call; they stay referenced by its arguments.
+        vo::TrackCrossingColumnsView view;view.rows=a.shape(0);
+        view.a={a.data(),a.shape(0)*16};view.b={b.data(),b.shape(0)*16};
+        view.localA={localA.data(),localA.shape(0)};view.localB={localB.data(),localB.shape(0)};
+        view.positionA={positionA.data(),positionA.shape(0)};view.positionB={positionB.data(),positionB.shape(0)};
+        view.clearance={clearance.data(),clearance.shape(0)};
+        const auto description=trackCrossingInfoFromPy(info);
+        vo::TrackCrossingWriteOptions options;options.workers=workers;options.sqlBatchRows=sqlBatchRows;options.memoryFirst=memoryFirst;
+        vo::InitialImportResult result;
+        {nb::gil_scoped_release release;result=vo::writeTrackCrossingStore(destination,view,description,options);}
+        nb::dict out;out["path"]=result.path.string();out["store_uuid"]=result.storeUuid;
+        out["ingestion_seconds"]=result.ingestionSeconds;out["persistence_seconds"]=result.persistenceSeconds;
+        out["total_seconds"]=result.totalSeconds;
+        // Per shard writer: native edge construction, and time spent waiting for rows.
+        std::vector<double> construction,waiting;
+        for(const auto& shard:result.shards){construction.push_back(shard.edgeSeconds);waiting.push_back(shard.producerSeconds);}
+        out["shard_edge_seconds"]=construction;out["shard_wait_seconds"]=waiting;return out;
+    },"destination"_a,"a"_a,"b"_a,"local_a"_a,"local_b"_a,"position_a"_a,"position_b"_a,"clearance"_a,"info"_a,
+      "workers"_a=8,"sql_batch_rows"_a=1,"memory_first"_a=false,
+      "Build a sealed track-crossing cache store with the sharded streaming importer; never overwrites.");
 
     module.def("write_extension_store",[](const std::filesystem::path& path,
             const std::vector<std::filesystem::path>& bases,const nb::sequence& definitions,const nb::dict& payload){

@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hold-out Review</title>
+<link rel="stylesheet" href="/common.css">
+<style>
+.question { font-size: 15px; margin: 12px 0 6px; }
+.answers { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 6px; }
+.answers button { text-align: left; padding: 6px 9px; }
+.answers button small { display: block; color: var(--muted); }
+.answers button.current { outline: 2px solid var(--select); }
+#section-wrap { position: relative; display: inline-block; }
+#section-img { display: block; max-width: 100%; }
+#section-box { position: absolute; border: 2px solid var(--select); pointer-events: none; }
+.stretches { display: grid; grid-template-columns: repeat(5, 1fr); gap: 4px; margin: 6px 0; }
+.stretches div { border: 1px solid var(--line); border-radius: 4px; padding: 3px 5px; font-variant-numeric: tabular-nums; }
+.stretches div small { display: block; color: var(--muted); }
+.bar { height: 8px; background: var(--line); border-radius: 4px; overflow: hidden; margin: 4px 0; }
+.bar div { height: 100%; background: var(--good); }
+#result { border: 1px solid var(--accent); border-radius: 6px; padding: 8px; margin-top: 8px; }
+tr { cursor: pointer; } tr.sel td { background: color-mix(in srgb, var(--select) 22%, transparent); }
+#done-list { max-height: 30vh; overflow: auto; }
+#note { display: block; width: 100%; margin-top: 8px; }
+</style>
+</head>
+<body>
+<header>
+  <a href="/">← pairs</a>
+  <h1 id="title">Hold-out set</h1>
+  <span id="count" class="muted"></span>
+  <button id="undo" disabled title="Take back your last answer and go back to that patch">Undo <kbd>u</kbd></button>
+  <button id="viewer" title="Both whole volumes overlaid where this patch sits, in Neuroglancer">Neuroglancer <kbd>g</kbd></button>
+  <button id="reveal" title="Show how the fit scores on the answers so far">Show result</button>
+  <a id="other-unit"></a>
+  <span id="error"></span>
+</header>
+<main>
+  <section>
+    <h2 id="unit-title">Patch</h2>
+    <div class="row" id="modes"></div>
+    <canvas id="strip" class="strip"></canvas>
+    <div class="labels"><span>xy (mid z)</span><span>xz (mid y)</span><span>yz (mid x)</span></div>
+    <p class="question">At its own measurement, does the fine scan line up with the coarse one?</p>
+    <div class="answers" id="answers"></div>
+    <textarea id="note" rows="2"
+      placeholder="note: what you see in this patch (n to write, Esc or leaving the field saves)"></textarea>
+    <p class="muted"><kbd>1</kbd>–<kbd>5</kbd> answer and next · <kbd>space</kbd> flip ·
+      <kbd>m</kbd> mode · <kbd>n</kbd> note · <kbd>u</kbd> undo · <kbd>g</kbd> Neuroglancer. No fit is shown here: the patch is drawn
+      through the transform it was measured under, moved to its own measurement.</p>
+  </section>
+  <section>
+    <h2>Progress</h2>
+    <div class="bar"><div id="bar"></div></div>
+    <div id="progress-text"></div>
+    <div class="stretches" id="stretches"></div>
+    <div id="result" hidden></div>
+    <h2 style="margin-top:10px">Where it is</h2>
+    <div id="section-wrap"><img id="section-img" alt="cross-section"><div id="section-box"></div></div>
+    <h2 style="margin-top:10px">Answered</h2>
+    <div id="done-list"><table><tbody id="done"></tbody></table></div>
+  </section>
+</main>
+<script src="/common.js"></script>
+<script>
+const HELP = {
+  "lines-up": "the whole view agrees at this one shift",
+  "partly": "some of it lines up, no single shift fits all",
+  "no": "it does not line up: the measurement is off",
+  "cant-tell": "too little structure to see",
+  "not-scroll": "case, debris, empty",
+};
+const OCTANTS = new URLSearchParams(location.search).get("unit") === "octants";
+const UNIT = OCTANTS ? "Octant" : "Patch";
+const API = `/api/pairs/${encodeURIComponent(PAIR)}`;
+let state = null, current = null, mode = "overlay", flipped = false, images = {}, reveal = false;
+let noteFor = null, sectionFor = null;
+const answered = [];       // answers given since the page loaded, each with the one it replaced
+
+async function load() {
+  state = await call(`${API}/holdout?unit=${OCTANTS ? "octants" : "patches"}${reveal ? "&reveal=1" : ""}`);
+  $("title").textContent = `${OCTANTS ? "Hold-out octants" : "Hold-out set"} · ${state.pair}`;
+  $("other-unit").href = OCTANTS ? "?" : "?unit=octants";
+  $("other-unit").textContent = OCTANTS ? "judge whole patches" : "judge octants";
+  const p = state.progress, a = p.answers;
+  $("count").textContent = `${state.units.filter(q => q.answer).length} of ${state.units.length} answered`;
+  $("bar").style.width = `${Math.min(100, 100 * p.lines_up / state.target)}%`;
+  const whole = a["lines-up"] + a.partly;
+  const answered = p.stretches.reduce((n, x) => n + x.answered, 0);
+  const needed = p.lines_up >= state.target ? `${state.target} needed ✓` : `${state.target} needed, ${state.target - p.lines_up} to go`;
+  $("progress-text").innerHTML = `<b>${p.lines_up}</b> of ${answered} answered line up (${needed}) · partly ${a.partly}` +
+    (whole ? ` (${Math.round(100 * a.partly / whole)}%)` : "") + ` · no ${a.no} · can't tell ${a["cant-tell"]} · not scroll ${a["not-scroll"]}`;
+  $("stretches").innerHTML = p.stretches.map((s, i) =>
+    `<div title="stretch ${i + 1} along the scroll"><b>${s.lines_up}</b><small>${s.left} left</small></div>`).join("");
+  showResult();
+  $("done").innerHTML = state.units.filter(q => q.answer)
+    .sort((x, y) => (y.answer.at ?? "").localeCompare(x.answer.at ?? ""))
+    .map(q => `<tr data-id="${q.id}" class="${q.id === current ? "sel" : ""}"><td>${q.id}</td><td>${q.answer.answer}${q.note ? " ✎" : ""}</td><td class="muted">stretch ${q.stretch + 1}</td></tr>`).join("");
+  for (const row of $("done").children) row.onclick = () => show(row.dataset.id);
+}
+
+function showResult() {
+  const box = $("result"), s = state.scores;
+  box.hidden = !s;
+  if (!s) return;
+  box.innerHTML = barTable(s) + `<div class="muted">` +
+    (state.score_stale ? "scored before your latest answers: run the pair to score again" : "") + `</div>` +
+    (s.drift ? `<div class="${s.drift.judge_again.length ? "fail" : "muted"}">measured again under the fit, the hold-out
+      positions move ${fmt(s.drift.median)} median, ${fmt(s.drift.max)} at most (fine voxels)${s.drift.judge_again.length ?
+      ` · worth judging again: ${s.drift.judge_again.map(id => `<a href="#" data-again="${id}">${id}</a>`).join(", ")}` : ""}</div>` : "");
+  for (const a of box.querySelectorAll("[data-again]")) a.onclick = e => { e.preventDefault(); show(a.dataset.again); };
+}
+
+async function saveNote() {
+  if (!noteFor) return;
+  const text = $("note").value.trim(), same = state.units.filter(q => q.patch === noteFor);
+  if (!same.length || (same[0].note ?? "") === text) return;
+  try { await call(`${API}/note`, {patch: noteFor, text}); for (const q of same) q.note = text || null; }
+  catch (e) { $("error").textContent = e.message; }
+}
+
+async function show(id) {
+  await saveNote();
+  current = id;
+  for (const row of $("done").children) row.classList.toggle("sel", row.dataset.id === id);
+  if (!id) { $("unit-title").textContent = "Nothing left to look at"; $("answers").innerHTML = ""; return; }
+  const u = state.units.find(q => q.id === id);
+  noteFor = u.patch; $("note").value = u.note ?? "";
+  $("unit-title").textContent = `${UNIT} ${u.id} · stretch ${u.stretch + 1} of ${state.progress.stretches.length}` +
+    ` · origin z ${u.origin_zyx[0]} y ${u.origin_zyx[1]} x ${u.origin_zyx[2]}`;
+  $("answers").innerHTML = state.answers.map((answer, i) =>
+    `<button data-a="${answer}" class="${u.answer?.answer === answer ? "current" : ""}"><kbd>${i + 1}</kbd> ${answer}<small>${HELP[answer]}</small></button>`).join("");
+  for (const b of $("answers").children) b.onclick = () => answer(b.dataset.a);
+  if (sectionFor !== id) { sectionFor = id; drawSection($("section-img"), $("section-box"), u.patch, u.origin_zyx, u.size); }
+  if (images.id === id && images.coarse) return;
+  images = {id};
+  $("strip").classList.add("loading");
+  let coarse, own;
+  try {
+    [coarse, own] = await Promise.all(["coarse", "own"].map(side => picture(`/img/${PAIR}/holdout/${id}/${side}.png`)));
+  } catch (e) { if (images.id === id) $("error").textContent = `${id}: the pictures did not load`; return; }
+  if (images.id !== id) return;
+  images = {id, coarse, own};
+  render();
+  $("strip").classList.remove("loading");
+}
+
+function render() {
+  if (!images.coarse) return;
+  const shown = mode === "flip" ? (flipped ? "fine" : "coarse") : mode;
+  drawStrip($("strip"), images.coarse, images.own, shown, OCTANTS ? 6 : 3);
+  modeButtons($("modes"), mode, flipped, shown, m => { mode = m; render(); });
+}
+
+async function answer(value) {
+  if (!current) return;
+  await saveNote();
+  const u = state.units.find(q => q.id === current);
+  try {
+    await call(`${API}/answer`, {unit: current, answer: value});
+    answered.push({id: current, answer: u.answer?.answer ?? null});
+    $("undo").disabled = false; $("error").textContent = "";
+    await load();
+    await show(state.next);
+  } catch (e) { $("error").textContent = e.message; }
+}
+
+async function undo() {
+  const last = answered.pop();
+  $("undo").disabled = answered.length === 0;
+  if (!last) return;
+  try { await call(`${API}/answer`, {unit: last.id, answer: last.answer}); await load(); await show(last.id); }
+  catch (e) { answered.push(last); $("undo").disabled = false; $("error").textContent = e.message; }
+}
+
+document.addEventListener("keydown", e => {
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  if (e.target === $("note")) { if (e.key === "Escape") $("note").blur(); return; }
+  if (e.key === "n") { e.preventDefault(); $("note").focus(); return; }
+  if (/^[1-5]$/.test(e.key)) answer(state.answers[Number(e.key) - 1]);
+  else if (e.key === " ") { e.preventDefault(); if (mode !== "flip") mode = "flip"; flipped = !flipped; render(); }
+  else if (e.key === "m") { mode = MODES[(MODES.indexOf(mode) + 1) % MODES.length]; render(); }
+  else if (e.key === "u") undo();
+  else if (e.key === "g") openViewer();
+});
+
+// The tab is opened before the link is asked for, so a popup blocker lets it through.
+async function openViewer() {
+  if (!current) return;
+  const tab = window.open("", "_blank");
+  try { tab.location = (await call(`${API}/viewer?id=${encodeURIComponent(current)}`)).url; }
+  catch (e) { tab.close(); $("error").textContent = e.message; }
+}
+$("viewer").onclick = openViewer;
+$("undo").onclick = undo;
+$("note").onblur = saveNote;
+$("reveal").onclick = async () => { reveal = true; await load(); };
+load().then(() => show(state.next)).catch(e => { $("error").textContent = e.message; });
+</script>
+</body>
+</html>

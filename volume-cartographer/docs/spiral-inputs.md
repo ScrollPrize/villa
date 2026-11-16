@@ -8,9 +8,13 @@ patches, point collections and fibers as the project's store for those kinds
 holds them now, updating each one a commit changes (fibers
 with *Show fitted fibers* in Display), and *Fit inputs* in the Spiral panel
 reports their digest, counts and what differs from what the fit read,
-including its links. Tracks and their crossing relationships participate in
-the same input comparison, but track geometry is not displayed by this view.
-Use VC3D and the service from the same checkout (API 47); enable tracks in
+including its links. Tracks participate in the same input comparison, but
+track geometry is not displayed by this view. Track crossings are computed by
+the fit from its tracks, so comparing the tracks covers them: crossing
+relationships of the store are neither read nor compared. For a fit made
+before API 48, whose manifest lists its crossings as relationships, the panel
+says that those crossings are not compared.
+Use VC3D and the service from the same checkout (API 48); enable tracks in
 the fit settings after importing them into the service's store. There is no
 track-DBM path selector.
 
@@ -62,8 +66,9 @@ text filter applies to the list. Remove (or
 *Discard Local Changes* in its context menu) discards an unsaved drawing.
 Leaving the workspace with unsaved drawings asks before discarding them.
 
-Changing tracks or their crossings requires *Rebuild Fit* → *Rebuild with
-Current Inputs*, as does changing the outer shell. With tracks enabled and
+Changing tracks (and with them the crossings the fit computes) requires
+*Rebuild Fit* → *Rebuild with Current Inputs*, as does changing the outer
+shell. With tracks enabled and
 `track_exclusion_radius > 0`, updates also require a rebuild because the
 track exclusion masks depend on the fit's trusted geometry. To edit against
 a service on another host, serve its store with `vc_object_server` (see the

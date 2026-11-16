@@ -20,8 +20,8 @@
 #     -f volume-cartographer/scripts/Dockerfile.appimage \
 #     --build-arg BUILDER_IMAGE=vc-builder:dev .
 
-# Published builder with deps recipe hash 675836fc3d478d17 (also used by PR CI).
-ARG BUILDER_IMAGE=ghcr.io/scrollprize/villa/volume-cartographer@sha256:1bebf104edbd6c290ddbaf8036c919635259f3722e8eddb31340b240baf1ed68
+# Published builder with deps recipe hash 6309e96d71462b0a (also used by PR CI).
+ARG BUILDER_IMAGE=ghcr.io/scrollprize/villa/volume-cartographer@sha256:9407753393547c422c9689cb8da6b6f4415cc91ad8fa4d89eb476a3df540d7f8
 
 FROM ${BUILDER_IMAGE} AS build
 ARG DEBIAN_FRONTEND=noninteractive
@@ -38,6 +38,15 @@ ARG VC_GIT_COMMIT_DATE=
 RUN apt-get update \
  && apt-get install -y --no-install-recommends patchelf file desktop-file-utils zstd \
  && rm -rf /var/lib/apt/lists/*
+
+# Top up the pinned builder with the current dependency recipe, as the PR CI
+# jobs do. A dependency added to install_build_deps.sh then builds here even
+# before BUILDER_IMAGE is re-pinned to the republished image; with a current
+# pin this installs nothing. Copied alone so the layer is reused until the
+# recipe changes.
+COPY volume-cartographer/scripts/install_build_deps.sh /tmp/install_build_deps.sh
+RUN bash /tmp/install_build_deps.sh minimal-build \
+ && rm -rf /var/lib/apt/lists/* /tmp/install_build_deps.sh
 
 # Preserve the monorepo sibling layout used by VC3D's runtime service install
 # and by cmake/ObjectStore.cmake, which builds ../vc_object_store from source
