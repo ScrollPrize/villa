@@ -14,7 +14,8 @@
 #include <set>
 
 namespace vc::objects {
-SelectedInputs LocalStoreReader::selectedInputs(const std::vector<ObjectVersion>& refs, const StoreStatus& position) const
+SelectedInputs LocalStoreReader::selectedInputs(const std::vector<ObjectVersion>& refs, const StoreStatus& position,
+    const std::optional<std::vector<ObjectVersion>>& relationshipVersions) const
 {
     const auto before = status();
     const bool inherited = std::any_of(refs.begin(), refs.end(), [&](const auto& ref) { return util::canonicalUuid(ref.storeUuid) != before.storeUuid; });
@@ -28,15 +29,34 @@ SelectedInputs LocalStoreReader::selectedInputs(const std::vector<ObjectVersion>
     // One memo for the whole read: the objects resolved here serve the
     // relationship read below instead of being resolved again.
     detail::SelectedReadScope memo;
+    std::vector<std::optional<ObjectRevision>> records;
     {
         detail::ScopedReadTimer timer(timing.objects);
-        const auto records = objectsAtVersions(refs);
-        for (size_t i = 0; i < refs.size(); ++i) {
-            if (!records[i] || records[i]->deleted) throw std::invalid_argument("selected object is not retained: " + refs[i].objectUuid);
-            result.objects.push_back(*records[i]);
-        }
+        records = store_->objectsAtVersions(*txn_, refs, result.trackDatasets);
     }
-    result.relationships = store_->relationshipsAt(*txn_, result.objects);
+    std::set<std::string> objects;
+    for (size_t i = 0; i < refs.size(); ++i) {
+        if (!records[i] || records[i]->deleted) throw std::invalid_argument("selected object is not retained: " + refs[i].objectUuid);
+        // Whichever relationships are read: one state of an object.
+        if (!objects.insert(records[i]->objectUuid).second)
+            throw std::invalid_argument("object history: object selected twice: " + records[i]->objectUuid);
+        result.objects.push_back(*records[i]);
+    }
+    if (relationshipVersions) {
+        std::set<std::tuple<std::string, std::string, std::string, int64_t>> selected;
+        const auto key = [](const ObjectVersion& ref) {
+            return std::tuple(util::canonicalUuid(ref.storeUuid), util::canonicalUuid(ref.generation),
+                              util::canonicalUuid(ref.objectUuid), ref.version);
+        };
+        for (const auto& ref : refs) selected.insert(key(ref));
+        for (const auto& ref : *relationshipVersions)
+            if (!selected.contains(key(ref)))
+                throw std::invalid_argument("selected inputs: relationships requested of an unselected object: " + ref.objectUuid);
+        result.relationships = relationshipsAt(*relationshipVersions);
+    } else {
+        // All selected objects: the revisions resolved above are used as they are.
+        result.relationships = store_->relationshipsAt(*txn_, result.objects);
+    }
     timing.report("selectedInputs", result.objects.size(), result.relationships.size());
     return result;
 }

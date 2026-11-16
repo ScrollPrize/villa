@@ -208,7 +208,7 @@ from surface_orientation import spiral_outward_sense_for
 # (neither /dataset nor a load request names a track database); the fit reads
 # the selected tracks (object_store_track_uuids/_tags, input_use_tracks) and
 # their crossing links, which its link refresh makes. The input manifest lists
-# tracks and track_crossing relationships like any other input.
+# tracks and track_crossing relationships like any other input (until 48).
 # 45: explicit inputs. A service has no dataset: --dataset, spiral-scroll.json
 # and conventional-directory discovery are gone. GET /dataset is replaced by
 # GET /bindings, which advertises the service's host bindings ("bindings":
@@ -265,7 +265,16 @@ from surface_orientation import spiral_outward_sense_for
 # "object_store_input_position" (service-owned) is a position. Commits
 # report "version" (no "pushed"/"push_error", no "pending_commits"). The
 # project's umbilicus is {uuid, generation, version, points_zyx}.
-API_VERSION = 47
+# 48: the fit computes track crossings itself from the selected tracks'
+# stored points, and reads no relationship of a track. The link refresh runs
+# no track-track detector, the link marker records no track selection, and
+# the input manifest lists no track_crossing relationships: it records the
+# crossings as "derived_inputs": {"track_crossing": {source, algorithm,
+# parameters, count, sha256}} (present when tracks are selected), which the
+# input digest covers. A client compares tracks, never crossing
+# relationships; a manifest of an older fit that lists them cannot be
+# compared on its crossings.
+API_VERSION = 48
 
 
 class SessionState(str, Enum):

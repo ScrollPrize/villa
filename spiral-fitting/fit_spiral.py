@@ -1511,7 +1511,7 @@ class FitContext:
         track_reload_source_ids = None
         if track_inputs is not None:
             # The store's tracks lying in the z window, in fit voxels, with
-            # the crossings its track-crossing detector linked.
+            # the crossings computed from them (materialize_tracks).
             tracks = track_inputs.tracks
             if track_sampling_config['crossing_precompute_max'] > 0:
                 progress.begin(
