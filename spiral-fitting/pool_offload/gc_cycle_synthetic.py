@@ -11,6 +11,13 @@ import gc, sys, time, json, os, resource, torch
 dev = sys.argv[1]; N = int(float(sys.argv[2])); S = int(sys.argv[3]); T = int(sys.argv[4]); policies = sys.argv[5].split(',')
 def rss(): return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024 / 1024
 res = {}
+if dev == 'cpu' and len(policies) > 1:
+    # Process RSS high-water marks cannot be reset, so on the CPU every policy runs in its own fresh process.
+    import subprocess
+    for pol in policies:
+        out = subprocess.run([sys.executable, __file__, dev, sys.argv[2], sys.argv[3], sys.argv[4], pol], capture_output=True, text=True).stdout
+        print(out.strip(), flush=True)
+    sys.exit(0)
 for pol in policies:
     gc.enable(); gc.unfreeze(); gc.collect(); heap = [[i] for i in range(N)]; gc.collect()
     if dev == 'cuda': torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats()

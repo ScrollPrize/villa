@@ -56,5 +56,5 @@ The growth can be reproduced without the fit (`pool_offload/gc_cycle_synthetic.p
 | Python 3.11 | 1e5 and 2e7 objects | 2,560 MiB (all 40 steps kept) | 64 MiB |
 | Python 3.14 (incremental collector) | 1e5 objects | 256 MiB (no growth) | 64 MiB |
 | Python 3.14 | 2e7 objects | 2,560 MiB | 64 MiB (1.2 s of collector time in total; collecting every step with no freeze: 49 s) |
-With CPU tensors the same test keeps 1,964 MiB (default) against 0 (freeze): the effect is the Python collector's, not the GPU's. So the growth appears when the heap is large (the fit's is tens of millions of objects once the tracks are loaded)
+With CPU tensors (each policy in a fresh process, 2e7-object heap, 30 steps of 64 MiB) the process grows by 1,963 MiB under the default collector and 110 MiB under `freeze` (collecting every step without a freeze: 110 MiB, 34 s of collector time): the effect is the Python collector's, not the GPU's. So the growth appears when the heap is large (the fit's is tens of millions of objects once the tracks are loaded)
 or on interpreters before 3.14; a small-heap fit on 3.14 (45 k tracks, 60 iterations, `off`) showed none, with the same torch peak as `freeze`.
