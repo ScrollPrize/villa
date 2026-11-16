@@ -111,6 +111,7 @@ from scipy.optimize import milp, LinearConstraint, Bounds
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _SCRIPT_DIR)
 import fit_spiral as fs
+from umbilicus import smooth_umbilicus_z_to_yx
 from sample_spiral import (
     get_theta_and_radii,
     get_theta_crossing_step_adjustments,
@@ -288,7 +289,9 @@ def build_transform(checkpoint, cfg, context, model_z_begin, model_z_end):
     device = torch.device('cuda')
 
     all_zs = np.arange(model_z_begin, model_z_end)
-    umbilicus_fn = context.umbilicus_z_to_yx()
+    umbilicus_fn = smooth_umbilicus_z_to_yx(
+        context.umbilicus_z_to_yx(), model_z_begin, model_z_end,
+        cfg.get('umbilicus_smoothing_sigma', 75.0))
     umbilicus_zyx = torch.from_numpy(
         np.concatenate([all_zs[:, None], umbilicus_fn(all_zs)], axis=-1).astype(np.float32)
     ).to(device)
