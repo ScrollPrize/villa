@@ -42,6 +42,7 @@ from vesuvius.ink_detection.inference.inference_runtime import (
     prepare_model_for_inference,
     resolve_amp_dtype,
 )
+from vesuvius.ink_detection.models.conv3d_as_2d import CONV3D_AS_2D_CHOICES
 from vesuvius.ink_detection.models.model import make_model
 from vesuvius.ink_detection.volume_io import (
     open_volume,
@@ -1717,6 +1718,17 @@ def parse_args(argv: Sequence[str] | None = None):
         help="Device for the model. auto picks CUDA, then MPS, then CPU; --gpus implies CUDA.",
     )
     parser.add_argument("--gpus")
+    parser.add_argument(
+        "--conv3d-as-2d",
+        choices=CONV3D_AS_2D_CHOICES,
+        default="auto",
+        help=(
+            "Run 3D convolutions as sums of 2D convolutions (same weights and "
+            "sums). 'auto' (default) does this on ROCm only, where MIOpen's 3D "
+            "convolutions are slow, and only for the 3D stem of 3D-stem/2D "
+            "models; 'on' rewrites every Conv3d, on any device (slower on NVIDIA)."
+        ),
+    )
     parser.add_argument("--compile-mode", default="reduce-overhead")
     parser.add_argument("--no-compile", dest="compile_model", action="store_false")
     parser.set_defaults(compile_model=True)
@@ -1757,6 +1769,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         device_type=args.device,
         compile_model=args.compile_model,
         compile_mode=args.compile_mode,
+        conv3d_as_2d=args.conv3d_as_2d,
     )
     configured = replace(configured, model=prepared_model)
     if args.folder is not None:
