@@ -111,14 +111,7 @@ void backproject(const float* sino, const float* angles_host, float* slice, int 
         if (p.fan) VC_TOMOGRAPHY_BP_OF(K, true); \
         else VC_TOMOGRAPHY_BP_OF(K, false); \
     } while (0)
-    switch (p.interp) {
-        case interp_core::Linear: VC_TOMOGRAPHY_BP(interp_core::Linear); break;
-        case interp_core::Cubic: VC_TOMOGRAPHY_BP(interp_core::Cubic); break;
-        case interp_core::Lanczos3: VC_TOMOGRAPHY_BP(interp_core::Lanczos3); break;
-        case interp_core::BSpline3: VC_TOMOGRAPHY_BP(interp_core::BSpline3); break;
-        case interp_core::BSpline5: VC_TOMOGRAPHY_BP(interp_core::BSpline5); break;
-        default: throw Error("backproject: unknown interpolation");
-    }
+    interp_core::dispatch_interp(p.interp, "backproject", [&](auto k) { VC_TOMOGRAPHY_BP(decltype(k)::value); });
 #undef VC_TOMOGRAPHY_BP
 #undef VC_TOMOGRAPHY_BP_OF
     VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());

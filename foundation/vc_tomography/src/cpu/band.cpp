@@ -63,14 +63,9 @@ void backproject_list(const float* sino, const float* angles, int n_angles, int 
         cs[a] = std::cos(angles[a]);
         sn[a] = std::sin(angles[a]);
     }
-    switch (p.interp) {
-        case interp_core::Linear: backproject_list_k<interp_core::Linear>(sino, cs, sn, n_angles, n_det, list, count, box, p, c, r, img); break;
-        case interp_core::Cubic: backproject_list_k<interp_core::Cubic>(sino, cs, sn, n_angles, n_det, list, count, box, p, c, r, img); break;
-        case interp_core::Lanczos3: backproject_list_k<interp_core::Lanczos3>(sino, cs, sn, n_angles, n_det, list, count, box, p, c, r, img); break;
-        case interp_core::BSpline3: backproject_list_k<interp_core::BSpline3>(sino, cs, sn, n_angles, n_det, list, count, box, p, c, r, img); break;
-        case interp_core::BSpline5: backproject_list_k<interp_core::BSpline5>(sino, cs, sn, n_angles, n_det, list, count, box, p, c, r, img); break;
-        default: throw Error("backproject_list: unknown interpolation");
-    }
+    interp_core::dispatch_interp(p.interp, "backproject_list", [&](auto k) {
+        backproject_list_k<decltype(k)::value>(sino, cs, sn, n_angles, n_det, list, count, box, p, c, r, img);
+    });
 }
 
 void band_sample(const float* img_lo, const float* img_hi, const float* fz, const float* y, const float* x,

@@ -1,7 +1,7 @@
 #pragma once
 // Interpolation of a sinogram row at a real detector position u (bins), shared by every exact backprojector
-// (CPU, CUDA, full slice, band). Samples outside [0, n) are 0. Add a kernel: a new Interp value, a weight function
-// and a case in sample_row / dispatch_interp.
+// (CPU, CUDA, full slice, band). Samples outside [0, n) are 0. Add a kernel: a new Interp value, a weight function,
+// a case in sample_row_reach, kInterpNames and dispatch_interp.
 //   Linear    2 taps (the classic pixel-driven backprojector)
 //   Cubic     4 taps, Keys a = -0.5 (Catmull-Rom)
 //   Lanczos3  6 taps, sinc(x) sinc(x/3), weights normalised to sum 1
@@ -13,12 +13,53 @@
 // Samples (and spline coefficients) outside [0, n) are 0: the row is zero-extended; the coefficients are exact for
 // that extension inside [0, n), the taps beyond are dropped (affects u within 2-3 bins of the detector ends).
 #include <cmath>
+#include <initializer_list>
+#include <string>
+#include <type_traits>
+
+#include "vc_tomography/common.hpp"
 
 #include "hd_math.hpp"
 
 namespace vc_tomography::interp_core {
 
 enum Interp : int { Linear = 0, Cubic = 1, Lanczos3 = 2, BSpline3 = 3, BSpline5 = 4, Lanczos8 = 5 };
+
+// (host) The kernels by name ("bspline" is bspline3). named: the kernel, if it is one of `allowed`, else an Error
+// "<what> must be a, b or c, not '<name>'".
+struct InterpName {
+    const char* name;
+    Interp id;
+};
+inline constexpr InterpName kInterpNames[] = {{"linear", Linear},     {"cubic", Cubic},       {"lanczos3", Lanczos3}, {"bspline3", BSpline3},
+                                              {"bspline", BSpline3},  {"bspline5", BSpline5}, {"lanczos8", Lanczos8}};
+inline const char* name_of(int id) {
+    for (const InterpName& n : kInterpNames)
+        if (n.id == id) return n.name;
+    return "linear";
+}
+// f(std::integral_constant<int, K>{}) for the backprojectors' kernel K = interp (Linear .. BSpline5); an Error
+// "<what>: unknown interpolation" for any other
+template <class F>
+void dispatch_interp(int interp, const char* what, F&& f) {
+    switch (interp) {
+        case Linear: f(std::integral_constant<int, Linear>{}); break;
+        case Cubic: f(std::integral_constant<int, Cubic>{}); break;
+        case Lanczos3: f(std::integral_constant<int, Lanczos3>{}); break;
+        case BSpline3: f(std::integral_constant<int, BSpline3>{}); break;
+        case BSpline5: f(std::integral_constant<int, BSpline5>{}); break;
+        default: throw Error(std::string(what) + ": unknown interpolation");
+    }
+}
+inline int named(const std::string& name, std::initializer_list<Interp> allowed, const std::string& what) {
+    for (Interp k : allowed)
+        for (const InterpName& n : kInterpNames)
+            if (n.id == k && name == n.name) return k;
+    std::string list;
+    std::size_t i = 0;
+    for (Interp k : allowed) list += (i++ ? (i == allowed.size() ? " or " : ", ") : "") + std::string(name_of(k));
+    throw Error(what + " must be " + list + ", not '" + name + "'");
+}
 
 // rows of the exact backprojectors need a B-spline prefilter (spline degree, 0: none)
 HR_HD int spline_degree(int interp) { return interp == BSpline3 ? 3 : (interp == BSpline5 ? 5 : 0); }

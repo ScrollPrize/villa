@@ -29,10 +29,8 @@ BlockCorrelator::BlockCorrelator(const BlockSpectraSpec& s) : spec_(s) {
 }
 
 int resample_interp_from_name(const std::string& name) {
-    if (name == "linear") return interp_core::Linear;
-    if (name == "cubic") return interp_core::Cubic;
-    if (name == "lanczos3") return interp_core::Lanczos3;
-    throw Error("resample: interp must be linear, cubic or lanczos3, not '" + name + "'");
+    using namespace interp_core;
+    return named(name, {Linear, Cubic, Lanczos3}, "resample: interp");
 }
 
 namespace block_spectra {

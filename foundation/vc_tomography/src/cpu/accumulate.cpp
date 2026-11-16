@@ -64,16 +64,11 @@ void set_x_kernel(AccumScanView& v, int interp, bool exact) {
 }
 
 int z_kernel_from_name(const std::string& name) {
-    if (name == "linear") return interp_core::Linear;
-    if (name == "cubic") return interp_core::Cubic;
-    if (name == "lanczos3") return interp_core::Lanczos3;
-    if (name == "lanczos8") return interp_core::Lanczos8;
-    throw Error("z_interp must be linear, cubic, lanczos3 or lanczos8, not '" + name + "'");
+    using namespace interp_core;
+    return named(name, {Linear, Cubic, Lanczos3, Lanczos8}, "z_interp");
 }
 
-const char* z_kernel_name(int interp) {
-    return interp == interp_core::Lanczos8 ? "lanczos8" : interp == interp_core::Lanczos3 ? "lanczos3" : interp == interp_core::Cubic ? "cubic" : "linear";
-}
+const char* z_kernel_name(int interp) { return interp_core::name_of(interp); }
 
 int z_kernel_context(int interp) {
     if (interp == interp_core::Linear) return 0;
