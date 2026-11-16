@@ -9,6 +9,7 @@
 #include "vc/fiber_tracer/LasagnaNormalAlignment.hpp"
 #include "vc/fiber_tracer/FiberNormalOrientation.hpp"
 #include "vc/fiber_tracer/FiberAxialAlignment.hpp"
+#include "vc/fiber_tracer/FiberStripNormals.hpp"
 #include "vc/fiber_tracer/PolylineGeometry.hpp"
 #include "vc/core/util/OrderedBatchQueue.hpp"
 #include <future>
@@ -7436,4 +7437,37 @@ TEST_CASE("Geometry-only extraction keeps every relation without a winding dista
         CHECK(std::isnan(b.windingDistance));CHECK(std::isnan(b.parallelWindingDistance));
         CHECK_FALSE(b.signedWindingDelta.has_value());
     }
+}
+
+TEST_CASE("strip normals follow a sign-free predicted axis and bridge nodes without one")
+{
+    using namespace vc::fiber_tracer;
+    // A straight fiber along x: geometry alone cannot choose the normal's angle.
+    std::vector<cv::Vec3d> points;
+    for(int i=0;i<=64;++i)points.push_back({double(i)*4.,0.,0.});
+    FiberStripNormalOptions options;
+    options.smoothingSigma=0.;options.resampleSpacing=8.;options.twistWeight=1000.;options.lateralWeight=1.;options.axisWeight=1.;
+    const auto chain=fiberStripChain(points,options);
+    REQUIRE(chain.points.size()>8);
+    // Axis targets alternate sign along the chain and are absent on the middle third.
+    std::vector<FiberStripAxisTarget> targets(chain.points.size());
+    const size_t a=chain.points.size()/3,b=2*chain.points.size()/3;
+    for(size_t k=0;k<targets.size();++k){
+        if(k>=a&&k<b)continue;
+        const double sign=k%2?-1.:1.;
+        targets[k]={cv::Vec3d(0.,sign*std::cos(0.3),sign*std::sin(0.3)),0.5};
+    }
+    const auto result=solveFiberStripNormals(points,options,&targets);
+    REQUIRE(result.normals.size()==points.size());
+    const cv::Vec3d axis(0.,std::cos(0.3),std::sin(0.3));
+    for(size_t i=0;i+1<result.normals.size();++i){
+        CHECK(std::abs(result.normals[i].dot(axis))>0.99);            // follows the axis everywhere, including the gap
+        CHECK(result.normals[i].dot(result.normals[i+1])>0.99);         // one consistent sign along the fiber
+        CHECK(std::abs(result.normals[i][0])<1e-6);                     // perpendicular to the fiber
+    }
+    // Without targets the straight fiber keeps its default angle; the axis term is what moved it.
+    const auto plain=solveFiberStripNormals(points,options);
+    CHECK(std::abs(plain.normals[32].dot(axis))<0.99);
+    std::vector<FiberStripAxisTarget> wrong(chain.points.size()-1);
+    CHECK_THROWS_AS(solveFiberStripNormals(points,options,&wrong),std::invalid_argument);
 }

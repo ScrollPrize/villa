@@ -47,6 +47,22 @@ struct LateralResidual {
     }
 };
 
+// sqrt(w_a w_i) (n(theta) - a) with the oriented axis in the vertex frame
+// (au, av, at) and n = (cos, sin, 0). The axis was oriented by the
+// geometry-only field beforehand, so the term has one minimum per node.
+struct AxisResidual {
+    double weight, au, av, at;
+    template <typename T>
+    bool operator()(const T* theta, T* residual) const
+    {
+        const T c = ceres::cos(theta[0]), s = ceres::sin(theta[0]);
+        residual[0] = T(weight) * (c - T(au));
+        residual[1] = T(weight) * (s - T(av));
+        residual[2] = T(weight) * (-T(at));
+        return true;
+    }
+};
+
 }  // namespace
 
 namespace
@@ -99,28 +115,48 @@ cv::Vec3d at(const std::vector<cv::Vec3d>& points, const std::vector<double>& ar
     return points[j - 1] + (points[j] - points[j - 1]) * f;
 }
 
-FiberStripNormalResult solveChain(const std::vector<cv::Vec3d>& points, const FiberStripNormalOptions& options);
+FiberStripNormalResult solveChain(
+    const std::vector<cv::Vec3d>& points, const FiberStripNormalOptions& options,
+    const std::vector<FiberStripAxisTarget>* targets);
+
+void validateOptions(const FiberStripNormalOptions& options)
+{
+    if (options.twistWeight < 0.0 || options.lateralWeight < 0.0 || options.axisWeight < 0.0 ||
+        options.maxIterations < 1 || options.smoothingSigma < 0.0 || options.resampleSpacing < 0.0)
+        throw std::invalid_argument("invalid fiber strip normal options");
+}
 
 }  // namespace
 
-FiberStripNormalResult solveFiberStripNormals(
-    const std::vector<cv::Vec3d>& points, const FiberStripNormalOptions& options)
+FiberStripChain fiberStripChain(const std::vector<cv::Vec3d>& points, const FiberStripNormalOptions& options)
 {
-    if (options.twistWeight < 0.0 || options.lateralWeight < 0.0 || options.maxIterations < 1 ||
-        options.smoothingSigma < 0.0 || options.resampleSpacing < 0.0)
-        throw std::invalid_argument("invalid fiber strip normal options");
-    FiberStripNormalResult result;
-    if (points.size() < 3) return result;
-    const auto arc = arcLengths(points);
-    const auto smoothed = smoothAlongArc(points, arc, options.smoothingSigma);
-    std::vector<cv::Vec3d> chain;
-    std::vector<double> chainArc;
+    validateOptions(options);
+    FiberStripChain chain;
+    if (points.size() < 3) return chain;
+    chain.vertexArc = arcLengths(points);
+    const auto smoothed = smoothAlongArc(points, chain.vertexArc, options.smoothingSigma);
     if (options.resampleSpacing > 0.0) {
-        for (double s = 0.0; s < arc.back(); s += options.resampleSpacing) { chain.push_back(at(smoothed, arc, s)); chainArc.push_back(s); }
-        chain.push_back(smoothed.back()); chainArc.push_back(arc.back());
-    } else { chain = smoothed; chainArc = arc; }
+        for (double s = 0.0; s < chain.vertexArc.back(); s += options.resampleSpacing) {
+            chain.points.push_back(at(smoothed, chain.vertexArc, s)); chain.arc.push_back(s);
+        }
+        chain.points.push_back(smoothed.back()); chain.arc.push_back(chain.vertexArc.back());
+    } else { chain.points = smoothed; chain.arc = chain.vertexArc; }
+    return chain;
+}
+
+FiberStripNormalResult solveFiberStripNormals(
+    const std::vector<cv::Vec3d>& points, const FiberStripNormalOptions& options,
+    const std::vector<FiberStripAxisTarget>* targets)
+{
+    FiberStripNormalResult result;
+    const auto chainData = fiberStripChain(points, options);
+    const auto& chain = chainData.points;
+    const auto& chainArc = chainData.arc;
+    const auto& arc = chainData.vertexArc;
     if (chain.size() < 3) return result;
-    auto solved = solveChain(chain, options);
+    if (targets && targets->size() != chain.size())
+        throw std::invalid_argument("fiber strip axis targets must match the chain points");
+    auto solved = solveChain(chain, options, targets);
     if (solved.normals.empty()) return result;
     // Normals back on the original vertices: unit interpolation along the arc.
     result = std::move(solved);
@@ -140,7 +176,8 @@ namespace
 {
 
 FiberStripNormalResult solveChain(
-    const std::vector<cv::Vec3d>& points, const FiberStripNormalOptions& options)
+    const std::vector<cv::Vec3d>& points, const FiberStripNormalOptions& options,
+    const std::vector<FiberStripAxisTarget>* targets)
 {
     FiberStripNormalResult result;
     const size_t n = points.size();
@@ -198,27 +235,46 @@ FiberStripNormalResult solveChain(
         theta[i] = target;
         previous = target;
     }
-    ceres::Problem problem;
     const double twist = std::sqrt(options.twistWeight), lateral = std::sqrt(options.lateralWeight);
-    for (size_t i = 0; i < n; ++i) problem.AddParameterBlock(&theta[i], 1);
-    for (size_t i = 0; i + 1 < n; ++i) {
-        problem.AddResidualBlock(
-            new ceres::AutoDiffCostFunction<TwistResidual, 1, 1, 1>(new TwistResidual{twist}),
-            nullptr, &theta[i], &theta[i + 1]);
-    }
-    for (size_t i = 1; i + 1 < n; ++i) {
-        problem.AddResidualBlock(
-            new ceres::AutoDiffCostFunction<LateralResidual, 1, 1>(new LateralResidual{lateral, du[i], dv[i]}),
-            nullptr, &theta[i]);
-    }
     ceres::Solver::Options solver;
     solver.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
     solver.max_num_iterations = options.maxIterations;
     solver.num_threads = 1;
     solver.logging_type = ceres::SILENT;
+    // Pass 1: geometry only. Pass 2 (with targets): the geometry field orients
+    // every axis target, then the signed axis term pulls the normals from there.
+    const bool fuse = targets && options.axisWeight > 0.0;
     ceres::Solver::Summary summary;
-    ceres::Solve(solver, &problem, &summary);
-    result.initialCost = summary.initial_cost;
+    for (int pass = 0; pass < (fuse ? 2 : 1); ++pass) {
+        ceres::Problem problem;
+        for (size_t i = 0; i < n; ++i) problem.AddParameterBlock(&theta[i], 1);
+        for (size_t i = 0; i + 1 < n; ++i) {
+            problem.AddResidualBlock(
+                new ceres::AutoDiffCostFunction<TwistResidual, 1, 1, 1>(new TwistResidual{twist}),
+                nullptr, &theta[i], &theta[i + 1]);
+        }
+        for (size_t i = 1; i + 1 < n; ++i) {
+            problem.AddResidualBlock(
+                new ceres::AutoDiffCostFunction<LateralResidual, 1, 1>(new LateralResidual{lateral, du[i], dv[i]}),
+                nullptr, &theta[i]);
+        }
+        if (pass == 1) {
+            for (size_t i = 0; i < n; ++i) {
+                const auto& target = (*targets)[i];
+                cv::Vec3d a = unit(target.axis);
+                if (!(target.weight > 0.0) || cv::norm(a) == 0.0) continue;
+                const cv::Vec3d current = u[i] * std::cos(theta[i]) + v[i] * std::sin(theta[i]);
+                if (current.dot(a) < 0.0) a = -a;
+                const double weight = std::sqrt(options.axisWeight * target.weight);
+                problem.AddResidualBlock(
+                    new ceres::AutoDiffCostFunction<AxisResidual, 3, 1>(
+                        new AxisResidual{weight, a.dot(u[i]), a.dot(v[i]), a.dot(tangent[i])}),
+                    nullptr, &theta[i]);
+            }
+        }
+        ceres::Solve(solver, &problem, &summary);
+        if (pass == 0) result.initialCost = summary.initial_cost;
+    }
     result.finalCost = summary.final_cost;
     result.iterations = static_cast<int>(summary.iterations.size());
     result.converged = summary.termination_type == ceres::CONVERGENCE ||
@@ -233,12 +289,17 @@ FiberStripNormalResult solveChain(
 
 std::vector<FiberStripNormalResult> solveFiberStripNormals(
     const std::vector<std::vector<cv::Vec3d>>& fibers,
-    const FiberStripNormalOptions& options, int threads)
+    const FiberStripNormalOptions& options, int threads,
+    const std::vector<std::vector<FiberStripAxisTarget>>* targets)
 {
+    if (targets && targets->size() != fibers.size())
+        throw std::invalid_argument("fiber strip axis targets must match the fibers");
     std::vector<FiberStripNormalResult> results(fibers.size());
     cv::parallel_for_(cv::Range(0, static_cast<int>(fibers.size())), [&](const cv::Range& range) {
-        for (int i = range.start; i < range.end; ++i)
-            results[static_cast<size_t>(i)] = solveFiberStripNormals(fibers[static_cast<size_t>(i)], options);
+        for (int i = range.start; i < range.end; ++i) {
+            const auto f = static_cast<size_t>(i);
+            results[f] = solveFiberStripNormals(fibers[f], options, targets ? &(*targets)[f] : nullptr);
+        }
     }, std::max(1, threads));
     return results;
 }

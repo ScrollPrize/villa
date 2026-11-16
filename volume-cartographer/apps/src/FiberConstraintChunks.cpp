@@ -1,5 +1,6 @@
 #include "FiberConstraintChunks.hpp"
 #include "vc/fiber_tracer/FiberStripNormals.hpp"
+#include "vc/lasagna/ChannelSampler.hpp"
 #include "ChunkSaturationWindow.hpp"
 #include "vc/fiber_tracer/PolylineGeometry.hpp"
 #include "vc/fiber_tracer/FiberNormalOrientation.hpp"
@@ -190,7 +191,7 @@ Json extractFiberConstraintChunks(const Json& cfg,Json& metadata,
     const FiberTraceConstraintConfig& extraction,
     const vc::lasagna::LasagnaNormalSampler& normals,const vc::lasagna::LasagnaNormalSampler& windings,
     const vc::core::util::Umbilicus& axis,FiberConstraintDatabaseOptions databaseOptions,
-    std::function<Json()> memorySnapshot)
+    std::function<Json()> memorySnapshot,const vc::lasagna::LasagnaChannelBinding* presence)
 {
     const auto started=Clock::now();const double size=cfg.value("chunk_size_base_voxels",defaultFiberConstraintChunkSizeBaseVoxels);
     const double spacing=cfg.value("normal_sample_spacing",4.);
@@ -216,7 +217,8 @@ Json extractFiberConstraintChunks(const Json& cfg,Json& metadata,
     for(auto& task:preparation)try{task.get();}catch(...){if(!preparationFailure)preparationFailure=std::current_exception();}
     if(preparationFailure)std::rethrow_exception(preparationFailure);
     std::unique_ptr<StripNormals> strips;
-    if(cfg.value("normal_source",std::string("lasagna"))=="geometry"){
+    const auto normalSource=cfg.value("normal_source",std::string("lasagna"));
+    if(normalSource=="geometry"||normalSource=="fused"){
         const auto stripStarted=Clock::now();
         vc::fiber_tracer::FiberStripNormalOptions options;
         options.twistWeight=cfg.value("strip_twist_weight",options.twistWeight);
@@ -226,14 +228,81 @@ Json extractFiberConstraintChunks(const Json& cfg,Json& metadata,
         options.resampleSpacing=cfg.value("strip_resample_spacing",options.resampleSpacing);
         std::vector<std::vector<cv::Vec3d>> polylines(lines.size());
         for(size_t i=0;i<lines.size();++i)polylines[i]=lines[i].pointsBaseXYZ;
-        const auto solved=vc::fiber_tracer::solveFiberStripNormals(polylines,options,int(workers));
+        // "fused": the predicted sheet axis at every chain node, weighted by the
+        // prediction's presence between presence_floor (weight 0) and
+        // presence_full (weight 1); nodes without a prediction keep weight 0.
+        std::unique_ptr<std::vector<std::vector<vc::fiber_tracer::FiberStripAxisTarget>>> targets;
+        Json fusion;
+        if(normalSource=="fused"){
+            if(!presence)throw std::invalid_argument("normal_source fused requires the prediction's presence channel");
+            options.axisWeight=cfg.value("fused_axis_weight",options.axisWeight);
+            const double floor=cfg.value("fused_presence_floor",0.);
+            const double full=cfg.value("fused_presence_full",128.);
+            if(!(full>floor)||floor<0.)throw std::invalid_argument("fused_presence_full must exceed fused_presence_floor >= 0");
+            // The prediction is sampled on the traced vertices themselves (they lie in
+            // the sheet; the smoothed chain may not) and gathered per chain node as
+            // the principal axis of the presence-weighted outer products of the
+            // vertex axes assigned to the node (nearest arc).
+            std::vector<cv::Vec3d> vertices;std::vector<std::pair<size_t,size_t>> owner;
+            std::vector<vc::fiber_tracer::FiberStripChain> chains(lines.size());
+            targets=std::make_unique<std::vector<std::vector<vc::fiber_tracer::FiberStripAxisTarget>>>(lines.size());
+            for(size_t i=0;i<lines.size();++i){
+                chains[i]=vc::fiber_tracer::fiberStripChain(polylines[i],options);
+                (*targets)[i].resize(chains[i].points.size());
+                for(size_t j=0;j<polylines[i].size();++j){vertices.push_back(polylines[i][j]);owner.push_back({i,j});}
+            }
+            std::vector<vc::lasagna::NormalSampleWithDerivative> axes;
+            (void)normals.sampleNormalBatch(vertices,false,int(workers),axes);
+            std::vector<cv::Vec3f> verticesF(vertices.begin(),vertices.end());
+            std::vector<std::vector<float>> presenceValues;
+            vc::lasagna::sampleLasagnaVectorBatch({*presence},verticesF,presenceValues,false);
+            std::vector<std::vector<cv::Matx33d>> scatter(lines.size());
+            std::vector<std::vector<double>> weightSums(lines.size());std::vector<std::vector<size_t>> counts(lines.size());
+            for(size_t i=0;i<lines.size();++i){
+                scatter[i].assign(chains[i].points.size(),cv::Matx33d::zeros());
+                weightSums[i].assign(chains[i].points.size(),0.);counts[i].assign(chains[i].points.size(),0);
+            }
+            size_t verticesWithAxis=0;
+            for(size_t j=0;j<vertices.size();++j){
+                const auto [i,vertex]=owner[j];const auto& chain=chains[i];
+                if(chain.points.empty())continue;
+                const double arc=chain.vertexArc[vertex];
+                const auto it=std::lower_bound(chain.arc.begin(),chain.arc.end(),arc);
+                size_t k=size_t(it-chain.arc.begin());
+                if(k==chain.arc.size())k=chain.arc.size()-1;
+                else if(k>0&&arc-chain.arc[k-1]<chain.arc[k]-arc)--k;
+                ++counts[i][k];
+                if(!axes[j].sample.valid||presenceValues[j].empty())continue;
+                const double w=std::clamp((double(presenceValues[j][0])-floor)/(full-floor),0.,1.);
+                if(!(w>0.))continue;
+                const cv::Vec3d a=axes[j].sample.normal;
+                scatter[i][k]+=w*cv::Matx33d(a[0]*a[0],a[0]*a[1],a[0]*a[2],a[1]*a[0],a[1]*a[1],a[1]*a[2],a[2]*a[0],a[2]*a[1],a[2]*a[2]);
+                weightSums[i][k]+=w;++verticesWithAxis;
+            }
+            size_t nodes=0,withAxis=0;double weightSum=0.;
+            for(size_t i=0;i<lines.size();++i)for(size_t k=0;k<chains[i].points.size();++k){
+                ++nodes;
+                if(!(weightSums[i][k]>0.)||!counts[i][k])continue;
+                cv::Vec3d eigenvalues;cv::Matx33d eigenvectors;
+                cv::eigen(scatter[i][k],eigenvalues,eigenvectors);
+                auto& target=(*targets)[i][k];
+                target.axis=cv::Vec3d(eigenvectors(0,0),eigenvectors(0,1),eigenvectors(0,2));
+                target.weight=weightSums[i][k]/double(counts[i][k]);
+                ++withAxis;weightSum+=target.weight;
+            }
+            fusion=Json{{"axis_weight",options.axisWeight},{"presence_floor",floor},{"presence_full",full},
+                {"vertices",vertices.size()},{"vertices_with_axis",verticesWithAxis},
+                {"chain_nodes",nodes},{"nodes_with_axis",withAxis},{"mean_axis_weight",withAxis?weightSum/withAxis:0.}};
+        }
+        const auto solved=vc::fiber_tracer::solveFiberStripNormals(polylines,options,int(workers),targets.get());
         strips=std::make_unique<StripNormals>(lines.size());
         size_t degenerate=0,unconverged=0;double cost=0;
         for(size_t i=0;i<lines.size();++i){(*strips)[i]=solved[i].normals;degenerate+=solved[i].normals.empty();unconverged+=!solved[i].normals.empty()&&!solved[i].converged;cost+=solved[i].finalCost;}
-        metadata["strip_normals"]=Json{{"twist_weight",options.twistWeight},{"lateral_weight",options.lateralWeight},
+        metadata["strip_normals"]=Json{{"source",normalSource},{"twist_weight",options.twistWeight},{"lateral_weight",options.lateralWeight},
             {"smoothing_sigma",options.smoothingSigma},{"resample_spacing",options.resampleSpacing},
             {"max_iterations",options.maxIterations},{"fibers",lines.size()},{"degenerate_fibers",degenerate},
             {"unconverged_fibers",unconverged},{"final_cost",cost},{"seconds",elapsed(stripStarted)}};
+        if(!fusion.is_null())metadata["strip_normals"]["fusion"]=fusion;
         std::cout<<"strip normals "<<metadata["strip_normals"].dump()<<std::endl;
     }
     std::map<Cell,size_t> cells;

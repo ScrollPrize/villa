@@ -198,7 +198,13 @@ int runFiberConstraintExtraction(int argc, char** argv)
     auto dataset=std::move(normalInput.dataset);
     auto provenance=std::move(normalInput.provenance);
     const auto normalSource=cfg.value("normal_source",std::string("lasagna"));
-    if(normalSource=="fiber"){
+    // "fused": the compound sheet axis, weighted by its presence, pulls the geometry
+    // strip normals (chunk pipeline). The presence channel is bound from the
+    // prediction's own manifest, which the sheet-normal view below renames.
+    const auto predictionManifest=dataset.manifest();
+    if(normalSource=="fiber"||normalSource=="fused"){
+        if(normalSource=="fused"&&!cfg.value("chunk_pipeline",true))
+            throw std::invalid_argument("normal_source fused requires the chunk pipeline");
         // Compound sheet normals carry no winding density: their validity is
         // the prediction's (chunk existence or a channel), not a measurement.
         if(!cfg.contains("orient_database") && !cfg.value("axial_prior_only",false) && !cfg.contains("winding_manifest") &&
@@ -210,7 +216,7 @@ int runFiberConstraintExtraction(int argc, char** argv)
         // still supplies the base shape and, unless winding_distances is
         // false, the winding density.
         if(!cfg.value("chunk_pipeline",true))throw std::invalid_argument("normal_source geometry requires the chunk pipeline");
-    }else if(normalSource!="lasagna")throw std::invalid_argument("normal_source must be lasagna, fiber or geometry");
+    }else if(normalSource!="lasagna")throw std::invalid_argument("normal_source must be lasagna, fiber, geometry or fused");
     if (!dataset.manifest().baseShapeZYX)
         throw std::invalid_argument("Lasagna manifest has no base shape");
     const auto baseShapeZYX=*dataset.manifest().baseShapeZYX;
@@ -360,6 +366,15 @@ int runFiberConstraintExtraction(int argc, char** argv)
         cfg.value("scoring_region_base_voxels",4096.));
     samplerOptions.windingBatchPoints=cfg.value("winding_batch_points",size_t{262144});
     const vc::lasagna::LasagnaNormalSampler normals(dataset,samplerOptions);
+    std::unique_ptr<vc::lasagna::LasagnaGroupArrays> presenceArrays;
+    std::optional<vc::lasagna::LasagnaChannelBinding> presence;
+    if(normalSource=="fused"){
+        presenceArrays=samplerOptions.memoryCache
+            ?std::make_unique<vc::lasagna::LasagnaGroupArrays>(samplerOptions.memoryCache,samplerOptions.channelCache)
+            :std::make_unique<vc::lasagna::LasagnaGroupArrays>(samplerOptions.maxCachedBytes,samplerOptions.channelCache);
+        presenceArrays->readerThreads=samplerOptions.readerThreads;
+        presence=vc::lasagna::bindLasagnaChannel(predictionManifest,"presence",*presenceArrays);
+    }
     std::unique_ptr<vc::lasagna::LasagnaNormalSampler> separateWindings;
     if(windingInput)separateWindings=std::make_unique<vc::lasagna::LasagnaNormalSampler>(windingInput->dataset,samplerOptions);
     const auto& windingSampler=separateWindings?*separateWindings:normals;
@@ -535,7 +550,7 @@ int runFiberConstraintExtraction(int argc, char** argv)
             if(cfg.value("normal_cache_profile",false))
                 snapshot["reader_stats"]={{"normals",readerStats(normals)},{"windings",readerStats(windingSampler)}};
             return snapshot;
-        });
+        },presence?&*presence:nullptr);
         if(cfg.value("saturated_chunk_benchmark",false))
             result["saturated_chunk_benchmark"]=result["chunk_pipeline"].at("benchmark");
         else result["export"]=result["chunk_pipeline"]["export"];

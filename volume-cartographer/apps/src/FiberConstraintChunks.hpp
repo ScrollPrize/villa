@@ -15,4 +15,7 @@ nlohmann::json extractFiberConstraintChunks(
     const vc::lasagna::LasagnaNormalSampler& windings,
     const vc::core::util::Umbilicus& umbilicus,
     FiberConstraintDatabaseOptions databaseOptions,
-    std::function<nlohmann::json()> memorySnapshot = {});
+    std::function<nlohmann::json()> memorySnapshot = {},
+    // normal_source "fused": the prediction's presence channel, weighting the
+    // predicted sheet axis per strip chain node.
+    const vc::lasagna::LasagnaChannelBinding* presence = nullptr);
