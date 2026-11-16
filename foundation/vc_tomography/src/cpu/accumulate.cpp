@@ -45,6 +45,17 @@ void contributor_slots(const ContributorList& c, int n_proj, std::vector<int32_t
         }
 }
 
+ColumnCachePlan column_cache_plan(const AccumScanView& s, const ContributorList& c, const AccumParams& p) {
+    ColumnCachePlan k;
+    k.measured_exact = p.measured_only && s.x_exact && (s.col_offset || s.map_cols);
+    k.use = (!p.measured_only || k.measured_exact) && !s.col_val && !c.proj.empty();
+    if (!k.use) return k;
+    contributor_slots(c, s.n_proj, k.slot, k.slot_proj);
+    k.shift = s.x_exact && (s.fract_x != 0.f || s.col_offset || s.map_cols);
+    k.stride = k.shift ? shift_row_stride(s.det_cols) : s.det_cols;
+    return k;
+}
+
 void set_x_kernel(AccumScanView& v, int interp, bool exact) {
     v.x_taps = 0;
     v.x_exact = 0;
@@ -127,13 +138,14 @@ void accumulate(const AccumScanView& view, const ContributorList& c, const Accum
     // has a lateral registration or the lateral part of a map: then its measured values are read exactly as well
     // (AccumScanView::col_wt)
     thread_local std::vector<float> col, col_wt;
-    std::vector<int32_t> slot, slot_proj;
-    const bool measured_exact = p.measured_only && s.x_exact && (s.col_offset || s.map_cols);
-    if ((!p.measured_only || measured_exact) && !s.col_val && !c.proj.empty()) {
-        contributor_slots(c, s.n_proj, slot, slot_proj);
+    const ColumnCachePlan cache = column_cache_plan(s, c, p);
+    const bool measured_exact = cache.measured_exact;
+    if (cache.use) {
+        const std::vector<int32_t>& slot = cache.slot;
+        const std::vector<int32_t>& slot_proj = cache.slot_proj;
         const int n_slots = static_cast<int>(slot_proj.size()), W = s.det_cols;
-        const bool shift = s.x_exact && (s.fract_x != 0.f || s.col_offset || s.map_cols);
-        const int stride = shift ? shift_row_stride(W) : W;
+        const bool shift = cache.shift;
+        const int stride = cache.stride;
         col.resize(static_cast<std::size_t>(n_slots) * p.H * stride);
         if (measured_exact) col_wt.resize(col.size());
         float* const values = col.data();   // (the calling thread's buffers: `col` names another in each worker)

@@ -198,6 +198,17 @@ struct AccumParams {
     float log_clip_min = 1e-6f, log_clip_max = 10.f;
 };
 
+// The column cache of a block (both backends): the vertically interpolated values of the block's projections, once
+// each. use: there is one (not measured-only gridding, unless its values are read exactly); measured_exact: the
+// measured values are read exactly (a lateral registration or map); shift: the rows are shifted exactly; stride:
+// a cached row's length; slot / slot_proj: contributor_slots.
+struct ColumnCachePlan {
+    bool use = false, measured_exact = false, shift = false;
+    int stride = 0;
+    std::vector<int32_t> slot, slot_proj;
+};
+ColumnCachePlan column_cache_plan(const AccumScanView& s, const ContributorList& c, const AccumParams& p);
+
 namespace cpu {
 // adds this scan's contributions to R, RW (L = g1 - g0, H, NX). weight2 (a second weight map of the detector, like
 // AccumScanView::weight): the same contributions with those weights are added to R2, RW2 as well (the block's rows

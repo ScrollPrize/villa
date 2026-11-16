@@ -135,13 +135,14 @@ void accumulate(const AccumScanView& view, const ContributorList& c, const Accum
     // tap of every pixel a sample lands on); measured-only gridding interpolates per corner instead, unless the scan
     // has a lateral registration or the lateral part of a map: then its measured values are read exactly as well
     // (AccumScanView::col_wt)
-    std::vector<int32_t> slot, slot_proj;
-    const bool measured_exact = p.measured_only && s.x_exact && (s.col_offset || s.map_cols);
-    if ((!p.measured_only || measured_exact) && !s.col_val) {
-        contributor_slots(c, s.n_proj, slot, slot_proj);
+    const ColumnCachePlan cache = column_cache_plan(s, c, p);
+    const bool measured_exact = cache.measured_exact;
+    if (cache.use) {
+        const std::vector<int32_t>& slot = cache.slot;
+        const std::vector<int32_t>& slot_proj = cache.slot_proj;
         const std::size_t n_slots = slot_proj.size();
-        const bool shift = s.x_exact && (s.fract_x != 0.f || s.col_offset || s.map_cols);
-        const int stride = shift ? shift_row_stride(s.det_cols) : s.det_cols;
+        const bool shift = cache.shift;
+        const int stride = cache.stride;
         d_col.ensure(n_slots * p.H * stride);
         s.col_slot = load(d_slot, slot, st);
         dim3 block(128, 1, 1), grid(grid_1d(s.det_cols, 128), p.H, static_cast<unsigned>(n_slots));
