@@ -18,6 +18,7 @@
 #include "vc/core/util/QuadSurface.hpp"
 
 #include <QAbstractItemView>
+#include <QCheckBox>
 #include <QAbstractSpinBox>
 #include <QAction>
 #include <QApplication>
@@ -519,18 +520,26 @@ public:
     // map the dialog's line positions (the current-position marker, clicks
     // on the bar) to fractions (see GeneratedOverviewAnchor); empty means the
     // plain proportional layout.
+    // Piece approval: fractions outside the open piece (drawn dimmed) and the
+    // approved / stale stretches (a thin underline).
+    struct PieceFractions {
+        std::vector<std::pair<double, double>> dimmed, approved, stale;
+    };
+
     void setLineData(size_t linePointCount,
                      std::vector<ControlDot> dots,
                      std::vector<std::pair<double, double>> gapFractionRanges,
                      std::vector<std::pair<double, double>> damagedFractionRanges,
                      std::vector<vc3d::line_annotation::GeneratedOverviewAnchor> positionAnchors,
                      std::vector<double> cumulativeArcLength,
-                     double totalArcLength)
+                     double totalArcLength,
+                     PieceFractions pieces = {})
     {
         _linePointCount = linePointCount;
         _dots = std::move(dots);
         _gapFractionRanges = std::move(gapFractionRanges);
         _damagedFractionRanges = std::move(damagedFractionRanges);
+        _pieces = std::move(pieces);
         _anchors = std::move(positionAnchors);
         _cumulativeArcLength = std::move(cumulativeArcLength);
         _totalArcLength = totalArcLength;
@@ -622,6 +631,23 @@ protected:
             painter.setPen(basePen);
             painter.drawLine(QPointF(cursorX, midY), QPointF(lineEndX, midY));
         }
+        // Outside the open piece: the baseline at half intensity over
+        // whatever piece style lies there.
+        painter.setPen(QPen(QColor(0, 0, 0, 140), 3.0));
+        for (const auto& [first, second] : _pieces.dimmed) {
+            if (std::isfinite(first) && std::isfinite(second) && second > first)
+                painter.drawLine(QPointF(xForFraction(first), midY), QPointF(xForFraction(second), midY));
+        }
+        // Approved (green) and stale (amber) stretches: an underline.
+        const auto underline = [&](const std::vector<std::pair<double, double>>& ranges, const QColor& color) {
+            painter.setPen(QPen(color, 2.0));
+            for (const auto& [first, second] : ranges) {
+                if (std::isfinite(first) && std::isfinite(second) && second > first)
+                    painter.drawLine(QPointF(xForFraction(first), midY + 5.0), QPointF(xForFraction(second), midY + 5.0));
+            }
+        };
+        underline(_pieces.approved, QColor(60, 220, 110));
+        underline(_pieces.stale, QColor(255, 180, 40));
 
         if (std::isfinite(_currentPosition)) {
             painter.setPen(QPen(_currentColor, 2.0));
@@ -701,6 +727,7 @@ private:
     double _totalArcLength = 0.0;
     std::vector<std::pair<double, double>> _gapFractionRanges;
     std::vector<std::pair<double, double>> _damagedFractionRanges;
+    PieceFractions _pieces;
     double _currentPosition = std::numeric_limits<double>::quiet_NaN();
     QColor _currentColor{0, 245, 255};
 };
@@ -1194,6 +1221,20 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
     _enableEditingButton->hide();
     buttonLayout->addWidget(_enableEditingButton);
     connect(_enableEditingButton, &QPushButton::clicked, this, &LineAnnotationDialog::editingRequested);
+    // Piece approval: two checkboxes, shown while a piece is open.
+    const auto makeApprovalBox = [&](const QString& text, const char* objectName, int aspect) {
+        auto* box = new QCheckBox(text, buttonRow);
+        box->setObjectName(QLatin1String(objectName));
+        box->setToolTip(tr("Approval of the open piece of this fiber (stored with your name and the time)."));
+        box->hide();
+        buttonLayout->addWidget(box);
+        connect(box, &QCheckBox::clicked, this, [this, aspect](bool checked) {
+            emit pieceApprovalChangeRequested(aspect, checked);
+        });
+        return box;
+    };
+    _pieceApprovedBox = makeApprovalBox(tr("Approved"), "lineAnnotationPieceApproved", 0);
+    _pieceNormalApprovedBox = makeApprovalBox(tr("Normal approved"), "lineAnnotationPieceNormalApproved", 1);
     _fiberNameLabel = new QLabel(buttonRow);
     _fiberNameLabel->setObjectName(QStringLiteral("lineAnnotationFiberNameLabel"));
     _fiberNameLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
@@ -2186,6 +2227,33 @@ void LineAnnotationDialog::setFiberTags(const std::vector<std::string>& knownTag
     _tagRowLayout->addWidget(addButton);
 }
 
+void LineAnnotationDialog::setPieceLockDisplay(const vc3d::line_annotation::PieceDisplayRanges& ranges,
+                                               const std::vector<size_t>& lockControls,
+                                               const vc3d::line_annotation::PieceApprovalBoxState& boxes,
+                                               bool editable)
+{
+    const bool changedRanges = ranges.dimmed != _pieceRanges.dimmed || ranges.approved != _pieceRanges.approved ||
+                               ranges.stale != _pieceRanges.stale || lockControls != _pieceLockControls;
+    _pieceRanges = ranges;
+    _pieceLockControls = lockControls;
+    _generatedViews.dimmedLineRanges = ranges.dimmed;
+    const auto apply = [&](QCheckBox* box, int aspect, const QString& text) {
+        if (!box) return;
+        const QSignalBlocker blocker(box);
+        box->setVisible(boxes.pieceOpen);
+        box->setEnabled(boxes.pieceOpen && editable);
+        box->setChecked(boxes.approved[size_t(aspect)]);
+        box->setText(boxes.stale[size_t(aspect)] ? text + tr(" (stale)") : text);
+    };
+    apply(_pieceApprovedBox, 0, tr("Approved"));
+    apply(_pieceNormalApprovedBox, 1, tr("Normal approved"));
+    if (changedRanges && _hasGeneratedViews) {
+        rebuildGeneratedOverlays();
+        _overviewLayoutDirty = true;
+        updateOverviewBar();
+    }
+}
+
 void LineAnnotationDialog::setCloseAfterFinalizationAllowed(bool allowed)
 {
     _closeAfterFinalizationAllowed = allowed;
@@ -2619,6 +2687,7 @@ bool LineAnnotationDialog::setGeneratedLineViews(
         const double previousLinePosition = _currentLinePosition;
         const float previousDisplayTangentSign = _displayTangentSign;
         _generatedViews = std::move(views);
+        _generatedViews.dimmedLineRanges = _pieceRanges.dimmed;
         invalidateStripContextIndex();
         noteDisplayedLineControls();
         _displayTangentSign = vc3d::line_annotation::generatedDisplayTangentSign(
@@ -2679,6 +2748,7 @@ bool LineAnnotationDialog::setGeneratedLineViews(
             !updateSidePlaneSurface(_generatedViews.sideCutSurface.get(),
                                     _currentLinePosition)) {
             _generatedViews = _heldGeneratedViews;
+            _generatedViews.dimmedLineRanges = _pieceRanges.dimmed;
             invalidateStripContextIndex();
             // The held controls may be a provisional publish; the line-space
             // bookkeeping is restored from its own snapshot.
@@ -2888,6 +2958,7 @@ bool LineAnnotationDialog::setGeneratedLineViews(
     _generatedTopWidget = nullptr;
 
     _generatedViews = views;
+    _generatedViews.dimmedLineRanges = _pieceRanges.dimmed;
     invalidateStripContextIndex();
     // Freshly built views (a new fiber, or panes rebuilt from scratch): the
     // settled layout, if any, belonged to the previous geometry.
@@ -3485,6 +3556,13 @@ LineAnnotationDialog::showGeneratedControlPointContextMenu(
     };
     options.setBreak = [this, surfaceName](size_t controlPointIndex, bool enabled) {
         emit generatedControlPointBreakChangeRequested(surfaceName, controlPointIndex, enabled);
+    };
+    options.setLock = [this, surfaceName](size_t controlPointIndex, bool enabled) {
+        emit generatedControlPointLockChangeRequested(surfaceName, controlPointIndex, enabled);
+    };
+    options.openPiece = [this, surfaceName](vc3d::line_annotation::GeneratedPieceEnd a,
+                                            vc3d::line_annotation::GeneratedPieceEnd b) {
+        emit generatedPieceOpenRequested(surfaceName, a, b);
     };
     const auto result = vc3d::line_annotation::showGeneratedControlPointContextMenu(options);
     if (!self) {
@@ -6771,15 +6849,38 @@ void LineAnnotationDialog::rebuildOverviewBarLayout()
             dot.dottedEdge = true;
             dot.radius += 1.0;
         }
+        if (control.isLock && !control.isLinkCandidate) {
+            // A lock control point of an approval piece: light grey ring.
+            dot.edge = QColor(235, 235, 235);
+            dot.radius += 1.0;
+        }
         dots.push_back(dot);
     }
+    // Piece approval ranges, in the same fractions as the current marker.
+    LineAnnotationOverviewBar::PieceFractions pieceFractions;
+    const auto toFractions = [&](const std::vector<std::pair<double, double>>& ranges) {
+        std::vector<std::pair<double, double>> result;
+        for (const auto& [first, second] : ranges) {
+            const auto fractionOf = [&](double position) {
+                return vc3d::line_annotation::generatedOverviewFraction(
+                    positionAnchors, vc3d::line_annotation::generatedArcLengthAt(cumulativeArcLength, position),
+                    totalArcLength);
+            };
+            result.emplace_back(fractionOf(first), fractionOf(second));
+        }
+        return result;
+    };
+    pieceFractions.dimmed = toFractions(_pieceRanges.dimmed);
+    pieceFractions.approved = toFractions(_pieceRanges.approved);
+    pieceFractions.stale = toFractions(_pieceRanges.stale);
     bar->setLineData(_generatedViews.linePoints.size(),
                      std::move(dots),
                      std::move(gapPieces),
                      std::move(damagedPieces),
                      positionAnchors,
                      cumulativeArcLength,
-                     totalArcLength);
+                     totalArcLength,
+                     std::move(pieceFractions));
 }
 
 void LineAnnotationDialog::updateOverviewBar()

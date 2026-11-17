@@ -1,5 +1,6 @@
 #pragma once
 
+#include "LineAnnotationPieceLock.hpp"
 #include <QMainWindow>
 #include <QElapsedTimer>
 #include <QList>
@@ -36,6 +37,7 @@ class QGraphicsRectItem;
 class QGraphicsSimpleTextItem;
 class QLabel;
 class QPushButton;
+class QCheckBox;
 class QPlainTextEdit;
 class QMdiArea;
 class QMdiSubWindow;
@@ -222,6 +224,13 @@ public:
     void setFiberTags(const std::vector<std::string>& knownTags,
                       const std::vector<std::string>& activeTags,
                       bool enabled);
+    // Piece approval display (LineAnnotationPieceLock.hpp): the dimmed and
+    // approved/stale line ranges, the lock control points, and the two
+    // approval checkboxes' state (shown only while a piece is open).
+    void setPieceLockDisplay(const vc3d::line_annotation::PieceDisplayRanges& ranges,
+                             const std::vector<size_t>& lockControls,
+                             const vc3d::line_annotation::PieceApprovalBoxState& boxes,
+                             bool editable);
     void setCloseAfterFinalizationAllowed(bool allowed);
     // A stored fiber opens read-only with an Enable editing button (disabled
     // when canEdit is false); the fiber settings are locked meanwhile.
@@ -283,6 +292,12 @@ signals:
                                      size_t firstControlPointIndex,
                                      size_t secondControlPointIndex,
                                      bool linkHalves);
+    void generatedControlPointLockChangeRequested(const std::string& surfaceName,
+                                                  size_t controlPointIndex,
+                                                  bool enabled);
+    void generatedPieceOpenRequested(const std::string& surfaceName,
+                                     vc3d::line_annotation::GeneratedPieceEnd a,
+                                     vc3d::line_annotation::GeneratedPieceEnd b);
     void generatedSpanGapChangeRequested(const std::string& surfaceName,
                                          size_t firstControlPointIndex,
                                          size_t secondControlPointIndex,
@@ -326,6 +341,8 @@ signals:
     void fiberFollowSettingsChanged();
     void fiberFollowConfidenceChanged();
     void fiberTagChangeRequested(const QString& tag, bool enabled);
+    // aspect: 0 geometry ("Approved"), 1 normals ("Normal approved").
+    void pieceApprovalChangeRequested(int aspect, bool approved);
     void closeFinalizationRequested(QCloseEvent* event);
     void reoptimizationModeChanged(LineAnnotationDialog::ReoptimizationMode mode);
     void fiberOptimizationModeChanged(
@@ -657,6 +674,10 @@ private:
     QSpinBox* _maxControlPointExtrapolationDistanceSpin = nullptr;
     QLabel* _fiberNameLabel = nullptr;
     QPushButton* _enableEditingButton = nullptr;
+    QCheckBox* _pieceApprovedBox = nullptr;
+    QCheckBox* _pieceNormalApprovedBox = nullptr;
+    vc3d::line_annotation::PieceDisplayRanges _pieceRanges;
+    std::vector<size_t> _pieceLockControls;
     bool _readOnly = false;
     QPointer<QLabel> _optimizationStatusLabel;
     bool _optimizationStatusOptimized = false;

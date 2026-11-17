@@ -1,5 +1,6 @@
 #pragma once
 
+#include "LineAnnotationPieceLock.hpp"
 #include <QFutureWatcher>
 #include <QGraphicsView>
 #include <QHash>
@@ -128,6 +129,9 @@ public:
 
 signals:
     void openFiberAtControlPointRequested(uint64_t fiberId, int controlPointIndex);
+    // "Open piece from control point ... to ...": the fiber as an approval
+    // piece (LineAnnotationPieceLock.hpp).
+    void openFiberPieceRequested(uint64_t fiberId, vc3d::line_annotation::PiecePlan plan);
 
 public:
     // Everything the rebuild worker consumes and produces, owned BY the job

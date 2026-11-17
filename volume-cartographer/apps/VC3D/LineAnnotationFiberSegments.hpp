@@ -514,6 +514,14 @@ struct FiberModeOptimizationRequest {
     std::optional<std::vector<size_t>> dirtySegments;
     bool globalGoalsOnly = false;
     bool retraceAll = false;
+    // Spans fixed by piece approvals (LineAnnotationPieceLock.hpp): never
+    // attempted, their base geometry kept whatever the dirty set or a
+    // whole-line pass asks for.
+    std::vector<size_t> lockedSpans;
+    // Keep the base line's open tail on this side (the side is locked)
+    // instead of re-tracing or regrowing it.
+    bool retainLeftTail = false;
+    bool retainRightTail = false;
     // Ordinary line annotation retains open geometry outside the controls.
     // Spiral 2D annotation uses the controls as inclusive bounds.
     bool retainOpenTails = true;

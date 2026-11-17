@@ -355,9 +355,16 @@ std::string applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
     // A damaged span: the same dashes in the pastel pink.
     ViewerOverlayControllerBase::OverlayStyle damagedLineStyle = gapLineStyle;
     damagedLineStyle.penColor = generatedDamagedColor(230);
+    // Outside the open approval piece: the fiber's line at half intensity.
+    ViewerOverlayControllerBase::OverlayStyle dimmedLineStyle = lineStyle;
+    dimmedLineStyle.penColor = QColor(lineStyle.penColor.red() / 2, lineStyle.penColor.green() / 2,
+                                      lineStyle.penColor.blue() / 2, lineStyle.penColor.alpha());
     // Which of the fiber's span styles a stretch of line takes.
-    enum class SpanStyle { Line, Gap, Damaged };
+    enum class SpanStyle { Line, Gap, Damaged, Dimmed };
     const auto spanStyleAt = [&overlay](double previousLinePosition, double currentLinePosition) {
+        if (generatedLineSegmentInGap(previousLinePosition, currentLinePosition, overlay.dimmedLineRanges)) {
+            return SpanStyle::Dimmed;
+        }
         if (generatedLineSegmentInGap(previousLinePosition, currentLinePosition, overlay.gapLineRanges)) {
             return SpanStyle::Gap;
         }
@@ -384,6 +391,10 @@ std::string applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
             primitives.push_back(ViewerOverlayControllerBase::LineStripPrimitive{
                 std::move(points), false, lineStyle});
             break;
+        case SpanStyle::Dimmed:
+            primitives.push_back(ViewerOverlayControllerBase::LineStripPrimitive{
+                std::move(points), false, dimmedLineStyle});
+            break;
         }
     };
     const auto pushStyledSurfaceStrip = [&](float x0, float x1, float y, SpanStyle spanStyle) {
@@ -400,6 +411,10 @@ std::string applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
         case SpanStyle::Line:
             primitives.push_back(ViewerOverlayControllerBase::SurfaceLineStripPrimitive{
                 points, false, lineStyle});
+            break;
+        case SpanStyle::Dimmed:
+            primitives.push_back(ViewerOverlayControllerBase::SurfaceLineStripPrimitive{
+                points, false, dimmedLineStyle});
             break;
         }
     };
@@ -514,6 +529,11 @@ std::string applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
             if (!linked) {
                 style.brushColor = Qt::transparent;
             }
+        }
+        if (control.isLock && !control.isLinkCandidate) {
+            // Light grey ring: a lock control point of an approval piece.
+            style.penColor = QColor(235, 235, 235, 245);
+            style.penWidth = 2.5;
         }
         return style;
     };
@@ -658,7 +678,13 @@ std::string applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
                 };
                 collectPieces(overlay.gapLineRanges, SpanStyle::Gap);
                 collectPieces(overlay.damagedLineRanges, SpanStyle::Damaged);
-                std::sort(pieces.begin(), pieces.end());
+                // Dimmed pieces come first at equal x so they win the cursor
+                // sweep over a gap or damaged span they contain.
+                collectPieces(overlay.dimmedLineRanges, SpanStyle::Dimmed);
+                std::stable_sort(pieces.begin(), pieces.end(), [](const StyledPiece& a, const StyledPiece& b) {
+                    if (a.x0 != b.x0) return a.x0 < b.x0;
+                    return a.spanStyle == SpanStyle::Dimmed && b.spanStyle != SpanStyle::Dimmed;
+                });
                 float cursorX = lineStartX;
                 for (const auto& piece : pieces) {
                     if (piece.x0 > cursorX) {
@@ -1044,6 +1070,22 @@ std::function<bool(QAction*)> appendGeneratedSpanContextActions(
         damagedAction->setEnabled(!blocked);
     }
 
+    // Piece approval: a new piece whose one end is a lock control inserted at
+    // the clicked line position, the other a lock control or a fiber end.
+    std::vector<std::pair<QAction*, GeneratedPieceEnd>> pieceActions;
+    if (options.openPiece && std::isfinite(options.linePosition)) {
+        QMenu* pieceMenu = menu.addMenu(QWidget::tr("New piece from here to"));
+        for (const auto* control : sortedControls) {
+            if (!control->isLock) continue;
+            GeneratedPieceEnd end; end.controlIndex = control->controlIndex;
+            pieceActions.emplace_back(pieceMenu->addAction(QWidget::tr("lock CP %1").arg(control->controlIndex)), end);
+        }
+        GeneratedPieceEnd start; start.fiberStart = true;
+        pieceActions.emplace_back(pieceMenu->addAction(QWidget::tr("the fiber start")), start);
+        GeneratedPieceEnd finish; finish.fiberEnd = true;
+        pieceActions.emplace_back(pieceMenu->addAction(QWidget::tr("the fiber end")), finish);
+    }
+
     QAction* splitAction = nullptr;
     QAction* splitAndLinkAction = nullptr;
     if (options.splitSpan) {
@@ -1083,6 +1125,12 @@ std::function<bool(QAction*)> appendGeneratedSpanContextActions(
         }
         if (splitAndLinkAction && selected == splitAndLinkAction && splitAndLinkAction->isEnabled()) {
             options.splitSpan(owner.controlIndex, next.controlIndex, true);
+            return true;
+        }
+        for (const auto& [action, end] : pieceActions) {
+            if (selected != action) continue;
+            GeneratedPieceEnd here; here.linePosition = options.linePosition;
+            options.openPiece(here, end);
             return true;
         }
         return false;
@@ -1657,6 +1705,28 @@ GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
         breakAction->setEnabled(enabled);
     }
 
+    // Piece approval: the lock tag, and opening a piece from this point.
+    QAction* lockAction = nullptr;
+    std::vector<std::pair<QAction*, GeneratedPieceEnd>> pieceActions;
+    if (options.setLock) {
+        lockAction = menu.addAction(QWidget::tr("Lock control point"));
+        lockAction->setCheckable(true);
+        lockAction->setChecked(selectedControl.isLock);
+        lockAction->setEnabled(haveControlIndex);
+    }
+    if (options.openPiece && haveControlIndex) {
+        QMenu* pieceMenu = menu.addMenu(QWidget::tr("Open piece from this control point to"));
+        for (const auto& other : options.controlPoints) {
+            if (!other.isLock || other.controlIndex == selectedControlIndex) continue;
+            GeneratedPieceEnd end; end.controlIndex = other.controlIndex;
+            pieceActions.emplace_back(pieceMenu->addAction(QWidget::tr("lock CP %1").arg(other.controlIndex)), end);
+        }
+        GeneratedPieceEnd start; start.fiberStart = true;
+        pieceActions.emplace_back(pieceMenu->addAction(QWidget::tr("the fiber start")), start);
+        GeneratedPieceEnd finish; finish.fiberEnd = true;
+        pieceActions.emplace_back(pieceMenu->addAction(QWidget::tr("the fiber end")), finish);
+    }
+
     // Section 3: new annotations at the clicked location (not the point).
     menu.addSeparator();
     clickActions.addNewAnnotations(menu, options);
@@ -1692,6 +1762,16 @@ GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
     }
     if (breakAction && selected == breakAction && breakAction->isEnabled()) {
         options.setBreak(selectedControlIndex, !selectedControl.isBreak);
+        return GeneratedControlPointContextResult::Handled;
+    }
+    if (lockAction && selected == lockAction && lockAction->isEnabled()) {
+        options.setLock(selectedControlIndex, !selectedControl.isLock);
+        return GeneratedControlPointContextResult::Handled;
+    }
+    for (const auto& [action, end] : pieceActions) {
+        if (selected != action) continue;
+        GeneratedPieceEnd here; here.controlIndex = selectedControlIndex;
+        options.openPiece(here, end);
         return GeneratedControlPointContextResult::Handled;
     }
     for (const auto& [action, branch] : openBranchActions) {

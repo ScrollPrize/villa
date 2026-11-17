@@ -90,6 +90,7 @@ set(srcs
     LineAnnotationController.cpp
     LineAnnotationController.hpp
     LineAnnotationFiberSegments.cpp
+    LineAnnotationPieceLock.cpp
     LineAnnotationStructuralEdits.cpp
     LineAnnotationFiberSegments.hpp
     LineAnnotationDialog.cpp

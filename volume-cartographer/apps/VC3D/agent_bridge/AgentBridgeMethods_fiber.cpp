@@ -81,6 +81,58 @@ void AgentBridgeServer::registerFiberHandlers()
         },
         [this](const QJsonValue& p) { return handleFiberOpen(p); });
 
+    const auto pieceEnd = [](const QString& name) {
+        return Params::requiredObject(
+            name,
+            {
+                Params::optionalNumber(QStringLiteral("controlPointId")),
+                nonNegativeIndex(QStringLiteral("lineIndex")),
+                Params::optionalBoolean(QStringLiteral("fiberEnd"), false),
+            });
+    };
+    registerMethod(
+        {
+            .name = QStringLiteral("fiber.open_piece"),
+            .params = {
+                fiberId(QStringLiteral("fiberId")),
+                pieceEnd(QStringLiteral("a")),
+                pieceEnd(QStringLiteral("b")),
+                Params::optionalBoolean(QStringLiteral("editable"), false),
+            },
+            .errors = {-32602, -32000, -32010, -32007, -32005},
+            .mcp = Mcp::snakeCase(QStringLiteral("vc3d_fiber_open_piece")),
+        },
+        [this](const QJsonValue& p) { return handleFiberOpenPiece(p); });
+
+    registerMethod(
+        {
+            .name = QStringLiteral("fiber.approve_piece"),
+            .params = {
+                fiberId(QStringLiteral("fiberId")),
+                Params::optionalStringEnum(
+                    QStringLiteral("aspect"),
+                    {QStringLiteral("geometry"), QStringLiteral("normals")},
+                    QStringLiteral("geometry")),
+                Params::optionalBoolean(QStringLiteral("approved"), true),
+            },
+            .errors = {-32602, -32000, -32010, -32007, -32005},
+            .mcp = Mcp::snakeCase(QStringLiteral("vc3d_fiber_approve_piece")),
+        },
+        [this](const QJsonValue& p) { return handleFiberApprovePiece(p); });
+
+    registerMethod(
+        {
+            .name = QStringLiteral("fiber.lock_cp"),
+            .params = {
+                fiberId(QStringLiteral("fiberId")),
+                nonNegativeIndex(QStringLiteral("controlPointIndex")),
+                Params::optionalBoolean(QStringLiteral("enabled"), true),
+            },
+            .errors = {-32602, -32000, -32010, -32007, -32005},
+            .mcp = Mcp::snakeCase(QStringLiteral("vc3d_fiber_lock_cp")),
+        },
+        [this](const QJsonValue& p) { return handleFiberLockControlPoint(p); });
+
     registerMethod(
         {
             .name = QStringLiteral("fiber.set_follow"),

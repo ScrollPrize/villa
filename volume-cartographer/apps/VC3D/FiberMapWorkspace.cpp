@@ -4274,6 +4274,33 @@ void FiberMapWorkspace::handleControlPointMenu(const QPointF& scenePos, const QP
                 }
                 emit openFiberAtControlPointRequested(fiberId, bestIndex);
             });
+        // Piece approval: open the fiber as a piece from this control point
+        // to another lock control point or a fiber end.
+        if (const auto controls = _controller ? _controller->storedControlSummaries(fiberId)
+                                              : std::vector<LineAnnotationController::StoredControlSummary>{};
+            size_t(bestIndex) < controls.size() && controls[size_t(bestIndex)].storeId >= 0) {
+            QMenu* pieceMenu = menu.addMenu(tr("Open piece from control point %1 to").arg(bestIndex));
+            const auto addPiece = [&](const QString& label, vc3d::line_annotation::PiecePlanEnd other, bool otherFirst) {
+                QAction* pieceAction = pieceMenu->addAction(label);
+                vc3d::line_annotation::PiecePlan plan;
+                vc3d::line_annotation::PiecePlanEnd here;
+                here.storeId = controls[size_t(bestIndex)].storeId;
+                // Ends in line order: a fiber start comes first, a fiber end last.
+                plan.a = otherFirst ? other : here;
+                plan.b = otherFirst ? here : other;
+                connect(pieceAction, &QAction::triggered, this, [this, fiberId, plan]() {
+                    emit openFiberPieceRequested(fiberId, plan);
+                });
+            };
+            for (const auto& control : controls) {
+                if (int(control.index) == bestIndex || control.storeId < 0 || !control.lock) continue;
+                vc3d::line_annotation::PiecePlanEnd end; end.storeId = control.storeId;
+                addPiece(tr("lock control point %1").arg(control.index), end, int(control.index) < bestIndex);
+            }
+            vc3d::line_annotation::PiecePlanEnd fiberEnd; fiberEnd.fiberEnd = true;
+            addPiece(tr("the fiber start"), fiberEnd, true);
+            addPiece(tr("the fiber end"), fiberEnd, false);
+        }
         menu.addSeparator();
     }
     if (_selectedFibers.size() == 2) {

@@ -1032,6 +1032,59 @@ are optional for typed geometry; when present, descriptors and their diagnostics
 are validated. A descriptor on the final control point is invalid. Evaluation
 that depends on trace provenance requires the per-span descriptors.
 
+## Piece approval and lock control points
+
+A reviewer approves *pieces* of a fiber instead of the whole fiber. The store
+side (rows, fingerprints, validity) is `vc_object_store/docs/fiber-piece-approval.md`;
+the session side is `apps/VC3D/LineAnnotationPieceLock.hpp`.
+
+- A **piece** runs between two **lock control points** (ordinary control
+  points with the `lock` tag and an explicit direction), or from one lock to the
+  fiber end. The splitting of fibers into pieces is not VC3D's job; it takes
+  the lock points as given and can add them on demand.
+- **Opening a piece** (`openFiberPiece`, the Fiber Map's "Open piece from
+  control point ... to ...", the CP menu's "Open piece from this control point
+  to", the span menu's "New piece from here to", the bridge's
+  `fiber.open_piece`) opens the whole fiber focused on the piece's lower end.
+  Everything outside the piece, tails included, is drawn at half intensity in
+  the strips, the cuts and the overview bar and cannot be edited. A plan end
+  that names a line position inserts a lock control exactly on that line point
+  (tangent direction, the enclosing span's descriptor on both halves); an
+  existing control is tagged instead. Those changes live in the session only:
+  **opening a piece and leaving without an edit writes nothing**.
+- **The first edit** inside the piece releases the save hold. Its save commits
+  the lock controls and, in the same transaction, crops every live approval
+  reaching into the piece to its part outside (a row entirely inside is
+  revoked). The overlap taken over this way needs the new piece's approval.
+- **Lock set.** With a piece open: every span outside it and every lock-tagged
+  control. Opened normally: the spans approved by current rows (geometry
+  aspect) and, for display-normal edits, those approved for normals, plus every
+  lock-tagged control. CP placement, moves, deletes, direction and tag edits,
+  interpolation goals, splits and merges that would dirty a locked span or
+  touch a lock control are refused with the approver's name and time; the
+  way to change an approved stretch is to open its piece. The solver never
+  attempts a locked span (`FiberModeOptimizationRequest::lockedSpans`, also in
+  whole-line passes) and keeps the base line's tail on a locked side
+  (`retainLeftTail` / `retainRightTail`). The commit refuses a save whose
+  locked spans (or, with a piece open, anything outside it) changed, so bridge
+  and script paths cannot bypass the predicate.
+- **Approving** is the "Approved" / "Normal approved" checkbox in the top bar
+  (enabled with editing on, no solve running) or `fiber.approve_piece`: the
+  session is saved first, then one row is appended expecting the saved
+  version. A row some spans of which no longer match shows as "(stale)" and
+  unchecked. Unchecking appends a revocation. The overview bar underlines
+  approved stretches green and stale ones amber; lock controls draw a light
+  grey ring.
+- **Lock release.** A lock control no live row references any more (its rows
+  were revoked or cropped away) loses its tag at the session's next save, keeping
+  its direction. "Lock control point" in the CP menu (and `fiber.lock_cp`)
+  toggles the tag by hand; unlocking a control an approval references, or one
+  that bounds the open piece, is refused.
+- **Split and merge** copy the approvals of the retired fiber into the new fiber
+  that received all of a piece's control points; a piece cut by a split is
+  dropped.
+- Approvals are not consumed by the Fiber Map or Spiral inputs yet.
+
 ## Database persistence
 
 VC3D uses the database's checked transactions, geometry edit APIs, relationships

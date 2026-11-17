@@ -93,6 +93,9 @@ commits a checked action; a link is one shared edge, so changing it never rewrit
 the fiber at the other end. Opening a fiber in Line Annotation reads it and its
 linked peers in one snapshot. Whole-store tools (detailed export, the fiber map)
 query the whole store when they run.
+Pieces of a fiber can be approved separately; the lock control points, the
+locked spans and the approval rows are described in
+[line_annotation_fibers.md](line_annotation_fibers.md#piece-approval-and-lock-control-points).
 
 VC3D queries in the active volume's voxels through the store's volume target
 (`ObjectSelection::volume`, `RegionOptions::volume`), which spans every
