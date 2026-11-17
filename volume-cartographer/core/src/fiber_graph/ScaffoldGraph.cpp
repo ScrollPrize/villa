@@ -51,7 +51,8 @@ std::string declaredVolume(const std::vector<objects::ObjectRecord>& records)
     return volume;
 }
 
-int statedHandedness(const objects::StoreReader& reader, const std::string& volume)
+// The handedness the store's umbilicus objects state, or nullopt.
+std::optional<int> statedHandedness(const objects::StoreReader& reader, const std::string& volume)
 {
     std::optional<int> stated;
     for (const auto& record : objects::volumeUmbilici(reader, volume)) {
@@ -67,10 +68,7 @@ int statedHandedness(const objects::StoreReader& reader, const std::string& volu
             throw std::invalid_argument("scaffold graph: umbilicus objects state different winding handedness values");
         stated = value;
     }
-    if (!stated)
-        throw std::invalid_argument("scaffold graph: the store states no winding handedness; tag the umbilicus object "
-                                    "with winding_handedness, or pass the handedness explicitly");
-    return *stated;
+    return stated;
 }
 
 std::optional<geometry::Point> anchorPosition(const objects::Anchor& anchor)
@@ -94,8 +92,9 @@ ScaffoldGraph loadScaffoldGraph(const objects::StoreReader& reader, const Scaffo
 {
     if (!std::isfinite(options.scale) || options.scale <= 0)
         throw std::invalid_argument("scaffold graph: target scale must be finite and positive");
-    if (options.handedness && *options.handedness != 1 && *options.handedness != -1)
-        throw std::invalid_argument("scaffold graph: winding handedness must be +1 or -1");
+    for (const auto& value : {options.handedness, options.fallbackHandedness})
+        if (value && *value != 1 && *value != -1)
+            throw std::invalid_argument("scaffold graph: winding handedness must be +1 or -1");
 
     ScaffoldGraph graph;
     graph.seamAngle = options.seamAngle;
@@ -107,7 +106,19 @@ ScaffoldGraph loadScaffoldGraph(const objects::StoreReader& reader, const Scaffo
     const auto records = reader.selectObjects(selection);
     graph.report.fiberRecords = std::int64_t(records.size());
     graph.volume = options.volume.empty() ? declaredVolume(records) : options.volume;
-    graph.handedness = options.handedness ? *options.handedness : statedHandedness(reader, graph.volume);
+    if (options.handedness) {
+        graph.handedness = *options.handedness;
+        graph.report.handednessSource = ScaffoldHandednessSource::Option;
+    } else if (const auto stated = statedHandedness(reader, graph.volume)) {
+        graph.handedness = *stated;
+        graph.report.handednessSource = ScaffoldHandednessSource::Store;
+    } else if (options.fallbackHandedness) {
+        graph.handedness = *options.fallbackHandedness;
+        graph.report.handednessSource = ScaffoldHandednessSource::Fallback;
+    } else {
+        throw std::invalid_argument("scaffold graph: the store states no winding handedness; tag the umbilicus object "
+                                    "with winding_handedness, or pass the handedness explicitly");
+    }
 
     // Accept the fibers whose stored family the caller asked for, in the
     // store's UUID order: that order is the solve's node order.

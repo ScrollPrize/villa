@@ -108,17 +108,27 @@ std::int64_t otherEnd(const ScaffoldConstraint& constraint, std::int64_t fiber)
     return constraint.a == fiber ? constraint.b : constraint.a;
 }
 
-// The control-point index range covering an arc interval.
+// The controls bracketing an arc interval, outward: the stretch covers the
+// spans [controlFrom, controlTo - 1], and a piece opened between those two
+// controls contains it. A fiber without control points keeps -1.
 void controlRange(const ScaffoldGraph& graph, const ScaffoldGeometry& geometry, ScaffoldPiece& piece)
 {
     const auto& fiber = graph.fibers.at(std::size_t(piece.fiber));
+    const auto controls = fiber.content.controlIds.size();
+    if (controls == 0) return;
     const double low = std::min(piece.arcFrom, piece.arcTo), high = std::max(piece.arcFrom, piece.arcTo);
-    for (std::size_t control = 0; control < fiber.content.controlIds.size(); ++control) {
+    piece.controlFrom = 0;
+    piece.controlTo = std::int64_t(controls) - 1;
+    for (std::size_t control = 0; control < controls; ++control) {
         const double arc = geometry.controlArc(std::size_t(piece.fiber), control);
-        if (arc < low || arc > high) continue;
-        if (piece.controlFrom < 0) piece.controlFrom = std::int64_t(control);
-        piece.controlTo = std::int64_t(control);
+        if (arc <= low) piece.controlFrom = std::int64_t(control);
+        if (arc >= high) {
+            piece.controlTo = std::int64_t(control);
+            break;
+        }
     }
+    if (piece.controlTo <= piece.controlFrom)
+        piece.controlTo = std::min(piece.controlFrom + 1, std::int64_t(controls) - 1);
 }
 
 struct PathSearch {

@@ -63,9 +63,13 @@ struct ScaffoldLink {
     std::string approvalState;
 };
 
+// Where the winding handedness came from, so a run can state it.
+enum class ScaffoldHandednessSource { Option, Store, Fallback };
+
 struct ScaffoldLoadReport {
     std::int64_t fiberRecords = 0, fibers = 0, untagged = 0, manualFamily = 0, automaticFamily = 0,
                  filteredFamily = 0, shortFibers = 0, links = 0, linkRecords = 0, pieceApprovalRows = 0;
+    ScaffoldHandednessSource handednessSource = ScaffoldHandednessSource::Store;
 };
 
 struct ScaffoldGraph {
@@ -95,9 +99,13 @@ struct ScaffoldLoadOptions {
     std::string volume;
     double scale = 1;
     // The scroll's winding direction. Unset reads `winding_handedness` from
-    // the volume's umbilicus object; a store that states it nowhere is an
-    // error.
+    // the volume's umbilicus object; a store that states it nowhere falls
+    // back to `fallbackHandedness` (the caller's own source, such as the
+    // open-data catalog's orientation) and is an error without one. It is
+    // never inferred from the fibers: a mirrored solve must not happen
+    // silently.
     std::optional<int> handedness;
+    std::optional<int> fallbackHandedness;
     double seamAngle = -std::numbers::pi / 2;
     ScaffoldFamilySource familySource = ScaffoldFamilySource::Any;
     // Load untagged fibers too (they carry no winding relation; the winding

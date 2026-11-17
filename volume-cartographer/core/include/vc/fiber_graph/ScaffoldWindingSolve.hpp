@@ -89,8 +89,9 @@ struct ScaffoldPiece {
     // The constraints bounding the stretch (indices into
     // ScaffoldSolveResult::constraints).
     std::int64_t constraintFrom = -1, constraintTo = -1;
-    // Control-point index range covering [arcFrom, arcTo]; -1 when the fiber
-    // has no control point on the line.
+    // The controls bracketing [arcFrom, arcTo] outward: the stretch covers
+    // the spans [controlFrom, controlTo - 1], and a piece opened between
+    // these two controls contains it. -1 for a fiber without controls.
     std::int64_t controlFrom = -1, controlTo = -1;
     double length() const { return std::abs(arcTo - arcFrom); }
 };

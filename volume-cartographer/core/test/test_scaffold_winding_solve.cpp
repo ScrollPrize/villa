@@ -192,6 +192,15 @@ TEST_CASE("a frustrated triangle names the cycle its violation lies on")
     for (const auto& piece : residual.pieces) fibers.push_back(piece.fiber);
     std::sort(fibers.begin(), fibers.end());
     CHECK(fibers == std::vector<std::int64_t>{std::int64_t(h), std::int64_t(middle), std::int64_t(v)});
+    // Each stretch is bracketed by the controls a piece would be opened at.
+    for (const auto& piece : residual.pieces) {
+        REQUIRE(piece.controlFrom >= 0);
+        CHECK(piece.controlTo > piece.controlFrom);
+        CHECK(geometry.controlArc(std::size_t(piece.fiber), std::size_t(piece.controlFrom)) <=
+              std::min(piece.arcFrom, piece.arcTo) + 1e-9);
+        CHECK(geometry.controlArc(std::size_t(piece.fiber), std::size_t(piece.controlTo)) >=
+              std::max(piece.arcFrom, piece.arcTo) - 1e-9);
+    }
     // Every stretch is accused, and the cost is distributed over them once.
     double score = 0;
     for (const auto& piece : result.pieces) score += piece.score;
