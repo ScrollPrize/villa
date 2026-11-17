@@ -59,6 +59,12 @@ library states those exactly as the automatic pipeline does
   fiber, so both inward normals point from the H anchor towards the V one).
   The fiber format states display normals outward, so the inward target is
   their negation; the adjacent-link anchor assumes no convention at all.
+  With a prediction bound (*variant B*) every chain node is also pulled
+  towards the sheet axis the fiber-inference volume states there: the axes
+  are sampled at the fibers' own vertices, which lie in the sheet, weighted
+  by the prediction's presence between `presence_floor` (weight 0) and
+  `presence_full` (weight 1), and gathered per node as the principal axis of
+  their weighted outer products. The anchors still win at the nodes they fix.
 - **crossings** (`ScaffoldConstraints.hpp`). `extractFiberTraceConstraints`
   runs on the annotation's own polylines, which stay whole (no piece
   splitting). The geometry decides whether a crossing is parallel or
@@ -143,8 +149,11 @@ vc_scaffold_solve config.json
 | `constraints.perpendicular_offset`, `.winding_scale`, `.enclosures` | `0.5`, `1`, `true` | relation conventions |
 | `weights.perpendicular`, `.parallel`, `.enclosure` | `1`, `1`, `1` | weight per measured arc |
 | `winding.manifest`, `winding.remote_cache` | — | the Lasagna normal dataset the separations are measured on |
-| `normals.twist_weight`, `.lateral_weight`, `.smoothing_sigma`, `.resample_spacing` | `100`, `1`, `32`, `32` | the strip solve |
+| `normals.twist_weight`, `.lateral_weight`, `.smoothing_sigma`, `.resample_spacing` | `1000`, `1`, `64`, `64` | the strip solve; the measurements below say why these and not the tracer's |
 | `normals.manual_display_normals`, `.approved_pieces`, `.adjacent_links` | `true` | which anchors fix a sign |
+| `normals.source` | `geometry` | `geometry` (variant A) or `fused` (variant B) |
+| `normals.axis_weight`, `.presence_floor`, `.presence_full` | `100`, `0`, `128` | the fused axis term and its presence mapping |
+| `prediction.manifest`, `prediction.remote_cache` | — | the fiber-inference dataset a fused run reads |
 | `sign.solve`, `sign.backend` | `true`, `irls` | decide unanchored signs; `irls` or `ceres` |
 | `include_untagged` | `false` | load the fibers without an H/V tag too |
 | `lemon.backend`, `lemon.capacity_scale` | `network_simplex`, `1000` | flow backend |
@@ -280,39 +289,55 @@ workers on an AMD EPYC 7J13 CPU):
 |---|---|
 | normals | 292 of 292 fibers solved, 46 anchored by the 23 adjacent links |
 | crossings | 10,195 crossings, all with a measured separation |
-| signs | 46 held, 228 decided by crossings, 18 left undecided; 26.9 % of the 353 strict crossings (axes within 30 degrees, less than one turn apart) disagree with the decided signs |
-| relations | 6,993 crossings assert an arc (11,796 after the fractional split), 786 dropped where the geometry's verdict disagrees with the annotated families; 747 enclosure pairs give 51 exact relations, 652 one-sided, 26 non-unique, 18 contradictory |
-| solve | 12,079 constraints over 1,969 aggregated arcs, 15 components, weighted L1 2,942.8 turns, 5,724 violated constraints, largest residual 9 turns |
+| signs | 46 held, 233 decided by crossings, 13 left undecided; 0.78 % of the 514 strict crossings (axes within 30 degrees, less than one turn apart) disagree with the decided signs |
+| relations | 8,878 crossings assert an arc (16,011 after the fractional split), 786 dropped where the geometry's verdict disagrees with the annotated families; 931 enclosure pairs give 181 exact relations, 735 one-sided, 7 non-unique, 8 contradictory |
+| solve | 16,424 constraints over 2,413 aggregated arcs, 13 components, weighted L1 3,297.9 turns, 7,890 violated constraints, largest residual 8 turns |
 
 Wall time of that run: 1.05 s reading the store, 0.02 s packing the geometry,
-0.98 s for the strip normals, 0.37 s for the crossings, 0.03 s for the sign
-solve, 0.01 s assembling the relations and 1.74 s for the LEMON solve with its
-residual analysis.
+0.26 s for the strip normals, 0.32 s for the crossings, 0.009 s for the sign
+solve, 0.006 s assembling the relations and 1.74 s for the LEMON solve with
+its residual analysis.
 
-Those residuals are a statement about the *evidence*, not a verdict: a
-scaffold's geometry-only normals are weak evidence, as the strict sign
-disagreement of 26.9 % says, and the measured relations contradict the manual
-links accordingly. The 51 exact enclosure relations are the strongest of the
-measured kinds — they are integer bounds from both sides rather than a rounded
-measurement — and adding them alone to the 232 link constraints leaves 3
-violated constraints with a weighted L1 of 5 turns, which is what the approval
-dock is there to adjudicate.
+Those residuals are a statement about the *evidence*, not a verdict. A
+rounded separation is the weakest of the measured kinds: it asserts a whole
+number of windings from a measurement that lands between two of them, and
+7,890 of those 16,424 constraints disagree with the solve's compromise. The
+181 exact enclosure relations are the strongest, because they are integer
+bounds from both sides rather than a rounded measurement, and reading the
+ranking from the strongest evidence down is what the approval dock is for.
 
-Variant B says what the prediction is worth. The same run with the normals
-fused with the PHerc0332 fiber-inference prediction (axis weight 100, twist
-weight 1000, smoothing and resampling 64 voxels, presence 0 to 128):
+What decides the quality of a scaffold's normals is the stiffness of the
+strip solve, not the normal source. The same run at three settings, all with
+measured separations:
 
-| | Variant A, geometry normals | Variant B, fused prediction |
-|---|---|---|
-| strict crossings (axes within 30 degrees, under one turn apart) | 353 | 736 |
-| of those, disagreeing with the solved signs | 26.9 % | 2.3 % |
-| weight-weighted disagreement over all crossings | 29.2 % | 2.5 % |
-| mean agreement of a solved normal with the outward radial | 0.45 | 0.80 |
-| crossings that assert a relation | 6,993 of 10,195 | 9,060 of 10,195 |
-| exact enclosure relations (contradictory pairs) | 51 (18) | 182 (9) |
-| components | 15 | 14 |
+| | strip 100/32/32 | strip 1000/64/64 | fused, strip 1000/64/64 |
+|---|---|---|---|
+| strict crossings (axes within 30 degrees, under one turn apart) | 353 | 514 | 736 |
+| of those, disagreeing with the solved signs | 26.91 % | **0.78 %** | 2.31 % |
+| weight-weighted disagreement over all crossings | 31.65 % | 1.12 % | 2.46 % |
+| mean agreement of a solved normal with the outward radial | 0.486 | 0.817 | 0.803 |
+| crossings that assert a relation (of 10,195) | 6,993 | 8,878 | 9,060 |
+| exact enclosure relations (contradictory pairs) | 51 (18) | 181 (8) | 182 (9) |
+| components | 15 | 13 | 14 |
 
-Reading the prediction along all 851,285 line points is what a fused run
-costs: 79 s of the run's 83 s, against 1.0 s for the geometry-only strip
-normals. Everything after it is unchanged (0.27 s for the crossings, 0.008 s
-for the sign solve, 1.8 s for the LEMON solve and its residual analysis).
+The first column is the tracer's own strip defaults (twist weight 100,
+smoothing and resampling 32 voxels), which a hand-drawn polyline is too
+sparse and too noisy for; the scaffold's defaults are therefore the second
+column's (twist weight 1000, smoothing and resampling 64 voxels), and
+`ScaffoldNormalOptions` states them. With those, the fiber geometry alone
+decides the normals about as well as the prediction does: the prediction adds
+one exact enclosure relation and costs 79 s of an 83 s run to read along all
+851,285 line points, against 0.26 s for the geometry-only strip solve.
+Everything after the normals is unchanged (0.32 s for the crossings, 0.009 s
+for the sign solve, 1.74 s for the LEMON solve and its residual analysis).
+Variant B is worth its minute where a fiber's own geometry says little - a
+straight V fiber has no preferred normal axis at all - not as a default.
+
+The links-plus-enclosures configuration (perpendicular and parallel weight 0)
+shows what the exact relations alone assert: 232 links and 181 enclosure
+relations leave 4 violated constraints and a weighted L1 of 6 turns, and the
+fused normals leave exactly the same four. One of them, a link violated by 3
+turns on a 7-hop cycle, is violated under every sign configuration measured,
+including the 32 % disagreement one; the 1-turn violations move when the
+signs improve. A residual that survives the signs is the kind the approval
+dock is for.

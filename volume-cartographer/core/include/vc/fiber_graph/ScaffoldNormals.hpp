@@ -70,7 +70,19 @@ using ScaffoldAxisSampler =
     std::function<std::vector<ScaffoldPredictedAxis>(std::span<const geometry::Point> points, std::size_t workers)>;
 
 struct ScaffoldNormalOptions {
-    fiber_tracer::FiberStripNormalOptions strip;
+    // The strip solve, with the scaffold's own defaults rather than the
+    // tracer's: an annotated polyline is drawn by hand, so twisting the
+    // normal along it has to cost far more than the lateral term, and it is
+    // smoothed and resampled over 64 rather than 32 voxels. Measured on the
+    // PHerc0332 scaffold with geometry normals and measured separations:
+    // these leave 0.78 % of the 514 strict crossings disagreeing with the
+    // solved signs, where the tracer's 100 / 32 / 32 leave 26.91 % of 353.
+    fiber_tracer::FiberStripNormalOptions strip{.twistWeight = 1000.0,
+                                                .lateralWeight = 1.0,
+                                                .smoothingSigma = 64.0,
+                                                .resampleSpacing = 64.0,
+                                                .axisWeight = 100.0,
+                                                .maxIterations = 50};
     // Variant B: map the prediction's presence to an axis weight, 0 at
     // `presenceFloor` and 1 at `presenceFull`. Ignored without a sampler.
     double presenceFloor = 0.0, presenceFull = 128.0;
