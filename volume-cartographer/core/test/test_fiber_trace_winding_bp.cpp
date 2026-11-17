@@ -7471,3 +7471,25 @@ TEST_CASE("strip normals follow a sign-free predicted axis and bridge nodes with
     std::vector<FiberStripAxisTarget> wrong(chain.points.size()-1);
     CHECK_THROWS_AS(solveFiberStripNormals(points,options,&wrong),std::invalid_argument);
 }
+
+TEST_CASE("fixed strip targets set the fiber's sign and override the free axes' orientation")
+{
+    using namespace vc::fiber_tracer;
+    std::vector<cv::Vec3d> points;
+    for(int i=0;i<=64;++i)points.push_back({double(i)*4.,0.,0.});
+    FiberStripNormalOptions options;
+    options.smoothingSigma=0.;options.resampleSpacing=8.;options.twistWeight=1000.;options.lateralWeight=1.;options.axisWeight=1.;
+    const auto chain=fiberStripChain(points,options);
+    std::vector<FiberStripAxisTarget> targets(chain.points.size());
+    for(size_t k=0;k<targets.size();++k)targets[k]={cv::Vec3d(0.,1.,0.),0.5,false};
+    // Two signed anchors pointing to -y near the ends.
+    targets[1]={cv::Vec3d(0.,-1.,0.),50.,true};
+    targets[targets.size()-2]={cv::Vec3d(0.,-1.,0.),50.,true};
+    const auto result=solveFiberStripNormals(points,options,&targets);
+    REQUIRE(result.normals.size()==points.size());
+    for(const auto& n:result.normals){CHECK(n[1]<-0.99);}
+    // The same anchors pointing to +y give the opposite sign; the free targets never decide it.
+    targets[1].axis=cv::Vec3d(0.,1.,0.);targets[targets.size()-2].axis=cv::Vec3d(0.,1.,0.);
+    const auto flipped=solveFiberStripNormals(points,options,&targets);
+    for(const auto& n:flipped.normals){CHECK(n[1]>0.99);}
+}

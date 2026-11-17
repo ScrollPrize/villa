@@ -259,10 +259,30 @@ FiberStripNormalResult solveChain(
                 nullptr, &theta[i]);
         }
         if (pass == 1) {
+            // Fixed (signed) targets decide the fiber's gauge: flip the geometry
+            // field when their weighted majority points against it.
+            double vote = 0.0;
+            for (size_t i = 0; i < n; ++i) {
+                const auto& target = (*targets)[i];
+                if (!target.fixed || !(target.weight > 0.0)) continue;
+                const cv::Vec3d a = unit(target.axis);
+                if (cv::norm(a) == 0.0) continue;
+                vote += target.weight * a.dot(u[i] * std::cos(theta[i]) + v[i] * std::sin(theta[i]));
+            }
+            if (vote < 0.0) for (size_t i = 0; i < n; ++i) theta[i] += kPi;
             for (size_t i = 0; i < n; ++i) {
                 const auto& target = (*targets)[i];
                 cv::Vec3d a = unit(target.axis);
                 if (!(target.weight > 0.0) || cv::norm(a) == 0.0) continue;
+                if (target.fixed) {
+                    // A boundary condition: the normal is the anchor's direction
+                    // (projected into the node's plane) and does not move.
+                    const double au = a.dot(u[i]), av = a.dot(v[i]);
+                    if (std::hypot(au, av) < 1e-9) continue;  // anchor along the fiber: no direction
+                    theta[i] = std::atan2(av, au);
+                    problem.SetParameterBlockConstant(&theta[i]);
+                    continue;
+                }
                 const cv::Vec3d current = u[i] * std::cos(theta[i]) + v[i] * std::sin(theta[i]);
                 if (current.dot(a) < 0.0) a = -a;
                 const double weight = std::sqrt(options.axisWeight * target.weight);

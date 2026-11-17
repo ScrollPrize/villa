@@ -9,6 +9,7 @@
 #include <vc_object_store/objects/InitialImport.hpp>
 #include <vc_object_store/objects/FiberGraphSolveExtension.hpp>
 #include <algorithm>
+#include <fstream>
 #include <atomic>
 #include <chrono>
 #include <bit>
@@ -243,56 +244,155 @@ Json extractFiberConstraintChunks(const Json& cfg,Json& metadata,
             // the sheet; the smoothed chain may not) and gathered per chain node as
             // the principal axis of the presence-weighted outer products of the
             // vertex axes assigned to the node (nearest arc).
-            std::vector<cv::Vec3d> vertices;std::vector<std::pair<size_t,size_t>> owner;
+            // Chains (smoothing + resampling) per fiber in parallel; the solve recomputes them identically.
+            const auto chainStarted=Clock::now();
             std::vector<vc::fiber_tracer::FiberStripChain> chains(lines.size());
+            cv::parallel_for_(cv::Range(0,int(lines.size())),[&](const cv::Range& range){
+                for(int i=range.start;i<range.end;++i)chains[size_t(i)]=vc::fiber_tracer::fiberStripChain(polylines[size_t(i)],options);
+            },int(workers));
+            const double chainSeconds=elapsed(chainStarted);
+            std::vector<cv::Vec3d> vertices;std::vector<std::pair<size_t,size_t>> owner;
+            size_t vertexTotal=0;for(const auto& line:polylines)vertexTotal+=line.size();
+            vertices.reserve(vertexTotal);owner.reserve(vertexTotal);
             targets=std::make_unique<std::vector<std::vector<vc::fiber_tracer::FiberStripAxisTarget>>>(lines.size());
             for(size_t i=0;i<lines.size();++i){
-                chains[i]=vc::fiber_tracer::fiberStripChain(polylines[i],options);
                 (*targets)[i].resize(chains[i].points.size());
                 for(size_t j=0;j<polylines[i].size();++j){vertices.push_back(polylines[i][j]);owner.push_back({i,j});}
             }
-            std::vector<vc::lasagna::NormalSampleWithDerivative> axes;
-            (void)normals.sampleNormalBatch(vertices,false,int(workers),axes);
+            // Axes, sampled per slice of whole fibers on worker threads: chunk
+            // decoding happens on the calling thread, so one big batch would decode
+            // the whole prediction serially.
+            const auto axesStarted=Clock::now();
+            std::vector<vc::lasagna::NormalSampleWithDerivative> axes(vertices.size());
+            {
+                const size_t slices=std::max<size_t>(1,std::min(workers*8,lines.size()));
+                std::vector<size_t> sliceFirstVertex(slices+1,0);
+                for(size_t sIdx=0;sIdx<slices;++sIdx){
+                    const size_t fiberEnd=(sIdx+1)*lines.size()/slices;
+                    size_t v=0;for(size_t i=0;i<fiberEnd;++i)v+=polylines[i].size();
+                    sliceFirstVertex[sIdx+1]=v;
+                }
+                cv::parallel_for_(cv::Range(0,int(slices)),[&](const cv::Range& range){
+                    for(int sIdx=range.start;sIdx<range.end;++sIdx){
+                        const size_t begin=sliceFirstVertex[size_t(sIdx)],end=sliceFirstVertex[size_t(sIdx)+1];
+                        if(begin>=end)continue;
+                        std::vector<cv::Vec3d> slice(vertices.begin()+begin,vertices.begin()+end);
+                        std::vector<vc::lasagna::NormalSampleWithDerivative> values;
+                        (void)normals.sampleNormalBatch(slice,false,1,values);
+                        for(size_t j=0;j<values.size();++j)axes[begin+j]=std::move(values[j]);
+                    }
+                },int(workers));
+            }
+            const double axesSeconds=elapsed(axesStarted);
+            // Presence, sampled on `workers` slices in parallel (the vector batch itself is serial).
+            const auto presenceStarted=Clock::now();
             std::vector<cv::Vec3f> verticesF(vertices.begin(),vertices.end());
-            std::vector<std::vector<float>> presenceValues;
-            vc::lasagna::sampleLasagnaVectorBatch({*presence},verticesF,presenceValues,false);
-            std::vector<std::vector<cv::Matx33d>> scatter(lines.size());
-            std::vector<std::vector<double>> weightSums(lines.size());std::vector<std::vector<size_t>> counts(lines.size());
-            for(size_t i=0;i<lines.size();++i){
-                scatter[i].assign(chains[i].points.size(),cv::Matx33d::zeros());
-                weightSums[i].assign(chains[i].points.size(),0.);counts[i].assign(chains[i].points.size(),0);
+            std::vector<std::vector<float>> presenceValues(verticesF.size());
+            {
+                const size_t slices=std::max<size_t>(1,std::min(workers*4,verticesF.size()));
+                const size_t per=(verticesF.size()+slices-1)/slices;
+                cv::parallel_for_(cv::Range(0,int(slices)),[&](const cv::Range& range){
+                    for(int sIdx=range.start;sIdx<range.end;++sIdx){
+                        const size_t begin=size_t(sIdx)*per,end=std::min(verticesF.size(),begin+per);
+                        if(begin>=end)continue;
+                        std::vector<cv::Vec3f> slice(verticesF.begin()+begin,verticesF.begin()+end);
+                        std::vector<std::vector<float>> values;
+                        vc::lasagna::sampleLasagnaVectorBatch({*presence},slice,values,false);
+                        for(size_t j=0;j<values.size();++j)presenceValues[begin+j]=std::move(values[j]);
+                    }
+                },int(workers));
             }
-            size_t verticesWithAxis=0;
-            for(size_t j=0;j<vertices.size();++j){
-                const auto [i,vertex]=owner[j];const auto& chain=chains[i];
-                if(chain.points.empty())continue;
-                const double arc=chain.vertexArc[vertex];
-                const auto it=std::lower_bound(chain.arc.begin(),chain.arc.end(),arc);
-                size_t k=size_t(it-chain.arc.begin());
-                if(k==chain.arc.size())k=chain.arc.size()-1;
-                else if(k>0&&arc-chain.arc[k-1]<chain.arc[k]-arc)--k;
-                ++counts[i][k];
-                if(!axes[j].sample.valid||presenceValues[j].empty())continue;
-                const double w=std::clamp((double(presenceValues[j][0])-floor)/(full-floor),0.,1.);
-                if(!(w>0.))continue;
-                const cv::Vec3d a=axes[j].sample.normal;
-                scatter[i][k]+=w*cv::Matx33d(a[0]*a[0],a[0]*a[1],a[0]*a[2],a[1]*a[0],a[1]*a[1],a[1]*a[2],a[2]*a[0],a[2]*a[1],a[2]*a[2]);
-                weightSums[i][k]+=w;++verticesWithAxis;
-            }
-            size_t nodes=0,withAxis=0;double weightSum=0.;
-            for(size_t i=0;i<lines.size();++i)for(size_t k=0;k<chains[i].points.size();++k){
-                ++nodes;
-                if(!(weightSums[i][k]>0.)||!counts[i][k])continue;
-                cv::Vec3d eigenvalues;cv::Matx33d eigenvectors;
-                cv::eigen(scatter[i][k],eigenvalues,eigenvectors);
-                auto& target=(*targets)[i][k];
-                target.axis=cv::Vec3d(eigenvectors(0,0),eigenvectors(0,1),eigenvectors(0,2));
-                target.weight=weightSums[i][k]/double(counts[i][k]);
-                ++withAxis;weightSum+=target.weight;
-            }
+            const double presenceSeconds=elapsed(presenceStarted);
+            std::cout<<"fused sampling chain_seconds="<<chainSeconds<<" axes_seconds="<<axesSeconds<<" presence_seconds="<<presenceSeconds<<" vertices="<<vertices.size()<<std::endl;
+            // Per fiber in parallel: gather the vertex axes into each chain node's
+            // presence-weighted scatter matrix and take its principal axis.
+            const auto gatherStarted=Clock::now();
+            std::vector<size_t> fiberFirstVertex(lines.size()+1,0);
+            for(size_t i=0;i<lines.size();++i)fiberFirstVertex[i+1]=fiberFirstVertex[i]+polylines[i].size();
+            std::atomic<size_t> verticesWithAxisCount{0},withAxisCount{0};std::atomic<double> weightSumTotal{0.};
+            cv::parallel_for_(cv::Range(0,int(lines.size())),[&](const cv::Range& range){
+                for(int fi=range.start;fi<range.end;++fi){
+                    const size_t i=size_t(fi);const auto& chain=chains[i];
+                    if(chain.points.empty())continue;
+                    std::vector<cv::Matx33d> scatter(chain.points.size(),cv::Matx33d::zeros());
+                    std::vector<double> weightSums(chain.points.size(),0.);std::vector<size_t> counts(chain.points.size(),0);
+                    size_t local=0;
+                    for(size_t vertex=0;vertex<polylines[i].size();++vertex){
+                        const size_t j=fiberFirstVertex[i]+vertex;
+                        const double arc=chain.vertexArc[vertex];
+                        const auto it=std::lower_bound(chain.arc.begin(),chain.arc.end(),arc);
+                        size_t k=size_t(it-chain.arc.begin());
+                        if(k==chain.arc.size())k=chain.arc.size()-1;
+                        else if(k>0&&arc-chain.arc[k-1]<chain.arc[k]-arc)--k;
+                        ++counts[k];
+                        if(!axes[j].sample.valid||presenceValues[j].empty())continue;
+                        const double w=std::clamp((double(presenceValues[j][0])-floor)/(full-floor),0.,1.);
+                        if(!(w>0.))continue;
+                        const cv::Vec3d a=axes[j].sample.normal;
+                        scatter[k]+=w*cv::Matx33d(a[0]*a[0],a[0]*a[1],a[0]*a[2],a[1]*a[0],a[1]*a[1],a[1]*a[2],a[2]*a[0],a[2]*a[1],a[2]*a[2]);
+                        weightSums[k]+=w;++local;
+                    }
+                    verticesWithAxisCount.fetch_add(local);
+                    size_t nodesWithAxis=0;double fiberWeight=0.;
+                    for(size_t k=0;k<chain.points.size();++k){
+                        if(!(weightSums[k]>0.)||!counts[k])continue;
+                        cv::Vec3d eigenvalues;cv::Matx33d eigenvectors;
+                        cv::eigen(scatter[k],eigenvalues,eigenvectors);
+                        auto& target=(*targets)[i][k];
+                        target.axis=cv::Vec3d(eigenvectors(0,0),eigenvectors(0,1),eigenvectors(0,2));
+                        target.weight=weightSums[k]/double(counts[k]);
+                        ++nodesWithAxis;fiberWeight+=target.weight;
+                    }
+                    withAxisCount.fetch_add(nodesWithAxis);
+                    double expected=weightSumTotal.load();while(!weightSumTotal.compare_exchange_weak(expected,expected+fiberWeight)){}
+                }
+            },int(workers));
+            size_t nodes=0;for(const auto& chain:chains)nodes+=chain.points.size();
+            const size_t verticesWithAxis=verticesWithAxisCount.load(),withAxis=withAxisCount.load();const double weightSum=weightSumTotal.load();
+            const double gatherSeconds=elapsed(gatherStarted);
+            std::cout<<"fused gather seconds="<<gatherSeconds<<" nodes="<<nodes<<" nodes_with_axis="<<withAxis<<std::endl;
             fusion=Json{{"axis_weight",options.axisWeight},{"presence_floor",floor},{"presence_full",full},
+                {"chain_seconds",chainSeconds},{"axes_seconds",axesSeconds},{"presence_seconds",presenceSeconds},{"gather_seconds",gatherSeconds},
                 {"vertices",vertices.size()},{"vertices_with_axis",verticesWithAxis},
                 {"chain_nodes",nodes},{"nodes_with_axis",withAxis},{"mean_axis_weight",withAxis?weightSum/withAxis:0.}};
+            // Signed anchors transported from an independently resolved fiber
+            // volume: {"<fiber uuid>": [[arc_base, nx, ny, nz, weight], ...]}. They
+            // replace the free axis at their nearest chain node and fix its sign.
+            if(cfg.contains("normal_anchors")){
+                const double anchorWeight=cfg.value("fused_anchor_weight",100.);
+                std::ifstream in(cfg.at("normal_anchors").get<std::string>());
+                if(!in)throw std::runtime_error("cannot read normal_anchors");
+                const Json anchors=Json::parse(in);
+                std::map<std::string,size_t> index;for(size_t i=0;i<ids.size();++i)index[ids[i]]=i;
+                std::vector<std::vector<cv::Vec3d>> sums(lines.size());std::vector<std::vector<double>> anchorWeights(lines.size());
+                for(size_t i=0;i<lines.size();++i){sums[i].assign(chains[i].points.size(),cv::Vec3d(0,0,0));anchorWeights[i].assign(chains[i].points.size(),0.);}
+                size_t used=0,unknown=0;
+                for(const auto& [id,list]:anchors.items()){
+                    const auto it=index.find(id);
+                    if(it==index.end()){++unknown;continue;}
+                    const size_t i=it->second;const auto& chain=chains[i];
+                    if(chain.points.empty())continue;
+                    for(const auto& entry:list){
+                        const double arc=entry.at(0).get<double>();
+                        cv::Vec3d a(entry.at(1).get<double>(),entry.at(2).get<double>(),entry.at(3).get<double>());
+                        const double w=entry.size()>4?entry.at(4).get<double>():1.;
+                        const double length=cv::norm(a);
+                        if(!(length>0.)||!(w>0.))continue;
+                        const auto pos=std::lower_bound(chain.arc.begin(),chain.arc.end(),arc);
+                        size_t k=size_t(pos-chain.arc.begin());
+                        if(k==chain.arc.size())k=chain.arc.size()-1;
+                        else if(k>0&&arc-chain.arc[k-1]<chain.arc[k]-arc)--k;
+                        sums[i][k]+=a*(w/length);anchorWeights[i][k]+=w;++used;
+                    }
+                }
+                size_t anchoredNodes=0;
+                for(size_t i=0;i<lines.size();++i)for(size_t k=0;k<chains[i].points.size();++k){
+                    if(!(anchorWeights[i][k]>0.)||!(cv::norm(sums[i][k])>0.))continue;
+                    auto& target=(*targets)[i][k];
+                    target.axis=sums[i][k]/cv::norm(sums[i][k]);target.weight=anchorWeight*anchorWeights[i][k];target.fixed=true;++anchoredNodes;
+                }
+                fusion["anchors"]=Json{{"weight",anchorWeight},{"anchors_used",used},{"anchors_for_unknown_fibers",unknown},{"anchored_nodes",anchoredNodes}};
+            }
         }
         const auto solved=vc::fiber_tracer::solveFiberStripNormals(polylines,options,int(workers),targets.get());
         strips=std::make_unique<StripNormals>(lines.size());

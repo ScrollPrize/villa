@@ -18,9 +18,13 @@
 // Optionally a predicted sheet axis a_i (sign-free) pulls the normal at a node:
 //   axis:    w_a w_i |n_i - a_i|^2
 // with a per-node weight w_i (for example from the prediction's presence). The
-// geometry-only solution is computed first and orients every a_i (so the term
-// has one minimum per node and the sign stays continuous along the fiber);
-// nodes without a prediction (w_i = 0) are bridged by the geometry terms. No
+// geometry-only solution is computed first and orients every free a_i (so the
+// term has one minimum per node and the sign stays continuous along the fiber);
+// fixed (signed) targets are boundary conditions: the node's normal is set to
+// the anchor direction and held constant, so only the stretches between anchors
+// are solved (the geometry field is first flipped as a whole when the anchors'
+// weighted majority disagrees with it, to start near the solution). Nodes
+// without a prediction (w_i = 0) are bridged by the geometry terms. No
 // umbilicus enters the energy. The sign of a whole fiber stays undetermined
 // here; the joint sign stage decides it.
 namespace vc::fiber_tracer
@@ -54,11 +58,15 @@ struct FiberStripChain {
     const std::vector<cv::Vec3d>& pointsBaseXYZ,
     const FiberStripNormalOptions& options = {});
 
-// A predicted sheet axis at one chain point. The sign of `axis` is irrelevant;
-// weight 0 (or a zero axis) means no prediction there.
+// A predicted sheet axis at one chain point. The sign of `axis` is irrelevant
+// unless `fixed`: a fixed target is a signed anchor held constant in the solve
+// (for example a signed normal transported from an independently resolved fiber
+// volume); its weight only enters the initial whole-fiber orientation vote.
+// Weight 0 (or a zero axis) means no prediction there.
 struct FiberStripAxisTarget {
     cv::Vec3d axis{0.0, 0.0, 0.0};
     double weight = 0.0;
+    bool fixed = false;
 };
 
 struct FiberStripNormalResult {
