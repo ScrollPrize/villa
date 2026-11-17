@@ -21,7 +21,10 @@
 #include "vc/fiber_graph/ScaffoldGraph.hpp"
 #include "vc_object_store/geometry/FiberWindingFlow.hpp"
 
+#include <array>
 #include <cstdint>
+#include <limits>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -33,7 +36,13 @@ struct WindingArc {
     double weight = 0;
 };
 
-enum class ScaffoldConstraintKind : int { Manual = 0 };
+// Manual: an annotation link. Perpendicular and Parallel: a measured
+// crossing's rounded winding separation. Enclosure: the exact H->V step the
+// signed order of a pair's perpendicular crossings bounds from both sides
+// (ScaffoldConstraints.hpp).
+enum class ScaffoldConstraintKind : int { Manual = 0, Perpendicular = 1, Parallel = 2, Enclosure = 3 };
+
+const char* scaffoldConstraintKindName(ScaffoldConstraintKind);
 
 // One asserted winding relation, before aggregation, with the anchors it was
 // asserted at: the residual analysis needs them to name the pieces a cycle
@@ -47,9 +56,16 @@ struct ScaffoldConstraint {
     std::int64_t step = 0;          // the anchor-level assertion (0, or +-1 adjacent)
     std::int64_t target = 0;        // the whole-fiber step
     double weight = 0;
-    // Approved: a link whose record approval state is approved (measured
-    // constraints gain their own approval rows in a later step).
+    // Approved: a link whose record approval state is approved, or a
+    // measured constraint with a live approval row
+    // (vc_object_store FiberConstraintApprovalExtension.hpp).
     bool approved = false;
+    // The crossing a measured constraint came from (an index into the event
+    // list it was assembled from), -1 for a manual link.
+    std::int64_t event = -1;
+    // The measured separation in turns; NaN for a manual link and for a
+    // relation no sampler measured.
+    double windingDistance = std::numeric_limits<double>::quiet_NaN();
 };
 
 struct ScaffoldLinkArcOptions {
@@ -135,6 +151,8 @@ struct ScaffoldSolveOptions {
 
 struct ScaffoldSolveResult {
     std::vector<ScaffoldConstraint> constraints;
+    // Constraints per kind, indexed by ScaffoldConstraintKind.
+    std::array<std::int64_t, 4> constraintsByKind{};
     std::vector<WindingArc> arcs; // aggregated, as solved
     std::vector<std::int64_t> winding, component; // per fiber; unconstrained fibers get their own component
     std::int64_t components = 0, isolatedFibers = 0;
@@ -151,7 +169,12 @@ struct ScaffoldSolveResult {
 // Throws std::runtime_error when the library was built without LEMON, and
 // std::invalid_argument when an approved subgraph cannot be satisfied (the
 // message names the violated approved constraints so they can be revoked).
+// `measured` holds the constraints of the measured crossings
+// (ScaffoldConstraints.hpp), which the solve treats exactly like the links:
+// same aggregation, same contraction of the approved ones, same residual
+// analysis.
 ScaffoldSolveResult solveScaffoldWinding(const ScaffoldGraph&, const ScaffoldGeometry&,
-                                         const ScaffoldSolveOptions& = {});
+                                         const ScaffoldSolveOptions& = {},
+                                         std::span<const ScaffoldConstraint> measured = {});
 
 } // namespace vc::fiber_graph

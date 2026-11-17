@@ -10,6 +10,7 @@
 // Nothing here opens or writes a store: the rows are built here and the
 // caller submits them (VC3D through its checked request, the CLI through its
 // own transaction). Reading goes through any StoreReader.
+#include "vc/fiber_graph/ScaffoldConstraints.hpp"
 #include "vc/fiber_graph/ScaffoldWindingSolve.hpp"
 #include "vc_object_store/objects/FiberGraphSolveExtension.hpp"
 
@@ -35,9 +36,23 @@ struct ScaffoldRunRows {
     std::vector<std::pair<std::string, std::vector<objects::ExtensionRow>>> rows;
 };
 
+// What a run did beyond the links: the normals it solved, the signs those
+// decided and the measured crossings it assembled. Every member is optional;
+// a links-only run passes none and the rows record only the link settings.
+struct ScaffoldRunStages {
+    const ScaffoldNormalOptions* normalOptions = nullptr;
+    const ScaffoldNormalReport* normals = nullptr;
+    const ScaffoldEventOptions* eventOptions = nullptr;
+    const ScaffoldEventReport* events = nullptr;
+    const ScaffoldMeasuredOptions* measuredOptions = nullptr;
+    const ScaffoldMeasuredReport* measured = nullptr;
+    const ScaffoldSignOptions* signOptions = nullptr;
+    const ScaffoldSignResult* signs = nullptr;
+};
+
 // The rows of one solve. `method` names the backend the result came from.
 ScaffoldRunRows scaffoldSolveRunRows(const ScaffoldGraph&, const ScaffoldSolveResult&, const ScaffoldSolveOptions&,
-                                     const ScaffoldRunRecord&);
+                                     const ScaffoldRunRecord&, const ScaffoldRunStages& = {});
 
 struct ScaffoldStoredRun {
     std::string runUuid, stage, method, settingsJson;

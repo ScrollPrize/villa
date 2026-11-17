@@ -1,5 +1,7 @@
 #include "vc/fiber_graph/ScaffoldWindingSolve.hpp"
 
+#include "vc_object_store/ParallelFor.hpp"
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -135,14 +137,15 @@ struct PathSearch {
     // Satisfied constraints incident to each fiber.
     std::vector<std::vector<std::int64_t>> incident;
     const std::vector<ScaffoldConstraint>* constraints;
-    std::set<std::int64_t> blocked;
 
     // Shortest alternative path from `from` to `to` over satisfied
     // constraints: fewest hops, ties by the total length of the fiber
     // stretches the cycle runs along. The search state is the constraint a
     // fiber was entered by, because the stretch depends on both incident
-    // anchors.
-    std::vector<std::int64_t> shortest(std::int64_t from, std::int64_t to, const ScaffoldConstraint& closing) const
+    // anchors. The search reads only its arguments, so violated constraints
+    // can be analysed in parallel.
+    std::vector<std::int64_t> shortest(std::int64_t from, std::int64_t to, const ScaffoldConstraint& closing,
+                                       const std::set<std::int64_t>& blocked) const
     {
         struct State {
             std::int64_t hops;
@@ -232,6 +235,17 @@ std::vector<ScaffoldPiece> cyclePieces(const ScaffoldGraph& graph, const Scaffol
     return pieces;
 }
 } // namespace
+
+const char* scaffoldConstraintKindName(ScaffoldConstraintKind kind)
+{
+    switch (kind) {
+        case ScaffoldConstraintKind::Manual: return "manual";
+        case ScaffoldConstraintKind::Perpendicular: return "perpendicular";
+        case ScaffoldConstraintKind::Parallel: return "parallel";
+        case ScaffoldConstraintKind::Enclosure: return "enclosure";
+    }
+    throw std::invalid_argument("scaffold winding: unknown constraint kind");
+}
 
 std::optional<std::int64_t> adjacentStep(ScaffoldFamily a, ScaffoldFamily b)
 {
@@ -335,7 +349,8 @@ std::vector<ScaffoldConstraint> scaffoldLinkConstraints(const ScaffoldGraph& gra
 }
 
 ScaffoldSolveResult solveScaffoldWinding(const ScaffoldGraph& graph, const ScaffoldGeometry& geometry,
-                                         const ScaffoldSolveOptions& options)
+                                         const ScaffoldSolveOptions& options,
+                                         std::span<const ScaffoldConstraint> measured)
 {
     if (!geometry::windingMinCostFlowAvailable())
         throw std::runtime_error("scaffold winding: vc_object_store was built without LEMON (VC_OBJECT_STORE_WITH_LEMON)");
@@ -346,6 +361,18 @@ ScaffoldSolveResult solveScaffoldWinding(const ScaffoldGraph& graph, const Scaff
 
     ScaffoldSolveResult result;
     result.constraints = scaffoldLinkConstraints(graph, geometry, options.links, result.linkReport);
+    result.constraints.insert(result.constraints.end(), measured.begin(), measured.end());
+    for (const auto& constraint : result.constraints) {
+        const auto kind = std::size_t(constraint.kind);
+        if (kind >= result.constraintsByKind.size())
+            throw std::invalid_argument("scaffold winding: unknown constraint kind");
+        ++result.constraintsByKind[kind];
+        if (constraint.a < 0 || constraint.b < 0 || std::size_t(constraint.a) >= nodes ||
+            std::size_t(constraint.b) >= nodes || constraint.a == constraint.b)
+            throw std::invalid_argument("scaffold winding: a constraint names an unknown fiber pair");
+        if (!std::isfinite(constraint.weight) || constraint.weight < 0)
+            throw std::invalid_argument("scaffold winding: a constraint weight is negative or nonfinite");
+    }
     std::vector<WindingArc> arcs;
     for (const auto& constraint : result.constraints)
         if (constraint.weight > 0) arcs.push_back({constraint.a, constraint.b, constraint.target, constraint.weight});
@@ -441,49 +468,58 @@ ScaffoldSolveResult solveScaffoldWinding(const ScaffoldGraph& graph, const Scaff
             search.incident[std::size_t(constraint.b)].push_back(std::int64_t(i));
         }
     }
-    std::map<std::tuple<std::int64_t, std::int64_t, std::int64_t>, std::size_t> pieceIndex;
-    for (std::size_t i = 0; i < result.constraints.size(); ++i) {
-        if (residual[i] == 0) continue;
-        ++result.violatedConstraints;
+    // The cycle of one violated constraint is found from the satisfied ones
+    // alone, so the searches are independent. They run in parallel and are
+    // merged in constraint order afterwards: the ranking never depends on
+    // how the work was split.
+    std::vector<std::int64_t> violated;
+    for (std::size_t i = 0; i < result.constraints.size(); ++i)
+        if (residual[i] != 0) violated.push_back(std::int64_t(i));
+    result.violatedConstraints = std::int64_t(violated.size());
+    std::vector<ScaffoldResidual> entries(violated.size());
+    objects::parallelFor(violated.size(), std::max<std::size_t>(1, options.workers), [&](std::size_t task) {
+        const auto i = std::size_t(violated[task]);
         const auto& constraint = result.constraints[i];
-        ScaffoldResidual entry;
+        auto& entry = entries[task];
         entry.constraint = std::int64_t(i);
         entry.residual = residual[i];
         entry.cost = constraint.weight * residual[i];
-        search.blocked.clear();
-        const auto path = search.shortest(constraint.a, constraint.b, constraint);
-        if (!path.empty()) {
-            entry.cycleHops = std::int64_t(path.size()) + 1;
-            entry.pieces = cyclePieces(graph, geometry, result.constraints, std::int64_t(i), path);
-            for (const auto& piece : entry.pieces) entry.cyclePieceLength += piece.length();
-            entry.joint = entry.cost / double(entry.cycleHops);
-            entry.redundancy = 1;
-            auto blocking = path;
-            for (std::int64_t round = 1; round < options.maxAlternativePaths; ++round) {
-                for (const auto edge : blocking) search.blocked.insert(edge);
-                blocking = search.shortest(constraint.a, constraint.b, constraint);
-                if (blocking.empty()) break;
-                ++entry.redundancy;
-            }
-            // A violated constraint accuses the stretches its cycle runs
-            // along, a short stretch more specifically than a long one: its
-            // cost is split in proportion to 1 / max(length, 1 voxel).
-            double total = 0;
-            for (const auto& piece : entry.pieces) total += 1. / std::max(piece.length(), 1.);
-            for (const auto& piece : entry.pieces) {
-                const double share = entry.cost * (1. / std::max(piece.length(), 1.)) / std::max(total, 1e-300);
-                const std::tuple<std::int64_t, std::int64_t, std::int64_t> key{piece.fiber, piece.controlFrom,
-                                                                              piece.controlTo};
-                const auto found = pieceIndex.find(key);
-                if (found == pieceIndex.end()) {
-                    pieceIndex.emplace(key, result.pieces.size());
-                    result.pieces.push_back({piece, share, entry.cycleHops, 1});
-                } else {
-                    auto& score = result.pieces[found->second];
-                    score.score += share;
-                    ++score.constraints;
-                    score.cycleHops = std::min(score.cycleHops, entry.cycleHops);
-                }
+        std::set<std::int64_t> blocked;
+        const auto path = search.shortest(constraint.a, constraint.b, constraint, blocked);
+        if (path.empty()) return;
+        entry.cycleHops = std::int64_t(path.size()) + 1;
+        entry.pieces = cyclePieces(graph, geometry, result.constraints, std::int64_t(i), path);
+        for (const auto& piece : entry.pieces) entry.cyclePieceLength += piece.length();
+        entry.joint = entry.cost / double(entry.cycleHops);
+        entry.redundancy = 1;
+        auto blocking = path;
+        for (std::int64_t round = 1; round < options.maxAlternativePaths; ++round) {
+            for (const auto edge : blocking) blocked.insert(edge);
+            blocking = search.shortest(constraint.a, constraint.b, constraint, blocked);
+            if (blocking.empty()) break;
+            ++entry.redundancy;
+        }
+    });
+    std::map<std::tuple<std::int64_t, std::int64_t, std::int64_t>, std::size_t> pieceIndex;
+    for (auto& entry : entries) {
+        // A violated constraint accuses the stretches its cycle runs along, a
+        // short stretch more specifically than a long one: its cost is split
+        // in proportion to 1 / max(length, 1 voxel).
+        double total = 0;
+        for (const auto& piece : entry.pieces) total += 1. / std::max(piece.length(), 1.);
+        for (const auto& piece : entry.pieces) {
+            const double share = entry.cost * (1. / std::max(piece.length(), 1.)) / std::max(total, 1e-300);
+            const std::tuple<std::int64_t, std::int64_t, std::int64_t> key{piece.fiber, piece.controlFrom,
+                                                                          piece.controlTo};
+            const auto found = pieceIndex.find(key);
+            if (found == pieceIndex.end()) {
+                pieceIndex.emplace(key, result.pieces.size());
+                result.pieces.push_back({piece, share, entry.cycleHops, 1});
+            } else {
+                auto& score = result.pieces[found->second];
+                score.score += share;
+                ++score.constraints;
+                score.cycleHops = std::min(score.cycleHops, entry.cycleHops);
             }
         }
         result.residuals.push_back(std::move(entry));

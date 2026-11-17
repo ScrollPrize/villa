@@ -205,12 +205,14 @@ target_link_libraries(vc_fiber_tracer PRIVATE ${CMAKE_DL_LIBS})
 # analysis. No Qt, no sampling; VC3D and the CLI call the same library.
 add_library(vc_fiber_graph_solve
     src/fiber_graph/ScaffoldGraph.cpp
+    src/fiber_graph/ScaffoldNormals.cpp
+    src/fiber_graph/ScaffoldConstraints.cpp
     src/fiber_graph/ScaffoldWindingSolve.cpp
     src/fiber_graph/ScaffoldSolveRuns.cpp
 )
 target_include_directories(vc_fiber_graph_solve PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_features(vc_fiber_graph_solve PUBLIC cxx_std_20)
-target_link_libraries(vc_fiber_graph_solve PUBLIC vc_core vc_object_store::vc_geometry
+target_link_libraries(vc_fiber_graph_solve PUBLIC vc_core vc_fiber_tracer vc_object_store::vc_geometry
     PRIVATE nlohmann_json::nlohmann_json)
 set_target_properties(vc_fiber_graph_solve PROPERTIES POSITION_INDEPENDENT_CODE ON)
 

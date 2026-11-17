@@ -44,9 +44,45 @@ Anchors are projected onto their fiber's polyline; an anchor farther than
 coordinate-frame guard rather than a tolerance to widen. Identical
 `(a, b, target)` relations are aggregated, their weights summed.
 
-Measured perpendicular/parallel/enclosure constraints are not part of this
-step; the constraint kind is already in the result rows so they can join
-without changing the readers.
+### Measured constraints
+
+A crossing of two annotated fibers asserts a winding step too, and the
+library states those exactly as the automatic pipeline does
+(`windingEventRelation`, shared with `prepareFiberWindingGraph`):
+
+- **normals** (`ScaffoldNormals.hpp`). Each fiber gets a strip normal from its
+  own geometry (`solveFiberStripNormals`), which is an axis without a sign.
+  The annotation fixes the sign where it states one, in this precedence: a
+  control point's `display_normal` with source `manual`; the display normals
+  of the spans approved for the normals aspect; an adjacent link, whose two
+  anchors say which way is inward (the V fiber lies one winding inside the H
+  fiber, so both inward normals point from the H anchor towards the V one).
+  The fiber format states display normals outward, so the inward target is
+  their negation; the adjacent-link anchor assumes no convention at all.
+- **crossings** (`ScaffoldConstraints.hpp`). `extractFiberTraceConstraints`
+  runs on the annotation's own polylines, which stay whole (no piece
+  splitting). The geometry decides whether a crossing is parallel or
+  perpendicular; a crossing whose verdict disagrees with the two annotated
+  families is dropped and counted, never forced. The winding separation along
+  each connector comes from a Lasagna normal volume's `grad_mag` density
+  through a sampler the caller supplies; without one every relation keeps a
+  NaN separation, which asserts no arc but still witnesses an enclosure.
+- **signs**. The fibers no anchor fixed are decided by the perpendicular
+  crossings, with the native sign solve (`vc/fiber_tracer/FiberNormalSign.hpp`,
+  `irls` or `ceres`), from the radial prior of each fiber's own normals. An
+  anchored fiber's sign is held. The run records how many signs each source
+  decided, and how many anchored fibers the crossings disagreed with.
+- **relations**. A perpendicular crossing asserts the rounded separation plus
+  the half winding between the two families, a parallel one the separation
+  itself; a fractional separation asserts the two integers around it with the
+  weight split between them. The signed order of a perpendicular crossing also
+  bounds the pair's H->V step from one side, and a pair bounded from both
+  sides that agree fixes its step exactly: the *enclosure* relation. Weights
+  are `weights.perpendicular`, `weights.parallel` and `weights.enclosure`.
+
+Every kind lands in the same constraint list, so the solve, the contraction of
+approved constraints and the residual analysis treat a crossing exactly like a
+link.
 
 ## Solve
 
@@ -98,6 +134,19 @@ vc_scaffold_solve config.json
 | `links.include_auto` | `false` | also use `meta.auto` links |
 | `links.max_anchor_distance` | `5` | voxels, a hard guard |
 | `weights.manual` | `1` | weight per manual link arc |
+| `constraints.enabled` | `false` | also measure the scaffold's own crossings |
+| `constraints.resample_spacing`, `.maximum_distance`, `.tangent_window` | `32`, `128`, `32` | voxels, the extraction's geometry |
+| `constraints.relax_endpoint_certification` | `false` | accept crossings near a hand-drawn fiber's ends |
+| `constraints.winding_distances` | `true` | measure each connector's separation |
+| `constraints.winding_step` | `8` | voxels per integration step |
+| `constraints.maximum_winding_distance`, `.enforce_maximum_winding` | `1.5`, `false` | turns, and whether to reject beyond it |
+| `constraints.perpendicular_offset`, `.winding_scale`, `.enclosures` | `0.5`, `1`, `true` | relation conventions |
+| `weights.perpendicular`, `.parallel`, `.enclosure` | `1`, `1`, `1` | weight per measured arc |
+| `winding.manifest`, `winding.remote_cache` | — | the Lasagna normal dataset the separations are measured on |
+| `normals.twist_weight`, `.lateral_weight`, `.smoothing_sigma`, `.resample_spacing` | `100`, `1`, `32`, `32` | the strip solve |
+| `normals.manual_display_normals`, `.approved_pieces`, `.adjacent_links` | `true` | which anchors fix a sign |
+| `sign.solve`, `sign.backend` | `true`, `irls` | decide unanchored signs; `irls` or `ceres` |
+| `include_untagged` | `false` | load the fibers without an H/V tag too |
 | `lemon.backend`, `lemon.capacity_scale` | `network_simplex`, `1000` | flow backend |
 | `fix_approved_subgraphs` | `true` | contract approved subgraphs |
 | `max_alternative_paths` | `4` | redundancy cap |
@@ -184,3 +233,37 @@ approval state for the second), as do the component partition and the
 per-fiber windings up to the per-component gauge each solve is free to choose.
 Wall time, single run: 1.02 s reading the store, 0.024 s packing the geometry,
 0.011 s for the solve and residual analysis.
+
+The measured stages reproduce the reference extraction on the same store. With
+every fiber record loaded (293 fibers, 852,536 line points) and geometry strip
+normals, the native run finds 10,208 crossings — 8,315 parallel and 1,893
+perpendicular — which is what the reference Python extraction
+(`vc_wgraph extract`, `normal_source: geometry`) reports for the same store.
+Loading only the 292 H/V-tagged fibers leaves 10,195 crossings (8,302 parallel,
+1,893 perpendicular).
+
+A full variant A run on that store (292 tagged fibers, approved and pending
+links, winding separations from the PHerc0332 Lasagna normal volume, 32
+workers on an AMD EPYC 7J13 CPU):
+
+| Stage | Result |
+|---|---|
+| normals | 292 of 292 fibers solved, 46 anchored by the 23 adjacent links |
+| crossings | 10,195 crossings, all with a measured separation |
+| signs | 46 held, 228 decided by crossings, 18 left undecided; 26.9 % of the 353 strict crossings (axes within 30 degrees, less than one turn apart) disagree with the decided signs |
+| relations | 6,993 crossings assert an arc (11,796 after the fractional split), 786 dropped where the geometry's verdict disagrees with the annotated families; 747 enclosure pairs give 51 exact relations, 652 one-sided, 26 non-unique, 18 contradictory |
+| solve | 12,079 constraints over 1,969 aggregated arcs, 15 components, weighted L1 2,942.8 turns, 5,724 violated constraints, largest residual 9 turns |
+
+Wall time of that run: 1.05 s reading the store, 0.02 s packing the geometry,
+0.98 s for the strip normals, 0.37 s for the crossings, 0.03 s for the sign
+solve, 0.01 s assembling the relations and 1.74 s for the LEMON solve with its
+residual analysis.
+
+Those residuals are a statement about the *evidence*, not a verdict: a
+scaffold's geometry-only normals are weak evidence, as the strict sign
+disagreement of 26.9 % says, and the measured relations contradict the manual
+links accordingly. The 51 exact enclosure relations are the strongest of the
+measured kinds — they are integer bounds from both sides rather than a rounded
+measurement — and adding them alone to the 232 link constraints leaves 3
+violated constraints with a weighted L1 of 5 turns, which is what the approval
+dock is there to adjudicate.

@@ -1,0 +1,144 @@
+#pragma once
+// Measured winding evidence for a scaffold: the crossings of its annotated
+// fibers, the whole-fiber normal signs those crossings decide, and the integer
+// winding relations they assert.
+//
+// The manual links of ScaffoldWindingSolve.hpp are one kind of constraint; a
+// crossing of two fibers is another. Two H fibers (or two V fibers) that run
+// side by side are a *parallel* relation, an H and a V fiber that cross are a
+// *perpendicular* one, and the signed order of a perpendicular crossing - which
+// of the two lies further out - also bounds the H->V step of the pair exactly,
+// the *enclosure* relation. All three are assembled exactly as the automatic
+// pipeline assembles them (vc_object_store/geometry/FiberWindingGraph.hpp:
+// windingEventRelation), so a scaffold run and a traced run speak one language.
+//
+// The geometry comes from the scaffold's own polylines
+// (extractFiberTraceConstraints with preserveInputLinesAsPieces), the normals
+// from ScaffoldNormals, and the winding separation along a connector from a
+// sampler the caller supplies - VC3D the package's Lasagna normal dataset, the
+// CLI a dataset it opens. A relation without a measured separation is kept: it
+// still witnesses an enclosure.
+#include "vc/fiber_graph/ScaffoldNormals.hpp"
+#include "vc/fiber_graph/ScaffoldWindingSolve.hpp"
+#include "vc/fiber_tracer/FiberNormalSign.hpp"
+#include "vc/fiber_tracer/FiberTraceConstraints.hpp"
+
+#include <cstdint>
+#include <limits>
+#include <span>
+#include <vector>
+
+namespace vc::fiber_graph {
+
+// One measured crossing of two scaffold fibers, in the fibers' own normal
+// gauges (the whole-fiber signs are applied later, by the assembly).
+struct ScaffoldEvent {
+    std::int64_t a = 0, b = 0; // fiber indices in graph order
+    double arcA = 0, arcB = 0;
+    geometry::Point pointA{}, pointB{};
+    geometry::Point normalA{}, normalB{};
+    bool validA = false, validB = false, validConnector = false;
+    // The geometry's own verdict: the two fibers run side by side.
+    bool parallel = false;
+    // Separation along the connector in turns; NaN when none was measured.
+    double distance = std::numeric_limits<double>::quiet_NaN();
+    double closestDistance = 0; // voxels between the two anchors
+    double parallelScore = 0, perpendicularScore = 0;
+};
+
+struct ScaffoldEventOptions {
+    double resampleSpacing = 32.0;
+    double maximumDistance = 128.0;
+    double tangentWindow = 32.0;
+    // Accept crossings near a fiber's ends, which the automatic pipeline
+    // certifies against the trace's own endpoint support. A hand-drawn fiber
+    // ends where the annotator stopped, so relaxing it keeps the crossings
+    // there; off is the automatic extraction's own mode and the one a traced
+    // run compares against.
+    bool relaxEndpointCertification = false;
+    // Measure the winding separation of every accepted crossing. Off keeps
+    // the relations with a NaN separation: enclosure evidence only.
+    bool measureWindingDistances = true;
+    double windingIntegrationStep = 8.0;
+    // Reject a crossing whose measured separation exceeds this many turns.
+    // Off by default, as in the automatic extraction: a sparse scaffold has
+    // real crossings several windings apart, and a rejected one is evidence
+    // thrown away rather than a bad measurement caught.
+    double maximumWindingDistance = 1.5;
+    bool enforceMaximumWindingDistance = false;
+    std::size_t workers = 0; // 0: the extractor's own default
+};
+
+struct ScaffoldEventReport {
+    std::int64_t lines = 0, shortLines = 0, resampledPoints = 0;
+    std::int64_t events = 0, perpendicular = 0, parallel = 0;
+    std::int64_t withoutNormals = 0, withDistance = 0;
+    std::int64_t rejectedTangents = 0, rejectedWinding = 0, rejectedWindingCutoff = 0;
+    double seconds = 0;
+};
+
+// Winding separations along connectors, in turns. Required when
+// `measureWindingDistances` is set: the library substitutes no guess.
+using ScaffoldWindingDistances = fiber_tracer::FiberTraceWindingDistanceBatch;
+
+// The crossings of a scaffold. Throws std::invalid_argument when a separation
+// was asked for and no sampler was given.
+std::vector<ScaffoldEvent> scaffoldEvents(const ScaffoldGraph&, const ScaffoldGeometry&, const ScaffoldNormals&,
+                                          const ScaffoldEventOptions&, const ScaffoldWindingDistances&,
+                                          ScaffoldEventReport&);
+
+struct ScaffoldSignOptions {
+    fiber_tracer::FiberSignOptions sign;
+    // Decide the gauge of the fibers no anchor fixed, from the perpendicular
+    // crossings. Off leaves them at their geometry gauge, which only means
+    // something when every fiber carries an anchor.
+    bool solve = true;
+};
+
+struct ScaffoldSignResult {
+    // Per fiber: the multiplier that turns its gauge normal into the inward
+    // one, as the winding assembly's `normalSign` column.
+    std::vector<std::int64_t> sign;
+    // Per fiber: what decided that sign.
+    std::vector<ScaffoldSignSource> source;
+    fiber_tracer::FiberSignResult solve;
+    std::int64_t events = 0, fixed = 0, decided = 0, flipped = 0, undecided = 0;
+    // Anchored fibers whose sign the crossings would have flipped: the
+    // anchors held, but the evidence disagreed with them.
+    std::int64_t fixedDisagreements = 0;
+    bool solved = false;
+};
+
+// The whole-fiber normal signs of a scaffold: the anchored fibers keep their
+// gauge, the rest are decided by the crossings (vc/fiber_tracer/FiberNormalSign.hpp).
+ScaffoldSignResult scaffoldNormalSigns(const ScaffoldGraph&, const ScaffoldNormals&, std::span<const ScaffoldEvent>,
+                                       const ScaffoldSignOptions& = {});
+
+struct ScaffoldMeasuredOptions {
+    // Per-type weights, the names the automatic winding stage uses. A zero
+    // weight omits that type's arcs; enclosures are derived from the signed
+    // perpendicular events whatever the perpendicular weight is.
+    double perpendicularWeight = 1.0, parallelWeight = 1.0, enclosureWeight = 1.0;
+    // Half a winding between an H and a V fiber of the same sheet pair, and
+    // the scale the measured separations are read in.
+    double perpendicularOffset = 0.5, windingScale = 1.0;
+    bool enclosures = true;
+};
+
+struct ScaffoldMeasuredReport {
+    std::int64_t events = 0, used = 0, expanded = 0, withoutDistance = 0;
+    std::int64_t perpendicular = 0, parallel = 0;
+    std::int64_t skippedInvalid = 0, skippedUntagged = 0, skippedSelf = 0, skippedFamilyMismatch = 0;
+    std::int64_t enclosurePairs = 0, enclosureArcs = 0, enclosureOneSided = 0, enclosureContradictory = 0,
+                 enclosureNonunique = 0;
+};
+
+// The measured constraints of a scaffold, one per asserted relation (a
+// fractional separation asserts the two integers around it, with the
+// weight split between them). `normalSign` holds one +-1 per fiber.
+std::vector<ScaffoldConstraint> scaffoldMeasuredConstraints(const ScaffoldGraph&, const ScaffoldGeometry&,
+                                                           std::span<const ScaffoldEvent>,
+                                                           std::span<const std::int64_t> normalSign,
+                                                           const ScaffoldMeasuredOptions&, ScaffoldMeasuredReport&);
+
+} // namespace vc::fiber_graph

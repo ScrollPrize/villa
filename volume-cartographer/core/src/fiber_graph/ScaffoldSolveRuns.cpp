@@ -73,7 +73,8 @@ void scanRun(const objects::StoreReader& reader, FiberGraphTable kind, const std
 } // namespace
 
 ScaffoldRunRows scaffoldSolveRunRows(const ScaffoldGraph& graph, const ScaffoldSolveResult& result,
-                                     const ScaffoldSolveOptions& options, const ScaffoldRunRecord& record)
+                                     const ScaffoldSolveOptions& options, const ScaffoldRunRecord& record,
+                                     const ScaffoldRunStages& stages)
 {
     if (record.runUuid.empty()) throw std::invalid_argument("scaffold run: a run UUID is required");
     if (result.winding.size() != graph.fibers.size() || result.component.size() != graph.fibers.size())
@@ -96,6 +97,50 @@ ScaffoldRunRows scaffoldSolveRunRows(const ScaffoldGraph& graph, const ScaffoldS
         {"lemon_capacity_scale", options.flow.capacityScale},
         {"fix_approved_subgraphs", options.fixApprovedSubgraphs},
         {"max_alternative_paths", options.maxAlternativePaths}};
+    // The measured stages, when the run ran them. A run without them is a
+    // links-only run and says so by the absence of these keys.
+    if (stages.normalOptions) {
+        settings.emplace("normals_twist_weight", stages.normalOptions->strip.twistWeight);
+        settings.emplace("normals_lateral_weight", stages.normalOptions->strip.lateralWeight);
+        settings.emplace("normals_smoothing_sigma", stages.normalOptions->strip.smoothingSigma);
+        settings.emplace("normals_resample_spacing", stages.normalOptions->strip.resampleSpacing);
+        settings.emplace("normals_manual_display", stages.normalOptions->manualDisplayNormals);
+        settings.emplace("normals_approved_pieces", stages.normalOptions->approvedNormalPieces);
+        settings.emplace("normals_adjacent_links", stages.normalOptions->adjacentLinkAnchors);
+        settings.emplace("normals_anchor_weight", stages.normalOptions->anchorWeight);
+    }
+    if (stages.eventOptions) {
+        settings.emplace("events_resample_spacing", stages.eventOptions->resampleSpacing);
+        settings.emplace("events_maximum_distance", stages.eventOptions->maximumDistance);
+        settings.emplace("events_tangent_window", stages.eventOptions->tangentWindow);
+        settings.emplace("events_relax_endpoint_certification", stages.eventOptions->relaxEndpointCertification);
+        settings.emplace("events_winding_distances", stages.eventOptions->measureWindingDistances);
+        settings.emplace("events_winding_step", stages.eventOptions->windingIntegrationStep);
+        settings.emplace("events_maximum_winding_distance", stages.eventOptions->maximumWindingDistance);
+        settings.emplace("events_enforce_maximum_winding", stages.eventOptions->enforceMaximumWindingDistance);
+    }
+    if (stages.measuredOptions) {
+        settings.emplace("weight_perpendicular", stages.measuredOptions->perpendicularWeight);
+        settings.emplace("weight_parallel", stages.measuredOptions->parallelWeight);
+        settings.emplace("weight_enclosure", stages.measuredOptions->enclosureWeight);
+        settings.emplace("perpendicular_offset", stages.measuredOptions->perpendicularOffset);
+        settings.emplace("winding_scale", stages.measuredOptions->windingScale);
+        settings.emplace("enclosures", stages.measuredOptions->enclosures);
+    }
+    if (stages.signOptions) {
+        settings.emplace("sign_solve", stages.signOptions->solve);
+        settings.emplace("sign_backend_ceres",
+                         stages.signOptions->sign.backend == fiber_tracer::FiberSignBackend::Ceres);
+        settings.emplace("sign_dot_weight_power", stages.signOptions->sign.dotWeightPower);
+        settings.emplace("sign_prior_weight", stages.signOptions->sign.priorWeight);
+        settings.emplace("sign_fixed_weight", stages.signOptions->sign.fixedSignWeight);
+        settings.emplace("sign_broken_penalty", stages.signOptions->sign.brokenPenalty);
+        settings.emplace("sign_epsilon", stages.signOptions->sign.epsilon);
+        settings.emplace("sign_iterations", std::int64_t(stages.signOptions->sign.iterations));
+        settings.emplace("sign_fixed_keep", stages.signOptions->sign.fixedKeep);
+        settings.emplace("sign_inverse_square_distance",
+                         stages.signOptions->sign.distanceWeight == fiber_tracer::FiberSignDistanceWeight::InverseSquare);
+    }
 
     ScaffoldRunRows out;
     const auto add = [&](FiberGraphTable kind, std::vector<ExtensionRow> rows) {
@@ -116,6 +161,9 @@ ScaffoldRunRows scaffoldSolveRunRows(const ScaffoldGraph& graph, const ScaffoldS
              {"run_uuid", uuidValue(record.runUuid)},
              {"family", std::int64_t(fiber.family)},
              {"enabled", std::int64_t(fiber.family == ScaffoldFamily::Untagged ? 0 : 1)},
+             {"normal_sign", stages.signs && stages.signs->sign.size() == graph.fibers.size()
+                                 ? ExtensionValue{stages.signs->sign[i]}
+                                 : nullValue()},
              {"selected_winding", result.winding[i]},
              {"component", result.component[i]}}).values);
     }
@@ -127,22 +175,70 @@ ScaffoldRunRows scaffoldSolveRunRows(const ScaffoldGraph& graph, const ScaffoldS
             {{"run_uuid", uuidValue(record.runUuid)}, {"iteration", std::int64_t(0)}, {"scope", std::string("all")},
              {"name", std::string(name)}, {"value", value}, {"units", std::string(units)}}).values);
     };
-    const auto count = [&](const char* name, std::int64_t value) {
+    // Every count states what it counts: the rows are read by people.
+    const auto count = [&](const char* name, std::int64_t value, const char* units) {
         metrics.push_back(objects::fiberGraphSolveRow(FiberGraphTable::Metrics,
             {{"run_uuid", uuidValue(record.runUuid)}, {"iteration", std::int64_t(0)}, {"scope", std::string("all")},
-             {"name", std::string(name)}, {"count", value}, {"units", std::string("fibers")}}).values);
+             {"name", std::string(name)}, {"count", value}, {"units", std::string(units)}}).values);
     };
     metric("weighted_l1", result.objective, "weighted_turns");
     metric("max_residual", result.maxResidual, "turns");
     metric("solve_seconds", result.seconds, "seconds");
-    count("fibers", std::int64_t(graph.fibers.size()));
-    count("arcs", std::int64_t(result.arcs.size()));
-    count("constraints", std::int64_t(result.constraints.size()));
-    count("components", result.components);
-    count("isolated_fibers", result.isolatedFibers);
-    count("violated_arcs", result.violatedArcs);
-    count("violated_constraints", result.violatedConstraints);
-    count("approved_subgraphs", result.approvedSubgraphs);
+    count("fibers", std::int64_t(graph.fibers.size()), "fibers");
+    count("arcs", std::int64_t(result.arcs.size()), "arcs");
+    count("constraints", std::int64_t(result.constraints.size()), "constraints");
+    count("components", result.components, "components");
+    count("isolated_fibers", result.isolatedFibers, "fibers");
+    count("violated_arcs", result.violatedArcs, "arcs");
+    count("violated_constraints", result.violatedConstraints, "constraints");
+    count("approved_subgraphs", result.approvedSubgraphs, "subgraphs");
+    count("contracted_fibers", result.contractedFibers, "fibers");
+    count("manual_constraints", result.constraintsByKind[std::size_t(ScaffoldConstraintKind::Manual)], "constraints");
+    count("perpendicular_constraints", result.constraintsByKind[std::size_t(ScaffoldConstraintKind::Perpendicular)], "constraints");
+    count("parallel_constraints", result.constraintsByKind[std::size_t(ScaffoldConstraintKind::Parallel)], "constraints");
+    count("enclosure_constraints", result.constraintsByKind[std::size_t(ScaffoldConstraintKind::Enclosure)], "constraints");
+    if (stages.normals) {
+        count("normal_fibers_solved", stages.normals->solved, "fibers");
+        count("normal_fibers_degenerate", stages.normals->degenerate, "fibers");
+        count("normal_fibers_anchored", stages.normals->anchoredFibers, "fibers");
+        count("normal_anchors_manual", stages.normals->manualAnchors, "anchors");
+        count("normal_anchors_approved_piece", stages.normals->approvedPieceAnchors, "anchors");
+        count("normal_anchors_adjacent_link", stages.normals->adjacentLinkAnchors, "anchors");
+        metric("normals_seconds", stages.normals->seconds, "seconds");
+    }
+    if (stages.events) {
+        count("events", stages.events->events, "events");
+        count("events_perpendicular", stages.events->perpendicular, "events");
+        count("events_parallel", stages.events->parallel, "events");
+        count("events_with_winding_distance", stages.events->withDistance, "events");
+        count("events_without_normals", stages.events->withoutNormals, "events");
+        metric("events_seconds", stages.events->seconds, "seconds");
+    }
+    if (stages.measured) {
+        count("measured_events_used", stages.measured->used, "events");
+        count("measured_without_distance", stages.measured->withoutDistance, "events");
+        count("enclosure_pairs", stages.measured->enclosurePairs, "fiber_pairs");
+        count("enclosure_one_sided", stages.measured->enclosureOneSided, "fiber_pairs");
+        count("enclosure_contradictory", stages.measured->enclosureContradictory, "fiber_pairs");
+        count("enclosure_nonunique", stages.measured->enclosureNonunique, "fiber_pairs");
+    }
+    if (stages.signs) {
+        count("sign_events", stages.signs->events, "events");
+        count("signs_fixed", stages.signs->fixed, "fibers");
+        count("signs_decided", stages.signs->decided, "fibers");
+        count("signs_flipped", stages.signs->flipped, "fibers");
+        count("signs_undecided", stages.signs->undecided, "fibers");
+        count("sign_fixed_disagreements", stages.signs->fixedDisagreements, "fibers");
+        if (stages.signs->solved) {
+            metric("sign_objective", stages.signs->solve.objective, "weighted_phase");
+            metric("sign_exact_objective", stages.signs->solve.exactObjective, "weighted_phase");
+            metric("sign_seconds", stages.signs->solve.seconds, "seconds");
+            metric("sign_weighted_disagreement_percent", stages.signs->solve.metrics.weightedDisagreementPercent,
+                   "percent");
+            metric("sign_strict_disagreement_percent", stages.signs->solve.metrics.strictDisagreementPercent,
+                   "percent");
+        }
+    }
     add(FiberGraphTable::Metrics, std::move(metrics));
 
     std::vector<ExtensionRow> residuals, pieces;
