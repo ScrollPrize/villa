@@ -1,5 +1,7 @@
 #pragma once
 #include "vc_object_store/objects/FiberGraphSolveExtension.hpp"
+#include "vc_object_store/objects/FiberPieceApprovalExtension.hpp"
+#include <nanobind/stl/tuple.h>
 #include "vc_object_store/objects/TransactionJson.hpp"
 
 // Included after StorageBindings.hpp: use the same transaction wrappers and
@@ -217,8 +219,173 @@ void bindExtensionApi(nb::class_<T>& cls)
     }, nb::arg("table"), nb::arg("reference"));
 }
 
+// ---- Fiber piece approval -------------------------------------------------
+inline vo::FiberPieceAspect fiberPieceAspectFromPy(const std::string& name)
+{
+    if (name == "geometry") return vo::FiberPieceAspect::Geometry;
+    if (name == "normals") return vo::FiberPieceAspect::Normals;
+    throw std::invalid_argument("fiber piece aspect is geometry or normals");
+}
+inline const char* fiberPieceAspectName(vo::FiberPieceAspect aspect)
+{
+    return aspect == vo::FiberPieceAspect::Normals ? "normals" : "geometry";
+}
+inline nb::dict fiberPieceApprovalToPy(const vo::FiberPieceApproval& row)
+{
+    nb::dict d;
+    d["fiber_uuid"] = row.fiberUuid; d["row_uuid"] = row.rowUuid; d["approval_uuid"] = row.approvalUuid;
+    d["aspect"] = fiberPieceAspectName(row.aspect);
+    d["state"] = row.state == vo::FiberPieceState::Revoked ? "revoked" : "approved";
+    d["supersedes"] = row.supersedes ? nb::cast(*row.supersedes) : nb::none();
+    d["lock_cp_a"] = row.lockCpA;
+    d["lock_cp_b"] = row.lockCpB ? nb::cast(*row.lockCpB) : nb::none();
+    d["inside_cp"] = row.insideCp; d["fiber_version"] = row.fiberVersion;
+    d["author"] = row.author; d["approved_at"] = row.approvedAt; d["host"] = row.host;
+    d["changed_by"] = row.changedBy ? nb::cast(*row.changedBy) : nb::none();
+    d["changed_at"] = row.changedAt ? nb::cast(*row.changedAt) : nb::none();
+    nb::list spans, controls;
+    for (const auto& span : row.spans) spans.append(nb::make_tuple(span.idLow, span.idHigh, span.hash));
+    for (const auto& control : row.controls) controls.append(nb::make_tuple(control.id, control.hash));
+    d["spans"] = spans; d["controls"] = controls;
+    return d;
+}
+inline vo::FiberPieceApproval fiberPieceApprovalFromPy(const nb::dict& d)
+{
+    vo::FiberPieceApproval row;
+    const auto optionalText = [&](const char* key) -> std::optional<std::string> {
+        if (!d.contains(key) || d[key].is_none()) return std::nullopt;
+        return nb::cast<std::string>(d[key]);
+    };
+    row.fiberUuid = nb::cast<std::string>(d["fiber_uuid"]);
+    row.rowUuid = nb::cast<std::string>(d["row_uuid"]);
+    row.approvalUuid = nb::cast<std::string>(d["approval_uuid"]);
+    row.aspect = fiberPieceAspectFromPy(nb::cast<std::string>(d["aspect"]));
+    const auto state = nb::cast<std::string>(d["state"]);
+    if (state != "approved" && state != "revoked") throw std::invalid_argument("fiber piece state is approved or revoked");
+    row.state = state == "revoked" ? vo::FiberPieceState::Revoked : vo::FiberPieceState::Approved;
+    row.supersedes = optionalText("supersedes");
+    row.lockCpA = nb::cast<int64_t>(d["lock_cp_a"]);
+    if (d.contains("lock_cp_b") && !d["lock_cp_b"].is_none()) row.lockCpB = nb::cast<int64_t>(d["lock_cp_b"]);
+    row.insideCp = nb::cast<int64_t>(d["inside_cp"]);
+    row.fiberVersion = nb::cast<int64_t>(d["fiber_version"]);
+    row.author = nb::cast<std::string>(d["author"]);
+    row.approvedAt = nb::cast<std::string>(d["approved_at"]);
+    row.host = nb::cast<std::string>(d["host"]);
+    row.changedBy = optionalText("changed_by");
+    row.changedAt = optionalText("changed_at");
+    if (d.contains("spans"))
+        for (const auto item : d["spans"]) {
+            const auto t = nb::cast<std::tuple<int64_t, int64_t, uint64_t>>(item);
+            row.spans.push_back({std::get<0>(t), std::get<1>(t), std::get<2>(t)});
+        }
+    if (d.contains("controls"))
+        for (const auto item : d["controls"]) {
+            const auto t = nb::cast<std::tuple<int64_t, uint64_t>>(item);
+            row.controls.push_back({std::get<0>(t), std::get<1>(t)});
+        }
+    return row;
+}
+// {"control_ids": [...], "control_points": [[x,y,z],...], "line_points": [[x,y,z],...], "annotations": [{...},...]}
+inline vo::FiberPieceContent fiberPieceContentFromPy(const nb::dict& d)
+{
+    vc::geometry::Fiber fiber;
+    fiber.controlPointIds = nb::cast<std::vector<int64_t>>(d["control_ids"]);
+    fiber.controlPoints = nb::cast<std::vector<std::array<double, 3>>>(d["control_points"]);
+    if (d.contains("line_points")) fiber.linePoints = nb::cast<std::vector<std::array<double, 3>>>(d["line_points"]);
+    nlohmann::json annotations = nlohmann::json::array();
+    if (d.contains("annotations")) annotations = nlohmann::json::parse(jsonDumps(d["annotations"]));
+    return vo::fiberPieceContent(fiber, annotations);
+}
+inline std::vector<vo::FiberPieceApproval> fiberPieceApprovalsFromPy(const nb::sequence& rows)
+{
+    std::vector<vo::FiberPieceApproval> result;
+    for (const auto item : rows) result.push_back(fiberPieceApprovalFromPy(nb::cast<nb::dict>(item)));
+    return result;
+}
+inline vo::FiberPieceRange fiberPieceRangeFromPy(const vo::FiberPieceContent& content, int64_t lockCpA,
+                                                 const std::optional<int64_t>& lockCpB, int64_t insideCp)
+{
+    const auto range = vo::fiberPieceRange(content, lockCpA, lockCpB, insideCp);
+    if (!range) throw std::invalid_argument("fiber piece: the lock and inside control points do not delimit a range");
+    return *range;
+}
+
+inline void bindFiberPieceApproval(nb::module_& module)
+{
+    module.attr("FIBER_LOCK_CONTROL_POINT_TAG") = vo::kFiberLockControlPointTag;
+    module.attr("FIBER_PIECE_APPROVAL_TABLE") = vo::kFiberPieceApprovalTable;
+    module.def("fiber_piece_approval_table", [] { return extensionTableToPy(vo::fiberPieceApprovalTable()); },
+        "The ext_fiber_piece_approval definition (docs/fiber-piece-approval.md).")
+    .def("fiber_piece_approval_from_row", [](const nb::sequence& values) {
+        return fiberPieceApprovalToPy(vo::decodeFiberPieceApprovalRow(extensionRowFromPy(values)));
+    }, nb::arg("values"), "Decode a typed row of ext_fiber_piece_approval into a dict.")
+    .def("fiber_piece_approval_to_row", [](const nb::dict& row) {
+        return extensionRowToPy(vo::fiberPieceApprovalRow(fiberPieceApprovalFromPy(row)));
+    }, nb::arg("row"), "Encode an approval dict as the typed row to append.")
+    .def("fingerprint_fiber_piece", [](const nb::dict& fiber, int64_t lockCpA, const std::optional<int64_t>& lockCpB,
+                                       int64_t insideCp, const std::string& aspect) {
+        const auto content = fiberPieceContentFromPy(fiber);
+        const auto prints = vo::fingerprintFiberPiece(content, fiberPieceRangeFromPy(content, lockCpA, lockCpB, insideCp),
+                                                      fiberPieceAspectFromPy(aspect));
+        nb::list spans, controls;
+        for (const auto& span : prints.spans) spans.append(nb::make_tuple(span.idLow, span.idHigh, span.hash));
+        for (const auto& control : prints.controls) controls.append(nb::make_tuple(control.id, control.hash));
+        nb::dict d; d["spans"] = spans; d["controls"] = controls; return d;
+    }, nb::arg("fiber"), nb::arg("lock_cp_a"), nb::arg("lock_cp_b"), nb::arg("inside_cp"), nb::arg("aspect") = "geometry",
+       "Span and control fingerprints of the piece between the lock control points (lock_cp_b None: to the fiber end).")
+    .def("approve_fiber_piece", [](const nb::dict& fiber, const std::string& fiberUuid, int64_t lockCpA,
+                                   const std::optional<int64_t>& lockCpB, int64_t insideCp, const std::string& aspect,
+                                   int64_t fiberVersion, const std::string& author, const std::string& approvedAt,
+                                   const std::string& host) {
+        const auto content = fiberPieceContentFromPy(fiber);
+        return fiberPieceApprovalToPy(vo::approveFiberPiece(content, fiberUuid,
+            fiberPieceRangeFromPy(content, lockCpA, lockCpB, insideCp), fiberPieceAspectFromPy(aspect),
+            fiberVersion, author, approvedAt, host));
+    }, nb::arg("fiber"), nb::arg("fiber_uuid"), nb::arg("lock_cp_a"), nb::arg("lock_cp_b"), nb::arg("inside_cp"),
+       nb::arg("aspect"), nb::arg("fiber_version"), nb::arg("author"), nb::arg("approved_at"), nb::arg("host") = std::string(),
+       "A fresh approval row (dict) for the piece, fingerprinted over `fiber`.")
+    .def("revoke_fiber_piece_approval", [](const nb::dict& row, const std::string& changedBy, const std::string& now) {
+        return fiberPieceApprovalToPy(vo::revokeFiberPieceApproval(fiberPieceApprovalFromPy(row), changedBy, now));
+    }, nb::arg("row"), nb::arg("changed_by"), nb::arg("now"), "The revocation row superseding a live approval row.")
+    .def("crop_fiber_piece_approvals", [](const nb::dict& fiber, const nb::sequence& live, size_t openedFirst,
+                                          size_t openedLast, const std::string& changedBy, const std::string& now) {
+        const auto content = fiberPieceContentFromPy(fiber);
+        nb::list result;
+        for (const auto& row : vo::cropFiberPieceApprovals(content, fiberPieceApprovalsFromPy(live), openedFirst, openedLast, changedBy, now))
+            result.append(fiberPieceApprovalToPy(row));
+        return result;
+    }, nb::arg("fiber"), nb::arg("live_rows"), nb::arg("opened_first"), nb::arg("opened_last"), nb::arg("changed_by"), nb::arg("now"),
+       "The superseding rows that crop every live row reaching into the opened control index range (inclusive).")
+    .def("fiber_piece_approval_states", [](const nb::dict& fiber, const nb::sequence& rows) {
+        const auto content = fiberPieceContentFromPy(fiber);
+        const auto states = vo::fiberPieceApprovalStates(content, fiberPieceApprovalsFromPy(rows));
+        nb::dict d;
+        nb::list live;
+        for (const auto& row : states.live) live.append(fiberPieceApprovalToPy(row));
+        d["live"] = live;
+        nb::dict spans, approved;
+        for (size_t aspect = 0; aspect < 2; ++aspect) {
+            const char* name = fiberPieceAspectName(vo::FiberPieceAspect(aspect));
+            nb::list entries;
+            for (const auto& state : states.spans[aspect]) {
+                nb::dict e; e["row"] = state.row ? nb::cast(*state.row) : nb::none(); e["current"] = state.current; entries.append(e);
+            }
+            spans[name] = entries;
+            approved[name] = states.approvedSpans[aspect];
+        }
+        d["spans"] = spans; d["approved_spans"] = approved;
+        d["row_current"] = states.rowCurrent;
+        d["lock_cp_ids"] = std::vector<int64_t>(states.lockCpIds.begin(), states.lockCpIds.end());
+        d["releasable_lock_cp_ids"] = std::vector<int64_t>(states.releasableLockCpIds.begin(), states.releasableLockCpIds.end());
+        return d;
+    }, nb::arg("fiber"), nb::arg("rows"),
+       "Per-span approval state of the fiber under these rows: live rows, per-aspect span states and approved spans, "
+       "row currency, referenced and releasable lock control-point ids.");
+}
+
 inline void bindExtensionHelpers(nb::module_& module)
 {
+    bindFiberPieceApproval(module);
     module.def("encode_fiber_arc",[](double value){const auto b=vo::encodeFiberArc(value);return nb::bytes(reinterpret_cast<const char*>(b.data()),b.size());});
     module.def("encode_fiber_direction",[](const std::array<double,3>& value){const auto b=vo::encodeFiberDirection(value);return nb::bytes(reinterpret_cast<const char*>(b.data()),b.size());});
     module.def("encode_fiber_winding",[](double value)->nb::object{const auto b=vo::encodeFiberWindingDistance(value);if(!b)return nb::none();const char c=char(*b);return nb::bytes(&c,1);});

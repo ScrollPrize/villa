@@ -64,6 +64,7 @@ add_library(vc_objects ${_vc_store_library_type}
     imports/FiberImportExtension.cpp
     imports/FiberConstraintGraph.cpp
     imports/FiberGraphSolveExtension.cpp
+    imports/FiberPieceApprovalExtension.cpp
     imports/FiberUvExport.cpp
     imports/TrackCrossingStore.cpp
     VolumeTransforms.cpp
