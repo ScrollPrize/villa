@@ -574,7 +574,7 @@ Checkpoints embed their training config, so inference rebuilds the model and its
 | 28 (the published 9.362&nbsp;µm renders, the w035 render above) | slices 6–22 | −6 … +5 |
 | 41 (`--num-slices 41`) | slices 12–28 | −12 … +12 |
 
-For example, on the 28-slice render `--layer-start 3 --layer-end 20` shifts the window by −3. Windows that extend past the last rendered slice are zero-padded silently (e.g. `--layer-start 13 --layer-end 30`, k = +7 on 28 slices, gives only 15 real slices), so render deep enough: `vc_render_tifxyz --num-slices`. The log line `Selected source layer indices=` shows which slices were used.
+For example, on the 28-slice render `--layer-start 3 --layer-end 20` shifts the window by −3. Windows that extend past the last rendered slice are clamped: on 28 slices, `--layer-start 13 --layer-end 30` (k = +7) keeps only slices 13–27, and these 15 are centered in the model's 17-slice input with one zero slice on each side, so the run acts like k = +6 with missing data at both ends. Render deep enough (`vc_render_tifxyz --num-slices`). The log line `Selected source layer indices=` shows which slices were used.
 
 Run both seeds and a few different steps; and when you don't know which way the surface faces, run both directions too (`--direction both`). Here is how the two seeds compare on the w035 render from above:
 
