@@ -1062,6 +1062,8 @@ NB_MODULE(_core, m) {
     m.def("cuda_available", &cuda_available, "True if built with CUDA and a GPU is usable");
     m.def("release_pinned_memory", &release_pinned_memory,
           "free the page-locked host buffers kept for reuse by later reconstructors (CUDA; up to 24 GB)");
+    m.def("release_device_scratch", &release_device_scratch,
+          "free the device scratch the CUDA kernels keep between calls on this thread (done by a reconstructor's end)");
 #ifdef VC_TOMOGRAPHY_WITH_CUDA
     m.attr("built_with_cuda") = true;
 #else

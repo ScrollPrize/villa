@@ -1,5 +1,5 @@
-"""networks/denoising: the network's tiling and the spool's bookkeeping. Needs PyTorch (vc_tomography's environment has
-none: the tests are skipped there); on the host, small sizes."""
+"""networks/denoising: the network's tiling and the spool's bookkeeping. Needs PyTorch (`uv sync --extra denoise`; skipped
+without it); on the host, small sizes."""
 import importlib.util
 from pathlib import Path
 

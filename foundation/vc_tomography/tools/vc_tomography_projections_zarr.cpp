@@ -171,7 +171,7 @@ std::string spec_of(const Scan& s, const Json& tile) {
 
 int usage() {
     std::fprintf(stderr, "usage: vc_tomography_projections_zarr OUT.zarr SCALE_DIR [SCALE_DIR ...] [--tiles T ...] [--threads N] [--level L] [--no_verify]\n"
-                         "(see the head of tools/vc_tomography_projections_zarr.cpp and README.md)\n");
+                         "(see the head of tools/vc_tomography_projections_zarr.cpp and docs/reconstruction.md)\n");
     return 2;
 }
 

@@ -22,8 +22,8 @@ A.npz>B.npz is a pair of which A is always the input: two runs of vc_tomography'
 
 apply writes, for the block's region: even, odd (the network on each half: neither has seen the other half), full
 (their mean: the picture of all the projections) and full_direct (the network on the reconstruction of all the
-projections, whose noise is half of what it was trained on). Run with an environment that has PyTorch (in this
-repository: the vesuvius one); it reads and writes .npz files only. Whole volumes: denoise_spool.py, masked_volume.py.
+projections, whose noise is half of what it was trained on). Run with vc_tomography's environment with the
+`denoise` extra (PyTorch); it reads and writes .npz files only. Whole volumes: denoise_spool.py, masked_volume.py.
 """
 import argparse
 import sys

@@ -310,6 +310,7 @@ struct SliceReconstructor::Impl {
     bool take_prefetch(int lo, int hi, int m);  // true: pinned now holds that chunk's raw windows
     ~Impl() {
         if (pf_thread.joinable()) pf_thread.join();
+        if (cfg.device == Device::CUDA) release_device_scratch();   // (the kernels' thread_local scratch: see common.hpp)
     }
     cuda::DeviceBuffer<float> R, RW, Wp, Aha, Bha, Atot, Btot, S, W, row, wrow, pad, slice, arc_d;
     cuda::DeviceBuffer<float> R2, RW2, Wp2, Aha2, Bha2, Atot2, Btot2, W2, w2row, brow;   // (band-dependent weights)

@@ -57,7 +57,7 @@ int usage() {
                  "                         [--start S] [--step S] [--direction auto|+1|-1] [--interpolation bicubic|linear] [--out_shape H W]\n"
                  "                         [--xy_slices N] [--slice_margin M] [--u8_window LO HI] [--surface_zarr] [--tag TAG] [--out_root DIR]\n"
                  "                         [--overwrite] [--config FILE]\n"
-                 "(see the head of tools/vc_tomography_composite.cpp and README.md)\n");
+                 "(see the head of tools/vc_tomography_composite.cpp and docs/reconstruction.md)\n");
     return 2;
 }
 

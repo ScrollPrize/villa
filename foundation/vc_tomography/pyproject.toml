@@ -14,6 +14,7 @@ vc_tomography_download_projections = "vc_tomography.download_projections:main"
 
 [project.optional-dependencies]
 test = ["pytest", "tifffile", "h5py", "hdf5plugin"]
+denoise = ["torch>=2.12,<3"]
 
 [tool.uv.sources]
 vc-reader = { path = "../../vc_reader" }

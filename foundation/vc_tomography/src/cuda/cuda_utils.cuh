@@ -3,8 +3,12 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <functional>
+#include <memory>
 #include <mutex>
+#include <new>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -89,6 +93,45 @@ class DeviceBuffer {
   private:
     T* ptr_ = nullptr;
     std::size_t n_ = 0;
+};
+
+// The kernels keep device scratch between calls in thread_local objects (buffers, cuFFT plans). They only grow, and
+// a thread_local lives as long as its thread: in a long-lived process (Python's main thread) they would outlast every
+// reconstructor. Each such object is registered on the thread that owns it,
+//     thread_local DeviceBuffer<float> a, b;
+//     thread_local ThreadScratch scratch(a, b);   // (declared after them: unregistered before they are destroyed)
+// and ThreadScratch::release() puts every registered object of the calling thread back to its default (empty) state.
+// The caller makes sure no work in flight still uses them (cudaDeviceSynchronize) and that no call on this thread is
+// using them (the kernels are not re-entrant across threads: each thread only touches its own).
+class ThreadScratch {
+  public:
+    template <class... T>
+    explicit ThreadScratch(T&... objects) {
+        (releases_.push_back([&o = objects] {
+             using O = std::remove_reference_t<decltype(o)>;
+             std::destroy_at(&o);
+             ::new (static_cast<void*>(&o)) O();
+         }),
+         ...);
+        list().push_back(this);
+    }
+    ~ThreadScratch() {
+        auto& l = list();
+        l.erase(std::remove(l.begin(), l.end(), this), l.end());
+    }
+    ThreadScratch(const ThreadScratch&) = delete;
+    ThreadScratch& operator=(const ThreadScratch&) = delete;
+    static void release() {
+        for (ThreadScratch* s : list())
+            for (auto& r : s->releases_) r();
+    }
+
+  private:
+    static std::vector<ThreadScratch*>& list() {
+        thread_local std::vector<ThreadScratch*> l;
+        return l;
+    }
+    std::vector<std::function<void()>> releases_;
 };
 
 // Process-wide cache of page-locked allocations. Locking pages costs ~0.2 s/GB, so the buffers a reconstructor

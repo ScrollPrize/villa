@@ -130,6 +130,7 @@ void accumulate(const AccumScanView& view, const ContributorList& c, const Accum
     thread_local DeviceBuffer<int8_t> d_role;
     thread_local DeviceBuffer<float> d_col, d_col_wt, d_delay;
     thread_local DeviceBuffer<ResampleRow> d_row;
+    thread_local ThreadScratch scratch(d_off, d_proj, d_slot, d_slot_proj, d_role, d_col, d_col_wt, d_delay, d_row);
     AccumScanView s = view;
     // the vertically interpolated values of the block's projections, once each (they are the same at every column
     // tap of every pixel a sample lands on); measured-only gridding interpolates per corner instead, unless the scan

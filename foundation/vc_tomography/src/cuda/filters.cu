@@ -33,6 +33,7 @@ void median_frames(float* frames, int n_frames, int H, int W, int radius, void* 
     cudaStream_t s = as_stream(stream);
     const size_t n = static_cast<size_t>(n_frames) * H * W;
     thread_local DeviceBuffer<float> tmp;
+    thread_local ThreadScratch scratch(tmp);
     tmp.ensure(n);
     VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpyAsync(tmp.data(), frames, n * sizeof(float), cudaMemcpyDeviceToDevice, s));
     const unsigned grid = grid_for(n);

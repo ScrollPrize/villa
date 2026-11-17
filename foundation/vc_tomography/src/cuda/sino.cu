@@ -289,6 +289,7 @@ void angular_fir(const float* in, float* out, int n_proj, int n_cols, const floa
 void ramp_pad(const float* sino, float* padded, const RampGeometry& g, void* stream, const int32_t* opposite) {
     cudaStream_t s = as_stream(stream);
     thread_local DeviceBuffer<float> adj;  // reused: no allocation / synchronisation per call
+    thread_local ThreadScratch scratch(adj);
     adj.ensure(g.n_proj);
     ramp_adj_kernel<<<g.n_proj, 32, 0, s>>>(sino, adj.data(), g, opposite);
     VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());

@@ -80,6 +80,7 @@ struct Compactor {  // CUB scratch, reused
 };
 Compactor& compactor() {
     thread_local Compactor c;
+    thread_local ThreadScratch scratch(c);
     return c;
 }
 }  // namespace
@@ -112,6 +113,7 @@ void backproject_list(const float* sino, const void* cs_sn, int n_angles, int n_
     const float r = p.clip_radius >= 0.f ? p.clip_radius : c;
     // (kept between calls; the host table is the caller's and outlives the call)
     thread_local DeviceBuffer<float> d_fan;
+    thread_local ThreadScratch scratch(d_fan);
     if (p.fan && p.n_fan < 1) throw Error("backproject_list: a fan without columns");
     if (p.fan) {
         d_fan.ensure(static_cast<size_t>(p.n_fan));

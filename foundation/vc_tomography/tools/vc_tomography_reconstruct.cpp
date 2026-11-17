@@ -91,7 +91,7 @@ int usage() {
                  "                           [--u8_compression vc-delta3d|none|zlib] [--u8_delta3d_preset fast|medium|slow|slower|delta]\n"
                  "                           [--tag TAG] [--out_root DIR] [--previews] [--overwrite] [--set KEY=VALUE ...] [--device cuda|cpu]\n"
                  "                           [--cache_dir DIR] [--projection_store STORE.zarr] [--reduce 0|1|2|3]\n"
-                 "(see the head of tools/vc_tomography_reconstruct.cpp and README.md)\n");
+                 "(see the head of tools/vc_tomography_reconstruct.cpp and docs/reconstruction.md)\n");
     return 2;
 }
 

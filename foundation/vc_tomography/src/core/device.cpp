@@ -33,4 +33,11 @@ void release_pinned_memory() {
 #endif
 }
 
+void release_device_scratch() {
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
+    cudaDeviceSynchronize();   // (work in flight may still use the scratch; an error here is the caller's to see later)
+    cuda::ThreadScratch::release();
+#endif
+}
+
 }  // namespace vc_tomography

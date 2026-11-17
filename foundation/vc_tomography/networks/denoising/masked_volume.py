@@ -2,10 +2,11 @@
 OME-Zarr under a mask, where the reconstruction needs the device to itself.
 
     python masked_volume.py DATA --cache DIR --geometry CAL.json --filters CHAIN [--set KEY=VALUE ..]
-                            --window LO HI --voxel_um UM --mask MASK.npy --model model.pt --torch_python PYTHON
+                            --window LO HI --voxel_um UM --mask MASK.npy --model model.pt [--torch_python PYTHON]
                             --zarr OUT.zarr [--zarr_not_denoised RAW.zarr] --spool DIR [--slices J0 J1]
 
-Run with vc_tomography's environment; --torch_python is the Python of an environment that has PyTorch. The reconstruction's
+Run with vc_tomography's environment, installed with the `denoise` extra (PyTorch); --torch_python names another
+Python for the network (default: this one). The reconstruction's
 parameters are those of reconstruct_block.py (`pinned_params`: the same recipe as the network's training blocks).
 
 The volume is vc_tomography's slice grid (grid x grid) over every height the scan can give: slice j is view height
@@ -13,9 +14,9 @@ The volume is vc_tomography's slice grid (grid x grid) over every height the sca
 segment (plus a margin for the network's halo):
 
     1. the segment's slices (with 8 neighbours either side) reconstructed into the spool folder by a process of their
-       own (the device is clean for it, and after it: a reconstructor released inside a process leaves some 4 GB
-       behind, which with the next one was too much on a device of 32 GB);
-    2. denoise_spool.py on the spool, as a process of the PyTorch environment (the device to itself);
+       own (the device is clean for it, and after it; a failed segment is retried in a new process at half the call
+       size);
+    2. denoise_spool.py on the spool, as a process of its own (the device to itself);
     3. what comes back (uint8) set to 0 outside the mask, put at its place in whole slices and given to the writer.
 
 A segment whose reconstruction fails (the device's memory) goes on in a new process with half as many slices a call.
@@ -91,7 +92,7 @@ def main():
     ap.add_argument("--zarr_not_denoised", default="", help="a second volume: the same slices without the network (same window, same mask)")
     ap.add_argument("--spool", required=True)
     ap.add_argument("--model")
-    ap.add_argument("--torch_python", help="the Python of an environment with PyTorch")
+    ap.add_argument("--torch_python", default=sys.executable, help="the Python that runs the network (default: this one)")
     ap.add_argument("--mask", help="the volume's 4x level > 0, as .npy (z, y, x)")
     ap.add_argument("--slices", type=int, nargs=2, default=None, help="slices [J0, J1) of the volume (default: all)")
     ap.add_argument("--segment", type=int, default=480)
@@ -106,7 +107,7 @@ def main():
     pinned = rb.pinned_params(a.geometry, a.filters, a.backprojector, a.set)
     if a.reconstruct_segment:
         return reconstruct_segment(a, pinned)
-    missing = [k for k in ("window", "voxel_um", "zarr", "model", "torch_python", "mask") if not getattr(a, k)]
+    missing = [k for k in ("window", "voxel_um", "zarr", "model", "mask") if not getattr(a, k)]
     if missing:
         ap.error("needed: " + ", ".join("--" + k for k in missing))
     from vc_tomography.omezarr import OmeZarrWriter

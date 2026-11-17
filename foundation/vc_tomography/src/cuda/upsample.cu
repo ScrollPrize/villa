@@ -103,6 +103,7 @@ void shift_rows(float* rows, int n_rows, int n, float shift, void* stream, const
     if (n_rows <= 0 || n <= 1) return;
     cudaStream_t s = as_stream(stream);
     thread_local RowShifter U;
+    thread_local ThreadScratch scratch(U);
     const int L = upsample_fft_length(n), S = shift_row_stride(n), nc = L / 2 + 1;
     U.ensure(L, 4096);
     cufft_check(cufftSetStream(U.fwd, s), "stream");
@@ -195,6 +196,7 @@ void resample_rows_at(float* rows, int n_rows, int n, const double* positions, c
     cudaStream_t s = as_stream(stream);
     thread_local RowShifter U;
     thread_local RowResampler V;
+    thread_local ThreadScratch scratch(U, V);
     const int L = upsample_fft_length(n), S = shift_row_stride(n), nc = L / 2 + 1;
     const int M = resample_oversampling * L, nco = M / 2 + 1, So = 2 * nco;
     U.ensure(L, 4096);
@@ -254,6 +256,7 @@ void upsample_rows(const float* in, float* out, int n_rows, int n, int os, void*
         return;
     }
     thread_local Upsampler U;
+    thread_local ThreadScratch scratch(U);
     const int L = upsample_fft_length(n);
     U.ensure(n_rows, L, os);
     cufft_check(cufftSetStream(U.fwd, s), "stream");

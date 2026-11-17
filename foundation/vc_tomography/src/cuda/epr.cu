@@ -64,6 +64,7 @@ void epr_frames(float* frames, int n_frames, int H, int W, const EprParams& p, F
                                                         static_cast<size_t>(std::max(1, n_frames))));
     const size_t cap = static_cast<size_t>(batch) * plane;
     thread_local DeviceBuffer<float> I, gx, gy, q, D, r;
+    thread_local ThreadScratch scratch(I, gx, gy, q, D, r);
     I.ensure(cap);
     if (p.iters > 0) {
         gx.ensure(cap);

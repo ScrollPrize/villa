@@ -82,6 +82,7 @@ void backproject(const float* sino, const float* angles_host, float* slice, int 
     thread_local DeviceBuffer<float2> d_cs;
     thread_local DeviceBuffer<int32_t> d_tiles;
     thread_local DeviceBuffer<float> d_fan;
+    thread_local ThreadScratch scratch(d_cs, d_tiles, d_fan);
     if (p.fan && p.n_fan < 1) throw Error("backproject: a fan without columns");
     if (p.fan) {
         d_fan.ensure(static_cast<size_t>(p.n_fan));
