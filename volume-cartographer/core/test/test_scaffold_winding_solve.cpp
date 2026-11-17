@@ -8,6 +8,7 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
+#include "vc/fiber_graph/ScaffoldRunMonitor.hpp"
 #include "vc/fiber_graph/ScaffoldSolveRuns.hpp"
 #include "vc/fiber_graph/ScaffoldWindingSolve.hpp"
 
@@ -209,6 +210,36 @@ TEST_CASE("a frustrated triangle names the cycle its violation lies on")
     for (const auto& piece : result.pieces) CHECK(piece.cycleHops == 3);
 }
 
+TEST_CASE("a monitor reports the solve's stages and takes the run back")
+{
+    Builder builder;
+    const auto h = builder.fiber(ScaffoldFamily::Horizontal, 100.);
+    const auto middle = builder.fiber(ScaffoldFamily::Horizontal, 110.);
+    const auto v = builder.fiber(ScaffoldFamily::Vertical, 120.);
+    builder.link(h, middle, false, "approved", 2., 2.);
+    builder.link(middle, v, false, "approved", 8., 8.);
+    builder.link(h, v, true, "approved", 5., 5.);
+    const ScaffoldGeometry geometry(builder.graph);
+    ScaffoldRunMonitor monitor;
+    ScaffoldSolveOptions options;
+    options.fixApprovedSubgraphs = false;
+    options.monitor = &monitor;
+    const auto result = solveScaffoldWinding(builder.graph, geometry, options);
+    CHECK(result.violatedConstraints == 1);
+    // The last stage a run passes through is the residual analysis, and it
+    // counted off exactly the violated constraints it searched cycles for.
+    const auto progress = monitor.progress();
+    CHECK(progress.stage == "residual cycles");
+    CHECK(progress.total == 1);
+    CHECK(progress.done == 1);
+
+    // Cancelled before it starts: nothing is solved, and the stage it died in
+    // says so rather than reporting a failure.
+    monitor.cancel();
+    CHECK(monitor.cancelled());
+    CHECK_THROWS_AS(solveScaffoldWinding(builder.graph, geometry, options), ScaffoldCancelled);
+}
+
 TEST_CASE("the shortest cycle wins over a longer one")
 {
     Builder builder;
@@ -380,6 +411,9 @@ TEST_CASE("a solve round-trips through the store's extension tables")
     CHECK(runs.front().metrics.at("weighted_l1") == doctest::Approx(result.objective));
     CHECK(runs.front().residuals == 1);
     CHECK(runs.front().settingsJson.find("\"fix_approved_subgraphs\":false") != std::string::npos);
+    // The store state the run read comes back, so a dock can tell a run that
+    // is behind the store from a current one.
+    CHECK(runs.front().input == record.input);
 
     const auto stored = readScaffoldResiduals(reader, record.runUuid);
     REQUIRE(stored.size() == 1);

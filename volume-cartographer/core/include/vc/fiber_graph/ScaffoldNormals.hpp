@@ -28,6 +28,7 @@
 // normals from the annotation and the fiber geometry only.
 #include "vc/fiber_graph/ScaffoldGraph.hpp"
 #include "vc/fiber_tracer/FiberStripNormals.hpp"
+#include "vc/fiber_graph/ScaffoldRunMonitor.hpp"
 
 #include <cstdint>
 #include <functional>
@@ -95,6 +96,18 @@ struct ScaffoldNormalOptions {
     std::vector<std::string> linkApprovalStates{"approved"};
     bool includeAutoLinks = false;
     std::size_t workers = 1;
+    // Vertices per call into the prediction sampler. A sample depends on
+    // nothing but its own point, so this changes no result; it only decides
+    // how often a fused run reports its progress and can be stopped.
+    // Measured on the PHerc0332 scaffold (851,285 line points, 32 workers,
+    // one run each): 107.7 s of prediction sampling in 65,536-point chunks
+    // against 107.6 s in a single call, so the chunking costs nothing and
+    // the default is small enough to stop within seconds.
+    std::size_t predictionChunkPoints = 65536;
+    // Optional progress and cancellation (ScaffoldRunMonitor.hpp). The
+    // prediction is sampled in chunks either way; with a monitor the stage
+    // counts the vertices off and stops between chunks.
+    ScaffoldRunMonitor* monitor = nullptr;
 };
 
 struct ScaffoldNormalReport {

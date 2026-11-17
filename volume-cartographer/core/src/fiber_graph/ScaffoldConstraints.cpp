@@ -70,7 +70,12 @@ std::vector<ScaffoldEvent> scaffoldEvents(const ScaffoldGraph& graph, const Scaf
     config.enforceMaximumWindingDistance = options.enforceMaximumWindingDistance;
     config.parallelThreads = options.workers;
 
+    if (options.monitor) {
+        options.monitor->enter("crossings");
+        options.monitor->checkpoint();
+    }
     const auto extracted = extractFiberTraceConstraints(lines, config, {}, distances);
+    if (options.monitor) options.monitor->checkpoint();
     report.resampledPoints = std::int64_t(extracted.resampledPoints);
     report.rejectedTangents = std::int64_t(extracted.rejectedTangents);
     report.rejectedWinding = std::int64_t(extracted.rejectedWinding);
@@ -161,6 +166,10 @@ ScaffoldSignResult scaffoldNormalSigns(const ScaffoldGraph& graph, const Scaffol
         return result;
     }
 
+    if (options.monitor) {
+        options.monitor->enter("normal signs");
+        options.monitor->checkpoint();
+    }
     result.solve = fiber_tracer::solveFiberNormalSigns(normals.radialAgreement(), signEvents, options.sign,
                                                        normals.fixedSigns());
     result.solved = true;

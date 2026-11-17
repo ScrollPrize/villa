@@ -50,7 +50,8 @@ std::vector<std::int64_t> componentLabels(UnionFind& sets, std::size_t nodes, st
 // component. Nodes without arcs stay at 0.
 std::vector<std::int64_t> solveComponents(std::size_t nodes, const std::vector<WindingArc>& arcs,
                                           const geometry::WindingFlowOptions& options,
-                                          geometry::WindingFlowQuantization* quantization = nullptr)
+                                          geometry::WindingFlowQuantization* quantization = nullptr,
+                                          ScaffoldRunMonitor* monitor = nullptr)
 {
     std::vector<std::int64_t> winding(nodes, 0);
     if (arcs.empty()) return winding;
@@ -62,7 +63,12 @@ std::vector<std::int64_t> solveComponents(std::size_t nodes, const std::vector<W
     std::vector<std::vector<const WindingArc*>> grouped(componentCount);
     for (const auto& arc : arcs) grouped[std::size_t(label[std::size_t(arc.a)])].push_back(&arc);
     std::vector<std::int64_t> local(nodes, -1);
+    if (monitor) monitor->enter("winding", std::int64_t(grouped.size()));
     for (std::size_t component = 0; component < grouped.size(); ++component) {
+        if (monitor) {
+            monitor->checkpoint();
+            monitor->advance();
+        }
         if (grouped[component].empty()) continue;
         std::vector<std::int64_t> members;
         for (const auto* arc : grouped[component])
@@ -358,6 +364,10 @@ ScaffoldSolveResult solveScaffoldWinding(const ScaffoldGraph& graph, const Scaff
         throw std::invalid_argument("scaffold winding: the alternative path cap must be non-negative");
     const auto started = std::chrono::steady_clock::now();
     const auto nodes = graph.fibers.size();
+    if (options.monitor) {
+        options.monitor->enter("constraints");
+        options.monitor->checkpoint();
+    }
 
     ScaffoldSolveResult result;
     result.constraints = scaffoldLinkConstraints(graph, geometry, options.links, result.linkReport);
@@ -427,7 +437,8 @@ ScaffoldSolveResult solveScaffoldWinding(const ScaffoldGraph& graph, const Scaff
         const auto target = arc.target + offset[std::size_t(arc.a)] - offset[std::size_t(arc.b)];
         contracted.push_back(a < b ? WindingArc{a, b, target, arc.weight} : WindingArc{b, a, -target, arc.weight});
     }
-    const auto solved = solveComponents(nodes, aggregateWindingArcs(contracted), options.flow, &result.quantization);
+    const auto solved =
+        solveComponents(nodes, aggregateWindingArcs(contracted), options.flow, &result.quantization, options.monitor);
     result.winding.resize(nodes);
     for (std::size_t i = 0; i < nodes; ++i)
         result.winding[i] = solved[std::size_t(representative[i])] + offset[i];
@@ -477,7 +488,14 @@ ScaffoldSolveResult solveScaffoldWinding(const ScaffoldGraph& graph, const Scaff
         if (residual[i] != 0) violated.push_back(std::int64_t(i));
     result.violatedConstraints = std::int64_t(violated.size());
     std::vector<ScaffoldResidual> entries(violated.size());
+    if (options.monitor) options.monitor->enter("residual cycles", std::int64_t(violated.size()));
     objects::parallelFor(violated.size(), std::max<std::size_t>(1, options.workers), [&](std::size_t task) {
+        // A cancelled run leaves the loop through its first checkpoint:
+        // parallelFor stops its other workers and rethrows here.
+        if (options.monitor) {
+            options.monitor->checkpoint();
+            options.monitor->advance();
+        }
         const auto i = std::size_t(violated[task]);
         const auto& constraint = result.constraints[i];
         auto& entry = entries[task];

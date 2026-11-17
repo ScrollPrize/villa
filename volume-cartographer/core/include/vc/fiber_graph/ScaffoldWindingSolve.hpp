@@ -19,6 +19,7 @@
 // many edge-disjoint alternatives exist. That is what the approval dock
 // orders by: smallest cycle first, then cost.
 #include "vc/fiber_graph/ScaffoldGraph.hpp"
+#include "vc/fiber_graph/ScaffoldRunMonitor.hpp"
 #include "vc_object_store/geometry/FiberWindingFlow.hpp"
 
 #include <array>
@@ -147,6 +148,10 @@ struct ScaffoldSolveOptions {
     // constraint.
     std::int64_t maxAlternativePaths = 4;
     std::size_t workers = 1;
+    // Optional progress and cancellation (ScaffoldRunMonitor.hpp): the solve
+    // stops between components and between the cycle searches of the
+    // residual analysis.
+    ScaffoldRunMonitor* monitor = nullptr;
 };
 
 struct ScaffoldSolveResult {

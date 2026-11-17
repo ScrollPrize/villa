@@ -19,6 +19,7 @@
 // CLI a dataset it opens. A relation without a measured separation is kept: it
 // still witnesses an enclosure.
 #include "vc/fiber_graph/ScaffoldNormals.hpp"
+#include "vc/fiber_graph/ScaffoldRunMonitor.hpp"
 #include "vc/fiber_graph/ScaffoldWindingSolve.hpp"
 #include "vc/fiber_tracer/FiberNormalSign.hpp"
 #include "vc/fiber_tracer/FiberTraceConstraints.hpp"
@@ -68,6 +69,10 @@ struct ScaffoldEventOptions {
     double maximumWindingDistance = 1.5;
     bool enforceMaximumWindingDistance = false;
     std::size_t workers = 0; // 0: the extractor's own default
+    // Optional progress and cancellation. The extraction itself is one call
+    // into the tracer, so a run can be taken back before and after it, not
+    // during it.
+    ScaffoldRunMonitor* monitor = nullptr;
 };
 
 struct ScaffoldEventReport {
@@ -94,6 +99,8 @@ struct ScaffoldSignOptions {
     // crossings. Off leaves them at their geometry gauge, which only means
     // something when every fiber carries an anchor.
     bool solve = true;
+    // Optional progress and cancellation, checked before the solve starts.
+    ScaffoldRunMonitor* monitor = nullptr;
 };
 
 struct ScaffoldSignResult {

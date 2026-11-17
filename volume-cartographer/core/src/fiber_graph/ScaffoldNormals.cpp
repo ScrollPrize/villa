@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <span>
 #include <cmath>
 #include <stdexcept>
 
@@ -62,6 +63,8 @@ ScaffoldNormals::ScaffoldNormals(const ScaffoldGraph& graph, const ScaffoldGeome
     if (prediction && (!(options.presenceFull > options.presenceFloor) || options.presenceFloor < 0))
         throw std::invalid_argument("scaffold normals: the presence range must rise from a non-negative floor");
     const auto started = std::chrono::steady_clock::now();
+    auto* const monitor = options.monitor;
+    if (monitor) monitor->checkpoint();
     const auto fibers = graph.fibers.size();
     report_.fibers = std::int64_t(fibers);
     signSources_.assign(fibers, ScaffoldSignSource::None);
@@ -179,9 +182,24 @@ ScaffoldNormals::ScaffoldNormals(const ScaffoldGraph& graph, const ScaffoldGeome
         vertices.reserve(fiberFirstVertex.back());
         for (const auto& line : lines)
             for (const auto& point : line) vertices.push_back({point[0], point[1], point[2]});
-        const auto sampled = prediction(vertices, std::max<std::size_t>(1, options.workers));
-        if (sampled.size() != vertices.size())
-            throw std::runtime_error("scaffold normals: the prediction returned a different sample count");
+        // Sampled in chunks: a sample depends on nothing but its own point,
+        // so this is the same result as one call, and it is the stage where a
+        // fused run spends its time - the one that has to be interruptible
+        // and has to say how far it is.
+        const auto chunkPoints = std::max<std::size_t>(1, options.predictionChunkPoints);
+        if (monitor) monitor->enter("prediction axis", std::int64_t(vertices.size()));
+        std::vector<ScaffoldPredictedAxis> sampled;
+        sampled.reserve(vertices.size());
+        for (std::size_t first = 0; first < vertices.size(); first += chunkPoints) {
+            if (monitor) monitor->checkpoint();
+            const auto count = std::min(chunkPoints, vertices.size() - first);
+            const auto chunk = prediction(std::span<const geometry::Point>(vertices.data() + first, count),
+                                          std::max<std::size_t>(1, options.workers));
+            if (chunk.size() != count)
+                throw std::runtime_error("scaffold normals: the prediction returned a different sample count");
+            sampled.insert(sampled.end(), chunk.begin(), chunk.end());
+            if (monitor) monitor->advance(std::int64_t(count));
+        }
         report_.predictedVertices = std::int64_t(vertices.size());
         std::vector<std::int64_t> withAxis(fibers, 0), nodesWithAxis(fibers, 0);
         std::vector<double> weightSum(fibers, 0.);
@@ -255,8 +273,13 @@ ScaffoldNormals::ScaffoldNormals(const ScaffoldGraph& graph, const ScaffoldGeome
     for (std::size_t i = 0; i < fibers; ++i)
         if (signSources_[i] != ScaffoldSignSource::None) fixedSigns_[i] = 1;
 
+    if (monitor) {
+        monitor->checkpoint();
+        monitor->enter("fiber normals", std::int64_t(fibers));
+    }
     const auto results = fiber_tracer::solveFiberStripNormals(lines, options.strip,
                                                               int(std::max<std::size_t>(1, options.workers)), &targets);
+    if (monitor) monitor->advance(std::int64_t(fibers));
     if (results.size() != fibers) throw std::runtime_error("scaffold normals: strip solve result count differs");
     for (std::size_t i = 0; i < fibers; ++i) {
         const auto& fiber = graph.fibers[i];
