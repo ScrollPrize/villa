@@ -223,8 +223,11 @@ Three docks (`FiberMapScaffoldSolve.hpp`, with the Qt-free ranking in
   fibers approved from end to end. Selecting a *measured* constraint enables
   **Approve constraint**, which records that this crossing is right
   (`ext_fiber_constraint_approval`); selecting one already approved offers to
-  revoke it instead. A link is never approved there: a link's approval is its
-  review state in the annotation.
+  revoke it instead. A crossing can only be approved once both pieces it lies
+  on carry a current geometry approval: a constraint is a statement about two
+  pieces of geometry, and pinning a solve to geometry nobody reviewed is what
+  the workflow is meant to prevent. A link is never approved there: a link's
+  approval is its review state in the annotation.
 
 The approval overlays are halos behind the fibers rather than a change of the
 fibers' own colour, so what the map says about a fiber's geometry stays what it

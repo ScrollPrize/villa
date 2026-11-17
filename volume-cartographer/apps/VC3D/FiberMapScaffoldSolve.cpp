@@ -498,6 +498,15 @@ QString ScaffoldSolveController::setConstraintApproval(const ScaffoldStoredResid
                 const auto span = vc::fiber_graph::scaffoldSpanCoveringArc(contents[side], arcs[side]);
                 if (!span) { error = tr("A fiber of this constraint has no span covering its anchor."); return; }
                 spans[side] = *span;
+                // A constraint is a statement about two pieces of geometry.
+                // Approving it before those pieces are approved would pin a
+                // solve to geometry nobody has reviewed.
+                const auto states = fiberPieceApprovalStates(contents[side], readFiberPieceApprovals(reader, uuids[side]));
+                const auto& approvedSpans = states.approvedSpans[std::size_t(FiberPieceAspect::Geometry)];
+                if (std::find(approvedSpans.begin(), approvedSpans.end(), spans[side]) == approvedSpans.end()) {
+                    error = tr("Approve the geometry of both pieces this crossing lies on first.");
+                    return;
+                }
             }
             values.push_back(fiberConstraintApprovalRow(
                 approveFiberConstraint(*identity, contents[0], spans[0], versions[0], contents[1], spans[1],
