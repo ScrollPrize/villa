@@ -24,7 +24,8 @@ from gap_parameterization import (
     lower_bounded_dr,
     lower_bounded_gap,
 )
-from geom_utils import expm_2x2, grid_sample_border, interp1d
+from geom_utils import (
+    _expm_2x2, _interp1d, expm_2x2, grid_sample_border, interp1d, maybe_compile)
 from sample_spiral import get_bounding_windings, get_theta_and_radii
 
 
@@ -285,6 +286,49 @@ class GapExpandingTransform(pyro.distributions.transforms.Transform):
         return transformed_zyx
 
 
+@maybe_compile
+def _varying_linear_fast(input_zyx, logits_table, min_z, max_z, inverse):
+    # VaryingLinearTransform._call's FIT_SPIRAL_FAST_LINEAR path without
+    # truncation, as one function so FIT_SPIRAL_COMPILE can fuse it.
+    zs = input_zyx[..., :1]
+    Z = logits_table.shape[0]
+    zn = (zs.view(-1) - min_z) / (max_z - min_z)
+    coord = (zn * 2 - 1 + 1) / 2 * (Z - 1)
+    coord = coord.clamp(min=0., max=float(Z - 1))
+    lo = coord.detach().floor().clamp(max=float(Z - 2) if Z > 1 else 0.)
+    frac = (coord - lo)[..., None]
+    lo = lo.to(torch.int64)
+    flat = logits_table.reshape(Z, 4)
+    if Z > 1:
+        logits = torch.lerp(
+            F.embedding(lo, flat), F.embedding(lo + 1, flat), frac)
+    else:
+        logits = F.embedding(lo, flat)
+    logits = logits.view(*input_zyx.shape[:-1], 2, 2)
+    if inverse:
+        logits = -logits
+    M = _expm_2x2(logits)
+    y, x = input_zyx[..., 1], input_zyx[..., 2]
+    yx_out = torch.stack([
+        M[..., 0, 0] * y + M[..., 0, 1] * x,
+        M[..., 1, 0] * y + M[..., 1, 1] * x,
+    ], dim=-1)
+    return torch.cat([zs, yx_out], dim=-1)
+
+
+@maybe_compile
+def _umbilicus_shift(input_zyx, z, yx_table, inverse):
+    # UmbilicusTransform._call as one function so FIT_SPIRAL_COMPILE can fuse
+    # the interpolation with the shift.
+    centre_yx = _interp1d(input_zyx[..., 0].contiguous(), z, yx_table)
+    # Add the centre to the yx columns directly rather than materialising
+    # a zero-padded [..., 3] offset; z passes through untouched (it only
+    # gained an exact +0 before) and the yx additions are identical.
+    yx = (input_zyx[..., 1:] - centre_yx if inverse
+          else input_zyx[..., 1:] + centre_yx)
+    return torch.cat([input_zyx[..., :1], yx], dim=-1)
+
+
 class VaryingLinearTransform(pyro.distributions.transforms.Transform):
 
     # This applies a z-dependent 2x2 linear transform M(z) on yx, parametrised
@@ -303,7 +347,15 @@ class VaryingLinearTransform(pyro.distributions.transforms.Transform):
 
     def _call(self, input_zyx, inverse=False):
         zs = input_zyx[..., :1]
-        if os.environ.get('FIT_SPIRAL_FAST_LINEAR', '1') != '0':
+        fast = os.environ.get('FIT_SPIRAL_FAST_LINEAR', '1') != '0'
+        if fast and self.truncate_frac is None:
+            # The steady step's path: lerp, expm and the 2x2 apply as one
+            # helper, so FIT_SPIRAL_COMPILE fuses the whole chain (and its
+            # backward) instead of only expm_2x2. Same operations in the same
+            # order as below.
+            return _varying_linear_fast(
+                input_zyx, self.logits, self.min_z, self.max_z, inverse)
+        if fast:
             # Explicit 1-D lerp over z + elementwise 2x2 apply. The
             # grid_sample this replaces is a pure z-interpolation on a
             # [Z, 2, 2] table (W=1, align_corners=True, border padding), but
@@ -366,13 +418,7 @@ class UmbilicusTransform(pyro.distributions.transforms.Transform):
         self._z = umbilicus_zyx[:, :1].contiguous()
 
     def _call(self, input_zyx, inverse=False):
-        centre_yx = interp1d(input_zyx[..., 0].contiguous(), self._z, self._yx)
-        # Add the centre to the yx columns directly rather than materialising
-        # a zero-padded [..., 3] offset; z passes through untouched (it only
-        # gained an exact +0 before) and the yx additions are identical.
-        yx = (input_zyx[..., 1:] - centre_yx if inverse
-              else input_zyx[..., 1:] + centre_yx)
-        return torch.cat([input_zyx[..., :1], yx], dim=-1)
+        return _umbilicus_shift(input_zyx, self._z, self._yx, inverse)
 
     def _inverse(self, input_zyx):
         return self._call(input_zyx, inverse=True)

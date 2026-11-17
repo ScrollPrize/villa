@@ -38,12 +38,20 @@ def maybe_compile(fn):
         # donated buffers assume single-use backward graphs and hard-error.
         import torch._functorch.config
         torch._functorch.config.donated_buffer = False
+        # Each call site sees its own sample count, and the fused transform
+        # helpers also specialise on their inverse flag, so a static-shape
+        # compile needs more than the default 8 graphs per function before it
+        # falls back to eager.
+        import torch._dynamo.config
+        for name in ('recompile_limit', 'cache_size_limit'):
+            if hasattr(torch._dynamo.config, name):
+                setattr(torch._dynamo.config, name,
+                        max(getattr(torch._dynamo.config, name), 64))
         return torch.compile(fn, dynamic=True)
     return fn
 
 
-@maybe_compile
-def expm_2x2(L):
+def _expm_2x2(L):
     # Closed-form matrix exponential for (..., 2, 2) matrices:
     # exp(L) = e^m (cosh(s) I + sinh(s)/s (L - m I)), where
     # m = tr(L)/2 and s^2 = ((a - d)/2)^2 + bc.
@@ -67,6 +75,11 @@ def expm_2x2(L):
         f_off * c,
         f_diag + f_off * (d - m),
     ], dim=-1).view(*L.shape)
+
+
+# The undecorated body stays callable so the fused transform helpers in
+# transforms.py can inline it into their own compiled graph.
+expm_2x2 = maybe_compile(_expm_2x2)
 
 
 @maybe_compile
@@ -105,7 +118,7 @@ def bilinear_atlas_lookup(zyxs_flat, offsets, widths, patch_indices, ijs, height
     return top + (bottom - top) * di
 
 
-def interp1d(x: torch.Tensor, xp: torch.Tensor, fp: torch.Tensor, dim: int=-1, extrapolate: str='const') -> torch.Tensor:
+def _interp1d(x: torch.Tensor, xp: torch.Tensor, fp: torch.Tensor, dim: int=-1, extrapolate: str='const') -> torch.Tensor:
     # See https://github.com/pytorch/pytorch/issues/50334
     m = (fp[1:] - fp[:-1]) / (xp[1:] - xp[:-1])
     b = fp[:-1] - (m * xp[:-1])
@@ -113,6 +126,9 @@ def interp1d(x: torch.Tensor, xp: torch.Tensor, fp: torch.Tensor, dim: int=-1, e
     indices = torch.searchsorted(xp.squeeze(-1), x) - 1
     indices = torch.clamp(indices, 0, len(m) - 1)
     return m[indices] * x[..., None] + b[indices]
+
+
+interp1d = maybe_compile(_interp1d)
 
 
 def grid_sample_border(input, grid):
