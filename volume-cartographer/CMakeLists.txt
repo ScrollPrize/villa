@@ -307,7 +307,7 @@ if(NOT MSVC AND CMAKE_BUILD_TYPE STREQUAL "QuickBuild")
     # and macro definitions that no automated test job consumes.
     set(_dbg -g1 -fno-omit-frame-pointer -fasynchronous-unwind-tables)
 endif()
-# Builds nobody debugs (static analysis such as the CodeQL job) can drop debug
+# Builds nobody debugs (static analysis, throwaway compile checks) can drop debug
 # info: -g3 makes up a large share of compile time and peak memory for the
 # template-heavy sources. -g0 last also overrides CMake's -g for Debug.
 option(VC_DEBUG_INFO "Emit debug info (GCC/Clang); OFF for analysis-only builds" ON)

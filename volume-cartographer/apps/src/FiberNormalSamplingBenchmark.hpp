@@ -40,8 +40,8 @@ inline nlohmann::json benchmarkFiberNormalSampling(const nlohmann::json& config,
     options.pointInterpolation=true;
     vc::lasagna::LasagnaNormalSampler fused(dataset,options);
     const auto channels=fused.regionChannels();
-    if(!channels[0].packed||channels[0].cuda||channels[0].array!=channels[1].array||channels[0].array!=channels[2].array)
-        throw std::invalid_argument("normal policy benchmark requires one CPU packed channel array");
+    if(!channels[0].packed||channels[0].cuda||channels[0].chunkValidity||channels[0].array!=channels[1].array||channels[0].array!=channels[2].array)
+        throw std::invalid_argument("normal policy benchmark requires one CPU packed channel array with a validity channel");
     // The caller participates, so workers-1 helpers gives this outer width.
     auto pool=vcr::sharedPool(workers-1);
     std::vector<Sample> expected(count),actual(count);
