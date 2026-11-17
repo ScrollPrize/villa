@@ -424,13 +424,23 @@ ScaffoldRunsPanel::ScaffoldRunsPanel(ScaffoldSolveController* controller, QWidge
                          "L1 is the weighted residual in turns, bad the violated constraints,\n"
                          "max the largest single residual in turns."));
     layout->addWidget(_tree, 1);
+    _followCheck = new QCheckBox(tr("Lay the map out from this solve"), this);
+    _followCheck->setObjectName(QStringLiteral("fiberMapFollowSolve"));
+    _followCheck->setToolTip(tr("Walk exactly the links the selected solve walked: the links it did\n"
+                                "not use carry no constraint here, and the ones it could not satisfy\n"
+                                "are drawn suspect. The map's own crossing evidence still places the\n"
+                                "fibers it says nothing about."));
+    layout->addWidget(_followCheck);
 
     if (_controller) {
         connect(_controller, &ScaffoldSolveController::runsChanged, this, [this]() { rebuild(); });
         connect(_tree, &QTreeWidget::itemSelectionChanged, this, [this]() { applySelection(); });
     }
+    connect(_followCheck, &QCheckBox::toggled, this, [this]() { emit followChanged(); });
     rebuild();
 }
+
+bool ScaffoldRunsPanel::follow() const { return _followCheck && _followCheck->isChecked(); }
 
 void ScaffoldRunsPanel::rebuild()
 {

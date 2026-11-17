@@ -483,6 +483,47 @@ private slots:
     // H fiber, lands one winding in, and the link is not suspect. The same
     // geometry with the V fiber's crossing read alone would only say "H is
     // outward of V" (W_H >= W_V + 1), which the link pins to equality.
+    // Following a saved solve: a link that solve did not use carries no
+    // constraint here and is not suspect for it; one it used and could not
+    // satisfy carries none either and is suspect, which is what the solve
+    // said about it.
+    void aFollowedSolveDecidesWhichLinksTheMapWalks()
+    {
+        const std::vector<cv::Vec3f> umbilicus = straightUmbilicus(40000);
+        std::vector<InputFiber> fibers = adjacentPair(4000.0, 150.0, 0.3 * kTwoPi, 'V');
+        addAdjacentLink(fibers[0], 1, fibers[1], 1);
+        for (auto& fiber : fibers)
+            for (auto& link : fiber.links) link.edgeUuid = "11111111-1111-4111-8111-111111111111";
+
+        GlobalLayoutParams unused = defaultParams();
+        unused.followed.unusedLinkUuids.insert("11111111-1111-4111-8111-111111111111");
+        const GlobalResult left =
+            vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, unused);
+        QCOMPARE(left.links.size(), std::size_t(1));
+        QVERIFY(left.links.front().notFollowed);
+        QVERIFY(!left.links.front().suspect);
+        QCOMPARE(left.suspectLinkCount, 0);
+        // Both fibers are still placed: the crossing evidence alone decides
+        // them, which only says the H fiber is outward of the V fiber.
+        QVERIFY(findFiber(left, 900) && findFiber(left, 901));
+
+        GlobalLayoutParams violated = defaultParams();
+        violated.followed.violatedLinkUuids.insert("11111111-1111-4111-8111-111111111111");
+        const GlobalResult broken =
+            vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, violated);
+        QCOMPARE(broken.links.size(), std::size_t(1));
+        QVERIFY(!broken.links.front().notFollowed);
+        QVERIFY(broken.links.front().suspect);
+        QCOMPARE(broken.suspectLinkCount, 1);
+
+        // Selecting another solve is a different input: the digests differ, so
+        // no memoized layout is reused across the two.
+        QVERIFY(!(vc3d::fiber_map::digestGlobalInputs(fibers, umbilicus, unused) ==
+                  vc3d::fiber_map::digestGlobalInputs(fibers, umbilicus, violated)));
+        QVERIFY(!(vc3d::fiber_map::digestGlobalInputs(fibers, umbilicus, unused) ==
+                  vc3d::fiber_map::digestGlobalInputs(fibers, umbilicus, defaultParams())));
+    }
+
     void adjacentLinkPlacesTheVerticalOneWindingInside()
     {
         const std::vector<cv::Vec3f> umbilicus = straightUmbilicus(40000);

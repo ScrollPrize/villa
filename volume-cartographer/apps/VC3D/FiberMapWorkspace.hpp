@@ -166,6 +166,9 @@ private:
     // Redraws the approval overlays: the approved spans while their highlight
     // is on, and the stretch or constraint the approval dock has selected.
     void rebuildApprovalOverlay();
+    // The links the selected solve did not use and could not satisfy, from
+    // that run's rows and settings; a rebuild follows when they change.
+    void updateFollowedSolve();
     // Selects the row's fibers and remembers its control range for the
     // overlay.
     void showScaffoldHighlight(const vc3d::fiber_map::ScaffoldHighlight& highlight);
@@ -480,6 +483,8 @@ private:
     // Scene-owned overlays of the approval dock: the approved spans (and the
     // fibers approved throughout), and the stretch of the selected row.
     std::vector<QGraphicsItem*> _approvalItems;
+    // The solve the map currently follows (empty: the map's own evidence).
+    vc3d::fiber_map::FollowedSolve _followedSolve;
     // Runtime fiber id by store UUID, from the published layout's snapshot:
     // how a stored solve's rows (which name fibers by UUID) reach the map.
     std::map<std::string, uint64_t> _fiberIdByUuid;

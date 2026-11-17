@@ -150,13 +150,20 @@ private:
     std::optional<int> _fallbackHandedness;
 };
 
-// The list of saved solves. Selecting one lays the map out from it.
+// The list of saved solves. Selecting one, with the switch on, lays the map
+// out from it.
 class ScaffoldRunsPanel : public QWidget
 {
     Q_OBJECT
 
 public:
     ScaffoldRunsPanel(ScaffoldSolveController* controller, QWidget* parent = nullptr);
+
+    // Whether the map should follow the selected solve's links.
+    [[nodiscard]] bool follow() const;
+
+signals:
+    void followChanged();
 
 private:
     enum Column {
@@ -173,6 +180,7 @@ private:
 
     ScaffoldSolveController* _controller = nullptr;
     QTreeWidget* _tree = nullptr;
+    QCheckBox* _followCheck = nullptr;
     bool _rebuilding = false;
 };
 

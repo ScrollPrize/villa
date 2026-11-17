@@ -328,6 +328,7 @@ struct LinkRecord {
     bool anyExplicitOrdinary = false;
     // Any ref said automatic; kept under `pending && !adjacent`.
     bool autoLink = false;
+    std::string edgeUuid;
     bool disagrees() const { return anyAdjacent && anyExplicitOrdinary; }
 };
 
@@ -478,11 +479,14 @@ std::vector<LinkRecord> collectValidLinks(
                 seen.anyExplicitOrdinary |= explicitOrdinary;
                 seen.autoLink = seen.pending && !humanPending && (seen.autoLink || thisAuto) &&
                                 !seen.adjacent;
+                // Reciprocal refs describe one edge; keep whichever states it.
+                if (seen.edgeUuid.empty()) seen.edgeUuid = link.edgeUuid;
                 continue;
             }
             links.push_back(LinkRecord{member, ia, other, ib, 0.0, link.pending, link.adjacent,
                                        link.adjacent, explicitOrdinary,
-                                       link.autoLink && link.pending && !link.adjacent});
+                                       link.autoLink && link.pending && !link.adjacent,
+                                       link.edgeUuid});
         }
     }
     std::sort(links.begin(), links.end(),
@@ -1102,6 +1106,7 @@ Result buildLayout(const std::vector<InputFiber>& fibers,
 
         for (const LinkRecord& link : links) {
             PlacedLink placedLink;
+            placedLink.edgeUuid = link.edgeUuid;
             placedLink.fiberA = ordered[link.a]->id;
             placedLink.cpA = link.ia;
             placedLink.fiberB = ordered[link.b]->id;
@@ -1490,6 +1495,15 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
         }
     }
 
+    // Following a saved solve means walking exactly the relations it walked:
+    // a link it did not use, and one it could not satisfy, constrain nothing
+    // here.
+    const auto notFollowed = [&](const LinkRecord& link) {
+        return !link.edgeUuid.empty() && params.followed.unusedLinkUuids.count(link.edgeUuid) != 0;
+    };
+    const auto violatedByFollowed = [&](const LinkRecord& link) {
+        return !link.edgeUuid.empty() && params.followed.violatedLinkUuids.count(link.edgeUuid) != 0;
+    };
     std::vector<winding::LinkInput> linkInputs;
     linkInputs.reserve(allLinks.size());
     for (const LinkRecord& link : allLinks) {
@@ -1505,7 +1519,8 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
             adjacentWindingOffset(link.adjacent, tagA, tagB),
             // An unpaired or self-contradicting adjacent link is an error,
             // not evidence.
-            adjacentUnpaired(link.adjacent, tagA, tagB) || link.disagrees()});
+            adjacentUnpaired(link.adjacent, tagA, tagB) || link.disagrees() ||
+                notFollowed(link) || violatedByFollowed(link)});
     }
 
     winding::SolverParams solverParams = params.solver;
@@ -1920,6 +1935,7 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
             continue;
         }
         PlacedLink placedLink;
+        placedLink.edgeUuid = link.edgeUuid;
         placedLink.fiberA = ordered[link.a]->id;
         placedLink.cpA = link.ia;
         placedLink.fiberB = ordered[link.b]->id;
@@ -1935,14 +1951,18 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
         placedLink.adjacentUnpaired =
             adjacentUnpaired(link.adjacent, ordered[link.a]->hvTag, ordered[link.b]->hvTag);
         placedLink.adjacentDisagrees = link.disagrees();
+        placedLink.notFollowed = notFollowed(link);
         // A link the repair had to drop is winding-suspect whatever its
         // residual now reads: the map placed its endpoints against it. The
         // boundary is inclusive because a residual AT the threshold already
         // solves with zero confidence. An unpaired adjacent link never
         // constrained (its turn error is unset) and is suspect as an error.
-        placedLink.suspect = placedLink.turnErr >= params.suspectTurns ||
-                             droppedLinks.count(l) != 0 || placedLink.adjacentUnpaired ||
-                             placedLink.adjacentDisagrees;
+        // A link the followed solve never used is not suspect for carrying no
+        // constraint here; one it could not satisfy is, exactly as it said.
+        placedLink.suspect = placedLink.adjacentUnpaired || placedLink.adjacentDisagrees ||
+                             violatedByFollowed(link) ||
+                             (!placedLink.notFollowed &&
+                              (placedLink.turnErr >= params.suspectTurns || droppedLinks.count(l) != 0));
         if (placedLink.suspect) {
             ++result.suspectLinkCount;
         }
@@ -2309,6 +2329,15 @@ ContentDigest digestGlobalInputs(const std::vector<InputFiber>& fibers,
     hashDouble(digest, solver.apexProminenceVx);
     hashU64(digest, static_cast<uint64_t>(
                         static_cast<int64_t>(solver.chiralityOverride)));
+    // The followed solve is an input like any other: selecting another run
+    // reads as changed inputs, so no memoized result is reused across it.
+    for (const auto* set : {&params.followed.unusedLinkUuids, &params.followed.violatedLinkUuids}) {
+        hashU64(digest, set->size());
+        for (const auto& uuid : *set) {
+            hashU64(digest, uuid.size());
+            hashBytes(digest, uuid.data(), uuid.size());
+        }
+    }
     return digest;
 }
 

@@ -178,6 +178,8 @@ public:
         bool adjacent = false;
         // Mirrors FiberBranchRef::autoLink (an unreviewed automatic link).
         bool autoLink = false;
+        // The store edge this link is: how a saved solve names it.
+        std::string edgeUuid;
     };
 
     struct FiberMapFiber {

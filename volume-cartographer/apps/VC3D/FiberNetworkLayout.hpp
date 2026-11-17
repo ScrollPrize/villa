@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <algorithm>
 #include <map>
+#include <set>
 #include <tuple>
 #include <string>
 #include <utility>
@@ -54,6 +55,10 @@ struct InputLink {
     // An unreviewed automatic link (FiberBranchRef::autoLink). ORed on dedup
     // under `pending && !adjacent`.
     bool autoLink = false;
+    // The store edge this link is, when it has one: how a saved solve names
+    // the relation it did or did not satisfy (FollowedSolve). Last so the
+    // positional initialisers of the existing callers keep their meaning.
+    std::string edgeUuid;
 };
 
 struct InputFiber {
@@ -203,6 +208,11 @@ struct PlacedLink {
     // An unreviewed automatic link (InputLink::autoLink, ORed on dedup):
     // drawn with dashed endpoint markers in the pending colours.
     bool autoLink = false;
+    // The followed solve did not use this link (FollowedSolve): it carries no
+    // constraint in this layout and is not suspect for it.
+    bool notFollowed = false;
+    // The store edge, when the link has one (InputLink::edgeUuid).
+    std::string edgeUuid;
 };
 
 struct WindingMark {
@@ -251,6 +261,17 @@ struct Result {
 // solver inferred for it, x = (s*theta + 2*pi*k) * rRef, y = z. Voxels
 // throughout, like buildLayout.
 
+// Follow a saved solve rather than this build's own link evidence. The links
+// that solve did not use are drawn but not followed; the ones it used and
+// could not satisfy are followed by nobody and marked suspect, which is what
+// the solve said about them. Both sets are store edge UUIDs; empty sets mean
+// the map uses every link it has, as it always did.
+struct FollowedSolve {
+    std::set<std::string> unusedLinkUuids;
+    std::set<std::string> violatedLinkUuids;
+    [[nodiscard]] bool empty() const { return unusedLinkUuids.empty() && violatedLinkUuids.empty(); }
+};
+
 struct GlobalLayoutParams {
     // One link-suspicion threshold: this value also overrides
     // solver.linkSuspectTurns inside buildGlobalLayout, so the confidence a
@@ -263,6 +284,7 @@ struct GlobalLayoutParams {
     double minPadXVx = 9167.0;
     double minPadYVx = 6667.0;
     winding::SolverParams solver;
+    FollowedSolve followed;
 };
 
 // How a fiber's component got its absolute winding; mirrors the solver's

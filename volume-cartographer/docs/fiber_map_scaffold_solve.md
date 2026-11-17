@@ -154,6 +154,18 @@ The approval overlays are halos behind the fibers rather than a change of the
 fibers' own colour, so what the map says about a fiber's geometry stays what it
 always said.
 
+### Laying the map out from a solve
+
+*Lay the map out from this solve* (in the solves dock) makes the map walk
+exactly the relations the selected run walked: a link that run did not use
+(its review state, or an automatic link it excluded) carries no constraint in
+the layout and is not marked suspect for it, and a link it used and could not
+satisfy carries none either and is drawn suspect, which is what the run said
+about it. The map's own crossing evidence still places the fibers the run says
+nothing about, so the map stays a map. Which solve is followed is part of the
+layout's input digest, so selecting another run rebuilds rather than reusing a
+memoized layout.
+
 ## Measured parity
 
 On the PHerc0332 scaffold store (`objects-v22.vcobj`, 293 fiber records, 292

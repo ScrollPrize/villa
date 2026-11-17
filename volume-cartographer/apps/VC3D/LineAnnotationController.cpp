@@ -13567,7 +13567,8 @@ LineAnnotationController::FiberMapSnapshot LineAnnotationController::finishFiber
                                                branch.branchControlPointIndex,
                                                branch.pending,
                                                branch.adjacent,
-                                               branch.autoLink});
+                                               branch.autoLink,
+                                               branch.edgeUuid});
         }
         snapshot.fibers.push_back(std::move(entry));
     }

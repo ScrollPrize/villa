@@ -2,6 +2,8 @@
 
 #include "FiberMapScaffoldSolve.hpp"
 
+#include <nlohmann/json.hpp>
+
 #include "FiberLengthDisplay.hpp"
 #include "FiberMapRuler.hpp"
 #include "FiberMapRulerMath.hpp"
@@ -1194,6 +1196,10 @@ FiberMapWorkspace::FiberMapWorkspace(CState* state, LineAnnotationController* co
             });
     connect(_approvalPanel, &vc3d::fiber_map::ScaffoldApprovalPanel::highlightModeChanged, this,
             [this]() { rebuildApprovalOverlay(); });
+    connect(_runsPanel, &vc3d::fiber_map::ScaffoldRunsPanel::followChanged, this,
+            [this]() { updateFollowedSolve(); });
+    connect(_solveController, &vc3d::fiber_map::ScaffoldSolveController::selectionChanged, this,
+            [this]() { updateFollowedSolve(); });
 
     // Match the workaround used by Main's other movable docks. On Wayland,
     // Qt can retain a failed mouse grab after a dock drag and stop delivering
@@ -2079,7 +2085,8 @@ void runRebuildJob(const std::shared_ptr<FiberMapWorkspace::RebuildJobResult>& j
                                                link.branchControlPointIndex,
                                                link.pending,
                                                link.adjacent,
-                                               link.autoLink});
+                                               link.autoLink,
+                                               link.edgeUuid});
             }
             inputs.push_back(std::move(input));
         }
@@ -2327,6 +2334,9 @@ void FiberMapWorkspace::continueRebuild()
         // de-bumping. The resampling stays; it only interpolates the raw
         // polyline.
         job->params.smoothVx = 0.0;
+        // Following a saved solve is an input of the build, hashed into the
+        // input digest like every other.
+        job->params.followed = _followedSolve;
         // The layout and solver are unit-free, so the physical intents behind
         // their tuning lengths are converted here — once the voxel size is
         // known, exactly as documented on GlobalLayoutParams and SolverParams.
@@ -3848,6 +3858,45 @@ void FiberMapWorkspace::rebuildApprovalOverlay()
         if (entry != _entries.end())
             add(pathBetweenControls(entry->fiber, _highlightPieceFrom, _highlightPieceTo), kSuspect,
                 kApprovalSelectionWidth, kHighlightZ);
+    }
+}
+
+// Which of the map's links the selected solve used, and which of those it
+// could not satisfy. The run states the review states and the automatic
+// inclusion it ran with; each link's own state decides the rest. A link
+// without a store edge was not in any solve, so a followed solve does not
+// walk it either.
+void FiberMapWorkspace::updateFollowedSolve()
+{
+    vc3d::fiber_map::FollowedSolve followed;
+    const auto* view = _solveController ? _solveController->selected() : nullptr;
+    if (_runsPanel && _runsPanel->follow() && view) {
+        bool approved = true, pending = false, automatic = false;
+        const auto settings = nlohmann::json::parse(view->run.settingsJson, nullptr, false);
+        if (settings.is_object()) {
+            approved = settings.value("link_state_approved", true);
+            pending = settings.value("link_state_pending", false);
+            automatic = settings.value("link_include_auto", false);
+        }
+        for (const auto& link : _layout.links) {
+            if (link.edgeUuid.empty()) continue;
+            const bool used = (link.pending ? pending : approved) && (!link.autoLink || automatic);
+            if (!used) followed.unusedLinkUuids.insert(link.edgeUuid);
+        }
+        for (const auto& residual : view->residuals)
+            if (!residual.edgeUuid.empty()) followed.violatedLinkUuids.insert(residual.edgeUuid);
+    }
+    if (followed.unusedLinkUuids == _followedSolve.unusedLinkUuids &&
+        followed.violatedLinkUuids == _followedSolve.violatedLinkUuids)
+        return;
+    _followedSolve = std::move(followed);
+    if (_layoutBuilt) {
+        setOperationStatus(_followedSolve.empty()
+                               ? tr("Following the map's own evidence again — rebuilding")
+                               : tr("Following the selected solve: %1 links left out, %2 violated — rebuilding")
+                                     .arg(_followedSolve.unusedLinkUuids.size())
+                                     .arg(_followedSolve.violatedLinkUuids.size()));
+        requestRebuild(false, false);
     }
 }
 
