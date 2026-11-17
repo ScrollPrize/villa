@@ -49,6 +49,11 @@ target_link_libraries(test_fiber_graph_extension PRIVATE vc_objects nlohmann_jso
 target_include_directories(test_fiber_graph_extension PRIVATE ../../src)
 add_test(NAME object_store_fiber_graph_extension COMMAND test_fiber_graph_extension)
 set_tests_properties(object_store_fiber_graph_extension PROPERTIES TIMEOUT 30)
+add_executable(test_fiber_constraint_approval test_fiber_constraint_approval.cpp)
+target_link_libraries(test_fiber_constraint_approval PRIVATE vc_objects nlohmann_json::nlohmann_json)
+target_include_directories(test_fiber_constraint_approval PRIVATE ../../src)
+add_test(NAME object_store_fiber_constraint_approval COMMAND test_fiber_constraint_approval)
+
 add_executable(test_fiber_piece_approval test_fiber_piece_approval.cpp)
 target_link_libraries(test_fiber_piece_approval PRIVATE vc_objects nlohmann_json::nlohmann_json)
 target_include_directories(test_fiber_piece_approval PRIVATE ../../src)

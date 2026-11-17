@@ -90,6 +90,85 @@ inline Point point(std::span<const double> values,size_t at,double sign=1.){
 }
 }
 
+// One measured relation, as both the bulk preparation below and a single-event
+// caller (a manual scaffold's crossings) state it: the two catalog nodes with
+// their winding families and whole-fiber normal signs, the anchors, the
+// measured winding distance in turns (already scaled; NaN for a relation
+// without one) and the connector and sign-free normals at the event.
+struct WindingEvent {
+    int64_t a=0,b=0,familyA=0,familyB=0,signA=1,signB=1;
+    double arcA=0,arcB=0,distance=0;
+    bool parallel=false;
+    Point connector{},normalA{},normalB{};
+    // Weight of this relation's type; zero witnesses enclosures only.
+    double weight=0;
+    bool enclosure=false; // collect the signed enclosure bound of this event
+    double perpendicularOffset=.5;
+};
+// What one event contributes: its signed order, the arcs of the fractional
+// target expansion in node order (a < b) and its enclosure bound.
+struct WindingEventRelation {
+    int sign=0;
+    bool withoutDistance=false,usable=false,hasEnclosure=false,hasUpper=false,hasTransport=false;
+    winding_graph_detail::EnclosureBound enclosure{};
+    winding_graph_detail::Arc lower{},upper{};
+    // The whole-fiber transport of the a->b step (connector crossings minus
+    // b's turns plus a's), present whenever the event yielded an arc or an
+    // enclosure bound: target = anchor step + transport.
+    int64_t transport=0;
+};
+inline WindingEventRelation windingEventRelation(const PackedFiberGeometry& geometry,const WindingEvent& event)
+{
+    using namespace winding_graph_detail;
+    const auto a=event.a,b=event.b;
+    WindingEventRelation out;
+    out.sign=int(fiberSignedOrder(event.connector,
+        Point{event.normalA[0]*double(event.signA),event.normalA[1]*double(event.signA),event.normalA[2]*double(event.signA)},
+        Point{event.normalB[0]*double(event.signB),event.normalB[1]*double(event.signB),event.normalB[2]*double(event.signB)}));
+    const int delta=int(event.familyB-event.familyA);const bool parallel=event.parallel;
+    const double weight=event.weight;
+    const bool enclosure=event.enclosure&&!parallel&&out.sign!=0;
+    if(weight<=0&&!enclosure)return out;
+    const double distance=event.distance;
+    // NaN is a measured relation without a winding distance: it yields no
+    // automatic arc but still witnesses enclosures.
+    const bool hasDistance=!std::isnan(distance);
+    if(hasDistance&&(!std::isfinite(distance)||distance<0))throw std::invalid_argument("invalid measured winding separation");
+    out.withoutDistance=!hasDistance&&weight>0;
+    const auto plus=hasDistance?integerTarget(distance,1,delta,parallel,event.perpendicularOffset):0;
+    const auto minus=hasDistance?integerTarget(distance,-1,delta,parallel,event.perpendicularOffset):0;
+    const bool usable=hasDistance&&weight>0&&!(out.sign==0&&plus!=minus);
+    if(!usable&&!enclosure)return out;
+    const auto start=geometry.sample(a,event.arcA),finish=geometry.sample(b,event.arcB);
+    const auto c=geometry.seam().transport(start.point,finish.point);
+    out.transport=(int64_t(c)-finish.turn)+start.turn;
+    out.hasTransport=true;
+    if(enclosure){
+        // Transport-only shift of the a->b step; oriented from the H fiber.
+        const bool forward=event.familyA==0;
+        const int64_t shift=(int64_t(c)-finish.turn)+start.turn;
+        const int oriented=forward?out.sign:-out.sign;
+        const int64_t step=forward?shift:-shift;
+        out.enclosure={forward?a:b,forward?b:a,oriented,oriented>0?step:step-1};
+        out.hasEnclosure=true;
+    }
+    if(!usable)return out;
+    const double outward=distance-out.sign*(parallel?0.:event.perpendicularOffset*delta);
+    const double minimum=!parallel&&out.sign*delta<0?1.:0.;
+    const double measured=out.sign==0?double(plus):out.sign*std::max(outward,minimum);
+    const double corrected=((measured+double(c))-double(finish.turn))+double(start.turn);
+    const double floor=std::floor(corrected),fraction=corrected-floor;
+    constexpr double safe=double(std::numeric_limits<int64_t>::max()/4);
+    if(!std::isfinite(corrected)||floor>safe||floor<-safe)throw std::invalid_argument("winding target outside supported integer range");
+    const auto arc=[&](int64_t target,double value){
+        return a>b?Arc{b,a,-target,value}:Arc{a,b,target,value};
+    };
+    out.lower=arc(int64_t(floor),weight*(1-fraction));
+    if(fraction>0){out.upper=arc(int64_t(floor)+1,weight*fraction);out.hasUpper=true;}
+    out.usable=true;
+    return out;
+}
+
 inline FiberWindingL1Columns prepareFiberWindingGraph(const PackedFiberGeometry& geometry,
     const FiberWindingGraphInput& in,const FiberWindingGraphOptions& options={})
 {
@@ -132,45 +211,23 @@ inline FiberWindingL1Columns prepareFiberWindingGraph(const PackedFiberGeometry&
                 const auto a=mapped(in.a[k]),b=mapped(in.b[k]);
                 if(a<0||b<0||!in.validA[k]||!in.validB[k]||!in.validConnector[k]||
                    in.parallel[k]!=(in.family[a]==in.family[b]))continue;
-                const auto connector=point(in.connector,k);
-                const int sign=int(fiberSignedOrder(connector,point(in.normalA,k,in.normalSign[a]),point(in.normalB,k,in.normalSign[b])));
-                const int delta=int(in.family[b]-in.family[a]);const bool parallel=in.parallel[k];
-                const double weight=parallel?options.parallelWeight:options.perpendicularWeight;
-                const bool enclosure=options.enclosures&&!parallel&&sign!=0;
-                if(weight<=0&&!enclosure)continue;
-                const double distance=in.distance[k]*options.windingScale;
-                // NaN is a measured relation without a winding distance: it
-                // yields no automatic arc but still witnesses enclosures.
-                const bool hasDistance=!std::isnan(distance);
-                if(hasDistance&&(!std::isfinite(distance)||distance<0))throw std::invalid_argument("invalid measured winding separation");
-                if(!hasDistance&&weight>0)++part.withoutDistance;
-                const auto plus=hasDistance?integerTarget(distance,1,delta,parallel,options.perpendicularOffset):0;
-                const auto minus=hasDistance?integerTarget(distance,-1,delta,parallel,options.perpendicularOffset):0;
-                const bool usable=hasDistance&&weight>0&&!(sign==0&&plus!=minus);
-                if(!usable&&!enclosure)continue;
-                const auto start=geometry.sample(a,in.arcA[k]),finish=geometry.sample(b,in.arcB[k]);
-                const auto c=geometry.seam().transport(start.point,finish.point);
-                if(enclosure){
-                    // Transport-only shift of the a->b step; oriented from the H fiber.
-                    const bool forward=in.family[a]==0;
-                    const int64_t shift=(int64_t(c)-finish.turn)+start.turn;
-                    const int oriented=forward?sign:-sign;
-                    const int64_t step=forward?shift:-shift;
-                    part.enclosures.push_back({forward?a:b,forward?b:a,oriented,oriented>0?step:step-1});
-                }
-                if(!usable)continue;
-                const double outward=distance-sign*(parallel?0.:options.perpendicularOffset*delta);
-                const double minimum=!parallel&&sign*delta<0?1.:0.;
-                const double measured=sign==0?double(plus):sign*std::max(outward,minimum);
-                const double corrected=((measured+double(c))-double(finish.turn))+double(start.turn);
-                const double floor=std::floor(corrected),fraction=corrected-floor;
-                constexpr double safe=double(std::numeric_limits<int64_t>::max()/4);
-                if(!std::isfinite(corrected)||floor>safe||floor<-safe)throw std::invalid_argument("winding target outside supported integer range");
-                const auto append=[&](std::vector<Arc>& rows,int64_t target,double value){
-                    rows.push_back(a>b?Arc{b,a,-target,value}:Arc{a,b,target,value});
-                };
-                append(batch,int64_t(floor),weight*(1-fraction));
-                if(fraction>0)append(upper,int64_t(floor)+1,weight*fraction);
+                WindingEvent event;
+                event.a=a;event.b=b;event.familyA=in.family[a];event.familyB=in.family[b];
+                event.signA=in.normalSign[a];event.signB=in.normalSign[b];
+                event.arcA=in.arcA[k];event.arcB=in.arcB[k];
+                event.distance=in.distance[k]*options.windingScale;
+                event.parallel=in.parallel[k];
+                event.connector=point(in.connector,k);
+                event.normalA=point(in.normalA,k);event.normalB=point(in.normalB,k);
+                event.weight=event.parallel?options.parallelWeight:options.perpendicularWeight;
+                event.enclosure=options.enclosures;
+                event.perpendicularOffset=options.perpendicularOffset;
+                const auto relation=windingEventRelation(geometry,event);
+                part.withoutDistance+=relation.withoutDistance;
+                if(relation.hasEnclosure)part.enclosures.push_back(relation.enclosure);
+                if(!relation.usable)continue;
+                batch.push_back(relation.lower);
+                if(relation.hasUpper)upper.push_back(relation.upper);
                 ++part.used;
             }
             batch.insert(batch.end(),upper.begin(),upper.end());part.expanded+=batch.size();

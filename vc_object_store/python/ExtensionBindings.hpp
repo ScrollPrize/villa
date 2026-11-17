@@ -1,5 +1,6 @@
 #pragma once
 #include "vc_object_store/objects/FiberGraphSolveExtension.hpp"
+#include "vc_object_store/objects/FiberConstraintApprovalExtension.hpp"
 #include "vc_object_store/objects/FiberPieceApprovalExtension.hpp"
 #include <nanobind/stl/tuple.h>
 #include "vc_object_store/objects/TransactionJson.hpp"
@@ -311,6 +312,112 @@ inline vo::FiberPieceRange fiberPieceRangeFromPy(const vo::FiberPieceContent& co
     return *range;
 }
 
+inline const char* fiberConstraintKindName(vo::FiberConstraintKind kind)
+{
+    switch (kind) {
+    case vo::FiberConstraintKind::Perpendicular: return "perpendicular";
+    case vo::FiberConstraintKind::Parallel: return "parallel";
+    case vo::FiberConstraintKind::Enclosure: return "enclosure";
+    }
+    throw std::invalid_argument("fiber constraint approval: unknown kind");
+}
+inline vo::FiberConstraintKind fiberConstraintKindFromPy(const std::string& name)
+{
+    if (name == "perpendicular") return vo::FiberConstraintKind::Perpendicular;
+    if (name == "parallel") return vo::FiberConstraintKind::Parallel;
+    if (name == "enclosure") return vo::FiberConstraintKind::Enclosure;
+    throw std::invalid_argument("fiber constraint approval: kind must be perpendicular, parallel or enclosure");
+}
+inline nb::object fiberSpanFingerprintToPy(const std::optional<vo::FiberSpanFingerprint>& span)
+{
+    if (!span) return nb::none();
+    return nb::make_tuple(span->idLow, span->idHigh, span->hash);
+}
+inline std::optional<vo::FiberSpanFingerprint> fiberSpanFingerprintFromPy(const nb::handle& value)
+{
+    if (value.is_none()) return std::nullopt;
+    const auto entry = nb::cast<std::tuple<int64_t, int64_t, uint64_t>>(value);
+    return vo::FiberSpanFingerprint{std::get<0>(entry), std::get<1>(entry), std::get<2>(entry)};
+}
+inline nb::dict fiberConstraintApprovalToPy(const vo::FiberConstraintApproval& row)
+{
+    nb::dict d;
+    d["fiber_a"] = row.identity.fiberA; d["fiber_b"] = row.identity.fiberB;
+    d["kind"] = fiberConstraintKindName(row.identity.kind);
+    d["arc_a"] = row.identity.arcA; d["arc_b"] = row.identity.arcB;
+    d["row_uuid"] = row.rowUuid; d["approval_uuid"] = row.approvalUuid;
+    d["state"] = row.state == vo::FiberConstraintApprovalState::Revoked ? "revoked" : "approved";
+    d["supersedes"] = row.supersedes ? nb::cast(*row.supersedes) : nb::none();
+    d["fiber_version_a"] = row.fiberVersionA; d["fiber_version_b"] = row.fiberVersionB;
+    d["span_a"] = fiberSpanFingerprintToPy(row.spanA); d["span_b"] = fiberSpanFingerprintToPy(row.spanB);
+    d["author"] = row.author; d["approved_at"] = row.approvedAt; d["host"] = row.host;
+    d["changed_by"] = row.changedBy ? nb::cast(*row.changedBy) : nb::none();
+    d["changed_at"] = row.changedAt ? nb::cast(*row.changedAt) : nb::none();
+    return d;
+}
+inline vo::FiberConstraintApproval fiberConstraintApprovalFromPy(const nb::dict& d)
+{
+    vo::FiberConstraintApproval row;
+    const auto optionalText = [&](const char* key) -> std::optional<std::string> {
+        if (!d.contains(key) || d[key].is_none()) return std::nullopt;
+        return nb::cast<std::string>(d[key]);
+    };
+    row.identity.fiberA = nb::cast<std::string>(d["fiber_a"]);
+    row.identity.fiberB = nb::cast<std::string>(d["fiber_b"]);
+    row.identity.kind = fiberConstraintKindFromPy(nb::cast<std::string>(d["kind"]));
+    row.identity.arcA = nb::cast<int64_t>(d["arc_a"]);
+    row.identity.arcB = nb::cast<int64_t>(d["arc_b"]);
+    row.rowUuid = nb::cast<std::string>(d["row_uuid"]);
+    row.approvalUuid = nb::cast<std::string>(d["approval_uuid"]);
+    const auto state = nb::cast<std::string>(d["state"]);
+    if (state == "approved") row.state = vo::FiberConstraintApprovalState::Approved;
+    else if (state == "revoked") row.state = vo::FiberConstraintApprovalState::Revoked;
+    else throw std::invalid_argument("fiber constraint approval: state must be approved or revoked");
+    row.supersedes = optionalText("supersedes");
+    row.fiberVersionA = nb::cast<int64_t>(d["fiber_version_a"]);
+    row.fiberVersionB = nb::cast<int64_t>(d["fiber_version_b"]);
+    if (d.contains("span_a")) row.spanA = fiberSpanFingerprintFromPy(d["span_a"]);
+    if (d.contains("span_b")) row.spanB = fiberSpanFingerprintFromPy(d["span_b"]);
+    row.author = nb::cast<std::string>(d["author"]);
+    row.approvedAt = nb::cast<std::string>(d["approved_at"]);
+    row.host = d.contains("host") && !d["host"].is_none() ? nb::cast<std::string>(d["host"]) : std::string();
+    row.changedBy = optionalText("changed_by");
+    row.changedAt = optionalText("changed_at");
+    return row;
+}
+
+inline void bindFiberConstraintApproval(nb::module_& module)
+{
+    module.attr("FIBER_CONSTRAINT_APPROVAL_TABLE") = vo::kFiberConstraintApprovalTable;
+    module.attr("FIBER_CONSTRAINT_ARC_QUANTUM") = vo::kFiberConstraintArcQuantum;
+    module.def("fiber_constraint_approval_table", [] { return extensionTableToPy(vo::fiberConstraintApprovalTable()); },
+        "The ext_fiber_constraint_approval definition (docs/extensions.md).")
+    .def("fiber_constraint_identity", [](const std::string& fiberA, double arcA, const std::string& fiberB,
+                                         double arcB, const std::string& kind, double quantum) {
+        const auto identity = vo::fiberConstraintIdentity(fiberA, arcA, fiberB, arcB,
+                                                          fiberConstraintKindFromPy(kind), quantum);
+        nb::dict d;
+        d["fiber_a"] = identity.fiberA; d["fiber_b"] = identity.fiberB;
+        d["kind"] = fiberConstraintKindName(identity.kind);
+        d["arc_a"] = identity.arcA; d["arc_b"] = identity.arcB;
+        return d;
+    }, nb::arg("fiber_a"), nb::arg("arc_a"), nb::arg("fiber_b"), nb::arg("arc_b"), nb::arg("kind"),
+       nb::arg("quantum") = vo::kFiberConstraintArcQuantum,
+       "The identity of one measured crossing: both fibers in UUID order and both anchors in arc quanta.")
+    .def("fiber_constraint_approval_from_row", [](const nb::sequence& values) {
+        return fiberConstraintApprovalToPy(vo::decodeFiberConstraintApprovalRow(extensionRowFromPy(values)));
+    }, nb::arg("values"), "Decode a typed row of ext_fiber_constraint_approval into a dict.")
+    .def("fiber_constraint_approval_to_row", [](const nb::dict& row) {
+        return extensionRowToPy(vo::fiberConstraintApprovalRow(fiberConstraintApprovalFromPy(row)));
+    }, nb::arg("row"), "Encode an approval dict as the typed row to append.")
+    .def("revoke_fiber_constraint_approval", [](const nb::dict& row, const std::string& changedBy,
+                                                const std::string& now) {
+        return fiberConstraintApprovalToPy(
+            vo::revokeFiberConstraintApproval(fiberConstraintApprovalFromPy(row), changedBy, now));
+    }, nb::arg("row"), nb::arg("changed_by"), nb::arg("now"),
+       "The revocation row superseding a live constraint approval.");
+}
+
 inline void bindFiberPieceApproval(nb::module_& module)
 {
     module.attr("FIBER_LOCK_CONTROL_POINT_TAG") = vo::kFiberLockControlPointTag;
@@ -387,6 +494,7 @@ inline void bindFiberPieceApproval(nb::module_& module)
 inline void bindExtensionHelpers(nb::module_& module)
 {
     bindFiberPieceApproval(module);
+    bindFiberConstraintApproval(module);
     module.def("encode_fiber_arc",[](double value){const auto b=vo::encodeFiberArc(value);return nb::bytes(reinterpret_cast<const char*>(b.data()),b.size());});
     module.def("encode_fiber_direction",[](const std::array<double,3>& value){const auto b=vo::encodeFiberDirection(value);return nb::bytes(reinterpret_cast<const char*>(b.data()),b.size());});
     module.def("encode_fiber_winding",[](double value)->nb::object{const auto b=vo::encodeFiberWindingDistance(value);if(!b)return nb::none();const char c=char(*b);return nb::bytes(&c,1);});

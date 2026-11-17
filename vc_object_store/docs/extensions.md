@@ -277,6 +277,53 @@ The Python table roles are the suffixes without their underscore: `runs`,
 
 Use a new run UUID for another independently saved result/checkpoint. Metric progression can be appended under the same run UUID at distinct iterations. The definitions provision the full data path; existing solver/checkpoint producers are not automatically migrated to these new tables.
 
+## Measured constraint approval
+
+A link between two fibers carries its approval state on its edge record. A
+*measured* constraint - a crossing an extraction found rather than an
+annotation - has no record to carry one, so its approval is a row of
+`ext_fiber_constraint_approval` (extension `fiber-constraint-approval`, format
+1, `keySpace="objects"`, immutable). Revoking appends a superseding row, as in
+[piece approval](fiber-piece-approval.md); live rows of one constraint never
+overlap.
+
+| Column | Type | Value |
+| --- | --- | --- |
+| `fiber_a`, `fiber_b` | BLOB, 16 bytes | The two fibers, in ascending UUID order |
+| `kind` | INTEGER | perpendicular=1, parallel=2, enclosure=3 |
+| `arc_a`, `arc_b` | INTEGER | Each anchor's arclength divided by the arc quantum (64 base voxels), floored |
+| `row_uuid` | BLOB, 16 bytes | This row; the five columns above plus it are the primary key |
+| `approval_uuid` | BLOB, 16 bytes | The approval event, shared by the rows derived from it |
+| `state` | INTEGER | approved=1, revoked=2 |
+| `supersedes` | BLOB, 16 bytes, NULL | The row this one replaces; required on a revocation |
+| `fiber_version_a`, `fiber_version_b` | INTEGER | Object versions the approval was taken at |
+| `span_a_id_low`, `span_a_id_high`, `span_a_hash` | INTEGER, NULL | Fingerprint of the span of fiber a covering its anchor |
+| `span_b_id_low`, `span_b_id_high`, `span_b_hash` | INTEGER, NULL | The same for fiber b |
+| `author`, `approved_at`, `host` | TEXT | Who approved it, when (ISO-8601 UTC) and where |
+| `changed_by`, `changed_at` | TEXT, NULL | Who wrote a superseding row, and when |
+
+A constraint is identified by its two fibers, its kind and its two quantized
+anchors, not by an event UUID: an extraction run mints new event identities
+every time, while a re-extraction places the same crossing within one quantum
+of where it was, so the approval survives it. A different crossing of the same
+pair falls in another quantum and keeps its own identity.
+
+The two span fingerprints are the piece-approval ones (FNV-1a 64 over the
+span's line points): editing either covering span invalidates the approval the
+same way it invalidates a piece approval, and
+`fiberConstraintApprovalCurrent` is what states that. An approval row carries
+both fingerprints; a revocation carries neither.
+
+These rows record a reviewer's decision about one measured relation. They do
+not change a solve: a solver reads them to decide which constraints it may
+hold rigid.
+
+Python has the same definitions and constructors:
+`fiber_constraint_approval_table()`, `fiber_constraint_identity(fiber_a,
+arc_a, fiber_b, arc_b, kind)`, `fiber_constraint_approval_to_row(row)`,
+`fiber_constraint_approval_from_row(values)` and
+`revoke_fiber_constraint_approval(row, changed_by, now)`.
+
 ## Track crossing cache
 
 `objects/TrackCrossingStore.hpp` stores the crossings a consumer computed between tracks as a local, derived collection: a cache file beside the consumer, not part of the store the tracks live in and not served by a hosted store. The Spiral fitter keeps one per selection of track revisions under its cache directory.
