@@ -3,6 +3,7 @@
 #include "FiberConstraintGeometry.hpp"
 #include "FiberGeometryStageBenchmark.hpp"
 #include <vc_object_store/objects/ObjectCollection.hpp>
+#include <vc_object_store/Uuid.hpp>
 #include <vc_object_store/geometry/SegmentClip.hpp>
 #include <vc_object_store/geometry/ArrayBytes.hpp>
 #include "FiberConstraintDatabase.hpp"
@@ -169,7 +170,7 @@ int runFiberConstraintExtraction(int argc, char** argv)
     const bool jointNormals=validateFiberConstraintJointNormals(cfg);
     // SQLite reader fan-out can regress badly through backend contention;
     // keep it independent of the compute pool and opt in only after measuring.
-    const int loadThreads=cfg.value("load_threads",1);
+    const int loadThreads=cfg.value("load_threads",threads);
     if (threads<1 || repetitions<1) throw std::invalid_argument("Positive threads/repetitions required");
     if(loadThreads<1)throw std::invalid_argument("Positive load_threads required");
     if(cfg.contains("database") && repetitions!=1)throw std::invalid_argument("Database export requires one repetition");
@@ -275,45 +276,47 @@ int runFiberConstraintExtraction(int argc, char** argv)
     const double querySeconds=seconds(queryStart);
     const auto loadStart=Clock::now();
     std::vector<FiberletCropTraceLine> lines(ids.size());
-    std::atomic<size_t> next{0},loaded{0};
-    constexpr size_t kLoadBatch=1024;
-    std::vector<std::future<void>> loaders;
-    for(int worker=0;worker<std::min<int>(loadThreads,ids.size());++worker)loaders.push_back(std::async(std::launch::async,[&]{
-        auto pinnedOptions=storeOptions;
-        pinnedOptions.readPosition=vc::objects::StoreStatus{store.uuid(txn),sourceStatus.generation,sourceStatus.commitSequence};
-        auto reader=vc::objects::ObjectCollection::open(cfg.at("fibers").get<std::string>(),pinnedOptions);
-        auto read=reader.read();
-        const auto workerStatus=reader.provisioning(read);
-        if(reader.uuid(read)!=store.uuid(txn)||workerStatus.generation!=sourceStatus.generation||
-           workerStatus.commitSequence!=sourceStatus.commitSequence)
-            throw vc::objects::StoreBusy("Fiber source changed before parallel geometry loading");
-        for(size_t begin;(begin=next.fetch_add(kLoadBatch))<ids.size();){
-            const auto end=std::min(ids.size(),begin+kLoadBatch);
-            for(size_t i=begin;i<end;++i){
-                const vc::objects::ObjectKey key{"",ids[i]};
-                const auto head=reader.currentGeometry(read,key);
-                if(!head)throw std::runtime_error("Fiber has no geometry: "+ids[i]);
-                const auto array=std::find_if(head->arrays.begin(),head->arrays.end(),[](const auto& a){return a.name=="line_points";});
-                if(array==head->arrays.end()||array->shape.at(0)<2)continue;
-                if(array->dtype!="<f8")throw std::runtime_error("Fiber line points must be float64");
-                const auto bytes=reader.readGeometryArray(read,key,"line_points");
-                auto& line=lines[i];
-                for(const auto& stored:vc::objects::xyzFromBytes<double>(bytes)){
-                    const auto p=mappings[i].apply(stored);line.pointsBaseXYZ.emplace_back(p[0],p[1],p[2]);
-                }
-                if(selectionBounds){
-                    bool intersects=false;
-                    for(size_t j=1;j<line.pointsBaseXYZ.size()&&!intersects;++j){
-                        const auto& a=line.pointsBaseXYZ[j-1];const auto& b=line.pointsBaseXYZ[j];double first,last;
-                        intersects=vc::geometry::clipSegment({a[0],a[1],a[2]},{b[0],b[1],b[2]},*selectionBounds,first,last);
-                    }
-                    if(!intersects)line.pointsBaseXYZ.clear();
-                }
+    {
+        // One bulk column read of every fiber's line points, in the target volume's
+        // coordinates, on load_threads native workers (the per-fiber reads this
+        // replaced decoded one object at a time).
+        std::vector<std::array<unsigned char,16>> keys(ids.size());
+        std::map<std::array<unsigned char,16>,size_t> keyIndex;
+        for(size_t i=0;i<ids.size();++i){
+            const auto canonical=vc::objects::util::canonicalUuid(ids[i]);
+            size_t k=0;
+            for(size_t c=0;c<canonical.size();++c){
+                if(canonical[c]=='-')continue;
+                const auto hex=[](char h){return h<='9'?h-'0':h-'a'+10;};
+                keys[i][k/2]=static_cast<unsigned char>((keys[i][k/2]<<4)|hex(canonical[c]));++k;
             }
-            progress({"load",loaded.fetch_add(end-begin)+(end-begin),ids.size()});
+            keyIndex[keys[i]]=i;
         }
-    }));
-    for(auto& loader:loaders)loader.get();
+        const vc::objects::StoreStatus pinned{store.uuid(txn),sourceStatus.generation,sourceStatus.commitSequence};
+        const auto columns=store.readGeometryArrayColumns(txn,keys,"line_points","fiber",volume,pinned,
+            size_t(loadThreads),false,store.supportsTrustedGeometryReads(txn));
+        if(columns.geometry.dtype!="<f8"||columns.geometry.shape.size()!=2||columns.geometry.shape[1]!=3)
+            throw std::runtime_error("Fiber line points must be float64 xyz");
+        const auto* values=reinterpret_cast<const double*>(columns.geometry.data.data());
+        for(size_t k=0;k<columns.objectUuids.size();++k){
+            const auto found=keyIndex.find(columns.objectUuids[k]);
+            if(found==keyIndex.end())throw std::runtime_error("Bulk geometry read returned an unrequested fiber");
+            const auto i=found->second;
+            const auto begin=columns.geometry.offsets.at(k),end=columns.geometry.offsets.at(k+1);
+            if(end<begin+2)continue;
+            auto& line=lines[i];line.pointsBaseXYZ.reserve(end-begin);
+            for(auto row=begin;row<end;++row)line.pointsBaseXYZ.emplace_back(values[row*3],values[row*3+1],values[row*3+2]);
+            if(selectionBounds){
+                bool intersects=false;
+                for(size_t j=1;j<line.pointsBaseXYZ.size()&&!intersects;++j){
+                    const auto& a=line.pointsBaseXYZ[j-1];const auto& b=line.pointsBaseXYZ[j];double first,last;
+                    intersects=vc::geometry::clipSegment({a[0],a[1],a[2]},{b[0],b[1],b[2]},*selectionBounds,first,last);
+                }
+                if(!intersects)line.pointsBaseXYZ.clear();
+            }
+        }
+        progress({"load",ids.size(),ids.size()});
+    }
     size_t kept=0;cv::Vec3d lo{INFINITY,INFINITY,INFINITY},hi{-INFINITY,-INFINITY,-INFINITY};
     double totalArc=0.;size_t totalPoints=0;
     for(size_t i=0;i<ids.size();++i){
