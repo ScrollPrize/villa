@@ -23,7 +23,8 @@ A.npz>B.npz is a pair of which A is always the input: two runs of vc_tomography'
 apply writes, for the block's region: even, odd (the network on each half: neither has seen the other half), full
 (their mean: the picture of all the projections) and full_direct (the network on the reconstruction of all the
 projections, whose noise is half of what it was trained on). Run with vc_tomography's environment with the
-`denoise` extra (PyTorch); it reads and writes .npz files only. Whole volumes: denoise_spool.py, masked_volume.py.
+`denoise` extra (PyTorch); it reads and writes .npz files only. Whole volumes: masked_volume.py, through
+run_to_uint8.
 """
 import argparse
 import sys
@@ -35,6 +36,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# A whole run of slices (run_to_uint8): slabs of SLAB slices of which the middle KEEP are kept (HALO_Z neighbours either
+# side: against 16 the result differs by 2 % of what the network changes), the first and last slab to the run's ends.
+SLAB, KEEP, HALO_Z = 64, 48, 8
 SCALE = 10.0     # the slices are per cm (standard deviation about 0.07): the network works on 10 times that
 AMP = {"fp16": torch.float16, "bf16": torch.bfloat16}   # half precision of the convolutions (bf16: fp32's range, 8 bits)
 
@@ -104,6 +108,54 @@ def run_tiled(net, v, tile=256, halo=48):
                 r = net(t[None, None].to(dev) * SCALE)[0, 0].float() / SCALE
                 out[:, y: y + h, x: x + w] = r[:, halo: halo + h, halo: halo + w].to(v.device)
     return out
+
+
+
+def slab_to_uint8(net, vol, k0, k1, lo, hi, dev, tile=256, halo=48):
+    """the network on vol (a slab on the host), its slices [k0, k1) as uint8 in the window [lo, hi]; in tiles of the
+    plane with a halo, reflected where the volume ends (the arithmetic of run_tiled, a tile at a time so that the slab
+    stays on the host)"""
+    ny, nx = vol.shape[1:]
+    out = np.empty((k1 - k0, ny, nx), np.uint8)
+    with torch.no_grad(), torch.autocast("cuda", dtype=AMP[net.amp]):
+        for y in range(0, ny, tile):
+            for x in range(0, nx, tile):
+                h, w = min(tile, ny - y), min(tile, nx - x)
+                ya, yb, xa, xb = max(y - halo, 0), min(y + tile + halo, ny), max(x - halo, 0), min(x + tile + halo, nx)
+                t = torch.from_numpy(vol[:, ya:yb, xa:xb]).to(dev)[None, None]
+                top, left = halo - (y - ya), halo - (x - xa)
+                bottom, right = min(halo, max(0, y + tile + halo - ny)), min(halo, max(0, x + tile + halo - nx))
+                if top or left or bottom or right:
+                    t = F.pad(t, (left, right, top, bottom, 0, 0), mode="reflect")
+                py, px = tile + 2 * halo - t.shape[3], tile + 2 * halo - t.shape[4]
+                if py or px:
+                    t = F.pad(t, (0, px, 0, py, 0, 0), mode="replicate")
+                r = net(t * SCALE)[0, 0].float() / SCALE
+                r = r[k0:k1, halo: halo + h, halo: halo + w]
+                out[:, y: y + h, x: x + w] = torch.round(torch.clamp((r - lo) / (hi - lo), 0, 1) * 255).to(torch.uint8).cpu().numpy()
+    return out
+
+
+def run_to_uint8(net, vol, lo, hi, dev, log=None):
+    """the network on a run of slices vol (n, ny, nx; float32 per cm on the host, n >= SLAB) as uint8 in the window
+    [lo, hi]: slabs of SLAB slices that step by KEEP, each giving its slices up to HALO_Z from its far end (the first
+    from the run's start, the last to the run's end); log(text) after each slab"""
+    n = len(vol)
+    if n < SLAB:
+        raise ValueError("a run of %d slices is shorter than a slab of %d" % (n, SLAB))
+    out = np.empty(vol.shape, np.uint8)
+    base = done = 0            # the slab starts at slice base; slices [0, done) are denoised
+    while True:
+        first = base if base + SLAB <= n else n - SLAB      # (no further slab fits: the run's last SLAB slices)
+        end = n if first + SLAB == n else first + SLAB - HALO_Z
+        t = time.time()
+        out[done:end] = slab_to_uint8(net, vol[first: first + SLAB], done - first, end - first, lo, hi, dev)
+        if log:
+            log("slices %d..%d from the slab %d..%d in %.0f s" % (done, end - 1, first, first + SLAB - 1, time.time() - t))
+        done = end
+        if done == n:
+            return out
+        base += KEEP
 
 
 def train(a):

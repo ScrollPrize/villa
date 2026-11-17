@@ -14,7 +14,6 @@ trained weights are not in the repository.
 |---|---|
 | `reconstruct_block.py` | Reconstructs a block of slices to `.npz`: training pairs, and blocks to try a network on |
 | `noise2inverse.py` | The network: `train`, `apply` (to a block), `slices` (pictures of a block) |
-| `denoise_spool.py` | Denoises slices another process reconstructs, through a spool folder, to uint8 |
 | `masked_volume.py` | Reconstructs, denoises and writes a whole scan as a uint8 OME-Zarr under a mask |
 
 ## Setup
@@ -83,7 +82,7 @@ python networks/denoising/masked_volume.py SCANS --cache CACHE --geometry geomet
     --filters "paganin(delta_beta=1000)+unsharp(sigma=1.2,coeff=4)" \
     --set sharpness_weighting=auto --set luminosity_repartition=100 \
     --window -0.06 0.29 --voxel_um 8.64 --mask mask_level2.npy \
-    --model MODEL_DIR/model.pt --zarr denoised.zarr --zarr_not_denoised not_denoised.zarr --spool SPOOL_DIR
+    --model MODEL_DIR/model.pt --zarr denoised.zarr --zarr_not_denoised not_denoised.zarr
 ```
 
 - The volume covers every height the scan can reconstruct. It is written as uint8 within `--window` (attenuation
@@ -92,9 +91,12 @@ python networks/denoising/masked_volume.py SCANS --cache CACHE --geometry geomet
   stored as nothing; only the mask's bounding box is reconstructed in each segment.
 - `--zarr_not_denoised` also writes the same slices without the network, for comparison.
 - `--slices J0 J1` makes only part of the volume.
-- The reconstruction and the network do not fit on the GPU together. Each segment of 480 slices is therefore
-  reconstructed by one process and denoised by another, and they pass slices through the `--spool` folder. A run
-  that stops picks up from the segments already finished.
+- It all runs in one process, one segment of 480 slices at a time. A segment is reconstructed into memory, then its
+  reconstructor is destroyed (giving the GPU back), then the network denoises it. The two never use the GPU at the
+  same time. The host holds one segment's float slices: (segment + 16) x the mask's box x 4 bytes, at most about
+  50 GB for PHerc0343P's full grid; `--segment` makes it smaller.
+- If a reconstruction runs out of GPU memory, it starts again from that slice with half as many slices per call.
+- A run that stops starts over; `--slices` makes the rest as a separate part.
 - The network sees slabs of 64 slices and keeps the middle 48, in tiles of 256 px with a 48 px overlap.
 
 ## Trained networks
@@ -115,5 +117,5 @@ The PHerc. 172 network rates 0.90 on PHerc0343P, which is why each scan needs it
 uv run pytest tests/test_denoising_network.py
 ```
 
-These check that tiling matches running the network on the whole volume, that `denoise_spool`'s output matches,
-that a saved network loads again, and the spool's bookkeeping. They are skipped when PyTorch is not installed.
+These check that tiling matches running the network on the whole volume, that a slab's uint8 output matches,
+that a run takes each slice from the right slab, and that a saved network loads again. They are skipped when PyTorch is not installed.
