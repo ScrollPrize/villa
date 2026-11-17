@@ -17,6 +17,8 @@
 
 #include "FiberMapScaffoldRanking.hpp"
 
+#include <vc/fiber_graph/ScaffoldNormals.hpp>
+
 #include <vc_object_store/objects/FiberConstraintApprovalExtension.hpp>
 #include <vc_object_store/objects/ObjectStoreSession.hpp>
 
@@ -63,6 +65,9 @@ struct ScaffoldSolveRequest {
     // Measure each connector's winding separation on the bound normal
     // dataset. Off keeps the crossings as enclosure evidence only.
     bool measureWindingDistances = true;
+    // "geometry": the fibers' own strip normals. "fused": those pulled
+    // towards the sheet axis the package's fiber-inference prediction states.
+    std::string normalSource = "geometry";
     std::string signBackend = "irls";
     std::size_t workers = 1;
 };
@@ -105,6 +110,11 @@ public:
         std::function<std::shared_ptr<vc::lasagna::LasagnaNormalSampler>(QString* error)>;
     void setWindingSampler(WindingSamplerResolver);
 
+    // The prediction a fused run reads its sheet axis from. Resolved like the
+    // winding sampler: on this thread, before the run starts.
+    using AxisSamplerResolver = std::function<vc::fiber_graph::ScaffoldAxisSampler(QString* error)>;
+    void setAxisSampler(AxisSamplerResolver);
+
     // Approval of a *measured* constraint (a crossing). A link's approval is
     // its edge record's review state and is not touched here.
     void reloadConstraintApprovals();
@@ -145,6 +155,7 @@ private:
     std::shared_ptr<SolveJob> _job;
     QFutureWatcher<void>* _watcher = nullptr;
     WindingSamplerResolver _windingSampler;
+    AxisSamplerResolver _axisSampler;
 };
 
 // The solver dock: what a run uses, and the Run button.
@@ -178,6 +189,7 @@ private:
     QDoubleSpinBox* _perpendicularWeightSpin = nullptr;
     QDoubleSpinBox* _parallelWeightSpin = nullptr;
     QDoubleSpinBox* _enclosureWeightSpin = nullptr;
+    QComboBox* _normalSourceCombo = nullptr;
     QComboBox* _signBackendCombo = nullptr;
     QComboBox* _backendCombo = nullptr;
     QPushButton* _runButton = nullptr;

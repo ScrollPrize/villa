@@ -198,8 +198,9 @@ Three docks (`FiberMapScaffoldSolve.hpp`, with the Qt-free ranking in
 - **Graph solver.** Which links a run uses (by review state, and whether
   automatic links count), the link weight, the LEMON backend and *fix approved
   subgraphs* (on by default). *Measure the fibers' crossings* adds the measured
-  stages: the per-type weights, the sign backend, and whether the winding
-  separations are measured at all. The winding density they are measured on is
+  stages: where the normals come from (the fibers' geometry, or that fused
+  with the package's fiber-inference prediction), the per-type weights, the
+  sign backend, and whether the winding separations are measured at all. The winding density they are measured on is
   the package's own selected Lasagna dataset, the one the annotation optimizes
   against; a run that would measure separations without a bound dataset, or on
   a dataset that states no `grad_mag` density, is refused before it starts
@@ -293,3 +294,22 @@ measured kinds — they are integer bounds from both sides rather than a rounded
 measurement — and adding them alone to the 232 link constraints leaves 3
 violated constraints with a weighted L1 of 5 turns, which is what the approval
 dock is there to adjudicate.
+
+Variant B says what the prediction is worth. The same run with the normals
+fused with the PHerc0332 fiber-inference prediction (axis weight 100, twist
+weight 1000, smoothing and resampling 64 voxels, presence 0 to 128):
+
+| | Variant A, geometry normals | Variant B, fused prediction |
+|---|---|---|
+| strict crossings (axes within 30 degrees, under one turn apart) | 353 | 736 |
+| of those, disagreeing with the solved signs | 26.9 % | 2.3 % |
+| weight-weighted disagreement over all crossings | 29.2 % | 2.5 % |
+| mean agreement of a solved normal with the outward radial | 0.45 | 0.80 |
+| crossings that assert a relation | 6,993 of 10,195 | 9,060 of 10,195 |
+| exact enclosure relations (contradictory pairs) | 51 (18) | 182 (9) |
+| components | 15 | 14 |
+
+Reading the prediction along all 851,285 line points is what a fused run
+costs: 79 s of the run's 83 s, against 1.0 s for the geometry-only strip
+normals. Everything after it is unchanged (0.27 s for the crossings, 0.008 s
+for the sign solve, 1.8 s for the LEMON solve and its residual analysis).

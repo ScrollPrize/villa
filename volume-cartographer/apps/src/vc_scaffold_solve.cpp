@@ -16,6 +16,7 @@
 #include "vc/fiber_graph/ScaffoldConstraints.hpp"
 #include "vc/fiber_graph/ScaffoldSolveRuns.hpp"
 #include "vc/fiber_graph/ScaffoldWindingSolve.hpp"
+#include "vc/lasagna/ChannelSampler.hpp"
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
 
@@ -89,6 +90,9 @@ ScaffoldNormalOptions normalOptionsFrom(const Json& cfg)
     options.approvedNormalPieces = section.value("approved_pieces", options.approvedNormalPieces);
     options.adjacentLinkAnchors = section.value("adjacent_links", options.adjacentLinkAnchors);
     options.anchorWeight = section.value("anchor_weight", options.anchorWeight);
+    options.strip.axisWeight = section.value("axis_weight", options.strip.axisWeight);
+    options.presenceFloor = section.value("presence_floor", options.presenceFloor);
+    options.presenceFull = section.value("presence_full", options.presenceFull);
     // The links that anchor a normal are the links that constrain a winding,
     // unless the caller names its own set.
     const auto links = cfg.value("links", Json::object());
@@ -295,8 +299,60 @@ int run(const std::string& configPath)
                 return sampler->normalAlignedWindingDistancesBatch(connectors, step, workers);
             };
         }
+        // Variant B: the sheet axis the fiber-inference prediction states at
+        // every vertex, weighted by its presence, pulls the strip normals.
+        // The annotation's anchors still win at the nodes they fix.
+        ScaffoldAxisSampler axisSampler;
+        const auto normalSource = cfg.value("normals", Json::object()).value("source", std::string{"geometry"});
+        std::shared_ptr<vc::lasagna::LasagnaDataset> predictionDataset, sheetDataset;
+        std::shared_ptr<vc::lasagna::LasagnaNormalSampler> sheetSampler;
+        std::shared_ptr<vc::lasagna::LasagnaGroupArrays> predictionArrays;
+        if (normalSource == "fused") {
+            const auto section = cfg.value("prediction", Json::object());
+            if (!section.contains("manifest"))
+                throw std::invalid_argument("normals.source fused needs prediction.manifest");
+            vc::lasagna::LasagnaDatasetOpenOptions open;
+            open.workingToBaseScale = 1.;
+            if (section.contains("remote_cache")) open.remoteCacheRoot = section.at("remote_cache").get<std::string>();
+            predictionDataset = std::make_shared<vc::lasagna::LasagnaDataset>(
+                vc::lasagna::LasagnaDataset::openLocation(section.at("manifest"), open));
+            sheetDataset = std::make_shared<vc::lasagna::LasagnaDataset>(
+                vc::lasagna::fiberSheetNormalDataset(*predictionDataset));
+            vc::lasagna::LasagnaNormalSamplerOptions samplerOptions;
+            samplerOptions.maxCachedBytes = section.value("cache_bytes", samplerOptions.maxCachedBytes);
+            samplerOptions.readerThreads = section.value("reader_threads", std::size_t{0});
+            sheetSampler = std::make_shared<vc::lasagna::LasagnaNormalSampler>(*sheetDataset, samplerOptions);
+            predictionArrays = std::make_shared<vc::lasagna::LasagnaGroupArrays>(samplerOptions.maxCachedBytes, true);
+            const auto presence =
+                vc::lasagna::bindLasagnaChannel(predictionDataset->manifest(), "presence", *predictionArrays);
+            axisSampler = [sheetSampler, presence](std::span<const vc::geometry::Point> points,
+                                                   std::size_t workers) {
+                std::vector<cv::Vec3d> xyz;
+                std::vector<cv::Vec3f> xyzf;
+                xyz.reserve(points.size());
+                xyzf.reserve(points.size());
+                for (const auto& point : points) {
+                    xyz.emplace_back(point[0], point[1], point[2]);
+                    xyzf.emplace_back(float(point[0]), float(point[1]), float(point[2]));
+                }
+                std::vector<vc::lasagna::NormalSampleWithDerivative> axes;
+                (void)sheetSampler->sampleNormalBatch(xyz, false, int(workers), axes);
+                std::vector<std::vector<float>> presenceValues;
+                vc::lasagna::sampleLasagnaVectorBatch({presence}, xyzf, presenceValues, false);
+                std::vector<ScaffoldPredictedAxis> out(points.size());
+                for (std::size_t i = 0; i < points.size(); ++i) {
+                    if (i >= axes.size() || !axes[i].sample.valid) continue;
+                    if (i >= presenceValues.size() || presenceValues[i].empty()) continue;
+                    const auto& normal = axes[i].sample.normal;
+                    out[i] = {{normal[0], normal[1], normal[2]}, double(presenceValues[i][0]), true};
+                }
+                return out;
+            };
+        } else if (normalSource != "geometry") {
+            throw std::invalid_argument("normals.source must be geometry or fused");
+        }
         auto started = Clock::now();
-        normals.emplace(graph, geometry, *normalOptions);
+        normals.emplace(graph, geometry, *normalOptions, axisSampler);
         normalSeconds = seconds(started);
         started = Clock::now();
         events = scaffoldEvents(graph, geometry, *normals, *eventOptions, distances, eventReport);
@@ -381,6 +437,14 @@ int run(const std::string& configPath)
                                   {"adjacent_link_anchors", normalReport.adjacentLinkAnchors},
                                   {"degenerate_anchors", normalReport.degenerateAnchors},
                                   {"skipped_links", normalReport.skippedLinks},
+                                  {"source", cfg.value("normals", Json::object()).value("source",
+                                                                                        std::string{"geometry"})},
+                                  {"predicted_vertices", normalReport.predictedVertices},
+                                  {"vertices_with_axis", normalReport.verticesWithAxis},
+                                  {"chain_nodes", normalReport.chainNodes},
+                                  {"nodes_with_axis", normalReport.nodesWithAxis},
+                                  {"mean_axis_weight", normalReport.meanAxisWeight},
+                                  {"prediction_seconds", normalReport.predictionSeconds},
                                   {"seconds", normalReport.seconds}};
         summary["events"] = Json{{"lines", eventReport.lines},
                                  {"short_lines", eventReport.shortLines},

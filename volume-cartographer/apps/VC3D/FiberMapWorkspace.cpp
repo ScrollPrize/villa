@@ -9,6 +9,10 @@
 #include "FiberMapRulerMath.hpp"
 #include "FiberLineGeometry.hpp"
 #include "LineAnnotationController.hpp"
+
+#include "vc/lasagna/ChannelSampler.hpp"
+#include "vc/lasagna/Dataset.hpp"
+#include "vc/lasagna/LasagnaNormalSampler.hpp"
 #include "FiberNameDisplay.hpp"
 #include "CState.hpp"
 #include "FiberMapAutoLink.hpp"
@@ -1183,6 +1187,56 @@ FiberMapWorkspace::FiberMapWorkspace(CState* state, LineAnnotationController* co
         if (!inputs) return {};
         if (!inputs->baseNormalSampler && error) *error = tr("The package has no usable normal dataset.");
         return inputs->baseNormalSampler;
+    });
+    // The sheet axis a fused run reads: the package's fiber-inference
+    // prediction, sampled at the fibers' own vertices and weighted by its
+    // presence there.
+    _solveController->setAxisSampler([this](QString* error) -> vc::fiber_graph::ScaffoldAxisSampler {
+        if (!_controller) {
+            if (error) *error = tr("No annotation controller is attached.");
+            return {};
+        }
+        auto inputs = _controller->resolveFiberOptimizationInputs({}, {}, error);
+        if (!inputs) return {};
+        if (!inputs->fiberDataset) {
+            if (error) *error = tr("The package has no usable fiber-inference dataset.");
+            return {};
+        }
+        try {
+            auto sheet = std::make_shared<vc::lasagna::LasagnaDataset>(
+                vc::lasagna::fiberSheetNormalDataset(*inputs->fiberDataset));
+            auto sampler = std::make_shared<vc::lasagna::LasagnaNormalSampler>(*sheet);
+            auto arrays = std::make_shared<vc::lasagna::LasagnaGroupArrays>(512ULL * 1024ULL * 1024ULL, true);
+            const auto presence =
+                vc::lasagna::bindLasagnaChannel(inputs->fiberDataset->manifest(), "presence", *arrays);
+            return [sheet, sampler, arrays, presence](std::span<const vc::geometry::Point> points,
+                                                      std::size_t workers) {
+                std::vector<cv::Vec3d> xyz;
+                std::vector<cv::Vec3f> xyzf;
+                xyz.reserve(points.size());
+                xyzf.reserve(points.size());
+                for (const auto& point : points) {
+                    xyz.emplace_back(point[0], point[1], point[2]);
+                    xyzf.emplace_back(float(point[0]), float(point[1]), float(point[2]));
+                }
+                std::vector<vc::lasagna::NormalSampleWithDerivative> axes;
+                (void)sampler->sampleNormalBatch(xyz, false, int(workers), axes);
+                std::vector<std::vector<float>> presenceValues;
+                vc::lasagna::sampleLasagnaVectorBatch({presence}, xyzf, presenceValues, false);
+                std::vector<vc::fiber_graph::ScaffoldPredictedAxis> out(points.size());
+                for (std::size_t i = 0; i < points.size(); ++i) {
+                    if (i >= axes.size() || !axes[i].sample.valid) continue;
+                    if (i >= presenceValues.size() || presenceValues[i].empty()) continue;
+                    const auto& normal = axes[i].sample.normal;
+                    out[i] = {{normal[0], normal[1], normal[2]}, double(presenceValues[i][0]), true};
+                }
+                return out;
+            };
+        } catch (const std::exception& problem) {
+            if (error) *error = tr("The fiber-inference prediction could not be bound: %1")
+                                    .arg(QString::fromUtf8(problem.what()));
+            return {};
+        }
     });
     connect(_solverPanel, &vc3d::fiber_map::ScaffoldSolverPanel::solveRequested, this, [this]() {
         if (!_solveController || !_solverPanel) return;

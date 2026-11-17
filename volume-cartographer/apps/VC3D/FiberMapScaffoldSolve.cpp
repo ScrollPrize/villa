@@ -66,6 +66,8 @@ struct ScaffoldSolveController::SolveJob {
     // Resolved on the GUI thread before the job starts; null when the run
     // measures no winding separations.
     std::shared_ptr<vc::lasagna::LasagnaNormalSampler> sampler;
+    // The prediction's sheet axis, for a fused run.
+    vc::fiber_graph::ScaffoldAxisSampler axes;
     // Outputs.
     QString error;
     QString summary;
@@ -85,6 +87,11 @@ ScaffoldSolveController::~ScaffoldSolveController() = default;
 void ScaffoldSolveController::setWindingSampler(WindingSamplerResolver resolver)
 {
     _windingSampler = std::move(resolver);
+}
+
+void ScaffoldSolveController::setAxisSampler(AxisSamplerResolver resolver)
+{
+    _axisSampler = std::move(resolver);
 }
 
 std::optional<vc::objects::AttachmentIdentity> ScaffoldSolveController::attachment() const
@@ -237,7 +244,20 @@ void ScaffoldSolveController::startSolve(const ScaffoldSolveRequest& request)
             return;
         }
     }
+    // The same for the prediction a fused run reads its sheet axis from.
+    vc::fiber_graph::ScaffoldAxisSampler axes;
+    if (request.measureCrossings && request.normalSource == "fused") {
+        QString error;
+        if (_axisSampler) axes = _axisSampler(&error);
+        if (!axes) {
+            _lastError = error.isEmpty() ? tr("No fiber-inference prediction is bound, so no sheet axis can be read.")
+                                         : error;
+            emit statusMessage(_lastError);
+            return;
+        }
+    }
     _job = std::make_shared<SolveJob>();
+    _job->axes = std::move(axes);
     _job->sampler = std::move(sampler);
     _job->request = request;
     _job->attachment = store;
@@ -303,7 +323,7 @@ void ScaffoldSolveController::startSolve(const ScaffoldSolveRequest& request)
                                               double step, int workers) {
                             return sampler->normalAlignedWindingDistancesBatch(connectors, step, workers);
                         };
-                    normals.emplace(graph, geometry, normalOptions);
+                    normals.emplace(graph, geometry, normalOptions, job->axes);
                     events = scaffoldEvents(graph, geometry, *normals, eventOptions, distances, eventReport);
                     signs = scaffoldNormalSigns(graph, *normals, events, signOptions);
                     measured =
@@ -595,6 +615,17 @@ ScaffoldSolverPanel::ScaffoldSolverPanel(ScaffoldSolveController* controller, QW
            "crossings bound from both sides. Zero leaves enclosures out."));
     form->addRow(tr("Enclosure weight"), _enclosureWeightSpin);
 
+    _normalSourceCombo = new QComboBox(this);
+    _normalSourceCombo->setObjectName(QStringLiteral("fiberMapSolveNormalSource"));
+    _normalSourceCombo->addItem(tr("fiber geometry"), QStringLiteral("geometry"));
+    _normalSourceCombo->addItem(tr("fused prediction"), QStringLiteral("fused"));
+    _normalSourceCombo->setToolTip(tr("Where the fibers' normals come from. The geometry alone gives every\n"
+                                      "fiber a strip normal; the fused source also pulls each node towards\n"
+                                      "the sheet axis the package's fiber-inference prediction states there,\n"
+                                      "weighted by its presence. Fused reads the prediction volume along\n"
+                                      "every fiber, which takes a minute on a large scaffold."));
+    form->addRow(tr("Normals"), _normalSourceCombo);
+
     _signBackendCombo = new QComboBox(this);
     _signBackendCombo->setObjectName(QStringLiteral("fiberMapSolveSignBackend"));
     _signBackendCombo->addItem(tr("IRLS"), QStringLiteral("irls"));
@@ -644,7 +675,8 @@ void ScaffoldSolverPanel::updateEnabled()
     if (_volume.empty()) _runButton->setToolTip(tr("The map has no annotation volume to solve in."));
     const bool crossings = _crossingsCheck->isChecked();
     for (auto* widget : std::initializer_list<QWidget*>{_windingDistanceCheck, _perpendicularWeightSpin,
-                                                        _parallelWeightSpin, _enclosureWeightSpin, _signBackendCombo})
+                                                        _parallelWeightSpin, _enclosureWeightSpin,
+                                                        _normalSourceCombo, _signBackendCombo})
         widget->setEnabled(crossings);
 }
 
@@ -665,6 +697,7 @@ ScaffoldSolveRequest ScaffoldSolverPanel::request() const
     request.perpendicularWeight = _perpendicularWeightSpin->value();
     request.parallelWeight = _parallelWeightSpin->value();
     request.enclosureWeight = _enclosureWeightSpin->value();
+    request.normalSource = _normalSourceCombo->currentData().toString().toStdString();
     request.signBackend = _signBackendCombo->currentData().toString().toStdString();
     request.workers = std::size_t(std::max(1, QThread::idealThreadCount()));
     return request;

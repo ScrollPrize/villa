@@ -30,6 +30,7 @@
 #include "vc/fiber_tracer/FiberStripNormals.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <span>
 #include <string>
@@ -56,8 +57,23 @@ struct ScaffoldNormalAnchor {
     double weight = 1;
 };
 
+// Variant B: what a prediction volume states at one point - the sheet axis
+// (sign-free) and the raw presence value there.
+struct ScaffoldPredictedAxis {
+    geometry::Point axis{};
+    double presence = 0;
+    bool valid = false;
+};
+// Samples the prediction at the fibers' own vertices, in order. The caller
+// owns the dataset; the library only gathers what comes back.
+using ScaffoldAxisSampler =
+    std::function<std::vector<ScaffoldPredictedAxis>(std::span<const geometry::Point> points, std::size_t workers)>;
+
 struct ScaffoldNormalOptions {
     fiber_tracer::FiberStripNormalOptions strip;
+    // Variant B: map the prediction's presence to an axis weight, 0 at
+    // `presenceFloor` and 1 at `presenceFull`. Ignored without a sampler.
+    double presenceFloor = 0.0, presenceFull = 128.0;
     bool manualDisplayNormals = true;
     bool approvedNormalPieces = true;
     bool adjacentLinkAnchors = true;
@@ -77,12 +93,20 @@ struct ScaffoldNormalReport {
     // stored display normal is parallel to the fiber there.
     std::int64_t degenerateAnchors = 0;
     std::int64_t skippedLinks = 0;
+    // Variant B: the prediction's own contribution.
+    std::int64_t predictedVertices = 0, verticesWithAxis = 0, chainNodes = 0, nodesWithAxis = 0;
+    double meanAxisWeight = 0, predictionSeconds = 0;
     double seconds = 0;
 };
 
 class ScaffoldNormals {
 public:
-    ScaffoldNormals(const ScaffoldGraph&, const ScaffoldGeometry&, const ScaffoldNormalOptions& = {});
+    // Without a sampler this is variant A: the normals come from the fibers'
+    // own geometry and the annotation's anchors. With one, every chain node
+    // is also pulled towards the sheet axis the prediction states there
+    // (variant B); the anchors still win at the nodes they fix.
+    ScaffoldNormals(const ScaffoldGraph&, const ScaffoldGeometry&, const ScaffoldNormalOptions& = {},
+                    const ScaffoldAxisSampler& = {});
 
     // One gauge normal per line point, XYZ triples in ScaffoldGraph::linePoints
     // order; a degenerate fiber's points are zero.

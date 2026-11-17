@@ -2,6 +2,8 @@
 
 #include "vc/fiber_tracer/FiberDisplay.hpp"
 
+#include "vc_object_store/ParallelFor.hpp"
+
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -51,12 +53,14 @@ const char* scaffoldSignSourceName(ScaffoldSignSource source)
 }
 
 ScaffoldNormals::ScaffoldNormals(const ScaffoldGraph& graph, const ScaffoldGeometry& geometry,
-                                const ScaffoldNormalOptions& options)
+                                const ScaffoldNormalOptions& options, const ScaffoldAxisSampler& prediction)
     : graph_(&graph)
     , geometry_(&geometry)
 {
     if (!std::isfinite(options.anchorWeight) || options.anchorWeight <= 0)
         throw std::invalid_argument("scaffold normals: the anchor weight must be finite and positive");
+    if (prediction && (!(options.presenceFull > options.presenceFloor) || options.presenceFloor < 0))
+        throw std::invalid_argument("scaffold normals: the presence range must rise from a non-negative floor");
     const auto started = std::chrono::steady_clock::now();
     const auto fibers = graph.fibers.size();
     report_.fibers = std::int64_t(fibers);
@@ -150,12 +154,85 @@ ScaffoldNormals::ScaffoldNormals(const ScaffoldGraph& graph, const ScaffoldGeome
             lines[i][std::size_t(j)] = {graph.linePoints[at], graph.linePoints[at + 1], graph.linePoints[at + 2]};
         }
     }
+    // The chains the solve will run on, computed here so an anchor and a
+    // predicted axis can name the node they belong to. The solve recomputes
+    // them identically.
+    std::vector<fiber_tracer::FiberStripChain> chains(fibers);
+    objects::parallelFor(fibers, std::max<std::size_t>(1, options.workers),
+                         [&](std::size_t i) { chains[i] = fiber_tracer::fiberStripChain(lines[i], options.strip); });
     std::vector<std::vector<double>> chainArcs(fibers);
     for (std::size_t i = 0; i < fibers; ++i) {
-        const auto chain = fiber_tracer::fiberStripChain(lines[i], options.strip);
-        chainArcs[i] = chain.arc;
-        targets[i].assign(chain.points.size(), fiber_tracer::FiberStripAxisTarget{});
-        claimed[i].assign(chain.points.size(), 0);
+        chainArcs[i] = chains[i].arc;
+        targets[i].assign(chains[i].points.size(), fiber_tracer::FiberStripAxisTarget{});
+        claimed[i].assign(chains[i].points.size(), 0);
+        report_.chainNodes += std::int64_t(chains[i].points.size());
+    }
+    // Variant B: the predicted sheet axis at every vertex, gathered into the
+    // chain node it belongs to as the principal axis of the presence-weighted
+    // outer products. The prediction is sampled on the traced vertices
+    // themselves, which lie in the sheet; the smoothed chain may not.
+    if (prediction) {
+        const auto predictionStarted = std::chrono::steady_clock::now();
+        std::vector<geometry::Point> vertices;
+        std::vector<std::size_t> fiberFirstVertex(fibers + 1, 0);
+        for (std::size_t i = 0; i < fibers; ++i) fiberFirstVertex[i + 1] = fiberFirstVertex[i] + lines[i].size();
+        vertices.reserve(fiberFirstVertex.back());
+        for (const auto& line : lines)
+            for (const auto& point : line) vertices.push_back({point[0], point[1], point[2]});
+        const auto sampled = prediction(vertices, std::max<std::size_t>(1, options.workers));
+        if (sampled.size() != vertices.size())
+            throw std::runtime_error("scaffold normals: the prediction returned a different sample count");
+        report_.predictedVertices = std::int64_t(vertices.size());
+        std::vector<std::int64_t> withAxis(fibers, 0), nodesWithAxis(fibers, 0);
+        std::vector<double> weightSum(fibers, 0.);
+        objects::parallelFor(fibers, std::max<std::size_t>(1, options.workers), [&](std::size_t i) {
+            const auto& chain = chains[i];
+            if (chain.points.empty()) return;
+            std::vector<cv::Matx33d> scatter(chain.points.size(), cv::Matx33d::zeros());
+            std::vector<double> weights(chain.points.size(), 0.);
+            std::vector<std::size_t> counts(chain.points.size(), 0);
+            for (std::size_t vertex = 0; vertex < lines[i].size(); ++vertex) {
+                const auto arc = chain.vertexArc[vertex];
+                const auto at = std::lower_bound(chain.arc.begin(), chain.arc.end(), arc);
+                std::size_t node = std::size_t(at - chain.arc.begin());
+                if (node == chain.arc.size()) node = chain.arc.size() - 1;
+                else if (node > 0 && arc - chain.arc[node - 1] < chain.arc[node] - arc) --node;
+                ++counts[node];
+                const auto& sample = sampled[fiberFirstVertex[i] + vertex];
+                if (!sample.valid) continue;
+                const double weight = std::clamp((sample.presence - options.presenceFloor) /
+                                                     (options.presenceFull - options.presenceFloor),
+                                                 0., 1.);
+                if (!(weight > 0)) continue;
+                const cv::Vec3d axis(sample.axis[0], sample.axis[1], sample.axis[2]);
+                scatter[node] += weight * cv::Matx33d(axis[0] * axis[0], axis[0] * axis[1], axis[0] * axis[2],
+                                                      axis[1] * axis[0], axis[1] * axis[1], axis[1] * axis[2],
+                                                      axis[2] * axis[0], axis[2] * axis[1], axis[2] * axis[2]);
+                weights[node] += weight;
+                ++withAxis[i];
+            }
+            for (std::size_t node = 0; node < chain.points.size(); ++node) {
+                if (!(weights[node] > 0) || counts[node] == 0) continue;
+                cv::Vec3d eigenvalues;
+                cv::Matx33d eigenvectors;
+                cv::eigen(scatter[node], eigenvalues, eigenvectors);
+                auto& target = targets[i][node];
+                target.axis = {eigenvectors(0, 0), eigenvectors(0, 1), eigenvectors(0, 2)};
+                target.weight = weights[node] / double(counts[node]);
+                target.fixed = false;
+                ++nodesWithAxis[i];
+                weightSum[i] += target.weight;
+            }
+        });
+        double totalWeight = 0;
+        for (std::size_t i = 0; i < fibers; ++i) {
+            report_.verticesWithAxis += withAxis[i];
+            report_.nodesWithAxis += nodesWithAxis[i];
+            totalWeight += weightSum[i];
+        }
+        report_.meanAxisWeight = report_.nodesWithAxis > 0 ? totalWeight / double(report_.nodesWithAxis) : 0.;
+        report_.predictionSeconds =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - predictionStarted).count();
     }
     std::stable_sort(anchors_.begin(), anchors_.end(), [](const ScaffoldNormalAnchor& x, const ScaffoldNormalAnchor& y) {
         return std::tie(x.fiber, x.source, x.arc) < std::tie(y.fiber, y.source, y.arc);

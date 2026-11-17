@@ -579,3 +579,46 @@ TEST_CASE("an approval row marks the measured constraint it names")
     CHECK(approvals.stale == 1);
     CHECK_FALSE(measured.front().approved);
 }
+
+TEST_CASE("a prediction's sheet axis pulls the strip normals")
+{
+    // A V fiber running straight along z has no geometry preference for its
+    // normal direction. A prediction that states the radial axis everywhere
+    // decides it, without fixing a sign.
+    Scaffold scaffold;
+    const auto vertical = scaffold.fiber(ScaffoldFamily::Vertical, verticalLine(300., 45., -150., 150., 30));
+    const ScaffoldGeometry geometry(scaffold.graph);
+    const Point radial{std::cos(radians(45.)), std::sin(radians(45.)), 0.};
+
+    std::size_t sampled = 0;
+    const ScaffoldAxisSampler prediction = [&](std::span<const Point> points, std::size_t) {
+        sampled = points.size();
+        std::vector<ScaffoldPredictedAxis> out;
+        out.reserve(points.size());
+        for (std::size_t i = 0; i < points.size(); ++i) out.push_back({radial, 128., true});
+        return out;
+    };
+    ScaffoldNormalOptions options;
+    options.strip.axisWeight = 100.;
+    const ScaffoldNormals fused(scaffold.graph, geometry, options, prediction);
+    CHECK(sampled == std::size_t(scaffold.graph.fibers[vertical].pointCount));
+    CHECK(fused.report().predictedVertices == scaffold.graph.fibers[vertical].pointCount);
+    CHECK(fused.report().verticesWithAxis == fused.report().predictedVertices);
+    CHECK(fused.report().chainNodes > 0);
+    CHECK(fused.report().nodesWithAxis == fused.report().chainNodes);
+    CHECK(fused.report().meanAxisWeight == doctest::Approx(1.));
+    // No anchor fixed a sign, so the gauge is still free - but the axis is
+    // the predicted one.
+    CHECK(fused.report().anchoredFibers == 0);
+    const auto solved = fused.at(vertical, geometry.arcLength(vertical) / 2.);
+    REQUIRE(solved);
+    CHECK(std::abs(dot(*solved, radial)) > 0.99);
+
+    // A prediction whose presence stays below the floor weighs nothing.
+    const ScaffoldAxisSampler weightless = [&](std::span<const Point> points, std::size_t) {
+        return std::vector<ScaffoldPredictedAxis>(points.size(), ScaffoldPredictedAxis{radial, 0., true});
+    };
+    const ScaffoldNormals none(scaffold.graph, geometry, options, weightless);
+    CHECK(none.report().verticesWithAxis == 0);
+    CHECK(none.report().nodesWithAxis == 0);
+}
