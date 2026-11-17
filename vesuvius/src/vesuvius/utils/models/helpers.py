@@ -219,3 +219,7 @@ class dummy_context(object):
     def __exit__(self, exc_type, exc_val, exc_tb):
         pass
 
+
+def inference_autocast_enabled(device):
+    """Use FP32 for automatic CPU inference; keep accelerator AMP unchanged."""
+    return device.type != "cpu"

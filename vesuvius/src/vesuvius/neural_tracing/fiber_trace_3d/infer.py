@@ -267,6 +267,15 @@ def _resolve_inference_precision(
     else:
         mode = _normalize_mixed_precision_mode(request)
 
+    # Resolve automatic CPU policy before effective config and cache identity.
+    # Explicit --inference-precision remains an override.
+    from vesuvius.utils.models.helpers import inference_autocast_enabled
+
+    if derived and mode == "bf16" and any(
+        not inference_autocast_enabled(device) for device in devices
+    ):
+        return "off", "checkpoint-cpu-fp32"
+
     if mode == "auto":
         mode = "off"
     if not validate_devices:
@@ -844,7 +853,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--inference-precision", choices=("auto", "fp32", "fp16", "bf16"), default="auto",
-        help="Model autocast precision; auto uses checkpoint training metadata (default: auto).",
+        help="Model autocast precision; auto uses checkpoint training metadata, except that "
+        "checkpoint bf16 resolves to fp32 on CPU devices (default: auto).",
     )
     parser.add_argument(
         "--product-accumulator-dtype", choices=("float16", "float32"), default="float16",

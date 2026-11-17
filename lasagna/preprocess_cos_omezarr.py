@@ -37,6 +37,7 @@ except ImportError:
 	numba = None
 	_HAS_NUMBA = False
 import torch
+from vesuvius.utils.models.helpers import inference_autocast_enabled
 import vc_reader
 from vc_reader.reader import ZarrGroup, ZarrWriter, open_group, open_node, open_zarr
 
@@ -247,7 +248,7 @@ class LasagnaCosPredict3DAdapter:
 			module.running_var = torch.ones(module.num_features, device=device)
 
 	def run_tile_inference(self, model, tile: torch.Tensor, *, device: torch.device):
-		with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+		with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=inference_autocast_enabled(device)):
 			output = model(tile)
 		return output["output"] if isinstance(output, dict) else output
 

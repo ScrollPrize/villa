@@ -852,7 +852,7 @@ def test_inference_precision_auto_uses_checkpoint_policy(tmp_path: Path) -> None
     torch.save({"config": {"training": {"mixed_precision": "bf16"}}}, checkpoint)
     assert _resolve_inference_precision(
         "auto", checkpoint=checkpoint, devices=(torch.device("cpu"),)
-    ) == ("bf16", "checkpoint")
+    ) == ("off", "checkpoint-cpu-fp32")
 
 
 def test_inference_precision_auto_legacy_and_unsupported_fall_back(tmp_path: Path) -> None:
