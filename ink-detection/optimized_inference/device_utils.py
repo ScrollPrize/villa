@@ -10,7 +10,7 @@ autocast a no-op when the tensors are on MPS.
 import os
 import torch
 
-__all__ = ["select_device", "amp_device_type", "sync", "empty_cache"]
+__all__ = ["select_device", "amp_device_type", "autocast_enabled", "sync", "empty_cache"]
 
 
 def select_device(prefer: str | None = None) -> torch.device:
@@ -49,3 +49,36 @@ def empty_cache(device: torch.device | None = None) -> None:
         torch.cuda.empty_cache()
     if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
         torch.mps.empty_cache()
+
+
+def _native_cpu_bf16() -> bool:
+    """True when the CPU itself has BF16 instructions (x86 AVX512_BF16 or AMX).
+
+    Torch 2.11+ has torch.cpu.get_capabilities(). Torch 2.5-2.10 (the ink
+    image uses 2.10) has only private probes and no AMX_BF16 one, so AMX_TILE
+    stands in there. Both report the hardware and ignore ONEDNN_MAX_CPU_ISA.
+    Torch before 2.5 has neither, so it gets False (CPU FP32).
+    """
+    get_capabilities = getattr(torch.cpu, "get_capabilities", None)
+    if get_capabilities is not None:
+        caps = get_capabilities()
+        return bool(caps.get("avx512_bf16", False) or caps.get("amx_bf16", False))
+    probes = ("_is_avx512_bf16_supported", "_is_amx_tile_supported")
+    return any(bool(getattr(torch.cpu, name, lambda: False)()) for name in probes)
+
+
+def autocast_enabled(device: torch.device) -> bool:
+    """Keep accelerator AMP; use CPU BF16 only with native BF16 hardware.
+
+    Both _native_cpu_bf16() and the oneDNN backend query must agree; the
+    oneDNN query also turns BF16 off under an AVX2-level ISA cap. These are
+    partly private APIs, so a failed or missing query uses CPU FP32.
+    """
+    if device.type != "cpu":
+        return True
+    if not torch.backends.mkldnn.is_available() or not torch.backends.mkldnn.enabled:
+        return False
+    try:
+        return _native_cpu_bf16() and bool(torch.ops.mkldnn._is_mkldnn_bf16_supported())
+    except (AttributeError, RuntimeError):
+        return False
