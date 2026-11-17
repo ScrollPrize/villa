@@ -11,6 +11,7 @@
 
 #include <array>
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -60,6 +61,29 @@ struct ScaffoldApprovalRow {
 };
 [[nodiscard]] bool scaffoldApprovalRowBefore(const ScaffoldApprovalRow& x, const ScaffoldApprovalRow& y,
                                              ScaffoldApprovalOrder order);
+
+// What two solves disagree about.
+//
+// A winding is gauged per component and per run (minimum 0), so comparing the
+// stored numbers one by one would count a gauge shift - or a different
+// component partition - as every fiber having moved. The comparison is
+// therefore relative: fibers that are in the same component here *and* in the
+// same component there move together, and the ones counted are those whose
+// offset between the two runs differs from the offset most of their group
+// shares. That is exactly "which fibers moved against their neighbours".
+struct ScaffoldRunDiff {
+    // Fibers both runs placed, and the ones only one of them did.
+    std::int64_t shared = 0, onlyFirst = 0, onlySecond = 0;
+    // Shared fibers that moved relative to their group, and shared fibers
+    // whose normal sign differs (counted only where both runs state one).
+    std::int64_t winding = 0, sign = 0;
+    // The (component here, component there) groups the comparison was made
+    // in, and the shared fibers whose normal sign both runs state.
+    std::int64_t groups = 0, signStated = 0;
+};
+[[nodiscard]] ScaffoldRunDiff scaffoldRunDiff(
+    const std::map<std::string, vc::fiber_graph::ScaffoldStoredWinding>& first,
+    const std::map<std::string, vc::fiber_graph::ScaffoldStoredWinding>& second);
 
 // Per fiber, which spans carry a live and current piece approval, by aspect
 // (0 geometry, 1 normals). Spans are indexed by their lower control point.

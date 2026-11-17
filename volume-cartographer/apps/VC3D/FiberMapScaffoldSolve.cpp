@@ -23,6 +23,7 @@
 #include <QSysInfo>
 #include <QThread>
 #include <QThreadPool>
+#include <QTimer>
 #include <QTreeWidget>
 #include <QVBoxLayout>
 #include <QtConcurrent>
@@ -30,6 +31,7 @@
 #include <algorithm>
 #include <limits>
 #include <map>
+#include <set>
 #include <tuple>
 
 namespace vc3d::fiber_map
@@ -68,8 +70,12 @@ struct ScaffoldSolveController::SolveJob {
     std::shared_ptr<vc::lasagna::LasagnaNormalSampler> sampler;
     // The prediction's sheet axis, for a fused run.
     vc::fiber_graph::ScaffoldAxisSampler axes;
+    // Progress and cancellation, read from the GUI thread while the worker
+    // writes it.
+    vc::fiber_graph::ScaffoldRunMonitor monitor;
     // Outputs.
     QString error;
+    bool cancelled = false;
     QString summary;
     std::string runUuid;
     ScaffoldRunRows rows;
@@ -113,6 +119,11 @@ void ScaffoldSolveController::reloadRuns()
     try {
         session->readStore(*store, [&](const vc::objects::StoreReader& reader, const auto&) {
             _runs = readScaffoldRuns(reader);
+            _storeState = reader.status();
+            // When the annotation itself last changed. Taken from the records
+            // rather than the change feed: a store may retain no feed at all,
+            // and a run's own rows are extension rows, which move no record.
+            _lastAnnotationCommit = scaffoldAnnotationCommit(reader);
         });
     } catch (const std::exception& problem) {
         error = tr("The saved solves could not be read: %1").arg(QString::fromUtf8(problem.what()));
@@ -124,6 +135,15 @@ void ScaffoldSolveController::reloadRuns()
         emit statusMessage(error);
     }
     emit runsChanged();
+}
+
+bool ScaffoldSolveController::runStale(const ScaffoldStoredRun& run) const
+{
+    // A run that recorded no input says nothing about what it read, so it is
+    // not claimed to be current either.
+    if (run.input.storeUuid.empty() || _storeState.storeUuid.empty()) return false;
+    if (run.input.storeUuid != _storeState.storeUuid || run.input.generation != _storeState.generation) return true;
+    return _lastAnnotationCommit > run.input.commitSequence;
 }
 
 void ScaffoldSolveController::selectRun(const std::string& runUuid)
@@ -157,6 +177,29 @@ void ScaffoldSolveController::selectRun(const std::string& runUuid)
     view.pieces = rankScaffoldPieces(view.residuals);
     _selected = std::move(view);
     emit selectionChanged();
+}
+
+ScaffoldRunDiff ScaffoldSolveController::diffRuns(const std::string& first, const std::string& second,
+                                                 QString& error)
+{
+    error.clear();
+    const auto store = attachment();
+    const auto session = _state ? _state->objectStoreSession() : nullptr;
+    if (!store || !session) {
+        error = tr("No fiber store is attached.");
+        return {};
+    }
+    std::map<std::string, ScaffoldStoredWinding> here, there;
+    try {
+        session->readStore(*store, [&](const vc::objects::StoreReader& reader, const auto&) {
+            here = readScaffoldWindings(reader, first);
+            there = readScaffoldWindings(reader, second);
+        });
+    } catch (const std::exception& problem) {
+        error = tr("The solves could not be compared: %1").arg(QString::fromUtf8(problem.what()));
+        return {};
+    }
+    return scaffoldRunDiff(here, there);
 }
 
 void ScaffoldSolveController::dropApprovals()
@@ -220,6 +263,12 @@ void ScaffoldSolveController::startSolve(const ScaffoldSolveRequest& request)
         emit statusMessage(_lastError);
         return;
     }
+    // A scope that resolved to nothing is a refusal, not a whole-scaffold run.
+    if (request.restricted && request.fiberSubset.empty()) {
+        _lastError = tr("The scope is a selected network, but the map has none selected.");
+        emit statusMessage(_lastError);
+        return;
+    }
     if (!vc::geometry::windingMinCostFlowAvailable()) {
         _lastError = tr("This build has no LEMON min-cost-flow backend.");
         emit statusMessage(_lastError);
@@ -278,6 +327,7 @@ void ScaffoldSolveController::startSolve(const ScaffoldSolveRequest& request)
             ScaffoldLoadOptions load;
             load.volume = job->request.volume;
             load.fallbackHandedness = job->request.fallbackHandedness;
+            load.fiberSubset = job->request.fiberSubset;
             ScaffoldSolveOptions options;
             options.links.approvalStates = job->request.approvalStates;
             options.links.includeAuto = job->request.includeAuto;
@@ -285,6 +335,8 @@ void ScaffoldSolveController::startSolve(const ScaffoldSolveRequest& request)
             options.fixApprovedSubgraphs = job->request.fixApprovedSubgraphs;
             options.flow.backend = vc::geometry::parseWindingFlowBackend(job->request.lemonBackend);
             options.workers = std::max<std::size_t>(1, job->request.workers);
+            options.monitor = &job->monitor;
+            job->monitor.enter("reading the store");
             ScaffoldRunRecord record;
             record.runUuid = vc::objects::util::newUuid();
             job->session->readStore(*job->attachment, [&](const vc::objects::StoreReader& reader, const auto&) {
@@ -308,8 +360,10 @@ void ScaffoldSolveController::startSolve(const ScaffoldSolveRequest& request)
                     normalOptions.linkApprovalStates = job->request.approvalStates;
                     normalOptions.includeAutoLinks = job->request.includeAuto;
                     normalOptions.workers = options.workers;
+                    normalOptions.monitor = &job->monitor;
                     eventOptions.measureWindingDistances = job->request.measureWindingDistances;
                     eventOptions.workers = options.workers;
+                    eventOptions.monitor = &job->monitor;
                     measuredOptions.perpendicularWeight = job->request.perpendicularWeight;
                     measuredOptions.parallelWeight = job->request.parallelWeight;
                     measuredOptions.enclosureWeight = job->request.enclosureWeight;
@@ -317,6 +371,7 @@ void ScaffoldSolveController::startSolve(const ScaffoldSolveRequest& request)
                                                    ? vc::fiber_tracer::FiberSignBackend::Ceres
                                                    : vc::fiber_tracer::FiberSignBackend::Irls;
                     signOptions.sign.threads = int(options.workers);
+                    signOptions.monitor = &job->monitor;
                     ScaffoldWindingDistances distances;
                     if (auto sampler = job->sampler)
                         distances = [sampler](const std::vector<std::pair<cv::Vec3d, cv::Vec3d>>& connectors,
@@ -359,11 +414,34 @@ void ScaffoldSolveController::startSolve(const ScaffoldSolveRequest& request)
                                         .arg(measuredReport.used)
                                         .arg(measuredReport.enclosureArcs)
                                         .arg(signs.decided);
+                // A crossing whose geometry and whose H/V tags disagree is
+                // dropped, and that is a question about the tagging: say so
+                // rather than leaving it in the gap between read and used.
+                if (job->request.measureCrossings && measuredReport.skippedFamilyMismatch > 0)
+                    job->summary += QObject::tr("; %1 crossings dropped where the pair's geometry and their H/V \n"
+                                                "tags disagree")
+                                        .arg(measuredReport.skippedFamilyMismatch);
             });
+        } catch (const ScaffoldCancelled&) {
+            // Asked for by the caller: no error, no rows.
+            job->cancelled = true;
         } catch (const std::exception& problem) {
             job->error = QString::fromUtf8(problem.what());
         }
     }));
+}
+
+void ScaffoldSolveController::cancelSolve()
+{
+    if (!_busy || !_job) return;
+    _job->monitor.cancel();
+    emit statusMessage(tr("Taking the solve back..."));
+}
+
+vc::fiber_graph::ScaffoldRunMonitor::Progress ScaffoldSolveController::progress() const
+{
+    if (!_busy || !_job) return {};
+    return _job->monitor.progress();
 }
 
 void ScaffoldSolveController::finishSolve()
@@ -373,6 +451,10 @@ void ScaffoldSolveController::finishSolve()
     _busy = false;
     emit busyChanged(false);
     if (!job) return;
+    if (job->cancelled) {
+        emit statusMessage(tr("The solve was taken back; nothing was saved."));
+        return;
+    }
     if (!job->error.isEmpty()) {
         _lastError = tr("The solve failed: %1").arg(job->error);
         emit statusMessage(_lastError);
@@ -587,6 +669,17 @@ ScaffoldSolverPanel::ScaffoldSolverPanel(ScaffoldSolveController* controller, QW
     _backendCombo->setToolTip(tr("The min-cost-flow backend. Both solve the same problem exactly."));
     form->addRow(tr("Backend"), _backendCombo);
 
+    _scopeCombo = new QComboBox(this);
+    _scopeCombo->setObjectName(QStringLiteral("fiberMapSolveScope"));
+    _scopeCombo->addItem(tr("the whole scaffold"), false);
+    _scopeCombo->addItem(tr("the selected network"), true);
+    _scopeCombo->setToolTip(tr("Which fibers the run reads. The selected network is the group the map\n"
+                               "currently has selected: its fibers alone are loaded, so the links,\n"
+                               "crossings and components of the run are those of that part of the\n"
+                               "annotation. A run with nothing selected is refused rather than run on\n"
+                               "everything."));
+    form->addRow(tr("Scope"), _scopeCombo);
+
     _crossingsCheck = new QCheckBox(tr("Measure the fibers' crossings"), this);
     _crossingsCheck->setObjectName(QStringLiteral("fiberMapSolveCrossings"));
     _crossingsCheck->setToolTip(tr("Also use the crossings of the annotated fibers themselves: their strip\n"
@@ -644,11 +737,28 @@ ScaffoldSolverPanel::ScaffoldSolverPanel(ScaffoldSolveController* controller, QW
     form->addRow(tr("Sign backend"), _signBackendCombo);
     layout->addLayout(form);
 
-    _runButton = new QPushButton(tr("Solve"), this);
+    auto* buttons = new QWidget(this);
+    auto* buttonLayout = new QHBoxLayout(buttons);
+    buttonLayout->setContentsMargins(0, 0, 0, 0);
+    _runButton = new QPushButton(tr("Solve"), buttons);
     _runButton->setObjectName(QStringLiteral("fiberMapSolveRun"));
     _runButton->setToolTip(tr("Read the store's fibers, links, approvals and umbilicus, assign every\n"
                               "fiber an integer winding, and save the run in the store."));
-    layout->addWidget(_runButton);
+    _cancelButton = new QPushButton(tr("Cancel"), buttons);
+    _cancelButton->setObjectName(QStringLiteral("fiberMapSolveCancel"));
+    _cancelButton->setEnabled(false);
+    _cancelButton->setToolTip(tr("Take the running solve back. It stops at its next checkpoint - between\n"
+                                 "fibers, between chunks of the prediction, between components or\n"
+                                 "between cycle searches - and saves nothing."));
+    buttonLayout->addWidget(_runButton, 1);
+    buttonLayout->addWidget(_cancelButton);
+    layout->addWidget(buttons);
+
+    _progressLabel = new QLabel(this);
+    _progressLabel->setObjectName(QStringLiteral("fiberMapSolveProgress"));
+    _progressLabel->setToolTip(tr("The stage the running solve is in, and the work it has done of what\n"
+                                  "that stage announced."));
+    layout->addWidget(_progressLabel);
 
     _statusLabel = new QLabel(this);
     _statusLabel->setObjectName(QStringLiteral("fiberMapSolveStatus"));
@@ -658,15 +768,50 @@ ScaffoldSolverPanel::ScaffoldSolverPanel(ScaffoldSolveController* controller, QW
     layout->addStretch(1);
 
     connect(_runButton, &QPushButton::clicked, this, [this]() { emit solveRequested(); });
+    connect(_cancelButton, &QPushButton::clicked, this, [this]() {
+        if (_controller) _controller->cancelSolve();
+    });
+    // The worker writes its progress into the run's monitor; the dock reads it
+    // rather than the worker signalling every fiber it finished.
+    _progressTimer = new QTimer(this);
+    _progressTimer->setInterval(250);
+    connect(_progressTimer, &QTimer::timeout, this, [this]() { showProgress(); });
     for (auto* box : {_approvedCheck, _pendingCheck, _crossingsCheck}) {
         connect(box, &QCheckBox::toggled, this, [this]() { updateEnabled(); });
     }
     if (_controller) {
-        connect(_controller, &ScaffoldSolveController::busyChanged, this, [this]() { updateEnabled(); });
+        connect(_controller, &ScaffoldSolveController::busyChanged, this, [this](bool busy) {
+            updateEnabled();
+            if (busy) {
+                _progressTimer->start();
+            } else {
+                _progressTimer->stop();
+                _progressLabel->clear();
+            }
+        });
         connect(_controller, &ScaffoldSolveController::statusMessage, this,
                 [this](const QString& message) { _statusLabel->setText(message); });
     }
     updateEnabled();
+}
+
+void ScaffoldSolverPanel::setScopeResolver(ScopeResolver resolver)
+{
+    _scope = std::move(resolver);
+}
+
+void ScaffoldSolverPanel::showProgress()
+{
+    if (!_controller) return;
+    const auto progress = _controller->progress();
+    if (progress.stage.empty()) {
+        _progressLabel->clear();
+        return;
+    }
+    const auto stage = QString::fromStdString(progress.stage);
+    _progressLabel->setText(progress.total > 0
+                                ? tr("%1: %2 of %3").arg(stage).arg(progress.done).arg(progress.total)
+                                : tr("%1...").arg(stage));
 }
 
 void ScaffoldSolverPanel::setFrame(const std::string& volume, std::optional<int> fallbackHandedness)
@@ -681,6 +826,7 @@ void ScaffoldSolverPanel::updateEnabled()
     const bool states = _approvedCheck->isChecked() || _pendingCheck->isChecked();
     const bool busy = _controller && _controller->busy();
     _runButton->setEnabled(states && !busy && !_volume.empty());
+    _cancelButton->setEnabled(busy);
     if (_volume.empty()) _runButton->setToolTip(tr("The map has no annotation volume to solve in."));
     const bool crossings = _crossingsCheck->isChecked();
     for (auto* widget : std::initializer_list<QWidget*>{_windingDistanceCheck, _perpendicularWeightSpin,
@@ -709,6 +855,8 @@ ScaffoldSolveRequest ScaffoldSolverPanel::request() const
     request.normalSource = _normalSourceCombo->currentData().toString().toStdString();
     request.signBackend = _signBackendCombo->currentData().toString().toStdString();
     request.workers = std::size_t(std::max(1, QThread::idealThreadCount()));
+    request.restricted = _scopeCombo->currentData().toBool();
+    if (request.restricted && _scope) request.fiberSubset = _scope();
     return request;
 }
 
@@ -724,16 +872,31 @@ ScaffoldRunsPanel::ScaffoldRunsPanel(ScaffoldSolveController* controller, QWidge
     _tree = new QTreeWidget(this);
     _tree->setObjectName(QStringLiteral("fiberMapSolvesTree"));
     _tree->setColumnCount(kRunColumnCount);
-    _tree->setHeaderLabels({tr("method"), tr("fibers"), tr("comp"), tr("L1"), tr("bad"), tr("max")});
+    _tree->setHeaderLabels({tr("method"), tr("fibers"), tr("comp"), tr("arcs"), tr("L1"), tr("bad"), tr("max"),
+                            tr("state"), tr("diff")});
     _tree->setUniformRowHeights(true);
     _tree->setRootIsDecorated(false);
-    _tree->setSelectionMode(QAbstractItemView::SingleSelection);
+    // Two runs can be selected, which compares them; the first of them is
+    // the one the other docks follow.
+    _tree->setSelectionMode(QAbstractItemView::ExtendedSelection);
     _tree->header()->setStretchLastSection(true);
     _tree->setToolTip(tr("Every solve saved in this store, newest first. Selecting one lays the\n"
                          "map out from it: each fiber at the winding that solve gave it.\n"
                          "L1 is the weighted residual in turns, bad the violated constraints,\n"
-                         "max the largest single residual in turns."));
+                         "max the largest single residual in turns, state whether the store has\n"
+                         "changed since the run read it.\n"
+                         "Selecting a second run compares the two: diff counts the fibers one\n"
+                         "run places differently from the other."));
     layout->addWidget(_tree, 1);
+    _diffLabel = new QLabel(this);
+    _diffLabel->setObjectName(QStringLiteral("fiberMapSolvesDiff"));
+    _diffLabel->setWordWrap(true);
+    _diffLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    _diffLabel->setToolTip(tr("What the two selected solves disagree about. A winding is gauged per\n"
+                              "component and per run, so the comparison is relative: the fibers\n"
+                              "counted are those that moved against the neighbours they share a\n"
+                              "component with in both runs."));
+    layout->addWidget(_diffLabel);
     _followCheck = new QCheckBox(tr("Lay the map out from this solve"), this);
     _followCheck->setObjectName(QStringLiteral("fiberMapFollowSolve"));
     _followCheck->setToolTip(tr("Walk exactly the links the selected solve walked: the links it did\n"
@@ -771,9 +934,18 @@ void ScaffoldRunsPanel::rebuild()
         item->setText(kRunMethodColumn, QString::fromStdString(run.method));
         item->setText(kRunFibersColumn, QString::number(count("fibers")));
         item->setText(kRunComponentsColumn, QString::number(count("components")));
+        item->setText(kRunArcsColumn, QString::number(count("arcs")));
         item->setText(kRunObjectiveColumn, QString::number(metric("weighted_l1"), 'f', 3));
         item->setText(kRunViolatedColumn, QString::number(count("violated_constraints")));
         item->setText(kRunMaxResidualColumn, QString::number(metric("max_residual"), 'f', 3));
+        const bool stale = _controller->runStale(run);
+        item->setText(kRunStaleColumn, stale ? tr("stale") : tr("current"));
+        item->setToolTip(kRunStaleColumn,
+                         stale ? tr("A fiber, a link or the umbilicus changed after this run read the\n"
+                                    "store (it read commit %1): its windings may answer a question about\n"
+                                    "an annotation that has moved since.")
+                                     .arg(run.input.commitSequence)
+                               : tr("Nothing in the annotation has changed since this run read it."));
         item->setData(kRunMethodColumn, Qt::UserRole, QString::fromStdString(run.runUuid));
         item->setToolTip(kRunMethodColumn, oneLine(run) + QStringLiteral("\n") +
                                                QString::fromStdString(run.settingsJson));
@@ -781,6 +953,7 @@ void ScaffoldRunsPanel::rebuild()
     }
     for (int column = 0; column < kRunColumnCount - 1; ++column) _tree->resizeColumnToContents(column);
     _rebuilding = false;
+    showDiff();
 }
 
 void ScaffoldRunsPanel::applySelection()
@@ -792,6 +965,37 @@ void ScaffoldRunsPanel::applySelection()
         return;
     }
     _controller->selectRun(items.front()->data(kRunMethodColumn, Qt::UserRole).toString().toStdString());
+    showDiff();
+}
+
+void ScaffoldRunsPanel::showDiff()
+{
+    if (!_controller) return;
+    for (int row = 0; row < _tree->topLevelItemCount(); ++row)
+        _tree->topLevelItem(row)->setText(kRunDiffColumn, QString());
+    _diffLabel->clear();
+    const auto items = _tree->selectedItems();
+    if (items.size() != 2) return;
+    const auto uuid = [](const QTreeWidgetItem* item) {
+        return item->data(kRunMethodColumn, Qt::UserRole).toString().toStdString();
+    };
+    QString error;
+    const auto diff = _controller->diffRuns(uuid(items[0]), uuid(items[1]), error);
+    if (!error.isEmpty()) {
+        _diffLabel->setText(error);
+        return;
+    }
+    const auto moved = QString::number(diff.winding);
+    for (auto* item : items) item->setText(kRunDiffColumn, moved);
+    _diffLabel->setText(tr("%1 of %2 shared fibers at a different winding, %3 of %4 with a different normal "
+                           "sign, over %5 component pairs; %6 and %7 fibers only one run placed.")
+                            .arg(diff.winding)
+                            .arg(diff.shared)
+                            .arg(diff.sign)
+                            .arg(diff.signStated)
+                            .arg(diff.groups)
+                            .arg(diff.onlyFirst)
+                            .arg(diff.onlySecond));
 }
 
 ScaffoldApprovalPanel::ScaffoldApprovalPanel(ScaffoldSolveController* controller, QWidget* parent)
@@ -830,6 +1034,18 @@ ScaffoldApprovalPanel::ScaffoldApprovalPanel(ScaffoldSolveController* controller
                                "expensive violation on a short loop."));
     orderLayout->addWidget(_orderCombo, 1);
     layout->addWidget(orderRow);
+
+    auto* componentRow = new QWidget(this);
+    auto* componentLayout = new QHBoxLayout(componentRow);
+    componentLayout->setContentsMargins(0, 0, 0, 0);
+    componentLayout->addWidget(new QLabel(tr("Component"), componentRow));
+    _componentCombo = new QComboBox(componentRow);
+    _componentCombo->setObjectName(QStringLiteral("fiberMapApprovalComponent"));
+    _componentCombo->setToolTip(tr("Show only the rows of one component of the selected solve. A component\n"
+                                   "is solved on its own, so its violations can only be explained by its\n"
+                                   "own annotation."));
+    componentLayout->addWidget(_componentCombo, 1);
+    layout->addWidget(componentRow);
 
     _tree = new QTreeWidget(this);
     _tree->setObjectName(QStringLiteral("fiberMapApprovalTree"));
@@ -873,7 +1089,11 @@ ScaffoldApprovalPanel::ScaffoldApprovalPanel(ScaffoldSolveController* controller
         }
         applySelection();
     });
-    connect(_orderCombo, &QComboBox::currentIndexChanged, this, [this]() { rebuild(); });
+    for (auto* combo : {_orderCombo, _componentCombo})
+        connect(combo, &QComboBox::currentIndexChanged, this, [this]() {
+            if (_rebuilding) return;
+            rebuild();
+        });
     connect(_tree, &QTreeWidget::itemSelectionChanged, this, [this]() { applySelection(); });
     connect(_tree, &QTreeWidget::itemDoubleClicked, this,
             [this](QTreeWidgetItem* item, int) { activateRow(item); });
@@ -938,6 +1158,13 @@ void ScaffoldApprovalPanel::rebuild()
         // Index into the run's residuals for a constraint row, -1 otherwise.
         std::int64_t residual = -1;
     };
+    // The component each row's fiber was solved in, so the dock can show one
+    // component at a time. A constraint's two fibers are in the same
+    // component by construction (it is an arc between them).
+    const auto componentOf = [&](const std::string& uuid) -> std::int64_t {
+        const auto found = view->windings.find(uuid);
+        return found == view->windings.end() ? -1 : found->second.component;
+    };
     std::vector<Row> rows;
     for (std::size_t index = 0; index < view->residuals.size(); ++index) {
         const auto& residual = view->residuals[index];
@@ -975,10 +1202,36 @@ void ScaffoldApprovalPanel::rebuild()
                  << QString::number(piece.constraints);
         rows.push_back(std::move(row));
     }
+    // Offer every component the rows actually name, keeping the chosen one
+    // when the run still has it.
+    std::set<std::int64_t> components;
+    for (const auto& row : rows) {
+        const auto component = componentOf(row.fiberUuid);
+        if (component >= 0) components.insert(component);
+    }
+    const auto chosen = _componentCombo->count() > 0 && _componentCombo->currentIndex() > 0
+                            ? _componentCombo->currentData().toLongLong()
+                            : -1;
+    _componentCombo->clear();
+    _componentCombo->addItem(tr("all (%1)").arg(components.size()), qlonglong(-1));
+    for (const auto component : components)
+        _componentCombo->addItem(QString::number(component), qlonglong(component));
+    if (chosen >= 0) {
+        const auto at = _componentCombo->findData(qlonglong(chosen));
+        if (at > 0) _componentCombo->setCurrentIndex(at);
+    }
+    const auto filter = _componentCombo->currentIndex() > 0 ? _componentCombo->currentData().toLongLong() : -1;
+    if (filter >= 0)
+        rows.erase(std::remove_if(rows.begin(), rows.end(),
+                                  [&](const Row& row) { return componentOf(row.fiberUuid) != filter; }),
+                   rows.end());
+
     const auto order = ScaffoldApprovalOrder(_orderCombo->currentData().toInt());
     std::stable_sort(rows.begin(), rows.end(),
                      [&](const Row& x, const Row& y) { return scaffoldApprovalRowBefore(x.keys, y.keys, order); });
+    std::int64_t constraintRows = 0, pieceRows = 0;
     for (const auto& row : rows) {
+        if (row.piece) ++pieceRows; else ++constraintRows;
         auto* item = new QTreeWidgetItem(_tree, row.text);
         item->setData(kKindColumn, Qt::UserRole, row.piece);
         item->setData(kFiberColumn, Qt::UserRole, QString::fromStdString(row.fiberUuid));
@@ -988,9 +1241,17 @@ void ScaffoldApprovalPanel::rebuild()
         item->setData(kCountColumn, Qt::UserRole, QVariant::fromValue(qlonglong(row.residual)));
     }
     for (int column = 0; column < kColumnCount - 1; ++column) _tree->resizeColumnToContents(column);
-    _summaryLabel->setText(tr("%1 violated constraints, %2 accused stretches")
-                               .arg(view->residuals.size())
-                               .arg(view->pieces.size()));
+    _summaryLabel->setText(filter >= 0
+                               ? tr("%1 violated constraints and %2 accused stretches of component %3, of %4 and %5 "
+                                    "in the whole solve")
+                                     .arg(constraintRows)
+                                     .arg(pieceRows)
+                                     .arg(filter)
+                                     .arg(view->residuals.size())
+                                     .arg(view->pieces.size())
+                               : tr("%1 violated constraints, %2 accused stretches")
+                                     .arg(view->residuals.size())
+                                     .arg(view->pieces.size()));
     _rebuilding = false;
 }
 

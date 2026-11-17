@@ -6,12 +6,15 @@
 
 #include <QtTest/QtTest>
 
+#include <map>
+#include <optional>
 #include <string>
 #include <vector>
 
 using namespace vc3d::fiber_map;
 using vc::fiber_graph::ScaffoldStoredPiece;
 using vc::fiber_graph::ScaffoldStoredResidual;
+using vc::fiber_graph::ScaffoldStoredWinding;
 
 namespace
 {
@@ -39,6 +42,16 @@ ScaffoldStoredResidual residual(std::int64_t index, double cost, std::optional<s
     entry.cycleHops = hops;
     if (hops) entry.redundancy = 1;
     entry.pieces = std::move(pieces);
+    return entry;
+}
+
+vc::fiber_graph::ScaffoldStoredWinding winding(std::int64_t turns, std::int64_t component,
+                                              std::optional<std::int64_t> normalSign = std::nullopt)
+{
+    vc::fiber_graph::ScaffoldStoredWinding entry;
+    entry.winding = turns;
+    entry.component = component;
+    entry.normalSign = normalSign;
     return entry;
 }
 
@@ -115,6 +128,65 @@ private slots:
         QVERIFY(!scaffoldApprovalRowBefore(row(2.0, 8, 1.0), row(1.0, 3, 1.0), order));
         // Equal per-hop cost falls back to the shorter cycle.
         QVERIFY(scaffoldApprovalRowBefore(row(1.0, 2, 1.0), row(2.0, 4, 1.0), order));
+    }
+
+    void aGaugeShiftIsNotADisagreement()
+    {
+        // The same relative placement, one run gauged two turns higher: no
+        // fiber moved against its neighbours.
+        std::map<std::string, ScaffoldStoredWinding> first{
+            {"a", winding(0, 0)}, {"b", winding(1, 0)}, {"c", winding(2, 0)}};
+        std::map<std::string, ScaffoldStoredWinding> second{
+            {"a", winding(2, 0)}, {"b", winding(3, 0)}, {"c", winding(4, 0)}};
+        const auto diff = scaffoldRunDiff(first, second);
+        QCOMPARE(diff.shared, 3);
+        QCOMPARE(diff.winding, 0);
+        QCOMPARE(diff.groups, 1);
+        QCOMPARE(diff.onlyFirst, 0);
+        QCOMPARE(diff.onlySecond, 0);
+    }
+
+    void oneFiberMovingAgainstItsComponentIsCounted()
+    {
+        std::map<std::string, ScaffoldStoredWinding> first{
+            {"a", winding(0, 0)}, {"b", winding(1, 0)}, {"c", winding(2, 0)}};
+        std::map<std::string, ScaffoldStoredWinding> second{
+            {"a", winding(2, 0)}, {"b", winding(3, 0)}, {"c", winding(7, 0)}};
+        const auto diff = scaffoldRunDiff(first, second);
+        QCOMPARE(diff.shared, 3);
+        QCOMPARE(diff.winding, 1);
+    }
+
+    void componentsAreComparedApartAndFibersOnlyOneRunPlacedAreNamed()
+    {
+        // Two components here, each with its own gauge there, plus a fiber
+        // the second run did not solve and one only it did.
+        std::map<std::string, ScaffoldStoredWinding> first{
+            {"a", winding(0, 0)}, {"b", winding(1, 0)}, {"c", winding(0, 1)}, {"d", winding(1, 1)},
+            {"gone", winding(5, 1)}};
+        std::map<std::string, ScaffoldStoredWinding> second{
+            {"a", winding(3, 0)}, {"b", winding(4, 0)}, {"c", winding(9, 7)}, {"d", winding(11, 7)},
+            {"new", winding(0, 7)}};
+        const auto diff = scaffoldRunDiff(first, second);
+        QCOMPARE(diff.shared, 4);
+        QCOMPARE(diff.groups, 2);
+        QCOMPARE(diff.onlyFirst, 1);
+        QCOMPARE(diff.onlySecond, 1);
+        // Component 0 shifted by 3 as a whole, so neither of its fibers
+        // moved. The other group's two fibers shifted by 9 and 10; the tie
+        // goes to the lower offset, so the other one is the fiber counted.
+        QCOMPARE(diff.winding, 1);
+    }
+
+    void normalSignsAreComparedWhereBothRunsStateThem()
+    {
+        std::map<std::string, ScaffoldStoredWinding> first{
+            {"a", winding(0, 0, 1)}, {"b", winding(1, 0, -1)}, {"c", winding(2, 0)}};
+        std::map<std::string, ScaffoldStoredWinding> second{
+            {"a", winding(0, 0, 1)}, {"b", winding(1, 0, 1)}, {"c", winding(2, 0, 1)}};
+        const auto diff = scaffoldRunDiff(first, second);
+        QCOMPARE(diff.signStated, 2);
+        QCOMPARE(diff.sign, 1);
     }
 };
 

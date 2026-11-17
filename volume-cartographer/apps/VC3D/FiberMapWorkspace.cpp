@@ -1238,6 +1238,23 @@ FiberMapWorkspace::FiberMapWorkspace(CState* state, LineAnnotationController* co
             return {};
         }
     });
+    // The restricted scope: the map's selection grown to the networks it
+    // touches. A run over part of the annotation has to carry every link of
+    // that part, and a network is exactly the group the layout linked.
+    _solverPanel->setScopeResolver([this]() -> std::vector<std::string> {
+        std::set<int> networks;
+        std::set<uint64_t> wanted(_selectedFibers.begin(), _selectedFibers.end());
+        for (const uint64_t id : _selectedFibers) {
+            const auto entry = _entries.find(id);
+            if (entry != _entries.end() && entry->networkId >= 0) networks.insert(entry->networkId);
+        }
+        for (auto entry = _entries.begin(); entry != _entries.end(); ++entry)
+            if (entry->networkId >= 0 && networks.count(entry->networkId) != 0) wanted.insert(entry.key());
+        std::vector<std::string> uuids;
+        for (const auto& [uuid, id] : _fiberIdByUuid)
+            if (wanted.count(id) != 0) uuids.push_back(uuid);
+        return uuids;
+    });
     connect(_solverPanel, &vc3d::fiber_map::ScaffoldSolverPanel::solveRequested, this, [this]() {
         if (!_solveController || !_solverPanel) return;
         _solveController->startSolve(_solverPanel->request());

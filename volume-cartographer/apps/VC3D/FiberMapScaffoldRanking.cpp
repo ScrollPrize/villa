@@ -42,6 +42,47 @@ std::vector<ScaffoldRankedPiece> rankScaffoldPieces(
     return pieces;
 }
 
+ScaffoldRunDiff scaffoldRunDiff(const std::map<std::string, vc::fiber_graph::ScaffoldStoredWinding>& first,
+                                const std::map<std::string, vc::fiber_graph::ScaffoldStoredWinding>& second)
+{
+    ScaffoldRunDiff out;
+    // Per (component, component) group: how many shared fibers share each
+    // offset. The most frequent offset is that group's gauge difference.
+    std::map<std::pair<std::int64_t, std::int64_t>, std::map<std::int64_t, std::int64_t>> offsets;
+    for (const auto& [uuid, here] : first) {
+        const auto found = second.find(uuid);
+        if (found == second.end()) {
+            ++out.onlyFirst;
+            continue;
+        }
+        ++out.shared;
+        ++offsets[{here.component, found->second.component}][found->second.winding - here.winding];
+        if (here.normalSign && found->second.normalSign) {
+            ++out.signStated;
+            if (*here.normalSign != *found->second.normalSign) ++out.sign;
+        }
+    }
+    for (const auto& entry : second)
+        if (first.find(entry.first) == first.end()) ++out.onlySecond;
+    out.groups = std::int64_t(offsets.size());
+    std::map<std::pair<std::int64_t, std::int64_t>, std::int64_t> gauge;
+    for (const auto& [group, counts] : offsets) {
+        std::int64_t best = 0, bestCount = -1;
+        for (const auto& [offset, count] : counts)
+            // Ties go to the smaller offset, so the answer does not depend on
+            // the order the fibers came in.
+            if (count > bestCount) { best = offset; bestCount = count; }
+        gauge[group] = best;
+    }
+    for (const auto& [uuid, here] : first) {
+        const auto found = second.find(uuid);
+        if (found == second.end()) continue;
+        const std::pair<std::int64_t, std::int64_t> group{here.component, found->second.component};
+        if (found->second.winding - here.winding != gauge[group]) ++out.winding;
+    }
+    return out;
+}
+
 bool scaffoldApprovalRowBefore(const ScaffoldApprovalRow& x, const ScaffoldApprovalRow& y,
                                ScaffoldApprovalOrder order)
 {

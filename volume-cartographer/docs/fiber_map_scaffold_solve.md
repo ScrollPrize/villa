@@ -69,7 +69,13 @@ library states those exactly as the automatic pipeline does
   runs on the annotation's own polylines, which stay whole (no piece
   splitting). The geometry decides whether a crossing is parallel or
   perpendicular; a crossing whose verdict disagrees with the two annotated
-  families is dropped and counted, never forced. The winding separation along
+  families is dropped, never forced, and the run says so rather than leaving
+  it in the gap between the crossings read and the relations used:
+  `measured_skipped_family_mismatch` (with `_invalid`, `_untagged` and
+  `_self`) is a run metric, and the solver dock's report names it when it is
+  not zero. On the PHerc0332 scaffold 786 of the 10,195 crossings are dropped
+  that way, which is a question about the H/V tags of those pairs, not about
+  the measurement. The winding separation along
   each connector comes from a Lasagna normal volume's `grad_mag` density
   through a sampler the caller supplies; without one every relation keeps a
   NaN separation, which asserts no arc but still witnesses an enclosure.
@@ -103,6 +109,30 @@ so one of them can be revoked; otherwise each approved subgraph is contracted
 into one node with per-member offsets, and the remaining arcs are rewritten
 `k_S(b) - k_S(a) = target + offset_a - offset_b`. Approved relations are
 therefore held exactly, whatever the rest of the evidence says.
+
+### Scope
+
+A run reads every fiber of the store unless it is given a scope. `fibers` (CLI)
+or *the selected network* (dock) names the fibers to load; the others are not
+read at all, so the links, crossings, normals and components of the run are
+those of that part of the annotation, and the run records how many fiber
+records its scope left out (`scope_excluded_fibers`). Measured on the
+PHerc0332 scaffold: restricted to the 108 fibers of its largest links-only
+component, the run reads 510,667 of the 851,285 line points, assembles 111 of
+the 232 link constraints, finds one component with objective 0, and places
+every one of the 108 fibers at the same winding as the whole-scaffold run.
+
+### Progress and cancellation
+
+A measured run reads the volume along every fiber and takes a minute, so it
+reports where it is and can be taken back (`ScaffoldRunMonitor`). The stages
+name themselves and count their work off - the prediction sampling per chunk
+of vertices, the normals per fiber, the solve per component, the residual
+analysis per violated constraint - and check for cancellation at those same
+points. A cancelled run throws `ScaffoldCancelled` out of the stage it was in
+and writes nothing: no run row, no partial result. The dock polls the monitor
+rather than being signalled per fiber, and the **Cancel** button next to
+*Solve* is what sets it.
 
 ## Residual analysis
 
@@ -155,7 +185,9 @@ vc_scaffold_solve config.json
 | `normals.axis_weight`, `.presence_floor`, `.presence_full` | `100`, `0`, `128` | the fused axis term and its presence mapping |
 | `prediction.manifest`, `prediction.remote_cache` | — | the fiber-inference dataset a fused run reads |
 | `sign.solve`, `sign.backend` | `true`, `irls` | decide unanchored signs; `irls` or `ceres` |
+| `normals.prediction_chunk` | `65536` | vertices per call into the prediction sampler; changes no result |
 | `include_untagged` | `false` | load the fibers without an H/V tag too |
+| `fibers` | all of them | restrict the run to these fiber UUIDs (the dock's scope) |
 | `lemon.backend`, `lemon.capacity_scale` | `network_simplex`, `1000` | flow backend |
 | `fix_approved_subgraphs` | `true` | contract approved subgraphs |
 | `max_alternative_paths` | `4` | redundancy cap |
@@ -209,7 +241,11 @@ Three docks (`FiberMapScaffoldSolve.hpp`, with the Qt-free ranking in
   subgraphs* (on by default). *Measure the fibers' crossings* adds the measured
   stages: where the normals come from (the fibers' geometry, or that fused
   with the package's fiber-inference prediction), the per-type weights, the
-  sign backend, and whether the winding separations are measured at all. The winding density they are measured on is
+  sign backend, and whether the winding separations are measured at all. The
+  *scope* is the whole scaffold or the map's selected network (the selection
+  grown to the networks it touches); a scope that resolves to nothing refuses
+  the run rather than solving everything, and **Cancel** takes a running solve
+  back. The winding density they are measured on is
   the package's own selected Lasagna dataset, the one the annotation optimizes
   against; a run that would measure separations without a bound dataset, or on
   a dataset that states no `grad_mag` density, is refused before it starts
@@ -219,12 +255,25 @@ Three docks (`FiberMapScaffoldSolve.hpp`, with the Qt-free ranking in
   as a fallback. The run is saved in the store, and its one-line report lands in
   the map's status line.
 - **Solves.** Every run saved in the store, newest first, with its method,
-  fibers, components, weighted L1, violated constraints and largest residual.
-  Selecting one loads its ranking.
+  fibers, components, arcs, weighted L1, violated constraints, largest
+  residual and whether it is still *current*. A run is **stale** when a fiber,
+  a link or the umbilicus changed after it read the store - taken from the
+  records' own commit sequences (`scaffoldAnnotationCommit`), not from the
+  change feed, because a store may retain no feed and because a run's own rows
+  are extension rows, which change no record: saving a run does not make it
+  stale. Selecting one loads its ranking. Selecting a *second* run compares
+  the two: `diff` counts the fibers one run places differently from the other,
+  and the line below spells the comparison out. Windings are gauged per
+  component and per run, so the comparison is relative - the fibers counted
+  are those that moved against the neighbours they share a component with in
+  both runs; a pure gauge shift or a renumbered component counts as no
+  difference.
 - **Fiber and piece approval.** The selected run's violated constraints and the
   stretches they accuse, in one table, ordered by *smallest cycle* (then the
   shorter stretch), *highest cost* (then the shorter cycle and stretch) or
-  *cost per hop*. Selecting a row selects its fibers on the map and draws the
+  *cost per hop*, and filtered to one component of the run if asked - a
+  component was solved on its own, so its violations can only be explained by
+  its own annotation. Selecting a row selects its fibers on the map and draws the
   stretch; double-clicking a stretch opens it as an approval piece between the
   control points that bracket it, which is where its geometry and normals are
   approved. Two switches outline what is already approved: every span with a

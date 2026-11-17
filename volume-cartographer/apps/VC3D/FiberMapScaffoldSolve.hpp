@@ -18,9 +18,11 @@
 #include "FiberMapScaffoldRanking.hpp"
 
 #include <vc/fiber_graph/ScaffoldNormals.hpp>
+#include <vc/fiber_graph/ScaffoldRunMonitor.hpp>
 
 #include <vc_object_store/objects/FiberConstraintApprovalExtension.hpp>
 #include <vc_object_store/objects/ObjectStoreSession.hpp>
+#include <vc_object_store/objects/Transactions.hpp>
 
 #include <array>
 #include <functional>
@@ -40,6 +42,7 @@ class QPushButton;
 class QRadioButton;
 class QTreeWidget;
 class QTreeWidgetItem;
+class QTimer;
 template <class T> class QFutureWatcher;
 
 namespace vc3d::fiber_map
@@ -70,6 +73,12 @@ struct ScaffoldSolveRequest {
     std::string normalSource = "geometry";
     std::string signBackend = "irls";
     std::size_t workers = 1;
+    // Scope: with `restricted` set, only `fiberSubset` is loaded and solved
+    // (the dock's scope selector fills it from the map's selected network).
+    // A restricted request with an empty subset is refused rather than run on
+    // the whole scaffold.
+    bool restricted = false;
+    std::vector<std::string> fiberSubset;
 };
 
 // One stored run with everything the docks show, read back from the store.
@@ -125,10 +134,24 @@ public:
 
     // Re-read the store's run rows (after a solve, or when the store changed).
     void reloadRuns();
+    // True when a fiber, a link or the umbilicus was changed after the run
+    // read the store (scaffoldAnnotationCommit): its windings answer a
+    // question about an annotation that has moved since. A run's own rows are
+    // extension rows, so saving a run does not make it stale.
+    [[nodiscard]] bool runStale(const vc::fiber_graph::ScaffoldStoredRun&) const;
     // Read one run's windings and ranking; an empty UUID clears the selection.
     void selectRun(const std::string& runUuid);
     // Start a solve. Refused while one is running or without a fiber store.
     void startSolve(const ScaffoldSolveRequest&);
+    // Asks the running solve to stop at its next checkpoint (between fibers,
+    // prediction chunks, components or cycle searches). Nothing is written.
+    void cancelSolve();
+    // Where the running solve is; an empty stage when none is in flight.
+    [[nodiscard]] vc::fiber_graph::ScaffoldRunMonitor::Progress progress() const;
+
+    // What two stored runs disagree about, read from the store on demand.
+    // `error` is empty when the comparison was made.
+    ScaffoldRunDiff diffRuns(const std::string& first, const std::string& second, QString& error);
 
 signals:
     void runsChanged();
@@ -148,6 +171,10 @@ private:
     bool _busy = false;
     QString _lastError;
     std::vector<vc::fiber_graph::ScaffoldStoredRun> _runs;
+    // The store state the run list was read at, and the commit the annotation
+    // itself last changed at, for the stale verdict.
+    vc::objects::StoreStatus _storeState;
+    std::int64_t _lastAnnotationCommit = 0;
     std::optional<ScaffoldRunView> _selected;
     std::map<std::string, ScaffoldApprovalSpans> _approvals;
     bool _approvalsLoaded = false;
@@ -169,6 +196,11 @@ public:
     // The map supplies the frame it drew in and the sense the catalog states;
     // the panel does not go looking for either.
     void setFrame(const std::string& volume, std::optional<int> fallbackHandedness);
+    // The fibers of the map's currently selected network, for the restricted
+    // scope. Asked on the GUI thread when a run starts; an empty answer makes
+    // the controller refuse the run.
+    using ScopeResolver = std::function<std::vector<std::string>()>;
+    void setScopeResolver(ScopeResolver);
     [[nodiscard]] ScaffoldSolveRequest request() const;
     [[nodiscard]] bool fixApprovedSubgraphs() const;
 
@@ -177,6 +209,8 @@ signals:
 
 private:
     void updateEnabled();
+    // The running solve's stage on the dock's progress line.
+    void showProgress();
 
     ScaffoldSolveController* _controller = nullptr;
     QCheckBox* _approvedCheck = nullptr;
@@ -192,8 +226,13 @@ private:
     QComboBox* _normalSourceCombo = nullptr;
     QComboBox* _signBackendCombo = nullptr;
     QComboBox* _backendCombo = nullptr;
+    QComboBox* _scopeCombo = nullptr;
     QPushButton* _runButton = nullptr;
+    QPushButton* _cancelButton = nullptr;
     QLabel* _statusLabel = nullptr;
+    QLabel* _progressLabel = nullptr;
+    QTimer* _progressTimer = nullptr;
+    ScopeResolver _scope;
     std::string _volume;
     std::optional<int> _fallbackHandedness;
 };
@@ -218,17 +257,26 @@ private:
         kRunMethodColumn = 0,
         kRunFibersColumn,
         kRunComponentsColumn,
+        kRunArcsColumn,
         kRunObjectiveColumn,
         kRunViolatedColumn,
         kRunMaxResidualColumn,
+        // Whether the run is behind the store it was computed from.
+        kRunStaleColumn,
+        // Filled only while exactly two runs are selected: the fibers this
+        // run places differently from the other one.
+        kRunDiffColumn,
         kRunColumnCount,
     };
     void rebuild();
     void applySelection();
+    // Compares the two selected runs, or clears the diff column.
+    void showDiff();
 
     ScaffoldSolveController* _controller = nullptr;
     QTreeWidget* _tree = nullptr;
     QCheckBox* _followCheck = nullptr;
+    QLabel* _diffLabel = nullptr;
     bool _rebuilding = false;
 };
 
@@ -276,6 +324,7 @@ private:
     QCheckBox* _highlightFibersCheck = nullptr;
     QCheckBox* _highlightPiecesCheck = nullptr;
     QComboBox* _orderCombo = nullptr;
+    QComboBox* _componentCombo = nullptr;
     QTreeWidget* _tree = nullptr;
     QLabel* _summaryLabel = nullptr;
     LabelLookup _labels;
