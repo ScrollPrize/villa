@@ -21,9 +21,9 @@ struct Multiply {   // x *= w
     float* x; const float* w;
     HR_HD void operator()(std::size_t i) const { x[i] = hd::mul(x[i], w[i]); }
 };
-struct Product {    // out = a * b
-    const float *a, *b; float* out;
-    HR_HD void operator()(std::size_t i) const { out[i] = hd::mul(a[i], b[i]); }
+struct WeightedRow {    // a zero detector weight masks even a nonfinite sample
+    const float *rows, *weights; float* out;
+    HR_HD void operator()(std::size_t i) const { out[i] = weights[i] == 0.f ? 0.f : hd::mul(rows[i], weights[i]); }
 };
 struct AddScaled {  // x += s y
     float* x; const float* y; float s;

@@ -364,7 +364,7 @@ struct CudaBackend final : TomoWorkspace {
     template <class F>
     void each(std::size_t n, const F& f) { cuda::each(n, f); }
     void fill(float* d, float v, std::size_t n) { each(n, elementwise::Fill{d, v}); }
-    void weighted_rows(const float* rows, const float* w, float* out, std::size_t n) { each(n, elementwise::Product{rows, w, out}); }
+    void weighted_rows(const float* rows, const float* w, float* out, std::size_t n) { each(n, elementwise::WeightedRow{rows, w, out}); }
     void initial_rows(const float* rows, const float* weights, float* out, float* iw, std::size_t n) {
         each(n, tomo_algos::InitialCopyF{rows, weights, out, iw});
         cuda::rebalance(out, iw, n_angles, 1, g.n_det, g.rot, false);
@@ -388,8 +388,8 @@ struct CudaBackend final : TomoWorkspace {
             gr_pdim = pdim;
             gr_have_fp = false;
         }
-        if (!gr_have_fp || gr_args.filter_name != a.filter_name || gr_args.filter_par != a.filter_par) {
-            const auto fp = filter_phase(pdim, NG, g.rot, a, span_factor(angles.data(), NG));
+        if (!gr_have_fp || gr_args.filter_name != a.filter_name || gr_args.filter_par != a.filter_par || gr_args.gridrec_angle_step != a.gridrec_angle_step) {
+            const auto fp = filter_phase(pdim, NG, g.rot, a, span_factor(angles.data(), NG, a.gridrec_angle_step));
             std::vector<float2> fph(fp.size());
             for (std::size_t i = 0; i < fp.size(); ++i) fph[i] = make_float2(fp[i].real(), fp[i].imag());
             gr_fp.upload(fph.data(), fph.size());

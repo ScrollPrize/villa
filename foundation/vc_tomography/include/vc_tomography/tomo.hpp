@@ -42,6 +42,7 @@ struct TomoArgs {
     bool init_divergence = false;            // init=fbp in a pipeline: the start carries the beam's divergence
     float init_value = 1e-6f;
     int projector = 1;                       // 0 chord (line through the cell centre), 1 sf (separable footprint)
+    float gridrec_angle_step = 0.f;         // nominal bin width in radians, zero to infer from unwrapped view angles
 };
 
 // slice geometry: the N x N grid

@@ -13,5 +13,5 @@ float grid_shift(int N);   // image offset (pixels, both axes) of the pipeline c
 int kernel_cells();        // width of the gridding kernel in grid cells
 void pswf_tables(int pdim, std::vector<float>& wtbl, std::vector<float>& winv);
 std::vector<std::complex<float>> filter_phase(int pdim, int n_angles, float center, const TomoArgs& a, float scale);
-float span_factor(const float* angles, int n);
+float span_factor(const float* angles, int n, float step);
 }  // namespace vc_tomography::tomo_gridrec

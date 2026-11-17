@@ -84,9 +84,13 @@ std::vector<std::complex<float>> filter_phase(int pdim, int n_angles, float cent
 }
 
 // angular span / pi: the normalisation assumes dt angles over pi; 360 deg (weighted, half-acquisition) data -> 2
-float span_factor(const float* angles, int n) {
-    if (n < 2) return 1.f;
-    return std::fabs(angles[1] - angles[0]) * n / static_cast<float>(M_PI);
+float span_factor(const float* angles, int n, float step) {
+    if (step == 0.f) {
+        if (n < 2) return 1.f;
+        const auto bounds = std::minmax_element(angles, angles + n);
+        step = (*bounds.second - *bounds.first) / (n - 1);
+    }
+    return step * n / static_cast<float>(M_PI);
 }
 }  // namespace tomo_gridrec
 
@@ -102,7 +106,7 @@ void gridrec_slice(const float* data, int NG, int ND, const float* angles, float
     const int pdim = pdim_for(ND, N), pd2 = pdim / 2, M2 = pd2;
     std::vector<float> wtbl, winv;
     pswf_tables(pdim, wtbl, winv);
-    const auto filphase = filter_phase(pdim, NG, center, a, span_factor(angles, NG));
+    const auto filphase = filter_phase(pdim, NG, center, a, span_factor(angles, NG, a.gridrec_angle_step));
     const float sh = grid_shift(N), w0 = -2.f * static_cast<float>(M_PI) * sh / pdim;
     const float L2 = static_cast<float>(static_cast<int>(kC / M_PI));
     const int L = kernel_cells();
@@ -275,7 +279,7 @@ struct CpuBackend final : TomoWorkspace {
     template <class F>
     void each(std::size_t n, const F& f) { cpu::each(n, f); }
     void fill(float* d, float v, std::size_t n) { std::fill(d, d + n, v); }
-    void weighted_rows(const float* rows, const float* w, float* out, std::size_t n) { each(n, elementwise::Product{rows, w, out}); }
+    void weighted_rows(const float* rows, const float* w, float* out, std::size_t n) { each(n, elementwise::WeightedRow{rows, w, out}); }
     void gridrec(const float* wrows, float* out, const TomoArgs& a) {
         gridrec_slice(wrows, n_angles, g.n_det, angles.data(), g.rot, g.N, a, out);
     }

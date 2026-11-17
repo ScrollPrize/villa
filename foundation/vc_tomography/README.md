@@ -210,6 +210,9 @@ on its own from Python (`vc_tomography._core`, re-exported in `vc_tomography`) o
     scale is that of the exact FBP (peak values of small features within 0.1 % at any radius,
     `tests/test_tomo.py`). The closed form inherited from tomopy overestimated them by 12 % at the centre, rising
     to 44 % at 0.59 of the padded half width, and `init=gridrec` carried that into SIRT / MLEM.
+  * Gridrec uses the pipeline's angular bin width. For standalone reconstruction, supply unwrapped angles
+    in radians. Each view receives the mean spacing between angles, independent of row order. A detector
+    sample with zero weight contributes zero, including when its value is NaN.
   * CUDA gridrec is not bit-reproducible: its gridding scatters into the Fourier grid with float `atomicAdd`, whose
     order of addition varies from run to run, so repeated runs (and `init=gridrec`) differ in the last bits. The CPU
     gridrec is deterministic.

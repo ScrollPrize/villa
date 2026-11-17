@@ -82,6 +82,9 @@ class TomoBackprojector final : public ExternalBackprojector {
     void set_start(const float* image) override { start_ = image; }
     void slice(int, const float* rows, const float* weights, int n_angles, int n_det, const float* angles,
                const BackprojectParams& p, int N, const SliceRoi& roi, Device device, float* out) override {
+        // Whole-slice methods receive one row per bin of the full turn, even when
+        // nearest-bin gridding shifts the representative angle within a bin.
+        a_.gridrec_angle_step = static_cast<float>(2 * M_PI / n_angles);
         const float c = p.center >= 0 ? p.center : 0.5f * (N - 1), rad = p.clip_radius >= 0 ? p.clip_radius : c;
         TomoGeom t;
         t.n_angles = n_angles; t.n_det = n_det; t.N = N; t.rot = p.rot_center;

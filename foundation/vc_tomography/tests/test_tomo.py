@@ -64,6 +64,21 @@ def test_gridrec_position_and_scale(device):
     assert best[1:] == (0, 0)
 
 
+def test_gridrec_view_order_and_masked_nan(device):
+    rows = sino_of(PH)
+    weights = np.full_like(rows, 0.5)
+    weights[0, 0] = 0
+
+    def reconstruct(r, w, angles):
+        return _core.tomo_reconstruct(r, w, angles, N, ROT, "gridrec", {}, device=device)
+
+    reference = reconstruct(rows, weights, ANG)
+    order = np.random.default_rng(43).permutation(len(ANG))
+    np.testing.assert_allclose(reconstruct(rows[order], weights[order], ANG[order]), reference, atol=2e-5)
+    rows[0, 0] = np.nan
+    np.testing.assert_allclose(reconstruct(rows, weights, ANG), reference, atol=2e-5)
+
+
 def test_gridrec_windows_cut_at_nyquist(device):
     # a detector-Nyquist pattern: the default hann (cutoff 0.5 cycles per pixel) removes it, hamming leaves 8 %
     s = np.tile(np.where(np.arange(ND) % 2, -1, 1) * np.hanning(ND), (len(ANG), 1)).astype(np.float32)

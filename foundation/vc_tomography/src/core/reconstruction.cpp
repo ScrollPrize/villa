@@ -35,6 +35,10 @@ void say(const Log& log, const std::string& line) {
     if (log) log(line);
 }
 
+void check_reduce(int reduce) {
+    if (reduce < 0 || reduce > 3) throw Error("reduce is 0, 1, 2 or 3");
+}
+
 using io::exists;
 using io::read_text;
 
@@ -482,7 +486,7 @@ Reconstruction::Reconstruction(const std::string& projections, const std::string
     Impl& I = *impl_;
     I.projections = projections;
     I.options = std::move(options);
-    if (I.options.reduce < 0 || I.options.reduce > 3) throw Error("reduce is 0, 1, 2 or 3");
+    check_reduce(I.options.reduce);
     if (I.options.reduce && I.options.projection_store.empty()) throw Error("frames read reduced are a projection store's: give the store (vc_tomography_projections_zarr, or the downloader's --zarr)");
     std::vector<calibration::Scan> found = calibration::discover_scans(projections);
     std::string said;
@@ -637,6 +641,7 @@ std::string Reconstruction::provenance() const {
 // ---------------------------------------------------------------- one tile of a mosaic
 
 TileReconstruction tile_reconstructor(const std::string& master, const std::string& description, const std::string& label, const TileOptions& o) {
+    check_reduce(o.reduce);
     const Json cal = Json::parse(description);
     const Json& L = member(cal, "layout");
     // a joint geometry calibration (vc_tomography_calibration geometry), of which `label` names a scan; or the tiles' description
@@ -647,6 +652,13 @@ TileReconstruction tile_reconstructor(const std::string& master, const std::stri
     out.scan = calibration::open_scan(master);
     const calibration::Scan& scan = out.scan;
     const int rows_full = scan.rows, cols_full = scan.cols;
+    if (o.reduced) {
+        const auto& red = *o.reduced;
+        const std::size_t pixels = static_cast<std::size_t>(rows_full) * cols_full;
+        if (red.rows != rows_full || red.cols != cols_full || red.dark.size() != pixels ||
+            red.flats.size() != pixels * scan.flats.size())
+            throw Error("tile " + label + ": supplied darks and flats must match the detector dimensions and flat series count");
+    }
     std::optional<geometry::Calibration> joined;
     std::size_t joint_scan = 0;
     if (!joint) {

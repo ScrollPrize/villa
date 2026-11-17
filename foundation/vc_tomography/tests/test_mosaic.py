@@ -1,6 +1,7 @@
 """vc_tomography.mosaic: what a description of the tiles' geometry says of a frame (frame_pose), and the per-projection
 terms the reconstruction of one tile is given (reconstruction_terms). No frames are read."""
 import numpy as np
+import pytest
 
 from vc_tomography import mosaic as M
 
@@ -60,3 +61,23 @@ def test_reconstruction_terms_of_a_tile():
     inner = slice(20, -20)
     assert np.allclose(T["row_scale"][inner], -np.gradient(row)[inner] * per_row, rtol=0.02)
     assert all(len(T[k]) == len(f) for k in ("angles_deg", "row_offset", "col_offset", "row_slope", "col_slope", "row_scale", "col_scale"))
+
+
+@pytest.mark.parametrize("reduce", [-1, 4, 32])
+def test_tile_rejects_invalid_reduction(reduce):
+    with pytest.raises(ValueError, match="reduce is 0, 1, 2 or 3"):
+        M.tile_reconstructor("unused", {}, "T0", reduce=reduce, device="cpu")
+
+
+@pytest.mark.parametrize("dark_shape, flat_shape, error", [
+    ((2, 3), (2, 2, 3), "detector dimensions"),
+    ((4, 6), (1, 4, 6), "flat series count"),
+    ((4, 6), (2, 6, 4), "flat dimensions"),
+])
+def test_tile_checks_supplied_calibration(tmp_path, dark_shape, flat_shape, error):
+    from test_scan import _write_scan
+
+    master = _write_scan(tmp_path, "sample_HA")
+    reduced = np.ones(dark_shape, np.float32), np.ones(flat_shape, np.float32)
+    with pytest.raises(ValueError, match=error):
+        M.tile_reconstructor(master, {"layout": {}}, "T0", reduced=reduced, device="cpu")

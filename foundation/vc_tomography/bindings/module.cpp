@@ -1502,6 +1502,7 @@ NB_MODULE(_core, m) {
             if (!reduced.is_none()) {
                 auto dark = nb::cast<nb::ndarray<const float, nb::ndim<2>, nb::c_contig, nb::device::cpu>>(nb::module_::import_("numpy").attr("ascontiguousarray")(reduced[0], "float32"));
                 auto flats = nb::cast<nb::ndarray<const float, nb::ndim<3>, nb::c_contig, nb::device::cpu>>(nb::module_::import_("numpy").attr("ascontiguousarray")(reduced[1], "float32"));
+                require(flats.shape(1) == dark.shape(0) && flats.shape(2) == dark.shape(1), "tile: flat dimensions must match the dark");
                 given.rows = static_cast<int>(dark.shape(0)), given.cols = static_cast<int>(dark.shape(1));
                 given.dark.assign(dark.data(), dark.data() + dark.size());
                 given.flats.assign(flats.data(), flats.data() + flats.size());
