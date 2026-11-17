@@ -275,6 +275,7 @@ vc_add_test(NAME test_fiber_trace3d
 vc_add_test(NAME test_fiber_anchors LIBS doctest::doctest vc_fiber_tracer)
 vc_add_test(NAME test_fiber_json LIBS doctest::doctest vc_fiber_tracer)
 vc_add_test(NAME test_fiber_trace_winding_bp LIBS doctest::doctest vc_fiber_tracer)
+vc_add_test(NAME test_fiber_normal_sign LIBS doctest::doctest vc_fiber_tracer)
 
 # The native constraint-store regression shares the app's import adapter.
 # Register it after the common test-target helpers are available.
