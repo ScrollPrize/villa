@@ -142,6 +142,11 @@ comparing a CPU run with an MPS one. `get_ink_metrics.py --device` picks the
 nnU-Net device; without it the folds take CUDA, else MPS, else the CPU, whatever
 the fitting variables say.
 
+The spiral's winding angles (`sample_spiral.get_spiral_yxs`) are always built
+in float64, since float32 angles move the outer nodes by up to half a voxel.
+Where `float_hi()` is float32 they are built on the CPU and only the node
+positions are copied to the device.
+
 ## Opt-in flow-field switches
 
 Both are off by default and do not change the math.
