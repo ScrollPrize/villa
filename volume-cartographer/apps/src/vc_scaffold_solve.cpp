@@ -234,10 +234,12 @@ int run(const std::string& configPath)
     storeOptions.author = "vc_scaffold_solve";
     auto store = vc::objects::ObjectStore::open(cfg.at("store").get<std::string>(), storeOptions);
     ScaffoldGraph graph;
+    std::vector<vc::objects::FiberConstraintApproval> constraintApprovals;
     {
         const auto txn = store.read();
         const vc::objects::LocalStoreReader reader(store, txn);
         graph = loadScaffoldGraph(reader, loadOptionsFrom(cfg));
+        constraintApprovals = vc::objects::readFiberConstraintApprovals(reader);
     }
     const double readSeconds = seconds(readStarted);
 
@@ -256,6 +258,7 @@ int run(const std::string& configPath)
     ScaffoldEventReport eventReport;
     ScaffoldMeasuredReport measuredReport;
     ScaffoldSignResult signs;
+    ScaffoldApprovalReport approvalReport;
     std::vector<ScaffoldConstraint> measured;
     double normalSeconds = 0, eventSeconds = 0, signSeconds = 0, measuredSeconds = 0;
     if (measure) {
@@ -303,6 +306,7 @@ int run(const std::string& configPath)
         signSeconds = seconds(started);
         started = Clock::now();
         measured = scaffoldMeasuredConstraints(graph, geometry, events, signs.sign, *measuredOptions, measuredReport);
+        applyScaffoldConstraintApprovals(graph, geometry, measured, constraintApprovals, approvalReport);
         measuredSeconds = seconds(started);
     }
     const auto result = solveScaffoldWinding(graph, geometry, options, measured);
@@ -424,6 +428,11 @@ int run(const std::string& configPath)
                                    {"enclosure_one_sided", measuredReport.enclosureOneSided},
                                    {"enclosure_contradictory", measuredReport.enclosureContradictory},
                                    {"enclosure_nonunique", measuredReport.enclosureNonunique}};
+        summary["constraint_approvals"] = Json{{"rows", approvalReport.rows},
+                                               {"live", approvalReport.live},
+                                               {"approved", approvalReport.approved},
+                                               {"unmatched", approvalReport.unmatched},
+                                               {"stale", approvalReport.stale}};
     }
 
     if (persist) {

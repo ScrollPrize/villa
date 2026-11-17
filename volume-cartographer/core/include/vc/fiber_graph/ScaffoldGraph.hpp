@@ -118,6 +118,11 @@ struct ScaffoldLoadOptions {
 // umbilicus for the frame, or mixes annotation frames.
 ScaffoldGraph loadScaffoldGraph(const objects::StoreReader&, const ScaffoldLoadOptions& = {});
 
+// One fiber's piece content with its line points filled in again (the loader
+// keeps them once, in ScaffoldGraph::linePoints). Fingerprinting a span needs
+// them, so this is what an approval check is taken over.
+objects::FiberPieceContent scaffoldFiberContent(const ScaffoldGraph&, std::size_t fiber);
+
 // Seam transport and the packed arc/turn columns of a loaded scaffold. Holds
 // its own columns and borrows the graph's polylines, so the graph must outlive
 // it.
@@ -133,6 +138,8 @@ public:
     // Arc length at a control point, or the fiber end when it has no line
     // index.
     double controlArc(std::size_t fiber, std::size_t control) const;
+    // The fiber's own index of the line point nearest an arc position.
+    std::int64_t lineIndexAt(std::size_t fiber, double arc) const;
     double arcLength(std::size_t fiber) const { return packed_.arcLength(std::int64_t(fiber)); }
     std::span<const double> arcs() const { return columns_.arc; }
     std::span<const std::int64_t> turns() const { return columns_.turns; }

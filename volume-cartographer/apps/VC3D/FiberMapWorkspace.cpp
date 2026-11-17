@@ -1170,6 +1170,20 @@ FiberMapWorkspace::FiberMapWorkspace(CState* state, LineAnnotationController* co
     _solvesDock->setWidget(_runsPanel);
     addDockWidget(Qt::RightDockWidgetArea, _solvesDock);
     resizeDocks({_solverDock, _solvesDock}, {320, 320}, Qt::Horizontal);
+    // The winding density a measured run reads: the package's own selected
+    // Lasagna dataset, the one the annotation optimizes against. Resolved on
+    // demand and on this thread, so a missing or unusable dataset is one
+    // message in the dock rather than a half-measured run.
+    _solveController->setWindingSampler([this](QString* error) -> std::shared_ptr<vc::lasagna::LasagnaNormalSampler> {
+        if (!_controller) {
+            if (error) *error = tr("No annotation controller is attached.");
+            return {};
+        }
+        auto inputs = _controller->resolveFiberOptimizationInputs({}, {}, error);
+        if (!inputs) return {};
+        if (!inputs->baseNormalSampler && error) *error = tr("The package has no usable normal dataset.");
+        return inputs->baseNormalSampler;
+    });
     connect(_solverPanel, &vc3d::fiber_map::ScaffoldSolverPanel::solveRequested, this, [this]() {
         if (!_solveController || !_solverPanel) return;
         _solveController->startSolve(_solverPanel->request());
@@ -3806,6 +3820,9 @@ void FiberMapWorkspace::updateSolveFrame()
     if (!_solvesLoaded) {
         _solvesLoaded = true;
         _solveController->reloadRuns();
+        // Which measured constraints are already approved; the approval dock
+        // offers revoking those and approving the rest.
+        _solveController->reloadConstraintApprovals();
     }
 }
 

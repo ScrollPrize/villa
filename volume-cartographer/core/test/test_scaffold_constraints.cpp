@@ -91,6 +91,7 @@ struct Scaffold {
         entry.uuid = vc::objects::util::newUuid();
         entry.name = "fiber " + std::to_string(graph.fibers.size());
         entry.family = family;
+        entry.version = 1;
         entry.pointFirst = graph.offsets.back();
         entry.pointCount = std::int64_t(points.size());
         for (const auto& point : points) graph.linePoints.insert(graph.linePoints.end(), point.begin(), point.end());
@@ -522,4 +523,59 @@ TEST_CASE("a scaffold's measured relations are the ones the bulk assembly builds
     }
     CHECK(measuredReport.withoutDistance == std::int64_t(columns.withoutDistance));
     CHECK(measuredReport.used == std::int64_t(columns.used));
+}
+
+TEST_CASE("an approval row marks the measured constraint it names")
+{
+    Scaffold scaffold;
+    const auto horizontal = scaffold.fiber(ScaffoldFamily::Horizontal, arcLine(300., 20., 70., 0., 40));
+    const auto vertical = scaffold.fiber(ScaffoldFamily::Vertical, verticalLine(260., 45., -150., 150., 30));
+    scaffold.manualOutwardNormal(horizontal, 2);
+    scaffold.manualOutwardNormal(vertical, 1);
+    const ScaffoldGeometry geometry(scaffold.graph);
+    const ScaffoldNormals normals(scaffold.graph, geometry);
+    ScaffoldEventReport report;
+    const auto events = scaffoldEvents(scaffold.graph, geometry, normals, {}, constantDistance(1.), report);
+    ScaffoldMeasuredReport measuredReport;
+    auto measured = scaffoldMeasuredConstraints(scaffold.graph, geometry, events, kInwardSigns, {}, measuredReport);
+    REQUIRE_FALSE(measured.empty());
+    for (const auto& constraint : measured) CHECK_FALSE(constraint.approved);
+
+    const auto row = approveScaffoldConstraint(scaffold.graph, geometry, measured.front(), "alice",
+                                               "2026-11-17T10:00:00Z", "host-a");
+    const auto identity = scaffoldConstraintIdentity(scaffold.graph, measured.front());
+    CHECK(row.identity == identity);
+    CHECK(row.identity.fiberA < row.identity.fiberB);
+
+    ScaffoldApprovalReport approvals;
+    applyScaffoldConstraintApprovals(scaffold.graph, geometry, measured, {&row, 1}, approvals);
+    CHECK(approvals.live == 1);
+    CHECK(approvals.approved >= 1);
+    CHECK(approvals.unmatched == 0);
+    CHECK(measured.front().approved);
+
+    // A revoked row approves nothing, and the one it revoked is not live.
+    const auto revoked = vc::objects::revokeFiberConstraintApproval(row, "bob", "2026-11-17T11:00:00Z");
+    const std::vector<vc::objects::FiberConstraintApproval> both{row, revoked};
+    for (auto& constraint : measured) constraint.approved = false;
+    applyScaffoldConstraintApprovals(scaffold.graph, geometry, measured, both, approvals);
+    CHECK(approvals.rows == 2);
+    CHECK(approvals.live == 0);
+    CHECK(approvals.approved == 0);
+    CHECK_FALSE(measured.front().approved);
+
+    // Moving a line point of the covering span invalidates the approval.
+    Scaffold moved = scaffold;
+    const auto spans = scaffoldConstraintSpans(scaffold.graph, geometry, measured.front());
+    REQUIRE(spans);
+    const auto& fiber = moved.graph.fibers[std::size_t(measured.front().a)];
+    const auto line = std::size_t(fiber.content.controlLineIndex.at(spans->spanA));
+    moved.graph.linePoints[3 * (std::size_t(fiber.pointFirst) + line) + 2] += 0.5;
+    const ScaffoldGeometry movedGeometry(moved.graph);
+    for (auto& constraint : measured) constraint.approved = false;
+    applyScaffoldConstraintApprovals(moved.graph, movedGeometry, measured, {&row, 1}, approvals);
+    CHECK(approvals.live == 1);
+    CHECK(approvals.approved == 0);
+    CHECK(approvals.stale == 1);
+    CHECK_FALSE(measured.front().approved);
 }

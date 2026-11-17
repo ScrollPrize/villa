@@ -192,6 +192,9 @@ ScaffoldRunRows scaffoldSolveRunRows(const ScaffoldGraph& graph, const ScaffoldS
     count("violated_arcs", result.violatedArcs, "arcs");
     count("violated_constraints", result.violatedConstraints, "constraints");
     count("approved_subgraphs", result.approvedSubgraphs, "subgraphs");
+    std::int64_t approvedConstraints = 0;
+    for (const auto& constraint : result.constraints) approvedConstraints += constraint.approved ? 1 : 0;
+    count("approved_constraints", approvedConstraints, "constraints");
     count("contracted_fibers", result.contractedFibers, "fibers");
     count("manual_constraints", result.constraintsByKind[std::size_t(ScaffoldConstraintKind::Manual)], "constraints");
     count("perpendicular_constraints", result.constraintsByKind[std::size_t(ScaffoldConstraintKind::Perpendicular)], "constraints");

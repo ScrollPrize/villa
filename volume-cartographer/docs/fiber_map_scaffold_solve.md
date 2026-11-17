@@ -174,6 +174,22 @@ them back through any StoreReader; Python reads the same rows through
 `CollectionReader.extension_rows` and the `residuals` / `residual_pieces`
 table roles.
 
+## Approving a measured constraint
+
+An approved constraint is held rigid: the next run solves the approved
+constraints alone first and contracts each approved subgraph into one node, so
+an approved relation is never traded away (and approved relations that
+contradict each other stop the run instead of being averaged). A link's
+approval is its record's review state. A measured crossing has no record, so
+its approval is a row of `ext_fiber_constraint_approval`, keyed by the two
+fibers, the kind and the two anchors quantized to 64 base voxels, and carrying
+the piece-approval fingerprints of the two covering spans. `applyScaffoldConstraintApprovals`
+marks the constraints a live row covers, and skips a row whose spans have been
+edited since: the annotation moved under it, so the decision is no longer
+about what is there now. Re-running the extraction does not lose an approval -
+the crossing lands in the same quantum - but editing either fiber's covering
+span does.
+
 ## In the fiber map
 
 Three docks (`FiberMapScaffoldSolve.hpp`, with the Qt-free ranking in
@@ -181,11 +197,17 @@ Three docks (`FiberMapScaffoldSolve.hpp`, with the Qt-free ranking in
 
 - **Graph solver.** Which links a run uses (by review state, and whether
   automatic links count), the link weight, the LEMON backend and *fix approved
-  subgraphs* (on by default). The solve runs in the frame the map was built in
-  and on its own worker; the store's umbilicus states the winding handedness,
-  and only when it does not does the dock offer the catalog's sense as a
-  fallback. The run is saved in the store, and its one-line report lands in the
-  map's status line.
+  subgraphs* (on by default). *Measure the fibers' crossings* adds the measured
+  stages: the per-type weights, the sign backend, and whether the winding
+  separations are measured at all. The winding density they are measured on is
+  the package's own selected Lasagna dataset, the one the annotation optimizes
+  against; a run that would measure separations without a bound dataset, or on
+  a dataset that states no `grad_mag` density, is refused before it starts
+  rather than quietly measuring none. The solve runs in the frame the map was
+  built in and on its own worker; the store's umbilicus states the winding
+  handedness, and only when it does not does the dock offer the catalog's sense
+  as a fallback. The run is saved in the store, and its one-line report lands in
+  the map's status line.
 - **Solves.** Every run saved in the store, newest first, with its method,
   fibers, components, weighted L1, violated constraints and largest residual.
   Selecting one loads its ranking.
@@ -197,7 +219,11 @@ Three docks (`FiberMapScaffoldSolve.hpp`, with the Qt-free ranking in
   control points that bracket it, which is where its geometry and normals are
   approved. Two switches outline what is already approved: every span with a
   current geometry approval, the spans whose normals are approved too, and the
-  fibers approved from end to end.
+  fibers approved from end to end. Selecting a *measured* constraint enables
+  **Approve constraint**, which records that this crossing is right
+  (`ext_fiber_constraint_approval`); selecting one already approved offers to
+  revoke it instead. A link is never approved there: a link's approval is its
+  review state in the annotation.
 
 The approval overlays are halos behind the fibers rather than a change of the
 fibers' own colour, so what the map says about a fiber's geometry stays what it

@@ -2,13 +2,16 @@
 
 #include "CState.hpp"
 
+#include "vc/fiber_graph/ScaffoldConstraints.hpp"
 #include "vc/fiber_graph/ScaffoldWindingSolve.hpp"
+#include "vc/lasagna/LasagnaNormalSampler.hpp"
 
 #include <vc_object_store/Uuid.hpp>
 #include <vc_object_store/objects/StoreReader.hpp>
 #include <vc_object_store/objects/Transactions.hpp>
 
 #include <QCheckBox>
+#include <QDateTime>
 #include <QComboBox>
 #include <QDoubleSpinBox>
 #include <QFormLayout>
@@ -17,6 +20,8 @@
 #include <QHeaderView>
 #include <QLabel>
 #include <QPushButton>
+#include <QSysInfo>
+#include <QThread>
 #include <QThreadPool>
 #include <QTreeWidget>
 #include <QVBoxLayout>
@@ -58,6 +63,9 @@ struct ScaffoldSolveController::SolveJob {
     ScaffoldSolveRequest request;
     std::optional<vc::objects::AttachmentIdentity> attachment;
     std::shared_ptr<vc::objects::ObjectStoreSession> session;
+    // Resolved on the GUI thread before the job starts; null when the run
+    // measures no winding separations.
+    std::shared_ptr<vc::lasagna::LasagnaNormalSampler> sampler;
     // Outputs.
     QString error;
     QString summary;
@@ -73,6 +81,11 @@ ScaffoldSolveController::ScaffoldSolveController(CState* state, QObject* parent)
 }
 
 ScaffoldSolveController::~ScaffoldSolveController() = default;
+
+void ScaffoldSolveController::setWindingSampler(WindingSamplerResolver resolver)
+{
+    _windingSampler = std::move(resolver);
+}
 
 std::optional<vc::objects::AttachmentIdentity> ScaffoldSolveController::attachment() const
 {
@@ -205,7 +218,27 @@ void ScaffoldSolveController::startSolve(const ScaffoldSolveRequest& request)
         emit statusMessage(_lastError);
         return;
     }
+    // A run that measures separations needs the density to measure them on,
+    // and says so before it starts rather than quietly measuring none.
+    std::shared_ptr<vc::lasagna::LasagnaNormalSampler> sampler;
+    if (request.measureCrossings && request.measureWindingDistances) {
+        QString error;
+        if (_windingSampler) sampler = _windingSampler(&error);
+        if (!sampler) {
+            _lastError = error.isEmpty() ? tr("No normal dataset is bound, so no winding separation can be measured.")
+                                         : error;
+            emit statusMessage(_lastError);
+            return;
+        }
+        if (!sampler->hasWindingDensity()) {
+            _lastError = tr("The bound normal dataset states no winding density (grad_mag): it cannot measure a \n"
+                            "winding separation.");
+            emit statusMessage(_lastError);
+            return;
+        }
+    }
     _job = std::make_shared<SolveJob>();
+    _job->sampler = std::move(sampler);
     _job->request = request;
     _job->attachment = store;
     _job->session = session;
@@ -231,16 +264,66 @@ void ScaffoldSolveController::startSolve(const ScaffoldSolveRequest& request)
             options.links.weight = job->request.manualWeight;
             options.fixApprovedSubgraphs = job->request.fixApprovedSubgraphs;
             options.flow.backend = vc::geometry::parseWindingFlowBackend(job->request.lemonBackend);
+            options.workers = std::max<std::size_t>(1, job->request.workers);
             ScaffoldRunRecord record;
             record.runUuid = vc::objects::util::newUuid();
             job->session->readStore(*job->attachment, [&](const vc::objects::StoreReader& reader, const auto&) {
                 const auto graph = loadScaffoldGraph(reader, load);
                 const ScaffoldGeometry geometry(graph);
-                const auto result = solveScaffoldWinding(graph, geometry, options);
+                // The measured stages, when the run asked for them. They run
+                // on this worker, in the frame the map was built in.
+                std::optional<ScaffoldNormals> normals;
+                std::vector<ScaffoldEvent> events;
+                std::vector<ScaffoldConstraint> measured;
+                ScaffoldNormalOptions normalOptions;
+                ScaffoldEventOptions eventOptions;
+                ScaffoldMeasuredOptions measuredOptions;
+                ScaffoldSignOptions signOptions;
+                ScaffoldEventReport eventReport;
+                ScaffoldMeasuredReport measuredReport;
+                ScaffoldSignResult signs;
+                ScaffoldApprovalReport approvals;
+                ScaffoldRunStages stages;
+                if (job->request.measureCrossings) {
+                    normalOptions.linkApprovalStates = job->request.approvalStates;
+                    normalOptions.includeAutoLinks = job->request.includeAuto;
+                    normalOptions.workers = options.workers;
+                    eventOptions.measureWindingDistances = job->request.measureWindingDistances;
+                    eventOptions.workers = options.workers;
+                    measuredOptions.perpendicularWeight = job->request.perpendicularWeight;
+                    measuredOptions.parallelWeight = job->request.parallelWeight;
+                    measuredOptions.enclosureWeight = job->request.enclosureWeight;
+                    signOptions.sign.backend = job->request.signBackend == "ceres"
+                                                   ? vc::fiber_tracer::FiberSignBackend::Ceres
+                                                   : vc::fiber_tracer::FiberSignBackend::Irls;
+                    signOptions.sign.threads = int(options.workers);
+                    ScaffoldWindingDistances distances;
+                    if (auto sampler = job->sampler)
+                        distances = [sampler](const std::vector<std::pair<cv::Vec3d, cv::Vec3d>>& connectors,
+                                              double step, int workers) {
+                            return sampler->normalAlignedWindingDistancesBatch(connectors, step, workers);
+                        };
+                    normals.emplace(graph, geometry, normalOptions);
+                    events = scaffoldEvents(graph, geometry, *normals, eventOptions, distances, eventReport);
+                    signs = scaffoldNormalSigns(graph, *normals, events, signOptions);
+                    measured =
+                        scaffoldMeasuredConstraints(graph, geometry, events, signs.sign, measuredOptions, measuredReport);
+                    applyScaffoldConstraintApprovals(graph, geometry, measured,
+                                                     vc::objects::readFiberConstraintApprovals(reader), approvals);
+                    stages.normalOptions = &normalOptions;
+                    stages.normals = &normals->report();
+                    stages.eventOptions = &eventOptions;
+                    stages.events = &eventReport;
+                    stages.measuredOptions = &measuredOptions;
+                    stages.measured = &measuredReport;
+                    stages.signOptions = &signOptions;
+                    stages.signs = &signs;
+                }
+                const auto result = solveScaffoldWinding(graph, geometry, options, measured);
                 record.input = {graph.source.storeUuid, graph.source.generation, graph.source.commitSequence};
-                job->rows = scaffoldSolveRunRows(graph, result, options, record);
+                job->rows = scaffoldSolveRunRows(graph, result, options, record, stages);
                 job->runUuid = record.runUuid;
-                job->summary = QObject::tr("%1 fibers in %2 components, %3 turns of residual, %4 violated of %5 "
+                job->summary = QObject::tr("%1 fibers in %2 components, %3 turns of residual, %4 violated of %5 \n"
                                            "constraints, %6 approved subgraphs, %7 s")
                                    .arg(graph.fibers.size())
                                    .arg(result.components)
@@ -249,6 +332,13 @@ void ScaffoldSolveController::startSolve(const ScaffoldSolveRequest& request)
                                    .arg(result.constraints.size())
                                    .arg(result.approvedSubgraphs)
                                    .arg(result.seconds, 0, 'f', 3);
+                if (job->request.measureCrossings)
+                    job->summary += QObject::tr("; %1 crossings, %2 measured relations, %3 enclosures, %4 signs from \n"
+                                                "crossings")
+                                        .arg(eventReport.events)
+                                        .arg(measuredReport.used)
+                                        .arg(measuredReport.enclosureArcs)
+                                        .arg(signs.decided);
             });
         } catch (const std::exception& problem) {
             job->error = QString::fromUtf8(problem.what());
@@ -284,8 +374,130 @@ void ScaffoldSolveController::finishSolve()
     }
     reloadRuns();
     selectRun(job->runUuid);
+    reloadConstraintApprovals();
     if (_approvalsLoaded) loadApprovals();
     emit statusMessage(job->summary);
+}
+
+namespace {
+// The store's kind of a stored residual's constraint, or nullopt for a manual
+// link (whose approval is its edge record's review state).
+std::optional<vc::objects::FiberConstraintKind> storedConstraintKind(const ScaffoldStoredResidual& residual)
+{
+    switch (residual.kind) {
+    case std::int64_t(ScaffoldConstraintKind::Perpendicular): return vc::objects::FiberConstraintKind::Perpendicular;
+    case std::int64_t(ScaffoldConstraintKind::Parallel): return vc::objects::FiberConstraintKind::Parallel;
+    case std::int64_t(ScaffoldConstraintKind::Enclosure): return vc::objects::FiberConstraintKind::Enclosure;
+    default: return std::nullopt;
+    }
+}
+std::optional<vc::objects::FiberConstraintIdentity> storedConstraintIdentity(const ScaffoldStoredResidual& residual)
+{
+    const auto kind = storedConstraintKind(residual);
+    if (!kind || residual.fiberA.empty() || residual.fiberB.empty()) return std::nullopt;
+    try {
+        return vc::objects::fiberConstraintIdentity(residual.fiberA, residual.arcA, residual.fiberB, residual.arcB,
+                                                    *kind);
+    } catch (const std::exception&) {
+        return std::nullopt;
+    }
+}
+} // namespace
+
+void ScaffoldSolveController::reloadConstraintApprovals()
+{
+    _constraintApprovals.clear();
+    const auto store = attachment();
+    const auto session = _state ? _state->objectStoreSession() : nullptr;
+    if (store && session) {
+        try {
+            session->readStore(*store, [&](const vc::objects::StoreReader& reader, const auto&) {
+                for (auto& row : vc::objects::liveFiberConstraintApprovals(
+                         vc::objects::readFiberConstraintApprovals(reader)))
+                    _constraintApprovals.insert_or_assign(row.identity, row);
+            });
+        } catch (const std::exception& problem) {
+            _lastError = tr("The constraint approvals could not be read: %1").arg(QString::fromUtf8(problem.what()));
+            emit statusMessage(_lastError);
+        }
+    }
+    emit constraintApprovalsChanged();
+}
+
+bool ScaffoldSolveController::constraintApproved(const ScaffoldStoredResidual& residual) const
+{
+    const auto identity = storedConstraintIdentity(residual);
+    return identity && _constraintApprovals.count(*identity) != 0;
+}
+
+QString ScaffoldSolveController::setConstraintApproval(const ScaffoldStoredResidual& residual, bool approved)
+{
+    using namespace vc::objects;
+    const auto identity = storedConstraintIdentity(residual);
+    if (!identity)
+        return tr("A link's approval is its review state; only a measured crossing is approved here.");
+    const auto store = attachment();
+    const auto session = _state ? _state->objectStoreSession() : nullptr;
+    if (!store || !session) return tr("No fiber store is attached.");
+    const auto existing = _constraintApprovals.find(*identity);
+    if (!approved && existing == _constraintApprovals.end())
+        return tr("This constraint carries no approval to revoke.");
+
+    auto request = session->newRequest(*store);
+    const std::string now = QDateTime::currentDateTimeUtc().toString(Qt::ISODate).toStdString();
+    const std::string host = QSysInfo::machineHostName().toStdString();
+    std::vector<ExtensionRow> values;
+    std::vector<ObjectRevision> revisions;
+    QString error;
+    try {
+        session->readStore(*store, [&](const StoreReader& reader, const auto&) {
+            if (!approved) {
+                values.push_back(fiberConstraintApprovalRow(
+                    revokeFiberConstraintApproval(existing->second, request.author, now)));
+                return;
+            }
+            // Both fibers as the store holds them now: the approval records
+            // their versions and the fingerprints of the two covering spans.
+            std::array<FiberPieceContent, 2> contents;
+            std::array<std::int64_t, 2> versions{0, 0};
+            std::array<std::size_t, 2> spans{0, 0};
+            const std::array<std::string, 2> uuids{identity->fiberA, identity->fiberB};
+            const std::array<double, 2> arcs{identity->fiberA == residual.fiberA ? residual.arcA : residual.arcB,
+                                             identity->fiberA == residual.fiberA ? residual.arcB : residual.arcA};
+            for (std::size_t side = 0; side < 2; ++side) {
+                const auto record = reader.currentObject(uuids[side]);
+                if (!record) { error = tr("A fiber of this constraint is no longer in the store."); return; }
+                const auto found = reader.objectsAtVersions({record->reference()});
+                if (found.empty() || !found.front() || found.front()->deleted) {
+                    error = tr("A fiber of this constraint cannot be read.");
+                    return;
+                }
+                revisions.push_back(*found.front());
+                contents[side] = fiberPieceContent(reader, *found.front());
+                versions[side] = found.front()->version;
+                const auto span = vc::fiber_graph::scaffoldSpanCoveringArc(contents[side], arcs[side]);
+                if (!span) { error = tr("A fiber of this constraint has no span covering its anchor."); return; }
+                spans[side] = *span;
+            }
+            values.push_back(fiberConstraintApprovalRow(
+                approveFiberConstraint(*identity, contents[0], spans[0], versions[0], contents[1], spans[1],
+                                       versions[1], request.author, now, host)));
+        });
+    } catch (const std::exception& problem) {
+        return tr("The store could not be read: %1").arg(QString::fromUtf8(problem.what()));
+    }
+    if (!error.isEmpty()) return error;
+    if (values.empty()) return tr("Nothing to write.");
+    for (const auto& revision : revisions) expectObject(request, revision);
+    request.operations.push_back(CreateExtensionTableOp{fiberConstraintApprovalTable()});
+    request.operations.push_back(AppendExtensionRowsOp{kFiberConstraintApprovalTable, std::move(values)});
+    try {
+        session->submitDurably(*store, request);
+    } catch (const std::exception& problem) {
+        return tr("The approval could not be stored: %1").arg(QString::fromUtf8(problem.what()));
+    }
+    reloadConstraintApprovals();
+    return {};
 }
 
 ScaffoldSolverPanel::ScaffoldSolverPanel(ScaffoldSolveController* controller, QWidget* parent)
@@ -345,6 +557,51 @@ ScaffoldSolverPanel::ScaffoldSolverPanel(ScaffoldSolveController* controller, QW
     _backendCombo->addItem(tr("cost scaling"), QStringLiteral("cost_scaling"));
     _backendCombo->setToolTip(tr("The min-cost-flow backend. Both solve the same problem exactly."));
     form->addRow(tr("Backend"), _backendCombo);
+
+    _crossingsCheck = new QCheckBox(tr("Measure the fibers' crossings"), this);
+    _crossingsCheck->setObjectName(QStringLiteral("fiberMapSolveCrossings"));
+    _crossingsCheck->setToolTip(tr("Also use the crossings of the annotated fibers themselves: their strip\n"
+                                   "normals, the signs those crossings decide, and the perpendicular,\n"
+                                   "parallel and enclosure relations they assert. This reads the volume and\n"
+                                   "takes seconds rather than milliseconds."));
+    form->addRow(tr("Crossings"), _crossingsCheck);
+
+    _windingDistanceCheck = new QCheckBox(tr("Measure winding separations"), this);
+    _windingDistanceCheck->setObjectName(QStringLiteral("fiberMapSolveWindingDistances"));
+    _windingDistanceCheck->setChecked(true);
+    _windingDistanceCheck->setToolTip(tr("Measure how many windings apart each crossing is, on the bound\n"
+                                         "Lasagna normal dataset's winding density. Without it a crossing\n"
+                                         "asserts no step and only witnesses an enclosure."));
+    form->addRow(QString(), _windingDistanceCheck);
+
+    const auto weightSpin = [this](const char* name, const QString& tip) {
+        auto* spin = new QDoubleSpinBox(this);
+        spin->setObjectName(QString::fromLatin1(name));
+        spin->setRange(0.0, 1000.0);
+        spin->setDecimals(2);
+        spin->setSingleStep(0.25);
+        spin->setValue(1.0);
+        spin->setToolTip(tip);
+        return spin;
+    };
+    _perpendicularWeightSpin = weightSpin("fiberMapSolvePerpendicularWeight",
+        tr("Cost of one winding of error on a measured perpendicular crossing."));
+    form->addRow(tr("Perpendicular weight"), _perpendicularWeightSpin);
+    _parallelWeightSpin = weightSpin("fiberMapSolveParallelWeight",
+        tr("Cost of one winding of error on a measured parallel relation."));
+    form->addRow(tr("Parallel weight"), _parallelWeightSpin);
+    _enclosureWeightSpin = weightSpin("fiberMapSolveEnclosureWeight",
+        tr("Cost of one winding of error on an enclosure relation: the exact step a pair's\n"
+           "crossings bound from both sides. Zero leaves enclosures out."));
+    form->addRow(tr("Enclosure weight"), _enclosureWeightSpin);
+
+    _signBackendCombo = new QComboBox(this);
+    _signBackendCombo->setObjectName(QStringLiteral("fiberMapSolveSignBackend"));
+    _signBackendCombo->addItem(tr("IRLS"), QStringLiteral("irls"));
+    _signBackendCombo->addItem(tr("Ceres"), QStringLiteral("ceres"));
+    _signBackendCombo->setToolTip(tr("Which backend decides the normal signs of the fibers no anchor fixed.\n"
+                                     "Both descend the same objective."));
+    form->addRow(tr("Sign backend"), _signBackendCombo);
     layout->addLayout(form);
 
     _runButton = new QPushButton(tr("Solve"), this);
@@ -361,7 +618,7 @@ ScaffoldSolverPanel::ScaffoldSolverPanel(ScaffoldSolveController* controller, QW
     layout->addStretch(1);
 
     connect(_runButton, &QPushButton::clicked, this, [this]() { emit solveRequested(); });
-    for (auto* box : {_approvedCheck, _pendingCheck}) {
+    for (auto* box : {_approvedCheck, _pendingCheck, _crossingsCheck}) {
         connect(box, &QCheckBox::toggled, this, [this]() { updateEnabled(); });
     }
     if (_controller) {
@@ -385,6 +642,10 @@ void ScaffoldSolverPanel::updateEnabled()
     const bool busy = _controller && _controller->busy();
     _runButton->setEnabled(states && !busy && !_volume.empty());
     if (_volume.empty()) _runButton->setToolTip(tr("The map has no annotation volume to solve in."));
+    const bool crossings = _crossingsCheck->isChecked();
+    for (auto* widget : std::initializer_list<QWidget*>{_windingDistanceCheck, _perpendicularWeightSpin,
+                                                        _parallelWeightSpin, _enclosureWeightSpin, _signBackendCombo})
+        widget->setEnabled(crossings);
 }
 
 ScaffoldSolveRequest ScaffoldSolverPanel::request() const
@@ -399,6 +660,13 @@ ScaffoldSolveRequest ScaffoldSolverPanel::request() const
     request.lemonBackend = _backendCombo->currentData().toString().toStdString();
     request.volume = _volume;
     request.fallbackHandedness = _fallbackHandedness;
+    request.measureCrossings = _crossingsCheck->isChecked();
+    request.measureWindingDistances = _windingDistanceCheck->isChecked();
+    request.perpendicularWeight = _perpendicularWeightSpin->value();
+    request.parallelWeight = _parallelWeightSpin->value();
+    request.enclosureWeight = _enclosureWeightSpin->value();
+    request.signBackend = _signBackendCombo->currentData().toString().toStdString();
+    request.workers = std::size_t(std::max(1, QThread::idealThreadCount()));
     return request;
 }
 
@@ -537,12 +805,32 @@ ScaffoldApprovalPanel::ScaffoldApprovalPanel(ScaffoldSolveController* controller
                          "as a piece, where its geometry and normals can be approved."));
     layout->addWidget(_tree, 1);
 
+    _approveButton = new QPushButton(tr("Approve constraint"), this);
+    _approveButton->setObjectName(QStringLiteral("fiberMapApproveConstraint"));
+    _approveButton->setEnabled(false);
+    _approveButton->setToolTip(tr("Record that this measured crossing is right. An approved constraint is\n"
+                                  "held rigid by the next solve, and the record is invalidated if either\n"
+                                  "fiber's covering span is edited. A link is not approved here: its\n"
+                                  "approval is its review state in the annotation."));
+    layout->addWidget(_approveButton);
+
     _summaryLabel = new QLabel(this);
     _summaryLabel->setObjectName(QStringLiteral("fiberMapApprovalSummary"));
     _summaryLabel->setWordWrap(true);
     _summaryLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
     layout->addWidget(_summaryLabel);
 
+    connect(_approveButton, &QPushButton::clicked, this, [this]() {
+        const auto* residual = residualOf(_tree->currentItem());
+        if (!residual || !_controller) return;
+        const bool approved = _controller->constraintApproved(*residual);
+        const auto error = _controller->setConstraintApproval(*residual, !approved);
+        if (!error.isEmpty()) {
+            _summaryLabel->setText(error);
+            return;
+        }
+        applySelection();
+    });
     connect(_orderCombo, &QComboBox::currentIndexChanged, this, [this]() { rebuild(); });
     connect(_tree, &QTreeWidget::itemSelectionChanged, this, [this]() { applySelection(); });
     connect(_tree, &QTreeWidget::itemDoubleClicked, this,
@@ -557,6 +845,8 @@ ScaffoldApprovalPanel::ScaffoldApprovalPanel(ScaffoldSolveController* controller
         connect(_controller, &ScaffoldSolveController::selectionChanged, this, [this]() { rebuild(); });
         connect(_controller, &ScaffoldSolveController::approvalsChanged, this,
                 [this]() { emit highlightModeChanged(); });
+        connect(_controller, &ScaffoldSolveController::constraintApprovalsChanged, this,
+                [this]() { applySelection(); });
     }
     rebuild();
 }
@@ -587,6 +877,14 @@ void ScaffoldApprovalPanel::rebuild()
         }
         return QString::fromStdString(uuid).left(8);
     };
+    const auto kindName = [](std::int64_t kind) {
+        switch (kind) {
+        case std::int64_t(ScaffoldConstraintKind::Perpendicular): return tr("perpendicular");
+        case std::int64_t(ScaffoldConstraintKind::Parallel): return tr("parallel");
+        case std::int64_t(ScaffoldConstraintKind::Enclosure): return tr("enclosure");
+        default: return tr("constraint");
+        }
+    };
     // One row per violated constraint and per accused stretch, ordered by the
     // chosen key with the documented secondary keys.
     struct Row {
@@ -595,17 +893,21 @@ void ScaffoldApprovalPanel::rebuild()
         QStringList text;
         std::string fiberUuid, otherUuid;
         std::int64_t controlFrom = -1, controlTo = -1;
+        // Index into the run's residuals for a constraint row, -1 otherwise.
+        std::int64_t residual = -1;
     };
     std::vector<Row> rows;
-    for (const auto& residual : view->residuals) {
+    for (std::size_t index = 0; index < view->residuals.size(); ++index) {
+        const auto& residual = view->residuals[index];
         Row row;
         row.piece = false;
+        row.residual = std::int64_t(index);
         row.keys.cost = residual.weight * residual.residual;
         row.keys.cycle = residual.cycleHops.value_or(-1);
         row.keys.length = residual.cyclePieceLength;
         row.fiberUuid = residual.fiberA;
         row.otherUuid = residual.fiberB;
-        row.text << (residual.edgeUuid.empty() ? tr("constraint") : tr("link"))
+        row.text << (residual.edgeUuid.empty() ? kindName(residual.kind) : tr("link"))
                  << tr("%1 - %2").arg(label(residual.fiberA), label(residual.fiberB))
                  << tr("%1 turns off").arg(residual.residual, 0, 'f', 2)
                  << QString::number(row.keys.cost, 'f', 3)
@@ -641,6 +943,7 @@ void ScaffoldApprovalPanel::rebuild()
         item->setData(kWhereColumn, Qt::UserRole, QString::fromStdString(row.otherUuid));
         item->setData(kCostColumn, Qt::UserRole, QVariant::fromValue(qlonglong(row.controlFrom)));
         item->setData(kCycleColumn, Qt::UserRole, QVariant::fromValue(qlonglong(row.controlTo)));
+        item->setData(kCountColumn, Qt::UserRole, QVariant::fromValue(qlonglong(row.residual)));
     }
     for (int column = 0; column < kColumnCount - 1; ++column) _tree->resizeColumnToContents(column);
     _summaryLabel->setText(tr("%1 violated constraints, %2 accused stretches")
@@ -649,10 +952,27 @@ void ScaffoldApprovalPanel::rebuild()
     _rebuilding = false;
 }
 
+const ScaffoldStoredResidual* ScaffoldApprovalPanel::residualOf(const QTreeWidgetItem* item) const
+{
+    const auto* view = _controller ? _controller->selected() : nullptr;
+    if (!item || !view) return nullptr;
+    const auto index = item->data(kCountColumn, Qt::UserRole).toLongLong();
+    if (index < 0 || std::size_t(index) >= view->residuals.size()) return nullptr;
+    return &view->residuals[std::size_t(index)];
+}
+
 void ScaffoldApprovalPanel::applySelection()
 {
     if (_rebuilding) return;
     const auto items = _tree->selectedItems();
+    // The approve button follows the selection: a measured crossing can be
+    // approved or revoked, a link and a stretch cannot.
+    const auto* residual = items.isEmpty() ? nullptr : residualOf(items.front());
+    const bool measured = residual && residual->edgeUuid.empty() &&
+                          residual->kind != std::int64_t(ScaffoldConstraintKind::Manual);
+    const bool approved = measured && _controller && _controller->constraintApproved(*residual);
+    _approveButton->setEnabled(measured);
+    _approveButton->setText(approved ? tr("Revoke approval") : tr("Approve constraint"));
     if (items.isEmpty()) {
         emit highlightRequested({});
         return;

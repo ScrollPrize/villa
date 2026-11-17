@@ -17,6 +17,7 @@
 
 #include "FiberMapScaffoldRanking.hpp"
 
+#include <vc_object_store/objects/FiberConstraintApprovalExtension.hpp>
 #include <vc_object_store/objects/ObjectStoreSession.hpp>
 
 #include <array>
@@ -28,6 +29,7 @@
 #include <vector>
 
 class CState;
+namespace vc::lasagna { class LasagnaNormalSampler; }
 class QCheckBox;
 class QComboBox;
 class QDoubleSpinBox;
@@ -53,6 +55,16 @@ struct ScaffoldSolveRequest {
     std::string lemonBackend = "network_simplex";
     std::string volume;
     std::optional<int> fallbackHandedness;
+    // Also measure the scaffold's own crossings: strip normals from the
+    // annotation, their signs from the crossings, and the perpendicular,
+    // parallel and enclosure relations they assert.
+    bool measureCrossings = false;
+    double perpendicularWeight = 1.0, parallelWeight = 1.0, enclosureWeight = 1.0;
+    // Measure each connector's winding separation on the bound normal
+    // dataset. Off keeps the crossings as enclosure evidence only.
+    bool measureWindingDistances = true;
+    std::string signBackend = "irls";
+    std::size_t workers = 1;
 };
 
 // One stored run with everything the docks show, read back from the store.
@@ -86,6 +98,21 @@ public:
     void loadApprovals();
     void dropApprovals();
 
+    // The winding density a run measures its separations on. The workspace
+    // binds the package's Lasagna normal dataset; a run that would measure
+    // one without a sampler is refused rather than run without distances.
+    using WindingSamplerResolver =
+        std::function<std::shared_ptr<vc::lasagna::LasagnaNormalSampler>(QString* error)>;
+    void setWindingSampler(WindingSamplerResolver);
+
+    // Approval of a *measured* constraint (a crossing). A link's approval is
+    // its edge record's review state and is not touched here.
+    void reloadConstraintApprovals();
+    [[nodiscard]] bool constraintApproved(const vc::fiber_graph::ScaffoldStoredResidual&) const;
+    // Writes the approval or its revocation; the returned message is empty
+    // when the store took it.
+    QString setConstraintApproval(const vc::fiber_graph::ScaffoldStoredResidual&, bool approved);
+
     // Re-read the store's run rows (after a solve, or when the store changed).
     void reloadRuns();
     // Read one run's windings and ranking; an empty UUID clears the selection.
@@ -97,6 +124,7 @@ signals:
     void runsChanged();
     void selectionChanged();
     void approvalsChanged();
+    void constraintApprovalsChanged();
     void busyChanged(bool busy);
     // A line for the workspace status bar; errors arrive here too.
     void statusMessage(const QString& message);
@@ -113,8 +141,10 @@ private:
     std::optional<ScaffoldRunView> _selected;
     std::map<std::string, ScaffoldApprovalSpans> _approvals;
     bool _approvalsLoaded = false;
+    std::map<vc::objects::FiberConstraintIdentity, vc::objects::FiberConstraintApproval> _constraintApprovals;
     std::shared_ptr<SolveJob> _job;
     QFutureWatcher<void>* _watcher = nullptr;
+    WindingSamplerResolver _windingSampler;
 };
 
 // The solver dock: what a run uses, and the Run button.
@@ -142,7 +172,13 @@ private:
     QCheckBox* _pendingCheck = nullptr;
     QCheckBox* _autoCheck = nullptr;
     QCheckBox* _fixApprovedCheck = nullptr;
+    QCheckBox* _crossingsCheck = nullptr;
+    QCheckBox* _windingDistanceCheck = nullptr;
     QDoubleSpinBox* _manualWeightSpin = nullptr;
+    QDoubleSpinBox* _perpendicularWeightSpin = nullptr;
+    QDoubleSpinBox* _parallelWeightSpin = nullptr;
+    QDoubleSpinBox* _enclosureWeightSpin = nullptr;
+    QComboBox* _signBackendCombo = nullptr;
     QComboBox* _backendCombo = nullptr;
     QPushButton* _runButton = nullptr;
     QLabel* _statusLabel = nullptr;
@@ -219,8 +255,12 @@ private:
     void rebuild();
     void applySelection();
     void activateRow(QTreeWidgetItem* item);
+    // The residual a row names, when the row is a constraint of the selected
+    // run; null for a stretch or a row of another run.
+    [[nodiscard]] const vc::fiber_graph::ScaffoldStoredResidual* residualOf(const QTreeWidgetItem*) const;
 
     ScaffoldSolveController* _controller = nullptr;
+    QPushButton* _approveButton = nullptr;
     QCheckBox* _highlightFibersCheck = nullptr;
     QCheckBox* _highlightPiecesCheck = nullptr;
     QComboBox* _orderCombo = nullptr;

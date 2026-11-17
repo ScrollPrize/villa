@@ -229,6 +229,19 @@ ScaffoldGraph loadScaffoldGraph(const objects::StoreReader& reader, const Scaffo
     return graph;
 }
 
+objects::FiberPieceContent scaffoldFiberContent(const ScaffoldGraph& graph, std::size_t fiber)
+{
+    const auto& entry = graph.fibers.at(fiber);
+    auto content = entry.content;
+    content.linePoints.resize(std::size_t(entry.pointCount));
+    for (std::int64_t j = 0; j < entry.pointCount; ++j) {
+        const auto at = std::size_t(3 * (entry.pointFirst + j));
+        content.linePoints[std::size_t(j)] = {graph.linePoints[at], graph.linePoints[at + 1],
+                                              graph.linePoints[at + 2]};
+    }
+    return content;
+}
+
 ScaffoldGeometry::ScaffoldGeometry(const ScaffoldGraph& graph, std::size_t workers)
     : graph_(&graph)
     , columns_(geometry::packWindingGeometry(graph.offsets, graph.linePoints,
@@ -258,6 +271,20 @@ ScaffoldGeometry::Projection ScaffoldGeometry::project(std::size_t fiber, const 
         }
     }
     return best;
+}
+
+std::int64_t ScaffoldGeometry::lineIndexAt(std::size_t fiber, double arc) const
+{
+    const auto& entry = graph_->fibers.at(fiber);
+    const auto first = std::size_t(entry.pointFirst), count = std::size_t(entry.pointCount);
+    if (count == 0) return -1;
+    const auto begin = columns_.arc.begin() + std::ptrdiff_t(first);
+    const auto end = begin + std::ptrdiff_t(count);
+    auto upper = std::lower_bound(begin, end, arc);
+    if (upper == end) return std::int64_t(count) - 1;
+    if (upper == begin) return 0;
+    const auto index = std::size_t(upper - begin);
+    return std::int64_t(arc - *(upper - 1) <= *upper - arc ? index - 1 : index);
 }
 
 double ScaffoldGeometry::controlArc(std::size_t fiber, std::size_t control) const

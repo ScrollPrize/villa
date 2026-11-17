@@ -22,6 +22,7 @@
 #include "vc/fiber_graph/ScaffoldWindingSolve.hpp"
 #include "vc/fiber_tracer/FiberNormalSign.hpp"
 #include "vc/fiber_tracer/FiberTraceConstraints.hpp"
+#include "vc_object_store/objects/FiberConstraintApprovalExtension.hpp"
 
 #include <cstdint>
 #include <limits>
@@ -140,5 +141,46 @@ std::vector<ScaffoldConstraint> scaffoldMeasuredConstraints(const ScaffoldGraph&
                                                            std::span<const ScaffoldEvent>,
                                                            std::span<const std::int64_t> normalSign,
                                                            const ScaffoldMeasuredOptions&, ScaffoldMeasuredReport&);
+
+// A measured constraint's identity in the store, and the spans an approval of
+// it is fingerprinted over. A manual link is not one of these: its approval is
+// its edge record's state.
+objects::FiberConstraintKind scaffoldConstraintStoreKind(ScaffoldConstraintKind);
+
+// The covering span of each endpoint: the span of that fiber between the two
+// control points around the constraint's anchor. Nullopt when a fiber carries
+// too few control points to have one.
+struct ScaffoldConstraintSpans {
+    std::size_t spanA = 0, spanB = 0;
+};
+std::optional<ScaffoldConstraintSpans> scaffoldConstraintSpans(const ScaffoldGraph&, const ScaffoldGeometry&,
+                                                               const ScaffoldConstraint&);
+objects::FiberConstraintIdentity scaffoldConstraintIdentity(const ScaffoldGraph&, const ScaffoldConstraint&);
+
+// The span of a fiber covering an arc position, over a content read straight
+// from the store: the arc is the cumulative chord length of its line points,
+// which is the measure every anchor arc is stated in. Nullopt when the fiber
+// has fewer than two control points on its line.
+std::optional<std::size_t> scaffoldSpanCoveringArc(const objects::FiberPieceContent&, double arc);
+
+// A fresh approval row for one measured constraint, fingerprinted over the
+// two covering spans of the loaded scaffold. Throws std::invalid_argument for
+// a manual link or a constraint whose spans cannot be resolved.
+objects::FiberConstraintApproval approveScaffoldConstraint(const ScaffoldGraph&, const ScaffoldGeometry&,
+                                                          const ScaffoldConstraint&, const std::string& author,
+                                                          const std::string& approvedAt, const std::string& host);
+
+struct ScaffoldApprovalReport {
+    std::int64_t rows = 0, live = 0, approved = 0;
+    // Live rows whose constraint this run did not measure, and rows whose
+    // covering spans have changed since they were approved.
+    std::int64_t unmatched = 0, stale = 0;
+};
+
+// Mark the measured constraints that a live approval row covers. A row whose
+// spans no longer hash to what it recorded approves nothing: the annotation
+// moved under it.
+void applyScaffoldConstraintApprovals(const ScaffoldGraph&, const ScaffoldGeometry&, std::span<ScaffoldConstraint>,
+                                      std::span<const objects::FiberConstraintApproval>, ScaffoldApprovalReport&);
 
 } // namespace vc::fiber_graph

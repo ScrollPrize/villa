@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <map>
 #include <stdexcept>
 
 namespace vc::fiber_graph {
@@ -322,6 +323,130 @@ std::vector<ScaffoldConstraint> scaffoldMeasuredConstraints(const ScaffoldGraph&
         i = j;
     }
     return constraints;
+}
+
+objects::FiberConstraintKind scaffoldConstraintStoreKind(ScaffoldConstraintKind kind)
+{
+    switch (kind) {
+        case ScaffoldConstraintKind::Perpendicular: return objects::FiberConstraintKind::Perpendicular;
+        case ScaffoldConstraintKind::Parallel: return objects::FiberConstraintKind::Parallel;
+        case ScaffoldConstraintKind::Enclosure: return objects::FiberConstraintKind::Enclosure;
+        case ScaffoldConstraintKind::Manual: break;
+    }
+    throw std::invalid_argument("scaffold constraints: a manual link's approval is its edge record's state");
+}
+
+std::optional<ScaffoldConstraintSpans> scaffoldConstraintSpans(const ScaffoldGraph& graph,
+                                                               const ScaffoldGeometry& geometry,
+                                                               const ScaffoldConstraint& constraint)
+{
+    const auto span = [&](std::int64_t fiber, double arc) -> std::optional<std::size_t> {
+        const auto content = scaffoldFiberContent(graph, std::size_t(fiber));
+        const auto line = geometry.lineIndexAt(std::size_t(fiber), arc);
+        if (line < 0) return std::nullopt;
+        return objects::fiberSpanCoveringLineIndex(content, line);
+    };
+    const auto a = span(constraint.a, constraint.arcA);
+    const auto b = span(constraint.b, constraint.arcB);
+    if (!a || !b) return std::nullopt;
+    return ScaffoldConstraintSpans{*a, *b};
+}
+
+objects::FiberConstraintIdentity scaffoldConstraintIdentity(const ScaffoldGraph& graph,
+                                                            const ScaffoldConstraint& constraint)
+{
+    return objects::fiberConstraintIdentity(graph.fibers.at(std::size_t(constraint.a)).uuid, constraint.arcA,
+                                            graph.fibers.at(std::size_t(constraint.b)).uuid, constraint.arcB,
+                                            scaffoldConstraintStoreKind(constraint.kind));
+}
+
+std::optional<std::size_t> scaffoldSpanCoveringArc(const objects::FiberPieceContent& content, double arc)
+{
+    if (content.linePoints.size() < 2 || !std::isfinite(arc)) return std::nullopt;
+    double walked = 0, bestDistance = std::abs(arc);
+    std::size_t best = 0;
+    for (std::size_t i = 1; i < content.linePoints.size(); ++i) {
+        const auto& previous = content.linePoints[i - 1];
+        const auto& current = content.linePoints[i];
+        const double dx = current[0] - previous[0], dy = current[1] - previous[1], dz = current[2] - previous[2];
+        walked += std::sqrt((dx * dx + dy * dy) + dz * dz);
+        const double distance = std::abs(arc - walked);
+        if (distance < bestDistance) {
+            bestDistance = distance;
+            best = i;
+        }
+    }
+    return objects::fiberSpanCoveringLineIndex(content, std::int64_t(best));
+}
+
+objects::FiberConstraintApproval approveScaffoldConstraint(const ScaffoldGraph& graph,
+                                                           const ScaffoldGeometry& geometry,
+                                                           const ScaffoldConstraint& constraint,
+                                                           const std::string& author, const std::string& approvedAt,
+                                                           const std::string& host)
+{
+    const auto identity = scaffoldConstraintIdentity(graph, constraint);
+    const auto spans = scaffoldConstraintSpans(graph, geometry, constraint);
+    if (!spans)
+        throw std::invalid_argument("scaffold constraints: the constraint's anchors lie on no control point span");
+    const auto& fiberA = graph.fibers.at(std::size_t(constraint.a));
+    const auto& fiberB = graph.fibers.at(std::size_t(constraint.b));
+    // The identity orders the two fibers by UUID; the spans follow it.
+    const bool ordered = fiberA.uuid < fiberB.uuid;
+    const auto contentA = scaffoldFiberContent(graph, std::size_t(ordered ? constraint.a : constraint.b));
+    const auto contentB = scaffoldFiberContent(graph, std::size_t(ordered ? constraint.b : constraint.a));
+    const auto versionA = (ordered ? fiberA : fiberB).version;
+    const auto versionB = (ordered ? fiberB : fiberA).version;
+    if (!versionA || !versionB)
+        throw std::invalid_argument("scaffold constraints: an approval records both fibers' versions");
+    return objects::approveFiberConstraint(identity, contentA, ordered ? spans->spanA : spans->spanB, *versionA,
+                                           contentB, ordered ? spans->spanB : spans->spanA, *versionB, author,
+                                           approvedAt, host);
+}
+
+void applyScaffoldConstraintApprovals(const ScaffoldGraph& graph, const ScaffoldGeometry& geometry,
+                                      std::span<ScaffoldConstraint> measured,
+                                      std::span<const objects::FiberConstraintApproval> rows,
+                                      ScaffoldApprovalReport& report)
+{
+    report = ScaffoldApprovalReport{};
+    report.rows = std::int64_t(rows.size());
+    const auto live = objects::liveFiberConstraintApprovals(rows);
+    report.live = std::int64_t(live.size());
+    if (live.empty()) return;
+    std::map<objects::FiberConstraintIdentity, std::size_t> index;
+    for (std::size_t i = 0; i < live.size(); ++i) index.emplace(live[i].identity, i);
+    std::vector<char> matched(live.size(), 0);
+    // One content per fiber, materialized only for the fibers an approval
+    // names: the fingerprints are taken over their line points.
+    std::map<std::size_t, objects::FiberPieceContent> contents;
+    const auto contentOf = [&](std::size_t fiber) -> const objects::FiberPieceContent& {
+        const auto found = contents.find(fiber);
+        if (found != contents.end()) return found->second;
+        return contents.emplace(fiber, scaffoldFiberContent(graph, fiber)).first->second;
+    };
+    for (auto& constraint : measured) {
+        if (constraint.kind == ScaffoldConstraintKind::Manual) continue;
+        const auto found = index.find(scaffoldConstraintIdentity(graph, constraint));
+        if (found == index.end()) continue;
+        matched[found->second] = 1;
+        const auto spans = scaffoldConstraintSpans(graph, geometry, constraint);
+        if (!spans) continue;
+        const auto& fiberA = graph.fibers.at(std::size_t(constraint.a));
+        const auto& fiberB = graph.fibers.at(std::size_t(constraint.b));
+        const bool ordered = fiberA.uuid < fiberB.uuid;
+        const auto& contentA = contentOf(std::size_t(ordered ? constraint.a : constraint.b));
+        const auto& contentB = contentOf(std::size_t(ordered ? constraint.b : constraint.a));
+        if (!objects::fiberConstraintApprovalCurrent(live[found->second], contentA,
+                                                     ordered ? spans->spanA : spans->spanB, contentB,
+                                                     ordered ? spans->spanB : spans->spanA))
+            continue;
+        constraint.approved = true;
+        ++report.approved;
+    }
+    for (std::size_t i = 0; i < live.size(); ++i)
+        if (!matched[i]) ++report.unmatched;
+    report.stale = report.live - report.unmatched - report.approved;
 }
 
 } // namespace vc::fiber_graph
