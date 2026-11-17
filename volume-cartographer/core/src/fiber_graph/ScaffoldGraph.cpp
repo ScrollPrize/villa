@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <set>
 #include <stdexcept>
 
 namespace vc::fiber_graph {
@@ -88,6 +89,20 @@ std::optional<std::size_t> ScaffoldGraph::indexOf(const std::string& fiberUuid) 
     return found->second;
 }
 
+std::int64_t scaffoldAnnotationCommit(const objects::StoreReader& reader)
+{
+    std::int64_t last = 0;
+    for (const char* kind : {"fiber", "umbilicus"}) {
+        objects::ObjectSelection selection;
+        selection.kind = kind;
+        for (const auto& record : reader.selectObjects(selection)) last = std::max(last, record.commitSequence);
+    }
+    objects::EdgeSelection links;
+    links.kind = "fiber_branch";
+    for (const auto& edge : reader.selectEdges(links)) last = std::max(last, edge.commitSequence);
+    return last;
+}
+
 ScaffoldGraph loadScaffoldGraph(const objects::StoreReader& reader, const ScaffoldLoadOptions& options)
 {
     if (!std::isfinite(options.scale) || options.scale <= 0)
@@ -124,7 +139,12 @@ ScaffoldGraph loadScaffoldGraph(const objects::StoreReader& reader, const Scaffo
     // store's UUID order: that order is the solve's node order.
     struct Accepted { objects::ObjectRecord record; ScaffoldFamily family; bool manual; };
     std::vector<Accepted> accepted;
+    // A restricted run: the subset is a set of UUIDs, and a UUID the store
+    // does not hold is simply not found (the caller's selection may be older
+    // than the store).
+    const std::set<std::string> subset(options.fiberSubset.begin(), options.fiberSubset.end());
     for (const auto& record : records) {
+        if (!subset.empty() && subset.count(record.uuid) == 0) { ++graph.report.filteredSubset; continue; }
         if (!record.fiber) { ++graph.report.untagged; continue; }
         const auto family = familyOf(record.fiber->family);
         const bool manual = record.fiber->manualFamily;

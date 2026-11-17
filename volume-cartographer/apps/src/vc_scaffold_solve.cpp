@@ -74,6 +74,10 @@ ScaffoldLoadOptions loadOptionsFrom(const Json& cfg)
     else if (source == "automatic") options.familySource = ScaffoldFamilySource::Automatic;
     else throw std::invalid_argument("family_source must be any, manual or automatic");
     options.includeUntagged = cfg.value("include_untagged", false);
+    // A restricted run: only these fibers are loaded (the GUI's scope
+    // selector states the map's selected network here).
+    for (const auto& uuid : cfg.value("fibers", Json::array()))
+        options.fiberSubset.push_back(uuid.get<std::string>());
     return options;
 }
 
@@ -86,6 +90,7 @@ ScaffoldNormalOptions normalOptionsFrom(const Json& cfg)
     options.strip.smoothingSigma = section.value("smoothing_sigma", options.strip.smoothingSigma);
     options.strip.resampleSpacing = section.value("resample_spacing", options.strip.resampleSpacing);
     options.strip.maxIterations = section.value("max_iterations", options.strip.maxIterations);
+    options.predictionChunkPoints = section.value("prediction_chunk", options.predictionChunkPoints);
     options.manualDisplayNormals = section.value("manual_display_normals", options.manualDisplayNormals);
     options.approvedNormalPieces = section.value("approved_pieces", options.approvedNormalPieces);
     options.adjacentLinkAnchors = section.value("adjacent_links", options.adjacentLinkAnchors);
@@ -239,11 +244,15 @@ int run(const std::string& configPath)
     auto store = vc::objects::ObjectStore::open(cfg.at("store").get<std::string>(), storeOptions);
     ScaffoldGraph graph;
     std::vector<vc::objects::FiberConstraintApproval> constraintApprovals;
+    // When the annotation itself last changed, so a log says whether a later
+    // run read the same fibers (the Solves dock's stale verdict).
+    std::int64_t annotationCommit = 0;
     {
         const auto txn = store.read();
         const vc::objects::LocalStoreReader reader(store, txn);
         graph = loadScaffoldGraph(reader, loadOptionsFrom(cfg));
         constraintApprovals = vc::objects::readFiberConstraintApprovals(reader);
+        annotationCommit = scaffoldAnnotationCommit(reader);
     }
     const double readSeconds = seconds(readStarted);
 
@@ -377,11 +386,14 @@ int run(const std::string& configPath)
                        {"manual_family", graph.report.manualFamily},
                        {"automatic_family", graph.report.automaticFamily},
                        {"filtered_family", graph.report.filteredFamily},
+                       {"filtered_subset", graph.report.filteredSubset},
                        {"short_fibers", graph.report.shortFibers},
                        {"links", graph.report.links},
                        {"piece_approval_rows", graph.report.pieceApprovalRows},
                        {"line_points", std::int64_t(graph.linePoints.size() / 3)},
-                       {"umbilicus_points", std::int64_t(graph.umbilicus.size())}}},
+                       {"umbilicus_points", std::int64_t(graph.umbilicus.size())},
+                       {"commit_sequence", graph.source.commitSequence},
+                       {"annotation_commit", annotationCommit}}},
         {"manual_links", linkReportJson(result.linkReport)},
         {"solve", Json{{"constraints", std::int64_t(result.constraints.size())},
                        {"arcs", std::int64_t(result.arcs.size())},

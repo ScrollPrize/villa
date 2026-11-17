@@ -69,6 +69,8 @@ enum class ScaffoldHandednessSource { Option, Store, Fallback };
 struct ScaffoldLoadReport {
     std::int64_t fiberRecords = 0, fibers = 0, untagged = 0, manualFamily = 0, automaticFamily = 0,
                  filteredFamily = 0, shortFibers = 0, links = 0, linkRecords = 0, pieceApprovalRows = 0;
+    // Fiber records the load's `fiberSubset` left out.
+    std::int64_t filteredSubset = 0;
     ScaffoldHandednessSource handednessSource = ScaffoldHandednessSource::Store;
 };
 
@@ -112,7 +114,20 @@ struct ScaffoldLoadOptions {
     // solve leaves them out).
     bool includeUntagged = false;
     bool readPieceApprovals = true;
+    // Load only these fibers (by UUID), empty for all of them. This is how a
+    // run is restricted to one part of the annotation - the map's selected
+    // network: the other fibers are not loaded at all, so no link, crossing
+    // or normal of theirs enters the run, and its components are the
+    // components of the subset.
+    std::vector<std::string> fiberSubset;
 };
+
+// The store commit that last changed anything a scaffold run reads: a fiber
+// record, one of their links, or an umbilicus. A run whose recorded input
+// commit sequence is below this was computed from an annotation that has
+// changed since. A run's own output is extension rows, which change no
+// record, so saving a run does not move this.
+std::int64_t scaffoldAnnotationCommit(const objects::StoreReader&);
 
 // Throws std::invalid_argument when the store states no handedness, holds no
 // umbilicus for the frame, or mixes annotation frames.

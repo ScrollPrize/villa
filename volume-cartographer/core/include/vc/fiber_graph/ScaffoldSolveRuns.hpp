@@ -56,6 +56,10 @@ ScaffoldRunRows scaffoldSolveRunRows(const ScaffoldGraph&, const ScaffoldSolveRe
 
 struct ScaffoldStoredRun {
     std::string runUuid, stage, method, settingsJson;
+    // The store state the run read, as it recorded it (role "input_0"). A run
+    // whose generation or commit sequence is behind the store's own was
+    // computed from an annotation that has changed since.
+    objects::ExtensionSource input;
     // Metric rows of the run, by name (scope "all").
     std::map<std::string, double> metrics;
     std::map<std::string, std::int64_t> counts;

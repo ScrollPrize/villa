@@ -96,7 +96,9 @@ ScaffoldRunRows scaffoldSolveRunRows(const ScaffoldGraph& graph, const ScaffoldS
         {"link_state_count", std::int64_t(states.size())},
         {"lemon_capacity_scale", options.flow.capacityScale},
         {"fix_approved_subgraphs", options.fixApprovedSubgraphs},
-        {"max_alternative_paths", options.maxAlternativePaths}};
+        {"max_alternative_paths", options.maxAlternativePaths},
+        // A restricted run says so: the fibers its scope left out.
+        {"scope_excluded_fibers", graph.report.filteredSubset}};
     // The measured stages, when the run ran them. A run without them is a
     // links-only run and says so by the absence of these keys.
     if (stages.normalOptions) {
@@ -108,6 +110,7 @@ ScaffoldRunRows scaffoldSolveRunRows(const ScaffoldGraph& graph, const ScaffoldS
         settings.emplace("normals_approved_pieces", stages.normalOptions->approvedNormalPieces);
         settings.emplace("normals_adjacent_links", stages.normalOptions->adjacentLinkAnchors);
         settings.emplace("normals_anchor_weight", stages.normalOptions->anchorWeight);
+        settings.emplace("normals_prediction_chunk", std::int64_t(stages.normalOptions->predictionChunkPoints));
     }
     if (stages.eventOptions) {
         settings.emplace("events_resample_spacing", stages.eventOptions->resampleSpacing);
@@ -220,6 +223,14 @@ ScaffoldRunRows scaffoldSolveRunRows(const ScaffoldGraph& graph, const ScaffoldS
     if (stages.measured) {
         count("measured_events_used", stages.measured->used, "events");
         count("measured_without_distance", stages.measured->withoutDistance, "events");
+        // Why the rest were dropped, so the gap between the crossings read
+        // and the relations used is accounted for rather than implied. A
+        // family mismatch means the pair's geometry and their H/V tags
+        // disagree, which is a tagging question, not a measurement one.
+        count("measured_skipped_invalid", stages.measured->skippedInvalid, "events");
+        count("measured_skipped_untagged", stages.measured->skippedUntagged, "events");
+        count("measured_skipped_self", stages.measured->skippedSelf, "events");
+        count("measured_skipped_family_mismatch", stages.measured->skippedFamilyMismatch, "events");
         count("enclosure_pairs", stages.measured->enclosurePairs, "fiber_pairs");
         count("enclosure_one_sided", stages.measured->enclosureOneSided, "fiber_pairs");
         count("enclosure_contradictory", stages.measured->enclosureContradictory, "fiber_pairs");
@@ -310,6 +321,15 @@ std::vector<ScaffoldStoredRun> readScaffoldRuns(const objects::StoreReader& read
         entry.settingsJson = runs.text(row, "settings");
         if (stage.empty() || entry.stage == stage) out.push_back(std::move(entry));
     });
+    const Columns inputs(FiberGraphTable::Inputs);
+    for (auto& entry : out) {
+        scanRun(reader, FiberGraphTable::Inputs, entry.runUuid, [&](const ExtensionRow& row) {
+            if (inputs.text(row, "role") != "input_0") return;
+            entry.input.storeUuid = inputs.uuid(row, "store_uuid");
+            entry.input.generation = inputs.uuid(row, "generation_uuid");
+            entry.input.commitSequence = inputs.integer(row, "commit_sequence");
+        });
+    }
     const Columns metrics(FiberGraphTable::Metrics);
     for (auto& entry : out) {
         scanRun(reader, FiberGraphTable::Metrics, entry.runUuid, [&](const ExtensionRow& row) {
