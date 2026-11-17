@@ -32,7 +32,7 @@ def test_volume_export_includes_available_normals(tmp_path, monkeypatch, normal,
         output = tmp_path / fmt / 'prediction.lasagna.json'
         infer.run_fiber_trace_3d_inference(
             input_path=str(source), output_path=output, checkpoint=checkpoint,
-            output_format=fmt, device='cpu', no_download=True, base_ref=str(base), base_scale=0,
+            output_format=fmt, device='cpu', base_ref=str(base), base_scale=0,
             tile_size=16, overlap=0, border=0,
             levels=3, ome_chunk=4, flush_workers=0, accumulator_workers=0,
             inference_precision='off',
@@ -41,8 +41,10 @@ def test_volume_export_includes_available_normals(tmp_path, monkeypatch, normal,
         channels = {c for group in manifest.groups.values() for c in group.channels}
         expected = {'presence', 'nx', 'ny', 'width'}
         if normal:
-            expected |= {'sheet_nx', 'sheet_ny', 'sheet_grad_mag'}
+            expected |= {'sheet_nx', 'sheet_ny'}
         assert channels == expected
+        assert manifest.validity_channel == 'chunks'
+        assert manifest.validity_by_chunks
         provenance = json.loads((output.parent / 'inference.json').read_text())
         schema = provenance['checkpoint']['output_schema']
         assert schema['annotations'] == cfg['annotations']
@@ -54,10 +56,12 @@ def test_volume_export_includes_available_normals(tmp_path, monkeypatch, normal,
         level = 1 if input_scale == 1 else 2
         array = open_zarr(tmp_path / f'compact/prediction.zarr/sd{level}/{level}')
         assert array.shape[1:] == (8,8,8)
-        assert array.shape[0] == array.chunks[0] == 7
-        assert np.any(array[-1] == 255)
+        assert array.shape[0] == array.chunks[0] == 6
         values = array[:]
-        assert np.all(values[:, values[0] == 0] == 0)
+        # Unblanked: encoded normal bytes are never 0 (round(n*127+128) >= 1), so a
+        # zero would only come from presence blanking, which is off by default.
+        assert not manifest.extra_fields['blank_invalid']
+        assert np.all(values[4:6] != 0)
 
 
 @pytest.mark.parametrize('width', [False, True])
@@ -81,7 +85,7 @@ def test_normals_are_explicit_and_preserve_other_outputs(width):
     nx,ny = encode_normal_nxny_u8(*expected[0].numpy())
     np.testing.assert_array_equal(values['sheet_nx'],nx)
     np.testing.assert_array_equal(values['sheet_ny'],ny)
-    assert np.all(values['sheet_grad_mag']==255)
+    assert set(values) == {'sheet_nx', 'sheet_ny'}
     with pytest.raises(ValueError,match='invalid normal'):
         new.finalize_product_slab(new.output_products[-1], np.full((6,2,2,2),np.nan))
 

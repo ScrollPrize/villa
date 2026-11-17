@@ -26,7 +26,7 @@ vc-reader = { path = "../vc_reader", editable = true }
 vc_fiberlets = "vc.fiberlets_cli:main"
 
 [tool.scikit-build]
-cmake.version = ">=3.22"
+cmake.version = ">=3.28"
 wheel.packages = []
 
 [tool.scikit-build.cmake.define]

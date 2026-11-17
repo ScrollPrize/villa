@@ -33,6 +33,9 @@ all = [
 vc-reader = "vc_reader.cli:main"
 
 [tool.scikit-build]
+# CUDA targets use the CUDA20 dialect, which needs a CMake newer than Ubuntu 22.04's 3.22;
+# scikit-build-core fetches one that satisfies this.
+cmake.version = ">=3.28"
 # The C++ read path (src/cpp/, module vc_reader._reader); see CMakeLists.txt for system deps.
 minimum-version = "build-system.requires"
 wheel.packages = ["src/vc_reader"]
