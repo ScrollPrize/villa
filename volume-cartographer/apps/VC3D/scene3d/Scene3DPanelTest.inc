@@ -185,6 +185,9 @@ int runScene3DPanelTests()
         auto* zValue = panel.findChild<QDoubleSpinBox*>("scene3DSliceZValue");
         auto* follow = panel.findChild<QCheckBox*>("scene3DFollowMainXY");
         require(zSlider && zValue && follow && follow->isChecked(), "XY position controls center on the mesh initially");
+        // The slice images are produced asynchronously; software GL (the
+        // headless test host) can take a moment to deliver the first one.
+        settle([&] { return !canvas->ctSlices().empty(); });
         const auto original = canvas->ctSlices();
         require(original.size() == 1 && original.front()->plane.axis == 0, "visible mesh shows only the XY slice");
         const auto& xy = original.front()->plane;
