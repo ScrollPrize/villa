@@ -19,8 +19,9 @@ inline std::map<std::string, std::filesystem::path> materializeJsonDocuments(
     QCryptographicHash hash(QCryptographicHash::Sha256);
     for (const auto& [uuid, document] : documents) {
         vc::objects::util::canonicalUuid(uuid);
-        hash.addData(QByteArrayView(uuid.data(), qsizetype(uuid.size())));
-        hash.addData(QByteArrayView(document.data(), qsizetype(document.size())));
+        // Qt 6.2 has no QByteArrayView overload.
+        hash.addData(uuid.data(), qsizetype(uuid.size()));
+        hash.addData(document.data(), qsizetype(document.size()));
     }
     if (!temporary) temporary = std::make_shared<QTemporaryDir>();
     if (!temporary->isValid()) throw std::runtime_error("Cannot create object transport directory");
