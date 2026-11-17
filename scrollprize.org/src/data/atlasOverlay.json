@@ -579,7 +579,7 @@
       "content": null,
       "progress": {
         "patches": null,
-        "textFound": "Scanned",
+        "textFound": "Ink detected",
         "textRank": 0,
         "unrolledPct": 0,
         "score": 0.6
@@ -588,7 +588,7 @@
         "scanned": true,
         "segmented": false,
         "unrolled": false,
-        "ink": false,
+        "ink": true,
         "text": false,
         "furthest": 0,
         "unrolledPct": 0
