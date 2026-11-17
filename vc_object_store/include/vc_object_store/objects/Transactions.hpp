@@ -14,6 +14,7 @@
 // advances the store's commit sequence by one and appends its changes to an
 // ordered feed. A transaction that changes nothing advances nothing.
 
+#include "vc_object_store/objects/Extensions.hpp"
 #include <atomic>
 #include <compare>
 #include <cstddef>
@@ -329,12 +330,21 @@ struct IngestGeometryOp {
 struct LinkObjectsOp { std::string planJson; };
 inline constexpr const char* kLinkObjectsOperation = "link_objects"; // its wire name and preparer key
 
+// Register an extension table (ObjectStore::createExtensionTable: a repeated
+// identical definition is a no-op, a differing one fails) and append rows to
+// an immutable extension table (ObjectStore::appendExtensionRows) within the
+// request's checked transaction. Rows are typed values in declared column
+// order; a duplicate primary key fails the whole request.
+struct CreateExtensionTableOp { ExtensionTable table; };
+struct AppendExtensionRowsOp { std::string table; std::vector<ExtensionRow> rows; };
+
 using TransactionOperation = std::variant<
     CreateObjectOp, UpdateObjectOp, SetMetaOp, RemoveMetaOp, SetApprovalOp,
     RetireObjectOp, RestoreObjectOp, DeleteObjectOp,
     AddEdgeOp, UpdateEdgeOp, RemoveEdgeOp, RetainRelationshipOp, KeepRecordedRelationshipOp,
     PutGeometryOp, EditGeometryOp, EditGeometryRectangleOp, RecordCatalogTransformsOp, SetSurfaceChannelsOp,
-    UpdateGeometryArraysOp, IngestGeometryOp, CheckVolumeMappingOp, LinkObjectsOp>;
+    UpdateGeometryArraysOp, IngestGeometryOp, CheckVolumeMappingOp, LinkObjectsOp,
+    CreateExtensionTableOp, AppendExtensionRowsOp>;
 
 // Wire/command format version, part of every request digest.
 inline constexpr int kTransactionCommandVersion = 3;

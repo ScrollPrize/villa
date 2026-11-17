@@ -14,6 +14,7 @@
 
 #include <limits>
 #include <set>
+#include <span>
 #include <functional>
 
 namespace vc::objects {
@@ -92,6 +93,15 @@ public:
     // Per-point annotations of a sequence array (ObjectStore::geometryPointAnnotations).
     virtual nlohmann::json geometryPointAnnotations(const std::string& revisionUuid, const std::string& arrayName) const = 0;
     virtual int64_t nextGeometryPointId(const std::string& objectUuid, const std::string& arrayName) const = 0;
+    // Rows of an immutable extension table in primary-key order, optionally
+    // under an equality prefix of its key (ObjectStore::scanExtensionRows). A
+    // hosted reader has no extension access and throws.
+    virtual void scanExtensionRows(const std::string& table, const std::function<bool(const ExtensionRow&)>&,
+                                   std::span<const ExtensionValue> keyPrefix = {}) const
+    {
+        (void)table; (void)keyPrefix;
+        throw std::runtime_error("object store: extension rows are not available through this reader");
+    }
     // Keep existing unique IDs; replace negative/duplicate entries with fresh
     // IDs respecting retained history. Call under a checked edit's read snapshot.
     std::vector<int64_t> assignGeometryPointIds(const std::string& objectUuid, const std::string& arrayName,
@@ -221,6 +231,8 @@ public:
                                                int64_t columns) const override;
     nlohmann::json geometryPointAnnotations(const std::string& revisionUuid, const std::string& arrayName) const override;
     int64_t nextGeometryPointId(const std::string& objectUuid, const std::string& arrayName) const override;
+    void scanExtensionRows(const std::string& table, const std::function<bool(const ExtensionRow&)>&,
+                           std::span<const ExtensionValue> keyPrefix = {}) const override;
     VolumeTransforms volumeTransforms() const override;
     std::vector<ObjectRecord> selectObjects(
         const ObjectSelection&, const std::optional<std::vector<std::string>>& fields = std::nullopt) const override;

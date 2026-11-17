@@ -13,6 +13,7 @@
 #include <openssl/evp.h>
 
 #include <algorithm>
+#include <charconv>
 #include <mutex>
 
 namespace vc::objects {
@@ -141,6 +142,94 @@ TransactionRequest requestHeader(const Json& j)
     return request;
 }
 
+// Extension values on the wire: null, JSON integer, JSON float, string, or
+// {"blob": hex}. Integers and reals stay distinct typed values.
+Json extensionValueJson(const ExtensionValue& value)
+{
+    return std::visit([](const auto& v) -> Json {
+        using T = std::decay_t<decltype(v)>;
+        if constexpr (std::is_same_v<T, std::monostate>) return nullptr;
+        else if constexpr (std::is_same_v<T, int64_t>) return v;
+        else if constexpr (std::is_same_v<T, double>) return v;
+        else if constexpr (std::is_same_v<T, std::string>) return v;
+        else {
+            static constexpr char digits[] = "0123456789abcdef";
+            std::string hex;
+            hex.reserve(v.size() * 2);
+            for (const auto byte : v) { hex.push_back(digits[byte >> 4]); hex.push_back(digits[byte & 15]); }
+            return Json{{"blob", hex}};
+        }
+    }, value);
+}
+ExtensionValue extensionValueFrom(const Json& j)
+{
+    if (j.is_null()) return std::monostate{};
+    if (j.is_number_integer()) return j.get<int64_t>();
+    if (j.is_number_float()) return j.get<double>();
+    if (j.is_string()) return j.get<std::string>();
+    if (j.is_object() && j.contains("blob") && j.at("blob").is_string()) {
+        const auto hex = j.at("blob").get<std::string>();
+        if (hex.size() % 2) throw std::invalid_argument("transaction: extension blob hex length");
+        std::vector<uint8_t> bytes(hex.size() / 2);
+        for (size_t i = 0; i < bytes.size(); ++i) {
+            unsigned value = 0;
+            const auto result = std::from_chars(hex.data() + 2 * i, hex.data() + 2 * i + 2, value, 16);
+            if (result.ec != std::errc{} || result.ptr != hex.data() + 2 * i + 2) throw std::invalid_argument("transaction: extension blob hex");
+            bytes[i] = uint8_t(value);
+        }
+        return bytes;
+    }
+    throw std::invalid_argument("transaction: invalid extension value");
+}
+const char* extensionTypeName(ExtensionType type)
+{
+    switch (type) {
+    case ExtensionType::Integer: return "integer";
+    case ExtensionType::Real: return "real";
+    case ExtensionType::Text: return "text";
+    case ExtensionType::Blob: return "blob";
+    }
+    throw std::invalid_argument("transaction: invalid extension column type");
+}
+ExtensionType extensionTypeFrom(const std::string& name)
+{
+    if (name == "integer") return ExtensionType::Integer;
+    if (name == "real") return ExtensionType::Real;
+    if (name == "text") return ExtensionType::Text;
+    if (name == "blob") return ExtensionType::Blob;
+    throw std::invalid_argument("transaction: invalid extension column type " + name);
+}
+Json extensionTableJson(const ExtensionTable& table)
+{
+    auto columns = Json::array();
+    for (const auto& column : table.columns)
+        columns.push_back({{"name", column.name}, {"type", extensionTypeName(column.type)}, {"nullable", column.nullable}});
+    auto indexes = Json::array();
+    for (const auto& index : table.indexes) indexes.push_back({{"columns", index.columns}, {"unique", index.unique}});
+    return {{"name", table.name}, {"extension", table.extension}, {"format_version", table.formatVersion},
+            {"provisioning", Json::parse(table.provisioning)}, {"based_on", Json::parse(extensionSourcesJson(table.basedOn))},
+            {"columns", std::move(columns)}, {"primary_key", table.primaryKey}, {"indexes", std::move(indexes)},
+            {"key_space", table.keySpace}, {"versioned", table.versioned}};
+}
+ExtensionTable extensionTableFrom(const Json& j)
+{
+    ExtensionTable table;
+    table.name = j.at("name").get<std::string>();
+    table.extension = j.at("extension").get<std::string>();
+    table.formatVersion = j.at("format_version").get<int64_t>();
+    table.provisioning = j.at("provisioning").dump();
+    table.basedOn = extensionSourcesFromJson(j.at("based_on").dump());
+    for (const auto& column : j.at("columns"))
+        table.columns.push_back({column.at("name").get<std::string>(), extensionTypeFrom(column.at("type").get<std::string>()),
+                                 column.value("nullable", false)});
+    table.primaryKey = j.at("primary_key").get<std::vector<std::string>>();
+    for (const auto& index : j.at("indexes"))
+        table.indexes.push_back({index.at("columns").get<std::vector<std::string>>(), index.value("unique", false)});
+    table.keySpace = j.value("key_space", std::string());
+    table.versioned = j.value("versioned", false);
+    return table;
+}
+
 class Encoder {
 public:
     explicit Encoder(TransactionPayloads* payloads) : payloads_(payloads) {}
@@ -244,6 +333,17 @@ public:
         auto plan = Json::parse(op.planJson);
         if (!plan.is_object()) throw std::invalid_argument("transaction: link_objects plan is a JSON object");
         return {{"op", kLinkObjectsOperation}, {"plan", std::move(plan)}};
+    }
+    Json operator()(const CreateExtensionTableOp& op) { return {{"op", "create_extension_table"}, {"table", extensionTableJson(op.table)}}; }
+    Json operator()(const AppendExtensionRowsOp& op)
+    {
+        auto rows = Json::array();
+        for (const auto& row : op.rows) {
+            auto values = Json::array();
+            for (const auto& value : row) values.push_back(extensionValueJson(value));
+            rows.push_back(std::move(values));
+        }
+        return {{"op", "append_extension_rows"}, {"table", op.table}, {"rows", std::move(rows)}};
     }
 private:
     Json data(const GeometryData& data)
@@ -414,6 +514,17 @@ TransactionOperation operationFrom(const Json& j, const TransactionPayloads& pay
         const auto& plan = j.at("plan");
         if (!plan.is_object()) throw std::invalid_argument("transaction: link_objects plan is a JSON object");
         return LinkObjectsOp{plan.dump()};
+    }
+    if (op == "create_extension_table") return CreateExtensionTableOp{extensionTableFrom(j.at("table"))};
+    if (op == "append_extension_rows") {
+        AppendExtensionRowsOp result;
+        result.table = j.at("table").get<std::string>();
+        for (const auto& row : j.at("rows")) {
+            ExtensionRow values;
+            for (const auto& value : row) values.push_back(extensionValueFrom(value));
+            result.rows.push_back(std::move(values));
+        }
+        return result;
     }
     throw std::invalid_argument("transaction: unknown operation " + op);
 }
@@ -695,6 +806,8 @@ struct Executor {
     {
         store.updateSurfaceChannels(txn, op.objectUuid, op.channels, op.remove, geometryHead(op.objectUuid), edgeEdits(op));
     }
+    void operator()(const CreateExtensionTableOp& op) { store.createExtensionTable(txn, op.table); }
+    void operator()(const AppendExtensionRowsOp& op) { store.appendExtensionRows(txn, op.table, op.rows); }
     void operator()(const LinkObjectsOp&)
     {
         const auto found = prepared.find(index);

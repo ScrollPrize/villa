@@ -469,6 +469,12 @@ nlohmann::json LocalStoreReader::geometryPointAnnotations(const std::string& rev
     return store_->geometryPointAnnotations(*txn_, revisionUuid, arrayName);
 }
 
+void LocalStoreReader::scanExtensionRows(const std::string& table, const std::function<bool(const ExtensionRow&)>& visitor,
+                                         std::span<const ExtensionValue> keyPrefix) const
+{
+    store_->scanExtensionRows(*txn_, table, visitor, keyPrefix);
+}
+
 std::optional<ObjectRevision> LocalStoreReader::objectAtGeometry(const std::string& uuid) const
 { return store_->objectAtGeometry(*txn_,uuid); }
 VolumeTransforms LocalStoreReader::volumeTransforms() const { return store_->volumeTransforms(*txn_); }
