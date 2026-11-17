@@ -53,10 +53,41 @@ def solve_stage(config, stage, *, data=None, stats=None, return_solution=False):
     unary_weight=weak*a.abs()/n
     unary_constant=weak*(1-a.abs())/(2*n)
     prior_target=((a<0) if stage=='normal_sign' else (a>=0)).to(a.dtype)
+    # fixed_signs (normal_sign only): {"<fiber uuid>": +1|-1} from an independent solution,
+    # e.g. the scaffold's link-propagated signs. Those fibres get that sign as a unary target
+    # with a weight above the total pair weight, so the solve treats them as given.
+    fixed_count=0
+    if stage=='normal_sign' and config.get('fixed_signs'):
+        fixed=json.loads(Path(config['fixed_signs']).read_text())
+        ids=np.asarray(d['ids'],dtype=str);lookup={str(k):int(v) for k,v in fixed.items()}
+        values=np.array([lookup.get(str(fid),0) for fid in ids],dtype=np.int64)
+        mask=tensor(values!=0);signs=tensor(values.astype(np.float32))
+        # Saved signs are in the inward convention (inward_solution negates the raw phase sign):
+        # saved +1 is raw -1, i.e. phase 1.
+        prior_target=torch.where(mask,(signs>0).to(a.dtype),prior_target)
+        unary_weight=torch.where(mask,torch.full_like(unary_weight,float(config.get('fixed_sign_weight',10.))),unary_weight)
+        unary_constant=torch.where(mask,torch.zeros_like(unary_constant),unary_constant)
+        fixed_count=int(mask.sum())
+        phase=torch.where(mask,prior_target,phase)
+        print(json.dumps(dict(stage='normal_sign_fixed_signs',fibers=fixed_count,unknown=len(lookup)-fixed_count)),flush=True)
+    distance=factor=None
     if stage=='normal_sign':
         evidence=tensor(d['dot'])
         target=(evidence<0).to(a.dtype)
-        weight=evidence.abs()/evidence.abs().sum().clamp_min(1e-12)
+        distance=tensor(d['distance']) if 'distance' in d else torch.full_like(evidence,float('nan'))
+        # Defaults: a crossing's weight is dot^2 of its two normal axes times min(1, 1/d^2) of
+        # its measured winding distance (unmeasured distances count as within one winding).
+        mode=config.get('winding_distance_weight','inverse_square')
+        if mode=='none':mode=None
+        measured=int(torch.isfinite(distance).sum())
+        if mode is not None and measured==0:
+            print(json.dumps(dict(stage='normal_sign_weights',note='no measured winding distances; the distance factor is 1 everywhere')),flush=True)
+        factor=normal.winding_distance_factor(distance,mode)
+        power=float(config.get('normal_dot_weight_power',2.))
+        if power<1.:raise ValueError('normal_dot_weight_power must be >= 1')
+        factor=factor*evidence.abs().clamp_min(1e-12)**(power-1.)
+        weight=evidence.abs()*factor
+        weight=weight/weight.sum().clamp_min(1e-12)
         modes=['uniform']
     else:
         evidence=tensor(d['relation'])
@@ -85,7 +116,7 @@ def solve_stage(config, stage, *, data=None, stats=None, return_solution=False):
                 b=_logit(1-k)
                 if stage=='normal_sign':
                     h=_logit(1-p)
-                    m=normal.metrics(h,b,a,i,j,evidence)
+                    m=normal.metrics(h,b,a,i,j,evidence,distance=distance,factor=factor)
                     old=normal.losses(h,b,a,i,j,evidence,weak,float(penalty))[0]
                     m['retained_arc_percent']=float(100*(tensor(d['lengths'])*(k>.5)).sum()/tensor(d['lengths']).sum()) if 'lengths' in d else None
                 else:
@@ -141,7 +172,9 @@ def solve_stage(config, stage, *, data=None, stats=None, return_solution=False):
             if not direct:np.savez(root/f'solution_{name}.npz',**saved)
             if config.get('write_result_store',True):
                 write_results(root/f'solution_{name}.vcobj',[config['database']],stage,'wrapped_irls',{'fibers':rows},
-                              settings=dict(options,broken_penalty=float(penalty),prior_weight=weak,cost_mode=mode))
+                              settings=dict(options,broken_penalty=float(penalty),prior_weight=weak,cost_mode=mode,
+                                            winding_distance_weight=mode,fixed_signs=config.get('fixed_signs'),fixed_sign_count=fixed_count,
+                                            normal_dot_weight_power=float(config.get('normal_dot_weight_power',2.))))
     summary=dict(config=config,input=stats,runs=runs,gpu=torch.cuda.get_device_name(),
         backend='wrapped_irls',peak_allocated_bytes=max(r['peak_allocated_bytes'] for r in runs),
         interpretation='Periodic Huber-L1 relaxation; class scores are not calibrated probabilities; original_expected_objective is the unchanged SGD objective at this state.')

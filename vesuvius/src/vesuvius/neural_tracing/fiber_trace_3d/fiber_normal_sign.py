@@ -29,16 +29,45 @@ def losses(sign_logits, broken_logits, prior, i, j, dot, prior_weight, broken_pe
     return pair + prior_weight*outward + broken_penalty*broken, pair, outward, broken
 
 
-def metrics(u, v, a, i, j, dot):
+STRICT_MAX_ANGLE_DEGREES = 30.   # internal evaluation: nearly parallel normal axes ...
+STRICT_MAX_WINDING_DISTANCE = 1.  # ... on crossings less than one winding apart
+
+
+def winding_distance_factor(distance, mode):
+    """Per-event weight factor from the measured winding distance: ``inverse_square`` gives
+    min(1, 1/d^2) (1 within one winding, 1/4 at two, 1/9 at three); an unmeasured (NaN)
+    distance keeps 1. ``None`` disables the factor."""
     import torch
+    if mode is None:
+        return torch.ones_like(distance)
+    if mode != 'inverse_square':
+        raise ValueError('winding_distance_weight must be inverse_square or none')
+    d = distance.abs()
+    factor = torch.where(torch.isfinite(d) & (d > 1.), 1./(d*d).clamp_min(1e-12), torch.ones_like(d))
+    return factor
+
+
+def metrics(u, v, a, i, j, dot, distance=None, factor=None):
+    """Event-weighted agreement (weight |dot| times the winding-distance factor), plus the
+    unweighted internal evaluation over nearly parallel normals within one winding."""
+    import torch, math
     with torch.no_grad():
         s = torch.where(u >= 0, 1., -1.)
         kept = (v[i] < 0) & (v[j] < 0)
         wrong = dot*s[i]*s[j] < 0
-        weight = dot.abs()
+        weight = dot.abs() if factor is None else dot.abs()*factor
         denominator = weight.sum().clamp_min(1e-12)
         kept_weight = weight[kept].sum()
         retained_error = 100*weight[kept & wrong].sum()/kept_weight if kept_weight > 0 else None
+        strict = {}
+        if distance is not None:
+            close = dot.abs() > math.cos(math.radians(STRICT_MAX_ANGLE_DEGREES))
+            near = torch.isfinite(distance) & (distance.abs() < STRICT_MAX_WINDING_DISTANCE)
+            sel = close & near
+            selected = int(sel.sum())
+            strict = dict(strict_events=selected,
+                          strict_disagreement_percent=float(100*(wrong & sel).sum()/max(selected, 1)),
+                          strict_retained_disagreement_percent=float(100*(wrong & sel & kept).sum()/max(int((sel & kept).sum()), 1)))
         return dict(broken_fibers_percent=float(100*(v>=0).float().mean()),
                     expected_broken_percent=float(100*v.sigmoid().mean()),
                     retained_events_percent=float(100*kept.float().mean()) if kept.numel() else None,
@@ -46,7 +75,8 @@ def metrics(u, v, a, i, j, dot):
                     weighted_disagreement_retained_percent=float(retained_error) if retained_error is not None else None,
                     retained_disagreement_original_weight_percent=float(100*weight[kept & wrong].sum()/denominator),
                     outward_agreement=float((a*s).mean()),
-                    uncertain_signs_percent=float(100*((u.sigmoid()>.1)&(u.sigmoid()<.9)).float().mean()))
+                    uncertain_signs_percent=float(100*((u.sigmoid()>.1)&(u.sigmoid()<.9)).float().mean()),
+                    **strict)
 
 
 def prepare(config, *, graph=None, return_arrays=False, prior=None):
@@ -81,11 +111,15 @@ def prepare(config, *, graph=None, return_arrays=False, prior=None):
     if not np.isfinite(dot).all() or np.any(abs(dot)>1.000001):
         raise ValueError('Invalid normal dot products')
     dot=np.clip(dot,-1,1)
+    # Measured winding distance per event (NaN when the extractor measured none);
+    # the solve can weight events by it and the strict metric selects on it.
+    distance=np.asarray(graph.distance[valid],dtype=np.float32)
     data=dict(ids=ids,lengths=graph.lengths.copy() if return_arrays else graph.lengths,
-              prior=a,i=indices[:,0],j=indices[:,1],dot=dot,event_ids=event_ids)
+              prior=a,i=indices[:,0],j=indices[:,1],dot=dot,distance=distance,event_ids=event_ids)
     degree=np.bincount(indices.ravel(),minlength=len(ids))
     stats=dict(signature=signature,fibers=len(ids),perpendicular_events=total,
                used_events=len(dot),invalid_events_skipped=total-len(dot),
+               events_with_winding_distance=int(np.isfinite(distance).sum()),
                isolated_fibers=int((degree==0).sum()),tensor_bytes=0,
                seconds=time.monotonic()-started)
     if return_arrays:return data,stats

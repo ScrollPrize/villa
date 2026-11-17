@@ -91,3 +91,25 @@ def test_cached_tensor_identity_and_invalid_edges(tmp_path):
     prior.write_text(json.dumps(dict(payload,source_store=dict(graph.source,commit_sequence=-1))))
     with pytest.raises(ValueError,match='another store snapshot'):
         prepare(config)
+
+
+def test_winding_distance_factor_and_strict_metric():
+    torch=pytest.importorskip('torch')
+    from vesuvius.neural_tracing.fiber_trace_3d.fiber_normal_sign import winding_distance_factor, metrics
+    distance=torch.tensor([0.5,1.,2.,3.,float('nan')])
+    factor=winding_distance_factor(distance,'inverse_square')
+    assert torch.allclose(factor,torch.tensor([1.,1.,.25,1/9,1.]))
+    assert torch.equal(winding_distance_factor(distance,None),torch.ones(5))
+    with pytest.raises(ValueError):winding_distance_factor(distance,'linear')
+    # Three fibres, four crossings; fibre 2 is signed against the others.
+    u=torch.tensor([3.,3.,-3.]);v=torch.full((3,),-3.);a=torch.zeros(3)
+    i=torch.tensor([0,0,1,1]);j=torch.tensor([1,2,2,2])
+    dot=torch.tensor([.95,.95,.95,.5])          # the last crossing's axes differ by 60 degrees
+    distance=torch.tensor([0.5,0.5,2.,0.5])     # the third crossing is two windings away
+    m=metrics(u,v,a,i,j,dot,distance=distance,factor=winding_distance_factor(distance,'inverse_square'))
+    # strict set: nearly parallel (<30 deg) and within one winding -> crossings 0 and 1; crossing 1 disagrees.
+    assert m['strict_events']==2 and m['strict_disagreement_percent']==pytest.approx(50.)
+    # weighted: wrong crossings 1,2,3 with weights .95, .95/4, .5 over the total .95+.95+.2375+.5
+    assert m['weighted_disagreement_all_percent']==pytest.approx(100*(.95+.2375+.5)/(.95+.95+.2375+.5))
+    plain=metrics(u,v,a,i,j,dot)
+    assert 'strict_events' not in plain and plain['weighted_disagreement_all_percent']==pytest.approx(100*(.95+.95+.5)/(.95*3+.5))
