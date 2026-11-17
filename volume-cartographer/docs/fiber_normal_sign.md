@@ -43,8 +43,9 @@ winding distance is below one turn), so runs compare directly.
 
 ## Backends
 
-`FiberSignBackend::Irls` reproduces the reference stage: each step reweights
-the wrapped residuals into a quadratic, solves it with Jacobi-preconditioned
+`FiberSignBackend::Irls` is the default, which the measurements below support,
+and reproduces the reference stage: each step reweights the wrapped residuals
+into a quadratic, solves it with Jacobi-preconditioned
 conjugate gradients (`cgIterations`, `cgTolerance`), takes one bounded keep
 update and backtracks whenever the periodic objective fails to improve. Five
 steps whose improvement stays below `tolerance` end the solve.
@@ -53,7 +54,8 @@ steps whose improvement stays below `tolerance` end the solve.
 and lets a sparse trust-region solver move the phases: one residual per
 crossing with an analytic Jacobian, under a Huber loss scaled per block so the
 Ceres cost equals the pair and prior terms exactly (`ScaledLoss(Huber(eps),
-w/eps)` on the unscaled residual). Keep is held during a solve; `keepRounds`
+w/eps)` on the unscaled residual), with `linearSolver` defaulting to sparse
+Cholesky of the normal equations. Keep is held during a solve; `keepRounds`
 alternations of (phase solve, keep update) follow, and a round that raises the
 periodic objective is rolled back. `iterations` caps the trust-region steps per
 round.
