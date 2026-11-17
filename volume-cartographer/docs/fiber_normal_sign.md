@@ -68,7 +68,7 @@ constraint store (`database`), its radial priors (`priors`, a
 `fiber-outward-priors` document) and optional `fixed_signs`, and writes the
 summary, the per-fiber signs and the prepared events as JSON. Option keys
 mirror the stage's (`backend`, `threads`, `epsilon`, `iterations`,
-`cg_iterations`, `keep_rounds`, `prior_weight`, `broken_penalty`,
+`cg_iterations`, `keep_rounds`, `ceres_linear_solver`, `prior_weight`, `broken_penalty`,
 `fixed_sign_weight`, `winding_distance_weight`, `normal_dot_weight_power`,
 `fixed_keep`).
 
@@ -101,10 +101,39 @@ gets there by rejecting 38% of the fibers where the others reject 30%, and 63
 of its 293 signs differ. A lower value of this objective is not a better sign
 field, which is why the scaffold workflow solves the signs with `fixedKeep`.
 
-A note on both tunables this exposes. The Ceres backend used
-`SPARSE_NORMAL_CHOLESKY` with SuiteSparse and honored its thread count, but a
-scaffold is far too small to pay for threads: it took 0.108, 0.128 and 0.140
-seconds at 1, 8 and 16 threads. The native IRLS backend splits its loops into
+The Ceres backend's `linearSolver` picks how each trust-region step is solved.
+Measured on the same scaffold, signs only, step cap 2,000, one thread (eight
+threads is slower throughout, see below):
+
+| ceres_linear_solver | solve seconds | steps | objective | strict disagreement % | signs differing from the IRLS |
+| --- | --- | --- | --- | --- | --- |
+| `sparse_normal_cholesky` | 0.260 | 247 | 0.24754727 | 19.556 | 0 of 293 |
+| `dense_schur` | 0.343 | 247 | 0.24754727 | 19.556 | 0 of 293 |
+| `sparse_schur` | 0.361 | 247 | 0.24754727 | 19.556 | 0 of 293 |
+| `iterative_schur` | 0.697 | 281 | 0.24672191 | 18.667 | 272 of 293 |
+| `cgnr` | 0.728 | 286 | 0.24682922 | 18.667 | 272 of 293 |
+| `dense_normal_cholesky` | 4.047 | 247 | 0.24754727 | 19.556 | 0 of 293 |
+| `dense_qr` | 10.438 | 247 | 0.24754727 | 19.556 | 0 of 293 |
+
+Every exact factorization lands on the same solution as the IRLS backend. The
+dense forms are not a shortcut at this size: they densify the whole Jacobian
+(about 2,200 residuals by 293 fibers per step), and only `dense_schur`, whose
+Schur complement is small, stays competitive.
+
+The two iterative solvers are the interesting result. They reach a lower
+objective (7e-4 below the factorizations), a lower strict disagreement (18.667%
+against 19.556% of 450 crossings) and a radial agreement of +0.079 against
+-0.006, so they end in the better-aligned gauge; 272 of the 293 signs differ
+from the factorized solution. The objective is not convex, so an inexact step
+can leave a local minimum the exact step stays in. Nothing here promises that
+the better optimum is the correct sign field, but it does mean the solution the
+reference stage reports on this store is not the best one its own objective
+admits.
+
+A note on both tunables this exposes. The Ceres backend honored its
+thread count and used SuiteSparse for the sparse forms, but a scaffold is far
+too small to pay for threads: `sparse_normal_cholesky` took 0.260 seconds at one
+thread and 0.303 at eight, and every other solver above also lost time. The native IRLS backend splits its loops into
 work units of 4,096 entries, so a problem of this size is one unit and runs
 serially whatever `threads` says (0.058, 0.058 and 0.063 seconds at 1, 8 and
 16): the parallel path only engages well above ten thousand fibers or

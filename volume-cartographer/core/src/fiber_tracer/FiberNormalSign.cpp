@@ -616,7 +616,34 @@ void solveCeres(Problem& problem, const FiberSignOptions& options, FiberSignResu
                 &problem.phase[v]);
         }
         ceres::Solver::Options solverOptions;
-        solverOptions.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
+        switch (options.linearSolver) {
+            case FiberSignLinearSolver::SparseSchur:
+                solverOptions.linear_solver_type = ceres::SPARSE_SCHUR;
+                break;
+            case FiberSignLinearSolver::IterativeSchur:
+                solverOptions.linear_solver_type = ceres::ITERATIVE_SCHUR;
+                solverOptions.preconditioner_type = ceres::SCHUR_JACOBI;
+                break;
+            case FiberSignLinearSolver::Cgnr:
+                solverOptions.linear_solver_type = ceres::CGNR;
+                solverOptions.preconditioner_type = ceres::JACOBI;
+                break;
+            case FiberSignLinearSolver::DenseNormalCholesky:
+                solverOptions.linear_solver_type = ceres::DENSE_NORMAL_CHOLESKY;
+                break;
+            case FiberSignLinearSolver::DenseQr:
+                solverOptions.linear_solver_type = ceres::DENSE_QR;
+                break;
+            case FiberSignLinearSolver::DenseSchur:
+                solverOptions.linear_solver_type = ceres::DENSE_SCHUR;
+                break;
+            case FiberSignLinearSolver::SparseNormalCholesky:
+            default:
+                solverOptions.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
+                break;
+        }
+        // A Schur form needs an independent set of fibers to eliminate; with no
+        // ordering given Ceres computes one from the graph itself.
         solverOptions.sparse_linear_algebra_library_type =
             ceres::IsSparseLinearAlgebraLibraryTypeAvailable(ceres::SUITE_SPARSE) ? ceres::SUITE_SPARSE
                                                                                   : ceres::EIGEN_SPARSE;

@@ -59,8 +59,25 @@ enum class FiberSignBackend { Irls, Ceres };
 // as within one winding. None drops the factor.
 enum class FiberSignDistanceWeight { InverseSquare, None };
 
+// The Ceres backend's linear solver. The quadratic is a graph Laplacian with
+// one scalar per fiber: the sparse forms factorize it directly, the Schur forms
+// eliminate an automatically chosen independent set of fibers first, the dense
+// forms ignore the sparsity (worth it only for a few thousand fibers, such as a
+// manual scaffold) and Cgnr is conjugate gradients on the normal equations, the
+// same family as the IRLS backend's inner solve. Ignored by the IRLS backend.
+enum class FiberSignLinearSolver {
+    SparseNormalCholesky,
+    SparseSchur,
+    IterativeSchur,
+    Cgnr,
+    DenseNormalCholesky,
+    DenseQr,
+    DenseSchur
+};
+
 struct FiberSignOptions {
     FiberSignBackend backend = FiberSignBackend::Irls;
+    FiberSignLinearSolver linearSolver = FiberSignLinearSolver::SparseNormalCholesky;
     FiberSignDistanceWeight distanceWeight = FiberSignDistanceWeight::InverseSquare;
     // Crossing weight |dot|^dotWeightPower; at least 1.
     double dotWeightPower = 2.0;

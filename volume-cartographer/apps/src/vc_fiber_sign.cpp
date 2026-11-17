@@ -56,6 +56,16 @@ FiberSignOptions optionsFrom(const Json& cfg)
     if (backend == "irls") options.backend = FiberSignBackend::Irls;
     else if (backend == "ceres") options.backend = FiberSignBackend::Ceres;
     else throw std::invalid_argument("backend must be irls or ceres");
+    const auto solver = cfg.value("ceres_linear_solver", std::string{"sparse_normal_cholesky"});
+    if (solver == "sparse_normal_cholesky") options.linearSolver = FiberSignLinearSolver::SparseNormalCholesky;
+    else if (solver == "sparse_schur") options.linearSolver = FiberSignLinearSolver::SparseSchur;
+    else if (solver == "iterative_schur") options.linearSolver = FiberSignLinearSolver::IterativeSchur;
+    else if (solver == "cgnr") options.linearSolver = FiberSignLinearSolver::Cgnr;
+    else if (solver == "dense_normal_cholesky") options.linearSolver = FiberSignLinearSolver::DenseNormalCholesky;
+    else if (solver == "dense_qr") options.linearSolver = FiberSignLinearSolver::DenseQr;
+    else if (solver == "dense_schur") options.linearSolver = FiberSignLinearSolver::DenseSchur;
+    else throw std::invalid_argument("ceres_linear_solver must be sparse_normal_cholesky, sparse_schur, "
+                                     "iterative_schur, cgnr, dense_normal_cholesky, dense_qr or dense_schur");
     const auto distance = cfg.value("winding_distance_weight", std::string{"inverse_square"});
     if (distance == "inverse_square") options.distanceWeight = FiberSignDistanceWeight::InverseSquare;
     else if (distance == "none") options.distanceWeight = FiberSignDistanceWeight::None;
@@ -79,6 +89,7 @@ FiberSignOptions optionsFrom(const Json& cfg)
 Json optionsJson(const Json& cfg, const FiberSignOptions& options)
 {
     return Json{{"backend", cfg.value("backend", std::string{"irls"})},
+                {"ceres_linear_solver", cfg.value("ceres_linear_solver", std::string{"sparse_normal_cholesky"})},
                 {"winding_distance_weight", cfg.value("winding_distance_weight", std::string{"inverse_square"})},
                 {"normal_dot_weight_power", options.dotWeightPower},
                 {"prior_weight", options.priorWeight},
