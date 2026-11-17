@@ -4,7 +4,7 @@
 #include <QOffscreenSurface>
 #include <QOpenGLContext>
 #include <QOpenGLFramebufferObject>
-#include <QTest>
+#include "support/QtTestCompat.hpp"
 #include <stdexcept>
 
 using namespace vc3d::fibers3d;
