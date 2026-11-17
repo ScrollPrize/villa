@@ -200,6 +200,20 @@ add_library(vc_fiber_tracer
 target_link_libraries(vc_fiber_tracer PUBLIC vc_core vc_lasagna PRIVATE Eigen3::Eigen Ceres::ceres)
 target_link_libraries(vc_fiber_tracer PRIVATE ${CMAKE_DL_LIBS})
 
+# Scaffold winding solves for the fiber map: store loading, manual link and
+# measured arc assembly, the LEMON min-cost-flow solve and its residual
+# analysis. No Qt, no sampling; VC3D and the CLI call the same library.
+add_library(vc_fiber_graph_solve
+    src/fiber_graph/ScaffoldGraph.cpp
+    src/fiber_graph/ScaffoldWindingSolve.cpp
+    src/fiber_graph/ScaffoldSolveRuns.cpp
+)
+target_include_directories(vc_fiber_graph_solve PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_features(vc_fiber_graph_solve PUBLIC cxx_std_20)
+target_link_libraries(vc_fiber_graph_solve PUBLIC vc_core vc_object_store::vc_geometry
+    PRIVATE nlohmann_json::nlohmann_json)
+set_target_properties(vc_fiber_graph_solve PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 # Optional backend; CPU builds do not need a CUDA toolkit.
 option(VC_BUILD_FIBER_CHUNK_CUDA "Build resident CUDA chunk tracing backend" OFF)
 if(VC_BUILD_FIBER_CHUNK_CUDA)
