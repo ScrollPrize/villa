@@ -220,6 +220,8 @@ Every following table name begins with `ext_fiber_graph_solve`. Multiple runs sh
 | `_positions` | `fiber_uuid, run_uuid, layer, hypothesis, node_index` | Arc position, optional constraint UUID/source endpoint, continuous U in turns and/or U/V in base voxels |
 | `_relations` | `edge_uuid, run_uuid, layer, evaluation_index` | Inclusion, endpoint hypotheses, fulfillment/sign result, probabilities, meeting weight, required/realized step, winding/U/V residuals and loss |
 | `_metrics` | `run_uuid, iteration, scope, name` | One floating value or integer count, with units |
+| `_residuals` | `run_uuid, residual_index` | One violated constraint of a winding run: kind, both fibers and anchor arcs, optional link UUID, target, weight, residual, and the shortest cycle it lies on (hops, total piece length, how many edge-disjoint alternatives were found) |
+| `_residual_pieces` | `run_uuid, residual_index, member_index` | A fiber stretch that residual's cycle runs along: fiber UUID, arc range, optional control-point range and the piece's share of the violated costs |
 
 Fiber-owned tables route with object UUIDs and relation results with edge UUIDs. Run-oriented tables are not object aliases; each run/input/width/metric record is stored once in a chosen database and found by ordinary collection scans. Run-to-fiber and run-to-edge indexes support lookup from the result as well as from its source entity.
 
@@ -230,6 +232,8 @@ For numerical stage setup, `CollectionReader.fiber_result_columns(run_uuid)` ret
 `fiberGraphSolveRow` constructs rows by named fields, fills omitted nullable values with NULL, and rejects missing required fields, unknown fields, wrong types and invalid scalar/vector conventions. UUID values are binary. Family codes are H=0, V=1, broken=2; NULL means unresolved. Normal sign is −1 or +1, flags are 0/1 and probabilities lie in [0,1]. Invalid normal samples can omit their XYZ values; a valid normal requires all three coordinates. These builders validate representation; they do not normalize probabilities, invent normals or perform optimization. Hot bulk paths can supply the same declared column order directly.
 
 `p_h`, `p_v` and `p_broken` are joint classification probabilities (not H/V probabilities conditional on being enabled). `selected_probability` and `_hypotheses.probability` are winding probabilities conditional on being enabled; `joint_probability` includes disablement. An explicit `enabled` flag records the output selection rather than imposing a probability threshold in storage. Sample directions and normal axes are in the fiber's core XYZ coordinate frame. `normal_sign` is the whole-fiber multiplier applied to the locally aligned sample axes; `sign_probability` is the probability of multiplier +1, not an inward/outward label. A downstream stage can reference the sampling/classification run through `_inputs` instead of repeating its rows.
+
+`_residuals` rows are ranked within their run: `residual_index` 0 is the most expensive violation. A violated constraint whose two fibers are not otherwise connected lies on no cycle and leaves `cycle_hops`, `cycle_piece_length` and `redundancy` NULL together; a row with one of them must have all three. `redundancy` counts the edge-disjoint alternative paths a run looked for, so it is at least 1 whenever a cycle was found and is capped by the solve's own setting. `_residual_pieces` names the stretches between the constraints that enter and leave each fiber of that cycle; `control_from`/`control_to` are NULL when the fiber has no control point inside the range. These rows are a solver's ranking of its own violations, not a verdict about the annotation.
 
 Metrics use exactly one of `value` or `count`. For example, a mean residual and its sample count are two separately named metrics, not a floating value with an overloaded count field. Missing metrics stay absent/NULL rather than pretending to be zero.
 
@@ -266,6 +270,10 @@ with results.write() as tx:
     for row in rows:
         tx.append_extension_rows(row["table"], [row["values"]])
 ```
+
+The Python table roles are the suffixes without their underscore: `runs`,
+`inputs`, `fibers`, `samples`, `hypotheses`, `widths`, `positions`,
+`relations`, `metrics`, `residuals` and `residual_pieces`.
 
 Use a new run UUID for another independently saved result/checkpoint. Metric progression can be appended under the same run UUID at distinct iterations. The definitions provision the full data path; existing solver/checkpoint producers are not automatically migrated to these new tables.
 

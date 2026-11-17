@@ -16,8 +16,9 @@ const std::string sourceUuid = "10000000-0000-4000-8000-000000000001";
 const std::string lineageUuid = "20000000-0000-4000-8000-000000000001";
 const std::array<std::string,2> runUuids{
     "30000000-0000-4000-8000-000000000001", "30000000-0000-4000-8000-000000000002"};
-const std::array<Table,9> tables{Table::Runs, Table::Inputs, Table::FiberResults, Table::Samples,
-    Table::Hypotheses, Table::Widths, Table::Positions, Table::ConstraintResults, Table::Metrics};
+const std::array<Table,11> tables{Table::Runs, Table::Inputs, Table::FiberResults, Table::Samples,
+    Table::Hypotheses, Table::Widths, Table::Positions, Table::ConstraintResults, Table::Metrics,
+    Table::Residuals, Table::ResidualPieces};
 
 size_t column(Table kind, const std::string& name)
 {
@@ -81,6 +82,8 @@ InitialExtensionRow relationRow(const std::string& edge, size_t run)
         {"u_error_vx", 2.5}, {"v_error_vx", 1.5}, {"loss", 8.5}});
 }
 
+void residualRanking();
+
 void definitionsAndValidation()
 {
     const auto source = fiberSourceExtension(FiberSourceInfo{sourceUuid, std::string(64, 'a'), 2, 100});
@@ -117,6 +120,44 @@ void definitionsAndValidation()
         {"run_uuid", extensionUuid(runUuids[0])}, {"normal_sign", int64_t(0)}}); });
     mustFail([&] { fiberGraphSolveRow(Table::Widths, {{"run_uuid", std::string(runUuids[0])},
         {"winding", int64_t(5)}, {"width_vx", 9000.0}}); });
+    residualRanking();
+}
+
+// A winding run's violated constraints and the cycle stretches they accuse.
+void residualRanking()
+{
+    const std::map<std::string, ExtensionValue> residual{{"run_uuid", extensionUuid(runUuids[0])},
+        {"residual_index", int64_t(0)}, {"kind", int64_t(0)}, {"fiber_a", extensionUuid(sourceUuid)},
+        {"fiber_b", extensionUuid(lineageUuid)}, {"target", int64_t(-1)}, {"weight", 1.0}, {"residual", 1.0}};
+    const auto localized = [&](std::map<std::string, ExtensionValue> fields) {
+        auto all = residual;
+        for (auto& [name, value] : fields) all[name] = value;
+        return fiberGraphSolveRow(Table::Residuals, all);
+    };
+    // A violation that no cycle localizes keeps every cycle field NULL.
+    const auto alone = localized({});
+    require(std::holds_alternative<std::monostate>(alone.values[column(Table::Residuals, "cycle_hops")]) &&
+            std::holds_alternative<std::monostate>(alone.values[column(Table::Residuals, "redundancy")]),
+            "a residual on no cycle stores no cycle description");
+    (void)localized({{"cycle_hops", int64_t(3)}, {"cycle_piece_length", 120.}, {"redundancy", int64_t(2)}});
+    // Partial cycle descriptions, impossible counts and negative measures are
+    // rejected rather than stored as a half-known ranking.
+    mustFail([&] { localized({{"cycle_hops", int64_t(3)}}); });
+    mustFail([&] { localized({{"cycle_hops", int64_t(3)}, {"cycle_piece_length", 120.}}); });
+    mustFail([&] { localized({{"cycle_hops", int64_t(1)}, {"cycle_piece_length", 120.}, {"redundancy", int64_t(1)}}); });
+    mustFail([&] { localized({{"cycle_hops", int64_t(3)}, {"cycle_piece_length", -1.}, {"redundancy", int64_t(1)}}); });
+    mustFail([&] { localized({{"cycle_hops", int64_t(3)}, {"cycle_piece_length", 1.}, {"redundancy", int64_t(0)}}); });
+    mustFail([&] { localized({{"residual", -1.}}); });
+    mustFail([&] { localized({{"kind", int64_t(-1)}}); });
+    const std::map<std::string, ExtensionValue> piece{{"run_uuid", extensionUuid(runUuids[0])},
+        {"residual_index", int64_t(0)}, {"member_index", int64_t(1)}, {"fiber_uuid", extensionUuid(sourceUuid)},
+        {"arc_from", 10.}, {"arc_to", 90.}, {"score", 0.5}};
+    const auto member = fiberGraphSolveRow(Table::ResidualPieces, piece);
+    require(member.table == "ext_fiber_graph_solve_residual_pieces" &&
+            std::holds_alternative<std::monostate>(member.values[column(Table::ResidualPieces, "control_from")]),
+            "a cycle stretch without a control point inside it stores NULL, not a sentinel index");
+    mustFail([&] { auto fields = piece; fields["arc_to"] = -1.; return fiberGraphSolveRow(Table::ResidualPieces, fields); });
+    mustFail([&] { auto fields = piece; fields["member_index"] = int64_t(-1); return fiberGraphSolveRow(Table::ResidualPieces, fields); });
 }
 
 void multipleRuns()
@@ -164,7 +205,7 @@ void multipleRuns()
         priorRun = {status.storeUuid, status.generation, status.commitSequence};
     }
     auto txn = store.read();
-    require(store.extensionTables(txn).size() == 11 && store.objectCount(txn, "fiber", true) == 2,
+    require(store.extensionTables(txn).size() == 2 + tables.size() && store.objectCount(txn, "fiber", true) == 2,
             "multiple runs share core fibers instead of creating result proxy objects");
     for (size_t run = 0; run < runUuids.size(); ++run) {
         for (const auto& expected : fiberRows(firstFiber, edgeUuid, run)) {

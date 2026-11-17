@@ -106,6 +106,27 @@ ExtensionTable fiberGraphSolveTable(FiberGraphTable kind)
         table.indexes = {{{"run_uuid", "edge_uuid"}, false},
                          {{"run_uuid", "included", "sign_violation"}, false}};
         break;
+    case FiberGraphTable::Residuals:
+        table.name = std::string(kFiberGraphSolveExtension) + "_residuals";
+        table.columns = {required("run_uuid", Type::Blob), required("residual_index", Type::Integer),
+            required("kind", Type::Integer), required("fiber_a", Type::Blob), required("fiber_b", Type::Blob),
+            required("target", Type::Integer), required("weight", Type::Real), required("residual", Type::Real),
+            optional("edge_uuid", Type::Blob), optional("arc_a", Type::Real), optional("arc_b", Type::Real),
+            optional("cycle_hops", Type::Integer), optional("cycle_piece_length", Type::Real),
+            optional("redundancy", Type::Integer)};
+        table.primaryKey = {"run_uuid", "residual_index"};
+        table.indexes = {{{"run_uuid", "residual"}, false}, {{"run_uuid", "cycle_hops"}, false}};
+        break;
+    case FiberGraphTable::ResidualPieces:
+        table.name = std::string(kFiberGraphSolveExtension) + "_residual_pieces";
+        table.columns = {required("run_uuid", Type::Blob), required("residual_index", Type::Integer),
+            required("member_index", Type::Integer), required("fiber_uuid", Type::Blob),
+            required("arc_from", Type::Real), required("arc_to", Type::Real),
+            optional("control_from", Type::Integer), optional("control_to", Type::Integer),
+            optional("score", Type::Real)};
+        table.primaryKey = {"run_uuid", "residual_index", "member_index"};
+        table.indexes = {{{"run_uuid", "fiber_uuid"}, false}};
+        break;
     case FiberGraphTable::Metrics:
         table.name = std::string(kFiberGraphSolveExtension) + "_metrics";
         table.columns = {required("run_uuid", Type::Blob), required("iteration", Type::Integer),
@@ -177,10 +198,22 @@ void validateFiberGraphField(const ExtensionColumn& column,const ExtensionValue&
         if(std::get<int64_t>(value)!=0&&std::get<int64_t>(value)!=1)
             throw std::invalid_argument("fiber graph: binary flag must be 0 or 1");
     if(column.name=="iteration"||column.name=="commit_sequence"||column.name=="count"||
-       column.name=="node_index"||column.name=="sample_index"||column.name=="evaluation_index")
+       column.name=="node_index"||column.name=="sample_index"||column.name=="evaluation_index"||
+       column.name=="residual_index"||column.name=="member_index"||column.name=="kind"||
+       column.name=="control_from"||column.name=="control_to")
         if(std::get<int64_t>(value)<0)throw std::invalid_argument("fiber graph: negative count/index");
-    if(column.name=="arc"||column.name=="anchor_arc"||column.name=="winding_sigma")
+    if(column.name=="arc"||column.name=="anchor_arc"||column.name=="winding_sigma"||
+       column.name=="arc_a"||column.name=="arc_b"||column.name=="arc_from"||column.name=="arc_to"||
+       column.name=="cycle_piece_length"||column.name=="score")
         if(std::get<double>(value)<0)throw std::invalid_argument("fiber graph: negative arc/uncertainty");
+    // A residual is a count of windings; a cycle has at least two
+    // constraints, and a cycle found at all has at least one alternative.
+    if(column.name=="residual"||column.name=="weight")
+        if(std::get<double>(value)<0)throw std::invalid_argument("fiber graph: negative residual/weight");
+    if(column.name=="cycle_hops"&&std::get<int64_t>(value)<2)
+        throw std::invalid_argument("fiber graph: a cycle needs at least two constraints");
+    if(column.name=="redundancy"&&std::get<int64_t>(value)<1)
+        throw std::invalid_argument("fiber graph: redundancy counts the paths found, at least one");
     if(column.name=="width_vx"&&std::get<double>(value)<=0)
         throw std::invalid_argument("fiber graph: width must be positive");
 }
@@ -219,6 +252,11 @@ InitialExtensionRow fiberGraphSolveRow(FiberGraphTable kind,
         }
         if (std::get<int64_t>(fields.at("normal_valid")) && !present("normal_x"))
             throw std::invalid_argument("fiber graph: valid normal requires coordinates");
+    }
+    if (kind == FiberGraphTable::Residuals) {
+        const auto cycle = present("cycle_hops");
+        if (cycle != present("redundancy") || cycle != present("cycle_piece_length"))
+            throw std::invalid_argument("fiber graph: a residual's cycle needs hops, length and redundancy together");
     }
     if (kind == FiberGraphTable::Positions) {
         if (std::get<int64_t>(fields.at("layer")) == int64_t(FiberGraphLayer::Shared) &&

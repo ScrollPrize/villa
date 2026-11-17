@@ -26,7 +26,8 @@ vo::FiberGraphTable fiberGraphTableFromPy(const std::string& name)
     const std::map<std::string, Table> names = {{"runs", Table::Runs}, {"inputs", Table::Inputs},
         {"fibers", Table::FiberResults}, {"samples", Table::Samples}, {"hypotheses", Table::Hypotheses},
         {"widths", Table::Widths}, {"positions", Table::Positions}, {"relations", Table::ConstraintResults},
-        {"metrics", Table::Metrics}};
+        {"metrics", Table::Metrics}, {"residuals", Table::Residuals},
+        {"residual_pieces", Table::ResidualPieces}};
     const auto found = names.find(name);
     if (found == names.end()) throw std::invalid_argument("unknown fiber graph table role: " + name);
     return found->second;

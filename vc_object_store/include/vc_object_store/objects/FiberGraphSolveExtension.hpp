@@ -10,7 +10,11 @@ class CollectionTxn;
 // create only sources/constraints; solve writers create the tables they use.
 enum class FiberGraphTable {
     Runs, Inputs, FiberResults, Samples, Hypotheses, Widths, Positions,
-    ConstraintResults, Metrics
+    ConstraintResults, Metrics,
+    // One row per violated constraint of a winding run, and the fiber
+    // stretches its shortest cycle runs along. Written by scaffold solves so
+    // the approval tools and Python read the same ranking.
+    Residuals, ResidualPieces
 };
 enum class FiberGraphLayer : int64_t { Shared = 0, Intermediate = 1, Final = 2, Refined = 3 };
 
