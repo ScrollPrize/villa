@@ -125,6 +125,35 @@ them back through any StoreReader; Python reads the same rows through
 `CollectionReader.extension_rows` and the `residuals` / `residual_pieces`
 table roles.
 
+## In the fiber map
+
+Three docks (`FiberMapScaffoldSolve.hpp`, with the Qt-free ranking in
+`FiberMapScaffoldRanking.hpp`):
+
+- **Graph solver.** Which links a run uses (by review state, and whether
+  automatic links count), the link weight, the LEMON backend and *fix approved
+  subgraphs* (on by default). The solve runs in the frame the map was built in
+  and on its own worker; the store's umbilicus states the winding handedness,
+  and only when it does not does the dock offer the catalog's sense as a
+  fallback. The run is saved in the store, and its one-line report lands in the
+  map's status line.
+- **Solves.** Every run saved in the store, newest first, with its method,
+  fibers, components, weighted L1, violated constraints and largest residual.
+  Selecting one loads its ranking.
+- **Fiber and piece approval.** The selected run's violated constraints and the
+  stretches they accuse, in one table, ordered by *smallest cycle* (then the
+  shorter stretch), *highest cost* (then the shorter cycle and stretch) or
+  *cost per hop*. Selecting a row selects its fibers on the map and draws the
+  stretch; double-clicking a stretch opens it as an approval piece between the
+  control points that bracket it, which is where its geometry and normals are
+  approved. Two switches outline what is already approved: every span with a
+  current geometry approval, the spans whose normals are approved too, and the
+  fibers approved from end to end.
+
+The approval overlays are halos behind the fibers rather than a change of the
+fibers' own colour, so what the map says about a fiber's geometry stays what it
+always said.
+
 ## Measured parity
 
 On the PHerc0332 scaffold store (`objects-v22.vcobj`, 293 fiber records, 292

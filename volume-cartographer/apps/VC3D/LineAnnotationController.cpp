@@ -13510,6 +13510,7 @@ LineAnnotationController::FiberMapSnapshot LineAnnotationController::finishFiber
         // username field: for some fibers the two disagree and the file name
         // is what the fiber panel shows.
         entry.fileName = fiber.fileName;
+        entry.uuid = fiber.uuid;
         const QString stem =
             vc3d::displayStemForFiberFile(QString::fromStdString(fiber.fileName));
         const int separator = stem.indexOf(QLatin1Char('_'));

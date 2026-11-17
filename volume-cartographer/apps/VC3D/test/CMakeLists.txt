@@ -610,6 +610,26 @@ add_test(NAME fiber_map_kollesis COMMAND test_fiber_map_kollesis)
 vc_register_test_target(test_fiber_map_kollesis)
 vc_register_ctest(fiber_map_kollesis test_fiber_map_kollesis)
 
+add_executable(test_fiber_map_scaffold_ranking
+    test_fiber_map_scaffold_ranking.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberMapScaffoldRanking.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberMapScaffoldRanking.hpp)
+
+set_target_properties(test_fiber_map_scaffold_ranking PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+
+target_include_directories(test_fiber_map_scaffold_ranking PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
+target_link_libraries(test_fiber_map_scaffold_ranking PRIVATE
+    vc_fiber_graph_solve
+    Qt6::Core
+    Qt6::Test)
+
+add_test(NAME fiber_map_scaffold_ranking COMMAND test_fiber_map_scaffold_ranking)
+vc_register_test_target(test_fiber_map_scaffold_ranking)
+vc_register_ctest(fiber_map_scaffold_ranking test_fiber_map_scaffold_ranking)
+
 add_executable(test_line_annotation_fiber_deletion
     test_line_annotation_fiber_deletion.cpp
     ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationFiberDeletion.hpp)

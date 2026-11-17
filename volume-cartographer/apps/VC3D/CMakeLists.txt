@@ -80,6 +80,10 @@ set(srcs
     FiberMapGapField.hpp
     FiberMapKollesis.cpp
     FiberMapKollesis.hpp
+    FiberMapScaffoldSolve.cpp
+    FiberMapScaffoldSolve.hpp
+    FiberMapScaffoldRanking.cpp
+    FiberMapScaffoldRanking.hpp
     FiberNetworkLayout.cpp
     FiberMapAutoLink.cpp
     FiberNetworkLayout.hpp
@@ -427,6 +431,7 @@ target_link_libraries(vc3d_app PUBLIC
     vc_fiber_view
     vc_lasagna
     vc_fiber_tracer
+    vc_fiber_graph_solve
     vc_tracer
     Ceres::ceres
     Qt6::Core

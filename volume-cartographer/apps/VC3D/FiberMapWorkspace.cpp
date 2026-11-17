@@ -1,5 +1,7 @@
 #include "FiberMapWorkspace.hpp"
 
+#include "FiberMapScaffoldSolve.hpp"
+
 #include "FiberLengthDisplay.hpp"
 #include "FiberMapRuler.hpp"
 #include "FiberMapRulerMath.hpp"
@@ -253,6 +255,20 @@ constexpr qreal kInterpolatedHighlightWidth = 2.4;
 // subordinate to the selection itself.
 constexpr qreal kNetworkGlowWidthPx = 20.0;
 constexpr int kNetworkGlowAlpha = 70;
+// The approval overlays: a wide halo behind the fibers rather than a change
+// of their own colour, so what the map says about a fiber's geometry stays
+// what it always said. Green for an approved span, a brighter green for one
+// whose normals are approved too, and the same green at double width for a
+// fiber approved from end to end. The selected row's stretch is drawn in the
+// suspect red above the fibers.
+// #AARRGGBB.
+const QColor kApprovedPieceColor(QStringLiteral("#664caf50"));
+const QColor kApprovedNormalsColor(QStringLiteral("#cc8bc34a"));
+const QColor kApprovedFiberColor(QStringLiteral("#404caf50"));
+constexpr qreal kApprovedPieceWidth = 7.0;
+constexpr qreal kApprovedNormalsWidth = 3.0;
+constexpr qreal kApprovedFiberWidth = 14.0;
+constexpr qreal kApprovalSelectionWidth = 5.0;
 constexpr qreal kPanelZ = -3.0;
 // The gap heat map: over the ground, under the winding grid and every fiber.
 constexpr qreal kGapZ = -2.5;
@@ -281,6 +297,8 @@ constexpr int kGapFadeWindingsMax = 7;
 // scene extent - the ring, or both rings of a suspect link, to bring into
 // view (a QRectF, possibly of zero size; unset on every other item).
 constexpr int kErrorExtentRole = Qt::UserRole + 1;
+// Behind the fibers, over the network glow.
+constexpr qreal kApprovalZ = 1.75;
 constexpr qreal kNetworkGlowZ = 1.5;
 constexpr qreal kFiberZ = 2.0;
 constexpr qreal kHighlightZ = 7.0;
@@ -543,6 +561,37 @@ QPainterPath pathForRuns(const vc3d::fiber_map::PlacedFiber& fiber, RunKind kind
         path.moveTo(points.front());
         for (std::size_t i = 1; i < points.size(); ++i) {
             path.lineTo(points[i]);
+        }
+    }
+    return path;
+}
+
+// The drawn curve between two of the fiber's control points, used by the
+// approval overlays. Runs carry their samples' arclength in the layout's own
+// parameterisation, which is also what controlArclength is in, so the range
+// is selected by arclength rather than by sample index.
+QPainterPath pathBetweenControls(const vc3d::fiber_map::PlacedFiber& fiber, std::int64_t from, std::int64_t to)
+{
+    QPainterPath path;
+    if (from < 0 || to <= from || std::size_t(to) >= fiber.controlArclength.size()) return path;
+    const double low = fiber.controlArclength[std::size_t(from)];
+    const double high = fiber.controlArclength[std::size_t(to)];
+    for (std::size_t runIndex = 0; runIndex < fiber.runs.size(); ++runIndex) {
+        const auto& run = fiber.runs[runIndex];
+        const std::vector<QPointF> points = vc3d::fiber_map::displayRunPoints(fiber, runIndex);
+        if (points.size() < 2 || run.arclengths.size() != points.size()) continue;
+        bool open = false;
+        for (std::size_t i = 0; i < points.size(); ++i) {
+            if (run.arclengths[i] < low || run.arclengths[i] > high) {
+                open = false;
+                continue;
+            }
+            if (!open) {
+                path.moveTo(points[i]);
+                open = true;
+            } else {
+                path.lineTo(points[i]);
+            }
         }
     }
     return path;
@@ -1099,6 +1148,52 @@ FiberMapWorkspace::FiberMapWorkspace(CState* state, LineAnnotationController* co
     _fiberDock->setWidget(dockBody);
     addDockWidget(Qt::LeftDockWidgetArea, _fiberDock);
     resizeDocks({_fiberDock}, {360}, Qt::Horizontal);
+
+    // The scaffold solve. The dock only collects settings and shows the run
+    // report; the solve runs in the native library on its own worker and is
+    // saved in the store it solved.
+    _solveController = new vc3d::fiber_map::ScaffoldSolveController(_state, this);
+    _solverPanel = new vc3d::fiber_map::ScaffoldSolverPanel(_solveController, this);
+    _solverDock = new QDockWidget(tr("Graph solver"), this);
+    _solverDock->setObjectName(QStringLiteral("fiberMapSolverDock"));
+    _solverDock->setFeatures(QDockWidget::DockWidgetMovable | QDockWidget::DockWidgetFloatable |
+                             QDockWidget::DockWidgetClosable);
+    _solverDock->setWidget(_solverPanel);
+    addDockWidget(Qt::RightDockWidgetArea, _solverDock);
+    _runsPanel = new vc3d::fiber_map::ScaffoldRunsPanel(_solveController, this);
+    _solvesDock = new QDockWidget(tr("Solves"), this);
+    _solvesDock->setObjectName(QStringLiteral("fiberMapSolvesDock"));
+    _solvesDock->setFeatures(QDockWidget::DockWidgetMovable | QDockWidget::DockWidgetFloatable |
+                             QDockWidget::DockWidgetClosable);
+    _solvesDock->setWidget(_runsPanel);
+    addDockWidget(Qt::RightDockWidgetArea, _solvesDock);
+    resizeDocks({_solverDock, _solvesDock}, {320, 320}, Qt::Horizontal);
+    connect(_solverPanel, &vc3d::fiber_map::ScaffoldSolverPanel::solveRequested, this, [this]() {
+        if (!_solveController || !_solverPanel) return;
+        _solveController->startSolve(_solverPanel->request());
+    });
+    connect(_solveController, &vc3d::fiber_map::ScaffoldSolveController::statusMessage, this,
+            [this](const QString& message) { setOperationStatus(message); });
+    _approvalPanel = new vc3d::fiber_map::ScaffoldApprovalPanel(_solveController, this);
+    _approvalPanel->setLabelLookup([this](const std::string& uuid) -> QString {
+        const auto found = _fiberIdByUuid.find(uuid);
+        if (found == _fiberIdByUuid.end() || !_controller) return {};
+        return _controller->fiberDisplayName(found->second);
+    });
+    _approvalDock = new QDockWidget(tr("Fiber and piece approval"), this);
+    _approvalDock->setObjectName(QStringLiteral("fiberMapApprovalDock"));
+    _approvalDock->setFeatures(QDockWidget::DockWidgetMovable | QDockWidget::DockWidgetFloatable |
+                               QDockWidget::DockWidgetClosable);
+    _approvalDock->setWidget(_approvalPanel);
+    addDockWidget(Qt::RightDockWidgetArea, _approvalDock);
+    connect(_approvalPanel, &vc3d::fiber_map::ScaffoldApprovalPanel::highlightRequested, this,
+            [this](const vc3d::fiber_map::ScaffoldHighlight& highlight) { showScaffoldHighlight(highlight); });
+    connect(_approvalPanel, &vc3d::fiber_map::ScaffoldApprovalPanel::pieceActivated, this,
+            [this](const std::string& fiber, std::int64_t from, std::int64_t to) {
+                openScaffoldPiece(fiber, from, to);
+            });
+    connect(_approvalPanel, &vc3d::fiber_map::ScaffoldApprovalPanel::highlightModeChanged, this,
+            [this]() { rebuildApprovalOverlay(); });
 
     // Match the workaround used by Main's other movable docks. On Wayland,
     // Qt can retain a failed mouse grab after a dock drag and stop delivering
@@ -2075,6 +2170,9 @@ void FiberMapWorkspace::showEvent(QShowEvent* event)
 {
     QMainWindow::showEvent(event);
     if (_focusBoundsDirty) updateFocusBounds();
+    // The store's saved solves are listed the first time the map is opened,
+    // whether or not a layout has been built yet.
+    updateSolveFrame();
     if (_stalePollTimer) {
         _stalePollTimer->start();
     }
@@ -2412,6 +2510,9 @@ void FiberMapWorkspace::publishRebuild(RebuildJobResult& job)
     _gapFieldParams = job.gapParams;
     _layoutUmbilicusDependency = job.preReadUmbilicusDependency;
     _layoutCatalogOrientation = catalogOrientationKey(job.snapshot.catalogVolume);
+    _layoutCatalogHandedness = job.snapshot.catalogVolume
+        ? vc3d::opendata::windingChiralityOf(job.snapshot.catalogVolume->orientation)
+        : std::nullopt;
     _layoutGeneration = job.snapshot.generation;
     _layoutAnnotationVolume = QString::fromStdString(job.snapshot.annotationVolume);
     _layoutPackageGeneration = job.builtPackageGeneration;
@@ -2422,6 +2523,12 @@ void FiberMapWorkspace::publishRebuild(RebuildJobResult& job)
     _restingReason.clear();
     _voxelSizeUm = job.snapshot.voxelSizeUm;
     _fiberLengthVx = std::move(job.fiberLengthVx);
+    // How a stored solve's rows reach this map's fibers. The worker moved the
+    // snapshot's geometry out, but not its identities.
+    _fiberIdByUuid.clear();
+    for (const auto& fiber : job.snapshot.fibers)
+        if (!fiber.uuid.empty()) _fiberIdByUuid.emplace(fiber.uuid, fiber.id);
+    updateSolveFrame();
     // The scale's tooltip notes an assumed voxel size, which this may have
     // just replaced with the package's own.
     updateGapLegend();
@@ -2704,6 +2811,10 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
     // Scene-owned: clear() deletes them.
     _gapTiles.clear();
     _kollesisItems.clear();
+    _approvalItems.clear();
+    _highlightPieceFiber = 0;
+    _highlightPieceFrom = -1;
+    _highlightPieceTo = -1;
     _scene->clear();
 
     // Kept so a theme change can rebuild the scene as it stands, without asking
@@ -2827,6 +2938,7 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
     // The kollesis seams, over the ground and the heat map, under the grid
     // and the fibers.
     rebuildKollesisOverlay();
+    rebuildApprovalOverlay();
 
     // The winding grid, one line per integer winding. The numbers are the
     // top ruler's, which labels whatever is in view; the scene carries only
@@ -3672,6 +3784,127 @@ void FiberMapWorkspace::updateFocusBounds()
         }
     }
     _focusBoundsDirty = false;
+}
+
+// The solve runs in the frame the map was built in: a solve in another frame
+// would place fibers the map cannot draw. The catalog's winding sense is
+// offered as a fallback only; the store's own statement wins.
+void FiberMapWorkspace::updateSolveFrame()
+{
+    if (!_solverPanel || !_solveController) return;
+    _solverPanel->setFrame(_layoutAnnotationVolume.toStdString(), _layoutCatalogHandedness);
+    if (!_solvesLoaded) {
+        _solvesLoaded = true;
+        _solveController->reloadRuns();
+    }
+}
+
+// The approved spans of every fiber, and the stretch the approval dock has
+// selected. Cheap (no solve, no store read), so every switch and every row
+// click calls it.
+void FiberMapWorkspace::rebuildApprovalOverlay()
+{
+    for (QGraphicsItem* item : _approvalItems) {
+        _scene->removeItem(item);
+        delete item;
+    }
+    _approvalItems.clear();
+    if (!_layoutBuilt || _layout.fibers.empty() || !_approvalPanel || !_solveController) return;
+    const auto add = [&](const QPainterPath& path, const QColor& color, qreal width, qreal z) {
+        if (path.isEmpty()) return;
+        auto* item = _scene->addPath(path, cosmeticPen(color, width), Qt::NoBrush);
+        item->setZValue(z);
+        _approvalItems.push_back(item);
+    };
+    const bool fibers = _approvalPanel->highlightApprovedFibers();
+    const bool pieces = _approvalPanel->highlightApprovedPieces();
+    if (fibers || pieces) {
+        for (const auto& [uuid, spans] : _solveController->approvals()) {
+            const auto found = _fiberIdByUuid.find(uuid);
+            if (found == _fiberIdByUuid.end()) continue;
+            const auto entry = _entries.find(found->second);
+            if (entry == _entries.end()) continue;
+            const auto& geometry = spans.approved[0];
+            const auto& normals = spans.approved[1];
+            const bool whole = !geometry.empty() &&
+                std::all_of(geometry.begin(), geometry.end(), [](auto value) { return value != 0; });
+            if (fibers && whole)
+                add(pathBetweenControls(entry->fiber, 0, std::int64_t(entry->fiber.controlArclength.size()) - 1),
+                    kApprovedFiberColor, kApprovedFiberWidth, kApprovalZ);
+            if (!pieces) continue;
+            QPainterPath approved, withNormals;
+            for (std::size_t span = 0; span < geometry.size(); ++span) {
+                if (!geometry[span]) continue;
+                const auto path = pathBetweenControls(entry->fiber, std::int64_t(span), std::int64_t(span) + 1);
+                approved.addPath(path);
+                if (span < normals.size() && normals[span]) withNormals.addPath(path);
+            }
+            add(approved, kApprovedPieceColor, kApprovedPieceWidth, kApprovalZ);
+            add(withNormals, kApprovedNormalsColor, kApprovedNormalsWidth, kApprovalZ);
+        }
+    }
+    if (_highlightPieceFiber != 0 && _highlightPieceFrom >= 0) {
+        const auto entry = _entries.find(_highlightPieceFiber);
+        if (entry != _entries.end())
+            add(pathBetweenControls(entry->fiber, _highlightPieceFrom, _highlightPieceTo), kSuspect,
+                kApprovalSelectionWidth, kHighlightZ);
+    }
+}
+
+void FiberMapWorkspace::showScaffoldHighlight(const vc3d::fiber_map::ScaffoldHighlight& highlight)
+{
+    _highlightPieceFiber = 0;
+    _highlightPieceFrom = -1;
+    _highlightPieceTo = -1;
+    std::vector<uint64_t> fibers;
+    for (const auto& uuid : highlight.fiberUuids) {
+        const auto found = _fiberIdByUuid.find(uuid);
+        if (found == _fiberIdByUuid.end()) continue;
+        if (_entries.find(found->second) == _entries.end()) continue;
+        fibers.push_back(found->second);
+    }
+    if (fibers.empty()) {
+        setOperationStatus(tr("That fiber is not on the map; press Update"));
+        rebuildApprovalOverlay();
+        return;
+    }
+    // The map selects at most two fibers, which is exactly a constraint's pair.
+    if (fibers.size() > 2) fibers.resize(2);
+    if (highlight.controlFrom >= 0) {
+        _highlightPieceFiber = fibers.front();
+        _highlightPieceFrom = highlight.controlFrom;
+        _highlightPieceTo = highlight.controlTo;
+    }
+    setSelectedFibers(fibers);
+    rebuildApprovalOverlay();
+}
+
+void FiberMapWorkspace::openScaffoldPiece(const std::string& fiberUuid, std::int64_t controlFrom,
+                                          std::int64_t controlTo)
+{
+    if (!_controller) return;
+    const auto found = _fiberIdByUuid.find(fiberUuid);
+    if (found == _fiberIdByUuid.end()) {
+        setOperationStatus(tr("That fiber is not on the map; press Update"));
+        return;
+    }
+    const auto fiberId = found->second;
+    const auto controls = _controller->storedControlSummaries(fiberId);
+    if (std::size_t(controlTo) >= controls.size() || controlFrom < 0 || controlTo <= controlFrom) {
+        setOperationStatus(tr("The solve's control range is no longer in that fiber; press Update"));
+        return;
+    }
+    const auto& a = controls[std::size_t(controlFrom)];
+    const auto& b = controls[std::size_t(controlTo)];
+    if (a.storeId < 0 || b.storeId < 0) {
+        setOperationStatus(tr("That stretch's control points are not saved yet"));
+        return;
+    }
+    // Ends in line order; both become lock control points when the piece opens.
+    vc3d::line_annotation::PiecePlan plan;
+    plan.a.storeId = a.storeId;
+    plan.b.storeId = b.storeId;
+    emit openFiberPieceRequested(fiberId, plan);
 }
 
 void FiberMapWorkspace::paintFiberEmphasis(FiberEntry& entry,

@@ -186,6 +186,10 @@ public:
         // Stable identity across loads; anything acted on later is resolved
         // from this.
         std::string fileName;
+        // The store object's UUID, which is how store-side results (solve
+        // runs, approvals) name this fiber. Empty for a fiber that has never
+        // been stored.
+        std::string uuid;
         // "<file prefix>-<sequence>", e.g. "kb-604".
         QString label;
         char hvTag = '?';

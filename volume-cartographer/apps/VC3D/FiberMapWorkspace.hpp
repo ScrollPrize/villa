@@ -15,6 +15,7 @@
 #include <QStringList>
 
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -51,6 +52,15 @@ class QPushButton;
 class QShowEvent;
 class QTimer;
 class QTreeWidget;
+
+namespace vc3d::fiber_map
+{
+class ScaffoldSolveController;
+class ScaffoldSolverPanel;
+class ScaffoldRunsPanel;
+class ScaffoldApprovalPanel;
+struct ScaffoldHighlight;
+}
 class QWheelEvent;
 
 // Pan/zoom view of the fiber map, with the same gestures as the volume viewers:
@@ -150,6 +160,22 @@ protected:
 
 private:
     void updateFocusBounds();
+    // Tells the solver dock which frame the map was built in and what the
+    // catalog says about the winding sense, and refreshes the list of solves.
+    void updateSolveFrame();
+    // Redraws the approval overlays: the approved spans while their highlight
+    // is on, and the stretch or constraint the approval dock has selected.
+    void rebuildApprovalOverlay();
+    // Selects the row's fibers and remembers its control range for the
+    // overlay.
+    void showScaffoldHighlight(const vc3d::fiber_map::ScaffoldHighlight& highlight);
+    // Opens a ranked stretch as an approval piece between its bracketing
+    // control points.
+    void openScaffoldPiece(const std::string& fiberUuid, std::int64_t controlFrom, std::int64_t controlTo);
+    // The approval dock's current row, as a fiber and control range of the
+    // published layout (ids are runtime, so this is cleared with the layout).
+    uint64_t _highlightPieceFiber = 0;
+    std::int64_t _highlightPieceFrom = -1, _highlightPieceTo = -1;
     std::optional<Rect3D> _focusBounds;
     bool _focusBoundsDirty = false;
     // Scene-space copy of the placed fiber (y negated once, so scroll z reads
@@ -440,6 +466,23 @@ private:
     QGraphicsScene* _scene = nullptr;
     QTreeWidget* _tree = nullptr;
     QDockWidget* _fiberDock = nullptr;
+    // The scaffold solve: the solver dock, the list of solves saved in the
+    // store, and the controller that runs and reads them. The solve is the
+    // native library's, run on its own worker; nothing about it is in the
+    // layout's own crossing-evidence solve.
+    vc3d::fiber_map::ScaffoldSolveController* _solveController = nullptr;
+    vc3d::fiber_map::ScaffoldSolverPanel* _solverPanel = nullptr;
+    vc3d::fiber_map::ScaffoldRunsPanel* _runsPanel = nullptr;
+    vc3d::fiber_map::ScaffoldApprovalPanel* _approvalPanel = nullptr;
+    QDockWidget* _solverDock = nullptr;
+    QDockWidget* _solvesDock = nullptr;
+    QDockWidget* _approvalDock = nullptr;
+    // Scene-owned overlays of the approval dock: the approved spans (and the
+    // fibers approved throughout), and the stretch of the selected row.
+    std::vector<QGraphicsItem*> _approvalItems;
+    // Runtime fiber id by store UUID, from the published layout's snapshot:
+    // how a stored solve's rows (which name fibers by UUID) reach the map.
+    std::map<std::string, uint64_t> _fiberIdByUuid;
     QPushButton* _updateButton = nullptr;
     // The dock's search box: a case-insensitive substring filter over each
     // fiber row's label and annotation name, re-applied after every tree
@@ -621,6 +664,11 @@ private:
     QString _layoutAnnotationVolume;
     vc3d::fiber_map::UmbilicusDependency _layoutUmbilicusDependency;
     QString _layoutCatalogOrientation;
+    // The winding sense the catalog states for the published layout's volume,
+    // which the scaffold solve falls back to when the store's umbilicus does
+    // not state one. Unset when the catalog does not orient it.
+    std::optional<int> _layoutCatalogHandedness;
+    bool _solvesLoaded = false;
     // Controller counters as of the build. Compared rather than observed, so that
     // this workspace existing costs annotation work nothing.
     uint64_t _layoutPackageGeneration = 0;
