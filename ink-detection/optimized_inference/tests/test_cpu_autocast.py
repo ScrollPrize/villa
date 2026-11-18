@@ -156,6 +156,22 @@ class TestCPUAutocast(unittest.TestCase):
             enabled = next(k.value for k in calls[0].keywords if k.arg == "enabled")
             self.assertEqual(ast.unparse(enabled), "autocast_enabled(device)")
 
+    def test_onednn_cap_below_native_bf16_uses_fp32(self):
+        # The hardware probe and oneDNN's BF16 query both still say yes under an
+        # AVX512_CORE cap, where BF16 is emulated and slower than FP32.
+        cases = [(None, True), ("AVX512_CORE_BF16", True), ("avx512_core_amx", True),
+                 ("AVX512_CORE", False), ("AVX512_CORE_VNNI", False), ("avx2", False)]
+        for variable in ("ONEDNN_MAX_CPU_ISA", "DNNL_MAX_CPU_ISA"):
+            for cap, expected in cases:
+                env = {} if cap is None else {variable: cap}
+                with self.subTest(variable=variable, cap=cap), _backend(True), \
+                        patch.dict("os.environ", env, clear=False), \
+                        patch.object(device_utils, "_native_cpu_bf16", return_value=True):
+                    if cap is None:
+                        for name in ("ONEDNN_MAX_CPU_ISA", "DNNL_MAX_CPU_ISA"):
+                            device_utils.os.environ.pop(name, None)
+                    self.assertIs(device_utils.autocast_enabled(CPU), expected)
+
 
 if __name__ == "__main__":
     unittest.main()
