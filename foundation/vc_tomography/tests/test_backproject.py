@@ -140,3 +140,41 @@ def test_cpu_cuda_agree_with_a_fan():
         np.testing.assert_allclose(a, b, rtol=1e-4, atol=2e-3 * np.abs(a).max())
     with pytest.raises(ValueError, match="fan"):
         vc_tomography.backproject(sino, angles, ny=8, nx=8, rot_center=150.0, fan=[])
+
+
+@cuda_only
+@pytest.mark.parametrize("interp", [0, 1, 2, 3, 4])
+def test_cuda_tiles_read_the_rows_as_single_pixels_do(interp):
+    """The CUDA backprojector stages, tile by tile, the bins of each row that the tile's pixels read (for bspline3
+    the cubic of every interval) and skips the angles at which a tile lies off the detector. On rows of white noise,
+    where another bin, a bin not staged or a skipped angle shows at once, it gives what the CPU's gives, which reads
+    every pixel on its own: rows oversampled or not, shorter than a tile is wide, a beam that diverges, areas far off
+    the axis, more angles than a pass holds."""
+    rng = np.random.default_rng(10 + interp)
+    cases = [
+        # columns, angles, bins per column, fan per column, the area
+        (300, 333, 1, 0.0, dict(ny=90, nx=110, rot_center=171.3, center=200.0, x0=40, y0=150)),
+        (300, 301, 2, 1.5e-4, dict(ny=70, nx=97, rot_center=171.3, center=200.0, x0=140, y0=30, clip_outer_circle=True, clip_radius=150.0)),
+        (40, 17, 1, 0.0, dict(ny=65, nx=40, rot_center=12.2)),                       # rows shorter than a tile's reach
+        (20, 9, 3, -2e-3, dict(ny=40, nx=33, rot_center=4.7, center=30.0, x0=7, y0=11)),
+        (300, 64, 8, 1.5e-4, dict(ny=33, nx=64, rot_center=150.5, center=31.5, x0=3, y0=1)),
+        (700, 1200, 2, 0.0, dict(ny=64, nx=64, rot_center=500.25, center=400.0, x0=700, y0=650)),   # mostly off the detector
+    ]
+    for cols, n_angles, bins, fan_step, kw in cases:
+        sino = rng.standard_normal((n_angles, cols * bins)).astype(np.float32)
+        angles = rng.uniform(-7, 7, n_angles).astype(np.float32)
+        fan = None if fan_step == 0.0 else list((fan_step * (np.arange(cols) - 0.4 * cols)).astype(np.float32))
+        kw = dict(kw, scale=0.7, interp=interp, u_scale=float(bins), fan=fan)
+        a = vc_tomography.backproject(sino, angles, device="cpu", **kw)
+        b = vc_tomography.backproject(sino, angles, device="cuda", **kw)
+        # (the two round a position apart by a few units in its last place, which on white noise is 1e-5 of a value;
+        # with a fan a position that close to the middle between two columns takes the next column's fan in one of
+        # them: a pixel in thousands, by the fan's step x its depth, here up to 0.05 bins)
+        d = np.abs(a - b) / np.abs(a).max()
+        assert d.max() < 2e-3 and np.quantile(d, 0.99) < 1e-4, (cols, n_angles, bins, fan_step, float(d.max()), float(np.quantile(d, 0.99)))
+        assert np.abs(a).max() > 0
+    # a fan that moves a pixel by more bins than a tile can stage is refused, not read short
+    sino = rng.standard_normal((8, 300 * 8)).astype(np.float32)
+    with pytest.raises(Exception, match="divergence"):
+        vc_tomography.backproject(sino, np.zeros(8, np.float32), ny=64, nx=64, rot_center=150.0, center=2000.0, u_scale=8.0, interp=interp,
+                                  fan=[0.5] * 300, device="cuda")

@@ -146,18 +146,20 @@ HR_HD float reach_lo() { return static_cast<float>(1 - tap_count<K>() - tap_lo<K
 template <int K>
 HR_HD float reach_hi() { return static_cast<float>(-tap_lo<K>()); }
 
-// u within the kernel's reach of the detector (see reach_lo / reach_hi)
+// The cubic spline of the B-spline coefficients c0 .. c3 (those at floor(u) - 1 .. floor(u) + 2) as a polynomial of the
+// fraction w = u - floor(u): a[0] + w (a[1] + w (a[2] + w a[3])). The same value as combine_taps<BSpline3> to
+// rounding; a caller that reads many positions of one interval forms the polynomial once.
+HR_HD void bspline3_polynomial(float c0, float c1, float c2, float c3, float* a) {
+    a[0] = (c0 + 4.f * c1 + c2) * (1.f / 6.f);
+    a[1] = 0.5f * (c2 - c0);
+    a[2] = 0.5f * (c0 + c2) - c1;
+    a[3] = (c3 - c0) * (1.f / 6.f) + 0.5f * (c1 - c2);
+}
+
+// the value of kernel K from its taps v (tap_count<K>() of them, the first at floor(u) + tap_lo<K>()) at the
+// fraction w = u - floor(u)
 template <int K>
-HR_HD float sample_row_reach(const float* row, int n, float u) {
-    const float fu = floorf(u);
-    const float w = u - fu;
-    const int j = static_cast<int>(fu) + tap_lo<K>(), T = tap_count<K>();
-    float v[6];
-    if (j >= 0 && j + T <= n) {   // every tap on the detector
-        for (int t = 0; t < T; ++t) v[t] = row[j + t];
-    } else {
-        for (int t = 0; t < T; ++t) v[t] = tap(row, n, j + t);
-    }
+HR_HD float combine_taps(const float* v, float w) {
     if (K == Linear) {
         return v[0] + w * (v[1] - v[0]);
     } else if (K == Cubic) {
@@ -180,6 +182,21 @@ HR_HD float sample_row_reach(const float* row, int n, float u) {
         }
         return acc / ws;
     }
+}
+
+// u within the kernel's reach of the detector (see reach_lo / reach_hi)
+template <int K>
+HR_HD float sample_row_reach(const float* row, int n, float u) {
+    const float fu = floorf(u);
+    const float w = u - fu;
+    const int j = static_cast<int>(fu) + tap_lo<K>(), T = tap_count<K>();
+    float v[6];
+    if (j >= 0 && j + T <= n) {   // every tap on the detector
+        for (int t = 0; t < T; ++t) v[t] = row[j + t];
+    } else {
+        for (int t = 0; t < T; ++t) v[t] = tap(row, n, j + t);
+    }
+    return combine_taps<K>(v, w);
 }
 
 template <int K>
