@@ -4,6 +4,7 @@ from __future__ import annotations
 import dbm
 import pickle
 import sys
+import types
 from pathlib import Path
 
 import numpy as np
@@ -106,6 +107,20 @@ def test_slab_workers_on_zarr(tmp_path):
     want = _run(tmp_path, 'ref', volume)
     got = _run(tmp_path, 'new', zarr.open_array(str(tmp_path / 'pred.zarr'), mode='r'),
                slab_workers=3, kimimaro_parallel=1)
+    assert _canonical(got) == _canonical(want)
+
+
+def test_spawned_slab_workers_get_the_settings(tmp_path, monkeypatch):
+    # Outside Linux the slab workers are spawned: they import this module afresh, and the parent
+    # hands them its settings. Forced on every OS here. Each of the four settings changes the
+    # tracks of this volume, so a worker that missed one would write other tracks.
+    monkeypatch.setattr(est, 'sys', types.SimpleNamespace(platform='darwin'))
+    volume = _blobs((64, 128, 128), 0.06, 3)
+    opts = dict(downsample_factor=2, dust_threshold=100, max_area_threshold=20_000,
+                path_mode='maximal_chain', kimimaro_parallel=1)
+    want = _run(tmp_path, 'ref', volume, **opts)
+    assert _canonical(want) != _canonical(_run(tmp_path, 'default', volume, kimimaro_parallel=1))
+    got = _run(tmp_path, 'new', volume, slab_workers=2, **opts)
     assert _canonical(got) == _canonical(want)
 
 
