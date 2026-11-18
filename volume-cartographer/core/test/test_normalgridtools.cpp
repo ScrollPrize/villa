@@ -480,7 +480,7 @@ TEST_CASE("fit_umbilicus_along_z: a straight axis is returned as it is")
     CHECK(worstError(fit_umbilicus_along_z(e, slices, 2000.0), slices) < 1e-6);
 }
 
-TEST_CASE("fit_umbilicus_along_z: slices that walked off the axis are outvoted")
+TEST_CASE("fit_umbilicus_along_z: at window 2000, slices that walked off the axis are outvoted")
 {
     // One slice in seven lands 400 voxels off; the others scatter by 20. Over seeds 1-20 the
     // worst slice of the fit, the end slices and the walked-off slices included, is 54.0 voxels
@@ -494,6 +494,31 @@ TEST_CASE("fit_umbilicus_along_z: slices that walked off the axis are outvoted")
         CHECK(robust < 60.0);
         CHECK(plain > 150.0);
     }
+}
+
+TEST_CASE("fit_umbilicus_along_z: at window 500, most slices that walked off keep their own estimate")
+{
+    // The recommended --zfit 500 at one slice every 256 puts one slice each side in the window.
+    // The end slices have 2 estimates in theirs, so they keep their own estimate. Once the
+    // reweighting drops a slice that walked off, its window has fewer than 3 weighted estimates
+    // left, and it keeps its own estimate too. Over seeds 1-20, 120 of the 160 interior walked-off
+    // slices come back unchanged with libstdc++ (125 with libc++). If this starts failing because
+    // they are outvoted, update the --zfit help and the comment at the top of vc_gen_umbilicus.cpp.
+    int kept = 0;
+    for (std::uint32_t seed = 1; seed <= 20; ++seed) {
+        std::vector<double> slices;
+        const auto e = scatteredEstimates(seed, 20.0, 7, 400.0, slices);
+        const auto fit = fit_umbilicus_along_z(e, slices, 500.0);
+        CHECK(fit.front()[0] == e.front()[1]);
+        CHECK(fit.front()[1] == e.front()[2]);
+        CHECK(fit.back()[0] == e.back()[1]);
+        CHECK(fit.back()[1] == e.back()[2]);
+        for (size_t i = 3; i + 1 < e.size(); i += 7) {
+            if (fit[i][0] == e[i][1] && fit[i][1] == e[i][2])
+                ++kept;
+        }
+    }
+    CHECK(kept >= 80);
 }
 
 TEST_CASE("fit_umbilicus_along_z: a window with too few estimates keeps the slice's median")
