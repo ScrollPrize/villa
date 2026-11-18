@@ -11,6 +11,7 @@ set(srcs
     CState.cpp
     OpenedVolumes.cpp
     CState.hpp
+    CoordinateCopy.hpp
     Keybinds.cpp
     Keybinds.hpp
     CWindow.cpp
