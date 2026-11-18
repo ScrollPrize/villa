@@ -73,7 +73,6 @@ class CufftFourierFilter final : public FourierFilter {
         batch_ = static_cast<int>(std::max<size_t>(1, (256u << 20) / item_bytes));
         norm_ = 1.f / static_cast<float>(static_cast<size_t>(rows_) * spec_.pw);
     }
-    ~CufftFourierFilter() override { destroy_plans(); }
 
   protected:
     void on_filter_changed() override {
@@ -91,23 +90,23 @@ class CufftFourierFilter final : public FourierFilter {
         const size_t in_item = static_cast<size_t>(p.ndim == 2 ? p.h * p.w : p.w);
         for (int i0 = 0; i0 < items_total; i0 += batch_) {
             const int n = std::min(batch_, items_total - i0);
-            ensure_plans(n, s);
+            Plans& plans = plans_for(n);
             const size_t n_real = static_cast<size_t>(n) * rows_ * p.pw;
             const size_t n_cplx = static_cast<size_t>(n) * rows_ * nc_;
-            d_real_.resize(std::max(d_real_.size(), n_real));
-            d_cplx_.resize(std::max(d_cplx_.size(), n_cplx));
-            pad_kernel<<<grid_for(n_real), 256, 0, s>>>(in + i0 * in_item, d_real_.data(), n, rows_, p.pw,
+            float* const real = grown(fft_scratch().real[0], n_real);
+            cufftComplex* const cplx = grown(fft_scratch().cplx[0], n_cplx);
+            pad_kernel<<<grid_for(n_real), 256, 0, s>>>(in + i0 * in_item, real, n, rows_, p.pw,
                                                         p.h, p.w, p.pad_top, p.pad_left, p.mode, p.ndim == 2);
             VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
-            cufft_check(cufftExecR2C(fwd_, d_real_.data(), d_cplx_.data()), "R2C");
-            multiply_kernel<<<grid_for(n_cplx), 256, 0, s>>>(d_cplx_.data(), d_filter_.data(),
+            cufft_check(cufftExecR2C(plans.fwd.bind(s), real, cplx), "R2C");
+            multiply_kernel<<<grid_for(n_cplx), 256, 0, s>>>(cplx, d_filter_.data(),
                                                              spec_.filter_imag.empty() ? nullptr : d_filter_imag_.data(),
                                                              rows_ * nc_, n_cplx, norm_);
             VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
-            cufft_check(cufftExecC2R(inv_, d_cplx_.data(), d_real_.data()), "C2R");
+            cufft_check(cufftExecC2R(plans.inv.bind(s), cplx, real), "C2R");
             const int out_rows = p.ndim == 2 ? p.h : 1;
             const size_t n_out = static_cast<size_t>(n) * out_rows * p.w;
-            crop_kernel<<<grid_for(n_out), 256, 0, s>>>(d_real_.data(), out + i0 * in_item, n, rows_, p.pw,
+            crop_kernel<<<grid_for(n_out), 256, 0, s>>>(real, out + i0 * in_item, n, rows_, p.pw,
                                                          out_rows, p.w, p.ndim == 2 ? p.pad_top : 0, p.pad_left);
             VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
         }
@@ -126,13 +125,13 @@ class CufftFourierFilter final : public FourierFilter {
         (void)spectrum_floats();
         for (int i0 = 0; i0 < n_frames; i0 += batch_) {
             const int n = std::min(batch_, n_frames - i0);
-            ensure_plans(n, s);
+            Plans& plans = plans_for(n);
             const size_t n_real = static_cast<size_t>(n) * rows_ * p.pw;
-            d_real_.resize(std::max(d_real_.size(), n_real));
-            pad_kernel<<<grid_for(n_real), 256, 0, s>>>(in + i0 * in_item, d_real_.data(), n, rows_, p.pw, p.h, p.w,
+            float* const real = grown(fft_scratch().real[0], n_real);
+            pad_kernel<<<grid_for(n_real), 256, 0, s>>>(in + i0 * in_item, real, n, rows_, p.pw, p.h, p.w,
                                                         p.pad_top, p.pad_left, p.mode, true);
             VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
-            cufft_check(cufftExecR2C(fwd_, d_real_.data(), spec + i0 * per), "R2C");
+            cufft_check(cufftExecR2C(plans.fwd.bind(s), real, spec + i0 * per), "R2C");
         }
     }
     void inverse(const float* spectrum, float* out, int n_frames, void* stream) override {
@@ -143,66 +142,42 @@ class CufftFourierFilter final : public FourierFilter {
         (void)spectrum_floats();
         for (int i0 = 0; i0 < n_frames; i0 += batch_) {
             const int n = std::min(batch_, n_frames - i0);
-            ensure_plans(n, s);
+            Plans& plans = plans_for(n);
             const size_t n_real = static_cast<size_t>(n) * rows_ * p.pw, n_cplx = static_cast<size_t>(n) * per;
-            d_real_.resize(std::max(d_real_.size(), n_real));
-            d_cplx_.resize(std::max(d_cplx_.size(), n_cplx));
+            float* const real = grown(fft_scratch().real[0], n_real);
+            cufftComplex* const cplx = grown(fft_scratch().cplx[0], n_cplx);
             multiply_copy_kernel<<<grid_for(n_cplx), 256, 0, s>>>(
-                spec + i0 * per, d_cplx_.data(), d_filter_.data(),
+                spec + i0 * per, cplx, d_filter_.data(),
                 spec_.filter_imag.empty() ? nullptr : d_filter_imag_.data(), per, n_cplx, norm_);
             VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
-            cufft_check(cufftExecC2R(inv_, d_cplx_.data(), d_real_.data()), "C2R");
+            cufft_check(cufftExecC2R(plans.inv.bind(s), cplx, real), "C2R");
             const size_t n_out = static_cast<size_t>(n) * out_item;
-            crop_kernel<<<grid_for(n_out), 256, 0, s>>>(d_real_.data(), out + i0 * out_item, n, rows_, p.pw, p.h, p.w,
+            crop_kernel<<<grid_for(n_out), 256, 0, s>>>(real, out + i0 * out_item, n, rows_, p.pw, p.h, p.w,
                                                          p.pad_top, p.pad_left);
             VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
         }
     }
 
   private:
-    // plans by batch size (full passes and the remainder pass of a frame count keep their plans)
-    void ensure_plans(int n, cudaStream_t s) {
-        Plans* hit = nullptr;
+    // plans by batch size (full passes and the remainder pass of a frame count keep their plans); they work in the
+    // thread's shared work area, and the padded frames and their spectra are the thread's shared buffers (cufft_utils.cuh)
+    struct Plans { int n = 0; CufftPlan fwd, inv; };
+    Plans& plans_for(int n) {
         for (auto& p : plans_)
-            if (p.n == n) { hit = &p; break; }
-        if (!hit) {
-            if (plans_.size() >= 4) {
-                cufftDestroy(plans_.front().fwd);
-                cufftDestroy(plans_.front().inv);
-                plans_.erase(plans_.begin());
-            }
-            Plans p;
-            p.n = n;
-            if (spec_.ndim == 2) {
-                int dims[2] = {spec_.ph, spec_.pw};
-                cufft_check(cufftPlanMany(&p.fwd, 2, dims, nullptr, 1, 0, nullptr, 1, 0, CUFFT_R2C, n), "plan R2C");
-                cufft_check(cufftPlanMany(&p.inv, 2, dims, nullptr, 1, 0, nullptr, 1, 0, CUFFT_C2R, n), "plan C2R");
-            } else {
-                int dims[1] = {spec_.pw};
-                cufft_check(cufftPlanMany(&p.fwd, 1, dims, nullptr, 1, 0, nullptr, 1, 0, CUFFT_R2C, n), "plan R2C");
-                cufft_check(cufftPlanMany(&p.inv, 1, dims, nullptr, 1, 0, nullptr, 1, 0, CUFFT_C2R, n), "plan C2R");
-            }
-            plans_.push_back(p);
-            hit = &plans_.back();
-        }
-        fwd_ = hit->fwd;
-        inv_ = hit->inv;
-        cufft_check(cufftSetStream(fwd_, s), "set stream");
-        cufft_check(cufftSetStream(inv_, s), "set stream");
+            if (p.n == n) return p;
+        if (plans_.size() >= 4) plans_.erase(plans_.begin());
+        Plans p;
+        p.n = n;
+        int dims[2] = {spec_.ph, spec_.pw};
+        const int rank = spec_.ndim == 2 ? 2 : 1;
+        p.fwd.make(rank, dims + (2 - rank), CUFFT_R2C, n, "plan R2C");
+        p.inv.make(rank, dims + (2 - rank), CUFFT_C2R, n, "plan C2R");
+        plans_.push_back(std::move(p));
+        return plans_.back();
     }
-    void destroy_plans() {
-        for (auto& p : plans_) {
-            cufftDestroy(p.fwd);
-            cufftDestroy(p.inv);
-        }
-        plans_.clear();
-    }
-    struct Plans { int n = 0; cufftHandle fwd = 0, inv = 0; };
     std::vector<Plans> plans_;
 
-    DeviceBuffer<float> d_filter_, d_filter_imag_, d_real_;
-    DeviceBuffer<cufftComplex> d_cplx_;
-    cufftHandle fwd_ = 0, inv_ = 0;
+    DeviceBuffer<float> d_filter_, d_filter_imag_;
     int batch_ = 1, rows_ = 1;
     size_t nc_ = 0;
     float norm_ = 1.f;

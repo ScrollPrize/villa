@@ -34,26 +34,28 @@ __global__ void crop_scale_kernel(const float* in, float* out, int n_rows, int m
     VC_TOMOGRAPHY_GRID_STRIDE(k, total)
         out[k] = in[(k / m) * Lo + k % m] * s;
 }
+// The rows are transformed kUpsampleBatch at a time (a sinogram of tens of thousands of rows would otherwise hold
+// its padded and oversampled copies and their spectra whole); a plan per batch size: the full batches' and the last
+// one's. (The plans work in the thread's shared work area; the rows and their spectra are its shared buffers:
+// cufft_utils.cuh)
+constexpr int kUpsampleBatch = 4096;
 struct Upsampler {
-    int n_rows = 0, L = 0, os = 0;
-    cufftHandle fwd = 0, inv = 0;
-    DeviceBuffer<float> a, b;
-    DeviceBuffer<cufftComplex> A, B;
-    ~Upsampler() { release(); }
-    void release() {
-        if (fwd) { cufftDestroy(fwd); cufftDestroy(inv); fwd = inv = 0; }
-    }
-    void ensure(int rows, int l, int o) {
-        if (rows == n_rows && l == L && o == os) return;
-        release();
-        n_rows = rows; L = l; os = o;
+    int L = 0, os = 0;
+    struct Plans { int rows = 0; CufftPlan fwd, inv; };
+    std::vector<Plans> plans;
+    Plans& plans_for(int rows, int l, int o) {
+        if (l != L || o != os) plans.clear();
+        L = l; os = o;
+        for (auto& p : plans)
+            if (p.rows == rows) return p;
+        if (plans.size() >= 2) plans.erase(plans.begin());
+        Plans p;
+        p.rows = rows;
         int nl = L, nlo = L * os;
-        cufft_check(cufftPlanMany(&fwd, 1, &nl, nullptr, 1, 0, nullptr, 1, 0, CUFFT_R2C, rows), "plan R2C");
-        cufft_check(cufftPlanMany(&inv, 1, &nlo, nullptr, 1, 0, nullptr, 1, 0, CUFFT_C2R, rows), "plan C2R");
-        a.ensure(static_cast<size_t>(rows) * L);
-        b.ensure(static_cast<size_t>(rows) * L * os);
-        A.ensure(static_cast<size_t>(rows) * (L / 2 + 1));
-        B.ensure(static_cast<size_t>(rows) * (L * os / 2 + 1));
+        p.fwd.make(1, &nl, CUFFT_R2C, rows, "plan R2C");
+        p.inv.make(1, &nlo, CUFFT_C2R, rows, "plan C2R");
+        plans.push_back(std::move(p));
+        return plans.back();
     }
 };
 
@@ -80,19 +82,14 @@ __global__ void shift_phase_kernel(cufftComplex* A, int n_rows, int nc, int L, f
 // time, the last, incomplete batch through `tail`).
 struct RowShifter {
     int L = 0, batch = 0;
-    cufftHandle fwd = 0, inv = 0;
+    CufftPlan fwd, inv;
     DeviceBuffer<float> tail;
-    ~RowShifter() { release(); }
-    void release() {
-        if (fwd) { cufftDestroy(fwd); cufftDestroy(inv); fwd = inv = 0; }
-    }
     void ensure(int l, int b) {
         if (l == L && b == batch) return;
-        release();
         L = l; batch = b;
         int n = L, real = 2 * (L / 2 + 1), cplx = L / 2 + 1;
-        cufft_check(cufftPlanMany(&fwd, 1, &n, &real, 1, real, &cplx, 1, cplx, CUFFT_R2C, batch), "plan R2C (shift)");
-        cufft_check(cufftPlanMany(&inv, 1, &n, &cplx, 1, cplx, &real, 1, real, CUFFT_C2R, batch), "plan C2R (shift)");
+        fwd.make(1, &n, &real, 1, real, &cplx, 1, cplx, CUFFT_R2C, batch, "plan R2C (shift)");
+        inv.make(1, &n, &cplx, 1, cplx, &real, 1, real, CUFFT_C2R, batch, "plan C2R (shift)");
         tail.ensure(static_cast<size_t>(batch) * real);
         VC_TOMOGRAPHY_CUDA_CHECK(cudaMemset(tail.data(), 0, static_cast<size_t>(batch) * real * sizeof(float)));
     }
@@ -106,8 +103,6 @@ void shift_rows(float* rows, int n_rows, int n, float shift, void* stream, const
     thread_local ThreadScratch scratch(U);
     const int L = upsample_fft_length(n), S = shift_row_stride(n), nc = L / 2 + 1;
     U.ensure(L, 4096);
-    cufft_check(cufftSetStream(U.fwd, s), "stream");
-    cufft_check(cufftSetStream(U.inv, s), "stream");
     shift_bridge_kernel<<<grid_for(static_cast<size_t>(n_rows) * (L - n)), 256, 0, s>>>(rows, n_rows, n, L, S);
     for (int r0 = 0; r0 < n_rows; r0 += U.batch) {
         const int nr = std::min(U.batch, n_rows - r0);
@@ -117,11 +112,11 @@ void shift_rows(float* rows, int n_rows, int n, float shift, void* stream, const
             w = U.tail.data();
             VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpyAsync(w, a, static_cast<size_t>(nr) * S * sizeof(float), cudaMemcpyDeviceToDevice, s));
         }
-        cufft_check(cufftExecR2C(U.fwd, w, reinterpret_cast<cufftComplex*>(w)), "R2C (shift)");
+        cufft_check(cufftExecR2C(U.fwd.bind(s), w, reinterpret_cast<cufftComplex*>(w)), "R2C (shift)");
         const int np = w == a ? nr : U.batch;   // (every row of `tail`: its spare rows must stay bounded)
         shift_phase_kernel<<<grid_for(static_cast<size_t>(np) * nc), 256, 0, s>>>(reinterpret_cast<cufftComplex*>(w), np, nc, L, shift,
                                                                                     shifts ? shifts + r0 : nullptr, nr);
-        cufft_check(cufftExecC2R(U.inv, reinterpret_cast<cufftComplex*>(w), w), "C2R (shift)");
+        cufft_check(cufftExecC2R(U.inv.bind(s), reinterpret_cast<cufftComplex*>(w), w), "C2R (shift)");
         if (w != a)
             VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpyAsync(a, w, static_cast<size_t>(nr) * S * sizeof(float), cudaMemcpyDeviceToDevice, s));
     }
@@ -170,18 +165,13 @@ __global__ void resample_gather_kernel(const double* g, float* rows, int n_rows,
 // the oversampled transform back, in batches as RowShifter's, and the kernel's factors
 struct RowResampler {
     int L = 0, batch = 0;
-    cufftHandle inv = 0;
+    CufftPlan inv;
     DeviceBuffer<double> grid, factor, kernel;
-    ~RowResampler() { release(); }
-    void release() {
-        if (inv) { cufftDestroy(inv); inv = 0; }
-    }
     void ensure(int n, int l, int b) {
         if (l == L && b == batch) return;
-        release();
         L = l; batch = b;
         int m = resample_oversampling * L, cplx = m / 2 + 1, real = 2 * cplx;
-        cufft_check(cufftPlanMany(&inv, 1, &m, &cplx, 1, cplx, &real, 1, real, CUFFT_Z2D, batch), "plan Z2D (resample)");
+        inv.make(1, &m, &cplx, 1, cplx, &real, 1, real, CUFFT_Z2D, batch, "plan Z2D (resample)");
         grid.ensure(static_cast<size_t>(batch) * real);
         const std::vector<double> f = resample_deconvolution(n);
         factor.upload(f.data(), f.size());
@@ -201,8 +191,6 @@ void resample_rows_at(float* rows, int n_rows, int n, const double* positions, c
     const int M = resample_oversampling * L, nco = M / 2 + 1, So = 2 * nco;
     U.ensure(L, 4096);
     V.ensure(n, L, U.batch);
-    cufft_check(cufftSetStream(U.fwd, s), "stream");
-    cufft_check(cufftSetStream(V.inv, s), "stream");
     shift_bridge_kernel<<<grid_for(static_cast<size_t>(n_rows) * (L - n)), 256, 0, s>>>(rows, n_rows, n, L, S);
     for (int r0 = 0; r0 < n_rows; r0 += U.batch) {
         const int nr = std::min(U.batch, n_rows - r0);
@@ -213,11 +201,11 @@ void resample_rows_at(float* rows, int n_rows, int n, const double* positions, c
             VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpyAsync(w, a, static_cast<size_t>(nr) * S * sizeof(float), cudaMemcpyDeviceToDevice, s));
             VC_TOMOGRAPHY_CUDA_CHECK(cudaMemsetAsync(w + static_cast<size_t>(nr) * S, 0, static_cast<size_t>(U.batch - nr) * S * sizeof(float), s));
         }
-        cufft_check(cufftExecR2C(U.fwd, w, reinterpret_cast<cufftComplex*>(w)), "R2C (resample)");
+        cufft_check(cufftExecR2C(U.fwd.bind(s), w, reinterpret_cast<cufftComplex*>(w)), "R2C (resample)");
         cufftDoubleComplex* B = reinterpret_cast<cufftDoubleComplex*>(V.grid.data());
         resample_spread_kernel<<<grid_for(static_cast<size_t>(U.batch) * nco), 256, 0, s>>>(reinterpret_cast<cufftComplex*>(w), B, U.batch,
                                                                                          nc, nco, L, V.factor.data());
-        cufft_check(cufftExecZ2D(V.inv, B, V.grid.data()), "Z2D (resample)");
+        cufft_check(cufftExecZ2D(V.inv.bind(s), B, V.grid.data()), "Z2D (resample)");
         resample_gather_kernel<<<grid_for(static_cast<size_t>(nr) * ((n + resample_block - 1) / resample_block)), 256, 0, s>>>(
             V.grid.data(), a, nr, n, S, So, M, positions ? positions + static_cast<size_t>(r0) * n : nullptr, row ? row + r0 : nullptr, geo,
             V.kernel.data());
@@ -258,16 +246,21 @@ void upsample_rows(const float* in, float* out, int n_rows, int n, int os, void*
     thread_local Upsampler U;
     thread_local ThreadScratch scratch(U);
     const int L = upsample_fft_length(n);
-    U.ensure(n_rows, L, os);
-    cufft_check(cufftSetStream(U.fwd, s), "stream");
-    cufft_check(cufftSetStream(U.inv, s), "stream");
-    pad_rows_kernel<<<grid_for(static_cast<size_t>(n_rows) * L), 256, 0, s>>>(in, U.a.data(), n_rows, n, L);
-    cufft_check(cufftExecR2C(U.fwd, U.a.data(), U.A.data()), "R2C");
-    spread_spectrum_kernel<<<grid_for(static_cast<size_t>(n_rows) * (L * os / 2 + 1)), 256, 0, s>>>(
-        U.A.data(), U.B.data(), n_rows, L / 2 + 1, L * os / 2 + 1, L);
-    cufft_check(cufftExecC2R(U.inv, U.B.data(), U.b.data()), "C2R");
-    crop_scale_kernel<<<grid_for(static_cast<size_t>(n_rows) * n * os), 256, 0, s>>>(U.b.data(), out, n_rows, n * os, L * os,
+    FftScratch& scratch_fft = fft_scratch();
+    for (int r0 = 0; r0 < n_rows; r0 += kUpsampleBatch) {
+        const int nr = std::min(kUpsampleBatch, n_rows - r0);
+        Upsampler::Plans& P = U.plans_for(nr, L, os);
+        float* const a = grown(scratch_fft.real[0], static_cast<size_t>(nr) * L);
+        float* const b = grown(scratch_fft.real[1], static_cast<size_t>(nr) * L * os);
+        cufftComplex* const A = grown(scratch_fft.cplx[0], static_cast<size_t>(nr) * (L / 2 + 1));
+        cufftComplex* const B = grown(scratch_fft.cplx[1], static_cast<size_t>(nr) * (L * os / 2 + 1));
+        pad_rows_kernel<<<grid_for(static_cast<size_t>(nr) * L), 256, 0, s>>>(in + static_cast<size_t>(r0) * n, a, nr, n, L);
+        cufft_check(cufftExecR2C(P.fwd.bind(s), a, A), "R2C");
+        spread_spectrum_kernel<<<grid_for(static_cast<size_t>(nr) * (L * os / 2 + 1)), 256, 0, s>>>(A, B, nr, L / 2 + 1, L * os / 2 + 1, L);
+        cufft_check(cufftExecC2R(P.inv.bind(s), B, b), "C2R");
+        crop_scale_kernel<<<grid_for(static_cast<size_t>(nr) * n * os), 256, 0, s>>>(b, out + static_cast<size_t>(r0) * n * os, nr, n * os, L * os,
                                                                                   1.f / static_cast<float>(L));
+    }
     VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
 }
 

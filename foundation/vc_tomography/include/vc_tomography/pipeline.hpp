@@ -130,7 +130,8 @@ struct ReconConfig {
     std::uint32_t noise_split_seed = 0;
     float mend_threshold = 1e-4f;       // mending domain: the merged columns the scans' weight maps cover
     float log_clip_min = 1e-6f, log_clip_max = 10.f;
-    int block_angles = 500;
+    int block_angles = 500;             // grid angles gridded at once, at most (fewer for a tall stack: a block is kept to
+                                        // about 24 000 rows of the merged frame, which bounds its share of the device)
     // reconstruction
     float rot_center = 0.f;             // in the merged frame
     // backprojector: "fbp" (default; exact pixel-driven: bp_interp, bp_oversample), "ghbp" (the reference's), "sirt" /

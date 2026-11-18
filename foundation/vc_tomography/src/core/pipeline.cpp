@@ -50,6 +50,9 @@ std::pair<int, int> weight_vanishing_margins(const std::vector<float>& w, int ro
 // recordings of a line, two per turn, are then at most the rebalance's table: sino.hpp)
 constexpr int kMaxViewTurns = 16;
 
+// rows of the merged frame gridded at once (grid angles x rows of the stack): see Impl::run
+constexpr int kBlockRows = 24000;
+
 struct ScanChunk {  // host data of one scan for the current chunk
     ChunkScan cs;
     std::vector<uint16_t> raw;
@@ -1494,7 +1497,11 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
     ap.log_clip_min = cfg.log_clip_min;
     ap.log_clip_max = cfg.log_clip_max;
     const bool filter_context = !sets[0]->steps().empty();
-    const int BL = std::max(1, cfg.block_angles);
+    // Grid angles per block: cfg.block_angles at most, and fewer for a taller stack, so that a block's sums (a dozen
+    // arrays of block angles x H rows x NX, with the raw windows and the rows' cache) stay about kBlockRows rows of
+    // the merged frame whatever the chunk. (Measured on an RTX 5090, 102 rows of 3372 columns: 250 angles a block
+    // take the time of 500 and 3.2 GB less of the device; 125 take 2.5 % longer.)
+    const int BL = std::max(1, std::min(cfg.block_angles, std::max(16, kBlockRows / std::max(1, H))));
     const std::size_t blk = static_cast<std::size_t>(BL) * H * NX;
     const std::size_t sino_n = static_cast<std::size_t>(NR) * DY * NX;
 

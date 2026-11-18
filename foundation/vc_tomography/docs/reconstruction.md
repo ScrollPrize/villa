@@ -82,7 +82,7 @@ from 0 (top) to 1 (bottom).
 |---|---|
 | `--z Z0 Z1` | slices `Z0` to `Z1 − 1`, numbered from 0 at the top of the reconstructable height |
 | `--heights H0 H1` | the same range given as detector view heights |
-| `--chunk N` | slices reconstructed at once (default 32); lower it if GPU memory runs out |
+| `--chunk N` | slices reconstructed at once (default 32). A larger chunk is faster per slice, because every chunk also grids the context rows its filters need above and below it (43 each with Paganin, unsharp and two scans), and takes more GPU memory; lower it if GPU memory runs out. |
 | `--format zarr\|tiff` | OME-Zarr (default) or one TIFF stack per output |
 | `--levels N` | pyramid levels in the OME-Zarr (default 1) |
 | `--zarr_chunks CZ CY CX` | OME-Zarr chunk shape (default 128³) |
@@ -158,7 +158,7 @@ changed with `--set paganin.delta_beta=500`.
 | `row_time_us` | measured | the camera's row time, used only when the geometry calibration is made |
 | `sld` | none | correction for the scintillator's long-range glare, e.g. `fraction=0.43,length=170,outside=lit`, or `json=FILE` for a BM18 calibration file. The values must be measured for the detector (`evaluation/calibrate_sld.py`). |
 | `beam_divergence` | `true` | FBP follows the beam's divergence within the slice, when the calibration knows the source distance |
-| `sharpness_weighting` | `auto` | weight the recordings of a ray by the detector's local sharpness at high frequencies. Uses about 7.5 GB more GPU memory per 32-slice chunk; `off` disables it. |
+| `sharpness_weighting` | `auto` | weight the recordings of a ray by the detector's local sharpness at high frequencies. Uses about 5.6 GB more GPU memory per 32-slice chunk; `off` disables it. |
 | `angle_interp` | `views` | `views`: every projection backprojected at its own measured angle. `nearest`: projections binned to one turn. |
 | `z_interp` | `lanczos8` | interpolation between detector rows (`lanczos8`, `lanczos3`, `cubic`, `linear`) |
 | `x_interp` | `sinc` | resampling of a scan at a fractional column offset (`sinc` is exact) |
