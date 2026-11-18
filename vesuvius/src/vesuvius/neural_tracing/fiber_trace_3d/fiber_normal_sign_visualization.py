@@ -1,7 +1,7 @@
 """CPU-only original-fiber OBJ and signed-normal mesh PLY export."""
 import json
 from pathlib import Path
-import sqlite3
+from .fiber_graph_store import FiberGraph, store_digest
 import numpy as np
 from lasagna.inference_provenance import atomic_write, sha256_file
 from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fiber_catalog, fiber_volume, open_store, read_polylines
@@ -259,7 +259,7 @@ def export(config):
         raise ValueError('Duplicate solution IDs or invalid signs')
     dbpath=Path(config['database'])
     summary=json.loads((solution_path.parent/'summary.json').read_text())
-    if sha256_file(dbpath)!=summary['input']['signature']['database_sha256']:
+    if store_digest(dbpath)!=summary['input']['signature']['database_sha256']:
         raise ValueError('Solution and normal database do not match')
     hv=None
     if config.get('hv_solution'):
@@ -271,10 +271,13 @@ def export(config):
         if not np.array_equal(hv['ids'],ids) or not np.isin(hv['labels'],[0,1,2]).all():raise ValueError('Invalid H/V IDs or labels')
         if not np.array_equal(hv['inherited_broken'],solution['broken']) or np.any(hv['labels'][solution['broken']]!=2):
             raise ValueError('H/V changed inherited exclusions')
-    db=sqlite3.connect(dbpath.resolve().as_uri()+'?mode=ro',uri=True)
-    fibers=Path(config['fibers']);volume=fiber_volume(fibers)
-    get_meta=lambda c,k:json.loads(c.execute('SELECT value FROM metadata WHERE key=?',(k,)).fetchone()[0])
-    source_version=get_meta(db,'provenance').get('fiber_source',{})
+    graph=FiberGraph(dbpath)
+    from .fiber_graph_store import original_fiber_source
+    fibers,source_version=original_fiber_source(dbpath);volume=graph.volume
+    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fibers_digest, FiberBlockIndex
+    expected=fibers_digest(fibers,source_version=source_version)
+    if fibers_digest(dbpath)!=expected or fibers_digest(config['fibers'])!=expected:
+        raise ValueError('Wrong source fiber snapshot')
     selected=config.get('fiber_ids')
     bounds=config.get('bounds_xyz')
     focus=None
@@ -285,7 +288,7 @@ def export(config):
         counts=config['hv_sample_counts']
         if len(counts)!=3 or any(int(c)!=c or c<0 for c in counts):raise ValueError('Expected H,V,broken counts')
         selected=[];remaining=list(counts)
-        for fid in [r['id'] for r in sorted(fiber_catalog(fibers,volume),key=lambda r:(-r['length'],r['id']))]:
+        for fid in graph.ids[np.lexsort((graph.ids,-graph.lengths))]:
             if fid not in lookup:continue
             label=int(hv['labels'][lookup[fid]])
             if remaining[label]>0:selected.append(fid);remaining[label]-=1
@@ -311,14 +314,15 @@ def export(config):
             candidates=np.flatnonzero(solution['broken'] & (degree>0))
             if not len(candidates):candidates=np.flatnonzero(degree>0)
             focus=str(ids[candidates[np.argmax(degree[candidates])]])
-            pos=db.execute('SELECT ax,ay,az FROM constraints WHERE fiber_a=? UNION ALL SELECT bx,by,bz FROM constraints WHERE fiber_b=? LIMIT 1',(focus,focus)).fetchone()
+            ea=np.flatnonzero(graph.fiber_a==focus)
+            eb=np.flatnonzero(graph.fiber_b==focus)
+            pos=graph.point_a[ea[0]] if len(ea) else graph.point_b[eb[0]]
             center=np.asarray(pos);half=float(config.get('crop_size',512))/2
             bounds=[(center-half).tolist(),(center+half).tolist()]
         lo,hi=np.asarray(bounds,dtype=float)
         if not np.isfinite([lo,hi]).all() or np.any(lo>=hi):raise ValueError('Invalid bbox')
-        with open_store(fibers) as store:
-            selected=[r['object_uuid'] for r in store.spatial_regions([*lo.tolist(),*hi.tolist()],object_kind='fiber',volume=volume)
-                      if r['array_name']=='line_points']
+        spatial=FiberBlockIndex(fibers,ids,volume=volume)
+        selected=spatial.query(np.asarray([(lo+hi)/2]),(hi-lo)/2)
     selected=sorted(set(map(str,selected)))
     if config.get('exclude_broken',False):
         selected=[fid for fid in selected if fid in lookup and not solution['broken'][lookup[fid]]]
@@ -354,11 +358,14 @@ def export(config):
                            broken_probability=float(hv['probabilities'][k,2]),
                            rejection_stage=1 if solution['broken'][k] else (2 if broken else 0))
             line_vertex+=len(points)
-            rows=db.execute('SELECT id,arc_a,ax,ay,az,normal_a FROM constraints WHERE fiber_a=? '
-                'UNION ALL SELECT id,arc_b,bx,by,bz,normal_b FROM constraints WHERE fiber_b=? ORDER BY 2,1',(fid,fid))
+            a=np.flatnonzero(graph.fiber_a==fid);b=np.flatnonzero(graph.fiber_b==fid)
+            rows=sorted([(int(graph.event_ids[e]),float(arcs[e]),*points[e].tolist(),
+                          dict(valid=bool(valid[e]),xyz=normals[e].tolist()))
+                          for events,arcs,points,normals,valid in
+                          [(a,graph.arc_a,graph.point_a,graph.normal_a,graph.valid_a),
+                           (b,graph.arc_b,graph.point_b,graph.normal_b,graph.valid_b)] for e in events],key=lambda r:(r[1],r[0]))
             last=-np.inf
-            for event,arc,x,y,z,normal_json in rows:
-                normal=json.loads(normal_json)
+            for event,arc,x,y,z,normal in rows:
                 if not normal['valid'] or arc-last<spacing:continue
                 last=arc;p=np.asarray([x,y,z]);n=sign*np.asarray(normal['xyz'])
                 if len(verts)>=config.get('max_arrows',50000):raise ValueError('Too many arrows; increase spacing or reduce selection')
@@ -373,7 +380,7 @@ def export(config):
     faces=np.concatenate(triangles) if triangles else np.empty((0,3),dtype=np.int32)
     color=np.concatenate(colors) if colors else np.empty((0,3),dtype=np.uint8)
     write_ply(root/'signed_normals.ply',vertices,faces,color)
-    report=dict(config=config,fiber_source=source_version,solution_sha256=sha256_file(solution_path),focus_fiber=focus,selection_bbox=bounds,
+    report=dict(config=dict(config,fibers=str(fibers)),fiber_source=source_version,solution_sha256=sha256_file(solution_path),focus_fiber=focus,selection_bbox=bounds,
         selection_semantics=selection_semantics,
         normal_convention='inward',display_normal_convention='outward',
         units='native L0 XYZ/base voxels',fibers=len(records),broken_fibers=sum(r['broken'] for r in records),

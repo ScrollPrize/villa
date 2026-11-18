@@ -5,6 +5,19 @@
 // Included after StorageBindings.hpp: use the same transaction wrappers and
 // JSON metadata codec, but never round-trip typed row data through JSON.
 namespace {
+std::map<std::string,vo::FiberGraphSetting> fiberGraphSettingsFromPy(const nb::dict& input)
+{
+    std::map<std::string,vo::FiberGraphSetting> settings;
+    for(const auto [name,value]:input){
+        const auto key=nb::cast<std::string>(name);
+        if(nb::isinstance<nb::bool_>(value))settings.emplace(key,nb::cast<bool>(value));
+        else if(nb::isinstance<nb::int_>(value))settings.emplace(key,nb::cast<int64_t>(value));
+        else if(nb::isinstance<nb::float_>(value))settings.emplace(key,nb::cast<double>(value));
+        else throw std::invalid_argument("fiber graph settings must be explicit boolean/integer/real scalars");
+    }
+    return settings;
+}
+
 vo::FiberGraphTable fiberGraphTableFromPy(const std::string& name)
 {
     using Table = vo::FiberGraphTable;
@@ -66,6 +79,13 @@ vo::ExtensionRow extensionRowFromPy(const nb::handle& input)
 {
     vo::ExtensionRow result;
     for (const auto value : nb::cast<nb::sequence>(input)) result.push_back(extensionValueFromPy(value));
+    return result;
+}
+
+vo::ExtensionKeyFilter extensionKeyFilterFromPy(const nb::dict& input)
+{
+    vo::ExtensionKeyFilter result;
+    for(const auto [name,value]:input)result.emplace(nb::cast<std::string>(name),extensionValueFromPy(value));
     return result;
 }
 
@@ -160,26 +180,28 @@ void bindExtensionApi(nb::class_<T>& cls)
         for (const auto& table : tables) result.append(extensionTableToPy(table));
         return result;
     })
-    .def("extension_rows", [](T& self, const std::string& table, const nb::sequence& prefix) {
+    .def("extension_rows", [](T& self, const std::string& table, const nb::sequence& prefix,const nb::dict& filter) {
         const auto key = extensionRowFromPy(prefix);
+        const auto selection = extensionKeyFilterFromPy(filter);
         nb::list result;
         self.withRead([&](auto& db, auto& txn) {
-            db.scanExtensionRows(txn, table, [&](const auto& row) { result.append(extensionRowToPy(row)); return true; }, key);
+            db.scanExtensionRows(txn, table, [&](const auto& row) { result.append(extensionRowToPy(row)); return true; }, key,selection);
         });
         return result;
-    }, nb::arg("table"), nb::arg("key_prefix") = nb::tuple())
-    .def("scan_extension_rows", [](T& self, const std::string& table, const nb::callable& visitor, const nb::sequence& prefix) {
+    }, nb::arg("table"), nb::arg("key_prefix") = nb::tuple(),nb::arg("key_filter")=nb::dict())
+    .def("scan_extension_rows", [](T& self, const std::string& table, const nb::callable& visitor, const nb::sequence& prefix,const nb::dict& filter) {
         const auto key = extensionRowFromPy(prefix);
+        const auto selection = extensionKeyFilterFromPy(filter);
         size_t visited = 0;
         self.withRead([&](auto& db, auto& txn) {
             db.scanExtensionRows(txn, table, [&](const auto& row) {
                 ++visited;
                 const auto keepGoing = visitor(extensionRowToPy(row));
                 return keepGoing.is_none() || nb::cast<bool>(keepGoing);
-            }, key);
+            }, key,selection);
         });
         return visited;
-    }, nb::arg("table"), nb::arg("visitor"), nb::arg("key_prefix") = nb::tuple())
+    }, nb::arg("table"), nb::arg("visitor"), nb::arg("key_prefix") = nb::tuple(),nb::arg("key_filter")=nb::dict())
     .def("extension_rows_at_version", [](T& self, const std::string& table, const nb::dict& ref) {
         const bool object = has(ref, "object"), relationship = has(ref, "relationship");
         if (object == relationship) throw std::invalid_argument("extension reference needs exactly one object or relationship UUID");
@@ -197,6 +219,12 @@ void bindExtensionApi(nb::class_<T>& cls)
 
 inline void bindExtensionHelpers(nb::module_& module)
 {
+    module.def("encode_fiber_arc",[](double value){const auto b=vo::encodeFiberArc(value);return nb::bytes(reinterpret_cast<const char*>(b.data()),b.size());});
+    module.def("encode_fiber_direction",[](const std::array<double,3>& value){const auto b=vo::encodeFiberDirection(value);return nb::bytes(reinterpret_cast<const char*>(b.data()),b.size());});
+    module.def("encode_fiber_winding",[](double value)->nb::object{const auto b=vo::encodeFiberWindingDistance(value);if(!b)return nb::none();const char c=char(*b);return nb::bytes(&c,1);});
+    module.def("decode_fiber_arc",[](nb::bytes value){return vo::decodeFiberArc({reinterpret_cast<const uint8_t*>(value.c_str()),value.size()});});
+    module.def("decode_fiber_direction",[](nb::bytes value){return vo::decodeFiberDirection({reinterpret_cast<const uint8_t*>(value.c_str()),value.size()});});
+    module.def("decode_fiber_winding",[](nb::bytes value){return vo::decodeFiberWindingDistance({reinterpret_cast<const uint8_t*>(value.c_str()),value.size()});});
     module.def("extension_uuid", [](const nb::handle& input) -> nb::object {
         if (nb::isinstance<nb::str>(input)) return extensionValueToPy(vo::extensionUuid(nb::cast<std::string>(input)));
         return nb::cast(vo::extensionUuid(extensionValueFromPy(input)));
@@ -207,11 +235,13 @@ inline void bindExtensionHelpers(nb::module_& module)
     }, nb::arg("source_uuid"), nb::arg("sha256") = nb::none(),
        nb::arg("fiber_count") = nb::none(), nb::arg("point_count") = nb::none())
     .def("fiber_constraint_extension", [](const std::string& uuid, const std::optional<std::string>& sha256,
-                                         std::optional<int64_t> count, const nb::list& basedOn) {
-        return extensionTableToPy(vo::fiberConstraintExtension({uuid, sha256, count},
+                                         std::optional<int64_t> count, const nb::list& basedOn,
+                                         const std::optional<std::string>& coordinateSpace) {
+        return extensionTableToPy(vo::fiberConstraintExtension({uuid, sha256, count, coordinateSpace},
             vo::extensionSourcesFromJson(jsonDumps(basedOn))));
     }, nb::arg("fiber_source_uuid"), nb::arg("sha256") = nb::none(),
-       nb::arg("constraint_count") = nb::none(), nb::arg("based_on") = nb::list())
+       nb::arg("constraint_count") = nb::none(), nb::arg("based_on") = nb::list(),
+       nb::arg("coordinate_space") = nb::none())
     .def("fiber_graph_solve_table", [](const std::string& role) {
         return extensionTableToPy(vo::fiberGraphSolveTable(fiberGraphTableFromPy(role)));
     }, nb::arg("role"))
@@ -224,14 +254,7 @@ inline void bindExtensionHelpers(nb::module_& module)
     }, nb::arg("role"), nb::arg("fields"))
     .def("fiber_graph_run_row", [](const std::string& uuid, const std::string& stage,
                                   const std::string& method, const nb::dict& input) {
-        std::map<std::string, vo::FiberGraphSetting> settings;
-        for (const auto [name, value] : input) {
-            const auto key = nb::cast<std::string>(name);
-            if (nb::isinstance<nb::bool_>(value)) settings.emplace(key, nb::cast<bool>(value));
-            else if (nb::isinstance<nb::int_>(value)) settings.emplace(key, nb::cast<int64_t>(value));
-            else if (nb::isinstance<nb::float_>(value)) settings.emplace(key, nb::cast<double>(value));
-            else throw std::invalid_argument("fiber graph settings must be explicit boolean/integer/real scalars");
-        }
+        const auto settings=fiberGraphSettingsFromPy(input);
         const auto row = vo::fiberGraphRunRow(uuid, stage, method, settings);
         nb::dict result; result["table"] = row.table; result["values"] = extensionRowToPy(row.values); return result;
     }, nb::arg("run_uuid"), nb::arg("stage"), nb::arg("method"), nb::arg("settings") = nb::dict())

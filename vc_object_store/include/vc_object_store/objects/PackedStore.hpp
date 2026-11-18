@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <atomic>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -12,7 +13,13 @@ namespace vc::objects {
 // Container version is independent of the logical vcobj and SQLite schema versions.
 inline constexpr unsigned packedStoreFormatVersion = 1;
 
+struct PackedStoreMemoryStats {
+    std::atomic<std::size_t> residentBytes{0},peakResidentBytes{0};
+};
+
 struct PackedStoreOptions {
+    // Optional diagnostics, updated only when an extent is allocated/evicted.
+    std::shared_ptr<PackedStoreMemoryStats> memoryStats;
     std::size_t extentBytes = 4 * 1024 * 1024;
     std::size_t residentBytes = 256 * 1024 * 1024;
     // Only for disposable imports: SQLite sync requests do not sync storage.

@@ -37,7 +37,7 @@ def test_native_only_policy_and_mixed_policy_rejection(tmp_path):
 def test_special_reducers_do_not_compute_discarded_scalar_means(tmp_path, monkeypatch):
     from lasagna.compact_zarr import _build_compact_pyramid_chunk
     import lasagna.omezarr_pyramid as pyramid
-    p = product("fiber", ["presence", "nx", "ny", "width", "sheet_grad_mag"])
+    p = product("fiber", ["presence", "nx", "ny", "width", "grad_mag"])
     output = CompactOutputAdapter(root=tmp_path / "p.zarr", products=(p,), n_levels=2,
                                   validity_channel="presence", blank_invalid=True)
     output.prepare(base_shape_zyx=(4,4,4), ome_chunk=4)
@@ -57,7 +57,7 @@ def test_special_reducers_do_not_compute_discarded_scalar_means(tmp_path, monkey
     methods = json.loads((tmp_path / "p.zarr/sd0/.zattrs").read_text())["lasagna_pyramid_downsample"]
     assert methods == dict(presence="mean_pool2x", nx="normal_second_moment_mean_pool2x",
                           ny="normal_second_moment_mean_pool2x", width="mean_pool2x_valid_presence",
-                          sheet_grad_mag="mean_pool2x_zero_overrides")
+                          grad_mag="mean_pool2x_zero_overrides")
 
 
 def test_touched_python_parses():
@@ -100,7 +100,7 @@ def test_packed_atomic_blank_resume_pyramid(tmp_path):
 def test_pyramid_auto_workers_progress_resume_and_exact_output(tmp_path, monkeypatch, capsys):
     import lasagna.compact_zarr as compact
     monkeypatch.setattr(compact.multiprocessing, "cpu_count", lambda: 2)
-    p = product("fiber", ["presence", "nx", "ny", "width", "sheet_nx", "sheet_ny", "sheet_grad_mag"])
+    p = product("fiber", ["presence", "nx", "ny", "width", "sheet_nx", "sheet_ny"])
     rng = np.random.default_rng(19)
     data = {name: rng.integers(0, 256, (16, 16, 16), dtype=np.uint8) for name in p.channel_names}
     data['presence'][::2] = 0
@@ -145,6 +145,26 @@ def test_scales_validity_and_zero_chunks(tmp_path):
     del attrs["lasagna"]["validity_channel"]
     with pytest.raises(ValueError, match="validity"):
         LasagnaVolume.validate_compact(attrs["lasagna"])
+
+
+def test_chunk_validity_stores_all_zero_chunks(tmp_path):
+    """With validity by chunk existence, a computed chunk that is entirely zero is
+    still published: its existence is what marks the voxels as predicted."""
+    p = product("fiber", ["presence", "nx", "ny"])
+    output = CompactOutputAdapter(root=tmp_path / "chunks.zarr", products=(p,), n_levels=1, validity_channel="chunks")
+    output.prepare(base_shape_zyx=(4, 8, 4), ome_chunk=4)
+    output.write_products_chunk([(p, {c: np.zeros((4, 4, 4), np.uint8) for c in p.channel_names})],
+                                chunk_origin_zyx=(0, 0, 0))
+    writer = ZarrWriter.open(tmp_path / "chunks.zarr/sd0/0")
+    assert writer.chunk_exists((0, 0, 0, 0))
+    assert not writer.chunk_exists((0, 0, 1, 0))
+    manifest = LasagnaVolume.load(tmp_path / "chunks.zarr")
+    assert manifest.validity_by_chunks and manifest.validity_channel == "chunks"
+    with pytest.raises(ValueError, match="chunks"):
+        CompactOutputAdapter(root=tmp_path / "bad.zarr", products=(product("x", ["chunks", "nx"]),),
+                             n_levels=1, validity_channel="chunks").prepare(base_shape_zyx=(4, 4, 4), ome_chunk=4)
+    with pytest.raises(ValueError, match="validity_channel"):
+        CompactOutputAdapter(root=tmp_path / "bad2.zarr", products=(p,), n_levels=1, validity_channel="missing")
 
 
 def test_output_resolution(tmp_path):

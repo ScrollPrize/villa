@@ -17,10 +17,12 @@
 #include "vc_object_store/objects/ToolObjects.hpp"
 #include "vc_object_store/objects/VolumeUmbilicus.hpp"
 #include "vc_object_store/objects/RelationshipInputs.hpp"
+#include "vc_object_store/objects/TrackDatasets.hpp"
 #include "vc_object_store/geometry/PointMap.hpp"
 #include "vc_object_store/objects/ManifestReferences.hpp"
 #include "vc_object_store/objects/SurfaceCreate.hpp"
 #include "internal/Database.hpp"
+#include "internal/RecordResolver.hpp"
 #include "imports/SourceIdentityIndex.hpp"
 #include <fstream>
 #include <iostream>
@@ -35,6 +37,16 @@ namespace {
 OpenOptions options(HistoryMode mode){OpenOptions o;o.author="coherent-api";o.history=mode;o.spatialIndex=false;return o;}
 ObjectRecord track(const std::string& id){ObjectRecord r;r.uuid=id;r.kind="track";r.track.emplace();r.track->externalKey="0";r.track->datasetRef=id;r.meta=R"({"quality":7})";return r;}
 GeometryData shape(){return vc::geometry::encode(vc::geometry::Track{{{1,2,3},{4,5,6},{7,8,9}}});}
+struct DenyRelationshipReads {
+    std::vector<sqlite3*> sources;
+    explicit DenyRelationshipReads(sqlite3* db):sources(querySources(db)) {
+        for(auto* source:sources)sqlite3_set_authorizer(source,
+            [](void*,int action,const char* table,const char*,const char*,const char*){
+                return action==SQLITE_READ&&table&&std::string_view(table)=="edges"?SQLITE_DENY:SQLITE_OK;
+            },nullptr);
+    }
+    ~DenyRelationshipReads(){for(auto* source:sources)sqlite3_set_authorizer(source,nullptr,nullptr);}
+};
 ExtensionTable extension(){
     ExtensionTable spec;spec.name="ext_manual_edges";spec.extension="manual";spec.keySpace="edges";spec.versioned=true;
     spec.columns={{"owner",ExtensionType::Blob},{"value",ExtensionType::Integer}};spec.primaryKey={"owner"};return spec;
@@ -54,7 +66,7 @@ struct Fixture {
                 ObjectRecord source;source.uuid=file;source.kind="fiber";source.storageKind="file";source.storageRef="fiber.json";
                 store.upsertObject(w,source);
                 std::ofstream(base.parent_path()/"fiber.json")<<"{\"uuid\":\""<<file<<"\",\"line_points\":[]}";
-                EdgeRecord e;e.kind="related";e.aUuid=a;e.bUuid=b;e.aAnchor.wholeGeometry=e.bAnchor.wholeGeometry=true;
+                EdgeRecord e;e.kind="declared_reference";e.aUuid=a;e.bUuid=b;e.aAnchor.wholeGeometry=e.bAnchor.wholeGeometry=true;
                 e.aAnchor.metadataKeys=e.bAnchor.metadataKeys={"quality"};edge=store.addEdge(w,e);
                 if(extensions)store.createExtensionTable(w,extension());w.commit();
             }
@@ -87,6 +99,11 @@ void readsAndOverrides(HistoryMode baseHistory,HistoryMode overlayHistory){
         require(store.graphReadView(r).objectUuids.size()==3,"ordinary graph includes inherited objects");
         const auto graph=store.graphReadViewAt(r,std::vector<ObjectVersion>{f.av,f.bv});
         require(graph.objectUuids.size()==2&&graph.edgeUuids.size()==1,"exact graphs work for current-only and archived sources");
+        {DenyRelationshipReads guard(ObjectStoreImplAccess::conn(r));EdgeSelection noEdges;noEdges.limit=0;
+            const auto geometry=store.graphReadViewAt(r,{f.av,f.bv},noEdges);
+            require(geometry.objectUuids==graph.objectUuids&&geometry.geometryRevisions==graph.geometryRevisions&&
+                    geometry.edgeUuids.empty()&&geometry.selectedObjects->size()==2,
+                    "zero edge limit retains selected geometry/identity without any relationship read");}
         require(store.resolveStoragePath(r,f.file)==f.base.parent_path()/"fiber.json","relative sources use their owner's path");
         std::vector<ExtensionRow> rows;store.scanExtensionRows(r,extension().name,[&](const auto& row){rows.push_back(row);return true;});
         require(rows.size()==1&&std::get<int64_t>(rows[0][1])==4,"ordinary extension reader resolves inherited snapshots");
@@ -252,7 +269,7 @@ void followupRegressions(){
             newGeometry=store.editGeometry(w,a,{{"line_points",0,scalarBytes<double>(xyz)}},oldGeometry);w.commit();}
         {auto r=store.read();newVersion=store.currentObjectRevision(r,a)->reference();}
         {auto w=store.writeNumbered(VersionSelection{{retired,1},{a,newVersion.version},{b,1}});store.retireObject(w,retired);
-            EdgeRecord e;e.kind="related";e.aUuid=a;e.bUuid=b;e.aAnchor.wholeGeometry=e.bAnchor.wholeGeometry=true;
+            EdgeRecord e;e.kind="declared_reference";e.aUuid=a;e.bUuid=b;e.aAnchor.wholeGeometry=e.bAnchor.wholeGeometry=true;
             edge=store.addEdge(w,e);store.seal(w);w.commit();}
     }
     const auto overlay=[&](const char* name){const auto path=dir.path/name;
@@ -267,7 +284,7 @@ void followupRegressions(){
     }
     {auto store=overlay("collision.vcobj");
         mustFail([&]{auto w=store.write();auto r=track(edge);store.upsertObject(w,r);w.commit();});
-        mustFail([&]{auto w=store.write();EdgeRecord e;e.uuid=point;e.kind="related";e.aUuid=a;e.bUuid=b;
+        mustFail([&]{auto w=store.write();EdgeRecord e;e.uuid=point;e.kind="declared_reference";e.aUuid=a;e.bUuid=b;
             e.aAnchor.wholeGeometry=e.bAnchor.wholeGeometry=true;store.addEdge(w,e);w.commit();});
         {auto w=store.write();store.removeEdge(w,edge);w.commit();}
         mustFail([&]{auto w=store.write();store.upsertObject(w,track(edge));w.commit();});
@@ -564,13 +581,13 @@ void inventorySelectedMembership() {
     const auto a=util::newUuid(),b=util::newUuid();std::vector<ObjectVersion> refs;std::string edge;
     {auto store=ObjectStore::create(base,options(HistoryMode::On));
         {auto w=store.write();store.upsertObject(w,track(a));store.upsertObject(w,track(b));
-            EdgeRecord e;e.aUuid=a;e.bUuid=b;e.kind="old";edge=store.addEdge(w,e);w.commit();}
+            EdgeRecord e;e.aUuid=a;e.bUuid=b;e.kind="parallel";edge=store.addEdge(w,e);w.commit();}
         {auto r=store.read();refs={store.currentObjectRevision(r,a)->reference(),store.currentObjectRevision(r,b)->reference()};}
-        {auto w=store.write();store.removeEdge(w,edge);EdgeRecord e;e.aUuid=a;e.bUuid=b;e.kind="new";store.addEdge(w,e);store.seal(w);w.commit();}}
+        {auto w=store.write();store.removeEdge(w,edge);EdgeRecord e;e.aUuid=a;e.bUuid=b;e.kind="perpendicular";store.addEdge(w,e);store.seal(w);w.commit();}}
     {auto collection=ObjectCollection::create(overlay,{base},options(HistoryMode::Off));}
     auto store=ObjectStore::open(overlay,options(HistoryMode::Off));auto r=store.read();
     const auto graph=LocalStoreReader(store,r).graphReadViewAt(refs);
-    require(graph.selectedRelationships->size()==1&&graph.selectedRelationships->front().record.kind=="old",
+    require(graph.selectedRelationships->size()==1&&graph.selectedRelationships->front().record.kind=="parallel",
         "history-off attachment cannot substitute newer source graph memberships");
 }
 
@@ -968,6 +985,129 @@ void fittingRelationshipPolicy()
     require(fittingRelationshipInput(edge, true, kinds, false).exclusion == "unused kind same-surface", "unsupported endpoint pair excluded");
 }
 
+// Tracks are prepared for crossing detection by dataset, then source ID.
+void trackDatasetGroups()
+{
+    using Rows = std::vector<TrackDatasetRow>;
+    const Rows rows{{"u0", "/data/b", "10", "vertical"}, {"u1", "/data/a", "7", ""}, {"u2", "/data/b", "9", "horizontal"},
+                    {"u3", "/data/a", "10", "horizontal"}};
+    const auto groups = groupTrackDatasets(rows);
+    require(groups.size() == 2 && groups[0].dataset == "/data/a" && groups[0].rows == std::vector<size_t>{1, 3}
+                && groups[0].sourceIds == std::vector<uint64_t>{7, 10} && groups[0].families == std::vector<int8_t>{-1, 0}
+                && groups[1].dataset == "/data/b" && groups[1].rows == std::vector<size_t>{2, 0}
+                && groups[1].sourceIds == std::vector<uint64_t>{9, 10} && groups[1].families == std::vector<int8_t>{0, 1},
+            "tracks group by dataset in source-ID order; an ID may repeat across datasets");
+    require(groupTrackDatasets(Rows{}).empty(), "no tracks, no groups");
+    const auto refused = [](Rows bad, const char* text) {
+        try { groupTrackDatasets(bad); } catch (const std::runtime_error& error) {
+            require(std::string(error.what()).find(text) != std::string::npos, text);
+            return;
+        }
+        require(false, text);
+    };
+    refused({{"u0", "", "1", ""}}, "track has no dataset_ref: u0");
+    refused({{"u0", "/d", "07", ""}}, "canonical decimal source ID");
+    refused({{"u0", "/d", "7", ""}, {"u1", "/d", "7", ""}}, "duplicate registered track source ID");
+    refused({{"u0", "/d", "7", "diagonal"}}, "invalid stored track family");
+}
+
+// A relationship subset enumerates exactly its objects' links; every object
+// is selected once; a track that declares no dataset is still selectable.
+void selectedRelationshipSubset(HistoryMode mode)
+{
+    TemporaryDirectory dir;
+    auto store = ObjectStore::create(dir.path / "store.vcobj", options(mode));
+    const std::string a = util::newUuid(), b = util::newUuid(), c = util::newUuid(), d = util::newUuid(),
+                      placeholder = util::newUuid();
+    std::string ab, cd;
+    {
+        auto w = store.write();
+        for (const auto& id : {a, b, c, d}) { store.upsertObject(w, track(id)); store.putGeometry(w, id, shape()); }
+        ObjectRecord bare; bare.uuid = placeholder; bare.kind = "track";
+        store.upsertObject(w, bare);
+        const auto link = [&](const std::string& from, const std::string& to) {
+            EdgeRecord e; e.kind = "declared_reference"; e.aUuid = from; e.bUuid = to;
+            e.aAnchor.wholeGeometry = e.bAnchor.wholeGeometry = true;
+            return store.addEdge(w, e);
+        };
+        ab = link(a, b); cd = link(c, d);
+        w.commit();
+    }
+    ObjectVersion first;
+    {
+        auto r = store.read(); LocalStoreReader reader(store, r);
+        const auto position = reader.status();
+        std::vector<ObjectVersion> refs;
+        for (const auto& id : {a, b, c, d, placeholder}) refs.push_back(store.currentObjectRevision(r, id)->reference());
+        first = refs[0];
+        const auto links = [&](const std::optional<std::vector<ObjectVersion>>& subset) {
+            std::set<std::string> uuids;
+            const auto selected = reader.selectedInputs(refs, position, subset);
+            require(selected.objects.size() == refs.size(), "a relationship subset returns every selected object");
+            for (const auto& link : selected.relationships) uuids.insert(link.relationship.record.uuid);
+            return uuids;
+        };
+        require(links(std::nullopt) == std::set{ab, cd} && links(std::vector<ObjectVersion>{}).empty()
+                    && links(std::vector{refs[0]}) == std::set{ab} && links(std::vector{refs[3], refs[2]}) == std::set{cd}
+                    && links(std::vector{refs[4]}).empty(),
+                "a relationship subset enumerates its objects' links, and no link among the others");
+        const auto selected = reader.selectedInputs(refs, position);
+        require(selected.trackDatasets.objects.size() == refs.size() && selected.trackDatasets.of(0)
+                    && !selected.trackDatasets.of(4),
+                "a track that declares no dataset is selected, without one");
+    }
+    { auto w = store.write(); store.setMeta(w, a, "quality", "8"); w.commit(); }
+    {
+        auto r = store.read(); LocalStoreReader reader(store, r);
+        const auto second = store.currentObjectRevision(r, a)->reference();
+        require(second.version != first.version, "the edit numbered another version");
+        // History-off stores do not retain the first; either way one
+        // selection never holds two states of an object.
+        mustFail([&] { reader.selectedInputs({first, second}, reader.status(), std::vector<ObjectVersion>{}); });
+        mustFail([&] { reader.selectedInputs({second, second}, reader.status(), std::vector<ObjectVersion>{}); });
+    }
+}
+
+// A partition of a store resolves its tracks' datasets beside itself, as the
+// track-track detector (resolveStoragePath) does, not beside the manifest.
+void selectedTrackDatasetsOfPartitions()
+{
+    TemporaryDirectory dir;
+    auto opt = options(HistoryMode::Off);
+    const auto owner = util::newUuid(), lineage = util::newUuid();
+    std::vector<std::filesystem::path> shards;
+    std::vector<std::string> ids;
+    for (int i = 0; i < 2; ++i) {
+        auto shard = opt; shard.creationStoreUuid = owner; shard.creationGeneration = lineage;
+        shard.objectIdRange = {1 + i * 100, 100 + i * 100};
+        const auto directory = dir.path / (i ? "b" : "a");
+        std::filesystem::create_directories(directory);
+        shards.push_back(directory / "part.vcobj");
+        auto store = ObjectStore::create(shards.back(), shard);
+        auto w = store.write();
+        ids.push_back(util::newUuid());
+        auto record = track(ids.back()); record.track->datasetRef = "tracks.vctracks";
+        store.upsertObject(w, record); store.putGeometry(w, ids.back(), shape()); w.commit();
+        auto seal = store.write(); store.seal(seal); seal.commit();
+    }
+    std::filesystem::create_directories(dir.path / "root");
+    const auto manifest = dir.path / "root" / "index.vcobj";
+    { auto collection = ObjectCollection::publishShards(manifest, shards, opt); }
+    auto readOnly = opt; readOnly.readOnly = true;
+    auto store = ObjectStore::open(manifest, readOnly);
+    auto r = store.read(); LocalStoreReader reader(store, r);
+    std::vector<ObjectVersion> refs;
+    for (const auto& id : ids) refs.push_back(store.currentObjectRevision(r, id)->reference());
+    require(refs[0].storeUuid == refs[1].storeUuid, "the partitions are one logical store");
+    const auto selected = reader.selectedInputs(refs, reader.status());
+    const auto& datasets = selected.trackDatasets;
+    require(datasets.of(0) && datasets.of(1) && *datasets.of(0) != *datasets.of(1)
+                && *datasets.of(0) == trackDatasetIdentity(*store.resolveStoragePath(r, ids[0]))
+                && *datasets.of(1) == trackDatasetIdentity(*store.resolveStoragePath(r, ids[1]))
+                && *datasets.of(0) == std::filesystem::weakly_canonical(dir.path / "a" / "tracks.vctracks").generic_string(),
+            "a selection resolves each partition's dataset as the detector does");
+}
+
 void selectedGraphCapture(HistoryMode mode)
 {
     Fixture f(mode, mode);
@@ -978,9 +1118,49 @@ void selectedGraphCapture(HistoryMode mode)
         const auto status = reader.status(); position = status;
         const auto selected = reader.selectedInputs({f.av, f.bv}, position);
         const auto request = selectedInputsRequestToJson({f.av, f.bv}, position);
-        const auto [references, decodedPosition] = selectedInputsRequestFromJson(request);
-        require(references == std::vector{f.av, f.bv} && decodedPosition.commitSequence == status.commitSequence,
+        const auto decodedRequest = selectedInputsRequestFromJson(request);
+        require(decodedRequest.versions == std::vector{f.av, f.bv}
+                    && decodedRequest.position.commitSequence == status.commitSequence
+                    && !decodedRequest.relationshipVersions
+                    && !nlohmann::json::parse(request).contains("relationship_versions"),
                 "capture uses one snapshot position, not a feed cursor");
+        // Relationships of a subset: every object is still returned, and
+        // only the subset's links are enumerated.
+        const auto none = reader.selectedInputs({f.av, f.bv}, position, std::vector<ObjectVersion>{});
+        const auto one = reader.selectedInputs({f.av, f.bv}, position, std::vector{f.av});
+        const auto both = reader.selectedInputs({f.av, f.bv}, position, std::vector{f.bv, f.av});
+        require(none.objects.size() == 2 && none.relationships.empty() && one.objects.size() == 2
+                    && one.relationships.size() == reader.relationshipsAt({f.av}).size()
+                    && both.relationships.size() == selected.relationships.size(),
+                "a relationship subset limits the links, not the objects");
+        mustFail([&] { reader.selectedInputs({f.av}, position, std::vector{f.bv}); });
+        const auto subset = selectedInputsRequestFromJson(
+            selectedInputsRequestToJson({f.av, f.bv}, position, std::vector{f.bv}));
+        require(subset.versions == std::vector{f.av, f.bv} && subset.relationshipVersions == std::vector{f.bv}
+                    && selectedInputsRequestFromJson(selectedInputsRequestToJson({f.av}, position, std::vector<ObjectVersion>{}))
+                           .relationshipVersions->empty(),
+                "the relationship subset travels with the request, an empty one included");
+        {
+            // The inherited tracks' dataset is beside the store that owns
+            // them, as the detector resolves it; it travels with the answer.
+            const auto dataset = trackDatasetIdentity(*store.resolveStoragePath(r, f.a));
+            const auto& datasets = selected.trackDatasets;
+            require(datasets.objects.size() == 2 && datasets.of(0) && datasets.of(1) && *datasets.of(0) == dataset
+                        && *datasets.of(1) == trackDatasetIdentity(*store.resolveStoragePath(r, f.b))
+                        && dataset == std::filesystem::weakly_canonical(f.base.parent_path() / f.a).generic_string()
+                        && none.trackDatasets == datasets,
+                    "selected tracks come with the dataset their owning store resolves");
+            require(selectedInputsFromJson(selectedInputsToJson(status, selected)).trackDatasets == datasets
+                        && !nlohmann::json::parse(selectedInputsToJson(status, SelectedInputs{}))["inputs"].contains("track_datasets")
+                        && selectedInputsFromJson(selectedInputsToJson(status, SelectedInputs{})).trackDatasets == TrackDatasets{},
+                    "track datasets travel with the selection, and are absent without tracks");
+            for (const char* bad : {"index", "count"}) {
+                auto malformed = nlohmann::json::parse(selectedInputsToJson(status, selected));
+                auto& indices = malformed["inputs"]["track_datasets"]["objects"];
+                if (std::string_view(bad) == "index") indices[0] = 7; else indices.push_back(0);
+                mustFail([&] { selectedInputsFromJson(malformed.dump()); });
+            }
+        }
         auto obsolete = nlohmann::json::parse(request);
         obsolete["position"]["sequence"] = status.commitSequence;
         mustFail([&] { selectedInputsRequestFromJson(obsolete.dump()); });
@@ -1097,6 +1277,9 @@ int main()try{
             mustFail([&]{vc::geometry::decodePointMap(nlohmann::json::parse(json));});
     }
     for(const auto mode:{HistoryMode::Off,HistoryMode::On})postFusionSelectedState(mode);
+    trackDatasetGroups();
+    selectedRelationshipSubset(HistoryMode::On); selectedRelationshipSubset(HistoryMode::Off);
+    selectedTrackDatasetsOfPartitions();
     selectedGraphCapture(HistoryMode::On); selectedGraphCapture(HistoryMode::Off);
     fittingRelationshipPolicy();
     for (const auto mode : {HistoryMode::Off, HistoryMode::On}) unifiedExpectations(mode);

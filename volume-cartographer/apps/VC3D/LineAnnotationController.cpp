@@ -5186,9 +5186,12 @@ LineAnnotationController::resolveAlignmentMetricsDataset()
 {
     // Metrics must use the same normal-source policy as annotation/tracing,
     // including predicted-only compound volumes.
+    // The metrics worker builds its own sampler from the dataset, so only the
+    // choice of dataset is made here: building a sampler on the GUI thread
+    // costs ~0.4 s per landing and the sampler would be thrown away.
     LineAnnotationSession session;
     session.suppressErrorDialogs = _errorDialogsSuppressed;
-    if (!ensureDatasetForSession(session)) return {};
+    if (!resolveDatasetForSession(session, true, {}, false)) return {};
     return session.dataset;
 }
 
@@ -8334,8 +8337,15 @@ bool LineAnnotationController::ensureDatasetForSession(LineAnnotationSession& se
 
 bool LineAnnotationController::resolveDatasetForSession(LineAnnotationSession& session,
                                                         bool required,
-                                                        const std::function<bool()>& stillValid)
+                                                        const std::function<bool()>& stillValid,
+                                                        bool buildNormalSampler)
 {
+    const auto makeNormalSampler = [&](const vc::lasagna::LasagnaDataset& dataset)
+        -> std::shared_ptr<vc::lasagna::LasagnaNormalSampler> {
+        if (!buildNormalSampler) return {};
+        ++_sessionNormalSamplerBuilds;
+        return std::make_shared<vc::lasagna::LasagnaNormalSampler>(dataset);
+    };
     if (session.modelOnly) {
         try {
             if (!_state || !_state->currentVolume())
@@ -8386,7 +8396,7 @@ bool LineAnnotationController::resolveDatasetForSession(LineAnnotationSession& s
                     manifest.workingToBaseScale = vc3d::line_annotation::resolveFiberNormalCoordinateScales(
                         manifest.baseShapeZYX, annotationShapeZYX(_state), 1.0).fiberBaseToNormalBase;
                     auto dataset = std::make_shared<vc::lasagna::LasagnaDataset>(std::move(manifest));
-                    auto sampler = std::make_shared<vc::lasagna::LasagnaNormalSampler>(*dataset);
+                    auto sampler = makeNormalSampler(*dataset);
                     session.dataset = std::move(dataset);
                     session.normalSampler = std::move(sampler);
                     session.usingFiberNormals = true;
@@ -8504,7 +8514,7 @@ bool LineAnnotationController::resolveDatasetForSession(LineAnnotationSession& s
             auto dataset = std::make_shared<vc::lasagna::LasagnaDataset>(
                 openSelectedDataset(selected));
             manifestPath = dataset->manifest().manifestPath;
-            auto sampler = std::make_shared<vc::lasagna::LasagnaNormalSampler>(*dataset);
+            auto sampler = makeNormalSampler(*dataset);
             session.dataset = std::move(dataset);
             session.normalSampler = std::move(sampler);
         } catch (const std::exception& ex) {
@@ -8530,7 +8540,7 @@ bool LineAnnotationController::resolveDatasetForSession(LineAnnotationSession& s
                 auto dataset = std::make_shared<vc::lasagna::LasagnaDataset>(
                     openSelectedDataset(selected));
                 manifestPath = dataset->manifest().manifestPath;
-                auto sampler = std::make_shared<vc::lasagna::LasagnaNormalSampler>(*dataset);
+                auto sampler = makeNormalSampler(*dataset);
                 session.dataset = std::move(dataset);
                 session.normalSampler = std::move(sampler);
             } catch (const std::exception& ex) {

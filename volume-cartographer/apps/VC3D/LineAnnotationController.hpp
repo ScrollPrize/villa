@@ -992,8 +992,11 @@ private:
     // package; false makes the helper return false at once.
     bool ensureDatasetForSession(LineAnnotationSession& session, bool required = true,
                                  const std::function<bool()>& stillValid = {});
+    // buildNormalSampler=false resolves the dataset only (session.normalSampler
+    // stays empty), for callers that sample on a worker with their own sampler.
     bool resolveDatasetForSession(LineAnnotationSession& session, bool required,
-                                  const std::function<bool()>& stillValid);
+                                  const std::function<bool()>& stillValid,
+                                  bool buildNormalSampler = true);
     bool ensureFiberInferenceDatasetForSession(LineAnnotationSession& session,
                                                const std::function<bool()>& stillValid = {});
     // Every backend a fiber-mode solve of the session needs (dataset, and
@@ -1617,6 +1620,7 @@ private:
     // or their metrics invalidated during it (the read is then made again).
     std::unordered_map<uint64_t, bool> _alignmentMetricWorkerReads;
     uint64_t _alignmentMetricWorkerReadCount = 0;  // reads started (tests)
+    uint64_t _sessionNormalSamplerBuilds = 0;      // samplers resolveDatasetForSession built (tests)
     // stillValid (optional): a failed metadata save shows a modal; false
     // right after it returns without scheduling the autosave.
     void saveFiberDisplayAnnotations(LineAnnotationSession& session,

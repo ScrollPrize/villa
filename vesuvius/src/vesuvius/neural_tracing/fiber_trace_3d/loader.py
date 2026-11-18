@@ -1700,11 +1700,14 @@ def _apply_blur_kernels_3d(
         raise ValueError("blur-kernel descriptor count does not match batch size")
     isotropic = tuple(None if item is None else item.isotropic_1d for item in kernels)
     directional = tuple(None if item is None else item.directional_zyx for item in kernels)
-    return _apply_directional_kernels_3d(
-        _apply_isotropic_kernels_3d(volume, isotropic),
-        directional,
-        max_padding_ratio=max_directional_padding_ratio,
-    )
+    # The blur is a float32 convolution on every device: cuDNN's TF32 convolutions
+    # (on by default on Ampere and later) would change GPU augmentation by ~1e-4.
+    with torch.backends.cudnn.flags(enabled=torch.backends.cudnn.enabled, allow_tf32=False):
+        return _apply_directional_kernels_3d(
+            _apply_isotropic_kernels_3d(volume, isotropic),
+            directional,
+            max_padding_ratio=max_directional_padding_ratio,
+        )
 
 
 def _native_value_transform(

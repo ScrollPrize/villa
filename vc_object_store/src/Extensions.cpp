@@ -65,9 +65,9 @@ void bindValue(Statement& statement,int col,const ExtensionValue& value) {
         else statement.bind(col,v);
     },value);
 }
-ExtensionRow readRow(const Statement& rows) {
-    ExtensionRow row;row.reserve(sqlite3_column_count(rows.value));
-    for(int col=0;col<sqlite3_column_count(rows.value);++col)switch(sqlite3_column_type(rows.value,col)) {
+ExtensionRow readRow(const Statement& rows,int first=0) {
+    ExtensionRow row;row.reserve(sqlite3_column_count(rows.value)-first);
+    for(int col=first;col<sqlite3_column_count(rows.value);++col)switch(sqlite3_column_type(rows.value,col)) {
         case SQLITE_NULL:row.emplace_back(std::monostate{});break;
         case SQLITE_INTEGER:row.emplace_back(rows.i64(col));break;
         case SQLITE_FLOAT:row.emplace_back(rows.f64(col));break;
@@ -89,25 +89,48 @@ void validateValue(const ExtensionColumn& column,const ExtensionValue& value) {
     if(const auto* real=std::get_if<double>(&value);real&&!std::isfinite(*real))
         throw std::invalid_argument("extension: nonfinite real value");
 }
-void insertRows(sqlite3* db,const ExtensionTableInfo& info,std::span<const ExtensionRow* const> rows) {
+std::vector<std::pair<size_t,const ExtensionValue*>> keyFilterColumns(
+    const ExtensionTableInfo& table,const ExtensionKeyFilter& filter) {
+    std::vector<std::pair<size_t,const ExtensionValue*>> result;
+    for(const auto& [name,value]:filter) {
+        if(std::find(table.primaryKey.begin(),table.primaryKey.end(),name)==table.primaryKey.end())
+            throw std::invalid_argument("extension: key filter is not a primary-key column: "+name);
+        const auto found=std::find_if(table.columns.begin(),table.columns.end(),[&](const auto& c){return c.name==name;});
+        validateValue(*found,value);
+        result.emplace_back(size_t(found-table.columns.begin()),&value);
+    }
+    return result;
+}
+void insertRows(sqlite3* db,const ExtensionTableInfo& info,std::span<const ExtensionRow* const> rows,
+                const std::string& target={},bool track=true,
+                std::span<const InitialExtensionRow* const> stagedRows={}) {
     if(rows.empty())return;
     std::string parameters;
     for(size_t i=0;i<info.columns.size();++i){if(i)parameters+=",";parameters+="?";}
-    Statement insert(db,"INSERT INTO "+identifier(info.name)+" VALUES("+parameters+")");
+    if(!stagedRows.empty()){
+        if(stagedRows.size()!=rows.size())throw std::logic_error("staging payload count differs");parameters+=",?";
+    }
+    Statement insert(db,"INSERT INTO "+(target.empty()?identifier(info.name):target)+" VALUES("+parameters+")");
     size_t uuidColumn=0;
     if(!info.keySpace.empty()) {
         const auto it=std::find_if(info.columns.begin(),info.columns.end(),[&](const auto& c){return c.name==info.primaryKey.front();});
         uuidColumn=size_t(it-info.columns.begin());
     }
+    size_t rowIndex=0;
     for(const auto* row:rows) {
         if(!row || row->size()!=info.columns.size())throw std::invalid_argument("extension: row column count differs");
         insert.reset();
         for(size_t i=0;i<row->size();++i){validateValue(info.columns[i],(*row)[i]);bindValue(insert,int(i+1),(*row)[i]);}
         if(!info.keySpace.empty()&&std::get<std::vector<uint8_t>>((*row)[uuidColumn]).size()!=16)
             throw std::invalid_argument("extension: routing key must be a binary UUID");
+        if(!stagedRows.empty()){
+            const auto& payload=stagedRows[rowIndex]->stagingPayload;
+            if(payload.empty())insert.bindNull(int(row->size()+1));else insert.bind(int(row->size()+1),std::span<const uint8_t>(payload));
+        }
         insert.stepDone();
+        ++rowIndex;
     }
-    changed(db,info.name);
+    if(track)changed(db,info.name);
 }
 }
 
@@ -137,7 +160,7 @@ std::string extensionUuid(const ExtensionValue& value){const auto& b=std::get<st
     if(b.size()!=16)throw std::invalid_argument("extension: invalid UUID bytes");
     std::array<unsigned char,16> bytes;std::copy(b.begin(),b.end(),bytes.begin());return formatUuid(bytes);}
 size_t extensionPayloadBytes(std::span<const InitialExtensionRow> rows){size_t bytes=0;
-    for(const auto& row:rows){bytes+=sizeof(row)+row.table.size()+row.values.size()*sizeof(ExtensionValue);
+    for(const auto& row:rows){bytes+=sizeof(row)+row.table.size()+row.values.size()*sizeof(ExtensionValue)+row.stagingPayload.size();
         for(const auto& v:row.values)std::visit([&](const auto& x){if constexpr(requires{x.size();})bytes+=x.size();},v);}
     return bytes;}
 
@@ -158,6 +181,9 @@ std::optional<ExtensionTableInfo> detail::extensionTable(sqlite3* db,const std::
     info.formatVersion=row.i64(3);info.basedOn=extensionSourcesFromJson(row.text(4));info.provisioning=row.text(5);
     info.keySpace=row.text(6);info.lastModifiedCommit=row.i64(7);
     info.versioned=row.i64(8)!=0;
+    if(const auto pool=activeStatementPools.find(db);pool!=activeStatementPools.end()&&pool->second->selectedSourceCommit&&
+       !info.versioned&&info.lastModifiedCommit>*pool->second->selectedSourceCommit)
+        throw std::runtime_error("extension: requested historical rows were not retained: "+name);
     std::map<int64_t,std::string> keys;
     Statement columns(db,"SELECT name,type,\"notnull\",pk FROM pragma_table_info(?) ORDER BY cid",name);
     while(columns.row()){info.columns.push_back({columns.text(0),columnType(columns.text(1)),columns.i64(2)==0});
@@ -243,22 +269,81 @@ void detail::replaceCurrentExtensionRows(sqlite3* db,const std::string& name,con
     Savepoint save(db);Statement erase(db,"DELETE FROM "+identifier(name)+" WHERE "+identifier(info->primaryKey.front())+"=?");
     bindValue(erase,1,owner);erase.stepDone();insertRows(db,*info,pointers);changed(db,name);save.release();
 }
-void detail::appendInitialExtensions(sqlite3* db,std::span<const InitialExtensionRow* const> rows) {
-    std::map<std::string,std::vector<const ExtensionRow*>> tables;
-    for(const auto* row:rows)tables[row->table].push_back(&row->values);
-    for(const auto& [name,values]:tables){const auto info=extensionTable(db,name,false);
+void detail::appendInitialExtensions(sqlite3* db,std::span<const InitialExtensionRow* const> rows,std::span<const std::string> staged) {
+    std::map<std::string,std::vector<const InitialExtensionRow*>> tables;
+    for(const auto* row:rows)tables[row->table].push_back(row);
+    for(const auto& [name,records]:tables){const auto info=extensionTable(db,name,false);
         if(!info)throw std::invalid_argument("extension: unregistered initial table "+name);
         if(info->versioned)throw std::invalid_argument("extension: initial rows must not bypass owner versioning");
-        insertRows(db,*info,values);}
+        const bool pending=std::find(staged.begin(),staged.end(),name)!=staged.end();
+        std::vector<const ExtensionRow*> values;values.reserve(records.size());
+        for(const auto* record:records){
+            if(!pending&&!record->stagingPayload.empty())throw std::invalid_argument("transient payload requires an explicitly staged extension");
+            values.push_back(&record->values);
+        }
+        insertRows(db,*info,values,pending?"temp."+identifier("__vc_initial_stage_"+name):std::string{},!pending,
+            pending?std::span<const InitialExtensionRow* const>(records):std::span<const InitialExtensionRow* const>{});}
+}
+void detail::createInitialExtensionStages(sqlite3* db,std::span<const std::string> names) {
+    for(const auto& name:names) {
+        const auto info=extensionTable(db,name,false);
+        if(!info||info->versioned)throw std::invalid_argument("initial staging requires a registered immutable extension");
+        exec(db,("CREATE TEMP TABLE "+identifier("__vc_initial_stage_"+name)+
+            " AS SELECT * FROM main."+identifier(name)+" WHERE 0").c_str());
+        exec(db,("ALTER TABLE temp."+identifier("__vc_initial_stage_"+name)+" ADD COLUMN __vc_stage_payload BLOB").c_str());
+    }
+}
+bool detail::hasInitialExtensionStages(sqlite3* db) {
+    Statement pending(db,"SELECT 1 FROM sqlite_temp_schema WHERE type='table' AND name GLOB '__vc_initial_stage_*' LIMIT 1");
+    return pending.row();
+}
+int64_t detail::transferInitialExtensionStage(sqlite3* db,const std::string& name,
+    const std::function<void(ExtensionRow&)>& transform,size_t batchRows) {
+    if(!transform||!batchRows)throw std::invalid_argument("initial extension transfer requires a transform and positive batch size");
+    const auto info=extensionTable(db,name,false);
+    if(!info||info->versioned)throw std::invalid_argument("initial transfer requires a registered immutable extension");
+    const auto stage="__vc_initial_stage_"+name;
+    {
+        Statement present(db,"SELECT 1 FROM sqlite_temp_schema WHERE type='table' AND name=?",stage);
+        if(!present.row())throw std::invalid_argument("initial transfer has no staged extension "+name);
+    }
+    Savepoint save(db);int64_t count=0,last=0;
+    for(;;) {
+        std::vector<ExtensionRow> batch;batch.reserve(batchRows);
+        {
+            Statement scan(db,"SELECT rowid,* FROM temp."+identifier(stage)+" WHERE rowid>? ORDER BY rowid LIMIT ?",
+                last,int64_t(batchRows));
+            while(scan.row()) {
+                last=scan.i64(0);
+                auto row=readRow(scan,1);
+                const bool hasPayload=!std::holds_alternative<std::monostate>(row.back());
+                if(!hasPayload)row.pop_back();
+                transform(row);
+                if(row.size()!=info->columns.size() && !(hasPayload&&row.size()==info->columns.size()+1))
+                    throw std::invalid_argument("initial extension transform changed the canonical column count");
+                if(row.size()==info->columns.size()+1)row.pop_back();
+                batch.push_back(std::move(row));
+            }
+        }
+        if(batch.empty())break;
+        std::vector<const ExtensionRow*> values;values.reserve(batch.size());
+        for(const auto& row:batch)values.push_back(&row);
+        insertRows(db,*info,values);count+=int64_t(batch.size());
+        Statement erase(db,"DELETE FROM temp."+identifier(stage)+" WHERE rowid<=?",last);erase.stepDone();
+    }
+    exec(db,("DROP TABLE temp."+identifier(stage)).c_str());save.release();return count;
 }
 void detail::scanExtensionRows(sqlite3* db,const std::string& name,const std::function<bool(const ExtensionRow&)>& visitor,
-                               std::span<const ExtensionValue> prefix) {
+                               std::span<const ExtensionValue> prefix,const ExtensionKeyFilter& filter) {
     const auto info=extensionTable(db,name,false);if(!info)throw std::invalid_argument("extension: unregistered table "+name);
     if(!visitor||prefix.size()>info->primaryKey.size())throw std::invalid_argument("extension: invalid scan");
     std::string where;
     for(size_t i=0;i<prefix.size();++i){where+=i?" AND ":" WHERE ";where+=identifier(info->primaryKey[i])+"=?";}
+    const auto filters=keyFilterColumns(*info,filter);
+    for(const auto& [column,value]:filters){where+=where.empty()?" WHERE ":" AND ";where+=identifier(info->columns[column].name)+"=?";}
     Statement rows(db,"SELECT * FROM "+identifier(name)+where+" ORDER BY "+joined(info->primaryKey));
     for(size_t i=0;i<prefix.size();++i)bindValue(rows,int(i+1),prefix[i]);
+    for(size_t i=0;i<filters.size();++i)bindValue(rows,int(prefix.size()+i+1),*filters[i].second);
     while(rows.row())if(!visitor(readRow(rows)))break;
 }
 void detail::rejectExtensionLoss(sqlite3* db,const char* operation){if(hasExtensionTables(db))
@@ -293,12 +378,15 @@ std::vector<ExtensionTableInfo> ObjectStore::extensionTables(const Txn& t) const
     return result;
 }
 void ObjectStore::appendExtensionRows(WriteTxn& t,const std::string& name,std::span<const ExtensionRow> rows){detail::appendExtensionRows(static_cast<sqlite3*>(connection(t)),name,rows);}
-void ObjectStore::scanExtensionRows(const Txn& t,const std::string& name,const std::function<bool(const ExtensionRow&)>& visitor,std::span<const ExtensionValue> prefix) const {
+void ObjectStore::scanExtensionRows(const Txn& t,const std::string& name,const std::function<bool(const ExtensionRow&)>& visitor,
+                                  std::span<const ExtensionValue> prefix,const ExtensionKeyFilter& filter) const {
     auto* db=static_cast<sqlite3*>(connection(t));
     const auto table=resolvedExtensionTable(db,name);
     const auto sources=querySources(db);
     if(!table)throw std::invalid_argument("extension: unregistered table "+name);
     if(!visitor||prefix.size()>table->primaryKey.size())throw std::invalid_argument("extension: invalid scan");
+    const auto filters=keyFilterColumns(*table,filter);
+    const auto matches=[&](const ExtensionRow& row){for(const auto& [column,value]:filters)if(row.at(column)!=*value)return false;return true;};
     if(table->versioned){
         std::set<std::string> seen;bool more=true;
         for(auto* source:sources){
@@ -307,7 +395,7 @@ void ObjectStore::scanExtensionRows(const Txn& t,const std::string& name,const s
                 std::optional<std::string> meta;
                 if(table->keySpace=="objects") {if(auto record=objectByUuid(t,owner))meta=record->meta;}
                 else if(auto record=edgeByUuid(t,owner))meta=record->meta;
-                if(meta)more=scanExtensionSnapshot(db,*table,owner,*meta,visitor,prefix);
+                if(meta)more=scanExtensionSnapshot(db,*table,owner,*meta,[&](const ExtensionRow& row){return !matches(row)||visitor(row);},prefix);
                 return more;
             });
             if(!more)return;
@@ -323,7 +411,7 @@ void ObjectStore::scanExtensionRows(const Txn& t,const std::string& name,const s
         detail::scanExtensionRows(source,name,[&](const ExtensionRow& row){
             ExtensionRow key;for(auto i:keys)key.push_back(row.at(i));
             if(seen.insert(std::move(key)).second)more=visitor(row);return more;
-        },prefix);
+        },prefix,filter);
         if(!more)return;
     }
 }

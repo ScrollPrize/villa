@@ -175,7 +175,7 @@ void nativeChanges(HistoryMode history)
     {
         auto txn = store.write();
         // Failure rolls back the API savepoint, including any allocated ID.
-        EdgeRecord relation; relation.kind = "bad"; relation.aUuid = a; relation.bUuid = util::newUuid();
+        EdgeRecord relation; relation.kind = "declared_reference"; relation.aUuid = a; relation.bUuid = util::newUuid();
         mustFail([&] { store.addEdge(txn, relation); });
         txn.commit();
     }

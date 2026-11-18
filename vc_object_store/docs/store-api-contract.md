@@ -30,7 +30,7 @@ Repin from the receipt's complete object references, not its committing store pl
 
 Structural point IDs come from the shared retained-allocation API, not a restorable metadata counter or maximum surviving point ID. A foreign source slice does not establish ownership of an existing target point ID.
 
-Public composite/batch writes roll back the complete operation even if the caller catches an error and commits its surrounding transaction. Trusted initial construction uses the dedicated batch APIs, not interactive edit bookkeeping.
+Public composite/batch writes roll back the complete operation even if the caller catches an error and commits its surrounding transaction. A prepared `link_objects` operation (`PreparedOperation::apply`) is stricter: it takes no savepoint, so when it throws it fails the surrounding transaction as a whole, whose commit then throws and rolls back every write in it, including earlier ones. Trusted initial construction uses the dedicated batch APIs, not interactive edit bookkeeping.
 
 ## Queries, history and physical copies
 
@@ -44,6 +44,6 @@ Copy/export collections through shared dependency-closure APIs, not a backup of 
 
 Trace an invariant through all producer, binding, transport and consumer entry points, including read/write siblings. Distinguish legitimate boundary adaptation from duplicated policy. A passing unrelated suite or a file inspection does not establish that every caller obeys the contract.
 
-Regression cases cover local and referenced data, sharded/packed placement, local/hosted transport, source/destination history-policy combinations, current and retained exact reads after override/deletion, no-op writes, and different owners with equal version numbers where applicable. For batch failure tests, catch the failure and commit the enclosing transaction to verify operation-wide rollback. Add mapping/membership races and retained point-ID checks where the edited path depends on them.
+Regression cases cover local and referenced data, sharded/packed placement, local/hosted transport, source/destination history-policy combinations, current and retained exact reads after override/deletion, no-op writes, and different owners with equal version numbers where applicable. For batch failure tests, catch the failure and commit the enclosing transaction to verify operation-wide rollback; for a prepared `link_objects` operation, verify instead that the commit throws and nothing of the transaction is stored. Add mapping/membership races and retained point-ID checks where the edited path depends on them.
 
 Review changed shared APIs together with their callers and document capability limits rather than introducing consumer workarounds. Keep transient findings, coverage ledgers, plans and run logs in ignored local storage; permanent docs describe supported behavior, contracts and usage, not review chronology or historical test totals.

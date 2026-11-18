@@ -28,14 +28,14 @@ void borrowedChunks()
     const auto geometry=shape();
     auto otherGeometry=geometry;
     otherGeometry.arrays.front().bytes.front()^=1;
-    std::string baseRevision,currentRevision;
+    std::string baseRevision,currentRevision,currentOwner;
     {
         auto base=ObjectStore::create(basePath,options());auto w=base.write();
         base.upsertObject(w,track(owner));baseRevision=base.putGeometry(w,owner,geometry);base.seal(w);w.commit();
     }
     {
         auto config=options();config.history=HistoryMode::Off;
-        auto base=ObjectStore::create(currentPath,config);auto w=base.write();const auto key=util::newUuid();
+        auto base=ObjectStore::create(currentPath,config);auto w=base.write();const auto key=util::newUuid();currentOwner=key;
         base.upsertObject(w,track(key));currentRevision=base.putGeometry(w,key,otherGeometry);base.seal(w);w.commit();
     }
     std::string revision;
@@ -68,6 +68,29 @@ void borrowedChunks()
     const auto missing=resolveGeometryRecord(source.get(),util::newUuid());
     require(!missing,"missing geometry reference is not substituted by current geometry");
     require(chunks(source.get())==0,"source borrows payloads without local registrations");
+    {
+        auto readOptions=options();readOptions.readOnly=true;
+        auto root=ObjectStore::open(sourcePath,readOptions);auto snapshot=root.read();
+        const auto packed=root.readGeometryArrays(snapshot,mixed,"points");
+        for(size_t i=0;i<mixed.size();++i){
+            const auto expected=(mixed[i]==currentRevision?otherGeometry:geometry).arrays.front().bytes;
+            const auto actual=packedItem(packed,i);
+            require(std::equal(actual.begin(),actual.end(),expected.begin(),expected.end()),
+                "packed payload batches retain each descriptor owner's borrowed scope and duplicate order");
+        }
+        auto collection=ObjectCollection::open(sourcePath,readOptions);auto selected=collection.read();
+        const std::array<std::array<unsigned char,16>,3> keys{parseUuid(id),parseUuid(currentOwner),parseUuid(owner)};
+        for(const auto workers:{size_t(1),size_t(4)}){
+            const auto columns=collection.readGeometryArrayColumns(selected,keys,"points",std::string("track"),std::nullopt,std::nullopt,workers);
+            require(columns.objectUuids.size()==3,"parallel packed selection preserves all distinct descriptor owners");
+            for(size_t i=0;i<columns.objectUuids.size();++i){
+                const auto expected=(columns.objectUuids[i]==parseUuid(currentOwner)?otherGeometry:geometry).arrays.front().bytes;
+                const auto actual=packedItem(columns.geometry,i);
+                require(std::equal(actual.begin(),actual.end(),expected.begin(),expected.end()),
+                    "sealed packed selection reads borrowed chunks through the same owner-scoped resolver");
+            }
+        }
+    }
     {
         auto target=ObjectStore::create(dir.path/"standalone-target",options());auto w=target.write();
         target.upsertObject(w,track(id));auto* sql=ObjectStoreImplAccess::conn(w);
@@ -105,12 +128,18 @@ void currentDescriptor(HistoryMode history)
     const auto descriptor=current.text(2),checksum=current.text(1);
     require(store.currentGeometry(w,id)->contentHash==checksum,"current descriptor checksum matches object");
     require(GeometryReader(db,revision).read("points",0)==geometry.arrays.front().bytes,"current descriptor reads in either history mode");
+    {GeometryWork work;GeometryWorkScope scope(work);
+        const auto catalog=store.geometryArrayCounts(w,"track","points");
+        require(catalog.uuids.size()==1&&catalog.uuids[0]==parseUuid(id)&&catalog.counts==std::vector<int64_t>{3},
+                "descriptor-only catalog reports the selected point count");
+        require(work.readBytes.empty(),"descriptor-only catalog does not read coordinate payloads");}
 
     // The object descriptor is authoritative even when an intact archived
     // revision would otherwise allow a reader to silently ignore corruption.
     execute(db,"UPDATE objects SET geometry_manifest='{}' WHERE uuid=?",parseUuid(id));
     mustFail([&]{store.currentGeometry(w,id);});
     mustFail([&]{GeometryReader reader(db,revision);});
+    mustFail([&]{store.geometryArrayCounts(w,"track","points");});
     execute(db,"UPDATE objects SET geometry_manifest=? WHERE uuid=?",descriptor,parseUuid(id));
     if(history==HistoryMode::On) {
         auto different=Json::parse(descriptor);different["attributes"]["unexpected"]=true;
@@ -118,10 +147,103 @@ void currentDescriptor(HistoryMode history)
         execute(db,"UPDATE objects SET geometry_manifest=?,data_checksum=? WHERE uuid=?",text,hashText(text),parseUuid(id));
         mustFail([&]{store.currentGeometry(w,id);});
         mustFail([&]{GeometryReader reader(db,revision);});
+        mustFail([&]{store.geometryArrayCounts(w,"track","points");});
         execute(db,"UPDATE objects SET geometry_manifest=?,data_checksum=? WHERE uuid=?",descriptor,checksum,parseUuid(id));
     }
     require(GeometryReader(db,revision).read("points",0)==geometry.arrays.front().bytes,"restored descriptor remains readable");
+    execute(db,"UPDATE objects SET geometry_manifest=NULL WHERE uuid=?",parseUuid(id));
+    require(!store.currentGeometry(w,id),"a missing selected head is not a current geometry");
+    require(store.geometryArrayCounts(w,"track","points").counts==std::vector<int64_t>{0},
+        "descriptor catalog does not resurrect a missing head from its retained archive");
+    execute(db,"UPDATE objects SET geometry_manifest=? WHERE uuid=?",descriptor,parseUuid(id));
     w.commit();
+}
+
+void descriptorCatalogOverlay(HistoryMode baseHistory)
+{
+    TemporaryDirectory dir;auto config=options();config.history=baseHistory;
+    const auto basePath=dir.path/"base",overlayPath=dir.path/"overlay";
+    const auto a=util::newUuid(),b=util::newUuid(),c=util::newUuid();
+    {
+        auto base=ObjectStore::create(basePath,config);auto w=base.write();
+        for(const auto& uuid:{a,b,c}){base.upsertObject(w,track(uuid));base.putGeometry(w,uuid,shape());}
+        base.seal(w);w.commit();
+    }
+    {
+        auto overlay=ObjectCollection::create(overlayPath,{basePath},options());auto w=overlay.write();
+        overlay.setMeta(w,{{},a},"label","\"metadata-only\"");
+        overlay.deleteObject(w,{{},b});w.commit();
+    }
+    auto overlay=ObjectStore::open(overlayPath,options());auto w=overlay.write();
+    GeometryWork work;GeometryWorkScope scope(work);
+    const auto mapped=[&]{
+        const auto columns=overlay.geometryArrayCounts(w,"track","points");
+        std::map<std::string,int64_t> result;
+        for(size_t i=0;i<columns.uuids.size();++i)result.emplace(formatUuid(columns.uuids[i]),columns.counts[i]);
+        return result;
+    };
+    require(mapped()==std::map<std::string,int64_t>{{a,3},{c,3}},
+        "metadata-only overrides keep their descriptor and tombstones suppress base geometry");
+    auto* sql=ObjectStoreImplAccess::conn(w);
+    std::string descriptor;
+    {Statement row(sql,"SELECT geometry_manifest FROM objects WHERE uuid=?",parseUuid(a));row.row();descriptor=row.text(0);}
+    execute(sql,"UPDATE objects SET geometry_manifest=NULL WHERE uuid=?",parseUuid(a));
+    require(!overlay.currentGeometry(w,a),"the metadata overlay's missing head stays absent");
+    require(mapped()==std::map<std::string,int64_t>{{a,0},{c,3}},
+        "descriptor catalog never falls through a missing overlay head to base/archive geometry");
+    require(work.readBytes.empty(),"overlaid descriptor counts never load coordinate payloads");
+    execute(sql,"UPDATE objects SET geometry_manifest=? WHERE uuid=?",descriptor,parseUuid(a));w.commit();
+    auto r=overlay.read();ObjectSelection selection;selection.kind="track";
+    const auto view=overlay.geometryReadView(r,selection);
+    require(view.selectedObjects->size()==2,"current geometry selection suppresses inherited tombstones");
+    const auto changed=std::find_if(view.selectedObjects->begin(),view.selectedObjects->end(),[&](const auto& o){return o.objectUuid==a;});
+    const auto inherited=std::find_if(view.selectedObjects->begin(),view.selectedObjects->end(),[&](const auto& o){return o.objectUuid==c;});
+    require(changed->record.meta.find("metadata-only")!=std::string::npos&&
+            changed->reference().storeUuid!=inherited->reference().storeUuid,
+            "current geometry keeps overlaid metadata with its actual owner and inherited metadata with its base owner");
+    const auto packed=overlay.readSelectedGeometryArrays(r,*view.selectedObjects,"points");
+    require(packed.offsets==std::vector<uint64_t>{0,3,6},"overlaid and inherited geometry use one verified packed read");
+}
+
+void currentGeometryReadIntegrity(HistoryMode history)
+{
+    TemporaryDirectory dir;auto config=options();config.history=history;
+    const auto path=dir.path/"current-read";const auto id=util::newUuid();
+    std::string descriptor,checksum;
+    {
+        auto store=ObjectStore::create(path,config);auto w=store.write();
+        store.upsertObject(w,track(id));store.putGeometry(w,id,shape());w.commit();
+        auto r=store.read();auto* sql=ObjectStoreImplAccess::conn(r);
+        Statement saved(sql,"SELECT geometry_manifest,data_checksum FROM objects WHERE uuid=?",parseUuid(id));saved.row();
+        descriptor=saved.text(0);checksum=saved.text(1);
+        ObjectSelection selection;selection.kind="track";
+        const auto view=store.geometryReadView(r,selection);
+        require(view.selectedObjects&&view.selectedObjects->size()==1,"current geometry view retains its selected metadata");
+        require(view.edgeUuids.empty(),"current geometry view never enumerates graph evidence");
+        require(store.readSelectedGeometryArrays(r,*view.selectedObjects,"points").data==shape().arrays.front().bytes,
+            "current selected geometry uses the ordinary verified packed reader");
+    }
+    const auto mutate=[&](const std::optional<std::string>& manifest,const std::string& hash){
+        Db raw(openConnection(path,SQLITE_OPEN_READWRITE,config,false),sqlite3_close_v2);
+        int previous=0;check(sqlite3_db_config(raw.get(),SQLITE_DBCONFIG_ENABLE_TRIGGER,0,&previous),raw.get());
+        execute(raw.get(),"UPDATE objects SET geometry_manifest=?,data_checksum=? WHERE uuid=?",manifest,hash,parseUuid(id));
+    };
+    const auto read=[&](bool empty){
+        auto store=ObjectStore::open(path,OpenOptions{.readOnly=true});auto r=store.read();
+        ObjectSelection selection;selection.kind="track";
+        const auto view=store.geometryReadView(r,selection);
+        if(empty){
+            require(!view.geometryRevisions.at(0),"absent current head is not recovered from its archive");
+            mustFail([&]{store.readSelectedGeometryArrays(r,*view.selectedObjects,"points");});
+        }else store.readSelectedGeometryArrays(r,*view.selectedObjects,"points");
+    };
+    mutate(std::string("{}"),checksum);mustFail([&]{read(false);});
+    if(history==HistoryMode::On){
+        auto changed=Json::parse(descriptor);changed["attributes"]["unexpected"]=true;
+        const auto text=changed.dump();mutate(text,hashText(text));
+        mustFail([&]{read(false);}); // A valid but conflicting current manifest must not be ignored.
+    }
+    mutate(std::nullopt,checksum);read(true);
 }
 
 void independentGeometryBranches()
@@ -215,7 +337,7 @@ void unpublishedRelationship()
      for(const auto& id:{a,b}){store.upsertObject(w,track(id));const auto token=store.putGeometry(w,id,shape());if(id==a)before=token;}
      w.commit();}
     auto w=store.write();
-    EdgeRecord edge;edge.kind="related";edge.aUuid=a;edge.bUuid=b;
+    EdgeRecord edge;edge.kind="declared_reference";edge.aUuid=a;edge.bUuid=b;
     edge.aAnchor.points=edge.bAnchor.points={{"points",{0}}};
     const auto id=store.addEdge(w,edge);
     mustFail([&]{store.keepRecordedRelationship(w,id);});
@@ -265,7 +387,7 @@ void changedRelationshipKeepsPublishedGeometry(bool retainFirst)
     const auto a=util::newUuid(),b=util::newUuid();std::string edge,before;
     {auto w=store.write();
      for(const auto& id:{a,b}){store.upsertObject(w,track(id));const auto token=store.putGeometry(w,id,shape());if(id==a)before=token;}
-     EdgeRecord record;record.kind="related";record.aUuid=a;record.bUuid=b;
+     EdgeRecord record;record.kind="declared_reference";record.aUuid=a;record.bUuid=b;
      record.aAnchor.points=record.bAnchor.points={{"points",{0}}};edge=store.addEdge(w,record);w.commit();}
     const std::array<int32_t,1> changed{40};
     {auto w=store.write();
@@ -286,5 +408,5 @@ void changedRelationshipKeepsPublishedGeometry(bool retainFirst)
     require((record.aUuid==a?state.aRevision:state.bRevision)==before,"keep-recorded preserves the published endpoint geometry");
 }
 }
-int main()try{restoreBorrowedDelta();borrowedChunks();currentDescriptor(HistoryMode::Off);currentDescriptor(HistoryMode::On);independentGeometryBranches();retainedPointIdentities();restoreArchivedGeometry();unpublishedRelationship();changedRelationshipKeepsPublishedGeometry(false);changedRelationshipKeepsPublishedGeometry(true);std::cout<<"geometry descriptor tests passed\n";}
+int main()try{restoreBorrowedDelta();borrowedChunks();currentDescriptor(HistoryMode::Off);currentDescriptor(HistoryMode::On);descriptorCatalogOverlay(HistoryMode::Off);descriptorCatalogOverlay(HistoryMode::On);currentGeometryReadIntegrity(HistoryMode::Off);currentGeometryReadIntegrity(HistoryMode::On);independentGeometryBranches();retainedPointIdentities();restoreArchivedGeometry();unpublishedRelationship();changedRelationshipKeepsPublishedGeometry(false);changedRelationshipKeepsPublishedGeometry(true);std::cout<<"geometry descriptor tests passed\n";}
 catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}

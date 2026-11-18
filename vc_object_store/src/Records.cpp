@@ -3,6 +3,7 @@
 #include "internal/RecordOverrides.hpp"
 #include "internal/ExtensionHistory.hpp"
 #include "geometry/GeometryDelta.hpp"
+#include "internal/ObjectScan.hpp"
 
 namespace vc::objects {
 using namespace detail;
@@ -49,10 +50,12 @@ int64_t ObjectStore::objectCount(const Txn& txn, const std::string& kind, bool i
     auto* db = static_cast<sqlite3*>(connection(txn));
     if(querySources(db).size()>1){
         ObjectSelection selection;selection.kind=kind;selection.includeRetired=includeRetired;
-        return selectObjects(txn,selection,std::vector<std::string>{}).size();
+        int64_t count=0;
+        scanVisibleObjectReferences(db,selection,[&](ObjectVersion&&){++count;return true;});
+        return count;
     }
-    Statement s(db, "SELECT count(*) FROM objects WHERE kind=? AND state<>2" +
-        (includeRetired ? std::string() : " AND " + activeObjectSql("objects.id")), kind);
+    Statement s(db, std::string("SELECT count(*) FROM objects WHERE kind=? AND ")+
+        (includeRetired?"state<>2":"state=0"), kind);
     (void)s.row();
     return s.i64(0);
 }

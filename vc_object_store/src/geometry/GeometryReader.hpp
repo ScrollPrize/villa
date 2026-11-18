@@ -39,6 +39,7 @@ private:
 
     sqlite3* db_;
     std::array<unsigned char, 16> revision_;
+    bool currentOnly_ = false;
     bool cacheChunks_;
     nlohmann::json manifest_;
     std::string contentHash_;

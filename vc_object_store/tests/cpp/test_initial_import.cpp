@@ -5,6 +5,7 @@
 #include <fstream>
 #include <future>
 #include <iostream>
+#include <map>
 #include <sqlite3.h>
 #include <thread>
 
@@ -21,8 +22,7 @@ struct CountConnections {
 InitialImportOptions options(size_t shards=1,bool packed=false)
 {
     InitialImportOptions result;result.store.author="bulk-api-test";result.uuidHashRouting=false;result.shards.clear();
-    for(size_t i=0;i<shards;++i)result.shards.push_back({{int64_t(i*100+1),int64_t((i+1)*100)},
-        {int64_t(i*100+1),int64_t((i+1)*100)}});
+    for(size_t i=0;i<shards;++i)result.shards.push_back({{int64_t(i*100+1),int64_t((i+1)*100)}});
     if(packed){result.packed.emplace();result.packed->memoryFirst=true;result.packed->disposableBulk=true;
         result.packed->backgroundFlush=false;result.packed->residentBytes=64*1024*1024;}
     return result;
@@ -77,6 +77,8 @@ void roundTrip(size_t shards,bool packed)
     require(store.provisioning(r).sealed && store.provisioning(r).commitSequence>baseSequence,
         "sealed commit sequence follows dependencies");
     const auto pin=store.provisioning(r);
+    require(result.generation==pin.generation && result.commitSequence==pin.commitSequence,
+        "import returns the sealed snapshot without a reader reopen");
     for(const auto& member:store.members())if(member.storeUuid==result.storeUuid)
         require(member.generation==pin.generation&&member.commitSequence==pin.commitSequence,
             "parallel shards share the manifest lineage and commit sequence");
@@ -172,7 +174,7 @@ void phased(bool packed)
     },[&](size_t i,auto& shard){
         if(i==0)require(!secondObjectStarted,"referenced sibling object must not exist yet");
         bool sent=false;shard.importEdges([&](auto& batch){if(sent)return false;sent=true;
-            EdgeRecord edge;edge.uuid=edges[i];edge.kind="sibling";edge.aAnchor.points={{"line_points",{1}}};
+            EdgeRecord edge;edge.uuid=edges[i];edge.kind="declared_reference";edge.aAnchor.points={{"line_points",{1}}};
             edge.bAnchor.points={{"line_points",{0}}};edge.aAnchor.metadataKeys={"native"};
             batch.push_back({{shard.storeUuid(),ids[i]},{shard.storeUuid(),ids[(i+1)%2]},edge});return true;});
         if(i==0)firstEdgesImported.set_value();
@@ -197,7 +199,7 @@ void directConnections(bool packed) {
                 [&](size_t i,auto& shard){auto row=fiber(ids[i]);row.id=opt.shards[i].objectIds[0];shard.appendObjects(std::span(&row,1));},
                 [&](size_t i,auto& shard){if(count==1)return;bool sent=false;
                     shard.importEdges([&](auto& batch){if(sent)return false;sent=true;
-                        EdgeRecord edge;edge.uuid=util::newUuid();edge.kind="direct";
+                        EdgeRecord edge;edge.uuid=util::newUuid();edge.kind="declared_reference";
                         edge.aAnchor.wholeGeometry=edge.bAnchor.wholeGeometry=true;
                         batch.push_back({{shard.storeUuid(),ids[i]},{shard.storeUuid(),ids[(i+1)%count]},edge});return true;});});
             require(connectionCount==count+(count>1?1:0),
@@ -216,6 +218,29 @@ void directConnections(bool packed) {
         }
     }
 }
+void dependencyReaderConnections(bool packed)
+{
+    TemporaryDirectory dir;
+    constexpr size_t shards=4;
+    auto opt=options(shards,packed);
+    const auto base=importInitialCollection(dir.path/"base",opt,[](size_t,auto&){});
+    opt.dependencies={base.path};
+    // Initial-import workers are thread-confined. An ordinary reader-pool
+    // setting must not multiply connections by both input and output shards.
+    opt.store.readerPoolSize=16;
+    {
+        CountConnections observed;
+        const auto result=importInitialCollection(dir.path/"derived",opt,[](size_t,auto&){});
+        require(result.shards.size()==shards,"derived import keeps all shards");
+        const size_t maxConnections=shards*(2*(shards+1)+1)+1;
+        require(connectionCount<=maxConnections,"batch dependencies need one reader per database per worker, not a pool");
+    }
+    auto collection=ObjectCollection::open(packed?dir.path/"derived":dir.path/"derived/collection.vcobj",
+        OpenOptions{.readOnly=true});
+    auto read=collection.read();
+    require(collection.provisioning(read).sealed,"derived import remains readable and sealed");
+}
+
 void phaseFailures()
 {
     TemporaryDirectory dir;auto opt=options(3);
@@ -235,7 +260,7 @@ void phaseFailures()
     std::vector<std::string> ids(3);for(auto& id:ids)id=util::newUuid();
     fail([&](size_t i,auto& shard){auto row=fiber(ids[i]);shard.appendObjects(std::span(&row,1));},[&](size_t i,auto& shard){
         bool sent=false;shard.importEdges([&](auto& batch){if(sent)return false;sent=true;
-            EdgeRecord edge;edge.kind="bad";edge.uuid="not-a-uuid";
+            EdgeRecord edge;edge.kind="declared_reference";edge.uuid="not-a-uuid";
             batch.push_back({{shard.storeUuid(),ids[i]},{shard.storeUuid(),ids[(i+1)%3]},edge});return true;});
     });
     // Uniqueness must reject even cross-batch duplicates before any
@@ -249,7 +274,7 @@ void phaseFailures()
                 const auto edgeUuid=util::newUuid();
                 try{shard.importEdges([&](auto& batch){
                     if(batchNumber++==2)return false;
-                    EdgeRecord edge;edge.uuid=edgeUuid;edge.kind="duplicate";
+                    EdgeRecord edge;edge.uuid=edgeUuid;edge.kind="declared_reference";
                     edge.aAnchor.wholeGeometry=edge.bAnchor.wholeGeometry=true;
                     batch.push_back({{shard.storeUuid(),ids[i]},{shard.storeUuid(),ids[(i+1)%3]},edge});
                     return true;
@@ -286,6 +311,143 @@ void sourceCompletion(size_t shards,bool packed)
     mustFail([&]{importInitialCollection(dir.path/"failed",opt,[](size_t,auto&){throw std::runtime_error("producer failed");});});
     require(completions==2&&!std::filesystem::exists(dir.path/"failed"),"producer failure skips completion and publication");
 }
+
+ExtensionTable stagedMeasurements()
+{
+    ExtensionTable table;table.name="ext_test_staged_measurements";table.extension="test_staging";table.keySpace="edges";
+    table.columns={{"edge_uuid",ExtensionType::Blob},{"value",ExtensionType::Real},
+        {"valid",ExtensionType::Integer},{"label",ExtensionType::Text,true},{"payload",ExtensionType::Blob}};
+    table.primaryKey={"edge_uuid"};return table;
 }
-int main(){try{for(bool packed:{false,true}){for(size_t count:{1u,2u}){roundTrip(count,packed);sourceCompletion(count,packed);}phased(packed);directConnections(packed);}failures();phaseFailures();
+ExtensionTable immediateMeasurements()
+{
+    ExtensionTable table;table.name="ext_test_immediate_measurements";table.extension="test_staging";table.keySpace="edges";
+    table.columns={{"edge_uuid",ExtensionType::Blob},{"ordinal",ExtensionType::Integer}};
+    table.primaryKey={"edge_uuid"};return table;
+}
+void stagedExtensionTransfer(bool packed)
+{
+    TemporaryDirectory dir;auto opt=options(2,packed);
+    const auto definition=stagedMeasurements(),immediate=immediateMeasurements();
+    opt.extensions={definition,immediate};opt.edges.stagedExtensions={definition.name};
+    std::vector<std::string> ids(2);for(auto& id:ids)id=util::newUuid();
+    std::array<std::array<std::string,2>,2> edges;
+    for(auto& shard:edges)for(auto& id:shard)id=util::newUuid();
+    std::atomic<size_t> transformed=0;InitialImportResult result;
+    {
+        CountConnections connections;
+        result=importInitialCollection(dir.path/"staged",opt,[&](size_t i,auto& shard){
+            auto row=fiber(ids[i]);shard.appendObjects(std::span(&row,1));
+        },[&](size_t i,auto& shard){
+            size_t next=0;
+            const auto count=shard.importEdges([&](auto& batch){
+                if(next==2)return false;
+                InitialCollectionEdge edge;edge.record.uuid=edges[i][next];edge.record.kind="declared_reference";
+                edge.record.aAnchor.wholeGeometry=edge.record.bAnchor.wholeGeometry=true;
+                edge.a={shard.storeUuid(),ids[i]};edge.b={shard.storeUuid(),ids[(i+1)%2]};
+                const auto ordinal=int64_t(i*2+next);
+                ExtensionRow values={extensionUuid(edge.record.uuid),double(ordinal)+.25,int64_t(1),
+                    next?ExtensionValue(std::monostate{}):ExtensionValue(std::string("kept")),std::vector<uint8_t>{0,1,2}};
+                edge.extensions.push_back({definition.name,std::move(values),std::vector<uint8_t>{3,4,5}});
+                edge.extensions.push_back({immediate.name,{extensionUuid(edge.record.uuid),ordinal}});
+                batch.push_back(std::move(edge));++next;return true;
+            });
+            require(count==2,"staging preserves native edge count");
+            require(shard.transferStagedExtensionRows(definition.name,[&](ExtensionRow& row){
+                require(row.size()==definition.columns.size()+1&&std::get<std::vector<uint8_t>>(row.back())==std::vector<uint8_t>({3,4,5}),
+                    "temporary staging payload is available to the transform only");
+                row[1]=-std::get<double>(row[1]);++transformed;
+            },1)==2,"staged transfer returns rows written across bounded batches");
+        });
+        require(connectionCount==3,"staging must not reopen shards or create additional SQLite connections");
+    }
+    require(transformed==4,"every staged row is transformed exactly once");
+    auto store=ObjectCollection::open(result.path,OpenOptions{.readOnly=true});auto txn=store.read();
+    std::map<std::string,size_t> publishedDefinitions;
+    for(const auto& table:store.extensionTables(txn)) {
+        require(table.name==definition.name||table.name==immediate.name,
+            "temporary staging must not leak into published extension metadata");
+        ++publishedDefinitions[table.name];
+    }
+    require(publishedDefinitions.size()==2,"both public extension definitions are retained across shards");
+    std::map<std::string,size_t> expected;
+    for(size_t i=0;i<edges.size();++i)for(size_t j=0;j<edges[i].size();++j)expected.emplace(edges[i][j],i*2+j);
+    size_t seen=0;
+    store.scanExtensionRows(txn,definition.name,[&](const ExtensionRow& row){
+        require(row.size()==definition.columns.size(),"staging-only payload is not a published column");
+        const auto ordinal=expected.at(extensionUuid(row[0]));
+        require(std::get<double>(row[1])==-(double(ordinal)+.25),"published rows contain transformed values, not staged originals");
+        require(std::get<int64_t>(row[2])==1&&std::get<std::vector<uint8_t>>(row[4])==std::vector<uint8_t>({0,1,2}),
+            "staging retains untouched integer and binary values");
+        if(ordinal%2)require(std::holds_alternative<std::monostate>(row[3]),"staging retains NULL values");
+        else require(std::get<std::string>(row[3])=="kept","staging retains text values");
+        require(bool(store.edge(txn,{result.storeUuid,extensionUuid(row[0])})),"transferred measurement addresses the original native edge");
+        ++seen;return true;
+    });
+    require(seen==4,"published staged row count");
+    seen=0;store.scanExtensionRows(txn,immediate.name,[&](const ExtensionRow& row){
+        require(std::get<int64_t>(row[1])==int64_t(expected.at(extensionUuid(row[0]))),"nonstaged extension rows are unchanged");
+        ++seen;return true;
+    });
+    require(seen==4,"staged and immediate extensions coexist in the same edge stream");
+}
+void stagedExtensionFailures(bool packed)
+{
+    TemporaryDirectory dir;auto opt=options(1,packed);const auto definition=stagedMeasurements();
+    opt.extensions={definition};opt.edges.stagedExtensions={definition.name};
+    const auto object=util::newUuid(),otherObject=util::newUuid();
+    for(int mode:{0,1,2}){
+        const auto output=dir.path/("failed-"+std::to_string(mode));
+        mustFail([&]{importInitialCollection(output,opt,[&](size_t,auto& shard){
+            auto row=fiber(object);shard.appendObjects(std::span(&row,1));
+            row=fiber(otherObject);shard.appendObjects(std::span(&row,1));
+        },[&](size_t,auto& shard){
+            int sent=0;shard.importEdges([&](auto& batch){
+                if(sent==2)return false;
+                InitialCollectionEdge edge;edge.record.uuid=util::newUuid();edge.record.kind="declared_reference";
+                edge.record.aAnchor.wholeGeometry=edge.record.bAnchor.wholeGeometry=true;
+                edge.a={shard.storeUuid(),object};edge.b={shard.storeUuid(),otherObject};
+                edge.extensions.push_back({definition.name,{extensionUuid(edge.record.uuid),double(sent),int64_t(1),
+                    std::monostate{},std::vector<uint8_t>{7}}});
+                batch.push_back(std::move(edge));++sent;return true;
+            });
+            if(mode==0)return; // Untransferred staged rows must prevent sealing.
+            size_t transformed=0;
+            shard.transferStagedExtensionRows(definition.name,[&](ExtensionRow& row){
+                if(mode==1&&++transformed==2)throw std::runtime_error("transform failed after one row");
+                if(mode==2)row.pop_back(); // Invalid final row must not be published.
+            },1);
+        });});
+        require(!std::filesystem::exists(output),"staging/transform failure must not publish any partial store");
+        require(std::filesystem::is_empty(dir.path),"staging/transform failure cleans all private data");
+    }
+}
+void changedHistoryDependencyKeepsPublication(bool packed)
+{
+    TemporaryDirectory dir;auto opt=options(2,packed);
+    const auto base=dir.path/"mutable.vcobj",output=dir.path/"failed.vcobj";
+    OpenOptions sourceOptions;sourceOptions.author="source";sourceOptions.spatialIndex=false;
+    {auto source=ObjectStore::create(base,sourceOptions);auto write=source.write();
+        ObjectRecord record;record.kind="note";source.upsertObject(write,record);write.commit();}
+    opt.dependencies={base};
+    // Runs after the workers finish, before durable publication. The retained
+    // source is still readable, but its newer membership must not be followed.
+    opt.beforePublish=[&]{auto source=ObjectStore::open(base,sourceOptions);auto write=source.write();
+        ObjectRecord record;record.kind="note";source.upsertObject(write,record);write.commit();};
+    const auto result=importInitialCollection(output,opt,[](size_t,auto&){});
+    auto reader=ObjectCollection::open(result.path,OpenOptions{.readOnly=true});auto read=reader.read();size_t count=0;
+    reader.scanObjects(read,[&](const auto&){++count;return true;});
+    require(count==1,"source advancement preserves the original dependency membership");
+    read.commit();
+    for(int iteration=0;iteration<3;++iteration){
+        {auto source=ObjectStore::open(base,sourceOptions);auto write=source.write();
+            ObjectRecord record;record.kind="note";source.upsertObject(write,record);write.commit();}
+        auto again=reader.read();count=0;
+        reader.scanObjects(again,[&](const auto&){++count;return true;});
+        require(count==1,"pooled historical projections survive source changes without leaking lease state");
+        again.commit();
+    }
+}
+}
+int main(){try{for(bool packed:{false,true}){for(size_t count:{1u,2u}){roundTrip(count,packed);sourceCompletion(count,packed);}phased(packed);directConnections(packed);dependencyReaderConnections(packed);stagedExtensionTransfer(packed);stagedExtensionFailures(packed);changedHistoryDependencyKeepsPublication(packed);}failures();phaseFailures();
     std::cout<<"initial import passed\n";return 0;}catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}
