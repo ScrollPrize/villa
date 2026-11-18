@@ -521,6 +521,11 @@ struct FiberModeOptimizationRequest {
     // Ordinary line annotation retains open geometry outside the controls.
     // Spiral 2D annotation uses the controls as inclusive bounds.
     bool retainOpenTails = true;
+    // Cspline-only annotation (LineAnnotationCsplineOnly.hpp): no normal
+    // sampler is required, every attempted span is Cspline (spans outside
+    // dirtySegments / globalGoalsOnly keep their geometry) and both open
+    // tails are rays.
+    bool csplineOnly = false;
     // CT + model session: no Lasagna initialization, normal field or fallback.
     // The builder supplies measured model/CT normals after geometry is complete.
     std::function<vc::lasagna::LineModel(const std::vector<cv::Vec3d>&)> modelLineBuilder;

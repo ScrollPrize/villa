@@ -364,3 +364,103 @@ TEST_CASE("reverse-then-merge covers the endpoint orientation recipe")
     CHECK(merged->linePoints[merged->linePoints.size() - 3] ==
           cv::Vec3d(3.0, 0.0, 0.0));
 }
+
+TEST_CASE("cspline-only optimization needs no normals and splines every span")
+{
+    // Three controls on a bent line; Global goals and the trace global mode
+    // would otherwise demand predictions or Lasagna normals.
+    const std::vector<cv::Vec3d> linePoints{
+        {0.0, 0.0, 0.0}, {50.0, 0.0, 0.0}, {100.0, 0.0, 0.0},
+        {150.0, 20.0, 0.0}, {200.0, 40.0, 0.0},
+    };
+    vc3d::line_annotation::FiberModeOptimizationRequest request;
+    request.controlPoints = {
+        {0.0, linePoints[0], true, 0},
+        {2.0, linePoints[2], false, 2},
+        {4.0, linePoints[4], false, 4},
+    };
+    request.linePointsBase = linePoints;
+    request.globalMode = FiberOptimizationMode::NativeFiberTrace3d;
+    request.csplineOnly = true;
+    request.lasagnaConfig.segmentLength = 5.0;
+    request.breakExtrapolationDistanceBaseVoxels = 30.0;
+
+    const auto result =
+        vc3d::line_annotation::optimizeFiberWithNativeFallback(std::move(request));
+    REQUIRE(result.controlPoints.size() == 3);
+    CHECK(result.nativeSegments == 0);
+    CHECK(result.lasagnaFallbackSegments == 0);
+    CHECK(result.rayExtrapolations == 2);
+    const auto& points = result.optimization.line.points;
+    for (size_t i = 0; i < result.controlPoints.size(); ++i) {
+        const auto& control = result.controlPoints[i];
+        REQUIRE(control.optimizedIndex >= 0);
+        REQUIRE(static_cast<size_t>(control.optimizedIndex) < points.size());
+        CHECK(cv::norm(points[static_cast<size_t>(control.optimizedIndex)].position -
+                       control.volumePoint) < 1e-9);
+        if (i + 1 < result.controlPoints.size()) {
+            REQUIRE(control.segmentToNext);
+            CHECK(control.segmentToNext->interpMode == SegmentInterpolationMode::Cspline);
+        }
+    }
+    // Ray tails extend past both end controls.
+    CHECK(result.controlPoints.front().optimizedIndex > 0);
+    CHECK(static_cast<size_t>(result.controlPoints.back().optimizedIndex) + 1 < points.size());
+}
+
+TEST_CASE("cspline-only single seed gets ray tails without normals")
+{
+    vc3d::line_annotation::FiberModeOptimizationRequest request;
+    request.controlPoints = {{1.0, {10.0, 0.0, 0.0}, true, 1}};
+    request.linePointsBase = {{9.0, 0.0, 0.0}, {10.0, 0.0, 0.0}, {11.0, 0.0, 0.0}};
+    request.csplineOnly = true;
+    request.lasagnaConfig.segmentLength = 5.0;
+    request.breakExtrapolationDistanceBaseVoxels = 30.0;
+
+    const auto result =
+        vc3d::line_annotation::optimizeFiberWithNativeFallback(std::move(request));
+    const auto& points = result.optimization.line.points;
+    REQUIRE(points.size() > 3);
+    CHECK(result.rayExtrapolations == 2);
+    CHECK(cv::norm(points[static_cast<size_t>(result.controlPoints.front().optimizedIndex)].position -
+                   cv::Vec3d(10.0, 0.0, 0.0)) < 1e-9);
+    CHECK(std::abs(points.front().position[0] - points.back().position[0]) > 50.0);
+}
+
+TEST_CASE("cspline-only partial solve keeps spans outside the dirty set")
+{
+    const std::vector<cv::Vec3d> linePoints{
+        {0.0, 0.0, 0.0}, {50.0, 5.0, 0.0}, {100.0, 0.0, 0.0},
+        {150.0, 20.0, 0.0}, {200.0, 40.0, 0.0},
+    };
+    vc3d::line_annotation::FiberModeOptimizationRequest request;
+    request.controlPoints = {
+        {0.0, linePoints[0], true, 0},
+        {2.0, linePoints[2], false, 2},
+        {4.0, linePoints[4], false, 4},
+    };
+    FiberTraceSegmentMetadata lasagnaSpan;
+    lasagnaSpan.interpMode = SegmentInterpolationMode::Lasagna;
+    lasagnaSpan.message = "lasagna";
+    request.controlPoints[0].segmentToNext = lasagnaSpan;
+    request.controlPoints[1].segmentToNext = lasagnaSpan;
+    request.linePointsBase = linePoints;
+    request.csplineOnly = true;
+    request.dirtySegments = std::vector<size_t>{1};
+    request.lasagnaConfig.segmentLength = 5.0;
+    request.breakExtrapolationDistanceBaseVoxels = 30.0;
+
+    const auto result =
+        vc3d::line_annotation::optimizeFiberWithNativeFallback(std::move(request));
+    REQUIRE(result.controlPoints.size() == 3);
+    REQUIRE(result.controlPoints[0].segmentToNext);
+    REQUIRE(result.controlPoints[1].segmentToNext);
+    CHECK(result.controlPoints[0].segmentToNext->interpMode == SegmentInterpolationMode::Lasagna);
+    CHECK(result.controlPoints[1].segmentToNext->interpMode == SegmentInterpolationMode::Cspline);
+    // The kept span's interior vertex survives unchanged.
+    const auto& points = result.optimization.line.points;
+    const int first = result.controlPoints[0].optimizedIndex;
+    REQUIRE(first >= 0);
+    REQUIRE(static_cast<size_t>(first) + 1 < points.size());
+    CHECK(cv::norm(points[static_cast<size_t>(first) + 1].position - linePoints[1]) < 1e-9);
+}
