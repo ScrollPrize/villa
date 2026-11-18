@@ -1012,6 +1012,11 @@ ConversionResult convertStoreInPlace(const std::filesystem::path& input,
     // The converter verified and copied every referenced artifact. In-place
     // replacement keeps the original, identical content-addressed files;
     // only the SQLite file changes atomically. The verified copies are private.
+#ifdef _WIN32
+    // Windows refuses to replace a file that is still open. Close the locked
+    // connection first; the service ownership guard still excludes clients.
+    locked = Connection{};
+#endif
     vcr::platform::replace_file(sibling, source, true);
     cleanup.published=true;
     vcr::platform::sync_directory(source.parent_path(), "vcobj schema conversion");
