@@ -368,6 +368,10 @@ This writes `render/00.tif` (360×360 pixels for the segment above, about
   `--voxel-unit` applies to `--voxel-size` and defaults to `nanometer`, so
   pass both flags when overriding; `--voxel-size 45.532` alone yields a TIFF
   resolution 1000× too large.
+  `--voxel-size` is always the size of a level-0 voxel, whatever `-g` is: the
+  renderer scales it to the rendered level itself and logs the result as
+  `Output pixel size (group 1, scale 1): ...`. Passing the level-1 size with
+  `-g 1` declares pixels twice their real size.
 - `-g` selects the pyramid level: `-g 3` renders the same segment at 1/8
   scale (45×45 pixels, about 4 MiB fetched). A level the remote pyramid does
   not have fails immediately with

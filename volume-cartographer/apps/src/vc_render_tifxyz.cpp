@@ -885,7 +885,7 @@ int main(int argc, char *argv[])
         ("pyramid", po::value<bool>()->default_value(true), "Build pyramid levels L1-L5 (default: true)")
         ("resume", po::bool_switch()->default_value(false), "Skip chunks that already exist on disk")
         ("pre", po::bool_switch()->default_value(false), "Create zarr + all level datasets")
-        ("voxel-size", po::value<double>(), "Physical voxel size for OME-Zarr scale metadata (reads from volume metadata if omitted)")
+        ("voxel-size", po::value<double>(), "Physical size of one level-0 voxel of the source volume, whatever --group-idx is; the renderer scales it to the level and --scale it renders at when it writes the OME-Zarr scale metadata (reads from volume metadata if omitted)")
         ("voxel-unit", po::value<std::string>()->default_value("nanometer"), "Unit of the number given to --voxel-size (nanometer, micrometer, millimeter, meter). Sizes read from volume metadata are always declared in micrometer.");
     StoreToolOptions::add(optional, "Object store holding the --surface to render; with --volume-uuid it is read in "
                                     "that volume's voxels through the store's view of it (its binding or a "
@@ -1283,8 +1283,8 @@ int main(int argc, char *argv[])
         }
 
         if (resolved.isUsable()) {
-            // Log exactly what .zattrs will declare, so the log line can be
-            // checked against the output instead of needing its own conversion.
+            // Log the level-0 size in the unit .zattrs will use. What .zattrs
+            // declares for the rendered level is logged below, once it is known.
             logPrintf(stdout, "Voxel size (%s): %g %s\n",
                       voxelSizeSourceName(resolved.source), zarr_voxel_value,
                       zarr_voxel_unit.c_str());
@@ -1319,6 +1319,17 @@ int main(int argc, char *argv[])
         render_level_voxel_size = ds_scale > 0
             ? zarr_voxel_value / double(ds_scale)
             : zarr_voxel_value;
+
+        // Log exactly what .zattrs will declare in-plane at output level 0, so
+        // the log can be checked against the output. It differs from the line
+        // above whenever --group-idx or --scale is not 0 / 1: a caller who passes
+        // the size of the level being rendered sees the doubled value here.
+        if (resolved.isUsable()) {
+            const double px = tgt_scale > 0 ? double(tgt_scale) : 1.0;
+            logPrintf(stdout, "Output pixel size (group %d, scale %g): %g %s\n",
+                      group_idx, double(tgt_scale), render_level_voxel_size / px,
+                      zarr_voxel_unit.c_str());
+        }
     }
 
     int rotQuadGlobal = -1;
