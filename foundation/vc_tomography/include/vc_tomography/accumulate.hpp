@@ -125,6 +125,12 @@ struct AccumScanView {
     int col_rows = 0;
     int col_stride = 0;
     int col_shifted = 0;
+    // optional (accumulate sets it with col_slot for the block in hand): the flat-fielded intensity of every raw sample
+    // of the block's projections, each computed once: a row of a frame is a tap of the vertical kernel of every stack
+    // row within the kernel's reach of it. The intensity of projection k at stack row t (window row t + win_off),
+    // detector column c is ff[(col_slot[k] * win_rows + t + win_off) * det_cols + c]; window rows off the detector
+    // hold 0 and are not read.
+    const float* ff = nullptr;
     // optional (accumulate sets it with col_val, unless it grids measured pixels only): the vertically interpolated
     // weights of the block's projections (the scan's weight map, or the second one while its sums are made), each
     // computed once with its value: the row a sample is read at need not be found again at every pixel it lands on.

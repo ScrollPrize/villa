@@ -174,27 +174,43 @@ void shift_rows(float* rows, int n_rows, int n, float shift, const float* shifts
 
 namespace {
 
-// rows read at positions(r, j0, count, p): the positions of samples [j0, j0 + count) of row r (sino.hpp)
+// the oversampled row's transform back in the precision T (sino.hpp resample_real)
+inline FftwfPlan inverse_plan(int m, std::complex<float>* spectrum, float* samples) {
+    return make_fftw_plan([&] { return fftwf_plan_dft_c2r_1d(m, reinterpret_cast<fftwf_complex*>(spectrum), samples, FFTW_ESTIMATE | FFTW_UNALIGNED); });
+}
+inline FftwPlan inverse_plan(int m, std::complex<double>* spectrum, double* samples) {
+    return make_fftw_plan([&] { return fftw_plan_dft_c2r_1d(m, reinterpret_cast<fftw_complex*>(spectrum), samples, FFTW_ESTIMATE | FFTW_UNALIGNED); });
+}
+inline void inverse(const FftwfPlan& plan, std::complex<float>* spectrum, float* samples) {
+    fftwf_execute_dft_c2r(plan, reinterpret_cast<fftwf_complex*>(spectrum), samples);
+}
+inline void inverse(const FftwPlan& plan, std::complex<double>* spectrum, double* samples) {
+    fftw_execute_dft_c2r(plan, reinterpret_cast<fftw_complex*>(spectrum), samples);
+}
+
+// rows read at positions(r, j0, count, p, below, rest): the positions p of samples [j0, j0 + count) of row r (sino.hpp;
+// true), or where the kernel starts for them (below, rest: sino_core::resample_values_near; false)
 template <class Positions>
 void resample_rows_at(float* rows, int n_rows, int n, const Positions& positions) {
+    using T = resample_real;
     if (n_rows <= 0 || n <= 1) return;
     const int L = upsample_fft_length(n), S = shift_row_stride(n), nc = L / 2 + 1;
     const int M = resample_oversampling * L, nco = M / 2 + 1;
-    const std::vector<double> factor = resample_deconvolution(n);
-    const double* kernel = resample_kernel().data();
+    const std::vector<double> factor_d = resample_deconvolution(n);
+    const std::vector<T> factor(factor_d.begin(), factor_d.end()), kernel_t(resample_kernel().begin(), resample_kernel().end());
+    const T* kernel = kernel_t.data();
     const FftwfPlan fwd = make_fftw_plan([&] { return fftwf_plan_dft_r2c_1d(L, rows, reinterpret_cast<fftwf_complex*>(rows), FFTW_ESTIMATE | FFTW_UNALIGNED); });
-    FftwPlan inv;
-    {
-        std::vector<std::complex<double>> spectrum(nco);
-        std::vector<double> samples(M);
-        inv = make_fftw_plan([&] { return fftw_plan_dft_c2r_1d(M, reinterpret_cast<fftw_complex*>(spectrum.data()), samples.data(), FFTW_ESTIMATE | FFTW_UNALIGNED); });
-    }
+    std::vector<std::complex<T>> plan_spectrum(nco);
+    std::vector<T> plan_samples(M);
+    const auto inv = inverse_plan(M, plan_spectrum.data(), plan_samples.data());
 #pragma omp parallel
     {
-        std::vector<std::complex<double>> spectrum(nco);
-        std::vector<double> samples(M);
+        std::vector<std::complex<T>> spectrum(nco);
+        std::vector<T> samples(M);
         constexpr int B = resample_block;
         double p[B];
+        int below[B];
+        float rest[B];
 #pragma omp for schedule(static)
         for (int r = 0; r < n_rows; ++r) {
             float* a = rows + static_cast<std::size_t>(r) * S;
@@ -202,13 +218,13 @@ void resample_rows_at(float* rows, int n_rows, int n, const Positions& positions
             for (int i = n; i < L; ++i) a[i] = sino_core::shift_bridge(last, first, i, n, L);
             fftwf_execute_dft_r2c(fwd, a, reinterpret_cast<fftwf_complex*>(a));
             for (int k = 0; k < nc; ++k)   // (the Nyquist bin of a real row is real)
-                spectrum[k] = std::complex<double>(a[2 * k] * factor[k], 2 * k == L ? 0.0 : a[2 * k + 1] * factor[k]);
-            std::fill(spectrum.begin() + nc, spectrum.end(), std::complex<double>(0));
-            fftw_execute_dft_c2r(inv, reinterpret_cast<fftw_complex*>(spectrum.data()), samples.data());
+                spectrum[k] = std::complex<T>(static_cast<T>(a[2 * k]) * factor[k], 2 * k == L ? static_cast<T>(0) : static_cast<T>(a[2 * k + 1]) * factor[k]);
+            std::fill(spectrum.begin() + nc, spectrum.end(), std::complex<T>(0));
+            inverse(inv, spectrum.data(), samples.data());
             for (int j0 = 0; j0 < n; j0 += B) {
                 const int count = std::min(B, n - j0);
-                positions(r, j0, count, p);
-                sino_core::resample_values<B>(samples.data(), M, p, kernel, a + j0, count);
+                if (positions(r, j0, count, p, below, rest)) sino_core::resample_values<B, T>(samples.data(), M, p, kernel, a + j0, count);
+                else sino_core::resample_values_near<B, T>(samples.data(), M, below, rest, kernel, a + j0, count);
             }
         }
     }
@@ -218,19 +234,35 @@ void resample_rows_at(float* rows, int n_rows, int n, const Positions& positions
 
 void resample_rows(float* rows, int n_rows, int n, const double* positions) {
     constexpr int B = resample_block;
-    resample_rows_at(rows, n_rows, n, [=](int r, int j0, int count, double* p) {
+    resample_rows_at(rows, n_rows, n, [=](int r, int j0, int count, double* p, int*, float*) {
         std::copy_n(positions + static_cast<std::size_t>(r) * n + j0, count, p);
         std::fill(p + count, p + B, 0.0);
+        return true;
     });
 }
 
 void resample_rows(float* rows, int n_rows, int n, const ResampleRow* row, const ResampleGeometry& g) {
     constexpr int B = resample_block;
-    resample_rows_at(rows, n_rows, n, [=, &g](int r, int j0, int, double* p) {
+    // the polynomial of each row's displacement along the row, where it has one (map_core::row_fit)
+    static const map_core::RowFitTable table = map_core::row_fit_table();
+    std::vector<double> fit(static_cast<std::size_t>(std::max(n_rows, 0)) * map_core::kRowFitSize);
+    const auto terms = [&](int r) {
         const ResampleRow& w = row[r];
-        double X[B], v[B];
-        for (int q = 0; q < B; ++q) X[q] = static_cast<double>(j0 + q) - static_cast<double>(w.shift);
-        map_core::source<B>(g.map, w.y, w.row_slope, g.slope_col, w.col_scale, g.scale_col, w.row_scale, g.scale_row, X, p, v);
+        return map_core::row_terms<double>(g.map, w.y, w.row_slope, g.slope_col, w.col_scale, g.scale_col, w.row_scale, g.scale_row);
+    };
+#pragma omp parallel for schedule(static)
+    for (int r = 0; r < n_rows; ++r)
+        map_core::row_fit(g.map, terms(r), table, static_cast<double>(row[r].shift), n, fit.data() + static_cast<std::size_t>(r) * map_core::kRowFitSize);
+    resample_rows_at(rows, n_rows, n, [&](int r, int j0, int, double* p, int* below, float* rest) {
+        const double* c = fit.data() + static_cast<std::size_t>(r) * map_core::kRowFitSize;
+        if (c[0] == c[0]) {
+            map_core::row_fit_taps<B>(c, static_cast<double>(row[r].shift), j0, n, resample_oversampling, resample_taps / 2, below, rest);
+            return false;
+        }
+        double X[B], v[B], du[B], dv[B];
+        for (int q = 0; q < B; ++q) X[q] = static_cast<double>(j0 + q) - static_cast<double>(row[r].shift);
+        map_core::source<B>(g.map, terms(r), X, p, v, du, dv);
+        return true;
     });
 }
 

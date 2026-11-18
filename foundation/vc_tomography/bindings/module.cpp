@@ -151,7 +151,7 @@ HostOut backproject_py(HostIn sino, HostIn angles, int ny, int nx, float rot_cen
         p.n_fan = static_cast<int>(fan->size());
     }
     if (tiles) {
-        const int T = kBackprojectTile, n_tiles = ((nx + T - 1) / T) * ((ny + T - 1) / T);
+        const int n_tiles = BackprojectTiles(ny, nx, x0, y0).count();
         std::vector<char> seen(static_cast<std::size_t>(std::max(n_tiles, 0)), 0);
         for (std::int32_t t : *tiles) {
             require(t >= 0 && t < n_tiles && !seen[t], "tiles: indices of the slice's tiles, each once");
@@ -1079,8 +1079,9 @@ NB_MODULE(_core, m) {
           "Exact pixel-driven backprojection of a parallel beam, or with fan (the fan [rad] of every column: the ray recorded at "
           "column m is the parallel beam's turned by fan[m] towards the angle less fan[m]) of a diverging one; interp 0 linear, 1 cubic (Keys), 2 lanczos3, 3 bspline3, 4 bspline5 "
           "(B-spline: pass bspline_prefilter'd rows); rows "
-          "sampled u_scale times per bin. tiles: only these 32 x 32 pixel tiles of the slice (index ty * ceil(nx / 32) + "
-          "tx) are computed, the others are 0");
+          "sampled u_scale times per bin. tiles: only these 32 x 32 pixel tiles are computed, the others are 0; the tiles are the "
+          "grid's, cut from its pixel (0, 0), and are numbered ty * ntx + tx from the one that holds the slice's first "
+          "pixel (x0, y0), ntx of them along x (kernels.hpp, BackprojectTiles)");
     m.def("upsample_rows",
           [](HostIn rows, int os, const std::string& device) {
               require(rows.ndim() == 2, "rows must be (n_rows, n)");

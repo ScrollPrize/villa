@@ -169,61 +169,100 @@ HR_HD void shift_bin(float& re, float& im, int k, int L, float shift) {
 }
 
 // ---------------------------------------------------------------- band-limited resampling of rows (sino.hpp)
+// the operations of the kernel's weights and sums in either precision: in single precision fused on both backends
+// (the same roundings), in double precision contracted under CUDA alone (hd::dmuladd)
+HR_HD float r_add(float a, float b) { return add(a, b); }
+HR_HD float r_sub(float a, float b) { return sub(a, b); }
+HR_HD float r_mul(float a, float b) { return mul(a, b); }
+HR_HD float r_muladd(float a, float b, float c) { return hd::fma(a, b, c); }
+HR_HD double r_add(double a, double b) { return dadd(a, b); }
+HR_HD double r_sub(double a, double b) { return dsub(a, b); }
+HR_HD double r_mul(double a, double b) { return dmul(a, b); }
+HR_HD double r_muladd(double a, double b, double c) { return dmuladd(a, b, c); }
+
 // The row's values at B positions p (samples of the row; any real numbers: the row is periodic) from g, its
 // transform laid in M = resample_oversampling x L bins and transformed back (M samples): for each the sum of the
-// resample_taps samples around resample_oversampling x p with the kernel's weights (kernel: resample_kernel()), in
-// ascending order. The weights of the taps i and taps - 1 - i are the two signs of one polynomial: its even and odd
-// parts in t are evaluated once, in powers of t^2. Out: the first `count` values (NaN for a position that is not
-// finite, or too large to be reduced to the row's period).
-template <int B>
-HR_HD void resample_values(const double* g, int M, const double* p, const double* kernel, float* out, int count) {
+// resample_taps samples around resample_oversampling x p with the kernel's weights (kernel: resample_kernel(), in
+// the precision T of g), in ascending order. The weights of the taps i and taps - 1 - i are the two signs of one
+// polynomial: its even and odd parts in t are evaluated once, in powers of t^2. A position's first tap and its
+// fraction t are found in double precision; the weights and the sum (resample_sums: from each position's first tap
+// and fraction) are in T. Out: the first `count` values (NaN for a position that is not finite, or too large to be
+// reduced to the row's period).
+template <int B, class T>
+HR_HD void resample_sums(const T* g, int M, const int* first, const T* t, const T* bad, const T* kernel, float* out, int count) {
     constexpr int H = resample_taps / 2, D = resample_degree;
     constexpr int qe = D - D % 2, qo = D - 1 + D % 2;   // the largest even and odd powers
     // (loops over the B positions, one operation each: the form the CPU's compilers vectorise)
-    double first[B], t[B], s[B], even[B], odd[B], bad[B], w[resample_taps][B];
+    T s[B], even[B], odd[B], w[resample_taps][B];
+    HR_SIMD
+    for (int l = 0; l < B; ++l) s[l] = r_mul(t[l], t[l]);
+    for (int i = 0; i < H; ++i) {
+        const T* c = kernel + i;   // (the coefficient of t^q of tap i: c[q * H])
+        HR_SIMD
+        for (int l = 0; l < B; ++l) even[l] = c[qe * H];
+        for (int q = qe - 2; q >= 0; q -= 2)
+            HR_SIMD
+            for (int l = 0; l < B; ++l) even[l] = r_muladd(even[l], s[l], c[q * H]);
+        HR_SIMD
+        for (int l = 0; l < B; ++l) odd[l] = c[qo * H];
+        for (int q = qo - 2; q >= 1; q -= 2)
+            HR_SIMD
+            for (int l = 0; l < B; ++l) odd[l] = r_muladd(odd[l], s[l], c[q * H]);
+        HR_SIMD
+        for (int l = 0; l < B; ++l) odd[l] = r_mul(odd[l], t[l]);
+        T* lower = w[i];
+        T* upper = w[resample_taps - 1 - i];
+        HR_SIMD
+        for (int l = 0; l < B; ++l) lower[l] = r_add(even[l], odd[l]);
+        HR_SIMD
+        for (int l = 0; l < B; ++l) upper[l] = r_sub(even[l], odd[l]);
+    }
+    for (int l = 0; l < count; ++l) {
+        int m = first[l];
+        m = m < 0 ? m + M : m;
+        T v = 0;
+        for (int i = 0; i < resample_taps; ++i) {
+            v = r_muladd(w[i][l], g[m], v);
+            m = m + 1 == M ? 0 : m + 1;
+        }
+        out[l] = static_cast<float>(v + bad[l]);
+    }
+}
+template <int B, class T>
+HR_HD void resample_values(const T* g, int M, const double* p, const T* kernel, float* out, int count) {
+    int first[B];
+    T t[B], bad[B];
     HR_SIMD
     for (int l = 0; l < B; ++l) {
         double u = p[l] * static_cast<double>(resample_oversampling);   // (exact: a power of two)
         u -= static_cast<double>(M) * floor(u / static_cast<double>(M));   // (exact: fmod's result, or M - a rounding of it)
         const bool in_period = u >= 0.0 && u <= static_cast<double>(M);
-        bad[l] = in_period ? 0.0 : static_cast<double>(NAN);
+        bad[l] = in_period ? static_cast<T>(0) : static_cast<T>(NAN);
         u = in_period ? u : 0.0;
         const double lo = dsub(u, 0.5 * resample_taps);
-        first[l] = ceil(lo);
-        t[l] = dsub(dmul(2.0, dsub(first[l], lo)), 1.0);
-        s[l] = dmul(t[l], t[l]);
+        const double f = ceil(lo);
+        first[l] = static_cast<int>(f);
+        t[l] = static_cast<T>(dsub(dmul(2.0, dsub(f, lo)), 1.0));
     }
-    for (int i = 0; i < H; ++i) {
-        const double* c = kernel + i;   // (the coefficient of t^q of tap i: c[q * H])
-        HR_SIMD
-        for (int l = 0; l < B; ++l) even[l] = c[qe * H];
-        for (int q = qe - 2; q >= 0; q -= 2)
-            HR_SIMD
-            for (int l = 0; l < B; ++l) even[l] = dmuladd(even[l], s[l], c[q * H]);
-        HR_SIMD
-        for (int l = 0; l < B; ++l) odd[l] = c[qo * H];
-        for (int q = qo - 2; q >= 1; q -= 2)
-            HR_SIMD
-            for (int l = 0; l < B; ++l) odd[l] = dmuladd(odd[l], s[l], c[q * H]);
-        HR_SIMD
-        for (int l = 0; l < B; ++l) odd[l] = dmul(odd[l], t[l]);
-        double* lower = w[i];
-        double* upper = w[resample_taps - 1 - i];
-        HR_SIMD
-        for (int l = 0; l < B; ++l) lower[l] = dadd(even[l], odd[l]);
-        HR_SIMD
-        for (int l = 0; l < B; ++l) upper[l] = dsub(even[l], odd[l]);
+    resample_sums<B, T>(g, M, first, t, bad, kernel, out, count);
+}
+// The same for positions given as a whole number of oversampled samples and a small rest, with no double precision:
+// the kernel's first tap lies at below[l] + rest[l] oversampled samples (resample_oversampling x the position -
+// resample_taps / 2), below[l] within a period of the row either side of it.
+template <int B, class T>
+HR_HD void resample_values_near(const T* g, int M, const int* below, const float* rest, const T* kernel, float* out, int count) {
+    int first[B];
+    T t[B], bad[B];
+    HR_SIMD
+    for (int l = 0; l < B; ++l) {
+        const float f = ceilf(rest[l]);
+        int m = below[l] + static_cast<int>(f);
+        m = m >= M ? m - M : m;
+        first[l] = m;   // (below 0: resample_sums adds the period)
+        t[l] = static_cast<T>(hd::fma(-2.0f, rest[l], sub(mul(2.0f, f), 1.0f)));   // 2 (f - rest) - 1, rounded once
+        bad[l] = static_cast<T>(0);
     }
-    for (int l = 0; l < count; ++l) {
-        int m = static_cast<int>(first[l]);
-        m = m < 0 ? m + M : m;
-        double v = 0.0;
-        for (int i = 0; i < resample_taps; ++i) {
-            v = dmuladd(w[i][l], g[m], v);
-            m = m + 1 == M ? 0 : m + 1;
-        }
-        out[l] = static_cast<float>(v + bad[l]);
-    }
+    resample_sums<B, T>(g, M, first, t, bad, kernel, out, count);
 }
 
 }  // namespace vc_tomography::sino_core

@@ -123,31 +123,63 @@ void shift_rows(float* rows, int n_rows, int n, float shift, void* stream, const
     VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
 }
 
+// the oversampled row and its transform in the precision T (sino.hpp resample_real)
+template <class T>
+struct ResampleTypes;
+template <>
+struct ResampleTypes<float> {
+    using complex = cufftComplex;
+    static constexpr cufftType inverse = CUFFT_C2R;
+    static cufftResult execute(cufftHandle plan, complex* in, float* out) { return cufftExecC2R(plan, in, out); }
+};
+template <>
+struct ResampleTypes<double> {
+    using complex = cufftDoubleComplex;
+    static constexpr cufftType inverse = CUFFT_Z2D;
+    static cufftResult execute(cufftHandle plan, complex* in, double* out) { return cufftExecZ2D(plan, in, out); }
+};
+
 namespace {
 // the rows' transforms A (n_rows, nc) times `factor` (nc), laid in the nco bins of the oversampled transform
-__global__ void resample_spread_kernel(const cufftComplex* A, cufftDoubleComplex* B, int n_rows, int nc, int nco, int L,
-                                       const double* factor) {
+template <class T>
+__global__ void resample_spread_kernel(const cufftComplex* A, typename ResampleTypes<T>::complex* B, int n_rows, int nc, int nco, int L,
+                                       const T* factor) {
     const size_t total = static_cast<size_t>(n_rows) * nco;
     VC_TOMOGRAPHY_GRID_STRIDE(q, total) {
         const int k = static_cast<int>(q % nco);
-        cufftDoubleComplex v = make_cuDoubleComplex(0.0, 0.0);
+        typename ResampleTypes<T>::complex v;
+        v.x = v.y = 0;
         if (k < nc) {
             const cufftComplex a = A[(q / nco) * nc + k];   // (the Nyquist bin of a real row is real)
-            v = make_cuDoubleComplex(hd::dmul(a.x, factor[k]), 2 * k == L ? 0.0 : hd::dmul(a.y, factor[k]));
+            v.x = sino_core::r_mul(static_cast<T>(a.x), factor[k]);
+            v.y = 2 * k == L ? static_cast<T>(0) : sino_core::r_mul(static_cast<T>(a.y), factor[k]);
         }
         B[q] = v;
     }
 }
+// the polynomial of each row's displacement along the row (map_core::row_fit): fit (n_rows, kRowFitSize)
+__global__ void resample_fit_kernel(const ResampleRow* row, ResampleGeometry geo, const map_core::RowFitTable* table, int n_rows, int n,
+                                    double* fit) {
+    VC_TOMOGRAPHY_GRID_STRIDE(r, static_cast<size_t>(n_rows)) {
+        const ResampleRow w = row[r];
+        const map_core::RowTerms<double> terms = map_core::row_terms<double>(geo.map, w.y, w.row_slope, geo.slope_col, w.col_scale,
+                                                                              geo.scale_col, w.row_scale, geo.scale_row);
+        map_core::row_fit(geo.map, terms, *table, static_cast<double>(w.shift), n, fit + r * map_core::kRowFitSize);
+    }
+}
 // g (n_rows, So): the oversampled rows (M samples each); rows (n_rows, S): sample j of row r <- its value at
-// positions[r n + j], or at the position its detector map gives (row, geo). A thread takes B consecutive samples
-// of a row (what a row's positions share is computed once for them).
-__global__ void resample_gather_kernel(const double* g, float* rows, int n_rows, int n, int S, int So, int M, const double* positions,
-                                       const ResampleRow* row, ResampleGeometry geo, const double* kernel) {
+// positions[r n + j], or at the position its detector map gives (row, geo), solved sample by sample: only the rows
+// without a polynomial (fit: null, or the rows' polynomials). A thread takes B consecutive samples of a row (what a
+// row's positions share is computed once for them).
+template <class T>
+__global__ void resample_gather_kernel(const T* g, float* rows, int n_rows, int n, int S, int So, int M, const double* positions,
+                                       const ResampleRow* row, ResampleGeometry geo, const double* fit, const T* kernel) {
     constexpr int B = resample_block;
     const int strips = (n + B - 1) / B;
     const size_t total = static_cast<size_t>(n_rows) * strips;
     VC_TOMOGRAPHY_GRID_STRIDE(q, total) {
         const size_t r = q / strips;
+        if (fit && fit[r * map_core::kRowFitSize] == fit[r * map_core::kRowFitSize]) continue;   // (resample_gather_fit_kernel's)
         const int j0 = static_cast<int>(q % strips) * B;
         double X[B], p[B], v[B];
         const int count = n - j0 < B ? n - j0 : B;
@@ -158,34 +190,63 @@ __global__ void resample_gather_kernel(const double* g, float* rows, int n_rows,
             for (int l = 0; l < B; ++l) X[l] = static_cast<double>(j0 + l) - static_cast<double>(w.shift);
             map_core::source<B>(geo.map, w.y, w.row_slope, geo.slope_col, w.col_scale, geo.scale_col, w.row_scale, geo.scale_row, X, p, v);
         }
-        sino_core::resample_values<B>(g + r * So, M, p, kernel, rows + r * S + j0, count);
+        sino_core::resample_values<B, T>(g + r * So, M, p, kernel, rows + r * S + j0, count);
+    }
+}
+// the same for the rows read through a detector map that have a polynomial (map_core::row_fit_taps)
+template <class T>
+__global__ void resample_gather_fit_kernel(const T* g, float* rows, int n_rows, int n, int S, int So, int M, const ResampleRow* row,
+                                           const double* fit, const T* kernel) {
+    constexpr int B = resample_block;
+    const int strips = (n + B - 1) / B;
+    const size_t total = static_cast<size_t>(n_rows) * strips;
+    VC_TOMOGRAPHY_GRID_STRIDE(q, total) {
+        const size_t r = q / strips;
+        const double* c = fit + r * map_core::kRowFitSize;
+        if (c[0] != c[0]) continue;
+        const int j0 = static_cast<int>(q % strips) * B;
+        int below[B];
+        float rest[B];
+        map_core::row_fit_taps<B>(c, static_cast<double>(row[r].shift), j0, n, resample_oversampling, resample_taps / 2, below, rest);
+        sino_core::resample_values_near<B, T>(g + r * So, M, below, rest, kernel, rows + r * S + j0, n - j0 < B ? n - j0 : B);
     }
 }
 
 // the oversampled transform back, in batches as RowShifter's, and the kernel's factors
+template <class T>
 struct RowResampler {
     int L = 0, batch = 0;
     CufftPlan inv;
-    DeviceBuffer<double> grid, factor, kernel;
+    DeviceBuffer<T> grid, factor, kernel;
+    DeviceBuffer<double> fit;                    // (batch, kRowFitSize): the rows' polynomials (map_core::row_fit)
+    DeviceBuffer<map_core::RowFitTable> table;
     void ensure(int n, int l, int b) {
+        if (!table.size()) {
+            const map_core::RowFitTable t = map_core::row_fit_table();
+            table.upload(&t, 1);
+        }
         if (l == L && b == batch) return;
         L = l; batch = b;
         int m = resample_oversampling * L, cplx = m / 2 + 1, real = 2 * cplx;
-        inv.make(1, &m, &cplx, 1, cplx, &real, 1, real, CUFFT_Z2D, batch, "plan Z2D (resample)");
+        inv.make(1, &m, &cplx, 1, cplx, &real, 1, real, ResampleTypes<T>::inverse, batch, "plan C2R (resample)");
         grid.ensure(static_cast<size_t>(batch) * real);
+        fit.ensure(static_cast<size_t>(batch) * map_core::kRowFitSize);
         const std::vector<double> f = resample_deconvolution(n);
-        factor.upload(f.data(), f.size());
-        kernel.upload(resample_kernel().data(), resample_kernel().size());
+        const std::vector<T> ft(f.begin(), f.end()), kt(resample_kernel().begin(), resample_kernel().end());
+        factor.upload(ft.data(), ft.size());
+        kernel.upload(kt.data(), kt.size());
         VC_TOMOGRAPHY_CUDA_CHECK(cudaStreamSynchronize(nullptr));
     }
 };
 
 void resample_rows_at(float* rows, int n_rows, int n, const double* positions, const ResampleRow* row, const ResampleGeometry& geo,
                       void* stream) {
+    using T = resample_real;
+    using Complex = ResampleTypes<T>::complex;
     if (n_rows <= 0 || n <= 1) return;
     cudaStream_t s = as_stream(stream);
     thread_local RowShifter U;
-    thread_local RowResampler V;
+    thread_local RowResampler<T> V;
     thread_local ThreadScratch scratch(U, V);
     const int L = upsample_fft_length(n), S = shift_row_stride(n), nc = L / 2 + 1;
     const int M = resample_oversampling * L, nco = M / 2 + 1, So = 2 * nco;
@@ -202,13 +263,19 @@ void resample_rows_at(float* rows, int n_rows, int n, const double* positions, c
             VC_TOMOGRAPHY_CUDA_CHECK(cudaMemsetAsync(w + static_cast<size_t>(nr) * S, 0, static_cast<size_t>(U.batch - nr) * S * sizeof(float), s));
         }
         cufft_check(cufftExecR2C(U.fwd.bind(s), w, reinterpret_cast<cufftComplex*>(w)), "R2C (resample)");
-        cufftDoubleComplex* B = reinterpret_cast<cufftDoubleComplex*>(V.grid.data());
-        resample_spread_kernel<<<grid_for(static_cast<size_t>(U.batch) * nco), 256, 0, s>>>(reinterpret_cast<cufftComplex*>(w), B, U.batch,
-                                                                                         nc, nco, L, V.factor.data());
-        cufft_check(cufftExecZ2D(V.inv.bind(s), B, V.grid.data()), "Z2D (resample)");
-        resample_gather_kernel<<<grid_for(static_cast<size_t>(nr) * ((n + resample_block - 1) / resample_block)), 256, 0, s>>>(
-            V.grid.data(), a, nr, n, S, So, M, positions ? positions + static_cast<size_t>(r0) * n : nullptr, row ? row + r0 : nullptr, geo,
-            V.kernel.data());
+        Complex* B = reinterpret_cast<Complex*>(V.grid.data());
+        resample_spread_kernel<T><<<grid_for(static_cast<size_t>(U.batch) * nco), 256, 0, s>>>(reinterpret_cast<cufftComplex*>(w), B, U.batch,
+                                                                                            nc, nco, L, V.factor.data());
+        cufft_check(ResampleTypes<T>::execute(V.inv.bind(s), B, V.grid.data()), "C2R (resample)");
+        const dim3 strips = grid_for(static_cast<size_t>(nr) * ((n + resample_block - 1) / resample_block));
+        const double* pos = positions ? positions + static_cast<size_t>(r0) * n : nullptr;
+        if (row) {   // the rows with a polynomial of their displacement, then those to be solved sample by sample
+            // (blocks of one warp: the fit is double precision, of which a consumer GPU has little per multiprocessor)
+            resample_fit_kernel<<<(nr + 31) / 32, 32, 0, s>>>(row + r0, geo, V.table.data(), nr, n, V.fit.data());
+            resample_gather_fit_kernel<T><<<strips, 256, 0, s>>>(V.grid.data(), a, nr, n, S, So, M, row + r0, V.fit.data(), V.kernel.data());
+        }
+        resample_gather_kernel<T><<<strips, 256, 0, s>>>(V.grid.data(), a, nr, n, S, So, M, pos, row ? row + r0 : nullptr, geo,
+                                                         row ? V.fit.data() : nullptr, V.kernel.data());
     }
     VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
 }

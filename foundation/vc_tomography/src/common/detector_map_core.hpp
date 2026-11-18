@@ -2,6 +2,8 @@
 // Inversion of a detector map (vc_tomography/detector_map.hpp), shared by CPU and CUDA: the same operations in the same
 // order on both. In double precision the sums of the terms are contracted under CUDA (hd::dmuladd), so that the two
 // backends' positions differ by roundings of double precision; in single precision nothing is contracted.
+#include <cmath>
+
 #include "hd_math.hpp"
 #include "vc_tomography/detector_map.hpp"
 
@@ -124,21 +126,23 @@ HR_HD void displacement(const DetectorMapView& m, const RowTerms<T>& r, const T*
 // detector_map_tolerance (a pass contracts by m's planned factor q, so that a change of d leaves at most
 // d q / (1 - q)); at most m.passes + 1 of them, which reach the tolerance from any start within the map's bounds.
 // B positions at a time, each with the same operations in the same order, the passes of all B ending together.
+// further: that many passes more once the passes have settled (each takes what is left down by the planned factor
+// again: for positions that are to be far inside the tolerance, row_fit's). The second form also gives the
+// displacements (du, dv) = (Eu, Ev) at the positions.
 template <int B>
-HR_HD void source(const DetectorMapView& m, double y0, double row_slope, double slope_col, double col_scale,
-                  double scale_col, double row_scale, double scale_row, const double* X, double* p, double* v) {
-    const RowTerms<double> r = row_terms<double>(m, y0, row_slope, slope_col, col_scale, scale_col, row_scale, scale_row);
-    double du[B], dv[B];
+HR_HD void source(const DetectorMapView& m, const RowTerms<double>& r, const double* X, double* p, double* v, double* du, double* dv,
+                  int further = 0) {
     HR_SIMD
     for (int l = 0; l < B; ++l) du[l] = dv[l] = 0.0;
     if (m.n > 0 && m.passes > 0) {
         int dx = 0, dy = 0;
         degrees(m, dx, dy);
         {
-            const RowTerms<float> rf = row_terms<float>(m, static_cast<float>(y0), static_cast<float>(row_slope),
-                                                        static_cast<float>(slope_col), static_cast<float>(col_scale),
-                                                        static_cast<float>(scale_col), static_cast<float>(row_scale),
-                                                        static_cast<float>(scale_row));
+            RowTerms<float> rf;
+            rf.y0 = static_cast<float>(r.y0); rf.row_slope = static_cast<float>(r.row_slope); rf.slope_col = static_cast<float>(r.slope_col);
+            rf.gc = static_cast<float>(r.gc); rf.gr = static_cast<float>(r.gr); rf.kc = static_cast<float>(r.kc); rf.kr = static_cast<float>(r.kr);
+            rf.c_lo = static_cast<float>(r.c_lo); rf.c_hi = static_cast<float>(r.c_hi); rf.v_hi = static_cast<float>(r.v_hi);
+            rf.c0 = static_cast<float>(r.c0); rf.ics = static_cast<float>(r.ics); rf.v0 = static_cast<float>(r.v0); rf.ivs = static_cast<float>(r.ivs);
             float eu[detector_map_max_terms], ev[detector_map_max_terms], Xf[B], pf[B], vf[B], uf[B], wf[B];
             for (int k = 0; k < m.n; ++k) {
                 eu[k] = static_cast<float>(m.eu[k]);
@@ -160,7 +164,8 @@ HR_HD void source(const DetectorMapView& m, double y0, double row_slope, double 
             }
         }
         double nu[B], nv[B];
-        for (int pass = 0; pass <= m.passes; ++pass) {
+        int left = further;
+        for (int pass = 0; pass <= m.passes + further; ++pass) {
             positions<double, B>(r, X, du, dv, p, v);
             displacement<double, B>(m, r, m.eu, m.ev, dx, dy, p, v, nu, nv);
             double change = 0.0;
@@ -171,10 +176,134 @@ HR_HD void source(const DetectorMapView& m, double y0, double row_slope, double 
                 du[l] = nu[l];
                 dv[l] = nv[l];
             }
-            if (change <= m.settle) break;
+            if (change <= m.settle && left-- <= 0) break;
         }
     }
     positions<double, B>(r, X, du, dv, p, v);
+}
+template <int B>
+HR_HD void source(const DetectorMapView& m, double y0, double row_slope, double slope_col, double col_scale,
+                  double scale_col, double row_scale, double scale_row, const double* X, double* p, double* v) {
+    double du[B], dv[B];
+    source<B>(m, row_terms<double>(m, y0, row_slope, slope_col, col_scale, scale_col, row_scale, scale_row), X, p, v, du, dv);
+}
+
+// The positions of a whole row of samples, X = j - shift for j = 0 .. n - 1, without solving the map at each: along
+// a row the map's displacement Eu is a smooth function of j, so it is solved at the kRowFit Chebyshev nodes of the
+// row and read elsewhere from the polynomial through them, wherever that polynomial is the displacement to
+// kRowFitError pixels (far below detector_map_tolerance): checked at as many other points of the row, the row's
+// ends among them, against the map solved there (at all these points one pass further than a sample's own solution
+// takes, which leaves 1e-11 pixels where that leaves up to the tolerance). A row that fails the check (it crosses an edge of the area the
+// map is held to, where Eu has a kink, or its map takes more terms) is solved sample by sample.
+// row_fit: c[0 .. kRowFit) the coefficients of the powers of xi = (2 j - (n - 1)) / (n - 1), or c[0] not a number
+// for a row to be solved sample by sample; then the row's kc and gc (RowTerms), kRowFitSize numbers in all.
+// row_fit_taps: where the kernel of resample_rows starts for the samples j0 .. j0 + B - 1, from them.
+constexpr int kRowFit = 16;
+constexpr int kRowFitSize = kRowFit + 2;
+constexpr double kRowFitError = 1e-9;
+// the points of a row the map is solved at, as xi: the Chebyshev nodes, then as many between them with both ends;
+// and the cosines that give the Chebyshev coefficients from the values at the nodes
+struct RowFitTable {
+    double xi[2 * kRowFit];
+    double dct[kRowFit][kRowFit];
+};
+inline RowFitTable row_fit_table() {
+    constexpr int N = kRowFit;
+    constexpr double pi = 3.14159265358979323846;
+    RowFitTable t;
+    for (int k = 0; k < N; ++k) {
+        t.xi[k] = std::cos(pi * (k + 0.5) / N);
+        t.xi[N + k] = std::cos(pi * (k < N / 2 ? k : k + 1) / N);   // (1 first, -1 last)
+        for (int j = 0; j < N; ++j) t.dct[j][k] = (j == 0 ? 1.0 : 2.0) / N * std::cos(pi * j * (k + 0.5) / N);
+    }
+    return t;
+}
+HR_HD void row_fit(const DetectorMapView& m, const RowTerms<double>& r, const RowFitTable& t, double shift, int n, double* c) {
+    constexpr int N = kRowFit;
+    const double half = 0.5 * static_cast<double>(n - 1);
+    double X[2 * N], p[2 * N], v[2 * N], du[2 * N], dv[2 * N];
+    for (int k = 0; k < 2 * N; ++k) X[k] = (t.xi[k] + 1.0) * half - shift;
+    for (int k = 0; k < 2 * N; k += 8) source<8>(m, r, X + k, p + k, v + k, du + k, dv + k, 1);
+    // the map's two holds leave the row smooth only if it stays on one side of each (the positions between the
+    // points solved lie within a row and a column of them)
+    bool smooth = n >= 4 * N;
+    double v_lo = v[0], v_top = v[0], p_lo = p[0], p_top = p[0];
+    for (int k = 1; k < 2 * N; ++k) {
+        v_lo = v[k] < v_lo ? v[k] : v_lo;
+        v_top = v[k] > v_top ? v[k] : v_top;
+        p_lo = p[k] < p_lo ? p[k] : p_lo;
+        p_top = p[k] > p_top ? p[k] : p_top;
+    }
+    smooth = smooth && (v_top <= -1.0 || v_lo >= r.v_hi + 1.0 || (v_lo >= 1.0 && v_top <= r.v_hi - 1.0));
+    smooth = smooth && p_lo >= r.c_lo + 1.0 && p_top <= r.c_hi - 1.0;
+    // the Chebyshev coefficients of the displacement at the nodes, then the powers of xi
+    double T0[N], T1[N], T2[N];
+    for (int q = 0; q < N; ++q) c[q] = T0[q] = T1[q] = 0.0;
+    T0[0] = 1.0;
+    T1[1] = 1.0;
+    for (int j = 0; j < N; ++j) {
+        double a = 0.0;
+        for (int k = 0; k < N; ++k) a += du[k] * t.dct[j][k];
+        if (j >= 2) {   // T_j = 2 xi T_(j - 1) - T_(j - 2), into T1
+            for (int q = 0; q < N; ++q) T2[q] = (q > 0 ? 2.0 * T1[q - 1] : 0.0) - T0[q];
+            for (int q = 0; q < N; ++q) {
+                T0[q] = T1[q];
+                T1[q] = T2[q];
+            }
+        }
+        const double* T = j == 0 ? T0 : T1;
+        for (int q = 0; q <= j; ++q) c[q] += a * T[q];
+    }
+    for (int k = N; k < 2 * N && smooth; ++k) {
+        double value = c[N - 1];
+        for (int q = N - 2; q >= 0; --q) value = value * t.xi[k] + c[q];
+        smooth = fabs(value - du[k]) <= kRowFitError;
+    }
+    if (!smooth) c[0] = static_cast<double>(NAN);
+    c[N] = r.kc;
+    c[N + 1] = r.gc;
+}
+// Where the kernel of resample_rows starts for the samples j0 .. j0 + B - 1 of a row with a fit: its first tap lies
+// at below[l] + rest[l] samples of the row oversampled `os` times (os x the position - half_taps), below a whole
+// number and rest within 1 of 0 (sino_core::resample_values_near). The polynomial is expanded about the middle of the
+// B samples: its value and slope there in double precision, the three terms after them in single precision, which
+// holds them to 1e-12 pixels (over B samples they come to 1e-5 pixels; the term after those is below 1e-13). The
+// position is never formed: it is the sample's own number less a small displacement, and only the displacement's
+// part of the first tap needs more than whole numbers. Double precision is used once for the B samples, not for each.
+template <int B>
+HR_HD void row_fit_taps(const double* c, double shift, int j0, int n, int os, int half_taps, int* below, float* rest) {
+    const double scale = 2.0 / static_cast<double>(n - 1), kc = c[kRowFit], gc = c[kRowFit + 1];
+    const double mid = 0.5 * static_cast<double>(B - 1), jc = static_cast<double>(j0) + mid;
+    const double xi = hd::dsub(hd::dmul(jc, scale), 1.0);
+    const float xf = static_cast<float>(xi);
+    // b_i: the polynomial's derivative of order i over i!, at xi (Horner's scheme, carried to the fourth)
+    double b0 = c[kRowFit - 1], b1 = 0.0;
+    float b2 = 0.0f, b3 = 0.0f, b4 = 0.0f;
+    for (int q = kRowFit - 2; q >= 0; --q) {
+        b4 = hd::fma(b4, xf, b3);
+        b3 = hd::fma(b3, xf, b2);
+        b2 = hd::fma(b2, xf, static_cast<float>(b1));
+        b1 = hd::dmuladd(b1, xi, b0);
+        b0 = hd::dmuladd(b0, xi, c[q]);
+    }
+    // the position of sample j is j - d(j): d = j (1 - gc) + (shift + Eu - kc) gc, from p = (j - shift + kc - Eu) gc;
+    // at the middle sample, and its terms in t = j - the middle sample
+    const double ng = hd::dsub(1.0, gc);
+    const double d0 = hd::dmuladd(hd::dsub(hd::dadd(shift, b0), kc), gc, hd::dmul(jc, ng));
+    const float hf = static_cast<float>(scale), gf = static_cast<float>(gc);
+    const float d1 = static_cast<float>(hd::dmuladd(hd::dmul(b1, scale), gc, ng));
+    const float d2 = b2 * hf * hf * gf, d3 = b3 * hf * hf * hf * gf, d4 = b4 * (hf * hf) * (hf * hf) * gf;
+    // os x (j - d) - half_taps = [os j - half_taps + whole] + [part - os (d - d0)], os d0 = -(whole + part)
+    const double a = hd::dmul(-static_cast<double>(os), d0), whole = floor(a + 0.5);
+    const float part = static_cast<float>(hd::dsub(a, whole)), osf = static_cast<float>(os);
+    const int base = os * j0 - half_taps + static_cast<int>(whole);
+    HR_SIMD
+    for (int l = 0; l < B; ++l) {
+        const float t = static_cast<float>(l) - static_cast<float>(mid);
+        const float moved = hd::fma(hd::fma(hd::fma(d4, t, d3), t, d2), t, d1) * t;   // d(j) - d0
+        below[l] = base + os * l;
+        rest[l] = hd::fma(-osf, moved, part);
+    }
 }
 
 // The detector row read at the integer detector column c for the ideal row base + pos, relative to `base`: the v with

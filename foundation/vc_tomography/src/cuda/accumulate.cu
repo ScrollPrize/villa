@@ -31,6 +31,15 @@ __global__ void accumulate_kernel(const AccumScanView* __restrict__ view, const 
     RW[o] = b;
 }
 
+// the flat-fielded intensities of the block's projections (AccumScanView::ff): threads x over detector columns, y over
+// window rows, z over the projections (slots)
+__global__ void flat_field_kernel(const AccumScanView* __restrict__ view, const int32_t* __restrict__ slot_proj, float* __restrict__ out) {
+    const AccumScanView& s = *view;
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= s.det_cols) return;
+    out[(static_cast<size_t>(blockIdx.z) * s.win_rows + blockIdx.y) * s.det_cols + c] = flat_field_of_window(s, slot_proj[blockIdx.z], blockIdx.y, c);
+}
+
 // the vertically interpolated values of the block's projections and their weights (wt: of the scan's weight map; wt2:
 // of a second map, weight2; null: none): threads x over detector columns, y over rows t, z over the projections (slots)
 // finite: the rows are to be read exactly (a value that is not finite becomes 0: see cpu::accumulate)
@@ -138,15 +147,15 @@ void accumulate(const AccumScanView& view, const ContributorList& c, const Accum
     // (work buffers of the calling thread, kept between blocks: every call finishes before it returns)
     thread_local DeviceBuffer<int32_t> d_off, d_proj, d_slot, d_slot_proj;
     thread_local DeviceBuffer<int8_t> d_role;
-    thread_local DeviceBuffer<float> d_col, d_col_wt, d_col_w, d_col_w2, d_delay;
+    thread_local DeviceBuffer<float> d_col, d_col_wt, d_col_w, d_col_w2, d_delay, d_ff;
     thread_local DeviceBuffer<ResampleRow> d_row;
     thread_local DeviceBuffer<AccumScanView> d_view;
-    thread_local ThreadScratch scratch(d_view, d_off, d_proj, d_slot, d_slot_proj, d_role, d_col, d_col_wt, d_col_w, d_col_w2, d_delay, d_row);
+    thread_local ThreadScratch scratch(d_view, d_off, d_proj, d_slot, d_slot_proj, d_role, d_col, d_col_wt, d_col_w, d_col_w2, d_delay, d_row, d_ff);
     AccumScanView s = view;
     // the view as the kernels read it: slot i of d_view takes the view as it stands (the launches are queued, so each
     // state of the view a kernel is given keeps its own slot, on the host as well until the copies have been made)
-    d_view.ensure(3);
-    AccumScanView states[3];
+    d_view.ensure(4);
+    AccumScanView states[4];
     const auto on_device = [&](int i) {
         states[i] = s;
         VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpyAsync(d_view.data() + i, &states[i], sizeof s, cudaMemcpyHostToDevice, st));
@@ -169,6 +178,11 @@ void accumulate(const AccumScanView& view, const ContributorList& c, const Accum
         dim3 block(128, 1, 1), grid(grid_1d(s.det_cols, 128), p.H, static_cast<unsigned>(n_slots));
         const int32_t* sp = load(d_slot_proj, slot_proj, st);
         const int n_rows = static_cast<int>(n_slots) * p.H;
+        // every raw sample flat-fielded once (the vertical kernel reads each at up to z_taps stack rows)
+        d_ff.ensure(n_slots * s.win_rows * static_cast<std::size_t>(s.det_cols));
+        flat_field_kernel<<<dim3(grid_1d(s.det_cols, 128), s.win_rows, static_cast<unsigned>(n_slots)), block, 0, st>>>(on_device(3), sp, d_ff.data());
+        VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
+        s.ff = d_ff.data();
         const AccumScanView* dv = on_device(0);
         if (measured_exact) {
             d_col_wt.ensure(n_slots * p.H * stride);

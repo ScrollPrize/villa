@@ -1,6 +1,7 @@
 #pragma once
 // Kernel interfaces. One block per pipeline stage; the CPU and CUDA versions
 // have identical semantics and are validated against each other in tests/.
+#include <algorithm>
 #include <cstdint>
 #include <string>
 
@@ -41,9 +42,30 @@ void flatfield(const float* raw, const float* dark, const float* flat, float* ou
 // R = clip_radius (default: c).
 // sino: (n_angles, n_det), angles: (n_angles) radians, slice: (ny, nx)
 // With `tiles`, only the pixels of the listed tiles are computed and the others are 0 (a caller that knows which
-// pixels it keeps, e.g. under an output mask, skips the rest): the slice is cut in tiles of kBackprojectTile x
-// kBackprojectTile pixels from its first pixel, tile ty * ceil(nx / kBackprojectTile) + tx.
+// pixels it keeps, e.g. under an output mask, skips the rest). The tiles are those of the grid, which is cut in tiles
+// of kBackprojectTile x kBackprojectTile pixels from its pixel (0, 0), not from the slice's first pixel: a pixel then
+// lies at the same place of the same tile whatever part of the grid a slice covers, and has the same value there
+// (the CUDA backprojector counts a pixel's positions from its tile's first pixel). BackprojectTiles: the tiles that
+// hold pixels of a slice, tile ty * ntx + tx.
 constexpr int kBackprojectTile = 32;
+struct BackprojectTiles {
+    int tx0 = 0, ty0 = 0;   // the grid's tile that holds the slice's first pixel
+    int ntx = 0, nty = 0;   // the tiles the slice reaches along x and y
+    int x0 = 0, y0 = 0, nx = 0, ny = 0;
+    BackprojectTiles(int ny_, int nx_, int x0_, int y0_) : x0(x0_), y0(y0_), nx(nx_), ny(ny_) {
+        const auto tile = [](int v) { return v >= 0 ? v / kBackprojectTile : -((-v + kBackprojectTile - 1) / kBackprojectTile); };
+        tx0 = tile(x0);
+        ty0 = tile(y0);
+        ntx = nx > 0 ? tile(x0 + nx - 1) - tx0 + 1 : 0;
+        nty = ny > 0 ? tile(y0 + ny - 1) - ty0 + 1 : 0;
+    }
+    int count() const { return ntx * nty; }
+    // the slice's pixels [x_lo, x_hi) x [y_lo, y_hi) of its tile (tx, ty)
+    int x_lo(int tx) const { return std::max(0, (tx0 + tx) * kBackprojectTile - x0); }
+    int x_hi(int tx) const { return std::min(nx, (tx0 + tx + 1) * kBackprojectTile - x0); }
+    int y_lo(int ty) const { return std::max(0, (ty0 + ty) * kBackprojectTile - y0); }
+    int y_hi(int ty) const { return std::min(ny, (ty0 + ty + 1) * kBackprojectTile - y0); }
+};
 struct BackprojectParams {
     float rot_center = 0.f;
     float scale = 1.f;

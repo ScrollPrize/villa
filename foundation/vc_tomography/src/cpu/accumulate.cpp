@@ -137,7 +137,7 @@ void accumulate(const AccumScanView& view, const ContributorList& c, const Accum
     // tap of every pixel a sample lands on); measured-only gridding interpolates per corner instead, unless the scan
     // has a lateral registration or the lateral part of a map: then its measured values are read exactly as well
     // (AccumScanView::col_wt)
-    thread_local std::vector<float> col, col_wt, col_w, col_w2;
+    thread_local std::vector<float> col, col_wt, col_w, col_w2, ff;
     const ColumnCachePlan cache = column_cache_plan(s, c, p);
     const bool measured_exact = cache.measured_exact;
     if (cache.use) {
@@ -152,7 +152,18 @@ void accumulate(const AccumScanView& view, const ContributorList& c, const Accum
         const std::size_t n_w = measured_exact ? 0 : static_cast<std::size_t>(n_slots) * p.H * W;
         col_w.resize(n_w);
         col_w2.resize(weight2 ? n_w : 0);
-        float* const values = col.data();   // (the calling thread's buffers: `col` names another in each worker)
+        // every raw sample flat-fielded once (the vertical kernel reads each at up to z_taps stack rows)
+        ff.resize(static_cast<std::size_t>(n_slots) * s.win_rows * W);
+        float* const flat_fielded = ff.data();   // (the calling thread's buffers: `ff`, `col` name others in each worker)
+#pragma omp parallel for collapse(2) schedule(dynamic, 4)
+        for (int q = 0; q < n_slots; ++q)
+            for (int w = 0; w < s.win_rows; ++w) {
+                float* out = flat_fielded + (static_cast<std::size_t>(q) * s.win_rows + w) * W;
+                for (int x = 0; x < W; ++x) out[x] = flat_field_of_window(s, slot_proj[q], w, x);
+            }
+        s.col_slot = slot.data();
+        s.ff = flat_fielded;
+        float* const values = col.data();
         float* const weights = col_wt.data();
         float* const w1 = col_w.data();
         float* const w2 = weight2 ? col_w2.data() : nullptr;

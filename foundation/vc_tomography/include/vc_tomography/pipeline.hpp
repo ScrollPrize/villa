@@ -204,8 +204,9 @@ struct OutputMask {
 // one byte per pixel.
 // Only the pixels that are needed are backprojected: those of `region` (slice coordinates; the rest of the output is
 // 0), and with uint8 slices alone, those within the bounds of what u8_mask keeps, and for the exact backprojector
-// only its tiles that hold a kept pixel (the others are 0 either way). The exact backprojector computes each pixel on
-// its own, so the pixels computed are those of a whole-slice run; a chunk with none is not reconstructed at all.
+// only its tiles that hold a kept pixel (the others are 0 either way). The exact backprojector gives a pixel the same
+// value whatever part of the slice is computed (its tiles are the slice's own: kernels.hpp, BackprojectTiles), so the
+// pixels computed are those of a whole-slice run; a chunk with none is not reconstructed at all.
 struct SliceOutput {
     float* f32 = nullptr;
     std::uint8_t* u8 = nullptr;

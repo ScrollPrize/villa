@@ -86,7 +86,8 @@ def smooth_displacements(n_rows, n, rng, reach=2.0):
 @pytest.mark.parametrize("n", [2528, 161, 160, 77])     # the detector; an odd transform length; small rows
 def test_resample_rows_is_the_interpolant(n):
     """resample_rows against the direct sum, at positions displaced smoothly by up to 2 samples: within 1e-6 of
-    each row's amplitude (its largest sample), content up to Nyquist included; the two backends agree as closely."""
+    each row's amplitude (its largest sample), content up to Nyquist included; the two backends, whose transforms
+    round apart, agree to 1.5e-6."""
     rng = np.random.default_rng(n)
     rows = sample_rows(n, rng)
     amp = np.abs(rows).max(1, keepdims=True)
@@ -99,7 +100,7 @@ def test_resample_rows_is_the_interpolant(n):
         assert got[d].dtype == np.float32 and got[d].shape == rows.shape
         assert (np.abs(got[d] - want) / amp).max() <= 1e-6, d
     if len(DEVICES) > 1:
-        assert (np.abs(got["cpu"] - got["cuda"]) / amp).max() <= 1e-6
+        assert (np.abs(got["cpu"] - got["cuda"]) / amp).max() <= 1.5e-6
     # positions beyond the row and far beyond it: the bridge, and the interpolant's period
     far = pos + np.linspace(-40, 40, len(rows))[:, None] + 3 * fft_length(n)
     for d in DEVICES:
@@ -256,7 +257,9 @@ def test_resample_rows_through_a_map(device):
                            float(row_scale[r]), 599.5)[0] for r in range(nr)]).astype(np.float64)
     assert 0.5 < np.abs(pos - X).max() < 4
     assert (np.abs(got - interpolant(rows, pos)) / amp).max() <= 1e-6
-    assert (np.abs(got - _core.resample_rows(rows, pos, device=device)) / amp).max() <= 2e-7
+    # (the same rows at the positions given: the kernel's fraction is single precision in both, rounded once from the
+    # position there and a few times here, which rows at the Nyquist frequency show most)
+    assert (np.abs(got - _core.resample_rows(rows, pos, device=device)) / amp).max() <= 5e-7
     # Eu = +2: the ideal column X is the detector's column X - 2
     whole = dict(map_i=[0], map_j=[0], map_eu=[2.0], map_ev=[-1.0], det_rows=det_rows)
     out = _core.resample_rows(rows, row_y=list(ys), **whole, device=device)
@@ -281,7 +284,7 @@ def test_resample_rows_backends_agree_through_a_map():
     kw = dict(shift=0.25, row_y=list(np.linspace(0, det_rows - 1, nr)), row_slope=[1e-3] * nr, slope_col=1263.5,
               col_scale=[1e-4] * nr, scale_col=1263.5, row_scale=[-8e-5] * nr, scale_row=599.5, **m)
     a, b = (_core.resample_rows(rows, **kw, device=d) for d in ("cpu", "cuda"))
-    assert (np.abs(a - b) / np.abs(rows).max(1, keepdims=True)).max() <= 1e-6
+    assert (np.abs(a - b) / np.abs(rows).max(1, keepdims=True)).max() <= 1.5e-6   # (each rounds its own transforms)
 
 
 # ---------------------------------------------------------------- through the pipeline

@@ -22,7 +22,10 @@
 // 2 pixels that changes by 1e-3 pixels per pixel). The gridding's rows are solved so in single precision
 // (accumulate.hpp: within 1e-6 rows); the columns of resample_rows (sino.hpp) in double precision, started from the
 // single-precision passes and ended when a pass changes (Eu, Ev) by less than `settle`, which leaves less than the
-// tolerance.
+// tolerance. Along a row of resample_rows the displacement is smooth: it is solved so at 16 points of the row and
+// read between them from the polynomial through those, where 16 more points of the row confirm the polynomial to
+// 1e-9 pixels; a row that fails (one that crosses an edge of the area the map is held to) is solved at every sample
+// (src/common/detector_map_core.hpp, row_fit).
 #include <cstdint>
 #include <vector>
 

@@ -1978,17 +1978,19 @@ Block mask_bounds(const OutputMask& m, int n, int ry, int rx) {
     return {x0, y0, x1 - x0, y1 - y0};
 }
 
-// The backprojector's tiles (kernels.hpp) of a (bh, bw) block that hold a pixel the mask slice keeps; the block's
-// pixel (y, x) reads the mask element (mask_index(y, oy, fy, ny), mask_index(x, ox, fx, nx)) (as to_uint8).
-void kept_tiles(const std::uint8_t* mask, int ny, int nx, int fy, int fx, int oy, int ox, int bh, int bw,
+// The backprojector's tiles (kernels.hpp BackprojectTiles) of a (bh, bw) block, whose first pixel is (x0, y0) of the
+// slice, that hold a pixel the mask slice keeps; the block's pixel (y, x) reads the mask element (mask_index(y, oy,
+// fy, ny), mask_index(x, ox, fx, nx)) (as to_uint8).
+void kept_tiles(const std::uint8_t* mask, int ny, int nx, int fy, int fx, int oy, int ox, int bh, int bw, int x0, int y0,
                 std::vector<std::int32_t>& tiles) {
-    const int T = kBackprojectTile, ntx = (bw + T - 1) / T, nty = (bh + T - 1) / T;
+    const BackprojectTiles t(bh, bw, x0, y0);
+    const int ntx = t.ntx, nty = t.nty;
     const auto index = output_core::mask_index;
     tiles.clear();
     for (int ty = 0; ty < nty; ++ty) {
-        const int i0 = index(ty * T, oy, fy, ny), i1 = index(std::min(bh, (ty + 1) * T) - 1, oy, fy, ny);
+        const int i0 = index(t.y_lo(ty), oy, fy, ny), i1 = index(t.y_hi(ty) - 1, oy, fy, ny);
         for (int tx = 0; tx < ntx; ++tx) {
-            const int j0 = index(tx * T, ox, fx, nx), j1 = index(std::min(bw, (tx + 1) * T) - 1, ox, fx, nx);
+            const int j0 = index(t.x_lo(tx), ox, fx, nx), j1 = index(t.x_hi(tx) - 1, ox, fx, nx);
             bool kept = false;
             for (int i = i0; i <= i1 && !kept; ++i)
                 kept = std::any_of(mask + static_cast<std::size_t>(i) * nx + j0, mask + static_cast<std::size_t>(i) * nx + j1 + 1,
@@ -2077,7 +2079,7 @@ void SliceReconstructor::reconstruct(int h_lo, int h_hi, const SliceOutput& out,
         if (mask_slice(y) != tiles_of) {
             tiles_of = mask_slice(y);
             kept_tiles(mask.data + tiles_of * mask_plane, mask.ny, mask.nx, mask.fy, mask.fx, mask.oy + B.y0,
-                       mask.ox + B.x0, bh, bw, tiles);
+                       mask.ox + B.x0, bh, bw, computed.x0, computed.y0, tiles);
         }
         bp.tiles = tiles.data();
         bp.n_tiles = static_cast<int>(tiles.size());

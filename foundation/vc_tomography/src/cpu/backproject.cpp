@@ -36,13 +36,13 @@ void backproject_k(const float* sino, const std::vector<float>& cs, const std::v
         slice[static_cast<std::size_t>(iy) * nx + ix] = acc * p.scale;
     };
     if (p.tiles) {   // the listed tiles; the rest of the slice is 0
-        const int T = kBackprojectTile, ntx = (nx + T - 1) / T;
+        const BackprojectTiles t(ny, nx, p.x0, p.y0);
         std::fill(slice, slice + static_cast<std::size_t>(ny) * nx, 0.f);
 #pragma omp parallel for schedule(dynamic, 1)
         for (int i = 0; i < p.n_tiles; ++i) {
-            const int tx = p.tiles[i] % ntx, ty = p.tiles[i] / ntx;
-            for (int iy = ty * T; iy < std::min(ny, (ty + 1) * T); ++iy)
-                for (int ix = tx * T; ix < std::min(nx, (tx + 1) * T); ++ix) pixel(iy, ix);
+            const int tx = p.tiles[i] % t.ntx, ty = p.tiles[i] / t.ntx;
+            for (int iy = t.y_lo(ty); iy < t.y_hi(ty); ++iy)
+                for (int ix = t.x_lo(tx); ix < t.x_hi(tx); ++ix) pixel(iy, ix);
         }
         return;
     }

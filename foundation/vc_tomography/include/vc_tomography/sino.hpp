@@ -241,10 +241,16 @@ void shift_rows(float* rows, int n_rows, int n, float shift, void* stream = null
 // window at the interval's Chebyshev nodes: within 2e-11 of it); the transform it is divided by is that of those
 // polynomials, so that the kernel's aliases are all that is lost: at most 4e-9 of the amplitude of a frequency, at
 // any frequency up to Nyquist (10 taps, oversampling 2, beta = 23; a row of n frequencies in phase could add them
-// up, random ones do not). The row's transform is taken in single precision, as shift_rows takes it, and its
-// rounding is what the result's error is made of (some 1e-7 of the amplitude, 5e-7 at most over the rows tested);
-// all that follows is in double precision: the kernel's transform falls by 3.7 from the middle of the band to its
-// end, and the sum takes that back by cancellation.
+// up, random ones do not). The positions are taken in double precision (the place among the oversampled samples and
+// the fraction the kernel is evaluated at); the transform back, the kernel's weights and the sum are in the precision
+// resample_real. In single precision the result's error is the rounding of the two transforms, of the weights and of
+// the sum (the kernel's transform falls by 3.7 from the middle of the band to its end, and the sum takes that back
+// by cancellation): over the rows tested (content up to Nyquist included) at most 8e-7 of a row's largest sample,
+// 1.3e-7 rms; on rows like a projection's 4e-7, 1e-7 rms. With resample_real = double only the forward transform
+// rounds, which is single precision as shift_rows takes it: 5e-7 at most, 8e-8 rms (projection: 3.5e-7, 8e-8 rms);
+// a consumer GPU, slow in double precision, then takes 3.5 times as long for the transform back and the sums (14.8
+// against 4.3 ms for 24 000 rows of 2528 on an RTX 5090).
+using resample_real = float;
 constexpr int resample_oversampling = 2;
 constexpr int resample_taps = 10;
 constexpr int resample_degree = 10;

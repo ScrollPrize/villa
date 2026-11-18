@@ -78,8 +78,8 @@ HR_HD float split_number(const AccumScanView& s, std::uint32_t frame, int r, int
 }
 constexpr std::uint32_t kSplitFlat = 0xf1a70000U;   // the frame ids of a scan's flats (above any projection's place)
 
-// flat-fielded intensity of projection k at window row t, source column c
-HR_HD float flat_field(const AccumScanView& s, int k, int t, int c) {
+// flat-fielded intensity of projection k at stack row t, source column c, from the frame
+HR_HD float flat_field_of_frame(const AccumScanView& s, int k, int t, int c) {
     const int r = s.row0[k] + t;  // raw detector row
     const std::size_t pix = static_cast<std::size_t>(r) * s.det_cols + c;
     const std::size_t slot = s.raw_slot ? static_cast<std::size_t>(s.raw_slot[k]) : static_cast<std::size_t>(k);
@@ -115,6 +115,19 @@ HR_HD float flat_field(const AccumScanView& s, int k, int t, int c) {
     }
     const float flat = add(mul(sub(1.0f, f), flat0), mul(f, flat1));
     return div(sig, flat);
+}
+
+// flat-fielded intensity of projection k at stack row t, source column c: what accumulate computed of it for the
+// block in hand (AccumScanView::ff), else computed here
+HR_HD float flat_field(const AccumScanView& s, int k, int t, int c) {
+    if (s.ff) return s.ff[(static_cast<std::size_t>(s.col_slot[k]) * s.win_rows + (t + s.win_off)) * s.det_cols + c];
+    return flat_field_of_frame(s, k, t, c);
+}
+
+// the entry of AccumScanView::ff for window row w of projection k, column c (0 for a row off the detector)
+HR_HD float flat_field_of_window(const AccumScanView& s, int k, int w, int c) {
+    const int t = w - s.win_off, r = s.row0[k] + t;
+    return r >= 0 && r < s.det_rows ? flat_field_of_frame(s, k, t, c) : 0.f;
 }
 
 // The vertical position of the sample for stack row t at column c: window row tt and fraction a, i.e. row
