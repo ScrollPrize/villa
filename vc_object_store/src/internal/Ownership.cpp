@@ -23,6 +23,10 @@ std::filesystem::path guardPath(const std::filesystem::path& store)
     // weakly_canonical resolves symlinks of the existing prefix (the store
     // exists for every writable open except create, where its directory does).
     auto path = std::filesystem::weakly_canonical(std::filesystem::absolute(store));
+    // SQLite journals and the ownership guard are both pathname-based.
+    // Distinct hard links would give the same database independent sidecars.
+    if (std::filesystem::is_regular_file(path) && std::filesystem::hard_link_count(path) > 1)
+        throw std::runtime_error("object store: writable open of a hard-linked file is not supported: " + path.string());
     path += "-owner";
     return path;
 }

@@ -10,7 +10,7 @@ void SurfaceQuerySet::rebuild(const std::vector<SurfacePtr>& surfaces) {
         std::vector<uint8_t> validity;
         (void)surface->gridVertices(validity,points);
         auto resident=std::make_shared<vc::object_links::SurfaceGrid>(*points,surface->scale(),validity);
-        identities_.emplace(resident.get(),surface);
+        identities_.emplace(resident.get(),Identity{surface,surface->gridToPtr({0,0})});
         geometry_.emplace(surface.get(),resident);
         geometry.push_back(std::move(resident));
     }
@@ -25,8 +25,8 @@ std::vector<SurfaceQuerySet::LookupResult> SurfaceQuerySet::locateAll(const Poin
     if (query.surfaces.only && !geometry_.contains(query.surfaces.only.get())) return {};
     std::vector<LookupResult> result;
     for (const auto& hit:index_.locateAll(queryFor(query))) {
-        const auto& surface=identities_.at(hit.surface.get());
-        result.push_back({surface,surface->gridToPtr(hit.grid),hit.distance});
+        const auto& identity=identities_.at(hit.surface.get());
+        result.push_back({identity.surface,identity.ptrOrigin+cv::Vec3f(hit.grid[0],hit.grid[1],0),hit.distance});
     }
     return result;
 }
@@ -34,6 +34,6 @@ std::optional<SurfaceQuerySet::LookupResult> SurfaceQuerySet::locate(const Point
     if (query.surfaces.only && !geometry_.contains(query.surfaces.only.get())) return {};
     const auto hit=index_.locate(queryFor(query));
     if (!hit) return {};
-    const auto& surface=identities_.at(hit->surface.get());
-    return LookupResult{surface,surface->gridToPtr(hit->grid),hit->distance};
+    const auto& identity=identities_.at(hit->surface.get());
+    return LookupResult{identity.surface,identity.ptrOrigin+cv::Vec3f(hit->grid[0],hit->grid[1],0),hit->distance};
 }

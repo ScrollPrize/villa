@@ -35,6 +35,7 @@
 
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/SurfaceQuerySet.hpp"
 
 Q_LOGGING_CATEGORY(lcViewerManager, "vc.viewer.manager")
 
@@ -639,25 +640,17 @@ std::vector<std::optional<ViewerManager::SurfaceLocation>> ViewerManager::locate
                                                                                  float tolerance) const
 {
     std::vector<std::optional<SurfaceLocation>> result(points.size());
-    const auto session = _state ? _state->objectStoreSession() : nullptr;
-    if (points.empty() || !session || !_state->currentVolume() || !vc::objects::util::isUuid(surface.id)) return result;
+    if (points.empty()) return result;
     if (!std::isfinite(tolerance) || tolerance < 0) return result;
-    std::vector<std::array<double, 3>> queried;
-    std::vector<size_t> sources;
-    for (size_t i = 0; i < points.size(); ++i)
-        if (std::isfinite(points[i][0]) && std::isfinite(points[i][1]) && std::isfinite(points[i][2])) {
-            queried.push_back({points[i][0], points[i][1], points[i][2]});
-            sources.push_back(i);
-        }
-    const auto hits = SurfaceCatalog::nearest(*session, _state->surfaceSources(),
-                                              _state->annotationVolume().value_or(vc::project::AnnotationVolume{}),
-                                              {surface.id}, queried, tolerance);
-    for (size_t i = 0; i < queried.size(); ++i)
-        if (!hits[i].empty()) {
-            const auto& hit = hits[i].front();
-            result[sources[i]] =
-                SurfaceLocation{surface.gridToPtr({float(hit.grid[0]), float(hit.grid[1])}), float(hit.distance)};
-        }
+    // Query the displayed geometry, including historical surfaces and drafts.
+    // The borrowed identity cannot outlive this call; the index copies its grid.
+    SurfaceQuerySet index;
+    index.rebuild({SurfaceQuerySet::SurfacePtr(const_cast<QuadSurface*>(&surface), [](QuadSurface*) {})});
+    for (size_t i = 0; i < points.size(); ++i) {
+        if (!std::isfinite(points[i][0]) || !std::isfinite(points[i][1]) || !std::isfinite(points[i][2])) continue;
+        if (const auto hit = index.locate({points[i], tolerance, {}}))
+            result[i] = SurfaceLocation{hit->ptr, hit->distance};
+    }
     return result;
 }
 

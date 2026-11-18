@@ -192,6 +192,19 @@ class SteppedSelectionTests(unittest.TestCase):
                         np.testing.assert_array_equal(reader.read(selection, source=source).numpy(), self.values[selection])
 
     @unittest.skipUnless(is_available(), 'CUDA build and device required')
+    def test_cuda_stepped_selections_of_a_channel_match_numpy(self):
+        rng = np.random.default_rng(9)
+        values = rng.integers(0, 255, size=(3, 13, 20, 27), dtype=np.uint8)
+        chunked(self.root / 'czyx', values, (2, 4, 5, 6))
+        with ZarrReader.open(self.root / 'czyx') as source:
+            for channel in range(values.shape[0]):
+                with source.cuda(cache_bytes=1 << 20, channel=channel) as reader:
+                    for route in ('cpu', 'chunks'):
+                        for selection, value in zip(STEPPED, reader.read_many(STEPPED, source=route)):
+                            with self.subTest(channel=channel, source=route, selection=selection):
+                                np.testing.assert_array_equal(value.numpy(), values[channel][selection])
+
+    @unittest.skipUnless(is_available(), 'CUDA build and device required')
     def test_cuda_stepped_reads_load_only_sampled_bricks(self):
         path = self.root / 'sparse_cuda'
         chunked(path, self.values, (4, 5, 6))

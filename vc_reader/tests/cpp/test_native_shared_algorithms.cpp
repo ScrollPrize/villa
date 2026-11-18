@@ -29,7 +29,7 @@ void caches()
     cache.put("a", 5, 6);
     check(*cache.get("a") == 4, "oversized replacement preserves cached value");
     cache.clear(); check(cache.size() == 0 && cache.bytes() == 0, "clear accounting");
-    vcr::MemoryCache chunks(64);
+    vcr::MemoryCache chunks(64,1,false);
     chunks.put("missing", nullptr);
     check(chunks.get("missing") == std::pair<bool, vcr::ChunkPtr>{true, nullptr}, "cached missing chunk");
     chunks.put("data", std::make_shared<vcr::Chunk>(64, 7));

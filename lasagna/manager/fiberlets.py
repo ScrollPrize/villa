@@ -291,8 +291,6 @@ def _remote_bytes(url: str) -> bytes:
 def _discover_published_manifest(
     record: LasagnaPredictionRecord,
 ) -> str:
-    from lasagna.scripts.download_omezarr import list_s3_prefix
-
     artifact_s3 = record.s3_url
     artifact_url = record.artifact_url
     if not artifact_s3 or not artifact_url:
@@ -300,9 +298,8 @@ def _discover_published_manifest(
     bucket, prefix, region = parse_catalog_s3_url(artifact_s3)
     prefix = prefix.rstrip("/") + "/"
     try:
-        entries = list_s3_prefix(
-            bucket, prefix, anon=True, region=region,
-        )
+        # Anonymous listing names the bucket's region in the location.
+        entries = ObjectStore(f"s3+{region}://{bucket}", auth=None).keys(prefix)
     except Exception as error:
         raise RuntimeError(
             f"could not list published prediction {record.selector} at {artifact_s3}: {error}"

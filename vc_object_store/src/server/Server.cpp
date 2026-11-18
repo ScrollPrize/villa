@@ -8,7 +8,11 @@
 #include "vc_object_store/Uuid.hpp"
 #include "vc_object_store/objects/Artifacts.hpp"
 #include "vc_object_store/objects/ObjectStore.hpp"
+#include "vc_object_store/objects/StoreReader.hpp"
 #include "vc_object_store/objects/TransactionJson.hpp"
+#if VC_OBJECT_SERVER_LINKING
+#include "vc_object_store/object_links/LinkObjects.hpp"
+#endif
 
 #include <boost/asio.hpp>
 #include <boost/beast/core.hpp>
@@ -356,10 +360,21 @@ std::string utcNow()
     return text;
 }
 
+// A link_objects request being prepared or committed (submitPrepared).
+struct InFlightLink {
+    std::string digest;
+    std::vector<std::function<void(Reply)>> waiters; // every connection awaiting its answer
+};
+
 struct ServerState {
     ServerOptions options;
     std::optional<ObjectStore> store;
     Staging staging;
+    struct {
+        std::mutex mutex;
+        std::map<std::string, std::shared_ptr<InFlightLink>> inFlight; // by request UUID
+        uint64_t detections = 0; // link requests whose detection this service ran (a replay runs none)
+    } links;
     // Before io: connections still queued in io decrement them as io is destroyed.
     std::atomic<std::size_t> connections{0}, responseBytes{0};
     WalUpkeep wal;
@@ -383,8 +398,16 @@ struct ServerState {
         return ObjectStore::open(path, open);
     }
 
+    static ObjectStore openWithLinking(const std::filesystem::path& path, const ServerOptions& options)
+    {
+#if VC_OBJECT_SERVER_LINKING
+        object_links::enableLinkObjects();
+#endif
+        return openOwned(path, options);
+    }
+
     ServerState(const std::filesystem::path& path, ServerOptions o)
-        : options(std::move(o)), store(openOwned(path, options)),
+        : options(std::move(o)), store(openWithLinking(path, options)),
           staging(stagingDirectory(path, options), options.maxStagedBytes, options.stagingLifetime), acceptor(io)
     {
         const tcp::endpoint endpoint(net::ip::make_address(options.listenAddress), options.port);
@@ -429,7 +452,16 @@ struct ServerState {
             {"queues", {{"writer", writer->queued()}, {"read", readers->queued()}, {"control", control->queued()},
                         {"transfer", transfers->queued()}}},
             {"response_bytes_in_flight", responseBytes.load()},
+            {"link_requests", linkReport()},
             {"staging", staging.report()}, {"wal", walJson}}.dump());
+    }
+
+    Json linkReport()
+    {
+        std::lock_guard lock(links.mutex);
+        std::size_t waiting = 0;
+        for (const auto& [uuid, entry] : links.inFlight) waiting += entry->waiters.size();
+        return {{"in_flight", links.inFlight.size()}, {"waiting_connections", waiting}, {"detections", links.detections}};
     }
 
     // Writer lane: one scheduled checkpoint between transactions.
@@ -464,6 +496,83 @@ struct ServerState {
         return jsonReply(transactionReceiptToJson(receipt));
     }
 
+    // A request with a prepared operation (link_objects): its preparation
+    // (the detection) runs here, on a read worker; the checked write is then
+    // queued to the writer like any transaction, which holds the writer lane
+    // only for the commit. A request whose payloads are not all staged takes
+    // the ordinary path (a saved receipt or the missing hashes answer it).
+    //
+    // A link request in flight is remembered by its request UUID until it is
+    // answered: a retry of it (a client whose stall timeout elapsed before
+    // the detection was done, or a second client sending the same request)
+    // waits for the running detection and gets its answer, instead of
+    // starting the detection again; a same-UUID request with other contents
+    // is refused, as submit refuses it once the receipt is saved.
+    void submitPrepared(const std::shared_ptr<std::string>& body, const std::function<void(Reply)>& done)
+    {
+        auto request = std::make_shared<TransactionRequest>();
+        bool parsed = false, unstaged = false;
+        const auto parse = guarded([&] {
+            TransactionPayloads payloads;
+            for (const auto& hash : transactionJsonPayloadHashes(*body)) {
+                auto bytes = staging.get(hash);
+                if (!bytes) { unstaged = true; return Reply{}; }
+                payloads.emplace(hash, std::move(*bytes));
+            }
+            *request = transactionRequestFromJson(*body, payloads);
+            parsed = true;
+            return Reply{};
+        });
+        if (unstaged) {
+            if (!writer->tryPost([this, body, done] { done(guarded([&] { return submit(*body); })); }))
+                done(errorReply(http::status::service_unavailable, "server busy; retry"));
+            return;
+        }
+        if (!parsed) { done(parse); return; }
+        const auto uuid = request->requestUuid;
+        const auto digest = transactionRequestDigest(*request);
+        {
+            std::lock_guard lock(links.mutex);
+            if (const auto running = links.inFlight.find(uuid); running != links.inFlight.end()) {
+                if (running->second->digest != digest)
+                    done(errorReply(http::status::bad_request, "request " + uuid + " is in flight with different contents"));
+                else running->second->waiters.push_back(done);
+                return;
+            }
+            auto entry = std::make_shared<InFlightLink>();
+            entry->digest = digest;
+            entry->waiters.push_back(done);
+            links.inFlight.emplace(uuid, std::move(entry));
+        }
+        // Answers everyone waiting on this request and forgets it.
+        auto finish = [this, uuid](const Reply& reply) {
+            std::vector<std::function<void(Reply)>> waiters;
+            {
+                std::lock_guard lock(links.mutex);
+                const auto running = links.inFlight.find(uuid);
+                waiters.swap(running->second->waiters);
+                links.inFlight.erase(running);
+            }
+            for (const auto& waiter : waiters) waiter(reply);
+        };
+        auto prepared = std::make_shared<PreparedOperations>();
+        bool ready = false;
+        const auto reply = guarded([&] {
+            PrepareOptions prepare;
+            prepare.localPaths = false;
+            prepare.scratchDirectory = options.linkScratchDirectory;
+            *prepared = store->prepare(*request, prepare);
+            ready = true;
+            return Reply{};
+        });
+        if (ready && !prepared->empty()) { std::lock_guard lock(links.mutex); ++links.detections; }
+        if (!ready) { finish(reply); return; }
+        const auto commit = [this, request, prepared, finish] {
+            finish(guarded([&] { return jsonReply(transactionReceiptToJson(store->submit(*request, *prepared))); }));
+        };
+        if (!writer->tryPost(commit)) finish(errorReply(http::status::service_unavailable, "server busy; retry"));
+    }
+
     Reply changes(const Target& target)
     {
         FeedCursor cursor{uuidSegment(target.param("store")), uuidSegment(target.param("generation")),
@@ -478,8 +587,7 @@ struct ServerState {
         auto txn = store->read();
         const auto revision = store->currentObjectRevision(txn, uuidSegment(uuid));
         if (!revision) return errorReply(http::status::not_found, "no object " + uuid);
-        return jsonReply(Json{{"status", Json::parse(storeStatusToJson(store->status(txn)))},
-                              {"revision", Json::parse(objectRevisionToJson(*revision))}}.dump());
+        return jsonReply(currentObjectResultToJson(store->status(txn), *revision));
     }
 
     Reply objectVersion(const std::string& uuid, const std::string& version, const Target& target)
@@ -503,6 +611,13 @@ struct ServerState {
         return jsonReply(geometryRevisionToJson(*revision));
     }
 
+    Reply geometryObject(const std::string& revisionUuid)
+    {
+        auto txn=store->read();
+        const auto object=store->objectAtGeometry(txn,uuidSegment(revisionUuid));
+        return object?jsonReply(objectRevisionToJson(*object)):errorReply(http::status::not_found,"geometry metadata unavailable");
+    }
+
     Reply geometryAnnotations(const std::string& revisionUuid, const std::string& array)
     {
         auto txn = store->read();
@@ -512,6 +627,12 @@ struct ServerState {
         if (int64_t(text.size()) > options.maxResponseBytes)
             return errorReply(http::status::payload_too_large, "point annotations exceed the response limit");
         return jsonReply(std::move(text));
+    }
+
+    Reply nextPointId(const std::string& objectUuid,const std::string& array)
+    {
+        auto txn=store->read();
+        return jsonReply(Json(store->nextGeometryPointId(txn,uuidSegment(objectUuid),array)).dump());
     }
 
     Reply geometryArray(const std::string& revisionUuid, const std::string& array, const Target& target)
@@ -532,6 +653,131 @@ struct ServerState {
                              http::status::payload_too_large);
         const auto bytes = store->readGeometryArray(txn, revision->uuid, array, offset, count);
         return {http::status::ok, "application/octet-stream", std::string(bytes.begin(), bytes.end())};
+    }
+
+    // Many geometry revisions in one reply (hosted decodes of many fibers):
+    // request {"revisions": [uuid], "arrays": [name], "annotations": [name]};
+    // reply = 8-byte little-endian header length, the JSON header, then the
+    // arrays' bytes in header order. Revisions are answered in request order
+    // until the response limit; "answered" says how many (at least one, unless
+    // that one alone exceeds the limit: then its arrays are left out and the
+    // client reads them by range).
+    Reply queryGeometry(const std::string& body)
+    {
+        const auto request = Json::parse(body);
+        const auto revisions = request.at("revisions").get<std::vector<std::string>>();
+        const auto unique = [](std::vector<std::string> names) {
+            std::sort(names.begin(), names.end());
+            names.erase(std::unique(names.begin(), names.end()), names.end());
+            return names;
+        };
+        const auto arrays = unique(request.value("arrays", std::vector<std::string>{}));
+        const auto annotations = unique(request.value("annotations", std::vector<std::string>{}));
+        if (revisions.size() > size_t(options.maxQueryResults))
+            throw std::invalid_argument("geometry query: at most " + std::to_string(options.maxQueryResults) + " revisions");
+        auto txn = store->read();
+        Json header = Json::object();
+        header["revisions"] = Json::array();
+        std::string data;
+        size_t answered = 0;
+        // Bounded: each entry's arrays are sized from its descriptor before any
+        // array is read, annotations are estimated (per point) before they are
+        // loaded, and the entry's actual encoded size is checked before it is
+        // added. An entry that alone would exceed the limit is answered without
+        // data (or, when even its descriptor is too large, as {"uuid",
+        // "oversized": true}); the client reads those individually.
+        const size_t limit = size_t(options.maxResponseBytes);
+        const size_t headerOverhead = 64;
+        size_t used = 8 + headerOverhead;
+        // The smallest answer (one compact entry) must fit, or nothing can.
+        if (!revisions.empty()) {
+            const auto compact = Json{{"uuid", revisions.front()}, {"descriptor", nullptr}, {"oversized", true},
+                                      {"arrays", Json::object()}, {"annotations", Json::object()}}.dump().size() + 2;
+            if (used + compact > limit)
+                return errorReply(http::status::payload_too_large, "geometry query: the response limit is smaller than one entry");
+        }
+        const auto annotationEstimate = [](const GeometryArrayInfo& info) {
+            return size_t(info.shape.empty() ? 0 : std::max<int64_t>(info.shape.front(), 0)) * 512 + 64;
+        };
+        for (const auto& requested : revisions) {
+            Json entry = Json::object();
+            entry["uuid"] = requested;
+            const auto revision = store->geometryRevision(txn, uuidSegment(requested));
+            std::string arrayBytes;
+            if (!revision) {
+                entry["descriptor"] = nullptr;
+            } else {
+                entry["descriptor"] = Json::parse(geometryRevisionToJson(*revision));
+                const auto infoOf = [&](const std::string& name) -> const GeometryArrayInfo* {
+                    const auto found = std::find_if(revision->arrays.begin(), revision->arrays.end(),
+                                                    [&](const GeometryArrayInfo& a) { return a.name == name; });
+                    return found == revision->arrays.end() ? nullptr : &*found;
+                };
+                const size_t base = entry.dump().size() + 64;
+                size_t planned = base;
+                for (const auto& name : arrays)
+                    if (const auto* info = infoOf(name)) planned += size_t(info->byteLength) + name.size() + 64;
+                for (const auto& name : annotations)
+                    if (const auto* info = infoOf(name)) planned += annotationEstimate(*info);
+                if (answered > 0 && used + planned > limit) break;
+                Json arrayIndex = Json::object();
+                Json annotationValues = Json::object();
+                if (used + planned <= limit) {
+                    // Annotations only for arrays of at most kBatchAnnotationPoints
+                    // points (fibers' control points), read with a byte budget
+                    // checked against each value's packed size before it is
+                    // loaded; otherwise left for the client's own read.
+                    constexpr int64_t kBatchAnnotationPoints = 4096;
+                    for (const auto& name : annotations) {
+                        const auto* info = infoOf(name);
+                        if (!info || info->shape.empty() || info->shape.front() > kBatchAnnotationPoints) continue;
+                        // Read only up to what the response can still carry
+                        // (one budget shared by this entry's annotation arrays).
+                        const size_t spent = annotationValues.dump().size();
+                        const size_t room = limit > used + base + spent ? limit - used - base - spent : 0;
+                        auto value = store->geometryPointAnnotationsWithin(txn, revision->uuid, name, room);
+                        if (!value) continue;
+                        annotationValues[name] = std::move(*value);
+                    }
+                    for (const auto& name : arrays) {
+                        if (!infoOf(name)) continue;
+                        const auto bytes = store->readGeometryArray(txn, revision->uuid, name, 0, std::nullopt);
+                        arrayIndex[name] = {{"offset", data.size() + arrayBytes.size()}, {"length", bytes.size()}};
+                        arrayBytes.append(bytes.begin(), bytes.end());
+                    }
+                }
+                entry["arrays"] = std::move(arrayIndex);
+                entry["annotations"] = std::move(annotationValues);
+            }
+            if (!entry.contains("arrays")) entry["arrays"] = Json::object();
+            if (!entry.contains("annotations")) entry["annotations"] = Json::object();
+            size_t actual = entry.dump().size() + 2 + arrayBytes.size();
+            if (used + actual > limit) {
+                if (answered > 0) break;
+                // Alone too large after all (an estimate fell short): no data.
+                arrayBytes.clear();
+                entry["arrays"] = Json::object();
+                entry["annotations"] = Json::object();
+                actual = entry.dump().size() + 2;
+                if (used + actual > limit) {
+                    entry = Json{{"uuid", requested}, {"descriptor", nullptr}, {"oversized", true},
+                                 {"arrays", Json::object()}, {"annotations", Json::object()}};
+                    actual = entry.dump().size() + 2;
+                }
+            }
+            used += actual;
+            data += arrayBytes;
+            header["revisions"].push_back(std::move(entry));
+            ++answered;
+        }
+        header["answered"] = answered;
+        const auto headerText = header.dump();
+        std::string reply(8, '\0');
+        uint64_t length = headerText.size();
+        for (int i = 0; i < 8; ++i) reply[size_t(i)] = char((length >> (8 * i)) & 0xff);
+        reply += headerText;
+        reply += data;
+        return {http::status::ok, "application/octet-stream", std::move(reply)};
     }
 
     Reply artifactInfo(const std::string& hash)
@@ -617,10 +863,10 @@ struct ServerState {
         return jsonReply(uuidListResultToJson(store->status(txn), uuids));
     }
 
-    Reply objectHistory(const std::string& uuid)
+    Reply objectHistory(const std::string& uuid, const Target& target)
     {
         auto txn = store->read();
-        const auto history = store->objectHistory(txn, uuidSegment(uuid));
+        const auto history = store->objectHistory(txn, uuidSegment(uuid), target.integer("if_retained", 0) != 0);
         if (history.empty()) return errorReply(http::status::not_found, "no object " + uuid);
         return jsonReply(objectHistoryToJson(store->status(txn), history));
     }
@@ -630,6 +876,14 @@ struct ServerState {
         const auto versions = objectVersionsRequestFromJson(body);
         auto txn = store->read();
         return jsonReply(relationshipQueryResultToJson(store->status(txn), store->relationshipsAt(txn, versions)));
+    }
+
+    Reply querySelectedInputs(const std::string& body)
+    {
+        const auto request = selectedInputsRequestFromJson(body);
+        auto txn = store->read();
+        return jsonReply(selectedInputsToJson(store->status(txn), LocalStoreReader(*store, txn).selectedInputs(
+            request.versions, request.position, request.relationshipVersions)));
     }
 
     Reply queryVersions(const std::string& body)
@@ -666,6 +920,9 @@ struct ServerState {
         Lane* lane = nullptr;
         std::function<Reply()> work;
         bool busy = false;
+        // Set instead of `work` for a request that answers from another lane
+        // (submitPrepared): runs on `lane` and calls done when it has a reply.
+        std::function<void(std::function<void(Reply)>)> continued;
     };
 
     Route route(const Request& request)
@@ -688,22 +945,40 @@ struct ServerState {
         if (method == http::verb::get && is({"v1", "service"})) return {control.get(), [this] { return service(); }};
         if (method == http::verb::get && is({"v1", "receipts", "*"}))
             return {control.get(), [this, target] { return receipt(target->path[2]); }};
-        if (method == http::verb::post && is({"v1", "transactions"}))
+        if (method == http::verb::post && is({"v1", "transactions"})) {
+            if (transactionJsonHasPreparedOperations(*body)) {
+                Route route;
+                route.lane = readers.get();
+                route.continued = [this, body](std::function<void(Reply)> done) { submitPrepared(body, done); };
+                return route;
+            }
             return {writer.get(), [this, body] { return submit(*body); }};
+        }
         if (method == http::verb::get && is({"v1", "changes"}))
             return {readers.get(), [this, target] { return changes(*target); }};
+        if (method == http::verb::get && is({"v1", "volume-transforms"}))
+            return {readers.get(), [this] {
+                auto txn = store->read();
+                std::vector<std::optional<ObjectRevision>> selected;
+                for (const auto* kind : {"volume_transform", "volume_transform_choice"})
+                    for (const auto& object : store->objectsByKind(txn, kind))
+                        selected.push_back(store->currentObjectRevision(txn, object.uuid));
+                return jsonReply(objectsAtVersionsResultToJson(store->status(txn), selected));
+            }};
         if (method == http::verb::get && is({"v1", "objects", "*"}))
             return {readers.get(), [this, target] { return currentObject(target->path[2]); }};
         if (method == http::verb::get && is({"v1", "objects", "*", "versions", "*"}))
             return {readers.get(), [this, target] { return objectVersion(target->path[2], target->path[4], *target); }};
         if (method == http::verb::get && is({"v1", "objects", "*", "history"}))
-            return {readers.get(), [this, target] { return objectHistory(target->path[2]); }};
+            return {readers.get(), [this, target] { return objectHistory(target->path[2], *target); }};
         if (method == http::verb::post && is({"v1", "query", "objects"}))
             return {readers.get(), [this, body] { return queryObjects(*body); }};
         if (method == http::verb::post && is({"v1", "query", "edges"}))
             return {readers.get(), [this, body] { return queryEdges(*body); }};
         if (method == http::verb::post && is({"v1", "query", "relationships"}))
             return {readers.get(), [this, body] { return queryRelationships(*body); }};
+        if (method == http::verb::post && is({"v1", "query", "selected-inputs"}))
+            return {readers.get(), [this, body] { return querySelectedInputs(*body); }};
         if (method == http::verb::post && is({"v1", "query", "count"}))
             return {readers.get(), [this, body] { return queryCount(*body); }};
         if (method == http::verb::post && is({"v1", "query", "graph"}))
@@ -712,12 +987,34 @@ struct ServerState {
             return {readers.get(), [this, body] { return queryTags(*body); }};
         if (method == http::verb::post && is({"v1", "query", "versions"}))
             return {readers.get(), [this, body] { return queryVersions(*body); }};
+        if (method == http::verb::post && is({"v1", "query", "versions-at"}))
+            return {readers.get(), [this, body] {
+                const auto anchors = objectVersionsRequestFromJson(*body);
+                if (anchors.size() != 1) throw std::invalid_argument("version snapshot needs one anchor");
+                auto txn = store->read();
+                return jsonReply(objectVersionsRequestToJson(store->versionsAt(txn, anchors.front())));
+            }};
+        if (method == http::verb::post && is({"v1", "query", "storage-path"}))
+            return {readers.get(), [this, body] {
+                const auto request = Json::parse(*body);
+                std::optional<std::filesystem::path> root;
+                if (!request.at("dataset_root").is_null()) root = request.at("dataset_root").get<std::string>();
+                auto txn = store->read();
+                const auto path = store->resolveStoragePath(txn, request.at("uuid").get<std::string>(), root);
+                return jsonReply((path ? Json(path->string()) : Json(nullptr)).dump());
+            }};
         if (method == http::verb::post && is({"v1", "query", "region"}))
             return {readers.get(), [this, body] { return queryRegion(*body); }};
         if (method == http::verb::post && is({"v1", "query", "nearest_surfaces"}))
             return {readers.get(), [this, body] { return queryNearestSurfaces(*body); }};
+        if (method == http::verb::post && is({"v1", "query", "geometry"})) {
+            if (responseBytes.load() > options.maxResponseBytesInFlight) return {nullptr, nullptr, true};
+            return {readers.get(), [this, body] { return queryGeometry(*body); }};
+        }
         if (method == http::verb::get && is({"v1", "geometry", "*"}))
             return {readers.get(), [this, target] { return geometry(target->path[2]); }};
+        if (method == http::verb::get && is({"v1", "geometry", "*", "object"}))
+            return {readers.get(), [this, target] { return geometryObject(target->path[2]); }};
         if (method == http::verb::get && is({"v1", "artifacts", "*", "info"}))
             return {transfers.get(), [this, target] { return artifactInfo(target->path[2]); }};
         if (method == http::verb::get && is({"v1", "artifacts", "*"})) {
@@ -726,6 +1023,8 @@ struct ServerState {
         }
         if (method == http::verb::get && is({"v1", "geometry", "*", "annotations", "*"}))
             return {readers.get(), [this, target] { return geometryAnnotations(target->path[2], target->path[4]); }};
+        if (method == http::verb::get && is({"v1", "objects", "*", "next-point-id", "*"}))
+            return {readers.get(), [this, target] { return nextPointId(target->path[2], target->path[4]); }};
         if (method == http::verb::get && is({"v1", "geometry", "*", "arrays", "*"})) {
             // Bounded download memory: unsent replies stay below the limit
             // (plus the replies being produced, each maxResponseBytes at most).
@@ -741,8 +1040,14 @@ struct ServerState {
             return work();
         } catch (const TransactionConflict& conflict) {
             return jsonReply(transactionConflictToJson(conflict), http::status::conflict);
+        } catch (const StoreBusy& e) {
+            return jsonReply(Json{{"error", e.what()}, {"store_busy", true}}.dump(), http::status::conflict);
         } catch (const MissingPayloads& missing) {
             return jsonReply(Json{{"error", missing.what()}, {"missing", missing.hashes()}}.dump(),
+                             http::status::unprocessable_entity);
+        } catch (const PreparationFailed& failed) {
+            // Not the service's fault and not transient: no retry.
+            return jsonReply(Json{{"error", failed.what()}, {"preparation_failed", true}}.dump(),
                              http::status::unprocessable_entity);
         } catch (const std::invalid_argument& e) {
             return errorReply(http::status::bad_request, e.what());
@@ -774,7 +1079,9 @@ struct ServerState {
             done(errorReply(http::status::not_found, "unknown endpoint"));
             return;
         }
-        auto job = [work = std::move(r.work), done]() mutable { done(guarded(work)); };
+        std::function<void()> job;
+        if (r.continued) job = [continued = std::move(r.continued), done] { continued(done); };
+        else job = [work = std::move(r.work), done] { done(guarded(work)); };
         if (!r.lane->tryPost(job)) done(errorReply(http::status::service_unavailable, "server busy; retry"));
     }
 

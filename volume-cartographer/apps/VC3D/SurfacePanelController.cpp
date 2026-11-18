@@ -263,9 +263,18 @@ void SurfacePanelController::replaceOpenedSurface(SurfaceCatalog::Opened opened)
     _opened = std::move(opened);
 }
 
-void SurfacePanelController::activate(const std::string& id, bool preserveEditing,
+bool SurfacePanelController::prepareSelectionChange()
+{
+    if (!_selectionChangeGuard || _selectionChangeGuard()) return true;
+    if (!_currentSurfaceId.empty()) selectSurfaceById(_currentSurfaceId);
+    emit statusMessageRequested(tr("Surface selection kept: pending corrections could not be saved."), 8000);
+    return false;
+}
+
+bool SurfacePanelController::activate(const std::string& id, bool preserveEditing,
                                       std::optional<SurfaceCatalog::Opened> opened)
 {
+    if (!prepareSelectionChange()) return false;
     const QString idQString = QString::fromStdString(id);
     std::shared_ptr<QuadSurface> surface;
     _opened.reset();
@@ -276,7 +285,7 @@ void SurfacePanelController::activate(const std::string& id, bool preserveEditin
         const auto* row = _catalog->row(id);
         if (row && row->fromCatalog()) {
             fetchThenActivate(id, preserveEditing);
-            return;
+            return false;
         }
         emit statusMessageRequested(tr("Cannot open surface %1: it has no geometry").arg(idQString), 8000);
     } catch (const std::exception& error) {
@@ -298,6 +307,7 @@ void SurfacePanelController::activate(const std::string& id, bool preserveEditin
     if (isCurrentOnlyFilterEnabled()) {
         applyFilters();
     }
+    return _opened.has_value();
 }
 
 // A catalog surface still remote: fetch its geometry in the background, then
@@ -369,6 +379,7 @@ void SurfacePanelController::handleTreeSelectionChanged()
     }
 
     if (selectedItems.isEmpty()) {
+        if (!prepareSelectionChange()) return;
         _currentSurfaceId.clear();
         _opened.reset();
         resetTagUi();
@@ -630,6 +641,7 @@ void SurfacePanelController::showHistory(const std::string& id)
     list->setHeaderLabels({tr("Published"), tr("Author"), tr("Name"), tr("Geometry")});
     list->setRootIsDecorated(false);
     std::optional<std::string> previousGeometry;
+    std::map<const QTreeWidgetItem*, vc::objects::ObjectVersion> references;
     for (const auto& revision : history) {
         if (revision.deleted) {
             continue;
@@ -640,9 +652,7 @@ void SurfacePanelController::showHistory(const std::string& id)
         auto* item = new QTreeWidgetItem(list, {published, QString::fromStdString(revision.record.changedBy),
                                                 QString::fromStdString(revision.record.name),
                                                 revision.geometryRevision == previousGeometry ? QString() : tr("changed")});
-        item->setData(0, Qt::UserRole, QString::fromStdString(revision.uuid));
-        item->setData(1, Qt::UserRole, QVariant::fromValue<qlonglong>(revision.version));
-        item->setData(2, Qt::UserRole, QString::fromStdString(revision.generation));
+        references.emplace(item, revision.reference());
         previousGeometry = revision.geometryRevision;
     }
     if (list->topLevelItemCount() > 0) {
@@ -653,19 +663,17 @@ void SurfacePanelController::showHistory(const std::string& id)
     auto* view = buttons->addButton(tr("View"), QDialogButtonBox::ActionRole);
     auto* restore = buttons->addButton(tr("Restore"), QDialogButtonBox::ActionRole);
     restore->setEnabled(_catalog->session()->writable(attachment));
-    auto selected = [list, &attachment, &id]() -> std::optional<vc::objects::ObjectVersion> {
+    auto selected = [list, &references]() -> std::optional<vc::objects::ObjectVersion> {
         const auto* item = list->currentItem();
         if (!item) return std::nullopt;
-        return vc::objects::ObjectVersion{attachment.storeUuid, item->data(2, Qt::UserRole).toString().toStdString(), id,
-                                          item->data(1, Qt::UserRole).toLongLong()};
+        return references.at(item);
     };
     connect(view, &QPushButton::clicked, &dialog, [&]() {
         const auto* item = list->currentItem();
         if (!item || !selectSurfaceById(id)) {
             return;
         }
-        const vc::objects::ObjectVersion version{attachment.storeUuid, item->data(2, Qt::UserRole).toString().toStdString(), id,
-                                                 item->data(1, Qt::UserRole).toLongLong()};
+        const auto version = *selected();
         try {
             activate(id, false, _catalog->open(id, version));
         } catch (const std::exception& error) {
@@ -704,7 +712,7 @@ bool SurfacePanelController::restoreRevision(const std::string& id, const vc::ob
             head = reader.currentObject(id);
         });
         if (!head) throw std::runtime_error("The surface is no longer in the object store");
-        if (head->version == version.version && head->generation == version.generation) return true;
+        if (head->reference() == version) return true;
         (void)_catalog->session()->editCurrent(attachment, {id}, [&](const vc::objects::StoreReader&, const std::string& uuid) {
             return std::vector<vc::objects::TransactionOperation>{vc::objects::RestoreObjectOp{uuid, version}};
         });
@@ -753,6 +761,9 @@ void SurfacePanelController::bindSurface(const std::string& id)
     if (!volume || !row || !_catalog->attachment()) {
         return;
     }
+    const auto selected = row->record;
+    const auto attachment = *_catalog->attachment();
+    const auto voxels = _catalog->voxels();
     const auto scale = vc3d::promptStoredUnitsPerVoxel(_ui.treeWidget, tr("Bind Surface Coordinates"), tr("surface"), *volume,
                                                        row_meta(*row).value("coordinates", nlohmann::json::object()));
     if (!scale) {
@@ -761,12 +772,13 @@ void SurfacePanelController::bindSurface(const std::string& id)
     try {
         // Units per voxel of the open volume, so per voxel of its store volume
         // at the open volume's scale of it.
-        const auto& voxels = _catalog->voxels();
-        (void)_catalog->session()->editCurrent(*_catalog->attachment(), {id},
-            [&](const vc::objects::StoreReader& reader, const std::string& uuid) {
-                return std::vector<vc::objects::TransactionOperation>{vc::objects::bindCoordinatesOperation(
-                    reader.currentObject(uuid)->record, voxels.volume, *scale * voxels.scale)};
-            });
+        auto request = _catalog->session()->newRequest(attachment);
+        _catalog->session()->readStore(attachment, [&](const vc::objects::StoreReader& reader, const auto&) {
+            vc::objects::editCurrentRequest(reader, request, {id},
+                {vc::objects::bindCoordinatesOperation(selected, voxels.volume, *scale * voxels.scale)});
+        });
+        vc::objects::expectObject(request, selected.reference());
+        (void)_catalog->session()->submit(attachment, request);
     } catch (const std::exception& error) {
         QMessageBox::critical(_ui.treeWidget, tr("Bind Failed"), QString::fromUtf8(error.what()));
     }
@@ -992,6 +1004,7 @@ bool SurfacePanelController::activateSurfaceById(const std::string& surfaceId,
     if (!_catalog || !_catalog->row(surfaceId)) {
         return fail(tr("unknown surface: %1").arg(idQString));
     }
+    if (!prepareSelectionChange()) return fail(tr("pending edits could not be saved"));
     std::optional<SurfaceCatalog::Opened> opened;
     try {
         try {
@@ -1009,8 +1022,9 @@ bool SurfacePanelController::activateSurfaceById(const std::string& surfaceId,
     if (!selectSurfaceById(surfaceId)) {
         return fail(tr("surface %1 could not be selected").arg(idQString));
     }
-    activate(surfaceId, false, std::move(opened));
-    return _opened.has_value();
+    if (!activate(surfaceId, false, std::move(opened)))
+        return fail(tr("surface selection was not activated; save pending edits first"));
+    return true;
 }
 
 void SurfacePanelController::resetTagUi()

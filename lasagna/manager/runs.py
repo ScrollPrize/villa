@@ -18,20 +18,14 @@ from ..cooperative_inference import INFERENCE_ENV
 
 from .catalog import VolumeRecord
 from .config import ManagerConfig
-from .prefetch import build_prefetch_request, volume_cache_root
+from .prefetch import build_prefetch_request, input_cache_dir, volume_cache_root, volume_input_location
 from .snapshots import SnapshotRecord
 from .tmux import Tmux
 
 try:
-    from lasagna.live_omezarr_cache import (
-        DEFAULT_LIVE_CACHE_GIB, DEFAULT_LIVE_FETCH_AHEAD_TILES,
-        path_has_download_source,
-    )
+    from lasagna.input_level import DEFAULT_INPUT_CONNECTIONS, DEFAULT_READ_AHEAD_TILES
 except ImportError:  # pragma: no cover
-    from live_omezarr_cache import (
-        DEFAULT_LIVE_CACHE_GIB, DEFAULT_LIVE_FETCH_AHEAD_TILES,
-        path_has_download_source,
-    )
+    from input_level import DEFAULT_INPUT_CONNECTIONS, DEFAULT_READ_AHEAD_TILES
 
 
 SCHEMA_VERSION = 1
@@ -249,7 +243,6 @@ def build_fiber_command(
     extra_args: Sequence[str] = (),
     provenance_context: dict[str, Any] | None = None,
     legacy_config: str | Path | None = None,
-    no_download: bool = True,
 ) -> tuple[list[str], Path]:
     if scale < 0:
         raise ValueError("scale must be a non-negative OME-Zarr group index")
@@ -261,13 +254,14 @@ def build_fiber_command(
     atomic_json(context_file, provenance_context or {})
     legacy = _cli_option_value(extra_args, "--output-format") == "legacy"
     manifest = run_dir / "artifacts" / (run_dir.name + (".lasagna.json" if legacy else ".zarr"))
-    input_path = volume_cache_root(config, volume) / str(scale)
     command = [
         str(_runtime_python(config)), "-m", "vesuvius.neural_tracing.fiber_trace_3d.infer",
         *([str(Path(legacy_config).expanduser().resolve())] if legacy_config is not None else []),
-        "--input", str(input_path), "--output", str(manifest),
+        "--input", volume_input_location(volume, scale),
+        "--input-disk-cache-dir", str(input_cache_dir(config)),
+        "--output", str(manifest),
         "--checkpoint", snapshot.path, "--provenance-context", str(context_file),
-        *(["--no-download"] if no_download else []), *extra_args,
+        *extra_args,
     ]
     return command, manifest
 
@@ -281,7 +275,6 @@ def build_lasagna_command(
     *,
     extra_args: Sequence[str] = (),
     provenance_context: dict[str, Any] | None = None,
-    no_download: bool = True,
 ) -> tuple[list[str], Path]:
     if scale < 0:
         raise ValueError("scale must be a non-negative OME-Zarr group index")
@@ -289,13 +282,13 @@ def build_lasagna_command(
     atomic_json(context_file, provenance_context or {})
     legacy = _cli_option_value(extra_args, "--output-format") == "legacy"
     manifest = run_dir / "artifacts" / (run_dir.name + (".lasagna.json" if legacy else ".zarr"))
-    input_path = volume_cache_root(config, volume) / str(scale)
     command = [
         str(_runtime_python(config)), "-m", "preprocess_cos_omezarr", "predict3d",
-        "--input", str(input_path), "--output", str(manifest),
+        "--input", volume_input_location(volume, scale),
+        "--input-disk-cache-dir", str(input_cache_dir(config)),
+        "--output", str(manifest),
         "--unet-checkpoint", snapshot.path,
         "--provenance-context", str(context_file),
-        *(["--no-download"] if no_download else []),
         *extra_args,
     ]
     return command, manifest
@@ -311,11 +304,9 @@ def launch_inference(
     extra_args: Sequence[str] = (),
     legacy_config: str | Path | None = None,
     prefetch: bool = True,
-    download_workers: int = 64,
-    live_fetch: bool = False,
-    live_cache_gib: float | None = None,
-    live_fetch_ahead_tiles: int | None = None,
-    remote_inventory: bool = True,
+    input_connections: int = DEFAULT_INPUT_CONNECTIONS,
+    input_disk_cache_gib: float | None = None,
+    read_ahead_tiles: int = DEFAULT_READ_AHEAD_TILES,
     tmux: Tmux | None = None,
     now: datetime | None = None,
 ) -> Path:
@@ -328,27 +319,17 @@ def launch_inference(
         )
     if snapshot.backend == "lasagna" and legacy_config is not None:
         raise ValueError("--legacy-config applies only to Fiber checkpoints")
-    if int(download_workers) <= 0:
-        raise ValueError("download_workers must be a positive integer")
-    if live_fetch and prefetch:
-        raise ValueError("live fetch and the manager bulk-prefetch phase are mutually exclusive")
-    resolved_live_cache_gib = float(
-        DEFAULT_LIVE_CACHE_GIB if live_cache_gib is None else live_cache_gib
-    )
-    resolved_live_lookahead = int(
-        DEFAULT_LIVE_FETCH_AHEAD_TILES
-        if live_fetch_ahead_tiles is None else live_fetch_ahead_tiles
-    )
-    if live_cache_gib is not None and not live_fetch:
-        raise ValueError("--live-cache-gib requires --live-fetch")
-    if live_fetch_ahead_tiles is not None and not live_fetch:
-        raise ValueError("--live-fetch-ahead-tiles requires --live-fetch")
-    if (
-        not math.isfinite(resolved_live_cache_gib)
-        or resolved_live_cache_gib <= 0
-        or resolved_live_lookahead <= 0
+    if int(input_connections) <= 0:
+        raise ValueError("input_connections must be a positive integer")
+    if int(read_ahead_tiles) <= 0:
+        raise ValueError("read_ahead_tiles must be > 0")
+    if input_disk_cache_gib is not None and (
+        not math.isfinite(float(input_disk_cache_gib)) or float(input_disk_cache_gib) <= 0
     ):
-        raise ValueError("live cache target and lookahead must be > 0")
+        raise ValueError("input_disk_cache_gib must be finite and > 0")
+    if input_disk_cache_gib is not None and prefetch:
+        raise ValueError("a bounded input disk cache and the manager prefetch phase are mutually exclusive")
+    volume_input_location(volume, scale)
     python = _runtime_python(config)
     if snapshot.backend == "lasagna":
         runtime_config = {
@@ -398,47 +379,28 @@ def launch_inference(
         "model": model_context,
         "manager": {"version": "0.1"},
     }
-    generated_args: tuple[str, ...] = ()
-    if live_fetch:
-        generated_args = (
-            "--live-fetch",
-            "--live-cache-gib", str(resolved_live_cache_gib),
-            "--live-fetch-ahead-tiles", str(resolved_live_lookahead),
-            "--download-workers", str(int(download_workers)),
-        )
-    elif not prefetch:
-        generated_args = ("--download-workers", str(int(download_workers)))
+    generated_args: tuple[str, ...] = (
+        "--input-connections", str(int(input_connections)),
+        "--read-ahead-tiles", str(int(read_ahead_tiles)),
+        *(
+            ("--input-disk-cache-gib", str(float(input_disk_cache_gib)))
+            if input_disk_cache_gib is not None else ()
+        ),
+    )
     configured_args = config.lasagna_params if snapshot.backend == "lasagna" else config.params
-    backend_args = _inference_args(configured_args, (*generated_args, *extra_args))
-    if live_fetch and _has_cli_option(backend_args, "--no-download"):
-        raise ValueError("live fetch conflicts with --no-download in manager params/backend arguments")
-    if live_fetch and any(
-        _has_cli_option(backend_args, option) for option in ("--crop", "--crop-xyzwhd")
-    ):
-        raise ValueError("live fetch supports only full, non-cropped inference")
-    pred_dt = _cli_option_value(backend_args, "--pred-dt")
-    if live_fetch and pred_dt and path_has_download_source(pred_dt):
-        raise ValueError("live fetch does not yet support a separately remote --pred-dt source")
-    if not prefetch:
-        if not volume.s3_url:
-            raise ValueError(f"volume {volume.selector!r} has no supported S3 origin")
-        from lasagna.scripts.download_omezarr import initialize_download_source
-
-        initialize_download_source(
-            str(volume_cache_root(config, volume)), volume.s3_url, True,
-        )
+    # Manager-generated input options come first so configured and explicit arguments can override them.
+    backend_args = (*generated_args, *_inference_args(configured_args, extra_args))
     if snapshot.backend == "fiber3d":
         command, manifest = build_fiber_command(
             config, snapshot, volume, scale, run_dir,
             extra_args=backend_args, provenance_context=provenance_context,
-            legacy_config=legacy_config, no_download=prefetch,
+            legacy_config=legacy_config,
         )
         artifact_kind = "fiber3d-prediction"
     else:
         command, manifest = build_lasagna_command(
             config, snapshot, volume, scale, run_dir,
             extra_args=backend_args, provenance_context=provenance_context,
-            no_download=prefetch,
         )
         artifact_kind = "lasagna"
     record = {
@@ -465,7 +427,8 @@ def launch_inference(
         "source": {
             "volume": {**asdict(volume), "selector": volume.selector},
             "scale": scale,
-            "local_path": str(volume_cache_root(config, volume) / str(scale)),
+            "location": volume_input_location(volume, scale),
+            "cached_level": str(volume_cache_root(config, volume) / str(scale)),
         },
         "snapshot": asdict(snapshot),
         "runtime_config": {"source": runtime_config_source, "sha256": hashlib.sha256(json.dumps(runtime_config, sort_keys=True, default=str).encode()).hexdigest()},
@@ -481,11 +444,11 @@ def launch_inference(
             "inference": "created", "staging_upload": "not_started",
             "atlas_ingest": "not_started", "atlas_publication": "not_started",
         },
-        "live_fetch": {
-            "enabled": bool(live_fetch),
-            "cache_target_gib": resolved_live_cache_gib if live_fetch else None,
-            "lookahead_tiles": resolved_live_lookahead if live_fetch else None,
-            "download_workers": int(download_workers) if live_fetch else None,
+        "input": {
+            "disk_cache_dir": str(input_cache_dir(config)),
+            "disk_cache_gib": None if input_disk_cache_gib is None else float(input_disk_cache_gib),
+            "connections": int(input_connections),
+            "read_ahead_tiles": int(read_ahead_tiles),
         },
         "prefetch": {
             "started_at": None, "ended_at": None, "error": None,
@@ -494,8 +457,7 @@ def launch_inference(
     prefetch_request = None
     if prefetch:
         prefetch_request = build_prefetch_request(
-            volume, volume_cache_root(config, volume), scale,
-            workers=download_workers, remote_inventory=remote_inventory,
+            config, volume, scale, connections=input_connections,
         )
     command_record = {
         "schema_version": 1,

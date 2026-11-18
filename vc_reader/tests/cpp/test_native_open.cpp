@@ -339,6 +339,79 @@ void keptPyramid(const fs::path& root)
     require(direct == 2 * once, "a store elsewhere is read each time");
 }
 
+// A public array's document is read once per process; elsewhere, every open reads it.
+void knownArrays()
+{
+    const std::string zarray =
+        R"({"zarr_format":2,"shape":[2,2,2],"chunks":[2,2,2],"dtype":"|u1","compressor":null,"fill_value":0,"order":"C","filters":null})";
+    const std::string publicArray = "s3://vesuvius-challenge-open-data/S/known.zarr/0";
+    const std::string privateArray = "s3://my.private.bucket/known.zarr/0";
+    const std::string missing = "s3://vesuvius-challenge-open-data/S/missing.zarr/0";
+    std::map<std::string, int> requests;
+    OpenOptions options;
+    options.metadata = [&](const std::string& location, const std::string& name) -> std::optional<std::string> {
+        ++requests[location];
+        if (location != missing && name == ".zarray")
+            return zarray;
+        return std::nullopt;
+    };
+    require(readArrayDocument(publicArray, options).has_value(), "a public array is read");
+    const auto first = requests[publicArray];
+    require(first > 0, "the first open asks");
+    require(readArrayDocument(publicArray, options).has_value() &&
+            openArray(publicArray, options).meta.shape == vcr::Index{2, 2, 2} &&
+            requests[publicArray] == first, "later opens of a public array ask nothing");
+    forgetKeptMetadata(publicArray + "/", options);
+    require(readArrayDocument(publicArray, options).has_value() && requests[publicArray] == 2 * first,
+            "forgetting it reads it as published");
+    // Forgetting the artifact above it, or its HTTPS alias, also drops it.
+    forgetKeptMetadata("s3://vesuvius-challenge-open-data/S/known.zarr", options);
+    require(readArrayDocument(publicArray, options).has_value() && requests[publicArray] == 3 * first,
+            "forgetting the artifact reads its arrays as published");
+    forgetKeptMetadata("https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/S/known.zarr/0", options);
+    require(readArrayDocument(publicArray, options).has_value() && requests[publicArray] == 4 * first,
+            "forgetting the HTTPS alias reads it as published");
+    forgetKeptMetadata("s3://vesuvius-challenge-open-data/S/known.zarr/00", options);
+    require(readArrayDocument(publicArray, options).has_value() && requests[publicArray] == 4 * first,
+            "a sibling's forget keeps it");
+    // A sibling sorting between the artifact and its children does not hide them.
+    const std::string sibling = "s3://vesuvius-challenge-open-data/S/known.zarr-backup/0";
+    (void)readArrayDocument(sibling, options);
+    forgetKeptMetadata("s3://vesuvius-challenge-open-data/S/known.zarr", options);
+    require(readArrayDocument(publicArray, options).has_value() && requests[publicArray] == 5 * first,
+            "forgetting the artifact past a sibling");
+    const auto siblingReads = requests[sibling];
+    require(readArrayDocument(sibling, options).has_value() && requests[sibling] == siblingReads,
+            "the sibling stays known");
+    forgetKeptMetadata("https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/S/known.zarr/0/?x=1", options);
+    require(readArrayDocument(publicArray, options).has_value() && requests[publicArray] == 6 * first,
+            "a slash before a query is the same location");
+    forgetKeptMetadata("s3+us-east-1://vesuvius-challenge-open-data/S/known.zarr/0", options);
+    require(readArrayDocument(publicArray, options).has_value() && requests[publicArray] == 7 * first,
+            "the regional spelling is the same location");
+    const std::string other = "s3://vesuvius-challenge/S/known.zarr/0";
+    (void)readArrayDocument(other, options);
+    const auto otherReads = requests[other];
+    forgetKeptMetadata("s3+us-east-1://vesuvius-challenge/S/known.zarr/0", options);
+    require(readArrayDocument(other, options).has_value() && requests[other] == 2 * otherReads,
+            "the regional spelling of the other public bucket is the same location");
+    // A custom endpoint is another server: never served from what AWS answered.
+    OpenOptions elsewhere = options;
+    elsewhere.access.endpoint = "http://localhost:9000";
+    const auto beforeEndpoint = requests[publicArray];
+    (void)readArrayDocument(publicArray, elsewhere);
+    require(requests[publicArray] > beforeEndpoint, "a custom endpoint asks");
+
+    (void)readArrayDocument(privateArray, options);
+    const auto once = requests[privateArray];
+    (void)readArrayDocument(privateArray, options);
+    require(requests[privateArray] == 2 * once, "an array elsewhere is read each time");
+
+    require(!readArrayDocument(missing, options), "a missing public array");
+    const auto absent = requests[missing];
+    require(!readArrayDocument(missing, options) && requests[missing] == 2 * absent, "absence is not kept");
+}
+
 int main()
 {
     const auto root = fs::temp_directory_path() / ("vcr-native-open-" +
@@ -370,6 +443,7 @@ int main()
         errors(root);
         groups(root);
         metadata(root);
+        knownArrays();
         std::cout << "Native opening, access and volume metadata passed\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

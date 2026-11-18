@@ -50,12 +50,17 @@ std::string objectRecordJson(const ObjectRecord&);
 std::string edgeRecordJson(const EdgeRecord&);
 
 std::string transactionReceiptToJson(const TransactionReceipt&);
+RecordSelection recordSelectionFromJson(const std::string&, bool relationships = false);
+std::string recordSelectionToJson(const RecordSelection&, bool relationships = false);
 TransactionReceipt transactionReceiptFromJson(const std::string&);
 std::string storeStatusToJson(const StoreStatus&);
 std::string changePageToJson(const ChangePage&);
 
 // Wire forms shared by the hosted service and its clients.
 std::vector<std::string> transactionJsonPayloadHashes(const std::string& requestJson);
+// Whether the request holds an operation that is prepared before the writer
+// lock (link_objects), so a service runs its preparation on a read worker.
+bool transactionJsonHasPreparedOperations(const std::string& requestJson);
 std::string transactionConflictToJson(const TransactionConflict&);
 TransactionConflict transactionConflictFromJson(const std::string&);
 StoreStatus storeStatusFromJson(const std::string&);
@@ -63,6 +68,8 @@ ChangePage changePageFromJson(const std::string&);
 std::string feedCursorQuery(const FeedCursor&); // URL query parameters
 std::string objectRevisionToJson(const ObjectRevision&);
 ObjectRevision objectRevisionFromJson(const std::string&);
+std::string currentObjectResultToJson(const StoreStatus&, const ObjectRevision&);
+ObjectRevision currentObjectResultFromJson(const std::string&, StoreStatus* asOf = nullptr);
 std::string geometryRevisionToJson(const GeometryRevision&);
 GeometryRevision geometryRevisionFromJson(const std::string&);
 
@@ -118,6 +125,10 @@ std::vector<ObjectRevision> objectHistoryFromJson(const std::string&, StoreStatu
 
 // Lists of numbered object references: relationship queries and batched
 // reads at versions send them in this form.
+std::string objectVersionToJson(const ObjectVersion&);
+ObjectVersion objectVersionFromJson(const std::string&);
+std::string relationshipVersionToJson(const RelationshipVersion&);
+RelationshipVersion relationshipVersionFromJson(const std::string&);
 std::string objectVersionsRequestToJson(const std::vector<ObjectVersion>&);
 std::vector<ObjectVersion> objectVersionsRequestFromJson(const std::string&);
 // Batched reads at versions: one entry per reference, null where not recorded.
@@ -125,6 +136,19 @@ std::string objectsAtVersionsResultToJson(const StoreStatus&, const std::vector<
 std::vector<std::optional<ObjectRevision>> objectsAtVersionsResultFromJson(const std::string&, StoreStatus* asOf);
 std::string relationshipQueryResultToJson(const StoreStatus&, const std::vector<SelectedRelationship>&);
 std::vector<SelectedRelationship> relationshipQueryResultFromJson(const std::string&, StoreStatus* asOf);
+std::string selectedInputsToJson(const StoreStatus&, const SelectedInputs&);
+SelectedInputs selectedInputsFromJson(const std::string&);
+// `relationshipVersions` (StoreReader::selectedInputs) travels as the optional
+// key relationship_versions, sent only when given: a server that predates it
+// refuses the request rather than enumerate every relationship.
+struct SelectedInputsRequest {
+    std::vector<ObjectVersion> versions;
+    StoreStatus position;
+    std::optional<std::vector<ObjectVersion>> relationshipVersions;
+};
+std::string selectedInputsRequestToJson(const std::vector<ObjectVersion>&, const StoreStatus&,
+    const std::optional<std::vector<ObjectVersion>>& relationshipVersions = std::nullopt);
+SelectedInputsRequest selectedInputsRequestFromJson(const std::string&);
 
 std::string regionQueryRequestToJson(const RegionSlice&, const RegionOptions&);
 std::pair<RegionSlice, RegionOptions> regionQueryRequestFromJson(const std::string&);

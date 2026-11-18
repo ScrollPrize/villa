@@ -1,5 +1,7 @@
 include(GNUInstallDirs)
 find_package(Threads REQUIRED)
+find_package(Boost REQUIRED)
+find_package(concurrentqueue CONFIG REQUIRED)
 
 # Publish the Python-independent headers without maintaining copies. In the build
 # tree vc_reader/native is a link to src/cpp, so a source file may include a
@@ -30,7 +32,7 @@ target_include_directories(vc_reader_headers INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/include>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
-target_link_libraries(vc_reader_headers INTERFACE Threads::Threads)
+target_link_libraries(vc_reader_headers INTERFACE Threads::Threads Boost::headers concurrentqueue::concurrentqueue)
 
 add_library(vc_reader_thinning STATIC
     src/cpp/thinning/trace.cpp src/cpp/thinning/history.cpp src/cpp/thinning/distance.cpp src/cpp/thinning/skeleton.cpp

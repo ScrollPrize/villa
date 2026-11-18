@@ -1,4 +1,3 @@
-import itertools
 import os
 from dataclasses import dataclass
 
@@ -53,7 +52,43 @@ def pcl_sampling_group_weight(group, cfg):
         )
 
 
-def build_pcl_sampling_strata(sampling_groups, cfg, member_weights=None):
+def _sampling_units(indices, member_units, member_weights):
+    # Group pool indices sharing a sampling unit (member_units[index], None =
+    # its own unit) into (units, unit_probs), units being arrays of pool
+    # indices and unit_probs their summed member weights, normalised; None
+    # when every unit is a single member, so those pools draw as before.
+    if member_units is None:
+        return None
+    units = {}
+    for index in indices:
+        unit = member_units[index]
+        units.setdefault(('index', int(index)) if unit is None else ('unit', unit),
+                         []).append(int(index))
+    if all(len(members) == 1 for members in units.values()):
+        return None
+    units = [np.asarray(members, dtype=np.int64) for members in units.values()]
+    weights = np.asarray([
+        1.0 * len(members) if member_weights is None
+        else member_weights[members].sum() for members in units])
+    return units, weights / weights.sum()
+
+
+def _draw_pool(indices, count, probs, units):
+    # count pool indices from one pool. A pool with multi-member units draws
+    # units (without replacement while it can) by summed weight, then one
+    # member of each, so a unit's expected share of a batch follows its
+    # weight however many members it has.
+    if units is None:
+        return np.random.choice(indices, count, replace=count > len(indices), p=probs)
+    unit_arrays, unit_probs = units
+    chosen = np.random.choice(len(unit_arrays), count,
+                              replace=count > len(unit_arrays), p=unit_probs)
+    return np.asarray([unit_arrays[u][np.random.randint(len(unit_arrays[u]))]
+                       for u in chosen], dtype=np.int64)
+
+
+def build_pcl_sampling_strata(sampling_groups, cfg, member_weights=None,
+                              member_units=None):
     # Precompute the per-step sampling pool for _choose_pcl_indices from each pool
     # member's sampling group (source json file; all fibers share one 'fibers'
     # group). Members whose group is None are ineligible and excluded. When
@@ -64,12 +99,16 @@ def build_pcl_sampling_strata(sampling_groups, cfg, member_weights=None):
     # member_weights (parallel to sampling_groups) sets each member's relative draw
     # probability within its stratum (and within the combined pool); used to give a
     # fiber-link component the sampling pressure of its member count rather than a
-    # single strip's. None means uniform.
+    # single strip's. None means uniform. member_units (parallel, None entries
+    # for members of their own) groups members drawn as one unit: units are
+    # drawn by summed member weight, then one member uniformly (patch-overlap
+    # pairs of one edge, so an edge's share does not grow with its pairs).
     # Returns {'strata': [int64 pool-index array per group], 'groups': [group name
     # per stratum], 'weights': float weight per stratum, 'member_probs': [per-stratum
-    # draw probabilities or None], 'all': all eligible indices, 'all_probs': draw
-    # probabilities over 'all' or None, 'effective_size': eligible member count
-    # after expanding component multiplicities}.
+    # draw probabilities or None], 'member_units': [per-stratum units or None],
+    # 'all': all eligible indices, 'all_probs': draw probabilities over 'all' or
+    # None, 'all_units', 'effective_size': eligible member count after expanding
+    # component multiplicities}.
     sampling_groups = list(sampling_groups)
     if member_weights is not None:
         member_weights = np.asarray(list(member_weights), dtype=np.float64)
@@ -80,13 +119,14 @@ def build_pcl_sampling_strata(sampling_groups, cfg, member_weights=None):
             continue
         group_to_indices.setdefault(group, []).append(idx)
     weighted = cfg['pcl_sampling_weights'] is not None
-    strata, groups, weights, member_probs = [], [], [], []
+    strata, groups, weights, member_probs, units = [], [], [], [], []
     for group, indices in group_to_indices.items():
         weight = pcl_sampling_group_weight(group, cfg) if weighted else 1.0
         if weighted and weight <= 0:
             continue  # switched off
         indices = np.asarray(indices, dtype=np.int64)
         strata.append(indices)
+        units.append(_sampling_units(indices, member_units, member_weights))
         groups.append(group)
         weights.append(weight)
         if member_weights is None:
@@ -107,8 +147,10 @@ def build_pcl_sampling_strata(sampling_groups, cfg, member_weights=None):
         'groups': groups,
         'weights': np.asarray(weights, dtype=np.float64),
         'member_probs': member_probs,
+        'member_units': units,
         'all': all_indices,
         'all_probs': all_probs,
+        'all_units': _sampling_units(all_indices, member_units, member_weights),
         'effective_size': effective_size,
     }
 
@@ -121,9 +163,9 @@ def _choose_pcl_indices(sampling_strata, num_to_sample, cfg):
     # the bundle carries them, skew the within-pool draws.
     weighted = cfg['pcl_sampling_weights'] is not None
     if not weighted and not cfg['pcl_stratified_pcl_sampling']:
-        return np.random.choice(sampling_strata['all'], num_to_sample,
-                                replace=num_to_sample > len(sampling_strata['all']),
-                                p=sampling_strata['all_probs'])
+        return _draw_pool(sampling_strata['all'], num_to_sample,
+                          sampling_strata['all_probs'],
+                          sampling_strata.get('all_units'))
     strata = sampling_strata['strata']
     weights = sampling_strata['weights'] if weighted else np.ones(
         len(strata), dtype=np.float64)
@@ -134,9 +176,11 @@ def _choose_pcl_indices(sampling_strata, num_to_sample, cfg):
         frac = shares - quotas
         probs = frac / frac.sum() if frac.sum() > 0 else weights / weights.sum()
         quotas[np.random.choice(len(strata), remainder, replace=False, p=probs)] += 1
+    units = sampling_strata.get('member_units') or [None] * len(strata)
     chosen = [
-        np.random.choice(stratum, quota, replace=quota > len(stratum), p=probs)
-        for stratum, quota, probs in zip(strata, quotas, sampling_strata['member_probs'])
+        _draw_pool(stratum, quota, probs, stratum_units)
+        for stratum, quota, probs, stratum_units in zip(
+            strata, quotas, sampling_strata['member_probs'], units)
         if quota > 0
     ]
     return np.concatenate(chosen) if chosen else np.empty(0, dtype=np.int64)
@@ -739,6 +783,28 @@ def _sample_requested_patch_rows(patch_indices, point_cap, patch_atlas):
     return ijs, zyxs, node_ids, mask
 
 
+def _physical_point(entry):
+    """The chain point behind a points_by_patch entry: an attachment view's
+    physical point (which owns the theta node), else the entry itself."""
+    return entry.get('physical', entry)
+
+
+def _random_patch_pairs(patch_ids, count):
+    """Up to count distinct unordered pairs of patch_ids, uniformly at random.
+
+    Draws pairs directly instead of listing all n*(n-1)/2: a point collection
+    in a merged fiber-link component can touch thousands of patches."""
+    n = len(patch_ids)
+    count = min(count, n * (n - 1) // 2)
+    pairs = {}
+    while len(pairs) < count:
+        a = np.random.randint(n)
+        b = np.random.randint(n - 1)
+        b += b >= a
+        pairs[(min(a, b), max(a, b))] = None
+    return [(patch_ids[a], patch_ids[b]) for a, b in pairs]
+
+
 def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding,
                                patches_dict, patch_atlas, point_collections,
                                sampling_strata, *, crossing_map, cfg,
@@ -755,24 +821,22 @@ def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding,
     for pcl_idx in _choose_pcl_indices(sampling_strata, num_pcls, cfg):
         pcl = point_collections[pcl_idx]
         patch_ids = list(pcl['points_by_patch'])
+        pair_count = cfg['sample_count_relative_winding_patch_pairs_per_pcl']
         if cfg['pcl_rel_winding_adjacent_patches_only']:
             candidates = list(zip(patch_ids, patch_ids[1:]))
+            pairs = [candidates[i] for i in np.random.choice(
+                len(candidates), min(len(candidates), pair_count),
+                replace=False)]
         else:
-            candidates = list(itertools.combinations(patch_ids, 2))
-        pair_count = min(
-            len(candidates),
-            cfg['sample_count_relative_winding_patch_pairs_per_pcl'])
-        if pair_count <= 0:
-            continue
-        for pair_idx in np.random.choice(
-                len(candidates), pair_count, replace=False):
-            pid1, pid2 = candidates[pair_idx]
+            pairs = _random_patch_pairs(patch_ids, pair_count)
+        for pid1, pid2 in pairs:
             p1s = pcl['points_by_patch'][pid1]
             p2s = pcl['points_by_patch'][pid2]
             p1 = p1s[np.random.randint(len(p1s))]
             p2 = p2s[np.random.randint(len(p2s))]
             ij1 = p1['on_patch']['ij']
             ij2 = p2['on_patch']['ij']
+            p1, p2 = _physical_point(p1), _physical_point(p2)
             attached1 = _valid_patch_annotation(
                 patches_dict, patch_atlas, pid1, ij1[0], ij1[1])
             attached2 = _valid_patch_annotation(
@@ -877,6 +941,7 @@ def get_patch_abs_winding_loss(slice_to_spiral_transform, dr_per_winding,
                 patches_dict, patch_atlas, pid, ij[0], ij[1])
             if resolved is None:
                 continue
+            point = _physical_point(point)
             rows.append((
                 resolved[0], resolved[1], int(point['_theta_node_id']),
                 point['winding_annotation']))
@@ -1226,15 +1291,17 @@ def get_unattached_pcl_strip_losses(
     # (but excluded from) the random loss samples).
     #
     # Graph awareness (cross-fiber links): sampling_strata indexes *components* --
-    # groups of strips joined by same-winding links (component_strip_lists gives
+    # groups of strips joined by fiber links (component_strip_lists gives
     # each component's member strip indices, component_edges its junctions as
     # (strip_a, pos_a, strip_b, pos_b)). Each chosen component contributes one row
     # sampled along a chain *walk* through its strips (_sample_component_walk):
     # along a strip, hopping to the linked strip at a junction with
     # cfg['loss_fiber_link_branch_probability'], so a junction hop is an ordinary
     # registered step and cached crossings continue through it. The constant-shifted-radius target (1) along the
-    # walk then pulls points on either side of every traversed junction onto one
-    # shared winding; over steps, random walks cover all of a component's
+    # walk then pulls points on either side of every traversed junction onto
+    # their linked windings (one shared winding, or one apart across an
+    # adjacent-winding link: the fibers' winding annotations differ by it);
+    # over steps, random walks cover all of a component's
     # junctions. Rows can mix strips, but every walk begins at one endpoint of
     # one member strip, which supplies a canonical DT frame anchor. A singleton
     # component reduces exactly to the legacy per-strip row.

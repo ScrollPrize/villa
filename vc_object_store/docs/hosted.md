@@ -22,8 +22,16 @@ is **no authentication** — keep the default loopback listen address behind an
 SSH tunnel, or listen (`--listen`) only on a trusted private network.
 `--read-workers`, `--max-payload-mib`, `--max-staged-mib`, and `--staging-dir`
 bound its queues and staged uploads; a full queue answers 503 with
-`Retry-After`, which clients retry. `GET /v1/service` reports connection,
-queue, staging, and WAL-checkpoint state. In VC3D: Stores → Attach Hosted
+`Retry-After`, which clients retry. A `link_objects` request
+([graph edges](graph-edges.md#linking-as-a-checked-request-link_objects))
+runs its detectors on a read worker and queues only their commit to the
+writer; it answers when the detection is done, so `--request-deadline`
+(default 300 s) and the client's link timeout (`HostedStoreOptions::linkTimeoutS`,
+Python `link_timeout_s`, default 300 s) must both exceed the longest link,
+and `--strip-cache DIR` keeps the fiber strips between such requests. A
+retry of a link request in flight (same UUID) waits for the running
+detection instead of starting another. `GET /v1/service` reports connection,
+queue, staging, link-request, and WAL-checkpoint state. In VC3D: Stores → Attach Hosted
 Store...
 
 ## Pasting an SSH address in VC3D
@@ -83,7 +91,11 @@ with the same types as the local API: `status`, `submit`, `receipt`,
 same `TransactionConflict`. Transport failures, 429, and 5xx are retried with
 the **same request UUID**, so a lost reply is answered by the saved receipt;
 when retries run out the outcome is unknown — recover it with `receipt()` or
-by resubmitting the identical request, never under a new UUID. If a request's
+by resubmitting the identical request, never under a new UUID. A
+`link_objects` request is sent with `linkTimeoutS` (default 300 s, the
+server's default `--request-deadline`) in place of `stallTimeoutS`, since
+its reply waits for the detection; a retry of one joins the detection the
+server is already running. If a request's
 payloads have expired from server staging and no receipt answers it, the
 server names the missing hashes; upload them and resubmit identically.
 
@@ -91,6 +103,14 @@ Most tools never touch the client classes directly: a store **location** is
 a file path or an `http(s)://` endpoint, and the Python helpers
 (`surfaces.read_surface`, `surfaces.create_surface`,
 `documents.attach_document`, `locations.attached(location)`) work on either.
+`locations.open_store(location, author=, read_only=, link_timeout_s=,
+cache_directory=)` yields the `ObjectStore` itself for a file and a
+`HostedStoreHandle` for an endpoint: the same reading and request methods
+(status, submit and receipts, the change feed, current and numbered records,
+relationships at versions, geometry descriptors, arrays and annotations,
+object and edge selections, pinned overlap correspondences) over one session
+attachment, with `cache_directory` as its persistent cache, so one code path
+reads, links and writes a store wherever it is.
 
 ## Sessions: `ObjectStoreSession`
 
@@ -102,7 +122,7 @@ const auto attachment = session.attach("objects.vcobj", options);
 auto request = session.newRequest(attachment);
 session.readStore(attachment, [&](const vc::objects::StoreReader& reader, const auto& cancel) {
     if (cancel.load()) return;
-    request.expectedObjects[objectUuid] = reader.currentObject(objectUuid)->version;
+    request.expectedObjects[objectUuid] = reader.currentObject(objectUuid)->reference();
 });
 request.operations.push_back(vc::objects::SetMetaOp{objectUuid, "review_note", R"("checked")"});
 session.submit(attachment, request); // TransactionConflict when the object moved on
@@ -136,10 +156,14 @@ session.submit(attachment, request); // TransactionConflict when the object move
   registered for its meta key (`setGeometryFetcher`,
   [objects/CatalogStore.hpp](../include/vc_object_store/objects/CatalogStore.hpp)),
   in any writable attachment.
-- Python mirrors this: `ObjectStoreSession` with `attach_hosted`, `hosted`,
-  `attach_location`, `status`, `submit`, `receipt`, `current_object`,
-  `objects_at_versions`, `select_objects`, `read_surface_grid`,
-  `read_geometry_arrays`, `create_surface`, `attach_document`,
+- Python mirrors this: `ObjectStoreSession` with `attach_hosted` (its
+  `cache_directory`, `disk_cache_bytes` and `min_free_bytes` are the
+  persistent cache below), `hosted`, `attach_location`, `location`,
+  `status`, `submit`, `receipt`, `current_object`, `objects_at_versions`,
+  `relationships_at_versions`, `changes_since`, `select_objects`,
+  `select_edges`, `read_surface_grid`, `read_geometry_arrays`,
+  `geometry_revision`, `read_geometry_array`, `geometry_point_annotations`,
+  `overlap_correspondences_at`, `create_surface`, `attach_document`,
   `attached_document`, `point_collections`, `artifacts`,
   `publish_artifacts`, `materialize_artifacts`, and the draft calls below.
 
@@ -160,12 +184,14 @@ feed reports them changed, all within `cacheBytes` — cached data stays
 readable while the host is unreachable, but listings and spatial queries
 always need the host.
 
-Underneath, every publishing transaction appends to one ordered feed:
-`status()` (`storeUuid`, `generation`, `commitSequence`, `feedStart`) and
+With history enabled, every publishing transaction appends to one ordered feed:
+`status()` (`storeUuid`, `generation`, `commitSequence`, `feedStart`, `historyEnabled`) and
 `changes_since(cursor, max_changes)` return whole commits (continuing inside
 a commit only when it alone exceeds the page). A cursor from another
 generation, the future, or before `feedStart` comes back invalid — revalidate
 cached heads and rerun queries.
+
+History-off stores keep numbered current versions and the commit sequence, but not a replayable feed. Sessions detect a lineage/sequence change and emit `revalidate` without fabricated change entries; hosted snapshots validate that the sequence stayed fixed during their reads. Explicit historical requests remain unavailable. A lineage UUID and commit sequence are distinct from the session-local attachment generation.
 
 ## What differs on a hosted attachment
 
@@ -232,13 +258,14 @@ bytes, `Content-Length` required; 400 hash/length mismatch, 411 no length,
 | --- | --- |
 | `GET /v1/status` | store, generation, commit sequence, feed start |
 | `GET /v1/service` | connections, queue depths, staging use, WAL checkpoints |
-| `POST /v1/transactions` (request JSON) | receipt; 409 conflict; 422 `missing` payload hashes; 400 invalid |
+| `POST /v1/transactions` (request JSON) | receipt; 409 conflict; 422 `missing` payload hashes; 400 invalid. A request with a `link_objects` operation is prepared on a read worker first |
 | `GET /v1/receipts/{request}` | saved receipt or 404 |
 | `GET /v1/changes?store&generation&sequence&offset&max` | feed page |
 | `GET /v1/objects/{uuid}` | current revision + snapshot status |
 | `GET /v1/objects/{uuid}/versions/{n}?store&generation` | that numbered revision or 404 |
 | `GET /v1/objects/{uuid}/history` | every recorded revision, or 404 |
 | `GET /v1/geometry/{revision}` | geometry descriptor (immutable) |
+| `GET /v1/geometry/{revision}/object` | latest retained object metadata naming that geometry, or 404; not immutable, use an exact object reference to pin metadata |
 | `GET /v1/geometry/{revision}/arrays/{name}?offset&count` | array bytes; 413 above the response limit |
 | `GET /v1/geometry/{revision}/annotations/{name}` | per-point annotations (exact JSON, immutable) |
 | `PUT /v1/artifacts/{sha256}` (bytes) | kept durably by the store |

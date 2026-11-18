@@ -71,7 +71,7 @@ int main() try
         store.editGeometry(txn, a, {edit}, originalGeometry, [&](const std::vector<EdgeRecord>& affected) {
             std::vector<GeometryEdgeEdit> decisions;
             for (const auto& edge : affected) {
-                GeometryEdgeEdit decision; decision.edgeUuid = edge.uuid; decision.expectedGeneration = edge.generation;
+                GeometryEdgeEdit decision; decision.edgeUuid = edge.uuid; decision.expectedVersion = edge.version.value();
                 decision.aRevision = store.currentGeometry(txn, edge.aUuid)->uuid;
                 decision.bRevision = store.currentGeometry(txn, edge.bUuid)->uuid;
                 decision.action = "keep_recorded";

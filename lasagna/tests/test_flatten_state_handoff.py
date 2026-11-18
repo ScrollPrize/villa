@@ -153,6 +153,9 @@ class FlattenStateHandoffTest(unittest.TestCase):
 			np.testing.assert_array_equal(
 				np.load(str(root / "out_file" / "map.npy")),
 				np.load(str(root / "out_state" / "map.npy")))
+			# No target volume shape: the flatten keeps Lasagna base coordinates, and says so.
+			meta = json.loads((from_state / "meta.json").read_text(encoding="utf-8"))
+			self.assertEqual(meta["export_coordinate_scale"], 1.0)
 
 	def test_out_dir_export_reuses_state_and_matches_mesh(self) -> None:
 		with tempfile.TemporaryDirectory() as td:

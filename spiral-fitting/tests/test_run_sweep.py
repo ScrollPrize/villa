@@ -7,23 +7,28 @@ from runners import run_sweep
 
 def test_child_command_forwards_optional_wandb_group(tmp_path):
     args = run_sweep.build_parser().parse_args([
-        "--dataset", str(tmp_path / "dataset"),
+        "--inputs", str(tmp_path / "spiral-inputs.json"),
+        "--object-store", str(tmp_path / "inputs.vcobj"),
         "--ink-volume", str(tmp_path / "ink"),
         "--output", str(tmp_path / "output"),
         "--config-folder", str(tmp_path / "configs"),
         "--sweep-config", str(tmp_path / "sweep.json"),
         "--wandb-group", "experiment",
+        "--object-store-author", "sweeper",
     ])
 
     command = run_sweep.child_command(
         args, "baseline", tmp_path / "baseline.json", (0,))
 
     assert command[command.index("--wandb-group") + 1] == "experiment"
+    assert command[command.index("--object-store") + 1] == str(tmp_path / "inputs.vcobj")
+    assert command[command.index("--object-store-author") + 1] == "sweeper"
 
 
 def test_sweep_parser_supports_opt_in_overwrite(tmp_path):
     args = run_sweep.build_parser().parse_args([
-        "--dataset", str(tmp_path / "dataset"),
+        "--inputs", str(tmp_path / "spiral-inputs.json"),
+        "--object-store", str(tmp_path / "inputs.vcobj"),
         "--ink-volume", str(tmp_path / "ink"),
         "--config-folder", str(tmp_path / "configs"),
         "--sweep-config", str(tmp_path / "sweep.json"),

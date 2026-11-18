@@ -1,6 +1,7 @@
 #include "SpiralReloadComparison.hpp"
 #include "SpiralSessionSync.hpp"
 
+#include <QJsonArray>
 #include <QJsonObject>
 #include <QTemporaryFile>
 #include <QtTest/QtTest>
@@ -195,11 +196,11 @@ private slots:
     {
         const QJsonObject defaults;
         QJsonObject loaded{
-            {"paths", QJsonObject{{"verified_patches", "/patches"}}},
+            {"paths", QJsonObject{{"outer_shell", "/shell"}}},
             {"run", QJsonObject{{"config", defaults}}},
         };
         QJsonObject current = loaded;
-        current["paths"] = QJsonObject{{"verified_patches", "/other-patches"}};
+        current["paths"] = QJsonObject{{"outer_shell", "/other-shell"}};
 
         QVERIFY(
             vc3d::normalizedSpiralReloadRequest(current, defaults, {})
@@ -210,7 +211,7 @@ private slots:
     {
         const QSet<QString> modelStageKeys{"model_num_flow_stages"};
         const QJsonObject loaded{
-            {"paths", QJsonObject{{"verified_patches", "/patches"}}},
+            {"paths", QJsonObject{{"outer_shell", "/shell"}}},
             {"run", QJsonObject{{"z_end", 900}, {"config", QJsonObject{
                 {"model_num_flow_stages", 1},
                 {"loss_weight_patch_radius", 8.0},
@@ -245,8 +246,16 @@ private slots:
         QCOMPARE(vc3d::spiralRebuildStage(otherRun, loaded, modelStageKeys),
                  QStringLiteral("all"));
         QJsonObject otherPaths = loaded;
-        otherPaths["paths"] = QJsonObject{{"verified_patches", "/elsewhere"}};
+        otherPaths["paths"] = QJsonObject{{"outer_shell", "/elsewhere"}};
         QCOMPARE(vc3d::spiralRebuildStage(otherPaths, loaded, modelStageKeys),
+                 QStringLiteral("all"));
+        // The fit inputs are a store selection in run.config: choosing other
+        // objects is the whole build, and so is rereading the same selection.
+        QCOMPARE(vc3d::spiralRebuildStage(
+                     withConfig("object_store_patch_tags", QJsonArray{"reviewed"}),
+                     loaded, modelStageKeys),
+                 QStringLiteral("all"));
+        QCOMPARE(vc3d::spiralRebuildStage(loaded, loaded, modelStageKeys, true),
                  QStringLiteral("all"));
         // A key present on one side only counts as changed, exactly as the
         // service's own diff over the requests counts it.

@@ -24,7 +24,9 @@ namespace
         deps.fiberGeneration = 7;
         deps.packageGeneration = 3;
         deps.umbilicusGeneration = 2;
-        deps.umbilicusFingerprint = QStringLiteral("umb|1024:99");
+        deps.umbilicusDependency.reference = vc::objects::ObjectVersion{
+            "11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222",
+            "33333333-3333-4333-8333-333333333333", 99};
         deps.annotationVolume = QStringLiteral("20260102150214");
         deps.voxelSizeUm = 9.596;
         deps.catalogOrientation = QStringLiteral("z-top-to-bottom 1, left-handed 0");
@@ -123,7 +125,7 @@ private slots:
         QCOMPARE(verdict(baseline(), fibers).cause, StaleVerdict::Cause::Fibers);
 
         auto umbilicus = baseline();
-        umbilicus.umbilicusFingerprint = QStringLiteral("umb|2|2");
+        umbilicus.umbilicusDependency.reference->version = 2;
         QCOMPARE(verdict(baseline(), umbilicus).cause,
                  StaleVerdict::Cause::Umbilicus);
 
@@ -172,8 +174,29 @@ private slots:
     void aRewrittenUmbilicusFileMarksStale()
     {
         auto current = baseline();
-        current.umbilicusFingerprint = QStringLiteral("umb|2048:101");
+        current.umbilicusDependency.reference->version = 101;
         QCOMPARE(verdict(baseline(), current).action, StaleVerdict::Action::MarkStale);
+    }
+
+    void sameCounterDifferentOwnerOrLineageMarksStale()
+    {
+        auto current = baseline();
+        current.umbilicusDependency.reference->storeUuid = "44444444-4444-4444-8444-444444444444";
+        QCOMPARE(verdict(baseline(), current).cause, StaleVerdict::Cause::Umbilicus);
+        current = baseline();
+        current.umbilicusDependency.reference->generation = "55555555-5555-4555-8555-555555555555";
+        QCOMPARE(verdict(baseline(), current).cause, StaleVerdict::Cause::Umbilicus);
+    }
+
+    void unavailableStatusRemainsADependency()
+    {
+        auto built = baseline();
+        built.umbilicusDependency = {std::nullopt, QStringLiteral("missing")};
+        auto current = built;
+        QCOMPARE(verdict(built, current).action, StaleVerdict::Action::Fresh);
+        current.umbilicusDependency.problem = QStringLiteral("unreadable");
+        QCOMPARE(verdict(built, current).cause, StaleVerdict::Cause::Umbilicus);
+        QCOMPARE(verdict(built, baseline()).cause, StaleVerdict::Cause::Umbilicus);
     }
 
     // The catalog's orientation of the volume is a dependency like the

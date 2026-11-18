@@ -14,7 +14,11 @@
 // advances the store's commit sequence by one and appends its changes to an
 // ordered feed. A transaction that changes nothing advances nothing.
 
+#include <atomic>
+#include <compare>
+#include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <functional>
 #include <map>
 #include <optional>
@@ -23,10 +27,22 @@
 #include <variant>
 #include <vector>
 
+#include "vc_object_store/Progress.hpp"
 #include "vc_object_store/objects/Geometry.hpp"
 #include <vc_reader/registrations.hpp>
 
 namespace vc::objects {
+// A coherent read could not retain the requested snapshot. Retry or reselect.
+class StoreBusy : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+// An unreadable success/replay receipt does not prove the request failed.
+// Keep its pending identity; never resubmit under a fresh request UUID.
+class ReceiptDecodeError : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
 
 struct ObjectRecord;
 struct EdgeRecord;
@@ -36,17 +52,43 @@ struct ObjectVersion {
     std::string storeUuid, generation, objectUuid;
     int64_t version = 0;
     bool operator==(const ObjectVersion&) const = default;
+    auto operator<=>(const ObjectVersion&) const = default;
 };
 
 struct RelationshipVersion {
     std::string storeUuid, generation, relationshipUuid;
     int64_t version = 0;
     bool operator==(const RelationshipVersion&) const = default;
+    auto operator<=>(const RelationshipVersion&) const = default;
 };
 
-// Record UUID -> expected live version; nullopt expects no live record (never
-// created, or deleted).
+// Numbered wire/receipt and storage projection only. Native selected guards use
+// RecordSelection below; do not drop their owner/lineage into this map.
 using VersionSelection = std::map<std::string, std::optional<int64_t>>;
+
+// One selected identity per guard. NoLive does not mean never seen:
+// a deleted record also has no live head. A selected tombstone retains its
+// reference with deleted=true instead.
+struct RecordExpectation {
+    std::variant<std::monostate, ObjectVersion, RelationshipVersion> selected;
+    bool deleted = false;
+    RecordExpectation() = default;
+    RecordExpectation(std::nullopt_t) {}
+    RecordExpectation(ObjectVersion ref) : selected(std::move(ref)) {}
+    RecordExpectation(RelationshipVersion ref) : selected(std::move(ref)) {}
+    std::optional<int64_t> number() const {
+        if (deleted) return {};
+        if (const auto* r = std::get_if<ObjectVersion>(&selected)) return r->version;
+        if (const auto* r = std::get_if<RelationshipVersion>(&selected)) return r->version;
+        return {};
+    }
+    bool complete() const { return std::holds_alternative<ObjectVersion>(selected) || std::holds_alternative<RelationshipVersion>(selected); }
+    bool operator==(const RecordExpectation&) const = default;
+};
+
+using RecordSelection = std::map<std::string, RecordExpectation>;
+VersionSelection numberedSelection(const RecordSelection&); // storage/wire projection only
+void mergeExpectations(RecordSelection&, const RecordSelection&, const char* description);
 
 struct StoreStatus {
     std::string storeUuid, generation;
@@ -54,6 +96,10 @@ struct StoreStatus {
     // Changes after this sequence are retained in the feed; a cursor below it
     // cannot be continued and requires revalidating cached state.
     int64_t feedStart = 0;
+    bool historyEnabled = true;
+    // Generic record-only copies cannot preserve extension-owned rows. This
+    // capability is advertised by local and hosted readers before such copies.
+    bool extensionsPresent = false;
 };
 
 // Writes are attributed to `author` (falling back to the store's open
@@ -63,7 +109,7 @@ struct StoreStatus {
 //    history generation;
 //  - expectedObjects are write preconditions. Every object the transaction
 //    changes (including relationship endpoints) must be listed, and creation
-//    lists the new UUID as nullopt;
+//    lists the new UUID as nullopt (no live record);
 //  - expectedRelationships are optional relationship preconditions (every
 //    relationship change also versions both endpoints, which must be listed);
 //  - readDependencies are current-state guards on records read but not
@@ -77,7 +123,7 @@ struct TransactionContext {
     std::optional<std::string> requestDigest;
     std::optional<std::string> storeUuid, generation;
     std::optional<std::string> author;
-    VersionSelection expectedObjects, expectedRelationships, readDependencies;
+    RecordSelection expectedObjects, expectedRelationships, readDependencies;
     std::optional<int64_t> expectedCommitSequence;
 };
 
@@ -89,6 +135,11 @@ struct TransactionReceipt {
     // Versions after commit of every expected and every changed record;
     // nullopt for a record that is absent (deleted).
     VersionSelection objects, relationships;
+    // Complete identities at commit, including unchanged inherited inputs.
+    // Absent/deleted objects have no reference. Never reconstruct these from
+    // the receipt's committing store/generation and a numeric object version.
+    std::map<std::string, ObjectVersion> objectReferences;
+    std::optional<ObjectVersion> objectReference(const std::string& uuid) const;
     // Objects/relationships this transaction created, in creation order.
     std::vector<std::string> created;
     // True when submit() returned the receipt saved by an earlier identical
@@ -268,24 +319,106 @@ struct IngestGeometryOp {
     std::string coordinateContext = "{}";
 };
 
+// Run relationship detectors over stored objects and publish their links with
+// the store's link marker, as one commit. `planJson` is the canonical plan
+// (object_links/LinkObjects.hpp: the ordered detectors with their parameters
+// and the marker's content). This is a *prepared* operation: detection runs
+// under a read snapshot outside the writer lock (ObjectStore::prepare), and
+// the checked write expects every object the detectors read at the version
+// they read, so a commit in between conflicts and nothing is written.
+struct LinkObjectsOp { std::string planJson; };
+inline constexpr const char* kLinkObjectsOperation = "link_objects"; // its wire name and preparer key
+
 using TransactionOperation = std::variant<
     CreateObjectOp, UpdateObjectOp, SetMetaOp, RemoveMetaOp, SetApprovalOp,
     RetireObjectOp, RestoreObjectOp, DeleteObjectOp,
     AddEdgeOp, UpdateEdgeOp, RemoveEdgeOp, RetainRelationshipOp, KeepRecordedRelationshipOp,
     PutGeometryOp, EditGeometryOp, EditGeometryRectangleOp, RecordCatalogTransformsOp, SetSurfaceChannelsOp,
-    UpdateGeometryArraysOp, IngestGeometryOp, CheckVolumeMappingOp>;
+    UpdateGeometryArraysOp, IngestGeometryOp, CheckVolumeMappingOp, LinkObjectsOp>;
 
 // Wire/command format version, part of every request digest.
-inline constexpr int kTransactionCommandVersion = 1;
+inline constexpr int kTransactionCommandVersion = 3;
 
 struct TransactionRequest {
     std::string requestUuid;       // required: identifies retries
     std::string storeUuid;         // required
     std::string generation;        // required: expected active generation
     std::string author;            // required: attribution, not authentication
-    VersionSelection expectedObjects, expectedRelationships, readDependencies;
+    RecordSelection expectedObjects, expectedRelationships, readDependencies;
     std::optional<int64_t> expectedCommitSequence;
     std::vector<TransactionOperation> operations;
 };
+
+// Guard the selected owner, lineage and version as well as its numeric version.
+void expectObject(TransactionRequest&, const ObjectVersion&);
+void expectObject(TransactionRequest&, const struct ObjectRevision&);
+void expectRead(TransactionRequest&, const ObjectVersion&);
+void expectRelationship(TransactionRequest&, const RelationshipVersion&);
+
+// ---- Prepared operations ---------------------------------------------------
+// An operation whose work happens before the writer lock is taken (link
+// detection over a read snapshot) and whose publication joins the request's
+// checked write. ObjectStore::prepare runs the registered preparer of each
+// such operation and returns what the write needs: the versions the
+// preparation observed, added to the request's expectations and read
+// dependencies at begin, and the publication to run in the operation's place.
+// The request itself (and so its digest and receipt) is unchanged.
+
+class ObjectStore;
+class WriteTxn;
+
+// A preparation that could not be made: its request publishes nothing and
+// has no receipt (a link detector that failed to run, for instance). Not a
+// transport failure: a retry of the same request repeats the work.
+class PreparationFailed : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
+struct PreparedOperation {
+    RecordSelection expectedObjects, readDependencies;
+    // Publishes the preparation in the caller's write transaction. A
+    // preparer may fail the whole transaction when apply throws (link_objects
+    // does: see object_links::prepareLinkObjects), so a caller must not catch
+    // the error and commit: the commit throws and rolls every write back.
+    std::function<void(ObjectStore&, WriteTxn&)> apply;
+};
+
+// What ObjectStore::prepare returns: the request's preparations, bound to
+// the request (its UUID and digest) and the store they ran on. submit refuses a
+// preparation made for another request or on another store, so a
+// preparation can only publish what its own request's detection read.
+class PreparedOperations {
+public:
+    // Nothing to apply: the request has no prepared operation, or its
+    // receipt is already saved (submit replays it).
+    bool empty() const { return operations_.empty(); }
+    // Every version the preparations observed and the write expects.
+    RecordSelection expectedObjects() const;
+    RecordSelection readDependencies() const;
+
+private:
+    friend class ObjectStore;
+    std::string requestUuid_, requestDigest_, storeUuid_, generation_;
+    std::map<std::size_t, PreparedOperation> operations_; // by index in TransactionRequest::operations
+};
+
+struct PrepareOptions {
+    util::ProgressCallback progress;          // the preparation's stages (detector progress)
+    const std::atomic_bool* cancel = nullptr; // checked between steps; a cancelled preparation throws
+    // Where a preparation may keep disposable files of its own (a hosted
+    // service's strip cache); empty keeps everything in memory.
+    std::filesystem::path scratchDirectory;
+    // Whether the request may name files on this host (a standalone writer
+    // runs where its author is; a hosted service refuses client paths).
+    bool localPaths = true;
+};
+
+// The preparer of one operation type, registered by the library that
+// implements it (object_links::enableLinkObjects for "link_objects"), so the
+// core library stays free of detector dependencies. Called by
+// ObjectStore::prepare with the operation to prepare.
+using OperationPreparer = std::function<PreparedOperation(ObjectStore&, const TransactionOperation&, const PrepareOptions&)>;
+void registerOperationPreparer(const std::string& operationName, OperationPreparer);
 
 } // namespace vc::objects

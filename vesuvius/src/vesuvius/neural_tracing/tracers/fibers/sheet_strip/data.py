@@ -86,6 +86,7 @@ class RunFibers(Sequence):
 
     def __init__(self, fibers, index: StripIndex, grid_scale, length_power=1.):
         self.fibers = FiberStore(fibers, fiber_volume(fibers), grid_scale, split='all', cache_size=64)
+        self.fibers.require_digest(index.meta.get('fibers_digest'))
         self.index = index
         self.lengths = index.unit_length**length_power
 
