@@ -191,9 +191,10 @@ invalid, unsupported, or historically ambiguous saved `auto` policy warns and
 falls back to FP32. Explicit `fp32`, `bf16`, or `fp16` overrides take priority
 and unsupported explicit modes fail. This metadata records training policy,
 not the dtype of checkpoint parameter tensors.
-On CPU devices, `auto` resolves a saved `bf16` policy to FP32 (source
-`checkpoint-cpu-fp32`) because BF16 3D convolution measured slower than FP32
-on CPU; pass `--inference-precision bf16` to opt back in.
+On CPU devices without Intel AMX, `auto` resolves a saved `bf16` policy to
+FP32 (source `checkpoint-cpu-fp32`) because BF16 3D convolution measured
+slower than FP32 there; AMX CPUs keep BF16. Pass `--inference-precision bf16`
+to opt back in.
 
 Each distinct inference scale has separate raw-product float32 mmap rings by
 default and one shared float32 geometric weight ring. Experimental

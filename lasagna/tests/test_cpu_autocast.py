@@ -4,15 +4,51 @@ from pathlib import Path
 import pytest
 import torch
 
+from vesuvius.utils.models import helpers
 from vesuvius.utils.models.helpers import inference_autocast_enabled
 
 
+@pytest.fixture
+def no_amx(monkeypatch):
+    monkeypatch.setattr(helpers, "_cpu_has_amx_bf16", lambda: False)
+
+
 @pytest.mark.parametrize("kind,expected", [("cpu", False), ("cuda", True), ("mps", True), ("xpu", True)])
-def test_policy(kind, expected):
+def test_policy(no_amx, kind, expected):
     assert inference_autocast_enabled(torch.device(kind)) is expected
 
 
-def test_predict3d_adapter_uses_fp32_on_cpu():
+def test_policy_keeps_cpu_bf16_on_amx(monkeypatch):
+    monkeypatch.setattr(helpers, "_cpu_has_amx_bf16", lambda: True)
+    assert inference_autocast_enabled(torch.device("cpu")) is True
+
+
+@pytest.mark.parametrize("caps,expected", [
+    ({"avx512_bf16": True, "amx_bf16": False}, False),
+    ({"avx512_bf16": True, "amx_bf16": True}, True),
+    ({}, False),
+])
+def test_amx_probe_reads_capabilities(monkeypatch, caps, expected):
+    monkeypatch.setattr(torch.cpu, "get_capabilities", lambda: caps, raising=False)
+    helpers._cpu_has_amx_bf16.cache_clear()
+    try:
+        assert helpers._cpu_has_amx_bf16() is expected
+    finally:
+        helpers._cpu_has_amx_bf16.cache_clear()
+
+
+def test_amx_probe_failure_means_fp32(monkeypatch):
+    def broken():
+        raise RuntimeError("probe failed")
+    monkeypatch.setattr(torch.cpu, "get_capabilities", broken, raising=False)
+    helpers._cpu_has_amx_bf16.cache_clear()
+    try:
+        assert helpers._cpu_has_amx_bf16() is False
+    finally:
+        helpers._cpu_has_amx_bf16.cache_clear()
+
+
+def test_predict3d_adapter_uses_fp32_on_cpu(no_amx):
     from lasagna.preprocess_cos_omezarr import LasagnaCosPredict3DAdapter
 
     adapter = LasagnaCosPredict3DAdapter.__new__(LasagnaCosPredict3DAdapter)

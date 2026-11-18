@@ -854,7 +854,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--inference-precision", choices=("auto", "fp32", "fp16", "bf16"), default="auto",
         help="Model autocast precision; auto uses checkpoint training metadata, except that "
-        "checkpoint bf16 resolves to fp32 on CPU devices (default: auto).",
+        "checkpoint bf16 resolves to fp32 on CPUs without Intel AMX (default: auto).",
     )
     parser.add_argument(
         "--product-accumulator-dtype", choices=("float16", "float32"), default="float16",

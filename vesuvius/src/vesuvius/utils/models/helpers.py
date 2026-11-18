@@ -1,3 +1,4 @@
+import functools
 import os
 import socket
 import torch.distributed as dist
@@ -220,6 +221,31 @@ class dummy_context(object):
         pass
 
 
+@functools.lru_cache(maxsize=1)
+def _cpu_has_amx_bf16():
+    """True when the CPU has Intel AMX BF16 tiles (Sapphire Rapids and later).
+
+    Torch 2.11+ has torch.cpu.get_capabilities(); older torch only has the
+    private AMX_TILE probe. A missing or failing probe counts as no AMX.
+    """
+    try:
+        get_capabilities = getattr(torch.cpu, "get_capabilities", None)
+        if get_capabilities is not None:
+            return bool(get_capabilities().get("amx_bf16", False))
+        probe = getattr(torch.cpu, "_is_amx_tile_supported", None)
+        return bool(probe()) if probe is not None else False
+    except Exception:
+        return False
+
+
 def inference_autocast_enabled(device):
-    """Use FP32 for automatic CPU inference; keep accelerator AMP unchanged."""
-    return device.type != "cpu"
+    """Whether automatic inference should use BF16 autocast on *device*.
+
+    Accelerators keep AMP. On CPU, BF16 3D convolution measured slower than
+    FP32 on CPUs without AMX (including ones with AVX512_BF16) and far slower
+    on CPUs without native BF16, so CPU uses FP32 unless the CPU has AMX,
+    where the previous BF16 behaviour is kept.
+    """
+    if device.type != "cpu":
+        return True
+    return _cpu_has_amx_bf16()
