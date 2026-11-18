@@ -1,6 +1,7 @@
 import dbm
 import json
 import pickle
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -14,6 +15,7 @@ from tracks_to_ome_zarr import (
     LocalLabeler,
     RoundRobinLabeler,
     SpatialLabeler,
+    TrackDatabase,
     _rasterize_polyline,
     main,
 )
@@ -181,6 +183,28 @@ class TrackOmeZarrIntegrationTests(unittest.TestCase):
                 zarr.open_group(serial_path, mode='r')['0'][:],
                 zarr.open_group(pipelined_path, mode='r')['0'][:],
             )
+
+
+class TrackDatabaseTests(unittest.TestCase):
+    def test_committed_wal_pages_are_read(self):
+        # An interrupted or still running extraction leaves records that only
+        # the -wal file beside the store holds.
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / 'tracks.dbm'
+            with dbm.open(str(path), 'c') as database:
+                database[b'h:0'] = pickle.dumps([])
+            self.assertEqual(dbm.whichdb(str(path)), 'dbm.sqlite3')
+            writer = sqlite3.connect(path)
+            try:
+                writer.execute('PRAGMA wal_autocheckpoint = 0')
+                writer.execute('INSERT INTO Dict VALUES (?, ?)', (b'h:16', pickle.dumps([])))
+                writer.commit()
+                self.assertTrue(Path(f'{path}-wal').exists())
+                database = TrackDatabase(path)
+                self.assertEqual([key for key, _ in database.records()], [b'h:0', b'h:16'])
+                self.assertEqual(len(database), 2)
+            finally:
+                writer.close()
 
 
 if __name__ == '__main__':
