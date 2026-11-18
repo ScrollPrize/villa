@@ -8,6 +8,7 @@
 #include "vc_object_store/objects/GeometryIngest.hpp"
 #include "vc_object_store/objects/ObjectStoreSession.hpp"
 #include "vc_object_store/objects/ObjectStoreSession.hpp"
+#include "vc_object_store/objects/SurfaceCreate.hpp"
 #include "vc_object_store/store/GeometryViews.hpp"
 #include <nlohmann/json.hpp>
 #include <algorithm>
@@ -324,6 +325,22 @@ int main() try
         require(exportGeometry(target,fiber,output,old)==old,"export preserves inherited exact version");
         std::ifstream file(output);const auto json=nlohmann::json::parse(file);
         require(json.at("line_points").size()==2,"inherited historical export contains selected geometry");
+    }
+    // Store-mode tools such as vc_grow_seg_from_seed record "source" as their
+    // name; such surfaces export with that name kept in meta.json.
+    {
+        const auto grown = util::newUuid();
+        {
+            auto txn = db.write();
+            createSurface(db, txn, grown, "grown", {}, nlohmann::json::object(), {"vc_grow_seg_from_seed"},
+                          {{"source", "vc_grow_seg_from_seed"}, {"vc_gsfs_mode", "explicit_seed"}},
+                          vc::geometry::encode(plane(0)));
+            txn.commit();
+        }
+        const auto output = directory.path / "grown-export";
+        exportGeometry(db, grown, output);
+        const auto meta = nlohmann::json::parse(std::ifstream(output / "meta.json"));
+        require(meta.at("source") == "vc_grow_seg_from_seed", "a tool-named source exports");
     }
     std::cout << "surface tifxyz workflow passed\n";
     return 0;
