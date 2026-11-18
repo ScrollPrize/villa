@@ -109,6 +109,7 @@ export default function DataCatalog({ scroll }) {
     detail: [
       v.px != null ? `${v.px} µm` : null,
       v.energy != null ? `${v.energy} keV` : null,
+      v.supersededBy ? `superseded by ${v.supersededBy}` : null,
     ]
       .filter(Boolean)
       .join(" · "),
