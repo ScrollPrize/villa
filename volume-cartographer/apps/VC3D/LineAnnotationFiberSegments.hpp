@@ -251,6 +251,10 @@ struct StoredControlPoint : cv::Vec3d {
     // Serialized as the control point's optional "tags" array; omitted when
     // empty so untagged fibers are written exactly as before.
     std::vector<std::string> tags;
+    // The identity of the session control this one was snapshot from
+    // (LineControlPoint::identity; 0 when it was not taken from a session):
+    // which live control a saved one is, once the save returns. Not persisted.
+    uint64_t sessionIdentity = 0;
 
     StoredControlPoint() = default;
     explicit StoredControlPoint(const cv::Vec3d& position) : cv::Vec3d(position) {}
