@@ -19,8 +19,9 @@
 // tool then refuses --threads above 1, because that generator is shared mutable state.
 //
 // Each slice is estimated on its own, but the axis is one continuous curve. --zfit fits that
-// curve through the estimates of every slice (fit_umbilicus_along_z), so a slice whose estimate
-// scattered or walked off is outvoted by its neighbours.
+// curve through the estimates of every slice (fit_umbilicus_along_z), so each slice is smoothed
+// with its neighbours. With one slice each side in the window (--zfit 500 at one slice every
+// 256), a slice far off the axis keeps its own estimate, and so do the first and last slice.
 //
 // It does not build normal grids, and does not need to: vc_gen_normalgrids already builds them
 // from a prediction volume, reading every non zero voxel of a uint8 zarr with fill_value 0 as
