@@ -221,6 +221,19 @@ class dummy_context(object):
         pass
 
 
+# oneDNN ISA caps that exclude AMX, so BF16 would not use AMX tiles.
+_ONEDNN_CAPS_WITHOUT_AMX = frozenset({
+    "SSE41", "AVX", "AVX2", "AVX2_VNNI", "AVX2_VNNI_2", "AVX512_CORE", "AVX512_CORE_VNNI",
+    "AVX512_CORE_BF16", "AVX512_CORE_FP16", "AVX10_1_512", "AVX10_2_512",
+})
+
+
+def _onednn_cap_allows_amx():
+    """False when ONEDNN_MAX_CPU_ISA (or DNNL_MAX_CPU_ISA) caps oneDNN below AMX."""
+    cap = os.getenv("ONEDNN_MAX_CPU_ISA") or os.getenv("DNNL_MAX_CPU_ISA") or ""
+    return cap.strip().upper() not in _ONEDNN_CAPS_WITHOUT_AMX
+
+
 @functools.lru_cache(maxsize=1)
 def _cpu_has_amx_bf16():
     """True when the CPU has Intel AMX BF16 tiles (Sapphire Rapids and later).
@@ -243,9 +256,10 @@ def inference_autocast_enabled(device):
 
     Accelerators keep AMP. On CPU, BF16 3D convolution measured slower than
     FP32 on CPUs without AMX (including ones with AVX512_BF16) and far slower
-    on CPUs without native BF16, so CPU uses FP32 unless the CPU has AMX,
-    where the previous BF16 behaviour is kept.
+    on CPUs without native BF16, so CPU uses FP32 unless the CPU has AMX
+    (and no ONEDNN_MAX_CPU_ISA cap excludes it), where the previous BF16
+    behaviour is kept.
     """
     if device.type != "cpu":
         return True
-    return _cpu_has_amx_bf16()
+    return _onednn_cap_allows_amx() and _cpu_has_amx_bf16()

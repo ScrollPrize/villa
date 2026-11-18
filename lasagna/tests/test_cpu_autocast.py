@@ -10,6 +10,8 @@ from vesuvius.utils.models.helpers import inference_autocast_enabled
 
 @pytest.fixture
 def no_amx(monkeypatch):
+    monkeypatch.delenv("ONEDNN_MAX_CPU_ISA", raising=False)
+    monkeypatch.delenv("DNNL_MAX_CPU_ISA", raising=False)
     monkeypatch.setattr(helpers, "_cpu_has_amx_bf16", lambda: False)
 
 
@@ -19,8 +21,24 @@ def test_policy(no_amx, kind, expected):
 
 
 def test_policy_keeps_cpu_bf16_on_amx(monkeypatch):
+    monkeypatch.delenv("ONEDNN_MAX_CPU_ISA", raising=False)
+    monkeypatch.delenv("DNNL_MAX_CPU_ISA", raising=False)
     monkeypatch.setattr(helpers, "_cpu_has_amx_bf16", lambda: True)
     assert inference_autocast_enabled(torch.device("cpu")) is True
+
+
+@pytest.mark.parametrize("variable", ["ONEDNN_MAX_CPU_ISA", "DNNL_MAX_CPU_ISA"])
+@pytest.mark.parametrize("cap,expected", [
+    ("AVX512_CORE_AMX", True), ("all", True),
+    ("AVX512_CORE_BF16", False), ("AVX512_CORE", False), ("AVX2", False),
+])
+def test_onednn_cap_below_amx_uses_fp32(monkeypatch, variable, cap, expected):
+    monkeypatch.delenv("ONEDNN_MAX_CPU_ISA", raising=False)
+    monkeypatch.delenv("DNNL_MAX_CPU_ISA", raising=False)
+    monkeypatch.setenv(variable, cap)
+    monkeypatch.setattr(helpers, "_cpu_has_amx_bf16", lambda: True)
+    assert inference_autocast_enabled(torch.device("cpu")) is expected
+    assert inference_autocast_enabled(torch.device("cuda")) is True
 
 
 @pytest.mark.parametrize("caps,expected", [
