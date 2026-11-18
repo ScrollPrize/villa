@@ -745,7 +745,8 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
 
         if (request.modelLineBuilder || request.csplineOnly) {
             // These three points only provide the two seed directions. Both
-            // provisional tails are replaced (or removed) by model tracing.
+            // provisional tails are replaced (or removed) by model tracing,
+            // or by rays in cspline-only mode.
             const auto seed = request.controlPoints.front().volumePoint;
             for (const auto& p : {seed - tangent, seed, seed + tangent}) {
                 vc::lasagna::LinePoint point;

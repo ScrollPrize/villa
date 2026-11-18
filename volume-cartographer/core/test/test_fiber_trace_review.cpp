@@ -426,3 +426,41 @@ TEST_CASE("cspline-only single seed gets ray tails without normals")
                    cv::Vec3d(10.0, 0.0, 0.0)) < 1e-9);
     CHECK(std::abs(points.front().position[0] - points.back().position[0]) > 50.0);
 }
+
+TEST_CASE("cspline-only partial solve keeps spans outside the dirty set")
+{
+    const std::vector<cv::Vec3d> linePoints{
+        {0.0, 0.0, 0.0}, {50.0, 5.0, 0.0}, {100.0, 0.0, 0.0},
+        {150.0, 20.0, 0.0}, {200.0, 40.0, 0.0},
+    };
+    vc3d::line_annotation::FiberModeOptimizationRequest request;
+    request.controlPoints = {
+        {0.0, linePoints[0], true, 0},
+        {2.0, linePoints[2], false, 2},
+        {4.0, linePoints[4], false, 4},
+    };
+    FiberTraceSegmentMetadata lasagnaSpan;
+    lasagnaSpan.interpMode = SegmentInterpolationMode::Lasagna;
+    lasagnaSpan.message = "lasagna";
+    request.controlPoints[0].segmentToNext = lasagnaSpan;
+    request.controlPoints[1].segmentToNext = lasagnaSpan;
+    request.linePointsBase = linePoints;
+    request.csplineOnly = true;
+    request.dirtySegments = std::vector<size_t>{1};
+    request.lasagnaConfig.segmentLength = 5.0;
+    request.breakExtrapolationDistanceBaseVoxels = 30.0;
+
+    const auto result =
+        vc3d::line_annotation::optimizeFiberWithNativeFallback(std::move(request));
+    REQUIRE(result.controlPoints.size() == 3);
+    REQUIRE(result.controlPoints[0].segmentToNext);
+    REQUIRE(result.controlPoints[1].segmentToNext);
+    CHECK(result.controlPoints[0].segmentToNext->interpMode == SegmentInterpolationMode::Lasagna);
+    CHECK(result.controlPoints[1].segmentToNext->interpMode == SegmentInterpolationMode::Cspline);
+    // The kept span's interior vertex survives unchanged.
+    const auto& points = result.optimization.line.points;
+    const int first = result.controlPoints[0].optimizedIndex;
+    REQUIRE(first >= 0);
+    REQUIRE(static_cast<size_t>(first) + 1 < points.size());
+    CHECK(cv::norm(points[static_cast<size_t>(first) + 1].position - linePoints[1]) < 1e-9);
+}

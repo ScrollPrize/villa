@@ -379,10 +379,11 @@ void CFiberWidget::setupUi()
     auto* csplineOnlyCheckBox = new QCheckBox(tr("Cspline only (no Lasagna / predictions)"), mainWidget);
     csplineOnlyCheckBox->setObjectName(QStringLiteral("fiberCsplineOnlyCheckBox"));
     csplineOnlyCheckBox->setToolTip(
-        tr("Line annotation interpolates every span with a cubic spline through the "
-           "control points and draws straight rays past the end points. No Lasagna "
-           "dataset, fiber predictions or fiber-follow model is opened. Applies to the "
-           "next solve; set it before opening Line Annotation for a clean session."));
+        tr("Line annotation interpolates each span it solves with a cubic spline "
+           "through the control points and draws straight rays past the end points. "
+           "Spans of a reopened fiber keep their geometry until they are edited. No "
+           "Lasagna dataset, fiber predictions or fiber-follow model is opened. Applies "
+           "from the next solve; set it before opening Line Annotation for a clean session."));
     csplineOnlyCheckBox->setChecked(vc3d::line_annotation::csplineOnlyAnnotationEnabled());
     layout->addWidget(csplineOnlyCheckBox);
     connect(csplineOnlyCheckBox, &QCheckBox::toggled, this, [](bool checked) {
