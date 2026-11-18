@@ -130,3 +130,23 @@ TEST_CASE("Volume: metadata.json's scan is flattened, and a shape that disagrees
     CHECK_THROWS_WITH_AS(Volume::New(d), doctest::Contains("does not match"), std::runtime_error);
     fs::remove_all(d);
 }
+
+TEST_CASE("Volume: a downloaded open-data store opens with its own metadata.json")
+{
+    // The open-data volumes publish their acquisition record as metadata.json, with no
+    // VC `type`, `uuid` or shape. A local copy opens as a URL to it does: shape from the
+    // zarr levels, voxel size from the record (samplePixelSize is in millimeters).
+    auto d = tmpDir("open_data_record");
+    vcr::zarr::Writer::create(d / "0", {.shape = {4, 6, 8}, .chunks = {4, 6, 8}, .compressor = ""});
+    writeTextFile(d / "metadata.json",
+                  R"({"scan": {"tomo": {"acquisition": {"detector": {"samplePixelSize": 0.00864}}}},)"
+                  R"( "zarr_export": {"workflow_name": "mask-layers"}})");
+    const auto v = Volume::New(d);
+    CHECK(v->shape() == std::array<int, 3>{4, 6, 8});
+    CHECK(v->voxelSize() == doctest::Approx(8.64));
+
+    // meta.json is VC's own record: one without `type` is still an error.
+    writeTextFile(d / "meta.json", R"({"uuid": "no-type", "width": 8, "height": 6, "slices": 4})");
+    CHECK_THROWS_WITH_AS(Volume::New(d), doctest::Contains("type"), std::runtime_error);
+    fs::remove_all(d);
+}
