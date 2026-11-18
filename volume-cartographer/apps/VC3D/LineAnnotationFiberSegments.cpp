@@ -656,7 +656,7 @@ int replaceOpenTails(
 FiberModeOptimizationResult optimizeFiberWithNativeFallback(
     FiberModeOptimizationRequest request)
 {
-    if (!request.baseNormalSampler && !request.modelLineBuilder) {
+    if (!request.baseNormalSampler && !request.modelLineBuilder && !request.csplineOnly) {
         throw std::invalid_argument(
             "fiber-mode optimization requires a base normal sampler");
     }
@@ -714,7 +714,9 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
     request.controlPoints.back().segmentToNext.reset();
     // Which open tails become straight rays (lone end breaks, kollesis
     // ends); read from the sorted controls and their span tags.
-    const OpenTailPolicy tailPolicy = openTailPolicyForControls(request.controlPoints);
+    const OpenTailPolicy tailPolicy = request.csplineOnly
+        ? OpenTailPolicy{true, true}
+        : openTailPolicyForControls(request.controlPoints);
     const bool traceGlobalMode =
         request.globalMode == FiberOptimizationMode::NativeFiberTrace3d;
     // Lasagna mode keeps the solver's own tails unless a side is a ray; the
@@ -741,7 +743,7 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
             config.useInitialTangent = true;
         }
 
-        if (request.modelLineBuilder) {
+        if (request.modelLineBuilder || request.csplineOnly) {
             // These three points only provide the two seed directions. Both
             // provisional tails are replaced (or removed) by model tracing.
             const auto seed = request.controlPoints.front().volumePoint;
@@ -891,7 +893,9 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
         }
         const double endpointDistanceBaseVoxels = pointDistance(
             owner.volumePoint, request.controlPoints[spanIndex + 1].volumePoint);
-        const SegmentInterpolationMode requestedMode = resolveSegmentInterpolationMode(
+        const SegmentInterpolationMode requestedMode = request.csplineOnly
+            ? SegmentInterpolationMode::Cspline
+            : resolveSegmentInterpolationMode(
             goal,
             request.globalMode,
             endpointDistanceBaseVoxels,
@@ -900,7 +904,9 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
             modes[spanIndex] = SegmentInterpolationMode::Cspline;
             metadata.interpMode = SegmentInterpolationMode::Cspline;
             metadata.metric.reset();
-            metadata.message = goal == SegmentInterpolationGoal::Global
+            metadata.message = request.csplineOnly
+                ? "cspline only"
+                : goal == SegmentInterpolationGoal::Global
                 ? "short span"
                 : "cspline";
             metadata.meetingErrorBaseVoxels.reset();
@@ -1135,7 +1141,7 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
             request.controlPoints[index].linePosition = controlIndices[index];
         }
 
-        if (request.modelLineBuilder) {
+        if (request.modelLineBuilder || request.csplineOnly) {
             reinitialized.fixedPointIndices = controlIndices;
             for (const auto& p : stitched) {
                 vc::lasagna::LinePoint point;

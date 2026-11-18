@@ -92,6 +92,7 @@ set(srcs
     LineAnnotationFiberSegments.cpp
     LineAnnotationStructuralEdits.cpp
     LineAnnotationFiberSegments.hpp
+    LineAnnotationCsplineOnly.hpp
     LineAnnotationDialog.cpp
     LineAnnotationDialog.hpp
     LineAnnotationGeneratedViews.cpp

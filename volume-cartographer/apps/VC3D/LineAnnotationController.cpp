@@ -23,6 +23,7 @@
 #include "OpenDataLasagna.hpp"
 #include "FiberLineGeometry.hpp"
 #include "FiberMapAutoLink.hpp"
+#include "LineAnnotationCsplineOnly.hpp"
 #include "LineAnnotationFiberLinks.hpp"
 #include "LineAnnotationStructuralEdits.hpp"
 #include "LineAnnotationFiberNaming.hpp"
@@ -5909,7 +5910,8 @@ void LineAnnotationController::handleLineSeed(const std::string& surfaceName,
     }
 
     session.nativeSeedTracePending = false;
-    if (session.fiberOptimizationMode ==
+    const bool csplineOnlySeed = vc3d::line_annotation::csplineOnlyAnnotationEnabled() && !session.modelOnly;
+    if (!csplineOnlySeed && session.fiberOptimizationMode ==
         vc3d::line_annotation::FiberOptimizationMode::NativeFiberTrace3d) {
         const auto vpkg = _state ? _state->vpkg() : nullptr;
         const size_t fiberInferenceEntryCount = vpkg
@@ -5954,7 +5956,7 @@ void LineAnnotationController::handleLineSeed(const std::string& surfaceName,
     session.controlPoints.front().tags = std::move(seedTags);
     setSessionOptimizationState(session, SessionOptimizationState::Unoptimized);
     syncLinkedBranchMetadataAfterFiberModification(session);
-    if (session.modelOnly) {
+    if (session.modelOnly || csplineOnlySeed) {
         session.nativeSeedTracePending = false;
         auto axis = normalizedOrZero(session.sourceSliceNormal);
         if (!finiteDirection(axis)) axis = {0.0, 0.0, 1.0};
@@ -8346,7 +8348,7 @@ bool LineAnnotationController::resolveDatasetForSession(LineAnnotationSession& s
         ++_sessionNormalSamplerBuilds;
         return std::make_shared<vc::lasagna::LasagnaNormalSampler>(dataset);
     };
-    if (session.modelOnly) {
+    if (session.modelOnly || vc3d::line_annotation::csplineOnlyAnnotationEnabled()) {
         try {
             if (!_state || !_state->currentVolume())
                 throw std::runtime_error("No active volume is loaded.");
@@ -10112,6 +10114,9 @@ bool LineAnnotationController::ensureSessionSolveBackends(
     if (stillValid && !stillValid()) {
         return false;
     }
+    if (vc3d::line_annotation::csplineOnlyAnnotationEnabled() && !session.modelOnly) {
+        return true;
+    }
     if (!session.normalSampler && !session.modelOnly) {
         showError(tr("Could not run final line optimization: no normal source is loaded."),
                   session.suppressErrorDialogs);
@@ -10558,6 +10563,13 @@ LineAnnotationController::makeFiberModeOptimizationRequest(
     request.lasagnaConfig.maxIterations = 1000;
     request.lasagnaConfig.differentiableNormalSampling = true;
     request.lasagnaConfig.printSolverProgress = false;
+    request.csplineOnly = vc3d::line_annotation::csplineOnlyAnnotationEnabled() && !session.modelOnly;
+    if (request.csplineOnly) {
+        // Rays past both ends at the extrapolation distance: display only.
+        request.breakExtrapolationDistanceBaseVoxels =
+            static_cast<double>(std::max(1, extrapolationDistanceVx));
+        return request;
+    }
     if ((session.modelOnly || fiberFollowEnabled()) && FiberFollowService::instance().isRunning()) {
         installFiberFollowTracer(request, session.fiberId != 0 ? fiberHvDirectionTag(session.fiberId)
                                                                : QString::fromStdString(session.fiberManualHvTag));
@@ -10814,17 +10826,19 @@ void LineAnnotationController::startFiberModeOptimization(
     saveSessionAsFiber(session, false, true);
     if (_fiberSaveFailureCount != failures) return;
 
-    if (!ensureDatasetForSession(session) || (!session.normalSampler && !session.modelOnly)) {
+    const bool csplineOnly = vc3d::line_annotation::csplineOnlyAnnotationEnabled() && !session.modelOnly;
+    if (!ensureDatasetForSession(session) ||
+        (!session.normalSampler && !session.modelOnly && !csplineOnly)) {
         return;
     }
-    const bool needsTrace = session.fiberOptimizationMode ==
+    const bool needsTrace = !csplineOnly && (session.fiberOptimizationMode ==
             vc3d::line_annotation::FiberOptimizationMode::NativeFiberTrace3d ||
         std::any_of(session.controlPoints.begin(), session.controlPoints.end(),
                     [](const auto& control) {
                         return control.segmentToNext &&
                             control.segmentToNext->interpGoal ==
                                 vc3d::line_annotation::SegmentInterpolationGoal::Trace;
-                    });
+                    }));
     // A single control whose both tails are rays (lone break, kollesis end)
     // traces nothing: no inference inputs are needed for it. A model session
     // always ensures its service (the request installs the callbacks the
@@ -15504,6 +15518,8 @@ vc::lasagna::LineModel LineAnnotationController::lineModelFromPoints(
     const std::vector<cv::Vec3d>& points,
     const vc::lasagna::NormalSampler* normalSampler)
 {
+    if (!normalSampler && vc3d::line_annotation::csplineOnlyAnnotationEnabled())
+        return vc::lasagna::lineModelForInspection(points);
     return vc::lasagna::lineModelFromSampledPoints(points, normalSampler);
 }
 
