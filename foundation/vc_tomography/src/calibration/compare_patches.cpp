@@ -154,6 +154,10 @@ void measure_patches(const Pairing& P, const BlockPlan& plan, const std::vector<
         const int* const L = shape(k).L;
         if (s.plan.max_row_shift + 3 > mg[1]) return false;  // the margin of rows cannot take the pre-alignment
         if (s.plan.j0 - m0 < 0 || s.plan.j0 + n0 + m0 > nb) return false;
+        if (s.extra[0]) {  // a cut moved by what the registration found, onto frames a partial copy does not hold: given up
+            const Stretch& held = P.B.rec->stretches[P.sb];
+            if (!held.on_disk(std::max<std::int64_t>(0, s.plan.j0 - m0 - kSlack[0])) || !held.on_disk(std::min(nb, s.plan.j0 + n0 + m0 + kSlack[0]) - 1)) return false;
+        }
         frame_b = s.plan.j0 - m0;
         row_b = c.row_a + s.plan.row_offset + s.extra[1] - mg[1];
         col = (P.mirror ? c.col_b - s.extra[2] : c.col_b + s.extra[2]) - mg[2];

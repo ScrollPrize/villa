@@ -1,7 +1,9 @@
-"""One tile of a mosaic, reconstructed alone.
+"""A mosaic: one tile reconstructed alone, or all tiles as one slice.
 
 A mosaic is scans of one sample at several places on the rotation stage (tiles), each a helix with the rotation
-axis inside the detector. `tile_reconstructor` makes a vc_tomography reconstructor of one tile.
+axis inside the detector. `tile_reconstructor` makes a vc_tomography reconstructor of one tile;
+`canvas_reconstruction` reconstructs the whole mosaic as one slice by one filtered backprojection, from a geometry
+calibration that holds the tiles' places.
 
 `cal` is a geometry calibration of the tiles (`geometry.calibrate_geometry`, `vc_tomography_calibration geometry`:
 "model": "joint") and `label` the tile as that calibration's layout names it: the tile is reconstructed under its
@@ -12,7 +14,7 @@ is the model's (x, -y) from the tile's rotation axis.
 
 Or `cal` is the description that the mosaic's geometry calibration removed in November 2026 wrote. Nothing makes
 one any more; its form below is what this reconstructor reads of it, not a statement of how a mosaic's geometry
-should be modelled or measured. A mosaic cannot be reconstructed as one volume yet.
+should be modelled or measured.
 
 That description is a dict (JSON as `geometry.save` writes it):
 
@@ -103,3 +105,37 @@ def tile_reconstructor(master, cal, label, device="cuda", params=None, row_origi
     return _core.tile_reconstructor(str(master), cal if isinstance(cal, str) else json.dumps(cal, default=float), str(label), device,
                                     json.dumps(params or {}, default=float), row_origin, weight, float(cache_gb), reduced, str(cache_dir or ""),
                                     int(reduce), log, str(projections or ""))     # vc_tomography::tile_reconstructor
+
+
+def canvas_reconstruction(projections, cal, device="cuda", params=None, reduce=0, projection_store=None, cache_dir=None, taper=200, levels=True, keep_tiles=False, log=print):
+    """The whole mosaic as one slice by one filtered backprojection (vc_tomography::MosaicReconstruction,
+    vc_tomography/mosaic.hpp): every tile's rows of a slice, as its own pipeline grids them, are placed in one sinogram as
+    wide as the mosaic (the tile's rows delayed to where its axis falls on the canvas at each angle), the recordings of
+    every ray averaged by their weights, and that sinogram is ramp-filtered and backprojected once. No row is cut inside
+    the sample, so the slice has neither the slow shading of a tile reconstructed alone nor seams between tiles.
+
+    cal: the joint geometry calibration of the mosaic's tiles (vc_tomography_calibration geometry on all of them:
+    every scan's d and height against the anchor; a file with every place at nothing is refused), as text, a dict
+    or a path.
+    projections: the folder of the tiles' scan folders (a master is taken from there when the calibration names it
+    elsewhere). params: reconstruction parameters (filters, backprojector="fbp(...)", z_interp, ...). reduce,
+    projection_store: frames at a half, a quarter or an eighth, from a projection store. taper: stored columns at either
+    end of a tile's rows over which its weight falls to nothing. levels: one additive level per tile and slice from the
+    rays two tiles share. keep_tiles: every tile's reconstructor kept between chunks (faster; each holds device memory).
+
+    Returns the reconstruction: .doable (slices [lo, hi)), .size (canvas pixels a side), .pixel_size_m, .info() (JSON
+    text: the tiles' places on the canvas among it), .reconstruct(h_lo, h_hi, roi=None, debug=False) -> (n, ny, nx)
+    float32 in 1 / cm with pixel (row, col) = (half + Y, half + X), and of the last chunk .levels and .angle_spread."""
+    import json
+    import os
+
+    from . import _core
+    if isinstance(cal, dict):
+        text = json.dumps(cal, default=float)
+    elif isinstance(cal, (str, os.PathLike)) and os.path.exists(cal):
+        with open(cal) as f:
+            text = f.read()
+    else:
+        text = str(cal)
+    return _core.MosaicReconstruction(str(projections), text, device, json.dumps(params or {}, default=float), int(reduce), str(projection_store or ""), str(cache_dir or ""),
+                                      int(taper), bool(levels), bool(keep_tiles), log)

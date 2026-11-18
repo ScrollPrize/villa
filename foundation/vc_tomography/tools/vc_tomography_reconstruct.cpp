@@ -26,6 +26,11 @@
 // level R (1, 2, 3: a half, a quarter, an eighth of the detector), PROJECTIONS then holding the scans' master files
 // alone; the slices are of those frames (pixels 2^R times the stored ones), and of each scan the frames the
 // geometry calibration was made on are used.
+// A mosaic (--set geometry=FILE names a joint geometry calibration of tiles: scans at several places on the rotation
+// stage, each with its place): the whole mosaic is reconstructed as one slice by one filtered backprojection
+// (vc_tomography::MosaicReconstruction, vc_tomography/mosaic.hpp). Slices are numbered from 0 (--fractions, -n, --z or
+// --heights, the same numbers) and written as TIFF; --roi crops; --keep_tiles keeps every tile's reconstructor between
+// chunks (faster, more device memory); --set tile_taper=N, tile_levels=false change the blend.
 // --config FILE: a JSON object of options (keys = option names without the dashes); the command line wins. Each run
 // saves its config.json, which reruns it.
 #include <algorithm>
@@ -43,6 +48,7 @@
 #include <set>
 
 #include "vc_tomography/kernels.hpp"
+#include "vc_tomography/mosaic.hpp"
 #include "vc_tomography/progress.hpp"
 #include "vc_tomography/reconstruction.hpp"
 #include "vc_tomography/reference.hpp"
@@ -74,7 +80,7 @@ const Spec& option_spec() {
                                {"u8_compression", 1, 's'}, {"u8_delta3d_preset", 1, 's'}, {"tag", 1, 's'},          {"out_root", 1, 's'},
                                {"previews", 0, 'b'},       {"no_preview", 0, 'b'},     {"overwrite", 0, 'b'},       {"set", -2, 's'},
                                {"device", 1, 's'},         {"cache_dir", 1, 's'},      {"projections", 1, 's'},
-                               {"projection_store", 1, 's'}, {"reduce", 1, 'i'},
+                               {"projection_store", 1, 's'}, {"reduce", 1, 'i'},          {"keep_tiles", 0, 'b'},
                            },
                            {{"-n", "n_slices"}},
                            "projections",
@@ -90,7 +96,7 @@ int usage() {
                  "                           [--reference_cache DIR] [--chunk N] [--zarr_chunks CZ CY CX] [--levels N] [--compression none|zlib]\n"
                  "                           [--u8_compression vc-delta3d|none|zlib] [--u8_delta3d_preset fast|medium|slow|slower|delta]\n"
                  "                           [--tag TAG] [--out_root DIR] [--previews] [--overwrite] [--set KEY=VALUE ...] [--device cuda|cpu]\n"
-                 "                           [--cache_dir DIR] [--projection_store STORE.zarr] [--reduce 0|1|2|3]\n"
+                 "                           [--cache_dir DIR] [--projection_store STORE.zarr] [--reduce 0|1|2|3] [--keep_tiles]\n"
                  "(see the head of tools/vc_tomography_reconstruct.cpp and docs/reconstruction.md)\n");
     return 2;
 }
@@ -416,6 +422,129 @@ struct Run {
     }
 };
 
+// The geometry calibration a run names (--set geometry=FILE), if it is of a mosaic's tiles (a scan of it sits elsewhere
+// on the rotation stage than the anchor): its text; else nothing.
+std::optional<std::string> mosaic_geometry(const std::vector<std::string>& sets) {
+    std::string path;
+    for (const std::string& s : sets)
+        if (s.rfind("geometry=", 0) == 0) path = s.substr(9);
+    if (path.empty() || !fs::exists(path)) return std::nullopt;
+    std::ifstream f(path);
+    const std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    const Json cal = Json::parse(text);
+    const Json* layout = cal.find("layout");
+    const Json* scans = layout ? layout->find("scans") : nullptr;
+    if (!scans || !scans->is(Json::Array)) return std::nullopt;
+    for (const Json& sc : scans->array)
+        if (const Json* moved = sc.find("moved_on_stage"); moved && moved->is(Json::Bool) && moved->boolean) return text;
+    return std::nullopt;
+}
+
+// A mosaic: whole-canvas slices as TIFF (the head of this file).
+int run_mosaic(const Args& a, const std::vector<std::string>& sets, const std::string& geometry, const std::string& outdir, Device dev, const std::string& cache, bool range_mode,
+               bool format_given) {
+    const auto t0 = std::chrono::steady_clock::now();
+    if (a.text("format") == "zarr" && format_given) fail("a mosaic's slices are written as TIFF (--format tiff)");
+    if (a.get("reference_volume") || a.get("bbox") || a.flag("previews")) fail("a mosaic takes no --reference_volume, --bbox or --previews");
+    // the settings: the geometry is given here; tile_taper and tile_levels are the blend's, the rest every tile's pipeline's
+    MosaicOptions o;
+    std::vector<std::string> rest;
+    for (const std::string& s : sets) {
+        if (s.rfind("geometry=", 0) == 0) continue;
+        if (s.rfind("tile_taper=", 0) == 0) o.taper = std::stoi(s.substr(11));
+        else if (s.rfind("tile_levels=", 0) == 0) o.levels = s.substr(12) != "false" && s.substr(12) != "0";
+        else rest.push_back(s);
+    }
+    o.device = dev;
+    o.params = parse_settings(rest);
+    o.cache_dir = cache;
+    o.keep_tiles = a.flag("keep_tiles");
+    o.log = say;
+    if (a.get("projection_store")) o.projection_store = fs::absolute(a.text("projection_store")).lexically_normal().string();
+    if (a.get("reduce")) o.reduce = static_cast<int>(a.number("reduce"));
+    MosaicReconstruction r(a.text("projections"), geometry, o);
+    const auto [lo, hi] = r.doable();
+    const int N = r.size();
+    say("setup " + fmt("%.1f", since(t0)) + "s: a mosaic of " + std::to_string(r.tiles().size()) + " tiles, slices [" + std::to_string(lo) + ", " + std::to_string(hi) + "), canvas " +
+        std::to_string(N) + " x " + std::to_string(N) + " px of " + fmt("%.3f", r.pixel_size_m() * 1e6) + " um");
+    SliceRoi area{0, N, 0, N};
+    if (a.get("roi")) {
+        const auto v = a.ints("roi");
+        if (!(0 <= v[0] && v[0] < v[1] && v[1] <= N && 0 <= v[2] && v[2] < v[3] && v[3] <= N)) fail("--roi must lie within [0, " + std::to_string(N) + "]");
+        area = SliceRoi{v[0], v[1], v[2], v[3]};
+    }
+    const int ny = area.y1 - area.y0, nx = area.x1 - area.x0;
+    // the slices asked for, in runs of at most --chunk
+    std::vector<int> wanted;
+    if (range_mode) {
+        const auto z = a.get("z") ? a.ints("z") : a.ints("heights");
+        if (!(lo <= z[0] && z[0] < z[1] && z[1] <= hi)) fail("range outside the slices [" + std::to_string(lo) + ", " + std::to_string(hi) + ")");
+        for (int h = z[0]; h < z[1]; ++h) wanted.push_back(h);
+    } else {
+        std::vector<double> fractions = a.numbers("fractions");
+        if (fractions.empty()) {
+            const auto range = a.numbers("range");
+            const int n = static_cast<int>(a.number("n_slices"));
+            for (int i = 0; i < n; ++i) fractions.push_back(n == 1 ? 0.5 * (range[0] + range[1]) : range[0] + (range[1] - range[0]) * i / (n - 1));
+        }
+        for (double f : fractions) wanted.push_back(std::clamp(lo + static_cast<int>(std::lround(f * (hi - lo - 1))), lo, hi - 1));
+    }
+    const bool uint8 = a.flag("uint8"), uint8_only = a.flag("uint8_only");
+    const std::array<double, 2> window = a.get("u8_window") ? std::array<double, 2>{a.numbers("u8_window")[0], a.numbers("u8_window")[1]} : display_window("corrected");
+    Json manifest = Json::dict()
+                        .set("created", Json::of(now_iso()))
+                        .set("projections", Json::of(a.text("projections")))
+                        .set("device", Json::of(a.text("device")))
+                        .set("method", Json::of(std::string("whole-canvas filtered backprojection of a mosaic (vc_tomography/mosaic.hpp)")))
+                        .set("mosaic", Json::parse(r.info_json()))
+                        .set("roi_xyxy", ints_json({area.x0, area.x1, area.y0, area.y1}))
+                        .set("uint8_window", Json::list().add(Json::of(window[0])).add(Json::of(window[1])))
+                        .set("vc_tomography", Json::of(build_revision()))
+                        .set("slices", Json::list());
+    const int chunk = range_mode ? static_cast<int>(a.number("chunk")) : 1;
+    std::vector<float> img;
+    for (std::size_t i = 0; i < wanted.size();) {
+        std::size_t j = i + 1;
+        while (j < wanted.size() && static_cast<int>(j - i) < chunk && wanted[j] == wanted[j - 1] + 1) ++j;
+        const int h0 = wanted[i], n = static_cast<int>(j - i);
+        img.resize(static_cast<std::size_t>(n) * ny * nx);
+        const auto t = std::chrono::steady_clock::now();
+        r.reconstruct(h0, h0 + n, img.data(), &area);
+        const double dt = since(t) / n;
+        for (int y = 0; y < n; ++y) {
+            char name[64];
+            std::snprintf(name, sizeof name, "slice_%05d", h0 + y);
+            const float* one = img.data() + static_cast<std::size_t>(y) * ny * nx;
+            Json levels = Json::list();
+            for (double v : r.levels()[static_cast<std::size_t>(y)]) levels.add(Json::of(v));
+            Json entry = Json::dict()
+                             .set("name", Json::of(std::string(name)))
+                             .set("slice", Json::whole_number(h0 + y))
+                             .set("seconds", Json::of(std::round(dt * 100) / 100))
+                             .set("tile_levels", levels)
+                             .set("angle_spread_bins", Json::of(r.angle_spread()[static_cast<std::size_t>(y)]));
+            std::string path;
+            if (!uint8_only) {
+                path = outdir + "/" + name + ".tiff";
+                entry.set("tiff", Json::of(path));
+                write_tiff(path, one, ny, nx);
+            }
+            if (uint8) {
+                const std::string p8 = outdir + "/" + name + "_uint8.tif";
+                entry.set("tiff_uint8", Json::of(p8));
+                write_tiff(p8, to_u8(one, ny, nx, window).data(), ny, nx);
+                if (path.empty()) path = p8;
+            }
+            manifest.find("slices")->add(entry);
+            say("slice " + std::to_string(h0 + y) + " " + fmt("%.1f", dt) + "s -> " + path);
+        }
+        write_text(outdir + "/manifest.json", manifest.text());
+        i = j;
+    }
+    say("done in " + fmt("%.0f", since(t0)) + "s -> " + outdir);
+    return 0;
+}
+
 int run(int argc, char** argv) {
     Json given = parse(argc, argv, option_spec());
     if (const Json* np = given.find("no_preview"))  // (--no_preview: the default)
@@ -472,6 +601,8 @@ int run(int argc, char** argv) {
     const std::string cache = a.get("cache_dir") ? a.text("cache_dir") : a.text("out_root") + "/_calibration";
     std::vector<std::string> sets;
     for (const Json& s : a.get("set")->array) sets.push_back(s.string);
+
+    if (const std::optional<std::string> tiles = mosaic_geometry(sets)) return run_mosaic(a, sets, *tiles, outdir, dev, cache, range_mode, given.find("format") != nullptr);
 
     const auto t0 = std::chrono::steady_clock::now();
     Reconstruction::Options opt;

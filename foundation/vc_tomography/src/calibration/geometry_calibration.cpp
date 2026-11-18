@@ -1011,6 +1011,144 @@ void to_stored_pixels(Acquisition& acq, GeometrySolution& solution, GeometryRepo
 
 void save_text(const std::string& text, const std::string& path) { io::write_text_atomic(path, text); }
 
+namespace {
+
+// What the tiles' stage of the step found (calibrate_geometry, a mosaic).
+struct TilesFound {
+    GeometrySolution solution;
+    double pitch = 0;                 // as solved [rad]
+    int orientation = 0;              // of the motors' plane in the model's (places_from_motors)
+    std::vector<std::size_t> scores;  // accepted patches of the trial of each orientation
+    std::size_t edges = 0, blocks = 0;
+};
+
+// A mosaic's tiles placed against each other, after each tile's own views (`own`, measured; `all` receives them
+// and the tiles' comparisons with each other). The places start at the record's motors' (places_from_motors),
+// which are good to tens of pixels: the tiles' comparisons are planned from them, each block registered whole
+// before its patches. In turn:
+//   the orientation  of the motors' plane: a few blocks of the anchor's neighbours planned under each of the eight,
+//                    the one whose blocks register
+//   the comparisons  every pair of neighbouring tiles, at equal angle and half a turn apart (plan_tiles)
+//   the solves       solve_tiles
+TilesFound place_tiles(Session& session, const Acquisition& acq, const std::vector<Comparison>& own, std::vector<Comparison>& all, const Options& options, int patch, const Log& log) {
+    const std::size_t n = acq.scans.size(), anchor = static_cast<std::size_t>(acq.anchor);
+    TilesFound found;
+    // each tile's own parameters, coarsely: its own views alone
+    Parameters start = empty_parameters(acq);
+    for (std::size_t k = 0; k < n; ++k)
+        if (!std::isnan(acq.scans[k].axis)) start.scans[k].axis = acq.scans[k].axis;
+    start.about_height = (acq.rows - 1) / 2.0 - acq.scans[anchor].mid_height;
+    const GeometrySolution first = solve_geometry(acq, own, start, GeometryOptions{});
+    const auto placed = [&](int o) { return places_from_motors(acq, first.parameters, o); };
+    const std::vector<std::array<int, 2>> edges = neighbours(acq).edges;
+    if (edges.empty()) throw Error("geometry calibration: no two tiles of the mosaic reconstruct a part of the sample in common");
+    found.edges = edges.size();
+    // the orientation: the anchor's edges (else the first few), a few positions each
+    std::vector<std::array<int, 2>> trial;
+    for (const auto& e : edges)
+        if (e[0] == acq.anchor || e[1] == acq.anchor) trial.push_back(e);
+    if (trial.empty()) trial.assign(edges.begin(), edges.begin() + static_cast<std::ptrdiff_t>(std::min<std::size_t>(edges.size(), 6)));
+    PlanCounts few;
+    few.tile_positions = 8, few.tile_bands = 1, few.tile_windows = 1;
+    std::string said;
+    for (int o = 0; o < kMotorOrientations; ++o) {
+        const Parameters p = placed(o);
+        found.scores.push_back(measure(session, acq, plan_tiles(acq, p, trial, few), options.device, patch).size());
+        said += fmt("%s%zu", o ? ", " : "", found.scores.back());
+    }
+    found.orientation = static_cast<int>(std::max_element(found.scores.begin(), found.scores.end()) - found.scores.begin());
+    // the next best that puts a tile elsewhere (tiles in one line along a motor lie the same under two orientations)
+    const Parameters best = placed(found.orientation);
+    std::size_t next = 0;
+    for (int o = 0; o < kMotorOrientations; ++o) {
+        const Parameters p = placed(o);
+        double apart = 0;
+        for (std::size_t k = 0; k < n; ++k) apart = std::max(apart, std::hypot(p.scans[k].d[0] - best.scans[k].d[0], p.scans[k].d[1] - best.scans[k].d[1]));
+        if (apart > 1.0) next = std::max(next, found.scores[static_cast<std::size_t>(o)]);
+    }
+    static const char* const kNamed[kMotorOrientations] = {"(v, -u)", "(v, u)", "(-v, u)", "(-v, -u)", "(u, v)", "(u, -v)", "(-u, v)", "(-u, -v)"};
+    say(log, fmt("  the motors' plane in the model's: of the eight orientations the patches accepted between the anchor and its neighbours are %s; taken: d = %s of the motors' (u, v)", said.c_str(),
+                 kNamed[found.orientation]));
+    const std::size_t most = found.scores[static_cast<std::size_t>(found.orientation)];
+    if (most < 16 || most < 2 * next)
+        throw Error("geometry calibration: the tiles do not register with their neighbours where the record's motors put them under any orientation of the motors' plane (accepted patches: " + said + ")");
+    const Parameters& places = best;
+    const std::vector<Planned> planned = plan_tiles(acq, places, edges);
+    found.blocks = planned.size();
+    measure_timing(true);
+    const auto t = std::chrono::steady_clock::now();
+    const std::vector<Comparison> between = measure(session, acq, planned, options.device, patch);
+    const MeasureTiming spent = measure_timing();
+    std::size_t equal = 0;
+    for (const Comparison& c : between) equal += c.kind == "tiles";
+    say(log, fmt("  the tiles with each other: %zu pairs of neighbours, %zu blocks planned, %zu patches of %d accepted (%zu at equal angle, %zu half a turn apart) in %.0f s (reading %.0f, converting %.0f, "
+                 "registering %.0f)", edges.size(), planned.size(), between.size(), patch, equal, between.size() - equal, std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count(),
+                 spent.read, spent.integrals, spent.registration));
+    if (between.size() < 8 * edges.size()) throw Error("geometry calibration: too few patches register between the tiles to place them");
+    all = own;
+    all.insert(all.end(), between.begin(), between.end());
+
+    std::size_t unknowns_first = 0;
+    found.solution = solve_tiles(acq, own, between, places, options.order > 0, &unknowns_first);
+    found.pitch = found.solution.parameters.pitch;
+    double moved = 0;
+    for (std::size_t k = 0; k < n; ++k) moved = std::max(moved, std::hypot(found.solution.parameters.scans[k].d[0] - places.scans[k].d[0], found.solution.parameters.scans[k].d[1] - places.scans[k].d[1]));
+    say(log, fmt("  three solves: all together (%zu unknowns), each tile's own parameters from its own views, the shared terms and the places with a scale per tile (%zu unknowns); the tiles lie up to "
+                 "%.1f px of these frames from the motors' places", unknowns_first, found.solution.free.size(), moved));
+    return found;
+}
+
+}  // namespace
+
+Parameters places_from_motors(const Acquisition& acq, const Parameters& p, int orientation) {
+    // d = (m0 u + m1 v, m2 u + m3 v)
+    static constexpr int kOrientations[kMotorOrientations][4] = {{0, 1, -1, 0}, {0, 1, 1, 0}, {0, -1, 1, 0}, {0, -1, -1, 0}, {1, 0, 0, 1}, {1, 0, 0, -1}, {-1, 0, 0, 1}, {-1, 0, 0, -1}};
+    if (orientation < 0 || orientation >= kMotorOrientations) throw Error("geometry calibration: the motors' plane lies in the model's in one of eight ways, 0 to 7");
+    if (p.scans.size() != acq.scans.size()) throw Error("geometry calibration: the parameters and the acquisition differ in their scans");
+    const std::size_t anchor = static_cast<std::size_t>(acq.anchor);
+    for (const ScanLayout& sc : acq.scans)
+        if (std::isnan(sc.on_stage[0]) || std::isnan(sc.on_stage[1]))
+            throw Error("geometry calibration: the record of " + sc.name + " does not name the stages that hold the sample on the rotation: a mosaic's tiles cannot be placed");
+    Parameters out = p;
+    const int* m = kOrientations[orientation];
+    for (std::size_t k = 0; k < acq.scans.size(); ++k) {
+        const double u = acq.scans[k].on_stage[0] - acq.scans[anchor].on_stage[0], v = acq.scans[k].on_stage[1] - acq.scans[anchor].on_stage[1];
+        out.scans[k].d[0] = m[0] * u + m[1] * v, out.scans[k].d[1] = m[2] * u + m[3] * v;
+        out.scans[k].height = 0;
+    }
+    return out;
+}
+
+GeometrySolution solve_tiles(const Acquisition& acq, const std::vector<Comparison>& own, const std::vector<Comparison>& between, const Parameters& places, bool radial_map,
+                             std::size_t* unknowns_first) {
+    const std::size_t n = acq.scans.size(), anchor = static_cast<std::size_t>(acq.anchor);
+    std::vector<Comparison> all = own;
+    all.insert(all.end(), between.begin(), between.end());
+    std::vector<std::string> radial, at_places, own_parameters, scales;
+    if (radial_map) radial = {"map.eu.i3j0", "map.eu.i1j2", "map.ev.i2j1", "map.ev.i0j3"};
+    for (std::size_t k = 0; k < n; ++k) {
+        const std::string scan = "scan" + std::to_string(k) + ".";
+        for (const char* c : {"d0", "d1", "height"}) at_places.push_back(scan + c);
+        for (const char* c : {"axis", "axis_slope", "axial_scale", "height_once_cos", "height_once_sin"}) own_parameters.push_back(scan + c);
+        if (k != anchor) scales.push_back(scan + "column_scale");
+    }
+    Parameters begin = places;
+    if (radial_map) begin.map = geometry::empty_map(acq.rows, acq.cols, 3);
+    GeometryOptions one;
+    one.freed = radial;
+    const GeometrySolution a = solve_geometry(acq, all, begin, one);
+    if (unknowns_first) *unknowns_first = a.free.size();
+    GeometryOptions two;
+    two.held = at_places;
+    two.held.push_back("roll"), two.held.push_back("stage");
+    const GeometrySolution b = solve_geometry(acq, own, a.parameters, two);
+    GeometryOptions three;
+    three.freed = radial;
+    three.freed.insert(three.freed.end(), scales.begin(), scales.end());
+    three.held = own_parameters;
+    return solve_geometry(acq, all, b.parameters, three);
+}
+
 std::string calibrate_geometry(const std::vector<std::string>& scans, const Options& options) {
     if (scans.empty()) throw Error("the geometry calibration takes the master files of the scans of one sample");
     const Log& log = options.log;
@@ -1049,7 +1187,7 @@ std::string calibrate_geometry(const std::vector<std::string>& scans, const Opti
     if (options.patch < 32) throw Error("geometry calibration: patches of at least 32 x 32");
     const int patch = std::max(32, options.patch / reduced_by);
     measure_timing(true);
-    const std::vector<Comparison> comparisons = measure(session, acq, planned, options.device, patch);
+    std::vector<Comparison> comparisons = measure(session, acq, planned, options.device, patch);
     const MeasureTiming spent = measure_timing();
     std::map<std::string, long long> accepted;
     for (const Comparison& c : comparisons) ++accepted[c.kind];
@@ -1088,7 +1226,16 @@ std::string calibrate_geometry(const std::vector<std::string>& scans, const Opti
     // anchor's frames on disk
     how.tilts_after = true;
     start.about_height = (acq.rows - 1) / 2.0 - acq.scans[static_cast<std::size_t>(acq.anchor)].mid_height;
-    GeometrySolution solution = solve_geometry(acq, comparisons, start, how);
+    // A mosaic (scans at several places on the rotation stage): the tiles are placed against each other (place_tiles)
+    const bool mosaic = acq.scans.size() > 1 && std::any_of(acq.scans.begin(), acq.scans.end(), [](const ScanLayout& sc) { return sc.moved_on_stage; });
+    std::optional<TilesFound> tiles;
+    if (mosaic) {
+        const std::vector<Comparison> own = comparisons;
+        tiles = place_tiles(session, acq, own, comparisons, options, patch, log);
+        accepted.clear();
+        for (const Comparison& c : comparisons) ++accepted[c.kind];
+    }
+    GeometrySolution solution = mosaic ? tiles->solution : solve_geometry(acq, comparisons, start, how);
     if (!solution.undetermined.empty()) {
         std::string names;
         for (const std::string& n : solution.undetermined) names += (names.empty() ? "" : ", ") + n;
@@ -1148,6 +1295,13 @@ std::string calibrate_geometry(const std::vector<std::string>& scans, const Opti
         say(log, fmt("  over the %d scans with opposite views: axis column %.3f px (%.3f rms), its slope %.2e per row (%.2e rms), axial scale %.0f ppm (%.0f rms, mean %.0f)", told.axis.n, told.axis.range, told.axis.sd,
                      told.axis_slope.range, told.axis_slope.sd, told.axial_scale.range * 1e6, told.axial_scale.sd * 1e6, told.axial_scale.mean * 1e6));
     if (acq.scans.size() > 1) say(log, fmt("  %zu pairs of scans reconstruct a part of the sample in common; %zu triangles of them", told.neighbours.edges.size(), told.neighbours.triangles.size()));
+    if (mosaic) {
+        // The pitch of the rotation axis towards the beam is measured between the tiles and stated beside the
+        // parameters; the parameters hold none, so that no tile's rows take it (geometry.hpp: a pitch in the
+        // parameters lifts every frame's rows by the depth of the sample's origin)
+        say(log, fmt("  pitch of the rotation axis towards the beam %+.1f urad (measured; not put into the tiles' rows); roll %+.1f urad", tiles->pitch * 1e6, solution.parameters.roll * 1e6));
+        solution.parameters.pitch = 0;
+    }
     Json names = Json::list();
     for (const std::string& s : scans) names.add(Json::of(s));
     Json counts = Json::dict();
@@ -1168,7 +1322,18 @@ std::string calibrate_geometry(const std::vector<std::string>& scans, const Opti
     cal.set("row_time", Json::dict().set("seconds_per_row", num(row_time)).set("frame_period_s", num(acq.period_s)).set("frames_per_row", num(acq.row_time)).set("from_middle", Json::of_bool(acq.rows_from_middle)).set("measured", timing));
     if (radial.is(Json::Object)) cal.set("map_radial", radial);  // (what the map below is the terms of)
     cal.set("map", map).set("parameters", parameters).set("solution", solve).set("report", Json::parse(report_json(acq, told)));
-    cal.set("comparisons", Json::dict().set("blocks", count(static_cast<long long>(planned.size()))).set("patch", count(patch * reduced_by)).set("accepted", counts));
+    cal.set("comparisons", Json::dict().set("blocks", count(static_cast<long long>(planned.size() + (tiles ? tiles->blocks : 0)))).set("patch", count(patch * reduced_by)).set("accepted", counts));
+    if (tiles) {
+        Json scores = Json::list();
+        for (std::size_t v : tiles->scores) scores.add(count(static_cast<long long>(v)));
+        cal.set("tiles", Json::dict()
+                             .set("pairs", count(static_cast<long long>(tiles->edges)))
+                             .set("blocks", count(static_cast<long long>(tiles->blocks)))
+                             .set("motors_orientation", count(tiles->orientation))  // places_from_motors'
+                             .set("orientation_scores", scores)
+                             .set("pitch_measured", num(tiles->pitch))
+                             .set("solves", Json::of(std::string("all with the map's radial terms; each tile's own parameters from its own views; the shared terms and places with a scale per tile"))));
+    }
     return cal.text();
 }
 

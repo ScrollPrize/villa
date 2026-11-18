@@ -18,7 +18,9 @@
 //
 // geometry measures the detector's map and the places of the scans of one sample from their own frames (a scan
 // alone, a pair moved sideways, the tiles of a mosaic; a scan with the rotation axis inside the detector's field
-// first) and writes them as JSON, which the reconstruction reads for a pair (vc_tomography/geometry.hpp). --row-time-us:
+// first) and writes them as JSON, which the reconstruction reads for a pair (vc_tomography/geometry.hpp). A mosaic's
+// tiles (the reference tile first) are placed against each other from their comparisons in projections, starting at
+// the record's motors'; the file then holds every tile's place, which the whole-canvas reconstruction reads. --row-time-us:
 // the time of a stored row within the frame, signed, if known for this camera configuration (0: not known, done
 // without); measured from a refill otherwise. --rows-from-middle: the camera's two halves are read at once, the row
 // time counted from the middle row to both ends; a row time not given is then measured from the frames between

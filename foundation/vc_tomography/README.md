@@ -14,7 +14,7 @@ It is a C++20 library with Python bindings (nanobind). Every image operation has
 | ESRF BM18 helical pair (`HA` + `TA`): two helical scans of one sample, the rotation stage moved sideways between them to cover a field wider than the detector | BLISS master (`.h5`) with plain or JPEG 2000 frames | one merged volume |
 | ESRF BM18 multi-column scan (`HA`, `TA`, `TA2`, `TA3`, ...): more scans moved sideways in the same way | BLISS master | one merged volume |
 | Diamond I12 grid: circular (non-helical) scans at several positions across the beam and several heights | NeXus NXtomo (`.nxs`, written by GDA) | one merged volume |
-| ESRF BM18 mosaic: helical scans of one sample at different positions on the rotation stage (tiles) | BLISS master | each tile on its own (no merged volume yet) |
+| ESRF BM18 mosaic: helical scans of one sample at different positions on the rotation stage (tiles) | BLISS master | each tile on its own, or all tiles as one slice by one FBP (whole-canvas FBP) |
 
 Frames can also be read at 1/2, 1/4 or 1/8 resolution, either from the JPEG 2000 files directly or from a
 projection store (a multiscale Zarr copy of the frames).

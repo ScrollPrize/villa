@@ -346,6 +346,38 @@ void bind_geometry_calibration(nb::module_& m) {
         "scan a, scan b, the place, the displacement, its sigma): (the solution as JSON text, the comparisons' residuals (n, 3):\n"
         "frames, rows, columns, the lens patches' (n, 3): x, y, z). (vc_tomography::calibration::geometry_calibration::solve_geometry)");
     m.def(
+        "geometry_places_from_motors",
+        [](const gc::Acquisition& acq, const std::string& parameters, int orientation) { return gc::parameters_json(acq, gc::places_from_motors(acq, parameters_of(acq, parameters), orientation)); },
+        "acquisition"_a, "parameters"_a, "orientation"_a = 0,
+        "The parameters with every scan's place from the record's motors, under one of the eight orientations of the motors'\n"
+        "plane, as JSON text. (vc_tomography::calibration::geometry_calibration::places_from_motors)");
+    m.def(
+        "geometry_solve_tiles",
+        [](const gc::Acquisition& acq, const std::vector<std::string>& kinds, Table a, Table b, const std::vector<bool>& opposite, std::size_t n_own, const std::string& places, bool radial_map) {
+            const std::size_t n = kinds.size();
+            if (a.shape(0) != n || b.shape(0) != n || opposite.size() != n || a.shape(1) != 5 || b.shape(1) != 5 || n_own > n)
+                throw Error("geometry_solve_tiles: one kind, two sightings (scan, stretch, frame, row, column) and one flag per comparison, the tiles' own first");
+            std::vector<gc::Comparison> own(n_own), between(n - n_own);
+            for (std::size_t i = 0; i < n; ++i) {
+                gc::Comparison& c = i < n_own ? own[i] : between[i - n_own];
+                c.kind = kinds[i], c.a = sighting_of(a.data() + 5 * i), c.b = sighting_of(b.data() + 5 * i), c.opposite = opposite[i];
+            }
+            gc::GeometrySolution s;
+            std::size_t first = 0;
+            {
+                const gc::Parameters p0 = parameters_of(acq, places);
+                nb::gil_scoped_release nogil;
+                s = gc::solve_tiles(acq, own, between, p0, radial_map, &first);
+            }
+            auto residual = vc_tomography::py::new_array_t<double>({n, std::size_t(3)});
+            for (std::size_t i = 0; i < n; ++i) std::copy(s.residual[i].begin(), s.residual[i].end(), static_cast<double*>(residual.data()) + 3 * i);
+            return nb::make_tuple(gc::solution_json(acq, s), residual, first);
+        },
+        "acquisition"_a, "kinds"_a, "a"_a, "b"_a, "opposite"_a, "n_own"_a, "places"_a, "radial_map"_a = true,
+        "A mosaic's tiles placed against each other from their own views (the first n_own comparisons) and their comparisons\n"
+        "with each other, in three solves: (the solution as JSON text, the residuals (n, 3), the first solve's unknowns).\n"
+        "(vc_tomography::calibration::geometry_calibration::solve_tiles)");
+    m.def(
         "geometry_lens_residuals",
         [](const gc::Acquisition& acq, const std::string& parameters, Table lens_table) {
             const std::vector<gc::LensPatch> lens = lens_of(lens_table);

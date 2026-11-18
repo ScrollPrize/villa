@@ -1177,6 +1177,80 @@ def test_tiles_give_the_scales_of_their_images():
         assert "RANK_DEFICIENT" in str(e)
 
 
+def test_places_from_the_motors_under_the_eight_orientations():
+    """The record's motors give a tile's place on the rotation stage as (u, v); the model's d is that vector in one
+    of eight orientations (the two stages' names and senses). The first is ESRF BM18's, d = (v, -u). The places are
+    against the anchor's, the heights nothing, and the rest of the parameters is kept."""
+    f = np.arange(2 * PER_TURN)
+    stretch = lambda: dict(name="helix", helix=True, angle_deg=f * 360.0 / PER_TURN, rows=-f * 300.0 / PER_TURN)
+    motors = [(40.0, -25.0), (340.0, 35.0), (-110.0, 265.0)]
+    scans = [dict(name=f"T{k}", axis=301.3, on_stage=list(m), moved_on_stage=k > 0, stretches=[stretch()]) for k, m in enumerate(motors)]
+    acq = G.acquisition(dict(rows=ROWS, cols=COLS, per_turn=PER_TURN, scans=scans))
+    start = dict(roll=1e-4, scans=[dict(axis=300.0 + k, axial_scale=1e-4 * k, d=[9.0, 9.0], height=7.0) for k in range(3)])
+    named = [lambda u, v: (v, -u), lambda u, v: (v, u), lambda u, v: (-v, u), lambda u, v: (-v, -u), lambda u, v: (u, v), lambda u, v: (u, -v), lambda u, v: (-u, v), lambda u, v: (-u, -v)]
+    seen = set()
+    for o, as_d in enumerate(named):
+        got = G.places_from_motors(acq, start, o)
+        assert got["roll"] == 1e-4
+        for k, (sc, m) in enumerate(zip(got["scans"], motors)):
+            assert sc["d"] == pytest.approx(list(as_d(m[0] - motors[0][0], m[1] - motors[0][1]))) and sc["height"] == 0.0
+            assert sc["axis"] == 300.0 + k and sc["axial_scale"] == pytest.approx(1e-4 * k)
+        seen.add(tuple(np.round(got["scans"][1]["d"], 6)))
+    assert len(seen) == 8 and G.places_from_motors(acq, start)["scans"] == G.places_from_motors(acq, start, 0)["scans"]
+    with pytest.raises(ValueError, match="one of eight ways"):
+        G.places_from_motors(acq, start, 8)
+    unnamed = G.acquisition(dict(rows=ROWS, cols=COLS, per_turn=PER_TURN, scans=[dict(s, on_stage=None) if k == 2 else s for k, s in enumerate(scans)]))
+    with pytest.raises(ValueError, match="does not name the stages"):
+        G.places_from_motors(unnamed, start)
+
+
+def test_a_mosaics_tiles_are_placed_from_the_motors_in_three_solves():
+    """Three tiles whose images differ in scale across the beam, the record's motors off their true places by a few
+    pixels. What the geometry step does for a mosaic: each tile's own views solved, the places taken from the
+    motors, and solve_tiles on the tiles' own views and their comparisons with each other: all together; each
+    tile's own parameters again from its own views; the shared terms and the places with a scale per tile. The
+    places, heights, scales and axis columns come back; the scales are in the last solve alone."""
+    rng = np.random.default_rng(57)
+    scales = [0.0, 2e-4, -1.5e-4]
+    places = [(0.0, 0.0), (330.0, 60.0), (-150.0, 290.0)]
+    off = [(0.0, 0.0), (2.5, -1.5), (-2.0, 3.0)]                                    # the motors' error [px]
+    shared = {k: TRUTH[k] for k in ("roll", "height_once", "axis_twice")}
+    scans = [Scan([("helix", 3 * PER_TURN)], index=k, axis=TRUTH["axis"] - 0.2 * k, axial_scale=TRUTH["axial_scale"] + 1e-4 * k, d=d, height=1.5 * k, moved=k > 0, column_scale=scales[k], **shared)
+             for k, d in enumerate(places)]
+    # the motors' (u, v) of BM18's orientation: d = (v, -u)
+    layouts = [dict(sc.layout(), on_stage=[-(d[1] + e[1]), d[0] + e[0]]) for sc, d, e in zip(scans, places, off)]
+    acq = G.acquisition(dict(rows=ROWS, cols=COLS, row_time=0.0, scans=layouts))
+    own = [c for sc in scans for c in _helix_comparisons(rng, sc, 0, 500, 0.004) if c["kind"] == "opposite"]
+    between = _tile_comparisons(rng, scans, [(0, 1), (0, 2), (1, 2)], 400)
+    first = G.solve_geometry(acq, own, start=dict(scans=[dict(axis=TRUTH["axis"] + 0.5) for _ in scans]))
+    start = G.places_from_motors(acq, first)
+    for sc, d, e in zip(start["scans"], places, off):
+        assert sc["d"] == pytest.approx([d[0] + e[0], d[1] + e[1]]) and sc["height"] == 0.0
+    got = G.solve_tiles(acq, own, between, start, radial_map=False)
+    names = ["scan1.column_scale", "scan2.column_scale"]
+    assert all(n in got["free"] for n in names) and "scan0.column_scale" not in got["free"]
+    assert not any(n.endswith((".axis", ".axis_slope", ".axial_scale")) for n in got["free"])       # held at their own views'
+    assert got["solver"]["rank"] == len(got["free"]) and got["unknowns_first"] > 0 and got["map"]["i"] == []
+    for k, (s, d) in enumerate(zip(got["scans"], places)):
+        assert s["d"] == pytest.approx(list(d), abs=0.02) and s["height"] == pytest.approx(1.5 * k, abs=0.05), k
+        assert s["column_scale"] == pytest.approx(scales[k], abs=1.5e-5), k
+        assert s["axis"] == pytest.approx(TRUTH["axis"] - 0.2 * k, abs=6e-3) and s["axial_scale"] == pytest.approx(TRUTH["axial_scale"] + 1e-4 * k, abs=4e-5), k
+    assert got["roll"] == pytest.approx(TRUTH["roll"], abs=3e-5)
+    assert got["residual"].shape == (len(own) + len(between), 3)
+    tiles = np.arange(len(got["residual"])) >= len(own)
+    assert np.sqrt(np.mean(got["residual"][tiles, 2] ** 2)) < 0.01 and np.sqrt(np.mean(got["residual"][~tiles, 2] ** 2)) < 0.01
+    # a tile's axis column is its own views': the one of the second solve, which the tiles' comparisons do not move
+    alone = G.solve_geometry(acq, own, start=dict(got, map=None), held=["roll", "stage"] + [f"scan{k}.{c}" for k in range(3) for c in ("d0", "d1", "height")])
+    for a, b in zip(alone["scans"], got["scans"]):
+        assert a["axis"] == pytest.approx(b["axis"], abs=1e-4)
+    # with the map's radial terms free (a detector without distortion): they come back as nothing, the places the same
+    radial = G.solve_tiles(acq, own, between, start)
+    assert sorted(n for n in radial["free"] if n.startswith("map.")) == ["map.eu.i1j2", "map.eu.i3j0", "map.ev.i0j3", "map.ev.i2j1"]
+    assert max(abs(v) for v in radial["map"]["eu"] + radial["map"]["ev"]) < 0.05
+    for k, (s, d) in enumerate(zip(radial["scans"], places)):
+        assert s["d"] == pytest.approx(list(d), abs=0.05), k
+
+
 def test_the_tilt_of_a_scan_moved_sideways_is_solved_after_the_rest():
     """Two scans of one sample, the second moved sideways and holding the sample tilted against the first. Asked
     for (tilts_after: what the step does), the tilt comes from the two scans' comparisons at equal frames, in a

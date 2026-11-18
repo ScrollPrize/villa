@@ -111,13 +111,45 @@ vc_tomography_calibration geometry r1c1.nxs r1c2.nxs r1c3.nxs r2c1.nxs r2c2.nxs 
 #### BM18 mosaic tiles
 
 ```bash
-vc_tomography_calibration geometry T0.h5 T1-01.h5 T1-02.h5 ... --out geometry.json --order 0 --row-time-us 0
+vc_tomography_calibration geometry T0-01.h5 T1-01.h5 T1-02.h5 ... --out geometry.json --row-time-us -3.5
 ```
 
-This calibrates each tile from its own views only (axis, axial scale, wobble). The tiles' positions relative to
-each other are not solved by this command. The Python functions `geometry.plan_tiles`, `geometry.measure_tiles` and
-`geometry.solve_geometry` (with lens patches from overlapping tile volumes) measure them, but this is not yet a
-step of the tool.
+The first file is the reference tile: its rotation axis is the origin of the tiles' places. For a mosaic the step
+has two parts.
+
+1. **Each tile from its own views.** Opposite views about the tile's own rotation axis give its axis column, axis
+   slope, axial scale and wobble, as for a scan alone.
+2. **The tiles against each other.**
+   - *Starting places.* The record's motors (`sample_u`, `sample_v`) give each tile's place to a few tens of
+     pixels. How the motors' plane lies in the model's is not in the record, so a few blocks between the reference
+     tile and its neighbours are measured under each of the eight orientations, and the one whose blocks register
+     is taken. It is an error if none stands out.
+   - *Comparisons.* Every pair of neighbouring tiles (tiles whose reconstructed discs overlap) is compared in
+     projections: at equal angle, where both detectors record the same rays, and half a turn apart, mirrored.
+   - *Three solves.* (1) All unknowns from all comparisons. (2) Each tile's own parameters again from its own
+     views only, with the places, roll and map of (1) held: in (1) the comparisons between tiles outnumber a
+     tile's own views and pull its axis column. (3) The places, heights, roll and map again from all comparisons,
+     with the tiles' own parameters held and one more unknown per tile: the scale of its image across the beam
+     against the reference tile (`column_scale`).
+
+The file then holds every tile's place (`parameters.scans[k].d`), height and `column_scale` against the reference
+tile, and a `tiles` entry with the number of neighbouring pairs, the orientation taken and its scores. Both ways of
+reconstructing a mosaic read this file (see [Reconstructing a scan](reconstruction.md#notes-by-scan-type)).
+
+- **Detector map.** Only its four terms of a radial displacement are solved: a mosaic's comparisons do not tell a
+  general map from the roll. `--order 0` leaves the map out. `--radial-map` has no effect on a mosaic.
+- **Row time.** No refill is needed if the value is given. −3.5 µs per stored row is the value measured for the
+  PHercParis4 mosaic's camera configuration.
+- **Pitch.** The tilt of the rotation axis towards the beam is measured from the tiles at equal angle and written
+  as `tiles.pitch_measured`. `parameters.pitch` is written as 0: the reconstruction does not apply it.
+- **Not solved.** The tiles' rotations against each other, and the beam's divergence.
+
+On the 19 tiles of PHercParis4 at a quarter from a projection store (`--reduce 2 --projections projections.zarr`,
+RTX 5090) the step takes 4 minutes 42 seconds: 19 098 patches of the tiles' own views, 96 437 patches between 42
+pairs of neighbours, 82 unknowns. The tiles lie up to 42 stored pixels from the motors' places.
+
+From Python the parts are `geometry.places_from_motors`, `geometry.neighbours`, `geometry.plan_tiles`,
+`geometry.measure_tiles` and `geometry.solve_tiles`.
 
 ### Options
 

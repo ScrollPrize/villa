@@ -56,7 +56,13 @@ struct Options {
     Log log;          // progress, a line at a time (none: silent)
 };
 // scans: the master files of the scans of one sample, a scan with the rotation axis inside its field first: the
-// layout, the rows' timing, every comparison of the plan measured once, one solve. Returns the calibration as
+// layout, the rows' timing, every comparison of the plan measured once, one solve. A mosaic's tiles (scans at
+// different places on the rotation stage; the reference tile first) are then placed against each other: the
+// places taken from the record's motors under the orientation of the motors' plane whose comparisons register
+// (places_from_motors), every pair of neighbours compared (neighbours, plan_tiles), and solve_tiles in place of the
+// one solve, with the map's four radial terms where Options::order is above 0 (Options::radial_map is not used). The
+// calibration then holds "tiles": pairs, blocks, motors_orientation, orientation_scores, pitch_measured (the
+// parameters' pitch is written as nothing: the reconstructions do not apply it). Returns the calibration as
 // JSON text ("model": "joint"; vc_tomography/geometry.hpp reads a pair's); it is an error if the rows' timing is not
 // given and nothing measures it (a refill in a stretch on disk; with Options::rows_from_middle, scans at two heights).
 std::string calibrate_geometry(const std::vector<std::string>& scans, const Options& options = {});
@@ -485,6 +491,30 @@ GeometrySolution solve_geometry(const Acquisition& acq, const std::vector<Compar
 inline GeometrySolution solve_geometry(const Acquisition& acq, const std::vector<Comparison>& comparisons, const Parameters& start, const GeometryOptions& options = {}) {
     return solve_geometry(acq, comparisons, {}, start, options);
 }
+// The tiles' places from the record's motors: of every scan d = M (on_stage - the anchor's on_stage) and the height
+// nothing (the record's heights are in the frames' rows already); the rest of `p` as it is. The motors' plane lies
+// in the model's in one of eight ways (which, depends on how the two stages on the rotation are named and
+// mounted): orientation 0 ... 7 are d = (v, -u), (v, u), (-v, u), (-v, -u), (u, v), (u, -v), (-u, v), (-u, -v). The
+// first is ESRF BM18's (PHercParis4's mosaic). The motors are good to tens of pixels: what the tiles' comparisons
+// are planned from (plan_tiles), not the places themselves. An error if the record names no such motors.
+constexpr int kMotorOrientations = 8;
+Parameters places_from_motors(const Acquisition& acq, const Parameters& p, int orientation = 0);
+
+// A mosaic's tiles placed against each other: the solve of each tile's own views (`own`) with the tiles'
+// comparisons with each other (`between`: plan_tiles, measured), from `places` (each tile's own parameters with
+// the places the comparisons were planned from). Three solves in turn:
+//   (1) everything on all the comparisons. radial_map: with the detector map's four terms of a radial displacement
+//       free (eu.i3j0, eu.i1j2, ev.i2j1, ev.i0j3; a general map is not told from the roll by a mosaic's
+//       comparisons), the map being an empty one of the third order; else the map `places` holds, as it is
+//   (2) each tile's own parameters (axis column, its slope, axial scale, height once per turn) again from its own
+//       views alone, under (1)'s map, roll, stage and places: in (1) the tiles' comparisons outnumber a tile's own
+//       views and pull its axis column off where its own views put it
+//   (3) the shared terms and the places again from all, the tiles' own parameters held at (2)'s, with the scale
+//       of each tile's image across the beam free (ScanParameters::column_scale; the anchor's stays at nothing)
+// The solution is (3)'s, its residuals those of `own` followed by `between`. unknowns_first: how many unknowns (1) had.
+GeometrySolution solve_tiles(const Acquisition& acq, const std::vector<Comparison>& own, const std::vector<Comparison>& between, const Parameters& places, bool radial_map = true,
+                             std::size_t* unknowns_first = nullptr);
+
 // As JSON text: the parameters by name (roll, stage, scans, map).
 std::string parameters_json(const Acquisition& acq, const Parameters& p);
 // As JSON text: the parameters by name, how the solve ended, what is left.

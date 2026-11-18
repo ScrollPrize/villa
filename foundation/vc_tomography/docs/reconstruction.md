@@ -203,9 +203,47 @@ vc_tomography_reconstruct PROJ --heights 1200 1210 --format tiff --set geometry=
     --set luminosity_repartition=0 --set "filters=paganin(delta_beta=175)+unsharp(sigma=1.2,coeff=4)"
 ```
 
-**BM18 mosaic.** `vc_tomography_reconstruct` does not take a mosaic. A single tile is reconstructed from Python
-with `vc_tomography.mosaic.tile_reconstructor(master, cal, name)`, using a geometry calibration made for the tiles
-(see [Calibration and alignment](calibration.md#bm18-mosaic-tiles)).
+**BM18 mosaic.** A mosaic is reconstructed in one of two ways.
+
+*Each tile alone.* `vc_tomography.mosaic.tile_reconstructor(master, cal, name)` reconstructs one tile from Python,
+using a geometry calibration made for the tiles (see [Calibration and alignment](calibration.md#bm18-mosaic-tiles)).
+A tile gives a disc around its own rotation axis. Its rows end inside the sample, so its slice carries a slow
+shading, and neighbouring tiles differ in level where they overlap.
+
+*All tiles as one slice (whole-canvas FBP).* `vc_tomography_reconstruct` takes a mosaic when the geometry
+calibration given with `--set geometry=FILE` is of a mosaic's tiles. It reads every tile's place and height
+against the first tile (`parameters.scans[k].d`, `.height`), which the geometry calibration measures:
+
+```bash
+vc_tomography_reconstruct RAW_DATA --set geometry=geometry.json --fractions 0.5 --tag canvas
+vc_tomography_reconstruct RAW_DATA --set geometry=geometry.json --z 400 432 --chunk 4 --roi 3000 5000 3000 5000 \
+    --projection_store projections.zarr --reduce 2 --keep_tiles --tag canvas_block
+```
+
+Every tile's rows of a slice are placed in one sinogram as wide as the whole mosaic, at the columns where the
+tile's rotation axis falls at each angle; the recordings of every ray, by any tile from either side, are averaged
+by their weights; and that sinogram is ramp-filtered and backprojected once. No row is cut inside the sample.
+
+- Slices are numbered from 0 (`--fractions`, `-n`, `--z` and `--heights` all take these numbers) and are written
+  as TIFF, `slice_<number>.tiff`, with `manifest.json`. `--roi` crops; `--uint8` adds an 8-bit copy.
+- The canvas is the slice of the whole mosaic, with the first tile's rotation axis at its middle pixel. Pixels
+  outside every tile's disc are 0.
+- `--keep_tiles` keeps every tile's reconstructor between chunks. It avoids setting each tile up again and needs
+  device memory for all of them at once: use it for reduced frames.
+- `--set tile_taper=N` sets the stored columns at either end of a tile's rows over which its weight falls to
+  nothing (default 200). `--set tile_levels=false` turns off the level solved per tile and slice from the rays two
+  tiles share.
+- `filters`, `z_interp`, `x_interp` and `backprojector=fbp(...)` are taken as for any scan. The filters act on
+  each tile's frames, before the rows are joined. Only `fbp` is available.
+- Not applied: the beam's divergence and the tiles' rotations against each other. The tiles' angles within one
+  angular bin are taken as equal; `manifest.json` states by how much they differ (`angle_spread_bins`).
+- The places come from `vc_tomography_calibration geometry` run on all the tiles (see
+  [Calibration and alignment](calibration.md#bm18-mosaic-tiles)). A file in which every place is 0 is refused.
+
+From Python: `vc_tomography.mosaic.canvas_reconstruction(projections, cal, ...)` returns an object with `doable`,
+`size` and `reconstruct(h_lo, h_hi, roi=None)`. From C++: `vc_tomography::MosaicReconstruction`
+(`include/vc_tomography/mosaic.hpp`). On the 19 tiles of PHercParis4 at a quarter (RTX 5090) the setup takes 18
+seconds and a slice of 9005 × 9005 pixels 7 seconds.
 
 ## Reconstructing at reduced resolution
 
@@ -283,6 +321,6 @@ options. `vc_tomography.band.BandComposite` computes surface composites from the
 - Slices are reconstructed one at a time in a parallel-beam model. Effects that move a ray out of its slice (beam
   divergence along the axis, tilt of the rotation axis toward the beam) are measured by the geometry calibration
   but not applied. `manifest.json` lists them under `provenance.geometry.measured_not_applied`.
-- A mosaic cannot be reconstructed as one volume.
+- A mosaic is reconstructed as one slice only by FBP, and written only as TIFF.
 - Parameter sweeps run only on CUDA.
 - Only xy slices are produced.

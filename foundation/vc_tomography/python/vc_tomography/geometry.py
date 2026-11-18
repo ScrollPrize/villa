@@ -305,6 +305,38 @@ def solve_geometry(acquisition_, comparisons, start=None, huber=0.03, max_iterat
     return out
 
 
+def places_from_motors(acquisition_, parameters, orientation=0):
+    """`parameters` with every scan's place from the record's motors: d = M (on_stage - the anchor's on_stage), the
+    height nothing. orientation 0 ... 7: which of the eight ways the motors' plane lies in the model's, d = (v, -u),
+    (v, u), (-v, u), (-v, -u), (u, v), (u, -v), (-u, v), (-u, -v) of the motors' (u, v); 0 is ESRF BM18's. The motors
+    are good to tens of pixels: what a mosaic's comparisons are planned from (plan_tiles).
+    (vc_tomography::calibration::geometry_calibration::places_from_motors)"""
+    from . import _core
+    return json.loads(_core.geometry_places_from_motors(acquisition(acquisition_), _parameters_text(parameters), int(orientation)))
+
+
+def solve_tiles(acquisition_, own, between, places, radial_map=True):
+    """A mosaic's tiles placed against each other: each tile's own views (`own`) and the tiles' comparisons with
+    each other (`between`: measure_tiles), from `places` (the tiles' own parameters with the places the comparisons
+    were planned from). Three solves in turn: (1) everything on all the comparisons, with the detector map's four
+    terms of a radial displacement free (radial_map; else the map `places` holds, as it is); (2) each tile's own
+    parameters (axis column, its slope, axial scale, height once per turn) again from its own views alone under
+    (1)'s map, roll, stage and places; (3) the shared terms and the places again from all, the tiles' own
+    parameters held, with the scale of each tile's image across the beam free ("scan<k>.column_scale"). Returns
+    (3)'s solution as solve_geometry does, "residual" being of `own` followed by `between`, and "unknowns_first"
+    how many unknowns (1) had. What the geometry step does for a mosaic.
+    (vc_tomography::calibration::geometry_calibration::solve_tiles)"""
+    from . import _core
+    comparisons = list(own) + list(between)
+    text, residual, first = _core.geometry_solve_tiles(acquisition(acquisition_), [str(c["kind"]) for c in comparisons], _sightings([c["a"] for c in comparisons]),
+                                                       _sightings([c["b"] for c in comparisons]), [bool(c.get("opposite", False)) for c in comparisons], len(own),
+                                                       _parameters_text(places), bool(radial_map))
+    out = json.loads(text)
+    out["residual"] = residual
+    out["unknowns_first"] = int(first)
+    return out
+
+
 def to_stored_pixels(acquisition_, parameters, rows, cols, f):
     """The joint model's parameters, found on frames read at 1 / f (a session with reduce), in the pixels of the
     frames as stored (rows x cols): positions times f, ratios as they are, each axis column moved along the roll to
@@ -411,6 +443,10 @@ def calibrate_geometry(scans, row_time=None, device="auto", order=3, threads=8, 
     reduce: 1, 2, 3 to measure on the frames read at a half, a quarter, an eighth (the result is in stored pixels
     all the same; the C++ Options say by how much it then differs from the stored frames'). projections: a projection
     store (STORE.zarr of vc_tomography_projections_zarr) to read the frames, darks and flats from, at the level `reduce`.
+    A mosaic's tiles (scans at different places on the rotation stage, the reference tile first) are also placed
+    against each other: places_from_motors under the orientation whose comparisons register, the neighbours compared
+    (plan_tiles), solve_tiles; the dict then holds "tiles" (pairs, blocks, motors_orientation, orientation_scores,
+    pitch_measured).
     Returns a dict (see `save`): layout, row_time, map, parameters, solution (what is left per kind), report, comparisons.
     (vc_tomography::calibration::geometry_calibration::calibrate_geometry; the same as `vc_tomography_calibration geometry`)"""
     from . import _core

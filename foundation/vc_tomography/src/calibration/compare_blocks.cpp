@@ -126,6 +126,8 @@ bool measure(const Pairing& P, const BlockPlan& first_plan, Cut cut, const Regis
         if (extra[0] && !plan_block_at(*P.ta, *P.tb, plan.p0, n[0], mg[0], J0 + extra[0], P.angle_offset, plan)) return false;
         if (plan.max_row_shift + 3 > mg[1]) return false;  // the margin of rows cannot take the pre-alignment
         if (plan.j0 - mg[0] < 0 || plan.j0 + n[0] + mg[0] > nb) return false;
+        // a cut moved by what the registration found, onto frames a partial copy does not hold: the block is given up
+        if (extra[0] && (!P.B.rec->stretches[P.sb].on_disk(plan.j0 - mg[0]) || !P.B.rec->stretches[P.sb].on_disk(plan.j0 + n[0] + mg[0] - 1))) return false;
         // a sway of B's content along the columns: whole columns go into the cut, the rest is resampled per frame
         std::vector<double> sway, sway_per_row;
         int sway_whole = 0, pad = 0;
