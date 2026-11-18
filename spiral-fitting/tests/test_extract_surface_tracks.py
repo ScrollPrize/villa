@@ -343,6 +343,18 @@ def test_gpus_with_cpu_backend_is_rejected(capsys):
     assert '--gpus applies to the GPU backend only' in capsys.readouterr().err
 
 
+def test_slab_workers_need_linux(monkeypatch, capsys):
+    argv = ['--predictions', 'p.zarr', '--out', 't.dbm', '--backend', 'cpu',
+            '--slab-workers', '4', '--kimimaro-parallel', '1']
+    monkeypatch.setattr(sys, 'platform', 'linux')
+    args = est.parse_args(argv)
+    assert (args.slab_workers, args.kimimaro_parallel) == (4, 1)
+    monkeypatch.setattr(sys, 'platform', 'darwin')
+    with pytest.raises(SystemExit):
+        est.parse_args(argv)
+    assert '--slab-workers > 1 needs Linux' in capsys.readouterr().err
+
+
 def test_import_and_parse_args_stay_lazy():
     # A GPU-only install has no Kimimaro: importing the script and parsing its arguments must
     # not import the CPU backend's packages (or vesuvius and PyTorch). A fresh interpreter,
