@@ -125,6 +125,11 @@ struct AccumScanView {
     int col_rows = 0;
     int col_stride = 0;
     int col_shifted = 0;
+    // optional (accumulate sets it with col_val, unless it grids measured pixels only): the vertically interpolated
+    // weights of the block's projections (the scan's weight map, or the second one while its sums are made), each
+    // computed once with its value: the row a sample is read at need not be found again at every pixel it lands on.
+    // The weight of projection k at stack row t, detector column c is col_w[(col_slot[k] * col_rows + t) * det_cols + c].
+    const float* col_w = nullptr;
     // Gridding of measured pixels only, of a scan with a lateral registration or the lateral part of a map (x_exact
     // and col_offset or map_cols; accumulate sets col_wt for the block in hand, with col_val and col_shifted): the
     // cached rows are the measured intensities of the detector's columns (measured_column: value over weight, the

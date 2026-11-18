@@ -14,9 +14,12 @@ using namespace vc_tomography::accum_core;
 namespace {
 
 // threads: x over merged columns, y over rows t, z over grid angles of the block
-__global__ void accumulate_kernel(AccumScanView s, const int32_t* __restrict__ offsets, const int32_t* __restrict__ proj,
+// (the scan's view is read from device memory: a kernel that takes a view of this size by value and hands it on by
+// reference copies it to the stack of every thread, which cost several times the gather itself)
+__global__ void accumulate_kernel(const AccumScanView* __restrict__ view, const int32_t* __restrict__ offsets, const int32_t* __restrict__ proj,
                                   const int8_t* __restrict__ role, int L, int H, int NX, AccumParams p,
                                   float* __restrict__ R, float* __restrict__ RW) {
+    const AccumScanView& s = *view;
     const int X = blockIdx.x * blockDim.x + threadIdx.x;
     const int t = blockIdx.y;
     const int jl = blockIdx.z;
@@ -28,21 +31,26 @@ __global__ void accumulate_kernel(AccumScanView s, const int32_t* __restrict__ o
     RW[o] = b;
 }
 
-// the vertically interpolated values of the block's projections: threads x over detector columns, y over rows t, z
-// over the projections (slots)
+// the vertically interpolated values of the block's projections and their weights (wt: of the scan's weight map; wt2:
+// of a second map, weight2; null: none): threads x over detector columns, y over rows t, z over the projections (slots)
 // finite: the rows are to be read exactly (a value that is not finite becomes 0: see cpu::accumulate)
-__global__ void column_values_kernel(AccumScanView s, const int32_t* __restrict__ slot_proj, int H, int stride, bool finite,
-                                     float* __restrict__ out) {
+__global__ void column_values_kernel(const AccumScanView* __restrict__ view, const int32_t* __restrict__ slot_proj, int H, int stride, bool finite,
+                                     float non_zero, float* __restrict__ out, const float* __restrict__ weight2,
+                                     float* __restrict__ wt, float* __restrict__ wt2) {
+    const AccumScanView& s = *view;
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     const int t = blockIdx.y;
     if (c >= s.det_cols || t >= H) return;
-    const float v = column_interp(s, slot_proj[blockIdx.z], t, c);
-    out[(static_cast<size_t>(blockIdx.z) * H + t) * stride + c] = finite && !hd::is_finite(v) ? 0.f : v;
+    const size_t row = static_cast<size_t>(blockIdx.z) * H + t;
+    const size_t o = row * s.det_cols + c;
+    column_cache_entry(s, weight2, slot_proj[blockIdx.z], t, c, non_zero, finite, out[row * stride + c], wt ? wt + o : nullptr,
+                       wt2 ? wt2 + o : nullptr);
 }
 
 // the same for measured pixels only (measured_value): each detector column's measured value and its weight
-__global__ void measured_values_kernel(AccumScanView s, const int32_t* __restrict__ slot_proj, int H, int stride, AccumParams p,
+__global__ void measured_values_kernel(const AccumScanView* __restrict__ view, const int32_t* __restrict__ slot_proj, int H, int stride, AccumParams p,
                                        float* __restrict__ out, float* __restrict__ wt) {
+    const AccumScanView& s = *view;
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     const int t = blockIdx.y;
     if (c >= s.det_cols || t >= H) return;
@@ -57,13 +65,15 @@ __global__ void measured_rows_kernel(float* __restrict__ val, float* __restrict_
 }
 
 // the delay of every cached row for the frames' lateral registration (column_delay): (n_slots, H)
-__global__ void column_delay_kernel(AccumScanView s, const int32_t* __restrict__ slot_proj, int n_slots, int H, float* __restrict__ out) {
+__global__ void column_delay_kernel(const AccumScanView* __restrict__ view, const int32_t* __restrict__ slot_proj, int n_slots, int H, float* __restrict__ out) {
+    const AccumScanView& s = *view;
     const int q = blockIdx.x * blockDim.x + threadIdx.x;
     if (q < n_slots * H) out[q] = column_delay(s, slot_proj[q / H], q % H);
 }
 
 // the rows of resample_rows for the cached rows (resample_row): (n_slots, H)
-__global__ void resample_row_kernel(AccumScanView s, const int32_t* __restrict__ slot_proj, int n_slots, int H, ResampleRow* __restrict__ out) {
+__global__ void resample_row_kernel(const AccumScanView* __restrict__ view, const int32_t* __restrict__ slot_proj, int n_slots, int H, ResampleRow* __restrict__ out) {
+    const AccumScanView& s = *view;
     const int q = blockIdx.x * blockDim.x + threadIdx.x;
     if (q < n_slots * H) out[q] = resample_row(s, slot_proj[q / H], q % H);
 }
@@ -128,10 +138,20 @@ void accumulate(const AccumScanView& view, const ContributorList& c, const Accum
     // (work buffers of the calling thread, kept between blocks: every call finishes before it returns)
     thread_local DeviceBuffer<int32_t> d_off, d_proj, d_slot, d_slot_proj;
     thread_local DeviceBuffer<int8_t> d_role;
-    thread_local DeviceBuffer<float> d_col, d_col_wt, d_delay;
+    thread_local DeviceBuffer<float> d_col, d_col_wt, d_col_w, d_col_w2, d_delay;
     thread_local DeviceBuffer<ResampleRow> d_row;
-    thread_local ThreadScratch scratch(d_off, d_proj, d_slot, d_slot_proj, d_role, d_col, d_col_wt, d_delay, d_row);
+    thread_local DeviceBuffer<AccumScanView> d_view;
+    thread_local ThreadScratch scratch(d_view, d_off, d_proj, d_slot, d_slot_proj, d_role, d_col, d_col_wt, d_col_w, d_col_w2, d_delay, d_row);
     AccumScanView s = view;
+    // the view as the kernels read it: slot i of d_view takes the view as it stands (the launches are queued, so each
+    // state of the view a kernel is given keeps its own slot, on the host as well until the copies have been made)
+    d_view.ensure(3);
+    AccumScanView states[3];
+    const auto on_device = [&](int i) {
+        states[i] = s;
+        VC_TOMOGRAPHY_CUDA_CHECK(cudaMemcpyAsync(d_view.data() + i, &states[i], sizeof s, cudaMemcpyHostToDevice, st));
+        return static_cast<const AccumScanView*>(d_view.data() + i);
+    };
     // the vertically interpolated values of the block's projections, once each (they are the same at every column
     // tap of every pixel a sample lands on); measured-only gridding interpolates per corner instead, unless the scan
     // has a lateral registration or the lateral part of a map: then its measured values are read exactly as well
@@ -149,18 +169,23 @@ void accumulate(const AccumScanView& view, const ContributorList& c, const Accum
         dim3 block(128, 1, 1), grid(grid_1d(s.det_cols, 128), p.H, static_cast<unsigned>(n_slots));
         const int32_t* sp = load(d_slot_proj, slot_proj, st);
         const int n_rows = static_cast<int>(n_slots) * p.H;
+        const AccumScanView* dv = on_device(0);
         if (measured_exact) {
             d_col_wt.ensure(n_slots * p.H * stride);
-            measured_values_kernel<<<grid, block, 0, st>>>(s, sp, p.H, stride, p, d_col.data(), d_col_wt.data());
+            measured_values_kernel<<<grid, block, 0, st>>>(dv, sp, p.H, stride, p, d_col.data(), d_col_wt.data());
             VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
             measured_rows_kernel<<<(n_rows + 63) / 64, 64, 0, st>>>(d_col.data(), d_col_wt.data(), n_rows, s.det_cols, stride, s.col_guard);
-        } else {
-            column_values_kernel<<<grid, block, 0, st>>>(s, sp, p.H, stride, shift, d_col.data());
+        } else {   // (with the rows' weights, of both weight maps: the gather below reads them)
+            const std::size_t n_w = n_slots * p.H * static_cast<std::size_t>(s.det_cols);
+            d_col_w.ensure(n_w);
+            if (weight2) d_col_w2.ensure(n_w);
+            column_values_kernel<<<grid, block, 0, st>>>(dv, sp, p.H, stride, shift, p.non_zero, d_col.data(), weight2, d_col_w.data(),
+                                                         weight2 ? d_col_w2.data() : nullptr);
         }
         VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
         if (shift && s.map_cols) {   // each ideal column from its detector column: the detector map, the frames' scale
             d_row.ensure(n_rows);
-            resample_row_kernel<<<(n_rows + 255) / 256, 256, 0, st>>>(s, sp, static_cast<int>(n_slots), p.H, d_row.data());
+            resample_row_kernel<<<(n_rows + 255) / 256, 256, 0, st>>>(dv, sp, static_cast<int>(n_slots), p.H, d_row.data());
             VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
             ResampleGeometry g;
             g.map = s.map;
@@ -170,7 +195,7 @@ void accumulate(const AccumScanView& view, const ContributorList& c, const Accum
             resample_rows(d_col.data(), n_rows, s.det_cols, d_row.data(), g, st);
         } else if (shift && s.col_offset) {   // each row by its own amount: the frames' lateral registration
             d_delay.ensure(n_rows);
-            column_delay_kernel<<<(n_rows + 255) / 256, 256, 0, st>>>(s, sp, static_cast<int>(n_slots), p.H, d_delay.data());
+            column_delay_kernel<<<(n_rows + 255) / 256, 256, 0, st>>>(dv, sp, static_cast<int>(n_slots), p.H, d_delay.data());
             VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
             shift_rows(d_col.data(), n_rows, s.det_cols, s.fract_x, st, d_delay.data());
         } else if (shift) {
@@ -181,16 +206,18 @@ void accumulate(const AccumScanView& view, const ContributorList& c, const Accum
         s.col_stride = stride;
         s.col_shifted = shift ? 1 : 0;
         if (measured_exact) s.col_wt = d_col_wt.data();
+        else s.col_w = d_col_w.data();
     }
     const int32_t* off = load(d_off, c.offsets, st);
     const int32_t* proj = load(d_proj, c.proj, st);
     const int8_t* role = load(d_role, c.role, st);
     dim3 block(128, 1, 1), grid(grid_1d(p.NX, 128), p.H, L);
-    accumulate_kernel<<<grid, block, 0, st>>>(s, off, proj, role, L, p.H, p.NX, p, R, RW);
+    accumulate_kernel<<<grid, block, 0, st>>>(on_device(1), off, proj, role, L, p.H, p.NX, p, R, RW);
     VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
     if (weight2) {   // the same contributions with the second weight map
         s.weight = weight2;
-        accumulate_kernel<<<grid, block, 0, st>>>(s, off, proj, role, L, p.H, p.NX, p, R2, RW2);
+        if (s.col_w) s.col_w = d_col_w2.data();
+        accumulate_kernel<<<grid, block, 0, st>>>(on_device(2), off, proj, role, L, p.H, p.NX, p, R2, RW2);
         VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
     }
     VC_TOMOGRAPHY_CUDA_CHECK(cudaStreamSynchronize(st));

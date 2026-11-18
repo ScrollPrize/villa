@@ -200,11 +200,8 @@ HR_HD int padded_row(const AccumScanView& s, int k, int t, bool& pad) {
     return t;
 }
 
-// vertically interpolated value at window row t of column c: the value of column_value
-HR_HD float column_interp(const AccumScanView& s, int k, int t0, int c) {
-    int t;
-    float a;
-    row_position(s, k, t0, c, t, a);
+// vertically interpolated value at the position (t, a) row_position gives for column c
+HR_HD float column_interp_at(const AccumScanView& s, int k, int t, float a, int c) {
     bool pad;
     const int tv = padded_row(s, k, t, pad);
     float val, zw[z_max_taps];
@@ -221,16 +218,22 @@ HR_HD float column_interp(const AccumScanView& s, int k, int t0, int c) {
     return val;
 }
 
+// vertically interpolated value at window row t of column c: the value of column_value
+HR_HD float column_interp(const AccumScanView& s, int k, int t0, int c) {
+    int t;
+    float a;
+    row_position(s, k, t0, c, t, a);
+    return column_interp_at(s, k, t, a, c);
+}
+
 // what accumulate computed of column_interp for the block in hand (AccumScanView::col_val)
 HR_HD float column_cached(const AccumScanView& s, int k, int t, int c) {
     return s.col_val[(static_cast<std::size_t>(s.col_slot[k]) * s.col_rows + t) * s.col_stride + c];
 }
 
-// vertically interpolated weight at window row t of column c
-HR_HD float column_weight(const AccumScanView& s, int k, int t0, int c, float non_zero) {
-    int t;
-    float a;
-    row_position(s, k, t0, c, t, a);
+// vertically interpolated weight (of the map `weight`: AccumScanView::weight, or a second one) at the position
+// (t, a) row_position gives for column c
+HR_HD float column_weight_at(const AccumScanView& s, const float* weight, int k, int t, float a, int c, float non_zero) {
     bool pad;
     const int tv = padded_row(s, k, t, pad);
     const int rr = s.row0[k] + tv;
@@ -241,10 +244,34 @@ HR_HD float column_weight(const AccumScanView& s, int k, int t0, int c, float no
         return s.flats[s.flat_i0[k] * plane + pix] > 0.f && s.flats[s.flat_i1[k] * plane + pix] > 0.f ? non_zero : 0.f;
     }
     const float dw = s.weight_factor[k];
-    const float w0 = mul(s.weight[static_cast<std::size_t>(rr) * s.det_cols + c], dw);
+    const float w0 = mul(weight[static_cast<std::size_t>(rr) * s.det_cols + c], dw);
     if (a == 0.0f) return w0;
-    const float w1 = mul(s.weight[static_cast<std::size_t>(rr + 1) * s.det_cols + c], dw);
+    const float w1 = mul(weight[static_cast<std::size_t>(rr + 1) * s.det_cols + c], dw);
     return add(mul(sub(1.0f, a), w0), mul(a, w1));
+}
+
+// vertically interpolated weight at window row t of column c: what accumulate computed of it for the block in hand
+// (AccumScanView::col_w), else computed here
+HR_HD float column_weight(const AccumScanView& s, int k, int t0, int c, float non_zero) {
+    if (s.col_w) return s.col_w[(static_cast<std::size_t>(s.col_slot[k]) * s.col_rows + t0) * s.det_cols + c];
+    int t;
+    float a;
+    row_position(s, k, t0, c, t, a);
+    return column_weight_at(s, s.weight, k, t, a, c, non_zero);
+}
+
+// The block's cache of projection k at stack row t, detector column c, with the row's position found once: the
+// vertically interpolated value (column_interp; `finite`: a value that is not finite becomes 0, for rows that are
+// read exactly) and the vertically interpolated weights of the scan's weight map and of a second one (null: none).
+HR_HD void column_cache_entry(const AccumScanView& s, const float* weight2, int k, int t0, int c, float non_zero, bool finite,
+                              float& val, float* wt, float* wt2) {
+    int t;
+    float a;
+    row_position(s, k, t0, c, t, a);
+    const float v = column_interp_at(s, k, t, a, c);
+    val = finite && !hd::is_finite(v) ? 0.f : v;
+    if (wt) *wt = column_weight_at(s, s.weight, k, t, a, c, non_zero);
+    if (wt2) *wt2 = column_weight_at(s, weight2, k, t, a, c, non_zero);
 }
 
 // vertically interpolated value (column_interp, or what was computed of it: column_cached, unless those rows are

@@ -137,7 +137,7 @@ void accumulate(const AccumScanView& view, const ContributorList& c, const Accum
     // tap of every pixel a sample lands on); measured-only gridding interpolates per corner instead, unless the scan
     // has a lateral registration or the lateral part of a map: then its measured values are read exactly as well
     // (AccumScanView::col_wt)
-    thread_local std::vector<float> col, col_wt;
+    thread_local std::vector<float> col, col_wt, col_w, col_w2;
     const ColumnCachePlan cache = column_cache_plan(s, c, p);
     const bool measured_exact = cache.measured_exact;
     if (cache.use) {
@@ -148,8 +148,14 @@ void accumulate(const AccumScanView& view, const ContributorList& c, const Accum
         const int stride = cache.stride;
         col.resize(static_cast<std::size_t>(n_slots) * p.H * stride);
         if (measured_exact) col_wt.resize(col.size());
+        // (not measured-only: the rows' weights with their values, of both weight maps; the gather below reads them)
+        const std::size_t n_w = measured_exact ? 0 : static_cast<std::size_t>(n_slots) * p.H * W;
+        col_w.resize(n_w);
+        col_w2.resize(weight2 ? n_w : 0);
         float* const values = col.data();   // (the calling thread's buffers: `col` names another in each worker)
         float* const weights = col_wt.data();
+        float* const w1 = col_w.data();
+        float* const w2 = weight2 ? col_w2.data() : nullptr;
 #pragma omp parallel for collapse(2) schedule(dynamic, 4)
         for (int q = 0; q < n_slots; ++q)
             for (int t = 0; t < p.H; ++t) {
@@ -160,12 +166,11 @@ void accumulate(const AccumScanView& view, const ContributorList& c, const Accum
                     measured_row_for_exact_read(out, wt, W, s.col_guard);
                     continue;
                 }
-                for (int x = 0; x < W; ++x) out[x] = column_interp(s, slot_proj[q], t, x);
                 // (a row to be read exactly must be finite: a pixel without a flat signal has no finite value and,
                 // by the reconstructor's weight maps and column_weight, no weight: 0 in its place)
-                if (shift)
-                    for (int x = 0; x < W; ++x)
-                        if (!hd::is_finite(out[x])) out[x] = 0.f;
+                const std::size_t o = (static_cast<std::size_t>(q) * p.H + t) * W;
+                for (int x = 0; x < W; ++x)
+                    column_cache_entry(s, weight2, slot_proj[q], t, x, p.non_zero, shift, out[x], w1 + o + x, w2 ? w2 + o + x : nullptr);
             }
         if (shift && s.map_cols) {   // each ideal column from its detector column: the detector map, the frames' scale
             std::vector<ResampleRow> row(static_cast<std::size_t>(n_slots) * p.H);
@@ -191,9 +196,13 @@ void accumulate(const AccumScanView& view, const ContributorList& c, const Accum
         s.col_stride = stride;
         s.col_shifted = shift ? 1 : 0;
         if (measured_exact) s.col_wt = weights;
+        else s.col_w = w1;
     }
     for (int pass = 0; pass < (weight2 ? 2 : 1); ++pass) {
-        if (pass == 1) s.weight = weight2;
+        if (pass == 1) {
+            s.weight = weight2;
+            if (s.col_w) s.col_w = col_w2.data();
+        }
         float* const Rp = pass ? R2 : R;
         float* const RWp = pass ? RW2 : RW;
 #pragma omp parallel for collapse(2) schedule(dynamic, 4)
