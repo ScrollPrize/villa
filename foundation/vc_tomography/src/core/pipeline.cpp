@@ -540,7 +540,11 @@ SliceReconstructor::SliceReconstructor(std::vector<ScanData> scans, ReconConfig 
     if (I.x_kernel != interp_core::Linear && I.x_kernel != interp_core::Cubic && I.x_kernel != interp_core::Lanczos3)
         throw Error("x_interp must be sinc, lanczos3, cubic or linear");
     I.z_kernel = I.cfg.legacy_reference ? static_cast<int>(interp_core::Linear) : z_kernel_from_name(I.cfg.z_interp);
-    I.z_ctx = I.z_pad = z_kernel_context(I.z_kernel);
+    I.z_ctx = z_kernel_context(I.z_kernel);
+    // (one row of the window before the stack at least: a slice below the detector's last row pair takes the value
+    // of its last row but one (padded_row), which lies one row before the window of a projection whose first row is
+    // the detector's last)
+    I.z_pad = std::max(I.z_ctx, 1);
     {   // rolled frames: rows of context for the largest row offset on the detector, and the kernel's table
         float reach = 0.f;
         for (const auto& s : I.scans) {
