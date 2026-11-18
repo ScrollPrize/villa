@@ -35,6 +35,7 @@
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
 #include "vc_object_store/objects/FiberJson.hpp"
 #include <mutex>
+#include "vc_reader/zarr.hpp"
 using namespace vc::python;
 namespace {
 nb::list collectionsToPy(const std::vector<vo::AttachedCollection>& collections)
@@ -1019,6 +1020,15 @@ void bindSessionOperations(nb::class_<vo::ObjectStoreSession> session)
 
 NB_MODULE(_native, m)
 {
+    // This module links its own copy of vc_reader and had no translator for it, so a
+    // missing Zarr group reached Python as RuntimeError. Map it as vc_reader's module does.
+    nb::register_exception_translator([](const std::exception_ptr& p, void*) {
+        try {
+            std::rethrow_exception(p);
+        } catch (const vcr::zarr::NotFound& e) {
+            PyErr_SetString(PyExc_FileNotFoundError, e.what());
+        }
+    });
     m.def("fitting_relationship_inputs", [](const nb::list& entries, const std::map<std::string, std::string>& kinds, bool approvedOnly) {
         nb::list selected; std::map<std::string, int64_t> exclusions;
         for (size_t index = 0; index < entries.size(); ++index) {
