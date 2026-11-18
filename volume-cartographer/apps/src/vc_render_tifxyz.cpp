@@ -1524,8 +1524,10 @@ int main(int argc, char *argv[])
             }
         }
 
-        // Single-part: create the pyramid datasets now; multi-part/resume: --pre created them.
-        if (wantZarr && wantPyramid && !pre_flag && numParts <= 1 && !resumeFlag)
+        // Single-part: create the pyramid datasets now, unless a resumed run finds them
+        // all there (the last level is created last); multi-part: --pre created them.
+        if (wantZarr && wantPyramid && !pre_flag && numParts <= 1 &&
+            !(resumeFlag && vcr::zarr::isLocalZarrArray(outFilePath / std::to_string(kRenderPyramid.levels))))
             vcr::zarr::createPyramidLevels(outFilePath, outputOptions, kRenderPyramid);
 
         // Each part renders a contiguous range of tile rows. With a pyramid the
