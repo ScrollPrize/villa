@@ -40,6 +40,7 @@
 #include "overlays/BBoxOverlayController.hpp"
 #include "overlays/VectorOverlayController.hpp"
 #include "overlays/InkDetectionOverlayController.hpp"
+#include "overlays/InkPreviewOverlayController.hpp"
 #include "overlays/PlaneSlicingOverlayController.hpp"
 #include "overlays/SurfaceRotationOverlayController.hpp"
 #include "overlays/VolumeOverlayController.hpp"
@@ -346,6 +347,7 @@ private:
     std::unique_ptr<PlaneSlicingOverlayController> _planeSlicingOverlay;
     std::unique_ptr<StoreSurfaceOverlayController> _storeSurfaceOverlay;
     std::unique_ptr<SurfaceRotationOverlayController> _surfaceRotationOverlay;
+    std::unique_ptr<InkPreviewOverlayController> _inkPreviewOverlay;
     std::unique_ptr<FiberCollectionController> _fiberCollection;
     std::unique_ptr<SegmentationModule> _segmentationModule;
     std::unique_ptr<SurfaceCatalog> _surfaceCatalog;
