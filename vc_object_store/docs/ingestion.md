@@ -91,7 +91,12 @@ version 4:
 
 - Version-4 branch endpoints require `target_uuid`; `branch_file` only
   locates a missing peer's transport file. Version-3 links resolve by
-  `branch_file`. There is no filename-based endpoint repair.
+  `branch_file`. VC3D's own fiber files from before the store also say
+  version 4 but link by `branch_file` alone, as the published fiber
+  annotations do; ingest resolves such a branch like a version-3 one, taking
+  `target_uuid` from the peer file, and reads a level-0
+  `vc_open_data_coordinate_space` in such a file as in version 3. There is no
+  other filename-based endpoint repair.
 - A link declared from both ends imports once. Reciprocal declarations that
   disagree roll back the whole batch.
 - A level-0 open-data coordinate space becomes the volume binding
