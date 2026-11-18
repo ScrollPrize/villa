@@ -175,6 +175,47 @@ def validate_portable_bundle(
     return value
 
 
+def _precision_name(value: Any) -> str | None:
+    if value is None:
+        return None
+    name = str(value).strip().lower()
+    return "fp32" if name in {"off", "fp32", "float32", "none"} else name
+
+
+def check_resume_precision(path: str | Path, precision: str) -> None:
+    """Refuse to resume an output that an earlier run wrote at another precision.
+
+    Tiled runners skip chunks that already exist, so continuing an output with a
+    different autocast precision would mix the two in one result. An existing
+    provenance document without a recorded precision cannot be checked; it gets
+    a warning instead of an error so older outputs stay resumable.
+    """
+    path = Path(path)
+    if not path.is_file():
+        return
+    try:
+        existing = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return
+    inference = existing.get("inference") if isinstance(existing, Mapping) else None
+    recorded = _precision_name(inference.get("precision")) if isinstance(inference, Mapping) else None
+    current = _precision_name(precision)
+    if recorded is None:
+        print(
+            f"[provenance] WARNING: {path} does not record the inference precision, so resuming "
+            f"cannot check that existing chunks were written at {current}. Use a new output "
+            "to avoid mixing precisions.",
+            flush=True,
+        )
+        return
+    if recorded != current:
+        raise ValueError(
+            f"{path.parent} was started at inference precision {recorded}, but this run resolved "
+            f"{current}; resuming would mix both in one output. Write to a new output, or rerun "
+            f"with the original precision."
+        )
+
+
 def base_document(*, artifact_kind: str, context: Mapping[str, Any] | None = None) -> dict[str, Any]:
     supplied = dict(context or {})
     allowed = {key: supplied[key] for key in (

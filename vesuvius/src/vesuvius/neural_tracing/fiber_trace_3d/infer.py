@@ -516,6 +516,11 @@ def run_fiber_trace_3d_inference(
         f"{'fp32' if precision_mode == 'off' else precision_mode} source={precision_source}",
         flush=True,
     )
+    try:
+        from inference_provenance import check_resume_precision
+    except ImportError:  # pragma: no cover - monorepo package import mode.
+        from lasagna.inference_provenance import check_resume_precision
+    check_resume_precision(provenance_path, precision_mode)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     removed = _cleanup_predict3d_temp_files(output_dir, f"{json_stem}_")
