@@ -12,6 +12,9 @@
 #include <vc_object_store/geometry/Geometry.hpp>
 
 #include <opencv2/imgproc.hpp>
+// QuadSurface::rotate uses getRotationMatrix2D and invertAffineTransform,
+// which OpenCV 5 moved out of imgproc into the geometry module.
+#include "vc/core/util/OpenCvCompat.hpp"
 
 #include <array>
 #include <cstdlib>
