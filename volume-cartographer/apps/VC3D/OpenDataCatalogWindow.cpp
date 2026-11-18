@@ -67,6 +67,10 @@ constexpr int kSampleTableInitialWidth = 940;
 constexpr int kDetailsInitialWidth = 520;
 constexpr int kRepresentationVolumeIndexRole = Qt::UserRole;
 constexpr int kRepresentationArtifactIndexRole = Qt::UserRole + 1;
+// Volumes tree: every row carries its volume index; an encoding child row also
+// carries its artifact index.
+constexpr int kVolumeIndexRole = Qt::UserRole;
+constexpr int kVolumeArtifactIndexRole = Qt::UserRole + 1;
 
 class OverviewPhotoLabel : public QLabel {
 public:
@@ -274,14 +278,68 @@ QString representationParameters(const vcr::catalog::OpenDataArtifact& artifact)
     return details.empty() ? QStringLiteral("—") : qstr(details.dump());
 }
 
+// How a source volume's chunks are published: "raw", or the Delta3D codec with
+// its version, predictor, quantization and chunk size.
+QString sourceVolumeEncoding(const vcr::catalog::OpenDataArtifact& artifact)
+{
+    const auto codec = vcr::catalog::sourceVolumeCodec(artifact);
+    if (codec.empty()) return QObject::tr("raw");
+    QStringList parts{QString::fromUtf8(codec.data(), int(codec.size()))};
+    if (!artifact.delta3dVersion.empty()) parts.push_back("v" + qstr(artifact.delta3dVersion));
+    if (!artifact.predictor.empty()) parts.push_back(qstr(artifact.predictor));
+    if (artifact.quant) parts.push_back(QObject::tr("quant %1").arg(*artifact.quant));
+    if (artifact.chunkSize) parts.push_back(QObject::tr("chunk %1").arg(*artifact.chunkSize));
+    return parts.join(QStringLiteral(", "));
+}
+
+// The published name of a source volume: the last component of its URL.
+QString sourceVolumeFilename(const vcr::catalog::OpenDataArtifact& artifact)
+{
+    auto url = qstr(artifact.url());
+    while (url.endsWith('/')) url.chop(1);
+    return url.mid(url.lastIndexOf('/') + 1);
+}
+
+constexpr int kVolumeColumns = 11;
+constexpr int kVolumeEncodingColumn = 7;
+constexpr int kVolumeNormalGridsColumn = 8;
+constexpr int kVolumeExportDateColumn = 9;
+constexpr int kVolumeSourceFilenameColumn = 10;
+
 QStringList volumeCells(const std::filesystem::path& remoteRoot,
                         const vcr::catalog::OpenDataSample& sample, const vcr::catalog::OpenDataVolume& volume)
 {
+    const auto sources = vcr::catalog::sourceVolumeArtifacts(volume);
+    const QString encoding = sources.size() >= 2 ? QObject::tr("%n encodings", nullptr, int(sources.size()))
+                           : sources.size() == 1 ? sourceVolumeEncoding(volume.artifacts[sources.front()])
+                                                 : QStringLiteral("—");
     return {qstr(volume.id), qstr(volume.scanId), qstr(volume.suffix),
             optionalNumber(volume.pixelSizeUm), optionalNumber(volume.energyKeV, 'f', 1),
-            optionalNumber(volume.detectorDistanceMm, 'f', 1), qstr(volume.dataFormat),
+            optionalNumber(volume.detectorDistanceMm, 'f', 1), qstr(volume.dataFormat), encoding,
             normalGridsStatusDisplay(remoteRoot, sample.id, volume), qstr(volume.createdAt),
             volumeSourceFilename(volume)};
+}
+
+// A child row under a volume published in several encodings: only what differs
+// between them (codec, encoding parameters, export date, published name).
+QStringList sourceVolumeCells(const vcr::catalog::OpenDataArtifact& artifact)
+{
+    QStringList cells(kVolumeColumns);
+    const auto codec = vcr::catalog::sourceVolumeCodec(artifact);
+    cells[0] = codec.empty() ? QObject::tr("raw zarr") : QString::fromUtf8(codec.data(), int(codec.size()));
+    cells[kVolumeEncodingColumn] = sourceVolumeEncoding(artifact);
+    cells[kVolumeExportDateColumn] = artifact.creation.date.empty() ? QStringLiteral("—") : qstr(artifact.creation.date);
+    cells[kVolumeSourceFilenameColumn] = sourceVolumeFilename(artifact);
+    return cells;
+}
+
+template <typename Parent>
+QTreeWidgetItem* treeRow(Parent* parent, const QStringList& cells)
+{
+    auto* row = new QTreeWidgetItem(parent, cells);
+    for (int col = 0; col < cells.size(); ++col)
+        row->setToolTip(col, cells[col]);
+    return row;
 }
 
 QStringList representationCells(const vcr::catalog::OpenDataVolume& volume, const vcr::catalog::OpenDataArtifact& artifact,
@@ -462,24 +520,28 @@ void OpenDataCatalogWindow::createSelectedProject()
     layout->addLayout(form);
     auto* tabs = new QTabWidget(&dialog);
     layout->addWidget(tabs, 1);
-    auto makeTree = [&](const QString& label, const QTableWidget* catalog) {
+    // A checkbox tree with the catalog view's columns, in its order and widths.
+    auto makeTree = [&](const QString& label, const QStringList& headers, const QHeaderView* catalog) {
         auto* tree = new QTreeWidget(tabs);
-        QStringList headers;
-        for (int i = 0; i < catalog->columnCount(); ++i)
-            headers.push_back(catalog->horizontalHeaderItem(i)->text());
         tree->setHeaderLabels(headers);
         tree->header()->setStretchLastSection(false);
-        for (int visual = 0; visual < catalog->columnCount(); ++visual) {
-            const int logical = catalog->horizontalHeader()->logicalIndex(visual);
+        for (int visual = 0; visual < headers.size(); ++visual) {
+            const int logical = catalog->logicalIndex(visual);
             tree->header()->moveSection(tree->header()->visualIndex(logical), visual);
-            tree->setColumnWidth(logical, std::clamp(catalog->columnWidth(logical), 90, 360));
+            tree->setColumnWidth(logical, std::clamp(catalog->sectionSize(logical), 90, 360));
         }
         tree->setColumnWidth(0, 260);
         tabs->addTab(tree, label);
         return tree;
     };
-    auto* volumeTree = makeTree(tr("Volumes"), _volumesTable);
-    auto* representationTree = makeTree(tr("Representations"), _representationsTable);
+    QStringList volumeHeaders, representationHeaders;
+    for (int i = 0; i < _volumesTree->columnCount(); ++i)
+        volumeHeaders.push_back(_volumesTree->headerItem()->text(i));
+    for (int i = 0; i < _representationsTable->columnCount(); ++i)
+        representationHeaders.push_back(_representationsTable->horizontalHeaderItem(i)->text());
+    auto* volumeTree = makeTree(tr("Volumes"), volumeHeaders, _volumesTree->header());
+    auto* representationTree =
+        makeTree(tr("Representations"), representationHeaders, _representationsTable->horizontalHeader());
     auto group = [](QTreeWidget* tree, const QString& label) {
         auto* item = new QTreeWidgetItem(tree, {label});
         item->setFlags(item->flags() | Qt::ItemIsUserCheckable | Qt::ItemIsAutoTristate);
@@ -495,6 +557,9 @@ void OpenDataCatalogWindow::createSelectedProject()
         return item;
     };
     std::vector<std::pair<QTreeWidgetItem*, std::string>> volumes;
+    // The checkbox that stands for each source artifact: its own child row when
+    // the volume is published in several encodings, else the volume's row.
+    std::vector<std::pair<QTreeWidgetItem*, OpenDataSourceArtifactRef>> sourceArtifacts;
     std::vector<std::pair<QTreeWidgetItem*, vcr::catalog::OpenDataRepresentationRef>> representations;
     auto* sourceGroup = group(volumeTree, tr("Source volumes"));
     for (std::size_t row = 0; row < sample.volumes.size(); ++row) {
@@ -502,7 +567,18 @@ void OpenDataCatalogWindow::createSelectedProject()
         if (std::none_of(volume.artifacts.begin(), volume.artifacts.end(),
                         [](const auto& a) { return !vcr::catalog::classifyDerivedRepresentation(a) && a.hasResolvedUrl(); }))
             continue;
-        volumes.emplace_back(leaf(sourceGroup, volumeCells(remoteRoot, sample, volume)), volume.id);
+        auto* volumeItem = leaf(sourceGroup, volumeCells(remoteRoot, sample, volume));
+        volumes.emplace_back(volumeItem, volume.id);
+        const auto sources = vcr::catalog::sourceVolumeArtifacts(volume);
+        if (sources.size() >= 2) {
+            volumeItem->setFlags(volumeItem->flags() | Qt::ItemIsAutoTristate);
+            for (const auto index : sources)
+                sourceArtifacts.emplace_back(leaf(volumeItem, sourceVolumeCells(volume.artifacts[index])),
+                                             OpenDataSourceArtifactRef{row, index});
+        } else {
+            for (const auto index : sources)
+                sourceArtifacts.emplace_back(volumeItem, OpenDataSourceArtifactRef{row, index});
+        }
     }
     QMap<QString, QTreeWidgetItem*> groups;
     const auto refs = vcr::catalog::derivedRepresentations(sample);
@@ -563,9 +639,13 @@ void OpenDataCatalogWindow::createSelectedProject()
     if (dialog.exec() != QDialog::Accepted) return;
     OpenDataResourceSelection selection;
     selection.rawVolumeIds.emplace();
+    selection.rawVolumeArtifacts.emplace();
     selection.representations.emplace();
+    // A volume with some of its encodings checked is partially checked.
     for (const auto& [item, id] : volumes)
-        if (item->checkState(0) == Qt::Checked) selection.rawVolumeIds->push_back(id);
+        if (item->checkState(0) != Qt::Unchecked) selection.rawVolumeIds->push_back(id);
+    for (const auto& [item, ref] : sourceArtifacts)
+        if (item->checkState(0) == Qt::Checked) selection.rawVolumeArtifacts->push_back(ref);
     for (const auto& [item, ref] : representations)
         if (item->checkState(0) == Qt::Checked) selection.representations->push_back(ref);
     const OpenDataNewProject project{QFileInfo(path->text()).absoluteFilePath().toStdString(),
@@ -649,9 +729,12 @@ void OpenDataCatalogWindow::buildUi()
 
     auto* volumesPage = new QWidget(_tabs);
     auto* volumesLayout = new QVBoxLayout(volumesPage);
-    _volumesTable = new QTableWidget(volumesPage);
-    _volumesTable->setColumnCount(10);
-    _volumesTable->setHorizontalHeaderLabels({
+    // One row per catalog volume; a volume published in several encodings (raw
+    // and Delta3D) has a child row per encoding.
+    _volumesTree = new QTreeWidget(volumesPage);
+    _volumesTree->setObjectName("catalogVolumes");
+    _volumesTree->setColumnCount(kVolumeColumns);
+    _volumesTree->setHeaderLabels({
         tr("Volume ID"),
         tr("Scan ID"),
         tr("Suffix"),
@@ -659,16 +742,17 @@ void OpenDataCatalogWindow::buildUi()
         tr("Energy (keV)"),
         tr("Detector distance"),
         tr("Format"),
+        tr("Encoding"),
         tr("Normal grids"),
         tr("Export date"),
         tr("Source filename")
     });
-    _volumesTable->setEditTriggers(QAbstractItemView::NoEditTriggers);
-    _volumesTable->setSelectionBehavior(QAbstractItemView::SelectRows);
-    _volumesTable->setSelectionMode(QAbstractItemView::SingleSelection);
-    _volumesTable->horizontalHeader()->setStretchLastSection(true);
-    _volumesTable->horizontalHeader()->moveSection(9, 2);
-    _volumesTable->verticalHeader()->hide();
+    _volumesTree->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    _volumesTree->setSelectionBehavior(QAbstractItemView::SelectRows);
+    _volumesTree->setSelectionMode(QAbstractItemView::SingleSelection);
+    _volumesTree->setUniformRowHeights(true);
+    _volumesTree->header()->setStretchLastSection(true);
+    _volumesTree->header()->moveSection(kVolumeSourceFilenameColumn, 2);
     auto* volumeActions = new QHBoxLayout;
     _downloadNormalGridsButton = new QPushButton(tr("Download Normal Grids"), volumesPage);
     _downloadNormalGridsButton->setToolTip(
@@ -682,7 +766,7 @@ void OpenDataCatalogWindow::buildUi()
     volumeActions->addWidget(_copyVolumeUrlButton);
     volumeActions->addWidget(_attachVolumeButton);
     volumeActions->addWidget(_openVolumeUrlButton);
-    volumesLayout->addWidget(_volumesTable, 1);
+    volumesLayout->addWidget(_volumesTree, 1);
     volumesLayout->addLayout(volumeActions);
     _tabs->addTab(volumesPage, tr("Volumes"));
 
@@ -800,7 +884,7 @@ void OpenDataCatalogWindow::buildUi()
             });
     connect(_sampleTable->selectionModel(), &QItemSelectionModel::selectionChanged,
             this, &OpenDataCatalogWindow::updateSelectedSample);
-    connect(_volumesTable->selectionModel(), &QItemSelectionModel::selectionChanged,
+    connect(_volumesTree->selectionModel(), &QItemSelectionModel::selectionChanged,
             this, &OpenDataCatalogWindow::updateActionButtons);
     connect(_representationsTable->selectionModel(),
             &QItemSelectionModel::selectionChanged,
@@ -1050,14 +1134,24 @@ void OpenDataCatalogWindow::populateDetails(const vcr::catalog::OpenDataSample* 
     }
     _scansTable->resizeColumnsToContents();
 
-    _volumesTable->setRowCount(static_cast<int>(sample->volumes.size()));
-    for (int row = 0; row < static_cast<int>(sample->volumes.size()); ++row) {
-        const auto& volume = sample->volumes[static_cast<std::size_t>(row)];
-        setCatalogRow(_volumesTable, row, volumeCells(remoteRoot, *sample, volume));
-        _volumesTable->item(row, 0)->setData(Qt::UserRole, row);
+    _volumesTree->clear();
+    for (std::size_t row = 0; row < sample->volumes.size(); ++row) {
+        const auto& volume = sample->volumes[row];
+        auto* volumeItem = treeRow(_volumesTree, volumeCells(remoteRoot, *sample, volume));
+        volumeItem->setData(0, kVolumeIndexRole, static_cast<qulonglong>(row));
+        const auto sources = vcr::catalog::sourceVolumeArtifacts(volume);
+        if (sources.size() < 2) continue;
+        for (const auto index : sources) {
+            auto* child = treeRow(volumeItem, sourceVolumeCells(volume.artifacts[index]));
+            child->setData(0, kVolumeIndexRole, static_cast<qulonglong>(row));
+            child->setData(0, kVolumeArtifactIndexRole, static_cast<qulonglong>(index));
+        }
     }
-    _volumesTable->resizeColumnsToContents();
-    _volumesTable->setColumnWidth(9, std::min(_volumesTable->columnWidth(9), 420));
+    _volumesTree->expandAll();
+    for (int col = 0; col < _volumesTree->columnCount(); ++col)
+        _volumesTree->resizeColumnToContents(col);
+    _volumesTree->setColumnWidth(kVolumeSourceFilenameColumn,
+                                 std::min(_volumesTree->columnWidth(kVolumeSourceFilenameColumn), 420));
 
     _representationsTable->setRowCount(static_cast<int>(representations.size()));
     for (int row = 0; row < static_cast<int>(representations.size()); ++row) {
@@ -1107,8 +1201,8 @@ void OpenDataCatalogWindow::clearDetails()
     if (_scansTable) {
         _scansTable->setRowCount(0);
     }
-    if (_volumesTable) {
-        _volumesTable->setRowCount(0);
+    if (_volumesTree) {
+        _volumesTree->clear();
     }
     if (_representationsTable) {
         _representationsTable->setRowCount(0);
@@ -1242,19 +1336,29 @@ const vcr::catalog::OpenDataSample* OpenDataCatalogWindow::selectedSample() cons
 const vcr::catalog::OpenDataVolume* OpenDataCatalogWindow::selectedVolume() const
 {
     const auto* sample = selectedSample();
-    if (!sample || !_volumesTable || _volumesTable->currentRow() < 0) {
+    const auto* row = _volumesTree ? _volumesTree->currentItem() : nullptr;
+    if (!sample || !row) {
         return nullptr;
     }
-    const int row = _volumesTable->currentRow();
-    const auto* idItem = _volumesTable->item(row, 0);
-    if (!idItem) {
-        return nullptr;
-    }
-    const int volumeIndex = idItem->data(Qt::UserRole).toInt();
-    if (volumeIndex < 0 || volumeIndex >= static_cast<int>(sample->volumes.size())) {
+    const auto volumeIndex = row->data(0, kVolumeIndexRole).toULongLong();
+    if (volumeIndex >= sample->volumes.size()) {
         return nullptr;
     }
     return &sample->volumes[static_cast<std::size_t>(volumeIndex)];
+}
+
+const vcr::catalog::OpenDataArtifact* OpenDataCatalogWindow::selectedVolumeArtifact() const
+{
+    const auto* volume = selectedVolume();
+    if (!volume) {
+        return nullptr;
+    }
+    const auto artifactIndex = _volumesTree->currentItem()->data(0, kVolumeArtifactIndexRole);
+    if (!artifactIndex.isValid()) {
+        return vcr::catalog::preferredVolumeArtifact(*volume);
+    }
+    const auto index = artifactIndex.toULongLong();
+    return index < volume->artifacts.size() ? &volume->artifacts[static_cast<std::size_t>(index)] : nullptr;
 }
 
 std::optional<vcr::catalog::OpenDataRepresentationRef> OpenDataCatalogWindow::selectedRepresentation() const
@@ -1302,15 +1406,8 @@ const vcr::catalog::OpenDataSegment* OpenDataCatalogWindow::selectedSegment() co
 
 QString OpenDataCatalogWindow::selectedVolumeUrl() const
 {
-    const auto* volume = selectedVolume();
-    if (!volume) {
-        return {};
-    }
-    const auto* artifact = vcr::catalog::preferredVolumeArtifact(*volume);
-    if (!artifact) {
-        return {};
-    }
-    return qstr(artifact->url());
+    const auto* artifact = selectedVolumeArtifact();
+    return artifact ? qstr(artifact->url()) : QString{};
 }
 
 QString OpenDataCatalogWindow::selectedRepresentationUrl() const
@@ -1458,7 +1555,7 @@ void OpenDataCatalogWindow::downloadSelectedVolumeNormalGrids()
     }
     const auto remoteRoot = vc3d::remoteCachePathFs();
     const QString volumeLabel = qstr(volume->id);
-    const int volumeRow = _volumesTable ? _volumesTable->currentRow() : -1;
+    const auto volumeIndex = static_cast<qulonglong>(volume - sample->volumes.data());
 
     auto cancelFlag = std::make_shared<std::atomic<bool>>(false);
     auto* dialog = new QProgressDialog(
@@ -1554,10 +1651,15 @@ void OpenDataCatalogWindow::downloadSelectedVolumeNormalGrids()
     }
 
     // Refresh the volume's status cell and the button state.
-    if (_volumesTable && volumeRow >= 0 && volumeRow < _volumesTable->rowCount() &&
-        selectedSample() == sample) {
-        _volumesTable->setItem(
-            volumeRow, 7, item(normalGridsStatusDisplay(remoteRoot, sample->id, *volume)));
+    if (_volumesTree && selectedSample() == sample) {
+        for (int i = 0; i < _volumesTree->topLevelItemCount(); ++i) {
+            auto* row = _volumesTree->topLevelItem(i);
+            if (row->data(0, kVolumeIndexRole).toULongLong() != volumeIndex) continue;
+            const auto status = normalGridsStatusDisplay(remoteRoot, sample->id, *volume);
+            row->setText(kVolumeNormalGridsColumn, status);
+            row->setToolTip(kVolumeNormalGridsColumn, status);
+            break;
+        }
     }
     updateActionButtons();
 }

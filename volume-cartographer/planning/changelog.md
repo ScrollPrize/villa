@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-11-16
+
+- Open Data Catalog: a volume published in several encodings (raw zarr and
+  Delta3D `ome-zarr-vcd3d`) shows a child row per encoding in the Volumes tab,
+  with an Encoding column, and Create Project lets you pick encodings
+  individually (`OpenDataResourceSelection::rawVolumeArtifacts`). vc_reader:
+  `sourceVolumeArtifacts`, `sourceVolumeCodec`, Delta3D parameters on
+  `OpenDataArtifact`; `volumeAt` treats every encoding as the source volume.
+
 ## 2026-10-27
 
 Removals (planning/cleanup_removals_plan.md):

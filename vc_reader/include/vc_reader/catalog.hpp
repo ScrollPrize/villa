@@ -21,6 +21,8 @@ namespace artifact_type {
 inline constexpr const char* photo = "photo";
 inline constexpr const char* photoMask = "photo-mask";
 inline constexpr const char* omeZarr = "ome-zarr";
+// The volume's voxels re-encoded with vc-delta3d (a source volume, not a derived representation).
+inline constexpr const char* omeZarrVcd3d = "ome-zarr-vcd3d";
 inline constexpr const char* surfacePredictionZarr = "surface-prediction-zarr";
 inline constexpr const char* normalGrids = "normal-grids";
 inline constexpr const char* lasagna = "lasagna";
@@ -112,6 +114,12 @@ struct OpenDataArtifact {
     // Typed parameters and properties of rendered and labelled artifacts.
     std::optional<int> renderLevel;
     std::optional<double> downscale;
+    // Delta3D-compressed source volumes (ome-zarr-vcd3d): parameters.vc_delta3d_version,
+    // .predictor, .quant and .chunk_size as published.
+    std::string delta3dVersion;
+    std::string predictor;
+    std::optional<int> quant;
+    std::optional<int> chunkSize;
     std::string format;
     std::string compositeMode;
     std::string labelSet;
@@ -454,6 +462,15 @@ struct OpenDataManifest {
 
 [[nodiscard]] const OpenDataArtifact* preferredVolumeArtifact(
     const OpenDataVolume& volume) noexcept;
+
+// A source volume: the volume's own voxels (raw ome-zarr or an ome-zarr-vcd3d
+// re-encoding), i.e. a zarr with a resolved URL that is not a derived representation.
+[[nodiscard]] bool isSourceVolumeArtifact(const OpenDataArtifact& artifact);
+// The indices of a volume's source volumes, the preferred one first.
+[[nodiscard]] std::vector<std::size_t> sourceVolumeArtifacts(const OpenDataVolume& volume);
+// The chunk codec a source volume is published with: "vc-delta3d" for ome-zarr-vcd3d,
+// empty for a raw zarr.
+[[nodiscard]] std::string_view sourceVolumeCodec(const OpenDataArtifact& artifact) noexcept;
 
 [[nodiscard]] const OpenDataArtifact* preferredPhotoArtifact(
     const OpenDataSample& sample) noexcept;

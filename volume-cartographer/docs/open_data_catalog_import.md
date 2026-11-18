@@ -16,7 +16,12 @@ project from the catalog, discarding every change.
 Select a sample in Open Data Catalog and choose **Create Project...** beside
 **Open Sample**. Everything starts unchecked. Select source volumes, individual
 derived representations (grouped by type). Group checkboxes and Select all/Select
-none also work. Segments are not chosen here: the project gets the sample's
+none also work. A volume the catalog publishes in several encodings (its raw
+zarr and Delta3D re-encodings, `ome-zarr-vcd3d`) has a checkbox per encoding
+under its row; checking the volume takes them all. The selection carries the
+checked encodings (`OpenDataResourceSelection::rawVolumeArtifacts`); a selection
+without that field attaches every encoding of an allowed volume, as before.
+Segments are not chosen here: the project gets the sample's
 catalog surfaces. Set the project name and a new `.vcobj` file, then choose
 **Create and Open**. An empty selection creates a project without volumes.
 
@@ -40,9 +45,26 @@ under the plain catalog ID by the earlier implementation is left untouched.
 The initial JSON destination uses the same directory as File -> New Project
 (normally the per-user `.VC3D` directory). Volumes and Representations
 have separate checkbox tabs that share the catalog's model-to-display formatters,
-including source filename, resolution, energy, export date, prediction/artifact
-type, model, level, coordinates, parameters and URL where applicable. Long values
-have full-text tooltips. Select all/none operates across both tabs.
+including source filename, resolution, energy, encoding, export date,
+prediction/artifact type, model, level, coordinates, parameters and URL where
+applicable. Long values have full-text tooltips. Select all/none operates across
+both tabs.
+
+## Volumes tab
+
+The catalog window's Volumes tab lists one row per catalog volume with the
+scan's metadata. Its **Encoding** column shows how the volume's chunks are
+published: `raw`, or the Delta3D codec with its version, predictor, quantization
+and chunk size (`vcr::catalog::sourceVolumeCodec` and the artifact's
+`delta3dVersion`, `predictor`, `quant`, `chunkSize` from the manifest's
+`parameters`). A volume published in two or more encodings
+(`vcr::catalog::sourceVolumeArtifacts`) gets a child row per encoding carrying
+only what differs: the codec, the encoding, the export date and the published
+name. Copy URL, Open URL and Attach to Current Project act on the selected row:
+a child's own zarr, or the volume's preferred (raw) zarr for a volume row.
+Every encoding of a volume is the same catalog volume to VC3D
+(`OpenDataManifest::volumeAt` reports it as a source at the base level), so
+normal grids, Lasagna datasets and overlays pair with it like with the raw zarr.
 
 Selecting a derived resource includes its channel volumes, using existing
 attachment/coordinate validation. It does not add raw scans or unrelated

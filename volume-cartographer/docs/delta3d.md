@@ -17,6 +17,10 @@ their original codec before upgrading. Older readers that only support D3D1
 cannot read new preset frames: upgrade consumers before sharing newly encoded
 volumes or caches with them.
 
+Delta3D re-encodings of a published volume (`ome-zarr-vcd3d`) are listed and
+selectable in the Open Data Catalog beside the raw zarr; see the Volumes tab
+section of [open_data_catalog_import.md](open_data_catalog_import.md).
+
 ## Tests
 
 With the normal project build dependencies available:

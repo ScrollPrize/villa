@@ -300,10 +300,7 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
                             volumeIndex, artifactIndex, *reprKind, volume.id)) {
                         continue;
                     }
-                } else if (selection->rawVolumeIds &&
-                           std::find(selection->rawVolumeIds->begin(),
-                                     selection->rawVolumeIds->end(), volume.id) ==
-                               selection->rawVolumeIds->end()) {
+                } else if (!selection->allowsSourceArtifact(volumeIndex, artifactIndex, volume.id)) {
                     continue;
                 }
             }

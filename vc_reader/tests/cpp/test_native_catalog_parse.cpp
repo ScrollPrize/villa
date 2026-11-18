@@ -57,7 +57,11 @@ const char* kSample = R"({
               "origins": [{"path": "PHerc0139/representations/predictions/fibers/f1/", "access_roots": [
               {"type": "s3", "url": "s3://vesuvius-challenge-open-data/", "usage": "public-read"}]}]},
             {"type": "ink_detection_3d_zarr"},
-            {"type": "future-pred-zarr"}
+            {"type": "future-pred-zarr"},
+            {"type": "ome-zarr-vcd3d", "parameters": {"vc_delta3d_version": "0.3.2", "predictor": "fast", "quant": 1, "chunk_size": 64},
+              "creation_info": {"date": "2026-11-13T17:30:18Z", "process": "vcd3d-from-ome-zarr"},
+              "origins": [{"path": "PHerc0139/volumes/vol1-fast-q1-c64-v0.3.2.vcd3d.zarr", "access_roots": [
+              {"type": "s3", "url": "s3://vesuvius-challenge-open-data/", "usage": "public-read"}]}]}
           ]},
         "vol2": {"id": "vol2", "scan_id": "scan-a", "properties": {}}
       },
@@ -180,6 +184,21 @@ int main()
         require(atL0 && atL0->level == 0, "published source path");
         require(!atL0->sameGrid(*atL2) && atL2->sameGrid(*manifest.volumeAt(zarrUrl, 2)), "a level is its own grid");
         require(!manifest.volumeAt("https://example.test/other.zarr"), "unknown volume");
+
+        // A Delta3D re-encoding is a source volume of the same catalog volume, not a derived dataset.
+        const auto sources = sourceVolumeArtifacts(*vol1);
+        require(sources.size() == 2 && &artifacts[sources[0]] == zarr && sources[1] == 6, "source volumes, preferred first");
+        const auto& vcd3d = artifacts[6];
+        require(sourceVolumeCodec(vcd3d) == "vc-delta3d" && sourceVolumeCodec(*zarr).empty() &&
+                    vcd3d.delta3dVersion == "0.3.2" && vcd3d.predictor == "fast" && vcd3d.quant == 1 &&
+                    vcd3d.chunkSize == 64 && vcd3d.creation.date == "2026-11-13T17:30:18Z",
+                "delta3d encoding parameters");
+        require(zarr->delta3dVersion.empty() && !zarr->quant && !zarr->chunkSize, "raw zarr has no encoding parameters");
+        require(!classifyDerivedRepresentation(vcd3d) && isSourceVolumeArtifact(vcd3d), "vcd3d is not a derived representation");
+        const auto atVcd3d = manifest.volumeAt(vcd3d.url(), 1);
+        require(atVcd3d && atVcd3d->volumeId == "vol1" && atVcd3d->source && atVcd3d->level == 1 &&
+                    atVcd3d->artifact == &vcd3d && atVcd3d->sameGrid(*manifest.volumeAt(zarrUrl, 1)),
+                "delta3d source volume shares the catalog volume's grid");
 
         require(sampleNameKey("PHerc. Paris 4") == "phercparis4" && sampleNameKey("PHerc 0332") == "pherc332" &&
                     sampleNameKey("x100") == "x100" && sampleNameKey("000") == "0" && sampleNameKey("Scroll 1") == "scroll1",

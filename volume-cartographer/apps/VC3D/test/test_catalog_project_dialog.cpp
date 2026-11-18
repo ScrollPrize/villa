@@ -110,12 +110,20 @@ private slots:
         volume.id = "test-volume";
         volume.dataFormat = "zarr";
         volume.pixelSizeUm = 2.4;
-        vcr::catalog::OpenDataArtifact raw, prediction;
+        vcr::catalog::OpenDataArtifact raw, prediction, vcd3d;
         raw.type = "ome-zarr";
         raw.resolvedUrl = "https://example.invalid/source.zarr";
         prediction.type = "surface-prediction-zarr";
         prediction.resolvedUrl = "https://example.invalid/prediction.zarr";
-        volume.artifacts = {raw, prediction};
+        // The same voxels re-encoded with Delta3D: a second source volume of the catalog volume.
+        vcd3d.type = "ome-zarr-vcd3d";
+        vcd3d.resolvedUrl = "https://example.invalid/source-fast-q1-c64-v0.3.2.vcd3d.zarr";
+        vcd3d.delta3dVersion = "0.3.2";
+        vcd3d.predictor = "fast";
+        vcd3d.quant = 1;
+        vcd3d.chunkSize = 64;
+        vcd3d.creation.date = "2026-11-13T17:30:18Z";
+        volume.artifacts = {raw, prediction, vcd3d};
         sample.volumes = {volume};
         vcr::catalog::OpenDataSegment segment;
         segment.id = "segment";
@@ -132,6 +140,7 @@ private slots:
         more.id = "second-volume";
         more.artifacts[0].resolvedUrl = "https://example.invalid/second-source.zarr";
         more.artifacts[1].resolvedUrl = "https://example.invalid/second-prediction.zarr";
+        more.artifacts[2].resolvedUrl = "https://example.invalid/second-source.vcd3d.zarr";
         sample.volumes.push_back(more);
         manifest.samples = {first, sample};
         if (qEnvironmentVariableIsSet("VC_CATALOG_TEST_MANIFEST")) {
@@ -158,6 +167,35 @@ private slots:
         for (auto* edit : catalog.findChildren<QLineEdit*>()) {
             if (edit->placeholderText() == "Filter sample ID") edit->setText("Paris4");
         }
+        if (!qEnvironmentVariableIsSet("VC_CATALOG_TEST_MANIFEST")) {
+            // The Volumes tab: one row per volume, and a child row per encoding
+            // of a volume published in several; selecting a child offers its URL.
+            auto* volumes = catalog.findChild<QTreeWidget*>("catalogVolumes");
+            QVERIFY(volumes);
+            QCOMPARE(volumes->topLevelItemCount(), 2);
+            auto* first = volumes->topLevelItem(0);
+            QCOMPARE(first->text(0), QString("test-volume"));
+            QCOMPARE(first->text(7), QString("2 encodings"));
+            QCOMPARE(first->childCount(), 2);
+            QCOMPARE(first->child(0)->text(0), QString("raw zarr"));
+            QCOMPARE(first->child(0)->text(7), QString("raw"));
+            QCOMPARE(first->child(1)->text(0), QString("vc-delta3d"));
+            QCOMPARE(first->child(1)->text(7), QString("vc-delta3d, v0.3.2, fast, quant 1, chunk 64"));
+            QCOMPARE(first->child(1)->text(9), QString("2026-11-13T17:30:18Z"));
+            QCOMPARE(first->child(1)->text(10), QString("source-fast-q1-c64-v0.3.2.vcd3d.zarr"));
+            QSignalSpy attached(&catalog, &OpenDataCatalogWindow::attachVolumeRequested);
+            QPushButton* attach = nullptr;
+            for (auto* button : catalog.findChildren<QPushButton*>())
+                if (button->text() == "Attach to Current Project...") attach = button;
+            QVERIFY(attach);
+            volumes->setCurrentItem(first);
+            attach->click();
+            volumes->setCurrentItem(first->child(1));
+            attach->click();
+            QCOMPARE(attached.count(), 2);
+            QCOMPARE(attached[0][0].toString(), QString::fromStdString(raw.resolvedUrl));
+            QCOMPARE(attached[1][0].toString(), QString::fromStdString(vcd3d.resolvedUrl));
+        }
         bool opened = false;
         QTimer::singleShot(0, &catalog, [&]() {
             auto* dialog = qobject_cast<QDialog*>(QApplication::activeModalWidget());
@@ -175,6 +213,10 @@ private slots:
                     QCOMPARE(tree->topLevelItem(0)->childCount(), 2);
                     QCOMPARE(tree->topLevelItem(0)->child(0)->text(0), QString("test-volume"));
                     QCOMPARE(tree->topLevelItem(0)->child(1)->text(0), QString("second-volume"));
+                    // Each volume offers its two encodings.
+                    QCOMPARE(tree->topLevelItem(0)->child(0)->childCount(), 2);
+                    QCOMPARE(tree->topLevelItem(0)->child(0)->child(1)->text(0), QString("vc-delta3d"));
+                    QCOMPARE(tree->topLevelItem(0)->child(1)->childCount(), 2);
                 }
             }
             dialog->reject();
@@ -191,6 +233,11 @@ private slots:
                 QVERIFY(selection.rawVolumeIds.has_value());
                 QCOMPARE(selection.rawVolumeIds->size(), std::size_t{1});
                 QCOMPARE(selection.rawVolumeIds->front(), std::string("test-volume"));
+                // Only the Delta3D encoding was checked.
+                QVERIFY(selection.rawVolumeArtifacts.has_value());
+                QCOMPARE(selection.rawVolumeArtifacts->size(), std::size_t{1});
+                QCOMPARE(selection.rawVolumeArtifacts->front().volumeIndex, std::size_t{0});
+                QCOMPARE(selection.rawVolumeArtifacts->front().artifactIndex, std::size_t{2});
                 QVERIFY(selection.representations.has_value());
                 QVERIFY(selection.representations->empty());
                 QCOMPARE(project.name, std::string("my-selection"));
@@ -200,7 +247,15 @@ private slots:
                 auto pkg = vc::test::emptyProject(options);
                 attachOpenDataSampleVolumes(*pkg, selectedSample, &selection);
                 QCOMPARE(pkg->volumeEntries().size(), std::size_t{1});
-                QCOMPARE(pkg->volumeEntries().front().location, raw.resolvedUrl);
+                QCOMPARE(pkg->volumeEntries().front().location, vcd3d.resolvedUrl);
+                // The whole volume: every encoding, the raw zarr first.
+                auto whole = selection;
+                whole.rawVolumeArtifacts.reset();
+                auto all = vc::test::emptyProject(options);
+                attachOpenDataSampleVolumes(*all, selectedSample, &whole);
+                QCOMPARE(all->volumeEntries().size(), std::size_t{2});
+                QCOMPARE(all->volumeEntries()[0].location, raw.resolvedUrl);
+                QCOMPARE(all->volumeEntries()[1].location, vcd3d.resolvedUrl);
                 };
                 verify();
                 return false;
@@ -213,8 +268,10 @@ private slots:
                 path->setText(temp.filePath("my-selection.VCPROJ"));
                 auto trees = dialog->findChildren<QTreeWidget*>();
                 for (auto* tree : trees) {
-                    if (tree->topLevelItem(0)->text(0) == "Source volumes")
-                        tree->topLevelItem(0)->child(0)->setCheckState(0, Qt::Checked);
+                    if (tree->topLevelItem(0)->text(0) != "Source volumes") continue;
+                    auto* volume = tree->topLevelItem(0)->child(0);
+                    volume->child(1)->setCheckState(0, Qt::Checked);
+                    QCOMPARE(volume->checkState(0), Qt::PartiallyChecked);
                 }
                 dialog->findChild<QDialogButtonBox*>()->button(QDialogButtonBox::Save)->click();
             });

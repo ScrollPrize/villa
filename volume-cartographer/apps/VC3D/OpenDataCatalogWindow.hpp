@@ -20,6 +20,8 @@ class QLineEdit;
 class QPushButton;
 class QTableWidget;
 class QTabWidget;
+class QTreeWidget;
+class QTreeWidgetItem;
 
 namespace vc3d::opendata {
 
@@ -94,6 +96,9 @@ private:
 
     [[nodiscard]] const vcr::catalog::OpenDataSample* selectedSample() const;
     [[nodiscard]] const vcr::catalog::OpenDataVolume* selectedVolume() const;
+    // The selected source artifact: a child row's encoding, or the volume's
+    // preferred artifact for a volume row.
+    [[nodiscard]] const vcr::catalog::OpenDataArtifact* selectedVolumeArtifact() const;
     [[nodiscard]] std::optional<vcr::catalog::OpenDataRepresentationRef> selectedRepresentation() const;
     [[nodiscard]] const vcr::catalog::OpenDataArtifact* selectedRepresentationArtifact() const;
     [[nodiscard]] const vcr::catalog::OpenDataSegment* selectedSegment() const;
@@ -109,7 +114,7 @@ private:
     QLabel* _overviewLabel{nullptr};
     QLabel* _overviewPhotoLabel{nullptr};
     QTableWidget* _scansTable{nullptr};
-    QTableWidget* _volumesTable{nullptr};
+    QTreeWidget* _volumesTree{nullptr};
     QTableWidget* _representationsTable{nullptr};
     QTableWidget* _segmentsTable{nullptr};
     QLabel* _statusLabel{nullptr};

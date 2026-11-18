@@ -274,6 +274,10 @@ std::vector<OpenDataArtifact> parseArtifacts(const nlohmann::json& ownerJson)
         artifact.format = stringValue(artifact.parameters, "format").value_or("");
         artifact.compositeMode = stringValue(artifact.parameters, "composite_mode").value_or("");
         artifact.labelSet = stringValue(artifact.parameters, "label_set").value_or("");
+        artifact.delta3dVersion = stringValue(artifact.parameters, "vc_delta3d_version").value_or("");
+        artifact.predictor = stringValue(artifact.parameters, "predictor").value_or("");
+        artifact.quant = intValue(artifact.parameters, "quant");
+        artifact.chunkSize = intValue(artifact.parameters, "chunk_size");
         artifact.width = intValue(artifact.properties, "width");
         artifact.height = intValue(artifact.properties, "height");
         artifact.arrays = stringList(artifact.properties, "arrays").value_or(std::vector<std::string>{});
@@ -729,7 +733,8 @@ std::optional<OpenDataVolumeView> OpenDataManifest::volumeAt(std::string_view ur
             const auto* source = preferredVolumeArtifact(volume);
             for (const auto& artifact : volume.artifacts) {
                 if (artifact.url() != wanted && trimmed(artifact.sourcePath) != wanted) continue;
-                if (&artifact == source) return OpenDataVolumeView{sample.id, volume.id, baseLevel, true, &artifact};
+                if (&artifact == source || isSourceVolumeArtifact(artifact))
+                    return OpenDataVolumeView{sample.id, volume.id, baseLevel, true, &artifact};
                 if (!classifyDerivedRepresentation(artifact) || !artifact.sourceCoordinateLevel) continue;
                 return OpenDataVolumeView{sample.id, volume.id, baseLevel + *artifact.sourceCoordinateLevel, false, &artifact};
             }
@@ -1008,6 +1013,27 @@ const OpenDataArtifact* preferredVolumeArtifact(const OpenDataVolume& volume) no
         return &*it;
     }
     return volume.artifacts.empty() ? nullptr : &volume.artifacts.front();
+}
+
+bool isSourceVolumeArtifact(const OpenDataArtifact& artifact)
+{
+    return artifact.hasResolvedUrl() && isZarrArtifact(artifact) && !classifyDerivedRepresentation(artifact);
+}
+
+std::vector<std::size_t> sourceVolumeArtifacts(const OpenDataVolume& volume)
+{
+    std::vector<std::size_t> result;
+    const auto* preferred = preferredVolumeArtifact(volume);
+    for (std::size_t i = 0; i < volume.artifacts.size(); ++i)
+        if (&volume.artifacts[i] == preferred && isSourceVolumeArtifact(volume.artifacts[i])) result.push_back(i);
+    for (std::size_t i = 0; i < volume.artifacts.size(); ++i)
+        if (&volume.artifacts[i] != preferred && isSourceVolumeArtifact(volume.artifacts[i])) result.push_back(i);
+    return result;
+}
+
+std::string_view sourceVolumeCodec(const OpenDataArtifact& artifact) noexcept
+{
+    return iequals(artifact.type, artifact_type::omeZarrVcd3d) ? std::string_view("vc-delta3d") : std::string_view();
 }
 
 const OpenDataArtifact* preferredPhotoArtifact(const OpenDataSample& sample) noexcept
