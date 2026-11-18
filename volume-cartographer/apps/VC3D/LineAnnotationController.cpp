@@ -24,6 +24,7 @@
 #include "FiberLineGeometry.hpp"
 #include "FiberMapAutoLink.hpp"
 #include "LineAnnotationCsplineOnly.hpp"
+#include "LineAnnotationSpanMetrics.hpp"
 #include "LineAnnotationFiberLinks.hpp"
 #include "LineAnnotationStructuralEdits.hpp"
 #include "LineAnnotationFiberNaming.hpp"
@@ -11478,9 +11479,12 @@ LineAnnotationController::generatedSpanAlignmentMetricsForSession(
     const LineAnnotationSession& session) const
 {
     std::vector<vc3d::line_annotation::GeneratedSpanAlignmentMetric> metrics;
-    if (session.inspectionFrameOnly || session.modelOnly || session.controlPoints.size() < 2) {
+    if (session.modelOnly || session.controlPoints.size() < 2) {
         return metrics;
     }
+    // Without a normal source (inspection frame) the span descriptors are
+    // still shown; only normal-alignment measurements are left out.
+    const bool normalMeasurements = !session.inspectionFrameOnly;
 
     const auto controls = generatedControlMarkers(session.controlPoints);
     struct ControlRef {
@@ -11521,34 +11525,9 @@ LineAnnotationController::generatedSpanAlignmentMetricsForSession(
             controls);
         const auto& segment = session.controlPoints[first.index].segmentToNext;
         if (segment) {
-            metric.modeMarker = vc3d::line_annotation::segmentInterpolationModeMarker(
-                segment->interpMode);
-            metric.message = segment->message;
-            metric.gap = vc3d::line_annotation::spanIsGap(segment);
-            metric.damaged = vc3d::line_annotation::spanIsDamaged(segment);
-            if (segment->interpMode ==
-                vc3d::line_annotation::SegmentInterpolationMode::Trace) {
-                metric.kind = vc3d::line_annotation::GeneratedSpanAlignmentMetric::Kind::NativeMeetingError;
-            } else if (segment->interpMode ==
-                       vc3d::line_annotation::SegmentInterpolationMode::Cspline) {
-                metric.kind = vc3d::line_annotation::GeneratedSpanAlignmentMetric::Kind::Cspline;
-            } else {
-                metric.kind = vc3d::line_annotation::GeneratedSpanAlignmentMetric::Kind::LasagnaNormalAlignment;
-            }
-            if (segment->metric) {
-                metric.available = true;
-                metric.maxErrorDegrees = *segment->metric;
-            }
-            if (segment->meetingErrorBaseVoxels) {
-                metric.meetingErrorBaseVoxels =
-                    *segment->meetingErrorBaseVoxels;
-            }
-            if (segment->meetingErrorRatio)
-                metric.meetingErrorRatio = *segment->meetingErrorRatio;
-            metric.meetingSource = segment->meetingSource;
-            metric.failureCode = segment->failureCode;
-            metric.failureDetail = segment->failureDetail;
-        } else if (session.fiberId != 0 &&
+            vc3d::line_annotation::fillSpanMetricFromSegment(
+                metric, *segment, normalMeasurements);
+        } else if (normalMeasurements && session.fiberId != 0 &&
                    session.fiberMetricsMatchStoredFiber) {
             const auto alignment = cachedAlignmentForSpan(
                 session.fiberId, spanIndex);
