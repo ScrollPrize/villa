@@ -816,6 +816,10 @@ std::shared_ptr<ExternalBackprojector> python_backprojector(const FilterParams& 
 class PySliceReconstructor {
   public:
     // the reconstructor a Reconstruction made (shared with it)
+    auto nearest_view_angles(int lo, int hi) {
+        const auto a = impl_->nearest_view_angles(lo, hi);
+        return to_numpy(a, {static_cast<std::size_t>(hi - lo), static_cast<std::size_t>(impl_->n_grid())});
+    }
     explicit PySliceReconstructor(std::shared_ptr<SliceReconstructor> rec) : impl_(std::move(rec)) {}
     PySliceReconstructor(std::vector<ScanData> scans, const nb::dict& c) {
         ReconConfig cfg;
@@ -1420,6 +1424,7 @@ NB_MODULE(_core, m) {
           "(c - scale_col) and the ideal row v + Ev + row_scale (v - scale_row). Lateral parts need x_interp=sinc");
     nb::class_<PySliceReconstructor>(m, "SliceReconstructor")
         .def(nb::init<std::vector<ScanData>, const nb::dict&>(), "scans"_a, "config"_a)
+        .def("nearest_view_angles", &PySliceReconstructor::nearest_view_angles, "h_lo"_a, "h_hi"_a)
         .def_prop_ro("info", &PySliceReconstructor::info)
         .def_prop_ro("fan_of_columns", &PySliceReconstructor::fan_of_columns,
                      "the beam's divergence as the backprojector takes it: the fan [rad] of every merged column (empty: a parallel beam)")

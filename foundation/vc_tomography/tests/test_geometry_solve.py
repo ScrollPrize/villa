@@ -620,6 +620,16 @@ def test_the_reconstructions_poses_are_the_models():
         th, d = np.radians(poses[k]["angle_deg"]), truth["scans"][k]["d"]
         assert np.allclose(leaning[k]["row"] - poses[k]["row"], pitch * (d[1] * np.cos(th) - d[0] * np.sin(th)), atol=1e-9)
         assert np.array_equal(leaning[k]["axis"], poses[k]["axis"])
+    # Archived mosaics used a zero placeholder. Current files can deliberately set zero.
+    for parameter, report, expected in [
+        (0.0, dict(pitch_measured=pitch), leaning),
+        (pitch, dict(pitch_measured=-pitch), leaning),
+        (pitch, dict(pitch_measured=pitch, pitch_in_parameters=True), leaning),
+        (0.0, dict(pitch_measured=pitch, pitch_in_parameters=True), poses),
+    ]:
+        loaded, _ = G.scan_poses(dict(cal, tiles=report, parameters=dict(cal["parameters"], pitch=parameter)), angles, heights)
+        for actual, reference in zip(loaded, expected):
+            np.testing.assert_array_equal(actual["row"], reference["row"])
     # a calibration that holds a scale of the second scan's image across the beam: the poses scale its columns about
     # its rotation axis' column, and a pixel put through them is still the model's ray
     wider = dict(truth, scans=[truth["scans"][0], dict(truth["scans"][1], column_scale=3e-4)])

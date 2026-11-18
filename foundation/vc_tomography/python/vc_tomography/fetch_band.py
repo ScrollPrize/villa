@@ -143,11 +143,14 @@ def _run_job(job, output, remote, source_root, retries):
     remote_path, origin = _remote_path(link, str(Path(source_root) / job["file"]))
     select = None
     if job["role"] == "projection":
-        frames = {int(k): v for k, v in job["frames"].items()}
+        if "row_windows" in job:
+            frames = {int(k): v for k, v in job["row_windows"].items()}
+        else:
+            frames = {int(k): [v] for k, v in job["frames"].items()}
 
         def select(offset, shape):
-            band = frames.get(offset[0])
-            return band is not None and offset[1] < band[1] and offset[1] + shape[1] > band[0]
+            return any(offset[1] < hi and offset[1] + shape[1] > lo
+                       for lo, hi in frames.get(offset[0], ()))
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".partial")
     for attempt in range(retries + 1):

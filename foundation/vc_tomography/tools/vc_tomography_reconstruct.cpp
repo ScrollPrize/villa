@@ -453,7 +453,17 @@ int run_mosaic(const Args& a, const std::vector<std::string>& sets, const std::s
         if (s.rfind("geometry=", 0) == 0) continue;
         if (s.rfind("tile_taper=", 0) == 0) o.taper = std::stoi(s.substr(11));
         else if (s.rfind("tile_levels=", 0) == 0) o.levels = s.substr(12) != "false" && s.substr(12) != "0";
-        else rest.push_back(s);
+        else if (s.rfind("tile_rebin=", 0) == 0) {
+            const auto value = s.substr(11);
+            if (value == "linear" || value == "lanczos3" || value == "measured" || value == "exposure") {
+                o.rebin_angles = true;
+                o.rebin_kernel = value;
+                continue;
+            }
+            o.rebin_kernel = "two_pass";
+            if (value != "true" && value != "false" && value != "1" && value != "0") fail("tile_rebin expects true, false, linear, lanczos3, measured or exposure");
+            o.rebin_angles = value == "true" || value == "1";
+        } else rest.push_back(s);
     }
     o.device = dev;
     o.params = parse_settings(rest);
@@ -501,7 +511,7 @@ int run_mosaic(const Args& a, const std::vector<std::string>& sets, const std::s
                         .set("uint8_window", Json::list().add(Json::of(window[0])).add(Json::of(window[1])))
                         .set("vc_tomography", Json::of(build_revision()))
                         .set("slices", Json::list());
-    const int chunk = range_mode ? static_cast<int>(a.number("chunk")) : 1;
+    const int chunk = range_mode ? std::min(static_cast<int>(a.number("chunk")), r.max_chunk()) : 1;
     std::vector<float> img;
     for (std::size_t i = 0; i < wanted.size();) {
         std::size_t j = i + 1;

@@ -216,6 +216,7 @@ struct SliceReconstructor::Impl {
     const float* fbp_angles_of(int y) const {
         return nearest ? slice_fbp_angles.data() + static_cast<std::size_t>(y) * chunk_rows : fbp_angles.data();
     }
+    ChunkScan chunk_geometry(std::size_t s, int lo, int hi, int margin);
     void set_slice_angles(const std::vector<ChunkScan*>& cs, int DY, int m);
     // exposure arc: taps of its inverse along the angle (empty: none), and the arc in grid angles
     std::vector<float> arc_taps;
@@ -690,8 +691,8 @@ SliceReconstructor::SliceReconstructor(std::vector<ScanData> scans, ReconConfig 
     // The beam's divergence: the fan of every merged column, fan_per_column x (the scan's column there - its middle
     // column). Where several scans hold a merged column, the mean by the weight of their columns (the sums of their
     // weight maps' columns, each over its largest); a column none holds takes the nearest scan's line on.
-    // (in the exact backprojector alone: backprojector "fbp", and the FBP start of a method that asks for it there)
-    if (I.cfg.fan_per_column != 0 && !I.cfg.legacy_reference && (I.cfg.backprojector == "fbp" || I.fbp_start == 2)) {
+    // The exact FBP, a divergence-aware FBP start, and clients that rebin the measured columns use this table.
+    if (I.cfg.fan_per_column != 0 && !I.cfg.legacy_reference && (I.cfg.backprojector == "fbp" || I.fbp_start == 2 || (I.cfg.external && I.cfg.external->uses_column_fan()))) {
         std::vector<double> sum(I.NX, 0.0), wsum(I.NX, 0.0);
         for (const auto& s : I.scans) {
             const int R = s.traj.det_rows, C = s.traj.det_cols;
@@ -836,6 +837,34 @@ const std::vector<float>& SliceReconstructor::fan_of_columns() const { return im
 std::string SliceReconstructor::angle_interp() const { return impl_->views ? "views" : impl_->nearest ? "nearest" : "linear"; }
 std::string SliceReconstructor::z_interp() const {
     return z_kernel_name(impl_->z_kernel);
+}
+
+ChunkScan SliceReconstructor::Impl::chunk_geometry(std::size_t s, int lo, int hi, int m) {
+    ChunkScan c = prepare_chunk_scan(scans[s].traj, spans[s], scans[s].control_A, scans[s].flat_info,
+                                     lo, hi, m, n_grid, 0.2, full_context, !measured, rows_of_scans);
+    if (nearest && !views) {
+        for (int k = 0; k < c.p1 - c.p0; ++k) {
+            const int b = bins[s].bin[c.p0 + k] % n_grid;
+            c.j0[k] = b < 0 ? b + n_grid : b;
+            c.alpha[k] = 0.f;
+        }
+    }
+    return c;
+}
+
+std::vector<float> SliceReconstructor::nearest_view_angles(int lo, int hi) {
+    Impl& I = *impl_;
+    if (!I.nearest || I.views || lo < I.doable.first || hi > I.doable.second || hi <= lo)
+        throw Error("nearest_view_angles: expected nearest-bin gridding and reconstructable slices");
+    std::vector<ChunkScan> chunks(I.scans.size());
+    std::vector<ChunkScan*> scans;
+    for (std::size_t s = 0; s < chunks.size(); ++s) {
+        chunks[s] = I.chunk_geometry(s, lo, hi, I.margin);
+        scans.push_back(&chunks[s]);
+    }
+    I.chunk_rows = I.n_grid;
+    I.set_slice_angles(scans, hi - lo, I.margin);
+    return I.slice_fbp_angles;
 }
 
 // Angles of the chunk's slices under nearest-bin gridding: bin b of slice y is at (b + d) 2 pi / n_grid, d the mean
@@ -1403,19 +1432,10 @@ void SliceReconstructor::Impl::run(int h_lo, int h_hi, ChunkDebug* dbg, const st
     const int fm = measured_only ? -1 : filter_rows;   // (measured data: every step its own margin)
     std::vector<ScanChunk> chunks(I.scans.size());
     for (std::size_t s = 0; s < I.scans.size(); ++s) {
-        chunks[s].cs = prepare_chunk_scan(I.scans[s].traj, I.spans[s], I.scans[s].control_A, I.scans[s].flat_info,
-                                          h_lo, h_hi, m, NG, 0.2, I.full_context, !measured_only, I.rows_of_scans);
+        chunks[s].cs = I.chunk_geometry(s, h_lo, h_hi, m);
         chunks[s].win_rows = H + 1 + 2 * I.z_pad;
         chunks[s].win0 = window_rows(chunks[s].cs, I.z_pad);
         chunks[s].z_w = z_kernel_weights(chunks[s].cs.fract_v, I.z_kernel);
-        if (I.nearest && !I.views) {   // every projection whole in its bin
-            auto& c = chunks[s].cs;
-            for (int k = 0; k < c.p1 - c.p0; ++k) {
-                const int b = I.bins[s].bin[c.p0 + k] % NG;
-                c.j0[k] = b < 0 ? b + NG : b;
-                c.alpha[k] = 0.f;
-            }
-        }
         if (timing) {
             const double np = chunks[s].cs.p1 - chunks[s].cs.p0;
             dbg->stats["n_proj_" + std::to_string(s)] = np;

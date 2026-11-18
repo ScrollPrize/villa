@@ -63,3 +63,13 @@ def test_sparse_copy_holds_the_band_chunks_alone(tmp_path, monkeypatch):
     assert fetch_band._run_job(job, str(out), "esrf:x", str(tmp_path / "raw"), 0)["resumed"]
     assert not fetch_band._run_job(dict(job, id="other"), str(out), "esrf:" + str(tmp_path / "raw"),
                                    str(tmp_path / "raw"), 0)["resumed"]
+
+    several = dict(job, id="two bands", row_windows={"0": [[10, 20], [540, 545]]})
+    del several["frames"]
+    fetch_band._run_job(several, str(out), "esrf:" + str(tmp_path / "raw"), str(tmp_path / "raw"), 0)
+    sparse = _core.RawReader([str(copy)], "data", rows, cols, decoder="openjph")
+    for row in (10, 540):
+        args = (zero, zero, np.array([row], np.int32), 1)
+        np.testing.assert_array_equal(sparse.read_rows(*args), full.read_rows(*args))
+    with pytest.raises(Exception, match="blosc2"):
+        sparse.read_rows(zero, zero, np.array([300], np.int32), 1)

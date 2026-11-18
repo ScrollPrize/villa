@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstring>
 #include <filesystem>
+#include <limits>
 #include <optional>
 
 #include "common/interp_core.hpp"
@@ -97,12 +98,24 @@ const Json& member(const Json& j, const char* key) {
 // ---------------------------------------------------------------- the canvas
 
 struct MosaicCanvas::Impl {
-    explicit Impl(Device d) : G(d), W(d), ws(d), ww(d), gain(d), frac(d), pad(d), filt(d), up(d), img(d), first(d) {}
+    explicit Impl(Device d) : G(d), W(d), ws(d), ww(d), gain(d), frac(d), pad(d), filt(d), up(d), img(d), first(d), source_views(d), bin_lower(d), column_offsets(d), measured_bins(d), brackets(d), poses(d), fans(d), targets(d), opposite(d), discs(d), ordinary(d), regional_weights(d), regional_image(d) {}
     CanvasConfig cfg;
     std::vector<CanvasTile> tiles;
     int NG = 0, size = 0, half = 0, n = 0, stride = 0, n_slices = 0;
     Array<float> G, W, ws, ww, gain, frac, pad, filt, up, img;
     Array<std::int32_t> first;
+    Array<CanvasView> source_views;
+    Array<int> bin_lower;
+    Array<double> column_offsets, measured_bins;
+    Array<CanvasBracket> brackets;
+    Array<CanvasPose> poses;
+    Array<CanvasFan> fans;
+    Array<CanvasTarget> targets;
+    Array<CanvasOpposite> opposite;
+    Array<CanvasDisc> discs;
+    Array<float> ordinary, regional_weights, regional_image;
+    std::unique_ptr<FourierFilter> highpass;
+    bool measured() const { return cfg.rebin_angles && (cfg.rebin_kernel == "measured" || cfg.rebin_kernel == "exposure"); }
     RampGeometry rg, rg_half;
     std::unique_ptr<FourierFilter> ramp;
     BackprojectParams bp;
@@ -110,13 +123,19 @@ struct MosaicCanvas::Impl {
     std::vector<int> sub;            // the angles compared for the levels
     struct Kept {                    // of one tile in one slice, until the slice is made
         bool have = false;
+        std::vector<float> signal;   // aligned weighted rows retained for regional FBP
         std::vector<float> w;        // (NG, stride): its weights as placed (shifted)
+        std::vector<float> angles;   // original bin angles for the direct blend
         std::vector<float> sub_s;    // (sub, stride): value x weight as placed, of the angles compared
         std::vector<std::int32_t> first;
-        std::vector<float> angles;
     };
     struct Made {
         bool done = false;
+        int direction = 0;
+        double phase = 0;  // common angular origin in radians
+        int angle_sets = 0;
+        std::vector<double> mean_angles;
+        std::vector<CanvasOpposite> opposite;
         std::vector<double> levels;
         std::vector<float> angles;   // (NG / 2): the angle every folded row is backprojected at
         double spread = 0;
@@ -126,7 +145,13 @@ struct MosaicCanvas::Impl {
 
     float* slice_of(Array<float>& a, int y) { return a.data() + static_cast<std::size_t>(y) * NG * size; }
     std::vector<double> solve_levels(int y) const;
+    CanvasRebin plan_rebin(const CanvasTile& tile, const float* angles, Made& slice,
+                           const std::vector<int>& native_first, std::vector<int>& target_first);
+    void direct_angles(int y);
     void make(int y);
+    void filter(int y, float* sums, float* weights, Array<float>& filtered, CanvasDebug* debug);
+    void project(int y, SliceRoi region, const float* filtered, Array<float>& image);
+    void exposure_regions(int y, SliceRoi region);
 };
 
 MosaicCanvas::MosaicCanvas(CanvasConfig config, std::vector<CanvasTile> tiles) : impl_(std::make_unique<Impl>(config.device)) {
@@ -136,10 +161,21 @@ MosaicCanvas::MosaicCanvas(CanvasConfig config, std::vector<CanvasTile> tiles) :
     if (!(config.pixel_size_m > 0)) throw Error("mosaic canvas: no pixel size");
     if (config.bp_oversample < 1 || config.bp_oversample > 8) throw Error("bp_oversample must be 1..8");
     if (config.anchor < 0 || config.anchor >= static_cast<int>(tiles.size())) throw Error("mosaic canvas: the anchor is not one of the tiles");
+    if (config.rebin_kernel != "two_pass" && config.rebin_kernel != "linear" && config.rebin_kernel != "lanczos3" && config.rebin_kernel != "measured" && config.rebin_kernel != "exposure")
+        throw Error("mosaic canvas: rebin_kernel expects two_pass, linear, lanczos3, measured or exposure");
     I.n = tiles[0].cols;
     double reach = 0;
     for (const CanvasTile& t : tiles) {
+        if (!(std::isfinite(t.exposure_gate_rad) && t.exposure_gate_rad >= 0)) throw Error("mosaic canvas: invalid exposure gate");
         if (t.cols != I.n || t.cols < 2) throw Error("mosaic canvas: the tiles' rows must have one width");
+        if (!t.fan.empty() && (static_cast<int>(t.fan.size()) != I.n ||
+            !std::all_of(t.fan.begin(), t.fan.end(), [](float a) { return std::isfinite(a); }))) throw Error("mosaic canvas: invalid per-column fan");
+        if (config.rebin_angles && config.rebin_kernel != "two_pass") {
+            const double radius = std::hypot(t.ax, t.ay);
+            for (std::size_t c = 1; c < t.fan.size(); ++c)
+                if (radius * std::abs(static_cast<double>(t.fan[c]) - t.fan[c - 1]) >= 1)
+                    throw Error("mosaic canvas: column fan does not guarantee an invertible detector mapping");
+        }
         reach = std::max(reach, std::hypot(t.ax, t.ay) + std::max(t.rot_center, t.cols - 1 - t.rot_center));
     }
     I.cfg = std::move(config);
@@ -159,8 +195,14 @@ MosaicCanvas::MosaicCanvas(CanvasConfig config, std::vector<CanvasTile> tiles) :
     I.gain.put(gain.data(), gain.size());
     // one ramp over rows as wide as the canvas, the axis at their middle; half the turn is backprojected
     I.rg = ramp_geometry(I.size, I.NG, static_cast<float>(I.half), 1, false);
-    I.rg_half = ramp_geometry(I.size, I.NG / 2, static_cast<float>(I.half), 1, false);
+    I.rg_half = I.rg;
+    I.rg_half.n_proj = I.NG / 2;
     I.ramp = make_fourier_filter(I.cfg.device, ramp_filter_spec(I.rg, ramp_scale(I.NG, false), I.cfg.ramp_filter_name, I.cfg.ramp_filter_par));
+    if (I.cfg.rebin_angles && I.cfg.rebin_kernel == "exposure" && I.tiles.size() > 1 &&
+        std::all_of(I.tiles.begin(), I.tiles.end(), [](const CanvasTile& t) { return t.exposure_gate_rad > 0; })) {
+        if (!(I.cfg.exposure_fade > 0)) throw Error("mosaic canvas: expected a positive regional taper");
+        I.highpass = make_fourier_filter(I.cfg.device, band_filter_spec(1, 1, I.size, .04, .10));
+    }
     I.bp.rot_center = static_cast<float>(I.half);
     I.bp.center = static_cast<float>(I.half);
     I.bp.scale = static_cast<float>(1.0 / (I.cfg.pixel_size_m * 1e2));
@@ -173,6 +215,7 @@ MosaicCanvas::MosaicCanvas(CanvasConfig config, std::vector<CanvasTile> tiles) :
 
 MosaicCanvas::~MosaicCanvas() = default;
 int MosaicCanvas::size() const { return impl_->size; }
+bool MosaicCanvas::exposure_weighted() const { return bool(impl_->highpass); }
 int MosaicCanvas::half() const { return impl_->half; }
 const CanvasConfig& MosaicCanvas::config() const { return impl_->cfg; }
 
@@ -187,53 +230,195 @@ void MosaicCanvas::begin(int n_slices) {
     I.made.assign(static_cast<std::size_t>(n_slices), Impl::Made{});
 }
 
+void MosaicCanvas::add_view_angles(int y, const float* angles) {
+    Impl& I = *impl_;
+    if (!I.measured() || y < 0 || y >= I.n_slices) throw Error("mosaic: expected a measured-mode slice");
+    auto& m = I.made[y];
+    if (m.direction || m.done) throw Error("mosaic: supply target angles before adding rows");
+    for (int r = 0; r < I.NG; ++r)
+        if (!std::isfinite(angles[r])) throw Error("mosaic: nonfinite target angle");
+    m.mean_angles.resize(I.NG);
+    ++m.angle_sets;
+    for (int r = 0; r < I.NG; ++r) {
+        double& a = m.mean_angles[r];
+        a = m.angle_sets == 1 ? angles[r] : a + std::remainder(angles[r] - a, 2 * M_PI) / m.angle_sets;
+    }
+}
+
+CanvasRebin MosaicCanvas::Impl::plan_rebin(const CanvasTile& t, const float* angles, Made& slice,
+                                          const std::vector<int>& native_first, std::vector<int>& target_first) {
+    // A uniform physical grid shared by every tile. Work in bin units for
+    // the periodic angular lookup. The second half is exactly conjugate.
+    const bool native = this->measured();
+    if (native && slice.mean_angles.empty()) slice.mean_angles.assign(angles, angles + NG);
+    if (!slice.direction) {
+        double travel = 0;
+        for (int r = 1; r < NG; ++r)
+            travel += std::remainder(static_cast<double>(angles[r]) - angles[r - 1], 2 * M_PI);
+        if (NG == 2) travel = static_cast<double>(angles[1]) - angles[0];
+        slice.direction = travel >= 0 ? 1 : -1;
+        // Minimize the angular displacement of the first tile's views to the
+        // uniform grid. Unwrap residuals against its first bin, including
+        // acquisitions whose mean phase straddles the half-bin boundary.
+        const double bin_width = slice.direction * 2 * M_PI / NG;
+        double residual = 0;
+        for (int r = 0; r < NG; ++r)
+            residual += std::remainder((angles[r] - static_cast<double>(angles[0])) / bin_width - r, static_cast<double>(NG));
+        slice.phase = angles[0] + bin_width * residual / NG;
+    }
+    const double step = slice.direction * 2 * M_PI / NG;
+    const auto wrap = [this](double bin) {
+        double v = std::fmod(bin, static_cast<double>(NG));
+        if (v < 0) v += NG;
+        return v < NG ? v : 0.0;
+    };
+    const auto bin_of = [&](double a, int r) {
+        return a == static_cast<float>(slice.phase + r * step) ? double(r) : wrap((a - slice.phase) / step);
+    };
+    std::vector<double> measured(NG);
+    std::vector<CanvasView> views(NG + 2);
+    for (int r = 0; r < NG; ++r) {
+        const double bin = bin_of(angles[r], r);
+        measured[r] = bin;
+        views[r + 1] = {bin, r};
+        slice.spread = std::max(slice.spread, std::fabs(std::remainder(bin - (native ? bin_of(slice.mean_angles[r], r) : r), static_cast<double>(NG))));
+    }
+    std::sort(views.begin() + 1, views.end() - 1, [](CanvasView a, CanvasView b) {
+        return a.bin < b.bin || (a.bin == b.bin && a.row < b.row);
+    });
+    views.front() = {views[NG].bin - NG, views[NG].row};
+    views.back() = {views[1].bin + NG, views[1].row};
+    std::vector<int> lower(NG);
+    int k = 0;
+    for (int r = 0; r < NG; ++r) {
+        while (views[k + 1].bin <= r) ++k;
+        lower[r] = k;
+    }
+    CanvasRebin grid{};
+    const bool gather = cfg.rebin_kernel != "two_pass";
+    if (gather || !t.fan.empty()) {
+        source_views.put(views.data(), views.size());
+        bin_lower.put(lower.data(), lower.size());
+    }
+    if (!gather && !t.fan.empty()) {
+        measured_bins.put(measured.data(), measured.size());
+        std::vector<double> fan_bins(t.fan.size());
+        std::transform(t.fan.begin(), t.fan.end(), fan_bins.begin(), [&](float fan) { return wrap(fan / step); });
+        column_offsets.put(fan_bins.data(), fan_bins.size());
+        grid = {source_views.data(), bin_lower.data(), column_offsets.data(), measured_bins.data()};
+    }
+
+    std::vector<CanvasTarget> target(gather ? NG : 0);
+    for (int r = 0; r < NG; ++r) {
+        const double a = native ? slice.mean_angles[r] : slice.phase + r * step;
+        const double origin = half - t.rot_center + t.ax * std::cos(a) + t.ay * std::sin(a);
+        target_first[r] = static_cast<int>(std::floor(origin));
+        if (gather) target[r] = {target_first[r], origin - target_first[r], native ? bin_of(a, r) : double(r)};
+    }
+    if (gather) {
+        std::vector<CanvasPose> source(NG);
+        for (int r = 0; r < NG; ++r) {
+            const double cs = std::cos(static_cast<double>(angles[r])), sn = std::sin(static_cast<double>(angles[r]));
+            const double projection = t.ax * cs + t.ay * sn;
+            source[r] = {native_first[r], half - t.rot_center + projection - native_first[r],
+                         projection, -t.ax * sn + t.ay * cs};
+        }
+        std::vector<CanvasFan> columns;
+        columns.reserve(t.fan.size());
+        for (double angle : t.fan)
+            columns.push_back({angle / step, std::cos(angle) - 1, std::sin(angle)});
+        poses.put(source.data(), NG);
+        targets.put(target.data(), NG);
+        fans.put(columns.data(), columns.size());
+        return grid;
+    }
+    std::vector<CanvasBracket> br(NG);
+    for (int r = 0; r < NG; ++r) {
+        const CanvasView lo = views[lower[r]], hi = views[lower[r] + 1];
+        br[r] = {lo.row, hi.row, target_first[r] - native_first[lo.row], target_first[r] - native_first[hi.row],
+                 static_cast<float>((r - lo.bin) / (hi.bin - lo.bin))};
+    }
+    brackets.put(br.data(), br.size());
+    return grid;
+}
+
 void MosaicCanvas::add(int tile, int y, const float* rows, const float* weights, const float* angles) {
     Impl& I = *impl_;
     if (tile < 0 || tile >= static_cast<int>(I.tiles.size()) || y < 0 || y >= I.n_slices) throw Error("mosaic canvas: no such tile or slice");
+    if (I.made[static_cast<std::size_t>(y)].done) throw Error("mosaic canvas: the slice is made; nothing more is added to it");
     Impl::Kept& K = I.kept[static_cast<std::size_t>(y)][static_cast<std::size_t>(tile)];
     if (K.have) throw Error("mosaic canvas: a tile's rows of a slice are added once");
-    if (I.made[static_cast<std::size_t>(y)].done) throw Error("mosaic canvas: the slice is made; nothing more is added to it");
     const CanvasTile& t = I.tiles[static_cast<std::size_t>(tile)];
     const int NG = I.NG, n = I.n, stride = I.stride;
     // where the tile's column 0 falls on the canvas at every row's angle: whole columns, and the fraction its rows are delayed by
     K.first.resize(static_cast<std::size_t>(NG));
-    K.angles.assign(angles, angles + NG);
-    std::vector<float> frac(static_cast<std::size_t>(NG));
+    std::vector<float> frac(NG);
     for (int r = 0; r < NG; ++r) {
-        const double a = angles[r], s = I.half - t.rot_center + t.ax * std::cos(a) + t.ay * std::sin(a), f = std::floor(s);
-        K.first[static_cast<std::size_t>(r)] = static_cast<std::int32_t>(f);
-        frac[static_cast<std::size_t>(r)] = static_cast<float>(s - f);
+        if (!std::isfinite(angles[r])) throw Error("mosaic canvas: nonfinite view angle");
+        const double x = I.half - t.rot_center + t.ax * std::cos(static_cast<double>(angles[r])) + t.ay * std::sin(static_cast<double>(angles[r]));
+        K.first[r] = static_cast<int>(std::floor(x));
+        frac[r] = static_cast<float>(x - K.first[r]);
     }
+    CanvasRebin grid{};
+    if (I.cfg.rebin_angles) {
+        const std::vector<int> native_first = K.first;
+        grid = I.plan_rebin(t, angles, I.made[y], native_first, K.first);
+    } else K.angles.assign(angles, angles + NG);
     I.first.put(K.first.data(), K.first.size());
     I.frac.put(frac.data(), frac.size());
     const std::size_t rown = static_cast<std::size_t>(NG) * stride;
     I.ws.ensure(rown);
     I.ww.ensure(rown);
+    // Reuse the ramp's scratch for the native rows during angular rebinning.
+    // The direct blend writes straight to the buffers consumed by place_rows.
+    float* native_s = I.ws.data();
+    float* native_w = I.ww.data();
+    if (I.cfg.rebin_angles) {
+        I.pad.ensure(rown);
+        I.filt.ensure(rown);
+        native_s = I.pad.data();
+        native_w = I.filt.data();
+    }
+    const bool gather = I.cfg.rebin_angles && I.cfg.rebin_kernel != "two_pass";
+    const CanvasGather rays{I.source_views.data(), I.bin_lower.data(), I.poses.data(), t.fan.empty() ? nullptr : I.fans.data(),
+                            I.targets.data(), I.cfg.rebin_kernel == "lanczos3" || I.measured()};
     float* G = I.slice_of(I.G, y);
     float* W = I.slice_of(I.W, y);
 #ifdef VC_TOMOGRAPHY_WITH_CUDA
     if (I.cfg.device == Device::CUDA) {
-        cuda::tile_rows(rows, weights, I.gain.data(), NG, n, stride, I.ws.data(), I.ww.data());
-        cuda::shift_rows(I.ws.data(), NG, n, 0.f, nullptr, I.frac.data());
-        cuda::shift_rows(I.ww.data(), NG, n, 0.f, nullptr, I.frac.data());
+        if (grid.fan) cuda::rebin_tile_rows(grid, rows, weights, I.gain.data(), NG, n, stride, native_s, native_w);
+        else cuda::tile_rows(rows, weights, I.gain.data(), NG, n, stride, native_s, native_w);
+        cuda::shift_rows(native_s, NG, n, 0.f, nullptr, I.frac.data());
+        cuda::shift_rows(native_w, NG, n, 0.f, nullptr, I.frac.data());
+        if (gather) cuda::gather_rows(rays, native_s, native_w, NG, n, stride, I.ws.data(), I.ww.data());
+        else if (I.cfg.rebin_angles) cuda::rebin_placed_rows(I.brackets.data(), native_s, native_w, NG, n, stride, I.ws.data(), I.ww.data());
         cuda::place_rows(I.ws.data(), I.first.data(), 1.f, false, NG, n, stride, G, I.size);
         cuda::place_rows(I.ww.data(), I.first.data(), 1.f, true, NG, n, stride, W, I.size);
     } else
 #endif
     {
-        cpu::tile_rows(rows, weights, I.gain.data(), NG, n, stride, I.ws.data(), I.ww.data());
-        cpu::shift_rows(I.ws.data(), NG, n, 0.f, I.frac.data());
-        cpu::shift_rows(I.ww.data(), NG, n, 0.f, I.frac.data());
+        if (grid.fan) cpu::rebin_tile_rows(grid, rows, weights, I.gain.data(), NG, n, stride, native_s, native_w);
+        else cpu::tile_rows(rows, weights, I.gain.data(), NG, n, stride, native_s, native_w);
+        cpu::shift_rows(native_s, NG, n, 0.f, I.frac.data());
+        cpu::shift_rows(native_w, NG, n, 0.f, I.frac.data());
+        if (gather) cpu::gather_rows(rays, native_s, native_w, NG, n, stride, I.ws.data(), I.ww.data());
+        else if (I.cfg.rebin_angles) cpu::rebin_placed_rows(I.brackets.data(), native_s, native_w, NG, n, stride, I.ws.data(), I.ww.data());
         cpu::place_rows(I.ws.data(), I.first.data(), 1.f, false, NG, n, stride, G, I.size);
         cpu::place_rows(I.ww.data(), I.first.data(), 1.f, true, NG, n, stride, W, I.size);
     }
     // kept on the host until the slice is made: the weights as placed (a level is added through them, and the
     // angles are averaged by them), and of the angles compared the values
-    K.w.resize(rown);
-    I.ww.get(K.w.data(), rown);
-    if (I.cfg.levels && I.tiles.size() > 1) {
+    if (I.highpass || !I.cfg.rebin_angles || (I.cfg.levels && I.tiles.size() > 1)) {
+        K.w.resize(rown);
+        I.ww.get(K.w.data(), rown);
+    }
+    if (!I.highpass && I.cfg.levels && I.tiles.size() > 1) {
         K.sub_s.resize(I.sub.size() * static_cast<std::size_t>(stride));
         for (std::size_t q = 0; q < I.sub.size(); ++q) I.ws.get(K.sub_s.data() + q * stride, static_cast<std::size_t>(stride), static_cast<std::size_t>(I.sub[q]) * stride);
+    }
+    if (I.highpass) {
+        K.signal.resize(rown);
+        I.ws.get(K.signal.data(), rown);
     }
     K.have = true;
 }
@@ -263,7 +448,10 @@ std::vector<double> MosaicCanvas::Impl::solve_levels(int y) const {
             const std::size_t g = static_cast<std::size_t>(sub[q]);
             const int fa = A.first[g], fb = B.first[g], lo = std::max(fa, fb), hi = std::min(fa, fb) + n;
             if (hi - lo < kLeast) continue;
-            const float *wa = A.w.data() + g * stride, *wb = B.w.data() + g * stride, *sa = A.sub_s.data() + q * stride, *sb = B.sub_s.data() + q * stride;
+            const std::size_t row = g * stride;
+            const float *wa = A.w.data() + row, *wb = B.w.data() + row;
+            const float* sa = highpass ? A.signal.data() + row : A.sub_s.data() + q * stride;
+            const float* sb = highpass ? B.signal.data() + row : B.sub_s.data() + q * stride;
             double num = 0, den = 0;
             int m = 0;
             for (int c = lo; c < hi; ++c) {
@@ -295,29 +483,10 @@ std::vector<double> MosaicCanvas::Impl::solve_levels(int y) const {
     return levels;
 }
 
-// The slice's sinogram as it is filtered: the tiles' levels added, the angle of every row, the two halves of the
-// turn folded, the sums divided, what no tile recorded mended.
-void MosaicCanvas::Impl::make(int y) {
-    Made& M = made[static_cast<std::size_t>(y)];
-    std::vector<Kept>& K = kept[static_cast<std::size_t>(y)];
-    const std::size_t T = tiles.size(), rown = static_cast<std::size_t>(NG) * stride, all = static_cast<std::size_t>(NG) * size;
-    float* Gy = slice_of(G, y);
-    float* Wy = slice_of(W, y);
-    M.levels.assign(T, 0.0);
-    if (cfg.levels && T > 1) {
-        M.levels = solve_levels(y);
-        for (std::size_t k = 0; k < T; ++k) {
-            if (!K[k].have || M.levels[k] == 0.0) continue;
-            ww.put(K[k].w.data(), rown);
-            first.put(K[k].first.data(), K[k].first.size());
-            const float level = static_cast<float>(M.levels[k]);
-#ifdef VC_TOMOGRAPHY_WITH_CUDA
-            if (cfg.device == Device::CUDA) cuda::place_rows(ww.data(), first.data(), level, true, NG, n, stride, Gy, size);
-            else
-#endif
-                cpu::place_rows(ww.data(), first.data(), level, true, NG, n, stride, Gy, size);
-        }
-    }
+void MosaicCanvas::Impl::direct_angles(int y) {
+    Made& M = made[y];
+    const auto& K = kept[y];
+    const std::size_t T = tiles.size();
     // the angle of every row: the tiles' by the weight each has in the row; then of the two rows folded onto each other
     std::vector<double> sum_w(static_cast<std::size_t>(NG), 0.0), sum_a(static_cast<std::size_t>(NG), 0.0);
     std::vector<std::vector<double>> row_w(T);
@@ -357,6 +526,82 @@ void MosaicCanvas::Impl::make(int y) {
             M.spread = std::max(M.spread, std::fabs(mine - M.angles[static_cast<std::size_t>(r % H)]) / step);
         }
     }
+}
+
+static std::vector<CanvasOpposite> opposite_plan(const std::vector<double>& angles, int direction) {
+    const int n = static_cast<int>(angles.size());
+    const double step = direction * 2 * M_PI / n;
+    std::vector<CanvasView> views(n);
+    for (int r = 0; r < n; ++r) {
+        double bin = std::fmod((angles[r] - angles[0]) / step, double(n));
+        if (bin < 0) bin += n;
+        views[r] = {bin, r};
+    }
+    std::sort(views.begin(), views.end(), [](CanvasView a, CanvasView b) { return a.bin < b.bin; });
+    const auto at = [&](int i) {
+        // The six-tap stencil may wrap more than once for very short turns.
+        const int idx = (i % n + n) % n;
+        return CanvasView{views[idx].bin + i - idx, views[idx].row};
+    };
+    std::vector<CanvasOpposite> plan(n);
+    for (int i = 0; i < n; ++i) {
+        auto& p = plan[views[i].row];
+        // Periodic trapezoidal weight, including 1/2 for full-turn redundancy.
+        p.quadrature = static_cast<float>(0.25 * (at(i + 1).bin - at(i - 1).bin));
+        const double mirror = std::fmod(views[i].bin + 0.5 * n, double(n));
+        const int lo = static_cast<int>(std::upper_bound(views.begin(), views.end(), mirror,
+            [](double b, CanvasView v) { return b < v.bin; }) - views.begin()) - 1;
+        const double t = (mirror - at(lo).bin) / (at(lo + 1).bin - at(lo).bin);
+        p.fraction = static_cast<float>(t);
+        p.lanczos = n >= 6 && p.fraction > 0 && p.fraction < 1;
+        float norm = 0;
+        for (int j = 0; j < 6; ++j) {
+            const int k = lo + j - 2;
+            const double gap = at(k).bin - at(k - 1).bin;
+            if (j && (gap <= 0 || gap > 1.5)) p.lanczos = false;
+            p.row[j] = at(k).row;
+            p.coefficient[j] = interp_core::lanczos3(j - 2 - p.fraction);
+            norm += p.coefficient[j];
+        }
+        for (float& coefficient : p.coefficient) coefficient /= norm;
+    }
+    return plan;
+}
+
+void MosaicCanvas::Impl::make(int y) {
+    Made& M = made[static_cast<std::size_t>(y)];
+    std::vector<Kept>& K = kept[static_cast<std::size_t>(y)];
+    const std::size_t T = tiles.size(), rown = static_cast<std::size_t>(NG) * stride, all = static_cast<std::size_t>(NG) * size;
+    float* Gy = slice_of(G, y);
+    float* Wy = slice_of(W, y);
+    M.levels.assign(T, 0.0);
+    if (cfg.levels && T > 1) {
+        M.levels = solve_levels(y);
+        for (std::size_t k = 0; k < T; ++k) {
+            if (!K[k].have || M.levels[k] == 0.0) continue;
+            ww.put(K[k].w.data(), rown);
+            first.put(K[k].first.data(), K[k].first.size());
+            const float level = static_cast<float>(M.levels[k]);
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
+            if (cfg.device == Device::CUDA) cuda::place_rows(ww.data(), first.data(), level, true, NG, n, stride, Gy, size);
+            else
+#endif
+                cpu::place_rows(ww.data(), first.data(), level, true, NG, n, stride, Gy, size);
+        }
+    }
+    if (measured()) {
+        if (!M.direction) throw Error("mosaic canvas: a slice no tile was added to");
+        M.angles.assign(M.mean_angles.begin(), M.mean_angles.end());
+        M.opposite = opposite_plan(M.mean_angles, M.direction);
+        if (!highpass) K.clear();
+        M.done = true;
+        return;
+    }
+    if (cfg.rebin_angles) {
+        if (!M.direction) throw Error("mosaic canvas: a slice no tile was added to");
+        M.angles.resize(NG / 2);
+        for (int r = 0; r < NG / 2; ++r) M.angles[r] = static_cast<float>(M.phase + r * (M.direction * 2 * M_PI / NG));
+    } else direct_angles(y);
     K.clear();
     K.shrink_to_fit();
 #ifdef VC_TOMOGRAPHY_WITH_CUDA
@@ -376,70 +621,197 @@ void MosaicCanvas::Impl::make(int y) {
     M.done = true;
 }
 
+// Complete and ramp-filter one set of full-width weighted rays. The regional
+// sums may occupy pad: completion consumes them before ramp padding reuses it.
+void MosaicCanvas::Impl::filter(int y, float* Gy, float* Wy, Array<float>& filtered, CanvasDebug* debug) {
+    const Made& M = made[y];
+    const int bp_views = static_cast<int>(M.angles.size()), os = cfg.bp_oversample;
+    const std::size_t all = static_cast<std::size_t>(NG) * size, bp_samples = static_cast<std::size_t>(bp_views) * size;
+    pad.ensure(static_cast<std::size_t>(NG) * rg.npad);
+    filtered.ensure(bp_samples);
+    up.ensure(bp_samples * os);
+    if (measured()) {
+        opposite.put(M.opposite.data(), NG);
+        float* completed = filtered.data();
+        float* support = up.data();
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
+        if (cfg.device == Device::CUDA) {
+            cuda::complete_views(opposite.data(), Gy, Wy, NG, size, completed, support);
+            if (cfg.mend_threshold > 0) cuda::mend_null_weights(completed, support, NG, 1, size, cfg.mend_threshold, 0, size);
+        } else
+#endif
+        {
+            cpu::complete_views(opposite.data(), Gy, Wy, NG, size, completed, support);
+            if (cfg.mend_threshold > 0) cpu::mend_null_weights(completed, support, NG, 1, size, cfg.mend_threshold, 0, size);
+        }
+    }
+    if (debug) {
+        debug->sino.resize(all), debug->weights.resize(all);
+        W.get(debug->weights.data(), all, static_cast<std::size_t>(y) * all);
+        if (measured()) {
+            up.get(debug->sino.data(), all);
+            std::size_t supported = 0, borrowed = 0;
+            for (std::size_t i = 0; i < all; ++i) {
+                if (debug->sino[i] <= cfg.mend_threshold) continue;
+                ++supported;
+                if (debug->weights[i] <= cfg.mend_threshold) ++borrowed;
+            }
+            debug->opposite_only_fraction = supported ? double(borrowed) / supported : 0;
+            debug->weights.swap(debug->sino);
+            filtered.get(debug->sino.data(), all);
+        } else G.get(debug->sino.data(), all, static_cast<std::size_t>(y) * all);
+        debug->angles = M.angles;
+    }
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
+    if (cfg.device == Device::CUDA) {
+        if (measured()) cuda::pad_measured(opposite.data(), filtered.data(), NG, size, rg.npad, rg.switch_pos, pad.data());
+        else cuda::ramp_pad(Gy, pad.data(), rg);
+        ramp->apply(pad.data(), pad.data(), bp_views);
+        cuda::ramp_crop(pad.data(), filtered.data(), measured() ? rg : rg_half);
+    } else
+#endif
+    {
+        if (measured()) cpu::pad_measured(opposite.data(), filtered.data(), NG, size, rg.npad, rg.switch_pos, pad.data());
+        else cpu::ramp_pad(Gy, pad.data(), rg);
+        ramp->apply(pad.data(), pad.data(), bp_views);
+        cpu::ramp_crop(pad.data(), filtered.data(), measured() ? rg : rg_half);
+    }
+    if (debug) {
+        debug->filtered.resize(bp_samples);
+        filtered.get(debug->filtered.data(), bp_samples);
+    }
+}
+
+void MosaicCanvas::Impl::project(int y, SliceRoi R, const float* filtered, Array<float>& image) {
+    const Made& M = made[y];
+    const int bp_views = static_cast<int>(M.angles.size()), os = cfg.bp_oversample;
+    const int ny = R.y1 - R.y0, nx = R.x1 - R.x0;
+    image.ensure(static_cast<std::size_t>(ny) * nx);
+    BackprojectParams bp = this->bp;
+    bp.x0 = R.x0, bp.y0 = R.y0;
+    const float* rows = nullptr;
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
+    if (cfg.device == Device::CUDA) {
+        rows = filtered;
+        if (os > 1) {
+            cuda::upsample_rows(filtered, up.data(), bp_views, size, os);
+            rows = up.data();
+        }
+        if (degree) {
+            cuda::bspline_prefilter(rows, up.data(), bp_views, size * os, degree);
+            rows = up.data();
+        }
+        cuda::backproject(rows, M.angles.data(), image.data(), bp_views, size * os, ny, nx, bp);
+    } else
+#endif
+    {
+        rows = filtered;
+        if (os > 1) {
+            cpu::upsample_rows(filtered, up.data(), bp_views, size, os);
+            rows = up.data();
+        }
+        if (degree) {
+            cpu::bspline_prefilter(rows, up.data(), bp_views, size * os, degree);
+            rows = up.data();
+        }
+        cpu::backproject(rows, M.angles.data(), image.data(), bp_views, size * os, ny, nx, bp);
+    }
+}
+
+void MosaicCanvas::Impl::exposure_regions(int y, SliceRoi output) {
+    const Made& M = made[y];
+    const auto& aligned = kept[y];
+    std::vector<CanvasDisc> footprints;
+    std::vector<std::size_t> focuses;
+    std::vector<SliceRoi> regions;
+    for (std::size_t k = 0; k < tiles.size(); ++k) {
+        if (!aligned[k].have) continue;
+        const auto& t = tiles[k];
+        const double radius = std::max(t.rot_center, t.cols - 1 - t.rot_center);
+        const double x = half + t.ax, y0 = half + t.ay;
+        const double dx = std::clamp(x, double(output.x0), double(output.x1 - 1)) - x;
+        const double dy = std::clamp(y0, double(output.y0), double(output.y1 - 1)) - y0;
+        if (dx * dx + dy * dy >= radius * radius) continue;
+        focuses.push_back(k);
+        footprints.push_back({x, y0, radius, std::min(radius, cfg.exposure_fade)});
+        regions.push_back({std::max(output.x0, int(std::ceil(x - radius))), std::min(output.x1, int(std::floor(x + radius)) + 1),
+                           std::max(output.y0, int(std::ceil(y0 - radius))), std::min(output.y1, int(std::floor(y0 + radius)) + 1)});
+    }
+    if (focuses.empty()) return;
+    discs.put(footprints.data(), footprints.size());
+    const auto blend = [&](int focus, SliceRoi region, const float* image) {
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
+        if (cfg.device == Device::CUDA)
+            cuda::blend_region(discs.data(), footprints.size(), focus, region, output, image, img.data());
+        else
+#endif
+            cpu::blend_region(discs.data(), footprints.size(), focus, region, output, image, img.data());
+    };
+    blend(-1, output, nullptr);
+    const std::size_t samples = std::size_t(NG) * size;
+    std::vector<double> sine(NG), cosine(NG);
+    std::vector<float> quality(NG);
+    for (int r = 0; r < NG; ++r) {
+        sine[r] = std::sin(M.mean_angles[r]);
+        cosine[r] = std::cos(M.mean_angles[r]);
+    }
+    for (std::size_t i = 0; i < focuses.size(); ++i) {
+        const auto& center = tiles[focuses[i]];
+        pad.zero(samples);
+        regional_weights.zero(samples);
+        for (std::size_t k = 0; k < tiles.size(); ++k) {
+            const Kept& K = aligned[k];
+            if (!K.have) continue;
+            const auto& t = tiles[k];
+            for (int r = 0; r < NG; ++r) {
+                const double travel = t.exposure_gate_rad * ((center.ax - t.ax) * sine[r] - (center.ay - t.ay) * cosine[r]);
+                const double q = travel * 0.5;
+                quality[r] = float(.01 + .99 / (1. + q * q * q * q));
+            }
+            const float level = static_cast<float>(M.levels[k]);
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
+            if (cfg.device == Device::CUDA) {
+                frac.put(quality.data(), NG);
+                first.put(K.first.data(), NG);
+                ws.put(K.signal.data(), K.signal.size());
+                ww.put(K.w.data(), K.w.size());
+                cuda::place_exposure(ws.data(), ww.data(), first.data(), frac.data(), level, NG, n, stride, pad.data(), regional_weights.data(), size);
+            } else
+#endif
+                cpu::place_exposure(K.signal.data(), K.w.data(), K.first.data(), quality.data(), level, NG, n, stride, pad.data(), regional_weights.data(), size);
+        }
+        filter(y, pad.data(), regional_weights.data(), filt, nullptr);
+        const auto add = [&](float scale) {
+#ifdef VC_TOMOGRAPHY_WITH_CUDA
+            if (cfg.device == Device::CUDA) cuda::add_scaled(filt.data(), ordinary.data(), scale, samples);
+            else
+#endif
+                cpu::add_scaled(filt.data(), ordinary.data(), scale, samples);
+        };
+        add(-1.f);
+        for (int r = 0; r < NG; r += 64) {
+            float* rows = filt.data() + std::size_t(r) * size;
+            highpass->apply(rows, rows, std::min(64, NG - r));
+        }
+        add(1.f);
+        project(y, regions[i], filt.data(), regional_image);
+        blend(int(i), regions[i], regional_image.data());
+    }
+}
+
 void MosaicCanvas::slice(int y, float* out, const SliceRoi* roi, CanvasDebug* debug) {
     Impl& I = *impl_;
     if (y < 0 || y >= I.n_slices) throw Error("mosaic canvas: no such slice");
     if (!I.made[static_cast<std::size_t>(y)].done) I.make(y);
-    const Impl::Made& M = I.made[static_cast<std::size_t>(y)];
-    const int NG = I.NG, H = NG / 2, size = I.size, os = I.cfg.bp_oversample;
+    const int size = I.size;
     const SliceRoi whole{0, size, 0, size};
     const SliceRoi R = roi ? *roi : whole;
     if (!(0 <= R.x0 && R.x0 < R.x1 && R.x1 <= size && 0 <= R.y0 && R.y0 < R.y1 && R.y1 <= size)) throw Error("mosaic canvas: the region is not inside the canvas");
     const int ny = R.y1 - R.y0, nx = R.x1 - R.x0;
-    const std::size_t all = static_cast<std::size_t>(NG) * size, half_rows = static_cast<std::size_t>(H) * size;
-    float* Gy = I.slice_of(I.G, y);
-    if (debug) {
-        debug->sino.resize(all), debug->weights.resize(all);
-        I.G.get(debug->sino.data(), all, static_cast<std::size_t>(y) * all);
-        I.W.get(debug->weights.data(), all, static_cast<std::size_t>(y) * all);
-        debug->angles = M.angles;
-    }
-    // every row is whole and the turn's second half repeats its first (mirrored): the rows of the whole turn are
-    // padded (each from its opposite row, as any sinogram's: sino.hpp), the first half filtered and backprojected,
-    // each row standing for itself and for its opposite
-    I.pad.ensure(static_cast<std::size_t>(NG) * I.rg.npad);
-    I.filt.ensure(half_rows);
-    I.up.ensure(half_rows * os);
-    I.img.ensure(static_cast<std::size_t>(ny) * nx);
-    BackprojectParams bp = I.bp;
-    bp.x0 = R.x0, bp.y0 = R.y0;
-    const float* rows = nullptr;
-#ifdef VC_TOMOGRAPHY_WITH_CUDA
-    if (I.cfg.device == Device::CUDA) {
-        cuda::ramp_pad(Gy, I.pad.data(), I.rg);
-        I.ramp->apply(I.pad.data(), I.pad.data(), H);
-        cuda::ramp_crop(I.pad.data(), I.filt.data(), I.rg_half);
-        rows = I.filt.data();
-        if (os > 1) {
-            cuda::upsample_rows(I.filt.data(), I.up.data(), H, size, os);
-            rows = I.up.data();
-        }
-        if (I.degree) {
-            cuda::bspline_prefilter(rows, I.up.data(), H, size * os, I.degree);
-            rows = I.up.data();
-        }
-        cuda::backproject(rows, M.angles.data(), I.img.data(), H, size * os, ny, nx, bp);
-    } else
-#endif
-    {
-        cpu::ramp_pad(Gy, I.pad.data(), I.rg);
-        I.ramp->apply(I.pad.data(), I.pad.data(), H);
-        cpu::ramp_crop(I.pad.data(), I.filt.data(), I.rg_half);
-        rows = I.filt.data();
-        if (os > 1) {
-            cpu::upsample_rows(I.filt.data(), I.up.data(), H, size, os);
-            rows = I.up.data();
-        }
-        if (I.degree) {
-            cpu::bspline_prefilter(rows, I.up.data(), H, size * os, I.degree);
-            rows = I.up.data();
-        }
-        cpu::backproject(rows, M.angles.data(), I.img.data(), H, size * os, ny, nx, bp);
-    }
-    if (debug) {
-        debug->filtered.resize(half_rows);
-        I.filt.get(debug->filtered.data(), half_rows);
-    }
+    auto& baseline = I.highpass ? I.ordinary : I.filt;
+    I.filter(y, I.slice_of(I.G, y), I.slice_of(I.W, y), baseline, debug);
+    I.project(y, R, baseline.data(), I.img);
+    if (I.highpass) I.exposure_regions(y, R);
     I.img.get(out, static_cast<std::size_t>(ny) * nx);
     // nothing is reconstructed outside the tiles' discs (from each axis to the far end of its rows)
 #pragma omp parallel for schedule(static)
@@ -483,6 +855,8 @@ class Collector : public ExternalBackprojector {
   public:
     MosaicCanvas* canvas = nullptr;
     int tile = 0, h_lo = 0, n_angles = 0, cols = 0;
+    bool rebin_angles = false;
+    bool uses_column_fan() const override { return rebin_angles; }
     bool filtered() const override { return false; }
     bool measured_only() const override { return true; }
     void slice(int view_height, const float* rows, const float* weights, int n_angles_, int n_det, const float* angles, const BackprojectParams&, int, const SliceRoi& roi,
@@ -543,6 +917,7 @@ MosaicReconstruction::MosaicReconstruction(const std::string& projections, const
     Impl& I = *impl_;
     namespace fs = std::filesystem;
     I.options = std::move(options);
+    I.collector->rebin_angles = I.options.rebin_angles;
     I.geometry = geometry_text;
     if (I.options.reduce < 0 || I.options.reduce > 3) throw Error("mosaic: reduce is 0, 1, 2 or 3");
     I.factor = 1 << I.options.reduce;
@@ -626,7 +1001,17 @@ MosaicReconstruction::MosaicReconstruction(const std::string& projections, const
         if (t.reconstructor->n_grid() != I.n_angles || t.reconstructor->merged_width() != I.cols)
             throw Error("mosaic: tile " + p.name + " has other angles or columns than the anchor");
         I.doable = k == 0 ? p.doable : std::make_pair(std::max(I.doable.first, p.doable.first), std::min(I.doable.second, p.doable.second));
-        on_canvas.push_back(CanvasTile{p.rot_center, p.ax, p.ay, I.cols});
+        // The physical acquisition step is independent of the requested reconstruction grid.
+        if (t.scan.exposure_arc) {
+            double fraction = *t.scan.exposure_arc;
+            const Json* period = L.find("frame_period_s");
+            if (period && period->is(Json::Number) && period->number > 0 && t.scan.count_time_s) {
+                const double timed = *t.scan.count_time_s / period->number;
+                if (timed > 0 && timed <= 1) fraction = timed;
+            }
+            p.exposure_gate_rad = fraction * recorded_angle_step(t.scan.unwrapped_angles_deg) * (M_PI / 180.);
+        }
+        on_canvas.push_back(CanvasTile{p.rot_center, p.ax, p.ay, I.cols, t.reconstructor->fan_of_columns(), p.exposure_gate_rad});
         I.close(k);
     }
     if (I.doable.second <= I.doable.first) throw Error("mosaic: no slice that every tile can give");
@@ -638,7 +1023,10 @@ MosaicReconstruction::MosaicReconstruction(const std::string& projections, const
     c.ramp_filter_name = asked.ramp_filter_name, c.ramp_filter_par = asked.ramp_filter_par;
     c.taper = std::max(0, I.options.taper / I.factor);
     c.levels = I.options.levels;
+    c.exposure_fade = 600. / I.factor;
     c.anchor = I.anchor;
+    c.rebin_angles = I.options.rebin_angles;
+    c.rebin_kernel = I.options.rebin_kernel;
     if (const Json* v = I.params.find("mend_threshold"); v && v->is(Json::Number)) c.mend_threshold = static_cast<float>(v->number);
     I.canvas = std::make_unique<MosaicCanvas>(c, std::move(on_canvas));
     I.collector->canvas = I.canvas.get();
@@ -653,6 +1041,17 @@ const std::vector<MosaicTile>& MosaicReconstruction::tiles() const { return impl
 const std::vector<std::vector<double>>& MosaicReconstruction::levels() const { return impl_->levels; }
 const std::vector<double>& MosaicReconstruction::angle_spread() const { return impl_->spread; }
 
+int MosaicReconstruction::max_chunk() const {
+    const Impl& I = *impl_;
+    if (!I.canvas->exposure_weighted()) return std::numeric_limits<int>::max();
+    // Two full-width accumulators and the aligned signal/support of each tile per height.
+    // A single native height can exceed the batch budget and is always processed.
+    const std::size_t bytes = 2 * sizeof(float) * I.n_angles *
+        (I.canvas->size() + I.tiles.size() * shift_row_stride(I.cols));
+    constexpr std::size_t batch_budget = std::size_t(1) << 30;
+    return static_cast<int>(std::max(std::size_t(1), batch_budget / bytes));
+}
+
 std::string MosaicReconstruction::info_json() const {
     const Impl& I = *impl_;
     Json tiles = Json::list();
@@ -663,6 +1062,7 @@ std::string MosaicReconstruction::info_json() const {
                       .set("ax", Json::of(t.pub.ax))
                       .set("ay", Json::of(t.pub.ay))
                       .set("height", Json::of(t.pub.height))
+                      .set("exposure_gate_rad", Json::of(t.pub.exposure_gate_rad))
                       .set("rot_center", Json::of(t.pub.rot_center))
                       .set("doable", Json::list().add(Json::whole_number(t.pub.doable.first)).add(Json::whole_number(t.pub.doable.second))));
     const CanvasConfig& c = I.canvas->config();
@@ -678,6 +1078,9 @@ std::string MosaicReconstruction::info_json() const {
         .set("anchor", Json::of(I.tiles[static_cast<std::size_t>(I.anchor)].pub.name))
         .set("taper", Json::whole_number(c.taper))
         .set("levels", Json::of_bool(c.levels))
+        .set("rebin_angles", Json::of_bool(c.rebin_angles))
+        .set("rebin_kernel", Json::of(c.rebin_angles ? c.rebin_kernel : "direct"))
+        .set("exposure_weighted", Json::of_bool(I.canvas->exposure_weighted()))
         .set("bp_interp", Json::of(c.bp_interp))
         .set("bp_oversample", Json::whole_number(c.bp_oversample))
         .set("ramp_filter_name", Json::of(c.ramp_filter_name))
@@ -689,23 +1092,36 @@ std::string MosaicReconstruction::info_json() const {
 void MosaicReconstruction::reconstruct(int h_lo, int h_hi, float* out, const SliceRoi* roi, std::vector<CanvasDebug>* debug) {
     Impl& I = *impl_;
     if (h_lo < I.doable.first || h_hi > I.doable.second || h_hi <= h_lo) throw Error("mosaic: slices outside the doable span");
-    const int n = h_hi - h_lo, size = I.canvas->size();
-    I.canvas->begin(n);
-    std::vector<float> own(static_cast<std::size_t>(n));   // a tile's own slices: one pixel each, left empty
-    const SliceRoi one{0, 1, 0, 1};
-    for (std::size_t k = 0; k < I.tiles.size(); ++k) {
-        TileReconstruction& t = I.open(k);
-        I.collector->tile = static_cast<int>(k), I.collector->h_lo = h_lo;
-        t.reconstructor->reconstruct(h_lo, h_hi, own.data(), nullptr, &one);
-        I.close(k);
-    }
+    const int size = I.canvas->size(), limit = std::min(max_chunk(), h_hi - h_lo);
     const std::size_t plane = roi ? static_cast<std::size_t>(roi->y1 - roi->y0) * (roi->x1 - roi->x0) : static_cast<std::size_t>(size) * size;
-    if (debug) debug->assign(static_cast<std::size_t>(n), CanvasDebug{});
+    if (debug) debug->assign(static_cast<std::size_t>(h_hi - h_lo), CanvasDebug{});
     I.levels.clear(), I.spread.clear();
-    for (int y = 0; y < n; ++y) {
-        I.canvas->slice(y, out + static_cast<std::size_t>(y) * plane, roi, debug ? &(*debug)[static_cast<std::size_t>(y)] : nullptr);
-        I.levels.push_back(I.canvas->levels(y));
-        I.spread.push_back(I.canvas->angle_spread(y));
+    for (int lo = h_lo; lo < h_hi;) {
+        const int n = std::min(limit, h_hi - lo);
+        I.canvas->begin(n);
+        if (I.options.rebin_angles && (I.options.rebin_kernel == "measured" || I.options.rebin_kernel == "exposure")) {
+            for (std::size_t k = 0; k < I.tiles.size(); ++k) {
+                const auto angles = I.open(k).reconstructor->nearest_view_angles(lo, lo + n);
+                for (int y = 0; y < n; ++y)
+                    I.canvas->add_view_angles(y, angles.data() + static_cast<std::size_t>(y) * I.n_angles);
+                I.close(k);
+            }
+        }
+        std::vector<float> own(static_cast<std::size_t>(n));   // a tile's own slices: one pixel each, left empty
+        const SliceRoi one{0, 1, 0, 1};
+        for (std::size_t k = 0; k < I.tiles.size(); ++k) {
+            TileReconstruction& t = I.open(k);
+            I.collector->tile = static_cast<int>(k), I.collector->h_lo = lo;
+            t.reconstructor->reconstruct(lo, lo + n, own.data(), nullptr, &one);
+            I.close(k);
+        }
+        for (int y = 0; y < n; ++y) {
+            const auto index = static_cast<std::size_t>(lo - h_lo + y);
+            I.canvas->slice(y, out + index * plane, roi, debug ? &(*debug)[index] : nullptr);
+            I.levels.push_back(I.canvas->levels(y));
+            I.spread.push_back(I.canvas->angle_spread(y));
+        }
+        lo += n;
     }
 }
 

@@ -228,6 +228,8 @@ class ExternalBackprojector {
   public:
     virtual ~ExternalBackprojector() = default;
     virtual bool filtered() const = 0;
+    // Request the calibrated per-column fan for a method that rebins measured rays.
+    virtual bool uses_column_fan() const { return false; }
     // Request measured-only gridding, with support preserved before any hole filling or rebalance.
     virtual bool measured_only() const { return false; }
     // The image the method starts from, asked of the pipeline: 0 none; 1 the exact FBP of the slice with a parallel
@@ -262,6 +264,8 @@ class SliceReconstructor {
     double fan_per_column() const;             // the beam's divergence in use [rad per column] (0: a parallel beam)
     // the fan of every merged column [rad] as the backprojector takes it (empty: a parallel beam)
     const std::vector<float>& fan_of_columns() const;
+    // Nearest-bin FBP directions [rad], height-major, from trajectory and detector weights alone.
+    std::vector<float> nearest_view_angles(int h_lo, int h_hi);
     std::string angle_interp() const;          // the angular gridding in use: "views", "nearest" or "linear"
     std::string z_interp() const;              // the vertical kernel in use
     std::vector<int> projection_counts() const;   // projections in use, per scan (a subset: fewer than recorded)

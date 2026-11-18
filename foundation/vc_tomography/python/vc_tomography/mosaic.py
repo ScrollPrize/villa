@@ -2,7 +2,7 @@
 
 A mosaic is scans of one sample at several places on the rotation stage (tiles), each a helix with the rotation
 axis inside the detector. `tile_reconstructor` makes a vc_tomography reconstructor of one tile;
-`canvas_reconstruction` reconstructs the whole mosaic as one slice by one filtered backprojection, from a geometry
+`canvas_reconstruction` reconstructs the whole mosaic as one slice by full-width filtered backprojection, from a geometry
 calibration that holds the tiles' places.
 
 `cal` is a geometry calibration of the tiles (`geometry.calibrate_geometry`, `vc_tomography_calibration geometry`:
@@ -107,12 +107,10 @@ def tile_reconstructor(master, cal, label, device="cuda", params=None, row_origi
                                     int(reduce), log, str(projections or ""))     # vc_tomography::tile_reconstructor
 
 
-def canvas_reconstruction(projections, cal, device="cuda", params=None, reduce=0, projection_store=None, cache_dir=None, taper=200, levels=True, keep_tiles=False, log=print):
-    """The whole mosaic as one slice by one filtered backprojection (vc_tomography::MosaicReconstruction,
-    vc_tomography/mosaic.hpp): every tile's rows of a slice, as its own pipeline grids them, are placed in one sinogram as
-    wide as the mosaic (the tile's rows delayed to where its axis falls on the canvas at each angle), the recordings of
-    every ray averaged by their weights, and that sinogram is ramp-filtered and backprojected once. No row is cut inside
-    the sample, so the slice has neither the slow shading of a tile reconstructed alone nor seams between tiles.
+def canvas_reconstruction(projections, cal, device="cuda", params=None, reduce=0, projection_store=None, cache_dir=None, taper=200, levels=True, keep_tiles=False, log=print, rebin_angles="exposure"):
+    """Reconstruct the whole mosaic with full-width filtered backprojection.
+    Each tile's pipeline supplies measured rows in calibrated coordinates. The default uses all tiles
+    for coarse structure and weights their fine detail by the exposure travel at each region's centre.
 
     cal: the joint geometry calibration of the mosaic's tiles (vc_tomography_calibration geometry on all of them:
     every scan's d and height against the anchor; a file with every place at nothing is refused), as text, a dict
@@ -122,6 +120,15 @@ def canvas_reconstruction(projections, cal, device="cuda", params=None, reduce=0
     projection_store: frames at a half, a quarter or an eighth, from a projection store. taper: stored columns at either
     end of a tile's rows over which its weight falls to nothing. levels: one additive level per tile and slice from the
     rays two tiles share. keep_tiles: every tile's reconstructor kept between chunks (faster; each holds device memory).
+
+    Each tile uses angle_interp="nearest" even if params specifies "views". Repeated turns contribute to
+    one row per angular bin before the canvas receives them. Standalone FBP can keep the turns separate.
+    rebin_angles: interpolate measured rows and weights at fixed canvas column onto a common angular grid
+    before backprojection. False selects the direct folded blend. True uses two linear passes. "linear" or "lanczos3" use one angular interpolation
+    with the calibrated in-plane fan when beam_divergence is enabled. "measured" aligns tiles
+    to the measured mean angle of each view and backprojects both halves of the turn. The default
+    "exposure" uses this grid and preferentially weights views with short exposure travel for
+    fine detail in each tile disc. It uses ordinary measured-angle FBP when gates are unavailable.
 
     Returns the reconstruction: .doable (slices [lo, hi)), .size (canvas pixels a side), .pixel_size_m, .info() (JSON
     text: the tiles' places on the canvas among it), .reconstruct(h_lo, h_hi, roi=None, debug=False) -> (n, ny, nx)
@@ -138,4 +145,5 @@ def canvas_reconstruction(projections, cal, device="cuda", params=None, reduce=0
     else:
         text = str(cal)
     return _core.MosaicReconstruction(str(projections), text, device, json.dumps(params or {}, default=float), int(reduce), str(projection_store or ""), str(cache_dir or ""),
-                                      int(taper), bool(levels), bool(keep_tiles), log)
+                                      int(taper), bool(levels), bool(keep_tiles), log, bool(rebin_angles),
+                                      rebin_angles if isinstance(rebin_angles, str) else "two_pass")

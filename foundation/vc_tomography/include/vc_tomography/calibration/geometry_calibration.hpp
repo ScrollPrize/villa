@@ -61,8 +61,8 @@ struct Options {
 // places taken from the record's motors under the orientation of the motors' plane whose comparisons register
 // (places_from_motors), every pair of neighbours compared (neighbours, plan_tiles), and solve_tiles in place of the
 // one solve, with the map's four radial terms where Options::order is above 0 (Options::radial_map is not used). The
-// calibration then holds "tiles": pairs, blocks, motors_orientation, orientation_scores, pitch_measured (the
-// parameters' pitch is written as nothing: the reconstructions do not apply it). Returns the calibration as
+// calibration then holds "tiles": pairs, blocks, motors_orientation, orientation_scores, pitch_measured. The fitted
+// pitch in the parameters shifts each view to the depth of the common sample origin. Returns the calibration as
 // JSON text ("model": "joint"; vc_tomography/geometry.hpp reads a pair's); it is an error if the rows' timing is not
 // given and nothing measures it (a refill in a stretch on disk; with Options::rows_from_middle, scans at two heights).
 std::string calibrate_geometry(const std::vector<std::string>& scans, const Options& options = {});

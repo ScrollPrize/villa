@@ -193,6 +193,9 @@ def test_rolling_shutter_turns_the_slices_angles(tmp_path, device):
     (rows - 1) from the projection's angle; a bin holding several projections takes their mean"""
     ngrid, rows, h = 64, 12, 7
     angles = lambda s, **kw: recon(pattern_scan(tmp_path, 0.0), device, backprojector="fbp", rolling_shutter=s, **kw).reconstruct(h, h + 1, debug=True)["angles"][0]
+    r = recon(pattern_scan(tmp_path, 0.0), device, backprojector="fbp", rolling_shutter=.5)
+    planned = r.nearest_view_angles(h, h + 2)
+    np.testing.assert_array_equal(planned, -r.reconstruct(h, h + 2, debug=True)["angles"])
     base = angles(0.0)
     np.testing.assert_allclose(base, np.arange(ngrid) * (2 * np.pi / ngrid), atol=1e-6)
     # pattern_scan: projection p at angle p steps, 0.06 row further each: the slice is at row h - 0.06 p of it

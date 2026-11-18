@@ -279,7 +279,14 @@ Poses joint_scan_poses(const Json& cal, int rows, std::size_t s, const std::vect
     const double roll = number(par, "roll", "the parameters");
     // the pitch of the rotation axis towards the beam, where the calibration has it (a mosaic's tiles give it)
     const Json* leans = par.find("pitch");
-    const double pitch = leans && leans->is(Json::Number) ? leans->number : 0.0;
+    double pitch = leans && leans->is(Json::Number) ? leans->number : 0.0;
+    // Older mosaic writers stored a zero placeholder and saved the fitted pitch only in the tile report.
+    if (const Json* tiles = cal.find("tiles"); tiles && pitch == 0.0) {
+        const Json* saved = tiles->find("pitch_in_parameters");
+        const Json* measured = tiles->find("pitch_measured");
+        if (!(saved && saved->is(Json::Bool) && saved->boolean) && measured && measured->is(Json::Number) && std::isfinite(measured->number))
+            pitch = measured->number;
+    }
     const Json& stage = member(par, "stage", "the parameters");
     const double lift[2] = {two_numbers(stage, "height_once", "the stage", 0), two_numbers(stage, "height_once", "the stage", 1)};
     const double sway[2] = {two_numbers(stage, "axis_twice", "the stage", 0), two_numbers(stage, "axis_twice", "the stage", 1)};

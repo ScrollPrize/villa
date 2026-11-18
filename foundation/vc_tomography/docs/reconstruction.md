@@ -220,9 +220,9 @@ vc_tomography_reconstruct RAW_DATA --set geometry=geometry.json --z 400 432 --ch
     --projection_store projections.zarr --reduce 2 --keep_tiles --tag canvas_block
 ```
 
-Every tile's rows of a slice are placed in one sinogram as wide as the whole mosaic, at the columns where the
-tile's rotation axis falls at each angle; the recordings of every ray, by any tile from either side, are averaged
-by their weights; and that sinogram is ramp-filtered and backprojected once. No row is cut inside the sample.
+Every tile contributes to full-width projections in the same calibrated coordinates. By default, the canvas
+uses ordinary projection weights for coarse structure and gives more weight to views with shorter exposure
+travel for fine detail. The blend happens in the ramp-filtered detector rows before backprojection.
 
 - Slices are numbered from 0 (`--fractions`, `-n`, `--z` and `--heights` all take these numbers) and are written
   as TIFF, `slice_<number>.tiff`, with `manifest.json`. `--roi` crops; `--uint8` adds an 8-bit copy.
@@ -235,8 +235,46 @@ by their weights; and that sinogram is ramp-filtered and backprojected once. No 
   tiles share.
 - `filters`, `z_interp`, `x_interp` and `backprojector=fbp(...)` are taken as for any scan. The filters act on
   each tile's frames, before the rows are joined. Only `fbp` is available.
-- Not applied: the beam's divergence and the tiles' rotations against each other. The tiles' angles within one
-  angular bin are taken as equal; `manifest.json` states by how much they differ (`angle_spread_bins`).
+- Whole-canvas FBP sets each tile's `angle_interp` to `nearest`, including when the input requests `views`.
+  Repeated turns contribute to one row per angular bin. The `tile_rebin` setting controls how the canvas
+  combines those rows across tiles. Standalone FBP with `angle_interp=views` keeps the turns separate.
+- The default is `--set tile_rebin=exposure` (Python `rebin_angles="exposure"`). Each region is centred
+  on a tile axis and uses projections from all tiles on the measured-angle grid. For a feature at the
+  centre of that region, let `L` be the predicted detector travel in pixels during one recorded exposure.
+  Multiply each view's support by `0.01 + 0.99 / (1 + (L / 2)^4)` for the fine band. The transition from
+  ordinary to travel-weighted projections runs from 0.04 to 0.10 cycles per reconstruction pixel.
+  Regions crossfade over the inner 600 stored pixels at the edge of each coverage disc, capped at its radius.
+  The ordinary FBP supplies the balance wherever the tapers sum to less than one.
+- Exposure weighting requires a continuous-rotation gate for every tile and at least two tiles. Otherwise
+  the default uses ordinary measured-angle FBP. The manifest records the resolved `exposure_weighted` flag
+  and each tile's `exposure_gate_rad`. Sinogram debug arrays describe the ordinary full-field pass.
+  The exposure mode caches aligned tile rows for reuse and limits the number of heights processed together
+  on large canvases. A cropped reconstruction evaluates only the regions intersecting the crop.
+- `--set tile_rebin=false` selects the previous direct blend, using the weighted mean angle of each folded bin. Use `--set tile_rebin=true` to
+  interpolate onto a common parallel-ray angle grid. The first tile sets the grid phase for each slice.
+  With `beam_divergence` enabled and a calibrated fan, the canvas first interpolates each detector
+  column to its parallel-ray direction using the single-tile FBP's small-fan model. It then places each measured row at its own angle and interpolates
+  the weighted line integrals and weights at **fixed canvas column** before folding. Linear angular
+  interpolation can attenuate fine detail when adjacent views are far apart. In Python pass
+  `rebin_angles=True` to `mosaic.canvas_reconstruction`.
+- Use `--set tile_rebin=lanczos3` for a single six-tap angular interpolation, or
+  `--set tile_rebin=linear` for a single linear interpolation. Both keep the native Fourier
+  detector shift. At a fixed canvas column they account for the fan-dependent detector offset
+  and interpolate between the physical directions of the bracketing views. Lanczos weights
+  use this fractional view index and fall back to linear at gaps or weak coverage.
+  The Python values are `rebin_angles="lanczos3"` and `rebin_angles="linear"`.
+- `--set tile_rebin=measured` (Python `rebin_angles="measured"`) keeps both halves of the
+  turn through FBP. A geometry pass computes the mean measured direction of each view across
+  tiles at the slice height. Same-side tiles align there. At each detector position the stronger side keeps
+  its measurement. The weaker or missing side borrows from the mirrored detector position
+  interpolated at the physical opposite direction. Each completed
+  projection is filtered once and backprojected with its angular quadrature weight.
+  Debug output includes all view angles, one filtered row per angle, and the fraction of
+  supported rays requiring opposite-side coverage (`opposite_only_fraction`).
+- `manifest.json` records the mode and the largest input row-centre angle offset from its output bin
+  (`angle_spread_bins`). All modes reconstruct horizontal slices. The calibrated rotation-axis pitch
+  shifts each tile's detector rows to the common sample origin at each view. The variation in ray
+  height with depth within the sample and the relative tile rotations remain outside this model.
 - The places come from `vc_tomography_calibration geometry` run on all the tiles (see
   [Calibration and alignment](calibration.md#bm18-mosaic-tiles)). A file in which every place is 0 is refused.
 

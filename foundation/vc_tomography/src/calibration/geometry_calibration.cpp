@@ -1016,7 +1016,6 @@ namespace {
 // What the tiles' stage of the step found (calibrate_geometry, a mosaic).
 struct TilesFound {
     GeometrySolution solution;
-    double pitch = 0;                 // as solved [rad]
     int orientation = 0;              // of the motors' plane in the model's (places_from_motors)
     std::vector<std::size_t> scores;  // accepted patches of the trial of each orientation
     std::size_t edges = 0, blocks = 0;
@@ -1090,7 +1089,6 @@ TilesFound place_tiles(Session& session, const Acquisition& acq, const std::vect
 
     std::size_t unknowns_first = 0;
     found.solution = solve_tiles(acq, own, between, places, options.order > 0, &unknowns_first);
-    found.pitch = found.solution.parameters.pitch;
     double moved = 0;
     for (std::size_t k = 0; k < n; ++k) moved = std::max(moved, std::hypot(found.solution.parameters.scans[k].d[0] - places.scans[k].d[0], found.solution.parameters.scans[k].d[1] - places.scans[k].d[1]));
     say(log, fmt("  three solves: all together (%zu unknowns), each tile's own parameters from its own views, the shared terms and the places with a scale per tile (%zu unknowns); the tiles lie up to "
@@ -1295,13 +1293,8 @@ std::string calibrate_geometry(const std::vector<std::string>& scans, const Opti
         say(log, fmt("  over the %d scans with opposite views: axis column %.3f px (%.3f rms), its slope %.2e per row (%.2e rms), axial scale %.0f ppm (%.0f rms, mean %.0f)", told.axis.n, told.axis.range, told.axis.sd,
                      told.axis_slope.range, told.axis_slope.sd, told.axial_scale.range * 1e6, told.axial_scale.sd * 1e6, told.axial_scale.mean * 1e6));
     if (acq.scans.size() > 1) say(log, fmt("  %zu pairs of scans reconstruct a part of the sample in common; %zu triangles of them", told.neighbours.edges.size(), told.neighbours.triangles.size()));
-    if (mosaic) {
-        // The pitch of the rotation axis towards the beam is measured between the tiles and stated beside the
-        // parameters; the parameters hold none, so that no tile's rows take it (geometry.hpp: a pitch in the
-        // parameters lifts every frame's rows by the depth of the sample's origin)
-        say(log, fmt("  pitch of the rotation axis towards the beam %+.1f urad (measured; not put into the tiles' rows); roll %+.1f urad", tiles->pitch * 1e6, solution.parameters.roll * 1e6));
-        solution.parameters.pitch = 0;
-    }
+    if (mosaic)
+        say(log, fmt("  pitch of the rotation axis towards the beam %+.1f urad at the sample origin; roll %+.1f urad", solution.parameters.pitch * 1e6, solution.parameters.roll * 1e6));
     Json names = Json::list();
     for (const std::string& s : scans) names.add(Json::of(s));
     Json counts = Json::dict();
@@ -1331,7 +1324,8 @@ std::string calibrate_geometry(const std::vector<std::string>& scans, const Opti
                              .set("blocks", count(static_cast<long long>(tiles->blocks)))
                              .set("motors_orientation", count(tiles->orientation))  // places_from_motors'
                              .set("orientation_scores", scores)
-                             .set("pitch_measured", num(tiles->pitch))
+                             .set("pitch_measured", num(solution.parameters.pitch))
+                             .set("pitch_in_parameters", Json::of_bool(true))
                              .set("solves", Json::of(std::string("all with the map's radial terms; each tile's own parameters from its own views; the shared terms and places with a scale per tile"))));
     }
     return cal.text();
