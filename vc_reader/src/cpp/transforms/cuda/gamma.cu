@@ -10,14 +10,14 @@ template<class T> __device__ void gamma_kernel(KernelIndex vcr_launch, View<T> d
     EACH_INDEX(data.size) {
         const T low = T(stats->low), range = T(stats->high)-low;
         T unit = (data.ptr[i]-low)/fmax(range,T(eps));
-        if (clip) unit = fmin(fmax(unit,T(0)),T(1));
+        unit = clip ? fmin(fmax(unit,T(0)),T(1)) : fmax(unit,T(0));
         T value = pow(unit,T(gamma))*range+low;
         if constexpr (std::is_same_v<T,float>) {
             // Finite float32 endpoints can still have an overflowing difference.
             if (!isfinite(value) || !isfinite(range) || !isfinite(T(gamma))) {
                 const double wide_range = stats->high-stats->low;
                 double wide = (widen(data.ptr[i])-stats->low)/fmax(wide_range,eps);
-                if (clip) wide = fmin(fmax(wide,0.),1.);
+                wide = clip ? fmin(fmax(wide,0.),1.) : fmax(wide,0.);
                 value = T(pow(wide,gamma)*wide_range+stats->low);
             }
         }

@@ -1,4 +1,5 @@
 #include <vc_reader/transforms.hpp>
+#include <cmath>
 #include <iostream>
 
 int main()
@@ -38,6 +39,18 @@ int main()
             require(threw, std::string("rejected: ") + what);
         };
         Normalize percentiles; percentiles.lower = 90; percentiles.upper = 10; rejected(percentiles, "percentile order");
+        {
+            // Masked Gamma without clipping: voxels below the masked minimum (the padding) must not
+            // raise a negative base to a fractional power, which was NaN.
+            std::vector<float> v{-10, 2, 4, 6, 20, 3}; std::vector<std::uint8_t> m{0, 1, 1, 1, 0, 1};
+            Target unfilled; unfilled.refill = false; Target valid; valid.role = Role::Valid;
+            Gamma g; g.gamma = .7; g.masked = true; g.clip = false;
+            Sample s; s["image"] = {Array({1, 1, 2, 3}, 'f', 4), unfilled, "image"};
+            std::memcpy(s.at("image").array.data(), v.data(), 6 * sizeof(float));
+            Array mask({1, 1, 2, 3}, 'u', 1); std::memcpy(mask.data(), m.data(), 6); s["padding_mask"] = {std::move(mask), valid, "padding_mask"};
+            const auto out = Pipeline({g}, {{"image", unfilled}, {"padding_mask", valid}}).run(s, 0, false).sample.at("image").array;
+            for (std::size_t i = 0; i < 6; ++i) require(std::isfinite(out.get(i)), "masked gamma without clipping is finite below the masked minimum");
+        }
         Normalize fixed; fixed.scale = 0; rejected(fixed, "fixed scale");
         BrightnessMultiply chance; chance.options.p_channel = 2; rejected(chance, "channel probability");
         Gamma gamma; gamma.p_invert = -1; rejected(gamma, "gamma inversion probability");
