@@ -165,6 +165,9 @@ def parser() -> argparse.ArgumentParser:
         subcommand.add_argument('-o', '--output', dest='output_path', metavar='FILE', help='override the new output vcobj store')
         subcommand.add_argument('--print-config', action='store_true', help='print resolved settings without running the stage')
     subcommands.add_parser('profiles', help='list available named profiles and their source files')
+    crossings = subcommands.add_parser('crossings', help='score solved windings against the crossing measurements')
+    crossings.add_argument('profile', metavar='JSON',
+                           help='JSON with graph_store, winding settings, solves {label: store} and optional focus/output')
     handed = subcommands.add_parser('handedness', help="show or tag the scroll's winding direction on a store's umbilicus object")
     handed.add_argument('-i', '--input', dest='input_path', metavar='FILE', required=True, help='vcobj store with an umbilicus object')
     handed.add_argument('--set', dest='value', type=int, choices=(1, -1), help='tag the umbilicus with this winding handedness')
@@ -177,6 +180,13 @@ def main(argv=None) -> int:
     if args.stage == 'profiles':
         for name, path in sorted(available_profiles(args.profile_dir).items()):
             print(f'{name}\t{path}')
+        return 0
+    if args.stage == 'crossings':
+        from vesuvius.neural_tracing.fiber_trace_3d.fiber_crossing_eval import run as evaluate, tables
+        settings = json.loads(Path(args.profile).read_text() if Path(args.profile).exists() else args.profile)
+        for label, report in evaluate(settings).items():
+            print(tables(report, title=label))
+            print()
         return 0
     if args.stage == 'handedness':
         from vesuvius.neural_tracing.fiber_trace_3d.fiber_graph_store import tag_store_handedness, store_handedness

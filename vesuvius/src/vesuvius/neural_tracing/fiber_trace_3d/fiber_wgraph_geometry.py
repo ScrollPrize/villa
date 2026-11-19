@@ -42,13 +42,19 @@ def winding_settings(config):
     if int(lemon['capacity_scale'])!=lemon['capacity_scale'] or lemon['capacity_scale']<1:
         raise ValueError('lemon.capacity_scale must be a positive integer')
     classification=config.get('classification','run');record_family=config.get('record_family','any');normal_sign=config.get('normal_sign','run')
-    if classification not in ('run','record'):raise ValueError('classification must be run or record')
+    # run: the pinned classification run decides every fiber. record: the
+    # stored H/V tags do. run+record: the run decides, except for the fibers
+    # that carry a tag - a hand-tagged scaffold imported into a traced volume
+    # keeps its own families and stays enabled, whatever the classifier made
+    # of its few short fibers.
+    if classification not in ('run','record','run+record'):
+        raise ValueError('classification must be run, record or run+record')
     if record_family not in ('any','manual','automatic'):raise ValueError('record_family must be any, manual or automatic')
     if normal_sign not in ('run','none'):raise ValueError('normal_sign must be run or none')
     automatic=any(weights[name]>0 for name in ('parallel','perpendicular','enclosure'))
     if normal_sign=='none' and automatic:
         raise ValueError('normal_sign none requires zero parallel, perpendicular and enclosure weights (manual links only)')
-    if normal_sign=='none' and classification=='run':
+    if normal_sign=='none' and classification!='record':
         raise ValueError('normal_sign none needs classification record; there is no run to pin')
     if not automatic and weights['manual']<=0:raise ValueError('All constraint weights are zero')
     # How much each crossing counts as evidence on top of its type weight, in
@@ -119,6 +125,8 @@ def _input_lineage(config, winding_run=None, *, settings=None):
         if config.get('classification_run_uuid') is not None:
             raise ValueError('classification record takes no classification run selector')
         return dict(classification=None,normal_sign=sign)
+    # run+record pins the same classification run as run: the tags only
+    # override its answer for the fibers that carry one.
     classified=parent(sign,'classification')
     explicit=config.get('classification_run_uuid')
     if explicit is not None and _uuid(explicit)!=classified:
@@ -212,6 +220,16 @@ def _read_winding_inputs(config,input_source,selected,*,stage,modes=None):
     if selected['classification'] is not None:
         classified=_fiber_columns(config['database'],selected['classification'],ids,required=('family','enabled'),exact=True)
         family=classified['family'];enabled=classified['enabled']
+        if modes['classification']=='run+record':
+            # A tagged fiber keeps its tag and stays in the solve; the rest is
+            # the classification run's answer, untouched.
+            tagged,tag_counts=fiber_families_from_record(base,ids,modes['record_family'])
+            override=tagged>=0
+            family=np.where(override,tagged,family).astype(np.int64)
+            enabled=np.where(override,1,enabled).astype(np.int64)
+            tag_counts=dict(tag_counts,overridden=int(override.sum()),
+                            overridden_enabled=int((override&(classified['enabled']==0)).sum()),
+                            overridden_family=int((override&(classified['family']!=tagged)).sum()))
     else:
         family,tag_counts=fiber_families_from_record(base,ids,modes['record_family'])
         enabled=(family>=0).astype(np.int64);family=np.where(family>=0,family,2)

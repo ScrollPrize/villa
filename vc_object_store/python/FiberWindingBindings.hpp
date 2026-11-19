@@ -127,7 +127,7 @@ void bindFiberWinding(nb::module_& module){
             WindingArc distance,WindingFlag parallel,WindingXYZ normalA,WindingXYZ normalB,WindingXYZ connector,
             WindingFlag validA,WindingFlag validB,WindingFlag validConnector,
             double scale,double offset,double parallelWeight,double perpendicularWeight,
-            double dotWeightPower,bool dampByWindingDistance,bool enclosures,
+            double dotWeightPower,bool dampByWindingDistance,bool enclosures,bool eventTargets,
             size_t constraintBatch,size_t readBatch,size_t workers){
             if(normalA.shape(1)!=3||normalB.shape(1)!=3||connector.shape(1)!=3)
                 throw std::invalid_argument("winding graph normals require XYZ triples");
@@ -140,7 +140,7 @@ void bindFiberWinding(nb::module_& module){
                 std::span(normalA.data(),normalA.shape(0)*3),std::span(normalB.data(),normalB.shape(0)*3),
                 std::span(connector.data(),connector.shape(0)*3)};
             vc::geometry::FiberWindingGraphOptions options{scale,offset,perpendicularWeight,parallelWeight,
-                dotWeightPower,dampByWindingDistance,enclosures,constraintBatch,readBatch,workers};
+                dotWeightPower,dampByWindingDistance,enclosures,constraintBatch,readBatch,workers,eventTargets};
             vc::geometry::FiberWindingL1Columns output;
             {nb::gil_scoped_release release;output=vc::geometry::prepareFiberWindingGraph(self.geometry,input,options);}
             nb::dict result;
@@ -150,6 +150,14 @@ void bindFiberWinding(nb::module_& module){
             result["weight"]=uvOwnedColumn(std::move(output.weight),output.arcs);
             result["read"]=output.read;result["used"]=output.used;result["expanded"]=output.expanded;
             result["without_distance"]=output.withoutDistance;
+            if(eventTargets){
+                result["event_a"]=uvOwnedColumn(std::move(output.eventA),output.events);
+                result["event_b"]=uvOwnedColumn(std::move(output.eventB),output.events);
+                result["event_target"]=uvOwnedColumn(std::move(output.eventTarget),output.events);
+                result["event_measured"]=uvOwnedColumn(std::move(output.eventMeasured),output.events);
+                result["event_distance"]=uvOwnedColumn(std::move(output.eventDistance),output.events);
+                result["event_weight"]=uvOwnedColumn(std::move(output.eventWeight),output.events);
+            }
             if(enclosures){
                 result["enclosure_a"]=uvOwnedColumn(std::move(output.enclosureA),output.enclosureArcs);
                 result["enclosure_b"]=uvOwnedColumn(std::move(output.enclosureB),output.enclosureArcs);
@@ -164,7 +172,7 @@ void bindFiberWinding(nb::module_& module){
           "valid_a"_a,"valid_b"_a,"valid_connector"_a,
           "lasagna_winding_scale"_a=1.,"perpendicular_offset"_a=.5,"parallel_weight"_a=1.,"perpendicular_weight"_a=1.,
           "dot_weight_power"_a=0.,"damp_by_winding_distance"_a=false,
-          "enclosures"_a=false,"constraint_batch"_a=500000,"read_batch"_a=32768,"workers"_a=32);
+          "enclosures"_a=false,"event_targets"_a=false,"constraint_batch"_a=500000,"read_batch"_a=32768,"workers"_a=32);
     module.def("fiber_signed_order",[](WindingXYZ connector,WindingXYZ a,WindingXYZ b,double minimum,size_t workers){
         const size_t n=connector.shape(0);
         if(connector.shape(1)!=3||a.shape(1)!=3||b.shape(1)!=3||a.shape(0)!=n||b.shape(0)!=n||!std::isfinite(minimum))
