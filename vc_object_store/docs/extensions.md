@@ -277,6 +277,52 @@ The Python table roles are the suffixes without their underscore: `runs`,
 
 Use a new run UUID for another independently saved result/checkpoint. Metric progression can be appended under the same run UUID at distinct iterations. The definitions provision the full data path; existing solver/checkpoint producers are not automatically migrated to these new tables.
 
+## Scaffold derived results (normals and crossings)
+
+A measured scaffold run spends its time on two computations over stored
+geometry: each fiber's strip normals, and the crossings of every H/V pair,
+whose winding separations are sampled out of the volume. Both are cached as
+immutable rows of the `fiber-scaffold-cache` extension (format 1,
+`keySpace="objects"`), so a later run reads what has not changed and computes
+only what has. Nothing is hashed: a row names the versions of the records it
+was computed from and states its parameters as readable `name=value;` text.
+
+`ext_fiber_strip_normals`:
+
+| Column | Type | Value |
+| --- | --- | --- |
+| `fiber_uuid` | BLOB, 16 bytes | The fiber |
+| `fiber_version` | INTEGER | The object version the normals were solved from |
+| `normals_uuid` | BLOB, 16 bytes | This row's own identity; crossings extracted with these normals name it |
+| `inputs` | TEXT | What else the normals were solved from: the frame, the parameters, the prediction a fused run read, and one `by=` entry per anchoring record (`link <uuid>@<version> peer <uuid>@<version>`, or `control <index> <source>`) |
+| `sign_source` | INTEGER | What fixed the sign (the scaffold's own enumeration) |
+| `sign` | INTEGER | +1 for an anchored fiber, 0 when the sign solve decides it |
+| `converged` | INTEGER | The strip solve's own verdict |
+| `normals` | BLOB | Three float64 per line point, little endian, in stored order |
+| `author`, `computed_at` | TEXT | Who computed them and when (ISO-8601 UTC) |
+
+`ext_fiber_pair_crossings`, one row per crossing of one pair:
+
+| Column | Type | Value |
+| --- | --- | --- |
+| `fiber_a`, `fiber_b` | BLOB, 16 bytes | The pair, in ascending UUID order |
+| `version_a`, `version_b` | INTEGER | Both object versions at extraction time |
+| `normals_a`, `normals_b` | BLOB, 16 bytes | The normals rows of the two fibers the extraction read |
+| `inputs` | TEXT | The extraction parameters |
+| `event_index` | INTEGER | The crossing within this pair, or -1: the pair has none |
+| `arc_a`, `arc_b` | REAL | The anchors' arclengths on each fiber |
+| `point_a_x/y/z`, `point_b_x/y/z` | REAL | The two anchor points, base voxels |
+| `parallel_score`, `perpendicular_score` | REAL | The extraction's own verdict |
+| `winding_distance`, `parallel_winding_distance` | REAL, NULL | The measured separation in turns; NULL when none was measured |
+| `parallel` | INTEGER | Whether the pair runs side by side here |
+| `author`, `computed_at` | TEXT | Who extracted it and when |
+
+Nothing is invalidated by hand. A fiber edit advances its object version, so
+its normals row and every crossing row naming it stop matching; a parameter
+change moves the digest, so nothing matches. A pair with no crossing is cached
+as the `event_index = -1` marker, because an empty answer is an answer and
+re-extracting it costs the same as any other pair.
+
 ## Measured constraint approval
 
 A link between two fibers carries its approval state on its edge record. A

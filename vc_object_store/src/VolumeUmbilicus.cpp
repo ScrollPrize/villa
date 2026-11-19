@@ -30,6 +30,21 @@ std::vector<ObjectRecord> volumeUmbilici(const StoreReader& reader, const std::s
     return reader.selectObjects(umbilici(volume));
 }
 
+std::optional<int> umbilicusWindingHandedness(const ObjectRecord& record)
+{
+    if (record.meta.empty()) return std::nullopt;
+    const auto meta = nlohmann::json::parse(record.meta, nullptr, false);
+    if (!meta.is_object()) return std::nullopt;
+    const auto found = meta.find("winding_handedness");
+    if (found == meta.end() || found->is_null()) return std::nullopt;
+    if (!found->is_number_integer())
+        throw std::invalid_argument("umbilicus " + record.name + ": winding_handedness must be +1 or -1");
+    const auto value = found->get<int>();
+    if (value != 1 && value != -1)
+        throw std::invalid_argument("umbilicus " + record.name + ": winding_handedness must be +1 or -1");
+    return value;
+}
+
 std::optional<VolumeUmbilicus> volumeUmbilicus(const StoreReader& reader, const VolumeVoxels& volume)
 {
     const auto records = volumeUmbilici(reader, volume.volume);
@@ -45,7 +60,8 @@ std::optional<VolumeUmbilicus> volumeUmbilicus(const StoreReader& reader, const 
     // The geometry of the version read, so points and version agree.
     const auto canonical = GeometrySnapshot(reader).umbilicus(*head);
     VolumeUmbilicus result{record.uuid, record.name, head->reference(),
-                           canonical.viewTransformedAt(volume.volume, volume.scale).points("points", 0, canonical.size())};
+                           canonical.viewTransformedAt(volume.volume, volume.scale).points("points", 0, canonical.size()),
+                           umbilicusWindingHandedness(record)};
     return result;
 }
 

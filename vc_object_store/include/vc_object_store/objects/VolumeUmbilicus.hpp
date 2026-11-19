@@ -13,7 +13,14 @@ struct VolumeUmbilicus {
     std::string uuid, name;
     ObjectVersion version; // the version read
     std::vector<geometry::Point> points; // in the volume's voxels
+    // The scroll's winding direction as the record states it
+    // (meta.winding_handedness, +1 or -1); nullopt when it states none.
+    std::optional<int> windingHandedness;
 };
+// The winding direction an umbilicus record states (meta.winding_handedness),
+// or nullopt. Throws std::invalid_argument for anything but +1 or -1: a
+// mirrored map or solve must never come from a malformed value.
+std::optional<int> umbilicusWindingHandedness(const ObjectRecord& record);
 // The live umbilici that map to `volume` (one, unless the store is inconsistent).
 std::vector<ObjectRecord> volumeUmbilici(const StoreReader&, const std::string& volume);
 // The umbilicus of `volume`'s volume, its points in `volume`; nullopt when it

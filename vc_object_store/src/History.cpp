@@ -183,6 +183,23 @@ std::map<std::string, std::string> members(sqlite3* db, const std::string& revis
     return result;
 }
 
+// Many relationships of one selection pin the same endpoint revisions. Within
+// one relationshipsAtSelected call (one read transaction, nothing written)
+// each endpoint revision is resolved once.
+struct EndpointMemo {
+    std::map<std::pair<sqlite3*,std::string>,ObjectVersion> references;
+    std::map<ObjectVersion,std::optional<ObjectRevision>> versions;
+};
+thread_local EndpointMemo* activeEndpointMemo = nullptr;
+struct EndpointMemoScope {
+    EndpointMemo memo;
+    bool owned = activeEndpointMemo == nullptr;
+    EndpointMemoScope() { if (owned) activeEndpointMemo = &memo; }
+    ~EndpointMemoScope() { if (owned) activeEndpointMemo = nullptr; }
+    EndpointMemoScope(const EndpointMemoScope&) = delete;
+    EndpointMemoScope& operator=(const EndpointMemoScope&) = delete;
+};
+
 RelationshipRevision relationship(sqlite3* db, const std::string& uuid)
 {
     db=resolveReference(db,[&](sqlite3* source){
@@ -208,8 +225,15 @@ RelationshipRevision relationship(sqlite3* db, const std::string& uuid)
     result.record.versionGeneration = result.generation;
     const auto endpointReference = [&](const ObjectRevisionKey& reference) {
         if(const auto* ref=std::get_if<ObjectVersion>(&reference))return *ref;
-        const auto value=resolveObjectRevisionKey(db,reference);
-        return value?value->revision.reference():ObjectVersion{};
+        const auto resolve=[&]{
+            const auto value=resolveObjectRevisionKey(db,reference);
+            return value?value->revision.reference():ObjectVersion{};
+        };
+        if(!activeEndpointMemo)return resolve();
+        const std::pair key{db,std::get<std::string>(reference)};
+        auto found=activeEndpointMemo->references.find(key);
+        if(found==activeEndpointMemo->references.end())found=activeEndpointMemo->references.emplace(key,resolve()).first;
+        return found->second;
     };
     result.aReference=endpointReference(aKey);result.bReference=endpointReference(bKey);
     return result;
@@ -221,7 +245,22 @@ bool endpointApplies(const ObjectStore& store, const Txn& txn, const Anchor& anc
                      const ObjectRevision& selected)
 {
     if (selected.deleted || selected.record.retired) return false;
-    const auto original = store.objectAtVersion(txn, pinned);
+    // The relationship pins the very version selected: the original is the
+    // selected revision, so nothing is read or compared.
+    if (pinned == selected.reference())
+        return (anchor.metadataKeys.empty() || selected.metadataComplete) &&
+               !endpointChanged(store, txn, anchor, geometry, selected.geometryRevision);
+    std::optional<ObjectRevision> read;
+    const std::optional<ObjectRevision>* resolved = &read;
+    if (activeEndpointMemo) {
+        auto found = activeEndpointMemo->versions.find(pinned);
+        if (found == activeEndpointMemo->versions.end())
+            found = activeEndpointMemo->versions.emplace(pinned, store.objectAtVersion(txn, pinned)).first;
+        resolved = &found->second;
+    } else {
+        read = store.objectAtVersion(txn, pinned);
+    }
+    const auto& original = *resolved;
     if (!original || (!anchor.metadataKeys.empty() && !original->metadataComplete)) return false;
     return dependencyMetadata(objectToJson(original->record), anchor) ==
                dependencyMetadata(objectToJson(selected.record), anchor) &&
@@ -945,6 +984,7 @@ std::vector<ObjectVersion> ObjectStore::versionsAt(const Txn& txn, const ObjectV
 std::vector<SelectedRelationship> ObjectStore::relationshipsAtSelected(const Txn& txn, const std::vector<ObjectRevision>& selection) const
 {
     DependencyScope dependencies;
+    EndpointMemoScope endpoints;
     auto* db = static_cast<sqlite3*>(connection(txn));
     std::map<std::string, ObjectRevision> revisions;
     using Membership=std::map<std::string,RelationshipVersion>;
@@ -962,6 +1002,14 @@ std::vector<SelectedRelationship> ObjectStore::relationshipsAtSelected(const Txn
         if(found==revisions.end())return true; // Incident bindings still expose off-screen endpoints.
         return reference==found->second.reference();
     };
+    // A relationship is incident to both its endpoints: its recorded binding
+    // is resolved once per source, not once per selected endpoint.
+    std::map<std::pair<sqlite3*,std::string>,std::optional<RelationshipRevision>> recorded;
+    const auto recordedOnce=[&](sqlite3* scope,const std::string& edge)->const std::optional<RelationshipRevision>&{
+        auto found=recorded.find({scope,edge});
+        if(found==recorded.end())found=recorded.emplace(std::pair{scope,edge},recordedRelationship(scope,edge)).first;
+        return found->second;
+    };
     for (const auto& revision : selection) {
         const auto& uuid=revision.objectUuid;
         const auto* value=&revisions.at(uuid);
@@ -976,7 +1024,7 @@ std::vector<SelectedRelationship> ObjectStore::relationshipsAtSelected(const Txn
         std::set<std::string> seenBindings;
         for(auto* scope:scopes){
             for(const auto& visible:incidentEdges(scope,uuid)){
-                const auto binding=recordedRelationship(scope,visible.uuid);
+                const auto& binding=recordedOnce(scope,visible.uuid);
                 if(!binding)continue;
                 if(!matchesSelectedEndpoint(binding->record.aUuid,binding->aReference)||
                    !matchesSelectedEndpoint(binding->record.bUuid,binding->bReference))continue;
