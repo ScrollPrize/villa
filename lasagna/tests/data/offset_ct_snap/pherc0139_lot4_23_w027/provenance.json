@@ -1,0 +1,47 @@
+{
+  "license": "CC BY-NC 4.0 (Vesuvius Challenge open data, https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/LICENSE.txt). These two surfaces are derived from that data; they are not covered by the repository's MIT license.",
+  "attribution": "Vesuvius Challenge open data, PHerc0139",
+  "coordinate_units": "XYZ voxels of PHerc0139 volume 20260102150214 (2.399 micrometers), level 0",
+  "start.tifxyz": {
+    "source": "PHerc0139/segments/20250108000002-w027_2025010845/ (published tifxyz of the annotated trace w027, coordinates at original_volume_downscale 4)",
+    "selection": "rows 828-837, columns 858-877 of the published x/y/z grid, multiplied by 4 (original_volume_downscale in the published catalog metadata); x/y/z values not otherwise changed. meta.json is written for this window (uuid w027_start, its own bbox and scale), not copied from the published segment"
+  },
+  "fit.tifxyz": {
+    "source": "output of a Lasagna Offset fit (+1) started from start.tifxyz, on the published Lasagna predictions PHerc0139/representations/predictions/lasagna/20260102150214-lasagna-20260419180421-L2/",
+    "settings": "lasagna/configs/offset_snap.json as fixed by PR #2418 (missing comma, pred_dt 0.0 in the snap stage), CPU, torch 2.11.0; written by fit2tifxyz; not modified afterwards"
+  },
+  "files": {
+    "fit.tifxyz/meta.json": {
+      "bytes": 329,
+      "sha256": "8aed8cbc80386a7d03668210e16eeec1b37819dc00fa8a3025ecfd39ee1e5e3f"
+    },
+    "fit.tifxyz/x.tif": {
+      "bytes": 946,
+      "sha256": "494a9e84af90494974f65e9e0e46924c3c3bb18b92284d6bf0740ffabd31afad"
+    },
+    "fit.tifxyz/y.tif": {
+      "bytes": 946,
+      "sha256": "6ce3d67680faa9344efd60921704101b6a3b0bf7e39589906301b17dde587c92"
+    },
+    "fit.tifxyz/z.tif": {
+      "bytes": 946,
+      "sha256": "51285ea04488bc5cebf4a194494885371f6cb2314163b358b2cb359e3b06d4c2"
+    },
+    "start.tifxyz/meta.json": {
+      "bytes": 274,
+      "sha256": "10ac959766afd1cabf3ca6273bcbea6148849915f6f14ab9a382abb1e51f0fe3"
+    },
+    "start.tifxyz/x.tif": {
+      "bytes": 1072,
+      "sha256": "dc8084dec05eee3923720cc5c4ad4c8cd898efb8f76c226f75badbce4603ccf8"
+    },
+    "start.tifxyz/y.tif": {
+      "bytes": 1072,
+      "sha256": "31004e807cd839db0da3fb5a794a56e7a17cc41280ee9284c38ae54b8fd6fbc0"
+    },
+    "start.tifxyz/z.tif": {
+      "bytes": 1072,
+      "sha256": "07c0cd0d26b9659b1c8ae482fbdc3a02563f4ae3ebb5ef5a022536c1da46c40d"
+    }
+  }
+}
