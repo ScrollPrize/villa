@@ -44,6 +44,9 @@ struct FiberWindingGraphOptions {
     bool dampByWindingDistance=false;
     bool enclosures=false;
     size_t constraintBatch=500000,readBatch=32768,workers=32;
+    // Also return one row per usable event with its fractional target, for a
+    // readout that scores a solve against the measurements themselves.
+    bool eventTargets=false;
 };
 struct FiberWindingL1Columns {
     std::unique_ptr<int64_t[]> a,b,target;
@@ -53,6 +56,12 @@ struct FiberWindingL1Columns {
     // present when FiberWindingGraphOptions::enclosures is set.
     std::unique_ptr<int64_t[]> enclosureA,enclosureB,enclosureTarget;
     size_t enclosureArcs{},enclosurePairs{},enclosureOneSided{},enclosureContradictory{},enclosureNonunique{};
+    // One row per usable event (FiberWindingGraphOptions::eventTargets): the
+    // node pair in arc order and the measured target in turns, unexpanded and
+    // unaggregated.
+    std::unique_ptr<int64_t[]> eventA,eventB;
+    std::unique_ptr<double[]> eventTarget,eventMeasured,eventDistance,eventWeight;
+    size_t events{};
 };
 
 namespace winding_graph_detail {
@@ -123,6 +132,16 @@ struct WindingEventRelation {
     // b's turns plus a's), present whenever the event yielded an arc or an
     // enclosure bound: target = anchor step + transport.
     int64_t transport=0;
+    // What the measurement says before the integer expansion: the corrected
+    // target in turns, oriented like the arcs (negated when a>b). A readout
+    // that scores a solve against the measurements wants this, not the two
+    // integer arcs the L1 problem is built from.
+    double fractionalTarget=0;
+    // The same target with the measurement left as measured: no clamp to the
+    // half-winding minimum, so a crossing inside one winding keeps its
+    // fractional separation. Only a readout wants this; the L1 problem does
+    // not, because a target below the minimum is not a relation it can state.
+    double measuredTarget=0;
 };
 inline WindingEventRelation windingEventRelation(const PackedFiberGeometry& geometry,const WindingEvent& event)
 {
@@ -170,6 +189,9 @@ inline WindingEventRelation windingEventRelation(const PackedFiberGeometry& geom
     const auto arc=[&](int64_t target,double value){
         return a>b?Arc{b,a,-target,value}:Arc{a,b,target,value};
     };
+    out.fractionalTarget=a>b?-corrected:corrected;
+    const double unclamped=((out.sign==0?double(plus):out.sign*outward)+double(c))-double(finish.turn)+double(start.turn);
+    out.measuredTarget=a>b?-unclamped:unclamped;
     out.lower=arc(int64_t(floor),weight*(1-fraction));
     if(fraction>0){out.upper=arc(int64_t(floor)+1,weight*fraction);out.hasUpper=true;}
     out.usable=true;
@@ -206,7 +228,9 @@ inline FiberWindingL1Columns prepareFiberWindingGraph(const PackedFiberGeometry&
         if(owner<-1||(owner>=0&&uint64_t(owner)>=n))throw std::invalid_argument("winding node outside catalog");
         return owner;
     };
-    struct Job {std::vector<Arc> arcs;std::vector<EnclosureBound> enclosures;size_t used{},expanded{},withoutDistance{};};
+    struct Job {std::vector<Arc> arcs;std::vector<EnclosureBound> enclosures;
+                std::vector<int64_t> eventA,eventB;std::vector<double> eventTarget,eventMeasured,eventDistance,eventWeight;
+                size_t used{},expanded{},withoutDistance{};};
     const size_t jobs=(m+options.constraintBatch-1)/options.constraintBatch;
     std::vector<Job> parts(jobs);
     vc::objects::parallelFor(jobs,options.workers,[&](size_t job){
@@ -243,6 +267,12 @@ inline FiberWindingL1Columns prepareFiberWindingGraph(const PackedFiberGeometry&
                 if(!relation.usable)continue;
                 batch.push_back(relation.lower);
                 if(relation.hasUpper)upper.push_back(relation.upper);
+                if(options.eventTargets){
+                    part.eventA.push_back(relation.lower.a);part.eventB.push_back(relation.lower.b);
+                    part.eventTarget.push_back(relation.fractionalTarget);
+                    part.eventMeasured.push_back(relation.measuredTarget);
+                    part.eventDistance.push_back(event.distance);part.eventWeight.push_back(event.weight);
+                }
                 ++part.used;
             }
             batch.insert(batch.end(),upper.begin(),upper.end());part.expanded+=batch.size();
@@ -278,6 +308,28 @@ inline FiberWindingL1Columns prepareFiberWindingGraph(const PackedFiberGeometry&
         out.enclosureB=std::make_unique_for_overwrite<int64_t[]>(out.enclosureArcs);
         out.enclosureTarget=std::make_unique_for_overwrite<int64_t[]>(out.enclosureArcs);
         for(size_t i=0;i<out.enclosureArcs;++i){out.enclosureA[i]=relations[i].a;out.enclosureB[i]=relations[i].b;out.enclosureTarget[i]=relations[i].target;}
+    }
+    if(options.eventTargets){
+        for(const auto& part:parts)out.events+=part.eventA.size();
+        out.eventA=std::make_unique_for_overwrite<int64_t[]>(out.events);
+        out.eventB=std::make_unique_for_overwrite<int64_t[]>(out.events);
+        out.eventTarget=std::make_unique_for_overwrite<double[]>(out.events);
+        out.eventMeasured=std::make_unique_for_overwrite<double[]>(out.events);
+        out.eventDistance=std::make_unique_for_overwrite<double[]>(out.events);
+        out.eventWeight=std::make_unique_for_overwrite<double[]>(out.events);
+        size_t at=0;
+        for(auto& part:parts){
+            for(size_t i=0;i<part.eventA.size();++i,++at){
+                out.eventA[at]=part.eventA[i];out.eventB[at]=part.eventB[i];
+                out.eventTarget[at]=part.eventTarget[i];out.eventMeasured[at]=part.eventMeasured[i];
+                out.eventDistance[at]=part.eventDistance[i];
+                out.eventWeight[at]=part.eventWeight[i];
+            }
+            std::vector<int64_t>().swap(part.eventA);std::vector<int64_t>().swap(part.eventB);
+            std::vector<double>().swap(part.eventTarget);std::vector<double>().swap(part.eventMeasured);
+            std::vector<double>().swap(part.eventDistance);
+            std::vector<double>().swap(part.eventWeight);
+        }
     }
     if(!out.used&&!out.enclosureArcs)throw std::invalid_argument("no usable winding constraints");
     // Merge independent sorted job outputs in disjoint A-node ranges. Equal

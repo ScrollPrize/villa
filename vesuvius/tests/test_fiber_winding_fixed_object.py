@@ -62,3 +62,18 @@ def test_settings_reject_an_unknown_key_and_a_missing_path():
         fixed_object_settings(dict(fixed_object=dict(windings='w.json', extra=1)))
     with pytest.raises(ValueError):
         fixed_object_settings(dict(fixed_object=dict()))
+
+
+def test_classification_modes_are_validated():
+    """run+record is accepted; the sign-free mode still needs the tags alone."""
+    from vesuvius.neural_tracing.fiber_trace_3d.fiber_wgraph_geometry import winding_settings
+    base = dict(weights=dict(parallel=1, perpendicular=1, enclosure=0, manual=0))
+    assert winding_settings(dict(base, classification='run+record'))['classification'] == 'run+record'
+    assert winding_settings(dict(base))['classification'] == 'run'
+    with pytest.raises(ValueError):
+        winding_settings(dict(base, classification='tags'))
+    with pytest.raises(ValueError):
+        # Without a classification run there is nothing to pin, so a run that
+        # solves no signs needs the tags alone.
+        winding_settings(dict(weights=dict(parallel=0, perpendicular=0, enclosure=0, manual=1),
+                              classification='run+record', normal_sign='none'))

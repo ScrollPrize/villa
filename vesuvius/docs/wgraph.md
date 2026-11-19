@@ -66,6 +66,29 @@ Packaged stage defaults are merged first, then the selected common and stage set
 
 Stages produce new stores rather than mutating inputs. Derived result stores reference their chosen upstream stores; classification, sign, winding and UV results can therefore be rerun independently of extraction. The native extraction stage publishes normal-aligned standard measurement data; staging internals are not a public graph format. See [fiber workflows](fiber_workflows.md) for the graph schemas and detailed stage output fields.
 
+### Crossing evaluation
+
+`vc_wgraph crossings CONFIG` scores solved windings against the crossing
+measurements themselves, one row per measured crossing: no fractional target
+expansion, no aggregation by fiber pair and no clamping of the measured
+separation. The relation is `k_b - k_a = target`, where the target is the
+measured winding separation corrected for the H/V offset and the seam
+transport, and the residual is reported both unrounded (against that measured
+target) and rounded (against the target rounded to a whole turn, the relation
+the L1 problem can state). Four numbers per group: unrounded mean and median,
+rounded median and the share of crossings the solve satisfies exactly. A
+nonzero rounded median is a systematic winding shift; an unrounded mean away
+from zero without it is a sub-turn displacement.
+
+The config names `graph_store` (the sign-lineage store the solve read),
+`winding` (the same settings the solve used), `solves` (label to result
+store), optionally `focus` (a JSON file of fiber UUIDs, or a list: only
+crossings between a focus fiber and another fiber are scored) and `output`.
+Results are grouped by distance cut (`|round(measured separation)| <= 0, 1,
+2`) and, for the tightest cut, by the winding the solve gives the focus side.
+Only the largest connected component is scored unless
+`largest_component_only` is false.
+
 The store chain is `import → extract → hvb → sign → winding → uv`. `winding` consumes typed classification and normal-sign runs from its input store references, builds the existing fractional-target L1 graph, and runs the historic linear GPU IRLS solver (15 reweighting rounds, 500 CG iterations, epsilon .05 unless explicitly overridden). It records integer readout, continuous potential, connected component and residual metrics. These are point estimates, not calibrated winding probabilities. No GT labels, spiral reference solution or external solver-source file is required. The measured geometry and umbilicus working-coordinate binding remain required inputs for seam transport.
 
 ### Winding inputs and weights
@@ -83,7 +106,7 @@ The store chain is `import → extract → hvb → sign → winding → uv`. `wi
 | `manual_links.approval_states` | list, default `["approved"]` | Approval states of links to use. |
 | `manual_links.include_auto` | bool, default false | Also use pending automatic (`meta.auto`) links. |
 | `manual_links.max_anchor_distance` | voxels, default 5 | Anchors farther from their fiber polyline fail the run (coordinate-frame guard). |
-| `classification` | `run` (default), `record` | Families from the pinned classification run, or from the fiber records' `family` column (`record_family`: `any`, `manual`, `automatic` selects by `manual_family`). With `record` no `hvb` run is needed. |
+| `classification` | `run` (default), `record`, `run+record` | Families from the pinned classification run, from the fiber records' `family` column (`record_family`: `any`, `manual`, `automatic` selects by `manual_family`), or the run with the tagged fibers overriding it. With `record` no `hvb` run is needed; `run+record` pins the same run as `run` and keeps every tagged fiber enabled with its tagged family, which is how a hand-tagged scaffold imported into a traced volume keeps its own fibers when the classifier calls them broken. |
 | `normal_sign` | `run` (default), `none` | A pinned normal-sign run, or none. `none` is only valid with zero automatic weights (manual links only) and `classification: record`; such a run pins no input run. |
 | `umbilicus` | path or `store` | The legacy umbilicus document, or the input store's own umbilicus object (which retains that document's metadata). |
 | `handedness` | `+1`, `-1` | The scroll's winding direction for seam transport: `+1` when the winding index grows with increasing angle around the umbilicus, `-1` otherwise. Normally not set here: the stage reads it from the store umbilicus object's `winding_handedness` meta (`vc_wgraph handedness -i store.vcobj --set -1`), else from the open-data catalog orientation (`-1` when exactly one of `z_direction_is_top_to_bottom` and `left_handed_coordinates` holds, as VC3D reads it). A volume whose handedness is stated nowhere is an error, never a guess. The run records the value used. |
