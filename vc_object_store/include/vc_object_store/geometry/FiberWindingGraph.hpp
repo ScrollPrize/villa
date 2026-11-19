@@ -1,4 +1,5 @@
 #pragma once
+#include "vc_object_store/geometry/FiberCrossingWeight.hpp"
 #include "vc_object_store/geometry/FiberWinding.hpp"
 #include <queue>
 
@@ -35,6 +36,12 @@ struct FiberWindingGraphInput {
 // events regardless of the perpendicular weight.
 struct FiberWindingGraphOptions {
     double windingScale=1,perpendicularOffset=.5,perpendicularWeight=1,parallelWeight=1;
+    // How much each crossing counts as evidence, on top of its type weight
+    // (FiberCrossingWeight.hpp, the rule the sign solve uses): |dot|^power,
+    // and with `dampByWindingDistance` also min(1, 1/d^2) of its measured
+    // separation. Power 0 without damping is the flat per-type weight.
+    double dotWeightPower=0;
+    bool dampByWindingDistance=false;
     bool enclosures=false;
     size_t constraintBatch=500000,readBatch=32768,workers=32;
 };
@@ -177,7 +184,8 @@ inline FiberWindingL1Columns prepareFiberWindingGraph(const PackedFiberGeometry&
     if(!options.workers||!options.constraintBatch||!options.readBatch||
        !std::isfinite(options.windingScale)||options.windingScale<0||
        !std::isfinite(options.perpendicularOffset)||!std::isfinite(options.perpendicularWeight)||options.perpendicularWeight<0||
-       !std::isfinite(options.parallelWeight)||options.parallelWeight<0)
+       !std::isfinite(options.parallelWeight)||options.parallelWeight<0||
+       !std::isfinite(options.dotWeightPower)||options.dotWeightPower<0)
         throw std::invalid_argument("invalid winding graph preparation settings");
     if(options.perpendicularWeight<=0&&options.parallelWeight<=0&&!options.enclosures)
         throw std::invalid_argument("winding graph preparation needs a positive parallel or perpendicular weight, or enclosures");
@@ -219,7 +227,14 @@ inline FiberWindingL1Columns prepareFiberWindingGraph(const PackedFiberGeometry&
                 event.parallel=in.parallel[k];
                 event.connector=point(in.connector,k);
                 event.normalA=point(in.normalA,k);event.normalB=point(in.normalB,k);
-                event.weight=event.parallel?options.parallelWeight:options.perpendicularWeight;
+                // The type weight, scaled by how square the crossing is and
+                // damped by how far apart in winding it is (both off by
+                // default, which is the flat per-type weight).
+                const double dot=event.normalA[0]*event.normalB[0]+event.normalA[1]*event.normalB[1]
+                                +event.normalA[2]*event.normalB[2];
+                event.weight=(event.parallel?options.parallelWeight:options.perpendicularWeight)
+                            *fiberCrossingDotWeight(dot,options.dotWeightPower)
+                            *(options.dampByWindingDistance?fiberCrossingDistanceFactor(event.distance):1.);
                 event.enclosure=options.enclosures;
                 event.perpendicularOffset=options.perpendicularOffset;
                 const auto relation=windingEventRelation(geometry,event);

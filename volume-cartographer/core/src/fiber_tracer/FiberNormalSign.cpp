@@ -1,5 +1,7 @@
 #include "vc/fiber_tracer/FiberNormalSign.hpp"
 
+#include <vc_object_store/geometry/FiberCrossingWeight.hpp>
+
 #include <ceres/ceres.h>
 #include <opencv2/core.hpp>
 
@@ -30,18 +32,16 @@ double fiberSignCost(const double residual, const double epsilon)
 
 double fiberSignWindingDistanceFactor(const double distance, const FiberSignDistanceWeight mode)
 {
+    // The shared rule (vc_object_store geometry/FiberCrossingWeight.hpp): the
+    // winding graph weighs a crossing the same way when it is asked to.
     if (mode == FiberSignDistanceWeight::None) return 1.0;
-    const double turns = std::abs(distance);
-    // An unmeasured (or infinite) distance counts as within one winding.
-    if (!std::isfinite(turns) || !(turns > 1.0)) return 1.0;
-    return 1.0 / std::max(turns * turns, 1e-12);
+    return vc::geometry::fiberCrossingDistanceFactor(distance);
 }
 
 double fiberSignEventWeight(const double dot, const double windingDistance, const FiberSignOptions& options)
 {
-    const double magnitude = std::abs(dot);
-    return magnitude * fiberSignWindingDistanceFactor(windingDistance, options.distanceWeight)
-           * std::pow(std::max(magnitude, 1e-12), options.dotWeightPower - 1.0);
+    return fiberSignWindingDistanceFactor(windingDistance, options.distanceWeight)
+           * vc::geometry::fiberCrossingDotWeight(dot, options.dotWeightPower);
 }
 
 namespace
