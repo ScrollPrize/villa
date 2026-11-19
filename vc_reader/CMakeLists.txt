@@ -9,10 +9,15 @@ endif()
 option(VC_READER_BUILD_PYTHON "Build Python extensions" ON)
 option(VC_READER_BUILD_READER "Build Zarr reading and sampling APIs" ON)
 option(VC_READER_BUILD_NATIVE_TESTS "Build native C++ API tests" OFF)
+# AMD GPUs: the CUDA backends compiled with HIP (ROCm), see cmake/Hip.cmake.
+option(VC_READER_ENABLE_HIP "Build the GPU backends for AMD GPUs with HIP instead of CUDA" OFF)
+if(VC_READER_ENABLE_HIP AND VC_READER_ENABLE_CUDA)
+    message(FATAL_ERROR "VC_READER_ENABLE_CUDA and VC_READER_ENABLE_HIP are mutually exclusive")
+endif()
 
 # Initialize CUDA architecture defaults before creating targets.
 # An explicit CPU build skips CUDA discovery entirely.
-if(NOT DEFINED VC_READER_ENABLE_CUDA OR VC_READER_ENABLE_CUDA)
+if(NOT VC_READER_ENABLE_HIP AND (NOT DEFINED VC_READER_ENABLE_CUDA OR VC_READER_ENABLE_CUDA))
     if(NOT DEFINED CMAKE_CUDA_COMPILER AND NOT DEFINED ENV{CUDACXX})
         # Toolkit discovery also searches standard locations outside PATH.
         find_package(CUDAToolkit QUIET)
@@ -30,7 +35,11 @@ if(CMAKE_CUDA_COMPILER)
 endif()
 option(VC_READER_ENABLE_CUDA "Build optional CUDA reader and transform backends"
     ${_vc_reader_cuda_default})
-if(VC_READER_ENABLE_CUDA)
+if(VC_READER_ENABLE_HIP)
+    include(cmake/Hip.cmake)
+    # The CUDA backends are described once and compiled by the HIP compiler.
+    set(VC_READER_ENABLE_CUDA ON)
+elseif(VC_READER_ENABLE_CUDA)
     enable_language(CUDA)
     find_package(CUDAToolkit REQUIRED)
 endif()
@@ -67,6 +76,9 @@ if(VC_READER_BUILD_READER)
     include(cmake/NativeReader.cmake)
 endif()
 include(cmake/InstallNative.cmake)
+if(VC_READER_ENABLE_HIP)
+    vc_reader_hip_finalize()
+endif()
 
 if(VC_READER_BUILD_NATIVE_TESTS)
     enable_testing()

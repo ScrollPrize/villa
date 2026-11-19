@@ -10,6 +10,10 @@ import os
 import numpy as np
 from . import _reader
 
+# DLPack device type of vc_reader GPU arrays: 2 (CUDA), or 10 (ROCm) when the
+# extension was built for AMD GPUs with HIP.
+_DEVICE_TYPE = getattr(_reader, "_gpu_device_type", 2)
+
 
 def is_available():
     return bool(getattr(_reader, "reader_cuda_available", lambda: False)())
@@ -97,7 +101,7 @@ class DeviceArray:
 
     def __dlpack_device__(self):
         self._ready()
-        return (2, self.device)
+        return (_DEVICE_TYPE, self.device)
 
     def __array__(self, *args, **kwargs):
         raise TypeError("use DeviceArray.numpy() for an explicit host copy")
@@ -126,12 +130,12 @@ def pool_release_threshold(*, device=0):
 
 
 def is_device_array(value):
-    """True for DeviceArray or any CUDA DLPack producer (e.g. a CUDA torch tensor)."""
+    """True for DeviceArray or any GPU DLPack producer on the same platform (e.g. a CUDA or ROCm torch tensor)."""
     if isinstance(value, DeviceArray):
         return True
     describe = getattr(value, "__dlpack_device__", None)
     try:
-        return describe is not None and describe()[0] == 2
+        return describe is not None and describe()[0] == _DEVICE_TYPE
     except Exception:
         return False
 

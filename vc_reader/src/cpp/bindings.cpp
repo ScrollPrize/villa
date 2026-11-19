@@ -6,6 +6,7 @@
 // Python bindings for the C++ read path (module vc_reader._reader).
 #include "array.hpp"
 #include "cuda_available.hpp"
+#include "gpu_device.hpp"
 #include "vc_reader/composite.hpp"
 #include "vc_reader/grid.hpp"
 #include "vc_reader/computed.hpp"
@@ -116,6 +117,8 @@ NB_MODULE(_reader, m)
 {
     vcr::display::python::bind(m);
     m.doc() = "Zarr reader: local and HTTP chunks, disk cache layers, memory cache.";
+    // DLPack device type of GPU arrays: 2 (CUDA), or 10 (ROCm) in HIP builds.
+    m.attr("_gpu_device_type") = int(vcr::GpuDevice::value);
     m.def("_local_points", [](HostPoints points, std::optional<vcr::Index> origin) -> nb::object {
         if (points.shape(1) != 3) throw nb::value_error("expected points of shape (N, 3)");
         const auto local = [&](const auto* p) -> nb::object {
@@ -448,7 +451,7 @@ NB_MODULE(_reader, m)
                 else toUint16(input.data(),input.size(),output.data(),conversion);
             }
 #ifdef VC_READER_CUDA
-            else if (input.device_type()==nb::device::cuda::value) {
+            else if (input.device_type()==vcr::GpuDevice::value) {
                 vcr::device::Guard guard(input.device_id());
                 if constexpr (sizeof(T) == 1) vcr::display::cuda::toUint8(input.data(),input.size(),output.data(),coverage ? coverage->data() : nullptr,conversion);
                 else vcr::display::cuda::toUint16(input.data(),input.size(),output.data(),conversion);
@@ -471,7 +474,7 @@ NB_MODULE(_reader, m)
         if (input.device_type()==nb::device::cpu::value)
             vcr::display::applyLut(input.data(),input.shape(0),input.shape(1),input.shape(1),lut.data(),output.data(),output.shape(1));
 #ifdef VC_READER_CUDA
-        else if (input.device_type()==nb::device::cuda::value) {
+        else if (input.device_type()==vcr::GpuDevice::value) {
             vcr::device::Guard guard(input.device_id());
             vcr::display::cuda::applyLut(input.data(),input.shape(0),input.shape(1),input.shape(1),lut.data(),output.data(),output.shape(1));
         }
@@ -489,7 +492,7 @@ NB_MODULE(_reader, m)
         if (base.device_type()==nb::device::cpu::value)
             vcr::display::blend(base.data(),overlay.data(),base.size(),opacity,output.data());
 #ifdef VC_READER_CUDA
-        else if (base.device_type()==nb::device::cuda::value) {
+        else if (base.device_type()==vcr::GpuDevice::value) {
             vcr::device::Guard guard(base.device_id());
             vcr::display::cuda::blend(base.data(),overlay.data(),base.size(),opacity,output.data());
         }

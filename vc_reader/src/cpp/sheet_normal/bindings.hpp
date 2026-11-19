@@ -1,6 +1,7 @@
 #pragma once
 #include "normal.hpp"
 #include "sample.hpp"
+#include "../gpu_device.hpp"
 namespace vcr::sheet_normal {
 template<class A> inline bool validate(A image,std::size_t batch) {
     auto dt=image.dtype();
@@ -87,7 +88,7 @@ inline void bind(nb::module_& m) {
         return nb::cast(nb::ndarray<nb::numpy,float>(ptr,{n,4},owner));
     },"image"_a,"centers"_a,"out"_a=nb::none());
 #ifdef VC_READER_CUDA
-    using Device=nb::ndarray<nb::array_api,nb::c_contig,nb::device::cuda>;
+    using Device=nb::ndarray<nb::array_api,nb::c_contig,vcr::GpuDevice>;
     m.def("_sheet_normals_cuda",[check,check_output](Device image,Centers centers,nb::object destination) -> nb::object {
         check(centers); const auto n=centers.shape(0); bool floating=validate(image,n);
         device::Storage out;

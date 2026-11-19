@@ -2,6 +2,7 @@
 #include "reader.hpp"
 #include "../cuda_available.hpp"
 #include "../cuda_stream.hpp"
+#include "../gpu_device.hpp"
 #include <nanobind/stl/array.h>
 #include <nanobind/stl/optional.h>
 namespace vcr::reader_cuda {
@@ -11,7 +12,7 @@ namespace vcr::reader_cuda {
 struct Owned {
     device::Storage storage; std::size_t count; nb::dlpack::dtype dtype; int device;
     nb::object array(nb::handle self) const {
-        return nb::cast(nb::ndarray<nb::array_api, nb::device::cuda>(storage->ptr,1,&count,self,nullptr,dtype,nb::device::cuda::value,device));
+        return nb::cast(nb::ndarray<nb::array_api, vcr::GpuDevice>(storage->ptr,1,&count,self,nullptr,dtype,vcr::GpuDevice::value,device));
     }
 };
 inline nb::object owned(device::Storage storage, std::size_t count, nb::dlpack::dtype dtype, int device) {
@@ -29,7 +30,7 @@ inline nb::object outputs(Result result, int device) {
 }
 inline void bind(nb::module_& m) {
     using Host=nb::ndarray<nb::ro,nb::c_contig,nb::device::cpu>;
-    using Device=nb::ndarray<nb::array_api,nb::c_contig,nb::device::cuda>;
+    using Device=nb::ndarray<nb::array_api,nb::c_contig,vcr::GpuDevice>;
     m.def("reader_cuda_available",&vcr::cuda::available);
     nb::class_<Owned>(m,"CudaStorage")
         .def("array",[](nb::handle self) { return nb::cast<const Owned&>(self).array(self); })
@@ -53,10 +54,10 @@ inline void bind(nb::module_& m) {
     m.def("_cuda_view",[](Device input,const std::vector<std::size_t>& shape,std::size_t offset) {
         std::size_t n=1; for (auto s:shape) { if (s && n>SIZE_MAX/s) throw nb::value_error("shape overflow"); n*=s; }
         if (offset>input.size() || n>input.size()-offset) throw nb::value_error("view exceeds storage");
-        return nb::ndarray<nb::array_api, nb::device::cuda>(static_cast<char*>(input.data())+offset*input.dtype().bits/8,
-            shape.size(),shape.data(),nb::cast(input,nb::rv_policy::reference),nullptr,input.dtype(),nb::device::cuda::value,input.device_id());
+        return nb::ndarray<nb::array_api, vcr::GpuDevice>(static_cast<char*>(input.data())+offset*input.dtype().bits/8,
+            shape.size(),shape.data(),nb::cast(input,nb::rv_policy::reference),nullptr,input.dtype(),vcr::GpuDevice::value,input.device_id());
     });
-    m.def("_cuda_describe",[](nb::ndarray<nb::ro,nb::device::cuda> input) {
+    m.def("_cuda_describe",[](nb::ndarray<nb::ro,vcr::GpuDevice> input) {
         if (input.size()) {
             std::int64_t stride=1;
             for (std::size_t a=input.ndim();a-->0;) {
