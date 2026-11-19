@@ -85,6 +85,45 @@ def test_native_winding_graph_matches_existing_partitioned_preparation(workers,s
     assert not actual['weight'].flags.writeable
 
 
+@pytest.mark.parametrize('workers',[1,4])
+def test_crossing_weighting_scales_each_arc_by_squareness_and_separation(workers):
+    """The sign solve's rule, asked of the winding graph: |dot|^p * min(1, 1/d^2).
+
+    The arcs themselves do not move - only what each crossing is worth - so the
+    weighted preparation differs from the flat one by exactly the per-event
+    factor, aggregated the same way.
+    """
+    paths,native,data,mapping,family,signs=fixture()
+    common=dict(constraint_batch=97,read_batch=19,workers=workers,parallel_weight=1.,perpendicular_weight=1.)
+    arguments=(data.i,data.j,mapping,family,signs,data.arc_a,data.arc_b,data.distance,data.parallel,
+               data.normal_a,data.normal_b,data.connector,data.valid_a,data.valid_b,data.valid_connector)
+    flat=native.prepare_winding_graph(*arguments,**common)
+    weighted=native.prepare_winding_graph(*arguments,dot_weight_power=2.,damp_by_winding_distance=True,**common)
+    # Same arcs, same targets: the weighting decides nothing about the relation.
+    for key in ('a','b','target'):np.testing.assert_array_equal(weighted[key],flat[key])
+    assert weighted['used']==flat['used'] and weighted['expanded']==flat['expanded']
+    # Per event, the factor the sign solve would give it, aggregated per arc.
+    scaled=SimpleNamespace(**{name:getattr(data,name) for name in
+        ('i','j','arc_a','arc_b','distance','parallel','normal_a','normal_b','connector',
+         'valid_a','valid_b','valid_connector')})
+    dot=np.sum(data.normal_a*data.normal_b,axis=1)
+    turns=np.abs(data.distance)
+    factor=np.abs(dot)**2*np.where(turns>1.,1./np.maximum(turns*turns,1e-12),1.)
+    expected=native.prepare_winding_graph(scaled.i,scaled.j,mapping,family,signs,scaled.arc_a,scaled.arc_b,
+        scaled.distance,scaled.parallel,scaled.normal_a,scaled.normal_b,scaled.connector,
+        scaled.valid_a,scaled.valid_b,scaled.valid_connector,dot_weight_power=2.,damp_by_winding_distance=True,**common)
+    np.testing.assert_array_equal(weighted['weight'],expected['weight'])
+    # A square, close crossing keeps its weight; everything else loses some.
+    assert np.all(weighted['weight']<=flat['weight']+1e-12)
+    assert np.any(weighted['weight']<flat['weight']-1e-12)
+    assert 0 < factor.max() <= 1.
+    # The per-type weight still scales on top of it.
+    tenth=native.prepare_winding_graph(*arguments[:5],*arguments[5:],
+        **dict(common,parallel_weight=.1),dot_weight_power=2.,damp_by_winding_distance=True)
+    parallel_only=weighted['weight']!=tenth['weight']
+    assert parallel_only.any()
+
+
 def test_shared_native_signed_order_matches_numpy():
     _,_,data,_,_,_=fixture()
     np.testing.assert_array_equal(fiber_signed_order(data.connector,data.normal_a,data.normal_b),

@@ -1,5 +1,7 @@
 #include "vc/fiber_tracer/FiberNormalSign.hpp"
 
+#include <vc_object_store/geometry/FiberCrossingWeight.hpp>
+
 #include <ceres/ceres.h>
 #include <opencv2/core.hpp>
 
@@ -30,11 +32,10 @@ double fiberSignCost(const double residual, const double epsilon)
 
 double fiberSignWindingDistanceFactor(const double distance, const FiberSignDistanceWeight mode)
 {
+    // The shared rule (vc_object_store geometry/FiberCrossingWeight.hpp): the
+    // winding graph weighs a crossing the same way when it is asked to.
     if (mode == FiberSignDistanceWeight::None) return 1.0;
-    const double turns = std::abs(distance);
-    // An unmeasured (or infinite) distance counts as within one winding.
-    if (!std::isfinite(turns) || !(turns > 1.0)) return 1.0;
-    return 1.0 / std::max(turns * turns, 1e-12);
+    return vc::geometry::fiberCrossingDistanceFactor(distance);
 }
 
 namespace
@@ -412,9 +413,8 @@ Problem build(const std::vector<double>& agreement, const std::vector<FiberSignE
         problem.dot[e] = dot;
         problem.distance[e] = event.windingDistance;
         problem.target[e] = dot < 0.0 ? 1.0 : 0.0;
-        const double factor = fiberSignWindingDistanceFactor(event.windingDistance, options.distanceWeight)
-                              * std::pow(std::max(std::abs(dot), 1e-12), options.dotWeightPower - 1.0);
-        problem.rawWeight[e] = std::abs(dot) * factor;
+        problem.rawWeight[e] = fiberSignWindingDistanceFactor(event.windingDistance, options.distanceWeight)
+                               * vc::geometry::fiberCrossingDotWeight(dot, options.dotWeightPower);
         total += problem.rawWeight[e];
         if (event.a == event.b) ++result.selfEvents;
         if (std::isfinite(event.windingDistance)) ++result.eventsWithWindingDistance;

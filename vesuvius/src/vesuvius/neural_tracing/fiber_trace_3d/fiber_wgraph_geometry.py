@@ -51,10 +51,42 @@ def winding_settings(config):
     if normal_sign=='none' and classification=='run':
         raise ValueError('normal_sign none needs classification record; there is no run to pin')
     if not automatic and weights['manual']<=0:raise ValueError('All constraint weights are zero')
+    # How much each crossing counts as evidence on top of its type weight, in
+    # the sign stage's own terms: |dot|^normal_dot_weight_power, damped by
+    # min(1, 1/d^2) of its measured separation when winding_distance_weight is
+    # inverse_square. The defaults are the flat per-type weights.
+    dot_power=float(config.get('normal_dot_weight_power',0.))
+    if not np.isfinite(dot_power) or dot_power<0:
+        raise ValueError('normal_dot_weight_power must be a finite non-negative number')
+    distance_weight=config.get('winding_distance_weight','none')
+    if distance_weight not in ('inverse_square','none'):
+        raise ValueError('winding_distance_weight must be inverse_square or none')
     from .fiber_wgraph_links import link_settings
     return dict(optimizer=optimizer,weights=weights,lemon=dict(backend=lemon['backend'],capacity_scale=int(lemon['capacity_scale'])),
                 classification=classification,record_family=record_family,normal_sign=normal_sign,automatic=automatic,
+                dot_weight_power=dot_power,winding_distance_weight=distance_weight,
+                fixed_object=fixed_object_settings(config),
                 manual_links=link_settings(config) if weights['manual']>0 else None)
+
+
+def fixed_object_settings(config):
+    """Rigid groups of fibers the solve must keep as they are, or None.
+
+    ``fixed_object.windings`` names a solve's windings JSON (``ids``,
+    ``selected_winding`` and ``component``, as ``vc_scaffold_solve`` writes
+    it). Every fiber of this store listed there joins its component; a
+    component with two or more fibers present is contracted into one node, so
+    the global solve may move the group but never its members against each
+    other.
+    """
+    section=config.get('fixed_object')
+    if section is None:return None
+    if not isinstance(section,dict):raise ValueError('fixed_object must be an object')
+    unknown=set(section)-{'windings'}
+    if unknown:raise ValueError('Unknown fixed_object settings: '+', '.join(sorted(unknown)))
+    path=section.get('windings')
+    if not path:raise ValueError('fixed_object needs windings: the solve whose groups are fixed')
+    return dict(windings=str(path))
 
 
 def _input_lineage(config, winding_run=None, *, settings=None):
@@ -213,6 +245,74 @@ def _read_winding_inputs(config,input_source,selected,*,stage,modes=None):
     return graph,paths,ids,family,normal_sign,timings
 
 
+def fixed_object_groups(settings,ids):
+    """Per fiber: its rigid group's root index and its offset inside it.
+
+    Returns ``(root, offset, report)`` with ``root`` -1 for a fiber in no
+    group. A group is a component of the fixed solve with at least two of its
+    fibers in this store; a component present once fixes nothing, so it is
+    left free and counted.
+    """
+    section=settings.get('fixed_object')
+    if section is None:return None,None,None
+    fixed=json.loads(Path(section['windings']).read_text())
+    for key in ('ids','selected_winding','component'):
+        if key not in fixed:raise ValueError(f'fixed_object windings need {key}')
+    winding={str(u):int(w) for u,w in zip(fixed['ids'],fixed['selected_winding'])}
+    component={str(u):int(c) for u,c in zip(fixed['ids'],fixed['component'])}
+    members={}
+    for index,uuid in enumerate(ids):
+        key=str(uuid)
+        if key in component:members.setdefault(component[key],[]).append((index,winding[key]))
+    root=np.full(len(ids),-1,np.int64);offset=np.zeros(len(ids),np.int64)
+    groups=0;fibers=0;single=0
+    for _,entries in sorted(members.items()):
+        if len(entries)<2:
+            single+=len(entries)
+            continue
+        entries.sort()
+        base,baseWinding=entries[0]
+        groups+=1
+        for index,value in entries:
+            root[index]=base;offset[index]=value-baseWinding;fibers+=1
+    report=dict(solve_fibers=len(winding),solve_components=len(set(component.values())),
+                present=sum(len(entries) for entries in members.values()),
+                groups=groups,fixed_fibers=fibers,single_fiber_components=single)
+    if groups==0:return None,None,report
+    return root,offset,report
+
+
+def _contract_fixed_groups(merged,root,offset,report):
+    """Move every arc of a fixed group to its root and drop the internal ones.
+
+    An arc between two members of one group asserts what the group already
+    fixes: it is dropped and counted, with the turns it disagrees by, so a
+    scaffold that contradicts the constraints cannot hide.
+    """
+    a=merged['a'];b=merged['b'];target=merged['target'];weight=merged['weight']
+    rootA=root[a];rootB=root[b]
+    inA=rootA>=0;inB=rootB>=0
+    internal=inA&inB&(rootA==rootB)
+    if internal.any():
+        residual=np.abs(target[internal]-(offset[b[internal]]-offset[a[internal]]))
+        report.update(internal_arcs=int(internal.sum()),
+                      internal_weight=float(weight[internal].sum()),
+                      internal_disagreeing_arcs=int((residual>0).sum()),
+                      internal_disagreement_turns=float(residual.sum()))
+    else:
+        report.update(internal_arcs=0,internal_weight=0.,internal_disagreeing_arcs=0,internal_disagreement_turns=0.)
+    keep=~internal
+    a=a[keep];b=b[keep];target=target[keep];weight=weight[keep]
+    rootA=root[a];rootB=root[b]
+    # k_member = k_root + offset, so an arc that leaves the group takes the
+    # member's offset into its target.
+    movedA=rootA>=0;movedB=rootB>=0
+    target=target+np.where(movedA,offset[a],0)-np.where(movedB,offset[b],0)
+    a=np.where(movedA,rootA,a);b=np.where(movedB,rootB,b)
+    report.update(rewritten_arcs=int((movedA|movedB).sum()),remaining_arcs=int(len(a)))
+    return dict(a=a,b=b,target=target,weight=weight)
+
+
 def _assemble_arcs(config,settings,graph,paths,ids,family,normal_sign):
     """Automatic, enclosure and manual arcs with their type weights, aggregated."""
     from .fiber_packed_priors import _geometry
@@ -226,6 +326,8 @@ def _assemble_arcs(config,settings,graph,paths,ids,family,normal_sign):
             lasagna_winding_scale=float(config.get('lasagna_winding_scale',1.)),
             perpendicular_offset=float(config.get('perpendicular_offset',.5)),
             parallel_weight=weights['parallel'],perpendicular_weight=weights['perpendicular'],
+            dot_weight_power=settings['dot_weight_power'],
+            damp_by_winding_distance=settings['winding_distance_weight']=='inverse_square',
             enclosures=weights['enclosure']>0,
             constraint_batch=int(config.get('constraint_batch',500000)),
             read_batch=int(config.get('read_batch',32768)),
@@ -250,8 +352,16 @@ def _assemble_arcs(config,settings,graph,paths,ids,family,normal_sign):
     positive=merged['weight']>0
     merged={key:value[positive] for key,value in merged.items()}
     if not len(merged['a']):raise ValueError('No usable winding constraints')
+    root,offset,fixed_report=fixed_object_groups(settings,ids)
+    if fixed_report is not None:counts['fixed_object']=fixed_report
+    if root is not None:
+        merged={key:np.asarray(value) for key,value in merged.items()}
+        merged['a']=merged['a'].astype(np.int64);merged['b']=merged['b'].astype(np.int64)
+        merged['target']=merged['target'].astype(np.int64)
+        merged=_contract_fixed_groups(merged,root,offset,fixed_report)
+        if not len(merged['a']):raise ValueError('No winding constraints left outside the fixed groups')
     g=aggregate_l1_edges(merged['a'].astype(np.int64),merged['b'].astype(np.int64),merged['target'].astype(np.int64),merged['weight'])
-    return g,counts
+    return g,counts,(root,offset)
 
 
 def _flat_settings(settings,counts,config):
@@ -259,6 +369,9 @@ def _flat_settings(settings,counts,config):
     flat=dict(classification_from_record=settings['classification']=='record',normal_sign_from_run=settings['normal_sign']=='run',
               handedness=int(counts.get('handedness',0)))
     for name in WEIGHT_TYPES:flat['weight_'+name]=float(settings['weights'][name])
+    flat['normal_dot_weight_power']=float(settings['dot_weight_power'])
+    flat['winding_distance_damped']=settings['winding_distance_weight']=='inverse_square'
+    flat['fixed_object']=settings.get('fixed_object') is not None
     if settings['optimizer']=='lemon':
         flat.update(lemon_capacity_scale=int(settings['lemon']['capacity_scale']))
     else:
@@ -291,7 +404,7 @@ def _solve_winding_direct(config):
     selected=_input_lineage(config,settings=settings)
     graph,paths,ids,family,normal_sign,timings=_read_winding_inputs(config,input_source,selected,stage='winding',modes=settings)
     phase=time.monotonic()
-    g,counts=_assemble_arcs(config,settings,graph,paths,ids,family,normal_sign)
+    g,counts,(fixed_root,fixed_offset)=_assemble_arcs(config,settings,graph,paths,ids,family,normal_sign)
     if getattr(paths,'tag_counts',None) is not None:counts['record_family']=paths.tag_counts
     counts['handedness']=int(getattr(getattr(paths,'seam',None),'handedness',0))
     timings['native_winding_graph']=time.monotonic()-phase
@@ -322,11 +435,24 @@ def _solve_winding_direct(config):
         if not np.isfinite(x).all():raise RuntimeError('IRLS returned nonfinite winding potentials')
         labels=round_components(x,component)
         method='linear_irls'
+    if fixed_root is not None:
+        # The group moved as one: its members sit where their root does, each
+        # at the offset the fixed solve gave it, in the root's component.
+        members=fixed_root>=0
+        labels=np.asarray(labels,np.int64).copy()
+        x=np.asarray(x,float).copy()
+        component=np.asarray(component).copy()
+        labels[members]=labels[fixed_root[members]]+fixed_offset[members]
+        x[members]=x[fixed_root[members]]+fixed_offset[members]
+        component[members]=component[fixed_root[members]]
+        residual=np.abs(labels[g['b']]-labels[g['a']]-g['target']).astype(float)
     timings['solve']=time.monotonic()-phase
     summary=dict(fibers=n,arcs=len(g['a']),seconds=timings['solve'],method=method,
         weighted_l1=float(np.dot(g['weight'],residual)),mean_residual=float(residual.mean()),
         max_residual=float(residual.max()),expanded_arcs_within_half_turn_percent=float(100*np.mean(residual<=.5)),
-        components=int(component.max())+1,counts=counts,settings=settings)
+        # Distinct labels, not the largest plus one: a fixed group's members
+        # take their root's component, which leaves holes in the numbering.
+        components=int(np.unique(component).size),counts=counts,settings=settings)
     columns=dict(enabled=np.ones(n,np.int64),family=family,selected_winding=labels.astype(np.int64),
                  winding_mean=x,component=component.astype(np.int64))
     metrics=[dict(iteration=int(config.get('irls',15)) if method=='linear_irls' else 0,scope='all',name=name,

@@ -126,7 +126,8 @@ void bindFiberWinding(nb::module_& module){
             WindingI64 graphToCatalog,WindingI64 family,WindingI64 signs,WindingArc arcA,WindingArc arcB,
             WindingArc distance,WindingFlag parallel,WindingXYZ normalA,WindingXYZ normalB,WindingXYZ connector,
             WindingFlag validA,WindingFlag validB,WindingFlag validConnector,
-            double scale,double offset,double parallelWeight,double perpendicularWeight,bool enclosures,
+            double scale,double offset,double parallelWeight,double perpendicularWeight,
+            double dotWeightPower,bool dampByWindingDistance,bool enclosures,
             size_t constraintBatch,size_t readBatch,size_t workers){
             if(normalA.shape(1)!=3||normalB.shape(1)!=3||connector.shape(1)!=3)
                 throw std::invalid_argument("winding graph normals require XYZ triples");
@@ -138,7 +139,8 @@ void bindFiberWinding(nb::module_& module){
                 windingSpan(parallel),windingSpan(validA),windingSpan(validB),windingSpan(validConnector),
                 std::span(normalA.data(),normalA.shape(0)*3),std::span(normalB.data(),normalB.shape(0)*3),
                 std::span(connector.data(),connector.shape(0)*3)};
-            vc::geometry::FiberWindingGraphOptions options{scale,offset,perpendicularWeight,parallelWeight,enclosures,constraintBatch,readBatch,workers};
+            vc::geometry::FiberWindingGraphOptions options{scale,offset,perpendicularWeight,parallelWeight,
+                dotWeightPower,dampByWindingDistance,enclosures,constraintBatch,readBatch,workers};
             vc::geometry::FiberWindingL1Columns output;
             {nb::gil_scoped_release release;output=vc::geometry::prepareFiberWindingGraph(self.geometry,input,options);}
             nb::dict result;
@@ -161,6 +163,7 @@ void bindFiberWinding(nb::module_& module){
           "distance"_a,"parallel"_a,"normal_a"_a,"normal_b"_a,"connector"_a,
           "valid_a"_a,"valid_b"_a,"valid_connector"_a,
           "lasagna_winding_scale"_a=1.,"perpendicular_offset"_a=.5,"parallel_weight"_a=1.,"perpendicular_weight"_a=1.,
+          "dot_weight_power"_a=0.,"damp_by_winding_distance"_a=false,
           "enclosures"_a=false,"constraint_batch"_a=500000,"read_batch"_a=32768,"workers"_a=32);
     module.def("fiber_signed_order",[](WindingXYZ connector,WindingXYZ a,WindingXYZ b,double minimum,size_t workers){
         const size_t n=connector.shape(0);
