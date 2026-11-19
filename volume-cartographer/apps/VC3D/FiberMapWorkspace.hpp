@@ -193,6 +193,9 @@ private:
     // Selects the row's fibers and remembers its control range for the
     // overlay.
     void showScaffoldHighlight(const vc3d::fiber_map::ScaffoldHighlight& highlight);
+    // The approval row under the mouse: drawn in a style of its own, without
+    // selecting anything or moving the view.
+    void showScaffoldHover(const vc3d::fiber_map::ScaffoldHighlight& highlight);
     // Opens a ranked stretch as an approval piece between its bracketing
     // control points.
     // `arcFrom`/`arcTo`: the stretch's own ends, used for the lock controls
@@ -529,6 +532,7 @@ private:
     // fibers approved throughout), and the stretch of the selected row.
     std::vector<QGraphicsItem*> _approvalItems;
     std::vector<QGraphicsItem*> _highlightSpanItems;
+    std::vector<QGraphicsItem*> _hoverItems;
     // The solve the map currently follows (empty: the map's own evidence).
     vc3d::fiber_map::FollowedSolve _followedSolve;
     // The datasets one Solve click captured, shared by its two openers for

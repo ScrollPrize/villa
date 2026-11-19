@@ -341,6 +341,9 @@ public:
 
 signals:
     void highlightRequested(const ScaffoldHighlight& highlight);
+    // The row under the mouse, or an empty highlight when it left the list:
+    // shown on the map in a style of its own, without selecting or moving.
+    void hoverRequested(const ScaffoldHighlight& highlight);
     // Double-click on a stretch: open it as a piece between its bracketing
     // control points.
     // `arcFrom`/`arcTo`: the stretch's own arc range, so the piece can open
@@ -388,6 +391,9 @@ private:
     void activateRow(QTreeWidgetItem* item);
     // The row an item names, or null when the item is stale.
     [[nodiscard]] const Row* rowOf(const QTreeWidgetItem*) const;
+    // What a row names on the map: its fibers and the stretches drawn.
+    [[nodiscard]] ScaffoldHighlight highlightOf(const QTreeWidgetItem*) const;
+    bool eventFilter(QObject* watched, QEvent* event) override;
     // The residual a row names, when the row is a constraint of the selected
     // run; null for a stretch or a row of another run.
     [[nodiscard]] const vc::fiber_graph::ScaffoldStoredResidual* residualOf(const QTreeWidgetItem*) const;

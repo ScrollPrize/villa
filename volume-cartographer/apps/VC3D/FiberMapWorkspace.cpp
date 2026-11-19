@@ -172,6 +172,8 @@ const FiberMapPalette& activePalette()
 // either theme: they read against both grounds and, in the link case, mirror
 // colours fixed by the line annotation.
 const QColor kSuspect(QStringLiteral("#ff6b6b"));
+// The approval row under the mouse.
+const QColor kHover(QStringLiteral("#4dd0e1"));
 
 // Link markers use the line annotation's branch-link palette verbatim, so a
 // crossing reads the same here as it does in the slice and generated views:
@@ -270,6 +272,7 @@ constexpr qreal kSelectedGlowWidthPx = 14.0;
 constexpr int kSelectedGlowAlpha = 130;
 // The stretch an approval row selected: solid, wider than the traced line.
 constexpr qreal kSpanSelectionWidthPx = 5.5;
+constexpr qreal kHoverWidthPx = 3.0;
 // The fade: the background painted over the unapproved spans at half opacity,
 // wide enough to cover the traced line it dims.
 constexpr qreal kFadeWidthPx = 4.5;
@@ -1354,6 +1357,8 @@ FiberMapWorkspace::FiberMapWorkspace(CState* state, LineAnnotationController* co
     addDockWidget(Qt::RightDockWidgetArea, _approvalDock);
     connect(_approvalPanel, &vc3d::fiber_map::ScaffoldApprovalPanel::highlightRequested, this,
             [this](const vc3d::fiber_map::ScaffoldHighlight& highlight) { showScaffoldHighlight(highlight); });
+    connect(_approvalPanel, &vc3d::fiber_map::ScaffoldApprovalPanel::hoverRequested, this,
+            [this](const vc3d::fiber_map::ScaffoldHighlight& highlight) { showScaffoldHover(highlight); });
     connect(_approvalPanel, &vc3d::fiber_map::ScaffoldApprovalPanel::pieceActivated, this,
             [this](const std::string& fiber, std::int64_t from, std::int64_t to, double arcFrom, double arcTo) {
                 openScaffoldPiece(fiber, from, to, arcFrom, arcTo);
@@ -3165,6 +3170,7 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
     _kollesisItems.clear();
     _approvalItems.clear();
     _highlightSpanItems.clear();
+    _hoverItems.clear();
     _highlightSpans.clear();
     _spanSelection = false;
     _scene->clear();
@@ -4431,15 +4437,52 @@ void FiberMapWorkspace::showScaffoldHighlight(const vc3d::fiber_map::ScaffoldHig
             const auto bounds = fiberBounds(entry->fiber);
             extent = extent.isNull() ? bounds : extent.united(bounds);
         }
-    if (_view && !extent.isNull()) {
-        const QRectF visible = _view->mapToScene(_view->viewport()->rect()).boundingRect();
-        if (extent.width() > visible.width() * 0.8 || extent.height() > visible.height() * 0.8) {
-            const double margin = 0.15 * std::max(extent.width(), extent.height());
-            _view->fitInView(extent.adjusted(-margin, -margin, margin, margin), Qt::KeepAspectRatio);
-            updateLabelChipVisibility();
-        } else {
-            _view->centerOn(extent.center());
+    // Focus only: the view is centred on it and the zoom is the user's.
+    if (_view && !extent.isNull()) _view->centerOn(extent.center());
+}
+
+void FiberMapWorkspace::showScaffoldHover(const vc3d::fiber_map::ScaffoldHighlight& highlight)
+{
+    for (QGraphicsItem* item : _hoverItems) {
+        _scene->removeItem(item);
+        delete item;
+    }
+    _hoverItems.clear();
+    if (!_layoutBuilt || _layout.fibers.empty()) return;
+    // The stretches the row names, or its whole fibers when it names none.
+    QPainterPath hovered;
+    for (const auto& span : highlight.spans) {
+        const auto found = _fiberIdByUuid.find(span.fiberUuid);
+        if (found == _fiberIdByUuid.end()) continue;
+        const auto entry = _entries.find(found->second);
+        if (entry == _entries.end()) continue;
+        hovered.addPath(pathBetweenControls(entry->fiber, span.controlFrom, span.controlTo));
+    }
+    if (hovered.isEmpty())
+        for (const auto& uuid : highlight.fiberUuids) {
+            const auto found = _fiberIdByUuid.find(uuid);
+            if (found == _fiberIdByUuid.end()) continue;
+            const auto entry = _entries.find(found->second);
+            if (entry == _entries.end()) continue;
+            for (std::size_t run = 0; run < entry->fiber.runs.size(); ++run) {
+                const auto points = vc3d::fiber_map::displayRunPoints(entry->fiber, run);
+                if (points.size() < 2) continue;
+                hovered.moveTo(points.front());
+                for (std::size_t i = 1; i < points.size(); ++i) hovered.lineTo(points[i]);
+            }
         }
+    if (hovered.isEmpty()) return;
+    // Apart from the selection's solid red: a dashed cyan line over a dark
+    // casing, so it reads on any fiber colour and next to a selected stretch.
+    auto* casing = _scene->addPath(hovered, cosmeticPen(QColor(0, 0, 0, 170), kHoverWidthPx + 2.5), Qt::NoBrush);
+    casing->setZValue(kHighlightZ + 0.2);
+    QPen dashed = cosmeticPen(kHover, kHoverWidthPx);
+    dashed.setStyle(Qt::DashLine);
+    auto* line = _scene->addPath(hovered, dashed, Qt::NoBrush);
+    line->setZValue(kHighlightZ + 0.3);
+    for (auto* item : {casing, line}) {
+        item->setAcceptedMouseButtons(Qt::NoButton);
+        _hoverItems.push_back(item);
     }
 }
 

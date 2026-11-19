@@ -27,6 +27,7 @@
 
 #include <opencv2/core.hpp>
 #include <algorithm>
+#include <filesystem>
 #include <cmath>
 #include <cstdio>
 #include <iostream>
@@ -157,6 +158,31 @@ auto main(int argc, char* argv[]) -> int
 #endif
 
     vc::crash::install();
+
+    // A headless benchmark is not the user's session: it runs on a copy of
+    // their settings in a config directory of its own, so the window layout
+    // it restores and saves (on an offscreen display) never reaches theirs.
+    // The copy still names the same remote cache, which stays shared.
+    if (hasCliFlag(argc, argv, "--bench-fiber-map") && std::getenv("VC3D_CONFIG_DIR") == nullptr) {
+        try {
+            const auto settings = vc::settings::settingsFilePath();
+            const auto cache = vc::settings::remoteCachePath();
+            const auto benchDirectory = settings.parent_path() / "bench-config";
+            std::filesystem::create_directories(benchDirectory);
+            std::filesystem::copy_file(settings, benchDirectory / settings.filename(),
+                                       std::filesystem::copy_options::overwrite_existing);
+            {
+                QSettings copy(QString::fromStdString((benchDirectory / settings.filename()).string()),
+                               QSettings::IniFormat);
+                copy.setValue(vc::settings::kRemoteCacheDirectory, QString::fromStdString(cache.string()));
+            }
+            qputenv("VC3D_CONFIG_DIR", QByteArray::fromStdString(benchDirectory.string()));
+            std::cout << "bench: settings copied to " << benchDirectory.string() << std::endl;
+        } catch (const std::exception& problem) {
+            std::cerr << "bench: could not set up its own settings: " << problem.what() << std::endl;
+            return 2;
+        }
+    }
 
 #ifndef __linux__
     // On non-Linux, preinit_array is unavailable so set env vars at start of main.

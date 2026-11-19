@@ -14,6 +14,7 @@
 
 #include <QCheckBox>
 #include <QDateTime>
+#include <QEvent>
 #include <QComboBox>
 #include <QDoubleSpinBox>
 #include <QFormLayout>
@@ -1367,6 +1368,11 @@ ScaffoldApprovalPanel::ScaffoldApprovalPanel(ScaffoldSolveController* controller
             rebuild();
         });
     connect(_tree, &QTreeWidget::itemSelectionChanged, this, [this]() { applySelection(); });
+    // Hovering a row shows it on the map, apart from the selection.
+    _tree->setMouseTracking(true);
+    _tree->viewport()->installEventFilter(this);
+    connect(_tree, &QTreeWidget::itemEntered, this,
+            [this](QTreeWidgetItem* item, int) { emit hoverRequested(highlightOf(item)); });
     connect(_tree, &QTreeWidget::itemDoubleClicked, this,
             [this](QTreeWidgetItem* item, int) { activateRow(item); });
     connect(_fadeCombo, &QComboBox::currentIndexChanged, this, [this]() {
@@ -1665,9 +1671,16 @@ void ScaffoldApprovalPanel::applySelection()
         emit highlightRequested({});
         return;
     }
-    const auto* row = rowOf(items.front());
-    if (!row) return;
+    if (!rowOf(items.front())) return;
+    emit highlightRequested(highlightOf(items.front()));
+}
+
+ScaffoldHighlight ScaffoldApprovalPanel::highlightOf(const QTreeWidgetItem* item) const
+{
     ScaffoldHighlight highlight;
+    const auto* row = rowOf(item);
+    if (!row) return highlight;
+    const auto* residual = residualOf(item);
     if (!row->fiberUuid.empty()) highlight.fiberUuids.push_back(row->fiberUuid);
     if (!row->otherUuid.empty()) highlight.fiberUuids.push_back(row->otherUuid);
     if (row->kind == Row::Kind::Piece) {
@@ -1682,7 +1695,14 @@ void ScaffoldApprovalPanel::applySelection()
             if (spans[side].known)
                 highlight.spans.push_back({uuids[side], spans[side].controlFrom, spans[side].controlTo});
     }
-    emit highlightRequested(highlight);
+    return highlight;
+}
+
+bool ScaffoldApprovalPanel::eventFilter(QObject* watched, QEvent* event)
+{
+    // The mouse left the list: nothing is hovered any more.
+    if (_tree && watched == _tree->viewport() && event->type() == QEvent::Leave) emit hoverRequested({});
+    return QWidget::eventFilter(watched, event);
 }
 
 void ScaffoldApprovalPanel::activateRow(QTreeWidgetItem* item)
