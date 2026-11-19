@@ -1411,7 +1411,15 @@ std::array<ScaffoldAnchorSpan, 2> ScaffoldApprovalPanel::coveringSpans(const Sca
 
 void ScaffoldApprovalPanel::rebuild()
 {
+    // Loading the approvals announces them, and that announcement asks for a
+    // rebuild: the one already running is that rebuild. Without this the
+    // inner one filled the list and the outer one then appended every row a
+    // second time.
+    if (_rebuilding) return;
     _rebuilding = true;
+    // Before anything is cleared or read: the state column and the approve
+    // button need them.
+    if (_controller && _controller->selected() && !_controller->approvalsLoaded()) _controller->loadApprovals();
     _tree->setSortingEnabled(false);
     _tree->clear();
     _rows.clear();
@@ -1421,9 +1429,6 @@ void ScaffoldApprovalPanel::rebuild()
         _rebuilding = false;
         return;
     }
-    // The piece approvals answer the state column and gate the approve
-    // button, so the dock needs them as soon as it has rows.
-    if (_controller && !_controller->approvalsLoaded()) _controller->loadApprovals();
     const auto label = [this](const std::string& uuid) {
         if (_labels) {
             const auto text = _labels(uuid);

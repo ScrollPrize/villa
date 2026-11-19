@@ -22,6 +22,7 @@
 #include <QTabWidget>
 #include <QTreeWidget>
 
+#include <functional>
 #include <iostream>
 
 namespace
@@ -99,6 +100,37 @@ int runFiberMapBenchmark(const QString& project, bool followSolve, int runs, con
         follow->setChecked(true);
         // Following a solve asks for a rebuild of its own; let it finish.
         waitFor([update] { return update->isEnabled(); }, 600000);
+    }
+
+    // BENCH_DUMP_APPROVAL="<text>;<text>": for every saved solve, print the
+    // approval list's rows whose columns contain every given text - what the
+    // dock shows, for checking it against the store.
+    if (const auto wanted = qEnvironmentVariable("BENCH_DUMP_APPROVAL"); !wanted.isEmpty()) {
+        auto* solves = map->findChild<QTreeWidget*>(QStringLiteral("fiberMapSolvesTree"));
+        auto* panel = map->findChild<vc3d::fiber_map::ScaffoldApprovalPanel*>();
+        auto* list = panel ? panel->findChild<QTreeWidget*>() : nullptr;
+        if (solves == nullptr || list == nullptr) {
+            std::cerr << "bench: no solves or approval list" << std::endl;
+            return 2;
+        }
+        const auto needles = wanted.split(QLatin1Char(';'), Qt::SkipEmptyParts);
+        for (int run = 0; run < solves->topLevelItemCount(); ++run) {
+            solves->setCurrentItem(solves->topLevelItem(run));
+            waitFor([] { return false; }, 1500);
+            std::cout << "approval list of solve " << run << " (" << solves->topLevelItem(run)->text(0).toStdString()
+                      << "): " << list->topLevelItemCount() << " top-level rows" << std::endl;
+            const std::function<void(QTreeWidgetItem*, int)> walk = [&](QTreeWidgetItem* item, int depth) {
+                QStringList columns;
+                for (int column = 0; column < list->columnCount(); ++column) columns << item->text(column);
+                const auto line = columns.join(QStringLiteral(" | "));
+                bool all = true;
+                for (const auto& needle : needles) all = all && line.contains(needle);
+                if (all) std::cout << "  " << (depth ? "    child: " : "row: ") << line.toStdString() << std::endl;
+                for (int child = 0; child < item->childCount(); ++child) walk(item->child(child), depth + 1);
+            };
+            for (int row = 0; row < list->topLevelItemCount(); ++row) walk(list->topLevelItem(row), 0);
+        }
+        return 0;
     }
 
     // `--solve geometry|fused`: time a measured scaffold solve instead, as
