@@ -440,8 +440,11 @@ uv run --extra models python -m vesuvius.ink_detection.inference.infer \
   --direction both
 ```
 
-Folder mode writes dated TIFFs below each segment's `preds/` directory and
-skips a segment/direction when a matching dated prediction already exists.
+Folder mode reads each segment's `<segment>`, `<segment>.zarr`, or
+`<segment>.ome.zarr`; without one of those it reads the only Zarr in the
+segment directory, not counting the label and mask Zarrs. It writes dated
+TIFFs below each segment's `preds/` directory and skips a segment/direction
+when a matching dated prediction already exists.
 Single mode writes the requested path; `--direction both` adds `_reverse` to
 the second output.
 

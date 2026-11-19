@@ -390,6 +390,38 @@ def test_folder_mode_logs_existing_prediction_and_summary(
     assert "segments_ran=0 segments_skipped=1" in caplog.text
 
 
+def test_folder_mode_runs_a_segment_stored_beside_its_label_zarrs(
+    tmp_path, monkeypatch, caplog
+):
+    labelled = tmp_path / "w035"
+    for name in (
+        "surface-volume.zarr",
+        "w035_inklabels.zarr",
+        "w035_supervision_mask.zarr",
+        "w035_validation_mask_v2.zarr",
+    ):
+        (labelled / name).mkdir(parents=True)
+    for name in ("first.zarr", "second.zarr"):
+        (tmp_path / "ambiguous" / name).mkdir(parents=True)
+    runs = []
+    monkeypatch.setattr(
+        "vesuvius.ink_detection.inference.infer.infer_single_zarr",
+        lambda **kwargs: runs.append(kwargs["input_zarr"]),
+    )
+    args = SimpleNamespace(
+        folder=tmp_path,
+        checkpoint=Path("model.pth"),
+        output_prefix="",
+        direction="forward",
+    )
+
+    with caplog.at_level("INFO"):
+        infer_folder(args, None, device=torch.device("cpu"))
+
+    assert runs == [labelled / "surface-volume.zarr"]
+    assert "segments_ran=1 segments_skipped=1" in caplog.text
+
+
 def test_cpu_command_checkpoint_to_tiff_timeline(tmp_path, caplog):
     mapping = config_mapping(
         "vesuvius_unet_2p5d", depth=3, side=16

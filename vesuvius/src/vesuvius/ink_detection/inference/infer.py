@@ -33,6 +33,7 @@ from vesuvius.ink_detection.models.checkpoint import (
     select_inference_weights,
 )
 from vesuvius.ink_detection.config import InkConfig, NormalizationConfig
+from vesuvius.ink_detection.data.segment import parse_label_asset_path
 from vesuvius.ink_detection.inference.inference_runtime import (
     DEVICE_CHOICES,
     TargetModel,
@@ -1493,7 +1494,11 @@ def resolve_single_output_path(
 
 
 def resolve_segment_zarr_path(segment_dir: Path) -> Path:
-    """Resolve the frozen folder-mode direct candidates or sole discovery."""
+    """Resolve the frozen folder-mode direct candidates or sole discovery.
+
+    Label and mask Zarrs stored beside the surface volume, as in the published
+    label layout, are not candidates.
+    """
 
     candidates = (
         segment_dir / segment_dir.name,
@@ -1505,7 +1510,7 @@ def resolve_segment_zarr_path(segment_dir: Path) -> Path:
             return candidate
     discovered = []
     for child in sorted(segment_dir.iterdir()):
-        if not child.is_dir():
+        if not child.is_dir() or parse_label_asset_path(child) is not None:
             continue
         if child.suffix == ".zarr" or any(
             (child / marker).exists()
