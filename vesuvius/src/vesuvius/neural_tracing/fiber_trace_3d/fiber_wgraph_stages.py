@@ -145,6 +145,51 @@ def _solver_config(config, root):
     return settings
 
 
+def solve_residuals(database, run):
+    """One scaffold run's violated constraints, as the dock ranks them.
+
+    The rows are what `vc_fiber_graph_solve` persisted (ext_fiber_graph_solve_
+    residuals): one per constraint the winding solve could not satisfy, with
+    the shortest cycle it lies on. `run` is the explicit run UUID; nothing
+    here picks a run for the caller.
+    """
+    with CollectionReader(str(database)) as store:
+        table=next((t for t in store.extension_tables() if t['name']==PREFIX+'residuals'),None)
+        if table is None:raise ValueError('Input has no scaffold residual rows')
+        columns=[c['name'] for c in table['columns']]
+        rows=store.extension_rows(PREFIX+'residuals',key_filter={'run_uuid':uuid.UUID(_uuid(run)).bytes})
+    out=[]
+    for row in rows:
+        entry=dict(zip(columns,row))
+        for name in ('run_uuid','fiber_a','fiber_b','edge_uuid'):
+            if entry.get(name) is not None:entry[name]=_uuid(entry[name])
+        out.append(entry)
+    out.sort(key=lambda entry:entry['residual_index'])
+    return out
+
+
+def solve_residual_pieces(database, run):
+    """The fiber stretches those residuals accuse, keyed by residual index.
+
+    Each stretch is a piece of one fiber between two constraints of the cycle,
+    with the share of the violated cost it carries and the control range a
+    piece opened for it covers (null when the fiber has no controls there).
+    """
+    with CollectionReader(str(database)) as store:
+        table=next((t for t in store.extension_tables() if t['name']==PREFIX+'residual_pieces'),None)
+        if table is None:raise ValueError('Input has no scaffold residual piece rows')
+        columns=[c['name'] for c in table['columns']]
+        rows=store.extension_rows(PREFIX+'residual_pieces',key_filter={'run_uuid':uuid.UUID(_uuid(run)).bytes})
+    pieces={}
+    for row in rows:
+        entry=dict(zip(columns,row))
+        for name in ('run_uuid','fiber_uuid'):
+            if entry.get(name) is not None:entry[name]=_uuid(entry[name])
+        pieces.setdefault(entry['residual_index'],[]).append(entry)
+    for members in pieces.values():members.sort(key=lambda entry:entry['member_index'])
+    return pieces
+
+
 def run_stage(stage, config):
     """Start one managed process before preparing any solver arrays."""
     if stage in ('winding','uv'):
