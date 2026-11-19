@@ -12,6 +12,8 @@
 // the requested target volume. The scroll's winding handedness is read from
 // the umbilicus object and never guessed: a mirrored solve must not happen
 // silently.
+#include "vc/fiber_graph/ScaffoldRunMonitor.hpp"
+
 #include "vc_object_store/geometry/FiberWinding.hpp"
 #include "vc_object_store/objects/FiberPieceApprovalExtension.hpp"
 #include "vc_object_store/objects/StoreReader.hpp"
@@ -53,6 +55,8 @@ struct ScaffoldFiber {
 // does, so a coordinate-frame error is reported with its distance).
 struct ScaffoldLink {
     std::string uuid, aUuid, bUuid;
+    // The link record's version, as the store states it.
+    std::optional<std::int64_t> version;
     // Fiber indices, or -1 when that endpoint is not a loaded fiber.
     std::int64_t a = -1, b = -1;
     std::optional<geometry::Point> anchorA, anchorB;
@@ -120,6 +124,9 @@ struct ScaffoldLoadOptions {
     // or normal of theirs enters the run, and its components are the
     // components of the subset.
     std::vector<std::string> fiberSubset;
+    // Progress and cancellation of the read itself, which is a stage of its
+    // own: a scaffold's line points are the run's first long wait.
+    ScaffoldRunMonitor* monitor = nullptr;
 };
 
 // The store commit that last changed anything a scaffold run reads: a fiber

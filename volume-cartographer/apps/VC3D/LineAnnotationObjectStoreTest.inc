@@ -4,6 +4,7 @@
 #include <QElapsedTimer>
 #include <QThread>
 #include "FiberCollectionController.hpp"
+#include "FiberMapScaffoldSolve.hpp"
 #include <vc_object_store/geometry/Geometry.hpp>
 #include <vc_object_store/objects/AttachedDocument.hpp>
 #include <vc_object_store/objects/ObjectCollection.hpp>
@@ -117,6 +118,7 @@ int runObjectStoreControllerTests()
 #include "LineAnnotationCompoundTest.inc"
 #include "LineAnnotationFiberCacheTest.inc"
 #include "LineAnnotationPieceLockTest.inc"
+#include "FiberMapScaffoldApprovalTest.inc"
         if (const char* source = std::getenv("VC3D_OBJECT_STORE_READ_ONLY_BENCH")) {
             CState state;
             Controller controller(&state,nullptr,nullptr,nullptr);

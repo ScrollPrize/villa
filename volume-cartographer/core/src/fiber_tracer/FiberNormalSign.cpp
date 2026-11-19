@@ -454,7 +454,7 @@ Problem build(const std::vector<double>& agreement, const std::vector<FiberSignE
 }
 
 void solveIrls(Problem& problem, const FiberSignOptions& options, FiberSignResult& result,
-               const std::chrono::steady_clock::time_point started)
+               const std::chrono::steady_clock::time_point started, const FiberSignStepCallback& onStep)
 {
     const std::size_t n = problem.nodes, m = problem.events;
     const double epsilon = options.epsilon;
@@ -484,6 +484,8 @@ void solveIrls(Problem& problem, const FiberSignOptions& options, FiberSignResul
         proposed(n), oldPhase(n), oldKeep(n), eventCost;
     int stalled = 0, lastStep = 0;
     for (int step = 1; step <= options.iterations; ++step) {
+        // The caller's step hook: progress, and the chance to stop.
+        if (onStep && !onStep(step, options.iterations)) break;
         lastStep = step;
         forChunks(m, problem.threads, [&](const std::size_t lo, const std::size_t hi) {
             for (std::size_t e = lo; e < hi; ++e) {
@@ -688,7 +690,8 @@ void solveCeres(Problem& problem, const FiberSignOptions& options, FiberSignResu
 
 FiberSignResult solveFiberNormalSigns(const std::vector<double>& agreement,
                                       const std::vector<FiberSignEvent>& events, const FiberSignOptions& options,
-                                      const std::vector<int>& fixedSigns)
+                                      const std::vector<int>& fixedSigns,
+    const FiberSignStepCallback& onStep)
 {
     FiberSignResult result;
     Problem problem = build(agreement, events, options, fixedSigns, result);
@@ -696,7 +699,7 @@ FiberSignResult solveFiberNormalSigns(const std::vector<double>& agreement,
     if (options.backend == FiberSignBackend::Ceres)
         solveCeres(problem, options, result, started);
     else
-        solveIrls(problem, options, result, started);
+        solveIrls(problem, options, result, started, onStep);
     result.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
 
     const Terms terms = objectiveOf(problem, options.epsilon);

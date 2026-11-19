@@ -245,6 +245,28 @@ auto main(int argc, char* argv[]) -> int
     QSurfaceFormat::setDefaultFormat(glFormat);
 
     QApplication app(argc, argv);
+    // Headless timing of the fiber map's Update, for measuring the stages and
+    // re-measuring them after a change (FiberMapBenchmark.cpp).
+    if (hasCliFlag(argc, argv, "--bench-fiber-map")) {
+        extern int runFiberMapBenchmark(const QString& project, bool followSolve, int runs,
+                                        const QString& solveNormals);
+        QString project, solveNormals;
+        int runs = 1;
+        for (int i = 1; i < argc; ++i) {
+            const QString argument = QString::fromLocal8Bit(argv[i]);
+            if (argument == QLatin1String("--bench-fiber-map") && i + 1 < argc)
+                project = QString::fromLocal8Bit(argv[++i]);
+            else if (argument == QLatin1String("--runs") && i + 1 < argc)
+                runs = QString::fromLocal8Bit(argv[++i]).toInt();
+            else if (argument == QLatin1String("--solve") && i + 1 < argc)
+                solveNormals = QString::fromLocal8Bit(argv[++i]);
+        }
+        const bool follow = hasCliFlag(argc, argv, "--follow-solve");
+        const int result = runFiberMapBenchmark(project, follow, std::max(1, runs), solveNormals);
+        std::cout.flush();
+        std::cerr.flush();
+        std::_Exit(result);
+    }
 #ifdef VC_TESTING
     if (hasCliFlag(argc, argv, "--test-viewer-regressions")) {
         extern int runViewerRegressionTests();

@@ -38,6 +38,19 @@ struct CatalogVolumeSense {
 };
 [[nodiscard]] std::optional<CatalogVolumeSense> catalogVolumeSense(const VolumePkg& pkg, const std::string& volumeId);
 
+// The winding sense a map is built in, and who stated it. The sense is the
+// scroll's and is never guessed: the store's umbilicus states it first
+// (meta.winding_handedness), the catalog second, for the volumes it orients
+// in full. With neither this throws std::runtime_error saying what to set -
+// building both senses and picking one costs three builds and can draw a
+// mirrored map.
+struct WindingSense {
+    int sense = 0;            // +1 or -1
+    bool fromCatalog = false; // false: the store's umbilicus
+};
+[[nodiscard]] WindingSense statedWindingSense(std::optional<int> umbilicusHandedness,
+                                              const std::optional<CatalogVolumeSense>& catalog);
+
 // The orientation as comparable text, for dependency checks.
 [[nodiscard]] std::string orientationText(const vcr::catalog::OpenDataOrientation& orientation);
 

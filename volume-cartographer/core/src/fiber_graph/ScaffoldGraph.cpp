@@ -57,14 +57,9 @@ std::optional<int> statedHandedness(const objects::StoreReader& reader, const st
 {
     std::optional<int> stated;
     for (const auto& record : objects::volumeUmbilici(reader, volume)) {
-        const auto meta = metaOf(record.meta);
-        const auto found = meta.find("winding_handedness");
-        if (found == meta.end() || found->is_null()) continue;
-        if (!found->is_number_integer())
-            throw std::invalid_argument("scaffold graph: winding_handedness must be +1 or -1");
-        const auto value = found->get<int>();
-        if (value != 1 && value != -1)
-            throw std::invalid_argument("scaffold graph: winding_handedness must be +1 or -1");
+        const auto handedness = objects::umbilicusWindingHandedness(record);
+        if (!handedness) continue;
+        const auto value = *handedness;
         if (stated && *stated != value)
             throw std::invalid_argument("scaffold graph: umbilicus objects state different winding handedness values");
         stated = value;
@@ -175,7 +170,16 @@ ScaffoldGraph loadScaffoldGraph(const objects::StoreReader& reader, const Scaffo
 
     objects::GeometrySnapshot snapshot(reader);
     graph.offsets.push_back(0);
+    // Per fiber: the affine its geometry was read through, so a link's
+    // anchors can be mapped the same way. A run is one frame; an anchor left
+    // in the stored frame lands a whole volume away from its polyline.
+    std::map<std::string, vcr::catalog::Affine> mappingOf;
+    if (options.monitor) options.monitor->enter("reading the fibers", std::int64_t(accepted.size()));
     for (std::size_t i = 0; i < accepted.size(); ++i) {
+        if (options.monitor) {
+            options.monitor->checkpoint();
+            options.monitor->report(std::int64_t(i));
+        }
         const auto& entry = accepted[i];
         if (!revisions[i]) throw std::runtime_error("scaffold graph: fiber revision disappeared: " + entry.record.uuid);
         const auto& revision = *revisions[i];
@@ -205,6 +209,7 @@ ScaffoldGraph loadScaffoldGraph(const objects::StoreReader& reader, const Scaffo
                     if (annotations[k].is_object()) fiber.content.annotations[k] = annotations[k];
         }
         fiber.content.resolveLineIndices();
+        mappingOf.insert_or_assign(fiber.uuid, view.mapping());
         if (options.readPieceApprovals) {
             const auto rows = objects::readFiberPieceApprovals(reader, fiber.uuid);
             graph.report.pieceApprovalRows += std::int64_t(rows.size());
@@ -222,20 +227,31 @@ ScaffoldGraph loadScaffoldGraph(const objects::StoreReader& reader, const Scaffo
     }
     graph.report.fibers = std::int64_t(graph.fibers.size());
 
+    // Each anchor through the mapping of the fiber it sits on.
+    const auto mappedAnchor = [&](const objects::Anchor& anchor,
+                                  const std::string& fiberUuid) -> std::optional<geometry::Point> {
+        const auto position = anchorPosition(anchor);
+        if (!position) return std::nullopt;
+        const auto found = mappingOf.find(fiberUuid);
+        if (found == mappingOf.end()) return position;  // a fiber this run did not load
+        const auto mapped = found->second.apply({(*position)[0], (*position)[1], (*position)[2]});
+        return geometry::Point{mapped[0], mapped[1], mapped[2]};
+    };
     objects::EdgeSelection links;
     links.kind = "fiber_branch";
     for (const auto& edge : reader.selectEdges(links)) {
         ++graph.report.linkRecords;
         ScaffoldLink link;
         link.uuid = edge.uuid;
+        link.version = edge.version;
         link.aUuid = edge.aUuid;
         link.bUuid = edge.bUuid;
         link.approvalState = edge.approvalState;
         const auto meta = metaOf(edge.meta);
         link.adjacent = meta.value("adjacent", false);
         link.autoLink = meta.value("auto", false);
-        link.anchorA = anchorPosition(edge.aAnchor);
-        link.anchorB = anchorPosition(edge.bAnchor);
+        link.anchorA = mappedAnchor(edge.aAnchor, edge.aUuid);
+        link.anchorB = mappedAnchor(edge.bAnchor, edge.bUuid);
         if (const auto a = graph.indexOf(edge.aUuid)) link.a = std::int64_t(*a);
         if (const auto b = graph.indexOf(edge.bUuid)) link.b = std::int64_t(*b);
         graph.links.push_back(std::move(link));

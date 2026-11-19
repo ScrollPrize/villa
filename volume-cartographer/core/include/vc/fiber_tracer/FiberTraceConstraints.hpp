@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <filesystem>
 #include <functional>
+#include <stdexcept>
 #include <exception>
 #include <optional>
 #include <span>
@@ -111,6 +112,15 @@ struct FiberTraceConstraintConfig {
     // scoring/refinement/deduplication/normalization independently. Requires
     // the unsigned whole-fiber geometry handoff; scientific rules unchanged.
     bool pairOwnedGeometry = false;
+    // Asked between blocks of every phase, from worker threads: true takes
+    // the extraction back with FiberTraceCancelled. It must be cheap,
+    // thread-safe and must not throw.
+    std::function<bool()> cancelled;
+    // The caller's trace-pair filter answers from the pair alone and is
+    // thread-safe, so the search keeps its workers. Without this a filtered
+    // search runs serially, because an arbitrary filter may depend on the
+    // order its callbacks arrive in.
+    bool parallelPairFilter = false;
 };
 
 struct FiberTraceConstraintPiece {
@@ -301,6 +311,13 @@ struct FiberTraceConstraintProgress {
     std::size_t total = 0;
     std::size_t candidates = 0;
 };
+// Thrown by the extraction when the caller's `cancelled` predicate returned
+// true. Nothing is reported: the caller asked for the work back.
+class FiberTraceCancelled : public std::runtime_error {
+public:
+    FiberTraceCancelled() : std::runtime_error("fiber trace constraints: cancelled") {}
+};
+
 using FiberTraceConstraintProgressCallback =
     std::function<void(const FiberTraceConstraintProgress&)>;
 

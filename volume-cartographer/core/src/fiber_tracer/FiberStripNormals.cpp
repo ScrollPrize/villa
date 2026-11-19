@@ -1,5 +1,7 @@
 #include "vc/fiber_tracer/FiberStripNormals.hpp"
 
+#include <atomic>
+
 #include <ceres/ceres.h>
 
 #include <algorithm>
@@ -310,15 +312,19 @@ FiberStripNormalResult solveChain(
 std::vector<FiberStripNormalResult> solveFiberStripNormals(
     const std::vector<std::vector<cv::Vec3d>>& fibers,
     const FiberStripNormalOptions& options, int threads,
-    const std::vector<std::vector<FiberStripAxisTarget>>* targets)
+    const std::vector<std::vector<FiberStripAxisTarget>>* targets,
+    const FiberStripNormalProgress& onFiberSolved)
 {
     if (targets && targets->size() != fibers.size())
         throw std::invalid_argument("fiber strip axis targets must match the fibers");
     std::vector<FiberStripNormalResult> results(fibers.size());
+    std::atomic<std::int64_t> solved{0};
+    const auto total = static_cast<std::int64_t>(fibers.size());
     cv::parallel_for_(cv::Range(0, static_cast<int>(fibers.size())), [&](const cv::Range& range) {
         for (int i = range.start; i < range.end; ++i) {
             const auto f = static_cast<size_t>(i);
             results[f] = solveFiberStripNormals(fibers[f], options, targets ? &(*targets)[f] : nullptr);
+            if (onFiberSolved) onFiberSolved(solved.fetch_add(1) + 1, total);
         }
     }, std::max(1, threads));
     return results;

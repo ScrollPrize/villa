@@ -86,6 +86,13 @@ public:
     [[nodiscard]] bool storedAt(int64_t x, int64_t y, int64_t z);
     // Whether spatial chunk (cx, cy, cz) is stored.
     [[nodiscard]] bool storedChunk(int64_t cx, int64_t cy, int64_t cz);
+    // Asks for every one of these spatial chunks that is not known yet, all
+    // at once on the array's own readers. Asking is what fetches a remote
+    // chunk, so a batch that would otherwise pull its chunks in one after
+    // another - each a round trip to the source - pulls them in together.
+    // Chunks outside the grid and repeated ones are fine; afterwards
+    // storedChunk() and storedAt() answer from memory.
+    void resolveChunks(std::vector<std::array<int64_t, 3>> chunksXYZ);
     [[nodiscard]] const std::array<int64_t, 3>& chunkShapeXYZ() const noexcept { return chunkXYZ_; }
 private:
     struct State;

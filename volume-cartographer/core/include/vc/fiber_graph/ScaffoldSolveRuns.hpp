@@ -28,6 +28,9 @@ struct ScaffoldRunRecord {
     // The store state that was solved, recorded as the run's input.
     objects::ExtensionSource input;
     std::string stage = "winding";
+    // When the run was made, Unix seconds UTC, 0 when unstated. The caller
+    // states it: the store records commits, not when a solve was computed.
+    std::int64_t createdAtUnix = 0;
 };
 
 struct ScaffoldRunRows {
@@ -48,6 +51,7 @@ struct ScaffoldRunStages {
     const ScaffoldMeasuredReport* measured = nullptr;
     const ScaffoldSignOptions* signOptions = nullptr;
     const ScaffoldSignResult* signs = nullptr;
+    const ScaffoldApprovalReport* approvals = nullptr;
 };
 
 // The rows of one solve. `method` names the backend the result came from.
@@ -56,6 +60,12 @@ ScaffoldRunRows scaffoldSolveRunRows(const ScaffoldGraph&, const ScaffoldSolveRe
 
 struct ScaffoldStoredRun {
     std::string runUuid, stage, method, settingsJson;
+    // Read out of the settings, for the columns the docks show: when the run
+    // was made (Unix seconds UTC, 0 when the run recorded none), which
+    // normals it used ("geometry" or "fused") and which sign backend
+    // ("irls", "ceres", or empty for a run that solved no signs).
+    std::int64_t createdAtUnix = 0;
+    std::string normalSource, signBackend;
     // The store state the run read, as it recorded it (role "input_0"). A run
     // whose generation or commit sequence is behind the store's own was
     // computed from an annotation that has changed since.

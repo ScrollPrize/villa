@@ -27,6 +27,8 @@
 #include <array>
 #include <functional>
 #include <map>
+#include <chrono>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -38,6 +40,7 @@ class QCheckBox;
 class QComboBox;
 class QDoubleSpinBox;
 class QLabel;
+class QProgressBar;
 class QPushButton;
 class QRadioButton;
 class QTreeWidget;
@@ -53,11 +56,14 @@ namespace vc3d::fiber_map
 // drawn in, and the store is the first authority on the scroll's winding
 // sense.
 struct ScaffoldSolveRequest {
+    // With no link state selected the run solves on the measured constraints
+    // alone; the dock only offers that while it is measuring crossings.
+    bool useLinks = true;
     std::vector<std::string> approvalStates{"approved"};
     bool includeAuto = false;
     double manualWeight = 1.0;
     bool fixApprovedSubgraphs = true;
-    std::string lemonBackend = "network_simplex";
+    std::string lemonBackend = "cost_scaling";
     std::string volume;
     std::optional<int> fallbackHandedness;
     // Also measure the scaffold's own crossings: strip normals from the
@@ -111,17 +117,30 @@ public:
     [[nodiscard]] bool approvalsLoaded() const { return _approvalsLoaded; }
     void loadApprovals();
     void dropApprovals();
+    // The span of a fiber covering an anchor arc, and whether it is approved.
+    // Answers from the loaded piece approvals, so it needs loadApprovals().
+    [[nodiscard]] ScaffoldAnchorSpan anchorSpan(const std::string& fiberUuid, double arc) const;
 
     // The winding density a run measures its separations on. The workspace
     // binds the package's Lasagna normal dataset; a run that would measure
     // one without a sampler is refused rather than run without distances.
-    using WindingSamplerResolver =
+    //
+    // Two steps, so that Solve never blocks the GUI: the resolver runs on the
+    // GUI thread and only captures what the project says to open; the opener
+    // it returns runs on the solve's worker, where a remote manifest may take
+    // its seconds. A dataset that cannot be opened fails the run there.
+    using WindingSamplerOpener =
         std::function<std::shared_ptr<vc::lasagna::LasagnaNormalSampler>(QString* error)>;
+    using WindingSamplerResolver = std::function<WindingSamplerOpener()>;
     void setWindingSampler(WindingSamplerResolver);
 
     // The prediction a fused run reads its sheet axis from. Resolved like the
     // winding sampler: on this thread, before the run starts.
-    using AxisSamplerResolver = std::function<vc::fiber_graph::ScaffoldAxisSampler(QString* error)>;
+    // `identity` receives what the prediction is called (its manifest
+    // location): the key a fused run's normals are cached under.
+    using AxisSamplerOpener =
+        std::function<vc::fiber_graph::ScaffoldAxisSampler(QString* error, std::string* identity)>;
+    using AxisSamplerResolver = std::function<AxisSamplerOpener()>;
     void setAxisSampler(AxisSamplerResolver);
 
     // Approval of a *measured* constraint (a crossing). A link's approval is
@@ -134,6 +153,9 @@ public:
 
     // Re-read the store's run rows (after a solve, or when the store changed).
     void reloadRuns();
+    // Whether the last reloadRuns() read a store, as opposed to finding none
+    // attached. False means the empty list says nothing about the store.
+    [[nodiscard]] bool runsLoaded() const { return _runsLoaded; }
     // True when a fiber, a link or the umbilicus was changed after the run
     // read the store (scaffoldAnnotationCommit): its windings answer a
     // question about an annotation that has moved since. A run's own rows are
@@ -178,6 +200,7 @@ private:
     std::optional<ScaffoldRunView> _selected;
     std::map<std::string, ScaffoldApprovalSpans> _approvals;
     bool _approvalsLoaded = false;
+    bool _runsLoaded = false;
     std::map<vc::objects::FiberConstraintIdentity, vc::objects::FiberConstraintApproval> _constraintApprovals;
     std::shared_ptr<SolveJob> _job;
     QFutureWatcher<void>* _watcher = nullptr;
@@ -201,6 +224,10 @@ public:
     // the controller refuse the run.
     using ScopeResolver = std::function<std::vector<std::string>()>;
     void setScopeResolver(ScopeResolver);
+    // Whether the map can restrict a run to a selected network. Without a
+    // layout there is no selection, so the scope is the whole scaffold and
+    // the chooser says why.
+    void setScopeAvailable(bool available);
     [[nodiscard]] ScaffoldSolveRequest request() const;
     [[nodiscard]] bool fixApprovedSubgraphs() const;
 
@@ -231,7 +258,13 @@ private:
     QPushButton* _cancelButton = nullptr;
     QLabel* _statusLabel = nullptr;
     QLabel* _progressLabel = nullptr;
+    QProgressBar* _progressBar = nullptr;
     QTimer* _progressTimer = nullptr;
+    // The stage the ETA is being measured over, and when it started. A stage
+    // counts its own work, so the estimate is per stage and restarts with it.
+    std::string _progressStage;
+    std::chrono::steady_clock::time_point _progressStarted;
+    std::int64_t _progressStageFirstDone = 0;
     ScopeResolver _scope;
     std::string _volume;
     std::optional<int> _fallbackHandedness;
@@ -254,13 +287,21 @@ signals:
 
 private:
     enum Column {
-        kRunMethodColumn = 0,
+        // When the run was made, from its own settings.
+        kRunWhenColumn = 0,
+        kRunMethodColumn,
+        // "geometry" or "fused", and the sign backend it ran.
+        kRunNormalsColumn,
+        kRunSignBackendColumn,
         kRunFibersColumn,
         kRunComponentsColumn,
         kRunArcsColumn,
         kRunObjectiveColumn,
         kRunViolatedColumn,
         kRunMaxResidualColumn,
+        // Anchored fibers whose sign the crossings would have flipped
+        // (sign_fixed_disagreements); empty for a run that solved no signs.
+        kRunSignColumn,
         // Whether the run is behind the store it was computed from.
         kRunStaleColumn,
         // Filled only while exactly two runs are selected: the fibers this
@@ -289,8 +330,11 @@ class ScaffoldApprovalPanel : public QWidget
 public:
     ScaffoldApprovalPanel(ScaffoldSolveController* controller, QWidget* parent = nullptr);
 
-    [[nodiscard]] bool highlightApprovedFibers() const;
-    [[nodiscard]] bool highlightApprovedPieces() const;
+    // What the map fades: nothing, the spans whose geometry is not approved,
+    // or the spans whose normals are not (which implies their geometry is,
+    // since a normals approval requires one).
+    enum class FadeMode { None, Geometry, Normals };
+    [[nodiscard]] FadeMode fadeMode() const;
     // Fiber labels for the table; the map knows them, the store rows do not.
     using LabelLookup = std::function<QString(const std::string& fiberUuid)>;
     void setLabelLookup(LabelLookup);
@@ -299,7 +343,11 @@ signals:
     void highlightRequested(const ScaffoldHighlight& highlight);
     // Double-click on a stretch: open it as a piece between its bracketing
     // control points.
-    void pieceActivated(const std::string& fiberUuid, std::int64_t controlFrom, std::int64_t controlTo);
+    // `arcFrom`/`arcTo`: the stretch's own arc range, so the piece can open
+    // on its ends rather than on the controls that bracket it. NaN when the
+    // row names no arcs.
+    void pieceActivated(const std::string& fiberUuid, std::int64_t controlFrom, std::int64_t controlTo,
+                        double arcFrom, double arcTo);
     void highlightModeChanged();
 
 private:
@@ -307,26 +355,58 @@ private:
         kKindColumn = 0,
         kFiberColumn,
         kWhereColumn,
+        kOffColumn,
+        kStateColumn,
         kCostColumn,
+        kJointColumn,
+        // The numbered cycle (scaffoldCycleNumbers) and its constraint count.
+        kCycleNumberColumn,
         kCycleColumn,
+        kLengthColumn,
         kCountColumn,
         kColumnCount,
+    };
+    // One table row. A constraint row carries the two covering pieces as its
+    // children, which are rows of their own: that is what has to be approved
+    // before the constraint can be.
+    struct Row {
+        enum class Kind { Constraint, Piece };
+        Kind kind = Kind::Constraint;
+        // Index into the selected run's residuals, -1 for a stretch or a
+        // covering piece.
+        std::int64_t residual = -1;
+        std::string fiberUuid, otherUuid;
+        std::int64_t controlFrom = -1, controlTo = -1;
+        // The stretch's own arc range (voxels); NaN when the row names none,
+        // which is a covering piece of a constraint.
+        double arcFrom = std::numeric_limits<double>::quiet_NaN();
+        double arcTo = std::numeric_limits<double>::quiet_NaN();
+        ScaffoldApprovalRow keys;
     };
     void rebuild();
     void applySelection();
     void activateRow(QTreeWidgetItem* item);
+    // The row an item names, or null when the item is stale.
+    [[nodiscard]] const Row* rowOf(const QTreeWidgetItem*) const;
     // The residual a row names, when the row is a constraint of the selected
     // run; null for a stretch or a row of another run.
     [[nodiscard]] const vc::fiber_graph::ScaffoldStoredResidual* residualOf(const QTreeWidgetItem*) const;
+    // The two covering pieces of a measured constraint, in the order of its
+    // fibers; `known` is false when a fiber's spans could not place the arc.
+    [[nodiscard]] std::array<ScaffoldAnchorSpan, 2> coveringSpans(
+        const vc::fiber_graph::ScaffoldStoredResidual&) const;
 
     ScaffoldSolveController* _controller = nullptr;
     QPushButton* _approveButton = nullptr;
-    QCheckBox* _highlightFibersCheck = nullptr;
-    QCheckBox* _highlightPiecesCheck = nullptr;
+    QComboBox* _fadeCombo = nullptr;
     QComboBox* _orderCombo = nullptr;
     QComboBox* _componentCombo = nullptr;
     QTreeWidget* _tree = nullptr;
     QLabel* _summaryLabel = nullptr;
+    // Errors of an approval attempt, kept apart from the summary so a
+    // refusal does not erase the counts.
+    QLabel* _errorLabel = nullptr;
+    std::vector<Row> _rows;
     LabelLookup _labels;
     bool _rebuilding = false;
 };

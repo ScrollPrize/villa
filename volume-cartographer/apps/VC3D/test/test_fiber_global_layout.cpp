@@ -524,6 +524,55 @@ private slots:
                   vc3d::fiber_map::digestGlobalInputs(fibers, umbilicus, defaultParams())));
     }
 
+    void aFollowedSolvePlacesTheFibersItCoversAndOnlyThose()
+    {
+        const std::vector<cv::Vec3f> umbilicus = straightUmbilicus(40000);
+        std::vector<InputFiber> fibers = adjacentPair(4000.0, 150.0, 0.3 * kTwoPi, 'V');
+
+        // The run's answer: the H fiber two turns out, the V fiber three.
+        GlobalLayoutParams followed = defaultParams();
+        followed.followed.windings.emplace(fibers[0].id,
+                                           vc3d::fiber_map::FollowedSolve::Winding{2, 0});
+        followed.followed.windings.emplace(fibers[1].id,
+                                           vc3d::fiber_map::FollowedSolve::Winding{3, 0});
+        const GlobalResult placed =
+            vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, followed);
+        const auto* h = findFiber(placed, fibers[0].id);
+        const auto* v = findFiber(placed, fibers[1].id);
+        QVERIFY(h && v);
+        // Each fiber's winding range is its own angle plus the turn the run
+        // assigned it, and the run's assignment is what anchored it.
+        QCOMPARE(h->meta.anchor, GlobalAnchor::Primary);
+        QCOMPARE(v->meta.anchor, GlobalAnchor::Primary);
+
+        // Another winding for the same fiber moves it by exactly that many
+        // turns and nothing else: the placement is the run's answer.
+        GlobalLayoutParams shifted = followed;
+        shifted.followed.windings[fibers[0].id].turns = 5;
+        const GlobalResult moved = vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, shifted);
+        const auto* movedH = findFiber(moved, fibers[0].id);
+        QVERIFY(movedH);
+        QVERIFY(std::abs((movedH->meta.windingLo - h->meta.windingLo) - 3.0) < 1e-6);
+        // No crossing detection ran, so the map reports none of its own.
+        QVERIFY(placed.crossingEvents.empty());
+
+        // A fiber the run did not cover is not drawn: the map is of the
+        // solve, and it is reported rather than silently missing.
+        GlobalLayoutParams partial = defaultParams();
+        partial.followed.windings.emplace(fibers[0].id,
+                                          vc3d::fiber_map::FollowedSolve::Winding{2, 0});
+        const GlobalResult half =
+            vc3d::fiber_map::buildGlobalLayout(fibers, umbilicus, partial);
+        QVERIFY(findFiber(half, fibers[0].id));
+        QVERIFY(!findFiber(half, fibers[1].id));
+        QCOMPARE(half.unplaced.size(), std::size_t(1));
+        QCOMPARE(half.unplaced.front().id, fibers[1].id);
+
+        // The windings are an input: another run is another layout.
+        QVERIFY(!(vc3d::fiber_map::digestGlobalInputs(fibers, umbilicus, followed) ==
+                  vc3d::fiber_map::digestGlobalInputs(fibers, umbilicus, partial)));
+    }
+
     void adjacentLinkPlacesTheVerticalOneWindingInside()
     {
         const std::vector<cv::Vec3f> umbilicus = straightUmbilicus(40000);

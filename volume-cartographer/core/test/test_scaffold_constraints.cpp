@@ -10,6 +10,7 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
+#include "vc/fiber_graph/ScaffoldCache.hpp"
 #include "vc/fiber_graph/ScaffoldConstraints.hpp"
 
 #include <vc_object_store/geometry/FiberWindingGraph.hpp>
@@ -158,6 +159,145 @@ ScaffoldEventOptions withoutDistances()
 }
 
 } // namespace
+
+TEST_CASE("the cache reuses unchanged fibers and pairs, and nothing else")
+{
+    // The same scaffold solved twice: the second run reads every normal and
+    // every pair from what the first wrote, and extracts nothing.
+    Scaffold scaffold;
+    const auto horizontal = scaffold.fiber(ScaffoldFamily::Horizontal, arcLine(300., 20., 70., 0., 40));
+    const auto vertical = scaffold.fiber(ScaffoldFamily::Vertical, verticalLine(260., 45., -150., 150., 30));
+    scaffold.manualOutwardNormal(horizontal, 2);
+    scaffold.manualOutwardNormal(vertical, 1);
+    // Versions: the store states them, and the cache is keyed on them.
+    for (auto& fiber : scaffold.graph.fibers) fiber.version = 7;
+    const ScaffoldGeometry geometry(scaffold.graph);
+
+    ScaffoldCacheSink sink;
+    sink.author = "cache-test";
+    sink.computedAt = "2026-11-18T12:00:00Z";
+    ScaffoldNormalOptions normalOptions;
+    normalOptions.sink = &sink;
+    const ScaffoldNormals first(scaffold.graph, geometry, normalOptions);
+    CHECK(first.report().reused == 0);
+    CHECK(first.report().cached == 2);
+    REQUIRE(sink.normals.size() == 2);
+
+    ScaffoldEventOptions eventOptions;
+    eventOptions.sink = &sink;
+    ScaffoldEventReport firstReport;
+    const auto firstEvents =
+        scaffoldEvents(scaffold.graph, geometry, first, eventOptions, constantDistance(1.), firstReport);
+    CHECK(firstReport.reusedPairs == 0);
+    CHECK(firstReport.cachedPairs == 1);
+    REQUIRE_FALSE(firstEvents.empty());
+    REQUIRE_FALSE(sink.crossings.empty());
+
+    // Second run, same inputs: everything comes from the cache, and the
+    // events are the ones the first run found.
+    const ScaffoldCache cache(sink.normals, sink.crossings);
+    ScaffoldNormalOptions reuseNormals;
+    reuseNormals.cache = &cache;
+    const ScaffoldNormals second(scaffold.graph, geometry, reuseNormals);
+    CHECK(second.report().reused == 2);
+    CHECK(second.report().cached == 0);
+    // The reused rows are the ones the first run wrote, by their own identity,
+    // and what they were solved from is stated in the clear.
+    CHECK(second.cacheRows() == first.cacheRows());
+    for (const auto& row : sink.normals) {
+        CHECK_FALSE(row.normalsUuid.empty());
+        CHECK(row.inputs.find("twist=") != std::string::npos);
+        CHECK(row.inputs.find("by=control ") != std::string::npos);
+    }
+    for (std::size_t i = 0; i < scaffold.graph.fibers.size(); ++i) CHECK(second.solved(i));
+
+    ScaffoldEventOptions reuseEvents;
+    reuseEvents.cache = &cache;
+    ScaffoldEventReport secondReport;
+    // The sampler is still handed over: a reusing run must not need it for
+    // the pairs it reuses, but the option still says separations are
+    // measured, and a pair that was not cached would need it.
+    const auto secondEvents =
+        scaffoldEvents(scaffold.graph, geometry, second, reuseEvents, constantDistance(1.), secondReport);
+    CHECK(secondReport.reusedPairs == 1);
+    CHECK(secondReport.reusedEvents == std::int64_t(firstEvents.size()));
+    CHECK(secondEvents.size() == firstEvents.size());
+    for (std::size_t i = 0; i < secondEvents.size(); ++i) {
+        CHECK(secondEvents[i].a == firstEvents[i].a);
+        CHECK(secondEvents[i].b == firstEvents[i].b);
+        CHECK(secondEvents[i].arcA == doctest::Approx(firstEvents[i].arcA));
+        CHECK(secondEvents[i].arcB == doctest::Approx(firstEvents[i].arcB));
+        CHECK(secondEvents[i].parallel == firstEvents[i].parallel);
+        CHECK(secondEvents[i].distance == doctest::Approx(firstEvents[i].distance));
+    }
+
+    // An edited fiber: its version moved, so its normals and every pair it
+    // is in are computed again.
+    auto edited = scaffold;
+    edited.graph.fibers[horizontal].version = 8;
+    const ScaffoldGeometry editedGeometry(edited.graph);
+    const ScaffoldNormals third(edited.graph, editedGeometry, reuseNormals);
+    CHECK(third.report().reused == 1);
+    ScaffoldEventReport thirdReport;
+    scaffoldEvents(edited.graph, editedGeometry, third, reuseEvents, constantDistance(1.), thirdReport);
+    CHECK(thirdReport.reusedPairs == 0);
+
+    // A changed parameter: a different question, so nothing matches.
+    ScaffoldNormalOptions otherParams = reuseNormals;
+    otherParams.strip.twistWeight *= 2.;
+    const ScaffoldNormals fourth(scaffold.graph, geometry, otherParams);
+    CHECK(fourth.report().reused == 0);
+}
+
+TEST_CASE("a fractional separation is split or rounded as the mode says")
+{
+    // Two crossing fibers whose measured separation is fractional: the split
+    // asserts the two integers around it with weights 1 - fraction and
+    // fraction, the rounded mode asserts the nearer one with the whole
+    // weight.
+    Scaffold scaffold;
+    const auto horizontal = scaffold.fiber(ScaffoldFamily::Horizontal, arcLine(300., 20., 70., 0., 40));
+    const auto vertical = scaffold.fiber(ScaffoldFamily::Vertical, verticalLine(260., 45., -150., 150., 30));
+    scaffold.manualOutwardNormal(horizontal, 2);
+    scaffold.manualOutwardNormal(vertical, 1);
+    const ScaffoldGeometry geometry(scaffold.graph);
+    const ScaffoldNormals normals(scaffold.graph, geometry);
+    ScaffoldEventReport events;
+    const auto crossings = scaffoldEvents(scaffold.graph, geometry, normals, {}, constantDistance(1.8), events);
+    REQUIRE_FALSE(crossings.empty());
+
+    ScaffoldMeasuredReport splitReport;
+    ScaffoldMeasuredOptions split;
+    split.separations = ScaffoldSeparationMode::Split;
+    const auto splitArcs =
+        scaffoldMeasuredConstraints(scaffold.graph, geometry, crossings, kInwardSigns, split, splitReport);
+    ScaffoldMeasuredReport roundedReport;
+    ScaffoldMeasuredOptions rounded;
+    rounded.separations = ScaffoldSeparationMode::Rounded;
+    const auto roundedArcs =
+        scaffoldMeasuredConstraints(scaffold.graph, geometry, crossings, kInwardSigns, rounded, roundedReport);
+
+    CHECK(splitReport.used == roundedReport.used);
+    CHECK(splitReport.fractional == roundedReport.fractional);
+    CHECK(splitReport.fractional > 0);
+    // The split emits two arcs per fractional crossing, the rounded one.
+    CHECK(splitReport.expanded == 2 * roundedReport.expanded);
+    CHECK(splitArcs.size() == 2 * roundedArcs.size());
+    // Each rounded constraint carries the whole weight of its event, and the
+    // two halves of the split sum to it.
+    for (const auto& constraint : roundedArcs) CHECK(constraint.weight == doctest::Approx(1.));
+    double splitWeight = 0;
+    for (const auto& constraint : splitArcs) splitWeight += constraint.weight;
+    double roundedWeight = 0;
+    for (const auto& constraint : roundedArcs) roundedWeight += constraint.weight;
+    CHECK(splitWeight == doctest::Approx(roundedWeight));
+    // No two rounded constraints of one event contradict each other on the
+    // same pair, which is what the split does.
+    for (std::size_t i = 0; i < roundedArcs.size(); ++i)
+        for (std::size_t j = i + 1; j < roundedArcs.size(); ++j)
+            CHECK_FALSE(roundedArcs[i].a == roundedArcs[j].a && roundedArcs[i].b == roundedArcs[j].b &&
+                        roundedArcs[i].event == roundedArcs[j].event);
+}
 
 TEST_CASE("an adjacent link fixes the inward normal of both of its fibers")
 {
@@ -548,6 +688,24 @@ TEST_CASE("an approval row marks the measured constraint it names")
     CHECK(row.identity.fiberA < row.identity.fiberB);
 
     ScaffoldApprovalReport approvals;
+    // The row alone approves nothing while the pieces it lies on are not
+    // approved geometry.
+    applyScaffoldConstraintApprovals(scaffold.graph, geometry, measured, {&row, 1}, approvals);
+    CHECK(approvals.live == 1);
+    CHECK(approvals.approved == 0);
+    CHECK(approvals.withoutPieces >= 1);
+    CHECK_FALSE(measured.front().approved);
+
+    // With both covering pieces approved it applies.
+    const auto covering = scaffoldConstraintSpans(scaffold.graph, geometry, measured.front());
+    REQUIRE(covering.has_value());
+    const auto approveSpan = [&](std::int64_t fiber, std::size_t span) {
+        scaffold.graph.fibers[std::size_t(fiber)]
+            .approvals.approvedSpans[std::size_t(vc::objects::FiberPieceAspect::Geometry)]
+            .push_back(span);
+    };
+    approveSpan(measured.front().a, covering->spanA);
+    approveSpan(measured.front().b, covering->spanB);
     applyScaffoldConstraintApprovals(scaffold.graph, geometry, measured, {&row, 1}, approvals);
     CHECK(approvals.live == 1);
     CHECK(approvals.approved >= 1);

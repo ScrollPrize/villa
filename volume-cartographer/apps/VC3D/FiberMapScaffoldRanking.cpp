@@ -8,11 +8,39 @@
 namespace vc3d::fiber_map
 {
 
+std::vector<std::int64_t> scaffoldCycleNumbers(
+    const std::vector<vc::fiber_graph::ScaffoldStoredResidual>& residuals)
+{
+    // A cycle's identity is the set of stretches it runs along, which is what
+    // the run stored about it; the same loop found from two of its own
+    // constraints names the same stretches.
+    using Signature = std::vector<std::tuple<std::string, double, double>>;
+    std::map<Signature, std::int64_t> numbers;
+    std::vector<std::int64_t> out(residuals.size(), 0);
+    for (std::size_t index = 0; index < residuals.size(); ++index) {
+        const auto& residual = residuals[index];
+        if (!residual.cycleHops || *residual.cycleHops <= 0 || residual.pieces.empty()) continue;
+        Signature signature;
+        signature.reserve(residual.pieces.size());
+        for (const auto& piece : residual.pieces)
+            signature.emplace_back(piece.fiberUuid, piece.arcFrom, piece.arcTo);
+        std::sort(signature.begin(), signature.end());
+        signature.erase(std::unique(signature.begin(), signature.end()), signature.end());
+        const auto found = numbers.find(signature);
+        out[index] = found != numbers.end() ? found->second : std::int64_t(numbers.size()) + 1;
+        if (found == numbers.end()) numbers.emplace(std::move(signature), out[index]);
+    }
+    return out;
+}
+
 std::vector<ScaffoldRankedPiece> rankScaffoldPieces(
     const std::vector<vc::fiber_graph::ScaffoldStoredResidual>& residuals)
 {
+    const auto cycles = scaffoldCycleNumbers(residuals);
     std::map<std::tuple<std::string, double, double>, ScaffoldRankedPiece> merged;
-    for (const auto& residual : residuals) {
+    for (std::size_t index = 0; index < residuals.size(); ++index) {
+        const auto& residual = residuals[index];
+        const auto cycle = cycles[index];
         for (const auto& piece : residual.pieces) {
             const std::tuple<std::string, double, double> key{piece.fiberUuid, piece.arcFrom, piece.arcTo};
             const auto found = merged.find(key);
@@ -26,11 +54,17 @@ std::vector<ScaffoldRankedPiece> rankScaffoldPieces(
                 entry.score = piece.score;
                 entry.cycleHops = residual.cycleHops.value_or(-1);
                 entry.constraints = 1;
+                if (cycle > 0) entry.cycles.push_back(cycle);
                 merged.emplace(key, entry);
                 continue;
             }
             found->second.score += piece.score;
             ++found->second.constraints;
+            if (cycle > 0 && std::find(found->second.cycles.begin(), found->second.cycles.end(), cycle) ==
+                                 found->second.cycles.end()) {
+                auto& list = found->second.cycles;
+                list.insert(std::upper_bound(list.begin(), list.end(), cycle), cycle);
+            }
             if (residual.cycleHops && (found->second.cycleHops < 0 || *residual.cycleHops < found->second.cycleHops))
                 found->second.cycleHops = *residual.cycleHops;
         }

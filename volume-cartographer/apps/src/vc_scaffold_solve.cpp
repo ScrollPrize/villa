@@ -13,6 +13,7 @@
 // normal dataset (`winding.manifest`), whose grad_mag winding density is the
 // measure; without one the relations keep no separation and witness
 // enclosures only.
+#include "vc/fiber_graph/ScaffoldCache.hpp"
 #include "vc/fiber_graph/ScaffoldConstraints.hpp"
 #include "vc/fiber_graph/ScaffoldSolveRuns.hpp"
 #include "vc/fiber_graph/ScaffoldWindingSolve.hpp"
@@ -27,6 +28,7 @@
 #include <nlohmann/json.hpp>
 
 #include <chrono>
+#include <format>
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -140,6 +142,12 @@ ScaffoldMeasuredOptions measuredOptionsFrom(const Json& cfg)
     options.perpendicularOffset = section.value("perpendicular_offset", options.perpendicularOffset);
     options.windingScale = section.value("winding_scale", options.windingScale);
     options.enclosures = section.value("enclosures", options.enclosures);
+    // "split" (the automatic stage's two weighted integers) or "rounded" (one
+    // constraint at the nearer integer, what the scaffold dock runs).
+    const auto separations = section.value("separations", std::string{"split"});
+    if (separations == "rounded") options.separations = ScaffoldSeparationMode::Rounded;
+    else if (separations != "split")
+        throw std::invalid_argument("constraints.separations must be \"split\" or \"rounded\"");
     return options;
 }
 
@@ -170,12 +178,27 @@ ScaffoldSignOptions signOptionsFrom(const Json& cfg)
     return options;
 }
 
+// The run's time as a person reads it, for the rows it writes.
+std::string isoTimestampNow()
+{
+    const auto now = std::chrono::system_clock::now();
+    return std::format("{:%FT%TZ}", std::chrono::time_point_cast<std::chrono::seconds>(now));
+}
+
+// The run's time, Unix seconds UTC.
+std::int64_t unixSecondsNow()
+{
+    return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
 ScaffoldSolveOptions solveOptionsFrom(const Json& cfg)
 {
     ScaffoldSolveOptions options;
     const auto links = cfg.value("links", Json::object());
     if (links.contains("approval_states"))
         options.links.approvalStates = links.at("approval_states").get<std::vector<std::string>>();
+    options.links.useLinks = links.value("use_links", true);
     options.links.includeAuto = links.value("include_auto", false);
     options.links.maxAnchorDistance = links.value("max_anchor_distance", 5.0);
     options.links.weight = cfg.value("weights", Json::object()).value("manual", 1.0);
@@ -243,6 +266,12 @@ int run(const std::string& configPath)
     storeOptions.author = "vc_scaffold_solve";
     auto store = vc::objects::ObjectStore::open(cfg.at("store").get<std::string>(), storeOptions);
     ScaffoldGraph graph;
+    // Derived results earlier runs left in the store, and what this run
+    // computes for the next one (vc/fiber_graph/ScaffoldCache.hpp).
+    ScaffoldCache derivedCache;
+    ScaffoldCacheSink cacheSink;
+    cacheSink.author = storeOptions.author;
+    cacheSink.computedAt = isoTimestampNow();
     std::vector<vc::objects::FiberConstraintApproval> constraintApprovals;
     // When the annotation itself last changed, so a log says whether a later
     // run read the same fibers (the Solves dock's stale verdict).
@@ -253,6 +282,7 @@ int run(const std::string& configPath)
         graph = loadScaffoldGraph(reader, loadOptionsFrom(cfg));
         constraintApprovals = vc::objects::readFiberConstraintApprovals(reader);
         annotationCommit = scaffoldAnnotationCommit(reader);
+        derivedCache = ScaffoldCache(reader);
     }
     const double readSeconds = seconds(readStarted);
 
@@ -277,6 +307,12 @@ int run(const std::string& configPath)
     if (measure) {
         normalOptions = normalOptionsFrom(cfg);
         eventOptions = eventOptionsFrom(cfg);
+        normalOptions->cache = &derivedCache;
+        eventOptions->cache = &derivedCache;
+        if (persist) {
+            normalOptions->sink = &cacheSink;
+            eventOptions->sink = &cacheSink;
+        }
         measuredOptions = measuredOptionsFrom(cfg);
         signOptions = signOptionsFrom(cfg);
         std::unique_ptr<vc::lasagna::LasagnaNormalSampler> sampler;
@@ -325,6 +361,7 @@ int run(const std::string& configPath)
             if (section.contains("remote_cache")) open.remoteCacheRoot = section.at("remote_cache").get<std::string>();
             predictionDataset = std::make_shared<vc::lasagna::LasagnaDataset>(
                 vc::lasagna::LasagnaDataset::openLocation(section.at("manifest"), open));
+            normalOptions->predictionIdentity = section.at("manifest").get<std::string>();
             sheetDataset = std::make_shared<vc::lasagna::LasagnaDataset>(
                 vc::lasagna::fiberSheetNormalDataset(*predictionDataset));
             vc::lasagna::LasagnaNormalSamplerOptions samplerOptions;
@@ -438,7 +475,9 @@ int run(const std::string& configPath)
 
     if (measure) {
         const auto& normalReport = normals->report();
-        summary["normals"] = Json{{"fibers", normalReport.fibers},
+        summary["normals"] = Json{{"reused", normalReport.reused},
+                                  {"cached", normalReport.cached},
+                                  {"fibers", normalReport.fibers},
                                   {"solved", normalReport.solved},
                                   {"degenerate", normalReport.degenerate},
                                   {"converged", normalReport.converged},
@@ -458,7 +497,10 @@ int run(const std::string& configPath)
                                   {"mean_axis_weight", normalReport.meanAxisWeight},
                                   {"prediction_seconds", normalReport.predictionSeconds},
                                   {"seconds", normalReport.seconds}};
-        summary["events"] = Json{{"lines", eventReport.lines},
+        summary["events"] = Json{{"reused_pairs", eventReport.reusedPairs},
+                                 {"reused_events", eventReport.reusedEvents},
+                                 {"cached_pairs", eventReport.cachedPairs},
+                                 {"lines", eventReport.lines},
                                  {"short_lines", eventReport.shortLines},
                                  {"resampled_points", eventReport.resampledPoints},
                                  {"events", eventReport.events},
@@ -492,6 +534,7 @@ int run(const std::string& configPath)
         summary["measured"] = Json{{"events", measuredReport.events},
                                    {"used", measuredReport.used},
                                    {"expanded_arcs", measuredReport.expanded},
+                                   {"fractional_separations", measuredReport.fractional},
                                    {"perpendicular", measuredReport.perpendicular},
                                    {"parallel", measuredReport.parallel},
                                    {"without_distance", measuredReport.withoutDistance},
@@ -514,6 +557,7 @@ int run(const std::string& configPath)
     if (persist) {
         ScaffoldRunRecord record;
         record.runUuid = vc::objects::util::newUuid();
+        record.createdAtUnix = unixSecondsNow();
         record.input = {graph.source.storeUuid, graph.source.generation, graph.source.commitSequence};
         ScaffoldRunStages stages;
         if (measure) {
@@ -525,11 +569,24 @@ int run(const std::string& configPath)
             stages.measured = &measuredReport;
             stages.signOptions = &*signOptions;
             stages.signs = &signs;
+            stages.approvals = &approvalReport;
         }
         const auto rows = scaffoldSolveRunRows(graph, result, options, record, stages);
         auto txn = store.write();
         for (const auto& table : rows.tables) store.createExtensionTable(txn, table);
         for (const auto& [table, values] : rows.rows) store.appendExtensionRows(txn, table, values);
+        if (!cacheSink.normals.empty()) {
+            std::vector<vc::objects::ExtensionRow> values;
+            for (const auto& row : cacheSink.normals) values.push_back(vc::objects::fiberScaffoldNormalsRow(row));
+            store.createExtensionTable(txn, vc::objects::fiberScaffoldNormalsTable());
+            store.appendExtensionRows(txn, vc::objects::kFiberScaffoldNormalsTable, values);
+        }
+        if (!cacheSink.crossings.empty()) {
+            std::vector<vc::objects::ExtensionRow> values;
+            for (const auto& row : cacheSink.crossings) values.push_back(vc::objects::fiberScaffoldCrossingsRow(row));
+            store.createExtensionTable(txn, vc::objects::fiberScaffoldCrossingsTable());
+            store.appendExtensionRows(txn, vc::objects::kFiberScaffoldCrossingsTable, values);
+        }
         txn.commit();
         summary["run_uuid"] = record.runUuid;
     }

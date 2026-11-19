@@ -70,6 +70,11 @@ struct ScaffoldConstraint {
 };
 
 struct ScaffoldLinkArcOptions {
+    // Off solves on the measured constraints alone: the annotation's links
+    // assert nothing, which is a run against the crossings only. Empty
+    // approval states remain an error, so a misconfigured state list cannot
+    // silently become a linkless run.
+    bool useLinks = true;
     // Record approval states to use; the Python stage's default is approved only.
     std::vector<std::string> approvalStates{"approved"};
     bool includeAuto = false;
@@ -83,6 +88,9 @@ struct ScaffoldLinkReport {
     std::int64_t links = 0, used = 0, ordinary = 0, adjacent = 0, skippedApprovalState = 0, skippedAutomatic = 0,
                  skippedEndpoint = 0, skippedSelfLink = 0, skippedAdjacentSameFamily = 0, skippedMissingAnchor = 0,
                  skippedUntagged = 0;
+    // Links the record approved whose covering pieces are not both approved
+    // for geometry: they are used, but they are not held rigid.
+    std::int64_t approvedWithoutPieces = 0;
     double maxAnchorDistance = 0;
 };
 

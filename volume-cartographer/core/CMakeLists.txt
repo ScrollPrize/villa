@@ -205,6 +205,7 @@ target_link_libraries(vc_fiber_tracer PRIVATE ${CMAKE_DL_LIBS})
 # analysis. No Qt, no sampling; VC3D and the CLI call the same library.
 add_library(vc_fiber_graph_solve
     src/fiber_graph/ScaffoldGraph.cpp
+    src/fiber_graph/ScaffoldCache.cpp
     src/fiber_graph/ScaffoldNormals.cpp
     src/fiber_graph/ScaffoldConstraints.cpp
     src/fiber_graph/ScaffoldWindingSolve.cpp

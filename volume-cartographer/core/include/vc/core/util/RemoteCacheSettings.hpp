@@ -18,7 +18,12 @@ inline constexpr unsigned long long kRemoteCacheMinFreeGibDefault = 20;
 inline constexpr auto kRemoteDownloadAutomatic = "perf/remote_download_automatic";
 inline constexpr bool kRemoteDownloadAutomaticDefault = true;
 inline constexpr auto kRemoteDownloadParallelism = "perf/remote_download_parallelism";
-inline constexpr int kRemoteDownloadParallelismDefault = 16;
+// Measured on turbosheep against the open bucket, cold cache each time, the
+// PHerc0332 scaffold's crossing extraction (10,195 crossings, 201 MiB
+// fetched, one run per setting): the extraction stage takes 104.1 s at 4,
+// 32.8 s at 16, 24.1 s at 32 and 15.8 s at 64, and gets worse above that
+// (40.3 s at 128, 49.1 s at 256), so 64 is both the default and the ceiling.
+inline constexpr int kRemoteDownloadParallelismDefault = 64;
 // Remote volumes read only from the cache root, never the network: "off" (default),
 // "on" (a chunk not in the cache is an error), "fill" (it reads as fill and is
 // recorded, vcr::Array::offline_misses). Metadata must be cached in both offline modes.

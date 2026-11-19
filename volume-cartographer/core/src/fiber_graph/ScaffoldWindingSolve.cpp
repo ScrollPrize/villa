@@ -1,5 +1,7 @@
 #include "vc/fiber_graph/ScaffoldWindingSolve.hpp"
 
+#include "vc/fiber_graph/ScaffoldConstraints.hpp"
+
 #include "vc_object_store/ParallelFor.hpp"
 
 #include <algorithm>
@@ -135,8 +137,15 @@ void controlRange(const ScaffoldGraph& graph, const ScaffoldGeometry& geometry, 
             break;
         }
     }
-    if (piece.controlTo <= piece.controlFrom)
-        piece.controlTo = std::min(piece.controlFrom + 1, std::int64_t(controls) - 1);
+    // A degenerate range is widened by one span, downward at the fiber's last
+    // control (where there is nothing above it): cp n-n is no piece at all.
+    if (piece.controlTo <= piece.controlFrom) {
+        if (piece.controlFrom + 1 <= std::int64_t(controls) - 1)
+            piece.controlTo = piece.controlFrom + 1;
+        else
+            piece.controlFrom = std::max<std::int64_t>(0, piece.controlTo - 1);
+    }
+    if (piece.controlTo <= piece.controlFrom) { piece.controlFrom = -1; piece.controlTo = -1; }
 }
 
 struct PathSearch {
@@ -329,7 +338,13 @@ std::vector<ScaffoldConstraint> scaffoldLinkConstraints(const ScaffoldGraph& gra
         constraint.arcB = projectedB.arc;
         constraint.step = step;
         constraint.weight = options.weight;
+        // An approved record is not enough: a link is held rigid only when
+        // the two pieces its anchors lie on are approved geometry.
         constraint.approved = link.approvalState == "approved";
+        if (constraint.approved && !scaffoldConstraintPiecesApproved(graph, geometry, constraint)) {
+            constraint.approved = false;
+            ++report.approvedWithoutPieces;
+        }
         constraints.push_back(constraint);
         ++report.used;
     }
@@ -370,7 +385,12 @@ ScaffoldSolveResult solveScaffoldWinding(const ScaffoldGraph& graph, const Scaff
     }
 
     ScaffoldSolveResult result;
-    result.constraints = scaffoldLinkConstraints(graph, geometry, options.links, result.linkReport);
+    // A run with the links switched off reads none of them: the report stays
+    // empty and only the measured constraints below constrain the windings.
+    if (options.links.useLinks)
+        result.constraints = scaffoldLinkConstraints(graph, geometry, options.links, result.linkReport);
+    else
+        result.linkReport = ScaffoldLinkReport{};
     result.constraints.insert(result.constraints.end(), measured.begin(), measured.end());
     for (const auto& constraint : result.constraints) {
         const auto kind = std::size_t(constraint.kind);

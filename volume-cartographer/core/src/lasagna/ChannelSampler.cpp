@@ -289,6 +289,24 @@ void readCorners(const LasagnaChannelBinding& binding,
         if (!binding.inventory)
             throw std::logic_error("chunk-validity binding without a chunk inventory");
         int64_t xyz[4];
+        // Every chunk the batch touches is asked for first, together: the
+        // per-corner lookups below then answer from memory instead of each
+        // new chunk being one more round trip to the source.
+        {
+            const auto& chunk = binding.inventory->chunkShapeXYZ();
+            std::vector<std::array<int64_t, 3>> touched;
+            std::array<int64_t, 3> last{-1, -1, -1};
+            for (size_t p = 0; p < n; ++p) {
+                const int64_t* zyx = coords(p, xyz);
+                if (coords.channel >= 0) ++zyx;
+                if (zyx[0] < 0 || zyx[1] < 0 || zyx[2] < 0) continue;
+                const std::array<int64_t, 3> at{zyx[2] / chunk[0], zyx[1] / chunk[1], zyx[0] / chunk[2]};
+                if (at == last) continue;  // neighbouring corners share a chunk
+                touched.push_back(at);
+                last = at;
+            }
+            binding.inventory->resolveChunks(std::move(touched));
+        }
         for (size_t p = 0; p < n; ++p) {
             const int64_t* zyx = coords(p, xyz);
             if (coords.channel >= 0) ++zyx;
@@ -466,6 +484,38 @@ bool LasagnaChunkInventory::storedChunk(int64_t cx, int64_t cy, int64_t cz)
     return stored;
 }
 
+void LasagnaChunkInventory::resolveChunks(std::vector<std::array<int64_t, 3>> chunksXYZ)
+{
+    auto& s = *state_;
+    std::sort(chunksXYZ.begin(), chunksXYZ.end());
+    chunksXYZ.erase(std::unique(chunksXYZ.begin(), chunksXYZ.end()), chunksXYZ.end());
+    const auto keyOf = [](const std::array<int64_t, 3>& c) {
+        return (uint64_t(c[2]) << 42) | (uint64_t(c[1]) << 21) | uint64_t(c[0]);
+    };
+    std::vector<std::array<int64_t, 3>> unknown;
+    {
+        std::shared_lock lock(s.mutex);
+        for (const auto& c : chunksXYZ) {
+            if (c[0] < 0 || c[1] < 0 || c[2] < 0 || c[0] >= s.gridXYZ[0] || c[1] >= s.gridXYZ[1] ||
+                c[2] >= s.gridXYZ[2])
+                continue;
+            if (s.stored.find(keyOf(c)) == s.stored.end()) unknown.push_back(c);
+        }
+    }
+    if (unknown.size() < 2) return;  // one chunk is storedChunk()'s own job
+    // The array's pool is the reader's configured parallelism (and, for a
+    // remote source, its connections); the caller takes part, so this is
+    // safe from inside that pool too.
+    std::vector<uint8_t> stored(unknown.size(), 0);
+    s.array->parallel_for(unknown.size(), [&](std::size_t i) {
+        vcr::Index index = s.prefix;
+        index.insert(index.end(), {unknown[i][2], unknown[i][1], unknown[i][0]});
+        stored[i] = s.array->chunk(index) ? 1 : 0;
+    });
+    std::unique_lock lock(s.mutex);
+    for (std::size_t i = 0; i < unknown.size(); ++i) s.stored.emplace(keyOf(unknown[i]), stored[i] != 0);
+}
+
 bool LasagnaChunkInventory::storedAt(int64_t x, int64_t y, int64_t z)
 {
     if (x < 0 || y < 0 || z < 0)
@@ -507,8 +557,17 @@ void readLasagnaChunkValidityBox(
     out.assign(voxels, uint8_t{0});
     const auto& chunk = binding.inventory->chunkShapeXYZ();
     const std::array<int64_t, 3> last{int64_t(binding.shapeZYX[2]), int64_t(binding.shapeZYX[1]), int64_t(binding.shapeZYX[0])};
-    // Fill chunk by chunk: one inventory query per chunk the box touches.
+    // Fill chunk by chunk: one inventory query per chunk the box touches,
+    // all of them asked for together first.
     const auto floorDiv = [](int64_t v, int64_t c) { return v >= 0 ? v / c : -((-v + c - 1) / c); };
+    {
+        std::vector<std::array<int64_t, 3>> touched;
+        for (int64_t cz = floorDiv(originXYZ[2], chunk[2]); cz * chunk[2] < originXYZ[2] + shapeXYZ[2]; ++cz)
+            for (int64_t cy = floorDiv(originXYZ[1], chunk[1]); cy * chunk[1] < originXYZ[1] + shapeXYZ[1]; ++cy)
+                for (int64_t cx = floorDiv(originXYZ[0], chunk[0]); cx * chunk[0] < originXYZ[0] + shapeXYZ[0]; ++cx)
+                    touched.push_back({cx, cy, cz});
+        binding.inventory->resolveChunks(std::move(touched));
+    }
     for (int64_t cz = floorDiv(originXYZ[2], chunk[2]); cz * chunk[2] < originXYZ[2] + shapeXYZ[2]; ++cz)
         for (int64_t cy = floorDiv(originXYZ[1], chunk[1]); cy * chunk[1] < originXYZ[1] + shapeXYZ[1]; ++cy)
             for (int64_t cx = floorDiv(originXYZ[0], chunk[0]); cx * chunk[0] < originXYZ[0] + shapeXYZ[0]; ++cx) {

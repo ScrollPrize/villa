@@ -66,6 +66,7 @@ namespace vc::fiber_tracer { class FiberPredictionField; }
 
 // LineAnnotationController::beginFiberMapSnapshot's state, opaque to other headers.
 struct FiberMapSnapshotDecodeState;
+namespace vc::fiber_graph { class ScaffoldRunMonitor; }
 
 class LineAnnotationController : public QObject
 {
@@ -192,6 +193,8 @@ public:
         // runs, approvals) name this fiber. Empty for a fiber that has never
         // been stored.
         std::string uuid;
+        // The store version this geometry was read at; 0 when unknown.
+        std::int64_t version = 0;
         // "<file prefix>-<sequence>", e.g. "kb-604".
         QString label;
         char hvTag = '?';
@@ -247,6 +250,19 @@ public:
         // bare guessed factor. Carries the stamp-mismatch and registered-volume
         // notes when either check fires. Empty when no umbilicus was applied.
         QString umbilicusLabel;
+        // The winding direction the store's umbilicus states
+        // (meta.winding_handedness); nullopt when it states none. The map's
+        // first authority on the winding sense, as it is the solve's.
+        std::optional<int> umbilicusHandedness;
+        // The umbilicus' store identity: the object and the version read.
+        std::string umbilicusUuid;
+        std::int64_t umbilicusVersion = 0;
+        // Which precondition a holder found missing when there are no fibers:
+        // a current volume to lay them out in, and a fiber store to read.
+        // Without these the snapshot is empty for a reason that has nothing to
+        // do with the annotation, and saying "no fibers" would mislead.
+        bool hasAnnotationVolume = false;
+        bool hasFiberStore = false;
     };
 
     // One-line umbilicus availability summary for workspace status bars:
@@ -374,6 +390,10 @@ public:
     // for menus that offer pieces; empty when the fiber is not stored.
     struct StoredControlSummary { size_t index = 0; int64_t storeId = -1; bool lock = false; };
     [[nodiscard]] std::vector<StoredControlSummary> storedControlSummaries(uint64_t fiberId) const;
+    // The stored fiber's line index nearest an arc position, measured as the
+    // cumulative chord length of its line points - the measure every scaffold
+    // anchor arc is stated in. Nullopt when the fiber or its line is missing.
+    [[nodiscard]] std::optional<int> storedLineIndexAtArc(uint64_t fiberId, double arc) const;
     // Stored fibers open read-only unless the user's Open fibers editable
     // setting is on. Enables editing in the most recent pane of this fiber
     // (as its Enable editing button does); false when it cannot.
@@ -422,6 +442,10 @@ public:
     // throws when the project or fiber store changed since begin.
     using FiberMapSnapshotDecode = ::FiberMapSnapshotDecodeState;
     [[nodiscard]] std::shared_ptr<FiberMapSnapshotDecode> beginFiberMapSnapshot() const;
+    // Watch the decode: the read reports the fibers it has decoded and stops
+    // at the next one when the monitor was cancelled.
+    static void watchFiberMapSnapshot(FiberMapSnapshotDecode&,
+                                      std::shared_ptr<vc::fiber_graph::ScaffoldRunMonitor>);
     static void decodeFiberMapSnapshot(FiberMapSnapshotDecode& decode);
     [[nodiscard]] FiberMapSnapshot finishFiberMapSnapshot(FiberMapSnapshotDecode& decode) const;
     // The current volume's stored umbilicus for a status line only; nothing is
@@ -503,6 +527,23 @@ public:
             const std::string& fallbackNormalLocation,
             const std::string& fallbackFiberLocation,
             QString* errorMessage = nullptr) const;
+    // The same in two steps, for callers that must not block the GUI: what
+    // the project says to open is captured on the GUI thread (cheap), and the
+    // datasets - possibly remote manifests - are opened on any thread.
+    struct FiberOptimizationInputSources {
+        bool loaded = false;
+        std::filesystem::path projectDirectory, remoteCacheRoot;
+        std::string fiberDataset, lasagnaDataset, normalSource;
+        std::optional<std::array<std::size_t, 3>> annotationShapeZYX;
+        std::shared_ptr<vcr::MemoryCache> memoryCache;
+    };
+    [[nodiscard]] FiberOptimizationInputSources fiberOptimizationInputSources() const;
+    [[nodiscard]] static std::optional<ResolvedFiberOptimizationInputs>
+        resolveFiberOptimizationInputs(
+            const FiberOptimizationInputSources& sources,
+            const std::string& fallbackNormalLocation,
+            const std::string& fallbackFiberLocation,
+            QString* errorMessage = nullptr);
     void optimizeAndSaveFiberHeadless(HeadlessFiberOptimizationRequest request,
                                       HeadlessFiberCompletion completion);
 
@@ -1198,6 +1239,9 @@ private:
         std::vector<cv::Vec3f> centers;  // scaled into the fibers' frame, z-sorted
         QString label;                   // the umbilicus' name; empty when refused
         QString message;                 // why there is none; empty on success
+        std::optional<int> handedness;   // meta.winding_handedness, when stated
+        std::string uuid;                // the store object read
+        std::int64_t version = 0;        // and its version
     };
     [[nodiscard]] SnapshotUmbilicus umbilicusForSnapshot(const std::string& annotationVolume) const;
     void onActiveVolumeChanged();
@@ -1313,6 +1357,9 @@ private:
     static std::vector<StoredFiber> readStoredFibersInContext(
         FiberReadContext&, const std::optional<std::vector<std::string>>&, bool, FiberDependencies*);
     // One attempt: throws FiberGraphMoved when the store committed during it.
+    // Tests: the number of store readers a fiber read decodes on, whatever
+    // the fiber count; 0 lets the read decide.
+    static inline std::size_t fiberReadTestWorkers = 0;
     struct FiberGraphMoved : std::runtime_error {
         using std::runtime_error::runtime_error;
     };

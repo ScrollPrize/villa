@@ -96,6 +96,16 @@ struct ScaffoldNormalOptions {
     std::vector<std::string> linkApprovalStates{"approved"};
     bool includeAutoLinks = false;
     std::size_t workers = 1;
+    // Reuse: the normals of a fiber whose version and input digest are
+    // already cached are read instead of solved, and what this run solves is
+    // written into `sink` for the caller to commit. Both null is a run that
+    // computes everything and keeps nothing.
+    // What the axis sampler of a fused run reads, by the identity the store
+    // or the catalog gives it (the prediction volume). A fused run without
+    // one is solved every time: nothing says what its rows would be about.
+    std::string predictionIdentity;
+    const class ScaffoldCache* cache = nullptr;
+    struct ScaffoldCacheSink* sink = nullptr;
     // Vertices per call into the prediction sampler. A sample depends on
     // nothing but its own point, so this changes no result; it only decides
     // how often a fused run reports its progress and can be stopped.
@@ -111,6 +121,9 @@ struct ScaffoldNormalOptions {
 };
 
 struct ScaffoldNormalReport {
+    // Fibers whose normals came from the cache, and those this run solved
+    // and wrote back.
+    std::int64_t reused = 0, cached = 0;
     std::int64_t fibers = 0, solved = 0, degenerate = 0, converged = 0;
     std::int64_t anchoredFibers = 0, unanchoredFibers = 0;
     std::int64_t manualAnchors = 0, approvedPieceAnchors = 0, adjacentLinkAnchors = 0;
@@ -151,6 +164,10 @@ public:
     // a fiber whose sign the sign solve decides.
     const std::vector<int>& fixedSigns() const { return fixedSigns_; }
     const ScaffoldNormalReport& report() const { return report_; }
+    // Per fiber: the identity of the cache row its normals are (read from it,
+    // or written by this run), which the crossings extracted with them name.
+    // Empty for a fiber whose normals cannot be cached.
+    const std::vector<std::string>& cacheRows() const { return cacheRows_; }
 
 private:
     const ScaffoldGraph* graph_ = nullptr;
@@ -161,6 +178,7 @@ private:
     std::vector<ScaffoldSignSource> signSources_;
     std::vector<double> radialAgreement_;
     std::vector<int> fixedSigns_;
+    std::vector<std::string> cacheRows_;
     ScaffoldNormalReport report_;
 };
 

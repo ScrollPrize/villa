@@ -13,6 +13,8 @@
 #include "ObjectStoreArtifacts.hpp"
 #include <vc_object_store/geometry/Geometry.hpp>
 #include "LineAnnotationController.hpp"
+
+#include "vc/fiber_graph/ScaffoldRunMonitor.hpp"
 #include <QTemporaryDir>
 #include <QDateTime>
 #include <QSysInfo>
@@ -5731,6 +5733,9 @@ LineAnnotationController::umbilicusForSnapshot(const std::string& annotationVolu
     std::sort(result.centers.begin(), result.centers.end(),
               [](const cv::Vec3f& a, const cv::Vec3f& b) { return a[2] < b[2]; });
     result.label = tr("umbilicus %1").arg(QString::fromStdString(umbilicus->name));
+    result.handedness = umbilicus->windingHandedness;
+    result.uuid = umbilicus->uuid;
+    result.version = umbilicus->version.version;
     return result;
 }
 
@@ -9831,6 +9836,23 @@ std::vector<LineAnnotationController::StoredControlSummary> LineAnnotationContro
     return result;
 }
 
+std::optional<int> LineAnnotationController::storedLineIndexAtArc(uint64_t fiberId, double arc) const
+{
+    if (!std::isfinite(arc) || arc < 0.0) return std::nullopt;
+    const auto stored = readStoredFiber(fiberId, true);
+    if (!stored || stored->linePoints.size() < 2) return std::nullopt;
+    double walked = 0.0;
+    for (size_t i = 1; i < stored->linePoints.size(); ++i) {
+        const double step = cv::norm(stored->linePoints[i] - stored->linePoints[i - 1]);
+        if (walked + step >= arc) {
+            // The nearer of the two line points bounding the arc.
+            return int(arc - walked <= walked + step - arc ? i - 1 : i);
+        }
+        walked += step;
+    }
+    return int(stored->linePoints.size() - 1);
+}
+
 std::optional<QString> LineAnnotationController::setFiberControlLock(uint64_t fiberId, size_t controlPointIndex, bool enabled)
 {
     for (auto it = _panes.rbegin(); it != _panes.rend(); ++it) {
@@ -12856,30 +12878,26 @@ std::map<std::string, fs::path> LineAnnotationController::fiberTransportPaths(
 
 std::optional<LineAnnotationController::ResolvedFiberOptimizationInputs>
 LineAnnotationController::resolveFiberOptimizationInputs(
+    const FiberOptimizationInputSources& sources,
     const std::string& fallbackNormalLocation,
     const std::string& fallbackFiberLocation,
-    QString* errorMessage) const
+    QString* errorMessage)
 {
-    if (!_state || !_state->vpkg()) {
+    if (!sources.loaded) {
         if (errorMessage) *errorMessage = tr("No volume package is loaded.");
         return std::nullopt;
     }
-    auto vpkg = _state->vpkg();
     vc::lasagna::LasagnaDatasetOpenOptions options;
-    options.remoteCacheRoot = vc3d::remoteCachePathFs();
-    const auto resolveLocation = [vpkg](const std::string& location) {
+    options.remoteCacheRoot = sources.remoteCacheRoot;
+    const auto resolveLocation = [&sources](const std::string& location) {
         return vcr::zarr::isRemote(location)
             ? location
-            : vc::project::resolveLocalPath(
-                  location, vpkg->path().parent_path()).string();
+            : vc::project::resolveLocalPath(location, sources.projectDirectory).string();
     };
 
     ResolvedFiberOptimizationInputs result;
     QStringList failures;
-    auto selectedFiber = vpkg->selectedFiberInferenceDataset();
-    const auto fiberEntries = vpkg->fiberInferenceDatasetEntries();
-    if (selectedFiber.empty() && fiberEntries.size() == 1)
-        selectedFiber = fiberEntries.front().location;
+    const auto& selectedFiber = sources.fiberDataset;
     const std::vector<std::string> fiberCandidates = {
         selectedFiber, fallbackFiberLocation};
     for (const auto& candidate : fiberCandidates) {
@@ -12897,7 +12915,7 @@ LineAnnotationController::resolveFiberOptimizationInputs(
                 std::make_shared<vc::fiber_tracer::FiberPredictionField>(*dataset);
             result.fiberManifestLocation = candidate;
             const auto annotationToFiberBase = vc3d::line_annotation::resolveFiberNormalCoordinateScales(
-                opened.manifest().baseShapeZYX, annotationShapeZYX(_state), 1.0).fiberBaseToNormalBase;
+                opened.manifest().baseShapeZYX, sources.annotationShapeZYX, 1.0).fiberBaseToNormalBase;
             result.traceToBaseScale = scales.traceToBaseScale / annotationToFiberBase;
             result.fiberDataset = std::move(dataset);
             result.predictions = std::move(predictions);
@@ -12908,7 +12926,7 @@ LineAnnotationController::resolveFiberOptimizationInputs(
         }
     }
 
-    const auto normalPreference = vpkg->annotationNormalSource();
+    const auto& normalPreference = sources.normalSource;
     bool predictedNormals = false;
     try {
         predictedNormals = result.fiberDataset &&
@@ -12920,7 +12938,7 @@ LineAnnotationController::resolveFiberOptimizationInputs(
     }
     const std::vector<std::string> normalCandidates = predictedNormals
         ? std::vector<std::string>{result.fiberManifestLocation}
-        : std::vector<std::string>{vpkg->selectedLasagnaDataset(), fallbackNormalLocation};
+        : std::vector<std::string>{sources.lasagnaDataset, fallbackNormalLocation};
     for (const auto& candidate : normalCandidates) {
         if (candidate.empty() || result.normalDataset || !result.fiberDataset)
             continue;
@@ -12932,7 +12950,7 @@ LineAnnotationController::resolveFiberOptimizationInputs(
             const auto coordinateScales =
                 vc3d::line_annotation::resolveFiberNormalCoordinateScales(
                     normalManifest.baseShapeZYX,
-                    annotationShapeZYX(_state).has_value() ? annotationShapeZYX(_state) : result.fiberDataset->manifest().baseShapeZYX,
+                    sources.annotationShapeZYX.has_value() ? sources.annotationShapeZYX : result.fiberDataset->manifest().baseShapeZYX,
                     result.traceToBaseScale);
 
             auto baseManifest = normalManifest;
@@ -12940,8 +12958,13 @@ LineAnnotationController::resolveFiberOptimizationInputs(
                 coordinateScales.fiberBaseToNormalBase;
             auto baseDataset = std::make_shared<vc::lasagna::LasagnaDataset>(
                 std::move(baseManifest));
+            // The app's own chunk cache, never a private one: these
+            // samplers are rebuilt per request and would otherwise start
+            // cold and re-read what the process already decoded.
+            vc::lasagna::LasagnaNormalSamplerOptions samplerOptions;
+            samplerOptions.memoryCache = sources.memoryCache;
             auto baseSampler =
-                std::make_shared<vc::lasagna::LasagnaNormalSampler>(*baseDataset);
+                std::make_shared<vc::lasagna::LasagnaNormalSampler>(*baseDataset, samplerOptions);
 
             auto traceManifest = normalManifest;
             traceManifest.workingToBaseScale =
@@ -12949,7 +12972,7 @@ LineAnnotationController::resolveFiberOptimizationInputs(
             auto traceDataset = std::make_shared<vc::lasagna::LasagnaDataset>(
                 std::move(traceManifest));
             auto traceSampler =
-                std::make_shared<vc::lasagna::LasagnaNormalSampler>(*traceDataset);
+                std::make_shared<vc::lasagna::LasagnaNormalSampler>(*traceDataset, samplerOptions);
 
             result.normalManifestLocation = candidate;
             result.normalDataset = std::move(baseDataset);
@@ -12972,6 +12995,34 @@ LineAnnotationController::resolveFiberOptimizationInputs(
         return std::nullopt;
     }
     return result;
+}
+
+LineAnnotationController::FiberOptimizationInputSources LineAnnotationController::fiberOptimizationInputSources() const
+{
+    FiberOptimizationInputSources sources;
+    if (!_state || !_state->vpkg()) return sources;
+    const auto vpkg = _state->vpkg();
+    sources.loaded = true;
+    sources.projectDirectory = vpkg->path().parent_path();
+    sources.remoteCacheRoot = vc3d::remoteCachePathFs();
+    sources.fiberDataset = vpkg->selectedFiberInferenceDataset();
+    const auto fiberEntries = vpkg->fiberInferenceDatasetEntries();
+    if (sources.fiberDataset.empty() && fiberEntries.size() == 1) sources.fiberDataset = fiberEntries.front().location;
+    sources.lasagnaDataset = vpkg->selectedLasagnaDataset();
+    sources.normalSource = vpkg->annotationNormalSource();
+    sources.annotationShapeZYX = annotationShapeZYX(_state);
+    sources.memoryCache = _state->volumeMemoryCache();
+    return sources;
+}
+
+std::optional<LineAnnotationController::ResolvedFiberOptimizationInputs>
+LineAnnotationController::resolveFiberOptimizationInputs(
+    const std::string& fallbackNormalLocation,
+    const std::string& fallbackFiberLocation,
+    QString* errorMessage) const
+{
+    return resolveFiberOptimizationInputs(fiberOptimizationInputSources(), fallbackNormalLocation,
+                                          fallbackFiberLocation, errorMessage);
 }
 
 void LineAnnotationController::optimizeAndSaveFiberHeadless(
@@ -13373,6 +13424,10 @@ struct LineAnnotationController::FiberReadContext {
     vc::objects::VolumeVoxels target;
     bool hasVolume = false;
     std::function<bool()> cancelled;
+    // Called as the read decodes, with the fibers done and the fibers it was
+    // asked for: how a long read reports its progress. From the reading
+    // thread, so it must be cheap and must not throw.
+    std::function<void(std::int64_t done, std::int64_t total)> progress;
     std::function<uint64_t(const std::string&)> idForUuid;
     std::unordered_map<std::string, StoredFiberPtr> cache;
     FiberDependencies dependencies;
@@ -13411,6 +13466,8 @@ struct FiberMapSnapshotDecodeState {
     LineAnnotationController::WorkerFiberIds ids;
     std::vector<LineAnnotationController::StoredFiberPtr> fibers;
     std::string error;
+    // The caller's progress and cancellation, when it watches this read.
+    std::shared_ptr<vc::fiber_graph::ScaffoldRunMonitor> monitor;
 };
 
 LineAnnotationController::FiberMapSnapshot LineAnnotationController::fiberMapSnapshot() const
@@ -13431,6 +13488,8 @@ std::shared_ptr<LineAnnotationController::FiberMapSnapshotDecode> LineAnnotation
     // current volume shows, every pyramid level alike), at its voxel size.
     const auto annotation = _state ? _state->annotationVolume() : std::nullopt;
     decode->annotation = annotation;
+    snapshot.hasAnnotationVolume = annotation.has_value();
+    snapshot.hasFiberStore = _state && _state->storeFor("fiber").has_value();
     if (!annotation) return decode;
     snapshot.annotationVolume = annotation->volume;
     snapshot.voxelSizeUm = annotation->voxelSizeUm;
@@ -13459,12 +13518,31 @@ std::shared_ptr<LineAnnotationController::FiberMapSnapshotDecode> LineAnnotation
     return decode;
 }
 
+void LineAnnotationController::watchFiberMapSnapshot(FiberMapSnapshotDecode& decode,
+                                                     std::shared_ptr<vc::fiber_graph::ScaffoldRunMonitor> monitor)
+{
+    decode.monitor = std::move(monitor);
+}
+
 void LineAnnotationController::decodeFiberMapSnapshot(FiberMapSnapshotDecode& decode)
 {
     if (!decode.annotation || !decode.read.attachment) return;
+    // The caller's monitor, when it gave one: the read is the first long
+    // stage of an Update and reports and stops like every other.
+    if (decode.monitor) {
+        auto monitor = decode.monitor;
+        decode.read.cancelled = [monitor]() { return monitor->cancelled(); };
+        decode.read.progress = [monitor](std::int64_t done, std::int64_t total) {
+            monitor->report(done, total);
+        };
+        monitor->enter("reading the fibers");
+    }
     try {
         useWorkerFiberIds(decode.read, decode.ids);
+        QElapsedTimer contextTimer;
+        contextTimer.start();
         decode.fibers = storedFibersInContext(decode.read, std::nullopt, true);
+        Logger()->info("fiber read: storedFibersInContext {} ms", contextTimer.elapsed());
     } catch (const std::exception& error) {
         decode.error = error.what();
     }
@@ -13511,6 +13589,7 @@ LineAnnotationController::FiberMapSnapshot LineAnnotationController::finishFiber
         // is what the fiber panel shows.
         entry.fileName = fiber.fileName;
         entry.uuid = fiber.uuid;
+        if (fiber.storePin) entry.version = fiber.storePin->reference().version;
         const QString stem =
             vc3d::displayStemForFiberFile(QString::fromStdString(fiber.fileName));
         const int separator = stem.indexOf(QLatin1Char('_'));
@@ -13580,6 +13659,9 @@ LineAnnotationController::FiberMapSnapshot LineAnnotationController::finishFiber
     snapshot.umbilicusMessage = std::move(umbilicus.message);
     snapshot.umbilicusLabel = std::move(umbilicus.label);
     snapshot.umbilicusCenters = std::move(umbilicus.centers);
+    snapshot.umbilicusHandedness = umbilicus.handedness;
+    snapshot.umbilicusUuid = std::move(umbilicus.uuid);
+    snapshot.umbilicusVersion = umbilicus.version;
     return snapshot;
 }
 
@@ -16698,6 +16780,8 @@ std::vector<LineAnnotationController::StoredFiber> LineAnnotationController::rea
     connection->readStore(*attachment, [&](const StoreReader& reader, const auto& cancel) {
         // One status for the pins, the heads selected below and the validation
         // stamp, read before every read it certifies (transforms included).
+        QElapsedTimer readTimer;
+        readTimer.start();
         const auto state = reader.status();
         if (startedAt) *startedAt = state;
         if (context.observedStatus) context.observedStatus(state);
@@ -16705,7 +16789,14 @@ std::vector<LineAnnotationController::StoredFiber> LineAnnotationController::rea
         const auto& loadedStatus = state;
         // Fibers bound to the open volume (by scale or a registration) are read in its voxels.
         const auto transforms = context.hasVolume ? std::optional(reader.volumeTransforms()) : std::nullopt;
-        auto decode = [&](const ObjectRecord& object, const ObjectRevision& head, bool withLines) {
+        const qint64 transformsMs = readTimer.elapsed();
+        qint64 lapListMs = 0, lapHeadsMs = 0;
+        QElapsedTimer lap;
+        // `reader` is the caller's or a worker's own: every decode reads
+        // through the reader of the thread it runs on. `id` is assigned by
+        // the caller, in decode order.
+        auto decode = [&](const StoreReader& reader, const ObjectRecord& object, const ObjectRevision& head,
+                          bool withLines, uint64_t id) {
             StoredFiber fiber;
             fiber.uuid = object.uuid;
             fiber.readOnly = readOnly;
@@ -16715,7 +16806,7 @@ std::vector<LineAnnotationController::StoredFiber> LineAnnotationController::rea
             fiber.tags = object.tags;
             fiber.storePin = pinOf(*attachment, head, activeGeneration);
             fiber.graphCommit = loadedStatus.commitSequence;
-            fiber.id = context.idForUuid(object.uuid);
+            fiber.id = id;
             try {
                 if (!head.geometryRevision) throw std::runtime_error("Fiber has no geometry");
                 // Controls always; the sampled line only when asked for.
@@ -16790,13 +16881,19 @@ std::vector<LineAnnotationController::StoredFiber> LineAnnotationController::rea
         auto heads = [&](ObjectSelection selection) {
             selection.kind = "fiber";
             std::vector<ObjectVersion> references;
+            lap.start();
             for (const auto& record : reader.selectObjects(selection, std::vector<std::string>{})) {
                 if (!record.version) throw std::runtime_error("Fiber listing without versions");
                 references.push_back(record.reference());
             }
+            lapListMs += lap.elapsed();
             std::map<std::string, ObjectRevision> result;
             if (references.empty()) return result;
-            for (auto& head : reader.objectsAtVersions(references)) {
+            QElapsedTimer headsLap;
+            headsLap.start();
+            const auto atVersions = reader.objectsAtVersions(references);
+            lapHeadsMs += headsLap.elapsed();
+            for (auto head : atVersions) {
                 // Listed a moment ago: a store without history no longer has
                 // the version once another commit replaced it. Read again.
                 if (!head) throw FiberGraphMoved("Missing object revision");
@@ -16860,8 +16957,10 @@ std::vector<LineAnnotationController::StoredFiber> LineAnnotationController::rea
         std::vector<ObjectVersion> versions;
         for (const auto& head : objects) versions.push_back(head.reference());
         // The pinned relationships the decode below resolves branches from.
+        const qint64 beforeRelationshipsMs = readTimer.elapsed();
         const auto selectedRelationships = versions.empty() ? std::vector<SelectedRelationship>{}
                                                             : reader.relationshipsAt(versions);
+        const qint64 relationshipsMs = readTimer.elapsed() - beforeRelationshipsMs;
         std::map<std::string, ObjectRecord> undecodedHeads;
         if (dependencies && !requested.empty()) {
             // Include inapplicable links too: a peer edit can restore their
@@ -16900,6 +16999,13 @@ std::vector<LineAnnotationController::StoredFiber> LineAnnotationController::rea
                     (lines && requested.contains(head.objectUuid) ? withLines : revisions).push_back(*head.geometryRevision);
             // Best effort: one unreadable geometry fails the whole batch, and
             // the decodes below then read (and report) each fiber on its own.
+            if (objects.size() > 16)
+                Logger()->info("fiber read: before the decode {} ms = status+transforms {} · list {} · heads {} · "
+                               "relationships {} · links and rest {}",
+                               readTimer.elapsed(), transformsMs, lapListMs, lapHeadsMs, relationshipsMs,
+                               readTimer.elapsed() - transformsMs - lapListMs - lapHeadsMs - relationshipsMs);
+            QElapsedTimer prefetchTimer;
+            prefetchTimer.start();
             try {
                 if (!revisions.empty())
                     reader.prefetchGeometry(revisions, {"control_points", "control_point_ids"}, {"control_points"});
@@ -16907,16 +17013,83 @@ std::vector<LineAnnotationController::StoredFiber> LineAnnotationController::rea
                     reader.prefetchGeometry(withLines, {"control_points", "control_point_ids", "line_points"}, {"control_points"});
             } catch (const std::exception&) {
             }
+            if (objects.size() > 16)
+                Logger()->info("fiber read: prefetch of {} geometries {} ms", objects.size(), prefetchTimer.elapsed());
         }
-        std::vector<StoredFiber> decoded;
+        std::vector<StoredFiber> decoded(objects.size());
         std::unordered_map<std::string, size_t> byUuid;
         std::unordered_map<std::string, StoredFiberHeadState> decodedHeads;
-        for (const auto& head : objects) {
-            if (cancel.load() || (context.cancelled && context.cancelled())) throw std::runtime_error("Object store read cancelled");
-            byUuid[head.objectUuid] = decoded.size();
-            decodedHeads.insert_or_assign(head.objectUuid, head.reference());
-            decoded.push_back(decode(head.record, head, lines && requested.contains(head.objectUuid)));
+        QElapsedTimer decodeLoopTimer;
+        decodeLoopTimer.start();
+        // Ids in decode order, before any worker runs: the id source is the
+        // caller's and is not shared between threads.
+        std::vector<uint64_t> ids(objects.size());
+        for (size_t i = 0; i < objects.size(); ++i) {
+            byUuid[objects[i].objectUuid] = i;
+            decodedHeads.insert_or_assign(objects[i].objectUuid, objects[i].reference());
+            ids[i] = context.idForUuid(objects[i].objectUuid);
         }
+        // A fiber's decode is JSON parsing inside the store and depends on
+        // that fiber alone. A local store hands every worker a reader of its
+        // own; each proves it reads the position this read started at, so
+        // the result is the one a single reader would have produced. A
+        // hosted reader batches its requests and stays on this thread.
+        std::atomic<size_t> next{0}, done{0};
+        std::mutex progressMutex;
+        const auto cancelled = [&]() { return cancel.load() || (context.cancelled && context.cancelled()); };
+        const auto decodeFrom = [&](const StoreReader& own) {
+            for (size_t i = next.fetch_add(1); i < objects.size(); i = next.fetch_add(1)) {
+                if (cancelled()) throw std::runtime_error("Object store read cancelled");
+                const auto& head = objects[i];
+                decoded[i] = decode(own, head.record, head, lines && requested.contains(head.objectUuid), ids[i]);
+                const auto count = done.fetch_add(1) + 1;
+                if (context.progress) {
+                    std::lock_guard lock(progressMutex);
+                    context.progress(std::int64_t(count), std::int64_t(objects.size()));
+                }
+            }
+        };
+        const bool local = dynamic_cast<const LocalStoreReader*>(&reader) != nullptr;
+        const size_t workers = !local || objects.empty()
+            ? 1
+            : fiberReadTestWorkers > 0
+                ? std::min(fiberReadTestWorkers, objects.size())
+                : objects.size() < 32
+                    ? 1
+                    : std::min<size_t>({CState::kStoreReadWorkers, std::max(1u, std::thread::hardware_concurrency()),
+                                        objects.size() / 8});
+        if (workers <= 1) {
+            decodeFrom(reader);
+        } else {
+            std::vector<std::exception_ptr> failures(workers);
+            const auto work = [&](size_t worker) {
+                try {
+                    if (worker == 0) return decodeFrom(reader);
+                    connection->readStore(*attachment, [&](const StoreReader& own, const auto&) {
+                        const auto now = own.status();
+                        if (now.storeUuid != state.storeUuid || now.generation != state.generation ||
+                            now.commitSequence != state.commitSequence)
+                            throw FiberGraphMoved("The store moved during the fiber read");
+                        decodeFrom(own);
+                    });
+                } catch (...) {
+                    failures[worker] = std::current_exception();
+                    next.store(objects.size()); // the others stop at their next fiber
+                }
+            };
+            std::vector<std::thread> pool;
+            for (size_t worker = 1; worker < workers; ++worker) pool.emplace_back(work, worker);
+            work(0);
+            for (auto& thread : pool) thread.join();
+            // A moved store outranks what it made the other workers fail with.
+            for (const auto& failure : failures)
+                if (failure) try { std::rethrow_exception(failure); } catch (const FiberGraphMoved&) { throw; } catch (...) {}
+            for (const auto& failure : failures)
+                if (failure) std::rethrow_exception(failure);
+        }
+        if (objects.size() > 16)
+            Logger()->info("fiber read: decode of {} fibers {} ms on {} readers", objects.size(),
+                           decodeLoopTimer.elapsed(), workers);
         if (dependencies && !requested.empty()) {
             // The decode is exact as of `state` for everything read from the
             // store; hosted transforms are known current only up to

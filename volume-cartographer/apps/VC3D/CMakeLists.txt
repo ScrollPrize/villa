@@ -68,6 +68,7 @@ set(srcs
     LineAnnotationFiberDeletion.hpp
     FiberNameDisplay.cpp
     FiberNameDisplay.hpp
+    FiberMapBenchmark.cpp
     FiberMapWorkspace.cpp
     FiberMapWorkspace.hpp
     ProjectWorkspace.cpp

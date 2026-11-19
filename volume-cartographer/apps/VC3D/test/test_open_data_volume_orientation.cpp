@@ -27,6 +27,36 @@ class TestOpenDataVolumeOrientation : public QObject
     Q_OBJECT
 
 private slots:
+    // The store's umbilicus is the first authority, the catalog the second,
+    // and a sense nobody states is refused - never decided from the geometry.
+    void theSenseIsStatedOrRefused()
+    {
+        using vc3d::opendata::CatalogVolumeSense;
+        using vc3d::opendata::statedWindingSense;
+        const std::optional<CatalogVolumeSense> oriented = CatalogVolumeSense{"s/v", orientation(false, false)};
+        const std::optional<CatalogVolumeSense> unoriented =
+            CatalogVolumeSense{"s/v", orientation(std::nullopt, false)};
+
+        const auto store = statedWindingSense(-1, oriented);
+        QCOMPARE(store.sense, -1); // the catalog alone would say +1
+        QVERIFY(!store.fromCatalog);
+        const auto catalog = statedWindingSense(std::nullopt, oriented);
+        QCOMPARE(catalog.sense, 1);
+        QVERIFY(catalog.fromCatalog);
+
+        const auto refused = [](std::optional<int> umbilicus, const std::optional<CatalogVolumeSense>& catalog) {
+            try {
+                (void)statedWindingSense(umbilicus, catalog);
+            } catch (const std::runtime_error&) {
+                return true;
+            }
+            return false;
+        };
+        QVERIFY(refused(std::nullopt, unoriented));
+        QVERIFY(refused(std::nullopt, std::nullopt));
+        QVERIFY(refused(0, oriented));
+    }
+
     // The sense is -1 exactly when one of the two properties holds, and
     // unknown while either is unset.
     void windingSenseFollowsTheTwoProperties()

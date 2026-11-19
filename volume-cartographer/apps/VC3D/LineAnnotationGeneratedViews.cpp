@@ -681,6 +681,30 @@ std::string applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
                 // Dimmed pieces come first at equal x so they win the cursor
                 // sweep over a gap or damaged span they contain.
                 collectPieces(overlay.dimmedLineRanges, SpanStyle::Dimmed);
+                // Outside the open piece the strip itself is shaded, not just
+                // its line: what can be edited and approved is the part that
+                // stayed bright. The quad spans the strip's full height in
+                // surface units (its rows over the surface's row scale).
+                if (!overlay.dimmedLineRanges.empty() && scale[1] != 0.0f) {
+                    const float halfHeight = static_cast<float>(points->rows) / (2.0f * scale[1]);
+                    ViewerOverlayControllerBase::OverlayStyle shadeStyle;
+                    shadeStyle.penColor = Qt::transparent;
+                    shadeStyle.penWidth = 0.0;
+                    shadeStyle.brushColor = QColor(0, 0, 0, 120);
+                    shadeStyle.z = lineStyle.z - 1.0;
+                    for (const auto& [first, second] : overlay.dimmedLineRanges) {
+                        const float x0 = surfaceXForLinePosition(std::clamp(first, 0.0, maximumLinePosition));
+                        const float x1 = surfaceXForLinePosition(std::clamp(second, 0.0, maximumLinePosition));
+                        if (!std::isfinite(x0) || !std::isfinite(x1) || x1 <= x0) continue;
+                        const float left = std::clamp(x0, lineStartX, lineEndX);
+                        const float right = std::clamp(x1, lineStartX, lineEndX);
+                        if (right <= left) continue;
+                        primitives.push_back(ViewerOverlayControllerBase::SurfaceLineStripPrimitive{
+                            {cv::Vec2f(left, surfaceY - halfHeight), cv::Vec2f(right, surfaceY - halfHeight),
+                             cv::Vec2f(right, surfaceY + halfHeight), cv::Vec2f(left, surfaceY + halfHeight)},
+                            true, shadeStyle});
+                    }
+                }
                 std::stable_sort(pieces.begin(), pieces.end(), [](const StyledPiece& a, const StyledPiece& b) {
                     if (a.x0 != b.x0) return a.x0 < b.x0;
                     return a.spanStyle == SpanStyle::Dimmed && b.spanStyle != SpanStyle::Dimmed;

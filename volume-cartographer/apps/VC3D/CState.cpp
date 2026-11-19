@@ -1,4 +1,6 @@
 #include "CState.hpp"
+
+#include "vc/lasagna/ProjectVolumes.hpp"
 #include <vc_object_store/Uuid.hpp>
 #include "PointCollectionSync.hpp"
 #include "SessionDrafts.hpp"
@@ -57,12 +59,31 @@ vc::objects::AttachmentIdentity connectHostedStore(
     return connection.get();
 }
 
-std::shared_ptr<const vcr::catalog::RegistrationGraph> catalogTransformSnapshot()
+// Every registration a store resolves through besides its own records: the
+// cached catalog's, and the project's Lasagna base-shape relations. A Lasagna
+// group is nobody's registered volume - its frame is its manifest's base
+// shape scaled down - so without these a fiber cannot be read in one. The
+// graph is built here and nowhere else: every store opened with these options
+// resolves the same edges, whichever reader asks.
+std::shared_ptr<const vcr::catalog::RegistrationGraph> catalogTransformSnapshot(const VolumePkg* pkg)
 {
-    const auto catalog=vcr::catalog::cachedManifest(vcr::catalog::catalogCacheFile(std::string(vcr::catalog::kDefaultManifestUrl)));
-    if(!catalog)return {};
     auto graph=std::make_shared<vcr::catalog::RegistrationGraph>();
-    graph->addCatalog(*catalog);
+    bool any=false;
+    if(const auto catalog=vcr::catalog::cachedManifest(vcr::catalog::catalogCacheFile(std::string(vcr::catalog::kDefaultManifestUrl)))) {
+        graph->addCatalog(*catalog);
+        any=true;
+    }
+    if(pkg) {
+        for(auto& registration:vc::lasagna::lasagnaProjectRegistrations(*pkg,vc3d::remoteCachePathFs())) {
+            try {
+                graph->add(std::move(registration));
+                any=true;
+            } catch(const std::exception&) {
+                // A duplicate or degenerate edge: what is already there says it.
+            }
+        }
+    }
+    if(!any)return {};
     return graph;
 }
 
@@ -72,9 +93,12 @@ std::shared_ptr<const vcr::catalog::RegistrationGraph> catalogTransformSnapshot(
 vc::objects::OpenOptions viewerOpenOptions()
 {
     vc::objects::OpenOptions options;
-    options.catalogTransforms = catalogTransformSnapshot();
     options.geometryCacheBytes = size_t(256) << 20;
     options.surfaceTiles = CState::surfaceGeometryCache();
+    // The store's own readers, plus one for every worker of a fiber read:
+    // those hold a reader each while the read that started them holds its
+    // own, and must never wait on the readers the rest of the viewer uses.
+    options.readerPoolSize += int(CState::kStoreReadWorkers);
     return options;
 }
 
@@ -364,11 +388,18 @@ vc::objects::AttachmentIdentity CState::attachHostedStore(const std::string& end
     return attachment;
 }
 
+std::shared_ptr<vcr::MemoryCache> CState::volumeMemoryCache() const
+{
+    return _openedVolumes ? _openedVolumes->memoryCache() : nullptr;
+}
+
 bool CState::storeAuthorConfigured() { return namesAuthor(configuredAuthor()); }
 
-vc::objects::OpenOptions CState::storeOpenOptions(const QString& author, bool readOnly)
+vc::objects::OpenOptions CState::storeOpenOptions(
+    const QString& author, bool readOnly, const std::shared_ptr<const vcr::catalog::RegistrationGraph>& registrations)
 {
     auto options = viewerOpenOptions();
+    options.catalogTransforms = registrations ? registrations : catalogTransformSnapshot(nullptr);
     options.author = author.toStdString();
     options.readOnly = readOnly;
     return options;
@@ -410,7 +441,7 @@ vc::objects::AttachmentIdentity CState::prepareStore(const std::filesystem::path
 {
     if (_objectStoreOwner) return _objectStoreOwner->prepareStore(path, author, readOnly);
     if (const auto existing = attachedAt(path)) return *existing;
-    return _objectStoreSession->attach(path, storeOpenOptions(author, readOnly));
+    return _objectStoreSession->attach(path, storeOpenOptions(author, readOnly, _registrationGraph));
 }
 void CState::releasePreparedStore(const vc::objects::AttachmentIdentity& attachment)
 {
@@ -631,6 +662,8 @@ void CState::setVpkg(std::shared_ptr<VolumePkg> pkg)
         _storeReferences.clear();
     }
     _vpkg = std::move(pkg);
+    // Before the stores are attached below: they are opened with this graph.
+    if (changed) _registrationGraph = catalogTransformSnapshot(_vpkg.get());
     if (changed && !_objectStoreOwner) {
         restoreStoreRoutes();
         pollObjectStoreChanges();

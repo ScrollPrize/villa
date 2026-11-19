@@ -29,11 +29,22 @@ struct ScaffoldRankedPiece {
     std::int64_t cycleHops = -1;
     // How many violated constraints accuse this stretch.
     std::int64_t constraints = 0;
+    // The numbered cycles this stretch lies on (scaffoldCycleNumbers),
+    // ascending; empty when no accusing constraint had one.
+    std::vector<std::int64_t> cycles;
 };
 
 // One entry per distinct stretch, summing the shares the violated constraints
 // gave it, highest score first.
 [[nodiscard]] std::vector<ScaffoldRankedPiece> rankScaffoldPieces(
+    const std::vector<vc::fiber_graph::ScaffoldStoredResidual>& residuals);
+
+// A number per cycle, so the dock can say which rows are about the same loop.
+// A run stores a cycle as the stretches it runs along, so two residuals are
+// on the same cycle when they name the same stretches; the cycles are
+// numbered from 1 in the order the residuals appear (worst first), and a
+// residual that no cycle localizes gets 0. Indexed by residual order.
+[[nodiscard]] std::vector<std::int64_t> scaffoldCycleNumbers(
     const std::vector<vc::fiber_graph::ScaffoldStoredResidual>& residuals);
 
 // How the approval table is ordered.
@@ -90,13 +101,31 @@ struct ScaffoldRunDiff {
 struct ScaffoldApprovalSpans {
     std::vector<std::int64_t> controlIds;
     std::array<std::vector<std::uint8_t>, 2> approved;
+    // Arc length of each control point along the fiber's line points
+    // (voxels), so an anchor arc can be mapped to the span covering it. Same
+    // length as controlIds; empty for a fiber with fewer than two controls.
+    std::vector<double> controlArcs;
 };
 
-// What a selected row asks the map to show: the fibers to select and, for a
-// stretch, the control range on the first of them (-1: the whole fiber).
+// The span of a fiber covering an anchor, with its approval states. `known`
+// is false when the fiber's controls could not place the arc, which is not
+// the same as a span that is simply unapproved.
+struct ScaffoldAnchorSpan {
+    bool known = false;
+    std::int64_t span = -1, controlFrom = -1, controlTo = -1;
+    bool geometryApproved = false, normalsApproved = false;
+};
+
+// What a selected row asks the map to show: the fibers to select, and the
+// control ranges to draw on them - a stretch, or the two pieces a
+// constraint's anchors lie on.
 struct ScaffoldHighlight {
+    struct Span {
+        std::string fiberUuid;
+        std::int64_t controlFrom = -1, controlTo = -1;
+    };
     std::vector<std::string> fiberUuids;
-    std::int64_t controlFrom = -1, controlTo = -1;
+    std::vector<Span> spans;
 };
 
 } // namespace vc3d::fiber_map

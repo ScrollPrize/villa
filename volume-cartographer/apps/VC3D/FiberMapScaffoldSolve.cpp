@@ -1,5 +1,7 @@
 #include "FiberMapScaffoldSolve.hpp"
 
+#include "vc/fiber_graph/ScaffoldCache.hpp"
+
 #include "CState.hpp"
 
 #include "vc/fiber_graph/ScaffoldConstraints.hpp"
@@ -19,7 +21,9 @@
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QLabel>
+#include <QProgressBar>
 #include <QPushButton>
+#include <QStandardItemModel>
 #include <QSysInfo>
 #include <QThread>
 #include <QThreadPool>
@@ -39,6 +43,62 @@ namespace vc3d::fiber_map
 namespace
 {
 using namespace vc::fiber_graph;
+
+// A duration as the dock states it: seconds below a minute, minutes and
+// seconds below an hour, hours and minutes above.
+QString scaffoldDurationText(double seconds)
+{
+    const auto whole = std::int64_t(seconds + 0.5);
+    if (whole < 60) return QObject::tr("%1 s").arg(whole);
+    if (whole < 3600) return QObject::tr("%1 min %2 s").arg(whole / 60).arg(whole % 60);
+    return QObject::tr("%1 h %2 min").arg(whole / 3600).arg((whole % 3600) / 60);
+}
+
+// Arc length of each control point along the fiber's line points (voxels).
+// Empty when the controls cannot be placed on the line.
+std::vector<double> scaffoldControlArcs(const vc::objects::FiberPieceContent& content)
+{
+    auto indices = content.controlLineIndex;
+    if (indices.size() != content.controlIds.size()) {
+        auto copy = content;
+        copy.resolveLineIndices();
+        indices = copy.controlLineIndex;
+    }
+    if (indices.size() != content.controlIds.size() || content.linePoints.size() < 2) return {};
+    std::vector<double> cumulative(content.linePoints.size(), 0.);
+    for (std::size_t i = 1; i < content.linePoints.size(); ++i) {
+        const auto& previous = content.linePoints[i - 1];
+        const auto& point = content.linePoints[i];
+        const auto dx = point[0] - previous[0], dy = point[1] - previous[1], dz = point[2] - previous[2];
+        cumulative[i] = cumulative[i - 1] + std::sqrt(dx * dx + dy * dy + dz * dz);
+    }
+    std::vector<double> arcs;
+    arcs.reserve(indices.size());
+    for (const auto index : indices) {
+        if (index < 0 || std::size_t(index) >= cumulative.size()) return {};
+        arcs.push_back(cumulative[std::size_t(index)]);
+    }
+    // Controls are stored along the line, so the arcs are nondecreasing; a
+    // table that is not says the line indices do not match this content.
+    if (!std::is_sorted(arcs.begin(), arcs.end())) return {};
+    return arcs;
+}
+
+// Sorts by the numeric key a column stored, falling back to the text for the
+// columns that carry none. A QTreeWidget compares the display text, which
+// would order 10 before 9.
+class RankingItem : public QTreeWidgetItem
+{
+public:
+    using QTreeWidgetItem::QTreeWidgetItem;
+    bool operator<(const QTreeWidgetItem& other) const override
+    {
+        const auto column = treeWidget() ? treeWidget()->sortColumn() : 0;
+        const auto mine = data(column, Qt::UserRole + 1), theirs = other.data(column, Qt::UserRole + 1);
+        if (mine.isValid() && theirs.isValid()) return mine.toDouble() < theirs.toDouble();
+        return text(column).localeAwareCompare(other.text(column)) < 0;
+    }
+};
 
 QString oneLine(const ScaffoldStoredRun& run)
 {
@@ -65,14 +125,21 @@ struct ScaffoldSolveController::SolveJob {
     ScaffoldSolveRequest request;
     std::optional<vc::objects::AttachmentIdentity> attachment;
     std::shared_ptr<vc::objects::ObjectStoreSession> session;
-    // Resolved on the GUI thread before the job starts; null when the run
-    // measures no winding separations.
+    // Captured on the GUI thread, opened on the worker (startSolve).
+    ScaffoldSolveController::WindingSamplerOpener openSampler;
+    ScaffoldSolveController::AxisSamplerOpener openAxes;
+    // Null when the run measures no winding separations.
     std::shared_ptr<vc::lasagna::LasagnaNormalSampler> sampler;
     // The prediction's sheet axis, for a fused run.
     vc::fiber_graph::ScaffoldAxisSampler axes;
     // Progress and cancellation, read from the GUI thread while the worker
     // writes it.
     vc::fiber_graph::ScaffoldRunMonitor monitor;
+    // Derived results this run may reuse, and what it computed for the next
+    // one (vc/fiber_graph/ScaffoldCache.hpp).
+    vc::fiber_graph::ScaffoldCacheSink cacheSink;
+    // What the fused run's prediction is called; empty when it reads none.
+    std::string predictionIdentity;
     // Outputs.
     QString error;
     bool cancelled = false;
@@ -106,15 +173,46 @@ std::optional<vc::objects::AttachmentIdentity> ScaffoldSolveController::attachme
     return _state->storeFor("fiber");
 }
 
+ScaffoldAnchorSpan ScaffoldSolveController::anchorSpan(const std::string& fiberUuid, double arc) const
+{
+    ScaffoldAnchorSpan answer;
+    const auto found = _approvals.find(fiberUuid);
+    if (found == _approvals.end()) return answer;
+    const auto& arcs = found->second.controlArcs;
+    if (arcs.size() < 2 || !std::isfinite(arc)) return answer;
+    // The span between the two controls bracketing the arc, clamped to the
+    // fiber's ends: an anchor beyond the last control belongs to the last
+    // span, which is the span whose geometry covers it.
+    auto upper = std::upper_bound(arcs.begin(), arcs.end(), arc);
+    auto span = std::size_t(std::distance(arcs.begin(), upper));
+    if (span == 0) span = 1;
+    if (span >= arcs.size()) span = arcs.size() - 1;
+    answer.known = true;
+    answer.span = std::int64_t(span - 1);
+    answer.controlFrom = std::int64_t(span - 1);
+    answer.controlTo = std::int64_t(span);
+    const auto approvedAt = [&](std::size_t aspect) {
+        const auto& flags = found->second.approved[aspect];
+        return std::size_t(answer.span) < flags.size() && flags[std::size_t(answer.span)] != 0;
+    };
+    answer.geometryApproved = approvedAt(std::size_t(vc::objects::FiberPieceAspect::Geometry));
+    answer.normalsApproved = approvedAt(std::size_t(vc::objects::FiberPieceAspect::Normals));
+    return answer;
+}
+
 void ScaffoldSolveController::reloadRuns()
 {
     _runs.clear();
     const auto store = attachment();
     const auto session = _state ? _state->objectStoreSession() : nullptr;
     if (!store || !session) {
+        // Nothing was read, so the caller may not take this for the store's
+        // answer: the list is listed again once a store is there.
+        _runsLoaded = false;
         emit runsChanged();
         return;
     }
+    _runsLoaded = true;
     QString error;
     try {
         session->readStore(*store, [&](const vc::objects::StoreReader& reader, const auto&) {
@@ -221,14 +319,14 @@ void ScaffoldSolveController::loadApprovals()
             vc::objects::ObjectSelection selection;
             selection.kind = "fiber";
             for (const auto& record : reader.selectObjects(selection)) {
-                const auto rows = vc::objects::readFiberPieceApprovals(reader, record.uuid);
-                if (rows.empty()) continue;
                 const auto revision = reader.currentObject(record.uuid);
                 if (!revision) continue;
                 const auto content = vc::objects::fiberPieceContent(reader, *revision);
+                const auto rows = vc::objects::readFiberPieceApprovals(reader, record.uuid);
                 const auto states = vc::objects::fiberPieceApprovalStates(content, rows);
                 ScaffoldApprovalSpans entry;
                 entry.controlIds = content.controlIds;
+                entry.controlArcs = scaffoldControlArcs(content);
                 const auto spans = content.controlIds.empty() ? 0 : content.controlIds.size() - 1;
                 for (std::size_t aspect = 0; aspect < 2; ++aspect) {
                     entry.approved[aspect].assign(spans, 0);
@@ -274,40 +372,15 @@ void ScaffoldSolveController::startSolve(const ScaffoldSolveRequest& request)
         emit statusMessage(_lastError);
         return;
     }
-    // A run that measures separations needs the density to measure them on,
-    // and says so before it starts rather than quietly measuring none.
-    std::shared_ptr<vc::lasagna::LasagnaNormalSampler> sampler;
-    if (request.measureCrossings && request.measureWindingDistances) {
-        QString error;
-        if (_windingSampler) sampler = _windingSampler(&error);
-        if (!sampler) {
-            _lastError = error.isEmpty() ? tr("No normal dataset is bound, so no winding separation can be measured.")
-                                         : error;
-            emit statusMessage(_lastError);
-            return;
-        }
-        if (!sampler->hasWindingDensity()) {
-            _lastError = tr("The bound normal dataset states no winding density (grad_mag): it cannot measure a \n"
-                            "winding separation.");
-            emit statusMessage(_lastError);
-            return;
-        }
-    }
-    // The same for the prediction a fused run reads its sheet axis from.
-    vc::fiber_graph::ScaffoldAxisSampler axes;
-    if (request.measureCrossings && request.normalSource == "fused") {
-        QString error;
-        if (_axisSampler) axes = _axisSampler(&error);
-        if (!axes) {
-            _lastError = error.isEmpty() ? tr("No fiber-inference prediction is bound, so no sheet axis can be read.")
-                                         : error;
-            emit statusMessage(_lastError);
-            return;
-        }
-    }
+    // What a measured run reads is captured here and opened on the worker:
+    // opening a dataset (a remote manifest, say) must never block the GUI.
+    ScaffoldSolveController::WindingSamplerOpener openSampler;
+    if (request.measureCrossings && request.measureWindingDistances && _windingSampler) openSampler = _windingSampler();
+    ScaffoldSolveController::AxisSamplerOpener openAxes;
+    if (request.measureCrossings && request.normalSource == "fused" && _axisSampler) openAxes = _axisSampler();
     _job = std::make_shared<SolveJob>();
-    _job->axes = std::move(axes);
-    _job->sampler = std::move(sampler);
+    _job->openSampler = std::move(openSampler);
+    _job->openAxes = std::move(openAxes);
     _job->request = request;
     _job->attachment = store;
     _job->session = session;
@@ -328,7 +401,49 @@ void ScaffoldSolveController::startSolve(const ScaffoldSolveRequest& request)
             load.volume = job->request.volume;
             load.fallbackHandedness = job->request.fallbackHandedness;
             load.fiberSubset = job->request.fiberSubset;
+            load.monitor = &job->monitor;
+            // Coarse progress: the stages this run will enter. Reading the
+            // fibers, the constraint assembly, the winding solve and the
+            // residual cycles always; a measured run adds the normals, the
+            // six phases the crossing extraction reports, the sign solve and
+            // the prediction axis when it is fused.
+            // A run that measures separations needs the density to measure
+            // them on, and a fused run its prediction: both are opened here,
+            // and a run that cannot have them stops before it reads a fiber.
+            if (job->request.measureCrossings &&
+                (job->request.measureWindingDistances || job->request.normalSource == "fused")) {
+                job->monitor.enter("opening the datasets");
+                if (job->request.measureWindingDistances) {
+                    QString error;
+                    if (job->openSampler) job->sampler = job->openSampler(&error);
+                    if (!job->sampler)
+                        throw std::runtime_error(error.isEmpty()
+                            ? "No normal dataset is bound, so no winding separation can be measured."
+                            : error.toStdString());
+                    if (!job->sampler->hasWindingDensity())
+                        throw std::runtime_error("The bound normal dataset states no winding density (grad_mag): it "
+                                                 "cannot measure a winding separation.");
+                }
+                job->monitor.checkpoint();
+                if (job->request.normalSource == "fused") {
+                    QString error;
+                    if (job->openAxes) job->axes = job->openAxes(&error, &job->predictionIdentity);
+                    if (!job->axes)
+                        throw std::runtime_error(error.isEmpty()
+                            ? "No fiber-inference prediction is bound, so no sheet axis can be read."
+                            : error.toStdString());
+                }
+                job->monitor.checkpoint();
+            }
+            job->cacheSink.author = job->session->newRequest(*job->attachment).author;
+            job->cacheSink.computedAt = QDateTime::currentDateTimeUtc().toString(Qt::ISODate).toStdString();
+            const bool opens = job->request.measureCrossings &&
+                               (job->request.measureWindingDistances || job->request.normalSource == "fused");
+            job->monitor.expectStages((job->request.measureCrossings
+                                           ? (job->request.normalSource == "fused" ? 13 : 12)
+                                           : 4) + (opens ? 1 : 0));
             ScaffoldSolveOptions options;
+            options.links.useLinks = job->request.useLinks;
             options.links.approvalStates = job->request.approvalStates;
             options.links.includeAuto = job->request.includeAuto;
             options.links.weight = job->request.manualWeight;
@@ -336,11 +451,15 @@ void ScaffoldSolveController::startSolve(const ScaffoldSolveRequest& request)
             options.flow.backend = vc::geometry::parseWindingFlowBackend(job->request.lemonBackend);
             options.workers = std::max<std::size_t>(1, job->request.workers);
             options.monitor = &job->monitor;
-            job->monitor.enter("reading the store");
+
             ScaffoldRunRecord record;
             record.runUuid = vc::objects::util::newUuid();
+            record.createdAtUnix = QDateTime::currentDateTimeUtc().toSecsSinceEpoch();
             job->session->readStore(*job->attachment, [&](const vc::objects::StoreReader& reader, const auto&) {
                 const auto graph = loadScaffoldGraph(reader, load);
+                // What earlier runs computed from the same geometry with the
+                // same parameters: read once, before anything is solved.
+                const vc::fiber_graph::ScaffoldCache cache(reader);
                 const ScaffoldGeometry geometry(graph);
                 // The measured stages, when the run asked for them. They run
                 // on this worker, in the frame the map was built in.
@@ -357,6 +476,11 @@ void ScaffoldSolveController::startSolve(const ScaffoldSolveRequest& request)
                 ScaffoldApprovalReport approvals;
                 ScaffoldRunStages stages;
                 if (job->request.measureCrossings) {
+                    normalOptions.cache = &cache;
+                    normalOptions.sink = &job->cacheSink;
+                    normalOptions.predictionIdentity = job->predictionIdentity;
+                    eventOptions.cache = &cache;
+                    eventOptions.sink = &job->cacheSink;
                     normalOptions.linkApprovalStates = job->request.approvalStates;
                     normalOptions.includeAutoLinks = job->request.includeAuto;
                     normalOptions.workers = options.workers;
@@ -364,6 +488,9 @@ void ScaffoldSolveController::startSolve(const ScaffoldSolveRequest& request)
                     eventOptions.measureWindingDistances = job->request.measureWindingDistances;
                     eventOptions.workers = options.workers;
                     eventOptions.monitor = &job->monitor;
+                    // The dock only ever rounds: an approval is a statement
+                    // about an integer winding relation.
+                    measuredOptions.separations = ScaffoldSeparationMode::Rounded;
                     measuredOptions.perpendicularWeight = job->request.perpendicularWeight;
                     measuredOptions.parallelWeight = job->request.parallelWeight;
                     measuredOptions.enclosureWeight = job->request.enclosureWeight;
@@ -393,6 +520,7 @@ void ScaffoldSolveController::startSolve(const ScaffoldSolveRequest& request)
                     stages.measured = &measuredReport;
                     stages.signOptions = &signOptions;
                     stages.signs = &signs;
+                    stages.approvals = &approvals;
                 }
                 const auto result = solveScaffoldWinding(graph, geometry, options, measured);
                 record.input = {graph.source.storeUuid, graph.source.generation, graph.source.commitSequence};
@@ -468,6 +596,28 @@ void ScaffoldSolveController::finishSolve()
             request.operations.push_back(vc::objects::CreateExtensionTableOp{table});
         for (auto& [table, rows] : job->rows.rows)
             request.operations.push_back(vc::objects::AppendExtensionRowsOp{table, rows});
+        // The derived results of this run, so the next one reads them instead
+        // of sampling the volume again.
+        if (!job->cacheSink.normals.empty()) {
+            std::vector<vc::objects::ExtensionRow> values;
+            values.reserve(job->cacheSink.normals.size());
+            for (const auto& row : job->cacheSink.normals)
+                values.push_back(vc::objects::fiberScaffoldNormalsRow(row));
+            request.operations.push_back(
+                vc::objects::CreateExtensionTableOp{vc::objects::fiberScaffoldNormalsTable()});
+            request.operations.push_back(
+                vc::objects::AppendExtensionRowsOp{vc::objects::kFiberScaffoldNormalsTable, std::move(values)});
+        }
+        if (!job->cacheSink.crossings.empty()) {
+            std::vector<vc::objects::ExtensionRow> values;
+            values.reserve(job->cacheSink.crossings.size());
+            for (const auto& row : job->cacheSink.crossings)
+                values.push_back(vc::objects::fiberScaffoldCrossingsRow(row));
+            request.operations.push_back(
+                vc::objects::CreateExtensionTableOp{vc::objects::fiberScaffoldCrossingsTable()});
+            request.operations.push_back(
+                vc::objects::AppendExtensionRowsOp{vc::objects::kFiberScaffoldCrossingsTable, std::move(values)});
+        }
         job->session->submitDurably(*job->attachment, request);
     } catch (const std::exception& problem) {
         _lastError = tr("The solve could not be saved: %1").arg(QString::fromUtf8(problem.what()));
@@ -636,7 +786,9 @@ ScaffoldSolverPanel::ScaffoldSolverPanel(ScaffoldSolveController* controller, QW
     statesLayout->addWidget(_pendingCheck);
     statesLayout->addStretch(1);
     states->setToolTip(tr("Which links the solve uses, by their review state.\n"
-                          "A rejected link is never used."));
+                          "A rejected link is never used. With neither checked the run uses no\n"
+                          "link at all and solves on the measured crossings alone, which it then\n"
+                          "has to be measuring."));
     form->addRow(tr("Links"), states);
 
     _autoCheck = new QCheckBox(tr("Use automatic links"), this);
@@ -664,8 +816,8 @@ ScaffoldSolverPanel::ScaffoldSolverPanel(ScaffoldSolveController* controller, QW
 
     _backendCombo = new QComboBox(this);
     _backendCombo->setObjectName(QStringLiteral("fiberMapSolveBackend"));
-    _backendCombo->addItem(tr("network simplex"), QStringLiteral("network_simplex"));
     _backendCombo->addItem(tr("cost scaling"), QStringLiteral("cost_scaling"));
+    _backendCombo->addItem(tr("network simplex"), QStringLiteral("network_simplex"));
     _backendCombo->setToolTip(tr("The min-cost-flow backend. Both solve the same problem exactly."));
     form->addRow(tr("Backend"), _backendCombo);
 
@@ -754,10 +906,21 @@ ScaffoldSolverPanel::ScaffoldSolverPanel(ScaffoldSolveController* controller, QW
     buttonLayout->addWidget(_cancelButton);
     layout->addWidget(buttons);
 
+    _progressBar = new QProgressBar(this);
+    _progressBar->setObjectName(QStringLiteral("fiberMapSolveProgressBar"));
+    _progressBar->setTextVisible(false);
+    _progressBar->setVisible(false);
+    _progressBar->setToolTip(tr("How far the running stage is through the work it announced. A stage\n"
+                                "that cannot count its work shows as busy instead; the line below\n"
+                                "names which stage of how many the run is in."));
+    layout->addWidget(_progressBar);
+
     _progressLabel = new QLabel(this);
     _progressLabel->setObjectName(QStringLiteral("fiberMapSolveProgress"));
-    _progressLabel->setToolTip(tr("The stage the running solve is in, and the work it has done of what\n"
-                                  "that stage announced."));
+    _progressLabel->setToolTip(tr("The stage the running solve is in, the work it has done of what that\n"
+                                  "stage announced, and the time left at the rate this stage has held so\n"
+                                  "far. The estimate covers the running stage only: a run's later stages\n"
+                                  "do not announce their work until they start."));
     layout->addWidget(_progressLabel);
 
     _statusLabel = new QLabel(this);
@@ -783,16 +946,35 @@ ScaffoldSolverPanel::ScaffoldSolverPanel(ScaffoldSolveController* controller, QW
         connect(_controller, &ScaffoldSolveController::busyChanged, this, [this](bool busy) {
             updateEnabled();
             if (busy) {
+                _progressStage.clear();
                 _progressTimer->start();
+                showProgress();
             } else {
                 _progressTimer->stop();
                 _progressLabel->clear();
+                _progressStage.clear();
+                _progressBar->setVisible(false);
             }
         });
         connect(_controller, &ScaffoldSolveController::statusMessage, this,
                 [this](const QString& message) { _statusLabel->setText(message); });
     }
     updateEnabled();
+}
+
+void ScaffoldSolverPanel::setScopeAvailable(bool available)
+{
+    if (!_scopeCombo) return;
+    const auto at = _scopeCombo->findData(true);
+    if (at < 0) return;
+    if (!available && _scopeCombo->currentIndex() == at) _scopeCombo->setCurrentIndex(0);
+    if (auto* model = qobject_cast<QStandardItemModel*>(_scopeCombo->model()))
+        if (auto* item = model->item(at)) item->setEnabled(available);
+    _scopeCombo->setItemData(at,
+                             available ? QString()
+                                       : tr("The map has no layout yet, so it has no selected network; press "
+                                            "Update to restrict a run to one."),
+                             Qt::ToolTipRole);
 }
 
 void ScaffoldSolverPanel::setScopeResolver(ScopeResolver resolver)
@@ -806,12 +988,44 @@ void ScaffoldSolverPanel::showProgress()
     const auto progress = _controller->progress();
     if (progress.stage.empty()) {
         _progressLabel->clear();
+        _progressBar->setVisible(false);
         return;
     }
-    const auto stage = QString::fromStdString(progress.stage);
-    _progressLabel->setText(progress.total > 0
-                                ? tr("%1: %2 of %3").arg(stage).arg(progress.done).arg(progress.total)
-                                : tr("%1...").arg(stage));
+    const auto now = std::chrono::steady_clock::now();
+    // A new stage restarts the measurement: it counts its own work, and the
+    // work already done when it was first seen is not this measurement's.
+    if (progress.stage != _progressStage) {
+        _progressStage = progress.stage;
+        _progressStarted = now;
+        _progressStageFirstDone = progress.done;
+    }
+    // Coarse progress first: which stage of how many, then the stage itself.
+    const auto coarse = progress.stageCount > 1
+        ? tr("%1/%2 ").arg(progress.stageIndex).arg(progress.stageCount)
+        : QString();
+    const auto stage = coarse + QString::fromStdString(progress.stage);
+    if (progress.total <= 0) {
+        // Nothing to divide: a busy bar and the stage's name, which is all a
+        // stage that announced no total can honestly show.
+        _progressBar->setRange(0, 0);
+        _progressBar->setVisible(true);
+        _progressLabel->setText(tr("%1...").arg(stage));
+        return;
+    }
+    _progressBar->setRange(0, int(std::min<std::int64_t>(progress.total, std::numeric_limits<int>::max())));
+    _progressBar->setValue(int(std::min<std::int64_t>(progress.done, progress.total)));
+    _progressBar->setVisible(true);
+    const auto done = progress.done - _progressStageFirstDone;
+    const auto seconds = std::chrono::duration<double>(now - _progressStarted).count();
+    QString eta;
+    // Below a second of measurement or a single step the rate says nothing;
+    // the line then carries the counts alone rather than a wild number.
+    if (done > 0 && seconds >= 1.) {
+        const auto left = double(progress.total - progress.done) * seconds / double(done);
+        if (left >= 1.) eta = tr(", %1 left").arg(scaffoldDurationText(left));
+    }
+    _progressLabel->setText(
+        tr("%1: %2 of %3%4").arg(stage).arg(progress.done).arg(progress.total).arg(eta));
 }
 
 void ScaffoldSolverPanel::setFrame(const std::string& volume, std::optional<int> fallbackHandedness)
@@ -824,11 +1038,17 @@ void ScaffoldSolverPanel::setFrame(const std::string& volume, std::optional<int>
 void ScaffoldSolverPanel::updateEnabled()
 {
     const bool states = _approvedCheck->isChecked() || _pendingCheck->isChecked();
-    const bool busy = _controller && _controller->busy();
-    _runButton->setEnabled(states && !busy && !_volume.empty());
-    _cancelButton->setEnabled(busy);
-    if (_volume.empty()) _runButton->setToolTip(tr("The map has no annotation volume to solve in."));
     const bool crossings = _crossingsCheck->isChecked();
+    const bool busy = _controller && _controller->busy();
+    // No link state selected is a measured-only run, which needs the
+    // crossings: without either the solve would have nothing to constrain.
+    _runButton->setEnabled((states || crossings) && !busy && !_volume.empty());
+    _cancelButton->setEnabled(busy);
+    if (_volume.empty())
+        _runButton->setToolTip(tr("The map has no annotation volume to solve in."));
+    else if (!states && !crossings)
+        _runButton->setToolTip(tr("Nothing would constrain the windings: select a link state, or measure the\n"
+                                  "fibers' crossings."));
     for (auto* widget : std::initializer_list<QWidget*>{_windingDistanceCheck, _perpendicularWeightSpin,
                                                         _parallelWeightSpin, _enclosureWeightSpin,
                                                         _normalSourceCombo, _signBackendCombo})
@@ -841,6 +1061,7 @@ ScaffoldSolveRequest ScaffoldSolverPanel::request() const
     request.approvalStates.clear();
     if (_approvedCheck->isChecked()) request.approvalStates.push_back("approved");
     if (_pendingCheck->isChecked()) request.approvalStates.push_back("pending");
+    request.useLinks = !request.approvalStates.empty();
     request.includeAuto = _autoCheck->isChecked();
     request.manualWeight = _manualWeightSpin->value();
     request.fixApprovedSubgraphs = _fixApprovedCheck->isChecked();
@@ -872,8 +1093,8 @@ ScaffoldRunsPanel::ScaffoldRunsPanel(ScaffoldSolveController* controller, QWidge
     _tree = new QTreeWidget(this);
     _tree->setObjectName(QStringLiteral("fiberMapSolvesTree"));
     _tree->setColumnCount(kRunColumnCount);
-    _tree->setHeaderLabels({tr("method"), tr("fibers"), tr("comp"), tr("arcs"), tr("L1"), tr("bad"), tr("max"),
-                            tr("state"), tr("diff")});
+    _tree->setHeaderLabels({tr("when"), tr("method"), tr("normals"), tr("sign"), tr("fibers"), tr("comp"), tr("arcs"),
+                            tr("L1"), tr("bad"), tr("max"), tr("sign!"), tr("state"), tr("diff")});
     _tree->setUniformRowHeights(true);
     _tree->setRootIsDecorated(false);
     // Two runs can be selected, which compares them; the first of them is
@@ -931,6 +1152,21 @@ void ScaffoldRunsPanel::rebuild()
             return found == run.metrics.end() ? 0. : found->second;
         };
         auto* item = new QTreeWidgetItem(_tree);
+        // The run's own time, as it recorded it; a run saved before the
+        // settings carried one shows nothing rather than a guess.
+        const auto when = run.createdAtUnix > 0
+            ? QDateTime::fromSecsSinceEpoch(run.createdAtUnix, Qt::UTC).toLocalTime()
+            : QDateTime();
+        item->setText(kRunWhenColumn, when.isValid() ? when.toString(QStringLiteral("MM-dd HH:mm")) : QString());
+        item->setToolTip(kRunWhenColumn, when.isValid()
+                                             ? when.toUTC().toString(Qt::ISODate)
+                                             : tr("This run recorded no time."));
+        item->setText(kRunNormalsColumn, QString::fromStdString(run.normalSource));
+        item->setToolTip(kRunNormalsColumn, tr("The normals the run used: the fibers' own geometry, or those fused\n"
+                                               "with the prediction's sheet axis. Empty for a links-only run."));
+        item->setText(kRunSignBackendColumn, QString::fromStdString(run.signBackend));
+        item->setToolTip(kRunSignBackendColumn, tr("Which backend decided the normal signs. Empty for a run that\n"
+                                                   "solved none."));
         item->setText(kRunMethodColumn, QString::fromStdString(run.method));
         item->setText(kRunFibersColumn, QString::number(count("fibers")));
         item->setText(kRunComponentsColumn, QString::number(count("components")));
@@ -938,6 +1174,13 @@ void ScaffoldRunsPanel::rebuild()
         item->setText(kRunObjectiveColumn, QString::number(metric("weighted_l1"), 'f', 3));
         item->setText(kRunViolatedColumn, QString::number(count("violated_constraints")));
         item->setText(kRunMaxResidualColumn, QString::number(metric("max_residual"), 'f', 3));
+        // The sign solve's own disagreement with the anchors it held.
+        const auto signs = run.counts.find("sign_fixed_disagreements");
+        item->setText(kRunSignColumn, signs == run.counts.end() ? QString() : QString::number(signs->second));
+        item->setToolTip(kRunSignColumn,
+                         tr("Anchored fibers whose normal sign the crossings would have flipped: the\n"
+                            "anchors held, but the measured evidence disagreed with them. Empty for a\n"
+                            "run that solved no signs."));
         const bool stale = _controller->runStale(run);
         item->setText(kRunStaleColumn, stale ? tr("stale") : tr("current"));
         item->setToolTip(kRunStaleColumn,
@@ -1006,16 +1249,21 @@ ScaffoldApprovalPanel::ScaffoldApprovalPanel(ScaffoldSolveController* controller
     layout->setContentsMargins(4, 4, 4, 4);
     layout->setSpacing(3);
 
-    _highlightFibersCheck = new QCheckBox(tr("Highlight approved fibers"), this);
-    _highlightFibersCheck->setObjectName(QStringLiteral("fiberMapHighlightApprovedFibers"));
-    _highlightFibersCheck->setToolTip(tr("Outline the fibers whose every span carries a current geometry\n"
-                                         "approval."));
-    _highlightPiecesCheck = new QCheckBox(tr("Highlight approved pieces"), this);
-    _highlightPiecesCheck->setObjectName(QStringLiteral("fiberMapHighlightApprovedPieces"));
-    _highlightPiecesCheck->setToolTip(tr("Outline every span that carries a current geometry approval, and\n"
-                                         "mark the spans whose normals are approved too."));
-    layout->addWidget(_highlightFibersCheck);
-    layout->addWidget(_highlightPiecesCheck);
+    auto* fadeRow = new QWidget(this);
+    auto* fadeLayout = new QHBoxLayout(fadeRow);
+    fadeLayout->setContentsMargins(0, 0, 0, 0);
+    fadeLayout->addWidget(new QLabel(tr("Fade unapproved"), fadeRow));
+    _fadeCombo = new QComboBox(fadeRow);
+    _fadeCombo->setObjectName(QStringLiteral("fiberMapApprovalFade"));
+    _fadeCombo->addItem(tr("nothing"), int(FadeMode::None));
+    _fadeCombo->addItem(tr("geometry"), int(FadeMode::Geometry));
+    _fadeCombo->addItem(tr("normals"), int(FadeMode::Normals));
+    _fadeCombo->setToolTip(tr("Draw the approved spans as the map always draws them and fade the rest:\n"
+                              "geometry fades every span without a current geometry approval; normals\n"
+                              "fades every span whose normals are not approved, which includes those\n"
+                              "whose geometry is not (a normals approval requires one)."));
+    fadeLayout->addWidget(_fadeCombo, 1);
+    layout->addWidget(fadeRow);
 
     auto* orderRow = new QWidget(this);
     auto* orderLayout = new QHBoxLayout(orderRow);
@@ -1050,9 +1298,29 @@ ScaffoldApprovalPanel::ScaffoldApprovalPanel(ScaffoldSolveController* controller
     _tree = new QTreeWidget(this);
     _tree->setObjectName(QStringLiteral("fiberMapApprovalTree"));
     _tree->setColumnCount(kColumnCount);
-    _tree->setHeaderLabels({tr("what"), tr("fiber"), tr("where"), tr("cost"), tr("cycle"), tr("n")});
+    _tree->setHeaderLabels({tr("what"), tr("fiber"), tr("where"), tr("off"), tr("state"), tr("cost"), tr("joint"),
+                            tr("loop"), tr("cycle"), tr("length"), tr("paths")});
+    _tree->headerItem()->setToolTip(kOffColumn, tr("Turns of winding the solve could not satisfy on this constraint."));
+    _tree->headerItem()->setToolTip(kStateColumn,
+                                    tr("A constraint: approved, approvable (both pieces approved), blocked (they are\n"
+                                       "not) or link (its approval is its review state). A piece: whether its\n"
+                                       "geometry is approved, +n when its normals are too."));
+    _tree->headerItem()->setToolTip(kCostColumn, tr("Weight times residual, in weighted turns."));
+    _tree->headerItem()->setToolTip(kJointColumn, tr("Cost per constraint of the shortest cycle (weighted turns)."));
+    _tree->headerItem()->setToolTip(kCycleNumberColumn,
+                                    tr("Which cycle this row is about, numbered from 1 in rank order. Rows\n"
+                                       "sharing a number are about the same loop; a stretch lists every loop\n"
+                                       "that runs along it."));
+    _tree->headerItem()->setToolTip(kCycleColumn, tr("Constraints on the shortest cycle the violation lies on."));
+    _tree->headerItem()->setToolTip(kLengthColumn,
+                                    tr("The stretch's length, or the cycle's total stretch length (voxels)."));
+    _tree->headerItem()->setToolTip(kCountColumn,
+                                    tr("A constraint: edge-disjoint alternative paths found (redundancy). A\n"
+                                       "stretch: how many violated constraints accuse it."));
     _tree->setUniformRowHeights(true);
-    _tree->setRootIsDecorated(false);
+    _tree->setRootIsDecorated(true);
+    _tree->setExpandsOnDoubleClick(false);
+    _tree->setSortingEnabled(true);
     _tree->setSelectionMode(QAbstractItemView::SingleSelection);
     _tree->header()->setStretchLastSection(true);
     _tree->setToolTip(tr("What the selected solve could not satisfy. A violated constraint is\n"
@@ -1078,16 +1346,20 @@ ScaffoldApprovalPanel::ScaffoldApprovalPanel(ScaffoldSolveController* controller
     _summaryLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
     layout->addWidget(_summaryLabel);
 
+    _errorLabel = new QLabel(this);
+    _errorLabel->setObjectName(QStringLiteral("fiberMapApprovalError"));
+    _errorLabel->setWordWrap(true);
+    _errorLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    layout->addWidget(_errorLabel);
+
     connect(_approveButton, &QPushButton::clicked, this, [this]() {
         const auto* residual = residualOf(_tree->currentItem());
         if (!residual || !_controller) return;
         const bool approved = _controller->constraintApproved(*residual);
         const auto error = _controller->setConstraintApproval(*residual, !approved);
-        if (!error.isEmpty()) {
-            _summaryLabel->setText(error);
-            return;
-        }
-        applySelection();
+        _errorLabel->setText(error);
+        if (!error.isEmpty()) return;
+        rebuild();
     });
     for (auto* combo : {_orderCombo, _componentCombo})
         connect(combo, &QComboBox::currentIndexChanged, this, [this]() {
@@ -1097,24 +1369,26 @@ ScaffoldApprovalPanel::ScaffoldApprovalPanel(ScaffoldSolveController* controller
     connect(_tree, &QTreeWidget::itemSelectionChanged, this, [this]() { applySelection(); });
     connect(_tree, &QTreeWidget::itemDoubleClicked, this,
             [this](QTreeWidgetItem* item, int) { activateRow(item); });
-    for (auto* box : {_highlightFibersCheck, _highlightPiecesCheck}) {
-        connect(box, &QCheckBox::toggled, this, [this](bool on) {
-            if (on && _controller && !_controller->approvalsLoaded()) _controller->loadApprovals();
-            emit highlightModeChanged();
-        });
-    }
+    connect(_fadeCombo, &QComboBox::currentIndexChanged, this, [this]() {
+        if (fadeMode() != FadeMode::None && _controller && !_controller->approvalsLoaded())
+            _controller->loadApprovals();
+        emit highlightModeChanged();
+    });
     if (_controller) {
         connect(_controller, &ScaffoldSolveController::selectionChanged, this, [this]() { rebuild(); });
-        connect(_controller, &ScaffoldSolveController::approvalsChanged, this,
-                [this]() { emit highlightModeChanged(); });
-        connect(_controller, &ScaffoldSolveController::constraintApprovalsChanged, this,
-                [this]() { applySelection(); });
+        connect(_controller, &ScaffoldSolveController::approvalsChanged, this, [this]() {
+            rebuild();
+            emit highlightModeChanged();
+        });
+        connect(_controller, &ScaffoldSolveController::constraintApprovalsChanged, this, [this]() { rebuild(); });
     }
     rebuild();
 }
 
-bool ScaffoldApprovalPanel::highlightApprovedFibers() const { return _highlightFibersCheck->isChecked(); }
-bool ScaffoldApprovalPanel::highlightApprovedPieces() const { return _highlightPiecesCheck->isChecked(); }
+ScaffoldApprovalPanel::FadeMode ScaffoldApprovalPanel::fadeMode() const
+{
+    return FadeMode(_fadeCombo->currentData().toInt());
+}
 
 void ScaffoldApprovalPanel::setLabelLookup(LabelLookup lookup)
 {
@@ -1122,16 +1396,28 @@ void ScaffoldApprovalPanel::setLabelLookup(LabelLookup lookup)
     rebuild();
 }
 
+std::array<ScaffoldAnchorSpan, 2> ScaffoldApprovalPanel::coveringSpans(const ScaffoldStoredResidual& residual) const
+{
+    if (!_controller) return {};
+    return {_controller->anchorSpan(residual.fiberA, residual.arcA),
+            _controller->anchorSpan(residual.fiberB, residual.arcB)};
+}
+
 void ScaffoldApprovalPanel::rebuild()
 {
     _rebuilding = true;
+    _tree->setSortingEnabled(false);
     _tree->clear();
+    _rows.clear();
     const auto* view = _controller ? _controller->selected() : nullptr;
     if (!view) {
         _summaryLabel->setText(tr("Select a solve to see what it could not satisfy."));
         _rebuilding = false;
         return;
     }
+    // The piece approvals answer the state column and gate the approve
+    // button, so the dock needs them as soon as it has rows.
+    if (_controller && !_controller->approvalsLoaded()) _controller->loadApprovals();
     const auto label = [this](const std::string& uuid) {
         if (_labels) {
             const auto text = _labels(uuid);
@@ -1147,17 +1433,6 @@ void ScaffoldApprovalPanel::rebuild()
         default: return tr("constraint");
         }
     };
-    // One row per violated constraint and per accused stretch, ordered by the
-    // chosen key with the documented secondary keys.
-    struct Row {
-        ScaffoldApprovalRow keys;
-        bool piece = false;
-        QStringList text;
-        std::string fiberUuid, otherUuid;
-        std::int64_t controlFrom = -1, controlTo = -1;
-        // Index into the run's residuals for a constraint row, -1 otherwise.
-        std::int64_t residual = -1;
-    };
     // The component each row's fiber was solved in, so the dock can show one
     // component at a time. A constraint's two fibers are in the same
     // component by construction (it is an arc between them).
@@ -1165,48 +1440,117 @@ void ScaffoldApprovalPanel::rebuild()
         const auto found = view->windings.find(uuid);
         return found == view->windings.end() ? -1 : found->second.component;
     };
-    std::vector<Row> rows;
+    // A row and the children it owns: the two pieces a constraint lies on.
+    struct Entry {
+        Row row;
+        QStringList text;
+        std::vector<std::pair<Row, QStringList>> children;
+    };
+    const auto spanText = [&](const ScaffoldAnchorSpan& span, double arc) {
+        return span.known ? tr("cp %1-%2").arg(span.controlFrom).arg(span.controlTo)
+                          : tr("%1 vx").arg(arc, 0, 'f', 0);
+    };
+    const auto stateText = [&](const ScaffoldAnchorSpan& span) {
+        if (!span.known) return tr("unknown");
+        if (span.geometryApproved) return span.normalsApproved ? tr("approved +n") : tr("approved");
+        return tr("unapproved");
+    };
+    const auto cycleNumbers = scaffoldCycleNumbers(view->residuals);
+    const auto cycleText = [](std::int64_t number) { return number > 0 ? QString::number(number) : QString(); };
+    std::vector<Entry> entries;
     for (std::size_t index = 0; index < view->residuals.size(); ++index) {
         const auto& residual = view->residuals[index];
-        Row row;
-        row.piece = false;
-        row.residual = std::int64_t(index);
-        row.keys.cost = residual.weight * residual.residual;
-        row.keys.cycle = residual.cycleHops.value_or(-1);
-        row.keys.length = residual.cyclePieceLength;
-        row.fiberUuid = residual.fiberA;
-        row.otherUuid = residual.fiberB;
-        row.text << (residual.edgeUuid.empty() ? kindName(residual.kind) : tr("link"))
-                 << tr("%1 - %2").arg(label(residual.fiberA), label(residual.fiberB))
-                 << tr("%1 turns off").arg(residual.residual, 0, 'f', 2)
-                 << QString::number(row.keys.cost, 'f', 3)
-                 << (row.keys.cycle > 0 ? QString::number(row.keys.cycle) : tr("none"))
-                 << (residual.redundancy ? QString::number(*residual.redundancy) : QString());
-        rows.push_back(std::move(row));
+        Entry entry;
+        entry.row.kind = Row::Kind::Constraint;
+        entry.row.residual = std::int64_t(index);
+        entry.row.keys.cost = residual.weight * residual.residual;
+        entry.row.keys.cycle = residual.cycleHops.value_or(-1);
+        entry.row.keys.length = residual.cyclePieceLength;
+        entry.row.fiberUuid = residual.fiberA;
+        entry.row.otherUuid = residual.fiberB;
+        const auto measured = residual.edgeUuid.empty() &&
+                              residual.kind != std::int64_t(ScaffoldConstraintKind::Manual);
+        const auto spans = coveringSpans(residual);
+        // Where: the two pieces the crossing lies on, which is where it can
+        // be looked at; a link states its anchors the same way.
+        const auto where = tr("%1 / %2").arg(spanText(spans[0], residual.arcA), spanText(spans[1], residual.arcB));
+        const auto approvedConstraint = measured && _controller && _controller->constraintApproved(residual);
+        const auto state = !measured
+            ? tr("link")
+            : (approvedConstraint ? tr("approved")
+                                  : (spans[0].geometryApproved && spans[1].geometryApproved ? tr("approvable")
+                                                                                            : tr("blocked")));
+        entry.text << (residual.edgeUuid.empty() ? kindName(residual.kind) : tr("link"))
+                   << tr("%1 - %2").arg(label(residual.fiberA), label(residual.fiberB)) << where
+                   << tr("%1 turns").arg(residual.residual, 0, 'f', 2) << state
+                   << QString::number(entry.row.keys.cost, 'f', 3)
+                   << (entry.row.keys.cycle > 0
+                           ? QString::number(entry.row.keys.cost / double(entry.row.keys.cycle), 'f', 3)
+                           : QString())
+                   << cycleText(cycleNumbers[index])
+                   << (entry.row.keys.cycle > 0 ? QString::number(entry.row.keys.cycle) : tr("none"))
+                   << QString::number(entry.row.keys.length, 'f', 0)
+                   << (residual.redundancy ? QString::number(*residual.redundancy) : QString());
+        // The two covering pieces as children: each is openable, and its
+        // state says what still blocks the constraint.
+        const std::array<std::string, 2> uuids{residual.fiberA, residual.fiberB};
+        for (std::size_t side = 0; side < 2; ++side) {
+            if (!spans[side].known) continue;
+            Row child;
+            child.kind = Row::Kind::Piece;
+            child.fiberUuid = uuids[side];
+            child.controlFrom = spans[side].controlFrom;
+            child.controlTo = spans[side].controlTo;
+            QStringList text;
+            text << tr("piece") << label(uuids[side]) << spanText(spans[side], 0.) << QString()
+                 << stateText(spans[side]) << QString() << QString() << QString() << QString() << QString()
+                 << QString();
+            entry.children.emplace_back(child, text);
+        }
+        entries.push_back(std::move(entry));
     }
     for (const auto& piece : view->pieces) {
-        Row row;
-        row.piece = true;
-        row.keys.cost = piece.score;
-        row.keys.cycle = piece.cycleHops;
-        row.keys.length = piece.arcTo - piece.arcFrom;
-        row.fiberUuid = piece.fiberUuid;
-        row.controlFrom = piece.controlFrom.value_or(-1);
-        row.controlTo = piece.controlTo.value_or(-1);
-        const QString where = row.controlFrom >= 0
-            ? tr("cp %1-%2").arg(row.controlFrom).arg(row.controlTo)
-            : tr("%1 vx").arg(row.keys.length, 0, 'f', 0);
-        row.text << tr("stretch") << label(piece.fiberUuid) << where
-                 << QString::number(row.keys.cost, 'f', 3)
-                 << (row.keys.cycle > 0 ? QString::number(row.keys.cycle) : tr("none"))
-                 << QString::number(piece.constraints);
-        rows.push_back(std::move(row));
+        Entry entry;
+        entry.row.kind = Row::Kind::Piece;
+        entry.row.keys.cost = piece.score;
+        entry.row.keys.cycle = piece.cycleHops;
+        entry.row.keys.length = piece.arcTo - piece.arcFrom;
+        entry.row.fiberUuid = piece.fiberUuid;
+        entry.row.arcFrom = std::min(piece.arcFrom, piece.arcTo);
+        entry.row.arcTo = std::max(piece.arcFrom, piece.arcTo);
+        entry.row.controlFrom = piece.controlFrom.value_or(-1);
+        entry.row.controlTo = piece.controlTo.value_or(-1);
+        // A run that recorded no range, or a degenerate one, is not fatal: the
+        // fiber's own control arcs place the stretch's start.
+        if (entry.row.controlTo <= entry.row.controlFrom) {
+            const auto resolved = _controller ? _controller->anchorSpan(piece.fiberUuid, piece.arcFrom)
+                                              : ScaffoldAnchorSpan{};
+            if (resolved.known) {
+                entry.row.controlFrom = resolved.controlFrom;
+                entry.row.controlTo = resolved.controlTo;
+            }
+        }
+        const auto span = _controller ? _controller->anchorSpan(piece.fiberUuid, piece.arcFrom) : ScaffoldAnchorSpan{};
+        const QString where = entry.row.controlFrom >= 0
+            ? tr("cp %1-%2").arg(entry.row.controlFrom).arg(entry.row.controlTo)
+            : tr("%1 vx").arg(entry.row.keys.length, 0, 'f', 0);
+        QStringList loops;
+        for (const auto number : piece.cycles) loops << QString::number(number);
+        entry.text << tr("stretch") << label(piece.fiberUuid) << where << QString() << stateText(span)
+                   << QString::number(entry.row.keys.cost, 'f', 3)
+                   << (entry.row.keys.cycle > 0
+                           ? QString::number(entry.row.keys.cost / double(entry.row.keys.cycle), 'f', 3)
+                           : QString())
+                   << loops.join(QStringLiteral(", "))
+                   << (entry.row.keys.cycle > 0 ? QString::number(entry.row.keys.cycle) : tr("none"))
+                   << QString::number(entry.row.keys.length, 'f', 0) << QString::number(piece.constraints);
+        entries.push_back(std::move(entry));
     }
     // Offer every component the rows actually name, keeping the chosen one
     // when the run still has it.
     std::set<std::int64_t> components;
-    for (const auto& row : rows) {
-        const auto component = componentOf(row.fiberUuid);
+    for (const auto& entry : entries) {
+        const auto component = componentOf(entry.row.fiberUuid);
         if (component >= 0) components.insert(component);
     }
     const auto chosen = _componentCombo->count() > 0 && _componentCombo->currentIndex() > 0
@@ -1222,46 +1566,73 @@ void ScaffoldApprovalPanel::rebuild()
     }
     const auto filter = _componentCombo->currentIndex() > 0 ? _componentCombo->currentData().toLongLong() : -1;
     if (filter >= 0)
-        rows.erase(std::remove_if(rows.begin(), rows.end(),
-                                  [&](const Row& row) { return componentOf(row.fiberUuid) != filter; }),
-                   rows.end());
+        entries.erase(std::remove_if(entries.begin(), entries.end(),
+                                     [&](const Entry& entry) { return componentOf(entry.row.fiberUuid) != filter; }),
+                      entries.end());
 
     const auto order = ScaffoldApprovalOrder(_orderCombo->currentData().toInt());
-    std::stable_sort(rows.begin(), rows.end(),
-                     [&](const Row& x, const Row& y) { return scaffoldApprovalRowBefore(x.keys, y.keys, order); });
-    std::int64_t constraintRows = 0, pieceRows = 0;
-    for (const auto& row : rows) {
-        if (row.piece) ++pieceRows; else ++constraintRows;
-        auto* item = new QTreeWidgetItem(_tree, row.text);
-        item->setData(kKindColumn, Qt::UserRole, row.piece);
-        item->setData(kFiberColumn, Qt::UserRole, QString::fromStdString(row.fiberUuid));
-        item->setData(kWhereColumn, Qt::UserRole, QString::fromStdString(row.otherUuid));
-        item->setData(kCostColumn, Qt::UserRole, QVariant::fromValue(qlonglong(row.controlFrom)));
-        item->setData(kCycleColumn, Qt::UserRole, QVariant::fromValue(qlonglong(row.controlTo)));
-        item->setData(kCountColumn, Qt::UserRole, QVariant::fromValue(qlonglong(row.residual)));
+    std::stable_sort(entries.begin(), entries.end(), [&](const Entry& x, const Entry& y) {
+        return scaffoldApprovalRowBefore(x.row.keys, y.row.keys, order);
+    });
+    // The rows are kept beside the items: an item carries only its index, so
+    // every column is free to show what it means rather than a payload.
+    const auto append = [this](QTreeWidgetItem* parent, const Row& row, const QStringList& text) {
+        auto* item = new RankingItem(text);
+        if (parent) parent->addChild(item); else _tree->addTopLevelItem(item);
+        item->setData(kKindColumn, Qt::UserRole, qlonglong(_rows.size()));
+        // Numeric sort keys for the columns a header click orders by; the
+        // text of those columns is formatted for reading.
+        const auto number = [&](int column, double value) {
+            item->setData(column, Qt::UserRole + 1, value);
+        };
+        number(kCostColumn, row.keys.cost);
+        number(kJointColumn, row.keys.cycle > 0 ? row.keys.cost / double(row.keys.cycle) : 0.);
+        number(kCycleColumn, row.keys.cycle > 0 ? double(row.keys.cycle) : 1e18);
+        number(kLengthColumn, row.keys.length);
+        _rows.push_back(row);
+        return item;
+    };
+    std::int64_t constraintRows = 0, pieceRows = 0, blocked = 0, approvedRows = 0;
+    for (const auto& entry : entries) {
+        if (entry.row.kind == Row::Kind::Piece) ++pieceRows; else ++constraintRows;
+        auto* item = append(nullptr, entry.row, entry.text);
+        if (entry.text.value(kStateColumn) == tr("blocked")) ++blocked;
+        if (entry.text.value(kStateColumn) == tr("approved")) ++approvedRows;
+        for (const auto& [row, text] : entry.children) append(item, row, text);
     }
+    _tree->setSortingEnabled(true);
     for (int column = 0; column < kColumnCount - 1; ++column) _tree->resizeColumnToContents(column);
-    _summaryLabel->setText(filter >= 0
-                               ? tr("%1 violated constraints and %2 accused stretches of component %3, of %4 and %5 "
-                                    "in the whole solve")
-                                     .arg(constraintRows)
-                                     .arg(pieceRows)
-                                     .arg(filter)
-                                     .arg(view->residuals.size())
-                                     .arg(view->pieces.size())
-                               : tr("%1 violated constraints, %2 accused stretches")
-                                     .arg(view->residuals.size())
-                                     .arg(view->pieces.size()));
+    const auto counts = filter >= 0
+        ? tr("%1 violated constraints and %2 accused stretches of component %3, of %4 and %5 in the whole solve")
+              .arg(constraintRows)
+              .arg(pieceRows)
+              .arg(filter)
+              .arg(view->residuals.size())
+              .arg(view->pieces.size())
+        : tr("%1 violated constraints, %2 accused stretches")
+              .arg(view->residuals.size())
+              .arg(view->pieces.size());
+    _summaryLabel->setText(counts + tr("; %1 approved, %2 blocked by unapproved geometry")
+                                        .arg(approvedRows)
+                                        .arg(blocked));
     _rebuilding = false;
+    applySelection();
+}
+
+const ScaffoldApprovalPanel::Row* ScaffoldApprovalPanel::rowOf(const QTreeWidgetItem* item) const
+{
+    if (!item) return nullptr;
+    const auto index = item->data(kKindColumn, Qt::UserRole).toLongLong();
+    if (index < 0 || std::size_t(index) >= _rows.size()) return nullptr;
+    return &_rows[std::size_t(index)];
 }
 
 const ScaffoldStoredResidual* ScaffoldApprovalPanel::residualOf(const QTreeWidgetItem* item) const
 {
     const auto* view = _controller ? _controller->selected() : nullptr;
-    if (!item || !view) return nullptr;
-    const auto index = item->data(kCountColumn, Qt::UserRole).toLongLong();
-    if (index < 0 || std::size_t(index) >= view->residuals.size()) return nullptr;
-    return &view->residuals[std::size_t(index)];
+    const auto* row = rowOf(item);
+    if (!view || !row || row->residual < 0 || std::size_t(row->residual) >= view->residuals.size()) return nullptr;
+    return &view->residuals[std::size_t(row->residual)];
 }
 
 void ScaffoldApprovalPanel::applySelection()
@@ -1269,38 +1640,57 @@ void ScaffoldApprovalPanel::applySelection()
     if (_rebuilding) return;
     const auto items = _tree->selectedItems();
     // The approve button follows the selection: a measured crossing can be
-    // approved or revoked, a link and a stretch cannot.
+    // approved or revoked, and only while both pieces it lies on are
+    // approved geometry. A link and a stretch cannot be approved here.
     const auto* residual = items.isEmpty() ? nullptr : residualOf(items.front());
     const bool measured = residual && residual->edgeUuid.empty() &&
                           residual->kind != std::int64_t(ScaffoldConstraintKind::Manual);
     const bool approved = measured && _controller && _controller->constraintApproved(*residual);
-    _approveButton->setEnabled(measured);
+    bool pieces = false;
+    if (measured) {
+        const auto spans = coveringSpans(*residual);
+        pieces = spans[0].geometryApproved && spans[1].geometryApproved;
+    }
+    _approveButton->setEnabled(measured && (approved || pieces));
     _approveButton->setText(approved ? tr("Revoke approval") : tr("Approve constraint"));
+    if (measured && !approved && !pieces)
+        _approveButton->setToolTip(tr("Both pieces this crossing lies on have to be approved for geometry\n"
+                                      "first: they are the rows under it, and a double-click opens one."));
+    else
+        _approveButton->setToolTip(tr("Record that this measured crossing is right. An approved constraint is\n"
+                                      "held rigid by the next solve, and the record is invalidated if either\n"
+                                      "fiber's covering span is edited or its approval revoked. A link is not\n"
+                                      "approved here: its approval is its review state in the annotation."));
     if (items.isEmpty()) {
         emit highlightRequested({});
         return;
     }
-    const auto* item = items.front();
+    const auto* row = rowOf(items.front());
+    if (!row) return;
     ScaffoldHighlight highlight;
-    const auto fiber = item->data(kFiberColumn, Qt::UserRole).toString().toStdString();
-    const auto other = item->data(kWhereColumn, Qt::UserRole).toString().toStdString();
-    if (!fiber.empty()) highlight.fiberUuids.push_back(fiber);
-    if (!other.empty()) highlight.fiberUuids.push_back(other);
-    if (item->data(kKindColumn, Qt::UserRole).toBool()) {
-        highlight.controlFrom = item->data(kCostColumn, Qt::UserRole).toLongLong();
-        highlight.controlTo = item->data(kCycleColumn, Qt::UserRole).toLongLong();
+    if (!row->fiberUuid.empty()) highlight.fiberUuids.push_back(row->fiberUuid);
+    if (!row->otherUuid.empty()) highlight.fiberUuids.push_back(row->otherUuid);
+    if (row->kind == Row::Kind::Piece) {
+        if (row->controlFrom >= 0 && row->controlTo > row->controlFrom)
+            highlight.spans.push_back({row->fiberUuid, row->controlFrom, row->controlTo});
+    } else if (residual) {
+        // A constraint is drawn as the two pieces its anchors lie on, which
+        // is what makes it visible on the map at all.
+        const auto spans = coveringSpans(*residual);
+        const std::array<std::string, 2> uuids{residual->fiberA, residual->fiberB};
+        for (std::size_t side = 0; side < 2; ++side)
+            if (spans[side].known)
+                highlight.spans.push_back({uuids[side], spans[side].controlFrom, spans[side].controlTo});
     }
     emit highlightRequested(highlight);
 }
 
 void ScaffoldApprovalPanel::activateRow(QTreeWidgetItem* item)
 {
-    if (!item || !item->data(kKindColumn, Qt::UserRole).toBool()) return;
-    const auto fiber = item->data(kFiberColumn, Qt::UserRole).toString().toStdString();
-    const auto from = item->data(kCostColumn, Qt::UserRole).toLongLong();
-    const auto to = item->data(kCycleColumn, Qt::UserRole).toLongLong();
-    if (fiber.empty() || from < 0 || to <= from) return;
-    emit pieceActivated(fiber, from, to);
+    const auto* row = rowOf(item);
+    if (!row || row->kind != Row::Kind::Piece) return;
+    if (row->fiberUuid.empty() || row->controlFrom < 0 || row->controlTo <= row->controlFrom) return;
+    emit pieceActivated(row->fiberUuid, row->controlFrom, row->controlTo, row->arcFrom, row->arcTo);
 }
 
 } // namespace vc3d::fiber_map

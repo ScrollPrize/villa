@@ -28,6 +28,7 @@ Q_DECLARE_METATYPE(vc::objects::StoreSessionEvent)
 class VolumePkg;
 class Volume;
 class OpenedVolumes;
+namespace vcr { class MemoryCache; }
 class QuadSurface;
 class Surface;
 class VCCollection;
@@ -54,6 +55,10 @@ class CState : public QObject
     Q_OBJECT
 
 public:
+    // Store readers one bulk read (a fiber read's decode) may work on at
+    // once. Stores are opened with this many reader connections beyond the
+    // store's own default, so those workers never wait on the viewer's.
+    static constexpr std::size_t kStoreReadWorkers = 8;
     // cacheBytes sizes the opened volumes' memory cache (0: the RAM cache setting).
     explicit CState(QObject* parent = nullptr, CState* objectStoreOwner = nullptr, std::size_t cacheBytes = 0);
     ~CState();
@@ -62,6 +67,9 @@ public:
     std::shared_ptr<vc::objects::ObjectStoreSession> objectStoreSession() const { return _objectStoreSession; }
     // The opened volume levels the tools sample, shared with the object-store owner's windows.
     std::shared_ptr<OpenedVolumes> openedVolumes() const { return _openedVolumes; }
+    // The process's decoded-chunk cache, for anything that samples volume
+    // data (Lasagna samplers above all). Null before a project is open.
+    [[nodiscard]] std::shared_ptr<vcr::MemoryCache> volumeMemoryCache() const;
     // Decoded surface geometry kept for every store VC3D opens (all workspaces),
     // up to the surface geometry cache setting; re-read after Settings change.
     static std::shared_ptr<vc::objects::SurfaceTileCache> surfaceGeometryCache();
@@ -70,8 +78,21 @@ public:
     static QString storeAuthor();
     // Whether the username setting names an author (set, and not "anon").
     static bool storeAuthorConfigured();
+    // Every registration the stores of this project resolve through besides
+    // their own records: the cached catalog's and the project's Lasagna
+    // base-shape relations. Rebuilt when the project changes; null when there
+    // is nothing to add. The one graph: nothing else assembles registrations.
+    [[nodiscard]] std::shared_ptr<const vcr::catalog::RegistrationGraph> registrationGraph() const
+    {
+        return _registrationGraph;
+    }
     // Open Options for attaching stores to the viewer's session.
-    static vc::objects::OpenOptions storeOpenOptions(const QString& author, bool readOnly);
+    // `registrations`: the graph the store resolves through besides its own
+    // records (CState::registrationGraph()). Null opens with the cached
+    // catalog alone, which is right for a store opened outside a project.
+    static vc::objects::OpenOptions storeOpenOptions(
+        const QString& author, bool readOnly,
+        const std::shared_ptr<const vcr::catalog::RegistrationGraph>& registrations = {});
     static vc::objects::HostedSessionOptions hostedOptions(const QString& author);
 
     // Project references are stable IDs; attachments exist only for available stores.
@@ -229,6 +250,7 @@ private:
     std::map<std::string, vc::objects::AttachmentIdentity> _storeReferences;
     QString _objectStoreObservationError;
     std::shared_ptr<VolumePkg> _vpkg;
+    std::shared_ptr<const vcr::catalog::RegistrationGraph> _registrationGraph;
     std::shared_ptr<Volume> _currentVolume;
 
     std::optional<vc::project::AnnotationVolume> _annotationVolume;

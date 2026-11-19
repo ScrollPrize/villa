@@ -73,9 +73,17 @@ struct ScaffoldEventOptions {
     // into the tracer, so a run can be taken back before and after it, not
     // during it.
     ScaffoldRunMonitor* monitor = nullptr;
+    // Reuse: a pair whose two fibers and parameters are already cached is not
+    // extracted again (the search skips it), and what this run extracted is
+    // written into `sink` for the caller to commit.
+    const class ScaffoldCache* cache = nullptr;
+    struct ScaffoldCacheSink* sink = nullptr;
 };
 
 struct ScaffoldEventReport {
+    // Pairs whose crossings came from the cache, and the events they
+    // contributed; pairs this run extracted and wrote back.
+    std::int64_t reusedPairs = 0, reusedEvents = 0, cachedPairs = 0;
     std::int64_t lines = 0, shortLines = 0, resampledPoints = 0;
     std::int64_t events = 0, perpendicular = 0, parallel = 0;
     std::int64_t withoutNormals = 0, withDistance = 0;
@@ -122,7 +130,25 @@ struct ScaffoldSignResult {
 ScaffoldSignResult scaffoldNormalSigns(const ScaffoldGraph&, const ScaffoldNormals&, std::span<const ScaffoldEvent>,
                                        const ScaffoldSignOptions& = {});
 
+// How a fractional measured separation becomes integer constraints. Both
+// modes exist in the Python reference stage, so both are kept here.
+enum class ScaffoldSeparationMode {
+    // The automatic stage's rule: the two integers around the measurement,
+    // weighted 1 - fraction and fraction. Faithful to the measurement, but
+    // the two halves assert different windings on one pair, so one of them is
+    // always violated.
+    Split,
+    // One constraint at the nearer integer with the event's whole weight (a
+    // separation of exactly one half rounds down, the tie the split's own
+    // weights make). What the scaffold approval workflow uses: a fractional
+    // winding is not something an annotation can be edited to satisfy or an
+    // approval can assert, and a split pair would be reported as a
+    // two-constraint cycle over a zero-length stretch.
+    Rounded,
+};
+
 struct ScaffoldMeasuredOptions {
+    ScaffoldSeparationMode separations = ScaffoldSeparationMode::Split;
     // Per-type weights, the names the automatic winding stage uses. A zero
     // weight omits that type's arcs; enclosures are derived from the signed
     // perpendicular events whatever the perpendicular weight is.
@@ -135,6 +161,9 @@ struct ScaffoldMeasuredOptions {
 
 struct ScaffoldMeasuredReport {
     std::int64_t events = 0, used = 0, expanded = 0, withoutDistance = 0;
+    // Crossings whose separation was fractional: split into two constraints
+    // under Split, rounded to the nearer integer under Rounded.
+    std::int64_t fractional = 0;
     std::int64_t perpendicular = 0, parallel = 0;
     std::int64_t skippedInvalid = 0, skippedUntagged = 0, skippedSelf = 0, skippedFamilyMismatch = 0;
     std::int64_t enclosurePairs = 0, enclosureArcs = 0, enclosureOneSided = 0, enclosureContradictory = 0,
@@ -162,6 +191,12 @@ struct ScaffoldConstraintSpans {
 };
 std::optional<ScaffoldConstraintSpans> scaffoldConstraintSpans(const ScaffoldGraph&, const ScaffoldGeometry&,
                                                                const ScaffoldConstraint&);
+
+// Whether the geometry of both covering pieces is an approved span of its
+// fiber right now. A constraint may only count as approved when it is: an
+// approval of a relation between unreviewed geometry would pin a solve to
+// geometry nobody has looked at. False when the spans cannot be resolved.
+bool scaffoldConstraintPiecesApproved(const ScaffoldGraph&, const ScaffoldGeometry&, const ScaffoldConstraint&);
 objects::FiberConstraintIdentity scaffoldConstraintIdentity(const ScaffoldGraph&, const ScaffoldConstraint&);
 
 // The span of a fiber covering an arc position, over a content read straight
@@ -182,6 +217,9 @@ struct ScaffoldApprovalReport {
     // Live rows whose constraint this run did not measure, and rows whose
     // covering spans have changed since they were approved.
     std::int64_t unmatched = 0, stale = 0;
+    // Live and current rows whose covering pieces are no longer approved for
+    // geometry: the approval is kept, but it fixes nothing in this run.
+    std::int64_t withoutPieces = 0;
 };
 
 // Mark the measured constraints that a live approval row covers. A row whose

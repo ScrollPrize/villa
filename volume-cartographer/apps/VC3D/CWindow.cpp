@@ -9,6 +9,7 @@
 #include <vc_object_store/objects/GeometryCoordinates.hpp>
 #include <vc_object_store/objects/VolumeTransforms.hpp>
 #include "vc/core/util/RemoteUrl.hpp"
+#include "vc/lasagna/ProjectVolumes.hpp"
 
 #include "StatusDockPanelHost.hpp"
 
@@ -908,6 +909,7 @@ CWindow::CWindow(size_t cacheSizeGB) :
     if (auto* tabBar = _workspaceTabs->tabBar()) {
         tabBar->setTabButton(fiberMapIndex, QTabBar::RightSide, nullptr);
     }
+    connect(_fiberMapWorkspace, &FiberMapWorkspace::dockLayoutChanged, this, &CWindow::scheduleWindowStateSave);
     connect(_fiberMapWorkspace, &FiberMapWorkspace::openFiberPieceRequested,
             this, [this](uint64_t fiberId, vc3d::line_annotation::PiecePlan plan) {
                 if (_fiberWidget) _fiberWidget->selectFiber(fiberId);
@@ -1271,6 +1273,17 @@ CWindow::CWindow(size_t cacheSizeGB) :
             if (!restoredState) {
                 Logger()->warn("Failed to restore main window state; clearing saved state");
                 geometry.remove(vc3d::settings::window::STATE);
+                geometry.sync();
+            }
+        }
+        // The Fiber Map's own docks. A failure here is not the main window's:
+        // only this key is dropped, and the map opens with its default docks.
+        const QByteArray savedFiberMapState =
+            geometry.value(vc3d::settings::window::FIBER_MAP_STATE).toByteArray();
+        if (!savedFiberMapState.isEmpty()) {
+            if (!_fiberMapWorkspace || !_fiberMapWorkspace->restoreState(savedFiberMapState)) {
+                Logger()->warn("Failed to restore the Fiber Map dock layout; clearing it");
+                geometry.remove(vc3d::settings::window::FIBER_MAP_STATE);
                 geometry.sync();
             }
         }
@@ -3316,6 +3329,28 @@ void CWindow::CreateWidgets(void)
                         widget->setKnownTags(tags);
                         widget->setNextPageAvailable(morePages);
                     });
+                    // The fiber map lists the same fibers before it has a
+                    // layout: the store knows them, Update only places them.
+                    if (_fiberMapWorkspace) {
+                        std::vector<FiberMapWorkspace::StoreFiberRow> listed;
+                        listed.reserve(rows.size());
+                        for (const auto& row : rows) {
+                            FiberMapWorkspace::StoreFiberRow listedRow;
+                            listedRow.id = _lineAnnotationController->fiberIdForUuid(row.record.uuid);
+                            listedRow.label = _lineAnnotationController->fiberDisplayName(listedRow.id);
+                            if (const auto& fiber = row.record.fiber) {
+                                // The store's family is a word ("horizontal");
+                                // the map's column is its initial.
+                                listedRow.hvTag = fiber->family.empty()
+                                    ? '?'
+                                    : char(std::toupper(static_cast<unsigned char>(fiber->family.front())));
+                                listedRow.lengthVx = row.record.volumeLength.value_or(fiber->length);
+                            }
+                            listedRow.links = row.links;
+                            listed.push_back(std::move(listedRow));
+                        }
+                        _fiberMapWorkspace->setStoreFibers(std::move(listed));
+                    }
                 });
         connect(collection, &FiberCollectionController::fiberRevealed, this,
                 [withFiberWidget, catalogEntry](const FiberCollectionController::CatalogRow& row) {
@@ -3967,6 +4002,9 @@ void CWindow::saveWindowState()
     if (_segmentWorkspaceWindow) {
         settings.setValue(vc3d::settings::window::STATE, _segmentWorkspaceWindow->saveState());
     }
+    if (_fiberMapWorkspace) {
+        settings.setValue(vc3d::settings::window::FIBER_MAP_STATE, _fiberMapWorkspace->saveState());
+    }
     if (_workspaceTabs) {
         settings.setValue(WORKSPACE_TAB_SETTING, _workspaceTabs->currentIndex());
         if (auto* workspace = _workspaceTabs->currentWidget())
@@ -4491,13 +4529,16 @@ void CWindow::rememberCurrentVolumeForPackage(const QString& volumeId) const
 std::optional<vcr::catalog::Affine> CWindow::volumeTransformForSwitch(const vc::objects::VolumeVoxels& from,
                                                                       const vc::objects::VolumeVoxels& to) const
 {
-    // The store's resolution (catalog registrations, its own and its route
-    // choices); without a store, the cached catalog's registrations.
+    // The store's own resolution: its records, its route choices, and the
+    // registrations it was opened with (CState::registrationGraph - the
+    // catalog's and the project's Lasagna relations). Nothing is assembled
+    // here, so this answers exactly what a fiber read answers. Without a
+    // store, that same graph alone.
     vc::objects::VolumeTransforms transforms;
     if (const auto attachment = _state->storeFor("volume_transform")) {
         transforms = _state->objectStoreSession()->volumeTransforms(*attachment);
-    } else if (const auto catalog = vcr::catalog::cachedManifest(vcr::catalog::catalogCacheFile(std::string(vcr::catalog::kDefaultManifestUrl)))) {
-        transforms.graph.addCatalog(*catalog);
+    } else if (const auto graph = _state->registrationGraph()) {
+        transforms.graph = *graph;
     }
     return transforms.toVolume(nlohmann::json{{"coordinates", vc::objects::volumeCoordinates(from)}}, to.volume, to.scale);
 }

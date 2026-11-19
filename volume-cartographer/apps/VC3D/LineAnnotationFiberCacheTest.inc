@@ -132,7 +132,11 @@ if (const char* source = std::getenv("VC3D_FIBER_CACHE_TEST_STORE")) {
     };
     const auto checkFresh = [&] {
         const auto cached = controller.readStoredFibersCached(ids, true);
+        // The fresh read decodes on several store readers: what they return
+        // is what the single reader of the cached read returned.
+        LineAnnotationController::fiberReadTestWorkers = 3;
         const auto fresh = controller.readStoredFibers(ids, true);
+        LineAnnotationController::fiberReadTestWorkers = 0;
         require(cached.size() == fresh.size(), "cache excludes deleted and retired fibers");
         for (size_t i = 0; i < fresh.size(); ++i) {
             const auto& a = cached[i]; const auto& b = fresh[i];

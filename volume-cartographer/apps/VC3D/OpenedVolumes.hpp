@@ -57,6 +57,10 @@ public:
     };
     // The decoded bytes the shared memory cache holds, and its limit.
     CacheStats cacheStats() const { return {cache_->nbytes(), cache_->max_bytes()}; }
+    // The one decoded-chunk cache of this process (the RAM budget setting).
+    // Every sampler that reads volume data shares it: a private cache would
+    // start cold on each use and re-read what this one already holds.
+    std::shared_ptr<vcr::MemoryCache> memoryCache() const { return cache_; }
     struct TransferStats {
         std::uint64_t chunks = 0, bytes = 0;
         std::uint64_t offlineMisses = 0;  // chunks offline reads lacked (remote_offline "fill")

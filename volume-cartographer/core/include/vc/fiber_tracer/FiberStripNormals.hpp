@@ -3,6 +3,8 @@
 #include <opencv2/core.hpp>
 
 #include <cstddef>
+#include <functional>
+#include <atomic>
 #include <vector>
 
 // Geometry-only strip normals for a traced fiber.
@@ -85,10 +87,15 @@ struct FiberStripNormalResult {
 
 // Per-fiber solves in parallel; a fiber with fewer than three distinct
 // vertices gets an empty normal list. `targets`, when given, has one list per fiber.
+// `onFiberSolved`, when given, is called once per finished fiber with the
+// number finished so far. It arrives from the worker threads, so it must be
+// thread-safe, must not throw and must not touch the inputs.
+using FiberStripNormalProgress = std::function<void(std::int64_t solved, std::int64_t total)>;
 [[nodiscard]] std::vector<FiberStripNormalResult> solveFiberStripNormals(
     const std::vector<std::vector<cv::Vec3d>>& fibers,
     const FiberStripNormalOptions& options,
     int threads,
-    const std::vector<std::vector<FiberStripAxisTarget>>* targets = nullptr);
+    const std::vector<std::vector<FiberStripAxisTarget>>* targets = nullptr,
+    const FiberStripNormalProgress& onFiberSolved = {});
 
 }  // namespace vc::fiber_tracer

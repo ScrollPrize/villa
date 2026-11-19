@@ -46,6 +46,138 @@ void createZyx(const fs::path& path, vcr::Index shape = {2, 2, 2})
 }  // namespace
 
 #ifndef _WIN32
+namespace
+{
+vc::lasagna::LasagnaRegistrationVolume frame(std::string id, double scale,
+                                             std::array<std::size_t, 3> shape,
+                                             std::optional<std::array<std::size_t, 3>> base = std::nullopt)
+{
+    return {std::move(id), scale, shape, base};
+}
+}  // namespace
+
+TEST_CASE("a Lasagna group registers against the volume carrying its declared base shape")
+{
+    const std::array<std::size_t, 3> base{512, 1024, 2048};
+    const std::array<std::size_t, 3> group{64, 128, 256};  // three levels down
+    const std::vector<vc::lasagna::LasagnaRegistrationVolume> volumes{
+        frame("ct", 1.0, base), frame("presence", 1.0, group, base)};
+    const auto out = vc::lasagna::lasagnaBaseShapeRegistrations(volumes);
+    REQUIRE(out.size() == 1);
+    CHECK(out.front().source == "presence");
+    CHECK(out.front().target == "ct");
+    // Eight base voxels per group voxel, as a pure scale.
+    const auto mapped = out.front().matrix.apply({10., 20., 30.});
+    CHECK(mapped[0] == doctest::Approx(80.));
+    CHECK(mapped[1] == doctest::Approx(160.));
+    CHECK(mapped[2] == doctest::Approx(240.));
+}
+
+TEST_CASE("the base volume's own working level is carried by the scales, not by the shape ratio")
+{
+    const std::array<std::size_t, 3> declared{512, 1024, 2048};
+    // The CT volume is loaded two levels down, so its working shape is a
+    // quarter of the declared base shape and its coordinate scale says so.
+    const std::vector<vc::lasagna::LasagnaRegistrationVolume> volumes{
+        frame("ct", 0.25, {128, 256, 512}), frame("presence", 1.0, {64, 128, 256}, declared)};
+    const auto out = vc::lasagna::lasagnaBaseShapeRegistrations(volumes);
+    REQUIRE(out.size() == 1);
+    // Working frames differ by two levels; the level-0 matrix divides that by
+    // the base's own scale so toVolume's composition reproduces it exactly.
+    const auto mapped = out.front().matrix.apply({1., 1., 1.});
+    CHECK(mapped[0] == doctest::Approx(8.));
+}
+
+TEST_CASE("an unrelated or absent base shape registers nothing")
+{
+    const std::array<std::size_t, 3> declared{512, 1024, 2048};
+    CHECK(vc::lasagna::lasagnaBaseShapeRegistrations(
+              std::vector<vc::lasagna::LasagnaRegistrationVolume>{
+                  frame("other", 1.0, {500, 1000, 2000}), frame("presence", 1.0, {64, 128, 256}, declared)})
+              .empty());
+    CHECK(vc::lasagna::lasagnaBaseShapeRegistrations(
+              std::vector<vc::lasagna::LasagnaRegistrationVolume>{frame("presence", 1.0, {64, 128, 256}, declared)})
+              .empty());
+}
+
+TEST_CASE("every volume of the dataset is related and the graph resolves each pair")
+{
+    // The shapes of a real project: the CT volume at the declared base shape
+    // and three derived levels of it.
+    const std::array<std::size_t, 3> declared{33592, 15761, 15761};
+    const std::vector<vc::lasagna::LasagnaRegistrationVolume> volumes{
+        frame("ct", 1.0, declared),
+        frame("presence", 1.0, {8398, 3941, 3941}, declared),
+        frame("nx", 1.0, {2100, 986, 986}, declared),
+        frame("cos", 1.0, {4199, 1971, 1971}, declared)};
+    const auto out = vc::lasagna::lasagnaBaseShapeRegistrations(volumes);
+    // Three groups to the CT volume, and one edge per pair of groups.
+    CHECK(out.size() == 6);
+
+    vcr::catalog::RegistrationGraph graph;
+    for (auto registration : out) graph.add(std::move(registration));
+    const auto factorTo = [&](const std::string& source, const std::string& target) {
+        const auto resolution = graph.resolve(source, target);
+        REQUIRE(resolution.status == vcr::catalog::TransformStatus::Resolved);
+        return resolution.resolved().forward.apply({1., 1., 1.})[0];
+    };
+    CHECK(factorTo("presence", "ct") == doctest::Approx(4.));
+    CHECK(factorTo("cos", "ct") == doctest::Approx(8.));
+    CHECK(factorTo("nx", "ct") == doctest::Approx(16.));
+    // Composed routes agree with the direct ones, so nothing is ambiguous.
+    CHECK(factorTo("nx", "presence") == doctest::Approx(4.));
+    CHECK(factorTo("ct", "nx") == doctest::Approx(1. / 16.));
+}
+
+TEST_CASE("the working level composes with the base-shape relation")
+{
+    // The scan open at level 1 - half the declared shape, coordinates at
+    // scale 0.5 - and the prediction group at its own level 0. A point of the
+    // scan's working frame has to land on the same place of the group's.
+    const std::array<std::size_t, 3> declared{33592, 15761, 15761};
+    const std::vector<vc::lasagna::LasagnaRegistrationVolume> volumes{
+        frame("ct", 0.5, {16796, 7881, 7881}, declared),
+        frame("presence", 1.0, {8398, 3941, 3941}, declared)};
+    const auto out = vc::lasagna::lasagnaBaseShapeRegistrations(volumes);
+    REQUIRE(out.size() == 1);
+    vcr::catalog::RegistrationGraph graph;
+    for (auto registration : out) graph.add(std::move(registration));
+    // The edge relates the two level-0 frames, which is four of the group's
+    // voxels to one of the scan's own level-0 voxels, divided by the scan's
+    // working scale: toVolume composes scale(target) * edge * scale(1/source).
+    const auto edge = [&](const std::string& source, const std::string& target) {
+        const auto resolution = graph.resolve(source, target);
+        REQUIRE(resolution.status == vcr::catalog::TransformStatus::Resolved);
+        return resolution.resolved().forward.apply({1., 1., 1.})[0];
+    };
+    const auto working = [&](const std::string& source, double sourceScale, const std::string& target,
+                             double targetScale, double coordinate) {
+        return targetScale * edge(source, target) * (coordinate / sourceScale);
+    };
+    // The group's 2048 is the scan's 8192 at level 0, which is 4096 at level 1.
+    CHECK(working("presence", 1.0, "ct", 0.5, 2048.) == doctest::Approx(4096.));
+    CHECK(working("ct", 0.5, "presence", 1.0, 4096.) == doctest::Approx(2048.));
+}
+
+TEST_CASE("a second volume at the declared shape is related too, not treated as a conflict")
+{
+    // Both conventions of the same shape (voxel count and inclusive maximum)
+    // belong to the dataset; the group relates to each.
+    const std::array<std::size_t, 3> declared{512, 1024, 2048};
+    const std::vector<vc::lasagna::LasagnaRegistrationVolume> volumes{
+        frame("ct", 1.0, declared), frame("ct-inclusive", 1.0, {512, 1024, 2049}),
+        frame("presence", 1.0, {64, 128, 256}, declared)};
+    const auto out = vc::lasagna::lasagnaBaseShapeRegistrations(volumes);
+    REQUIRE(out.size() == 2);
+    vcr::catalog::RegistrationGraph graph;
+    for (auto registration : out) graph.add(std::move(registration));
+    for (const char* target : {"ct", "ct-inclusive"}) {
+        const auto resolution = graph.resolve("presence", target);
+        REQUIRE(resolution.status == vcr::catalog::TransformStatus::Resolved);
+        CHECK(resolution.resolved().forward.apply({1., 1., 1.})[0] == doctest::Approx(8.));
+    }
+}
+
 TEST_CASE("remote packed subgroup views reload and change working level together")
 {
     const auto dir = temporaryDirectory();

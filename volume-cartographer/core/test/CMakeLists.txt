@@ -112,7 +112,7 @@ vc_add_test(NAME test_ink_detection_overlay
             ${cstate_ink_detection_moc}
             ${vccollection_ink_detection_moc}
             ${surface_catalog_ink_detection_moc}
-    LIBS opencv_imgcodecs vc_object_store::vc_objects vc_object_store::vc_object_geometry doctest::doctest Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Test vc_core
+    LIBS opencv_imgcodecs vc_object_store::vc_objects vc_object_store::vc_object_geometry doctest::doctest Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Test vc_core vc_lasagna
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D
     DEFS VC_TESTING)
 
@@ -201,7 +201,7 @@ vc_add_test(NAME test_segmentation_lasagna_panel_ui
             ${cstate_lasagna_panel_moc}
             ${vccollection_lasagna_panel_moc}
             ${surface_catalog_lasagna_panel_moc}
-    LIBS vc_object_store::vc_objects vc_object_store::vc_object_geometry Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Concurrent Qt6::Test vc_core
+    LIBS vc_object_store::vc_objects vc_object_store::vc_object_geometry Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Concurrent Qt6::Test vc_core vc_lasagna
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D
     DEFS VC_TEST_DISABLE_LASAGNA_DISCOVERY VC_TEST_DISABLE_LASAGNA_DIALOGS)
 

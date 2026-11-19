@@ -226,6 +226,9 @@ namespace viewer_cache {
 namespace window {
     constexpr auto GEOMETRY = "mainWin/geometry";
     constexpr auto STATE = "mainWin/state";
+    // The Fiber Map workspace is a main window of its own inside the tab, so
+    // its docks are saved separately from the segmentation workspace's.
+    constexpr auto FIBER_MAP_STATE = "mainWin/fiber_map_state";
     constexpr auto RESTORE_IN_PROGRESS = "mainWin/restore_in_progress";
     constexpr auto RESTORE_DISABLED = "mainWin/restore_disabled";
     constexpr auto STATE_META_SCREEN_SIGNATURE = "mainWin/state_meta/screen_signature";

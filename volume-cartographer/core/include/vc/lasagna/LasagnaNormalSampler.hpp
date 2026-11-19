@@ -22,6 +22,9 @@ void validateLasagnaNormalDatasetStructure(const LasagnaDataset& dataset);
 // cache shared with other readers), else an auto-sized cache when requested,
 // else a new fixed cache of maxCachedBytes.
 struct LasagnaNormalSamplerOptions {
+    // Only used when `memoryCache` is unset. An application that has a cache
+    // of its own passes it: a private cache starts cold on every sampler and
+    // re-reads what the process already decoded.
     size_t maxCachedBytes = 512ULL * 1024ULL * 1024ULL;
     std::shared_ptr<vcr::MemoryCache> memoryCache;
     std::optional<double> autoCacheFraction;

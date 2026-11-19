@@ -215,13 +215,116 @@ them back through any StoreReader; Python reads the same rows through
 `CollectionReader.extension_rows` and the `residuals` / `residual_pieces`
 table roles.
 
+## Fractional separations
+
+A measured winding separation is rarely a whole turn. The automatic stage
+splits a fractional one into the two integers around it, weighted `1 -
+fraction` and `fraction` - faithful to the measurement, but the two halves
+assert different windings on the same pair, so one of them is always violated,
+its shortest cycle is its own sibling (two constraints) and the stretch
+between them has zero length. Nothing can be edited or approved to fix that.
+
+`ScaffoldSeparationMode` keeps both rules, as the Python reference stage does:
+`Split` is the automatic stage's, `Rounded` states one constraint at the
+nearer integer with the event's whole weight (exactly one half rounds down).
+The CLI chooses with `constraints.separations` (`"split"`, the default, or
+`"rounded"`); the scaffold dock always runs `Rounded`, because an approval is
+a statement about an integer relation. A run records which it used
+(`separations_rounded`) and how many crossings were fractional
+(`measured_fractional_separations`).
+
+## Laying the map out from a solve
+
+With "Lay the map out from this solve" on, the map is built **from the run**:
+`FollowedSolve::windings` carries the run's winding and component per fiber,
+and `buildGlobalLayout` places each covered fiber at `u = winding + the
+fraction of a turn its geometry makes around the umbilicus`, `v = height`. No
+crossing detection runs, no constraint graph is built and no winding is
+solved - the run already decided all of that, and its residuals already say
+which constraints it could not satisfy (drawn suspect).
+
+What the map still does: the per-fiber geometry pass (unwrap the angle,
+radius, resample - cached per fiber), the relative placement of components,
+which a solve gauges separately and does not relate, and the networks, which
+come from the annotation's links rather than from the solve. A fiber the run
+did not cover - untagged, isolated, outside a restricted scope, or created
+since - is **not drawn**: it is reported as unplaced, because the map is of
+the solve.
+
+## One run, one frame
+
+A run is solved in one volume at one scale: the fibers' geometry is read
+through `viewTransformedAt(volume, scale)`, and the links' anchors - recorded
+in the stored frame on the edge record - are mapped with the *same* affine
+(`loadScaffoldGraph`, per fiber). Without that the anchors stay in the stored
+frame, and solving in another one puts every anchor a volume away from its
+polyline: the run is then refused by the anchor-distance guard ("link anchors
+lie N voxels from their fiber polyline"), which is the guard doing its job
+rather than an annotation error. The transforms do not move anything to a
+canonical base frame; they map into the frame the run asked for.
+
+## What a run reuses
+
+The normals and the crossings are cached in the store
+(`ext_fiber_strip_normals`, `ext_fiber_pair_crossings`;
+vc_object_store/docs/extensions.md). A run states what it would compute from -
+the parameters, each fiber's object version, and the version of every link
+and peer fiber that anchors it - looks that up, and computes only what is
+missing: an edited fiber is solved again and so are the pairs it is in,
+everything else is read. The keys are the store's versions and the parameters
+in the clear; nothing is hashed. A fused run is cached under the identity of
+the prediction it read (its manifest location). The extraction is told to skip
+the cached pairs through its trace-pair filter, with
+`parallelPairFilter` set so the search keeps its workers.
+
+Measured on PHerc0332 (`objects-v22.vcobj`, 292 fibers, 851,285 line points,
+32 workers, enclosure run with winding separations, warm on-disk volume
+cache): the first run solved 292 fibers' normals in 0.337 s and extracted
+10,195 crossings over 21,189 pairs in 0.380 s; the second reused all of them
+(0.090 s and 0.106 s) and sampled the volume not at all, reporting every
+number of the first run identically. On a cold remote cache the saving is the
+whole sampling time, which is where a measured run's minutes go.
+
+A run records what it reused: `normal_fibers_reused`, `normal_fibers_cached`,
+`events_reused_pairs`, `events_reused`, `events_cached_pairs`.
+
+## Stages, progress and cancellation
+
+A run announces how many stages it will enter (4 for a links-only run, 12
+measured, 13 fused) and each stage counts its own work: reading the fibers
+(per fiber), the fiber normals (per fiber), the crossing extraction's own
+phases (prepare, spatial_index, search, candidate_order, score, deduplicate),
+the sign solve (per IRLS step), the winding solve (per component) and the
+residual cycles (per violated constraint). The dock shows `i/n stage: done of
+total` with the rate's estimate of the time left in that stage, and the bar
+shows the stage's fraction.
+
+Cancellation is asked inside those stages, not only between them: the
+extraction takes a predicate and stops within a block (OpenMP regions are
+left by skipping their remaining blocks, never by an exception), the sign
+solve stops at its next step, and the strip solve between fibers. A cancelled
+run writes nothing.
+
+The map's Update is cancellable the same way: the rebuild carries the same
+monitor, reports the conversion and the pair sweep, and a cancelled build
+publishes nothing and leaves the previous layout and its cache in place.
+
 ## Approving a measured constraint
 
 An approved constraint is held rigid: the next run solves the approved
 constraints alone first and contracts each approved subgraph into one node, so
 an approved relation is never traded away (and approved relations that
-contradict each other stop the run instead of being averaged). A link's
-approval is its record's review state. A measured crossing has no record, so
+contradict each other stop the run instead of being averaged).
+
+Nothing is held rigid over geometry nobody reviewed. Whatever states the
+approval, a constraint only counts as approved when the two pieces its anchors
+lie on are *currently* approved for geometry
+(`scaffoldConstraintPiecesApproved`). That covers both kinds: a link whose
+record says approved but whose pieces are not counts as an ordinary link and
+is reported as `link_approved_without_pieces`, and a measured crossing with a
+live approval row whose pieces have since been revoked is reported as
+`constraint_approvals_without_pieces`. A link's approval is otherwise its
+record's review state. A measured crossing has no record, so
 its approval is a row of `ext_fiber_constraint_approval`, keyed by the two
 fibers, the kind and the two anchors quantized to 64 base voxels, and carrying
 the piece-approval fingerprints of the two covering spans. `applyScaffoldConstraintApprovals`
@@ -252,11 +355,16 @@ Three docks (`FiberMapScaffoldSolve.hpp`, with the Qt-free ranking in
   rather than quietly measuring none. The solve runs in the frame the map was
   built in and on its own worker; the store's umbilicus states the winding
   handedness, and only when it does not does the dock offer the catalog's sense
-  as a fallback. The run is saved in the store, and its one-line report lands in
+  as a fallback. The map itself follows the same order on every Update - the
+  umbilicus' `winding_handedness` first, the catalog's orientation second - and
+  refuses to build when neither states the sense: it is never decided from the
+  geometry. The run is saved in the store, and its one-line report lands in
   the map's status line.
 - **Solves.** Every run saved in the store, newest first, with its method,
   fibers, components, arcs, weighted L1, violated constraints, largest
-  residual and whether it is still *current*. A run is **stale** when a fiber,
+  residual, *sign!* (`sign_fixed_disagreements`: anchored fibers whose sign the
+  crossings would have flipped, empty for a run that solved no signs) and
+  whether it is still *current*. A run is **stale** when a fiber,
   a link or the umbilicus changed after it read the store - taken from the
   records' own commit sequences (`scaffoldAnnotationCommit`), not from the
   change feed, because a store may retain no feed and because a run's own rows
@@ -269,27 +377,63 @@ Three docks (`FiberMapScaffoldSolve.hpp`, with the Qt-free ranking in
   both runs; a pure gauge shift or a renumbered component counts as no
   difference.
 - **Fiber and piece approval.** The selected run's violated constraints and the
-  stretches they accuse, in one table, ordered by *smallest cycle* (then the
-  shorter stretch), *highest cost* (then the shorter cycle and stretch) or
-  *cost per hop*, and filtered to one component of the run if asked - a
+  stretches they accuse, in one table. Columns: what, fiber (the pair for a
+  constraint), where (the control spans the anchors lie on), *off* (turns the
+  solve could not satisfy), *state*, *cost* (weight times residual, weighted
+  turns), *joint* (cost per constraint of the shortest cycle), *cycle*
+  (constraints on that cycle), *loop* (which cycle, numbered from 1 in rank
+  order - rows sharing a number are about the same loop, and a stretch lists
+  every loop running along it), *length* (the stretch, or the cycle's total
+  stretch length, voxels) and *paths* (edge-disjoint alternatives for a
+  constraint, accusing constraints for a stretch). The Order combo applies
+  the three documented orders with their tie-breaks - *smallest cycle* (then
+  the shorter stretch), *highest cost* (then the shorter cycle and stretch),
+  *cost per hop* - and a header click sorts by that column's own number.
+  The component filter restricts the table to one component of the run; a
   component was solved on its own, so its violations can only be explained by
-  its own annotation. Selecting a row selects its fibers on the map and draws the
-  stretch; double-clicking a stretch opens it as an approval piece between the
-  control points that bracket it, which is where its geometry and normals are
-  approved. Two switches outline what is already approved: every span with a
-  current geometry approval, the spans whose normals are approved too, and the
-  fibers approved from end to end. Selecting a *measured* constraint enables
-  **Approve constraint**, which records that this crossing is right
-  (`ext_fiber_constraint_approval`); selecting one already approved offers to
-  revoke it instead. A crossing can only be approved once both pieces it lies
-  on carry a current geometry approval: a constraint is a statement about two
-  pieces of geometry, and pinning a solve to geometry nobody reviewed is what
-  the workflow is meant to prevent. A link is never approved there: a link's
-  approval is its review state in the annotation.
+  its own annotation.
 
-The approval overlays are halos behind the fibers rather than a change of the
-fibers' own colour, so what the map says about a fiber's geometry stays what it
-always said.
+  Each constraint row carries the two pieces its anchors lie on as child
+  rows, with their approval state: those are what has to be approved before
+  the constraint can be, and a double-click on one opens it as an approval
+  piece between the control points that bracket it. The same goes for a
+  stretch row. Selecting any row selects its fibers on the map and draws the
+  spans it names - for a constraint, both covering pieces, which is how a
+  crossing is found on the map at all - and brings them into view, zooming out
+  only when the current scale cannot hold them. The selection is a halo, the
+  same kind the fiber list's selection draws.
+
+  **Fade unapproved** states what the map dims: *nothing*, *geometry* (every
+  span without a current geometry approval) or *normals* (every span whose
+  normals are not approved, which includes the spans whose geometry is not,
+  since a normals approval requires one). An approved span is drawn exactly as
+  the map draws everything else; a faded one has the background painted over
+  it at half opacity. There is no second colour for approval: what is bright is
+  approved.
+
+  The *state* column reads `approved`, `approvable` (both pieces approved),
+  `blocked` (they are not) or `link`, and **Approve constraint** is enabled
+  only for an approvable or an approved crossing - a constraint is a statement
+  about two pieces of geometry, and pinning a solve to geometry nobody
+  reviewed is what the workflow is meant to prevent. The write refuses the
+  same case regardless of the button, and the refusal appears on its own line
+  below the counts. A link is never approved here: a link's approval is its
+  review state in the annotation.
+
+A run records what its approvals actually fixed:
+`constraint_approval_rows` (live rows), `constraint_approvals_applied`,
+`constraint_approvals_stale` (the covering spans were edited),
+`constraint_approvals_without_pieces` (the pieces are no longer approved) and
+`link_approved_without_pieces`.
+
+Halos are reserved for the selection - the fiber list's and the approval
+dock's - so what the map says about a fiber's own geometry stays what it always
+said. One path per layer covers the whole map, which is what keeps panning with
+the fade on as cheap as panning without it.
+
+A piece opened from the dock also shades the strip view outside the opened
+range, so the part that can be edited and approved is the part that stayed
+bright.
 
 ### Laying the map out from a solve
 

@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <limits>
 #include <string>
+#include <functional>
 #include <vector>
 
 // Whole-fiber normal signs from perpendicular crossings, on the CPU.
@@ -194,10 +195,15 @@ struct FiberSignResult {
 // known). `fixedSigns`, when not empty, holds one entry per fiber: 0 to solve
 // it, or +1/-1 for an inward sign held by a strong prior. Event indices
 // address `agreement`. Throws std::invalid_argument on invalid input.
+// `onStep`, when given, is called after each reweighting step with the step
+// number and the planned number of steps; returning false stops the solve and
+// keeps the signs of the last step (a cancelled run discards them anyway).
+using FiberSignStepCallback = std::function<bool(int step, int steps)>;
 [[nodiscard]] FiberSignResult solveFiberNormalSigns(
     const std::vector<double>& agreement,
     const std::vector<FiberSignEvent>& events,
     const FiberSignOptions& options = {},
-    const std::vector<int>& fixedSigns = {});
+    const std::vector<int>& fixedSigns = {},
+    const FiberSignStepCallback& onStep = {});
 
 }  // namespace vc::fiber_tracer

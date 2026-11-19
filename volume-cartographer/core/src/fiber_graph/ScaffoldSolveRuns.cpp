@@ -87,6 +87,7 @@ ScaffoldRunRows scaffoldSolveRunRows(const ScaffoldGraph& graph, const ScaffoldS
     };
     std::map<std::string, objects::FiberGraphSetting> settings{
         {"handedness", std::int64_t(graph.handedness)},
+        {"links_used", options.links.useLinks},
         {"weight_manual", options.links.weight},
         {"link_include_auto", options.links.includeAuto},
         {"link_max_anchor_distance", options.links.maxAnchorDistance},
@@ -98,10 +99,14 @@ ScaffoldRunRows scaffoldSolveRunRows(const ScaffoldGraph& graph, const ScaffoldS
         {"fix_approved_subgraphs", options.fixApprovedSubgraphs},
         {"max_alternative_paths", options.maxAlternativePaths},
         // A restricted run says so: the fibers its scope left out.
-        {"scope_excluded_fibers", graph.report.filteredSubset}};
+        {"scope_excluded_fibers", graph.report.filteredSubset},
+        {"created_at_unix", record.createdAtUnix}};
     // The measured stages, when the run ran them. A run without them is a
     // links-only run and says so by the absence of these keys.
     if (stages.normalOptions) {
+        // Which normals the run used: the prediction states a sheet axis only
+        // on a fused run, so its own count is the honest answer.
+        settings.emplace("normals_fused", stages.normals && stages.normals->predictedVertices > 0);
         settings.emplace("normals_twist_weight", stages.normalOptions->strip.twistWeight);
         settings.emplace("normals_lateral_weight", stages.normalOptions->strip.lateralWeight);
         settings.emplace("normals_smoothing_sigma", stages.normalOptions->strip.smoothingSigma);
@@ -129,6 +134,8 @@ ScaffoldRunRows scaffoldSolveRunRows(const ScaffoldGraph& graph, const ScaffoldS
         settings.emplace("perpendicular_offset", stages.measuredOptions->perpendicularOffset);
         settings.emplace("winding_scale", stages.measuredOptions->windingScale);
         settings.emplace("enclosures", stages.measuredOptions->enclosures);
+        settings.emplace("separations_rounded",
+                         stages.measuredOptions->separations == ScaffoldSeparationMode::Rounded);
     }
     if (stages.signOptions) {
         settings.emplace("sign_solve", stages.signOptions->solve);
@@ -198,6 +205,9 @@ ScaffoldRunRows scaffoldSolveRunRows(const ScaffoldGraph& graph, const ScaffoldS
     std::int64_t approvedConstraints = 0;
     for (const auto& constraint : result.constraints) approvedConstraints += constraint.approved ? 1 : 0;
     count("approved_constraints", approvedConstraints, "constraints");
+    // Approved by their record, not held rigid: the pieces they lie on are
+    // not approved geometry.
+    count("link_approved_without_pieces", result.linkReport.approvedWithoutPieces, "links");
     count("contracted_fibers", result.contractedFibers, "fibers");
     count("manual_constraints", result.constraintsByKind[std::size_t(ScaffoldConstraintKind::Manual)], "constraints");
     count("perpendicular_constraints", result.constraintsByKind[std::size_t(ScaffoldConstraintKind::Perpendicular)], "constraints");
@@ -205,6 +215,8 @@ ScaffoldRunRows scaffoldSolveRunRows(const ScaffoldGraph& graph, const ScaffoldS
     count("enclosure_constraints", result.constraintsByKind[std::size_t(ScaffoldConstraintKind::Enclosure)], "constraints");
     if (stages.normals) {
         count("normal_fibers_solved", stages.normals->solved, "fibers");
+        count("normal_fibers_reused", stages.normals->reused, "fibers");
+        count("normal_fibers_cached", stages.normals->cached, "fibers");
         count("normal_fibers_degenerate", stages.normals->degenerate, "fibers");
         count("normal_fibers_anchored", stages.normals->anchoredFibers, "fibers");
         count("normal_anchors_manual", stages.normals->manualAnchors, "anchors");
@@ -214,6 +226,9 @@ ScaffoldRunRows scaffoldSolveRunRows(const ScaffoldGraph& graph, const ScaffoldS
     }
     if (stages.events) {
         count("events", stages.events->events, "events");
+        count("events_reused_pairs", stages.events->reusedPairs, "fiber_pairs");
+        count("events_reused", stages.events->reusedEvents, "events");
+        count("events_cached_pairs", stages.events->cachedPairs, "fiber_pairs");
         count("events_perpendicular", stages.events->perpendicular, "events");
         count("events_parallel", stages.events->parallel, "events");
         count("events_with_winding_distance", stages.events->withDistance, "events");
@@ -223,6 +238,7 @@ ScaffoldRunRows scaffoldSolveRunRows(const ScaffoldGraph& graph, const ScaffoldS
     if (stages.measured) {
         count("measured_events_used", stages.measured->used, "events");
         count("measured_without_distance", stages.measured->withoutDistance, "events");
+        count("measured_fractional_separations", stages.measured->fractional, "events");
         // Why the rest were dropped, so the gap between the crossings read
         // and the relations used is accounted for rather than implied. A
         // family mismatch means the pair's geometry and their H/V tags
@@ -252,6 +268,12 @@ ScaffoldRunRows scaffoldSolveRunRows(const ScaffoldGraph& graph, const ScaffoldS
             metric("sign_strict_disagreement_percent", stages.signs->solve.metrics.strictDisagreementPercent,
                    "percent");
         }
+    }
+    if (stages.approvals) {
+        count("constraint_approval_rows", stages.approvals->live, "rows");
+        count("constraint_approvals_applied", stages.approvals->approved, "constraints");
+        count("constraint_approvals_stale", stages.approvals->stale, "rows");
+        count("constraint_approvals_without_pieces", stages.approvals->withoutPieces, "rows");
     }
     add(FiberGraphTable::Metrics, std::move(metrics));
 
@@ -319,6 +341,21 @@ std::vector<ScaffoldStoredRun> readScaffoldRuns(const objects::StoreReader& read
         entry.stage = runs.text(row, "stage");
         entry.method = runs.text(row, "method");
         entry.settingsJson = runs.text(row, "settings");
+        // The columns the docks show, out of the settings the run recorded.
+        try {
+            const auto settings = nlohmann::json::parse(entry.settingsJson, nullptr, false);
+            if (settings.is_object()) {
+                if (settings.contains("created_at_unix") && settings["created_at_unix"].is_number_integer())
+                    entry.createdAtUnix = settings["created_at_unix"].get<std::int64_t>();
+                if (settings.contains("normals_fused") && settings["normals_fused"].is_boolean())
+                    entry.normalSource = settings["normals_fused"].get<bool>() ? "fused" : "geometry";
+                if (settings.contains("sign_backend_ceres") && settings["sign_backend_ceres"].is_boolean())
+                    entry.signBackend = settings["sign_backend_ceres"].get<bool>() ? "ceres" : "irls";
+            }
+        } catch (const std::exception&) {
+            // Settings that cannot be parsed leave the columns empty; the run
+            // itself is still a run.
+        }
         if (stage.empty() || entry.stage == stage) out.push_back(std::move(entry));
     });
     const Columns inputs(FiberGraphTable::Inputs);

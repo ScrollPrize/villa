@@ -1709,6 +1709,22 @@ FiberTraceConstraintReport extractFiberTraceConstraints(
     if (!config.extraPieceCutsBaseVoxels.empty() &&
         (config.extraPieceCutsBaseVoxels.size() != lines.size() || config.preserveInputLinesAsPieces))
         throw std::invalid_argument("Piece cut hints require one entry per trace and ordinary splitting");
+    // Cancellation: the predicate is asked between blocks and its answer is
+    // kept in one flag, so a phase stops within a block rather than running
+    // to the end. OpenMP regions must not be left by an exception, so they
+    // skip their remaining blocks and the throw happens after the region.
+    std::atomic<bool> cancelRequested{false};
+    const auto cancelled = [&]() {
+        if (cancelRequested.load(std::memory_order_relaxed)) return true;
+        if (config.cancelled && config.cancelled()) {
+            cancelRequested.store(true, std::memory_order_relaxed);
+            return true;
+        }
+        return false;
+    };
+    const auto throwIfCancelled = [&]() {
+        if (cancelRequested.load(std::memory_order_relaxed)) throw FiberTraceCancelled();
+    };
     const auto prepareStarted = std::chrono::steady_clock::now();
     if(progress)progress({"prepare",0,lines.size()});
     {
@@ -1818,8 +1834,9 @@ FiberTraceConstraintReport extractFiberTraceConstraints(
     // Use contiguous worker buffers rather than one tree allocation per pair.
     // Legacy nearest-pair reduction uses an epsilon comparator, so preserve its
     // serial visitation order. Arbitrary caller filters retain serial callbacks.
+    const bool parallelFilter=!tracePairFilter||config.parallelPairFilter;
     const int queryWorkers=static_cast<int>(std::min<std::size_t>(
-        config.localEvents && !tracePairFilter ? requestedThreads : 1,
+        config.localEvents && parallelFilter ? requestedThreads : 1,
         std::max<std::size_t>(1,samples.size())));
     struct alignas(64) QueryScratch {
         std::vector<RTreeValue> hits;
@@ -1846,6 +1863,7 @@ FiberTraceConstraintReport extractFiberTraceConstraints(
         auto& local=scratch[0];
 #endif
         if(queryFailed.load(std::memory_order_relaxed))continue;
+        if(cancelled())continue;
         const auto first=static_cast<std::size_t>(block)*queryBlock;
         const auto end=std::min(first+queryBlock,samples.size());
         const auto before=local.spatialHits;
@@ -1928,6 +1946,7 @@ FiberTraceConstraintReport extractFiberTraceConstraints(
         count+=local.candidates.size()+local.best.size();
         report.spatialHits+=local.spatialHits;
     }
+    throwIfCancelled();
     if(progress)progress({"search",samples.size(),samples.size(),count});
     if(progress)progress({"candidate_order",0,count,count});
     if(config.pairOwnedGeometry) {
@@ -2055,10 +2074,12 @@ FiberTraceConstraintReport extractFiberTraceConstraints(
         } catch (...) {
             failures[static_cast<std::size_t>(index)] = std::current_exception();
         }
+        if(cancelRequested.load(std::memory_order_relaxed))continue;
         if(progress && ++localCompleted==256) {
             const auto done=completedScores.fetch_add(localCompleted,std::memory_order_relaxed)+localCompleted;
             localCompleted=0;
             progress({"score",done,candidates.size(),candidates.size()});
+            cancelled();
         }
     }
     if(progress && localCompleted) {
@@ -2071,6 +2092,7 @@ FiberTraceConstraintReport extractFiberTraceConstraints(
         if (failure)
             std::rethrow_exception(failure);
     }
+    throwIfCancelled();
     report.localPerpendicularReciprocalEvaluated+=reciprocalEvaluated;
     report.localPerpendicularReciprocalWindowFailures+=reciprocalWindowFailures;
     report.localPerpendicularReciprocalEndpointFailures+=reciprocalEndpointFailures;

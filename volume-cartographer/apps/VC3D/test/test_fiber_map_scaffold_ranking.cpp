@@ -67,6 +67,35 @@ class FiberMapScaffoldRankingTest : public QObject
     Q_OBJECT
 
 private slots:
+    void cyclesAreNumberedByTheStretchesTheyRunAlong()
+    {
+        const std::vector<ScaffoldStoredResidual> residuals{
+            // Two violated constraints of one loop: the same stretches, so
+            // the same number.
+            residual(0, 2.0, 3, {piece("a", 0.0, 10.0, 0.5), piece("b", 5.0, 15.0, 0.5)}),
+            residual(1, 1.5, 3, {piece("b", 5.0, 15.0, 0.5), piece("a", 0.0, 10.0, 0.5)}),
+            // Another loop, sharing one stretch with the first.
+            residual(2, 1.0, 4, {piece("a", 0.0, 10.0, 0.4), piece("c", 1.0, 2.0, 0.6)}),
+            // No cycle localized this one.
+            residual(3, 0.5, std::nullopt, {})};
+        const auto numbers = scaffoldCycleNumbers(residuals);
+        QCOMPARE(numbers.size(), std::size_t{4});
+        QCOMPARE(numbers[0], std::int64_t{1});
+        QCOMPARE(numbers[1], std::int64_t{1});
+        QCOMPARE(numbers[2], std::int64_t{2});
+        QCOMPARE(numbers[3], std::int64_t{0});
+        // A stretch lists every loop that runs along it, ascending.
+        const auto ranked = rankScaffoldPieces(residuals);
+        const auto of = [&](const std::string& fiber) {
+            for (const auto& entry : ranked)
+                if (entry.fiberUuid == fiber) return entry.cycles;
+            return std::vector<std::int64_t>{};
+        };
+        QCOMPARE(of("a"), (std::vector<std::int64_t>{1, 2}));
+        QCOMPARE(of("b"), (std::vector<std::int64_t>{1}));
+        QCOMPARE(of("c"), (std::vector<std::int64_t>{2}));
+    }
+
     void aStretchAccusedTwiceSumsBothShares()
     {
         const std::vector<ScaffoldStoredResidual> residuals{

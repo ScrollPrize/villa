@@ -1,5 +1,7 @@
 #include "vc/fiber_graph/ScaffoldConstraints.hpp"
 
+#include "vc/fiber_graph/ScaffoldCache.hpp"
+
 #include "vc_object_store/geometry/FiberWindingGraph.hpp"
 
 #include <algorithm>
@@ -70,11 +72,77 @@ std::vector<ScaffoldEvent> scaffoldEvents(const ScaffoldGraph& graph, const Scaf
     config.enforceMaximumWindingDistance = options.enforceMaximumWindingDistance;
     config.parallelThreads = options.workers;
 
+    // The extraction reports its own phases (prepare, spatial_index, search,
+    // candidate_order, score, deduplicate); each becomes a stage of the run,
+    // so the dock shows where the minutes go, and the same monitor is what
+    // the extraction asks whether to stop - which it does within a block
+    // rather than at the end of the phase.
+    fiber_tracer::FiberTraceConstraintProgressCallback progress;
     if (options.monitor) {
+        auto* monitor = options.monitor;
+        config.cancelled = [monitor]() { return monitor->cancelled(); };
+        progress = [monitor, phase = std::make_shared<std::string>()](
+                       const fiber_tracer::FiberTraceConstraintProgress& reported) {
+            // A stage per phase: entering resets the count, so a phase is
+            // entered when its name changes. Calls arrive from workers; the
+            // monitor guards its own state.
+            std::string name = "crossings: ";
+            name += reported.phase;
+            if (*phase != name) {
+                *phase = name;
+                monitor->enter(name, std::int64_t(reported.total));
+            }
+            monitor->report(std::int64_t(reported.completed), std::int64_t(reported.total));
+        };
         options.monitor->enter("crossings");
         options.monitor->checkpoint();
     }
-    const auto extracted = extractFiberTraceConstraints(lines, config, {}, distances);
+    // Reuse: every pair whose two fibers are unchanged and whose parameters
+    // match is read from the cache, and the search is told to skip it. The
+    // filter answers from the pair alone, so the search keeps its workers.
+    const auto& normalRows = normals.cacheRows();
+    const auto pairInputs = scaffoldCrossingInputs(options);
+    // A pair is cached under the normals rows it was extracted with; a fiber
+    // without one (never cached) makes its pairs uncacheable.
+    const auto normalsRowOf = [&](std::size_t fiber) -> const std::string& {
+        static const std::string none;
+        return fiber < normalRows.size() ? normalRows[fiber] : none;
+    };
+    const auto versionOf = [&](std::size_t fiber) -> std::int64_t {
+        const auto& version = graph.fibers[fiber].version;
+        return version ? *version : 0;
+    };
+    std::map<std::pair<std::size_t, std::size_t>, std::vector<objects::FiberScaffoldCrossingRow>> reused;
+    if (options.cache) {
+        for (std::size_t a = 0; a < graph.fibers.size(); ++a) {
+            if (versionOf(a) == 0) continue;
+            for (std::size_t b = a + 1; b < graph.fibers.size(); ++b) {
+                if (versionOf(b) == 0) continue;
+                if (normalsRowOf(a).empty() || normalsRowOf(b).empty()) continue;
+                const auto rows = options.cache->crossings(graph.fibers[a].uuid, versionOf(a), normalsRowOf(a),
+                                                           graph.fibers[b].uuid, versionOf(b), normalsRowOf(b),
+                                                           pairInputs);
+                if (!rows) continue;
+                reused.emplace(std::pair{a, b}, std::vector<objects::FiberScaffoldCrossingRow>(rows->begin(), rows->end()));
+            }
+        }
+    }
+    if (!reused.empty()) {
+        config.parallelPairFilter = true;
+        report.reusedPairs = std::int64_t(reused.size());
+    }
+    const fiber_tracer::FiberTraceConstraintTracePairFilter filter =
+        reused.empty() ? fiber_tracer::FiberTraceConstraintTracePairFilter{}
+                       : [&reused](std::size_t a, std::size_t b) {
+                             return reused.find(a < b ? std::pair{a, b} : std::pair{b, a}) == reused.end();
+                         };
+    const auto extracted = [&] {
+        try {
+            return extractFiberTraceConstraints(lines, config, {}, distances, filter, nullptr, progress);
+        } catch (const fiber_tracer::FiberTraceCancelled&) {
+            throw ScaffoldCancelled();
+        }
+    }();
     if (options.monitor) options.monitor->checkpoint();
     report.resampledPoints = std::int64_t(extracted.resampledPoints);
     report.rejectedTangents = std::int64_t(extracted.rejectedTangents);
@@ -96,6 +164,8 @@ std::vector<ScaffoldEvent> scaffoldEvents(const ScaffoldGraph& graph, const Scaf
 
     std::vector<ScaffoldEvent> events;
     events.reserve(extracted.constraints.size());
+    // Per pair, in the pair's UUID order: what this run writes back.
+    std::map<std::pair<std::size_t, std::size_t>, std::vector<ScaffoldEvent>> fresh;
     for (const auto& constraint : extracted.constraints) {
         if (constraint.pieceA >= extracted.pieces.size() || constraint.pieceB >= extracted.pieces.size())
             throw std::runtime_error("scaffold constraints: extracted event names an unknown piece");
@@ -124,7 +194,113 @@ std::vector<ScaffoldEvent> scaffoldEvents(const ScaffoldGraph& graph, const Scaf
         if (!event.validA || !event.validB) ++report.withoutNormals;
         if (!std::isnan(event.distance)) ++report.withDistance;
         if (event.parallel) ++report.parallel; else ++report.perpendicular;
+        // Written back per pair below, so the next run skips this pair.
+        if (options.sink) {
+            // Keyed by fiber index, smaller first: the order the pairs are
+            // walked in when they are written.
+            fresh[std::minmax(std::size_t(event.a), std::size_t(event.b))].push_back(event);
+        }
         events.push_back(event);
+    }
+    // The cached pairs' events, filled in with the fibers' current normals
+    // exactly as the fresh ones are: the pair digest covers those normals, so
+    // a cached event is about the same geometry it was extracted from.
+    for (const auto& [pair, rows] : reused) {
+        for (const auto& row : rows) {
+            const bool forward = graph.fibers[pair.first].uuid == row.fiberA;
+            // Oriented as the extraction orients its events - the fiber of
+            // the smaller index first - whichever way the row (UUID order)
+            // happens to state the pair.
+            ScaffoldEvent event;
+            event.a = std::int64_t(pair.first);
+            event.b = std::int64_t(pair.second);
+            event.arcA = forward ? row.arcA : row.arcB;
+            event.arcB = forward ? row.arcB : row.arcA;
+            const auto& rowPointA = forward ? row.pointA : row.pointB;
+            const auto& rowPointB = forward ? row.pointB : row.pointA;
+            event.pointA = {rowPointA[0], rowPointA[1], rowPointA[2]};
+            event.pointB = {rowPointB[0], rowPointB[1], rowPointB[2]};
+            event.parallelScore = row.parallelScore;
+            event.perpendicularScore = row.perpendicularScore;
+            event.parallel = row.parallel;
+            event.distance = row.parallel ? row.parallelWindingDistance : row.windingDistance;
+            const geometry::Point connector{event.pointB[0] - event.pointA[0], event.pointB[1] - event.pointA[1],
+                                            event.pointB[2] - event.pointA[2]};
+            event.closestDistance = length(connector);
+            const auto normalA = normals.at(std::size_t(event.a), event.arcA);
+            const auto normalB = normals.at(std::size_t(event.b), event.arcB);
+            event.validA = normalA.has_value();
+            event.validB = normalB.has_value();
+            if (normalA) event.normalA = *normalA;
+            if (normalB) event.normalB = *normalB;
+            event.validConnector = event.closestDistance > 0;
+            if (!event.validA || !event.validB) ++report.withoutNormals;
+            if (!std::isnan(event.distance)) ++report.withDistance;
+            if (event.parallel) ++report.parallel; else ++report.perpendicular;
+            ++report.reusedEvents;
+            events.push_back(event);
+        }
+    }
+    // What this run extracted, per pair. A pair the search covered and found
+    // nothing in is cached too, as the "no crossings" marker: an empty answer
+    // is an answer, and re-extracting it every run is the cost this avoids.
+    if (options.sink) {
+        const auto rowOf = [&](std::size_t a, std::size_t b, std::int64_t index,
+                               const ScaffoldEvent* event) {
+            objects::FiberScaffoldCrossingRow row;
+            const bool ordered = graph.fibers[a].uuid < graph.fibers[b].uuid;
+            const auto first = ordered ? a : b, second = ordered ? b : a;
+            row.fiberA = graph.fibers[first].uuid;
+            row.fiberB = graph.fibers[second].uuid;
+            row.versionA = versionOf(first);
+            row.versionB = versionOf(second);
+            row.inputs = pairInputs;
+            row.normalsA = normalsRowOf(first);
+            row.normalsB = normalsRowOf(second);
+            row.eventIndex = index;
+            row.author = options.sink->author;
+            row.computedAt = options.sink->computedAt;
+            if (event != nullptr) {
+                const bool forward = std::size_t(event->a) == first;
+                row.arcA = forward ? event->arcA : event->arcB;
+                row.arcB = forward ? event->arcB : event->arcA;
+                const auto& pointFirst = forward ? event->pointA : event->pointB;
+                const auto& pointSecond = forward ? event->pointB : event->pointA;
+                row.pointA = {pointFirst[0], pointFirst[1], pointFirst[2]};
+                row.pointB = {pointSecond[0], pointSecond[1], pointSecond[2]};
+                row.parallelScore = event->parallelScore;
+                row.perpendicularScore = event->perpendicularScore;
+                row.parallel = event->parallel;
+                if (event->parallel) {
+                    row.parallelWindingDistance = event->distance;
+                    row.windingDistance = std::numeric_limits<double>::quiet_NaN();
+                } else {
+                    row.windingDistance = event->distance;
+                    row.parallelWindingDistance = std::numeric_limits<double>::quiet_NaN();
+                }
+            }
+            return row;
+        };
+        for (std::size_t a = 0; a < graph.fibers.size(); ++a) {
+            if (versionOf(a) == 0) continue;
+            for (std::size_t b = a + 1; b < graph.fibers.size(); ++b) {
+                if (versionOf(b) == 0 || normalsRowOf(a).empty() || normalsRowOf(b).empty()) continue;
+                if (reused.find({a, b}) != reused.end()) continue;  // already cached
+                const auto found = fresh.find({a, b});
+                if (found == fresh.end()) {
+                    // Only pairs the extraction could have found something in
+                    // are worth a marker: an H/V pair of this run's tags.
+                    if (graph.fibers[a].family == graph.fibers[b].family) continue;
+                    options.sink->crossings.push_back(rowOf(a, b, objects::kFiberScaffoldNoCrossings, nullptr));
+                    ++report.cachedPairs;
+                    continue;
+                }
+                std::int64_t index = 0;
+                for (const auto& event : found->second)
+                    options.sink->crossings.push_back(rowOf(a, b, index++, &event));
+                ++report.cachedPairs;
+            }
+        }
     }
     report.events = std::int64_t(events.size());
     report.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
@@ -166,12 +342,21 @@ ScaffoldSignResult scaffoldNormalSigns(const ScaffoldGraph& graph, const Scaffol
         return result;
     }
 
+    // The sign solve counts its own reweighting steps, and stops at one when
+    // the run was taken back.
+    fiber_tracer::FiberSignStepCallback onStep;
     if (options.monitor) {
-        options.monitor->enter("normal signs");
-        options.monitor->checkpoint();
+        auto* monitor = options.monitor;
+        monitor->enter("normal signs", std::int64_t(options.sign.iterations));
+        monitor->checkpoint();
+        onStep = [monitor](int step, int steps) {
+            monitor->report(std::int64_t(step), std::int64_t(steps));
+            return !monitor->cancelled();
+        };
     }
     result.solve = fiber_tracer::solveFiberNormalSigns(normals.radialAgreement(), signEvents, options.sign,
-                                                       normals.fixedSigns());
+                                                       normals.fixedSigns(), onStep);
+    if (options.monitor) options.monitor->checkpoint();
     result.solved = true;
     std::vector<char> witnessed(fibers, 0);
     for (const auto& entry : signEvents) {
@@ -280,11 +465,21 @@ std::vector<ScaffoldConstraint> scaffoldMeasuredConstraints(const ScaffoldGraph&
         if (relation.hasEnclosure) bounds.push_back({relation.enclosure, std::int64_t(index), relation.transport});
         if (!relation.usable) continue;
         const auto kind = event.parallel ? ScaffoldConstraintKind::Parallel : ScaffoldConstraintKind::Perpendicular;
-        append(relation.lower, event, std::int64_t(index), relation.transport, kind);
-        ++report.expanded;
-        if (relation.hasUpper) {
-            append(relation.upper, event, std::int64_t(index), relation.transport, kind);
+        if (relation.hasUpper) ++report.fractional;
+        if (options.separations == ScaffoldSeparationMode::Rounded) {
+            // The nearer integer with the event's whole weight.
+            auto nearer = relation.hasUpper && relation.upper.weight > relation.lower.weight ? relation.upper
+                                                                                            : relation.lower;
+            nearer.weight = input.weight;
+            append(nearer, event, std::int64_t(index), relation.transport, kind);
             ++report.expanded;
+        } else {
+            append(relation.lower, event, std::int64_t(index), relation.transport, kind);
+            ++report.expanded;
+            if (relation.hasUpper) {
+                append(relation.upper, event, std::int64_t(index), relation.transport, kind);
+                ++report.expanded;
+            }
         }
         ++report.used;
         if (event.parallel) ++report.parallel; else ++report.perpendicular;
@@ -413,6 +608,20 @@ objects::FiberConstraintApproval approveScaffoldConstraint(const ScaffoldGraph& 
                                            approvedAt, host);
 }
 
+bool scaffoldConstraintPiecesApproved(const ScaffoldGraph& graph, const ScaffoldGeometry& geometry,
+                                      const ScaffoldConstraint& constraint)
+{
+    const auto spans = scaffoldConstraintSpans(graph, geometry, constraint);
+    if (!spans) return false;
+    const auto approved = [&](std::int64_t fiber, std::size_t span) {
+        if (fiber < 0 || std::size_t(fiber) >= graph.fibers.size()) return false;
+        const auto& list =
+            graph.fibers[std::size_t(fiber)].approvals.approvedSpans[std::size_t(objects::FiberPieceAspect::Geometry)];
+        return std::find(list.begin(), list.end(), span) != list.end();
+    };
+    return approved(constraint.a, spans->spanA) && approved(constraint.b, spans->spanB);
+}
+
 void applyScaffoldConstraintApprovals(const ScaffoldGraph& graph, const ScaffoldGeometry& geometry,
                                       std::span<ScaffoldConstraint> measured,
                                       std::span<const objects::FiberConstraintApproval> rows,
@@ -450,6 +659,12 @@ void applyScaffoldConstraintApprovals(const ScaffoldGraph& graph, const Scaffold
                                                      ordered ? spans->spanA : spans->spanB, contentB,
                                                      ordered ? spans->spanB : spans->spanA))
             continue;
+        // The piece approvals can be revoked after the constraint was
+        // approved; the constraint then asserts nothing rigid either.
+        if (!scaffoldConstraintPiecesApproved(graph, geometry, constraint)) {
+            ++report.withoutPieces;
+            continue;
+        }
         constraint.approved = true;
         ++report.approved;
     }

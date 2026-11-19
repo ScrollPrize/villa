@@ -7,6 +7,9 @@
 #include <initializer_list>
 
 #include <algorithm>
+#include <exception>
+#include <thread>
+#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <functional>
@@ -819,8 +822,46 @@ ContentDigest seededDigest(uint64_t seed)
 
 // The geometry-relevant fiber content: what prep and detection consume.
 // Links are deliberately excluded - no cached artifact reads them.
+// Runs `work(i)` for every fiber on the machine's cores. Each index is taken
+// by exactly one worker; an exception from any of them is rethrown here.
+// Plain threads: this file is built into targets that link nothing but Qt.
+template <class Work>
+void parallelOverFibers(std::size_t count, const Work& work)
+{
+    if (count == 0) return;
+    const std::size_t workers =
+        std::min<std::size_t>(count, std::max(1u, std::thread::hardware_concurrency()));
+    std::vector<std::exception_ptr> failures(count);
+    std::atomic<std::size_t> next{0};
+    const auto run = [&]() {
+        for (std::size_t i = next.fetch_add(1); i < count; i = next.fetch_add(1)) {
+            try {
+                work(i);
+            } catch (...) {
+                failures[i] = std::current_exception();
+            }
+        }
+    };
+    std::vector<std::thread> pool;
+    pool.reserve(workers - 1);
+    for (std::size_t w = 1; w < workers; ++w) pool.emplace_back(run);
+    run();
+    for (auto& thread : pool) thread.join();
+    for (const auto& failure : failures)
+        if (failure) std::rethrow_exception(failure);
+}
+
 ContentDigest fiberContentDigest(const InputFiber& fiber)
 {
+    // A stored fiber is identified by what the store calls it: object,
+    // version and the frame it was read in. No point is hashed.
+    if (!fiber.uuid.empty() && fiber.version > 0) {
+        ContentDigest identity = seededDigest(0x1DE27);
+        hashString(identity, fiber.uuid);
+        hashU64(identity, static_cast<uint64_t>(fiber.version));
+        hashString(identity, fiber.frame);
+        return identity;
+    }
     ContentDigest digest = seededDigest(0xF1BE1);
     hashString(digest, fiber.fileName);
     hashU64(digest, static_cast<uint64_t>(fiber.hvTag));
@@ -839,8 +880,17 @@ ContentDigest fiberContentDigest(const InputFiber& fiber)
     return digest;
 }
 
-ContentDigest umbilicusDigest(const UmbilicusInterp& umbilicus)
+ContentDigest umbilicusDigest(const UmbilicusInterp& umbilicus, const GlobalLayoutParams& params)
 {
+    // A stored umbilicus is identified by what the store calls it: object,
+    // version and the frame it was read in. No point is hashed.
+    if (!params.umbilicusUuid.empty() && params.umbilicusVersion > 0) {
+        ContentDigest identity = seededDigest(0x0B1D);
+        hashString(identity, params.umbilicusUuid);
+        hashU64(identity, static_cast<uint64_t>(params.umbilicusVersion));
+        hashString(identity, params.umbilicusFrame);
+        return identity;
+    }
     ContentDigest digest = seededDigest(0x0B111);
     hashU64(digest, umbilicus.z.size());
     for (std::size_t i = 0; i < umbilicus.z.size(); ++i) {
@@ -1214,6 +1264,12 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
                                const GlobalLayoutParams& params,
                                GlobalLayoutCache* cache)
 {
+    if (params.solver.chiralityOverride == 0 && params.followed.places() && params.followed.chirality != 0) {
+        // Placed from a run: its sense is the sense of its windings.
+        GlobalLayoutParams stated = params;
+        stated.solver.chiralityOverride = params.followed.chirality;
+        return buildGlobalLayout(fibers, umbilicusCenters, stated, cache);
+    }
     if (params.solver.chiralityOverride == 0) {
         // No stated sense: decide it on the geometry alone, then build. Both
         // senses are solved with the links left out and compared on their
@@ -1324,6 +1380,7 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
     if (cache != nullptr) {
         cache->_stats.used = true;
     }
+    const auto bodyBegin = std::chrono::steady_clock::now();
     const auto sortUnplaced = [&result]() {
         std::sort(result.unplaced.begin(), result.unplaced.end(),
                   [](const UnplacedFiber& a, const UnplacedFiber& b) {
@@ -1363,44 +1420,71 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
         indexById.emplace(ordered[i]->id, i);
     }
 
-    const ContentDigest umbDigest = umbilicusDigest(umbilicus);
+    const ContentDigest umbDigest = umbilicusDigest(umbilicus, params);
     std::vector<ContentDigest> prepKeys(fiberCount);
 
     const auto prepBegin = std::chrono::steady_clock::now();
+    result.setupMs = std::chrono::duration<double, std::milli>(prepBegin - bodyBegin).count();
     std::vector<PreparedFiber> prepared;
-    prepared.reserve(fiberCount);
-    for (std::size_t i = 0; i < fiberCount; ++i) {
-        if (cache == nullptr) {
-            prepared.push_back(prepareFiber(*ordered[i], umbilicus));
-            continue;
+    // Per fiber and independent of every other: the cache slots are resolved
+    // first (the map is not to be touched from workers), then every fiber is
+    // keyed and prepared - or copied from its slot - in parallel.
+    prepared.resize(fiberCount);
+    double prepHashMs = 0.0;
+    std::vector<GlobalLayoutCache::PrepSlot*> prepSlots(fiberCount, nullptr);
+    bool uniqueSlots = true;
+    if (cache != nullptr) {
+        std::set<GlobalLayoutCache::PrepSlot*> seen;
+        for (std::size_t i = 0; i < fiberCount; ++i) {
+            prepSlots[i] = &cache->_prep[ordered[i]->fileName];
+            uniqueSlots = seen.insert(prepSlots[i]).second && uniqueSlots;
         }
-        prepKeys[i] = combineDigests(
-            0x50E5, {fiberContentDigest(*ordered[i]), umbDigest});
-        GlobalLayoutCache::PrepSlot& slot = cache->_prep[ordered[i]->fileName];
+    }
+    std::atomic<int> fibersReused{0}, fibersRecomputed{0};
+    const auto prepareOne = [&](std::size_t i) {
+        if (cache == nullptr) {
+            prepared[i] = prepareFiber(*ordered[i], umbilicus);
+            return;
+        }
+        prepKeys[i] = combineDigests(0x50E5, {fiberContentDigest(*ordered[i]), umbDigest});
+        GlobalLayoutCache::PrepSlot& slot = *prepSlots[i];
         if (slot.key == prepKeys[i]) {
             PreparedFiber entry;
             entry.input = ordered[i];
             entry.thetaLine = slot.thetaLine;
             entry.radius = slot.radius;
             entry.controlLineIndex = slot.controlLineIndex;
-            prepared.push_back(std::move(entry));
-            ++cache->_stats.fibersReused;
+            prepared[i] = std::move(entry);
+            fibersReused.fetch_add(1, std::memory_order_relaxed);
         } else {
-            prepared.push_back(prepareFiber(*ordered[i], umbilicus));
+            prepared[i] = prepareFiber(*ordered[i], umbilicus);
             // Value complete before the key is published: a throw during the
             // copies must never leave a matching key over stale data.
             GlobalLayoutCache::PrepSlot fresh;
-            fresh.thetaLine = prepared.back().thetaLine;
-            fresh.radius = prepared.back().radius;
-            fresh.controlLineIndex = prepared.back().controlLineIndex;
+            fresh.thetaLine = prepared[i].thetaLine;
+            fresh.radius = prepared[i].radius;
+            fresh.controlLineIndex = prepared[i].controlLineIndex;
             fresh.key = prepKeys[i];
             slot = std::move(fresh);
-            ++cache->_stats.fibersRecomputed;
+            fibersRecomputed.fetch_add(1, std::memory_order_relaxed);
         }
+    };
+    // Two fibers sharing a slot (a duplicated file name) would race on it;
+    // that input is walked in order, as it always was.
+    if (uniqueSlots) {
+        parallelOverFibers(fiberCount, prepareOne);
+    } else {
+        for (std::size_t i = 0; i < fiberCount; ++i) prepareOne(i);
+    }
+    if (cache != nullptr) {
+        cache->_stats.fibersReused += fibersReused.load();
+        cache->_stats.fibersRecomputed += fibersRecomputed.load();
     }
     result.prepMs = std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() - prepBegin)
                         .count();
+    result.prepHashMs = prepHashMs;
+    const auto tracesBegin = std::chrono::steady_clock::now();
 
     // The solver sees only the control-point-bounded domain of every fiber:
     // the undrawn line-point tails must not constrain the solve any more than
@@ -1654,8 +1738,53 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
         }
     }
 
+    result.tracesMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tracesBegin)
+                          .count();
+    // The run's own placement, when the map is laid out from a solve, and
+    // the fibers that solve did not cover.
+    std::optional<winding::SolveResult> solveFromRun;
+    std::vector<char> coveredByRun(fiberCount, 0);
+    // Laid out FROM a solve: the run already decided every winding, so the
+    // map places its fibers at them and runs no detection and no solve of its
+    // own. The fibers the run did not cover are not drawn - the map is of the
+    // solve, not of everything the store holds.
+    if (params.followed.places()) {
+        winding::SolveResult fromSolve;
+        fromSolve.chirality = chirality;
+        fromSolve.placements.assign(fiberCount, winding::Placement{});
+        for (std::size_t i = 0; i < fiberCount; ++i) {
+            const auto found = params.followed.windings.find(ordered[i]->id);
+            if (found == params.followed.windings.end()) continue;
+            coveredByRun[i] = 1;
+            auto& placement = fromSolve.placements[i];
+            placement.turns = double(found->second.turns);
+            // The run gauged each component on its own, so its windings are
+            // as anchored as the solve made them: Primary says exactly that.
+            placement.anchor = winding::ComponentAnchor::Primary;
+            placement.linked = true;
+            // The winding over the fiber's own samples, as the geometry pass
+            // below draws it: the turn offset plus the unwrapped angle.
+            double lo = std::numeric_limits<double>::infinity();
+            double hi = -std::numeric_limits<double>::infinity();
+            for (const double theta : prepared[i].thetaLine) {
+                const double w = placement.turns + double(chirality) * theta / kTwoPi;
+                lo = std::min(lo, w);
+                hi = std::max(hi, w);
+            }
+            if (std::isfinite(lo) && std::isfinite(hi)) {
+                placement.windingLo = lo;
+                placement.windingHi = hi;
+            }
+        }
+        // No link took part in a placement the run made, so every residual
+        // is "never constrained here" - the documented infinity. The links'
+        // suspicion comes from the run's own residual rows instead.
+        fromSolve.linkTurnErrors.assign(allLinks.size(), std::numeric_limits<double>::infinity());
+        fromSolve.droppedLinks.clear();
+        solveFromRun = std::move(fromSolve);
+    }
     std::vector<winding::CanonicalTrace> canonical(fiberCount);
-    for (std::size_t i = 0; i < fiberCount; ++i) {
+    for (std::size_t i = 0; i < fiberCount && !solveFromRun; ++i) {
         canonical[i] = winding::canonicalizeTrace(traces[i], chirality);
     }
     const ContentDigest detectParams = detectionParamsDigest(solverParams);
@@ -1674,14 +1803,31 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
     // Per classified pair: its geometry and fibers, for the second pass.
     std::vector<const winding::PairDetections*> geometryOf;
     std::map<std::pair<std::size_t, std::size_t>, std::size_t> pairIndexOf;
-    for (std::size_t h = 0; h < fiberCount; ++h) {
+    // The pair sweep is the build's long stretch: it reports its progress and
+    // is where a cancelled Update stops.
+    std::int64_t pairsWalked = 0;
+    // Only the H/V pairs are walked, and that is what the count is of.
+    std::int64_t pairsTotal = 0;
+    if (!solveFromRun) {
+        std::int64_t horizontals = 0, verticals = 0;
+        for (std::size_t i = 0; i < fiberCount; ++i) {
+            if (canonical[i].psi.empty()) continue;
+            if (canonical[i].hvTag == 'H') ++horizontals;
+            else if (canonical[i].hvTag == 'V') ++verticals;
+        }
+        pairsTotal = horizontals * verticals;
+    }
+    for (std::size_t h = 0; h < fiberCount && !solveFromRun; ++h) {
         if (canonical[h].hvTag != 'H' || canonical[h].psi.empty()) {
             continue;
         }
+        if (params.cancelled && params.cancelled()) throw GlobalLayoutCancelled();
+        if (params.progress) params.progress("crossing pairs", pairsWalked, pairsTotal);
         for (std::size_t v = 0; v < fiberCount; ++v) {
             if (canonical[v].hvTag != 'V' || canonical[v].psi.empty()) {
                 continue;
             }
+            ++pairsWalked;
             const winding::PairDetections* geometry = nullptr;
             if (cache == nullptr) {
                 freshShards.push_back(winding::detectPairCrossings(
@@ -1715,8 +1861,9 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
                                     std::chrono::steady_clock::now() - detectBegin)
                                     .count();
     winding::SolveResult solve =
-        winding::solveWindings(traces, linkInputs, solverParams, chirality,
-                               detections);
+        solveFromRun ? std::move(*solveFromRun)
+                     : winding::solveWindings(traces, linkInputs, solverParams, chirality, detections);
+    const bool placedFromRun = params.followed.places();
     // Seam encounters the solve finds (see winding::Crossing::kollesisInferred):
     // on a V the annotator certified as on a kollesis, an Outside crossing
     // that lost to the rest of its H fiber's evidence by exactly one turn,
@@ -1733,7 +1880,9 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
     double reclassifyMs = 0.0;
     double assemblyMs = solve.detectMs;
     double solveMs = solve.solveMs;
-    {
+    // The kollesis pass reads the solve's own crossings; a run-placed map has
+    // none, and the run already settled what it settled.
+    if (!placedFromRun) {
         // Per kollesis V: the side (+1 / -1 in canonical angle) its inner
         // sheet's ends lie on, or 0 when unsettled.
         std::map<std::size_t, int> innerEndSide;
@@ -1839,6 +1988,18 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
     const double thetaScale = static_cast<double>(solve.chirality);
 
     const auto geometryBegin = std::chrono::steady_clock::now();
+    if (params.progress) params.progress("drawing the fibers", 0, std::int64_t(fiberCount));
+    // Each fiber's drawn geometry (unroll, smooth, resample) depends on that
+    // fiber alone, so they are built in parallel; the loop below assembles
+    // the result in fiber order, exactly as before.
+    std::vector<FiberGeometry> builtGeometry(fiberCount);
+    std::vector<decltype(GlobalPlacedFiber{}.fiber)> builtFibers(fiberCount);
+    parallelOverFibers(fiberCount, [&](std::size_t i) {
+        if (placedFromRun && !coveredByRun[i]) return;
+        builtGeometry[i] = buildFiberGeometry(prepared[i], thetaScale, kTwoPi * solve.placements[i].turns,
+                                              rRefVx, sigmaVx, resampleStepVx);
+        builtFibers[i] = makePlacedFiber(*ordered[i], builtGeometry[i]);
+    });
     double loX = std::numeric_limits<double>::infinity();
     double hiX = -std::numeric_limits<double>::infinity();
     double loY = std::numeric_limits<double>::infinity();
@@ -1848,12 +2009,19 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
     geometry.reserve(fiberCount);
     result.fibers.reserve(fiberCount);
     for (std::size_t i = 0; i < fiberCount; ++i) {
+        if (placedFromRun && !coveredByRun[i]) {
+            // Outside this solve: the map is of the run, so the fiber is
+            // reported unplaced rather than drawn at a winding nobody
+            // assigned it.
+            result.unplaced.push_back(
+                UnplacedFiber{ordered[i]->id, ordered[i]->fileName, ordered[i]->label, ordered[i]->hvTag});
+            geometry.push_back(FiberGeometry{});
+            continue;
+        }
         const winding::Placement& placement = solve.placements[i];
-        const double offsetRad = kTwoPi * placement.turns;
-        FiberGeometry geo = buildFiberGeometry(prepared[i], thetaScale, offsetRad,
-                                               rRefVx, sigmaVx, resampleStepVx);
+        FiberGeometry geo = std::move(builtGeometry[i]);
         GlobalPlacedFiber placed;
-        placed.fiber = makePlacedFiber(*ordered[i], geo);
+        placed.fiber = std::move(builtFibers[i]);
         // Geometry too degenerate to draw a single run (a one-point trace,
         // say) or containing non-finite coordinates is unplaceable, honestly,
         // rather than a placed fiber the map never shows. Note the fiber's
@@ -1908,6 +2076,8 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
         }
         result.fibers.push_back(std::move(placed));
         geometry.push_back(std::move(geo));
+        if (params.progress) params.progress("drawing the fibers", std::int64_t(i + 1), std::int64_t(fiberCount));
+        if (params.cancelled && params.cancelled()) throw GlobalLayoutCancelled();
     }
     if (!(loX <= hiX) || !(loY <= hiY)) {
         // Nothing drew at all; the accounting still owes the caller every
@@ -1926,6 +2096,11 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
     result.geometryMs = std::chrono::duration<double, std::milli>(
                             std::chrono::steady_clock::now() - geometryBegin)
                             .count();
+    const auto assembleBegin = std::chrono::steady_clock::now();
+    const auto assembleDone = [&result, assembleBegin]() {
+        result.assembleMs =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - assembleBegin).count();
+    };
     std::set<std::size_t> droppedLinks(solve.droppedLinks.begin(),
                                        solve.droppedLinks.end());
     result.links.reserve(allLinks.size());
@@ -1959,9 +2134,13 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
         // constrained (its turn error is unset) and is suspect as an error.
         // A link the followed solve never used is not suspect for carrying no
         // constraint here; one it could not satisfy is, exactly as it said.
+        // On a map placed from a run no link constrained anything here, so
+        // its residual is the "never took part" placeholder and says nothing:
+        // there a link is suspect only when the run itself could not satisfy
+        // it. Reading the placeholder as a residual would ring every link.
         placedLink.suspect = placedLink.adjacentUnpaired || placedLink.adjacentDisagrees ||
                              violatedByFollowed(link) ||
-                             (!placedLink.notFollowed &&
+                             (!placedFromRun && !placedLink.notFollowed &&
                               (placedLink.turnErr >= params.suspectTurns || droppedLinks.count(l) != 0));
         if (placedLink.suspect) {
             ++result.suspectLinkCount;
@@ -2168,6 +2347,9 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
         }
     }
     sortUnplaced();
+    assembleDone();
+    result.bodyMs =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - bodyBegin).count();
     return result;
 }
 
@@ -2256,7 +2438,7 @@ ContentDigest digestGlobalInputs(const std::vector<InputFiber>& fibers,
 {
     ContentDigest digest = seededDigest(0x1B9);
     const UmbilicusInterp umbilicus = interpolateUmbilicus(umbilicusCenters);
-    const ContentDigest umb = umbilicusDigest(umbilicus);
+    const ContentDigest umb = umbilicusDigest(umbilicus, params);
     hashU64(digest, umb.a);
     hashU64(digest, umb.b);
     // Snapshot order is content-derived, so hashing fibers in input order is
@@ -2337,6 +2519,14 @@ ContentDigest digestGlobalInputs(const std::vector<InputFiber>& fibers,
             hashU64(digest, uuid.size());
             hashBytes(digest, uuid.data(), uuid.size());
         }
+    }
+    // The windings a followed solve places the fibers at are inputs too.
+    hashU64(digest, static_cast<uint64_t>(static_cast<int64_t>(params.followed.chirality)));
+    hashU64(digest, params.followed.windings.size());
+    for (const auto& [id, winding] : params.followed.windings) {
+        hashU64(digest, id);
+        hashU64(digest, static_cast<uint64_t>(winding.turns));
+        hashU64(digest, static_cast<uint64_t>(winding.component));
     }
     return digest;
 }

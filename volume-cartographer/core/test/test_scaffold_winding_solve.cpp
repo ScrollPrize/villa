@@ -55,6 +55,17 @@ struct Builder {
         return graph.fibers.size() - 1;
     }
 
+    // Every span of a fiber approved for geometry: the condition a link or a
+    // measured constraint has to meet to be held rigid.
+    void approveGeometry(std::size_t fiber)
+    {
+        auto& entry = graph.fibers[fiber];
+        const auto spans = entry.content.controlIds.size() - 1;
+        auto& approved = entry.approvals.approvedSpans[std::size_t(vc::objects::FiberPieceAspect::Geometry)];
+        approved.clear();
+        for (std::size_t span = 0; span < spans; ++span) approved.push_back(span);
+    }
+
     // Anchors on the polylines at height `height`, so their projection
     // distance is zero and the arc equals the height.
     void link(std::size_t a, std::size_t b, bool adjacent = false, const std::string& state = "approved",
@@ -279,6 +290,7 @@ TEST_CASE("approved subgraphs are held rigid")
     builder.link(a, b, false, "approved");
     builder.link(b, c, false, "approved");
     builder.link(a, c, true, "pending"); // contradicts the approved pair
+    for (const auto fiber : {a, b, c}) builder.approveGeometry(fiber);
     const ScaffoldGeometry geometry(builder.graph);
     const auto result = solveScaffoldWinding(builder.graph, geometry, pendingAndApproved());
     CHECK(result.approvedSubgraphs == 1);
@@ -298,8 +310,33 @@ TEST_CASE("contradicting approved constraints stop the run")
     const auto b = builder.fiber(ScaffoldFamily::Vertical, 110.);
     builder.link(a, b, false, "approved");
     builder.link(a, b, true, "approved"); // the same pair, one winding apart
+    builder.approveGeometry(a);
+    builder.approveGeometry(b);
     const ScaffoldGeometry geometry(builder.graph);
     CHECK_THROWS_AS(solveScaffoldWinding(builder.graph, geometry), std::invalid_argument);
+}
+
+TEST_CASE("an approved link over unapproved geometry is not held rigid")
+{
+    Builder builder;
+    const auto a = builder.fiber(ScaffoldFamily::Horizontal, 100.);
+    const auto b = builder.fiber(ScaffoldFamily::Horizontal, 110.);
+    const auto c = builder.fiber(ScaffoldFamily::Vertical, 120.);
+    builder.link(a, b, false, "approved");
+    builder.link(b, c, false, "approved");
+    builder.link(a, c, true, "pending"); // contradicts the approved pair
+    // Only one side of the approved pair has approved pieces, so neither
+    // approved link is rigid and the pending link is free to be satisfied.
+    builder.approveGeometry(a);
+    const ScaffoldGeometry geometry(builder.graph);
+    const auto result = solveScaffoldWinding(builder.graph, geometry, pendingAndApproved());
+    CHECK(result.linkReport.approvedWithoutPieces == 2);
+    CHECK(result.approvedSubgraphs == 0);
+    CHECK(result.contractedFibers == 0);
+    for (const auto& constraint : result.constraints) CHECK_FALSE(constraint.approved);
+    // Three links, one of which must give: the solve is free to choose, and
+    // the cheapest answer is one winding of residual somewhere.
+    CHECK(result.objective == doctest::Approx(1.));
 }
 
 TEST_CASE("links are filtered by approval state, automation and family")
@@ -330,6 +367,76 @@ TEST_CASE("links are filtered by approval state, automation and family")
     CHECK(report.used == 2);
     CHECK(report.skippedAutomatic == 0);
     CHECK(more.size() == 2);
+}
+
+TEST_CASE("links switched off solve on the measured constraints alone")
+{
+    Builder builder;
+    const auto a = builder.fiber(ScaffoldFamily::Horizontal, 100.);
+    const auto b = builder.fiber(ScaffoldFamily::Vertical, 110.);
+    // The link says the same winding, the measured crossing says one apart:
+    // with the links off only the measurement is asserted, so the run is
+    // exact and reads no link at all.
+    builder.link(a, b);
+    ScaffoldConstraint constraint;
+    constraint.kind = ScaffoldConstraintKind::Perpendicular;
+    constraint.a = std::int64_t(a);
+    constraint.b = std::int64_t(b);
+    constraint.target = 1;
+    constraint.weight = 2.;
+    const ScaffoldGeometry geometry(builder.graph);
+    ScaffoldSolveOptions options;
+    options.links.useLinks = false;
+    options.links.approvalStates.clear();
+    const std::vector<ScaffoldConstraint> measured{constraint};
+    const auto result = solveScaffoldWinding(builder.graph, geometry, options, measured);
+    CHECK(result.linkReport.links == 0);
+    CHECK(result.linkReport.used == 0);
+    REQUIRE(result.constraints.size() == 1);
+    CHECK(result.constraints.front().kind == ScaffoldConstraintKind::Perpendicular);
+    CHECK(result.objective == doctest::Approx(0.));
+    CHECK(result.violatedConstraints == 0);
+    CHECK(result.components == 1);
+    CHECK(result.winding[b] - result.winding[a] == 1);
+    // The same options with the links on are the misconfiguration the guard
+    // still refuses: no approval state is not a linkless run.
+    options.links.useLinks = true;
+    CHECK_THROWS_AS(solveScaffoldWinding(builder.graph, geometry, options, measured), std::invalid_argument);
+}
+
+TEST_CASE("a link's anchors are read in the frame the run is solved in")
+{
+    // The loader maps a fiber's geometry into the run's volume and must map
+    // the links' anchors with it. This is that rule at the arithmetic the
+    // loader applies: an anchor scaled like its fiber projects onto the
+    // polyline, an unscaled one lands a whole volume away.
+    Builder builder;
+    const auto a = builder.fiber(ScaffoldFamily::Horizontal, 100.);
+    const auto b = builder.fiber(ScaffoldFamily::Vertical, 110.);
+    builder.link(a, b);
+    const ScaffoldGeometry geometry(builder.graph);
+    CHECK(solveScaffoldWinding(builder.graph, geometry).linkReport.maxAnchorDistance == doctest::Approx(0.));
+
+    // The same scaffold read at half the scale: with the anchors left in the
+    // stored frame the guard refuses the run, which is what an unmapped
+    // anchor looks like.
+    auto stale = builder.graph;
+    for (auto& point : stale.linePoints) point *= 0.5;
+    for (auto& fiber : stale.fibers)
+        for (auto& control : fiber.content.controlPoints)
+            for (auto& value : control) value *= 0.5;
+    const ScaffoldGeometry staleGeometry(stale);
+    CHECK_THROWS_AS(solveScaffoldWinding(stale, staleGeometry), std::invalid_argument);
+
+    // Mapped with the fibers, as loadScaffoldGraph now does, it is exact again.
+    auto mapped = stale;
+    for (auto& link : mapped.links) {
+        for (auto* anchor : {&link.anchorA, &link.anchorB})
+            if (*anchor)
+                for (auto& value : **anchor) value *= 0.5;
+    }
+    const ScaffoldGeometry mappedGeometry(mapped);
+    CHECK(solveScaffoldWinding(mapped, mappedGeometry).linkReport.maxAnchorDistance == doctest::Approx(0.));
 }
 
 TEST_CASE("an anchor off its polyline fails the run")

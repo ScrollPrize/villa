@@ -12,6 +12,9 @@
 #include <tuple>
 #include <string>
 #include <utility>
+#include <functional>
+#include <stdexcept>
+#include <string_view>
 #include <vector>
 
 #include "FiberWindingSolver.hpp"
@@ -66,6 +69,13 @@ struct InputFiber {
     // Stable identity, carried through so callers can act on a placed fiber
     // after the runtime ids have been reassigned.
     std::string fileName;
+    // The store's identity of this geometry: the object, its version, and
+    // the frame it was read in. When stated, this IS the fiber's cache
+    // identity - the store versions its objects, so nothing is hashed. Only
+    // a fiber that was never stored (version 0) is identified by its content.
+    std::string uuid;
+    std::int64_t version = 0;
+    std::string frame;
     QString label;
     char hvTag = '?';
     std::vector<cv::Vec3d> controlPoints;
@@ -269,7 +279,28 @@ struct Result {
 struct FollowedSolve {
     std::set<std::string> unusedLinkUuids;
     std::set<std::string> violatedLinkUuids;
-    [[nodiscard]] bool empty() const { return unusedLinkUuids.empty() && violatedLinkUuids.empty(); }
+    // The run's own answer, by fiber id: the winding it assigned and the
+    // component it gauged it in. With these the map is laid out FROM the
+    // solve - every covered fiber is drawn at that winding, the fibers the
+    // run did not cover are not drawn at all, and no crossing detection and
+    // no winding solve run. Empty: the map solves the windings itself.
+    struct Winding {
+        std::int64_t turns = 0;
+        std::int64_t component = -1;
+        bool operator==(const Winding&) const = default;
+    };
+    std::map<std::uint64_t, Winding> windings;
+    // The winding sense the run was solved in (+1 / -1), 0 when it stated
+    // none. A map placed from the run is drawn in that sense: deciding it
+    // again from the geometry would cost two trial builds and could
+    // disagree with the windings being drawn.
+    int chirality = 0;
+    [[nodiscard]] bool empty() const
+    {
+        return unusedLinkUuids.empty() && violatedLinkUuids.empty() && windings.empty();
+    }
+    // Whether the solve places the fibers (rather than only marking links).
+    [[nodiscard]] bool places() const { return !windings.empty(); }
 };
 
 struct GlobalLayoutParams {
@@ -285,6 +316,25 @@ struct GlobalLayoutParams {
     double minPadYVx = 6667.0;
     winding::SolverParams solver;
     FollowedSolve followed;
+    // The umbilicus' store identity (object, version, frame it was read in).
+    // When stated it IS the umbilicus' cache identity; an umbilicus that was
+    // never stored (version 0) is identified by its points.
+    std::string umbilicusUuid;
+    std::int64_t umbilicusVersion = 0;
+    std::string umbilicusFrame;
+    // Progress and cancellation of one build. `progress` is called as the
+    // build walks its pairs and fibers; `cancelled` is asked in the same
+    // places and stops the build with GlobalLayoutCancelled. Neither is part
+    // of the content digest: they do not change what is built.
+    std::function<void(std::string_view stage, std::int64_t done, std::int64_t total)> progress;
+    std::function<bool()> cancelled;
+};
+
+// Thrown by buildGlobalLayout when `params.cancelled` returned true: the
+// caller asked for the build back, and nothing was produced.
+class GlobalLayoutCancelled : public std::runtime_error {
+public:
+    GlobalLayoutCancelled() : std::runtime_error("fiber map layout: cancelled") {}
 };
 
 // How a fiber's component got its absolute winding; mirrors the solver's
@@ -509,9 +559,19 @@ struct GlobalResult {
     double sheetPitchVx = 0.0;
     // Phase timings (milliseconds), for the rebuild's one-line profile.
     double prepMs = 0.0;
+    // Of prepMs: the content hashing that keys the per-fiber cache.
+    double prepHashMs = 0.0;
     double detectMs = 0.0;
     double solveMs = 0.0;
     double geometryMs = 0.0;
+    // Between prep and the solve: the traces, links, networks and seam
+    // evidence; and after the geometry: links, events, marks and padding.
+    double tracesMs = 0.0;
+    double assembleMs = 0.0;
+    // Before prep (ordering, umbilicus interpolation), and the whole body up
+    // to the return - what a caller measures beyond it is teardown.
+    double setupMs = 0.0;
+    double bodyMs = 0.0;
 };
 
 // Distance along the sheet as a function of map position. The map's x is

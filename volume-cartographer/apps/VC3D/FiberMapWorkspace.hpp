@@ -29,6 +29,8 @@
 #include "FiberMapRuler.hpp"
 #include "FiberMapStaleness.hpp"
 #include "FiberNetworkLayout.hpp"
+
+#include "vc/fiber_graph/ScaffoldRunMonitor.hpp"
 #include "vc/core/util/Rect3D.hpp"
 #include "OpenDataVolumeOrientation.hpp"
 
@@ -142,8 +144,25 @@ signals:
     // "Open piece from control point ... to ...": the fiber as an approval
     // piece (LineAnnotationPieceLock.hpp).
     void openFiberPieceRequested(uint64_t fiberId, vc3d::line_annotation::PiecePlan plan);
+    // A dock of this workspace was moved, floated or closed, so the window
+    // state is worth saving again (CWindow owns the settings).
+    void dockLayoutChanged();
 
 public:
+    // One fiber of the store as the catalog lists it: what the dock can show
+    // before a layout exists. The map needs no geometry for this - the list
+    // is the store's answer, the map's own rows replace it once it is built.
+    struct StoreFiberRow {
+        uint64_t id = 0;
+        QString label;
+        char hvTag = '?';
+        double lengthVx = 0;
+        int links = 0;
+    };
+    // The store's fibers, for the list while no layout is built. Called
+    // whenever the catalog changes; an empty list clears it.
+    void setStoreFibers(std::vector<StoreFiberRow> fibers);
+
     // Everything the rebuild worker consumes and produces, owned BY the job
     // so the two threads share no mutable state (public so the worker's free
     // function can see it; construction and use stay private to this class).
@@ -166,6 +185,8 @@ private:
     // Redraws the approval overlays: the approved spans while their highlight
     // is on, and the stretch or constraint the approval dock has selected.
     void rebuildApprovalOverlay();
+    // Only the selected spans, so a row click does not restroke the halos.
+    void rebuildHighlightOverlay();
     // The links the selected solve did not use and could not satisfy, from
     // that run's rows and settings; a rebuild follows when they change.
     void updateFollowedSolve();
@@ -174,11 +195,24 @@ private:
     void showScaffoldHighlight(const vc3d::fiber_map::ScaffoldHighlight& highlight);
     // Opens a ranked stretch as an approval piece between its bracketing
     // control points.
-    void openScaffoldPiece(const std::string& fiberUuid, std::int64_t controlFrom, std::int64_t controlTo);
+    // `arcFrom`/`arcTo`: the stretch's own ends, used for the lock controls
+    // when the fiber states them; NaN falls back to the bracketing controls.
+    void openScaffoldPiece(const std::string& fiberUuid, std::int64_t controlFrom, std::int64_t controlTo,
+                           double arcFrom = std::numeric_limits<double>::quiet_NaN(),
+                           double arcTo = std::numeric_limits<double>::quiet_NaN());
     // The approval dock's current row, as a fiber and control range of the
     // published layout (ids are runtime, so this is cleared with the layout).
-    uint64_t _highlightPieceFiber = 0;
-    std::int64_t _highlightPieceFrom = -1, _highlightPieceTo = -1;
+    // The control ranges the approval dock asked to draw: one for a stretch,
+    // two for a constraint (the pieces its anchors lie on).
+    struct HighlightSpan {
+        uint64_t fiber = 0;
+        std::int64_t controlFrom = -1, controlTo = -1;
+    };
+    std::vector<HighlightSpan> _highlightSpans;
+    // Set while the selection came from the approval dock: the fibers are
+    // selected for their spans, so the network keeps its plain look and only
+    // the span's own control points are marked.
+    bool _spanSelection = false;
     std::optional<Rect3D> _focusBounds;
     bool _focusBoundsDirty = false;
     // Scene-space copy of the placed fiber (y negated once, so scroll z reads
@@ -216,6 +250,11 @@ private:
     void requestRebuild(bool fullRebuild = false, bool automatic = false);
     void rebuildScene(const QString& emptyMessage);
     void rebuildTree();
+    // The dock's list when no layout is built: the store's own fibers, with
+    // what the catalog knows about them. No networks, no windings - those are
+    // the layout's answers.
+    void rebuildStoreTree();
+    std::vector<StoreFiberRow> _storeFibers;
     // The dock tree's columns, in order; the len column's header names the
     // unit its cells are in (cm with a voxel size, else vx).
     enum TreeColumn {
@@ -355,8 +394,14 @@ private:
     // selects one (or none); Shift+click keeps the last two clicked. Both
     // paint as selected with their control dots; the network glow and the
     // dock row follow the most recent (_highlightedFiber).
-    void setSelectedFibers(std::vector<uint64_t> fibers);
-    void drawControlPointDots(uint64_t fiberId);
+    // `spanSelection`: the fibers were selected for a stretch of them (an
+    // approval row), so the network keeps its plain look, the fibers are not
+    // emphasized whole, and only the stretch's controls are marked.
+    void setSelectedFibers(std::vector<uint64_t> fibers, bool spanSelection = false);
+    // `controlRange`: draw only the dots of that inclusive control range -
+    // the span an approval row selected - instead of the whole fiber's.
+    void drawControlPointDots(uint64_t fiberId,
+                              std::optional<std::pair<std::int64_t, std::int64_t>> controlRange = std::nullopt);
     void updateSelectionStatus();
     // "Link <A> and <B>": the deferred three-phase trigger (see the plan in
     // the header comment of startAutoLink).
@@ -483,12 +528,21 @@ private:
     // Scene-owned overlays of the approval dock: the approved spans (and the
     // fibers approved throughout), and the stretch of the selected row.
     std::vector<QGraphicsItem*> _approvalItems;
+    std::vector<QGraphicsItem*> _highlightSpanItems;
     // The solve the map currently follows (empty: the map's own evidence).
     vc3d::fiber_map::FollowedSolve _followedSolve;
+    // The datasets one Solve click captured, shared by its two openers for
+    // one turn of the event loop.
+    std::shared_ptr<void> _measurementDatasets;
     // Runtime fiber id by store UUID, from the published layout's snapshot:
     // how a stored solve's rows (which name fibers by UUID) reach the map.
     std::map<std::string, uint64_t> _fiberIdByUuid;
     QPushButton* _updateButton = nullptr;
+    // Shown while a rebuild runs: takes it back at its next checkpoint.
+    QPushButton* _cancelUpdateButton = nullptr;
+    // The progress and cancellation of the rebuild in flight, shared with
+    // the worker (the job type itself is private to the .cpp).
+    std::shared_ptr<vc::fiber_graph::ScaffoldRunMonitor> _rebuildMonitor;
     // The dock's search box: a case-insensitive substring filter over each
     // fiber row's label and annotation name, re-applied after every tree
     // rebuild.
@@ -673,7 +727,8 @@ private:
     // which the scaffold solve falls back to when the store's umbilicus does
     // not state one. Unset when the catalog does not orient it.
     std::optional<int> _layoutCatalogHandedness;
-    bool _solvesLoaded = false;
+    // The fiber store the solves list was read from, so a changed store reloads it.
+    std::optional<vc::objects::AttachmentIdentity> _solvesStore;
     // Controller counters as of the build. Compared rather than observed, so that
     // this workspace existing costs annotation work nothing.
     uint64_t _layoutPackageGeneration = 0;
