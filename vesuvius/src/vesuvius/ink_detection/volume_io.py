@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +44,116 @@ def open_volume_root(
     )
 
 
+class PyramidDepthScaleError(ValueError):
+    """A pyramid level's depth disagrees with its declared Z scale."""
+
+
+def _multiscale_entry(root: Any) -> dict[str, Any] | None:
+    attrs = getattr(root, "attrs", None)
+    if not isinstance(attrs, dict):
+        return None
+    multiscales = attrs.get("multiscales") or []
+    if not multiscales or not isinstance(multiscales[0], dict):
+        return None
+    return multiscales[0]
+
+
+def _dataset_by_path(entry: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    found: dict[str, dict[str, Any]] = {}
+    for dataset in entry.get("datasets") or []:
+        if isinstance(dataset, dict) and dataset.get("path") is not None:
+            found[str(dataset["path"])] = dataset
+    return found
+
+
+def _depth_axis(entry: dict[str, Any], rank: int) -> int:
+    for index, axis in enumerate(entry.get("axes") or []):
+        if isinstance(axis, dict) and str(axis.get("name", "")).lower() == "z" and index < rank:
+            return index
+    return 0
+
+
+def _positive_scale_component(dataset: dict[str, Any], axis: int) -> float | None:
+    for transform in dataset.get("coordinateTransformations") or []:
+        if not isinstance(transform, dict):
+            continue
+        scale = transform.get("scale")
+        if not isinstance(scale, (list, tuple)) or axis >= len(scale):
+            continue
+        try:
+            value = float(scale[axis])
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(value) or value <= 0.0:
+            return None
+        return value
+    return None
+
+
+def require_pyramid_depth_scale(
+    root: Any,
+    resolution: int | str,
+    *,
+    source: str = "",
+) -> None:
+    """Reject a level whose depth does not match its declared Z scale.
+
+    A Z-scale ratio near 1 says the level kept every depth slice and only
+    changed the in-plane sampling. A larger ratio says depth was pooled by
+    about that factor. Published ink volumes that declare a Z scale of 1
+    while storing only a prefix of the stack (issue 2107) are refused here.
+    Missing multiscale metadata is left unchanged, and this does not rebuild
+    a published pyramid.
+    """
+
+    if hasattr(root, "shape"):
+        return
+    entry = _multiscale_entry(root)
+    if entry is None:
+        return
+    datasets = _dataset_by_path(entry)
+    level = str(resolution)
+    reference_name = "0" if "0" in datasets else next(iter(datasets), "")
+    if not reference_name or level == reference_name or level not in datasets:
+        return
+    try:
+        reference = root[reference_name]
+        selected = root[level]
+    except KeyError:
+        return
+    reference_shape = tuple(int(value) for value in reference.shape)
+    selected_shape = tuple(int(value) for value in selected.shape)
+    if len(reference_shape) < 1 or len(reference_shape) != len(selected_shape):
+        return
+    axis = _depth_axis(entry, len(reference_shape))
+    reference_scale = _positive_scale_component(datasets[reference_name], axis)
+    selected_scale = _positive_scale_component(datasets[level], axis)
+    if reference_scale is None or selected_scale is None:
+        return
+    ratio = selected_scale / reference_scale
+    reference_depth = reference_shape[axis]
+    selected_depth = selected_shape[axis]
+    where = f" of {source}" if source else ""
+    if abs(ratio - 1.0) <= 1e-3:
+        if selected_depth != reference_depth:
+            raise PyramidDepthScaleError(
+                f"Pyramid level {level}{where} has depth {selected_depth}, "
+                f"but level {reference_name} has depth {reference_depth} and "
+                f"the declared Z scale ratio is {ratio:.6g}. A ratio near 1 "
+                "keeps every depth slice. Rebuild this level from the full stack."
+            )
+        return
+    expected = reference_depth / ratio
+    tolerance = max(1.0, 0.08 * expected)
+    if abs(selected_depth - expected) > tolerance:
+        raise PyramidDepthScaleError(
+            f"Pyramid level {level}{where} has depth {selected_depth}; the "
+            f"declared Z scale ratio {ratio:.6g} against level {reference_name} "
+            f"depth {reference_depth} expects about {expected:.4g}. Rebuild "
+            "this level from the full stack, or correct its Z scale."
+        )
+
+
 def select_volume_level(
     root: Any,
     resolution: int | str,
@@ -59,6 +170,7 @@ def select_volume_level(
                 f"in zarr array {source!r})"
             )
         return root
+    require_pyramid_depth_scale(root, resolution, source=source)
     try:
         return root[str(resolution)]
     except KeyError as exc:
