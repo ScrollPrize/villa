@@ -36,9 +36,9 @@ if(VC_READER_ENABLE_CUDA)
 endif()
 
 
+find_package(nlohmann_json CONFIG REQUIRED)
 include(cmake/NativeTargets.cmake)
 add_subdirectory(third_party/volcomp)
-find_package(nlohmann_json CONFIG REQUIRED)
 find_package(CURL REQUIRED)
 find_package(ZLIB REQUIRED)
 find_package(SQLite3 3.24 REQUIRED)
