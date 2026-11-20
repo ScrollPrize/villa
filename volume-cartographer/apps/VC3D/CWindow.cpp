@@ -2960,6 +2960,17 @@ void CWindow::CreateWidgets(void)
     _surfaceRotationOverlay->setSaver([this](QuadSurface* surface) {
         return _segmentationModule && _segmentationModule->saveSurface(surface);
     });
+    // Apply saves only over the stored revision Rotate was opened on.
+    _surfaceRotationOverlay->setRevisionReader([this](const std::string& id) -> std::optional<std::string> {
+        const auto* row = _surfaceCatalog ? _surfaceCatalog->row(id) : nullptr;
+        if (!row) return std::nullopt;
+        try {
+            const auto head = _surfaceCatalog->session()->currentObject(row->source, id);
+            return head ? std::optional(head->uuid) : std::nullopt;
+        } catch (const std::exception&) {
+            return std::nullopt;
+        }
+    });
     _surfaceRotationOverlay->setViewerManager(_viewerManager.get());
 
     _segmentationModule = std::make_unique<SegmentationModule>(
