@@ -114,9 +114,11 @@ def open_volume_levels(path: str) -> list:
 def by_z_range(array):
     """Whether a box of `array` can be read as byte ranges: a zarr v2 array behind fsspec
     whose chunks are stored raw (no compressor, no filter) in C order. Then the planes
-    z0..z1 of a chunk are one contiguous run of bytes."""
+    z0..z1 of a chunk are one contiguous run of bytes. zarr 3 has no FSStore, so there
+    every box is read through zarr."""
+    fsstore = getattr(zarr.storage, "FSStore", None)
     store = getattr(array, "store", None)
-    return (isinstance(store, zarr.storage.FSStore) and array._compressor is None
+    return (fsstore is not None and isinstance(store, fsstore) and array._compressor is None
             and not array._filters and array.order == "C")
 
 
