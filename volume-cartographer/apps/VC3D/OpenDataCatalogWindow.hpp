@@ -69,6 +69,8 @@ private:
         vcr::catalog::OpenDataManifest manifest;
         QString sourceLabel;
         QString error;
+        // The manifest is not the one in the catalog cache file.
+        bool browseOnly = false;
     };
 
     struct PhotoLoadResult {
@@ -80,7 +82,10 @@ private:
 
     void buildUi();
     void loadCachedManifestIfAvailable();
-    void applyManifest(vcr::catalog::OpenDataManifest manifest, QString sourceLabel, bool fromCache);
+    void applyManifest(vcr::catalog::OpenDataManifest manifest, QString sourceLabel, bool fromCache,
+                       bool browseOnly = false);
+    // Opening and populating projects reads the catalog cache file, so it must be the catalog shown.
+    [[nodiscard]] bool projectActionsReady() const;
     void setStatus(const QString& text);
     void setLoading(bool loading);
     void populateSamples();
@@ -132,6 +137,7 @@ private:
     std::vector<std::size_t> _visibleSampleIndexes;
     QFutureWatcher<ManifestLoadResult>* _fetchWatcher{nullptr};
     bool _manifestRefreshPending{false};
+    bool _browseOnly{false};
     std::vector<QFutureWatcher<PhotoLoadResult>*> _photoWatchers;
     QString _pendingPhotoSampleId;
     std::function<bool(const vcr::catalog::OpenDataSample&)> _openSampleHandler;

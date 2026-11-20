@@ -427,7 +427,7 @@ void OpenDataCatalogWindow::setRefreshSampleHandler(RefreshSampleHandler handler
 
 void OpenDataCatalogWindow::createSelectedProject()
 {
-    if (_manifestRefreshPending || !selectedSample() || !_createProjectHandler) return;
+    if (!projectActionsReady() || !selectedSample() || !_createProjectHandler) return;
     // Snapshot indices and metadata while the modal dialog is open.
     const auto sample = *selectedSample();
     const auto remoteRoot = vc3d::remoteCachePathFs();
@@ -823,7 +823,7 @@ void OpenDataCatalogWindow::buildUi()
     connect(_attachRepresentationButton, &QPushButton::clicked, this, [this]() {
         const auto* sample = selectedSample();
         const auto ref = selectedRepresentation();
-        if (_manifestRefreshPending || !sample || !ref || !_attachRepresentationHandler ||
+        if (!projectActionsReady() || !sample || !ref || !_attachRepresentationHandler ||
             !canAttachRepresentation(*sample, *ref))
             return;
         // The full sample gives the attach its catalog context (source volumes,
@@ -880,6 +880,7 @@ void OpenDataCatalogWindow::reloadManifest()
             auto loaded = vcr::catalog::loadCatalog(manifestUrl,
                 {vcr::catalog::catalogCacheFile(std::string(vcr::catalog::kDefaultManifestUrl)), true});
             result.manifest = std::move(loaded.manifest);
+            result.browseOnly = !loaded.onDisk;
             if (loaded.fromCache) result.sourceLabel += QStringLiteral(" (cached)");
             if (!loaded.warning.empty()) result.sourceLabel += QStringLiteral(": ") + QString::fromStdString(loaded.warning);
         } catch (const std::exception& e) {
@@ -908,7 +909,7 @@ void OpenDataCatalogWindow::onFetchFinished()
         return;
     }
 
-    applyManifest(result.manifest, result.sourceLabel, false);
+    applyManifest(result.manifest, result.sourceLabel, false, result.browseOnly);
 }
 
 void OpenDataCatalogWindow::loadCachedManifestIfAvailable()
@@ -923,14 +924,25 @@ void OpenDataCatalogWindow::loadCachedManifestIfAvailable()
         setStatus(tr("Could not parse cached open-data manifest %1").arg(qstr(path.string())));
 }
 
-void OpenDataCatalogWindow::applyManifest(vcr::catalog::OpenDataManifest manifest, QString sourceLabel, bool fromCache)
+void OpenDataCatalogWindow::applyManifest(vcr::catalog::OpenDataManifest manifest, QString sourceLabel, bool fromCache,
+                                          bool browseOnly)
 {
     _manifest = std::move(manifest);
+    _browseOnly = browseOnly;
     populateSamples();
-    setStatus(tr("%1 catalog: %2 samples. Source: %3")
-                  .arg(fromCache ? tr("Cached") : tr("Live"))
-                  .arg(_manifest->samples.size())
-                  .arg(sourceLabel));
+    auto status = tr("%1 catalog: %2 samples. Source: %3")
+                      .arg(fromCache ? tr("Cached") : tr("Live"))
+                      .arg(_manifest->samples.size())
+                      .arg(sourceLabel);
+    if (_browseOnly)
+        status += tr(". Browse only: projects cannot be opened or changed until the catalog can be cached.");
+    setStatus(status);
+    updateActionButtons();
+}
+
+bool OpenDataCatalogWindow::projectActionsReady() const
+{
+    return !_manifestRefreshPending && !_browseOnly;
 }
 
 void OpenDataCatalogWindow::setStatus(const QString& text)
@@ -1337,12 +1349,13 @@ QString OpenDataCatalogWindow::selectedSegmentUrl() const
 void OpenDataCatalogWindow::updateActionButtons()
 {
     const bool manifestReady = !_manifestRefreshPending;
+    const bool projectReady = projectActionsReady();
     const bool hasVolumeUrl = !selectedVolumeUrl().isEmpty();
     const bool hasRepresentationUrl = !selectedRepresentationUrl().isEmpty();
     if (_attachRepresentationButton) {
         const auto* sample = selectedSample();
         const auto representation = selectedRepresentation();
-        _attachRepresentationButton->setEnabled(manifestReady && sample && representation &&
+        _attachRepresentationButton->setEnabled(projectReady && sample && representation &&
                                                 bool(_attachRepresentationHandler) &&
                                                 canAttachRepresentation(*sample, *representation));
     }
@@ -1352,14 +1365,14 @@ void OpenDataCatalogWindow::updateActionButtons()
     const auto remoteRoot = vc3d::remoteCachePathFs();
     const bool canOpenSample = sample != nullptr &&
                                static_cast<bool>(_openSampleHandler) &&
-                               manifestReady;
+                               projectReady;
     if (_openSampleButton) {
         _openSampleButton->setEnabled(canOpenSample);
     }
     if (_createProjectButton)
-        _createProjectButton->setEnabled(manifestReady && sample && bool(_createProjectHandler));
+        _createProjectButton->setEnabled(projectReady && sample && bool(_createProjectHandler));
     if (_refreshSampleButton)
-        _refreshSampleButton->setEnabled(manifestReady && sample && sample->surfaceSegmentCount() > 0 &&
+        _refreshSampleButton->setEnabled(projectReady && sample && sample->surfaceSegmentCount() > 0 &&
                                          bool(_refreshSampleHandler));
     if (_downloadNormalGridsButton) {
         const auto* volume = selectedVolume();
@@ -1404,7 +1417,7 @@ void OpenDataCatalogWindow::updateActionButtons()
 void OpenDataCatalogWindow::openSelectedSample()
 {
     const auto* sample = selectedSample();
-    if (_manifestRefreshPending || !sample || !_openSampleHandler) {
+    if (!projectActionsReady() || !sample || !_openSampleHandler) {
         return;
     }
     if (_openSampleHandler(*sample)) {
@@ -1582,7 +1595,7 @@ void OpenDataCatalogWindow::openSelectedSegmentUrl()
 void OpenDataCatalogWindow::refreshSelectedSample()
 {
     const auto* sample = selectedSample();
-    if (!sample || !_refreshSampleHandler) return;
+    if (!projectActionsReady() || !sample || !_refreshSampleHandler) return;
     setStatus(tr("Refreshing %1 from Open Data...").arg(qstr(sample->id)));
     setStatus(_refreshSampleHandler(*sample));
 }
