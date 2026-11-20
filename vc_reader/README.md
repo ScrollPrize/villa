@@ -194,7 +194,7 @@ included as `vc_reader/native/<file>`. They have no stability guarantee beyond t
 | Symmetric eigendecomposition | `symmetric_eigen.hpp` |
 | LRU storage, [shared reader scheduling](docs/reader-scheduling.md), owned chunk bytes, reused output buffers and [worker-local decoder scratch/contexts](docs/decoder-scratch.md) | `lru.hpp`, `thread_pool.hpp`, `chunk_buffer.hpp`, `output_pool.hpp`, `scratch_pool.hpp`, `decoder_context.hpp` |
 | Atomic file writes | `atomic_file.hpp` |
-| Portable file I/O (open, pread, fstat, mmap, file locks, rename-over, temp dirs) on POSIX and Windows; headers must not include `<windows.h>` | `platform_io.hpp` (Windows bodies in `platform_io.cpp`) |
+| Portable file I/O (open, pread, fstat, mmap, file locks, rename-over, temp dirs) and the user's home directory, on POSIX and Windows; headers must not include `<windows.h>` | `platform_io.hpp` (Windows bodies in `platform_io.cpp`) |
 | OME storage transforms | `storage_transform.hpp` |
 | Percentile, median, histogram, Fourier, elastic field and resize helpers shared by CPU and CUDA transforms | `transforms/shared/` |
 
