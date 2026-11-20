@@ -150,3 +150,60 @@ def test_predict_keeps_normals_with_default_tta(tmp_path, monkeypatch):
     length = np.sqrt((with_tta[2:5] ** 2).sum(0))[mask]
     assert length.mean() > 0.99, f"TTA normals have mean length {length.mean():.3f}"
     assert np.abs(with_tta[2:5] - without[2:5])[:, mask].max() < 1e-2  # float16 blend
+
+
+def _run_helper(helper, model, x, targets, groups):
+    kwargs = dict(is_multi_task=True, concat_multi_task_outputs=_concat(targets), channel_groups=groups)
+    with torch.inference_mode():
+        if helper == "batched":
+            return tta.infer_with_tta_batched_3d(model, x, **kwargs)
+        return tta.infer_with_tta_sequential(model, x, "mirroring", **kwargs)
+
+
+@pytest.mark.parametrize("helper", ["batched", "sequential"])
+def test_half_precision_sign_alignment_keeps_small_directions(helper):
+    """CUDA inference runs under autocast: the heads come out in float16. Opposite in-plane
+    vectors of length 1e-4 have a float16 product that rounds to zero."""
+    targets = {name: TARGETS[name] for name in ("surface", "direction")}
+    groups = tta.tta_channel_groups(targets, _target_info(targets), 3)
+
+    def model(x):  # the x axis in every mirrored frame, at length 1e-4
+        direction = torch.zeros(x.shape[0], 3, *x.shape[2:], dtype=torch.float16)
+        direction[:, 0] = 1e-4
+        return {"surface": x.repeat(1, 2, 1, 1, 1).half(), "direction": direction}
+
+    out = _run_helper(helper, model, torch.rand(1, 1, 4, 4, 4), targets, groups)
+    assert out.dtype == torch.float16
+    assert torch.allclose(out[:, 2:5].float(), torch.tensor([1e-4, 0.0, 0.0]).view(1, 3, 1, 1, 1),
+                          rtol=0, atol=1e-6), f"x component {out[0, 2].float().mean():.6f}"
+
+
+def _peak_bytes(fn):
+    """Peak bytes of the CPU tensors fn() allocates, from torch.profiler's allocation events."""
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU], profile_memory=True) as prof:
+        fn()
+    live = peak = 0
+    for event in sorted(prof.events(), key=lambda e: e.time_range.start):
+        live += event.self_cpu_memory_usage
+        peak = max(peak, live)
+    return peak
+
+
+@pytest.mark.parametrize("helper", ["batched", "sequential"])
+@pytest.mark.parametrize("head", ["normals", "direction"])
+def test_component_transform_keeps_peak_memory(helper, head):
+    """Undoing the component change works on the variants in place: no extra full-size copies
+    of the output beyond what the plain mirroring average already holds."""
+    targets = {name: TARGETS[name] for name in ("surface", head)}
+    groups = tta.tta_channel_groups(targets, _target_info(targets), 3)
+
+    def model(x):
+        y = x.half()
+        return {"surface": torch.cat([y, -y], dim=1), head: torch.cat([y, -y, y], dim=1)}
+
+    x = torch.rand(1, 1, 32, 32, 32)
+    variant = 5 * 32 ** 3 * 2  # one float16 output of 5 channels
+    plain = _peak_bytes(lambda: _run_helper(helper, model, x, targets, None))
+    transformed = _peak_bytes(lambda: _run_helper(helper, model, x, targets, groups))
+    assert transformed - plain < variant, f"{(transformed - plain) / variant:.1f} extra output copies"
+

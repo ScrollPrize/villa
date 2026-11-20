@@ -45,6 +45,7 @@ def tta_channel_groups(targets, target_info, spatial_dims: int):
 def _undo_component_change(output: torch.Tensor, channel_groups, flipped=(), swapped=None) -> torch.Tensor:
     """Bring the components of an un-flipped / un-transposed variant back to the input frame.
 
+    Works in place on `output` (a TTA variant the caller owns), so no full-size copy is made.
     `flipped`: the spatial dims the input was mirrored over (a component along one of
     them changes sign). `swapped`: the pair of spatial dims the input was transposed over
     (components along them trade places).
@@ -56,37 +57,51 @@ def _undo_component_change(output: torch.Tensor, channel_groups, flipped=(), swa
     if swapped is not None:
         a, b = swapped
         sigma = {a: b, b: a}
-    perm = list(range(output.shape[1]))
-    negate = []
+    targets, sources = [], []
     for group in channel_groups:
         channels = group['channels']
         for key, ch in channels.items():
             if sum(axis in flipped for axis in key) % 2:
-                negate.append(ch)
+                output[:, ch].neg_()
             if sigma:
                 source = tuple(sigma.get(axis, axis) for axis in key)
-                perm[ch] = channels[source] if source in channels else channels[source[::-1]]
-    if negate:
-        output = output.clone()
-        output[:, negate] = -output[:, negate]
-    if sigma:
-        output = output[:, perm]
+                source = channels[source] if source in channels else channels[source[::-1]]
+                if source != ch:
+                    targets.append(ch)
+                    sources.append(source)
+    if targets:
+        # copies only the swapped channels
+        output[:, targets] = output[:, sources]
     return output
 
 
+def _dot32(a: torch.Tensor, b: torch.Tensor, channels) -> torch.Tensor:
+    """Per-voxel dot product of a and b over `channels`, in float32: half-precision products
+    of small components underflow to zero. One channel at a time, so temporaries stay small."""
+    dot = None
+    for ch in channels:
+        term = a[:, ch].float() * b[:, ch].float()
+        dot = term if dot is None else dot.add_(term)
+    return dot
+
+
+def _flip_where(output: torch.Tensor, channels, negative: torch.Tensor) -> None:
+    """Negate `channels` of `output` in place where `negative` is True."""
+    sign = 1 - 2 * negative.to(output.dtype)
+    for ch in channels:
+        output[:, ch].mul_(sign)
+
+
 def _average_variants(variants, channel_groups) -> torch.Tensor:
-    """Mean of the TTA variants; sign-ambiguous directions are first aligned with the first variant."""
+    """Mean of the TTA variants (a list, or a tensor stacked on dim 0); sign-ambiguous directions
+    are first aligned with the first variant, in place."""
     axial = [list(g['channels'].values()) for g in (channel_groups or []) if g['kind'] == 'axial']
-    if axial:
+    for chs in axial:
         reference = variants[0]
-        aligned = [reference]
         for variant in variants[1:]:
-            variant = variant.clone()
-            for chs in axial:
-                dot = (variant[:, chs] * reference[:, chs]).sum(dim=1, keepdim=True)
-                variant[:, chs] = torch.where(dot < 0, -variant[:, chs], variant[:, chs])
-            aligned.append(variant)
-        variants = aligned
+            _flip_where(variant, chs, _dot32(variant, reference, chs) < 0)
+    if torch.is_tensor(variants):
+        return variants.mean(dim=0)
     return torch.mean(torch.stack(list(variants), dim=0), dim=0)
 
 
@@ -149,9 +164,9 @@ def infer_with_tta_batched_3d(model, inputs: torch.Tensor,
 
     if channel_groups:
         flips = [(), (-1,), (-2,), (-3,), (-1, -2), (-1, -3), (-2, -3), (-1, -2, -3)]
-        return _average_variants(
-            [_undo_component_change(outputs[k], channel_groups, flipped=f) for k, f in enumerate(flips)],
-            channel_groups)
+        for k, f in enumerate(flips):
+            _undo_component_change(outputs[k], channel_groups, flipped=f)
+        return _average_variants(outputs, channel_groups)
 
     # Average across augmentations
     return outputs.mean(dim=0)
@@ -193,9 +208,9 @@ def infer_with_tta_batched_2d(model, inputs: torch.Tensor,
 
     if channel_groups:
         flips = [(), (-1,), (-2,), (-2, -1)]
-        return _average_variants(
-            [_undo_component_change(outputs[k], channel_groups, flipped=f) for k, f in enumerate(flips)],
-            channel_groups)
+        for k, f in enumerate(flips):
+            _undo_component_change(outputs[k], channel_groups, flipped=f)
+        return _average_variants(outputs, channel_groups)
 
     return outputs.mean(dim=0)
 
@@ -246,7 +261,8 @@ def infer_with_tta_sequential(model,
                 torch.flip(m6, dims=[-2, -3]),
                 torch.flip(m7, dims=[-1, -2, -3])
             ]
-            outputs = [_undo_component_change(o, channel_groups, flipped=f) for o, f in zip(outputs, flips)]
+            for o, f in zip(outputs, flips):
+                _undo_component_change(o, channel_groups, flipped=f)
             return _average_variants(outputs, channel_groups)
         else:  # 2D flips over H and W
             m0 = model(inputs)
@@ -266,7 +282,8 @@ def infer_with_tta_sequential(model,
                 torch.flip(m2, dims=[-2]),
                 torch.flip(m3, dims=[-2, -1])
             ]
-            outputs = [_undo_component_change(o, channel_groups, flipped=f) for o, f in zip(outputs, flips)]
+            for o, f in zip(outputs, flips):
+                _undo_component_change(o, channel_groups, flipped=f)
             return _average_variants(outputs, channel_groups)
 
     else:  # rotation
