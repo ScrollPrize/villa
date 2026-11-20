@@ -265,6 +265,10 @@ class Catalog:
                 distance = float(np.linalg.norm(delta))
                 if distance > GAP_CAP:
                     continue
+                # Too short to give a direction, but the bridge must not step back along either end segment.
+                if distance < .25 and (np.dot(delta, pa[-1]-pa[-2] if ea else pa[0]-pa[1]) < 0 or
+                                       np.dot(delta, pb[-1]-pb[-2] if eb else pb[0]-pb[1]) > 0):
+                    continue
                 direction = delta / distance if distance >= .25 else np.asarray(ta[ea]['tangent'])
                 ca = float(np.dot(ta[ea]['tangent'], direction))
                 cb = float(np.dot(tb[eb]['tangent'], -direction))
