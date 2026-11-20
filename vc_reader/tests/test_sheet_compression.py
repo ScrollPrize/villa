@@ -36,6 +36,11 @@ def source(strength):
     return Z + strength * np.cumsum(SHEET_ID == 0)
 
 
+def ramp_after(coordinate):
+    """The ramp linearly sampled at `coordinate`, with the fill (0) beyond the volume."""
+    return np.interp(coordinate, np.r_[Z, LENGTH], np.r_[RAMP, 0], right=0)
+
+
 def centroids(profile):
     """Intensity-weighted centroids of the runs above .5."""
     edges = np.flatnonzero(np.diff(np.r_[0, profile > .5, 0]))
@@ -63,8 +68,8 @@ def run(backend, strength=.35, padding=None, lateral=8, smoothing=0, **options):
 def test_sampling_coordinate_is_in_voxels_and_moves_forward(backend, strength, options):
     out = run(backend, strength, **options)
     ramp, mask, outside = out['ramp'], out['padding_mask'], source(strength) > LENGTH - 1
-    np.testing.assert_allclose(ramp, np.minimum(source(strength), LENGTH - 1), atol=1e-3)
-    assert (ramp >= Z - 1e-3).all() and ramp[LENGTH // 2] > LENGTH // 2 + 1
+    np.testing.assert_allclose(ramp, ramp_after(source(strength)), rtol=1e-4, atol=1e-3)
+    assert (ramp[~outside] >= Z[~outside] - 1e-3).all() and ramp[LENGTH // 2] > LENGTH // 2 + 1
     # The tail pulled in from outside the volume is marked invalid and blank.
     assert outside.sum() > 5 and abs(int(mask.size - mask.sum()) - int(outside.sum())) <= 1
     assert (mask[:10] == 1).all() and (mask[-3:] == 0).all()
@@ -77,7 +82,7 @@ def test_every_axis_gives_the_same_closed_form_in_3d_and_2d(backend, dims, axes,
     sample = {'image': along((SHEET_ID > 0).astype(np.float32), position, dims), 'ramp': along(RAMP, position, dims)}
     out = compress(sample, {'image': A.Image(), 'ramp': A.ScalarField()}, backend, axes=axes)
     columns = np.moveaxis(out['ramp'], 1 + position, 1).reshape(LENGTH, -1)
-    np.testing.assert_allclose(columns, np.broadcast_to(np.minimum(source(.35), LENGTH - 1)[:, None], columns.shape), atol=1e-3)
+    np.testing.assert_allclose(columns, np.broadcast_to(ramp_after(source(.35))[:, None], columns.shape), rtol=1e-4, atol=1e-3)
 
 
 @cases
@@ -109,6 +114,16 @@ def test_image_labels_and_validity_stay_aligned_with_padding(backend, strength):
 
 
 @backends
+def test_the_tail_beyond_the_volume_is_padding_without_a_mask(backend):
+    end = FIRST + PERIOD * (SHEETS - 1) + 2  # The volume ends inside the last sheet.
+    image, ids = (a[:, :end].copy() for a in phantom())
+    out = compress({'image': image, 'seg': ids}, {'image': A.Image(), 'seg': A.Label()}, backend)
+    beyond = source(.35)[:end] >= end
+    assert beyond.sum() > 5 and out['seg'][0, :, 4, 4].max() == SHEETS
+    assert (out['image'][0, beyond] == 0).all() and (out['seg'][0, beyond] == 0).all()
+
+
+@backends
 def test_smoothing_leaves_a_laterally_uniform_volume_unchanged(backend):
     plain, smooth = (run(backend, lateral=16, smoothing=s) for s in (0, 2))
     for key in ('image', 'ramp', 'padding_mask'):
@@ -122,10 +137,11 @@ def test_smoothing_blurs_the_displacement_across_the_axis_only(backend):
     image = phantom(16)[0]
     image[..., 8:] = 1  # Right half is solid: no gaps, no displacement.
     field = ndimage.gaussian_filter(.35 * np.cumsum(1 - image.astype(np.float64), axis=1), (0, 0, 2, 2), mode='mirror', truncate=6)
-    expected = np.clip(Z.reshape(1, -1, 1, 1) + field, 0, LENGTH - 1)
+    expected = Z.reshape(1, -1, 1, 1) + field
     out = compress({'image': image, 'ramp': along(RAMP, lateral=16)}, {'image': A.Image(), 'ramp': A.ScalarField()},
                    backend, smoothing=2)
-    np.testing.assert_allclose(out['ramp'], expected, atol=.05)  # Kernel truncation differs by ~.02.
+    inside = expected <= LENGTH - 1
+    np.testing.assert_allclose(out['ramp'][inside], expected[inside], atol=.05)  # Kernel truncation differs by ~.02.
     assert abs(expected[0, 80, :, 7] - expected[0, 80, :, 8]).max() > 0
 
 

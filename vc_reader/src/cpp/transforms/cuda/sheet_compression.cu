@@ -33,7 +33,7 @@ Parameters sample_sheet(const SheetCompression& t,const Sample& s,Random& r,bool
     if(smooth>.5) {std::vector<double> sigmas(d,smooth);sigmas[chosen]=0;blur(data,g,sigmas,6,Boundary::Mirror,true);}
     auto field=std::make_shared<Buffer<float>>(g.size*d);
     launch(blocks(g.size),256,0,vcr::device::stream(), compression_field_launch{}, values.ptr,field->ptr,Layout(g),int(chosen));
-    check(cudaGetLastError());p.device_field=field;p.border=true;
+    check(cudaGetLastError());p.device_field=field;
     if(record) {p.field.resize(field->size);field->download(p.field.data());}
     };
     if (image.bytes==4) build.template operator()<float>(); else build.template operator()<double>();
