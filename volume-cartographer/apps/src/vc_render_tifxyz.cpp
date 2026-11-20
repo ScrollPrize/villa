@@ -584,6 +584,24 @@ static bool mergeTiffParts(const std::string& outputPath, int numParts)
         return false;
     }
 
+    bool complete = true;
+    for (const auto& [finalPath, partFiles] : groups) {
+        if (partFiles.size() != std::size_t(numParts)) {
+            logPrintf(stderr, "Cannot merge %s: expected %d parts, found %zu.\n",
+                      finalPath.filename().string().c_str(), numParts, partFiles.size());
+            complete = false;
+        }
+        for (int part = 0; part < numParts; ++part) {
+            const auto expected = finalPath.parent_path() /
+                (finalPath.stem().string() + ".part" + std::to_string(part) + ".tif");
+            if (!std::filesystem::is_regular_file(expected)) {
+                logPrintf(stderr, "Missing TIFF part: %s\n", expected.filename().string().c_str());
+                complete = false;
+            }
+        }
+    }
+    if (!complete) return false;
+
     logPrintf(stdout, "Merging %zu TIFF(s) from %d parts...\n", groups.size(), numParts);
     size_t failures = 0;
     for (auto& [finalPath, partFiles] : groups) {
