@@ -73,8 +73,9 @@ S3 paths containing `vesuvius-challenge-open-data` use anonymous access;
 HTTPS volumes may use the username/password JSON selected by
 `volume_auth_json`.
 
-The optional on-disk compressed-chunk cache requires Zarr 3. Set
-`volume_cache_dir` for training, or `--cache-dir` for native inference.
+Volume reads and disk caching use `vc_reader`, which supports Zarr v2 and v3
+without the Python `zarr` package. Set `volume_cache_dir` for training, or
+`--cache-dir` for native inference.
 Flat inference opens its input directly: it never reads `volume_auth_json`,
 `volume_cache_dir`, or `volume_cache_max_gb` from the checkpoint-embedded
 config, so published checkpoints whose embedded paths do not exist on the
@@ -82,21 +83,19 @@ local machine still run. Model artifacts are the one exception: a checkpoint
 whose `model_config.pretrained_backbone` names a checkpoint path or a
 downloadable backbone is resolved during model construction, exactly as in
 training (the published `ink_9um` checkpoints embed no backbone reference).
-Uncached volume reads remain supported with Zarr 2.18.7 and Zarr 3;
-the package dependency range remains `zarr>=2.18.7,<4`. Each authored volume
-path receives its own hashed subdirectory, so
-`volume_cache_max_gb` and `--cache-max-gb` are decimal-GB budgets per volume,
-not totals across the cache root.
 
-When a volume opens with a budget, the code scans that volume's cache
-subdirectory once. An over-budget directory is pruned oldest-mtime-first to at
-most 90% of the budget; an at- or under-budget directory is left alone. Zarr's
-CacheStore then applies a process-local steady-state LRU. Multiple workers may
-share the directory safely because LocalStore installs complete values
-atomically, but independent process accounting means the directory can briefly
-overshoot its budget before a later open-time sweep. Every process constructs
-its own source store after it starts; a remote fsspec store is never inherited
-as the active transport across a fork.
+`volume_cache_max_gb` and `--cache-max-gb` are decimal-GB budgets for cached
+chunk payloads, shared across arrays in the same cache root, including different
+volumes and pyramid levels. The native reader coordinates the budget across
+processes through SQLite and evicts the oldest writes first. Metadata and the
+cache index are outside this budget; it is not a limit on the directory's total
+size.
+
+New caches store decoded chunks, so their disk usage can exceed the compressed
+download size. Existing supported caches can be reused in their stored format.
+Without a cache directory, reads still work but do not create this disk cache. See the
+[`vc_reader` cache API](../../vc_reader/src/vc_reader/reader/disk_cache.py) for
+the supported layouts and VC3D cache integration.
 
 ## Shipped aligned-corpus configs
 
