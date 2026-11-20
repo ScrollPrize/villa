@@ -12,21 +12,21 @@ direction, its bend is flipped); a chain shorter than --ext is reflected again a
 reached. The tracer's end trim then removes about the mirrored part, and split.py drops every remaining mirrored or
 joint column and cuts the chain strips back into one strip per piece.
 
-  PIECES.vcobj             one fiber per piece, '<name>#piece<k>' (what the split strips refer to)
-  CHAINS.vcobj             one fiber per chain with its extensions, '<name>#chain<c>' (what infer_all traces)
-  CHAINS.vcobj.joined.json per chain: its pieces' [start, end] point indices and the extension ranges ('ext')
+  PIECES.vcobj  one fiber per piece, '<name>#piece<k>' (what the split strips refer to)
+  CHAINS.vcobj  one fiber per chain with its extensions, '<name>#chain<c>' (what infer_all traces)
 
---join and --ext are in patch voxels; stores hold volume voxels (--level-scale volume voxels per patch voxel).
+A chain's ``meta.gap_strips`` records, besides its source: ``pieces`` (per piece its UUID, number and inclusive
+[start, end] point indices in the chain), ``ext`` (the inclusive point index ranges of the extensions) and
+``level_scale``. --join and --ext are in patch voxels; stores hold volume voxels, --level-scale volume voxels per
+patch voxel, which must be the scale infer_all traces at (its --ct-grid-scale).
 """
 import argparse
-import json
 
 import numpy as np
 
-from vesuvius.neural_tracing.tracers.fibers.sheet_strip.gap_strips.pieces import piece_rows
-from vesuvius.neural_tracing.tracers.fibers.sheet_strip.gap_strips.spans import (
-    derived_id, fiber_row, pieces_of, read_annotated, read_only_list)
-from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import write_fibers
+from vesuvius.neural_tracing.tracers.fibers.sheet_strip.gap_strips.pieces import (
+    add_source_arguments, piece_row, pieces_or_exit, read_source, write_derived)
+from vesuvius.neural_tracing.tracers.fibers.sheet_strip.gap_strips.spans import derived_id, fiber_row
 
 
 def arclen(points):
@@ -34,20 +34,26 @@ def arclen(points):
 
 
 def extension(points, length):
-    """Points beyond points[-1] (moving away from the line), by repeated point reflection, cut at ``length`` of
-    arclength (the units of ``points``)."""
+    """Points beyond points[-1] (moving away from the line) by repeated point reflection, ``length`` of arclength
+    long (the units of ``points``): the last point is cut to that length exactly."""
+    if not np.isfinite(length) or length < 0:
+        raise ValueError('The extension length must be finite and not negative')
     out, S, have = [], points, 0.0
-    if len(points) < 2:
+    if len(points) < 2 or not arclen(points) > 0 or length == 0:
         return np.zeros((0, 3))
     while have < length:
         R = 2*S[-1]-S[::-1][1:]  # S reflected through its last point, ordered outward
         prev = S[-1]
         for q in R:
-            have += float(np.linalg.norm(q-prev))
+            step = float(np.linalg.norm(q-prev))
+            if have+step >= length:
+                if step > 0:
+                    out.append(prev+(q-prev)*((length-have)/step))
+                have = length
+                break
+            have += step
             prev = q
             out.append(q)
-            if have >= length:
-                break
         S = np.concatenate([S[-1:], R])
     return np.array(out)
 
@@ -83,37 +89,31 @@ def main(argv=None):
     ap.add_argument('source')
     ap.add_argument('pieces_out')
     ap.add_argument('chains_out')
-    ap.add_argument('--only', help='text file of fiber UUIDs or names, one per line')
+    add_source_arguments(ap)
     ap.add_argument('--join', type=float, default=75.0, help='patch voxels: join pieces no farther apart than this')
     ap.add_argument('--ext', type=float, default=80.0, help='patch voxels of mirrored line added at each chain end')
     ap.add_argument('--level-scale', type=float, default=4.0, help='volume voxels per patch voxel')
-    ap.add_argument('--spacing', type=float, default=2.0, help='volume voxels between the written line points')
     a = ap.parse_args(argv)
     scale = a.level_scale
-    volume, fibers = read_annotated(a.source, read_only_list(a.only))
-    chain_rows, chain_log = [], []
-    stats = dict(joins=0, chains=0, shorter_than_ext=0)
+    if not (np.isfinite(scale) and scale > 0 and a.join >= 0 and a.ext >= 0):
+        raise SystemExit('--level-scale must be positive; --join and --ext must not be negative')
+    volume, fibers = read_source(a)
+    piece_rows, chain_rows, joins = [], [], 0
     for fiber in fibers:
-        pieces = pieces_of(fiber, a.spacing)
+        pieces = pieces_or_exit(fiber, a.spacing)
         if not pieces:
             continue
+        piece_rows += [piece_row(piece, fiber['reference']) for piece in pieces]
         for c, chain in enumerate(chains_of(pieces, a.join*scale)):
-            points, spans, ranges, length = extended_chain(chain, a.ext*scale)
+            points, spans, ranges, _ = extended_chain(chain, a.ext*scale)
             entry = dict(id=derived_id(fiber['id'], f'chain{c}'), name=f"{fiber['name']}#chain{c}",
                          family=fiber['family'], source=fiber['id'])
-            chain_rows.append((fiber_row(entry, fiber['reference'], chain=c, pieces=[s['id'] for s in spans],
-                                         join=a.join, ext=a.ext, level_scale=scale), points))
-            chain_log.append(dict(id=entry['id'], name=entry['name'], source=fiber['id'], chain=c, points=len(points),
-                                  length=round(length/scale, 1), pieces=spans, ext=ranges))
-            stats['joins'] += len(chain)-1
-            stats['chains'] += 1
-            stats['shorter_than_ext'] += length < a.ext*scale
-    rows, log = piece_rows(fibers, a.spacing)
-    print(write_fibers(a.pieces_out, rows, volume=volume) | dict(ids=len(rows)))
-    json.dump(log, open(str(a.pieces_out)+'.pieces.json', 'w'), indent=1)
-    print(write_fibers(a.chains_out, chain_rows, volume=volume) | dict(ids=len(chain_rows)))
-    json.dump(chain_log, open(str(a.chains_out)+'.joined.json', 'w'), indent=1)
-    print(f'{len(fibers)} fibers -> {len(rows)} pieces, {len(chain_rows)} chains; {stats}')
+            chain_rows.append((fiber_row(entry, 'chain', fiber['reference'], chain=c, pieces=spans, ext=ranges,
+                                         join=a.join, ext_length=a.ext, level_scale=scale), points))
+            joins += len(chain)-1
+    write_derived(a.pieces_out, piece_rows, volume, 'pieces')
+    write_derived(a.chains_out, chain_rows, volume, 'chains')
+    print(f'{len(fibers)} fibers -> {len(piece_rows)} pieces, {len(chain_rows)} chains ({joins} joins)')
 
 
 if __name__ == '__main__':

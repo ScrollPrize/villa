@@ -1,29 +1,29 @@
-"""Retry fibers for chains infer_all could not seed at their first point.
+"""Retry fibers for chains infer_all could not start.
 
     python -m vesuvius.neural_tracing.tracers.fibers.sheet_strip.gap_strips.retry CHAINS.vcobj RETRY.vcobj ID [ID ...]
 
 The strip of a chain (mirror.py) starts on the mirrored extension, which can lie outside the scanned material; the
 tracer then fails or skips that fiber. The retry fiber is the chain without its leading extension, so the strip starts
 on the fiber's own first point (that end then gets the tracer's normal end trim); the trailing extension is kept.
-UUIDs are unchanged and RETRY.vcobj.joined.json holds the shifted point indices, so split.py works on the retry run
-as on the first one.
+UUIDs and names are unchanged and ``meta.gap_strips`` holds the shifted point indices (and
+``leading_extension_removed``, the number of points cut), so split.py works on the retry run as on the first one.
 """
 import argparse
-import json
 
-from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fiber_volume, read_polylines, write_fibers
+from vesuvius.neural_tracing.tracers.fibers.sheet_strip.gap_strips.pieces import write_derived
+from vesuvius.neural_tracing.tracers.fibers.sheet_strip.gap_strips.spans import META_KEY, read_derived
+from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fiber_volume
 
 
-def without_leading_extension(entry, points):
-    """A chain's joined.json entry and points with the leading mirrored extension cut off."""
-    entry = dict(entry)
-    ext = list(entry['ext'])
+def without_leading_extension(derived, points):
+    """A chain's ``meta.gap_strips`` and points with the leading mirrored extension cut off."""
+    derived = dict(derived)
+    ext = list(derived['ext'])
     cut = ext[0][1]+1 if ext and ext[0][0] == 0 else 0
-    entry['pieces'] = [dict(s, start=s['start']-cut, end=s['end']-cut) for s in entry['pieces']]
-    entry['ext'] = [[lo-cut, hi-cut] for lo, hi in ext if lo >= cut]
-    entry['points'] = len(points)-cut
-    entry['leading_extension_removed'] = cut
-    return entry, points[cut:]
+    derived['pieces'] = [dict(s, start=s['start']-cut, end=s['end']-cut) for s in derived['pieces']]
+    derived['ext'] = [[lo-cut, hi-cut] for lo, hi in ext if lo >= cut]
+    derived['leading_extension_removed'] = cut+derived.get('leading_extension_removed', 0)
+    return derived, points[cut:]
 
 
 def main(argv=None):
@@ -32,15 +32,15 @@ def main(argv=None):
     ap.add_argument('out')
     ap.add_argument('ids', nargs='+')
     a = ap.parse_args(argv)
-    chain_log = {e['id']: e for e in json.load(open(a.chains+'.joined.json'))}
-    rows, log = [], []
-    for row, points in read_polylines(a.chains, a.ids):
-        entry, points = without_leading_extension(chain_log[row['id']], points)
-        meta = {k: v for k, v in row['meta'].items() if k != 'coordinates'}
-        rows.append((dict(id=row['id'], name=row['name'], family=row['family'], meta=meta), points))
-        log.append(entry)
-    print(write_fibers(a.out, rows, volume=fiber_volume(a.chains)) | dict(ids=len(rows)))
-    json.dump(log, open(a.out+'.joined.json', 'w'), indent=1)
+    try:
+        chains = read_derived(a.chains, 'chain', a.ids)
+    except ValueError as error:
+        raise SystemExit(str(error))
+    rows = []
+    for row, points in chains.values():
+        derived, points = without_leading_extension(row['gap_strips'], points)
+        rows.append((dict(id=row['id'], name=row['name'], family=row['family'], meta={META_KEY: derived}), points))
+    write_derived(a.out, rows, fiber_volume(a.chains), 'retry chains')
 
 
 if __name__ == '__main__':
