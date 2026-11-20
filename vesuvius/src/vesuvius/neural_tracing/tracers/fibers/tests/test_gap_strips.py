@@ -281,9 +281,10 @@ def test_fit_patches_thin_strips(tmp_path):
     with pytest.raises(SystemExit, match='not on the strip grid'):
         fit_patches.main([str(run), str(tmp_path/'other')])
     (run/'strips'/'00'/'fiber_1'/'expected_error.tif').unlink()
-    (run/'strips'/'01'/'fiber_2'/'trace.json').write_text('{')
-    with pytest.raises(SystemExit, match='no readable trace.json'):
-        fit_patches.main([str(run), str(tmp_path/'other')])
+    for broken in ('{', 'null', '[]'):
+        (run/'strips'/'01'/'fiber_2'/'trace.json').write_text(broken)
+        with pytest.raises(SystemExit, match='no readable trace.json'):
+            fit_patches.main([str(run), str(tmp_path/'other')])
     (run/'strips'/'01'/'fiber_2'/'y.tif').unlink()
     with pytest.raises(SystemExit, match='not a readable tifxyz'):
         fit_patches.main([str(run), str(tmp_path/'other')])

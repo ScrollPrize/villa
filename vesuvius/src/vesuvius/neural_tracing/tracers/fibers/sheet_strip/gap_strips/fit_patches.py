@@ -51,6 +51,8 @@ def main(argv=None):
             traces.append(json.loads((strip/'trace.json').read_text()))
         except (OSError, ValueError) as error:
             raise SystemExit(f'{strip} has no readable trace.json: {error}')
+        if not isinstance(traces[-1], dict):
+            raise SystemExit(f'{strip} has no readable trace.json: not an object')
     a.patches.mkdir(parents=True)
     s = a.stride
     written = short = dropped = 0
