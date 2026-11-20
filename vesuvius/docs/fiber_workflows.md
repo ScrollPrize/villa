@@ -861,8 +861,10 @@ winding labels are not passed to the combined solve.
 # Enclosure-only constraints and frozen-reference normal signs
 
 The `fiber_eval_enclosures` workflow imports a directory listing of annotated
-fiber JSONs, preserves full `line_points`, and uses the existing native local-event
-extractor and fiber-local normal sweep. It does not fit winding widths or UV.
+fiber JSONs, stores each raw `line_points` with its `control_points` (so readers drop
+the extrapolated tails past the first and last control; catalog lengths are
+annotated lengths), and uses the existing native local-event extractor and
+fiber-local normal sweep. It does not fit winding widths or UV.
 
 Set `sign_alignment: "reference_constraints"` and provide
 `reference_constraint_alignment` (the `fiber_reference_constraint_signs` workflow

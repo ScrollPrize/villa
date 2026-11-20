@@ -45,7 +45,10 @@ def adjacent_step(family_a, family_b):
 
 
 def project_arc(paths, fiber, point):
-    """Arc length of the polyline point nearest ``point`` and its distance."""
+    """Arc length of the polyline point nearest ``point`` and its distance.
+
+    ``paths`` hold annotated lines (PackedPaths drops manual fibers' tails), so
+    an anchor never projects onto extrapolation; one past an end clamps to it."""
     begin, end = int(paths.offset[fiber]), int(paths.offset[fiber + 1])
     xyz = np.asarray(paths.xyz[begin:end], dtype=float)
     arc = np.asarray(paths.keys['arc'][begin:end], dtype=float)

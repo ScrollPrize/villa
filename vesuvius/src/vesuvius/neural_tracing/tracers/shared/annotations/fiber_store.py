@@ -5,6 +5,10 @@ A fiber is identified by its object UUID. Its geometry is the ``line_points`` ar
 ``meta.coordinates`` declares ({volume_uuid, scale_factor}: stored = volume voxel * scale_factor); everything here
 returns volume voxels of one named volume (an open-data volume id, ``open_data_volume``). Fibers not bound to that
 volume are not listed; a fiber without line points is skipped.
+
+Every reader returns the annotated line only (``annotated_line``): a manual fiber's line points past its first and
+last control point are optimizer extrapolation and are dropped, as are their lengths, counts and bounds. Raw lines
+with tails are returned only on explicit request (``raw=True``), for lossless copies and display.
 """
 from collections import OrderedDict
 from collections.abc import Sequence
@@ -18,6 +22,8 @@ import uuid as uuidlib
 import numpy as np
 from vc_object_store import Fiber, ObjectStore, import_initial_records, canonical_uuid, geometry_scale_to_volume, object_reference
 from vc_object_store.derivation import derived_metadata
+from vesuvius.neural_tracing.tracers.shared.annotations.annotated_line import (
+    annotated_line_range, packed_annotated_ranges)
 from vesuvius.neural_tracing.tracers.shared.annotations.repair import ANNOTATION_REPAIR, repair_kinks
 from vesuvius.neural_tracing.tracers.shared.annotations.traced import TracedFiber
 from vesuvius.neural_tracing.tracers.shared.annotations.splits import heldout_ids
@@ -59,17 +65,29 @@ def fiber_catalog(path, volume=None, *, source_version=None):
 
 
 def fiber_point_counts(path, *, source_version=None):
-    """UUID-ordered selected line-point counts without reading XYZ payloads.
+    """UUID-ordered annotated line-point counts, the lengths of read_polyline_arrays' packed lines.
 
-    Descriptor interpretation and retained/current integrity checks are native.
+    Descriptors give the counts of fibers with fewer than two controls (no tails)
+    without reading XYZ; only manual fibers' lines are read to find their tails.
     Frozen evidence may require the same store position on both sides.
     """
     with open_store(path,position=source_version) as store:
         _require_source_version(store, source_version)
+        position = source_version or _source_version(store)
         columns = store.geometry_array_counts('fiber', 'line_points')
-        _require_source_version(store, source_version)
+        controls = store.geometry_array_counts('fiber', 'control_points')
+        _require_source_version(store, position)
     ids = np.frombuffer(columns['uuid_ascii'], dtype='S36').astype('U36')
-    return ids, columns['count']
+    if not np.array_equal(np.frombuffer(controls['uuid_ascii'], dtype='S36').astype('U36'), ids):
+        raise ValueError('Fiber line and control descriptors differ')
+    counts = np.array(columns['count'], dtype=np.int64)
+    manual = np.flatnonzero(np.asarray(controls['count']) >= 2)
+    if len(manual):
+        selected, packed = read_polyline_arrays(path, ids[manual], source_version=position)
+        if not np.array_equal(selected, ids[manual]):
+            raise ValueError('Fiber identity differs')
+        counts[manual] = np.diff(np.asarray(packed.offsets, dtype=np.int64))
+    return ids, counts
 
 
 def fiber_count(path, *, source_version=None):
@@ -96,15 +114,40 @@ def _read_rows(store, records, volume, *, require_lines=True):
             yield from _view_rows(view, volume, require_lines=require_lines)
 
 
-def _view_rows(view, volume, *, require_lines=True):
-    """Adapt selected mapped geometry only for callers requiring row records."""
+def _view_line_ranges(view, nodes, line_offsets):
+    """Annotated ``(begin, end)`` per node, measured in the stored frame (where controls and line are written)."""
+    controls = view.read_geometry_arrays('control_points', nodes=nodes)
+    control_offsets = np.asarray(controls.offsets, dtype=np.int64)
+    manual = np.flatnonzero(np.diff(control_offsets) >= 2)
+    begin = np.zeros(len(nodes), np.int64)
+    end = np.diff(np.asarray(line_offsets, dtype=np.int64))
+    if len(manual):
+        stored = view.read_geometry_arrays('line_points', nodes=[nodes[i] for i in manual])
+        if not np.array_equal(np.diff(np.asarray(stored.offsets, dtype=np.int64)), end[manual]):
+            raise ValueError('Mapped and stored fiber lines differ in length')
+        sizes = np.diff(control_offsets)[manual]
+        picked = np.r_[0, np.cumsum(sizes)]
+        index = np.repeat(control_offsets[manual]-picked[:-1], sizes)+np.arange(picked[-1])
+        begin[manual], end[manual] = packed_annotated_ranges(picked, np.asarray(controls.values).reshape(-1, 3)[index],
+                                                             stored.offsets, stored.values)
+    return begin, end
+
+
+def _view_rows(view, volume, *, require_lines=True, raw=False):
+    """Adapt selected mapped geometry only for callers requiring row records; annotated lines unless ``raw``."""
     records = view.objects(['name', 'fiber', 'meta'])
     for start in range(0, len(records), WRITE_BATCH):
         selected = records[start:start+WRITE_BATCH]
-        packed = view.read_geometry_arrays('line_points', nodes=list(range(start, start+len(selected))), volume=volume)
+        nodes = list(range(start, start+len(selected)))
+        packed = view.read_geometry_arrays('line_points', nodes=nodes, volume=volume)
         values, offsets = packed.values, packed.offsets
+        if raw:
+            begin, end = np.zeros(len(nodes), np.int64), np.diff(np.asarray(offsets, dtype=np.int64))
+        else:
+            begin, end = _view_line_ranges(view, nodes, offsets)
         for node, record in enumerate(selected):
-            xyz = np.array(values[offsets[node]:offsets[node+1]], dtype=np.float64)
+            first = int(offsets[node])
+            xyz = np.array(values[first+begin[node]:first+end[node]], dtype=np.float64)
             if len(xyz) < 2:
                 if require_lines:
                     raise ValueError(f'Fiber {record["uuid"]} is not bound to volume {volume} or has no line')
@@ -114,7 +157,7 @@ def _view_rows(view, volume, *, require_lines=True):
             yield dict(id=record['uuid'], name=record['name'], family=fiber.get('family', ''),
                        length=float(np.linalg.norm(np.diff(xyz, axis=0), axis=1).sum()),
                        point_count=len(xyz), bbox=[*map(float, xyz.min(0)), *map(float, xyz.max(0))],
-                       scale=1. if scale is None else scale,
+                       scale=1. if scale is None else scale, line_range=(int(begin[node]), int(end[node])),
                        meta=record['meta'], reference=object_reference(record)), xyz
 
 
@@ -169,9 +212,11 @@ def _position(store):
     return tuple(_source_version(store).values())
 
 
-def iter_polylines(path, fiber_ids=None, *, volume=None, source_version=None):
-    """[(row, xyz)] of the requested fibers (all bound ones when None), in UUID order; xyz are the raw line points in
-    volume voxels (no repair or densifying). row = dict(id, name, family, length, point_count, meta, reference). ``volume``
+def iter_polylines(path, fiber_ids=None, *, volume=None, source_version=None, raw=False):
+    """[(row, xyz)] of the requested fibers (all bound ones when None), in UUID order; xyz are the annotated line points
+    (tails dropped; ``raw=True`` keeps them) in volume voxels (no repair or densifying).
+    row = dict(id, name, family, length, point_count, bbox, line_range, meta, reference); length, point_count and bbox
+    describe xyz, line_range is xyz's [begin, end) in the stored line. ``volume``
     defaults to the store's one volume (fiber_volume). Raises for an unknown, unbound or line-less requested fiber.
     Frozen evidence supplies ``source_version``; both sides of the read must match that store snapshot."""
     volume = volume or fiber_volume(path,source_version=source_version)
@@ -189,22 +234,23 @@ def iter_polylines(path, fiber_ids=None, *, volume=None, source_version=None):
                 ids = view.object_uuids
                 if selected is not None and ids != selected:
                     raise ValueError('Unknown requested fiber')
-                yield from _view_rows(view, volume, require_lines=selected is not None)
+                yield from _view_rows(view, volume, require_lines=selected is not None, raw=raw)
             if selected is not None or len(ids) < WRITE_BATCH:
                 break
             cursor = ids[-1]
         _require_source_version(store, position)
 
 
-def read_polylines(path, fiber_ids=None, *, volume=None, source_version=None):
-    """Materialize raw curves; use iter_polylines for bounded streaming with the same source pin."""
-    return list(iter_polylines(path, fiber_ids, volume=volume, source_version=source_version))
+def read_polylines(path, fiber_ids=None, *, volume=None, source_version=None, raw=False):
+    """Materialize annotated curves (``raw=True``: with tails); use iter_polylines for bounded streaming."""
+    return list(iter_polylines(path, fiber_ids, volume=volume, source_version=source_version, raw=raw))
 
 
 def read_polyline_arrays(path, fiber_ids, *, volume=None, source_version=None, workers=1, trusted_immutable=False):
-    """Current packed XYZ and UUID columns, without Python per-fiber records.
+    """Current packed annotated XYZ (tails dropped) and UUID columns, without Python per-fiber records.
 
-    Native reading captures metadata/geometry together and performs coordinate
+    The native column reader returns fiber line_points without tails by default
+    (the store's annotatedLineRange); nothing is re-clipped here. Native reading captures metadata/geometry together and performs coordinate
     mapping under the same source-position guard. Returned buffers own their
     data after the store transaction closes.
     trusted_immutable='auto' uses trusted reads only for a fully sealed,
@@ -279,7 +325,8 @@ def _references_digest(references):
 def write_fibers(destination, fibers, *, volume, author=None, metadata_policy='portable', replace=False):
     """A new store holding ``fibers``: (row, xyz) pairs, xyz in voxels of ``volume`` (bound with scale 1). row keys:
     id (a UUID to keep, or absent/None for a new one), name, family, optional meta (its coordinates are replaced).
-    Each fiber gets end-point controls 0,1 and every sample as line points. Written to a sibling staging file and
+    Each fiber gets the row's ``control_points`` (same frame as xyz) or else end-point controls, and every sample as
+    line points; catalog length/bbox describe the annotated line. Written to a sibling staging file and
     published into place; an existing destination is refused unless replace=True. Managed extension/artifact descriptors are rejected
     unless metadata_policy='geometry_only' explicitly requests new geometry without those payloads.
     This is a derived-data writer, not a store/relationship/history copy. Returns dict(fibers, points, ids)."""
@@ -307,17 +354,19 @@ def write_fibers(destination, fibers, *, volume, author=None, metadata_policy='p
                 xyz = np.ascontiguousarray(xyz, dtype='<f8')
                 if xyz.ndim != 2 or xyz.shape[1] != 3 or len(xyz) < 2 or not np.isfinite(xyz).all():
                     raise ValueError(f'Invalid polyline for fiber {row.get("id")}')
+                controls = np.ascontiguousarray(np.reshape(row.get('control_points', xyz[[0, -1]]), (-1, 3)), dtype='<f8')
+                annotated = xyz[slice(*annotated_line_range(controls, xyz))]
                 fid = canonical_uuid(str(row['id'])) if row.get('id') else str(uuidlib.uuid4())
                 ids.append(fid)
                 points_total += len(xyz)
                 record = dict(uuid=fid, kind='fiber', name=row.get('name', ''), format_version=4,
-                              fiber=dict(family=row.get('family', ''), control_point_count=2,
+                              fiber=dict(family=row.get('family', ''), control_point_count=len(controls),
                                          line_point_count=len(xyz),
-                                         length=float(np.linalg.norm(np.diff(xyz, axis=0), axis=1).sum()),
-                                         bbox=[*map(float, xyz.min(0)), *map(float, xyz.max(0))]),
+                                         length=float(np.linalg.norm(np.diff(annotated, axis=0), axis=1).sum()),
+                                         bbox=[*map(float, annotated.min(0)), *map(float, annotated.max(0))]),
                               meta={**derived_metadata(row.get('meta') or {}, policy=metadata_policy,
                                                        reference=row.get('reference')), 'coordinates': coordinates})
-                pending.append((record, Fiber.from_arrays(np.ascontiguousarray(xyz[[0, -1]]), xyz)))
+                pending.append((record, Fiber.from_arrays(controls, xyz)))
                 if len(pending) >= WRITE_BATCH:
                     flush()
             flush()
@@ -335,6 +384,9 @@ def write_fibers(destination, fibers, *, volume, author=None, metadata_policy='p
 def write_initial_fibers(destination, fibers, *, volume, workers=32, packed=False):
     """Immutable batch import of traced polylines; no invented control points.
 
+    A row may carry the fiber's ``control_points`` ([N,3], same frame as the line) and ``control_point_ids``; a manual
+    fiber's controls must travel with its raw line so readers can still drop its tails. Rows without them are
+    whole-line traces. Catalog length and bbox describe the annotated line.
     Uses the same UUID-routed native queues as AFV and prepared imports. The
     native importer owns staging, failure cleanup, sealing and atomic publication.
     Returns the actual root locator (collection.vcobj for unpacked shards).
@@ -346,18 +398,24 @@ def write_initial_fibers(destination, fibers, *, volume, workers=32, packed=Fals
         xyz = np.ascontiguousarray(points, dtype='<f8')
         if xyz.ndim != 2 or xyz.shape[1] != 3 or len(xyz) < 2 or not np.isfinite(xyz).all():
             raise ValueError(f'Invalid polyline for fiber {row.get("id")}')
+        controls = np.ascontiguousarray(np.reshape(row.get('control_points', np.empty((0, 3))), (-1, 3)), dtype='<f8')
+        # Omitted IDs get the native encoder's allocation, 0..N-1.
+        control_ids = np.ascontiguousarray(row.get('control_point_ids', np.arange(len(controls))), dtype='<i8').reshape(-1)
+        if not np.isfinite(controls).all() or len(control_ids) != len(controls):
+            raise ValueError(f'Invalid control points for fiber {row.get("id")}')
+        annotated = xyz[slice(*annotated_line_range(controls, xyz))]
         fid = str(uuidlib.UUID(str(row['id']))) if row.get('id') else str(uuidlib.uuid4())
         ids.append(fid)
         points_total += len(xyz)
         record = dict(uuid=fid, kind='fiber', name=row.get('name', ''), format_version=4,
-                      fiber=dict(family=row.get('family', ''), control_point_count=0,
+                      fiber=dict(family=row.get('family', ''), control_point_count=len(controls),
                                  line_point_count=len(xyz),
-                                 length=float(np.linalg.norm(np.diff(xyz, axis=0), axis=1).sum()),
-                                 bbox=[*map(float, xyz.min(0)), *map(float, xyz.max(0))]),
+                                 length=float(np.linalg.norm(np.diff(annotated, axis=0), axis=1).sum()),
+                                 bbox=[*map(float, annotated.min(0)), *map(float, annotated.max(0))]),
                       meta={**(row.get('meta') or {}), 'coordinates': dict(volume_uuid=str(volume), scale_factor=1)})
         records.append(dict(record=record, geometry=dict(kind='fiber', format_version=1,
-                            arrays=[dict(name='control_points', dtype='<f8', shape=[0,3], data=b''),
-                                    dict(name='control_point_ids', dtype='<i8', shape=[0], data=b''),
+                            arrays=[dict(name='control_points', dtype='<f8', shape=list(controls.shape), data=controls.tobytes()),
+                                    dict(name='control_point_ids', dtype='<i8', shape=list(control_ids.shape), data=control_ids.tobytes()),
                                     dict(name='line_points', dtype='<f8', shape=list(xyz.shape), data=xyz.tobytes())])))
     if len(set(ids)) != len(ids):
         raise ValueError('Duplicate fiber UUID')
@@ -444,6 +502,7 @@ class FiberStore(Sequence):
             row = self.catalog[index]
             with self.store().graph_read(versions=[row['reference']], edge_limit=0) as view:
                 xyz = view.read_geometry_arrays('line_points').values
+                xyz = xyz[slice(*annotated_line_range(view.read_geometry_arrays('control_points').values, xyz))]
             self._require_unchanged()
             if len(xyz) < 2 or not np.isfinite(xyz).all():
                 raise ValueError(f'Invalid fiber geometry: {row["id"]}')
@@ -460,7 +519,8 @@ class FiberStore(Sequence):
         return result
 
     def _regions(self, lo, hi):
-        """The store's spatial blocks (<= 257 line points) of this split whose bounds overlap [lo, hi] (trace grid)."""
+        """The store's spatial blocks (<= 257 line points) of this split whose bounds overlap [lo, hi] (trace grid).
+        Block bounds include tails; _blocks drops them, so a block may come back empty."""
         self._require_unchanged()
         bbox = [*(np.asarray(lo)*self.grid_scale), *(np.asarray(hi)*self.grid_scale)]
         regions = [r for r in self.store().spatial_regions(bbox, object_kind='fiber', volume=self.volume)
@@ -475,9 +535,15 @@ class FiberStore(Sequence):
         with self.store().geometry_snapshot() as snapshot:
             for r in regions:
                 fid = r['object_uuid']
-                scale = self.catalog[self.id_to_index[fid]]['scale']/self.grid_scale
-                line = snapshot.fiber(fid, r['revision_uuid'])
-                blocks.append((fid, int(r['start'][0]), line.line_points_array(int(r['start'][0]), int(r['shape'][0]))*scale))
+                row = self.catalog[self.id_to_index[fid]]
+                scale = row['scale']/self.grid_scale
+                begin = max(int(r['start'][0]), row['line_range'][0])
+                end = min(int(r['start'][0])+int(r['shape'][0]), row['line_range'][1])
+                if end-begin < 2:
+                    continue  # the block lies in a tail
+                points = snapshot.fiber(fid, r['revision_uuid']).line_points_array(begin, end-begin)*scale
+                if np.all(points.max(0) >= lo) and np.all(points.min(0) <= hi):
+                    blocks.append((fid, begin, points))
         self._require_unchanged()
         yield from blocks
 
@@ -492,7 +558,7 @@ class FiberStore(Sequence):
 
     def nearby_fiber_ids(self, point, radius, exclude_id):
         point = np.asarray(point)
-        return sorted({r['object_uuid'] for r in self._regions(point-radius, point+radius)} - {exclude_id})
+        return sorted({fid for fid, _, _ in self._blocks(point-radius, point+radius)} - {exclude_id})
 
 
 class _Fiber:

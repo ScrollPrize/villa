@@ -42,6 +42,8 @@ These are separate commands, not one automatic pipeline invocation. A stage crea
 | Existing compatible vcobj fibers | Start at `vc_wgraph extract` | No format conversion or reimport needed. |
 | Application-owned polylines/records | Shared initial-fiber / native initial-import APIs | Requires a source adapter; not an additional auto-detected CLI file format. |
 
+Line tails: a manual fiber (two or more control points) is annotated only between its first and last control point. Line points the optimizer extrapolated past them are not fiber; every stage ignores them (geometry, constraints, crossings, link anchors, lengths, bounds), and readers return the annotated line by default. Fibers with fewer than two controls (automatic traces) have no tails. Adapters must therefore import a manual fiber's control points with its raw line, or import the annotated line alone.
+
 The two tracer adapters are Python modules under `vesuvius.neural_tracing.fiber_trace_3d`, not selectable input backends of `vc_wgraph import`. They use the shared native bulk writer but currently materialize records in Python first; their preparation cost is not covered by the AFV runtime below. Both preserve source-derived UUIDs and import unknown family labels for subsequent H/V classification. See [tracer adapter settings](fiber_workflows.md#route-page-import) and the [source-independent native construction API](../../vc_object_store/docs/initial-import.md). Coordinate frames must match; a file containing polylines alone is not sufficient to infer the volume binding.
 
 ### Manual scaffold workflow (record families and links only)

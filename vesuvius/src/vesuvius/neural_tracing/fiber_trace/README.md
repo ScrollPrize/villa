@@ -33,6 +33,11 @@ CP-owned segment schema. The unpublished file version 2 is unsupported. Version
 }
 ```
 
+Only the part of `line_points` between the first and last control point (the
+line vertices nearest them) is annotated fiber. Points past them are optimizer
+extrapolation ("tails") and are ignored by every consumer; a fiber with fewer
+than two control points has no tails.
+
 The training loader exposes `control_points_xyz` as before and separately
 returns the strictly validated optional segment metadata. `interp_goal`
 records the requested `global`/`cspline`/`lasagna`/`trace` policy, while

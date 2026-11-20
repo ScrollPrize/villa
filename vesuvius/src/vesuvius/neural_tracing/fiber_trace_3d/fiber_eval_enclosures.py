@@ -35,6 +35,7 @@ def download(config, root):
 
 def prepare(config, root):
     from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import write_initial_fibers, fiber_volume
+    from vesuvius.neural_tracing.tracers.shared.annotations.annotated_line import annotated_line, document_control_points
     files = download(config, root); curves = []; index = []; families = []; lengths = []
     volume=config.get('volume') or fiber_volume(config['frame_template'])
     expected=np.asarray(config['base_shape_zyx'])
@@ -64,10 +65,14 @@ def prepare(config, root):
             allowed = config.get('allowed_source_shape_zyx')
             if allowed is None or not np.array_equal(shape, allowed): raise ValueError('Unapproved shape discrepancy')
             shape_notes[file.name] = shape.tolist()
-        if np.any(xyz<0) or np.any(xyz>=expected[::-1]): raise ValueError('Points outside target coordinate frame')
+        # The store keeps the raw line with its controls; the annotated span alone is fiber (no tails).
+        controls = document_control_points(d); annotated = annotated_line(controls, xyz)
+        if len(annotated) < 2: raise ValueError('No annotated span: '+file.name)
+        if np.any(annotated<0) or np.any(annotated>=expected[::-1]): raise ValueError('Points outside target coordinate frame')
         # Frame discrepancy is metadata-only: never rescale, shift or clip points.
-        fid = str(uuid.UUID(d['uuid'])) if d.get('uuid') else str(uuid.uuid5(uuid.NAMESPACE_URL,config['url']+file.name)); length = float(np.linalg.norm(np.diff(xyz, axis=0), axis=1).sum())
-        curves.append((dict(id=fid, name=file.name, family=family, meta={k:v for k,v in d.items() if k not in ('line_points','control_points')}), xyz))
+        fid = str(uuid.UUID(d['uuid'])) if d.get('uuid') else str(uuid.uuid5(uuid.NAMESPACE_URL,config['url']+file.name)); length = float(np.linalg.norm(np.diff(annotated, axis=0), axis=1).sum())
+        curves.append((dict(id=fid, name=file.name, family=family, control_points=controls,
+                            meta={k:v for k,v in d.items() if k not in ('line_points','control_points')}), xyz))
         index.append(dict(source_id=fid, name=file.name, family=family, length=length))
         families.append(0 if family=='H' else 1); lengths.append(length)
     # All solver arrays follow the same global UUID order as store readers.

@@ -142,17 +142,15 @@ def prepare(workload, *, pilot_only=False):
             points = np.asarray(fiber.line_points_xyz, dtype=np.float64)
             # Evaluation excludes extrapolated tails outside the CP span. A
             # tail may extend beyond the scan without invalidating its GT span.
-            from vesuvius.neural_tracing.fiber_trace_2d.strip_geometry import control_point_line_index
-            cp_indices = [control_point_line_index(fiber, i)
-                          for i in range(len(fiber.control_points_xyz))]
-            bounded = points[min(cp_indices):max(cp_indices)+1] if cp_indices else points
+            from vesuvius.neural_tracing.tracers.shared.annotations.annotated_line import annotated_line
+            bounded = annotated_line(fiber.control_points_xyz, points)
             if not np.isfinite(points).all() or np.any(bounded < 0) or np.any(bounded > np.array(shape[::-1])-1):
                 raise ValueError(f"nonfinite/out-of-bounds reference: {path}")
-            length = float(np.linalg.norm(np.diff(points, axis=0), axis=1).sum())
+            length = float(np.linalg.norm(np.diff(bounded, axis=0), axis=1).sum())
             if length <= 0:
                 raise ValueError(f"degenerate reference: {path}")
             fibers.append({"path": str(path), "sha256": sha256_file(path), "length_base_voxels": length,
-                           "points": len(points), "min_xyz": points.min(axis=0).tolist(), "max_xyz": points.max(axis=0).tolist(),
+                           "points": len(bounded), "min_xyz": bounded.min(axis=0).tolist(), "max_xyz": bounded.max(axis=0).tolist(),
                            "embedded_coordinate_space": document.get("vc_open_data_coordinate_space")})
         sources.append({"id": collection, "coordinate_space": coordinate_space,
                         "input_volume": binding["input_volume"].rstrip("/"), "input_level": input_level,

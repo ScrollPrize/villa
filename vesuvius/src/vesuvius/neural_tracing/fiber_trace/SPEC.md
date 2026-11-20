@@ -100,6 +100,10 @@ any value `> 0` is valid; there is no configurable validity threshold.
 Coordinate convention:
 
 - VC3D fiber JSON `line_points` and `control_points` are canonical `xyz`.
+- Only the part of `line_points` between the first and last control point
+  (the line vertices nearest them) is annotated fiber. Points past them are
+  optimizer extrapolation ("tails") and are ignored by every consumer; a fiber
+  with fewer than two control points has no tails.
 - Geometry, tangents, conditioning vectors, target directions, normals, and up
   vectors are computed in `xyz`.
 - Dense arrays, zarr reads, crop origins, masks, and tensor spatial axes are

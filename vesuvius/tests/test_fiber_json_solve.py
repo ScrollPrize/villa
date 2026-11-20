@@ -62,8 +62,10 @@ def test_conversion_roundtrip_and_source_guard(tmp_path):
     from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import read_polylines
     source=tmp_path/'source';source.mkdir()
     uuid='12345678-1234-1234-1234-123456789abc'
-    doc=dict(uuid=uuid,coordinate_base_shape_zyx=[20,20,20],line_points=[[1,2,3],[4,5,6]],
-             control_points=[dict(segment_to_next=dict(normal_manifest='test-volume/test-scan',interp_mode='trace')),{}],
+    # Tails past the controls (one outside the scan) are kept in the store but never read as fiber.
+    doc=dict(uuid=uuid,coordinate_base_shape_zyx=[20,20,20],line_points=[[-1,2,3],[1,2,3],[4,5,6],[5,5,6]],
+             control_points=[dict(position=[1,2,3],segment_to_next=dict(normal_manifest='test-volume/test-scan',interp_mode='trace')),
+                             dict(position=[4,5,6])],
              hv_classification={'automatic_tag':'H'},branches=[],adjacent_branches=[])
     path=source/'a.json';path.write_text(json.dumps(doc))
     output=tmp_path/'out.vcobj'
@@ -72,7 +74,8 @@ def test_conversion_roundtrip_and_source_guard(tmp_path):
     assert convert(source,output)==records
     [(row,xyz)]=read_polylines(output)
     assert row['id']==uuid and row['name']=='a.json' and row['meta']['annotation']==doc
-    np.testing.assert_array_equal(xyz,doc['line_points'])
+    np.testing.assert_array_equal(xyz,doc['line_points'][1:3])
+    np.testing.assert_array_equal(read_polylines(output,raw=True)[0][1],doc['line_points'])
     doc['line_points'][0][0]=2;path.write_text(json.dumps(doc))
     with pytest.raises(ValueError,match='Changed source'):
         convert(source,output)
@@ -85,12 +88,12 @@ def test_conversion_roundtrip_and_source_guard(tmp_path):
     assert len(convert(source,tmp_path/'missing_shape.vcobj'))==1
     doc['coordinates']=dict(volume_uuid=VOLUME,scale_factor=.5);path.write_text(json.dumps(doc))
     convert(source,tmp_path/'scaled.vcobj')
-    np.testing.assert_array_equal(read_polylines(tmp_path/'scaled.vcobj')[0][1],np.array(doc['line_points'])*2)
+    np.testing.assert_array_equal(read_polylines(tmp_path/'scaled.vcobj')[0][1],np.array(doc['line_points'][1:3])*2)
     doc['coordinates']=dict(volume_uuid='other',scale_factor=1);path.write_text(json.dumps(doc))
     with pytest.raises(ValueError,match='another volume'):
         convert(source,tmp_path/'other_volume.vcobj')
     del doc['coordinates']
-    doc['line_points'][0][0]=20
+    doc['line_points'][2][0]=20
     path.write_text(json.dumps(doc))
     with pytest.raises(ValueError,match='outside verified'):
         convert(source,tmp_path/'outside.vcobj')

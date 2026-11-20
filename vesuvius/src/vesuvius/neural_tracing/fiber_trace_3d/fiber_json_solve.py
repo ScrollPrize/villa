@@ -10,12 +10,14 @@ def convert(source_dir, destination, *, volume, shape_zyx, expected_manifest_tok
     """Reviewed VC3D fiber JSON -> a store of fibers bound to ``volume`` (base voxels, shape ``shape_zyx``); each
     fiber keeps its document's own ``uuid``."""
     from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import write_initial_fibers, read_polylines
+    from vesuvius.neural_tracing.tracers.shared.annotations.annotated_line import annotated_line, document_control_points
     if not expected_manifest_tokens or any(not str(token) for token in expected_manifest_tokens):
         raise ValueError('Provide expected_manifest_tokens to verify the source scan')
     shape=list(shape_zyx)
     fibers=[]; records=[]
     for path in sorted(Path(source_dir).glob('*.json')):
         doc=json.loads(path.read_text()); xyz=np.asarray(doc['line_points'], dtype=np.float64)
+        controls=document_control_points(doc)
         fid=str(uuid.UUID(str(doc['uuid'])))
         if doc.get('coordinate_base_shape_zyx',shape) != shape:
             raise ValueError('Coordinate shape mismatch: '+str(path))
@@ -23,7 +25,8 @@ def convert(source_dir, destination, *, volume, shape_zyx, expected_manifest_tok
         coordinates=doc.get('coordinates') or {}
         if coordinates.get('volume_uuid') not in (None,str(volume)):
             raise ValueError('Fiber bound to another volume: '+str(path))
-        if coordinates.get('volume_uuid') is not None:xyz=xyz/float(coordinates['scale_factor'])
+        if coordinates.get('volume_uuid') is not None:
+            xyz=xyz/float(coordinates['scale_factor']);controls=controls/float(coordinates['scale_factor'])
         if xyz.ndim!=2 or xyz.shape[1]!=3 or len(xyz)<2 or not np.isfinite(xyz).all():
             raise ValueError('Invalid curve: '+str(path))
         if doc.get('branches') or doc.get('adjacent_branches'):
@@ -31,11 +34,14 @@ def convert(source_dir, destination, *, volume, shape_zyx, expected_manifest_tok
         manifests=[' '.join(str(c.get('segment_to_next',{}).get(k,'')) for k in ('normal_manifest','fiber_manifest')) for c in doc['control_points']]
         if len(manifests)<2 or any(any(str(token) not in m for token in expected_manifest_tokens) for m in manifests[:-1]):
             raise ValueError('Unverified source scan: '+str(path))
-        if np.any(xyz<0) or np.any(xyz>=np.asarray(shape)[::-1]):
+        # The store keeps the raw line and its controls; only the annotated span is fiber.
+        annotated=annotated_line(controls,xyz)
+        if len(annotated)<2:raise ValueError('No annotated span: '+str(path))
+        if np.any(annotated<0) or np.any(annotated>=np.asarray(shape)[::-1]):
             raise ValueError('Curve outside verified source scan: '+str(path))
-        row=dict(id=fid,name=path.name,family='unknown',meta=dict(annotation=doc))
+        row=dict(id=fid,name=path.name,family='unknown',meta=dict(annotation=doc),control_points=controls)
         fibers.append((row,xyz))
-        records.append(dict(id=fid,file=str(path),sha256=sha256_file(path),points=len(xyz),
+        records.append(dict(id=fid,file=str(path),sha256=sha256_file(path),points=len(annotated),
                             saved_hv=doc['hv_classification'],
                             segment_modes=[c.get('segment_to_next',{}).get('interp_mode') for c in doc['control_points'][:-1]]))
     if not fibers: raise ValueError('No input fibers')
@@ -49,7 +55,8 @@ def convert(source_dir, destination, *, volume, shape_zyx, expected_manifest_tok
     actual=read_polylines(destination,volume=str(volume))
     if len(actual)!=len(fibers): raise ValueError('Roundtrip fiber count')
     for (row,a),(other,b) in zip(sorted(fibers,key=lambda f:f[0]['id']),actual):
-        if row['id']!=other['id'] or not np.array_equal(a,b): raise ValueError('Store roundtrip differs')
+        if row['id']!=other['id'] or not np.array_equal(annotated_line(row['control_points'],a),b):
+            raise ValueError('Store roundtrip differs')
     return records
 
 

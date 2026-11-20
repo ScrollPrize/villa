@@ -19,7 +19,8 @@ from .fiber_graph_store import FiberGraph, store_digest, write_winding_result, w
 from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import read_polyline_arrays, fiber_point_counts
 
 KEY_DTYPE=np.dtype([('source','<i8'),('arc','<f8')])
-PACKED_GEOMETRY_FORMAT=3
+# 4: lines are annotated (no tails past the first/last control); 3 kept manual fibers' tails.
+PACKED_GEOMETRY_FORMAT=4
 _worker=None
 
 
@@ -51,6 +52,9 @@ class PackedPaths:
     @classmethod
     def from_store(cls, config, ids):
         """One bulk native read and native arc/transport construction in RAM.
+
+        Lines are annotated (read_polyline_arrays drops manual fibers' tails),
+        so arcs start at the first control and every projection stays on fiber.
 
         This is the production solver input API. It returns the measured
         geometry directly, never a per-fiber Python Paths implementation or
