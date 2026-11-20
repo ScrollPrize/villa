@@ -132,7 +132,7 @@ Where those 92 GB go:
 | surface geometry `x/y/z.tif` + `meta.json` | 4 | 0.20 GB |
 | ink labels, supervision mask (all levels) | 12,621 | 0.03 GB |
 
-Training with `volume_scale: "0"` reads only the level-0 chunks under the labeled patches: **with the flat-path selector, ~2.4 GB** instead of 92 GB. If disk or bandwidth is tight, [download just that part](#small-gpu-or-small-disk) instead.
+Training with `volume_scale: "0"` reads only the level-0 chunks under the labeled patches: **with the flat-path selector, ~3 GB** instead of 92 GB. If disk or bandwidth is tight, [download just that part](#small-gpu-or-small-disk) instead.
 
 `hf buckets sync` works like `rsync`: re-running it resumes interrupted downloads and only transfers what changed. If you hit rate limits, create a free account, generate a read token under **Settings → Access Tokens**, and either run `uvx --from huggingface_hub hf auth login` once or set `HF_TOKEN=hf_...` in your environment.
 
@@ -278,7 +278,7 @@ uv run --extra models python -m vesuvius.ink_detection.inference.infer \
   --batch-size 4
 ```
 
-The three positional arguments are the segment's surface volume, the checkpoint (here the last one written by the 20,000-iteration run above), and the output path. (`--overlap 0.5 --blend-mode hann` spell out the defaults, 50% overlap with Hann blending, so the command stays reproducible.) The model slides across the whole segment in overlapping windows, blends the overlapping predictions, and writes a grayscale TIFF where each pixel's brightness (0–255) is the predicted probability of ink. Expect this to take on the order of an hour on a single GPU for a full segment. Open the result in any image viewer, and if all went well, you'll see letters, including outside the regions you had labels for.
+The three positional arguments are the segment's surface volume, the checkpoint (here the last one written by the 20,000-iteration run above), and the output path. (`--overlap 0.5 --blend-mode hann` spell out the defaults, 50% overlap with Hann blending, so the command stays reproducible.) The model slides across the whole segment in overlapping windows, blends the overlapping predictions, and writes a grayscale TIFF where each pixel's brightness (0–255) is the predicted probability of ink. Expect this to take on the order of an hour on a single GPU for a full segment. If you downloaded only the [training subset](#small-gpu-or-small-disk), first rerun the full `hf buckets sync` from [the dataset section](#the-dataset). Open the result in any image viewer, and if all went well, you'll see letters, including outside the regions you had labels for.
 
 :::tip
 For a faster first look, pass `--mask-path region.tif` — a grayscale TIFF the size of the segment where nonzero pixels mark the region to predict — to limit inference to an area of interest.
@@ -309,8 +309,9 @@ The commands above assume a data-center GPU and room for the whole segment. Both
 uvx --from huggingface_hub hf buckets sync \
   hf://buckets/scrollprize/datasets/ink/phercparis4/w00_20231016151002 \
   ./ink-dataset/phercparis4/w00_20231016151002 \
-  --include "*_inklabels.zarr/*" --include "*_supervision_mask.zarr/*" --include "*_validation_mask.zarr/*" \
-  --include "*.zarr/.z*" --include "*.zarr/0/.z*" --include "x.tif" --include "meta.json"
+  --include "*_inklabels*.zarr/*" --include "*_supervision_mask*.zarr/*" --include "*_validation_mask*.zarr/*" \
+  --include "*.zarr/.z*" --include "*.zarr/*/.z*" --include "*.zarr/zarr.json" --include "*.zarr/*/zarr.json" \
+  --include "x.tif" --include "meta.json"
 
 # 2. the full plan, without downloading anything
 uvx --from huggingface_hub hf buckets sync \
@@ -323,7 +324,7 @@ uv run --extra models python -m vesuvius.ink_detection.preprocessing.select_flat
 uvx --from huggingface_hub hf buckets sync --apply subset.jsonl
 ```
 
-For the tutorial segment this keeps 3,534 of 101,304 level-0 chunks (2.95 GB) with `patch_size [64, 256, 256]`, and 2,862 chunks (2.42 GB) with `[64, 128, 128]`. Step 1 is many small files (12,625 files, 70 MB) and took 8 minutes here; step 3 runs patch discovery and took about 10 seconds. Selecting the chunks is config-specific: if you change `patch_size`, `patch_overlap`, `patch_min_labeled_coverage` or the labels, rerun step 3. With `flat_z_window_jitter` enabled, the selection also covers every Z offset the jitter can draw.
+For the tutorial segment this keeps 3,534 of 101,304 level-0 chunks (2.95 GB) with `patch_size [64, 256, 256]`, and 2,862 chunks (2.42 GB) with `[64, 128, 128]`. Step 1 is many small files (12,635 files, 70 MB) and took 8 minutes here; step 3 runs patch discovery and took about 10 seconds. Selecting the chunks is config-specific: if you change `patch_size`, `patch_overlap`, `patch_min_labeled_coverage` or the labels, rerun step 3. With `flat_z_window_jitter` enabled, the selection also covers every Z offset the jitter can draw.
 
 **Settings that fit a 6 GB GPU.** Measured on an RTX 3060 Laptop GPU (6 GB), driver 616.92, WSL2, `torch 2.12.1+cu130`, on the tutorial segment with `mixed_precision: fp16` and `dataloader_workers: 4`. Steady-state time per iteration after 20 iterations; "spills" means the card was full and the driver moved memory into system RAM (see the tip above):
 

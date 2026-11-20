@@ -5,7 +5,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from vc_reader.reader import create_group
+from vc_reader.reader import ZarrWriter, create_group
 
 from vesuvius.ink_detection.preprocessing.select_flat_training_chunks import chunk_key_encoder, main
 from vesuvius.ink_detection.volume_io import open_volume
@@ -83,10 +83,25 @@ def test_keeps_only_level0_chunks_under_labeled_patches(tmp_path):
         "seg-a.zarr/0/0.1.0",
         "seg-a.zarr/0/0.1.1",
     }
-    assert {"x.tif", "meta.json", "seg-a.zarr/.zgroup", "seg-a.zarr/0/.zarray"} <= kept
+    assert {"x.tif", "meta.json", "seg-a.zarr/.zgroup", "seg-a.zarr/0/.zarray", "seg-a.zarr/1/.zarray"} <= kept
     assert {"seg-a_supervision_mask.zarr/0/0.0.0", "seg-a_inklabels.zarr/1/0.0.0"} <= kept
-    assert not kept & {"seg-a.zarr/1/.zarray", "seg-a.zarr/1/0.0.0", "preds/prediction.tif"}
+    assert not kept & {"seg-a.zarr/1/0.0.0", "preds/prediction.tif"}
     assert records[0]["summary"]["downloads"] == len(kept)
+
+
+def test_standalone_array_chunks_have_no_level_prefix(tmp_path):
+    segment = _segment(tmp_path)
+    image = segment / "seg-a.zarr"
+    ZarrWriter.create(image, shape=SHAPE_ZYX, chunks=CHUNKS_ZYX, dtype=np.uint8, overwrite=True)[...] = 100
+    records = [{"type": "header", "source": "hf://buckets/x/y/seg-a", "dest": "./ink-dataset/seg-a"}]
+    records += [{"type": "operation", "action": "download", "path": "seg-a.zarr/0.0.0", "size": 10}]
+    plan = tmp_path / "full.jsonl"
+    plan.write_text("\n".join(json.dumps(r) for r in records) + "\n", encoding="utf-8")
+    output = tmp_path / "subset.jsonl"
+
+    assert main([str(_config(tmp_path)), str(plan), str(output), "--plan-root", str(tmp_path)]) == 0
+
+    assert json.loads(output.read_text().splitlines()[1])["path"] == "seg-a.zarr/0.0.0"
 
 
 def test_keeps_every_chunk_a_z_jittered_window_can_read(tmp_path, monkeypatch):

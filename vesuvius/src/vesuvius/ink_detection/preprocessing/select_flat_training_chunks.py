@@ -8,9 +8,9 @@ run does not need the full download.
 1. Sync the labels, the Zarr metadata and ``x.tif`` (segment discovery requires it):
 
        hf buckets sync hf://buckets/scrollprize/datasets/ink/phercparis4/<segment> ./ink-dataset/phercparis4/<segment> \\
-         --include "*_inklabels.zarr/*" --include "*_supervision_mask.zarr/*" \\
-         --include "*_validation_mask.zarr/*" --include "*.zarr/.z*" --include "*.zarr/0/.z*" \\
-         --include "x.tif" --include "meta.json"
+         --include "*_inklabels*.zarr/*" --include "*_supervision_mask*.zarr/*" \\
+         --include "*_validation_mask*.zarr/*" --include "*.zarr/.z*" --include "*.zarr/*/.z*" \\
+         --include "*.zarr/zarr.json" --include "*.zarr/*/zarr.json" --include "x.tif" --include "meta.json"
 
 2. Write the full plan without downloading anything:
 
@@ -33,17 +33,19 @@ from typing import Sequence
 
 from vesuvius.ink_detection.data.dataset import InkDataset, flat_z_window_bbox
 from vesuvius.ink_detection.training.train import stage_training_request, training_dataset_config
-from vesuvius.ink_detection.volume_io import open_volume
+from vesuvius.ink_detection.volume_io import open_volume_root, select_volume_level
 from vesuvius.utils.cli import HyphenUnderscoreParser
 
 
 # Everything except surface-volume chunks is small and always kept.
 SMALL_PATTERNS = (
-    "*_inklabels.zarr/*",
-    "*_supervision_mask.zarr/*",
-    "*_validation_mask.zarr/*",
+    "*_inklabels*.zarr/*",
+    "*_supervision_mask*.zarr/*",
+    "*_validation_mask*.zarr/*",
     "*.zarr/.z*",
-    "*.zarr/0/.z*",
+    "*.zarr/*/.z*",
+    "*.zarr/zarr.json",
+    "*.zarr/*/zarr.json",
     "x.tif",
     "meta.json",
 )
@@ -137,9 +139,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             continue
         patches = [patch for patch in dataset.patches if patch.segment is segment]
         patch_count += len(patches)
-        volume = open_volume(segment.image_volume, 0)
+        root = open_volume_root(segment.image_volume)
+        volume = select_volume_level(root, 0, source=str(segment.image_volume))
         prefix = "" if prefix == "." else prefix + "/"
-        wanted_chunks |= {f"{prefix}0/{key}" for key in chunk_keys_for_patches(patches, volume, config)}
+        if not hasattr(root, "shape"):
+            prefix += "0/"
+        wanted_chunks |= {prefix + key for key in chunk_keys_for_patches(patches, volume, config)}
     if not wanted_chunks:
         raise SystemExit(f"no discovered segment lies under the plan destination {plan_root}")
 
