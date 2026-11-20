@@ -17,6 +17,10 @@
 #include <algorithm>
 #include <random>
 
+#ifndef O_ACCMODE  // not in the Microsoft <fcntl.h>
+#define O_ACCMODE (O_RDONLY | O_WRONLY | O_RDWR)
+#endif
+
 namespace vcr::platform {
 namespace {
 int errno_from(DWORD error)
