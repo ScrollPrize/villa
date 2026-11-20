@@ -223,7 +223,7 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 
 - [Rescaled to 7.91um fragment surfaces and labels](https://dl.ash2txt.org/community-uploads/jrudolph/rescaled-fragments/) by Johannes Rudolph
 
-- [PHerc. 1451 surfaces v1](https://github.com/EconLearn/pherc1451-surfaces) by EconLearn -- 41 automatically grown surfaces on PHerc. 1451 (scan `20260319101107`, 2.399 µm, a scan with no published segments), 192.36 cm² counted once, as tifxyz in level-0 voxels; all 41 open with `vc_tifxyz2obj`. Grown with `vc_grow_seg_from_seed` on the m7 prediction, kept where three independently grown patches agree, then moved to the CT density centre of the layer. Geometry only, no ink result; which sheet a patch follows is not verified -- check the limits in the README.
+- [PHerc. 1451 surfaces v3](https://github.com/EconLearn/pherc1451-surfaces/releases/tag/v3) by EconLearn -- 57 automatically grown surfaces on PHerc. 1451 (scan `20260319101107`, 2.399 µm, a scan with no published segments) as tifxyz in level-0 voxels. 38 of them pass a fibre check, a self-check for sheet jumps and a winding cross-check where surfaces overlap, about 220 cm² counted once; all 57 open with villa's loader. Candidate surfaces, no ink result; winding identity is not independently verified -- see the limits in the README.
 
 #### 🏷️ Volumetric Labels
 
