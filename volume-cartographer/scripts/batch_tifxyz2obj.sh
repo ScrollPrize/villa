@@ -14,10 +14,10 @@ if [ "$#" -lt 2 ]; then
     echo "Additional arguments (optional) will be passed to vc_tifxyz2obj:"
     echo "  --normalize-uv : Normalize UVs to [0,1] range"
     echo "  --align-grid   : Align grid Z only (flatten Z per row)"
-    echo "  --decimate [n] : Reduce points by ~90% per iteration (default n=1)"
+    echo "  --keep=<p>     : Percent of source points to keep (1..100, default 100)"
     echo "  --clean [K]    : Remove outlier points; K is sigma multiplier (default 5.0)"
     echo ""
-    echo "Example: $0 /path/to/input /path/to/output --normalize-uv --decimate 1"
+    echo "Example: $0 /path/to/input /path/to/output --normalize-uv --keep=10"
     exit 1
 fi
 
