@@ -901,7 +901,10 @@ static std::unique_ptr<QuadSurface> flatten(QuadSurface& surface, const Options&
 {
   cv::Mat_<cv::Vec3f> full = surface.rawPoints().clone();
 
-  // Initial UVs are grid positions scaled by 1/scale, as vc_tifxyz2obj writes them.
+  // Initial UVs are positions in the full grid scaled by 1/scale. A decimated
+  // cell (r, c) sits at (r, c) * stride in the full grid: without the stride the
+  // starting map is stride times too small, and SLIM, which has no term keeping
+  // disconnected pieces apart, grows them onto each other.
   const cv::Vec2f scale = surface.scale();
   const float uv_fac_x = (std::isfinite(scale[0]) && scale[0] > 0.f) ? 1.0f / scale[0] : 1.0f;
   const float uv_fac_y = (std::isfinite(scale[1]) && scale[1] > 0.f) ? 1.0f / scale[1] : 1.0f;
@@ -926,7 +929,8 @@ static std::unique_ptr<QuadSurface> flatten(QuadSurface& surface, const Options&
   for (std::size_t i = 0; i < coarse_mesh.positions.size(); ++i) {
     const auto& p = coarse_mesh.positions[i];
     V.row(i) << p[0], p[1], p[2];
-    TC.row(i) << float(coarse_mesh.cells[i][1]) * uv_fac_x, float(coarse_mesh.cells[i][0]) * uv_fac_y;
+    TC.row(i) << float(coarse_mesh.cells[i][1] * stride) * uv_fac_x,
+        float(coarse_mesh.cells[i][0] * stride) * uv_fac_y;
   }
   Eigen::MatrixXi F(coarse_mesh.faces.size(), 3);
   for (std::size_t f = 0; f < coarse_mesh.faces.size(); ++f)
