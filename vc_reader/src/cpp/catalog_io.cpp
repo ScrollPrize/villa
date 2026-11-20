@@ -61,7 +61,7 @@ std::string readCatalogFile(const std::filesystem::path& path) {
     return decode(std::move(body));
 }
 CatalogLoadResult loadCatalog(const std::string& source,const CatalogLoadOptions& options) {
-    if(!source.starts_with("https://")&&!source.starts_with("http://"))return {loadOpenDataManifestFile(source),false,{}};
+    if(!source.starts_with("https://")&&!source.starts_with("http://"))return {loadOpenDataManifestFile(source),false,false,{}};
     static std::mutex cacheMutex;
     std::lock_guard lock(cacheMutex);
     std::optional<OpenDataManifest> cached;
@@ -72,19 +72,22 @@ CatalogLoadResult loadCatalog(const std::string& source,const CatalogLoadOptions
         info=nlohmann::json::parse(readCatalogFile(infoPath));
         if(info.value("source",std::string{})==source)cached=loadOpenDataManifestFile(options.cacheFile,source);
     }catch(const std::exception&){}
-    if(cached&&!options.refresh&&now-info.value("checked_at",0.)<options.maxAgeSeconds)return {*cached,true,{}};
+    if(cached&&!options.refresh&&now-info.value("checked_at",0.)<options.maxAgeSeconds)return {*cached,true,true,{}};
     try {
         auto [body,response]=request(source,cached?info.value("etag",std::string{}):std::string{},options.timeoutSeconds);
         if(response.status==304&&!cached)throw std::runtime_error("catalog returned 304 without cached content");
         auto manifest=response.status==304?*cached:parseOpenDataManifest(body,source);
         std::string warning;
-        // A cache folder that cannot be written does not make the downloaded catalog unusable.
+        // A 304 confirms the body already in the cache file.
+        bool onDisk=response.status==304;
+        // A cache folder that cannot be written does not make the downloaded catalog unusable,
+        // but readers of the cache file do not see it: onDisk stays false.
         if(!options.cacheFile.empty())try {
-            if(response.status!=304)atomic_write(options.cacheFile.string(), reinterpret_cast<const std::uint8_t*>(body.data()), body.size());
+            if(response.status!=304){atomic_write(options.cacheFile.string(), reinterpret_cast<const std::uint8_t*>(body.data()), body.size());onDisk=true;}
             const auto infoText = nlohmann::json{{"source",source},{"checked_at",now},{"etag",response.etag.empty()?info.value("etag",std::string{}):response.etag}}.dump();
             atomic_write(infoPath, reinterpret_cast<const std::uint8_t*>(infoText.data()), infoText.size());
         }catch(const std::exception& e){warning=std::string("catalog not cached: ")+e.what();}
-        return {std::move(manifest),response.status==304,std::move(warning)};
-    }catch(const std::exception& e){if(cached)return {*cached,true,e.what()};throw;}
+        return {std::move(manifest),response.status==304,onDisk,std::move(warning)};
+    }catch(const std::exception& e){if(cached)return {*cached,true,true,e.what()};throw;}
 }
 }
