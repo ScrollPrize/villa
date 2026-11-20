@@ -414,7 +414,8 @@ def test_downloader_plans_the_trainer_crop_at_volume_scale_one(tmp_path: Path) -
     crop = (slice(6, 8), slice(6, 8), slice(8, 10))
     output = open_group(output_root / "dataset.zarr")
     plan = output.attrs[download_required_zarr_chunks.DOWNLOAD_PLAN_ATTR]
-    assert plan["chunk_ids_by_scale"]["1"] == [[3, 3, 4]]
+    planned = plan["chunk_ids_by_scale"]["1"]
+    assert [3, 3, 4] in planned and all(chunk[0] == 3 for chunk in planned)
     np.testing.assert_array_equal(np.asarray(output["1"])[crop], source["1"][crop])
 
 

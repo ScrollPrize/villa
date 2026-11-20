@@ -14,6 +14,7 @@ from tqdm.auto import tqdm
 from vc_reader import tifxyz
 
 from vesuvius.ink_detection.config import InkDataConfig
+from vesuvius.ink_detection.data.augmentations import NATIVE_CROP_TRANSLATION_MAX_VOXELS
 from vesuvius.ink_detection.data.geometry import (
     compute_native_crop_bbox,
     native_tifxyz_pyramid_params,
@@ -722,10 +723,15 @@ def _build_segment_download_patches(
             flat_grid_stride=stride,
             native_coordinate_scale=coordinate_scale,
         )
-        native_world_bbox = compute_native_crop_bbox(
+        z0, crop_y0, crop_x0, z1, crop_y1, crop_x1 = compute_native_crop_bbox(
             patch_zyxs,
             flat_valid,
             tuple(int(value) for value in patch_size),
+        )
+        # Training may translate the crop in Y and X, so plan every read it can make.
+        pad = NATIVE_CROP_TRANSLATION_MAX_VOXELS
+        native_world_bbox = (
+            z0, crop_y0 - pad, crop_x0 - pad, z1, crop_y1 + pad, crop_x1 + pad
         )
 
         if validation_mask is not None:
