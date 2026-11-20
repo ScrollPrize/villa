@@ -448,6 +448,13 @@ def parse_args(argv=None):
         help='z voxel where the extraction ends, exclusive (default: %(default)s)',
     )
     parser.add_argument(
+        '--downsample-factor', metavar='N', type=int, default=downsample_factor,
+        help='max-pool factor applied to the labelled components before skeletonizing; '
+             'use 1 when neighbouring sheets are only a few voxels apart. Resuming an '
+             'existing DBM with another factor mixes the two: use a new --out '
+             '(default: %(default)s)',
+    )
+    parser.add_argument(
         '--backend', choices=BACKENDS, default=skeleton_backend,
         help='Brook on NVIDIA GPUs, Kimimaro on the CPU, or auto: the GPU backend '
              'when it can run, else Kimimaro (default: %(default)s)',
@@ -484,6 +491,9 @@ def parse_args(argv=None):
                 f'{option} or set {name} at the top of extract_surface_tracks.py')
     if args.z_min < 0 or args.z_min >= args.z_max:
         parser.error('--z-min must be non-negative and less than --z-max')
+    if not 1 <= args.downsample_factor <= min(z_chunk_depth_h, yx_chunk_thickness_v):
+        parser.error(f'--downsample-factor must be between 1 and the slab thickness '
+                     f'({min(z_chunk_depth_h, yx_chunk_thickness_v)})')
     if args.backend == 'cpu' and args.gpus is not None:
         parser.error('--gpus applies to the GPU backend only, not to --backend cpu')
     cpu_opts = ('slab_workers', 'kimimaro_parallel')
@@ -499,14 +509,12 @@ def parse_args(argv=None):
 
 
 def main(argv=None):
-    # The slab functions above read the z range from the module configuration.
-    global z_min, z_max, slab_workers, kimimaro_parallel
+    # The slab functions above read the z range and downsample factor from the module configuration.
+    global z_min, z_max, downsample_factor, slab_workers, kimimaro_parallel
     args = parse_args(argv)
     z_min, z_max = args.z_min, args.z_max
+    downsample_factor = args.downsample_factor
     slab_workers, kimimaro_parallel = args.slab_workers, args.kimimaro_parallel
-
-    assert z_chunk_depth_h >= downsample_factor
-    assert yx_chunk_thickness_v >= downsample_factor
 
     backend = select_backend(args.backend, gpus=args.gpus)
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
