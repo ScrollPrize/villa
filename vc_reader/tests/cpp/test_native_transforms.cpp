@@ -58,6 +58,16 @@ int main()
                 for (std::size_t i = 0; i < n; ++i) worst = std::max(worst, std::abs(x[i]));
                 require(worst < 10.f, "robust normalization of a half constant window");
             }
+            // A standard deviation below a small MAD must not amplify more than the MAD.
+            Sample sparse;
+            sparse["image"] = {Array({1, 17, 64 * 64}, 'f', 4), image};
+            auto* v = static_cast<float*>(sparse.at("image").array.data());
+            for (std::size_t i = 0; i < n; ++i) v[i] = 1000.f + float(i % 3);
+            v[0] = 1030.f;
+            robust.clip = false;
+            const auto out = Pipeline({robust}, schema).run(sparse, 0, true);
+            require(static_cast<const float*>(out.sample.at("image").array.data())[0] < 21.f,
+                    "robust normalization keeps a usable MAD over a smaller deviation");
         }
         Normalize fixed; fixed.scale = 0; rejected(fixed, "fixed scale");
         BrightnessMultiply chance; chance.options.p_channel = 2; rejected(chance, "channel probability");

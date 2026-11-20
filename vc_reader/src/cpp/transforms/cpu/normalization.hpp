@@ -9,12 +9,12 @@ inline ChannelPlan channel_parameters(const Normalize&, const Array&, Random&) {
 namespace normalization_detail {
 using percentile_detail::percentile;
 using percentile_detail::sorted_percentile;
-// The robust scale: 1.4826 MAD, else the first usable fallback. A MAD far below the
-// value span (a window about half one constant value) counts as zero, not as a scale:
-// below five per cent of the span the fallback is the population standard deviation.
+// The robust scale: 1.4826 MAD, else the first usable fallback. Below five per cent of the
+// span (a window about half one constant value) a larger standard deviation replaces the MAD.
 VCR_HD inline double robust_scale(double mad, double deviation, double span) {
     double scale = 1.4826 * mad;
-    if (std::isfinite(scale) && scale >= std::max(1e-6, 5e-2 * std::fabs(span))) return scale;
+    if (std::isfinite(scale) && scale >= 1e-6
+        && (scale >= 5e-2 * std::fabs(span) || !(std::fabs(deviation) > scale))) return scale;
     if (std::isfinite(deviation) && std::fabs(deviation) >= 1e-6) return std::fabs(deviation);
     if (std::isfinite(span) && std::fabs(span) / 2 >= 1e-6) return std::fabs(span) / 2;
     return 1;
