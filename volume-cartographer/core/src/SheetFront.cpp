@@ -35,12 +35,12 @@ cv::Vec3f across(const Points& points, std::size_t i)
 // parameterization anchor. If the front contracts, continue its ends along
 // the sheet instead of piling several vertices onto an endpoint.
 Points redistribute(const Points& predicted, const std::vector<double>& spacing,
-                    const SheetNormalFn& normal, const SheetWalkOptions& options)
+                    const SheetNormalFn& normal, const SheetWalkOptions& options, unsigned workers)
 {
     const auto arc = arcLengths(predicted);
     const auto center = (predicted.size() - 1) / 2;
     Points result(predicted.size());
-    for (std::size_t i = 0; i < predicted.size(); ++i) {
+    forEachIndex(predicted.size(), workers, [&](std::size_t i) {
         const double target = arc[center] + spacing[i] - spacing[center];
         if (target < 0 || target > arc.back()) {
             const bool first = target < 0;
@@ -62,7 +62,7 @@ Points redistribute(const Points& predicted, const std::vector<double>& spacing,
                 result[i] = predicted[j - 1] + (predicted[j] - predicted[j - 1]) * static_cast<float>(t);
             }
         }
-    }
+    });
     return result;
 }
 }
@@ -96,8 +96,11 @@ void walkSheetStrip(const SheetWalk& walk, const SheetNormalFn& normal,
     for (int cell = 0; cell < walk.cells; ++cell) {
         SheetWalk step{0, 1, front, headings, walk.options};
         // Choose directions from the current edge, not from independent rays
-        // launched at the beginning of the entire extension.
-        for (std::size_t i = 0; i < count; ++i) {
+        // launched at the beginning of the entire extension. Each vertex's
+        // direction depends only on the current front, so they are found in
+        // parallel; the normal callback is already called concurrently by
+        // walkSheetLines.
+        forEachIndex(count, workers, [&](std::size_t i) {
             // A chord across a curved step can be shorter than its arc length.
             // Missing normals must not progressively shrink output spacing.
             step.steps[i] = unit(headings[i]) * lengths[i];
@@ -109,11 +112,11 @@ void walkSheetStrip(const SheetWalk& walk, const SheetNormalFn& normal,
                     step.steps[i] = forward * lengths[i];
                 }
             }
-        }
+        });
         // Only this single step is independent. Join before redistributing
         // the new edge so subsequent steps see the same coherent front.
         walkSheetLines(step, normal, predicted, workers);
-        const auto next = redistribute(predicted, spacing, normal, walk.options);
+        const auto next = redistribute(predicted, spacing, normal, walk.options, workers);
         for (std::size_t i = 0; i < count; ++i) {
             headings[i] = predicted[i] - front[i];
             guess[i * walk.cells + cell] = next[i];

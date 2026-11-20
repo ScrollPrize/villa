@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <memory>
 #include <stdexcept>
 #include <vector>
 
@@ -20,6 +21,26 @@ constexpr std::size_t kPatchBytes = sizeof(vcr::sheet_normal::CpuPatch) +
                                     6ULL * vcr::sheet_normal::count * sizeof(float);
 constexpr std::size_t kPatchCacheCapacity = kPatchCacheBytes / kPatchBytes;
 static_assert(kPatchCacheCapacity > 0, "The normal cache must hold at least one patch");
+
+// The filtered patch of the 109 voxel cube around a lattice point. The cube is
+// ZYX with x fastest; outside the volume, and where no chunk is stored, it reads
+// as the fill value. Each thread keeps its cube and filter buffers: read_many
+// writes every voxel of the cube and prepare() writes every buffer element it
+// reads, so nothing carries over from the previous patch, and the 10 MB are not
+// allocated, zeroed and page-faulted again for every new lattice point. Kept out
+// of line so that queries answered from the cache never touch thread-local storage.
+[[gnu::noinline]] std::shared_ptr<vcr::sheet_normal::CpuPatch> preparePatch(vcr::Array& volume,
+                                                                             const std::array<int, 3>& lattice)
+{
+    thread_local auto image =
+        std::make_unique_for_overwrite<uint8_t[]>(static_cast<size_t>(kWidth) * kWidth * kWidth);
+    thread_local vcr::sheet_normal::CpuWorkspace workspace;
+    const vcr::Index start{lattice[2] - kHalf, lattice[1] - kHalf, lattice[0] - kHalf};
+    volume.read_many({start}, {{kWidth, kWidth, kWidth}}, {image.get()});
+    auto prepared = std::make_shared<vcr::sheet_normal::CpuPatch>();
+    workspace.prepare(image.get(), *prepared);
+    return prepared;
+}
 
 } // namespace
 
@@ -54,15 +75,7 @@ std::optional<cv::Vec3f> SheetNormalField::normalAt(const cv::Vec3f& world, bool
     }
     std::optional<cv::Vec3f> result;
     if (!patch) {
-        // The 109 voxel cube around the lattice point, ZYX with x fastest; outside
-        // the volume, and where no chunk is stored, it reads as the fill value.
-        std::vector<uint8_t> image(static_cast<size_t>(kWidth) * kWidth * kWidth);
-        const vcr::Index start{lattice[2] - kHalf, lattice[1] - kHalf, lattice[0] - kHalf};
-        _volume->read_many({start}, {{kWidth, kWidth, kWidth}}, {image.data()});
-        auto prepared = std::make_shared<vcr::sheet_normal::CpuPatch>();
-        vcr::sheet_normal::CpuWorkspace workspace;
-        workspace.prepare(image.data(), *prepared);
-        patch = std::move(prepared);
+        patch = preparePatch(*_volume, lattice);
         if (continuous) {
             std::lock_guard lock(_mutex);
             // Two workers may prepare the same patch concurrently. Keep
