@@ -257,7 +257,7 @@ def prepare_model_for_inference(
     elif device_type == "auto":
         # get_accelerator() tries cuda first, so CUDA hosts resolve exactly as before;
         # it adds mps for Apple Silicon and xpu for Intel GPUs, which otherwise fell back to cpu here.
-        device = get_accelerator()
+        device = get_accelerator(include_xpu=True)
     elif device_type == "cuda":
         if not torch.cuda.is_available():
             raise ValueError("--device cuda was requested, but CUDA is unavailable")

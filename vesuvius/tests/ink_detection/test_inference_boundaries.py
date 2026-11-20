@@ -126,8 +126,8 @@ def test_compile_fallback_returns_eager_model_when_compiler_is_unavailable(monke
     )
 
     assert prepared is source
-    # Without --gpus the device is get_accelerator()'s (cuda, else mps, else cpu), and the model is on it.
-    assert device == get_accelerator()
+    # Without --gpus the device is get_accelerator()'s (cuda, else mps, else xpu, else cpu), and the model is on it.
+    assert device == get_accelerator(include_xpu=True)
     assert next(prepared.parameters()).device.type == device.type
 
 
