@@ -265,6 +265,10 @@ python -m vesuvius.neural_tracing.tracers.fibers.sheet_strip.infer --fibers FIBE
 On validation fiber 469373 (6100 voxels, 758 decisions, 2.5 minutes), the update-16000 checkpoint gave 1.22 voxels
 mean error against 6.89 for the frame plane, with 82% of points within 2 voxels.
 
+`sheet_strip/gap_strips/` derives the fiber stores to trace for fibers that carry `gap` / `damaged` spans (per valid
+piece, or joined and mirror-extended chains so that the end trim does not eat the fiber) and writes the strips as
+patches for the spiral fit (its `README.md`).
+
 `sheet_strip/infer_all.py` runs the same per-fiber inference over every fiber of a store above a length, without scoring or
 renders, sharded over processes. Each strip is written as a tifxyz in `OUT/strips/BUCKET/fiber_UUID` (BUCKET: the UUID's first two digits), with
 `expected_error.tif` when the model predicts its error. An H fiber runs along the strip's columns and a V fiber along
