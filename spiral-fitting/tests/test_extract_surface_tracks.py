@@ -561,19 +561,11 @@ def test_gpu_backend_matches_per_slab_brook(monkeypatch, tmp_path):
     assert _read_dbm(tmp_path / 'fallback.dbm') == {**expected, 'h:16': pickle.dumps(['kept'])}
 
 
-def test_skeletonize_dust_threshold_counts_downsampled_voxels(monkeypatch):
-    """dust_threshold is in full-resolution voxels; the skeletonizer sees the downsampled labels, so it must get the
-    same cutoff prepare_cc_labels applies there, not the full-resolution number."""
-    monkeypatch.setattr(est, 'dust_threshold', 400)
-    monkeypatch.setattr(est, 'downsample_factor', 4)
-    assert est.skeletonize_kwargs()['dust_threshold'] == max(1, 400 // 4 ** 3)
-
-
 def test_component_kept_by_prepare_cc_labels_is_skeletonized(monkeypatch):
-    """A sheet fragment that passes prepare_cc_labels' dust filter must reach the tracks."""
+    """A sheet fragment that passes prepare_cc_labels' dust filter, even exactly at the cutoff, must reach the tracks."""
     pytest.importorskip('kimimaro')
     pytest.importorskip('cc3d')
-    monkeypatch.setattr(est, 'dust_threshold', 400)
+    monkeypatch.setattr(est, 'dust_threshold', 2304)
     monkeypatch.setattr(est, 'downsample_factor', 4)
     monkeypatch.setattr(est, 'path_mode', 'interjoint')
     volume = np.zeros((16, 64, 160), np.uint8)
@@ -582,3 +574,12 @@ def test_component_kept_by_prepare_cc_labels_is_skeletonized(monkeypatch):
     assert labels.max() == 1
     tracks = est.get_skeleton_tracks(labels, (0, 0, 0))
     assert len(tracks) == 1
+
+
+def test_one_voxel_wide_slab_is_skeletonized():
+    """A slab that pools to a line, e.g. a vertical slab over a 4-voxel z range, with a component at its end."""
+    pytest.importorskip('kimimaro')
+    labels = np.zeros((1, 1, 32), np.uint32)
+    labels[0, 0, 16:] = 1
+    tracks = est.get_skeleton_tracks(labels, (0, 0, 0))
+    assert [len(t) for t in tracks] == [16]

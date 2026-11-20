@@ -132,9 +132,8 @@ def skeletonize_kwargs():
     return dict(
         teasar_params={'scale': 1., 'const': 2.},
         anisotropy=(downsample_factor, downsample_factor, downsample_factor),  # skeletons therefore have not-downsampled coordinates
-        # the skeletonizer counts voxels of the downsampled labels; dust_threshold is in full-res voxels
-        # (the same conversion prepare_cc_labels and the GPU backend's component filter use)
-        dust_threshold=max(1, dust_threshold // downsample_factor ** 3),
+        # one below prepare_cc_labels' downsampled cutoff (it keeps counts >= it); Kimimaro and Brook keep counts > this
+        dust_threshold=max(1, dust_threshold // downsample_factor ** 3) - 1,
         fix_branching=True,
         fix_borders=True,
         fill_holes=False,
@@ -160,12 +159,15 @@ def get_skeleton_tracks(cc_labels, offset_zyx, verbose=False, skeletonize=None):
     Any function with Kimimaro's signature can be passed, e.g. ``brook.skeletonize``.
     """
     import networkx as nx
+    kwargs = skeletonize_kwargs()
     if skeletonize is None:
         import kimimaro
         skeletonize = kimimaro.skeletonize
+        if sorted(cc_labels.shape)[1] == 1:
+            kwargs['fix_borders'] = False  # Kimimaro's border targets index out of bounds on a one-voxel face
     skeletons = skeletonize(
         cc_labels,
-        **skeletonize_kwargs(),
+        **kwargs,
         progress=verbose,
         parallel=kimimaro_parallel,
         parallel_chunk_size=250,
