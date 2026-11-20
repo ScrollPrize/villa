@@ -862,8 +862,12 @@ OpenDataManifest loadOpenDataManifestFile(const std::filesystem::path& manifestP
 
 // The public channels' s3:// and https:// roots, as the scrollprize.org data
 // browser rewrites them.
+// The first https:// root of a channel is the one s3:// URLs resolve to; later ones are other
+// spellings of the same channel (the region-less virtual-hosted endpoint is the form the data
+// browser and the model cards publish), accepted when mapping back to s3://.
 constexpr std::pair<std::string_view, std::string_view> kPublicChannels[] = {
     {"s3://vesuvius-challenge-open-data/", "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/"},
+    {"s3://vesuvius-challenge-open-data/", "https://vesuvius-challenge-open-data.s3.amazonaws.com/"},
     {"s3://vesuvius-challenge/", "https://data.aws.ash2txt.org/samples/"},
 };
 
