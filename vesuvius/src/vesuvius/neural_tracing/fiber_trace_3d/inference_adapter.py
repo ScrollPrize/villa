@@ -79,6 +79,12 @@ def _config_from_checkpoint(
     if checkpoint_config is not None:
         effective = dict(config)
         effective.update(checkpoint_config)
+        # Checkpoint training metadata must not undo resolved inference precision.
+        runtime_training = config.get("training", {})
+        if "mixed_precision" in runtime_training:
+            training = dict(effective.get("training", {}))
+            training["mixed_precision"] = runtime_training["mixed_precision"]
+            effective["training"] = training
         effective.setdefault("_config_dir", config.get("_config_dir"))
         if not _conditioned_decoder_enabled(effective):
             inference_cfg = dict(effective.get("inference", {}))

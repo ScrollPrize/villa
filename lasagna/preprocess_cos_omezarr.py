@@ -37,6 +37,7 @@ except ImportError:
 	numba = None
 	_HAS_NUMBA = False
 import torch
+from vesuvius.utils.models.helpers import inference_autocast_enabled
 import vc_reader
 from vc_reader.reader import ZarrGroup, ZarrWriter, open_group, open_node, open_zarr
 
@@ -247,7 +248,7 @@ class LasagnaCosPredict3DAdapter:
 			module.running_var = torch.ones(module.num_features, device=device)
 
 	def run_tile_inference(self, model, tile: torch.Tensor, *, device: torch.device):
-		with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+		with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=inference_autocast_enabled(device)):
 			output = model(tile)
 		return output["output"] if isinstance(output, dict) else output
 
@@ -2673,6 +2674,7 @@ def main_predict3d(argv: list[str] | None = None) -> int:
 	try:
 		from inference_provenance import (
 			atomic_write as write_provenance,
+			check_resume_precision,
 			base_document,
 			code_commit,
 			finalize_document,
@@ -2682,6 +2684,7 @@ def main_predict3d(argv: list[str] | None = None) -> int:
 	except ImportError:  # pragma: no cover - monorepo package import mode.
 		from lasagna.inference_provenance import (
 			atomic_write as write_provenance,
+			check_resume_precision,
 			base_document,
 			code_commit,
 			finalize_document,
@@ -2692,6 +2695,14 @@ def main_predict3d(argv: list[str] | None = None) -> int:
 	output_manifest, args.output_format = resolve_output(args.output, args.output_format)
 	args.output = str(output_manifest)
 	provenance_path = output_manifest.parent / "inference.json"
+	# Device validation happens in run_preprocess_3d; --devices always names CUDA devices.
+	requested_device = str(args.device or "auto").strip().lower()
+	if args.devices is not None or requested_device != "auto":
+		precision_device = torch.device("cuda" if args.devices is not None else requested_device)
+	else:
+		precision_device = resolve_inference_devices(device=None, auto_mps=True)[0]
+	inference_precision = "bf16" if inference_autocast_enabled(precision_device) else "fp32"
+	check_resume_precision(provenance_path, inference_precision)
 	context = load_context(args.provenance_context)
 	provenance = base_document(artifact_kind="lasagna", context=context)
 	checkpoint_payload = torch.load(args.unet_checkpoint, map_location="cpu", weights_only=True)
@@ -2718,6 +2729,7 @@ def main_predict3d(argv: list[str] | None = None) -> int:
 			"ome_chunk": int(args.ome_chunk),
 			"ome_compressor_requested": str(args.ome_compressor),
 			"product_accumulator_dtype": str(args.product_accumulator_dtype),
+			"precision": inference_precision,
 			"input": {
 				"location": str(args.input),
 				"disk_cache_dir": args.input_disk_cache_dir,
