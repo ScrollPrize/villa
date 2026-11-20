@@ -13,7 +13,11 @@
 #include "internal/ObjectVersionJson.hpp"
 #include "internal/RecordOverrides.hpp"
 #include "internal/ReferenceResolver.hpp"
+#include "internal/ReadTiming.hpp"
+#include "internal/SelectedRead.hpp"
 #include <limits>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace vc::objects {
 using namespace detail;
@@ -67,6 +71,93 @@ nlohmann::json detail::currentDependencyMetadata(sqlite3* db,const std::string& 
 }
 namespace {
 using Json = nlohmann::json;
+
+// The incident live edges of the selected objects in one query source, read
+// with batched IN lists instead of one query per object. Each (edge, selected
+// endpoint) pair is collected from the one batch that holds that endpoint, so
+// an endpoint's list holds exactly the rows of its per-object query
+// (state=0 AND (a_uuid=? OR b_uuid=?) ORDER BY uuid), in that order. The
+// batches walk the endpoints in key order, so the index probes of one batch
+// touch neighbouring pages instead of pages spread over the whole table.
+const std::unordered_map<std::string, std::vector<std::string>>& incidenceOf(
+    SelectedReadMemo& memo, sqlite3* scope, sqlite3* source, const std::vector<std::string>& selectedUuids)
+{
+    // The rows depend on the source connection and the fixed selection only; `scope` (a sharded collection's query scope) filters visibility later,
+    // so every scope shares one table instead of rescanning and retaining a copy per scope.
+    (void)scope;
+    if (const auto found = memo.incidence.find(source); found != memo.incidence.end()) return found->second;
+    auto& table = memo.incidence[source];
+    ScopedReadTimer buildTimer(readTiming().incidentBuild);
+    const auto capacity = std::min(size_t(500), size_t(sqlite3_limit(source, SQLITE_LIMIT_VARIABLE_NUMBER, -1)));
+    if (!capacity) throw std::runtime_error("SQLite variable limit cannot hold a UUID");
+    std::vector<std::array<unsigned char, 16>> keys;
+    keys.reserve(selectedUuids.size());
+    for (const auto& uuid : selectedUuids) keys.push_back(parseUuid(uuid));
+    std::sort(keys.begin(), keys.end());
+    // The key columns are physical in every layout (no read fallback), so the
+    // table is queried directly.
+    const std::string from = " FROM edges WHERE " + edgeReadColumn(source, "state") + "=0 ";
+    // A selection that covers much of the store (a fit reads every track) is
+    // served by one pass over the edge table in key order: every row is read
+    // once, sequentially, and each endpoint's rows arrive in edge uuid order.
+    // A small selection in a large store probes the adjacency indexes instead.
+    int64_t objectCount = 0;
+    // Only "does the selection cover at least a tenth of the store" matters: count up to that threshold plus one, so a small selection never pays for a scan
+    // of a multi-million-object table.
+    { Statement count(source, "SELECT count(*) FROM (SELECT 1 FROM objects LIMIT ?1)");
+      count.bind(1, int64_t(keys.size()) * 10 + 1);
+      if (count.row()) objectCount = count.i64(0); }
+    if (objectCount > 0 && keys.size() * 10 >= size_t(objectCount)) {
+        std::unordered_set<std::string> selected;
+        for (const auto& key : keys) selected.insert(formatUuid(key));
+        Statement rows(source, "SELECT uuid,a_uuid,b_uuid" + from + "ORDER BY uuid");
+        while (rows.row()) {
+            const auto a = rows.uuid(1), b = rows.uuid(2);
+            const bool aSelected = selected.contains(a), bSelected = b != a && selected.contains(b);
+            if (!aSelected && !bSelected) continue;
+            const auto edge = rows.uuid(0);
+            if (aSelected) table[a].push_back(edge);
+            if (bSelected) table[b].push_back(edge);
+        }
+        return table;
+    }
+    // One query per endpoint column, each served by that column's adjacency
+    // index; the two row sets of an endpoint are merged in edge uuid order.
+    const std::string probe = from + "AND ";
+    std::string sqlA, sqlB; size_t previous = 0;
+    std::unordered_map<std::string, std::vector<std::pair<std::array<unsigned char, 16>, std::string>>> hits;
+    for (size_t begin = 0; begin < keys.size();) {
+        const auto n = std::min(capacity, keys.size() - begin);
+        if (n != previous) {
+            std::string parameters;
+            for (size_t i = 0; i < n; ++i) { if (i) parameters += ','; parameters += '?' + std::to_string(i + 1); }
+            sqlA = "SELECT uuid,a_uuid,b_uuid" + probe + "a_uuid IN (" + parameters + ") ORDER BY uuid";
+            sqlB = "SELECT uuid,a_uuid,b_uuid" + probe + "b_uuid IN (" + parameters + ") ORDER BY uuid";
+            previous = n;
+        }
+        std::unordered_set<std::string> batch;
+        for (size_t i = 0; i < n; ++i) batch.insert(formatUuid(keys[begin + i]));
+        for (const auto* sql : {&sqlA, &sqlB}) {
+            Statement rows(source, *sql);
+            for (size_t i = 0; i < n; ++i) rows.bind(int(i + 1), keys[begin + i]);
+            const bool byA = sql == &sqlA;
+            while (rows.row()) {
+                const auto a = rows.uuid(1), b = rows.uuid(2);
+                const auto& endpoint = byA ? a : b;
+                if (!byA && b == a) continue;            // a self-edge is one row of its endpoint's query
+                if (batch.contains(endpoint)) hits[endpoint].emplace_back(rows.blob16(0), rows.uuid(0));
+            }
+        }
+        begin += n;
+    }
+    for (auto& [endpoint, list] : hits) {
+        std::sort(list.begin(), list.end(), [](const auto& x, const auto& y) { return x.first < y.first; });
+        auto& out = table[endpoint];
+        out.reserve(list.size());
+        for (auto& hit : list) out.push_back(std::move(hit.second));
+    }
+    return table;
+}
 
 // Archived revision UUIDs and ordinary four-field ObjectVersion references.
 // Both forms are binary in SQLite; public APIs use canonical text UUIDs.
@@ -160,9 +251,19 @@ Json metadata(sqlite3* db, const ObjectRevisionKey& key)
 std::map<std::string, std::string> members(sqlite3* db, const std::string& revision)
 {
     std::map<std::string, std::string> result;
-    const auto resolved=resolveObjectRevision(db,revision);
-    if(!resolved)throw std::runtime_error("history: unavailable membership revision");
-    if(resolved->source!=db)return members(resolved->source,resolved->revision.uuid);
+    sqlite3* source = nullptr;
+    const auto canonical = formatUuid(parseUuid(revision));
+    if (activeSelectedRead) {
+        // The revision's source is known from its earlier resolution in this read.
+        const auto known = activeSelectedRead->revisionSources.find(canonical);
+        if (known != activeSelectedRead->revisionSources.end()) source = known->second;
+    }
+    if (!source) {
+        const auto resolved=resolveObjectRevision(db,revision);
+        if(!resolved)throw std::runtime_error("history: unavailable membership revision");
+        source = resolved->source;
+    }
+    if(source!=db)return members(source,canonical);
     Statement isHead(db, "SELECT object_uuid FROM object_heads WHERE revision_uuid=?", parseUuid(revision));
     if (isHead.row()) {
         Statement s(db, "SELECT edge_uuid,relationship_uuid FROM object_relationship_heads WHERE object_uuid=?",
@@ -183,6 +284,41 @@ std::map<std::string, std::string> members(sqlite3* db, const std::string& revis
     return result;
 }
 
+// One relationship revision from its row (record, a_revision, b_revision,
+// a_geometry, b_geometry at `first`..`first+4`) and its numbered version, if any.
+RelationshipRevision relationshipFromRow(sqlite3* db, const std::string& uuid, Statement& s, int first,
+                                         std::optional<int64_t> version, const std::optional<std::string>& generation)
+{
+    RelationshipRevision result;
+    result.uuid = uuid;
+    auto& timing = readTiming();
+    Json record;
+    { ScopedReadTimer timer(timing.rowJsonParse); record = Json::parse(s.text(first)); }
+    { ScopedReadTimer timer(timing.rowEdgeFromJson); result.record = edgeFromJson(record); }
+    { ScopedReadTimer timer(timing.rowStoreUuid); result.record.versionStoreUuid = storeUuidText(db); }
+    ScopedReadTimer refsTimer(timing.rowReferences);
+    const auto aKey = referenceColumn(s,first+1), bKey = referenceColumn(s,first+2);
+    if (const auto* archive = std::get_if<std::string>(&aKey)) result.aRevision = *archive;
+    if (const auto* archive = std::get_if<std::string>(&bKey)) result.bRevision = *archive;
+    result.aGeometryRevision = optionalUuid(s,first+3); result.bGeometryRevision = optionalUuid(s,first+4);
+    if (version) { result.version=*version; result.generation=*generation; }
+    result.record.version = result.version;
+    result.record.versionGeneration = result.generation;
+    const auto endpointReference = [&](const ObjectRevisionKey& reference) {
+        if(const auto* ref=std::get_if<ObjectVersion>(&reference))return *ref;
+        if(activeSelectedRead){
+            // A selected endpoint's reference is already known from its resolved revision.
+            const auto known=activeSelectedRead->referencesByRevision.find(formatUuid(parseUuid(std::get<std::string>(reference))));
+            if(known!=activeSelectedRead->referencesByRevision.end()){++readTiming().referenceMemoHits;return known->second;}
+            ++readTiming().referenceMemoMisses;
+        }
+        const auto value=resolveObjectRevisionKey(db,reference);
+        return value?value->revision.reference():ObjectVersion{};
+    };
+    result.aReference=endpointReference(aKey);result.bReference=endpointReference(bKey);
+    return result;
+}
+
 RelationshipRevision relationship(sqlite3* db, const std::string& uuid)
 {
     db=resolveReference(db,[&](sqlite3* source){
@@ -193,26 +329,69 @@ RelationshipRevision relationship(sqlite3* db, const std::string& uuid)
     Statement s(db, "SELECT record,a_revision,b_revision,a_geometry,b_geometry FROM main.relationship_revisions WHERE uuid=?",
         parseUuid(uuid));
     if (!s.row()) throw std::runtime_error("object history: missing relationship revision");
-    RelationshipRevision result;
-    result.uuid = uuid;
-    const auto record = Json::parse(s.text(0));
-    result.record = edgeFromJson(record);
-    result.record.versionStoreUuid = storeUuidText(db);
-    const auto aKey = referenceColumn(s,1), bKey = referenceColumn(s,2);
-    if (const auto* archive = std::get_if<std::string>(&aKey)) result.aRevision = *archive;
-    if (const auto* archive = std::get_if<std::string>(&bKey)) result.bRevision = *archive;
-    result.aGeometryRevision = optionalUuid(s,3); result.bGeometryRevision = optionalUuid(s,4);
-    Statement version(db, "SELECT version,generation FROM main.relationship_versions WHERE revision_uuid=?", parseUuid(uuid));
-    if (version.row()) { result.version=version.i64(0); result.generation=version.uuid(1); }
-    result.record.version = result.version;
-    result.record.versionGeneration = result.generation;
-    const auto endpointReference = [&](const ObjectRevisionKey& reference) {
-        if(const auto* ref=std::get_if<ObjectVersion>(&reference))return *ref;
-        const auto value=resolveObjectRevisionKey(db,reference);
-        return value?value->revision.reference():ObjectVersion{};
+    std::optional<int64_t> version; std::optional<std::string> generation;
+    Statement numbered(db, "SELECT version,generation FROM main.relationship_versions WHERE revision_uuid=?", parseUuid(uuid));
+    if (numbered.row()) { version=numbered.i64(0); generation=numbered.uuid(1); }
+    return relationshipFromRow(db, uuid, s, 0, version, generation);
+}
+
+// The recorded bindings of many edges of one history-enabled scope at once: the
+// head binding of each edge (the row its per-edge LIMIT 1 lookup visits first:
+// index order edge uuid, then object uuid), then the bound relationship
+// revisions with their numbered versions, in batched IN-list queries, through
+// the same row reader as relationship(). An edge without a head row here, or
+// whose revision is not in this scope's own history, is left out and
+// recordedRelationship() answers it one at a time as before.
+void recordedRelationshipsOf(sqlite3* db, const std::vector<std::string>& edges, SelectedReadMemo& memo)
+{
+    if (!historyEnabled(db) || edges.empty()) return;
+    const auto capacity = std::min(size_t(500), size_t(sqlite3_limit(db, SQLITE_LIMIT_VARIABLE_NUMBER, -1)));
+    if (!capacity) throw std::runtime_error("SQLite variable limit cannot hold a UUID");
+    const auto parameters = [](size_t n) {
+        std::string p; for (size_t i = 0; i < n; ++i) { if (i) p += ','; p += '?' + std::to_string(i + 1); } return p;
     };
-    result.aReference=endpointReference(aKey);result.bReference=endpointReference(bKey);
-    return result;
+    std::map<std::string, std::vector<std::string>> edgesByHead; // relationship revision uuid -> the edges bound to it
+    auto& timing = readTiming();
+    ScopedReadTimer headsTimer(timing.recordedHeads);
+    std::vector<std::array<unsigned char, 16>> keys;      // the edges in key order: neighbouring index pages per batch
+    keys.reserve(edges.size());
+    for (const auto& edge : edges) keys.push_back(parseUuid(edge));
+    std::sort(keys.begin(), keys.end());
+    for (size_t begin = 0; begin < keys.size();) {
+        const auto n = std::min(capacity, keys.size() - begin);
+        Statement heads(db, "SELECT edge_uuid,relationship_uuid FROM object_relationship_heads WHERE edge_uuid IN (" +
+            parameters(n) + ") ORDER BY edge_uuid,object_uuid");
+        for (size_t i = 0; i < n; ++i) heads.bind(int(i + 1), keys[begin + i]);
+        std::string previous;
+        while (heads.row()) {
+            auto edge = heads.uuid(0);
+            if (edge == previous) continue;
+            previous = edge;
+            edgesByHead[heads.uuid(1)].push_back(std::move(edge));
+        }
+        begin += n;
+    }
+    std::vector<std::string> revisions; revisions.reserve(edgesByHead.size());
+    for (const auto& [revision, bound] : edgesByHead) revisions.push_back(revision);
+    for (size_t begin = 0; begin < revisions.size();) {
+        const auto n = std::min(capacity, revisions.size() - begin);
+        Statement rows(db, "SELECT r.uuid,r.record,r.a_revision,r.b_revision,r.a_geometry,r.b_geometry,v.version,v.generation "
+            "FROM main.relationship_revisions r LEFT JOIN main.relationship_versions v ON v.revision_uuid=r.uuid WHERE r.uuid IN (" +
+            parameters(n) + ")");
+        for (size_t i = 0; i < n; ++i) rows.bind(int(i + 1), parseUuid(revisions[begin + i]));
+        while (true) {
+            bool more;
+            { ScopedReadTimer timer(timing.recordedRows); more = rows.row(); }
+            if (!more) break;
+            const auto revision = rows.uuid(0);
+            std::optional<int64_t> version; std::optional<std::string> generation;
+            if (!rows.isNull(6)) { version = rows.i64(6); generation = rows.uuid(7); }
+            const auto binding = relationshipFromRow(db, revision, rows, 1, version, generation);
+            ScopedReadTimer timer(timing.recordedEmplace);
+            for (const auto& edge : edgesByHead.at(revision)) memo.bindings.emplace(std::pair{db, edge}, binding);
+        }
+        begin += n;
+    }
 }
 
 // One dependency definition for selected graphs and current indexed queries.
@@ -221,6 +400,15 @@ bool endpointApplies(const ObjectStore& store, const Txn& txn, const Anchor& anc
                      const ObjectRevision& selected)
 {
     if (selected.deleted || selected.record.retired) return false;
+    // The pinned endpoint IS the selected revision (the usual case of a selected
+    // graph): the record compared with itself has equal dependency metadata, so
+    // only the geometry dependencies decide. Same answer, without resolving the
+    // revision again or serialising the record twice.
+    if (selected.version > 0 && !selected.storeUuid.empty() && !selected.generation.empty() &&
+        !selected.objectUuid.empty() && pinned == selected.reference()) {
+        if (!anchor.metadataKeys.empty() && !selected.metadataComplete) return false;
+        return !endpointChanged(store, txn, anchor, geometry, selected.geometryRevision);
+    }
     const auto original = store.objectAtVersion(txn, pinned);
     if (!original || (!anchor.metadataKeys.empty() && !original->metadataComplete)) return false;
     return dependencyMetadata(objectToJson(original->record), anchor) ==
@@ -485,6 +673,8 @@ void detail::publishHistory(sqlite3* db, bool baseline)
                 throw std::runtime_error("object history: missing expected validation endpoint " + formatUuid(required.blob16(0)));
         }
     }
+    std::optional<GeometryPhase> step;
+    step.emplace("history.dirty_objects");
     while (dirty.row()) {
         const auto object = formatUuid(dirty.blob16(0));
         if(borrowedObject(db,object))continue;
@@ -520,6 +710,7 @@ void detail::publishHistory(sqlite3* db, bool baseline)
     }
     // Ordinary metadata is independent unless the relationship declares a
     // dependency. Check the final state, not the order of earlier API calls.
+    step.reset(); step.emplace("history.metadata_dependencies");
     for (const auto& [object, p] : objects) {
         if (!p.exists || p.delta.empty()) continue;
         // A promoted external endpoint has no fabricated local predecessor.
@@ -555,6 +746,7 @@ void detail::publishHistory(sqlite3* db, bool baseline)
     };
     std::vector<ChangedEdge> edges;
     Statement dirtyEdges(db, "SELECT uuid FROM history_dirty_edges ORDER BY uuid");
+    step.reset(); step.emplace("history.changed_edges");
     while (dirtyEdges.row()) {
         ChangedEdge e;
         e.uuid = formatUuid(dirtyEdges.blob16(0));
@@ -636,6 +828,7 @@ void detail::publishHistory(sqlite3* db, bool baseline)
     CommitPublisher commit(db, publishedAtUs, baseline);
     // Allocate all identities first: shared records may pin both revisions
     // published by this action, including cycles and self relationships.
+    step.reset(); step.emplace("history.object_revisions");
     for (auto& [object, p] : objects) {
         if (!p.exists) {
             if (const auto before = publicationBase(db, object)) {
@@ -690,17 +883,31 @@ void detail::publishHistory(sqlite3* db, bool baseline)
         if(!row.row())throw std::runtime_error("history: endpoint version unavailable");
         return row.uuid(0);
     };
+    step.reset(); step.emplace("history.edge_revisions");
+    // Within this commit an endpoint's pinned revision for a geometry and the
+    // lifecycle epoch of a pinned revision do not change: look each up once.
+    std::map<std::pair<std::string, std::optional<std::string>>, ObjectRevisionKey> pins;
+    std::map<ObjectRevisionKey, std::string> epochs;
+    const auto pinOf = [&](const std::string& object, const std::optional<std::string>& geometry) {
+        const auto key = std::pair{object, geometry};
+        auto found = pins.find(key);
+        if (found == pins.end()) found = pins.emplace(key, pin(object, geometry)).first;
+        return found->second;
+    };
+    const auto epochOf = [&](const ObjectRevisionKey& reference) -> const std::string& {
+        auto found = epochs.find(reference);
+        if (found == epochs.end()) found = epochs.emplace(reference, metadata(db, reference).value("lifecycle_epoch", "")).first;
+        return found->second;
+    };
     for (const auto& edge : edges) {
         if (edge.record) {
-            const auto aPin = edge.aPin ? *edge.aPin : pin(edge.record->aUuid, edge.aGeometry);
-            const auto bPin = edge.bPin ? *edge.bPin : pin(edge.record->bUuid, edge.bGeometry);
+            const auto aPin = edge.aPin ? *edge.aPin : pinOf(edge.record->aUuid, edge.aGeometry);
+            const auto bPin = edge.bPin ? *edge.bPin : pinOf(edge.record->bUuid, edge.bGeometry);
             if (!baseline) writeRecordVersion(db,"edges",edge.uuid);
             Statement currentEdge(db, "SELECT "+projectedEdgeColumns(db)+" FROM "+edgeReadSource(db)+" AS edges WHERE uuid=?",parseUuid(edge.uuid)); currentEdge.row();
             execute(db, "INSERT INTO relationship_revisions VALUES(?,?,?,?,?,?,?)", parseUuid(edge.version), parseUuid(edge.uuid),
                 edgeToJson(readEdgeRow(db,currentEdge), nullptr, false).dump(), sqlReference(aPin), sqlReference(bPin), sqlReference(edge.aGeometry), sqlReference(edge.bGeometry));
-            const auto a = metadata(db, aPin);
-            const auto b = metadata(db, bPin);
-            bindLifecycle(db, *edge.record, a.value("lifecycle_epoch", ""), b.value("lifecycle_epoch", ""));
+            bindLifecycle(db, *edge.record, epochOf(aPin), epochOf(bPin));
             commit.relationship(edge.uuid, edge.version);
         } else {
             commit.relationship(edge.uuid, std::nullopt);
@@ -767,6 +974,7 @@ std::optional<ResolvedObjectVersion> detail::resolveObjectRevision(sqlite3* db,c
     Statement version(db,"SELECT version,generation,commit_seq FROM main.object_versions WHERE revision_uuid=?",parseUuid(canonical));
     if(version.row()){result.version=version.i64(0);result.generation=version.uuid(1);if(!version.isNull(2))result.commitSequence=version.i64(2);}
     setRecord(result,metadata(db,canonical));
+    if(activeSelectedRead)activeSelectedRead->revisionSources.emplace(canonical,db);
     return ResolvedObjectVersion{db,std::move(result)};
 }
 std::optional<ResolvedObjectVersion> detail::resolveObjectVersion(sqlite3* db,const ObjectVersion& reference)
@@ -794,6 +1002,11 @@ std::optional<ResolvedObjectVersion> detail::resolveObjectVersion(sqlite3* db,co
         if(!row.row())return false;
         result=resolveObjectRevision(source,row.uuid(0));return bool(result);
     });
+    if(result&&activeSelectedRead){
+        activeSelectedRead->versionSources.emplace(reference,result->source);
+        if(!result->revision.uuid.empty())
+            activeSelectedRead->revisionSources.emplace(formatUuid(parseUuid(result->revision.uuid)),result->source);
+    }
     return result;
 }
 std::optional<ObjectRevision> ObjectStore::objectRevision(const Txn& txn,const std::string& uuid)const
@@ -962,36 +1175,88 @@ std::vector<SelectedRelationship> ObjectStore::relationshipsAtSelected(const Txn
         if(found==revisions.end())return true; // Incident bindings still expose off-screen endpoints.
         return reference==found->second.reference();
     };
+    auto& timing = readTiming();
+    SelectedReadScope memoScope;
+    auto& memo = memoScope.active();
+    std::vector<std::string> selectedUuids;
+    selectedUuids.reserve(selection.size());
+    for (const auto& revision : selection) {
+        selectedUuids.push_back(revision.objectUuid);
+        if (!revision.uuid.empty() && revision.version > 0 && !revision.storeUuid.empty() && !revision.generation.empty())
+            memo.referencesByRevision.emplace(formatUuid(parseUuid(revision.uuid)), revision.reference());
+    }
     for (const auto& revision : selection) {
         const auto& uuid=revision.objectUuid;
         const auto* value=&revisions.at(uuid);
-        const auto archived=value->uuid.empty()?std::map<std::string,std::string>{}:members(db,value->uuid);
+        std::map<std::string,std::string> archived;
+        { ScopedReadTimer timer(timing.members); if(!value->uuid.empty()) archived=members(db,value->uuid); }
         Membership selected;
         // Include bindings created in overlays or other shards only when they
         // actually record this exact endpoint. Never replace archived membership
         // using a newer endpoint merely because the attachment has no history.
-        const auto source=resolveObjectVersion(db,value->reference());
+        sqlite3* sourceDb=nullptr;
+        { ScopedReadTimer timer(timing.scopeResolve);
+          // The source of this revision is known from its resolution in this read.
+          if(const auto known=memo.versionSources.find(value->reference());known!=memo.versionSources.end())sourceDb=known->second;
+          else if(const auto resolved=resolveObjectVersion(db,value->reference()))sourceDb=resolved->source;
+          // A revision saved before an update in a store without history may name a version that is no longer retained.
+          else throw std::invalid_argument("object history: selected version is not recorded in this store and generation: "+uuid); }
         std::vector<sqlite3*> scopes{db};
-        if(source->source!=db&&!historyEnabled(source->source))scopes.push_back(source->source);
+        if(sourceDb!=db&&!historyEnabled(sourceDb))scopes.push_back(sourceDb);
         std::set<std::string> seenBindings;
+        const auto canonicalUuid=formatUuid(parseUuid(uuid));
         for(auto* scope:scopes){
-            for(const auto& visible:incidentEdges(scope,uuid)){
-                const auto binding=recordedRelationship(scope,visible.uuid);
-                if(!binding)continue;
-                if(!matchesSelectedEndpoint(binding->record.aUuid,binding->aReference)||
-                   !matchesSelectedEndpoint(binding->record.bUuid,binding->bReference))continue;
-                if(!seenBindings.insert(visible.uuid).second)continue;
-                const auto key=binding->reference();
-                selected[visible.uuid]=key;
-                bindings.insert_or_assign(key,*binding);
+            // The rows incidentEdges(scope, uuid) returns: per query source, the
+            // live edges at this endpoint whose edgeSource is that source.
+            std::vector<std::string> visibleEdges;
+            { ScopedReadTimer timer(timing.incident);
+              for(auto* querySource:querySources(scope)){
+                const auto& table=incidenceOf(memo,scope,querySource,selectedUuids);
+                const auto found=table.find(canonicalUuid);
+                if(found==table.end())continue;
+                for(const auto& edge:found->second){
+                    auto owner=memo.edgeSources.find({scope,edge});
+                    if(owner==memo.edgeSources.end())
+                        owner=memo.edgeSources.emplace(std::pair{scope,edge},recordSource(scope,edge,false,false,false,querySource)).first;
+                    if(owner->second==querySource)visibleEdges.push_back(edge);
+                }
+              } }
+            timing.incidentEdges += long(visibleEdges.size());
+            if(!memo.prefilled.contains(scope)){
+                // Decode the bindings of every incident edge of this scope in one batch.
+                memo.prefilled.insert(scope);
+                std::vector<std::string> all; std::unordered_set<std::string> seen;
+                for(auto* querySource:querySources(scope))
+                    for(const auto& [endpoint,list]:incidenceOf(memo,scope,querySource,selectedUuids))
+                        for(const auto& edge:list) if(seen.insert(edge).second) all.push_back(edge);
+                ScopedReadTimer timer(timing.recorded);
+                recordedRelationshipsOf(scope,all,memo);
+                timing.recordedCalls += long(all.size());
+            }
+            for(const auto& visible:visibleEdges){
+                auto binding=memo.bindings.find({scope,visible});
+                if(binding==memo.bindings.end()){
+                    ScopedReadTimer timer(timing.recorded);
+                    binding=memo.bindings.emplace(std::pair{scope,visible},recordedRelationship(scope,visible)).first;
+                    ++timing.recordedCalls;
+                }
+                if(!binding->second)continue;
+                if(!matchesSelectedEndpoint(binding->second->record.aUuid,binding->second->aReference)||
+                   !matchesSelectedEndpoint(binding->second->record.bUuid,binding->second->bReference))continue;
+                if(!seenBindings.insert(visible).second)continue;
+                const auto key=binding->second->reference();
+                selected[visible]=key;
+                bindings.insert_or_assign(key,*binding->second);
             }
         }
         // Resolve only surviving physical memberships, after current bindings
         // have taken precedence. Each distinct archive is decoded once.
+        ScopedReadTimer archiveTimer(timing.archives);
         for(const auto& [edge,archive]:archived)if(!selected.contains(edge)){
             auto known=archives.find(archive);
             if(known==archives.end()){
                 auto binding=relationship(db,archive);
+                ++timing.archiveDecodes;
                 known=archives.emplace(archive,binding.reference()).first;
                 bindings.try_emplace(known->second,std::move(binding));
             }
@@ -1001,6 +1266,7 @@ std::vector<SelectedRelationship> ObjectStore::relationshipsAtSelected(const Txn
         memberships.emplace(uuid, std::move(selected));
     }
     std::vector<SelectedRelationship> result;
+    ScopedReadTimer appliesTimer(timing.applies);
     for (const auto& version : versions) {
         auto edge = bindings.at(version);
         auto endpoint = [&](const std::string& object, const Anchor& anchor, const std::optional<std::string>& geometry,
@@ -1009,15 +1275,16 @@ std::vector<SelectedRelationship> ObjectStore::relationshipsAtSelected(const Txn
             if (found == revisions.end()) return false;
             const auto& membership = memberships.at(object);
             const auto member = membership.find(edge.record.uuid);
-            return ((member != membership.end() && member->second == version) ||
-                    (member == membership.end() && matchesSelectedEndpoint(object,pinned))) &&
-                endpointApplies(*this, txn, anchor, geometry, pinned, found->second);
+            if (!((member != membership.end() && member->second == version) ||
+                  (member == membership.end() && matchesSelectedEndpoint(object,pinned)))) return false;
+            ++timing.appliesCalls;
+            return endpointApplies(*this, txn, anchor, geometry, pinned, found->second);
         };
         const bool applicable = endpoint(edge.record.aUuid, edge.record.aAnchor, edge.aGeometryRevision, edge.aReference) &&
                                 endpoint(edge.record.bUuid, edge.record.bAnchor, edge.bGeometryRevision, edge.bReference);
         result.push_back({std::move(edge), applicable});
     }
-    orderRelationships(result);
+    { ScopedReadTimer timer(timing.order); orderRelationships(result); }
     return result;
 }
 

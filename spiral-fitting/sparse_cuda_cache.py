@@ -182,6 +182,19 @@ class ResidentBrickPool:
         self.table = None
 
 
+
+def resident_brick_pool_class():
+    """ResidentBrickPool, or its host-RAM subclass (brick_pool_offload.OffloadBrickPool) when FIT_SPIRAL_POOL_OFFLOAD=1.
+
+    The offload keeps the brick table and the index arithmetic on the card but holds the uint8 pool in page-locked host RAM mapped into the
+    card's address space, so a whole-height fit of a tall or many-winding scroll fits a 24-32 GB card; values are bit-identical to the
+    resident gather (see POOL_OFFLOAD.md). Default off."""
+    if os.environ.get("FIT_SPIRAL_POOL_OFFLOAD") == "1":
+        import sys
+        import brick_pool_offload
+        return brick_pool_offload.offload_class(sys.modules[__name__])
+    return ResidentBrickPool
+
 class SparseLasagnaStore:
     def __init__(
         self,

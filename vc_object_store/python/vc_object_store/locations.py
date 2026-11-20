@@ -158,6 +158,11 @@ class HostedStoreHandle:
     def read_geometry_array(self, revision_uuid, array_name, byte_offset=0, byte_count=None):
         return self.session.read_geometry_array(self._require(), revision_uuid, array_name, byte_offset, byte_count)
 
+    def read_geometry_arrays(self, revision_uuids, array_name):
+        """One array of many geometry revisions in a single read: a packed buffer with row offsets (as
+        ``ObjectStore.read_geometry_arrays``)."""
+        return self.session.read_geometry_arrays(self._require(), list(revision_uuids), array_name)
+
     def geometry_point_annotations(self, revision_uuid, array_name):
         return self.session.geometry_point_annotations(self._require(), revision_uuid, array_name)
 

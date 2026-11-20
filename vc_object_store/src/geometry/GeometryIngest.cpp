@@ -5,6 +5,8 @@
 #include "vc_object_store/objects/StoreReader.hpp"
 #include "vc_object_store/objects/TransactionJson.hpp"
 #include "vc_object_store/PackedTrackStore.hpp"
+#include "vc_object_store/objects/InitialImport.hpp"
+#include <limits>
 #include "vc_object_store/Uuid.hpp"
 #include "formats/GeometryInput.hpp"
 #include "formats/TrackInput.hpp"
@@ -396,3 +398,51 @@ std::string importSurfaceChannel(ObjectStore& db, WriteTxn& txn, const std::stri
     return db.updateSurfaceChannels(txn, objectUuid, {formats::surfaceChannel(name, tiff)}, {}, current->uuid);
 }
 } // namespace vc::objects
+
+namespace vc::objects {
+GeometryIngestReport ingestTracksBulk(const fs::path& source, const fs::path& destination, const std::string& author,
+    const std::string& coordinateContext, const std::vector<std::string>& tags, std::size_t shards)
+{
+    GeometryIngestReport report;
+    if (shards == 0) shards = 1;
+    if (fs::exists(destination)) throw std::runtime_error("bulk ingest: destination exists: " + destination.string());
+    geometryCoordinates(nlohmann::json::parse(coordinateContext));
+    const auto packed = resolvePackedTrackStore(source);
+    PackedTrackStore store(packed);
+    const size_t rows = store.sourceIds().size();
+    nlohmann::json sourceMeta = nlohmann::json::object();
+    if (fs::exists(packed / "metadata.json")) sourceMeta = readJson(packed / "metadata.json");
+    const std::string ref = packed.string();
+    // Fresh identities, routed to their shard (the initial-import API requires uuidShardIndex routing).
+    std::vector<std::string> uuids(rows);
+    std::vector<std::vector<uint32_t>> byShard(shards);
+    for (size_t i = 0; i < rows; ++i) { uuids[i] = util::newUuid(); byShard[uuidShardIndex(uuids[i], shards)].push_back(uint32_t(i)); }
+    InitialImportOptions options;
+    options.store.author = author;
+    options.shards.assign(shards, InitialShardSpec{});
+    const int64_t per = std::numeric_limits<int64_t>::max() / int64_t(shards);
+    for (size_t k = 0; k < shards; ++k) options.shards[k].objectIds = {int64_t(k) * per + 1, int64_t(k + 1) * per};
+    std::atomic<int64_t> done{0};
+    importInitialCollection(destination, options, [&](size_t shardIndex, InitialShardImport& shard) {
+        std::vector<InitialObjectRecord> batch;
+        auto flush = [&] { if (batch.empty()) return; shard.appendObjects(batch); done += int64_t(batch.size()); batch.clear(); };
+        for (const uint32_t row : byShard[shardIndex]) {
+            ObjectRecord object;
+            object.uuid = uuids[row]; object.kind = "track"; object.name = std::to_string(store.sourceIds()[row]);
+            object.storageKind = "dataset"; object.storageRef = ref;
+            object.track = TrackDetail{}; object.track->datasetRef = ref; object.track->externalKey = object.name;
+            auto p = track(store, row, object);
+            p.source = sourceMeta;
+            addTags(p, tags);
+            detail::normalizeIngestMetadata(p, coordinateContext);
+            InitialObjectRecord record; record.record = std::move(p.object); record.geometry = std::move(p.geometry);
+            batch.push_back(std::move(record));
+            if (batch.size() >= 2000) { flush(); shard.checkCancelled(); }
+        }
+        flush();
+    });
+    report.ingested = done.load();
+    report.uuids = std::move(uuids);        // the objects created, as the per-track path reports them
+    return report;
+}
+}

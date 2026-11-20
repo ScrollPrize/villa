@@ -421,12 +421,12 @@ def test_track_points_crossings_cannot_index_are_refused(db, monkeypatch):
     far = put_track(db, _line((10, 60, (1 << 20) - 3), 2, 6), 2, 'horizontal')
     with pytest.raises(osi.ObjectStoreInputError, match=f'track {far} has coordinates outside'):
         _materialize_tracks(db)
-    read = osi.read_geometry
+    read = osi.read_track_points
 
-    def flat(store, revision, names, optional=()):
-        arrays, attributes = read(store, revision, names, optional)
-        return {'points': arrays['points'].reshape(-1)}, attributes
-    monkeypatch.setattr(osi, 'read_geometry', flat)
+    def flat(store, tracks, chunk=None):
+        for xyz in read(store, tracks, chunk):
+            yield xyz.reshape(-1)
+    monkeypatch.setattr(osi, 'read_track_points', flat)
     with pytest.raises(osi.ObjectStoreInputError, match=f'track {far} points have shape'):
         _materialize_tracks(db)
 
@@ -1194,3 +1194,79 @@ def test_a_fit_prepares_store_tracks_with_their_crossings(db, tmp_path):
         cache_dir=str(tmp_path / 'cache'), object_store_inputs=off)
     context.load_host_inputs()
     assert context.tracks is None and context.track_graph is None
+
+
+class _CountingStore:
+    """A store that counts its geometry reads; ``batch`` False hides the batch read, ``refuse`` makes it raise."""
+
+    def __init__(self, db, batch=True, refuse=False):
+        self.db, self.calls, self.refuse = db, [], refuse
+        if not batch:
+            self.read_geometry_arrays = None
+
+    def __getattr__(self, name):
+        method = getattr(self.db, name)
+        if not callable(method):
+            return method
+
+        def counted(*args, **kwargs):
+            self.calls.append(name)
+            if name == 'read_geometry_arrays' and self.refuse:
+                raise RuntimeError('refused')
+            return method(*args, **kwargs)
+        return counted
+
+
+def _selected_tracks(db):
+    snapshot = osi.read_snapshot(db, osi.InputRequest())
+    return osi._ordered_tracks(snapshot.objects_of('track'))[0]
+
+
+def test_track_points_are_read_in_one_batch_per_chunk(db):
+    """The points of many tracks are one read, not two per track: a read per
+    call rebuilds a read context, which on a bulk store reopens every part
+    store, so the read time grew with the number of tracks."""
+    _varied_tracks(db)
+    tracks = _selected_tracks(db)
+    expected = [osi.read_geometry(db, obj.geometry_revision, ['points'])[0]['points']
+                for obj in tracks]
+    for chunk, reads in ((None, 1), (3, 3), (1, len(tracks))):
+        counting = _CountingStore(db)
+        got = list(osi.read_track_points(counting, tracks, chunk=chunk))
+        assert len(got) == len(expected)
+        for have, want in zip(got, expected):
+            assert have.dtype == want.dtype and have.shape == want.shape
+            np.testing.assert_array_equal(have, want)
+        assert counting.calls.count('read_geometry_arrays') == reads
+        assert 'read_geometry_array' not in counting.calls and 'geometry_revision' not in counting.calls
+
+
+@pytest.mark.parametrize('how', ['no batch read', 'batch read refused'])
+def test_track_points_fall_back_to_reading_one_by_one(db, how, capsys):
+    _varied_tracks(db)
+    tracks = _selected_tracks(db)
+    expected = [osi.read_geometry(db, obj.geometry_revision, ['points'])[0]['points']
+                for obj in tracks]
+    counting = _CountingStore(db, batch=how != 'no batch read', refuse=how == 'batch read refused')
+    for have, want in zip(osi.read_track_points(counting, tracks), expected):
+        np.testing.assert_array_equal(have, want)
+    assert counting.calls.count('read_geometry_array') == len(tracks)
+    assert ('refused' in capsys.readouterr().out) == (how == 'batch read refused')
+
+
+def test_materialized_tracks_do_not_depend_on_how_their_points_are_read(db, monkeypatch):
+    _varied_tracks(db)
+    _lattice(db, dataset='lattice.vctracks')
+    snapshot = osi.read_snapshot(db, osi.InputRequest())
+    results = {}
+    for label, store, chunk in (('batch', db, osi.TRACK_POINT_READ_CHUNK), ('chunks of 2', db, 2),
+                                ('one by one', _CountingStore(db, batch=False), osi.TRACK_POINT_READ_CHUNK)):
+        monkeypatch.setattr(osi, 'TRACK_POINT_READ_CHUNK', chunk)
+        results[label] = osi.materialize_tracks(store, snapshot, z_begin=0, z_end=64)
+    (first, counts), = [results['batch']]
+    for label in ('chunks of 2', 'one by one'):
+        other, other_counts = results[label]
+        assert other_counts == counts
+        for name in ('coordinates', 'offsets', 'source_ids', 'family_codes', 'arclengths', 'tortuosities'):
+            np.testing.assert_array_equal(getattr(other.tracks, name), getattr(first.tracks, name))
+        _assert_same_crossings(other.crossings, first.crossings)

@@ -971,6 +971,49 @@ def read_geometry(store, geometry_revision, names, optional=()):
     return result, descriptor['attributes'] or {}
 
 
+TRACK_POINT_READ_CHUNK = 1 << 16
+
+
+def read_track_points(store, tracks, chunk=None):
+    """The stored ``points`` array of each of ``tracks``, in order (a generator).
+
+    The points of ``chunk`` tracks are read in ONE batch through the store's
+    ``read_geometry_arrays``: one read transaction and one verified packed
+    buffer with row offsets. Reading a track per call (``read_geometry``: its
+    descriptor and then its array, each its own read transaction) builds a
+    read context per call, which on a bulk store (several part stores) reopens
+    every part store each time, so the read time grew with the number of
+    tracks instead of the data (a 1.48M-track bulk store was still reading
+    after 82 minutes; the same tracks in per-track stores took 28).
+
+    A store without the batch read, and a chunk the batch read refuses (arrays
+    of differing shape or dtype, a track without ``points``), read per track
+    with ``read_geometry``, which reports the problem as it always did.
+    """
+    chunk = chunk or TRACK_POINT_READ_CHUNK
+    batch = getattr(store, 'read_geometry_arrays', None)
+    for start in range(0, len(tracks), chunk):
+        part = tracks[start:start + chunk]
+        packed = None
+        if batch is not None:
+            try:
+                packed = batch([obj.geometry_revision for obj in part], 'points')
+                values, offsets = packed.values, packed.offsets
+                if len(offsets) != len(part) + 1 or int(offsets[-1]) != len(values):
+                    raise ValueError(f'{len(offsets)} row offsets for {len(part)} tracks '
+                                     f'and {len(values)} rows')
+            except Exception as error:
+                print(f'track points: batch read of {len(part)} tracks refused ({error}); '
+                      'reading them one by one')
+                packed = None
+        if packed is None:
+            for obj in part:
+                yield read_geometry(store, obj.geometry_revision, ['points'])[0]['points']
+            continue
+        for index in range(len(part)):
+            yield values[int(offsets[index]):int(offsets[index + 1])]
+
+
 def point_annotations(store, geometry_revision, point_ids):
     """{point id: annotation dict} aligned to the stored point order."""
     annotations = store.geometry_point_annotations(geometry_revision, 'points')
@@ -1984,9 +2027,7 @@ def materialize_tracks(store, snapshot, *, z_begin, z_end,
         selection = [None] * len(tracks) if cached is None else None
         problems = []
         kept, stored, fit, families, scales = [], [], [], [], []
-        for index, obj in enumerate(tracks):
-            arrays, _ = read_geometry(store, obj.geometry_revision, ['points'])
-            xyz = arrays['points']
+        for index, (obj, xyz) in enumerate(zip(tracks, read_track_points(store, tracks))):
             if xyz.ndim != 2 or xyz.shape[1] != 3:
                 problems.append(f'track {obj.uuid} points have shape {xyz.shape}')
                 continue

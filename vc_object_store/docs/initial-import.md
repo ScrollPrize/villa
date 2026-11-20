@@ -112,3 +112,25 @@ Coordinate/source metadata is parsed and serialized once. The initial object INS
 Initial geometry uses the ordinary manifest encoder, sequence identity/annotation format, current-descriptor writer and chunk writer. Preparation consumes per-point source annotations into shared metadata and computes managed object fields before the single initial object insertion; surfaces also derive their grid dimensions and area before inserting the detail row. It does not call `putGeometry`, mutate metadata afterward, stamp an existing record, scan incident edges or repair an existing geometry. Preparation and publication share the caller's rollback boundary. Newly inserted chunks need no redundant byte readback: SQLite has stored the supplied payload. When a hash already exists, its bytes are still compared, including pinned external payloads, so corrupt or colliding hashes are rejected.
 
 Relationship anchors are supplied by the producer without owner-geometry reads during batch construction. Neither local nor sibling/external endpoints create a descriptor copy, subtype row, geometry copy or registration entry. Current relations refer to the current endpoints, with later ordinary edits checked transactionally. Historical relationships retain endpoint version references only when history is enabled.
+
+## Bulk tracks: `vc_object_ingest --bulk`
+
+`vc_object_ingest --tracks` commits one transaction per track: every track is its own object with its own identity, revision and geometry,
+so the store does the same fixed amount of work per track however small the track is. For millions of small tracks use `--bulk`, which
+builds the tracks through `importInitialCollection` (`ingestTracksBulk`):
+
+```
+vc_object_ingest --bulk --bulk-shards 8 --db scroll.vcobj --author NAME --tracks tracks.dbm --volume-uuid ID --scale-factor 1
+```
+
+* `scroll.vcobj.tracks` is the new **sealed, history-off** collection (one shard: one SQLite file; N shards: a directory whose root
+  locator is `collection.vcobj`). `scroll.vcobj` (must not exist) is an **editable, history-on overlay root** over it
+  (`ObjectCollection::create`), which is what a consumer opens: it opens writable, reads every track through the shared collection reader,
+  and keeps its own writes (links, metadata edits) local. The sealed collection cannot be opened writable and is never modified.
+* The objects have the same records, coordinate frame (`--volume-uuid` and `--scale-factor` are required together, as for the per-track path)
+  and geometry as the per-track path; identities are fresh UUIDs, as there, so the two paths are not interchangeable for one store
+  (a re-run of either on the same source creates new objects). `tests/cpp/test_bulk_tracks.cpp` checks that a per-track store and the bulk
+  collection (one file and sharded, alone and under the overlay root) expose identical tracks, and that an overlay write leaves the base unchanged.
+* Capability limits: bulk mode is a command-line feature for new, whole datasets of tracks (one `--tracks` source per run, nothing else in the
+  same run). It is not available through the Python `ingest_geometry_source`, and it does not add tracks to an existing store. The
+  per-track path is unchanged and remains the default.

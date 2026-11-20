@@ -186,7 +186,8 @@ add_library(vc_object_links STATIC
     linking/TrackTrack.cpp linking/StoredGeometry.cpp linking/LineSurface.cpp
     linking/TrackSurface.cpp linking/PointCollectionSurface.cpp linking/LinkObjects.cpp)
 target_include_directories(vc_object_links PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
-target_link_libraries(vc_object_links PUBLIC vc_objects PRIVATE vc_track_crossings vc_object_formats vc_resident_geometry vc_reader::reader opencv_core nlohmann_json::nlohmann_json)
+# geometry/GeometryInternal.hpp includes <openssl/evp.h>: declare the dependency directly (its include path does not propagate from vc_objects / vc_object_geometry).
+target_link_libraries(vc_object_links PUBLIC vc_objects PRIVATE vc_track_crossings vc_object_formats vc_resident_geometry vc_reader::reader opencv_core OpenSSL::Crypto nlohmann_json::nlohmann_json)
 
 if(TARGET vc_object_server)
     target_link_libraries(vc_object_server PRIVATE vc_object_links)
