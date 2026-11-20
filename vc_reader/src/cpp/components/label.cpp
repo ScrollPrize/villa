@@ -73,9 +73,8 @@ void row_runs(const std::uint64_t* words, std::size_t nx, Run* runs) {
 }
 
 ThreadPool& pool() {
-    // Never destroyed; see samplingPool() in thread_pool.hpp.
-    static auto* workers = new ThreadPool(std::max(1u, std::thread::hardware_concurrency()) - 1);
-    return *workers;
+    static StaticPool workers(std::max(1u, std::thread::hardware_concurrency()) - 1);
+    return *workers.pool;
 }
 }
 

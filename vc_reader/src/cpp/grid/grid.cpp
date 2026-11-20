@@ -64,9 +64,8 @@ constexpr float kNaN = std::numeric_limits<float>::quiet_NaN();
 
 ThreadPool& resamplePool()
 {
-    // Never destroyed; see samplingPool() in thread_pool.hpp.
-    static auto* pool = new ThreadPool(std::max(1u, std::thread::hardware_concurrency()));
-    return *pool;
+    static StaticPool pool(std::max(1u, std::thread::hardware_concurrency()));
+    return *pool.pool;
 }
 
 }  // namespace
