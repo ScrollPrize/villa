@@ -347,6 +347,24 @@ the remote volume as before.
 
 #### Rendering it
 
+To count the source chunks before rendering, use the same sampling options with
+`--dry-run`:
+
+```bash
+vc_render_tifxyz -v "$URL" -s out/auto_grown_* --scale 1 -g 0 --dry-run
+```
+
+This reads the volume metadata and the surface, but no CT chunks, and writes no
+render output. It reports the number of distinct source chunks and their full
+decoded size, including chunks already cached. This is not the compressed
+download size or a prediction of peak RAM use. Metadata may be cached.
+
+Crop, rotation, slice offsets, accumulation and surface interpolation use the
+renderer's sampling path. For a multipart Zarr render, keep `--zarr-output` and
+the pyramid options in the dry-run command so its tile-row partition is the
+same; the output path is not written. `--dry-run` does not support `--pre`,
+`--resume`, `--merge-tiff-parts`, composite rendering or CUDA sampling.
+
 ```bash
 vc_render_tifxyz -v "$URL" -s out/auto_grown_* \
   --scale 1 -g 0 --voxel-size 45.532 --voxel-unit micrometer --tif-output render/
