@@ -1297,6 +1297,8 @@ class _Job:
             say(f'yx range (full-res): {min_yx} .. {max_yx}')
             for axis, prefix in (('y', 'vy'), ('x', 'vx')):
                 lo, hi = (min_yx[0], max_yx[0]) if axis == 'y' else (min_yx[1], max_yx[1])
+                # Start the slabs on the downsample grid (see extract_vertical in extract_surface_tracks.py).
+                lo -= lo % ds
                 along = Y if axis == 'y' else X
                 keys = []
                 for w in range(lo, hi, geo['yx_stride_v']):

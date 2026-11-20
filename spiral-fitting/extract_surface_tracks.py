@@ -306,6 +306,9 @@ def extract_vertical(predictions_zarr_array, tracks_db, axis, min_yx, max_yx):
         key_prefix = 'vx'
     else:
         assert False
+    # Start the slabs on the downsample grid: horizontal-ribbon tracks lie on it, and crossings
+    # are exact voxel matches, so slabs starting off the grid share no voxels with them.
+    lo -= lo % downsample_factor
 
     z_limit = predictions_zarr_array.shape[0]
     z_range_min = min(z_min, z_limit)
