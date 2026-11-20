@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <exception>
 #include <limits>
 #include <map>
 #include <queue>
@@ -1288,6 +1289,8 @@ void ManualAddTool::walkSheetExtension(const SheetWalk& walk,
         fill.size() != walk.origins.size() * static_cast<std::size_t>(walk.cells) ||
         guess.size() != fill.size())
         throw std::invalid_argument("Sheet growth edge and grid dimensions disagree.");
+    // Split the edge into coherent strips (runs of grid-adjacent vertices).
+    std::vector<std::pair<std::size_t, std::size_t>> strips;
     std::size_t begin = 0;
     while (begin < walk.origins.size()) {
         std::size_t end = begin + 1;
@@ -1298,16 +1301,52 @@ void ManualAddTool::walkSheetExtension(const SheetWalk& walk,
                 break;
             ++end;
         }
+        strips.emplace_back(begin, end);
+        begin = end;
+    }
+    // Each strip reads only the walk and the normal field and writes only its own
+    // vertices, so strips can grow at the same time without changing any result.
+    // A broken edge has many strips of one or a few lines, which on their own
+    // keep a single thread busy: those grow side by side, one thread each, while
+    // longer strips grow one after another with every worker inside the strip.
+    auto grow = [&](std::size_t s, unsigned stripWorkers) {
+        const auto [first, last] = strips[s];
         SheetWalk strip;
         strip.cells = walk.cells;
         strip.options = walk.options;
-        strip.origins.assign(walk.origins.begin() + begin, walk.origins.begin() + end);
-        strip.steps.assign(walk.steps.begin() + begin, walk.steps.begin() + end);
-        std::vector<cv::Vec3f> grown((end - begin) * walk.cells);
-        vc::sheet::walkSheetStrip(strip, normal, grown, workers);
-        std::copy(grown.begin(), grown.end(), guess.begin() + begin * walk.cells);
-        begin = end;
+        strip.origins.assign(walk.origins.begin() + first, walk.origins.begin() + last);
+        strip.steps.assign(walk.steps.begin() + first, walk.steps.begin() + last);
+        std::vector<cv::Vec3f> grown((last - first) * walk.cells);
+        vc::sheet::walkSheetStrip(strip, normal, grown, stripWorkers);
+        std::copy(grown.begin(), grown.end(), guess.begin() + first * walk.cells);
+    };
+    const unsigned threads = std::max(1u, workers);
+    const std::size_t longStrip = 4 * static_cast<std::size_t>(threads);
+    // Failures are reported for the first failing strip in edge order, as a
+    // plain loop over the strips would.
+    std::vector<std::exception_ptr> errors(strips.size());
+    std::vector<std::size_t> shortStrips;
+    for (std::size_t s = 0; s < strips.size(); ++s) {
+        if (strips[s].second - strips[s].first >= longStrip || threads == 1) {
+            try {
+                grow(s, threads);
+            } catch (...) {
+                errors[s] = std::current_exception();
+                break;
+            }
+        } else {
+            shortStrips.push_back(s);
+        }
     }
+    vc::sheet::forEachIndex(shortStrips.size(), threads, [&](std::size_t k) {
+        try {
+            grow(shortStrips[k], 1);
+        } catch (...) {
+            errors[shortStrips[k]] = std::current_exception();
+        }
+    });
+    for (const auto& error : errors)
+        if (error) std::rethrow_exception(error);
 }
 
 bool ManualAddTool::applySheetWalk(std::uint64_t extensionId, std::vector<cv::Vec3f> guess, std::string* status)
