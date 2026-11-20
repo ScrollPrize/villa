@@ -8,7 +8,13 @@ import hashlib
 import random
 
 import torch
-from torch.utils.data import Sampler, WeightedRandomSampler
+from torch.utils.data import (
+    BatchSampler,
+    RandomSampler,
+    Sampler,
+    SequentialSampler,
+    WeightedRandomSampler,
+)
 
 from vesuvius.ink_detection.config import InkDataConfig
 from vesuvius.ink_detection.types import Patch, SamplingPolicy
@@ -246,6 +252,69 @@ class FixedScrollPriorStratifiedBatchSampler(Sampler[list[int]]):
                 key: queue.recycles for key, queue in sorted(self._patch_queues.items())
             },
         }
+
+
+class ResumableBatchSampler(Sampler[list[int]]):
+    """Training batch-index stream that a resumed run continues instead of replaying.
+
+    Every sampling policy is rebuilt from ``config.sampling.seed`` when a run
+    resumes from a checkpoint, so without this the resumed run starts the
+    index stream from the beginning and replays the batches of the first run.
+    ``fast_forward(n)`` draws the index lists of ``n`` already-trained batches
+    (indices only, no data is loaded), re-entering the inner sampler at each
+    epoch end exactly as the training loop does; the next ``__iter__``
+    continues that same stream. Without a fast-forward it is a pass-through.
+    """
+
+    def __init__(self, inner) -> None:
+        self.inner = inner
+        self._pending: Iterator[list[int]] | None = None
+        self.skipped_batches = 0
+
+    def __len__(self) -> int:
+        return len(self.inner)
+
+    def fast_forward(self, batches: int) -> None:
+        batches = int(batches)
+        if batches <= 0:
+            return
+        iterator = iter(self.inner)
+        for _ in range(batches):
+            try:
+                next(iterator)
+            except StopIteration:
+                iterator = iter(self.inner)
+                next(iterator)
+        self._pending = iterator
+        self.skipped_batches += batches
+
+    def __iter__(self) -> Iterator[list[int]]:
+        if self._pending is None:
+            yield from self.inner
+            return
+        iterator, self._pending = self._pending, None
+        yield from iterator
+
+
+def training_batch_sampler(
+    policy: SamplingPolicy, dataset_length: int, *, batch_size: int
+) -> ResumableBatchSampler:
+    """The batch sampler the training DataLoader iterates, for any policy.
+
+    It draws the same indices as passing ``batch_size``/``shuffle``/``sampler``
+    /``generator`` to ``DataLoader`` directly (same sampler objects, same
+    generator, ``drop_last=False``), so a fresh run is unchanged; it only adds
+    ``fast_forward`` for resumed runs.
+    """
+    if policy.batch_sampler is not None:
+        return ResumableBatchSampler(policy.batch_sampler)
+    if policy.sampler is not None:
+        sampler = policy.sampler
+    elif policy.shuffle:
+        sampler = RandomSampler(range(dataset_length), generator=policy.generator)
+    else:
+        sampler = SequentialSampler(range(dataset_length))
+    return ResumableBatchSampler(BatchSampler(sampler, batch_size, drop_last=False))
 
 
 def hierarchical_scroll_segment_weights(
