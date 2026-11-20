@@ -147,7 +147,8 @@ Volumetric instance segmentation labels.
 
 This dataset contains a subset of Scroll 1, chunked into 256x256x256 cubes.
 For each cube, the original scroll volume data and the instance segmentation data are provided (each in `.nrrd` format).
-The recommended `instance-labels-harmonized/` cubes share consistent instance IDs across cube boundaries, but the **volume** NRRD files are a mix of `uint8` and `uint16` (both dtypes appear in the published set). Intensity statistics computed without per-cube normalisation therefore split into two clusters about 250× apart for dtype reasons alone; normalise each cube (or cast to a common scale) before comparing intensities across cubes.
+The recommended `instance-labels-harmonized/` cubes share consistent instance IDs across cube boundaries, but the **volume** NRRD files are a mix of `uint8` and `uint16`, so their raw intensities are on different scales (in a sample of cubes, raw intensity standard deviations differed by about 250× between the two groups).
+Casting to a float type does not remove this gap. Per-cube normalisation gives consistent inputs, e.g. for training, but also removes real intensity differences between cubes; quantitative comparisons across cubes need a verified mapping of both dtypes to a common intensity scale.
 - [README](https://dl.ash2txt.org/full-scrolls/Scroll1/PHercParis4.volpkg/volumetric-instance-labels/README.txt)
 - [.zip download](https://dl.ash2txt.org/full-scrolls/Scroll1/PHercParis4.volpkg/volumetric-instance-labels/instance-labels-harmonized.zip) (1.4 GB)
 
