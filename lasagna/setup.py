@@ -140,6 +140,7 @@ setup(
             "lasagna-preprocess=preprocess_cos_omezarr:cli_main",
             "las_manager=lasagna.manager.cli:main",
             "lasagna-predict3d-holescan=predict3d_holescan:main",
+            "lasagna-offset-ct-snap=snap_offset_surface:main",
         ],
     },
     zip_safe=False,
