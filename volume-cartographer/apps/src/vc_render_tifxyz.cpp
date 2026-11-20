@@ -837,8 +837,12 @@ int main(int argc, char *argv[])
         ("affine", po::value<std::vector<std::string>>()->multitoken()->composing(), "Affine JSON files (append :inv to invert)")
         ("affine-invert", po::value<std::vector<int>>()->multitoken()->composing(), "0-based indices to invert")
         ("scale-segmentation", po::value<float>()->default_value(1.0), "Scale segmentation")
-        ("rotate", po::value<double>()->default_value(0.0), "Rotate output (0/90/180/270)")
-        ("flip", po::value<int>()->default_value(-1), "Flip: 0=V, 1=H, 2=Both")
+        ("rotate", po::value<double>()->default_value(0.0),
+            "Rotate output image (0/90/180/270). Applied in output pixel space after sampling; "
+            "a 180-degree image rotation sits one node step off a mesh whose node grid was rotated in index space.")
+        ("flip", po::value<int>()->default_value(-1),
+            "Flip output image: 0=V, 1=H, 2=Both. Applied in output pixel space after sampling "
+            "(unlike an index-space flip of the mesh node grid).")
         // The geometric normal is N = dP/dU x dP/dV (as vcr::grid's patch normals),
         // so (U, V, N) is right-handed. With the standard segment orientation (V down-screen
         // aligned with +z, text readable, U winding outside->inside) that normal points toward
