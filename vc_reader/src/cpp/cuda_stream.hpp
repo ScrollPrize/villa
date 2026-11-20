@@ -24,7 +24,14 @@ inline cudaStream_t stream_handle(std::uintptr_t handle) {
 // PyTorch rejects 2, and the per-thread default stream is a blocking stream, so
 // work on it already orders after the legacy default stream.
 inline std::uintptr_t dlpack_handle(cudaStream_t s) {
-    if (s == nullptr || s == cudaStreamLegacy || s == cudaStreamPerThread) return 1;
+    if (s == nullptr || s == cudaStreamLegacy || s == cudaStreamPerThread) {
+        // DLPack's default stream is 1 on CUDA but 0 on ROCm, which rejects 1.
+#ifdef VC_READER_HIP
+        return 0;
+#else
+        return 1;
+#endif
+    }
     return reinterpret_cast<std::uintptr_t>(s);
 }
 inline std::uintptr_t dlpack_handle() { return dlpack_handle(current_stream()); }
