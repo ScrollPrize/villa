@@ -2,6 +2,7 @@
 
 #include "vc/fiber_graph/ScaffoldConstraints.hpp"
 
+#include "vc/fiber_tracer/FiberTraceConstraints.hpp"
 #include "vc_object_store/ParallelFor.hpp"
 
 #include <algorithm>
@@ -123,6 +124,12 @@ std::int64_t otherEnd(const ScaffoldConstraint& constraint, std::int64_t fiber)
 // controls contains it. A fiber without control points keeps -1.
 void controlRange(const ScaffoldGraph& graph, const ScaffoldGeometry& geometry, ScaffoldPiece& piece)
 {
+    scaffoldPieceControls(graph, geometry, piece);
+}
+} // namespace
+
+void scaffoldPieceControls(const ScaffoldGraph& graph, const ScaffoldGeometry& geometry, ScaffoldPiece& piece)
+{
     const auto& fiber = graph.fibers.at(std::size_t(piece.fiber));
     const auto controls = fiber.content.controlIds.size();
     if (controls == 0) return;
@@ -147,6 +154,8 @@ void controlRange(const ScaffoldGraph& graph, const ScaffoldGeometry& geometry, 
     }
     if (piece.controlTo <= piece.controlFrom) { piece.controlFrom = -1; piece.controlTo = -1; }
 }
+
+namespace {
 
 struct PathSearch {
     // Satisfied constraints incident to each fiber.
@@ -254,7 +263,6 @@ std::vector<ScaffoldPiece> cyclePieces(const ScaffoldGraph& graph, const Scaffol
 const char* scaffoldConstraintKindName(ScaffoldConstraintKind kind)
 {
     switch (kind) {
-        case ScaffoldConstraintKind::Manual: return "manual";
         case ScaffoldConstraintKind::Perpendicular: return "perpendicular";
         case ScaffoldConstraintKind::Parallel: return "parallel";
         case ScaffoldConstraintKind::Enclosure: return "enclosure";
@@ -296,8 +304,32 @@ std::vector<ScaffoldConstraint> scaffoldLinkConstraints(const ScaffoldGraph& gra
     if (options.approvalStates.empty())
         throw std::invalid_argument("scaffold winding: at least one link approval state is required");
 
+    if (!(options.refineMaximumDistance > 0) || !std::isfinite(options.refineMaximumDistance))
+        throw std::invalid_argument("scaffold winding: the link refinement distance must be positive and finite");
+
     report = ScaffoldLinkReport{};
     std::vector<ScaffoldConstraint> constraints;
+    // The extraction's own refinement, in the mode the scaffold's crossings
+    // are extracted in (whole fibers, endpoint support certified).
+    fiber_tracer::FiberTraceConstraintConfig refinement;
+    refinement.localEvents = true;
+    refinement.localKeepWholeFibers = true;
+    refinement.maximumDistanceBaseVoxels = options.refineMaximumDistance;
+    std::map<std::int64_t, fiber_tracer::PolylineArcGeometry> lines;
+    const auto lineOf = [&](std::int64_t fiber) -> const fiber_tracer::PolylineArcGeometry& {
+        auto found = lines.find(fiber);
+        if (found == lines.end()) {
+            const auto& entry = graph.fibers[std::size_t(fiber)];
+            std::vector<cv::Vec3d> points;
+            points.reserve(std::size_t(entry.pointCount));
+            for (std::int64_t j = 0; j < entry.pointCount; ++j) {
+                const auto at = std::size_t(3 * (entry.pointFirst + j));
+                points.emplace_back(graph.linePoints[at], graph.linePoints[at + 1], graph.linePoints[at + 2]);
+            }
+            found = lines.emplace(fiber, fiber_tracer::makePolylineArcGeometry(points)).first;
+        }
+        return found->second;
+    };
     for (std::size_t index = 0; index < graph.links.size(); ++index) {
         const auto& link = graph.links[index];
         ++report.links;
@@ -328,14 +360,41 @@ std::vector<ScaffoldConstraint> scaffoldLinkConstraints(const ScaffoldGraph& gra
         const auto projectedA = geometry.project(std::size_t(link.a), *link.anchorA);
         const auto projectedB = geometry.project(std::size_t(link.b), *link.anchorB);
         report.maxAnchorDistance = std::max({report.maxAnchorDistance, projectedA.distance, projectedB.distance});
+        // A frame error is reported by the guard below, not as a rejection.
+        if (std::max(projectedA.distance, projectedB.distance) > options.maxAnchorDistance) continue;
+        if (fiberA.pointCount < 2 || fiberB.pointCount < 2) {
+            ++report.skippedEndSupport;
+            if (link.adjacent) --report.adjacent; else --report.ordinary;
+            continue;
+        }
+        const auto refined =
+            fiber_tracer::refineFiberCrossing(lineOf(link.a), lineOf(link.b), projectedA.arc, projectedB.arc, refinement);
+        const bool sameFamily = fiberA.family == fiberB.family;
+        if (!refined.accepted) {
+            const auto& why = refined.failure;
+            if (why.find("orientation") != std::string::npos) ++report.skippedAngle;
+            else if (why.find("support") != std::string::npos) ++report.skippedEndSupport;
+            else if (why.find("distance") != std::string::npos) ++report.skippedDistance;
+            else ++report.skippedConsistency;
+            if (link.adjacent) --report.adjacent; else --report.ordinary;
+            continue;
+        }
+        // The geometry's verdict has to be the families': as for a crossing.
+        if (refined.parallel != sameFamily) {
+            ++report.skippedAngle;
+            if (link.adjacent) --report.adjacent; else --report.ordinary;
+            continue;
+        }
+        report.maxRefinementShift = std::max({report.maxRefinementShift, std::abs(refined.arcA - projectedA.arc),
+                                              std::abs(refined.arcB - projectedB.arc)});
 
         ScaffoldConstraint constraint;
-        constraint.kind = ScaffoldConstraintKind::Manual;
+        constraint.kind = refined.parallel ? ScaffoldConstraintKind::Parallel : ScaffoldConstraintKind::Perpendicular;
         constraint.link = std::int64_t(index);
         constraint.a = link.a;
         constraint.b = link.b;
-        constraint.arcA = projectedA.arc;
-        constraint.arcB = projectedB.arc;
+        constraint.arcA = refined.arcA;
+        constraint.arcB = refined.arcB;
         constraint.step = step;
         constraint.weight = options.weight;
         // An approved record is not enough: a link is held rigid only when
@@ -391,7 +450,37 @@ ScaffoldSolveResult solveScaffoldWinding(const ScaffoldGraph& graph, const Scaff
         result.constraints = scaffoldLinkConstraints(graph, geometry, options.links, result.linkReport);
     else
         result.linkReport = ScaffoldLinkReport{};
-    result.constraints.insert(result.constraints.end(), measured.begin(), measured.end());
+    result.linkConstraints = std::int64_t(result.constraints.size());
+    // One encounter, one relation: a measured crossing at a refined link is
+    // that link's encounter, and the link's step stands. An enclosure is a
+    // statement about the pair, not about one encounter, and stays.
+    {
+        if (!(options.links.deduplicateArc >= 0))
+            throw std::invalid_argument("scaffold winding: the deduplication arc distance must be non-negative");
+        std::multimap<std::pair<std::int64_t, std::int64_t>, std::size_t> linked;
+        for (std::size_t i = 0; i < result.constraints.size(); ++i)
+            linked.emplace(std::pair{result.constraints[i].a, result.constraints[i].b}, i);
+        std::vector<char> hasCrossing(result.constraints.size(), 0);
+        std::set<std::int64_t> droppedEvents;
+        for (const auto& constraint : measured) {
+            bool duplicate = false;
+            if (constraint.kind != ScaffoldConstraintKind::Enclosure) {
+                const auto [first, last] = linked.equal_range(std::pair{constraint.a, constraint.b});
+                for (auto at = first; at != last; ++at) {
+                    const auto& link = result.constraints[at->second];
+                    if (std::abs(link.arcA - constraint.arcA) > options.links.deduplicateArc ||
+                        std::abs(link.arcB - constraint.arcB) > options.links.deduplicateArc)
+                        continue;
+                    duplicate = true;
+                    hasCrossing[at->second] = 1;
+                }
+            }
+            if (duplicate) droppedEvents.insert(constraint.event);
+            else result.constraints.push_back(constraint);
+        }
+        result.linkReport.deduplicatedCrossings = std::int64_t(droppedEvents.size());
+        result.linkReport.linksWithCrossing = std::count(hasCrossing.begin(), hasCrossing.end(), char(1));
+    }
     for (const auto& constraint : result.constraints) {
         const auto kind = std::size_t(constraint.kind);
         if (kind >= result.constraintsByKind.size())

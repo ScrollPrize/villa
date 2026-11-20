@@ -201,6 +201,8 @@ ScaffoldSolveOptions solveOptionsFrom(const Json& cfg)
     options.links.useLinks = links.value("use_links", true);
     options.links.includeAuto = links.value("include_auto", false);
     options.links.maxAnchorDistance = links.value("max_anchor_distance", 5.0);
+    options.links.refineMaximumDistance = links.value("refine_maximum_distance", options.links.refineMaximumDistance);
+    options.links.deduplicateArc = links.value("deduplicate_arc", options.links.deduplicateArc);
     options.links.weight = cfg.value("weights", Json::object()).value("manual", 1.0);
     const auto lemon = cfg.value("lemon", Json::object());
     options.flow.backend = vc::geometry::parseWindingFlowBackend(lemon.value("backend", std::string{"network_simplex"}));
@@ -224,7 +226,14 @@ Json linkReportJson(const ScaffoldLinkReport& report)
                 {"skipped_adjacent_same_family", report.skippedAdjacentSameFamily},
                 {"skipped_missing_anchor", report.skippedMissingAnchor},
                 {"skipped_untagged", report.skippedUntagged},
-                {"max_anchor_distance_vx", report.maxAnchorDistance}};
+                {"max_anchor_distance_vx", report.maxAnchorDistance},
+                {"rejected_angle", report.skippedAngle},
+                {"rejected_end_support", report.skippedEndSupport},
+                {"rejected_distance", report.skippedDistance},
+                {"rejected_consistency", report.skippedConsistency},
+                {"max_refinement_shift_vx", report.maxRefinementShift},
+                {"links_with_crossing", report.linksWithCrossing},
+                {"crossings_replaced", report.deduplicatedCrossings}};
 }
 
 Json pieceJson(const ScaffoldGraph& graph, const ScaffoldPiece& piece)
@@ -412,6 +421,9 @@ int run(const std::string& configPath)
         measuredSeconds = seconds(started);
     }
     const auto result = solveScaffoldWinding(graph, geometry, options, measured);
+    std::vector<ScaffoldNormalFlip> flips;
+    ScaffoldNormalFlipReport flipReport;
+    if (normals) flips = scaffoldLinkNormalFlips(graph, geometry, *normals, signs.sign, result.constraints, flipReport);
 
     Json summary{
         {"store", cfg.at("store")},
@@ -431,7 +443,7 @@ int run(const std::string& configPath)
                        {"umbilicus_points", std::int64_t(graph.umbilicus.size())},
                        {"commit_sequence", graph.source.commitSequence},
                        {"annotation_commit", annotationCommit}}},
-        {"manual_links", linkReportJson(result.linkReport)},
+        {"map_links", linkReportJson(result.linkReport)},
         {"solve", Json{{"constraints", std::int64_t(result.constraints.size())},
                        {"arcs", std::int64_t(result.arcs.size())},
                        {"components", result.components},
@@ -450,7 +462,7 @@ int run(const std::string& configPath)
                               {"original_weight", result.quantization.originalWeight},
                               {"dropped_weight", result.quantization.droppedWeight},
                               {"capacity_absolute_error", result.quantization.capacityAbsoluteError}}},
-        {"constraint_kinds", Json{{"manual", result.constraintsByKind[std::size_t(ScaffoldConstraintKind::Manual)]},
+        {"constraint_kinds", Json{{"from_map_links", result.linkConstraints},
                                   {"perpendicular",
                                    result.constraintsByKind[std::size_t(ScaffoldConstraintKind::Perpendicular)]},
                                   {"parallel", result.constraintsByKind[std::size_t(ScaffoldConstraintKind::Parallel)]},
@@ -570,6 +582,8 @@ int run(const std::string& configPath)
             stages.signOptions = &*signOptions;
             stages.signs = &signs;
             stages.approvals = &approvalReport;
+            stages.flips = &flips;
+            stages.flipReport = &flipReport;
         }
         const auto rows = scaffoldSolveRunRows(graph, result, options, record, stages);
         auto txn = store.write();
@@ -615,6 +629,29 @@ int run(const std::string& configPath)
     }
     summary["pieces"] = pieces;
 
+    if (normals) {
+        Json rows = Json::array();
+        for (const auto& flip : flips) {
+            const auto& constraint = result.constraints[std::size_t(flip.constraint)];
+            rows.push_back({{"fiber", graph.fibers[std::size_t(flip.fiber)].uuid},
+                            {"other", graph.fibers[std::size_t(flip.other)].uuid},
+                            {"link", graph.links[std::size_t(constraint.link)].uuid},
+                            {"arc", flip.arc},
+                            {"agreeing_links", flip.agreeing},
+                            {"disagreeing_links", flip.disagreeing},
+                            {"bracketed", flip.bracketed},
+                            {"arc_from", flip.piece.arcFrom},
+                            {"arc_to", flip.piece.arcTo},
+                            {"control_from", flip.piece.controlFrom},
+                            {"control_to", flip.piece.controlTo}});
+        }
+        summary["normal_flips"] = Json{{"links_checked", flipReport.checked},
+                                       {"agreed", flipReport.agreed},
+                                       {"disagreed", flipReport.disagreed},
+                                       {"undetermined", flipReport.undetermined},
+                                       {"opposed_normals", flipReport.opposed},
+                                       {"suspects", std::move(rows)}};
+    }
     if (cfg.contains("windings_output")) {
         Json windings{{"ids", Json::array()}, {"family", Json::array()}, {"selected_winding", Json::array()},
                       {"component", Json::array()}};

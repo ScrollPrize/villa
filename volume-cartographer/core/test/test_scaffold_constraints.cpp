@@ -550,15 +550,65 @@ TEST_CASE("the winding solve takes measured constraints beside the links")
     measured.event = 0;
 
     const auto result = solveScaffoldWinding(scaffold.graph, geometry, {}, {&measured, 1});
-    CHECK(result.constraintsByKind[std::size_t(ScaffoldConstraintKind::Manual)] == 1);
+    // The measured relation is the link's own encounter: the link stands
+    // alone, with its step, and the crossing is dropped.
+    CHECK(result.linkConstraints == 1);
+    CHECK(result.linkReport.linksWithCrossing == 1);
+    CHECK(result.linkReport.deduplicatedCrossings == 1);
     CHECK(result.constraintsByKind[std::size_t(ScaffoldConstraintKind::Perpendicular)] == 1);
     CHECK(result.objective == doctest::Approx(0.));
     CHECK(result.components == 1);
     CHECK(result.winding[horizontal] == 1);
     CHECK(result.winding[vertical] == 0);
-    // Both relations are the same arc, so their weights are summed.
+    // One encounter, one relation: the arc carries the link's weight alone.
     REQUIRE(result.arcs.size() == 1);
-    CHECK(result.arcs.front().weight == doctest::Approx(3.));
+    CHECK(result.arcs.front().weight == doctest::Approx(1.));
+}
+
+TEST_CASE("a link whose order the normals contradict accuses both fibers of a flip")
+{
+    // The V fiber lies inside the H fiber (radius 260 against 300) and both
+    // carry an outward display normal. An adjacent link states that order; an
+    // ordinary link states the opposite one.
+    for (const bool adjacent : {true, false}) {
+        Scaffold scaffold;
+        const auto horizontal = scaffold.fiber(ScaffoldFamily::Horizontal, arcLine(300., 20., 70., 0., 40));
+        const auto vertical = scaffold.fiber(ScaffoldFamily::Vertical, verticalLine(260., 45., -150., 150., 30));
+        scaffold.manualOutwardNormal(horizontal, 2);
+        scaffold.manualOutwardNormal(vertical, 1);
+        scaffold.link(horizontal, vertical, polar(300., 45., 0.), polar(260., 45., 0.), adjacent);
+        const ScaffoldGeometry geometry(scaffold.graph);
+        const ScaffoldNormals normals(scaffold.graph, geometry);
+        ScaffoldSignOptions signOptions;
+        signOptions.solve = false;
+        const auto signs = scaffoldNormalSigns(scaffold.graph, normals, {}, signOptions);
+        ScaffoldLinkArcOptions linkOptions;
+        linkOptions.approvalStates = {"approved", "pending"};
+        ScaffoldLinkReport linkReport;
+        const auto constraints = scaffoldLinkConstraints(scaffold.graph, geometry, linkOptions, linkReport);
+        REQUIRE(constraints.size() == 1);
+        CHECK(constraints.front().kind == ScaffoldConstraintKind::Perpendicular);
+        ScaffoldNormalFlipReport report;
+        const auto flips = scaffoldLinkNormalFlips(scaffold.graph, geometry, normals, signs.sign, constraints, report);
+        CHECK(report.checked == 1);
+        CHECK(report.undetermined == 0);
+        if (adjacent) {
+            CHECK(report.agreed == 1);
+            CHECK(flips.empty());
+        } else {
+            CHECK(report.disagreed == 1);
+            // One suspect per fiber; nothing brackets either, so each names
+            // the span around its anchor.
+            REQUIRE(flips.size() == 2);
+            for (const auto& flip : flips) {
+                CHECK(flip.disagreeing == 1);
+                CHECK(flip.agreeing == 0);
+                CHECK_FALSE(flip.bracketed);
+                CHECK(flip.piece.controlTo > flip.piece.controlFrom);
+            }
+            CHECK(flips[0].fiber != flips[1].fiber);
+        }
+    }
 }
 
 TEST_CASE("a scaffold's measured relations are the ones the bulk assembly builds")

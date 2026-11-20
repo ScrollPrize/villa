@@ -52,7 +52,18 @@ struct ScaffoldRunStages {
     const ScaffoldSignOptions* signOptions = nullptr;
     const ScaffoldSignResult* signs = nullptr;
     const ScaffoldApprovalReport* approvals = nullptr;
+    // The normal flips the map links accuse (scaffoldLinkNormalFlips), over
+    // the solve's own constraints.
+    const std::vector<ScaffoldNormalFlip>* flips = nullptr;
+    const ScaffoldNormalFlipReport* flipReport = nullptr;
 };
+
+// A normal flip suspect is stored beside the residuals, as a row of this kind
+// after them: fiber_a the suspected fiber and arc_a the disagreeing link's
+// anchor on it, fiber_b / arc_b the link's other fiber, edge_uuid the link,
+// `residual` and `weight` the suspected fiber's disagreeing and agreeing
+// links, and one piece row for the stretch to look at.
+inline constexpr std::int64_t kScaffoldNormalFlipRowKind = 16;
 
 // The rows of one solve. `method` names the backend the result came from.
 ScaffoldRunRows scaffoldSolveRunRows(const ScaffoldGraph&, const ScaffoldSolveResult&, const ScaffoldSolveOptions&,
@@ -95,6 +106,16 @@ struct ScaffoldStoredResidual {
 
 // The ranked residuals of one run, in stored order (worst cost first).
 std::vector<ScaffoldStoredResidual> readScaffoldResiduals(const objects::StoreReader&, const std::string& runUuid);
+// The run's normal flip suspects (kScaffoldNormalFlipRowKind), in stored order.
+std::vector<ScaffoldStoredResidual> readScaffoldNormalFlips(const objects::StoreReader&, const std::string& runUuid);
+
+// The gauge strip normals last solved for one fiber (XYZ per annotated line
+// point), from the store's derived-result rows: the newest row of the fiber's
+// highest version that was solved from the given source (`fused`: with the
+// prediction's sheet axis) and covers exactly `linePoints` points. nullopt
+// when the store holds none - no measured run solved this fiber as it is now.
+std::optional<std::vector<double>> readScaffoldFiberNormals(const objects::StoreReader&, const std::string& fiberUuid,
+                                                            bool fused, std::size_t linePoints);
 
 // Per-fiber windings of one run, by fiber UUID.
 struct ScaffoldStoredWinding {

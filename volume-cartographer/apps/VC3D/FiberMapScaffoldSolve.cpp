@@ -274,6 +274,7 @@ void ScaffoldSolveController::selectRun(const std::string& runUuid)
     try {
         session->readStore(*store, [&](const vc::objects::StoreReader& reader, const auto&) {
             view.residuals = readScaffoldResiduals(reader, runUuid);
+            view.flips = readScaffoldNormalFlips(reader, runUuid);
             view.windings = readScaffoldWindings(reader, runUuid);
         });
     } catch (const std::exception& problem) {
@@ -322,6 +323,63 @@ void ScaffoldSolveController::setFrame(const std::string& volume)
     if (volume == _frameVolume) return;
     _frameVolume = volume;
     dropApprovals();
+}
+
+std::optional<ScaffoldSolveController::RunFiberNormals> ScaffoldSolveController::runFiberNormals(
+    const std::string& fiberUuid, QString* why) const
+{
+    const auto fail = [&](const QString& reason) -> std::optional<RunFiberNormals> {
+        if (why) *why = reason;
+        return std::nullopt;
+    };
+    const auto* view = selected();
+    if (!view) return fail(tr("no solve is selected"));
+    const auto winding = view->windings.find(fiberUuid);
+    if (winding == view->windings.end() || !winding->second.normalSign)
+        return fail(tr("the selected solve solved no normal for this fiber"));
+    const auto store = attachment();
+    const auto session = _state ? _state->objectStoreSession() : nullptr;
+    if (!store || !session) return fail(tr("no object store is attached"));
+    const bool fused = view->run.normalSource == "fused";
+    const double sign = double(*winding->second.normalSign);
+    std::optional<RunFiberNormals> out;
+    QString reason;
+    try {
+        session->readStore(*store, [&](const vc::objects::StoreReader& reader, const auto&) {
+            const auto revision = reader.currentObject(fiberUuid);
+            if (!revision) { reason = tr("the fiber is no longer in the store"); return; }
+            auto content = vc::objects::fiberPieceContent(reader, *revision);
+            if (!_frameVolume.empty() && !content.linePoints.empty()) {
+                const vc::objects::GeometrySnapshot snapshot(reader);
+                const auto transformed = snapshot.viewTransformedAt(*revision, _frameVolume, 1.);
+                content.linePoints = transformed.points("line_points", 0, content.linePoints.size());
+                content.controlPoints = transformed.points("control_points", 0, content.controlPoints.size());
+            }
+            // The solve reads the annotated line only; its normals are per
+            // point of that.
+            const auto range = vc::geometry::annotatedLineRange(content.controlPoints, content.linePoints);
+            const auto gauge = vc::fiber_graph::readScaffoldFiberNormals(reader, fiberUuid, fused, range.size());
+            if (!gauge) {
+                reason = tr("the store holds no %1 normals for this fiber as it is now; solve again")
+                             .arg(fused ? tr("fused") : tr("geometry"));
+                return;
+            }
+            out.emplace();
+            out->points.reserve(range.size());
+            out->normals.reserve(range.size());
+            for (std::size_t i = 0; i < range.size(); ++i) {
+                const auto& point = content.linePoints[range.begin + i];
+                out->points.emplace_back(float(point[0]), float(point[1]), float(point[2]));
+                // The run's inward normal, turned outward for the views.
+                out->normals.emplace_back(float(-sign * (*gauge)[3 * i]), float(-sign * (*gauge)[3 * i + 1]),
+                                          float(-sign * (*gauge)[3 * i + 2]));
+            }
+        });
+    } catch (const std::exception& problem) {
+        return fail(tr("the solve's normals could not be read: %1").arg(QString::fromUtf8(problem.what())));
+    }
+    if (!out) return fail(reason);
+    return out;
 }
 
 void ScaffoldSolveController::loadApprovals()
@@ -552,6 +610,15 @@ void ScaffoldSolveController::startSolve(const ScaffoldSolveRequest& request)
                     stages.approvals = &approvals;
                 }
                 const auto result = solveScaffoldWinding(graph, geometry, options, measured);
+                // Where the map links and the solved normals disagree about
+                // which fiber is inside: the stretches to review first.
+                std::vector<ScaffoldNormalFlip> flips;
+                ScaffoldNormalFlipReport flipReport;
+                if (normals) {
+                    flips = scaffoldLinkNormalFlips(graph, geometry, *normals, signs.sign, result.constraints, flipReport);
+                    stages.flips = &flips;
+                    stages.flipReport = &flipReport;
+                }
                 record.input = {graph.source.storeUuid, graph.source.generation, graph.source.commitSequence};
                 job->rows = scaffoldSolveRunRows(graph, result, options, record, stages);
                 job->runUuid = record.runUuid;
@@ -661,10 +728,11 @@ void ScaffoldSolveController::finishSolve()
 }
 
 namespace {
-// The store's kind of a stored residual's constraint, or nullopt for a manual
+// The store's kind of a stored residual's constraint, or nullopt for a map
 // link (whose approval is its edge record's review state).
 std::optional<vc::objects::FiberConstraintKind> storedConstraintKind(const ScaffoldStoredResidual& residual)
 {
+    if (!residual.edgeUuid.empty()) return std::nullopt;
     switch (residual.kind) {
     case std::int64_t(ScaffoldConstraintKind::Perpendicular): return vc::objects::FiberConstraintKind::Perpendicular;
     case std::int64_t(ScaffoldConstraintKind::Parallel): return vc::objects::FiberConstraintKind::Parallel;
@@ -1514,8 +1582,7 @@ void ScaffoldApprovalPanel::rebuild()
         entry.row.keys.density = residual.cyclePieceLength > 0 ? entry.row.keys.cost / residual.cyclePieceLength : 0.;
         entry.row.fiberUuid = residual.fiberA;
         entry.row.otherUuid = residual.fiberB;
-        const auto measured = residual.edgeUuid.empty() &&
-                              residual.kind != std::int64_t(ScaffoldConstraintKind::Manual);
+        const auto measured = residual.edgeUuid.empty();
         const auto spans = coveringSpans(residual);
         // Where: the two pieces the crossing lies on, which is where it can
         // be looked at; a link states its anchors the same way.
@@ -1625,6 +1692,45 @@ void ScaffoldApprovalPanel::rebuild()
     std::stable_sort(entries.begin(), entries.end(), [&](const Entry& x, const Entry& y) {
         return scaffoldApprovalRowBefore(x.row.keys, y.row.keys, order);
     });
+    // The normal flip suspects come first: a stretch on which a fiber's
+    // normal turns over makes every crossing beyond it state the wrong order,
+    // so it is looked at before the residuals it causes.
+    {
+        std::vector<Entry> flipEntries;
+        for (const auto& flip : view->flips) {
+            if (filter >= 0 && componentOf(flip.fiberA) != filter) continue;
+            Entry entry;
+            entry.row.kind = Row::Kind::Piece;
+            entry.row.fiberUuid = flip.fiberA;
+            entry.row.otherUuid = flip.fiberB;
+            QString where = tr("%1 vx").arg(flip.arcA, 0, 'f', 0);
+            double length = 0;
+            if (!flip.pieces.empty()) {
+                const auto& piece = flip.pieces.front();
+                entry.row.arcFrom = piece.arcFrom;
+                entry.row.arcTo = piece.arcTo;
+                entry.row.controlFrom = piece.controlFrom.value_or(-1);
+                entry.row.controlTo = piece.controlTo.value_or(-1);
+                length = piece.arcTo - piece.arcFrom;
+                if (piece.controlFrom && piece.controlTo)
+                    where = tr("cp %1-%2").arg(*piece.controlFrom).arg(*piece.controlTo);
+            }
+            entry.row.keys.length = length;
+            // Agreeing links bracket the flip; without one only the anchor's
+            // own span is known.
+            const bool bracketed = flip.weight > 0;
+            entry.text << tr("normal flip") << tr("%1 vs %2").arg(label(flip.fiberA), label(flip.fiberB)) << where
+                       << QString()
+                       << tr("%1 of %2 links disagree")
+                              .arg(qlonglong(flip.residual))
+                              .arg(qlonglong(flip.residual + flip.weight))
+                       << QString() << QString() << QString() << QString() << QString()
+                       << (bracketed ? QString::number(length, 'f', 0) : QString()) << QString();
+            flipEntries.push_back(std::move(entry));
+        }
+        entries.insert(entries.begin(), std::make_move_iterator(flipEntries.begin()),
+                       std::make_move_iterator(flipEntries.end()));
+    }
     // The rows are kept beside the items: an item carries only its index, so
     // every column is free to show what it means rather than a payload.
     const auto append = [this](QTreeWidgetItem* parent, const Row& row, const QStringList& text) {
@@ -1661,7 +1767,8 @@ void ScaffoldApprovalPanel::rebuild()
               .arg(filter)
               .arg(view->residuals.size())
               .arg(segments.size())
-        : tr("%1 violated constraints, %2 stretches to look at")
+        : tr("%1 normal flip suspects, %2 violated constraints, %3 stretches to look at")
+              .arg(view->flips.size())
               .arg(view->residuals.size())
               .arg(segments.size());
     _summaryLabel->setText(counts + tr("; %1 approved, %2 blocked by unapproved geometry")
@@ -1695,8 +1802,7 @@ void ScaffoldApprovalPanel::applySelection()
     // approved or revoked, and only while both pieces it lies on are
     // approved geometry. A link and a stretch cannot be approved here.
     const auto* residual = items.isEmpty() ? nullptr : residualOf(items.front());
-    const bool measured = residual && residual->edgeUuid.empty() &&
-                          residual->kind != std::int64_t(ScaffoldConstraintKind::Manual);
+    const bool measured = residual && residual->edgeUuid.empty();
     const bool approved = measured && _controller && _controller->constraintApproved(*residual);
     bool pieces = false;
     if (measured) {

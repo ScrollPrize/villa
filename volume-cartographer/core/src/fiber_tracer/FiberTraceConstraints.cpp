@@ -3207,4 +3207,34 @@ FiberTraceConstraintObjReport writeFiberTraceConstraintObjs(
     return result;
 }
 
+FiberCrossingRefinement refineFiberCrossing(const PolylineArcGeometry& a, const PolylineArcGeometry& b,
+    double arcA, double arcB, const FiberTraceConstraintConfig& config)
+{
+    if (!config.localEvents) throw std::invalid_argument("refineFiberCrossing needs the local-event mode");
+    std::vector<std::optional<PolylineArcGeometry>> geometries;
+    geometries.emplace_back(a);
+    geometries.emplace_back(b);
+    std::vector<FiberTraceConstraintPiece> pieces(2);
+    for (std::size_t i = 0; i < 2; ++i) {
+        pieces[i].traceIndex = pieces[i].pieceIndex = i;
+        pieces[i].endArcBaseVoxels = geometries[i]->length();
+        pieces[i].sampleArcsBaseVoxels = {std::clamp(i ? arcB : arcA, 0., geometries[i]->length())};
+    }
+    PairCandidate candidate;
+    candidate.pieces.a = 0;
+    candidate.pieces.b = 1;
+    candidate.arcA = pieces[0].sampleArcsBaseVoxels[0];
+    candidate.arcB = pieces[1].sampleArcsBaseVoxels[0];
+    std::pmr::monotonic_buffer_resource storage;
+    const auto scored = scoreLocalCandidate(candidate, pieces, geometries, config, storage);
+    FiberCrossingRefinement out;
+    out.accepted = scored.constraint != nullptr;
+    if (!out.accepted) out.failure = scored.failureCheck ? scored.failureCheck : "rejected";
+    out.parallel = scored.initialLocalRelation == 1;
+    out.arcA = scored.candidate.arcA;
+    out.arcB = scored.candidate.arcB;
+    out.distance = length(samplePolylineArc(a, out.arcA).point - samplePolylineArc(b, out.arcB).point);
+    return out;
+}
+
 }  // namespace vc::fiber_tracer

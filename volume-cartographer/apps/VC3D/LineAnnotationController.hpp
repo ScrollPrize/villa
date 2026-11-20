@@ -377,6 +377,16 @@ public:
     // lock controls inserted or tagged in the session only until the first
     // edit (docs/line_annotation_fibers.md, "Piece approval and lock control points").
     void openFiberPiece(uint64_t fiberId, const vc3d::line_annotation::PiecePlan& plan);
+    // The normals a scaffold solve used along a fiber, in the active volume:
+    // one per point of the line the solve read, pointing away from the scroll
+    // centre. While set, every session of that fiber takes them as its
+    // baseline normals instead of the sampled sheet normals - the views, and
+    // the interpolation of manual normals on top of them (displayFieldForSession).
+    // Null clears them.
+    struct SolverLineNormals {
+        std::vector<cv::Vec3f> points, normals;
+    };
+    void setSolverLineNormals(uint64_t fiberId, std::shared_ptr<const SolverLineNormals> normals);
     // Approves (or revokes the approval of) the open piece in the most recent
     // pane of the fiber for one aspect: saves the session first (which crops
     // neighbouring approvals), then appends the row expecting the saved
@@ -1255,6 +1265,7 @@ private:
     // Per-line-point sampled sheet normals, sign-oriented away from the
     // scroll center (umbilicus when available, volume XY center otherwise);
     // NaN entries mark invalid samples.
+    std::map<uint64_t, std::shared_ptr<const SolverLineNormals>> _solverLineNormals;
     [[nodiscard]] std::vector<cv::Vec3f> orientedLineNormalsForSession(
         const LineAnnotationSession& session);
     [[nodiscard]] vc::fiber_tracer::FiberDisplayField displayFieldForSession(

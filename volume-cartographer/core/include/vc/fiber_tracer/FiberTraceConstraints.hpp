@@ -2,6 +2,7 @@
 #include <map>
 
 #include "vc/fiber_tracer/FiberletCropTrace.hpp"
+#include "vc/fiber_tracer/PolylineGeometry.hpp"
 
 #include <cstddef>
 #include <filesystem>
@@ -414,5 +415,19 @@ pruneFiberTraceConstraintsByStrength(
 [[nodiscard]] FiberTraceConstraintObjReport writeFiberTraceConstraintObjs(
     const FiberTraceConstraintReport& report,
     const std::filesystem::path& outputBase);
+
+// The local-event refinement of one stated encounter: seeded at two arcs, as
+// the extraction refines and certifies a candidate it found itself (`config`
+// with localEvents). This is how a relation asserted from outside - an
+// annotation link - is brought to the position and the acceptance rules of the
+// extracted crossings. `failure` names the check that rejected it.
+struct FiberCrossingRefinement {
+    bool accepted = false;
+    std::string failure;
+    bool parallel = false; // the geometry's verdict; meaningful once a relation was found
+    double arcA = 0, arcB = 0, distance = 0;
+};
+[[nodiscard]] FiberCrossingRefinement refineFiberCrossing(const PolylineArcGeometry& a, const PolylineArcGeometry& b,
+    double arcA, double arcB, const FiberTraceConstraintConfig& config);
 
 }  // namespace vc::fiber_tracer

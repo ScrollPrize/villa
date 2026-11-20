@@ -535,9 +535,8 @@ objects::FiberConstraintKind scaffoldConstraintStoreKind(ScaffoldConstraintKind 
         case ScaffoldConstraintKind::Perpendicular: return objects::FiberConstraintKind::Perpendicular;
         case ScaffoldConstraintKind::Parallel: return objects::FiberConstraintKind::Parallel;
         case ScaffoldConstraintKind::Enclosure: return objects::FiberConstraintKind::Enclosure;
-        case ScaffoldConstraintKind::Manual: break;
     }
-    throw std::invalid_argument("scaffold constraints: a manual link's approval is its edge record's state");
+    throw std::invalid_argument("scaffold constraints: unknown constraint kind");
 }
 
 std::optional<ScaffoldConstraintSpans> scaffoldConstraintSpans(const ScaffoldGraph& graph,
@@ -589,6 +588,8 @@ objects::FiberConstraintApproval approveScaffoldConstraint(const ScaffoldGraph& 
                                                            const std::string& author, const std::string& approvedAt,
                                                            const std::string& host)
 {
+    if (constraint.link >= 0)
+        throw std::invalid_argument("scaffold constraints: a map link's approval is its edge record's state");
     const auto identity = scaffoldConstraintIdentity(graph, constraint);
     const auto spans = scaffoldConstraintSpans(graph, geometry, constraint);
     if (!spans)
@@ -644,7 +645,7 @@ void applyScaffoldConstraintApprovals(const ScaffoldGraph& graph, const Scaffold
         return contents.emplace(fiber, scaffoldFiberContent(graph, fiber)).first->second;
     };
     for (auto& constraint : measured) {
-        if (constraint.kind == ScaffoldConstraintKind::Manual) continue;
+        if (constraint.link >= 0) continue; // a map link's approval is its edge record's state
         const auto found = index.find(scaffoldConstraintIdentity(graph, constraint));
         if (found == index.end()) continue;
         matched[found->second] = 1;
@@ -671,6 +672,100 @@ void applyScaffoldConstraintApprovals(const ScaffoldGraph& graph, const Scaffold
     for (std::size_t i = 0; i < live.size(); ++i)
         if (!matched[i]) ++report.unmatched;
     report.stale = report.live - report.unmatched - report.approved;
+}
+
+std::vector<ScaffoldNormalFlip> scaffoldLinkNormalFlips(const ScaffoldGraph& graph, const ScaffoldGeometry& geometry,
+                                                        const ScaffoldNormals& normals,
+                                                        std::span<const std::int64_t> normalSign,
+                                                        std::span<const ScaffoldConstraint> constraints,
+                                                        ScaffoldNormalFlipReport& report)
+{
+    if (normalSign.size() != graph.fibers.size())
+        throw std::invalid_argument("scaffold constraints: the normal signs cover a different fiber set");
+    report = ScaffoldNormalFlipReport{};
+    struct Check { std::size_t constraint; double arc; bool agrees; };
+    std::map<std::int64_t, std::vector<Check>> checks;
+    std::vector<std::size_t> disagreeing;
+    for (std::size_t index = 0; index < constraints.size(); ++index) {
+        const auto& constraint = constraints[index];
+        if (constraint.link < 0 || constraint.kind == ScaffoldConstraintKind::Enclosure) continue;
+        ++report.checked;
+        const auto inward = [&](std::int64_t fiber, double arc) -> std::optional<geometry::Point> {
+            const auto normal = normals.at(std::size_t(fiber), arc);
+            if (!normal) return std::nullopt;
+            const double sign = double(normalSign[std::size_t(fiber)]);
+            return geometry::Point{(*normal)[0] * sign, (*normal)[1] * sign, (*normal)[2] * sign};
+        };
+        const auto normalA = inward(constraint.a, constraint.arcA), normalB = inward(constraint.b, constraint.arcB);
+        int observed = 0, expected = 1;
+        if (normalA && normalB) {
+            if (constraint.kind == ScaffoldConstraintKind::Parallel) {
+                const double dot = ((*normalA)[0] * (*normalB)[0] + (*normalA)[1] * (*normalB)[1]) +
+                                   (*normalA)[2] * (*normalB)[2];
+                observed = std::abs(dot) < .1 ? 0 : (dot > 0 ? 1 : -1);
+            } else {
+                const auto start = geometry.packed().sample(constraint.a, constraint.arcA).point;
+                const auto finish = geometry.packed().sample(constraint.b, constraint.arcB).point;
+                const geometry::Point connector{finish[0] - start[0], finish[1] - start[1], finish[2] - start[2]};
+                // Stated from the H fiber: +1 the V fiber outside it, -1 inside.
+                const bool forward = graph.fibers[std::size_t(constraint.a)].family == ScaffoldFamily::Horizontal;
+                const int order = int(geometry::fiberSignedOrder(connector, *normalA, *normalB));
+                observed = forward ? order : -order;
+                expected = (forward ? constraint.step : -constraint.step) >= 0 ? 1 : -1;
+                // No order at all because the two normals face each other
+                // across the connector: two fibers of one sheet cannot, so one
+                // of them is flipped whatever the link states.
+                if (order == 0) {
+                    const double length = std::sqrt((connector[0] * connector[0] + connector[1] * connector[1]) +
+                                                    connector[2] * connector[2]);
+                    const auto along = [&](const geometry::Point& normal) {
+                        return ((connector[0] * normal[0] + connector[1] * normal[1]) + connector[2] * normal[2]) /
+                               std::max(length, 1e-12);
+                    };
+                    const double a = along(*normalA), b = along(*normalB);
+                    if (length > 0 && a * b < 0 && std::min(std::abs(a), std::abs(b)) >= .1) {
+                        observed = -expected;
+                        ++report.opposed;
+                    }
+                }
+            }
+        }
+        if (observed == 0) { ++report.undetermined; continue; }
+        const bool agrees = observed == expected;
+        if (agrees) ++report.agreed; else { ++report.disagreed; disagreeing.push_back(index); }
+        checks[constraint.a].push_back({index, constraint.arcA, agrees});
+        checks[constraint.b].push_back({index, constraint.arcB, agrees});
+    }
+    std::vector<ScaffoldNormalFlip> flips;
+    for (const auto index : disagreeing) {
+        const auto& constraint = constraints[index];
+        for (const bool first : {true, false}) {
+            ScaffoldNormalFlip flip;
+            flip.constraint = std::int64_t(index);
+            flip.fiber = first ? constraint.a : constraint.b;
+            flip.other = first ? constraint.b : constraint.a;
+            flip.arc = first ? constraint.arcA : constraint.arcB;
+            flip.otherArc = first ? constraint.arcB : constraint.arcA;
+            double nearest = std::numeric_limits<double>::quiet_NaN();
+            for (const auto& check : checks[flip.fiber]) {
+                if (!check.agrees) { ++flip.disagreeing; continue; }
+                ++flip.agreeing;
+                if (std::isnan(nearest) || std::abs(check.arc - flip.arc) < std::abs(nearest - flip.arc))
+                    nearest = check.arc;
+            }
+            flip.bracketed = !std::isnan(nearest);
+            flip.piece.fiber = flip.fiber;
+            flip.piece.arcFrom = flip.bracketed ? std::min(nearest, flip.arc) : flip.arc;
+            flip.piece.arcTo = flip.bracketed ? std::max(nearest, flip.arc) : flip.arc;
+            scaffoldPieceControls(graph, geometry, flip.piece);
+            flips.push_back(flip);
+        }
+    }
+    std::stable_sort(flips.begin(), flips.end(), [](const ScaffoldNormalFlip& x, const ScaffoldNormalFlip& y) {
+        if (x.bracketed != y.bracketed) return x.bracketed;
+        return x.piece.length() < y.piece.length();
+    });
+    return flips;
 }
 
 } // namespace vc::fiber_graph

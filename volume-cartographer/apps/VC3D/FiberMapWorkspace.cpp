@@ -4552,6 +4552,21 @@ void FiberMapWorkspace::openScaffoldPiece(const std::string& fiberUuid, std::int
             plan.b.lineIndex = *last;
         }
     }
+    // A stretch a solve accuses is reviewed against that solve: the annotation
+    // shows the normals the run used, and interpolates on top of those.
+    if (_solveController) {
+        QString why;
+        auto normals = _solveController->runFiberNormals(fiberUuid, &why);
+        if (normals) {
+            auto shared = std::make_shared<LineAnnotationController::SolverLineNormals>();
+            shared->points = std::move(normals->points);
+            shared->normals = std::move(normals->normals);
+            _controller->setSolverLineNormals(fiberId, std::move(shared));
+        } else {
+            _controller->setSolverLineNormals(fiberId, nullptr);
+            setOperationStatus(tr("The annotation shows its own normals: %1").arg(why));
+        }
+    }
     emit openFiberPieceRequested(fiberId, plan);
 }
 

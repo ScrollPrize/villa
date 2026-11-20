@@ -228,4 +228,39 @@ struct ScaffoldApprovalReport {
 void applyScaffoldConstraintApprovals(const ScaffoldGraph&, const ScaffoldGeometry&, std::span<ScaffoldConstraint>,
                                       std::span<const objects::FiberConstraintApproval>, ScaffoldApprovalReport&);
 
+// A map link states which of its two fibers lies inside the other (an
+// ordinary H-V link: the V fiber outside the H fiber; an adjacent one: inside;
+// a same-family link: side by side, normals alike). The solved fiber normals
+// state the same order at the link's encounter. Where the two disagree, one of
+// the two fibers' normals points the wrong way there: a flip somewhere along
+// it. One entry per disagreeing link and fiber, with the stretch the flip has
+// to lie on - from the nearest link of that fiber whose order agrees to the
+// disagreeing one.
+struct ScaffoldNormalFlip {
+    std::int64_t constraint = 0; // the disagreeing link, an index into the constraints given
+    std::int64_t fiber = 0, other = 0;
+    double arc = 0, otherArc = 0;
+    // This fiber's other links: how many agree and disagree with its normal
+    // (the disagreeing one included).
+    std::int64_t agreeing = 0, disagreeing = 0;
+    // The stretch to look at; the fiber's covering span around the anchor
+    // when none of its links agrees (then nothing brackets the flip).
+    ScaffoldPiece piece;
+    bool bracketed = false;
+};
+struct ScaffoldNormalFlipReport {
+    // Links compared, and those whose order the normals could not state (no
+    // normal, or a connector nearly along the sheet).
+    std::int64_t checked = 0, agreed = 0, disagreed = 0, undetermined = 0;
+    // Of the disagreeing links: those whose two normals face each other
+    // across the connector, which is a flip whatever the link states.
+    std::int64_t opposed = 0;
+};
+// `constraints` are a solve's; only its map links are compared. Ordered with
+// the bracketed stretches first, the shortest before the longer.
+std::vector<ScaffoldNormalFlip> scaffoldLinkNormalFlips(const ScaffoldGraph&, const ScaffoldGeometry&,
+                                                        const ScaffoldNormals&, std::span<const std::int64_t> normalSign,
+                                                        std::span<const ScaffoldConstraint> constraints,
+                                                        ScaffoldNormalFlipReport&);
+
 } // namespace vc::fiber_graph

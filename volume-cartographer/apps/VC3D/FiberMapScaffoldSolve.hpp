@@ -24,6 +24,8 @@
 #include <vc_object_store/objects/ObjectStoreSession.hpp>
 #include <vc_object_store/objects/Transactions.hpp>
 
+#include <opencv2/core.hpp>
+
 #include <array>
 #include <functional>
 #include <map>
@@ -91,6 +93,9 @@ struct ScaffoldSolveRequest {
 struct ScaffoldRunView {
     vc::fiber_graph::ScaffoldStoredRun run;
     std::vector<vc::fiber_graph::ScaffoldStoredResidual> residuals;
+    // Normal flip suspects: a map link whose inside/outside order the solved
+    // normals contradict, one row per accused fiber (ScaffoldSolveRuns.hpp).
+    std::vector<vc::fiber_graph::ScaffoldStoredResidual> flips;
     std::map<std::string, vc::fiber_graph::ScaffoldStoredWinding> windings;
     // The accused stretches, highest score first (rankScaffoldPieces).
     std::vector<ScaffoldRankedPiece> pieces;
@@ -122,6 +127,16 @@ public:
     // placed against are measured in it too - not in each fiber's stored
     // frame, where the same fiber has another length.
     void setFrame(const std::string& volume);
+    // The normals the selected run used along one fiber: its annotated line in
+    // the runs' frame and, per point, the solved strip normal with the run's
+    // whole-fiber sign, turned to point away from the scroll centre (the
+    // annotation views' convention). nullopt, with the reason, when the
+    // selected run solved no normals or the store no longer holds them for
+    // the fiber as it is now.
+    struct RunFiberNormals {
+        std::vector<cv::Vec3f> points, normals;
+    };
+    [[nodiscard]] std::optional<RunFiberNormals> runFiberNormals(const std::string& fiberUuid, QString* why = nullptr) const;
     // The span of a fiber covering an anchor arc, and whether it is approved.
     // Answers from the loaded piece approvals, so it needs loadApprovals().
     [[nodiscard]] ScaffoldAnchorSpan anchorSpan(const std::string& fiberUuid, double arc) const;

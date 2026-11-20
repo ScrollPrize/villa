@@ -37,11 +37,13 @@ struct WindingArc {
     double weight = 0;
 };
 
-// Manual: an annotation link. Perpendicular and Parallel: a measured
-// crossing's rounded winding separation. Enclosure: the exact H->V step the
-// signed order of a pair's perpendicular crossings bounds from both sides
-// (ScaffoldConstraints.hpp).
-enum class ScaffoldConstraintKind : int { Manual = 0, Perpendicular = 1, Parallel = 2, Enclosure = 3 };
+// Perpendicular and Parallel: one encounter of two fibers, the geometry's own
+// verdict - a measured crossing with its rounded winding separation, or an
+// annotation link refined onto the same encounter (`ScaffoldConstraint::link`
+// names the source; the link's step replaces the measurement). Enclosure: the
+// exact H->V step the signed order of a pair's perpendicular crossings bounds
+// from both sides (ScaffoldConstraints.hpp).
+enum class ScaffoldConstraintKind : int { Perpendicular = 1, Parallel = 2, Enclosure = 3 };
 
 const char* scaffoldConstraintKindName(ScaffoldConstraintKind);
 
@@ -49,8 +51,9 @@ const char* scaffoldConstraintKindName(ScaffoldConstraintKind);
 // asserted at: the residual analysis needs them to name the pieces a cycle
 // runs along.
 struct ScaffoldConstraint {
-    ScaffoldConstraintKind kind = ScaffoldConstraintKind::Manual;
-    // Index into ScaffoldGraph::links for a manual link, -1 otherwise.
+    ScaffoldConstraintKind kind = ScaffoldConstraintKind::Perpendicular;
+    // The source: an index into ScaffoldGraph::links for a map link (manual
+    // or automatic), -1 for a relation the extraction found itself.
     std::int64_t link = -1;
     std::int64_t a = 0, b = 0;      // fiber indices, a < b
     double arcA = 0, arcB = 0;      // anchor arc lengths on a and b
@@ -82,6 +85,15 @@ struct ScaffoldLinkArcOptions {
     // coordinate-frame guard, not a tolerance to widen silently.
     double maxAnchorDistance = 5.0;
     double weight = 1.0;
+    // A link is refined onto the encounter of its two fibers with the
+    // crossing extraction's own refinement and acceptance rules (angle
+    // tolerance, fiber support on both sides), seeded at its anchors. This is
+    // the farthest the two refined points may lie apart, in voxels.
+    double refineMaximumDistance = 512.0;
+    // A measured crossing of the same pair within this arc distance of a
+    // refined link, on both fibers, is the same encounter: the link is kept
+    // and the crossing's own relation is dropped.
+    double deduplicateArc = 64.0;
 };
 
 struct ScaffoldLinkReport {
@@ -92,14 +104,27 @@ struct ScaffoldLinkReport {
     // for geometry: they are used, but they are not held rigid.
     std::int64_t approvedWithoutPieces = 0;
     double maxAnchorDistance = 0;
+    // Links the refinement rejected, by the rule that rejected them: the two
+    // fibers do not meet at the angle their families state (or at no clear
+    // angle), a fiber ends too close to the encounter to certify it, the
+    // refined points lie farther apart than the limit, or another
+    // consistency check of the extraction.
+    std::int64_t skippedAngle = 0, skippedEndSupport = 0, skippedDistance = 0, skippedConsistency = 0;
+    // The largest arc distance a refinement moved an anchor, in voxels.
+    double maxRefinementShift = 0;
+    // Measured relations dropped because a refined link states the same
+    // encounter, and the links that had one.
+    std::int64_t deduplicatedCrossings = 0, linksWithCrossing = 0;
 };
 
 // W_b - W_a asserted by an adjacent link, or nullopt when the pair is not one
 // H and one V (an annotation error that constrains nothing).
 std::optional<std::int64_t> adjacentStep(ScaffoldFamily a, ScaffoldFamily b);
 
-// The manual-link constraints of a scaffold. Throws std::invalid_argument when
-// an anchor lies farther than `maxAnchorDistance` from its polyline.
+// The map-link constraints of a scaffold, each refined onto the encounter of
+// its two fibers; a link the refinement rejects asserts nothing and is
+// counted. Throws std::invalid_argument when an anchor lies farther than
+// `maxAnchorDistance` from its polyline.
 std::vector<ScaffoldConstraint> scaffoldLinkConstraints(const ScaffoldGraph&, const ScaffoldGeometry&,
                                                         const ScaffoldLinkArcOptions&, ScaffoldLinkReport&);
 
@@ -120,6 +145,9 @@ struct ScaffoldPiece {
     std::int64_t controlFrom = -1, controlTo = -1;
     double length() const { return std::abs(arcTo - arcFrom); }
 };
+
+// Fill a piece's controlFrom / controlTo from its arcs.
+void scaffoldPieceControls(const ScaffoldGraph&, const ScaffoldGeometry&, ScaffoldPiece&);
 
 struct ScaffoldResidual {
     std::int64_t constraint = 0;
@@ -164,8 +192,10 @@ struct ScaffoldSolveOptions {
 
 struct ScaffoldSolveResult {
     std::vector<ScaffoldConstraint> constraints;
-    // Constraints per kind, indexed by ScaffoldConstraintKind.
+    // Constraints per kind, indexed by ScaffoldConstraintKind (map links
+    // included), and how many of them came from a map link.
     std::array<std::int64_t, 4> constraintsByKind{};
+    std::int64_t linkConstraints = 0;
     std::vector<WindingArc> arcs; // aggregated, as solved
     std::vector<std::int64_t> winding, component; // per fiber; unconstrained fibers get their own component
     std::int64_t components = 0, isolatedFibers = 0;

@@ -36,19 +36,31 @@ struct Builder {
         graph.offsets.push_back(0);
     }
 
+    // The point of a fiber at `height`: its arc is height + 195.
+    static vc::geometry::Point at(ScaffoldFamily family, double x, double height)
+    {
+        return family == ScaffoldFamily::Vertical ? vc::geometry::Point{x, 10., height}
+                                                  : vc::geometry::Point{x, 5. + height, 5.};
+    }
+
     std::size_t fiber(ScaffoldFamily family, double x)
     {
         ScaffoldFiber entry;
         entry.uuid = vc::objects::util::newUuid();
         entry.family = family;
         entry.pointFirst = graph.offsets.back();
-        const std::vector<vc::geometry::Point> points{{x, 10., 0.}, {x, 10., 5.}, {x, 10., 10.}};
+        // 400 voxels of straight line, long enough on both sides of a link
+        // for the refinement to certify it: a V fiber runs along z, an H fiber
+        // along y, and both pass (x, 10, 5) at arc 200, so an H and a V fiber
+        // cross there at a right angle and two of one family run side by side.
+        std::vector<vc::geometry::Point> points;
+        for (int i = 0; i <= 80; ++i) points.push_back(at(family, x, 5. * i - 195.));
         entry.pointCount = std::int64_t(points.size());
         for (const auto& point : points) graph.linePoints.insert(graph.linePoints.end(), point.begin(), point.end());
         entry.content.controlIds = {1, 2, 3};
-        entry.content.controlPoints = points;
-        entry.content.controlLineIndex = {0, 1, 2};
-        entry.content.annotations.assign(points.size(), nlohmann::json::object());
+        entry.content.controlPoints = {points[0], points[40], points[80]};
+        entry.content.controlLineIndex = {0, 40, 80};
+        entry.content.annotations.assign(3, nlohmann::json::object());
         graph.offsets.push_back(entry.pointFirst + entry.pointCount);
         graph.index.emplace(entry.uuid, graph.fibers.size());
         graph.fibers.push_back(std::move(entry));
@@ -67,7 +79,7 @@ struct Builder {
     }
 
     // Anchors on the polylines at height `height`, so their projection
-    // distance is zero and the arc equals the height.
+    // distance is zero.
     void link(std::size_t a, std::size_t b, bool adjacent = false, const std::string& state = "approved",
               double heightA = 5., double heightB = 5., bool automatic = false)
     {
@@ -80,8 +92,8 @@ struct Builder {
         entry.adjacent = adjacent;
         entry.autoLink = automatic;
         entry.approvalState = state;
-        entry.anchorA = vc::geometry::Point{graph.fibers[a].content.controlPoints.front()[0], 10., heightA};
-        entry.anchorB = vc::geometry::Point{graph.fibers[b].content.controlPoints.front()[0], 10., heightB};
+        entry.anchorA = at(graph.fibers[a].family, graph.fibers[a].content.controlPoints.front()[0], heightA);
+        entry.anchorB = at(graph.fibers[b].family, graph.fibers[b].content.controlPoints.front()[0], heightB);
         graph.links.push_back(std::move(entry));
     }
 };
@@ -122,13 +134,13 @@ TEST_CASE("link anchors project onto their polyline")
     Builder builder;
     builder.fiber(ScaffoldFamily::Horizontal, 100.);
     const ScaffoldGeometry geometry(builder.graph);
-    const auto on = geometry.project(0, {100., 10., 2.5});
-    CHECK(on.arc == doctest::Approx(2.5));
+    const auto on = geometry.project(0, Builder::at(ScaffoldFamily::Horizontal, 100., 2.5));
+    CHECK(on.arc == doctest::Approx(197.5));
     CHECK(on.distance == doctest::Approx(0.));
-    const auto beside = geometry.project(0, {103., 10., 7.});
-    CHECK(beside.arc == doctest::Approx(7.));
+    const auto beside = geometry.project(0, Builder::at(ScaffoldFamily::Horizontal, 103., 7.));
+    CHECK(beside.arc == doctest::Approx(202.));
     CHECK(beside.distance == doctest::Approx(3.));
-    CHECK(geometry.controlArc(0, 2) == doctest::Approx(10.));
+    CHECK(geometry.controlArc(0, 2) == doctest::Approx(400.));
 }
 
 TEST_CASE("a consistent scaffold is solved exactly")
@@ -369,6 +381,54 @@ TEST_CASE("links are filtered by approval state, automation and family")
     CHECK(more.size() == 2);
 }
 
+TEST_CASE("a link is refined onto the encounter of its two fibers")
+{
+    Builder builder;
+    const auto h = builder.fiber(ScaffoldFamily::Horizontal, 100.);
+    const auto v = builder.fiber(ScaffoldFamily::Vertical, 110.);
+    const auto other = builder.fiber(ScaffoldFamily::Horizontal, 120.);
+    // Anchors 30 voxels along both fibers from where they cross.
+    builder.link(h, v, false, "approved", 35., 35.);
+    // Side by side: the first fiber's anchor stays, the second is projected.
+    builder.link(h, other, false, "approved", 35., 60.);
+    const ScaffoldGeometry geometry(builder.graph);
+    ScaffoldLinkReport report;
+    const auto constraints = scaffoldLinkConstraints(builder.graph, geometry, ScaffoldLinkArcOptions{}, report);
+    REQUIRE(constraints.size() == 2);
+    CHECK(constraints[0].kind == ScaffoldConstraintKind::Perpendicular);
+    CHECK(constraints[0].link == 0);
+    CHECK(constraints[0].arcA == doctest::Approx(200.));
+    CHECK(constraints[0].arcB == doctest::Approx(200.));
+    CHECK(constraints[1].kind == ScaffoldConstraintKind::Parallel);
+    CHECK(constraints[1].arcA == doctest::Approx(230.));
+    CHECK(constraints[1].arcB == doctest::Approx(230.));
+    CHECK(report.maxRefinementShift == doctest::Approx(30.));
+}
+
+TEST_CASE("a link the refinement rejects asserts nothing")
+{
+    Builder builder;
+    const auto h = builder.fiber(ScaffoldFamily::Horizontal, 100.);
+    const auto other = builder.fiber(ScaffoldFamily::Horizontal, 110.);
+    const auto v = builder.fiber(ScaffoldFamily::Vertical, 120.);
+    const auto far = builder.fiber(ScaffoldFamily::Horizontal, 700.);
+    // At the fibers' first points: nothing on one side to certify it.
+    builder.link(h, other, false, "approved", -195., -195.);
+    // Tagged as two H fibers, but they cross at a right angle.
+    builder.graph.fibers[v].family = ScaffoldFamily::Horizontal;
+    builder.link(h, v);
+    // Side by side, 600 voxels apart.
+    builder.link(h, far);
+    const ScaffoldGeometry geometry(builder.graph);
+    ScaffoldLinkReport report;
+    const auto constraints = scaffoldLinkConstraints(builder.graph, geometry, ScaffoldLinkArcOptions{}, report);
+    CHECK(constraints.empty());
+    CHECK(report.used == 0);
+    CHECK(report.skippedEndSupport == 1);
+    CHECK(report.skippedAngle == 1);
+    CHECK(report.skippedDistance == 1);
+}
+
 TEST_CASE("links switched off solve on the measured constraints alone")
 {
     Builder builder;
@@ -445,7 +505,7 @@ TEST_CASE("an anchor off its polyline fails the run")
     const auto a = builder.fiber(ScaffoldFamily::Horizontal, 100.);
     const auto b = builder.fiber(ScaffoldFamily::Horizontal, 110.);
     builder.link(a, b);
-    builder.graph.links.back().anchorB = vc::geometry::Point{200., 10., 5.};
+    builder.graph.links.back().anchorB = vc::geometry::Point{200., 10., 5.}; // 90 voxels off the fiber at x = 110
     const ScaffoldGeometry geometry(builder.graph);
     ScaffoldLinkReport report;
     CHECK_THROWS_AS(scaffoldLinkConstraints(builder.graph, geometry, ScaffoldLinkArcOptions{}, report),

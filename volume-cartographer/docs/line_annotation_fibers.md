@@ -236,6 +236,24 @@ interpolated display normal before insertion, rather than adding a zero-offset
 knot. Existing CP replacements keep their stored normal; explicit edge-drag
 normals take precedence. Uncorrected regions remain unset and follow Lasagna.
 
+**Reviewing against a scaffold solve.** A stretch opened from the scaffold
+approval list (a normal flip suspect, an accused stretch, a constraint's piece)
+is shown with the normals the selected solve used, not with the sampled sheet
+normals: the strip normal the run solved at each point of the fiber's annotated
+line, with the run's whole-fiber sign, turned away from the scroll centre. This
+is not a setting. Those normals are the baseline of every session of that fiber
+from then on - the views, the cut frames and the interpolation of manual
+display normals between control points all start from them - so a flip of the
+solver's normal is visible as a flip of the view, and a manual normal is an
+offset against what the solver believed. Each line point takes the normal of
+the nearest point of the line the run read, so the baseline survives edits of
+the session's line; it is the run's, and does not follow the edits until the
+scaffold is solved again. A solve that stored no normals for the fiber as it is
+now (a links-only run, or a fiber edited since) leaves the annotation on its
+own normals and says so in the map's status line
+(`ScaffoldSolveController::runFiberNormals`,
+`LineAnnotationController::setSolverLineNormals`).
+
 In the upper-left cross view, Shift-left-drag selects the closest of the
 center and two nominal width edges (not the tolerance boundaries), in screen
 space. Moving the center translates it without editing its normal or width.

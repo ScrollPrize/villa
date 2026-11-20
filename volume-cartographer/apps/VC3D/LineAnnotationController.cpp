@@ -11976,11 +11976,54 @@ std::function<cv::Vec3f(const cv::Vec3f&)> LineAnnotationController::displayCent
     };
 }
 
+void LineAnnotationController::setSolverLineNormals(uint64_t fiberId,
+                                                    std::shared_ptr<const SolverLineNormals> normals)
+{
+    if (normals && !normals->points.empty() && normals->points.size() == normals->normals.size())
+        _solverLineNormals[fiberId] = std::move(normals);
+    else
+        _solverLineNormals.erase(fiberId);
+}
+
 std::vector<cv::Vec3f> LineAnnotationController::orientedLineNormalsForSession(
     const LineAnnotationSession& session)
 {
     constexpr float kNan = std::numeric_limits<float>::quiet_NaN();
     ensureScrollUmbilicusLoaded();
+
+    // A fiber under review against a scaffold solve shows that solve's
+    // normals: each line point takes the normal of the nearest point of the
+    // line the solve read. The session's line may have been edited since, so
+    // the match is by position; a solve's line that is nowhere near (another
+    // frame) is not used.
+    if (session.fiberId) {
+        const auto found = _solverLineNormals.find(session.fiberId);
+        if (found != _solverLineNormals.end() && !session.optimizedLine.points.empty()) {
+            const auto& solver = *found->second;
+            std::vector<cv::Vec3f> normals;
+            std::vector<float> distances;
+            normals.reserve(session.optimizedLine.points.size());
+            distances.reserve(session.optimizedLine.points.size());
+            std::size_t nearest = 0;
+            for (const auto& point : session.optimizedLine.points) {
+                const cv::Vec3f position(point.position);
+                const auto squared = [&](std::size_t index) {
+                    const cv::Vec3f delta = solver.points[index] - position;
+                    return delta.dot(delta);
+                };
+                float best = squared(nearest);
+                for (std::size_t index = 0; index < solver.points.size(); ++index) {
+                    const float distance = squared(index);
+                    if (distance < best) { best = distance; nearest = index; }
+                }
+                normals.push_back(solver.normals[nearest]);
+                distances.push_back(best);
+            }
+            std::nth_element(distances.begin(), distances.begin() + distances.size() / 2, distances.end());
+            // Half of the line within 64 voxels of the solve's: the same frame.
+            if (distances[distances.size() / 2] <= 64.f * 64.f) return normals;
+        }
+    }
 
     std::shared_ptr<Volume> volume;
     try {

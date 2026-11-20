@@ -55,6 +55,60 @@ Anchors are projected onto their fiber's polyline; an anchor farther than
 coordinate-frame guard rather than a tolerance to widen. Identical
 `(a, b, target)` relations are aggregated, their weights summed.
 
+### Links are refined onto their encounter
+
+A link is one statement about one encounter of two fibers, and so is a
+measured crossing. Before a link constrains anything it is brought onto that
+encounter by the crossing extraction's own refinement, seeded at the link's two
+anchors (`refineFiberCrossing`, `vc/fiber_tracer/FiberTraceConstraints.hpp`),
+and it has to pass the extraction's acceptance rules. This is not optional:
+
+- the two fibers must meet at the angle their families state - perpendicular
+  for an H and a V fiber, parallel for two of the same family, within the
+  extraction's 30 degree tolerance, at the encounter and at its probes;
+- both fibers must continue far enough on both sides of the encounter to
+  certify it (the extraction's endpoint support; a link at a fiber's last
+  point fails it);
+- the two refined points may lie at most `links.refine_maximum_distance`
+  (default 512 voxels) apart.
+
+A link that fails asserts nothing. The run counts them by rule
+(`links_rejected_angle`, `links_rejected_end_support`,
+`links_rejected_distance`, `links_rejected_consistency`) and records the
+farthest a refinement moved an anchor (`link_refinement_max_shift`). An
+accepted link is a constraint of the geometry's own kind, `perpendicular` or
+`parallel`, whose source is the map link (`ScaffoldConstraint::link`, the
+`edge_uuid` of a stored residual): there is no separate link kind.
+
+A measured crossing of the same pair within `links.deduplicate_arc` (default
+64 voxels of arc, on both fibers) of a refined link is the same encounter. The
+link is kept, with its own step, and the crossing's relation is dropped
+(`links_with_crossing`, `crossings_replaced_by_links`), so an encounter is
+never stated twice and a link cannot close a cycle with its own crossing. An
+enclosure is a statement about the pair, not about one encounter, and stays.
+On the PHerc0332 scaffold 244 of the 281 links are accepted (13 fail the
+angle, 24 the end support), 239 of them have a crossing, and 256 crossings are
+replaced.
+
+### Normal flips
+
+A map link also states an order: an ordinary H-V link puts the V fiber outside
+the H fiber, an adjacent one inside, and a same-family link puts the two side
+by side with their normals alike. A measured run's solved normals state the
+same order at the link's refined encounter (`fiberSignedOrder`, the order the
+crossings use). Two normals that face each other across the connector state no
+order at all, which two fibers of one sheet cannot do: that is a disagreement
+whatever the link says (`normal_order_links_opposed`); only a connector lying
+nearly in the sheet leaves a link undetermined. Where the two disagree, one of the two fibers' normals points
+the wrong way there - a flip somewhere along it - and every crossing beyond the
+flip measures the wrong side. `scaffoldLinkNormalFlips` lists one suspect per
+disagreeing link and fiber, with the stretch to look at: from that fiber's
+nearest link whose order agrees to the disagreeing one, or the anchor's own
+span when none of its links agrees. A run stores them beside its residuals
+(`kScaffoldNormalFlipRowKind`, `readScaffoldNormalFlips`) and counts the links
+compared (`normal_order_links_checked`, `_agreed`, `_disagreed`,
+`_undetermined`); the CLI summary lists them under `normal_flips`.
+
 ### Measured constraints
 
 A crossing of two annotated fibers asserts a winding step too, and the
@@ -180,7 +234,9 @@ vc_scaffold_solve config.json
 | `links.approval_states` | `["approved"]` | link record states to use |
 | `links.include_auto` | `false` | also use `meta.auto` links |
 | `links.max_anchor_distance` | `5` | voxels, a hard guard |
-| `weights.manual` | `1` | weight per manual link arc |
+| `links.refine_maximum_distance` | `512` | voxels between a link's two refined points |
+| `links.deduplicate_arc` | `64` | voxels of arc within which a crossing is the link's own encounter |
+| `weights.manual` | `1` | weight per map link arc |
 | `constraints.enabled` | `false` | also measure the scaffold's own crossings |
 | `constraints.resample_spacing`, `.maximum_distance`, `.tangent_window` | `32`, `128`, `32` | voxels, the extraction's geometry |
 | `constraints.relax_endpoint_certification` | `false` | accept crossings near a hand-drawn fiber's ends |
@@ -442,6 +498,11 @@ Three docks (`FiberMapScaffoldSolve.hpp`, with the Qt-free ranking in
   the map draws everything else; a faded one has the background painted over
   it at half opacity. There is no second colour for approval: what is bright is
   approved.
+
+  The list starts with the run's **normal flip** suspects (see *Normal
+  flips*): the accused fiber against the link's other fiber, the stretch to
+  look at, and how many of that fiber's links disagree with its normal.
+  Activating one opens the stretch, as for any other stretch.
 
   The *state* column reads `approved`, `approvable` (both pieces approved),
   `blocked` (they are not) or `link`, and **Approve constraint** is enabled

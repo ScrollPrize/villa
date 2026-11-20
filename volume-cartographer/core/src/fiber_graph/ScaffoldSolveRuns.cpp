@@ -1,5 +1,8 @@
 #include "vc/fiber_graph/ScaffoldSolveRuns.hpp"
 
+#include <cstring>
+#include <tuple>
+#include <vc_object_store/objects/FiberScaffoldCacheExtension.hpp>
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -209,7 +212,24 @@ ScaffoldRunRows scaffoldSolveRunRows(const ScaffoldGraph& graph, const ScaffoldS
     // not approved geometry.
     count("link_approved_without_pieces", result.linkReport.approvedWithoutPieces, "links");
     count("contracted_fibers", result.contractedFibers, "fibers");
-    count("manual_constraints", result.constraintsByKind[std::size_t(ScaffoldConstraintKind::Manual)], "constraints");
+    // The map links, refined onto their encounters: how many assert a
+    // relation, how many the refinement rejected and why, and how many
+    // measured crossings they replaced.
+    count("link_constraints", result.linkConstraints, "constraints");
+    count("links_rejected_angle", result.linkReport.skippedAngle, "links");
+    count("links_rejected_end_support", result.linkReport.skippedEndSupport, "links");
+    count("links_rejected_distance", result.linkReport.skippedDistance, "links");
+    count("links_rejected_consistency", result.linkReport.skippedConsistency, "links");
+    count("links_with_crossing", result.linkReport.linksWithCrossing, "links");
+    count("crossings_replaced_by_links", result.linkReport.deduplicatedCrossings, "crossings");
+    metric("link_refinement_max_shift", result.linkReport.maxRefinementShift, "voxels");
+    if (stages.flipReport) {
+        count("normal_order_links_checked", stages.flipReport->checked, "links");
+        count("normal_order_links_agreed", stages.flipReport->agreed, "links");
+        count("normal_order_links_disagreed", stages.flipReport->disagreed, "links");
+        count("normal_order_links_undetermined", stages.flipReport->undetermined, "links");
+        count("normal_order_links_opposed", stages.flipReport->opposed, "links");
+    }
     count("perpendicular_constraints", result.constraintsByKind[std::size_t(ScaffoldConstraintKind::Perpendicular)], "constraints");
     count("parallel_constraints", result.constraintsByKind[std::size_t(ScaffoldConstraintKind::Parallel)], "constraints");
     count("enclosure_constraints", result.constraintsByKind[std::size_t(ScaffoldConstraintKind::Enclosure)], "constraints");
@@ -326,6 +346,38 @@ ScaffoldRunRows scaffoldSolveRunRows(const ScaffoldGraph& graph, const ScaffoldS
             break;
         }
     }
+    if (stages.flips) {
+        for (std::size_t at = 0; at < stages.flips->size(); ++at) {
+            const auto& flip = (*stages.flips)[at];
+            const auto& constraint = result.constraints.at(std::size_t(flip.constraint));
+            const auto rank = std::int64_t(result.residuals.size() + at);
+            residuals.push_back(objects::fiberGraphSolveRow(FiberGraphTable::Residuals,
+                {{"run_uuid", uuidValue(record.runUuid)},
+                 {"residual_index", rank},
+                 {"kind", kScaffoldNormalFlipRowKind},
+                 {"fiber_a", uuidValue(graph.fibers[std::size_t(flip.fiber)].uuid)},
+                 {"fiber_b", uuidValue(graph.fibers[std::size_t(flip.other)].uuid)},
+                 {"target", constraint.target},
+                 {"weight", double(flip.agreeing)},
+                 {"residual", double(flip.disagreeing)},
+                 {"edge_uuid", constraint.link >= 0 ? uuidValue(graph.links[std::size_t(constraint.link)].uuid) : nullValue()},
+                 {"arc_a", flip.arc},
+                 {"arc_b", flip.otherArc},
+                 {"cycle_hops", nullValue()},
+                 {"cycle_piece_length", nullValue()},
+                 {"redundancy", nullValue()}}).values);
+            pieces.push_back(objects::fiberGraphSolveRow(FiberGraphTable::ResidualPieces,
+                {{"run_uuid", uuidValue(record.runUuid)},
+                 {"residual_index", rank},
+                 {"member_index", std::int64_t{0}},
+                 {"fiber_uuid", uuidValue(graph.fibers[std::size_t(flip.piece.fiber)].uuid)},
+                 {"arc_from", std::min(flip.piece.arcFrom, flip.piece.arcTo)},
+                 {"arc_to", std::max(flip.piece.arcFrom, flip.piece.arcTo)},
+                 {"control_from", flip.piece.controlFrom >= 0 ? ExtensionValue{flip.piece.controlFrom} : nullValue()},
+                 {"control_to", flip.piece.controlTo >= 0 ? ExtensionValue{flip.piece.controlTo} : nullValue()},
+                 {"score", nullValue()}}).values);
+        }
+    }
     add(FiberGraphTable::Residuals, std::move(residuals));
     add(FiberGraphTable::ResidualPieces, std::move(pieces));
     return out;
@@ -380,13 +432,33 @@ std::vector<ScaffoldStoredRun> readScaffoldRuns(const objects::StoreReader& read
         const auto found = entry.counts.find("fibers");
         if (found != entry.counts.end()) entry.fibers = found->second;
         const Columns residuals(FiberGraphTable::Residuals);
-        scanRun(reader, FiberGraphTable::Residuals, entry.runUuid, [&](const ExtensionRow&) { ++entry.residuals; });
+        scanRun(reader, FiberGraphTable::Residuals, entry.runUuid, [&](const ExtensionRow& row) {
+            if (residuals.integer(row, "kind") != kScaffoldNormalFlipRowKind) ++entry.residuals;
+        });
     }
     return out;
 }
 
+namespace {
+std::vector<ScaffoldStoredResidual> readResidualRows(const objects::StoreReader& reader, const std::string& runUuid,
+                                                     bool flips);
+}
+
 std::vector<ScaffoldStoredResidual> readScaffoldResiduals(const objects::StoreReader& reader,
                                                           const std::string& runUuid)
+{
+    return readResidualRows(reader, runUuid, false);
+}
+
+std::vector<ScaffoldStoredResidual> readScaffoldNormalFlips(const objects::StoreReader& reader,
+                                                            const std::string& runUuid)
+{
+    return readResidualRows(reader, runUuid, true);
+}
+
+namespace {
+std::vector<ScaffoldStoredResidual> readResidualRows(const objects::StoreReader& reader, const std::string& runUuid,
+                                                     bool flips)
 {
     if (runUuid.empty()) throw std::invalid_argument("scaffold run: a run UUID is required");
     const Columns columns(FiberGraphTable::Residuals);
@@ -396,6 +468,7 @@ std::vector<ScaffoldStoredResidual> readScaffoldResiduals(const objects::StoreRe
         ScaffoldStoredResidual entry;
         entry.index = columns.integer(row, "residual_index");
         entry.kind = columns.integer(row, "kind");
+        if ((entry.kind == kScaffoldNormalFlipRowKind) != flips) return;
         entry.target = columns.integer(row, "target");
         entry.fiberA = columns.uuid(row, "fiber_a");
         entry.fiberB = columns.uuid(row, "fiber_b");
@@ -424,6 +497,48 @@ std::vector<ScaffoldStoredResidual> readScaffoldResiduals(const objects::StoreRe
         out[found->second].pieces.push_back(std::move(piece));
     });
     return out;
+}
+} // namespace
+
+std::optional<std::vector<double>> readScaffoldFiberNormals(const objects::StoreReader& reader,
+                                                            const std::string& fiberUuid, bool fused,
+                                                            std::size_t linePoints)
+{
+    if (fiberUuid.empty()) throw std::invalid_argument("scaffold run: a fiber UUID is required");
+    // Columns as fiberScaffoldNormalsTable declares them; the rows of one
+    // fiber are a primary-key prefix.
+    const auto table = objects::fiberScaffoldNormalsTable();
+    const auto column = [&](const char* name) {
+        for (std::size_t i = 0; i < table.columns.size(); ++i)
+            if (table.columns[i].name == name) return i;
+        throw std::logic_error("scaffold run: the normals table has no such column");
+    };
+    const auto versionAt = column("fiber_version"), inputsAt = column("inputs"), normalsAt = column("normals"),
+               computedAt = column("computed_at");
+    const std::vector<ExtensionValue> prefix{uuidValue(fiberUuid)};
+    std::optional<std::vector<double>> best;
+    std::int64_t bestVersion = -1;
+    std::string bestComputed;
+    try {
+        reader.scanExtensionRows(table.name, [&](const ExtensionRow& row) {
+            const auto& blob = std::get<std::vector<std::uint8_t>>(row.at(normalsAt));
+            if (blob.size() != linePoints * 3 * sizeof(double)) return true;
+            // A fused row states the prediction it read (scaffoldNormalInputs).
+            const auto& inputs = std::get<std::string>(row.at(inputsAt));
+            if ((inputs.find("prediction=") != std::string::npos) != fused) return true;
+            const auto version = std::get<std::int64_t>(row.at(versionAt));
+            const auto& computed = std::get<std::string>(row.at(computedAt));
+            if (best && std::tie(version, computed) <= std::tie(bestVersion, bestComputed)) return true;
+            bestVersion = version;
+            bestComputed = computed;
+            best.emplace(linePoints * 3);
+            std::memcpy(best->data(), blob.data(), blob.size());
+            return true;
+        }, prefix);
+    } catch (const std::invalid_argument&) {
+        // No such table in this store: no measured run ever cached a normal.
+    }
+    return best;
 }
 
 std::map<std::string, ScaffoldStoredWinding> readScaffoldWindings(const objects::StoreReader& reader,
