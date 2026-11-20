@@ -11,6 +11,7 @@
 #include <QVBoxLayout>
 #include <QFontMetricsF>
 #include <iostream>
+#include "vc_object_store/geometry/Geometry.hpp"
 #include <vc_object_store/geometry/ArrayBytes.hpp>
 #include <vc_object_store/objects/StoreReader.hpp>
 #include <vc_object_store/store/GeometryViews.hpp>
@@ -707,7 +708,14 @@ void FiberCollectionController::selectFiber(int64_t id, bool focusView, bool ope
                 const auto fiber=vc::objects::GeometrySnapshot(reader).fiber(uuid,*revision->geometryRevision);
                 selected.pointCount=fiber.linePointCount() ? fiber.linePointCount() : fiber.controlPointCount();
                 if (row.mapping) {
-                    auto points=fiber.linePointCount() ? fiber.linePoints(0,selected.pointCount) : fiber.controlPoints(0,selected.pointCount);
+                    // Annotated length: a manual fiber's extrapolated tails are not fiber.
+                    const auto controls=fiber.controlPoints(0,fiber.controlPointCount());
+                    std::vector<vc::geometry::Point> points;
+                    if (fiber.linePointCount()) {
+                        const auto line=fiber.linePoints(0,fiber.linePointCount());
+                        const auto annotated=vc::geometry::annotatedLine(controls,line);
+                        points.assign(annotated.begin(),annotated.end());
+                    } else points=controls;
                     for(auto& point:points) point=row.mapping->apply(point);
                     selected.volumeLength=vc::geometry::polylineLength(points);
                 }

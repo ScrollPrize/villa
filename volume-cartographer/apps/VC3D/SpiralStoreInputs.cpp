@@ -1,4 +1,5 @@
 #include "SpiralStoreInputs.hpp"
+#include "vc_object_store/geometry/Geometry.hpp"
 #include <vc_object_store/store/GeometryViews.hpp>
 
 #include "vc/core/util/QuadSurface.hpp"
@@ -180,8 +181,13 @@ void readObject(const StoreReader& reader, const StoreInputPin& pin, const std::
         } else if (geometry && pin.kind == "fiber") {
             if (current->record.fiber) fiber.family = current->record.fiber->family;
             const auto view = vc::objects::GeometrySnapshot(reader).fiber(pin.uuid, geometry->uuid);
-            fiber.controls = scaledPoints(view.controlPoints(0, view.controlPointCount()), *scale);
-            fiber.line = scaledPoints(view.linePoints(0, view.linePointCount()), *scale);
+            const auto controls = view.controlPoints(0, view.controlPointCount());
+            const auto line = view.linePoints(0, view.linePointCount());
+            // The fit sees only the annotated line: a manual fiber's
+            // extrapolated tails past its end controls are not fiber.
+            const auto annotated = vc::geometry::annotatedLine(controls, line);
+            fiber.controls = scaledPoints(controls, *scale);
+            fiber.line = scaledPoints({annotated.begin(), annotated.end()}, *scale);
         }
     } catch (const std::exception& error) {
         // Nothing of an unreadable input is shown.

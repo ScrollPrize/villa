@@ -400,20 +400,22 @@ double positionAtArclength(const std::vector<double>& cumulative, double s)
 
 // The exact window of one side: fractional line positions [lo, hi] whose
 // arclength is within +-window of the arclength at `position` (clipped to
-// the line), never empty.
-std::pair<double, double> windowPositions(const std::vector<double>& cumulative,
-                                          double position, double window)
+// the side's annotated domain, never a tail), never empty.
+std::pair<double, double> windowPositions(const std::vector<double>& cumulative, const FiberSide& side)
 {
     const std::size_t n = cumulative.size();
     if (n == 0) {
         return {0.0, 0.0};
     }
-    const double s = arclengthAt(cumulative, position);
-    double lo = positionAtArclength(cumulative, s - window);
-    double hi = positionAtArclength(cumulative, s + window);
     const double maxPosition = static_cast<double>(n - 1);
-    lo = std::clamp(std::min(lo, position), 0.0, maxPosition);
-    hi = std::clamp(std::max(hi, position), 0.0, maxPosition);
+    const double domainLo = std::clamp(side.domainLo, 0.0, maxPosition);
+    const double domainHi = side.domainHi < 0.0 ? maxPosition : std::clamp(side.domainHi, domainLo, maxPosition);
+    const double position = std::clamp(side.position, domainLo, domainHi);
+    const double s = arclengthAt(cumulative, position);
+    double lo = positionAtArclength(cumulative, s - side.windowVx);
+    double hi = positionAtArclength(cumulative, s + side.windowVx);
+    lo = std::clamp(std::min(lo, position), domainLo, domainHi);
+    hi = std::clamp(std::max(hi, position), domainLo, domainHi);
     return {lo, hi};
 }
 
@@ -500,8 +502,8 @@ std::optional<ClosestPass> findClosestPass(const FiberSide& a, const FiberSide& 
         b.cumulative->size() != b.linePoints->size()) {
         return std::nullopt;
     }
-    const auto [loA, hiA] = windowPositions(*a.cumulative, a.position, a.windowVx);
-    const auto [loB, hiB] = windowPositions(*b.cumulative, b.position, b.windowVx);
+    const auto [loA, hiA] = windowPositions(*a.cumulative, a);
+    const auto [loB, hiB] = windowPositions(*b.cumulative, b);
     const std::vector<cv::Vec3d>& la = *a.linePoints;
     const std::vector<cv::Vec3d>& lb = *b.linePoints;
 

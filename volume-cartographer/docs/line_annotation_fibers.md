@@ -448,7 +448,9 @@ The length of a fiber is the arc length of its line between its first and
 last control point, in the annotation frame (voxels). The open tails the
 optimizer extrapolates past the end control points (the extrapolation
 distance, on both sides) are not counted: they are not annotated fiber, and
-they would swamp a short fiber. It is shown in centimetres when the
+they would swamp a short fiber. This is the store-wide rule for every
+consumer, not only the length: see `vc::geometry::annotatedLineRange` in
+vc_object_store's `typed-geometry.md`. It is shown in centimetres when the
 annotation frame's voxel size is known (the volume package's metadata,
 through `annotationFrame().voxelSizeUm`) and in voxels otherwise; the unit
 is never guessed. Centimetres show two decimals everywhere. The shared

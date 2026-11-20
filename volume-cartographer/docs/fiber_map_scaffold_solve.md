@@ -28,6 +28,17 @@ Coordinates are voxels of the annotation frame throughout. The loader maps
 every fiber to the requested target volume (by default the one the fibers
 declare); fibers declaring different volumes are an error.
 
+Only a fiber's annotated line is read. A manual fiber (two or more control
+points) is fiber between its first and last control point; the line points
+the optimizer extrapolates past them (the open tails) are not, and the solve
+never sees them: no normal, prediction sample, crossing, link anchor,
+enclosure or residual lies on a tail, and arc 0 of a fiber is its first
+control. Automatic traces (fewer than two controls) have no tails. The one
+rule is `vc::geometry::annotatedLineRange` (vc_object_store
+`typed-geometry.md`); the dock's control arcs and the cache keys
+(`line annotated` in `inputs`) follow it, so rows and runs solved on whole
+lines no longer match and are solved again.
+
 ## Constraints
 
 Every constraint asserts an integer winding step between two fibers at two
@@ -392,6 +403,27 @@ Three docks (`FiberMapScaffoldSolve.hpp`, with the Qt-free ranking in
   The component filter restricts the table to one component of the run; a
   component was solved on its own, so its violations can only be explained by
   its own annotation.
+
+  The stretch rows are *segments*, not the stored stretches. Cycles that
+  leave a fiber at different crossings accuse nearly the same piece of it, so
+  listing every stored stretch would ask for that piece many times over. Per
+  fiber, the accused stretches are taken in order of cost per voxel and what
+  each adds that no earlier segment and no approved piece covers becomes a
+  new segment, or - within 500 voxels of a segment's original extent, so
+  absorptions never chain - part of that segment. A segment shorter than 100
+  voxels joins the one it touches. Approved geometry is subtracted: only the
+  unapproved part is offered, reaching 50 voxels back into the piece it
+  continues (*extends approved*). Ends move outward to a control point within
+  750 voxels and the boundary two touching segments share moves to one inside
+  both; they never move inward. An end that is on no control point is stated
+  as a control position - `cp 3.42` is 42 % of the way from control point 3
+  to 4 - and the control points an edit needs there are inserted when the
+  piece is edited or saved. A segment's *cost* is the sum of the shares of
+  every constraint accusing it and *cost/kvx* the densest of them, per 1000
+  voxels; *cost per voxel* is the default order. The segments are computed
+  from the run's rows and the current approvals, so approving one shrinks or
+  removes the ones that overlapped it without a new solve. The dock places
+  the run's arcs against control arcs measured in the run's own frame.
 
   Each constraint row carries the two pieces its anchors lie on as child
   rows, with their approval state: those are what has to be approved before

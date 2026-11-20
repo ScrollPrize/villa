@@ -210,6 +210,9 @@ private:
     struct HighlightSpan {
         uint64_t fiber = 0;
         std::int64_t controlFrom = -1, controlTo = -1;
+        // Exact ends as control positions when the stretch does not end on
+        // control points; -1 draws the bracketing range.
+        double positionFrom = -1, positionTo = -1;
     };
     std::vector<HighlightSpan> _highlightSpans;
     // Set while the selection came from the approval dock: the fibers are

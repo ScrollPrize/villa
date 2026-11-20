@@ -1,5 +1,6 @@
 #include "vc/fiber_graph/ScaffoldGraph.hpp"
 
+#include "vc_object_store/geometry/Geometry.hpp"
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
 #include "vc_object_store/objects/VolumeUmbilicus.hpp"
 #include "vc_object_store/store/GeometryViews.hpp"
@@ -184,7 +185,13 @@ ScaffoldGraph loadScaffoldGraph(const objects::StoreReader& reader, const Scaffo
         if (!revisions[i]) throw std::runtime_error("scaffold graph: fiber revision disappeared: " + entry.record.uuid);
         const auto& revision = *revisions[i];
         const auto view = snapshot.viewTransformedAt(revision, graph.volume, graph.scale);
-        const auto lines = view.points("line_points", 0, entry.record.fiber->linePointCount);
+        const auto controls = view.points("control_points", 0, entry.record.fiber->controlPointCount);
+        // Only the annotated line: a manual fiber's extrapolated tails past its
+        // end controls are not fiber, so arc 0 is its first control and no
+        // normal, crossing, anchor or enclosure ever sees a tail.
+        const auto raw = view.points("line_points", 0, entry.record.fiber->linePointCount);
+        const auto annotated = geometry::annotatedLine(controls, raw);
+        const std::vector<geometry::Point> lines(annotated.begin(), annotated.end());
         // Seam transport needs a segment: a fiber of one point carries no
         // winding relation of its own.
         if (lines.size() < 2) { ++graph.report.shortFibers; continue; }
@@ -197,7 +204,7 @@ ScaffoldGraph loadScaffoldGraph(const objects::StoreReader& reader, const Scaffo
         fiber.version = revision.version;
         fiber.pointFirst = graph.offsets.back();
         fiber.pointCount = std::int64_t(lines.size());
-        fiber.content.controlPoints = view.points("control_points", 0, entry.record.fiber->controlPointCount);
+        fiber.content.controlPoints = controls;
         fiber.content.controlIds =
             std::get<objects::FiberView>(view.canonical()).controlPointIds(0, entry.record.fiber->controlPointCount);
         fiber.content.linePoints = lines;

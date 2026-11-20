@@ -29,6 +29,8 @@ std::string scaffoldNormalInputs(const ScaffoldNormalOptions& options, const std
 {
     Statement s;
     s.words("normals", "1");
+    // Rows solved on the whole line (tails included) never match.
+    s.words("line", "annotated");
     s.words("frame", frame);
     s.number("twist", options.strip.twistWeight);
     s.number("lateral", options.strip.lateralWeight);
@@ -51,6 +53,7 @@ std::string scaffoldCrossingInputs(const ScaffoldEventOptions& options)
 {
     Statement s;
     s.words("crossings", "1");
+    s.words("line", "annotated");
     s.number("spacing", options.resampleSpacing);
     s.number("distance", options.maximumDistance);
     s.number("tangent", options.tangentWindow);

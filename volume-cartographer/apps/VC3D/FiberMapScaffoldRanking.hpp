@@ -49,6 +49,10 @@ struct ScaffoldRankedPiece {
 
 // How the approval table is ordered.
 enum class ScaffoldApprovalOrder {
+    // The highest cost per voxel of fiber first: where a look at a short
+    // piece settles the most. A constraint's cost is spread over its cycle's
+    // stretches; a segment states the densest stretch it was built from.
+    Density,
     // The shortest loop first, then the shorter stretch: the most specific
     // suspects, which is where a correction is cheapest to judge.
     Cycle,
@@ -69,6 +73,9 @@ struct ScaffoldApprovalRow {
     // The stretch's length, or the cycle's total stretch length for a
     // constraint (voxels).
     double length = 0;
+    // Cost per voxel: a segment's densest accusation, a constraint's cost
+    // over its cycle's stretch length. 0 when no length says.
+    double density = 0;
 };
 [[nodiscard]] bool scaffoldApprovalRowBefore(const ScaffoldApprovalRow& x, const ScaffoldApprovalRow& y,
                                              ScaffoldApprovalOrder order);
@@ -116,13 +123,85 @@ struct ScaffoldAnchorSpan {
     bool geometryApproved = false, normalsApproved = false;
 };
 
+// The segments of a fiber the dock asks to be looked at.
+//
+// A run stores, per violated constraint, the stretches its cycle runs along;
+// cycles that leave a fiber at different crossings give stretches that
+// overlap almost everywhere. Listing each of them asks for the same piece of
+// fiber to be checked many times, so the dock lists *segments* instead: per
+// fiber, non-overlapping ranges built from the accused stretches, the
+// densest accusation first.
+//
+//   1. Every accused stretch is an interval of arc length carrying its share
+//      of its constraint's cost (cost split over the cycle's stretches in
+//      proportion to 1 / length, as the solve ranks them) and that share's
+//      density (share / length).
+//   2. Stretches are taken densest first. What a stretch covers that no
+//      earlier segment and no approved piece covers is new: it is absorbed
+//      into a neighbouring segment when the grown segment stays within
+//      `absorbVx` of that segment's *original* extent, and is a segment of
+//      its own otherwise. The original extent is what bounds the growth, so
+//      absorptions never chain along the fiber.
+//   3. Approved geometry is never offered again: only the unapproved part of
+//      a stretch becomes a segment, reaching `approvedOverlapVx` back into
+//      the approved piece it continues.
+//   4. A segment end is moved outward to the nearest control point within
+//      `snapVx`, never inward (that would leave accused fiber outside every
+//      segment) and never into a neighbouring segment. The boundary two
+//      touching segments share moves to the nearest control point within
+//      `snapVx` that lies inside both: together they cover the same fiber.
+//      An end no control point is near stays where it is, and is stated as
+//      a fractional control position.
+//   5. A segment shorter than `minSegmentVx` joins a segment it touches (the
+//      denser of two): a few voxels of fiber are not a piece to judge.
+struct ScaffoldSegmentOptions {
+    double minSegmentVx = 100.0;
+    double absorbVx = 500.0;
+    double snapVx = 750.0;
+    double approvedOverlapVx = 50.0;
+};
+
+struct ScaffoldSegment {
+    std::string fiberUuid;
+    double arcFrom = 0, arcTo = 0;
+    // The ends as control positions: 3.0 is control point 3, 3.42 is 42 % of
+    // the way from it to control point 4. -1 when the fiber's controls are
+    // unknown.
+    double controlFrom = -1, controlTo = -1;
+    // The summed shares of every constraint accusing the segment, and the
+    // highest density among the stretches it was built from.
+    double cost = 0, density = 0;
+    std::int64_t cycleHops = -1;
+    std::int64_t constraints = 0;
+    std::vector<std::int64_t> cycles;
+    // The segment continues a piece whose geometry is already approved.
+    bool extendsApproved = false;
+    double length() const { return arcTo - arcFrom; }
+};
+
+// Where an arc lies among a fiber's control points, as a control position
+// (see ScaffoldSegment); -1 without at least two control arcs. Arcs before
+// the first or past the last control clamp to them.
+[[nodiscard]] double scaffoldControlPosition(const std::vector<double>& controlArcs, double arc);
+
+// The segments of every fiber the residuals accuse, densest first. `fibers`
+// states each fiber's control arcs and approved spans; a fiber it does not
+// name has no snapping, no approved parts and no control positions.
+[[nodiscard]] std::vector<ScaffoldSegment> scaffoldApprovalSegments(
+    const std::vector<vc::fiber_graph::ScaffoldStoredResidual>& residuals,
+    const std::map<std::string, ScaffoldApprovalSpans>& fibers, const ScaffoldSegmentOptions& options = {});
+
 // What a selected row asks the map to show: the fibers to select, and the
 // control ranges to draw on them - a stretch, or the two pieces a
 // constraint's anchors lie on.
 struct ScaffoldHighlight {
     struct Span {
         std::string fiberUuid;
+        // The control points bracketing the range, and - for a segment whose
+        // ends are not on control points - the exact control positions to
+        // draw between (-1: draw the bracketing range).
         std::int64_t controlFrom = -1, controlTo = -1;
+        double positionFrom = -1, positionTo = -1;
     };
     std::vector<std::string> fiberUuids;
     std::vector<Span> spans;

@@ -658,6 +658,26 @@ private slots:
         QVERIFY(std::abs(pass->distance - 200.0) < 1e-6);
     }
 
+    // A manual fiber's extrapolated tail is not fiber: with the annotated
+    // domain ending at position 1 (x = 500), B touching the tail at x = 900
+    // is never the pass; the closest annotated point is the end control.
+    void closestPassNeverReachesATail()
+    {
+        const std::vector<cv::Vec3d> a{{0.0, 0.0, 0.0}, {500.0, 0.0, 0.0}, {1000.0, 0.0, 0.0}};
+        const std::vector<cv::Vec3d> b{{900.0, -10.0, 0.0}, {900.0, 10.0, 0.0}};
+        const std::vector<double> ca = autolink::cumulativeArclengths(a);
+        const std::vector<double> cb = autolink::cumulativeArclengths(b);
+        autolink::FiberSide sideA{&a, &ca, 0.9, 1000.0};
+        sideA.domainLo = 0.0;
+        sideA.domainHi = 1.0;
+        autolink::FiberSide sideB{&b, &cb, 0.5, 100.0};
+        const auto pass = autolink::findClosestPass(sideA, sideB);
+        QVERIFY(pass.has_value());
+        QVERIFY(pass->windowHiA <= 1.0);
+        QVERIFY(std::abs(pass->pointA[0] - 500.0) < 1e-6);
+        QVERIFY(std::abs(pass->distance - 400.0) < 1e-6);
+    }
+
     // A pass inside a linked control's spacing band moves to the band's
     // boundary, a fractional position between two line vertices.
     void controlChoiceFindsPositionsBetweenVertices()

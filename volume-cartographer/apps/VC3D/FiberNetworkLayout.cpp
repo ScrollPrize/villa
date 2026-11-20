@@ -314,6 +314,18 @@ PreparedFiber prepareFiber(const InputFiber& fiber, const UmbilicusInterp& umbil
         }
         entry.controlLineIndex[i] = bestIndex;
     }
+    // The unwrap's branch is anchored on the first control, not on the first
+    // line point: a manual fiber's extrapolated tail before it is not fiber
+    // and must not choose its turn. (A whole-turn shift only; the unwrap is
+    // continuous, so this is exact.)
+    if (!entry.controlLineIndex.empty() && !entry.thetaLine.empty()) {
+        const std::size_t first = *std::min_element(entry.controlLineIndex.begin(), entry.controlLineIndex.end());
+        const cv::Vec3d& point = fiber.linePoints[first];
+        const double raw = std::atan2(point[1] - interpolate(point[2], umbilicus.z, umbilicus.y),
+                                      point[0] - interpolate(point[2], umbilicus.z, umbilicus.x));
+        const double shift = entry.thetaLine[first] - raw;
+        for (double& theta : entry.thetaLine) theta -= shift;
+    }
     return entry;
 }
 
@@ -618,8 +630,28 @@ FiberGeometry buildFiberGeometry(const PreparedFiber& entry, double thetaScale,
     geo.thetaScale = thetaScale;
     geo.offsetRad = offsetRad;
     const std::vector<double> rawArclength = arclengths(unrolled);
-    smoothPolyline(unrolled, rawArclength, sigmaVx, resampleStepVx, geo.sampleArclength,
-                   geo.samples);
+    // Smoothed over the annotated line only (first to last control, the
+    // controls' nearest line points): a manual fiber's extrapolated tails are
+    // not fiber and must not pull the curve near its end controls. The
+    // parameter stays the raw arclength from the first line point.
+    {
+        std::size_t first = 0, last = unrolled.size() ? unrolled.size() - 1 : 0;
+        if (entry.controlLineIndex.size() >= 2) {
+            const auto [lo, hi] = std::minmax_element(entry.controlLineIndex.begin(), entry.controlLineIndex.end());
+            first = *lo;
+            last = *hi;
+        }
+        const std::size_t end = std::min(unrolled.size(), last + 1);
+        first = std::min(first, end);
+        const std::vector<QPointF> annotated(unrolled.begin() + std::ptrdiff_t(first),
+                                             unrolled.begin() + std::ptrdiff_t(end));
+        std::vector<double> annotatedArclength(annotated.size());
+        for (std::size_t i = 0; i < annotated.size(); ++i)
+            annotatedArclength[i] = rawArclength[first + i] - rawArclength[first];
+        smoothPolyline(annotated, annotatedArclength, sigmaVx, resampleStepVx, geo.sampleArclength, geo.samples);
+        if (!annotated.empty())
+            for (double& arc : geo.sampleArclength) arc += rawArclength[first];
+    }
     std::vector<double> sampleX(geo.samples.size());
     std::vector<double> sampleY(geo.samples.size());
     for (std::size_t i = 0; i < geo.samples.size(); ++i) {

@@ -6,6 +6,8 @@
 
 #include <opencv2/core.hpp>
 
+#include <vc_object_store/geometry/Geometry.hpp>
+
 namespace vc3d::fiber_line {
 namespace {
 
@@ -59,28 +61,26 @@ double polylineLengthRange(const std::vector<cv::Vec3d>& linePoints,
     return length;
 }
 
+LineIndexRange annotatedLineRange(const std::vector<cv::Vec3d>& linePoints,
+                                  const std::vector<cv::Vec3d>& controlPoints)
+{
+    const auto points = [](const std::vector<cv::Vec3d>& in) {
+        std::vector<vc::geometry::Point> out(in.size());
+        for (size_t i = 0; i < in.size(); ++i) out[i] = {in[i][0], in[i][1], in[i][2]};
+        return out;
+    };
+    const auto range = vc::geometry::annotatedLineRange(points(controlPoints), points(linePoints));
+    return {range.begin, range.end};
+}
+
 double annotatedLineLengthVx(const std::vector<cv::Vec3d>& linePoints,
                              const std::vector<cv::Vec3d>& controlPoints)
 {
-    if (linePoints.size() < 2) {
+    const auto range = annotatedLineRange(linePoints, controlPoints);
+    if (range.end < range.begin + 2) {
         return 0.0;
     }
-    size_t first = linePoints.size();
-    size_t last = 0;
-    size_t finiteControls = 0;
-    for (const cv::Vec3d& control : controlPoints) {
-        if (!isFinitePoint(control)) {
-            continue;
-        }
-        ++finiteControls;
-        const size_t index = nearestLinePointIndex(linePoints, control);
-        first = std::min(first, index);
-        last = std::max(last, index);
-    }
-    if (finiteControls < 2) {
-        return polylineLengthRange(linePoints, 0, linePoints.size() - 1);
-    }
-    return polylineLengthRange(linePoints, first, last);
+    return polylineLengthRange(linePoints, range.begin, range.end - 1);
 }
 
 namespace {

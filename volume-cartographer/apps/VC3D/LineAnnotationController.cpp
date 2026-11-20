@@ -3256,10 +3256,17 @@ std::optional<QString> LineAnnotationController::planAutoLinkChoices(
         side.orderedIndex = *ordered;
         side.cumulative = vc3d::fiber_line::cumulativePolylineArclengths(linePoints);
     }
-    al::FiberSide sideA{sides[0].source.linePoints, &sides[0].cumulative,
-                        sides[0].anchorPosition, sides[0].windowVx};
-    al::FiberSide sideB{sides[1].source.linePoints, &sides[1].cumulative,
-                        sides[1].anchorPosition, sides[1].windowVx};
+    // Only the annotated lines: a manual fiber's extrapolated tails are not
+    // fiber, so neither the pass nor a new control may lie on one.
+    const auto sideOf = [](const AutoLinkChoiceSide& side) {
+        const auto range = vc3d::fiber_line::annotatedLineRange(*side.source.linePoints, side.source.facts.controls);
+        al::FiberSide out{side.source.linePoints, &side.cumulative, side.anchorPosition, side.windowVx};
+        out.domainLo = double(range.begin);
+        out.domainHi = double(range.end - 1);
+        return out;
+    };
+    const al::FiberSide sideA = sideOf(sides[0]);
+    const al::FiberSide sideB = sideOf(sides[1]);
     const auto pass = al::findClosestPass(sideA, sideB);
     if (!pass) {
         return tr("Could not find where the fibers pass each other.");

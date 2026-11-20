@@ -17,10 +17,17 @@ size_t nearestLinePointIndex(const std::vector<cv::Vec3d>& linePoints,
 double polylineLengthRange(const std::vector<cv::Vec3d>& linePoints,
                            size_t firstIndex,
                            size_t lastIndex);
-// The length of a fiber as annotated: its line between the outermost control
-// points (each taken to its nearest line point), in voxels. The open tails
-// the optimizer extrapolates past the first and last control point are not
-// part of it. With fewer than two finite control points the whole line.
+// The annotated line of a fiber as line indices [begin, end): a manual
+// fiber's first to last control. The open tails the optimizer extrapolates
+// past them are not fiber and every consumer ignores them; with fewer than
+// two control points (automatic traces) the whole line. The one rule is
+// vc::geometry::annotatedLineRange; this only adapts the point type.
+struct LineIndexRange {
+    size_t begin = 0, end = 0;
+};
+LineIndexRange annotatedLineRange(const std::vector<cv::Vec3d>& linePoints,
+                                  const std::vector<cv::Vec3d>& controlPoints);
+// The length of a fiber as annotated (annotatedLineRange), in voxels.
 double annotatedLineLengthVx(const std::vector<cv::Vec3d>& linePoints,
                              const std::vector<cv::Vec3d>& controlPoints);
 std::vector<double> cumulativePolylineArclengths(

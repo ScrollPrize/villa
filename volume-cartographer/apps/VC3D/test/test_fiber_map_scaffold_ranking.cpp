@@ -159,6 +159,151 @@ private slots:
         QVERIFY(scaffoldApprovalRowBefore(row(1.0, 2, 1.0), row(2.0, 4, 1.0), order));
     }
 
+    // Cycles that leave a fiber at different crossings accuse nearly the
+    // same piece of it: the dock offers that piece once.
+    void overlappingStretchesBecomeOneSegment()
+    {
+        // The densest stretch is taken first; the others reach at most 122
+        // voxels past it and are absorbed.
+        const std::vector<ScaffoldStoredResidual> residuals{
+            residual(0, 4.0, 2, {piece("f", 2426.6, 3682.0, 0.)}),
+            residual(1, 1.0, 2, {piece("f", 2426.6, 3726.0, 0.)}),
+            residual(2, 1.0, 2, {piece("f", 2426.6, 3743.3, 0.)}),
+            residual(3, 1.0, 2, {piece("f", 2426.6, 3804.0, 0.)}),
+        };
+        std::map<std::string, ScaffoldApprovalSpans> fibers;
+        fibers["f"].controlArcs = {0., 1000., 2000., 6000.};
+        fibers["f"].approved[0] = {0, 0, 0};
+        const auto segments = scaffoldApprovalSegments(residuals, fibers);
+        QCOMPARE(segments.size(), std::size_t(1));
+        const auto& segment = segments.front();
+        // The start snaps outward to control point 2 (427 voxels away); the
+        // end has no control point within reach and stays, as a fraction.
+        QCOMPARE(segment.arcFrom, 2000.);
+        QCOMPARE(segment.arcTo, 3804.);
+        QCOMPARE(segment.controlFrom, 2.);
+        QVERIFY(std::abs(segment.controlTo - (2. + 1804. / 4000.)) < 1e-12);
+        QCOMPARE(segment.constraints, std::int64_t(4));
+        QVERIFY(std::abs(segment.cost - 7.0) < 1e-9); // every share, summed
+        QVERIFY(std::abs(segment.density - 4.0 / (3682.0 - 2426.6)) < 1e-12); // the densest stretch's
+        QVERIFY(!segment.extendsApproved);
+        QCOMPARE(segment.cycles.size(), std::size_t(4));
+    }
+
+    // Absorption is bounded by the segment's original extent, so it cannot
+    // chain along the fiber.
+    void absorptionDoesNotChain()
+    {
+        const std::vector<ScaffoldStoredResidual> residuals{
+            residual(0, 9.0, 2, {piece("f", 0., 1000., 0.)}),
+            residual(1, 0.3, 2, {piece("f", 1000., 1400., 0.)}),
+            residual(2, 0.2, 2, {piece("f", 1400., 1800., 0.)}),
+            residual(3, 0.1, 2, {piece("f", 1800., 2200., 0.)}),
+        };
+        auto segments = scaffoldApprovalSegments(residuals, {});
+        std::sort(segments.begin(), segments.end(), [](const auto& x, const auto& y) { return x.arcFrom < y.arcFrom; });
+        QCOMPARE(segments.size(), std::size_t(2));
+        // 1000-1400 lies within 500 voxels of the first segment's original
+        // end; 1400-1800 does not, although the grown segment now reaches it.
+        QCOMPARE(segments[0].arcFrom, 0.);
+        QCOMPARE(segments[0].arcTo, 1400.);
+        // The next one starts over, and absorbs what is within its own reach.
+        QCOMPARE(segments[1].arcFrom, 1400.);
+        QCOMPARE(segments[1].arcTo, 2200.);
+        // Without the fiber's controls nothing is snapped or positioned.
+        QCOMPARE(segments[0].controlFrom, -1.);
+    }
+
+    // Approved geometry is not offered again: only what is new, reaching a
+    // little back into the piece it continues.
+    void approvedGeometryIsSubtracted()
+    {
+        const std::vector<ScaffoldStoredResidual> residuals{residual(0, 2.0, 2, {piece("f", 500., 1600., 0.)})};
+        std::map<std::string, ScaffoldApprovalSpans> fibers;
+        fibers["f"].controlArcs = {0., 1000., 2000., 3000.};
+        fibers["f"].approved[0] = {1, 0, 0};
+        const auto segments = scaffoldApprovalSegments(residuals, fibers);
+        QCOMPARE(segments.size(), std::size_t(1));
+        QCOMPARE(segments[0].arcFrom, 950.);  // 50 voxels back into the approved piece
+        QCOMPARE(segments[0].arcTo, 2000.);   // outward to control point 2
+        QVERIFY(segments[0].extendsApproved);
+        QVERIFY(std::abs(segments[0].controlFrom - 0.95) < 1e-12);
+        QCOMPARE(segments[0].controlTo, 2.);
+        // A stretch that lies wholly on approved geometry asks for nothing.
+        const std::vector<ScaffoldStoredResidual> covered{residual(0, 2.0, 2, {piece("f", 100., 900., 0.)})};
+        QVERIFY(scaffoldApprovalSegments(covered, fibers).empty());
+    }
+
+    // Ends never move inward, and never across a neighbouring segment.
+    void snappingIsOutwardAndStopsAtANeighbour()
+    {
+        const std::vector<ScaffoldStoredResidual> residuals{
+            residual(0, 9.0, 2, {piece("f", 1100., 1200., 0.)}),
+            residual(1, 1.0, 2, {piece("f", 3000., 3100., 0.)}),
+        };
+        std::map<std::string, ScaffoldApprovalSpans> fibers;
+        fibers["f"].controlArcs = {0., 1000., 1900., 3500., 9000.};
+        fibers["f"].approved[0] = {0, 0, 0, 0};
+        auto segments = scaffoldApprovalSegments(residuals, fibers);
+        std::sort(segments.begin(), segments.end(), [](const auto& x, const auto& y) { return x.arcFrom < y.arcFrom; });
+        QCOMPARE(segments.size(), std::size_t(2));
+        QCOMPARE(segments[0].arcFrom, 1000.);
+        QCOMPARE(segments[0].arcTo, 1900.);   // 700 voxels out, within reach
+        // The control point below 3000 is 1900, 1100 voxels away: out of
+        // reach, so the start stays a fraction rather than moving inward.
+        QCOMPARE(segments[1].arcFrom, 3000.);
+        QCOMPARE(segments[1].arcTo, 3500.);
+        QVERIFY(segments[1].controlFrom > 2. && segments[1].controlFrom < 3.);
+    }
+
+    // Where two segments meet is an accident of the accusations: the shared
+    // boundary moves to a control point within reach, and nothing is lost.
+    void aSharedBoundaryMovesToAControlPoint()
+    {
+        const std::vector<ScaffoldStoredResidual> residuals{
+            residual(0, 9.0, 2, {piece("f", 1000., 2100., 0.)}),
+            residual(1, 1.0, 2, {piece("f", 2100., 4000., 0.)}),
+        };
+        std::map<std::string, ScaffoldApprovalSpans> fibers;
+        fibers["f"].controlArcs = {0., 1000., 2000., 4000.};
+        fibers["f"].approved[0] = {0, 0, 0};
+        auto segments = scaffoldApprovalSegments(residuals, fibers);
+        std::sort(segments.begin(), segments.end(), [](const auto& x, const auto& y) { return x.arcFrom < y.arcFrom; });
+        QCOMPARE(segments.size(), std::size_t(2));
+        QCOMPARE(segments[0].arcFrom, 1000.);
+        QCOMPARE(segments[0].arcTo, 2000.);   // the boundary at 2100 moved to control point 2
+        QCOMPARE(segments[1].arcFrom, 2000.);
+        QCOMPARE(segments[1].arcTo, 4000.);
+        QCOMPARE(segments[0].controlTo, 2.);
+    }
+
+    // A very dense accusation a few voxels long is taken first and would be
+    // a row of its own; it joins the segment it touches instead.
+    void aSliverJoinsItsNeighbour()
+    {
+        const std::vector<ScaffoldStoredResidual> residuals{
+            residual(0, 5.0, 2, {piece("f", 3000., 3040., 0.)}),
+            residual(1, 1.0, 2, {piece("f", 1500., 3000., 0.)}),
+        };
+        const auto segments = scaffoldApprovalSegments(residuals, {});
+        QCOMPARE(segments.size(), std::size_t(1));
+        QCOMPARE(segments[0].arcFrom, 1500.);
+        QCOMPARE(segments[0].arcTo, 3040.);
+        QVERIFY(std::abs(segments[0].cost - 6.0) < 1e-9);
+        QVERIFY(std::abs(segments[0].density - 5.0 / 40.0) < 1e-12);
+        QCOMPARE(segments[0].constraints, std::int64_t(2));
+    }
+
+    void densityOrderPrefersTheHighestCostPerVoxel()
+    {
+        ScaffoldApprovalRow dense{1.0, 2, 100.};
+        dense.density = 0.01;
+        ScaffoldApprovalRow heavy{5.0, 2, 5000.};
+        heavy.density = 0.001;
+        QVERIFY(scaffoldApprovalRowBefore(dense, heavy, ScaffoldApprovalOrder::Density));
+        QVERIFY(scaffoldApprovalRowBefore(heavy, dense, ScaffoldApprovalOrder::Cost));
+    }
+
     void aGaugeShiftIsNotADisagreement()
     {
         // The same relative placement, one run gauged two turns higher: no

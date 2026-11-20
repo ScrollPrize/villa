@@ -117,6 +117,11 @@ public:
     [[nodiscard]] bool approvalsLoaded() const { return _approvalsLoaded; }
     void loadApprovals();
     void dropApprovals();
+    // The volume the runs are solved in. A run states its anchors and
+    // stretches as arc lengths in that frame, so the control arcs they are
+    // placed against are measured in it too - not in each fiber's stored
+    // frame, where the same fiber has another length.
+    void setFrame(const std::string& volume);
     // The span of a fiber covering an anchor arc, and whether it is approved.
     // Answers from the loaded piece approvals, so it needs loadApprovals().
     [[nodiscard]] ScaffoldAnchorSpan anchorSpan(const std::string& fiberUuid, double arc) const;
@@ -199,6 +204,7 @@ private:
     std::int64_t _lastAnnotationCommit = 0;
     std::optional<ScaffoldRunView> _selected;
     std::map<std::string, ScaffoldApprovalSpans> _approvals;
+    std::string _frameVolume;
     bool _approvalsLoaded = false;
     bool _runsLoaded = false;
     std::map<vc::objects::FiberConstraintIdentity, vc::objects::FiberConstraintApproval> _constraintApprovals;
@@ -361,6 +367,8 @@ private:
         kOffColumn,
         kStateColumn,
         kCostColumn,
+        // Cost per 1000 voxels of fiber: what the default order ranks by.
+        kDensityColumn,
         kJointColumn,
         // The numbered cycle (scaffoldCycleNumbers) and its constraint count.
         kCycleNumberColumn,
@@ -380,6 +388,9 @@ private:
         std::int64_t residual = -1;
         std::string fiberUuid, otherUuid;
         std::int64_t controlFrom = -1, controlTo = -1;
+        // A segment's exact ends as control positions (3.42: 42 % of the way
+        // from control point 3 to 4); -1 for a row that names whole spans.
+        double positionFrom = -1, positionTo = -1;
         // The stretch's own arc range (voxels); NaN when the row names none,
         // which is a covering piece of a constraint.
         double arcFrom = std::numeric_limits<double>::quiet_NaN();

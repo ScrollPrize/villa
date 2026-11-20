@@ -101,6 +101,12 @@ struct FiberSide {
     const std::vector<double>* cumulative = nullptr;
     double position = 0.0;
     double windowVx = 0.0;
+    // The annotated line as line positions [domainLo, domainHi]: a manual
+    // fiber's first to last control. Its extrapolated tails are not fiber,
+    // so neither the pass nor a new control is ever searched there. A
+    // negative domainHi means the whole line (a fiber without tails).
+    double domainLo = 0.0;
+    double domainHi = -1.0;
 };
 
 [[nodiscard]] std::optional<ClosestPass> findClosestPass(const FiberSide& a, const FiberSide& b);

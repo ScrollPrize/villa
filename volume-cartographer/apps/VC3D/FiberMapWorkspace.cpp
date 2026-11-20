@@ -584,12 +584,23 @@ QPainterPath pathForRuns(const vc3d::fiber_map::PlacedFiber& fiber, RunKind kind
 // approval overlays. Runs carry their samples' arclength in the layout's own
 // parameterisation, which is also what controlArclength is in, so the range
 // is selected by arclength rather than by sample index.
-QPainterPath pathBetweenControls(const vc3d::fiber_map::PlacedFiber& fiber, std::int64_t from, std::int64_t to)
+// `from` and `to` are control positions: 3.0 is control point 3, 3.42 lies
+// 42 % of the way from it to control point 4.
+QPainterPath pathBetweenControlPositions(const vc3d::fiber_map::PlacedFiber& fiber, double from, double to)
 {
     QPainterPath path;
-    if (from < 0 || to <= from || std::size_t(to) >= fiber.controlArclength.size()) return path;
-    const double low = fiber.controlArclength[std::size_t(from)];
-    const double high = fiber.controlArclength[std::size_t(to)];
+    if (from < 0 || !(to > from) || fiber.controlArclength.size() < 2) return path;
+    const auto arclengthAt = [&](double position) {
+        const double last = double(fiber.controlArclength.size() - 1);
+        const double clamped = std::clamp(position, 0., last);
+        const auto index = std::min(std::size_t(clamped), fiber.controlArclength.size() - 2);
+        const double fraction = clamped - double(index);
+        return fiber.controlArclength[index] +
+               fraction * (fiber.controlArclength[index + 1] - fiber.controlArclength[index]);
+    };
+    if (to > double(fiber.controlArclength.size() - 1) + 1e-9) return path;
+    const double low = arclengthAt(from);
+    const double high = arclengthAt(to);
     for (std::size_t runIndex = 0; runIndex < fiber.runs.size(); ++runIndex) {
         const auto& run = fiber.runs[runIndex];
         const std::vector<QPointF> points = vc3d::fiber_map::displayRunPoints(fiber, runIndex);
@@ -609,6 +620,21 @@ QPainterPath pathBetweenControls(const vc3d::fiber_map::PlacedFiber& fiber, std:
         }
     }
     return path;
+}
+
+QPainterPath pathBetweenControls(const vc3d::fiber_map::PlacedFiber& fiber, std::int64_t from, std::int64_t to)
+{
+    if (from < 0 || to <= from) return {};
+    return pathBetweenControlPositions(fiber, double(from), double(to));
+}
+
+// A highlight span's path: its exact control positions when it states them.
+template <class Span>
+QPainterPath pathOfSpan(const vc3d::fiber_map::PlacedFiber& fiber, const Span& span)
+{
+    if (span.positionFrom >= 0 && span.positionTo > span.positionFrom)
+        return pathBetweenControlPositions(fiber, span.positionFrom, span.positionTo);
+    return pathBetweenControls(fiber, span.controlFrom, span.controlTo);
 }
 
 double distanceToSegment(const QPointF& point, const QPointF& a, const QPointF& b)
@@ -4246,6 +4272,7 @@ void FiberMapWorkspace::updateSolveFrame()
         }
     }
     _solverPanel->setFrame(volume, handedness);
+    _solveController->setFrame(volume);
     // Without a layout there is no selection to restrict a run to.
     _solverPanel->setScopeAvailable(_layoutBuilt && !_layout.fibers.empty());
     // The runs live in the fiber store, so the list follows it: attaching a
@@ -4320,7 +4347,7 @@ void FiberMapWorkspace::rebuildHighlightOverlay()
         if (span.fiber == 0 || span.controlFrom < 0) continue;
         const auto entry = _entries.find(span.fiber);
         if (entry == _entries.end()) continue;
-        selected.addPath(pathBetweenControls(entry->fiber, span.controlFrom, span.controlTo));
+        selected.addPath(pathOfSpan(entry->fiber, span));
     }
     if (selected.isEmpty()) return;
     // Solid and on top: the stretch has to read against the fiber it is part
@@ -4414,7 +4441,8 @@ void FiberMapWorkspace::showScaffoldHighlight(const vc3d::fiber_map::ScaffoldHig
         const auto found = _fiberIdByUuid.find(span.fiberUuid);
         if (found == _fiberIdByUuid.end() || _entries.find(found->second) == _entries.end()) continue;
         if (span.controlFrom < 0 || span.controlTo <= span.controlFrom) continue;
-        _highlightSpans.push_back({found->second, span.controlFrom, span.controlTo});
+        _highlightSpans.push_back(
+            {found->second, span.controlFrom, span.controlTo, span.positionFrom, span.positionTo});
     }
     if (spanSelection && _highlightSpans.empty())
         setOperationStatus(tr("That stretch has no control range on this map; nothing to draw"));
@@ -4427,7 +4455,7 @@ void FiberMapWorkspace::showScaffoldHighlight(const vc3d::fiber_map::ScaffoldHig
     for (const auto& span : _highlightSpans) {
         const auto entry = _entries.find(span.fiber);
         if (entry == _entries.end()) continue;
-        const auto bounds = pathBetweenControls(entry->fiber, span.controlFrom, span.controlTo).boundingRect();
+        const auto bounds = pathOfSpan(entry->fiber, span).boundingRect();
         extent = extent.isNull() ? bounds : extent.united(bounds);
     }
     if (extent.isNull())
@@ -4456,7 +4484,7 @@ void FiberMapWorkspace::showScaffoldHover(const vc3d::fiber_map::ScaffoldHighlig
         if (found == _fiberIdByUuid.end()) continue;
         const auto entry = _entries.find(found->second);
         if (entry == _entries.end()) continue;
-        hovered.addPath(pathBetweenControls(entry->fiber, span.controlFrom, span.controlTo));
+        hovered.addPath(pathOfSpan(entry->fiber, span));
     }
     if (hovered.isEmpty())
         for (const auto& uuid : highlight.fiberUuids) {
