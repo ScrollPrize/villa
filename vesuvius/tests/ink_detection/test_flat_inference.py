@@ -22,6 +22,7 @@ from vesuvius.ink_detection.inference.infer import (
     compute_chunk_contribution_counts,
     compute_equal_length_mirror_axes,
     compute_importance_map_2d,
+    compute_nonempty_mask_from_lowres_array,
     flat_preprocessing_from_config,
     infer_folder,
     iter_blocks,
@@ -71,6 +72,23 @@ def test_pyramid_substitution_and_mask_alignment_warn_factually(tmp_path, caplog
     assert mask.shape == (3, 2)
     assert "Requested input level 0 was not found; using level 1" in caplog.text
     assert "Mask shape (2, 3) did not match Zarr shape (3, 2)" in caplog.text
+
+
+def test_occupancy_scan_keeps_the_depth_axis_of_a_narrow_render():
+    # Level 3 of a 65-layer, 48-row render: pyramids shrink only rows and
+    # columns, so the 6 rows are now the smallest axis.
+    level = np.zeros((65, 6, 80), dtype=np.uint8)
+    level[30:35, 2:4, 10:70] = 1
+
+    occupancy = compute_nonempty_mask_from_lowres_array(level, depth_axis_first=True)
+    expected = np.zeros((6, 80), dtype=bool)
+    expected[2:4, 10:70] = True
+    np.testing.assert_array_equal(occupancy, expected)
+
+    depth_last = compute_nonempty_mask_from_lowres_array(
+        np.moveaxis(level, 0, -1), depth_axis_first=False
+    )
+    np.testing.assert_array_equal(depth_last, expected)
 
 
 def test_flat_preprocessing_accepts_exact_training_contracts():
