@@ -38,16 +38,19 @@ def main(argv=None):
     strips = sorted(a.run.glob('strips/*/fiber_*'))
     if not strips:
         raise SystemExit(f'{a.run} has no strips')
-    surfaces = []
+    surfaces, errors = [], []
     for strip in strips:  # read everything before writing anything: a malformed strip stops the run
         try:
             surfaces.append(tifxyz.read(strip))
         except Exception as error:
             raise SystemExit(f'{strip} is not a readable tifxyz: {error}')
+        errors.append(images.read(strip/'expected_error.tif') if (strip/'expected_error.tif').is_file() else None)
+        if errors[-1] is not None and errors[-1].shape != tuple(surfaces[-1].shape):
+            raise SystemExit(f'{strip}: expected_error.tif is not on the strip grid')
     a.patches.mkdir(parents=True)
     s = a.stride
     written = short = dropped = 0
-    for strip, surface in zip(strips, surfaces):
+    for strip, surface, error in zip(strips, surfaces, errors):
         xyz, valid = np.asarray(surface.xyz), np.asarray(surface.valid)
         if int(valid.sum()) < a.min_nodes:
             short += 1
@@ -61,9 +64,8 @@ def main(argv=None):
         write_surface(dest, xyz[::s, ::s], keep, s/surface.scale[0], s/surface.scale[1],
                       dict(trace, patch=dict(source_strip=str(strip), stride=s)),
                       voxel_size_um=surface.extra.get('voxel_size_um'))
-        if (strip/'expected_error.tif').is_file():
-            images.write_tiff(dest/'expected_error.tif',
-                              np.ascontiguousarray(images.read(strip/'expected_error.tif')[::s, ::s]))
+        if error is not None:
+            images.write_tiff(dest/'expected_error.tif', np.ascontiguousarray(error[::s, ::s]))
         written += 1
     print(f'{a.patches}: {written} patches as {a.prefix}* (stride {s}); skipped {short} with < {a.min_nodes} nodes, '
           f'{dropped} with < {a.min_strided_nodes} strided nodes')

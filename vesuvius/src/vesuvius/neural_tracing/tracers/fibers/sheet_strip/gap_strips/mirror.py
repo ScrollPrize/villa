@@ -15,8 +15,8 @@ joint column and cuts the chain strips back into one strip per piece.
   PIECES.vcobj  one fiber per piece, '<name>#piece<k>' (what the split strips refer to)
   CHAINS.vcobj  one fiber per chain with its extensions, '<name>#chain<c>' (what infer_all traces)
 
-A chain's ``meta.gap_strips`` records, besides its source: ``pieces`` (per piece its UUID, number and inclusive
-[start, end] point indices in the chain), ``ext`` (the inclusive point index ranges of the extensions) and
+A chain's ``meta.gap_strips`` records, besides its source: ``pieces`` (per piece its UUID, its version in
+PIECES.vcobj (``reference``), number and inclusive [start, end] point indices in the chain), ``ext`` (the inclusive point index ranges of the extensions) and
 ``level_scale``. --join and --ext are in patch voxels; stores hold volume voxels, --level-scale volume voxels per
 patch voxel, which must be the scale infer_all traces at (its --ct-grid-scale).
 """
@@ -27,6 +27,7 @@ import numpy as np
 from vesuvius.neural_tracing.tracers.fibers.sheet_strip.gap_strips.pieces import (
     add_source_arguments, piece_row, pieces_or_exit, read_source, write_derived)
 from vesuvius.neural_tracing.tracers.fibers.sheet_strip.gap_strips.spans import derived_id, fiber_row
+from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fiber_catalog
 
 
 def arclen(points):
@@ -98,7 +99,7 @@ def main(argv=None):
     if not (np.isfinite(scale) and scale > 0 and a.join >= 0 and a.ext >= 0):
         raise SystemExit('--level-scale must be positive; --join and --ext must not be negative')
     volume, fibers = read_source(a)
-    piece_rows, chain_rows, joins = [], [], 0
+    piece_rows, chain_entries, joins = [], [], 0
     for fiber in fibers:
         pieces = pieces_or_exit(fiber, a.spacing)
         if not pieces:
@@ -108,10 +109,16 @@ def main(argv=None):
             points, spans, ranges, _ = extended_chain(chain, a.ext*scale)
             entry = dict(id=derived_id(fiber['id'], f'chain{c}'), name=f"{fiber['name']}#chain{c}",
                          family=fiber['family'], source=fiber['id'])
-            chain_rows.append((fiber_row(entry, 'chain', fiber['reference'], chain=c, pieces=spans, ext=ranges,
-                                         join=a.join, ext_length=a.ext, level_scale=scale), points))
+            chain_entries.append((entry, fiber['reference'], dict(chain=c, pieces=spans, ext=ranges, join=a.join,
+                                                                  ext_length=a.ext, level_scale=scale), points))
             joins += len(chain)-1
     write_derived(a.pieces_out, piece_rows, volume, 'pieces')
+    # A chain names the piece versions just written: split.py cuts only with those.
+    written = {row['id']: row['reference'] for row in fiber_catalog(a.pieces_out)}
+    chain_rows = []
+    for entry, reference, fields, points in chain_entries:
+        fields['pieces'] = [dict(s, reference=written[s['id']]) for s in fields['pieces']]
+        chain_rows.append((fiber_row(entry, 'chain', reference, **fields), points))
     write_derived(a.chains_out, chain_rows, volume, 'chains')
     print(f'{len(fibers)} fibers -> {len(piece_rows)} pieces, {len(chain_rows)} chains ({joins} joins)')
 

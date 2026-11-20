@@ -33,8 +33,9 @@ No strip from either mode has a node on a gap, a damaged span or a tail.
 
 Each module's docstring gives its command line and output format. The source store is only read. A piece or chain
 has a UUID derived from its source fiber's UUID, so a rerun gives the same strip folders. Its `meta.gap_strips`
-names the source fiber and version and, for a chain, where its pieces and mirrored parts lie; `split.py` reads that
-from the chain version a strip was traced on, and refuses a strip traced on another version.
+names the source fiber and version and, for a chain, its piece versions and where they and the mirrored parts lie;
+`split.py` reads that from the chain version a strip was traced on, and refuses a strip traced on another chain
+version or a pieces store other than the one the chain was made with.
 
 ## Inputs
 
@@ -47,7 +48,8 @@ from the chain version a strip was traced on, and refuses a strip traced on anot
 The strip checkpoint defaults to `scrollprize/fiber_strip_small_v1` on Hugging Face (see the `sheet_strip` section of
 `fibers/README.md`). `--join` and `--ext` are in patch voxels. `mirror.py --level-scale` (default 4) is the number of
 volume voxels per patch voxel and must be the scale the tracer runs at (`infer_all --ct-grid-scale`);
-`grow_strips.sh` passes its `LEVEL_SCALE` to both, with `CT_LEVEL` (default 2) as the CT pyramid level read.
+`grow_strips.sh` passes its `LEVEL_SCALE` to both, with `CT_LEVEL` (default 2) as the CT pyramid level read, and
+gives the tracer the matching voxel sizes (`BASE_VOXEL_UM` x `LEVEL_SCALE` per patch voxel).
 
 ## Run
 
@@ -77,7 +79,7 @@ the leading copy and add their strips before the `patches` step:
 PKG=vesuvius.neural_tracing.tracers.fibers.sheet_strip
 python -m $PKG.gap_strips.retry $OUT/chains.vcobj $OUT/retry.vcobj UUID1 UUID2 ...
 python -m $PKG.infer_all --fibers $OUT/retry.vcobj --out $OUT/strips_retry --ct $CT --ct-level 2 --ct-grid-scale 4 \
-    --umbilicus $UMBILICUS
+    --base-voxel-um 2.4 --voxel-size-um 9.6 --umbilicus $UMBILICUS
 python -m $PKG.gap_strips.split $OUT/strips_retry $OUT/retry.vcobj $OUT/pieces.vcobj $OUT/strips_split_retry
 cp -r $OUT/strips_split_retry/strips/* $OUT/strips_split/strips/
 ```

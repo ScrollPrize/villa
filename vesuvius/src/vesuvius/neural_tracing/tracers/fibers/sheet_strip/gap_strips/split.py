@@ -4,7 +4,8 @@
         OUT_RUN [--max-offset 16]
 
 CHAIN_RUN is infer_all's output for CHAINS.vcobj (or for a retry.py store). A strip is used only when its trace.json
-names the chain version now in CHAINS.vcobj, so a strip never meets other geometry than it was traced on. Every strip
+names the chain version now in CHAINS.vcobj and PIECES.vcobj holds the piece versions that chain was made with, so
+a strip never meets other geometry than it was traced on. Every strip
 column along the fiber (trace.json ``fiber_along``; a 'rows' strip is handled transposed and written back as rows) is
 placed on the chain by its centre vertex (the valid vertex nearest the middle row): the nearest point of the chain
 polyline, in patch voxels (the chain's recorded ``level_scale``). A column belongs to a piece only when that point
@@ -14,7 +15,7 @@ become the tifxyz OUT_RUN/strips/BUCKET/fiber_<piece UUID> (written as infer_all
 measured on the piece strip), with ``expected_error.tif`` cropped beside it. Its trace.json is the chain strip's with
 ``fiber``, ``fibers`` and ``source_reference`` naming the piece in PIECES.vcobj, and ``split`` (the chain, the chain
 version traced, the column range, the piece number). OUT_RUN/run.json is CHAIN_RUN's with ``fibers`` = PIECES.vcobj;
-OUT_RUN/index/shard_0.jsonl and OUT_RUN/split_report.json list the piece strips.
+OUT_RUN/index/shard_0.jsonl and OUT_RUN/split_report.json list the piece strips. A run that stops leaves no OUT_RUN.
 
 A strip whose centre vertices lie more than --max-offset patch voxels (median) from its chain stops the run: the
 chain was traced at another scale than its ``level_scale``.
@@ -25,38 +26,21 @@ import shutil
 from pathlib import Path
 
 import numpy as np
-from scipy.spatial import cKDTree
 from vc_reader import images, tifxyz
 
 from vesuvius.neural_tracing.tracers.fibers.sheet_strip.gap_strips.spans import read_derived
 from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fiber_catalog
+from vesuvius.neural_tracing.tracers.shared.geometry import exact_nearest
 from vesuvius.neural_tracing.tracers.sheets.tracing.inference import write_surface
 
 JOINT, EMPTY = -1, -2
-SAMPLE_STEP = 0.25  # patch voxels between the chain samples that find a vertex's nearest segments
-NEIGHBOURS = 3  # segments on either side of the nearest sample's that are projected onto
 
 
 def chain_positions(points, queries):
     """For every query point, its nearest point on the polyline ``points`` as a position in point-index units
     (segment index + fraction along the segment) and its distance from it."""
-    a, b = points[:-1], points[1:]
-    lengths = np.linalg.norm(b-a, axis=1)
-    counts = np.maximum(1, np.ceil(lengths/SAMPLE_STEP)).astype(np.int64)
-    segment = np.repeat(np.arange(len(a)), counts)
-    first = np.cumsum(counts)-counts
-    fraction = (np.arange(len(segment))-first[segment]+.5)/counts[segment]
-    samples = a[segment]+(b-a)[segment]*fraction[:, None]
-    nearest = segment[cKDTree(samples).query(queries)[1]]
-    best_position, best_distance = np.zeros(len(queries)), np.full(len(queries), np.inf)
-    for offset in range(-NEIGHBOURS, NEIGHBOURS+1):
-        s = np.clip(nearest+offset, 0, len(a)-1)
-        d = b[s]-a[s]
-        u = np.clip(((queries-a[s])*d).sum(1)/np.maximum((d*d).sum(1), 1e-30), 0., 1.)
-        distance = np.linalg.norm(queries-(a[s]+d*u[:, None]), axis=1)
-        closer = distance < best_distance
-        best_position[closer], best_distance[closer] = (s+u)[closer], distance[closer]
-    return best_position, best_distance
+    distance, _, segment, fraction = exact_nearest(queries, points)
+    return segment+fraction, distance
 
 
 def column_labels(xyz, valid, points, pieces):
@@ -99,6 +83,14 @@ def main(argv=None):
         raise SystemExit(str(error))
     piece_rows = {row['id']: row for row in fiber_catalog(a.pieces)}
     (out/'index').mkdir(parents=True)
+    try:
+        split_run(a, src, out, strips, chains, piece_rows)
+    except BaseException:
+        shutil.rmtree(out, ignore_errors=True)
+        raise
+
+
+def split_run(a, src, out, strips, chains, piece_rows):
     run = json.loads((src/'run.json').read_text())
     run['fibers'] = str(a.pieces)
     run['split_from'] = dict(run_dir=str(src), fibers=str(a.chains))
@@ -118,14 +110,20 @@ def main(argv=None):
                 raise SystemExit(f'{sd} was not traced on the version of chain {cid} in {a.chains}')
             if trace.get('fiber_along') not in ('columns', 'rows'):
                 raise SystemExit(f"{sd}: fiber_along {trace.get('fiber_along')!r}")
-            missing = [s['id'] for s in derived['pieces'] if s['id'] not in piece_rows]
-            if missing:
-                raise SystemExit(f'{a.pieces} has no piece {missing[0]} of chain {cid}')
+            changed = [s['id'] for s in derived['pieces']
+                       if s['id'] not in piece_rows or piece_rows[s['id']]['reference'] != s['reference']]
+            if changed:
+                raise SystemExit(f'{a.pieces} does not hold piece {changed[0]} as chain {cid} was made with it')
             surface = tifxyz.read(sd)
             transposed = trace['fiber_along'] == 'rows'  # work along columns; transpose back on write
             turn = (lambda array: np.swapaxes(array, 0, 1)) if transposed else (lambda array: array)
             xyz, valid = turn(np.asarray(surface.xyz)), turn(np.asarray(surface.valid))
-            expected = turn(images.read(sd/'expected_error.tif')) if (sd/'expected_error.tif').is_file() else None
+            expected = None
+            if (sd/'expected_error.tif').is_file():
+                expected = images.read(sd/'expected_error.tif')
+                if expected.shape != tuple(surface.shape):
+                    raise SystemExit(f'{sd}: expected_error.tif is not on the strip grid')
+                expected = turn(expected)
             labels, offset = column_labels(xyz, valid, points/derived['level_scale'], derived['pieces'])
             if offset > a.max_offset:
                 raise SystemExit(f"{sd} lies {offset:.1f} patch voxels from chain {cid}: it was not traced at "

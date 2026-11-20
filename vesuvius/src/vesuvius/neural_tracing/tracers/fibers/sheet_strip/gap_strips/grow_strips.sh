@@ -7,6 +7,7 @@
 #   CT         the CT zarr (local path or URL)      OUT        output folder
 # Optional: NAMES (text file of fiber UUIDs or names, one per line; default every fiber), PY=python,
 #   CT_LEVEL=2 and LEVEL_SCALE=4 (the CT pyramid level traced and its volume voxels per patch voxel: set both),
+#   BASE_VOXEL_UM=2.4 (the volume's voxel size),
 #   CHECKPOINT (strip checkpoint file or Hugging Face repo; default infer_all's), JOIN=75, EXT=80 (patch voxels),
 #   BATCH=8, THREADS=2, STRIDE=2, PREFIX=strip-net-.
 # Result: $OUT/patches. See README.md beside this file.
@@ -16,6 +17,7 @@ case $MODE in pieces|mirror) ;; *) echo "MODE must be pieces or mirror" >&2; exi
 case $STEP in fibers|trace|split|patches|all) ;; *) echo "STEP must be fibers, trace, split, patches or all" >&2; exit 2;; esac
 : "${SOURCE:?}" "${CT:?}" "${UMBILICUS:?}" "${OUT:?}"
 PY=${PY:-python}; PKG=vesuvius.neural_tracing.tracers.fibers.sheet_strip; LEVEL_SCALE=${LEVEL_SCALE:-4}
+BASE_VOXEL_UM=${BASE_VOXEL_UM:-2.4}; PATCH_VOXEL_UM=$(awk "BEGIN { print $BASE_VOXEL_UM * $LEVEL_SCALE }")
 mkdir -p "$OUT"
 run() { [ "$STEP" = "$1" ] || [ "$STEP" = all ]; }
 if run fibers; then
@@ -30,7 +32,7 @@ TRACED=$OUT/pieces.vcobj; STRIPS=$OUT/strips_traced
 if [ "$MODE" = mirror ]; then TRACED=$OUT/chains.vcobj; STRIPS=$OUT/strips_split; fi
 if run trace; then
   "$PY" -m $PKG.infer_all --fibers "$TRACED" --out "$OUT/strips_traced" --ct "$CT" --ct-level "${CT_LEVEL:-2}" \
-    --ct-grid-scale "$LEVEL_SCALE" --umbilicus "$UMBILICUS" --batch "${BATCH:-8}" --threads "${THREADS:-2}" \
+    --ct-grid-scale "$LEVEL_SCALE" --base-voxel-um "$BASE_VOXEL_UM" --voxel-size-um "$PATCH_VOXEL_UM" --umbilicus "$UMBILICUS" --batch "${BATCH:-8}" --threads "${THREADS:-2}" \
     ${CHECKPOINT:+--checkpoint "$CHECKPOINT"}
 fi
 if run split && [ "$MODE" = mirror ]; then

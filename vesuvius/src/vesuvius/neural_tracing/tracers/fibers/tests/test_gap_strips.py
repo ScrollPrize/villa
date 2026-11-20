@@ -5,7 +5,7 @@ import struct
 import numpy as np
 import pytest
 from vc_object_store import Fiber, ObjectStore, object_reference
-from vc_reader import tifxyz
+from vc_reader import images, tifxyz
 
 from vesuvius.neural_tracing.tracers.fibers.sheet_strip.gap_strips import fit_patches, mirror, pieces, retry, spans, split
 from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import (
@@ -110,8 +110,8 @@ def test_tagged_store_to_pieces_chains_and_retry(tmp_path):
     derived = chain['gap_strips']
     assert chain['id'] == spans.derived_id(SOURCE, 'chain0') and derived['level_scale'] == 4.
     assert chain_points[[0, -1], 0].tolist() == [-40., 440.]  # 10 patch voxels of 4 volume voxels mirrored out
-    assert [(s['id'], s['start'], s['end']) for s in derived['pieces']] == [
-        (first[0]['id'], 20, 100), (second[0]['id'], 101, 181)]
+    assert [(s['id'], s['reference'], s['start'], s['end']) for s in derived['pieces']] == [
+        (first[0]['id'], first[0]['reference'], 20, 100), (second[0]['id'], second[0]['reference'], 101, 181)]
     assert derived['ext'] == [[0, 19], [182, 201]]
     assert chain_points[[100, 101], 0].tolist() == [160., 240.]  # the gap's line points are cut out
     with pytest.raises(ValueError, match='not a gap_strips chain'):
@@ -175,6 +175,17 @@ def test_columns_beside_a_piece_end_are_dropped():
     assert position.tolist() == [1.5, 3.5] and distance.tolist() == [3., 4.]
 
 
+def test_a_column_on_a_gap_is_dropped_when_a_later_piece_passes_close_by():
+    # the chain leaves along x, turns back and ends 0.05 above the middle of its second segment, the excluded one
+    points = np.array([[x, y, 100.] for x, y in ((-2, 0), (-1, 0), (1, 0), (2, 0), (2, 1), (1, 1), (.125, 1),
+                                                 (.125, .05), (-.125, .05))], float)
+    position, distance = split.chain_positions(points, np.array([[0., 0., 100.]]))
+    assert position.tolist() == [1.5] and distance.tolist() == [0.]
+    labels, _ = split.column_labels(np.array([[[0., 0., 100.]]]), np.ones((1, 1), bool), points,
+                                    [dict(start=0, end=1), dict(start=2, end=8)])
+    assert labels.tolist() == [split.JOINT]
+
+
 def traced_chain_strip(tmp_path, fiber_along):
     """source_store's fiber as stores and a synthetic infer_all run of its chain: a flat strip at z 100 (patch
     voxels) with a column every 2 patch voxels from x -8 to 108 and 5 nodes across."""
@@ -232,6 +243,15 @@ def test_split_refuses_a_strip_of_another_chain_version_or_scale(tmp_path):
         split.main([arguments[0], str(tmp_path/'chains8.vcobj'), str(tmp_path/'pieces8.vcobj'), str(tmp_path/'scale')])
     with pytest.raises(SystemExit, match='not an infer_all run'):
         split.main([str(tmp_path/'missing'), *arguments[1:], str(tmp_path/'none')])
+    # pieces made again are other versions than the chain names
+    (strip/'trace.json').write_text(json.dumps(trace))
+    pieces.main([str(tmp_path/'source.vcobj'), str(tmp_path/'pieces_again.vcobj')])
+    with pytest.raises(SystemExit, match='does not hold piece'):
+        split.main([*arguments[:2], str(tmp_path/'pieces_again.vcobj'), str(tmp_path/'again')])
+    images.write_tiff(strip/'expected_error.tif', np.zeros((1, 1), np.float32))
+    with pytest.raises(SystemExit, match='not on the strip grid'):
+        split.main([*arguments, str(tmp_path/'error')])
+    assert not any((tmp_path/name).exists() for name in ('stale', 'scale', 'none', 'again', 'error'))
 
 
 def write_strip(path, shape=(30, 40)):
@@ -257,6 +277,10 @@ def test_fit_patches_thin_strips(tmp_path):
         fit_patches.main([str(run), str(out)])
     with pytest.raises(SystemExit, match='no strips'):
         fit_patches.main([str(tmp_path/'missing'), str(tmp_path/'other')])
+    images.write_tiff(run/'strips'/'00'/'fiber_1'/'expected_error.tif', np.zeros((1, 1), np.float32))
+    with pytest.raises(SystemExit, match='not on the strip grid'):
+        fit_patches.main([str(run), str(tmp_path/'other')])
+    (run/'strips'/'00'/'fiber_1'/'expected_error.tif').unlink()
     (run/'strips'/'01'/'fiber_2'/'y.tif').unlink()
     with pytest.raises(SystemExit, match='not a readable tifxyz'):
         fit_patches.main([str(run), str(tmp_path/'other')])
