@@ -3,6 +3,7 @@
 #include "ToolExecutable.hpp"
 
 #include <QDateTime>
+#include <QDir>
 #include <QFileInfo>
 #include <QStandardPaths>
 #include <QTimer>
@@ -24,6 +25,26 @@ QString quoteArg(const QString& arg)
     escaped.replace('\\', "\\\\");
     escaped.replace('"', "\\\"");
     return "\"" + escaped + "\"";
+}
+
+// The Linux AppImage bundles glibc and runs VC3D through the bundled loader
+// (scripts/appimage/AppRun). A bundled tool started directly is loaded by the
+// host's loader, which then picks up the bundled libc through the tool's
+// RUNPATH and fails unless the host glibc is the same version. Start it
+// through the bundled loader, as AppRun does.
+void useBundledLoader(QString& program, QStringList& args)
+{
+    const QString appDir = qEnvironmentVariable("APPDIR");
+    if (appDir.isEmpty()) return;
+    const QDir usr(QDir(appDir).filePath(QStringLiteral("usr")));
+    const QString libDir = usr.filePath(QStringLiteral("lib"));
+    const QString loader = QDir(libDir).filePath(QStringLiteral("ld-linux-x86-64.so.2"));
+    const QString binDir = QFileInfo(usr.filePath(QStringLiteral("bin"))).canonicalFilePath();
+    if (binDir.isEmpty() || !QFileInfo(loader).isFile() || QFileInfo(program).canonicalPath() != binDir) return;
+    args.prepend(program);
+    args.prepend(libDir);
+    args.prepend(QStringLiteral("--library-path"));
+    program = loader;
 }
 }
 
@@ -60,6 +81,7 @@ bool ToolProcess::start(const Launch& launch)
     }
     QString program = executable_;
     QStringList args = arguments(launch);
+    useBundledLoader(program, args);
     if (launch.lowPriority) {
 #if defined(Q_OS_UNIX)
         if (const auto nice = QStandardPaths::findExecutable(QStringLiteral("nice")); !nice.isEmpty()) {
@@ -68,7 +90,7 @@ bool ToolProcess::start(const Launch& launch)
             if (const auto ionice = QStandardPaths::findExecutable(QStringLiteral("ionice")); !ionice.isEmpty())
                 wrapped << ionice << QStringLiteral("-c") << QStringLiteral("3");
 #endif
-            args = wrapped + QStringList{executable_} + args;
+            args = wrapped + QStringList{program} + args;
             program = nice;
         }
 #endif
