@@ -1,0 +1,18 @@
+{
+  "bucket": "hf://buckets/scrollprize/datasets",
+  "source_path": "ink/phercparis4/w00_20231016151002/w00_20231016151002_supervision_mask.tif",
+  "source_sha256": "70d5f3d7c849fdc24c04e903791adf047ec95f590246b7472e33f411ebc19a1a",
+  "source_shape_yx": [
+    32249,
+    51380
+  ],
+  "transformation": "Unmodified label values, cropped and losslessly encoded as PNG.",
+  "crop_yx": [
+    3845,
+    3974,
+    19511,
+    19656
+  ],
+  "pixel_sha256": "77ef2ec2097a020c15d3854ef97d20fb8e742b8b5eb6f4332d2490e181ba08e0",
+  "png_sha256": "ef7d6431af7c6f5dee849802e2003f493dde4c95849bdee97c1cc3ea8e0eba4e"
+}
