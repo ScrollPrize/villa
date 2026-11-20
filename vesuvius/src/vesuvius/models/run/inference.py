@@ -578,6 +578,9 @@ class Inferer():
                     'start_channel': self.num_classes,
                     'end_channel': self.num_classes + target_channels
                 }
+                if target_config.get('auxiliary_task', False):
+                    # a regression head: multiclass finalization takes classes from the others
+                    self.target_info[target_name]['auxiliary_task'] = True
                 self.num_classes += target_channels
             if self.verbose:
                 print(f"Detected multi-task model with targets: {list(model_info['targets'].keys())}")

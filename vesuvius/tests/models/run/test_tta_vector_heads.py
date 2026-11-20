@@ -258,3 +258,64 @@ def test_overlapping_patches_keep_a_sign_ambiguous_axis(tmp_path, monkeypatch):
     inner = direction[:, 4:12, 4:12, 4:20]  # away from the volume faces, where the weights vanish
     assert inner[0].min() > 0.99 and np.abs(inner[1:]).max() == 0
 
+
+class ConstantScores(Oracle):
+    """Oracle heads, with class 1 scoring 0.5 and class 0 scoring 0 everywhere."""
+
+    def forward(self, x):
+        out = super().forward(x)
+        s = x[:, :1].float()
+        out["surface"] = torch.cat([torch.zeros_like(s), torch.full_like(s, 0.5)], dim=1)
+        return out
+
+
+def test_predict_multiclass_classes_come_from_segmentation_heads(tmp_path, monkeypatch):
+    """--blend_in_memory --mode multiclass with default TTA: the restored normal components
+    (up to 1.0) are not class scores; class 1 (score 0.5) wins everywhere."""
+    from vesuvius.models.run.finalize_outputs import FinalizeConfig
+
+    targets = {name: TARGETS[name] for name in ("surface", "normals")}
+    out = _predict(tmp_path, monkeypatch, _volume((32, 32, 32)).numpy(), ConstantScores(), targets,
+                   (16, 16, 16), "multiclass",
+                   in_memory_blend={"finalize_config": FinalizeConfig(mode="multiclass")})
+    assert out.shape == (3, 32, 32, 32)  # softmax class 0, class 1, argmax
+    assert np.unique(out[-1]).tolist() == [1]
+
+
+def _seg_and_normals_info(seg_channels):
+    info = _target_info({"surface": {"out_channels": seg_channels}, "normals": {"out_channels": 3}})
+    info["normals"]["auxiliary_task"] = True
+    return info
+
+
+def test_multiclass_finalization_skips_auxiliary_heads():
+    """Three class scores and a normal, no TTA: the class is the best score, not the normal's x."""
+    from vesuvius.models.run.finalize_outputs import (FinalizeConfig, apply_finalization,
+                                                      compute_finalized_shape)
+
+    config = FinalizeConfig(mode="multiclass", is_multi_task=True, target_info=_seg_and_normals_info(3))
+    logits = np.zeros((6, 1, 1, 2), dtype=np.float32)
+    logits[:, 0, 0, 0] = [0.0, 0.5, 0.2, 1.0, 0.0, 0.0]
+    logits[:, 0, 0, 1] = [0.3, 0.0, 0.1, 0.0, 0.0, -1.0]
+    out, is_empty = apply_finalization(logits, 6, config)
+    assert not is_empty
+    assert out.shape == compute_finalized_shape((1, 1, 2), 6, config) == (4, 1, 1, 2)
+    assert out[-1].ravel().tolist() == [1, 0]
+
+
+def test_finalize_logits_multiclass_skips_auxiliary_heads(tmp_path):
+    """The staged path (blend_logits, then finalize_outputs) reads the heads from the logits attrs."""
+    from vesuvius.models.run.finalize_outputs import finalize_logits
+
+    logits = np.zeros((5, 4, 4, 4), dtype=np.float32)
+    logits[1], logits[2] = 0.5, 1.0  # class 1 beats class 0; the normal's x is larger still
+    writer = ZarrWriter.create(str(tmp_path / "logits.zarr"), shape=logits.shape, chunks=(5, 4, 4, 4),
+                               dtype=np.float32)
+    writer[:] = logits
+    writer.attrs["is_multi_task"] = True
+    writer.attrs["target_info"] = _seg_and_normals_info(2)
+    finalize_logits(str(tmp_path / "logits.zarr"), str(tmp_path / "final.zarr"), mode="multiclass",
+                    num_workers=1, verbose=False)
+    out = np.asarray(open_zarr(str(tmp_path / "final.zarr"))[:])
+    assert out.shape == (3, 4, 4, 4)
+    assert np.unique(out[-1]).tolist() == [1]
