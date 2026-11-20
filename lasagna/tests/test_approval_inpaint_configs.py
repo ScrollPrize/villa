@@ -55,5 +55,29 @@ class ApprovalInpaintConfigTest(unittest.TestCase):
 				self.assertEqual(args.get("approval-inpaint-output-mask-dilate"), 3)
 
 
+	def test_only_flowsnap_configs_put_tifxyz_flow_gate_channels_in_args(self) -> None:
+		"""Regression for #2458: the key must not sit in base (load_stages_cfg rejects it)."""
+		config_dir = Path(ROOT) / "configs"
+		for name in ("only_flowsnap.json", "only_flowsnap_speculative.json"):
+			with self.subTest(name=name):
+				cfg = json.loads((config_dir / name).read_text(encoding="utf-8"))
+				self.assertNotIn("tifxyz-flow-gate-channels", cfg.get("base", {}))
+				self.assertTrue(cfg.get("args", {}).get("tifxyz-flow-gate-channels"))
+
+	def test_only_flowsnap_configs_load_through_load_stages_cfg(self) -> None:
+		"""Both configs must clear the base-key check in load_stages_cfg (#2458)."""
+		try:
+			import optimizer
+		except ModuleNotFoundError as exc:
+			self.skipTest(f"optimizer import needs runtime deps: {exc}")
+
+		config_dir = Path(ROOT) / "configs"
+		for name in ("only_flowsnap.json", "only_flowsnap_speculative.json"):
+			with self.subTest(name=name):
+				cfg = json.loads((config_dir / name).read_text(encoding="utf-8"))
+				stages = optimizer.load_stages_cfg(cfg)
+				self.assertGreaterEqual(len(stages), 1)
+				self.assertEqual(stages[0].name, "snap")
+
 if __name__ == "__main__":
 	unittest.main()
