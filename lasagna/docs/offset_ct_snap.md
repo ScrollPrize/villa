@@ -209,6 +209,20 @@ voxels from a development zone (no shared voxel): a weaker independence than IND
 By the rule frozen in advance the full mode is **not validated** on IND2: gain of right vertices over the first default +18.09 points (95 % CI -0.20 to +42.44; needed: lower bound above 0, not held); wrong side added +1.02 points (allowed +0.5, **not held**); wrong side among delivered vertices 11.81 % (allowed 5 %, **not held**); sign inverted: 0 window(s) delivered; accepted windows that are mostly wrong: 0; pocket repair: at most +0.00 point of wrong side added on any window. Against the V6-F march on the same
 windows: +10.18 points right, -15.61 points wrong side.
 
+## A cross-section of the public PHerc0139 example
+
+![CT cross-section along the fitted surface. The orange line is the input fit. The blue line follows delivered vertices on a bright ridge.](pherc0139-w027.png)
+
+This is the centre row of the dense output grid for the real-data test above. The dotted line marks the starting winding. White areas lie outside the CT crop. Of 19,704 vertices inside the test domain, the default mode delivered 19,452. The image shows local placement on paper. Adjacent windings can touch, so identifying the intended winding is a separate test.
+
+The image uses the public PHerc0139 scan at 2.399 µm and the w027 window recorded in the [fixture provenance](../tests/data/offset_ct_snap/pherc0139_lot4_23_w027/provenance.json). The CT-derived image carries the same [CC BY-NC 4.0 license](https://creativecommons.org/licenses/by-nc/4.0/) as the source data.
+
+## Held-out PHerc0139 windows
+
+On 24 windows (IND3), the full experimental mode placed 73.33% of the scored domain on paper nearest the target trace, versus 59.14% for the earlier march. It delivered 93.04% of the domain. Among delivered vertices for which the winding could be scored unambiguously, 87.91% were correct (window-bootstrap 95% interval 80.26–93.91%). Four default-mode acceptances had a majority on the wrong side under the protocol's whole-domain scoring rule. IND3 missed its preregistered acceptance criteria.
+
+In a later draw (IND4), this exact module was a frozen comparison arm. Of 221,003 scored vertices across three windows, the input Offset fit had 75,817 correct. The full mode had 146,396 correct, 44,086 on the wrong side, four dark and 30,517 undelivered. It delivered 86.19% of the domain. The observed ratio of correct counts was 1.931. The draw yielded three windows from two neighboring starting windings on the same scroll. The protocol required at least 16 windows to reach a conclusion.
+
 ## Limits
 
 - One scroll, one resolution. Parameters are in voxels and were set on PHerc0139 at 2.4 µm (a sheet is about 18 voxels
