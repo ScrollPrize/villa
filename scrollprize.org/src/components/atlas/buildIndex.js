@@ -45,6 +45,38 @@ function scanFacts(scan) {
   return { px, energy, loc, name };
 }
 
+// A volume replaced by another one (e.g. PHerc0139 20260102150214, remasked
+// into 20260930100252): the successor's id, else null. The full metadata
+// carries {volume_id, date, reason}, the min projection only {volume_id}.
+function volumeSupersededBy(v) {
+  const sb = v && v.properties && v.properties.superseded_by;
+  return (sb && sb.volume_id) || null;
+}
+
+// Current volumes before superseded ones, then by id, so a scan's first
+// volume (its legacy `volume` field, the default Neuroglancer pick) is current.
+function byCurrentThenId([a, va], [b, vb]) {
+  const sa = volumeSupersededBy(va) ? 1 : 0;
+  const sb = volumeSupersededBy(vb) ? 1 : 0;
+  return sa - sb || a.localeCompare(b);
+}
+
+// Drop data entries that a listed entry supersedes. The atlas marks an old
+// artifact with `properties.superseded_by.path` = its replacement's path on
+// the same entity (both full metadata and the min projection carry it), and
+// the two usually share target_volume AND model_id (e.g. PHerc1667's
+// transform-revision-2 re-renders, 2026-11), so no later tie-break can tell
+// them apart. An entry whose replacement is not listed is kept: the old
+// artifact stays on S3 until its retain_until and is better than nothing.
+function withoutSuperseded(data) {
+  const pathOf = (d) => ((d && d.origins) || [])[0]?.path ?? null;
+  const listed = new Set(data.map(pathOf).filter((p) => p != null));
+  return data.filter((d) => {
+    const replacement = d && d.properties && d.properties.superseded_by;
+    return !(replacement && replacement.path && listed.has(replacement.path));
+  });
+}
+
 // Derive the FACTUAL fields for one sample from its S3 record.
 function deriveFacts(sample) {
   const sampleProps = (sample.sample && sample.sample.properties) || {};
@@ -59,13 +91,14 @@ function deriveFacts(sample) {
     // several reconstructions), each with its id and zarr URL (→ Neuroglancer).
     const scanVolumes = Object.entries(volumes)
       .filter(([, v]) => v.scan_id === sid)
-      .sort(([a], [b]) => a.localeCompare(b))
+      .sort(byCurrentThenId)
       .map(([vid, v]) => {
         const z = (v.data || []).find((d) => /zarr/i.test(d.type));
         const o = z && (z.origins || [])[0];
         const zarr =
           o && o.path ? `${((o.access_roots || [])[0] || {}).url || ""}/${o.path}` : null;
-        return { id: vid, zarr };
+        const supersededBy = volumeSupersededBy(v);
+        return { id: vid, zarr, ...(supersededBy ? { supersededBy } : {}) };
       });
     // `volume` kept for backward compat (first reconstruction's zarr).
     return { ...f, id: sid, volumes: scanVolumes, volume: (scanVolumes[0] || {}).zarr || null };
@@ -80,7 +113,7 @@ function deriveFacts(sample) {
   const licenses = [];
   const seenLic = new Set();
   const ctVolumes = [];
-  for (const [vid, v] of Object.entries(volumes).sort(([a], [b]) => a.localeCompare(b))) {
+  for (const [vid, v] of Object.entries(volumes).sort(byCurrentThenId)) {
     const lic = v.properties && v.properties.license;
     if (lic && lic.url && !seenLic.has(lic.url)) {
       seenLic.add(lic.url);
@@ -90,11 +123,13 @@ function deriveFacts(sample) {
     const co = ct && (ct.origins || [])[0];
     if (co && co.path) {
       const props = v.properties || {};
+      const supersededBy = volumeSupersededBy(v);
       ctVolumes.push({
         id: vid,
         px: props.pixel_size_um ?? null,
         energy: props.energy_keV ?? null,
         zarr: `${((co.access_roots || [])[0] || {}).url || ""}/${co.path}`,
+        ...(supersededBy ? { supersededBy } : {}),
       });
     }
   }
@@ -298,7 +333,7 @@ function extractInkSegments(sample, id, s3ToHttp, renderSizes) {
   const out = [];
   for (const key of Object.keys(segs).sort()) {
     const seg = segs[key];
-    const data = seg.data || [];
+    const data = withoutSuperseded(seg.data || []);
     const sid = seg.suffix || seg.long_id || key;
     // Per-segment surface layers (→ Neuroglancer) and mesh (→ download).
     const oneUrl = (d) => {

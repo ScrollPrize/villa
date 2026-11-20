@@ -62,6 +62,12 @@ export default function ScansPanel({ scans }) {
                     <td>{cont ? null : fmt(sc.loc)}</td>
                     <td>
                       <code>{v.id || "—"}</code>
+                      {v.supersededBy ? (
+                        <>
+                          {" "}
+                          (superseded by <code>{v.supersededBy}</code>)
+                        </>
+                      ) : null}
                     </td>
                     <td className="predlinks">
                       {ng ? (
