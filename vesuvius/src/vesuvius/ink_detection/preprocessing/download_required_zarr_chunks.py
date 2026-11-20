@@ -25,6 +25,7 @@ from vesuvius.ink_detection.data.patch_finding_default import (
     surface_patch_bbox,
 )
 from vesuvius.ink_detection.data.patch_finding_subtiling import build_patch_index
+from vesuvius.ink_detection.data.augmentations import NATIVE_CROP_TRANSLATION_MAX_VOXELS
 from vesuvius.ink_detection.data.segment import discover_segment_labels
 from vesuvius.ink_detection.types import Segment
 from vesuvius.ink_detection.volume_io import normalized_source_path, open_volume, open_volume_root
@@ -205,17 +206,26 @@ def collect_unique_chunk_ids(
     *,
     chunk_shape_zyx: tuple[int, int, int],
     array_shape_zyx: tuple[int, int, int],
+    native_crop_translation_halo_yx: int = 0,
 ) -> tuple[tuple[int, int, int], ...]:
+    """Include every chunk reachable by native Y/X crop translation."""
+    halo = int(native_crop_translation_halo_yx)
+    if halo < 0:
+        raise ValueError("native_crop_translation_halo_yx must be nonnegative")
     chunk_ids = set()
     for patch in patches:
-        world_bbox = patch["world_bbox"]
+        z0, y0, x0, z1, y1, x1 = (int(v) for v in patch["world_bbox"])
+        if z0 >= z1 or y0 >= y1 or x0 >= x1:
+            continue  # Invalid or empty source crop must stay empty after expansion.
+        # Native translation only changes Y and X; preserve Z exactly.
+        world_bbox = (z0, y0 - halo, x0 - halo, z1, y1 + halo, x1 + halo)
         chunk_ids.update(
             _bbox_to_chunk_ids(
-                tuple(int(v) for v in world_bbox),
+                world_bbox,
                 chunk_shape_zyx=chunk_shape_zyx,
                 array_shape_zyx=array_shape_zyx,
             )
-    )
+        )
     return tuple(sorted(chunk_ids))
 
 
@@ -956,6 +966,7 @@ def build_dataset_chunk_plan(
         patches,
         chunk_shape_zyx=tuple(int(v) for v in requested_scale_array.chunks),
         array_shape_zyx=tuple(int(v) for v in requested_scale_array.shape),
+        native_crop_translation_halo_yx=NATIVE_CROP_TRANSLATION_MAX_VOXELS,
     )
     chunk_ids_by_scale = scale_chunk_ids_across_multiscale(
         requested_scale_chunk_ids,

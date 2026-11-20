@@ -16,6 +16,7 @@ from vc_reader.reader import create_group, open_group
 
 from vesuvius.ink_detection.preprocessing import clean_labels
 from vesuvius.ink_detection.preprocessing import composite_from_zarr
+from vesuvius.ink_detection.data.augmentations import maybe_translate_crop_bbox
 from vesuvius.ink_detection.preprocessing import download_required_zarr_chunks
 from vesuvius.ink_detection.preprocessing import merge_predictions
 from vesuvius.ink_detection.preprocessing import validate_segments
@@ -52,6 +53,121 @@ def test_prediction_merge_and_chunk_coverage_are_deterministic() -> None:
         chunk_shape_zyx=(2, 2, 2),
         array_shape_zyx=(4, 6, 6),
     ) == ((0, 0, 0), (0, 0, 1), (0, 0, 2), (0, 1, 0), (0, 1, 1), (0, 1, 2), (0, 2, 0), (0, 2, 1), (0, 2, 2), (1, 0, 0), (1, 0, 1), (1, 0, 2), (1, 1, 0), (1, 1, 1), (1, 1, 2), (1, 2, 0), (1, 2, 1), (1, 2, 2))
+
+
+
+
+class _ForceSignedNativeCropTranslation:
+    def __init__(self, sign: int):
+        assert sign in (-1, 1)
+        self.sign = sign
+        self.calls = 0
+
+    def random(self):
+        self.calls += 1
+        return 0.0 if self.calls <= 2 or self.sign < 0 else 0.9
+
+    def shuffle(self, axes):
+        pass  # Leave native Y/X axis order unchanged.
+
+    def randint(self, low, high):
+        assert low <= 40 < high
+        return 40
+
+
+@pytest.mark.parametrize(
+    "sign,start,required_chunk",
+    [(1, 89, (0, 2, 2)), (-1, 167, (0, 0, 0))],
+)
+def test_downloader_halo_covers_accepted_native_translation(sign, start, required_chunk):
+    bbox = (0, start, start, 4, start + 128, start + 128)
+    y, x = np.meshgrid(np.arange(start, start + 128),
+                       np.arange(start, start + 128), indexing="ij")
+    positions = np.stack((np.full_like(y, 2), y, x), axis=-1)
+    valid = np.ones(y.shape, dtype=bool)
+    shifted = maybe_translate_crop_bbox(
+        bbox, positions, valid, valid,
+        rng=_ForceSignedNativeCropTranslation(sign),
+    )
+    assert shifted == (0, start + 40 * sign, start + 40 * sign,
+                       4, start + 128 + 40 * sign, start + 128 + 40 * sign)
+    retained = np.all(
+        (positions >= np.array(shifted[:3])) &
+        (positions < np.array(shifted[3:])), axis=-1,
+    )
+    assert int(retained.sum()) == 7744
+    assert int(retained.sum()) >= int(np.ceil(valid.size / 3))
+
+    def chunks(box, halo):
+        return set(download_required_zarr_chunks.collect_unique_chunk_ids(
+            [{"world_bbox": box}],
+            chunk_shape_zyx=(4, 128, 128),
+            array_shape_zyx=(16, 512, 512),
+            native_crop_translation_halo_yx=halo,
+        ))
+
+    baseline, patched, needed = chunks(bbox, 0), chunks(bbox, 40), chunks(shifted, 0)
+    assert required_chunk in needed and required_chunk not in baseline
+    assert needed <= patched
+    assert {z for z, _, _ in patched} == {0}
+
+
+def test_downloader_halo_does_not_resurrect_invalid_bbox():
+    assert download_required_zarr_chunks.collect_unique_chunk_ids(
+        [{"world_bbox": (10, 11, 11, 11, 10, 12)}],
+        chunk_shape_zyx=(2, 2, 2),
+        array_shape_zyx=(16, 64, 64),
+        native_crop_translation_halo_yx=40,
+    ) == ()
+
+
+def test_downloader_plan_wires_native_translation_halo(tmp_path: Path, monkeypatch) -> None:
+    downloader = download_required_zarr_chunks
+    dataset_dir = tmp_path / "tiny"
+    dataset_dir.mkdir()
+
+    class FakeArray:
+        shape = (16, 512, 512)
+        chunks = (4, 128, 128)
+
+    class FakeGroup:
+        def array_keys(self):
+            return ["0"]
+
+        def __getitem__(self, scale):
+            assert scale == "0"
+            return FakeArray()
+
+    monkeypatch.setattr(
+        downloader,
+        "open_volume_root",
+        lambda volume_path, auth_json_path=None: FakeGroup(),
+    )
+    monkeypatch.setattr(
+        downloader,
+        "_build_dataset_download_patches",
+        lambda **kwargs: ([{"world_bbox": (0, 89, 89, 4, 217, 217)}], 1),
+    )
+    plan = downloader.build_dataset_chunk_plan(
+        datasets_root=tmp_path,
+        output_root=tmp_path / "output",
+        source_spec=downloader.DatasetSourceSpec(
+            dataset_name="tiny", volume_path="stub://ct", volume_scale=0
+        ),
+        patch_size_zyx=(4, 128, 128),
+        overlap_fraction=0.5,
+        patch_filter="supervision",
+        patch_finding_type="default",
+        patch_min_labeled_coverage=0.0,
+        patch_finding_tile_size=None,
+        patch_finding_stride=None,
+        patch_finding_filter_empty_tile=False,
+        label_version=None,
+    )
+    required = set(plan.chunk_ids_by_scale[0])
+    assert plan.patch_count == 1
+    assert len(required) == 9
+    assert (0, 2, 2) in required
 
 
 def test_validate_segments_accepts_reference_binary_values() -> None:
