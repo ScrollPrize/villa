@@ -1053,7 +1053,22 @@ lease file under its output directory. Uploads accept resume checkpoints only.
 ### Creating the Spiral Python environment
 
 The service host needs the Spiral environment (a CUDA-capable PyTorch plus the
-dependencies in `pyproject.toml`, Python ≥ 3.14). With [uv](https://docs.astral.sh/uv/):
+dependencies in `pyproject.toml`, Python ≥ 3.14).
+
+`uv sync` compiles the local `vc_reader` and `vc_object_store` packages, and
+`uv` does not install system C++ libraries. Install them first. On Ubuntu:
+
+```sh
+sudo apt-get install -y build-essential cmake ninja-build pkg-config git \
+  libboost-dev libconcurrentqueue-dev nlohmann-json3-dev libsqlite3-dev \
+  libssl-dev libcurl4-openssl-dev zlib1g-dev libblosc-dev libblosc2-dev \
+  liblz4-dev libzstd-dev libopencv-dev libtiff-dev libpng-dev libjpeg-dev
+```
+
+`volume-cartographer/scripts/install_build_deps.sh` installs a superset of these
+(plus Qt and the other VC3D dependencies). The standalone `vc_object_ingest`,
+`vc_object_server` and `vc_object_convert` tools build from `vc_object_store`
+with the same packages (see its README). Then, with [uv](https://docs.astral.sh/uv/):
 
 ```sh
 cd spiral-fitting
