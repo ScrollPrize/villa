@@ -1,10 +1,11 @@
 #pragma once
 #include "plan.hpp"
 #include "vc_reader/components.hpp"
+#include "../gpu_device.hpp"
 namespace vcr::geometry {
 using Array=nb::ndarray<nb::c_contig>;
 inline void check(Array a,nb::dlpack::dtype dtype,std::vector<std::size_t> shape,int id){
-    if(a.dtype()!=dtype||a.ndim()!=shape.size()||a.device_type()!=(id<0?1:2)||(id>=0&&a.device_id()!=id))
+    if(a.dtype()!=dtype||a.ndim()!=shape.size()||a.device_type()!=(id<0?1:vcr::GpuDevice::value)||(id>=0&&a.device_id()!=id))
         throw nb::value_error("geometry array dtype, rank or device mismatch");
     for(std::size_t i=0;i<shape.size();++i)if(a.shape(i)!=shape[i])throw nb::value_error("geometry array shape mismatch");
 }
@@ -26,7 +27,7 @@ inline Bank bank(nb::handle obj,bool vertices=false){
     throw nb::value_error("expected geometry curve storage");
 #endif
 }
-inline int array_device(Array a){if(a.device_type()==1)return -1;if(a.device_type()==2)return a.device_id();throw nb::value_error("geometry supports CPU and CUDA arrays");}
+inline int array_device(Array a){if(a.device_type()==1)return -1;if(a.device_type()==vcr::GpuDevice::value)return a.device_id();throw nb::value_error("geometry supports CPU and CUDA arrays");}
 inline void bind(nb::module_& m){
     nb::class_<Curves>(m,"GeometryCurves")
       .def("__init__",[](Curves* self,Array p,Array offsets,Array s){
