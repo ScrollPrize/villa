@@ -1,4 +1,6 @@
-"""Raw-empty patches complete output chunks without contributing blend weight."""
+"""Raw-empty patches and pixels contribute no blend weight."""
+
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -8,10 +10,17 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from vesuvius.ink_detection.inference.infer import (
     ChunkAccumulator,
+    FlatBlockDataset,
+    FlatPatchReader,
     compute_chunk_contribution_counts,
     iter_blocks,
     run_block_inference,
 )
+
+
+def _occupancy(metadata, patch_hw):
+    """Every pixel of a raw-nonempty patch occupied, none of a raw-empty one."""
+    return metadata[:, 4, None, None].bool().expand(-1, *patch_hw)
 
 
 def _accumulator(shape, chunk_shape):
@@ -107,7 +116,10 @@ def test_inference_completes_skipped_tiles_without_adding_weights(
         metadata[:, 1] += roi_bounds[2]
     model = _ZeroLogits()
     run_block_inference(
-        loader=DataLoader(TensorDataset(images, metadata), batch_size=batch_size),
+        loader=DataLoader(
+            TensorDataset(images, metadata, _occupancy(metadata, (2, 2))),
+            batch_size=batch_size,
+        ),
         model=model, accumulator=accumulator,
         weight_map=np.ones((2, 2), dtype=np.float32), mask=None,
         device=torch.device("cpu"), amp_dtype=None, tta_axes=(),
@@ -128,7 +140,10 @@ def test_all_raw_empty_batch_finishes_without_model_forward():
     metadata = torch.tensor([[0, 0, 2, 2, 0], [0, 1, 2, 2, 0]])
     model = _ZeroLogits()
     run_block_inference(
-        loader=DataLoader(TensorDataset(images, metadata), batch_size=2),
+        loader=DataLoader(
+            TensorDataset(images, metadata, _occupancy(metadata, (2, 2))),
+            batch_size=2,
+        ),
         model=model, accumulator=accumulator,
         weight_map=np.ones((2, 2), dtype=np.float32), mask=None,
         device=torch.device("cpu"), amp_dtype=None, tta_axes=(),
@@ -139,3 +154,43 @@ def test_all_raw_empty_batch_finishes_without_model_forward():
     assert not accumulator.seen_counts
     assert not probability.any()
     assert not weight.any()
+
+
+def test_pixels_without_rendered_surface_get_no_weight():
+    # Real CT with the right part zeroed, as outside the edge of a flattened mesh.
+    with np.load(Path(__file__).parent / "fixtures/ink_roi_case.npz") as saved:
+        ct = saved["ct"].copy()
+    ct[:, :, 50:] = 0
+    reader = FlatPatchReader(
+        input_path="fixture", resolution="0", depth_axis_first=True,
+        height=80, width=80, layer_indices=np.arange(17), output_depth=17,
+        preprocessing="tifxyz_robust",
+    )
+    reader._array = ct
+    blocks = iter_blocks((80, 80), 128, 64)
+    probability = np.zeros((80, 80), dtype=np.float32)
+    weight = np.zeros_like(probability)
+    accumulator = ChunkAccumulator(
+        shape=(80, 80), chunk_shape=(80, 80),
+        prob_sum_store=probability, weight_sum_store=weight,
+        contribution_counts=compute_chunk_contribution_counts(
+            blocks, chunk_shape=(80, 80)
+        ),
+    )
+    run_block_inference(
+        loader=DataLoader(
+            FlatBlockDataset(
+                reader=reader, blocks=blocks, patch_size=128,
+                preprocessing="tifxyz_robust",
+            ),
+            batch_size=1,
+        ),
+        model=_ZeroLogits(), accumulator=accumulator,
+        weight_map=np.ones((128, 128), dtype=np.float32), mask=None,
+        device=torch.device("cpu"), amp_dtype=None, tta_axes=(),
+        tta_batch_size=None,
+    )
+    assert not weight[:, 50:].any()
+    assert not probability[:, 50:].any()
+    assert (weight[:, :50] == 1).all()
+    np.testing.assert_array_equal(probability[:, :50], 0.5)
