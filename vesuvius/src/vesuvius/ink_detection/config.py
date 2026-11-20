@@ -1481,6 +1481,7 @@ class TrainingConfig:
     extra_patches: ExtraPatchesConfig
     force_full_supervision: bool
     save_iterations: tuple[int, ...]
+    keep_last_checkpoints: int | None
 
     @classmethod
     def from_mapping(cls, canonical: Mapping[str, Any]) -> "TrainingConfig":
@@ -1567,6 +1568,14 @@ class TrainingConfig:
                 "save_iterations values must be completed-iteration counts in "
                 f"[1, {num_iterations}]"
             )
+        keep_last_value = canonical.get("keep_last_checkpoints")
+        keep_last_checkpoints = None
+        if keep_last_value is not None:
+            if isinstance(keep_last_value, bool) or int(keep_last_value) != keep_last_value:
+                raise TypeError("keep_last_checkpoints must be an integer or null")
+            keep_last_checkpoints = int(keep_last_value)
+            if keep_last_checkpoints < 1:
+                raise ValueError("keep_last_checkpoints must be at least 1")
         return cls(
             ink=ink,
             num_iterations=num_iterations,
@@ -1624,6 +1633,7 @@ class TrainingConfig:
             extra_patches=extra_patches,
             force_full_supervision=force_full_supervision,
             save_iterations=save_iterations,
+            keep_last_checkpoints=keep_last_checkpoints,
         )
 
     @property
