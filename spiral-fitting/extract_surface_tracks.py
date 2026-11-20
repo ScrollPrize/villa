@@ -300,8 +300,26 @@ def extract_vertical(predictions_zarr_array, tracks_db, axis, min_yx, max_yx):
         tracks_db[db_key] = pickle.dumps(tracks)
 
 
+def check_vertical_slab_grid(tracks_dbm_path):
+    """Refuse to resume a DBM with vertical slabs from before they started on the downsample
+    grid: resuming it would add aligned slabs beside its old ones."""
+    if not dbm.whichdb(tracks_dbm_path):
+        return
+    with dbm.open(tracks_dbm_path, 'r') as tracks_db:
+        keys = [key.decode() for key in tracks_db.keys()]
+    for prefix in ('vy', 'vx'):
+        starts = sorted(int(key.split(':')[1]) for key in keys if key.startswith(f'{prefix}:'))
+        if starts and (starts[0] % downsample_factor
+                       or any((w - starts[0]) % yx_stride_v for w in starts)):
+            raise SystemExit(
+                f'{tracks_dbm_path} has {prefix} slabs off the {downsample_factor}-voxel grid, so '
+                'they cannot cross the horizontal tracks. Delete the DBM, extract it again, then '
+                'rebuild its crossings with build_track_crossings.py --force.')
+
+
 def run_cpu(predictions_path, tracks_dbm_path):
     """Extract every slab in turn on the CPU (Kimimaro), writing each key as it completes."""
+    check_vertical_slab_grid(tracks_dbm_path)
     print(f'opening {predictions_path}')
     predictions_zarr_array = open_predictions(predictions_path)
 
@@ -323,6 +341,7 @@ def run_cpu(predictions_path, tracks_dbm_path):
 
 def run_gpu(predictions_path, tracks_dbm_path, gpus=None):
     """Extract the same slabs with Brook on the selected GPUs (``surface_tracks_gpu.py``)."""
+    check_vertical_slab_grid(tracks_dbm_path)
     import surface_tracks_gpu
     return surface_tracks_gpu.run(
         predictions_path, tracks_dbm_path, z_min=z_min, z_max=z_max, geometry=geometry(),

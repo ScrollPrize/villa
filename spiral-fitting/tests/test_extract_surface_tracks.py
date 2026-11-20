@@ -458,9 +458,10 @@ def test_cpu_backend_writes_the_track_format(monkeypatch, tmp_path):
     # h keys by z, then vy keys by y, then vx keys by x, over the yx range occupied in
     # the 20 sampled z slices (every 8th here)
     ys, xs = np.nonzero((volume[8:168:8] > 0).any(axis=0))
+    y0, x0 = ys.min() - ys.min() % 4, xs.min() - xs.min() % 4
     order = ([f'h:{z}' for z in range(8, 168, 8)]
-             + [f'vy:{w}' for w in range(ys.min(), ys.max(), 24)]
-             + [f'vx:{w}' for w in range(xs.min(), xs.max(), 24)])
+             + [f'vy:{w}' for w in range(y0, ys.max(), 24)]
+             + [f'vx:{w}' for w in range(x0, xs.max(), 24)])
     assert sorted(entries) == sorted(order)
     assert _write_order(out) in (None, order)
     n_tracks = 0
@@ -479,6 +480,11 @@ def test_cpu_backend_writes_the_track_format(monkeypatch, tmp_path):
         database['h:16'] = pickle.dumps(['kept'])
     est.run_cpu('synthetic', str(out))
     assert _read_dbm(out) == {**entries, 'h:16': pickle.dumps(['kept'])}
+
+    with dbm.open(str(out), 'w') as database:
+        database[f'vx:{xs.min()}'] = pickle.dumps([])
+    with pytest.raises(SystemExit, match='vx slabs off the 4-voxel grid'):
+        est.run_cpu('synthetic', str(out))
 
 
 # ------------------------------------------------------------------------------------------
