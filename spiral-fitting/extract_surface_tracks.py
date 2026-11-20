@@ -268,12 +268,14 @@ def extract_horizontal(predictions_zarr_array, tracks_db):
         z_chunk_max = min(z_chunk_min + z_chunk_depth_h, z_max, z_limit)
         if z_chunk_max <= z_chunk_min:
             continue
+        key = f'h:{z_chunk_min}'
         if z_chunk_max - z_chunk_min < downsample_factor:
             # The last ribbon, clipped at z_max or the volume end, is thinner than one max-pool
             # cell: downsample_maxpool would crop it to nothing, so it has no tracks.
-            tracks_db[f'h:{z_chunk_min}'] = pickle.dumps([])
+            if key not in tracks_db:
+                tracks_db[key] = pickle.dumps([])
             continue
-        jobs.append((f'h:{z_chunk_min}', slice(z_chunk_min, z_chunk_max), (z_chunk_min, 0, 0)))
+        jobs.append((key, slice(z_chunk_min, z_chunk_max), (z_chunk_min, 0, 0)))
     _run_slabs(predictions_zarr_array, tracks_db, jobs, 'horizontal ribbons')
 
 

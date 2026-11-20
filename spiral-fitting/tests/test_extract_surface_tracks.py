@@ -493,6 +493,9 @@ def test_cpu_slabs_thinner_than_downsample_factor_have_no_tracks(monkeypatch):
     database = {}
     est.extract_horizontal(volume, database)
     assert database == {'h:0': pickle.dumps([]), 'h:16': pickle.dumps([])}
+    database = {'h:16': pickle.dumps(['kept'])}
+    est.extract_horizontal(volume, database)
+    assert database['h:16'] == pickle.dumps(['kept'])
 
     monkeypatch.setattr(est, 'z_min', 16)
     min_yx, max_yx = est.find_yx_range(volume)
