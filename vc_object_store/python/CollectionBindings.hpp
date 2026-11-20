@@ -158,7 +158,7 @@ inline void bindCollectionApi(nb::module_& module) {
     .def("geometry_array_columns",[](PyCollectionReader& self,
         nb::ndarray<const uint8_t,nb::ndim<2>,nb::c_contig,nb::device::cpu> uuids,
         const std::string& name,const std::optional<std::string>& kind,const std::optional<std::string>& volume,
-        const std::optional<nb::dict>& expected,size_t workers,bool profile,bool trustedImmutable){
+        const std::optional<nb::dict>& expected,size_t workers,bool profile,bool trustedImmutable,bool includeTails){
         self.check();
         if(uuids.shape(1)!=16)throw std::invalid_argument("geometry object UUIDs must be a uint8 [N,16] column");
         const auto position=vc::python::storePositionFromPy(expected);
@@ -174,7 +174,7 @@ inline void bindCollectionApi(nb::module_& module) {
                     std::copy_n(uuids.data()+i*16,16,keys[i].data());
             });
             *columns=self.collection->readGeometryArrayColumns(*self.txn,
-                keys,name,kind,volume,position,workers,profile,trustedImmutable);
+                keys,name,kind,volume,position,workers,profile,trustedImmutable,includeTails);
             text=vo::fiberGraphUuidAscii(columns->objectUuids,workers);
         }
         auto* raw=columns.release();
@@ -193,8 +193,9 @@ inline void bindCollectionApi(nb::module_& module) {
         result["timings"]=timings;
         return result;
     },"object_uuid"_a,"array_name"_a,"object_kind"_a=nb::none(),"volume"_a=nb::none(),
-       "expected_position"_a=nb::none(),"workers"_a=32,"profile"_a=false,"trusted_immutable"_a=false,
-       "Owned packed geometry and UUID columns; parallel sealed-store reads share one native routing topology.")
+       "expected_position"_a=nb::none(),"workers"_a=32,"profile"_a=false,"trusted_immutable"_a=false,"include_tails"_a=false,
+       "Owned packed geometry and UUID columns; parallel sealed-store reads share one native routing topology. "
+       "Fiber line_points are the annotated lines (no tails) unless include_tails=True.")
     .def("edges",[](PyCollectionReader& self,const std::string& kind){
         self.check();std::vector<vo::CollectionEdge> edges;
         edges=self.collection->edgesByKind(*self.txn,kind);

@@ -82,7 +82,15 @@ inline void bindTypedGeometry(nb::module_& m)
         .def_rw("line_points", &vg::Fiber::linePoints)
         .def_rw("control_point_ids", &vg::Fiber::controlPointIds)
         .def("validate", &vg::Fiber::validate)
-        .def("length", &vg::Fiber::length)
+        .def("length", &vg::Fiber::length, "Arclength of the annotated line (no tails), else of the control polyline.")
+        .def("annotated_line_range", [](const vg::Fiber& f) {
+            const auto r = vg::annotatedLineRange(f.controlPoints, f.linePoints);
+            return std::make_tuple(r.begin, r.end);
+        }, "[begin, end) of line_points between the first and last control point (whole line with < 2 controls).")
+        .def("annotated_line", [](const vg::Fiber& f) {
+            const auto line = f.annotatedLine();
+            return std::vector<vg::Point>(line.begin(), line.end());
+        }, "line_points without the extrapolated tails.")
         .def_static("from_arrays", [](nb::ndarray<const double, nb::shape<-1, 3>, nb::c_contig, nb::device::cpu> controls,
                                       std::optional<nb::ndarray<const double, nb::shape<-1, 3>, nb::c_contig, nb::device::cpu>> line) {
             vg::Fiber f;

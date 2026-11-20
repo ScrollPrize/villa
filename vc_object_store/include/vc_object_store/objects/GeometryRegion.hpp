@@ -17,8 +17,9 @@ struct RegionSlice {
     std::array<double, 6> localBounds{-1, -1, -1, 1, 1, 1};
 };
 struct RegionOptions {
-    // Object kind to intersect. Polyline kinds: "fiber" (nonempty line_points,
-    // otherwise control_points) and "track" (points). "surface" returns the
+    // Object kind to intersect. Polyline kinds: "fiber" (the annotated range of
+    // nonempty line_points, never its tails; otherwise control_points) and
+    // "track" (points). "surface" returns the
     // polylines where its valid triangles cross the slab's mid-plane, clipped to
     // the u/v bounds; family and minLength do not apply to surfaces.
     std::string kind = "fiber";
@@ -26,7 +27,7 @@ struct RegionOptions {
     std::optional<std::string> selected;
     std::optional<std::string> family; // null = all; otherwise exact annotation
     double minLength = 0; // source annotation, not recomputed arclength
-    int64_t minPoints = 2; // checked against current sampled/fallback geometry
+    int64_t minPoints = 2; // checked against current sampled/fallback geometry (annotated range)
     uint64_t outputByteBudget = 8 * 1024 * 1024;
     uint64_t processingByteBudget = 64 * 1024 * 1024;
     uint64_t candidateWorkBudget = 1000000;

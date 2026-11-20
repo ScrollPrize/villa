@@ -170,8 +170,9 @@ struct ObjectStoreImplAccess {
         return store.geometryReadViewImpl(txn,selection,expected,true);
     }
     static PackedGeometryArray trustedCurrentGeometryArrays(const ObjectStore& store,const Txn& txn,
-        std::span<const ObjectRevision> selected,const std::string& name,const std::optional<std::string>& volume) {
-        return store.readSelectedGeometryArraysImpl(txn,selected,name,volume,true);
+        std::span<const ObjectRevision> selected,const std::string& name,const std::optional<std::string>& volume,
+        bool includeTails) {
+        return store.readSelectedGeometryArraysImpl(txn,selected,name,volume,true,includeTails);
     }
     static ObjectStore createInitial(const std::filesystem::path& path,const OpenOptions& options) {
         return ObjectStore(ObjectStore::openImpl(path,options,true,true));

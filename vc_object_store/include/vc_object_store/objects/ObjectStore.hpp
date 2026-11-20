@@ -32,7 +32,7 @@ struct FiberDetail {
     bool manualFamily = false;
     int64_t controlPointCount = 0;
     int64_t linePointCount = 0;
-    double length = 0.0;       // full polyline arclength in source voxels
+    double length = 0.0;       // annotated line arclength (no tails) in source voxels
     double width = 0.0;
     double widthGapFraction = 0.2;
     std::string optimizationMode;
@@ -730,12 +730,17 @@ public:
 
     // One packed buffer, caller revision order (including duplicates).
     // Dtype and trailing dimensions must match. All chunks remain verified.
+    // Fiber line_points are each fiber's annotated line (no tails, see
+    // vc::geometry::annotatedLineRange); includeTails returns the raw rows.
     PackedGeometryArray readGeometryArrays(const Txn&, const std::vector<std::string>& revisionUuids,
-        const std::string& arrayName) const;
+        const std::string& arrayName, bool includeTails = false) const;
     // Captured selected metadata and payload identities stay paired. Optional
     // mapping currently supports fiber line_points and returns float64 XYZ.
+    // Fiber line_points are each fiber's annotated line (no tails, see
+    // vc::geometry::annotatedLineRange); includeTails returns the raw rows.
     PackedGeometryArray readSelectedGeometryArrays(const Txn&, std::span<const ObjectRevision>,
-        const std::string& arrayName, const std::optional<std::string>& volume = std::nullopt) const;
+        const std::string& arrayName, const std::optional<std::string>& volume = std::nullopt,
+        bool includeTails = false) const;
 
     // Owned pinned payload with an explicit aggregate byte bound. Reads are
     // chunked; callers needing larger objects should use ranges/rectangles.
@@ -947,7 +952,7 @@ private:
     GraphReadView geometryReadViewImpl(const Txn&,const ObjectSelection&,
         const std::optional<StoreStatus>&,bool trustedCurrent) const;
     PackedGeometryArray readSelectedGeometryArraysImpl(const Txn&,std::span<const ObjectRevision>,
-        const std::string&,const std::optional<std::string>&,bool trustedCurrent) const;
+        const std::string&,const std::optional<std::string>&,bool trustedCurrent,bool includeTails) const;
     std::optional<ObjectRevision> objectRevision(const Txn&, const std::string& revisionUuid) const;
     RevisionSelection revisionSelectionAt(const Txn&, int64_t publishedAtUs, bool includeRetired) const;
     // Explicit, closed selection: omitted endpoints are not selected. null

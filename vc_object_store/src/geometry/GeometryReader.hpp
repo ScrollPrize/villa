@@ -8,6 +8,9 @@
 #include <iterator>
 
 namespace vc::objects::detail {
+// Cut each packed fiber line to its annotated rows (vc::geometry::annotatedLineRange)
+// in place; `controls` packs the same objects' control_points.
+void dropLineTails(PackedGeometryArray& line, const PackedGeometryArray& controls);
 
 // Bound to one connection. The read pool may retain it across unchanged read
 // snapshots; writes and internal integrity/publication paths use fresh readers.

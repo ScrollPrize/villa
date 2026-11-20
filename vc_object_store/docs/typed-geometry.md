@@ -30,10 +30,24 @@ Stable point IDs are nonnegative, unique, and need not be sorted.
 | Type | Fields | Notes |
 | --- | --- | --- |
 | `PointCollection` | int64 `ids`, float64 XYZ `points` | `point(id)` looks up by ID, not row; `indexOf(id)` |
-| `Fiber` | float64 XYZ `controlPoints`, `linePoints`; int64 `controlPointIds` | Length uses line points when present, else controls |
+| `Fiber` | float64 XYZ `controlPoints`, `linePoints`; int64 `controlPointIds` | Length uses the annotated line when present, else controls (see *Line tails*) |
 | `Track` | int32 XYZ `points` | Polyline length |
 | `Surface` | `rows`, `columns`, column/row `scale`, float32 XYZ `points`, `validity`, `channels` | Row-major; `scale` is grid steps per source voxel; missing vertices are `(-1,-1,-1)`. `validity` is the `valid` channel (empty, or one byte per vertex); `valid(row, column)` requires coordinates **and** validity. `channels` holds the other aligned channels |
 | `Umbilicus` | float64 XYZ `points` (ordered control polyline, at least one) | A scroll's centre line; native file is `vc_umbilicus` JSON |
+
+**Line tails.** A manual fiber (two or more control points) is annotated only
+between its first and last control point; the line points the optimizer
+extrapolates past them are *tails* and are not fiber. Fewer than two controls
+(automatic traces) means no tails: the whole line counts. Read a fiber's line
+through `annotatedLineRange(controls, line)` (`[begin, end)` rows, from the lowest to the
+highest line vertex nearest any finite control; control order does not matter) or `annotatedLine` / `Fiber::annotatedLine()`
+(Python `Fiber.annotated_line_range()` / `annotated_line()`). Every store API
+ignores tails by default: stored and measured lengths, object bounds and the
+spatial index, geometry regions, and packed `line_points` reads
+(`readGeometryArrays`, `readSelectedGeometryArrays`, `readGeometryArrayColumns`;
+pass `includeTails` / `include_tails=True` for the raw rows). Raw `linePoints`
+are only for editing, displaying the extrapolation and lossless round trips
+(`readGeometryArray`, ranges, typed decode/encode, fiber JSON).
 
 ```cpp
 #include <vc_object_store/geometry/Geometry.hpp>

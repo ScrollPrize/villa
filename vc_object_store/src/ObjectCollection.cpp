@@ -770,7 +770,7 @@ bool ObjectCollection::supportsTrustedGeometryReads(const CollectionTxn& txn)con
 ObjectCollection::GeometryArrayColumns ObjectCollection::readGeometryArrayColumns(const CollectionTxn& txn,
     std::span<const std::array<unsigned char,16>> requested,const std::string& name,
     const std::optional<std::string>& kind,const std::optional<std::string>& volume,
-    const std::optional<StoreStatus>& expected,size_t workers,bool profile,bool trustedImmutable)const
+    const std::optional<StoreStatus>& expected,size_t workers,bool profile,bool trustedImmutable,bool includeTails)const
 {
     using Clock=std::chrono::steady_clock;
     const auto stamp=[&]{return profile?Clock::now():Clock::time_point{};};
@@ -834,8 +834,8 @@ ObjectCollection::GeometryArrayColumns ObjectCollection::readGeometryArrayColumn
         if(profile)selectionTimes[block]=seconds(phase);
         phase=stamp();
         values[block]=trustedImmutable?
-            ObjectStoreImplAccess::trustedCurrentGeometryArrays(store,read,*view.selectedObjects,name,volume):
-            store.readSelectedGeometryArrays(read,*view.selectedObjects,name,volume);
+            ObjectStoreImplAccess::trustedCurrentGeometryArrays(store,read,*view.selectedObjects,name,volume,includeTails):
+            store.readSelectedGeometryArrays(read,*view.selectedObjects,name,volume,includeTails);
         if(profile)payloadTimes[block]=seconds(phase);
     };
     const auto count=std::min(workers,blocks);

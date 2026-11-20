@@ -749,16 +749,16 @@ void bindSessionOperations(nb::class_<vo::ObjectStoreSession> session)
         }, nb::arg("attachment"), nb::arg("query"),
            "Every record the query (wire form, as HostedStore.select_objects; complete without a limit) selects in one read.")
         .def("read_geometry_arrays", [](Session& self, const vo::AttachmentIdentity& attachment,
-                                        const std::vector<std::string>& revisions, const std::string& name) {
+                                        const std::vector<std::string>& revisions, const std::string& name, bool includeTails) {
             std::shared_ptr<vo::PackedGeometryArray> packed;
             {
                 nb::gil_scoped_release release;
                 self.readStore(attachment, [&](const vo::StoreReader& reader, const auto&) {
-                    packed = std::make_shared<vo::PackedGeometryArray>(reader.readGeometryArrays(revisions, name));
+                    packed = std::make_shared<vo::PackedGeometryArray>(reader.readGeometryArrays(revisions, name, includeTails));
                 });
             }
             return PyPackedGeometryArray{std::move(packed)};
-        }, nb::arg("attachment"), nb::arg("revision_uuids"), nb::arg("array_name"),
+        }, nb::arg("attachment"), nb::arg("revision_uuids"), nb::arg("array_name"), nb::arg("include_tails") = false,
            "Read homogeneous arrays into one verified packed buffer with row offsets (as ObjectStore.read_geometry_arrays).")
         .def("location", &Session::location, nb::arg("attachment"), "The store file of a local attachment, or a hosted one's endpoint.")
         .def("geometry_revision", [](Session& self, const vo::AttachmentIdentity& attachment, const std::string& revision) {
@@ -1365,12 +1365,13 @@ NB_MODULE(_native, m)
         .def("read_geometry_array", readMethod<&vo::ObjectStore::readGeometryArray, true>(), nb::arg("revision_uuid"), nb::arg("array_name"),
              nb::arg("byte_offset") = 0, nb::arg("byte_count") = std::nullopt)
         .def("read_geometry_arrays", [](PyObjectStore& self, const std::vector<std::string>& revisions,
-                                       const std::string& name) {
+                                       const std::string& name, bool includeTails) {
             return PyPackedGeometryArray{self.withRead<true>([&](auto& db, auto& txn) {
-                return std::make_shared<vo::PackedGeometryArray>(db.readGeometryArrays(txn, revisions, name));
+                return std::make_shared<vo::PackedGeometryArray>(db.readGeometryArrays(txn, revisions, name, includeTails));
             })};
-        }, nb::arg("revision_uuids"), nb::arg("array_name"),
-           "Read homogeneous arrays into one verified packed buffer with row offsets.")
+        }, nb::arg("revision_uuids"), nb::arg("array_name"), nb::arg("include_tails") = false,
+           "Read homogeneous arrays into one verified packed buffer with row offsets; "
+           "fiber line_points are the annotated lines (no tails) unless include_tails=True.")
         .def("read_geometry_rectangle", readMethod<&vo::ObjectStore::readGeometryRectangle, true>(), nb::arg("revision_uuid"), nb::arg("array_name"), nb::arg("row"), nb::arg("column"),
              nb::arg("rows"), nb::arg("columns"), "Read a dense row-major surface rectangle, preserving native dtype and component bytes.")
         .def("read_geometry_rectangles", readMethod<&vo::ObjectStore::readGeometryRectangles, true>(), nb::arg("revision_uuid"), nb::arg("array_name"), nb::arg("rectangles"),

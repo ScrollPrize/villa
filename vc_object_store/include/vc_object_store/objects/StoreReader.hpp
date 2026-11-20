@@ -82,9 +82,10 @@ public:
                                                    const std::optional<int64_t>& byteCount = std::nullopt) const = 0;
     // One packed buffer in caller revision order, as
     // ObjectStore::readGeometryArrays. By default each array is read whole
-    // through readGeometryArray (a hosted reader's cached arrays).
+    // through readGeometryArray (a hosted reader's cached arrays). Fiber
+    // line_points are the annotated lines (no tails) unless includeTails.
     virtual PackedGeometryArray readGeometryArrays(const std::vector<std::string>& revisionUuids,
-                                                   const std::string& arrayName) const;
+                                                   const std::string& arrayName, bool includeTails = false) const;
     // Dense row-major rectangle of a surface-aligned array, as
     // ObjectStore::readGeometryRectangle.
     virtual std::vector<uint8_t> readGeometryRectangle(const std::string& revisionUuid, const std::string& arrayName,
@@ -225,7 +226,7 @@ public:
                                            int64_t byteOffset = 0,
                                            const std::optional<int64_t>& byteCount = std::nullopt) const override;
     PackedGeometryArray readGeometryArrays(const std::vector<std::string>& revisionUuids,
-                                           const std::string& arrayName) const override;
+                                           const std::string& arrayName, bool includeTails = false) const override;
     std::vector<uint8_t> readGeometryRectangle(const std::string& revisionUuid, const std::string& arrayName,
                                                int64_t row, int64_t column, int64_t rows,
                                                int64_t columns) const override;

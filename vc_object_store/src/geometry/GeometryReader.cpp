@@ -1,4 +1,5 @@
 #include "geometry/GeometryReader.hpp"
+#include <cstring>
 #include "geometry/GeometryDelta.hpp"
 #include "geometry/SharedGeometry.hpp"
 #include "internal/ReferenceResolver.hpp"
@@ -679,19 +680,48 @@ PackedGeometryArray readPackedGeometryArrays(sqlite3* db,
 }
 
 PackedGeometryArray ObjectStore::readGeometryArrays(const Txn& txn,
-    const std::vector<std::string>& revisions, const std::string& name) const
+    const std::vector<std::string>& revisions, const std::string& name, bool includeTails) const
 {
-    return readPackedGeometryArrays(static_cast<sqlite3*>(connection(txn)),revisions,name);
+    auto* db=static_cast<sqlite3*>(connection(txn));
+    auto packed=readPackedGeometryArrays(db,revisions,name);
+    if(name=="line_points"&&!includeTails)dropLineTails(packed,readPackedGeometryArrays(db,revisions,"control_points"));
+    return packed;
 }
 
 PackedGeometryArray ObjectStore::readSelectedGeometryArrays(const Txn& txn,
-    std::span<const ObjectRevision> selected,const std::string& name,const std::optional<std::string>& volume) const
+    std::span<const ObjectRevision> selected,const std::string& name,const std::optional<std::string>& volume,
+    bool includeTails) const
 {
-    return readSelectedGeometryArraysImpl(txn,selected,name,volume,false);
+    return readSelectedGeometryArraysImpl(txn,selected,name,volume,false,includeTails);
+}
+
+void detail::dropLineTails(PackedGeometryArray& line,const PackedGeometryArray& controls)
+{
+    if(line.dtype!="<f8"||controls.dtype!="<f8"||line.offsets.size()!=controls.offsets.size())
+        throw std::invalid_argument("geometry: fiber line tails need float64 line and control points");
+    const auto points=[](const PackedGeometryArray& packed,size_t item){
+        std::vector<vc::geometry::Point> result(size_t(packed.offsets[item+1]-packed.offsets[item]));
+        for(size_t i=0;i<result.size();++i)
+            copyScalars<double>(std::span<const uint8_t>(packed.data).subspan((packed.offsets[item]+i)*24,24),result[i]);
+        return result;
+    };
+    std::vector<uint64_t> offsets{0};offsets.reserve(line.offsets.size());
+    size_t written=0;
+    for(size_t item=0;item+1<line.offsets.size();++item){
+        size_t begin=line.offsets[item],end=line.offsets[item+1];
+        if(controls.offsets[item+1]-controls.offsets[item]>=2&&end>begin){
+            const auto range=vc::geometry::annotatedLineRange(points(controls,item),points(line,item));
+            end=begin+range.end;begin+=range.begin;
+        }
+        if(written!=begin)std::memmove(line.data.data()+written*24,line.data.data()+begin*24,(end-begin)*24);
+        written+=end-begin;offsets.push_back(written);
+    }
+    line.data.resize(written*24);line.shape[0]=int64_t(written);line.offsets=std::move(offsets);
 }
 
 PackedGeometryArray ObjectStore::readSelectedGeometryArraysImpl(const Txn& txn,
-    std::span<const ObjectRevision> selected,const std::string& name,const std::optional<std::string>& volume,bool trustedCurrent) const
+    std::span<const ObjectRevision> selected,const std::string& name,const std::optional<std::string>& volume,bool trustedCurrent,
+    bool includeTails) const
 {
     std::vector<std::string> revisions;revisions.reserve(selected.size());
     for(const auto& object:selected){
@@ -699,6 +729,8 @@ PackedGeometryArray ObjectStore::readSelectedGeometryArraysImpl(const Txn& txn,
         revisions.push_back(*object.geometryRevision);
     }
     auto packed=readPackedGeometryArrays(static_cast<sqlite3*>(connection(txn)),revisions,name,selected,trustedCurrent);
+    if(name=="line_points"&&!includeTails&&!selected.empty())
+        dropLineTails(packed,readPackedGeometryArrays(static_cast<sqlite3*>(connection(txn)),revisions,"control_points",selected,trustedCurrent));
     if(!volume)return packed;
     if(name!="line_points"||std::any_of(selected.begin(),selected.end(),[](const auto& o){return o.record.kind!="fiber";}))
         throw std::invalid_argument("mapped packed geometry currently supports float64 fiber line_points only");

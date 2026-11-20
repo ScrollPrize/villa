@@ -105,6 +105,8 @@ Copying a project forks its logical and physical store identities, preserves ret
 
 `OpenOptions::spatialIndex = false` omits object-bounds, spatial-region and R-tree/shadow tables for a new store. Geometry, graph queries and ordinary selection remain available. Existing typed ingestion summaries, such as fiber length/bbox and surface area, are not silently removed.
 
+Fiber summaries and spatial rows cover the annotated line only: the stored fiber `length` (fiber JSON import), `object_bounds` and the `line_points` rows of `spatial_regions` exclude the tails past the first and last control ([line tails](typed-geometry.md)). Stores written before this rule keep tail-inclusive rows until the fiber is re-imported (length and bounds) or its geometry is next written (bounds); store conversion copies the existing rows. Live measurements (volume lengths, region `min_length`, fiber-constraint graph lengths) and region clipping apply the rule on read regardless.
+
 Spatial selection, region reads and nearest-surface queries fail explicitly when the index is absent, even if another filter would produce no records. On-demand spatial construction is not implemented yet.
 
 ## Sealed dependencies, sharding and packed containers

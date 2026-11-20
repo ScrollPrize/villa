@@ -2,6 +2,7 @@
 #include "linking/Detectors.hpp"
 #include "linking/LineSurface.hpp"
 #include "linking/StoredGeometry.hpp"
+#include "vc_object_store/geometry/Geometry.hpp"
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -38,33 +39,16 @@ std::optional<detail::LineData> loadFiber(detail::StoredGeometry& inputs,
         if (!(fiber.arclength.back() > 0) || !std::isfinite(fiber.arclength.back()))
             throw std::runtime_error("fiber has zero or non-finite length");
         fiber.lastLine = fiber.line.size() - 1;
-        if (!fiber.controls.empty()) {
-            // Project endpoint controls onto the ordered polyline. Testing
-            // arclength (rather than XYZ bounds) also works for curved fibers.
-            auto projectArc = [&](const cv::Vec3d& control) {
-                double bestDistance = std::numeric_limits<double>::infinity(), bestArc = 0;
-                for (size_t i = 1; i < fiber.line.size(); ++i) {
-                    const auto delta = fiber.line[i] - fiber.line[i-1];
-                    const double length2 = delta.dot(delta);
-                    const double t = length2 > 0
-                        ? std::clamp((control - fiber.line[i-1]).dot(delta) / length2, 0.0, 1.0) : 0;
-                    const auto offset = fiber.line[i-1] + t * delta - control;
-                    const double distance = offset.dot(offset);
-                    if (distance < bestDistance) {
-                        bestDistance = distance;
-                        bestArc = fiber.arclength[i-1] + t * (fiber.arclength[i] - fiber.arclength[i-1]);
-                    }
-                }
-                return bestArc;
-            };
-            const auto a = projectArc(fiber.controls.front()), b = projectArc(fiber.controls.back());
-            const auto first = std::lower_bound(fiber.arclength.begin(), fiber.arclength.end(), std::min(a, b));
-            const auto past = std::upper_bound(fiber.arclength.begin(), fiber.arclength.end(), std::max(a, b));
-            if (past - first < 2 || *(past - 1) <= *first)
-                throw std::runtime_error("fewer than two distinct line points between endpoint controls");
-            fiber.firstLine = static_cast<size_t>(first - fiber.arclength.begin());
-            fiber.lastLine = static_cast<size_t>(past - fiber.arclength.begin() - 1);
-        }
+        // Only the annotated line (between the end controls) is fiber; the
+        // tails stay in `line` so anchors keep their line_points indices.
+        std::vector<vc::geometry::Point> controls, line;
+        for (const auto& p : fiber.controls) controls.push_back({p[0], p[1], p[2]});
+        for (const auto& p : fiber.line) line.push_back({p[0], p[1], p[2]});
+        const auto range = vc::geometry::annotatedLineRange(controls, line);
+        if (range.size() < 2 || !(fiber.arclength[range.end - 1] > fiber.arclength[range.begin]))
+            throw std::runtime_error("fewer than two distinct line points between endpoint controls");
+        fiber.firstLine = range.begin;
+        fiber.lastLine = range.end - 1;
         return fiber;
     } catch (const std::exception& e) {
         report.problems.push_back(object.uuid + ": invalid stored fiber: " + e.what());

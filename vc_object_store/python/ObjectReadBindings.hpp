@@ -149,7 +149,7 @@ void bindGraphReadView(nb::module_& m) {
         }, nb::arg("fields") = std::nullopt)
         .def("read_geometry_arrays", [](PyGraphReadView& self, const std::string& name,
                                         const std::optional<std::vector<size_t>>& nodes,
-                                        const std::optional<std::string>& volume) {
+                                        const std::optional<std::string>& volume, bool includeTails) {
             self.require();
             std::vector<std::string> revisions;
             std::vector<vo::ObjectRevision> subset;
@@ -165,13 +165,14 @@ void bindGraphReadView(nb::module_& m) {
             { nb::gil_scoped_release release;
               if(self.graph->selectedObjects){
                   const auto selected=nodes?std::span<const vo::ObjectRevision>(subset):std::span<const vo::ObjectRevision>(*self.graph->selectedObjects);
-                  packed=std::make_shared<vo::PackedGeometryArray>(self.store->readSelectedGeometryArrays(*self.txn,selected,name,volume));
+                  packed=std::make_shared<vo::PackedGeometryArray>(self.store->readSelectedGeometryArrays(*self.txn,selected,name,volume,includeTails));
               }else{
                   if(volume)throw std::invalid_argument("mapped packed read requires selected object metadata; use geometry_read");
-                  packed = std::make_shared<vo::PackedGeometryArray>(self.store->readGeometryArrays(*self.txn, revisions, name));
+                  packed = std::make_shared<vo::PackedGeometryArray>(self.store->readGeometryArrays(*self.txn, revisions, name, includeTails));
               } }
             return PyPackedGeometryArray{std::move(packed)};
-        }, nb::arg("array_name"), nb::arg("nodes") = std::nullopt,nb::arg("volume")=std::nullopt)
+        }, nb::arg("array_name"), nb::arg("nodes") = std::nullopt,nb::arg("volume")=std::nullopt,nb::arg("include_tails")=false,
+           "Packed arrays; fiber line_points are the annotated lines (no tails) unless include_tails=True.")
         .def("read_geometry_ranges", [](PyGraphReadView& self, size_t node, const std::string& name,
                                          const std::vector<std::array<int64_t, 2>>& ranges) {
             self.require();

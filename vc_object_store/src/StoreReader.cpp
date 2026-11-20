@@ -158,8 +158,13 @@ std::vector<vcr::catalog::TransformResolution> StoreReader::availableTransforms(
 }
 
 PackedGeometryArray StoreReader::readGeometryArrays(const std::vector<std::string>& revisionUuids,
-                                                   const std::string& arrayName) const
+                                                   const std::string& arrayName, bool includeTails) const
 {
+    if (arrayName == "line_points" && !includeTails) {
+        auto line = readGeometryArrays(revisionUuids, arrayName, true);
+        detail::dropLineTails(line, readGeometryArrays(revisionUuids, "control_points"));
+        return line;
+    }
     PackedGeometryArray packed;
     for (const auto& revision : revisionUuids) {
         const auto descriptor = geometryRevision(revision);
@@ -222,10 +227,12 @@ double StoreReader::geometryLengthInVolume(const std::string& objectUuid, const 
             if (array.name == name) return array.shape.at(0);
         throw std::invalid_argument("geometry: array not found: " + name);
     };
-    const auto name = detail::lengthArrayName(kind, kind == "fiber" ? rows("line_points") : 0);
+    const auto range = detail::lengthRows(kind, rows, [&](const std::string& name, int64_t offset, int64_t bytes) {
+        return readGeometryArray(descriptor->uuid, name, offset, bytes);
+    });
     return detail::polylineLength(
-        [&](int64_t offset, int64_t bytes) { return readGeometryArray(descriptor->uuid, name, offset, bytes); },
-        rows(name), kind, *mapping);
+        [&](int64_t offset, int64_t bytes) { return readGeometryArray(descriptor->uuid, range.name, offset, bytes); },
+        range.begin, range.end, kind, *mapping);
 }
 
 void expectRelationshipEndpoints(const StoreReader& reader, TransactionRequest& request)
@@ -452,9 +459,9 @@ std::vector<uint8_t> LocalStoreReader::readGeometryArray(const std::string& revi
 }
 
 PackedGeometryArray LocalStoreReader::readGeometryArrays(const std::vector<std::string>& revisionUuids,
-                                                        const std::string& arrayName) const
+                                                        const std::string& arrayName, bool includeTails) const
 {
-    return store_->readGeometryArrays(*txn_, revisionUuids, arrayName);
+    return store_->readGeometryArrays(*txn_, revisionUuids, arrayName, includeTails);
 }
 
 std::vector<uint8_t> LocalStoreReader::readGeometryRectangle(const std::string& revisionUuid, const std::string& arrayName,

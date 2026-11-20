@@ -247,16 +247,19 @@ RegionResult ObjectStore::geometryRegion(const ReadTxn& txn, const RegionSlice& 
         for (const auto& candidate : kind.arrays)
             if (arrays.at(candidate).at("shape").at(0).get<int64_t>()) { name = candidate; break; }
         const auto& array = arrays.at(name);
-        const auto points = array.at("shape").at(0).get<int64_t>();
-        if (points < options.minPoints) return;
         if (array.at("dtype") != kind.dtype)
             throw std::runtime_error(options.kind + " coordinates must be " + kind.dtype);
+        // Rows [first, past) take part: a fiber line only over its annotated
+        // range, never its tails (also when the stored index predates that).
+        int64_t first = 0, past = array.at("shape").at(0).get<int64_t>();
+        if (name == "line_points") { const auto rows = lengthRows(reader, options.kind); first = rows.begin; past = rows.end; }
+        if (past - first < options.minPoints) return;
         const auto reference = currentObjectRevision(txn, uuid)->reference();
         bool hit = false;
-        int64_t nextSegment = 0;
+        int64_t nextSegment = first;
         auto appendRegion = [&](const SpatialRegion& region) {
             requestWork(&RegionStats::candidateVisits);
-            const auto end = std::min(points - 1, region.start.at(0) + region.shape.at(0) - 1);
+            const auto end = std::min(past - 1, region.start.at(0) + region.shape.at(0) - 1);
             auto start = std::max(nextSegment, region.start.at(0));
             for (; start < end;) {
                 const auto count = std::min<int64_t>(256, end-start);

@@ -81,7 +81,42 @@ void Fiber::validate() const {
     finite(controlPoints); finite(linePoints);
     if (!controlPointIds.empty()) PointCollection{controlPointIds,controlPoints}.validate();
 }
-double Fiber::length() const { validate(); return polylineLength(linePoints.empty() ? controlPoints : linePoints); }
+double Fiber::length() const
+{
+    validate();
+    return linePoints.empty() ? polylineLength(controlPoints) : polylineLength(annotatedLine());
+}
+AnnotatedLineRange annotatedLineRange(std::span<const Point> controlPoints, std::span<const Point> linePoints)
+{
+    if (linePoints.empty()) return {0, 0};
+    const auto distance = [](const Point& a, const Point& b) {
+        const double dx = a[0] - b[0], dy = a[1] - b[1], dz = a[2] - b[2];
+        return dx * dx + dy * dy + dz * dz;
+    };
+    // Each finite control's nearest line vertex (an exact control vertex, the
+    // writer's convention, is at distance zero); ties take the outermost one.
+    size_t first = linePoints.size(), last = 0, finite = 0;
+    for (const auto& control : controlPoints) {
+        if (!std::isfinite(control[0]) || !std::isfinite(control[1]) || !std::isfinite(control[2])) continue;
+        ++finite;
+        double best = std::numeric_limits<double>::infinity();
+        size_t low = 0, high = 0;
+        for (size_t i = 0; i < linePoints.size(); ++i) {
+            const double d = distance(linePoints[i], control);
+            if (d < best) { best = d; low = high = i; }
+            else if (d == best) high = i;
+        }
+        first = std::min(first, low);
+        last = std::max(last, high);
+    }
+    if (finite < 2) return {0, linePoints.size()};
+    return {first, last + 1};
+}
+std::span<const Point> annotatedLine(std::span<const Point> controlPoints, std::span<const Point> linePoints)
+{
+    const auto range = annotatedLineRange(controlPoints, linePoints);
+    return linePoints.subspan(range.begin, range.size());
+}
 void Track::validate() const {}
 void Umbilicus::validate() const
 {

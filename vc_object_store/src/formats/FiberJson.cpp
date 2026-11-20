@@ -89,7 +89,7 @@ GeometrySource decodeFiberJson(const std::string& text)
     root.erase("control_point_ids");
     FiberDetail f;
     f.controlPointCount = control.size(); f.linePointCount = line.size();
-    f.length = vc::geometry::polylineLength(line.empty() ? control : line);
+    f.length = vc::geometry::polylineLength(line.empty() ? std::span<const vc::geometry::Point>(control) : vc::geometry::annotatedLine(control, line));
     f.width = root.value("width", 0.0); f.widthGapFraction = root.value("width_gap_fraction", 0.2);
     f.optimizationMode = root.value("optimization_mode", "");
     if (root.contains("hv_classification")) {

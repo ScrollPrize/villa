@@ -3,6 +3,7 @@
 #include "internal/Database.hpp"
 #include "internal/RecordSql.hpp"
 #include "internal/Spatial.hpp"
+#include "internal/TransformedLength.hpp"
 #include "internal/VisibleRows.hpp"
 #include "geometry/ArrayLayout.hpp"
 #include "geometry/GeometryReader.hpp"
@@ -221,12 +222,21 @@ void indexGeometry(sqlite3* db, int64_t objectId, const std::string& revision,
                     emit(a.name, row, t * cells, height, std::min(cells + 1, cols - t * cells), tiles[t]);
             }
         } else {
-            const int64_t points = a.shape.at(0);
+            // A fiber's line is indexed over its annotated range only (no tails).
+            int64_t first = 0, past = a.shape.at(0);
+            if (kind == "fiber" && a.name == "line_points" && past) {
+                const auto rows = lengthRows(kind, [&](const std::string& name) {
+                    for (const auto& b : arrays) if (b.name == name) return b.shape.at(0);
+                    throw std::runtime_error("fiber geometry lacks " + name);
+                }, read);
+                first = rows.begin; past = rows.end;
+            }
+            const int64_t points = past - first;
             const bool line = polyline(kind);
             constexpr int64_t block = 256;
-            const auto end = line ? std::max<int64_t>(1, points - 1) : points;
-            for (int64_t start = 0; points && start < end; start += block) {
-                const int64_t count = std::min(block + (line ? 1 : 0), points - start);
+            const auto end = first + (line ? std::max<int64_t>(1, points - 1) : points);
+            for (int64_t start = first; points && start < end; start += block) {
+                const int64_t count = std::min(block + (line ? 1 : 0), past - start);
                 BoundsBuilder bounds;
                 bounds.append(read(a.name, start * stride, count * stride), a.dtype, false);
                 emit(a.name, start, 0, count, 0, bounds);

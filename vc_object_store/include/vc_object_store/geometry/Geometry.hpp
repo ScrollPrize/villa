@@ -26,11 +26,35 @@ struct PointCollection {
     std::optional<Point> point(PointId id) const;
 };
 
+// Line tails. A manual fiber (two or more control points) is annotated only
+// between its first and last control point. The line points the optimizer
+// extrapolates past them (the open tails) are not fiber: every consumer ignores
+// them - geometry, normals, crossings and constraints, link anchors, lengths,
+// bounds and regions. A fiber with fewer than two controls (automatic traces)
+// has no tails; its whole line counts. Read a fiber's line through
+// annotatedLine/annotatedLineRange; the raw `linePoints` (with tails) are for
+// editing, display of the extrapolation and lossless round trips only.
+//
+// The writer keeps every control as an exact line vertex. The annotated range
+// runs over the line vertices nearest the controls, from the lowest to the
+// highest such index, inclusive; control order does not matter (a live edit
+// may hold its controls in any order) and non-finite controls do not count.
+struct AnnotatedLineRange {
+    size_t begin = 0, end = 0;  // [begin, end) into linePoints
+    size_t size() const { return end - begin; }
+};
+AnnotatedLineRange annotatedLineRange(std::span<const Point> controlPoints, std::span<const Point> linePoints);
+std::span<const Point> annotatedLine(std::span<const Point> controlPoints, std::span<const Point> linePoints);
+
 struct Fiber {
-    std::vector<Point> controlPoints, linePoints;
+    std::vector<Point> controlPoints;
+    // Raw line including the extrapolated tails; consumers read annotatedLine().
+    std::vector<Point> linePoints;
     std::vector<PointId> controlPointIds; // encode allocates IDs for a new value when omitted
     void validate() const;
-    // Sampled line if present, otherwise the control polyline.
+    // The line without its tails (see "Line tails" above).
+    std::span<const Point> annotatedLine() const { return geometry::annotatedLine(controlPoints, linePoints); }
+    // Annotated line if present, otherwise the control polyline; never the tails.
     double length() const;
 };
 
