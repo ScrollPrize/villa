@@ -1616,10 +1616,10 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
 
 #if defined(_WIN32)
-    // On Windows the process can hang after a successful render, during
-    // process teardown (worker-thread/DLL shutdown), so callers that wait for
-    // it never return. All output is written at this point: flush C stdio and
-    // end the process directly.
+    // On Windows the process can hang in DLL shutdown after a successful
+    // render, so callers that wait for it never return. Release the source
+    // first: that finishes its queued cache writes and closes its SSH sessions.
+    source.reset();
     std::fflush(nullptr);
     TerminateProcess(GetCurrentProcess(), EXIT_SUCCESS);
 #endif
