@@ -52,6 +52,9 @@ public slots:
     void refreshAvailableDetections();
     void toggleVisibility();
     void setSelectedPath(const std::filesystem::path& path);
+    // Offer a local image (e.g. a prediction run on this machine) for the
+    // active surface and select it. Kept for the session.
+    void addLocalDetection(const std::filesystem::path& path);
     void clearSelection();
     void setOpacity(int opacity);
     void setColormapId(const std::string& id);
@@ -93,6 +96,7 @@ private:
     std::filesystem::path _selectedPath;
     std::string _selectedSegmentKey;
     std::unordered_map<std::string, std::filesystem::path> _selectedPathBySegment;
+    std::unordered_map<std::string, std::vector<Option>> _localOptionsBySegment;
     LoadedImage _selectedImage;
     int _opacity{70};
     int _opacityBeforeToggle{70};
