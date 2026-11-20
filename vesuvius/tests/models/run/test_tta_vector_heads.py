@@ -55,8 +55,10 @@ class Oracle(torch.nn.Module):
         else:
             gy, gx = grads
             st = torch.cat([gy * gy, gy * gx, gx * gx], dim=1)
-        # an eigenvector: the direction is defined, its sign is not (here: x component >= 0)
-        direction = n * torch.where(n[:, :1] < 0, -1.0, 1.0)
+        # an eigenvector: the direction is defined, its sign is not (here: the half-space
+        # 4x + 2y + z >= 0 in which vesuvius.predict reports it)
+        side = 4 * n[:, :1] + 2 * n[:, 1:2] + (n[:, 2:3] if nd == 3 else 0)
+        direction = n * torch.where(side < 0, -1.0, 1.0)
         out = {"surface": torch.cat([-s, s], dim=1), "normals": n, "st": st, "direction": direction}
         if nd == 3:
             out["nearest"] = torch.cat([-n, s.abs()], dim=1)
@@ -206,4 +208,53 @@ def test_component_transform_keeps_peak_memory(helper, head):
     plain = _peak_bytes(lambda: _run_helper(helper, model, x, targets, None))
     transformed = _peak_bytes(lambda: _run_helper(helper, model, x, targets, groups))
     assert transformed - plain < variant, f"{(transformed - plain) / variant:.1f} extra output copies"
+
+
+def _predict(tmp_path, monkeypatch, volume, network, targets, patch, name, **kwargs):
+    """vesuvius.predict with an in-memory blend of `volume`; returns the written output."""
+    if not (tmp_path / "model.pth").exists():
+        (tmp_path / "model.pth").write_bytes(b"")
+    writer = ZarrWriter.create(str(tmp_path / f"{name}_volume.zarr"), shape=volume.shape, chunks=patch,
+                               dtype=np.float32)
+    writer[:] = volume
+
+    def fake_load(self, checkpoint_path):
+        return {"network": network, "patch_size": patch, "num_input_channels": 1,
+                "num_seg_heads": sum(t["out_channels"] for t in targets.values()),
+                "targets": targets, "normalization_scheme": "none"}
+
+    monkeypatch.setattr(inference.Inferer, "_load_train_py_model", fake_load)
+    out = tmp_path / f"{name}.zarr"
+    blend = {"output_path": str(out), **kwargs.pop("in_memory_blend", {})}
+    Inferer(model_path=str(tmp_path / "model.pth"), input_dir=str(tmp_path / f"{name}_volume.zarr"),
+            output_dir=str(tmp_path / f"{name}_parts"), model_type="train_py", device="cpu",
+            num_dataloader_workers=0, in_memory_blend=blend, **kwargs).infer()
+    return np.asarray(open_zarr(str(out))[:])
+
+
+class AxisWithPatchSign(torch.nn.Module):
+    """The x axis everywhere, with a sign picked by the patch's first voxel. In-plane directions
+    are trained with a sign-invariant loss, so neighbouring patches may report one axis either way."""
+
+    def forward(self, x):
+        s = x[:, :1].float()
+        sign = torch.where(s[:, :, :1, :1, :1] > 0.5, 1.0, -1.0).expand_as(s)
+        return {"surface": torch.cat([-s, s], dim=1),
+                "direction": torch.cat([sign, torch.zeros_like(s), torch.zeros_like(s)], dim=1)}
+
+
+def test_overlapping_patches_keep_a_sign_ambiguous_axis(tmp_path, monkeypatch):
+    """Two patches (50% overlap) predict the x axis with opposite signs; blending must keep it.
+
+    The second patch's first voxel is dark, so it reports -x unmirrored and +x in the mirrored
+    variants. A sign chosen per patch made the two cancel where they overlap (0 at x = 12, where
+    both weigh the same)."""
+    volume = np.full((16, 16, 24), 0.9, dtype=np.float32) + np.linspace(0, 0.01, 24, dtype=np.float32)
+    volume[0, 0, 8] = 0.0
+    targets = {name: TARGETS[name] for name in ("surface", "direction")}
+    out = _predict(tmp_path, monkeypatch, volume, AxisWithPatchSign(), targets, (16, 16, 16), "seam")
+    direction = out[2:5].astype(np.float32)
+    assert direction[0, 8, 8, 12] > 0.99, f"x component at the seam {direction[0, 8, 8, 12]:.3f}"
+    inner = direction[:, 4:12, 4:12, 4:20]  # away from the volume faces, where the weights vanish
+    assert inner[0].min() > 0.99 and np.abs(inner[1:]).max() == 0
 

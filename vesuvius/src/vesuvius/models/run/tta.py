@@ -18,6 +18,11 @@ _AXES = {'z': -3, 'y': -2, 'x': -1}
 # task_type -> whether the direction's sign is arbitrary (an eigenvector)
 _VECTOR_TASKS = {'surface_normals': False, 'nearest_component': False, 'inplane_direction': True}
 _TENSOR_ORDER = {3: ('zz', 'zy', 'zx', 'yy', 'yx', 'xx'), 2: ('yy', 'yx', 'xx')}
+# A sign-ambiguous direction is reported in the half-space 4x + 2y + z >= 0 of the input frame.
+# A sign chosen per patch would let two overlapping patches that agree up to sign cancel when
+# blended; a fixed half-space gives them the same sign. No axis or axis diagonal lies on its
+# boundary plane.
+_AXIAL_HALF_SPACE = {-1: 4.0, -2: 2.0, -3: 1.0}
 
 
 def tta_channel_groups(targets, target_info, spatial_dims: int):
@@ -93,16 +98,28 @@ def _flip_where(output: torch.Tensor, channels, negative: torch.Tensor) -> None:
 
 
 def _average_variants(variants, channel_groups) -> torch.Tensor:
-    """Mean of the TTA variants (a list, or a tensor stacked on dim 0); sign-ambiguous directions
-    are first aligned with the first variant, in place."""
-    axial = [list(g['channels'].values()) for g in (channel_groups or []) if g['kind'] == 'axial']
-    for chs in axial:
+    """Mean of the TTA variants (a list, or a tensor stacked on dim 0).
+
+    Sign-ambiguous directions are first aligned with the first variant (in place), and their
+    mean is then put in the fixed half-space `_AXIAL_HALF_SPACE`.
+    """
+    axial = [g['channels'] for g in (channel_groups or []) if g['kind'] == 'axial']
+    for channels in axial:
+        chs = list(channels.values())
         reference = variants[0]
         for variant in variants[1:]:
             _flip_where(variant, chs, _dot32(variant, reference, chs) < 0)
     if torch.is_tensor(variants):
-        return variants.mean(dim=0)
-    return torch.mean(torch.stack(list(variants), dim=0), dim=0)
+        mean = variants.mean(dim=0)
+    else:
+        mean = torch.mean(torch.stack(list(variants), dim=0), dim=0)
+    for channels in axial:
+        side = None
+        for (axis,), ch in channels.items():
+            term = mean[:, ch].float() * _AXIAL_HALF_SPACE[axis]
+            side = term if side is None else side.add_(term)
+        _flip_where(mean, list(channels.values()), side < 0)
+    return mean
 
 
 def infer_with_tta_batched_3d(model, inputs: torch.Tensor,
