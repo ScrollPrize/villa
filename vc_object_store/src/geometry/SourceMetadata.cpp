@@ -64,6 +64,11 @@ Json nativeMetadata(const StoreReader& reader, const ObjectRecord& object, const
         result["external_key"] = object.track->externalKey;
         result["family"] = object.track->family;
     }
+    if (object.kind == "surface") {
+        // GrowPatch reads this marker when resuming from a TIFXYZ surface.
+        if (const auto anchor = metadata.find("seed_anchor"); anchor != metadata.end())
+            result["seed_anchor"] = *anchor;
+    }
     return result;
 }
 } // namespace vc::objects::detail
