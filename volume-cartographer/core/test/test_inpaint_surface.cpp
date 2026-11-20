@@ -100,3 +100,19 @@ TEST_CASE("inpaintSurfaceHoles: disc hole of radius 10 in a tilted plane, step 4
 {
     checkOnPlane(4.0, discR10);
 }
+
+TEST_CASE("inpaintSurfaceHoles: outer padding next to a hole stays invalid")
+{
+    // Rows 0-2 are padding; the 8x8 hole is one valid row below them.
+    auto padding = [](int r, int) { return r < 3; };
+    auto hole = [](int r, int c) { return r >= 4 && r < 12 && c >= 26 && c < 34; };
+    cv::Mat_<cv::Vec3f> pts(kN, kN);
+    for (int r = 0; r < kN; ++r)
+        for (int c = 0; c < kN; ++c)
+            pts(r, c) = padding(r, c) || hole(r, c) ? cv::Vec3f(-1, -1, -1)
+                                                    : cv::Vec3f(planePoint(r, c, 4.0));
+    CHECK(vc::core::util::inpaintSurfaceHoles(pts) == 64);
+    for (int r = 0; r < kN; ++r)
+        for (int c = 0; c < kN; ++c)
+            if (padding(r, c)) CHECK(pts(r, c)[0] == -1.f);
+}

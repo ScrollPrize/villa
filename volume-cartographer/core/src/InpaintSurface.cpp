@@ -288,10 +288,12 @@ int inpaintSurfaceHoles(cv::Mat_<cv::Vec3f>& points, double unit, int max_iters)
 
         solveRoi(roi, unknown, roi_unit, max_iters);
 
-        // 6. Write back the inpainted cells.
+        // 6. Write back this component's cells only, so that outer padding
+        //    inside the ROI stays invalid.
         for (int r = 0; r < H; ++r) {
+            const int* lr = labels.ptr<int>(rr0 + r);
             for (int c = 0; c < W; ++c) {
-                if (!unknown(r, c)) continue;
+                if (lr[cc0 + c] != comp) continue;
                 const cv::Vec3d& v = roi(r, c);
                 points(rr0 + r, cc0 + c) = cv::Vec3f(
                     static_cast<float>(v[0]),
