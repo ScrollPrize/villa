@@ -271,6 +271,121 @@ cv::Vec2f align_and_extract_umbilicus(const GridStore& grid_store, std::optional
     return best_umbilicus;
 }
 
+namespace {
+
+double tricube(double u)
+{
+    u = std::min(std::abs(u), 1.0);
+    const double t = 1.0 - u * u * u;
+    return t * t * t;
+}
+
+// Weighted least squares line through (z, x) and (z, y), read at z0, over the estimates (sorted by
+// z) that lie within half_width of z0. False when fewer than 3 of them carry weight. A window
+// whose estimates all share one z gives their weighted mean.
+bool local_linear(const std::vector<cv::Vec3d>& e, const std::vector<double>& w, double z0,
+                  double half_width, cv::Vec2d& out)
+{
+    const auto byZ = [](const cv::Vec3d& a, double z) { return a[0] < z; };
+    const size_t lo = std::lower_bound(e.begin(), e.end(), z0 - half_width, byZ) - e.begin();
+    double sw = 0.0, swz = 0.0, swx = 0.0, swy = 0.0;
+    int count = 0;
+    size_t hi = lo;
+    for (; hi < e.size() && e[hi][0] <= z0 + half_width; ++hi) {
+        const double k = tricube((e[hi][0] - z0) / half_width) * w[hi];
+        if (k > 0.0) {
+            ++count;
+        }
+        sw += k;
+        swz += k * e[hi][0];
+        swx += k * e[hi][1];
+        swy += k * e[hi][2];
+    }
+    if (count < 3 || sw <= 0.0) {
+        return false;
+    }
+    const double zm = swz / sw, xm = swx / sw, ym = swy / sw;
+    double szz = 0.0, szx = 0.0, szy = 0.0;
+    for (size_t i = lo; i < hi; ++i) {
+        const double k = tricube((e[i][0] - z0) / half_width) * w[i];
+        const double dz = e[i][0] - zm;
+        szz += k * dz * dz;
+        szx += k * dz * (e[i][1] - xm);
+        szy += k * dz * (e[i][2] - ym);
+    }
+    if (szz <= 1e-12 * std::max(1.0, sw)) {
+        out = cv::Vec2d(xm, ym);
+    } else {
+        out = cv::Vec2d(xm + szx / szz * (z0 - zm), ym + szy / szz * (z0 - zm));
+    }
+    return true;
+}
+
+double median_of(std::vector<double> v)
+{
+    const size_t n = v.size();
+    std::nth_element(v.begin(), v.begin() + n / 2, v.end());
+    const double hi = v[n / 2];
+    if (n % 2 == 1) {
+        return hi;
+    }
+    return 0.5 * (hi + *std::max_element(v.begin(), v.begin() + n / 2));
+}
+
+} // namespace
+
+std::vector<cv::Vec2d> fit_umbilicus_along_z(const std::vector<cv::Vec3d>& estimates,
+                                             const std::vector<double>& query_z,
+                                             double half_width,
+                                             int robustness_iterations)
+{
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    std::vector<cv::Vec2d> result(query_z.size(), cv::Vec2d(nan, nan));
+    if (estimates.empty() || !(half_width > 0.0)) {
+        return result;
+    }
+
+    std::vector<cv::Vec3d> sorted = estimates;
+    std::stable_sort(sorted.begin(), sorted.end(),
+                     [](const cv::Vec3d& a, const cv::Vec3d& b) { return a[0] < b[0]; });
+
+    std::vector<double> robust(sorted.size(), 1.0);
+    for (int it = 0; it < robustness_iterations; ++it) {
+        std::vector<double> residual(sorted.size(), 0.0);
+        for (size_t i = 0; i < sorted.size(); ++i) {
+            cv::Vec2d fit;
+            if (local_linear(sorted, robust, sorted[i][0], half_width, fit)) {
+                residual[i] = std::hypot(sorted[i][1] - fit[0], sorted[i][2] - fit[1]);
+            }
+        }
+        const double s = median_of(residual);
+        if (!(s > 0.0)) {
+            break;
+        }
+        for (size_t i = 0; i < sorted.size(); ++i) {
+            const double u = std::min(residual[i] / (6.0 * s), 1.0);
+            robust[i] = (1.0 - u * u) * (1.0 - u * u);
+        }
+    }
+
+    for (size_t q = 0; q < query_z.size(); ++q) {
+        if (local_linear(sorted, robust, query_z[q], half_width, result[q])) {
+            continue;
+        }
+        std::vector<double> xs, ys;
+        for (const auto& e : sorted) {
+            if (e[0] == query_z[q]) {
+                xs.push_back(e[1]);
+                ys.push_back(e[2]);
+            }
+        }
+        if (!xs.empty()) {
+            result[q] = cv::Vec2d(median_of(xs), median_of(ys));
+        }
+    }
+    return result;
+}
+
 void populate_normal_grid(const vcr::thinning::Traces& traces, GridStore& normal_grid, double spiral_step) {
     const float target_dist_sq = static_cast<float>(spiral_step * spiral_step);
 
