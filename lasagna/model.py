@@ -3286,7 +3286,7 @@ class Model3D(nn.Module):
 		centers64 = (0.25 * (q00 + q10 + q01 + q11)).astype(np.float64, copy=False)
 		lo64 = np.asarray(lo, dtype=np.float64)
 		# Upper bound on candidate (pixel, triangle) pairs processed at once.
-		budget = max(4096, 32 * int(chunk_points))
+		budget = max(4096, 8 * int(chunk_points))
 		cell_block = 131072
 
 		def _solve(points: np.ndarray, base: np.ndarray, e_a: np.ndarray, e_b: np.ndarray):
@@ -3305,153 +3305,157 @@ class Model3D(nn.Module):
 			)
 			return a, b, res2, inside
 
-		hit_pix: list[np.ndarray] = []
-		hit_res2: list[np.ndarray] = []
-		hit_dist2: list[np.ndarray] = []
-		hit_tri: list[np.ndarray] = []
-		hit_cell: list[np.ndarray] = []
-		hit_a: list[np.ndarray] = []
-		hit_b: list[np.ndarray] = []
-		with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
-			for c0 in range(0, n_cells, cell_block):
-				c1 = min(n_cells, c0 + cell_block)
-				cells = np.arange(c0, c1, dtype=np.int64)
-				# Triangle 0 is (p00, p10, p01); triangle 1 is (p10, p11, p01).
-				tri_cell = np.concatenate([cells, cells])
-				tri_id = np.concatenate([
-					np.zeros(cells.shape[0], dtype=np.int8),
-					np.ones(cells.shape[0], dtype=np.int8),
-				])
-				va = np.concatenate([q00[c0:c1], q10[c0:c1]]).astype(np.float64)
-				vb = np.concatenate([q10[c0:c1], q11[c0:c1]]).astype(np.float64)
-				vc = np.concatenate([q01[c0:c1], q01[c0:c1]]).astype(np.float64)
-				tmin = np.minimum(np.minimum(va, vb), vc) - lo64
-				tmax = np.maximum(np.maximum(va, vb), vc) - lo64
-				# Generous margin: the inside test below decides; the margin only
-				# guarantees every pixel the tolerance could accept is tested.
-				margin = 1.0e-3 * (tmax - tmin).max(axis=1, keepdims=True) + 1.0e-3
-				y0 = np.clip(np.ceil(tmin[:, 0] - margin[:, 0]), 0, out_h).astype(np.int64)
-				y1 = np.clip(np.floor(tmax[:, 0] + margin[:, 0]), -1, out_h - 1).astype(np.int64)
-				x0 = np.clip(np.ceil(tmin[:, 1] - margin[:, 0]), 0, out_w).astype(np.int64)
-				x1 = np.clip(np.floor(tmax[:, 1] + margin[:, 0]), -1, out_w - 1).astype(np.int64)
-				ny = np.maximum(0, y1 - y0 + 1)
-				nx = np.maximum(0, x1 - x0 + 1)
-				counts = ny * nx
-				keep = counts > 0
-				if not bool(keep.any()):
-					continue
-				tri_cell, tri_id = tri_cell[keep], tri_id[keep]
-				y0, x0, ny, nx = y0[keep], x0[keep], ny[keep], nx[keep]
-				# Split triangles whose box exceeds the budget into row bands so a
-				# runaway (huge) UV triangle cannot allocate an unbounded batch.
-				band = np.maximum(1, budget // nx)
-				pieces = (ny + band - 1) // band
-				if bool((pieces > 1).any()):
-					piece_of = np.repeat(np.arange(pieces.shape[0], dtype=np.int64), pieces)
-					piece_k = np.arange(piece_of.shape[0], dtype=np.int64) - np.repeat(np.cumsum(pieces) - pieces, pieces)
-					tri_cell, tri_id = tri_cell[piece_of], tri_id[piece_of]
-					y0 = y0[piece_of] + piece_k * band[piece_of]
-					ny = np.minimum(band[piece_of], ny[piece_of] - piece_k * band[piece_of])
-					x0, nx = x0[piece_of], nx[piece_of]
-				counts = ny * nx
-				ends = np.cumsum(counts)
-				t_start = 0
-				while t_start < int(counts.shape[0]):
-					done = int(ends[t_start - 1]) if t_start > 0 else 0
-					t_stop = int(np.searchsorted(ends, done + budget, side="right"))
-					t_stop = max(t_start + 1, t_stop)
-					sl = slice(t_start, t_stop)
-					cnt = counts[sl]
-					total = int(cnt.sum())
-					owner = np.repeat(np.arange(t_stop - t_start, dtype=np.int64), cnt)
-					first = np.cumsum(cnt) - cnt
-					local = np.arange(total, dtype=np.int64) - np.repeat(first, cnt)
-					nx_o = nx[sl][owner]
-					oy = y0[sl][owner] + local // nx_o
-					ox = x0[sl][owner] + local % nx_o
-					cell = tri_cell[sl][owner]
-					tri = tri_id[sl][owner]
-					points64 = np.stack([lo[0] + oy.astype(numpy_float_hi), lo[1] + ox.astype(numpy_float_hi)], axis=-1)
-					points = points64.astype(numpy_float_hi, copy=False)
-					is1 = tri == 1
-					base = np.where(is1[:, None], q10[cell], q00[cell])
-					e_a = np.where(is1[:, None], tri1_u_cell[cell], tri0_s_cell[cell])
-					e_b = np.where(is1[:, None], tri1_v_cell[cell], tri0_t_cell[cell])
-					a, b, res2, inside = _solve(points, base, e_a, e_b)
-					if bool(inside.any()):
-						d = points64[inside].astype(np.float64, copy=False) - centers64[cell[inside]]
-						hit_pix.append(oy[inside] * int(out_w) + ox[inside])
-						hit_res2.append(res2[inside])
-						hit_dist2.append((d * d).sum(axis=-1))
-						hit_tri.append(tri[inside])
-						hit_cell.append(cell[inside])
-						hit_a.append(a[inside])
-						hit_b.append(b[inside])
-					t_start = t_stop
-
 		out_map_t = torch.zeros((out_h * out_w, 2), dtype=torch.float32, device=result_device)
 		out_xyz_t = torch.zeros((out_h * out_w, 3), dtype=torch.float32, device=result_device)
 		out_mask_t = torch.zeros((out_h * out_w,), dtype=torch.bool, device=result_device)
-		if hit_pix:
-			pix = np.concatenate(hit_pix)
-			res2_all = np.concatenate(hit_res2)
-			dist2_all = np.concatenate(hit_dist2)
-			tri_all = np.concatenate(hit_tri)
-			cell_all = np.concatenate(hit_cell)
-			a_all = np.concatenate(hit_a)
-			b_all = np.concatenate(hit_b)
-			del hit_pix, hit_res2, hit_dist2, hit_tri, hit_cell, hit_a, hit_b
-			# One winner per output pixel: smallest barycentric residual, then the
-			# nearest cell centre, then triangle 0 -- the order the candidate
-			# search used (score, KD-tree rank, triangle 0 on ties).
-			order = np.lexsort((tri_all, dist2_all, res2_all, pix))
-			pix_sorted = pix[order]
-			winner = np.ones(pix_sorted.shape[0], dtype=bool)
-			winner[1:] = pix_sorted[1:] != pix_sorted[:-1]
-			sel = order[winner]
-			flat_idx = pix[sel]
-			best_cell = cell_all[sel]
-			best_tri1_np = tri_all[sel] == 1
-			a_sel = a_all[sel]
-			b_sel = b_all[sel]
-			zero_np = np.zeros_like(a_sel)
-			best_tri1 = torch.from_numpy(best_tri1_np)
-			best_s0 = torch.from_numpy(np.where(best_tri1_np, zero_np, a_sel))
-			best_t0 = torch.from_numpy(np.where(best_tri1_np, zero_np, b_sel))
-			best_u1 = torch.from_numpy(np.where(best_tri1_np, a_sel, zero_np))
-			best_v1 = torch.from_numpy(np.where(best_tri1_np, b_sel, zero_np))
+		chunk = max(1, int(chunk_points))
+		# Output points are rounded to numpy_float_hi before the solve.
+		point_eps = np.finfo(numpy_float_hi).eps * (np.abs(lo64) + np.array([out_h, out_w], dtype=np.float64))
+		# Winner state covers one stripe of output rows so it does not grow with the canvas.
+		stripe_rows = max(1, 64 * chunk // int(out_w))
+		for r0 in range(0, int(out_h), stripe_rows):
+			r1 = min(int(out_h), r0 + stripe_rows)
+			n_pix = (r1 - r0) * int(out_w)
+			best_res2 = np.full(n_pix, np.inf, dtype=numpy_float_hi)
+			best_dist2 = np.zeros(n_pix, dtype=np.float64)
+			best_tri = np.zeros(n_pix, dtype=np.int8)
+			best_cell_all = np.zeros(n_pix, dtype=np.int64)
+			best_a = np.zeros(n_pix, dtype=numpy_float_hi)
+			best_b = np.zeros(n_pix, dtype=numpy_float_hi)
+			with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+				for c0 in range(0, n_cells, cell_block):
+					c1 = min(n_cells, c0 + cell_block)
+					cells = np.arange(c0, c1, dtype=np.int64)
+					# Triangle 0 is (p00, p10, p01); triangle 1 is (p10, p11, p01).
+					tri_cell = np.concatenate([cells, cells])
+					tri_id = np.concatenate([
+						np.zeros(cells.shape[0], dtype=np.int8),
+						np.ones(cells.shape[0], dtype=np.int8),
+					])
+					va = np.concatenate([q00[c0:c1], q10[c0:c1]]).astype(np.float64)
+					vb = np.concatenate([q10[c0:c1], q11[c0:c1]]).astype(np.float64)
+					vc = np.concatenate([q01[c0:c1], q01[c0:c1]]).astype(np.float64)
+					tmin = np.minimum(np.minimum(va, vb), vc) - lo64
+					tmax = np.maximum(np.maximum(va, vb), vc) - lo64
+					# Generous margin: the inside test below decides; the margin only
+					# guarantees every pixel the tolerance could accept is tested.
+					margin = 1.0e-3 * (tmax - tmin).max(axis=1, keepdims=True) + 1.0e-3 + point_eps
+					y0 = np.clip(np.ceil(tmin[:, 0] - margin[:, 0]), r0, r1).astype(np.int64)
+					y1 = np.clip(np.floor(tmax[:, 0] + margin[:, 0]), r0 - 1, r1 - 1).astype(np.int64)
+					x0 = np.clip(np.ceil(tmin[:, 1] - margin[:, 1]), 0, out_w).astype(np.int64)
+					x1 = np.clip(np.floor(tmax[:, 1] + margin[:, 1]), -1, out_w - 1).astype(np.int64)
+					ny = np.maximum(0, y1 - y0 + 1)
+					nx = np.maximum(0, x1 - x0 + 1)
+					counts = ny * nx
+					keep = counts > 0
+					if not bool(keep.any()):
+						continue
+					tri_cell, tri_id = tri_cell[keep], tri_id[keep]
+					y0, x0, ny, nx = y0[keep], x0[keep], ny[keep], nx[keep]
+					# Split triangles whose box exceeds the budget into row bands so a
+					# runaway (huge) UV triangle cannot allocate an unbounded batch.
+					band = np.maximum(1, budget // nx)
+					pieces = (ny + band - 1) // band
+					if bool((pieces > 1).any()):
+						piece_of = np.repeat(np.arange(pieces.shape[0], dtype=np.int64), pieces)
+						piece_k = np.arange(piece_of.shape[0], dtype=np.int64) - np.repeat(np.cumsum(pieces) - pieces, pieces)
+						tri_cell, tri_id = tri_cell[piece_of], tri_id[piece_of]
+						y0 = y0[piece_of] + piece_k * band[piece_of]
+						ny = np.minimum(band[piece_of], ny[piece_of] - piece_k * band[piece_of])
+						x0, nx = x0[piece_of], nx[piece_of]
+					counts = ny * nx
+					ends = np.cumsum(counts)
+					t_start = 0
+					while t_start < int(counts.shape[0]):
+						done = int(ends[t_start - 1]) if t_start > 0 else 0
+						t_stop = int(np.searchsorted(ends, done + budget, side="right"))
+						t_stop = max(t_start + 1, t_stop)
+						sl = slice(t_start, t_stop)
+						cnt = counts[sl]
+						total = int(cnt.sum())
+						owner = np.repeat(np.arange(t_stop - t_start, dtype=np.int64), cnt)
+						first = np.cumsum(cnt) - cnt
+						local = np.arange(total, dtype=np.int64) - np.repeat(first, cnt)
+						nx_o = nx[sl][owner]
+						oy = y0[sl][owner] + local // nx_o
+						ox = x0[sl][owner] + local % nx_o
+						cell = tri_cell[sl][owner]
+						tri = tri_id[sl][owner]
+						points64 = np.stack([lo[0] + oy.astype(numpy_float_hi), lo[1] + ox.astype(numpy_float_hi)], axis=-1)
+						points = points64.astype(numpy_float_hi, copy=False)
+						is1 = tri == 1
+						base = np.where(is1[:, None], q10[cell], q00[cell])
+						e_a = np.where(is1[:, None], tri1_u_cell[cell], tri0_s_cell[cell])
+						e_b = np.where(is1[:, None], tri1_v_cell[cell], tri0_t_cell[cell])
+						a, b, res2, inside = _solve(points, base, e_a, e_b)
+						if bool(inside.any()):
+							d = points64[inside].astype(np.float64, copy=False) - centers64[cell[inside]]
+							pix = (oy[inside] - r0) * int(out_w) + ox[inside]
+							res2, dist2 = res2[inside], (d * d).sum(axis=-1)
+							tri, cell, a, b = tri[inside], cell[inside], a[inside], b[inside]
+							# Lowest residual, then nearest cell centre, then triangle 0; earlier hits win exact ties.
+							order = np.lexsort((tri, dist2, res2, pix))
+							first = np.ones(order.shape[0], dtype=bool)
+							first[1:] = pix[order[1:]] != pix[order[:-1]]
+							sel = order[first]
+							p = pix[sel]
+							cur_res2, cur_dist2 = best_res2[p], best_dist2[p]
+							better = (res2[sel] < cur_res2) | ((res2[sel] == cur_res2) & (
+								(dist2[sel] < cur_dist2) | ((dist2[sel] == cur_dist2) & (tri[sel] < best_tri[p]))))
+							sel, p = sel[better], p[better]
+							best_res2[p] = res2[sel]
+							best_dist2[p] = dist2[sel]
+							best_tri[p] = tri[sel]
+							best_cell_all[p] = cell[sel]
+							best_a[p] = a[sel]
+							best_b[p] = b[sel]
+						t_start = t_stop
 
-			# Clamp tiny shared-edge tolerances, then renormalize barycentric
-			# weights so source coordinates and sampled xyz use the same point.
-			zero = torch.zeros_like(best_s0)
-			w00 = torch.where(best_tri1, zero, 1.0 - best_s0 - best_t0)
-			w10 = torch.where(best_tri1, 1.0 - best_u1 - best_v1, best_s0)
-			w01 = torch.where(best_tri1, best_v1, best_t0)
-			w11 = torch.where(best_tri1, best_u1, zero)
-			weights = torch.stack((w00, w10, w01, w11), dim=-1).clamp_min(0.0)
-			weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1.0e-12)
+			filled = np.flatnonzero(np.isfinite(best_res2))
+			for start in range(0, int(filled.shape[0]), chunk):
+				flat_idx = filled[start:start + chunk]
+				best_cell = best_cell_all[flat_idx]
+				best_tri1_np = best_tri[flat_idx] == 1
+				a_sel = best_a[flat_idx]
+				b_sel = best_b[flat_idx]
+				zero_np = np.zeros_like(a_sel)
+				best_tri1 = torch.from_numpy(best_tri1_np)
+				best_s0 = torch.from_numpy(np.where(best_tri1_np, zero_np, a_sel))
+				best_t0 = torch.from_numpy(np.where(best_tri1_np, zero_np, b_sel))
+				best_u1 = torch.from_numpy(np.where(best_tri1_np, a_sel, zero_np))
+				best_v1 = torch.from_numpy(np.where(best_tri1_np, b_sel, zero_np))
 
-			def _selected_tensor(values: np.ndarray) -> torch.Tensor:
-				return torch.as_tensor(
-					np.ascontiguousarray(values[best_cell]),
-					dtype=torch_float_hi,
+				# Clamp tiny shared-edge tolerances, then renormalize barycentric
+				# weights so source coordinates and sampled xyz use the same point.
+				zero = torch.zeros_like(best_s0)
+				w00 = torch.where(best_tri1, zero, 1.0 - best_s0 - best_t0)
+				w10 = torch.where(best_tri1, 1.0 - best_u1 - best_v1, best_s0)
+				w01 = torch.where(best_tri1, best_v1, best_t0)
+				w11 = torch.where(best_tri1, best_u1, zero)
+				weights = torch.stack((w00, w10, w01, w11), dim=-1).clamp_min(0.0)
+				weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1.0e-12)
+
+				def _selected_tensor(values: np.ndarray) -> torch.Tensor:
+					return torch.as_tensor(
+						np.ascontiguousarray(values[best_cell]),
+						dtype=torch_float_hi,
+					)
+
+				best_rows = _selected_tensor(rows_float)
+				best_cols = _selected_tensor(cols_float)
+				src_r = best_rows + weights[:, 1] + weights[:, 3]
+				src_c = best_cols + weights[:, 2] + weights[:, 3]
+				sampled = (
+					weights[:, 0, None] * _selected_tensor(x00)
+					+ weights[:, 1, None] * _selected_tensor(x10)
+					+ weights[:, 2, None] * _selected_tensor(x01)
+					+ weights[:, 3, None] * _selected_tensor(x11)
 				)
-
-			best_rows = _selected_tensor(rows_float)
-			best_cols = _selected_tensor(cols_float)
-			src_r = best_rows + weights[:, 1] + weights[:, 3]
-			src_c = best_cols + weights[:, 2] + weights[:, 3]
-			sampled = (
-				weights[:, 0, None] * _selected_tensor(x00)
-				+ weights[:, 1, None] * _selected_tensor(x10)
-				+ weights[:, 2, None] * _selected_tensor(x01)
-				+ weights[:, 3, None] * _selected_tensor(x11)
-			)
-			flat_out = torch.as_tensor(flat_idx, dtype=torch.long, device=result_device)
-			out_map_t[flat_out, 0] = src_r.to(device=result_device, dtype=torch.float32)
-			out_map_t[flat_out, 1] = src_c.to(device=result_device, dtype=torch.float32)
-			out_xyz_t[flat_out] = sampled.to(device=result_device, dtype=torch.float32)
-			out_mask_t[flat_out] = True
+				flat_out = torch.as_tensor(flat_idx + r0 * int(out_w), dtype=torch.long, device=result_device)
+				out_map_t[flat_out, 0] = src_r.to(device=result_device, dtype=torch.float32)
+				out_map_t[flat_out, 1] = src_c.to(device=result_device, dtype=torch.float32)
+				out_xyz_t[flat_out] = sampled.to(device=result_device, dtype=torch.float32)
+				out_mask_t[flat_out] = True
 
 		# out_xyz_t is zero-initialized and written only at filled pixels, so it is
 		# already zero everywhere out_mask is False.

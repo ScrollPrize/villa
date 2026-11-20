@@ -143,9 +143,9 @@ For `flatten_solver: "forward"`:
    larger source-based canvas.
 3. Each valid source cell's fixed-diagonal UV triangles, `(p00,p10,p01)` and
    `(p10,p11,p01)`, are rasterized: only the output pixels inside a triangle's
-   bounding box are tested with barycentric coordinates. The cost scales with
-   the number of source cells, not with the output canvas, and no spatial
-   index is needed.
+   bounding box are tested with barycentric coordinates. The work scales with
+   the summed bounding-box areas, memory with the output canvas, and no
+   spatial index is needed.
 4. Where triangles overlap (folds), the smallest barycentric residual wins,
    then the nearest cell center, then the first triangle.
 5. Successful inversions barycentrically sample the same source mesh triangle.

@@ -259,6 +259,30 @@ class FlattenLossTest(unittest.TestCase):
 		self.assertTrue(torch.allclose(map_yx[1, :101, 1], expected, atol=1.0e-5))
 		self.assertTrue(torch.allclose(sampled[0, 1, :101, 0], expected, atol=1.0e-5))
 
+	def test_forward_inversion_keeps_pixels_rounded_onto_triangle_edge(self) -> None:
+		if fit_model.numpy_float_hi != np.float32:
+			self.skipTest("rounding case is specific to float32 output points")
+		# Output column 1 is at 32768.001953125, which rounds to the float32
+		# vertex 32768.0 that closes the last half-pixel cell.
+		uv = torch.stack(
+			[
+				torch.tensor([0.0, 0.5]).view(2, 1).expand(2, 3),
+				torch.tensor([32767.001953125, 32767.501953125, 32768.001953125]).view(1, 3).expand(2, 3),
+			],
+			dim=-1,
+		).contiguous()
+
+		_map_yx, _sampled, mask = fit_model.Model3D._flatten_invert_forward_uv_map(
+			_flat_grid(2, 3),
+			torch.ones(1, 2, dtype=torch.bool),
+			uv,
+			output_margin=0.0,
+			min_shape=(2, 2),
+		)
+
+		self.assertEqual(tuple(mask.shape), (2, 2))
+		self.assertTrue(bool(mask[0].all()))
+
 	def test_flatten_stage_defaults_disable_volume_losses(self) -> None:
 		stages = optimizer.load_stages_cfg({
 			"args": {"model-init": "flatten"},
