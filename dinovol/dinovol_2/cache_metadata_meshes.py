@@ -7,6 +7,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 from pathlib import Path
 import urllib.request
@@ -23,7 +24,12 @@ def ensure_metadata(metadata_path: Path, url: str = DEFAULT_METADATA_URL) -> Pat
     if not metadata_path.is_file():
         metadata_path.parent.mkdir(parents=True, exist_ok=True)
         print(f"Downloading {url} -> {metadata_path} ...")
-        urllib.request.urlretrieve(url, metadata_path)
+        with urllib.request.urlopen(url) as response:
+            data = response.read()
+        # The bucket sends metadata.json gzip-encoded; urllib does not decode it.
+        if data[:2] == b"\x1f\x8b":
+            data = gzip.decompress(data)
+        metadata_path.write_bytes(data)
     return metadata_path
 
 
