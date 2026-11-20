@@ -106,8 +106,41 @@ TEST_CASE("liftGridUVs is exact in grid space when border rows and columns are i
     }
     CHECK(inside > 150);
     CHECK(onSamples > 40);
-    // Vertices beyond the decimated quads (the last fine row/column here) still lift.
-    for (std::size_t i = 0; i < fine.cells.size(); ++i) CHECK(lifted.valid[i]);
+    // Vertices beyond the decimated quads (around the hole, and the last fine
+    // row/column here) continue the nearest quad's map instead of collapsing
+    // onto its nearest vertex: each keeps its own place in UV space.
+    for (std::size_t i = 0; i < fine.cells.size(); ++i) {
+        REQUIRE(lifted.valid[i]);
+        const cv::Vec2d expected = affine(double(fine.cells[i][0]) / stride, double(fine.cells[i][1]) / stride);
+        CHECK(std::abs(lifted.uvs[i][0] - expected[0]) < 1e-4);
+        CHECK(std::abs(lifted.uvs[i][1] - expected[1]) < 1e-4);
+    }
+}
+
+TEST_CASE("liftGridUVs leaves a vertex with no decimated quad within two cells invalid")
+{
+    // Columns 0..8 hold the only decimated quads (stride 4); column 24 is three
+    // decimated cells past the last of them.
+    auto points = sheet(9, 25);
+    for (int r = 0; r < points.rows; ++r)
+        for (int c = 9; c < 23; ++c) invalidate(points, r, c);
+
+    const int stride = 4;
+    const auto coarsePoints = decimateGrid(points, stride);
+    const auto coarse = meshGrid(coarsePoints);
+    std::vector<cv::Vec2d> coarseUVs;
+    for (const auto& cell : coarse.cells) coarseUVs.push_back(affine(cell[0], cell[1]));
+
+    const auto fine = meshGrid(points);
+    const auto lifted = liftGridUVs(fine, coarsePoints, coarse, coarseUVs, stride);
+    int near = 0, far = 0;
+    for (std::size_t i = 0; i < fine.cells.size(); ++i) {
+        const bool isFar = fine.cells[i][1] >= 23;
+        CHECK(bool(lifted.valid[i]) == !isFar);
+        ++(isFar ? far : near);
+    }
+    CHECK(near > 60);
+    CHECK(far > 10);
 }
 
 TEST_CASE("readUvObj reads vertices, UVs and the first three corners of each face")
