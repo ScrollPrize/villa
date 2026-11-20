@@ -6,7 +6,7 @@
 Every strip RUN/strips/BUCKET/fiber_UUID with at least --min-nodes kept nodes becomes the tifxyz
 PATCHES/<prefix>UUID holding every --stride-th row and column (strips come at about 4x5 patch-voxel quads, far finer
 than the fit needs), with ``expected_error.tif`` thinned beside it when the strip has one. Its trace.json is the
-strip's with ``patch`` (the source strip and the stride). A thinned strip with fewer than --min-strided-nodes nodes,
+strip's (which every strip must have) with ``patch`` (the source strip and the stride). A thinned strip with fewer than --min-strided-nodes nodes,
 or fewer than 2 rows or columns, is not written.
 
 The patches carry no weights. The fit weighs them by name and place: ``patch_sampling_name_weights`` (e.g.
@@ -38,7 +38,7 @@ def main(argv=None):
     strips = sorted(a.run.glob('strips/*/fiber_*'))
     if not strips:
         raise SystemExit(f'{a.run} has no strips')
-    surfaces, errors = [], []
+    surfaces, errors, traces = [], [], []
     for strip in strips:  # read everything before writing anything: a malformed strip stops the run
         try:
             surfaces.append(tifxyz.read(strip))
@@ -47,10 +47,14 @@ def main(argv=None):
         errors.append(images.read(strip/'expected_error.tif') if (strip/'expected_error.tif').is_file() else None)
         if errors[-1] is not None and errors[-1].shape != tuple(surfaces[-1].shape):
             raise SystemExit(f'{strip}: expected_error.tif is not on the strip grid')
+        try:
+            traces.append(json.loads((strip/'trace.json').read_text()))
+        except (OSError, ValueError) as error:
+            raise SystemExit(f'{strip} has no readable trace.json: {error}')
     a.patches.mkdir(parents=True)
     s = a.stride
     written = short = dropped = 0
-    for strip, surface, error in zip(strips, surfaces, errors):
+    for strip, surface, error, trace in zip(strips, surfaces, errors, traces):
         xyz, valid = np.asarray(surface.xyz), np.asarray(surface.valid)
         if int(valid.sum()) < a.min_nodes:
             short += 1
@@ -60,7 +64,6 @@ def main(argv=None):
             dropped += 1
             continue
         dest = a.patches/f'{a.prefix}{strip.name[len("fiber_"):]}'
-        trace = json.loads((strip/'trace.json').read_text()) if (strip/'trace.json').is_file() else {}
         write_surface(dest, xyz[::s, ::s], keep, s/surface.scale[0], s/surface.scale[1],
                       dict(trace, patch=dict(source_strip=str(strip), stride=s)),
                       voxel_size_um=surface.extra.get('voxel_size_um'))

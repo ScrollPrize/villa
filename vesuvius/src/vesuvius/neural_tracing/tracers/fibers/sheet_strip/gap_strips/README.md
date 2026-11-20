@@ -73,19 +73,16 @@ The patches carry no weights. The spiral fit weighs patches by name prefix and b
 ### Chains the tracer cannot start
 
 A chain's strip starts on the mirrored copy, which can lie outside the scanned material. Retry such chains without
-the leading copy and add their strips before the `patches` step:
+the leading copy, after the `split` step and before the `patches` step:
 
 ```bash
-PKG=vesuvius.neural_tracing.tracers.fibers.sheet_strip
-python -m $PKG.gap_strips.retry $OUT/chains.vcobj $OUT/retry.vcobj UUID1 UUID2 ...
-python -m $PKG.infer_all --fibers $OUT/retry.vcobj --out $OUT/strips_retry --ct $CT --ct-level 2 --ct-grid-scale 4 \
-    --base-voxel-um 2.4 --voxel-size-um 9.6 --umbilicus $UMBILICUS
-python -m $PKG.gap_strips.split $OUT/strips_retry $OUT/retry.vcobj $OUT/pieces.vcobj $OUT/strips_split_retry
-cp -r $OUT/strips_split_retry/strips/* $OUT/strips_split/strips/
+RETRY_IDS="UUID1 UUID2" sheet_strip/gap_strips/grow_strips.sh mirror retry
 ```
 
-`fit_patches.py` takes every strip folder under `strips/`, so the copied ones are staged with the rest; the index
-and report files of `strips_split` still list the first run only.
+This writes `$OUT/retry.vcobj` (`retry.py`), traces it with `--min-length-mm 0` (a chain without its leading copy
+can fall under the tracer's minimum length, and every named chain is wanted), splits the strips against it and copies
+the piece strips into `$OUT/strips_split/strips/`. `fit_patches.py` takes every strip folder under `strips/`, so the
+copied ones are staged with the rest; the index and report files of `strips_split` still list the first run only.
 
 ## Tests
 

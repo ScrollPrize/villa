@@ -2,6 +2,8 @@
 # grow_strips.sh MODE STEP : sheet strips of store fibers with gap/damaged spans, as patches for the spiral fit.
 #   MODE  pieces = one strip per valid piece;  mirror = join close pieces, mirror the ends, trace, cut back per piece
 #   STEP  fibers | trace | split | patches | all      (split does nothing in pieces mode; trace needs a GPU)
+#         retry (mirror mode, after split, before patches): trace the chains named in RETRY_IDS (UUIDs, space
+#         separated) again without their leading mirrored part, and add their piece strips to the split strips
 # Run it with the vesuvius environment active (or PY set to its python). Required environment:
 #   SOURCE     fiber store (.vcobj)                 UMBILICUS  umbilicus.json in patch voxels
 #   CT         the CT zarr (local path or URL)      OUT        output folder
@@ -12,9 +14,9 @@
 #   BATCH=8, THREADS=2, STRIDE=2, PREFIX=strip-net-.
 # Result: $OUT/patches. See README.md beside this file.
 set -euo pipefail
-MODE=${1:?pieces or mirror}; STEP=${2:?fibers, trace, split, patches or all}
+MODE=${1:?pieces or mirror}; STEP=${2:?fibers, trace, split, retry, patches or all}
 case $MODE in pieces|mirror) ;; *) echo "MODE must be pieces or mirror" >&2; exit 2;; esac
-case $STEP in fibers|trace|split|patches|all) ;; *) echo "STEP must be fibers, trace, split, patches or all" >&2; exit 2;; esac
+case $STEP in fibers|trace|split|retry|patches|all) ;; *) echo "STEP must be fibers, trace, split, retry, patches or all" >&2; exit 2;; esac
 : "${SOURCE:?}" "${CT:?}" "${UMBILICUS:?}" "${OUT:?}"
 PY=${PY:-python}; PKG=vesuvius.neural_tracing.tracers.fibers.sheet_strip; LEVEL_SCALE=${LEVEL_SCALE:-4}
 BASE_VOXEL_UM=${BASE_VOXEL_UM:-2.4}; PATCH_VOXEL_UM=$(awk "BEGIN { print $BASE_VOXEL_UM * $LEVEL_SCALE }")
@@ -30,13 +32,26 @@ if run fibers; then
 fi
 TRACED=$OUT/pieces.vcobj; STRIPS=$OUT/strips_traced
 if [ "$MODE" = mirror ]; then TRACED=$OUT/chains.vcobj; STRIPS=$OUT/strips_split; fi
-if run trace; then
-  "$PY" -m $PKG.infer_all --fibers "$TRACED" --out "$OUT/strips_traced" --ct "$CT" --ct-level "${CT_LEVEL:-2}" \
-    --ct-grid-scale "$LEVEL_SCALE" --base-voxel-um "$BASE_VOXEL_UM" --voxel-size-um "$PATCH_VOXEL_UM" --umbilicus "$UMBILICUS" --batch "${BATCH:-8}" --threads "${THREADS:-2}" \
-    ${CHECKPOINT:+--checkpoint "$CHECKPOINT"}
-fi
+trace() {  # trace FIBERS OUT [infer_all options]
+  local fibers=$1 out=$2; shift 2
+  "$PY" -m $PKG.infer_all --fibers "$fibers" --out "$out" --ct "$CT" --ct-level "${CT_LEVEL:-2}" \
+    --ct-grid-scale "$LEVEL_SCALE" --base-voxel-um "$BASE_VOXEL_UM" --voxel-size-um "$PATCH_VOXEL_UM" \
+    --umbilicus "$UMBILICUS" --batch "${BATCH:-8}" --threads "${THREADS:-2}" \
+    ${CHECKPOINT:+--checkpoint "$CHECKPOINT"} "$@"
+}
+if run trace; then trace "$TRACED" "$OUT/strips_traced"; fi
 if run split && [ "$MODE" = mirror ]; then
   "$PY" -m $PKG.gap_strips.split "$OUT/strips_traced" "$OUT/chains.vcobj" "$OUT/pieces.vcobj" "$STRIPS"
+fi
+if [ "$STEP" = retry ]; then
+  [ "$MODE" = mirror ] || { echo "retry is a mirror mode step" >&2; exit 2; }
+  : "${RETRY_IDS:?chain UUIDs to retry}"
+  # shellcheck disable=SC2086
+  "$PY" -m $PKG.gap_strips.retry "$OUT/chains.vcobj" "$OUT/retry.vcobj" $RETRY_IDS
+  trace "$OUT/retry.vcobj" "$OUT/strips_retry" --min-length-mm 0  # every named chain, however short it now is
+  "$PY" -m $PKG.gap_strips.split "$OUT/strips_retry" "$OUT/retry.vcobj" "$OUT/pieces.vcobj" "$OUT/strips_split_retry"
+  mkdir -p "$STRIPS/strips"
+  cp -R "$OUT/strips_split_retry/strips/." "$STRIPS/strips/"
 fi
 if run patches; then
   "$PY" -m $PKG.gap_strips.fit_patches "$STRIPS" "$OUT/patches" --prefix "${PREFIX:-strip-net-}" --stride "${STRIDE:-2}"
