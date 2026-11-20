@@ -27,11 +27,11 @@ def align_zarrs(zarr1_path: str, zarr2_path: str, M_init_ng: np.ndarray) -> np.n
     fixed_zarr = zarr.open(zarr1_path, mode="r")
     moving_zarr = zarr.open(zarr2_path, mode="r")
 
-    fixed_level = int(list(fixed_zarr.array_keys())[-2])
-    moving_level = int(list(moving_zarr.array_keys())[-2])
+    fixed_level = sorted(map(int, fixed_zarr.array_keys()))[-2]
+    moving_level = sorted(map(int, moving_zarr.array_keys()))[-2]
 
-    fixed_image = fixed_zarr[fixed_level]
-    moving_image = moving_zarr[moving_level]
+    fixed_image = fixed_zarr[str(fixed_level)]
+    moving_image = moving_zarr[str(moving_level)]
 
     fixed_scale_factor = 2**fixed_level
     moving_scale_factor = 2**moving_level
