@@ -302,6 +302,17 @@ std::vector<ScaffoldEvent> scaffoldEvents(const ScaffoldGraph& graph, const Scaf
             }
         }
     }
+    // A gap span is a bridge, not fiber: no crossing on it, or closer to it
+    // than a crossing needs fiber on both sides, is evidence. Applied after
+    // the cache, which keeps what the geometry alone yields.
+    std::erase_if(events, [&](const ScaffoldEvent& event) {
+        const double support = event.parallel ? kScaffoldParallelSupport : kScaffoldPerpendicularSupport;
+        if (!geometry.nearGap(std::size_t(event.a), event.arcA, support) &&
+            !geometry.nearGap(std::size_t(event.b), event.arcB, support))
+            return false;
+        ++report.rejectedGap;
+        return true;
+    });
     report.events = std::int64_t(events.size());
     report.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
     return events;

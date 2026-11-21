@@ -88,6 +88,9 @@ struct ScaffoldEventReport {
     std::int64_t events = 0, perpendicular = 0, parallel = 0;
     std::int64_t withoutNormals = 0, withDistance = 0;
     std::int64_t rejectedTangents = 0, rejectedWinding = 0, rejectedWindingCutoff = 0;
+    // Crossings dropped because one of their two points lies on a gap span
+    // or too close to one to be certified.
+    std::int64_t rejectedGap = 0;
     double seconds = 0;
 };
 

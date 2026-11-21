@@ -110,6 +110,10 @@ struct ScaffoldLinkReport {
     // refined points lie farther apart than the limit, or another
     // consistency check of the extraction.
     std::int64_t skippedAngle = 0, skippedEndSupport = 0, skippedDistance = 0, skippedConsistency = 0;
+    // Links with an anchor on a tail (past the fiber's first or last control
+    // point), and links whose anchor or refined point lies on a gap span or
+    // too close to one: neither is fiber, so the link asserts nothing.
+    std::int64_t skippedTail = 0, skippedGap = 0;
     // The largest arc distance a refinement moved an anchor, in voxels.
     double maxRefinementShift = 0;
     // Measured relations dropped because a refined link states the same

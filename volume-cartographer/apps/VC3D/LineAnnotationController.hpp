@@ -400,10 +400,14 @@ public:
     // for menus that offer pieces; empty when the fiber is not stored.
     struct StoredControlSummary { size_t index = 0; int64_t storeId = -1; bool lock = false; };
     [[nodiscard]] std::vector<StoredControlSummary> storedControlSummaries(uint64_t fiberId) const;
-    // The stored fiber's line index nearest an arc position, measured as the
-    // cumulative chord length of its line points - the measure every scaffold
-    // anchor arc is stated in. Nullopt when the fiber or its line is missing.
-    [[nodiscard]] std::optional<int> storedLineIndexAtArc(uint64_t fiberId, double arc) const;
+    // The stored fiber's line index nearest an arc position on its annotated
+    // line (first to last control point; a tail is never named), the measure
+    // every scaffold anchor arc is stated in. `frameLength` is the fiber's
+    // annotated length in the frame the arc is stated in, when that is not the
+    // open volume's (a solve's frame): the arc is scaled by the ratio. Nullopt
+    // when the fiber or its line is missing, or the arc lies past the last
+    // control point - never clamped onto one.
+    [[nodiscard]] std::optional<int> storedLineIndexAtArc(uint64_t fiberId, double arc, double frameLength = 0.0) const;
     // Stored fibers open read-only unless the user's Open fibers editable
     // setting is on. Enables editing in the most recent pane of this fiber
     // (as its Enable editing button does); false when it cannot.

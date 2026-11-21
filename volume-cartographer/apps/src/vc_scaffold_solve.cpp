@@ -231,6 +231,8 @@ Json linkReportJson(const ScaffoldLinkReport& report)
                 {"rejected_end_support", report.skippedEndSupport},
                 {"rejected_distance", report.skippedDistance},
                 {"rejected_consistency", report.skippedConsistency},
+                {"rejected_tail", report.skippedTail},
+                {"rejected_gap", report.skippedGap},
                 {"max_refinement_shift_vx", report.maxRefinementShift},
                 {"links_with_crossing", report.linksWithCrossing},
                 {"crossings_replaced", report.deduplicatedCrossings}};
@@ -521,6 +523,7 @@ int run(const std::string& configPath)
                                  {"without_normals", eventReport.withoutNormals},
                                  {"with_winding_distance", eventReport.withDistance},
                                  {"rejected_tangents", eventReport.rejectedTangents},
+                                 {"rejected_gap", eventReport.rejectedGap},
                                  {"rejected_winding", eventReport.rejectedWinding},
                                  {"rejected_winding_cutoff", eventReport.rejectedWindingCutoff},
                                  {"seconds", eventReport.seconds}};

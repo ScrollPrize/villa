@@ -359,6 +359,15 @@ std::vector<ScaffoldConstraint> scaffoldLinkConstraints(const ScaffoldGraph& gra
         if (!link.anchorA || !link.anchorB) { ++report.skippedMissingAnchor; continue; }
         const auto projectedA = geometry.project(std::size_t(link.a), *link.anchorA);
         const auto projectedB = geometry.project(std::size_t(link.b), *link.anchorB);
+        const auto drop = [&]() { if (link.adjacent) --report.adjacent; else --report.ordinary; };
+        // An anchor past the first or last control point is on a tail: the
+        // solve reads the annotated line only, so such an anchor projects onto
+        // the line's end from outside it. A tail is not fiber.
+        const auto onTail = [&](std::int64_t fiber, const ScaffoldGeometry::Projection& projected) {
+            const double length = geometry.arcLength(std::size_t(fiber));
+            return projected.distance > 0.5 && (projected.arc <= 1e-9 || projected.arc >= length - 1e-9);
+        };
+        if (onTail(link.a, projectedA) || onTail(link.b, projectedB)) { ++report.skippedTail; drop(); continue; }
         report.maxAnchorDistance = std::max({report.maxAnchorDistance, projectedA.distance, projectedB.distance});
         // A frame error is reported by the guard below, not as a rejection.
         if (std::max(projectedA.distance, projectedB.distance) > options.maxAnchorDistance) continue;
@@ -384,6 +393,18 @@ std::vector<ScaffoldConstraint> scaffoldLinkConstraints(const ScaffoldGraph& gra
             ++report.skippedAngle;
             if (link.adjacent) --report.adjacent; else --report.ordinary;
             continue;
+        }
+        // Neither the stated anchors nor the refined encounter may lie on a
+        // gap span, or closer to one than the encounter needs fiber.
+        {
+            const double support = refined.parallel ? kScaffoldParallelSupport : kScaffoldPerpendicularSupport;
+            const auto a = std::size_t(link.a), b = std::size_t(link.b);
+            if (geometry.nearGap(a, projectedA.arc, 0.) || geometry.nearGap(b, projectedB.arc, 0.) ||
+                geometry.nearGap(a, refined.arcA, support) || geometry.nearGap(b, refined.arcB, support)) {
+                ++report.skippedGap;
+                drop();
+                continue;
+            }
         }
         report.maxRefinementShift = std::max({report.maxRefinementShift, std::abs(refined.arcA - projectedA.arc),
                                               std::abs(refined.arcB - projectedB.arc)});

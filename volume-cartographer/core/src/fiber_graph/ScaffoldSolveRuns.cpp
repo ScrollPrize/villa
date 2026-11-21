@@ -220,6 +220,9 @@ ScaffoldRunRows scaffoldSolveRunRows(const ScaffoldGraph& graph, const ScaffoldS
     count("links_rejected_end_support", result.linkReport.skippedEndSupport, "links");
     count("links_rejected_distance", result.linkReport.skippedDistance, "links");
     count("links_rejected_consistency", result.linkReport.skippedConsistency, "links");
+    count("links_rejected_tail", result.linkReport.skippedTail, "links");
+    count("links_rejected_gap", result.linkReport.skippedGap, "links");
+    if (stages.events) count("crossings_rejected_gap", stages.events->rejectedGap, "crossings");
     count("links_with_crossing", result.linkReport.linksWithCrossing, "links");
     count("crossings_replaced_by_links", result.linkReport.deduplicatedCrossings, "crossings");
     metric("link_refinement_max_shift", result.linkReport.maxRefinementShift, "voxels");

@@ -4543,8 +4543,21 @@ void FiberMapWorkspace::openScaffoldPiece(const std::string& fiberUuid, std::int
     // placed there (inserted if the fiber carries none), so the piece is the
     // accused stretch and not the wider span its controls bracket.
     if (std::isfinite(arcFrom) && std::isfinite(arcTo) && arcTo > arcFrom) {
-        const auto first = _controller->storedLineIndexAtArc(fiberId, arcFrom);
-        const auto last = _controller->storedLineIndexAtArc(fiberId, arcTo);
+        // The solve's arcs are in its own frame: the fiber's annotated length
+        // there (its last control's arc) brings them into the open volume's.
+        double runLength = 0.0;
+        if (_solveController) {
+            if (!_solveController->approvalsLoaded()) _solveController->loadApprovals();
+            const auto spans = _solveController->approvals().find(fiberUuid);
+            if (spans != _solveController->approvals().end() && !spans->second.controlArcs.empty())
+                runLength = spans->second.controlArcs.back();
+        }
+        const auto first = _controller->storedLineIndexAtArc(fiberId, arcFrom, runLength);
+        const auto last = _controller->storedLineIndexAtArc(fiberId, arcTo, runLength);
+        if (!first || !last) {
+            setOperationStatus(tr("That stretch reaches past the fiber's control points; solve again"));
+            return;
+        }
         if (first && last && *last > *first) {
             plan.a = vc3d::line_annotation::PiecePlanEnd{};
             plan.b = vc3d::line_annotation::PiecePlanEnd{};

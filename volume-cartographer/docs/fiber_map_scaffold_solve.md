@@ -72,6 +72,18 @@ and it has to pass the extraction's acceptance rules. This is not optional:
 - the two refined points may lie at most `links.refine_maximum_distance`
   (default 512 voxels) apart.
 
+A link with an anchor on a tail - past its fiber's first or last control
+point - asserts nothing either (`links_rejected_tail`): a tail is not fiber,
+whoever placed the link there.
+
+**Gap spans** are treated like tails. A span between two control points tagged
+`break` (the span's `gap` tag) bridges damaged papyrus; it is not fiber. No
+crossing on a gap span, or closer to one than a crossing needs fiber on both
+sides (32 voxels for a perpendicular, 80 for a parallel one - the extraction's
+own end rule), is kept (`crossings_rejected_gap`), and a link whose anchor or
+refined point lies there asserts nothing (`links_rejected_gap`). A gap at a
+fiber's end is simply part of what is ignored.
+
 A link that fails asserts nothing. The run counts them by rule
 (`links_rejected_angle`, `links_rejected_end_support`,
 `links_rejected_distance`, `links_rejected_consistency`) and records the

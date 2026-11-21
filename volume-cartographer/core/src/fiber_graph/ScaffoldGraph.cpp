@@ -292,6 +292,39 @@ ScaffoldGeometry::ScaffoldGeometry(const ScaffoldGraph& graph, std::size_t worke
     , packed_(graph.offsets, columns_.arc.data(), columns_.arc.size(), 1, graph.linePoints, columns_.turns,
           geometry::WindingSeam(graph.umbilicus, graph.seamAngle, graph.handedness))
 {
+    // Gap spans, from the control annotations: the span's own `gap` tag, or
+    // both of its controls tagged `break` (which is what the tag records).
+    const auto tagged = [](const nlohmann::json& tags, const char* tag) {
+        if (!tags.is_array()) return false;
+        for (const auto& entry : tags)
+            if (entry.is_string() && entry.get<std::string>() == tag) return true;
+        return false;
+    };
+    gaps_.resize(graph.fibers.size());
+    for (std::size_t fiber = 0; fiber < graph.fibers.size(); ++fiber) {
+        const auto& annotations = graph.fibers[fiber].content.annotations;
+        const auto controls = graph.fibers[fiber].content.controlIds.size();
+        for (std::size_t control = 0; control + 1 < controls && control + 1 < annotations.size(); ++control) {
+            const auto& here = annotations[control];
+            const auto& next = annotations[control + 1];
+            if (!here.is_object() || !next.is_object()) continue;
+            const auto span = here.find("segment_to_next");
+            const bool gapTag = span != here.end() && span->is_object() && span->contains("tags") &&
+                                tagged((*span)["tags"], "gap");
+            const bool breaks = here.contains("tags") && next.contains("tags") && tagged(here["tags"], "break") &&
+                                tagged(next["tags"], "break");
+            if (!gapTag && !breaks) continue;
+            const double from = controlArc(fiber, control), to = controlArc(fiber, control + 1);
+            gaps_[fiber].emplace_back(std::min(from, to), std::max(from, to));
+        }
+    }
+}
+
+bool ScaffoldGeometry::nearGap(std::size_t fiber, double arc, double margin) const
+{
+    for (const auto& [from, to] : gaps_.at(fiber))
+        if (arc >= from - margin && arc <= to + margin) return true;
+    return false;
 }
 
 ScaffoldGeometry::Projection ScaffoldGeometry::project(std::size_t fiber, const geometry::Point& point) const

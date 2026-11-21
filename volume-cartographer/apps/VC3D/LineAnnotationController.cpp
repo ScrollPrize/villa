@@ -9843,13 +9843,27 @@ std::vector<LineAnnotationController::StoredControlSummary> LineAnnotationContro
     return result;
 }
 
-std::optional<int> LineAnnotationController::storedLineIndexAtArc(uint64_t fiberId, double arc) const
+std::optional<int> LineAnnotationController::storedLineIndexAtArc(uint64_t fiberId, double arc,
+                                                                 double frameLength) const
 {
     if (!std::isfinite(arc) || arc < 0.0) return std::nullopt;
     const auto stored = readStoredFiber(fiberId, true);
     if (!stored || stored->linePoints.size() < 2) return std::nullopt;
+    // Arcs are measured on the annotated line, from the first control point:
+    // a tail is not fiber and no arc ever names a point of one.
+    const auto range = vc3d::fiber_line::annotatedLineRange(
+        stored->linePoints, vc3d::line_annotation::storedControlPointPositions(stored->controlPoints));
+    if (range.end <= range.begin + 1) return std::nullopt;
+    // An arc stated in another frame (a solve's) is brought into this one by
+    // the ratio of the fiber's annotated length in the two.
+    if (frameLength > 0.0) {
+        double own = 0.0;
+        for (size_t i = range.begin + 1; i < range.end; ++i)
+            own += cv::norm(stored->linePoints[i] - stored->linePoints[i - 1]);
+        arc *= own / frameLength;
+    }
     double walked = 0.0;
-    for (size_t i = 1; i < stored->linePoints.size(); ++i) {
+    for (size_t i = range.begin + 1; i < range.end; ++i) {
         const double step = cv::norm(stored->linePoints[i] - stored->linePoints[i - 1]);
         if (walked + step >= arc) {
             // The nearer of the two line points bounding the arc.
@@ -9857,7 +9871,9 @@ std::optional<int> LineAnnotationController::storedLineIndexAtArc(uint64_t fiber
         }
         walked += step;
     }
-    return int(stored->linePoints.size() - 1);
+    // Past the last control point (beyond rounding): refused, never clamped.
+    if (arc <= walked + 1e-6 * std::max(1.0, walked)) return int(range.end - 1);
+    return std::nullopt;
 }
 
 std::optional<QString> LineAnnotationController::setFiberControlLock(uint64_t fiberId, size_t controlPointIndex, bool enabled)

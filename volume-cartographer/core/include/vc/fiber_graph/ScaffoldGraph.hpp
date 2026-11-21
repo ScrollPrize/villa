@@ -24,6 +24,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace vc::fiber_graph {
@@ -163,6 +164,14 @@ public:
     // The fiber's own index of the line point nearest an arc position.
     std::int64_t lineIndexAt(std::size_t fiber, double arc) const;
     double arcLength(std::size_t fiber) const { return packed_.arcLength(std::int64_t(fiber)); }
+    // The fiber's gap spans as arc ranges: a span whose two controls are
+    // tagged `break` (the span's own `gap` tag). A gap is a bridge across
+    // damaged papyrus, not fiber - like a tail it carries no constraint.
+    std::span<const std::pair<double, double>> gaps(std::size_t fiber) const { return gaps_.at(fiber); }
+    // Whether an encounter at `arc` is on a gap, or closer than `margin` to
+    // one: an encounter needs fiber on both sides to be certified, exactly as
+    // at a fiber's end.
+    bool nearGap(std::size_t fiber, double arc, double margin) const;
     std::span<const double> arcs() const { return columns_.arc; }
     std::span<const std::int64_t> turns() const { return columns_.turns; }
 
@@ -170,6 +179,12 @@ private:
     const ScaffoldGraph* graph_;
     geometry::PackedWindingColumns columns_;
     geometry::PackedFiberGeometry packed_;
+    std::vector<std::vector<std::pair<double, double>>> gaps_;
 };
+
+// The fiber an encounter of this kind needs on each side of it, in voxels:
+// what the crossing extraction's endpoint certification asks for (a tangent
+// window beyond its probes). The same distance is kept from a gap.
+inline constexpr double kScaffoldPerpendicularSupport = 32.0, kScaffoldParallelSupport = 80.0;
 
 } // namespace vc::fiber_graph

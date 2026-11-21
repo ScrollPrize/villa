@@ -429,6 +429,38 @@ TEST_CASE("a link the refinement rejects asserts nothing")
     CHECK(report.skippedDistance == 1);
 }
 
+TEST_CASE("a link on a tail or on a gap span asserts nothing")
+{
+    Builder builder;
+    const auto h = builder.fiber(ScaffoldFamily::Horizontal, 100.);
+    const auto v = builder.fiber(ScaffoldFamily::Vertical, 110.);
+    const auto other = builder.fiber(ScaffoldFamily::Horizontal, 120.);
+    // The V fiber's anchor 95 voxels past its last control point: on a tail.
+    // It is ignored, not reported as a frame error.
+    builder.link(h, v, false, "approved", 5., 300.);
+    // The second half of `other` is a gap span: its last two controls are
+    // tagged break. A link there, and one too close to it, assert nothing.
+    auto& annotations = builder.graph.fibers[other].content.annotations;
+    annotations[1] = {{"tags", {"break"}}, {"segment_to_next", {{"tags", {"gap"}}}}};
+    annotations[2] = {{"tags", {"break"}}};
+    builder.link(h, other, false, "approved", 60., 60.);  // arc 255, inside the gap
+    builder.link(h, other, false, "approved", -30., -30.); // arc 165, 35 voxels before it
+    builder.link(h, other, false, "approved", -90., -90.); // arc 105, clear of it
+    const ScaffoldGeometry geometry(builder.graph);
+    REQUIRE(geometry.gaps(other).size() == 1);
+    CHECK(geometry.gaps(other).front().first == doctest::Approx(200.));
+    CHECK(geometry.gaps(other).front().second == doctest::Approx(400.));
+    CHECK(geometry.nearGap(other, 165., kScaffoldParallelSupport));
+    CHECK_FALSE(geometry.nearGap(other, 105., kScaffoldParallelSupport));
+    ScaffoldLinkReport report;
+    const auto constraints = scaffoldLinkConstraints(builder.graph, geometry, ScaffoldLinkArcOptions{}, report);
+    CHECK(report.skippedTail == 1);
+    CHECK(report.skippedGap == 2);
+    REQUIRE(constraints.size() == 1);
+    CHECK(constraints.front().arcB == doctest::Approx(105.));
+    CHECK(report.used == 1);
+}
+
 TEST_CASE("links switched off solve on the measured constraints alone")
 {
     Builder builder;
