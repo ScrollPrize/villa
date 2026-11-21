@@ -142,6 +142,7 @@ std::filesystem::path selectedVc3dCacheRoot();
 // storing chunks as Delta3D when asked. An existing directory keeps its format.
 void createVc3dVolumeDir(const std::filesystem::path& volumeDir, bool delta3d);
 // cache_dir/<scheme>/<host or bucket>/<path>; public buckets are keyed by their s3:// form.
+// On Windows ':' is written %3A (host%3Aport), as file names cannot hold it.
 std::filesystem::path decodedCachePath(const std::filesystem::path& cacheDir, const std::string& url);
 // One SQLite eviction index per directory and process, shared by writers. No maxBytes keeps
 // the limit stored in the directory, unlimited for a new one; a value replaces it.

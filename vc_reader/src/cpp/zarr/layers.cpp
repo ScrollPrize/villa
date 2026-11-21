@@ -469,6 +469,12 @@ fs::path decodedCachePath(const fs::path& cacheDir, const std::string& input)
     const auto query = rest.find_first_of("?#");
     if (query != std::string::npos)
         rest.erase(query);
+#ifdef _WIN32
+    // A Windows file name cannot hold ':' ("h:80" would even name drive h:), so it is
+    // written percent-encoded, %3A.
+    for (auto colon = rest.find(':'); colon != std::string::npos; colon = rest.find(':', colon + 3))
+        rest.replace(colon, 1, "%3A");
+#endif
     const auto slash = rest.find('/');
     auto out = cacheDir / url.substr(0, scheme) / rest.substr(0, slash);
     if (slash != std::string::npos)
