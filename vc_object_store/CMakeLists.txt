@@ -16,7 +16,32 @@ option(VC_OBJECT_STORE_BUILD_TESTS "Build object-store C++ regression tests" ${P
 option(VC_OBJECT_STORE_BUILD_BENCHMARKS "Build prepared-input storage diagnostics" OFF)
 option(VC_OBJECT_STORE_SHARED "Build the runtime libraries as shared libraries" OFF)
 option(VC_OBJECT_STORE_BUILD_SERVER "Build vc_object_server (Boost.Beast/Asio)" ON)
+if(APPLE AND NOT DEFINED SQLite3_LIBRARY AND NOT DEFINED SQLite3_ROOT)
+    # The system SQLite (/usr/lib/libsqlite3.dylib) cannot open a store
+    # read-only once its -wal and -shm files are gone: a sealed store (the
+    # spiral fit's track-crossing cache) or a copied .vcobj fails with
+    # "unable to open database file". Prefer Homebrew's keg-only sqlite, as
+    # volume-cartographer/scripts/build_macos.sh does for VC3D.
+    find_program(VC_OBJECT_STORE_BREW brew)
+    if(VC_OBJECT_STORE_BREW)
+        execute_process(
+            COMMAND "${VC_OBJECT_STORE_BREW}" --prefix sqlite
+            OUTPUT_VARIABLE vc_object_store_sqlite_prefix
+            OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET
+            RESULT_VARIABLE vc_object_store_brew_result)
+        if(vc_object_store_brew_result EQUAL 0
+                AND EXISTS "${vc_object_store_sqlite_prefix}/include/sqlite3.h")
+            list(PREPEND CMAKE_PREFIX_PATH "${vc_object_store_sqlite_prefix}")
+        endif()
+    endif()
+endif()
 find_package(SQLite3 3.37 REQUIRED)
+if(APPLE AND SQLite3_LIBRARIES MATCHES "^/usr/lib/|/SDKs/")
+    message(WARNING
+        "vc_object_store links the system SQLite (${SQLite3_LIBRARIES}), which "
+        "cannot open sealed or copied stores read-only; install Homebrew's "
+        "(brew install sqlite) and reconfigure.")
+endif()
 find_package(OpenSSL REQUIRED COMPONENTS Crypto)
 find_package(nlohmann_json CONFIG REQUIRED)
 find_package(PkgConfig REQUIRED)
