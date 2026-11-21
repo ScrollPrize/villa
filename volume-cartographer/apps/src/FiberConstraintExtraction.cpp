@@ -8,6 +8,7 @@
 #include <vc_object_store/geometry/ArrayBytes.hpp>
 #include "FiberConstraintDatabase.hpp"
 #include "FiberConstraintChunks.hpp"
+#include "FiberCrossingAxes.hpp"
 #include "FiberConstraintParallelism.hpp"
 #include "FiberNormalSamplingBenchmark.hpp"
 #include "FiberConstraintSources.hpp"
@@ -57,6 +58,8 @@ vc::fiber_tracer::FiberTraceConstraintConfig extractionOptions(
     options.localEvents=true;options.localKeepWholeFibers=true;options.parallelThreads=threads;
     options.candidateBatchSize=cfg.value("candidate_batch_size",options.candidateBatchSize);
     options.scoringRegionBaseVoxels=cfg.value("scoring_region_base_voxels",options.scoringRegionBaseVoxels);
+    options.maximumDistanceBaseVoxels=cfg.value("maximum_distance_base_voxels",options.maximumDistanceBaseVoxels);
+    if(!(options.maximumDistanceBaseVoxels>0.))throw std::invalid_argument("maximum_distance_base_voxels must be positive");
     options.crossQueryPrefix=crossQueryPrefix;
     if(crossQueryPrefix>=lineCount&&crossQueryPrefix)throw std::invalid_argument("Cross query prefix must leave reference lines");
     options.certifyWinding=cfg.value("certify_winding",false);
@@ -69,6 +72,7 @@ vc::fiber_tracer::FiberTraceConstraintConfig extractionOptions(
     options.localMovingProjectionWindows=cfg.value("moving_projection_windows",true);
     options.localPerpendicularProjectionIterations=cfg.value("perpendicular_iterations",16u);
     options.pairOwnedGeometry=cfg.value("pair_owned_geometry",false);
+    options.localMinimumSeeds=cfg.value("local_minimum_seeds",false);
     return options;
 }
 
@@ -335,6 +339,25 @@ int runFiberConstraintExtraction(int argc, char** argv)
     progress({"load",lines.size(),ids.size()});
     const double loadSeconds=seconds(loadStart);
     auto options=extractionOptions(cfg,threads,crossQueryPrefix,lines.size());
+    if(cfg.contains("crossing_axes_output")) {
+        // Crossing-axis extraction: the geometry of every perpendicular crossing
+        // of a crossing search store (crossing_search_store) against the loaded
+        // fibers, written once for later normal solves (crossing_axes).
+        const auto axesStarted=Clock::now();
+        std::vector<std::vector<cv::Vec3d>> polylines(lines.size());
+        for(size_t i=0;i<lines.size();++i)polylines[i]=lines[i].pointsBaseXYZ;
+        const auto axesPath=std::filesystem::path(cfg.at("crossing_axes_output").get<std::string>());
+        std::filesystem::create_directories(axesPath.parent_path());
+        writeFiberCrossingAxes(axesPath,cfg.at("crossing_search_store").get<std::string>(),ids,polylines,size_t(threads));
+        Json result={{"config",cfg},{"crossing_axes_output",axesPath.string()},{"selected_fibers",lines.size()},
+            {"query_seconds",querySeconds},{"load_seconds",loadSeconds},{"axes_seconds",seconds(axesStarted)},
+            {"wall_seconds",seconds(started)},{"resources",processResources()}};
+        const auto output=std::filesystem::path(cfg.at("output").get<std::string>());
+        std::filesystem::create_directories(output.parent_path());
+        vcr::zarr::atomicWrite(output,result.dump(2)+"\n");
+        std::cout<<"crossing axes "<<result.dump()<<std::endl;
+        return 0;
+    }
     if(cfg.value("geometry_only",false)) {
         // Use the EXACT production source catalogue, UUID ordering, transforms,
         // geometry loading and options above. No alternative fixture loader.

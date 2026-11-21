@@ -286,7 +286,7 @@ FiberStripNormalResult solveChain(
             // keeps that normal smooth through a noisy axis, so every target
             // gets the sign of a normal that never turned over. The full solve
             // below then refines all nodes together from there.
-            std::vector<cv::Vec3d> oriented(n, cv::Vec3d(0, 0, 0));
+            std::vector<cv::Vec3d> oriented(n, cv::Vec3d(0, 0, 0)), orientedCrossing(n, cv::Vec3d(0, 0, 0));
             std::vector<char> has(n, 0);
             {
                 constexpr int kSteps = 720;  // half-degree candidates, then a parabolic refinement
@@ -340,6 +340,14 @@ FiberStripNormalResult solveChain(
                         au = a.dot(u[i]); av = a.dot(v[i]);
                         axisWeight = options.axisWeight * target.weight;
                     }
+                    cv::Vec3d x = unit(target.crossing);
+                    const bool crossed = !target.fixed && target.crossingWeight > 0.0 && cv::norm(x) > 0.0;
+                    double xu = 0.0, xv = 0.0;
+                    if (crossed) {
+                        const cv::Vec3d previous = u[i] * std::cos(before) + v[i] * std::sin(before);
+                        if (previous.dot(x) < 0.0) x = -x;
+                        xu = x.dot(u[i]); xv = x.dot(v[i]);
+                    }
                     const bool interior = i + 1 < n;
                     const double cb = std::cos(before), sb = std::sin(before);
                     const auto cost = [&](double c, double sn, double delta) {
@@ -347,6 +355,7 @@ FiberStripNormalResult solveChain(
                         double value = twistWeight * delta * delta;
                         if (interior) { const double l = -sn * du[i] + c * dv[i]; value += lateralWeight * l * l; }
                         if (pulled) value += axisWeight * ((c - au) * (c - au) + (sn - av) * (sn - av));
+                        if (crossed) value += target.crossingWeight * ((c - xu) * (c - xu) + (sn - xv) * (sn - xv));
                         return value;
                     };
                     int best = 0; double bestCost = std::numeric_limits<double>::infinity();
@@ -384,8 +393,22 @@ FiberStripNormalResult solveChain(
                         oriented[i] = normal.dot(a) < 0.0 ? -a : a;
                         has[i] = 1;
                     }
+                    const cv::Vec3d x = unit(target.crossing);
+                    if (!target.fixed && target.crossingWeight > 0.0 && cv::norm(x) > 0.0) {
+                        const cv::Vec3d normal = u[i] * std::cos(stepped[i]) + v[i] * std::sin(stepped[i]);
+                        orientedCrossing[i] = normal.dot(x) < 0.0 ? -x : x;
+                    }
                     theta[i] = stepped[i];
                 }
+            }
+            for (size_t i = 0; i < n; ++i) {
+                const auto& target = (*targets)[i];
+                const cv::Vec3d& x = orientedCrossing[i];
+                if (cv::norm(x) == 0.0) continue;
+                problem.AddResidualBlock(
+                    new ceres::AutoDiffCostFunction<AxisResidual, 3, 1>(
+                        new AxisResidual{std::sqrt(target.crossingWeight), x.dot(u[i]), x.dot(v[i]), x.dot(tangent[i])}),
+                    nullptr, &theta[i]);
             }
             for (size_t i = 0; i < n; ++i) {
                 const auto& target = (*targets)[i];

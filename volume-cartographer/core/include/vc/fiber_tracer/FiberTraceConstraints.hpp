@@ -84,6 +84,11 @@ struct FiberTraceConstraintConfig {
     bool localOnePerPair = false;
     bool localReplicateOverlap = false;
     bool localIncludeParallel = true;
+    // Seed only from the samples of each partner piece that are local distance
+    // minima along it (per query sample). Keeps the perpendicular encounters
+    // (crossing searches) at a fraction of the candidates; parallel events are
+    // seeded per sample pair and are thinned, so ordinary extraction keeps false.
+    bool localMinimumSeeds = false;
     // Whole input prefix queried only against the suffix. Zero disables this
     // native bipartite mode; unlike arbitrary callbacks it stays parallel.
     std::size_t crossQueryPrefix = 0;

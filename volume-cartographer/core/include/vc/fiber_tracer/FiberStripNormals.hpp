@@ -72,6 +72,11 @@ struct FiberStripAxisTarget {
     cv::Vec3d axis{0.0, 0.0, 0.0};
     double weight = 0.0;
     bool fixed = false;
+    // A second sign-free axis from the geometry of crossing fibers (own tangent x
+    // crossing tangent), oriented and pulled exactly like the free axis; its
+    // weight is absolute (not scaled by axisWeight). Ignored on fixed nodes.
+    cv::Vec3d crossing{0.0, 0.0, 0.0};
+    double crossingWeight = 0.0;
 };
 
 struct FiberStripNormalResult {

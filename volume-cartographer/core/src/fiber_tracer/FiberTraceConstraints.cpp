@@ -1838,8 +1838,10 @@ FiberTraceConstraintReport extractFiberTraceConstraints(
     const int queryWorkers=static_cast<int>(std::min<std::size_t>(
         config.localEvents && parallelFilter ? requestedThreads : 1,
         std::max<std::size_t>(1,samples.size())));
+    struct SeedHit {std::size_t piece,sample,global;double distanceSquared;};
     struct alignas(64) QueryScratch {
         std::vector<RTreeValue> hits;
+        std::vector<SeedHit> seeds;
         std::vector<PairCandidate> candidates;
         std::map<PiecePair,PairCandidate> best;
         std::size_t spatialHits=0;
@@ -1884,6 +1886,10 @@ FiberTraceConstraintReport extractFiberTraceConstraints(
             bgi::intersects(queryBox(
                 pointA, config.maximumDistanceBaseVoxels)),
             std::back_inserter(hits));
+        // localMinimumSeeds: per query sample and partner piece only the
+        // partner samples at local distance minima along it seed.
+        auto& seeds=local.seeds;
+        seeds.clear();
         for (const auto& hit : hits) {
             const std::size_t globalB = hit.second;
             if (globalB <= globalA)
@@ -1906,6 +1912,26 @@ FiberTraceConstraintReport extractFiberTraceConstraints(
                 continue;
             }
             ++local.spatialHits;
+            seeds.push_back({sampleB.piece,sampleB.sample,globalB,distanceSquared});
+        }
+        if (config.localMinimumSeeds) {
+            std::sort(seeds.begin(),seeds.end(),[](const SeedHit& p,const SeedHit& q) {
+                return std::tie(p.piece,p.sample)<std::tie(q.piece,q.sample);
+            });
+            std::size_t kept=0;
+            for (std::size_t k=0;k<seeds.size();++k) {
+                const bool hasPrevious=k>0&&seeds[k-1].piece==seeds[k].piece&&seeds[k-1].sample+1==seeds[k].sample;
+                const bool hasNext=k+1<seeds.size()&&seeds[k+1].piece==seeds[k].piece&&seeds[k].sample+1==seeds[k+1].sample;
+                if ((!hasPrevious||seeds[k].distanceSquared<seeds[k-1].distanceSquared) &&
+                    (!hasNext||seeds[k].distanceSquared<=seeds[k+1].distanceSquared))
+                    seeds[kept++]=seeds[k];
+            }
+            seeds.resize(kept);
+        }
+        for (const auto& seed : seeds) {
+            const std::size_t globalB = seed.global;
+            const auto& sampleB = samples[globalB];
+            const double distanceSquared = seed.distanceSquared;
             PairCandidate candidate;
             if (sampleA.piece < sampleB.piece) {
                 candidate.pieces = {sampleA.piece, sampleB.piece};
@@ -1987,12 +2013,18 @@ FiberTraceConstraintReport extractFiberTraceConstraints(
             std::vector<PairCandidate>().swap(scratch[w].candidates);
         }
     } else {
-    candidates.reserve(count);
-    for(auto& local:scratch) {
-        candidates.insert(candidates.end(),std::make_move_iterator(local.candidates.begin()),
-            std::make_move_iterator(local.candidates.end()));
+    // Worker buffers are concatenated in worker order on all query workers.
+    std::vector<std::size_t> starts(scratch.size()+1,0);
+    for(std::size_t w=0;w<scratch.size();++w)starts[w+1]=starts[w]+scratch[w].candidates.size()+scratch[w].best.size();
+    candidates.resize(count);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic,1) num_threads(queryWorkers)
+#endif
+    for(int w=0;w<int(scratch.size());++w) {
+        auto& local=scratch[w];auto out=candidates.begin()+std::ptrdiff_t(starts[w]);
+        out=std::move(local.candidates.begin(),local.candidates.end(),out);
         std::vector<PairCandidate>().swap(local.candidates);
-        for(const auto& [key,candidate]:local.best)candidates.push_back(candidate);
+        for(const auto& [key,candidate]:local.best)*out++=candidate;
     }
     if(config.localEvents)sortLocalCandidates(candidates,requestedThreads);
     }
