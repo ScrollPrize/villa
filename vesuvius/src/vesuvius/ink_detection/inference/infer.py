@@ -945,6 +945,8 @@ def run_block_inference(
     autocast = (
         torch.autocast("cuda", dtype=amp_dtype)
         if device.type == "cuda"
+        else torch.autocast("cpu", dtype=torch.bfloat16)
+        if device.type == "cpu" and amp_dtype == torch.bfloat16
         else nullcontext()
     )
     with torch.inference_mode(), autocast:
@@ -1438,7 +1440,10 @@ def infer_single_zarr(
                 weight_map=weight_map,
                 mask=mask,
                 device=device,
-                amp_dtype=configured_model.amp_dtype,
+                # On CPU, only an explicit --amp-dtype bf16 enables autocast.
+                amp_dtype=configured_model.amp_dtype
+                if device.type != "cpu" or args.amp_dtype == "bf16"
+                else None,
                 tta_axes=tta_axes,
                 tta_batch_size=args.tta_batch_size,
                 roi_bounds=roi_bounds,
