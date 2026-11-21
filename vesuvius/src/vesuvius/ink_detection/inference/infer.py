@@ -1717,9 +1717,10 @@ def parse_args(argv: Sequence[str] | None = None):
         help="Device for the model. auto picks CUDA, then MPS, then CPU; --gpus implies CUDA.",
     )
     parser.add_argument("--gpus")
+    parser.add_argument("--compile", dest="compile_model", action="store_true")
     parser.add_argument("--compile-mode", default="reduce-overhead")
     parser.add_argument("--no-compile", dest="compile_model", action="store_false")
-    parser.set_defaults(compile_model=True)
+    parser.set_defaults(compile_model=False)
     args = parser.parse_args(argv)
     if args.num_workers < 0:
         parser.error("--num-workers must be nonnegative")
