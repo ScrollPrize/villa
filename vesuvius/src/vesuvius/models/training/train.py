@@ -33,6 +33,7 @@ from vesuvius.models.training.save_checkpoint import (
 from vesuvius.models.utilities.load_checkpoint import load_checkpoint
 from vesuvius.models.utilities.compilation import has_triton
 from vesuvius.models.utilities.get_accelerator import get_accelerator
+from vesuvius.models.utilities.mps_conv3d import speed_up_3d_convs_on_mps
 from vesuvius.models.utilities.s3_utils import detect_s3_paths, setup_multiprocessing_for_s3
 from vesuvius.models.training.wandb_logging import save_train_val_filenames
 from vesuvius.models.evaluation.connected_components import ConnectedComponentsMetric
@@ -1572,6 +1573,7 @@ class BaseTrainer:
 
         model.apply(InitWeights_He(neg_slope=0.2))
         model = model.to(self.device)
+        speed_up_3d_convs_on_mps(model, self.device)
 
         use_amp = not getattr(self.mgr, 'no_amp', False)
         if not use_amp:
