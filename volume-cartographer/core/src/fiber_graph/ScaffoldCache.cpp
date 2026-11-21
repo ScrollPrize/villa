@@ -28,7 +28,8 @@ std::string scaffoldNormalInputs(const ScaffoldNormalOptions& options, const std
                                  std::span<const std::string> anchors)
 {
     Statement s;
-    s.words("normals", "1");
+    // 2: axis targets oriented by continuity along the fiber (FiberStripNormals.cpp).
+    s.words("normals", "2");
     // Rows solved on the whole line (tails included) never match.
     s.words("line", "annotated");
     s.words("frame", frame);

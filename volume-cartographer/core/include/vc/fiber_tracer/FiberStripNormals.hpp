@@ -20,8 +20,11 @@
 // Optionally a predicted sheet axis a_i (sign-free) pulls the normal at a node:
 //   axis:    w_a w_i |n_i - a_i|^2
 // with a per-node weight w_i (for example from the prediction's presence). The
-// geometry-only solution is computed first and orients every free a_i (so the
-// term has one minimum per node and the sign stays continuous along the fiber);
+// free a_i are oriented by a first pass that minimizes the same cost node by node
+// from one end, each node against the previous one held fixed and its axis signed
+// against the previous normal; every a_i then takes the sign of that normal (so
+// the term has one minimum per node and the sign stays continuous along the
+// fiber), and the full solve refines all nodes from there;
 // fixed (signed) targets are boundary conditions: the node's normal is set to
 // the anchor direction and held constant, so only the stretches between anchors
 // are solved (the geometry field is first flipped as a whole when the anchors'

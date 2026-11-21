@@ -5,6 +5,8 @@
 #include <ceres/ceres.h>
 
 #include <algorithm>
+#include <limits>
+#include <array>
 #include <cmath>
 #include <stdexcept>
 
@@ -50,8 +52,8 @@ struct LateralResidual {
 };
 
 // sqrt(w_a w_i) (n(theta) - a) with the oriented axis in the vertex frame
-// (au, av, at) and n = (cos, sin, 0). The axis was oriented by the
-// geometry-only field beforehand, so the term has one minimum per node.
+// (au, av, at) and n = (cos, sin, 0). The axis was oriented beforehand (by
+// continuity along the chain), so the term has one minimum per node.
 struct AxisResidual {
     double weight, au, av, at;
     template <typename T>
@@ -243,8 +245,9 @@ FiberStripNormalResult solveChain(
     solver.max_num_iterations = options.maxIterations;
     solver.num_threads = 1;
     solver.logging_type = ceres::SILENT;
-    // Pass 1: geometry only. Pass 2 (with targets): the geometry field orients
-    // every axis target, then the signed axis term pulls the normals from there.
+    // Pass 1: geometry only. Pass 2 (with targets): the axis targets are oriented
+    // by continuity along the chain, the geometry field decides the fiber's
+    // overall facing, then the signed axis term pulls the normals from there.
     const bool fuse = targets && options.axisWeight > 0.0;
     ceres::Solver::Summary summary;
     for (int pass = 0; pass < (fuse ? 2 : 1); ++pass) {
@@ -272,21 +275,130 @@ FiberStripNormalResult solveChain(
                 vote += target.weight * a.dot(u[i] * std::cos(theta[i]) + v[i] * std::sin(theta[i]));
             }
             if (vote < 0.0) for (size_t i = 0; i < n; ++i) theta[i] += kPi;
+            // The axis targets carry no sign. It is not taken from the geometry
+            // field at each node - that field is only the bending direction,
+            // and where it drifts past a right angle from the sheet it hands the
+            // two sides of the fiber opposite signs, a flip the prediction does
+            // not have. Instead the same cost is first minimised node by node
+            // from one end: each node's angle against the previous node held
+            // fixed (twist), its own lateral term and the pull to its axis,
+            // signed against the previous node's normal. The twist weight
+            // keeps that normal smooth through a noisy axis, so every target
+            // gets the sign of a normal that never turned over. The full solve
+            // below then refines all nodes together from there.
+            std::vector<cv::Vec3d> oriented(n, cv::Vec3d(0, 0, 0));
+            std::vector<char> has(n, 0);
+            {
+                constexpr int kSteps = 720;  // half-degree candidates, then a parabolic refinement
+                static const auto table = [] {
+                    std::array<std::array<double, 2>, kSteps> out{};
+                    for (int k = 0; k < kSteps; ++k) {
+                        const double angle = -kPi + 2 * kPi * k / kSteps;
+                        out[size_t(k)] = {std::cos(angle), std::sin(angle)};
+                    }
+                    return out;
+                }();
+                const double twistWeight = options.twistWeight, lateralWeight = options.lateralWeight;
+                std::vector<double> stepped(n, theta[0]);
+                const auto anchorAngle = [&](size_t i, double& angle) {
+                    const auto& target = (*targets)[i];
+                    const cv::Vec3d a = unit(target.axis);
+                    if (!target.fixed || !(target.weight > 0.0) || cv::norm(a) == 0.0) return false;
+                    const double au = a.dot(u[i]), av = a.dot(v[i]);
+                    if (std::hypot(au, av) < 1e-9) return false;
+                    angle = std::atan2(av, au);
+                    return true;
+                };
+                double first = 0.0;
+                bool anchorSeen = false;
+                if (anchorAngle(0, first)) { stepped[0] = first; anchorSeen = true; }
+                for (size_t i = 1; i < n; ++i) {
+                    const double before = stepped[i - 1];
+                    double fixedAngle = 0.0;
+                    if (anchorAngle(i, fixedAngle)) {
+                        // An anchor is a boundary condition: its own angle, in
+                        // the turn nearest the previous node. The first anchor
+                        // also decides the facing of the nodes before it.
+                        double previous = before;
+                        if (!anchorSeen && std::cos(fixedAngle - before) < 0.0) {
+                            for (size_t j = 0; j < i; ++j) stepped[j] += kPi;
+                            previous += kPi;
+                        }
+                        anchorSeen = true;
+                        while (fixedAngle - previous > kPi) fixedAngle -= 2 * kPi;
+                        while (fixedAngle - previous < -kPi) fixedAngle += 2 * kPi;
+                        stepped[i] = fixedAngle;
+                        continue;
+                    }
+                    const auto& target = (*targets)[i];
+                    cv::Vec3d a = unit(target.axis);
+                    const bool pulled = !target.fixed && target.weight > 0.0 && cv::norm(a) > 0.0;
+                    double au = 0.0, av = 0.0, axisWeight = 0.0;
+                    if (pulled) {
+                        const cv::Vec3d previous = u[i] * std::cos(before) + v[i] * std::sin(before);
+                        if (previous.dot(a) < 0.0) a = -a;
+                        au = a.dot(u[i]); av = a.dot(v[i]);
+                        axisWeight = options.axisWeight * target.weight;
+                    }
+                    const bool interior = i + 1 < n;
+                    const double cb = std::cos(before), sb = std::sin(before);
+                    const auto cost = [&](double c, double sn, double delta) {
+                        // c, sn: cos and sin of the candidate angle before + delta.
+                        double value = twistWeight * delta * delta;
+                        if (interior) { const double l = -sn * du[i] + c * dv[i]; value += lateralWeight * l * l; }
+                        if (pulled) value += axisWeight * ((c - au) * (c - au) + (sn - av) * (sn - av));
+                        return value;
+                    };
+                    int best = 0; double bestCost = std::numeric_limits<double>::infinity();
+                    std::array<double, kSteps> costs;
+                    for (int k = 0; k < kSteps; ++k) {
+                        const double cd = table[size_t(k)][0], sd = table[size_t(k)][1];
+                        costs[size_t(k)] = cost(cb * cd - sb * sd, sb * cd + cb * sd, -kPi + 2 * kPi * k / kSteps);
+                        if (costs[size_t(k)] < bestCost) { bestCost = costs[size_t(k)]; best = k; }
+                    }
+                    double delta = -kPi + 2 * kPi * best / kSteps;
+                    if (best > 0 && best + 1 < kSteps) {
+                        const double left = costs[size_t(best - 1)], right = costs[size_t(best + 1)];
+                        const double curve = left - 2 * bestCost + right;
+                        if (curve > 0.0) delta += 0.5 * (left - right) / curve * (2 * kPi / kSteps);
+                    }
+                    stepped[i] = before + delta;
+                }
+                // Which way the whole fiber faces: the signed anchors when there
+                // are any (the gauge flip above already sided the geometry
+                // field with them), otherwise the geometry field's majority.
+                double fieldVote = 0.0;
+                bool anchored = false;
+                for (size_t i = 0; i < n; ++i) {
+                    const auto& target = (*targets)[i];
+                    if (target.fixed && target.weight > 0.0) anchored = true;
+                    if (!(target.weight > 0.0)) continue;
+                    fieldVote += target.weight * std::cos(stepped[i] - theta[i]);
+                }
+                if (!anchored && fieldVote < 0.0) for (auto& angle : stepped) angle += kPi;
+                for (size_t i = 0; i < n; ++i) {
+                    const auto& target = (*targets)[i];
+                    cv::Vec3d a = unit(target.axis);
+                    if (!target.fixed && target.weight > 0.0 && cv::norm(a) > 0.0) {
+                        const cv::Vec3d normal = u[i] * std::cos(stepped[i]) + v[i] * std::sin(stepped[i]);
+                        oriented[i] = normal.dot(a) < 0.0 ? -a : a;
+                        has[i] = 1;
+                    }
+                    theta[i] = stepped[i];
+                }
+            }
             for (size_t i = 0; i < n; ++i) {
                 const auto& target = (*targets)[i];
-                cv::Vec3d a = unit(target.axis);
-                if (!(target.weight > 0.0) || cv::norm(a) == 0.0) continue;
+                const cv::Vec3d anchor = unit(target.axis);
+                if (!(target.weight > 0.0) || cv::norm(anchor) == 0.0) continue;
                 if (target.fixed) {
                     // A boundary condition: the normal is the anchor's direction
                     // (projected into the node's plane) and does not move.
-                    const double au = a.dot(u[i]), av = a.dot(v[i]);
-                    if (std::hypot(au, av) < 1e-9) continue;  // anchor along the fiber: no direction
-                    theta[i] = std::atan2(av, au);
+                    if (std::hypot(anchor.dot(u[i]), anchor.dot(v[i])) < 1e-9) continue;  // anchor along the fiber: no direction
                     problem.SetParameterBlockConstant(&theta[i]);
                     continue;
                 }
-                const cv::Vec3d current = u[i] * std::cos(theta[i]) + v[i] * std::sin(theta[i]);
-                if (current.dot(a) < 0.0) a = -a;
+                const cv::Vec3d& a = oriented[i];
                 const double weight = std::sqrt(options.axisWeight * target.weight);
                 problem.AddResidualBlock(
                     new ceres::AutoDiffCostFunction<AxisResidual, 3, 1>(
