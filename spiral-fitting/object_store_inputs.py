@@ -240,7 +240,9 @@ class InputRequest:
     """What to read: per-kind selectors, the fit volume and the approval policy.
 
     ``fit_volume_uuid`` None infers the volume from the selected objects'
-    declarations. ``approved_links_only`` consumes only approved
+    declarations; when none declares one, ``default_volume_uuid`` (the input
+    manifest's volume, for a fit on manifest inputs alone) is used if given.
+    ``approved_links_only`` consumes only approved
     relationships; otherwise pending and approved ones are consumed. Rejected
     relationships are never consumed. ``pins`` None reads the store as it is
     now; InputPins read the pinned object versions (selector membership
@@ -257,6 +259,8 @@ class InputRequest:
     # The pyramid level of the fit volume the fit works in (fit_volume_level):
     # a fit voxel is 2^level of the volume's voxels.
     fit_volume_level: int = 0
+    # The volume a selection no object of which declares one is fitted in.
+    default_volume_uuid: str = None
 
     @property
     def fit_scale(self):
@@ -554,13 +558,14 @@ def declared_coordinates(meta):
     return geometry_coordinates(meta.get('coordinates') or {})
 
 
-def infer_fit_volume(records, configured=None):
+def infer_fit_volume(records, configured=None, default=None):
     """Return ``(volume_uuid, 'inferred' | 'configured')``.
 
     Selected objects declaring different volumes are an error, even when one
     of them matches a configured volume: a configuration cannot override a
     conflict or silently drop objects. Without any declaration (including an
-    empty selection) the volume must be configured.
+    empty selection) the volume must be configured, or ``default`` given
+    (``'default'``): the input manifest names it for a fit on its inputs alone.
     """
     declared = {}
     for record in records:
@@ -579,6 +584,8 @@ def infer_fit_volume(records, configured=None):
                 f'{next(iter(declared))} the selected objects declare'])
         return configured, 'configured'
     if not declared:
+        if default is not None:
+            return default, 'default'
         raise ObjectStoreInputError([
             'no selected object declares a volume; configure fit_volume_uuid'])
     return next(iter(declared)), 'inferred'
@@ -868,7 +875,7 @@ def read_snapshot(store, request, selected=None):
     volume_uuid, volume_source = infer_fit_volume(
         [revision['record'] for revision in usable]
         + ([shell_revision['record']] if shell_revision is not None else []),
-        request.fit_volume_uuid)
+        request.fit_volume_uuid, request.default_volume_uuid)
 
     def stored(revision):
         record = revision['record']
@@ -3371,7 +3378,8 @@ def resume_problems(checkpoint_input_manifest, inputs, allow_changed=False, log=
 
 
 def load_fit_inputs(config, *, lasagna=None, external_frames=None, dist=None,
-                    cache_directory=None, log=print, minimum_position=None, pins=None):
+                    cache_directory=None, log=print, minimum_position=None, pins=None,
+                    default_volume_uuid=None):
     """Refresh, freeze and materialize a fit's object-store inputs.
 
     Rank zero (the only process when ``dist`` is None or single-rank) runs
@@ -3385,7 +3393,8 @@ def load_fit_inputs(config, *, lasagna=None, external_frames=None, dist=None,
     before anyone trains. Returns FitInputs carrying ``manifest`` and
     ``digest``. ``cache_directory`` is the fit's cache (the strip cache of
     a local link refresh and a served store's persistent cache live under
-    it).
+    it). ``default_volume_uuid`` is the fit volume when no selected object
+    declares one (InputRequest.default_volume_uuid).
     """
     if not config['object_store_location']:
         raise ObjectStoreInputError(['object_store_location is not configured'])
@@ -3394,8 +3403,9 @@ def load_fit_inputs(config, *, lasagna=None, external_frames=None, dist=None,
     if main:
         try:
             selected, lines, pinned = _startup_phase(
-                config, request_from_config(config), lasagna, cache_directory, log,
-                minimum_position, pins)
+                config, dataclasses.replace(request_from_config(config),
+                                            default_volume_uuid=default_volume_uuid),
+                lasagna, cache_directory, log, minimum_position, pins)
             status = {'ok': True, 'pins': pinned.provenance(), 'lines': lines}
         except ObjectStoreInputError as error:
             status = {'ok': False, 'problems': error.problems}
@@ -3413,7 +3423,8 @@ def load_fit_inputs(config, *, lasagna=None, external_frames=None, dist=None,
     # of some entering a collective the failed rank never joins.
     inputs, outcome = None, None
     request = dataclasses.replace(
-        request_from_config(config), pins=InputPins.from_provenance(status['pins']))
+        request_from_config(config), pins=InputPins.from_provenance(status['pins']),
+        default_volume_uuid=default_volume_uuid)
     try:
         with open_store(config, read_only=True, cache_directory=cache_directory) as store:
             snapshot = read_snapshot(store, request)

@@ -1,4 +1,5 @@
 """Selection, frames and relationship filtering of object-store fit inputs."""
+import dataclasses
 import json
 from types import SimpleNamespace
 
@@ -230,6 +231,18 @@ def test_explicit_selection_problems_are_reported_together(db):
     assert len(error.value.problems) == 2
     with pytest.raises(osi.ObjectStoreInputError, match='has no geometry'):
         osi.read_snapshot(db, request(surface={'uuids': (empty,)}))
+
+
+def test_an_undeclared_selection_is_fitted_in_the_default_volume(db):
+    # A fit on its input manifest's inputs alone (an empty store) is fitted
+    # in the manifest's volume; a selection that declares one keeps it.
+    empty = osi.read_snapshot(
+        db, dataclasses.replace(request(), default_volume_uuid=VOLUME))
+    assert (empty.volume_uuid, empty.volume_source) == (VOLUME, 'default')
+    put_patch(db, _grid())
+    declared = osi.read_snapshot(
+        db, dataclasses.replace(request(), default_volume_uuid='other-volume'))
+    assert (declared.volume_uuid, declared.volume_source) == (VOLUME, 'inferred')
 
 
 def test_the_volume_is_inferred_configured_or_refused(db):
