@@ -134,8 +134,8 @@ setup(
     entry_points={
         "console_scripts": [
             "lasagna-fit-service=fit_service:main",
-            "lasagna-download=lasagna.scripts.download_omezarr:main",
-            "lasagna-download-list=lasagna.scripts.download_volume_list:main",
+            "lasagna-prefill=lasagna.scripts.prefill_omezarr:main",
+            "lasagna-prefill-list=lasagna.scripts.prefill_volume_list:main",
             "lasagna-bootstrap=lasagna.scripts.bootstrap_venv:main",
             "lasagna-preprocess=preprocess_cos_omezarr:cli_main",
             "las_manager=lasagna.manager.cli:main",

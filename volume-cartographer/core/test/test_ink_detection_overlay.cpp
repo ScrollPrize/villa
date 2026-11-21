@@ -133,6 +133,12 @@ struct CatalogFixture {
         }
         REQUIRE(catalog->rows().size() == 1);
     }
+    std::shared_ptr<QuadSurface> surface() const
+    {
+        auto shown = makeSurface(surfaceUuid);
+        shown->meta = nlohmann::json::parse(catalog->rows().begin()->second.record.meta);
+        return shown;
+    }
     ~CatalogFixture()
     {
         catalog.reset();
@@ -220,7 +226,7 @@ TEST_CASE("ink detection options follow the active catalog surface")
     CatalogFixture fixture("options", "prediction.jpg");
     writeFile(fixture.inkFile, "not-empty");
 
-    auto source = makeSurface(fixture.surfaceUuid);
+    auto source = fixture.surface();
     fixture.state.setSurface("segmentation", source, false, false);
 
     InkDetectionOverlayController overlay(&fixture.state);
@@ -230,7 +236,7 @@ TEST_CASE("ink detection options follow the active catalog surface")
     CHECK(overlay.options().front().name == "prediction.jpg");
 
     // A preview of the same surface keeps them; another surface has none.
-    fixture.state.setSurface("segmentation", makeSurface(fixture.surfaceUuid), false, false);
+    fixture.state.setSurface("segmentation", fixture.surface(), false, false);
     CHECK(overlay.options().size() == 1);
     fixture.state.setSurface("segmentation", makeSurface({}), false, false);
     CHECK(overlay.options().empty());
@@ -243,7 +249,7 @@ TEST_CASE("ink detection overlay flips the displayed image")
     CatalogFixture fixture("flip", "prediction.png");
     writeGrayImage(fixture.inkFile);
 
-    fixture.state.setSurface("segmentation", makeSurface(fixture.surfaceUuid), false, false);
+    fixture.state.setSurface("segmentation", fixture.surface(), false, false);
 
     InkDetectionOverlayController overlay(&fixture.state);
     overlay.setSurfaceCatalog(fixture.catalog.get());

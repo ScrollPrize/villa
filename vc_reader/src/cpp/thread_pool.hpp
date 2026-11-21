@@ -3,6 +3,7 @@
 // item by item.
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <cstddef>
@@ -15,35 +16,61 @@
 #include <thread>
 #include <utility>
 #include <vector>
+#include <moodycamel/concurrentqueue.h>
 
 #include <unistd.h>
+#include "coordination_trace.hpp"
 
 namespace vcr {
 
 class ThreadPool {
+    struct Job {
+        std::shared_ptr<diagnostics::JobState> trace;
+        diagnostics::SchedulerStage stage=diagnostics::SchedulerStage::Other;
+        bool chunks=false;
+        std::size_t n=0;
+        const std::function<void(std::size_t)>* fn=nullptr;
+        std::atomic<std::size_t> next{0},references{1};
+        std::atomic<bool> failed{false};
+        std::size_t remaining=0;  // guarded by mutex
+        std::exception_ptr error;
+        std::mutex mutex;
+        std::condition_variable done;
+        void retain() noexcept {references.fetch_add(1,std::memory_order_relaxed);}
+        void release() noexcept {
+            if(references.fetch_sub(1,std::memory_order_acq_rel)==1)delete this;
+        }
+    };
+    struct ReleaseJob {void operator()(Job* job)const noexcept {job->release();}};
+    using JobPtr=std::unique_ptr<Job,ReleaseJob>;
+
+    static std::size_t checkedCapacity(std::size_t capacity) {
+        if(!capacity)throw std::invalid_argument("reader queue capacity must be positive");
+        return capacity;
+    }
 public:
-    explicit ThreadPool(std::size_t threads)
+    explicit ThreadPool(std::size_t threads,std::size_t queueCapacity=4096)
+        :queue_(checkedCapacity(queueCapacity))
     {
         workers_.reserve(threads);
-        for (std::size_t i = 0; i < threads; ++i)
-            workers_.emplace_back([this] { loop(); });
+        try {
+            for (std::size_t i = 0; i < threads; ++i)
+                workers_.emplace_back([this] { loop(); });
+        } catch(...) {stopWorkers();throw;}
     }
 
     ~ThreadPool()
     {
-        {
-            std::lock_guard lock(mutex_);
-            stopping_ = true;
-        }
-        cv_.notify_all();
-        for (auto& w : workers_)
-            w.join();
+        stopWorkers();
+        Job* job=nullptr;
+        while(queue_.try_dequeue(job))job->release();
     }
 
     ThreadPool(const ThreadPool&) = delete;
     ThreadPool& operator=(const ThreadPool&) = delete;
 
     std::size_t size() const noexcept { return workers_.size(); }
+    bool queue_lock_free()const noexcept {return queue_.is_lock_free();}
 
     // Runs fn(i) for every i in [0, n) on the pool and the calling thread, and
     // waits. The first exception stops the remaining items and is rethrown.
@@ -51,57 +78,70 @@ public:
     // callers share the workers instead of the first job taking all of them.
     void parallel_for(std::size_t n, const std::function<void(std::size_t)>& fn)
     {
+        diagnostics::schedulerRecord(diagnostics::SchedulerMetric::Calls,n);
+        diagnostics::schedulerRecord(n==0?diagnostics::SchedulerMetric::Size0:n==1?diagnostics::SchedulerMetric::Size1:
+            n<=4?diagnostics::SchedulerMetric::Size2to4:n<=16?diagnostics::SchedulerMetric::Size5to16:
+            n<=64?diagnostics::SchedulerMetric::Size17to64:n<=256?diagnostics::SchedulerMetric::Size65to256:diagnostics::SchedulerMetric::Size257plus);
         if (n == 0)
             return;
         if (n == 1) {
+            recordItem();
+            diagnostics::Scope task(diagnostics::Task);
             fn(0);
             return;
         }
-        auto job = std::make_shared<Job>();
+        run_job(n,fn);
+    }
+
+private:
+    void run_job(std::size_t n,const std::function<void(std::size_t)>& fn) {
+        JobPtr job(new Job);
+        job->stage=diagnostics::schedulerStage;
+        if(diagnostics::Trace::enabled()) {
+            job->chunks=diagnostics::threadState()->flags.load(std::memory_order_relaxed)&diagnostics::ChunkBatch;
+            // Detailed counters replace per-job trace registration, avoiding a
+            // diagnostic registry lock on every measured submission.
+            if(!diagnostics::schedulerProfiling())job->trace=diagnostics::Trace::instance().job(n,job->chunks);
+        }
         job->n = n;
         job->fn = &fn;
         job->remaining = n;
+        struct ActiveCall {
+            std::atomic<std::size_t>& count;
+            explicit ActiveCall(std::atomic<std::size_t>& c):count(c){count.fetch_add(1,std::memory_order_relaxed);}
+            ~ActiveCall(){count.fetch_sub(1,std::memory_order_relaxed);}
+        } active(active_calls_);
         if (!workers_.empty()) {
-            {
-                std::lock_guard lock(mutex_);
-                active_.push_back(job);
-                active_count_.store(active_.size(), std::memory_order_relaxed);
-            }
-            cv_.notify_all();
+            if(publish(*job))diagnostics::schedulerRecord(diagnostics::SchedulerMetric::Submitted,n);
         }
         while (run_one(*job)) {}
         {
             // Wait for the items, not the workers: a worker that picks the job after
             // every item has been taken just finds nothing to do.
-            std::unique_lock lock(job->mutex);
-            job->done.wait(lock, [&] { return job->remaining == 0; });
-        }
-        if (!workers_.empty()) {
-            std::lock_guard lock(mutex_);
-            retire(job.get());
+            diagnostics::SchedulerLock lock(job->mutex,diagnostics::SchedulerMetric::BatchLock);
+            diagnostics::Scope waiting(diagnostics::BatchWait);
+            lock.wait(job->done, [&] { return job->remaining == 0; },diagnostics::SchedulerMetric::BatchWait);
         }
         if (job->error)
             std::rethrow_exception(job->error);
     }
 
-private:
-    struct Job {
-        std::size_t n = 0;
-        const std::function<void(std::size_t)>* fn = nullptr;  // valid while items remain to be taken
-        std::atomic<std::size_t> next{0};
-        std::atomic<bool> failed{false};
-        std::size_t remaining = 0;  // items not yet finished; guarded by mutex
-        std::exception_ptr error;  // guarded by mutex
-        std::mutex mutex;
-        std::condition_variable done;
-    };
+    static void recordItem() {
+        if(diagnostics::schedulerProfiling())diagnostics::schedulerRecord(
+            diagnostics::threadState()->flags.load(std::memory_order_relaxed)&diagnostics::Helper?
+                diagnostics::SchedulerMetric::HelperItems:diagnostics::SchedulerMetric::CallerItems,1);
+    }
 
-    // Runs one item of the job; false when every item has been taken.
+    // Runs one item; false when every item has been taken.
     static bool run_one(Job& job)
     {
         const std::size_t i = job.next.fetch_add(1, std::memory_order_relaxed);
         if (i >= job.n)
             return false;
+        if(job.trace)job.trace->ready.fetch_sub(1,std::memory_order_relaxed);
+        diagnostics::SchedulerStageScope stage(job.stage);
+        recordItem();
+        diagnostics::Scope task(diagnostics::Task|(job.chunks?diagnostics::ChunkTask:0));
         if (!job.failed.load(std::memory_order_relaxed)) {  // after a failure, items are only counted
             try {
                 (*job.fn)(i);
@@ -112,68 +152,73 @@ private:
                 job.failed = true;
             }
         }
-        std::lock_guard lock(job.mutex);
+        diagnostics::SchedulerLock lock(job.mutex,diagnostics::SchedulerMetric::CompletionLock);
         if (--job.remaining == 0)
             job.done.notify_all();
         return true;
     }
 
-    // Removes a job from the active ones (if still there). Holds mutex_.
-    void retire(const Job* job)
-    {
-        for (std::size_t k = 0; k < active_.size(); ++k)
-            if (active_[k].get() == job) {
-                active_.erase(active_.begin() + std::ptrdiff_t(k));
-                if (k < cursor_)
-                    --cursor_;
-                break;
-            }
-        active_count_.store(active_.size(), std::memory_order_relaxed);
+    // One ticket circulates for each published batch. Every ticket owns a
+    // reference, including completed tickets awaiting dequeue. No caller waits
+    // for queue space or removes its completed ticket from the queue.
+    bool publish(Job& job) {
+        diagnostics::SchedulerElapsed elapsed(diagnostics::SchedulerMetric::QueuePush);
+        job.retain();
+        if(!queue_.try_enqueue(&job)) {
+            job.release();diagnostics::schedulerRecord(diagnostics::SchedulerMetric::QueueFull);return false;
+        }
+        available_.fetch_add(1,std::memory_order_release);
+        available_.notify_one();return true;
     }
 
-    // The next active job with items left, in turn; null when stopping.
-    std::shared_ptr<Job> next_job(std::unique_lock<std::mutex>& lock)
-    {
-        for (;;) {
-            cv_.wait(lock, [&] { return stopping_ || !active_.empty(); });
-            if (active_.empty())
-                return nullptr;
-            if (cursor_ >= active_.size())
-                cursor_ = 0;
-            auto job = active_[cursor_];
-            if (job->next.load(std::memory_order_relaxed) >= job->n) {
-                retire(job.get());
-                continue;
-            }
-            ++cursor_;
-            return job;
-        }
+    void stopWorkers()noexcept {
+        stopping_.store(true,std::memory_order_release);
+        available_.fetch_add(1,std::memory_order_release);
+        available_.notify_all();
+        for(auto& worker:workers_)worker.join();
     }
 
     void loop()
     {
-        std::shared_ptr<Job> job;
+        moodycamel::ConsumerToken consumer(queue_);
+        diagnostics::Scope helper(diagnostics::Helper);
         for (;;) {
-            // The only active job: keep taking its items without the pool's lock.
-            if (job && active_count_.load(std::memory_order_relaxed) == 1 && run_one(*job))
-                continue;
+            const auto observed=available_.load(std::memory_order_acquire);
+            if(stopping_.load(std::memory_order_acquire))return;
+            Job* raw=nullptr;
+            bool found;
             {
-                std::unique_lock lock(mutex_);
-                job = next_job(lock);
-                if (!job)
-                    return;
+                diagnostics::SchedulerElapsed elapsed(diagnostics::SchedulerMetric::QueuePop);
+                found=queue_.try_dequeue(consumer,raw);
             }
-            run_one(*job);
+            if(!found) {
+                // Read the epoch before checking the queue: a concurrent publish
+                // either supplies a ticket or changes the value we wait on.
+                diagnostics::SchedulerElapsed idle(diagnostics::SchedulerMetric::HelperIdle);
+                available_.wait(observed,std::memory_order_acquire);
+                continue;
+            }
+            JobPtr job(raw);
+            if(job->next.load(std::memory_order_relaxed)>=job->n) {
+                diagnostics::schedulerRecord(diagnostics::SchedulerMetric::QueueStale);continue;
+            }
+            // Republish before executing so other helpers can join a single
+            // large request. Atomic item claims, not tickets, own callbacks.
+            publish(*job);
+            while(run_one(*job)) {
+                if(active_calls_.load(std::memory_order_relaxed)!=1)break;
+            }
         }
     }
 
     std::vector<std::thread> workers_;
-    std::vector<std::shared_ptr<Job>> active_;  // jobs that may have items left; guarded by mutex_
-    std::size_t cursor_ = 0;                    // the next of active_ to take from; guarded by mutex_
-    std::atomic<std::size_t> active_count_{0};  // active_.size(), read without the lock
-    std::mutex mutex_;
-    std::condition_variable cv_;
-    bool stopping_ = false;
+    // Implicit producer state belongs to the queue, not to caller-local tokens
+    // that could outlive the pool. try_enqueue never grows the message blocks;
+    // initial producer registration may allocate once per participating thread.
+    moodycamel::ConcurrentQueue<Job*> queue_;
+    std::atomic<std::uint64_t> available_{0};
+    std::atomic<std::size_t> active_calls_{0};
+    std::atomic<bool> stopping_{false};
 };
 
 // Sampling, transfer and projection share a bounded pool rather than each

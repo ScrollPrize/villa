@@ -1,7 +1,6 @@
 """Frozen-solution cross-constraint votes against intact reviewed GT fibers."""
 import json
 from pathlib import Path
-import sqlite3
 
 import numpy as np
 from lasagna.inference_provenance import atomic_write, sha256_file
@@ -242,7 +241,7 @@ def run(settings):
     from .constraint_extraction import run_native_constraints
     from .fiber_normal_convention import inward_solution
     from .fiber_normal_sign_visualization import load_umbilicus_frame
-    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fiber_volume,fibers_digest,read_polylines,write_fibers
+    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fibers_digest,read_polylines,write_initial_fibers
     root=Path(settings['output_root']);root.mkdir(parents=True,exist_ok=True)
     configs=[json.loads(Path(p).read_text())['fiber_uv_layout'] for p in settings['configs']]
     cfg=configs[0];gtroot=Path(settings['gt_root'])
@@ -269,8 +268,9 @@ def run(settings):
     manifest=root/'inputs.json'
     if manifest.exists() and json.loads(manifest.read_text())!=signature:raise ValueError('Changed scoring inputs')
     atomic_write(manifest,signature,durable=False)
-    volume=fiber_volume(cfg['fibers'])
-    if fiber_volume(gcfg['fibers'])!=volume:raise ValueError('Test and GT fibers are bound to different volumes')
+    from .fiber_graph_store import workflow_volume
+    volume=workflow_volume(cfg)
+    if workflow_volume(gcfg)!=volume:raise ValueError('Test and GT measurement frames differ')
     test_curves=read_polylines(cfg['fibers'],np.unique(d['source_id']),volume=volume)
     gt_curves=read_polylines(gcfg['fibers'],np.unique(gd['source_id']),volume=volume)
     # Fibers keep their own UUIDs in the combined store; the kind of each is its membership.
@@ -279,12 +279,12 @@ def run(settings):
     kinds.update((row['id'],'gt') for row,_ in gt_curves)
     curves={row['id']:xyz for row,xyz in test_curves+gt_curves}
     combined=root/'combined.vcobj'
-    if not combined.exists():write_fibers(combined,test_curves+gt_curves,volume=volume)
+    if not combined.exists():write_initial_fibers(combined,test_curves+gt_curves,volume=volume,packed=True)
     for name,template in [('extract',settings['extract_template']),('orient',settings['orient_template'])]:
         native=json.loads(Path(template).read_text())
         native.update(fibers=str(combined),full_volume=True,threads=settings.get('threads',128),
-                      output=str(root/(name+'.json')),database=str(root/(name+'.sqlite')))
-        if name=='orient':native['orient_database']=str(root/'extract.sqlite')
+                      output=str(root/(name+'.json')),database=str(root/(name+'.vcobj')))
+        if name=='orient':native['orient_database']=str(root/'extract.vcobj')
         path=root/(name+'_config.json');atomic_write(path,native,durable=False)
         if not Path(native['output']).exists():
             run_native_constraints(path, settings)
@@ -295,7 +295,7 @@ def run(settings):
     if not (normal_root/'index.json').exists():
         native=json.loads((gtroot/'orient_config.json').read_text())
         native.update(orient_database=gcfg['database'],normal_curves_output=str(normal_root),
-                      database=str(root/'unused_curve_export.sqlite'),output=str(root/'frozen_gt_normals.json'))
+                      database=str(root/'unused_curve_export.vcobj'),output=str(root/'frozen_gt_normals.json'))
         path=root/'frozen_gt_normals_config.json';atomic_write(path,native,durable=False)
         run_native_constraints(path, settings)
     axis=load_umbilicus_frame(cfg['umbilicus'],volume)
@@ -305,40 +305,43 @@ def run(settings):
         angles[cid]=(arc,angle*(1 if cfg['h_convention']=='ccw' else -1))
     gn=inward_solution(arrays(gcfg['stage1']));normal_sign=dict(zip(gn['ids'],gn['normal_sign']))
     from .fiber_curve_bank import CurveBank
-    bank=CurveBank(gcfg['fibers'],gd['source_id'],normal_root,gn)
+    bank=CurveBank(gcfg['fibers'],gd['source_id'],normal_root,gn,volume=workflow_volume(gcfg))
     _,_,gkeep,gpick=uv.hard_assignment(gs['state'],len(gs['widths']),gcfg,best_nonbroken=True)
     if not gkeep.all():raise ValueError('GT must retain every fiber')
     events=[];excluded=dict(non_cross=0,outside_test_piece=0,invalid_gt_normal=0,tangent_connector=0)
     gauge_flips=0
-    with sqlite3.connect(root/'orient.sqlite') as db:
-        rows=db.execute('SELECT id,fiber_a,fiber_b,arc_a,arc_b,ax,ay,az,bx,by,bz,parallel_score,perpendicular_score,winding_distance,parallel_winding_distance,normal_a,normal_b FROM constraints ORDER BY id')
-        for r in rows:
-            ida,idb=r[1],r[2];ka,sa=kinds[ida],ida;kb,sb=kinds[idb],idb
-            if ka==kb:excluded['non_cross']+=1;continue
-            if ka=='test':ti,gi,ts,gid,ta,ga,tx,gx,normal=ida,idb,sa,sb,r[3],r[4],r[5:8],r[8:11],r[16]
-            else:ti,gi,ts,gid,ta,ga,tx,gx,normal=idb,ida,sb,sa,r[4],r[3],r[8:11],r[5:8],r[15]
-            tp=piece_at(d,ts,ta);gp=piece_at(gd,gid,ga)
-            if tp is None:excluded['outside_test_piece']+=1;continue
-            if gp is None:raise ValueError('GT event outside intact curve')
-            n=json.loads(normal)
-            if not n['valid']:excluded['invalid_gt_normal']+=1;continue
-            loc=int(np.searchsorted(bank.ids,gid))
-            _,frozen,valid=bank.sample(np.array([loc]),np.array([ga]))
-            raw=np.asarray(n['xyz']);agreement=float(raw@frozen[0])
-            if not valid[0] or abs(agreement)<.5:excluded['invalid_gt_normal']+=1;continue
-            inward=raw*(1 if agreement>=0 else -1)
-            gauge_flips+=bool((agreement>=0)!=(normal_sign[gid]>=0))
-            connector=np.asarray(gx)-tx;length=np.linalg.norm(connector)
-            cosine=-float(np.dot(connector,inward))/max(length,1e-30)
-            if length==0 or abs(cosine)<.1:excluded['tangent_connector']+=1;continue
-            sign=1 if cosine>0 else -1
-            at=float(np.interp(ta,*angles[ti]));ag=float(np.interp(ga,*angles[gi]))
-            pd=(ag-at+.5)%1-.5;parallel=r[11]>r[12];distance=float(r[14] if parallel else r[13])
-            events.append(dict(event_id=int(r[0]),test_source=ts,test_piece=tp,gt_source=gid,gt_piece=gp,
-                test_arc=ta,gt_arc=ga,test_angle=at,gt_angle=ag,phase_delta=pd,
-                family_delta=int(gd['family'][gp]-d['family'][tp]),parallel=bool(parallel),
-                signed_distance=sign*distance,normal_cosine=cosine,
-                class_matches_families=bool(parallel==(d['family'][tp]==gd['family'][gp]))))
+    from .fiber_graph_store import FiberGraph
+    for r in FiberGraph(root/'orient.vcobj').endpoint_rows():
+        ida,idb=r['fiber_a'],r['fiber_b'];ka,sa=kinds[ida],ida;kb,sb=kinds[idb],idb
+        if ka==kb:excluded['non_cross']+=1;continue
+        if ka=='test':
+            ti,gi,ts,gid,ta,ga,normal=ida,idb,sa,sb,r['arc_a'],r['arc_b'],r['normal_b']
+            connector=np.asarray(r['connector'])
+        else:
+            ti,gi,ts,gid,ta,ga,normal=idb,ida,sb,sa,r['arc_b'],r['arc_a'],r['normal_a']
+            connector=-np.asarray(r['connector'])
+        tp=piece_at(d,ts,ta);gp=piece_at(gd,gid,ga)
+        if tp is None:excluded['outside_test_piece']+=1;continue
+        if gp is None:raise ValueError('GT event outside intact curve')
+        n=normal
+        if not n['valid']:excluded['invalid_gt_normal']+=1;continue
+        loc=int(np.searchsorted(bank.ids,gid))
+        _,frozen,valid=bank.sample(np.array([loc]),np.array([ga]))
+        raw=np.asarray(n['xyz']);agreement=float(raw@frozen[0])
+        if not valid[0] or abs(agreement)<.5:excluded['invalid_gt_normal']+=1;continue
+        inward=raw*(1 if agreement>=0 else -1)
+        gauge_flips+=bool((agreement>=0)!=(normal_sign[gid]>=0))
+        length=np.linalg.norm(connector)
+        cosine=-float(np.dot(connector,inward))/max(length,1e-30)
+        if length==0 or abs(cosine)<.1:excluded['tangent_connector']+=1;continue
+        sign=1 if cosine>0 else -1
+        at=float(np.interp(ta,*angles[ti]));ag=float(np.interp(ga,*angles[gi]))
+        pd=(ag-at+.5)%1-.5;parallel=r['parallel'];distance=float(r['distance'])
+        events.append(dict(event_id=int(r['event_id']),test_source=ts,test_piece=tp,gt_source=gid,gt_piece=gp,
+            test_arc=ta,gt_arc=ga,test_angle=at,gt_angle=ag,phase_delta=pd,
+            family_delta=int(gd['family'][gp]-d['family'][tp]),parallel=bool(parallel),
+            signed_distance=sign*distance,normal_cosine=cosine,
+            class_matches_families=bool(parallel==(d['family'][tp]==gd['family'][gp]))))
     if not events:raise ValueError('No cross-constraint support')
     if settings.get('events_only'):
         result=dict(events=events,excluded=excluded,inputs=signature,

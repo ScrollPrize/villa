@@ -127,6 +127,15 @@ public:
         return true;
     }
 
+    void readRange(std::uint64_t offset, std::size_t length, std::uint8_t* destination)
+    {
+        if (offset > total || length > total-offset)
+            throw std::runtime_error("shard range exceeds opened file");
+        file_.seekg(std::streamoff(offset));
+        file_.read(reinterpret_cast<char*>(destination), std::streamsize(length));
+        if (!file_) throw std::runtime_error("truncated shard payload");
+    }
+
     std::vector<std::uint8_t> index;
     std::uint64_t total = 0;
 
@@ -134,9 +143,7 @@ private:
     void read(std::uint64_t offset, std::size_t length, std::vector<std::uint8_t>& body)
     {
         body.resize(length);
-        file_.seekg(std::streamoff(offset));
-        file_.read(reinterpret_cast<char*>(body.data()), std::streamsize(length));
-        if (!file_) throw std::runtime_error("truncated shard payload");
+        readRange(offset, length, body.data());
     }
     const ShardLayout& layout_;
     std::ifstream file_;

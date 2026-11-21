@@ -74,6 +74,11 @@ void enableLinkObjects();
 // publication. Throws std::invalid_argument for a malformed plan,
 // objects::PreparationFailed when a detector fails to run, and
 // std::runtime_error when cancelled.
+// The publication's apply(store, txn) writes the links and the link marker in
+// txn without a savepoint of its own. When apply throws, txn is failed as a
+// whole: its commit() throws and rolls back, so everything written in txn is
+// lost, including writes made before apply was called. A caller that applies
+// in its own transaction must let it roll back and start a new one.
 objects::PreparedOperation prepareLinkObjects(objects::ObjectStore& store, const objects::LinkObjectsOp& op,
                                               const objects::PrepareOptions& options);
 

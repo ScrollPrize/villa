@@ -323,12 +323,16 @@ LevelPlacement levelPlacement(const Json& groupAttributes, const std::string& pa
 LevelPlacement declaredPlacement(const Json& groupAttributes, const std::string& path);
 
 struct StoreMetadata;
-// Drops the metadata kept with a remote volume's caches (see Group::open, volumeMetadata), so
-// its next open reads it as published.
+// Drops the metadata kept with a remote volume's caches (see Group::open, volumeMetadata) and
+// the array documents this process knows at or below it, by either S3 or HTTPS spelling (see
+// readArrayDocument), so its next open reads it as published.
 void forgetKeptMetadata(const std::string& location, const OpenOptions& options);
 
 // Raw array metadata without constructing a numeric decoder (also object arrays).
 // Uses the same metadata readers and offline caches as openArray; absent for groups.
+// A public remote array's document is read once per process and then reused, until
+// forgetKeptMetadata, a Writer opened on it, this process writing or removing its metadata, or
+// (Python) an open with refresh=True.
 std::optional<Json> readArrayDocument(const std::string& location, const OpenOptions& options = {});
 
 class Group {

@@ -20,6 +20,27 @@ def test_interpolation_extrapolation():
     np.testing.assert_allclose(a,[-1,0,.5,1,2])
 
 
+def test_batched_interpolation_matches_scalar_fiber_search():
+    rng=np.random.default_rng(42)
+    counts=rng.integers(1,9,size=100)
+    owner=np.repeat(np.arange(100)*3,counts)
+    arc=np.concatenate([np.sort(rng.uniform(0,100,size=n)) for n in counts])
+    qo=rng.choice(np.arange(100)*3,size=10000);qa=rng.uniform(-100,200,size=len(qo))
+    l,r,t=c.interpolation_plan(owner,arc,qo,qa)
+    for f in np.unique(qo):
+        knots=np.flatnonzero(owner==f);rows=np.flatnonzero(qo==f)
+        if len(knots)==1:
+            np.testing.assert_array_equal(l[rows],knots[0]);np.testing.assert_array_equal(r[rows],knots[0])
+            np.testing.assert_array_equal(t[rows],0)
+        else:
+            ix=np.clip(np.searchsorted(arc[knots],qa[rows],side='right')-1,0,len(knots)-2)
+            a,b=knots[ix],knots[ix+1]
+            np.testing.assert_array_equal(l[rows],a);np.testing.assert_array_equal(r[rows],b)
+            np.testing.assert_array_equal(t[rows],(qa[rows]-arc[a])/(arc[b]-arc[a]))
+    with pytest.raises(ValueError,match='no perpendicular nodes'):
+        c.interpolation_plan(owner,arc,np.array([999]),np.array([0.]))
+
+
 @pytest.mark.parametrize('dtype',[torch.float32,torch.float64])
 @pytest.mark.parametrize('mapping',[False,True])
 def test_fixed_queries_all_node_cases(dtype,mapping):

@@ -62,13 +62,13 @@ def _load_completed_provenance(path: Path) -> tuple[list[object], dict | None, s
     artifacts = value.get("artifacts")
     inventory = list(artifacts) if isinstance(artifacts, list) else []
     inference = value.get("inference")
-    live_fetch = inference.get("live_fetch") if isinstance(inference, dict) else None
-    live_fetch = dict(live_fetch) if isinstance(live_fetch, dict) else None
+    input_record = inference.get("input") if isinstance(inference, dict) else None
+    input_record = dict(input_record) if isinstance(input_record, dict) else None
     if value.get("status") != "completed":
-        return inventory, live_fetch, f"portable provenance status is {value.get('status')!r}, expected 'completed'"
+        return inventory, input_record, f"portable provenance status is {value.get('status')!r}, expected 'completed'"
     if not isinstance(artifacts, list):
-        return [], live_fetch, "portable provenance has no artifact inventory"
-    return inventory, live_fetch, None
+        return [], input_record, "portable provenance has no artifact inventory"
+    return inventory, input_record, None
 
 
 def _process_start_time(pid: int) -> str | None:
@@ -206,10 +206,10 @@ def main(argv: list[str] | None = None) -> int:
                 f"Fiberlet portable provenance validation failed: {error}"
             )
     provenance_path = run_dir / metadata.get("artifacts", {}).get("provenance", "artifacts/inference.json")
-    inventory, live_fetch, provenance_error = _load_completed_provenance(provenance_path)
+    inventory, input_record, provenance_error = _load_completed_provenance(provenance_path)
     metadata.setdefault("artifacts", {})["inventory"] = inventory
-    if live_fetch is not None:
-        metadata["live_fetch"] = live_fetch
+    if input_record is not None:
+        metadata["input"] = input_record
     if returncode == 0 and not interrupted and provenance_error:
         returncode = 1
         status = "failed"

@@ -60,14 +60,20 @@ OpenedVolumes::Level OpenedVolumes::level(const Volume& volume, int level)
     std::lock_guard lock(mutex_);
     const int base = volume.baseScaleLevel();
     auto opened = open(volume, base + level);
+    const auto channel = opened->meta.shape.size() == 4
+        ? std::optional<std::int64_t>(volume.channel().value_or(0)) : std::nullopt;
     std::shared_ptr<vcr::reader_cuda::Reader> reader;
-    if (gpuCacheBytes_ && opened->meta.dtype == "|u1" && opened->meta.shape.size() == 3) {
-        auto& shared = readers_[opened->array.get()];
+    if (gpuCacheBytes_ && opened->meta.dtype == "|u1" &&
+        (opened->meta.shape.size() == 3 || opened->meta.shape.size() == 4)) {
+        auto& shared = readers_[{opened->array.get(), channel}];
         if (!shared)
-            shared = vc::cuda::makeReader(*opened->array, opened->meta.type, gpuPool_);
+            shared = vc::cuda::makeReader(*opened->array, opened->meta.type, gpuPool_, channel);
         reader = shared;
     }
-    return {opened, open(volume, base)->placement, std::move(reader)};
+    // Level zero is a coordinate frame, not necessarily a stored array: compact
+    // predictions often start at /2. A nonzero working base is a retained level.
+    const auto working = base == 0 ? vcr::zarr::LevelPlacement{} : open(volume, base)->placement;
+    return {opened, working, std::move(reader), channel};
 }
 
 const OpenedVolumes::Pyramid& OpenedVolumes::pyramid(const Volume& volume)

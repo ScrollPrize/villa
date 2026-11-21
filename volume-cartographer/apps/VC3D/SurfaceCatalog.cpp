@@ -216,22 +216,18 @@ SurfaceCatalog::Opened SurfaceCatalog::open(const std::shared_ptr<ObjectStoreSes
     auto& current = opened.current;
     session->readStore(attachment, [&](const StoreReader& reader, const auto&) {
         const auto activeGeneration = reader.status().generation;
-        auto revision = reader.currentObject(uuid);
-        if (!revision || revision->record.retired || revision->record.kind != "surface")
+        auto revision = at?reader.objectsAtVersions({*at}).front():reader.currentObject(uuid);
+        if (!revision || revision->deleted || revision->objectUuid!=util::canonicalUuid(uuid) ||
+            (!at&&revision->record.retired) || revision->record.kind != "surface")
             throw std::runtime_error("The surface is no longer in the object store");
-        if (at && (at->version != revision->version || at->generation != revision->generation)) {
-            auto found = reader.objectsAtVersions({*at}).front();
-            if (!found || found->objectUuid != revision->objectUuid || found->deleted)
-                throw std::runtime_error("The surface has no such revision");
-            revision = std::move(found);
-            current = false;
+        if(at){
+            const auto head=reader.currentObject(uuid);
+            current=head&&!head->record.retired&&head->reference()==revision->reference();
         }
         if (!revision->geometryRevision) throw NoGeometry("The surface has no geometry");
         const GeometrySnapshot snapshot(reader);
-        const auto view = current ? snapshot.viewTransformedAt(revision->objectUuid, volume.volume, volume.scale)
-                                  : snapshot.surface(revision->objectUuid, revision->geometryRevision)
-                                        .viewTransformedAt(volume.volume, volume.scale);
-        opened.surface = load_quad_from_store(reader, revision->objectUuid, *revision->geometryRevision, true, &view);
+        const auto view = snapshot.surface(*revision).viewTransformedAt(volume.volume,volume.scale);
+        opened.surface = load_quad_from_store(reader,*revision,true,&view);
         opened.view = view.frame();
         opened.pin = pinOf(attachment, *revision, activeGeneration);
     });
@@ -278,6 +274,30 @@ std::string SurfaceCatalog::create(QuadSurface& surface, const std::string& name
     session_->submit(*attachment_, request);
     surface.id = uuid;
     return uuid;
+}
+
+void SurfaceCatalog::Crossings::requireComplete() const
+{
+    if (!complete || !remote.empty())
+        throw std::runtime_error("Incomplete surface intersections; fetch the missing surfaces or narrow the selection before deriving annotations");
+}
+
+SurfaceCatalog::Crossings SurfaceCatalog::RegionInput::region(const RegionSlice& slice,
+                                                             const std::function<bool()>& cancelled) const
+{
+    auto remaining = options;
+    auto& selected = remaining.uuids.value();
+    std::erase_if(selected, [&](const auto& uuid) { return displayed.contains(uuid); });
+    Crossings result;
+    // A resident-only selection needs no store query.
+    if (!selected.empty()) result = SurfaceCatalog::region(*session, sources, volume, slice, remaining, cancelled);
+    for (const auto& [uuid, surface] : displayed) {
+        if (cancelled && cancelled()) { result.complete = false; break; }
+        auto crossings = surface->region(uuid, slice, [&](const auto&) { return cancelled && cancelled(); }, options.outputByteBudget);
+        result.complete = result.complete && crossings.complete();
+        for (auto& run : crossings.runs) result.runs.push_back(std::move(run));
+    }
+    return result;
 }
 
 SurfaceCatalog::Crossings SurfaceCatalog::region(ObjectStoreSession& session, const std::vector<AttachmentIdentity>& sources,

@@ -152,8 +152,32 @@ def _patch_aligned_chunks(offsets, chunk_size=PATCH_EVALUATION_CHUNK_SIZE):
         start = end
 
 
-@torch.inference_mode()
 def evaluate_patch_satisfaction_packed(
+        slice_to_spiral_transform, dr_per_winding, *args, **kwargs):
+    """Evaluate all ROI quad centres with two bounded model passes.
+
+    The per-quad-centre tensors (about a dozen values each) live on the fit
+    device. If that runs out of memory (large atlases beside the resident
+    training state), the evaluation reruns with them on the host and only
+    the model batches on the device."""
+    device = dr_per_winding.device
+    try:
+        return _evaluate_patch_satisfaction_packed(
+            slice_to_spiral_transform, dr_per_winding, *args,
+            quad_device=device, **kwargs)
+    except torch.OutOfMemoryError:
+        if device.type == 'cpu':
+            raise
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
+    print('patch satisfaction: out of device memory, keeping quad tensors on the host')
+    return _evaluate_patch_satisfaction_packed(
+        slice_to_spiral_transform, dr_per_winding, *args,
+        quad_device=torch.device('cpu'), **kwargs)
+
+
+@torch.inference_mode()
+def _evaluate_patch_satisfaction_packed(
     slice_to_spiral_transform,
     dr_per_winding,
     patches,
@@ -161,10 +185,10 @@ def evaluate_patch_satisfaction_packed(
     z_begin,
     z_end,
     *,
+    quad_device,
     include_splicing=True,
     verbose=False,
 ):
-    """Evaluate all ROI quad centres with two bounded model passes."""
     started = time.perf_counter()
     device = dr_per_winding.device
     dr = dr_per_winding.detach()
@@ -183,12 +207,13 @@ def evaluate_patch_satisfaction_packed(
         np.asarray(layout['boundary_flags'], dtype=np.uint8)).bool()
     full_valid_counts = torch.from_numpy(
         np.asarray(layout['full_valid_counts'], dtype=np.int64))
-    patch_indices = patch_indices_cpu.to(device=device)
-    boundary = boundary_cpu.to(device=device)
     count = int(offsets_np[-1]) if len(offsets_np) else 0
+    patch_indices = patch_indices_cpu.to(device=quad_device)
+    boundary = boundary_cpu.to(device=quad_device)
+    dr_quad = dr.to(device=quad_device)
 
     center_scroll = torch.empty(
-        (count, 3), dtype=torch.float32, device=device)
+        (count, 3), dtype=torch.float32, device=quad_device)
     center_spiral = torch.empty_like(center_scroll)
     forward_batches = 0
     with torch.no_grad():
@@ -199,11 +224,12 @@ def evaluate_patch_satisfaction_packed(
             # peak VRAM even though the model itself is chunked.
             centers = patch_atlas.vertex_zyxs(
                 corners[begin:end].to(device=device)).mean(dim=1)
-            center_scroll[begin:end] = centers
-            center_spiral[begin:end] = slice_to_spiral_transform(centers)
+            center_scroll[begin:end] = centers.to(device=quad_device)
+            center_spiral[begin:end] = slice_to_spiral_transform(
+                centers).to(device=quad_device)
             forward_batches += 1
     theta, radius, shifted = get_theta_and_radii(
-        center_spiral[..., 1:], dr_per_winding)
+        center_spiral[..., 1:], dr_quad)
 
     unwrap = native_atlas.unwrap_targets(
         np.ascontiguousarray(theta.float().cpu().numpy()),
@@ -220,24 +246,26 @@ def evaluate_patch_satisfaction_packed(
             print(f'Warning: patch {patch_index} has multiple disconnected '
                   'subrow components; using only the component containing '
                   'the center column')
-    target_raw = target_raw_cpu.to(device=device)
-    target_winding = target_winding_cpu.to(device=device)
+    target_raw = target_raw_cpu.to(device=quad_device)
+    target_winding = target_winding_cpu.to(device=quad_device)
     target_set = target_winding >= 0
     safe_target_raw = torch.where(target_set, target_raw, shifted)
-    scan_residual = torch.empty(count, dtype=torch.float32, device=device)
+    scan_residual = torch.empty(count, dtype=torch.float32, device=quad_device)
     inverse_batches = 0
     with torch.no_grad():
         for begin, end in _patch_aligned_chunks(offsets_np):
-            target_radius = (safe_target_raw[begin:end]
-                             + theta[begin:end] / (2 * np.pi) * dr)
+            theta_batch = theta[begin:end].to(device=device)
+            target_radius = (safe_target_raw[begin:end].to(device=device)
+                             + theta_batch / (2 * np.pi) * dr)
             target_spiral = torch.stack([
-                center_spiral[begin:end, 0],
-                torch.sin(theta[begin:end]) * target_radius,
-                torch.cos(theta[begin:end]) * target_radius,
+                center_spiral[begin:end, 0].to(device=device),
+                torch.sin(theta_batch) * target_radius,
+                torch.cos(theta_batch) * target_radius,
             ], dim=-1)
             target_scroll = slice_to_spiral_transform.inv(target_spiral)
             scan_residual[begin:end] = torch.linalg.norm(
-                target_scroll - center_scroll[begin:end], dim=-1)
+                target_scroll - center_scroll[begin:end].to(device=device),
+                dim=-1).to(device=quad_device)
             inverse_batches += 1
     spiral_residual = (shifted - safe_target_raw).abs()
     del center_scroll
@@ -252,10 +280,10 @@ def evaluate_patch_satisfaction_packed(
         thresholds = dict(metrics_config)
         thresholds.update(overrides)
         satisfied = (target_set
-                     & (spiral_residual <= dr * thresholds['satisfaction_radius_tolerance'])
+                     & (spiral_residual <= dr_quad * thresholds['satisfaction_radius_tolerance'])
                      & (scan_residual <= thresholds['satisfaction_distance_tolerance']))
         satisfied_counts = torch.zeros(
-            patch_count, dtype=torch.int64, device=device)
+            patch_count, dtype=torch.int64, device=quad_device)
         boundary_counts = torch.zeros_like(satisfied_counts)
         satisfied_boundary_counts = torch.zeros_like(satisfied_counts)
         if count:
@@ -265,8 +293,8 @@ def evaluate_patch_satisfaction_packed(
                 0, patch_indices, boundary.to(torch.int64))
             satisfied_boundary_counts.scatter_add_(
                 0, patch_indices, (satisfied & boundary).to(torch.int64))
-        compare_on = device
-        if torch.device(device).type == 'mps':
+        compare_on = quad_device
+        if torch.device(quad_device).type == 'mps':
             # MPS has no float64: compare on the CPU, where the results go next.
             compare_on = 'cpu'
             satisfied_counts = satisfied_counts.cpu()
@@ -293,12 +321,12 @@ def evaluate_patch_satisfaction_packed(
     patch_extents = [(None, None)] * patch_count
     patch_min = patch_max = None
     if count:
-        raw_windings = (shifted / dr).round().to(torch.int64).clamp_min(0)
-        max_radius = torch.full((patch_count,), -torch.inf, device=device)
-        max_winding = torch.full((patch_count,), -1, dtype=torch.int64, device=device)
+        raw_windings = (shifted / dr_quad).round().to(torch.int64).clamp_min(0)
+        max_radius = torch.full((patch_count,), -torch.inf, device=quad_device)
+        max_winding = torch.full((patch_count,), -1, dtype=torch.int64, device=quad_device)
         min_winding = torch.full(
             (patch_count,), torch.iinfo(torch.int64).max,
-            dtype=torch.int64, device=device)
+            dtype=torch.int64, device=quad_device)
         max_radius.scatter_reduce_(0, patch_indices, radius.float(), reduce='amax')
         scatter_reduce_(max_winding, patch_indices, raw_windings, 'amax')
         scatter_reduce_(min_winding, patch_indices, raw_windings, 'amin')
@@ -308,8 +336,8 @@ def evaluate_patch_satisfaction_packed(
         for index in torch.where(has_roi)[0].tolist():
             patch_extents[index] = (
                 float(max_radius_cpu[index]), int(max_winding_cpu[index]))
-        patch_min = int(min_winding[has_roi.to(device=device)].min().item())
-        patch_max = int(max_winding[has_roi.to(device=device)].max().item())
+        patch_min = int(min_winding[has_roi.to(device=quad_device)].min().item())
+        patch_max = int(max_winding[has_roi.to(device=quad_device)].max().item())
 
     elapsed = time.perf_counter() - started
     print('patch satisfaction: '

@@ -88,14 +88,19 @@ def _add_inference_launch_arguments(
             "--backend", choices=("fiber3d", "lasagna"), default=None,
             help="Restrict snapshot resolution; normally inferred from the snapshot selector.",
         )
-    parser.add_argument("--download-workers", type=int, default=64)
-    parser.add_argument("--no-prefetch", action="store_true")
     parser.add_argument(
-        "--live-fetch", action="store_true",
-        help="Stream the selected scale through a conservative rolling disk cache.",
+        "--input-connections", type=int, default=64,
+        help="Parallel remote input reads for the prefetch phase and the backend (default 64).",
     )
-    parser.add_argument("--live-cache-gib", type=float, default=None)
-    parser.add_argument("--live-fetch-ahead-tiles", type=int, default=None)
+    parser.add_argument(
+        "--no-prefetch", action="store_true",
+        help="Skip filling the input disk cache before inference; the backend reads ahead instead.",
+    )
+    parser.add_argument(
+        "--input-disk-cache-gib", type=float, default=None,
+        help="Bound the input disk cache (implies --no-prefetch); least recently used chunks are removed.",
+    )
+    parser.add_argument("--read-ahead-tiles", type=int, default=None)
     if legacy_config:
         parser.add_argument(
             "--legacy-config", default=None,
@@ -134,11 +139,10 @@ def _parser() -> argparse.ArgumentParser:
     volume_ls.add_argument("--sample")
     volume_ls.add_argument("--format", dest="data_format")
     volume_ls.add_argument("--json", action="store_true")
-    prefetch = volume_sub.add_parser("prefetch", help="download one OME-Zarr group into the configured cache")
+    prefetch = volume_sub.add_parser("prefetch", help="fill the input disk cache with one OME-Zarr level")
     prefetch.add_argument("volume")
     prefetch.add_argument("scale", type=int)
-    prefetch.add_argument("--workers", type=int, default=64)
-    prefetch.add_argument("--no-remote-inventory", action="store_true")
+    prefetch.add_argument("--connections", type=int, default=64)
     inference = sub.add_parser("inference")
     inference_sub = inference.add_subparsers(dest="inference_command", required=True)
     inference_sub.add_parser("ls", help="list durable inference records")
@@ -329,7 +333,7 @@ def _has_local_chunk(group: Path) -> bool:
         try:
             with os.scandir(directory) as entries:
                 for entry in entries:
-                    if entry.name.startswith("."):
+                    if entry.name.startswith(".") or entry.name.endswith(".missing"):
                         continue
                     if entry.is_file(follow_symlinks=False):
                         return True
@@ -438,11 +442,10 @@ def _launch_selected_inference(
         config, snapshot, volume, args.scale,
         original_argv=original_argv, extra_args=backend_args,
         legacy_config=getattr(args, "legacy_config", None),
-        prefetch=not args.no_prefetch and not args.live_fetch,
-        download_workers=args.download_workers,
-        live_fetch=bool(args.live_fetch),
-        live_cache_gib=args.live_cache_gib,
-        live_fetch_ahead_tiles=args.live_fetch_ahead_tiles,
+        prefetch=not args.no_prefetch and args.input_disk_cache_gib is None,
+        input_connections=args.input_connections,
+        input_disk_cache_gib=args.input_disk_cache_gib,
+        **({} if args.read_ahead_tiles is None else {"read_ahead_tiles": args.read_ahead_tiles}),
     )
 
 
@@ -503,10 +506,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             records = index_volumes(cache)
             if args.volume_command == "prefetch":
                 volume = resolve_volume(records, args.volume)
-                path = prefetch_volume(
-                    config, volume, args.scale, workers=args.workers,
-                    remote_inventory=not args.no_remote_inventory,
-                )
+                path = prefetch_volume(config, volume, args.scale, connections=args.connections)
                 print(path)
                 return 0
             if args.sample:

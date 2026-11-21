@@ -42,9 +42,9 @@ except ImportError:
 	)
 
 try:
-	from live_omezarr_cache import LiveOmeZarrCache, selected_level_lock_for_input
+	from input_level import InputLevel, split_level_location
 except ImportError:
-	from lasagna.live_omezarr_cache import LiveOmeZarrCache, selected_level_lock_for_input
+	from lasagna.input_level import InputLevel, split_level_location
 
 
 ChunkOriginZYX = tuple[int, int, int]
@@ -832,107 +832,8 @@ def _pyrdown3d(t: torch.Tensor, *, factor: int) -> torch.Tensor:
 			t = F.conv3d(F.pad(t.unsqueeze(0), pad_arg, mode='reflect'), kd, groups=C)[0]
 		t = t[:, ::2, ::2, ::2]
 		f //= 2
-	return t
-
-
-_input_writers: dict[str, ZarrWriter] = {}
-
-
-def _input_has_chunks(zarr_path: str, z0: int, z1: int, y0: int, y1: int,
-					  x0: int, x1: int) -> bool:
-	"""Check if any chunks are stored in the zarr array for the given region."""
-	array = _input_writers.get(zarr_path)
-	if array is None:
-		array = _input_writers[zarr_path] = ZarrWriter.open(zarr_path)
-	cz, cy, cx = array.chunks
-	for iz in range(max(0, z0 // cz), (z1 + cz - 1) // cz):
-		for iy in range(max(0, y0 // cy), (y1 + cy - 1) // cy):
-			for ix in range(max(0, x0 // cx), (x1 + cx - 1) // cx):
-				if array.chunk_exists((iz, iy, ix)):
-					return True
-	return False
-
-
-def _download_one_path(
-	zarr_path: str,
-	crop_xyzwhd: tuple[int, int, int, int, int, int] | None,
-	download_workers: int = 64,
-) -> None:
-	"""Download chunks for one zarr path from the S3 source in _download metadata."""
-	import sys as _sys
-
-	_lasagna_dir = str(Path(__file__).resolve().parent)
-	if _lasagna_dir not in _sys.path:
-		_sys.path.insert(0, _lasagna_dir)
-	from scripts.download_omezarr import download
-
-	p = Path(str(zarr_path).rstrip("/")).resolve()
-	group_root = None
-	dl_meta = None
-	check = p
-	for _ in range(5):
-		zattrs_path = check / ".zattrs"
-		if zattrs_path.is_file():
-			zattrs = json.loads(zattrs_path.read_text(encoding="utf-8"))
-			if "_download" in zattrs:
-				group_root = check
-				dl_meta = zattrs["_download"]
-				break
-		if check.parent == check:
-			break
-		check = check.parent
-
-	if group_root is None or dl_meta is None:
-		raise ValueError(
-			f"no _download metadata found walking up from {zarr_path} - "
-			"run download_omezarr.py on this volume first "
-			"(it records the S3 source), or pass --no-download to skip"
-		)
-
-	scales: list[int] | None = None
-	if p.name.isdigit():
-		scales = [int(p.name)]
-
-	bbox: tuple[int, int, int, int, int, int] | None = None
-	if crop_xyzwhd is not None:
-		x, y, z, w, h, d = crop_xyzwhd
-		bbox = (x, y, z, x + w, y + h, z + d)
-
-	source_uri = dl_meta["source"]
-	anon = dl_meta.get("anon", False)
-	region = dl_meta.get("region")
-
-	print(
-		f"[predict3d] downloading {source_uri} "
-		f"scales={scales or 'all'} dest={group_root} ...",
-		flush=True,
-	)
-	ret = download(
-		source=source_uri,
-		dest=str(group_root),
-		scales=scales,
-		bbox_xyzxyz=bbox,
-		anon=anon,
-		region=region,
-		workers=int(download_workers),
-	)
-	if ret != 0:
-		raise RuntimeError(f"download from {source_uri} failed (exit {ret})")
-
-
-def _auto_download(
-	input_path: str,
-	crop_xyzwhd: tuple[int, int, int, int, int, int] | None,
-	pred_dt_path: str | None = None,
-	download_workers: int = 64,
-) -> None:
-	"""Auto-download input and optional pred-dt data from S3 metadata."""
-	if int(download_workers) <= 0:
-		raise ValueError("download_workers must be a positive integer")
-	_download_one_path(input_path, crop_xyzwhd, int(download_workers))
-	if pred_dt_path:
-		_download_one_path(pred_dt_path, crop_xyzwhd, int(download_workers))
-	print("[predict3d] all downloads complete", flush=True)
+	# The native accumulator needs contiguous rows; the strided view above is not.
+	return t.contiguous()
 
 
 def _resolve_base_shape(
@@ -958,8 +859,7 @@ def _resolve_base_shape(
 		return (sh[0] * factor, sh[1] * factor, sh[2] * factor)
 
 	try:
-		inp = Path(str(input_path).rstrip("/"))
-		group_path = inp.parent if inp.name.isdigit() else inp
+		group_path, _level = split_level_location(input_path)
 
 		try:
 			sh = open_zarr(group_path, level=0).shape
@@ -1129,7 +1029,7 @@ def _omezarr_chunk_exists(omezarr_path: str, level: int, z: int, y: int, x: int,
 	if array is None:
 		try:
 			array = ZarrWriter.open(os.path.join(omezarr_path, str(level)))
-		except RuntimeError:
+		except (RuntimeError, FileNotFoundError):
 			return False
 		_chunk_stores[key] = array
 	try:
@@ -1347,18 +1247,14 @@ def _predict3d_progress_line(progress: dict) -> str:
 	fill = int(round(done / total * bar_w))
 	fill = max(0, min(bar_w, fill))
 	bar = "#" * fill + "-" * (bar_w - fill)
-	live_cache = progress.get("live_cache")
+	input_status = progress.get("input")
 	cache_status = ""
-	if isinstance(live_cache, Mapping):
-		target = int(live_cache.get("target_bytes", 0)) / float(1 << 40)
-		downloaded = int(live_cache.get("downloaded_chunks", 0))
-		missing = int(live_cache.get("missing_chunks", 0))
-		inflight = int(live_cache.get("inflight_regions", 0))
-		rate = float(live_cache.get("download_rate_bytes_s", 0.0)) / float(1 << 20)
-		cache_status = (
-			f" cache_target={target:.2f}TiB dl={downloaded} "
-			f"miss={missing} inflight={inflight} rate={rate:.1f}MiB/s"
-		)
+	if isinstance(input_status, Mapping) and input_status.get("remote"):
+		fetched = int(input_status.get("fetched_chunks", 0))
+		missing = int(input_status.get("missing_chunks", 0))
+		inflight = int(input_status.get("inflight_regions", 0))
+		rate = float(input_status.get("fetch_rate_bytes_s", 0.0)) / float(1 << 20)
+		cache_status = f" fetched={fetched} miss={missing} inflight={inflight} rate={rate:.1f}MiB/s"
 	return (
 		f"[predict3d] [{bar}] {done}/{total} tiles "
 		f"({100.0 * done / total:.1f}%) "
@@ -3091,25 +2987,7 @@ def _iter_canonical_tile_events(
 				yield int(tz), int(ty), int(tx), iy == len(y_positions) - 1 and ix == len(x_positions) - 1, next_tz
 
 
-def _lock_selected_level_reader(function):
-	@wraps(function)
-	def wrapped(*args, **kwargs):
-		if kwargs.get("live_cache") is not None:
-			return function(*args, **kwargs)
-		input_path = kwargs.get("input_zarr_path")
-		lock = (
-			selected_level_lock_for_input(input_path, exclusive=False)
-			if input_path is not None else None
-		)
-		if lock is None:
-			return function(*args, **kwargs)
-		with lock:
-			return function(*args, **kwargs)
-	return wrapped
-
-
 @cooperative_signals
-@_lock_selected_level_reader
 def run_tiled_inference_3d(
 	model,
 	zarr_arr,
@@ -3121,7 +2999,6 @@ def run_tiled_inference_3d(
 	products: Sequence[OutputProductSpec],
 	output_regions_zyx: Mapping[str, RegionZYX],
 	full_output_shapes_zyx: Mapping[str, tuple[int, int, int]],
-	input_zarr_path: str | None = None,
 	output_scaledown_base: Mapping[str, int] | int | None = None,
 	tile_size: int = 256,
 	overlap: int = 64,
@@ -3138,7 +3015,7 @@ def run_tiled_inference_3d(
 	profile_pipeline: bool = False,
 	product_accumulator_dtype: str | np.dtype = "float16",
 	accumulator_workers: int = 0,
-	live_cache: LiveOmeZarrCache | None = None,
+	input_level: InputLevel | None = None,
 	cooperative_factory=None,
 ) -> None:
 	"""Authoritative one-pass, multi-scale tiled inference engine."""
@@ -3174,15 +3051,12 @@ def run_tiled_inference_3d(
 			"product_accumulator_dtype must be float16 or float32, "
 			f"got {product_accumulator_dtype}"
 		)
-	if live_cache is not None:
-		if input_zarr_path is None:
-			raise ValueError("live cache requires input_zarr_path")
-		if Path(str(input_zarr_path).rstrip("/")).resolve() != live_cache.source.level_path.resolve():
-			raise ValueError("live cache selected level does not match input_zarr_path")
-		if (z0, z1, y0, y1, x0, x1) != (
-			0, volume_shape[0], 0, volume_shape[1], 0, volume_shape[2],
-		):
-			raise ValueError("live cache supports only full, non-cropped inference")
+	if input_level is not None and tuple(input_level.shape) != tuple(volume_shape):
+		raise ValueError(
+			f"input level shape {tuple(input_level.shape)} does not match the array's {volume_shape}"
+		)
+	# Remote levels are read ahead into the disk cache; local ones are read when needed.
+	read_ahead = input_level is not None and input_level.remote
 	scales = {
 		p.name: max(1, int(p.inference_scaledown or 1))
 		for p in products
@@ -3309,11 +3183,6 @@ def run_tiled_inference_3d(
 			resume_origins=set(), touched_bytes=0, cleared_bytes=0,
 		)
 
-	if input_zarr_path is not None:
-		input_dir = str(Path(str(input_zarr_path).rstrip("/")).resolve())
-	else:
-		input_dir = str(Path(str(getattr(zarr_arr, "location", "."))).resolve())
-
 	def _chunk_supported(sd: int, g: dict[str, Any], origin: ChunkOriginZYX) -> bool:
 		"""Whether the output chunk's own selected-input footprint has storage.
 
@@ -3335,8 +3204,7 @@ def run_tiled_inference_3d(
 				max(0, int(origin[2]) * sd), min(volume_shape[2], int(ends[2]) * sd),
 			)
 			cache[origin] = all(bounds[i] < bounds[i + 1] for i in (0, 2, 4)) and (
-				live_cache.region_has_remote_chunks(bounds)
-				if live_cache is not None else _input_has_chunks(input_dir, *bounds)
+				input_level.region_has_chunks(bounds) if input_level is not None else True
 			)
 		return bool(cache[origin])
 
@@ -3402,8 +3270,7 @@ def run_tiled_inference_3d(
 	def _tile_work(tz: int, ty: int, tx: int) -> tuple[tuple[str, ...], str | None]:
 		bounds = _tile_input_bounds(tz, ty, tx)
 		has_source = (
-			live_cache.region_has_remote_chunks(bounds)
-			if live_cache is not None else _input_has_chunks(input_dir, *bounds)
+			input_level.region_has_chunks(bounds) if input_level is not None else True
 		)
 		if not has_source:
 			return (), "empty"
@@ -3866,8 +3733,8 @@ def run_tiled_inference_3d(
 			tiles_skipped_empty=0, tiles_skipped_resume=0,
 			tile_time_sum=0.0, tiles_remaining_est=total,
 		)
-		if live_cache is not None:
-			progress["live_cache"] = live_cache.snapshot()
+		if input_level is not None:
+			progress["input"] = input_level.snapshot()
 	print(_predict3d_progress_line(progress) if progress is not None else f"[predict3d] 0/{total} tiles", flush=True)
 	progress_emitter = _Predict3dProgressEmitter()
 	requested_flush_frontier = None
@@ -3912,8 +3779,8 @@ def run_tiled_inference_3d(
 					tiles_skipped_empty=skipped_empty, tiles_skipped_resume=skipped_resume,
 					tile_time_sum=tile_time, tiles_remaining_est=total-done,
 				)
-				if live_cache is not None:
-					progress["live_cache"] = live_cache.snapshot()
+				if input_level is not None:
+					progress["input"] = input_level.snapshot()
 			status = _predict3d_progress_line(progress) if progress is not None else f"[predict3d] {done}/{total} tiles"
 			progress_emitter.emit(status, done=done, total=total)
 			if row_end:
@@ -3946,8 +3813,8 @@ def run_tiled_inference_3d(
 
 			def _next_serial_event() -> dict[str, Any] | None:
 				nonlocal serial_source_done, serial_ready_highwater
-				if live_cache is not None:
-					while not serial_source_done and len(serial_pending) < live_cache.lookahead_tiles:
+				if read_ahead:
+					while not serial_source_done and len(serial_pending) < input_level.read_ahead_tiles:
 						try:
 							tz, ty, tx, row_end, next_tz = next(serial_source)
 						except StopIteration:
@@ -3961,7 +3828,7 @@ def run_tiled_inference_3d(
 						else:
 							event.update(
 								status="fetching",
-								cache_task=live_cache.request_region(_tile_input_bounds(tz, ty, tx)),
+								cache_task=input_level.request_region(_tile_input_bounds(tz, ty, tx)),
 							)
 						serial_pending.append(event)
 
@@ -4096,7 +3963,7 @@ def run_tiled_inference_3d(
 			_slot_count = len(resolved_devices) * int(slots_per_gpu)
 			_prefetch_window = len(resolved_devices) * int(prefetch_tiles_per_gpu)
 			_materialization_window = (
-				live_cache.lookahead_tiles if live_cache is not None else _prefetch_window
+				input_level.read_ahead_tiles if read_ahead else _prefetch_window
 			)
 			_input_layouts, input_bytes = _packed_layouts((("input", (tile_size, tile_size, tile_size), np.dtype(zarr_arr.dtype)),))
 			_result_entries = []
@@ -4226,9 +4093,9 @@ def run_tiled_inference_3d(
 			source_done = False
 			cache_descriptor_source = (
 				iter(_iter_canonical_tile_events(z_positions, y_positions, x_positions, Zp))
-				if live_cache is not None else None
+				if read_ahead else None
 			)
-			cache_descriptor_done = live_cache is None
+			cache_descriptor_done = not read_ahead
 			cache_backlog: deque[tuple[int, dict[str, Any]]] = deque()
 			active_event_window = max(_slot_count, _prefetch_window)
 			next_sequence = next_commit = next_accum_dispatch = 0
@@ -4590,7 +4457,7 @@ def run_tiled_inference_3d(
 						band_source_done = False
 						made_progress = True
 					assert active_band is not None
-					if live_cache is not None:
+					if read_ahead:
 						while not cache_descriptor_done and len(cache_backlog) < _materialization_window:
 							try:
 								tz, ty, tx, row_end, next_tz = next(cache_descriptor_source)
@@ -4605,7 +4472,7 @@ def run_tiled_inference_3d(
 							else:
 								event.update(
 									status="fetching",
-									cache_task=live_cache.request_region(_tile_input_bounds(tz, ty, tx)),
+									cache_task=input_level.request_region(_tile_input_bounds(tz, ty, tx)),
 								)
 							cache_backlog.append((next_sequence, event))
 							next_sequence += 1

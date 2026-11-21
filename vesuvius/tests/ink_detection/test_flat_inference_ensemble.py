@@ -31,11 +31,11 @@ class _ConstantLogits(nn.Module):
 
 
 def _save_checkpoint(path, *, depth: int = 3, side: int = 16, seed: int = 0):
-    config_mapping = config_mapping("vesuvius_unet_2p5d", depth=depth, side=side)
-    config_mapping["image_normalization"] = "robust_mad"
+    mapping = config_mapping("vesuvius_unet_2p5d", depth=depth, side=side)
+    mapping["image_normalization"] = "robust_mad"
     torch.manual_seed(seed)
-    model = make_model(InkConfig.from_mapping(config_mapping))
-    torch.save({"config": config_mapping, "model": model.state_dict()}, path)
+    model = make_model(InkConfig.from_mapping(mapping))
+    torch.save({"config": mapping, "model": model.state_dict()}, path)
     return path
 
 

@@ -8,6 +8,10 @@
 #include <string>
 #include <vector>
 
+namespace vcr::zarr {
+struct Access;
+}
+
 namespace vcr::zarr::detail {
 // Writes beside the destination and publishes only after the complete file closes.
 void atomicWriteFile(const std::filesystem::path& path, const std::function<void(std::ostream&)>& write);
@@ -19,4 +23,8 @@ void atomicWriteFile(const std::filesystem::path& path, const std::function<void
 bool writeCacheMetadata(const std::filesystem::path& path, const std::string& data, const std::vector<std::string>& cacheDirs,
                         const std::optional<std::filesystem::path>& vc3dVolumeDir, std::optional<std::int64_t> maxBytes,
                         std::optional<std::int64_t> minFreeBytes);
+
+// Drops the array documents this process knows (see readArrayDocument) at a remote
+// location and below it, so their next open reads them as published.
+void forgetKnownArrays(const std::string& location, const Access& access);
 }
