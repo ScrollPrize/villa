@@ -7,6 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import flow_grad_smoothing
+import flow_metal
 import flow_triton
 from geom_utils import grid_sample_border
 
@@ -488,10 +489,11 @@ class CartesianFlowField(nn.Module):
         self._pending_lr_upsampled = lr_upsampled
         return low_field, high_field, self._field_grad_acc
 
-    def _get_direct_integrator(self):
+    def _get_direct_integrator(self, backend=flow_triton):
         # Direct-LR mode: sample the LR lattice at query points instead of
         # upsampling it to HR every step (FIT_SPIRAL_DIRECT_LR=1). Field
-        # gradients accumulate into per-lattice buffers.
+        # gradients accumulate into per-lattice buffers. `backend` is the
+        # fused-kernel module: flow_triton on CUDA, flow_metal on MPS.
         lr_flow, hr_flow = self.flows[0], self.flows[1]
         low, high = lr_flow, hr_flow
         training_field = torch.is_grad_enabled() and (
@@ -516,7 +518,7 @@ class CartesianFlowField(nn.Module):
         low_c, high_c = low.contiguous(), high.contiguous()
 
         def integrate(y_flat, h, n_steps, reverse=False):
-            return flow_triton.rk4_direct_integrate(
+            return backend.rk4_direct_integrate(
                 y_flat, low_c, high_c, 1.0, 1.0, acc_lo, acc_hi, h, n_steps,
                 reverse)
 
@@ -533,10 +535,13 @@ class CartesianFlowField(nn.Module):
         if flow_triton.direct_lr_enabled(self.direct_lr):
             if flow_triton.rk4_triton_available(self.flows[0], self.flows[1]):
                 return self._get_direct_integrator()
+            if flow_metal.rk4_metal_available(self.flows[0], self.flows[1]):
+                return self._get_direct_integrator(flow_metal)
             if flow_triton.direct_lr_requested():
                 raise RuntimeError(
                     'FIT_SPIRAL_DIRECT_LR=1 asks for direct low-resolution sampling, which exists only in the '
-                    f'fused Triton kernel (CUDA float32 lattices; here {self.flows[0].device}, {self.flows[0].dtype}). '
+                    'fused kernels (Triton on CUDA, Metal on MPS; float32 lattices; '
+                    f'here {self.flows[0].device}, {self.flows[0].dtype}). '
                     'Unset it, or set FIT_SPIRAL_DIRECT_LR=0, for the upsampled field.')
             if not getattr(self, '_upsampled_noted', False):
                 self._upsampled_noted = True
