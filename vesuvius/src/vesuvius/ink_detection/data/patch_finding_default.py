@@ -151,6 +151,17 @@ def find_segment_patches(
     return training, held_out
 
 
+def _occupied_stride_origins(surface: np.ndarray, stride: int) -> np.ndarray:
+    """Find nonempty stride cells in row-major order, including partial cells."""
+    if not surface.size:
+        return np.empty((0, 2), dtype=np.intp)
+    ys = np.arange(0, surface.shape[0], stride)
+    xs = np.arange(0, surface.shape[1], stride)
+    occupied_columns = np.logical_or.reduceat(surface, xs, axis=1)
+    occupied_cells = np.logical_or.reduceat(occupied_columns, ys, axis=0)
+    return np.argwhere(occupied_cells) * stride
+
+
 def find_segment_unlabeled_patches(
     segment: Segment, open_volume: Callable[[str, int], object]
 ) -> tuple[list[Patch], list[Patch]]:
@@ -170,9 +181,6 @@ def find_segment_unlabeled_patches(
         else open_volume(segment.validation_mask, scan_scale)
     )
     surface_slice = np.asarray(scan_volume[scan_surface])
-    ys, xs = np.nonzero(surface_slice)
-    if len(ys) == 0:
-        raise ValueError(f"{segment.image_volume} contains no nonzero projected data")
     stride = max(
         1,
         int(
@@ -182,9 +190,9 @@ def find_segment_unlabeled_patches(
             )
         ),
     )
-    corners = np.unique(
-        np.stack([ys // stride * stride, xs // stride * stride], axis=1), axis=0
-    )
+    corners = _occupied_stride_origins(surface_slice, stride)
+    if not len(corners):
+        raise ValueError(f"{segment.image_volume} contains no nonzero projected data")
     scan_h = max(1, int(round(patch_size[1] / scale_y)))
     scan_w = max(1, int(round(patch_size[2] / scale_x)))
     sup_surface = (
@@ -194,9 +202,8 @@ def find_segment_unlabeled_patches(
     training: list[Patch] = []
     for y_scan, x_scan in corners.tolist():
         y_scan, x_scan = int(y_scan), int(x_scan)
-        image_patch = scan_volume[
-            scan_surface, y_scan : y_scan + scan_h, x_scan : x_scan + scan_w
-        ]
+        # The center plane was already loaded to find the occupied cells.
+        image_patch = surface_slice[y_scan : y_scan + scan_h, x_scan : x_scan + scan_w]
         coverage = 0.0 if image_patch.size == 0 else (
             float(np.count_nonzero(image_patch)) / float(image_patch.size)
         )
