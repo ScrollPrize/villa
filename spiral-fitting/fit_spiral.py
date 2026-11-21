@@ -1727,11 +1727,14 @@ class FitContext:
         progress_or_null(self.progress).begin(
             'loading', 'Reading object-store inputs',
             detail=os.path.basename(str(self.config['object_store_location'])))
+        # The input manifest's volume is the fit volume of a selection no
+        # object of which declares one (a fit on manifest inputs alone).
         return load_fit_inputs(
             self.config, lasagna=self._lasagna_normal_inputs(),
             external_frames=self._external_input_frames(), dist=self.dist,
             cache_directory=self.cache_path, log=self.input_log,
-            pins=self._resume_input_pins())
+            pins=self._resume_input_pins(),
+            default_volume_uuid=getattr(self.paths, 'volume_uuid', None) or None)
 
     def _resume_input_pins(self):
         """The pins (object_store_inputs.InputPins) the resumed checkpoint's
