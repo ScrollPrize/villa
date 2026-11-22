@@ -18,6 +18,7 @@ from vesuvius.ink_detection.config import InkConfig, NormalizationConfig
 from vesuvius.ink_detection.inference.infer import (
     ChunkAccumulator,
     FlatPatchReader,
+    build_lowres_block_mask,
     choose_pyramid_array,
     compute_chunk_contribution_counts,
     compute_equal_length_mirror_axes,
@@ -89,6 +90,23 @@ def test_occupancy_scan_keeps_the_depth_axis_of_a_narrow_render():
         np.moveaxis(level, 0, -1), depth_axis_first=False
     )
     np.testing.assert_array_equal(depth_last, expected)
+
+
+@pytest.mark.parametrize("rounding", [np.ceil, np.floor])
+def test_occupancy_grid_aligns_with_user_mask_and_keeps_unscanned_edges(tmp_path, rounding):
+    height, width = 51, 67
+    level = np.zeros((17, int(rounding(height / 8)), int(rounding(width / 8))), dtype=np.uint8)
+    level[:, 0, 7] = 1
+    create_group(tmp_path / "render.zarr").create_array("3", shape=level.shape, chunks=level.shape, dtype="u1")[:] = level
+    user_mask = np.zeros((height, width), dtype=bool)
+    user_mask[:8, 56:] = True
+
+    occupancy, scale, _ = build_lowres_block_mask(
+        open_group(tmp_path / "render.zarr"), height=height, width=width, user_mask=user_mask
+    )
+
+    assert scale == (8, 8)
+    assert np.argwhere(occupancy).tolist() == [[0, 7]] + ([[0, 8]] if rounding is np.floor else [])
 
 
 def test_flat_preprocessing_accepts_exact_training_contracts():
