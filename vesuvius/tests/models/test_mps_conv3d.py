@@ -180,3 +180,24 @@ def test_per_tap_path_sums_low_precision_taps_in_fp32():
     assert got.dtype == native.dtype == torch.bfloat16
     native_err = (native.float() - want).abs().max()
     assert (got.float() - want).abs().max() <= 1.5 * native_err
+
+
+@pytest.mark.parametrize("stack_limit_bytes", [0, 2**40])
+def test_rewritten_output_is_contiguous_for_losses_that_view_it(stack_limit_bytes):
+    # SurfaceFrameMultiTermLoss (and the ECT loss) flatten predictions with view(); a 1x1x1 task head swapped by the
+    # trainer must give them a tensor they can view, with gradients intact.
+    from vesuvius.models.training.loss.surface_frame import SurfaceFrameMultiTermLoss
+
+    torch.manual_seed(0)
+    head = nn.Conv3d(4, 9, 1)
+    x = torch.randn(1, 4, 8, 8, 8)
+    target = torch.randn(1, 9, 8, 8, 8)
+    loss_fn = SurfaceFrameMultiTermLoss()
+    want, _ = loss_fn(head(x), target)
+    xr = x.clone().requires_grad_()
+    y = conv3d_as_conv2d(head, xr, stack_limit_bytes=stack_limit_bytes)
+    assert y.is_contiguous()
+    got, _ = loss_fn(y, target)
+    got.backward()
+    torch.testing.assert_close(got, want)
+    assert xr.grad is not None and torch.isfinite(xr.grad).all()

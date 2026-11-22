@@ -34,8 +34,9 @@ def conv3d_as_conv2d(conv: nn.Conv3d, x: torch.Tensor, stack_limit_bytes: int = 
     """``conv(x)`` for a zero-padded ``nn.Conv3d``, computed with ``F.conv2d`` over the output depth planes.
 
     Output plane ``o`` reads input planes ``o * stride + k * dilation - padding`` for the ``kd`` depth taps ``k``. The
-    input is read depth-major (``[D, B, C, H, W]``), so that the planes one tap reads form a slice, and the output is
-    returned as a view of a depth-major tensor, which the next layer's convolution reads without a copy.
+    input is read depth-major (``[D, B, C, H, W]``), so that the planes one tap reads form a slice. The output is
+    returned contiguous in the usual ``[B, C, D, H, W]`` layout, as ``nn.Conv3d`` returns it, so callers that ``view``
+    it (losses flattening the spatial axes, for example) work unchanged.
 
     Stacked channel-major (``[C, kd]``) the taps make one 2-D convolution with ``C * kd`` input channels (the weight
     ``[Co, C / groups, kd, kh, kw]`` reshaped to ``[Co, C / groups * kd, kh, kw]`` matches that order), which is the
@@ -104,7 +105,7 @@ def conv3d_as_conv2d(conv: nn.Conv3d, x: torch.Tensor, stack_limit_bytes: int = 
             # MPS frees a buffer only once the GPU work queued on it has run. This path is fast enough that, without a
             # wait, a whole decoder of these large layers gets queued ahead and the freed copies pile up.
             torch.mps.synchronize()
-    y = y.reshape(d_out, b, *y.shape[1:]).permute(1, 2, 0, 3, 4)
+    y = y.reshape(d_out, b, *y.shape[1:]).permute(1, 2, 0, 3, 4).contiguous()
     return y.squeeze(0) if unbatched else y
 
 
