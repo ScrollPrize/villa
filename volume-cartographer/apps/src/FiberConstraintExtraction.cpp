@@ -9,6 +9,7 @@
 #include "FiberConstraintDatabase.hpp"
 #include "FiberConstraintChunks.hpp"
 #include "FiberCrossingAxes.hpp"
+#include "FiberNeighbourNormals.hpp"
 #include "FiberConstraintParallelism.hpp"
 #include "FiberNormalSamplingBenchmark.hpp"
 #include "FiberConstraintSources.hpp"
@@ -160,6 +161,10 @@ int runFiberConstraintExtraction(int argc, char** argv)
     using Json = nlohmann::json;
     if (argc != 2) throw std::invalid_argument("usage: vc_fiber_constraints CONFIG.json [--cuda] [--cuda-cache-gb N]");
     Json cfg; std::ifstream input(argv[1]); input >> cfg;
+    if(cfg.contains("neighbour_normals_output")) {
+        std::cout<<"neighbour normals "<<inferFiberNeighbourNormals(cfg).dump()<<std::endl;
+        return 0;
+    }
     if(!cfg.value("sqlite_memory_statistics",true) && sqlite3_config(SQLITE_CONFIG_MEMSTATUS,0)!=SQLITE_OK)
         throw std::runtime_error("SQLite memory statistics must be configured before opening any store");
     for(const auto* key:{"sqlite_serialize_memory","sqlite_in_memory","sqlite_page_size","sqlite_insert_batch_rows"})

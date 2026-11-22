@@ -77,6 +77,11 @@ struct FiberStripAxisTarget {
     // weight is absolute (not scaled by axisWeight). Ignored on fixed nodes.
     cv::Vec3d crossing{0.0, 0.0, 0.0};
     double crossingWeight = 0.0;
+    // A signed soft target (for example other fibers' signed normals nearby):
+    // pulled as given, never re-oriented, and its weighted majority decides
+    // the fiber's facing unless fixed anchors do. Absolute weight; ignored on fixed nodes.
+    cv::Vec3d signedAxis{0.0, 0.0, 0.0};
+    double signedWeight = 0.0;
 };
 
 struct FiberStripNormalResult {

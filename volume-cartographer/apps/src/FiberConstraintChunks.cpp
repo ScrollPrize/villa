@@ -1,5 +1,6 @@
 #include "FiberConstraintChunks.hpp"
 #include "FiberCrossingAxes.hpp"
+#include "FiberNeighbourNormals.hpp"
 #include "vc/fiber_tracer/FiberStripNormals.hpp"
 #include "vc/lasagna/ChannelSampler.hpp"
 #include "ChunkSaturationWindow.hpp"
@@ -494,6 +495,40 @@ Json extractFiberConstraintChunks(const Json& cfg,Json& metadata,
                     {"prediction_frames",predictionFrames},{"crossing_frames",crossingFrames},
                     {"prediction_power",predictionPower},{"prediction_min",predictionMin},{"coherence_power",coherencePower},{"used",used},{"for_unknown_fibers",unknown},{"crossed_nodes",crossedNodes}};
             }
+            if(cfg.contains("neighbour_normals")){
+                // Signed normals of other fibers (neighbour_normals: strip samples of inferred
+                // normals), gathered per chain node with a Gaussian of neighbour_sigma along
+                // the arc: the signed mean direction, weight neighbour_weight * min(1, summed
+                // Gaussian) * |mean| / summed Gaussian (agreement of the samples).
+                const double neighbourWeight=cfg.value("neighbour_weight",100.),sigma=cfg.value("neighbour_sigma",32.);
+                if(!(sigma>0.)||neighbourWeight<0.)throw std::invalid_argument("neighbour_sigma must be positive and neighbour_weight >= 0");
+                size_t unknown=0;
+                const auto inferred=readFiberStripSamples(cfg.at("neighbour_normals").get<std::string>(),ids,unknown);
+                std::atomic<size_t> nodesTotal{0};
+                cv::parallel_for_(cv::Range(0,int(lines.size())),[&](const cv::Range& range){
+                    for(int fi=range.start;fi<range.end;++fi){
+                        const size_t i=size_t(fi);const auto& chain=chains[i];const auto& list=inferred[i];
+                        if(chain.points.empty()||list.empty())continue;
+                        size_t nodes=0;
+                        for(size_t k=0;k<chain.points.size();++k){
+                            cv::Vec3d mean{0,0,0};double sum=0.;
+                            const auto lo=std::lower_bound(list.begin(),list.end(),chain.arc[k]-3*sigma,[](const auto& a,double x){return a.arc<x;});
+                            for(auto it=lo;it!=list.end()&&it->arc<=chain.arc[k]+3*sigma;++it){
+                                const double d=it->arc-chain.arc[k],f=std::exp(-0.5*d*d/(sigma*sigma));
+                                mean+=f*it->normal;sum+=f;
+                            }
+                            const double length=cv::norm(mean);
+                            if(!(sum>0.)||!(length>0.))continue;
+                            auto& target=(*targets)[i][k];
+                            target.signedAxis=mean/length;
+                            target.signedWeight=neighbourWeight*std::min(1.,sum)*length/sum;
+                            ++nodes;
+                        }
+                        nodesTotal+=nodes;
+                    }
+                },int(workers));
+                fusion["neighbours"]=Json{{"weight",neighbourWeight},{"sigma",sigma},{"nodes",nodesTotal.load()},{"for_unknown_fibers",unknown}};
+            }
         }
         const auto solved=vc::fiber_tracer::solveFiberStripNormals(polylines,options,int(workers),targets.get());
         strips=std::make_unique<StripNormals>(lines.size());
@@ -504,6 +539,22 @@ Json extractFiberConstraintChunks(const Json& cfg,Json& metadata,
             {"max_iterations",options.maxIterations},{"fibers",lines.size()},{"degenerate_fibers",degenerate},
             {"unconverged_fibers",unconverged},{"final_cost",cost},{"seconds",elapsed(stripStarted)}};
         if(!fusion.is_null())metadata["strip_normals"]["fusion"]=fusion;
+        if(cfg.contains("strip_samples_output")){
+            // The solved normals at a regular arc spacing, for neighbour-normal inference.
+            const double step=cfg.value("strip_samples_spacing",16.);
+            if(!(step>0.))throw std::invalid_argument("strip_samples_spacing must be positive");
+            std::vector<std::vector<FiberStripSample>> samples(lines.size());
+            cv::parallel_for_(cv::Range(0,int(lines.size())),[&](const cv::Range& range){
+                for(int fi=range.start;fi<range.end;++fi){
+                    const size_t i=size_t(fi);const auto& g=geometries[i];
+                    for(double arc=0.;arc<=g.length();arc+=step){
+                        const auto n=stripNormalAt(*strips,i,g,arc);
+                        if(n.valid)samples[i].push_back({arc,samplePolylineArc(g,arc).point,n.normal});
+                    }
+                }
+            },int(workers));
+            writeFiberStripSamples(cfg.at("strip_samples_output").get<std::string>(),ids,samples);
+        }
         std::cout<<"strip normals "<<metadata["strip_normals"].dump()<<std::endl;
     }
     std::map<Cell,size_t> cells;

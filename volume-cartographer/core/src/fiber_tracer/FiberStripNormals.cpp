@@ -269,10 +269,12 @@ FiberStripNormalResult solveChain(
             double vote = 0.0;
             for (size_t i = 0; i < n; ++i) {
                 const auto& target = (*targets)[i];
+                const cv::Vec3d current = u[i] * std::cos(theta[i]) + v[i] * std::sin(theta[i]);
+                if (!target.fixed && target.signedWeight > 0.0) vote += target.signedWeight * unit(target.signedAxis).dot(current);
                 if (!target.fixed || !(target.weight > 0.0)) continue;
                 const cv::Vec3d a = unit(target.axis);
                 if (cv::norm(a) == 0.0) continue;
-                vote += target.weight * a.dot(u[i] * std::cos(theta[i]) + v[i] * std::sin(theta[i]));
+                vote += target.weight * a.dot(current);
             }
             if (vote < 0.0) for (size_t i = 0; i < n; ++i) theta[i] += kPi;
             // The axis targets carry no sign. It is not taken from the geometry
@@ -348,6 +350,9 @@ FiberStripNormalResult solveChain(
                         if (previous.dot(x) < 0.0) x = -x;
                         xu = x.dot(u[i]); xv = x.dot(v[i]);
                     }
+                    const cv::Vec3d sa = unit(target.signedAxis);
+                    const bool pulledSigned = !target.fixed && target.signedWeight > 0.0 && cv::norm(sa) > 0.0;
+                    const double su = sa.dot(u[i]), sv = sa.dot(v[i]);
                     const bool interior = i + 1 < n;
                     const double cb = std::cos(before), sb = std::sin(before);
                     const auto cost = [&](double c, double sn, double delta) {
@@ -356,6 +361,7 @@ FiberStripNormalResult solveChain(
                         if (interior) { const double l = -sn * du[i] + c * dv[i]; value += lateralWeight * l * l; }
                         if (pulled) value += axisWeight * ((c - au) * (c - au) + (sn - av) * (sn - av));
                         if (crossed) value += target.crossingWeight * ((c - xu) * (c - xu) + (sn - xv) * (sn - xv));
+                        if (pulledSigned) value += target.signedWeight * ((c - su) * (c - su) + (sn - sv) * (sn - sv));
                         return value;
                     };
                     int best = 0; double bestCost = std::numeric_limits<double>::infinity();
@@ -376,15 +382,19 @@ FiberStripNormalResult solveChain(
                 // Which way the whole fiber faces: the signed anchors when there
                 // are any (the gauge flip above already sided the geometry
                 // field with them), otherwise the geometry field's majority.
-                double fieldVote = 0.0;
-                bool anchored = false;
+                double fieldVote = 0.0, signedVote = 0.0;
+                bool anchored = false, signedSeen = false;
                 for (size_t i = 0; i < n; ++i) {
                     const auto& target = (*targets)[i];
                     if (target.fixed && target.weight > 0.0) anchored = true;
+                    if (!target.fixed && target.signedWeight > 0.0) {
+                        signedSeen = true;
+                        signedVote += target.signedWeight * unit(target.signedAxis).dot(u[i] * std::cos(stepped[i]) + v[i] * std::sin(stepped[i]));
+                    }
                     if (!(target.weight > 0.0)) continue;
                     fieldVote += target.weight * std::cos(stepped[i] - theta[i]);
                 }
-                if (!anchored && fieldVote < 0.0) for (auto& angle : stepped) angle += kPi;
+                if (!anchored && (signedSeen ? signedVote : fieldVote) < 0.0) for (auto& angle : stepped) angle += kPi;
                 for (size_t i = 0; i < n; ++i) {
                     const auto& target = (*targets)[i];
                     cv::Vec3d a = unit(target.axis);
@@ -403,6 +413,12 @@ FiberStripNormalResult solveChain(
             }
             for (size_t i = 0; i < n; ++i) {
                 const auto& target = (*targets)[i];
+                const cv::Vec3d sa = unit(target.signedAxis);
+                if (!target.fixed && target.signedWeight > 0.0 && cv::norm(sa) > 0.0)
+                    problem.AddResidualBlock(
+                        new ceres::AutoDiffCostFunction<AxisResidual, 3, 1>(
+                            new AxisResidual{std::sqrt(target.signedWeight), sa.dot(u[i]), sa.dot(v[i]), sa.dot(tangent[i])}),
+                        nullptr, &theta[i]);
                 const cv::Vec3d& x = orientedCrossing[i];
                 if (cv::norm(x) == 0.0) continue;
                 problem.AddResidualBlock(
