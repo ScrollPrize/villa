@@ -3279,12 +3279,16 @@ def _compared(manifest):
     location and history generation, the version pins (VERSION_FIELDS), how
     links were refreshed (their results are recorded) and the position they
     were read at (equal inputs at two positions are equal). A copy of a
-    store holding the same inputs compares equal."""
+    store holding the same inputs compares equal, as does a volume the input
+    manifest names (volume_source 'default') with fit_volume_uuid set to the
+    same volume ('configured')."""
     validated_manifest_references(manifest)
     manifest = dict(manifest)
     manifest['store'] = {'uuid': (manifest.get('store') or {}).get('uuid')}
     manifest.pop('link_refresh', None)
     manifest.pop('position', None)
+    if manifest.get('volume_source') == 'default':
+        manifest['volume_source'] = 'configured'
     if manifest.get('outer_shell'):
         manifest['outer_shell'] = {key: value for key, value in manifest['outer_shell'].items()
                                    if key != 'reference'}

@@ -1371,10 +1371,7 @@ class ServiceState:
         (_resolve_session_scroll repeats the check once the volume is
         known)."""
         project = scroll.project
-        volume = config.get("fit_volume_uuid")
-        if not volume and paths.checkpoint:
-            *_, manifest = self._checkpoint_durable_cfg(paths.checkpoint)
-            volume = ((manifest or {}).get("object_store") or {}).get("volume_uuid")
+        volume = config.get("fit_volume_uuid") or self._checkpoint_volume(paths.checkpoint)
         try:
             if volume:
                 scroll.umbilicus(str(volume))
@@ -1754,8 +1751,10 @@ class ServiceState:
                 "error", f"The inputs could not be updated; the fit is unchanged: {cause}",
                 severity="error", source="service", operation="updating_inputs")
         try:
+            # The inputs stay in the session's fit volume (_input_request).
             prepared = self._prepare_position(config, paths, scroll, minimum,
-                                              incremental=True)
+                                              incremental=True,
+                                              fit_volume=paths.volume_uuid)
         except BaseException as exc:
             refused(exc, "linking")
             return
@@ -1973,17 +1972,37 @@ class ServiceState:
         checkpoint's inputs were read in. A build without one (on a service
         without an object store, which only tests construct) fits the
         project's only volume."""
-        if paths.checkpoint:
-            *_, manifest = self._checkpoint_durable_cfg(paths.checkpoint)
-            volume = ((manifest or {}).get("object_store") or {}).get("volume_uuid")
-            if volume:
-                return str(volume)
+        volume = self._checkpoint_volume(paths.checkpoint)
+        if volume:
+            return volume
         volumes = sorted(scroll.project.volumes)
         if len(volumes) != 1:
             raise ScrollSpecError(
                 "the build reads no fit volume from its inputs, so it must be the "
                 f"project's only volume (it has {len(volumes)})")
         return volumes[0]
+
+    def _checkpoint_volume(self, path):
+        """The fit volume a checkpoint's object-store inputs were read in, or
+        None (no checkpoint, or one that records none)."""
+        if not path:
+            return None
+        *_, manifest = self._checkpoint_durable_cfg(path)
+        volume = ((manifest or {}).get("object_store") or {}).get("volume_uuid")
+        return str(volume) if volume else None
+
+    @staticmethod
+    def _input_request(config, fit_volume=None):
+        """``config``'s InputRequest, read in ``fit_volume`` (a resident
+        session's, or the resumed checkpoint's) when the configuration names
+        none, as when it does: a selection that declares no volume is read
+        in it, and objects declaring another one are refused. A session
+        fitted in its input manifest's volume names it nowhere else."""
+        from object_store_inputs import request_from_config
+        request = request_from_config(config)
+        if request.fit_volume_uuid is None and fit_volume:
+            request = dataclasses.replace(request, fit_volume_uuid=str(fit_volume))
+        return request
 
     def _checkpoint_pins(self, path):
         """The pins (object_store_inputs.InputPins) a checkpoint's inputs
@@ -2029,21 +2048,26 @@ class ServiceState:
         """Resolve the fit volume, then link and pin the selected inputs.
 
         Resolve the scroll first so linking uses the correct Lasagna scale.
-        Check that preparation keeps the same fit volume.
+        Check that preparation keeps the same fit volume. A build that resumes
+        a checkpoint reads in the checkpoint's fit volume (_input_request);
+        a fresh one in the volume its configuration or selection names.
         Returns ``(prepared, volume, paths, ScrollSpec)``.
         """
-        from object_store_inputs import read_snapshot, reading_stage, request_from_config
+        from object_store_inputs import read_snapshot, reading_stage
         config = self._effective_config(paths, run)
+        checkpoint_volume = self._checkpoint_volume(paths.checkpoint)
         progress = self._input_progress()
         try:
             with self.object_store.open(read_only=True, cache_directory=paths.cache_directory) as store, \
                     reading_stage(progress, "Reading the selected inputs", "fit volume"):
-                volume = read_snapshot(store, request_from_config(config)).volume_uuid
+                volume = read_snapshot(
+                    store, self._input_request(config, checkpoint_volume)).volume_uuid
         finally:
             progress.close()
         self._prepare_fiber_directions(scroll, volume, paths, config)
         paths, spec = self._resolve_session_scroll(scroll, volume, paths, config)
-        prepared, pinned = self._prepare_position(config, paths, spec, minimum, volume=True)
+        prepared, pinned = self._prepare_position(config, paths, spec, minimum, volume=True,
+                                                  fit_volume=checkpoint_volume)
         if pinned != volume:
             raise ScrollSpecError(
                 f"the inputs' fit volume changed from {volume} to {pinned} while "
@@ -2077,14 +2101,15 @@ class ServiceState:
         return preparation
 
     def _prepare_position(self, config, paths, scroll, minimum, *, volume=False,
-                          incremental=False):
+                          incremental=False, fit_volume=None):
         """Link and pin a position for ``config`` on the bound store; with
         ``volume``, also the fit volume pinned there (``(prepared,
         volume)``). ``incremental`` (an input update) links only objects
-        selected since the store's last refresh, when nothing else changed."""
+        selected since the store's last refresh, when nothing else changed.
+        ``fit_volume`` is the resident session's or the resumed checkpoint's
+        fit volume (_input_request)."""
         from fit_session import lasagna_normal_inputs
-        from object_store_inputs import (fit_volume_at, prepare_position,
-                                         request_from_config)
+        from object_store_inputs import fit_volume_at, prepare_position
         self._prepare_lasagna_packs(paths, config)
         lasagna = lasagna_normal_inputs(
             load_lasagna_source(paths.lasagna) if paths.lasagna else None,
@@ -2093,7 +2118,7 @@ class ServiceState:
         def log(line):
             self.events.append("log", line, source="service",
                                operation="preparing_inputs")
-        request = request_from_config(config)
+        request = self._input_request(config, fit_volume)
         progress = self._input_progress()
         with self._store_write_lock:
             try:

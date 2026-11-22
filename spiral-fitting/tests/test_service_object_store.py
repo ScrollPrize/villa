@@ -903,3 +903,92 @@ def test_winding_model_supervision_reads_the_bound_artifact(host, store_path, tm
     assert paths.provenance['winding_inference'] == str(artifact)
     paths, _, _, _ = state._prepare_session_request(initialize_body())
     assert paths.winding_inference == ''
+
+
+# ---------------------------------------------------------------------------
+# Input updates of a resident session
+# ---------------------------------------------------------------------------
+
+def _fallback_checkpoint(host, tmp_path):
+    """An empty store and a checkpoint of a fit on it in its input manifest's
+    volume (no store object declares one, fit_volume_uuid unset), under the
+    service's output directory. Returns ``(store, config, inputs, path)``."""
+    import torch
+    import object_store_inputs as osi
+    from object_store_fixture import fit_config
+    store = str(tmp_path / 'empty.vcobj')
+    with ObjectStore.create(store, author='ingest', hostname='host'):
+        pass
+    config = {**fit_config(store, 'svc'), **NO_DENSE}
+    inputs = osi.load_fit_inputs(config, log=lambda line: None, default_volume_uuid=VOLUME)
+    assert inputs.manifest['volume_source'] == 'default'
+    checkpoint = host.output / 'fit' / 'checkpoint.ckpt'
+    checkpoint.parent.mkdir(parents=True)
+    torch.save({'cfg': config, 'input_manifest': {'volume_uuid': VOLUME,
+                                                  'object_store': inputs.manifest}}, checkpoint)
+    return store, config, inputs, checkpoint
+
+
+def _put_elsewhere(store):
+    """Save a point collection declaring another volume than the fit's."""
+    from object_store_fixture import frame, put_pcl
+    with ObjectStore.open(store, author='editor') as db:
+        put_pcl(db, {0: ([5.0, 32.0, 32.0], None)},
+                coordinates=frame(volume='other-volume'), name='elsewhere')
+
+
+def test_an_input_update_links_an_undeclared_selection_in_the_session_volume(host, tmp_path):
+    """A session resumed from a checkpoint fitted in its input manifest's
+    volume prepares an input update in the session's volume, which its
+    configuration does not name; objects declaring another volume are
+    refused before anything is linked, as for a configured volume."""
+    import object_store_inputs as osi
+    store, config, inputs, checkpoint = _fallback_checkpoint(host, tmp_path)
+    state = service(host, store)
+    paths, _ = _built(state, initialize_body() | {'paths': {'checkpoint': str(checkpoint)}})
+    assert paths.volume_uuid == VOLUME and state.session_paths.volume_uuid == VOLUME
+    state._building = False
+    replaced = []
+    state.session = SimpleNamespace(
+        status=lambda: {'state': SessionState.Idle, 'input_generation': len(replaced),
+                        'applied_config': config},
+        update_inputs=lambda position: replaced.append(position) or {
+            'input_generation': len(replaced)})
+    state.update_inputs({})
+    wait_until(lambda: state._input_update is None)
+    assert state._input_preparation_error is None
+    [pinned] = replaced
+    assert pinned == osi.InputPins.from_manifest(inputs.manifest).provenance()
+    _put_elsewhere(store)
+    state.update_inputs({})
+    wait_until(lambda: state._input_update is None)
+    error = state._input_preparation_error
+    assert error['phase'] == 'linking', error
+    assert f'fit volume {VOLUME} does not match the volume other-volume' in error['message']
+    assert len(replaced) == 1
+
+
+def _reloaded(state, request, timeout=60):
+    """Build ``request`` as a rebuild that reloads the inputs does, capturing
+    what the build is given instead of building: ``(paths, scroll)``, or the
+    preparation error."""
+    built = []
+    state._build = lambda session_id, previous, paths, run, preview, scroll: (
+        built.append((paths, scroll)))
+    state._begin_build(*state._prepare_session_request(request), reload_inputs=True)
+    wait_until(lambda: built or not state._building, timeout)
+    return built[0] if built else state.status()['input_preparation_error']
+
+
+def test_a_reload_of_a_checkpoints_inputs_reads_them_in_its_volume(host, tmp_path):
+    """A rebuild that reloads the inputs of a checkpoint fitted in its input
+    manifest's volume reads them in that volume, as for a checkpoint fitted
+    with fit_volume_uuid; objects declaring another volume are refused before
+    the build."""
+    store, _, _, checkpoint = _fallback_checkpoint(host, tmp_path)
+    request = initialize_body() | {'paths': {'checkpoint': str(checkpoint)}}
+    paths, _ = _reloaded(service(host, store), request)
+    assert paths.volume_uuid == VOLUME
+    _put_elsewhere(store)
+    failure = _reloaded(service(host, store), request)
+    assert f'fit volume {VOLUME} does not match the volume other-volume' in failure['message']
