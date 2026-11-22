@@ -690,6 +690,7 @@ def _run_training(request: TrainingRequest) -> int:
         num_processes=accelerator.num_processes,
         train_samples=len(train_dataset),
         policy_audit=policy.audit,
+        patches=shared_dataset.training_patches,
     )
     stream_start_step = start_step
     fast_forward = {"steps_in_stream": 0, "epochs": 0, "batches_into_epoch": 0}
@@ -701,7 +702,9 @@ def _run_training(request: TrainingRequest) -> int:
             epochs, batches = resume_position(
                 steps_in_stream, len(train_loader), accelerator.num_processes
             )
-            train_batch_sampler.fast_forward(epochs, batches)
+            train_batch_sampler.fast_forward(
+                epochs, batches, num_processes=accelerator.num_processes
+            )
             fast_forward = {
                 "steps_in_stream": steps_in_stream,
                 "epochs": epochs,

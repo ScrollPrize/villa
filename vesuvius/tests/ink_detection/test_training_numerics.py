@@ -325,7 +325,11 @@ def test_flat_mode_never_enters_positive_full_3d_dilation_configuration():
 class _SyntheticTrainingDataset(torch.utils.data.Dataset):
     def __init__(self, config, *, do_augmentations, patches=None, segments=None):
         del config, do_augmentations
-        self.training_patches = [0, 1]
+        patch = SimpleNamespace(
+            segment=SimpleNamespace(dataset_idx=0, segment_relpath="s"),
+            bbox=(0, 0, 0, 1, 4, 4),
+        )
+        self.training_patches = [patch, patch]
         self.validation_patches = []
         self.segments = []
         self._patches = self.training_patches if patches is None else list(patches)

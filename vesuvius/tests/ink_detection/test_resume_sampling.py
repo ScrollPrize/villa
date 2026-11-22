@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 from pathlib import Path
 
@@ -22,7 +23,7 @@ from vesuvius.ink_detection.training.samplers import (
     sampling_stream_key,
     training_batch_sampler,
 )
-from vesuvius.ink_detection.types import Patch, Segment
+from vesuvius.ink_detection.types import Patch, SamplingPolicy, Segment
 
 CONFIGS = Path(__file__).resolve().parents[2] / "src/vesuvius/ink_detection/configs"
 STRATEGIES = ["uniform", "scroll_segment_balanced", "fixed_scroll_prior_stratified"]
@@ -66,9 +67,7 @@ def _config(tmp_path: Path, strategy: str) -> InkDataConfig:
     )
 
 
-def _policy(tmp_path: Path, strategy: str, counts=(2, 2, 4)):
-    """Build the policy the way train.py does on every (re)start: from the config seed."""
-    config = _config(tmp_path, strategy)
+def _patches(config: InkDataConfig, tmp_path: Path, counts=(2, 2, 4)) -> list[Patch]:
     patches = []
     for (dataset_idx, relpath), count in zip(((0, "a1"), (0, "a2"), (1, "b1")), counts):
         segment = Segment(
@@ -81,7 +80,13 @@ def _policy(tmp_path: Path, strategy: str, counts=(2, 2, 4)):
             image_volume="unused",
         )
         patches.extend(Patch(segment=segment, bbox=(0, 0, 0, 1, 2, 2)) for _ in range(count))
-    return build_sampling_policy(patches, config, batch_size=4)
+    return patches
+
+
+def _policy(tmp_path: Path, strategy: str, counts=(2, 2, 4)):
+    """Build the policy the way train.py does on every (re)start: from the config seed."""
+    config = _config(tmp_path, strategy)
+    return build_sampling_policy(_patches(config, tmp_path, counts), config, batch_size=4)
 
 
 def _main_loader(policy, dataset) -> DataLoader:
@@ -168,7 +173,9 @@ def test_resumed_fixed_prior_run_continues_the_uninterrupted_stream(tmp_path, co
         for rank in range(num_processes):
             loader, batch_sampler = _new_loader(_policy(tmp_path, FIXED, counts), dataset)
             prepared = _prepared(loader, num_processes, rank)
-            batch_sampler.fast_forward(*resume_position(completed, len(prepared), num_processes))
+            batch_sampler.fast_forward(
+                *resume_position(completed, len(prepared), num_processes), num_processes=num_processes
+            )
             resumed = _steps(prepared, after)
             assert resumed == uninterrupted[rank][completed : completed + after], (completed, rank)
 
@@ -188,6 +195,25 @@ def test_two_ranks_three_batch_epoch_skips_the_dropped_tail(tmp_path):
     batch_sampler.fast_forward(*resume_position(1, len(prepared), 2))
     # Step 2 of rank 0 is raw batch 4 (the first of the second pass), not raw batch 3.
     assert sorted(_steps(prepared, 1)[0]) == sorted(raw[3])
+
+
+def test_two_rank_resume_pads_the_tail_like_an_uninterrupted_run():
+    """Review case: 9 samples, batch 4, 2 ranks; the tail is padded from the pass start."""
+    dataset = list(range(9))
+
+    def loader(rank):
+        batch_sampler = training_batch_sampler(SamplingPolicy(), dataset, batch_size=4)
+        loader = DataLoader(dataset, batch_sampler=batch_sampler)
+        return _prepared(loader, 2, rank), batch_sampler
+
+    for rank in range(2):
+        uninterrupted = _steps(loader(rank)[0], 4)
+        for completed in range(4):
+            prepared, batch_sampler = loader(rank)
+            batch_sampler.fast_forward(
+                *resume_position(completed, len(prepared), 2), num_processes=2
+            )
+            assert _steps(prepared, 4 - completed) == uninterrupted[completed:], (completed, rank)
 
 
 @pytest.mark.parametrize("strategy", ["uniform", "scroll_segment_balanced"])
@@ -223,12 +249,13 @@ def _recipe(name: str, **changes) -> dict:
     return TrainingConfig.from_mapping(resolve_training_mapping(authored)).to_mapping()
 
 
-def _key(mapping, *, num_processes=1, train_samples=1000, audit=None):
+def _key(mapping, *, num_processes=1, train_samples=1000, audit=None, patches=()):
     return sampling_stream_key(
         mapping,
         num_processes=num_processes,
         train_samples=train_samples,
         policy_audit=audit or {"strategy": "uniform", "patches": train_samples},
+        patches=patches,
     )
 
 
@@ -267,6 +294,14 @@ def test_stream_key_tracks_process_count_and_data():
     assert _key(v2, num_processes=2) != _key(v2)
     assert _key(v2, train_samples=999) != _key(v2)
     assert _key(v2, audit={"strategy": "uniform", "patches": 1000, "x": 1}) != _key(v2)
+
+
+def test_stream_key_tracks_the_ordered_patches_and_quota_order(tmp_path):
+    patches = _patches(_config(tmp_path, FIXED), tmp_path)
+    moved = [replace(patches[0], bbox=(0, 1, 0, 1, 3, 2)), *patches[1:]]
+    keys = {_key({}, patches=p) for p in (patches, moved, patches[::-1])}
+    assert len(keys) == 3
+    assert _key({"quotas": {"A": 2, "B": 2}}) != _key({"quotas": {"B": 2, "A": 2}})
 
 
 @pytest.mark.parametrize(

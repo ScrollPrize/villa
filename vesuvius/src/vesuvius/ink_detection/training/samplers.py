@@ -325,8 +325,8 @@ class ResumableBatchSampler(Sampler[list[int]]):
     def __len__(self) -> int:
         return len(self.inner)
 
-    def fast_forward(self, epochs: int, batches: int = 0) -> None:
-        epochs, batches = int(epochs), int(batches)
+    def fast_forward(self, epochs: int, batches: int = 0, num_processes: int = 1) -> None:
+        epochs, batches, num_processes = int(epochs), int(batches), int(num_processes)
         if epochs < 0 or batches < 0:
             raise ValueError("fast_forward needs non-negative epochs and batches")
         if batches and batches >= len(self.inner):
@@ -346,20 +346,41 @@ class ResumableBatchSampler(Sampler[list[int]]):
                 for _batch in self.inner:
                     self.skipped_batches += 1
             iterator = iter(self.inner)
-            for _ in range(batches):
-                next(iterator)
+            head: list[int] = []
+            for index in range(batches):
+                batch = next(iterator)
+                if index < num_processes:
+                    head.extend(batch)
                 self.skipped_batches += 1
         finally:
             if set_fast_forwarding is not None:
                 set_fast_forwarding(False)
-        self._pending = iterator
+        self._pending = (iterator, head, num_processes)
 
     def __iter__(self) -> Iterator[list[int]]:
         if self._pending is None:
             yield from self.inner
             return
-        iterator, self._pending = self._pending, None
-        yield from iterator
+        (iterator, head, num_processes), self._pending = self._pending, None
+        if self.drop_last or num_processes == 1 or not head:
+            yield from iterator
+            return
+        # BatchSamplerShard pads a pass's tail from the first batches it sees,
+        # which were skipped here, so pad the resumed tail as it would have.
+        count, tail = 0, []
+        for batch in iterator:
+            if len(batch) < self.batch_size:
+                tail = list(batch)
+                break
+            yield batch
+            count += 1
+        while len(head) < num_processes * self.batch_size:
+            head = head + head
+        cursor = 0
+        while tail or count % num_processes:
+            end = cursor + self.batch_size - len(tail)
+            yield tail + head[cursor:end]
+            cursor, tail, count = end, [], count + 1
 
 
 def training_batch_sampler(
@@ -444,14 +465,15 @@ def sampling_stream_key(
     num_processes: int,
     train_samples: int,
     policy_audit: Mapping,
+    patches: Sequence[Patch],
 ) -> str:
     """Identify the training sample stream a checkpoint was written from.
 
     Two launches share a stream only when they train the same recipe on the
     same data with the same number of processes: the canonical config minus
-    :data:`RUN_CONTROL_KEYS`, the process count, the training dataset length
-    and the sampling policy's definition audit (which records the per-scroll,
-    per-segment and per-representation patch counts).
+    :data:`RUN_CONTROL_KEYS`, the process count, the training dataset length,
+    the sampling policy's definition audit and the ordered training patches.
+    Key order is kept because the samplers depend on it.
     """
     identity = {
         "config": {
@@ -462,8 +484,12 @@ def sampling_stream_key(
         "num_processes": int(num_processes),
         "train_samples": int(train_samples),
         "policy": dict(policy_audit),
+        "patches": [
+            [patch.segment.dataset_idx, patch.segment.segment_relpath, list(patch.bbox)]
+            for patch in patches
+        ],
     }
-    encoded = json.dumps(identity, sort_keys=True, default=str).encode("utf-8")
+    encoded = json.dumps(identity, default=str).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
 

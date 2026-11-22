@@ -419,8 +419,9 @@ override a checkpoint.
 
 Checkpoints also record the training sample stream they were written from
 (`sampling_stream`: a key over the config without its launch, save,
-validation and logging fields, the process count, the training sample count
-and the sampling policy definition; and the step at which the stream started).
+validation and logging fields, the process count, the training sample count,
+the sampling policy definition and the ordered training patches; and the step
+at which the stream started).
 A full-state resume with the same key skips the steps already taken in that
 stream, indices only, so the run continues its batches instead of replaying
 them; for `fixed_scroll_prior_stratified` the order is exactly that of an
