@@ -538,7 +538,7 @@ Result sampleTiles(int width, int height, const Request& request, const TilePoin
         static const bool avx2 = __builtin_cpu_supports("avx2");
         constexpr bool bytes = !General && std::is_same_v<std::invoke_result_t<Load, const std::uint8_t*>, std::uint8_t>;
         bool rows = bytes && avx2 && w >= 8 && request.order != 0 && !request.composite && lookups[0].stride[2] == 1 &&
-                    lookups[0].stride[0] + lookups[0].stride[1] < (1 << 28);
+                    lookups[0].block[0] * lookups[0].stride[0] < INT32_MAX;
         for (int a = 0; a < 3 && rows; ++a)
             rows = lookups[0].shift[a] >= 0 && lookups[0].shape[a] < (1 << 30) && maps[0].base[a] > -(1 << 30) && maps[0].base[a] < (1 << 30);
 #else
@@ -589,12 +589,11 @@ Result sampleTiles(int width, int height, const Request& request, const TilePoin
                         const std::size_t q0 = std::size_t(j0 + j) * std::size_t(width) + std::size_t(i0);
                         for (int i = 0; i < w;) {
                             const int first = std::min(i, w - 8);
-                            unsigned want = 0xff;
-                            if (request.pixels) {
-                                want = 0;
+                            unsigned want = (0xffu << (i - first)) & 0xff;  // not the lanes the group before took
+                            if (request.pixels)
                                 for (int l = 0; l < 8; ++l)
-                                    want |= unsigned(request.pixels[q0 + first + l] != 0) << l;
-                            }
+                                    if (!request.pixels[q0 + first + l])
+                                        want &= ~(1u << l);
                             float values[8];
                             const float* p = &xyz[(std::size_t(j) * w + first) * 3];
                             const float* n = needNormals ? &nrm[(std::size_t(j) * w + first) * 3] : nullptr;
@@ -604,7 +603,7 @@ Result sampleTiles(int width, int height, const Request& request, const TilePoin
                                     result.values[k * pixels + q0 + first + l] = values[l];
                                     std::int8_t& level = levels[std::size_t(j) * w + first + l];
                                     level = std::max(level, std::int8_t(0));
-                                } else if (first + l >= i && (want >> l & 1)) {
+                                } else if (want >> l & 1) {
                                     one(j, first + l, k);
                                 }
                             }
