@@ -1573,7 +1573,6 @@ class BaseTrainer:
 
         model.apply(InitWeights_He(neg_slope=0.2))
         model = model.to(self.device)
-        speed_up_3d_convs_on_mps(model, self.device)
 
         use_amp = not getattr(self.mgr, 'no_amp', False)
         if not use_amp:
@@ -1673,6 +1672,7 @@ class BaseTrainer:
             if checkpoint_loaded and self.mgr.load_weights_only:
                 scheduler, is_per_iteration_scheduler = self._get_scheduler(optimizer)
 
+        speed_up_3d_convs_on_mps(model, self.device)
         ds_enabled = bool(getattr(self.mgr, 'enable_deep_supervision', False))
         self._set_deep_supervision_enabled(model, ds_enabled)
         if ds_enabled:
