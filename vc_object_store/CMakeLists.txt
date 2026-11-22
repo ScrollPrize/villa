@@ -20,8 +20,8 @@ if(APPLE AND NOT DEFINED SQLite3_LIBRARY AND NOT DEFINED SQLite3_ROOT)
     # The system SQLite (/usr/lib/libsqlite3.dylib) cannot open a store
     # read-only once its -wal and -shm files are gone: a sealed store (the
     # spiral fit's track-crossing cache) or a copied .vcobj fails with
-    # "unable to open database file". Prefer Homebrew's keg-only sqlite, as
-    # volume-cartographer/scripts/build_macos.sh does for VC3D.
+    # "unable to open database file". Prefer Homebrew's keg-only sqlite
+    # (volume-cartographer/scripts/build_macos.sh installs the formula).
     find_program(VC_OBJECT_STORE_BREW brew)
     if(VC_OBJECT_STORE_BREW)
         execute_process(
