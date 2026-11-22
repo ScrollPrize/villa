@@ -581,7 +581,7 @@ NB_MODULE(_reader, m)
         options.fillValue = to_json(fill_value);
         options.identity = identity;
         if (cache_dir)
-            options.cacheDir = *cache_dir;
+            options.cacheDir = vcr::utf8Path(*cache_dir);
         options.cacheMaxBytes = cache_max_bytes;
         options.compressCache = compress_cache;
         options.memoryCache = std::move(memory_cache);
