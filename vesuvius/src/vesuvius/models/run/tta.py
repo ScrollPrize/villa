@@ -15,8 +15,12 @@ def _concat_if_multi_task(output, is_multi_task: bool, concat_fn):
 # both before averaging; otherwise the variants cancel (normals average to zero).
 # Spatial axes are named by their tensor dim: z = -3, y = -2, x = -1.
 _AXES = {'z': -3, 'y': -2, 'x': -1}
-# task_type -> whether the direction's sign is arbitrary (an eigenvector)
-_VECTOR_TASKS = {'surface_normals': False, 'nearest_component': False, 'inplane_direction': True}
+_VECTOR_TASKS = ('surface_normals', 'nearest_component', 'inplane_direction')
+# Vector heads that are axes when their configuration names no direction loss: an in-plane
+# direction is an eigenvector, so its sign is arbitrary.
+_AXIS_TASKS_BY_DEFAULT = ('inplane_direction',)
+# Direction losses that do not depend on the sign of the prediction.
+_SIGN_INVARIANT_LOSSES = ('SignInvariantCosineLoss',)
 _TENSOR_ORDER = {3: ('zz', 'zy', 'zx', 'yy', 'yx', 'xx'), 2: ('yy', 'yx', 'xx')}
 # A sign-ambiguous direction is reported in the half-space 4x + 2y + z >= 0 of the input frame.
 # A sign chosen per patch would let two overlapping patches that agree up to sign cancel when
@@ -25,21 +29,67 @@ _TENSOR_ORDER = {3: ('zz', 'zy', 'zx', 'yy', 'yx', 'xx'), 2: ('yy', 'yx', 'xx')}
 _AXIAL_HALF_SPACE = {-1: 4.0, -2: 2.0, -3: 1.0}
 
 
+def _direction_losses(target_config):
+    """Names of the losses configured for a vector head's direction channels.
+
+    A `ChannelSelectLoss` counts with its base loss, unless it selects only the last channel
+    (the distance of `nearest_component`)."""
+    losses = target_config.get('losses')
+    if not losses and target_config.get('loss_fn'):
+        losses = [{'name': target_config['loss_fn']}]
+    names = []
+    for loss in losses or ():
+        name = loss.get('name')
+        if name == 'ChannelSelectLoss':
+            kwargs = loss.get('kwargs') or {}
+            if kwargs.get('channels', loss.get('channels', 'all_but_last')) == 'last':
+                continue
+            name = (kwargs.get('base') or loss.get('base') or {}).get('name')
+        names.append(name)
+    return names
+
+
+def is_axis_head(target_config, out_channels=None, spatial_dims=3) -> bool:
+    """Whether a head's leading channels are an axis: a direction whose sign is arbitrary.
+
+    Read from the losses the head was trained with. When every loss on the direction channels
+    is `SignInvariantCosineLoss` (as configured for `inplane_direction` and for the direction
+    of `nearest_component`), the network may report either sign, so TTA variants and
+    overlapping patches can disagree in sign while they agree on the axis. Any other loss on
+    those channels (`CosineSimilarityLoss`, `NormalSmoothnessLoss`, a regression loss) can
+    supervise the orientation, so the head is signed and is never flipped, also when it is
+    combined with a sign-invariant loss. Without a direction loss in the configuration,
+    in-plane directions are axes and the other vector heads signed.
+    """
+    cfg = target_config or {}
+    task = str(cfg.get('task_type', '')).lower()
+    count = cfg.get('out_channels') if out_channels is None else out_channels
+    if task not in _VECTOR_TASKS or (count is not None and int(count) < spatial_dims):
+        return False
+    names = _direction_losses(cfg)
+    if not names:
+        return task in _AXIS_TASKS_BY_DEFAULT
+    return all(name in _SIGN_INVARIANT_LOSSES for name in names)
+
+
 def tta_channel_groups(targets, target_info, spatial_dims: int):
     """Geometric channel groups of a multi-task output, for `infer_with_tta(channel_groups=...)`.
 
     `targets` is the checkpoint's target configuration (with each auxiliary head's
-    `task_type`), `target_info` the channel range of each target in the concatenated output.
-    Each group maps a tuple of spatial dims to an output channel: (axis,) for a vector
-    component, (axis_a, axis_b) for a structure tensor component.
+    `task_type` and losses), `target_info` the channel range of each target in the concatenated
+    output. Each group maps a tuple of spatial dims to an output channel: (axis,) for a vector
+    component, (axis_a, axis_b) for a structure tensor component. Vector heads are 'axial'
+    when `is_axis_head`, otherwise 'vector'.
     """
     groups = []
     for name, info in (target_info or {}).items():
-        task = str(((targets or {}).get(name) or {}).get('task_type', '')).lower()
+        cfg = (targets or {}).get(name) or {}
+        task = str(cfg.get('task_type', '')).lower()
         start, count = int(info['start_channel']), int(info['out_channels'])
         if task in _VECTOR_TASKS and count >= spatial_dims:
             channels = {(_AXES[a],): start + i for i, a in enumerate('xyz'[:spatial_dims])}
-            groups.append({'kind': 'axial' if _VECTOR_TASKS[task] else 'vector', 'channels': channels})
+            kind = 'axial' if is_axis_head(cfg, count, spatial_dims) else 'vector'
+            groups.append({'kind': kind, 'channels': channels})
         elif task == 'structure_tensor' and count == len(_TENSOR_ORDER[spatial_dims]):
             channels = {(_AXES[c[0]], _AXES[c[1]]): start + i
                         for i, c in enumerate(_TENSOR_ORDER[spatial_dims])}

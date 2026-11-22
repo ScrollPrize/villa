@@ -7,11 +7,15 @@ Jyx Jxx) therefore need more than the spatial un-flip, or the TTA variants cance
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 import torch
+import yaml
 
 from vc_reader.reader import ZarrWriter, open_zarr
+import vesuvius.models
 from vesuvius.models.run import inference, tta
 from vesuvius.models.run.inference import Inferer
 
@@ -319,3 +323,81 @@ def test_finalize_logits_multiclass_skips_auxiliary_heads(tmp_path):
     out = np.asarray(open_zarr(str(tmp_path / "final.zarr"))[:])
     assert out.shape == (3, 4, 4, 4)
     assert np.unique(out[-1]).tolist() == [1]
+
+
+# --- The checkpoint's losses decide whether a direction is an axis (no sign) ---------------------
+
+def _shipped_nearest_component():
+    """The nearest_component head as the shipped nearest_component_3d.yaml trains it: the direction
+    with SignInvariantCosineLoss, the trailing distance with SmoothL1Loss."""
+    path = Path(vesuvius.models.__file__).parent / "configuration" / "aux_tasks" / "nearest_component_3d.yaml"
+    losses = yaml.safe_load(path.read_text())["auxiliary_tasks"]["nearest_component"]["losses"]
+    return {"out_channels": 4, "auxiliary_task": True, "task_type": "nearest_component", "losses": losses}
+
+
+def _nearest_component(*direction_losses):
+    """The shipped head with other losses on the direction channels (the distance keeps SmoothL1Loss)."""
+    head = _shipped_nearest_component()
+    distance = [loss for loss in head["losses"] if loss["kwargs"]["channels"] == "last"]
+    head["losses"] = [{"name": "ChannelSelectLoss", "weight": 1.0,
+                       "kwargs": {"channels": "all_but_last", "base": {"name": name, "kwargs": {}}}}
+                      for name in direction_losses] + distance
+    return head
+
+
+@pytest.mark.parametrize(("head", "kind"), [
+    (_shipped_nearest_component(), "axial"),  # SignInvariantCosineLoss on the direction
+    (_nearest_component("CosineSimilarityLoss"), "vector"),
+    # orientation supervised by any loss: signed, also next to a sign-invariant loss
+    (_nearest_component("SignInvariantCosineLoss", "CosineSimilarityLoss"), "vector"),
+    (_nearest_component("SignInvariantCosineLoss", "MSELoss"), "vector"),
+    ({**TARGETS["nearest"]}, "vector"),  # no losses configured: the task's default
+    ({**TARGETS["direction"], "losses": [{"name": "SignInvariantCosineLoss"}]}, "axial"),
+    ({**TARGETS["direction"], "losses": [{"name": "CosineSimilarityLoss"}]}, "vector"),
+    ({**TARGETS["direction"]}, "axial"),
+])
+def test_direction_kind_comes_from_the_training_losses(head, kind):
+    targets = {"surface": TARGETS["surface"], "h": head}
+    groups = tta.tta_channel_groups(targets, _target_info(targets), 3)
+    assert [g["kind"] for g in groups] == [kind]
+    assert sorted(groups[0]["channels"].values()) == [2, 3, 4]  # a nearest_component distance (5) stays scalar
+
+
+class SameSignXAxis(torch.nn.Module):
+    """Reports the x axis with the same sign in every mirrored frame, at distance 2. Under the
+    shipped SignInvariantCosineLoss that is a perfect direction wherever x is the true axis."""
+
+    def forward(self, x):
+        s = x[:, :1].float()
+        one = torch.ones_like(s)
+        return {"surface": torch.cat([-s, s], dim=1),
+                "nearest": torch.cat([one, 0 * one, 0 * one, 2 * one], dim=1)}
+
+
+def test_predict_keeps_a_sign_invariant_nearest_component_axis(tmp_path, monkeypatch):
+    """Default mirroring with the shipped nearest_component losses keeps the axis and the
+    distance: (1, 0, 0, 2). As a signed vector the mirrored variants cancelled to (0, 0, 0, 2)."""
+    targets = {"surface": TARGETS["surface"], "nearest": _shipped_nearest_component()}
+    out = _predict(tmp_path, monkeypatch, _volume((32, 32, 32)).numpy(), SameSignXAxis(), targets,
+                   (16, 16, 16), "nearest").astype(np.float32)
+    nearest = out[2:6]
+    assert nearest[:, 16, 16, 16].tolist() == [1.0, 0.0, 0.0, 2.0], nearest[:, 16, 16, 16]
+    inner = nearest[:, 4:28, 4:28, 4:28]  # away from the volume faces, where the weights vanish
+    assert np.abs(inner - np.array([1.0, 0, 0, 2.0]).reshape(4, 1, 1, 1)).max() < 1e-3
+
+
+@pytest.mark.parametrize("losses", [("CosineSimilarityLoss",), ("SignInvariantCosineLoss", "CosineSimilarityLoss")])
+def test_predict_never_reverses_a_signed_nearest_component(tmp_path, monkeypatch, losses):
+    """With a signed loss on the direction (alone or next to a sign-invariant one), TTA and blending
+    keep the predicted orientation, also where it points out of the half-space axes are written in."""
+    targets = {"surface": TARGETS["surface"], "nearest": _nearest_component(*losses)}
+    volume = _volume((32, 32, 32)).numpy()
+    with_tta = _predict(tmp_path, monkeypatch, volume, Oracle(), targets, (16, 16, 16), "tta").astype(np.float32)
+    without = _predict(tmp_path, monkeypatch, volume, Oracle(), targets, (16, 16, 16), "no_tta",
+                       do_tta=False).astype(np.float32)
+    mask = _defined(torch.from_numpy(volume)[None, None]).numpy()
+    mask[[0, -1]] = mask[:, [0, -1]] = mask[:, :, [0, -1]] = False
+    assert np.abs(with_tta[2:6] - without[2:6])[:, mask].max() < 1e-2
+    # the Oracle's direction points inwards: a good part of it lies outside the half-space
+    side = 4 * with_tta[2] + 2 * with_tta[3] + with_tta[4]
+    assert (side[mask] < -0.5).mean() > 0.3
