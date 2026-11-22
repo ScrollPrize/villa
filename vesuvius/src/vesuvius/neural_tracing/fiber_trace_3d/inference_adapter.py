@@ -387,6 +387,9 @@ class FiberTrace3DPredictAdapter:
                 map_location=device,
             )
         model.eval()
+        from vesuvius.models.utilities.mps_conv3d import speed_up_3d_convs_on_mps
+
+        speed_up_3d_convs_on_mps(model, device)
         return model
 
     @torch.no_grad()
