@@ -129,5 +129,8 @@ def checkpoint_flow_interpolant(checkpoint):
             "written without CUDA, where model_flow_field_direct_lr fell back "
             "to the upsampled field")
     return "direct_lr", (
-        "written on a CUDA machine, where the Triton kernel sampled the coarse "
-        "lattice directly")
+        "inferred, not recorded: written on a CUDA machine, where the Triton "
+        "kernel sampled the coarse lattice directly; a fit there that ran "
+        "without it (FIT_SPIRAL_DEVICE=cpu, FIT_SPIRAL_DIRECT_LR=0, "
+        "FIT_SPIRAL_TRITON=0 or no Triton) integrated the upsampled field: "
+        "set FIT_SPIRAL_DIRECT_LR=0 to keep that")

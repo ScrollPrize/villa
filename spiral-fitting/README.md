@@ -154,9 +154,10 @@ with: the upsampled field if it was written on MPS (it carries `torch_mps_rng_st
 CUDA, direct sampling if it came from a CUDA machine (a fit there that ran the upsampled field,
 with `FIT_SPIRAL_DEVICE=cpu`, `FIT_SPIRAL_DIRECT_LR=0`, `FIT_SPIRAL_TRITON=0` or no Triton, needs
 `FIT_SPIRAL_DIRECT_LR=0` to keep it). The interpolant changes only when asked, and the change is
-logged: `FIT_SPIRAL_DIRECT_LR=0` or `1` sets it for fresh fits and checkpoints alike, and a fit
-whose `model_flow_field_direct_lr` differs from its checkpoint's lets the configuration decide, as
-before checkpoints recorded it (logged as a warning). `FIT_SPIRAL_DIRECT_LR=1` is refused for a fresh
+logged: `FIT_SPIRAL_DIRECT_LR=0` or `1` sets it for fresh fits and checkpoints alike, and a resume
+or model-stage rebuild that sets `model_flow_field_direct_lr` otherwise than its checkpoint (in
+`FIT_SPIRAL_CONFIG_OVERRIDES` for a headless resume) lets the configuration decide, as before
+checkpoints recorded it (logged as a warning). `FIT_SPIRAL_DIRECT_LR=1` is refused for a fresh
 fit on a device without a fused kernel; on lattices its kernel does not take (a single-cell axis)
 it integrates direct sampling eagerly, slower but the same interpolant the kernels sample. The
 model-state digest that checkpoints, previews and commits carry names the interpolant, so a

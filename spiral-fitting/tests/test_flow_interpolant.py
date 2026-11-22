@@ -458,29 +458,42 @@ def test_an_unknown_recorded_interpolant_is_refused():
             {'cfg': _config(), 'flow_field_interpolant': 'bicubic'})
 
 
-def test_a_changed_direct_lr_setting_decides_and_is_logged(simulated_metal, capsys):
-    # model_flow_field_direct_lr is no model-shaping key: the preflight lets a
-    # fit (a model-stage rebuild, say) set it otherwise than its checkpoint.
-    # The configuration then decides, as it did before checkpoints recorded
-    # the interpolant, and the change is logged.
+def test_a_changed_direct_lr_setting_decides_only_a_resume(simulated_metal, capsys):
     cfg = _config()
     fitted = _model(cfg)
     points = _points()
-    upsampled, _ = _references(fitted.state_dict(), points)
+    upsampled, direct = _references(fitted.state_dict(), points)
     checkpoint = _Fit(fitted, cfg)._checkpoint_payload(7)
     assert checkpoint['flow_field_interpolant'] == 'direct_lr'
     off = _config(model_flow_field_direct_lr=False)
     session = _Fit(_model(off, seed=99), off)
-    capsys.readouterr()
 
     session.apply_checkpoint(checkpoint)
+    torch.testing.assert_close(_surface(session.spiral_and_transform, points),
+                               direct, **SAME)
 
+    capsys.readouterr()
+    session.apply_checkpoint(checkpoint, config_decides=True)
     torch.testing.assert_close(_surface(session.spiral_and_transform, points),
                                upsampled, **SAME)
     out = capsys.readouterr().out
     assert out.count('WARNING: checkpoint flow field: model_flow_field_direct_lr is False '
                      'here and was True') == 1
     assert 'the fitted surface moves' in out
+
+
+def test_every_load_of_a_legacy_cuda_checkpoint_says_it_is_inferred(simulated_metal, capsys):
+    cfg = _config()
+    session = _Fit(_model(cfg), cfg)
+    checkpoint = session._checkpoint_payload(7)
+    checkpoint.pop('flow_field_interpolant')
+    checkpoint['torch_cuda_rng_states'] = [torch.zeros(16, dtype=torch.uint8)]
+    capsys.readouterr()
+
+    session.apply_checkpoint(checkpoint)
+    session.apply_checkpoint(checkpoint)
+
+    assert capsys.readouterr().out.count('direct_lr (inferred, not recorded') == 2
 
 
 def test_a_checkpoint_of_another_field_type_is_left_to_the_preflight():

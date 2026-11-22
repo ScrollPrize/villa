@@ -733,7 +733,10 @@ def build_seed_rays(args, device="cuda:0"):
     ).to(device)
     model.load_state_dict(checkpoint["spiral_and_transform"])
     # The surface the fit placed: its interpolant, as the fitter keeps it.
-    model.pin_flow_interpolant(checkpoint_flow_interpolant(checkpoint)[0])
+    interpolant, note = checkpoint_flow_interpolant(checkpoint)
+    model.pin_flow_interpolant(interpolant)
+    if note:
+        print(f"checkpoint flow field: {interpolant} ({note})", flush=True)
     model.eval()
 
     if args.winding_range:
