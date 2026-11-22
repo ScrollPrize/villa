@@ -1642,12 +1642,13 @@ class ServiceState:
             live_paths = self.session_paths
         build_id = None
         if stage == "model":
-            # The model stage keeps the frozen inputs, at their position, and
-            # the project's umbilicus.
+            # The model stage keeps the frozen inputs, at their position and
+            # in their fit volume, and the project's umbilicus.
             run = dataclasses.replace(run, config={
                 **run.config,
                 "object_store_input_position": live_config.get("object_store_input_position")})
-            paths = dataclasses.replace(paths, umbilicus=live_paths.umbilicus)
+            paths = dataclasses.replace(paths, umbilicus=live_paths.umbilicus,
+                                        volume_uuid=live_paths.volume_uuid)
             self._begin_model_rebuild(paths, run, preview)
         else:
             build_id = self._begin_build(paths, run, preview, scroll,
