@@ -4,9 +4,11 @@
 #include <doctest/doctest.h>
 
 #include "vc/core/util/SurfaceMeshing.hpp"
+#include "vc/core/util/QuadSurface.hpp"
 
 #include <filesystem>
 #include <fstream>
+#include <memory>
 
 using namespace vc::meshing;
 
@@ -59,6 +61,30 @@ TEST_CASE("decimateGrid keeps every stride-th row and column")
     CHECK(thirds.cols == 3);
     CHECK(thirds(3, 2) == points(9, 6));
     CHECK(decimateGrid(points, 1).size() == points.size());
+}
+
+TEST_CASE("UV rasterization keeps mesh borders and preserves shared edge ownership")
+{
+    UvGridRasterizer rasterizer;
+    rasterizer.setMesh(
+        {{0, 0, 10}, {2, 0, 10}, {0, 2, 10}, {0, 2, 30}, {2, 0, 30}, {2, 2, 30}},
+        {{0, 0}, {2, 0}, {0, 2}, {2, 2}},
+        {{{0, 1, 2}, {0, 1, 2}}, {{3, 4, 5}, {2, 1, 3}}});
+    rasterizer.setSrcScale(cv::Vec2f(1, 1));
+    rasterizer.determineGridDimensions();
+
+    const std::unique_ptr<QuadSurface> surface(rasterizer.createQuadSurface());
+    const auto points = surface->rawPoints();
+    REQUIRE(points.rows == 3);
+    REQUIRE(points.cols == 3);
+    for (int y = 0; y < points.rows; ++y) {
+        for (int x = 0; x < points.cols; ++x) {
+            CHECK(points(y, x)[0] == float(x));
+            CHECK(points(y, x)[1] == float(y));
+        }
+    }
+    // The first triangle reaches this edge but the second one owns the sample.
+    CHECK(points(1, 1)[2] == 30.f);
 }
 
 TEST_CASE("liftGridUVs is exact in grid space when border rows and columns are invalid")

@@ -68,7 +68,8 @@ bool readUvObj(const std::string& path, UvMesh& mesh);
 
 // Rasterizes a UV-mapped triangle mesh onto a regular grid spanning its UV
 // bounds; each grid point takes the barycentric mix of its triangle's 3D
-// corners (exact fixed-point coverage, top-left fill rule, first triangle wins).
+// corners. The fixed-point top-left rule resolves shared samples; otherwise
+// empty samples on mesh edges are also kept.
 class UvGridRasterizer {
 public:
     void setUVMetric(bool v) { uv_is_metric = v; }
@@ -86,7 +87,8 @@ public:
 
 private:
     void calculateScaleFromGrid(const cv::Mat_<cv::Vec3f>& points, float mesh_units = 1.0f);
-    void rasterizeTriangle(cv::Mat_<cv::Vec3f>& points, const UvFace& face);
+    void rasterizeTriangle(cv::Mat_<cv::Vec3f>& points, const UvFace& face,
+                           std::vector<bool>* boundarySamples = nullptr);
 
     std::vector<cv::Vec3f> vertices;
     std::vector<cv::Vec2f> uvs;

@@ -319,12 +319,14 @@ void UvGridRasterizer::determineGridDimensions(float stretch_factor) {
 
 
 QuadSurface* UvGridRasterizer::createQuadSurface(float mesh_units) {
+    // Use one bit per cell to let the top-left owner replace an edge sample.
+    std::vector<bool> boundarySamples(static_cast<std::size_t>(grid_size[0]) * grid_size[1]);
     // Create points matrix initialized with invalid values
     cv::Mat_<cv::Vec3f>* points = new cv::Mat_<cv::Vec3f>(grid_size[1], grid_size[0], cv::Vec3f(-1, -1, -1));
 
     // Rasterize triangles onto the grid
     for (const auto& face : faces) {
-        rasterizeTriangle(*points, face);
+        rasterizeTriangle(*points, face, &boundarySamples);
     }
 
     // Count valid points
@@ -419,7 +421,8 @@ void UvGridRasterizer::calculateScaleFromGrid(const cv::Mat_<cv::Vec3f>& points,
     std::cout << "Calculated scale factors from grid: " << scale[0] << ", " << scale[1] << " micrometers" << std::endl;
 }
 
-void UvGridRasterizer::rasterizeTriangle(cv::Mat_<cv::Vec3f>& points, const UvFace& face) {
+void UvGridRasterizer::rasterizeTriangle(cv::Mat_<cv::Vec3f>& points, const UvFace& face,
+                                         std::vector<bool>* boundarySamples) {
     // Validate indices
     for (int k = 0; k < 3; ++k) {
         if (face.v[k] < 0 || face.v[k] >= (int)vertices.size()) {
@@ -486,16 +489,23 @@ void UvGridRasterizer::rasterizeTriangle(cv::Mat_<cv::Vec3f>& points, const UvFa
             const long long w0 = edgeFn(X[1], Y[1], X[2], Y[2], Px, Py); // weight of vertex 0
             const long long w1 = edgeFn(X[2], Y[2], X[0], Y[0], Px, Py); // weight of vertex 1
             const long long w2 = edgeFn(X[0], Y[0], X[1], Y[1], Px, Py); // weight of vertex 2
-            if ((w0 + bias0) < 0 || (w1 + bias1) < 0 || (w2 + bias2) < 0) {
+            const bool excluded = (w0 + bias0) < 0 || (w1 + bias1) < 0 || (w2 + bias2) < 0;
+            if (excluded && (!boundarySamples || w0 < 0 || w1 < 0 || w2 < 0)) {
                 continue;
             }
-            if (vc::geometry::validSurfacePoint(points(y, x))) {
-                continue; // first triangle wins
+            auto& point = points(y, x);
+            const auto index = static_cast<std::size_t>(y) * points.cols + x;
+            if (vc::geometry::validSurfacePoint(point)
+                && (!boundarySamples || excluded || !(*boundarySamples)[index])) {
+                continue;
             }
             const float b0 = static_cast<float>(w0 * inv_area);
             const float b1 = static_cast<float>(w1 * inv_area);
             const float b2 = static_cast<float>(w2 * inv_area);
-            points(y, x) = b0 * pos[0] + b1 * pos[1] + b2 * pos[2];
+            point = b0 * pos[0] + b1 * pos[1] + b2 * pos[2];
+            if (boundarySamples) {
+                (*boundarySamples)[index] = excluded;
+            }
         }
     }
 }
