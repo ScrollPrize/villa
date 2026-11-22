@@ -353,6 +353,7 @@ def build_training_checkpoint_payload(
     ema_model,
     wandb_module,
     validation_metrics: Mapping | None = None,
+    sampling_stream: Mapping | None = None,
 ) -> dict:
     canonical = config.to_mapping()
     run = None if wandb_module is None else wandb_module.run
@@ -368,6 +369,8 @@ def build_training_checkpoint_payload(
     }
     if validation_metrics is not None:
         payload["validation_metrics"] = dict(validation_metrics)
+    if sampling_stream is not None:
+        payload["sampling_stream"] = dict(sampling_stream)
     if ema_model is not None and config.ema.save_in_checkpoint:
         payload["ema_model"] = ema_model.state_dict()
         payload["ema_optimizer_step"] = optimizer_step
@@ -408,6 +411,9 @@ def _run_training(request: TrainingRequest) -> int:
     from vesuvius.ink_detection.training.optimizers import create_training_optimizer
     from vesuvius.ink_detection.training.samplers import (
         build_sampling_policy,
+        resume_position,
+        resumed_stream_steps,
+        sampling_stream_key,
         training_batch_sampler,
     )
 
@@ -574,7 +580,7 @@ def _run_training(request: TrainingRequest) -> int:
     # One batch-sampler seam for every policy, so a resumed run can continue
     # the index stream instead of replaying it from the first batch.
     train_batch_sampler = training_batch_sampler(
-        policy, len(train_dataset), batch_size=config.batch_size
+        policy, train_dataset, batch_size=config.batch_size
     )
     train_loader = DataLoader(
         train_dataset,
@@ -672,15 +678,51 @@ def _run_training(request: TrainingRequest) -> int:
         accelerator.print(
             f"Loaded checkpoint '{request.checkpoint_path}'{suffix}"
         )
-        if start_step > 0:
-            # The samplers are rebuilt from config.sampling.seed, so without
-            # this the resumed run would replay the first run's batches.
-            train_batch_sampler.fast_forward(start_step * accelerator.num_processes)
-            accelerator.print(
-                f"Fast-forwarded the training sampler by {start_step} steps "
-                "(indices only), so the resumed run continues its sample "
-                "stream instead of replaying it"
+
+    # The samplers are rebuilt from config.sampling.seed, so a resumed run
+    # would replay its first batches. A checkpoint records the sample stream it
+    # was written from; resuming that same stream skips the steps already
+    # taken in it (indices only), while a new recipe phase, another process
+    # count, other data or an older checkpoint starts a new stream at its
+    # beginning, as before.
+    stream_key = sampling_stream_key(
+        canonical,
+        num_processes=accelerator.num_processes,
+        train_samples=len(train_dataset),
+        policy_audit=policy.audit,
+    )
+    stream_start_step = start_step
+    fast_forward = {"steps_in_stream": 0, "epochs": 0, "batches_into_epoch": 0}
+    if request.checkpoint is not None and start_step > 0:
+        stream_start_step, steps_in_stream = resumed_stream_steps(
+            request.checkpoint.get("sampling_stream"), stream_key, start_step
+        )
+        if steps_in_stream > 0:
+            epochs, batches = resume_position(
+                steps_in_stream, len(train_loader), accelerator.num_processes
             )
+            train_batch_sampler.fast_forward(epochs, batches)
+            fast_forward = {
+                "steps_in_stream": steps_in_stream,
+                "epochs": epochs,
+                "batches_into_epoch": batches,
+            }
+            accelerator.print(
+                f"Continuing the sample stream started at step {stream_start_step}: "
+                f"skipped {steps_in_stream} steps ({epochs} loader epochs + "
+                f"{batches} batches, indices only)"
+            )
+        else:
+            accelerator.print(
+                f"Starting a new sample stream at step {start_step} (the "
+                "checkpoint was not written from this recipe, data and process "
+                "count)"
+            )
+    sampling_stream = {
+        "key": stream_key,
+        "start_step": stream_start_step,
+        "num_processes": accelerator.num_processes,
+    }
 
     fixed_batch_sampler = policy.batch_sampler
     gradient_health = {
@@ -704,7 +746,8 @@ def _run_training(request: TrainingRequest) -> int:
             return
         observed = fixed_batch_sampler.observed_audit()
         observed["training_step_completed"] = int(training_step)
-        observed["fast_forwarded_batches"] = int(train_batch_sampler.skipped_batches)
+        observed["sampling_stream_start_step"] = int(stream_start_step)
+        observed["fast_forward"] = dict(fast_forward)
         observed["target"] = policy.audit
         _write_json_replace(
             config.out_dir / "sampling_observed.json", observed
@@ -740,6 +783,7 @@ def _run_training(request: TrainingRequest) -> int:
             ema_model=ema_model,
             wandb_module=wandb_module,
             validation_metrics=validation_metrics,
+            sampling_stream=sampling_stream,
         )
         torch.save(
             payload,

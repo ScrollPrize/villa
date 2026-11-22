@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence, Sized
 import hashlib
+import json
 import random
 
 import torch
@@ -180,6 +181,17 @@ class FixedScrollPriorStratifiedBatchSampler(Sampler[list[int]]):
         self._observed_scrolls: Counter[str] = Counter()
         self._observed_physicals: Counter[str] = Counter()
         self._observed_representations: Counter[str] = Counter()
+        # Batches drawn while a resumed run skips its already-trained steps are
+        # counted apart, so the observed counts stay tied to loader requests.
+        self._fast_forwarding = False
+        self._skipped = 0
+        self._skipped_scrolls: Counter[str] = Counter()
+        self._skipped_physicals: Counter[str] = Counter()
+        self._skipped_representations: Counter[str] = Counter()
+
+    def set_fast_forwarding(self, enabled: bool) -> None:
+        """Count the next drawn batches as skipped instead of observed."""
+        self._fast_forwarding = bool(enabled)
 
     def __len__(self) -> int:
         return self._epoch_batches
@@ -204,10 +216,16 @@ class FixedScrollPriorStratifiedBatchSampler(Sampler[list[int]]):
             if dict(batch_scrolls) != self.batch_quotas:
                 raise RuntimeError(f"fixed-prior batch quota violation: {dict(batch_scrolls)!r}")
             self._batch_rng.shuffle(batch)
-            self._yielded += 1
-            self._observed_scrolls.update(batch_scrolls)
-            self._observed_physicals.update(batch_physicals)
-            self._observed_representations.update(batch_representations)
+            if self._fast_forwarding:
+                self._skipped += 1
+                self._skipped_scrolls.update(batch_scrolls)
+                self._skipped_physicals.update(batch_physicals)
+                self._skipped_representations.update(batch_representations)
+            else:
+                self._yielded += 1
+                self._observed_scrolls.update(batch_scrolls)
+                self._observed_physicals.update(batch_physicals)
+                self._observed_representations.update(batch_representations)
             yield batch
 
     def definition_audit(self) -> dict:
@@ -251,6 +269,16 @@ class FixedScrollPriorStratifiedBatchSampler(Sampler[list[int]]):
             "patch_queue_recycles": {
                 key: queue.recycles for key, queue in sorted(self._patch_queues.items())
             },
+            # Draws replayed to position a resumed run; not requested by the loader.
+            "fast_forwarded": {
+                "batches": self._skipped,
+                "samples": self._skipped * self.batch_size,
+                "by_scroll": dict(sorted(self._skipped_scrolls.items())),
+                "by_physical_segment": dict(sorted(self._skipped_physicals.items())),
+                "by_representation": dict(
+                    sorted(self._skipped_representations.items())
+                ),
+            },
         }
 
 
@@ -260,10 +288,17 @@ class ResumableBatchSampler(Sampler[list[int]]):
     Every sampling policy is rebuilt from ``config.sampling.seed`` when a run
     resumes from a checkpoint, so without this the resumed run starts the
     index stream from the beginning and replays the batches of the first run.
-    ``fast_forward(n)`` draws the index lists of ``n`` already-trained batches
-    (indices only, no data is loaded), re-entering the inner sampler at each
-    epoch end exactly as the training loop does; the next ``__iter__``
-    continues that same stream. Without a fast-forward it is a pass-through.
+
+    The wrapper is transparent to Accelerate: it exposes the wrapped sampler's
+    ``batch_size``, ``drop_last`` and ``sampler``, so ``BatchSamplerShard``
+    shards, drops and pads exactly as it does for the wrapped sampler, and the
+    shuffling generator is synchronized as before. A fresh run is unchanged.
+
+    ``fast_forward(epochs, batches)`` draws the index lists of ``epochs``
+    complete passes of the wrapped sampler, then ``batches`` more of a new pass
+    (indices only, no data is loaded); the next ``__iter__`` continues that
+    pass. Use :func:`resume_position` to turn completed training steps into
+    these two numbers.
     """
 
     def __init__(self, inner) -> None:
@@ -271,22 +306,53 @@ class ResumableBatchSampler(Sampler[list[int]]):
         self._pending: Iterator[list[int]] | None = None
         self.skipped_batches = 0
 
+    @property
+    def batch_size(self):
+        return getattr(self.inner, "batch_size", None)
+
+    @property
+    def drop_last(self) -> bool:
+        return bool(getattr(self.inner, "drop_last", False))
+
+    @property
+    def sampler(self):
+        return getattr(self.inner, "sampler", None)
+
+    @sampler.setter
+    def sampler(self, value) -> None:
+        self.inner.sampler = value
+
     def __len__(self) -> int:
         return len(self.inner)
 
-    def fast_forward(self, batches: int) -> None:
-        batches = int(batches)
-        if batches <= 0:
+    def fast_forward(self, epochs: int, batches: int = 0) -> None:
+        epochs, batches = int(epochs), int(batches)
+        if epochs < 0 or batches < 0:
+            raise ValueError("fast_forward needs non-negative epochs and batches")
+        if batches and batches >= len(self.inner):
+            raise ValueError(
+                f"fast_forward batches={batches} must be shorter than one pass "
+                f"({len(self.inner)} batches)"
+            )
+        if epochs == 0 and batches == 0:
             return
-        iterator = iter(self.inner)
-        for _ in range(batches):
-            try:
+        if self._pending is not None:
+            raise RuntimeError("fast_forward called twice before iterating")
+        set_fast_forwarding = getattr(self.inner, "set_fast_forwarding", None)
+        if set_fast_forwarding is not None:
+            set_fast_forwarding(True)
+        try:
+            for _ in range(epochs):
+                for _batch in self.inner:
+                    self.skipped_batches += 1
+            iterator = iter(self.inner)
+            for _ in range(batches):
                 next(iterator)
-            except StopIteration:
-                iterator = iter(self.inner)
-                next(iterator)
+                self.skipped_batches += 1
+        finally:
+            if set_fast_forwarding is not None:
+                set_fast_forwarding(False)
         self._pending = iterator
-        self.skipped_batches += batches
 
     def __iter__(self) -> Iterator[list[int]]:
         if self._pending is None:
@@ -297,7 +363,7 @@ class ResumableBatchSampler(Sampler[list[int]]):
 
 
 def training_batch_sampler(
-    policy: SamplingPolicy, dataset_length: int, *, batch_size: int
+    policy: SamplingPolicy, data_source: Sized, *, batch_size: int
 ) -> ResumableBatchSampler:
     """The batch sampler the training DataLoader iterates, for any policy.
 
@@ -311,10 +377,115 @@ def training_batch_sampler(
     if policy.sampler is not None:
         sampler = policy.sampler
     elif policy.shuffle:
-        sampler = RandomSampler(range(dataset_length), generator=policy.generator)
+        sampler = RandomSampler(data_source, generator=policy.generator)
     else:
-        sampler = SequentialSampler(range(dataset_length))
+        sampler = SequentialSampler(data_source)
     return ResumableBatchSampler(BatchSampler(sampler, batch_size, drop_last=False))
+
+
+def resume_position(
+    completed_steps: int, loader_batches_per_epoch: int, num_processes: int
+) -> tuple[int, int]:
+    """Translate completed training steps into ``fast_forward`` arguments.
+
+    The training loop takes one batch per process and step from the prepared
+    loader, and re-enters it at each loader epoch. One loader epoch iterates
+    one complete pass of the wrapped sampler, including the tail that
+    ``BatchSamplerShard`` drops or pads. Within an epoch, each per-process
+    batch before that tail takes ``num_processes`` consecutive batches of the
+    pass (one per process). ``loader_batches_per_epoch`` is ``len()`` of the
+    prepared loader, i.e. per process.
+    """
+    completed_steps = int(completed_steps)
+    loader_batches_per_epoch = int(loader_batches_per_epoch)
+    if completed_steps < 0:
+        raise ValueError("completed_steps must be non-negative")
+    if loader_batches_per_epoch <= 0:
+        raise ValueError("the prepared training loader has no batches")
+    epochs, within = divmod(completed_steps, loader_batches_per_epoch)
+    return epochs, within * max(1, int(num_processes))
+
+
+# Top-level config keys that only control how a run is launched, saved,
+# validated or logged. A resume may change them and still continue the same
+# sample stream; any other difference starts a new stream.
+RUN_CONTROL_KEYS = frozenset(
+    {
+        "description",
+        "checkpoint",
+        "weights_only",
+        "num_iterations",
+        "save_iterations",
+        "save_every",
+        "val_every",
+        "val_steps",
+        "val_preview_batches",
+        "log_every",
+        "out_dir",
+        "dataloader_workers",
+        "prefetch_factor",
+        "pin_memory",
+        "wandb_project",
+        "wandb_entity",
+        "wandb_run_id",
+        "wandb_resume",
+        "benchmark",
+        "sampling_audit_every",
+        "verify_finite_gradients_steps",
+        "max_amp_overflow_events",
+        "best_checkpoint_metric",
+    }
+)
+
+
+def sampling_stream_key(
+    config_mapping: Mapping,
+    *,
+    num_processes: int,
+    train_samples: int,
+    policy_audit: Mapping,
+) -> str:
+    """Identify the training sample stream a checkpoint was written from.
+
+    Two launches share a stream only when they train the same recipe on the
+    same data with the same number of processes: the canonical config minus
+    :data:`RUN_CONTROL_KEYS`, the process count, the training dataset length
+    and the sampling policy's definition audit (which records the per-scroll,
+    per-segment and per-representation patch counts).
+    """
+    identity = {
+        "config": {
+            key: value
+            for key, value in config_mapping.items()
+            if key not in RUN_CONTROL_KEYS
+        },
+        "num_processes": int(num_processes),
+        "train_samples": int(train_samples),
+        "policy": dict(policy_audit),
+    }
+    encoded = json.dumps(identity, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def resumed_stream_steps(record: object, key: str, start_step: int) -> tuple[int, int]:
+    """Where a resumed run stands in its sample stream.
+
+    ``record`` is the checkpoint's ``sampling_stream`` entry. Returns
+    ``(stream_start_step, steps_in_stream)``. The run continues its stream
+    only when the checkpoint was written from the same stream (same key);
+    otherwise, including checkpoints written before streams were recorded and
+    recipe phase transitions, a new stream starts at ``start_step`` and
+    nothing is skipped, as before this change.
+    """
+    start_step = int(start_step)
+    if start_step > 0 and isinstance(record, Mapping) and record.get("key") == key:
+        try:
+            stream_start = int(record.get("start_step", -1))
+        except (TypeError, ValueError):
+            stream_start = -1
+        if 0 <= stream_start <= start_step:
+            return stream_start, start_step - stream_start
+    return start_step, 0
 
 
 def hierarchical_scroll_segment_weights(
