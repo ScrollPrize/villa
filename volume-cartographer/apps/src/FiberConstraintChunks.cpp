@@ -1,6 +1,7 @@
 #include "FiberConstraintChunks.hpp"
 #include "FiberCrossingAxes.hpp"
 #include "FiberNeighbourNormals.hpp"
+#include "FiberGapFalloff.hpp"
 #include "vc/fiber_tracer/FiberStripNormals.hpp"
 #include "vc/lasagna/ChannelSampler.hpp"
 #include "ChunkSaturationWindow.hpp"
@@ -416,24 +417,15 @@ Json extractFiberConstraintChunks(const Json& cfg,Json& metadata,
                 const auto scales=cfg.value("crossing_gap_scales",std::vector<double>{64.,64.,64.});
                 const double predictionPower=cfg.value("crossing_prediction_power",0.),
                     predictionMin=cfg.value("crossing_prediction_min",0.),coherencePower=cfg.value("crossing_coherence_power",0.);
-                if(gapFalloff!="none"&&gapFalloff!="inverse"&&gapFalloff!="inverse_square"&&gapFalloff!="gaussian"&&gapFalloff!="cauchy"&&gapFalloff!="inverse_smooth")
-                    throw std::invalid_argument("crossing_gap_falloff must be none, inverse, inverse_square, gaussian, cauchy or inverse_smooth");
+                const GapFalloff falloff=parseGapFalloff(gapFalloff);
                 if(gapFrame!="isotropic"&&gapFrame!="crossing"&&gapFrame!="prediction")
                     throw std::invalid_argument("crossing_gap_frame must be isotropic, crossing or prediction");
                 if(scales.size()!=3||!(scales[0]>0.&&scales[1]>0.&&scales[2]>0.)||predictionPower<0.||coherencePower<0.)
                     throw std::invalid_argument("crossing_gap_scales must be 3 positive values (own tangent, side, normal), crossing powers >= 0");
                 // Falloff of the scaled gap g (dimensionless).
-                const auto gapFactor=[&](double g){
-                    if(gapFalloff=="inverse")return std::min(1.,1./std::max(g,1e-12));
-                    if(gapFalloff=="inverse_square"){const double r=std::min(1.,1./std::max(g,1e-12));return r*r;}
-                    if(gapFalloff=="gaussian")return std::exp(-0.5*g*g);
-                    if(gapFalloff=="cauchy")return 1./(1.+g*g);
-                    if(gapFalloff=="inverse_smooth")return 1./std::sqrt(1.+g*g);
-                    return 1.;};
-                // Scaled gap of offset d in the frame (own tangent t, side normal x t, normal n).
-                const auto scaledGap=[&](const cv::Vec3d& d,const cv::Vec3d& t,const cv::Vec3d& n){
-                    const cv::Vec3d side=n.cross(t);const double ct=d.dot(t)/scales[0],cs=d.dot(side)/scales[1],cn=d.dot(n)/scales[2];
-                    return std::sqrt(ct*ct+cs*cs+cn*cn);};
+                const std::array<double,3> frameScales{scales[0],scales[1],scales[2]};
+                const auto gapFactor=[&](double g){return gapFalloffFactor(falloff,g);};
+                const auto scaledGap=[&](const cv::Vec3d& d,const cv::Vec3d& t,const cv::Vec3d& n){return scaledFrameGap(d,t,n,frameScales);};
                 size_t unknown=0;
                 const auto crossings=readFiberCrossingAxes(cfg.at("crossing_axes").get<std::string>(),ids,unknown);
                 std::atomic<size_t> usedTotal{0},crossedTotal{0},predictionTotal{0},crossingTotal{0};
