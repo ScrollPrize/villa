@@ -172,17 +172,21 @@ def piece_starts(points: int, piece: int, stride: int) -> list:
     return starts
 
 
-def merge_pieces(pieces: list, offsets: list, columns: int) -> tuple:
+def merge_pieces(pieces: list, offsets: list, columns: int, threshold: float, tolerance: float) -> tuple:
     """One trace from per-piece ``(rows, confs)`` placed at column ``offsets`` of a front with ``columns`` columns.
 
-    At each step a column comes from the piece that is still tracing and holds it closest to its own centre; a column
-    no piece covers any more keeps its last position with confidence 0. The result is as long as the longest piece.
+    At each step a column comes from the piece that is still tracing and holds it closest to its own centre or, if
+    that sample is not above ``threshold``, from another live piece with a confident sample within ``tolerance`` of
+    it. Joins between pieces that have drifted more than ``tolerance`` apart get confidence 0, so no stretched cells
+    are written. A column no piece covers any more keeps its last position with confidence 0. The result is as long
+    as the longest piece.
     """
     T = max(len(r) for r, _ in pieces)
     rows = np.zeros((T, columns, 3), pieces[0][0].dtype)
     confs = np.zeros((T, columns), pieces[0][1].dtype)
     best = np.full((T, columns), np.inf)
-    for (r, c), off in zip(pieces, offsets):
+    source = np.full((T, columns), -1)
+    for k, ((r, c), off) in enumerate(zip(pieces, offsets)):
         width = r.shape[1]
         cols = np.arange(off, off+width)
         central = np.abs(np.arange(width)-(width-1)/2.)
@@ -191,8 +195,25 @@ def merge_pieces(pieces: list, offsets: list, columns: int) -> tuple:
             rows[t, cols[take]] = r[t, take]
             confs[t, cols[take]] = c[t, take]
             best[t, cols[take]] = central[take]
+            source[t, cols[take]] = k
     if not np.all(np.isfinite(best[0])):
         raise ValueError('the pieces do not cover every column of the seed row')
+    central_rows = rows.copy()
+    for k, ((r, c), off) in enumerate(zip(pieces, offsets)):
+        view = np.s_[:len(r), off:off+r.shape[1]]
+        near = np.linalg.norm(r-central_rows[view], axis=-1) <= tolerance
+        take = (confs[view] <= threshold) & (c > threshold) & near
+        rows[view][take], confs[view][take], source[view][take] = r[take], c[take], k
+    apart = np.zeros((T, columns), bool)
+    for k, ((r, _), off) in enumerate(zip(pieces, offsets)):
+        n, width = r.shape[:2]
+        own = source[:n, off:off+width] == k
+        far = np.linalg.norm(r-rows[:n, off:off+width], axis=-1) > tolerance
+        other = ~own & far & (confs[:n, off:off+width] > threshold)
+        apart[:n, off:off+width-1] |= own[:, :-1] & other[:, 1:]
+        apart[:n, off+1:off+width] |= own[:, 1:] & other[:, :-1]
+        apart[1:n, off:off+width] |= own[1:] & other[:-1]
+    confs[apart] = 0
     for t in range(1, T):
         gone = ~np.isfinite(best[t])
         rows[t, gone] = rows[t-1, gone]
@@ -212,7 +233,8 @@ def trace_in_pieces(model, cfg, seed: np.ndarray, direction: np.ndarray, steps: 
     pieces = [trace(model, cfg, seed[s:s+piece_points], direction[s:s+piece_points], steps, device, **kwargs)
               for s in starts]
     samples = cfg.trace.spline_samples
-    return merge_pieces(pieces, [s*samples for s in starts], (n-1)*samples+1)
+    return merge_pieces(pieces, [s*samples for s in starts], (n-1)*samples+1, cfg.trace.confidence_threshold,
+                        cfg.data.point_spacing/samples)
 
 
 def surface_area_vx2(xyz: np.ndarray) -> float:

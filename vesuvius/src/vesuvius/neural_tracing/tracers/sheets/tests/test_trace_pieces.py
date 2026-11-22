@@ -6,8 +6,12 @@ from vesuvius.neural_tracing.tracers.sheets.tracing import inference
 
 
 class _Cfg:
+    class data:
+        point_spacing = 60.
+
     class trace:
         spline_samples = 6
+        confidence_threshold = .4
 
 
 def _fake(lengths):
@@ -64,4 +68,22 @@ def test_long_row_merges_central_live_pieces(monkeypatch):
 
 def test_merge_needs_full_cover():
     with pytest.raises(ValueError):
-        inference.merge_pieces([(np.ones((2, 37, 3)), np.ones((2, 37)))], [0], 85)
+        inference.merge_pieces([(np.ones((2, 37, 3)), np.ones((2, 37)))], [0], 85, .4, 10.)
+
+
+def test_merge_drops_drifted_seams_and_keeps_confident_overlap():
+    def piece(off, shift):
+        rows = np.zeros((2, 13, 3), np.float32)
+        rows[..., 0] = (off+np.arange(13))*10.
+        rows[1, :, 0] += shift
+        return rows, np.full((2, 13), .6, np.float32)
+    a = piece(0, 0)
+    a[1][1, 8] = .3
+    rows, confs = inference.merge_pieces([a, piece(6, 2)], [0, 6], 19, .4, 10.)
+    assert rows[1, 8, 0] == 82 and np.all(confs > .4)
+    rows, confs = inference.merge_pieces([a, piece(6, 25)], [0, 6], 19, .4, 10.)
+    assert np.flatnonzero(confs[1] == 0).tolist() == [9, 10] and np.all(confs[0] > 0)
+    b = piece(6, 25)
+    b[1][1, 4] = .3
+    rows, confs = inference.merge_pieces([a, b], [0, 6], 19, .4, 10.)
+    assert confs[1, 9] > .4
