@@ -137,6 +137,12 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 VC_OBJECT_STORE_BUILD_PYTHON_PATH=build/python 
   /path/to/python -m pytest vc_object_store/tests/python -q
 ```
 
+On macOS the Python module is built without OpenMP, so from Python
+`link_tracks_to_tracks(workers=...)` runs on one worker there. `vc_object_links` and
+`vc_object_server` built beside it keep OpenMP when CMake finds it (Apple's clang
+needs `-DOpenMP_ROOT=$(brew --prefix libomp)`), so `--track-workers` and hosted
+`track-track` requests run the workers they ask for.
+
 On macOS the Python module links Homebrew's OpenCV, whose OpenBLAS loads Homebrew's
 `libomp.dylib`, while torch's wheels bring their own copy. When torch is installed,
 `import vc_object_store` loads torch's copy first, keeps the copy `_native` brings to
