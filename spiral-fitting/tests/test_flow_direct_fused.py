@@ -3,8 +3,9 @@
 flow_triton.TritonRK4DirectIntegrate (CUDA) and flow_metal.MetalRK4DirectIntegrate
 (MPS) integrate points through every slab of a low- and a high-resolution
 lattice, sampling the low one directly, and flow_fields' eager integrator
-(_EagerDirect, every device) does where neither kernel runs. The reference below runs the same
-integrator in eager PyTorch with autograd: trilinear samples at the lattice
+(_EagerDirect, every device) does where neither kernel runs. The reference
+(direct_lr_reference.py) runs the same integrator in eager PyTorch with
+autograd: trilinear samples at the lattice
 coordinates `normalised * a + b` from flow_triton._field_geoms (border clamp),
 RK4 with the kernels' stage arithmetic. Each available backend must match it:
 - the integrated points, forward and with `reverse`;
@@ -25,6 +26,7 @@ import torch.nn.functional as F
 import flow_fields
 import flow_metal
 import flow_triton
+from direct_lr_reference import reference_integrate, trilinear
 
 
 def _backends():
@@ -41,45 +43,6 @@ def _backends():
 BACKENDS = _backends()
 LOW = (2, 3, 5, 6, 7)       # slabs, 3, Zl, Yl, Xl
 HIGH = (2, 3, 17, 19, 23)   # slabs, 3, Z, Y, X (ratios are not integers)
-
-
-def _trilinear(field, p, geom):
-    # field :: 3, Z, Y, X; p :: n, 3 normalised zyx; geom = az,bz,ay,by,ax,bx.
-    size = field.shape[1:]
-    coords = []
-    for d in range(3):
-        c = p[:, d] * geom[2 * d] + geom[2 * d + 1]
-        coords.append(c.clamp(min=0.0, max=float(size[d] - 1)))
-    lo = [c.detach().floor().clamp(max=size[d] - 2) for d, c in enumerate(coords)]
-    frac = [c - l for c, l in zip(coords, lo)]
-    lo = [l.to(torch.int64) for l in lo]
-    out = 0.0
-    for dz in (0, 1):
-        for dy in (0, 1):
-            for dx in (0, 1):
-                w = ((frac[0] if dz else 1 - frac[0])
-                     * (frac[1] if dy else 1 - frac[1])
-                     * (frac[2] if dx else 1 - frac[2]))
-                v = field[:, lo[0] + dz, lo[1] + dy, lo[2] + dx]  # 3, n
-                out = out + v.T * w[:, None]
-    return out
-
-
-def _reference_integrate(y, low, high, lo_scale, hi_scale, h, n_steps,
-                         reverse):
-    geom = flow_triton._field_geoms(low, high)
-    slabs = range(low.shape[0] - 1, -1, -1) if reverse else range(low.shape[0])
-    for slab in slabs:
-        def velocity(p):
-            return (_trilinear(low[slab], p, geom[:6]) * lo_scale
-                    + _trilinear(high[slab], p, geom[6:]) * hi_scale)
-        for _ in range(n_steps):
-            k1 = velocity(y)
-            k2 = velocity(y + (h / 2) * k1)
-            k3 = velocity(y + (h / 2) * k2)
-            k4 = velocity(y + h * k3)
-            y = y + (h / 6) * (((k1 + 2.0 * k2) + 2.0 * k3) + k4)
-    return y
 
 
 def _case(n=4096, seed=7):
@@ -113,7 +76,7 @@ def _run_reference(reverse, n_steps, scales):
     low = low.requires_grad_(True)
     high = high.requires_grad_(True)
     y = y0.clone().requires_grad_(True)
-    out = _reference_integrate(y, low, high, scales[0], scales[1],
+    out = reference_integrate(y, low, high, scales[0], scales[1],
                                1.0 / n_steps, n_steps, reverse)
     out.backward(grad)
     # The kernels accumulate unscaled field gradients.
@@ -170,6 +133,6 @@ def test_direct_sample_matches_upsampled_field_on_high_res_nodes():
     grid = torch.stack(torch.meshgrid(*axes, indexing='ij'), dim=-1).reshape(-1, 3)
     upsampled = F.interpolate(low, size=(Z, Y, X), mode='trilinear')
     for slab in range(LOW[0]):
-        direct = _trilinear(low[slab], grid, geom[:6])
+        direct = trilinear(low[slab], grid, geom[:6])
         reference = flow_fields.sample_field(grid, upsampled[slab])
         torch.testing.assert_close(direct, reference, rtol=0, atol=1e-12)

@@ -24,8 +24,8 @@ place different surfaces, so:
 
 The Metal dispatch is checked on any machine. The ``simulated_metal`` fixture
 makes flow_metal accept CPU float32 lattices and run the kernels' arithmetic
-in eager PyTorch (test_flow_direct_fused's reference, which the real kernels
-are tested against there), after the kernels' own launch-time shape check.
+in eager PyTorch (direct_lr_reference, which test_flow_direct_fused holds the
+real kernels to), after the kernels' own launch-time shape check.
 The ``mps`` tests repeat the dispatch checks on a real Apple GPU.
 """
 import json
@@ -48,7 +48,7 @@ import flow_metal  # noqa: E402
 import flow_triton  # noqa: E402
 from config import Config  # noqa: E402
 from flow_fields import CartesianFlowField  # noqa: E402
-from test_flow_direct_fused import _reference_integrate  # noqa: E402
+from direct_lr_reference import reference_integrate  # noqa: E402
 from transforms import SpiralAndTransform  # noqa: E402
 
 MPS = torch.backends.mps.is_available()
@@ -88,7 +88,7 @@ class _ReferenceDirect(torch.autograd.Function):
         ctx.save_for_backward(y0, low, high)
         ctx.args = (lo_scale, hi_scale, acc_lo, acc_hi, h, n_steps, reverse)
         with torch.no_grad():
-            return _reference_integrate(y0, low, high, lo_scale, hi_scale, h,
+            return reference_integrate(y0, low, high, lo_scale, hi_scale, h,
                                         n_steps, reverse)
 
     @staticmethod
@@ -97,7 +97,7 @@ class _ReferenceDirect(torch.autograd.Function):
         lo_scale, hi_scale, acc_lo, acc_hi, h, n_steps, reverse = ctx.args
         with torch.enable_grad():
             leaves = [t.detach().requires_grad_(True) for t in (y0, low, high)]
-            out = _reference_integrate(*leaves, lo_scale, hi_scale, h, n_steps,
+            out = reference_integrate(*leaves, lo_scale, hi_scale, h, n_steps,
                                        reverse)
             g_y, g_lo, g_hi = torch.autograd.grad(out, leaves, grad)
         if acc_lo is not None:
@@ -114,7 +114,7 @@ def _simulated_direct_integrate(y0, low, high, lo_scale, hi_scale, acc_lo,
         return _ReferenceDirect.apply(y0, low, high, lo_scale, hi_scale,
                                       acc_lo, acc_hi, h, n_steps, reverse)
     with torch.no_grad():
-        return _reference_integrate(y0, low, high, lo_scale, hi_scale, h,
+        return reference_integrate(y0, low, high, lo_scale, hi_scale, h,
                                     n_steps, reverse)
 
 
