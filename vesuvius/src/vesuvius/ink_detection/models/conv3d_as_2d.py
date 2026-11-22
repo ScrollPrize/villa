@@ -4,11 +4,15 @@ A convolution with a depth-``Kd`` kernel is the sum, over its ``Kd`` depth taps,
 of 2D convolutions of depth-shifted slices. The weights and the products are
 the same; only the order of the additions changes.
 
-On ROCm, MIOpen runs 3D convolutions much slower than 2D ones, so this rewrite
+On ROCm, MIOpen runs 3D convolutions much slower than 2D ones, and on Apple
+MPS PyTorch runs ``Conv3d`` as an explicit matrix product, so this rewrite
 makes models with 3D layers faster there (for example the depth-fusion stem of
 the 3D-stem/2D-UNet ink models). On CUDA, cuDNN's 3D kernels are faster than
-the rewrite, which is why inference only turns it on under ROCm by default,
-and then only for those depth-fusion stems.
+the rewrite, which is why inference only turns it on under ROCm and MPS by
+default, and then only for those depth-fusion stems.
+
+Only plain ``nn.Conv3d`` layers are rewritten: subclasses, padding modes other
+than ``"zeros"``, string padding and dilation keep the stock convolution.
 """
 
 from __future__ import annotations
@@ -115,23 +119,30 @@ def _can_run_as_conv2d(module: nn.Module) -> bool:
 def split_conv3d_layers(model: nn.Module) -> int:
     """Swap every plain ``nn.Conv3d`` in ``model`` for ``Conv3dAsConv2d``.
 
-    Layers with other padding modes, string padding or dilation are left as
-    they are. Returns the number of layers swapped.
+    Subclasses, layers with other padding modes, string padding or dilation
+    are left as they are. A layer registered under several names (for example
+    ``ConvDropoutNormReLU`` keeps its convolution as both ``conv`` and
+    ``all_modules[0]``) gets one replacement, shared by all its names, and is
+    counted once. Returns the number of layers swapped.
     """
 
-    swapped = 0
+    replacements: dict[int, Conv3dAsConv2d] = {}
     for parent in list(model.modules()):
         for name, child in list(parent.named_children()):
-            if _can_run_as_conv2d(child):
-                setattr(parent, name, Conv3dAsConv2d.from_conv3d(child))
-                swapped += 1
-    return swapped
+            if id(child) in replacements:
+                setattr(parent, name, replacements[id(child)])
+            elif _can_run_as_conv2d(child):
+                replacement = Conv3dAsConv2d.from_conv3d(child)
+                replacements[id(child)] = replacement
+                setattr(parent, name, replacement)
+    return len(replacements)
 
 
 def resolve_conv3d_as_2d(mode: str, device: torch.device) -> bool:
     """Decide whether to run 3D convolutions as 2D ones on ``device``.
 
-    ``auto`` means only on a ROCm (HIP) build of PyTorch running on the GPU.
+    ``auto`` means only on a ROCm (HIP) build of PyTorch running on the GPU,
+    or on an Apple GPU (MPS).
     """
 
     if mode == "on":
@@ -139,7 +150,8 @@ def resolve_conv3d_as_2d(mode: str, device: torch.device) -> bool:
     if mode == "off":
         return False
     if mode == "auto":
-        return device.type == "cuda" and torch.version.hip is not None
+        rocm_gpu = device.type == "cuda" and torch.version.hip is not None
+        return rocm_gpu or device.type == "mps"
     raise ValueError(
         f"conv3d_as_2d must be one of {', '.join(CONV3D_AS_2D_CHOICES)}, got {mode!r}"
     )
@@ -150,10 +162,10 @@ def split_conv3d_for_inference(
 ) -> int:
     """Apply an inference ``conv3d_as_2d`` mode to ``model``.
 
-    ``on`` swaps every plain ``nn.Conv3d``. ``auto`` swaps, on ROCm only, the
-    layers of the depth-fusion stems (``LocalDepthFusionStem``) of the
-    3D-stem/2D-UNet models; fully 3D models keep stock ``Conv3d``. Returns the
-    number of layers swapped.
+    ``on`` swaps every plain ``nn.Conv3d`` (see :func:`split_conv3d_layers`).
+    ``auto`` swaps, on ROCm and MPS only, the layers of the depth-fusion stems
+    (``LocalDepthFusionStem``) of the 3D-stem/2D-UNet models; fully 3D models
+    keep stock ``Conv3d``. Returns the number of layers swapped.
     """
 
     if not resolve_conv3d_as_2d(mode, device):

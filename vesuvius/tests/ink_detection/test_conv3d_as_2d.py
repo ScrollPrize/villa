@@ -81,9 +81,11 @@ def test_split_leaves_layers_it_cannot_rewrite():
     assert all(type(layer) is nn.Conv3d for layer in layers)
 
 
-def test_auto_runs_as_2d_only_on_rocm(monkeypatch):
+def test_auto_runs_as_2d_only_on_rocm_and_mps(monkeypatch):
     monkeypatch.setattr(torch.version, "hip", None)
     assert resolve_conv3d_as_2d("auto", torch.device("cuda")) is False
+    assert resolve_conv3d_as_2d("auto", torch.device("mps")) is True
+    assert resolve_conv3d_as_2d("auto", torch.device("cpu")) is False
     monkeypatch.setattr(torch.version, "hip", "7.2")
     assert resolve_conv3d_as_2d("auto", torch.device("cuda")) is True
     assert resolve_conv3d_as_2d("auto", torch.device("cpu")) is False
@@ -119,6 +121,28 @@ def test_auto_swaps_only_the_depth_fusion_stem_on_rocm(monkeypatch):
         "depth_fusion.attention_logits": True,
         "body": False,
     }
+
+
+def test_auto_swaps_only_the_depth_fusion_stem_on_mps(monkeypatch):
+    monkeypatch.setattr(torch.version, "hip", None)
+    model = _stem_and_outside_conv3d()
+
+    assert split_conv3d_for_inference(model, "auto", torch.device("mps")) == 3
+    assert _swapped(model)["body"] is False
+
+
+def test_a_conv_registered_under_two_names_gets_one_replacement():
+    # ConvDropoutNormReLU keeps its convolution as both `conv` and `all_modules[0]`.
+    block = nn.Module()
+    block.conv = nn.Conv3d(2, 3, 3, padding=1)
+    block.all_modules = nn.Sequential(block.conv, nn.ReLU())
+    original_weight = block.conv.weight
+
+    assert split_conv3d_layers(block) == 1
+    assert isinstance(block.conv, Conv3dAsConv2d)
+    assert block.all_modules[0] is block.conv
+    assert block.conv.weight is original_weight
+    assert len([m for m in block.modules() if isinstance(m, nn.Conv3d)]) == 1
 
 
 def test_on_swaps_every_conv3d_and_auto_leaves_cuda_alone(monkeypatch):

@@ -1724,9 +1724,11 @@ def parse_args(argv: Sequence[str] | None = None):
         default="auto",
         help=(
             "Run 3D convolutions as sums of 2D convolutions (same weights and "
-            "sums). 'auto' (default) does this on ROCm only, where MIOpen's 3D "
-            "convolutions are slow, and only for the 3D stem of 3D-stem/2D "
-            "models; 'on' rewrites every Conv3d, on any device (slower on NVIDIA)."
+            "sums). 'auto' (default) does this on ROCm (AMD) and MPS (Apple) "
+            "only, where 3D convolutions are slow, and only for the 3D stem of "
+            "3D-stem/2D models; 'on' rewrites every plain Conv3d (not "
+            "subclasses, non-zero padding modes, string padding or dilation), "
+            "on any device (slower on NVIDIA)."
         ),
     )
     parser.add_argument("--compile-mode", default="reduce-overhead")

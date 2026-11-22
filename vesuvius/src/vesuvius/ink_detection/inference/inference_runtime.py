@@ -239,7 +239,7 @@ def prepare_model_for_inference(
 
     ``conv3d_as_2d`` (``auto``, ``on`` or ``off``) runs 3D convolutions as
     sums of 2D convolutions: ``on`` every plain ``Conv3d``, ``auto`` only the
-    depth-fusion stems of 3D-stem/2D models, and only on ROCm.
+    depth-fusion stems of 3D-stem/2D models, and only on ROCm and MPS.
     """
 
     requested = tuple(int(device_id) for device_id in gpu_ids)
