@@ -232,7 +232,7 @@ template<class T> __device__ void uint8_counts(KernelIndex vcr_launch, View<T> d
     __shared__ bool done;
     local[threadIdx.x] = 0;
     // Blocks starting after another found an unbinned value skip the data.
-    if (!threadIdx.x) done = *static_cast<volatile unsigned long long*>(&count[256]) != 0;
+    if (!threadIdx.x) done = atomicAdd(&count[256],0ull) != 0;
     __syncthreads();
     if (done) return;
     bool binned = true;
@@ -381,7 +381,8 @@ void apply_cuda(const Normalize& t, Sample& s, const Parameters& p, Session& ses
             check(cudaGetLastError()); return;
         }
         const OrderJob<T> job{data,valid ? valid->ptr : nullptr,valid ? selected.ptr : nullptr,Options(t),invalid};
-        if (BatchQueue::current) BatchQueue::current->append(job);
+        // Asynchronous runs must not wait for the histogram readback.
+        if (session.async) normalize_sorted(job.data,job.valid,job.selected,job.options,job.invalid);
         else OrderJob<T>::run({&job});
     });
 }

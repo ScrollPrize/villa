@@ -191,8 +191,8 @@ class CudaBatchTests(unittest.TestCase):
                 self.compare(transform, {'image': image})
 
     def test_uint8_valued_order_normalization_matches_cpu(self):
-        # Integer values in [0, 255] take the histogram path on both backends,
-        # so CUDA returns the CPU's bytes. Batches mix it with the sorted path.
+        # Integer values in [0, 255] take the histogram path on the CPU and in
+        # synchronous CUDA calls, so those return the CPU's bytes.
         rng = np.random.default_rng(91)
         tiny = rng.integers(0, 256, (3, 1, 1, 3)).astype(np.float32)  # percentiles interpolate
         crop = rng.integers(0, 256, (9, 37, 41)).astype(np.float32)
@@ -210,10 +210,10 @@ class CudaBatchTests(unittest.TestCase):
                         sample = {'image': x, 'valid': valid} if masked else {'image': x}
                         kwargs = dict(targets=targets) if masked else {}
                         with self.subTest(shape=x.shape, mode=mode, options=options, dtype=dtype, masked=masked):
-                            gpu = A.Pipeline([transform], backend='cuda', compact=False, **kwargs).batch(
-                                {k: torch.from_numpy(v.copy()).cuda() for k, v in sample.items()}, seeds=[0, 1, 2])
+                            pipeline = A.Pipeline([transform], backend='cuda', compact=False, **kwargs)
+                            gpu = np.stack([pipeline({k: v[b] for k, v in sample.items()}, seed=0)['image'] for b in range(len(x))])
                             cpu = transform.batch({k: torch.from_numpy(v.copy()) for k, v in sample.items()}, **kwargs)
-                            self.assertEqual(gpu['image'].cpu().numpy().tobytes(), cpu['image'].numpy().tobytes())
+                            self.assertEqual(gpu.tobytes(), cpu['image'].numpy().tobytes())
                     mixed = x.copy(); mixed[1] += dtype(.25)
                     with self.subTest(shape=x.shape, mode=mode, options=options, dtype=dtype, mixed=True):
                         self.compare(A.Normalize(mode, **options), {'image': mixed})
