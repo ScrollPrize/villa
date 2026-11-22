@@ -37,7 +37,7 @@ from checkpoint_io import load_checkpoint_cpu
 from sample_spiral import get_spiral_yxs
 from tifxyz import save_combined_tifxyz
 from transforms import SpiralAndTransform
-from umbilicus import json_umbilicus_z_to_yx
+from umbilicus import checkpoint_end_rule, json_umbilicus_z_to_yx
 
 
 MODEL_CONFIG_KEYS = (
@@ -146,7 +146,8 @@ def _build_model(
 
     z_values = np.arange(z_begin, z_end)
     centre = json_umbilicus_z_to_yx(
-        str(umbilicus_path), coordinate_scale=1.0)
+        str(umbilicus_path), coordinate_scale=1.0,
+        end_rule=checkpoint_end_rule(checkpoint))
     umbilicus_zyx = torch.from_numpy(np.concatenate([
         z_values[:, None], centre(z_values),
     ], axis=-1).astype(np.float32)).to(device)

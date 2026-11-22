@@ -670,7 +670,7 @@ def build_seed_rays(args, device="cuda:0"):
     if spiral_dir not in sys.path:
         sys.path.insert(0, spiral_dir)
     from transforms import SpiralAndTransform
-    from umbilicus import json_umbilicus_z_to_yx
+    from umbilicus import checkpoint_end_rule, json_umbilicus_z_to_yx
     from sample_spiral import get_spiral_yxs
 
     checkpoint = _load_checkpoint_cfg(args.fit_checkpoint)
@@ -706,7 +706,8 @@ def build_seed_rays(args, device="cuda:0"):
 
     device = torch.device(device)
     z_values = np.arange(z_begin, z_end)
-    centre = json_umbilicus_z_to_yx(umbilicus_path, coordinate_scale=1.0)
+    centre = json_umbilicus_z_to_yx(umbilicus_path, coordinate_scale=1.0,
+                                   end_rule=checkpoint_end_rule(checkpoint))
     umbilicus_zyx = torch.from_numpy(np.concatenate(
         [z_values[:, None], centre(z_values)], axis=-1
     ).astype(np.float32)).to(device)

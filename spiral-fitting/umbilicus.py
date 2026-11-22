@@ -2,6 +2,19 @@ import json
 import numpy as np
 import scipy.interpolate
 
+# How the centre continues past the first and last control points. A checkpoint records the rule it was
+# fitted with, because a saved model is rebuilt from the umbilicus file.
+HOLD_ENDS = 'hold'
+EXTRAPOLATE_ENDS = 'extrapolate'
+
+
+def checkpoint_end_rule(checkpoint):
+    # Checkpoints from before the rule was recorded extended the last segment in a straight line.
+    rule = checkpoint.get('umbilicus_end_rule', EXTRAPOLATE_ENDS)
+    if rule not in (HOLD_ENDS, EXTRAPOLATE_ENDS):
+        raise ValueError(f'unknown umbilicus end rule {rule!r}')
+    return rule
+
 
 def _z_interp_hold_ends(zs, vals):
     # Past the first and last control points, hold the end point (as VC3D's Umbilicus::interpolate_center does)
@@ -30,7 +43,7 @@ def thaumato_umbilicus_z_to_yx(filename, coordinate_scale=1.0, downsample_factor
     return _z_interp_hold_ends(zs, xys)  # z -> xy
 
 
-def json_umbilicus_z_to_yx(filename, coordinate_scale=1.0, downsample_factor=None):
+def json_umbilicus_z_to_yx(filename, coordinate_scale=1.0, downsample_factor=None, end_rule=HOLD_ENDS):
     if downsample_factor is not None:
         coordinate_scale = 1.0 / downsample_factor
     with open(filename, 'rt') as fp:
@@ -38,4 +51,8 @@ def json_umbilicus_z_to_yx(filename, coordinate_scale=1.0, downsample_factor=Non
     pts = sorted(data['control_points'], key=lambda p: p['z'])
     zs = np.asarray([p['z'] for p in pts], dtype=np.float32) * coordinate_scale
     yxs = np.asarray([(p['y'], p['x']) for p in pts], dtype=np.float32) * coordinate_scale
+    if end_rule == EXTRAPOLATE_ENDS:
+        return scipy.interpolate.interp1d(zs, yxs, axis=0, fill_value='extrapolate')  # z -> yx
+    if end_rule != HOLD_ENDS:
+        raise ValueError(f'unknown umbilicus end rule {end_rule!r}')
     return _z_interp_hold_ends(zs, yxs)  # z -> yx
