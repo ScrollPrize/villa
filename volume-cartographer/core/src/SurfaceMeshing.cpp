@@ -81,20 +81,21 @@ LiftedUVs liftGridUVs(const GridMesh& fine, const cv::Mat_<cv::Vec3f>& coarsePoi
     if (rows < 2 || cols < 2) return lifted;
 #pragma omp parallel for schedule(static)
     for (std::ptrdiff_t i = 0; i < static_cast<std::ptrdiff_t>(fine.cells.size()); ++i) {
-        const double gr = double(fine.cells[i][0]) / stride;
-        const double gc = double(fine.cells[i][1]) / stride;
-        const int fr = int(std::floor(gr)), fc = int(std::floor(gc));
+        const int row = fine.cells[i][0], col = fine.cells[i][1];
+        const double gr = double(row) / stride;
+        const double gc = double(col) / stride;
         // The valid decimated quad nearest to the vertex, within two cells: the
-        // one it lies in when there is one.
-        double best = std::numeric_limits<double>::infinity();
+        // one it lies in when there is one. Distances are in fine cells.
+        const int reach = 2 * stride;
+        int best = std::numeric_limits<int>::max();
         int bestRow = -1, bestCol = -1;
-        for (int r = std::max(0, fr - 2); r <= std::min(rows - 2, fr + 2); ++r)
-            for (int c = std::max(0, fc - 2); c <= std::min(cols - 2, fc + 2); ++c) {
+        for (int r = std::max(0, int(std::ceil(gr)) - 3); r <= std::min(rows - 2, int(std::floor(gr)) + 2); ++r)
+            for (int c = std::max(0, int(std::ceil(gc)) - 3); c <= std::min(cols - 2, int(std::floor(gc)) + 2); ++c) {
                 if (!loc_valid(coarsePoints, cv::Vec2d(r, c))) continue;
-                const double dr = gr - std::clamp(gr, double(r), double(r + 1));
-                const double dc = gc - std::clamp(gc, double(c), double(c + 1));
-                const double d = dr * dr + dc * dc;
-                if (d < best) {
+                const int dr = row - std::clamp(row, r * stride, (r + 1) * stride);
+                const int dc = col - std::clamp(col, c * stride, (c + 1) * stride);
+                const int d = dr * dr + dc * dc;
+                if (d <= reach * reach && d < best) {
                     best = d;
                     bestRow = r;
                     bestCol = c;
@@ -218,6 +219,11 @@ void UvGridRasterizer::determineGridDimensions(float stretch_factor) {
 
     std::cout << "UV bounds: [" << uv_min[0] << ", " << uv_min[1] << "] to [" 
               << uv_max[0] << ", " << uv_max[1] << "]" << std::endl;
+    const cv::Vec2f face_min = uv_min, face_max = uv_max;
+    if (grid_min && grid_max) {
+        uv_min = *grid_min;
+        uv_max = *grid_max;
+    }
 
     // Build raw grid (pre-decimation) from UV range and stretch factor
     const cv::Vec2f uv_range = uv_max - uv_min;
@@ -308,6 +314,17 @@ void UvGridRasterizer::determineGridDimensions(float stretch_factor) {
         std::cout << "Final grid: " << grid_size[0] << " x " << grid_size[1] << std::endl;
         std::cout << "Scale(OBJ units; compensated to raw-pixel spacing): "
                   << measured[0] << ", " << measured[1] << std::endl;
+    }
+
+    if (grid_min && grid_max) {
+        for (int a = 0; a < 2; ++a) {
+            const double step = double(uv_max[a] - uv_min[a]) / (grid_size[a] - 1);
+            const int before = std::max(0, static_cast<int>(std::ceil((uv_min[a] - face_min[a]) / step)));
+            const int after = std::max(0, static_cast<int>(std::ceil((face_max[a] - uv_max[a]) / step)));
+            uv_min[a] = static_cast<float>(uv_min[a] - before * step);
+            uv_max[a] = static_cast<float>(uv_max[a] + after * step);
+            grid_size[a] += before + after;
+        }
     }
 
     // rasterizeTriangle evaluates edge functions in int64 on fixed-point

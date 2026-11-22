@@ -119,11 +119,12 @@ TEST_CASE("liftGridUVs is exact in grid space when border rows and columns are i
 
 TEST_CASE("liftGridUVs leaves a vertex with no decimated quad within two cells invalid")
 {
-    // Columns 0..8 hold the only decimated quads (stride 4); column 24 is three
-    // decimated cells past the last of them.
+    // Columns 0..8 hold the only decimated quads (stride 4); column 16 is two
+    // decimated cells past the last of them, column 23 more.
     auto points = sheet(9, 25);
     for (int r = 0; r < points.rows; ++r)
-        for (int c = 9; c < 23; ++c) invalidate(points, r, c);
+        for (int c = 9; c < 23; ++c)
+            if (c < 15 || c > 16) invalidate(points, r, c);
 
     const int stride = 4;
     const auto coarsePoints = decimateGrid(points, stride);

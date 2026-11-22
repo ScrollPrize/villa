@@ -971,12 +971,24 @@ static std::unique_ptr<QuadSurface> flatten(QuadSurface& surface, const Options&
   for (const auto& f : fine_mesh.faces)
     if (uv_valid[f[0]] && uv_valid[f[1]] && uv_valid[f[2]])
       faces.push_back({{f[0], f[1], f[2]}, {f[0], f[1], f[2]}});
+  // The rasterizer keeps the first face to claim a pixel, and a continued
+  // border can overlap the interior in UV space.
+  if (decimating)
+    std::stable_partition(faces.begin(), faces.end(), [&](const vc::meshing::UvFace& f) {
+      const cv::Vec2i sum = fine_mesh.cells[f.v[0]] + fine_mesh.cells[f.v[1]] + fine_mesh.cells[f.v[2]];
+      return loc_valid(coarse, cv::Vec2d(sum) / (3.0 * stride));
+    });
   if (faces.size() != fine_mesh.faces.size())
     std::cerr << "warning: " << (fine_mesh.faces.size() - faces.size()) << " triangle(s) had no flattened UVs\n";
 
   // Rasterized at the source's sampling density, as vc_obj2tifxyz --tifxyz-source does.
   vc::meshing::UvGridRasterizer rasterizer;
   if (scale[0] > 0.f && scale[1] > 0.f) rasterizer.setSrcScale(scale);
+  // Border UVs continued past the decimated quads must not move the interior's samples.
+  if (decimating) {
+    const Eigen::RowVector2d lo = uv_out.colwise().minCoeff(), hi = uv_out.colwise().maxCoeff();
+    rasterizer.setGridBounds(cv::Vec2f(float(lo[0]), float(lo[1])), cv::Vec2f(float(hi[0]), float(hi[1])));
+  }
   rasterizer.setMesh(fine_mesh.positions, std::move(uvs), std::move(faces));
   rasterizer.determineGridDimensions(1.0f);
   std::unique_ptr<QuadSurface> flat(rasterizer.createQuadSurface(1.0f));
