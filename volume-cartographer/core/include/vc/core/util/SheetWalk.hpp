@@ -57,7 +57,7 @@ void walkSheetStrip(const SheetWalk& walk, const SheetNormalFn& normal,
 // Runs body(i) for every i in [0, n) on up to `workers` threads. Each i must
 // write only its own outputs, so the results do not depend on the schedule.
 // If any body throws, the exception of the lowest such i is rethrown: the
-// one a plain loop would have stopped at.
+// one a plain loop would have stopped at. Later i not yet started are skipped.
 template <class Body>
 void forEachIndex(std::size_t n, unsigned workers, const Body& body)
 {
@@ -68,12 +68,14 @@ void forEachIndex(std::size_t n, unsigned workers, const Body& body)
     }
     std::vector<std::exception_ptr> errors(n);
     std::atomic<std::size_t> next{0};
+    std::atomic<std::size_t> failed{n};
     auto work = [&]() {
-        for (std::size_t i = next++; i < n; i = next++) {
+        for (std::size_t i = next++; i < failed; i = next++) {
             try {
                 body(i);
             } catch (...) {
                 errors[i] = std::current_exception();
+                for (auto f = failed.load(); i < f && !failed.compare_exchange_weak(f, i);) {}
             }
         }
     };

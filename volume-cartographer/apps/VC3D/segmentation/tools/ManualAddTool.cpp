@@ -7,7 +7,6 @@
 
 #include <algorithm>
 #include <cmath>
-#include <exception>
 #include <limits>
 #include <map>
 #include <queue>
@@ -1306,9 +1305,6 @@ void ManualAddTool::walkSheetExtension(const SheetWalk& walk,
     }
     // Each strip reads only the walk and the normal field and writes only its own
     // vertices, so strips can grow at the same time without changing any result.
-    // A broken edge has many strips of one or a few lines, which on their own
-    // keep a single thread busy: those grow side by side, one thread each, while
-    // longer strips grow one after another with every worker inside the strip.
     auto grow = [&](std::size_t s, unsigned stripWorkers) {
         const auto [first, last] = strips[s];
         SheetWalk strip;
@@ -1321,32 +1317,20 @@ void ManualAddTool::walkSheetExtension(const SheetWalk& walk,
         std::copy(grown.begin(), grown.end(), guess.begin() + first * walk.cells);
     };
     const unsigned threads = std::max(1u, workers);
-    const std::size_t longStrip = 4 * static_cast<std::size_t>(threads);
-    // Failures are reported for the first failing strip in edge order, as a
-    // plain loop over the strips would.
-    std::vector<std::exception_ptr> errors(strips.size());
-    std::vector<std::size_t> shortStrips;
-    for (std::size_t s = 0; s < strips.size(); ++s) {
-        if (strips[s].second - strips[s].first >= longStrip || threads == 1) {
-            try {
-                grow(s, threads);
-            } catch (...) {
-                errors[s] = std::current_exception();
-                break;
-            }
-        } else {
-            shortStrips.push_back(s);
-        }
+    const auto stripWorkers = [&](std::size_t s) {
+        return static_cast<unsigned>(std::min<std::size_t>(threads, strips[s].second - strips[s].first));
+    };
+    // A strip cannot use more workers than it has lines, so consecutive strips
+    // grow together while their workers fit in the budget. Batches run in edge
+    // order, so the first failing strip's error is reported and later batches
+    // are not grown.
+    for (std::size_t first = 0; first < strips.size();) {
+        std::size_t last = first;
+        for (unsigned used = 0; last < strips.size() && used + stripWorkers(last) <= threads; ++last)
+            used += stripWorkers(last);
+        vc::sheet::forEachIndex(last - first, threads, [&](std::size_t k) { grow(first + k, stripWorkers(first + k)); });
+        first = last;
     }
-    vc::sheet::forEachIndex(shortStrips.size(), threads, [&](std::size_t k) {
-        try {
-            grow(shortStrips[k], 1);
-        } catch (...) {
-            errors[shortStrips[k]] = std::current_exception();
-        }
-    });
-    for (const auto& error : errors)
-        if (error) std::rethrow_exception(error);
 }
 
 bool ManualAddTool::applySheetWalk(std::uint64_t extensionId, std::vector<cv::Vec3f> guess, std::string* status)
