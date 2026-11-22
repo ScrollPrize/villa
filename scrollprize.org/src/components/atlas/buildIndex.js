@@ -61,20 +61,20 @@ function byCurrentThenId([a, va], [b, vb]) {
   return sa - sb || a.localeCompare(b);
 }
 
-// Drop data entries that a listed entry supersedes. The atlas marks an old
-// artifact with `properties.superseded_by.path` = its replacement's path on
-// the same entity (both full metadata and the min projection carry it), and
-// the two usually share target_volume AND model_id (e.g. PHerc1667's
-// transform-revision-2 re-renders, 2026-11), so no later tie-break can tell
-// them apart. An entry whose replacement is not listed is kept: the old
-// artifact stays on S3 until its retain_until and is better than nothing.
+// Put each listed replacement (`properties.superseded_by.path`, in both the
+// full and min metadata) in the place of the entry it supersedes, so
+// first-match picks (layers, folder) keep the same volume. The two usually
+// share target_volume AND model_id (PHerc1667's 2026-11 re-renders), so no
+// later tie-break can tell them apart. An entry whose replacement is not
+// listed is kept: it stays on S3 until its retain_until.
 function withoutSuperseded(data) {
   const pathOf = (d) => ((d && d.origins) || [])[0]?.path ?? null;
-  const listed = new Set(data.map(pathOf).filter((p) => p != null));
-  return data.filter((d) => {
-    const replacement = d && d.properties && d.properties.superseded_by;
-    return !(replacement && replacement.path && listed.has(replacement.path));
+  const byPath = new Map(data.map((d) => [pathOf(d), d]));
+  const replaced = data.map((d) => {
+    const sb = d && d.properties && d.properties.superseded_by;
+    return (sb && sb.path && byPath.get(sb.path)) || d;
   });
+  return [...new Set(replaced)];
 }
 
 // Derive the FACTUAL fields for one sample from its S3 record.

@@ -654,6 +654,12 @@ function reRegisteredSegment({ full = false, withReplacement = true } = {}) {
   ];
   if (withReplacement) {
     data.push(
+      // Another volume's layers listed between old and new must not take over.
+      mkEntry({
+        type: "layers-zarr",
+        targetVolume: "20260323082859",
+        path: `${dir}surface-volumes/1.129um-volume-20260323082859.zarr/`,
+      }),
       mkEntry({ ...common, type: "layers-zarr", path: newLayers }),
       mkEntry({ ...common, path: newInk }),
       mkEntry({ ...common, type: "ink-detection-downsampled", path: newDs })
@@ -670,7 +676,7 @@ for (const full of [false, true]) {
     const seg = firstSegment(reRegisteredSegment({ full }), "PHerc1667");
     assert.ok(seg.full.includes("-t2-"), seg.full);
     assert.ok(seg.down.includes("-t2-"), seg.down);
-    assert.ok(seg.layers.includes("-t2"), seg.layers);
+    assert.ok(seg.layers.includes("20251217075048-t2"), seg.layers);
     assert.strictEqual(seg.renders, undefined); // one variant, not old + new
   });
 }
