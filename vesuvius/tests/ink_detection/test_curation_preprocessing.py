@@ -210,6 +210,16 @@ def test_merge_predictions_exports_expected_values_reruns_and_rejects_invalid_in
     tifffile.imwrite(output, np.full((2, 2), 255, dtype=np.uint8))
     assert merge_predictions.main(args) == 0
     np.testing.assert_array_equal(tifffile.imread(output), expected)
+    tifffile.imwrite(
+        preds / "model_a_offsurface_forward_prediction.tif",
+        np.zeros((2, 2), dtype=np.uint8),
+    )
+    assert merge_predictions.main(args) == 0
+    np.testing.assert_array_equal(tifffile.imread(output), expected)
+    np.testing.assert_array_equal(
+        tifffile.imread(preds / "merged_soft_mean_offsurface_forward.tif"),
+        np.zeros((2, 2), dtype=np.uint8),
+    )
 
     empty = tmp_path / "empty" / "preds"
     empty.mkdir(parents=True)

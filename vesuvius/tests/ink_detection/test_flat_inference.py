@@ -381,6 +381,7 @@ def test_folder_mode_logs_existing_prediction_and_summary(
         checkpoint=Path("model.pth"),
         output_prefix="",
         direction="forward",
+        mask_off_surface=False,
     )
 
     with caplog.at_level("INFO"):
@@ -388,6 +389,15 @@ def test_folder_mode_logs_existing_prediction_and_summary(
 
     assert "already have segment_model_forward_010101.tif" in caplog.text
     assert "segments_ran=0 segments_skipped=1" in caplog.text
+
+    outputs = []
+    monkeypatch.setattr(
+        "vesuvius.ink_detection.inference.infer.infer_single_zarr",
+        lambda **kwargs: outputs.append(kwargs["output_tiff"].name),
+    )
+    args.mask_off_surface = True
+    infer_folder(args, None, device=torch.device("cpu"))
+    assert outputs[0].startswith("segment_model_offsurface_forward_")
 
 
 def test_cpu_command_checkpoint_to_tiff_timeline(tmp_path, caplog):

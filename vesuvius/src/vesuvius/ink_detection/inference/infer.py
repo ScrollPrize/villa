@@ -1576,6 +1576,8 @@ def infer_folder(
     checkpoint_stem = Path(args.checkpoint).stem
     if checkpoint_count > 1:
         checkpoint_stem = f"{checkpoint_stem}_ens{checkpoint_count}"
+    if args.mask_off_surface:
+        checkpoint_stem = f"{checkpoint_stem}_offsurface"
     date = datetime.now().strftime("%d%m%y")
     prefix = f"{args.output_prefix}_" if args.output_prefix else ""
     ran_count = 0
