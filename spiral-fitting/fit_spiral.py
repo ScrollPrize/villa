@@ -68,7 +68,8 @@ def _startup_resource_suffix(started_at=None):
 
 from lasagna_data import ensure_fit_sparse_stores, prepare_lasagna_volume
 from lasagna_source import load_lasagna_source
-from checkpoint_io import load_checkpoint_cpu, model_state_sha256
+from checkpoint_io import (FLOW_INTERPOLANT_KEY, checkpoint_flow_interpolant,
+                           load_checkpoint_cpu, model_state_sha256)
 from fiber_direction_samples import load_fiber_direction_samples
 from spiral_sampling import load_spiral_sampling
 from geom_utils import bilinear_atlas_lookup, grid_sample_border, interp1d
@@ -2398,6 +2399,10 @@ class FitContext:
             spiral_outward_sense=self.spiral_outward_sense,
         )
         self.spiral_and_transform.to(self.device)
+        if resume_checkpoint is not None:
+            # A resumed fit integrates the interpolant it was fitted with,
+            # whatever this device's kernels, from its first transform on.
+            self._keep_checkpoint_interpolant(resume_checkpoint)
 
         # ==========================================================================
         # Outer-shell setup
@@ -2672,12 +2677,40 @@ class FitContext:
         return model_state_sha256(
             self.spiral_and_transform.state_dict(),
             getattr(self, 'frozen_epochs', None) or (),
-            getattr(self, 'z_begin', None), getattr(self, 'z_end', None))
+            getattr(self, 'z_begin', None), getattr(self, 'z_end', None),
+            flow_interpolant=self._flow_interpolant())
+
+    def _flow_interpolant(self):
+        # The interpolant the resident flow field integrates (None for field
+        # types with only one).
+        interpolant = getattr(self.spiral_and_transform, 'flow_interpolant', None)
+        return None if interpolant is None else interpolant()
+
+    def _keep_checkpoint_interpolant(self, checkpoint):
+        """Integrate the flow interpolant ``checkpoint`` was fitted with
+        (checkpoint_io.checkpoint_flow_interpolant) from now on, and say so
+        when an older checkpoint's interpolant had to be inferred."""
+        pin = getattr(self.spiral_and_transform, 'pin_flow_interpolant', None)
+        if pin is None or not isinstance(checkpoint, dict):
+            return
+        try:
+            interpolant, note = checkpoint_flow_interpolant(checkpoint)
+        except ValueError:
+            return   # an unknown recorded interpolant: the preflight refuses it
+        field = getattr(self.spiral_and_transform, 'flow_field', None)
+        previous = getattr(field, 'pinned_interpolant', None)
+        pin(interpolant)
+        if note and previous != interpolant:
+            print(f'checkpoint flow field: {interpolant} ({note})', flush=True)
 
     def _checkpoint_payload(self, completed_iterations):
         return {
             'schema_version': 2,
             'model_state_sha256': self.model_state_digest(),
+            # The interpolant the fit integrated, not the one its
+            # configuration asked for (they differ where no fused kernel
+            # runs): reconstructions keep it.
+            FLOW_INTERPOLANT_KEY: self._flow_interpolant(),
             'completed_iterations': int(completed_iterations),
             'spiral_and_transform': self.spiral_and_transform.state_dict(),
             'optimiser': self.optimiser.state_dict(),
@@ -2807,6 +2840,10 @@ class FitContext:
         for key in ('spiral_and_transform', 'optimiser', 'cfg'):
             if checkpoint.get(key) is None:
                 reasons.append(f'checkpoint has no {key!r} entry')
+        try:
+            checkpoint_flow_interpolant(checkpoint)
+        except ValueError as exc:
+            reasons.append(str(exc))
 
         # --- scroll / input identity --------------------------------------
         # A fit that reads no Lasagna dataset has no downsampling to compare.
@@ -3054,6 +3091,9 @@ class FitContext:
             torch.mps.set_rng_state(checkpoint['torch_mps_rng_state'])
 
     def load_checkpoint(self, checkpoint):
+        # The model state places the checkpoint's surface only under the
+        # interpolant it was fitted with.
+        self._keep_checkpoint_interpolant(checkpoint)
         checkpoint, _ = tolerate_checkpoint_config(checkpoint)
         checkpoint = expand_gap_checkpoint_capacity(
             checkpoint, self.config['model_gap_expander_capacity_windings'])

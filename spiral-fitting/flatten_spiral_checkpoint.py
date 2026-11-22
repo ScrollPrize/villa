@@ -33,7 +33,7 @@ from urllib.parse import quote
 import numpy as np
 import torch
 
-from checkpoint_io import load_checkpoint_cpu
+from checkpoint_io import checkpoint_flow_interpolant, load_checkpoint_cpu
 from sample_spiral import get_spiral_yxs
 from tifxyz import save_combined_tifxyz
 from transforms import SpiralAndTransform
@@ -171,6 +171,12 @@ def _build_model(
             checkpoint.get("spiral_outward_sense") or "CW"),
     ).to(device)
     model.load_state_dict(state)
+    # The surface the fit placed: its parameters under the interpolant it
+    # integrated, whatever this device's kernels.
+    interpolant, note = checkpoint_flow_interpolant(checkpoint)
+    model.pin_flow_interpolant(interpolant)
+    if note:
+        print(f"checkpoint flow field: {interpolant} ({note})", flush=True)
     model.eval()
     return model
 

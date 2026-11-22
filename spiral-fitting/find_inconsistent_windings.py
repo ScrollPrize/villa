@@ -111,6 +111,7 @@ from scipy.optimize import milp, LinearConstraint, Bounds
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _SCRIPT_DIR)
 import fit_spiral as fs
+from checkpoint_io import checkpoint_flow_interpolant
 from sample_spiral import (
     get_theta_and_radii,
     get_theta_crossing_step_adjustments,
@@ -308,6 +309,11 @@ def build_transform(checkpoint, cfg, context, model_z_begin, model_z_end):
     )
     model.to(device)
     model.load_state_dict(checkpoint['spiral_and_transform'])
+    # The interpolant the checkpoint was fitted with, as the fitter keeps it.
+    interpolant, note = checkpoint_flow_interpolant(checkpoint)
+    model.pin_flow_interpolant(interpolant)
+    if note:
+        print(f'checkpoint flow field: {interpolant} ({note})')
     model.eval()
 
     transform = model.get_slice_to_spiral_transform()

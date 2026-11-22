@@ -429,6 +429,156 @@ def _slab_order(num_stages, reverse):
     return range(num_stages - 1, -1, -1) if reverse else range(num_stages)
 
 
+# The two interpolants a CartesianFlowField integrates: its coarse lattice
+# sampled directly at each point (the fused kernels' direct-LR path), or
+# upsampled to the fine lattice first. They agree on fine lattice nodes and
+# differ inside fine cells that straddle a coarse grid plane, so the same
+# parameters place slightly different surfaces.
+FLOW_INTERPOLANTS = ('direct_lr', 'upsampled')
+
+# Points per chunk of the eager direct integrator: bounds the autograd graph
+# its backward rebuilds.
+_EAGER_DIRECT_CHUNK = 1 << 16
+
+
+def _direct_trilinear(field, points, geom):
+    """One slab's lattice ``[3, Z, Y, X]`` sampled at ``points`` ``[n, 3]``
+    (normalised zyx) as the fused direct-LR kernels sample it: trilinear at
+    the lattice coordinates ``points * a + b`` (flow_triton._field_geoms),
+    clamped to the lattice, with the lower corner clamped to size - 2 (to 0 on
+    a single-cell axis) and the kernels' weight and summation order."""
+    corners = []
+    for axis in range(3):
+        size = int(field.shape[1 + axis])
+        # A NaN coordinate samples index 0, as the kernels' clamp flushes it.
+        coord = torch.nan_to_num(
+            points[:, axis] * geom[2 * axis] + geom[2 * axis + 1], nan=0.0)
+        coord = coord.clamp(0.0, float(size - 1))
+        low = coord.detach().floor().clamp(0, max(size - 2, 0))
+        frac = coord - low
+        low = low.to(torch.int64)
+        high = (low + 1).clamp(max=size - 1)
+        corners.append(((low, 1.0 - frac), (high, frac)))
+    out = None
+    for iz, wz in corners[0]:
+        for iy, wy in corners[1]:
+            for ix, wx in corners[2]:
+                term = field[:, iz, iy, ix].T * ((wx * wy) * wz)[:, None]
+                out = term if out is None else out + term
+    return out
+
+
+def _direct_rk4(y, low, high, lo_scale, hi_scale, h, n_steps, reverse):
+    # Every slab's RK4 walk (slabs in reverse order with `reverse`) over both
+    # lattices sampled directly, with the fused kernels' stage arithmetic.
+    geom = flow_triton._field_geoms(low, high)
+    slabs = range(low.shape[0] - 1, -1, -1) if reverse else range(low.shape[0])
+    for slab in slabs:
+        lo, hi = low[slab], high[slab]
+
+        def velocity(p, lo=lo, hi=hi):
+            return (_direct_trilinear(lo, p, geom[:6]) * lo_scale
+                    + _direct_trilinear(hi, p, geom[6:]) * hi_scale)
+
+        for _ in range(n_steps):
+            k1 = velocity(y)
+            k2 = velocity(y + (h / 2) * k1)
+            k3 = velocity(y + (h / 2) * k2)
+            k4 = velocity(y + h * k3)
+            y = y + (h / 6) * (((k1 + 2.0 * k2) + 2.0 * k3) + k4)
+    return y
+
+
+def _direct_rk4_no_grad(y0, low, high, lo_scale, hi_scale, h, n_steps, reverse):
+    with torch.no_grad():
+        chunks = [
+            _direct_rk4(y0[start:start + _EAGER_DIRECT_CHUNK], low, high,
+                        lo_scale, hi_scale, h, n_steps, reverse)
+            for start in range(0, max(y0.shape[0], 1), _EAGER_DIRECT_CHUNK)]
+        return chunks[0] if len(chunks) == 1 else torch.cat(chunks)
+
+
+class _EagerRK4DirectIntegrate(torch.autograd.Function):
+    # rk4_direct_integrate's contract (flow_triton, flow_metal) in eager
+    # PyTorch. The forward keeps only the start points; the backward
+    # re-integrates them chunk by chunk under autograd, returns the point
+    # gradients and adds the field gradients, unscaled like the kernels', to
+    # the caller's accumulators.
+
+    @staticmethod
+    def forward(ctx, y0, low, high, lo_scale, hi_scale, acc_lo, acc_hi, h,
+                n_steps, reverse):
+        ctx.set_materialize_grads(False)
+        ctx.save_for_backward(y0, low, high)
+        ctx.args = (float(lo_scale), float(hi_scale), acc_lo, acc_hi,
+                    float(h), int(n_steps), bool(reverse))
+        return _direct_rk4_no_grad(y0, low, high, lo_scale, hi_scale, h,
+                                   n_steps, reverse)
+
+    @staticmethod
+    def backward(ctx, grad_y):
+        if grad_y is None:
+            return (None,) * 10
+        y0, low, high = ctx.saved_tensors
+        lo_scale, hi_scale, acc_lo, acc_hi, h, n_steps, reverse = ctx.args
+        fields = acc_lo is not None
+        grad_points = torch.empty_like(y0)
+        with torch.enable_grad():
+            # The value scales are folded into the sampled lattices, so the
+            # lattice gradients come out unscaled (trilinear sampling is
+            # linear in the lattice values).
+            lo = (low.detach() * lo_scale).requires_grad_(fields)
+            hi = (high.detach() * hi_scale).requires_grad_(fields)
+            for start in range(0, y0.shape[0], _EAGER_DIRECT_CHUNK):
+                stop = min(start + _EAGER_DIRECT_CHUNK, y0.shape[0])
+                y = y0[start:stop].detach().requires_grad_(True)
+                out = _direct_rk4(y, lo, hi, 1.0, 1.0, h, n_steps, reverse)
+                grads = torch.autograd.grad(
+                    out, (y, lo, hi) if fields else (y,), grad_y[start:stop])
+                grad_points[start:stop] = grads[0]
+                if fields:
+                    acc_lo.add_(grads[1])
+                    acc_hi.add_(grads[2])
+        return (grad_points,) + (None,) * 9
+
+
+def eager_rk4_direct_integrate(y0, low, high, lo_scale, hi_scale, acc_lo,
+                               acc_hi, h, n_steps, reverse=False):
+    """flow_triton.rk4_direct_integrate's contract without a fused kernel.
+
+    Direct sampling of the coarse lattice where no fused kernel integrates
+    it (the CPU, FIT_SPIRAL_METAL=0, or lattices a kernel does not take), so
+    that a checkpoint fitted with direct sampling keeps its surface there.
+    Slower than the kernels, and its backward rebuilds the integration under
+    autograd.
+    """
+    if torch.is_grad_enabled() and y0.requires_grad:
+        return _EagerRK4DirectIntegrate.apply(
+            y0, low, high, lo_scale, hi_scale, acc_lo, acc_hi, h, n_steps,
+            reverse)
+    return _direct_rk4_no_grad(y0, low, high, lo_scale, hi_scale, h, n_steps,
+                               reverse)
+
+
+class _EagerDirect:
+    # The fused-kernel modules' interface, integrated eagerly.
+    rk4_direct_integrate = staticmethod(eager_rk4_direct_integrate)
+
+
+def _fused_direct_backend(low, high):
+    """``(module, None)`` for the fused kernel that integrates these lattices
+    directly (flow_triton on CUDA, flow_metal on MPS), else ``(None, why
+    not)``."""
+    if flow_triton.rk4_triton_available(low, high):
+        return flow_triton, None
+    if flow_metal.rk4_metal_available(low, high):
+        problem = flow_metal.lattice_shape_problem(low, high)
+        if problem is None:
+            return flow_metal, None
+        return None, problem
+    return None, f'no fused kernel on {low.device}'
+
+
 class CartesianFlowField(nn.Module):
     """Piecewise-stationary velocity field on two Cartesian lattices.
 
@@ -439,6 +589,11 @@ class CartesianFlowField(nn.Module):
     inverse), so ``num_stages`` slabs are the sequential composition of
     ``num_stages`` stationary flows. ``num_stages == 1`` is the original
     single-field model with identical parameters and state_dict keys.
+
+    It integrates one of two interpolants (FLOW_INTERPOLANTS); see
+    effective_interpolant. ``direct_lr`` (model_flow_field_direct_lr) asks
+    for direct sampling where a fused kernel runs it; pin_interpolant fixes
+    the interpolant a checkpoint was fitted with.
     """
 
     def __init__(self, resolution, spatial_scale_factor=6, num_stages=1, direct_lr=False):
@@ -446,6 +601,8 @@ class CartesianFlowField(nn.Module):
         self.num_stages = int(num_stages)
         assert self.num_stages >= 1
         self.direct_lr = direct_lr
+        self.pinned_interpolant = None
+        self._notes = set()
         self.spatial_scale_factor = int(spatial_scale_factor)
         resolution = [int(s) for s in resolution]
         self.flows = nn.ParameterList([
@@ -459,6 +616,67 @@ class CartesianFlowField(nn.Module):
         self._field_grad_acc = None
         self._lr_grad_acc = None
         self._pending_direct = False
+
+    def pin_interpolant(self, interpolant):
+        """Integrate ``interpolant`` (one of FLOW_INTERPOLANTS) whatever the
+        device's kernels: the interpolant a checkpoint was fitted with.
+        ``None`` returns to the configured choice."""
+        if interpolant is not None and interpolant not in FLOW_INTERPOLANTS:
+            raise ValueError(f'unknown flow interpolant {interpolant!r}')
+        self.pinned_interpolant = interpolant
+
+    def effective_interpolant(self):
+        """The interpolant get_integrator integrates: 'direct_lr' or
+        'upsampled'. Checkpoints record it and the model-state digest names
+        it, since the same parameters place a different surface under each."""
+        return self._resolve_interpolant(strict=False, log=False)[0]
+
+    def _note(self, message, log=True):
+        if log and message not in self._notes:
+            self._notes.add(message)
+            print(message, flush=True)
+
+    def _resolve_interpolant(self, strict=True, log=True):
+        """``(interpolant, backend)``. ``backend`` supplies
+        rk4_direct_integrate for 'direct_lr' (a fused kernel module, or the
+        eager integrator) and is None for 'upsampled'.
+
+        FIT_SPIRAL_DIRECT_LR, when set, decides ('1' direct, anything else
+        upsampled); else a pinned interpolant; else ``direct_lr``. Direct
+        sampling runs on a fused kernel when one takes these lattices. Where
+        none does, a pinned direct interpolant is integrated eagerly (the
+        checkpoint keeps its surface), an explicit FIT_SPIRAL_DIRECT_LR=1 is
+        refused with the reason, and the configured default falls back to the
+        upsampled field, as main does off CUDA.
+        """
+        override = os.environ.get('FIT_SPIRAL_DIRECT_LR')
+        pinned = self.pinned_interpolant
+        default = pinned == 'direct_lr' if pinned is not None else bool(self.direct_lr)
+        wanted = 'direct_lr' if flow_triton.direct_lr_enabled(default) else 'upsampled'
+        if pinned is not None and wanted != pinned:
+            self._note(f'flow field: FIT_SPIRAL_DIRECT_LR={override} switches the '
+                       f"checkpoint's {pinned} interpolant to {wanted}; the fitted "
+                       'surface moves', log)
+        if wanted == 'upsampled':
+            return 'upsampled', None
+        backend, reason = _fused_direct_backend(self.flows[0], self.flows[1])
+        if backend is not None:
+            return 'direct_lr', backend
+        if pinned == 'direct_lr':
+            self._note(f"flow field: {reason}; integrating the checkpoint's direct "
+                       'low-resolution sampling eagerly (slower than a fused kernel)', log)
+            return 'direct_lr', _EagerDirect
+        if flow_triton.direct_lr_requested():
+            if strict:
+                raise RuntimeError(
+                    'FIT_SPIRAL_DIRECT_LR=1 asks for direct low-resolution sampling, which only '
+                    'the fused kernels run (Triton on CUDA, Metal on MPS; float32 lattices): '
+                    f'{reason} (lattices on {self.flows[0].device}, {self.flows[0].dtype}). '
+                    'Unset it, or set FIT_SPIRAL_DIRECT_LR=0, for the upsampled field.')
+            return 'direct_lr', None
+        self._note(f'flow field: {reason}, using the upsampled field '
+                   '(model_flow_field_direct_lr applies only where a fused kernel runs)', log)
+        return 'upsampled', None
 
     def _prepare_upsampled_fields(self):
         # Shared state for get_sampler / get_integrator in upsampled-LR mode.
@@ -489,11 +707,11 @@ class CartesianFlowField(nn.Module):
         self._pending_lr_upsampled = lr_upsampled
         return low_field, high_field, self._field_grad_acc
 
-    def _get_direct_integrator(self, backend=flow_triton):
+    def _get_direct_integrator(self, backend):
         # Direct-LR mode: sample the LR lattice at query points instead of
-        # upsampling it to HR every step (FIT_SPIRAL_DIRECT_LR=1). Field
-        # gradients accumulate into per-lattice buffers. `backend` is the
-        # fused-kernel module: flow_triton on CUDA, flow_metal on MPS.
+        # upsampling it to HR every step. Field gradients accumulate into
+        # per-lattice buffers. `backend` provides rk4_direct_integrate:
+        # flow_triton on CUDA, flow_metal on MPS, else the eager integrator.
         lr_flow, hr_flow = self.flows[0], self.flows[1]
         low, high = lr_flow, hr_flow
         training_field = torch.is_grad_enabled() and (
@@ -532,21 +750,9 @@ class CartesianFlowField(nn.Module):
         whole walk is one autograd node (see flow_triton); the eager fallback
         composes one _RK4SparseFlowIntegrate node per slab.
         """
-        if flow_triton.direct_lr_enabled(self.direct_lr):
-            if flow_triton.rk4_triton_available(self.flows[0], self.flows[1]):
-                return self._get_direct_integrator()
-            if flow_metal.rk4_metal_available(self.flows[0], self.flows[1]):
-                return self._get_direct_integrator(flow_metal)
-            if flow_triton.direct_lr_requested():
-                raise RuntimeError(
-                    'FIT_SPIRAL_DIRECT_LR=1 asks for direct low-resolution sampling, which exists only in the '
-                    'fused kernels (Triton on CUDA, Metal on MPS; float32 lattices; '
-                    f'here {self.flows[0].device}, {self.flows[0].dtype}). '
-                    'Unset it, or set FIT_SPIRAL_DIRECT_LR=0, for the upsampled field.')
-            if not getattr(self, '_upsampled_noted', False):
-                self._upsampled_noted = True
-                print(f'flow field: no fused kernel on {self.flows[0].device}, using the upsampled field '
-                      '(model_flow_field_direct_lr applies only where the kernel runs)', flush=True)
+        interpolant, backend = self._resolve_interpolant()
+        if interpolant == 'direct_lr':
+            return self._get_direct_integrator(backend)
         low_field, high_field, acc = self._prepare_upsampled_fields()
 
         if flow_triton.rk4_triton_available(low_field, high_field, acc):

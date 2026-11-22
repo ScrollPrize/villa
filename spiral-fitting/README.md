@@ -135,11 +135,27 @@ picks one explicitly (`devices.py`). A distributed (torchrun) fit needs CUDA or
 the CPU: torch.distributed has no MPS backend. The Triton kernels are CUDA only, and the CUDA
 startup check is skipped elsewhere. On MPS, Metal versions of two of them run instead: the gap
 expander's (`gap_metal.py`) and the Cartesian field's direct low-resolution flow integration
-(`flow_metal.py`), so an MPS fit with the default `model_flow_field_direct_lr` samples the same
-interpolant as a CUDA one instead of the upsampled field. The other flow-field types, and the
-CPU, use the PyTorch paths; `FIT_SPIRAL_METAL=0` turns the Metal kernels off.
-`tests/test_gap_fused.py` and `tests/test_flow_direct_fused.py` check the fused kernels of
-whichever backend the machine has against the eager paths.
+(`flow_metal.py`). The other flow-field types, and the CPU, use the PyTorch paths;
+`FIT_SPIRAL_METAL=0` turns the Metal kernels off. `tests/test_gap_fused.py` and
+`tests/test_flow_direct_fused.py` check the fused kernels of whichever backend the machine has
+against the eager paths.
+
+The Cartesian field integrates one of two interpolants, which place slightly different surfaces
+for the same parameters. `model_flow_field_direct_lr` (on by default) samples its coarse lattice
+directly at each point. Only the fused kernels do that, so elsewhere, and for a lattice with a
+single cell along any axis (a 100-slice window with `model_flow_bounds_z_margin` 0 has one coarse
+z cell), a fit integrates the upsampled field. A new MPS fit therefore samples directly, as a CUDA
+fit does, where it used to integrate the upsampled field; `FIT_SPIRAL_DIRECT_LR=0` keeps the
+upsampled field. A checkpoint records the interpolant its fit integrated
+(`flow_field_interpolant`), and a resume, an in-session load and `flatten_spiral_checkpoint.py`
+keep it on any device: on a fused kernel where one runs, eagerly otherwise. A checkpoint written
+before that record keeps what it was fitted with: the upsampled field if it was written on MPS
+(it carries `torch_mps_rng_state`) or without CUDA, direct sampling if it came from a CUDA
+machine. `FIT_SPIRAL_DIRECT_LR=0` or `1` overrides the choice for fresh fits and checkpoints
+alike; switching a checkpoint's interpolant is logged, and its surface moves. `1` is refused
+where no fused kernel takes the lattices. The model-state digest that checkpoints and previews
+carry names the upsampled interpolant, so the service re-shows a preview only for the surface
+it shows.
 
 MPS has no float64. Device tensors that are float64 on CUDA take their dtype
 from `devices.float_hi()`, which is float32 on MPS;

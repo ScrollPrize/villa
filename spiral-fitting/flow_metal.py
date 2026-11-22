@@ -19,7 +19,9 @@ tests/test_flow_direct_fused.py checks both fused backends against an eager
 PyTorch implementation of the same integrator.
 
 Compiled once per process with torch.mps.compile_shader (PyTorch's safe math
-mode). Set FIT_SPIRAL_METAL=0 to use the eager (upsampled) path.
+mode). Set FIT_SPIRAL_METAL=0 to turn the kernels off. Lattices with a single
+cell along any axis are not taken (lattice_shape_problem): the field then
+integrates as it does without a kernel (CartesianFlowField.get_integrator).
 """
 import os
 
@@ -357,6 +359,8 @@ def _lib():
 
 
 def rk4_metal_available(*tensors):
+    # The device and dtype test. Whether the kernels take the lattices'
+    # shape is lattice_shape_problem's question.
     if os.environ.get('FIT_SPIRAL_METAL', '1') == '0':
         return False
     if not torch.backends.mps.is_available():
@@ -367,11 +371,28 @@ def rk4_metal_available(*tensors):
     )
 
 
+def lattice_shape_problem(low, high):
+    """Why the kernels cannot integrate these lattices, or None.
+
+    The backward's trilinear corner arithmetic needs two cells along every
+    axis of both lattices (its lower corner is clamped to size - 2). A narrow
+    fit window gives fewer: 100 slices with no z margin are six fine z cells
+    at the default 16-voxel spacing, so one coarse cell at scale 6.
+    """
+    for name, field in (('coarse', low), ('fine', high)):
+        for axis, size in zip('zyx', field.shape[2:]):
+            if int(size) < 2:
+                return (f'the {name} lattice has {int(size)} cell'
+                        f'{"" if int(size) == 1 else "s"} along {axis} '
+                        f'(shape {tuple(field.shape[2:])}; the Metal kernels '
+                        'need at least 2 per axis)')
+    return None
+
+
 def _params(n, low, high, lo_scale, hi_scale, h, n_steps):
-    for field in (low, high):
-        if min(field.shape[2:]) < 2:
-            raise ValueError(
-                f'flow lattices need at least 2 cells per axis, got {tuple(field.shape)}')
+    problem = lattice_shape_problem(low, high)
+    if problem is not None:
+        raise ValueError(problem)
     g = flow_triton._field_geoms(low, high)
     fp = [*g[:6], float(lo_scale), *g[6:], float(hi_scale),
           float(h), float(h / 2), float(h / 6)]

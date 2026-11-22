@@ -478,6 +478,25 @@ class SpiralAndTransform(nn.Module):
             maybe_flip = [pyro.distributions.transforms.AffineTransform(loc=0., scale=_acw_flip_scale(self.device))]
         return gap_expander, maybe_flip, diffeomorphism, truncate_frac
 
+    def flow_interpolant(self):
+        """The interpolant the flow field integrates ('direct_lr' or
+        'upsampled'; see CartesianFlowField.effective_interpolant), or None
+        for the field types that have only one."""
+        effective = getattr(self.flow_field, 'effective_interpolant', None)
+        return None if effective is None else effective()
+
+    def pin_flow_interpolant(self, interpolant):
+        """Integrate the interpolant a checkpoint was fitted with
+        (checkpoint_io.checkpoint_flow_interpolant); None leaves the choice to
+        the configuration."""
+        pin = getattr(self.flow_field, 'pin_interpolant', None)
+        if pin is not None:
+            pin(interpolant)
+        elif interpolant is not None:
+            raise ValueError(
+                f'{type(self.flow_field).__name__} has a single interpolant; '
+                f'a checkpoint cannot ask for {interpolant!r}')
+
     def get_slice_to_spiral_transform(self, truncate_at_step=None, shared=None):
         # `shared` optionally supplies the (dr_per_winding, scaled_linear_logits,
         # pinned_scaled_gap_logits) triple from get_shared_transform_tensors(),
