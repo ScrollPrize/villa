@@ -908,6 +908,11 @@ void OpenDataCatalogWindow::onFetchFinished()
         }
         return;
     }
+    // Keep the catalog read from the cache file, which project actions use.
+    if (result.browseOnly && _manifest && !_browseOnly) {
+        setStatus(tr("Using cached catalog. Live catalog from %1").arg(result.sourceLabel));
+        return;
+    }
 
     applyManifest(result.manifest, result.sourceLabel, false, result.browseOnly);
 }
@@ -1393,7 +1398,7 @@ void OpenDataCatalogWindow::updateActionButtons()
         _copyVolumeUrlButton->setEnabled(hasVolumeUrl);
     }
     if (_attachVolumeButton) {
-        _attachVolumeButton->setEnabled(manifestReady && hasVolumeUrl);
+        _attachVolumeButton->setEnabled(projectReady && hasVolumeUrl);
     }
     if (_openVolumeUrlButton) {
         _openVolumeUrlButton->setEnabled(hasVolumeUrl);

@@ -128,6 +128,13 @@ int main()
             require(names(&loaded.manifest, "Live") && !loaded.onDisk && !loaded.warning.empty(),
                     "a download over an older unsidecared body is not on disk");
             require(names(cachedManifest(older).get(), "Older"), "readers of the cache file see the older catalog");
+
+            fs::permissions(readOnly, fs::perms::owner_all);
+            std::ofstream(older.string() + ".info.json") << R"({"source": ")" + url + R"(", "checked_at": 0})";
+            fs::permissions(readOnly, fs::perms::owner_read | fs::perms::owner_exec);
+            loaded = loadCatalog(url, {older, true});
+            require(names(&loaded.manifest, "Older") && loaded.onDisk && loaded.fromCache && !loaded.warning.empty(),
+                    "an older cache that cannot be replaced is served");
         } else {
             std::cout << "skipping the read-only cache directory as root\n";
         }

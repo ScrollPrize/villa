@@ -86,7 +86,7 @@ CatalogLoadResult loadCatalog(const std::string& source,const CatalogLoadOptions
             if(response.status!=304){atomic_write(options.cacheFile.string(), reinterpret_cast<const std::uint8_t*>(body.data()), body.size());onDisk=true;}
             const auto infoText = nlohmann::json{{"source",source},{"checked_at",now},{"etag",response.etag.empty()?info.value("etag",std::string{}):response.etag}}.dump();
             atomic_write(infoPath, reinterpret_cast<const std::uint8_t*>(infoText.data()), infoText.size());
-        }catch(const std::exception& e){warning=std::string("catalog not cached: ")+e.what();}
+        }catch(const std::exception& e){if(cached&&!onDisk)throw;warning=std::string("catalog not cached: ")+e.what();}
         return {std::move(manifest),response.status==304,onDisk,std::move(warning)};
     }catch(const std::exception& e){if(cached)return {*cached,true,true,e.what()};throw;}
 }
