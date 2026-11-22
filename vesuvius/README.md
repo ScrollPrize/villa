@@ -94,16 +94,21 @@ To get started, we recommend these notebooks that jump right in:
 ## Installation
 
 `vesuvius` on `main` requires Python 3.14 and reads data through `vc-reader`,
-which is built from this monorepo (it is not on PyPI yet). To install `vc-reader`
-on its own, which is all the notebooks above need (CPU-only build):
+which is built from this monorepo (it is not on PyPI yet). The first two notebooks
+above need only `vc-reader` (CPU-only build):
 ```sh
 $ pip install "vc-reader @ git+https://github.com/ScrollPrize/villa.git#subdirectory=vc_reader" \
     --config-settings=cmake.define.VC_READER_ENABLE_CUDA=OFF
 ```
-`vc-reader` needs its native libraries first (Ubuntu/Debian: `libblosc-dev libzstd-dev
-liblz4-dev libsqlite3-dev nlohmann-json3-dev libcurl4-openssl-dev zlib1g-dev libtiff-dev
-libpng-dev libjpeg-dev pkg-config`). The `vesuvius` release on PyPI (0.2.x) predates the
-`vc-reader` migration and has a different API.
+`vc-reader` needs its native libraries first (Ubuntu/Debian: `libblosc-dev libblosc2-dev
+libboost-dev libconcurrentqueue-dev libzstd-dev liblz4-dev libsqlite3-dev nlohmann-json3-dev
+libcurl4-openssl-dev zlib1g-dev libtiff-dev libpng-dev libjpeg-dev pkg-config`). With
+`vc-reader` installed, install `vesuvius` from the monorepo:
+```sh
+$ pip install "vesuvius[volume-only] @ git+https://github.com/ScrollPrize/villa.git#subdirectory=vesuvius"
+```
+The `vesuvius` release on PyPI (0.2.x) predates the `vc-reader` migration and has a
+different API.
 
 For monorepo development, `uv sync --extra models`, `uv sync --extra all`, and
 `uv sync --all-extras` build the local `volume-cartographer` and `vc-object-store`
