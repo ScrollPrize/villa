@@ -44,6 +44,33 @@ Use `VC_READER_ENABLE_CUDA=ON` to require CUDA and fail if it is unavailable.
 Explicit settings persist in the CMake build cache, so pass `ON` to enable
 CUDA after a previous CPU-only build.
 
+**AMD GPUs (ROCm).** To build for an AMD GPU, enable `VC_READER_ENABLE_HIP=ON`.
+It is off by default (unlike CUDA, which turns on by itself when it finds the
+NVIDIA compiler `nvcc`):
+
+```bash
+python -m pip install -e '.[all]' \
+  --config-settings=cmake.define.VC_READER_ENABLE_HIP=ON
+```
+
+CMake looks for ROCm at its usual location, `/opt/rocm`. If ROCm is installed
+elsewhere, give it the path with `ROCM_PATH`. CMake detects the GPU by itself;
+if it cannot, give it with `CMAKE_HIP_ARCHITECTURES`, for example
+`--config-settings=cmake.define.CMAKE_HIP_ARCHITECTURES=gfx1200`.
+
+Only wave32 AMD GPUs (gfx10xx, gfx11xx, gfx12xx) are accepted. Wave64 GPUs (for
+example the MI50, gfx906) are refused, because some kernels use 32-bit masks, one
+bit per member of the warp: with 64 members, half would be left out and the
+results would be wrong.
+
+You cannot set `VC_READER_ENABLE_CUDA=ON` and `VC_READER_ENABLE_HIP=ON` together:
+your build targets one type of GPU (NVIDIA or AMD).
+
+For Python, nothing changes: you still write `backend='cuda'`, and PyTorch still
+calls the GPU `'cuda'`, even on AMD. Do not look for `backend='hip'`: there is none.
+
+Tested on an RX 9060 XT (gfx1200) with ROCm 7.2.4, under WSL2 (Ubuntu on Windows).
+
 This builds and installs the compiled extensions. The reader notebook needs NumPy
 and Pillow. The surface and training notebooks also need the `labels`
 dependencies (including tifffile),
