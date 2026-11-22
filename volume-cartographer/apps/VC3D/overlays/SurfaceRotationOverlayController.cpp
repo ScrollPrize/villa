@@ -66,7 +66,8 @@ void warnTransformNotApplied()
         nullptr,
         QObject::tr("Surface Transform Cancelled"),
         QObject::tr("The transform was not applied: the segment was deselected, reopened or saved again "
-                    "while Rotate was open. Select the segment and open Rotate again."));
+                    "while Rotate was open, or its stored revision could not be read. Open Rotate again "
+                    "on the segment as it is now."));
 }
 
 class RotationDial final : public QWidget
@@ -326,7 +327,10 @@ void SurfaceRotationOverlayController::beginRotate()
     cancelRotate();
     _sourceSurface = std::move(source);
     _sourceSurfaceId = sourceSurfaceId;
-    _sourceRevision = _revisionReader ? _revisionReader(_sourceSurfaceId) : std::nullopt;
+    // The revision of the geometry this tool transforms (Apply saves only over it).
+    _sourceRevision = _sourceRevisionReader ? _sourceRevisionReader(_sourceSurface.get())
+                      : _revisionReader     ? _revisionReader(_sourceSurfaceId)
+                                            : std::nullopt;
     _shownSurface = _state->surface("segmentation");
     _angleDeg = 0.0;
     _horizontalFlip = false;
@@ -386,21 +390,39 @@ bool SurfaceRotationOverlayController::sourceSelected() const
 
 bool SurfaceRotationOverlayController::sourceCurrent() const
 {
-    // E.g. the surface panel's Flip, an edit or another client saved the segment meanwhile.
-    return !_revisionReader || _revisionReader(_sourceSurfaceId) == _sourceRevision;
+    // E.g. the surface panel's Flip, an autosave or another client saved the segment meanwhile.
+    // A revision that is not known (not stored, or the store did not answer) never matches.
+    if (!_revisionReader) {
+        return true;
+    }
+    const auto stored = _revisionReader(_sourceSurfaceId);
+    return _sourceRevision && stored && *stored == *_sourceRevision;
+}
+
+bool SurfaceRotationOverlayController::newerRevisionStored() const
+{
+    if (!_revisionReader || !_sourceRevision) {
+        return false;
+    }
+    const auto stored = _revisionReader(_sourceSurfaceId);
+    return stored && *stored != *_sourceRevision;
 }
 
 void SurfaceRotationOverlayController::releaseSource()
 {
-    const bool current = sourceCurrent();
-    if (current && sourceSelected()) {
+    const bool newer = newerRevisionStored();
+    if (!newer && sourceSelected()) {
         endPreview(_sourceSurface);
         return;
     }
-    // A newer revision was saved: the old one must not stay selected, so that the surface panel
-    // and the agent bridge open the current one.
-    if (!current && _state->activeSurfaceId() == _sourceSurfaceId &&
+    // A newer revision was saved (the surface panel's Flip, an autosave, another client): the
+    // geometry the tool started from must not stay selected. Open the saved one, so that the next
+    // Rotate, the surface panel and the agent bridge continue from it; failing that, deselect.
+    if (newer && _state->activeSurfaceId() == _sourceSurfaceId &&
         _state->activeSurface().lock() == _sourceSurface) {
+        if (_reopener && _reopener(_sourceSurfaceId)) {
+            return;
+        }
         _state->clearActiveSurface();
     }
     // Take the preview down where it is still shown; another selection stays as it is.
@@ -755,7 +777,9 @@ void SurfaceRotationOverlayController::applyRotation()
                     return;
                 }
 
-                if (!self->_saver || !self->_saver(result.surface.get())) {
+                // The store edit refuses the save unless it still holds the geometry revision the
+                // transform started from (a save that finished or was resolved meanwhile wins).
+                if (!self->_saver || !self->_saver(result.surface.get(), self->_sourceRevision)) {
                     self->releaseSource();
                     // Apply can be tried again only on the selected, current segment.
                     if (!self->sourceSelected()) {

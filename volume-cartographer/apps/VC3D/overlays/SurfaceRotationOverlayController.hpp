@@ -24,14 +24,24 @@ public:
     ~SurfaceRotationOverlayController() override;
 
     void setViewerManager(ViewerManager* manager);
-    // Publishes the transformed surface to the object store.
-    void setSaver(std::function<bool(QuadSurface*)> saver) { _saver = std::move(saver); }
-    // The stored segment's current revision (none when it is not stored). Apply saves only over
-    // the revision the tool was opened on.
+    // Publishes the transformed surface to the object store, only over the stored geometry
+    // revision it was transformed from (the second argument).
+    using Saver = std::function<bool(QuadSurface*, const std::optional<std::string>&)>;
+    void setSaver(Saver saver) { _saver = std::move(saver); }
+    // The geometry revision a surface holds: the one it was opened at or last saved as (none
+    // when unknown). Read when Rotate opens, for the geometry it transforms.
+    void setSourceRevisionReader(std::function<std::optional<std::string>(QuadSurface*)> reader)
+    {
+        _sourceRevisionReader = std::move(reader);
+    }
+    // The stored segment's current geometry revision (none when it is not stored or the store
+    // did not answer). Apply saves only while it is the revision Rotate transforms.
     void setRevisionReader(std::function<std::optional<std::string>(const std::string&)> reader)
     {
         _revisionReader = std::move(reader);
     }
+    // Opens the segment's stored revision again (selects it as the surface panel does).
+    void setReopener(std::function<bool(const std::string&)> reopener) { _reopener = std::move(reopener); }
     void beginRotate();
     void cancelRotate();
 
@@ -61,16 +71,20 @@ private:
     void endPreview(const std::shared_ptr<QuadSurface>& surface);
     // The segment the tool was opened on is still selected and shown as the tool left it.
     bool sourceSelected() const;
-    // No newer revision of the segment was saved since the tool was opened.
+    // The stored geometry is known to be the one the tool transforms (an unknown revision never is).
     bool sourceCurrent() const;
-    // End the preview without saving, leaving a newer selection or revision alone.
+    // A newer geometry revision of the segment is known to be stored.
+    bool newerRevisionStored() const;
+    // End the preview without saving, leaving a newer selection alone; a newer revision is reopened.
     void releaseSource();
     void closeRotate();
     static std::shared_ptr<QuadSurface> cloneSurface(const std::shared_ptr<QuadSurface>& surface);
 
     CState* _state{nullptr};
-    std::function<bool(QuadSurface*)> _saver;
+    Saver _saver;
+    std::function<std::optional<std::string>(QuadSurface*)> _sourceRevisionReader;
     std::function<std::optional<std::string>(const std::string&)> _revisionReader;
+    std::function<bool(const std::string&)> _reopener;
     ViewerManager* _viewerManager{nullptr};
     QMetaObject::Connection _viewerCreatedConn;
     QMetaObject::Connection _viewerClosingConn;
@@ -82,6 +96,7 @@ private:
     bool _horizontalFlip{false};
     std::shared_ptr<QuadSurface> _sourceSurface;
     std::string _sourceSurfaceId;
+    // The geometry revision of _sourceSurface when the tool opened.
     std::optional<std::string> _sourceRevision;
     std::shared_ptr<QuadSurface> _previewSurface;
     // What the tool put in the viewer last (the source or a preview).
