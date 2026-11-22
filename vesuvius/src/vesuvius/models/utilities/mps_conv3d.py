@@ -66,7 +66,7 @@ def conv3d_as_conv2d(conv: nn.Conv3d, x: torch.Tensor, stack_limit_bytes: int = 
         # view of the chunk.
         plane_bytes = b * c * h * w * x.element_size()
         n = d_out if xd.is_contiguous() else max(1, min(stack_limit_bytes, CHUNK_BYTES) // (plane_bytes * sd))
-        y = None
+        y, out_dtype = None, None
         for o0 in range(0, d_out, n):
             o1 = min(d_out, o0 + n)
             i0 = max(0, o0 * sd - pd)
@@ -82,11 +82,15 @@ def conv3d_as_conv2d(conv: nn.Conv3d, x: torch.Tensor, stack_limit_bytes: int = 
                 first = lo * sd + k * dd - pd - i0
                 tap = xs[first:first + sd * (hi - lo - 1) + 1:sd].reshape((hi - lo) * b, c, h, w)
                 yk = F.conv2d(tap, conv.weight[:, :, k], None, stride, padding, dilation, conv.groups)
+                out_dtype = yk.dtype
+                # Under bf16 autocast, sum the taps in fp32 and round once, as a native 3-D convolution does: bf16
+                # partial sums double the error. fp16 partial sums cost little accuracy, and fp32 ones 23% more time.
+                acc_dtype = torch.float32 if out_dtype == torch.bfloat16 else out_dtype
                 if y is None and hi - lo == d_out:
-                    y = yk
+                    y = yk.to(acc_dtype)
                     continue
                 if y is None:
-                    y = yk.new_zeros(d_out * b, *yk.shape[1:])
+                    y = yk.new_zeros(d_out * b, *yk.shape[1:], dtype=acc_dtype)
                 y[lo * b:hi * b].add_(yk)
         if y is None:  # every tap reads only padding
             h_out = (h + 2 * padding[0] - dilation[0] * (conv.kernel_size[1] - 1) - 1) // stride[0] + 1
@@ -94,6 +98,8 @@ def conv3d_as_conv2d(conv: nn.Conv3d, x: torch.Tensor, stack_limit_bytes: int = 
             y = x.new_zeros(d_out * b, conv.out_channels, h_out, w_out)
         if conv.bias is not None:
             y.add_(conv.bias.view(1, -1, 1, 1))
+        if out_dtype is not None and y.dtype != out_dtype:
+            y = y.to(out_dtype)
         if y.device.type == "mps":
             # MPS frees a buffer only once the GPU work queued on it has run. This path is fast enough that, without a
             # wait, a whole decoder of these large layers gets queued ahead and the freed copies pile up.

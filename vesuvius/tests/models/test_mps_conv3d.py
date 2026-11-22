@@ -164,3 +164,19 @@ def test_swapped_training_step_on_mps_matches_cpu():
         opt.step()
     for (name, a), b in zip(ref.named_parameters(), net.parameters()):
         torch.testing.assert_close(b.detach().cpu(), a.detach(), rtol=1e-4, atol=1e-5, msg=name)
+
+
+def test_per_tap_path_sums_low_precision_taps_in_fp32():
+    # Under bf16 autocast each tap's 2-D convolution rounds to bf16; summing those in bf16 doubled the error of a
+    # native bf16 Conv3d. The taps are now summed in fp32 and rounded once.
+    torch.manual_seed(0)
+    conv = nn.Conv3d(32, 32, 3, padding=1)
+    x = torch.randn(1, 32, 16, 24, 24)
+    with torch.no_grad():
+        want = conv(x)
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            native = conv(x)
+            got = conv3d_as_conv2d(conv, x, stack_limit_bytes=0)
+    assert got.dtype == native.dtype == torch.bfloat16
+    native_err = (native.float() - want).abs().max()
+    assert (got.float() - want).abs().max() <= 1.5 * native_err
