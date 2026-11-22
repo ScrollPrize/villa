@@ -70,6 +70,9 @@ struct SurfaceOptions {
     // side of the mesh a signed offset samples with the context around the core, while positions and the
     // size of the normal still come from the whole surface. Ignored with vertex normals and in linear mode.
     std::array<int, 4> core{0, 0, 0, 0};
+    // Where the vertex normals given in `Vertices` blend to a nonfinite or zero normal,
+    // use the patch's normal instead of leaving no point.
+    bool patchNormalFallback = false;
 };
 
 // A raster laid over the grid: pixel (i, j) sits at grid column x0 + i * sx + j * kx,

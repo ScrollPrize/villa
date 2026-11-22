@@ -125,6 +125,7 @@ struct Surface::Impl {
             g.destination[a * 5] = 1.0f / options.spacing[std::size_t(a)];
         }
         g.orientation = options.flipNormals ? -1.0f : 1.0f;
+        g.patchNormalFallback = options.patchNormalFallback;
         return g;
     }
 

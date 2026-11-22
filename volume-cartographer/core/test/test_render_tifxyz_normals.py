@@ -1,7 +1,11 @@
-"""The layers of vc_render_tifxyz bend smoothly across grid cells. Run with: python test_render_tifxyz_normals_min.py /path/to/vc_render_tifxyz"""
+"""The layers of vc_render_tifxyz bend smoothly across grid cells. Run with: python test_render_tifxyz_normals.py /path/to/vc_render_tifxyz"""
 import json, subprocess, sys, tempfile, unittest
 from pathlib import Path
-import numpy as np, tifffile
+try:
+    import numpy as np, tifffile, imagecodecs  # noqa: F401  imagecodecs: the renderer writes LZW
+except ImportError as error:
+    print(f"SKIP: {error}")
+    sys.exit(77)
 RENDERER = str(Path(sys.argv.pop(1)).resolve())
 STEP, N, R = 8, 11, 150.0
 
