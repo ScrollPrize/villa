@@ -1044,13 +1044,19 @@ On macOS, `vc_object_store` links Homebrew's OpenCV, which links OpenBLAS, which
 loads Homebrew's `libomp.dylib`, and torch loads its own copy. The two copies share
 symbols, and whichever loads first serves both, which crashes torch's threads when
 `vc_object_store` is imported first. So on macOS, when torch is installed,
-importing `vc_object_store` loads torch's `libomp.dylib` first, keeps the copy it
-brings itself to one thread, and sets `KMP_DUPLICATE_LIB_OK=TRUE`, without which two
-runtimes stop Python with `OMP: Error #15` (a value you set wins). torch and
-`vc_object_store` can then be imported in either order. Other wheels that bundle a
-`libomp.dylib` are not covered: pykdtree's (which `import kimimaro` loads) and torch's
-crash when both run threads in one process, whichever is imported first. Spiral's own
-modules use no OpenMP on macOS.
+importing `vc_object_store` loads and starts torch's `libomp.dylib` first and keeps
+the copy it brings itself to one thread. Two runtimes stop Python with
+`OMP: Error #15` unless `KMP_DUPLICATE_LIB_OK=TRUE` is set, so the import sets it
+while the two start and then removes it (a value you set is left alone): torch and
+`vc_object_store` can be imported in either order, and later loads and child
+processes keep the check. If another `libomp.dylib` was loaded before torch's when
+`vc_object_store` is imported (pykdtree's, which `import kimimaro` loads), or you set
+`KMP_DUPLICATE_LIB_OK` to a false value, the import arranges nothing and OpenMP's own
+check reports it. Wheels that bundle a `libomp.dylib` are otherwise not covered:
+`import kimimaro` before `import torch` crashes torch's threads, with or without
+`vc_object_store`; pykdtree's copy stops Python with `OMP: Error #15` when it starts
+beside torch's, and with `KMP_DUPLICATE_LIB_OK=TRUE` the two crash when both run
+threads. Spiral's own modules use no OpenMP on macOS.
 
 ### Resident sparse field pools
 
