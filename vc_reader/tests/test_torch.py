@@ -458,7 +458,8 @@ class GeometryTests(unittest.TestCase):
 
 class NormalizeTests(unittest.TestCase):
     def devices(self):
-        return ['cpu', 'cuda'] if cuda.is_available() and torch.cuda.is_available() else ['cpu']
+        devices = ['cpu', 'cuda'] if cuda.is_available() and torch.cuda.is_available() else ['cpu']
+        return devices + (['mps'] if torch.backends.mps.is_available() else [])
 
     @staticmethod
     def normalize(x, mode='zscore', valid=None, eps=1e-6):
@@ -507,6 +508,25 @@ class NormalizeTests(unittest.TestCase):
                 tiny = torch.zeros_like(flat)
                 tiny[0, 0, 0, 0, 0] = 1e-7
                 self.assertAlmostEqual(self.normalize(tiny, 'minmax', eps=1e-6).max().item(), .1, places=5)
+
+    @unittest.skipUnless(torch.backends.mps.is_available(), "needs an Apple GPU (MPS)")
+    def test_mps_tensors_run_on_the_cpu_and_come_back(self):
+        # No vc_reader backend runs on MPS: its tensors are normalized on the CPU and returned on MPS.
+        rng = np.random.default_rng(2)
+        x = rng.normal(50, 9, (1, 12, 12, 12)).astype(np.float32)
+        valid = rng.random(x.shape) > .4
+        targets = {'image': A.Image(valid='valid', refill=False), 'valid': A.ValidMask()}
+        transform = A.Normalize('zscore', masked=True, eps=1e-6, nonzero=False)
+        want = transform({'image': torch.from_numpy(x), 'valid': torch.from_numpy(valid)}, targets=targets)['image']
+        got = transform({'image': torch.from_numpy(x).to('mps'), 'valid': torch.from_numpy(valid).to('mps')},
+                        targets=targets)['image']
+        self.assertEqual(got.device.type, 'mps')
+        self.assertTrue(torch.equal(got.cpu(), want))
+        image = torch.from_numpy(x).to('mps')
+        self.assertIs(A.Normalize('zscore', nonzero=False)(image, inplace=True), image)
+        self.assertTrue(torch.equal(image.cpu(), A.Normalize('zscore', nonzero=False)(torch.from_numpy(x))))
+        with self.assertRaisesRegex(ValueError, 'without autograd'):
+            A.Normalize('zscore', nonzero=False)(torch.from_numpy(x).to('mps').requires_grad_())
 
 
 if __name__ == '__main__':

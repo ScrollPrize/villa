@@ -30,6 +30,42 @@ def _is_torch(value):
     return type(value).__module__.split(".")[0] == "torch"
 
 
+def _host_tensors(sample):
+    """Copy Torch tensors on a device without vc_reader kernels (such as Apple's MPS) to the CPU.
+
+    Returns the sample to run and the original tensors that were copied, keyed like the sample, so that
+    :func:`_return_tensors` can hand the results back on their devices. CPU and CUDA tensors are left alone.
+    """
+    moved = {k: v for k, v in sample.items() if _is_torch(v) and v.device.type not in ("cpu", "cuda")}
+    if not moved:
+        return sample, moved
+    return {k: v.cpu() if k in moved else v for k, v in sample.items()}, moved
+
+
+def _return_tensors(out, moved, sample, inplace=False):
+    """Move results of the copied tensors back to their devices (into the originals when ``inplace``).
+
+    A field the transforms created (not in ``sample``) goes to the copied tensors' device when they share one.
+    """
+    if not moved:
+        return out
+    devices = {v.device for v in moved.values()}
+    created = devices.pop() if len(devices) == 1 else None
+    out = dict(out)
+    for k, value in out.items():
+        if not _is_torch(value):
+            continue
+        if k in moved:
+            if inplace:
+                moved[k].copy_(value)
+                out[k] = moved[k]
+            else:
+                out[k] = value.to(moved[k].device)
+        elif k not in sample and created is not None:
+            out[k] = value.to(created)
+    return out
+
+
 def _batch_seeds(values, count):
     if _is_torch(values):
         if values.device.type != "cpu":
@@ -95,6 +131,7 @@ def _direct_result(out, key):
 def _direct(config, data, targets, compact, inplace):
     from .. import cuda
     pipeline, sample, key = _direct_setup(config, data, targets, compact)
+    sample, moved = _host_tensors(sample)
     torch_cuda = [k for k, v in sample.items() if _is_torch(v) and getattr(v, "is_cuda", False)]
     if torch_cuda:
         sample = {k: cuda.wrap(v) if k in torch_cuda else v for k, v in sample.items()}
@@ -102,7 +139,7 @@ def _direct(config, data, targets, compact, inplace):
     if torch_cuda:
         import torch
         out = {k: torch.from_dlpack(v) if isinstance(v, cuda.DeviceArray) else v for k, v in out.items()}
-    return _direct_result(out, key)
+    return _direct_result(_return_tensors(out, moved, sample, inplace), key)
 
 
 def _direct_batch(config, data, targets, compact):
@@ -113,7 +150,9 @@ def _direct_batch(config, data, targets, compact):
         raise ValueError("batch targets need one nonempty, shared leading dimension")
     if pipeline.backend == "cuda":
         return _direct_result(pipeline.batch(sample, seeds=[_transforms.DIRECT_SEED] * count), key)
-    return _direct_result(pipeline._host_batch(sample, [_transforms.DIRECT_SEED] * count), key)
+    sample, moved = _host_tensors(sample)
+    out = pipeline._host_batch(sample, [_transforms.DIRECT_SEED] * count)
+    return _direct_result(_return_tensors(out, moved, sample), key)
 
 
 class Plan:

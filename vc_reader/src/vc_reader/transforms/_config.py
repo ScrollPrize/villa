@@ -35,11 +35,13 @@ class _Config:
         input gives the same output. Use a Pipeline for random augmentation.
 
         ``data`` is a channel-first (C, Y, X) / (C, Z, Y, X) NumPy array, Torch
-        tensor (CPU or CUDA) or DeviceArray, standing for the field the
+        tensor or DeviceArray, standing for the field the
         transform reads by default; the call returns the field it creates, else
         the transformed input. A sample dict works like ``Pipeline.__call__``
         (``targets`` as for Pipeline) and returns a dict. CUDA inputs run on
-        the CUDA backend and stay on device. ``inplace`` as for Pipeline.
+        the CUDA backend and stay on device; tensors on another device (such as
+        Apple's MPS, which has no vc_reader backend) run on the CPU and are
+        returned on their device. ``inplace`` as for Pipeline.
         Probabilities inside the transform (p_channel, p_axis, ...) and
         parameter ranges are drawn from the fixed seed too: pass plain values.
         """
@@ -51,7 +53,8 @@ class _Config:
 
         Same inputs and outputs as ``__call__`` with a leading batch dimension.
         CUDA tensors and DeviceArrays run as one ``Pipeline.batch`` call and
-        return CUDA tensors; host inputs run sample by sample.
+        return CUDA tensors; host inputs run sample by sample, and tensors on
+        another device (MPS) run on the CPU and are returned on their device.
         """
         from ._pipeline import _direct_batch
         return _direct_batch(self, data, targets, compact)
