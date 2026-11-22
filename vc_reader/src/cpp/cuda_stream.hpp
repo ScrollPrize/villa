@@ -20,9 +20,10 @@ inline cudaStream_t stream_handle(std::uintptr_t handle) {
     if (handle == 2) return cudaStreamPerThread;
     return reinterpret_cast<cudaStream_t>(handle);
 }
-// The DLPack consumer handle for a stream. The default streams map to 1 (legacy):
-// PyTorch rejects 2, and the per-thread default stream is a blocking stream, so
-// work on it already orders after the legacy default stream.
+// The DLPack consumer handle for a stream. The default streams map to DLPack's
+// default stream (1 on CUDA, 0 on ROCm): PyTorch rejects 2, and the per-thread
+// default stream is a blocking stream, so work on it already orders after the
+// legacy default stream.
 inline std::uintptr_t dlpack_handle(cudaStream_t s) {
     if (s == nullptr || s == cudaStreamLegacy || s == cudaStreamPerThread) {
         // DLPack's default stream is 1 on CUDA but 0 on ROCm, which rejects 1.
