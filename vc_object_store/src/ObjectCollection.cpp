@@ -407,7 +407,7 @@ std::vector<detail::CollectionScanPartition> detail::CollectionScanAccess::parti
     store.impl_->check(txn);
     std::vector<CollectionScanPartition> result;
     for(auto n:store.impl_->readOrder()) {
-        CollectionScanPartition part{store.impl_->db(txn,n),{}};
+        CollectionScanPartition part{store.impl_->db(txn,n),{},store.impl_->nodes[n].member};
         for(const auto& parent:store.impl_->nodes)for(const auto& route:parent.routes)
             if(route.databaseUuid==store.impl_->nodes[n].member.databaseUuid &&
                route.kind==RoutingKind::UuidHashV1)part.uuidRoutes.push_back(route);

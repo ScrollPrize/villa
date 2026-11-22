@@ -274,7 +274,7 @@ class FiberTrace3DPredictAdapter:
                 name=f'{self.product_prefix}_sheet_normal', level=int(level), scaledown=int(scaledown),
                 channels=tuple(OutputChannelSpec(f'sheet_{c}',
                     relative_path=f'{self.zarr_path_prefix}_sheet_{c}.ome.zarr')
-                    for c in ('nx', 'ny', 'grad_mag')),
+                    for c in ('nx', 'ny')),
                 chunk_size=int(chunk_size), dtype=np.uint8, value_range=(0., 255.),
                 pyramid_policy=PYRAMID_POLICY_CUSTOM, accumulator_channel_count=6,
                 inference_scaledown=int(inference_scaledown)),)
@@ -478,8 +478,7 @@ class FiberTrace3DPredictAdapter:
             if slab.ndim != 4 or slab.shape[0] != 6 or not np.isfinite(slab).all():
                 raise ValueError('invalid normal product slab')
             nx, ny = encode_normal_nxny_u8(*slab)
-            return {'sheet_nx': nx, 'sheet_ny': ny,
-                    'sheet_grad_mag': np.full(nx.shape, 255, dtype=np.uint8)}
+            return {'sheet_nx': nx, 'sheet_ny': ny}
         if self.emit_width and product.name == f'{self.product_prefix}_width':
             if slab.ndim != 4 or slab.shape[0] != 1 or not np.isfinite(slab).all() or (slab < 0).any():
                 raise ValueError('invalid width product slab')

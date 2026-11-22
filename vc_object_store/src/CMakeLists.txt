@@ -65,6 +65,7 @@ add_library(vc_objects ${_vc_store_library_type}
     imports/FiberConstraintGraph.cpp
     imports/FiberGraphSolveExtension.cpp
     imports/FiberUvExport.cpp
+    imports/TrackCrossingStore.cpp
     VolumeTransforms.cpp
     ObjectStoreSession.cpp
     HostedSession.cpp
@@ -78,6 +79,7 @@ add_library(vc_objects ${_vc_store_library_type}
     Records.cpp
     Metadata.cpp
     SourcePaths.cpp
+    TrackDatasets.cpp
     Snapshots.cpp
     Queries.cpp
     Spatial.cpp

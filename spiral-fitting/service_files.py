@@ -18,6 +18,8 @@ class ExclusiveFileLock:
         self._stream = None
 
     def acquire(self, timeout=0.0):
+        """Take the lock, retrying for ``timeout`` seconds (``None``: until
+        it is free) before raising FileLockUnavailable."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
         stream = self.path.open("a+b")
         if os.name == "nt":
@@ -26,7 +28,7 @@ class ExclusiveFileLock:
                 stream.write(b"\0")
                 stream.flush()
             stream.seek(0)
-        deadline = time.monotonic() + max(0.0, float(timeout))
+        deadline = None if timeout is None else time.monotonic() + max(0.0, float(timeout))
         while True:
             try:
                 if os.name == "nt":
@@ -42,7 +44,7 @@ class ExclusiveFileLock:
                 if exc.errno not in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
                     stream.close()
                     raise
-                if time.monotonic() >= deadline:
+                if deadline is not None and time.monotonic() >= deadline:
                     stream.close()
                     raise FileLockUnavailable(str(self.path)) from exc
                 time.sleep(0.05)

@@ -140,7 +140,7 @@ if (const char* source = std::getenv("VC3D_COMPOUND_TEST_VOLUME")) {
     for (auto& channel : channels) {
         if (channel == "sheet_nx") channel = "nx";
         else if (channel == "sheet_ny") channel = "ny";
-        else if (channel == "sheet_grad_mag") channel = "grad_mag";
+        else if (channel == "presence") continue;
         else channel = "unused_" + channel;
     }
     nlohmann::json normalJson = {

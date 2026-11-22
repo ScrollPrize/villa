@@ -40,6 +40,22 @@ import AwardedTotal from '@site/src/components/AwardedTotal';
 
 Vesuvius Challenge has awarded **<AwardedTotal />** in prizes since the competition started in 2023! This page lists all the prizes awarded so far.
 
+### \$50,000 First Letters: PHerc. 211 (November, 2026)
+
+**Goal:** Find 10 letters within a 4 cm² area of a scroll where nothing has been read yet.
+
+<div className="flex flex-row flex-wrap">
+  <PrizeCard
+    href="https://scrollprize.substack.com/p/first-letters-emerge-from-pherc-211"
+    prizeAmount="$50,000"
+    title="Winner"
+    description="Priyank Aranke found writing in PHerc. 211, including “καί τῆι̣ διαφ ̣ρ̣”, possibly “and to the difference”"
+    mediaSrc="/img/firstletters/pherc0211-priyank.webp"
+    mediaAlt="Ink detected in PHerc. 211 by Priyank Aranke, with the partial reading καί τῆι διαφ…ρ"
+    wide
+  />
+</div>
+
 ### \$40,750 Progress Prizes (October 2026)
 
 **Goal:** Improve the tools and training methods needed to read the scrolls.

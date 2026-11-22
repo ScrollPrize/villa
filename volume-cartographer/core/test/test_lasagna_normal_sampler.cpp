@@ -127,9 +127,11 @@ TEST_CASE("Packed prediction sheet normals preserve channel identity and odd bas
         std::vector<uint8_t> bytes(32);
         for(size_t k=0;k<4;++k)
             std::fill(bytes.begin()+8*k,bytes.begin()+8*(k+1),values[4*c+k]);
-        // Only one sheet-normal corner is valid. The other seven are blank,
-        // not diagonal normals, even though decoding (0,0) produces an axis.
-        if(c==1) for(size_t k=0;k<3;++k)
+        // Only one voxel has presence, the dataset's validity channel. The
+        // other seven sheet-normal corners are blank, not diagonal normals,
+        // even though decoding (0,0) produces an axis.
+        if(c==0) std::fill(bytes.begin()+1,bytes.begin()+8,uint8_t{0});
+        if(c==1) for(size_t k=0;k<2;++k)
             std::fill(bytes.begin()+8*k+1,bytes.begin()+8*(k+1),uint8_t{0});
         packed.writeChunk({int64_t(c),0,0,0},bytes.data(),bytes.size());
     }
@@ -138,11 +140,20 @@ TEST_CASE("Packed prediction sheet normals preserve channel identity and odd bas
         "channels":["presence","nx","ny","width","sheet_nx","sheet_ny","sheet_grad_mag"]}}}})");
     auto prediction=vc::lasagna::LasagnaDataset::open(dir);
     CHECK(prediction.manifest().raw.at("validity_channel")=="presence");
+    CHECK(prediction.manifest().validityChannel=="presence");
     auto normals=vc::lasagna::fiberSheetNormalDataset(prediction);
     CHECK(normals.manifest().groups.size()==1);
+    // The old sheet_grad_mag channel is carried along unused; presence validates.
+    CHECK(normals.manifest().groupForChannel("grad_mag")==nullptr);
+    CHECK(normals.manifest().groupForChannel("presence")!=nullptr);
+    CHECK(normals.manifest().groupForChannel("unused_fiber_normal_sheet_grad_mag")!=nullptr);
+    CHECK_FALSE(normals.manifest().raw.contains("grad_mag_encode_scale"));
     CHECK_NOTHROW(vc::lasagna::validateLasagnaNormalDatasetStructure(normals));
     vc::lasagna::LasagnaNormalSampler sampler(normals);
     CHECK(sampler.masksInvalidCorners());
+    CHECK_FALSE(sampler.hasWindingDensity());
+    CHECK_FALSE(sampler.sampleWindingDensity({2,2,2}).has_value());
+    CHECK_THROWS_AS((void)sampler.normalAlignedWindingDistancesBatch({{{0,0,0},{4,4,4}}},2.,1),std::logic_error);
     const auto n=sampler.sampleNormal({2,2,2});
     REQUIRE(n.valid);
     CHECK(n.normal[0]==doctest::Approx(0));
@@ -184,14 +195,15 @@ TEST_CASE("Packed prediction sheet normals preserve channel identity and odd bas
     }
     CHECK(fusedOptions.memoryCache->nbytes()==24);
     CHECK(fusedOptions.memoryCache->size()==3);
-    CHECK((fused.regionChannels()[0].array->cache_channels()==std::vector<int64_t>{4,5,6}));
+    CHECK((fused.regionChannels()[0].array->cache_channels()==std::vector<int64_t>{0,4,5}));
     auto floatPacked=vcr::zarr::Writer::create(dir/"float",{
         .shape={7,2,2,2},.chunks={4,2,2,2},.dtype="<f4",.compressor="",.fillValue=0.});
     for(size_t c=0;c<2;++c) {
         std::vector<float> bytes(32);
         for(size_t k=0;k<4;++k)
             std::fill(bytes.begin()+8*k,bytes.begin()+8*(k+1),float(values[4*c+k]));
-        if(c==1)for(size_t k=0;k<3;++k)
+        if(c==0)std::fill(bytes.begin()+1,bytes.begin()+8,0.f);
+        if(c==1)for(size_t k=0;k<2;++k)
             std::fill(bytes.begin()+8*k+1,bytes.begin()+8*(k+1),0.f);
         floatPacked.writeChunk({int64_t(c),0,0,0},reinterpret_cast<const uint8_t*>(bytes.data()),bytes.size()*sizeof(float));
     }
@@ -217,8 +229,10 @@ TEST_CASE("Packed prediction sheet normals preserve channel identity and odd bas
     const auto direction=vc::lasagna::bindLasagnaChannel(prediction.manifest(),"nx",arrays);
     CHECK(vc::lasagna::sampleLasagnaChannel(direction,cv::Vec3d{2,2,2}).value()==255);
     CHECK(prediction.manifest().groupForChannel("sheet_nx")->channelIndex("sheet_nx")==4);
-    auto bad=prediction.manifest(); bad.groups[0].channels.pop_back();
+    auto bad=prediction.manifest(); bad.groups[0].channels.pop_back();  // drops the unused sheet_grad_mag
     CHECK_THROWS(vc::lasagna::bindLasagnaChannel(bad,"nx",arrays));
+    CHECK_NOTHROW(vc::lasagna::fiberSheetNormalDataset(vc::lasagna::LasagnaDataset(bad)));
+    bad.groups[0].channels.pop_back();  // drops sheet_ny
     CHECK_THROWS(vc::lasagna::fiberSheetNormalDataset(vc::lasagna::LasagnaDataset(bad)));
 }
 
@@ -572,7 +586,66 @@ TEST_CASE("validity masks companion corners without diluting width or presence")
     fs::remove_all(dir);
 }
 
-TEST_CASE("LasagnaNormalSampler requires grad_mag channel")
+TEST_CASE("Chunk validity marks stored chunks valid and absent chunks invalid")
+{
+    using namespace vc::lasagna;
+    const auto dir=tmpDir("chunk_validity");
+    const DirectoryCleanup cleanup{dir};
+    // Two spatial chunks along x; only the first is stored. Presence is zero
+    // everywhere: with chunk validity it does not decide validity.
+    auto packed=vcr::zarr::Writer::create(dir/"sd0/0",{
+        .shape={6,2,2,4},.chunks={6,2,2,2},.compressor="",.fillValue=0.});
+    std::vector<uint8_t> bytes(6*8,0);
+    const std::array<uint8_t,6> constants{0,255,128,40,128,255};  // presence,nx,ny,width,sheet_nx,sheet_ny
+    for(size_t c=0;c<6;++c)std::fill(bytes.begin()+8*c,bytes.begin()+8*(c+1),constants[c]);
+    packed.writeChunk({0,0,0,0},bytes.data(),bytes.size());
+    writeText(dir/".zattrs",R"({"lasagna":{"version":3,"base_shape_zyx":[2,2,4],
+        "source_to_base":1.0,"validity_channel":"chunks","groups":{"sd0":{"scaledown":0,"zarr":"sd0/0",
+        "channels":["presence","nx","ny","width","sheet_nx","sheet_ny"]}}}})");
+    auto prediction=LasagnaDataset::open(dir);
+    CHECK(prediction.manifest().validityByChunks());
+    auto normals=fiberSheetNormalDataset(prediction);
+    CHECK_NOTHROW(validateLasagnaNormalDatasetStructure(normals));
+    LasagnaNormalSampler sampler(normals);
+    const auto channels=sampler.regionChannels();
+    CHECK(channels[0].chunkValidity);
+    CHECK(channels[0].array==channels[1].array);
+    CHECK(sampleLasagnaChannel(channels[0],cv::Vec3d{0.5,0.5,0.5}).value()==255);
+    CHECK(sampleLasagnaChannel(channels[0],cv::Vec3d{2.5,0.5,0.5}).value()==0);
+    // Inside the stored chunk the sheet normal (+Y) is valid despite presence 0.
+    const auto inside=sampler.sampleNormal({0.5,0.5,0.5});
+    REQUIRE(inside.valid);
+    CHECK(inside.normal[1]==doctest::Approx(1));
+    // Inside the absent chunk every corner is invalid.
+    CHECK_FALSE(sampler.sampleNormal({2.5,0.5,0.5}).valid);
+    // Straddling the chunk boundary: the absent chunk's corners are masked out,
+    // the stored chunk's corners still give the normal.
+    const auto edge=sampler.sampleNormal({1.5,0.5,0.5});
+    REQUIRE(edge.valid);
+    CHECK(edge.normal[1]==doctest::Approx(1));
+    std::vector<LasagnaNormalSampler::FloatNormalSample> batch;
+    (void)sampler.sampleNormalBatch(std::vector<cv::Vec3f>{{0.5f,0.5f,0.5f},{2.5f,0.5f,0.5f},{1.5f,0.5f,0.5f}},2,batch);
+    REQUIRE(batch.size()==3);
+    CHECK(batch[0].valid);CHECK_FALSE(batch[1].valid);CHECK(batch[2].valid);
+    std::vector<NormalSampleWithDerivative> doubles;
+    (void)sampler.sampleNormalBatch(std::vector<cv::Vec3d>{{0.5,0.5,0.5},{2.5,0.5,0.5}},false,2,doubles);
+    REQUIRE(doubles.size()==2);
+    CHECK(doubles[0].sample.valid);CHECK_FALSE(doubles[1].sample.valid);
+    // Validity boxes: one byte per voxel from chunk existence, 0 outside the grid.
+    std::vector<uint8_t> box;
+    readLasagnaChunkValidityBox(channels[0],{0,0,0},{5,1,1},box);
+    CHECK(box==std::vector<uint8_t>{255,255,0,0,0});
+    std::vector<uint8_t> interleaved;
+    readLasagnaChannelBox({&channels[0],&channels[1]},{1,0,0},{2,1,1},interleaved);
+    CHECK(interleaved==std::vector<uint8_t>{255,128,0,0});
+    // A channel named like the chunk marker is rejected.
+    writeText(dir/"bad.json",R"({"lasagna":{"version":3,"base_shape_zyx":[2,2,4],
+        "source_to_base":1.0,"validity_channel":"chunks","groups":{"sd0":{"scaledown":0,"zarr":"sd0/0",
+        "channels":["presence","nx","ny","width","sheet_nx","chunks"]}}}})");
+    CHECK_THROWS(LasagnaDatasetManifest::parseFile(dir/"bad.json"));
+}
+
+TEST_CASE("LasagnaNormalSampler requires a validity channel")
 {
     const auto dir = tmpDir("missing_grad_mag_channel");
     std::vector<uint8_t> nx(2 * 2 * 2, 128);

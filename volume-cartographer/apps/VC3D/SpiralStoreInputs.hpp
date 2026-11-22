@@ -25,6 +25,10 @@ namespace vc3d::spiral {
 // service as its input manifest artifact), compared by identities of the
 // store: geometry revision UUIDs, the metadata values the adapter read,
 // relationship record UUIDs, numbered versions and approval states.
+//
+// Track crossings are not relationships of a fit: it computes them from its
+// tracks, so comparing the tracks covers them, and no track is ever read as
+// a relationship endpoint here (a store may hold millions of crossings).
 
 // How one fitted input stands in the attached store now.
 enum class InputState {
@@ -108,6 +112,13 @@ struct FitInputs {
     // Relationships among the fitted objects that a rebuild would consume
     // and the fit did not (state Added), by record UUID.
     std::vector<FitRelationship> addedRelationships;
+    // The track crossings a manifest of an older fit lists as consumed
+    // relationships (uncomparedTrackCrossings). They are not compared with
+    // the store, so such a fit is never reported `unchanged()`.
+    std::size_t crossingsNotCompared = 0;
+    // The fitted objects whose relationships the last read enumerated or
+    // read: never a track.
+    std::set<std::string> relationshipEndpoints;
     // Why the manifest does not describe this store, or its relationships
     // cannot be compared; an input's own problem is on its entry.
     std::vector<std::string> problems;
@@ -117,12 +128,18 @@ struct FitInputs {
     // Every input and relationship is as the fit read it.
     bool unchanged() const
     {
-        return problems.empty()
+        return problems.empty() && crossingsNotCompared == 0
             && count(InputState::Fitted) == surfaces.size() + pointCollections.size()
                                            + fibers.size() + tracks.size() + outerShell.has_value()
             && count(LinkState::Fitted) == relationships.size() && addedRelationships.empty();
     }
 };
+
+// The number of track crossings an input manifest document lists as consumed
+// relationships (family track_crossing): a fit made before fits computed
+// their crossings. A property of the manifest alone, so it holds whatever a
+// read of the store gives; never throws.
+std::size_t uncomparedTrackCrossings(const nlohmann::json& document);
 
 // All objects of an input manifest document ({"digest", "manifest"}),
 // including its separately displayed outer shell, identified by its role.

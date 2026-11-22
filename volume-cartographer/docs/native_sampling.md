@@ -26,8 +26,10 @@ normals, valid = normal_sampler.sample(points, threads=1)
 
 Normal points are base-volume **XYZ**, and returned normals are unit XYZ axes
 (sign-ambiguous), with a boolean validity array. Interpolation uses the native
-axis-tensor decoder, not interpolation of encoded nx/ny bytes. Zero grad_mag
-marks invalid samples. The opt-in manifest setting `mask_invalid_normal_corners`
+axis-tensor decoder, not interpolation of encoded nx/ny bytes. The manifest's
+validity marks invalid samples: a zero value of its validity channel (`grad_mag`
+for Lasagna normals), or an absent chunk when `validity_channel` is `chunks`.
+The opt-in manifest setting `mask_invalid_normal_corners`
 also excludes invalid corners from interpolation; the default remains unchanged.
 The binding owns its dataset and releases the GIL for native sampling.
 

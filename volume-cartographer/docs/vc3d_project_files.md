@@ -124,7 +124,7 @@ or extracting channel files. For example:
 ```json
 {
   "location": "s3://bucket/path/compound.zarr/sd2",
-  "channels": ["presence", "nx", "ny", "width", "sheet_nx", "sheet_ny", "sheet_grad_mag"],
+  "channels": ["presence", "nx", "ny", "width", "sheet_nx", "sheet_ny"],
   "tags": [
     "vc-lasagna-manifest:s3://bucket/path/predictions.lasagna.json",
     "vc-lasagna-group:sd2"

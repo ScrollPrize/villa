@@ -880,9 +880,10 @@ struct ServerState {
 
     Reply querySelectedInputs(const std::string& body)
     {
-        const auto [versions, position] = selectedInputsRequestFromJson(body);
+        const auto request = selectedInputsRequestFromJson(body);
         auto txn = store->read();
-        return jsonReply(selectedInputsToJson(store->status(txn), LocalStoreReader(*store, txn).selectedInputs(versions, position)));
+        return jsonReply(selectedInputsToJson(store->status(txn), LocalStoreReader(*store, txn).selectedInputs(
+            request.versions, request.position, request.relationshipVersions)));
     }
 
     Reply queryVersions(const std::string& body)

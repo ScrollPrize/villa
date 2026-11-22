@@ -4,7 +4,8 @@ import pytest
 import torch
 from vc_reader.reader import MemoryCache, ZarrWriter, open_zarr
 
-from lasagna.tiled_predict3d import OutputProductSpec, _input_has_chunks, run_tiled_inference_3d
+from lasagna.input_level import InputLevel
+from lasagna.tiled_predict3d import OutputProductSpec, run_tiled_inference_3d
 from lasagna.tests.predict3d_spawn_helpers import SpawnIdentityAdapter
 
 
@@ -37,7 +38,7 @@ def test_inference_from_a_reader_matches_the_array_it_holds(tmp_path, devices):
 			None if devices else adapter.load_model(device=torch.device("cpu")), source,
 			crop_slices=(0, 8, 0, 8, 0, 8), device=torch.device("cpu"), model_adapter=adapter, output_adapter=output,
 			products=(product,), output_regions_zyx={"identity": (0, 0, 0, 8, 8, 8)},
-			full_output_shapes_zyx={"identity": (8, 8, 8)}, input_zarr_path=str(path), tile_size=4,
+			full_output_shapes_zyx={"identity": (8, 8, 8)}, tile_size=4,
 			overlap=0, border=0, tmp_dir=str(tmp_path), prefetch_tiles_per_gpu=2, devices=devices,
 			**({"slots_per_gpu": 1} if devices else {}),
 		)
@@ -51,6 +52,7 @@ def test_input_chunk_presence_is_what_the_array_stores(tmp_path):
 	path = tmp_path / "input.zarr"
 	array = ZarrWriter.create(path, shape=(8, 8, 8), chunks=(4, 4, 4), dtype="u1", separator="/")
 	array[4:8, 0:4, 0:4] = 1
-	assert _input_has_chunks(str(path), 4, 8, 0, 8, 0, 8)
-	assert _input_has_chunks(str(path), 0, 5, 0, 1, 0, 1)
-	assert not _input_has_chunks(str(path), 0, 4, 0, 8, 0, 8)
+	with InputLevel(path) as level:
+		assert level.region_has_chunks((4, 8, 0, 8, 0, 8))
+		assert level.region_has_chunks((0, 5, 0, 1, 0, 1))
+		assert not level.region_has_chunks((0, 4, 0, 8, 0, 8))
