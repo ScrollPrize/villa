@@ -3265,6 +3265,19 @@ class ServiceState:
                    if live.get(key) != value
                    and key not in SERVICE_OWNED_CONFIG_KEYS}
         payload = {"reasons": reasons, "stage": rebuild_stage(changed)}
+        live_end_rule = status.get("umbilicus_end_rule")
+        if live_end_rule is not None:
+            from checkpoint_io import load_checkpoint_cpu
+            from umbilicus import checkpoint_end_rule
+            try:
+                end_rule = checkpoint_end_rule(load_checkpoint_cpu(path))
+            except ValueError:
+                return ApiError(
+                    HTTPStatus.CONFLICT, f"Checkpoint refused: {cause}",
+                    payload={"reasons": reasons, "refused": True})
+            if end_rule != live_end_rule:
+                # Only the full build adopts a resumed checkpoint's axis.
+                payload["stage"] = "all"
         if inputs is not None:
             # A full-input rebuild rereads the store, which is what resumes
             # it if the store now holds the checkpoint's inputs; otherwise

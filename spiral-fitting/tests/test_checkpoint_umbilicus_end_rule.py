@@ -41,14 +41,16 @@ def _main_axis(window):
         zs, yxs, axis=0, fill_value='extrapolate')(np.arange(*window))
 
 
-def _preflight_context(path, window, rule):
+def _preflight_context(path, window, rule, model_window=None):
     context = _live_context()
-    context.model_z_begin, context.model_z_end = window
+    context.z_begin, context.z_end = window
+    context.model_z_begin, context.model_z_end = model_window or window
     context.umbilicus_end_rule = rule
     context.umbilicus_z_to_yx = lambda end_rule=None: json_umbilicus_z_to_yx(
         path, end_rule=end_rule or context.umbilicus_end_rule)
-    context._end_rule_moves_model_axis = (
-        lambda: fit_spiral.FitContext._end_rule_moves_model_axis(context))
+    context.umbilicus_end_rule_moves_axis = (
+        fit_spiral.FitContext._end_rule_moves_model_axis(context))
+    Path(path).unlink()
     return context
 
 
@@ -96,10 +98,13 @@ def test_flatten_rebuilds_the_saved_axis(path, saved):
     assert torch.equal(rebuilt.umbilicus_transform._yx, live.umbilicus_transform._yx)
 
 
-@pytest.mark.parametrize('window, accepted', [(CROSSING, False), (INSIDE, True)])
-def test_load_refuses_only_a_rule_that_moves_the_axis(path, window, accepted):
-    context = _preflight_context(path, window, HOLD_ENDS)
-    checkpoint = _checkpoint(z_begin=window[0], z_end=window[1])
+@pytest.mark.parametrize('window, model_window, accepted', [
+    (CROSSING, None, False), (INSIDE, None, True), (INSIDE, CROSSING, True)])
+def test_load_refuses_only_a_rule_that_moves_the_axis(
+        path, window, model_window, accepted):
+    context = _preflight_context(path, window, HOLD_ENDS, model_window)
+    domain = model_window or window
+    checkpoint = _checkpoint(z_begin=domain[0], z_end=domain[1])
     before = copy.deepcopy(vars(context)['config'])
     verdict = fit_spiral.FitContext.inspect_checkpoint(context, checkpoint)
     assert verdict.accepted is accepted
@@ -114,7 +119,6 @@ def test_load_refuses_only_a_rule_that_moves_the_axis(path, window, accepted):
     (INSIDE, HOLD_ENDS, True)])
 def test_digest_changes_only_when_the_axis_does(path, window, rule, same):
     context = _preflight_context(path, window, rule)
-    context.z_begin, context.z_end = window
     digest = fit_spiral.FitContext.model_state_digest(context)
     unmarked = model_state_sha256(
         context.spiral_and_transform.state_dict(), (), *window)

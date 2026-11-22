@@ -1474,6 +1474,16 @@ class BindingOwnershipTests(unittest.TestCase):
             "tolerated-live-differs.ckpt", partial))
         self.assertEqual(error.payload["stage"], "all")
 
+    def test_a_refusal_over_the_umbilicus_end_rule_needs_the_full_build(self):
+        session = _attach_fake_session(self.state, self.output, VOLUME)
+        live = Config().as_dict()
+        session.applied_config = dict(live)
+        status = session.status
+        session.status = lambda: {**status(), "umbilicus_end_rule": "hold"}
+        # The checkpoint predates the recorded rule, so it extrapolated.
+        error = self._refuse_load(session, self._write_checkpoint("legacy.ckpt", live))
+        self.assertEqual(error.payload["stage"], "all")
+
     def test_a_refusal_no_rebuild_can_fix_offers_nothing(self):
         session = _attach_fake_session(self.state, self.output, VOLUME)
         live = Config().as_dict()

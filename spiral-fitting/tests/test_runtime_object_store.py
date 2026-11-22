@@ -218,7 +218,8 @@ def test_settings_that_shape_the_inputs_need_a_full_rebuild(state, device_stubs)
 
 def _checkpoint(path, cfg, input_manifest):
     import torch
-    torch.save({'cfg': cfg, 'input_manifest': input_manifest}, path)
+    torch.save({'cfg': cfg, 'input_manifest': input_manifest,
+                'umbilicus_end_rule': 'hold'}, path)
     return str(path)
 
 

@@ -1409,6 +1409,7 @@ class FitContext:
         # filtered and weighted around it, so this precedes every use of it.
         self._adopt_resume_end_rule()
         umbilicus = self.umbilicus_z_to_yx()
+        self.umbilicus_end_rule_moves_axis = self._end_rule_moves_model_axis()
         if self.scroll_zarr_path:
             progress.begin('loading', 'Opening scroll volume')
             print('loading volume zarr')
@@ -2673,8 +2674,9 @@ class FitContext:
     # ==========================================================================
 
     def _end_rule_moves_model_axis(self):
-        """Whether the two end rules differ anywhere in the model's z-range."""
-        zs = np.arange(self.model_z_begin, self.model_z_end)
+        """Whether the two end rules differ anywhere in the optimisation
+        window, which is where the model samples its axis."""
+        zs = np.arange(self.z_begin, self.z_end)
         return not np.array_equal(self.umbilicus_z_to_yx(HOLD_ENDS)(zs),
                                   self.umbilicus_z_to_yx(EXTRAPOLATE_ENDS)(zs))
 
@@ -2689,7 +2691,7 @@ class FitContext:
         again.
         """
         end_rule = getattr(self, 'umbilicus_end_rule', None)
-        if end_rule != HOLD_ENDS or not self._end_rule_moves_model_axis():
+        if end_rule != HOLD_ENDS or not self.umbilicus_end_rule_moves_axis:
             end_rule = None
         return model_state_sha256(
             self.spiral_and_transform.state_dict(),
@@ -2969,7 +2971,7 @@ class FitContext:
                 reasons.append(f'checkpoint has an {exc}')
             else:
                 if (saved_end_rule != live_end_rule
-                        and self._end_rule_moves_model_axis()):
+                        and self.umbilicus_end_rule_moves_axis):
                     reasons.append(
                         f'checkpoint umbilicus end rule {saved_end_rule!r} gives '
                         f'a different model axis from this fit\'s '
