@@ -281,8 +281,8 @@ double tricube(double u)
 }
 
 // Weighted least squares line through (z, x) and (z, y), read at z0, over the estimates (sorted by
-// z) that lie within half_width of z0. False when fewer than 3 of them carry weight. A window
-// whose estimates all share one z gives their weighted mean.
+// z) that lie within half_width of z0. False when fewer than 3 of them carry weight, or when the
+// weighted ones all share one z.
 bool local_linear(const std::vector<cv::Vec3d>& e, const std::vector<double>& w, double z0,
                   double half_width, cv::Vec2d& out)
 {
@@ -314,10 +314,9 @@ bool local_linear(const std::vector<cv::Vec3d>& e, const std::vector<double>& w,
         szy += k * dz * (e[i][2] - ym);
     }
     if (szz <= 1e-12 * std::max(1.0, sw)) {
-        out = cv::Vec2d(xm, ym);
-    } else {
-        out = cv::Vec2d(xm + szx / szz * (z0 - zm), ym + szy / szz * (z0 - zm));
+        return false;
     }
+    out = cv::Vec2d(xm + szx / szz * (z0 - zm), ym + szy / szz * (z0 - zm));
     return true;
 }
 
@@ -351,18 +350,24 @@ std::vector<cv::Vec2d> fit_umbilicus_along_z(const std::vector<cv::Vec3d>& estim
 
     std::vector<double> robust(sorted.size(), 1.0);
     for (int it = 0; it < robustness_iterations; ++it) {
-        std::vector<double> residual(sorted.size(), 0.0);
+        // NaN where the window gives no fit; those estimates keep their weight.
+        std::vector<double> residual(sorted.size(), nan);
+        std::vector<double> found;
         for (size_t i = 0; i < sorted.size(); ++i) {
             cv::Vec2d fit;
             if (local_linear(sorted, robust, sorted[i][0], half_width, fit)) {
                 residual[i] = std::hypot(sorted[i][1] - fit[0], sorted[i][2] - fit[1]);
+                found.push_back(residual[i]);
             }
         }
-        const double s = median_of(residual);
+        const double s = found.empty() ? 0.0 : median_of(found);
         if (!(s > 0.0)) {
             break;
         }
         for (size_t i = 0; i < sorted.size(); ++i) {
+            if (std::isnan(residual[i])) {
+                continue;
+            }
             const double u = std::min(residual[i] / (6.0 * s), 1.0);
             robust[i] = (1.0 - u * u) * (1.0 - u * u);
         }

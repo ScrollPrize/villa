@@ -50,8 +50,9 @@ cv::Vec2f align_and_extract_umbilicus(const GridStore& grid_store,
  * @param query_z The z at which the fitted axis is returned.
  * @param half_width Window half-width, in the units of z. Must be > 0.
  * @param robustness_iterations Bisquare reweightings; 0 gives the plain local-linear fit.
- * @return (x, y) at each query z. Where fewer than 3 estimates fall inside the window, the
- *         coordinatewise median of the estimates at exactly that z, or NaN if there are none.
+ * @return (x, y) at each query z. Where fewer than 3 estimates fall inside the window, or they
+ *         all share one z, the coordinatewise median of the estimates at exactly that z, or NaN
+ *         if there are none.
  */
 std::vector<cv::Vec2d> fit_umbilicus_along_z(const std::vector<cv::Vec3d>& estimates,
                                              const std::vector<double>& query_z,

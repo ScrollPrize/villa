@@ -501,9 +501,9 @@ TEST_CASE("fit_umbilicus_along_z: at window 500, most slices that walked off kee
     // The recommended --zfit 500 at one slice every 256 puts one slice each side in the window.
     // The end slices have 2 estimates in theirs, so they keep their own estimate. Once the
     // reweighting drops a slice that walked off, its window has fewer than 3 weighted estimates
-    // left, and it keeps its own estimate too. Over seeds 1-20, 120 of the 160 interior walked-off
-    // slices come back unchanged with libstdc++ (125 with libc++). If this starts failing because
-    // they are outvoted, update the --zfit help and the comment at the top of vc_gen_umbilicus.cpp.
+    // left, and it keeps its own estimate too. Over seeds 1-20, all 160 interior walked-off slices
+    // come back unchanged. If this starts failing because they are outvoted, update the --zfit help
+    // and the comment at the top of vc_gen_umbilicus.cpp.
     int kept = 0;
     for (std::uint32_t seed = 1; seed <= 20; ++seed) {
         std::vector<double> slices;
@@ -519,6 +519,24 @@ TEST_CASE("fit_umbilicus_along_z: at window 500, most slices that walked off kee
         }
     }
     CHECK(kept >= 80);
+}
+
+TEST_CASE("fit_umbilicus_along_z: slices without a fit do not stop the reweighting elsewhere")
+{
+    std::vector<double> slices;
+    auto e = scatteredEstimates(1u, 20.0, 7, 400.0, slices);
+    for (int k = 0; k < 80; ++k)
+        e.emplace_back(1e5 + 1e4 * k, 0.0, 0.0);
+    const auto fit = fit_umbilicus_along_z(e, slices, 2000.0);
+    CHECK(worstError(fit, slices) < 60.0);
+}
+
+TEST_CASE("fit_umbilicus_along_z: repeats at one z alone keep the slice's median")
+{
+    const std::vector<cv::Vec3d> e = {{0.0, 10.0, 20.0}, {0.0, 11.0, 21.0}, {0.0, 40.0, 60.0}};
+    const auto fit = fit_umbilicus_along_z(e, {0.0}, 300.0);
+    CHECK(fit[0][0] == doctest::Approx(11.0));
+    CHECK(fit[0][1] == doctest::Approx(21.0));
 }
 
 TEST_CASE("fit_umbilicus_along_z: a window with too few estimates keeps the slice's median")

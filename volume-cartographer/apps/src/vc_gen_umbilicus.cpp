@@ -530,9 +530,14 @@ int main(int argc, char** argv)
             ++j;
         }
         Json point = Json::object();
+        bool inside = insideCount == j - i;
         if (zfit > 0.0) {
             point["x"] = fitted[pointIndex][0];
             point["y"] = fitted[pointIndex][1];
+            const double gx = fitted[pointIndex][0] * coordinateScale;
+            const double gy = fitted[pointIndex][1] * coordinateScale;
+            const cv::Size size = estimates[i].gridSize;
+            inside = gx >= 0.0 && gx <= size.width && gy >= 0.0 && gy <= size.height;
         } else {
             point["x"] = median(xs) / coordinateScale;
             point["y"] = median(ys) / coordinateScale;
@@ -540,9 +545,9 @@ int main(int argc, char** argv)
         ++pointIndex;
         point["z"] = estimates[i].slice / coordinateScale;
         point["estimates"] = static_cast<int>(j - i);
-        point["inside"] = insideCount == j - i;
+        point["inside"] = inside;
         points.push_back(point);
-        if (insideCount != j - i) {
+        if (!inside) {
             ++outside;
         }
         i = j;
