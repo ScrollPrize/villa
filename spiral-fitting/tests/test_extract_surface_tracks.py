@@ -336,11 +336,24 @@ def test_invalid_z_range_is_rejected(capsys, tmp_path):
     assert '--z-min must be' in capsys.readouterr().err
 
 
-@pytest.mark.parametrize('factor', ['0', '5'])
-def test_downsample_factor_outside_the_slab_is_rejected(capsys, factor):
+@pytest.mark.parametrize('factor', ['0', '3', '5'])
+def test_downsample_factor_off_the_slab_grid_is_rejected(capsys, factor):
     with pytest.raises(SystemExit):
         est.parse_args(['--predictions', 'p.zarr', '--out', 't.dbm', '--downsample-factor', factor])
-    assert '--downsample-factor must be between 1' in capsys.readouterr().err
+    assert '--downsample-factor must be at most' in capsys.readouterr().err
+
+
+def test_resume_with_another_downsample_factor_is_rejected(tmp_path):
+    out = str(tmp_path / 't.dbm')
+    est.check_downsample_factor(out, 1)
+    with dbm.open(out, 'w') as database:
+        database['h:0'] = pickle.dumps([])
+    est.check_downsample_factor(out, 1)
+    with pytest.raises(SystemExit, match='--downsample-factor 1'):
+        est.check_downsample_factor(out, 4)
+    os.remove(out + '.downsample_factor')
+    with pytest.raises(SystemExit, match='does not give'):
+        est.check_downsample_factor(out, 1)
 
 
 def test_gpus_with_cpu_backend_is_rejected(capsys):
