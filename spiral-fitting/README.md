@@ -156,11 +156,12 @@ with `FIT_SPIRAL_DEVICE=cpu`, `FIT_SPIRAL_DIRECT_LR=0`, `FIT_SPIRAL_TRITON=0` or
 `FIT_SPIRAL_DIRECT_LR=0` to keep it). The interpolant changes only when asked, and the change is
 logged: `FIT_SPIRAL_DIRECT_LR=0` or `1` sets it for fresh fits and checkpoints alike, and a fit
 whose `model_flow_field_direct_lr` differs from its checkpoint's lets the configuration decide, as
-before checkpoints recorded it. `FIT_SPIRAL_DIRECT_LR=1` is refused for a fresh fit where no fused
-kernel takes the lattices. The model-state digest that checkpoints, previews and commits carry
-names the interpolant, so a surface is never matched to a preview or commit of the other one; a
-Cartesian surface written before has another digest, and its preview is flattened and committed
-again once.
+before checkpoints recorded it (logged as a warning). `FIT_SPIRAL_DIRECT_LR=1` is refused for a fresh
+fit on a device without a fused kernel; on lattices its kernel does not take (a single-cell axis)
+it integrates direct sampling eagerly, slower but the same interpolant the kernels sample. The
+model-state digest that checkpoints, previews and commits carry names the interpolant, so a
+surface is never matched to a preview or commit of the other one; a Cartesian surface written
+before has another digest, and its preview is flattened and committed again once.
 
 MPS has no float64. Device tensors that are float64 on CUDA take their dtype
 from `devices.float_hi()`, which is float32 on MPS;

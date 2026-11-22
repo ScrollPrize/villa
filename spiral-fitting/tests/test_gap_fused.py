@@ -23,7 +23,9 @@ the comparison is built around where they cannot:
   eager one).
 The tolerances are set from the largest spreads over 200 seeds of each case
 on MPS (GAP_FUSED_SEEDS=200 runs them; see LOGIT_TOL), and the eager path
-itself is as far from a float64 run as the kernel is.
+itself is as far from a float64 run as the kernel is. They were measured on
+MPS only: on CUDA the same bounds hold the Triton kernels to the eager path
+untried.
 """
 import math
 import os
@@ -57,7 +59,9 @@ pytestmark = pytest.mark.skipif(
 
 SEEDS = range(1234, 1234 + int(os.environ.get('GAP_FUSED_SEEDS', '1')))
 # Tolerances of the accumulated gradients (see test_fused_gap_matches_eager),
-# against the largest spreads over 200 seeds of each case on MPS (torch 2.11):
+# against the largest spreads over 200 seeds of each case on MPS (torch 2.11;
+# the spread of CUDA's Triton kernels against its eager path was not measured
+# for these bounds):
 # - per logit element, |fused - eager| against the element's terms' absolute
 #   sum plus 1e-5 of the largest: up to 0.52. Two float32 orders do not
 #   agree on every element (a point past the outermost winding, for one,

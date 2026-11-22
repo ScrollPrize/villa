@@ -23,8 +23,8 @@ place different surfaces, so:
 - a lattice with a single cell along any axis (the documented 100-slice
   window with no z margin has one coarse z cell) reaches neither fused
   kernel: it falls back to the upsampled field, in training and export,
-  unless FIT_SPIRAL_DIRECT_LR=1 asks for direct sampling, which then names
-  the shape.
+  unless FIT_SPIRAL_DIRECT_LR=1 asks for direct sampling, which is then
+  integrated eagerly and names the shape.
 
 The Metal dispatch is checked on any machine. The ``simulated_metal`` fixture
 makes flow_metal accept CPU float32 lattices and run the kernels' arithmetic
@@ -478,7 +478,8 @@ def test_a_changed_direct_lr_setting_decides_and_is_logged(simulated_metal, caps
     torch.testing.assert_close(_surface(session.spiral_and_transform, points),
                                upsampled, **SAME)
     out = capsys.readouterr().out
-    assert out.count('model_flow_field_direct_lr is False here and was True') == 1
+    assert out.count('WARNING: checkpoint flow field: model_flow_field_direct_lr is False '
+                     'here and was True') == 1
     assert 'the fitted surface moves' in out
 
 
@@ -504,9 +505,11 @@ def test_a_one_cell_lattice_never_reaches_triton(monkeypatch):
     monkeypatch.setattr(flow_triton, 'rk4_triton_available',
                         lambda *tensors: True)
     thin = _thin(0)
-    backend, reason = flow_fields._fused_direct_backend(thin.flows[0], thin.flows[1])
-    assert backend is None and '1 cell along z' in reason
+    backend, reason, shape = flow_fields._fused_direct_backend(thin.flows[0], thin.flows[1])
+    assert backend is None and shape and '1 cell along z' in reason
     assert thin.effective_interpolant() == 'upsampled'
+    monkeypatch.setenv('FIT_SPIRAL_DIRECT_LR', '1')
+    assert thin._resolve_interpolant(log=False) == ('direct_lr', flow_fields._EagerDirect)
     wide = CartesianFlowField([12, 12, 12], spatial_scale_factor=6, direct_lr=True)
     assert flow_fields._fused_direct_backend(wide.flows[0], wide.flows[1])[0] is flow_triton
 
@@ -583,11 +586,24 @@ def test_a_one_cell_coarse_axis_falls_back_to_the_upsampled_field(
 
 
 @pytest.mark.parametrize('axis', [0, 1, 2], ids=['z', 'y', 'x'])
-def test_an_explicit_direct_request_names_the_unsupported_shape(
-        simulated_metal, monkeypatch, axis):
+def test_an_explicit_direct_request_on_a_one_cell_lattice_integrates_eagerly(
+        simulated_metal, monkeypatch, capsys, axis):
+    # The way back to direct sampling where the kernels do not take the
+    # lattice: FIT_SPIRAL_DIRECT_LR=1 integrates it eagerly, says why, and
+    # places the reference integrator's points (one-cell axes included).
     monkeypatch.setenv('FIT_SPIRAL_DIRECT_LR', '1')
-    with pytest.raises(RuntimeError, match='1 cell along ' + 'zyx'[axis]):
-        _thin(axis).get_integrator()
+    field = _thin(axis)
+    assert field.effective_interpolant() == 'direct_lr'
+    capsys.readouterr()
+    trained, exported = _train_and_export(field)
+    assert '1 cell along ' + 'zyx'[axis] in capsys.readouterr().out
+    points = torch.rand(64, 3, generator=torch.Generator().manual_seed(2))
+    with torch.no_grad():
+        expected = reference_integrate(points, field.flows[0].detach(),
+                                       field.flows[1].detach(), 1.0, 1.0,
+                                       1.0 / 3, 3, False)
+    torch.testing.assert_close(exported, expected, rtol=0, atol=1e-6)
+    torch.testing.assert_close(trained, expected, rtol=0, atol=1e-6)
 
 
 def test_the_documented_narrow_window_trains_and_exports(simulated_metal):

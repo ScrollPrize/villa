@@ -2719,9 +2719,9 @@ class FitContext:
         message = None
         if changed:
             now = self._flow_interpolant()
-            message = (f'checkpoint flow field: model_flow_field_direct_lr is {bool(live)} '
-                       f'here and was {bool(saved)} in the checkpoint ({interpolant}); '
-                       f'integrating {now}'
+            message = (f'WARNING: checkpoint flow field: model_flow_field_direct_lr is '
+                       f'{bool(live)} here and was {bool(saved)} in the checkpoint '
+                       f'({interpolant}); integrating {now}'
                        + ('; the fitted surface moves' if now != interpolant else ''))
         elif note and previous != interpolant:
             message = f'checkpoint flow field: {interpolant} ({note})'

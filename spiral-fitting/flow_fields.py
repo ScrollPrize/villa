@@ -566,21 +566,22 @@ class _EagerDirect:
 
 
 def _fused_direct_backend(low, high):
-    """``(module, None)`` for the fused kernel that integrates these lattices
-    directly (flow_triton on CUDA, flow_metal on MPS), else ``(None, why
-    not)``. Neither kernel takes a lattice with a single cell along an axis
-    (flow_metal.lattice_shape_problem): their backward clamps its lower corner
-    to size - 2, outside such a lattice."""
+    """``(module, None, False)`` for the fused kernel that integrates these
+    lattices directly (flow_triton on CUDA, flow_metal on MPS), else
+    ``(None, why not, shape)``: ``shape`` is True when the device has a
+    kernel that does not take these lattices. Neither kernel takes a lattice
+    with a single cell along an axis (flow_metal.lattice_shape_problem): their
+    backward clamps its lower corner to size - 2, outside such a lattice."""
     if flow_triton.rk4_triton_available(low, high):
         kernel = flow_triton
     elif flow_metal.rk4_metal_available(low, high):
         kernel = flow_metal
     else:
-        return None, f'no fused kernel on {low.device}'
+        return None, f'no fused kernel on {low.device}', False
     problem = flow_metal.lattice_shape_problem(low, high)
     if problem is not None:
-        return None, problem
-    return kernel, None
+        return None, problem, True
+    return kernel, None, False
 
 
 class CartesianFlowField(nn.Module):
@@ -649,9 +650,11 @@ class CartesianFlowField(nn.Module):
         upsampled); else a pinned interpolant; else ``direct_lr``. Direct
         sampling runs on a fused kernel when one takes these lattices. Where
         none does, a pinned direct interpolant is integrated eagerly (the
-        checkpoint keeps its surface), an explicit FIT_SPIRAL_DIRECT_LR=1 is
-        refused with the reason, and the configured default falls back to the
-        upsampled field, as main does off CUDA.
+        checkpoint keeps its surface), and so is an explicit
+        FIT_SPIRAL_DIRECT_LR=1 on lattices the device's kernel does not take
+        (a single-cell axis); an explicit request on a device without a fused
+        kernel is refused with the reason, and the configured default falls
+        back to the upsampled field, as main does off CUDA.
         """
         override = os.environ.get('FIT_SPIRAL_DIRECT_LR')
         pinned = self.pinned_interpolant
@@ -663,11 +666,15 @@ class CartesianFlowField(nn.Module):
                        'surface moves', log)
         if wanted == 'upsampled':
             return 'upsampled', None
-        backend, reason = _fused_direct_backend(self.flows[0], self.flows[1])
+        backend, reason, shape = _fused_direct_backend(self.flows[0], self.flows[1])
         if backend is not None:
             return 'direct_lr', backend
         if pinned == 'direct_lr':
             self._note(f"flow field: {reason}; integrating the checkpoint's direct "
+                       'low-resolution sampling eagerly (slower than a fused kernel)', log)
+            return 'direct_lr', _EagerDirect
+        if shape and flow_triton.direct_lr_requested():
+            self._note(f'flow field: {reason}; FIT_SPIRAL_DIRECT_LR=1 integrates direct '
                        'low-resolution sampling eagerly (slower than a fused kernel)', log)
             return 'direct_lr', _EagerDirect
         if flow_triton.direct_lr_requested():
