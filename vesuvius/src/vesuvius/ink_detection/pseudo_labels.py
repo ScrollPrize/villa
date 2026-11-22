@@ -17,9 +17,12 @@ the middle plane, values 0/255). Add them as their own dataset group with a shar
 **First Letters**: ink outputs of a submitted region must not overlap any training data. Pseudo-label some regions of the
 target scroll and read others; never read a pseudo-labelled region.
 
-Leave-one-scroll-out on PHerc 0139 native 9.362 um segments (seed 42, 25k steps, 16 of 64 slots): mean ROC-AUC 0.743
-(no target data) -> 0.786 (``background="mean"``) -> 0.804 (``background="max"``, margin 8, mirror-TTA teachers); the
-latter student beats its own four-model teacher (0.813 vs 0.808 with mirror TTA). See docs/ink_cross_scroll.md.
+Leave-one-scroll-out on PHerc 0139 native 9.362 um segments (25k steps, 16 of 64 slots, ``background="max"``, margin 8,
+mirror-TTA teachers), scored only on segments the student never received a label for (two complementary splits that
+together cover all five native segments; seeds 42, 43 and 44, each paired with the same-seed baseline): mean ROC-AUC
+0.790 -> 0.809 with mirror TTA (+0.018, SE 0.006; higher in 13 of 15 segment-seed pairs) and 0.763 -> 0.799 plain.
+Earlier single-seed numbers that also score the adapted segments (0.743 -> 0.804; 0.813 against the four-model
+teacher's 0.808) are transductive. See docs/ink_cross_scroll.md.
 
 CLI::
 
