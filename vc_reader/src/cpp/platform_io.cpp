@@ -180,7 +180,7 @@ std::string make_temp_directory(std::string pattern)
         for (std::size_t i = pattern.size() - 6; i < pattern.size(); ++i)
             pattern[i] = letters[random() % (sizeof letters - 1)];
         std::error_code error;
-        if (std::filesystem::create_directory(pattern, error)) return pattern;
+        if (std::filesystem::create_directory(utf8Path(pattern), error)) return pattern;
         if (error) throw std::system_error(error, "mkdtemp " + pattern);
     }
     throw std::system_error(EEXIST, std::generic_category(), "mkdtemp " + pattern);

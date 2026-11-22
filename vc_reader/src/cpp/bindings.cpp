@@ -14,6 +14,7 @@
 #include "vc_reader/zarr_metadata.hpp"
 #include "vc_reader/zarr_write.hpp"
 #include "output_pool.hpp"
+#include "vc_reader/native/utf8_path.hpp"
 
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
@@ -230,27 +231,27 @@ NB_MODULE(_reader, m)
     m.def("is_remote", &vcr::zarr::isRemote, "location"_a);
     m.def("http_url", &vcr::zarr::httpUrl, "location"_a);
     m.def("is_public_location", &vcr::zarr::isPublicLocation, "location"_a);
-    m.def("load_basic_auth", [](const std::string& path) { return vcr::zarr::loadBasicAuth(path); }, "path"_a);
+    m.def("load_basic_auth", [](const std::string& path) { return vcr::zarr::loadBasicAuth(vcr::utf8Path(path)); }, "path"_a);
     m.def("cache_roots", [](const std::vector<std::string>& cache_dirs) {
         std::vector<std::string> out;
         for (const auto& d : vcr::zarr::cacheRoots(cache_dirs))
-            out.push_back(d.string());
+            out.push_back(vcr::utf8String(d));
         return out;
     }, "cache_dirs"_a);
     m.def("decoded_cache_path", [](const std::string& cache_dir, const std::string& url) {
-        return vcr::zarr::decodedCachePath(cache_dir, url).string();
+        return vcr::utf8String(vcr::zarr::decodedCachePath(vcr::utf8Path(cache_dir), url));
     }, "cache_dir"_a, "url"_a);
     m.def("vc3d_volume_id", &vcr::zarr::vc3dVolumeId, "url"_a);
     m.def("vc3d_cache_root", []() -> std::optional<std::string> {
         const auto root = vcr::zarr::vc3dCacheRoot();
-        return root ? std::optional<std::string>(root->string()) : std::nullopt;
+        return root ? std::optional<std::string>(vcr::utf8String(*root)) : std::nullopt;
     });
     m.def("declared_placement", [](const nb::object& attributes, const std::string& path) {
         const auto placement = vcr::zarr::declaredPlacement(to_json(attributes), path);
         return nb::make_tuple(placement.scale, placement.offset);
     }, "attributes"_a, "path"_a);
-    m.def("selected_vc3d_cache_root", []() { return vcr::zarr::selectedVc3dCacheRoot().string(); });
-    m.def("vc3d_config_directory", []() { return vcr::zarr::vc3dConfigDirectory().string(); });
+    m.def("selected_vc3d_cache_root", []() { return vcr::utf8String(vcr::zarr::selectedVc3dCacheRoot()); });
+    m.def("vc3d_config_directory", []() { return vcr::utf8String(vcr::zarr::vc3dConfigDirectory()); });
     m.def("disk_budget", &vcr::zarr::diskBudget, "root"_a, "max_bytes"_a.none(),
           nb::call_guard<nb::gil_scoped_release>());
 
@@ -311,14 +312,14 @@ NB_MODULE(_reader, m)
         .def("decoded_zarray", [](const ArrayMeta& a) { return py_json(a.decodedZarray()); });
     m.def("zarr_inventory", [](const std::string& path, bool strict) {
         vcr::zarr::ArrayInventory result;
-        { nb::gil_scoped_release release; result=vcr::zarr::inventory(path,{},strict); }
+        { nb::gil_scoped_release release; result=vcr::zarr::inventory(vcr::utf8Path(path),{},strict); }
         return nb::make_tuple(py_json(result.metadata),result.chunks);
     }, "path"_a, "strict"_a=false);
     m.def("create_object_array", [](const std::string& path,const vcr::Index& shape,const vcr::Index& chunks,
                                     const nb::object& filters,const std::string& separator) {
         const auto config=to_json(filters);
         nb::gil_scoped_release release;
-        vcr::zarr::createObjectArray(path,shape,chunks,config,separator);
+        vcr::zarr::createObjectArray(vcr::utf8Path(path),shape,chunks,config,separator);
     }, "path"_a,"shape"_a,"chunks"_a,"filters"_a,"separator"_a="");
     m.def("parse_array_meta", [](const nb::object& metadata) { return vcr::zarr::parseArrayMeta(to_json(metadata)); }, "metadata"_a);
 
@@ -699,7 +700,7 @@ NB_MODULE(_reader, m)
     }, "data"_a, "max_bytes"_a);
     m.def("atomic_write", [](const std::string& path, ConstBytes data, bool fsync) {
         nb::gil_scoped_release release;
-        vcr::zarr::atomicWrite(path, data.data(), data.nbytes(), fsync ? vcr::zarr::Durability::Fsync : vcr::zarr::Durability::Fast);
+        vcr::zarr::atomicWrite(vcr::utf8Path(path), data.data(), data.nbytes(), fsync ? vcr::zarr::Durability::Fsync : vcr::zarr::Durability::Fast);
     }, "path"_a, "data"_a, "fsync"_a);
     nb::class_<Writer>(m, "Writer", "A Zarr array, local or on S3, opened for writing.")
         .def_static("create", [](const std::string& path, const vcr::Index& shape, const vcr::Index& chunks,
@@ -721,7 +722,7 @@ NB_MODULE(_reader, m)
             options.shardShape = shards;
             options.packbits = packbits;
             nb::gil_scoped_release release;
-            return Writer::create(path, options, access);
+            return Writer::create(vcr::utf8Path(path), options, access);
         }, "path"_a, "shape"_a, "chunks"_a, "dtype"_a, "compressor"_a, "level"_a, "cname"_a, "shuffle"_a, "overwrite"_a,
            "separator"_a, "fill_value"_a.none(), "version"_a, "shards"_a, "packbits"_a, "access"_a)
         .def_static("create_like", [](const std::string& path, const ArrayMeta& like, const std::optional<vcr::Index>& shape,
@@ -739,15 +740,15 @@ NB_MODULE(_reader, m)
             if (separator) options.separator = *separator;
             options.overwrite = overwrite;
             nb::gil_scoped_release release;
-            return Writer::create(path, options, access);
+            return Writer::create(vcr::utf8Path(path), options, access);
         }, "path"_a, "like"_a, "shape"_a.none(), "chunks"_a.none(), "dtype"_a.none(), "fill_value"_a.none(), "separator"_a.none(),
            "overwrite"_a, "access"_a)
         .def_static("open", [](const std::string& path, const vcr::zarr::Access& access) {
             nb::gil_scoped_release release;
-            return Writer::open(path, access);
+            return Writer::open(vcr::utf8Path(path), access);
         }, "path"_a, "access"_a)
         .def_prop_ro("meta", &Writer::meta, nb::rv_policy::reference_internal)
-        .def_prop_ro("path", [](const Writer& w) { return w.path().string(); })
+        .def_prop_ro("path", [](const Writer& w) { return vcr::utf8String(w.path()); })
         .def("write_region", [](Writer& w, const vcr::Index& start, const vcr::Index& shape, ConstBytes data, bool skip_empty) {
             std::int64_t n = static_cast<std::int64_t>(w.meta().itemsize());
             for (const auto extent : shape) n *= extent;
@@ -775,7 +776,7 @@ NB_MODULE(_reader, m)
     using vcr::zarr::Store;
     nb::class_<Store>(m, "Store", "The objects below a local directory or an s3:// prefix.")
         .def("__init__", [](Store* store, const std::string& location, const vcr::zarr::Access& access, int connections) {
-            new (store) Store(location, access, connections);
+            new (store) Store(vcr::utf8Path(location), access, connections);
         }, "location"_a, "access"_a, "connections"_a = 16)
         .def_prop_ro("location", &Store::location)
         .def_prop_ro("access", [](const Store& s) { return s.access(); })
@@ -854,25 +855,25 @@ NB_MODULE(_reader, m)
         Json attributes;
         {
             nb::gil_scoped_release release;
-            attributes = vcr::zarr::readAttributes(path, access);
+            attributes = vcr::zarr::readAttributes(vcr::utf8Path(path), access);
         }
         return py_json(attributes);
     }, "path"_a, "access"_a);
     m.def("write_attributes", [](const std::string& path, const nb::object& attributes, const Access& access) {
         const auto json = to_json(attributes);
         nb::gil_scoped_release release;
-        vcr::zarr::writeAttributes(path, json, access);
+        vcr::zarr::writeAttributes(vcr::utf8Path(path), json, access);
     }, "path"_a, "attributes"_a, "access"_a);
     m.def("create_group", [](const std::string& path, const nb::object& attributes, int version, const Access& access) {
         const auto json = attributes.is_none() ? std::nullopt : std::optional<Json>(to_json(attributes));
         nb::gil_scoped_release release;
-        vcr::zarr::createGroup(path, json, version, access);
+        vcr::zarr::createGroup(vcr::utf8Path(path), json, version, access);
     }, "path"_a, "attributes"_a.none(), "version"_a, "access"_a);
     m.def("remove_node", [](const std::string& path, const Access& access) {
         nb::gil_scoped_release release;
-        return vcr::zarr::removeNode(path, access);
+        return vcr::zarr::removeNode(vcr::utf8Path(path), access);
     }, "path"_a, "access"_a);
-    m.def("node_children", [](const std::string& path, const Access& access) { return vcr::zarr::nodeChildren(path, access); },
+    m.def("node_children", [](const std::string& path, const Access& access) { return vcr::zarr::nodeChildren(vcr::utf8Path(path), access); },
           "path"_a, "access"_a, nb::call_guard<nb::gil_scoped_release>());
 
     const auto pyramidOptions = [](int levels, const std::array<int, 3>& factors, const std::string& reduction, std::size_t threads) {
@@ -886,7 +887,7 @@ NB_MODULE(_reader, m)
     m.def("create_pyramid_levels", [pyramidOptions](const std::string& root, int levels, const std::array<int, 3>& factors, bool overwrite) {
         const auto options = pyramidOptions(levels, factors, "mean", 0);
         nb::gil_scoped_release release;
-        vcr::zarr::createPyramidLevels(root, options, overwrite);
+        vcr::zarr::createPyramidLevels(vcr::utf8Path(root), options, overwrite);
     }, "root"_a, "levels"_a, "factors"_a, "overwrite"_a);
     m.def("write_pyramid_level", [pyramidOptions](const std::string& root, int level, const std::array<int, 3>& factors,
                                                   const std::string& reduction, std::size_t threads,
@@ -896,13 +897,13 @@ NB_MODULE(_reader, m)
         if (begin && end)
             range = vcr::zarr::ChunkRange{*begin, *end};
         nb::gil_scoped_release release;
-        vcr::zarr::writePyramidLevel(root, level, options, range);
+        vcr::zarr::writePyramidLevel(vcr::utf8Path(root), level, options, range);
     }, "root"_a, "level"_a, "factors"_a, "reduction"_a, "threads"_a, "begin"_a.none(), "end"_a.none());
     m.def("write_pyramid", [pyramidOptions](const std::string& root, int levels, const std::array<int, 3>& factors,
                                             const std::string& reduction, std::size_t threads, bool overwrite) {
         const auto options = pyramidOptions(levels, factors, reduction, threads);
         nb::gil_scoped_release release;
-        vcr::zarr::writePyramid(root, options, overwrite);
+        vcr::zarr::writePyramid(vcr::utf8Path(root), options, overwrite);
     }, "root"_a, "levels"_a, "factors"_a, "reduction"_a, "threads"_a, "overwrite"_a);
     m.def("ome_multiscales", [](const std::string& name, int levels, const std::array<int, 3>& factors, const std::array<double, 3>& scale,
                                 const std::string& unit, const std::string& reduction, const std::array<std::string, 3>& axes) {

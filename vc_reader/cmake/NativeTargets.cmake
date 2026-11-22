@@ -20,7 +20,16 @@ endif()
 foreach(header IN LISTS _vc_native_headers)
     if(NOT IS_SYMLINK "${_vc_native_link}")  # no symbolic links (e.g. Windows without developer mode)
         # Forward to the file in src/cpp: a copy would be a second file to #pragma once.
-        file(CONFIGURE OUTPUT "${_vc_native_link}/${header}" CONTENT "#include \"${CMAKE_CURRENT_SOURCE_DIR}/src/cpp/${header}\"\n" @ONLY)
+        # Written only when it changes, and written as it is: file(CONFIGURE) would
+        # substitute an @name@ segment of the checkout path.
+        set(_vc_forward "#include \"${CMAKE_CURRENT_SOURCE_DIR}/src/cpp/${header}\"\n")
+        set(_vc_forwarded "")
+        if(EXISTS "${_vc_native_link}/${header}")
+            file(READ "${_vc_native_link}/${header}" _vc_forwarded)
+        endif()
+        if(NOT _vc_forwarded STREQUAL _vc_forward)
+            file(WRITE "${_vc_native_link}/${header}" "${_vc_forward}")
+        endif()
     endif()
     get_filename_component(directory "${header}" DIRECTORY)
     install(FILES "src/cpp/${header}" DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/vc_reader/native/${directory}")

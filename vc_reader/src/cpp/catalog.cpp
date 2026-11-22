@@ -1,5 +1,6 @@
 #include "vc_reader/catalog.hpp"
 #include "catalog_io.hpp"
+#include "vc_reader/native/utf8_path.hpp"
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -856,7 +857,7 @@ OpenDataManifest parseOpenDataManifest(std::string_view jsonText, std::string ma
 OpenDataManifest loadOpenDataManifestFile(const std::filesystem::path& manifestPath,
                                           std::string manifestUrl)
 {
-    if (manifestUrl.empty()) manifestUrl = manifestPath.string();
+    if (manifestUrl.empty()) manifestUrl = utf8String(manifestPath);
     return parseOpenDataManifest(readCatalogFile(manifestPath), std::move(manifestUrl));
 }
 

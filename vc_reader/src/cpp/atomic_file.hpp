@@ -33,13 +33,13 @@ class AtomicFile {
 public:
     explicit AtomicFile(const std::string& path) : path_(path)
     {
-        const auto parent = std::filesystem::path(path).parent_path();
+        const auto parent = utf8Path(path).parent_path();
         if (!parent.empty()) std::filesystem::create_directories(parent);
         tmp_ = vcr::temporary_path(path);
-        fd_ = platform::open_file(tmp_, O_RDWR | O_CREAT | O_TRUNC, 0644);
+        fd_ = platform::open_file(utf8Path(tmp_), O_RDWR | O_CREAT | O_TRUNC, 0644);
         if (fd_ < 0) throw std::system_error(errno, std::generic_category(), "create " + tmp_);
     }
-    ~AtomicFile() { if (fd_ >= 0) ::close(fd_); if (!tmp_.empty()) ::unlink(tmp_.c_str()); }
+    ~AtomicFile() { if (fd_ >= 0) ::close(fd_); if (!tmp_.empty()) { std::error_code ignored; std::filesystem::remove(utf8Path(tmp_), ignored); } }
     AtomicFile(const AtomicFile&) = delete;
     AtomicFile& operator=(const AtomicFile&) = delete;
     int fd() const noexcept { return fd_; }
@@ -68,10 +68,10 @@ public:
         const int fd = fd_;
         fd_ = -1;
         if (::close(fd)) throw std::system_error(errno, std::generic_category(), "close " + tmp_);
-        platform::replace_file(tmp_, path_, durable);
+        platform::replace_file(utf8Path(tmp_), utf8Path(path_), durable);
         tmp_.clear();
         if (durable) {
-            const auto parent = std::filesystem::path(path_).parent_path();
+            const auto parent = utf8Path(path_).parent_path();
             platform::sync_directory(parent.empty() ? std::filesystem::path(".") : parent, path_);
         }
     }
