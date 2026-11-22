@@ -65,11 +65,16 @@ SEEDS = range(1234, 1234 + int(os.environ.get('GAP_FUSED_SEEDS', '1')))
 #   this bound catches misrouted contributions, not small biases;
 # - the projection of the fused logit gradient on the eager one: within
 #   5.4e-5 of 1, so 1e-3 catches a bias of 0.1% in the scatter;
-# - dr_per_winding, against its terms' absolute sum: up to 1.3e-5, so 4e-5
-#   (a 1% error in the kernel's dr terms moved it by 6.7e-5 to 1e-3).
+# - dr_per_winding, against its terms' absolute sum: up to 1.3e-5, so 4e-5.
+#   Where that sum cancels, a 1% error in the kernel's dr terms can hide
+#   below it (7 of 40 cases over 10 seeds), so dr_per_winding's gradient
+#   through a radial loss (_radial_loss) is compared too, against its own
+#   terms' absolute sum: up to 1.5e-5 over 800 cases, against at least
+#   8.8e-3 with that 1% error, so 2e-4.
 LOGIT_TOL, LOGIT_FLOOR = 1.0, 1e-5
 PROJECTION_TOL = 1e-3
 DR_TOL = 4e-5
+RADIAL_DR_TOL = 2e-4
 
 
 def _inputs(n, logit_std, seed=1234):
@@ -167,9 +172,40 @@ def _run(device, truncate_frac, logit_std=0.01, n=4096, seed=1234, sums=False):
         'grad_logits': params.logits.grad, 'grad_dr': dr.grad.reshape(1),
     }
     out = {k: v.detach().cpu() for k, v in out.items()}
+    out['radial_dr'] = _radial_dr(device, truncate_frac, logits, points)
     if sums:
         out['absolute_sums'] = _absolute_sums(truncate_frac, logits, points, weights)
+        out['radial_dr_sum'] = _radial_dr_sum(truncate_frac, logits, points)
     return backend, out
+
+
+def _radial_loss(transform, x):
+    # The outward unit vector as the forward map's loss weight, its negation
+    # as the inverse's: the kernel's dr terms (gap derivative times the
+    # radius gradient) then share a sign, so a bias in them adds up instead
+    # of cancelling away as it can under random weights.
+    outward = torch.cat([torch.zeros_like(x[..., :1]),
+                         torch.nn.functional.normalize(x[..., 1:], dim=-1)], dim=-1)
+    return ((transform._call(x) * outward).sum(-1)
+            - (transform._inverse(x) * outward).sum(-1))
+
+
+def _radial_dr(device, truncate_frac, logits, points):
+    _, dr, transform = _transform(device, truncate_frac, logits)
+    _radial_loss(transform, points.to(device)).sum().backward()
+    return float(dr.grad)
+
+
+def _radial_dr_sum(truncate_frac, logits, points):
+    # The radial loss's dr_per_winding terms' absolute sum: each point's
+    # term by central differences, in float64.
+    terms = []
+    with torch.no_grad():
+        for step in (1e-6, -1e-6):
+            _, _, shifted = _transform('cpu', truncate_frac, logits, torch.float64)
+            shifted.dr_per_winding = torch.tensor(DR + step, dtype=torch.float64)
+            terms.append(_radial_loss(shifted, points.double()))
+    return float(((terms[0] - terms[1]) / 2e-6).abs().sum())
 
 
 # 0.01: the gaps stay within about 0.5-2x the nominal spacing, so some points
@@ -211,6 +247,8 @@ def test_fused_gap_matches_eager(monkeypatch, device, switch, module,
     assert abs(projection - 1.0) <= PROJECTION_TOL, projection
     dr_error = float((fused['grad_dr'] - eager['grad_dr']).abs())
     assert dr_error <= DR_TOL * dr_sum, (dr_error, dr_sum)
+    radial = abs(fused['radial_dr'] - eager['radial_dr'])
+    assert radial <= RADIAL_DR_TOL * eager['radial_dr_sum'], (radial, eager['radial_dr_sum'])
 
 
 @pytest.mark.parametrize('device,switch,module', BACKENDS,
