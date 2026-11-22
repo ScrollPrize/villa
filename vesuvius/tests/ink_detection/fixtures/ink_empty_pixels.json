@@ -20,5 +20,7 @@
   "checkpoint": "scrollprize/ink_9um hybrid_3d2d-seed42/step-075000.pth",
   "checkpoint_sha256": "e635558ae6a1a807a7e5ec1e83adfd45bc3c0ac53883ea43f1d4e085d62a9cab",
   "fixture_sha256": "9be2d2058942b2ea0d84d4afea1d5623d286c16b1ead045fbc87ec9d06bfc631",
-  "contents": "Rendered CT and unmodified CPU model logits for one patch crossing the segment boundary."
+  "contents": "Rendered CT and unmodified CPU model logits for one patch crossing the segment boundary.",
+  "ct_credit": "Vesuvius Challenge; CT rendered and cropped from the volume above",
+  "ct_license": "CC BY-NC 4.0, https://creativecommons.org/licenses/by-nc/4.0/ (https://scrollprize.org/data#licenses)"
 }
