@@ -61,7 +61,7 @@ void sampleLasagnaInterpolatedNormals(const std::array<LasagnaChannelBinding,3>&
 {
     if(!points.empty())vcr::diagnostics::recordCoordinates(points.front().val,points.size(),float(channels[0].spacing));
     for(const auto& c:channels)
-        if(!c.packed||c.cuda||c.array!=channels[0].array||!sameLasagnaSamplingGrid(c,channels[0]))
+        if(!c.packed||c.cuda||c.chunkValidity||c.array!=channels[0].array||!sameLasagnaSamplingGrid(c,channels[0]))
             throw std::invalid_argument("fused normal policy requires CPU channels of one packed sampling grid");
     const auto first=std::min({channels[0].channelIndex,channels[1].channelIndex,channels[2].channelIndex});
     NormalInterpolationPolicy<Store> policy{{int64_t(channels[0].channelIndex-first),
@@ -149,7 +149,7 @@ inline void sampleLasagnaInterpolatedWindingSamples(const std::array<LasagnaChan
     samples.assign(points.size(),{});
     const auto type=[](const auto& c){return c.float32?vcr::ElementType{'f',4,false}:vcr::ElementType{'u',1,false};};
     const auto& density=channels[0];const auto& nx=channels[1];const auto& ny=channels[2];
-    if(density.cuda||nx.cuda||ny.cuda||!sameLasagnaSamplingGrid(nx,ny))
+    if(density.cuda||nx.cuda||ny.cuda||density.chunkValidity||!sameLasagnaSamplingGrid(nx,ny))
         throw std::invalid_argument("CPU winding samples require compatible normal grids");
     density.array->sample_interpolated_coordinates(ChannelInterpolationCoordinates{points,density},points.size(),type(density),
         DensityInterpolationPolicy{density.packed,density.float32,[&](size_t i,float v){

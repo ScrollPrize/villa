@@ -11,6 +11,7 @@
 #include "vc_reader/computed.hpp"
 #include "vc_reader/reader.hpp"
 #include "vc_reader/zarr.hpp"
+#include "zarr/files.hpp"
 #include "vc_reader/zarr_metadata.hpp"
 #include "vc_reader/zarr_write.hpp"
 #include "output_pool.hpp"
@@ -660,6 +661,10 @@ NB_MODULE(_reader, m)
     m.def("forget_volume_metadata", &vcr::zarr::forgetVolumeMetadata);
     m.def("is_array_node", &vcr::zarr::isArrayNode, "location"_a, "options"_a, nb::call_guard<nb::gil_scoped_release>());
     m.def("forget_kept_metadata", &vcr::zarr::forgetKeptMetadata, "location"_a, "options"_a);
+    m.def("forget_known_arrays", [](const std::string& location, const OpenOptions& options) {
+        vcr::zarr::detail::forgetKnownArrays(location, options.access);
+    }, "location"_a, "options"_a,
+       "Drops the array documents this process read at or below a location (not the kept metadata on disk).");
     m.def("level_voxel_size_zyx", [](std::optional<double> voxel_size, const nb::object& documents, const std::string& level_key) {
         vcr::zarr::StoreMetadata metadata;
         metadata.voxelSizeUm = voxel_size;

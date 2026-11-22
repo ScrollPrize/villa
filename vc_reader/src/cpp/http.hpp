@@ -1,6 +1,6 @@
-// HTTP(S) requests over a bounded pool of libcurl handles: anonymous, HTTP basic
-// auth, or signed for S3 (AWS Signature Version 4). sftp:// and ssh:// URLs are
-// read through pooled OpenSSH sessions and answered with the same responses.
+// HTTP(S) requests over libcurl handles shared by the whole process: anonymous,
+// HTTP basic auth, or signed for S3 (AWS Signature Version 4). sftp:// and ssh://
+// URLs are read through pooled OpenSSH sessions and answered with the same responses.
 #pragma once
 
 #include "reader_types.hpp"
@@ -12,7 +12,14 @@
 #endif
 #include <curl/curl.h>
 
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
+
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -34,7 +41,7 @@
 namespace vcr {
 
 struct HttpOptions {
-    int connections = 16;          // concurrent requests (and kept-alive connections)
+    int connections = 16;          // concurrent requests of one client
     long connect_timeout_ms = 10000;
     long stall_timeout_s = 10;     // abort an attempt after this long without receiving data
     int retries = 5;
@@ -70,6 +77,87 @@ inline std::string select_ca_bundle(const std::string& builtin)
     return {};
 }
 
+// The libcurl easy handles of every HttpClient in the process. A handle keeps
+// its open connections between requests, and since libcurl 8 also a wakeup
+// descriptor of its own (an eventfd on Linux, a socket pair elsewhere), so a
+// client with its own handles holds file descriptors for as long as it lives. A process opening many remote arrays (each with a client) used to
+// keep hundreds of idle handles and run out of descriptors. Handles are now made
+// when a request needs one, shared by all clients (a connection to a host serves
+// any client asking that host), and at most kMaxIdle wait idle; the rest are
+// closed when their request ends. curl_easy_reset before every request clears
+// the previous request's options, credentials included.
+class CurlHandles {
+public:
+    static constexpr std::size_t kMaxIdle = 64;
+
+    // This process's pool. A forked child gets a new, empty one: the parent's
+    // handles share the parent's connections, and its lock may have been held
+    // across fork, so the inherited pool is left alone (leaked, never touched).
+    static CurlHandles& instance()
+    {
+        // Never destroyed: requests may still end during static destruction.
+        static std::atomic<CurlHandles*> current{new CurlHandles};
+        CurlHandles* pool = current.load(std::memory_order_acquire);
+        if (pool->owner_ == pid())
+            return *pool;
+        auto* fresh = new CurlHandles;
+        if (current.compare_exchange_strong(pool, fresh, std::memory_order_acq_rel))
+            return *fresh;
+        delete fresh;  // another thread of this process replaced it first
+        return *pool;
+    }
+
+    CURL* acquire()
+    {
+        {
+            std::lock_guard lock(mutex_);
+            if (!idle_.empty()) {
+                CURL* h = idle_.back();
+                idle_.pop_back();
+                return h;
+            }
+        }
+        CURL* h = curl_easy_init();
+        if (!h)
+            throw std::runtime_error("curl_easy_init failed");
+        return h;
+    }
+
+    void release(CURL* h) noexcept
+    {
+        {
+            std::lock_guard lock(mutex_);
+            if (idle_.size() < kMaxIdle) {
+                idle_.push_back(h);  // never allocates: capacity reserved up front
+                return;
+            }
+        }
+        curl_easy_cleanup(h);
+    }
+
+    std::size_t idle() const
+    {
+        std::lock_guard lock(mutex_);
+        return idle_.size();
+    }
+
+private:
+    CurlHandles() : owner_(pid()) { idle_.reserve(kMaxIdle); }
+
+    static long pid()
+    {
+#ifdef _WIN32
+        return static_cast<long>(::_getpid());
+#else
+        return static_cast<long>(::getpid());
+#endif
+    }
+
+    const long owner_;
+    mutable std::mutex mutex_;
+    std::vector<CURL*> idle_;
+};
+
 class HttpClient {
 public:
     explicit HttpClient(HttpOptions options) : options_(options)
@@ -78,14 +166,6 @@ public:
         std::call_once(init, [] { curl_global_init(CURL_GLOBAL_DEFAULT); });
         if (options_.connections < 1)
             options_.connections = 1;
-        handles_.reserve(options_.connections);
-        for (int i = 0; i < options_.connections; ++i) {
-            CURL* h = curl_easy_init();
-            if (!h)
-                throw std::runtime_error("curl_easy_init failed");
-            handles_.push_back(h);
-        }
-        free_ = handles_;
         auth_ = std::make_shared<const Auth>(options_.auth);
         if (!auth_->kind.empty() && auth_->kind != "basic" && auth_->kind != "s3")
             throw std::invalid_argument("unknown auth kind '" + auth_->kind + "'");
@@ -99,11 +179,7 @@ public:
         auth_ = std::move(next);
     }
 
-    ~HttpClient()
-    {
-        for (CURL* h : handles_)
-            curl_easy_cleanup(h);
-    }
+    ~HttpClient() = default;
 
     HttpClient(const HttpClient&) = delete;
     HttpClient& operator=(const HttpClient&) = delete;
@@ -409,21 +485,40 @@ private:
         ~HeaderList() { curl_slist_free_all(list); }
     };
 
+    // One of this client's `connections` request slots, and a handle from the
+    // process-wide pool for its duration.
     struct Lease {
         HttpClient& client;
-        CURL* handle;
+        CurlHandles& pool = CurlHandles::instance();
+        CURL* handle = nullptr;
         explicit Lease(HttpClient& c) : client(c)
         {
-            std::unique_lock lock(client.mutex_);
-            client.cv_.wait(lock, [&] { return !client.free_.empty(); });
-            handle = client.free_.back();
-            client.free_.pop_back();
+            {
+                std::unique_lock lock(client.mutex_);
+                client.cv_.wait(lock, [&] { return client.active_ < client.options_.connections; });
+                ++client.active_;
+            }
+            try {
+                handle = pool.acquire();
+            } catch (...) {
+                free_slot();
+                throw;
+            }
         }
         ~Lease()
         {
+            pool.release(handle);
+            free_slot();
+        }
+        Lease(const Lease&) = delete;
+        Lease& operator=(const Lease&) = delete;
+
+    private:
+        void free_slot() noexcept
+        {
             {
                 std::lock_guard lock(client.mutex_);
-                client.free_.push_back(handle);
+                --client.active_;
             }
             client.cv_.notify_one();
         }
@@ -497,8 +592,7 @@ private:
     }
 
     HttpOptions options_;
-    std::vector<CURL*> handles_;
-    std::vector<CURL*> free_;
+    int active_ = 0;  // requests in flight; guarded by mutex_
     std::shared_ptr<const Auth> auth_;  // guarded by mutex_
     std::unique_ptr<sftp::Fetcher> sftp_;  // created on the first sftp:// request; guarded by mutex_
     std::mutex mutex_;
