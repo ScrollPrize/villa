@@ -9,10 +9,13 @@ from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 
 import numpy as np
+import torch
 from scipy.ndimage import gaussian_filter
 from tqdm.auto import tqdm
 
 from vc_reader.reader import ObjectStore, ZarrWriter, open_zarr
+from vesuvius.models.run.tta import (accumulator_channels, axis_head_channels, orientation_layouts,
+                                     reduce_orientation_tensors)
 from vesuvius.utils.io.zarr_utils import mark_zarr_ready, wait_for_zarr_creation
 from vesuvius.utils.k8s import get_tqdm_kwargs
 from vesuvius.utils.cli import HyphenUnderscoreParser
@@ -340,13 +343,35 @@ def generate_gaussian_map(patch_size: tuple, sigma_scale: float = 8.0, dtype=np.
     return gaussian_map_np
 
 
+def _weigh_patch(patch_logits, weight, layouts, out):
+    """The weighted contribution of one patch to the blend sums, written into `out` (float32).
+
+    `out[:C]` gets w * logits. For each axis head (`orientation_layouts`) the channels of its
+    layout get w * v_i * v_j instead, so the blend averages the orientation tensor v v^T: two
+    overlapping patches that report one axis with opposite signs then add up instead of
+    cancelling. Both blenders weigh patches with this function.
+    """
+    num_channels = patch_logits.shape[0]
+    np.multiply(patch_logits, weight[np.newaxis], out=out[:num_channels])
+    for layout in layouts:
+        diagonal = [ch for (i, j), ch in sorted(layout.items()) if i == j]
+        for (i, j), ch in layout.items():
+            if i != j:  # w v_i * v_j, before the diagonal channels are squared below
+                np.multiply(out[diagonal[i]], patch_logits[diagonal[j]], out=out[ch])
+        for ch in diagonal:
+            np.multiply(out[ch], patch_logits[ch], out=out[ch])
+    return out
+
+
 def _write_blended_chunk(output_store, chunk_info, chunk_logits, chunk_weights, num_classes,
-                         finalize_config=None, epsilon=1e-8):
+                         finalize_config=None, epsilon=1e-8, layouts=()):
     """Normalise one chunk's weighted logit sum and write it to the output store.
 
-    `chunk_logits` (C, Z, Y, X) holds sum(w * logits) and `chunk_weights` (Z, Y, X) holds
-    sum(w); `chunk_logits` is divided in place. With `finalize_config` the chunk is
-    finalized (softmax + uint8) before writing, otherwise it is written as float16 logits.
+    `chunk_logits` (C_acc, Z, Y, X) holds sum(w * logits) and `chunk_weights` (Z, Y, X) holds
+    sum(w); `chunk_logits` is divided in place. The orientation tensors of axis heads
+    (`layouts`, accumulated after the `num_classes` channels) are then reduced to their
+    principal axis. With `finalize_config` the chunk is finalized (softmax + uint8) before
+    writing, otherwise it is written as float16 logits.
     """
     z_start, z_end = chunk_info['z_start'], chunk_info['z_end']
     y_start, y_end = chunk_info['y_start'], chunk_info['y_end']
@@ -363,6 +388,9 @@ def _write_blended_chunk(output_store, chunk_info, chunk_logits, chunk_weights, 
     weights_b = chunk_weights[np.newaxis, :, :, :]
     np.divide(chunk_logits, weights_b + epsilon,
               out=chunk_logits, where=weights_b > 0)
+    if layouts:
+        reduce_orientation_tensors(torch.from_numpy(chunk_logits), layouts)
+        chunk_logits = chunk_logits[:num_classes]
 
     if finalize_config is not None:
         from vesuvius.models.run.finalize_outputs import apply_finalization
@@ -380,7 +408,7 @@ _worker_state = {}
 
 
 def _init_worker(part_files, output_path, gaussian_map, patch_size, num_classes, is_s3,
-                 finalize_config=None):
+                 finalize_config=None, layouts=()):
     """Initialize per-worker process state with cached zarr stores.
 
     Called once when each worker process starts. Zarr stores (and their
@@ -390,6 +418,7 @@ def _init_worker(part_files, output_path, gaussian_map, patch_size, num_classes,
     Args:
         finalize_config: Optional FinalizeConfig. When set, chunks are finalized
             (softmax + uint8) inline instead of writing float16 blended logits.
+        layouts: `orientation_layouts` of the axis heads, blended as orientation tensors.
     """
     _worker_state.update({
         'part_files': part_files,
@@ -400,6 +429,7 @@ def _init_worker(part_files, output_path, gaussian_map, patch_size, num_classes,
         'logits_stores': {},
         'output_store': ZarrWriter.open(output_path, skip_empty=True),
         'finalize_config': finalize_config,
+        'layouts': layouts,
     })
 
 
@@ -422,6 +452,7 @@ def process_chunk(chunk_info, chunk_patches, epsilon=1e-8):
     is_s3 = _worker_state['is_s3']
     logits_stores = _worker_state['logits_stores']
     output_store = _worker_state['output_store']
+    layouts = _worker_state.get('layouts', ())
 
     z_start, z_end = chunk_info['z_start'], chunk_info['z_end']
     y_start, y_end = chunk_info['y_start'], chunk_info['y_end']
@@ -431,7 +462,8 @@ def process_chunk(chunk_info, chunk_patches, epsilon=1e-8):
 
     gaussian_map_spatial_np = gaussian_map[0]  # Shape (pZ, pY, pX)
 
-    chunk_shape = (num_classes, z_end - z_start, y_end - y_start, x_end - x_start)
+    chunk_shape = (accumulator_channels(layouts, num_classes),
+                   z_end - z_start, y_end - y_start, x_end - x_start)
     weights_shape = (z_end - z_start, y_end - y_start, x_end - x_start)
 
     chunk_logits = np.zeros(chunk_shape, dtype=np.float32)
@@ -491,7 +523,8 @@ def process_chunk(chunk_info, chunk_patches, epsilon=1e-8):
                 slice(px_start, px_end)
             ]
 
-            weighted_patch = logit_patch * weight_patch[np.newaxis, :, :, :]
+            weighted_patch = _weigh_patch(logit_patch, weight_patch, layouts,
+                                          np.empty((chunk_shape[0], *weight_patch.shape), dtype=np.float32))
 
             chunk_logits[
                 :,  # All classes
@@ -510,7 +543,7 @@ def process_chunk(chunk_info, chunk_patches, epsilon=1e-8):
 
     if patches_processed > 0:
         _write_blended_chunk(output_store, chunk_info, chunk_logits, chunk_weights, num_classes,
-                             _worker_state.get('finalize_config'), epsilon)
+                             _worker_state.get('finalize_config'), epsilon, layouts)
 
     return {
         'chunk': chunk_info,
@@ -642,17 +675,24 @@ class InMemoryBlender:
     above or below add their overlapping part, so every output chunk inside the slab gets the
     same sums as when the whole region is blended at once. A split run gives each part its own
     chunk-aligned slab (see `part_z_range`), so the parts write disjoint chunks.
+
+    `axis_channels` lists the (x, y, z) channels of heads whose direction has no sign
+    (`tta.axis_head_channels`); they are blended as orientation tensors, which takes three
+    more float32 sums per head.
     """
 
-    def __init__(self, patch_coords, patch_size, num_classes, volume_shape, sigma_scale=8.0, z_range=None):
+    def __init__(self, patch_coords, patch_size, num_classes, volume_shape, sigma_scale=8.0, z_range=None,
+                 axis_channels=()):
         self.patch_size = tuple(int(p) for p in patch_size)
         self.num_classes = int(num_classes)
+        self.layouts = orientation_layouts(axis_channels, self.num_classes)
+        self.num_sums = accumulator_channels(self.layouts, self.num_classes)
         self.volume_shape = tuple(int(v) for v in volume_shape)
         self.coords = np.asarray(patch_coords, dtype=np.int64).reshape(-1, 3)
         self.z_range = None if z_range is None else (int(z_range[0]), int(z_range[1]))
         self.origin, self.shape = self.extent(self.coords, self.patch_size, self.volume_shape, self.z_range)
         self.gaussian = generate_gaussian_map(self.patch_size, sigma_scale=sigma_scale)[0]
-        self.logits = np.zeros((self.num_classes, *self.shape), dtype=np.float32)
+        self.logits = np.zeros((self.num_sums, *self.shape), dtype=np.float32)
         self.weights = np.zeros(self.shape, dtype=np.float32)
         self.patches_added = 0
         self.patches_skipped_empty = 0
@@ -672,10 +712,13 @@ class InMemoryBlender:
         return tuple(int(v) for v in lo), tuple(int(v) for v in np.maximum(hi - lo, 0))
 
     @classmethod
-    def required_bytes(cls, patch_coords, patch_size, num_classes, volume_shape, z_range=None):
-        """Memory the float32 sums take: one array per class plus the weights."""
+    def required_bytes(cls, patch_coords, patch_size, num_classes, volume_shape, z_range=None,
+                       axis_channels=()):
+        """Memory the float32 sums take: one array per class (and per extra orientation
+        tensor component of an axis head) plus the weights."""
         _, shape = cls.extent(patch_coords, patch_size, volume_shape, z_range)
-        return (int(num_classes) + 1) * 4 * int(np.prod(shape, dtype=np.int64))
+        sums = accumulator_channels(orientation_layouts(axis_channels, num_classes), num_classes)
+        return (sums + 1) * 4 * int(np.prod(shape, dtype=np.int64))
 
     def add(self, patch_index, patch_logits):
         """Accumulate one patch, (C, pZ, pY, pX), placed at `patch_coords[patch_index]`.
@@ -695,11 +738,11 @@ class InMemoryBlender:
             canvas.append(slice(lo, hi))
             patch.append(slice(lo - s, hi - s))
         weight = self.gaussian[tuple(patch)]
-        # Same float32 product as process_chunk computes, written into a reused buffer.
+        # Same float32 products as process_chunk computes, written into a reused buffer.
         if self._scratch is None:
-            self._scratch = np.empty((self.num_classes, *self.patch_size), dtype=np.float32)
+            self._scratch = np.empty((self.num_sums, *self.patch_size), dtype=np.float32)
         weighted = self._scratch[(slice(None), *(slice(0, s.stop - s.start) for s in patch))]
-        np.multiply(patch_logits[(slice(None), *patch)], weight[np.newaxis], out=weighted)
+        _weigh_patch(patch_logits[(slice(None), *patch)], weight, self.layouts, weighted)
         self.logits[(slice(None), *canvas)] += weighted
         self.weights[tuple(canvas)] += weight
         self.patches_added += 1
@@ -763,13 +806,13 @@ class InMemoryBlender:
             chunk_weights[tuple(in_chunk)] = self.weights[tuple(in_canvas)]
             if not np.any(chunk_weights > 0):
                 return False
-            chunk_logits = np.zeros((self.num_classes, *chunk_weights.shape), dtype=np.float32)
+            chunk_logits = np.zeros((self.num_sums, *chunk_weights.shape), dtype=np.float32)
             chunk_logits[(slice(None), *in_chunk)] = self.logits[(slice(None), *in_canvas)]
             chunk_info = {'z_start': chunk[0][0], 'z_end': chunk[0][1],
                           'y_start': chunk[1][0], 'y_end': chunk[1][1],
                           'x_start': chunk[2][0], 'x_end': chunk[2][1]}
             _write_blended_chunk(output_store, chunk_info, chunk_logits, chunk_weights,
-                                 self.num_classes, finalize_config, epsilon)
+                                 self.num_classes, finalize_config, epsilon, self.layouts)
             return True
 
         if num_workers is None:
@@ -866,6 +909,8 @@ def merge_inference_outputs(
         patch_size = tuple(meta_attrs['patch_size'])
         original_volume_shape = tuple(meta_attrs['original_volume_shape'])  # MUST exist
         num_classes = part0_logits_store.shape[1]  # (N, C, pZ, pY, pX) -> C
+        # Heads whose direction has no sign are blended as orientation tensors.
+        layouts = orientation_layouts(axis_head_channels(meta_attrs.get('target_info', None)), num_classes)
 
     except Exception as e:
         traceback.print_exc()
@@ -996,7 +1041,8 @@ def merge_inference_outputs(
     with ProcessPoolExecutor(
         max_workers=num_workers,
         initializer=_init_worker,
-        initargs=(part_files, output_path, gaussian_map, patch_size, num_classes, is_s3, finalize_config)
+        initargs=(part_files, output_path, gaussian_map, patch_size, num_classes, is_s3, finalize_config,
+                  layouts)
     ) as executor:
         future_to_chunk = {
             executor.submit(

@@ -1,3 +1,5 @@
+import math
+
 import torch
 
 
@@ -22,11 +24,14 @@ _AXIS_TASKS_BY_DEFAULT = ('inplane_direction',)
 # Direction losses that do not depend on the sign of the prediction.
 _SIGN_INVARIANT_LOSSES = ('SignInvariantCosineLoss',)
 _TENSOR_ORDER = {3: ('zz', 'zy', 'zx', 'yy', 'yx', 'xx'), 2: ('yy', 'yx', 'xx')}
-# A sign-ambiguous direction is reported in the half-space 4x + 2y + z >= 0 of the input frame.
-# A sign chosen per patch would let two overlapping patches that agree up to sign cancel when
-# blended; a fixed half-space gives them the same sign. No axis or axis diagonal lies on its
-# boundary plane.
-_AXIAL_HALF_SPACE = {-1: 4.0, -2: 2.0, -3: 1.0}
+# An axis is written in the half-space 4x + 2y + z >= 0 of the input frame (x, y, z weights), so
+# the output has one sign convention. No coordinate axis or axis diagonal lies on its boundary.
+_HALF_SPACE = (4.0, 2.0, 1.0)
+# The orientation tensors of an axis head are reduced this many voxels (whole rows) at a time,
+# so their float32 temporaries have a fixed size instead of growing with the patch or chunk.
+_SLAB_VOXELS = 1 << 18
+# Squarings in `principal_axis`: the axis error falls like (l2 / l1) ** (2 ** _SQUARINGS).
+_SQUARINGS = 6
 
 
 def _direction_losses(target_config):
@@ -70,6 +75,13 @@ def is_axis_head(target_config, out_channels=None, spatial_dims=3) -> bool:
     if not names:
         return task in _AXIS_TASKS_BY_DEFAULT
     return all(name in _SIGN_INVARIANT_LOSSES for name in names)
+
+
+def axis_head_channels(target_info, spatial_dims=3):
+    """The (x, y[, z]) channels of each head marked `sign_invariant` in `target_info`."""
+    heads = sorted((target_info or {}).values(), key=lambda info: info['start_channel'])
+    return [tuple(range(int(info['start_channel']), int(info['start_channel']) + spatial_dims))
+            for info in heads if info.get('sign_invariant', False)]
 
 
 def tta_channel_groups(targets, target_info, spatial_dims: int):
@@ -130,46 +142,128 @@ def _undo_component_change(output: torch.Tensor, channel_groups, flipped=(), swa
     return output
 
 
-def _dot32(a: torch.Tensor, b: torch.Tensor, channels) -> torch.Tensor:
-    """Per-voxel dot product of a and b over `channels`, in float32: half-precision products
-    of small components underflow to zero. One channel at a time, so temporaries stay small."""
-    dot = None
-    for ch in channels:
-        term = a[:, ch].float() * b[:, ch].float()
-        dot = term if dot is None else dot.add_(term)
-    return dot
+def _pairs(d):
+    return [(i, j) for i in range(d) for j in range(i, d)]
 
 
-def _flip_where(output: torch.Tensor, channels, negative: torch.Tensor) -> None:
-    """Negate `channels` of `output` in place where `negative` is True."""
-    sign = 1 - 2 * negative.to(output.dtype)
-    for ch in channels:
-        output[:, ch].mul_(sign)
+def _row_slabs(rows, row_voxels):
+    """Slices of whole rows (the first spatial dim) holding about `_SLAB_VOXELS` voxels each."""
+    step = max(1, _SLAB_VOXELS // max(1, int(row_voxels)))
+    return [slice(s, min(s + step, rows)) for s in range(0, rows, step)]
+
+
+def principal_axis(m, d):
+    """The principal axis of per-voxel orientation tensors.
+
+    `m` maps (i, j), i <= j < d, to float32 tensors: the components of the (weighted) mean of
+    v v^T over the predictions v of each voxel. Returns the d components of the eigenvector of
+    its largest eigenvalue, scaled to the square root of that eigenvalue and put in the
+    half-space `_HALF_SPACE`. Predictions that agree up to sign give their common vector (with
+    its length); in general the length is the root mean square of their projections on the
+    axis. The result does not depend on the predictions' signs or order.
+    """
+    def at(p, i, j):
+        return p[(i, j) if i <= j else (j, i)]
+
+    def normalized(p):
+        trace = sum(p[(i, i)] for i in range(d))
+        inv = torch.where(trace > 0, trace.reciprocal(), torch.zeros_like(trace))
+        return {key: value * inv for key, value in p.items()}
+
+    # Repeated squaring: (M / tr M) ** (2 ** k), renormalised, tends to the projector on the axis.
+    p = normalized(m)
+    for _ in range(_SQUARINGS):
+        p = normalized({(i, j): sum(at(p, i, k) * at(p, k, j) for k in range(d)) for i, j in _pairs(d)})
+    # Its column with the largest diagonal entry is a nonzero multiple of the axis (unless M = 0).
+    column, diagonal = [at(p, i, 0) for i in range(d)], p[(0, 0)]
+    for j in range(1, d):
+        take = p[(j, j)] > diagonal
+        diagonal = torch.where(take, p[(j, j)], diagonal)
+        column = [torch.where(take, at(p, i, j), c) for i, c in enumerate(column)]
+    norm = torch.sqrt(sum(c * c for c in column))
+    inv = torch.where(norm > 0, norm.reciprocal(), torch.zeros_like(norm))
+    axis = [c * inv for c in column]
+    eigenvalue = sum(at(m, i, j) * axis[i] * axis[j] for i in range(d) for j in range(d))
+    length = torch.sqrt(eigenvalue.clamp_min(0))
+    side = sum(w * c for w, c in zip(_HALF_SPACE, axis))
+    length = torch.where(side < 0, -length, length)
+    return [c * length for c in axis]
+
+
+def _average_axis(mean: torch.Tensor, variants, channels) -> None:
+    """Write the variants' mean axis into `channels` (x, y[, z]) of `mean` (B, C, *spatial).
+
+    The variants are averaged as orientation tensors v v^T, in float32 (half-precision
+    products of small components underflow), and reduced to their principal axis. Signs
+    the variants or the network chose do not matter.
+    """
+    d, count = len(channels), len(variants)
+    row_voxels = mean.shape[0] * math.prod(mean.shape[3:])
+    for rows in _row_slabs(mean.shape[2], row_voxels):
+        m = {}
+        for variant in variants:
+            v = [variant[:, c, rows].float() for c in channels]
+            for i, j in _pairs(d):
+                term = v[i] * v[j]
+                m[(i, j)] = term if (i, j) not in m else m[(i, j)].add_(term)
+        axis = principal_axis({key: value.div_(count) for key, value in m.items()}, d)
+        for c, component in zip(channels, axis):
+            mean[:, c, rows] = component
 
 
 def _average_variants(variants, channel_groups) -> torch.Tensor:
     """Mean of the TTA variants (a list, or a tensor stacked on dim 0).
 
-    Sign-ambiguous directions are first aligned with the first variant (in place), and their
-    mean is then put in the fixed half-space `_AXIAL_HALF_SPACE`.
+    Axis heads (directions without a sign, see `is_axis_head`) get the principal axis of the
+    variants' mean orientation tensor instead of the mean of their components.
     """
-    axial = [g['channels'] for g in (channel_groups or []) if g['kind'] == 'axial']
-    for channels in axial:
-        chs = list(channels.values())
-        reference = variants[0]
-        for variant in variants[1:]:
-            _flip_where(variant, chs, _dot32(variant, reference, chs) < 0)
     if torch.is_tensor(variants):
         mean = variants.mean(dim=0)
     else:
         mean = torch.mean(torch.stack(list(variants), dim=0), dim=0)
-    for channels in axial:
-        side = None
-        for (axis,), ch in channels.items():
-            term = mean[:, ch].float() * _AXIAL_HALF_SPACE[axis]
-            side = term if side is None else side.add_(term)
-        _flip_where(mean, list(channels.values()), side < 0)
+    for group in channel_groups or ():
+        if group['kind'] == 'axial':
+            channels = group['channels']
+            _average_axis(mean, variants, [channels[(a,)] for a in (-1, -2, -3) if (a,) in channels])
     return mean
+
+
+def orientation_layouts(axis_channels, num_channels):
+    """Where a blend accumulates the orientation tensors v v^T of its axis heads.
+
+    `axis_channels` holds the (x, y, z) channels of each axis head (see `axis_head_channels`).
+    The diagonal xx, yy, zz goes to the head's own channels, the off-diagonal xy, xz, yz to
+    three extra channels after the `num_channels` output channels. Returns one {(i, j): channel}
+    per head; the accumulator needs `num_channels + 3 * len(axis_channels)` channels (3D).
+    """
+    layouts, extra = [], int(num_channels)
+    for channels in axis_channels:
+        layout = {}
+        for i, j in _pairs(len(channels)):
+            if i == j:
+                layout[(i, i)] = int(channels[i])
+            else:
+                layout[(i, j)], extra = extra, extra + 1
+        layouts.append(layout)
+    return layouts
+
+
+def accumulator_channels(layouts, num_channels):
+    """Channel count of a blend accumulator with these `orientation_layouts`."""
+    return max([int(num_channels)] + [c + 1 for layout in layouts for c in layout.values()])
+
+
+def reduce_orientation_tensors(sums: torch.Tensor, layouts) -> None:
+    """In blended means `sums` (C_acc, Z, Y, X), replace the orientation tensor of each axis
+    head (`orientation_layouts`) by its principal axis, in the head's x, y, z channels."""
+    row_voxels = math.prod(sums.shape[2:])
+    for layout in layouts:
+        d = sum(1 for i, j in layout if i == j)
+        channels = [layout[(i, i)] for i in range(d)]
+        for rows in _row_slabs(sums.shape[1], row_voxels):
+            axis = principal_axis({key: sums[c, rows] for key, c in layout.items()}, d)
+            for c, component in zip(channels, axis):
+                sums[c, rows] = component
 
 
 def infer_with_tta_batched_3d(model, inputs: torch.Tensor,

@@ -17,6 +17,7 @@ import yaml
 from vc_reader.reader import ZarrWriter, open_zarr
 import vesuvius.models
 from vesuvius.models.run import inference, tta
+from vesuvius.models.run.blending import merge_inference_outputs
 from vesuvius.models.run.inference import Inferer
 
 TARGETS = {
@@ -197,9 +198,12 @@ def _peak_bytes(fn):
 
 @pytest.mark.parametrize("helper", ["batched", "sequential"])
 @pytest.mark.parametrize("head", ["normals", "direction"])
-def test_component_transform_keeps_peak_memory(helper, head):
+def test_component_transform_keeps_peak_memory(helper, head, monkeypatch):
     """Undoing the component change works on the variants in place: no extra full-size copies
-    of the output beyond what the plain mirroring average already holds."""
+    of the output beyond what the plain mirroring average already holds. An axis head's
+    orientation tensors are reduced a slab of rows at a time (here one 32 x 32 row), so their
+    float32 temporaries do not grow with the patch."""
+    monkeypatch.setattr(tta, "_SLAB_VOXELS", 32 * 32, raising=False)
     targets = {name: TARGETS[name] for name in ("surface", head)}
     groups = tta.tta_channel_groups(targets, _target_info(targets), 3)
 
@@ -401,3 +405,98 @@ def test_predict_never_reverses_a_signed_nearest_component(tmp_path, monkeypatch
     # the Oracle's direction points inwards: a good part of it lies outside the half-space
     side = 4 * with_tta[2] + 2 * with_tta[3] + with_tta[4]
     assert (side[mask] < -0.5).mean() > 0.3
+
+
+# --- Blending keeps an axis on which overlapping patches agree up to sign ---------------------------
+
+SEAM_VOLUME = (16, 16, 24)  # two 16^3 patches at x = 0 and x = 8 (50% overlap); equal weights at x = 12
+SEAM_VOXEL = (8, 8, 12)
+
+
+def _seam_volume():
+    z, y, x = np.meshgrid(*[np.arange(n, dtype=np.float32) for n in SEAM_VOLUME], indexing="ij")
+    return 0.2 + 0.01 * x + 0.004 * y + 0.002 * z  # a ramp: its slope signs reveal the mirroring
+
+
+class PatchAxes(torch.nn.Module):
+    """An axis per patch, equivariant up to sign: the patch at x = 0 reports `first`, the one at
+    x = 8 `second` (as a `direction` head, or as the direction of a `nearest` head at distance
+    2 and 4), each with a sign that changes with the mirroring."""
+
+    def __init__(self, first, second, head="direction"):
+        super().__init__()
+        self.first, self.second, self.head = torch.tensor(first), torch.tensor(second), head
+
+    def forward(self, x):
+        s = x[:, :1].float()
+        b = s.shape[0]
+        # slope signs of the ramp along x, y, z: -1 where the input was mirrored
+        fx = torch.sign(s[..., 1:] - s[..., :-1]).mean(dim=(1, 2, 3, 4))
+        fy = torch.sign(s[..., 1:, :] - s[..., :-1, :]).mean(dim=(1, 2, 3, 4))
+        fz = torch.sign(s[:, :, 1:] - s[:, :, :-1]).mean(dim=(1, 2, 3, 4))
+        second = s.mean(dim=(1, 2, 3, 4)) > 0.2 + 0.01 * 11.5 + 0.004 * 7.5 + 0.002 * 7.5
+        axis = torch.where(second[:, None], self.second, self.first)
+        axis = axis / axis.norm(dim=1, keepdim=True)
+        frame = axis * torch.stack([fx, fy, fz], dim=1) * (fx * fy * fz)[:, None]
+        out = frame[:, :, None, None, None].expand(b, 3, *s.shape[2:])
+        if self.head == "nearest":
+            distance = torch.where(second, 4.0, 2.0)[:, None, None, None, None].expand_as(s)
+            out = torch.cat([out, distance], dim=1)
+        return {"surface": torch.cat([-s, s], dim=1), self.head: out.contiguous()}
+
+
+SEAM_CASES = {
+    "opposite on the plane": ((1.0, -2.0, 0.0), (-1.0, 2.0, 0.0)),  # 4x + 2y + z = 0
+    "either side of the plane": ((1.0, -1.999, 0.0), (1.0, -2.001, 0.0)),
+    "opposite, tilted": ((1.0, -2.0, 0.05), (-1.0, 2.0, 0.05)),
+}
+
+
+def _predict_staged(tmp_path, monkeypatch, volume, network, targets, patch, name, finalize_config=None, **kwargs):
+    """vesuvius.predict writing patch logits, then vesuvius.blend_logits (or blend_and_finalize)."""
+    (tmp_path / "model.pth").write_bytes(b"")
+    writer = ZarrWriter.create(str(tmp_path / f"{name}_volume.zarr"), shape=volume.shape, chunks=patch,
+                               dtype=np.float32)
+    writer[:] = volume
+
+    def fake_load(self, checkpoint_path):
+        return {"network": network, "patch_size": patch, "num_input_channels": 1,
+                "num_seg_heads": sum(t["out_channels"] for t in targets.values()),
+                "targets": targets, "normalization_scheme": "none"}
+
+    monkeypatch.setattr(inference.Inferer, "_load_train_py_model", fake_load)
+    parts = tmp_path / f"{name}_parts"
+    Inferer(model_path=str(tmp_path / "model.pth"), input_dir=str(tmp_path / f"{name}_volume.zarr"),
+            output_dir=str(parts), model_type="train_py", device="cpu", num_dataloader_workers=0,
+            **kwargs).infer()
+    out = tmp_path / f"{name}.zarr"
+    merge_inference_outputs(str(parts), str(out), num_workers=1, verbose=False, finalize_config=finalize_config)
+    return np.asarray(open_zarr(str(out))[:]), parts
+
+
+@pytest.mark.parametrize("case", list(SEAM_CASES))
+@pytest.mark.parametrize("head", ["direction", "nearest"])
+@pytest.mark.parametrize("do_tta", [True, False])
+def test_blending_keeps_an_axis_the_patches_agree_on_up_to_sign(tmp_path, monkeypatch, do_tta, head, case):
+    """Both blenders average an axis head as the orientation tensor v v^T: at the equally weighted
+    seam voxel two patches that agree on the axis (up to sign, or nearly) add up instead of
+    cancelling. The nearest_component distance is averaged as a scalar."""
+    first, second = SEAM_CASES[case]
+    targets = {"surface": TARGETS["surface"],
+               head: TARGETS["direction"] if head == "direction" else _shipped_nearest_component()}
+    volume, model = _seam_volume(), PatchAxes(first, second, head)
+    in_memory = _predict(tmp_path, monkeypatch, volume, model, targets, (16, 16, 16), "in_memory",
+                         do_tta=do_tta)[2:].astype(np.float32)
+    staged = _predict_staged(tmp_path, monkeypatch, volume, model, targets, (16, 16, 16), "staged",
+                             do_tta=do_tta)[0][2:].astype(np.float32)
+    units = [np.array(v) / np.linalg.norm(v) for v in (first, second)]
+    shared = np.linalg.eigh(sum(np.outer(u, u) for u in units) / 2)[1][:, -1]
+    for name, out in (("in-memory", in_memory), ("staged", staged)):
+        seam = out[(slice(0, 3), *SEAM_VOXEL)]
+        assert np.linalg.norm(seam) > 0.99, f"{name}: length {np.linalg.norm(seam):.5f} at the seam"
+        assert abs(seam @ shared) > 0.99, f"{name}: axis {seam} at the seam"
+        lengths = np.linalg.norm(out[:3, 2:14, 2:14, 2:22], axis=0)
+        assert lengths.min() > 0.99, f"{name}: min length {lengths.min():.5f}"
+        if head == "nearest":
+            assert abs(out[(3, *SEAM_VOXEL)] - 3.0) < 1e-2, f"{name}: distance {out[(3, *SEAM_VOXEL)]}"
+    np.testing.assert_allclose(in_memory, staged, atol=2e-3)
