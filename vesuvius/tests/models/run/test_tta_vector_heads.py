@@ -7,6 +7,7 @@ Jyx Jxx) therefore need more than the spatial un-flip, or the TTA variants cance
 """
 from __future__ import annotations
 
+import subprocess
 import sys
 from pathlib import Path
 
@@ -17,7 +18,7 @@ import yaml
 
 from vc_reader.reader import ZarrWriter, open_zarr
 import vesuvius.models
-from vesuvius.models.run import blending, inference, tta
+from vesuvius.models.run import blending, inference, orientation, tta
 from vesuvius.models.run.blending import merge_inference_outputs
 from vesuvius.models.run.finalize_outputs import FinalizeConfig, finalize_logits
 from vesuvius.models.run.inference import Inferer
@@ -205,7 +206,7 @@ def test_component_transform_keeps_peak_memory(helper, head, monkeypatch):
     of the output beyond what the plain mirroring average already holds. An axis head's
     orientation tensors are reduced a slab of rows at a time (here one 32 x 32 row), so their
     float32 temporaries do not grow with the patch."""
-    monkeypatch.setattr(tta, "_SLAB_VOXELS", 32 * 32, raising=False)
+    monkeypatch.setattr(orientation, "_SLAB_VOXELS", 32 * 32)
     targets = {name: TARGETS[name] for name in ("surface", head)}
     groups = tta.tta_channel_groups(targets, _target_info(targets), 3)
 
@@ -311,6 +312,9 @@ def test_multiclass_finalization_skips_auxiliary_heads():
     assert not is_empty
     assert out.shape == compute_finalized_shape((1, 1, 2), 6, config) == (4, 1, 1, 2)
     assert out[-1].ravel().tolist() == [1, 0]
+    with pytest.raises(ValueError, match="at least 2 class channels"):
+        compute_finalized_shape((1, 1, 2), 4, FinalizeConfig(mode="multiclass", threshold=0.5, is_multi_task=True,
+                                                             target_info=_seg_and_normals_info(1)))
 
 
 def test_finalize_logits_multiclass_skips_auxiliary_heads(tmp_path):
@@ -361,6 +365,11 @@ def _nearest_component(*direction_losses):
     ({**TARGETS["direction"], "losses": [{"name": "SignInvariantCosineLoss"}]}, "axial"),
     ({**TARGETS["direction"], "losses": [{"name": "CosineSimilarityLoss"}]}, "vector"),
     ({**TARGETS["direction"]}, "axial"),
+    ({**TARGETS["direction"], "losses": [{"name": "SignInvariantCosineLoss"}, {
+        "name": "ChannelSelectLoss", "kwargs": {"channels": "last", "base": {"name": "MSELoss"}}}]}, "vector"),
+    ({**TARGETS["nearest"], "losses": [{
+        "name": "ChannelSelectLoss", "kwargs": {"channels": "all_but_last", "base": {"name": "SignInvariantCosineLoss"}}}, {
+        "name": "ChannelSelectLoss", "kwargs": {"channels": [3], "base": {"name": "SmoothL1Loss"}}}]}, "axial"),
 ])
 def test_direction_kind_comes_from_the_training_losses(head, kind):
     targets = {"surface": TARGETS["surface"], "h": head}
@@ -407,6 +416,13 @@ def test_predict_never_reverses_a_signed_nearest_component(tmp_path, monkeypatch
     # the Oracle's direction points inwards: a good part of it lies outside the half-space
     side = 4 * with_tta[2] + 2 * with_tta[3] + with_tta[4]
     assert (side[mask] < -0.5).mean() > 0.3
+
+
+def test_blending_imports_without_torch():
+    """The blending modules import without torch, which the `blending` extra lacks."""
+    code = ("import sys; sys.modules['torch'] = None; "
+            "import vesuvius.models.run.blending, vesuvius.models.run.finalize_outputs")
+    subprocess.run([sys.executable, "-c", code], check=True)
 
 
 # --- Blending keeps an axis on which overlapping patches agree up to sign ---------------------------

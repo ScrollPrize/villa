@@ -9,13 +9,13 @@ from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 
 import numpy as np
-import torch
 from scipy.ndimage import gaussian_filter
 from tqdm.auto import tqdm
 
 from vc_reader.reader import ObjectStore, ZarrWriter, open_zarr
-from vesuvius.models.run.tta import (accumulator_channels, axis_head_channels, orientation_layouts,
-                                     reduce_orientation_tensors)
+from vesuvius.models.run.finalize_outputs import compute_finalized_shape
+from vesuvius.models.run.orientation import (accumulator_channels, axis_head_channels, orientation_layouts,
+                                             reduce_orientation_tensors)
 from vesuvius.utils.io.zarr_utils import mark_zarr_ready, wait_for_zarr_creation
 from vesuvius.utils.k8s import get_tqdm_kwargs
 from vesuvius.utils.cli import HyphenUnderscoreParser
@@ -389,7 +389,7 @@ def _write_blended_chunk(output_store, chunk_info, chunk_logits, chunk_weights, 
     np.divide(chunk_logits, weights_b + epsilon,
               out=chunk_logits, where=weights_b > 0)
     if layouts:
-        reduce_orientation_tensors(torch.from_numpy(chunk_logits), layouts)
+        reduce_orientation_tensors(chunk_logits, layouts)
         chunk_logits = chunk_logits[:num_classes]
 
     if finalize_config is not None:
@@ -604,7 +604,6 @@ def create_blend_output(output_path, original_volume_shape, num_classes, patch_s
     Shared by `merge_inference_outputs` and `InMemoryBlender`, so both write the same layout.
     """
     if finalize_config is not None:
-        from vesuvius.models.run.finalize_outputs import compute_finalized_shape
         output_shape = compute_finalized_shape(original_volume_shape, num_classes, finalize_config)
         output_dtype = np.uint8
         print(f"  Finalized output shape: {output_shape}")
@@ -677,7 +676,7 @@ class InMemoryBlender:
     chunk-aligned slab (see `part_z_range`), so the parts write disjoint chunks.
 
     `axis_channels` lists the (x, y, z) channels of heads whose direction has no sign
-    (`tta.axis_head_channels`); they are blended as orientation tensors, which takes three
+    (`axis_head_channels`); they are blended as orientation tensors, which takes three
     more float32 sums per head.
     """
 
@@ -769,6 +768,8 @@ class InMemoryBlender:
         Part 0 publishes readiness only after creation completes, including on an empty slab.
         """
         self._output_chunks(chunk_size)  # Validate the slab before replacing an existing output.
+        if finalize_config is not None:  # Every part rejects inputs it cannot finalize.
+            compute_finalized_shape(self.volume_shape, self.num_classes, finalize_config)
         if self.z_range is not None and (not run_id or not run_id.strip()):
             raise ValueError("Split in-memory blending requires a non-empty run_id shared by all parts.")
         if create:
@@ -927,6 +928,8 @@ def merge_inference_outputs(
         if hasattr(part0_logits_store, 'attrs'):
             finalize_config.is_multi_task = part0_logits_store.attrs.get('is_multi_task', False)
             finalize_config.target_info = part0_logits_store.attrs.get('target_info', None)
+        # Every part rejects inputs it cannot finalize before touching the output.
+        compute_finalized_shape(original_volume_shape, num_classes, finalize_config)
 
         print(f"Fused blend+finalize mode: {finalize_config.mode}, threshold={finalize_config.threshold}")
 

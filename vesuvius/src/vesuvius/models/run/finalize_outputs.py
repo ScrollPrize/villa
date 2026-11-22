@@ -38,6 +38,14 @@ def class_channels(num_classes, config: FinalizeConfig):
     return list(range(num_classes))
 
 
+def multiclass_scores(num_classes, config: FinalizeConfig):
+    """Number of class channels in multiclass mode, which needs at least two."""
+    num_scores = len(class_channels(num_classes, config))
+    if num_scores < 2:
+        raise ValueError(f"Multiclass mode expects at least 2 class channels, but input has {num_scores}.")
+    return num_scores
+
+
 def apply_finalization(logits_np, num_classes, config: FinalizeConfig):
     """
     Apply softmax + mode logic to normalized logits, producing uint8 output.
@@ -186,10 +194,11 @@ def compute_finalized_shape(spatial_shape, num_classes, config: FinalizeConfig):
         else:
             return (1, *spatial_shape)
     else:  # multiclass
+        num_scores = multiclass_scores(num_classes, config)
         if threshold:
             return (1, *spatial_shape)
         else:
-            return (len(class_channels(num_classes, config)) + 1, *spatial_shape)
+            return (num_scores + 1, *spatial_shape)
 
 
 def process_chunk(chunk_info, input_path, output_path, mode, threshold, num_classes, spatial_shape, output_chunks, is_multi_task=False, target_info=None):
@@ -314,9 +323,7 @@ def finalize_logits(
         elif num_classes == 1:
             print("Detected single-channel binary logits. Using sigmoid finalization (or thresholded mask with --threshold).")
     elif mode == "multiclass":
-        num_scores = len(class_channels(num_classes, FinalizeConfig(is_multi_task=is_multi_task, target_info=target_info)))
-        if num_scores < 2:
-            raise ValueError(f"Multiclass mode expects at least 2 class channels, but input has {num_scores}.")
+        num_scores = multiclass_scores(num_classes, FinalizeConfig(is_multi_task=is_multi_task, target_info=target_info))
         if num_scores < num_classes:
             print(f"Class scores: {num_scores} segmentation channels (auxiliary heads left out)")
     

@@ -24,7 +24,8 @@ from vc_reader.reader import ObjectStore, ZarrWriter, open_zarr
 from pathlib import Path
 from vesuvius.models.build.build_network_from_config import NetworkFromConfig
 from vesuvius.models.run.external_models.load_resnet import try_load_external_resnet34_model
-from vesuvius.models.run.tta import axis_head_channels, infer_with_tta, is_axis_head, tta_channel_groups
+from vesuvius.models.run.orientation import axis_head_channels
+from vesuvius.models.run.tta import infer_with_tta, is_axis_head, tta_channel_groups
 from vesuvius.models.run.patch_writer import BoundedPatchWriter
 from vesuvius.models.run.blending import InMemoryBlender, part_z_range, patches_in_z_range
 from vesuvius.utils.k8s import get_tqdm_kwargs
