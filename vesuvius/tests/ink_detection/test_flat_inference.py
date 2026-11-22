@@ -339,6 +339,7 @@ def test_cli_aliases_folder_shorthand_and_segment_resolution(tmp_path):
     assert args.compile_model is False
     assert parse_args([]).compile_model is False
     assert parse_args(["--compile"]).compile_model is True
+    assert parse_args(["--compile-mode", "max-autotune"]).compile_model is True
     shorthand = normalize_inference_paths(
         parse_args(["--folder", str(tmp_path), "weights.pth"])
     )

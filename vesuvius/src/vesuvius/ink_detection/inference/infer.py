@@ -1718,10 +1718,14 @@ def parse_args(argv: Sequence[str] | None = None):
     )
     parser.add_argument("--gpus")
     parser.add_argument("--compile", dest="compile_model", action="store_true")
-    parser.add_argument("--compile-mode", default="reduce-overhead")
+    parser.add_argument("--compile-mode")
     parser.add_argument("--no-compile", dest="compile_model", action="store_false")
-    parser.set_defaults(compile_model=False)
+    parser.set_defaults(compile_model=None)
     args = parser.parse_args(argv)
+    if args.compile_model is None:
+        args.compile_model = args.compile_mode is not None
+    if args.compile_mode is None:
+        args.compile_mode = "reduce-overhead"
     if args.num_workers < 0:
         parser.error("--num-workers must be nonnegative")
     if args.prefetch_factor <= 0:
