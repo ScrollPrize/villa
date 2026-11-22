@@ -18,6 +18,6 @@ endif()
 # Only when the exported detectors link OpenMP: on macOS a build with the
 # Python module may have found none, and its detectors are then serial.
 if(@VC_OBJECT_STORE_DETECTORS_OPENMP@)
-    find_dependency(OpenMP)
+    find_dependency(OpenMP COMPONENTS CXX)
 endif()
 include("${CMAKE_CURRENT_LIST_DIR}/vc_object_storeTargets.cmake")
