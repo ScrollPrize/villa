@@ -5,8 +5,9 @@ Average the teacher models' predictions on target segments, then label only what
   ink        - mean probability >= ``hi``;
   background - ``background="max"``: every teacher <= ``lo`` and the pixel is more than ``margin`` px (Euclidean) from any
                weak ink candidate (mean >= ``candidate``); ``background="mean"``: the mean <= ``lo``;
-  ignored    - everything else (supervision mask 0, so it adds no loss), and everything outside the papyrus (mid-plane of
-               the surface volume is 0, eroded by ``erode`` px so render edges are not used).
+  ignored    - everything else (supervision mask 0, so it adds no loss), everything outside the papyrus (mid-plane of
+               the surface volume is 0, eroded by ``erode`` px so render edges are not used), and every pixel that
+               any teacher predicts as 0 (read as no prediction, e.g. outside inference's ``--mask-path``).
 
 The flat recipe trains with BCE label smoothing 0.5, so its outputs lie in [0.25, 0.75] and 0.5 is the decision point;
 the defaults (hi 0.50, lo 0.30) are set for that. Output, per segment, in the layout ``find_segment_patches`` reads:
@@ -93,18 +94,24 @@ def build_segment(out_root: Path, name: str, surface_volume: str, predictions: l
     volume = open_node(f"{surface_volume}/0")
     depth = int(volume.shape[0])
     papyrus = np.asarray(volume[depth // 2]) > 0
+    covered = np.ones(papyrus.shape, bool)
     mean = np.zeros(papyrus.shape, np.float32)
     top = np.zeros(papyrus.shape, np.float32)
     for path in predictions:
         p = tifffile.imread(path).astype(np.float32) / 255.0
         if p.shape != papyrus.shape:
             raise ValueError(f"{path}: prediction {p.shape} does not match the surface volume {papyrus.shape}")
+        covered &= p > 0
         mean += p
         np.maximum(top, p, out=top)
     mean /= len(predictions)
-    ink, supervision = pseudo_label_masks(mean, top, papyrus, **rule)
+    ink, supervision = pseudo_label_masks(mean, top, papyrus & covered, **rule)
     seg_dir = out_root / name
     seg_dir.mkdir(parents=True, exist_ok=True)
+    # Without a supervision store the trainer rejects the segment instead of pairing new ink with old supervision.
+    old_supervision = seg_dir / f"{name}_supervision_mask.zarr"
+    if old_supervision.exists():
+        shutil.rmtree(old_supervision)
     attrs = {"format": "ink-pseudo-labels-v1", "case": name, "annotation_center_channel": depth // 2,
              "output_channels": depth, "teachers": predictions, "surface_volume": surface_volume, **rule}
     _write_label(seg_dir / f"{name}_inklabels.zarr", ink.astype(np.uint8) * 255, depth, attrs)
@@ -128,7 +135,7 @@ def main(argv=None) -> int:
     a = ap.parse_args(argv)
     rule = {"hi": a.hi, "lo": a.lo, "background": a.background, "margin": a.margin, "candidate": a.candidate,
             "erode": a.erode}
-    group = {"segments_path": str(a.out_root), "segments": [], "surface_volume_paths": {}}
+    group = {"segments_path": str(a.out_root), "volume_scale": 0, "segments": [], "surface_volume_paths": {}}
     for spec in a.segment:
         if len(spec) < 3:
             ap.error("--segment needs NAME SURFACE_VOLUME and at least one prediction")

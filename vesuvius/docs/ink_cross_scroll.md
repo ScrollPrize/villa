@@ -42,10 +42,10 @@ single-model seed mean 0.763 -> 0.790) at ~4x inference cost. Averaging three de
 
 A registered pooled/native pair of the same surface (PHerc 0814 segment 46527) shows the native render is, to first
 order, the pooled one blurred over ~3 depth planes and slightly in-plane, plus smooth low-frequency intensity differences
-(`scan_transfer_fit.py`: R^2 0.707 vs 0.580 for resampling alone on held-out 256 px spatial blocks with a guard band;
-0.711 vs 0.590 on randomly held-out pixels, so neighbouring-pixel leakage is negligible; three PHerc 0846A pairs give
-the same picture). The augmentation applies that kernel plus a matching smooth random field to a share of the training
-samples:
+(R^2 0.707 vs 0.580 for resampling alone on held-out 256 px spatial blocks with a guard band, a check outside
+`scan_transfer_fit.py`; 0.711 vs 0.590 on randomly held-out pixels, the split `scan_transfer_fit.py` uses, so
+neighbouring-pixel leakage is negligible; three PHerc 0846A pairs give the same picture). The augmentation applies
+that kernel plus a matching smooth random field to a share of the training samples:
 
 ```json
 "scan_transfer": {"enabled": true, "kernel": "builtin:pooled_to_native_pherc0814", "probability": 0.5,

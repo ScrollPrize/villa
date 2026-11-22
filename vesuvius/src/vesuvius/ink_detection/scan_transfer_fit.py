@@ -5,7 +5,8 @@ and from a native 8.6-9.4 um scan (28 planes). Steps: warp every pooled plane on
 offset; found by a scale grid with phase correlation unless given), match depth (pooled plane best correlated with each
 native plane), robust-standardise both on papyrus, then least squares for one 3D kernel ``K`` (kz x kxy x kxy) with
 ``native[i] ~ sum_dz,dy,dx K * pooled[i + offset + dz, y + dy, x + dx]`` over random papyrus pixels near the surface.
-Reports held-out R^2 against plain resampling and writes ``{"kernel": ..., "fit": ...}`` JSON for ``load_kernel``.
+Reports R^2 on randomly held-out pixels (overlapping neighbourhoods, not a spatial split) against plain resampling
+and writes ``{"kernel": ..., "fit": ...}`` JSON for ``load_kernel``.
 
 The shipped ``builtin:pooled_to_native_pherc0814`` came from PHerc 0814 segment 46527 (held-out R^2 0.740 vs 0.623 for
 resampling alone): depth weights -0.09 / 0.27 / 0.43 / 0.37 / 0.07, mild in-plane blur, no sharpening; the residual is

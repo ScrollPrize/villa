@@ -108,4 +108,5 @@ class CoordPatchDataset(Dataset):
             "inklabels": torch.zeros_like(image_tensor),
             "supervision_mask": mask_tensor.clone(),
             "is_unlabeled": torch.tensor(False, dtype=torch.bool),
+            "dataset_idx": torch.tensor(-1, dtype=torch.long),
         }
