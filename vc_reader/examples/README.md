@@ -68,6 +68,9 @@ your build targets one type of GPU (NVIDIA or AMD).
 
 For Python, nothing changes: you still write `backend='cuda'`, and PyTorch still
 calls the GPU `'cuda'`, even on AMD. Do not look for `backend='hip'`: there is none.
+On AMD, if you write your own script, import PyTorch before vc_reader.
+Otherwise two copies of libamdhip64 are loaded and PyTorch fails with
+"device kernel image is invalid".
 
 Tested on an RX 9060 XT (gfx1200) with ROCm 7.2.4, under WSL2 (Ubuntu on Windows).
 
