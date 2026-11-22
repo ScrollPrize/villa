@@ -11,7 +11,7 @@
 template<class F>
 vc::objects::VersionSelection storeAct(vc::objects::ObjectStore& store, const vc::objects::VersionSelection& expected, F&& fn)
 {
-    auto txn = store.write(expected);
+    auto txn = store.writeNumbered(expected);
     fn(store, txn);
     txn.commit();
     return txn.receipt()->objects;

@@ -659,34 +659,20 @@ def _store_uploaded_object(body: dict[str, Any]) -> dict[str, str]:
         raise
 
 
-def _is_surface_ref(ref: Any) -> bool:
-    """A stored surface: {"type": "surface", "uuid": ...}, at a numbered version with "generation" and "version"."""
-    return isinstance(ref, dict) and ref.get("type") == "surface"
-
-
 def _require_store() -> stored_surfaces.StoreSession:
     if _store is None:
         raise ValueError("stored surface references need a service started with --store")
     return _store
 
 
-def _stored_surface_path(ref: dict[str, Any]) -> str:
-    """The fit's reference to a stored surface (read from the service store)."""
-    _require_store()
-    if "revision" in ref:
-        raise ValueError("stored surface references select a numbered version (generation and version), not a revision")
-    version = ref.get("version")
-    if version is None:
-        return stored_surfaces.surface_ref(str(ref.get("uuid") or ""))
-    return stored_surfaces.surface_ref(str(ref.get("uuid") or ""), (str(ref.get("generation") or ""), int(version)))
-
-
-def _stored_model_path(ref: dict[str, Any]) -> Path:
+def _stored_model_path(ref: dict[str, Any] | str) -> Path:
     """The model checkpoint a fit published with a stored surface (its ``model.pt`` artifact), as a local copy in
     the service's object cache."""
-    path = _require_store().artifact_file(str(ref.get("uuid") or ""), "model.pt", _object_store_root() / "artifacts")
+    store = _require_store()
+    reference = store.decode_reference(ref)
+    path = store.artifact_file(reference, "model.pt", _object_store_root() / "artifacts")
     if path is None:
-        raise ValueError(f"surface {ref.get('uuid')} has no Lasagna model")
+        raise ValueError(f"surface {reference['object']} has no Lasagna model")
     return path
 
 
@@ -703,6 +689,7 @@ def _stored_corr_points(uuids: list[Any], volume: str | None, target_scale: floa
         collection = dict(stored["source"])
         collection["uuid"] = stored["uuid"]
         collection["name"] = stored["name"]
+        collection["reference"] = stored["reference"]
         collection["points"] = {
             str(point_id): {**(annotation if isinstance(annotation, dict) else {}), "p": list(point)}
             for point_id, point, annotation in zip(stored["ids"], stored["points"], stored["annotations"])}
@@ -754,7 +741,7 @@ def _resolve_lasagna_atlas_ref(ref_raw: Any) -> dict[str, Any]:
     base = resolved.get("base")
     if not isinstance(base, dict) or not isinstance(base.get("ref"), dict):
         raise ValueError("atlas JSON requires base.ref")
-    base["path"] = (_stored_surface_path(base["ref"]) if _is_surface_ref(base["ref"])
+    base["path"] = (_require_store().decode_reference(base["ref"]) if stored_surfaces.is_surface_ref(base["ref"])
                     else str(_resolve_object_ref(base["ref"])))
 
     objects = resolved.get("objects")
@@ -952,7 +939,7 @@ def _set_snap_surf_map_debug_obj_dir(cfg: dict[str, Any], out_dir: str) -> None:
                     map_args["debug_obj_dir"] = out_dir
 
 
-def _single_external_surface_path(cfg: dict[str, Any], *, consumer: str) -> str:
+def _single_external_surface_path(cfg: dict[str, Any], *, consumer: str) -> str | dict:
     external_surfaces = cfg.get("external_surfaces")
     if not isinstance(external_surfaces, list) or len(external_surfaces) != 1:
         count = len(external_surfaces) if isinstance(external_surfaces, list) else 0
@@ -960,7 +947,7 @@ def _single_external_surface_path(cfg: dict[str, Any], *, consumer: str) -> str:
     surface = external_surfaces[0]
     if not isinstance(surface, dict) or not surface.get("path"):
         raise ValueError(f"{consumer} external_surfaces[0] requires path")
-    return str(surface["path"])
+    return surface["path"]
 
 
 def _wire_external_surface_for_request(
@@ -1037,6 +1024,7 @@ def _body_with_resolved_job_spec(body: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("job_spec.config must be an object")
     resolved = dict(body)
     resolved_cfg = dict(cfg)
+    input_references = []
     external_surfaces_raw = resolved_cfg.get("external_surfaces")
     if external_surfaces_raw is not None:
         if not isinstance(external_surfaces_raw, list):
@@ -1046,8 +1034,9 @@ def _body_with_resolved_job_spec(body: dict[str, Any]) -> dict[str, Any]:
             if not isinstance(surface_raw, dict):
                 raise ValueError(f"job_spec.config.external_surfaces[{i}] must be an object")
             surface = dict(surface_raw)
-            if _is_surface_ref(surface):
-                surface["path"] = _stored_surface_path(surface)
+            if stored_surfaces.is_surface_ref(surface):
+                surface["path"] = _require_store().decode_reference(surface)
+                input_references.append(surface["path"])
             elif all(k in surface for k in ("type", "name", "hash")):
                 surface["path"] = str(_resolve_object_ref(surface))
             external_surfaces.append(surface)
@@ -1059,12 +1048,16 @@ def _body_with_resolved_job_spec(body: dict[str, Any]) -> dict[str, Any]:
             raise ValueError("job_spec.config.corr_point_collections must be a list of UUIDs")
         resolved_cfg["corr_points"] = _stored_corr_points(
             collection_uuids, _request_store_volume(body), _request_voxel_scale(body))
+        input_references.extend(collection["reference"] for collection in resolved_cfg["corr_points"]["collections"].values())
 
     model_ref = spec.get("model")
     model_object_refs: dict[str, Any] | None = None
     if model_ref not in (None, {}, ""):
+        if stored_surfaces.is_surface_ref(model_ref):
+            model_ref = _require_store().decode_reference(model_ref)
+            input_references.append(model_ref)
         resolved_model_path = str(
-            _stored_model_path(model_ref) if _is_surface_ref(model_ref) else _resolve_object_ref(model_ref))
+            _stored_model_path(model_ref) if stored_surfaces.is_surface_ref(model_ref) else _resolve_object_ref(model_ref))
         resolved["model_input"] = resolved_model_path
         model_object_refs = _checkpoint_object_refs(resolved_model_path)
 
@@ -1081,6 +1074,7 @@ def _body_with_resolved_job_spec(body: dict[str, Any]) -> dict[str, Any]:
         atlas_ref = model_atlas_ref
 
     effective_job_spec = {
+        "input_references": input_references,
         "model": spec.get("model"),
         "atlas": atlas_ref,
         "linked_surfaces": spec.get("linked_surfaces", []),
@@ -1093,6 +1087,8 @@ def _body_with_resolved_job_spec(body: dict[str, Any]) -> dict[str, Any]:
 
     if atlas_ref not in (None, {}, ""):
         resolved_cfg["atlas"] = _resolve_lasagna_atlas_ref(atlas_ref)
+        if stored_surfaces.is_surface_ref(resolved_cfg["atlas"]["base"]["path"]):
+            input_references.append(resolved_cfg["atlas"]["base"]["path"])
 
     linked_refs = spec.get("linked_surfaces", [])
     if linked_refs is None:
@@ -2488,7 +2484,7 @@ class _Handler(BaseHTTPRequestHandler):
         try:
             tmp_dir = tempfile.mkdtemp(prefix="fit_vis_")
 
-            if _is_surface_ref(body.get("model")):
+            if stored_surfaces.is_surface_ref(body.get("model")):
                 model_input = str(_stored_model_path(body["model"]))
             elif model_data:
                 model_bytes = base64.b64decode(model_data)

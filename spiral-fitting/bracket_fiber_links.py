@@ -486,7 +486,7 @@ def plan_edits(fibers: dict[str, Fiber], links: list[PlannedLink], *, pending: b
 
 
 def verify_documents(docs: dict[str, dict], fibers: dict[str, Fiber]):
-    """Structural checks mirroring VC3D's and the fitter's loaders."""
+    """Structural checks mirroring VC3D's fiber loader."""
     from vc3d_fiber_format_adapter import parse_vc3d_fiber_format
     all_docs = {name: fibers[name].data for name in fibers}
     all_docs.update(docs)
@@ -661,17 +661,6 @@ def main(fibers_dir, umbilicus_path, coordinate_scale, theta_bin, z_tolerance, m
     if problems:
         raise click.ClickException('refusing to write: verification problems above')
     _write_documents(docs, fibers, fibers_dir, apply, backup_dir)
-    if not docs:
-        return
-
-    # Final check through the fitter's own loader and link resolution.
-    from spiral_helpers import load_fiber_point_collections, resolve_fiber_links
-    collections, _ = load_fiber_point_collections(fibers_dir, 0, min_point_spacing=40.0)
-    for pcl in collections.values():
-        pcl['file_basename'] = os.path.basename(pcl['source_file'])
-    resolved = resolve_fiber_links(collections, include_pending=True, assume_unannotated=True)
-    print(f'fitter link resolution after write: {len(resolved)} links '
-          f'({sum(1 for l in resolved if l["pending"])} pending)')
 
 
 if __name__ == '__main__':

@@ -8,6 +8,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -26,6 +27,7 @@ public:
         // Samples the level on the GPU, when the settings turn GPU viewer sampling on
         // and the level is uint8; null otherwise. Every viewer samples through it.
         std::shared_ptr<vcr::reader_cuda::Reader> cuda;
+        std::optional<std::int64_t> channel;
     };
 
     // gpuCacheBytes > 0 samples on the GPU, keeping up to that many bytes resident in
@@ -78,6 +80,6 @@ private:
     std::size_t gpuCacheBytes_ = 0;
     std::shared_ptr<vcr::reader_cuda::Pool> gpuPool_;  // before readers_: they release into it
     std::map<std::pair<std::string, int>, std::shared_ptr<vcr::zarr::OpenedArray>> levels_;  // (location, level)
-    std::map<const vcr::Array*, std::shared_ptr<vcr::reader_cuda::Reader>> readers_;
+    std::map<std::pair<const vcr::Array*, std::optional<std::int64_t>>, std::shared_ptr<vcr::reader_cuda::Reader>> readers_;
     std::map<std::pair<std::string, int>, Pyramid> pyramids_;  // (location, working base): levels are renumbered from the base
 };

@@ -1,5 +1,6 @@
 #include "DraftCheckpoints.hpp"
 #include "internal/SurfaceDrafts.hpp"
+#include "internal/ObjectVersionJson.hpp"
 
 #include <vc_reader/native/atomic_file.hpp>
 
@@ -33,13 +34,13 @@ void writeDurably(const std::filesystem::path& path, const void* data, std::size
 Json versionJson(const std::optional<ObjectVersion>& v)
 {
     if (!v) return nullptr;
-    return {{"store", v->storeUuid}, {"generation", v->generation}, {"object", v->objectUuid}, {"version", v->version}};
+    return objectVersionJson(*v);
 }
 
 std::optional<ObjectVersion> versionFrom(const Json& j)
 {
     if (j.is_null()) return std::nullopt;
-    return ObjectVersion{j.at("store"), j.at("generation"), j.at("object"), j.at("version")};
+    return objectVersionFrom(j);
 }
 
 template <class T> Json nullable(const std::optional<T>& value) { return value ? Json(*value) : Json(nullptr); }
@@ -116,7 +117,7 @@ DraftDirectory::Loaded DraftDirectory::load()
         draft.submittedAsStored = d.at("submitted_as_stored");
         loaded.drafts.push_back(std::move(draft));
     }
-    for (const auto& p : manifest.at("pending"))
+    for (const auto& p : jsonArrayField(manifest, "pending"))
         loaded.pending.push_back({p.at("request"), p.at("store"), p.at("drafts").get<std::map<std::string, uint64_t>>()});
     return loaded;
 }

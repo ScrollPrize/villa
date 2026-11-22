@@ -24,7 +24,6 @@ def test_real_pipeline_balances_aligned_chunks_and_matches_serial(tmp_path, monk
     product = tiled.OutputProductSpec(name='identity', channels=('value',),
         level=0, scaledown=1, inference_scaledown=1, chunk_size=64)
     volume = np.random.default_rng(8).integers(1, 255, (128, 128, 128), dtype=np.uint8)
-    monkeypatch.setattr(tiled, '_input_has_chunks', lambda *args, **kwargs: True)
     outputs = []
     for workers in (0, 4):
         output = Output()

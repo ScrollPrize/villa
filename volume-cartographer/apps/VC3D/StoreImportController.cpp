@@ -153,7 +153,7 @@ bool StoreImportController::start(StoreImportRequest request,
                                                      request.coordinates, request.tags, request.options, cancel.get());
         } catch (const std::exception& error) {
             Report report;
-            report.problems.push_back(error.what());
+            report.fatalError = error.what();
             return report;
         }
     }));

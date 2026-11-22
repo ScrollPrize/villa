@@ -18,6 +18,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <functional>
 #include <iostream>
 #include <string>
 #include <thread>
@@ -195,6 +196,19 @@ void localRequests(const TemporaryDirectory& directory)
         require(retried.commitSequence && *retried.commitSequence == before + 1, "re-prepared, it commits");
     }
 
+    // Caller pins, then an edit happens before detection takes its snapshot.
+    {
+        auto stale = request(status(), plan());
+        { auto txn = db.read(); expectObject(stale, db.currentObjectRevision(txn, fixture.a)->reference()); }
+        { auto txn = db.write(); db.setMeta(txn, fixture.a, "note", R"("changed before detection")"); txn.commit(); }
+        const auto before = status().commitSequence;
+        bool conflicted = false;
+        try { db.submit(stale); } catch (const TransactionConflict& conflict) {
+            conflicted = conflict.reason() == TransactionConflict::Reason::Version;
+        }
+        require(conflicted && status().commitSequence == before, "caller-to-preparation race is retryable and writes nothing");
+    }
+
     // Prepared, then an unrelated commit: the links commit without waiting.
     {
         const auto unrelated = request(status(), plan());
@@ -298,6 +312,46 @@ void localRequests(const TemporaryDirectory& directory)
         const auto back = transactionRequestFromJson(text, {});
         require(transactionRequestDigest(back) == transactionRequestDigest(r), "link_objects has a canonical encoding");
         require(links::linkPlanJson(links::linkPlanFromJson(links::linkPlanJson(plan()))) == links::linkPlanJson(plan()), "plan JSON round-trips");
+    }
+}
+
+// A prepared link operation applied in a caller's own transaction: when it
+// fails part way, the transaction cannot be committed, so no link written
+// before the failure survives a caller that catches the error.
+struct StopWriting : std::runtime_error { using std::runtime_error::runtime_error; };
+void failedApplyCannotCommit(const TemporaryDirectory& directory)
+{
+    OpenOptions options; options.author = "links-test";
+    auto db = ObjectStore::create(directory.path / "failed-apply.vcobj", options);
+    populate(db);
+    const auto operation = links::linkObjectsOperation(plan());
+    // After the first link of the first detector, and after every link,
+    // before the marker.
+    const std::vector<std::function<bool(const util::ProgressUpdate&)>> failures{
+        [](const util::ProgressUpdate& update) {
+            return std::string(update.stage).find("writing links") != std::string::npos && update.completed == 1 && update.total == 2;
+        },
+        [](const util::ProgressUpdate& update) { return update.stage == "publishing the link marker"; }};
+    for (const auto& fails : failures) {
+        PrepareOptions prepare;
+        prepare.progress = [&fails](const util::ProgressUpdate& update) {
+            if (fails(update)) throw StopWriting("stop");
+        };
+        const auto prepared = links::prepareLinkObjects(db, operation, prepare);
+        bool failed = false, committed = false;
+        {
+            auto txn = db.write();
+            try { prepared.apply(db, txn); } catch (const StopWriting&) { failed = true; }
+            require(failed, "the apply fails part way");
+            try { txn.commit(); committed = true; } catch (const std::exception&) {}
+        }
+        require(!committed, "a transaction whose link apply failed cannot commit");
+        require(edgeCount(db, "point-surface") == 0 && edgeCount(db, "same-surface") == 0,
+                "no link of a failed apply is stored");
+        auto txn = db.write();
+        ObjectRecord record; record.kind = "note";
+        db.upsertObject(txn, record);
+        txn.commit();  // the failure does not outlive its transaction
     }
 }
 
@@ -448,6 +502,7 @@ try {
     installSlowPreparer();
     TemporaryDirectory directory;
     localRequests(directory);
+    failedApplyCannotCommit(directory);
 #ifdef VC_LINK_OBJECTS_TEST_HOSTED
     hostedRequests(directory);
 #endif

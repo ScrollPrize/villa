@@ -127,6 +127,40 @@ TEST_CASE("viewer levels and level choice")
     CHECK(g.scale[0] * 4.5 + g.offset[0] == doctest::Approx(2.0));
 }
 
+TEST_CASE("named packed channel views share CPU arrays and select independent scalar values")
+{
+    Fixture f;
+    const auto path = f.dir / "packed.zarr";
+    vcr::zarr::CreateOptions options;
+    options.shape = {3, 8, 8, 8};
+    options.chunks = options.shape;
+    options.compressor = "";
+    vcr::zarr::Writer::create(path, options);
+    std::vector<std::uint8_t> bytes(3 * 8 * 8 * 8);
+    for (std::size_t c = 0; c < 3; ++c)
+        std::fill_n(bytes.data() + c * 512, 512, std::uint8_t(30 + c * 80));
+    vcr::zarr::Writer::open(path).writeRegion({0,0,0,0}, options.shape, bytes.data());
+    const auto source = Volume::New(path);
+    OpenedVolumes cache(8 << 20);
+    vcr::Array* shared = nullptr;
+    for (std::int64_t c = 0; c < 3; ++c) {
+        const auto view = source->channelView(c, "channel" + std::to_string(c));
+        const auto levels = vc3d::openViewerLevels(cache, *view);
+        auto request = levels.request(0, 0);
+        REQUIRE(request.levels.size() == 1);
+        CHECK(request.levels[0].channel == c);
+        if (shared) CHECK(request.levels[0].array == shared);
+        shared = request.levels[0].array;
+        const auto frame = planeAt(2, 4, 4);
+        vcr::grid::Pending pending;
+        vcr::grid::sampleCached(frame, request, &pending);
+        if (c) CHECK(pending.empty());
+        vcr::grid::load(pending);
+        const auto sampled = vcr::grid::sampleCached(frame, request, nullptr);
+        for (const auto value : sampled.values) CHECK(value == doctest::Approx(30 + c * 80));
+    }
+}
+
 TEST_CASE("flattened LOD follows the actual voxel spacing of the surface")
 {
     Fixture f;

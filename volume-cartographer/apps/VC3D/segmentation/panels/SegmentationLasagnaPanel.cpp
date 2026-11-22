@@ -30,6 +30,7 @@
 #include <QHeaderView>
 #include <QJsonArray>
 #include <QJsonDocument>
+#include <vc_object_store/objects/TransactionJson.hpp>
 #include <QJsonObject>
 #include <QLabel>
 #include <QLineEdit>
@@ -1632,8 +1633,8 @@ SegmentationLasagnaPanel::startOptimizationWithOverrides(
         for (qsizetype i = 0; i < linkedSurfaces.size(); ++i) {
             QJsonObject link = linkedSurfaces[i].toObject();
             if (link[QStringLiteral("uuid")].toString() == QString::fromStdString(activeUuid) && revision) {
-                link[QStringLiteral("generation")] = QString::fromStdString(revision->generation);
-                link[QStringLiteral("version")] = static_cast<qint64>(revision->version);
+                link[QStringLiteral("reference")] = QJsonDocument::fromJson(QByteArray::fromStdString(
+                    vc::objects::objectVersionToJson(revision->reference()))).object();
                 linkedSurfaces[i] = link;
             }
         }

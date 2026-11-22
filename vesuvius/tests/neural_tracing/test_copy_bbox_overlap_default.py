@@ -7,6 +7,7 @@ validation logic, not just the source text's default declaration.
 
 import argparse
 import ast
+import json
 import math
 import os
 from pathlib import Path
@@ -26,7 +27,7 @@ REQUIRED_ARGS = [
 ]
 
 
-def _run_production_parser(extra_argv):
+def _run_production_parser(extra_argv, required_args=REQUIRED_ARGS):
     tree = ast.parse(SOURCE.read_text(encoding="utf-8"), filename=str(SOURCE))
     functions = [
         node for node in tree.body
@@ -39,6 +40,7 @@ def _run_production_parser(extra_argv):
     module = ast.fix_missing_locations(ast.Module(body=functions, type_ignores=[]))
     namespace = {
         "argparse": argparse,
+        "json": json,
         "os": os,
         "torch": SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False)),
         "np": SimpleNamespace(isfinite=math.isfinite),
@@ -51,7 +53,7 @@ def _run_production_parser(extra_argv):
         "is_auto_displacement_scale": lambda value: str(value).lower() == "auto",
     }
     exec(compile(module, str(SOURCE), "exec"), namespace)
-    return namespace["parse_args"](REQUIRED_ARGS + list(extra_argv))
+    return namespace["parse_args"](required_args + list(extra_argv))
 
 
 def test_copy_bbox_overlap_default_is_half():
@@ -64,6 +66,17 @@ def test_copy_bbox_overlap_allows_legacy_explicit_zero():
 
 def test_copy_bbox_overlap_allows_explicit_custom_value():
     assert _run_production_parser(["--bbox-overlap", "0.25"]).bbox_overlap == pytest.approx(0.25)
+
+
+def test_copy_parser_decodes_surface_reference():
+    reference = {"store": "source", "generation": "history", "object": "surface", "version": 3}
+    store_args = [
+        "--store", "example.vcobj", "--surface", "surface", "--volume-uuid", "volume",
+        "--volume-path", "example.zarr", "--checkpoint-path", "checkpoint.pth",
+    ]
+    assert _run_production_parser(
+        ["--surface-reference", json.dumps(reference)], required_args=store_args
+    ).surface_reference == reference
 
 
 @pytest.mark.parametrize("invalid", ["-0.01", "1.0", "1.5", "nan", "NaN", "inf", "-inf", "not-a-number"])

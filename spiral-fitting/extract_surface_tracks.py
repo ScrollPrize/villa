@@ -47,7 +47,6 @@ import importlib.util
 import os
 import pickle
 import re
-import sys
 
 import numpy as np
 
@@ -76,12 +75,14 @@ _PLACEHOLDER = re.compile(r'<[^<>/]+>')
 
 
 def open_predictions(path):
-    """Open the predictions array read-only with vesuvius's ``open_zarr`` (local path or URL)."""
-    vesuvius_src = f'{os.path.dirname(os.path.abspath(__file__))}/../vesuvius/src'
-    if vesuvius_src not in sys.path:
-        sys.path.insert(0, vesuvius_src)
-    from vesuvius.data.utils import open_zarr
-    return open_zarr(path, mode='r')
+    """Open the predictions array read-only with zarr: a local path, an http(s) URL, or an
+    s3:// URL read with the environment's AWS credentials."""
+    import zarr
+    if path.startswith('s3://'):
+        return zarr.open_array(path, mode='r', storage_options={'anon': False})
+    if path.startswith(('http://', 'https://')):
+        return zarr.open_array(path, mode='r', storage_options={})
+    return zarr.open_array(path, mode='r')
 
 
 def downsample_maxpool(x, factor):
@@ -131,7 +132,8 @@ def skeletonize_kwargs():
     return dict(
         teasar_params={'scale': 1., 'const': 2.},
         anisotropy=(downsample_factor, downsample_factor, downsample_factor),  # skeletons therefore have not-downsampled coordinates
-        dust_threshold=dust_threshold,
+        # one below prepare_cc_labels' downsampled cutoff (it keeps counts >= it); Kimimaro and Brook keep counts > this
+        dust_threshold=max(1, dust_threshold // downsample_factor ** 3) - 1,
         fix_branching=True,
         fix_borders=True,
         fill_holes=False,
@@ -157,12 +159,15 @@ def get_skeleton_tracks(cc_labels, offset_zyx, verbose=False, skeletonize=None):
     Any function with Kimimaro's signature can be passed, e.g. ``brook.skeletonize``.
     """
     import networkx as nx
+    kwargs = skeletonize_kwargs()
     if skeletonize is None:
         import kimimaro
         skeletonize = kimimaro.skeletonize
+        if sorted(cc_labels.shape)[1] == 1:
+            kwargs['fix_borders'] = False  # Kimimaro's border targets index out of bounds on a one-voxel face
     skeletons = skeletonize(
         cc_labels,
-        **skeletonize_kwargs(),
+        **kwargs,
         progress=verbose,
         parallel=kimimaro_parallel,
         parallel_chunk_size=250,

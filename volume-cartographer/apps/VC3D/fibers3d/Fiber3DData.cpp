@@ -183,7 +183,9 @@ Scene loadStore(const StoreSource& source, const QueryOptions& options, const st
                 exhausted = true;
                 return;
             }
-            const auto view = snapshot.viewTransformedAt(record.uuid, source.volume.volume, source.volume.scale, &transforms);
+            const auto selected = reader.selectedObject(record.uuid, {}, {}, record.reference());
+            if (!selected) throw std::runtime_error("Selected fiber revision is no longer retained");
+            const auto view = snapshot.viewTransformedAt(*selected, source.volume.volume, source.volume.scale, &transforms);
             const auto& canonical = std::get<vc::objects::FiberView>(view.canonical());
             const int64_t n = canonical.linePointCount() ? canonical.linePointCount() : canonical.controlPointCount();
             const auto nc = canonical.controlPointCount();
@@ -203,13 +205,11 @@ Scene loadStore(const StoreSource& source, const QueryOptions& options, const st
             fiber.source = Source::Store;
             fiber.fileName = QString::fromStdString(record.uuid + ".json");
             fiber.family = family(record.fiber->family);
-            fiber.lengthMm = (record.volumeLength ? *record.volumeLength
-                                                  : reader.geometryLengthInVolume(record.uuid, source.volume.volume, source.volume.scale)) *
-                             source.voxelSizeMm;
             for (const auto& tag : record.tags)
                 fiber.tags.push_back(QString::fromStdString(tag));
             const char* array = canonical.linePointCount() ? "line_points" : "control_points";
             const auto points = view.points(array, 0, n);
+            fiber.lengthMm = vc::geometry::polylineLength(points) * source.voxelSizeMm;
             std::vector<cv::Vec3d> displayed;
             displayed.reserve(points.size());
             for (const auto& p : points)

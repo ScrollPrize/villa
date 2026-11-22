@@ -385,7 +385,7 @@ QString spanAlignmentMetricToolTip(
         return status + tooltip;
     }
     if (metric.pending) {
-        return status + QObject::tr("Sampling Lasagna normals.");
+        return status + QObject::tr("Sampling annotation normals.");
     }
     if (!metric.error.empty()) {
         return status + QString::fromStdString(metric.error);
@@ -772,11 +772,16 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
     _lasagnaDatasetMenu = annotationMenu->addMenu(tr("Lasagna dataset"));
     _lasagnaDatasetMenu->setToolTipsVisible(true);
     _lasagnaDatasetMenu->menuAction()->setToolTip(
-        tr("Select the Lasagna dataset used for line annotation."));
+        tr("Select the external normal dataset, used when the normal source is Lasagna."));
     _fiberInferenceDatasetMenu = annotationMenu->addMenu(tr("Fiber dataset"));
     _fiberInferenceDatasetMenu->setToolTipsVisible(true);
     _fiberInferenceDatasetMenu->menuAction()->setToolTip(
         tr("Select the fiber inference dataset used for line annotation."));
+    _normalSourceMenu = annotationMenu->addMenu(tr("Tracing / annotation normals"));
+    _normalSourceMenu->setToolTipsVisible(true);
+    _normalSourceMenu->menuAction()->setToolTip(
+        tr("The normal source is saved with the project.\n"
+           "Select Lasagna explicitly to use the attached Lasagna normal volume instead."));
     {
         // Fiber model backend: the neural fiber-follow model (a vesuvius
         // checkpoint, run by the Python environment VC3D was started from)
@@ -1391,8 +1396,28 @@ void LineAnnotationDialog::updateFiberFollowMenu()
     }
 }
 
+void LineAnnotationDialog::setNormalSource(const std::string& source)
+{
+    _normalSource = source;
+    rebuildDatasetMenus();
+}
+
 void LineAnnotationDialog::rebuildDatasetMenus()
 {
+    if (_normalSourceMenu) {
+        _normalSourceMenu->clear();
+        const auto selected = QString::fromStdString(_normalSource);
+        for (const auto& [key, label] : std::vector<std::pair<QString, QString>>{
+                 {QStringLiteral("fiber"), tr("Predicted fiber normals")},
+                 {QStringLiteral("lasagna"), tr("Lasagna normals")}}) {
+            auto* action = _normalSourceMenu->addAction(label);
+            action->setCheckable(true);
+            action->setChecked(selected == key);
+            connect(action, &QAction::triggered, this, [this, key]() {
+                emit normalSourceSelectionChanged(key.toStdString());
+            });
+        }
+    }
     auto populateMenu =
         [this](QMenu* menu,
                const std::vector<std::pair<std::string, std::string>>& options,

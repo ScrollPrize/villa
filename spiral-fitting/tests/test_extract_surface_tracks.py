@@ -472,7 +472,10 @@ def test_cpu_backend_writes_the_track_format(monkeypatch, tmp_path):
             assert track.flags.c_contiguous and len(track) >= 10
         n_tracks += len(tracks)
     assert n_tracks > 50
-    assert pickle.dumps([]) in entries.values()
+    # Every slab of this volume crosses a sheet piece above the dust threshold, so none is empty. (An empty
+    # entry here used to mean pieces that passed prepare_cc_labels' dust filter but were dropped again by the
+    # skeletonizer, which got the threshold in full-resolution voxels.)
+    assert pickle.dumps([]) not in entries.values()
 
     # Resume: keys already present are not recomputed.
     with dbm.open(str(out), 'w') as database:
@@ -580,3 +583,27 @@ def test_gpu_backend_matches_per_slab_brook(monkeypatch, tmp_path):
         database['h:16'] = pickle.dumps(['kept'])
     est.run_gpu(fallback, str(tmp_path / 'fallback.dbm'), gpus=(device,))
     assert _read_dbm(tmp_path / 'fallback.dbm') == {**expected, 'h:16': pickle.dumps(['kept'])}
+
+
+def test_component_kept_by_prepare_cc_labels_is_skeletonized(monkeypatch):
+    """A sheet fragment that passes prepare_cc_labels' dust filter, even exactly at the cutoff, must reach the tracks."""
+    pytest.importorskip('kimimaro')
+    pytest.importorskip('cc3d')
+    monkeypatch.setattr(est, 'dust_threshold', 2304)
+    monkeypatch.setattr(est, 'downsample_factor', 4)
+    monkeypatch.setattr(est, 'path_mode', 'interjoint')
+    volume = np.zeros((16, 64, 160), np.uint8)
+    volume[4:8, 16:20, 8:152] = 255  # a 4 x 4 x 144 strip: 2,304 full-res voxels, 36 downsampled
+    labels = est.prepare_cc_labels(volume > 0)
+    assert labels.max() == 1
+    tracks = est.get_skeleton_tracks(labels, (0, 0, 0))
+    assert len(tracks) == 1
+
+
+def test_one_voxel_wide_slab_is_skeletonized():
+    """A slab that pools to a line, e.g. a vertical slab over a 4-voxel z range, with a component at its end."""
+    pytest.importorskip('kimimaro')
+    labels = np.zeros((1, 1, 32), np.uint32)
+    labels[0, 0, 16:] = 1
+    tracks = est.get_skeleton_tracks(labels, (0, 0, 0))
+    assert [len(t) for t in tracks] == [16]

@@ -275,6 +275,14 @@ vc_add_test(NAME test_fiber_trace3d
 vc_add_test(NAME test_fiber_anchors LIBS doctest::doctest vc_fiber_tracer)
 vc_add_test(NAME test_fiber_json LIBS doctest::doctest vc_fiber_tracer)
 vc_add_test(NAME test_fiber_trace_winding_bp LIBS doctest::doctest vc_fiber_tracer)
+
+# The native constraint-store regression shares the app's import adapter.
+# Register it after the common test-target helpers are available.
+if(TARGET test_fiber_normal_publication)
+    add_test(NAME test_fiber_normal_publication COMMAND test_fiber_normal_publication)
+    vc_register_test_target(test_fiber_normal_publication)
+    vc_register_ctest(test_fiber_normal_publication test_fiber_normal_publication)
+endif()
 vc_add_test(NAME test_lasagna_normal_alignment LIBS doctest::doctest vc_fiber_tracer)
 vc_add_test(NAME test_fiber_prediction_channels LIBS doctest::doctest vc_fiber_tracer)
 vc_add_test(NAME test_fiber_reference_replay_benchmark LIBS doctest::doctest vc_fiber_tracer)
@@ -447,6 +455,9 @@ vc_add_test(NAME test_load_json)
 
 vc_add_test(NAME test_lasagna_manifest LIBS doctest::doctest vc_lasagna)
 vc_add_test(NAME test_lasagna_project_volumes LIBS doctest::doctest vc_lasagna)
+# Live S3: a published Lasagna array cached whole as a directory Zarr.
+vc_add_test(NAME test_lasagna_cache_live_s3 LIBS doctest::doctest vc_lasagna)
+set_property(TEST test_lasagna_cache_live_s3 APPEND PROPERTY LABELS network)
 
 vc_add_test(NAME test_open_data_manifest
     SOURCES test_open_data_manifest.cpp
@@ -512,6 +523,7 @@ vc_add_test(NAME test_fiber_side_strip_intersections LIBS doctest::doctest vc_fi
 
 vc_add_test(NAME test_remote_url)
 vc_add_test(NAME test_loopback_http_server)
+vc_add_test(NAME test_http_handle_pool)
 vc_add_test(NAME test_remote_cache_settings)
 
 vc_add_test(NAME test_logging)

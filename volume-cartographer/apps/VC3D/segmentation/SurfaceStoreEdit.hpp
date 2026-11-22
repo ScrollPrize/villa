@@ -5,6 +5,7 @@
 #include <vc_object_store/objects/GeometryCoordinates.hpp>
 #include <vc_object_store/store/GeometryViews.hpp>
 #include <vc_object_store/objects/ObjectStoreSession.hpp>
+#include <vc_object_store/objects/AttachedDocument.hpp>
 #include <opencv2/core/types.hpp>
 #include <memory>
 #include <mutex>
@@ -40,6 +41,12 @@ public:
     const vc::objects::PinnedObject& origin() const { return _origin; }
     const std::string& uuid() const { return _uuid; }
     const std::optional<vc::objects::ViewFrame>& view() const { return _view; }
+    // One editor owns both the surface and its loaded attached collections.
+    // All its writes share the loaded membership guard and repin together.
+    void watchAttachedCollections(const vc::objects::AttachedCollectionsSnapshot&);
+    void saveAttachedCollections(vc::objects::AttachedCollectionsSnapshot&,
+        const std::vector<vc::objects::AttachedCollection>&, const nlohmann::json& coordinates);
+    vc::objects::TransactionReceipt submitAttached(vc::objects::TransactionRequest);
 
 private:
     std::shared_ptr<vc::objects::ObjectStoreSession> _session;
@@ -51,4 +58,6 @@ private:
     void settlePending();
     void repin(const vc::objects::TransactionReceipt&);
     const std::optional<vc::objects::ViewFrame> _view;
+    std::optional<vc::objects::AttachedCollectionsSnapshot> _collections;
+    void guardAttached(vc::objects::TransactionRequest&) const;
 };

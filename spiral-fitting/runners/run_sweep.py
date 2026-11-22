@@ -134,11 +134,14 @@ def child_command(
 ) -> list[str]:
     command = [
         sys.executable, str(Path(__file__).with_name("run_single.py")),
-        "--dataset", str(args.dataset), "--ink-volume", str(args.ink_volume),
+        "--inputs", str(args.inputs), "--ink-volume", str(args.ink_volume),
+        "--object-store", str(args.object_store),
         "--output", str(args.output.resolve() / stem),
         "--config", str(config), "--resume", "--gpus",
         ",".join(map(str, group)), "--vc-render-bin", str(args.vc_render_bin),
     ]
+    if args.object_store_author is not None:
+        command.extend(["--object-store-author", args.object_store_author])
     if args.seeds is not None:
         command.extend(["--seeds", ",".join(map(str, args.seeds))])
     if args.run_id is not None:
@@ -214,7 +217,7 @@ def execute(args: argparse.Namespace) -> int:
         run_single.overwrite_output(
             args.output,
             protected_paths=(
-                args.dataset,
+                args.inputs,
                 args.ink_volume,
                 args.vc_render_bin,
                 args.config_folder,

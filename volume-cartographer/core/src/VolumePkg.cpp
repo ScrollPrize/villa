@@ -115,6 +115,18 @@ std::shared_ptr<Volume> openRemoteVolumeEntry(
         !vc::project::usesAnonymousRemoteAuth(entry));
 }
 
+std::vector<std::shared_ptr<Volume>> volumeViews(
+    const std::shared_ptr<Volume>& volume, const std::vector<std::string>& channels)
+{
+    if (channels.empty()) return {volume};
+    if (!volume->channelCount() || *volume->channelCount() != static_cast<std::int64_t>(channels.size()))
+        throw std::invalid_argument("display channels do not match CZYX volume " + volume->sourceLocation());
+    std::vector<std::shared_ptr<Volume>> views;
+    for (std::size_t i = 0; i < channels.size(); ++i)
+        views.push_back(volume->channelView(static_cast<std::int64_t>(i), channels[i]));
+    return views;
+}
+
 std::string validateRemoteVolumeLocation(
     const std::string& location,
     bool requireDirectZarr)
@@ -425,7 +437,8 @@ void VolumePkg::readDocument()
     const auto entries = [&](const char* key) {
         std::vector<vc::project::Entry> out;
         for (const auto& entry : data.at(key))
-            out.push_back({entry.at("location"), entry.at("tags").get<std::vector<std::string>>()});
+            out.push_back({entry.at("location"), entry.at("tags").get<std::vector<std::string>>(),
+                           entry.value("channels", std::vector<std::string>{})});
         return out;
     };
     volumes_ = entries("volumes");
@@ -438,6 +451,10 @@ void VolumePkg::readDocument()
     };
     selectedLasagnaDataset_ = selection("selected_lasagna_dataset");
     selectedFiberInferenceDataset_ = selection("selected_fiber_inference_dataset");
+    annotationNormalSource_ = selection("annotation_normal_source");
+    if (annotationNormalSource_ && *annotationNormalSource_ != "fiber" &&
+        *annotationNormalSource_ != "lasagna")
+        throw std::invalid_argument("Unknown project annotation normal source");
     currentVolumeId_ = view.value("current_volume", std::string{});
     focusBounds_.reset();
     focusBoundsEnabled_ = false;
@@ -471,7 +488,9 @@ const char* resourceKey(const std::string& kind) {
     return "lasagna_datasets";
 }
 nlohmann::json entryJson(const vc::project::Entry& entry) {
-    return {{"location", entry.location}, {"tags", entry.tags}};
+    nlohmann::json json{{"location", entry.location}, {"tags", entry.tags}};
+    if (!entry.channels.empty()) json["channels"] = entry.channels;
+    return json;
 }
 }
 bool VolumePkg::writeEntry(const char* kind, const vc::project::Entry& entry)
@@ -491,10 +510,24 @@ nlohmann::json VolumePkg::viewJson() const
     auto view = nlohmann::json::object();
     if (selectedLasagnaDataset_) view["selected_lasagna_dataset"] = *selectedLasagnaDataset_;
     if (selectedFiberInferenceDataset_) view["selected_fiber_inference_dataset"] = *selectedFiberInferenceDataset_;
+    if (annotationNormalSource_) view["annotation_normal_source"] = *annotationNormalSource_;
     if (!currentVolumeId_.empty()) view["current_volume"] = currentVolumeId_;
     if (focusBounds_) view["focus_bounds"] = boundsJson(*focusBounds_, focusBoundsEnabled_);
     return view;
 }
+std::string VolumePkg::annotationNormalSource() const
+{
+    return annotationNormalSource_.value_or("lasagna");
+}
+
+void VolumePkg::setAnnotationNormalSource(std::string source)
+{
+    if (source != "fiber" && source != "lasagna")
+        throw std::invalid_argument("Annotation normal source must be fiber or lasagna");
+    annotationNormalSource_ = std::move(source);
+    writeView();
+}
+
 void VolumePkg::writeView()
 {
     if (!writable()) return; // Read-only projects may still be explored.
@@ -526,7 +559,9 @@ void VolumePkg::followEntries(const std::vector<vc::project::Entry>& previous)
     };
     for (auto it = loadedVolumes_.begin(); it != loadedVolumes_.end();) {
         const auto* entry = it->second ? backingEntry(*it->second) : nullptr;
-        if (!entry) {
+        const bool channelsChanged = entry && std::any_of(previous.begin(), previous.end(),
+            [&](const auto& old) { return old.location == entry->location && old.channels != entry->channels; });
+        if (!entry || channelsChanged) {
             volumeTagsByID_.erase(it->first);
             it = loadedVolumes_.erase(it);
             continue;
@@ -537,7 +572,7 @@ void VolumePkg::followEntries(const std::vector<vc::project::Entry>& previous)
     }
     for (const auto& entry : volumes_)
         if (std::none_of(previous.begin(), previous.end(),
-                         [&](const auto& old) { return old.location == entry.location; }))
+                         [&](const auto& old) { return old.location == entry.location && old.channels == entry.channels; }))
             resolveVolumeEntry(entry);
     resolvedNormalGridPaths_.clear();
     for (const auto& entry : normalGrids_) resolveNormalGridEntry(entry);
@@ -747,11 +782,11 @@ VolumePkg::AttachLasagnaResult VolumePkg::attachPreparedLasagnaDataset(
             throw std::invalid_argument(
                 "prepared Lasagna volume does not match its attachment location");
         }
-        auto loaded = loadedVolumes_.find(prepared.volume->id());
-        if (loaded != loadedVolumes_.end() &&
-            !loadedVolumeMatchesLocation(
-                loaded->second, prepared.location, directory())) {
-            return AttachLasagnaResult::VolumeIdConflict;
+        for (const auto& view : volumeViews(prepared.volume, prepared.channels)) {
+            auto loaded = loadedVolumes_.find(view->id());
+            if (loaded != loadedVolumes_.end() &&
+                !loadedVolumeMatchesLocation(loaded->second, prepared.location, directory()))
+                return AttachLasagnaResult::VolumeIdConflict;
         }
     }
 
@@ -761,6 +796,7 @@ VolumePkg::AttachLasagnaResult VolumePkg::attachPreparedLasagnaDataset(
     const auto oldVolumeTags = volumeTagsByID_;
     const auto oldSelected = selectedLasagnaDataset_;
     const auto oldSelectedFiber = selectedFiberInferenceDataset_;
+    const auto oldNormalSource = annotationNormalSource_;
     bool changed = false;
     try {
         auto manifest = std::find_if(lasagnaDatasets_.begin(), lasagnaDatasets_.end(), [&](const auto& entry) {
@@ -780,6 +816,19 @@ VolumePkg::AttachLasagnaResult VolumePkg::attachPreparedLasagnaDataset(
             }
         }
 
+        if (updateSelection && !annotationNormalSource_) {
+            const bool hasFiberNormals = std::any_of(
+                preparedVolumes.begin(), preparedVolumes.end(), [&](const auto& volume) {
+                    return hasTag(volume.tags, vc::project::kPredictedFiberNormalsTag);
+                });
+            // Do not override a legacy project's existing Lasagna selection,
+            // nor select normals from an incoming but unselected fiber dataset.
+            annotationNormalSource_ = fiberInference && hasFiberNormals &&
+                !selectedLasagnaDataset_ &&
+                (!selectedFiberInferenceDataset_ || selectedFiberInferenceDataset_ == manifestLocation)
+                ? "fiber" : "lasagna";
+            changed = true;
+        }
         if (updateSelection && fiberInference) {
             if (!selectedFiberInferenceDataset_) {
                 selectedFiberInferenceDataset_ = manifestLocation;
@@ -810,12 +859,14 @@ VolumePkg::AttachLasagnaResult VolumePkg::attachPreparedLasagnaDataset(
             }
             auto entry = std::find_if(
                 volumes_.begin(), volumes_.end(), [&](const auto& candidate) {
+                    if (!prepared.channels.empty())
+                        return sameAttachmentLocation(candidate.location, persistedLocation, directory());
                     return entryBacksAttachmentLocation(
                         candidate.location, persistedLocation,
                         directory());
                 });
             if (entry == volumes_.end()) {
-                volumes_.push_back({persistedLocation, tags});
+                volumes_.push_back({persistedLocation, tags, prepared.channels});
                 entry = std::prev(volumes_.end());
                 changed = true;
             } else {
@@ -827,18 +878,11 @@ VolumePkg::AttachLasagnaResult VolumePkg::attachPreparedLasagnaDataset(
                         changed = true;
                 }
             }
-            auto loaded = loadedVolumes_.find(prepared.volume->id());
-            if (loaded == loadedVolumes_.end()) {
-                loadedVolumes_.emplace(prepared.volume->id(), prepared.volume);
-                changed = true;
-            } else if (loaded->second != prepared.volume &&
-                       !loadedVolumeMatchesLocation(
-                           loaded->second, persistedLocation,
-                           directory())) {
-                loaded->second = prepared.volume;
+            if (entry->channels != prepared.channels) {
+                entry->channels = prepared.channels;
                 changed = true;
             }
-            volumeTagsByID_[prepared.volume->id()] = entry->tags;
+            changed |= registerVolumeViews(prepared.volume, *entry);
         }
         if (!changed)
             return AttachLasagnaResult::AlreadyAttached;
@@ -856,6 +900,7 @@ VolumePkg::AttachLasagnaResult VolumePkg::attachPreparedLasagnaDataset(
         volumeTagsByID_ = oldVolumeTags;
         selectedLasagnaDataset_ = oldSelected;
         selectedFiberInferenceDataset_ = oldSelectedFiber;
+        annotationNormalSource_ = oldNormalSource;
         // Some of the writes may have landed: follow what the store holds.
         try { reload(); } catch (...) {}
         throw;
@@ -909,7 +954,7 @@ bool VolumePkg::setVolumeLevel(const std::string& volumeId, int level)
     // Opened before the entry changes: a level that fails to open leaves the
     // project and the loaded volume as they were.
     auto reopened = openRemoteVolumeEntry(updated, opts_.catalog.get());
-    if (reopened->id() != volumeId)
+    if (reopened->id() != loaded->second->sourceVolumeId())
         throw std::runtime_error("volume " + volumeId + " opens as " + reopened->id() + " at level " +
                                  std::to_string(level));
     auto data = document_.data();
@@ -917,7 +962,7 @@ bool VolumePkg::setVolumeLevel(const std::string& volumeId, int level)
         if (e.at("location") == entry->location) e["location"] = updated.location;
     document_.replace(std::move(data));
     readDocument();
-    loadedVolumes_[volumeId] = std::move(reopened);
+    registerVolumeViews(reopened, updated, true);
     return true;
 }
 
@@ -1059,7 +1104,9 @@ void VolumePkg::resolveAll()
         auto loadRemote = [this, &remoteResults](std::size_t i) {
             const auto& entry = volumes_[i];
             try {
-                if (!isDirectRemoteZarrLocation(entry.location)) {
+                // Explicit channel views can reference a compound pyramid's
+                // subgroup (e.g. compound.zarr/sd2), not just a .zarr root.
+                if (entry.channels.empty() && !isDirectRemoteZarrLocation(entry.location)) {
                     remoteResults[i] = {nullptr, kDirectRemoteZarrRequired};
                     return;
                 }
@@ -1120,14 +1167,11 @@ void VolumePkg::resolveAll()
                            entry.location, resolved.error);
             continue;
         }
-        const auto id = resolved.volume->id();
-        if (loadedVolumes_.count(id) > 0) {
-            Logger()->warn("Duplicate remote volume id '{}' from '{}', skipping",
-                           id, entry.location);
-            continue;
+        try { registerVolumeViews(resolved.volume, entry); }
+        catch (const std::exception& ex) {
+            if (opts_.failOnRemoteError) throw;
+            Logger()->warn("Failed to load remote volume '{}': {}", entry.location, ex.what());
         }
-        loadedVolumes_.emplace(id, std::move(resolved.volume));
-        if (!entry.tags.empty()) volumeTagsByID_[id] = entry.tags;
     }
 
     for (const auto& e : normalGrids_) resolveNormalGridEntry(e);
@@ -1139,23 +1183,50 @@ void VolumePkg::resolveDeferredEntries()
     resolveAll();
 }
 
+bool VolumePkg::registerVolumeViews(const std::shared_ptr<Volume>& volume,
+                                   const vc::project::Entry& entry, bool replace)
+{
+    const auto views = volumeViews(volume, entry.channels);
+    std::set<std::string> ids;
+    for (const auto& view : views) {
+        ids.insert(view->id());
+        const auto existing = loadedVolumes_.find(view->id());
+        if (existing != loadedVolumes_.end() &&
+            !loadedVolumeMatchesLocation(existing->second, loadedVolumeLocation(*volume), directory()) &&
+            !(replace && existing->second->sourceLocation() == volume->sourceLocation()))
+            throw std::runtime_error("duplicate volume id from different sources: " + view->id());
+    }
+    bool changed = false;
+    // Reattaching a changed channel declaration also retires obsolete views.
+    for (auto it = loadedVolumes_.begin(); it != loadedVolumes_.end();) {
+        if (it->second->sourceVolumeId() == volume->sourceVolumeId() && !ids.contains(it->first)) {
+            volumeTagsByID_.erase(it->first);
+            it = loadedVolumes_.erase(it);
+            changed = true;
+        } else ++it;
+    }
+    for (const auto& view : views) {
+        auto& current = loadedVolumes_[view->id()];
+        if (!current || replace || current->channel() != view->channel() || current->name() != view->name()) {
+            current = view;
+            changed = true;
+        }
+        volumeTagsByID_[view->id()] = entry.tags;
+    }
+    return changed;
+}
+
 void VolumePkg::resolveVolumeEntry(const vc::project::Entry& e)
 {
     if (vcr::zarr::isRemote(e.location)) {
         try {
-            if (!isDirectRemoteZarrLocation(e.location)) {
+            if (e.channels.empty() && !isDirectRemoteZarrLocation(e.location)) {
                 Logger()->warn("Skipping remote volume location '{}': {}",
                                e.location, kDirectRemoteZarrRequired);
                 return;
             }
             auto v = openRemoteVolumeEntry(e, opts_.catalog.get());
-            const auto id = v->id();
-            if (loadedVolumes_.count(id) > 0) {
-                Logger()->warn("Duplicate remote volume id '{}' from '{}', skipping", id, e.location);
-                return;
-            }
-            loadedVolumes_.emplace(id, v);
-            if (!e.tags.empty()) volumeTagsByID_[id] = e.tags;
+            registerVolumeViews(v, e);
             return;
         } catch (const std::exception& ex) {
             if (opts_.failOnRemoteError) {
@@ -1175,13 +1246,7 @@ void VolumePkg::resolveVolumeEntry(const vc::project::Entry& e)
     auto loadOne = [&](const fs::path& vp) {
         try {
             auto v = Volume::New(vp, vc::project::catalogVolumeMetadata(opts_.catalog.get(), e.location));
-            const auto id = v->id();
-            if (loadedVolumes_.count(id) > 0) {
-                Logger()->warn("Duplicate volume id '{}' from '{}', skipping", id, vp.string());
-                return;
-            }
-            loadedVolumes_.emplace(id, v);
-            if (!e.tags.empty()) volumeTagsByID_[id] = e.tags;
+            registerVolumeViews(v, e);
         } catch (const std::exception& ex) {
             Logger()->warn("Failed to load volume '{}': {}", vp.string(), ex.what());
         }
@@ -1248,5 +1313,5 @@ vc::project::AnnotationVolume vc::project::annotationVolume(const VolumePkg* pkg
                 positive(sample->findVolume(view->volumeId)->pixelSizeUm)};
     }
     const double scale = std::ldexp(1.0, -volume.baseScaleLevel());
-    return {{volume.id(), scale}, positive(volume.voxelSize() * scale)};
+    return {{volume.sourceVolumeId(), scale}, positive(volume.voxelSize() * scale)};
 }

@@ -18,6 +18,10 @@ import re
 import numpy as np
 from PIL import Image
 
+# Preview surfaces and overlays are written by this service and span whole
+# scroll regions, so PIL's decompression-bomb guard rejects legitimate files.
+Image.MAX_IMAGE_PIXELS = None
+
 from surface_orientation import GridLayout
 
 

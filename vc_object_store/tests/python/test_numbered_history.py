@@ -9,7 +9,7 @@ import vc_object_store as vos
 
 def create(db, name, status):
     obj = str(uuid.uuid4())
-    request = dict(command_version=1, request=str(uuid.uuid4()), store=status["store"],
+    request = dict(command_version=3, request=str(uuid.uuid4()), store=status["store"],
                    generation=status["generation"], author="py", expected_objects={obj: None},
                    expected_relationships={}, read_dependencies={}, expected_commit_sequence=None,
                    operations=[dict(op="create_object", record=dict(uuid=obj, kind="note", name=name))])
@@ -30,6 +30,7 @@ def test_checked_request_versions_and_selection_record(db):
 
     rows = {r["uuid"]: r for r in db.select_objects(object_kind="note")}
     assert rows[a]["version"] == 1 and rows[a]["version_generation"] == status["generation"]
+    assert rows[a]["version_store"] == status["store"]
 
     ref = dict(store=status["store"], generation=status["generation"], object=a, version=1)
     missing = dict(ref, version=9)
@@ -57,18 +58,35 @@ def test_artifacts_named_by_manifest(db, tmp_path):
     assert db.artifact_length(digest) == 3000 and db.artifact_length("0" * 64) is None
     assert db.read_artifact(digest, 3, 3) == b"abc"
     manifest = vos.artifact_manifest_json([dict(name="w/weights.bin", sha256=digest, length=3000)])
-    request = dict(command_version=1, request=str(uuid.uuid4()), store=status["store"],
-                   generation=status["generation"], author="py", expected_objects={obj: 1},
+    request = dict(command_version=3, request=str(uuid.uuid4()), store=status["store"],
+                   generation=status["generation"], author="py", expected_objects={obj: vos.object_reference(db.object(obj))},
                    expected_relationships={}, read_dependencies={}, expected_commit_sequence=None,
                    operations=[dict(op="set_meta", uuid=obj, key=vos.ARTIFACTS_META_KEY, value=__import__("json").loads(manifest))])
     db.submit(request)
     assert db.current_object_revision(obj)["record"]["meta"]["artifacts"][0]["sha256"] == digest
-    unheld = dict(request, request=str(uuid.uuid4()), expected_objects={obj: 2},
+    unheld = dict(request, request=str(uuid.uuid4()), expected_objects={obj: vos.object_reference(db.object(obj))},
                   operations=[dict(op="set_meta", uuid=obj, key="artifacts",
                                    value=[dict(name="x", sha256="1" * 64, length=1)])])
     with pytest.raises(Exception):
         db.submit(unheld)
     assert db.current_version(obj) == 2
+
+
+def test_checked_write_carries_full_handles(db):
+    a, _, _ = create(db, "a", db.status())
+    b, _, _ = create(db, "b", db.status())
+    a_ref = vos.object_reference(db.object(a))
+    b_ref = vos.object_reference(db.object(b))
+    with db.write(expected_versions={a: a_ref}, read_dependencies={b: b_ref}) as write:
+        write.set_meta(a, "derived", 1)
+    assert db.current_version(a) == a_ref["version"] + 1
+    wrong_owner = dict(b_ref, store=str(uuid.uuid4()))
+    with pytest.raises(RuntimeError):
+        with db.write(read_dependencies={b: wrong_owner}):
+            pass
+    with pytest.raises(RuntimeError):
+        with db.write(expected_versions={a: a_ref}):
+            pass
 
 
 def test_session_artifacts_across_history_reset(db, db_path, tmp_path):
@@ -78,14 +96,14 @@ def test_session_artifacts_across_history_reset(db, db_path, tmp_path):
     attachment = session.attach(db_path, "pytest")
     original = tmp_path / "original.bin"
     original.write_bytes(b"old artifact")
-    first = session.publish_artifacts(attachment, obj, 1, {"original.bin": str(original)})
+    first = session.publish_artifacts(attachment, vos.object_reference(session.current_object(attachment, obj)["record"]), {"original.bin": str(original)})
     version, generation = first["objects"][obj], first["generation"]
     db.start_history_generation("restored backup")
     files = session.artifacts(attachment, obj, version=version, generation=generation)
     assert [f["name"] for f in files] == ["original.bin"]
     newer = tmp_path / "newer.bin"
     newer.write_bytes(b"new artifact")
-    session.publish_artifacts(attachment, obj, version, {"newer.bin": str(newer)})
+    session.publish_artifacts(attachment, vos.receipt_object_reference(first, obj), {"newer.bin": str(newer)})
     assert {f["name"] for f in session.artifacts(attachment, obj)} == {"original.bin", "newer.bin"}
     output = tmp_path / "historical"
     assert session.materialize_artifacts(attachment, obj, str(output), version=version, generation=generation) == files

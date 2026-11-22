@@ -34,7 +34,8 @@ struct StoreSource {
 
 // Worker-only value adapters. They do not access live controllers, mutate
 // annotations, create geometry, or resample curves. Cancelled calls throw and
-// their result must not be published. Store reads pin one immutable transaction.
+// their result must not be published. Geometry retains each listed object's
+// complete reference and the query's captured transform context (also hosted).
 Scene loadStore(const StoreSource& source, const QueryOptions& options, const std::atomic_bool* cancelled = nullptr);
 QString storeFiberKey(const vc::objects::AttachmentIdentity& attachment, const std::string& uuid);
 
