@@ -983,6 +983,7 @@ class OpenDataUrlTests(unittest.TestCase):
         self.assertEqual(vc_reader.to_s3(regional), s3)
         self.assertEqual(vc_reader.to_https(s3), regional)
         self.assertEqual(resolve_access(region_less, 'aws').kind, 'anonymous')
+        self.assertEqual(Path(decoded_cache_path('c', region_less)).parts[:2], ('c', 'https'))
 
 
 if __name__ == '__main__':

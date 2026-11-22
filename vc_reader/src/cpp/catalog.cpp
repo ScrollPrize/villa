@@ -798,7 +798,7 @@ std::vector<std::string> OpenDataManifest::samplesNamed(std::string_view name) c
 
 std::optional<OpenDataVolumeMetadata> OpenDataManifest::volumeMetadataAt(const std::string& url) const
 {
-    const auto view = volumeAt(resolveOpenDataUrl(url));
+    const auto view = volumeAt(resolveOpenDataUrl(openDataS3Url(url).value_or(url)));
     if (!view) return std::nullopt;
     const auto* sample = findSample(view->sampleId);
     const auto* volume = sample ? sample->findVolume(view->volumeId) : nullptr;
