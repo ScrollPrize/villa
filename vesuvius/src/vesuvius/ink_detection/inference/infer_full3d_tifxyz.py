@@ -30,6 +30,7 @@ from vesuvius.ink_detection.data.geometry import (
     select_flat_pixels_via_stored_resolution,
 )
 from vesuvius.ink_detection.data.normalization import normalize_image
+from vesuvius.ink_detection.inference.infer import keep_worker_descriptors_private
 from vesuvius.ink_detection.inference.inference_runtime import (
     DEVICE_CHOICES,
     TargetModel,
@@ -951,6 +952,7 @@ def run_native_inference(
             persistent_workers=True,
             prefetch_factor=int(args.prefetch_factor),
             multiprocessing_context="spawn",
+            worker_init_fn=keep_worker_descriptors_private,
         )
     loader = DataLoader(**loader_kwargs)
     accumulator = ChunkAccumulator3D(
