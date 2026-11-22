@@ -7,6 +7,7 @@ Jyx Jxx) therefore need more than the spatial un-flip, or the TTA variants cance
 """
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -16,8 +17,9 @@ import yaml
 
 from vc_reader.reader import ZarrWriter, open_zarr
 import vesuvius.models
-from vesuvius.models.run import inference, tta
+from vesuvius.models.run import blending, inference, tta
 from vesuvius.models.run.blending import merge_inference_outputs
+from vesuvius.models.run.finalize_outputs import FinalizeConfig, finalize_logits
 from vesuvius.models.run.inference import Inferer
 
 TARGETS = {
@@ -500,3 +502,40 @@ def test_blending_keeps_an_axis_the_patches_agree_on_up_to_sign(tmp_path, monkey
         if head == "nearest":
             assert abs(out[(3, *SEAM_VOXEL)] - 3.0) < 1e-2, f"{name}: distance {out[(3, *SEAM_VOXEL)]}"
     np.testing.assert_allclose(in_memory, staged, atol=2e-3)
+
+
+# --- Multiclass --threshold writes chunks of one nonzero class --------------------------------------
+
+class ClassOneAndLargeTensor(torch.nn.Module):
+    """Two segmentation scores that always favour class 1, and a structure tensor whose
+    components outscore them in part of the volume (they are not class scores)."""
+
+    def forward(self, x):
+        s = x[:, :1].float()
+        st = torch.cat([3 * s] + [torch.zeros_like(s)] * 5, dim=1)
+        return {"surface": torch.cat([torch.zeros_like(s), torch.full_like(s, 0.5)], dim=1), "st": st}
+
+
+def test_multiclass_threshold_writes_uniform_nonzero_class_chunks(tmp_path, monkeypatch):
+    """--mode multiclass --threshold, default mirroring: every voxel is class 1. A chunk of class 1
+    only was treated as empty and read back as class 0, in-memory, staged and fused."""
+    targets = {"surface": TARGETS["surface"], "st": TARGETS["st"]}
+    volume = _volume((32, 32, 32)).numpy()
+    assert (3 * volume > 0.5).any() and (3 * volume < 0.5).any()
+
+    in_memory = _predict(tmp_path, monkeypatch, volume, ClassOneAndLargeTensor(), targets, (16, 16, 16),
+                         "in_memory", in_memory_blend={"finalize_config": FinalizeConfig("multiclass", 0.5)})
+    _, parts = _predict_staged(tmp_path, monkeypatch, volume, ClassOneAndLargeTensor(), targets,
+                               (16, 16, 16), "staged")
+    finalize_logits(str(tmp_path / "staged.zarr"), str(tmp_path / "staged_final.zarr"), mode="multiclass",
+                    threshold=0.5, num_workers=1, verbose=False, delete_intermediates=True)
+    assert not (tmp_path / "staged.zarr").exists()  # removed only after every chunk was written
+    staged = np.asarray(open_zarr(str(tmp_path / "staged_final.zarr"))[:])
+    monkeypatch.setattr(sys, "argv", ["vesuvius.blend_and_finalize", str(parts), str(tmp_path / "fused.zarr"),
+                                      "--mode", "multiclass", "--threshold", "--num_workers", "1", "--quiet"])
+    assert blending.blend_and_finalize_main() == 0
+    fused = np.asarray(open_zarr(str(tmp_path / "fused.zarr"))[:])
+
+    for name, out in (("in-memory", in_memory), ("staged finalize", staged), ("blend_and_finalize", fused)):
+        assert out.shape == (1, 32, 32, 32), name
+        assert np.unique(out).tolist() == [1], f"{name}: classes {np.unique(out).tolist()}"

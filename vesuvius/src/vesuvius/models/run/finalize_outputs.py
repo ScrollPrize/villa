@@ -148,9 +148,11 @@ def apply_finalization(logits_np, num_classes, config: FinalizeConfig):
         if uncovered is not None:
             output_np[:, uncovered] = 0
 
-        # Empty chunks were caught above; skip a finalized chunk only when
-        # every byte is identical, which is what the old path did after scaling.
-        if np.all(output_np == output_np.flat[0]):
+        # Empty chunks were caught above. Skip a finalized chunk only when every
+        # byte is the output's fill value 0: a chunk whose voxels all select
+        # class 1 (with --threshold only the argmax is written) is not empty,
+        # and skipping it would read back as class 0.
+        if not np.any(output_np):
             return None, True
         return output_np, False
 
