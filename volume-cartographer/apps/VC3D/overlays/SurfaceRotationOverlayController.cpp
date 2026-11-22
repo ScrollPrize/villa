@@ -379,6 +379,11 @@ void SurfaceRotationOverlayController::closeRotate()
     clearWidgets();
 }
 
+bool SurfaceRotationOverlayController::isOpen() const
+{
+    return _rotateActive && _state && _state->surface("segmentation") == _shownSurface;
+}
+
 bool SurfaceRotationOverlayController::sourceSelected() const
 {
     // Not when the user selected another surface, cleared the selection or reopened the segment
@@ -781,10 +786,12 @@ void SurfaceRotationOverlayController::applyRotation()
                 // transform started from (a save that finished or was resolved meanwhile wins).
                 if (!self->_saver || !self->_saver(result.surface.get(), self->_sourceRevision)) {
                     self->releaseSource();
-                    // Apply can be tried again only on the selected, current segment.
-                    if (!self->sourceSelected()) {
-                        self->closeRotate();
+                    // The failed save can stay pending in the segment's store edit, and the next save
+                    // through it commits it first: continue only from the segment reopened.
+                    if (self->sourceSelected() && !(self->_reopener && self->_reopener(self->_sourceSurfaceId))) {
+                        self->_state->clearActiveSurface();
                     }
+                    self->closeRotate();
                     QMessageBox::warning(nullptr, tr("Surface Transform Failed"),
                                          tr("Failed to save the transformed surface to the object store."));
                     return;

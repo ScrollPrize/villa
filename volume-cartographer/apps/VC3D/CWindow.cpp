@@ -5429,7 +5429,7 @@ void CWindow::onSegmentationEditingModeChanged(bool enabled)
         const bool rotating = _surfaceRotationOverlay && _surfaceRotationOverlay->isOpen();
 
         if (rotating || !_segmentationModule->beginEditingSession(activeSurfaceShared)) {
-            showStatusBarMessage(rotating ? tr("Apply the Rotate tool before editing the segment")
+            showStatusBarMessage(rotating ? tr("Apply Rotate or select the segment again before editing it")
                                           : tr("Unable to start segmentation editing"),
                                  3000);
             if (_segmentationWidget && _segmentationWidget->isEditingEnabled()) {

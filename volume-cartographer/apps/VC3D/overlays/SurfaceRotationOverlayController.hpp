@@ -44,8 +44,8 @@ public:
     void setReopener(std::function<bool(const std::string&)> reopener) { _reopener = std::move(reopener); }
     void beginRotate();
     void cancelRotate();
-    // The tool is open: the viewer may show its unsaved preview.
-    bool isOpen() const { return _rotateActive; }
+    // The tool is open and the viewer still shows what it put there (possibly its unsaved preview).
+    bool isOpen() const;
 
 private:
     struct ViewerEntry {
