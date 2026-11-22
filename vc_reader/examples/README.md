@@ -46,9 +46,13 @@ CUDA after a previous CPU-only build.
 
 **AMD GPUs (ROCm).** To build for an AMD GPU, enable `VC_READER_ENABLE_HIP=ON`.
 It is off by default (unlike CUDA, which turns on by itself when it finds the
-NVIDIA compiler `nvcc`):
+NVIDIA compiler `nvcc`). Install the PyTorch build for your ROCm version first,
+for example ROCm 7.2, in place of any PyTorch already installed, so that
+`.[all]` keeps it:
 
 ```bash
+python -m pip uninstall -y torch
+python -m pip install torch --index-url https://download.pytorch.org/whl/rocm7.2
 python -m pip install -e '.[all]' \
   --config-settings=cmake.define.VC_READER_ENABLE_HIP=ON
 ```
@@ -68,9 +72,9 @@ your build targets one type of GPU (NVIDIA or AMD).
 
 For Python, nothing changes: you still write `backend='cuda'`, and PyTorch still
 calls the GPU `'cuda'`, even on AMD. Do not look for `backend='hip'`: there is none.
-On AMD, if you write your own script, import PyTorch before vc_reader.
-Otherwise two copies of libamdhip64 are loaded and PyTorch fails with
-"device kernel image is invalid".
+On AMD, import PyTorch before vc_reader, as the notebooks do. Otherwise two
+copies of libamdhip64 are loaded and PyTorch fails with "device kernel image is
+invalid".
 
 Tested on an RX 9060 XT (gfx1200) with ROCm 7.2.4, under WSL2 (Ubuntu on Windows).
 

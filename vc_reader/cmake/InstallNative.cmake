@@ -17,6 +17,11 @@ install(TARGETS ${_vc_native_targets} EXPORT vc_readerTargets
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+if(VC_READER_ENABLE_HIP)
+    # The .hpp and .cuh headers are installed with the other native headers.
+    install(DIRECTORY src/cpp/hip_compat/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/vc_reader/native/hip_compat
+        FILES_MATCHING PATTERN "*.h" PATTERN "tuple")
+endif()
 install(EXPORT vc_readerTargets NAMESPACE vc_reader:: DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/vc_reader)
 configure_package_config_file(cmake/vc_readerConfig.cmake.in
     "${CMAKE_CURRENT_BINARY_DIR}/vc_readerConfig.cmake"

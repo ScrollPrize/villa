@@ -82,6 +82,8 @@
 #define cudaMemPoolSetAttribute hipMemPoolSetAttribute
 
 // Streams and events.
+#define cudaStreamCreate hipStreamCreate
+#define cudaStreamDestroy hipStreamDestroy
 #define cudaStreamSynchronize hipStreamSynchronize
 #define cudaStreamWaitEvent hipStreamWaitEvent
 #define cudaEventCreateWithFlags hipEventCreateWithFlags
