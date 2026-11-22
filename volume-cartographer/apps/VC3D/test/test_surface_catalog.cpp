@@ -692,6 +692,45 @@ int main(int argc, char** argv)
             hostedSession->detach(hosted);
         }
 #endif
+        // Growing a masked surface opened through a view (the VC3D tracer path:
+        // invalidateMask() + grid expansion) must not leave a gap of old mask zeros
+        // between the original surface and the grown extension when reopened.
+        {
+            cv::Mat_<cv::Vec3f> initial(3, 3, cv::Vec3f(-1.f, -1.f, -1.f));
+            cv::Mat_<uint8_t> initialMask(3, 3, uint8_t(0));
+            for (int r = 0; r < 2; ++r) {
+                for (int c = 0; c < 3; ++c) {
+                    initial(r, c) = {float(c), float(r), 2.f};
+                    initialMask(r, c) = 255;
+                }
+            }
+            QuadSurface seed(initial, {1.f, 1.f});
+            seed.setChannel("mask", initialMask);
+            const auto uuid = util::newUuid();
+            ObjectRecord record;
+            record.uuid = uuid;
+            record.kind = "surface";
+            record.name = "masked-growth";
+            record.meta = nlohmann::json{{"coordinates", vc::objects::volumeCoordinates(volume->id(), 1)}}.dump();
+            storeSurface(*session, attachment, record, quad_surface_geometry(seed));
+
+            auto openedMasked = SurfaceCatalog::open(session, attachment, {volume->id()}, uuid);
+            SurfaceStoreEdit edit(session, openedMasked.pin, openedMasked.view);
+            cv::Mat_<cv::Vec3f> expanded(5, 3);
+            for (int r = 0; r < 5; ++r)
+                for (int c = 0; c < 3; ++c) expanded(r, c) = {float(c), float(r), 2.f};
+            *openedMasked.surface->rawPointsPtr() = expanded;
+            openedMasked.surface->invalidateMask();
+            edit.save(*openedMasked.surface, cv::Rect(0, 0, 3, 5));
+
+            const auto reopened = SurfaceCatalog::open(session, attachment, {volume->id()}, uuid);
+            const auto& pts = *reopened.surface->rawPointsPtr();
+            require(pts.rows == 5 && pts.cols == 3, "reopened grown surface keeps its new size");
+            for (int r = 0; r < 5; ++r)
+                for (int c = 0; c < 3; ++c)
+                    require(pts(r, c) == cv::Vec3f(float(c), float(r), 2.f),
+                            "grown surface reopens connected without an old-mask gap");
+        }
         session->detach(attachment);
         std::cout << "surface catalog tests passed\n";
         return 0;

@@ -1573,14 +1573,23 @@ bool SegmentationModule::finishManualAdd(bool apply)
             saveCorrections();
         }
         _manualAddGridPadding = {};
-        // Tracer fills went through growth, which already dropped the mask.
         const bool tracerFill = !extending &&
             _manualAddTool->config().interpolationMode == ManualAddTool::InterpolationMode::TracerRestrictedToFill;
-        if (!tracerFill && _editManager && _editManager->baseSurface()) {
+        if (_editManager && _editManager->baseSurface()) {
             std::vector<cv::Point> cells;
-            cells.reserve(_manualAddTool->changedVertices().size());
-            for (const auto& key : _manualAddTool->changedVertices()) {
-                cells.emplace_back(key.col, key.row);
+            if (tracerFill) {
+                const auto edited = _editManager->editedVertices();
+                cells.reserve(edited.size());
+                for (const auto& edit : edited) {
+                    if (vc::geometry::validSurfacePoint(edit.currentWorld)) {
+                        cells.emplace_back(edit.col, edit.row);
+                    }
+                }
+            } else {
+                cells.reserve(_manualAddTool->changedVertices().size());
+                for (const auto& key : _manualAddTool->changedVertices()) {
+                    cells.emplace_back(key.col, key.row);
+                }
             }
             if (segmentation::markMaskCellsValid(*_editManager->baseSurface(), cells)) {
                 _autosaveFullSurfaceNeeded = true;

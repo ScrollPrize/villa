@@ -379,6 +379,9 @@ bool SegmentationModule::applySurfaceUpdateFromGrowth(const cv::Rect& vertexRect
 
 void SegmentationModule::requestAutosaveFromGrowth()
 {
+    _saveSnapshot.reset();
+    _pendingAutosaveVertexUpdates.clear();
+    _autosaveFullSurfaceNeeded = true;
     markAutosaveNeeded();
 }
 

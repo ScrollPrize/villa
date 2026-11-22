@@ -428,18 +428,21 @@ geometry::Surface TransformedGeometryView::canonicalSurface(const geometry::Surf
         throw std::invalid_argument("surface shape mismatch");
     const auto stored=surface->readTile(0,0,surface->rows(),surface->columns());
     auto result=desired;result.scale=stored.scale;
-    if(result.validity.empty()&&!stored.validity.empty()) {
-        result.validity.assign(desired.points.size(),255);
-        for(int64_t r=0;r<std::min(stored.rows,desired.rows);++r)
-            for(int64_t c=0;c<std::min(stored.columns,desired.columns);++c)
-                result.validity[r*desired.columns+c]=stored.validity[r*stored.columns+c];
-    }
+    const bool sameShape=desired.rows==stored.rows&&desired.columns==stored.columns;
+    const bool inheritedValidity=sameShape&&result.validity.empty()&&!stored.validity.empty();
+    if(inheritedValidity)result.validity=stored.validity;
     const auto inverse=mapping_.inverse();
     for(int64_t r=0;r<desired.rows;++r)for(int64_t c=0;c<desired.columns;++c) {
         const auto i=r*desired.columns+c;
         const bool exists=r<stored.rows&&c<stored.columns;
-        result.points[i]=inverseSurfacePoint(desired.points[i],exists?std::optional(stored.points[r*stored.columns+c]):std::nullopt,
-            exists&&stored.valid(r,c),mapping_,inverse);
+        const bool storedValid=exists&&stored.valid(r,c);
+        const bool resultMasked=!result.validity.empty()&&!result.validity[i];
+        const bool keepHidden=sameShape&&exists&&(resultMasked||!geometry::validSurfacePoint(stored.points[r*stored.columns+c]));
+        const auto original=(storedValid||keepHidden)?std::optional(stored.points[r*stored.columns+c]):std::nullopt;
+        const bool effectiveStoredValid=storedValid&&!(sameShape&&resultMasked&&!geometry::validSurfacePoint(desired.points[i]));
+        result.points[i]=inverseSurfacePoint(desired.points[i],original,effectiveStoredValid,mapping_,inverse);
+        if(inheritedValidity&&!result.validity[i]&&geometry::validSurfacePoint(desired.points[i])&&geometry::validSurfacePoint(result.points[i]))
+            result.validity[i]=255;
     }
     result.validate();return result;
 }
@@ -461,11 +464,12 @@ std::vector<GeometryArrayEdit> TransformedGeometryView::surfaceEdits(int64_t row
     for(int64_t r=0;r<rows;++r)for(int64_t c=0;c<columns;++c) {
         const auto i=r*columns+c;
         const auto point=inverseSurfacePoint(desired[i],stored.points[i],stored.valid(r,c),mapping_,inverse);
-        if(point==stored.points[i])continue;
+        const bool pointChanged=point!=stored.points[i];
+        const bool unmask=!stored.validity.empty()&&!stored.validity[i]&&geometry::validSurfacePoint(desired[i])&&geometry::validSurfacePoint(point);
+        if(!pointChanged&&!unmask)continue;
         const auto offset=(row+r)*surface->columns()+column+c;
-        edits.push_back({"points",offset*3,detail::scalarBytes<float>(point)});
-        if(!stored.validity.empty()&&!stored.validity[i]&&geometry::validSurfacePoint(point))
-            edits.push_back({"valid",offset,{255}});
+        if(pointChanged)edits.push_back({"points",offset*3,detail::scalarBytes<float>(point)});
+        if(unmask)edits.push_back({"valid",offset,{255}});
     }
     return edits;
 }

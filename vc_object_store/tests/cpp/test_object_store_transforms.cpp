@@ -401,5 +401,56 @@ int main() try {
         }
         check(); // The historical payload is no longer the current geometry.
     }
+    // Growing a masked surface through a view must not stamp old invalid cells
+    // onto the grown grid or resurrect hidden canonical coordinates.
+    {
+        auto store = ObjectStore::create(directory.path / "surface-mask-growth.vcobj", options);
+        vc::geometry::Surface initial{3, 3, {1, 1}, {}};
+        for (int r = 0; r < 3; ++r)
+            for (int c = 0; c < 3; ++c) initial.points.push_back({float(c), float(r), 4.f});
+        // Row 2 is an invalid/masked border (row 2 col 1 has hidden coords, row 2 col 2 is missing).
+        initial.points[2 * 3 + 2] = {-1, -1, -1};
+        initial.validity = {255, 255, 255, 255, 255, 255, 0, 0, 0};
+        std::string uuid;
+        {
+            auto txn = store.write();
+            ObjectRecord r; r.kind = "surface";
+            r.meta = R"({"coordinates":{"volume_uuid":"a","scale_factor":0.5}})";
+            uuid = store.upsertObject(txn, r);
+            store.putGeometry(txn, uuid, vc::geometry::encode(initial));
+            txn.commit();
+        }
+        GeometrySnapshot snapshot(store);
+        const auto view = snapshot.surface(uuid).viewTransformedAt("a");
+        // Resized growth with no validity channel (as after invalidateMask()):
+        // fills row 2 (previously masked border) and adds row 3; leaves (2, 0) empty.
+        vc::geometry::Surface grown{4, 3, {0.5, 0.5}, std::vector<vc::geometry::SurfacePoint>(12, {-1, -1, -1})};
+        for (int r = 0; r < 4; ++r)
+            for (int c = 0; c < 3; ++c)
+                if (!(r == 2 && c == 0)) grown.points[size_t(r * 3 + c)] = {float(2 * c), float(2 * r), 8.f};
+        const auto canonical = view.canonicalSurface(grown);
+        require(canonical.validity.empty(), "resized canonical surface without mask drops stale validity");
+        require(canonical.valid(2, 1) && canonical.vertex(2, 1) == vc::geometry::SurfacePoint{1, 2, 4},
+                "grown vertices inside the old masked border stay valid");
+        require(canonical.valid(3, 1) && canonical.vertex(3, 1) == vc::geometry::SurfacePoint{1, 3, 4},
+                "grown vertices past the old border stay valid");
+        require(!canonical.valid(2, 0) && canonical.vertex(2, 0) == vc::geometry::SurfacePoint{-1, -1, -1},
+                "empty vertices on a resized grid do not resurrect hidden masked coordinates");
+        // Same-shape canonicalSurface without validity keeps untouched masked vertices
+        // and unmasks newly filled ones.
+        vc::geometry::Surface filled{3, 3, {0.5, 0.5}, std::vector<vc::geometry::SurfacePoint>(9, {-1, -1, -1})};
+        for (int r = 0; r < 2; ++r)
+            for (int c = 0; c < 3; ++c) filled.points[size_t(r * 3 + c)] = {float(2 * c), float(2 * r), 8.f};
+        filled.points[2 * 3 + 1] = {2.f, 4.f, 8.f}; // exact same canonical coords as hidden (2, 1)
+        const auto canonicalSame = view.canonicalSurface(filled);
+        require(!canonicalSame.valid(2, 0) && canonicalSame.vertex(2, 0) == vc::geometry::SurfacePoint{0, 2, 4},
+                "untouched masked vertex keeps its hidden canonical coordinates");
+        require(canonicalSame.valid(2, 1) && canonicalSame.vertex(2, 1) == vc::geometry::SurfacePoint{1, 2, 4},
+                "filling a masked vertex unmasks it");
+        // Sparse surfaceEdits also unmasks when the filled coordinates match the hidden ones.
+        const auto unmaskEdits = view.surfaceEdits(2, 1, 1, 1, {{2.f, 4.f, 8.f}});
+        require(unmaskEdits.size() == 1 && unmaskEdits[0].array == "valid" && unmaskEdits[0].bytes == std::vector<uint8_t>{255},
+                "surfaceEdits unmasks a vertex even when its canonical coordinates are unchanged");
+    }
     std::cout<<"object volume transformation checks passed\n";return 0;
 }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}
