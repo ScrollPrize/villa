@@ -10,6 +10,11 @@ variant, the same setup/forward/backward/handoff phases), on Apple's MPS:
   gap-eager    GapExpandingTransform _call + _inverse, eager
   gap-metal    the same with the Metal gap kernels
 
+Each worker sets the FIT_SPIRAL_METAL its variant names and clears an
+inherited FIT_SPIRAL_DIRECT_LR (which would otherwise turn flow-metal into an
+eager run, or make flow-eager refuse to run), then checks that the dispatch
+picks the labelled path and reports it as "path" (metal or eager).
+
 Run from spiral-fitting/ on a Mac (exact numbers need an otherwise idle GPU):
   .venv/bin/python bench_metal_kernels.py
   .venv/bin/python bench_metal_kernels.py --variants flow-eager flow-metal --points 1000000 --repetitions 1
@@ -50,7 +55,10 @@ def _summary(values):
 
 def _worker(args):
     os.environ['AGENTS_AGENT_MODE'] = '1'
+    # The variant alone decides the path.
     os.environ['FIT_SPIRAL_METAL'] = '1' if args.variant.endswith('metal') else '0'
+    os.environ.pop('FIT_SPIRAL_DIRECT_LR', None)
+    wanted = 'metal' if args.variant.endswith('metal') else 'eager'
     import torch
     sync = torch.mps.synchronize
     torch.manual_seed(1701)
@@ -64,6 +72,11 @@ def _worker(args):
         with torch.no_grad():
             flow.flows[0].uniform_(-2.0e-4, 2.0e-4)
             flow.flows[1].uniform_(-5.0e-5, 5.0e-5)
+        import flow_metal
+        interpolant, backend = flow._resolve_interpolant(log=False)
+        path = 'metal' if backend is flow_metal else 'eager'
+        if path == 'eager' and interpolant != 'upsampled':
+            path = f'eager {interpolant}'
         z = torch.rand(args.points, generator=gen)
         theta = torch.rand(args.points, generator=gen) * (2 * math.pi)
         radius = torch.sqrt(torch.rand(args.points, generator=gen))
@@ -104,6 +117,10 @@ def _worker(args):
         z = torch.rand(args.points, generator=gen) * zmax
         points = torch.stack([z, radius * torch.sin(theta), radius * torch.cos(theta)], -1).to(dev)
         weights = torch.randn(points.shape, generator=gen).to(dev)
+        import gap_metal
+        probe = GapExpandingTransform(params, dr, 0.0, zmax, gap_expander_lr_scale=0.3,
+                                      min_gap=1.0, softplus_bias=4.0)
+        path = 'metal' if probe._fused_gap(points, dr) is gap_metal else 'eager'
 
         def iteration():
             t = [time.perf_counter()]
@@ -121,6 +138,9 @@ def _worker(args):
         phases = ('setup', 'forward', 'backward')
         shape = {'windings': args.windings, 'lattice': list(params.logits.shape)}
 
+    if path != wanted:
+        raise SystemExit(f'{args.variant} would time the {path} path, not the {wanted} one '
+                         f'(FIT_SPIRAL_METAL={os.environ["FIT_SPIRAL_METAL"]}, device {dev})')
     for _ in range(args.warmups):
         iteration()
     samples = []
@@ -129,7 +149,7 @@ def _worker(args):
         samples.append({ph: (t[i + 1] - t[i]) * 1e3 for i, ph in enumerate(phases)}
                        | {'total': (t[-1] - t[0]) * 1e3})
     result = {
-        'status': 'ok', 'variant': args.variant, 'points': args.points, **shape,
+        'status': 'ok', 'variant': args.variant, 'path': path, 'points': args.points, **shape,
         'iterations': args.iterations, 'torch': torch.__version__,
         'driver_allocated_gib': torch.mps.driver_allocated_memory() / 2**30,
         'phases': {ph: _summary([s[ph] for s in samples]) for ph in (*phases, 'total')},
@@ -139,6 +159,10 @@ def _worker(args):
 
 
 def _controller(args):
+    inherited = sorted(k for k in ('FIT_SPIRAL_METAL', 'FIT_SPIRAL_DIRECT_LR') if k in os.environ)
+    if inherited:
+        print(f'note: ignoring {", ".join(inherited)} from the environment; each variant sets its own',
+              flush=True)
     results = []
     for rep in range(args.repetitions):
         for variant in args.variants:   # interleaved arms
@@ -154,7 +178,7 @@ def _controller(args):
             r = json.loads(lines[-1])
             r['repetition'] = rep
             results.append(r)
-            print(f"{variant:11s} rep{rep}: total p50 {r['phases']['total']['p50_ms']:9.2f} ms "
+            print(f"{variant:11s} rep{rep} ({r['path']}): total p50 {r['phases']['total']['p50_ms']:9.2f} ms "
                   f"(fwd {r['phases']['forward']['p50_ms']:.2f}, bwd {r['phases']['backward']['p50_ms']:.2f}) "
                   f"driver {r['driver_allocated_gib']:.2f} GiB", flush=True)
     print(json.dumps({'results': results}, indent=1, sort_keys=True))
