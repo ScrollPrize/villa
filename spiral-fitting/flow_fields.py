@@ -568,15 +568,19 @@ class _EagerDirect:
 def _fused_direct_backend(low, high):
     """``(module, None)`` for the fused kernel that integrates these lattices
     directly (flow_triton on CUDA, flow_metal on MPS), else ``(None, why
-    not)``."""
+    not)``. Neither kernel takes a lattice with a single cell along an axis
+    (flow_metal.lattice_shape_problem): their backward clamps its lower corner
+    to size - 2, outside such a lattice."""
     if flow_triton.rk4_triton_available(low, high):
-        return flow_triton, None
-    if flow_metal.rk4_metal_available(low, high):
-        problem = flow_metal.lattice_shape_problem(low, high)
-        if problem is None:
-            return flow_metal, None
+        kernel = flow_triton
+    elif flow_metal.rk4_metal_available(low, high):
+        kernel = flow_metal
+    else:
+        return None, f'no fused kernel on {low.device}'
+    problem = flow_metal.lattice_shape_problem(low, high)
+    if problem is not None:
         return None, problem
-    return None, f'no fused kernel on {low.device}'
+    return kernel, None
 
 
 class CartesianFlowField(nn.Module):

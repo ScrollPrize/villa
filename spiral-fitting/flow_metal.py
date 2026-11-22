@@ -372,9 +372,10 @@ def rk4_metal_available(*tensors):
 
 
 def lattice_shape_problem(low, high):
-    """Why the kernels cannot integrate these lattices, or None.
+    """Why the fused direct-LR kernels (these and flow_triton's) cannot
+    integrate these lattices, or None.
 
-    The backward's trilinear corner arithmetic needs two cells along every
+    Their backward's trilinear corner arithmetic needs two cells along every
     axis of both lattices (its lower corner is clamped to size - 2). A narrow
     fit window gives fewer: 100 slices with no z margin are six fine z cells
     at the default 16-voxel spacing, so one coarse cell at scale 6.
@@ -384,7 +385,7 @@ def lattice_shape_problem(low, high):
             if int(size) < 2:
                 return (f'the {name} lattice has {int(size)} cell'
                         f'{"" if int(size) == 1 else "s"} along {axis} '
-                        f'(shape {tuple(field.shape[2:])}; the Metal kernels '
+                        f'(shape {tuple(field.shape[2:])}; the fused kernels '
                         'need at least 2 per axis)')
     return None
 

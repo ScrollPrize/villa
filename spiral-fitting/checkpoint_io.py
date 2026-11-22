@@ -57,19 +57,23 @@ def model_state_sha256(state_dict, frozen_epochs=(), z_begin=None,
     ``flow_interpolant`` is the Cartesian flow field's interpolant
     (SpiralAndTransform.flow_interpolant): the same parameters place another
     surface under the upsampled field than under direct low-resolution
-    sampling. Only 'upsampled' is fed, so direct sampling (CUDA's, and the
-    shipped default) and the other field types keep the digests they always
-    had.
+    sampling. Either one is fed. Before it was recorded, the digest of the
+    same parameters was the same for both (CUDA stamped it on directly
+    sampled surfaces, MPS and the CPU on upsampled ones), so no Cartesian
+    digest equals an unrecorded one: a surface is never matched to a preview,
+    commit or checkpoint digest of the other interpolant, at the cost of one
+    re-flatten and re-commit per older surface. The other field types have a
+    single interpolant (None) and keep the digests they always had.
     """
     import hashlib
     import json
 
     digest = hashlib.sha256()
     digest.update(f"z_window|{z_begin!r}|{z_end!r}\n".encode("utf-8"))
-    if flow_interpolant == "upsampled":
-        digest.update(b"flow_interpolant|upsampled\n")
-    elif flow_interpolant not in (None, "direct_lr"):
-        raise ValueError(f"unknown flow interpolant {flow_interpolant!r}")
+    if flow_interpolant is not None:
+        if flow_interpolant not in ("direct_lr", "upsampled"):
+            raise ValueError(f"unknown flow interpolant {flow_interpolant!r}")
+        digest.update(f"flow_interpolant|{flow_interpolant}\n".encode("utf-8"))
     _feed_state_dict(digest, "live/", state_dict)
     for index, snapshot in enumerate(frozen_epochs or ()):
         prefix = f"frozen/{index}/"

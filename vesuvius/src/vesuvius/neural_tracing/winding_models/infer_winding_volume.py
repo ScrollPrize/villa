@@ -672,6 +672,7 @@ def build_seed_rays(args, device="cuda:0"):
     from transforms import SpiralAndTransform
     from umbilicus import json_umbilicus_z_to_yx
     from sample_spiral import get_spiral_yxs
+    from checkpoint_io import checkpoint_flow_interpolant
 
     checkpoint = _load_checkpoint_cfg(args.fit_checkpoint)
     cfg = dict(checkpoint["cfg"])
@@ -731,6 +732,8 @@ def build_seed_rays(args, device="cuda:0"):
             checkpoint.get("spiral_outward_sense") or "CW"),
     ).to(device)
     model.load_state_dict(checkpoint["spiral_and_transform"])
+    # The surface the fit placed: its interpolant, as the fitter keeps it.
+    model.pin_flow_interpolant(checkpoint_flow_interpolant(checkpoint)[0])
     model.eval()
 
     if args.winding_range:

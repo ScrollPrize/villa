@@ -142,20 +142,25 @@ against the eager paths.
 
 The Cartesian field integrates one of two interpolants, which place slightly different surfaces
 for the same parameters. `model_flow_field_direct_lr` (on by default) samples its coarse lattice
-directly at each point. Only the fused kernels do that, so elsewhere, and for a lattice with a
-single cell along any axis (a 100-slice window with `model_flow_bounds_z_margin` 0 has one coarse
-z cell), a fit integrates the upsampled field. A new MPS fit therefore samples directly, as a CUDA
-fit does, where it used to integrate the upsampled field; `FIT_SPIRAL_DIRECT_LR=0` keeps the
-upsampled field. A checkpoint records the interpolant its fit integrated
-(`flow_field_interpolant`), and a resume, an in-session load and `flatten_spiral_checkpoint.py`
-keep it on any device: on a fused kernel where one runs, eagerly otherwise. A checkpoint written
-before that record keeps what it was fitted with: the upsampled field if it was written on MPS
-(it carries `torch_mps_rng_state`) or without CUDA, direct sampling if it came from a CUDA
-machine. `FIT_SPIRAL_DIRECT_LR=0` or `1` overrides the choice for fresh fits and checkpoints
-alike; switching a checkpoint's interpolant is logged, and its surface moves. `1` is refused
-where no fused kernel takes the lattices. The model-state digest that checkpoints and previews
-carry names the upsampled interpolant, so the service re-shows a preview only for the surface
-it shows.
+directly at each point. Only the fused kernels do that, so elsewhere, and on any device for a
+lattice with a single cell along an axis (a 100-slice window with `model_flow_bounds_z_margin` 0
+has one coarse z cell), a fresh fit integrates the upsampled field. A new MPS fit therefore samples
+directly, as a CUDA fit does, where it used to integrate the upsampled field;
+`FIT_SPIRAL_DIRECT_LR=0` keeps the upsampled field. A checkpoint records the interpolant its fit
+integrated (`flow_field_interpolant`), and a resume, an in-session load, a model-stage rebuild and
+`flatten_spiral_checkpoint.py` keep it on any device: on a fused kernel where one takes the
+lattices, eagerly otherwise. A checkpoint written before that record keeps what it was fitted
+with: the upsampled field if it was written on MPS (it carries `torch_mps_rng_state`) or without
+CUDA, direct sampling if it came from a CUDA machine (a fit there that ran the upsampled field,
+with `FIT_SPIRAL_DEVICE=cpu`, `FIT_SPIRAL_DIRECT_LR=0`, `FIT_SPIRAL_TRITON=0` or no Triton, needs
+`FIT_SPIRAL_DIRECT_LR=0` to keep it). The interpolant changes only when asked, and the change is
+logged: `FIT_SPIRAL_DIRECT_LR=0` or `1` sets it for fresh fits and checkpoints alike, and a fit
+whose `model_flow_field_direct_lr` differs from its checkpoint's lets the configuration decide, as
+before checkpoints recorded it. `FIT_SPIRAL_DIRECT_LR=1` is refused for a fresh fit where no fused
+kernel takes the lattices. The model-state digest that checkpoints, previews and commits carry
+names the interpolant, so a surface is never matched to a preview or commit of the other one; a
+Cartesian surface written before has another digest, and its preview is flattened and committed
+again once.
 
 MPS has no float64. Device tensors that are float64 on CUDA take their dtype
 from `devices.float_hi()`, which is float32 on MPS;
@@ -1185,7 +1190,8 @@ previous successfully published preview.
 
 Every checkpoint and every raw preview export carry a content digest of the
 model state that placed the surface (`model_state_sha256`: live parameters,
-frozen constraint-bake epochs and run window). The service records each
+frozen constraint-bake epochs, run window and the Cartesian flow field's
+interpolant). The service records each
 published preview under that digest in
 `<output>/.spiral-published/preview-index.json`. When the fitter reports that
 its resident model equals a checkpoint - after a save, an in-session load or a

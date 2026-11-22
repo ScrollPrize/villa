@@ -2689,7 +2689,14 @@ class FitContext:
     def _keep_checkpoint_interpolant(self, checkpoint):
         """Integrate the flow interpolant ``checkpoint`` was fitted with
         (checkpoint_io.checkpoint_flow_interpolant) from now on, and say so
-        when an older checkpoint's interpolant had to be inferred."""
+        when an older checkpoint's interpolant had to be inferred.
+
+        A model_flow_field_direct_lr this fit sets otherwise than the
+        checkpoint did is an explicit change (the preflight does not compare
+        the key: a model-stage rebuild may change it), so the configuration
+        decides, as it did before checkpoints recorded the interpolant, and
+        the change is logged with the interpolant it leads to.
+        """
         pin = getattr(self.spiral_and_transform, 'pin_flow_interpolant', None)
         if pin is None or not isinstance(checkpoint, dict):
             return
@@ -2697,11 +2704,34 @@ class FitContext:
             interpolant, note = checkpoint_flow_interpolant(checkpoint)
         except ValueError:
             return   # an unknown recorded interpolant: the preflight refuses it
+        saved = (checkpoint.get('cfg') or {}).get('model_flow_field_direct_lr')
+        live = self.config.get('model_flow_field_direct_lr')
+        changed = (interpolant is not None and saved is not None
+                   and live is not None and bool(saved) != bool(live))
         field = getattr(self.spiral_and_transform, 'flow_field', None)
         previous = getattr(field, 'pinned_interpolant', None)
-        pin(interpolant)
-        if note and previous != interpolant:
-            print(f'checkpoint flow field: {interpolant} ({note})', flush=True)
+        try:
+            pin(None if changed else interpolant)
+        except ValueError:
+            # Another field type than the checkpoint's: the preflight refuses
+            # it and says why.
+            return
+        message = None
+        if changed:
+            now = self._flow_interpolant()
+            message = (f'checkpoint flow field: model_flow_field_direct_lr is {bool(live)} '
+                       f'here and was {bool(saved)} in the checkpoint ({interpolant}); '
+                       f'integrating {now}'
+                       + ('; the fitted surface moves' if now != interpolant else ''))
+        elif note and previous != interpolant:
+            message = f'checkpoint flow field: {interpolant} ({note})'
+        # A resume pins twice (at construction and in load_checkpoint): say it once.
+        logged = getattr(self, '_interpolant_messages', None)
+        if logged is None:
+            logged = self._interpolant_messages = set()
+        if message is not None and message not in logged:
+            logged.add(message)
+            print(message, flush=True)
 
     def _checkpoint_payload(self, completed_iterations):
         return {

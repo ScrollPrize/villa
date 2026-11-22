@@ -33,6 +33,7 @@ import math
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -42,7 +43,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import checkpoint_io  # noqa: E402
 import fit_spiral  # noqa: E402
 import flatten_spiral_checkpoint  # noqa: E402
+import flow_fields  # noqa: E402
 import flow_metal  # noqa: E402
+import flow_triton  # noqa: E402
 from config import Config  # noqa: E402
 from flow_fields import CartesianFlowField  # noqa: E402
 from test_flow_direct_fused import _reference_integrate  # noqa: E402
@@ -252,6 +255,8 @@ class _Fit(fit_spiral.FitContext):
         self.spiral_outward_sense = 'CW'
         self.z_direction_is_top_to_bottom = False
         self.interactive_driver = None
+        self.paths = SimpleNamespace(volume_uuid=None)
+        self.winding_model_mode = False
 
     def _checkpoint_input_manifest(self):
         return {}
@@ -408,21 +413,125 @@ def test_a_fresh_field_reports_the_interpolant_it_integrates(simulated_metal, mo
     assert _model(_config(model_flow_field_type='cylindrical')).flow_interpolant() is None
 
 
-def test_the_digest_names_the_upsampled_interpolant_only():
+def test_the_digest_names_either_interpolant():
+    # Before the interpolant was recorded, one digest covered both surfaces of
+    # the same parameters: CUDA stamped it on directly sampled ones, MPS and
+    # the CPU on upsampled ones. A digest naming either interpolant therefore
+    # equals no older one.
     state = _model(_config()).state_dict()
-    plain = checkpoint_io.model_state_sha256(state, (), 0, Z_SPAN)
-    # Direct sampling (CUDA's, and the shipped default) keeps the digest it
-    # always had, so existing CUDA checkpoints and previews still match.
-    assert checkpoint_io.model_state_sha256(
-        state, (), 0, Z_SPAN, flow_interpolant='direct_lr') == plain
-    assert checkpoint_io.model_state_sha256(
-        state, (), 0, Z_SPAN, flow_interpolant='upsampled') != plain
+    unrecorded = checkpoint_io.model_state_sha256(state, (), 0, Z_SPAN)
+    direct = checkpoint_io.model_state_sha256(
+        state, (), 0, Z_SPAN, flow_interpolant='direct_lr')
+    upsampled = checkpoint_io.model_state_sha256(
+        state, (), 0, Z_SPAN, flow_interpolant='upsampled')
+    assert len({unrecorded, direct, upsampled}) == 3
+
+
+def test_a_cuda_checkpoint_loaded_on_the_cpu_is_never_main_s_surface_digest(no_overrides):
+    # The reviewer's case: main loaded a CUDA checkpoint in session on the
+    # CPU, integrated the upsampled field and reported the unrecorded digest
+    # (which its published previews and commits carry). This session
+    # integrates the checkpoint's direct sampling, another surface, so it must
+    # report another digest.
+    cfg = _config()
+    fitted = _model(cfg)
+    session = _Fit(_model(cfg, seed=99), cfg)
+    checkpoint = session._checkpoint_payload(7)
+    checkpoint.pop('flow_field_interpolant', None)
+    checkpoint.update(spiral_and_transform=fitted.state_dict(),
+                      torch_cuda_rng_states=[torch.zeros(16, dtype=torch.uint8)])
+    mains = checkpoint_io.model_state_sha256(fitted.state_dict(), (), 0, Z_SPAN)
+
+    session.apply_checkpoint(checkpoint)
+
+    assert session.spiral_and_transform.flow_interpolant() == 'direct_lr'
+    assert session.model_state_digest() != mains
 
 
 def test_an_unknown_recorded_interpolant_is_refused():
     with pytest.raises(ValueError, match='unknown flow interpolant'):
         checkpoint_io.checkpoint_flow_interpolant(
             {'cfg': _config(), 'flow_field_interpolant': 'bicubic'})
+
+
+def test_a_changed_direct_lr_setting_decides_and_is_logged(simulated_metal, capsys):
+    # model_flow_field_direct_lr is no model-shaping key: the preflight lets a
+    # fit (a model-stage rebuild, say) set it otherwise than its checkpoint.
+    # The configuration then decides, as it did before checkpoints recorded
+    # the interpolant, and the change is logged.
+    cfg = _config()
+    fitted = _model(cfg)
+    points = _points()
+    upsampled, _ = _references(fitted.state_dict(), points)
+    checkpoint = _Fit(fitted, cfg)._checkpoint_payload(7)
+    assert checkpoint['flow_field_interpolant'] == 'direct_lr'
+    off = _config(model_flow_field_direct_lr=False)
+    session = _Fit(_model(off, seed=99), off)
+    capsys.readouterr()
+
+    session.apply_checkpoint(checkpoint)
+
+    torch.testing.assert_close(_surface(session.spiral_and_transform, points),
+                               upsampled, **SAME)
+    out = capsys.readouterr().out
+    assert out.count('model_flow_field_direct_lr is False here and was True') == 1
+    assert 'the fitted surface moves' in out
+
+
+def test_a_checkpoint_of_another_field_type_is_left_to_the_preflight():
+    # A Cartesian checkpoint resumed into a fit configured with another field
+    # type: keeping its interpolant must not raise before the preflight
+    # reports the model-shaping mismatch.
+    cylindrical = _config(model_flow_field_type='cylindrical')
+    session = _Fit(_model(cylindrical), cylindrical)
+    checkpoint = _legacy(_model(_config()).state_dict(), _config(), mps=True)
+    session._keep_checkpoint_interpolant(checkpoint)
+    assert session.spiral_and_transform.flow_interpolant() is None
+    verdict = session.inspect_checkpoint(checkpoint)
+    assert not verdict.accepted
+    assert 'model_flow_field_type' in verdict.message()
+
+
+def test_a_one_cell_lattice_never_reaches_triton(monkeypatch):
+    # Triton's backward clamps its lower corner to size - 2 as Metal's does,
+    # which is -1 on a single-cell axis: it would read and add outside the
+    # lattice. Such lattices take the path they take without a kernel.
+    monkeypatch.delenv('FIT_SPIRAL_DIRECT_LR', raising=False)
+    monkeypatch.setattr(flow_triton, 'rk4_triton_available',
+                        lambda *tensors: True)
+    thin = _thin(0)
+    backend, reason = flow_fields._fused_direct_backend(thin.flows[0], thin.flows[1])
+    assert backend is None and '1 cell along z' in reason
+    assert thin.effective_interpolant() == 'upsampled'
+    wide = CartesianFlowField([12, 12, 12], spatial_scale_factor=6, direct_lr=True)
+    assert flow_fields._fused_direct_backend(wide.flows[0], wide.flows[1])[0] is flow_triton
+
+
+def test_the_winding_volume_seeds_integrate_the_checkpoint_s_interpolant(no_overrides, tmp_path):
+    # vesuvius' infer_winding_volume rebuilds the fitted model to place its
+    # seed rays: a CUDA checkpoint keeps its direct sampling on the CPU too.
+    import importlib.util
+    path = (Path(__file__).resolve().parents[2] / 'vesuvius/src/vesuvius/neural_tracing'
+            / 'winding_models/infer_winding_volume.py')
+    spec = importlib.util.spec_from_file_location('infer_winding_volume_under_test', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    state = _model(_config()).state_dict()
+    umbilicus = _umbilicus_file(tmp_path)
+    seeds = {}
+    for name, extra in (('cuda', {}), ('direct', {'flow_field_interpolant': 'direct_lr'}),
+                        ('upsampled', {'flow_field_interpolant': 'upsampled'})):
+        checkpoint = {**_legacy(state, _config(), cuda=True), **extra}
+        torch.save(checkpoint, tmp_path / f'{name}.ckpt')
+        args = SimpleNamespace(fit_checkpoint=str(tmp_path / f'{name}.ckpt'),
+                               umbilicus=str(umbilicus), z_range=None,
+                               winding_range=(1, 3), winding_step=1, seed_spacing=8)
+        seeds[name] = module.build_seed_rays(args, device='cpu')['seed_xyz']
+    np = pytest.importorskip('numpy')
+    assert seeds['cuda'].shape == seeds['direct'].shape
+    np.testing.assert_allclose(seeds['cuda'], seeds['direct'], rtol=0, atol=1e-4)
+    assert seeds['cuda'].shape != seeds['upsampled'].shape or \
+        float(np.abs(seeds['cuda'] - seeds['upsampled']).max()) > 1e-3
 
 
 # --------------------------------------------------------------------------
