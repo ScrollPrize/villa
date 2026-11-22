@@ -1,6 +1,6 @@
 {
  "name": "pooled_to_native_pherc0814",
- "description": "Least-squares kernel mapping the pooled 2.4 um render (public_2p4_level2_zmean4, 21 planes) of PHerc 0814 segment 46527 onto its native 9.362 um render (28 planes), both z-scored on papyrus; cross-correlation over (z, y, x). Held-out R^2 0.740 (resampling alone 0.623); residual sd 0.454.",
+ "description": "Least-squares kernel mapping the pooled 2.4 um render (public_2p4_level2_zmean4, 21 planes) of PHerc 0814 segment 46527 onto its native 9.362 um render (28 planes), both z-scored on papyrus; cross-correlation over (z, y, x). Fitted with an earlier version of scan_transfer_fit.py (random 80/20 split of sampled papyrus pixels, no spatial separation): held-out R^2 0.740 (centre pooled voxel alone 0.623); residual sd 0.454. Refitting the same pair with the current scan_transfer_fit.py gives 0.711 vs 0.590 on randomly held-out pixels; a separate check holding out 256 px blocks with a guard band gives 0.707 vs 0.580.",
  "fit": {
   "pair": "PHerc0814 46527 pooled vs native 9.362um 113keV",
   "scale_yx": [
