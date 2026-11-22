@@ -12,15 +12,19 @@ place different surfaces, so:
   integrated where it was written: an MPS one (it carries
   ``torch_mps_rng_state``) or a CPU one to the upsampled field, a CUDA one to
   direct sampling;
-- startup resume, in-session load and the flattener keep that interpolant.
-  They integrate a direct one eagerly where no fused kernel runs. Only
-  FIT_SPIRAL_DIRECT_LR switches it, and the switch is logged;
-- the model-state digest (stamped into checkpoints and previews, and keying
-  preview reuse) tells the upsampled interpolant apart;
+- startup resume, in-session load, model-stage rebuilds, the flattener and
+  vesuvius' infer_winding_volume keep that interpolant. They integrate a
+  direct one eagerly where no fused kernel runs. It changes only when asked
+  (FIT_SPIRAL_DIRECT_LR, or a model_flow_field_direct_lr set otherwise than
+  the checkpoint's), and the change is logged;
+- the model-state digest (stamped into checkpoints, previews and commits,
+  and keying preview reuse) names the interpolant, so it equals no digest
+  written before, when one digest covered both surfaces;
 - a lattice with a single cell along any axis (the documented 100-slice
-  window with no z margin has one coarse z cell) falls back to the upsampled
-  field, in training and export, unless FIT_SPIRAL_DIRECT_LR=1 asks for
-  direct sampling, which then names the shape.
+  window with no z margin has one coarse z cell) reaches neither fused
+  kernel: it falls back to the upsampled field, in training and export,
+  unless FIT_SPIRAL_DIRECT_LR=1 asks for direct sampling, which then names
+  the shape.
 
 The Metal dispatch is checked on any machine. The ``simulated_metal`` fixture
 makes flow_metal accept CPU float32 lattices and run the kernels' arithmetic
