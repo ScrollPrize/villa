@@ -17,8 +17,11 @@ tests/test_gap_fused.py checks both fused backends against the eager path.
 
 One difference from the Triton kernels changes a gradient, at one boundary:
 the point gradient is zero exactly on the logit lattice's last row or column,
-as on the eager path (which repeats that row or column), where the Triton
-kernels take the slope towards a missing, zero-weighted neighbour.
+as on MPS's eager path (gathers that repeat that row or column:
+geom_utils.gather_grid_sample_border), where the Triton kernels take the slope
+towards a missing, zero-weighted neighbour. (CUDA's eager path, grid_sample,
+gives no gradient on the first row or column either; this kernel, like MPS's
+eager path, keeps the one-sided slope there.)
 
 Two further differences from the Triton kernels change no result:
 - Each thread stops at its own last useful winding instead of its block's.
@@ -332,7 +335,7 @@ kernel void gap_bwd(device const float* theta [[buffer(0)]],
                                       memory_order_relaxed);
         }
         // coordinate gradients: none outside the lattice (the border clamp)
-        // nor exactly on its last column, where the eager border sample
+        // nor exactly on its last column, where MPS's eager border sample
         // repeats that column (see gy_ok below)
         const float gx_ok = (ux_raw >= 0.0f && ux_raw < tm1f) ? 1.0f : 0.0f;
         const float g_ux = g_logit
@@ -342,10 +345,10 @@ kernel void gap_bwd(device const float* theta [[buffer(0)]],
         g_uy += g_logit * ((s.v_sw - s.v_nw) * s.wx0 + (s.v_se - s.v_ne) * s.wx1);
     }
     // z has no gradient outside the lattice (the border clamp) nor exactly on
-    // its last row: there the eager path's border sample (on MPS, gathers
-    // that repeat the last row: geom_utils.gather_grid_sample_border) is flat
-    // in z, while the missing row's zero weights here would give a slope.
-    // On the first row both take the one-sided slope into the lattice.
+    // its last row: there MPS's eager path (gathers that repeat the last row:
+    // geom_utils.gather_grid_sample_border) is flat in z, while the missing
+    // row's zero weights here would give a slope. On the first row both take
+    // the one-sided slope into the lattice.
     const float gy_ok = (r.uy_raw >= 0.0f && r.uy_raw < nzm1f) ? 1.0f : 0.0f;
     g_theta_buf[gid] = g_tn / two_pi;
     g_z_buf[gid] = g_uy * gy_ok * (nzm1f / 2.0f) * 2.0f / zrange;

@@ -17,12 +17,13 @@ the comparison is built around where they cannot:
   sample within rounding of an edge may take either slope: a few points may
   differ in the per-point quantities (at most 3 in 4096 measured);
 - the logit and dr_per_winding gradients each sum ~10^5 signed float32
-  terms, so they are compared against the terms' absolute sum, not the
-  (cancelling) result: the absolute sum is the gradient of a radial loss
-  with one sign per path, in float64 (_absolute_sums).
-Measured on MPS (torch 2.11) over 200 seeds of each case
-(GAP_FUSED_SEEDS=200 runs them): the tolerances below are about 5x the
-largest spread, and the eager path itself is as far from a float64 run.
+  terms, so they are compared against the terms' exact absolute sums
+  (_absolute_sums, float64), not the (cancelling) results, element by
+  element, and the logit gradient also as a whole (its projection on the
+  eager one).
+The tolerances are set from the largest spreads over 200 seeds of each case
+on MPS (GAP_FUSED_SEEDS=200 runs them; see LOGIT_TOL), and the eager path
+itself is as far from a float64 run as the kernel is.
 """
 import math
 import os
@@ -55,6 +56,20 @@ pytestmark = pytest.mark.skipif(
 
 
 SEEDS = range(1234, 1234 + int(os.environ.get('GAP_FUSED_SEEDS', '1')))
+# Tolerances of the accumulated gradients (see test_fused_gap_matches_eager),
+# against the largest spreads over 200 seeds of each case on MPS (torch 2.11):
+# - per logit element, |fused - eager| against the element's terms' absolute
+#   sum plus 1e-5 of the largest: up to 0.52. Two float32 orders do not
+#   agree on every element (a point past the outermost winding, for one,
+#   extrapolates its bracket and moved one element by 2.5% of its terms), so
+#   this bound catches misrouted contributions, not small biases;
+# - the projection of the fused logit gradient on the eager one: within
+#   5.4e-5 of 1, so 1e-3 catches a bias of 0.1% in the scatter;
+# - dr_per_winding, against its terms' absolute sum: up to 1.3e-5, so 4e-5
+#   (a 1% error in the kernel's dr terms moved it by 6.7e-5 to 1e-3).
+LOGIT_TOL, LOGIT_FLOOR = 1.0, 1e-5
+PROJECTION_TOL = 1e-3
+DR_TOL = 4e-5
 
 
 def _inputs(n, logit_std, seed=1234):
@@ -99,24 +114,44 @@ def _unambiguous(truncate_frac, logits, points, margin=0.05):
 
 
 def _absolute_sums(truncate_frac, logits, points, weights):
-    # The gap transform moves points radially, so each point's term in a logit
-    # or dr_per_winding gradient is at most |w_p| times its radius' derivative.
-    # With the outward unit vector as the forward map's loss weight and its
-    # negation as the inverse's, those derivatives all take one sign (forward
-    # radii grow with every gap, inverse ones shrink), so this loss's float64
-    # gradients are their absolute sums, times the largest |w_p|.
-    params, dr, transform = _transform('cpu', truncate_frac, logits, torch.float64)
-    x = points.double()
-    outward = torch.cat([torch.zeros_like(x[..., :1]),
-                         torch.nn.functional.normalize(x[..., 1:], dim=-1)], dim=-1)
-    ((transform._call(x) * outward).sum()
-     - (transform._inverse(x) * outward).sum()).backward()
-    largest = float(weights.norm(dim=-1).max())
-    return (float(params.logits.grad.abs().max()) * largest,
-            float(dr.grad.abs()) * largest)
+    """Each accumulated gradient's terms' absolute sum, exactly, in float64.
+
+    Logits: an element's gradient sums g * w over every (point, winding)
+    sample whose bilinear corners include it, with g the loss gradient at
+    the sampled logit and w >= 0 the corner weight. Recording both maps'
+    samples, then backpropagating |g| through the same samples, gives the
+    sum of |g| * w per element. dr_per_winding: each point's loss term's
+    derivative by central differences, summed in absolute value.
+    """
+    params, _, transform = _transform('cpu', truncate_frac, logits, torch.float64)
+    x, w = points.double(), weights.double()
+    samples, sample = [], transform.get_logits_by_winding
+
+    def recording(theta, z):
+        out = sample(theta, z)
+        out.retain_grad()
+        samples.append((theta.detach(), z.detach(), out))
+        return out
+    transform.get_logits_by_winding = recording
+    ((transform._call(x) * w[0]).sum() + (transform._inverse(x) * w[1]).sum()).backward()
+    transform.get_logits_by_winding = sample
+    params.logits.grad = None
+    transform._pinned_scaled_logits = None   # its graph went with that backward
+    sum((sample(theta, z) * out.grad.abs()).sum()
+        for theta, z, out in samples).backward()
+    logits_sums = params.logits.grad.abs().reshape(-1)
+    terms = []
+    with torch.no_grad():
+        for step in (1e-6, -1e-6):
+            _, _, shifted = _transform('cpu', truncate_frac, logits, torch.float64)
+            shifted.dr_per_winding = torch.tensor(DR + step, dtype=torch.float64)
+            terms.append((shifted._call(x) * w[0]).sum(-1)
+                         + (shifted._inverse(x) * w[1]).sum(-1))
+    dr_sum = float(((terms[0] - terms[1]) / 2e-6).abs().sum())
+    return logits_sums, dr_sum
 
 
-def _run(device, truncate_frac, logit_std=0.01, n=4096, seed=1234):
+def _run(device, truncate_frac, logit_std=0.01, n=4096, seed=1234, sums=False):
     logits, points, weights = _inputs(n, logit_std, seed)
     keep = _unambiguous(truncate_frac, logits, points)
     points, weights = points[keep], weights[:, keep]
@@ -124,15 +159,16 @@ def _run(device, truncate_frac, logit_std=0.01, n=4096, seed=1234):
     x = points.to(device).requires_grad_(True)
     mapped = transform._call(x)
     restored = transform._inverse(x)
-    weights = weights.to(device)
-    ((mapped * weights[0]).sum() + (restored * weights[1]).sum()).backward()
+    on_device = weights.to(device)
+    ((mapped * on_device[0]).sum() + (restored * on_device[1]).sum()).backward()
     backend = transform._fused_gap(x, dr)
     out = {
         'mapped': mapped, 'restored': restored, 'grad_points': x.grad,
         'grad_logits': params.logits.grad, 'grad_dr': dr.grad.reshape(1),
     }
     out = {k: v.detach().cpu() for k, v in out.items()}
-    out['absolute_sums'] = _absolute_sums(truncate_frac, logits, points, weights)
+    if sums:
+        out['absolute_sums'] = _absolute_sums(truncate_frac, logits, points, weights)
     return backend, out
 
 
@@ -146,7 +182,7 @@ def _run(device, truncate_frac, logit_std=0.01, n=4096, seed=1234):
 def test_fused_gap_matches_eager(monkeypatch, device, switch, module,
                                  truncate_frac, logit_std, seed):
     monkeypatch.setenv(switch, '0')
-    eager_backend, eager = _run(device, truncate_frac, logit_std, seed=seed)
+    eager_backend, eager = _run(device, truncate_frac, logit_std, seed=seed, sums=True)
     monkeypatch.setenv(switch, '1')
     fused_backend, fused = _run(device, truncate_frac, logit_std, seed=seed)
     assert eager_backend is None
@@ -160,14 +196,21 @@ def test_fused_gap_matches_eager(monkeypatch, device, switch, module,
         error = (fused[key] - eager[key]).abs().max(dim=-1).values
         outliers = int((error > tol * float(eager[key].abs().max())).sum())
         assert outliers <= 4, f'{key}: {outliers} points over {tol}'
-    # The sums, against their terms' absolute sums (largest spread over 200
-    # seeds: 3.8e-4 for the logits, 2.6e-4 for dr_per_winding).
-    logits_scale, dr_scale = eager['absolute_sums']
-    torch.testing.assert_close(fused['grad_logits'], eager['grad_logits'],
-                               rtol=0, atol=2e-3 * logits_scale)
-    torch.testing.assert_close(
-        fused['grad_dr'], eager['grad_dr'], rtol=0,
-        atol=2e-3 * max(dr_scale, float(eager['grad_dr'].abs().max())))
+    # The sums, element by element against their terms' absolute sums (plus
+    # a floor of LOGIT_FLOOR of the largest: an element whose whole sum is a
+    # rounding-sized corner weight of a sample on a cell edge), and the logit
+    # gradient as a whole by its projection on the eager one, which a bias
+    # in the scatter moves.
+    logits_sums, dr_sum = eager['absolute_sums']
+    fused_logits = fused['grad_logits'].reshape(-1).double()
+    eager_logits = eager['grad_logits'].reshape(-1).double()
+    bound = LOGIT_TOL * (logits_sums + LOGIT_FLOOR * logits_sums.max())
+    over = int(((fused_logits - eager_logits).abs() > bound).sum())
+    assert over == 0, f'{over} logit-gradient elements over their bound'
+    projection = float(fused_logits @ eager_logits / (eager_logits @ eager_logits))
+    assert abs(projection - 1.0) <= PROJECTION_TOL, projection
+    dr_error = float((fused['grad_dr'] - eager['grad_dr']).abs())
+    assert dr_error <= DR_TOL * dr_sum, (dr_error, dr_sum)
 
 
 @pytest.mark.parametrize('device,switch,module', BACKENDS,
@@ -218,16 +261,27 @@ def test_inputs_cover_the_inverse_never_found_case():
     assert past >= 50 and below >= 50, (past, below)
 
 
-# z exactly at max_z puts the logit lattice's row coordinate on its last row.
-# The eager path's border sample (on MPS, gathers that repeat the last row)
-# gives z no gradient through the logits there, and the kernels must not
-# either; z at min_z is the first row, where both take the one-sided slope.
+# The boundary reference is MPS's eager path: its border sample is built from
+# gathers that repeat the last row or column (flat there) and take the
+# one-sided slope on the first. On CUDA the eager path is grid_sample, which
+# gives no gradient on either boundary, and the Triton kernels keep the slope
+# on both: their boundary convention is not this one, so these run on MPS.
+needs_mps = pytest.mark.skipif(
+    not torch.backends.mps.is_available(),
+    reason="the boundary reference is MPS's eager path (gathers); CUDA's "
+           'grid_sample and the Triton kernels take other conventions there')
+
+
+# z exactly at max_z puts the logit lattice's row coordinate on its last row:
+# MPS's eager path gives z no gradient through the logits there, and the Metal
+# kernel must not either; z at min_z is the first row, where both take the
+# one-sided slope.
+@needs_mps
 @pytest.mark.parametrize('z', [MAX_Z, MIN_Z], ids=['upper', 'lower'])
 @pytest.mark.parametrize('truncate_frac', [None, 0.6])
-@pytest.mark.parametrize('device,switch,module', BACKENDS,
-                         ids=[b[0] for b in BACKENDS])
 def test_fused_gap_gradient_at_the_z_boundaries_matches_eager(
-        monkeypatch, device, switch, module, truncate_frac, z):
+        monkeypatch, truncate_frac, z):
+    device, switch = 'mps', 'FIT_SPIRAL_METAL'
     logits, points, weights = _inputs(1024, 0.7)
     points[:, 0] = z
     keep = _unambiguous(truncate_frac, logits, points)
@@ -253,3 +307,43 @@ def _run_points(device, truncate_frac, logits, points, weights):
      + (transform._inverse(x) * weights[1]).sum()).backward()
     return {'grad_points': x.grad.detach().cpu(),
             'grad_logits': params.logits.grad.detach().cpu()}
+
+
+@needs_mps
+def test_metal_gap_gradient_on_the_last_logit_column_matches_eager(monkeypatch):
+    # The last column, exactly. With dr_per_winding 2 and 5 windings the
+    # lattice has 6 columns, windings starting at [0, 1, 2, 4, 6]; at
+    # theta = 4 pi winding 2's column coordinate is 2 + 2 * (4 - 2) = 6, the
+    # last one, in float32 on both paths (the eager lerp gives 4 + 2). The
+    # bracketing winding 2 is the last one the backward walks.
+    monkeypatch.setenv('FIT_SPIRAL_METAL', '1')
+    params = GapExpanderParams(resolution=24, min_z=MIN_Z, max_z=MAX_Z,
+                               num_windings=5, dr_per_winding=2.0).to('mps')
+    assert params.winding_first_logit_idx.tolist() == [0, 1, 2, 4, 6]
+    with torch.no_grad():
+        params.logits.copy_(torch.randn(
+            params.logits.shape, generator=torch.Generator().manual_seed(5)) * 0.7)
+    dr = torch.tensor(2.0, device='mps')
+    z = torch.tensor([50.0, 100.0, 150.0], device='mps')   # off the row edges
+    iw = torch.full((3,), 2, dtype=torch.int64, device='mps')
+    grads = {}
+    for path in ('fused', 'eager'):
+        # One transform per path: it caches the pinned logits' graph.
+        transform = GapExpandingTransform(
+            params, dr, MIN_Z, MAX_Z, gap_expander_lr_scale=0.3, min_gap=0.5,
+            softplus_bias=4.0)
+        consts = transform._triton_consts()
+        theta = torch.full((3,), 4 * math.pi, device='mps', requires_grad=True)
+        if path == 'fused':
+            r_in, r_out = gap_metal.gap_bracketing_radii(
+                theta, z, transform._get_pinned_scaled_logits(), consts['idx'],
+                consts['idx_total'], dr, iw, None, consts['min_z'],
+                consts['max_z'], consts['min_gap'], consts['softplus_bias'],
+                consts['softplus_denominator'], consts['softplus_scale'])
+        else:
+            radii = transform.get_transformed_winding_radii(theta, z)
+            r_in = radii.gather(-1, iw[:, None]).squeeze(-1)
+            r_out = radii.gather(-1, (iw + 1)[:, None]).squeeze(-1)
+        (r_in * 0.3 + r_out * 1.7).sum().backward()
+        grads[path] = theta.grad.cpu()
+    torch.testing.assert_close(grads['fused'], grads['eager'], rtol=1e-5, atol=1e-5)
