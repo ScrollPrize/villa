@@ -460,7 +460,7 @@ struct OpenDataManifest {
 
 
 // Where manifests are cached: $VC_READER_CACHE_DIR, else $XDG_CACHE_HOME/vc_reader,
-// else ~/.cache/vc_reader.
+// else .cache/vc_reader in the home directory (%USERPROFILE% first on Windows).
 [[nodiscard]] std::filesystem::path defaultCatalogCacheDir();
 // The cache file of one manifest source in `cacheDir` (empty: the default directory).
 [[nodiscard]] std::filesystem::path catalogCacheFile(const std::string& source, const std::filesystem::path& cacheDir = {});

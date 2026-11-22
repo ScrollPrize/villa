@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <system_error>
 
@@ -159,5 +160,24 @@ inline std::string make_temp_directory(std::string pattern)
 inline long process_id() { return static_cast<long>(::getpid()); }
 
 #endif
+
+// The user's home directory: $HOME, after %USERPROFILE% and %HOMEDRIVE%%HOMEPATH% on
+// Windows, which sets no HOME itself. Inline on Windows too: it needs no <windows.h>.
+inline std::optional<std::filesystem::path> home_directory()
+{
+#ifdef _WIN32
+    if (const wchar_t* profile = _wgetenv(L"USERPROFILE"); profile && *profile)
+        return std::filesystem::path(profile);
+    const wchar_t* drive = _wgetenv(L"HOMEDRIVE");
+    const wchar_t* homePath = _wgetenv(L"HOMEPATH");
+    if (drive && *drive && homePath && *homePath)
+        return std::filesystem::path(std::wstring(drive) + homePath);
+#endif
+    if (const char* home = std::getenv("HOME"); home && *home) {
+        const std::string utf8(home);
+        return std::filesystem::path(std::u8string(utf8.begin(), utf8.end()));
+    }
+    return std::nullopt;
+}
 
 }  // namespace vcr::platform

@@ -2,6 +2,7 @@
 #include "vc_reader/catalog.hpp"
 #include "http.hpp"
 #include "atomic_file.hpp"
+#include "platform_io.hpp"
 #include <zlib.h>
 #include <cstdlib>
 #include <fstream>
@@ -14,7 +15,7 @@ std::filesystem::path defaultCatalogCacheDir() {
     const auto env=[](const char* name){const char* v=std::getenv(name);return std::string(v?v:"");};
     if(const auto dir=env("VC_READER_CACHE_DIR");!dir.empty())return dir;
     if(const auto xdg=env("XDG_CACHE_HOME");!xdg.empty())return std::filesystem::path(xdg)/"vc_reader";
-    return std::filesystem::path(env("HOME"))/".cache"/"vc_reader";
+    return platform::home_directory().value_or("")/".cache"/"vc_reader";
 }
 std::filesystem::path catalogCacheFile(const std::string& source,const std::filesystem::path& cacheDir) {
     Sha256 hash;hash.update(source.data(),source.size());

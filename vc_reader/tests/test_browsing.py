@@ -1,5 +1,6 @@
 """Relationship and resolution contracts, independent of optional readers."""
 import json
+import os
 import pickle
 import unittest
 from unittest.mock import patch
@@ -261,3 +262,13 @@ def test_native_artifact_parameter_parity():
     for level in [None, -1, 2.5, "2", 2, 5, 6, 10**40]:
         raw = {"type": "surface-prediction-zarr", "parameters": {"level": level}}
         assert Artifact.from_json(raw).level == _catalog.parse_artifacts([raw])[0].level
+
+
+def test_default_cache_dir_is_in_the_home_directory(monkeypatch, tmp_path):
+    from vc_reader import default_cache_dir
+    for name in ('VC_READER_CACHE_DIR', 'XDG_CACHE_HOME'):
+        monkeypatch.delenv(name, raising=False)
+    # Windows names the home directory in %USERPROFILE%, whatever a shell puts in HOME.
+    monkeypatch.setenv('HOME', str(tmp_path/'shell'))
+    monkeypatch.setenv('USERPROFILE' if os.name == 'nt' else 'HOME', str(tmp_path))
+    assert default_cache_dir() == tmp_path/'.cache'/'vc_reader'
