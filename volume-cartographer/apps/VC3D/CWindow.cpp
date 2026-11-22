@@ -5424,9 +5424,14 @@ void CWindow::onSegmentationEditingModeChanged(bool enabled)
 
     if (enabled) {
         auto activeSurfaceShared = std::dynamic_pointer_cast<QuadSurface>(_state->surface("segmentation"));
+        // While Rotate is open the viewer can show its unsaved preview: edits and their autosave
+        // would publish the preview's geometry outside Apply.
+        const bool rotating = _surfaceRotationOverlay && _surfaceRotationOverlay->isOpen();
 
-        if (!_segmentationModule->beginEditingSession(activeSurfaceShared)) {
-            showStatusBarMessage(tr("Unable to start segmentation editing"), 3000);
+        if (rotating || !_segmentationModule->beginEditingSession(activeSurfaceShared)) {
+            showStatusBarMessage(rotating ? tr("Apply the Rotate tool before editing the segment")
+                                          : tr("Unable to start segmentation editing"),
+                                 3000);
             if (_segmentationWidget && _segmentationWidget->isEditingEnabled()) {
                 QSignalBlocker blocker(_segmentationWidget);
                 _segmentationWidget->setEditingEnabled(false);
