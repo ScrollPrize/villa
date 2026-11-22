@@ -94,7 +94,7 @@ Alongside the meshes, a fit writes a model checkpoint, *satisfaction metrics* �
 
 ### How to run it
 
-The code lives in the villa repository under [`spiral-fitting`](https://github.com/ScrollPrize/villa/tree/main/spiral-fitting); the main entry point is [`fit_spiral.py`](https://github.com/ScrollPrize/villa/blob/main/spiral-fitting/fit_spiral.py). You'll need Python ≥ 3.14 and a GPU: an NVIDIA one, or an Apple-silicon Mac, where the fit runs on PyTorch's MPS backend (see [Running without CUDA](https://github.com/ScrollPrize/villa/blob/main/spiral-fitting/README.md#running-without-cuda)).
+The code lives in the villa repository under [`spiral-fitting`](https://github.com/ScrollPrize/villa/tree/main/spiral-fitting); the main entry point is [`fit_spiral.py`](https://github.com/ScrollPrize/villa/blob/main/spiral-fitting/fit_spiral.py). You'll need Python ≥ 3.14 and a GPU: an NVIDIA one, or an Apple-silicon Mac, where the fit runs on PyTorch's MPS backend (see [Running without CUDA](https://github.com/ScrollPrize/villa/blob/main/spiral-fitting/README.md#running-without-cuda)). With Apple's clang, `uv sync` currently stops at the OpenMP lookup even with Homebrew's `libomp` installed; [#2490](https://github.com/ScrollPrize/villa/pull/2490) proposes a fix.
 
 ```bash
 git clone https://github.com/ScrollPrize/villa.git
@@ -102,7 +102,7 @@ cd villa/spiral-fitting
 uv sync
 ```
 
-Everything the fit needs is declared in the project's own [`pyproject.toml`](https://github.com/ScrollPrize/villa/blob/main/spiral-fitting/pyproject.toml), `torch` included — on Linux it comes from the CUDA 12.8 wheel index, so there is no separate torch install to get right. `uv sync` also builds the repository's C++ packages: `vc_spiral`, the fit's native helpers, and `vc_reader` and `vc_object_store`, which read the object store the fit takes its inputs from. So the machine needs cmake, a C++ toolchain and their system libraries (Boost, Blosc, OpenCV, OpenSSL, SQLite, zstd and a few more), installed before `uv sync`; [Creating the Spiral Python environment](https://github.com/ScrollPrize/villa/blob/main/spiral-fitting/README.md#creating-the-spiral-python-environment) has the details. You no longer need a volume-cartographer Python install.
+Everything the fit needs is declared in the project's own [`pyproject.toml`](https://github.com/ScrollPrize/villa/blob/main/spiral-fitting/pyproject.toml), `torch` included — on Linux it comes from the CUDA 12.8 wheel index, so there is no separate torch install to get right. `uv sync` also builds the repository's C++ packages: `vc_spiral`, the fit's native helpers, and `vc_reader` and `vc_object_store`, which read the object store the fit takes its inputs from. So the machine needs cmake, a C++ toolchain and their system libraries (Boost, Blosc, OpenCV, OpenSSL, SQLite, zstd and a few more), installed before `uv sync`; VC3D's dependency lists for [Ubuntu](https://github.com/ScrollPrize/villa/blob/main/volume-cartographer/scripts/install_build_deps.sh) and [Homebrew](https://github.com/ScrollPrize/villa/blob/main/volume-cartographer/scripts/build_macos.sh) include them. If `uv` picks Ubuntu's own Python 3.14, also install `python3-dev` for its headers. You no longer need a volume-cartographer Python install.
 
 On Windows, `uv sync` also installs `triton-windows`, a community build of Triton, because PyTorch publishes no `triton` wheel there and the fit's fused kernels need one. The first run compiles those kernels once.
 
