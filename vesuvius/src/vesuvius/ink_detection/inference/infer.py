@@ -307,12 +307,14 @@ def iter_blocks(
     mask_lowres: np.ndarray | None = None,
     occupancy_scale: tuple[int, int] = (1, 1),
     *,
+    occupancy_origin: tuple[int, int] = (0, 0),
     roi_bounds: tuple[int, int, int, int] | None = None,
 ) -> list[Block]:
     """Schedule flat patches, including a final boundary-aligned position."""
 
     height, width = (int(value) for value in image_shape)
     scale_y, scale_x = (max(1, int(value)) for value in occupancy_scale)
+    origin_y, origin_x = occupancy_origin
     if roi_bounds is not None:
         roi_bounds = resolve_roi_bounds(roi_bounds, height=height, width=width)
     blocks: list[Block] = []
@@ -329,7 +331,10 @@ def iter_blocks(
                 low_x0 = x0 // scale_x
                 low_y1 = max(low_y0 + 1, math.ceil((y0 + valid_h) / scale_y))
                 low_x1 = max(low_x0 + 1, math.ceil((x0 + valid_w) / scale_x))
-                if not mask_lowres[low_y0:low_y1, low_x0:low_x1].any():
+                if not mask_lowres[
+                    max(0, low_y0 - origin_y) : max(0, low_y1 - origin_y),
+                    max(0, low_x0 - origin_x) : max(0, low_x1 - origin_x),
+                ].any():
                     continue
             blocks.append(Block(y0, x0, valid_h, valid_w))
     return blocks
@@ -395,46 +400,60 @@ def choose_pyramid_array(
     return selected, root[selected]
 
 
-def compute_nonempty_mask_from_lowres_array(array: Any) -> np.ndarray:
-    """Collapse a 2D/3D low-resolution array to a 2D occupancy mask."""
-
-    shape = tuple(int(value) for value in array.shape)
-    values = np.asarray(array[:])
-    if len(shape) == 2:
-        return values != 0
-    if len(shape) != 3:
-        raise ValueError(f"Occupancy array must be rank 2 or 3, got {shape!r}")
-    depth_axis = 0 if int(np.argmin(shape)) == 0 else 2
-    return np.any(values != 0, axis=depth_axis)
-
-
 def build_lowres_block_mask(
     root: Any,
     *,
     height: int,
     width: int,
     user_mask: np.ndarray | None,
-) -> tuple[np.ndarray | None, tuple[int, int], str | None]:
-    """Combine group occupancy and user mask at occupancy resolution."""
+    scan_bounds: tuple[int, int, int, int] | None = None,
+) -> tuple[np.ndarray | None, tuple[int, int], str | None, tuple[int, int]]:
+    """Read occupancy at the requested bounds and return its low-res origin."""
 
     if hasattr(root, "shape"):
-        occupancy = None
-        occupancy_level = None
-        occupancy_h, occupancy_w = height, width
+        occupancy = None if user_mask is None else np.asarray(user_mask, dtype=bool)
+        return occupancy, (1, 1), None, (0, 0)
+
+    occupancy_level, occupancy_array = choose_pyramid_array(
+        root,
+        preferred_key=DEFAULT_OCCUPANCY_SCAN_LEVEL,
+        purpose="occupancy scan",
+    )
+    shape = tuple(int(value) for value in occupancy_array.shape)
+    if len(shape) == 2:
+        depth_axis = None
+        occupancy_h, occupancy_w = shape
+    elif len(shape) == 3:
+        depth_axis = 0 if int(np.argmin(shape)) == 0 else 2
+        occupancy_h, occupancy_w = shape[1:] if depth_axis == 0 else shape[:2]
     else:
-        occupancy_level, occupancy_array = choose_pyramid_array(
-            root,
-            preferred_key=DEFAULT_OCCUPANCY_SCAN_LEVEL,
-            purpose="occupancy scan",
-        )
-        occupancy = compute_nonempty_mask_from_lowres_array(occupancy_array)
-        occupancy_h, occupancy_w = occupancy.shape
-    scale_y = max(1, int(round(height / max(1, occupancy_h))))
-    scale_x = max(1, int(round(width / max(1, occupancy_w))))
+        raise ValueError(f"Occupancy array must be rank 2 or 3, got {shape!r}")
+
+    scale_y = max(1, round(height / max(1, occupancy_h)))
+    scale_x = max(1, round(width / max(1, occupancy_w)))
+    y0, x0 = 0, 0
+    y1, x1 = occupancy_h, occupancy_w
+    if scan_bounds is not None and user_mask is None:
+        top, bottom, left, right = scan_bounds
+        y0 = max(0, min(occupancy_h, top // scale_y))
+        x0 = max(0, min(occupancy_w, left // scale_x))
+        y1 = max(y0, min(occupancy_h, math.ceil(bottom / scale_y)))
+        x1 = max(x0, min(occupancy_w, math.ceil(right / scale_x)))
+
+    row_slice, col_slice = slice(y0, y1), slice(x0, x1)
+    if y0 == y1 or x0 == x1:
+        occupancy = np.zeros((y1 - y0, x1 - x0), dtype=bool)
+    elif depth_axis is None:
+        occupancy = np.asarray(occupancy_array[row_slice, col_slice]) != 0
+    elif depth_axis == 0:
+        occupancy = np.any(np.asarray(occupancy_array[:, row_slice, col_slice]) != 0, axis=0)
+    else:
+        occupancy = np.any(np.asarray(occupancy_array[row_slice, col_slice, :]) != 0, axis=2)
+
     if user_mask is not None:
         pooled = downsample_mask_any(user_mask, scale_y, scale_x)
-        occupancy = pooled if occupancy is None else np.logical_and(occupancy, pooled)
-    return occupancy, (scale_y, scale_x), occupancy_level
+        occupancy = np.logical_and(occupancy, pooled)
+    return occupancy, (scale_y, scale_x), occupancy_level, (y0, x0)
 
 
 class FlatPatchReader:
@@ -1321,11 +1340,22 @@ def infer_single_zarr(
             args.mask_path,
             100.0 * float(mask.mean()),
         )
-    occupancy, occupancy_scale, occupancy_level = build_lowres_block_mask(
+    scan_bounds = None
+    if roi_bounds is not None:
+        # Overlapping parent patches can extend beyond the output rectangle.
+        halo = patch_size - 1
+        scan_bounds = (
+            max(0, r0 - halo),
+            min(height, r1 + halo),
+            max(0, c0 - halo),
+            min(width, c1 + halo),
+        )
+    occupancy, occupancy_scale, occupancy_level, occupancy_origin = build_lowres_block_mask(
         root,
         height=height,
         width=width,
         user_mask=mask,
+        scan_bounds=scan_bounds,
     )
     if occupancy is None:
         LOGGER.warning(
@@ -1335,13 +1365,14 @@ def infer_single_zarr(
         )
     else:
         LOGGER.info(
-            "Using occupancy scan level=%s shape=%s scale=(%d, %d) "
+            "Using occupancy scan level=%s shape=%s origin=%s scale=(%d, %d) "
             "nonempty_coverage=%.3f%%",
             occupancy_level,
             tuple(int(value) for value in occupancy.shape),
+            occupancy_origin,
             int(occupancy_scale[0]),
             int(occupancy_scale[1]),
-            100.0 * float(occupancy.mean()),
+            100.0 * float(occupancy.mean()) if occupancy.size else 0.0,
         )
     blocks = iter_blocks(
         (height, width),
@@ -1349,6 +1380,7 @@ def infer_single_zarr(
         stride,
         occupancy,
         occupancy_scale,
+        occupancy_origin=occupancy_origin,
         roi_bounds=roi_bounds,
     )
     LOGGER.info("Selected %d patches for inference", len(blocks))

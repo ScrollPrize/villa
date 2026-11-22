@@ -24,6 +24,90 @@ def test_roi_preserves_exact_parent_schedule(shape,roi,stride):
     assert infer.iter_blocks(shape,128,stride,roi_bounds=(0,shape[0],0,shape[1]))==full
 
 
+@pytest.mark.parametrize("depth_axis", [None, 0, 2])
+def test_roi_occupancy_preserves_parent_patches_outside_the_output(depth_axis):
+    class RecordingArray:
+        def __init__(self, values):
+            self.values = values
+            self.shape = values.shape
+            self.read_shapes = []
+
+        def __getitem__(self, selection):
+            values = self.values[selection]
+            self.read_shapes.append(values.shape)
+            return values
+
+    occupancy = np.zeros((32, 40), dtype=np.uint8)
+    # The ROI itself has no CT signal. This foreground is in an overlapping
+    # parent patch, which must still be scheduled.
+    occupancy[14, 18] = 1
+    values = occupancy if depth_axis is None else np.expand_dims(occupancy, depth_axis)
+    array = RecordingArray(values)
+
+    class Group(dict):
+        def array_keys(self):
+            return self.keys()
+
+    root = Group({"3": array})
+    height, width = (256, 320)
+    roi = (128, 131, 160, 166)
+    patch_size = 32
+    halo = patch_size - 1
+    scan_bounds = (roi[0] - halo, roi[1] + halo, roi[2] - halo, roi[3] + halo)
+    full, scale, _, origin = infer.build_lowres_block_mask(
+        root, height=height, width=width, user_mask=None,
+    )
+    expected = infer.iter_blocks(
+        (height, width), patch_size, 16, full, scale, occupancy_origin=origin, roi_bounds=roi,
+    )
+    bounded, scale, _, origin = infer.build_lowres_block_mask(
+        root, height=height, width=width, user_mask=None, scan_bounds=scan_bounds,
+    )
+    got = infer.iter_blocks(
+        (height, width), patch_size, 16, bounded, scale, occupancy_origin=origin, roi_bounds=roi,
+    )
+
+    assert expected and got == expected
+    assert origin == (12, 16)
+    assert np.prod(array.read_shapes[1]) < np.prod(array.read_shapes[0]) / 10
+
+
+def test_roi_occupancy_clamps_out_of_bounds_scan_bounds():
+    class RecordingArray:
+        def __init__(self, values):
+            self.values = values
+            self.shape = values.shape
+            self.read_shapes = []
+
+        def __getitem__(self, selection):
+            values = self.values[selection]
+            self.read_shapes.append(values.shape)
+            return values
+
+    class Group(dict):
+        def array_keys(self):
+            return self.keys()
+
+    occupancy = np.zeros((32, 40), dtype=np.uint8)
+    occupancy[0, 0] = 1
+    array = RecordingArray(occupancy[None, :, :])
+    root = Group({"3": array})
+
+    bounded, scale, _, origin = infer.build_lowres_block_mask(
+        root, height=256, width=320, user_mask=None, scan_bounds=(-31, 40, -31, 48),
+    )
+    assert origin == (0, 0)
+    assert scale == (8, 8)
+    assert bounded.shape == (5, 6)
+    assert bounded[0, 0]
+
+    empty, _, _, empty_origin = infer.build_lowres_block_mask(
+        root, height=256, width=320, user_mask=None, scan_bounds=(64, 32, 64, 64),
+    )
+    assert empty.shape == (0, 0)
+    assert empty_origin == (8, 8)
+
+
 @pytest.mark.parametrize('roi',[(-1,80,0,80),(0,81,0,80),(0,0,0,80),(0,80,5,4),(False,80,0,80),(0.,80,0,80),(0,80,0)])
 def test_roi_rejects_wrong_or_empty_coordinate_frame(roi):
     with pytest.raises(ValueError):infer.resolve_roi_bounds(roi,height=80,width=80)
