@@ -46,12 +46,13 @@ def _bare_surface(path):
     return path
 
 
-def _pyramid_surface(path):
-    volume = _volume()
+def _pyramid_surface(path, *, dtype="u1", empty=False):
+    volume = _volume().astype(dtype)
     level3 = np.zeros((5, 6), dtype=np.uint8)
-    level3[1:4, 2:5] = 1
+    # an empty occupancy level schedules no tile
+    level3[1:4, 2:5] = 0 if empty else 1
     group = create_group(path)
-    group.create_array("0", shape=volume.shape, chunks=(volume.shape[0], 16, 16), dtype="u1")[:] = volume
+    group.create_array("0", shape=volume.shape, chunks=(volume.shape[0], 16, 16), dtype=dtype)[:] = volume
     group.create_array("3", shape=level3.shape, chunks=level3.shape, dtype="u1")[:] = level3
     return path
 
@@ -153,6 +154,51 @@ def test_input_inkrs_declines_runs_on_pytorch_and_other_errors_raise(tmp_path, s
     assert not (tmp_path / "strict.tif").exists() and not (tmp_path / "oom.tif").exists()
 
 
+def test_input_inkrs_declines_from_its_metadata_is_never_read(tmp_path, stand_in, monkeypatch, caplog):
+    # a window over inkrs's size limit must fall back before villa reads it whole
+    surface = _bare_surface(tmp_path / "surface.zarr")
+    checkpoint = _save_checkpoint(tmp_path / "model.pth")
+    _infer(surface, checkpoint, tmp_path / "torch.tif", "--direction", "both")
+    monkeypatch.setattr(inkrs_stand_in.Engine, "max_volume_bytes", 1024)
+
+    with caplog.at_level("WARNING"):
+        _infer(surface, checkpoint, tmp_path / "fallback.tif", "--engine", "inkrs", "--direction", "both")
+    assert "inkrs does not support this input: volume of 5760 bytes is over 4 GiB" in caplog.text
+    for suffix in ("", "_reverse"):
+        np.testing.assert_array_equal(
+            tifffile.imread(tmp_path / f"fallback{suffix}.tif"), tifffile.imread(tmp_path / f"torch{suffix}.tif")
+        )
+
+    with pytest.raises(EngineUnavailable, match="over 4 GiB"):
+        _infer(surface, checkpoint, tmp_path / "strict.tif", "--engine", "inkrs", "--engine-fallback", "error")
+    uint16 = _pyramid_surface(tmp_path / "uint16.zarr", dtype="u2")
+    with pytest.raises(EngineUnavailable, match="uint8 only"):
+        _infer(uint16, checkpoint, tmp_path / "uint16.tif", "--engine", "inkrs", "--engine-fallback", "error")
+    assert inkrs_stand_in.Engine.runs == 4
+    assert stand_in == [], "a declined window was read"
+
+
+def test_a_folder_run_releases_each_segments_window(tmp_path, stand_in, monkeypatch):
+    # only the two directions of one segment share a read, also when the next
+    # segment never reaches inkrs because it schedules no tile
+    folder = tmp_path / "segments"
+    for name, empty in (("a", False), ("b", True)):
+        (folder / name).mkdir(parents=True)
+        _pyramid_surface(folder / name / f"{name}.zarr", empty=empty)
+    checkpoint = _save_checkpoint(tmp_path / "model.pth")
+    loaded = []
+    load = InkrsEngine.load.__func__
+    monkeypatch.setattr(InkrsEngine, "load", classmethod(lambda cls, *a: loaded.append(load(cls, *a)) or loaded[-1]))
+
+    assert main(["--folder", str(folder), str(checkpoint), *COMMON, "--direction", "both", "--engine", "inkrs"]) == 0
+    assert inkrs_stand_in.Engine.runs == 2
+    # villa centres the 3-layer window on segment a's 5 layers
+    assert stand_in == [(1, 1 + DEPTH)]
+    [engine] = loaded
+    assert engine._span is None, "segment b kept segment a's window"
+    assert len(list((folder / "b" / "preds").glob("*.tif"))) == 2
+
+
 @pytest.mark.parametrize(
     ("device", "expected"),
     [
@@ -177,6 +223,6 @@ def test_inkrs_loads_on_the_device_pytorch_uses(tmp_path, monkeypatch, device, e
 def test_villa_calls_match_the_installed_inkrs():
     inkrs = pytest.importorskip("inkrs")
     assert issubclass(inkrs.UnsupportedError, inkrs.InkrsError)
-    # villa calls Engine(checkpoint, device=) and run(volume, windows, stride=, occupancy=, coverage=)
+    # villa calls Engine(checkpoint, device=) and run(volume, windows, stride=, occupancy=)
     assert "device" in inspect.signature(inkrs.Engine.__init__).parameters
-    assert {"stride", "occupancy", "coverage"} <= set(inspect.signature(inkrs.Engine.run).parameters)
+    assert {"stride", "occupancy"} <= set(inspect.signature(inkrs.Engine.run).parameters)

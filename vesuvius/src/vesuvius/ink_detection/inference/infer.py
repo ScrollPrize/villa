@@ -1341,6 +1341,12 @@ def infer_single_zarr(
 
     root = open_volume_root(input_zarr)
     resolution = "0" if hasattr(root, "shape") else str(args.resolution)
+    engine = configured_model.engine
+    input_key = (str(input_zarr), resolution)
+    if engine is not None:
+        # release the last input's span before this input's occupancy scan,
+        # also when this input never reaches inkrs
+        engine.begin_input(input_key)
     volume = select_volume_level(root, resolution, source=str(input_zarr))
     depth_first, depth, height, width, chunk_h, chunk_w = _volume_axes(volume)
     roi_values = getattr(args, "roi", None)
@@ -1436,17 +1442,14 @@ def infer_single_zarr(
     LOGGER.info("Output bounds=(%d, %d, %d, %d) shape=%s; parent patch grid retained", *output_bounds, output_shape)
     # with no tile scheduled the map is all zero, which the PyTorch path writes
     # without reading the window or building a model
-    engine = configured_model.engine if blocks else None
-    if engine is not None:
+    if engine is not None and blocks:
         try:
             # villa zero-pads a shallow input to the model depth; inkrs does not
             if len(layer_indices) != configured_model.input_depth:
                 raise EngineUnavailable(
                     f"it needs {configured_model.input_depth} source layers, got {len(layer_indices)}"
                 )
-            probability, _ = engine.run(
-                volume, depth_first, layer_indices, occupancy, stride, (str(input_zarr), resolution)
-            )
+            probability = engine.run(volume, depth_first, layer_indices, occupancy, stride, input_key)
         except EngineUnavailable as exc:
             fall_back(f"The inkrs engine cannot run {input_zarr}: {exc}", fallback=args.engine_fallback)
         else:

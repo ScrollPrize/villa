@@ -47,6 +47,8 @@ class Engine:
     """
 
     runs = 0
+    # inkrs declines a volume of 4 GiB or more; tests lower it to decline a small one
+    max_volume_bytes = 2**32 - 1
 
     def __init__(self, checkpoint: Any, *, device: int = 0, batch_size: int = 2) -> None:
         self.configured = infer.configure_single_model(Path(checkpoint), amp_dtype="auto")
@@ -55,17 +57,22 @@ class Engine:
 
     def run(
         self,
-        volume: np.ndarray,
+        volume: Any,
         windows: Sequence[tuple[int, int]],
         *,
         stride: int,
         occupancy: np.ndarray | None,
-        coverage: bool,
+        coverage: bool = False,
     ) -> list[Any]:
         Engine.runs += 1
+        # as inkrs does, a lazy array's dtype and size are checked before it is read
+        if np.dtype(volume.dtype) != np.uint8:
+            raise UnsupportedError(f"volume dtype {volume.dtype}: inkrs reads uint8 only")
+        nbytes = int(np.prod(volume.shape))
+        if nbytes >= self.max_volume_bytes:
+            raise UnsupportedError(f"volume of {nbytes} bytes is over 4 GiB")
+        volume = np.asarray(volume)
         _, height, width = volume.shape
-        if volume.dtype != np.uint8:
-            raise UnsupportedError(f"uint8 volumes only, got {volume.dtype}")
         patch, depth = self.configured.patch_size, self.configured.input_depth
         mask, scale = None, (1, 1)
         if occupancy is not None:

@@ -539,12 +539,16 @@ missing CUDA libraries or running out of GPU memory, stop the command rather
 than fall back.
 
 When one input falls back, PyTorch builds its model for that input and the
-next input tries inkrs again.
+next input tries inkrs again. inkrs's model stays loaded on the GPU while
+PyTorch runs the input, so a fallback needs room for both.
+
+villa reads an input's 17-layer window into memory once and inkrs runs both
+directions from it, then villa releases it before the next input. inkrs checks
+the window's dtype and size before villa reads it, so an input it declines
+on those is never read.
 
 On the checkpoints tested, each inkrs map matched PyTorch's to within 4/255,
-with the same covered pixels. inkrs's
-[`scripts/villa_parity.py`](https://github.com/praveenperera/inkrs/blob/master/scripts/villa_parity.py)
-runs both engines on your own data and GPU and compares the maps.
+with the same covered pixels.
 
 ## Native 3D inference
 

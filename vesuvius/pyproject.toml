@@ -107,7 +107,7 @@ tests = ["pytest>=8.4.2", "tifffile>=2024.8.30"]
 # publishes no Linux ARM64 wheel, so the extra installs nothing there rather
 # than building inkrs from source
 inkrs = [
-    "inkrs>=0.2.1; sys_platform != 'linux' or platform_machine == 'x86_64'",
+    "inkrs>=0.3.1; sys_platform != 'linux' or platform_machine == 'x86_64'",
     "nvidia-cublas-cu12>=12.1,<13; sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
 
