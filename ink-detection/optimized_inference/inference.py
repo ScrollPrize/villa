@@ -204,12 +204,14 @@ class LayersSource:
             if self._arr is not None:
                 out[(yy1 - y1):(yy2 - y1), (xx1 - x1):(xx2 - x1)] = self._arr[yy1:yy2, xx1:xx2, :]
             else:
+                # Read into `out`: reader-allocated arrays of the varying region sizes would be kept
+                # by vc_reader's per-process output pool (up to 1 GiB in every worker).
+                dst = out[(yy1 - y1):(yy2 - y1), (xx1 - x1):(xx2 - x1)]
+                h, w, c = dst.shape
                 if self._needs_transpose:
-                    roi = self._mm[self._start_z:self._end_z, yy1:yy2, xx1:xx2]
-                    roi = np.transpose(roi, (1, 2, 0))
+                    self._mm.read_region((self._start_z, yy1, xx1), (c, h, w), out=dst.transpose(2, 0, 1))
                 else:
-                    roi = self._mm[yy1:yy2, xx1:xx2, self._start_z:self._end_z]
-                out[(yy1 - y1):(yy2 - y1), (xx1 - x1):(xx2 - x1)] = roi
+                    self._mm.read_region((yy1, xx1, self._start_z), (h, w, c), out=dst)
         return out
 
 # ----------------------------- Preprocess ------------------------------------
