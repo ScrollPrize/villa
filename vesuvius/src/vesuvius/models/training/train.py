@@ -13,6 +13,7 @@ import torch.nn.functional as F
 from vesuvius.models.augmentation.pipelines import sample_seed
 from vesuvius.models.training.lr_schedulers import get_scheduler
 from torch.utils.data import DataLoader, SubsetRandomSampler, Subset, WeightedRandomSampler
+from vesuvius.utils.dataloader_workers import keep_worker_descriptors_private
 from torch.utils.data.distributed import DistributedSampler
 from vesuvius.models.utils import InitWeights_He
 from vesuvius.models.datasets import ZarrDataset
@@ -1501,6 +1502,7 @@ class BaseTrainer:
             shuffle=False,
             pin_memory=pin_mem,
             num_workers=self.mgr.train_num_dataloader_workers,
+            worker_init_fn=keep_worker_descriptors_private,
             **dl_kwargs
         )
 
@@ -1512,6 +1514,7 @@ class BaseTrainer:
             shuffle=False,
             pin_memory=pin_mem,
             num_workers=self.mgr.train_num_dataloader_workers,
+            worker_init_fn=keep_worker_descriptors_private,
             **dl_kwargs
         )
 

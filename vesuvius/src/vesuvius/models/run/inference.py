@@ -17,6 +17,7 @@ from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 multiprocessing.set_start_method('spawn', force=True)
 from tqdm.auto import tqdm
 from torch.utils.data import DataLoader
+from vesuvius.utils.dataloader_workers import keep_worker_descriptors_private
 from vesuvius.utils.models.load_nnunet_model import load_model_for_inference
 from vesuvius.models.utilities.get_accelerator import get_accelerator
 from vesuvius.data.vc_dataset import VCDataset
@@ -928,6 +929,7 @@ class Inferer():
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=self.num_dataloader_workers,
+            worker_init_fn=keep_worker_descriptors_private,
             pin_memory=self.device.type == 'cuda',
             collate_fn=VCDataset.collate_fn  # we use custom collate fn here to tag patches that contain only zeros
                                              # so we don't run them through the model
