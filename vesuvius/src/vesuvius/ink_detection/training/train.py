@@ -226,32 +226,6 @@ def should_save_checkpoint(
     )
 
 
-_PERIODIC_CHECKPOINT_PREFIX = "ckpt_"
-
-
-def prune_periodic_checkpoints(
-    out_dir: Path, *, keep: int, save_iterations: Sequence[int] = ()
-) -> list[Path]:
-    """Delete all but the newest ``keep`` periodic ``ckpt_<iteration>.pth`` files.
-
-    Checkpoints requested explicitly through ``save_iterations`` and named
-    checkpoints such as ``best_val_loss.pth`` are never deleted.
-    """
-
-    protected = {int(item) for item in save_iterations}
-    periodic: list[tuple[int, Path]] = []
-    for path in Path(out_dir).glob(f"{_PERIODIC_CHECKPOINT_PREFIX}*.pth"):
-        digits = path.stem[len(_PERIODIC_CHECKPOINT_PREFIX):]
-        if not digits.isdigit() or int(digits) in protected:
-            continue
-        periodic.append((int(digits), path))
-    periodic.sort()
-    removed = [path for _, path in periodic[: max(0, len(periodic) - keep)]]
-    for path in removed:
-        path.unlink(missing_ok=True)
-    return removed
-
-
 def masked_unsmoothed_bce_with_logits(
     logits: torch.Tensor,
     targets: torch.Tensor,
@@ -731,6 +705,8 @@ def _run_training(request: TrainingRequest) -> int:
             "sampling_observed=" + json.dumps(observed, sort_keys=True)
         )
 
+    periodic_checkpoints: list[Path] = []
+
     def save_checkpoint(
         step: int,
         *,
@@ -759,16 +735,20 @@ def _run_training(request: TrainingRequest) -> int:
             wandb_module=wandb_module,
             validation_metrics=validation_metrics,
         )
-        torch.save(
-            payload,
-            config.out_dir / (filename or f"ckpt_{step + 1:06}.pth"),
+        path = config.out_dir / (filename or f"ckpt_{step + 1:06}.pth")
+        # Files that predate this run may be newer, milestones under another
+        # config, or the configured checkpoint, so they are never pruned.
+        prunable = (
+            filename is None
+            and config.keep_last_checkpoints is not None
+            and step + 1 not in config.save_iterations
+            and not path.exists()
         )
-        if filename is None and config.keep_last_checkpoints is not None:
-            prune_periodic_checkpoints(
-                config.out_dir,
-                keep=config.keep_last_checkpoints,
-                save_iterations=config.save_iterations,
-            )
+        torch.save(payload, path)
+        if prunable:
+            periodic_checkpoints.append(path)
+            if len(periodic_checkpoints) > config.keep_last_checkpoints:
+                periodic_checkpoints.pop(0).unlink(missing_ok=True)
 
     write_gradient_health()
     write_sampling_audit(start_step)

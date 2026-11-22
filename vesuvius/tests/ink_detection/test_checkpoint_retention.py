@@ -2,12 +2,22 @@
 
 from __future__ import annotations
 
+import json
+from types import SimpleNamespace
+
 import pytest
+import torch
 
 from vesuvius.ink_detection.config import TrainingConfig, resolve_training_mapping
-from vesuvius.ink_detection.training.train import prune_periodic_checkpoints
+from vesuvius.ink_detection.training.train import _run_training, stage_training_request
 
 from .helpers import config_mapping
+from .test_training_numerics import (
+    _SyntheticTrainingDataset,
+    _SyntheticTrainingLoss,
+    _SyntheticTrainingModel,
+    _training_mapping,
+)
 
 
 def _parse(**extra) -> TrainingConfig:
@@ -40,47 +50,46 @@ def test_keep_last_checkpoints_rejects_invalid_values(value, error):
         _parse(keep_last_checkpoints=value)
 
 
-def test_prune_keeps_the_newest_periodic_checkpoints(tmp_path):
-    _touch(tmp_path, "ckpt_000500.pth", "ckpt_001000.pth", "ckpt_001500.pth", "ckpt_002000.pth")
+def test_training_prunes_only_its_own_periodic_checkpoints(tmp_path, monkeypatch):
+    import vesuvius.ink_detection.data.dataset as dataset_module
+    import vesuvius.ink_detection.models.model as model_module
+    import vesuvius.ink_detection.training.losses as losses_module
+    import vesuvius.ink_detection.training.optimizers as optimizers_module
+    import vesuvius.ink_detection.training.samplers as samplers_module
 
-    removed = prune_periodic_checkpoints(tmp_path, keep=2)
+    authored = _training_mapping()
+    authored.update(
+        num_iterations=8, out_dir=str(tmp_path), mixed_precision="no", dataloader_workers=0,
+        val_every=99, save_every=2, log_every=99, save_iterations=[4], keep_last_checkpoints=1,
+    )
+    authored["model_config"]["pretrained_backbone"] = "synthetic"
+    config_path = tmp_path / "training.json"
+    config_path.write_text(json.dumps(authored), encoding="utf-8")
+    # Earlier runs' files: one this run overwrites, a newer one and another config's milestone.
+    _touch(tmp_path, "ckpt_000002.pth", "ckpt_000030.pth", "ckpt_000005.pth")
 
-    assert sorted(path.name for path in removed) == ["ckpt_000500.pth", "ckpt_001000.pth"]
-    assert sorted(path.name for path in tmp_path.iterdir()) == ["ckpt_001500.pth", "ckpt_002000.pth"]
-
-
-def test_prune_orders_by_iteration_not_by_name_width(tmp_path):
-    _touch(tmp_path, "ckpt_999000.pth", "ckpt_1000000.pth")
-
-    prune_periodic_checkpoints(tmp_path, keep=1)
-
-    assert [path.name for path in tmp_path.iterdir()] == ["ckpt_1000000.pth"]
-
-
-def test_prune_never_deletes_milestones_best_or_other_files(tmp_path):
-    _touch(
-        tmp_path,
-        "ckpt_000500.pth",
-        "ckpt_001000.pth",
-        "ckpt_001500.pth",
-        "best_val_loss.pth",
-        "ckpt_final.pth",
-        "notes.txt",
+    monkeypatch.setattr(dataset_module, "InkDataset", _SyntheticTrainingDataset)
+    monkeypatch.setattr(model_module, "make_model", lambda config: _SyntheticTrainingModel())
+    monkeypatch.setattr(losses_module, "create_loss", lambda config: _SyntheticTrainingLoss())
+    monkeypatch.setattr(
+        optimizers_module,
+        "create_training_optimizer",
+        lambda model, config: torch.optim.SGD(model.parameters(), lr=0.1),
+    )
+    monkeypatch.setattr(
+        samplers_module,
+        "build_sampling_policy",
+        lambda patches, config, batch_size: SimpleNamespace(
+            batch_sampler=None, shuffle=False, sampler=None, generator=None, audit={}
+        ),
     )
 
-    prune_periodic_checkpoints(tmp_path, keep=1, save_iterations=(500,))
+    assert _run_training(stage_training_request(config_path)) == 0
 
-    assert sorted(path.name for path in tmp_path.iterdir()) == [
-        "best_val_loss.pth",
-        "ckpt_000500.pth",
-        "ckpt_001500.pth",
-        "ckpt_final.pth",
-        "notes.txt",
+    assert sorted(path.name for path in tmp_path.glob("ckpt_*.pth")) == [
+        "ckpt_000002.pth",
+        "ckpt_000004.pth",
+        "ckpt_000005.pth",
+        "ckpt_000008.pth",
+        "ckpt_000030.pth",
     ]
-
-
-def test_prune_is_a_no_op_when_under_the_limit(tmp_path):
-    _touch(tmp_path, "ckpt_000500.pth")
-
-    assert prune_periodic_checkpoints(tmp_path, keep=3) == []
-    assert [path.name for path in tmp_path.iterdir()] == ["ckpt_000500.pth"]
