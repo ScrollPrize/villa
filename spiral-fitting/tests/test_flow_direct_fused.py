@@ -2,7 +2,8 @@
 
 flow_triton.TritonRK4DirectIntegrate (CUDA) and flow_metal.MetalRK4DirectIntegrate
 (MPS) integrate points through every slab of a low- and a high-resolution
-lattice, sampling the low one directly. The reference below runs the same
+lattice, sampling the low one directly, and flow_fields' eager integrator
+(_EagerDirect, every device) does where neither kernel runs. The reference below runs the same
 integrator in eager PyTorch with autograd: trilinear samples at the lattice
 coordinates `normalised * a + b` from flow_triton._field_geoms (border clamp),
 RK4 with the kernels' stage arithmetic. Each available backend must match it:
@@ -27,7 +28,9 @@ import flow_triton
 
 
 def _backends():
-    backends = []
+    # The eager integrator (direct sampling where no fused kernel runs) is
+    # held to the same contract, on the CPU.
+    backends = [('cpu', None, flow_fields._EagerDirect)]
     if flow_triton._HAS_TRITON and torch.cuda.is_available():
         backends.append(('cuda', 'FIT_SPIRAL_TRITON', flow_triton))
     if torch.backends.mps.is_available():
@@ -118,7 +121,6 @@ def _run_reference(reverse, n_steps, scales):
             'acc_lo': low.grad / scales[0], 'acc_hi': high.grad / scales[1]}
 
 
-@pytest.mark.skipif(not BACKENDS, reason='needs CUDA with Triton, or MPS')
 @pytest.mark.parametrize('scales', [(1.0, 1.0), (0.7, 1.3)])
 @pytest.mark.parametrize('n_steps', [1, 3])
 @pytest.mark.parametrize('reverse', [False, True])
@@ -142,7 +144,6 @@ def test_fused_direct_rk4_matches_reference(device, switch, module, reverse,
     assert outliers <= 8, f'{outliers} points with point-gradient error above {tol:.3g}'
 
 
-@pytest.mark.skipif(not BACKENDS, reason='needs CUDA with Triton, or MPS')
 @pytest.mark.parametrize('device,switch,module', BACKENDS,
                          ids=[b[0] for b in BACKENDS])
 def test_fused_direct_rk4_accepts_no_points(device, switch, module):
