@@ -175,7 +175,7 @@ std::optional<std::string> knownArrayPath(const std::string& location, const Acc
             if (const auto scheme = spelled.find("://"); scheme != std::string::npos)
                 spelled = "s3" + spelled.substr(scheme);
         // decodedCachePath drops a query; a slash before it goes here.
-        return stripSlashes(decodedCachePath({}, access.cacheUrl(spelled)).generic_string());
+        return stripSlashes(utf8GenericString(decodedCachePath({}, access.cacheUrl(spelled))));
     } catch (const std::invalid_argument&) {
         return std::nullopt;
     }

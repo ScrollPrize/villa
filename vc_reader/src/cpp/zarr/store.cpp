@@ -19,7 +19,7 @@ namespace vcr::zarr {
 namespace {
 bool isArrayMetadata(const std::string& name)
 {
-    const auto base = fs::path(name).filename();
+    const auto base = utf8Path(name).filename();
     return base == ".zarray" || base == "zarr.json";
 }
 
