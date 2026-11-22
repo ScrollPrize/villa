@@ -202,11 +202,12 @@ class InkDataset(Dataset):
             key = segment.dataset_idx, str(segment.image_volume), segment.scale
             self._segments_by_volume.setdefault(key, []).append(segment)
 
-    def _open(self, path: str | Path, resolution: int):
+    def _open(self, path: str | Path, resolution: int, check_depth_scale: bool = True):
         key = (
             os.getpid(),
             str(path),
             int(resolution),
+            check_depth_scale,
             None if self.config.volume_auth_json is None else str(self.config.volume_auth_json),
             None if self.config.volume_cache_dir is None else str(self.config.volume_cache_dir),
             self.config.volume_cache_max_gb,
@@ -219,6 +220,7 @@ class InkDataset(Dataset):
                 self.config.volume_auth_json,
                 cache_dir=self.config.volume_cache_dir,
                 cache_max_gb=self.config.volume_cache_max_gb,
+                check_depth_scale=check_depth_scale,
             )
             self._zarr_cache[key] = volume
         return volume
@@ -238,7 +240,16 @@ class InkDataset(Dataset):
                     return find_segment_unlabeled_patches(segment, self._open)
                 if self.config.patch_finding.kind == "subtiling":
                     return find_subtiling_patches(segment, self._open)
-                return find_default_patches(segment, self._open)
+                # Labeled discovery reads only the XY shape of the coarse image.
+                return find_default_patches(
+                    segment,
+                    lambda path, scale: self._open(
+                        path,
+                        scale,
+                        check_depth_scale=path != segment.image_volume
+                        or scale == segment.scale,
+                    ),
+                )
             except Exception as exc:
                 raise RuntimeError(
                     "Failed finding patches for "

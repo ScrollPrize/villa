@@ -160,6 +160,7 @@ def select_volume_level(
     *,
     source: str,
     root_array_is_requested_level: bool = False,
+    check_depth_scale: bool = True,
 ) -> Any:
     """Select one resolution from an already opened array or group root."""
 
@@ -170,7 +171,8 @@ def select_volume_level(
                 f"in zarr array {source!r})"
             )
         return root
-    require_pyramid_depth_scale(root, resolution, source=source)
+    if check_depth_scale:
+        require_pyramid_depth_scale(root, resolution, source=source)
     try:
         return root[str(resolution)]
     except KeyError as exc:
@@ -195,6 +197,7 @@ def open_volume(
     cache_dir: str | Path | None = None,
     cache_max_gb: float | None = None,
     root_array_is_requested_level: bool = False,
+    check_depth_scale: bool = True,
 ):
     """Open one Zarr pyramid level through the shared root boundary."""
 
@@ -209,6 +212,7 @@ def open_volume(
         resolution,
         source=str(path),
         root_array_is_requested_level=root_array_is_requested_level,
+        check_depth_scale=check_depth_scale,
     )
 
 
