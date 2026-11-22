@@ -6,11 +6,13 @@
 #include <vector>
 
 // Solved strip normals sampled at a regular arc spacing along every fiber
-// (unsigned: the whole-fiber sign comes from the sign stage).
+// (unsigned: the whole-fiber sign comes from the sign stage), with the unit
+// prediction axis there (zero where there is none).
 struct FiberStripSample {
     double arc = 0.;
     cv::Vec3d point{0., 0., 0.};
     cv::Vec3d normal{0., 0., 0.};
+    cv::Vec3d prediction{0., 0., 0.};
 };
 
 void writeFiberStripSamples(const std::filesystem::path& output, const std::vector<std::string>& ids,
@@ -22,10 +24,11 @@ std::vector<std::vector<FiberStripSample>> readFiberStripSamples(const std::file
 
 // Normal and sign at every strip sample of the query fibers, inferred only from
 // the signed strip samples of OTHER fibers within a radius: the principal axis
-// of the distance-weighted outer products (perpendicular to the own tangent),
-// signed by the weighted majority. Config keys: strip_samples, fiber_signs
-// (JSON uuid -> sign), neighbour_queries (JSON uuid -> uuids to exclude),
-// neighbour_variants ([{falloff, sigma, radius}]), neighbour_normals_output,
+// of the weighted outer products (perpendicular to the own tangent), signed by
+// the weighted majority. Config keys: strip_samples, fiber_signs (JSON uuid ->
+// sign), neighbour_queries (JSON uuid -> uuids to exclude), neighbour_variants
+// ([{falloff, sigma or scales (tangent, side, normal), frame (isotropic, own,
+// prediction, two_pass), radius, first_sigma, fiber_cap}]), neighbour_normals_output,
 // workers; optionally neighbour_samples_output (+ neighbour_samples_variant):
 // the signed inferred normals of one variant as strip samples. Returns the run summary.
 nlohmann::json inferFiberNeighbourNormals(const nlohmann::json& cfg);

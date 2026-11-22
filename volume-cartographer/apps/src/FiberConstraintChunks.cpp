@@ -535,13 +535,25 @@ Json extractFiberConstraintChunks(const Json& cfg,Json& metadata,
             // The solved normals at a regular arc spacing, for neighbour-normal inference.
             const double step=cfg.value("strip_samples_spacing",16.);
             if(!(step>0.))throw std::invalid_argument("strip_samples_spacing must be positive");
+            // With the fused prediction, each sample also carries the unit prediction axis
+            // of its nearest chain node (zero where the node has none).
             std::vector<std::vector<FiberStripSample>> samples(lines.size());
             cv::parallel_for_(cv::Range(0,int(lines.size())),[&](const cv::Range& range){
                 for(int fi=range.start;fi<range.end;++fi){
                     const size_t i=size_t(fi);const auto& g=geometries[i];
+                    vc::fiber_tracer::FiberStripChain chain;
+                    if(targets)chain=vc::fiber_tracer::fiberStripChain(polylines[i],options);
                     for(double arc=0.;arc<=g.length();arc+=step){
                         const auto n=stripNormalAt(*strips,i,g,arc);
-                        if(n.valid)samples[i].push_back({arc,samplePolylineArc(g,arc).point,n.normal});
+                        if(!n.valid)continue;
+                        cv::Vec3d prediction{0,0,0};
+                        if(targets&&!chain.arc.empty()&&chain.arc.size()==(*targets)[i].size()){
+                            const auto k=size_t(std::lower_bound(chain.arc.begin(),chain.arc.end(),arc)-chain.arc.begin());
+                            const size_t near=k==0?0:k>=chain.arc.size()?chain.arc.size()-1:(arc-chain.arc[k-1]<chain.arc[k]-arc?k-1:k);
+                            const auto& t=(*targets)[i][near];
+                            if(t.weight>0.&&cv::norm(t.axis)>0.)prediction=t.axis/cv::norm(t.axis);
+                        }
+                        samples[i].push_back({arc,samplePolylineArc(g,arc).point,n.normal,prediction});
                     }
                 }
             },int(workers));
