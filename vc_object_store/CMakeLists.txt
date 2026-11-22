@@ -39,8 +39,11 @@ find_package(SQLite3 3.37 REQUIRED)
 if(APPLE AND SQLite3_LIBRARIES MATCHES "^/usr/lib/|/SDKs/")
     message(WARNING
         "vc_object_store links the system SQLite (${SQLite3_LIBRARIES}), which "
-        "cannot open sealed or copied stores read-only; install Homebrew's "
-        "(brew install sqlite) and reconfigure.")
+        "cannot open sealed or copied stores read-only. Install Homebrew's "
+        "(brew install sqlite), then reconfigure with "
+        "-U 'SQLite3_*' -DSQLite3_ROOT=\"$(brew --prefix sqlite)\", or for the "
+        "Python package add --reinstall-package vc-object-store to your usual "
+        "uv sync command.")
 endif()
 find_package(OpenSSL REQUIRED COMPONENTS Crypto)
 find_package(nlohmann_json CONFIG REQUIRED)
