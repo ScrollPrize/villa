@@ -4,6 +4,7 @@
 #include <vc_reader/array.hpp>
 #include <vc_reader/grid.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -602,6 +603,87 @@ int main()
             vcr::grid::sample(vcr::grid::Points{a.data(), n.data(), 1, H}, request);
             require(column->stats().disk_hits.load() > 0 && kept->stats().disk_hits.load() == column->stats().disk_hits.load(),
                     "pixels a mask leaves out read no chunk");
+        }
+
+        // A cache-only frame during which the fine level's chunks reach the cache: each
+        // pixel's value must come from the level the frame reports for it. Nine pixels in
+        // a row, so the row's last group of eight overlaps the first by seven. The coarse
+        // array's cache takes an injected clock, which it reads on every lookup; the
+        // frame's first lookup there (pixel 0 falling back to the coarse level) loads all
+        // fine chunks. Pixel 1 comes after that and still reads coarse, because the
+        // sampler's recent-chunk slots hold its chunk as "not cached". Pixel 2's cell
+        // crosses a chunk border on every axis, so it is sampled one voxel at a time on
+        // either path and touches eight other chunks, which pushes that entry out of the
+        // eight slots, so
+        // pixels 3 to 8 read fine, and a second visit to pixel 1 would too: with AVX2 the
+        // row's last group must not make that visit. Without AVX2 only the scalar path
+        // is checked.
+        {
+            const auto small = path / "small";  // 16^3 in chunks of 4^3, value = x + 2y + 3z
+            fs::create_directories(small);
+            for (int cz = 0; cz < 4; ++cz)
+                for (int cy = 0; cy < 4; ++cy)
+                    for (int cx = 0; cx < 4; ++cx) {
+                        std::vector<std::uint8_t> chunk(64);
+                        for (int z = 0; z < 4; ++z)
+                            for (int y = 0; y < 4; ++y)
+                                for (int x = 0; x < 4; ++x)
+                                    chunk[std::size_t((z * 4 + y) * 4 + x)] =
+                                        std::uint8_t((cx * 4 + x) + 2 * (cy * 4 + y) + 3 * (cz * 4 + z));
+                        std::ofstream o(small / (std::to_string(cz) + "." + std::to_string(cy) + "." + std::to_string(cx)),
+                                        std::ios::binary);
+                        o.write(reinterpret_cast<const char*>(chunk.data()), 64);
+                    }
+            vcr::ArraySpec spec;
+            spec.shape = {16, 16, 16};
+            spec.chunks = {4, 4, 4};
+            spec.fill = {0};
+            spec.identity = small.string();
+            spec.layers.push_back({"array", small.string(), "", "", false});
+            vcr::Array fineLevel(spec, std::make_shared<vcr::MemoryCache>(1 << 20));
+            std::atomic<bool> armed{false};
+            vcr::MemoryCache::AutoOptions options;
+            options.available = [] { return std::uint64_t{1} << 30; };
+            options.now = [&] {
+                if (armed.exchange(false))
+                    for (std::int64_t cz = 0; cz < 4; ++cz)
+                        for (std::int64_t cy = 0; cy < 4; ++cy)
+                            for (std::int64_t cx = 0; cx < 4; ++cx)
+                                fineLevel.chunk({cz, cy, cx});
+                return std::chrono::steady_clock::now();
+            };
+            spec.shape = {8, 8, 8};
+            spec.chunks = {8, 8, 8};
+            spec.identity = coarse.string() + "#clock";
+            spec.layers = {{"array", coarse.string(), "", "", false}};
+            vcr::Array coarseLevel(spec, std::make_shared<vcr::MemoryCache>(options, 1, false));
+            coarseLevel.chunk({0, 0, 0});  // the coarse level is in memory, the fine level is not
+            const float at[9][3]{{1.5f, 1.5f, 1.5f},  {1.25f, 1.5f, 1.5f}, {7.5f, 7.5f, 7.5f},
+                                 {2.25f, 1.5f, 1.5f}, {1.5f, 2.25f, 1.5f}, {1.5f, 1.5f, 2.25f},
+                                 {2.5f, 2.5f, 1.5f},  {1.5f, 2.5f, 2.5f},  {2.75f, 1.25f, 2.5f}};
+            vcr::grid::Request arriving;
+            arriving.levels = {{&fineLevel, u8, L0.scale, L0.offset}, {&coarseLevel, u8, L1.scale, L1.offset}};
+            arriving.cachedOnly = true;
+            armed = true;
+            auto sampled = vcr::grid::sample(vcr::grid::Points{&at[0][0], nullptr, 9, 1}, arriving);
+            require(!armed, "the fine chunks were loaded during the frame");
+            for (std::size_t q = 0; q < 9; ++q) {
+                if (sampled.level[q] == 0)
+                    require(near(sampled.values[q], value(at[q][0], at[q][1], at[q][2]), 1e-3f),
+                            "a pixel reported at the fine level has the fine value");
+                else
+                    require(sampled.level[q] == 1 && near(sampled.values[q], 200.0f, 1e-3f),
+                            "a pixel reported at the coarse level has the coarse value");
+            }
+            // This split is what makes the case a test of the second visit. It rests on the
+            // sampler's eight recent-chunk slots: if it fails after a change there, pixel 1's
+            // entry is no longer pushed out and the points above need redesigning.
+            require(sampled.level[0] == 1 && sampled.level[1] == 1 && sampled.level[2] == 0 && sampled.level[8] == 0,
+                    "pixels 0 and 1 read coarse; pixels 2 and 8 find the fine chunks cached");
+            sampled = vcr::grid::sample(vcr::grid::Points{&at[0][0], nullptr, 9, 1}, arriving);
+            for (std::size_t q = 0; q < 9; ++q)
+                require(sampled.level[q] == 0 && near(sampled.values[q], value(at[q][0], at[q][1], at[q][2]), 1e-3f),
+                        "the next frame is complete at the fine level");
         }
 
         // Placement maps: scale form when axis aligned, otherwise general.
