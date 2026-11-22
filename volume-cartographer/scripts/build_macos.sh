@@ -210,6 +210,9 @@ for keg in lapack openblas openssl@3 sqlite; do
     export CMAKE_PREFIX_PATH="$brew_prefix/opt/$keg${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}"
   fi
 done
+# Re-find SQLite so build dirs configured before the keg was added drop the
+# cached system copy.
+extra_cmake_args+=("-USQLite3_INCLUDE_DIR" "-USQLite3_LIBRARY")
 # Force PaStiX onto OpenBLAS instead of letting morse_cmake fall back to
 # Accelerate.framework — see openblas note in required_formulae above.
 extra_cmake_args+=("-DBLA_VENDOR=OpenBLAS")
