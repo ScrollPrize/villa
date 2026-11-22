@@ -122,6 +122,7 @@ def _make_3d_stem_2d_model(config: InkConfig) -> Local3DStem2DUNet:
     source_model_config = dict(network_config["model_config"])
     source_model_config.pop("stem_channels", None)
     stem_channels = config.model.stem_channels
+    source_model_config.pop("stem_conv_backend", None)
     source_model_config.pop("input_pad_depth_to", None)
     source_model_config["z_projection_mode"] = "none"
     network_config["spacing"] = config.model.spacing[-2:]
@@ -138,6 +139,7 @@ def _make_3d_stem_2d_model(config: InkConfig) -> Local3DStem2DUNet:
         _build_network(network_config, op_dims=2),
         input_depth=input_depth,
         stem_channels=stem_channels,
+        stem_conv_backend=config.model.stem_conv_backend,
     )
 
 
