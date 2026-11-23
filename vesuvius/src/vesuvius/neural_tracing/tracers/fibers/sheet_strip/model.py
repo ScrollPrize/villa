@@ -18,6 +18,7 @@ from dataclasses import dataclass
 import math
 
 import torch
+from vc_reader.torch import sample_array
 from torch import nn
 import torch.nn.functional as F
 
@@ -232,10 +233,10 @@ class SheetStripFollower(RegressionFollower):
         depth, height, width = image.shape[2:]
         p = points.float()[..., None, :].expand(-1, -1, -1, len(self.strip_profile_offsets), -1).clone()
         p[..., 0] = p[..., 0]+self.strip_profile_offsets
-        grid = torch.stack(((p[..., 0]/c.spacing+(width-1)/2)/(width-1),
-                            (p[..., 1]/c.spacing+(height-1)/2)/(height-1),
-                            (p[..., 2]/c.spacing+c.behind)/(depth-1)), -1)*2-1
-        values = F.grid_sample(image, grid.reshape(b, -1, 1, 1, 3), align_corners=True)  # (B, C, M, 1, 1)
+        indices = torch.stack((p[..., 2]/c.spacing+c.behind,
+                               p[..., 1]/c.spacing+(height-1)/2,
+                               p[..., 0]/c.spacing+(width-1)/2), -1)
+        values = sample_array(image, indices.reshape(b, -1, 3))
         return values.reshape(b, -1, t, n*len(self.strip_profile_offsets)).permute(0, 2, 3, 1).reshape(b, t, -1)
 
     def strip_evidence(self, ctx, points):

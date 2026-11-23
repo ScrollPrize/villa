@@ -1,23 +1,26 @@
 // vc_grow_seg_from_seed in store mode: grow a surface into an object store, then
 // resume from the stored surface into a new object. With a fixed seed and one
-// thread the stored surface equals the tifxyz output of the same run. A
+// thread the stored surface equals the tifxyz output of the same run after
+// applying that format's negative-coordinate validity rule. A
 // neighbor copy projects and refines in one run, creating one surface.
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+#include <vc_object_store/objects/StoreReader.hpp>
 #include <doctest/doctest.h>
 
-#include "vc/core/types/Array3D.hpp"
+#include <vc_reader/zarr.hpp>
+#include <vc_reader/zarr_write.hpp>
+#include <vc_reader/tifxyz.hpp>
 #include "vc/core/types/Volume.hpp"
-#include "support/TestZarrVolume.hpp"
+#include <nlohmann/json.hpp>
+#include <filesystem>
+#include <fstream>
 #include "vc/core/util/QuadSurface.hpp"
 #include <vc_object_store/Uuid.hpp>
 
-#include <nlohmann/json.hpp>
 #include <opencv2/core.hpp>
 
 #include <cstdlib>
-#include <filesystem>
-#include <fstream>
 #include <regex>
 #include <sstream>
 
@@ -42,17 +45,15 @@ std::string run(const std::string& command, const fs::path& log)
 void writeSheets(const fs::path& dir, const std::vector<int>& centres)
 {
     fs::create_directories(dir);
-    vc::test::ZarrVolumeSpec options;
-    options.shapeZYX = {128, 128, 128};
-    options.uuid = "test-volume";
-    options.name = "test-volume";
-    auto volume = vc::test::createZarrVolume(dir / "volume.zarr", options);
-    Array3D<uint8_t> sheet({128, 128, 128}, 0);
+    const std::filesystem::path volumeRoot = dir / "volume.zarr";
+    const vcr::zarr::CreateOptions levelZero{.shape = {128, 128, 128}, .chunks = {64, 64, 64}, .compressor = "", .overwrite = true};
+    vcr::zarr::Writer::create(volumeRoot / "0", levelZero);
+    std::ofstream(volumeRoot / "meta.json") << nlohmann::json{{"type", "vol"}, {"uuid", "test-volume"}, {"name", "test-volume"}, {"format", "zarr"}, {"width", 128}, {"height", 128}, {"slices", 128}, {"voxelsize", 1.0}}.dump();
+    std::vector<uint8_t> sheet(128 * 128 * 128, 0);
     for (const int centre : centres)
         for (int z = centre - 4; z <= centre + 4; ++z)
-            for (size_t y = 0; y < 128; ++y)
-                for (size_t x = 0; x < 128; ++x) sheet(size_t(z), y, x) = uint8_t(255 - 20 * std::abs(z - centre));
-    vc::test::writeZYX(*volume, sheet, {0, 0, 0});
+            std::fill_n(sheet.begin() + size_t(z) * 128 * 128, 128 * 128, uint8_t(255 - 20 * std::abs(z - centre)));
+    vcr::zarr::Writer::open(dir / "volume.zarr" / "0").writeRegion({0, 0, 0}, {128, 128, 128}, sheet.data());
 }
 }
 
@@ -64,8 +65,7 @@ TEST_CASE("vc_grow_seg_from_seed grows into and resumes from an object store")
     writeSheets(dir, {64});
     OpenOptions options; options.author = "grow-store-test";
     { auto store = ObjectStore::create(dir / "objects.vcobj", options); }
-    std::ofstream(dir / "params.json") << nlohmann::json{{"generations", 6}, {"thread_limit", 1}, {"min_area_cm", 0},
-                                                          {"cache_root", (dir / "cache").string()}}.dump();
+    std::ofstream(dir / "params.json") << nlohmann::json{{"generations", 6}, {"thread_limit", 1}, {"min_area_cm", 0}}.dump();
     const std::string base = std::string("\"") + tool + "\" --volume \"" + (dir / "volume.zarr").string() +
         "\" --params \"" + (dir / "params.json").string() + "\" --rng-seed 1 --seed 64 64 64";
     const std::string common = base + " --store \"" + (dir / "objects.vcobj").string() + "\" --volume-uuid test-volume --tag paths";
@@ -85,12 +85,15 @@ TEST_CASE("vc_grow_seg_from_seed grows into and resumes from an object store")
         const auto meta = nlohmann::json::parse(object->meta);
         CHECK(meta.at("coordinates").at("volume_uuid") == "test-volume");
         CHECK(meta.at("provenance").at("tool") == "vc_grow_seg_from_seed");
-        CHECK(load_quad_from_store(store, txn, uuid)->countValidPoints() > 4);
+        CHECK(load_quad_from_store(vc::objects::LocalStoreReader(store, txn), uuid)->countValidPoints() > 4);
     }
-    const auto stored = load_quad_from_store(store, txn, grown);
+    const auto stored = load_quad_from_store(vc::objects::LocalStoreReader(store, txn), grown);
     const auto files = load_quad_from_tifxyz(dir / "files");
     REQUIRE(stored->rawPointsPtr()->size() == files->rawPointsPtr()->size());
-    CHECK(cv::norm(*stored->rawPointsPtr(), *files->rawPointsPtr(), cv::NORM_INF) == 0);
+    auto inFileFormat = stored->rawPointsPtr()->clone();
+    for (auto& point : inFileFormat)
+        if (!vcr::tifxyz::vertexValid(point.val)) point = {-1.f, -1.f, -1.f};
+    CHECK(cv::norm(inFileFormat, *files->rawPointsPtr(), cv::NORM_INF) == 0);
     CHECK(nlohmann::json::parse(store.objectByUuid(txn, resumed)->meta).at("provenance").at("sources") ==
           nlohmann::json::array({grown}));
     std::error_code ignored;
@@ -105,13 +108,10 @@ TEST_CASE("A neighbor copy projects and refines in one run and creates one surfa
     writeSheets(dir, {40, 90});
     OpenOptions options; options.author = "grow-store-test";
     { auto store = ObjectStore::create(dir / "objects.vcobj", options); }
-    const auto cache = (dir / "cache").string();
-    std::ofstream(dir / "grow.json") << nlohmann::json{{"generations", 6}, {"thread_limit", 1}, {"min_area_cm", 0},
-                                                        {"cache_root", cache}}.dump();
+    std::ofstream(dir / "grow.json") << nlohmann::json{{"generations", 6}, {"thread_limit", 1}, {"min_area_cm", 0}}.dump();
     std::ofstream(dir / "copy.json") << nlohmann::json{
-        {"mode", "gen_neighbor"}, {"neighbor_dir", "out"}, {"neighbor_max_distance", 80}, {"cache_root", cache},
-        {"refine", {{"max_gen", 1}, {"generations", 1}, {"thread_limit", 1}, {"min_area_cm", 0},
-                    {"cache_root", cache}}}}.dump();
+        {"mode", "gen_neighbor"}, {"neighbor_dir", "out"}, {"neighbor_max_distance", 80},
+        {"refine", {{"max_gen", 1}, {"generations", 1}, {"thread_limit", 1}, {"min_area_cm", 0}}}}.dump();
     const std::string common = std::string("\"") + tool + "\" --volume \"" + (dir / "volume.zarr").string() +
         "\" --store \"" + (dir / "objects.vcobj").string() + "\" --volume-uuid test-volume --tag paths";
 
@@ -126,7 +126,8 @@ TEST_CASE("A neighbor copy projects and refines in one run and creates one surfa
     const auto meta = nlohmann::json::parse(store.objectByUuid(txn, copied)->meta);
     CHECK(meta.at("provenance").at("sources") == nlohmann::json::array({grown}));
     CHECK(meta.at("vc_gsfs_mode") == "resume");  // the projection was refined in the same run
-    CHECK(load_quad_from_store(store, txn, copied)->countValidPoints() > 4);
+    // The source's vertices outside this small volume are invalid, which leaves one quad to copy.
+    CHECK(load_quad_from_store(vc::objects::LocalStoreReader(store, txn), copied)->countValidPoints() >= 4);
     std::error_code ignored;
     fs::remove_all(dir, ignored);
 }

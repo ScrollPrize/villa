@@ -166,9 +166,8 @@ class ProbeWorker:
         if str(training.get("device", "auto")).split(":")[0] not in ("cuda", "auto"):
             raise ValueError("memory calibration requires a CUDA training config")
         self.fingerprint = config_fingerprint(raw)
-        from .cooperative_resources import configure_cuda_memory_budget, initialize_worker_volume_cache
+        from .cooperative_resources import configure_cuda_memory_budget
         configure_cuda_memory_budget(grant["gpus"][self.devices[rank]], settings.reserve_bytes)
-        initialize_worker_volume_cache(raw)
         torch.cuda.set_device(0)
         torch.cuda.reset_peak_memory_stats(0)
         size = settings.microbatch_size

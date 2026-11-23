@@ -1,5 +1,5 @@
 import numpy as np
-import cc3d
+from vc_reader.geometry import label_components
 import torch
 from typing import Dict, Optional, Tuple
 from skimage.metrics import variation_of_information
@@ -104,8 +104,8 @@ def _compute_voi_3d(
         pred_use = pred_bin
 
     # Connected components (3D)
-    gt_lab = cc3d.connected_components(gt_use.astype(np.uint8), connectivity=connectivity)
-    pred_lab = cc3d.connected_components(pred_use.astype(np.uint8), connectivity=connectivity)
+    gt_lab, _ = label_components(gt_use, connectivity=connectivity)
+    pred_lab, _ = label_components(pred_use, connectivity=connectivity)
 
     if use_union_mask:
         m = (gt_lab > 0) | (pred_lab > 0)

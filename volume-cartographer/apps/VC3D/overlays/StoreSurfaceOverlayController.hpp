@@ -1,7 +1,7 @@
 #pragma once
-
 #include "overlays/ViewerOverlayControllerBase.hpp"
 #include "ObjectStoreRegions.hpp"
+#include "SurfaceCatalog.hpp"
 
 #include <QPolygonF>
 #include <QString>
@@ -19,18 +19,17 @@ class CState;
 class PlaneSurface;
 class QuadSurface;
 
-// Where surfaces cross each viewer, from the object store (stored surfaces and
-// the session's drafts; no surface is materialized or indexed here):
+// Where surfaces cross each viewer, using the store's shared intersection kernels:
 //  - plane viewers: the surface list's visible surfaces and the viewer's
 //    intersect targets (the active surface, workspace surfaces), queried per
 //    view region;
-//  - surface viewers: where the viewer's intersect planes ("seg xy/xz/yz") cut
-//    its surface, drawn on the surface through each crossing's grid position.
-// Drafts change while they are edited, so their lines are cut on the spot;
-// stored surfaces are read on the thread pool. Catalog placeholders reached
+//  - surface viewers: intersect the displayed immutable grid (current, historical
+//    or draft) through the same resident/store intersection kernel.
+// All selected geometry is cut on the thread pool. Catalog placeholders reached
 // are fetched one at a time in the background and drawn as each arrives.
 class StoreSurfaceOverlayController : public ViewerOverlayControllerBase
 {
+    friend int runViewerRegressionTests();
     Q_OBJECT
 public:
     StoreSurfaceOverlayController(CState* state, ViewerManager* manager, QObject* parent = nullptr);
@@ -46,6 +45,7 @@ public:
         std::string uuid;
         std::vector<std::array<double, 3>> points;
         std::vector<std::array<double, 2>> grid;
+        std::optional<vc::objects::ObjectVersion> reference;
     };
 
 protected:
@@ -56,7 +56,7 @@ protected:
 
 private:
     struct Listing {
-        std::vector<Run> runs;
+        std::map<std::string, std::vector<Run>> runs;
         bool complete = true;
         std::vector<std::pair<vc::objects::AttachmentIdentity, std::string>> remote;
     };
@@ -64,25 +64,22 @@ private:
     struct PlaneCut {
         std::string plane;
         vc3d::store::Region slab;
+        bool operator==(const PlaneCut&) const = default;
     };
     struct View {
-        // Plane viewers: stored targets in the view's region.
+        // One request lifecycle and result set for every geometry source.
         vc3d::store::RegionRequests region;
         std::optional<vc3d::store::Region> displayed;
         QRectF displayedRect;
         std::vector<std::string> targets;
-        std::vector<Run> runs;
+        std::map<std::string, std::vector<Run>> runs;
         std::uint64_t runsVersion{0};
         // Stored lines are a group of their own, drawn for this camera and
         // style: a pan only moves them.
-        // Drafts cut over the whole plane, at their revisions.
-        std::optional<vc3d::store::Region> draftSlab;
-        std::vector<std::string> drafted;
         std::vector<std::uint64_t> draftRevisions;
-        std::vector<Run> draftRuns;
+        std::map<std::string, std::shared_ptr<const vc::objects::ResidentSurface>> displayedSurfaces;
         struct Drawn {
             std::uint64_t runsVersion{0}, styleVersion{0};
-            std::vector<std::uint64_t> draftRevisions;
             QPointF origin, axisU, axisV;
             cv::Vec3f planeOrigin, planeNormal;
             std::vector<float> offsets;
@@ -93,15 +90,10 @@ private:
         std::optional<Drawn> drawn;
         bool dirty{true};
         bool refreshPending{false};
-        // Surface viewers: the planes' cuts of a stored surface.
+        // Cutting planes; plane viewers use an unnamed viewport cut.
         std::vector<PlaneCut> cuts;
-        std::map<std::string, std::vector<Run>> planeRuns;
-        std::uint64_t cutRevision{0};
-        bool cutsBusy{false};
-        bool cutsStale{false};
     };
-    void request(VolumeViewerBase* viewer, const vc3d::store::Region& region, const std::vector<std::string>& uuids);
-    void requestCuts(VolumeViewerBase* viewer, const std::string& uuid, const std::vector<PlaneCut>& cuts);
+    void request(VolumeViewerBase* viewer, const SurfaceCatalog::RegionInput& input, const std::vector<PlaneCut>& cuts);
     // Fetch placeholders' geometry (not already fetching or failed); each
     // arrival is a commit, which reads the views again.
     void fetch(const std::vector<std::pair<vc::objects::AttachmentIdentity, std::string>>& remote);
@@ -127,13 +119,11 @@ private:
     LineStyle lineStyle(VolumeViewerBase* viewer) const;
     void addLines(VolumeViewerBase* viewer, const std::vector<Run>& runs, const LineStyle& style,
                   OverlayBuilder& builder) const;
-    // Drafts among `uuids`, cut synchronously.
-    std::vector<Run> draftRuns(const std::vector<std::string>& uuids, const vc3d::store::Region& slab) const;
     void drawPlaneViewer(VolumeViewerBase* viewer, View& v, OverlayBuilder& builder);
     void drawSurfaceViewer(VolumeViewerBase* viewer, View& v, OverlayBuilder& builder);
+    std::shared_ptr<vc::objects::ResidentSurface> residentSurface(QuadSurface& surface);
 
     CState* _state;
-    std::string _volume;
     std::vector<std::string> _surfaces;
     std::set<std::string> _highlighted;
     std::uint64_t _styleVersion{0};
@@ -141,4 +131,5 @@ private:
     std::map<std::string, QString> _fetchFailures;
     std::shared_ptr<std::atomic_bool> _fetchCancel = std::make_shared<std::atomic_bool>(false);
     std::unordered_map<VolumeViewerBase*, std::unique_ptr<View>> _views;
+    std::map<std::string, std::pair<const QuadSurface*, std::shared_ptr<vc::objects::ResidentSurface>>> _residentSurfaces;
 };

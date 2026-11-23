@@ -1,5 +1,7 @@
 #pragma once
 
+#include "GrowPatchSeedDialog.hpp"
+
 #include <optional>
 #include <memory>
 #include <functional>
@@ -16,7 +18,6 @@
 
 #include "elements/VolumeSelector.hpp"
 #include "AlphaCompRefineRequest.hpp"
-#include "StraightenRequest.hpp"
 #include "CommandLaunchError.hpp"
 // Full definition needed: RenderSegmentParams stores a
 // CommandLineToolRunner::RenderOutputFormat (nested enum) by value.
@@ -68,12 +69,7 @@ public:
     };
 
     // Arguments accepted by startGrowPatchFromSeed.
-    struct GrowPatchSeedParams {
-        QString volumeId;          // vpkg volume id; empty => current volume
-        int     iterations{200};   // clamped/validated to [1, 100000]
-        double  minAreaCm{0.002};  // >= 0
-        QString outputTag{QStringLiteral("paths")};  // tag of the new surface
-    };
+    using GrowPatchSeedParams = ::GrowPatchSeedParams;
 
     // Arguments accepted by startRunTrace.
     struct RunTraceParams {
@@ -117,8 +113,6 @@ public:
                                      // <name>_flatboi (matching the dialog default)
     };
 
-    // Arguments accepted by startStraighten.
-    using StraightenParams = StraightenRequest;
 
     // Inputs shared by the interactive dialog and dialog-free caller. Base
     // tracer params are fixed; paramOverrides merge over them last.
@@ -165,9 +159,9 @@ signals:
     void statusMessage(QString text, int timeout);
 
     /**
-     * Emitted when a flattening job (SLIM or straighten) begins.
+     * Emitted when a flattening job (SLIM) begins.
      * Emitted from both interactive slots and direct start* methods. `kind` is
-     * "flatten.slim" / "flatten.straighten"; `label` is a short
+     * "flatten.slim"; `label` is a short
      * human string.
      */
     void flattenJobStarted(QString kind, QString label);
@@ -189,17 +183,7 @@ public slots:
     void onRotateSurface(const std::string& segmentId);
     void onAlphaCompRefine(const std::string& segmentId);
     void onSlimFlatten(const std::string& segmentId);
-    void onStraighten(const std::string& segmentId);
-    void onRasterizeSegments(const QStringList& segmentIds);
-    // Open the MergeSurfacesDialog seeded with `segmentIds` (empty = open
-    // dialog with empty grid for the user to populate via "Add segments").
-    void onMergeSurfaces(const QStringList& segmentIds);
-    // Open the MergePatchDialog. When invoked from the surface context
-    // menu we receive exactly two segment IDs; from the top menu the list
-    // is empty and the user picks both via the dialog combos.
-    void onMergePatch(const QStringList& segmentIds);
     void onGrowTrackPatches();
-    void onAddIgnoreLabel();
     void onNeighborCopyRequested(const QString& segmentId, bool copyOut);
     void onResumeLocalGrowPatchRequested(const QString& segmentId);
     void onCreateSegmentGrowPatchFromSeed(const QVector3D& seedPoint);
@@ -240,19 +224,6 @@ public:
                           CommandLaunchError* error = nullptr,
                           QString* resolvedOutputName = nullptr);
 
-    /// Starts vc_straighten asynchronously with dialogs suppressed. The tool is
-    /// validated before launch; completion uses flattenJobFinished.
-    bool startStraighten(const std::string& segmentId,
-                         const StraightenParams& params,
-                         CommandLaunchError* error = nullptr,
-                         QString* resolvedOutputName = nullptr);
-    // The one straighten launch, from the dialog (interactive) or the bridge.
-    bool startStraightenImpl(const std::string& segmentId,
-                             const StraightenParams& params,
-                             bool interactive,
-                             CommandLaunchError* error,
-                             QString* resolvedOutputName);
-
     /// Dialog-free Resume-opt Local (GrowPatch) launch. The interactive slot
     /// gathers the same ResumeLocalGrowParams and uses the same launch core.
     /// Completion is observable via CommandLineToolRunner::toolFinished (the
@@ -280,8 +251,6 @@ public:
                                   QString* errorMessage = nullptr);
 
 
-    // Marks a rasterized label volume and records its source surfaces (UUIDs).
-
 private:
     /** Helper: get current volume path from state */
     QString getCurrentVolumePath() const;
@@ -296,7 +265,7 @@ private:
     struct StoredSurface {
         std::string uuid;
         QString name;        // record name; the UUID when unnamed
-        QString store;       // the store file (a hosted replica's local file)
+        QString store;       // the store file
         QString volumeUuid;  // the current volume, which outputs are bound to
         double voxelScale = 1;  // tools' voxels per voxel of it (its working level)
     };
@@ -332,7 +301,6 @@ private:
     QVector<VolumeSelector::VolumeOption> buildVolumeOptionList(
         QString* defaultOut = nullptr);
     // The tool reads volume `volumeId`: a remote one with its locator and auth.
-    void configureCommandRunnerForVolume(const std::string& volumeId);
 
     /**
      * Fixed resume-local tracer params before caller overrides.

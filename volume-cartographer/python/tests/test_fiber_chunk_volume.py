@@ -67,26 +67,6 @@ def test_route_cli_uses_no_gpu_and_holds_both_locks(tmp_path, monkeypatch):
         workflow.main([str(tmp_path / "config"), str(source), "--routes-from", str(source)])
 
 
-def test_queued_loader_configuration(monkeypatch):
-    from vc import fiber_chunk_volume as workflow
-    calls = []
-    monkeypatch.setattr(workflow.ft, "configure_chunk_loader",
-                        lambda *args: calls.append(args) or '{"backend":"queued"}')
-    cfg = dict(cache_bytes=10 << 30, loader=dict(backend="queued", queued_chunk_window=512))
-    assert workflow.configure_loader(cfg, 36) == {"backend": "queued"}
-    assert calls == [(36, 10 << 30, "queued", 512)]
-    for loader in [dict(backend="unknown"), dict(queued_chunk_window=1),
-                   dict(backend="queued", queued_chunk_window=-1),
-                   dict(backend="queued", queued_chunk_window=True),
-                   dict(backend="queued", resource_scaled=False)]:
-        with pytest.raises(ValueError):
-            workflow.configure_loader(dict(loader=loader), 36)
-    with pytest.raises(ValueError, match="separate backends"):
-        workflow.configure_loader(dict(loader=dict(backend="queued"),
-                                       chunks=dict(worker_cache_bytes=1 << 30)), 36)
-    assert len(calls) == 1
-
-
 def test_gpu_default_uses_manager_inventory_without_nvidia_smi(monkeypatch):
     from vc import fiber_chunk_volume as workflow
     def unexpected(*args, **kwargs):
@@ -120,7 +100,6 @@ def test_cli_default_submits_all_manager_gpus(tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, "villa_gpu_manager.bootstrap", SimpleNamespace(ensure_manager=lambda: ("mock", inventory)))
     monkeypatch.setitem(sys.modules, "villa_gpu_manager.exclusive", SimpleNamespace(run_exclusive=submit))
     monkeypatch.setattr(workflow, "load_config", lambda path: {})
-    monkeypatch.setattr(workflow, "configure_loader", lambda *args: pytest.fail("pools created before grant"))
     monkeypatch.setattr(workflow, "inspect_outputs", lambda *args: (1, 1, True))
     monkeypatch.setattr(workflow, "open_inputs", lambda cfg: (None, None, None, SimpleNamespace(gpu_library="cuda", cache_only=False)))
     monkeypatch.setattr(workflow, "job_keys", lambda *args: [(0, 0, 0)])
@@ -169,7 +148,7 @@ def test_resume_flags_and_legacy(inputs):
     c.conflict_normal_base, c.conflict_tangent_base = 10, 20
     assert run(inputs, c, keys=((2, 0, 0),))["annotated"] == 1
     files[0].write_bytes(b"invalid cache")
-    with pytest.raises(RuntimeError, match="chunk cache frame"):
+    with pytest.raises(RuntimeError, match="cannot decompress chunk paths"):
         run(inputs, c)
     assert files[0].read_bytes() == b"invalid cache"
 
@@ -229,7 +208,7 @@ def test_native_pool_inventory(tmp_path):
 
 def test_command_callable_cpu(inputs, monkeypatch):
     cfg = dict(prediction_manifest=str(inputs / "pred.json"), normal_manifest=str(inputs / "norm.json"),
-               source_identity="callable", scaledown_power=0, enable_width=True,loader={"resource_scaled":False},
+               source_identity="callable", scaledown_power=0, enable_width=True,
                trace=trace_config().to_dict(), chunks=dict(core_base=64, halo_base=16, grid_base=4,
                nms_base=4, tube_half_base=8, tube_step_base=4, rim_normal_base=4, rim_tangent_base=4,
                conflict_normal_base=10, conflict_tangent_base=20), keys_xyz=[[0, 0, 0], [1, 0, 0]])
@@ -255,14 +234,11 @@ def test_partial_grant_caps_cpu_even_on_resume(inputs, monkeypatch):
     monkeypatch.setattr(workflow, "open_inputs", lambda cfg: (field, normal, trace_config(), chunks))
     monkeypatch.setattr(workflow, "job_keys", lambda *args: [])
     observed = []
-    loader_cores = []
-    monkeypatch.setattr(workflow, "configure_loader", lambda cfg, cores: loader_cores.append(cores) or {})
     def prepare(*args):
         observed.append(args[-2])
     monkeypatch.setattr(workflow.ft, "prepare_chunk_volume", prepare)
     result = workflow.execute(dict(source_identity="test"), inputs / "unused", 224, 8)
     assert observed == [2]
-    assert loader_cores == [2]
     assert result["workers"] == 2
 
 

@@ -129,7 +129,7 @@ struct QuantizeMedian {
         const double low=stats->low,range=stats->high-low;
         if (!(range>0) || !isfinite(range)) return;
         EACH_INDEX(data.size) {
-            const int code=int(clamp_value(floor((double(data.ptr[i])-low)/range*255+.5),0,255));
+            const int code=int(clamp_value(round_half_even((double(data.ptr[i])-low)/range*255),0,255));
             data.ptr[i]=palette[code];
         }
     }

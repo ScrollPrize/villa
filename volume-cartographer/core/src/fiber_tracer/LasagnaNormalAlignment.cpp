@@ -409,7 +409,6 @@ LasagnaNormalAlignmentField sampleAndAlignLasagnaNormalLattice(
     std::vector<vc::lasagna::LasagnaNormalSampler::FloatNormalSample> sampled;
     const auto sampling = sampler.sampleNormalBatch(
         field.lattice.positionsBaseXYZ, parallelThreads, sampled);
-    field.prefetchMilliseconds = sampling.prefetchMs;
     field.materializeMilliseconds = sampling.materializeMs;
     notifyProgress(
         progress,

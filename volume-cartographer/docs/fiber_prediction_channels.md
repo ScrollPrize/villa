@@ -52,13 +52,3 @@ ctest --test-dir build -R '^test_fiber_prediction_channels$' --output-on-failure
 
 Tests cover opt-in behavior, invalid channels, interpolation order,
 presence-masked width interpolation, out-of-volume handling and concurrency.
-To compare existing and options-based constructors on real anchor positions:
-
-```sh
-export VC_TEST_CHANNEL_PREDICTION_MANIFEST=/path/to/fibers.lasagna.json
-export VC_TEST_METRIC_ANCHORS=/path/to/anchors.json
-build/bin/test_fiber_prediction_channels
-```
-
-The real check reads existing data only. It verifies ordinary predictions stay
-identical; auxiliary interpolation correctness uses controlled float32 fixtures.

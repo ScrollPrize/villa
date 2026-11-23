@@ -5,6 +5,7 @@
 #include <cmath>
 #include <stdexcept>
 #include <string_view>
+#include <chrono>
 
 namespace vc::fiber_tracer {
 namespace {
@@ -21,6 +22,70 @@ void validateReverseSpan(const PolylineArcGeometry& geometry, double startArc,
         throw std::invalid_argument("invalid reverse start arc or coordinate scale");
     (void)samplePolylineArc(geometry, startArc);
 }
+}
+
+void FiberReverseCheckSchedule::update(const std::vector<cv::Vec3d>& points)
+{
+    if(points.empty() || observed_ >= points.size())
+        throw std::logic_error("reverse schedule requires append-only committed points");
+    for(size_t i=observed_+1;i<points.size();++i)
+        unchecked_+=cv::norm(points[i]-points[i-1]);
+    observed_=points.size()-1;
+}
+void FiberReverseCheckSchedule::accept(const std::vector<cv::Vec3d>& points,size_t target)
+{
+    checked_=target;unchecked_=0;
+    for(size_t i=target+1;i<points.size();++i)unchecked_+=cv::norm(points[i]-points[i-1]);
+}
+bool FiberReverseCheckSchedule::check(const std::vector<cv::Vec3d>& points,bool terminal,const Verify& verify)
+{
+    if(interval_<=0)return true;
+    update(points);
+    const size_t last=points.size()-1;
+    if(last<=checked_)return true;
+    if(!pending_ && !terminal && unchecked_>=interval_)pending_=last;
+    if(pending_ && (terminal || last-*pending_>=delay_)) {
+        if(!verify(*pending_,std::min(checked_,*pending_),false))return false;
+        accept(points,*pending_);pending_.reset();
+    }
+    if(terminal && last>checked_) {
+        if(!verify(last,checked_,true))return false;
+        accept(points,last);
+    }
+    return true;
+}
+bool FiberReverseCheckSchedule::stopTail(const std::vector<cv::Vec3d>& points,const Verify& verify)
+{
+    if(interval_<=0)return true;
+    const size_t last=points.size()-1;
+    const size_t target=last>delay_ ? last-delay_ : 0;
+    historyOnly_=target==0;
+    if(target && !verify(target,std::min(checked_,target),false))return false;
+    accept(points,last);pending_.reset();observed_=last;
+    return true;
+}
+
+FiberReverseCheckpointResult verifyFiberReverseCheckpoint(
+    const FiberPredictionSource& predictions,const vc::lasagna::NormalSampler& normals,
+    const FiberTraceConfig& config,const std::vector<cv::Vec3d>& points,
+    size_t checkpoint,size_t checked,double widthMean)
+{
+    const auto begin=std::chrono::steady_clock::now();
+    auto reverse=config;
+    if(reverse.widthRelativeTolerance>0)reverse.widthReferenceMean=widthMean;
+    const auto path=makePolylineArcGeometry(points);
+    ReverseSpanOptions options;
+    options.initialDirections=fiberReverseFutureHistory(path,checkpoint,config.replayReverseDelaySteps);
+    options.verifiedThroughArc=path.vertexArcs.at(checked);
+    options.minimumTravel=config.replayReverseConvergenceMinBase;
+    options.convergenceDistance=config.replayReverseConvergenceDistanceBase;
+    options.convergenceAngleDegrees=config.replayReverseConvergenceAngleDegrees;
+    options.convergenceSteps=config.replayReverseConvergenceSteps;
+    const auto check=verifyFiberReverseSpanDetailed(predictions,normals,reverse,path,
+        path.vertexArcs.at(checkpoint),config.replayReverseNormalRadiusBase,
+        config.replayReverseTangentialRadiusBase,0,options);
+    return {check.passed,check.travelled,check.converged,options.initialDirections.size(),
+        std::chrono::duration<double>(std::chrono::steady_clock::now()-begin).count()};
 }
 
 ReverseSpanVerifier::ReverseSpanVerifier(const PolylineArcGeometry& geometry,

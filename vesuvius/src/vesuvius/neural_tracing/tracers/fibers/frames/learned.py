@@ -18,7 +18,7 @@ import numpy as np
 from vesuvius.neural_tracing.tracers.shared.geometry import frame_from_heading
 from vesuvius.neural_tracing.tracers.fibers.frames.ct import (
     FRAME_POLICY, LEARNED_FRAME_POLICY, FRAME_POLICIES, PREDICTION_FRAME_POLICY, fiber_family, orient_item,
-    reframe_item, frame_prefetch_bounds, heading_free_bounds, normal_context)
+    reframe_item)
 from vesuvius.neural_tracing.tracers.shared.reference import observed_path
 
 DEFAULT_FRAME_CHECKPOINT = str(Path(__file__).resolve().parents[1]/'output'/'heading_model_l0_w16_centered_frame'/'heading_model.pt')
@@ -141,31 +141,31 @@ def trace_family_kwargs(tracer, families):
     return dict(families=families) if getattr(tracer, 'frame_predictor', None) is not None else {}
 
 
-def predict_frames(predictor, vol, positions, priors, paths, families, previous=None, *, pool=None):
+def predict_frames(predictor, ct, spec, positions, priors, paths, families, previous=None):
     if (hasattr(predictor, 'predict_frames_batched')
             and getattr(getattr(predictor, 'device', None), 'type', None) == 'cuda'):
-        return predictor.predict_frames_batched(vol, positions, priors, paths, families, previous, pool)
+        return predictor.predict_frames_batched(ct, spec, positions, priors, paths, families, previous)
     results = []
     previous = previous if previous is not None else [None]*len(positions)
     for start in range(0, len(positions), 64):
         part = slice(start, start+64)
-        results.extend(predictor.predict_frames(vol, positions[part], priors[part], paths[part], families[part],
-                                                previous=previous[part], pool=pool))
+        results.extend(predictor.predict_frames(ct, spec, positions[part], priors[part], paths[part], families[part],
+                                                previous=previous[part]))
     return results
 
 
-def orient_items(items, vol, predictor=None, *, previous=None, pool=None, window=0):
+def orient_items(items, ct, spec, predictor=None, *, previous=None, window=0):
     """Crop frames for items without a recorded frame policy: the frame model (or the CT frame), then for continuation
     items with a previous prediction the prediction axis over ``window`` vox (prediction_window)."""
     recorded = ['frame_policy' in item for item in items]  # recorded observation geometry stays immutable
-    _orient_items(items, vol, predictor, previous=previous, pool=pool)
+    _orient_items(items, ct, spec, predictor, previous=previous)
     for item, fixed in zip(items, recorded):
         if not fixed:
             apply_prediction_axis(item, window)
         item.pop('prev_prediction', None)  # used only to orient the crop
 
 
-def _orient_items(items, vol, predictor=None, *, previous=None, pool=None):
+def _orient_items(items, ct, spec, predictor=None, *, previous=None):
     pending = []
     for i, item in enumerate(items):
         if 'frame_policy' in item:
@@ -173,31 +173,17 @@ def _orient_items(items, vol, predictor=None, *, previous=None, pool=None):
                 raise ValueError('Unsupported crop frame policy; recollect replay')
             continue  # recorded observation geometry stays immutable
         if predictor is None or not item.get('fiber_family'):
-            orient_item(item, vol)
+            orient_item(item, ct, spec)
         else:
             pending.append(i)
     if not pending:
         return
     selected = [items[i] for i in pending]
-    frames = predict_frames(predictor, vol, [i['pos'] for i in selected], [i['frame'][:, 2] for i in selected],
+    frames = predict_frames(predictor, ct, spec, [i['pos'] for i in selected], [i['frame'][:, 2] for i in selected],
         [observed_path(i) for i in selected], [fiber_family(i['fiber_family']) for i in selected],
-        previous=[None if previous is None else previous[i] for i in pending], pool=pool)
+        previous=[None if previous is None else previous[i] for i in pending])
     for item, frame in zip(selected, frames):
         reframe_item(item, frame)
         from vesuvius.neural_tracing.tracers.fibers.data.targets import refresh_frame_targets
         refresh_frame_targets(item)
         item.update(frame_policy=LEARNED_FRAME_POLICY, ct_frame_diagnostics=dict(source=3, energy=0., gap=0.))
-
-
-def crop_frame_bounds(item, crop, vol, predictor=None):
-    """Reads of ``vol`` for one state's crop and frame."""
-    if predictor is None or item.get('frame_policy') in FRAME_POLICIES:
-        yield from frame_prefetch_bounds(item, crop, vol.input_scale)
-    else:
-        # Learned headings can change as well as roll; enclose every possible orientation.
-        yield heading_free_bounds(item['pos'], crop, vol.input_scale)
-        yield heading_free_bounds(item['pos'], predictor.model.cfg.patch, vol.input_scale)
-        if not item.get('fiber_family'):
-            yield normal_context(item['pos'], vol.input_scale)
-    if item.get('seed_heading_family') is not None:
-        yield normal_context(item['seed_pos'], vol.input_scale)

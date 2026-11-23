@@ -61,6 +61,7 @@ int main()
   <Contents><Key>root/%C3%A9%26x</Key><Size>0</Size></Contents>
   <CommonPrefixes><Prefix>root/sub%20dir/</Prefix></CommonPrefixes>
 </ListBucketResult>)");
+        require(page.objects[0].etag == "\"abc\"", "listed etag");
         require(page.objects.size() == 2 && page.objects[0].key == "root/a b.json" && page.objects[0].size == 12 &&
                     page.objects[1].key == "root/\xC3\xA9&x" && page.objects[1].size == 0,
                 "objects");

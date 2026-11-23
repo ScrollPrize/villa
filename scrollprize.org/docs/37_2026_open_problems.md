@@ -518,16 +518,13 @@ We have evidence that working on 1.1 µm data yields cleaner results than 2.4 µ
 
 The square brackets follow classics and papyrology's standard "Leiden Convention" for transcribing damaged text: they mark text that is missing or illegible at that point in the original, not a typo or a transcriber giving up. An open bracket with nothing closing it, as in "πρ\[", means the word is simply cut off there by damage.
 
-What happens if the models don’t generalize? The right conclusion here is neither "the scan failed" nor "the model failed." At the moment, several explanations remain possible:
+Why do ink models not generalize well to some scrolls/segments? This varies from case to case (and sometimes we have no explanation!), but for example:
 
 * the scan may not capture the relevant signal strongly enough;    
 * the surface may be slightly misplaced (suboptimally localized);    
 * the ink labels may not match the true location of the ink signal;    
-* the model architecture may not be exploiting the right features;    
-* the ink morphology or chemistry may differ across scrolls;    
-* the signal may be present but below the current pipeline's ability to use it.
-
-**This is why better diagnostics matter just as much as better models — without them, it's hard to know which of these failure modes you're even fighting.**
+* the model may not be exploiting the right features;    
+* the ink morphology or chemistry may differ across scrolls.
 
 ## 4\. Data scale: the infrastructure bottleneck
 A full-resolution scroll volume is huge — too huge to just download to a laptop and work with as a local folder. So the project increasingly depends on chunked, cloud-friendly formats instead.

@@ -98,11 +98,12 @@ void readFrameMetadata(const Json& metadata, UmbilicusFile& file)
     const auto readDimension = [&](const char* key, std::optional<int>& out) {
         if (!metadata.contains(key)) return;
         const auto& value = metadata.at(key);
-        if (value.is_number_integer() && value.get<int64_t>() > 0) {
+        if (value.is_number_integer() && value > 0 && value <= std::numeric_limits<int>::max()) {
             out = int(value.get<int64_t>());
         } else {
             dimensionRejected = true;
-            reject(key, "expected a positive integer", value);
+            reject(key, value.is_number_integer() && value > std::numeric_limits<int>::max()
+                ? "dimension exceeds supported integer range" : "expected a positive integer", value);
         }
     };
     readDimension("volume_width", file.volumeWidth);
@@ -350,12 +351,11 @@ std::string importVolumeUmbilicus(ObjectStoreSession& session, const AttachmentI
     record.kind = "umbilicus";
     record.name = name;
     record.meta = Json{{"coordinates", volumeCoordinates(volume, storedUnitsPerVoxel)}, {"provenance", std::move(provenance)}}.dump();
-    RevisionSelection pins;
-    session.read(attachment, [&](const auto& db, const auto& txn, const auto&) { pins = volumeUmbilicusRevisions(db, txn, volume); });
-    pins[record.uuid] = std::nullopt;
-    session.act(attachment, pins, [&](auto& db, auto& txn) {
-        setVolumeUmbilicus(db, txn, volume, record, geometry::Umbilicus{file.points});
+    auto request = session.newRequest(attachment);
+    session.readStore(attachment, [&](const StoreReader& reader, const auto&) {
+        setVolumeUmbilicusRequest(reader, request, volume, record, geometry::Umbilicus{file.points});
     });
+    (void)session.submit(attachment, request);
     return record.uuid;
 }
 }

@@ -66,7 +66,7 @@ def split_fractional_edges(a, b, target, weight):
                 one_sided=np.zeros(len(source), bool)), source
 
 
-def solve(node_count, a, b, target, weight=None, one_sided=None):
+def solve(node_count, a, b, target, weight=None, one_sided=None, *, log_progress=False):
     """Minimize sum w|Bk-d|, or w max(0,d-Bk) on one-sided edges.
 
     Solve min -d.y, B.T y=0, -w<=y<=w (0<=y<=w for hinges).
@@ -94,19 +94,28 @@ def solve(node_count, a, b, target, weight=None, one_sided=None):
                            (np.r_[a, b], np.r_[e, e])), shape=(node_count, len(a))).tocsr()
     lo = np.where(hinge, 0., -w)
     result = linprog(-d.astype(float), A_eq=incidence, b_eq=np.zeros(node_count),
-                     bounds=np.column_stack((lo, w)), method='highs-ds')
+                     bounds=np.column_stack((lo, w)), method='highs-ds',options={'disp':log_progress})
     if not result.success:
         raise RuntimeError(result.message)
-    raw = -result.eqlin.marginals
+    return certify_flow(node_count, a, b, d, w, hinge, -result.eqlin.marginals,
+                        result.x, seconds=time.monotonic()-started, iterations=int(result.nit), incidence=incidence)
+
+
+def certify_flow(node_count, a, b, d, w, hinge, raw, y, *, seconds, iterations, incidence=None):
+    """Shared unchanged integer primal/dual certificate for circulation backends."""
+    if incidence is None:
+        e = np.arange(len(a))
+        incidence = coo_matrix((np.r_[-np.ones(len(a)), np.ones(len(a))],
+                               (np.r_[a, b], np.r_[e, e])), shape=(node_count, len(a))).tocsr()
+    lo = np.where(hinge, 0., -w)
     k = np.rint(raw).astype(np.int64)
     graph = coo_matrix((np.ones(len(a)), (a, b)), shape=(node_count, node_count)).tocsr()
     count, component = connected_components(graph, directed=False)
-    for c in range(count):
-        mask = component == c
-        k[mask] -= k[np.flatnonzero(mask)[0]]
+    first=np.full(count,node_count,dtype=np.int64)
+    np.minimum.at(first,component,np.arange(node_count))
+    k-=k[first[component]]
     residual = d - (k[b] - k[a])
     primal = float(np.sum(w * np.where(hinge, np.maximum(residual, 0), abs(residual))))
-    y = result.x
     dual = float(d @ y)
     conservation = float(np.max(abs(incidence @ y), initial=0))
     bounds = float(max(np.max(lo-y, initial=0), np.max(y-w, initial=0)))
@@ -117,9 +126,26 @@ def solve(node_count, a, b, target, weight=None, one_sided=None):
     return dict(winding=k, flow=y, component=component, certificate=dict(
         primal=primal, dual=dual, gap=gap, conservation_max=conservation,
         capacity_violation_max=bounds, potential_rounding_max=float(np.max(abs(raw-np.rint(raw)))),
-        components=int(count), seconds=time.monotonic()-started, optimal=True,
+        components=int(count), seconds=seconds, optimal=True,
         backend='scipy.optimize.linprog/highs-ds capacitated circulation',
-        iterations=int(result.nit)))
+        iterations=iterations))
+
+
+def aggregate_l1_edges(a,b,target,weight):
+    """Combine identical unoriented L1 terms; never combine different targets.
+
+    Deterministic float64 capacity sums, with no quantization/target rounding.
+    This applies only to ordinary two-sided L1 edges, not one-sided hinges.
+    """
+    a,b,target,weight=(np.asarray(x) for x in (a,b,target,weight))
+    if any(x.shape!=a.shape for x in (b,target,weight)):raise ValueError('Edge shapes disagree')
+    if not len(a):return dict(a=a,b=b,target=target,weight=weight)
+    swap=a>b
+    aa=np.minimum(a,b);bb=np.maximum(a,b);tt=np.where(swap,-target,target)
+    order=np.lexsort((tt,bb,aa));aa=aa[order];bb=bb[order];tt=tt[order]
+    starts=np.r_[0,np.flatnonzero((np.diff(aa)!=0)|(np.diff(bb)!=0)|(np.diff(tt)!=0))+1]
+    return dict(a=aa[starts],b=bb[starts],target=tt[starts],
+                weight=np.add.reduceat(np.asarray(weight,dtype=np.float64)[order],starts))
 
 
 class Seam:
@@ -130,6 +156,7 @@ class Seam:
     is increasing atan2(Y-cY,X-cX). The seam belongs to its positive-angle side.
     """
     def __init__(self, axis, angle=-np.pi/2):
+        from vc_object_store import NativeWindingSeam
         self.axis = np.asarray(axis, float)
         self.axis = self.axis[np.argsort(self.axis[:, 2])]
         if len(self.axis) < 2 or not np.isfinite(self.axis).all() or np.any(np.diff(self.axis[:, 2]) <= 0):
@@ -137,40 +164,25 @@ class Seam:
         self.ray = np.array([np.cos(angle), np.sin(angle)])
         self.ray[abs(self.ray) < 1e-15] = 0
         self.angle = angle
+        self._native=NativeWindingSeam(np.ascontiguousarray(self.axis),float(angle))
 
     def relative(self, points):
-        p = np.asarray(points, float)
-        center = np.column_stack([np.interp(p[:, 2], self.axis[:, 2], self.axis[:, dim]) for dim in (0, 1)])
-        return p[:, :2]-center
+        return self._native.relative(np.ascontiguousarray(points,dtype=np.float64),1)
 
     def segment(self, start, end):
-        a, b = np.asarray(start, float), np.asarray(end, float)
-        if not np.isfinite([a, b]).all():
-            raise ValueError('Nonfinite path')
-        ts = np.array([0., 1.])
-        if b[2] != a[2]:
-            cuts = (self.axis[:, 2]-a[2])/(b[2]-a[2])
-            ts = np.sort(np.r_[ts, cuts[(cuts > 0)&(cuts < 1)]])
-        r = self.relative(a[None, :]+ts[:, None]*(b-a))
-        # Crossing through the axis is undefined, including a path lying along
-        # the cut and passing through its origin.
-        dr = np.diff(r, axis=0)
-        t = np.clip(-np.sum(r[:-1]*dr, axis=1)/np.maximum(np.sum(dr*dr, axis=1), 1e-300), 0, 1)
-        if np.any(np.linalg.norm(r[:-1]+t[:, None]*dr, axis=1) < 1e-8):
-            raise ValueError('Path intersects umbilicus; seam transport undefined')
-        u = r @ self.ray
-        v = self.ray[0]*r[:, 1]-self.ray[1]*r[:, 0]
-        up = (v[:-1] < 0)&(v[1:] >= 0)
-        down = (v[:-1] >= 0)&(v[1:] < 0)
-        chosen = up | down
-        if not chosen.any():
-            return 0
-        t = -v[:-1][chosen]/np.diff(v)[chosen]
-        outward = u[:-1][chosen]+t*np.diff(u)[chosen]
-        return int(np.sum(np.where(up[chosen], 1, -1)*(outward > 0)))
+        a=np.ascontiguousarray(start,dtype=np.float64).reshape(1,3)
+        b=np.ascontiguousarray(end,dtype=np.float64).reshape(1,3)
+        return int(self._native.segments(a,b,1)[0])
 
     def polyline(self, points):
-        return np.r_[0, np.cumsum([self.segment(a, b) for a, b in zip(points[:-1], points[1:])])]
+        return np.r_[0, np.cumsum(self.segments(points[:-1], points[1:]))]
+
+    def segments(self, start, end):
+        """Batch segments within linear axis intervals; split knot crossings exactly."""
+        start, end = np.ascontiguousarray(start,dtype=np.float64), np.ascontiguousarray(end,dtype=np.float64)
+        if start.shape != end.shape or start.ndim != 2 or start.shape[1] != 3:
+            raise ValueError('Expected matching XYZ segment arrays')
+        return self._native.segments(start,end,1)
 
 
 def corrected_targets(measured, fiber_a, fiber_b, connector):

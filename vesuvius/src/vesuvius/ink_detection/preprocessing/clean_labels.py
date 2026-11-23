@@ -11,11 +11,9 @@ import re
 import shutil
 from typing import Dict, List, Sequence
 
-import cv2
 import numpy as np
-from PIL import Image
-from scipy import ndimage
-import tifffile
+from vc_reader import images
+from vc_reader.geometry import fill_holes as fill_mask_holes, label_components
 from tqdm.auto import tqdm
 
 from vesuvius.ink_detection.preprocessing.staged_write import (
@@ -173,24 +171,8 @@ def find_target_images(root: Path, *, version_id: int | None = None) -> List[Pat
     return matches
 
 
-def _read_tiff_first_page(path: Path) -> np.ndarray:
-    with tifffile.TiffFile(path) as tif:
-        if len(tif.pages) == 0:
-            raise RuntimeError(f"No TIFF pages found in {path}")
-        return tif.pages[0].asarray()
-
-
 def load_image(path: Path) -> np.ndarray:
-    suffix = path.suffix.lower()
-    if suffix in {".tif", ".tiff"}:
-        image = _read_tiff_first_page(path)
-    else:
-        with Image.open(path) as pil_image:
-            image = np.asarray(pil_image)
-
-    if image is None:
-        raise RuntimeError(f"Failed to read image data from {path}")
-    return np.asarray(image)
+    return images.read(path, page=0)
 
 
 def normalize_mask_image(image: np.ndarray) -> np.ndarray:
@@ -219,16 +201,18 @@ def remove_small_components(mask_u8: np.ndarray, min_component_size: int) -> np.
     if min_component_size <= 1:
         return np.ascontiguousarray(mask_u8)
 
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask_u8, connectivity=8)
-    keep = np.zeros(num_labels, dtype=bool)
+    # One thread: this runs in process-pool workers.
+    labels, count = label_components(mask_u8, connectivity=8, threads=1)
+    areas = np.bincount(labels.ravel(), minlength=count + 1)
+    keep = areas >= int(min_component_size)
     keep[0] = False
-    keep[1:] = stats[1:, cv2.CC_STAT_AREA] >= int(min_component_size)
     filtered = keep[labels]
     return np.ascontiguousarray(filtered.astype(np.uint8) * 255)
 
 
 def fill_holes(mask_u8: np.ndarray) -> np.ndarray:
-    filled = ndimage.binary_fill_holes(mask_u8 != 0)
+    # One thread: this runs in process-pool workers.
+    filled = fill_mask_holes(mask_u8, threads=1)
     return np.ascontiguousarray(filled.astype(np.uint8) * 255)
 
 
@@ -236,8 +220,10 @@ def fill_small_holes(mask_u8: np.ndarray, max_hole_area: int) -> np.ndarray:
     if max_hole_area <= 0:
         return np.ascontiguousarray(mask_u8)
 
-    background = (mask_u8 == 0).astype(np.uint8)
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(background, connectivity=8)
+    background = mask_u8 == 0
+    labels, count = label_components(background, connectivity=8, threads=1)
+    num_labels = count + 1
+    areas = np.bincount(labels.ravel(), minlength=num_labels)
     if num_labels <= 1:
         return np.ascontiguousarray(mask_u8)
 
@@ -256,7 +242,7 @@ def fill_small_holes(mask_u8: np.ndarray, max_hole_area: int) -> np.ndarray:
 
     fill = np.zeros(num_labels, dtype=bool)
     candidate_labels = np.arange(1, num_labels)
-    candidate_areas = stats[1:, cv2.CC_STAT_AREA]
+    candidate_areas = areas[1:]
     fill[candidate_labels] = (~touches_border[candidate_labels]) & (candidate_areas <= int(max_hole_area))
 
     filled = (mask_u8 != 0) | fill[labels]
@@ -295,20 +281,7 @@ def backup_path_for_input(root: Path, input_path: Path) -> Path:
 
 def write_tiff(output_path: Path, image: np.ndarray) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    tifffile.imwrite(
-        output_path,
-        image,
-        compression="lzw",
-        tile=DEFAULT_TILE_SHAPE,
-        photometric="minisblack",
-        metadata=None,
-        bigtiff=bool(image.nbytes >= (4 * 1024**3)),
-    )
-
-
-def _configure_image_policy() -> None:
-    os.environ.setdefault("OPENCV_IO_MAX_IMAGE_PIXELS", "0")
-    Image.MAX_IMAGE_PIXELS = None
+    images.write_tiff(output_path, image, compression="lzw", tile=DEFAULT_TILE_SHAPE)
 
 
 def process_one(
@@ -320,7 +293,6 @@ def process_one(
     max_hole_area: int,
     overwrite: bool,
 ) -> Dict[str, str]:
-    _configure_image_policy()
     output_path = output_path_for_input(input_path)
     backup_path = backup_path_for_input(root, input_path)
     output_conflict = output_path != input_path and output_path.exists()

@@ -88,7 +88,6 @@ public slots:
     
 public slots:
     void onVolumeChanged(std::shared_ptr<Volume> vol, const std::string& volumeId);
-    void updateCurrentZSlice(int z);
     void onMousePress(cv::Vec3f vol_point, cv::Vec3f normal, Qt::MouseButton button, Qt::KeyboardModifiers modifiers);
     void onMouseMove(cv::Vec3f vol_point, Qt::MouseButtons buttons, Qt::KeyboardModifiers modifiers);
     void onMouseRelease(cv::Vec3f vol_point, Qt::MouseButton button, Qt::KeyboardModifiers modifiers);
@@ -108,6 +107,7 @@ private:
     void setupUI();
     void setDrawEnabled(bool enabled);
     void computeDistanceTransform();
+    std::vector<float> sampleIntensities(const Volume& volume, const std::vector<cv::Vec3f>& points) const;
     void updateModeUI();
     void analyzePaths();
     void findPeaksAlongPath(const ViewerOverlayControllerBase::PathPrimitive& path);
@@ -165,7 +165,6 @@ private:
     std::optional<SurfaceCatalog::ToolStore> batchStore(QString* error) const;
     SurfaceCatalog* _surfaceCatalog{nullptr};
     QPointer<CChunkedVolumeViewer> _relWindingDrawViewer;
-    int currentZSlice;
     VCCollection* _point_collection;
     cv::Mat distanceTransform;
     
@@ -191,8 +190,8 @@ private:
     int _batchOmpThreads{0};
     SeedingBatchTracker _batch;
     std::vector<ColPoint> _batchPoints;      // run: source points; empty for expand
-    // Resolved vc_grow_seg_from_seed volume argument: local zarr path for a mirrored
-    // volume, or the remote locator for a streaming-only volume (issue #1188). QString,
+    // Resolved vc_grow_seg_from_seed volume argument: local zarr path, or the remote
+    // locator for a remote volume (issue #1188). QString,
     // not filesystem::path, since a remote locator is a URL.
     QString _batchVolumePath;
     SurfaceCatalog::ToolStore _batchStore;  // the children's store contract (new surfaces are tagged "paths")

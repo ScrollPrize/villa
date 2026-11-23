@@ -83,7 +83,7 @@ std::string updateGeometryArrays(ObjectStore& db, WriteTxn& txn, const std::stri
                 const size_t count = target.shape.at(0), oldCount = old.shape.at(0);
                 const auto oldIds = idsName.empty() ? std::vector<int64_t>{} : pointIds(data, idsName, oldCount);
                 const auto newIds = idsName.empty() ? std::vector<int64_t>{} : pointIds(desired, idsName, count);
-                const auto oldAttrs = Json::parse(db.geometryPointAnnotations(txn, head, target.name));
+                const auto oldAttrs = db.geometryPointAnnotations(txn, head, target.name);
                 auto attrs = Json(std::vector<Json>(count, Json::object()));
                 std::map<int64_t, size_t> rows;
                 for (size_t i = 0; i < oldIds.size(); ++i) rows.emplace(oldIds[i], i);

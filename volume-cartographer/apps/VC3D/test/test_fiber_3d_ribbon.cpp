@@ -1,94 +1,18 @@
 #include "fibers3d/Fiber3DRibbon.hpp"
 #include "vc/core/types/Volume.hpp"
-#include "../../../core/test/support/TestZarrVolume.hpp"
+#include "OpenedVolumes.hpp"
+#include "support/TestVolume.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/fiber_tracer/FiberDisplay.hpp"
-#include "vc/core/render/IChunkedArray.hpp"
 #include <QTemporaryDir>
 #include <QTest>
 
 using namespace vc3d::fibers3d;
 
-// A deliberately unavailable fine level: any blocking read is a test failure.
-class DelayedCT : public vc::render::IChunkedArray
-{
-public:
-    bool fine = false, coarse = false, fail = false;
-    int requested = 0;
-    int numLevels() const override { return 2; }
-    std::array<int, 3> shape(int l) const override { return l ? std::array<int, 3>{4, 4, 4} : std::array<int, 3>{8, 8, 8}; }
-    std::array<int, 3> chunkShape(int l) const override { return shape(l); }
-    vc::render::ChunkDtype dtype() const override { return vc::render::ChunkDtype::UInt8; }
-    double fillValue() const override { return 0; }
-    LevelTransform levelTransform(int l) const override
-    {
-        return {{1.0 / double(1 << l), 1.0 / double(1 << l), 1.0 / double(1 << l)}, {0, 0, 0}};
-    }
-    vc::render::ChunkResult tryGetChunk(int l, int, int, int) override
-    {
-        ++requested;
-        vc::render::ChunkResult r;
-        r.shape = shape(l);
-        r.dtype = dtype();
-        if (!l && fail) {
-            r.status = vc::render::ChunkStatus::Error;
-            r.error = "test source failure";
-        } else if (l ? coarse : fine) {
-            r.status = vc::render::ChunkStatus::Data;
-            r.bytes = std::make_shared<const std::vector<std::byte>>(l ? 64 : 512, std::byte(l ? 32 : 123));
-        }
-        return r;
-    }
-    vc::render::ChunkResult getChunkBlocking(int, int, int, int) override
-    {
-        throw std::runtime_error("Interactive ribbon blocked on CT I/O");
-    }
-    void prefetchChunks(const std::vector<vc::render::ChunkKey>&, bool, int) override { throw std::runtime_error("Unexpected prefetch"); }
-    ChunkReadyCallbackId addChunkReadyListener(ChunkReadyCallback) override { return 1; }
-    void removeChunkReadyListener(ChunkReadyCallbackId) override {}
-};
-
 class Fiber3DRibbonTest : public QObject
 {
     Q_OBJECT
 private slots:
-    void incompleteCTNeverBlocksOrDrawsMissingDataAsBlack()
-    {
-        DelayedCT cache;
-        ct::Tile tile;
-        tile.width = 4;
-        tile.height = 2;
-        tile.left = {{0, 0, 0}, {0, 1, 0}};
-        tile.right = {{3, 0, 0}, {3, 1, 0}};
-        auto state = ct::sampleTileProgressive(tile, cache, 0);
-        QCOMPARE(state.valid, size_t(8));
-        QCOMPARE(state.covered, size_t(0));
-        QVERIFY(cache.requested > 0);
-        for (size_t i = 1; i < tile.pixels.size(); i += 2)
-            QCOMPARE(tile.pixels[i], uint8_t(0));
-        cache.coarse = true;
-        state = ct::sampleTileProgressive(tile, cache, 0);
-        QCOMPARE(state.covered, size_t(8));
-        QCOMPARE(state.requestedLevel, size_t(0));
-        for (size_t i = 0; i < tile.pixels.size(); i += 2) {
-            QCOMPARE(tile.pixels[i], uint8_t(32));
-            QCOMPARE(tile.pixels[i + 1], uint8_t(255));
-        }
-        cache.fine = true;
-        state = ct::sampleTileProgressive(tile, cache, 0);
-        QCOMPARE(state.requestedLevel, state.valid);
-        for (size_t i = 0; i < tile.pixels.size(); i += 2)
-            QCOMPARE(tile.pixels[i], uint8_t(123));
-        cache.fail = true;
-        state = ct::sampleTileProgressive(tile, cache, 0);
-        QVERIFY(state.errors > 0);
-        QCOMPARE(state.covered, size_t(8));
-        tile.left[0] = {-3, 0, 0};
-        state = ct::sampleTileProgressive(tile, cache, 0);
-        QCOMPARE(tile.pixels[1], uint8_t(0));
-        std::atomic_bool cancelled{true};
-        QVERIFY_THROWS_EXCEPTION(std::runtime_error, ct::sampleTileProgressive(tile, cache, 0, &cancelled));
-    }
     void storageBlocksKeepTheSameFramesAsAnUnsplitFiber()
     {
         Run full;
@@ -210,21 +134,22 @@ private slots:
     void nativeCtSamplingRotationAndTileSeams()
     {
         QTemporaryDir directory;
-        vc::test::ZarrVolumeSpec opts;
+        vc3d::test::VolumeSpec opts;
         opts.shapeZYX = {1100, 16, 16};
         opts.chunkShapeZYX = {32, 16, 16};
-        auto volume = vc::test::createZarrVolume(directory.path().toStdString(), opts);
-        Array3D<uint8_t> data({1100, 16, 16});
+        auto volume = vc3d::test::createVolume(directory.path().toStdString(), opts);
+        vc3d::test::Grid<uint8_t> data({1100, 16, 16});
         for (int z = 0; z < 1100; ++z)
             for (int y = 0; y < 16; ++y)
                 for (int x = 0; x < 16; ++x)
                     data(z, y, x) = uint8_t(x + 2 * y + (z % 100));
-        vc::test::writeZYX(*volume, data, {0, 0, 0});
+        vc3d::test::writeZYX(*volume, data, {0, 0, 0});
+        OpenedVolumes opened(std::size_t(1) << 26);
         Fiber f;
         f.runs = {Run{{{8, 8, 1}, {8, 8, 1098}}}};
         auto frames = ribbon::makeFrames(f, {}, [](const cv::Vec3d&) { return cv::Vec3d(1, 0, 0); });
         std::shared_ptr<ribbon::Image> image;
-        QTRY_VERIFY_WITH_TIMEOUT((image = ribbon::sampleProgressive(frames, *volume, 6, 0, 0))->complete, 5000);
+        QTRY_VERIFY_WITH_TIMEOUT((image = ribbon::sampleRibbon(frames, opened, *volume, 6, 0, 0))->complete, 5000);
         QCOMPARE(image->tiles.size(), size_t(2));
         const auto& first = image->tiles[0];
         const auto& second = image->tiles[1];
@@ -237,24 +162,16 @@ private slots:
             QCOMPARE(first.pixels[c * 2 + 1], uint8_t(255));
             QCOMPARE(first.pixels[(size_t(first.height - 1) * 7 + c) * 2], second.pixels[c * 2]);
         }
-        const auto progressive = ribbon::sampleProgressive(frames, *volume, 6, 0, 0);
-        QVERIFY(progressive->complete);
-        QCOMPARE(progressive->tiles.size(), image->tiles.size());
-        for (size_t i = 0; i < image->tiles.size(); ++i) {
-            QCOMPARE(progressive->tiles[i].left, image->tiles[i].left);
-            QCOMPARE(progressive->tiles[i].right, image->tiles[i].right);
-            QCOMPARE(progressive->tiles[i].pixels, image->tiles[i].pixels);
-        }
         std::shared_ptr<ribbon::Image> rotated;
-        QTRY_VERIFY_WITH_TIMEOUT((rotated = ribbon::sampleProgressive(frames, *volume, 6, 90, 0))->complete, 5000);
+        QTRY_VERIFY_WITH_TIMEOUT((rotated = ribbon::sampleRibbon(frames, opened, *volume, 6, 90, 0))->complete, 5000);
         for (int c = 0; c < 7; ++c)
             QCOMPARE(rotated->tiles[0].pixels[c * 2], uint8_t((5 + c) + 16 + 1));
-        auto outside = ribbon::sampleProgressive(frames, *volume, 32, 0, 0);
+        auto outside = ribbon::sampleRibbon(frames, opened, *volume, 32, 0, 0);
         QCOMPARE(outside->tiles[0].pixels[1], uint8_t(0));
         QCOMPARE(outside->tiles[0].pixels[16 * 2 + 1], uint8_t(255));
         std::atomic_bool cancelled{true};
-        QVERIFY_THROWS_EXCEPTION(std::runtime_error, ribbon::sampleProgressive(frames, *volume, 6, 0, 0, &cancelled));
-        QVERIFY_THROWS_EXCEPTION(std::invalid_argument, ribbon::sampleProgressive(frames, *volume, 513, 0, 0));
+        QVERIFY_THROWS_EXCEPTION(std::runtime_error, ribbon::sampleRibbon(frames, opened, *volume, 6, 0, 0, &cancelled));
+        QVERIFY_THROWS_EXCEPTION(std::invalid_argument, ribbon::sampleRibbon(frames, opened, *volume, 513, 0, 0));
     }
 };
 QTEST_GUILESS_MAIN(Fiber3DRibbonTest)

@@ -776,7 +776,10 @@ export function Landing() {
             </div>
             <div className="vc-team">
               <TeamGroup title="Technical Team" list={team.challenge} />
-              <TeamGroup title="Papyrology Team" list={team.papyrology} />
+              <div className="vc-team__col">
+                <TeamGroup title="Papyrology Team" list={team.papyrology} />
+                <TeamGroup title="Media" list={team.media} />
+              </div>
               <TeamGroup title="Annotation Team" list={team.annotation} />
             </div>
             {/* Secondary lists as tabs below the columns; the open one spans

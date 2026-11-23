@@ -362,7 +362,6 @@ QuadSurface* UvGridRasterizer::createQuadSurface(float mesh_units) {
 
 
 void UvGridRasterizer::calculateScaleFromGrid(const cv::Mat_<cv::Vec3f>& points, float mesh_units) {
-    // Based on vc_segmentation_scales from Slicing.cpp
     double sum_x = 0;
     double sum_y = 0;
     int count = 0;

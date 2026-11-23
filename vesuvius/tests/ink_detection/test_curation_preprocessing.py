@@ -12,7 +12,7 @@ import numpy as np
 from PIL import Image
 import pytest
 import tifffile
-import zarr
+from vc_reader.reader import create_group, open_group
 
 from vesuvius.ink_detection.preprocessing import clean_labels
 from vesuvius.ink_detection.preprocessing import composite_from_zarr
@@ -20,20 +20,13 @@ from vesuvius.ink_detection.preprocessing import download_required_zarr_chunks
 from vesuvius.ink_detection.preprocessing import merge_predictions
 from vesuvius.ink_detection.preprocessing import validate_segments
 from vesuvius.ink_detection.types import Segment
-from vesuvius.tifxyz import Tifxyz, write_tifxyz
+from vc_reader import tifxyz
 
 
 def _write_group(path: Path, arrays: dict[str, np.ndarray], *, chunks: tuple[int, ...]) -> None:
-    kwargs: dict[str, object] = {"mode": "w"}
-    zarr_v3 = int(zarr.__version__.split(".", 1)[0]) >= 3
-    if zarr_v3:
-        kwargs["zarr_format"] = 2
-    group = zarr.open_group(path, **kwargs)
+    group = create_group(path, overwrite=True)
     for key, array in arrays.items():
-        if zarr_v3:
-            group.create_array(key, data=array, chunks=chunks)
-        else:
-            group.create_dataset(key, data=array, chunks=chunks)
+        group.create_array(key, shape=array.shape, chunks=chunks, dtype=array.dtype)[...] = array
 
 
 def _set_tiny_pillow_limit() -> None:
@@ -307,14 +300,8 @@ def test_downloader_writes_v2_manifest_resumes_and_rejects_source_drift(
     segment = datasets_root / "dataset" / "segment"
     segment.mkdir(parents=True)
     grid_y, grid_x = np.mgrid[1:5, 1:5].astype(np.float32)
-    surface = Tifxyz(
-        _x=grid_x,
-        _y=grid_y,
-        _z=np.ones_like(grid_x),
-        uuid="segment",
-        _mask=np.ones_like(grid_x, dtype=bool),
-    )
-    write_tifxyz(segment, surface, overwrite=True)
+    surface = tifxyz.Surface(np.stack([grid_x, grid_y, np.ones_like(grid_x)], axis=-1), uuid="segment")
+    tifxyz.write(segment, surface, overwrite=True)
     label = np.zeros((3, 4, 4), dtype=np.uint8)
     label[1] = 255
     _write_group(segment / "segment_inklabels.zarr", {"0": label}, chunks=(1, 2, 2))
@@ -340,7 +327,7 @@ def test_downloader_writes_v2_manifest_resumes_and_rejects_source_drift(
     assert download_required_zarr_chunks.main(args) == 0
     output_path = output_root / "dataset.zarr"
     assert json.loads((output_path / ".zgroup").read_text()) == {"zarr_format": 2}
-    output = zarr.open_group(output_path, mode="r")
+    output = open_group(output_path)
     plan = output.attrs[download_required_zarr_chunks.DOWNLOAD_PLAN_ATTR]
     progress = output.attrs[download_required_zarr_chunks.DOWNLOAD_PROGRESS_ATTR]
     assert plan["source"]["volume_path"] == str(source_path.resolve())
@@ -349,7 +336,7 @@ def test_downloader_writes_v2_manifest_resumes_and_rejects_source_drift(
     first_export = np.asarray(output["0"])
     assert np.count_nonzero(first_export) > 0
     assert download_required_zarr_chunks.main(args) == 0
-    np.testing.assert_array_equal(zarr.open_group(output_path, mode="r")["0"], first_export)
+    np.testing.assert_array_equal(open_group(output_path)["0"], first_export)
 
     with pytest.raises(ValueError, match="source, chunk plan, array schema"):
         download_required_zarr_chunks.copy_chunks_to_output(
@@ -380,6 +367,56 @@ def test_downloader_writes_v2_manifest_resumes_and_rejects_source_drift(
     )
     with pytest.raises(ValueError, match="source, chunk plan, array schema"):
         download_required_zarr_chunks.main(args)
+
+
+def test_downloader_plans_the_trainer_crop_at_volume_scale_one(tmp_path: Path) -> None:
+    datasets_root = tmp_path / "datasets"
+    segment = datasets_root / "dataset" / "segment"
+    segment.mkdir(parents=True)
+    # Level-0 tifxyz grid whose positions are offset from its row/column indices.
+    grid_y, grid_x = np.mgrid[0:16, 0:16].astype(np.float32)
+    surface = tifxyz.Surface(
+        np.stack([grid_x + 8, grid_y + 4, np.full_like(grid_x, 12.0)], axis=-1),
+        uuid="segment",
+    )
+    tifxyz.write(segment, surface, overwrite=True)
+    label_levels = {"0": np.zeros((3, 16, 16), dtype=np.uint8), "1": np.zeros((3, 8, 8), dtype=np.uint8)}
+    label_levels["0"][1, 8:10, 8:10] = 255
+    label_levels["1"][1, 4, 4] = 255
+    _write_group(segment / "segment_inklabels.zarr", label_levels, chunks=(1, 2, 2))
+    _write_group(segment / "segment_supervision_mask.zarr", label_levels, chunks=(1, 2, 2))
+
+    source_path = tmp_path / "source.zarr"
+    source = {
+        "0": (np.arange(16 * 32 * 32) % 250 + 1).astype(np.uint8).reshape(16, 32, 32),
+        "1": (np.arange(8 * 16 * 16) % 250 + 1).astype(np.uint8).reshape(8, 16, 16),
+    }
+    _write_group(source_path, source, chunks=(2, 2, 2))
+    volumes_json = tmp_path / "volumes.json"
+    volumes_json.write_text(
+        json.dumps({"dataset": {"volume_path": str(source_path), "volume_scale": 1}})
+    )
+    output_root = tmp_path / "output"
+
+    assert download_required_zarr_chunks.main(
+        [
+            "--datasets-root", str(datasets_root),
+            "--volumes-json", str(volumes_json),
+            "--output-root", str(output_root),
+            "--patch-size", "2",
+            "--overlap-fraction", "0.5",
+            "--download-workers", "1",
+        ]
+    ) == 0
+
+    # The only patch starts at level-1 flat (4, 4). The trainer samples tifxyz
+    # rows/columns 8 and 10 and halves their positions: z 6, y 6..7, x 8..9.
+    crop = (slice(6, 8), slice(6, 8), slice(8, 10))
+    output = open_group(output_root / "dataset.zarr")
+    plan = output.attrs[download_required_zarr_chunks.DOWNLOAD_PLAN_ATTR]
+    planned = plan["chunk_ids_by_scale"]["1"]
+    assert [3, 3, 4] in planned and all(chunk[0] == 3 for chunk in planned)
+    np.testing.assert_array_equal(np.asarray(output["1"])[crop], source["1"][crop])
 
 
 @pytest.mark.parametrize(
@@ -481,7 +518,7 @@ def test_downloader_records_only_completed_writes_and_resumes_after_failure(
     ):
         with pytest.raises(OSError, match="injected chunk failure"):
             download_required_zarr_chunks.copy_chunks_to_output(**kwargs)
-    progress = zarr.open_group(output_path, mode="r").attrs[
+    progress = open_group(output_path).attrs[
         download_required_zarr_chunks.DOWNLOAD_PROGRESS_ATTR
     ]
     assert progress["completed_chunk_ids_by_scale"] == {"0": [[0, 0, 0]]}
@@ -492,6 +529,6 @@ def test_downloader_records_only_completed_writes_and_resumes_after_failure(
         "existing_counts_by_scale": {0: 1},
     }
     np.testing.assert_array_equal(
-        zarr.open_group(output_path, mode="r")["0"][2:4, 2:4, 2:4],
+        open_group(output_path)["0"][2:4, 2:4, 2:4],
         source[2:4, 2:4, 2:4],
     )

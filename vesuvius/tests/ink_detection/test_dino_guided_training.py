@@ -23,11 +23,11 @@ from vesuvius.ink_detection.training.train import (
     should_save_checkpoint,
 )
 
-from .test_model_foundation import _config_mapping
+from .helpers import config_mapping
 
 
 def _training_mapping() -> dict:
-    mapping = _config_mapping(depth=256, side=256)
+    mapping = config_mapping(depth=256, side=256)
     mapping.update(
         {
             "mode": "full_3d",

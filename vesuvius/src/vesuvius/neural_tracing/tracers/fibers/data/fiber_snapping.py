@@ -9,7 +9,7 @@ Validated on the automated Paris4 fibers against manual annotations (output/pari
 manual fiber median 1.46 -> 0.68 trace voxels, within 1 voxel 25% -> 77% (radius 2.5, sigma 2, two passes).
 
 The presence volume is read in ``tile``-voxel blocks (plus a margin covering the disk) in spatial order on worker
-threads, so each block is read once per pass; all points of a block are sampled in one ``grid_sample`` call.
+threads, so each block is read once per pass; all points of a block are sampled in one vc_reader sampling call.
 """
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
@@ -19,7 +19,7 @@ from pathlib import Path
 import numpy as np
 from scipy.ndimage import gaussian_filter1d
 import torch
-import torch.nn.functional as F
+from vc_reader.torch import sample_array
 
 
 @dataclass(frozen=True)
@@ -75,7 +75,7 @@ def frames(tangents):
 
 
 class PresenceTiles:
-    """Blocks of a zyx presence array (anything with ``read(start_zyx, size_zyx)`` and ``shape``) around xyz tiles,
+    """Blocks of a zyx presence array (a vc_reader ``ZarrReader``: ``read_region`` and ``shape``) around xyz tiles,
     returned in pinned memory when ``pinned`` (for asynchronous transfer to the GPU)."""
     def __init__(self, array, tile, margin, pinned=False):
         self.array, self.tile, self.margin, self.pinned = array, int(tile), int(margin), pinned
@@ -87,7 +87,7 @@ class PresenceTiles:
         a, b = np.maximum(lo, 0), np.minimum(hi, self.shape)
         out = torch.zeros(tuple(hi-lo), dtype=torch.uint8, pin_memory=self.pinned)
         if (b > a).all():
-            out.numpy()[tuple(slice(x-l, y-l) for x, y, l in zip(a, b, lo))] = self.array.read(tuple(a), tuple(b-a))
+            out.numpy()[tuple(slice(x-l, y-l) for x, y, l in zip(a, b, lo))] = self.array.read_region(tuple(a), tuple(b-a))
         return lo, out
 
 
@@ -118,10 +118,8 @@ def point_offsets(points, tangents, tiles, cfg, device):
             g = slice(breaks[index], breaks[index+1])
             world = (p[g, None]+local_t[None, :, 0:1]*a[g, None]+local_t[None, :, 1:2]*b[g, None]
                      +local_t[None, :, 2:3]*t[g, None])  # (n, K, 3) xyz
-            scale = torch.tensor([2/(n-1) for n in block.shape[::-1]], device=device)
-            grid = (world-torch.tensor(lo[::-1].tolist(), dtype=torch.float32, device=device))*scale-1
-            values = F.grid_sample(volume, grid[None, :, :, None], mode='bilinear', padding_mode='border',
-                                   align_corners=True)[0, 0, :, :, 0]  # (n, K)
+            local_points = world.flip(-1)-torch.as_tensor(lo, dtype=torch.float32, device=device)
+            values = sample_array(volume, local_points[None], boundary='border')[0, 0]
             values = values.reshape(-1, slices, len(disk)).mean(1)
             floor = values.min(1, keepdim=True).values
             top = values.max(1, keepdim=True).values
@@ -171,8 +169,8 @@ def snap_native(polylines, presence, scale, offset, cfg, device, output_step):
 
 
 def snap_store(source, destination, presence, scale, offset, cfg, device, output_step, limit, provenance):
-    """A new fiber store of ``source``'s fibers (UUIDs, names, families and meta kept) with the snapped geometry and
-    the snapping parameters in each fiber's meta['snapping']."""
+    """New geometry retaining UUIDs, names, families and application metadata, not source extension/artifact
+    payloads or relationships. The selected source and geometry-only policy are recorded with snapping parameters."""
     from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fiber_volume, read_polylines, write_fibers
     volume = fiber_volume(source)
     fibers = read_polylines(source, volume=volume)
@@ -181,8 +179,9 @@ def snap_store(source, destination, presence, scale, offset, cfg, device, output
     snapped = snap_native([p for _, p in fibers], presence, scale, offset, cfg, device, output_step)
     snapping = dict(provenance, snapped_from=str(Path(source).resolve()))
     result = write_fibers(destination, [(dict(id=row['id'], name=row['name'], family=row['family'],
-                                              meta=dict(row['meta'], snapping=snapping)), xyz)
-                                        for (row, _), xyz in zip(fibers, snapped)], volume=volume)
+                                              meta=dict(row['meta'], snapping=snapping), reference=row['reference']), xyz)
+                                        for (row, _), xyz in zip(fibers, snapped)], volume=volume,
+                          metadata_policy='geometry_only')
     return dict(fibers=result['fibers'], points=result['points'])
 
 

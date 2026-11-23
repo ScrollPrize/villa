@@ -1,4 +1,4 @@
-"""Crash-safe raw checkpoint selection from reviewed-trace results."""
+"""Crash-safe selection of the exact weights evaluated by reviewed tracing."""
 from __future__ import annotations
 
 from copy import deepcopy
@@ -55,15 +55,21 @@ def _canonical_digest(value: Mapping[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _raw_snapshot_metadata(path: Path, *, expected_step: int,
-                           expected_samples: int) -> dict[str, Any]:
+def _snapshot_metadata(path: Path, *, expected_step: int,
+                       expected_samples: int, weights: str = "raw") -> dict[str, Any]:
     if not path.is_file():
-        raise FileNotFoundError(f"reviewed-trace raw checkpoint is missing: {path}")
+        raise FileNotFoundError(f"reviewed-trace checkpoint is missing: {path}")
     payload = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
     if not isinstance(payload, dict):
         raise ValueError(f"reviewed-trace checkpoint is not a mapping: {path}")
-    if payload.get("snapshot_kind") not in (None, "raw") or "ema_metadata" in payload:
-        raise ValueError(f"reviewed-trace checkpoint must contain raw model weights: {path}")
+    if weights == "raw":
+        if payload.get("snapshot_kind") not in (None, "raw") or "ema_metadata" in payload:
+            raise ValueError(f"reviewed-trace checkpoint must contain raw model weights: {path}")
+    elif weights == "ema_0p999":
+        if payload.get("snapshot_kind") != "ema" or payload.get("ema_metadata", {}).get("decay") != .999:
+            raise ValueError(f"reviewed-trace checkpoint must contain EMA999 weights: {path}")
+    else:
+        raise ValueError(f"unsupported reviewed trace weights: {weights}")
     if int(payload.get("step", -1)) != int(expected_step):
         raise ValueError(
             f"reviewed-trace checkpoint step mismatch: expected {expected_step}, "
@@ -79,15 +85,21 @@ def _raw_snapshot_metadata(path: Path, *, expected_step: int,
 
 def freeze_raw_checkpoint(source: Path, destination: Path, *, step: int,
                           samples_seen: int) -> str:
+    return freeze_trace_checkpoint(source, destination, step=step,
+                                   samples_seen=samples_seen, weights="raw")
+
+
+def freeze_trace_checkpoint(source: Path, destination: Path, *, step: int,
+                            samples_seen: int, weights: str) -> str:
     """Copy and verify the immutable checkpoint that a trace attempt evaluates."""
     source = source.resolve()
     destination.parent.mkdir(parents=True, exist_ok=True)
     if destination.exists():
-        _raw_snapshot_metadata(
-            destination, expected_step=step, expected_samples=samples_seen
+        _snapshot_metadata(
+            destination, expected_step=step, expected_samples=samples_seen, weights=weights
         )
         return sha256_file(destination)
-    _raw_snapshot_metadata(source, expected_step=step, expected_samples=samples_seen)
+    _snapshot_metadata(source, expected_step=step, expected_samples=samples_seen, weights=weights)
     temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
     try:
         with source.open("rb") as input_stream, temporary.open("xb") as output_stream:
@@ -97,13 +109,13 @@ def freeze_raw_checkpoint(source: Path, destination: Path, *, step: int,
         source_digest = sha256_file(source)
         frozen_digest = sha256_file(temporary)
         if source_digest != frozen_digest:
-            raise RuntimeError("raw checkpoint changed while being frozen for reviewed tracing")
+            raise RuntimeError("checkpoint changed while being frozen for reviewed tracing")
         os.replace(temporary, destination)
         _fsync_directory(destination.parent)
     finally:
         temporary.unlink(missing_ok=True)
-    _raw_snapshot_metadata(
-        destination, expected_step=step, expected_samples=samples_seen
+    _snapshot_metadata(
+        destination, expected_step=step, expected_samples=samples_seen, weights=weights
     )
     return frozen_digest
 
@@ -117,14 +129,20 @@ def benchmark_identity(job: Mapping[str, Any], workload: Mapping[str, Any]) -> d
     ):
         effective.pop(key, None)
     split_manifest = Path(str(job["split_root"])) / "manifest.json"
+    # Resident training invokes the benchmark module directly, without a CLI
+    # runner. Keep explicit runners for legacy jobs and their saved identities.
+    runner = (Path(str(job["runner"])) if "runner" in job
+              else Path(__file__).with_name("training_trace_benchmark.py"))
     identity = {
         "version": SCHEMA_VERSION,
         "effective_workload_sha256": _canonical_digest(effective),
         "template_sha256": sha256_file(Path(str(job["template"]))),
         "split_manifest_sha256": sha256_file(split_manifest),
         "native_binary_sha256": sha256_file(Path(str(job["native_binary"]))),
-        "runner_sha256": sha256_file(Path(str(job["runner"]))),
+        "runner_sha256": sha256_file(runner),
     }
+    if "weights" in job:
+        identity["weights"] = job["weights"]
     identity["sha256"] = _canonical_digest(identity)
     return identity
 
@@ -199,7 +217,8 @@ def _validated_attempt(output: Path) -> tuple[dict[str, Any], dict[str, Any],
             or metrics.get("samples_seen") != samples
             or completion.get("samples_seen") != samples):
         raise ValueError("reviewed trace step/sample provenance is invalid")
-    _raw_snapshot_metadata(checkpoint, expected_step=step, expected_samples=samples)
+    _snapshot_metadata(checkpoint, expected_step=step, expected_samples=samples,
+                       weights=job.get("weights", "raw"))
     return job, metrics, identity, checkpoint, checkpoint_digest, restarts, samples
 
 
@@ -208,10 +227,11 @@ def _load_existing_best(path: Path) -> dict[str, Any] | None:
         return None
     payload = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
     if (not isinstance(payload, dict)
-            or payload.get("snapshot_kind") not in (None, "raw")
-            or "ema_metadata" in payload
+            or payload.get("snapshot_kind") not in (None, "raw", "ema")
             or payload.get("metric_name") != METRIC_NAME):
         raise ValueError(f"invalid reviewed-trace best checkpoint: {path}")
+    if payload.get('snapshot_kind') == 'ema' and payload.get('ema_metadata', {}).get('decay') != .999:
+        raise ValueError(f"reviewed-trace best checkpoint is not EMA999: {path}")
     _restart_count({"restarts_combined": payload.get("metric")})
     selection = payload.get("reviewed_trace_selection")
     if not isinstance(selection, dict):
@@ -233,7 +253,7 @@ def _save_checkpoint(destination: Path, payload: Mapping[str, Any]) -> None:
 
 
 def select_attempt(output: Path, snapshot_dir: Path) -> dict[str, Any]:
-    """Idempotently consider one completed trace attempt for the raw best."""
+    """Idempotently select the exact weights of a completed trace attempt."""
     marker = output / "checkpoint_selection.json"
     latest_path = snapshot_dir / LAST_BEST_FILENAME
     # Legacy runs already kept the first minimum. Seed the new companion without
@@ -298,7 +318,7 @@ def select_attempt(output: Path, snapshot_dir: Path) -> dict[str, Any]:
                          and samples > int(latest['reviewed_trace_selection']['samples_seen'])))
     if updated or update_latest:
         payload = torch.load(checkpoint, map_location="cpu", weights_only=False, mmap=True)
-        payload["snapshot_kind"] = "raw"
+        payload["snapshot_kind"] = payload.get("snapshot_kind", "raw")
         payload["metric"] = restarts
         payload["metric_name"] = METRIC_NAME
         payload["reviewed_trace_metrics"] = dict(metrics)
@@ -308,6 +328,7 @@ def select_attempt(output: Path, snapshot_dir: Path) -> dict[str, Any]:
             "samples_seen": samples,
             "evaluated_checkpoint_sha256": digest,
             "benchmark_identity_sha256": identity["sha256"],
+            "weights": job.get("weights", "raw"),
         }
         if updated:
             _save_checkpoint(destination, payload)
@@ -346,8 +367,8 @@ def finalize_attempt(output: Path, snapshot_dir: Path, *, canonical: Path | None
             raise RuntimeError(f"refusing to overwrite reviewed trace result: {canonical}")
         output.rename(canonical)
         destination = canonical
-    evaluated = destination / "evaluated_raw.pt"
-    evaluated.unlink(missing_ok=True)
+    for name in ("evaluated_raw.pt", "evaluated_ema_0p999.pt"):
+        (destination / name).unlink(missing_ok=True)
     return metrics, selection, destination
 
 
@@ -371,5 +392,6 @@ def reconcile_completed_attempts(run_dir: Path, snapshot_dir: Path) -> list[Path
             finalize_attempt(canonical, snapshot_dir)
             reconciled.append(canonical)
         else:
-            (canonical / "evaluated_raw.pt").unlink(missing_ok=True)
+            for name in ("evaluated_raw.pt", "evaluated_ema_0p999.pt"):
+                (canonical / name).unlink(missing_ok=True)
     return reconciled

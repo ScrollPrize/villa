@@ -15,6 +15,36 @@
 
 namespace vcr::catalog {
 
+// Artifact `type` strings documented by metadata.schema.json. New types appear over time;
+// unknown types are kept as plain artifacts.
+namespace artifact_type {
+inline constexpr const char* photo = "photo";
+inline constexpr const char* photoMask = "photo-mask";
+inline constexpr const char* omeZarr = "ome-zarr";
+inline constexpr const char* surfacePredictionZarr = "surface-prediction-zarr";
+inline constexpr const char* normalGrids = "normal-grids";
+inline constexpr const char* lasagna = "lasagna";
+inline constexpr const char* fiberlets = "fiberlets";
+inline constexpr const char* inkDetection3dZarr = "ink-detection-3d-zarr";
+inline constexpr const char* umbilicus = "umbilicus";
+inline constexpr const char* tifxyz = "tifxyz";
+inline constexpr const char* tifxyzFlattened = "tifxyz-flattened";
+inline constexpr const char* tifxyzNormalized = "tifxyz-normalized";
+inline constexpr const char* tifxyzTransformed = "tifxyz-transformed";
+inline constexpr const char* obj = "obj";
+inline constexpr const char* objLegacyUnits = "obj-legacy-units";
+inline constexpr const char* objFlattened = "obj-flattened";
+inline constexpr const char* objNormalized = "obj-normalized";
+inline constexpr const char* layersZarr = "layers-zarr";
+inline constexpr const char* layersTif = "layers-tif";
+inline constexpr const char* alphaRender = "alpha-render";
+inline constexpr const char* alphaRenderDownsampled = "alpha-render-downsampled";
+inline constexpr const char* inkDetection = "ink-detection";
+inline constexpr const char* inkDetectionDownsampled = "ink-detection-downsampled";
+inline constexpr const char* ink3dPrediction = "3d-ink-prediction";
+inline constexpr const char* inkLabels = "ink-labels";
+}
+
 inline constexpr std::string_view kDefaultManifestUrl =
     "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/metadata.json";
 
@@ -35,6 +65,7 @@ struct OpenDataCreation {
 struct OpenDataBounds {
     std::array<double, 3> low{0, 0, 0};
     std::array<double, 3> high{0, 0, 0};
+    bool operator==(const OpenDataBounds&) const = default;
 };
 
 struct OpenDataAccessRoot {
@@ -52,9 +83,13 @@ struct OpenDataOrigin {
     std::vector<OpenDataAccessRoot> accessRoots;
     nlohmann::json properties = nlohmann::json::object();
     nlohmann::json raw = nlohmann::json::object();
+
+    // This location under each of its access roots.
+    [[nodiscard]] std::vector<std::string> urls() const;
 };
 
 struct OpenDataArtifact {
+    std::optional<std::string> id;
     std::string type;
     std::vector<OpenDataOrigin> origins;
     nlohmann::json parameters = nlohmann::json::object();
@@ -101,9 +136,21 @@ struct OpenDataArtifact {
     std::string accessUsage;
 
     [[nodiscard]] bool hasResolvedUrl() const noexcept;
+    // The pyramid level of the source volume this artifact's own level 0 lies on, for
+    // OME-Zarr pyramids on the volume's grid; empty otherwise, and for a surface
+    // prediction whose level is unknown.
+    [[nodiscard]] std::optional<int> gridLevel() const;
     // The artifact's URL: the resolved public URL, else its source path,
     // without trailing slashes. Empty when it has no public origin.
     [[nodiscard]] std::string url() const;
+    // Every location as listed, in metadata order.
+    [[nodiscard]] std::vector<std::string> urls() const;
+    // The preferred location in a scheme: "https" (anonymous HTTP), "s3", or empty to keep
+    // the location's own. The open-data bucket is preferred over other channels, then
+    // metadata order. Empty optional when it has none; std::invalid_argument on another scheme.
+    [[nodiscard]] std::optional<std::string> location(std::string_view scheme = "https") const;
+    // Distinct access classes of the artifact's roots, sorted.
+    [[nodiscard]] std::vector<std::string> usage() const;
 };
 
 std::vector<OpenDataArtifact> parseCatalogArtifacts(const nlohmann::json& entries);
@@ -190,6 +237,7 @@ struct OpenDataVolumeCoverage {
     OpenDataBounds bbox;       // bbox_transformed, in that volume's voxels
     double overlapRatio = 0;   // 0: the segment does not reach the volume
     std::string computedAt;
+    bool operator==(const OpenDataVolumeCoverage&) const = default;
 };
 
 // The original tifxyz recorded at segment creation (creation.metadata).
@@ -225,6 +273,8 @@ struct OpenDataSegment {
     // The segment's identity across catalog revisions: long_id, else id.
     [[nodiscard]] std::string stableId() const;
     [[nodiscard]] const OpenDataVolumeCoverage* coverage(std::string_view volumeId) const noexcept;
+    // Artifacts of any of these types; with a target volume, only those keyed to it.
+    [[nodiscard]] std::vector<const OpenDataArtifact*> artifactsOf(const std::vector<std::string>& types, const std::optional<std::string>& targetVolume = std::nullopt) const;
 };
 
 // A tifxyz representation of a segment that can be opened as a surface.
@@ -335,6 +385,14 @@ struct OpenDataVolumeView {
     }
 };
 
+// What the catalog says about the volume a zarr shows; voxelSizeUm is that of the
+// dataset's own level 0 (a dataset derived on a coarser level has that level's voxels).
+struct OpenDataVolumeMetadata {
+    std::string sampleId, volumeId, scanId, name, createdAt, dataFormat;
+    std::optional<double> voxelSizeUm, energyKeV, detectorDistanceMm;
+    nlohmann::json raw;
+};
+
 struct OpenDataManifest {
     std::string manifestUrl;
     std::vector<OpenDataSample> samples;
@@ -347,7 +405,18 @@ struct OpenDataManifest {
     // parameters.level added to the base level). URLs compare without trailing
     // slashes, as resolved or as published.
     [[nodiscard]] std::optional<OpenDataVolumeView> volumeAt(std::string_view url, int baseLevel = 0) const;
+    // The volume at any spelling of a public location (s3:// or https://).
+    [[nodiscard]] std::optional<OpenDataVolumeMetadata> volumeMetadataAt(const std::string& url) const;
+    // The ids of the samples a person's name for one means: their id, description or
+    // community alias, compared by sampleNameKey, with or without the "PHerc" prefix.
+    [[nodiscard]] std::vector<std::string> samplesNamed(std::string_view name) const;
 };
+
+// Case-, punctuation- and zero-padding-insensitive key for a sample name: PHerc. Paris 4,
+// pherc paris 4 and PHercParis4 share one, as do PHerc 0332 and PHerc332.
+[[nodiscard]] std::string sampleNameKey(std::string_view name);
+// The community names of a sample (Scroll 1 is PHercParis4), as metadata.schema.json lists them.
+[[nodiscard]] std::vector<std::string> communityAliases(std::string_view sampleId);
 
 // The manifest in a cache file (loadCatalog's cacheFile), parsed once per file
 // version and shared; nullptr when the file is missing or invalid.
@@ -366,6 +435,8 @@ struct OpenDataManifest {
 // The https:// location of an s3:// URL (public channels by their published
 // rewrite, other buckets by region: s3+REGION://); other URLs are unchanged.
 [[nodiscard]] std::string resolveOpenDataUrl(std::string url);
+// resolveOpenDataUrl for http(s) and s3 URLs; nullopt for anything else.
+[[nodiscard]] std::optional<std::string> openDataHttpsUrl(std::string url);
 // The s3:// form of a URL in a public channel (or already s3://), else nullopt.
 [[nodiscard]] std::optional<std::string> openDataS3Url(std::string url);
 [[nodiscard]] std::string joinOpenDataUrl(std::string root, std::string path);
@@ -387,6 +458,12 @@ struct OpenDataManifest {
 [[nodiscard]] const OpenDataArtifact* preferredPhotoArtifact(
     const OpenDataSample& sample) noexcept;
 
+
+// Where manifests are cached: $VC_READER_CACHE_DIR, else $XDG_CACHE_HOME/vc_reader,
+// else ~/.cache/vc_reader.
+[[nodiscard]] std::filesystem::path defaultCatalogCacheDir();
+// The cache file of one manifest source in `cacheDir` (empty: the default directory).
+[[nodiscard]] std::filesystem::path catalogCacheFile(const std::string& source, const std::filesystem::path& cacheDir = {});
 
 struct CatalogLoadOptions {
     std::filesystem::path cacheFile;

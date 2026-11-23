@@ -3,13 +3,13 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
-import zarr
 
 from nnunetv2.preprocessing.normalization.default_normalization_schemes import (
     CTNormalization,
 )
 
-from vesuvius.data.volume import Volume
+from vc_reader.reader import ZarrWriter
+from vesuvius.data.vc_dataset import VCDataset
 from vesuvius.models.run import inference
 from vesuvius.models.run.inference import (
     Inferer,
@@ -61,26 +61,22 @@ def test_volume_ct_normalization_matches_nnunet(tmp_path):
         dtype=np.int16,
     )
     path = tmp_path / 'input.zarr'
-    array = zarr.open(
-        str(path), mode='w', shape=source.shape, chunks=source.shape,
-        dtype=source.dtype,
-    )
-    array[:] = source
+    ZarrWriter.create(path, shape=source.shape, chunks=source.shape, dtype=source.dtype)[:] = source
 
-    volume = Volume(
-        type='zarr',
-        path=str(path),
+    dataset = VCDataset(
+        input_path=str(path),
+        patch_size=(1, 1, 1),
         normalization_scheme='ct',
         intensity_props=CT_PROPERTIES,
         return_as_type='np.float32',
-        return_as_tensor=False,
+        skip_empty_patches=False,
     )
     expected = CTNormalization(
         use_mask_for_norm=False,
         intensityproperties=CT_PROPERTIES,
     ).run(source.copy())
 
-    np.testing.assert_array_equal(volume[:, :, :], expected)
+    np.testing.assert_allclose(dataset._read_patch(*(slice(None),) * 3).numpy(), expected, rtol=1e-6, atol=1e-6)
 
 
 @pytest.mark.parametrize(
@@ -145,17 +141,12 @@ def test_dataset_receives_ct_intensity_properties(monkeypatch):
     inferer.overlap = 0.5
     inferer.num_parts = 1
     inferer.part_id = 0
-    inferer.input_format = 'zarr'
     inferer.verbose = False
     inferer.skip_empty_patches = False
-    inferer.scroll_id = None
-    inferer.segment_id = None
-    inferer.energy = None
-    inferer.resolution = None
     inferer.input_anon = False
     inferer.bbox = None
-    inferer.read_retries = 1
     inferer.chunk_cache_mb = 0
+    inferer.num_dataloader_workers = 0
     inferer.device = torch.device('cpu')
     inferer.max_patches = None
 

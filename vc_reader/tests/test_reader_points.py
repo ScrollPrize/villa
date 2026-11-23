@@ -44,7 +44,7 @@ def test_dispersed_points(tmp_path, order, dtype):
             expected.append(np.nan if order else 99)
             valid.append(False)
             continue
-        low = np.floor(p).astype(np.int64) if order else np.rint(p).astype(np.int64)
+        low = np.floor(p).astype(np.int64) + (0 if order else (p-np.floor(p) >= .5))  # spatial ties round up
         fraction = p-low if order else np.zeros(3)
         value, inside = 0., True
         for corner in itertools.product((0, 1), repeat=3):
@@ -77,7 +77,8 @@ def test_compact_empty_and_nonfinite_points(tmp_path, order):
     array(tmp_path, values, fill=99)
     batches = [np.empty((0, 3)), np.array([[np.nan, 0, 0], [0, np.inf, 0]]),
                np.array([[1, 1, 1], [2.5, 1, 1], [1.5, 1, 1]])]
-    expected = [[], [np.nan, np.nan] if order else [99, 99], [21, 45 if order else 37, 29 if order else 37]]
+    # Nearest: z 2.5 rounds up to 3 (53), z 1.5 to 2 (37).
+    expected = [[], [np.nan, np.nan] if order else [99, 99], [21, 45 if order else 53, 29 if order else 37]]
     with ZarrReader.open(tmp_path) as reader:
         for points, wanted in zip(batches, expected):
             np.testing.assert_array_equal(reader.sample(points, order=order), wanted)

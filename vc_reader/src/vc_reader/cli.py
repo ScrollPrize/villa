@@ -2,7 +2,7 @@
 import argparse
 import sys
 
-from ._fetch import DEFAULT_METADATA_URL
+from .catalog import DEFAULT_METADATA_URL
 from .catalog import Catalog, DEFAULT_RESOLUTION_REL_TOL
 from .browsing import ScrollSource
 from .errors import VcReaderError

@@ -1,7 +1,6 @@
 """Storage integration: Zarr metadata, file transport, caches, registration."""
 
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import replace
 import base64
 import hashlib
 import http.server
@@ -41,6 +40,11 @@ def process_read(reader):
 def read_remote_source(source, options):
     with source.open(**options) as reader:
         return reader.read((0, 0), (5, 7))
+
+
+def cached_files(cache):
+    """Remote image files cached under ``cache`` (at their URLs' bucket paths)."""
+    return [p for p in Path(cache).rglob('*') if p.is_file() and p.suffix in ('.png', '.tif')]
 
 
 def array(path, data, attrs=None, fill=0):
@@ -168,7 +172,7 @@ class StorageTests(FixtureCase):
                     for result in pool.map(process_read, [reader, reader]):
                         np.testing.assert_array_equal(result, data[:3, :4])
             np.testing.assert_array_equal(reader.read_many([((0, 0), (3, 4))])[0], data[:3, :4])
-        encoded = replace(source, encoding=Encoding('integer', ((0, 0),), 'uint8', fallback=1))
+        encoded = source.replace(encoding=Encoding('integer', ((0, 0),), 'uint8', fallback=1))
         with encoded.open(max_decode_bytes=100) as reader:
             with self.assertRaisesRegex(MemoryError, 'max_decode_bytes'):
                 reader.read((0, 0), (5, 7))
@@ -177,9 +181,9 @@ class StorageTests(FixtureCase):
         path = self.root/'palette.png'
         image = Image.fromarray(np.zeros((20, 31), 'u1')).convert('P')
         image.save(path)
-        with patch('PIL.PngImagePlugin.PngImageFile.load', side_effect=AssertionError('pixel decode')):
-            with Source('palette', Storage(str(path), 'png')).open() as reader:
-                self.assertIsNotNone(reader.palette)
+        with Source('palette', Storage(str(path), 'png')).open() as reader:
+            self.assertIsNotNone(reader.palette)
+            self.assertEqual(reader.stats()['image_payload_bytes'], 0)
         path = self.root/'large.tif'
         data = np.ones((2048, 3072), dtype=np.uint16)
         tifffile.imwrite(path, data, tile=(32, 32), compression='deflate')
@@ -232,7 +236,7 @@ class StorageTests(FixtureCase):
             self.assertEqual(out.dtype, np.dtype('uint64'))
             self.assertEqual(out[0, 0], 2**40+3)
             self.assertEqual(out[1, 1], 2**40+1)
-        with replace(source, fill_value=None).open() as reader:
+        with source.replace(fill_value=None).open() as reader:
             self.assertEqual(reader.fill_value, 2**40+1)
 
     def test_zarr_time_selection_without_channels(self):
@@ -262,19 +266,22 @@ class StorageTests(FixtureCase):
         reg = VolumeRegistration('s', 'v', affine=Affine.scale(128), origin='catalog-fallback',
                                  declared_grid=Selection(level=0), volume_spacing_um=(2.,)*3)
         source = Source('pyramid', Storage(str(path), 'zarr', pyramid=True, grid_level=7), registration=reg)
+        # Scale-only levels are block-reduced: 8 um voxel j is centred at dataset-0
+        # (4 um) voxel 2j + .5, i.e. 8j + 2 um, volume (2 um) voxel 4j + 1.
+        level1 = Affine.from_rows(((4, 0, 0, 1), (0, 4, 0, 1), (0, 0, 4, 1)))
         with source.with_selection(level=1).open() as reader:
-            self.assertEqual(reader.registration.affine, Affine.scale(4))
+            self.assertEqual(reader.registration.affine, level1)
         request = source.with_selection(corresponding=LevelRequest(Frame('s', 'v', 2), -5))
         with request.open() as reader:
             self.assertEqual(reader.resolved.selection.array_path, '1')
-            self.assertEqual(reader.registration.affine, Affine.scale(4))
+            self.assertEqual(reader.registration.affine, level1)
         with self.assertRaisesRegex(ValueError, 'reference level 0'):
             source.with_selection(corresponding=LevelRequest(Frame('s', 'v', 0), -7)).open()
         with self.assertRaisesRegex(ValueError, 'source level 8'):
             source.with_selection(level=8).open()
         with self.assertRaisesRegex(ValueError, 'ambiguous'):
             source.open()
-        unknown = replace(source, registration=replace(reg, volume_spacing_um=None))
+        unknown = source.replace(registration=reg.replace(volume_spacing_um=None))
         with self.assertRaisesRegex(ValueError, 'volume_spacing_um'):
             unknown.with_selection(level=0).open()
 
@@ -287,15 +294,15 @@ class StorageTests(FixtureCase):
         with source.open() as reader:
             self.assertEqual(reader.registration.affine, affine)
         with source.with_selection(level=1).open() as reader:
-            self.assertEqual(reader.registration.affine, affine @ Affine.scale(2))
-            self.assertEqual(reader.registration.affine.translation[0], 2**26+.25)
+            self.assertEqual(reader.registration.affine, affine @ Affine.block_reduced(2))
+            self.assertEqual(reader.registration.affine.translation[0], 2**26+1.25)
         self.assertNotEqual(np.float32(2**26+.25).item(), 2**26+.25)
-        placed = replace(source, registration=VolumeRegistration('s', 'v', affine=Affine.scale(3),
+        placed = source.replace(registration=VolumeRegistration('s', 'v', affine=Affine.scale(3),
                           mode='storage', storage_frame='physical', storage_units='micrometer'))
         with placed.with_selection(level=1).open() as reader:
-            self.assertEqual(reader.registration.affine, Affine.scale(6))
+            self.assertEqual(reader.registration.affine, Affine.scale(3) @ Affine.block_reduced(2))
         with self.assertRaisesRegex(ValueError, 'storage_units'):
-            replace(placed, registration=replace(placed.registration, storage_units=None)).open()
+            placed.replace(registration=placed.registration.replace(storage_units=None)).open()
         attrs = json.loads((path / '.zattrs').read_text())
         attrs['multiscales'][0]['axes'][0]['unit'] = 'unknown'
         (path / '.zattrs').write_text(json.dumps(attrs))
@@ -344,7 +351,7 @@ class StorageTests(FixtureCase):
                     tifffile.imwrite(path, data, compression='deflate', metadata={'axes': axes}, **kwargs, **options)
                     source = Source('tiff', Storage(str(path), 'tiff'))
                     if options:
-                        source = replace(source, encoding=Encoding('color', (((3, 7, 11), 2**40+1),), 'uint64'))
+                        source = source.replace(encoding=Encoding('color', (((3, 7, 11), 2**40+1),), 'uint64'))
                     with source.open() as reader:
                         output = reader.read((14, 13), (7, 8))
                         np.testing.assert_array_equal(output, 2**40+1 if options else data[14:21, 13:21])
@@ -358,7 +365,7 @@ class StorageTests(FixtureCase):
         source = Source('pages', Storage(str(path), 'tiff'), encoding=Encoding('color', (((3, 7, 11), 2**40),), 'uint64'))
         with source.open() as reader:
             np.testing.assert_array_equal(reader.read((7, 9), (5, 7)), 2**40)
-        stack = replace(source, storage=Storage(format='stack', locations=(str(path), str(path))),
+        stack = source.replace(storage=Storage(format='stack', locations=(str(path), str(path))),
                         axes=('z', 'c', 'y', 'x'))
         with stack.open() as reader:
             np.testing.assert_array_equal(reader.read((0, 7, 9), (2, 5, 7)), 2**40)
@@ -387,10 +394,70 @@ class RemoteFixtureCase(FixtureCase):
 
 
 class RemoteTests(RemoteFixtureCase):
+    def test_auto_signs_private_buckets_and_keeps_public_channels_anonymous(self):
+        from vc_reader.reader.auth import resolve_access
+        keys = dict(AWS_ACCESS_KEY_ID='example', AWS_SECRET_ACCESS_KEY='test-secret', AWS_ENDPOINT_URL=self.url)
+        with patch.dict('os.environ', keys):
+            self.assertEqual(resolve_access('s3://my-private-bucket/volume.zarr').kind, 's3')
+            for public in ('s3://vesuvius-challenge-open-data/volume.zarr', 's3://vesuvius-challenge/volume.zarr',
+                           'https://example.com/volume.zarr'):
+                self.assertEqual(resolve_access(public).kind, 'anonymous')
+            # Open data is never signed, even when keys are asked for.
+            for public in ('s3://vesuvius-challenge-open-data/volume.zarr', 's3+us-east-1://vesuvius-challenge-open-data/volume.zarr',
+                           'https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/volume.zarr'):
+                self.assertEqual(resolve_access(public, 'aws').kind, 'anonymous')
+            self.assertEqual(resolve_access('s3://my-private-bucket/volume.zarr', 'aws').kind, 's3')
+            # A bucket root is open data too.
+            for public in ('s3://vesuvius-challenge-open-data', 's3+us-east-1://vesuvius-challenge-open-data',
+                           'https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com'):
+                self.assertEqual(resolve_access(public, 'aws').kind, 'anonymous')
+
+    def test_metadata_caching_obeys_the_floor_and_outlives_the_chunk_budget(self):
+        from vc_reader.reader import ZarrGroup
+        values = np.arange(12, dtype=np.uint8).reshape(3, 4)
+        for name in ('small', 'fits', 'floor'):
+            group = self.root/name
+            group.mkdir()
+            (group/'.zgroup').write_text('{"zarr_format": 2}')
+            (group/'.zattrs').write_text(json.dumps(dict(multiscales=[dict(datasets=[dict(path='0')])])))
+            array(group/'0', values)
+        def documents(name):
+            return sorted(p.relative_to(self.cache).as_posix() for p in self.cache.rglob('*')
+                          if p.is_file() and name in p.parts and p.name in ('.zgroup', '.zattrs', '.zarray'))
+        # A chunk budget too small for a chunk still keeps the documents: the group reopens
+        # offline, and only the chunks are missing there.
+        with ZarrGroup.open(self.url+'/small', cache_dir=self.cache, cache_max_bytes=1) as reader:
+            np.testing.assert_array_equal(reader.level(0)[:], values)
+        self.assertTrue(any(d.endswith('small/.zgroup') for d in documents('small')), documents('small'))
+        self.assertEqual([p for p in self.cache.rglob('small/0/*') if p.name[0].isdigit()], [])
+        with ZarrGroup.open(self.url+'/small', cache_dir=self.cache, offline=True) as reader:
+            with self.assertRaises(CacheMissError):
+                reader.level(0)[:]
+        budget = disk_budget(str(self.cache), 2**63-1)
+        with ZarrGroup.open(self.url+'/fits', cache_dir=self.cache) as reader:
+            reader.level(0)[:]
+        kept = documents('fits')
+        self.assertTrue(any(d.endswith('fits/0/.zarray') for d in kept), kept)
+        with ZarrGroup.open(self.url+'/fits', cache_dir=self.cache, offline=True) as reader:
+            np.testing.assert_array_equal(reader.level(0)[:], values)
+        # Under the floor another group's documents are refused and reported; the kept ones stay.
+        budget.set_min_free_bytes(2**62)
+        with ZarrGroup.open(self.url+'/floor', cache_dir=self.cache) as reader:
+            np.testing.assert_array_equal(reader.level(0)[:], values)
+        self.assertTrue(budget.low_space)
+        self.assertEqual(documents('floor'), [])
+        self.assertEqual(documents('fits'), kept)
+        with self.assertRaises(CacheMissError):
+            ZarrGroup.open(self.url+'/floor', cache_dir=self.cache, offline=True)
+        budget.set_min_free_bytes(0)
+        with ZarrGroup.open(self.url+'/floor', cache_dir=self.cache) as reader:
+            reader.level(0)[:]
+        self.assertFalse(budget.low_space)
+        with ZarrGroup.open(self.url+'/floor', cache_dir=self.cache, offline=True) as reader:
+            np.testing.assert_array_equal(reader.level(0)[:], values)
+
     def test_offline_s3_zarr_skips_auth_and_region_discovery(self):
         from vc_reader.reader import ZarrGroup
-        from vc_reader.reader.auth import Access
-        from vc_reader.reader.transport import cache_url
         group = self.root/'offline-group'
         group.mkdir()
         (group/'.zgroup').write_text('{"zarr_format": 2}')
@@ -402,17 +469,14 @@ class RemoteTests(RemoteFixtureCase):
         with ZarrGroup.open(url, cache_dir=self.cache, auth=keys) as reader:
             np.testing.assert_array_equal(reader.level(0)[:], values)
         before = dict(self.counts)
-        with patch('vc_reader.reader.auth.bucket_region', side_effect=AssertionError('region discovery')), \
-             patch('vc_reader.reader.auth._AwsSource', side_effect=AssertionError('credential discovery')), \
-             patch('vc_reader._reader.http_get', side_effect=AssertionError('metadata fetch')):
-            for auth in ('auto', 'aws', None, S3Credentials('example', 'test-secret')):
-                with self.subTest(auth=type(auth).__name__):
-                    with ZarrReader.open(url+'/0', cache_dir=self.cache, offline=True, auth=auth) as reader:
-                        np.testing.assert_array_equal(reader[:], values)
-                    with ZarrGroup.open(url, cache_dir=self.cache, offline=True, auth=auth) as reader:
-                        np.testing.assert_array_equal(reader.level(0)[:], values)
+        # No credentials and no way to learn a bucket's region: offline needs neither.
+        for auth in ('auto', 'aws', None, S3Credentials('example', 'test-secret')):
+            with self.subTest(auth=type(auth).__name__):
+                with ZarrReader.open(url+'/0', cache_dir=self.cache, offline=True, auth=auth) as reader:
+                    np.testing.assert_array_equal(reader[:], values)
+                with ZarrGroup.open(url, cache_dir=self.cache, offline=True, auth=auth) as reader:
+                    np.testing.assert_array_equal(reader.level(0)[:], values)
         self.assertEqual(before, self.counts)
-        self.assertEqual(cache_url(url, Access('anonymous')), cache_url(url, Access('s3')))
 
     def test_shared_memory_cache_separates_lossy_and_exact_reads(self):
         data = np.arange(64, dtype=np.uint8).reshape(4, 4, 4)
@@ -476,6 +540,135 @@ class RemoteTests(RemoteFixtureCase):
                 with sqlite3.connect(cache/'.vc_reader_cache.sqlite3') as db:
                     self.assertEqual(db.execute('select count(*) from downloads').fetchone()[0], 0)
 
+    def test_unsized_download_on_an_unlimited_budget_evicts_nothing(self):
+        payload = (self.root/'image.png').read_bytes()
+        def hook(handler):
+            if handler.path != '/unsized.png':
+                return False
+            handler.send_response(200)
+            handler.send_header('Connection', 'close')
+            handler.end_headers()
+            handler.wfile.write(payload)
+            handler.close_connection = True
+            return True
+        self.server.request_hook = hook
+        options = dict(cache_dir=self.cache)
+        read_remote_source(Source('kept', Storage(self.url+'/image.png', 'png')), options)
+        kept = list(cached_files(self.cache))
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(disk_budget(str(self.cache), None).max_bytes, 2**63-1)
+        read_remote_source(Source('unsized', Storage(self.url+'/unsized.png', 'png')), options)
+        self.assertTrue(kept[0].exists(), 'the unsized download evicted a cached file')
+        self.assertEqual(len(list(cached_files(self.cache))), 2)
+
+    def unsized(self, *names):
+        payload = (self.root/'image.png').read_bytes()
+        def hook(handler):
+            if handler.path.lstrip('/') not in names:
+                return False
+            handler.send_response(200)
+            handler.send_header('Connection', 'close')
+            handler.end_headers()
+            handler.wfile.write(payload)
+            handler.close_connection = True
+            return True
+        self.server.request_hook = hook
+        return len(payload)
+
+    def test_unsized_download_on_a_limited_budget_evicts_only_what_it_needs(self):
+        size = self.unsized('unsized.png')
+        options = dict(cache_dir=self.cache, cache_max_bytes=2*size+size//2)
+        for name in ('first.png', 'second.png'):
+            (self.root/name).write_bytes((self.root/'image.png').read_bytes())
+            read_remote_source(Source(name, Storage(self.url+'/'+name, 'png')), options)
+        first, second = [decoded_cache_path(self.cache, self.url+'/'+n) for n in ('first.png', 'second.png')]
+        read_remote_source(Source('unsized', Storage(self.url+'/unsized.png', 'png')), options)
+        self.assertFalse(Path(first).exists(), 'the oldest file makes room')
+        self.assertTrue(Path(second).exists(), 'nothing more than needed is evicted')
+        self.assertTrue(Path(decoded_cache_path(self.cache, self.url+'/unsized.png')).exists())
+
+    def test_unsized_download_past_the_limit_raises_and_leaves_no_reservation(self):
+        size = self.unsized('unsized.png')
+        options = dict(cache_dir=self.cache, cache_max_bytes=size-1)
+        with self.assertRaisesRegex(RuntimeError, 'cache_max_bytes'):
+            read_remote_source(Source('unsized', Storage(self.url+'/unsized.png', 'png')), options)
+        self.assertEqual(list(self.cache.rglob('*.tmp.*')), [])
+        with sqlite3.connect(self.cache/'.vc_reader_cache.sqlite3') as db:
+            self.assertEqual(db.execute('select count(*) from downloads').fetchone()[0], 0)
+
+    def test_concurrent_unsized_downloads_on_a_small_budget_all_finish(self):
+        names = [f'unsized{i}.png' for i in range(4)]
+        size = self.unsized(*names)
+        options = dict(cache_dir=self.cache, cache_max_bytes=size+size//2)
+        with ThreadPoolExecutor(4) as pool:
+            reads = [pool.submit(read_remote_source, Source(n, Storage(self.url+'/'+n, 'png')), options) for n in names]
+            for read in reads:
+                read.result(timeout=30)
+        self.assertEqual(list(self.cache.rglob('*.tmp.*')), [])
+
+    def test_low_free_space_refuses_a_download_and_keeps_cached_files(self):
+        from vc_reader import LowDiskSpaceError
+        options = dict(cache_dir=self.cache)
+        kept = Source('kept', Storage(self.url+'/image.png', 'png'))
+        np.testing.assert_array_equal(read_remote_source(kept, options), self.data)
+        self.assertEqual(len(cached_files(self.cache)), 1)
+        Image.fromarray(self.data+1).save(self.root/'later.png')
+        later = Source('later', Storage(self.url+'/later.png', 'png'))
+        budget = disk_budget(str(self.cache), None)
+        budget.set_min_free_bytes(2**62)
+        self.assertFalse(budget.low_space)
+        with self.assertRaisesRegex(LowDiskSpaceError, 'nothing cached was removed'):
+            read_remote_source(later, options)
+        self.assertTrue(budget.low_space)
+        # The refused download took nothing with it: no eviction, no temporary, no reservation.
+        self.assertEqual(len(cached_files(self.cache)), 1)
+        self.assertEqual(list(self.cache.rglob('*.tmp.*')), [])
+        with sqlite3.connect(self.cache/'.vc_reader_cache.sqlite3') as db:
+            self.assertEqual(db.execute('select count(*) from downloads').fetchone()[0], 0)
+        # The same floor refuses an unsized (chunked) response at its first growth.
+        def hook(handler):
+            if handler.path != '/chunked.png':
+                return False
+            payload = (self.root/'later.png').read_bytes()
+            handler.send_response(200)
+            handler.send_header('Transfer-Encoding', 'chunked')
+            handler.end_headers()
+            handler.wfile.write(f'{len(payload):x}\r\n'.encode()+payload+b'\r\n0\r\n\r\n')
+            return True
+        self.server.request_hook = hook
+        chunked = Source('chunked', Storage(self.url+'/chunked.png', 'png'))
+        with self.assertRaises(LowDiskSpaceError):
+            read_remote_source(chunked, options)
+        self.assertEqual(list(self.cache.rglob('*.tmp.*')), [])
+        # With the floor lowered the same file downloads and the state clears.
+        budget.set_min_free_bytes(0)
+        np.testing.assert_array_equal(read_remote_source(later, options), self.data+1)
+        self.assertFalse(budget.low_space)
+        self.assertEqual(len(cached_files(self.cache)), 2)
+
+    def test_concurrent_misses_for_one_file_download_it_once(self):
+        started = threading.Barrier(4, timeout=10)
+        def hook(handler):
+            if handler.path != '/slow/image.png':
+                return False
+            time.sleep(.2)
+            handler.path = '/image.png'
+            return False
+        self.server.request_hook = hook
+        options = dict(cache_dir=self.cache)
+        def read():
+            started.wait()  # four separately opened readers miss together
+            return read_remote_source(Source('same', Storage(self.url+'/slow/image.png', 'png')), options)
+        with ThreadPoolExecutor(4) as pool:
+            results = list(pool.map(lambda _: read(), range(4)))
+        for result in results:
+            np.testing.assert_array_equal(result, self.data)
+        self.assertEqual(self.counts.get('/image.png'), 1)  # counted after the hook's rewrite
+        self.assertEqual(len(cached_files(self.cache)), 1)
+        self.assertEqual(list(self.cache.rglob('*.tmp.*')), [])
+        with sqlite3.connect(self.cache/'.vc_reader_cache.sqlite3') as db:
+            self.assertEqual(db.execute('select count(*) from downloads').fetchone()[0], 0)
+
     def test_live_download_survives_another_cache_owner_and_budget_pressure(self):
         from vc_reader import _reader
         payload = (self.root/'image.png').read_bytes()
@@ -531,7 +724,7 @@ class RemoteTests(RemoteFixtureCase):
                 release.set()
             np.testing.assert_array_equal(first.result(10), self.data)
             np.testing.assert_array_equal(second.result(10), self.data)
-        self.assertLessEqual(sum(p.stat().st_size for p in self.cache.rglob('*.blob')), len(payload))
+        self.assertLessEqual(sum(p.stat().st_size for p in cached_files(self.cache)), len(payload))
         self.assertEqual(list(self.cache.rglob('*.tmp.*')), [])
 
     def test_abandoned_download_releases_its_reservation(self):
@@ -614,19 +807,20 @@ class RemoteTests(RemoteFixtureCase):
             np.testing.assert_array_equal(reader.read((0, 0), (5, 7)), self.data)
             self.assertEqual(before, self.counts)
         with source.open(cache_dir=self.cache) as reader:
-            self.assertEqual(reader.stats()['remote_bytes'], 0)  # Conditional 304.
-        missing = replace(source, storage=Storage(self.url+'/missing.png', 'png'))
+            self.assertEqual(reader.stats()['remote_bytes'], 0)
+        self.assertEqual(before, self.counts)  # A cached copy is trusted, never revalidated.
+        missing = source.replace(storage=Storage(self.url+'/missing.png', 'png'))
         with self.assertRaises(CacheMissError):
             missing.open(cache_dir=self.cache, offline=True)
-        alternate = replace(missing, storage=replace(missing.storage, alternatives=(source.storage.location,)))
+        alternate = missing.replace(storage=missing.storage.replace(alternatives=(source.storage.location,)))
         with alternate.open(cache_dir=self.cache) as reader:
             np.testing.assert_array_equal(reader.read((0, 0), (5, 7)), self.data)
-        basic = replace(source, storage=Storage(self.url+'/basic/image.png', 'png', alternatives=(source.storage.location,)))
+        basic = source.replace(storage=Storage(self.url+'/basic/image.png', 'png', alternatives=(source.storage.location,)))
         with self.assertRaises(PermissionError):
             basic.open(cache_dir=self.cache)
         with basic.open(cache_dir=self.cache, auth=('user', 'password')) as reader:
             np.testing.assert_array_equal(reader.read((0, 0), (5, 7)), self.data)
-        s3 = replace(source, storage=Storage('s3://bucket/image.png', 'png'))
+        s3 = source.replace(storage=Storage('s3://bucket/image.png', 'png'))
         keys = S3Credentials('example', 'test-secret', region='us-east-1', endpoint_url=self.url)
         with s3.open(cache_dir=self.cache, auth=keys) as reader:
             np.testing.assert_array_equal(reader.read((0, 0), (5, 7)), self.data)
@@ -649,7 +843,7 @@ class RemoteTests(RemoteFixtureCase):
         source = Source('image', Storage(self.url+'/image.png', 'png'))
         with self.assertRaisesRegex(RuntimeError, 'cache_max_bytes'):
             source.open(cache_dir=self.cache, cache_max_bytes=size-1)
-        self.assertEqual(list(self.cache.rglob('*.blob')), [])
+        self.assertEqual(list(cached_files(self.cache)), [])
         self.assertEqual(list(self.cache.rglob('*.tmp.*')), [])
         def read(_):
             with source.open(cache_dir=self.cache, cache_max_bytes=2*size) as reader:
@@ -657,17 +851,17 @@ class RemoteTests(RemoteFixtureCase):
         with ThreadPoolExecutor(max_workers=4) as executor:
             for result in executor.map(read, range(8)):
                 np.testing.assert_array_equal(result, self.data)
-        self.assertEqual(len(list(self.cache.rglob('*.blob'))), 1)
+        self.assertEqual(len(list(cached_files(self.cache))), 1)
         self.assertEqual(disk_budget(str(self.cache), None).max_bytes, 2*size)
         first = source.open(cache_dir=self.cache, cache_max_bytes=size)
         Image.fromarray(self.data+1).save(self.root/'other.png')
-        other = replace(source, storage=Storage(self.url+'/other.png', 'png'))
+        other = source.replace(storage=Storage(self.url+'/other.png', 'png'))
         with other.open(cache_dir=self.cache, cache_max_bytes=size) as reader:
             np.testing.assert_array_equal(reader.read((0, 0), (5, 7)), self.data+1)
         # A previously opened reader can re-materialize an evicted file.
         np.testing.assert_array_equal(first.read((0, 0), (5, 7)), self.data)
         first.close()
-        self.assertLessEqual(sum(p.stat().st_size for p in self.cache.rglob('*.blob')), size)
+        self.assertLessEqual(sum(p.stat().st_size for p in cached_files(self.cache)), size)
         restored = pickle.loads(pickle.dumps(source.open(cache_dir=self.cache)))
         np.testing.assert_array_equal(restored.read((0, 0), (5, 7)), self.data)
         restored.close()
@@ -683,6 +877,35 @@ class RemoteTests(RemoteFixtureCase):
             np.testing.assert_array_equal(reader.read((0, 0), (5, 7)), self.data)
         self.assertEqual(before, self.counts)
 
+    def test_mirrored_files_are_used_in_place_and_not_owned(self):
+        from vc_reader import _reader
+        # A mirror laid out by bucket path (e.g. an Open Data sync) already holds the file.
+        payload = (self.root/'image.png').read_bytes()
+        url = self.url+'/mirrored/image.png'
+        mirrored = Path(decoded_cache_path(self.cache, url))
+        mirrored.parent.mkdir(parents=True)
+        mirrored.write_bytes(payload)
+        source = Source('mirrored', Storage(url, 'png'))
+        with source.open(cache_dir=self.cache) as reader:
+            np.testing.assert_array_equal(reader.read((0, 0), (5, 7)), self.data)
+            self.assertEqual(reader.stats()['remote_bytes'], 0)
+        self.assertNotIn('/mirrored/image.png', self.counts)
+        # Downloads land at their own bucket paths and stay counted across owners;
+        # budget pressure evicts them, never the file found in place.
+        downloaded = Source('downloaded', Storage(self.url+'/image.png', 'png'))
+        with downloaded.open(cache_dir=self.cache, cache_max_bytes=len(payload)) as reader:
+            np.testing.assert_array_equal(reader.read((0, 0), (5, 7)), self.data)
+        self.assertTrue(Path(decoded_cache_path(self.cache, self.url+'/image.png')).is_file())
+        _reader.DiskCache(str(self.cache), -1)  # a new owner reconciles the index
+        with sqlite3.connect(self.cache/'.vc_reader_cache.sqlite3') as db:
+            self.assertEqual(db.execute('select total from budget').fetchone()[0], len(payload))
+        Image.fromarray(self.data+1).save(self.root/'other.png')
+        other = Source('other', Storage(self.url+'/other.png', 'png'))
+        with other.open(cache_dir=self.cache, cache_max_bytes=len(payload)) as reader:
+            np.testing.assert_array_equal(reader.read((0, 0), (5, 7)), self.data+1)
+        self.assertFalse(Path(decoded_cache_path(self.cache, self.url+'/image.png')).exists())
+        self.assertEqual(mirrored.read_bytes(), payload)
+
     def test_remote_tiff_stack_lazy_reads_and_content_change(self):
         tifffile.imwrite(self.root/'image.tif', self.data)
         source = Source('tiff', Storage(self.url+'/image.tif', 'tiff'))
@@ -697,6 +920,9 @@ class RemoteTests(RemoteFixtureCase):
         png = Source('changed', Storage(self.url+'/image.png', 'png'))
         old = png.open(cache_dir=self.cache)
         Image.fromarray(self.data+1).save(self.root/'image.png')
+        with png.open(cache_dir=self.cache) as current:  # the cached copy is trusted
+            np.testing.assert_array_equal(current.read((0, 0), (5, 7)), self.data)
+        Path(decoded_cache_path(self.cache, self.url+'/image.png')).unlink()  # as eviction would
         with png.open(cache_dir=self.cache) as current:
             np.testing.assert_array_equal(current.read((0, 0), (5, 7)), self.data+1)
         with self.assertRaisesRegex(ValueError, 'source changed'):
@@ -712,12 +938,17 @@ class RemoteTests(RemoteFixtureCase):
                 with multiprocessing.get_context(method).Pool(2) as pool:
                     for result in pool.map(process_read, [reader]*4):
                         np.testing.assert_array_equal(result, self.data[:3, :4])
-        self.assertEqual(len(list(self.cache.rglob('*.blob'))), 1)
-        self.assertEqual(disk_budget(str(self.cache), None).max_bytes, 1 << 30)
+        self.assertEqual(len(list(cached_files(self.cache))), 1)
+        self.assertEqual(disk_budget(str(self.cache), None).max_bytes, 2**63-1)
+        # With no cache to write to, files go to a temporary directory that stays bounded.
+        with source.open(cache_writes=False) as reader:
+            reader.read((0, 0), (5, 7))
+            temporary = Path(reader._engine().temporary_directory)
+            self.assertEqual(disk_budget(str(temporary), None).max_bytes, 1 << 30)
         with self.assertRaisesRegex(RuntimeError, 'cache_max_bytes'):
             source.open(cache_dir=self.root/'unused', cache_writes=False, cache_max_bytes=1)
         with source.open(cache_writes=False, cache_max_bytes=1024) as reader:
-            temporary = Path(reader._encoded._temp.name)
+            temporary = Path(reader._engine().temporary_directory)
             np.testing.assert_array_equal(reader.read((0, 0), (5, 7)), self.data)
         self.assertFalse(temporary.exists())
         self.assertFalse((self.root/'unused').exists())
@@ -728,7 +959,8 @@ class RemoteTests(RemoteFixtureCase):
         disk_budget(str(self.cache), limit)
         with zarr.open(cache_dir=self.cache) as reader:
             np.testing.assert_array_equal(reader.read((0, 0), (5, 7)), self.data)
-            self.assertEqual(reader._backend.reader.write_layer.budget_root, str(self.cache))
+            opened = reader._engine().zarr_array()
+            self.assertEqual(opened.layers[opened.writer].budget_root, str(self.cache))
         with source.open(cache_dir=self.cache) as reader:
             np.testing.assert_array_equal(reader.read((0, 0), (5, 7)), self.data)
         import sqlite3

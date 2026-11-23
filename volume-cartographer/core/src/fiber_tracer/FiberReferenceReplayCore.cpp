@@ -102,7 +102,7 @@ FiberReplayTraceResult traceReferenceReplayCore(
         size_t checkedMatches = 0;
         double checkedArc = segmentStartArc;
         double uncheckedTravel = 0;
-        std::optional<size_t> pendingCheckpoint;
+        FiberReverseCheckSchedule reverseSchedule(consistency.intervalBase,consistency.delaySteps);
         const auto verifyAt=[&](size_t target,bool atEnd,const std::vector<cv::Vec3d>& points) {
             ++result.reverseChecks;
             const auto check=consistency.verifyCheckpoint(points,target,std::min(checkedPoint,target),atEnd);
@@ -121,14 +121,8 @@ FiberReplayTraceResult traceReferenceReplayCore(
             if (consistency.intervalBase <= 0 || segment.tracePointsBase.size() <= checkedPoint + 1)
                 return true;
             if (consistency.verifyCheckpoint) {
-                const size_t last=segment.tracePointsBase.size()-1;
-                if (!pendingCheckpoint && !terminal) pendingCheckpoint=last;
-                if(pendingCheckpoint && (terminal || last-*pendingCheckpoint>=consistency.delaySteps)) {
-                    if(!verifyAt(*pendingCheckpoint,false,segment.tracePointsBase))return false;
-                    pendingCheckpoint.reset();
-                }
-                if(terminal && last>checkedPoint) return verifyAt(last,true,segment.tracePointsBase);
-                return true;
+                return reverseSchedule.check(segment.tracePointsBase,terminal,
+                    [&](size_t target,size_t,bool end){return verifyAt(target,end,segment.tracePointsBase);});
             }
             ++result.reverseChecks;
             const std::vector<cv::Vec3d> span(segment.tracePointsBase.begin() + (consistency.toStart ? 0 : checkedPoint),
@@ -232,30 +226,23 @@ FiberReplayTraceResult traceReferenceReplayCore(
         if (presenceFiltered && consistency.verifyCheckpoint && consistency.delaySteps > 0) {
             const size_t acceptedLast=segment.tracePointsBase.size()-1-(rejectedObservedPoint ? 1 : 0);
             if(acceptedLast>0) {
-                const size_t target=acceptedLast>consistency.delaySteps ? acceptedLast-consistency.delaySteps : 0;
                 // A rejected observer point is not usable incoming history. Do
                 // not erase it yet: failure metadata still refers to detection.
                 std::vector<cv::Vec3d> accepted;
                 if(rejectedObservedPoint)
                     accepted.assign(segment.tracePointsBase.begin(),segment.tracePointsBase.begin()+acceptedLast+1);
                 const auto& points=rejectedObservedPoint ? accepted : segment.tracePointsBase;
-                bool keep=false;
-                if(target==0) {
-                    // Entire accepted piece fits inside the requested history
-                    // tail: nothing precedes it to reverse-trace. Do not count
-                    // this retention as a successful verification.
-                    ++result.reverseStopTailHistoryOnly;
-                    keep=true;
-                } else {
+                const bool keep=reverseSchedule.stopTail(points,[&](size_t target,size_t,bool){
                     ++result.reverseStopTailChecks;
-                    keep=verifyAt(target,false,points);
-                    if(keep) ++result.reverseStopTailPassed;
-                }
+                    const bool passed=verifyAt(target,false,points);
+                    if(passed) ++result.reverseStopTailPassed;
+                    return passed;
+                });
+                if(reverseSchedule.historyOnly())++result.reverseStopTailHistoryOnly;
                 if(keep) {
                     // User policy: keep the accepted incoming-history tail too.
                     checkedPoint=acceptedLast;checkedMatches=acceptedLast;
                     checkedArc=segment.matches.at(acceptedLast-1).matchedReferenceArcBase;
-                    pendingCheckpoint.reset();
                 } else {
                     // Verification failed, so the filtering reason is reverse
                     // consistency rather than the original presence/width stop.

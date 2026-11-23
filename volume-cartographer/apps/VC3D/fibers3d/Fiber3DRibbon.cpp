@@ -1,5 +1,6 @@
 #include "Fiber3DRibbon.hpp"
 #include "Fiber3DGeometry.hpp"
+#include "OpenedVolumes.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/fiber_tracer/FiberDisplay.hpp"
@@ -256,16 +257,11 @@ cv::Vec3d position(const Row& row, double offsetVoxels, double rotationDegrees)
     return row.center + v * std::cos(a) + row.tangent.cross(v) * std::sin(a) + row.tangent * (row.tangent.dot(v) * (1 - std::cos(a)));
 }
 
-std::shared_ptr<Image> sampleProgressive(const Frames& frames, Volume& volume, int widthVoxels, int rotationDegrees, int level, const std::atomic_bool* cancelled)
+std::shared_ptr<Image> sampleRibbon(const Frames& frames, OpenedVolumes& volumes, const Volume& volume, int widthVoxels, int rotationDegrees, int level, const std::atomic_bool* cancelled)
 {
     check(cancelled);
     if (widthVoxels < 1 || widthVoxels > 512)
         throw std::invalid_argument("CT ribbon width must be 1–512 voxels");
-    if (!volume.hasScaleLevel(level))
-        throw std::runtime_error("Requested CT ribbon level is unavailable");
-    const auto dtype = volume.dtype();
-    if (dtype != vc::render::ChunkDtype::UInt8 && dtype != vc::render::ChunkDtype::UInt16)
-        throw std::runtime_error("CT ribbon supports uint8 and uint16 CT volumes");
     const int width = widthVoxels + 1;
     // Include the repeated tile-border rows in the cap.
     size_t texels = 0;
@@ -291,17 +287,15 @@ std::shared_ptr<Image> sampleProgressive(const Frames& frames, Volume& volume, i
                 tile.left.push_back(point(position(row, -widthVoxels * .5, rotationDegrees)));
                 tile.right.push_back(point(position(row, widthVoxels * .5, rotationDegrees)));
             }
-            const auto progress = ct::sampleTileProgressive(tile, *volume.chunkedCache(), level, cancelled);
-            image->validTexels += progress.valid;
-            image->coveredTexels += progress.covered;
-            image->requestedLevelTexels += progress.requestedLevel;
-            image->errors += progress.errors;
-            image->complete = image->complete && progress.requestedLevel == progress.valid;
+            ct::sampleTile(tile, volumes, volume, level, cancelled);
+            for (size_t i = 1; i < tile.pixels.size(); i += 2)
+                image->validTexels += tile.pixels[i] != 0;
             image->tiles.push_back(std::move(tile));
         }
     check(cancelled);
     if (image->tiles.empty())
         throw std::runtime_error("No continuous fiber segment in the displayed region");
+    image->coveredTexels = image->requestedLevelTexels = image->validTexels;
     return image;
 }
 }  // namespace vc3d::fibers3d::ribbon

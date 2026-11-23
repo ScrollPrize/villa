@@ -1,9 +1,12 @@
+#include "vc/core/util/CudaSampling.hpp"
 #include "vc/fiber_tracer/FiberletCropVisualization.hpp"
 
-#include "vc/core/util/AtomicFile.hpp"
-#include "vc/core/util/SurfaceTexture.hpp"
+#include "vc/core/util/ImageMat.hpp"
+#include <vc_reader/grid.hpp>
+#include <vc_reader/display.hpp>
 #include "vc/core/util/TexturedMesh.hpp"
-#include "vc/core/types/Volume.hpp"
+#include <vc_reader/grid.hpp>
+#include <vc_reader/zarr.hpp>
 #include "vc/fiber_tracer/FiberReplayVisualization.hpp"
 
 #include <algorithm>
@@ -75,7 +78,7 @@ vc::core::util::TexturedMesh faceMesh(const BoxFace& face)
 }  // namespace
 
 void writeFiberletCropBoxVisualization(
-    ::Volume& volume, const std::string& sourceLocator, const cv::Vec3d& minimumBaseXYZ, const cv::Vec3d& maximumBaseXYZ, const std::filesystem::path& outputStem, int maximumTextureDimension)
+    const vcr::zarr::OpenedArray& ct, const cv::Vec3d& minimumBaseXYZ, const cv::Vec3d& maximumBaseXYZ, const std::filesystem::path& outputStem, int maximumTextureDimension)
 {
     if (maximumTextureDimension < 2)
         throw std::invalid_argument("Fiberlet crop texture dimension must be at least two");
@@ -84,31 +87,50 @@ void writeFiberletCropBoxVisualization(
             throw std::invalid_argument("Fiberlet crop visualization bounds are invalid");
         }
     }
-    const auto source = validateFiberReplayStripCtVolume(volume, sourceLocator);
+    const auto source = validateFiberReplayStripCtVolume(ct);
     const auto directory = outputStem.parent_path();
     const auto stem = outputStem.stem().string();
     const auto mtlName = stem + ".mtl";
     std::string mtl;
     for (const auto& face : boxFaces(minimumBaseXYZ, maximumBaseXYZ)) {
-        const int columns = textureDimension(cv::norm(face.uExtent), source.scaleFromBaseXYZ[face.uAxis], maximumTextureDimension);
-        const int rows = textureDimension(cv::norm(face.vExtent), source.scaleFromBaseXYZ[face.vAxis], maximumTextureDimension);
+        // Level voxels per base voxel along a face axis: 1 / the level's scale.
+        const int columns = textureDimension(cv::norm(face.uExtent), 1.0 / source.placement.scale[2 - face.uAxis], maximumTextureDimension);
+        const int rows = textureDimension(cv::norm(face.vExtent), 1.0 / source.placement.scale[2 - face.vAxis], maximumTextureDimension);
         auto coordinates = coordinateGrid(face, columns, rows);
         for (auto& point : coordinates) {
-            for (std::size_t axis = 0; axis < 3; ++axis) {
-                point[axis] = static_cast<float>(static_cast<double>(point[axis]) * source.scaleFromBaseXYZ[axis] + source.offsetFromBaseXYZ[axis]);
+            for (int axis = 0; axis < 3; ++axis) {
+                point[axis] = static_cast<float>(source.fromBase(axis, static_cast<double>(point[axis])));
             }
         }
         const std::string textureName = stem + "_" + face.name + ".tif";
         const std::string materialName = "fiberlet_crop_" + std::string(face.name);
-        vc::core::util::writeUncompressedTextureTiff(
-            directory / textureName,
-            vc::core::util::renderCoordsTextureFineToCoarse(coordinates, volume, 0, 1, "Fiberlet crop texture sampling"));
+        vcr::sources::writeTiff(
+            directory / textureName, vc::core::util::imageBuffer([&]() {
+                const auto& vertices = coordinates;
+                const int factor = std::max(1, 1);
+                std::vector<uint8_t> valid(vertices.total(), 1);
+                for (int r = 0; r < vertices.rows; ++r)
+                    for (int c = 0; c < vertices.cols; ++c)
+                        valid[std::size_t(r) * vertices.cols + c] = vertices(r,c) != cv::Vec3f(-1,-1,-1);
+                const vcr::grid::Surface surface({reinterpret_cast<const float*>(vertices.data),
+                    vertices.rows, vertices.cols, vertices.step1(), nullptr, valid.data()});
+                const double step = 1.0 / factor;
+                const vcr::grid::Raster raster{0.5*step-0.5, 0.5*step-0.5, step, step,
+                    vertices.cols*factor, vertices.rows*factor};
+                vcr::grid::Request request;
+                request.levels = {{ct.array.get(), ct.meta.type}};
+                request.levels.front().cuda = vc::cuda::toolReader(ct);
+                const auto sampled = vcr::grid::sample(surface, raster, request);
+                cv::Mat_<uint8_t> texture(raster.height, raster.width);
+                vcr::display::toUint8(sampled.values.data(), texture.total(), texture.ptr());
+                return texture;
+            }()).view());
         mtl += vc::core::util::textureMaterialMtl(materialName, textureName);
-        vc::core::util::atomicWriteString(
+        vcr::zarr::atomicWrite(
             directory / (stem + "_" + face.name + ".obj"),
-            vc::core::util::texturedMeshObj(faceMesh(face), "VC3D Fiberlet crop bbox face", mtlName, materialName, face.name));
+            vc::core::util::texturedMeshObj(faceMesh(face), "VC3D Fiberlet crop bbox face", mtlName, materialName, face.name), vcr::zarr::Durability::Fsync);
     }
-    vc::core::util::atomicWriteString(directory / mtlName, mtl);
+    vcr::zarr::atomicWrite(directory / mtlName, mtl, vcr::zarr::Durability::Fsync);
 }
 
 }  // namespace vc::fiber_tracer

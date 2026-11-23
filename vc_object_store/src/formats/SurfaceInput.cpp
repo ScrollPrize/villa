@@ -3,7 +3,7 @@
 #include "geometry/ArrayLayout.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
 #include "formats/SurfaceInput.hpp"
-#include "spatial/SurfaceGrid.hpp"
+#include <vc_object_store/geometry/SurfaceGrid.hpp>
 #include <cmath>
 #include <bit>
 #include <set>
@@ -80,10 +80,15 @@ Prepared surfaceGeometry(const fs::path& source)
     return p;
 }
 
-Prepared surface(const fs::path& source)
+Prepared surface(const fs::path& source, const std::optional<std::string>& uuidNamespace)
 {
     auto p = surfaceGeometry(source);
     const auto detail = p.object.surface;
+    // VC3D names a tifxyz by its directory and stores that name as "uuid". Derived
+    // names keep the pre-rename "patch:" prefix so reingested identities are stable.
+    const auto named = p.source.contains("uuid") && p.source.at("uuid").is_string() ? p.source.at("uuid").get<std::string>() : std::string{};
+    const auto directory = source.filename().empty() ? source.parent_path() : source;
+    deriveSourceUuid(p.source, "patch", named.empty() ? directory.filename().string() : named, uuidNamespace);
     p.object = sourceObject(p.source, "surface", source);
     p.object.surface = detail;
     return p;

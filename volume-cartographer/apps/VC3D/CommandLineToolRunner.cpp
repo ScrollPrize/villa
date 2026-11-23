@@ -1,4 +1,6 @@
 #include "CommandLineToolRunner.hpp"
+
+#include <vc_reader/zarr.hpp>
 #include "ToolExecutable.hpp"
 #include "ToolOutput.hpp"
 #include <QDir>
@@ -11,6 +13,7 @@
 #include <QMessageBox>
 #include <QClipboard>
 #include <QApplication>
+#include <vc_object_store/objects/ObjectStoreSession.hpp>
 
 #include <cmath>
 #include <utility>
@@ -49,22 +52,6 @@ void CommandLineToolRunner::setVolumePath(const QString& path)
 {
     _volumePath = path;
     _explicitVolumePath = !_volumePath.isEmpty();
-}
-
-void CommandLineToolRunner::setRemoteVolumeUrl(const QString& url)
-{
-    _remoteVolumeUrl = url.trimmed();
-}
-
-void CommandLineToolRunner::setRemoteVolumeAuth(const QString& accessKey,
-                                                const QString& secretKey,
-                                                const QString& sessionToken,
-                                                const QString& region)
-{
-    _remoteAccessKey = accessKey;
-    _remoteSecretKey = secretKey;
-    _remoteSessionToken = sessionToken;
-    _remoteRegion = region;
 }
 
 void CommandLineToolRunner::setStore(const QString& storePath, double voxelScale)
@@ -180,12 +167,7 @@ bool CommandLineToolRunner::execute(Tool tool, ExecutionOptions options)
 
     const QString toolCmd = isCustom ? _customCommand : toolName(tool);
 
-    // vc_merge_tifxyz and vc_merge_patch only read and write stored surfaces;
-    // no volume required.
-    const bool needsVolume = !isCustom
-                             && tool != Tool::MergeTifxyz
-                             && tool != Tool::MergePatch;
-    if (needsVolume) {
+    if (!isCustom) {
         if (_explicitVolumePath) {
             if (_volumePath.isEmpty()) {
                 warn(tr("Error"), tr("Volume path not specified."));
@@ -208,21 +190,13 @@ bool CommandLineToolRunner::execute(Tool tool, ExecutionOptions options)
     }
 
     if (tool == Tool::GrowSegFromSegment || tool == Tool::AlphaCompRefine) {
-        const auto lowered = _volumePath.trimmed().toLower();
-        if (lowered.startsWith("http://") || lowered.startsWith("https://") ||
-            lowered.startsWith("s3://") || lowered.startsWith("s3+") ||
-            lowered.startsWith("sftp://") || lowered.startsWith("ssh://")) {
+        if (vcr::zarr::isRemote(_volumePath.trimmed().toStdString())) {
             warn(
                 tr("Unsupported Remote Volume"),
                 tr("This command accepts only a local volume path. "
                    "Remote locators are rejected without stripping selectors."));
             return false;
         }
-    }
-
-    if (tool == Tool::MergeTifxyz && _mergeJsonPath.isEmpty()) {
-        warn(tr("Error"), tr("merge.json path not specified."));
-        return false;
     }
 
     if (!isCustom && _storePath.isEmpty()) {
@@ -267,16 +241,6 @@ bool CommandLineToolRunner::execute(Tool tool, ExecutionOptions options)
     auto launch = launchFor(tool);
     launch.tool = toolCmd;
     launch.ompThreads = ompThreads;
-    if (!_remoteVolumeUrl.isEmpty() && !_remoteAccessKey.isEmpty() && !_remoteSecretKey.isEmpty()) {
-        launch.environment.insert(QStringLiteral("AWS_ACCESS_KEY_ID"), _remoteAccessKey);
-        launch.environment.insert(QStringLiteral("AWS_SECRET_ACCESS_KEY"), _remoteSecretKey);
-        launch.secretVariables << QStringLiteral("AWS_ACCESS_KEY_ID") << QStringLiteral("AWS_SECRET_ACCESS_KEY");
-        if (!_remoteSessionToken.isEmpty()) {
-            launch.environment.insert(QStringLiteral("AWS_SESSION_TOKEN"), _remoteSessionToken);
-            launch.secretVariables << QStringLiteral("AWS_SESSION_TOKEN");
-        }
-        if (!_remoteRegion.isEmpty()) launch.environment.insert(QStringLiteral("AWS_DEFAULT_REGION"), _remoteRegion);
-    }
     const QString toolLabel = isCustom && !_customLabel.isEmpty() ? _customLabel : QFileInfo(toolCmd).baseName();
     launch.logPath = QStringLiteral("%1/%2_%3.txt")
         .arg(QDir::tempPath(), QFileInfo(toolCmd).baseName(),
@@ -407,7 +371,6 @@ vc3d::ToolProcess::Launch CommandLineToolRunner::launchFor(Tool tool)
     launch.args = buildArguments(tool);
     launch.store = _storePath;
     launch.volume = tool == Tool::RenderTifXYZ ? _renderVolumeUuid
-                    : tool == Tool::MergePatch ? QString()
                                                : _volumeUuid;
     launch.voxelScale = tool == Tool::RenderTifXYZ ? _renderVoxelScale : _voxelScale;
     return launch;
@@ -428,9 +391,6 @@ QStringList CommandLineToolRunner::buildArguments(Tool tool)
                  << "--scale" << QString::number(_scale)
                  << "--group-idx" << QString::number(_resolution)
                  << "--num-slices" << QString::number(_layers);
-            if (!_remoteVolumeUrl.isEmpty()) {
-                args << "--remote-url" << _remoteVolumeUrl;
-            }
             if (_useRenderVoxelSize) {
                 args << "--voxel-size" << QString::number(_renderVoxelSizeUm, 'g', 17)
                      << "--voxel-unit" << "micrometer";
@@ -490,39 +450,6 @@ QStringList CommandLineToolRunner::buildArguments(Tool tool)
                 args << "--resume-opt" << _resumeOpt;
             }
             break;
-        case Tool::MergeTifxyz:
-            args << "--merge" << _mergeJsonPath
-                 << "--tag" << _outputTag;
-            // Empty refSurface -> let vc_merge_tifxyz auto-pick the
-            // surface with the largest valid-cell count. Otherwise pass
-            // the user's pick straight through.
-            if (!_mergeRefSurface.isEmpty()) {
-                args << "--ref" << _mergeRefSurface;
-            }
-            args << "--ransac-iters"      << QString::number(_mergeRansacIters)
-                 << "--ransac-min-thresh" << QString::number(_mergeRansacMinThresh, 'g', 10)
-                 << "--ransac-max-thresh" << QString::number(_mergeRansacMaxThresh, 'g', 10)
-                 << "--ransac-mad-k"      << QString::number(_mergeRansacMadK,      'g', 10)
-                 << "--ransac-seed"       << QString::number(_mergeRansacSeed)
-                 << "--anchor-cap"        << QString::number(_mergeAnchorCap)
-                 << "--strip-cols"        << QString::number(_mergeStripCols);
-            break;
-        case Tool::MergePatch:
-            // Roles are auto-detected by valid-cell count unless the user
-            // swapped them in the dialog (the first surface is the parent).
-            args << "--surface" << _patchParentSurface
-                 << "--surface" << _patchChildSurface;
-            if (_patchExplicitRoles) args << "--explicit-roles";
-            args << "--border-cells"      << QString::number(_patchBorderCells)
-                 << "--blend-cells"       << QString::number(_patchBlendCells)
-                 << "--idw-k"             << QString::number(_patchIdwK)
-                 << "--ransac-iters"      << QString::number(_patchRansacIters)
-                 << "--ransac-min-thresh" << QString::number(_patchRansacMinThresh, 'g', 10)
-                 << "--ransac-max-thresh" << QString::number(_patchRansacMaxThresh, 'g', 10)
-                 << "--ransac-mad-k"      << QString::number(_patchRansacMadK,      'g', 10)
-                 << "--ransac-seed"       << QString::number(_patchRansacSeed)
-                 << "--anchor-cap"        << QString::number(_patchAnchorCap);
-            break;
         case Tool::CustomCommand:
             args = _customArgs;
             break;
@@ -554,12 +481,6 @@ QString CommandLineToolRunner::toolName(Tool tool) const
         case Tool::NeighborCopy:
             return resolved(QStringLiteral("vc_grow_seg_from_seed"));
 
-        case Tool::MergeTifxyz:
-            return resolved(QStringLiteral("vc_merge_tifxyz"));
-
-        case Tool::MergePatch:
-            return resolved(QStringLiteral("vc_merge_patch"));
-
         case Tool::CustomCommand:
             return _customCommand.isEmpty() ? "custom_command" : _customCommand;
 
@@ -572,66 +493,31 @@ QString CommandLineToolRunner::getOutputPath() const
 {
     switch (_currentTool) {
         case Tool::RenderTifXYZ: return QFileInfo(_outputPattern).dir().path();
-        case Tool::tifxyz2obj: return _exportedObj;
+        case Tool::tifxyz2obj: return exportedObjCopy();
         // An in-place refinement creates nothing: the source changed.
         case Tool::AlphaCompRefine: return _createdSurfaces.isEmpty() ? _surfaceUuid : _createdSurfaces.join('\n');
-        // The binary edits the parent in place.
-        case Tool::MergePatch: return _patchParentSurface;
         case Tool::CustomCommand: return QString();
         default: return _createdSurfaces.join('\n');
     }
 }
 
-void CommandLineToolRunner::setMergeParams(const QString& mergeJsonPath,
-                                           const QString& volumeUuid,
-                                           const QString& outputTag,
-                                           const QString& refSurface,
-                                           int ransacIters,
-                                           double ransacMinThresh,
-                                           double ransacMaxThresh,
-                                           double ransacMadK,
-                                           int ransacSeed,
-                                           int anchorCap,
-                                           int stripCols)
+QString CommandLineToolRunner::exportedObjCopy() const
 {
-    _mergeJsonPath        = mergeJsonPath;
-    _volumeUuid           = volumeUuid;
-    _outputTag            = outputTag;
-    _mergeRefSurface      = refSurface;
-    _mergeRansacIters     = ransacIters;
-    _mergeRansacMinThresh = ransacMinThresh;
-    _mergeRansacMaxThresh = ransacMaxThresh;
-    _mergeRansacMadK      = ransacMadK;
-    _mergeRansacSeed      = ransacSeed;
-    _mergeAnchorCap       = anchorCap;
-    _mergeStripCols       = stripCols;
-}
-
-void CommandLineToolRunner::setMergePatchParams(const QString& parentSurface,
-                                                const QString& childSurface,
-                                                bool explicitRoles,
-                                                int borderCells,
-                                                int blendCells,
-                                                int idwK,
-                                                int ransacIters,
-                                                double ransacMinThresh,
-                                                double ransacMaxThresh,
-                                                double ransacMadK,
-                                                int ransacSeed,
-                                                int anchorCap)
-{
-    _patchParentSurface      = parentSurface;
-    _patchChildSurface       = childSurface;
-    _patchExplicitRoles   = explicitRoles;
-    _patchBorderCells     = borderCells;
-    _patchBlendCells      = blendCells;
-    _patchIdwK            = idwK;
-    _patchRansacIters     = ransacIters;
-    _patchRansacMinThresh = ransacMinThresh;
-    _patchRansacMaxThresh = ransacMaxThresh;
-    _patchRansacMadK      = ransacMadK;
-    _patchRansacSeed      = ransacSeed;
-    _patchAnchorCap       = anchorCap;
+    // The tool published the OBJ as an artifact of the surface; a copy goes
+    // to the surface's export directory for the user (and agents).
+    if (_exportedObj.isEmpty() || _storePath.isEmpty() || _surfaceUuid.isEmpty()) return {};
+    try {
+        vc::objects::ObjectStoreSession session;
+        vc::objects::OpenOptions options;
+        options.readOnly = true;
+        const auto store = session.attach(_storePath.toStdString(), options);
+        const auto directory = std::filesystem::path(vc3d::surfaceExportDirectory(_surfaceUuid).toStdString());
+        for (const auto& file : session.materializeArtifacts(store, _surfaceUuid.toStdString(), directory))
+            if (file.name == _exportedObj.toStdString()) return QString::fromStdString((directory / file.name).string());
+    } catch (const std::exception& error) {
+        _consoleOutput->appendOutput(tr("Cannot copy the exported OBJ: %1\n").arg(QString::fromUtf8(error.what())));
+    }
+    return {};
 }
 
 void CommandLineToolRunner::setObjRefineParams(const QString& volumePath,

@@ -10,14 +10,12 @@ import torch
 import subprocess
 import time
 import shutil
-import fsspec
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
-import zarr
 import numpy as np
+from vc_reader.reader import ObjectStore, create_group, open_zarr
 
-from vesuvius.data.utils import open_zarr, open_zarr_group, create_zarr_array
-from numcodecs import Blosc
+from vesuvius.structure_tensor.vf_format import zarr_codec
 
 def get_available_gpus():
     """Returns a list of available GPU IDs."""
@@ -78,38 +76,21 @@ def create_shared_output_store(args, input_shape, patch_size):
     # Use the patch size for chunking
     output_chunks = (6, *patch_size)
     
-    # Get compressor
-    if args.zarr_compressor.lower() == 'zstd':
-        compressor = Blosc(cname='zstd', clevel=args.zarr_compression_level, shuffle=Blosc.SHUFFLE)
-    elif args.zarr_compressor.lower() == 'lz4':
-        compressor = Blosc(cname='lz4', clevel=args.zarr_compression_level, shuffle=Blosc.SHUFFLE)
-    elif args.zarr_compressor.lower() == 'zlib':
-        compressor = Blosc(cname='zlib', clevel=args.zarr_compression_level, shuffle=Blosc.SHUFFLE)
-    elif args.zarr_compressor.lower() == 'none':
-        compressor = None
-    else:
-        compressor = Blosc(cname='zstd', clevel=1, shuffle=Blosc.SHUFFLE)
-    
     print(f"Creating shared output store at: {main_store_path}")
     print(f"Full volume shape: {output_shape}")
     print(f"Chunk shape: {output_chunks}")
     
     # Create the root group
-    root_store = open_zarr_group(
-        main_store_path,
-        mode='w',
-        storage_options={'anon': False} if main_store_path.startswith('s3://') else None
-    )
+    root_store = create_group(main_store_path, overwrite=True)
     
     # Create the structure_tensor array within the group
-    structure_tensor_arr = create_zarr_array(
-        root_store,
+    root_store.create_array(
         'structure_tensor',
         shape=output_shape,
         chunks=output_chunks,
         dtype=np.float32,
-        compressor=compressor,
-        write_empty_chunks=False
+        skip_empty=True,
+        **zarr_codec(args.zarr_compressor, args.zarr_compression_level),
     )
     
     # Store metadata in the root group
@@ -205,7 +186,7 @@ def run_structure_tensor_part(args, part_id, gpu_id, shared_output_path):
     return rc == 0
 
 
-def run_eigenanalysis(zarr_path, chunk_size, compressor, verbose, swap_eigenvectors, num_workers):
+def run_eigenanalysis(zarr_path, chunk_size, codec, verbose, swap_eigenvectors, num_workers):
     """Run eigenanalysis directly (no subprocess) to avoid duplicate prints."""
     from vesuvius.structure_tensor.create_st import _finalize_structure_tensor_torch
     print("\n--- Running Eigenanalysis ---")
@@ -217,7 +198,7 @@ def run_eigenanalysis(zarr_path, chunk_size, compressor, verbose, swap_eigenvect
         zarr_path=zarr_path,
         chunk_size=chunk_size,
         num_workers=num_workers,
-        compressor=compressor,
+        codec=codec,
         verbose=verbose,
         swap_eigenvectors=swap_eigenvectors,
         device=None,  # let the helper pick cuda/cpu
@@ -235,8 +216,7 @@ def delete_intermediate_file(file_path, verbose=False):
     """Delete an intermediate file or directory, handling both local and S3 paths."""
     try:
         if file_path.startswith('s3://'):
-            fs = fsspec.filesystem(file_path.split('://')[0], anon=False)
-            fs.rm(file_path, recursive=True)
+            ObjectStore(file_path).remove_all()
         else:
             if os.path.isdir(file_path):
                 shutil.rmtree(file_path, ignore_errors=True)
@@ -348,17 +328,7 @@ def main():
             print("Error: --eigen-input must be provided for eigenanalysis mode")
             return 1
     
-    # Get compressor for later use
-    if args.zarr_compressor.lower() == 'zstd':
-        compressor = Blosc(cname='zstd', clevel=args.zarr_compression_level, shuffle=Blosc.SHUFFLE)
-    elif args.zarr_compressor.lower() == 'lz4':
-        compressor = Blosc(cname='lz4', clevel=args.zarr_compression_level, shuffle=Blosc.SHUFFLE)
-    elif args.zarr_compressor.lower() == 'zlib':
-        compressor = Blosc(cname='zlib', clevel=args.zarr_compression_level, shuffle=Blosc.SHUFFLE)
-    elif args.zarr_compressor.lower() == 'none':
-        compressor = None
-    else:
-        compressor = Blosc(cname='zstd', clevel=1, shuffle=Blosc.SHUFFLE)
+    codec = zarr_codec(args.zarr_compressor, args.zarr_compression_level)
     
     # Parse chunk size for eigenanalysis if provided
     chunk_size_str = None
@@ -376,7 +346,7 @@ def main():
         success = run_eigenanalysis(
             zarr_path=args.eigen_input,
             chunk_size=chunk_size_str,
-            compressor=compressor,
+            codec=codec,
             verbose=args.verbose,
             swap_eigenvectors=args.swap_eigenvectors,
             num_workers=args.num_workers
@@ -416,11 +386,7 @@ def main():
             args.num_parts = 1
         
         # Get input shape for creating shared output store
-        input_store = open_zarr(
-            path=args.input_dir,
-            mode='r',
-            storage_options={'anon': False} if args.input_dir.startswith('s3://') else None
-        )
+        input_store = open_zarr(args.input_dir)
         input_shape = input_store.shape
         
         # Parse patch size if provided
@@ -524,7 +490,7 @@ def main():
         ok = run_eigenanalysis(
             zarr_path=zarr_path,
             chunk_size=chunk_size_str,
-            compressor=compressor,
+            codec=codec,
             verbose=args.verbose,
             swap_eigenvectors=args.swap_eigenvectors,
             num_workers=args.num_workers,

@@ -3,6 +3,7 @@ import copy
 import json
 import multiprocessing as mp
 import os
+from pathlib import Path
 import queue
 import threading
 import time
@@ -30,7 +31,7 @@ class Adapter:
         return {"presence": output}
 
 
-def _exercise(device):
+def _exercise(device, ema_name=None):
     torch.manual_seed(37)
     model = torch.nn.Sequential(torch.nn.Conv3d(1, 1, 1), torch.nn.Dropout(0.3)).to(device)
     model.train()
@@ -38,6 +39,10 @@ def _exercise(device):
     optimizer = torch.optim.AdamW(model.parameters())
     model(torch.ones(1, 1, 4, 4, 4, device=device)).sum().backward()
     optimizer.step()
+    from vesuvius.neural_tracing.fiber_trace_3d.ema import ModelEMA
+    ema = ModelEMA(model, (.999,))
+    for tensor in ema.tracks['ema_0p999']['model'].values():
+        tensor.add_(.75)  # Distinct predictions prove the EMA was actually applied.
     saved = copy.deepcopy(optimizer.state_dict())
     parameters = [p.detach().clone() for p in model.parameters()]
     gradients = [p.grad.clone() for p in model.parameters()]
@@ -62,7 +67,7 @@ def _exercise(device):
             try:
                 assert child.recv() == "trace"
                 args = child.recv()
-                serve_resident(child, model, 0, args)
+                serve_resident(child, model, 0, args, ema=ema, ema_name=ema_name)
             except BaseException as error:
                 errors.append(error)
             finally:
@@ -93,7 +98,8 @@ def _exercise(device):
         for key, state in saved["state"].items():
             for name, tensor in state.items():
                 torch.testing.assert_close(tensor, optimizer.state_dict()["state"][key][name], rtol=0, atol=0)
-        with torch.no_grad():
+        from contextlib import nullcontext
+        with torch.no_grad(), (ema.apply(model, ema_name) if ema_name else nullcontext()):
             expected = model[0](torch.from_numpy(raw).float().to(device)[None, None] / 255)[0].cpu().numpy()
         np.testing.assert_allclose(tiled._slot_array(outputs[0], outlayouts[0]), expected, rtol=1e-6)
         # A training step still works on the same optimizer and module objects.
@@ -111,6 +117,29 @@ def _exercise(device):
 
 def test_resident_preserves_model_optimizer_rng_and_modes():
     _exercise(torch.device("cpu"))
+
+
+def test_resident_ema999_inference_restores_raw_training_state():
+    _exercise(torch.device("cpu"), 'ema_0p999')
+
+
+def test_resident_ema999_restored_after_inference_exception(monkeypatch):
+    from vesuvius.neural_tracing.fiber_trace_3d.ema import ModelEMA
+    model = torch.nn.Linear(1, 1)
+    ema = ModelEMA(model, (.999,))
+    for tensor in ema.tracks['ema_0p999']['model'].values():
+        tensor.add_(1)
+    raw = copy.deepcopy(model.state_dict())
+    def fail(*args, **kwargs):
+        for key, value in model.state_dict().items():
+            torch.testing.assert_close(value, ema.tracks['ema_0p999']['model'][key])
+        raise RuntimeError('inference cancelled')
+    monkeypatch.setattr(tiled, '_multi_gpu_worker_main', fail)
+    args = (Adapter(), None, None, None, None, None, None, None, False, 1, False)
+    with pytest.raises(RuntimeError, match='inference cancelled'):
+        serve_resident(None, model, 0, args, ema=ema, ema_name='ema_0p999')
+    for key, value in model.state_dict().items():
+        torch.testing.assert_close(value, raw[key], rtol=0, atol=0)
 
 
 def test_resident_oom_reduces_batch_not_tile_geometry():
@@ -139,16 +168,21 @@ def test_training_trace_calls_shared_functions_without_python_subprocess(monkeyp
     checkpoint.write_bytes(b"snapshot")
     template = tmp_path / "template.json"
     template.write_text("{}")
+    (tmp_path / "manifest.json").write_text("{}")
+    native = tmp_path / "native"
+    native.write_bytes(b"native")
     job = {"inherited_manager_grant": True, "gpu_grant": {"GPU-resident": 100},
            "devices": "0", "checkpoint": str(checkpoint),
            "checkpoint_sha256": module.sha256_file(checkpoint),
            "template": str(template), "output_root": str(tmp_path),
-           "split_root": str(tmp_path), "native_binary": "native", "samples_seen": 128}
+           "split_root": str(tmp_path), "native_binary": str(native), "samples_seen": 128}
     path = tmp_path / "job.json"
     path.write_text(json.dumps(job))
     factory, cancel = object(), threading.Event()
-    monkeypatch.setattr(module, "build_workload", lambda *a, **k: {"evaluation": {}})
-    monkeypatch.setattr(module, "write_benchmark_identity", lambda *a: {})
+    def build(*args, **kwargs):
+        assert kwargs['presence_cutoff'] == .25
+        return {"evaluation": {}}
+    monkeypatch.setattr(module, "build_workload", build)
     monkeypatch.setattr(module, "prepare", lambda workload: calls.append("prepare"))
     def run(workload, **kwargs):
         assert kwargs["worker_factory"] is factory
@@ -162,16 +196,19 @@ def test_training_trace_calls_shared_functions_without_python_subprocess(monkeyp
     monkeypatch.setattr(module, "write_completion", lambda *a, **k: calls.append("complete"))
     monkeypatch.setattr(module.subprocess, "Popen", lambda *a, **k: pytest.fail("spawned Python evaluator"))
     result = module.run_job(path, worker_factory=factory, cancel_event=cancel)
+    identity = json.loads((tmp_path / "benchmark_identity.json").read_text())
+    assert identity["runner_sha256"] == module.sha256_file(Path(module.__file__))
     assert result["restarts_combined"] == 3
     assert calls == ["prepare", "run", "cleanup", "complete"]
 
 
 @pytest.mark.skipif(not os.environ.get("FIBER_COOPERATIVE_TEST_GPUS"), reason="manager GPU grant required")
-def test_cuda_resident_preserves_training_state():
+@pytest.mark.parametrize('ema_name', [None, 'ema_0p999'])
+def test_cuda_resident_preserves_training_state(ema_name):
     # The approved test launcher supplies UUIDs only inside its manager lease.
     os.environ["CUDA_VISIBLE_DEVICES"] = os.environ["FIBER_COOPERATIVE_TEST_GPUS"]
     torch.cuda.set_per_process_memory_fraction(0.10, 0)
-    _exercise(torch.device("cuda:0"))
+    _exercise(torch.device("cuda:0"), ema_name)
 
 
 def test_resident_cancel_does_not_consume_more_work():

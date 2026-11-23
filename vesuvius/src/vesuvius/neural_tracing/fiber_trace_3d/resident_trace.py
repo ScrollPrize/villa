@@ -1,6 +1,7 @@
 """Shared-slot inference serviced by the existing training GPU replicas."""
 import queue
 import threading
+from contextlib import nullcontext
 
 
 class _RemoteWork:
@@ -27,16 +28,18 @@ class _RemoteEvents:
         self.connection.send(("event", event))
 
 
-def serve_resident(connection, model, rank, arguments):
-    """Run the shared tiled kernel on a raw module, preserving training state."""
+def serve_resident(connection, model, rank, arguments, *, ema=None, ema_name=None):
+    """Run the tiled kernel with the selected weights, restoring training state."""
     import torch
     from lasagna.tiled_predict3d import _multi_gpu_worker_main
-    # No model loading, optimizer mutation, DDP wrapper or training RNG use.
+    if ema_name is not None and (ema is None or ema_name not in ema.tracks):
+        raise ValueError(f"resident trace requires configured EMA track: {ema_name}")
     cuda = next(model.parameters()).device
     modes = [(part, part.training) for part in model.modules()]
     flags = (torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32)
     try:
-        with torch.random.fork_rng(devices=[cuda.index] if cuda.type == "cuda" else []):
+        with (ema.apply(model, ema_name) if ema_name is not None else nullcontext()), \
+                torch.random.fork_rng(devices=[cuda.index] if cuda.type == "cuda" else []):
             adapter, state, tile, ramp, scales, stride, inputs, results, profile, batch, report = arguments
             allow_tf32 = adapter.config.get("inference", {}).get("allow_tf32")
             if allow_tf32 is not None:

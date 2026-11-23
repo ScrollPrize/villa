@@ -27,5 +27,5 @@ FiberletOnDemandConfig makeCanonicalFiberletOnDemandConfig(
     const FiberletPathConfig& paths,
     FiberStoredPredictionBatchSampler predictionSampler,
     std::shared_ptr<const vc::lasagna::NormalSampler> normalSampler,
-    const FiberletChunkCacheOptions& cacheOptions);
+    std::shared_ptr<vcr::MemoryCache> memoryCache);
 }

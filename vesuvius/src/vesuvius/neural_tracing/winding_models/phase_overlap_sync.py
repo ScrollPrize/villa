@@ -24,6 +24,7 @@ from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import numpy as np
+from vc_reader.resident import sample_array
 
 
 def _phase_sync_taper(value, low, high, width):
@@ -36,38 +37,6 @@ def _phase_sync_taper(value, low, high, width):
     return math.sin(fraction * (0.5 * math.pi)) ** 2
 
 
-def _sample_phase_trilinear(phase, ijk):
-    """Sample native ``[column_a, column_b, ray]`` phase at fractional ijk.
-
-    ``ijk`` is expressed in full-resolution slab samples; transverse native
-    columns are separated by ``column_stride`` and are converted by the
-    caller.  Returns NaN when any interpolation corner is outside the field.
-    """
-    coordinates = np.asarray(ijk, dtype=np.float64)
-    if coordinates.shape != (3,) or not np.isfinite(coordinates).all():
-        return float("nan")
-    lower = np.floor(coordinates).astype(np.int64)
-    upper = lower + 1
-    shape = np.asarray(phase.shape, dtype=np.int64)
-    if (lower < 0).any() or (upper >= shape).any():
-        return float("nan")
-    fraction = coordinates - lower
-    result = 0.0
-    for da in (0, 1):
-        wa = fraction[0] if da else 1.0 - fraction[0]
-        for db in (0, 1):
-            wb = fraction[1] if db else 1.0 - fraction[1]
-            for dk in (0, 1):
-                wk = fraction[2] if dk else 1.0 - fraction[2]
-                result += (
-                    wa * wb * wk
-                    * float(phase[
-                        lower[0] + da, lower[1] + db, lower[2] + dk
-                    ])
-                )
-    return result
-
-
 def _sample_cached_phase(phase, valid, frame, point_xyz, column_stride):
     """Return ``(phase, density, full-resolution ijk)`` at a world point."""
     slab = np.asarray(frame.to_slab(
@@ -78,7 +47,7 @@ def _sample_cached_phase(phase, valid, frame, point_xyz, column_stride):
         slab[1] / float(column_stride),
         slab[2],
     ], dtype=np.float64)
-    value = _sample_phase_trilinear(phase, native)
+    value = sample_array(phase, native)
     if not math.isfinite(value):
         return float("nan"), float("nan"), slab
 
@@ -92,8 +61,8 @@ def _sample_cached_phase(phase, valid, frame, point_xyz, column_stride):
     after = native.copy()
     before[2] -= 1.0
     after[2] += 1.0
-    previous = _sample_phase_trilinear(phase, before)
-    following = _sample_phase_trilinear(phase, after)
+    previous = sample_array(phase, before)
+    following = sample_array(phase, after)
     density = abs(following - previous) / (2.0 * float(frame.spacing))
     return value, density, slab
 
@@ -211,7 +180,7 @@ def _write_probe_block(task):
         own_phase, own_density, _ = _sample_cached_phase(
             phase, valid, frame, seeds[node], column_stride)
         reference[node - start] = own_phase
-        anchor_value = _sample_phase_trilinear(phase, np.array([
+        anchor_value = sample_array(phase, np.array([
             decoded_center / float(column_stride),
             decoded_center / float(column_stride),
             float(decoded_ray_anchor),

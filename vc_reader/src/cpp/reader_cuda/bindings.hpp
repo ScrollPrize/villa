@@ -1,5 +1,6 @@
 #pragma once
 #include "reader.hpp"
+#include "../cuda_available.hpp"
 #include "../cuda_stream.hpp"
 #include <nanobind/stl/array.h>
 #include <nanobind/stl/optional.h>
@@ -29,12 +30,15 @@ inline nb::object outputs(Result result, int device) {
 inline void bind(nb::module_& m) {
     using Host=nb::ndarray<nb::ro,nb::c_contig,nb::device::cpu>;
     using Device=nb::ndarray<nb::array_api,nb::c_contig,nb::device::cuda>;
-    m.def("reader_cuda_available",[] { int n=0; return cudaGetDeviceCount(&n)==cudaSuccess && n>0; });
+    m.def("reader_cuda_available",&vcr::cuda::available);
     nb::class_<Owned>(m,"CudaStorage")
         .def("array",[](nb::handle self) { return nb::cast<const Owned&>(self).array(self); })
         .def("export",[](Owned& o) { o.storage->exported=true; });
-    m.def("_set_stream",[](std::uintptr_t handle) { device::current_stream()=handle ? device::stream_handle(handle) : nullptr; });
+    m.def("_set_stream",[](std::uintptr_t handle) { device::current_stream()=handle ? device::stream_handle(handle) : cudaStreamPerThread; });
     m.def("_get_stream",[] { return reinterpret_cast<std::uintptr_t>(device::current_stream()); });
+    m.def("_dlpack_stream",[] { return device::dlpack_handle(); });
+    m.def("_set_pool_release_threshold",[](int id,std::uint64_t bytes) { device::set_pool_release_threshold(id,bytes); });
+    m.def("_pool_release_threshold",[](int id) { device::prepare_pool(id); return device::pool_release_threshold(id); });
     m.def("_cuda_empty",[](std::size_t count,const std::string& kind,std::size_t item,int id) {
         if (count>SIZE_MAX/8 || (kind!="f" && kind!="i" && kind!="u" && kind!="b") ||
             (item!=1 && item!=2 && item!=4 && item!=8) || (kind=="b" && item!=1) || (kind=="f" && item<2))
@@ -101,8 +105,18 @@ inline void bind(nb::module_& m) {
         for (std::size_t i=0;i<grids.size();++i) { auto& g=grids[i]; std::copy_n(shapes[i].begin(),3,g.shape); std::copy_n(bases[i].begin(),3,g.base); std::copy_n(origins[i].begin(),3,g.origin); std::copy_n(axes[i].begin(),9,g.axes); }
         return grids;
     };
+    nb::class_<Pool>(m,"CudaPool","A device brick cache that several CUDA readers share (one budget, one LRU order).")
+        .def("__init__",[](Pool* self,std::size_t budget,int device) { new (self) Pool(budget,device); },"budget"_a,"device"_a=0)
+        .def_prop_ro("budget",&Pool::budget)
+        .def_prop_ro("device",&Pool::device)
+        .def_prop_ro("slot_bytes",&Pool::slot_bytes)
+        .def_prop_ro("resident_bytes",&Pool::resident_bytes);
     nb::class_<Reader>(m,"CudaReader")
-        .def(nb::init<Array&,std::size_t,int>(),nb::keep_alive<1,2>())
+        .def(nb::init<Array&,std::size_t,int,std::optional<std::int64_t>>(),
+             "array"_a,"budget"_a,"device"_a,"channel"_a=nb::none(),nb::keep_alive<1,2>())
+        .def(nb::init<Array&,std::shared_ptr<Pool>,std::optional<std::int64_t>>(),
+             "array"_a,"pool"_a,"channel"_a=nb::none(),nb::keep_alive<1,2>())
+        .def_prop_ro("channel",&Reader::channel)
         .def("clear",&Reader::clear,nb::call_guard<nb::gil_scoped_release>())
         .def("stats",&Reader::stats,nb::call_guard<nb::gil_scoped_release>())
         .def("grids",[](Reader& r,const std::vector<std::array<std::int64_t,3>>& shapes,

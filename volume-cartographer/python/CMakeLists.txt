@@ -36,18 +36,6 @@ configure_file(vc/fiber_evaluation.py "${CMAKE_CURRENT_BINARY_DIR}/vc/fiber_eval
 install(FILES vc/fiber_evaluation.py DESTINATION vc)
 configure_file(vc/fiber_evaluation_vis.py "${CMAKE_CURRENT_BINARY_DIR}/vc/fiber_evaluation_vis.py" COPYONLY)
 install(FILES vc/fiber_evaluation_vis.py DESTINATION vc)
-configure_file(vc/compression/__init__.py
-    "${CMAKE_CURRENT_BINARY_DIR}/vc/compression/__init__.py"
-    COPYONLY
-)
-configure_file(vc/compression/vcz1_numcodecs.py
-    "${CMAKE_CURRENT_BINARY_DIR}/vc/compression/vcz1_numcodecs.py"
-    COPYONLY
-)
-configure_file(vc/compression/vcz1.py
-    "${CMAKE_CURRENT_BINARY_DIR}/vc/compression/vcz1.py"
-    COPYONLY
-)
 
 nanobind_add_module(vc_lasagna_amgx
     NOMINSIZE
@@ -61,7 +49,7 @@ set_target_properties(vc_lasagna_amgx PROPERTIES
 
 target_link_libraries(vc_lasagna_amgx PRIVATE vc_lasagna)
 
-set_target_properties(vc_core vc_lasagna utils utils_c3d_codec c3d utils_volcomp_codec volcomp PROPERTIES
+set_target_properties(vc_core vc_lasagna PROPERTIES
     INSTALL_RPATH "${VC_PY_RPATH_SELF}"
 )
 
@@ -77,7 +65,7 @@ set_target_properties(vc_volume PROPERTIES
     # site-packages root one level up, so search both.
     INSTALL_RPATH "${VC_PY_RPATH_SELF_AND_PARENT}"
 )
-target_link_libraries(vc_volume PRIVATE vc_core vc_lasagna)
+target_link_libraries(vc_volume PRIVATE vc_core vc_lasagna vc_reader::transforms)
 target_compile_features(vc_volume PRIVATE cxx_std_23)
 
 nanobind_add_module(vc_grid_raycast
@@ -113,7 +101,15 @@ install(TARGETS vc_lasagna_amgx
     RUNTIME DESTINATION .
 )
 
-install(TARGETS vc_core vc_lasagna vc_fiber_tracer utils utils_c3d_codec c3d utils_volcomp_codec volcomp
+# The modules link vc_reader's shared native library, found through $ORIGIN.
+if(TARGET vc_reader_native)
+    get_target_property(_vc_reader_native_type vc_reader_native TYPE)
+    if(_vc_reader_native_type STREQUAL "SHARED_LIBRARY")
+        install(TARGETS vc_reader_native LIBRARY DESTINATION . RUNTIME DESTINATION .)
+    endif()
+endif()
+
+install(TARGETS vc_core vc_lasagna vc_fiber_tracer
     LIBRARY DESTINATION .
     RUNTIME DESTINATION .
     ARCHIVE DESTINATION .
@@ -129,9 +125,3 @@ if(TARGET vc_fiberlets)
     install(TARGETS vc_fiberlets RUNTIME DESTINATION vc/bin)
 endif()
 configure_file(vc/fiberlets_cli.py "${CMAKE_CURRENT_BINARY_DIR}/vc/fiberlets_cli.py" COPYONLY)
-install(FILES vc/compression/__init__.py DESTINATION vc/compression)
-install(FILES
-    vc/compression/vcz1.py
-    vc/compression/vcz1_numcodecs.py
-    DESTINATION vc/compression
-)

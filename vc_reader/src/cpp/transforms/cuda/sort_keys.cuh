@@ -76,6 +76,6 @@ template<class K> void sort_keys(Buffer<K>& keys, std::size_t n) {
     SortJob<K> job{keys.ptr,sorted.ptr,n};
     if (BatchQueue::current) BatchQueue::current->append(job);
     else SortJob<K>::run({&job});
-    std::swap(keys.ptr,sorted.ptr);
+    keys.swap_storage(sorted);
 }
 }

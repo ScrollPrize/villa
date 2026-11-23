@@ -7,85 +7,56 @@ target_link_libraries(vc_fiber_view PUBLIC vc_object_store::vc_geometry)
 set_target_properties(vc_fiber_view PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 add_library(vc_core
+        src/SheetSeed.cpp
+        src/SheetWalk.cpp
+        src/SheetFront.cpp
+        src/SheetNormalField.cpp
         src/PolylineObj.cpp
-        src/AtomicFile.cpp
+        src/OutputDirectory.cpp
         src/TexturedMesh.cpp
-        src/SurfaceTexture.cpp
         src/GridStore.cpp
         src/NormalGridVolume.cpp
         src/normalgridtools.cpp
         src/Volume.cpp
         src/VolumePkg.cpp
         src/ProjectDocument.cpp
-        src/SurfacePatchIndex.cpp
-        src/PointIndex.cpp
+        src/ProjectCreation.cpp
+        src/SurfaceQuerySet.cpp
         src/Logging.cpp
         src/CrashHandler.cpp
-        src/MemMap.cpp
+        src/AnonymousPages.cpp
         src/UnixSocket.cpp
-        src/VoxelSizeMetadata.cpp
         src/SparseChunkSpool.cpp
-        src/Slicing.cpp
-        src/Compositing.cpp
         src/PlaneSurface.cpp
         src/Surface.cpp
         src/QuadSurface.cpp
+        src/ImageMat.cpp
         src/QuadSurfaceStore.cpp
         src/StoreSurfaces.cpp
         src/SurfaceMeshing.cpp
-        src/Tiff.cpp
-        src/Zarr.cpp
-        src/VcDataset.cpp
         src/LoadJson.cpp
         src/RemoteUrl.cpp
-        src/RemoteFileCache.cpp
-        src/RemoteMetadataCache.cpp
         src/RemoteCacheSettings.cpp
-        src/HttpFetch.cpp
-        src/S3AuthFallback.cpp
+        src/CudaSampling.cpp
         src/Geometry.cpp
         src/PointCollections.cpp
         src/StoredCollection.cpp
-        src/Thinning.cpp
         src/Umbilicus.cpp
-        src/render/ChunkCache.cpp
-        src/render/ChunkRequestScheduler.cpp
-        src/render/DecodedChunkCacheBudget.cpp
-        src/render/PersistentZarrCacheBudget.cpp
-        src/render/ChunkedPlaneSampler.cpp
-        src/render/SamplingWaitProfile.cpp
-        src/render/PinnedChunkRegion.cpp
-        src/render/SurfaceCache.cpp
-        src/render/Colormaps.cpp
-        src/render/PostProcess.cpp
-        src/render/ZarrChunkFetcher.cpp
-    src/render/ChunkChannelHints.cpp
-    src/render/ChunkLoadQueue.cpp
         ${CMAKE_CURRENT_BINARY_DIR}/Version.cpp
 )
 
 target_link_libraries(vc_core
-    PUBLIC vc_object_store::vc_objects vc_object_store::vc_object_formats vc_reader::catalog
+    PUBLIC vc_object_store::vc_resident_geometry vc_object_store::vc_objects vc_object_store::vc_object_formats vc_reader::catalog vc_reader::reader
+        vc_reader::transforms
         PUBLIC
         opencv_core
         opencv_imgproc
-        opencv_imgcodecs
         ${VC_OPENCV_CALIB_TARGETS}
         nlohmann_json::nlohmann_json
         OpenMP::OpenMP_CXX
-        TIFF::TIFF
-        CURL::libcurl
 )
 
-# utils header-only library + vendored c3d and volcomp codecs.
-target_link_libraries(vc_core PUBLIC
-    $<BUILD_INTERFACE:utils>
-    $<BUILD_INTERFACE:utils_c3d_codec>
-    vc_delta3d::vc_delta3d
-    $<BUILD_INTERFACE:utils_volcomp_codec>
-)
 target_link_libraries(vc_core PRIVATE
-    Blosc::blosc
     ${VC_LIBBACKTRACE}
 )
 
@@ -134,7 +105,6 @@ if(VC_USE_PCH)
         "$<$<COMPILE_LANGUAGE:CXX>:<string_view>>"
         "$<$<COMPILE_LANGUAGE:CXX>:<opencv2/core.hpp>>"
         "$<$<COMPILE_LANGUAGE:CXX>:<opencv2/imgproc.hpp>>"
-        "$<$<COMPILE_LANGUAGE:CXX>:<opencv2/imgcodecs.hpp>>"
         "$<$<COMPILE_LANGUAGE:CXX>:<nlohmann/json.hpp>>"
         CACHE INTERNAL "PCH header list shared by vc_* and downstream targets")
 
@@ -147,10 +117,8 @@ if(VC_USE_PCH)
     target_link_libraries(vc_common_pch PRIVATE
         opencv_core
         opencv_imgproc
-        opencv_imgcodecs
         nlohmann_json::nlohmann_json
-        OpenMP::OpenMP_CXX
-        TIFF::TIFF)
+        OpenMP::OpenMP_CXX)
     target_precompile_headers(vc_common_pch PRIVATE ${VC_PCH_HEADERS})
     target_precompile_headers(vc_core REUSE_FROM vc_common_pch)
 endif()
@@ -160,8 +128,8 @@ target_link_libraries(vc_inpaint PUBLIC vc_core PRIVATE Ceres::ceres)
 
 add_library(vc_lasagna
     src/lasagna/ChannelSampler.cpp
+    src/lasagna/Catalog.cpp
     src/lasagna/Dataset.cpp
-    src/lasagna/PredictionPooling.cpp
     src/lasagna/LaplaceAmgx.cpp
     src/lasagna/LaplaceRank.cpp
     src/lasagna/LasagnaNormalSampler.cpp
@@ -228,7 +196,7 @@ add_library(vc_fiber_tracer
     src/fiber_tracer/FiberSideStripIntersections.cpp
 )
 target_link_libraries(vc_fiber_tracer PUBLIC vc_core vc_lasagna PRIVATE Eigen3::Eigen Ceres::ceres)
-target_link_libraries(vc_fiber_tracer PRIVATE ${CMAKE_DL_LIBS} zstd::libzstd)
+target_link_libraries(vc_fiber_tracer PRIVATE ${CMAKE_DL_LIBS})
 
 # Optional backend; CPU builds do not need a CUDA toolkit.
 option(VC_BUILD_FIBER_CHUNK_CUDA "Build resident CUDA chunk tracing backend" OFF)
@@ -239,8 +207,8 @@ if(VC_BUILD_FIBER_CHUNK_CUDA)
     add_executable(benchmark_fiber_chunk_cuda src/fiber_tracer/FiberChunkGpu.cu)
     foreach(target vc_fiber_chunk_cuda benchmark_fiber_chunk_cuda)
         target_include_directories(${target} PRIVATE include)
-        target_link_libraries(${target} PRIVATE nlohmann_json::nlohmann_json)
-        set_target_properties(${target} PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        target_link_libraries(${target} PRIVATE nlohmann_json::nlohmann_json vc_reader::headers)
+        set_target_properties(${target} PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
         target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--expt-relaxed-constexpr>)
     endforeach()
 endif()
@@ -250,15 +218,14 @@ endif()
 
 add_library(vc_tracer
     src/GrowPatch.cpp
+    src/SheetGrowth.cpp
     src/GrowSurface.cpp
     src/SurfTrackerData.cpp
     src/NeuralTracerConnection.cpp
-    src/ChunkedTensor.cpp
     src/growth_strategies/CandidateOrdering.cpp
     src/growth_strategies/GrowthConfig.cpp
 )
 target_link_libraries(vc_tracer PUBLIC vc_core Ceres::ceres)
-target_include_directories(vc_tracer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../libs/edt)
 
 if(VC_USE_PCH)
     foreach(_lib vc_inpaint vc_lasagna vc_fiber_tracer vc_tracer)

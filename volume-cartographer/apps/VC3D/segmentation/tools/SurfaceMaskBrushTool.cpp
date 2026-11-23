@@ -486,7 +486,7 @@ void SurfaceMaskBrushTool::invalidateViewers(bool surfaceChanged)
         manager->forEachBaseViewer([surfaceChanged](VolumeViewerBase* viewer) {
             if (viewer) {
                 if (surfaceChanged && viewer->surfName() == "segmentation") {
-                    viewer->renderVisible(true);
+                    viewer->renderVisible();
                 }
                 viewer->requestRender();
             }

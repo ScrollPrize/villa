@@ -1,6 +1,7 @@
 // Parsing of published catalog records into typed fields, and the catalog's
 // own rules over them: surfaces of a segment, ink images, timestamps, origins.
 #include "vc_reader/catalog.hpp"
+#include "vc_reader/registrations.hpp"
 #include <cmath>
 #include <iostream>
 #include <stdexcept>
@@ -51,7 +52,9 @@ const char* kSample = R"({
               {"type": "s3", "url": "s3://vesuvius-challenge-open-data/", "usage": "public-read"}]}]},
             {"type": "surface-prediction-zarr", "parameters": {"level": 2}},
             {"type": "normal-grids", "parameters": {"level": 2.5}},
-            {"type": "lasagna", "origins": [{"path": "PHerc0139/representations/predictions/fibers/f1/", "access_roots": [
+            {"type": "lasagna", "parameters": {"model_id": "model-7"},
+              "creation_info": {"lasagna_version": 2, "source_to_base": 1.0},
+              "origins": [{"path": "PHerc0139/representations/predictions/fibers/f1/", "access_roots": [
               {"type": "s3", "url": "s3://vesuvius-challenge-open-data/", "usage": "public-read"}]}]},
             {"type": "ink_detection_3d_zarr"},
             {"type": "future-pred-zarr"}
@@ -144,6 +147,12 @@ int main()
         require(artifacts[1].levelParameterPresent && artifacts[1].sourceCoordinateLevel == 2, "integer level");
         require(artifacts[2].levelParameterPresent && !artifacts[2].sourceCoordinateLevel, "fractional level rejected");
         require(!artifacts[3].levelParameterPresent, "absent level");
+        require(artifacts[3].modelId == "model-7" && artifacts[3].lasagnaVersion == 2 &&
+                    artifacts[3].sourceToBase == 1.0 && !artifacts[1].lasagnaVersionPresent,
+                "Lasagna model and creation info");
+        require(artifacts[3].url() ==
+                    "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHerc0139/representations/predictions/fibers/f1",
+                "directory artifact URL has no trailing slash");
         const auto representations = derivedRepresentations(*sample);
         require(representations.size() == 5 && representations[0].kind == OpenDataRepresentationKind::Prediction &&
                     representations[1].kind == OpenDataRepresentationKind::NormalGrids &&
@@ -171,6 +180,37 @@ int main()
         require(atL0 && atL0->level == 0, "published source path");
         require(!atL0->sameGrid(*atL2) && atL2->sameGrid(*manifest.volumeAt(zarrUrl, 2)), "a level is its own grid");
         require(!manifest.volumeAt("https://example.test/other.zarr"), "unknown volume");
+
+        require(sampleNameKey("PHerc. Paris 4") == "phercparis4" && sampleNameKey("PHerc 0332") == "pherc332" &&
+                    sampleNameKey("x100") == "x100" && sampleNameKey("000") == "0" && sampleNameKey("Scroll 1") == "scroll1",
+                "name keys");
+        require(communityAliases("PHercParis4") == std::vector<std::string>{"Scroll 1"} && communityAliases("x").empty(), "aliases");
+        require(manifest.samplesNamed("pherc 139") == std::vector<std::string>{"PHerc0139"}, "a padded id");
+        require(manifest.samplesNamed("0139") == std::vector<std::string>{"PHerc0139"}, "without the prefix");
+        require(manifest.samplesNamed("nothing").empty(), "no such sample");
+        require(Affine::blockReduced(4)(0, 3) == 1.5 && Affine::blockReduced(4)(1, 1) == 4, "block reduced");
+        OpenDataArtifact gridded;
+        gridded.type = "surface-prediction-zarr";
+        gridded.sourceCoordinateLevel = 2;
+        require(gridded.gridLevel() == 2, "prediction grid level");
+        gridded.type = "ome-zarr";
+        require(gridded.gridLevel() == 0, "volume grid level");
+        gridded.type = "lasagna";
+        require(!gridded.gridLevel(), "no grid level");
+
+        const auto metadata = manifest.volumeMetadataAt("s3://vesuvius-challenge-open-data/PHerc0139/volumes/vol1.zarr");
+        require(metadata && metadata->sampleId == "PHerc0139" && metadata->volumeId == "vol1" &&
+                    metadata->scanId == "scan-a" && metadata->voxelSizeUm == 7.91 && metadata->energyKeV == 88.0 &&
+                    metadata->detectorDistanceMm == 12.5 && metadata->dataFormat == "uint8" &&
+                    metadata->raw.value("id", "") == "vol1",
+                "volume metadata at a location");
+        require(!manifest.volumeMetadataAt("https://example.test/other.zarr"), "no metadata for an unknown volume");
+        const auto& sample0 = *manifest.findSample("PHerc0139");
+        const auto direct = resolveVolumeTransform(sample0, "vol1", "vol2");
+        require(direct && direct->derivationPath == "vol1-vol2" && direct->forward(0, 3) == 10, "direct volume transform");
+        const auto inverse = resolveVolumeTransform(sample0, "vol2", "vol1");
+        require(inverse && inverse->derivationPath.empty() && inverse->forward(0, 0) == 2, "inverse volume transform");
+        require(!resolveVolumeTransform(sample0, "vol1", "nowhere"), "no route");
         // The transform and the supersession only: a pyramid level is a scale of its volume.
         require(registrations.registrations().size() == 2, "no level registrations");
 
@@ -270,6 +310,22 @@ int main()
                     model.task == "ink-detection" && model.architecture == "timesformer",
                 "model");
 
+        // Artifact queries.
+        const auto artifactsParsed = parseCatalogArtifacts(nlohmann::json::array({
+            {{"type", artifact_type::inkLabels}, {"parameters", {{"target_volume", "v"}}},
+             {"origins", {{{"path", "a"}, {"access_roots", {{{"type", "s3"}, {"url", "s3://b/"}, {"usage", "public"}},
+                                                             {{"type", "s3"}, {"url", "s3://c/"}, {"usage", "archive"}},
+                                                             {{"type", "s3"}, {"url", "s3://d/"}, {"usage", "public"}}}}}}}},
+            {{"type", artifact_type::layersZarr}, {"parameters", {{"target_volume", "w"}}}, {"origins", nlohmann::json::array()}}}));
+        require(artifactsParsed.front().usage() == std::vector<std::string>{"archive", "public"}, "distinct sorted usage");
+        OpenDataSegment withArtifacts;
+        withArtifacts.artifacts = artifactsParsed;
+        require(withArtifacts.artifactsOf({artifact_type::inkLabels, artifact_type::layersZarr}).size() == 2, "artifacts of types");
+        require(withArtifacts.artifactsOf({artifact_type::layersZarr}, "v").empty(), "another target volume");
+        require(withArtifacts.artifactsOf({artifact_type::layersZarr}, "w").size() == 1, "its target volume");
+        require(openDataHttpsUrl("/a/local/path") == std::nullopt, "no public form of a local path");
+        require(openDataHttpsUrl("https://example.com/a") == std::optional<std::string>("https://example.com/a"), "https stays");
+
         // Only published keys are read.
         const auto aliases = parseOpenDataManifest(R"({"metadata": {"samples": {"s": {}}}})");
         require(aliases.samples.empty(), "no metadata wrapper");
@@ -278,6 +334,12 @@ int main()
         require(camel.samples.front().volumes.front().scanId.empty() &&
                     !camel.samples.front().volumes.front().pixelSizeUm,
                 "camelCase keys are not read");
+
+        // Absent, null, or anything but a boolean is unset, never a default.
+        const auto unset = parseOpenDataManifest(
+            R"({"samples": {"s": {"volumes": {"v": {"properties": {"left_handed_coordinates": null, "z_direction_is_top_to_bottom": "true"}}}}}})");
+        const auto& orientation = unset.samples.front().volumes.front().orientation;
+        require(!orientation.zTopToBottom && !orientation.leftHandedCoordinates, "non-boolean orientation is unset");
     } catch (const std::exception& e) {
         std::cerr << "FAILED: " << e.what() << "\n";
         return 1;

@@ -35,10 +35,9 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
-import tifffile
-import zarr
+from vc_reader import images
 from scipy import ndimage
-from numcodecs import Blosc
+from vc_reader.reader import ZarrWriteGroup, ZarrWriter, create_group
 from tqdm import tqdm
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -128,11 +127,11 @@ def _process_single_sample(
         return None
 
     # Read shape from image
-    sample_data = tifffile.imread(str(img_path))
+    sample_data = images.read(str(img_path))
     shape = sample_data.shape
 
     # Read label and compute validation metrics
-    label_data = tifffile.imread(str(label_path))
+    label_data = images.read(str(label_path))
     non_zero_count = int(np.count_nonzero(label_data))
     total_voxels = label_data.size
     has_labels = non_zero_count > 0
@@ -329,10 +328,10 @@ def create_ome_zarr_group(
     output_path: Path,
     layout: LayoutConfig,
     dtype: str,
-    compressor,
+    codec: dict,
     num_levels: int,
     is_labels: bool = False,
-) -> zarr.Group:
+) -> ZarrWriteGroup:
     """
     Create an OME-Zarr group with multi-resolution pyramid structure.
 
@@ -344,8 +343,8 @@ def create_ome_zarr_group(
         Grid layout configuration
     dtype : str
         Data type for the arrays
-    compressor
-        Blosc compressor instance
+    codec
+        ``ZarrWriter.create`` codec arguments
     num_levels : int
         Number of resolution levels (1 = full res only)
     is_labels : bool
@@ -353,13 +352,13 @@ def create_ome_zarr_group(
 
     Returns
     -------
-    zarr.Group
+    ZarrWriteGroup
         Created zarr group with resolution levels
     """
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Create the root group
-    root = zarr.open_group(str(output_path), mode='w')
+    root = create_group(output_path, overwrite=True, auth=None)
 
     # Create each resolution level
     datasets = []
@@ -380,14 +379,13 @@ def create_ome_zarr_group(
             current_shape = level_shape
 
         # Create array for this level
-        root.create_dataset(
+        root.create_array(
             str(level),
             shape=level_shape,
             chunks=level_chunks,
             dtype=dtype,
             fill_value=0,
-            compressor=compressor,
-            write_empty_chunks=False,
+            **codec,
         )
 
         # Add to datasets list for metadata
@@ -547,8 +545,8 @@ def write_sample_to_ome_zarr(
     """
     try:
         # Read TIF files
-        image_data = tifffile.imread(str(sample.image_path))
-        label_data = tifffile.imread(str(sample.label_path))
+        image_data = images.read(str(sample.image_path))
+        label_data = images.read(str(sample.label_path))
 
         # Resize if needed
         if target_shape is not None and image_data.shape != target_shape:
@@ -556,9 +554,6 @@ def write_sample_to_ome_zarr(
             label_data = resize_volume(label_data, target_shape, is_labels=True)
 
         # Open zarr groups (each worker opens fresh handles for thread safety)
-        images_group = zarr.open_group(images_zarr_path, mode='r+')
-        labels_group = zarr.open_group(labels_zarr_path, mode='r+')
-
         # Calculate position at full resolution
         position = sample_to_position(sample.index, layout)
 
@@ -570,8 +565,8 @@ def write_sample_to_ome_zarr(
 
         for level in range(num_levels):
             # Get arrays for this level
-            img_arr = images_group[str(level)]
-            lbl_arr = labels_group[str(level)]
+            img_arr = ZarrWriter.open(f"{images_zarr_path}/{level}", skip_empty=True, auth=None)
+            lbl_arr = ZarrWriter.open(f"{labels_zarr_path}/{level}", skip_empty=True, auth=None)
 
             # Build slice for this level
             if layout.is_2d:
@@ -796,11 +791,10 @@ def main():
     images_zarr_path = args.output / 'images' / 'volume.zarr'
     labels_zarr_path = args.output / 'labels' / f'volume_{args.target_name}.zarr'
 
-    # Create compressor
-    compressor = Blosc(cname='zstd', clevel=args.compression_level, shuffle=Blosc.BITSHUFFLE)
+    codec = {'cname': 'zstd', 'level': args.compression_level, 'shuffle': 2}
 
     # Determine dtype from first sample
-    sample_data = tifffile.imread(str(samples[0].image_path))
+    sample_data = images.read(str(samples[0].image_path))
     dtype = str(sample_data.dtype)
     logger.info(f"Data type: {dtype}")
 
@@ -808,12 +802,12 @@ def main():
     logger.info(f"Creating OME-Zarr pyramids with {args.num_levels} levels...")
     logger.info("Images:")
     create_ome_zarr_group(
-        images_zarr_path, layout, dtype, compressor,
+        images_zarr_path, layout, dtype, codec,
         num_levels=args.num_levels, is_labels=False
     )
     logger.info("Labels:")
     create_ome_zarr_group(
-        labels_zarr_path, layout, dtype, compressor,
+        labels_zarr_path, layout, dtype, codec,
         num_levels=args.num_levels, is_labels=True
     )
 

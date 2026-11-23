@@ -19,8 +19,8 @@ from pathlib import Path
 
 import numpy as np
 from dtypes import numpy_float_hi
-import tifffile
-import zarr
+from vc_reader import images
+from vc_reader.reader import ZarrWriter
 from scipy.ndimage import distance_transform_edt, gaussian_filter, maximum_filter
 
 
@@ -113,7 +113,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # -- Read TIFF ----------------------------------------------------------
     print(f"{TAG} reading {input_path}", flush=True)
-    vol = tifffile.imread(str(input_path))
+    vol = images.read(str(input_path))
     if vol.ndim == 2:
         vol = vol[np.newaxis]
     assert vol.ndim == 3, f"expected 3D volume, got shape {vol.shape}"
@@ -222,7 +222,7 @@ def main(argv: list[str] | None = None) -> int:
     # Save center XY skeleton slice for debug
     zc = shape[0] // 2
     skel_dbg_path = output_path.parent / (output_path.stem + "_skel_dbg.tif")
-    tifffile.imwrite(str(skel_dbg_path), skel_vol[zc, :, :].astype(np.float32))
+    images.write_tiff(str(skel_dbg_path), skel_vol[zc, :, :].astype(np.float32))
     print(f"{TAG} skeleton debug slice: {skel_dbg_path} (z={zc})", flush=True)
 
     if args.no_skeleton:
@@ -424,10 +424,9 @@ def main(argv: list[str] | None = None) -> int:
     # -- Debug TIFF (center YZ plane) --------------------------------------
     dbg_path = output_path.parent / (output_path.stem + "_dbg.tif")
     dbg_names = sorted(dbg)
-    with tifffile.TiffWriter(str(dbg_path)) as tw:
+    with images.TiffWriter(dbg_path, dbg[dbg_names[0]].shape, np.float32, pages=len(dbg_names)) as writer:
         for name in dbg_names:
-            tw.write(dbg[name].astype(np.float32),
-                     extratags=[(285, 's', 0, name, False)])
+            writer.write_page(dbg[name].astype(np.float32), name=name)
     print(f"{TAG} debug TIFF: {dbg_path}  layers={dbg_names}", flush=True)
     del dbg
 
@@ -439,15 +438,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # -- Write zarr ---------------------------------------------------------
     cs = args.chunk_size
-    arr = zarr.open(
-        str(output_path),
-        mode="w",
-        shape=winding_ds.shape,
-        chunks=(cs, cs, cs),
-        dtype=np.float32,
-        fill_value=0.0,
-        zarr_format=2,
-    )
+    arr = ZarrWriter.create(output_path, shape=winding_ds.shape, chunks=(cs, cs, cs), dtype=np.float32, overwrite=True)
     arr[:] = winding_ds
     arr.attrs["scaledown"] = step
     arr.attrs["n_components"] = N

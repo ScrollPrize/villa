@@ -1700,10 +1700,10 @@
 - Line points and the control point for a patch must be transformed together in
   one vectorized lookup call through the fused map object, then split back into
   line and CP outputs.
-- Sparse line/control-point mapping must use direct bilinear gather against
-  `forward_map_xy`. Tiny `grid_sample` calls for sparse point lists are not the
-  intended implementation because their fixed launch overhead dominates the
-  small amount of point data.
+- Sparse line/control-point mapping uses native batched bilinear gather through
+  `vc_reader.torch.sample_array` against `forward_map_xy`, with queries in YX
+  index order. The shared sampler owns interpolation and its default policies;
+  the caller applies finite, bounds, and ragged-length masks.
 - When multiple patches from one loader sample need transformed line/control
   point coordinates, their `forward_map_xy` tensors and source point lists
   should be stacked and processed as a batched sparse lookup where shapes are

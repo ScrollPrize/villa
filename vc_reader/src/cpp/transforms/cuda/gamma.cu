@@ -6,15 +6,19 @@ template<class T> __device__ void invert_kernel(KernelIndex vcr_launch, View<T> 
 struct invert_kernel_launch {
     template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { invert_kernel(index,args...); }
 };
-template<class T> __device__ void gamma_kernel(KernelIndex vcr_launch, View<T> data, const Statistics* stats, double gamma) {
+template<class T> __device__ void gamma_kernel(KernelIndex vcr_launch, View<T> data, const Statistics* stats, double gamma, bool clip, double eps) {
     EACH_INDEX(data.size) {
         const T low = T(stats->low), range = T(stats->high)-low;
-        T value = pow((data.ptr[i]-low)/fmax(range,T(1e-7)),T(gamma))*range+low;
+        T unit = (data.ptr[i]-low)/fmax(range,T(eps));
+        if (clip) unit = fmin(fmax(unit,T(0)),T(1));
+        T value = pow(unit,T(gamma))*range+low;
         if constexpr (std::is_same_v<T,float>) {
             // Finite float32 endpoints can still have an overflowing difference.
             if (!isfinite(value) || !isfinite(range) || !isfinite(T(gamma))) {
                 const double wide_range = stats->high-stats->low;
-                value = T(pow((widen(data.ptr[i])-stats->low)/fmax(wide_range,1e-7),gamma)*wide_range+stats->low);
+                double wide = (widen(data.ptr[i])-stats->low)/fmax(wide_range,eps);
+                if (clip) wide = fmin(fmax(wide,0.),1.);
+                value = T(pow(wide,gamma)*wide_range+stats->low);
             }
         }
         data.ptr[i] = value;
@@ -35,13 +39,15 @@ struct finish_gamma_launch {
     template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { finish_gamma(index,args...); }
 };
 void apply_cuda(const Gamma& t, Sample& s, const Parameters& p, Session& session) {
-    apply_channels(t,s,p,session,[](const auto&, auto v, const Grid&, const ChannelPlan& c) {
+    apply_channels(t,s,p,session,[&](const auto& t, auto v, const Grid&, const ChannelPlan& c) {
         const bool invert = c.values[1], retain = c.values[2];
         if (invert) launch(blocks(v.size),256,0,vcr::device::stream(), invert_kernel_launch{}, v);
-        auto before = retain ? statistics(v,true) : bounds(v);
-        launch(blocks(v.size),256,0,vcr::device::stream(), gamma_kernel_launch{}, v,before.ptr,c.values[0]);
+        auto valid = t.masked ? valid_voxels(s, c, session) : nullptr;
+        const auto* flags = valid ? valid->ptr : nullptr;
+        auto before = retain || flags ? statistics(v,retain,nullptr,flags) : bounds(v);
+        launch(blocks(v.size),256,0,vcr::device::stream(), gamma_kernel_launch{}, v,before.ptr,c.values[0],t.clip,t.eps);
         if (retain) {
-            auto after = statistics(v,true);
+            auto after = statistics(v,true,nullptr,flags);
             launch(blocks(v.size),256,0,vcr::device::stream(), finish_gamma_launch{}, v,before.ptr,after.ptr,true,invert);
         } else if (invert) launch(blocks(v.size),256,0,vcr::device::stream(), invert_kernel_launch{}, v);
         check(cudaGetLastError());

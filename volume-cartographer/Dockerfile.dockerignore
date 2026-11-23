@@ -1,0 +1,13 @@
+**
+!volume-cartographer/
+!volume-cartographer/**
+!vc_reader/
+!vc_reader/**
+!vc_object_store/
+!vc_object_store/**
+**/build/
+**/build-*/
+**/.git
+**/.venv/
+**/dist/
+**/__pycache__/

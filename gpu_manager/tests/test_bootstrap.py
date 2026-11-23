@@ -89,3 +89,18 @@ def test_concurrent_starters_reuse_one_real_service(monkeypatch, tmp_path):
                 child.terminate()
         for child in children:
             child.wait(timeout=5)
+
+
+def test_fatal_startup_error_reaches_caller_without_polling_until_timeout(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    original = subprocess.Popen
+    def launch(command, **kwargs):
+        return original([sys.executable, "-c",
+                         "import sys; print('cannot verify journal ownership: pid=123', "
+                         "file=sys.stderr); sys.exit(42)"], **kwargs)
+    monkeypatch.setattr(subprocess, "Popen", launch)
+    import time
+    start = time.monotonic()
+    with pytest.raises(RuntimeError, match=r"startup failed \(exit=42\).*\n.*pid=123"):
+        bootstrap.ensure_manager(tmp_path / "service" / "m.sock", timeout=10)
+    assert time.monotonic() - start < 5

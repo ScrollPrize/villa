@@ -473,7 +473,14 @@ def test_cpu_backend_writes_the_track_format(monkeypatch, tmp_path):
             assert track.flags.c_contiguous and len(track) >= 10
         n_tracks += len(tracks)
     assert n_tracks > 50
-    assert pickle.dumps([]) in entries.values()
+    # Every slab of this volume crosses a sheet piece above the dust threshold, so none is empty. (An empty
+    # entry here used to mean pieces that passed prepare_cc_labels' dust filter but were dropped again by the
+    # skeletonizer, which got the threshold in full-resolution voxels.) A vy slab wholly inside the block's
+    # y range 196..230 is the exception: there the block joins the sheets into one component above
+    # max_area_threshold.
+    inside_block = {f'vy:{w}' for w in range(y0, ys.max(), 24)
+                    if 196 <= w and w + est.yx_chunk_thickness_v <= 230}
+    assert pickle.dumps([]) not in [v for key, v in entries.items() if key not in inside_block]
 
     # Resume: keys already present are not recomputed.
     with dbm.open(str(out), 'w') as database:
@@ -485,6 +492,30 @@ def test_cpu_backend_writes_the_track_format(monkeypatch, tmp_path):
         database[f'vx:{xs.min()}'] = pickle.dumps([])
     with pytest.raises(SystemExit, match='vx slabs off the 4-voxel grid'):
         est.run_cpu('synthetic', str(out))
+
+
+def test_cpu_slabs_thinner_than_downsample_factor_have_no_tracks(monkeypatch):
+    # z 0..18 (18 % z_chunk_stride_h == 2) clips the last ribbon, h:16, to 2 slices; z 16..18
+    # makes every vertical slab 2 slices deep. With a surface in those slices, such a slab has
+    # no tracks, rather than reaching prepare_cc_labels with nothing left after the max-pool crop.
+    assert est.downsample_factor == 4 and est.z_chunk_stride_h == 16
+    volume = np.zeros((18, 64, 64), np.uint8)
+    volume[16:18, 8:56, 20:24] = 1
+    monkeypatch.setattr(est, 'z_min', 0)
+    monkeypatch.setattr(est, 'z_max', 18)
+    database = {}
+    est.extract_horizontal(volume, database)
+    assert database == {'h:0': pickle.dumps([]), 'h:16': pickle.dumps([])}
+    database = {'h:16': pickle.dumps(['kept'])}
+    est.extract_horizontal(volume, database)
+    assert database['h:16'] == pickle.dumps(['kept'])
+
+    monkeypatch.setattr(est, 'z_min', 16)
+    min_yx, max_yx = est.find_yx_range(volume)
+    database = {}
+    est.extract_vertical(volume, database, axis='y', min_yx=min_yx, max_yx=max_yx)
+    est.extract_vertical(volume, database, axis='x', min_yx=min_yx, max_yx=max_yx)
+    assert database == {'vy:8': pickle.dumps([]), 'vx:20': pickle.dumps([])}
 
 
 # ------------------------------------------------------------------------------------------
@@ -562,3 +593,27 @@ def test_gpu_backend_matches_per_slab_brook(monkeypatch, tmp_path):
         database['h:16'] = pickle.dumps(['kept'])
     est.run_gpu(fallback, str(tmp_path / 'fallback.dbm'), gpus=(device,))
     assert _read_dbm(tmp_path / 'fallback.dbm') == {**expected, 'h:16': pickle.dumps(['kept'])}
+
+
+def test_component_kept_by_prepare_cc_labels_is_skeletonized(monkeypatch):
+    """A sheet fragment that passes prepare_cc_labels' dust filter, even exactly at the cutoff, must reach the tracks."""
+    pytest.importorskip('kimimaro')
+    pytest.importorskip('cc3d')
+    monkeypatch.setattr(est, 'dust_threshold', 2304)
+    monkeypatch.setattr(est, 'downsample_factor', 4)
+    monkeypatch.setattr(est, 'path_mode', 'interjoint')
+    volume = np.zeros((16, 64, 160), np.uint8)
+    volume[4:8, 16:20, 8:152] = 255  # a 4 x 4 x 144 strip: 2,304 full-res voxels, 36 downsampled
+    labels = est.prepare_cc_labels(volume > 0)
+    assert labels.max() == 1
+    tracks = est.get_skeleton_tracks(labels, (0, 0, 0))
+    assert len(tracks) == 1
+
+
+def test_one_voxel_wide_slab_is_skeletonized():
+    """A slab that pools to a line, e.g. a vertical slab over a 4-voxel z range, with a component at its end."""
+    pytest.importorskip('kimimaro')
+    labels = np.zeros((1, 1, 32), np.uint32)
+    labels[0, 0, 16:] = 1
+    tracks = est.get_skeleton_tracks(labels, (0, 0, 0))
+    assert [len(t) for t in tracks] == [16]

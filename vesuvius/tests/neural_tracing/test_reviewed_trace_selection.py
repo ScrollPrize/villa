@@ -11,6 +11,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.reviewed_trace_selection import (
     benchmark_identity,
     finalize_attempt,
     freeze_raw_checkpoint,
+    freeze_trace_checkpoint,
     reconcile_completed_attempts,
     select_attempt,
     sha256_file,
@@ -29,18 +30,18 @@ def _snapshot(path: Path, *, step: int, samples: int, value: float,
         "metric_name": "test/loss_total",
     }
     if ema:
-        payload.update(snapshot_kind="ema", ema_metadata={"decay": 0.99})
+        payload.update(snapshot_kind="ema", ema_metadata={"decay": 0.999})
     torch.save(payload, path)
 
 
 def _attempt(tmp_path: Path, name: str, *, step: int, restarts: int,
-             identity_salt: str = "same") -> Path:
+             identity_salt: str = "same", weights: str = 'raw') -> Path:
     output = tmp_path / name
     output.mkdir()
     source = tmp_path / f"source-{name}.pt"
-    _snapshot(source, step=step, samples=step * 128, value=float(step))
-    frozen = output / "evaluated_raw.pt"
-    digest = freeze_raw_checkpoint(source, frozen, step=step, samples_seen=step * 128)
+    _snapshot(source, step=step, samples=step * 128, value=float(step), ema=weights != 'raw')
+    frozen = output / f"evaluated_{weights}.pt"
+    digest = freeze_trace_checkpoint(source, frozen, step=step, samples_seen=step * 128, weights=weights)
     template = tmp_path / f"template-{identity_salt}.json"
     template.write_text(json.dumps({"salt": identity_salt}))
     split = tmp_path / f"split-{identity_salt}"
@@ -61,6 +62,8 @@ def _attempt(tmp_path: Path, name: str, *, step: int, restarts: int,
         "native_binary": str(native),
         "runner": str(runner),
     }
+    if weights != 'raw':
+        job['weights'] = weights
     workload = {
         "checkpoint": str(frozen),
         "checkpoint_sha256": digest,
@@ -114,6 +117,63 @@ def test_restart_selected_raw_checkpoint_strictly_improves_and_ties_hold(tmp_pat
     assert torch.load(snapshots / LAST_BEST_FILENAME, weights_only=True)['step'] == 13
     assert dense_best.read_bytes() == b"dense-best"
     assert ema_best.read_bytes() == b"ema-best"
+
+
+def test_restart_selection_saves_exact_evaluated_ema999_first_and_last(tmp_path):
+    snapshots = tmp_path / 'snapshots'
+    first = _attempt(tmp_path, 'first-ema', step=10, restarts=3, weights='ema_0p999')
+    selected = select_attempt(first, snapshots)
+    digest = sha256_file(first / 'evaluated_ema_0p999.pt')
+    assert selected['candidate_checkpoint_sha256'] == digest
+    tie = _attempt(tmp_path, 'later-ema', step=20, restarts=3, weights='ema_0p999')
+    finalize_attempt(tie, snapshots)
+    assert not (tie / 'evaluated_ema_0p999.pt').exists()
+    for name, step in ((BEST_FILENAME, 10), (LAST_BEST_FILENAME, 20)):
+        payload = torch.load(snapshots / name, weights_only=True)
+        assert payload['snapshot_kind'] == 'ema'
+        assert payload['ema_metadata']['decay'] == .999
+        assert payload['step'] == step and payload['metric'] == 3
+        assert payload['reviewed_trace_selection']['weights'] == 'ema_0p999'
+        torch.testing.assert_close(payload['model']['weight'], torch.tensor([float(step)]))
+
+
+def test_trace_freeze_rejects_wrong_ema_decay_and_stale_step(tmp_path):
+    source = tmp_path / 'ema.pt'
+    _snapshot(source, step=10, samples=1280, value=1., ema=True)
+    with pytest.raises(ValueError, match='step mismatch'):
+        freeze_trace_checkpoint(source, tmp_path / 'out.pt', step=11, samples_seen=1280, weights='ema_0p999')
+    payload = torch.load(source, weights_only=True)
+    payload['ema_metadata']['decay'] = .99
+    torch.save(payload, source)
+    with pytest.raises(ValueError, match='EMA999 weights'):
+        freeze_trace_checkpoint(source, tmp_path / 'out.pt', step=10, samples_seen=1280, weights='ema_0p999')
+
+
+def test_selection_does_not_mix_raw_and_ema_restart_scores(tmp_path):
+    snapshots = tmp_path / "snapshots"
+    select_attempt(_attempt(tmp_path, "raw", step=10, restarts=3), snapshots)
+    candidate = _attempt(tmp_path, "ema", step=20, restarts=0, weights="ema_0p999")
+    with pytest.raises(ValueError, match="benchmark identity changed"):
+        select_attempt(candidate, snapshots)
+    assert torch.load(snapshots / BEST_FILENAME, weights_only=True)["step"] == 10
+
+
+def test_callable_benchmark_identity_without_external_runner(tmp_path):
+    attempt = _attempt(tmp_path, "callable", step=10, restarts=3)
+    job = json.loads((attempt / "job.json").read_text())
+    workload = json.loads((attempt / "workload.json").read_text())
+    job.pop("runner")
+    identity = benchmark_identity(job, workload)
+    from vesuvius.neural_tracing.fiber_trace_3d import reviewed_trace_selection
+    module_path = Path(reviewed_trace_selection.__file__).with_name("training_trace_benchmark.py")
+    assert identity["runner_sha256"] == sha256_file(module_path)
+
+
+def test_raw_freeze_rejects_ema_weights(tmp_path):
+    source = tmp_path / "ema.pt"
+    _snapshot(source, step=10, samples=1280, value=1.0, ema=True)
+    with pytest.raises(ValueError, match="raw model weights"):
+        freeze_raw_checkpoint(source, tmp_path / "raw.pt", step=10, samples_seen=1280)
 
 
 def test_latest_tie_does_not_regress_and_legacy_marker_seeds(tmp_path):

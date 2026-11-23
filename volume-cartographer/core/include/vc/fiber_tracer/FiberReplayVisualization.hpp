@@ -1,21 +1,28 @@
 #pragma once
 #include "vc/lasagna/LineViewBuilder.hpp"
+#include <vc_reader/zarr.hpp>
 #include "vc/fiber_tracer/FiberGraph.hpp"
 #include "vc/fiber_tracer/FiberTrace.hpp"
 #include <functional>
 #include <filesystem>
 #include <opencv2/core/mat.hpp>
-class Volume;
+namespace vcr::zarr {
+struct OpenedArray;
+}
 namespace vc::fiber_tracer {
 [[nodiscard]] nlohmann::json fiberReplayTraceJson(const FiberReplayTraceResult&, double normalThresholdBaseVoxels);
 [[nodiscard]] FiberReplayTraceResult fiberReplayTraceFromJson(const nlohmann::json&);
 void writeFiberReplayTraceArtifacts(const std::filesystem::path&, const std::vector<cv::Vec3d>&,
     const FiberReplayTraceResult&, double normalThresholdBaseVoxels, const nlohmann::json& provenance);
+// The CT level textures are sampled from: its shape and where its indices sit relative to
+// base (level-0) coordinates (vcr::zarr::LevelPlacement, ZYX: base = scale * index + offset).
 struct FiberReplayStripTextureSource {
     std::string locator;
     std::array<int, 3> shapeZYX{};
-    std::array<double, 3> scaleFromBaseXYZ{};
-    std::array<double, 3> offsetFromBaseXYZ{};
+    vcr::zarr::LevelPlacement placement;
+    // Level index of a base coordinate along an XYZ axis, and back.
+    double fromBase(int xyzAxis, double base) const { return placement.fromLevel0(2 - xyzAxis, base); }
+    double toBase(int xyzAxis, double index) const { return placement.toLevel0(2 - xyzAxis, index); }
 };
 struct FiberReplayOverviewPanel {
     double progressFractionBegin = 0.0;
@@ -76,14 +83,13 @@ struct FiberReplayOverview {
     const vc::lasagna::NormalSampler& normalSampler,
     double normalWorkingToBaseScale,
     int parallelThreads,
-    ::Volume& volume,
-    const std::string& sourceLocator);
+    const vcr::zarr::OpenedArray& ct);
 [[nodiscard]] FiberReplayOverview renderFiberReplayTraceOverview(
     const std::vector<cv::Vec3d>& referenceGeometryBase,
     const FiberReplayTraceResult& replay,
     const vc::lasagna::NormalSampler& normalSampler,
     double normalWorkingToBaseScale, int parallelThreads,
-    ::Volume& volume, const std::string& sourceLocator);
+    const vcr::zarr::OpenedArray& ct);
 
 // Coordinates supplied to the texture callback are in the declared source
 // lattice, resampled at native spacing. The callback applies renderScale.
@@ -134,9 +140,10 @@ struct FiberReplaySectionFrame {
     const FiberReplayStripTextureSource& source, double workingToBaseScale,
     const FiberPredictionSource& predictions);
 
+// The texture source of a uint8 CT pyramid level, opened as a level of its group
+// (vcr::zarr::Group::array, which places it relative to the group's level 0).
 [[nodiscard]] FiberReplayStripTextureSource validateFiberReplayStripCtVolume(
-    ::Volume& volume,
-    const std::string& sourceLocator);
+    const vcr::zarr::OpenedArray& ct);
 #ifdef VC_TESTING
 namespace testing
 {

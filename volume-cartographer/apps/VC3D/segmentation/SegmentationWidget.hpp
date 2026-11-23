@@ -11,7 +11,7 @@
 #include "SegmentationCommon.hpp"
 #include "SegmentationPushPullConfig.hpp"
 
-#include "utils/Json.hpp"
+#include <nlohmann/json.hpp>
 
 #include "growth/SegmentationGrowth.hpp"
 #include "tools/ManualAddTool.hpp"
@@ -22,7 +22,6 @@ class SegmentationGrowthPanel;
 class SegmentationCorrectionsPanel;
 class SegmentationCustomParamsPanel;
 class SegmentationNeuralTracerPanel;
-class SegmentationDirectionFieldPanel;
 class SegmentationLasagnaPanel;
 class SegmentationManualAddPanel;
 
@@ -45,17 +44,18 @@ public:
     [[nodiscard]] float smoothingStrength() const;
     [[nodiscard]] int smoothingIterations() const;
     [[nodiscard]] SegmentationGrowthMethod growthMethod() const;
-    [[nodiscard]] SegmentationGrowthMethod lastNonManualGrowthMethod() const { return _lastNonManualGrowthMethod; }
     [[nodiscard]] int growthSteps() const;
     [[nodiscard]] QString customParamsText() const;
     [[nodiscard]] QString customParamsProfile() const;
     [[nodiscard]] bool customParamsValid() const;
     [[nodiscard]] QString customParamsError() const;
-    [[nodiscard]] utils::Json customParamsJson() const;
+    [[nodiscard]] nlohmann::json customParamsJson() const;
     [[nodiscard]] bool showHoverMarker() const;
     [[nodiscard]] bool growthKeybindsEnabled() const;
     [[nodiscard]] int growthScale() const;
     [[nodiscard]] ManualAddTool::Config manualAddConfig() const;
+    [[nodiscard]] int manualAddExtendCells() const;
+    [[nodiscard]] int manualGrowWorkers() const;
     // Neural tracer getters — delegated to panel
     [[nodiscard]] bool neuralTracerEnabled() const;
     [[nodiscard]] QString neuralCheckpointPath() const;
@@ -85,6 +85,7 @@ public:
     void setGrowthInProgress(bool running);
     void setShowHoverMarker(bool enabled);
     void setManualAddActive(bool active);
+    void setManualAddBusy(bool busy);
     ManualAddTool::LinePreviewMode cycleManualAddLinePreviewMode();
     // Route direct changes through the panel so manualAddConfigChanged reaches
     // the module just as it does for a combo-box edit.
@@ -108,7 +109,6 @@ public:
     [[nodiscard]] std::optional<std::pair<int, int>> correctionsZRange() const;
 
     [[nodiscard]] std::vector<SegmentationGrowthDirection> allowedGrowthDirections() const;
-    [[nodiscard]] std::vector<SegmentationDirectionFieldConfig> directionFieldConfigs() const;
 
     // "Draw mask" brush radius in voxels.
     [[nodiscard]] float maskBrushRadius() const { return _maskBrushRadius; }
@@ -196,6 +196,7 @@ signals:
     void manualAddRecomputeRequested();
     void manualAddApplyExitRequested();
     void manualAddCancelRequested();
+    void manualAddExtendRequested(int side, int cells);
 
 private:
     void buildUi();
@@ -203,7 +204,6 @@ private:
     void restoreSettings();
     void writeSetting(const QString& key, const QVariant& value);
     void updateEditingState(bool enabled, bool notifyListeners);
-    void noteGrowthMethod(SegmentationGrowthMethod method);
 
     bool _editingEnabled{false};
     bool _drawMaskEnabled{false};
@@ -218,10 +218,10 @@ private:
     SegmentationCorrectionsPanel* _correctionsPanel{nullptr};
     SegmentationCustomParamsPanel* _customParamsPanel{nullptr};
     SegmentationNeuralTracerPanel* _neuralTracerPanel{nullptr};
-    SegmentationDirectionFieldPanel* _directionFieldPanel{nullptr};
     SegmentationLasagnaPanel* _lasagnaPanel{nullptr};
     SegmentationManualAddPanel* _manualAddPanel{nullptr};
     bool _manualAddActive{false};
-    SegmentationGrowthMethod _lastNonManualGrowthMethod{SegmentationGrowthMethod::Tracer};
+    bool _manualAddBusy{false};
+    QWidget* _manualAddProgress{nullptr};
 
 };

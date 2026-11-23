@@ -3,12 +3,11 @@
 #include "../SegmentationModule.hpp"
 #include "../../ViewerManager.hpp"
 #include "SegmentationEditManager.hpp"
-#include "../SegmentationWidget.hpp"
 #include "../../CState.hpp"
 
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/util/Surface.hpp"
-#include "vc/core/util/Slicing.hpp"
+#include "../../OpenedVolumes.hpp"
 
 #include <QCoreApplication>
 #include <QTimer>
@@ -407,11 +406,9 @@ std::optional<cv::Vec3f> computeRobustNormal(QuadSurface* surface,
 
 SegmentationPushPullTool::SegmentationPushPullTool(SegmentationModule& module,
                                                    SegmentationEditManager* editManager,
-                                                   SegmentationWidget* widget,
                                                    CState* state)
     : _module(module)
     , _editManager(editManager)
-    , _widget(widget)
     , _state(state)
 {
     ensureTimer();
@@ -500,14 +497,11 @@ bool SegmentationPushPullTool::start(int direction, std::optional<bool> alphaOve
     }
 
     _activeAlphaEnabled = alphaOverride.value_or(false);
-    _alphaOverrideActive = alphaOverride.has_value();
     ++_alphaGeneration;
     _stopAfterAlphaResult = false;
 
     _ppState.active = true;
     _ppState.direction = direction;
-    _activeViewer = hover.viewer;
-    _undoCaptured = false;
     _lastAlphaStartFailure.clear();
 
     // Reset cached position for new operation
@@ -563,11 +557,9 @@ void SegmentationPushPullTool::stopAll()
 
     _ppState.active = false;
     _ppState.direction = 0;
-    _activeViewer = nullptr;
     if (_timer && _timer->isActive()) {
         _timer->stop();
     }
-    _alphaOverrideActive = false;
     _activeAlphaEnabled = false;
     _alphaComputePending = false;
     _stopAfterAlphaResult = false;
@@ -597,7 +589,6 @@ void SegmentationPushPullTool::stopAll()
         _module.markAutosaveNeeded();
     }
 
-    _undoCaptured = false;
     _lastAlphaStartFailure.clear();
 }
 
@@ -663,7 +654,8 @@ bool SegmentationPushPullTool::applyStepInternal()
     }
 
     // Get normal directly from grid position (avoids expensive pointTo lookup)
-    cv::Vec3f normal = baseSurface->gridNormal(row, col);
+    cv::Vec3f normal;
+    baseSurface->pointAt(float(col), float(row), nullptr, normal.val);
     if (!isValidNormal(normal)) {
         // Fallback to robust normal computation if direct lookup fails
         cv::Vec3f ptr(0, 0, 0);
@@ -772,7 +764,7 @@ void SegmentationPushPullTool::launchAlphaCompute()
     if (!volume && _state) {
         volume = _state->currentVolume();
     }
-    if (!volume) {
+    if (!volume || !_state) {
         failAlphaStart(QStringLiteral("Alpha push/pull aborted: no active volume to sample."));
         return;
     }
@@ -780,7 +772,6 @@ void SegmentationPushPullTool::launchAlphaCompute()
     // Alpha push/pull samples the user-selected OME-Zarr scale, independent of
     // the viewer's current display LOD.
     const int datasetIndex = std::clamp(_alphaConfig.computeScale, 0, 5);
-    constexpr float scale = 1.0f;
 
     const int direction = _ppState.direction;
     const AlphaPushPullConfig config = _alphaConfig;
@@ -802,7 +793,7 @@ void SegmentationPushPullTool::launchAlphaCompute()
         }
         centerWorld = *centerWorldOpt;
 
-        centerNormal = baseSurface->gridNormal(row, col);
+        baseSurface->pointAt(float(col), float(row), nullptr, centerNormal.val);
         if (!isValidNormal(centerNormal)) {
             cv::Vec3f ptr(0, 0, 0);
             locatePointer(_module.viewerManager(), *baseSurface, centerWorld, ptr);
@@ -831,7 +822,8 @@ void SegmentationPushPullTool::launchAlphaCompute()
             } else {
                 sampleInputs.reserve(totalSamples);
                 for (const auto& sample : activeSamples) {
-                    cv::Vec3f sampleNormal = baseSurface->gridNormal(sample.row, sample.col);
+                    cv::Vec3f sampleNormal;
+                    baseSurface->pointAt(float(sample.col), float(sample.row), nullptr, sampleNormal.val);
                     if (!isValidNormal(sampleNormal)) {
                         sampleNormal = centerNormal;
                     } else {
@@ -853,7 +845,7 @@ void SegmentationPushPullTool::launchAlphaCompute()
     _lastAlphaStartFailure.clear();
 
     auto future = QtConcurrent::run(
-        [volume, datasetIndex, scale, direction, config, generation, perVertex,
+        [volume, volumes = _state->openedVolumes(), datasetIndex, direction, config, generation, perVertex,
          centerWorld, centerNormal, sampleInputs]() -> AlphaResult {
         AlphaResult result;
         result.generation = generation;
@@ -866,8 +858,8 @@ void SegmentationPushPullTool::launchAlphaCompute()
                                                direction,
                                                config,
                                                volume,
+                                               *volumes,
                                                datasetIndex,
-                                               scale,
                                                generation);
             if (!result.success) {
                 return result;
@@ -906,7 +898,7 @@ void SegmentationPushPullTool::launchAlphaCompute()
             std::string noTargetReason;
             auto target = computeAlphaTargetStatic(
                 centerWorld, centerNormal, direction, config,
-                volume, datasetIndex, scale, &unavailable, &noTargetReason);
+                volume, *volumes, datasetIndex, &unavailable, &noTargetReason);
 
             if (target) {
                 result.singleTarget = *target;
@@ -927,8 +919,10 @@ void SegmentationPushPullTool::launchAlphaCompute()
         return result;
         } catch (const std::exception& e) {
             qCWarning(lcSegPushPull) << "Alpha push/pull worker failed:" << e.what();
+            result.noMovementReason = std::string("Alpha push/pull failed: ") + e.what();
         } catch (...) {
             qCWarning(lcSegPushPull) << "Alpha push/pull worker failed with an unknown exception";
+            result.noMovementReason = "Alpha push/pull failed.";
         }
         return result;
     });
@@ -1059,13 +1053,51 @@ void SegmentationPushPullTool::ensureTimer()
     });
 }
 
+// The layers of a size x size plane patch at `offsets` along `normal`: the centre pixel at
+// `centre`, unit steps of the plane's basis, sampled linearly from an opened level, as
+// fractions of the 8-bit range (0 where there is no sample).
+static std::vector<cv::Mat_<float>> samplePatchLayers(const OpenedVolumes::Level& level, const cv::Vec3f& centre,
+                                                        const cv::Vec3f& normal, cv::Size size,
+                                                        const std::vector<float>& offsets)
+{
+    const PlaneSurface plane(centre, normal);
+    const cv::Vec3f dx = plane.basisX(), dy = plane.basisY();
+    const cv::Vec3f origin = centre - dx * float(size.width / 2) - dy * float(size.height / 2);
+    vcr::grid::Request request;
+    request.levels = {vcr::zarr::gridLevel(*level.array, level.working, level.cuda.get())};
+    request.offsets = offsets;
+    const auto r = vcr::grid::sample(vcr::grid::Plane{{origin[0], origin[1], origin[2]}, {dx[0], dx[1], dx[2]},
+                                                      {dy[0], dy[1], dy[2]}, {normal[0], normal[1], normal[2]},
+                                                      size.width, size.height},
+                                     request);
+    std::vector<cv::Mat_<float>> layers(offsets.size());
+    const std::size_t n = std::size_t(size.area());
+    for (std::size_t k = 0; k < offsets.size(); ++k) {
+        layers[k].create(size);
+        for (std::size_t i = 0; i < n; ++i) {
+            const float v = r.values[k * n + i];
+            layers[k](int(i)) = std::isnan(v) ? 0.0f : std::clamp(v, 0.0f, 255.0f) / 255.0f;
+        }
+    }
+    return layers;
+}
+
+// The offsets start, start + step, ... up to stop, as the alpha loops step them.
+static std::vector<float> alphaOffsets(float start, float stop, float step)
+{
+    std::vector<float> offsets;
+    for (float offset = start; offset <= stop + 1e-4f; offset += step)
+        offsets.push_back(offset);
+    return offsets;
+}
+
 SegmentationPushPullTool::AlphaResult SegmentationPushPullTool::computeAlphaTargetsStatic(
     const std::vector<AlphaTargetInput>& inputs,
     int direction,
     const AlphaPushPullConfig& config,
     const std::shared_ptr<Volume>& volume,
+    OpenedVolumes& volumes,
     int datasetIndex,
-    float scale,
     std::uint64_t generation)
 {
     AlphaResult result;
@@ -1082,11 +1114,12 @@ SegmentationPushPullTool::AlphaResult SegmentationPushPullTool::computeAlphaTarg
     }
 
     AlphaPushPullConfig cfg = sanitizeConfig(config);
-    if (!volume->hasScaleLevel(datasetIndex)) {
+    if (!volumes.pyramid(*volume).has(datasetIndex)) {
         result.noMovementReason = "Alpha push/pull requested missing OME-Zarr scale " +
                                   std::to_string(datasetIndex) + ".";
         return result;
     }
+    const auto level = volumes.level(*volume, datasetIndex);
 
     const int radius = std::max(cfg.blurRadius, 0);
     const int kernel = radius * 2 + 1;
@@ -1099,9 +1132,9 @@ SegmentationPushPullTool::AlphaResult SegmentationPushPullTool::computeAlphaTarg
     std::vector<float> transparent(inputs.size(), 1.0f);
     std::vector<float> integ(inputs.size(), 0.0f);
 
-    cv::Mat_<cv::Vec3f> baseCoords(static_cast<int>(inputs.size()) * kernel, kernel);
-    cv::Mat_<cv::Vec3f> patchCoords;
     std::string firstNoTargetReason;
+    const auto offsets = alphaOffsets(cfg.start, cfg.stop, std::fabs(cfg.step));
+    cv::Mat floatPatch(patchSize, CV_32F);
 
     for (std::size_t i = 0; i < inputs.size(); ++i) {
         cv::Vec3f orientedNormal = inputs[i].normal * static_cast<float>(direction);
@@ -1116,59 +1149,9 @@ SegmentationPushPullTool::AlphaResult SegmentationPushPullTool::computeAlphaTarg
         normals[i] = orientedNormal;
         valid[i] = 1;
 
-        PlaneSurface plane(inputs[i].baseWorld, orientedNormal);
-        plane.gen(&patchCoords, nullptr, patchSize, cv::Vec3f(0, 0, 0), scale, cv::Vec3f(0, 0, 0));
-        patchCoords.copyTo(baseCoords.rowRange(static_cast<int>(i) * kernel,
-                                               static_cast<int>(i + 1) * kernel));
-    }
-
-    const float start = cfg.start;
-    const float stop = cfg.stop;
-    const float step = std::fabs(cfg.step);
-
-    cv::Mat_<cv::Vec3f> offsetCoords(baseCoords.size());
-    cv::Mat_<uint8_t> slice;
-    cv::Mat floatPatch(patchSize, CV_32F);
-
-    for (float offset = start; offset <= stop + 1e-4f; offset += step) {
-        for (std::size_t i = 0; i < inputs.size(); ++i) {
-            const int row0 = static_cast<int>(i) * kernel;
-            auto dstBlock = offsetCoords.rowRange(row0, row0 + kernel);
-            auto srcBlock = baseCoords.rowRange(row0, row0 + kernel);
-            const int total = kernel * kernel;
-            const auto* src = srcBlock.ptr<cv::Vec3f>();
-            auto* dst = dstBlock.ptr<cv::Vec3f>();
-            if (valid[i]) {
-                const cv::Vec3f delta = normals[i] * offset;
-                for (int p = 0; p < total; ++p) {
-                    dst[p] = src[p] + delta;
-                }
-            } else {
-                for (int p = 0; p < total; ++p) {
-                    dst[p] = src[p];
-                }
-            }
-        }
-
-        vc::SampleParams sp;
-        sp.level = datasetIndex;
-        volume->sample(slice, offsetCoords, sp);
-        if (slice.empty()) {
-            if (firstNoTargetReason.empty()) {
-                firstNoTargetReason = "Alpha push/pull sampled an empty volume slice.";
-            }
-            continue;
-        }
-
-        for (std::size_t i = 0; i < inputs.size(); ++i) {
-            if (!valid[i] || transparent[i] <= 1e-3f) {
-                continue;
-            }
-
-            const int row0 = static_cast<int>(i) * kernel;
-            const cv::Mat srcBlock(slice, cv::Rect(0, row0, kernel, kernel));
-            srcBlock.convertTo(floatPatch, CV_32F, 1.0 / 255.0);
-            cv::GaussianBlur(floatPatch, floatPatch, cv::Size(kernel, kernel), 0);
+        const auto layers = samplePatchLayers(level, inputs[i].baseWorld, orientedNormal, patchSize, offsets);
+        for (std::size_t k = 0; k < offsets.size() && transparent[i] > 1e-3f; ++k) {
+            cv::GaussianBlur(layers[k], floatPatch, cv::Size(kernel, kernel), 0);
 
             cv::Mat_<float> opaq = floatPatch;
             opaq = (opaq - cfg.low) / range;
@@ -1177,7 +1160,7 @@ SegmentationPushPullTool::AlphaResult SegmentationPushPullTool::computeAlphaTarg
 
             const float centerOpacity = opaq(centerIndex);
             const float joint = transparent[i] * centerOpacity;
-            integ[i] += joint * offset;
+            integ[i] += joint * offsets[k];
             transparent[i] -= joint;
         }
     }
@@ -1233,8 +1216,8 @@ std::optional<cv::Vec3f> SegmentationPushPullTool::computeAlphaTargetStatic(
     int direction,
     const AlphaPushPullConfig& config,
     const std::shared_ptr<Volume>& volume,
+    OpenedVolumes& volumes,
     int datasetIndex,
-    float scale,
     bool* outUnavailable,
     std::string* outNoTargetReason)
 {
@@ -1251,7 +1234,7 @@ std::optional<cv::Vec3f> SegmentationPushPullTool::computeAlphaTargetStatic(
     }
 
     AlphaPushPullConfig cfg = sanitizeConfig(config);
-    if (!volume->hasScaleLevel(datasetIndex)) {
+    if (!volumes.pyramid(*volume).has(datasetIndex)) {
         if (outUnavailable) {
             *outUnavailable = true;
         }
@@ -1261,6 +1244,7 @@ std::optional<cv::Vec3f> SegmentationPushPullTool::computeAlphaTargetStatic(
         }
         return std::nullopt;
     }
+    const auto level = volumes.level(*volume, datasetIndex);
 
     cv::Vec3f orientedNormal = normal * static_cast<float>(direction);
     const float norm = cv::norm(orientedNormal);
@@ -1274,39 +1258,17 @@ std::optional<cv::Vec3f> SegmentationPushPullTool::computeAlphaTargetStatic(
     const int kernel = radius * 2 + 1;
     const cv::Size patchSize(kernel, kernel);
 
-    PlaneSurface plane(centerWorld, orientedNormal);
-    cv::Mat_<cv::Vec3f> coords;
-    plane.gen(&coords, nullptr, patchSize, cv::Vec3f(0, 0, 0), scale, cv::Vec3f(0, 0, 0));
-
     const cv::Point2i centerIndex(radius, radius);
     const float range = std::max(cfg.high - cfg.low, kAlphaMinRange);
 
     float transparent = 1.0f;
     float integ = 0.0f;
 
-    const float start = cfg.start;
-    const float stop = cfg.stop;
-    const float step = std::fabs(cfg.step);
-
-    // Pre-allocate mats reused across loop iterations to avoid per-tick allocations
-    cv::Mat_<cv::Vec3f> offsetMat(patchSize);
-    cv::Mat_<cv::Vec3f> offsetCoords(patchSize);
-    cv::Mat_<uint8_t> slice(patchSize);
+    const auto offsets = alphaOffsets(cfg.start, cfg.stop, std::fabs(cfg.step));
+    const auto layers = samplePatchLayers(level, centerWorld, orientedNormal, patchSize, offsets);
     cv::Mat sliceFloat(patchSize, CV_32F);
-
-    for (float offset = start; offset <= stop + 1e-4f; offset += step) {
-        offsetMat.setTo(orientedNormal * offset);
-        cv::add(coords, offsetMat, offsetCoords);
-        vc::SampleParams sp;
-        sp.level = datasetIndex;
-        volume->sample(slice, offsetCoords, sp);
-        if (slice.empty()) {
-            setAlphaNoTargetReason(outNoTargetReason, "Alpha push/pull sampled an empty volume slice.");
-            continue;
-        }
-
-        slice.convertTo(sliceFloat, CV_32F, 1.0 / 255.0);
-        cv::GaussianBlur(sliceFloat, sliceFloat, cv::Size(kernel, kernel), 0);
+    for (std::size_t k = 0; k < offsets.size(); ++k) {
+        cv::GaussianBlur(layers[k], sliceFloat, cv::Size(kernel, kernel), 0);
 
         cv::Mat_<float> opaq = sliceFloat;
         opaq = (opaq - cfg.low) / range;
@@ -1315,7 +1277,7 @@ std::optional<cv::Vec3f> SegmentationPushPullTool::computeAlphaTargetStatic(
 
         const float centerOpacity = opaq(centerIndex);
         const float joint = transparent * centerOpacity;
-        integ += joint * offset;
+        integ += joint * offsets[k];
         transparent -= joint;
 
         if (transparent <= 1e-3f) {

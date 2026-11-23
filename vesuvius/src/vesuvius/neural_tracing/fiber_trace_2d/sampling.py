@@ -1,478 +1,168 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Any
+import time
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from typing import Any, Callable, Iterable, Sequence
 
 import numpy as np
-
-from vesuvius.neural_tracing.fiber_trace_2d.loader_support import (
-    ZarrChunkRequest,
-    chunk_requests_for_coords,
-    sample_array_trilinear,
-)
+import torch
 
 
 _REMOTE_PREFIXES = ("http://", "https://", "s3://")
 
 
-@dataclass(frozen=True)
-class CoordinateSampleResult:
-    image: np.ndarray
-    valid_mask: np.ndarray
-    stats: dict[str, Any]
+def volume_cache_dirs(volume_path: str, cache_root: str | None) -> str | list[str] | None:
+    """``cache_dir`` for ``vc_reader.reader.open_zarr`` of a CT volume.
+
+    Remote volumes use VC3D's configured cache root first, then the config's
+    ``volume_cache_dir``; local volumes are read in place.
+    """
+    if not str(volume_path).startswith(_REMOTE_PREFIXES):
+        return None
+    return ["vc3d", str(cache_root)] if cache_root else "vc3d"
 
 
-class CoordinateSampler:
-    def sample_coords(self, coords_zyx_base: np.ndarray, valid_mask: np.ndarray) -> CoordinateSampleResult:
-        raise NotImplementedError
-
-    def sample_block_zyx(self, start_zyx: np.ndarray, shape_zyx: tuple[int, int, int]) -> CoordinateSampleResult:
-        raise NotImplementedError
-
-    def sample_coord_batch(
-        self, coords_zyx_base: np.ndarray, valid_mask: np.ndarray
-    ) -> CoordinateSampleResult:
-        return _sample_coord_batch_flattened(self, coords_zyx_base, valid_mask)
-
-    def prefetch_coords(self, coords_zyx_base: np.ndarray, valid_mask: np.ndarray) -> dict[str, Any]:
-        result = self.sample_coords(coords_zyx_base, valid_mask)
-        stats = dict(result.stats)
-        stats.setdefault("prefetch_mode", "sample_coords")
-        stats.setdefault("valid_pixels", int(np.count_nonzero(valid_mask)))
-        return stats
-
-    def chunk_requests_for_coords(
-        self, coords_zyx_base: np.ndarray, valid_mask: np.ndarray
-    ) -> list[ZarrChunkRequest]:
-        raise NotImplementedError
-
-    def chunk_requests_for_bbox(
-        self, start_zyx: np.ndarray, end_zyx: np.ndarray
-    ) -> list[ZarrChunkRequest]:
-        raise NotImplementedError
-
-
-def _sample_coord_batch_flattened(
-    sampler: CoordinateSampler,
+def level_points(
     coords_zyx_base: np.ndarray,
     valid_mask: np.ndarray,
-) -> CoordinateSampleResult:
-    coords = np.asarray(coords_zyx_base, dtype=np.float32)
-    valid = np.asarray(valid_mask, dtype=bool)
-    if coords.ndim != 4 or coords.shape[-1] != 3:
-        raise ValueError("coords_zyx_base must have shape B,H,W,3")
-    if valid.shape != coords.shape[:3]:
-        raise ValueError("valid_mask must have shape B,H,W")
-    batch, height, width = (int(v) for v in coords.shape[:3])
-    flat_coords = np.ascontiguousarray(coords.reshape(batch * height, width, 3))
-    flat_valid = np.ascontiguousarray(valid.reshape(batch * height, width))
-    result = sampler.sample_coords(flat_coords, flat_valid)
-    image = np.asarray(result.image, dtype=np.float32)
-    sampled_valid = np.asarray(result.valid_mask, dtype=bool)
-    if image.shape != (batch * height, width):
-        raise ValueError(
-            "batched coordinate sampler returned incompatible image shape: "
-            f"shape={image.shape} expected={(batch * height, width)}"
-        )
-    if sampled_valid.shape != (batch * height, width):
-        raise ValueError(
-            "batched coordinate sampler returned incompatible valid-mask shape: "
-            f"shape={sampled_valid.shape} expected={(batch * height, width)}"
-        )
-    stats = dict(result.stats)
-    stats["batch_patches"] = batch
-    stats["batch_mode_flattened"] = 1
-    return CoordinateSampleResult(
-        image=image.reshape(batch, height, width),
-        valid_mask=sampled_valid.reshape(batch, height, width),
-        stats=stats,
-    )
-
-
-def _coords_zyx_base_to_xyz(coords_zyx_base: np.ndarray) -> np.ndarray:
-    coords = np.asarray(coords_zyx_base, dtype=np.float32)
-    return np.ascontiguousarray(coords[..., (2, 1, 0)])
-
-
-class Vc3dCoordinateSampler(CoordinateSampler):
-    def __init__(
-        self,
-        volume_path: str,
-        *,
-        level: int,
-        cache_root: str | None,
-        cache_budget_bytes: int | None = None,
-        io_threads: int | None = None,
-        decode_threads: int | None = None,
-        sample_threads: int | None = None,
-        chunk_locality_fast_path: bool = True,
-        collect_locality_stats: bool = False,
-        sampling: str = "trilinear",
-        blocking: bool = True,
-    ) -> None:
-        from vc.volume import (
-            Volume,
-            set_chunk_cache_budget,
-            set_chunk_cache_decode_threads,
-            set_chunk_cache_io_threads,
-        )
-
-        self.level = int(level)
-        self.sampling = str(sampling)
-        self.blocking = bool(blocking)
-        self.sample_threads = 0 if sample_threads is None else int(sample_threads)
-        self.chunk_locality_fast_path = bool(chunk_locality_fast_path)
-        self.collect_locality_stats = bool(collect_locality_stats)
-        if self.sample_threads < 0:
-            raise ValueError("sample_threads must be non-negative")
-        path = str(volume_path)
-        if path.startswith("s3://"):
-            # VC3D remote volume loading is HTTP-backed. The public Vesuvius S3
-            # zarrs are also exposed through the standard virtual-hosted URL.
-            without_scheme = path[len("s3://") :]
-            bucket, _, key = without_scheme.partition("/")
-            path = f"https://{bucket}.s3.amazonaws.com/{key}"
-        if path.startswith(_REMOTE_PREFIXES):
-            # Native remote volumes use the process-wide VC3D cache root.
-            # cache_root remains a compatibility argument, not a per-volume override.
-            self.volume = Volume.open_url(path)
-        else:
-            self.volume = Volume.open(path)
-        if cache_budget_bytes is not None:
-            budget = int(cache_budget_bytes)
-            if budget <= 0:
-                raise ValueError("cache_budget_bytes must be positive when provided")
-            set_chunk_cache_budget(budget)
-        if io_threads is not None:
-            threads = int(io_threads)
-            if threads <= 0:
-                raise ValueError("io_threads must be positive when provided")
-            set_chunk_cache_io_threads(threads)
-        if decode_threads is not None:
-            threads = int(decode_threads)
-            if threads <= 0:
-                raise ValueError("decode_threads must be positive when provided")
-            set_chunk_cache_decode_threads(threads)
-
-    @property
-    def store_identity(self) -> str:
-        volume_id = getattr(self.volume, "remote_url", "") or getattr(self.volume, "path", "")
-        return f"vc3d:{volume_id}:level={self.level}"
-
-    def sample_coords(self, coords_zyx_base: np.ndarray, valid_mask: np.ndarray) -> CoordinateSampleResult:
-        image, sampled_valid, stats = self.volume.sample_coords(
-            _coords_zyx_base_to_xyz(coords_zyx_base),
-            np.ascontiguousarray(valid_mask, dtype=np.bool_),
-            self.level,
-            self.sampling,
-            32,
-            self.blocking,
-            self.sample_threads,
-            self.chunk_locality_fast_path,
-            self.collect_locality_stats,
-        )
-        image_arr = np.asarray(image, dtype=np.float32)
-        valid_arr = np.asarray(sampled_valid, dtype=np.uint8)
-        stats_dict = dict(stats)
-        if self.blocking:
-            if "requested_level_only" not in stats_dict:
-                raise RuntimeError(
-                    "VC3D blocking coordinate sampling did not report requested_level_only; "
-                    "rebuild volume-cartographer so blocking sample_coords uses the "
-                    "strict requested-level sampler"
-                )
-            if not bool(stats_dict.get("requested_level_only")):
-                raise RuntimeError(
-                    f"VC3D blocking coordinate sampling did not use requested-level-only mode: "
-                    f"stats={stats_dict}"
-                )
-            fallback_levels = int(stats_dict.get("fallback_levels", 0) or 0)
-            if fallback_levels != 0:
-                raise RuntimeError(
-                    f"VC3D blocking coordinate sampling reported scale fallback: "
-                    f"stats={stats_dict}"
-                )
-        if image_arr.ndim == 3 and image_arr.shape[-1] == 1:
-            image_arr = image_arr[..., 0]
-        if valid_arr.ndim == 3 and valid_arr.shape[-1] == 1:
-            valid_arr = valid_arr[..., 0]
-        return CoordinateSampleResult(
-            image=image_arr.astype(np.float32, copy=False),
-            valid_mask=valid_arr.astype(bool, copy=False),
-            stats=stats_dict,
-        )
-
-    def sample_block_zyx(
-        self,
-        start_zyx: np.ndarray,
-        shape_zyx: tuple[int, int, int],
-    ) -> CoordinateSampleResult:
-        if hasattr(self, "blocking") and not bool(getattr(self, "blocking")):
-            raise ValueError("VC3D block sampling requires blocking=True")
-        sample_block = getattr(self.volume, "sample_zyx_block", None)
-        if sample_block is None:
-            raise RuntimeError(
-                "VC3D volume binding does not expose sample_zyx_block; rebuild "
-                "volume-cartographer so native 3D Trace2CP can use strict "
-                "requested-level axis-aligned block reads"
-            )
-        start = np.asarray(start_zyx, dtype=np.int64)
-        shape = np.asarray(shape_zyx, dtype=np.int64)
-        if start.shape != (3,) or shape.shape != (3,):
-            raise ValueError("start_zyx and shape_zyx must each have shape (3,)")
-        if not bool(np.all(shape > 0)):
-            raise ValueError("shape_zyx values must be positive")
-        image, sampled_valid, stats = sample_block(
-            tuple(int(v) for v in start),
-            tuple(int(v) for v in shape),
-            self.level,
-            self.blocking,
-        )
-        image_arr = np.asarray(image, dtype=np.float32)
-        valid_arr = np.asarray(sampled_valid, dtype=np.uint8)
-        stats_dict = dict(stats)
-        if self.blocking:
-            if "requested_level_only" not in stats_dict:
-                raise RuntimeError(
-                    "VC3D block sampling did not report requested_level_only; "
-                    "rebuild volume-cartographer so native 3D Trace2CP can use "
-                    "strict requested-level block reads"
-                )
-            if not bool(stats_dict.get("requested_level_only")):
-                raise RuntimeError(
-                    "VC3D block sampling did not use requested-level-only mode: "
-                    f"stats={stats_dict}"
-                )
-            fallback_levels = int(stats_dict.get("fallback_levels", 0) or 0)
-            if fallback_levels != 0:
-                raise RuntimeError(
-                    f"VC3D block sampling reported scale fallback: stats={stats_dict}"
-                )
-        expected_shape = tuple(int(v) for v in shape)
-        if image_arr.shape != expected_shape:
-            raise ValueError(
-                "VC3D block sampler returned incompatible image shape: "
-                f"shape={image_arr.shape} expected={expected_shape}"
-            )
-        if valid_arr.shape != expected_shape:
-            raise ValueError(
-                "VC3D block sampler returned incompatible valid-mask shape: "
-                f"shape={valid_arr.shape} expected={expected_shape}"
-            )
-        stats_dict.setdefault("sample_block_zyx", 1)
-        return CoordinateSampleResult(
-            image=image_arr.astype(np.float32, copy=False),
-            valid_mask=valid_arr.astype(bool, copy=False),
-            stats=stats_dict,
-        )
-
-    def chunk_requests_for_coords(
-        self, coords_zyx_base: np.ndarray, valid_mask: np.ndarray
-    ) -> list[ZarrChunkRequest]:
-        store = _Vc3dChunkStore(self.volume)
-        requests_by_identity: dict[tuple[str, str], ZarrChunkRequest] = {}
-        coords = np.asarray(coords_zyx_base, dtype=np.float32)
-        valid = np.asarray(valid_mask, dtype=np.bool_)
-        if coords.ndim < 3 or coords.shape[-1] != 3:
-            raise ValueError("coords_zyx_base must have shape [..., H, W, 3]")
-        if valid.shape != coords.shape[:-1]:
-            raise ValueError(
-                "valid_mask must match coords_zyx_base without the coordinate channel"
-            )
-
-        def collect_flattened(flat_coords: np.ndarray, flat_valid: np.ndarray) -> None:
-            if not bool(np.asarray(flat_valid, dtype=bool).any()):
-                return
-            dependencies = self.volume.collect_coords_dependencies(
-                _coords_zyx_base_to_xyz(flat_coords),
-                np.ascontiguousarray(flat_valid, dtype=np.bool_),
-                self.level,
-                self.sampling,
-                32,
-            )
-            for dependency in dependencies:
-                request = self._request_from_dependency(store, dependency)
-                requests_by_identity.setdefault((request.store_identity, request.key), request)
-
-        height = int(np.prod(coords.shape[:-2], dtype=np.int64))
-        width = int(coords.shape[-2])
-        flat_coords = np.ascontiguousarray(coords.reshape(height, width, 3))
-        flat_valid = np.ascontiguousarray(valid.reshape(height, width))
-        collect_flattened(flat_coords, flat_valid)
-        return list(requests_by_identity.values())
-
-    def chunk_requests_for_bbox(
-        self, start_zyx: np.ndarray, end_zyx: np.ndarray
-    ) -> list[ZarrChunkRequest]:
-        collect_bbox_dependencies = getattr(self.volume, "collect_bbox_dependencies", None)
-        if collect_bbox_dependencies is None:
-            raise RuntimeError(
-                "VC3D volume binding does not expose collect_bbox_dependencies; "
-                "rebuild volume-cartographer so 3D bbox prefetch can use VC3D-owned "
-                "chunk metadata"
-            )
-        start = np.floor(np.asarray(start_zyx, dtype=np.float64)).astype(np.int64)
-        end = np.ceil(np.asarray(end_zyx, dtype=np.float64)).astype(np.int64)
-        if start.shape != (3,) or end.shape != (3,):
-            raise ValueError("start_zyx and end_zyx must each have shape (3,)")
-        shape = np.maximum(end - start, 0)
-        if not bool(np.all(shape > 0)):
-            return []
-        dependencies = collect_bbox_dependencies(
-            tuple(int(v) for v in start),
-            tuple(int(v) for v in shape),
-            self.level,
-        )
-        store = _Vc3dChunkStore(self.volume)
-        requests_by_identity: dict[tuple[str, str], ZarrChunkRequest] = {}
-        for dependency in dependencies:
-            request = self._request_from_dependency(store, dependency)
-            requests_by_identity.setdefault((request.store_identity, request.key), request)
-        return list(requests_by_identity.values())
-
-    def _request_from_dependency(
-        self,
-        store: _Vc3dChunkStore,
-        dependency: Any,
-    ) -> ZarrChunkRequest:
-        if isinstance(dependency, dict):
-            def _path_or_none(name: str) -> Path | None:
-                value = str(dependency.get(name, "") or "")
-                return Path(value) if value else None
-
-            key = str(dependency.get("key", ""))
-            if not key:
-                level = int(dependency["level"])
-                iz = int(dependency["iz"])
-                iy = int(dependency["iy"])
-                ix = int(dependency["ix"])
-                key = f"{level}/{iz}/{iy}/{ix}"
-            return ZarrChunkRequest(
-                store=store,
-                store_identity=self.store_identity,
-                key=key,
-                cache_path=_path_or_none("cache_path"),
-                empty_path=_path_or_none("empty_path"),
-                remote_url=str(dependency.get("remote_url", "")) or None,
-                remote_chunk_key=str(dependency.get("remote_chunk_key", "")) or None,
-                cache_payload_format=str(dependency.get("cache_payload_format", "")) or None,
-                persistent_extension=str(dependency.get("persistent_extension", "")) or None,
-            )
-        raise RuntimeError(
-            "VC3D dependency collection returned legacy tuple dependencies. "
-            "Rebuild/use the updated volume-cartographer Python bindings so chunk "
-            "metadata includes remote_url, cache_path, empty_path, and cache_payload_format."
-        )
-
-
-class _Vc3dChunkStore:
-    def __init__(self, volume: Any) -> None:
-        self.volume = volume
-
-
-class NumpyZarrCoordinateSampler(CoordinateSampler):
-    def __init__(self, array: Any, *, level_spacing_base: float) -> None:
-        self.array = array
-        self.level_spacing_base = float(level_spacing_base)
-
-    def sample_coords(self, coords_zyx_base: np.ndarray, valid_mask: np.ndarray) -> CoordinateSampleResult:
-        coords_zyx_level = np.asarray(coords_zyx_base, dtype=np.float32) / self.level_spacing_base
-        image = sample_array_trilinear(self.array, coords_zyx_level, valid_mask)
-        return CoordinateSampleResult(
-            image=image,
-            valid_mask=np.asarray(valid_mask, dtype=bool),
-            stats={"covered_pixels": int(np.count_nonzero(valid_mask)), "requested_chunks": 0, "error_chunks": 0},
-        )
-
-    def sample_block_zyx(
-        self,
-        start_zyx: np.ndarray,
-        shape_zyx: tuple[int, int, int],
-    ) -> CoordinateSampleResult:
-        start = np.asarray(start_zyx, dtype=np.int64)
-        shape = np.asarray(shape_zyx, dtype=np.int64)
-        if start.shape != (3,) or shape.shape != (3,):
-            raise ValueError("start_zyx and shape_zyx must each have shape (3,)")
-        if not bool(np.all(shape > 0)):
-            raise ValueError("shape_zyx values must be positive")
-        array_shape = np.asarray(self.array.shape[:3], dtype=np.int64)
-        out = np.zeros(tuple(int(v) for v in shape), dtype=np.float32)
-        valid = np.zeros(tuple(int(v) for v in shape), dtype=bool)
-        read_lo = np.maximum(start, 0)
-        read_hi = np.minimum(start + shape, array_shape)
-        if bool(np.all(read_hi > read_lo)):
-            dst_lo = read_lo - start
-            dst_hi = dst_lo + (read_hi - read_lo)
-            src_slices = tuple(slice(int(lo), int(hi)) for lo, hi in zip(read_lo, read_hi, strict=True))
-            dst_slices = tuple(slice(int(lo), int(hi)) for lo, hi in zip(dst_lo, dst_hi, strict=True))
-            out[dst_slices] = np.asarray(self.array[src_slices], dtype=np.float32)
-            valid[dst_slices] = True
-        return CoordinateSampleResult(
-            image=out,
-            valid_mask=valid,
-            stats={
-                "covered_pixels": int(np.count_nonzero(valid)),
-                "requested_chunks": 0,
-                "error_chunks": 0,
-                "missing_chunks": 0,
-                "fallback_levels": 0,
-                "requested_level_only": True,
-                "sample_block_zyx": 1,
-            },
-        )
-
-    def chunk_requests_for_coords(
-        self, coords_zyx_base: np.ndarray, valid_mask: np.ndarray
-    ) -> list[ZarrChunkRequest]:
-        coords_zyx_level = np.asarray(coords_zyx_base, dtype=np.float32) / self.level_spacing_base
-        return chunk_requests_for_coords(self.array, coords_zyx_level, valid_mask)
-
-    def chunk_requests_for_bbox(
-        self, start_zyx: np.ndarray, end_zyx: np.ndarray
-    ) -> list[ZarrChunkRequest]:
-        del start_zyx, end_zyx
-        return []
-
-    def prefetch_coords(self, coords_zyx_base: np.ndarray, valid_mask: np.ndarray) -> dict[str, Any]:
-        requests = self.chunk_requests_for_coords(coords_zyx_base, valid_mask)
-        unique: dict[tuple[str, str], ZarrChunkRequest] = {
-            (request.store_identity, request.key): request for request in requests
-        }
-        return {
-            "prefetch_mode": "chunk_requests",
-            "generated": len(requests),
-            "unique_chunks": len(unique),
-            "downloaded": 0,
-            "bytes": 0,
-            "errors": 0,
-            "valid_pixels": int(np.count_nonzero(valid_mask)),
-        }
-
-
-def make_coordinate_sampler(
-    *,
-    volume_path: str,
-    array: Any,
     level: int,
-    level_spacing_base: float,
-    cache_root: str | None,
-    cache_budget_bytes: int | None = None,
-    io_threads: int | None = None,
-    decode_threads: int | None = None,
-    sample_threads: int | None = None,
-    chunk_locality_fast_path: bool = True,
-    collect_locality_stats: bool = False,
-) -> CoordinateSampler:
-    del array, level_spacing_base
-    return Vc3dCoordinateSampler(
-        volume_path,
-        level=level,
-        cache_root=cache_root,
-        cache_budget_bytes=cache_budget_bytes,
-        io_threads=io_threads,
-        decode_threads=decode_threads,
-        sample_threads=sample_threads,
-        chunk_locality_fast_path=chunk_locality_fast_path,
-        collect_locality_stats=collect_locality_stats,
-    )
+    shape_zyx: Sequence[int],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Pyramid-level ``level`` positions of level-0 ZYX coordinates, and which of them are sampled.
+
+    These scale-only pyramids place level-``k`` voxel ``i`` at level-0 coordinate
+    ``i * 2**k``, so positions are ``base / 2**k`` with no half-voxel offset.
+    A point is valid where ``valid_mask`` is set, its coordinates are finite and
+    it lies in ``[0, shape)`` on every axis of the level array.
+    """
+    points = np.asarray(coords_zyx_base, dtype=np.float32) / np.float32(1 << int(level))
+    shape = np.asarray(tuple(shape_zyx)[-3:], dtype=np.float32)
+    inside = np.isfinite(points) & (points >= 0.0) & (points < shape)
+    valid = np.asarray(valid_mask, dtype=bool) & np.all(inside, axis=-1)
+    return points, valid
+
+
+def format_seconds(seconds: float) -> str:
+    seconds = max(0.0, float(seconds))
+    if seconds < 60.0:
+        return f"{seconds:.1f}s"
+    minutes, sec = divmod(seconds, 60.0)
+    if minutes < 60.0:
+        return f"{int(minutes)}m{int(sec):02d}s"
+    hours, minutes = divmod(minutes, 60.0)
+    return f"{int(hours)}h{int(minutes):02d}m"
+
+
+def prefetch_samples(
+    read_sample: Callable[[int], dict[str, int]],
+    start_sample_index: int,
+    sample_count: int,
+    *,
+    workers: int,
+    readers: Iterable[Any],
+    count_keys: Sequence[str],
+    label: str,
+) -> dict[str, Any]:
+    """Run ``read_sample`` for samples ``start_sample_index ..+ sample_count`` on ``workers`` threads.
+
+    ``read_sample(index)`` reads the sample's augmentation envelope through its
+    vc_reader readers, blocking, and discards the values: the reads fetch and
+    disk-cache exactly the chunks the sample can touch. It returns the
+    ``count_keys`` counts, which are summed into the summary. A ValueError skips the sample, which still
+    counts as finished; any other exception is an error and leaves the sample
+    unfinished. ``max_exclusive_sample_index`` is the end of the contiguous run
+    of finished samples from ``start_sample_index`` (0 while there is none).
+    ``remote_fetches``/``remote_bytes`` sum the ``stats()`` changes of the
+    distinct ``readers``, whose queued cache writes are flushed at the end.
+    """
+    total = int(sample_count)
+    if total < 0:
+        raise ValueError("sample_count must be >= 0")
+    first_index = int(start_sample_index)
+    end_index = first_index + total
+    worker_count = max(1, int(workers))
+    distinct = list({id(reader): reader for reader in readers}.values())
+    before = [reader.stats() for reader in distinct]
+
+    def remote(name: str) -> int:
+        return sum(int(reader.stats()[name]) - int(stats[name]) for reader, stats in zip(distinct, before))
+
+    totals = {key: 0 for key in count_keys}
+    samples_done = skipped = errors = 0
+    first_error = first_skip = ""
+    finished: set[int] = set()
+    next_unfinished = first_index
+    started = time.perf_counter()
+    print(f"{label}: samples={total} workers={worker_count}", flush=True)
+
+    def progress(*, final: bool = False) -> None:
+        elapsed = max(time.perf_counter() - started, 1.0e-9)
+        rate = samples_done / elapsed
+        eta = (total - samples_done) / rate if rate > 0.0 else 0.0
+        filled = int(24 * samples_done / max(total, 1))
+        mib = remote("remote_bytes") / (1024.0 * 1024.0)
+        line = (
+            f"{label} samples[{'#' * filled}{'-' * (24 - filled)}] {samples_done}/{total} "
+            f"eta={format_seconds(eta)} idx={next_unfinished if next_unfinished > first_index else 0} "
+            f"skipped={skipped} errors={errors} fetches={remote('remote_fetches')} "
+            f"{mib:.1f} MiB {mib / elapsed:.1f} MiB/s"
+        )
+        if first_error:
+            line += f" first_error={first_error[:157]!r}"
+        print(line, end="\n" if final else "\r", flush=True)
+
+    previous_torch_threads = int(torch.get_num_threads())
+    torch.set_num_threads(1)
+    executor = ThreadPoolExecutor(max_workers=worker_count)
+    pending: dict[Future[dict[str, int]], int] = {}
+    completed = False
+    try:
+        next_index = first_index
+        last_progress = 0.0
+        while next_index < end_index or pending:
+            while next_index < end_index and len(pending) < 2 * worker_count:
+                pending[executor.submit(read_sample, next_index)] = next_index
+                next_index += 1
+            done, _ = wait(pending, timeout=0.5, return_when=FIRST_COMPLETED)
+            for future in done:
+                index = pending.pop(future)
+                samples_done += 1
+                try:
+                    counts = future.result()
+                except ValueError as exc:
+                    skipped += 1
+                    first_skip = first_skip or f"sample={index}: {exc}"
+                except Exception as exc:
+                    errors += 1
+                    first_error = first_error or f"sample={index}: {exc}"
+                    continue
+                else:
+                    for key in totals:
+                        totals[key] += int(counts[key])
+                finished.add(index)
+            while next_unfinished in finished:
+                finished.discard(next_unfinished)
+                next_unfinished += 1
+            now = time.perf_counter()
+            if now - last_progress >= 0.5:
+                progress()
+                last_progress = now
+        for reader in distinct:
+            reader.flush()
+        progress(final=True)
+        completed = True
+    finally:
+        executor.shutdown(wait=completed, cancel_futures=not completed)
+        torch.set_num_threads(previous_torch_threads)
+    return {
+        "samples": samples_done,
+        "skipped_samples": skipped,
+        **totals,
+        "errors": errors,
+        "first_error": first_error,
+        "first_sample_skip": first_skip,
+        "workers": worker_count,
+        "max_exclusive_sample_index": next_unfinished if next_unfinished > first_index else 0,
+        "remote_fetches": remote("remote_fetches"),
+        "remote_bytes": remote("remote_bytes"),
+    }

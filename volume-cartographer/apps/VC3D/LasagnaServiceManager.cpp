@@ -3,7 +3,6 @@
 #include <vc_object_store/Uuid.hpp>
 
 #include <QCoreApplication>
-#include <QCryptographicHash>
 #include <QDateTime>
 #include <QDir>
 #include <QElapsedTimer>
@@ -19,17 +18,13 @@
 #include <QRegularExpression>
 #include <QSet>
 #include <QSysInfo>
-#include <QTemporaryFile>
 #include <QUrl>
 
-#include <algorithm>
 #include <filesystem>
 #include <functional>
 #include <iostream>
 #include <memory>
-#include <stdexcept>
 #include <system_error>
-#include <vector>
 
 #ifdef Q_OS_UNIX
 #include <signal.h>
@@ -337,12 +332,12 @@ bool LasagnaServiceManager::startService(const QString& pythonPath,
         return false;
     }
     _dataDirectory = dataDirectoryInfo.absoluteFilePath();
-    if (_storePath.isEmpty()) {
+    if (_storeLocation.isEmpty()) {
         _lastError = tr("Lasagna needs an attached object store.");
         emit serviceError(_lastError);
         return false;
     }
-    _serviceStorePath = _storePath;
+    _serviceStoreLocation = _storeLocation;
 
     _process = std::make_unique<QProcess>();
     _process->setProcessChannelMode(QProcess::SeparateChannels);
@@ -404,8 +399,9 @@ bool LasagnaServiceManager::startService(const QString& pythonPath,
     QStringList args = {
         scriptPath, QStringLiteral("--port"), QStringLiteral("0"),
         QStringLiteral("--data-dir"), _dataDirectory,
-        // The service writes into this process's store file; its session syncs it.
-        QStringLiteral("--store"), _serviceStorePath, QStringLiteral("--shared-store")
+        // The service works on the attached store: its file (shared with this
+        // process) or the endpoint of the vc_object_server that hosts it.
+        QStringLiteral("--store"), _serviceStoreLocation, QStringLiteral("--shared-store")
     };
 
     emit statusMessage(tr("Starting lasagna service..."));
@@ -818,9 +814,9 @@ void LasagnaServiceManager::startOptimization(const QJsonObject& config)
         requestConfig[QStringLiteral("source")] = source;
     }
 
-    // The job reads the surfaces' current revisions from the store: an
-    // external service sees them once this replica has pushed its edits.
-    afterStoreSync([this, requestConfig]() { postOptimizationRequest(requestConfig); });
+    // The job reads the surfaces' current versions from the store, where
+    // every save is committed before it returns.
+    postOptimizationRequest(requestConfig);
 }
 
 QString LasagnaServiceManager::storeError() const
@@ -830,42 +826,12 @@ QString LasagnaServiceManager::storeError() const
     }
     if (_isExternal && _serviceStoreUuid != QString::fromStdString(_storeAttachment->storeUuid)) {
         return _serviceStoreUuid.isEmpty()
-            ? tr("The Lasagna service at %1:%2 has no object store; start it with --store on a replica of "
-                 "this hub.").arg(_host).arg(_port)
+            ? tr("The Lasagna service at %1:%2 has no object store; start it with --store on the attached "
+                 "store.").arg(_host).arg(_port)
             : tr("The Lasagna service at %1:%2 works on store %3, not the attached store; attach the same "
-                 "hosted store.").arg(_host).arg(_port).arg(_serviceStoreUuid);
+                 "store.").arg(_host).arg(_port).arg(_serviceStoreUuid);
     }
     return {};
-}
-
-void LasagnaServiceManager::afterStoreSync(std::function<void()> then)
-{
-    const auto session = _storeSession.lock();
-    if (!_isExternal || !session || !session->hubStatus(*_storeAttachment)) {
-        then();
-        return;
-    }
-    // The remote service reads the hub: wait off the GUI thread for a sync started now.
-    const quint64 generation = _requestGeneration;
-    vc3d::store::background<std::optional<vc::objects::HubSessionStatus>>(this,
-        [session, attachment = *_storeAttachment] { return session->syncHubAndWait(attachment, std::chrono::seconds(60)); },
-        [this, generation, then](vc3d::store::Outcome<std::optional<vc::objects::HubSessionStatus>> result) {
-            if (generation != _requestGeneration || !_storeAttachment) return;
-            const auto& status = result.value;
-            QString error;
-            if (!result.error.isEmpty())
-                error = tr("The object store did not sync with its hub: %1").arg(result.error);
-            else if (!status)
-                error = tr("The object store was detached.");
-            else if (!status->conflicts.empty())
-                error = tr("Resolve the object store's hub conflicts before running Lasagna.");
-            else if (!status->error.empty())
-                error = tr("The object store did not sync with its hub: %1").arg(QString::fromStdString(status->error));
-            if (error.isEmpty())
-                then();
-            else
-                emit optimizationError(error);
-        });
 }
 
 void LasagnaServiceManager::setObjectStore(std::shared_ptr<vc::objects::ObjectStoreSession> session,
@@ -873,23 +839,28 @@ void LasagnaServiceManager::setObjectStore(std::shared_ptr<vc::objects::ObjectSt
 {
     _storeSession = session;
     _storeAttachment = attachment;
-    _storePath.clear();
-    if (session && _storeAttachment) _storePath = QString::fromStdString(session->path(*_storeAttachment).string());
-    // The internal service works on one store file; restart it on the next job.
-    if (_process && !_isExternal && _serviceStorePath != _storePath) {
+    _storeLocation.clear();
+    // The service attaches the same store: a file path, or a hosted store's endpoint.
+    if (session && _storeAttachment)
+        _storeLocation = QString::fromStdString(session->location(*_storeAttachment));
+    // The internal service works on one store; restart it on the next job.
+    if (_process && !_isExternal && _serviceStoreLocation != _storeLocation) {
         stopService();
     }
 }
 
-std::optional<std::filesystem::path> LasagnaServiceManager::surfaceModel(const std::string& surfaceUuid) const
+bool LasagnaServiceManager::surfaceHasModel(const std::string& surfaceUuid) const
 {
     const auto session = _storeSession.lock();
     if (!session || !_storeAttachment) {
-        return std::nullopt;
+        return false;
     }
-    const auto model = session->artifactDirectory(*_storeAttachment, surfaceUuid, false) / "model.pt";
-    std::error_code ec;
-    return std::filesystem::is_regular_file(model, ec) ? std::optional(model) : std::nullopt;
+    try {
+        const auto files = session->artifacts(*_storeAttachment, surfaceUuid);
+        return std::any_of(files.begin(), files.end(), [](const auto& file) { return file.name == "model.pt"; });
+    } catch (const std::exception&) {
+        return false; // not a stored object (or the store is unavailable)
+    }
 }
 
 void LasagnaServiceManager::stopOptimization()
@@ -1237,10 +1208,6 @@ void LasagnaServiceManager::handleJobsReply(QNetworkReply* reply)
             QStringList surfaces;
             for (const QJsonValue& surface : obj[QStringLiteral("output_surfaces")].toArray()) {
                 surfaces.append(surface.toString());
-            }
-            // An external service pushed them to the hub: pull them now.
-            if (const auto session = _storeSession.lock(); _isExternal && session && _storeAttachment) {
-                session->syncHub(*_storeAttachment);
             }
             emit jobFinished(jobId, surfaces);
             emit optimizationFinished(surfaces);

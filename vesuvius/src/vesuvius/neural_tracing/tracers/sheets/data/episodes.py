@@ -21,9 +21,9 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from vc_reader.reader import ZarrReader, open_zarr
 
 from vesuvius.neural_tracing.tracers.shared.geometry import arclength, interp_at
-from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import ChunkedArray
 from vesuvius.neural_tracing.tracers.sheets.data.fibers import episode_fibers, fiber_pool
 from vesuvius.neural_tracing.tracers.sheets.data.patches import GridSpec, PatchInfo, PatchStore
 
@@ -121,13 +121,13 @@ class EpisodeSampler:
         """CT volume path -> reader, opened on first use."""
         return {}
 
-    def volume(self, root: str) -> ChunkedArray:
+    def volume(self, root: str) -> ZarrReader:
         """Reader of the CT volume the patches in directory ``root`` are on (data.patch_volumes)."""
         path = self.data.volume
         if self.data.patch_volumes:
             path = self.data.patch_volumes[self._dir_of[Path(root)]] or path
         if path not in self.volumes:
-            self.volumes[path] = ChunkedArray(f'{path}/{self.level}', self.data.worker_cache_mb << 20)
+            self.volumes[path] = open_zarr(path, level=self.level, memory_cache=self.data.worker_cache_mb << 20)
         return self.volumes[path]
 
     def _anchor(self, rng, info: PatchInfo, axis: int, sign_u: int, sign_v: int, check: bool = False):
@@ -347,7 +347,7 @@ class EpisodeSampler:
         scale = 1 << self.level
         origin = np.floor((lo[::-1]+.5)/scale-.5).astype(np.int64)  # zyx, level voxels
         size = tuple(int(v) for v in np.ceil((hi-lo)[::-1]/scale).astype(np.int64)+2)
-        return dict(block=self.volume(root).read(origin, size)[None], origin=origin)
+        return dict(block=self.volume(root).read_region(origin, size)[None], origin=origin)
 
     @cached_property
     def _by_key(self) -> dict:

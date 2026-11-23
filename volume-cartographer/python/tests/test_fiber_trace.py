@@ -9,13 +9,14 @@ import json
 from pathlib import Path
 
 import numpy as np
+from vc_reader.reader import ZarrWriter
 import pytest
 
 import os
 import vc
 if os.environ.get("VC_BUILD_PYTHON"):
     vc.__path__.insert(0, str(Path(os.environ["VC_BUILD_PYTHON"]) / "vc"))
-fiber_trace = pytest.importorskip("vc.fiber_trace")
+from vc import fiber_trace
 
 SHAPE = (16, 16, 64)  # z, y, x
 START = (8.0, 8.0, 8.0)  # x, y, z
@@ -23,20 +24,9 @@ TARGET = (56.0, 8.0, 8.0)
 
 
 def _write_u8_zarr(directory: Path, values: np.ndarray) -> None:
-    directory.mkdir(parents=True, exist_ok=True)
     values = np.ascontiguousarray(values, dtype=np.uint8)
-    (directory / ".zarray").write_text(json.dumps({
-        "zarr_format": 2,
-        "shape": list(values.shape),
-        "chunks": list(values.shape),
-        "dtype": "|u1",
-        "compressor": None,
-        "fill_value": 0,
-        "order": "C",
-        "filters": None,
-        "dimension_separator": ".",
-    }))
-    (directory / "0.0.0").write_bytes(values.tobytes())
+    writer = ZarrWriter.create(directory, shape=values.shape, chunks=values.shape, dtype="|u1", compressor=None)
+    writer[...] = values
 
 
 def _manifest(groups: dict[str, str], extra: dict | None = None) -> dict:

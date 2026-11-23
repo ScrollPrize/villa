@@ -31,6 +31,7 @@ struct Prefix {
 struct Object {
     std::string key;  // the full key, decoded
     std::uint64_t size = 0;
+    std::string etag, lastModified;  // as listed (ETag keeps its quotes); empty for local files
 };
 
 struct ListPage {

@@ -21,8 +21,6 @@ LAYER = ("utils/io", "data")
 
 # (path relative to src/vesuvius, function name) -> why swallowing is correct here.
 ALLOWED = {
-    ("utils/io/zarr_utils.py", "_is_ome_zarr"):
-        "reads .zattrs which the code documents as optional; the result does not depend on it",
     ("data/zarr_chunk_index.py", "_zarray_signature"):
         "computes a cache signature; None means 'no signature', a documented degraded mode",
 }

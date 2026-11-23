@@ -5,8 +5,9 @@
 #include "OpenDataLasagna.hpp"
 
 #include "vc/core/types/VolumePkg.hpp"
+#include "vc/core/util/RemoteCacheSettings.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
-#include "vc/core/render/ZarrChunkFetcher.hpp"
+#include "vc_reader/zarr.hpp"
 
 #include <vc_object_store/objects/CatalogStore.hpp>
 #include <vc_object_store/objects/Project.hpp>
@@ -27,25 +28,34 @@ namespace {
 // A catalog Zarr VC3D opens remotely.
 bool isRemoteZarr(const vcr::catalog::OpenDataArtifact& artifact)
 {
-    return vcr::catalog::isZarrArtifact(artifact) && vc::project::isLocationRemote(artifact.url());
+    return vcr::catalog::isZarrArtifact(artifact) && vcr::zarr::isRemote(artifact.url());
 }
 
 void preflightPredictionAndSource(const std::string& predictionUrl,
                                   const std::string& sourceUrl,
-                                  int sourceLevel)
+                                  int sourceLevel,
+                                  const std::filesystem::path& remoteCacheRoot)
 {
-    auto prediction = vc::render::openHttpZarrPyramid(
-        predictionUrl, vc::HttpAuth{}, 0); // explicit zero requests strict validation
-    auto source = vc::render::openHttpZarrPyramid(
-        sourceUrl, vc::HttpAuth{}, sourceLevel);
-    if (prediction.shapes.empty() || source.shapes.empty())
-        throw std::runtime_error("prediction/source descriptor is empty");
-    if (prediction.shapes[0] != source.shapes[0])
+    // Through the caches, under VC's cache settings: what a volume's pyramid looks like
+    // is kept with them.
+    const auto options = vc::settings::remoteOpenOptions(remoteCacheRoot);
+    auto predictionGroup = vcr::zarr::Group::open(predictionUrl, options);
+    const auto levelMeta = [](vcr::zarr::Group&& group, int level) {
+        const auto meta = group.arrayMeta(std::to_string(level));
+        if (!meta)
+            throw std::runtime_error("level /" + std::to_string(level) + " is missing from " + group.location());
+        return *meta;
+    };
+    // Level 0's own OME transform: placements are only relative to it.
+    const auto declared = vcr::zarr::declaredPlacement(predictionGroup.attributes(), "0");
+    const auto prediction = levelMeta(std::move(predictionGroup), 0);
+    const auto source = levelMeta(vcr::zarr::Group::open(sourceUrl, options), sourceLevel);
+    if (prediction.shape != source.shape)
         throw std::runtime_error("prediction /0 shape does not match source physical /" +
                                  std::to_string(sourceLevel));
     if (prediction.dtype != source.dtype)
         throw std::runtime_error("prediction/source dtype mismatch");
-    if (!prediction.physicalLevelZeroTransformIsIdentity)
+    if (declared.scale != vcr::zarr::LevelPlacement{}.scale || declared.offset != vcr::zarr::LevelPlacement{}.offset)
         throw std::runtime_error("prediction /0 coordinate scale must be identity");
 }
 
@@ -56,7 +66,7 @@ bool hasVolumeEntry(const VolumePkg& pkg, const std::string& location)
     const auto source = vc::parseRemoteVolumeSpec(location).sourceUrl;
     return std::any_of(entries.begin(), entries.end(), [&](const auto& entry) {
         return entry.location == location ||
-               (vc::project::isLocationRemote(entry.location) &&
+               (vcr::zarr::isRemote(entry.location) &&
                 vc::parseRemoteVolumeSpec(entry.location).sourceUrl == source);
     });
 }
@@ -159,7 +169,7 @@ std::shared_ptr<VolumePkg> createOpenDataSampleProject(
     // Catalog loads remain unresolved until normal-grid paths have been
     // reconciled.
     vc::project::LoadOptions loadOptions;
-    loadOptions.catalog = vc3d::opendata::cachedCatalog();
+    loadOptions.catalog = vcr::catalog::cachedManifest(vcr::catalog::catalogCacheFile(std::string(vcr::catalog::kDefaultManifestUrl)));
     loadOptions.deferResolution = true;
     auto pkg = VolumePkg::open(projectPath, loadOptions);
 
@@ -167,7 +177,7 @@ std::shared_ptr<VolumePkg> createOpenDataSampleProject(
                                                         selection ? selection->segmentIds : std::nullopt);
     if (surfaces.added > 0)
         result.messages.push_back("Added " + std::to_string(surfaces.added) + " catalog surface(s).");
-    auto attachResult = attachOpenDataSampleVolumes(*pkg, sample, selection);
+    auto attachResult = attachOpenDataSampleVolumes(*pkg, sample, selection, remoteCacheRoot);
     result.supportedVolumes = attachResult.supportedVolumes;
     result.attachedVolumeEntries = attachResult.attachedVolumeEntries;
     result.skippedVolumes = attachResult.skippedVolumes;
@@ -220,7 +230,8 @@ std::shared_ptr<VolumePkg> createOpenDataSampleProject(
 OpenDataSampleProjectResult attachOpenDataSampleVolumes(
     VolumePkg& pkg,
     const vcr::catalog::OpenDataSample& sample,
-    const OpenDataResourceSelection* selection)
+    const OpenDataResourceSelection* selection,
+    const std::filesystem::path& remoteCacheRoot)
 {
     OpenDataSampleProjectResult result;
     std::vector<std::string> supportedVolumeIds;
@@ -397,7 +408,8 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
 
         try {
             preflightPredictionAndSource(
-                candidate.predictionUrl, candidate.sourceUrl, level);
+                candidate.predictionUrl, candidate.sourceUrl, level,
+                remoteCacheRoot);
         } catch (const std::exception& e) {
             ++result.failedVolumes;
             result.messages.push_back(

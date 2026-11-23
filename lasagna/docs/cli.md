@@ -14,7 +14,6 @@ Each part provides `add_args(parser)` + `from_args(args)`:
   - `--winding-volume` optional winding volume zarr path
   - `--cuda-gridsample` enable custom CUDA uint8 sampling kernel
   - `--erode-valid-mask` erode valid mask by N pixels
-  - `--sparse-prefetch-backend` sparse streaming prefetcher (`tensorstore` default; `python-zarr` keeps the zarr fallback path)
 
 - **model**: [`cli_model.py`](../cli_model.py)
   - `--mesh-step` (default 100) height step in fullres voxels
@@ -71,16 +70,22 @@ For VC3D integration, VC3D is transport only: it sends the selected tifxyz/model
 
 ### Stored surfaces (VC3D)
 
-VC3D works on surfaces in a VC object store, never on tifxyz directories. Start the service with `--store PATH`
-(a hub replica or local store; `/health` reports its `store_uuid`); VC3D starts its internal service on its own
-store file with `--shared-store`, leaving hub sync to VC3D's session. A VC3D request names that store
-(`store_uuid`) and the volume it works in (`volume_uuid`); its surface references are
-`{"type": "surface", "uuid": ..., "revision": optional geometry revision}` in `external_surfaces`, the atlas
-`base.ref`, and `model` (the model checkpoint a fit left in that surface's artifact directory, `<hub>.artifacts/<uuid>/model.pt`).
-The service syncs the store before a job, the fit reads the surfaces directly (`fit.py --store --volume-uuid`,
-references `vcobj:<uuid>[@<revision>]`), and the export creates new surfaces in the store
-(`fit2tifxyz.py --store PATH --volume-uuid UUID [--tag TAG]`): the `d` and flow-gate channels are surface
-channels, `model.pt`/`model_params.json`/mask debug files go to the surface's artifact directory, and the
+VC3D works on surfaces in a VC object store, never on tifxyz directories. Start the service with `--store LOCATION`:
+a store file, or the endpoint of the `vc_object_server` that hosts the store (`http://host:8750`, e.g. through an SSH
+tunnel), so a service on another machine works on the store VC3D attached; `/health` reports its `store_uuid`. VC3D
+starts its internal service on its attached store (file or endpoint) with `--shared-store`. A VC3D request names that store
+(`store_uuid`) and the volume it works in (`volume_uuid`); its selected surface references are
+`{"type": "surface", "reference": {"store": ..., "generation": ..., "object": ..., "version": ...}}` in `external_surfaces`, the atlas
+`base.ref`, and `model` (the model checkpoint a fit published with that surface: its `model.pt` artifact, read as a
+local copy in the service's object cache, `<object store dir>/artifacts/<sha256>/model.pt`).
+The fit reads the surfaces directly (`fit.py --store --volume-uuid`).
+Structured configurations retain the same reference dictionary through geometry and checkpoint reads.
+CLI locators `vcobj:<uuid>[@[<store>/]<generation>/<version>]`, current `{"type":"surface","uuid":...}`
+and previously saved flattened JSON selectors are decoded once by the shared native input API; there is no Lasagna tuple API.
+The export creates new surfaces in the store
+(`fit2tifxyz.py --store LOCATION --volume-uuid UUID [--tag TAG]`): the `d` and flow-gate channels are surface
+channels, `model.pt`/`model_params.json`/mask debug files are published as the surface's artifacts (written to a
+temporary directory, then stored with the surface's version in one checked request), and the
 correction-point and atlas-control results are point collections attached to the surface (record meta `role`
 `lasagna_corr_points_results` / `lasagna_atlas_control_points_results`, an `attachment` relationship that is
 never a graph link). Provenance lists the stored surfaces the job read. The job reports the new surfaces'

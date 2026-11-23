@@ -11,7 +11,6 @@ import numpy as np
 from vesuvius.tifxyz_label_transfer.core import Surface, SurfaceMapper
 from vesuvius.tifxyz_label_transfer.prepare_canvas_offset_evidence import ZarrLevel
 from vesuvius.tifxyz_label_transfer.self_render_tifxyz import (
-    RawChunkSampler,
     _annotation_offsets,
     _canvas_shape_check,
     _measurement_is_translation,
@@ -23,7 +22,6 @@ from vesuvius.tifxyz_label_transfer.self_render_tifxyz import (
     build_parser,
     mapped_source_tile_geometry,
     matched_offsets,
-    required_chunks,
     surface_tile_geometry,
 )
 
@@ -43,7 +41,7 @@ def plane_surface(height: int, width: int) -> Surface:
 
 def raw_info() -> ZarrLevel:
     return ZarrLevel(
-        remote="remote:raw.zarr",
+        remote="s3://remote/raw.zarr",
         level="0",
         attrs={},
         metadata={
@@ -60,21 +58,21 @@ def raw_info() -> ZarrLevel:
     )
 
 
-class _FakeSampler:
+class _FakeInfo:
     def __init__(self, dtype: str) -> None:
-        self.info = type("Info", (), {"metadata": {"dtype": dtype}})()
+        self.metadata = {"dtype": dtype}
 
 
 class ToUint8Tests(unittest.TestCase):
     def test_uint16_values_scale_instead_of_wrapping(self) -> None:
-        sampler = _FakeSampler("<u2")
+        sampler = _FakeInfo("<u2")
         values = np.asarray([0.0, 257.0, 65535.0])
         np.testing.assert_array_equal(
             _to_uint8(values, sampler), np.asarray([0, 1, 255], dtype=np.uint8)
         )
 
     def test_uint8_values_pass_through_with_clipping(self) -> None:
-        sampler = _FakeSampler("|u1")
+        sampler = _FakeInfo("|u1")
         values = np.asarray([-3.0, 0.4, 254.6, 300.0])
         np.testing.assert_array_equal(
             _to_uint8(values, sampler), np.asarray([0, 0, 255, 255], dtype=np.uint8)
@@ -241,7 +239,7 @@ class SurfaceGeometryTests(unittest.TestCase):
         )
         with self.assertRaises(ValueError) as caught:
             _source_raw_volume_remote(info, None, None)
-        self.assertIn("--source-raw-rclone-root", str(caught.exception))
+        self.assertIn("--source-raw-root", str(caught.exception))
         self.assertIn("--source-raw-volume", str(caught.exception))
 
     def test_annotation_offsets_include_slice_step(self) -> None:
@@ -291,18 +289,6 @@ class SurfaceGeometryTests(unittest.TestCase):
             atol=1e-6,
         )
 
-    def test_required_chunks_include_trilinear_neighbours(self) -> None:
-        xyz = np.asarray([[[1.5, 1.5, 1.5]]])
-        normals = np.asarray([[[0.0, 0.0, 1.0]]])
-        chunks = required_chunks(
-            xyz,
-            normals,
-            np.asarray([[True]]),
-            [0.0],
-            raw_info(),
-        )
-        self.assertEqual(chunks, {(0, 0, 0)})
-
     def test_smaller_source_surface_maps_only_its_target_overlap(self) -> None:
         source = plane_surface(4, 4)
         source.x += 2.0
@@ -335,60 +321,6 @@ class SurfaceGeometryTests(unittest.TestCase):
 
     def test_matched_offsets_do_not_duplicate_a_center_only_sample(self) -> None:
         self.assertEqual(matched_offsets([0.0], 2.4, 2.4), [0.0])
-
-
-class RawSamplerTests(unittest.TestCase):
-    def test_trilinear_sampling_matches_eight_corner_average(self) -> None:
-        volume = np.arange(64, dtype=np.uint8).reshape(4, 4, 4)
-        with tempfile.TemporaryDirectory() as directory:
-            chunk_path = Path(directory) / "0" / "0" / "0"
-            chunk_path.parent.mkdir(parents=True)
-            chunk_path.write_bytes(volume.tobytes())
-            sampler = RawChunkSampler(raw_info(), Path(directory))
-            actual = sampler.sample(
-                np.asarray([[1.5, 1.5, 1.5]], dtype=np.float64)
-            )
-
-        expected = volume[1:3, 1:3, 1:3].mean()
-        np.testing.assert_allclose(actual, [expected], atol=1e-6)
-
-    def test_block_sampling_matches_scalar_sampler(self) -> None:
-        volume = np.arange(64, dtype=np.uint8).reshape(4, 4, 4)
-        with tempfile.TemporaryDirectory() as directory:
-            chunk_path = Path(directory) / "0" / "0" / "0"
-            chunk_path.parent.mkdir(parents=True)
-            chunk_path.write_bytes(volume.tobytes())
-            sampler = RawChunkSampler(raw_info(), Path(directory))
-            block, origin = sampler.load_block({(0, 0, 0)})
-            points = np.asarray([[1.25, 1.5, 1.75]], dtype=np.float64)
-
-            scalar = sampler.sample(points)
-            blocked = sampler.sample_block(points, block, origin)
-
-        np.testing.assert_allclose(blocked, scalar, atol=1e-6)
-
-    def test_block_sampling_clamps_to_logical_shape_not_chunk_padding(self) -> None:
-        info = raw_info()
-        info = ZarrLevel(
-            **{
-                **info.__dict__,
-                "metadata": {**info.metadata, "shape": [3, 3, 3]},
-                "level_zero_metadata": {"shape": [3, 3, 3]},
-            }
-        )
-        volume = np.full((4, 4, 4), 255, dtype=np.uint8)
-        volume[:3, :3, :3] = np.arange(27, dtype=np.uint8).reshape(3, 3, 3)
-        with tempfile.TemporaryDirectory() as directory:
-            chunk_path = Path(directory) / "0" / "0" / "0"
-            chunk_path.parent.mkdir(parents=True)
-            chunk_path.write_bytes(volume.tobytes())
-            sampler = RawChunkSampler(info, Path(directory))
-            block, origin = sampler.load_block({(0, 0, 0)})
-            actual = sampler.sample_block(
-                np.asarray([[4.0, 4.0, 4.0]]), block, origin
-            )
-
-        np.testing.assert_allclose(actual, [volume[2, 2, 2]])
 
 
 if __name__ == "__main__":

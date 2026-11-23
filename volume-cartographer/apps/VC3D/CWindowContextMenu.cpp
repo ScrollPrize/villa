@@ -1,3 +1,4 @@
+#include "ToolOutput.hpp"
 #include "CWindow.hpp"
 #include <iostream>
 #include "SurfacePanelController.hpp"
@@ -23,7 +24,7 @@
 #include "SurfaceCatalog.hpp"
 #include "elements/VolumeSelector.hpp"
 #include "elements/JsonProfilePresets.hpp"
-#include "utils/Json.hpp"
+#include <nlohmann/json.hpp>
 #include <vc_object_store/Uuid.hpp>
 
 
@@ -37,15 +38,13 @@ void CWindow::onVisLasagnaObj(const std::string& segmentId)
         return;
     }
     // The model a fit left with the surface in the store.
-    if (!_surfaceCatalog || !_surfaceCatalog->attachment() || !mgr.surfaceModel(segmentId)) {
+    if (!_surfaceCatalog || !_surfaceCatalog->attachment() || !mgr.surfaceHasModel(segmentId)) {
         QMessageBox::warning(this, tr("Error"), tr("This surface has no Lasagna model."));
         return;
     }
 
-    // Default output directory: the surface's artifacts, beside its model
-    QString defaultOutput = QString::fromStdString(
-        (_surfaceCatalog->session()->artifactDirectory(*_surfaceCatalog->attachment(), segmentId, false) / "vis_obj")
-            .string());
+    // Default output directory: the surface's local export directory.
+    QString defaultOutput = vc3d::surfaceExportDirectory(QString::fromStdString(segmentId)) + QStringLiteral("/vis_obj");
 
     VisLasagnaObjDialog dlg(this, defaultOutput);
     if (dlg.exec() != QDialog::Accepted) {

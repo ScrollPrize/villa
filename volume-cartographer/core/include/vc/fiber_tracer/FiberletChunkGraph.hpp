@@ -6,7 +6,6 @@
 #include "vc/fiber_tracer/FiberPaths.hpp"
 
 #include <array>
-#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -20,13 +19,12 @@ namespace vc::fiber_tracer
 
 enum class FiberletGraphQueryStatus {
     Ready,
-    Pending,
     Error,
 };
 
 template <typename T>
 struct FiberletGraphQuery {
-    FiberletGraphQueryStatus status = FiberletGraphQueryStatus::Pending;
+    FiberletGraphQueryStatus status = FiberletGraphQueryStatus::Error;
     T value;
     std::string error;
 };
@@ -84,45 +82,36 @@ struct FiberletStoredRouteLease {
 };
 
 using FiberletAnchorView =
-    std::function<std::shared_ptr<const std::vector<FiberletStoredAnchor>>(const vc::render::ChunkKey& key, std::shared_ptr<const FiberletAnchorChunkPayload> canonicalChunk)>;
+    std::function<std::shared_ptr<const std::vector<FiberletStoredAnchor>>(const FiberletChunkKey& key, std::shared_ptr<const FiberletAnchorChunkPayload> canonicalChunk)>;
 
 class FiberletChunkGraphSource
 {
 public:
-    using WaitExecutor = std::function<void(const std::function<void()>&)>;
-    void setWaitExecutor(WaitExecutor wait) { wait_ = std::move(wait); }
     FiberletChunkGraphSource(
         std::shared_ptr<FiberletChunkDataset> anchorDataset,
-        std::shared_ptr<vc::render::ChunkCache> anchorCache,
+        FiberletChunkRead anchorRead,
         std::shared_ptr<FiberletChunkDataset> fiberletDataset,
-        std::shared_ptr<vc::render::ChunkCache> fiberletCache,
+        FiberletChunkRead fiberletRead,
         FiberletPathConfig pathConfig = {},
         FiberletAnchorView anchorView = {});
 
-    [[nodiscard]] FiberletGraphQuery<FiberletIncidentLease> incidentEdges(const FiberletStorageKey& anchor, bool blocking = false) const;
-    [[nodiscard]] FiberletGraphQuery<FiberletAnchorLease> anchor(const FiberletStorageKey& anchor, bool blocking = false) const;
-    [[nodiscard]] FiberletGraphQuery<FiberletAnchorChunkLease> anchorsInChunk(const vc::render::ChunkKey& chunk, bool blocking = false) const;
-    [[nodiscard]] FiberletGraphQuery<FiberletPrefixChunkLease> prefixesInChunk(const vc::render::ChunkKey& chunk, bool blocking = false) const;
-    [[nodiscard]] FiberletGraphQuery<FiberletRouteChunkLease> routesInChunk(const vc::render::ChunkKey& chunk, bool blocking = false) const;
-    void prefetchAnchorChunks(
-        std::span<const vc::render::ChunkKey> chunks,
-        bool blocking = false) const;
-    void prefetchFiberletChunks(
-        std::span<const vc::render::ChunkKey> chunks,
-        bool blocking = false) const;
-    [[nodiscard]] std::vector<vc::render::ChunkKey> incidentPrefixChunks(
+    [[nodiscard]] FiberletGraphQuery<FiberletIncidentLease> incidentEdges(const FiberletStorageKey& anchor) const;
+    [[nodiscard]] FiberletGraphQuery<FiberletAnchorLease> anchor(const FiberletStorageKey& anchor) const;
+    [[nodiscard]] FiberletGraphQuery<FiberletAnchorChunkLease> anchorsInChunk(const FiberletChunkKey& chunk) const;
+    [[nodiscard]] FiberletGraphQuery<FiberletPrefixChunkLease> prefixesInChunk(const FiberletChunkKey& chunk) const;
+    [[nodiscard]] FiberletGraphQuery<FiberletRouteChunkLease> routesInChunk(const FiberletChunkKey& chunk) const;
+    [[nodiscard]] std::vector<FiberletChunkKey> incidentPrefixChunks(
         std::span<const FiberletStorageKey> anchors) const;
-    [[nodiscard]] FiberletGraphQuery<FiberletEdgeLease> edge(const FiberletStorageId& fiberlet, bool blocking = false) const;
+    [[nodiscard]] FiberletGraphQuery<FiberletEdgeLease> edge(const FiberletStorageId& fiberlet) const;
     [[nodiscard]] FiberletGraphQuery<FiberletStoredRouteLease> storedRoute(
-        const FiberletStorageId& fiberlet, bool blocking = false) const;
-    [[nodiscard]] FiberletGraphQuery<FiberletRouteLease> route(const FiberletStorageId& fiberlet, bool blocking = false) const;
+        const FiberletStorageId& fiberlet) const;
+    [[nodiscard]] FiberletGraphQuery<FiberletRouteLease> route(const FiberletStorageId& fiberlet) const;
     [[nodiscard]] FiberletGraphQuery<FiberletReplaySourceArc> directedEdge(
-        const DirectedFiberletStorageId& fiberlet, bool blocking = false) const;
+        const DirectedFiberletStorageId& fiberlet) const;
     [[nodiscard]] FiberletGraphQuery<std::optional<FiberletReplaySourceTransition>> transition(
         const FiberletReplaySourceArc& incoming,
         const FiberletReplaySourceArc& outgoing,
-        float maximumJoinAngleDegrees,
-        bool blocking = false) const;
+        float maximumJoinAngleDegrees) const;
     [[nodiscard]] FiberletGraphQuery<std::optional<FiberletReplaySourceTransition>> transitionAtAnchor(
         const FiberletReplaySourceArc& incoming,
         const FiberletReplaySourceArc& outgoing,
@@ -139,18 +128,14 @@ public:
 
 private:
     [[nodiscard]] FiberletGraphQuery<FiberletAnchorLease> endpoint(
-        const FiberletStorageKey&, const FiberletPrefixChunkPayload&, bool blocking) const;
-    [[nodiscard]] vc::render::ChunkResult fetchChunk(
-        const std::shared_ptr<vc::render::ChunkCache>& cache,
-        const vc::render::ChunkKey& key, bool blocking) const;
-    WaitExecutor wait_;
-    [[nodiscard]] vc::render::ChunkKey ownerChunk(const FiberletStorageKey& anchor, int level) const;
-    [[nodiscard]] std::vector<vc::render::ChunkKey> incidentOwnerChunks(const FiberletStorageKey& anchor) const;
+        const FiberletStorageKey&, const FiberletPrefixChunkPayload&) const;
+    [[nodiscard]] FiberletChunkKey ownerChunk(const FiberletStorageKey& anchor, int level) const;
+    [[nodiscard]] std::vector<FiberletChunkKey> incidentOwnerChunks(const FiberletStorageKey& anchor) const;
 
     std::shared_ptr<FiberletChunkDataset> anchorDataset_;
-    std::shared_ptr<vc::render::ChunkCache> anchorCache_;
+    FiberletChunkRead anchorRead_;
     std::shared_ptr<FiberletChunkDataset> fiberletDataset_;
-    std::shared_ptr<vc::render::ChunkCache> fiberletCache_;
+    FiberletChunkRead fiberletRead_;
     FiberletPathConfig pathConfig_;
     FiberletAnchorView anchorView_;
 };
@@ -173,13 +158,13 @@ class FiberletStoredReplayGraphSource final : public FiberletReplayGraphSource
 public:
     FiberletStoredReplayGraphSource(
         std::shared_ptr<FiberletChunkDataset> dataset,
-        FiberletChunkCacheOptions cacheOptions = {},
+        std::shared_ptr<vcr::MemoryCache> memoryCache = {},
         float maximumJoinAngleDegrees = 45.0F);
     FiberletStoredReplayGraphSource(
         std::shared_ptr<FiberletChunkDataset> anchorDataset,
-        std::shared_ptr<vc::render::ChunkCache> anchorCache,
+        FiberletChunkRead anchorRead,
         std::shared_ptr<FiberletChunkDataset> fiberletDataset,
-        std::shared_ptr<vc::render::ChunkCache> fiberletCache,
+        FiberletChunkRead fiberletRead,
         FiberletPathConfig pathConfig,
         float maximumJoinAngleDegrees = 45.0F,
         FiberletAnchorView anchorView = {});
@@ -207,14 +192,13 @@ public:
 
     [[nodiscard]] std::vector<FiberletStoredAnchor> anchorsInBaseBox(
         const cv::Vec3d& minimumBaseXYZ,
-        const cv::Vec3d& maximumBaseXYZ,
-        std::size_t prefetchWindow = 0) const;
+        const cv::Vec3d& maximumBaseXYZ) const;
     [[nodiscard]] const FiberletDatasetMetadata& metadata() const noexcept;
 
     // Include all edges incident to anchors in the half-open graph box and
     // their outside endpoints, but no joins at outside endpoints. The seed
     // box is separately bounded so lookahead may extend beyond the output crop.
-    // Loading uses the source's existing cache; the returned graph owns its
+    // Each chunk is decoded once for the pass; the returned graph owns its
     // geometry and supports concurrent, cache-independent queries.
     [[nodiscard]] FiberletMaterializedReplayGraph materializeBaseBox(
         const cv::Vec3d& minimumBaseXYZ, const cv::Vec3d& maximumBaseXYZ,
@@ -225,10 +209,12 @@ public:
         std::size_t parallelThreads = 1) const;
 
 private:
+    std::shared_ptr<FiberletChunkDataset> anchorDataset_;
     std::shared_ptr<FiberletChunkDataset> dataset_;
-    std::shared_ptr<vc::render::ChunkCache> anchorCache_;
-    std::shared_ptr<vc::render::ChunkCache> pathCache_;
     FiberletPathConfig pathConfig_;
+    FiberletChunkRead anchorRead_;
+    FiberletChunkRead pathRead_;
+    FiberletAnchorView anchorView_;
     FiberletChunkGraphSource chunks_;
     float maximumJoinAngleDegrees_ = 45.0F;
 };

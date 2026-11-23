@@ -1,3 +1,4 @@
+import functools
 import os
 
 import numpy as np
@@ -25,6 +26,14 @@ from gap_parameterization import (
 )
 from geom_utils import expm_2x2, grid_sample_border, interp1d
 from sample_spiral import get_bounding_windings, get_theta_and_radii
+
+
+@functools.lru_cache(maxsize=None)
+def _acw_flip_scale(device):
+    # Cached so the ACW flip does not do a blocking host-to-device copy per
+    # call; built outside inference mode so it is also usable for training.
+    with torch.inference_mode(False):
+        return torch.tensor([1., 1., -1.], device=device)
 
 
 class IntegratedFlowDiffeomorphism(pyro.distributions.transforms.Transform):
@@ -455,7 +464,7 @@ class SpiralAndTransform(nn.Module):
         else:
             assert self.spiral_outward_sense == 'ACW'
             # To make spiral go anticlockwise in slice space (going outwards from the centre), flip it horizontally
-            maybe_flip = [pyro.distributions.transforms.AffineTransform(loc=0., scale=torch.tensor([1., 1., -1.], device=self.device))]
+            maybe_flip = [pyro.distributions.transforms.AffineTransform(loc=0., scale=_acw_flip_scale(self.device))]
         return gap_expander, maybe_flip, diffeomorphism, truncate_frac
 
     def get_slice_to_spiral_transform(self, truncate_at_step=None, shared=None):

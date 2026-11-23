@@ -17,25 +17,17 @@ from unittest import mock
 import numpy as np
 import pytest
 import torch
-import zarr
+from vc_reader.reader import ZarrWriter
 
 from vesuvius.neural_tracing.winding_models import (
     export_spiral_supervision as exporter,
     infer_winding_volume as iwv,
 )
 
-# The native phase cache is written with the zarr v3 API; the direct store
-# is plain .npy files.
-requires_zarr_v3 = pytest.mark.skipif(
-    int(zarr.__version__.split(".", 1)[0]) < 3,
-    reason="the native phase cache needs zarr>=3")
-
 TRANSVERSE = 8
 RAY_LENGTH = 64
 NUM_RAYS = 70
 PART_RAYS = 16
-SKIPPED = {5, 33, 34}  # slabs whose volume chunks are "truncated"
-MALFORMED = "decoded chunk byte size does not match full chunk shape"
 ARRAYS = ("ray_origin_zyx", "ray_step_zyx", "crossing_offsets",
           "crossing_t", "crossing_level", "seed_winding")
 
@@ -120,6 +112,7 @@ def run(tmp_path, monkeypatch):
         dr_per_winding=16.0,
         umbilicus_path="umbilicus.json",
     )
+    ZarrWriter.create(tmp_path / "volume.zarr" / "0", shape=(8, 8, 8), chunks=(8, 8, 8), dtype="uint8")
     model_path = tmp_path / "model.pth"
     torch.save({
         "config": {
@@ -148,8 +141,6 @@ def run(tmp_path, monkeypatch):
             if index == fail_at:
                 raise ValueError("simulated interruption")
             extracted.append(index)
-            if index in SKIPPED:
-                raise RuntimeError(MALFORMED)
             image = np.full(valid.shape[1:], index, dtype=np.float32)
             return image, valid[index], self.slab_frame(direction, origin)
 
@@ -189,7 +180,6 @@ def _store_arrays(root):
     return manifest, {key: np.concatenate(value) for key, value in values.items()}
 
 
-@requires_zarr_v3
 def test_direct_store_matches_cache_then_export(run, tmp_path):
     run(tmp_path / "cache.zarr", "--native-phase-only")
     exporter.export_spiral_supervision(
@@ -204,13 +194,13 @@ def test_direct_store_matches_cache_then_export(run, tmp_path):
         np.testing.assert_array_equal(actual[key], expected[key], err_msg=key)
     # Slab 7 has an invalid anchor and keeps no crossings.
     assert direct["num_rays"] == cached["num_rays"]
-    assert 0 < direct["num_rays"] < NUM_RAYS - len(SKIPPED)
+    assert 0 < direct["num_rays"] < NUM_RAYS
     assert direct["num_crossings"] == cached["num_crossings"] > 0
     assert direct["export_mode"] == "direct"
     assert direct["source_cache"] is None
     attributes = direct["source_attributes"]
     assert attributes["num_slabs"] == NUM_RAYS
-    assert attributes["num_available_slabs"] == NUM_RAYS - len(SKIPPED)
+    assert attributes["num_available_slabs"] == NUM_RAYS
     for key in ("ray_length", "transverse_size", "column_stride", "spacing",
                 "model_ckpt", "reference_zarr", "z_range", "seed_windings"):
         assert attributes[key] == cached["source_attributes"][key], key

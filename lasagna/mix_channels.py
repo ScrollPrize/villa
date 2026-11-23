@@ -23,14 +23,14 @@ import threading
 import time
 
 import numpy as np
-import zarr
+from vc_reader.reader import ZarrReader, ZarrWriter, open_zarr
 
 
 CHUNK_SPATIAL = 32  # chunk size for all spatial dims
 WORK_TILE = 128     # work unit tile size (multiple of CHUNK_SPATIAL)
 
 
-def _parse_params(arr: zarr.Array) -> dict:
+def _parse_params(arr: ZarrReader) -> dict:
     params = dict(getattr(arr, "attrs", {}).get("preprocess_params", {}) or {})
     if not params:
         raise ValueError(f"zarr missing preprocess_params: shape={arr.shape}")
@@ -107,12 +107,8 @@ def main():
     args = ap.parse_args()
 
     # --- Open sources ---
-    base = zarr.open(args.base, mode="r")
-    other = zarr.open(args.other, mode="r")
-    if not isinstance(base, zarr.Array):
-        raise ValueError(f"--base must point to a zarr Array, got {type(base)}")
-    if not isinstance(other, zarr.Array):
-        raise ValueError(f"--other must point to a zarr Array, got {type(other)}")
+    base = open_zarr(args.base)
+    other = open_zarr(args.other)
 
     base_params = _parse_params(base)
     other_params = _parse_params(other)
@@ -154,7 +150,7 @@ def main():
             out_channels.append(name)
 
     # Build mapping: out_index -> (source_zarr, source_channel_index)
-    channel_map: list[tuple[zarr.Array, int, str]] = []
+    channel_map: list[tuple[ZarrReader, int, str]] = []
     for name in out_channels:
         if name in channels_from_other:
             channel_map.append((other, other_ci[name], name))
@@ -203,15 +199,7 @@ def main():
     print(f"[mix_channels] output {args.output} shape={out_shape} chunks={out_chunks} workers={n_workers}")
 
     # --- Create output ---
-    out = zarr.open(
-        args.output,
-        mode="w",
-        shape=out_shape,
-        chunks=out_chunks,
-        dtype=np.uint8,
-        fill_value=0,
-        zarr_format=2,
-    )
+    out = ZarrWriter.create(args.output, shape=out_shape, chunks=out_chunks, dtype=np.uint8, overwrite=True)
 
     # Provenance metadata
     gmag_scale = float(base_params.get("grad_mag_encode_scale",
@@ -234,7 +222,7 @@ def main():
     # Each work unit covers 128³ voxels (= 64 underlying 32³ zarr chunks).
     # Clamp to the crop region for partial border tiles.
     WT = WORK_TILE
-    work: list[tuple[int, int, int, int, int, int, int, zarr.Array, int]] = []
+    work: list[tuple[int, int, int, int, int, int, int, ZarrReader, int]] = []
     for ci, (src, si, _name) in enumerate(channel_map):
         for zs in range(z0 // WT * WT, z1, WT):
             ze = min(zs + WT, z1)
@@ -254,12 +242,9 @@ def main():
 
     def _copy_chunk(ci: int, zs: int, ze: int,
                     ys: int, ye: int, xs: int, xe: int,
-                    src: zarr.Array, si: int):
+                    src: ZarrReader, si: int):
         nonlocal done_count
-        # Materialize to numpy before writing to avoid zarr internal
-        # executor conflicts between concurrent read and write paths.
-        data = np.array(src[si, zs:ze, ys:ye, xs:xe])
-        out[ci, zs:ze, ys:ye, xs:xe] = data
+        out[ci, zs:ze, ys:ye, xs:xe] = src[si, zs:ze, ys:ye, xs:xe]
         with lock:
             done_count += 1
             n = done_count
@@ -273,8 +258,6 @@ def main():
 
     with ThreadPoolExecutor(max_workers=n_workers) as pool:
         futs = [pool.submit(_copy_chunk, *w) for w in work]
-        # Collect all results before pool shutdown to ensure zarr's
-        # internal async tasks finish while the executor is alive.
         errors = []
         for f in as_completed(futs):
             try:

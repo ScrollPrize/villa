@@ -1,4 +1,5 @@
 #include "Fiber3DRibbonControls.hpp"
+#include "OpenedVolumes.hpp"
 #include "Fiber3DRibbon.hpp"
 #include "Fiber3DCanvas.hpp"
 #include "CState.hpp"
@@ -11,8 +12,6 @@
 #include "OpenDataLasagna.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
-#include "vc/core/render/ChunkCache.hpp"
-#include "vc/core/render/ChunkedPlaneSampler.hpp"
 #include <QFutureWatcher>
 #include <QLabel>
 #include <QSettings>
@@ -42,10 +41,7 @@ struct Fiber3DRibbonControls::Impl {
     QToolButton* button;
     QSpinBox* width;
     QLabel* status;
-    QTimer debounce, refresh;
-    std::shared_ptr<vc::render::ChunkCache> cache;
-    vc::render::IChunkedArray::ChunkReadyCallbackId listener = 0;
-    std::shared_ptr<std::atomic_bool> chunksReady = std::make_shared<std::atomic_bool>(false);
+    QTimer debounce;
     int requestedLevel = -1;
     bool suspended = false;
     QFutureWatcher<Result> watcher;
@@ -101,17 +97,8 @@ struct Fiber3DRibbonControls::Impl {
         layout->addWidget(status);
         q->hide();
         button->setEnabled(false);
-        refresh.setInterval(500);
-        QObject::connect(&refresh, &QTimer::timeout, q, [this] {
-            if (busy || suspended || !button->isChecked() || !image || image->complete || image->errors)
-                return;
-            if (chunksReady->exchange(false)) {
-                pending = true;
-                start();
-            }
-        });
         QObject::connect(canvas, &Fiber3DCanvas::viewScaleChanged, q, [this] {
-            if (button->isChecked() && cache && levelForView() != requestedLevel)
+            if (button->isChecked() && state->currentVolume() && levelForView() != requestedLevel)
                 request();
         });
         debounce.setSingleShot(true);
@@ -145,31 +132,14 @@ struct Fiber3DRibbonControls::Impl {
             }
             if (pending)
                 debounce.start();
-            else if (!stale && image && !image->complete && !image->errors && !suspended)
-                refresh.start();
         });
     }
 
-    ~Impl() { releaseCache(); }
 
-    void releaseCache()
+    int levelForView() const
     {
-        if (cache && listener)
-            cache->removeChunkReadyListener(listener);
-        listener = 0;
-        cache.reset();
-        chunksReady->store(false);
-    }
-    int levelForView() const { return vc::render::ChunkedPlaneSampler::sourceLevelForView(*cache, canvas->pixelsPerVoxel()); }
-    void observeCache()
-    {
-        const auto next = state->currentVolume()->sharedChunkCache();
-        if (next == cache)
-            return;
-        releaseCache();
-        cache = next;
-        const auto ready = chunksReady;
-        listener = cache->addChunkReadyListener([ready] { ready->store(true); });
+        const double pixelsPerVoxel = canvas->pixelsPerVoxel();
+        return ct::levelForSpacing(*state->openedVolumes(), *state->currentVolume(), pixelsPerVoxel > 0 ? 1. / pixelsPerVoxel : 1.);
     }
     const Fiber* fiber() const
     {
@@ -185,7 +155,6 @@ struct Fiber3DRibbonControls::Impl {
             cancelled->store(true);
         pending = false;
         debounce.stop();
-        refresh.stop();
         canvas->setCTRibbon({});
     }
     void present()
@@ -203,10 +172,6 @@ struct Fiber3DRibbonControls::Impl {
         if (!warning.isEmpty())
             text += QStringLiteral("\n") + warning;
         text += q->tr(" · CT L%1").arg(image->level);
-        if (!image->complete) {
-            const int percent = image->validTexels ? int(100 * image->requestedLevelTexels / image->validTexels) : 100;
-            text += image->errors ? q->tr(" · CT read error; toggle ribbon to retry") : q->tr(" · loading details %1%").arg(percent);
-        }
         status->setText(text);
     }
     void request()
@@ -218,7 +183,6 @@ struct Fiber3DRibbonControls::Impl {
             status->setText(q->tr("Select a displayed fiber."));
             return;
         }
-        observeCache();
         requestedLevel = levelForView();
         // A newly attached/selected normal dataset must invalidate the fallback
         // cache even when the selected fiber and its display settings stay put.
@@ -259,6 +223,7 @@ struct Fiber3DRibbonControls::Impl {
         cancelled = std::make_shared<std::atomic_bool>(false);
         const auto token = cancelled;
         const auto volume = state->currentVolume();
+        const auto opened = state->openedVolumes();
         const Fiber selected = *fiber();
         const auto clip = scene->clipBounds;
         std::optional<StoreSource> source;
@@ -270,7 +235,6 @@ struct Fiber3DRibbonControls::Impl {
         const auto previousWarning = warning;
         const auto centerReference = annotations->displayCenterReference();
         const int w = width->value(), level = requestedLevel;
-        chunksReady->store(false);
         opendata::LasagnaResolutionSnapshot normalSource;
         if (const auto pkg = state->vpkg())
             normalSource = opendata::snapshotLasagnaForVolume(*pkg, state->currentVolumeId());
@@ -301,7 +265,7 @@ struct Fiber3DRibbonControls::Impl {
                             const auto location =
                                 resolved->manifestBacked
                                     ? resolved->manifestPath.string()
-                                    : (vc::project::isLocationRemote(resolved->sourceManifestLocation)
+                                    : (vcr::zarr::isRemote(resolved->sourceManifestLocation)
                                            ? resolved->sourceManifestLocation
                                            : vc::project::resolveLocalPath(resolved->sourceManifestLocation, normalSource.projectPath.parent_path())
                                                  .string());
@@ -320,8 +284,8 @@ struct Fiber3DRibbonControls::Impl {
                         throw std::runtime_error(result.warning.toStdString());
                     result.frames = std::make_shared<ribbon::Frames>(ribbon::makeFrames(complete, clip, {}, token.get(), model, centerReference));
                 }
-                result.image = ribbon::sampleProgressive(
-                    *result.frames, *volume, w, 0, level, token.get());
+                result.image = ribbon::sampleRibbon(
+                    *result.frames, *opened, *volume, w, 0, level, token.get());
                 result.image->key = selected.key;
             } catch (const std::exception& e) {
                 result.error = QString::fromUtf8(e.what());
@@ -362,9 +326,5 @@ void Fiber3DRibbonControls::setSelection(std::shared_ptr<const Scene> scene, con
     d->warning.clear();
     d->button->setEnabled(d->button->isChecked() || (d->fiber() && d->state->currentVolume()));
     d->request();
-    // A cleared/closed scene must not retain its volume's CT cache or listener.
-    // Hiding a valid scene still keeps its cache for immediate resumption.
-    if (!d->fiber())
-        d->releaseCache();
 }
 }  // namespace vc3d::fibers3d

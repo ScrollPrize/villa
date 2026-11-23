@@ -58,17 +58,16 @@ class TestModeContract:
         })
         fields = {error['field']
                   for error in validate_session_request(paths, run)}
-        assert {'winding_inference', 'outer_shell'} <= fields
+        # The outer shell is the store's tagged surface, checked when the
+        # inputs are read.
+        assert 'winding_inference' in fields and 'outer_shell' not in fields
 
         store = tmp_path / 'winding_inference'
         store.mkdir()
-        shell = tmp_path / 'outer_shell'
-        shell.mkdir()
-        paths = replace(
-            paths, winding_inference=str(store), outer_shell=str(shell))
+        paths = replace(paths, winding_inference=str(store))
         messages = {error['field']: error['message']
                     for error in validate_session_request(paths, run)}
-        assert messages['winding_inference'] == 'manifest.json is missing'
+        assert messages['winding_inference'].startswith('manifest.json is missing')
 
         (store / 'manifest.json').write_text(json.dumps({
             'artifact_type': 'winding_inference_crossings',
@@ -85,7 +84,7 @@ class TestModeContract:
         paths, run = self.base_request(tmp_path, {})
         assert run.config.get('dense_spacing_mode') is None
         fields = {error['field'] for error in validate_session_request(paths, run)}
-        assert {'winding_inference', 'outer_shell'} <= fields
+        assert 'winding_inference' in fields
 
     def test_grad_mag_mode_requires_grad_mag_only(self, tmp_path):
         paths, run = self.base_request(tmp_path, {
@@ -93,8 +92,16 @@ class TestModeContract:
             'loss_weight_dense_spacing': 12.0,
         })
         fields = {error['field'] for error in validate_session_request(paths, run)}
-        assert 'gradient_magnitude' in fields
-        assert 'normal_x' not in fields
+        assert 'lasagna' in fields
+        # The dataset needs its grad_mag channel, not normals.
+        for channels, refused in ((['grad_mag'], False), (['nx', 'ny'], True)):
+            manifest = tmp_path / 's.lasagna.json'
+            manifest.write_text(json.dumps({'version': 2, 'groups': {
+                channel: {'zarr': f's_{channel}.ome.zarr/4', 'scaledown': 4,
+                          'channels': [channel]} for channel in channels}}))
+            messages = {error['field']: error['message'] for error in
+                        validate_session_request(replace(paths, lasagna=str(manifest)), run)}
+            assert ('grad_mag' in messages.get('lasagna', '')) is refused
 
     def test_zero_weight_grad_mag_is_not_required(self, tmp_path):
         paths, run = self.base_request(tmp_path, {
@@ -102,7 +109,7 @@ class TestModeContract:
             'loss_weight_dense_spacing': 0.0,
         })
         fields = {error['field'] for error in validate_session_request(paths, run)}
-        assert 'gradient_magnitude' not in fields
+        assert 'lasagna' not in fields
 
     def test_disabled_grad_mag_source_is_not_required(self, tmp_path):
         paths, run = self.base_request(tmp_path, {
@@ -111,7 +118,7 @@ class TestModeContract:
             'input_use_gradient_magnitude': False,
         })
         fields = {error['field'] for error in validate_session_request(paths, run)}
-        assert 'gradient_magnitude' not in fields
+        assert 'lasagna' not in fields
 
     def test_disabled_outer_shell_cascades_winding_inference_off(self, tmp_path):
         paths, run = self.base_request(tmp_path, {
@@ -131,7 +138,7 @@ class TestModeContract:
         assert 'dense_spacing_mode' in by_field
         # The invalid-mode error must appear instead of misleading
         # mode-derived asset errors.
-        assert 'gradient_magnitude' not in by_field
+        assert 'lasagna' not in by_field
         assert 'winding_inference' not in by_field
 
 

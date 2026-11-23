@@ -23,3 +23,9 @@ class AmbiguousMatchError(VcReaderError, LookupError):
 
 class CacheMissError(VcReaderError, LookupError):
     """An offline read needed data that is in none of the disk caches."""
+
+
+class LowDiskSpaceError(VcReaderError, OSError):
+    """A remote file was not cached: the disk would fall under the cache's free-space floor.
+
+    Nothing cached was removed, and the file was not served."""

@@ -2,7 +2,7 @@ from pathlib import Path
 import argparse
 from typing import Optional, List
 
-import tifffile
+from vc_reader import images
 import numpy as np
 import torch
 
@@ -21,14 +21,13 @@ def _ensure_out_dir(out_dir: Path) -> None:
 
 
 def _num_layers(path: Path) -> int:
-	with tifffile.TiffFile(str(path)) as tif:
-		series = tif.series[0]
-		shape = series.shape
-		if len(shape) == 2:
-			return 1
-		if len(shape) == 3:
-			return int(shape[0])
-		raise ValueError(f"Unsupported TIFF shape {shape} for {path}")
+	with images.open(path) as reader:
+		shape = reader.shape
+	if len(shape) == 2:
+		return 1
+	if len(shape) == 3:
+		return int(shape[0])
+	raise ValueError(f"Unsupported TIFF shape {shape} for {path}")
 
 
 def _load_tiff_layer_uint8_norm(path: Path, layer: Optional[int], device: torch.device) -> torch.Tensor:
@@ -39,16 +38,9 @@ def _load_tiff_layer_uint8_norm(path: Path, layer: Optional[int], device: torch.
 	- If stack is 3D, use the given `layer` index (default 0 if None).
 	- If dtype is uint16: downscale to uint8 via division by 257.
 	"""
-	with tifffile.TiffFile(str(path)) as tif:
-		series = tif.series[0]
-		shape = series.shape
-		if len(shape) == 2:
-			img = series.asarray()
-		elif len(shape) == 3:
-			idx = 0 if layer is None else int(layer)
-			img = series.asarray(key=idx)
-		else:
-			raise ValueError(f"Unsupported TIFF shape {shape} for {path}")
+	img = images.read(path, page=0 if layer is None else int(layer))
+	if img.ndim != 2:
+		raise ValueError(f"Unsupported TIFF shape {img.shape} for {path}")
 
 	if img.dtype == np.uint16:
 		img = (img // 257).astype(np.uint8)
@@ -142,13 +134,13 @@ def batch_unet_tiled_infer(
 			dir_np = pred_np[2] if pred_np.shape[0] > 2 else None
 			dir2_np = pred_np[3] if pred_np.shape[0] > 3 else None
 	
-			tifffile.imwrite(f"{prefix}_cos.tif", cos_np, compression="lzw")
+			images.write_tiff(f"{prefix}_cos.tif", cos_np, compression="lzw")
 			if mag_np is not None:
-				tifffile.imwrite(f"{prefix}_mag.tif", mag_np, compression="lzw")
+				images.write_tiff(f"{prefix}_mag.tif", mag_np, compression="lzw")
 			if dir_np is not None:
-				tifffile.imwrite(f"{prefix}_dir.tif", dir_np, compression="lzw")
+				images.write_tiff(f"{prefix}_dir.tif", dir_np, compression="lzw")
 			if dir2_np is not None:
-				tifffile.imwrite(f"{prefix}_dir2.tif", dir2_np, compression="lzw")
+				images.write_tiff(f"{prefix}_dir2.tif", dir2_np, compression="lzw")
 
 
 def main() -> None:

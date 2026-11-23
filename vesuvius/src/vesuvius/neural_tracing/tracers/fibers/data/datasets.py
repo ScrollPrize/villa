@@ -5,6 +5,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from vc_reader.reader import open_zarr
 
 from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import FiberStore
 from vesuvius.neural_tracing.tracers.shared.annotations.open_data import open_data_volume
@@ -13,7 +14,7 @@ from vesuvius.neural_tracing.tracers.shared.annotations.traced import fiber_mani
 from vesuvius.neural_tracing.tracers.shared.annotations.vc3d import load_fibers
 from vesuvius.neural_tracing.tracers.fibers.data.follow_dataset import FollowDataset
 from vesuvius.neural_tracing.tracers.shared.paths import moved_path
-from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolumeSpec, CTVolume
+from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolumeSpec
 from vesuvius.neural_tracing.tracers.fibers.data.observations import IdentityObservationBuilder
 from vesuvius.neural_tracing.tracers.fibers.data.fiber_bank import FiberBank
 from vesuvius.neural_tracing.tracers.fibers.data.seeds import make_seeds, read_manifest
@@ -86,7 +87,7 @@ def parse_dataset_config(document, base):
 
 def validation_manifest(fibers, spec, seed=0, monitor_count=32):
     """Freeze distinct monitor/calibration/final fiber IDs and CT-only seeds."""
-    seed_volume = CTVolume(spec, cache_bytes=256 << 20)
+    ct = open_zarr(spec.ct_zarr, level=spec.ct_level, cache_dir=spec.cache_dir, memory_cache=256 << 20)
     rng = np.random.default_rng(seed)
     ids = rng.permutation(len(fibers)).tolist()
     n = min(monitor_count, max(1,len(ids)//3))
@@ -100,7 +101,7 @@ def validation_manifest(fibers, spec, seed=0, monitor_count=32):
         # Keep manifest generation bounded: reserve all IDs, but only generate
         # monitor-sized seed subsets for calibration/final on large fiber catalogs.
         for fi in members[:monitor_count]:
-            candidates = make_seeds([fibers[fi]],seed_volume,per_fiber=1,seed=seed+fi)
+            candidates = make_seeds([fibers[fi]],ct,spec,per_fiber=1,seed=seed+fi)
             if candidates:
                 value = candidates[0]
                 seeds.append(dict(value,fiber=fi))

@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
-import tifffile
+from vc_reader import images
 import torch
 import torch.nn.functional as F
 
@@ -184,7 +184,7 @@ class PreviewAccumulator:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         montage = self.montage()
         if montage is not None:
-            tifffile.imwrite(str(output_path), montage, compression="lzw")
+            images.write_tiff(str(output_path), montage, compression="lzw")
 
     def wandb_image(self, caption: str):
         montage = self.montage()

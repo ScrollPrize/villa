@@ -51,7 +51,7 @@ template<class Coord> __device__ float interpolate(Source s, const Coord* c, con
     for (int a=0;a<3;++a) {
         const Coord low=std::floor(c[a]), f=c[a]-low;
         const auto integer=base[a]+static_cast<std::int64_t>(low);
-        cell.lo[a]=integer+(order ? 0 : (f>.5f || (f==.5f && (integer&1))));
+        cell.lo[a]=integer+(order ? 0 : nearest_rounds_up(f));
         cell.frac[a]=order ? f : 0;
         if (cell.frac[a]!=0) cell.axes[cell.k++]=a;
     }
@@ -110,7 +110,7 @@ template<bool Pow2> __device__ float interpolate32(const Source& s, const float*
     for (int a=0;a<3;++a) {
         const float low=floorf(c[a]), f=c[a]-low;
         const int integer=int(base[a])+int(low);
-        lo[a]=integer+(order ? 0 : (f>.5f || (f==.5f && (integer&1))));
+        lo[a]=integer+(order ? 0 : nearest_rounds_up(f));
         frac[a]=order ? f : 0;
         const int within=Pow2 ? (lo[a]&((1<<s.shift[a])-1)) : lo[a]%int(s.brick[a]);
         whole &= frac[a]!=0 && lo[a]>=0 && lo[a]+1<s.shape[a];
@@ -192,7 +192,7 @@ template<class Coord> __device__ unsigned char supported(const Source& s, const 
         if (!(c[a]>Coord(-1-base[a]) && c[a]<Coord(s.shape[a]-base[a])+1)) return 0;
         const Coord low=std::floor(c[a]), f=c[a]-low;
         const auto integer=base[a]+static_cast<std::int64_t>(low);
-        lo[a]=integer+(order ? 0 : (f>.5f || (f==.5f && (integer&1))));
+        lo[a]=integer+(order ? 0 : nearest_rounds_up(f));
         frac[a]=order ? f : 0;
     }
     for (unsigned corner=0;corner<8;++corner) {

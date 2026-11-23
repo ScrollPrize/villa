@@ -33,7 +33,7 @@ boundaries where rounding can select a different corner. Exact grid equality
 is required to share a dependency plan between channels. Duplicate sample points
 do not result in duplicate dependencies.
 
-Supported entrypoints include scalar sampling, double/float batches, prefetch,
+Supported entrypoints include scalar sampling, double/float batches,
 width/embedding batches, fused normal-corner sampling/visitors, and indexed
 stored-grid sampling. Whole-volume sparse scans reject a configured gate:
 missing unpublished chunks cannot safely be interpreted as empty volume.

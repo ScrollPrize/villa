@@ -9,11 +9,11 @@ import pytest
 
 from vesuvius.ink_detection.config import InkConfig
 
-from .test_model_foundation import _config_mapping
+from .helpers import config_mapping
 
 
 def test_mapping_round_trips_without_inserted_defaults():
-    authored = _config_mapping("vesuvius_unet_3d_stem_2d", depth=3)
+    authored = config_mapping("vesuvius_unet_3d_stem_2d", depth=3)
     authored["description"] = "kept"
     authored["custom"] = {"ordered": [3, 1], "enabled": False}
     expected = deepcopy(authored)
@@ -29,7 +29,7 @@ def test_mapping_round_trips_without_inserted_defaults():
 
 
 def test_full_typed_config_survives_pickle_and_deepcopy_with_order():
-    authored = _config_mapping("vesuvius_unet_3d_stem_2d", depth=3)
+    authored = config_mapping("vesuvius_unet_3d_stem_2d", depth=3)
     authored["custom"] = {"nested": {"ordered": [3, 1]}}
     config = InkConfig.from_mapping(authored)
 
@@ -41,7 +41,7 @@ def test_full_typed_config_survives_pickle_and_deepcopy_with_order():
 
 
 def test_dinov2_backbone_is_supported_in_nested_model_config():
-    authored = _config_mapping()
+    authored = config_mapping()
     authored["model_config"].update(
         {
             "pretrained_backbone": "dinov2_ps8",
@@ -85,7 +85,7 @@ def test_unsupported_model_construction_paths_fail_at_config_boundary(
     value,
     message,
 ):
-    authored = _config_mapping()
+    authored = config_mapping()
     authored["model_config"][key] = value
     authored["model_config"]["guide_fusion_stage"] = "direct_segmentation"
     authored["model_config"]["mednext_model_id"] = "S"
@@ -97,7 +97,7 @@ def test_unsupported_model_construction_paths_fail_at_config_boundary(
 
 
 def test_accepted_unknown_model_settings_remain_preserved():
-    authored = _config_mapping()
+    authored = config_mapping()
     authored["model_config"]["architecture_type"] = "primus_s"
     authored["model_config"]["freeze_encoder"] = True
     authored["model_config"]["guide_fusion_stage"] = "feature_encoder"
@@ -119,7 +119,7 @@ def test_accepted_unknown_model_settings_remain_preserved():
 
 @pytest.mark.parametrize("missing", ["patch_overlap", "patch_min_labeled_coverage"])
 def test_full_config_keeps_required_patch_values_required(missing):
-    authored = _config_mapping()
+    authored = config_mapping()
     authored.pop(missing)
 
     with pytest.raises(KeyError, match=missing):
@@ -128,7 +128,7 @@ def test_full_config_keeps_required_patch_values_required(missing):
 
 @pytest.mark.parametrize("model_type", ["resnet3d", "resnet3d-50", "transformer"])
 def test_unsupported_model_values_fail_factually(model_type):
-    authored = _config_mapping()
+    authored = config_mapping()
     authored["model_type"] = model_type
 
     with pytest.raises(ValueError, match="model_type"):
@@ -136,7 +136,7 @@ def test_unsupported_model_values_fail_factually(model_type):
 
 
 def test_normal_pooled_mode_fails_factually():
-    authored = _config_mapping()
+    authored = config_mapping()
     authored["mode"] = "normal_pooled_3d"
 
     with pytest.raises(ValueError, match="mode.*full_3d"):
@@ -145,7 +145,7 @@ def test_normal_pooled_mode_fails_factually():
 
 @pytest.mark.parametrize("target_name", ["papyrus", "mask"])
 def test_unknown_target_names_fail_factually(target_name):
-    authored = _config_mapping()
+    authored = config_mapping()
     authored["targets"] = {
         target_name: {
             "out_channels": 1,
@@ -167,7 +167,7 @@ def test_unknown_target_names_fail_factually(target_name):
     ],
 )
 def test_unknown_target_settings_fail_factually(key, value, message):
-    authored = _config_mapping()
+    authored = config_mapping()
     authored["targets"]["ink"][key] = value
 
     with pytest.raises(ValueError, match=message):
@@ -176,7 +176,7 @@ def test_unknown_target_settings_fail_factually(key, value, message):
 
 @pytest.mark.parametrize("location", ["nested_target", "model_config"])
 def test_projection_modes_are_validated_without_storing_a_second_view(location):
-    authored = _config_mapping()
+    authored = config_mapping()
     if location == "nested_target":
         authored["targets"]["ink"]["z_projection"] = {"mode": "mystery"}
     else:
@@ -188,7 +188,7 @@ def test_projection_modes_are_validated_without_storing_a_second_view(location):
 
 @pytest.mark.parametrize("name", ["BettiMatchingLoss", "NearbyDiceLoss"])
 def test_unsupported_loss_names_fail_factually(name):
-    authored = _config_mapping()
+    authored = config_mapping()
     authored["loss"] = {"terms": [{"name": name}]}
 
     with pytest.raises(ValueError, match="Unsupported loss term"):

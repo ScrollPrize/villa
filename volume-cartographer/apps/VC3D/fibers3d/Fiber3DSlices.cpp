@@ -1,5 +1,6 @@
 #include "Fiber3DSlices.hpp"
 #include "Fiber3DGeometry.hpp"
+#include "OpenedVolumes.hpp"
 #include "vc/core/types/Volume.hpp"
 #include <algorithm>
 #include <cmath>
@@ -84,7 +85,7 @@ std::array<int, 3> dimensions(const Plane& p, int limit)
     }
 }
 }  // namespace
-std::shared_ptr<Image> sample(const Plane& plane, Volume& volume, const std::atomic_bool* cancelled, int maxTextureEdge)
+std::shared_ptr<Image> sample(const Plane& plane, OpenedVolumes& volumes, const Volume& volume, const std::atomic_bool* cancelled, int maxTextureEdge)
 {
     if (plane.width < 2 || plane.height < 2 || plane.width > 1024 || plane.height > 1024 || !finite(plane.origin) || !finite(plane.right) ||
         !finite(plane.down) || cv::norm(vec(plane.right).cross(vec(plane.down))) < 1e-8 ||
@@ -103,18 +104,14 @@ std::shared_ptr<Image> sample(const Plane& plane, Volume& volume, const std::ato
     double spacing = std::min(cv::norm(vec(plane.right)) / (tile.width - 1), cv::norm(vec(plane.down)) / (tile.height - 1));
     if (plane.volumetric)
         spacing = std::min(spacing, double(plane.front + plane.behind + 1) / dims[2]);
-    const int requested = int(std::clamp(std::floor(std::log2(std::max(1., spacing))), 0., 20.));
-    image->level = volume.firstPresentScaleLevel();
-    for (int level : volume.presentScaleLevels())
-        if (level <= requested && level > image->level)
-            image->level = level;
+    image->level = ct::levelForSpacing(volumes, volume, spacing);
     for (int r = 0; r < tile.height; ++r) {
         const double v = double(r) / (tile.height - 1);
         tile.left.push_back(at(plane, 0, v));
         tile.right.push_back(at(plane, 1, v));
     }
     if (!plane.volumetric)
-        ct::sampleTile(tile, volume, image->level, cancelled);
+        ct::sampleTile(tile, volumes, volume, image->level, cancelled);
     else {
         auto& slab = image->slab.emplace();
         const auto dx = vec(plane.right) / (tile.width - 1), dy = vec(plane.down) / (tile.height - 1);
@@ -139,7 +136,7 @@ std::shared_ptr<Image> sample(const Plane& plane, Volume& volume, const std::ato
                 layer.left.push_back(point(vec(tile.left[y]) + offset));
                 layer.right.push_back(point(vec(tile.right[y]) + offset));
             }
-            ct::sampleTile(layer, volume, image->level, cancelled);
+            ct::sampleTile(layer, volumes, volume, image->level, cancelled);
             std::copy(layer.pixels.begin(), layer.pixels.end(), slab.pixels.begin() + z * layerBytes);
         }
     }

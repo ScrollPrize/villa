@@ -1,7 +1,8 @@
 #pragma once
 #include "internal/Database.hpp"
+#include "geometry/GeometryToken.hpp"
 #include <numeric>
-#include "spatial/BoundsIndex.hpp"
+#include <vc_object_store/geometry/BoundsIndex.hpp>
 
 namespace vc::objects::detail {
 inline constexpr const char* regionColumns =
@@ -12,7 +13,7 @@ inline SpatialRegion readSpatialRegion(const Statement& rows)
 {
     SpatialRegion r;
     r.objectUuid = formatUuid(rows.blob16(0)); r.kind = rows.text(1);
-    if (!rows.isNull(2)) r.revisionUuid = formatUuid(rows.blob16(2));
+    if (!rows.isNull(2)) r.revisionUuid = readGeometryTokenColumn(rows,2);
     r.arrayName = rows.text(3);
     if (!r.arrayName.empty()) {
         r.start.push_back(rows.i64(4)); r.shape.push_back(rows.i64(6));
@@ -31,7 +32,7 @@ class ResidentSpatialIndex {
 public:
     bool load(sqlite3* db, size_t budget) {
         {
-            Statement states(db, "SELECT uuid FROM objects JOIN object_lifecycle lc ON lc.object_id=objects.id WHERE lc.retired=1");
+            Statement states(db, "SELECT uuid FROM objects WHERE state=1");
             while (states.row()) {
                 retired_.insert(formatUuid(states.blob16(0)));
                 if (retired_.size() > budget / 128) return false;
@@ -40,7 +41,7 @@ public:
         Statement rows(db, std::string("SELECT ") + regionColumns +
             " FROM spatial_regions b JOIN objects o ON o.id=b.object_id "
             "JOIN object_bounds h ON h.object_id=b.object_id "
-            "WHERE b.array_name!='' OR h.revision_uuid IS NULL");
+            "WHERE o.state<>2 AND (b.array_name!='' OR h.revision_uuid IS NULL)");
         size_t dynamic = sizeof(*this) + 256 + retired_.size() * 128;
         while (rows.row()) {
             auto r = readSpatialRegion(rows);

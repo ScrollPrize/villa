@@ -11,7 +11,7 @@ import numpy as np
 from dtypes import numpy_float_hi
 import torch
 import torch.nn.functional as F
-import zarr
+from vc_reader.reader import open_zarr
 
 from lasagna_volume import ChannelGroup, LasagnaVolume
 
@@ -122,13 +122,6 @@ def resolve_streaming_zarr_source(
 		_join_remote_artifact_url(artifact_url, key_parts),
 		remote=True,
 	)
-
-
-def _probe_tensorstore_zarr_shape(zarr_path: str, *, remote: bool) -> tuple[int, ...]:
-	"""Open only remote metadata so load_3d_streaming can validate its shape."""
-
-	from sparse_tensorstore_cache import probe_zarr_shape
-	return probe_zarr_shape(zarr_path, remote=remote)
 
 
 def _dilate26(t: torch.Tensor) -> torch.Tensor:
@@ -777,7 +770,7 @@ def load_winding_volume(
 ) -> tuple[torch.Tensor, float, float]:
 	"""Load winding volume zarr, apply crop, return ((1,1,Z,Y,X) tensor, min_winding, max_winding)."""
 	p = Path(path)
-	zsrc = zarr.open(str(p), mode="r")
+	zsrc = open_zarr(p)
 	wv_scaledown = int(zsrc.attrs.get("scaledown", 1))
 	wv_min = float(zsrc.attrs.get("min_winding", 1.0))
 	wv_max = float(zsrc.attrs.get("max_winding", 1.0))
@@ -877,9 +870,7 @@ def load_single_channel(
 		raise ValueError(f"channel '{channel}' not in volume (available: {vol.all_channels()})")
 	group, ch_idx = vol.channel_group(channel)
 	zarr_path = str(vol.path.parent / group.zarr_path)
-	zsrc = zarr.open(zarr_path, mode="r")
-	if not isinstance(zsrc, zarr.Array):
-		raise ValueError(f"expected zarr.Array at {zarr_path}, got {type(zsrc)}")
+	zsrc = open_zarr(zarr_path)
 	shape = tuple(int(v) for v in zsrc.shape)
 	Z_all, Y_all, X_all, is_3d = _validate_group_zarr_shape(
 		vol=vol,
@@ -1183,9 +1174,7 @@ def get_preprocessed_params(path: str) -> dict:
 	for group_name, g in sorted(vol.groups.items(), key=lambda item: item[1].sd_fac):
 		zarr_path = str(vol.path.parent / g.zarr_path)
 		try:
-			zsrc = zarr.open(zarr_path, mode="r")
-			if not isinstance(zsrc, zarr.Array):
-				raise ValueError(f"expected zarr.Array at {zarr_path}, got {type(zsrc)}")
+			zsrc = open_zarr(zarr_path)
 			shape = tuple(int(v) for v in zsrc.shape)
 			Z, Y, X, _is_3d = _validate_group_zarr_shape(
 				vol=vol,
@@ -1245,9 +1234,7 @@ def load_3d(
 		"""
 		group, ch_idx = vol.channel_group(name)
 		zarr_path = str(vol.path.parent / group.zarr_path)
-		zsrc = zarr.open(zarr_path, mode="r")
-		if not isinstance(zsrc, zarr.Array):
-			raise ValueError(f"expected zarr.Array at {zarr_path}, got {type(zsrc)}")
+		zsrc = open_zarr(zarr_path)
 		shape = tuple(int(v) for v in zsrc.shape)
 		Z_all, Y_all, X_all, is_3d = _validate_group_zarr_shape(
 			vol=vol,
@@ -1355,7 +1342,6 @@ def load_3d_streaming(
 	path: str,
 	device: torch.device,
 	skip_channels: set[str] | None = None,
-	sparse_prefetch_backend: str = "tensorstore",
 	require_umbilicus: bool = False,
 ) -> FitData3D:
 	"""Load .lasagna.json as sparse streaming cache — no upfront data load.
@@ -1363,7 +1349,7 @@ def load_3d_streaming(
 	Chunks are loaded on demand via prefetch/sync. The returned FitData3D has
 	dense channel tensors set to None and sparse_caches populated instead.
 	"""
-	from sparse_cache import SparseChunkGroupCache
+	from sparse_cache import READER_MEMORY_CACHE_BYTES, SparseChunkGroupCache
 
 	vol = LasagnaVolume.load(path, require_umbilicus=require_umbilicus)
 	gmag_enc = vol.grad_mag_encode_scale / vol.grad_mag_factor
@@ -1374,11 +1360,6 @@ def load_3d_streaming(
 		require_umbilicus=require_umbilicus,
 	)
 	_skip = skip_channels or set()
-	_backend = str(sparse_prefetch_backend)
-	if _backend not in {"tensorstore", "python-zarr"}:
-		raise ValueError(
-			f"unknown sparse_prefetch_backend={_backend!r}; "
-			"expected 'tensorstore' or 'python-zarr'")
 
 	# Build sparse caches per group
 	sparse_caches: dict[str, SparseChunkGroupCache] = {}
@@ -1399,18 +1380,8 @@ def load_3d_streaming(
 
 		source = resolve_streaming_zarr_source(vol, group)
 		zarr_path = source.zarr_path
-		if source.remote:
-			if _backend != "tensorstore":
-				raise ValueError(
-					"VC3D catalog split-cache fallback requires "
-					"sparse_prefetch_backend='tensorstore'"
-				)
-			shape = _probe_tensorstore_zarr_shape(zarr_path, remote=True)
-		else:
-			zsrc = zarr.open(zarr_path, mode="r")
-			if not isinstance(zsrc, zarr.Array):
-				raise ValueError(f"expected zarr.Array at {zarr_path}, got {type(zsrc)}")
-			shape = tuple(int(v) for v in zsrc.shape)
+		reader = open_zarr(zarr_path, memory_cache=READER_MEMORY_CACHE_BYTES)
+		shape = tuple(int(v) for v in reader.shape)
 		Z, Y, X, is_3d = _validate_group_zarr_shape(
 			vol=vol,
 			group_name=group_name,
@@ -1425,26 +1396,14 @@ def load_3d_streaming(
 			ch_idx = group.channels.index(ch)
 			channel_indices[ch] = ch_idx
 
-		if _backend == "tensorstore":
-			from sparse_tensorstore_cache import TensorStoreSparseChunkGroupCache
-			cache = TensorStoreSparseChunkGroupCache(
-				channels=channels,
-				zarr_path=zarr_path,
-				remote=source.remote,
-				vol_shape_zyx=(Z, Y, X),
-				channel_indices=channel_indices,
-				is_3d_zarr=is_3d,
-				device=device,
-			)
-		else:
-			cache = SparseChunkGroupCache(
-				channels=channels,
-				zarr_path=zarr_path,
-				vol_shape_zyx=(Z, Y, X),
-				channel_indices=channel_indices,
-				is_3d_zarr=is_3d,
-				device=device,
-			)
+		cache = SparseChunkGroupCache(
+			channels=channels,
+			reader=reader,
+			vol_shape_zyx=(Z, Y, X),
+			channel_indices=channel_indices,
+			is_3d_zarr=is_3d,
+			device=device,
+		)
 		sparse_caches[group_name] = cache
 
 		# Per-channel spacing
@@ -1465,8 +1424,7 @@ def load_3d_streaming(
 
 	print(f"[fit_data] load_3d_streaming: origin={origin_fullres} "
 		  f"primary_spacing={primary_spacing} source_to_base={s2b} "
-		  f"groups={list(sparse_caches.keys())} "
-		  f"sparse_prefetch={sparse_prefetch_backend}", flush=True)
+		  f"groups={list(sparse_caches.keys())}", flush=True)
 
 	return FitData3D(
 		cos=None,

@@ -1,6 +1,14 @@
 from typing import Any, Mapping, Sequence
 
-class _Config: ...
+class _Config:
+    def batch(self, data: Any, *, targets: Mapping[str, _Config] | None = None, compact: bool = True) -> Any:
+        """__call__ for each sample of a (B, C, ...) batch; CUDA inputs run as one Pipeline.batch call."""
+    def __call__(self, data: Any, *, targets: Mapping[str, _Config] | None = None, compact: bool = True, inplace: bool = False) -> Any:
+        """Apply on its own: always applied (p ignored), fixed seed, same input -> same output.
+
+        A channel-first array (NumPy, Torch CPU/CUDA, DeviceArray) stands for the field the
+        transform reads by default and returns the field it creates, else the transformed
+        input. A sample dict works like Pipeline.__call__ and returns a dict."""
 Scalar = float | tuple[float, float] | _Config
 
 def Normalize(mode: str = "zscore", *, masked: bool = False, nonzero: bool = True, eps: float = 0,
@@ -10,7 +18,7 @@ def Normalize(mode: str = "zscore", *, masked: bool = False, nonzero: bool = Tru
               channels: Sequence[int] = ..., p: float = 1, p_channel: float = 1) -> _Config:
     """Per-channel intensity normalization.
 
-    minmax: (x-min)/(max-min). zscore: (x-mean)/max(std, eps), population std;
+    minmax: (x-min)/max(max-min, eps). zscore: (x-mean)/max(std, eps), population std;
     nonzero=True (default) excludes and preserves zeros. robust: clip to the
     lower/upper percentiles (clip=True), then (x-median)/(1.4826 MAD) with
     vesuvius' fallbacks. percentile: clip to the percentiles, then
@@ -26,7 +34,7 @@ def Param(name: str) -> _Config: ...
 def Uniform(low: float, high: float) -> _Config: ...
 def Normal(mean: float = 0, std: float = .1) -> _Config: ...
 def Choice(values: Sequence[float]) -> _Config: ...
-def Image(fill: float = 0, valid: str | None = "padding_mask") -> _Config: ...
+def Image(fill: float = 0, valid: str | None = "padding_mask", refill: bool = True) -> _Config: ...
 def Label(fill: int = 0) -> _Config: ...
 def ScalarField(fill: float = 0) -> _Config: ...
 def ValidMask() -> _Config: ...
@@ -39,8 +47,8 @@ def CoordinateField(components: str = "zyx", frame: str = "external", fill: floa
 # Image transforms share keyword options: p, p_channel, shared, channels, on.
 def BrightnessMultiply(factor: Scalar = ..., *, p: float = 1, p_channel: float = 1, shared: bool = False, channels: Sequence[int] = ..., on: str | Sequence[str] | None = None) -> _Config: ...
 def BrightnessAdd(shift: Scalar = ..., **options: Any) -> _Config: ...
-def Contrast(factor: Scalar = ..., preserve_range: bool = True, **options: Any) -> _Config: ...
-def Gamma(gamma: Scalar = ..., p_invert: float = 0, p_retain_stats: float = 0, **options: Any) -> _Config: ...
+def Contrast(factor: Scalar = ..., preserve_range: bool = True, *, masked: bool = False, **options: Any) -> _Config: ...
+def Gamma(gamma: Scalar = ..., p_invert: float = 0, p_retain_stats: float = 0, *, masked: bool = False, clip: bool = False, eps: float = 1e-7, **options: Any) -> _Config: ...
 def Invert(**options: Any) -> _Config: ...
 def GaussianNoise(std: Scalar = ..., shared_noise: bool = False, **options: Any) -> _Config: ...
 def RicianNoise(std: Scalar = ..., shared_noise: bool = False, **options: Any) -> _Config: ...
@@ -84,7 +92,11 @@ def ThickSlice(scale: Scalar = ..., axes: str = "", labels: bool = True, *, p: f
 def StripGeometry(shift_x: Scalar = 0, shift_y: Scalar = 0, degrees: Scalar = 0, scale: Scalar = 1, shear_x: Scalar = 0, shear_y: Scalar = 0, smooth_offset: Scalar = 0, stride: Scalar = 16, p_flip_x: float = 0, p_flip_y: float = 0, shape: Sequence[int] = ..., *, p: float = 1) -> _Config: ...
 def SurfacePerturb(on: str = "surface", blobs: Scalar = ..., sigma_fraction: Scalar = ..., amplitude: Scalar = ..., points_affected: int = 10, radius_sigma: float = 2.5, max_displacement: float = 1.5, *, p: float = 1) -> _Config: ...
 
-def Morphology(operation: str = "close", radius: Scalar = 1, on: str | Sequence[str] | None = None, neutral_border: bool = False, footprint: str = "ball", *, p: float = 1) -> _Config: ...
+def Morphology(operation: str = "close", radius: Scalar = 1, on: str | Sequence[str] | None = None, neutral_border: bool = False, footprint: str = "ball", *, p: float = 1) -> _Config:
+    """Binary dilate, erode, open or close. footprint: ball (Euclidean radius), cross (L1;
+    SciPy default structure, iterations=radius), cube (Chebyshev; SciPy full connectivity,
+    iterations=radius) or repeated_cross. Outside the array is background (SciPy border_value=0)."""
+    ...
 def RandomBinaryOperator(on: str = "image", channels: Sequence[int] = ..., radius: Scalar = ..., operations: Sequence[str] = ..., p_channel: float = 1, *, p: float = 1) -> _Config: ...
 def RemoveComponents(on: str = "image", channels: Sequence[int] = ..., max_fraction: float = .25, p_fill: float = .25, p_channel: float = 1, full_connectivity: bool = True, *, p: float = 1) -> _Config: ...
 def ReplaceLabel(value: int = -1, replacement: int = 0, on: str = "mask", channels: Sequence[int] = ..., *, p: float = 1) -> _Config: ...
@@ -96,20 +108,25 @@ def ToPseudo2D(*, p: float = 1) -> _Config: ...
 def FromPseudo2D(*, p: float = 1) -> _Config: ...
 def DistanceTransform(on: str | Sequence[str] | None = None, *, channel: int = 0, threshold: float = 0,
                       mode: str = "signed", suffix: str = "_sdt", normals: str | None = None,
-                      components: str = "zyx", p: float = 1) -> _Config:
+                      components: str = "zyx", indices: str | None = None, implicit_background: bool = False, p: float = 1) -> _Config:
     """Exact Euclidean distance of one label channel (foreground: value > threshold).
 
     Creates ``name + suffix`` (ScalarField): signed = outside - inside distance
     (vesuvius aux SDT), inside, or outside. normals: also create ``name + normals``,
     a NormalField of the Scharr gradient of the signed distance divided by
     max(|gradient|, 1e-6) (vesuvius aux surface normals; use components="xyz").
-    A class absent from the crop contributes zero distance.
+    A class absent from the crop contributes zero distance, or distance to
+    (-1,0,...) with implicit_background=True (SciPy EDT convention).
+    indices: also create ``name + indices``, a (D, ...) int32 Label field of the
+    nearest voxel of the other class (SciPy return_indices): foreground for
+    "outside", background for "inside", and per voxel for "signed". With the
+    class absent it is (-1,0,...) under implicit_background, else the voxel itself.
     """
     ...
 def StructureTensor(on: str = "image", *, channel: int = 0, output: str | None = None, sigma: float = 1,
                     rho: float = 1.5, derivative: str = "pavel", boundary: str | None = None, truncate: float = 3,
                     scale: float = 1, field: str = "components", components: str = "zyx",
-                    confidence: str | None = None, at: Sequence[float] | None = None, p: float = 1) -> _Config:
+                    confidence: str | None = None, at: Sequence[float] | None = None, gradient: str = "", p: float = 1) -> _Config:
     """Structure tensor of one channel, created as ``output`` (default ``on + "_st"``).
 
     derivative="pavel" (boundary "zero"): vesuvius StructureTensorComputer;
@@ -120,9 +137,41 @@ def StructureTensor(on: str = "image", *, channel: int = 0, output: str | None =
     optionally a ``confidence`` ScalarField with the relative eigengap.
     at=(z, y, x): one (D, D) tensor (a Vectors target) with Gaussian rho weights
     normalized over the whole grid, as tracers' ct_structure_tensor.
+    gradient names component cotangents for the selected-channel backward pass;
+    it requires zero boundaries, field="components", and no at/confidence.
     """
     ...
-def MedialSurface(on: str | Sequence[str] | None = None, suffix: str = "_skel", tube: bool = True, open: bool = False, close: bool = True, ignore: Mapping[str, float] = ..., *, p: float = 1) -> _Config: ...
+def CoherenceEnhancingDiffusion(sigma: float = 1, rho: float = 2, lambda_: float = .01,
+                               exponent: float = 2, alpha: float = .01, step_size: float = .1,
+                               num_steps: int = 10, *, on: str | Sequence[str] | None = None,
+                               channels: Sequence[int] = ..., p: float = 1, p_channel: float = 1) -> _Config:
+    """CED of each selected channel of a (C,Y,X) image or (C,Z,Y,X) volume.
+
+    Recomputes Pavel structure tensors each step with nearest-edge filtering.
+    sigma/rho are voxel scales; lambda_ is a structure-tensor eigengap threshold
+    in squared input-intensity units. No automatic intensity normalization.
+    alpha in (0,1] sets minimum diffusivity; exponent must be positive.
+    No-flux explicit updates conserve mass with step_size in (0,1/6].
+    num_steps=0 is identity. Uses unit voxel spacing and preserves float dtype.
+    """
+    ...
+
+def Ridges(sigma: float = 6, gamma: float = 1.5, beta1: float = .5, beta2: float = .5, *,
+           on: str | Sequence[str] | None = None, channels: Sequence[int] = ..., p: float = 1, p_channel: float = 1) -> _Config:
+    """Hessian ridge response after smoothing/normalization. Uses second-order boundary differences.
+
+    Compose with GaussianBlur(sigma=2, boundary="reflect", truncate=4, full_width=False)
+    and Normalize("minmax") for the label-refinement filter. beta1 is the 2D blob
+    parameter or 3D planar parameter; beta2 is the 3D blob parameter.
+    """
+    ...
+
+def ConnectedComponents(on: str | Sequence[str] | None = None, suffix: str = "_components", connectivity: int = 0, *, p: float = 1) -> _Config:
+    """int32 labels of each channel's nonzero voxels, numbered as scipy.ndimage.label
+    (geometry.label_components). connectivity: 4/8 (2D) or 6/18/26 (3D); 0 for 8 or 26."""
+    ...
+def RidgeTrace(on: str | Sequence[str] | None = None, suffix: str = "_traces", *, p: float = 1) -> _Config: ...
+def MedialSurface(on: str | Sequence[str] | None = None, suffix: str = "_skel", tube: bool = True, open: bool = False, close: bool = True, ignore: Mapping[str, float] = ..., *, method: str = "zhang_suen", preserve_border: bool = False, p: float = 1) -> _Config: ...
 
 class Plan:
     def apply(self, sample: Mapping[str, Any]) -> dict[str, Any]: ...

@@ -1114,11 +1114,10 @@ def _add_common_transfer_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--rasterizer",
-        choices=("auto", "native", "python"),
+        choices=("auto", "native"),
         default="auto",
         help=(
-            "per-pixel rasterizer: use the compiled kernel when available "
-            "(auto), require it (native), or use the NumPy reference (python)"
+            "per-pixel rasterizer: prepared vc_reader kernel (auto/native)"
         ),
     )
     parser.add_argument(

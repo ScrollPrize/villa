@@ -1,7 +1,7 @@
 #include "vc/fiber_tracer/FiberChunkTrace.hpp"
 #include "vc/fiber_tracer/detail/FiberChunkTensor.hpp"
 #include <atomic>
-#include "vc/core/util/AtomicFile.hpp"
+#include <vc_reader/zarr.hpp>
 #include <condition_variable>
 #include <deque>
 #include <thread>
@@ -92,7 +92,7 @@ std::shared_ptr<void> acquireFiberChunkGpu(const FiberChunkTraceConfig& c,const 
 void runFiberChunkGpu(FiberChunkPaths& output,const FiberPredictionSource& source,
     const vc::lasagna::NormalSampler& normals,const FiberTraceConfig& cfg,
     const FiberChunkTraceConfig& c,double scale,const std::vector<Json>& gpuSeeds,
-    const std::shared_ptr<vc::render::PinnedChunkRegion>& pinned,const FiberChunkWait& wait,
+    const FiberChunkWait& wait,
     const detail::FiberChunkTensor* tensor)
 {
     if(c.gpuLibrary.empty())throw std::invalid_argument("GPU library required");
@@ -113,49 +113,13 @@ void runFiberChunkGpu(FiberChunkPaths& output,const FiberPredictionSource& sourc
             origin[a]=int(std::floor((out->lo[a]/scale-margin)/spacing));
             shape[a]=int(std::ceil((out->hi[a]/scale+margin)/spacing))-origin[a]+1;
         }
+        // The six channels and widths from the tensor read for this chunk: a boundary core
+        // still gets a complete lookahead halo, invalid outside the volume.
+        if(!tensor)throw std::logic_error("GPU chunks read through a dense tensor");
+        if(origin!=tensor->origin() || shape!=tensor->shape() || spacing!=tensor->spacing())
+            throw std::logic_error("GPU and owned tensor lattices disagree");
         std::vector<unsigned char> byteValues;std::vector<float> widthValues;
-        byteValues.reserve(size_t(shape[0])*shape[1]*shape[2]*6);
-        widthValues.reserve(size_t(shape[0])*shape[1]*shape[2]);
-        if(tensor) {
-            if(origin!=tensor->origin() || shape!=tensor->shape() || spacing!=tensor->spacing())
-                throw std::logic_error("GPU and owned tensor lattices disagree");
-            tensor->packGpu(byteValues,widthValues);
-        } else {
-
-        for(int z=0;z<shape[2];++z) {
-            std::vector<cv::Vec3f> points;
-            for(int y=0;y<shape[1];++y) for(int x=0;x<shape[0];++x)
-                points.emplace_back((origin[0]+x)*spacing,(origin[1]+y)*spacing,(origin[2]+z)*spacing);
-            vc::lasagna::LasagnaCornerBatch corners;
-            corners.values.resize(6);for(auto& channel:corners.values)channel.resize(points.size());
-            corners.fractionsXYZ.resize(points.size());corners.valid.resize(points.size());
-            auto visitor=[](void* context,size_t i,const cv::Vec3f& fraction,bool valid,
-                            std::span<const std::array<uint8_t,8>> values){
-                auto& c=*static_cast<vc::lasagna::LasagnaCornerBatch*>(context);
-                c.valid[i]=valid;c.fractionsXYZ[i]=fraction;
-                // Out-of-volume visitor callbacks carry no channel payload.
-                // Keep the same invalid padding as the owned ROI export.
-                if(!valid){for(auto& channel:c.values)channel[i]={};return;}
-                if(values.size()!=6)throw std::runtime_error("GPU export requires six aligned channels");
-                for(size_t k=0;k<6;++k)c.values[k][i]=values[k];
-            };
-            if(!field->visitCornerBatchWithNormals(*normalField,points,1,&corners,visitor,0,nullptr,pinned.get()))
-                throw std::runtime_error("GPU fixture requires aligned native corner grids");
-            std::vector<float> widths;if(pinned)field->sampleWidths(points,widths,*pinned);else field->sampleWidths(points,widths);
-            for(size_t i=0;i<points.size();++i) {
-                const int x=origin[0]+int(i%shape[0]),y=origin[1]+int(i/shape[0]),zz=origin[2]+z;
-                const bool inside=x>=0&&y>=0&&zz>=0&&size_t(x)<volumeShape[2]&&size_t(y)<volumeShape[1]&&size_t(zz)<volumeShape[0];
-                if(!inside){
-                    byteValues.insert(byteValues.end(),6,0);widths[i]=0;continue;
-                }
-                if(!corners.valid[i])throw std::runtime_error("GPU export invalid channels inside volume");
-                if(cv::norm(corners.fractionsXYZ[i])>1e-6)
-                    throw std::runtime_error("GPU fixture lattice mismatch");
-                for(int channel=0;channel<6;++channel) byteValues.push_back(corners.values[channel][i][0]);
-            }
-            widthValues.insert(widthValues.end(),widths.begin(),widths.end());
-        }
-        }
+        tensor->packGpu(byteValues,widthValues);
         out->timings["gpu_pack_seconds"]=elapsed();
         Json seeds=Json::array();for(const auto& seed:gpuSeeds) if(!seed.is_null()) seeds.push_back(seed);
         Json meta={{"seeds",seeds},{"origin",origin},{"shape_xyz",shape},{"spacing",spacing},
@@ -185,7 +149,7 @@ void runFiberChunkGpu(FiberChunkPaths& output,const FiberPredictionSource& sourc
             bytes.write(reinterpret_cast<const char*>(byteValues.data()),byteValues.size());
             floats.write(reinterpret_cast<const char*>(widthValues.data()),widthValues.size()*sizeof(float));
             if(!bytes||!floats)throw std::runtime_error("GPU fixture write failed");
-            vc::core::util::atomicWriteString(c.benchmarkExport/"gpu_input.json",meta.dump(2)+"\n");
+            vcr::zarr::atomicWrite(c.benchmarkExport/"gpu_input.json",meta.dump(2)+"\n", vcr::zarr::Durability::Fsync);
         }
         if(!c.gpuLibrary.empty()) {
             auto result=gpu.execute(meta,std::move(byteValues),std::move(widthValues),wait);

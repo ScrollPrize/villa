@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 import json
-import time
 from pathlib import Path
 
 import numpy as np
 import pytest
-from scipy import ndimage
 
 from vesuvius.data import affine
 
@@ -150,64 +148,6 @@ def test_aabb_clipped_to_image_shape() -> None:
         assert a <= 4
 
 
-def test_resample_identity_matches_slab() -> None:
-    rng = np.random.default_rng(4)
-    image = rng.integers(0, 255, size=(32, 32, 32), dtype=np.uint8)
-
-    patch = affine.resample_image_to_label_grid(
-        image,
-        np.eye(4),
-        position_label_zyx=(4, 6, 8),
-        patch_shape_zyx=(8, 8, 8),
-    )
-    np.testing.assert_allclose(patch, image[4:12, 6:14, 8:16].astype(np.float32), atol=1e-5)
-
-
-def test_resample_pure_translation() -> None:
-    rng = np.random.default_rng(5)
-    image = rng.integers(0, 255, size=(32, 32, 32), dtype=np.uint8)
-    m = np.eye(4)
-    m[:3, 3] = [3.0, -2.0, 1.0]  # image_zyx = label_zyx + [3, -2, 1]
-
-    patch = affine.resample_image_to_label_grid(
-        image, m, position_label_zyx=(5, 5, 5), patch_shape_zyx=(8, 8, 8),
-    )
-    expected = image[8:16, 3:11, 6:14].astype(np.float32)
-    np.testing.assert_allclose(patch, expected, atol=1e-5)
-
-
-def test_resample_pure_isotropic_scale() -> None:
-    """Scale 2x: image is half-resolution, each label voxel maps to half an image voxel."""
-    rng = np.random.default_rng(6)
-    image = rng.integers(0, 255, size=(32, 32, 32), dtype=np.uint8).astype(np.float32)
-    m = np.eye(4)
-    m[:3, :3] *= 0.5  # image = 0.5 * label  (label twice as fine)
-
-    patch_shape = (8, 8, 8)
-    pos = (4, 4, 4)
-    patch = affine.resample_image_to_label_grid(image, m, pos, patch_shape)
-
-    # Reference via scipy directly over the whole volume
-    zs = np.arange(patch_shape[0]) + pos[0]
-    ys = np.arange(patch_shape[1]) + pos[1]
-    xs = np.arange(patch_shape[2]) + pos[2]
-    gz, gy, gx = np.meshgrid(zs, ys, xs, indexing="ij")
-    coords = np.stack([gz * 0.5, gy * 0.5, gx * 0.5], axis=0)
-    expected = ndimage.map_coordinates(image, coords, order=1, mode="constant", cval=0.0, prefilter=False)
-    np.testing.assert_allclose(patch, expected, atol=1e-4)
-
-
-def test_resample_handles_out_of_bounds_patch() -> None:
-    image = np.ones((8, 8, 8), dtype=np.float32)
-    # Label patch translated entirely outside the image
-    m = np.eye(4)
-    m[:3, 3] = [100.0, 100.0, 100.0]
-    patch = affine.resample_image_to_label_grid(
-        image, m, position_label_zyx=(0, 0, 0), patch_shape_zyx=(4, 4, 4),
-    )
-    np.testing.assert_array_equal(patch, np.zeros((4, 4, 4), dtype=np.float32))
-
-
 def test_matrix_checksum_stable() -> None:
     m = np.eye(4)
     digest_a = affine.matrix_checksum(m)
@@ -215,20 +155,3 @@ def test_matrix_checksum_stable() -> None:
     assert digest_a == digest_b
     m[0, 0] = 2.0
     assert affine.matrix_checksum(m) != digest_a
-
-
-def test_resample_128_cube_within_budget() -> None:
-    """Microbenchmark: single 128^3 resample under 75 ms warm on CPU."""
-    rng = np.random.default_rng(7)
-    image = rng.integers(0, 255, size=(160, 160, 160), dtype=np.uint8).astype(np.float32)
-    m = np.eye(4)
-    m[:3, 3] = [0.25, 0.3, 0.4]  # sub-voxel shift so interpolation runs
-
-    # warm-up
-    affine.resample_image_to_label_grid(image, m, (8, 8, 8), (128, 128, 128))
-
-    t0 = time.perf_counter()
-    patch = affine.resample_image_to_label_grid(image, m, (8, 8, 8), (128, 128, 128))
-    elapsed = time.perf_counter() - t0
-    assert patch.shape == (128, 128, 128)
-    assert elapsed < 0.5, f"128^3 resample took {elapsed*1000:.1f} ms (expected < 500 ms)"

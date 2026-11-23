@@ -21,12 +21,15 @@ from pathlib import Path
 from typing import Optional, Sequence
 
 import numpy as np
-from scipy.ndimage import gaussian_filter
+import vc_reader.transforms as A
 
 from vesuvius.utils.cli import HyphenUnderscoreParser
 
 from .core import Surface, load_affine, transfer_array
 from .io import load_surface, read_image
+
+_BLUR_1 = A.GaussianBlur(sigma=1.0, boundary="reflect", truncate=4, full_width=False)
+_BLUR_8 = A.GaussianBlur(sigma=8.0, boundary="reflect", truncate=4, full_width=False)
 
 
 def _preprocess(image: np.ndarray, mode: str) -> np.ndarray:
@@ -36,9 +39,9 @@ def _preprocess(image: np.ndarray, mode: str) -> np.ndarray:
     if mode == "none":
         return values
     if mode == "dog":
-        return gaussian_filter(values, 1.0) - gaussian_filter(values, 8.0)
+        return _BLUR_1(values[None])[0] - _BLUR_8(values[None])[0]
     if mode == "gradient":
-        smooth = gaussian_filter(values, 1.0)
+        smooth = _BLUR_1(values[None])[0]
         dy, dx = np.gradient(smooth)
         return np.hypot(dy, dx)
     raise ValueError(f"unknown correlation preprocessing mode {mode!r}")

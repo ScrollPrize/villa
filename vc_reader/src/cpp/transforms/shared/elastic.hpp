@@ -83,6 +83,9 @@ inline std::vector<float> bspline_field(const Shape& shape,double spacing,Random
     return shape.size()==3 ? bspline_field_impl<3>(shape,spacing,rng) : bspline_field_impl<2>(shape,spacing,rng);
 }
 
+// Accumulators of normalize_impl's energy sum. At namespace scope, not in the function: CUDA
+// 13.0's cudafe++ mis-prints a std::array type first named with a function-local bound.
+inline constexpr std::size_t energy_lanes=8;
 // Elastic strength convention: RMS vector displacement in
 // output voxels. Limit a conservative infinity-norm Lipschitz bound to <1.
 // For trilinear interpolation, each derivative is a convex combination of
@@ -95,7 +98,6 @@ double normalize_impl(std::vector<float>& field,const Shape& shape,double rms,do
     // Independent accumulators allow SIMD without enabling global fast-math.
     // The reduction is deterministic, but may differ by a few rounding bits
     // from the old serial sum. Validate before using the resulting scale.
-    constexpr std::size_t energy_lanes=8;
     std::array<double,energy_lanes> energies{};
     bool finite=true;
     std::size_t i=0;

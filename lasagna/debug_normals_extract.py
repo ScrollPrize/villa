@@ -12,7 +12,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-import zarr
+from vc_reader.reader import ZarrGroup, open_node
 
 
 # ---------------------------------------------------------------------------
@@ -70,13 +70,13 @@ def _channel_index(channels: list[str], name: str) -> int:
 
 def _open_zarr_array(path: str):
     """Open zarr and return (array, params dict)."""
-    store = zarr.open(path, mode="r")
-    if isinstance(store, zarr.Group):
+    store = open_node(path)
+    if isinstance(store, ZarrGroup):
         arr = store["0"] if "0" in store else store[list(store.keys())[0]]
     else:
         arr = store
     params = dict(arr.attrs.get("preprocess_params", {}))
-    if not params and isinstance(store, zarr.Group):
+    if not params and isinstance(store, ZarrGroup):
         params = dict(store.attrs.get("preprocess_params", {}))
     return arr, params
 
@@ -211,8 +211,8 @@ def run_2d_inference(checkpoint_2d: str, input_zarr_path: str,
                       base_channels=32, num_levels=6, max_channels=1024)
     model.eval()
 
-    vol = zarr.open(input_zarr_path, mode="r")
-    if isinstance(vol, zarr.Group):
+    vol = open_node(input_zarr_path)
+    if isinstance(vol, ZarrGroup):
         vol = vol["0"] if "0" in vol else vol[list(vol.keys())[0]]
 
     half = wh // 2

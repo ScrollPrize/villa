@@ -41,7 +41,7 @@ class BootstrapVenvTests(unittest.TestCase):
             ]), 0)
 
         commands = [call.args[0] for call in mocked_run.call_args_list]
-        native = [["-e", str(villa / "volume-cartographer")], ["-e", str(villa / "vc_object_store")]]
+        native = [["-e", str(villa / name)] for name in ("vc_reader", "volume-cartographer", "vc_object_store")]
         for sibling in native:
             self.assertIn(sibling, [command[-2:] for command in commands])
         # The object store is installed before Lasagna, which requires it.
@@ -51,7 +51,7 @@ class BootstrapVenvTests(unittest.TestCase):
             call for call in mocked_run.call_args_list
             if call.args[0][-2:] in native
         ]
-        self.assertEqual(len(native_calls), 2)
+        self.assertEqual(len(native_calls), 3)
         for call in native_calls:
             self.assertEqual(call.kwargs["environment"], build_environment.return_value)
         for call in mocked_run.call_args_list:

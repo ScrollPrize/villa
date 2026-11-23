@@ -5,6 +5,8 @@ This module contains various learning rate scheduling strategies including
 the PolyLR scheduler used by nnU-Net.
 """
 
+import math
+
 import torch
 from torch.optim.lr_scheduler import _LRScheduler
 from typing import Optional
@@ -190,19 +192,15 @@ def get_scheduler(scheduler_type: str,
         warmup_steps = kwargs.get('warmup_steps', int(0.1 * max_steps))
         num_cycles = kwargs.get('num_cycles', 0.5)
 
-        try:
-            from diffusers.optimization import get_cosine_schedule_with_warmup
-        except ImportError as exc:
-            raise ImportError(
-                "diffusers is required for the 'diffusers_cosine_warmup' scheduler"
-            ) from exc
+        # Linear warmup from 0, then a cosine of num_cycles periods down to 0: the
+        # schedule diffusers' get_cosine_schedule_with_warmup gives, step for step.
+        def lr_lambda(step):
+            if step < warmup_steps:
+                return float(step) / float(max(1, warmup_steps))
+            progress = float(step - warmup_steps) / float(max(1, max_steps - warmup_steps))
+            return max(0.0, 0.5 * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress)))
 
-        return get_cosine_schedule_with_warmup(
-            optimizer=optimizer,
-            num_warmup_steps=warmup_steps,
-            num_training_steps=max_steps,
-            num_cycles=num_cycles,
-        )
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     
     elif scheduler_type == 'step':
         step_size = kwargs.get('step_size', max_steps // 3)

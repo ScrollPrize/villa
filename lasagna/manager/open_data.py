@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import cached_property
 import hashlib
 import importlib
 import json
@@ -11,6 +12,8 @@ import subprocess
 import tempfile
 from typing import Any, Iterable, Protocol
 from urllib.parse import urlparse
+
+import vc_reader.reader
 
 try:
     from inference_provenance import validate_portable_bundle
@@ -31,7 +34,7 @@ INCOMPLETE_MARKER = "_INCOMPLETE"
 _RUN_TIMESTAMP = re.compile(r"(?<!\d)(\d{8}_\d{6})(?!\d)")
 
 
-class ObjectStore(Protocol):
+class StagingStore(Protocol):
     def put_file(self, key: str, path: Path) -> None: ...
     def put_bytes(self, key: str, value: bytes) -> None: ...
     def delete(self, key: str) -> None: ...
@@ -53,21 +56,17 @@ class S3ObjectStore:
         self,
         bucket: str,
         *,
-        client: Any | None = None,
         rclone_params: Iterable[str] = (),
     ) -> None:
-        if client is None:
-            try:
-                import boto3
-            except ImportError as error:
-                raise RuntimeError("staging upload requires boto3") from error
-            client = boto3.client("s3")
         self.bucket = bucket
-        self.client = client
         self.rclone_params = tuple(rclone_params)
 
+    @cached_property
+    def store(self) -> vc_reader.reader.ObjectStore:
+        return vc_reader.reader.ObjectStore(f"s3://{self.bucket}")
+
     def put_file(self, key: str, path: Path) -> None:
-        self.client.upload_file(str(path), self.bucket, key)
+        self.store.write(key, path.read_bytes())
 
     def put_files(self, prefix: str, bundle: Path, files: Iterable[str]) -> None:
         """Upload a fixed bundle inventory concurrently with rclone."""
@@ -95,10 +94,10 @@ class S3ObjectStore:
         ], check=True)
 
     def put_bytes(self, key: str, value: bytes) -> None:
-        self.client.put_object(Bucket=self.bucket, Key=key, Body=value)
+        self.store.write(key, value)
 
     def delete(self, key: str) -> None:
-        self.client.delete_object(Bucket=self.bucket, Key=key)
+        self.store.remove(key)
 
 
 def _sha256(path: Path) -> str:
@@ -303,7 +302,7 @@ def _key(plan: UploadPlan, relative: str) -> str:
     return f"{plan.prefix}/{safe.as_posix()}"
 
 
-def stage_upload(plan: UploadPlan, store: ObjectStore) -> str:
+def stage_upload(plan: UploadPlan, store: StagingStore) -> str:
     """Upload through rclone, with a marker guarding manager-side commit."""
     marker_key = _key(plan, INCOMPLETE_MARKER)
     store.put_bytes(marker_key, b"")
@@ -352,7 +351,7 @@ def upload_inference(
     config: ManagerConfig,
     selector: str,
     *,
-    store: ObjectStore | None = None,
+    store: StagingStore | None = None,
     validator: Any | None = None,
     ingester: Any | None = None,
 ) -> dict[str, Any]:

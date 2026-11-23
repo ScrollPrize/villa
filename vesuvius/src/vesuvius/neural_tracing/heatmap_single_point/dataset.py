@@ -1,20 +1,21 @@
-import os
-import cv2
-import zarr
 import json
 import warnings
-import glob
 import torch
 import random
 import numpy as np
-import scipy.ndimage
 from tqdm import tqdm
 from einops import rearrange
 from functools import lru_cache
 import torch.nn.functional as F
 from dataclasses import dataclass
 
+from vc_reader import tifxyz
+from vc_reader.geometry import label_components
+from vc_reader.torch import surface_points, surface_derivatives
+from vc_reader.reader import ZarrReader, open_group
+
 import vesuvius.neural_tracing.heatmap_single_point.augmentation as augmentation
+from vesuvius.models.augmentation.pipelines import sample_seed
 
 
 
@@ -23,13 +24,14 @@ import vesuvius.neural_tracing.heatmap_single_point.augmentation as augmentation
 class Patch:
     zyxs: torch.Tensor
     scale: torch.Tensor
-    volume: zarr.Array
+    volume: ZarrReader
 
     def __post_init__(self):
         # Construct the valid *quads* mask; the ij'th element says whether all four corners of the quad with min-corner at ij are valid
         self.valid_quad_mask = torch.any(self.zyxs[:-1, :-1] != -1, dim=-1) & torch.any(self.zyxs[1:, :-1] != -1, dim=-1) & torch.any(self.zyxs[:-1, 1:] != -1, dim=-1) & torch.any(self.zyxs[1:, 1:] != -1, dim=-1)
         self.valid_quad_indices = torch.stack(torch.where(self.valid_quad_mask), dim=-1)
         self.valid_vertex_mask = torch.any(self.zyxs != -1, dim=-1)
+        self.derivatives = surface_derivatives(self.zyxs[None], self.valid_vertex_mask[None])
         assert len(self.valid_quad_indices) > 0
         self.area = self.valid_quad_mask.sum() * (1 / self.scale).prod()
         self.quad_centers = torch.where(self.valid_quad_mask[..., None], 0.5 * (self.zyxs[1:, 1:] + self.zyxs[:-1, :-1]), torch.tensor(-1.))
@@ -46,7 +48,6 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
     _channel_range_cache = {}
     _kernel_offsets_cache = {}
     _kernel_value_cache = {}
-    _quad_weight_cache = {}
 
     def __init__(self, config, patches_for_split, multistep_count, bidirectional):
         self._config = config
@@ -63,30 +64,10 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
         self._perturb_cache_key = None
         self._perturb_cache_value = None
         self._volume_patch_bboxes = {}
-        self._sampling = {}
         self._quad_bboxes = {}
         self._vertex_normals = {}
 
         for patch in self._patches:
-            top_left = patch.zyxs[:-1, :-1]
-            top_right = patch.zyxs[:-1, 1:]
-            bottom_left = patch.zyxs[1:, :-1]
-            bottom_right = patch.zyxs[1:, 1:]
-            quad_corners = torch.stack([
-                torch.stack([top_left, top_right], dim=2),
-                torch.stack([bottom_left, bottom_right], dim=2),
-            ], dim=2)  # shape: (h-1, w-1, 2, 2, 3)
-            points_per_side = (1 / patch.scale + 0.5).int()
-            v_points = torch.arange(points_per_side[0], dtype=torch.float32) / points_per_side[0]
-            u_points = torch.arange(points_per_side[1], dtype=torch.float32) / points_per_side[1]
-            self._sampling[id(patch)] = {
-                "quad_corners": quad_corners,
-                "v_points": v_points,
-                "u_points": u_points,
-                "uv_weights": self._make_quad_weights(v_points, u_points),
-                "quad_corners_flat": quad_corners.view(*quad_corners.shape[:2], 4, 3),
-            }
-
             valid_centers = patch.quad_centers[patch.valid_quad_mask]
             if len(valid_centers) == 0:
                 bbox_min = torch.zeros(3, dtype=patch.quad_centers.dtype)
@@ -111,48 +92,21 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             int(crop_size),
         )
 
-    @staticmethod
-    def _make_quad_weights(v_points, u_points):
-        one_minus_v = 1 - v_points
-        one_minus_u = 1 - u_points
-        w_tl = one_minus_v[:, None] * one_minus_u[None, :]
-        w_tr = one_minus_v[:, None] * u_points[None, :]
-        w_bl = v_points[:, None] * one_minus_u[None, :]
-        w_br = v_points[:, None] * u_points[None, :]
-        weights = torch.stack([w_tl, w_tr, w_bl, w_br], dim=-1)
-        return weights.view(-1, 4)
-
-    @classmethod
-    def _get_quad_weights(cls, points_per_side, device):
-        key = (int(points_per_side[0]), int(points_per_side[1]), device)
-        if key not in cls._quad_weight_cache:
-            v_points = torch.arange(points_per_side[0], dtype=torch.float32, device=device) / points_per_side[0]
-            u_points = torch.arange(points_per_side[1], dtype=torch.float32, device=device) / points_per_side[1]
-            cls._quad_weight_cache[key] = cls._make_quad_weights(v_points, u_points)
-        return cls._quad_weight_cache[key]
-
-    def _sample_points_from_quads(self, patch, quad_mask):
-        """Sample points finely from quads specified by the mask"""
-        if not torch.any(quad_mask):
-            return torch.empty(0, 3)
-        
-        filtered_quads_zyxs = torch.stack([
-            torch.stack([
-                patch.zyxs[:-1, :-1][quad_mask],
-                patch.zyxs[:-1, 1:][quad_mask],
-            ], dim=1),
-            torch.stack([
-                patch.zyxs[1:, :-1][quad_mask],
-                patch.zyxs[1:, 1:][quad_mask],
-            ], dim=1),
-        ], dim=1)  # quad, top/bottom, left/right, zyx
-        
-        points_per_side = (1 / patch.scale + 0.5).int()
-        quad_corners_flat = filtered_quads_zyxs.view(filtered_quads_zyxs.shape[0], 4, 3)
-        weights = self._get_quad_weights(points_per_side, device=filtered_quads_zyxs.device)
-        points_covering_quads = torch.einsum("kc,ncd->nkd", weights, quad_corners_flat)
-
-        return points_covering_quads.reshape(-1, 3)
+    def _sample_points_from_quads(self, patch, quad_mask, *, normals=False):
+        """Sample bicubic positions and optional tangent normals in selected quads."""
+        counts = (1 / patch.scale + 0.5).int()
+        offsets = torch.stack(torch.meshgrid(
+            torch.arange(counts[0], device=patch.zyxs.device) / counts[0],
+            torch.arange(counts[1], device=patch.zyxs.device) / counts[1],
+            indexing="ij"), -1).reshape(-1, 2)
+        rc = (torch.nonzero(quad_mask)[:, None] + offsets[None]).reshape(1, -1, 2)
+        points, row, col, _ = surface_points(patch.zyxs[None], patch.valid_vertex_mask[None], rc,
+                                            derivatives=patch.derivatives)
+        points = points[0]
+        if normals:
+            normal = F.normalize(torch.linalg.cross(col[0], row[0]), dim=-1, eps=1e-6)
+            return points, normal
+        return points
 
     def _get_quads_in_crop(self, patch, min_corner_zyx, crop_size):
         """Get mask of quads that fall within the crop region."""
@@ -167,25 +121,13 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
 
     @staticmethod
     def _compute_vertex_normals(patch):
-        """Pre-compute unit normals per vertex from valid quads."""
-        zyxs = patch.zyxs.to(dtype=torch.float32)
-        normals = torch.zeros_like(zyxs, dtype=torch.float32)
-
-        tl = zyxs[:-1, :-1]
-        tr = zyxs[:-1, 1:]
-        bl = zyxs[1:, :-1]
-        quad_normals = torch.linalg.cross(tr - tl, bl - tl)
-        quad_normals = quad_normals * patch.valid_quad_mask[..., None]
-
-        normals[:-1, :-1] += quad_normals
-        normals[:-1, 1:] += quad_normals
-        normals[1:, :-1] += quad_normals
-        normals[1:, 1:] += quad_normals
-
-        norms = torch.linalg.norm(normals, dim=-1, keepdim=True)
-        normals = torch.where(norms > 1e-6, normals / norms, torch.zeros_like(normals))
-        normals = torch.where(patch.valid_vertex_mask[..., None], normals, torch.zeros_like(normals))
-        return normals
+        """Unit normals from bicubic surface tangents at grid vertices."""
+        rc = torch.stack(torch.meshgrid(
+            torch.arange(patch.zyxs.shape[0], device=patch.zyxs.device),
+            torch.arange(patch.zyxs.shape[1], device=patch.zyxs.device), indexing="ij"), -1)
+        _, row, col, _ = surface_points(patch.zyxs[None], patch.valid_vertex_mask[None],
+                                        rc.reshape(1, -1, 2), derivatives=patch.derivatives)
+        return F.normalize(torch.linalg.cross(col, row), dim=-1, eps=1e-6).reshape_as(patch.zyxs)
 
     def _get_patch_points_in_crop(self, patch, min_corner_zyx, crop_size):
         """Get finely sampled points from a patch that fall within the crop region"""
@@ -200,12 +142,7 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
         if not torch.any(quad_in_crop):
             return torch.empty((0, 3), dtype=torch.float32)
 
-        info = self._sampling[id(patch)]
-        filtered_quads_zyxs = info["quad_corners_flat"][quad_in_crop]
-        weights = info["uv_weights"]
-        points_covering_quads = torch.einsum("kc,ncd->nkd", weights, filtered_quads_zyxs)
-
-        return points_covering_quads.reshape(-1, 3)
+        return self._sample_points_from_quads(patch, quad_in_crop)
 
     def _get_current_patch_center_component_mask(self, current_patch, center_ij, min_corner_zyx, crop_size):
         """Get the mask of the connected component containing the center point"""
@@ -222,11 +159,8 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             component_mask = torch.zeros_like(quad_in_crop)
             return component_mask
 
-        # use scipy label instead of dfs; use 8-connectivity (including diagonals) to avoid dashed lines
-        structure = np.array([[1, 1, 1],
-                              [1, 1, 1],
-                              [1, 1, 1]], dtype=np.int8)
-        labeled, _ = scipy.ndimage.label(quad_in_crop.cpu().numpy(), structure=structure)
+        # label components instead of a dfs; 8-connectivity (including diagonals) avoids dashed lines
+        labeled, _ = label_components(quad_in_crop.cpu().numpy(), connectivity=8, threads=1)
         label = labeled[center_quad[0].item(), center_quad[1].item()]
         if label == 0:
             component_mask = torch.zeros_like(quad_in_crop)
@@ -792,11 +726,8 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
                 quad_in_crop = self._get_quads_in_crop(patch, min_corner_zyx, crop_size)
 
                 if torch.any(quad_in_crop):
-                    info = self._sampling[id(patch)]
-                    weights = info["uv_weights"]  # [P, 4]
-
-                    quad_corners = info["quad_corners_flat"][quad_in_crop]
-                    points_covering_quads = torch.einsum("kc,ncd->nkd", weights, quad_corners).reshape(-1, 3)
+                    points_covering_quads, sampled_normals = self._sample_points_from_quads(
+                        patch, quad_in_crop, normals=True)
                     surface_pts_crop = (points_covering_quads - min_corner_zyx.to(points_covering_quads.device, non_blocking=True)).round().long()
                     in_bounds = ((surface_pts_crop >= 0) & (surface_pts_crop < crop_size)).all(dim=1)
                     surface_pts_crop = surface_pts_crop[in_bounds]
@@ -814,24 +745,16 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
                                 break
                         # Keep only the connected component touching the chosen anchor to avoid fragmented masks
                         if anchor_voxel is not None and surface_mask[0, anchor_voxel[0], anchor_voxel[1], anchor_voxel[2]] > 0:
-                            structure = np.ones((3, 3, 3), dtype=np.int8)
-                            labeled, _ = scipy.ndimage.label(surface_mask[0].cpu().numpy(), structure=structure)
+                            labeled, _ = label_components(surface_mask[0].cpu().numpy(), connectivity=26, threads=1)
                             label = labeled[anchor_voxel[0].item(), anchor_voxel[1].item(), anchor_voxel[2].item()]
                             if label != 0:
                                 surface_mask_np = (labeled == label)[None].astype(np.float32)
                                 surface_mask = torch.from_numpy(surface_mask_np).to(surface_mask.device, non_blocking=True)
                     if self._config.get("aux_normals", False):
-                        vertex_normals = self._vertex_normals[id(patch)]
-                        filtered_quad_normals = torch.stack([
-                            torch.stack([vertex_normals[:-1, :-1][quad_in_crop], vertex_normals[:-1, 1:][quad_in_crop]], dim=1),
-                            torch.stack([vertex_normals[1:, :-1][quad_in_crop], vertex_normals[1:, 1:][quad_in_crop]], dim=1),
-                        ], dim=1)  # [N, 2, 2, 3]
-                        quad_normals_flat = filtered_quad_normals.view(filtered_quad_normals.shape[0], 4, 3)
-                        normals_covering_quads = torch.einsum("kc,ncd->nkd", weights, quad_normals_flat).reshape(-1, 3)
-                        normals_covering_quads = normals_covering_quads[in_bounds]
+                        normals_covering_quads = sampled_normals[in_bounds]
 
             if self._config.get("aux_normals", False):
-                # Build dense normals by bilinearly interpolating vertex normals within each quad and splatting to voxels.
+                # Splat bicubic tangent normals to voxels.
                 if normals_covering_quads is None or surface_pts_crop is None or surface_pts_crop.numel() == 0:
                     continue
                 normals = torch.zeros((3, crop_size, crop_size, crop_size), device=surface_pts_crop.device, dtype=torch.float32)
@@ -901,19 +824,17 @@ class HeatmapDatasetV2(torch.utils.data.IterableDataset):
             uv_channels = uv_heatmaps_both.shape[0]
             regression_target = torch.cat([uv_heatmaps_both] + ([maybe_center_heatmap] if maybe_center_heatmap is not None else []), dim=0)
             seg_for_aug = seg[None] if seg is not None else None
-            while True:
-                augmented = self._augmentations(
-                    image=volume_crop[None],
-                    dist_map=localiser[None],
-                    regression_target=regression_target,
-                    segmentation=seg_for_aug,
-                    normals=normals,
-                    normals_mask=normals_mask,
-                )
-                if augmented['dist_map'] is not None:
-                    break
+            augmented = self._augmentations(
+                {
+                    'image': volume_crop[None],
+                    'regression_target': regression_target,
+                    'segmentation': seg_for_aug,
+                    'normals': normals,
+                    'normals_mask': normals_mask,
+                },
+                seed=sample_seed(0),
+            )
             volume_crop = augmented['image'].squeeze(0)
-            localiser = augmented['dist_map'].squeeze(0)
             regression_aug = rearrange(augmented['regression_target'], 'c z y x -> z y x c')
             uv_heatmaps_both = regression_aug[..., :uv_channels]
             maybe_center_heatmap = regression_aug[..., uv_channels] if uv_channels < regression_aug.shape[-1] else None
@@ -988,21 +909,9 @@ def mark_context_point(volume, point, value=1.):
 
 
 def get_zyx_from_patch(ij, patch):
-    original_shape = ij.shape
-    batch_dims = original_shape[:-1]
-    ij_flat = ij.view(-1, 2)
-    # Align grid coords to vertex centers: -1 -> [0,0], +1 -> [H-1, W-1]
-    denom = torch.as_tensor(patch.zyxs.shape[:2], device=ij_flat.device, dtype=ij_flat.dtype) - 1
-    denom = torch.clamp(denom, min=1)  # avoid divide-by-zero on degenerate patches
-    normalized_ij = ij_flat / denom * 2 - 1
-    interpolated = F.grid_sample(
-        rearrange(patch.zyxs, 'h w c -> 1 c h w'),
-        rearrange(normalized_ij.flip(-1), 'b xy -> 1 b 1 xy'),
-        align_corners=True,
-        mode='bilinear',
-        padding_mode='border'
-    )
-    return rearrange(interpolated, '1 c b 1 -> b c').view(*batch_dims, -1)
+    points, _, _, _ = surface_points(patch.zyxs[None], patch.valid_vertex_mask[None],
+                                      ij.reshape(1, -1, 2), derivatives=patch.derivatives, border=True)
+    return points.reshape(*ij.shape[:-1], 3)
 
 
 @lru_cache(maxsize=None)
@@ -1033,7 +942,8 @@ def load_datasets(config, shard_idx=None, total_shards=None):
                 "(LRUStoreCache was removed). Ignoring the option.",
                 stacklevel=2,
             )
-        ome_zarr = zarr.open(volume_path, mode='r')
+        # Read in DataLoader workers, which are the parallelism.
+        ome_zarr = open_group(volume_path, threads=1)
 
         volume_scale = dataset['volume_scale']
         volume = ome_zarr[str(volume_scale)]
@@ -1077,28 +987,14 @@ def load_datasets(config, shard_idx=None, total_shards=None):
 
 def load_tifxyz_patches(segments_path, z_range, volume):
 
-    segment_paths = glob.glob(segments_path + "/*")
-    segment_paths = sorted([path for path in segment_paths if os.path.isdir(path)])
-    print(f'found {len(segment_paths)} tifxyz patches')
+    entries = tifxyz.list_surfaces(segments_path, recursive=False, z_range=z_range)
+    print(f'found {len(entries)} tifxyz patches')
 
     all_patches = []
-    for segment_path in tqdm(segment_paths, desc='loading tifxyz patches'):
-        try:  # TODO: remove
-            # TODO: move this bit to a method in tifxyz.py
-            with open(f'{segment_path}/meta.json', 'r') as meta_json:
-                metadata = json.load(meta_json)
-                bbox = metadata['bbox']
-                scale = torch.tensor(metadata['scale'])
-            if z_range is not None and (bbox['min'][2] > z_range[1] or bbox['max'][2] < z_range[0]):
-                continue
-            zyxs = torch.from_numpy(np.stack([
-                cv2.imread( f'{segment_path}/{coord}.tif', flags=cv2.IMREAD_UNCHANGED)
-                for coord in 'zyx'
-            ], axis=-1))
-            all_patches.append(Patch(zyxs, scale, volume))
-        except Exception as e:
-            print(f'error loading {segment_path}: {e}')
-            continue
+    for entry in tqdm(entries, desc='loading tifxyz patches'):
+        surface = tifxyz.read(entry.location, mask=False)
+        zyxs = torch.from_numpy(surface.xyz[..., ::-1].copy())
+        all_patches.append(Patch(zyxs, torch.tensor(surface.scale[::-1]), volume))
 
     print(f'loaded {len(all_patches)} tifxyz patches from {segments_path}')
     return all_patches

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <vector>
+#include <vc_reader/thinning.hpp>
 #include <opencv2/core.hpp>
 #include <optional>
 #include <cstdint>
@@ -38,7 +39,7 @@ cv::Vec2f align_and_extract_umbilicus(const GridStore& grid_store,
 // Adds each trace to the grid, resampled so that consecutive kept points are at
 // least `spiral_step` apart. Traces that end up with fewer than two points are
 // skipped.
-void populate_normal_grid(const std::vector<std::vector<cv::Point>>& traces, GridStore& normal_grid, double spiral_step);
+void populate_normal_grid(const vcr::thinning::Traces& traces, GridStore& normal_grid, double spiral_step);
 
 } // namespace util
 } // namespace core

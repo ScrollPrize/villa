@@ -1,6 +1,7 @@
 """Process identities and peer credentials without creating a CUDA context."""
 
 import os
+from pathlib import Path
 import socket
 import struct
 import subprocess
@@ -21,9 +22,13 @@ def process_identity(pid=None):
 
 def process_state(identity, uid):
     """Return alive/dead/unknown; never interpret inaccessible as dead."""
+    # A process from an earlier boot is gone even if its PID now exists and
+    # belongs to another user. Do not inspect that unrelated process's UID.
+    if identity["boot_us"] != round(psutil.boot_time() * 1_000_000):
+        return "dead"
     try:
         p = psutil.Process(identity["pid"])
-        if process_identity(p.pid) != identity:
+        if round(p.create_time() * 1_000_000) != identity["start_us"]:
             return "dead"
         if p.uids().real != uid:
             return "unknown"
@@ -32,6 +37,13 @@ def process_state(identity, uid):
         return "dead"
     except (psutil.AccessDenied, OSError):
         return "unknown"
+
+
+def host_boot_id():
+    """Linux boot identity is stable across wall-clock corrections."""
+    if sys.platform.startswith("linux"):
+        return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    return None
 
 
 def descendants(identity, uid):

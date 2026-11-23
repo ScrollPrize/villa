@@ -62,6 +62,8 @@ run_in_builder() {
     docker run --rm \
         --user "$(id -u):$(id -g)" \
         -v "$src:/src" \
+        -v "$src/../vc_reader:/vc_reader:ro" \
+        -v "$src/../vc_object_store:/vc_object_store:ro" \
         -w /src \
         -e "VC_BUILD_SUFFIX=-$image" \
         -e "CCACHE_DIR=/src/.ccache" \
@@ -168,7 +170,7 @@ cmd_builder() {
         --file "$dockerfile" \
         --load \
         "${cache_args[@]}" \
-        .
+        "$REPO_ROOT/.."
 }
 
 cmd_publish() {
@@ -187,7 +189,7 @@ cmd_publish() {
         --label "vc-builder-deps-hash=$(builder_deps_hash "$image")" \
         --file "$dockerfile" \
         --push \
-        .
+        "$REPO_ROOT/.."
 }
 
 cmd_test() {

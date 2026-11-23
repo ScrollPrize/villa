@@ -43,22 +43,22 @@ TEST_CASE("areaCm2FromVox2: refuses a non-finite area")
 
 TEST_CASE("storeAreaMeta: records both areas when the voxel size is known")
 {
-    auto meta = utils::Json::object();
+    auto meta = nlohmann::json::object();
     storeAreaMeta(meta, 3625.31668921149, 2.4);
 
     REQUIRE(meta.contains("area_vx2"));
     REQUIRE(meta.contains("area_cm2"));
-    CHECK(meta["area_vx2"].get_double() == doctest::Approx(3625.31668921149));
-    CHECK(meta["area_cm2"].get_double() == doctest::Approx(0.000208818241).epsilon(1e-9));
+    CHECK(meta["area_vx2"].get<double>() == doctest::Approx(3625.31668921149));
+    CHECK(meta["area_cm2"].get<double>() == doctest::Approx(0.000208818241).epsilon(1e-9));
 }
 
 TEST_CASE("storeAreaMeta: omits area_cm2 when the voxel size is unknown")
 {
-    auto meta = utils::Json::object();
+    auto meta = nlohmann::json::object();
     storeAreaMeta(meta, 15627277.310839027, 0.0);
 
     REQUIRE(meta.contains("area_vx2"));
-    CHECK(meta["area_vx2"].get_double() == doctest::Approx(15627277.310839027));
+    CHECK(meta["area_vx2"].get<double>() == doctest::Approx(15627277.310839027));
     CHECK_FALSE(meta.contains("area_cm2"));
 }
 
@@ -66,10 +66,10 @@ TEST_CASE("storeAreaMeta: clears a stale area_cm2 rather than leaving it")
 {
     // The tracers seed meta from caller-supplied params, so the key can
     // already be present when the voxel size turns out to be unusable.
-    auto meta = utils::Json::object();
+    auto meta = nlohmann::json::object();
     meta["area_cm2"] = 12.5;
     storeAreaMeta(meta, 4096.0, 0.0);
 
     CHECK_FALSE(meta.contains("area_cm2"));
-    CHECK(meta["area_vx2"].get_double() == doctest::Approx(4096.0));
+    CHECK(meta["area_vx2"].get<double>() == doctest::Approx(4096.0));
 }

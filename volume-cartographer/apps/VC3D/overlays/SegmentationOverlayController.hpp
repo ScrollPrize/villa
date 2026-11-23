@@ -88,12 +88,10 @@ public:
     explicit SegmentationOverlayController(CState* state, QObject* parent = nullptr);
 
     void setEditingEnabled(bool enabled);
-    void setEditManager(SegmentationEditManager* manager);
     void setViewerManager(ViewerManager* manager) { _viewerManager = manager; }
     void applyState(const State& state);
 
     // Force refresh of all viewer overlays (bypasses state comparison optimization)
-    void forceRefreshAllOverlays();
 
 protected:
     bool isOverlayEnabledFor(VolumeViewerBase* viewer) const override;
@@ -116,7 +114,6 @@ private:
 
 
     CState* _state{nullptr};
-    SegmentationEditManager* _editManager{nullptr};
     ViewerManager* _viewerManager{nullptr};
     bool _editingEnabled{false};
     std::optional<State> _currentState;
@@ -129,7 +126,6 @@ private:
         std::uint64_t surfacesVersion{0};                   // CState surface map version
         float threshold{0.0f};                              // Threshold when image was built
         QuadSurface* surface{nullptr};                      // Current surface when image was built
-        int sampleStride{1};                                // Raw grid stride represented by one image pixel
     };
     mutable std::map<VolumeViewerBase*, OverlapCache> _overlapCaches;
 

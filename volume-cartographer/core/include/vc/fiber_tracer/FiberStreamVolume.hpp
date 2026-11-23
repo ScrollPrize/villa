@@ -5,6 +5,9 @@
 #include <nlohmann/json.hpp>
 
 namespace vc::fiber_tracer {
+// Streaming explicitly opts out through reverse_consistency=false. Historical
+// FW/BW-off trace configs otherwise receive the validated delayed-check policy.
+FiberTraceConfig fiberStreamTraceConfig(FiberTraceConfig, bool reverseConsistency = true);
 // All hot-path scheduling, collision/CT decisions, seed admission and output
 // assembly are native. Python may supply metadata and poll cancellation only.
 nlohmann::json runFiberStreamVolume(const FiberPredictionSource&,

@@ -2,6 +2,7 @@
 
 #include <QObject>
 #include <QString>
+#include <vc_object_store/objects/Transactions.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -9,6 +10,13 @@
 #include <optional>
 
 namespace vc3d::fiber_map {
+
+// Application status accompanies, but never substitutes for, selected identity.
+struct UmbilicusDependency {
+    std::optional<vc::objects::ObjectVersion> reference;
+    QString problem;
+    bool operator==(const UmbilicusDependency&) const = default;
+};
 
 // Everything a Fiber Map layout is derived from, gathered in one value so that
 // "what it was built from" and "what a rebuild would use now" are the same shape
@@ -21,8 +29,7 @@ struct FiberMapDependencies {
     uint64_t fiberGeneration = 0;
     uint64_t packageGeneration = 0;
     uint64_t umbilicusGeneration = 0;
-    // The stored umbilicus (uuid@revision), or why there is none.
-    QString umbilicusFingerprint;
+    UmbilicusDependency umbilicusDependency;
     // The volume the map is laid out in (CState::annotationVolume: the catalog
     // volume the current volume shows, every pyramid level alike, else the
     // current volume) and its voxel size.
@@ -157,10 +164,10 @@ inline StaleVerdict staleVerdictFor(const FiberMapDependencies& built,
         return verdict;
     }
 
-    // The counter covers what VC3D itself did; the fingerprint covers the file
-    // being added, replaced or rewritten underneath it.
+    // The counter covers application changes; the selected dependency also
+    // distinguishes owner/lineage changes with the same numeric version.
     if (current.umbilicusGeneration != built.umbilicusGeneration ||
-        current.umbilicusFingerprint != built.umbilicusFingerprint) {
+        current.umbilicusDependency != built.umbilicusDependency) {
         verdict.action = StaleVerdict::Action::MarkStale;
         verdict.cause = StaleVerdict::Cause::Umbilicus;
         verdict.reason = QObject::tr("Umbilicus changed — press Update");

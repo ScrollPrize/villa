@@ -31,23 +31,24 @@ checkpoint run's); models with ``strip_uncertainty`` also save their expected er
 (``expected_error_vox`` in strip.npz, its mean over the stitched rows in summary.json).
 Nodes within ``--trim`` patch voxels of either fiber end, or beyond it, are not kept (as infer_all.py).
 Arclengths and ``--step``/``--blend`` are trace voxels; ``--arc`` and ``--trim`` patch voxels.
-If trimming leaves no nodes, inference exits before writing. Missing scoring coverage leaves the predictions
-intact: summary.json records coverage counts and omits unavailable error statistics; empty patch sheets are not written.
+If trimming leaves no nodes, inference exits before writing the strip outputs (with --ct, --out already holds
+ct_normalization.json). Missing scoring coverage leaves the predictions intact: summary.json records coverage counts
+and omits unavailable error statistics; empty patch sheets are not written.
 """
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor
 import json
 import math
 from pathlib import Path
+import tempfile
 import time
 
 import numpy as np
 import torch
+from vc_reader.reader import open_zarr
 
-from vesuvius.neural_tracing.tracers.fibers.data.observations import (
-    IdentityObservationBuilder, IdentitySampling, image_crop)
+from vesuvius.neural_tracing.tracers.fibers.data.observations import IdentityObservationBuilder, IdentitySampling
 from vesuvius.neural_tracing.tracers.fibers.data.samples import STARTUP_CATEGORIES, SampleConfig, decision_on_path
 from vesuvius.neural_tracing.tracers.fibers.frames.ct import oriented_seed_heading
 from vesuvius.neural_tracing.tracers.fibers.frames.learned import prediction_window
@@ -59,7 +60,8 @@ from vesuvius.neural_tracing.tracers.fibers.sheet_strip.train import load_strip_
 from vesuvius.neural_tracing.tracers.fibers.tracing.runtime import (
     add_volume_arguments, configure_volume, resolve_checkpoint)
 from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import FiberStore, fiber_volume
-from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolume, CTVolumeSpec
+from vesuvius.neural_tracing.tracers.shared.crop_sampling.normalization import prepare_normalization
+from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolumeSpec
 from vesuvius.neural_tracing.tracers.shared.geometry import interp_at
 from vesuvius.neural_tracing.tracers.shared.hub import checkpoint_source, hf_repo, hub_folder
 from vesuvius.neural_tracing.tracers.shared.paths import recorded_path
@@ -139,7 +141,7 @@ def skip_remote_seed_heading(item, reach):
 
 
 
-def reuse_seed_heading(item, vol, cache):
+def reuse_seed_heading(item, ct, spec, cache):
     """Resolve a decision's CT seed heading as data/targets.resolve_trace_seed does, computing it once per seed:
     every decision of a fiber has the same seed, family and seed tangent, so ``cache`` (one per fiber) holds it.
     Decisions starting at the seed (a pending crop heading) are left to resolve_trace_seed."""
@@ -150,16 +152,32 @@ def reuse_seed_heading(item, vol, cache):
     seed, tangent = (np.asarray(item[k], np.float64) for k in ('seed_pos', 'seed_tangent'))
     key = (family, seed.tobytes(), tangent.tobytes())
     if key not in cache:
-        cache[key] = oriented_seed_heading(vol, item['seed_pos'], family, item['seed_tangent'])
+        cache[key] = oriented_seed_heading(ct, spec, item['seed_pos'], family, item['seed_tangent'])
     item['fiber_family'] = family
     item['seed_tangent'] = cache[key].copy()
+
+def bind_ct_override_normalization(spec, volume, known=None):
+    """With a ``--ct`` override (``volume.ct``: another CT than the checkpoint's), bind the per-crop z-score record of
+    ``spec`` to that CT, as tracing/inference.py does; without one, leave the checkpoint's record. The record carries
+    no learned statistics, only the volume's identity (normalize_ct checks only its method), so crops are normalized
+    the same either way; what changes is which volume the bound record names. It is persisted as
+    ``volume.out``/ct_normalization.json when the options name an output folder."""
+    if not getattr(volume, 'ct', None):
+        return
+    out = getattr(volume, 'out', None)
+    if out:
+        Path(out).mkdir(parents=True, exist_ok=True)
+        prepare_normalization(out, [spec], known=known)
+    else:
+        with tempfile.TemporaryDirectory(prefix='sheet_strip_ct_normalization_') as scratch:
+            prepare_normalization(scratch, [spec], known=known)
+
 
 class StripPredictor:
     """A sheet-strip checkpoint and what its decisions need (frame model and crop builder, CT volume, umbilicus),
     loaded once; ``predict`` runs one fiber's decisions."""
 
-    def __init__(self, checkpoint=DEFAULT_CHECKPOINT, device='cuda', umbilicus=None, batch=16, crop_threads=1,
-                 volume=None):
+    def __init__(self, checkpoint=DEFAULT_CHECKPOINT, device='cuda', umbilicus=None, batch=16, volume=None):
         """``checkpoint``: a file or a Hugging Face repo (module notes); ``volume``: parsed CT and frame-model options
         (runtime.add_volume_arguments; None: the checkpoint's). ``source`` is what outputs record as the checkpoint."""
         path = resolve_checkpoint(checkpoint)
@@ -169,20 +187,17 @@ class StripPredictor:
         self.data = self.ck['run_config']['data']
         self.spec = CTVolumeSpec.from_dict(self.ck['vol_spec'])
         configure_volume(volume or argparse.Namespace(), self.spec, self.cfg, path)
+        bind_ct_override_normalization(self.spec, volume, known=self.ck.get('ct_normalization'))
         self.trace_per_patch = self.spec.ct_grid_scale/self.spec.grid_scale
         self.f, self.v = (a.numpy().astype(np.float64) for a in strip_grid(self.cfg))
         self.sample_cfg = SampleConfig(**dict(self.ck['sample_cfg'], crop=self.cfg.fine,
                                               prediction_window=prediction_window(self.cfg)))
         self.builder = IdentityObservationBuilder(self.cfg, None, IdentitySampling(), augment=False)
-        if crop_threads > 1:
-            # A batch's crops are read and sampled on a thread pool (shared/crop_sampling/crops.scalar_crops: the same
-            # values; the sampler releases the GIL).
-            pool = ThreadPoolExecutor(crop_threads)
-            self.builder.crop_images = lambda items, vol, crop, _=None: image_crop(items, vol, crop, pool)
         self.umbilicus = None
         if self.cfg.strip_orientation:
             self.umbilicus = load_umbilicus(umbilicus or find_umbilicus(checkpoint, path, self.data.get('umbilicus')))
-        self.vol = CTVolume(self.spec)
+        self.ct = open_zarr(self.spec.ct_zarr, level=self.spec.ct_level, cache_dir=self.spec.cache_dir,
+                            memory_cache=3 << 30)
         self.rng = np.random.default_rng(0)
         c = self.cfg.fine  # the crop's farthest point from its head, plus a sample
         self.crop_reach = math.sqrt((max(c.behind, c.depth-c.behind)*c.spacing)**2+2*((c.width-1)/2*c.spacing)**2)+c.spacing
@@ -200,8 +215,8 @@ class StripPredictor:
                      for t in arcs[start:start+self.batch]]
             for item in items:
                 skip_remote_seed_heading(item, self.crop_reach)
-                reuse_seed_heading(item, self.vol, seed_headings)
-            batch = self.builder(items, self.vol)  # orients each crop with the frame model, then crops the CT
+                reuse_seed_heading(item, self.ct, self.spec, seed_headings)
+            batch = self.builder(items, self.ct, self.spec)  # orients each crop with the frame model, then crops the CT
             tube = np.zeros((len(items), 2048, 3), np.float32)
             valid = np.zeros((len(items), 2048), bool)
             for row, item in enumerate(items):
@@ -307,17 +322,16 @@ def stitch(heights, frames, positions, arcs, f, v, blend, weights=None):
     return mean, total, spread
 
 
-def render_strip(vol, rows, keep, row_step, column_step):
-    """CT (nearest) on a strip of patch-voxel rows (R, C, 3), its grid bilinearly refined to one voxel; NaN off it."""
-    from scipy.ndimage import map_coordinates
-    r = np.arange(0, len(rows)-1+1e-9, 1./row_step)
-    c = np.arange(0, rows.shape[1]-1+1e-9, 1./column_step)
-    grid = np.meshgrid(r, c, indexing='ij')
-    points = np.stack([map_coordinates(rows[..., i], grid, order=1) for i in range(3)], -1)
-    inside = map_coordinates(keep.astype(np.float32), grid, order=1) > .999
+def render_strip(ct, spec, rows, keep, row_step, column_step):
+    """CT (nearest) on a strip of patch-voxel rows (R, C, 3), its grid bicubically refined to one voxel; NaN off it."""
+    from vc_reader import tifxyz
+    r = np.arange(0, len(rows)-1+1e-9, 1./row_step, dtype=np.float32)
+    c = np.arange(0, rows.shape[1]-1+1e-9, 1./column_step, dtype=np.float32)
+    rr, cc = np.meshgrid(r, c, indexing='ij')
+    points, inside = tifxyz.Surface(np.asarray(rows, np.float32), mask=keep).points_at(rr, cc)
     image = np.full(points.shape[:2], np.nan, np.float32)
-    zyx = points[inside][:, ::-1]*(vol.spec.ct_grid_scale/vol.spec.grid_scale)*vol.input_scale  # -> trace -> CT
-    image[inside] = vol.ct.sample_nearest(zyx)
+    zyx = points[inside][:, ::-1]*(spec.ct_grid_scale/spec.grid_scale)*spec.input_scale  # -> trace -> CT
+    image[inside] = ct.sample(zyx, order=0)
     return image
 
 
@@ -367,15 +381,15 @@ def save_render(path, image, origin, title, error=None, length=1200):
     plt.close(fig)
 
 
-def render_saved(out, vol):
+def render_saved(out, ct, spec):
     """``render.png`` of an inference output folder: CT on its strip and the decisions' errors along it."""
-    import tifffile
+    from vc_reader import tifxyz
     out = Path(out)
     summary = json.loads((out/'summary.json').read_text())
     saved = np.load(out/'strip.npz')
-    rows = np.stack([tifffile.imread(out/'strip'/f'{axis}.tif') for axis in 'xyz'], -1).astype(np.float64)
+    rows = tifxyz.read(out/'strip').xyz.astype(np.float64)
     keep = np.all(rows != -1, -1)
-    image = render_strip(vol, rows, keep, summary['row_step_voxels'], summary['column_step_voxels'])
+    image = render_strip(ct, spec, rows, keep, summary['row_step_voxels'], summary['column_step_voxels'])
     filled = np.flatnonzero(np.isfinite(image).any(1))
     image = image[filled[0]:filled[-1]+1]
     origin = summary['first_row_arc_patch_voxels']+filled[0]
@@ -417,7 +431,7 @@ def main(argv=None):
         path = resolve_checkpoint(args.checkpoint)
         spec = CTVolumeSpec.from_dict(torch.load(path, map_location='cpu', weights_only=False)['vol_spec'])
         configure_volume(args, spec, argparse.Namespace(), path)  # the CT options; no frame model needed
-        render_saved(args.out, CTVolume(spec))
+        render_saved(args.out, open_zarr(spec.ct_zarr, level=spec.ct_level, cache_dir=spec.cache_dir), spec)
         return
     try:
         predictor = StripPredictor(args.checkpoint, args.device, args.umbilicus, args.batch, volume=args)
@@ -444,7 +458,6 @@ def main(argv=None):
     index_dir = None if args.index == 'none' else (args.index or recorded_file(data.get('index')))
     scorer = Scorer(index_dir, fibers_path, catalog_index, cfg, spec, data) if index_dir else None
     scorer = scorer if scorer is not None and scorer.unit is not None else None
-    vol = predictor.vol
     targets, masks = [], []
 
     def score(items):
@@ -519,7 +532,7 @@ def main(argv=None):
     (args.out/'summary.json').write_text(json.dumps(summary, indent=1))
     print(json.dumps(summary, indent=1), flush=True)
     if not args.no_render:
-        render_saved(args.out, vol)
+        render_saved(args.out, predictor.ct, spec)
 
 
 if __name__ == '__main__':

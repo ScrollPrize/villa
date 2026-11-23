@@ -2,13 +2,14 @@
 
 #include "ObjectStoreRegions.hpp"
 #include <vc_object_store/store/GeometryViews.hpp>
+#include <vc_object_store/objects/StoreReader.hpp>
 #include "vc/core/util/QuadSurface.hpp"
 
 using namespace vc::objects;
 
 SurfaceStoreEdit::SurfaceStoreEdit(std::shared_ptr<ObjectStoreSession> session, PinnedObject pin,
                                  std::optional<vc::objects::ViewFrame> view)
-    : _session(std::move(session)), _uuid(pin.object.objectUuid), _pin(pin), _origin(std::move(pin)),
+    : _session(std::move(session)), _uuid(pin.reference().objectUuid), _pin(pin), _origin(std::move(pin)),
       _view(std::move(view))
 {
     if (!_pin.geometryRevision) throw std::runtime_error("The surface has no geometry");
@@ -20,49 +21,170 @@ PinnedObject SurfaceStoreEdit::pin() const
     return _pin;
 }
 
-void SurfaceStoreEdit::save(QuadSurface& surface, const cv::Rect& rect, const std::vector<std::string>& channels)
+void SurfaceStoreEdit::repin(const TransactionReceipt& receipt)
 {
-    // One save at a time: each starts from the previous one's revisions.
+    if (_collections) {
+        _collections->snapshot.commitSequence = receipt.commitSequence.value_or(_collections->snapshot.commitSequence);
+        if (const auto owner = receipt.objectReference(_uuid)) _collections->owner = *owner;
+        for (auto& collection : _collections->collections)
+            if (const auto reference = receipt.objectReference(collection.uuid)) collection.reference = *reference;
+    }
+    const auto reference = receipt.objectReference(_uuid);
+    if (!reference || *reference == _pin.reference()) return;
+    const auto committed = _session->objectsAtVersions(
+        _pin.attachment, {*reference});
+    if (!committed.front()) throw std::runtime_error("the saved surface version cannot be read back");
+    _pin = pinOf(_pin.attachment, *committed.front(), receipt.generation);
+}
+
+void SurfaceStoreEdit::watchAttachedCollections(const AttachedCollectionsSnapshot& snapshot)
+{
     std::lock_guard lock(_mutex);
-    std::string geometry = *_pin.geometryRevision;
+    if (snapshot.owner != _pin.reference()) throw std::runtime_error("Surface changed while loading corrections; reopen it");
+    _collections = snapshot;
+}
+
+void SurfaceStoreEdit::guardAttached(TransactionRequest& request) const
+{
+    expectObject(request, _pin.reference());
+    if (!_collections) return;
+    request.storeUuid = _collections->snapshot.storeUuid;
+    request.generation = _collections->snapshot.generation;
+    request.expectedCommitSequence = _collections->snapshot.commitSequence;
+    for (const auto& collection : _collections->collections)
+        if (collection.reference) expectObject(request, *collection.reference);
+}
+
+void SurfaceStoreEdit::saveAttachedCollections(AttachedCollectionsSnapshot& snapshot,
+    const std::vector<AttachedCollection>& collections, const nlohmann::json& coordinates)
+{
+    std::lock_guard lock(_mutex);
+    settlePending();
+    if (!_collections || _collections->role != snapshot.role || _collections->owner.objectUuid != snapshot.owner.objectUuid)
+        throw std::runtime_error("Attached collections were not loaded by this editor");
+    auto next = *_collections;
+    const auto receipt = replaceAttachedCollections(*_session, _pin.attachment, next, collections, coordinates);
+    _collections = std::move(next);
+    repin(receipt);
+    snapshot = *_collections;
+}
+
+TransactionReceipt SurfaceStoreEdit::submitAttached(TransactionRequest request)
+{
+    std::lock_guard lock(_mutex);
+    settlePending();
+    guardAttached(request);
+    const auto receipt = _session->submit(_pin.attachment, request);
+    repin(receipt);
+    return receipt;
+}
+
+void SurfaceStoreEdit::settlePending()
+{
+    if (!_pending) return;
+    TransactionReceipt receipt;
+    try {
+        receipt = _session->resolvePending(_pin.attachment, *_pending);
+    } catch (const TransactionConflict&) {
+        _pending.reset();
+        throw;
+    } catch (const std::invalid_argument&) {
+        // Resolved meanwhile (on reattachment), or concluded: its receipt, if any.
+        const auto request = *std::exchange(_pending, std::nullopt);
+        if (const auto saved = _session->receipt(_pin.attachment, request)) repin(*saved);
+        return;
+    }
+    // Other failures (still unreachable) propagate and keep it pending.
+    _pending.reset();
+    repin(receipt);
+}
+
+void SurfaceStoreEdit::save(QuadSurface& surface, const cv::Rect& rect, const std::vector<std::string>& channels,
+                            std::optional<uint64_t> draftRevision)
+{
+    // One save at a time: each starts from the version the previous one committed.
+    std::lock_guard lock(_mutex);
+    settlePending();
     const auto& points = *surface.rawPointsPtr();
-    const auto receipt = _session->editKeepingRelationships(_pin.attachment, {{_uuid, _pin.objectRevision}}, {},
-        [&](auto& db, auto& txn, const auto& keep) {
-            std::optional<TransformedGeometryView> transformed;
-            if (_view) {
-                transformed = GeometrySnapshot(db, txn).viewTransformedAt(_uuid, _view->volume, _view->scale);
-                if (transformed->mapping() != _view->mapping)
-                    throw std::runtime_error("Volume registration changed; reopen the surface before saving");
-            }
-            const auto revision = db.geometryRevision(txn, geometry);
-            if (!revision) throw std::runtime_error("surface geometry revision not found: " + geometry);
-            const auto stored = std::find_if(revision->arrays.begin(), revision->arrays.end(),
-                                             [](const auto& array) { return array.name == "points"; });
-            if (stored == revision->arrays.end() || stored->shape[0] != points.rows || stored->shape[1] != points.cols) {
-                auto data = quad_surface_geometry(surface);
-                if(transformed) {
-                    vc::geometry::Surface desired;
-                    desired.rows=points.rows;desired.columns=points.cols;
-                    for(const auto& p:points)desired.points.push_back({p[0],p[1],p[2]});
-                    for(const auto& array:data.arrays)if(array.name=="valid")desired.validity=array.bytes;
-                    const auto canonical=vc::geometry::encode(transformed->canonicalSurface(desired));
-                    data.arrays.front()=canonical.arrays.front();
-                    data.attributes=canonical.attributes;
-                    for(const auto& array:canonical.arrays)if(array.name=="valid") {
-                        auto it=std::find_if(data.arrays.begin(),data.arrays.end(),[](const auto& a){return a.name=="valid";});
-                        if(it==data.arrays.end())data.arrays.push_back(array);else *it=array;
-                    }
+    auto request = _session->newRequest(_pin.attachment);
+    request.generation = _pin.writeGeneration;
+    vc::objects::expectObject(request, _pin.reference());
+    guardAttached(request);
+    _session->readStore(_pin.attachment, [&](const StoreReader& reader, const auto&) {
+        const GeometrySnapshot snapshot(reader);
+        std::optional<TransformedGeometryView> transformed;
+        if (_view) {
+            transformed = snapshot.surface(_uuid, *_pin.geometryRevision).viewTransformedAt(_view->volume, _view->scale);
+            if (transformed->mapping() != _view->mapping)
+                throw std::runtime_error("Volume registration changed; reopen the surface before saving");
+        }
+        const auto revision = reader.geometryRevision(*_pin.geometryRevision);
+        if (!revision) throw std::runtime_error("surface geometry revision not found: " + *_pin.geometryRevision);
+        const auto stored = std::find_if(revision->arrays.begin(), revision->arrays.end(),
+                                         [](const auto& array) { return array.name == "points"; });
+        if (stored == revision->arrays.end() || stored->shape[0] != points.rows || stored->shape[1] != points.cols) {
+            auto data = quad_surface_geometry(surface);
+            if(transformed) {
+                vc::geometry::Surface desired;
+                desired.rows=points.rows;desired.columns=points.cols;
+                for(const auto& p:points)desired.points.push_back({p[0],p[1],p[2]});
+                for(const auto& array:data.arrays)if(array.name=="valid")desired.validity=array.bytes;
+                const auto canonical=vc::geometry::encode(transformed->canonicalSurface(desired));
+                data.arrays.front()=canonical.arrays.front();
+                data.attributes=canonical.attributes;
+                for(const auto& array:canonical.arrays)if(array.name=="valid") {
+                    auto it=std::find_if(data.arrays.begin(),data.arrays.end(),[](const auto& a){return a.name=="valid";});
+                    if(it==data.arrays.end())data.arrays.push_back(array);else *it=array;
                 }
-                geometry = db.putGeometry(txn, _uuid, data, geometry, keep(db.affectedGeometryEdges(txn, _uuid, data)));
-                return;
             }
+            request.operations.push_back(PutGeometryOp{_uuid, std::move(data), {}, true});
+        } else {
+            // Channels first; the vertex edit then applies to the validity they set.
+            std::vector<uint8_t> validity;
+            const std::vector<uint8_t>* replaced = nullptr;
             if (!channels.empty()) {
-                geometry = write_quad_channels_to_store(db, txn, _uuid, surface, channels, {}, geometry);
-                if(transformed) transformed=GeometrySnapshot(db,txn).viewTransformedAt(
-                    _uuid,transformed->targetVolume(),transformed->targetScale());
+                auto op = quad_channels_operation(_uuid, surface, channels, {}, points.rows, points.cols);
+                for (const auto& array : op.channels)
+                    if (array.name == "valid") { validity = array.bytes; replaced = &validity; }
+                request.operations.push_back(std::move(op));
             }
-            geometry = write_quad_rect_to_store(db, txn, _uuid, surface, rect, geometry, keep, transformed ? &*transformed : nullptr);
-        });
-    _pin.objectRevision = *receipt.at(_uuid);
-    _pin.geometryRevision = geometry;
+            const auto view = transformed ? *transformed : snapshot.viewStored(_uuid, *_pin.geometryRevision);
+            if (auto edit = quad_rect_edit(view, surface, rect, replaced)) request.operations.push_back(std::move(*edit));
+        }
+        // Revalidate under the writer lock, including newly added registrations
+        // and route choices that a list of existing record versions cannot guard.
+        if (transformed && !request.operations.empty())
+            request.operations.insert(request.operations.begin(), transformed->checkMappingOperation());
+        expectRelationshipEndpoints(reader, request);
+        // The loaded correction collections move with this editor's surface.
+        // Revalidate only that role after its geometry edit; unrelated derived
+        // results keep their original evidence rather than being made current.
+        if (_collections && !request.operations.empty()) {
+            std::vector<GeometryRelationshipEdit> corrections;
+            for (const auto& edge : attachments(reader, _uuid, _collections->role))
+                corrections.push_back({edge.uuid, "retain"});
+            for (auto& operation : request.operations) std::visit([&](auto& edit) {
+                using T = std::decay_t<decltype(edit)>;
+                if constexpr (std::is_same_v<T, PutGeometryOp> || std::is_same_v<T, EditGeometryOp> || std::is_same_v<T, SetSurfaceChannelsOp>)
+                    edit.relationships.insert(edit.relationships.end(), corrections.begin(), corrections.end());
+            }, operation);
+        }
+    });
+    if (request.operations.empty()) return;
+    DurableSave durable;
+    durable.keepDrafts = true;
+    if (draftRevision && *draftRevision && *draftRevision <= _session->draftRevision(_uuid))
+        durable.drafts.push_back({_uuid, *draftRevision});
+    TransactionReceipt receipt;
+    try {
+        receipt = _session->submitDurably(_pin.attachment, request, durable);
+    } catch (const TransactionConflict&) {
+        throw;
+    } catch (...) {
+        const auto pending = _session->pendingSubmissions();
+        if (std::any_of(pending.begin(), pending.end(), [&](const auto& p) { return p.requestUuid == request.requestUuid; }))
+            _pending = request.requestUuid;
+        throw;
+    }
+    repin(receipt);
 }

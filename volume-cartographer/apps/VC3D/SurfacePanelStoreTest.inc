@@ -11,7 +11,17 @@
 #include <mutex>
 #include <QTreeWidget>
 #include <QDoubleSpinBox>
-#include "support/TestZarrVolume.hpp"
+#include "vc/core/types/Volume.hpp"
+#include <nlohmann/json.hpp>
+#include <vc_reader/zarr.hpp>
+#include <vc_reader/zarr_write.hpp>
+#include <filesystem>
+#include <fstream>
+#include "ViewerManager.hpp"
+#include "volume_viewers/CChunkedVolumeViewer.hpp"
+#include "overlays/StoreSurfaceOverlayController.hpp"
+#include "vc/core/util/PlaneSurface.hpp"
+#include "test/support/TestVolume.hpp"
 // Built only with VC_TESTING. The surface panel over a real object store:
 // listing, filters, tags, activation and deletion through commit events; an
 // Open Data sample's project (catalog surfaces of a volume the open one shows
@@ -34,9 +44,11 @@ int runSurfacePanelStoreTests()
     auto require = [](bool value, const char* message) { if (!value) throw std::runtime_error(message); };
     try {
         QTemporaryDir dir;
-        vc::test::ZarrVolumeSpec create;
-        create.shapeZYX = {4, 4, 4}; create.chunkShapeZYX = {4, 4, 4}; create.uuid = "panel-volume";
-        const auto volume = vc::test::createZarrVolume(fs::path(dir.path().toStdString()) / "ct.zarr", create);
+        const std::filesystem::path volumeRoot = fs::path(dir.path().toStdString()) / "ct.zarr";
+        const vcr::zarr::CreateOptions levelZero{.shape = {4, 4, 4}, .chunks = {4, 4, 4}, .compressor = "", .overwrite = true};
+        vcr::zarr::Writer::create(volumeRoot / "0", levelZero);
+        std::ofstream(volumeRoot / "meta.json") << nlohmann::json{{"type", "vol"}, {"uuid", "panel-volume"}, {"name", "panel-volume"}, {"format", "zarr"}, {"width", 4}, {"height", 4}, {"slices", 4}, {"voxelsize", 1.0}}.dump();
+        const auto volume = Volume::New(volumeRoot);
         const auto path = fs::path(dir.path().toStdString()) / "objects.vcobj";
         OpenOptions options; options.author = "surface-panel-test";
         { auto created = ObjectStore::create(path, options); }
@@ -50,11 +62,12 @@ int runSurfacePanelStoreTests()
         QuadSurface grid(points, {1.f, 1.f});
         auto add = [&](const std::string& name, std::vector<std::string> tags, bool bound) {
             const auto uuid = util::newUuid();
-            state.objectStoreSession()->act(attachment, {{uuid, std::nullopt}}, [&](auto& db, auto& txn) {
-                create_quad_in_store(db, txn, uuid, grid, name, tags,
-                                     bound ? vc::objects::volumeCoordinates(volume->id(), 1) : nlohmann::json::object(),
-                                     {"surface-panel-test"});
-            });
+            auto request = state.objectStoreSession()->newRequest(attachment);
+            request.expectedObjects = {{uuid, std::nullopt}};
+            request.operations = vc::objects::createSurfaceOperations(uuid, name, tags,
+                bound ? vc::objects::volumeCoordinates(volume->id(), 1) : nlohmann::json::object(),
+                {"surface-panel-test"}, grid.meta, quad_surface_geometry(grid));
+            state.objectStoreSession()->submit(attachment, request);
             return uuid;
         };
         const auto approved = add("approved", {"approved"}, true);
@@ -113,8 +126,12 @@ int runSurfacePanelStoreTests()
         require(panel.activateSurfaceById(plain, &error), "activating a bound surface opens it");
         require(activated.size() == 1 && activated.back() && (*activated.back()->rawPointsPtr())(1, 2) == cv::Vec3f(2, 1, 2),
                 "activation hands out the stored geometry");
-        require(panel.opened() && panel.opened()->editable && panel.opened()->pin.object.objectUuid == plain,
+        require(panel.opened() && panel.opened()->editable && panel.opened()->pin.reference().objectUuid == plain,
                 "the opened surface is pinned and editable");
+        panel.setSelectionChangeGuard([] { return false; });
+        require(!panel.activateSurfaceById(approved, &error) && panel.opened()->pin.reference().objectUuid == plain && activated.size() == 1,
+                "failed pending saves veto selection before replacing the displayed surface");
+        panel.setSelectionChangeGuard({});
         require(!panel.activateSurfaceById(unbound, &error), "unbound surfaces do not open");
 
         require(panel.setTagChecked(SurfacePanelController::Tag::Approved, true), "tag checkboxes are enabled for the selection");
@@ -140,9 +157,9 @@ int runSurfacePanelStoreTests()
             remote = util::newUuid();
             auto txn = db.write({{shown, std::nullopt}, {remote, std::nullopt}});
             QuadSurface published(points, {1.f, 1.f});
-            published.meta = utils::Json::parse(nlohmann::json{{"catalog", nlohmann::json::parse(binding).at("catalog")}}.dump());
-            create_quad_in_store(db, txn, shown, published, "shown", {}, nlohmann::json::parse(binding).at("coordinates"),
-                                 {"catalog-test"});
+            published.meta = nlohmann::json{{"catalog", nlohmann::json::parse(binding).at("catalog")}};
+            vc::objects::createSurface(db, txn, shown, "shown", {}, nlohmann::json::parse(binding).at("coordinates"),
+                                       {"catalog-test"}, published.meta, quad_surface_geometry(published));
             // As a catalog fetch records it.
             db.setMeta(txn, shown, "catalog_geometry_revision", nlohmann::json(db.currentGeometry(txn, shown)->uuid).dump());
             db.setMeta(txn, shown, "catalog_write", "\"fetched\"");
@@ -156,8 +173,8 @@ int runSurfacePanelStoreTests()
         state.objectStoreSession()->setGeometryFetcher(vc::objects::kCatalogMetaKey,
             [&](ObjectStore& store, const std::string& uuid, const ObjectStoreSession::FetchWrite& write) {
                 { std::lock_guard lock(fetchedMutex); fetched.push_back(uuid); }
-                const auto revision = store.currentObjectRevision(store.read(), uuid)->uuid;
-                write({{uuid, revision}}, [&](ObjectStore& db, WriteTxn& txn) {
+                const auto selected = store.currentObjectRevision(store.read(), uuid)->reference();
+                write({{uuid, selected}}, [&](ObjectStore& db, WriteTxn& txn) {
                     const auto geometry = db.putGeometry(txn, uuid, quad_surface_geometry(grid));
                     db.setMeta(txn, uuid, "catalog_geometry_revision", nlohmann::json(geometry).dump());
                     db.setMeta(txn, uuid, "catalog_write", "\"fetched\"");
@@ -187,7 +204,7 @@ int runSurfacePanelStoreTests()
         // Segmentation editing saves to the sample's project and preserves the view's scale.
         require(panel.activateSurfaceById(shown, &error), "the catalog surface reopens");
         const auto onScreen = panel.opened()->surface;
-        const auto publishedRevision = panel.opened()->pin.objectRevision;
+        const auto publishedVersion = panel.opened()->pin.reference();
         require(panel.prepareSurfaceEditing(shown, &error) && panel.opened()->editable &&
                     panel.opened()->pin.attachment == catalogAttachment && panel.opened()->surface == onScreen,
                 "editing keeps the sample's store and the surface on screen");
@@ -213,7 +230,7 @@ int runSurfacePanelStoreTests()
         }
         require((*catalog.open(shown).surface->rawPointsPtr())(1, 2) == cv::Vec3f(3, 4, 5),
                 "reopening the sample surface retains the edit in volume coordinates");
-        require(panel.restoreRevision(shown, publishedRevision, &error), "sample surfaces can restore their history");
+        require(panel.restoreRevision(shown, publishedVersion, &error), "sample surfaces can restore their history");
         require((*catalog.open(shown).surface->rawPointsPtr())(1, 2) == cv::Vec3f(1, 0.5f, 1),
                 "restoring history recovers the published geometry");
         state.objectStoreSession()->editRecords(catalogAttachment, {shown}, [](ObjectRecord& record) { record.name = "edited"; });
@@ -239,6 +256,202 @@ int runSurfacePanelStoreTests()
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "surface panel store test: " << error.what() << '\n';
+        return 1;
+    }
+}
+
+// Viewer regressions run independently of the surface panel's filter suite.
+int runViewerRegressionTests()
+{
+    using namespace vc::objects;
+    namespace fs = std::filesystem;
+    auto require = [](bool value, const char* message) { if (!value) throw std::runtime_error(message); };
+    auto pump = [&](const std::function<bool()>& done, const char* message) {
+        QElapsedTimer timer; timer.start();
+        while (!done() && timer.elapsed() < 10000) {
+            QApplication::processEvents();
+            QThread::msleep(1);
+        }
+        require(done(), message);
+    };
+    try {
+        QTemporaryDir dir;
+        const auto volume = vc3d::test::createVolume(fs::path(dir.path().toStdString()) / "panel.zarr", {});
+        const auto path = fs::path(dir.path().toStdString()) / "objects.vcobj";
+        OpenOptions options; options.author = "viewer-test";
+        { auto created = ObjectStore::create(path, options); }
+        CState state;
+        openStoreAsProject(state, QString::fromStdString(path.string()), "viewer-test");
+        auto attachment = *state.storeFor("surface");
+        cv::Mat_<cv::Vec3f> points(3, 3);
+        for (int r = 0; r < 3; ++r)
+            for (int c = 0; c < 3; ++c) points(r, c) = {float(c), float(r), 2};
+        QuadSurface grid(points, {1, 1});
+        const auto plain = util::newUuid();
+        {
+            auto request = state.objectStoreSession()->newRequest(attachment);
+            request.expectedObjects = {{plain, std::nullopt}};
+            request.operations = vc::objects::createSurfaceOperations(plain, "surface", {}, volumeCoordinates(volume->id(), 1),
+                                                                      {"viewer-test"}, grid.meta, quad_surface_geometry(grid));
+            state.objectStoreSession()->submit(attachment, request);
+        }
+        SurfaceCatalog catalog(state.objectStoreSession());
+        catalog.setSource(attachment, volume, {volume->id()});
+        SurfaceTreeWidget tree;
+        tree.setColumnCount(TIMESTAMP_COLUMN + 1);
+        SurfacePanelController panel({&tree}, &state, &catalog, nullptr, {});
+        pump([&] { return tree.topLevelItemCount() == 1; }, "the viewer fixture surface is listed");
+        require(panel.activateSurfaceById(plain), "the viewer fixture surface opens");
+        const auto originalFrame = *panel.opened();
+        int cleared = 0;
+        QObject::connect(&panel, &SurfacePanelController::surfaceSelectionCleared, [&] { ++cleared; });
+        catalog.setSource(attachment, volume, {volume->id(), 0.5});
+        require(cleared == 0 && panel.opened(), "a working-level reload retains the active selection");
+        panel.replaceOpenedSurface(catalog.open(plain));
+        pump([&] { return !catalog.loading(); }, "the working-level listing completes");
+        require(cleared == 0 && panel.opened()->surface->id == plain && !tree.selectedItems().empty(),
+                "the surface stays selected after the new mappings arrive");
+        require((*panel.opened()->surface->rawPointsPtr())(1, 2) == cv::Vec3f(1, 0.5f, 1),
+                "the selected geometry is reopened in the new working voxels");
+        {
+            auto editFrame = originalFrame;
+            SegmentationModule edits(nullptr, nullptr, nullptr, nullptr, &state, nullptr, false);
+            edits.setStorePinResolver([&](const QuadSurface*) -> std::optional<SegmentationModule::StoreOrigin> {
+                return SegmentationModule::StoreOrigin{editFrame.pin, editFrame.view};
+            });
+            require(edits.storePin(editFrame.surface.get()).has_value(), "an edit remembers the original frame");
+            editFrame = *panel.opened();
+            require(edits.saveSurface(editFrame.surface.get()), "the same revision can be edited at another level");
+        }
+        catalog.setSource(attachment, volume, {volume->id()});
+        panel.replaceOpenedSurface(catalog.open(plain));
+        pump([&] { return !catalog.loading(); }, "returning to the original level completes");
+        require((*panel.opened()->surface->rawPointsPtr())(1, 2) == cv::Vec3f(2, 1, 2),
+                "saving after a level switch maps back through the new frame");
+        state.closeProject();
+        {
+            // Exercise the real asynchronous viewer with a stationary camera.
+            const auto root = fs::path(dir.path().toStdString()) / "viewer.zarr";
+            auto ct = vc3d::test::createVolume(root, {.chunkShapeZYX = {4, 4, 4}, .numLevels = 2});
+            vc3d::test::Grid<uint8_t> data({32, 32, 32});
+            for (int z = 0; z < 32; ++z)
+                for (int y = 0; y < 32; ++y)
+                    for (int x = 0; x < 32; ++x) data(z, y, x) = uint8_t(8 * z);
+            vc3d::test::writeZYX(*ct, data, {0, 0, 0});
+            vc3d::test::Grid<uint8_t> coarse({16, 16, 16});
+            for (int z = 0; z < 16; ++z)
+                for (int y = 0; y < 16; ++y)
+                    for (int x = 0; x < 16; ++x) coarse(z, y, x) = uint8_t(16 * z + 4);
+            vc3d::test::writeZYX(*ct, coarse, {0, 0, 0}, 1);
+            state.setCurrentVolume(ct);
+            cv::Mat_<cv::Vec3f> vertices(9, 9);
+            for (int y = 0; y < 9; ++y)
+                for (int x = 0; x < 9; ++x) vertices(y, x) = {float(4 * x), float(4 * y), 8};
+            auto surface = std::make_shared<QuadSurface>(vertices, cv::Vec2f(0.25f, 0.25f));
+            surface->id = util::newUuid();
+            state.setSurface("segmentation", surface, false, true);
+            ViewerManager manager(&state, state.pointCollection());
+            QWidget host;
+            auto* viewer = static_cast<CChunkedVolumeViewer*>(manager.createViewerInWidget("segmentation", &host));
+            viewer->resize(128, 128);
+            host.resize(128, 128);
+            host.show(); viewer->show();
+            viewer->applyCameraState({0, 0, 8, 0});
+            auto centerPixel = [&] {
+                const auto& image = viewer->_framebuffer;
+                return image.isNull() ? -1 : qRed(image.pixel(image.width() / 2, image.height() / 2));
+            };
+            pump([&] { return centerPixel() == 64 && !viewer->_renderWorkerBusy && !viewer->_pendingRenderJob; },
+                 "the surface reaches native resolution without camera motion");
+            // Two edits before the first render completes must retain the latest.
+            for (int z : {9, 10}) {
+                for (auto& p : *surface->rawPointsPtr()) p[2] = float(z);
+                viewer->invalidateVis();
+                viewer->requestRender("segmentation edit refresh");
+            }
+            pump([&] { return centerPixel() == 80 && !viewer->_renderWorkerBusy && !viewer->_pendingRenderJob; },
+                 "successive in-place edits repaint without pointer motion");
+            for (auto& p : *surface->rawPointsPtr()) p[2] = 11;
+            state.setSurface("segmentation", surface, false, true);
+            pump([&] { return centerPixel() == 88; }, "surface edit signals also repaint immediately");
+            bool flashed = false;
+            const auto frameConnection = QObject::connect(viewer, &CChunkedVolumeViewer::renderFrameCompleted,
+                [&](auto, auto) { if (centerPixel() == 0) flashed = true; });
+            for (auto& p : *surface->rawPointsPtr()) p[2] = 16;
+            viewer->invalidateVis();
+            viewer->requestRender("edit into cold chunks");
+            pump([&] { return centerPixel() == 128 && !viewer->_renderWorkerBusy && !viewer->_pendingRenderJob && !viewer->_loadRunning; },
+                 "an edit into uncached chunks finishes without further input");
+            require(!flashed, "an edit retains pixels while its new chunks load");
+            QObject::disconnect(frameConnection);
+
+            state.setSurface("test plane", std::make_shared<PlaneSurface>(cv::Vec3f(16, 16, 16), cv::Vec3f(0, 0, 1)));
+            auto* idle = static_cast<CChunkedVolumeViewer*>(manager.createViewerInWidget("test plane", &host));
+            QStringList status;
+            QObject::connect(&manager, &ViewerManager::sharedCacheStatsChanged, [&](const QStringList& items) { status = items; });
+            viewer->_loadRunning = true;
+            idle->refreshStatus();
+            require(status.join(' ').contains("segmentation: loading L0"),
+                    "an idle viewer does not hide another viewer's loading status");
+            viewer->_loadRunning = false;
+            idle->refreshStatus();
+            require(!status.join(' ').contains("loading"), "loading clears when the reads finish");
+
+            viewer->applyCameraState({2, -3, 8, 2});
+            const auto camera = viewer->cameraState();
+            const auto snapshot = manager.captureNavigation();
+            cv::Mat_<cv::Vec3f> scaledPoints = surface->rawPoints() * 0.5f;
+            auto scaled = std::make_shared<QuadSurface>(scaledPoints, surface->scale() * 2.f);
+            scaled->id = surface->id;
+            state.setSurface("segmentation", scaled, false, true);
+            manager.restoreNavigation(snapshot, vcr::catalog::Affine::scale(0.5));
+            const auto restored = viewer->cameraState();
+            const auto beforeGrid = surface->surfaceToGrid({camera.surfacePtrX, camera.surfacePtrY});
+            const auto afterGrid = scaled->surfaceToGrid({restored.surfacePtrX, restored.surfacePtrY});
+            require(cv::norm(beforeGrid - afterGrid) < 1e-5 && restored.scale == camera.scale * 2 &&
+                    restored.zOffset == camera.zOffset * 0.5f,
+                    "reloaded surfaces retain the physical camera center and zoom");
+            // Draft intersections honor the declaration's scale and volume ID.
+            struct WorkingVolume : Volume {
+                explicit WorkingVolume(const fs::path& path) : Volume(path) { baseScaleLevel_ = 1; }
+            };
+            state.setCurrentVolume(std::make_shared<WorkingVolume>(root));
+            StoreSurfaceOverlayController overlay(&state, &manager);
+            const auto voxels = *state.annotationVolume();
+            state.objectStoreSession()->setDraft(scaled->id, quad_surface_grid(*scaled), volumeCoordinates(voxels));
+            PlaneSurface plane({8, 8, 8}, {1, 0, 0});
+            const auto slab = StoreSurfaceOverlayController::planeSlab(plane);
+            require(slab.has_value(), "the plane slab is valid");
+            const auto crossings = SurfaceCatalog::RegionInput{state.objectStoreSession(), {}, VolumeVoxels(voxels),
+                RegionOptions{.uuids = std::vector<std::string>{scaled->id}}, {}}.region(vc3d::store::regionSlice(*slab)).runs;
+            require(!crossings.empty() && std::abs(crossings.front().points.front()[2] - 8) < 1e-5,
+                    "the selected surface has plane intersections");
+            state.objectStoreSession()->clearDraft(scaled->id);
+            state.setSurface("test plane", std::make_shared<PlaneSurface>(cv::Vec3f(8, 8, 8), cv::Vec3f(1, 0, 0)));
+            overlay.setSurfaces({scaled->id});
+            StoreSurfaceOverlayController::OverlayBuilder selectedLines(idle);
+            overlay.collectPrimitives(idle, selectedLines);
+            const auto& selectedView = *overlay._views.at(idle);
+            pump([&] { return !selectedView.region.busy && selectedView.runs.contains("") && !selectedView.runs.at("").empty(); },
+                 "displayed plane intersections complete asynchronously");
+            require(std::abs(selectedView.runs.at("").front().points.front()[2] - 8) < 1e-5,
+                    "plane overlays use the displayed grid rather than querying the UUID's current head");
+            auto anotherSelection = std::make_shared<QuadSurface>(scaled->rawPoints().clone(), scaled->scale());
+            anotherSelection->id = scaled->id;
+            for (auto& p : *anotherSelection->rawPointsPtr()) p[2] = 6;
+            state.setSurface("segmentation", anotherSelection, false, true);
+            StoreSurfaceOverlayController::OverlayBuilder switchedLines(idle);
+            overlay.collectPrimitives(idle, switchedLines);
+            pump([&] { return !selectedView.region.busy && selectedView.runs.contains("") && !selectedView.runs.at("").empty(); },
+                 "changed displayed plane intersections complete asynchronously");
+            require(std::abs(selectedView.runs.at("").front().points.front()[2] - 6) < 1e-5,
+                    "same-UUID selection changes replace orthogonal-plane intersections");
+            viewer->quiesceForClose();
+        }
+        std::cerr << "viewer regression tests passed\n";
+        return 0;
+    } catch (const std::exception& error) {
+        std::cerr << "viewer regression test: " << error.what() << '\n';
         return 1;
     }
 }

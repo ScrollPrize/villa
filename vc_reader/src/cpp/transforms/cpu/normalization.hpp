@@ -1,29 +1,14 @@
 #pragma once
 #include "../ops/normalization.hpp"
 #include "../core.hpp"
+#include "../shared/percentile.hpp"
 
 namespace vcr::transforms {
 inline ChannelPlan channel_parameters(const Normalize&, const Array&, Random&) { return {}; }
 
 namespace normalization_detail {
-// NumPy's default ("linear") percentile, including its virtual-index and
-// interpolation formulas, evaluated in float64 on sorted selected values.
-VCR_HD inline double percentile_index(std::size_t n, double percent) {
-    const double q = percent / 100;
-    return double(n) * q + (1 + q * -1.) - 1;
-}
-VCR_HD inline double lerp(double a, double b, double t) {
-    const double d = b - a;
-    return t >= .5 ? b - d * (1 - t) : a + d * t;
-}
-template<class Get> VCR_HD double sorted_percentile(Get&& get, std::size_t n, double percent) {
-    const double v = percentile_index(n, percent);
-    if (v >= double(n - 1)) return get(n - 1);
-    if (v < 0) return get(0);
-    const double below = std::floor(v);
-    const auto j = std::size_t(below);
-    return lerp(get(j), get(j + 1), v - below);
-}
+using percentile_detail::percentile;
+using percentile_detail::sorted_percentile;
 // The robust scale: 1.4826 MAD, else the first usable fallback.
 VCR_HD inline double robust_scale(double mad, double deviation, double span) {
     double scale = 1.4826 * mad;
@@ -121,7 +106,7 @@ void normalize_crop(T* values, std::size_t n, const Normalize& t, const std::uin
     double lo = stats[0].lo, hi = stats[0].hi;
     std::size_t count = 0;
     for (const auto& s : stats) { lo = std::min(lo, s.lo); hi = std::max(hi, s.hi); count += s.count; }
-    if (!count || lo == hi) {
+    if (!count || (lo == hi && t.eps == 0)) {
         for_parts(parts, [&](std::size_t p) {
             std::fill(values + p * grain, values + std::min(n, (p + 1) * grain), T{0});
         });
@@ -130,6 +115,7 @@ void normalize_crop(T* values, std::size_t n, const Normalize& t, const std::uin
     double scale = 1, center = lo, divisor = hi - lo;
     if (t.mode == Normalization::MinMax) {
         if (!std::isfinite(divisor)) { scale = 2; center = lo / scale; divisor = hi / scale - center; }
+        divisor = std::max(divisor, t.eps / scale);
     } else {
         const double magnitude = std::max(std::abs(lo), std::abs(hi));
         // Scale extreme finite doubles so sums of squared deviations cannot
@@ -169,21 +155,6 @@ void normalize_crop(T* values, std::size_t n, const Normalize& t, const std::uin
             values[i] = (nonzero && values[i] == T{0}) || divisor == 0 ? T{0}
                 : static_cast<T>((static_cast<double>(values[i]) / scale - center) / divisor);
     });
-}
-// Order statistic k of values, which are reordered. Later calls only need
-// the elements above the previous rank to stay above it.
-template<class T> double rank(std::vector<T>& values, std::size_t k) {
-    std::nth_element(values.begin(), values.begin() + k, values.end());
-    return double(values[k]);
-}
-template<class T> double percentile(std::vector<T>& values, double percent) {
-    std::size_t last = std::size_t(-1); double previous = 0;
-    return sorted_percentile([&](std::size_t k) {
-        // Linear interpolation reads ranks j and j+1: after selecting j, rank
-        // j+1 is the minimum of the upper partition.
-        previous = k == last + 1 ? double(*std::min_element(values.begin() + k, values.end())) : rank(values, k);
-        last = k; return previous;
-    }, values.size(), percent);
 }
 template<class T>
 void normalize_order(T* values, std::size_t n, const Normalize& t, const std::uint8_t* valid) {

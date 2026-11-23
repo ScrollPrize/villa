@@ -1,6 +1,7 @@
 #pragma once
 
 #include "SpiralPclRole.hpp"
+#include <vc_object_store/objects/Transactions.hpp>
 
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -14,6 +15,7 @@
 #include <vector>
 
 namespace vc3d::spiral {
+inline constexpr const char* kObjectReferenceKey = "reference";
 
 struct EditablePclPoint {
     cv::Vec3f previewPosition{0.0f, 0.0f, 0.0f};
@@ -23,6 +25,10 @@ struct EditablePclPoint {
     // drawing them does not depend on projecting their rounded 3D position
     // back through the surface index. Imported points have no such coordinate.
     std::optional<QPointF> previewSurfacePosition;
+    // The point's id in its source collection (stable in the object store);
+    // none for appended points. replacementDocument() renumbers; a store save
+    // keeps these.
+    std::optional<qint64> sourceId;
 };
 
 // One editable collection. Point order, preview geometry, and the source JSON
@@ -30,6 +36,7 @@ struct EditablePclPoint {
 // without the others. `role` decides what `wind_a` each appended point gets
 // and what reversing the collection means for the annotations.
 struct EditablePclDraft {
+    std::optional<vc::objects::ObjectVersion> reference;
     PclRole role = PclRole::SameWinding;
     QString collectionId;
     QString sourceIdentity;

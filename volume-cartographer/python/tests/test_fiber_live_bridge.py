@@ -200,6 +200,9 @@ def test_empty_cancellation_reason_still_fails():
 def test_field_publication_and_bridge_ownership(inputs):
     offline, normals = handles(inputs)
     cfg, chunks = trace_config(), chunk_config()
+    # Width scoring reads the width channel, whose chunks must then be published too.
+    cfg.width_relative_tolerance = .4
+    cfg.width_cosine_weight = True
     expected = ft.ChunkCache(offline, normals, cfg, chunks, str(inputs/"offline"), "fixture").get([0,0,0])
     with Coordinator(lambda s,c,r: s.ready(c,r)) as server:
         field, normals = handles(inputs)
@@ -262,7 +265,7 @@ def test_queued_publication_failure_cancels_siblings(inputs):
 
 
 def test_cached_paris4_live_replay(tmp_path):
-    from test_fiber_chunk_trace import test_real_paris4_chunk_replay
+    from test_fiber_chunk_trace import test_real_data_chunk_replay
     if not os.environ.get("VC_TEST_WIDTH_MANIFEST"):
         pytest.skip("set cached Paris4 fixture paths")
     original = ft.open_prediction_field
@@ -274,6 +277,6 @@ def test_cached_paris4_live_replay(tmp_path):
             return field
         with pytest.MonkeyPatch.context() as monkeypatch:
             monkeypatch.setattr(ft, "open_prediction_field", opened)
-            test_real_paris4_chunk_replay(tmp_path)
+            test_real_data_chunk_replay(tmp_path)
         assert server.requests
         client.cancel()

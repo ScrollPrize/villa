@@ -1,4 +1,5 @@
 #pragma once
+#include "vc_object_store/objects/TransactionJson.hpp"
 #include "StorageBindings.hpp"
 #include "vc_object_store/objects/GeometryRegion.hpp"
 
@@ -34,17 +35,8 @@ inline void bindGeometryRegion(nb::module_& m)
         .def_rw("volume", &vo::RegionOptions::volume)
         .def_rw("target_scale", &vo::RegionOptions::targetScale);
 }
-inline nb::dict geometryRegionFromPy(PyObjectStore& self, const vo::RegionSlice& slice,
-                                     const vo::RegionOptions& options, RegionCancellation* cancel)
+inline nb::dict regionResultToPy(const vo::RegionResult& result)
 {
-    // Copy mutable Python-owned options before releasing the GIL.
-    const auto view = slice;
-    const auto request = options;
-    vo::RegionResult result;
-    { auto lease = self.db; self.require(); nb::gil_scoped_release release;
-      result = self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) {
-          return db.geometryRegion(txn, view, request, [cancel](const auto&) { return cancel && cancel->cancelled.load(); });
-      }); }
     nb::dict output, stats;
     const auto& s = result.stats;
     stats["output_bytes"] = s.outputBytes;
@@ -64,6 +56,8 @@ inline nb::dict geometryRegionFromPy(PyObjectStore& self, const vo::RegionSlice&
         item["object_uuid"] = run.objectUuid; item["revision_uuid"] = run.revisionUuid;
         item["array_name"] = run.arrayName; item["family"] = run.family;
         item["first_segment"] = run.firstSegment; item["points"] = run.points;
+        item["object_reference"] = jsonLoads(vo::objectVersionToJson(run.objectReference));
+        item["object_to_volume"] = run.objectToVolume ? jsonLoads(run.objectToVolume->json().dump()) : nb::none();
         if (!run.grid.empty()) item["grid"] = run.grid;
         runs.append(item);
     }
@@ -72,5 +66,18 @@ inline nb::dict geometryRegionFromPy(PyObjectStore& self, const vo::RegionSlice&
     output["complete"] = result.complete();
     output["intersecting_objects"] = result.intersectingObjects;
     return output;
+}
+inline nb::dict geometryRegionFromPy(PyObjectStore& self, const vo::RegionSlice& slice,
+                                     const vo::RegionOptions& options, RegionCancellation* cancel)
+{
+    // Copy mutable Python-owned options before releasing the GIL.
+    const auto view = slice;
+    const auto request = options;
+    vo::RegionResult result;
+    { auto lease = self.db; self.require(); nb::gil_scoped_release release;
+      result = self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) {
+          return db.geometryRegion(txn, view, request, [cancel](const auto&) { return cancel && cancel->cancelled.load(); });
+      }); }
+    return regionResultToPy(result);
 }
 }

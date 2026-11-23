@@ -27,19 +27,17 @@ public:
     void keyPressEvent(QKeyEvent *event) override;
     void keyReleaseEvent(QKeyEvent *event) override;
     void resizeEvent(QResizeEvent *event) override;
-    // physical=false: sx/sy are voxels (not µm) per scene px; the scalebar
+    // physical=false: sx is voxels (not µm) per scene px; the scalebar
     // labels in "vx" instead of physical units.
-    void setVoxelSize(double sx, double sy, bool physical = true)
+    void setVoxelSize(double sx, bool physical = true)
     {
         m_vx = sx;
-        m_vy = sy;
         m_physicalUnits = physical;
         update();
     }
 
     void setMiddleButtonPanEnabled(bool enabled) { _middleButtonPanEnabled = enabled; }
     bool middleButtonPanEnabled() const { return _middleButtonPanEnabled; }
-    void setScrollPanDisabled(bool disabled) { _scrollPanDisabled = disabled; }
     
     void showCoordinateFrame(bool visible);
     void setCoordinateFrame(PlaneSurface* plane);
@@ -76,12 +74,10 @@ signals:
     void sendKeyRelease(int key, Qt::KeyboardModifiers modifiers);
     void sendTiltHandleChanged(QPointF tilt);
     void sendTiltHandleReset();
-    void paintCompleted();
     
 protected:
     bool _regular_pan = false;
     QPoint _last_pan_position;
-    bool _left_button_pressed = false;
     bool _right_button_mouse_forwarded = false;
     bool _tiltHandleDragging = false;
     /// Draw our scalebar on every repaint
@@ -113,15 +109,13 @@ private:
     bool pointInSceneWidget(const QPointF& viewportPos) const;
 
     // µm (or voxels, when !m_physicalUnits) per scene-unit (pixel)
-    double m_vx = 32.0, m_vy = 32.0;
+    double m_vx = 32.0;
     bool m_physicalUnits = true;
     bool _middleButtonPanEnabled = true;
-    bool _scrollPanDisabled = false;
     bool _sceneWidgetMouseCapture = false;
     int _wheelAccum = 0;  // fractional wheel delta accumulator
     Qt::KeyboardModifiers _wheelAccumModifiers = Qt::NoModifier;  // modifiers _wheelAccum was gathered under
     mutable QFont _cachedFont;
-    mutable bool _scalebarCacheDirty = true;
     mutable double _cachedBarPx = 0;
     mutable QString _cachedBarLabel;
     mutable double _cachedM11 = 0;

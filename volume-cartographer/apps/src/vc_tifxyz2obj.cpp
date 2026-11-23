@@ -3,14 +3,12 @@
 
 #include "vc/core/util/Geometry.hpp"
 #include "vc/core/util/InpaintSurface.hpp"
-#include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/StoreToolOptions.hpp"
 #include "vc/core/util/SurfaceMeshing.hpp"
 
-#include "vc/core/types/VcDataset.hpp"
-#include "utils/Json.hpp"
+#include <nlohmann/json.hpp>
 
 #include <filesystem>
 #include <fstream>
@@ -18,10 +16,11 @@
 #include <iostream>
 #include <cmath>
 #include <algorithm>
+#include <vc_object_store/Uuid.hpp>
 #include <limits>
 
 
-using Json = utils::Json;
+using Json = nlohmann::json;
 
 // ---- small helpers ---------------------------------------------------------
 static inline bool finite3(const cv::Vec3f& v) {
@@ -73,10 +72,7 @@ static void write_vertex(std::ofstream& out,
     if (ok) n = unit_or_default(n);
 
     if (!ok || (n[0] == 0.f && n[1] == 0.f && n[2] == 0.f)) {
-        // fall back to grid_normal (expects x,y), then to finite-diff
-        cv::Vec3f ng = grid_normal(points, cv::Vec3f(float(loc[1]), float(loc[0]), 0.f));
-        if (finite3(ng)) n = unit_or_default(ng);
-        else             n = fd_fallback_normal(points, loc[0], loc[1]);
+        n = fd_fallback_normal(points, loc[0], loc[1]);
     }
     out << "vn " << n[0] << " " << n[1] << " " << n[2] << '\n';
 }
@@ -331,17 +327,22 @@ int main(int argc, char *argv[])
 
     std::unique_ptr<QuadSurface> surf;
     std::filesystem::path obj_path;
+    std::unique_ptr<StoreSurfaces> store;
+    std::filesystem::path scratch;
     if (store_options) {
         const std::filesystem::path name = *store_options->name;
         const auto& uuid = store_options->surfaces.front();
         if (name.has_parent_path() || name.empty()) {
-            std::cerr << "error: --name is a file name inside the artifact directory\n";
+            std::cerr << "error: --name is the artifact's file name, without directories\n";
             return EXIT_FAILURE;
         }
         try {
-            StoreSurfaces store(store_options->store, "vc_tifxyz2obj");
-            surf = store.load(uuid, true, store_options->volume);
-            obj_path = store.objects().session()->artifactDirectory(store.objects().attachment(), uuid) / name;
+            store = std::make_unique<StoreSurfaces>(store_options->store, "vc_tifxyz2obj");
+            surf = store->load(uuid, true, store_options->volume);
+            // Written here, then published as an artifact of the surface version read.
+            scratch = std::filesystem::temp_directory_path() / ("vc_tifxyz2obj-" + vc::objects::util::newUuid());
+            std::filesystem::create_directories(scratch);
+            obj_path = scratch / name;
         } catch (const std::exception& error) {
             std::cerr << "error when loading " << uuid << ": " << error.what() << std::endl;
             return EXIT_FAILURE;
@@ -359,7 +360,23 @@ int main(int argc, char *argv[])
     }
 
     surf_write_obj(surf.get(), obj_path, normalize_uv, align_grid, keep_percent, clean_surface, clean_sigma_k, inpaint_holes);
-    if (store_options) std::cout << "obj: " << obj_path.string() << std::endl;
+    if (store_options) {
+        int status = EXIT_SUCCESS;
+        try {
+            const auto& uuid = store_options->surfaces.front();
+            const auto receipt = store->objects().publishArtifacts(uuid, {{*store_options->name, obj_path}});
+            store->objects().finish();
+            // The artifact's name, and the surface version that holds it.
+            std::cout << "obj: " << *store_options->name << std::endl;
+            std::cout << "artifact_version: " << receipt.objects.at(vc::objects::util::canonicalUuid(uuid)).value_or(0) << std::endl;
+        } catch (const std::exception& error) {
+            std::cerr << "error when publishing the OBJ: " << error.what() << std::endl;
+            status = EXIT_FAILURE;
+        }
+        std::error_code ignored;
+        std::filesystem::remove_all(scratch, ignored);
+        return status;
+    }
 
     return EXIT_SUCCESS;
 }

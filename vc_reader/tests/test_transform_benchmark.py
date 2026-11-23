@@ -45,7 +45,7 @@ class TransformBenchmarkTests(unittest.TestCase):
         import importlib.machinery
         with tempfile.TemporaryDirectory() as directory:
             modules = {}
-            for name in ('_reader', '_transforms'):
+            for name in ('_catalog', '_reader', '_transforms'):
                 path = Path(directory) / (name+importlib.machinery.EXTENSION_SUFFIXES[0])
                 path.touch()
                 modules['vc_reader.'+name] = SimpleNamespace(__file__=str(path))

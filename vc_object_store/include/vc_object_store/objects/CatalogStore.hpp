@@ -28,7 +28,7 @@ std::string catalogSurfaceUuid(const vcr::catalog::OpenDataSurface&);
 // records that revision in meta.catalog_geometry_revision.
 inline constexpr const char* kCatalogStorage = "open-data";
 struct CatalogFile {
-    std::string name;   // file name in the object's artifact directory
+    std::string name;   // file name
     std::string label;
     std::string url;
 };
@@ -72,10 +72,10 @@ void restoreCatalogVersion(ObjectStoreSession&, const AttachmentIdentity&, const
 // other object are untouched.
 CatalogStoreReport refreshCatalog(ObjectStoreSession&, const AttachmentIdentity&, const vcr::catalog::OpenDataSample&,
                                   const std::optional<std::vector<std::string>>& segmentIds = std::nullopt);
-// A published file of a catalog surface (CatalogReference::files) in its
-// artifact directory on `attachment`, downloaded first unless it is there.
-// Blocking.
-std::filesystem::path publishedFile(ObjectStoreSession&, const AttachmentIdentity&, const std::string& objectUuid,
-                                    const std::string& name);
+// Download a catalog surface's published file (CatalogReference::files) to
+// `target` unless it is there; returns `target`. These are copies of external
+// files, kept where the caller caches them (VC3D: its remote cache by URL), not
+// store artifacts: no store is read or written. Blocking.
+std::filesystem::path fetchPublishedFile(const CatalogFile&, const std::filesystem::path& target);
 
 } // namespace vc::objects

@@ -19,35 +19,58 @@ else()
 endif()
 
 # Shared owned geometry and operations; no SQLite, OpenCV or application types.
-add_library(vc_geometry ${_vc_store_library_type} geometry/TypedGeometry.cpp)
+add_library(vc_geometry ${_vc_store_library_type} geometry/TypedGeometry.cpp geometry/PointMap.cpp)
 target_include_directories(vc_geometry PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>" "$<INSTALL_INTERFACE:include>"
     PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
-target_link_libraries(vc_geometry PRIVATE nlohmann_json::nlohmann_json vc_reader::catalog)
+target_link_libraries(vc_geometry PUBLIC nlohmann_json::nlohmann_json PRIVATE vc_reader::catalog)
 target_compile_features(vc_geometry PUBLIC cxx_std_20)
-
-# SFTP v3 client over the system OpenSSH program; no SQLite or application types.
-add_library(vc_sftp ${_vc_store_library_type} sftp/Sftp.cpp sftp/SshProcess.cpp)
-target_include_directories(vc_sftp PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>" "$<INSTALL_INTERFACE:include>"
-    PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
-find_package(Threads REQUIRED)
-target_link_libraries(vc_sftp PRIVATE Threads::Threads)
-target_compile_features(vc_sftp PUBLIC cxx_std_20)
-add_library(vc_object_store::vc_sftp ALIAS vc_sftp)
 
 # Primary SQLite object database; no dependency on vc_core or Qt.
 add_library(vc_objects ${_vc_store_library_type}
-    sftp/SftpVfs.cpp
+    SqliteRuntime.cpp
     internal/Anchors.cpp
+    internal/Ownership.cpp
+    Versions.cpp
+    Selections.cpp
+    Artifacts.cpp
+    Commands.cpp
+    Wire.cpp
+    client/HostedStore.cpp
     internal/Sqlite.cpp
+    internal/Schema.cpp
+    internal/HistoricalSnapshot.cpp
     internal/RecordSql.cpp
+    internal/RecordOverrides.cpp
     internal/EdgeSql.cpp
+    internal/EdgeLayout.cpp
+    internal/InitialEdges.cpp
+    internal/InitialObjects.cpp
     internal/RecordJson.cpp
+    geometry/GeometryReference.cpp
     Uuid.cpp
     internal/JsonFields.cpp
     formats/FiberJson.cpp
     Database.cpp
+    Provisioning.cpp
+    Extensions.cpp
+    ExtensionHistory.cpp
+    ObjectCollection.cpp
+    CollectionSource.cpp
+    InitialImport.cpp
+    PackedStore.cpp
+    PackedCollection.cpp
+    StoreConversion.cpp
+    imports/AfvSource.cpp
+    imports/FiberImportExtension.cpp
+    imports/FiberConstraintGraph.cpp
+    imports/FiberGraphSolveExtension.cpp
+    imports/FiberUvExport.cpp
+    imports/TrackCrossingStore.cpp
     VolumeTransforms.cpp
     ObjectStoreSession.cpp
+    HostedSession.cpp
+    StoreReader.cpp
+    DraftCheckpoints.cpp
     Project.cpp
     FetchQueue.cpp
     Transactions.cpp
@@ -56,6 +79,7 @@ add_library(vc_objects ${_vc_store_library_type}
     Records.cpp
     Metadata.cpp
     SourcePaths.cpp
+    TrackDatasets.cpp
     Snapshots.cpp
     Queries.cpp
     Spatial.cpp
@@ -70,12 +94,7 @@ add_library(vc_objects ${_vc_store_library_type}
     ToolObjects.cpp
     AttachedDocument.cpp
     SurfaceCreate.cpp
-    sync/Replica.cpp
-    sync/GeometryTransfer.cpp
-    sync/Apply.cpp
-    hub/HubRules.cpp
-    hub/Hub.cpp
-    hub/HubWorker.cpp
+    SurfaceGrid.cpp
     geometry/GeometryViews.cpp
     imports/SourceRelationships.cpp
     geometry/GeometryIngestBatch.cpp
@@ -89,6 +108,7 @@ add_library(vc_objects ${_vc_store_library_type}
     geometry/GeometryDelta.cpp
     geometry/GeometryReader.cpp
     relationships/Edges.cpp
+    relationships/RelationshipInputs.cpp
     relationships/Traversal.cpp
     relationships/EdgeGeometry.cpp
 )
@@ -99,10 +119,31 @@ if(TARGET SQLite3::SQLite3)
 else()
     target_link_libraries(vc_objects PUBLIC SQLite::SQLite3)
 endif()
-target_link_libraries(vc_objects PUBLIC vc_geometry vc_sftp vc_reader::catalog nlohmann_json::nlohmann_json PRIVATE OpenSSL::Crypto zstd::libzstd)
+target_link_libraries(vc_objects PUBLIC vc_geometry vc_reader::catalog nlohmann_json::nlohmann_json PRIVATE OpenSSL::Crypto zstd::libzstd)
 target_compile_features(vc_objects PUBLIC cxx_std_20)
 add_library(vc_object_store::vc_objects ALIAS vc_objects)
+# Offline schema conversion; the runtime library knows only the current schema.
+add_library(vc_object_migration STATIC migration/ConvertStore.cpp migration/ConvertSchema21.cpp)
+target_include_directories(vc_object_migration PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+# geometry/GeometryInternal.hpp includes <openssl/evp.h>; Homebrew OpenSSL is not on the default include path.
+target_link_libraries(vc_object_migration PUBLIC vc_objects PRIVATE OpenSSL::Crypto nlohmann_json::nlohmann_json)
+target_compile_features(vc_object_migration PUBLIC cxx_std_20)
 add_library(vc_object_store::vc_geometry ALIAS vc_geometry)
+
+# Hosting service: Boost.Beast/Asio stays private to this target.
+if(VC_OBJECT_STORE_BUILD_SERVER)
+    add_library(vc_object_server STATIC server/Server.cpp)
+    target_link_libraries(vc_object_server PUBLIC vc_objects PRIVATE Boost::headers Threads::Threads nlohmann_json::nlohmann_json)
+    if(WIN32)
+        # Asio sockets on Windows need Winsock and AcceptEx.
+        target_link_libraries(vc_object_server PRIVATE ws2_32 mswsock)
+    endif()
+    target_compile_features(vc_object_server PUBLIC cxx_std_20)
+    add_library(vc_object_store::vc_object_server ALIAS vc_object_server)
+endif()
+# The service runs link_objects requests itself (their detection on its read
+# workers), so it links the detectors when they are built; see the end of
+# this file.
 
 if(NOT VC_OBJECT_STORE_BUILD_ADAPTERS)
     return()
@@ -111,32 +152,59 @@ find_package(TIFF REQUIRED)
 find_package(CURL REQUIRED)
 # vc_reader's HTTP client fetches remote sources; its Zarr reader is only needed
 # by the relationship detectors.
+add_library(vc_resident_geometry ${_vc_store_library_type} spatial/SurfaceIndex.cpp spatial/VertexIndex.cpp)
+add_library(vc_object_store::vc_resident_geometry ALIAS vc_resident_geometry)
+target_include_directories(vc_resident_geometry PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>" "$<INSTALL_INTERFACE:include>")
+target_link_libraries(vc_resident_geometry PUBLIC vc_geometry opencv_core)
+target_compile_features(vc_resident_geometry PUBLIC cxx_std_20)
 add_library(vc_object_formats ${_vc_store_library_type} Tiff.cpp MemMap.cpp PackedTrackStore.cpp spatial/SurfaceGrid.cpp)
 add_library(vc_object_store::vc_object_formats ALIAS vc_object_formats)
 target_include_directories(vc_object_formats PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>" "$<INSTALL_INTERFACE:include>" PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(vc_object_formats PUBLIC opencv_core TIFF::TIFF vc_geometry PRIVATE nlohmann_json::nlohmann_json)
 target_compile_features(vc_object_formats PUBLIC cxx_std_20)
 add_library(vc_object_geometry ${_vc_store_library_type} geometry/GeometryIngest.cpp geometry/GeometryExport.cpp geometry/SourceMetadata.cpp
+    imports/FiberAxialPriors.cpp
     formats/GeometryInput.cpp formats/FiberInput.cpp formats/SurfaceInput.cpp
     formats/PointCollectionInput.cpp formats/UmbilicusInput.cpp formats/TrackInput.cpp formats/GeometryOutput.cpp formats/RemoteSource.cpp
     catalog/CatalogStore.cpp)
 add_library(vc_object_store::vc_object_geometry ALIAS vc_object_geometry)
 target_include_directories(vc_object_geometry PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
-target_link_libraries(vc_object_geometry PUBLIC vc_objects PRIVATE vc_object_formats vc_reader::headers CURL::libcurl nlohmann_json::nlohmann_json)
+target_link_libraries(vc_object_geometry PUBLIC vc_objects PRIVATE vc_object_formats vc_reader::headers CURL::libcurl nlohmann_json::nlohmann_json OpenSSL::Crypto)
 if(NOT VC_OBJECT_STORE_BUILD_LINKING)
     return()
 endif()
 if(NOT TARGET vc_reader::reader)
     message(FATAL_ERROR "Relationship detectors require vc_reader's reader library")
 endif()
-add_library(vc_track_crossings STATIC TrackCrossings.cpp)
-target_include_directories(vc_track_crossings PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>" "$<INSTALL_INTERFACE:include>")
-target_link_libraries(vc_track_crossings PRIVATE OpenMP::OpenMP_CXX)
-target_compile_features(vc_track_crossings PUBLIC cxx_std_20)
-add_library(vc_object_links STATIC
-    CtSheetNormal.cpp spatial/SurfaceIndex.cpp
+# The detectors. Only TrackCrossings.cpp uses OpenMP, so the rest is compiled
+# once, and each copy of vc_object_links below is built from these objects.
+add_library(vc_object_links_objects OBJECT
+    CtSheetNormal.cpp
     linking/LinkCandidates.cpp linking/SurfaceOverlap.cpp linking/FiberSurface.cpp
     linking/TrackTrack.cpp linking/StoredGeometry.cpp linking/LineSurface.cpp
-    linking/TrackSurface.cpp linking/PointCollectionSurface.cpp)
-target_include_directories(vc_object_links PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
-target_link_libraries(vc_object_links PUBLIC vc_objects PRIVATE vc_track_crossings vc_object_formats vc_reader::reader opencv_core nlohmann_json::nlohmann_json)
+    linking/TrackSurface.cpp linking/PointCollectionSurface.cpp linking/LinkObjects.cpp)
+target_include_directories(vc_object_links_objects PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_link_libraries(vc_object_links_objects PRIVATE vc_objects vc_object_formats vc_resident_geometry vc_reader::reader opencv_core nlohmann_json::nlohmann_json)
+# vc_track_crossings<suffix> and vc_object_links<suffix>, with or without OpenMP.
+function(vc_object_store_detectors suffix use_openmp)
+    add_library(vc_track_crossings${suffix} STATIC TrackCrossings.cpp)
+    target_include_directories(vc_track_crossings${suffix} PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>" "$<INSTALL_INTERFACE:include>")
+    if(use_openmp)
+        target_link_libraries(vc_track_crossings${suffix} PRIVATE OpenMP::OpenMP_CXX)
+    endif()
+    target_compile_features(vc_track_crossings${suffix} PUBLIC cxx_std_20)
+    add_library(vc_object_links${suffix} STATIC $<TARGET_OBJECTS:vc_object_links_objects>)
+    target_link_libraries(vc_object_links${suffix} PUBLIC vc_objects PRIVATE vc_track_crossings${suffix} vc_object_formats vc_resident_geometry vc_reader::reader opencv_core nlohmann_json::nlohmann_json)
+endfunction()
+# The copy the native tools, the server and the installed package use.
+vc_object_store_detectors("" ${VC_OBJECT_STORE_DETECTORS_OPENMP})
+# On macOS the Python module must not link OpenMP (see the top-level
+# CMakeLists.txt), so when the native copy does, the module gets a serial one.
+if(APPLE AND VC_OBJECT_STORE_BUILD_PYTHON AND VC_OBJECT_STORE_DETECTORS_OPENMP)
+    vc_object_store_detectors(_serial OFF)
+endif()
+
+if(TARGET vc_object_server)
+    target_link_libraries(vc_object_server PRIVATE vc_object_links)
+    target_compile_definitions(vc_object_server PRIVATE VC_OBJECT_SERVER_LINKING=1)
+endif()

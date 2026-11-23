@@ -240,6 +240,7 @@ std::vector<OpenDataArtifact> parseArtifacts(const nlohmann::json& ownerJson)
         if (!itemJson.is_object()) continue;
         OpenDataArtifact artifact;
         artifact.raw = itemJson;
+        artifact.id = stringValue(itemJson, "id");
         artifact.parameters = objectOrEmpty(itemJson, "parameters");
         artifact.properties = objectOrEmpty(itemJson, "properties");
         artifact.creationInfo = objectOrEmpty(itemJson, "creation_info");
@@ -488,6 +489,51 @@ bool OpenDataArtifact::hasResolvedUrl() const noexcept
     return !resolvedUrl.empty();
 }
 
+std::vector<std::string> OpenDataOrigin::urls() const
+{
+    std::vector<std::string> out;
+    for (const auto& root : accessRoots) out.push_back(joinOpenDataUrl(root.url, path));
+    return out;
+}
+
+std::vector<std::string> OpenDataArtifact::urls() const
+{
+    std::vector<std::string> out;
+    for (const auto& origin : origins)
+        for (auto& url : origin.urls()) out.push_back(std::move(url));
+    return out;
+}
+
+std::vector<std::string> OpenDataArtifact::usage() const
+{
+    std::vector<std::string> out;
+    for (const auto& origin : origins)
+        for (const auto& root : origin.accessRoots)
+            out.push_back(root.usage);
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
+}
+
+std::vector<const OpenDataArtifact*> OpenDataSegment::artifactsOf(const std::vector<std::string>& types, const std::optional<std::string>& targetVolume) const
+{
+    std::vector<const OpenDataArtifact*> out;
+    for (const auto& artifact : artifacts) {
+        if (targetVolume && artifact.targetVolumeId != targetVolume) continue;
+        if (std::find(types.begin(), types.end(), artifact.type) != types.end()) out.push_back(&artifact);
+    }
+    return out;
+}
+
+std::optional<std::string> OpenDataArtifact::location(std::string_view scheme) const
+{
+    if (scheme != "https" && scheme != "s3" && !scheme.empty())
+        throw std::invalid_argument("unknown scheme '" + std::string(scheme) + "'; use 'https', 's3' or None");
+    if (scheme == "s3") return openDataS3Url(sourcePath);
+    const auto& value = scheme.empty() ? sourcePath : resolvedUrl;
+    return value.empty() ? std::nullopt : std::optional(value);
+}
+
 std::string OpenDataArtifact::url() const
 {
     std::string value = resolvedUrl.empty() ? sourcePath : resolvedUrl;
@@ -527,7 +573,7 @@ bool OpenDataSegment::hasLayersZarr() const
 {
     return std::any_of(artifacts.begin(), artifacts.end(), [](const OpenDataArtifact& artifact) {
         const auto type = lowerCopy(artifact.type);
-        return type == "layers_zarr" || type == "layers-zarr" ||
+        return type == "layers_zarr" || type == artifact_type::layersZarr ||
                type == "layers zarr" || (type.find("layers") != std::string::npos &&
                                           type.find("zarr") != std::string::npos);
     });
@@ -571,7 +617,7 @@ std::vector<OpenDataSurface> OpenDataSample::surfaces(const OpenDataSegment& seg
 
     std::map<std::string, const OpenDataArtifact*> publishedByTarget;
     for (const auto& artifact : segment.artifacts) {
-        if (lowerCopy(artifact.type) != "tifxyz-transformed" || artifact.url().empty() ||
+        if (lowerCopy(artifact.type) != artifact_type::tifxyzTransformed || artifact.url().empty() ||
             !artifact.targetVolumeId || !findVolume(*artifact.targetVolumeId))
             continue;
         publishedByTarget.emplace(*artifact.targetVolumeId, &artifact);
@@ -589,7 +635,7 @@ std::vector<OpenDataSurface> OpenDataSample::surfaces(const OpenDataSegment& seg
                            1.0e-9 * std::max(1.0, segment.originalVolumeDownscale)) { level = l; break; }
                    return level.has_value();
                }()) {
-        for (const auto* type : {"tifxyz-flattened", "tifxyz", "tifxyz-normalized"}) {
+        for (const auto* type : {artifact_type::tifxyzFlattened, artifact_type::tifxyz, artifact_type::tifxyzNormalized}) {
             const auto it = std::find_if(segment.artifacts.begin(), segment.artifacts.end(), [&](const auto& artifact) {
                 return lowerCopy(artifact.type) == type && !artifact.url().empty();
             });
@@ -620,7 +666,7 @@ std::optional<OpenDataRepresentationKind> classifyDerivedRepresentation(
     if (type.find("normal-grid") != std::string::npos) {
         return OpenDataRepresentationKind::NormalGrids;
     }
-    if (type == "lasagna") {
+    if (type == artifact_type::lasagna) {
         return OpenDataRepresentationKind::Lasagna;
     }
     const bool prediction =
@@ -691,6 +737,79 @@ std::optional<OpenDataVolumeView> OpenDataManifest::volumeAt(std::string_view ur
     return std::nullopt;
 }
 
+std::optional<int> OpenDataArtifact::gridLevel() const
+{
+    if (type == artifact_type::omeZarr || type == artifact_type::inkDetection3dZarr) return 0;
+    if (type == artifact_type::surfacePredictionZarr) return sourceCoordinateLevel;
+    return std::nullopt;
+}
+
+std::string sampleNameKey(std::string_view name)
+{
+    std::string key;
+    for (const unsigned char c : name)
+        if (std::isalnum(c) && c < 128) key += char(std::tolower(c));
+    // Zeros that only pad a number.
+    std::string out;
+    for (std::size_t i = 0; i < key.size(); ++i) {
+        const bool afterDigit = i > 0 && std::isdigit(static_cast<unsigned char>(key[i - 1]));
+        if (key[i] == '0' && !afterDigit) {
+            std::size_t end = i;
+            while (end < key.size() && key[end] == '0') ++end;
+            // A number that is only zeros keeps one.
+            i = end < key.size() && std::isdigit(static_cast<unsigned char>(key[end])) ? end : end - 1;
+        }
+        out += key[i];
+    }
+    return out;
+}
+
+std::vector<std::string> communityAliases(std::string_view sampleId)
+{
+    static constexpr std::pair<std::string_view, std::string_view> aliases[] = {
+        {"Scroll 1", "PHercParis4"}, {"Scroll 2", "PHercParis3"}, {"Scroll 3", "PHerc0332"},
+        {"Scroll 4", "PHerc1667"},   {"Scroll 5", "PHerc0172"},
+    };
+    std::vector<std::string> out;
+    for (const auto& [alias, id] : aliases)
+        if (id == sampleId) out.emplace_back(alias);
+    return out;
+}
+
+std::vector<std::string> OpenDataManifest::samplesNamed(std::string_view name) const
+{
+    const auto named = [&](const std::string& key) {
+        std::vector<std::string> ids;
+        for (const auto& sample : samples) {
+            bool match = sampleNameKey(sample.id) == key;
+            for (const auto& alias : communityAliases(sample.id)) match |= sampleNameKey(alias) == key;
+            if (const auto it = sample.properties.find("description");
+                it != sample.properties.end() && it->is_string() && !it->get<std::string>().empty())
+                match |= sampleNameKey(it->get<std::string>()) == key;
+            if (match) ids.push_back(sample.id);
+        }
+        return ids;
+    };
+    const auto key = sampleNameKey(name);
+    auto ids = named(key);
+    if (ids.empty() && !key.starts_with("pherc")) ids = named("pherc" + key);
+    return ids;
+}
+
+std::optional<OpenDataVolumeMetadata> OpenDataManifest::volumeMetadataAt(const std::string& url) const
+{
+    const auto view = volumeAt(resolveOpenDataUrl(url));
+    if (!view) return std::nullopt;
+    const auto* sample = findSample(view->sampleId);
+    const auto* volume = sample ? sample->findVolume(view->volumeId) : nullptr;
+    if (!volume) return std::nullopt;
+    OpenDataVolumeMetadata out{view->sampleId, view->volumeId, volume->scanId, volume->suffix,
+                               volume->createdAt, volume->dataFormat, std::nullopt, volume->energyKeV,
+                               volume->detectorDistanceMm, volume->raw};
+    if (volume->pixelSizeUm) out.voxelSizeUm = std::ldexp(*volume->pixelSizeUm, view->level);
+    return out;
+}
+
 std::shared_ptr<const OpenDataManifest> cachedManifest(const std::filesystem::path& cacheFile)
 {
     struct Entry {
@@ -748,10 +867,25 @@ constexpr std::pair<std::string_view, std::string_view> kPublicChannels[] = {
     {"s3://vesuvius-challenge/", "https://data.aws.ash2txt.org/samples/"},
 };
 
+// `url` in the channel's other form: below its root, or the root without its slash.
+std::optional<std::string> throughChannel(const std::string& url, std::string_view from, std::string_view to)
+{
+    if (startsWith(url, from)) return std::string(to) + url.substr(from.size());
+    if (url == from.substr(0, from.size() - 1)) return std::string(to.substr(0, to.size() - 1));
+    return std::nullopt;
+}
+
+std::optional<std::string> openDataHttpsUrl(std::string url)
+{
+    if (url.starts_with("http://") || url.starts_with("https://") || url.starts_with("s3://") || url.starts_with("s3+"))
+        return resolveOpenDataUrl(std::move(url));
+    return std::nullopt;
+}
+
 std::string resolveOpenDataUrl(std::string url)
 {
     for (const auto& [s3, https] : kPublicChannels)
-        if (startsWith(url, s3)) return std::string(https) + url.substr(s3.size());
+        if (auto out = throughChannel(url, s3, https)) return *out;
     if (startsWith(url, "s3://") || startsWith(url, "s3+")) {
         const auto scheme = url.find("://");
         if (scheme == std::string::npos) return url;
@@ -778,7 +912,7 @@ std::optional<std::string> openDataS3Url(std::string url)
 {
     if (startsWith(url, "s3://")) return url;
     for (const auto& [s3, https] : kPublicChannels)
-        if (startsWith(url, https)) return std::string(s3) + url.substr(https.size());
+        if (auto out = throughChannel(url, https, s3)) return out;
     return std::nullopt;
 }
 

@@ -1,8 +1,8 @@
 #include "vc/lasagna/MaxflowGraph.hpp"
 
+#include "vc/lasagna/ChannelSampler.hpp"
 #include "vc/lasagna/Dataset.hpp"
 
-#include "utils/zarr.hpp"
 
 #include <algorithm>
 #include <array>
@@ -11,6 +11,8 @@
 #include <limits>
 #include <sstream>
 #include <stdexcept>
+#include "vc_reader/array.hpp"
+#include "vc_reader/zarr.hpp"
 
 namespace vc::lasagna {
 namespace {
@@ -180,88 +182,12 @@ void checkDirectedEdges(uint64_t value)
     return pred;
 }
 
-struct PredDtBinding {
-    const LasagnaChannelGroup* group = nullptr;
-    size_t channelIndex = 0;
-    utils::ZarrArray array;
-    bool hasChannelDimension = false;
-    std::array<size_t, 3> shapeZYX{0, 0, 0};
-    std::array<size_t, 3> chunksZYX{0, 0, 0};
-    double spacingBase = 1.0;
-};
-
-[[nodiscard]] PredDtBinding bindPredDt(const LasagnaDatasetManifest& manifest)
+// The pred_dt channel, bound as every Lasagna channel is: uint8, (Z,Y,X) or packed
+// (C,Z,Y,X), with working point p at channel voxel p / spacing.
+[[nodiscard]] LasagnaChannelBinding bindPredDt(const LasagnaDatasetManifest& manifest)
 {
-    const LasagnaChannelGroup* group = manifest.groupForChannel("pred_dt");
-    if (group == nullptr) {
-        throw std::runtime_error("Lasagna dataset missing required channel 'pred_dt'");
-    }
-    const auto channelIndex = group->channelIndex("pred_dt");
-    if (!channelIndex.has_value()) {
-        throw std::runtime_error("Internal Lasagna pred_dt channel lookup failure");
-    }
-
-    PredDtBinding binding{
-        group,
-        *channelIndex,
-        openLasagnaChannelArray(manifest, *group, 1),
-        false,
-        {0, 0, 0},
-        {0, 0, 0},
-        static_cast<double>(group->scaleFactor()) * manifest.sourceToBase /
-            manifest.workingToBaseScale,
-    };
-    const auto& meta = binding.array.metadata();
-    if (meta.dtype != utils::ZarrDtype::uint8) {
-        throw std::runtime_error("Lasagna channel 'pred_dt' must be uint8");
-    }
-    if (meta.shape.size() == 3) {
-        if (meta.chunks.size() != 3) {
-            throw std::runtime_error("Lasagna pred_dt zarr has invalid chunks");
-        }
-        binding.shapeZYX = {meta.shape[0], meta.shape[1], meta.shape[2]};
-        binding.chunksZYX = {meta.chunks[0], meta.chunks[1], meta.chunks[2]};
-    } else if (meta.shape.size() == 4) {
-        if (meta.chunks.size() != 4 || *channelIndex >= meta.shape[0]) {
-            throw std::runtime_error("Lasagna pred_dt zarr has invalid channel dimension");
-        }
-        binding.hasChannelDimension = true;
-        binding.shapeZYX = {meta.shape[1], meta.shape[2], meta.shape[3]};
-        binding.chunksZYX = {meta.chunks[1], meta.chunks[2], meta.chunks[3]};
-    } else {
-        throw std::runtime_error("Lasagna pred_dt zarr must be 3D or channel-first 4D");
-    }
-    if (binding.chunksZYX[0] == 0 || binding.chunksZYX[1] == 0 || binding.chunksZYX[2] == 0) {
-        throw std::runtime_error("Lasagna pred_dt zarr has zero-sized chunks");
-    }
-    return binding;
-}
-
-[[nodiscard]] size_t chunkOffset(
-    const PredDtBinding& binding,
-    size_t localZ,
-    size_t localY,
-    size_t localX)
-{
-    const auto& chunks = binding.array.metadata().chunks;
-    if (binding.hasChannelDimension) {
-        return (((binding.channelIndex % chunks[0]) * chunks[1] + localZ) * chunks[2] + localY) *
-                   chunks[3] +
-               localX;
-    }
-    return (localZ * binding.chunksZYX[1] + localY) * binding.chunksZYX[2] + localX;
-}
-
-[[nodiscard]] std::vector<size_t> chunkIndices(
-    const PredDtBinding& binding,
-    size_t cz,
-    size_t cy,
-    size_t cx)
-{
-    if (binding.hasChannelDimension) {
-        return {binding.channelIndex / binding.array.metadata().chunks[0], cz, cy, cx};
-    }
-    return {cz, cy, cx};
+    LasagnaGroupArrays arrays(std::shared_ptr<vcr::MemoryCache>{});
+    return bindLasagnaChannel(manifest, "pred_dt", arrays);
 }
 
 } // namespace
@@ -388,14 +314,13 @@ MaxflowPredDtVolume loadPredDtPassability(
     if (options.marginBaseVoxels < 0) {
         throw std::runtime_error("margin-base-voxels must be non-negative");
     }
-    const PredDtBinding binding = bindPredDt(manifest);
+    const LasagnaChannelBinding binding = bindPredDt(manifest);
     MaxflowPredDtVolume volume;
     volume.zarrPath = binding.group->zarrPath;
     volume.shapeZYX = binding.shapeZYX;
-    volume.chunksZYX = binding.chunksZYX;
-    volume.spacingBase = binding.spacingBase;
-    volume.cropBaseXYZ = baseCropForShape(options, binding.shapeZYX, binding.spacingBase);
-    volume.cropPredXYZ = predCropForBaseCrop(volume.cropBaseXYZ, binding.shapeZYX, binding.spacingBase);
+    volume.spacingBase = binding.spacing;
+    volume.cropBaseXYZ = baseCropForShape(options, binding.shapeZYX, binding.spacing);
+    volume.cropPredXYZ = predCropForBaseCrop(volume.cropBaseXYZ, binding.shapeZYX, binding.spacing);
 
     const size_t cropX = static_cast<size_t>(volume.cropPredXYZ.end.x - volume.cropPredXYZ.begin.x);
     const size_t cropY = static_cast<size_t>(volume.cropPredXYZ.end.y - volume.cropPredXYZ.begin.y);
@@ -405,57 +330,19 @@ MaxflowPredDtVolume loadPredDtPassability(
         return volume;
     }
 
-    const size_t z0 = static_cast<size_t>(volume.cropPredXYZ.begin.z);
-    const size_t y0 = static_cast<size_t>(volume.cropPredXYZ.begin.y);
-    const size_t x0 = static_cast<size_t>(volume.cropPredXYZ.begin.x);
-    const size_t z1 = static_cast<size_t>(volume.cropPredXYZ.end.z);
-    const size_t y1 = static_cast<size_t>(volume.cropPredXYZ.end.y);
-    const size_t x1 = static_cast<size_t>(volume.cropPredXYZ.end.x);
-
-    const size_t cz0 = z0 / binding.chunksZYX[0];
-    const size_t cy0 = y0 / binding.chunksZYX[1];
-    const size_t cx0 = x0 / binding.chunksZYX[2];
-    const size_t cz1 = (z1 - 1) / binding.chunksZYX[0];
-    const size_t cy1 = (y1 - 1) / binding.chunksZYX[1];
-    const size_t cx1 = (x1 - 1) / binding.chunksZYX[2];
-
-    for (size_t cz = cz0; cz <= cz1; ++cz) {
-        for (size_t cy = cy0; cy <= cy1; ++cy) {
-            for (size_t cx = cx0; cx <= cx1; ++cx) {
-                const auto indices = chunkIndices(binding, cz, cy, cx);
-                const auto chunk = binding.array.read_chunk(indices);
-                if (!chunk.has_value()) {
-                    continue;
-                }
-                const size_t chunkBaseZ = cz * binding.chunksZYX[0];
-                const size_t chunkBaseY = cy * binding.chunksZYX[1];
-                const size_t chunkBaseX = cx * binding.chunksZYX[2];
-                const size_t oz0 = std::max(z0, chunkBaseZ);
-                const size_t oy0 = std::max(y0, chunkBaseY);
-                const size_t ox0 = std::max(x0, chunkBaseX);
-                const size_t oz1 = std::min(z1, chunkBaseZ + binding.chunksZYX[0]);
-                const size_t oy1 = std::min(y1, chunkBaseY + binding.chunksZYX[1]);
-                const size_t ox1 = std::min(x1, chunkBaseX + binding.chunksZYX[2]);
-                for (size_t z = oz0; z < oz1; ++z) {
-                    for (size_t y = oy0; y < oy1; ++y) {
-                        for (size_t x = ox0; x < ox1; ++x) {
-                            const size_t src = chunkOffset(
-                                binding,
-                                z - chunkBaseZ,
-                                y - chunkBaseY,
-                                x - chunkBaseX);
-                            if (src >= chunk->size()) {
-                                throw std::runtime_error("Lasagna pred_dt chunk is smaller than expected");
-                            }
-                            const size_t dst = ((z - z0) * cropY + (y - y0)) * cropX + (x - x0);
-                            const bool passable = static_cast<uint8_t>((*chunk)[src]) >= options.threshold;
-                            volume.passable[dst] = passable ? 1 : 0;
-                            volume.passableVoxels += passable ? 1U : 0U;
-                        }
-                    }
-                }
-            }
-        }
+    // One region read of the crop; chunks that are not stored read as fill.
+    vcr::Index start{volume.cropPredXYZ.begin.z, volume.cropPredXYZ.begin.y, volume.cropPredXYZ.begin.x};
+    vcr::Index size{int64_t(cropZ), int64_t(cropY), int64_t(cropX)};
+    if (binding.packed) {
+        start.insert(start.begin(), int64_t(binding.channelIndex));
+        size.insert(size.begin(), 1);
+    }
+    std::vector<uint8_t> values(volume.passable.size());
+    binding.array->read_many({start}, {size}, {values.data()});
+    for (size_t i = 0; i < values.size(); ++i) {
+        const bool passable = values[i] >= options.threshold;
+        volume.passable[i] = passable ? 1 : 0;
+        volume.passableVoxels += passable ? 1U : 0U;
     }
 
     return volume;

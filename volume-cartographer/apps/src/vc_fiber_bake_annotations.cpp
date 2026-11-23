@@ -3,11 +3,13 @@
 #include <iostream>
 #include <map>
 #include <memory>
+#include "vc/core/util/CudaSampling.hpp"
 #include "vc/fiber_tracer/FiberJson.hpp"
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
 
-int main()
+int main(int argc, char** argv)
 {
+    vc::cuda::applyToolOptions(argc, argv);
     using namespace vc::fiber_tracer;
     using nlohmann::json;
     try {

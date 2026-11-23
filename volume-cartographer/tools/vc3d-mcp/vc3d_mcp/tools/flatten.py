@@ -1,4 +1,4 @@
-"""Render + flatten/straighten output-producing tools."""
+"""Render + flatten output-producing tools."""
 
 from __future__ import annotations
 
@@ -110,58 +110,6 @@ async def vc3d_flatten_slim(
                 "energyType": energy_type,
                 "keepPercent": keep_percent,
                 "inpaintHoles": inpaint_holes,
-                "outputName": output_name,
-            }
-        ),
-    )
-    return await _wait_for_job(result["jobId"], wait, result, ctx)
-
-
-@mcp.tool()
-async def vc3d_flatten_straighten(
-    segment_id: str,
-    unbend: bool = True,
-    unbend_smooth_cols: float = 300.0,
-    overlap_passes: int = 2,
-    orthogonalize: bool = True,
-    trim: bool = True,
-    trim_max_edge: float = 100.0,
-    output_name: Optional[str] = None,
-    wait: bool = False,
-    ctx: Optional[Context] = None,
-) -> dict[str, Any]:
-    """Straighten a segment with vc_straighten -- the headless twin of the
-    "Straighten" context-menu action. Asynchronous (a source:"flatten" job --
-    poll vc3d_job_status). No dialog is ever shown.
-
-    segment_id: id of the segment to straighten.
-    unbend: run the unbend (spine-straightening) stage (default true).
-    unbend_smooth_cols: spine Gaussian sigma in columns (default 300); only
-    used when unbend is true.
-    overlap_passes: number of --overlap-pairs passes (default 2).
-    orthogonalize: run the orthogonalize stage (default true).
-    trim: run the trim stage (default true).
-    trim_max_edge: max edge length for the trim stage (default 100); only used
-    when trim is true.
-    output_name: name of the new straightened surface. Default is
-    <name>_straightened.
-    wait: if true (MCP-server-side only), block until the job finishes
-    (30-minute cap) and return the terminal job.status inline.
-
-    Returns {"jobId", "kind": "flatten.straighten", "source": "flatten",
-    "outputName"}; the new surface's UUID is the finished job's output.
-    """
-    result = await _call(
-        "flatten.straighten",
-        _strip_none(
-            {
-                "segmentId": segment_id,
-                "unbend": unbend,
-                "unbendSmoothCols": unbend_smooth_cols,
-                "overlapPasses": overlap_passes,
-                "orthogonalize": orthogonalize,
-                "trim": trim,
-                "trimMaxEdge": trim_max_edge,
                 "outputName": output_name,
             }
         ),
