@@ -3,7 +3,7 @@ without scoring or renders).
 
     python -m vesuvius.neural_tracing.tracers.fibers.sheet_strip.infer_all --fibers FIBERS.vcobj --out OUT \\
         [--checkpoint scrollprize/fiber_strip_small_v1] [--min-length-mm 2.5] [--base-voxel-um 2.4] [--step 8] \\
-        [--blend 16] [--trim 75] [--shard K N] [--workers N [--across-fibers [--compile MODE]] --crops gpu]
+        [--blend 16] [--trim 75] [--shard K N] [--across-fibers] [--workers N [--compile MODE] --crops gpu]
 
 ``--checkpoint`` and the CT, frame-model and umbilicus options are infer.py's (a Hugging Face repo by default).
 
@@ -20,7 +20,13 @@ checkpoint, the complete input reference, the mean expected error, seconds); an 
 left off, also with another checkpoint (run.json lists every checkpoint used). Lengths: the store catalog's, in base
 voxels of ``--base-voxel-um``.
 
-``--workers N`` runs the shard through sheet_strip/batched.py instead of fiber by fiber: N CPU worker processes build
+Fiber by fiber, this process prepares the next batch of decisions (crops, frames) while the device runs the current
+one, and writes each strip as its fiber completes; a record's seconds is the time since the shard's previous record.
+Each fiber's decisions run in batches of ``--batch`` of their own, so on the CPU the strips are those of infer.py.
+``--across-fibers`` fills every strip-model batch with the next ``--batch`` decisions, from the next fibers when one
+ends, so batches stay full (faster on a GPU; heights then move by the batch's rounding).
+
+``--workers N`` (CUDA or the CPU) runs the shard through sheet_strip/batched.py instead of fiber by fiber: N CPU worker processes build
 the decisions' geometry and write the strips, and this process runs the crops (``--crops gpu``: on the GPU) and both
 models over the decisions of many fibers at once. Strips and index records are written as above, in the order fibers
 finish; a record's seconds is the time since the shard's previous record, since fibers overlap. The strip model runs
@@ -235,18 +241,17 @@ def main(argv=None):
                     help='batched mode (sheet_strip/batched.py): CPU worker processes building the geometry while this '
                          'process runs crops and models over many fibers (default 0: fiber by fiber)')
     ap.add_argument('--across-fibers', action='store_true',
-                    help='with --workers: strip-model batches of --batch decisions from any fibers (default: each '
-                         "fiber's own)")
+                    help="strip-model batches of --batch decisions from any fibers (default: each fiber's own)")
     ap.add_argument('--compile', metavar='MODE',
-                    help='with --across-fibers: torch.compile the strip model in this mode (e.g. '
+                    help='with --workers and --across-fibers on CUDA: torch.compile the strip model in this mode (e.g. '
                          'max-autotune-no-cudagraphs), with inductor emulating eager precision casts')
     args = ap.parse_args(argv)
     if args.workers < 0:
         raise SystemExit('--workers must be 0 (fiber by fiber) or more')
-    if args.across_fibers and not args.workers:
-        raise SystemExit('--across-fibers needs --workers')
-    if args.compile and not args.across_fibers:
-        raise SystemExit('--compile needs --across-fibers (one batch shape)')
+    if args.compile and not (args.workers and args.across_fibers):
+        raise SystemExit('--compile needs --workers and --across-fibers (one batch shape)')
+    if args.compile and torch.device(args.device).type != 'cuda':
+        raise SystemExit('--compile needs a CUDA --device (inductor with emulated bf16 casts)')
     torch.set_num_threads(args.threads)
     k, n = args.shard
     try:
@@ -302,12 +307,19 @@ def main(argv=None):
             job = StoreJob(fibers, writer, (args.checkpoint, args.umbilicus, args.batch, volume))
             run_batched(engine, job, todo, args.workers, append, report)
             return
-        for count, catalog_index in enumerate(todo, 1):
-            tick = time.time()
-            rows, keep, expected, arcs = strip_of_fiber(predictor, fibers[catalog_index], args.step, args.blend,
-                                                        args.trim*tpp)
-            append(writer.write(catalog_index, fibers.catalog[catalog_index], rows, keep, expected, arcs),
-                   time.time()-tick)
+        # predict_many keeps the device busy between fibers, preparing the next batch while one runs; with
+        # --across-fibers its batches also take decisions from the next fibers, otherwise each fiber's are its own, as
+        # predict batches them. Records are written as fibers complete; seconds is the time since the previous one
+        jobs = ((index, fiber, decision_arcs(fiber, args.step)) for index in todo for fiber in (fibers[index],))
+        grid = (predictor.f, predictor.v, tpp)
+        tick = time.time()
+        results = predictor.predict_many(jobs, across_fibers=args.across_fibers)
+        for count, ((catalog_index, fiber, arcs), result) in enumerate(results, 1):
+            rows, keep, expected = stitched_strip(grid, fiber, arcs, *result, args.blend, args.trim*tpp)
+            record = writer.write(catalog_index, fibers.catalog[catalog_index], rows, keep, expected, arcs)
+            now = time.time()
+            append(record, now-tick)
+            tick = now
             decisions += len(arcs)
             if count % 50 == 0 or count == len(todo):
                 report(count, decisions, time.time()-started)

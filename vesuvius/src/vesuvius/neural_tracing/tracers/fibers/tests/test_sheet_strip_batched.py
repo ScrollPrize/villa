@@ -147,8 +147,16 @@ def test_infer_all_batched_writes_the_per_fiber_strips(tmp_path):
     assert len((tmp_path/'batched'/'index'/'shard_0.jsonl').read_text().splitlines()) == 2
 
 
-@pytest.mark.parametrize('options, message', [(['--across-fibers'], '--across-fibers needs --workers'),
-                                              (['--workers', '2', '--compile', 'default'], '--compile needs')])
+@pytest.mark.parametrize('options, message', [
+    (['--across-fibers', '--compile', 'default'], '--compile needs --workers'),
+    (['--workers', '2', '--compile', 'default'], '--compile needs --workers'),
+    (['--workers', '2', '--across-fibers', '--compile', 'default', '--device', 'mps'], '--compile needs a CUDA')])
 def test_infer_all_refuses_batched_options_without_their_mode(tmp_path, options, message):
     with pytest.raises(SystemExit, match=message):
         infer_all.main(['--out', str(tmp_path), *options])
+
+
+def test_batched_engine_refuses_mps():
+    """The engine has no MPS launch handling: on MPS, batched mode stops before loading anything."""
+    with pytest.raises(ValueError, match='on MPS run without --workers'):
+        StripEngine(Namespace(device='mps'))

@@ -98,3 +98,19 @@ def zscore_crops_float64(crops):
     deviation = x-x.sum(1, keepdim=True)/x.shape[1]
     divisor = torch.sqrt((deviation*deviation).sum(1, keepdim=True)/x.shape[1]).clamp_min(ZSCORE_EPSILON)
     return (deviation*(1/divisor)).float().view_as(crops)
+
+
+def zscore_crops_torch(crops):
+    """``zscore_crops`` in PyTorch on any device, for GPUs vc_reader's transforms do not run on (Apple MPS).
+
+    The native z-score's rules: population standard deviation about the mean, divisor ``max(std, epsilon)``, and a
+    constant crop becomes all zeros. Statistics accumulate in float32 where the native code uses float64 (MPS has no
+    float64), which moves outputs by about 1e-6; constant crops are found exactly, by their extrema, so float32
+    rounding of the mean cannot turn one into noise divided by epsilon."""
+    flat = crops.reshape(-1, crops.shape[-3:].numel())
+    mean = flat.mean(1, keepdim=True)
+    centred = flat-mean
+    std = centred.square().mean(1, keepdim=True).sqrt()
+    out = centred*std.clamp_min(ZSCORE_EPSILON).reciprocal()
+    constant = flat.amin(1, keepdim=True) == flat.amax(1, keepdim=True)
+    return out.masked_fill_(constant, 0.).view_as(crops)

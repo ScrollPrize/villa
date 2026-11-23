@@ -25,6 +25,7 @@ import torch.nn.functional as F
 from vesuvius.neural_tracing.tracers.models.blocks import MLP
 from vesuvius.neural_tracing.tracers.models.crop_transformer import CELL, RegressionConfig, RegressionFollower
 from vesuvius.neural_tracing.tracers.models.follower import crop_support, sample_features
+from vesuvius.neural_tracing.tracers.models.mps import render_tube_max
 from vesuvius.neural_tracing.tracers.models.patch_tokens import _local, slab_depths
 from vesuvius.neural_tracing.tracers.shared.policy import DEFAULT_CONFIDENCE
 
@@ -150,6 +151,8 @@ def render_tube(points, valid, crop, sigma, out=None, chunk=1 << 14):
                          points[..., 0]/crop.spacing+(crop.width-1)/2), -1).float()  # (B, P, 3) d, h, w
     offsets = tube_offsets(sigma).to(points.device)
     out = points.new_zeros((b, 1, *shape), dtype=torch.float32) if out is None else out.zero_()
+    if out.device.type == 'mps':
+        return render_tube_max(index, valid, offsets, sigma, out)  # the same samples and weights, no sync per crop
     flat = out.view(-1)
     limit = torch.tensor(shape, device=points.device)
     rows, columns = valid.nonzero(as_tuple=True)

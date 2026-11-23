@@ -262,6 +262,42 @@ def test_seed_heading_is_reused_per_seed(monkeypatch):
     assert pending['seed_heading_family'] == 'H'  # a seed decision's crop heading stays with resolve_trace_seed
 
 
+def test_predict_many_batches_fibers():
+    """predict_many returns every fiber's results in order, as one predict per fiber would, with and without the
+    prepare pipeline: in each fiber's own batches, or with ``across_fibers`` in full batches across fiber ends."""
+    from types import SimpleNamespace
+    from vesuvius.neural_tracing.tracers.fibers.sheet_strip.infer import StripPredictor
+
+    def run(pipeline, across_fibers):
+        predictor, launched = object.__new__(StripPredictor), []
+        predictor.batch, predictor.pipeline, predictor.pad_batches = 4, pipeline, False
+
+        def prepare(part):
+            # each decision's value is its fiber's id plus its arclength / 100, so outputs show where they landed
+            values = [job.fiber.id+t/100. for job, t in part]
+            items = [dict(frame=np.eye(3)*v, pos=np.full(3, v)) for v in values]
+            return items, dict(values=torch.tensor(values))
+
+        def launch(inputs):
+            launched.append(len(inputs['values']))
+            v = inputs['values'][:, None, None, None]
+            return v.expand(-1, 2, 3, 5).clone(), -v[:, 0].expand(-1, 3, 5).clone()
+        predictor._prepare, predictor._launch = prepare, launch
+        fibers = [SimpleNamespace(id=i) for i in (10, 20, 30)]
+        jobs = [(f'k{f.id}', f, np.arange(n)*8.+12.) for f, n in zip(fibers, (3, 6, 2))]
+        return list(predictor.predict_many(iter(jobs), across_fibers=across_fibers)), jobs, launched
+
+    for pipeline, across_fibers in ((True, True), (False, True), (True, False), (False, False)):
+        results, jobs, launched = run(pipeline, across_fibers)
+        # 11 decisions over fibers of 3, 6 and 2: full batches across the ends, or each fiber's own as predict's
+        assert launched == ([4, 4, 3] if across_fibers else [3, 4, 2, 2])
+        assert [job for job, _ in results] == jobs
+        for (key, fiber, arcs), (heights, scales, frames, positions) in results:
+            want = fiber.id+arcs/100.
+            assert heights.shape == (len(arcs), 3, 5) and heights.dtype == np.float64
+            assert np.allclose(heights[:, 0, 0], want) and np.allclose(scales[:, 0, 0], -want)
+            assert np.allclose(frames[:, 0, 0], want) and np.allclose(positions[:, 0], want)
+
 def test_display_grid_puts_higher_z_on_top():
     """An H strip runs along the columns and a V strip along the rows, row 0 the highest z."""
     from vesuvius.neural_tracing.tracers.fibers.sheet_strip.infer_all import display_grid
@@ -329,3 +365,39 @@ def test_transfer_to_single_lattice_keeps_what_it_can():
         x_in['fine'] = torch.cat((x_in['fine'], torch.zeros_like(x_in['fine'])), 1)
         heights = target.forward_strip(x_in, hist, hmask)
     assert torch.isfinite(heights).all() and not hasattr(target, 'coarse_cnn')
+
+
+def test_optimize_for_mps_swaps_the_checkpoint_cnn():
+    # fiber_strip_small_v1's CNN: its pooled skips store sizes as lists and its identity skips are lambdas, which the
+    # Metal kernels must still accept instead of silently falling back to the slower MPS layers
+    from vesuvius.neural_tracing.tracers.models.blocks import CropCNN
+    from vesuvius.neural_tracing.tracers.models.mps import optimize_for_mps
+    from vesuvius.neural_tracing.tracers.models.mps_cnn import MetalCropCNN
+
+    model = torch.nn.Module()
+    model.cnn = CropCNN((12, 24, 64), (2, 2, 1), (1, 2, 2), activation='leaky_relu', in_channels=2, context=64)
+    optimize_for_mps(model)
+    assert type(model.cnn) is MetalCropCNN
+    # its blocks and convs were swapped for the MPS fallback classes after it; the kernels must still cover them
+    assert MetalCropCNN.covers(model.cnn)
+    stem = CropCNN((12, 24, 64), (2, 2, 1), (1, 2, 2), stem=True, activation='leaky_relu', in_channels=2, context=64)
+    assert not MetalCropCNN.suits(stem)
+
+
+def test_patch_token_tables_match_grid_sample():
+    # MetalPatchTokens replaces grid_sample with fixed (corner, weight) tables; on the CPU the same tables, applied
+    # by a torch gather, must give the stock tokens, including points outside the crop and the border clamp
+    from vesuvius.neural_tracing.tracers.models.mps_tokens import MetalPatchTokens, reference_gather
+    from vesuvius.neural_tracing.tracers.models.patch_tokens import PatchTokens
+
+    cfg = SheetStripConfig(**dict(SMALL, multiscale_fine_width=None, cnn_channels=(8, 16)), **STRIP)
+    tokens = SheetStripFollower(cfg).cell_token
+    assert type(tokens) is PatchTokens and MetalPatchTokens.suits(tokens)
+    g = torch.Generator().manual_seed(1)
+    lattice = torch.randn(2, 16, 8, 8, 8, generator=g)
+    want = PatchTokens.forward(tokens, lattice)
+    tokens.__class__ = MetalPatchTokens
+    with torch.no_grad():
+        got = tokens.table_forward(lattice, reference_gather)
+    assert got.shape == want.shape
+    assert torch.allclose(got, want, atol=1e-5), (got-want).abs().max()

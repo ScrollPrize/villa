@@ -7,7 +7,7 @@ the CPU, then the strip model. Here the same decisions are split around the fram
 - ``StripGeometry.plan`` (worker): the decisions as ``predict`` builds them, without training labels
   (``decision_on_path(labels=False)``) or identity evidence, which are never model inputs, and with the seed heading
   resolved as ``predict`` does; returns the frame model's inputs (``FrameRequest``).
-- ``StripEngine.frame_outputs`` (GPU process): frame-model crops from vc_reader's CUDA reader and the frame model on
+- ``StripEngine.frame_outputs`` (GPU process): frame-model crops from vc_reader's CUDA or Metal reader and the frame model on
   the GPU, over the requests of many fibers.
 - ``StripGeometry.finish`` (worker): the learned frame, the crop axis of the previous prediction, the references,
   path features, tube points and crop orientation (``StripInputs``), as the observation builder sets them.
@@ -148,14 +148,19 @@ TUBE_POINTS = 2048  # infer.StripPredictor.predict's tube buffer
 
 class StripEngine:
     """The model half of ``StripPredictor.predict`` over the decisions of many fibers per call: crops and both
-    models on ``predictor``'s device. Crops come from vc_reader's CUDA reader with ``crops='gpu'``, else from the CPU
-    sampler (on the CPU, the engine then reproduces ``predict``)."""
+    models on ``predictor``'s device. Crops come from vc_reader's CUDA or Metal reader with ``crops='gpu'``, else from
+    the CPU sampler (on the CPU, the engine then reproduces ``predict``)."""
 
     def __init__(self, predictor, batch=4, frame_chunk=64, across_fibers=False, compile_mode=None):
         """``compile_mode``: a torch.compile mode for the strip model after the tube render (with ``across_fibers``:
         every batch is then padded to ``batch`` decisions so the compiled graph keeps one shape). Compiling turns on
         inductor's ``emulate_precision_casts`` for the whole process."""
         import torch
+        if torch.device(predictor.device).type == 'mps':
+            # the engine's launches have neither predict's MPS batch padding nor its queue flushes; on MPS one process
+            # fiber by fiber with across-fiber batches (StripPredictor.predict_many) keeps the GPU busy
+            raise ValueError('Batched mode (--workers) runs on CUDA or the CPU; on MPS run without --workers, with '
+                             '--across-fibers')
         self.predictor, self.batch, self.frame_chunk = predictor, batch, frame_chunk
         self.across_fibers = across_fibers
         if compile_mode is not None and not across_fibers:
@@ -177,11 +182,12 @@ class StripEngine:
         self.frame_model = predictor.builder.frames().model
 
     def crops(self, items, crop):
-        """(B, 1, D, H, W) z-scored float32 crops of ``items`` on the engine's device."""
-        from vesuvius.neural_tracing.tracers.shared.crop_sampling.crops import cuda_scalar_crops, scalar_crops
+        """(B, 1, D, H, W) z-scored float32 crops of ``items`` on the engine's device: from the predictor's GPU crop
+        backend with ``crops='gpu'`` (vc_reader's CUDA or Metal reader), else from the CPU sampler."""
+        from vesuvius.neural_tracing.tracers.shared.crop_sampling.crops import scalar_crops
         p = self.predictor
-        if p.cuda is not None:
-            return cuda_scalar_crops(items, p.cuda, p.spec, crop)
+        if p.gpu_crops is not None:
+            return p.gpu_crops(items, p.ct, p.spec, crop)
         return scalar_crops(items, p.ct, p.spec, crop).to(self.device)
 
     def frame_outputs(self, requests):
