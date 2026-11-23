@@ -118,7 +118,7 @@ class Record:
         `name` is another lock, for what is read, changed and written back (the settings).
         Taken again by the thread that holds it, it is already held: a check and the writes
         it allows are made under one hold. Other threads and processes wait."""
-        key = (os.path.abspath(self.directory), name)
+        key = (os.path.normcase(os.path.realpath(self.directory)), name)    # one file, one key, however it is spelled
         held = _held.__dict__.setdefault("depth", {})
         if held.get(key):
             held[key] += 1

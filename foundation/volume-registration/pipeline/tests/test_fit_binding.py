@@ -10,6 +10,7 @@ test_review_blockers.py); on Windows the real LockFileEx is used."""
 
 import builtins
 import json
+import os
 import shutil
 import threading
 import time
@@ -26,7 +27,7 @@ from volreg import stages as pipeline_stages
 from volreg.engine import DONE, FAILED
 from volreg.review.server import Reviews, handler_for
 
-from test_review_blockers import CONTEXT, REVIEWER, lock_kind  # noqa: F401 - a fixture
+from test_review_blockers import CONTEXT, REVIEWER, as_windows_locks, lock_kind  # noqa: F401 - a fixture
 import test_redo_release as fakes
 from test_redo_release import _fit_id, drain, new_pair, pick_all, released, released_transform
 
@@ -893,3 +894,83 @@ def test_c_releases_while_another_process_keeps_restoring_each_match_their_decis
     print("releases with the pair, without:", shipped[True], shipped[False])
     drain(directory)
     assert_release_matches_its_decision(released(tmp_path, [root], "end") and tmp_path / "out-end")
+
+
+# ============================= Windows reads and keys: a stamp being replaced, a path's spelling
+
+def _refuse_reads_of(monkeypatch, target, times):
+    """Reads of `target` refused `times` times, as Windows refuses a read that lands while
+    the file is being replaced."""
+    real, refused = Path.read_text, [0]
+
+    def read_text(self, *args, **kwargs):
+        if self == target and refused[0] < times():
+            refused[0] += 1
+            raise PermissionError(13, "the file is being replaced", str(self))
+        return real(self, *args, **kwargs)
+    monkeypatch.setattr(Path, "read_text", read_text)
+    return refused
+
+
+def test_a_stamp_read_while_the_stamp_is_replaced_is_asked_again(tmp_path, stand_ins, monkeypatch):
+    """Windows refuses a read of a stamp that lands while its replace is under way. Store and
+    the decision's reads ask again, as replace and unlink wait for readers, instead of failing
+    or answering 500."""
+    as_windows_locks(monkeypatch)
+    root = tmp_path / "records"
+    directory = stored_pair(root)
+    pipeline = pipeline_stages.pipeline(directory)
+    limit = [3]
+    refused = _refuse_reads_of(monkeypatch, pipeline.stamp_path("fit"), lambda: limit[0])
+    assert pipeline_stages._stamp(pipeline, "fit")["status"] == "ok" and refused[0] == 3
+    refused[0] = 0
+    assert pipeline_stages.fit_unit(pipeline).fit_id == "f001" and refused[0] == 3
+    refused[0], limit[0] = 0, 2
+    assert pipeline_stages.pipeline(directory).run_stage("store")["status"] == "ok" and refused[0] == 2
+    shown = page(directory)               # the page reads no stamp; the decision it sends does
+    refused[0], limit[0] = 0, 2
+    decide_shown(directory, "affine", shown)
+    assert refused[0] == 2 and rec.Record(directory).read(rec.FINAL_REVIEW)["decision"]["publish"] == "affine"
+
+
+def test_a_stamp_that_stays_unreadable_is_not_hidden(tmp_path, stand_ins, monkeypatch):
+    """The wait is for a replace in progress. A permission problem that does not go away
+    surfaces after it, as it does for replace and unlink."""
+    as_windows_locks(monkeypatch)
+    directory = stored_pair(tmp_path / "records")
+    pipeline = pipeline_stages.pipeline(directory)
+    _refuse_reads_of(monkeypatch, pipeline.stamp_path("fit"), lambda: 10 ** 9)
+    monkeypatch.setattr(filelock, "RETRY_SECONDS", 0.2)
+    with pytest.raises(PermissionError):
+        pipeline_stages._stamp(pipeline, "fit")
+
+
+@pytest.mark.parametrize("spelling", ["symlink", "case"])
+def test_the_record_lock_is_one_lock_however_the_records_path_is_spelled(tmp_path, monkeypatch, spelling):
+    """The thread that holds a record's lock holds it for every spelling of the record's
+    path (a link to it, the other case on Windows): taking it again through another one is
+    the same hold, not a second lock on the same file, which Windows would refuse for ever."""
+    directory = tmp_path / "Record"
+    directory.mkdir()
+    if spelling == "symlink":
+        link = tmp_path / "link"
+        try:
+            os.symlink(directory, link, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            pytest.skip("this system cannot make a symbolic link")
+        other = link
+    else:
+        if os.name != "nt":
+            pytest.skip("paths differ by case on Windows only")
+        other = Path(str(directory).swapcase())
+    taken, real = [], filelock.lock_exclusive
+    monkeypatch.setattr(filelock, "lock_exclusive", lambda handle: (taken.append(1), real(handle))[1])
+    first, second = rec.Record(directory), rec.Record(other)
+    with first.lock():
+        with second.lock():
+            with first.lock():
+                pass
+    assert len(taken) == 1
+    with second.lock():
+        pass
+    assert len(taken) == 2

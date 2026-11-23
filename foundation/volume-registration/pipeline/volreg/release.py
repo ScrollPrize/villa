@@ -119,17 +119,17 @@ def not_stored_since_redo(record):
         return None
     stamp = record.read(STORE_STAMP) if record.exists(STORE_STAMP) else {}
     if stamp.get("status") != "ok" or stamp.get("redo_mark") != mark:
-        return "a redo came after its decision was stored; store it again"
+        return "a redo came after its decision was stored; store it again with `volreg redo <pair> store`"
     outputs = stamp.get("outputs") or []
     if (not set(outputs) <= set(FILES) or (rec.TRANSFORM in outputs) != record.exists(rec.TRANSFORM)
             or digest_contents((name, record.contents.get(name)) for name in outputs)
             != stamp.get("output_digest")):
-        return "its record is not what its store wrote after the redo; store it again"
+        return "its record is not what its store wrote after the redo; store it again with `volreg redo <pair> store`"
     decision = record.read(rec.FINAL_REVIEW)["decision"]
     stored = record.read(rec.FIT) if record.exists(rec.FIT) else {}
     if stored.get("fit") != decision.get("fit") or stored.get("decision") != {
             "fit": decision.get("fit"), "publish": decision.get("publish")}:
-        return "its decision is not the one its fit was stored under; store it again"
+        return "its decision is not the one its fit was stored under; store it again with `volreg redo <pair> store`"
     return None
 
 
@@ -153,29 +153,29 @@ def stored_mismatch(record, decision, legacy_too=True):
     if binding is not None:
         if (binding.get("fit"), binding.get("publish"), stored.get("fit")) != (fit, publish, fit):
             return (f"it stores {binding.get('publish')} of {binding.get('fit')}, but its decision is "
-                    f"{publish} of {fit}; store it again")
+                    f"{publish} of {fit}; store it again with `volreg redo <pair> store`")
         scored = (stored.get("scored") or {}).get("fit", fit)
         if scored != fit:
-            return f"its scores are of {scored}, not of {fit}; store it again"
+            return f"its scores are of {scored}, not of {fit}; store it again with `volreg redo <pair> store`"
         if (content and hashlib.sha256(content).hexdigest()) != binding.get("transform_sha256"):
             return ("its transform is not the one its fit.json was stored with (a store that did not finish, "
-                    "or a file changed since); store it again")
+                    "or a file changed since); store it again with `volreg redo <pair> store`")
         return None
     if not legacy_too:
         return None
     if stored.get("decision") not in (None, {"fit": fit, "publish": publish}):
         old = stored["decision"]
-        return f"it stores {old.get('publish')} of {old.get('fit')}, but its decision is {publish} of {fit}; store it again"
+        return f"it stores {old.get('publish')} of {old.get('fit')}, but its decision is {publish} of {fit}; store it again with `volreg redo <pair> store`"
     if stored.get("fit") not in (None, fit):
-        return f"it stores {stored['fit']}, but its decision is about {fit}; store it again"
+        return f"it stores {stored['fit']}, but its decision is about {fit}; store it again with `volreg redo <pair> store`"
     if publish in ("bend", "affine") and content is None:
-        return "it stores no transform; store it again"
+        return "it stores no transform; store it again with `volreg redo <pair> store`"
     bent = content is not None and json.loads(content).get("deformation") is not None
     if publish == "affine" and bent:
-        return "it stores the bend, but its decision is the affine; store it again"
+        return "it stores the bend, but its decision is the affine; store it again with `volreg redo <pair> store`"
     if publish == "bend" and stored.get("bend") and not bent:
         # The fit has a bend (its metadata says so), and what is stored is without it.
-        return "it stores the affine, but its decision is the bend; store it again"
+        return "it stores the affine, but its decision is the bend; store it again with `volreg redo <pair> store`"
     return None
 
 

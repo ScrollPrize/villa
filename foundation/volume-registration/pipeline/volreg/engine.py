@@ -145,8 +145,11 @@ class Pipeline:
         return self.work("stages", f"{name}.json")
 
     def stamp(self, name):
+        """The stage's stamp, or None. On Windows a read that lands while a stamp is being
+        replaced is refused (PermissionError); it is asked again, as replace and unlink wait
+        for readers."""
         path = self.stamp_path(name)
-        return json.loads(path.read_text()) if path.exists() else None
+        return filelock.retry(lambda: json.loads(path.read_text()) if path.exists() else None)
 
     def _write_stamp(self, name, stamp):
         path = self.stamp_path(name)
