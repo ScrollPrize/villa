@@ -401,9 +401,10 @@ inline void restore_valid(Sample& s) {
         // datasets build it): a typed loop instead of a per-voxel dtype dispatch through get() and
         // set(); the same voxels take the same fill.
         if (f.array.kind == 'f' && f.array.bytes == 4 && mask.shape[0] == 1 && (mask.bytes == 1 || (mask.kind == 'f' && mask.bytes == 4))) {
-            auto* values = static_cast<float*>(f.array.data()); const float fill = static_cast<float>(f.target.fill);
+            const float fill = static_cast<float>(f.target.fill);
             const auto refill = [&](const auto* flags) {
                 if (std::find(flags, flags + n, 0) == flags + n) return;
+                auto* values = static_cast<float*>(f.array.data());
                 for (std::size_t c = 0; c < f.array.shape[0]; ++c) for (std::size_t i = 0; i < n; ++i) if (!flags[i]) values[c * n + i] = fill;
             };
             if (mask.bytes == 1) refill(static_cast<const std::uint8_t*>(mask.data())); else refill(static_cast<const float*>(mask.data()));
