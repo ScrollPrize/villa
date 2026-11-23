@@ -5,7 +5,9 @@
     <record>/final-review.json    the blind rounds and the decision
     <record>/patch-reviews.json   verdicts and notes on fit patches (the first reviews had them)
     <record>/fit/transform.json   the final transform, in the atlas's format
-    <record>/fit/fit.json         how it was fitted, the points it rests on, its scores
+    <record>/fit/fit.json         how it was fitted, the points it rests on, its scores, and
+                                  (`stored`) the fit, variant and transform digest it was
+                                  stored with: what binds it to the transform beside it
     <record>/events.jsonl         every answer and job, append-only
 
 Files other than `events.jsonl` are replaced whole, in one step, so a reader never sees half
@@ -16,6 +18,7 @@ import json
 import os
 import secrets
 import stat
+import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -40,6 +43,16 @@ LINES_UP = "lines-up"
 BLIND_ANSWERS = ("unsure", "none")
 # What a decision can publish.
 PUBLISH = ("bend", "affine", "nothing")
+
+
+# The record locks this thread holds, and how deep: a lock taken again by its holder (a
+# decision checked and written under one hold) is not waited for.
+_held = threading.local()
+
+
+def dumps(data):
+    """A record file's bytes, as `Record.write` writes them."""
+    return (json.dumps(data, indent=1) + "\n").encode()
 
 
 def now():
@@ -74,17 +87,23 @@ class Record:
         with open(self.path(name)) as handle:
             return json.load(handle)
 
+    def read_bytes(self, name):
+        return self.path(name).read_bytes()
+
     def write(self, name, data):
         """Replace a file in one step, with the schema stamped in."""
-        target = self.path(name)
-        target.parent.mkdir(parents=True, exist_ok=True)
         if isinstance(data, dict) and name.endswith(".json") and name != TRANSFORM:
             data = {"schema": SCHEMA} | data
+        self.write_bytes(name, dumps(data))
+
+    def write_bytes(self, name, content):
+        """Replace a file in one step with `content`, exactly."""
+        target = self.path(name)
+        target.parent.mkdir(parents=True, exist_ok=True)
         descriptor, scratch = _scratch(target)
         try:
-            with os.fdopen(descriptor, "w") as handle:
-                json.dump(data, handle, indent=1)
-                handle.write("\n")
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(content)
                 handle.flush()
                 os.fsync(handle.fileno())
             filelock.replace(scratch, target)
@@ -96,13 +115,26 @@ class Record:
     def lock(self, name=".lock"):
         """Held while a view (`holdout.json`, `final-review.json`) is rewritten from the
         log, so a page and a job doing it at once cannot lose each other's answers. Another
-        `name` is another lock, for what is read, changed and written back (the settings)."""
-        self.directory.mkdir(parents=True, exist_ok=True)
-        with open(self.directory / name, "w") as handle:
-            filelock.lock_exclusive(handle)
+        `name` is another lock, for what is read, changed and written back (the settings).
+        Taken again by the thread that holds it, it is already held: a check and the writes
+        it allows are made under one hold. Other threads and processes wait."""
+        key = (os.path.abspath(self.directory), name)
+        held = _held.__dict__.setdefault("depth", {})
+        if held.get(key):
+            held[key] += 1
             try:
                 yield
             finally:
+                held[key] -= 1
+            return
+        self.directory.mkdir(parents=True, exist_ok=True)
+        with open(self.directory / name, "w") as handle:
+            filelock.lock_exclusive(handle)
+            held[key] = 1
+            try:
+                yield
+            finally:
+                held.pop(key, None)
                 filelock.unlock(handle)
 
     def log(self, kind, **fields):
@@ -200,12 +232,19 @@ class Record:
         self.refresh_final()
 
 
-    def decide(self, decision, reviewer):
-        """The final decision: `{"fit", "publish", "reason", "override"}`; logged, then shown."""
+    def decide(self, decision, reviewer, check=None):
+        """The final decision: `{"fit", "publish", "reason", "override"}` and, from the review
+        page, the `round` it was made on; logged, then shown. `check(final)`, given
+        `final-review.json` as it stands, raises if the decision does not apply to it; it is
+        called under the record lock the decision is then written under, so no round can be
+        added or answered between the check and the write."""
         if decision["publish"] not in PUBLISH:
             raise ValueError(f"publish one of {', '.join(PUBLISH)}")
-        self.log("decision", **decision, by=reviewer)
-        self.refresh_final()
+        with self.lock():
+            if check is not None:
+                check(self.read(FINAL_REVIEW) if self.exists(FINAL_REVIEW) else {})
+            self.log("decision", **decision, by=reviewer)
+            self.refresh_final()
 
 
     def refresh_final(self, rounds=None):
@@ -222,7 +261,8 @@ class Record:
                     picks[(event["round"], event["item"])] = event["choice"]
                 elif event["kind"] == "decision":
                     decision = {key: event[key] for key in ("fit", "publish", "reason", "override")
-                                } | {"by": event.get("by"), "at": event["at"]}
+                                } | {"by": event.get("by"), "at": event["at"]} | (
+                                    {"round": event["round"]} if event.get("round") else {})
             for round_ in final["rounds"]:
                 for index, item in enumerate(round_["items"]):
                     if (round_["id"], index) in picks:

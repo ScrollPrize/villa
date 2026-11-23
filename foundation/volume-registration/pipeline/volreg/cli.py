@@ -200,13 +200,21 @@ def status(args):
 
 
 def check(args):
-    """Recompute the published transform's score from the record alone, and compare it with
-    the stored one; check the decision against the bar. Exit 1 on any mismatch."""
+    """Check that the stored transform, its metadata and its scores are the one result the
+    decision names (the fit, the variant, the transform's digest: see `release.stored_mismatch`),
+    then recompute the published transform's score from the record alone and compare it with
+    the stored one, and check the decision against the bar. Exit 1 on any mismatch."""
     failed = 0
     for record in records(args.records):
         final = record.read(rec.FINAL_REVIEW) if record.exists(rec.FINAL_REVIEW) else {}
         decision = final.get("decision")
         if not decision or not record.exists(rec.FIT):
+            continue
+        mismatch = releasing.stored_mismatch(record, decision, legacy_too=is_pipeline(record))
+        if mismatch or decision["publish"] == "nothing":
+            failed += bool(mismatch)
+            print(f"{record.directory.name:18s} {decision['publish']:6s} of {decision['fit']}  "
+                  + (f"NOT WHAT IS STORED: {mismatch}" if mismatch else "nothing published"))
             continue
         pair, fit = record.read(rec.PAIR), record.read(rec.FIT)
         result = score(record.read(rec.TRANSFORM), record.read(rec.HOLDOUT),

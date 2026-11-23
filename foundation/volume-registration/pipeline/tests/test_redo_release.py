@@ -75,9 +75,12 @@ def _score():
 
 
 def fake_score(pipeline, params):
+    """Scores of the fit as run_score reads it, naming it as run_score does."""
+    unit = pipeline_stages.fit_unit(pipeline)
     pipeline.work("scores.json").write_text(json.dumps({
         "bar": {"version": "test"}, "scores": {"bend": _score(), "affine": _score()},
-        "drift": {}, "under": _fit_id(pipeline)}) + "\n")
+        "drift": {}, "under": unit.fit_id,
+        "scored": {"fit": unit.fit_id, "fit_digest": unit.digest}}) + "\n")
     return ["work/scores.json"]
 
 
@@ -126,9 +129,11 @@ def pick_all(directory):
 
 
 def decide(directory, publish):
-    """The decision as the review page makes it, for the fit there is now."""
+    """The decision as the review page makes it: on the round and fit it shows."""
     pick_all(directory)
-    Reviews(directory.parent, BY, auto_advance=False).decide(directory.name, publish, "")
+    reviews = Reviews(directory.parent, BY, auto_advance=False)
+    shown = reviews.blind(directory.name)
+    reviews.decide(directory.name, publish, "", shown["round"]["id"], shown["fit"])
 
 
 def new_pair(root, name="a", pair="A"):
@@ -740,12 +745,12 @@ def test_a_rewrite_keeps_the_existing_mode_throughout_the_save(tmp_path, umask, 
     record.write(rec.HOLDOUT, {"patches": []})
     os.chmod(tmp_path / rec.HOLDOUT, existing)
     seen = []
-    real_dump = rec.json.dump
+    real_fdopen = rec.os.fdopen
 
-    def watching(data, handle, *args, **kwargs):
-        seen.append(stat.S_IMODE(os.fstat(handle.fileno()).st_mode))   # before any data
-        return real_dump(data, handle, *args, **kwargs)
-    monkeypatch.setattr(rec.json, "dump", watching)
+    def watching(descriptor, *args, **kwargs):
+        seen.append(stat.S_IMODE(os.fstat(descriptor).st_mode))   # before any data
+        return real_fdopen(descriptor, *args, **kwargs)
+    monkeypatch.setattr(rec.os, "fdopen", watching)
     real_replace = rec.filelock.replace
     monkeypatch.setattr(rec.filelock, "replace", lambda source, target: (
         seen.append(stat.S_IMODE(os.stat(source).st_mode)), real_replace(source, target)))
@@ -886,7 +891,8 @@ def test_interleaving_new_fit_round_without_a_redo_keeps_the_reviewed_record(tmp
     drain(directory)
     pairs, _index = released(tmp_path, [root], "decided")
     assert pairs["A"]["decision"] | {"at": None, "by": None} == {
-        "fit": "f002", "publish": "affine", "reason": "", "override": None, "at": None, "by": None}
+        "fit": "f002", "publish": "affine", "reason": "", "override": None, "at": None, "by": None,
+        "round": "c002"}
     transform = released_transform(tmp_path, "decided")
     assert transform["fit"] == "f002" and "deformation" not in transform
 

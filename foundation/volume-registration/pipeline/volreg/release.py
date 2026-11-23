@@ -7,8 +7,15 @@ is not decided yet (deferred, or still under review) is held back whole: an olde
 of it is not released in the meantime. A pipeline record that has been redone is released
 only once its store has run since the last redo, wrote the files it holds, and was run
 under the decision it holds now (the same fit, the same variant); until then it is left
-out, and if it is the newest decision of its pair, the pair is held back whole too. A
-record with no redo in its history is taken as it is. Of a record, the files a person
+out, and if it is the newest decision of its pair, the pair is held back whole too.
+
+Every pipeline record is also checked for what its store bound together (see
+`stored_mismatch`): the fit, the variant and the transform stored must be the ones its
+decision names, whether or not it was ever redone. A record whose store has not run since
+its decision changed, or stopped between its writes, is left out the same way. A record
+stored before stores bound their files (by main, say) is checked on what it holds: the fit
+it names and whether its transform has a bend; one that agrees with its decision is taken
+as it is. Of a record, the files a person
 decided and what they rest on are copied whole, as they were read at one moment; the event
 log, the stage settings and the derived state under `work/` stay behind. `index.json` lists
 each pair with where it came from, its decision and score, the hash of every file, and what
@@ -85,6 +92,11 @@ class Snapshot:
             raise FileNotFoundError(self.path(name))
         return json.loads(self.contents[name])
 
+    def read_bytes(self, name):
+        if name not in self.contents:
+            raise FileNotFoundError(self.path(name))
+        return self.contents[name]
+
     def sha256(self, name):
         return hashlib.sha256(self.contents[name]).hexdigest()
 
@@ -117,6 +129,55 @@ def not_stored_since_redo(record):
             "fit": decision.get("fit"), "publish": decision.get("publish")}:
         return "its decision is not the one its fit was stored under; store it again"
     return None
+
+
+def stored_mismatch(record, decision, legacy_too=True):
+    """Why what a record stores is not the one result its decision names, or None.
+
+    A store binds what it writes in `fit.json` (`stored`): the fit, the variant, and the
+    digest of the transform written with it (none for publishing nothing). All of it must be
+    the decision's, the scores it holds must be that fit's, and the transform there must be
+    the one named: a store that stopped between its writes, or has not run since the decision
+    changed, fails here. A record stored before stores bound their files is checked, if
+    `legacy_too`, on what it holds: the fit it names, and that an affine decision has a
+    transform without a bend. `record` is a Record or a Snapshot."""
+    if not record.exists(rec.FIT):
+        return "nothing is stored for its decision yet; store it" if legacy_too else None
+    stored = record.read(rec.FIT)
+    content = record.read_bytes(rec.TRANSFORM) if record.exists(rec.TRANSFORM) else None
+    fit, publish = decision.get("fit"), decision.get("publish")
+    binding = stored.get("stored")
+    if binding is not None:
+        if (binding.get("fit"), binding.get("publish"), stored.get("fit")) != (fit, publish, fit):
+            return (f"it stores {binding.get('publish')} of {binding.get('fit')}, but its decision is "
+                    f"{publish} of {fit}; store it again")
+        scored = (stored.get("scored") or {}).get("fit", fit)
+        if scored != fit:
+            return f"its scores are of {scored}, not of {fit}; store it again"
+        if (content and hashlib.sha256(content).hexdigest()) != binding.get("transform_sha256"):
+            return ("its transform is not the one its fit.json was stored with (a store that did not finish, "
+                    "or a file changed since); store it again")
+        return None
+    if not legacy_too:
+        return None
+    if stored.get("decision") not in (None, {"fit": fit, "publish": publish}):
+        old = stored["decision"]
+        return f"it stores {old.get('publish')} of {old.get('fit')}, but its decision is {publish} of {fit}; store it again"
+    if stored.get("fit") not in (None, fit):
+        return f"it stores {stored['fit']}, but its decision is about {fit}; store it again"
+    if publish in ("bend", "affine") and content is None:
+        return "it stores no transform; store it again"
+    if publish == "affine" and json.loads(content).get("deformation") is not None:
+        return "it stores the bend, but its decision is the affine; store it again"
+    return None
+
+
+def unreleasable(record, decision):
+    """Why a decided record cannot be released as it stands, or None: a redo since its store
+    (`not_stored_since_redo`), or a stored result that is not the one its decision names
+    (`stored_mismatch`; a migrated record has nothing to check but what a store bound)."""
+    return not_stored_since_redo(record) or (
+        decision["publish"] != "nothing" and stored_mismatch(record, decision, legacy_too=is_pipeline(record)))
 
 
 def newness(record):
@@ -185,7 +246,7 @@ def release(out, roots):
             name = record.read(rec.PAIR)["pair"]
             final = record.read(rec.FINAL_REVIEW) if record.exists(rec.FINAL_REVIEW) else {}
             decision = final.get("decision")
-            why = decision and not_stored_since_redo(record)
+            why = decision and unreleasable(record, decision)
             if not decision:
                 left_out.append({"source": source, "pair": name,
                                  "why": final.get("status") or "not decided"})

@@ -186,9 +186,14 @@ class Pipeline:
         lock file for its whole life, exclusive; whoever asks takes it shared, so askers never
         read each other as the job, and a lock that is free belongs to no one. Only a lock
         file from before that (no `os-lock` in it) is judged by its pid (on Windows also what
-        tells it from a later process with the same pid); nothing is signalled."""
+        tells it from a later process with the same pid); nothing is signalled. A lock file
+        that cannot be opened for writing (a read-only copy of a pipeline) is asked read-only."""
         try:
-            with open(self.lock_path(name), "r+b") as handle:
+            try:
+                handle = open(self.lock_path(name), "r+b")
+            except PermissionError:
+                handle = open(self.lock_path(name), "rb")
+            with handle:
                 if not filelock.try_lock(handle, filelock.OWNER_OFFSET, shared=True):
                     return True
                 try:
@@ -397,6 +402,14 @@ class Pipeline:
         no redo can begin in the middle of them."""
         with self._launch_guard():
             self._require_current(name)
+            yield
+
+    @contextmanager
+    def steady(self):
+        """Held while something is checked against the stages' results and written on that
+        basis (a decision on the review page): no job stamps a result, and no redo begins,
+        until it is let go."""
+        with self._launch_guard():
             yield
 
     @contextmanager

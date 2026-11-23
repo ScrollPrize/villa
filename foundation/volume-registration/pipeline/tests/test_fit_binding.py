@@ -360,7 +360,7 @@ def test_check_verifies_the_binding_not_just_the_score(tmp_path, stand_ins, caps
     (tampered / "A" / rec.TRANSFORM).write_text(json.dumps(transform, indent=1) + "\n")
     capsys.readouterr()
     assert cli.main(["check", str(tampered)]) == 1
-    assert "f002" in capsys.readouterr().out
+    assert "NOT WHAT IS STORED" in capsys.readouterr().out
 
 
 def _scorable(directory):

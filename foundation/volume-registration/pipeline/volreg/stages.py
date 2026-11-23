@@ -6,9 +6,11 @@ The stages that read the volumes work on one session of `cores/fit_session.py` i
 a person judged stays what is scored.
 """
 
+import hashlib
 import json
 import shutil
 from contextlib import contextmanager
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -19,7 +21,7 @@ from . import render
 from .cores import fit_session as fs
 from .cores import session_overview
 from .cores.transform_io import volume_name
-from .engine import Pipeline, Stage
+from .engine import Pipeline, Stage, digest_contents
 from .scoring import BAR, bar_check, score
 
 PARAMS = "params.json"
@@ -28,6 +30,87 @@ SETTINGS_LOCK = ".settings.lock"
 # Draws of the hold-out stage, at most, to make up for patches that cannot be measured.
 HOLDOUT_DRAWS = 4
 SESSION = "session"
+# What the fit stage writes, and the score stage.
+FIT_TRANSFORM, FIT_META, SCORES = "work/fit/transform.json", "work/fit/fit.json", "work/scores.json"
+
+
+class Incoherent(RuntimeError):
+    """The fit, its scores and what was decided are not of one fit as they were read: a new
+    fit or new scores are being written, or were written in between."""
+
+
+@dataclass
+class FitUnit:
+    """One finished fit as its job wrote it, read and checked against its stamp: the files
+    are the ones the job finished with, not a mix of them and a later fit's. With
+    `reviewed_unit`, also the scores made of exactly this fit."""
+    fit_id: str
+    fit: dict
+    transform: dict
+    digest: str             # the fit stamp's output digest: which fit, to the byte
+    code: dict
+    scores: dict = None
+    scores_sha256: str = None
+
+
+def _read_bytes(pipeline, path):
+    try:
+        return (pipeline.directory / path).read_bytes()
+    except FileNotFoundError:
+        return None
+
+
+def _stamp(pipeline, name):
+    try:
+        return pipeline.stamp(name) or {}
+    except (FileNotFoundError, ValueError):     # moved by a redo, or replaced, as it was read
+        return {}
+
+
+def fit_unit(pipeline):
+    """The current fit, whole: its stamp, then its files, each read once, and the files
+    checked against the digest the stamp holds. Incoherent if there is no finished fit (it
+    was redone and is being made again) or the files are not the ones its job finished with
+    (a later fit is being written over them)."""
+    stamp = _stamp(pipeline, "fit")
+    if stamp.get("status") != "ok":
+        raise Incoherent("there is no finished fit: it is being made again")
+    outputs = stamp.get("outputs") or []
+    contents = {path: _read_bytes(pipeline, path) for path in outputs}
+    if (FIT_TRANSFORM not in outputs or FIT_META not in outputs
+            or digest_contents((path, contents[path]) for path in outputs) != stamp.get("output_digest")):
+        raise Incoherent("the fit's files are not the ones its job finished with: a new fit is being written")
+    fit = json.loads(contents[FIT_META])
+    return FitUnit(fit["fit"], fit, json.loads(contents[FIT_TRANSFORM]), stamp["output_digest"],
+                   stamp.get("code"))
+
+
+def reviewed_unit(pipeline):
+    """`fit_unit`, with the scores of that same fit: `scores.json` names the fit it scored (by
+    the fit stamp's digest), or, written before it did, its stamps chain to that fit (score on
+    recheck, recheck on the fit). Incoherent if they are another fit's or are being written."""
+    unit = fit_unit(pipeline)
+    content = _read_bytes(pipeline, SCORES)
+    if content is None:
+        raise Incoherent(f"{unit.fit_id} is not scored")
+    try:
+        scores = json.loads(content)
+    except ValueError as error:
+        raise Incoherent(f"the scores are being written: {error}") from error
+    scored = scores.get("scored")
+    if scored is not None:
+        if scored.get("fit_digest") != unit.digest:
+            raise Incoherent(f"the scores are of {scored.get('fit')}, not of {unit.fit_id} as it is now")
+    else:
+        score, recheck = _stamp(pipeline, "score"), _stamp(pipeline, "recheck")
+        if not (score.get("status") == recheck.get("status") == "ok"
+                and score.get("outputs") == [SCORES]
+                and digest_contents([(SCORES, content)]) == score.get("output_digest")
+                and (score.get("inputs") or {}).get("needs", {}).get("recheck") == recheck.get("output_digest")
+                and (recheck.get("inputs") or {}).get("needs", {}).get("fit") == unit.digest):
+            raise Incoherent(f"the scores are not those of {unit.fit_id} as it is now")
+    unit.scores, unit.scores_sha256 = scores, hashlib.sha256(content).hexdigest()
+    return unit
 
 
 @contextmanager
@@ -325,8 +408,8 @@ def holdout_judged(pipeline, params):
 def run_score(pipeline, params):
     """Score the fit's bend and its affine part against the answered hold-out set."""
     pair = pipeline.record.read(rec.PAIR)
-    transform = json.loads(pipeline.work("fit", "transform.json").read_text())
-    fit = json.loads(pipeline.work("fit", "fit.json").read_text())
+    unit = fit_unit(pipeline)          # the transform and its metadata, of one fit
+    transform, fit = unit.transform, unit.fit
     held = pipeline.record.read(rec.HOLDOUT)
     fixed_is_coarse = pair["coarse_side"] == "fixed"
     scores = {name: score(transform, held, fixed_is_coarse, fit["fine_um"], affine_only=name == "affine")
@@ -342,8 +425,12 @@ def run_score(pipeline, params):
              # was given to a picture that may be off, so they are worth judging again.
              "judge_again": [patch_id for patch_id in recheck["flagged"] if patch_id in lining_up]}
     out = pipeline.work("scores.json")
-    out.write_text(json.dumps({"bar": BAR, "scores": scores, "drift": drift}, indent=1) + "\n")
-    return ["work/scores.json"]
+    # Which fit was scored, to the byte: Store and the decision take these scores only
+    # with that fit.
+    out.write_text(json.dumps({"bar": BAR, "scores": scores, "drift": drift,
+                               "scored": {"fit": unit.fit_id, "fit_digest": unit.digest}},
+                              indent=1) + "\n")
+    return [SCORES]
 
 
 def run_blind(pipeline, params):
@@ -354,7 +441,7 @@ def run_blind(pipeline, params):
     few answers, or before the count was raised -- grows: if someone has picked in it, the
     next patches by spread are added after its items, which keep their places and picks;
     if nobody has, it is drawn again under its id. A new fit gets a new round."""
-    fit = json.loads(pipeline.work("fit", "fit.json").read_text())
+    fit = fit_unit(pipeline).fit
     candidates = [fit["fit"], fit["fit"] + fs.AFFINE]
     final = pipeline.record.read(rec.FINAL_REVIEW) if pipeline.record.exists(rec.FINAL_REVIEW) else {}
     rounds = final.get("rounds") or []
@@ -410,40 +497,72 @@ def run_blind(pipeline, params):
 
 
 def final_decided(pipeline, params):
-    return pipeline.record.exists(rec.FINAL_REVIEW) and \
-        bool(pipeline.record.read(rec.FINAL_REVIEW).get("decision"))
+    """Decided, on a round that is still complete (one grown since waits for its new items);
+    a decision from before decisions named their round, as before."""
+    if not pipeline.record.exists(rec.FINAL_REVIEW):
+        return False
+    final = pipeline.record.read(rec.FINAL_REVIEW)
+    decision = final.get("decision")
+    if not decision:
+        return False
+    return not decision.get("round") or decided_round_problem(final, decision) is None
 
 
-def run_store(pipeline, params):
-    """Put the decided fit into the record: the transform as it will be published (without
-    its bend when the decision says affine), how it was fitted, its scores, and the decision
-    it was stored under. Only the fit the decision is about: after a new fit (a redo, more
-    fit patches) the old decision is not taken for it, and the store fails until the new
-    fit is decided."""
-    decision = pipeline.record.read(rec.FINAL_REVIEW)["decision"]
-    fit = json.loads(pipeline.work("fit", "fit.json").read_text())
-    if decision["fit"] != fit["fit"]:
-        raise RuntimeError(f"the decision is about {decision['fit']}, but the fit is {fit['fit']} "
-                           f"now: judge its blind round and decide again")
-    scores = json.loads(pipeline.work("scores.json").read_text())
-    stamp = pipeline.stamp("fit") or {}
-    stored = fit | scores | {"code": stamp.get("code"),
-                             "decision": {key: decision[key] for key in ("fit", "publish")}}
-    if decision["publish"] == "nothing":
-        with pipeline.publishing("store"):
-            filelock.unlink(pipeline.record.path(rec.TRANSFORM), missing_ok=True)
-            pipeline.record.write(rec.FIT, stored)
-        return [rec.FIT]
-    transform = json.loads(pipeline.work("fit", "transform.json").read_text())
-    if decision["publish"] == "affine":
+def decided_round_problem(final, decision):
+    """Why the round a decision names is not a complete round of its fit, or None."""
+    round_ = next((round_ for round_ in final.get("rounds") or [] if round_["id"] == decision["round"]), None)
+    if round_ is None or (round_.get("candidates") or [None])[0] != decision["fit"]:
+        return f"the decision names round {decision['round']}, which is not a round of {decision['fit']}"
+    if any(item.get("choice") is None for item in round_["items"]):
+        return f"round {decision['round']} has unanswered items since the decision"
+    return None
+
+
+def published(transform, publish):
+    """The transform as a decision publishes it: without its bend for the affine."""
+    if publish == "affine":
         transform = {key: value for key, value in transform.items() if key != "deformation"}
         if transform.get("schema_version") in ("1.2.0", "1.3.0"):
             transform["schema_version"] = "1.1.0" if transform.get("fit") else "1.0.0"
-    transform["fixed_volume"] = volume_name(transform["fixed_volume"])
+    return transform | {"fixed_volume": volume_name(transform["fixed_volume"])}
+
+
+def run_store(pipeline, params):
+    """Put the decided fit into the record as one unit: the transform as it will be published
+    (without its bend when the decision says affine), how it was fitted, its scores, and the
+    decision it was stored under. Only the fit the decision is about: after a new fit (a
+    redo, more fit patches) the old decision is not taken for it, and the store fails until
+    the new fit is decided.
+
+    The fit, its transform and its scores are read as one finished fit (`reviewed_unit`): if
+    a new fit or new scores are written while they are read, the store fails rather than
+    mixing them. What it writes binds the unit: `fit.json` names the fit, the variant and the
+    digest of the transform stored with it, and it is written first, so a store that stops
+    before the transform leaves a `fit.json` that names another transform than the one
+    there, which no release takes."""
+    final = pipeline.record.read(rec.FINAL_REVIEW)
+    decision = final["decision"]
+    unit = reviewed_unit(pipeline)
+    if decision["fit"] != unit.fit_id:
+        raise RuntimeError(f"the decision is about {decision['fit']}, but the fit is {unit.fit_id} "
+                           f"now: judge its blind round and decide again")
+    if decision.get("round") and decided_round_problem(final, decision):
+        raise RuntimeError(f"{decided_round_problem(final, decision)}: decide again")
+    publish = decision["publish"]
+    content = None if publish == "nothing" else rec.dumps(published(unit.transform, publish))
+    binding = {"fit": unit.fit_id, "publish": publish, "round": decision.get("round"),
+               "transform_sha256": content and hashlib.sha256(content).hexdigest(),
+               "fit_digest": unit.digest, "scores_sha256": unit.scores_sha256}
+    stored = unit.fit | unit.scores | {"code": unit.code,
+                                       "decision": {key: decision[key] for key in ("fit", "publish")},
+                                       "stored": binding}
     with pipeline.publishing("store"):
-        pipeline.record.write(rec.TRANSFORM, transform)
         pipeline.record.write(rec.FIT, stored)
-    return [rec.TRANSFORM, rec.FIT]
+        if content is None:
+            filelock.unlink(pipeline.record.path(rec.TRANSFORM), missing_ok=True)
+        else:
+            pipeline.record.write_bytes(rec.TRANSFORM, content)
+    return [rec.FIT] if content is None else [rec.FIT, rec.TRANSFORM]
 
 
 def stages():

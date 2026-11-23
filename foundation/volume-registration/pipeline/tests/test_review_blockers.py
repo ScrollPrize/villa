@@ -556,5 +556,10 @@ def test_store_names_a_windows_volume_by_its_zarr(tmp_path):
     (work / "fit" / "transform.json").write_text(json.dumps({
         "fixed_volume": "C:\\scans\\coarse.zarr", "transformation_matrix": [[1, 0, 0, 0]] * 3}))
     pipeline = pipeline_stages.pipeline(tmp_path / "pair")
+    outputs = [pipeline_stages.FIT_TRANSFORM, pipeline_stages.FIT_META]     # as the fit's job stamps them
+    pipeline._write_stamp("fit", {"status": "ok", "outputs": outputs,
+                                  "output_digest": engine.digest_files(pipeline.directory, outputs)})
+    unit = pipeline_stages.fit_unit(pipeline)
+    (work / "scores.json").write_text(json.dumps({"scores": {}, "scored": {"fit": "f001", "fit_digest": unit.digest}}))
     pipeline_stages.run_store(pipeline, {})
     assert record.read(rec.TRANSFORM)["fixed_volume"] == "coarse.zarr"

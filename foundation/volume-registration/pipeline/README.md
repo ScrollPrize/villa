@@ -60,6 +60,21 @@ Two things behave differently from the first runs:
 | `final-review` | you | the blind picks, then the decision; publishing what misses the bar needs a reason, and is stored as an override |
 | `store` | auto | writes the decided transform and its scores into the record; after a new fit it fails until the new fit is decided |
 
+Store takes the fit, its transform and its scores as one finished fit: the fit's files must
+be the ones its job stamped, and the scores must name that fit (or, written before they
+did, rest on it through their stamps). If a new fit or new scores are written while Store
+reads them, it fails instead of mixing two fits. It writes `fit/fit.json` first, naming the
+fit, the variant and the digest of the transform it then writes beside it; a release and
+`check` take a record only when all three are its decision's, so a store that stopped
+between its writes, or has not run since the decision changed, is not released.
+
+The decision is made on the round and fit the blind page shows: the page sends both, and
+the server refuses it (409, saying to reload) unless the round is the newest, every item is
+answered, it is about the current fit, the blind stage is done, and the scores are that
+fit's. This is checked while no job can stamp a result or a redo begin, and under the lock
+the decision is written under, so a page left open across a redo cannot decide for the fit
+made since.
+
 A job that finishes starts whatever its result made ready, and so does an answer or a
 decision on the review page. So a pair moves on by itself until you are next. Jobs started
 from a `uv run --with-requirements` go back through the same uv (`UV`, which uv sets, or
@@ -134,8 +149,12 @@ hashes, and what its record does not hold (a migrated record has no code commit 
 time, for example); nothing is filled in. Undecided and superseded records are listed as
 left out. A pipeline record redone after its decision was stored is left out until its
 store has run again under the decision it now holds; while it is its pair's newest
-decision, the pair's older records are held back too. The release is written beside `OUT`
-and moved there whole, so a failed release leaves nothing. `check` runs on a release as on any records folder:
+decision, the pair's older records are held back too. Every pipeline record must also hold
+the result its decision names (the fit, the variant, the transform its `fit.json` was stored
+with), redone or not; a record stored by an older version is checked on the fit it names
+and whether its transform has a bend. The release is written beside `OUT`
+and moved there whole, so a failed release leaves nothing. `check` runs on a release as on any records folder, and checks that binding before it
+recomputes the score:
 
     uv run --python 3.12 --with-requirements requirements.txt python -m volreg.cli release OUT RECORDS [RECORDS ...]
 

@@ -8,8 +8,10 @@ from http.server import ThreadingHTTPServer
 
 import pytest
 
+from volreg import engine
 from volreg import record as rec
-from volreg.review.server import Reviews, handler_for
+from volreg import stages as pipeline_stages
+from volreg.review.server import Conflict, Reviews, handler_for
 
 REVIEWER = {"handle": "test", "email": "test@example.org"}
 
@@ -42,11 +44,36 @@ def pairs(tmp_path):
     work = tmp_path / "pair-a" / "work"
     (work / "fit").mkdir()
     (work / "fit" / "fit.json").write_text(json.dumps({"fit": "f002"}))
+    (work / "fit" / "transform.json").write_text(json.dumps({"fixed_volume": "fixed.zarr"}))
     (work / "scores.json").write_text(json.dumps(scores(1.5, 2.3)))
     record.refresh_final([{"id": "c001", "candidates": ["f002", "f002/affine"], "items": [
         {"patch": "p0001", "options": [["f002/affine"], ["f002"]], "choice": None},
         {"patch": "p0002", "options": [["f002"], ["f002/affine"]], "choice": None}]}])
     return Reviews(tmp_path, REVIEWER, auto_advance=False), record
+
+
+def stamp_as_done(directory):
+    """Stamp every automatic stage finished on what is there, as its jobs would have, with
+    the scores naming the fit they scored: what a decision rests on. The hold-out set counts
+    as judged."""
+    rec.Record(directory).write(pipeline_stages.PARAMS, {"judge-holdout": {"min_lines_up": 0}})
+    pipeline = pipeline_stages.pipeline(directory)
+    outputs = {"fit": [pipeline_stages.FIT_TRANSFORM, pipeline_stages.FIT_META],
+               "score": [pipeline_stages.SCORES], "blind": [rec.FINAL_REVIEW]}
+    for name in pipeline.order:
+        if pipeline.stages[name].human:
+            continue
+        if name == "score":
+            unit = pipeline_stages.fit_unit(pipeline)
+            (directory / pipeline_stages.SCORES).write_text(json.dumps(
+                scores(1.5, 2.3) | {"scored": {"fit": unit.fit_id, "fit_digest": unit.digest}}))
+        written = outputs.get(name) or [f"work/{name}.json"]
+        for path in written:
+            if not (directory / path).exists():
+                (directory / path).write_text("{}")
+        pipeline._write_stamp(name, {"stage": name, "status": "ok", "inputs": pipeline.inputs(name),
+                                     "outputs": written,
+                                     "output_digest": engine.digest_files(directory, written)})
 
 
 def test_holdout_answers_and_notes_go_to_the_log(pairs):
@@ -74,29 +101,34 @@ def test_the_next_unit_comes_from_the_stretch_with_fewest_lining_up(pairs):
 
 
 def test_the_blind_mapping_stays_hidden_until_every_item_is_answered(pairs):
-    reviews, _record = pairs
+    reviews, record = pairs
+    stamp_as_done(record.directory)
     state = reviews.blind("pair-a")
     assert not state["done"] and state["tally"] is None and state["scores"] is None
     assert all("revealed" not in item for item in state["round"]["items"])
     reviews.pick("pair-a", "c001", 0, 1)        # item 0, option B: the bend
-    with pytest.raises(ValueError):
-        reviews.decide("pair-a", "bend", "")    # the round is not finished
+    with pytest.raises(Conflict, match="unanswered"):
+        reviews.decide("pair-a", "bend", "", "c001", "f002")    # the round is not finished
+    assert state["fit"] is None
     reviews.pick("pair-a", "c001", 1, "unsure")
     state = reviews.blind("pair-a")
     assert state["done"] and state["tally"] == {"f002": 1, "f002/affine": 0, "unsure": 1, "none": 0}
+    assert state["fit"] == "f002"
     assert state["round"]["items"][0]["revealed"] == [["f002/affine"], ["f002"]]
 
 
 def test_publishing_what_misses_the_bar_needs_a_reason_and_is_an_override(pairs):
     reviews, record = pairs
+    stamp_as_done(record.directory)
     reviews.pick("pair-a", "c001", 0, 1)
     reviews.pick("pair-a", "c001", 1, 0)
     with pytest.raises(ValueError, match="misses the bar"):
-        reviews.decide("pair-a", "affine", "")
-    reviews.decide("pair-a", "affine", "the bend is not visible")
+        reviews.decide("pair-a", "affine", "", "c001", "f002")
+    reviews.decide("pair-a", "affine", "the bend is not visible", "c001", "f002")
     decision = record.read(rec.FINAL_REVIEW)["decision"]
     assert decision["publish"] == "affine" and decision["override"]["bar_missed"] == ["median"]
-    reviews.decide("pair-a", "bend", "")       # passes: no reason needed, no override
+    assert decision["round"] == "c001"
+    reviews.decide("pair-a", "bend", "", "c001", "f002")       # passes: no reason needed, no override
     assert record.read(rec.FINAL_REVIEW)["decision"]["override"] is None
 
 

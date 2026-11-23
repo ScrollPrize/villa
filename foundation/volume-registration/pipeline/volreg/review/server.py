@@ -28,7 +28,9 @@ migrated records, say, which have no pipeline to drive.
     POST /api/pairs/<pair>/answer             {"unit": ..., "answer": ... or null}
     POST /api/pairs/<pair>/note               {"patch": ..., "text": ...}
     POST /api/pairs/<pair>/pick               {"round": ..., "index": i, "choice": i or "unsure"/"none"}
-    POST /api/pairs/<pair>/decide             {"publish": bend|affine|nothing, "reason": ...}
+    POST /api/pairs/<pair>/decide             {"publish": bend|affine|nothing, "reason": ...,
+                                               "round": ..., "fit": ...}   (the round and fit shown;
+                                               409 if either is no longer current)
 """
 
 import argparse
@@ -59,6 +61,10 @@ SETTINGS_LOCK = pipeline_stages.SETTINGS_LOCK
 # Settings that only extend what is there: a hold-out set, fit patches or a blind round
 # already drawn stays, so a smaller number would change nothing.
 GROW_ONLY = {("holdout", "patches"), ("fit", "patches"), ("blind", "count")}
+
+
+class Conflict(ValueError):
+    """What a page asks rests on what it showed, and that is no longer current (HTTP 409)."""
 
 
 class Reviews:
@@ -242,6 +248,8 @@ class Reviews:
         scores = pipeline.work("scores.json")
         return {
             "pair": pipeline.record.read(rec.PAIR)["pair"], "done": done,
+            # The fit the round is about, once it is answered: what a decision on it is for.
+            "fit": round_["candidates"][0] if done else None,
             "round": {"id": round_["id"], "candidates": round_["candidates"] if done else None,
                       "items": [{"patch": item["patch"], "options": len(item["options"]),
                                  "choice": item["choice"]}
@@ -271,24 +279,52 @@ class Reviews:
     def pick(self, name, round_id, index, choice):
         self.record(name).blind_pick(round_id, int(index), choice, self.reviewer)
 
-    def decide(self, name, publish, reason):
-        """The decision, checked against the bar: publishing a variant that misses it is an
-        override, which needs a reason and names what it missed."""
+    def decide(self, name, publish, reason, round_id=None, fit_id=None):
+        """The decision on the round and fit the page showed (`round_id`, `fit_id`), checked
+        against the bar: publishing a variant that misses it is an override, which needs a
+        reason and names what it missed.
+
+        Conflict unless the round is the newest one, every item of it is answered, and it is
+        about the current fit, whose blind round is done (nothing it rests on is being made
+        again), with scores of that fit. All of it is checked while no job can stamp a result
+        or a redo begin (`Pipeline.steady`), and the round under the record lock the decision
+        is written under: a page left open across a redo, or an old round's id, is refused,
+        never applied to the fit there is now."""
         pipeline = self.pipeline(name)
-        final = pipeline.record.read(rec.FINAL_REVIEW)
-        rounds = final.get("rounds") or []
-        if not rounds or any(item["choice"] is None for item in rounds[-1]["items"]):
-            raise ValueError("finish the blind round first")
-        fit = json.loads(pipeline.work("fit", "fit.json").read_text())["fit"]
-        scores = json.loads(pipeline.work("scores.json").read_text())["scores"]
-        override = None
-        if publish in ("bend", "affine") and not scores[publish]["bar"]["passes"]:
-            if not (reason or "").strip():
-                raise ValueError(f"the {publish} misses the bar: give a reason to publish it anyway")
-            missed = [part for part, ok in scores[publish]["bar"]["checks"].items() if not ok]
-            override = {"by": self.reviewer, "reason": reason, "bar_missed": missed}
-        pipeline.record.decide({"fit": fit, "publish": publish, "reason": reason or "",
-                                "override": override}, self.reviewer)
+        if not round_id or not fit_id:
+            raise Conflict("the page did not say which round and fit it shows: reload it and decide again")
+        with pipeline.steady():
+            state = pipeline.states()["blind"]
+            if state != engine.DONE:
+                raise Conflict(f"the blind round is not ready (it is {state}): reload the page "
+                               f"once it is, and decide on what it shows then")
+            try:
+                unit = pipeline_stages.reviewed_unit(pipeline)
+            except pipeline_stages.Incoherent as error:
+                raise Conflict(f"{error}: reload the page once it is done") from error
+
+            def check(final):
+                rounds = final.get("rounds") or []
+                if not rounds or rounds[-1]["id"] != round_id:
+                    raise Conflict(f"the page shows round {round_id}, but the current round is "
+                                   f"{rounds[-1]['id'] if rounds else 'none'}: reload the page")
+                if any(item["choice"] is None for item in rounds[-1]["items"]):
+                    raise Conflict(f"round {round_id} has unanswered items: finish the blind round "
+                                   f"first (reload the page if you did)")
+                if fit_id != rounds[-1]["candidates"][0] or fit_id != unit.fit_id:
+                    raise Conflict(f"the page shows {fit_id}, but the current fit is {unit.fit_id}: "
+                                   f"reload the page")
+
+            scores = unit.scores["scores"]
+            override = None
+            if publish in ("bend", "affine") and not scores[publish]["bar"]["passes"]:
+                if not (reason or "").strip():
+                    check(pipeline.record.read(rec.FINAL_REVIEW))   # a stale page hears that first
+                    raise ValueError(f"the {publish} misses the bar: give a reason to publish it anyway")
+                missed = [part for part, ok in scores[publish]["bar"]["checks"].items() if not ok]
+                override = {"by": self.reviewer, "reason": reason, "bar_missed": missed}
+            pipeline.record.decide({"fit": fit_id, "publish": publish, "reason": reason or "",
+                                    "override": override, "round": round_id}, self.reviewer, check=check)
         self.advance(name)
 
     # ---------------------------------------------------------------------- pictures
@@ -454,12 +490,15 @@ def handler_for(reviews):
                     reviews.pick(name, body["round"], body["index"], body["choice"])
                     self.send_json({"ok": True})
                 elif action == "decide":
-                    reviews.decide(name, body["publish"], body.get("reason"))
+                    reviews.decide(name, body["publish"], body.get("reason"), body.get("round"),
+                                   body.get("fit"))
                     self.send_json({"ok": True})
                 else:
                     raise KeyError(action)
             except KeyError as error:
                 self.send_json({"error": f"not found: {error}"}, 404)
+            except Conflict as error:
+                self.send_json({"error": str(error)}, 409)
             except (IndexError, ValueError, StopIteration) as error:
                 self.send_json({"error": str(error)}, 400)
             except Exception as error:  # noqa: BLE001 - report it to the page
