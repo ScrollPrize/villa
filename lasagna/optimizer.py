@@ -1497,6 +1497,9 @@ def optimize(
 	def _timing_cuda_sync() -> None:
 		if torch.cuda.is_available():
 			torch.cuda.synchronize()
+		elif torch.backends.mps.is_available():
+			# MPS work is asynchronous too; without this the timing window would report only encode time
+			torch.mps.synchronize()
 
 	def _truthy(value) -> bool:
 		if isinstance(value, bool):
