@@ -84,7 +84,7 @@ class Record:
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(scratch, target)
+        filelock.replace(scratch, target)
 
     @contextmanager
     def lock(self):
@@ -99,10 +99,11 @@ class Record:
                 filelock.unlock(handle)
 
     def log(self, kind, **fields):
-        """Append one event; `at` defaults to now. Never rewrites what is there."""
-        self.directory.mkdir(parents=True, exist_ok=True)
+        """Append one event; `at` defaults to now. Never rewrites what is there. Under the
+        record lock: a Windows append seeks to the end and then writes, so two writers at
+        once could pick the same spot and one event would overwrite the other."""
         event = {"at": fields.pop("at", None) or now(), "kind": kind} | fields
-        with open(self.path(EVENTS), "a") as handle:
+        with self.lock(), open(self.path(EVENTS), "a") as handle:
             handle.write(json.dumps(event, sort_keys=False) + "\n")
             handle.flush()
             os.fsync(handle.fileno())

@@ -419,7 +419,7 @@ def run_store(pipeline, params):
     scores = json.loads(pipeline.work("scores.json").read_text())
     stamp = pipeline.stamp("fit") or {}
     if decision["publish"] == "nothing":
-        pipeline.record.path(rec.TRANSFORM).unlink(missing_ok=True)
+        filelock.unlink(pipeline.record.path(rec.TRANSFORM), missing_ok=True)
         pipeline.record.write(rec.FIT, fit | scores | {"code": stamp.get("code")})
         return [rec.FIT]
     transform = json.loads(pipeline.work("fit", "transform.json").read_text())

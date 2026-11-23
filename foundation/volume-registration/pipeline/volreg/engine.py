@@ -29,15 +29,21 @@ import json
 import os
 import subprocess
 import sys
+import time
 import traceback
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
+from . import filelock
 from . import record as rec
 
 DONE, STALE, RUNNING, FAILED, READY, WAITING, BLOCKED = (
     "done", "stale", "running", "failed", "ready", "waiting", "blocked")
+
+# A lock file with no pid in it yet is a job caught between creating it and writing to it.
+LOCK_WRITE_SECONDS = 5
 
 
 @dataclass
@@ -118,7 +124,7 @@ class Pipeline:
         path.parent.mkdir(parents=True, exist_ok=True)
         scratch = path.with_name(path.name + ".tmp")
         scratch.write_text(json.dumps(stamp, indent=1) + "\n")
-        os.replace(scratch, path)
+        filelock.replace(scratch, path)
 
     def lock_path(self, name):
         return self.work("stages", f"{name}.lock")
@@ -144,14 +150,25 @@ class Pipeline:
                 "params": digest_json(self.stage_params(name))}
 
     def running(self, name):
+        """Whether a job holds the stage's lock and is alive. The lock names the job's pid
+        (on Windows also what tells it from a later process with the same pid); nothing is
+        signalled."""
         lock = self.lock_path(name)
-        if not lock.exists():
-            return False
         try:
-            os.kill(int(lock.read_text().split()[0]), 0)
-            return True
-        except (ValueError, ProcessLookupError, PermissionError, IndexError):
+            text = lock.read_text()
+            age = time.time() - lock.stat().st_mtime
+        except FileNotFoundError:
             return False
+        parts = text.split()
+        if not parts:
+            # Just created, its owner still writing its pid in; a crash there goes stale.
+            return age < LOCK_WRITE_SECONDS
+        try:
+            pid = int(parts[0])
+            token = int(parts[1]) if len(parts) > 1 else None
+        except (ValueError, OverflowError):
+            return False
+        return filelock.pid_alive(pid, token)
 
     def state(self, name, _memo=None):
         memo = {} if _memo is None else _memo
@@ -192,14 +209,19 @@ class Pipeline:
         lock = self.lock_path(name)
         lock.parent.mkdir(parents=True, exist_ok=True)
         try:
-            descriptor = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            self._create_lock(lock)
         except FileExistsError:
-            if self.running(name):
-                raise RuntimeError(f"{name} is already running")
-            lock.unlink()
-            descriptor = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        os.write(descriptor, f"{os.getpid()}\n".encode())
-        os.close(descriptor)
+            # A job's lock, live or left behind by one that died. Only one process at a time
+            # may judge it, and it is removed only if still dead once it is that one's turn;
+            # a worker that took the stage in the meantime is left alone.
+            with self._stage_guard(name):
+                if self.running(name):
+                    raise RuntimeError(f"{name} is already running")
+                filelock.unlink(lock, missing_ok=True)
+                try:
+                    self._create_lock(lock)
+                except FileExistsError:
+                    raise RuntimeError(f"{name} is already running") from None
         inputs, params = self.inputs(name), self.stage_params(name)
         stamp = {"stage": name, "inputs": inputs, "params": params, "code": code_version(),
                  "started": rec.now()}
@@ -215,9 +237,43 @@ class Pipeline:
                       "traceback": traceback.format_exc()}
             self.record.log("job-failed", stage=name, error=stamp["error"])
         finally:
-            self._write_stamp(name, stamp)
-            lock.unlink(missing_ok=True)
+            try:
+                self._write_stamp(name, stamp)
+            finally:
+                filelock.unlink(lock, missing_ok=True)
         return stamp
+
+    @staticmethod
+    def _create_lock(lock):
+        """Create the lock file, or raise FileExistsError, with this process's pid in it."""
+        token = filelock.process_token()
+        owner = f"{os.getpid()}\n" if token is None else f"{os.getpid()} {token}\n"
+        descriptor = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(descriptor, owner.encode())
+        os.close(descriptor)
+
+    @contextmanager
+    def _stage_guard(self, name):
+        """Held while a stage's left-over lock is judged and replaced."""
+        with open(self.work("stages", f"{name}.recover"), "w") as handle:
+            filelock.lock_exclusive(handle)
+            try:
+                yield
+            finally:
+                filelock.unlock(handle)
+
+    @contextmanager
+    def _launch_guard(self):
+        """Held while jobs are chosen and started, and while a redo clears stamps, so a job is
+        never started on the half of a redo that is done."""
+        path = self.work("stages", "launch.guard")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w") as handle:
+            filelock.lock_exclusive(handle)
+            try:
+                yield
+            finally:
+                filelock.unlock(handle)
 
     def start(self, name, command):
         """Start a stage as a background job: `command` (a list) is run with its output going
@@ -234,11 +290,12 @@ class Pipeline:
     def advance(self, launch):
         """Start every ready or stale automatic stage; `launch(name)` starts one. Returns the
         states before, and the stages started."""
-        states = self.states()
-        started = [name for name in self.order
-                   if states[name] in (READY, STALE) and not self.stages[name].human]
-        for name in started:
-            launch(name)
+        with self._launch_guard():
+            states = self.states()
+            started = [name for name in self.order
+                       if states[name] in (READY, STALE) and not self.stages[name].human]
+            for name in started:
+                launch(name)
         return states, started
 
     def adopt_needs(self, name, reason):
@@ -267,14 +324,28 @@ class Pipeline:
 
     def redo(self, name):
         """Make a stage and everything after it that depends on it run again. Its stamp is
-        kept beside, so what it was is not lost."""
+        kept beside, so what it was is not lost. All or nothing: if a stamp cannot be moved
+        (a reader has it open for longer than a replace waits), those already moved go back,
+        and the error is raised."""
         affected = self.downstream(name)
-        for stage in affected:
-            stamp = self.stamp_path(stage)
-            if stamp.exists():
-                history = self.work("stages", "history")
-                history.mkdir(parents=True, exist_ok=True)
-                os.replace(stamp, history / f"{stage}.{rec.now().replace(':', '')}.json")
+        history = self.work("stages", "history")
+        moved = []
+        with self._launch_guard():
+            try:
+                for stage in affected:
+                    stamp = self.stamp_path(stage)
+                    if stamp.exists():
+                        history.mkdir(parents=True, exist_ok=True)
+                        kept = history / f"{stage}.{rec.now().replace(':', '')}.json"
+                        filelock.replace(stamp, kept)
+                        moved.append((stamp, kept))
+            except BaseException:
+                for stamp, kept in reversed(moved):
+                    try:
+                        filelock.replace(kept, stamp)
+                    except OSError:
+                        pass   # put back what can be; the error that matters is the first
+                raise
         self.record.log("redo", stage=name, affected=affected)
         return affected
 

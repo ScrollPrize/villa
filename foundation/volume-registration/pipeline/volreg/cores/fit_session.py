@@ -30,7 +30,6 @@ moving -> fixed -- so a session file reads like a transform file.
 
 import argparse
 import json
-import os
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -39,6 +38,7 @@ from typing import NamedTuple
 
 import numpy as np
 
+from .. import filelock
 from . import dense_correlation as dense
 from . import session_overview
 from .deformable import (
@@ -325,7 +325,7 @@ class Session:
         scratch = target.with_suffix(".json.tmp")
         with open(scratch, "w") as handle:
             json.dump(self.state, handle, indent=1)
-        os.replace(scratch, target)
+        filelock.replace(scratch, target)
         self._as_read = (self._stamp(), json.loads(json.dumps(person_fields(self.state))))
 
     # -------------------------------------------------------------------- the volumes
