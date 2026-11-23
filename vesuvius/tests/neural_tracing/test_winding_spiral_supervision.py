@@ -149,7 +149,8 @@ def run(tmp_path, monkeypatch):
             "--reference-zarr", str(tmp_path / "volume.zarr"),
             "--model-ckpt", str(model_path),
             "--seed-rays-npz", str(seeds_path),
-            "--gpus", gpus, "--batch-size", "4", "--extract-threads", "1",
+            *(["--gpus", gpus] if gpus else []),
+            "--batch-size", "4", "--extract-threads", "1",
             *mode_args,
         ]
         with mock.patch.object(sys, "argv", argv), \
@@ -264,5 +265,85 @@ def test_direct_mode_rejects_reconstruction_options(extra):
     argv = ["infer_winding_volume.py", "fit.ckpt", "out", "--reference-zarr",
             "volume.zarr", "--model-ckpt", "model.pth",
             "--spiral-supervision-only", *extra]
+    with mock.patch.object(sys, "argv", argv), pytest.raises(SystemExit):
+        iwv.parse_args()
+
+
+def test_cpu_device_writes_the_same_store_as_cuda_workers(run, tmp_path):
+    """``--device cpu`` (or mps) runs one worker over every ray; the store
+    matches the one two CUDA worker slots write."""
+    run(tmp_path / "cuda", "--spiral-supervision-only")
+    run(tmp_path / "cpu", "--spiral-supervision-only", "--device", "cpu",
+        gpus=None)
+    _, cuda_arrays = _store_arrays(tmp_path / "cuda")
+    _, cpu_arrays = _store_arrays(tmp_path / "cpu")
+    for key in ARRAYS:
+        np.testing.assert_array_equal(cpu_arrays[key], cuda_arrays[key])
+
+
+def test_worker_device_follows_the_device_option():
+    def args(device):
+        return types.SimpleNamespace(device=device)
+
+    assert iwv._worker_device(args("cuda"), 3) == torch.device("cuda:3")
+    assert iwv._worker_device(args("mps"), 0) == torch.device("mps")
+    assert iwv._worker_device(args("cpu"), 0) == torch.device("cpu")
+
+
+def test_forward_runs_fp32_off_cuda():
+    """Off CUDA the model runs without autocast. (Before --device existed
+    the forward always entered CUDA autocast, which did nothing for a CPU
+    or MPS model; bf16 on MPS moves decoded crossings, so it stays off.)"""
+    seen = []
+
+    class Model:
+        def __call__(self, images, valid):
+            seen.append(torch.is_autocast_enabled("cpu"))
+            return {"phase": images.float()}
+
+    batch = [(0, np.zeros((4, 4, 8), np.float32), np.ones((4, 4, 8), bool),
+              None)]
+    _, phases, _ = iwv._forward_batch(batch, Model(), torch.device("cpu"))
+    assert seen == [False]
+    assert phases.shape == (1, 4, 4, 8)
+
+
+def test_forward_keeps_bf16_autocast_on_cuda(monkeypatch):
+    calls = []
+
+    class Autocast:
+        def __init__(self, device_type, dtype=None, enabled=True):
+            calls.append((device_type, dtype, enabled))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    class FakeCuda:
+        type = "cuda"
+
+    monkeypatch.setattr(torch, "autocast", Autocast)
+    monkeypatch.setattr(torch.Tensor, "to", lambda self, *a, **k: self)
+
+    class Model:
+        def __call__(self, images, valid):
+            return {"phase": images.float()}
+
+    batch = [(0, np.zeros((4, 4, 8), np.float32), np.ones((4, 4, 8), bool),
+              None)]
+    iwv._forward_batch(batch, Model(), FakeCuda())
+    assert calls == [("cuda", torch.bfloat16, True)]
+
+
+@pytest.mark.parametrize("extra", [
+    ["--device", "mps", "--gpus", "0"],
+    ["--device", "cpu", "--gpus", "0,1"],
+    ["--device", "mps", "--prob-volume"],
+])
+def test_device_option_rejects_cuda_only_settings(extra):
+    argv = ["infer_winding_volume.py", "fit.ckpt", "out", "--reference-zarr",
+            "volume.zarr", "--model-ckpt", "model.pth", *extra]
     with mock.patch.object(sys, "argv", argv), pytest.raises(SystemExit):
         iwv.parse_args()
