@@ -4,10 +4,13 @@
 // the sign problem the same way the reference stage does, runs one of the CPU
 // backends and writes a JSON summary. Optionally writes the per-fiber signs
 // and the prepared events, so another solver's result can be compared against
-// the same inputs.
+// the same inputs. With `support_output` it instead reports the sign support
+// of given signs (FiberSignSupport.hpp) and solves nothing.
 #include "vc/fiber_tracer/FiberNormalSign.hpp"
+#include "vc/fiber_tracer/FiberSignSupport.hpp"
 
 #include <vc_object_store/objects/FiberConstraintGraph.hpp>
+#include <vc_object_store/objects/FiberGraphSolveExtension.hpp>
 #include <vc_object_store/objects/ObjectCollection.hpp>
 
 #include <nlohmann/json.hpp>
@@ -18,6 +21,9 @@
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <optional>
+#include <string_view>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -121,9 +127,175 @@ Json metricsJson(const FiberSignMetrics& metrics)
                 {"strict_retained_disagreement_percent", metrics.strictRetainedDisagreementPercent}};
 }
 
+// The crossings the sign solve uses: perpendicular, with a valid normal on both
+// sides (the reference stage's selection). Counts the perpendicular ones.
+std::vector<std::size_t> signEventRows(const vc::objects::FiberGraphColumns& columns, std::size_t& perpendicular)
+{
+    std::vector<std::size_t> rows;
+    perpendicular = 0;
+    for (std::size_t e = 0; e < columns.events; ++e) {
+        if (columns.parallel[e] != 0) continue;
+        ++perpendicular;
+        if (columns.validA[e] != 0 && columns.validB[e] != 0) rows.push_back(e);
+    }
+    return rows;
+}
+
+double eventDot(const vc::objects::FiberGraphColumns& columns, const std::size_t e)
+{
+    const auto& a = columns.normalA[e];
+    const auto& b = columns.normalB[e];
+    return std::clamp(a[0] * b[0] + a[1] * b[1] + a[2] * b[2], -1.0, 1.0);
+}
+
+// Sign support of the store's normal-sign run (`sign_run` selects one when
+// there are several) over the sign solve's crossings that agree with its
+// signs, weighted as the solve weights them (same config keys). Writes `support_output` (VCSUPP1:
+// magic, u64 fibers, then per fiber a 16-byte uuid, u64 n and n samples of
+// arc, missed length, missed crossing cost and local cut (fiberSignCut) as
+// doubles) and its JSON summary next to it.
+int runSupport(const Json& cfg)
+{
+    const auto started = Clock::now();
+    vc::objects::OpenOptions storeOptions;
+    storeOptions.readOnly = true;
+    auto store = vc::objects::ObjectCollection::open(cfg.at("database").get<std::string>(), storeOptions);
+    const auto txn = store.read();
+    const auto columns = vc::objects::readFiberGraphColumns(store, txn, cfg.value("workers", std::size_t{32}));
+
+    // Signs of the store's sign-stage run (or `sign_run`), read natively from its fiber result table.
+    const std::string signRun = vc::objects::selectFiberGraphRun(store, txn, "normal_sign",
+        cfg.contains("sign_run") ? std::optional<std::string>(cfg.at("sign_run").get<std::string>()) : std::nullopt);
+    const auto results = vc::objects::readFiberGraphResultColumns(store, txn, signRun);
+    constexpr std::size_t signColumn = 2;
+    static_assert(std::string_view(vc::objects::FiberGraphResultColumns::names[signColumn]) == "normal_sign");
+    std::map<vc::objects::FiberGraphUuid, int> lookup;
+    for (std::size_t r = 0; r < results.fiberUuids.size(); ++r)
+        if (results.valid[r][signColumn] != 0) lookup[results.fiberUuids[r]] = int(results.integers[r][signColumn]);
+    std::vector<int> sign(columns.nodes, 0);
+    std::vector<double> lengths(columns.lengths.get(), columns.lengths.get() + columns.nodes);
+    for (std::size_t v = 0; v < columns.nodes; ++v) {
+        const auto found = lookup.find(columns.fiberUuids[v]);
+        if (found != lookup.end()) sign[v] = found->second;
+    }
+
+    // The sign solve's crossings and weights; those disagreeing with the signs are detected flips.
+    const FiberSignOptions options = optionsFrom(cfg);
+    std::size_t perpendicular = 0;
+    std::vector<FiberSupportCrossing> crossings, disagreeingCrossings;
+    std::int64_t used = 0, disagreeing = 0, weak = 0;
+    const double minWeight = cfg.value("support_min_weight", 0.1);
+    if (!(minWeight > 0.0)) throw std::invalid_argument("support_min_weight must be positive");
+    for (const std::size_t e : signEventRows(columns, perpendicular)) {
+        const auto a = columns.endpoints[e][0], b = columns.endpoints[e][1];
+        if (a == b || sign[a] == 0 || sign[b] == 0) continue;
+        const double dot = eventDot(columns, e);
+        const double weight = fiberSignEventWeight(dot, columns.distance[e], options);
+        // Weak crossings (perpendicular or far-apart axes) support nothing: 1 / weight would explode.
+        if (!(weight >= minWeight)) {
+            ++weak;
+            continue;
+        }
+        ++used;
+        const FiberSupportCrossing crossing{a, b, columns.arcs[e][0], columns.arcs[e][1], weight};
+        if (dot * sign[a] * sign[b] < 0.0) {
+            ++disagreeing;
+            disagreeingCrossings.push_back(crossing);
+            continue;
+        }
+        crossings.push_back(crossing);
+    }
+    const double spacing = cfg.value("support_spacing", 64.0);
+    const FiberSupportResult result = fiberSignSupport(lengths, crossings, spacing);
+    FiberCutOptions cutOptions;
+    cutOptions.cap = cfg.value("support_cut_cap", cutOptions.cap);
+    cutOptions.maxHops = cfg.value("support_cut_hops", cutOptions.maxHops);
+    cutOptions.maxFibers = cfg.value("support_cut_fibers", cutOptions.maxFibers);
+    cutOptions.chainWeightLength = cfg.value("support_cut_chain_length", cutOptions.chainWeightLength);
+    const auto cutStarted = Clock::now();
+    const FiberCutResult cut = fiberSignCut(lengths, crossings, spacing, cutOptions);
+    const double cutSeconds = seconds(cutStarted);
+
+    const std::string output = cfg.at("support_output").get<std::string>();
+    std::ofstream file(output, std::ios::binary);
+    if (!file) throw std::runtime_error("cannot write " + output);
+    const char magic[8] = {'V', 'C', 'S', 'U', 'P', 'P', '1', 0};
+    file.write(magic, sizeof magic);
+    const std::uint64_t fibers = columns.nodes;
+    file.write(reinterpret_cast<const char*>(&fibers), sizeof fibers);
+    std::vector<double> buffer;
+    double linked = 0.0, total = 0.0;
+    for (std::size_t v = 0; v < columns.nodes; ++v) {
+        const auto& points = result.points[v];
+        file.write(reinterpret_cast<const char*>(columns.fiberUuids[v].data()), 16);
+        const std::uint64_t n = points.size();
+        file.write(reinterpret_cast<const char*>(&n), sizeof n);
+        buffer.clear();
+        for (std::size_t k = 0; k < points.size(); ++k) {
+            const auto& p = points[k];
+            buffer.insert(buffer.end(), {p.arc, p.missedLength, p.missedCrossingCost, cut.points[v][k].cut});
+            total += 1.0;
+            if (std::isfinite(p.missedLength)) linked += 1.0;
+        }
+        file.write(reinterpret_cast<const char*>(buffer.data()), std::streamsize(buffer.size() * sizeof(double)));
+    }
+    if (!file) throw std::runtime_error("write failed " + output);
+
+    Json summary{{"store", store.uuid(txn)},
+                       {"sign_run", signRun},
+                       {"fibers", columns.nodes},
+                       {"signed_fibers", std::count_if(sign.begin(), sign.end(), [](int s) { return s != 0; })},
+                       {"crossings", used},
+                       {"min_weight", minWeight},
+                       {"weak_dropped", weak},
+                       {"disagreeing_dropped", disagreeing},
+                       {"crossing_ends", 2 * crossings.size()},
+                       {"chain_edges", result.chainEdges},
+                       {"bridge_chain_edges", result.bridgeChainEdges},
+                       {"bridge_crossings", result.bridgeCrossings},
+                       {"two_edge_connected_components", result.components},
+                       {"core_ends", result.coreEnds},
+                       {"unlinked_ends", result.unlinkedEnds},
+                       {"spacing", spacing},
+                       {"cut", Json{{"cap", cutOptions.cap}, {"hops", cutOptions.maxHops},
+                                    {"fibers", cutOptions.maxFibers}, {"chain_length", cutOptions.chainWeightLength},
+                                    {"segments", cut.segments}, {"seconds", cutSeconds}}},
+                       {"samples", total},
+                       {"linked_sample_percent", 100.0 * linked / std::max(total, 1.0)},
+                       {"seconds", seconds(started)}};
+    // lambda and q from the core's detectable flips (FiberSignSupport.hpp).
+    const auto calibration = fiberSignCalibration(lengths, crossings, disagreeingCrossings,
+                                                  cfg.value("calibration_min_bin_flips", std::int64_t{30}));
+    const auto binsJson = [](const std::vector<FiberCalibrationBin>& bins, const char* exposure) {
+        Json out = Json::array();
+        for (const auto& b : bins)
+            out.push_back(Json{{"lo", b.lo}, {"hi", std::isfinite(b.hi) ? Json(b.hi) : Json(nullptr)},
+                               {"count", b.count}, {"flips", b.events}, {exposure, b.exposure},
+                               {"rate", b.exposure > 0.0 ? Json(double(b.events) / b.exposure) : Json(nullptr)}});
+        return out;
+    };
+    summary["calibration"] = Json{{"lambda_per_voxel", calibration.lambda},
+                                  {"q_per_unit_weight", calibration.q},
+                                  {"lambda_bound_per_voxel", calibration.lambdaBound},
+                                  {"q_bound_per_unit_weight", calibration.qBound},
+                                  {"core_crossings", calibration.coreCrossings},
+                                  {"core_disagreeing", calibration.coreDisagreeing},
+                                  {"chain_flips", calibration.chainSwitches},
+                                  {"wrong_crossings", calibration.wrongCrossings},
+                                  {"core_chain_length_voxels", calibration.coreChainLength},
+                                  {"core_inverse_weight", calibration.coreInverseWeight},
+                                  {"by_chain_gap_voxels", binsJson(calibration.gapBins, "chain_voxels")},
+                                  {"by_crossing_weight", binsJson(calibration.weightBins, "inverse_weight")}};
+    summary["seconds"] = seconds(started);
+    writeJson(output + ".json", summary);
+    std::cout << summary.dump() << '\n';
+    return 0;
+}
+
 int run(const std::string& configPath)
 {
     const Json cfg = readJson(configPath);
+    if (cfg.contains("support_output")) return runSupport(cfg);
     const FiberSignOptions options = optionsFrom(cfg);
     const auto readStarted = Clock::now();
 
@@ -149,19 +321,15 @@ int run(const std::string& configPath)
 
     // Perpendicular crossings with a valid normal on both sides, exactly the
     // reference stage's selection.
-    std::vector<FiberSignEvent> events;
-    events.reserve(columns.events);
     std::size_t perpendicular = 0;
-    for (std::size_t e = 0; e < columns.events; ++e) {
-        if (columns.parallel[e] != 0) continue;
-        ++perpendicular;
-        if (columns.validA[e] == 0 || columns.validB[e] == 0) continue;
-        const auto& a = columns.normalA[e];
-        const auto& b = columns.normalB[e];
+    const auto rows = signEventRows(columns, perpendicular);
+    std::vector<FiberSignEvent> events;
+    events.reserve(rows.size());
+    for (const std::size_t e : rows) {
         FiberSignEvent event;
         event.a = columns.endpoints[e][0];
         event.b = columns.endpoints[e][1];
-        event.dot = std::clamp(a[0] * b[0] + a[1] * b[1] + a[2] * b[2], -1.0, 1.0);
+        event.dot = eventDot(columns, e);
         event.windingDistance = columns.distance[e];
         events.push_back(event);
     }
