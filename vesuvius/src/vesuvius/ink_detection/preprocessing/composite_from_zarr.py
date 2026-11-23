@@ -470,23 +470,23 @@ def _write_projection(job: DatasetJob) -> None:
 
     shared_root = None
     shared_array = None
-    if job.parallelism == "threads":
-        shared_root, shared_array = _open_array(job.zarr_path, job.array_key)
-        _set_worker_config(worker_config, shared_array=shared_array)
-        executor_cls = ThreadPoolExecutor
-        executor_kwargs = {"max_workers": job.workers}
-    else:
-        _set_worker_config(worker_config, shared_array=None)
-        executor_cls = ProcessPoolExecutor
-        executor_kwargs = {
-            "max_workers": job.workers,
-            "initializer": _set_worker_config,
-            "initargs": (worker_config,),
-        }
-
-    max_in_flight = max(1, job.workers * 2)
     staged_output = create_staged_output(job.output_path)
     try:
+        if job.parallelism == "threads":
+            shared_root, shared_array = _open_array(job.zarr_path, job.array_key)
+            _set_worker_config(worker_config, shared_array=shared_array)
+            executor_cls = ThreadPoolExecutor
+            executor_kwargs = {"max_workers": job.workers}
+        else:
+            _set_worker_config(worker_config, shared_array=None)
+            executor_cls = ProcessPoolExecutor
+            executor_kwargs = {
+                "max_workers": job.workers,
+                "initializer": _set_worker_config,
+                "initargs": (worker_config,),
+            }
+
+        max_in_flight = max(1, job.workers * 2)
         with executor_cls(**executor_kwargs) as executor:
             with closing(
                 _iter_projected_tiles(
