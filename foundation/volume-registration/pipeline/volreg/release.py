@@ -139,8 +139,9 @@ def stored_mismatch(record, decision, legacy_too=True):
     the decision's, the scores it holds must be that fit's, and the transform there must be
     the one named: a store that stopped between its writes, or has not run since the decision
     changed, fails here. A record stored before stores bound their files is checked, if
-    `legacy_too`, on what it holds: the fit it names, and that an affine decision has a
-    transform without a bend. `record` is a Record or a Snapshot."""
+    `legacy_too`, on what it holds: the fit it names, that an affine decision has a
+    transform without a bend, and that a bend decision has one with a bend if the fit it
+    names had one. `record` is a Record or a Snapshot."""
     if not record.exists(rec.FIT):
         return "nothing is stored for its decision yet; store it" if legacy_too else None
     stored = record.read(rec.FIT)
@@ -167,8 +168,12 @@ def stored_mismatch(record, decision, legacy_too=True):
         return f"it stores {stored['fit']}, but its decision is about {fit}; store it again"
     if publish in ("bend", "affine") and content is None:
         return "it stores no transform; store it again"
-    if publish == "affine" and json.loads(content).get("deformation") is not None:
+    bent = content is not None and json.loads(content).get("deformation") is not None
+    if publish == "affine" and bent:
         return "it stores the bend, but its decision is the affine; store it again"
+    if publish == "bend" and stored.get("bend") and not bent:
+        # The fit has a bend (its metadata says so), and what is stored is without it.
+        return "it stores the affine, but its decision is the bend; store it again"
     return None
 
 
