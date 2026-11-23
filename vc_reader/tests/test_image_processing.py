@@ -44,9 +44,20 @@ def _torch_tensor_reference(image, sigma, rho):
     return smooth(torch.cat([gradients[a] * gradients[b] for a in range(dim) for b in range(a, dim)], dim=1), rho)
 
 
+@pytest.fixture
+def exact_reference():
+    """On recent NVIDIA GPUs, PyTorch rounds cuDNN convolutions with TF32 by default,
+    so the reference and its backward pass would be less precise than the native code."""
+    torch = pytest.importorskip("torch")
+    allow_tf32 = torch.backends.cudnn.allow_tf32
+    torch.backends.cudnn.allow_tf32 = False
+    yield
+    torch.backends.cudnn.allow_tf32 = allow_tf32
+
+
 @pytest.mark.parametrize("dim", [2, 3])
 @pytest.mark.parametrize("sigma,rho", [(0, 0), (.8, 1.1)])
-def test_structure_tensor_values_and_backward(dim, sigma, rho):
+def test_structure_tensor_values_and_backward(dim, sigma, rho, exact_reference):
     torch = pytest.importorskip("torch")
     from vc_reader.torch import structure_tensor
     for device in _backends():
@@ -217,7 +228,7 @@ def test_transform_points_normalizes_vectors():
     np.testing.assert_array_equal(result[1], 0)
 
 
-def test_real_scroll_structure_and_normalization():
+def test_real_scroll_structure_and_normalization(exact_reference):
     from pathlib import Path
     torch = pytest.importorskip("torch")
     from vc_reader.torch import structure_tensor
