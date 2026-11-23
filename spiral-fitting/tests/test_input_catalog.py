@@ -14,6 +14,9 @@ def test_catalog_covers_every_fit_input_path_field():
         # locations.
         "volume_uuid", "provenance", "scroll_zarr", "checkpoint",
         "output_directory", "cache_directory",
+        # Stores the winding-solve reader opens (fiber_solve_inputs), like
+        # the object store: not files the catalog validates.
+        "winding_solve_fibers", "winding_solve_run_store", "winding_solve_run_uuid",
     }
     assert keys == input_fields
     # The command-line manifest names every one of them.

@@ -161,7 +161,8 @@ by path; nothing is discovered in a dataset directory and no filename is
 inferred. Relative paths resolve against the manifest's own directory, so a
 fit runs the same from any working directory; files may have any names and
 live anywhere. Geometry (patches, tracks and the outer shell)
-is read from `--object-store` only and has no manifest entry. A service
+is read from `--object-store` only and has no manifest entry; fibers come
+with the winding solve that labels them (`winding_solve`). A service
 session takes the scroll's facts and inputs from the VC3D project and its own
 launch bindings instead; see
 [The VC3D project's inputs](#the-vc3d-projects-inputs). This is not covered
@@ -186,6 +187,11 @@ the fitter's checkpoint input-manifest checks still apply when fitting resumes.
     "spiral_outward_sense": "CW"
   },
   "umbilicus": {"path": "umbilicus.json", "coordinate_scale": 1},
+  "winding_solve": {
+    "fibers": "winding/full-union/union-fibers.vcobj",
+    "run_store": "winding/runs/B-union-fixed.vcobj",
+    "run_uuid": "74720635-b9a0-4e93-9e18-1031b50c56cc"
+  },
   "lasagna": {
     "manifest": "lasagna/predictions.lasagna.json",
     "original_url": "https://example.org/predictions.lasagna.json"
@@ -205,6 +211,9 @@ Required:
 - `scroll` — the scroll's physical facts (below).
 - `umbilicus` — `path` to its control-point JSON, and optionally
   `coordinate_scale` (its coordinates per fit-volume voxel, default 1).
+- `winding_solve` — the fiber winding solve (see "Fiber winding solve"):
+  `fibers`, the fiber store; `run_store`, the store holding the solve's
+  results; `run_uuid`, the winding run in it.
 
 Optional, but required when the configuration's losses read them (checked,
 all at once, before the fit starts):
@@ -311,9 +320,10 @@ Migrating a dataset directory: write a manifest beside it naming its
 `vc_object_store` database (`object_store_inputs.py`), opened read-only: the
 fit writes nothing to the store and reads no relationship between objects. It
 never reads patch directories or track databases. Point collections and
-fibers in the store are not read. The other inputs (umbilicus,
-lasagna normal/gradient stores, fiber directions, winding inference) are
-named by the input manifest (`--inputs`; see "Input manifest").
+fibers in this store (`--object-store`) are not read; the fit's fibers come
+from the winding solve's own fiber store. The other inputs (umbilicus, the fiber
+winding solve, lasagna normal/gradient stores, fiber directions, winding
+inference) are named by the input manifest (`--inputs`; see "Input manifest").
 
 ### One-time dataset ingest
 
@@ -419,6 +429,37 @@ its geometry revision and a hash of the metadata the adapter reads
 (`metadata_sha256`: its frame, erosion and track family). The manifest keeps
 each object's numbered `version`, outside the digest, to read the inputs
 back exactly.
+
+### Fiber winding solve
+
+The fit's fibers are those of one fiber winding solve (`vesuvius.wgraph
+winding`), named by the input manifest's `winding_solve` block and read by
+`fiber_solve_inputs.py`; no other fibers are read. The run store's lineage
+must include the fiber store: the fibers are read at the position the run
+consumed, in the reference volume's voxels the store maps their declared
+frames to. Fibers without a row in the run (wgraph leaves out broken ones) or
+with a disabled row (`enabled = 0`) are dropped and counted; every other row
+must be an enabled H (family 0) or V (family 1) fiber with a winding and a
+component.
+
+The run's `selected_winding` W is the winding at a fiber's first vertex.
+Each vertex gets the continuous winding `w = W + turns + φ`, the unwrapped
+angle around the manifest's umbilicus past the seam (the half-plane towards
+−y), as `vc_object_store`'s `WindingSeam` defines it. The handedness is the
+scroll's: −1 for `ACW`, +1 for `CW`; the run must record the same value in
+its settings, or the solve is refused. A non-finite vertex, a vertex on the
+axis or a step of more than 0.4 turns between consecutive vertices refuses it
+too. `w` is computed on whole fibers; then only the vertices inside the z
+window (widened by `patch_loss_z_margin`) are kept, as pieces of consecutive
+vertices, thinned along each piece to `fiber_min_point_spacing`.
+
+Once the model exists, `c`, the offset between the seam and Spiral's θ = 0
+under the step-0 transform, is the circular median of `φ − θ₀/2π` over the
+kept points, and `w_s = w − c`. A spread whose 99th percentile exceeds 0.05
+turns (a wrong handedness or fiber scale) refuses the solve. The log reports
+the counts (fibers, dropped fibers, components, the largest one, kept fibers,
+pieces and points), the largest step of `w` and `c`. No loss reads the fibers
+yet.
 
 ### Frames and units
 

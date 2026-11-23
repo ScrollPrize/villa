@@ -21,6 +21,7 @@ import os
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 from urllib.parse import urlsplit
+import uuid
 import zipfile
 
 from config import Config
@@ -482,6 +483,12 @@ class SpiralInputPaths:
 
     volume_uuid: str = ""
     umbilicus: str = ""
+    # The fiber winding solve (fiber_solve_inputs): the fiber store, the
+    # store holding the solve's results, and the winding run in it. A
+    # command-line fit always names one.
+    winding_solve_fibers: str = ""
+    winding_solve_run_store: str = ""
+    winding_solve_run_uuid: str = ""
     fiber_directions: str = ""
     lasagna: str = ""
     winding_inference: str = ""
@@ -492,7 +499,7 @@ class SpiralInputPaths:
     provenance: Mapping[str, Any] = field(default_factory=dict)
 
     # Fields that are not host paths.
-    _RECORD_FIELDS = ("volume_uuid", "provenance")
+    _RECORD_FIELDS = ("volume_uuid", "winding_solve_run_uuid", "provenance")
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "SpiralInputPaths":
@@ -504,6 +511,7 @@ class SpiralInputPaths:
                   for name in cls.__dataclass_fields__
                   if name not in cls._RECORD_FIELDS}
         return cls(volume_uuid=str(value.get("volume_uuid") or ""),
+                   winding_solve_run_uuid=str(value.get("winding_solve_run_uuid") or ""),
                    provenance=dict(value.get("provenance") or {}), **fields)
 
     def manifest(self) -> dict[str, Any]:
@@ -795,12 +803,15 @@ def resolve_lasagna_scale(spec: ScrollSpec, source: LasagnaSource) -> ScrollSpec
     return replace(spec, lasagna_scale=derived)
 
 
-# The input manifest's top-level keys. Geometry (patches, point collections,
-# fibers, tracks and the outer shell) is the object store's alone: it has no
-# entry here.
+# The input manifest's top-level keys. Patches, tracks and the outer shell
+# are the object store's alone: they have no entry here. Fibers come with the
+# winding solve that labels them (winding_solve).
 INPUT_MANIFEST_KEYS = ("schema_version", "volume_uuid", "scroll", "umbilicus",
-                       "lasagna", "fiber_directions", "winding_inference",
-                       "scroll_zarr")
+                       "winding_solve", "lasagna", "fiber_directions",
+                       "winding_inference", "scroll_zarr")
+# The winding_solve block: the fiber store, the store holding the solve's
+# results, and the winding run in it.
+WINDING_SOLVE_KEYS = ("fibers", "run_store", "run_uuid")
 # Keys a manifest may carry by mistake, with what to do instead: a former
 # spiral-scroll.json's, and geometry the object store holds.
 _MISPLACED_MANIFEST_KEYS = {
@@ -810,8 +821,9 @@ _MISPLACED_MANIFEST_KEYS = {
               "input at the top level, relative to the manifest"),
     "normal_zarr_group": "the Lasagna manifest (lasagna.manifest) names the arrays",
     **{key: "geometry is read from --object-store only"
-       for key in ("verified_patches", "patches", "fibers", "pcls",
+       for key in ("verified_patches", "patches", "pcls",
                    "point_collections", "outer_shell", "tracks", "tracks_dbm")},
+    "fibers": "name the fiber store as winding_solve.fibers",
 }
 
 
@@ -853,7 +865,8 @@ def load_input_manifest(path: str | os.PathLike[str], *,
 
     Every input is named; nothing is discovered. Relative paths resolve
     against the manifest's directory, so a fit does not depend on its working
-    directory. ``volume_uuid``, ``scroll`` and ``umbilicus`` are required;
+    directory. ``volume_uuid``, ``scroll``, ``umbilicus`` and
+    ``winding_solve`` are required;
     the supervision inputs are optional here and required by
     validate_fit_inputs when the configuration's losses read them. The scroll
     must decide its outward sense, unless the fit setting ``outward_sense``
@@ -911,6 +924,21 @@ def load_input_manifest(path: str | os.PathLike[str], *,
     scroll = _scroll_spec_from_fields(fields, f"{source}: scroll",
                                       outward_sense=outward_sense)
 
+    solve = _manifest_block(document, "winding_solve", WINDING_SOLVE_KEYS, source)
+    if solve is None:
+        raise ScrollSpecError(
+            f"{source}: winding_solve (the fiber store, the run store and the "
+            "winding run's run_uuid) is required")
+    solve_paths = {
+        f"winding_solve_{key}": _manifest_path(solve.get(key), base,
+                                               f"winding_solve.{key}", source)
+        for key in ("fibers", "run_store")}
+    try:
+        run_uuid = str(uuid.UUID(str(solve.get("run_uuid"))))
+    except ValueError:
+        raise ScrollSpecError(
+            f"{source}: winding_solve.run_uuid must be the winding run's UUID") from None
+
     provenance = {"input_manifest": source,
                   "sha256": hashlib.sha256(data).hexdigest()}
     lasagna = ""
@@ -938,8 +966,9 @@ def load_input_manifest(path: str | os.PathLike[str], *,
                       if document.get(key) is not None else "")
                 for key in ("fiber_directions", "winding_inference", "scroll_zarr")}
     return scroll, SpiralInputPaths(volume_uuid=volume_uuid.strip(),
-                                    umbilicus=umbilicus_path, lasagna=lasagna,
-                                    provenance=provenance, **optional)
+                                    umbilicus=umbilicus_path,
+                                    winding_solve_run_uuid=run_uuid, lasagna=lasagna,
+                                    provenance=provenance, **solve_paths, **optional)
 
 
 def check_fit_volume(paths: SpiralInputPaths, volume_uuid: str | None) -> None:

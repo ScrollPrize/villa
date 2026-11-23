@@ -44,13 +44,15 @@ _NULL_TYPES = {
 # Settings host preparation consumes irreversibly: patch materialization
 # erodes patches before they reach the resident pools, the patch-loss z
 # margin decides which attachments materialization keeps (and is recorded in
-# the input manifest), and the dense-spacing mode decides which dense stores
-# are opened. Nothing retained by a resident session can re-derive their
-# effect, so they demand a full rebuild.
+# the input manifest), the dense-spacing mode decides which dense stores
+# are opened, and the fiber point spacing decides which fiber points are
+# kept. Nothing retained by a resident session can re-derive their effect, so
+# they demand a full rebuild.
 _PREPARED_INPUT_FIELDS = {
     "patch_erode_patches",
     "patch_loss_z_margin",
     "dense_spacing_mode",
+    "fiber_min_point_spacing",
 }
 
 # The discretised outer-shell lookup/atlas. These are ordinary run-boundary
@@ -470,6 +472,9 @@ class Config:
         self.input_use_winding_inference = True
         self.input_use_outer_shell = True
         self.input_disable_patches = False
+        # The winding solve's fiber points in the z window are thinned along
+        # each fiber to at least this spacing (fiber_solve_inputs).
+        self.fiber_min_point_spacing = 16.0
         self.track_min_sample_spacing = 20.0
         self.track_max_sample_spacing = 60.0
         self.track_length_bin_weights = [0.0, 0.15, 0.85]

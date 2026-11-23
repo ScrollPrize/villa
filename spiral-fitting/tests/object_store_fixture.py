@@ -136,3 +136,49 @@ def head(path):
     from vc_object_store import ObjectStore
     with ObjectStore.open(str(path), read_only=True) as db:
         return int(db.status()['commit_sequence'])
+
+
+# ---------------------------------------------------------------------------
+# A fiber winding solve: a fiber store and a run store solved from it
+# ---------------------------------------------------------------------------
+
+def put_fiber(db, xyz, *, coordinates=frame(), **record):
+    """A fiber from stored (n, 3) XYZ line points (end points as controls).
+    Returns its UUID."""
+    from vc_object_store import Fiber
+    xyz = np.ascontiguousarray(xyz, dtype='<f8')
+    uid = db.upsert_object({
+        'kind': 'fiber', 'format_version': 4, 'meta': {'coordinates': coordinates},
+        'fiber': {'family': '', 'control_point_count': 2, 'line_point_count': len(xyz),
+                  'length': float(np.linalg.norm(np.diff(xyz, axis=0), axis=1).sum()),
+                  'bbox': [*map(float, xyz.min(0)), *map(float, xyz.max(0))]},
+        **record})
+    db.put_geometry(uid, Fiber.from_arrays(np.ascontiguousarray(xyz[[0, -1]]), xyz))
+    return uid
+
+
+def write_winding_solve(directory, fibers, *, handedness=-1, unsolved=(),
+                        coordinates=frame(), run_uuid='5b1e2c3d-4f50-4617-8a9b-0c1d2e3f4a5b'):
+    """A fiber store and a winding run over it, as wgraph writes them, in
+    ``directory``. ``fibers`` are (stored XYZ, selected_winding, component,
+    family[, enabled]) rows; ``unsolved`` stored XYZ polylines get no run
+    row. Returns
+    the input manifest's winding_solve block (absolute paths)."""
+    from vc_object_store import CollectionReader, ObjectStore, export_fiber_result_columns
+    import uuid
+    fiber_path, run_path = str(directory / 'fibers.vcobj'), str(directory / 'run.vcobj')
+    with ObjectStore.create(fiber_path, author='ingest', hostname='host') as db:
+        ids = [put_fiber(db, xyz, coordinates=coordinates) for xyz, *_ in fibers]
+        for xyz in unsolved:
+            put_fiber(db, xyz, coordinates=coordinates)
+    with CollectionReader(fiber_path) as reader:
+        source = reader.source
+    column = lambda index: np.array([row[index] for row in fibers], dtype=np.int64)  # noqa: E731
+    export_fiber_result_columns(
+        run_path, fiber_path, source, run_uuid, None, 'winding', 'test',
+        {'handedness': handedness},
+        np.array([list(uuid.UUID(uid).bytes) for uid in ids], dtype=np.uint8).reshape(-1, 16),
+        {'selected_winding': column(1), 'component': column(2), 'family': column(3),
+         'enabled': np.array([row[4] if len(row) > 4 else 1 for row in fibers],
+                             dtype=np.int64)}, workers=1)
+    return {'fibers': fiber_path, 'run_store': run_path, 'run_uuid': run_uuid}

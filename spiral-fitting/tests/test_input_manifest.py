@@ -6,6 +6,7 @@ from pathlib import Path
 import subprocess
 import sys
 
+import numpy as np
 import pytest
 
 from config import Config
@@ -15,6 +16,7 @@ from lasagna_source import load_lasagna_source, url_identity
 
 SPIRAL_DIR = Path(__file__).resolve().parents[1]
 URL = 'https://data.example.org/scroll/predictions.lasagna.json'
+RUN = '74720635-b9a0-4e93-9e18-1031b50c56cc'
 # The configuration reading none of the supervision inputs.
 NO_SUPERVISION = {'input_use_normals': False, 'input_use_gradient_magnitude': False,
                   'input_use_fiber_directions': False,
@@ -41,7 +43,9 @@ def write_manifest(directory, filename='fit-inputs.json', **entries):
     document = {'schema_version': 1, 'volume_uuid': 'volume-1',
                 'scroll': {'name': 's1', 'voxel_size_um': 8.0,
                            'spiral_outward_sense': 'CW'},
-                'umbilicus': {'path': 'centre-line.json'}}
+                'umbilicus': {'path': 'centre-line.json'},
+                'winding_solve': {'fibers': 'solve/fibers.vcobj',
+                                  'run_store': 'solve/runs/run.vcobj', 'run_uuid': RUN}}
     for key, value in entries.items():
         if value is None:
             document.pop(key, None)
@@ -74,6 +78,9 @@ def test_relative_paths_resolve_against_the_manifest_not_the_working_directory(
     assert scroll.name == 's1' and scroll.spiral_outward_sense == 'CW'
     assert paths.volume_uuid == 'volume-1'
     assert paths.umbilicus == str(root / 'centre-line.json')
+    assert paths.winding_solve_fibers == str(root / 'solve' / 'fibers.vcobj')
+    assert paths.winding_solve_run_store == str(root / 'solve' / 'runs' / 'run.vcobj')
+    assert paths.winding_solve_run_uuid == RUN
     assert paths.lasagna == str(root / 'lasagna-copy' / 'predictions.lasagna.json')
     assert paths.fiber_directions == str(root / 'fd.npz')
     assert paths.winding_inference == str(root / 'winding')
@@ -101,6 +108,9 @@ def test_supervision_entries_are_optional_and_nothing_is_discovered(tmp_path):
     ({'volume_uuid': None}, 'volume_uuid'),
     ({'scroll': None}, 'scroll block is required'),
     ({'umbilicus': {'path': 'https://example.org/u.json'}}, 'must be a local path'),
+    ({'winding_solve': None}, 'winding_solve .* is required'),
+    ({'winding_solve': {'fibers': 'f.vcobj', 'run_store': 'r.vcobj'}}, 'run_uuid'),
+    ({'winding_solve': {'fibers': 'f.vcobj', 'run_uuid': RUN}}, 'winding_solve.run_store'),
     ({'scroll': {'name': 's1', 'spiral_outward_sense': 'CW'}}, 'voxel_size_um'),
     ({'lasagna': {'manifest': URL}}, 'must be a local path'),
     ({'lasagna': {'manifest': 'l.json', 'original_url': '/local/path'}}, 'original_url'),
@@ -113,6 +123,7 @@ def test_malformed_manifests_are_refused(tmp_path, entries, message):
 @pytest.mark.parametrize('key, guidance', [
     ('name', 'belongs in the scroll block'),
     ('verified_patches', 'geometry is read from --object-store only'),
+    ('fibers', 'winding_solve.fibers'),
 ])
 def test_retired_and_geometry_keys_are_refused_with_guidance(tmp_path, key, guidance):
     with pytest.raises(ScrollSpecError, match=guidance):
@@ -212,7 +223,7 @@ def test_the_cli_fit_refuses_store_objects_of_another_volume(tmp_path, monkeypat
     pytest.importorskip('vc_object_store')
     from vc_object_store import ObjectStore
     import object_store_reference as reference
-    from object_store_fixture import VOLUME, plane, put_patch
+    from object_store_fixture import VOLUME, plane, put_patch, write_winding_solve
     from config import FitConfig
     from fit_spiral import FitContext
     monkeypatch.setenv('FIT_SPIRAL_DEVICE', 'cpu')
@@ -221,17 +232,29 @@ def test_the_cli_fit_refuses_store_objects_of_another_volume(tmp_path, monkeypat
         put_patch(db, plane(), (0.25, 0.25), name='near')
     umbilicus = str(tmp_path / 'umbilicus.json')
     reference.write_umbilicus(umbilicus)
+    line = np.array([[4.0, 4.0, 8.0], [60.0, 8.0, 12.0]])
+    solve = write_winding_solve(
+        tmp_path, [(line, 2, 0, 0), (line + 1, 0, 1, 2, 0)], unsolved=[line + 2],
+        handedness=1 if reference.scroll_spec().spiral_outward_sense == 'CW' else -1)
 
     def context(volume):
         return FitContext(
             FitConfig({**reference.fit_config(), 'object_store_location': store}),
             scroll=reference.scroll_spec(),
-            paths=SpiralInputPaths(volume_uuid=volume, umbilicus=umbilicus),
+            paths=SpiralInputPaths(volume_uuid=volume, umbilicus=umbilicus,
+                                   winding_solve_fibers=solve['fibers'],
+                                   winding_solve_run_store=solve['run_store'],
+                                   winding_solve_run_uuid=solve['run_uuid']),
             cache_dir=str(tmp_path / 'cache'), out_base_dir=str(tmp_path / 'out'),
             input_log=lambda line: None)
     with pytest.raises(ScrollSpecError, match=f'selected store objects are fitted in {VOLUME}'):
         context('another-volume').load_host_inputs()
-    context(VOLUME).load_host_inputs()
+    fit = context(VOLUME)
+    fit.load_host_inputs()
+    # The fiber without a run row and the disabled one are dropped and counted.
+    assert len(fit.fiber_solve.fiber_uuid) == 1
+    assert (fit.fiber_solve.store_fiber_count, fit.fiber_solve.disabled_count) == (3, 1)
+    assert 'dropped 1 without a run row and 1 disabled' in fit.fiber_solve.report()[0]
 
 
 def test_the_cli_reports_every_missing_input_before_fitting(tmp_path):

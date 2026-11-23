@@ -87,7 +87,7 @@ from tracks import (
     prepare_main_phase_tracks,
     validate_track_sampling_config,
 )
-from umbilicus import thaumato_umbilicus_z_to_yx, json_umbilicus_z_to_yx
+from umbilicus import thaumato_umbilicus_z_to_yx, json_umbilicus_z_to_yx, json_umbilicus_zyx
 from sample_spiral import (
     get_spiral_points,
     get_theta,
@@ -1129,6 +1129,9 @@ class FitContext:
         - trusted geometry: trusted_geometry_tree
         - tracks: tracks, track_reload_source, track_sampling_config,
           using_tracks, filter_tracks_by_shell
+        - fibers: fiber_solve (fiber_solve_inputs.WindingSolve, or None when
+          the inputs name no winding solve); its c and w_s are set once the
+          model exists (_measure_fiber_seam_offset)
         - misc: umbilicus, scroll_zarr, shell_envelope,
           dense_spacing_mode, grad_mag_spacing_enabled
         """
@@ -1191,6 +1194,9 @@ class FitContext:
         verified_patches = dict(self.object_store_inputs.patches)
         print(f' loaded {len(verified_patches)} patches from the object store')
         self._report_object_store_inputs(self.object_store_inputs)
+        # The fibers of the winding solve the inputs name (none in a session
+        # whose inputs name no solve). No loss reads them yet.
+        fiber_solve = self._load_winding_solve() if self.paths.winding_solve_fibers else None
 
         # ==========================================================================
         # dense-spacing mode, shell envelope, and tracks
@@ -1263,6 +1269,7 @@ class FitContext:
         self.tracks = tracks
         self.track_reload_source = track_reload_source
         self.using_tracks = using_tracks
+        self.fiber_solve = fiber_solve
         for name, value in patch_inputs.items():
             setattr(self, name, value)
 
@@ -1400,6 +1407,44 @@ class FitContext:
             self.config, external_frames=self._external_input_frames(), dist=self.dist,
             cache_directory=self.cache_path, log=self.input_log,
             pins=self._resume_input_pins())
+
+    def _load_winding_solve(self):
+        """The winding solve's fibers (fiber_solve_inputs.read_winding_solve):
+        the umbilicus in the reference volume's voxels, the handedness from
+        the scroll's outward sense, the kept points in the patch-loss z
+        window. Logs its summary."""
+        from fiber_solve_inputs import read_winding_solve
+        progress_or_null(self.progress).begin(
+            'loading', 'Reading the fiber winding solve',
+            detail=os.path.basename(self.paths.winding_solve_run_store))
+        margin = self.config['patch_loss_z_margin']
+        axis_zyx = json_umbilicus_zyx(self.paths.umbilicus) * float(
+            self.reference_scroll.umbilicus_coordinate_scale)
+        started = time.perf_counter()
+        solve = read_winding_solve(
+            fibers_path=self.paths.winding_solve_fibers,
+            run_store_path=self.paths.winding_solve_run_store,
+            run_uuid=self.paths.winding_solve_run_uuid,
+            volume_uuid=self.paths.volume_uuid, fit_scale=self.fit_level_scale,
+            axis_xyz=axis_zyx[:, ::-1], spiral_outward_sense=self.spiral_outward_sense,
+            z_window=(self.z_begin - margin, self.z_end + margin),
+            min_point_spacing=self.config['fiber_min_point_spacing'])
+        if self.dist.is_main_process:
+            for line in solve.report():
+                self.input_log(line)
+            self.input_log(f'winding solve: read ({_startup_resource_suffix(started)})')
+        return solve
+
+    def _measure_fiber_seam_offset(self):
+        """c, the solve's seam against Spiral's theta = 0 under the step-0
+        transform, and w_s at the kept fiber points (set_seam_offset)."""
+        from fiber_solve_inputs import undeformed_theta
+        if self.fiber_solve is None:
+            return
+        line = self.fiber_solve.set_seam_offset(
+            undeformed_theta(self.spiral_and_transform, self.fiber_solve.zyx))
+        if self.dist.is_main_process:
+            self.input_log(line)
 
     def _resume_input_pins(self):
         """The pins (object_store_inputs.InputPins) the resumed checkpoint's
@@ -1968,6 +2013,7 @@ class FitContext:
             spiral_outward_sense=self.spiral_outward_sense,
         )
         self.spiral_and_transform.to(self.device)
+        self._measure_fiber_seam_offset()
 
         # ==========================================================================
         # Outer-shell setup
