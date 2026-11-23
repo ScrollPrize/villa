@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import torch
 
+import mesh_loss_metal
 import model as fit_model
 
 
@@ -331,6 +332,10 @@ def step_loss_maps(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, torch.T
 	"""
 	xyz = res.xyz_lr  # (D, Hm, Wm, 3)
 	t = float(res.params.mesh_step)
+	if mesh_loss_metal.enabled(xyz, 2):
+		# one fused dispatch each way on MPS instead of a few hundred small ops; this function stays the reference
+		lm = mesh_loss_metal.step_loss_map(xyz, t)
+		return lm, torch.ones_like(lm)
 	t_diag = t * math.sqrt(2.0)
 
 	# H direction: (D, Hm-1, Wm, 1) -> crop W to (D, Hm-1, Wm-1, 1)

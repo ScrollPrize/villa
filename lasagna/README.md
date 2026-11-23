@@ -41,9 +41,10 @@ fits sample the streamed uint8 chunks with native Metal kernels
 (`u8_sample_metal.py`, compiled at first use through
 `torch.mps.compile_shader`, so no Xcode or C++ build is needed), and flatten
 fits with `fused_flatten_adam_clamp` use a Metal clamped-Adam step
-(`flatten_clamped_adam_metal.py`). Set `LASAGNA_METAL=0` to use the plain
-PyTorch versions of both instead, which are much slower on MPS but useful for
-comparison. `--device cpu` also runs every fit mode, with the same PyTorch
+(`flatten_clamped_adam_metal.py`). The step, bend and smooth mesh losses run as
+fused Metal kernels with their gradients (`mesh_loss_metal.py`). Set
+`LASAGNA_METAL=0` to use the plain PyTorch versions of all of these instead,
+which are much slower on MPS but useful for comparison. `--device cpu` also runs every fit mode, with the same PyTorch
 code.
 
 `compile_flatten` needs PyTorch 2.15 or newer on MPS: older Inductor versions

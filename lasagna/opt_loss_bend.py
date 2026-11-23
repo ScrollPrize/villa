@@ -4,6 +4,7 @@ import math
 
 import torch
 
+import mesh_loss_metal
 import model as fit_model
 
 _THRESHOLD_RAD = math.radians(60.0)  # activate when bend angle > 60° from flat
@@ -19,6 +20,10 @@ def bend_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[torch.
 	cos(angle) > cos(120°) = -0.5.
 	"""
 	xyz = res.xyz_lr  # (D, Hm, Wm, 3)
+	if mesh_loss_metal.enabled(xyz, 3):
+		# one fused dispatch each way on MPS; the PyTorch code below stays the reference
+		lm = mesh_loss_metal.bend_loss_map(xyz, _COS_THRESHOLD)
+		return lm.mean(), (lm,), (torch.ones_like(lm),)
 
 	def _bend_penalty(e1: torch.Tensor, e2: torch.Tensor) -> torch.Tensor:
 		"""Compute bend penalty for edge pairs. e1, e2: (..., 3).
