@@ -16,6 +16,7 @@ from vc_reader import images
 from tqdm.auto import tqdm
 
 from vc_reader.reader import ZarrReader, open_node
+from vc_reader.reader.decoded_cache import DEFAULT_DECODE_BYTES
 
 from vesuvius.utils.cli import HyphenUnderscoreParser
 
@@ -227,15 +228,19 @@ def _preview_invalid_values(values: set[int]) -> str:
     return preview
 
 
-def _iter_label_tiles(path: Path) -> Iterator[np.ndarray]:
-    """The first page in bands of rows, as one value per pixel: the largest colour channel."""
-    with images.open(path) as reader:
+def _iter_label_tiles(path: Path, *, workers: int = 1) -> Iterator[np.ndarray]:
+    """The first page in bands of rows, as one value per pixel: the largest colour channel.
+
+    ``workers`` concurrent scans share one scan's band rows and decode cache budget.
+    """
+    band_rows = max(1, LABEL_BAND_ROWS // workers)
+    with images.open(path, decoded_cache_bytes=DEFAULT_DECODE_BYTES // workers) as reader:
         axes = reader.axes
         page = (0,) if axes[0] == "z" else ()
         channels = axes.index("c") - len(page) if "c" in axes else None
         height = reader.shape[axes.index("y")]
-        for row in range(0, height, LABEL_BAND_ROWS):
-            band = reader[(*page, slice(row, row + LABEL_BAND_ROWS))] if channels != 0 else reader[(*page, slice(None), slice(row, row + LABEL_BAND_ROWS))]
+        for row in range(0, height, band_rows):
+            band = reader[(*page, slice(row, row + band_rows))] if channels != 0 else reader[(*page, slice(None), slice(row, row + band_rows))]
             if channels is not None:
                 count = band.shape[channels]
                 color = np.take(band, range(count - 1), axis=channels) if count in {2, 4} else band
@@ -279,7 +284,7 @@ def _find_invalid_binary_values(band: np.ndarray) -> set[int]:
 
 
 def validate_label_tiff(
-    path: Path, *, raw_shape: Sequence[int]
+    path: Path, *, raw_shape: Sequence[int], workers: int = 1
 ) -> tuple[str, ...]:
     issues: list[str] = []
 
@@ -287,7 +292,7 @@ def validate_label_tiff(
         issues.append("label image has an alpha channel")
 
     invalid_values: set[int] = set()
-    for band in _iter_label_tiles(path):
+    for band in _iter_label_tiles(path, workers=workers):
         invalid_values.update(_find_invalid_binary_values(band))
         if len(invalid_values) > 8:
             break
@@ -463,20 +468,26 @@ def validate_root(
         if _is_label_tiff(tiff_path):
             label_stage_items.append((state, tiff_path, metadata.raw_shape))
 
+    label_workers = max(1, min(workers, len(label_stage_items)))
+
     def _validate_label_contents(
         indexed_item: tuple[int, tuple[SegmentState, Path, tuple[int, ...]]],
     ) -> tuple[str, ...]:
         _, (_, label_path, raw_shape) = indexed_item
-        return tuple(
-            message
-            for message in validate_label_tiff(label_path, raw_shape=raw_shape)
-            if message != "label image has an alpha channel"
-        )
+        # Kept exceptions would hold the failed file's band through their tracebacks.
+        try:
+            return tuple(
+                message
+                for message in validate_label_tiff(label_path, raw_shape=raw_shape, workers=label_workers)
+                if message != "label image has an alpha channel"
+            )
+        except Exception as exc:
+            return (f"Failed to validate label contents: {exc}",)
 
-    label_outcomes: dict[int, tuple[str, ...] | Exception] = {}
+    label_outcomes: dict[int, tuple[str, ...]] = {}
     for item, result in _run_parallel_map(
         list(enumerate(label_stage_items)),
-        workers=workers,
+        workers=label_workers,
         fn=_validate_label_contents,
         desc="Label contents",
         unit="file",
@@ -486,11 +497,7 @@ def validate_root(
         label_outcomes[idx] = result
 
     for idx, (state, label_path, _raw_shape) in enumerate(label_stage_items):
-        result = label_outcomes[idx]
-        if isinstance(result, Exception):
-            state.issues.append(ShapeIssue(label_path, f"Failed to validate label contents: {result}"))
-            continue
-        for message in result:
+        for message in label_outcomes[idx]:
             state.issues.append(ShapeIssue(label_path, message))
 
     results = [
