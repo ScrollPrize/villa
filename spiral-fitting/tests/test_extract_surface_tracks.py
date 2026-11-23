@@ -336,6 +336,26 @@ def test_invalid_z_range_is_rejected(capsys, tmp_path):
     assert '--z-min must be' in capsys.readouterr().err
 
 
+@pytest.mark.parametrize('factor', ['0', '3', '5'])
+def test_downsample_factor_off_the_slab_grid_is_rejected(capsys, factor):
+    with pytest.raises(SystemExit):
+        est.parse_args(['--predictions', 'p.zarr', '--out', 't.dbm', '--downsample-factor', factor])
+    assert '--downsample-factor must be at most' in capsys.readouterr().err
+
+
+def test_resume_with_another_downsample_factor_is_rejected(tmp_path):
+    out = str(tmp_path / 't.dbm')
+    est.check_downsample_factor(out, 1)
+    with dbm.open(out, 'w') as database:
+        database['h:0'] = pickle.dumps([])
+    est.check_downsample_factor(out, 1)
+    with pytest.raises(SystemExit, match='--downsample-factor 1'):
+        est.check_downsample_factor(out, 4)
+    os.remove(out + '.downsample_factor')
+    with pytest.raises(SystemExit, match='does not give'):
+        est.check_downsample_factor(out, 1)
+
+
 def test_gpus_with_cpu_backend_is_rejected(capsys):
     with pytest.raises(SystemExit):
         est.parse_args(['--predictions', 'p.zarr', '--out', 't.dbm', '--backend', 'cpu',
@@ -359,17 +379,20 @@ def test_command_line_reaches_the_backend(monkeypatch, tmp_path):
     runs = []
     monkeypatch.setattr(est, 'z_min', est.z_min)  # main() sets the z range; restore it after
     monkeypatch.setattr(est, 'z_max', est.z_max)
+    monkeypatch.setattr(est, 'downsample_factor', est.downsample_factor)
     monkeypatch.setattr(est, 'write_native_packed_store', True)
     monkeypatch.setattr(est, 'select_backend', lambda requested, gpus=None: requested)
     monkeypatch.setattr(
-        est, 'run_cpu', lambda *args: runs.append(('cpu', args, est.z_min, est.z_max)))
+        est, 'run_cpu',
+        lambda *args: runs.append(('cpu', args, est.z_min, est.z_max, est.downsample_factor)))
     monkeypatch.setattr(
         est, 'run_gpu', lambda *args, gpus=None: runs.append(('gpu', args, gpus)))
     monkeypatch.setattr(est, 'write_packed_store', lambda path: runs.append(('packed', path)))
     out = tmp_path / 'tracks' / 't.dbm'
     est.main(['--predictions', 'p.zarr', '--out', str(out), '--z-min', '64', '--z-max', '128',
-              '--backend', 'cpu', '--no-packed-store'])
-    assert runs == [('cpu', ('p.zarr', str(out)), 64, 128)]
+              '--backend', 'cpu', '--no-packed-store', '--downsample-factor', '1'])
+    assert runs == [('cpu', ('p.zarr', str(out)), 64, 128, 1)]
+    assert est.skeletonize_kwargs()['anisotropy'] == (1, 1, 1)
     assert out.parent.is_dir()
     runs.clear()
     est.main(['--predictions', 'p.zarr', '--out', str(out), '--backend', 'gpu', '--gpus', '2,0'])

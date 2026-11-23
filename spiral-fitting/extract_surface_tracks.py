@@ -459,6 +459,27 @@ def write_packed_store(tracks_dbm_path):
             tracks_dbm_path, force=True, show_progress=True)
 
 
+def check_downsample_factor(tracks_dbm_path, factor):
+    record = tracks_dbm_path + '.downsample_factor'
+    with dbm.open(tracks_dbm_path, 'c') as tracks_db:
+        resuming = bool(tracks_db.keys())
+    if resuming:
+        try:
+            with open(record) as f:
+                written = int(f.read())
+        except (OSError, ValueError):
+            raise SystemExit(f'{tracks_dbm_path} holds slabs, but {record} does not give the '
+                             f'--downsample-factor they were extracted with; write that factor '
+                             f'to {record} to resume, or pass a new --out') from None
+        if written != factor:
+            raise SystemExit(f'{tracks_dbm_path} holds slabs extracted with --downsample-factor '
+                             f'{written}; resume it with that factor or pass a new --out')
+        return
+    with open(record + '.tmp', 'w') as f:
+        f.write(f'{factor}\n')
+    os.replace(record + '.tmp', record)
+
+
 def parse_args(argv=None):
     from runners.run_single import parse_gpu_ids
 
@@ -479,6 +500,12 @@ def parse_args(argv=None):
     parser.add_argument(
         '--z-max', metavar='Z', type=int, default=z_max,
         help='z voxel where the extraction ends, exclusive (default: %(default)s)',
+    )
+    parser.add_argument(
+        '--downsample-factor', metavar='N', type=int, default=downsample_factor,
+        help='max-pool factor applied to the labelled components before skeletonizing; '
+             'use 1 when neighbouring sheets are only a few voxels apart. An existing DBM '
+             'resumes only with the factor it was written with (default: %(default)s)',
     )
     parser.add_argument(
         '--backend', choices=BACKENDS, default=skeleton_backend,
@@ -517,6 +544,13 @@ def parse_args(argv=None):
                 f'{option} or set {name} at the top of extract_surface_tracks.py')
     if args.z_min < 0 or args.z_min >= args.z_max:
         parser.error('--z-min must be non-negative and less than --z-max')
+    # Otherwise horizontal and vertical tracks are sampled on mostly disjoint grids.
+    ds = args.downsample_factor
+    if (not 1 <= ds <= min(z_chunk_depth_h, yx_chunk_thickness_v)
+            or z_chunk_stride_h % ds or yx_stride_v % ds):
+        parser.error(f'--downsample-factor must be at most the slab thickness '
+                     f'({min(z_chunk_depth_h, yx_chunk_thickness_v)}) and divide the slab '
+                     f'strides ({z_chunk_stride_h} and {yx_stride_v})')
     if args.backend == 'cpu' and args.gpus is not None:
         parser.error('--gpus applies to the GPU backend only, not to --backend cpu')
     cpu_opts = ('slab_workers', 'kimimaro_parallel')
@@ -532,17 +566,16 @@ def parse_args(argv=None):
 
 
 def main(argv=None):
-    # The slab functions above read the z range from the module configuration.
-    global z_min, z_max, slab_workers, kimimaro_parallel
+    # The slab functions above read the z range and downsample factor from the module configuration.
+    global z_min, z_max, downsample_factor, slab_workers, kimimaro_parallel
     args = parse_args(argv)
     z_min, z_max = args.z_min, args.z_max
+    downsample_factor = args.downsample_factor
     slab_workers, kimimaro_parallel = args.slab_workers, args.kimimaro_parallel
-
-    assert z_chunk_depth_h >= downsample_factor
-    assert yx_chunk_thickness_v >= downsample_factor
 
     backend = select_backend(args.backend, gpus=args.gpus)
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
+    check_downsample_factor(args.out, args.downsample_factor)
     if backend == 'gpu':
         run_gpu(args.predictions, args.out, gpus=args.gpus)
     else:
