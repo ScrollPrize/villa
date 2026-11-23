@@ -122,8 +122,8 @@ def _run(fn, spiral, dr_value, sample, dtype, device):
               for k, v in sample.items()}
     loss = fn(spiral, dr, sample)
     loss.backward()
-    return (loss.detach().double().cpu(), spiral.grad.double().cpu(),
-            dr.grad.double().cpu())
+    return (loss.detach().cpu().double(), spiral.grad.cpu().double(),
+            dr.grad.cpu().double())
 
 
 def _fused(spiral, dr, sample):
