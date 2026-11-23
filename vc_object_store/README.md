@@ -137,6 +137,22 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 VC_OBJECT_STORE_BUILD_PYTHON_PATH=build/python 
   /path/to/python -m pytest vc_object_store/tests/python -q
 ```
 
+On macOS the Python module is built without OpenMP, so from Python
+`link_tracks_to_tracks(workers=...)` runs on one worker there. `vc_object_links` and
+`vc_object_server` built beside it keep OpenMP when CMake finds it (Apple's clang
+needs `-DOpenMP_ROOT=$(brew --prefix libomp)`), so `--track-workers` and hosted
+`track-track` requests run the workers they ask for.
+
+On macOS the Python module links Homebrew's OpenCV, whose OpenBLAS loads Homebrew's
+`libomp.dylib`, while torch's wheels bring their own copy. When torch is installed,
+`import vc_object_store` loads and starts torch's copy first and keeps the copy
+`_native` brings to one thread, so torch and `vc_object_store` can be imported in
+either order. It sets `KMP_DUPLICATE_LIB_OK=TRUE` (unless you set it) only while the
+two copies start, so later loads and child processes keep OpenMP's check for a second
+runtime. If another `libomp.dylib` was loaded before torch's when `vc_object_store` is
+imported, or `KMP_DUPLICATE_LIB_OK` is set to a false value, the import arranges nothing
+and OpenMP's own check reports it (`python/vc_object_store/__init__.py`).
+
 Older upstream stores (schema 16–21; the runtime opens schema 22) convert with
 `vc_object_convert old.vcobj new.vcobj`, which also writes a revision mapping
 and a report beside the destination. Native directory export currently

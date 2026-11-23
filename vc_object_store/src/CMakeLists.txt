@@ -176,17 +176,33 @@ endif()
 if(NOT TARGET vc_reader::reader)
     message(FATAL_ERROR "Relationship detectors require vc_reader's reader library")
 endif()
-add_library(vc_track_crossings STATIC TrackCrossings.cpp)
-target_include_directories(vc_track_crossings PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>" "$<INSTALL_INTERFACE:include>")
-target_link_libraries(vc_track_crossings PRIVATE OpenMP::OpenMP_CXX)
-target_compile_features(vc_track_crossings PUBLIC cxx_std_20)
-add_library(vc_object_links STATIC
+# The detectors. Only TrackCrossings.cpp uses OpenMP, so the rest is compiled
+# once, and each copy of vc_object_links below is built from these objects.
+add_library(vc_object_links_objects OBJECT
     CtSheetNormal.cpp
     linking/LinkCandidates.cpp linking/SurfaceOverlap.cpp linking/FiberSurface.cpp
     linking/TrackTrack.cpp linking/StoredGeometry.cpp linking/LineSurface.cpp
     linking/TrackSurface.cpp linking/PointCollectionSurface.cpp linking/LinkObjects.cpp)
-target_include_directories(vc_object_links PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
-target_link_libraries(vc_object_links PUBLIC vc_objects PRIVATE vc_track_crossings vc_object_formats vc_resident_geometry vc_reader::reader opencv_core nlohmann_json::nlohmann_json)
+target_include_directories(vc_object_links_objects PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_link_libraries(vc_object_links_objects PRIVATE vc_objects vc_object_formats vc_resident_geometry vc_reader::reader opencv_core nlohmann_json::nlohmann_json)
+# vc_track_crossings<suffix> and vc_object_links<suffix>, with or without OpenMP.
+function(vc_object_store_detectors suffix use_openmp)
+    add_library(vc_track_crossings${suffix} STATIC TrackCrossings.cpp)
+    target_include_directories(vc_track_crossings${suffix} PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>" "$<INSTALL_INTERFACE:include>")
+    if(use_openmp)
+        target_link_libraries(vc_track_crossings${suffix} PRIVATE OpenMP::OpenMP_CXX)
+    endif()
+    target_compile_features(vc_track_crossings${suffix} PUBLIC cxx_std_20)
+    add_library(vc_object_links${suffix} STATIC $<TARGET_OBJECTS:vc_object_links_objects>)
+    target_link_libraries(vc_object_links${suffix} PUBLIC vc_objects PRIVATE vc_track_crossings${suffix} vc_object_formats vc_resident_geometry vc_reader::reader opencv_core nlohmann_json::nlohmann_json)
+endfunction()
+# The copy the native tools, the server and the installed package use.
+vc_object_store_detectors("" ${VC_OBJECT_STORE_DETECTORS_OPENMP})
+# On macOS the Python module must not link OpenMP (see the top-level
+# CMakeLists.txt), so when the native copy does, the module gets a serial one.
+if(APPLE AND VC_OBJECT_STORE_BUILD_PYTHON AND VC_OBJECT_STORE_DETECTORS_OPENMP)
+    vc_object_store_detectors(_serial OFF)
+endif()
 
 if(TARGET vc_object_server)
     target_link_libraries(vc_object_server PRIVATE vc_object_links)

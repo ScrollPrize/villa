@@ -132,7 +132,8 @@ def skeletonize_kwargs():
     return dict(
         teasar_params={'scale': 1., 'const': 2.},
         anisotropy=(downsample_factor, downsample_factor, downsample_factor),  # skeletons therefore have not-downsampled coordinates
-        dust_threshold=dust_threshold,
+        # one below prepare_cc_labels' downsampled cutoff (it keeps counts >= it); Kimimaro and Brook keep counts > this
+        dust_threshold=max(1, dust_threshold // downsample_factor ** 3) - 1,
         fix_branching=True,
         fix_borders=True,
         fill_holes=False,
@@ -158,12 +159,15 @@ def get_skeleton_tracks(cc_labels, offset_zyx, verbose=False, skeletonize=None):
     Any function with Kimimaro's signature can be passed, e.g. ``brook.skeletonize``.
     """
     import networkx as nx
+    kwargs = skeletonize_kwargs()
     if skeletonize is None:
         import kimimaro
         skeletonize = kimimaro.skeletonize
+        if sorted(cc_labels.shape)[1] == 1:
+            kwargs['fix_borders'] = False  # Kimimaro's border targets index out of bounds on a one-voxel face
     skeletons = skeletonize(
         cc_labels,
-        **skeletonize_kwargs(),
+        **kwargs,
         progress=verbose,
         parallel=kimimaro_parallel,
         parallel_chunk_size=250,
@@ -269,7 +273,14 @@ def extract_horizontal(predictions_zarr_array, tracks_db):
         z_chunk_max = min(z_chunk_min + z_chunk_depth_h, z_max, z_limit)
         if z_chunk_max <= z_chunk_min:
             continue
-        jobs.append((f'h:{z_chunk_min}', slice(z_chunk_min, z_chunk_max), (z_chunk_min, 0, 0)))
+        key = f'h:{z_chunk_min}'
+        if z_chunk_max - z_chunk_min < downsample_factor:
+            # The last ribbon, clipped at z_max or the volume end, is thinner than one max-pool
+            # cell: downsample_maxpool would crop it to nothing, so it has no tracks.
+            if key not in tracks_db:
+                tracks_db[key] = pickle.dumps([])
+            continue
+        jobs.append((key, slice(z_chunk_min, z_chunk_max), (z_chunk_min, 0, 0)))
     _run_slabs(predictions_zarr_array, tracks_db, jobs, 'horizontal ribbons')
 
 
@@ -306,6 +317,9 @@ def extract_vertical(predictions_zarr_array, tracks_db, axis, min_yx, max_yx):
         key_prefix = 'vx'
     else:
         assert False
+    # Start the slabs on the downsample grid: horizontal-ribbon tracks lie on it, and crossings
+    # are exact voxel matches, so slabs starting off the grid share no voxels with them.
+    lo -= lo % downsample_factor
 
     z_limit = predictions_zarr_array.shape[0]
     z_range_min = min(z_min, z_limit)
@@ -320,7 +334,7 @@ def extract_vertical(predictions_zarr_array, tracks_db, axis, min_yx, max_yx):
         if db_key in tracks_db:
             continue
         w_max = min(w + yx_chunk_thickness_v, shape_along)
-        if w_max - w < downsample_factor:
+        if w_max - w < downsample_factor or z_range_max - z_range_min < downsample_factor:
             tracks_db[db_key] = pickle.dumps([])
             continue
         if axis == 'y':
@@ -333,8 +347,26 @@ def extract_vertical(predictions_zarr_array, tracks_db, axis, min_yx, max_yx):
     _run_slabs(predictions_zarr_array, tracks_db, jobs, f'vertical {axis}-stride slabs')
 
 
+def check_vertical_slab_grid(tracks_dbm_path):
+    """Refuse to resume a DBM with vertical slabs from before they started on the downsample
+    grid: resuming it would add aligned slabs beside its old ones."""
+    if not dbm.whichdb(tracks_dbm_path):
+        return
+    with dbm.open(tracks_dbm_path, 'w') as tracks_db:
+        keys = [key.decode() for key in tracks_db.keys()]
+    for prefix in ('vy', 'vx'):
+        starts = sorted(int(key.split(':')[1]) for key in keys if key.startswith(f'{prefix}:'))
+        if starts and (starts[0] % downsample_factor
+                       or any((w - starts[0]) % yx_stride_v for w in starts)):
+            raise SystemExit(
+                f'{tracks_dbm_path} has {prefix} slabs off the {downsample_factor}-voxel grid, so '
+                'they cannot cross the horizontal tracks. Delete the DBM, extract it again, then '
+                'rebuild its crossings with build_track_crossings.py --force.')
+
+
 def run_cpu(predictions_path, tracks_dbm_path):
     """Extract every slab on the CPU (Kimimaro), writing each key as it completes."""
+    check_vertical_slab_grid(tracks_dbm_path)
     print(f'opening {predictions_path}')
     predictions_zarr_array = open_predictions(predictions_path)
 
@@ -356,6 +388,7 @@ def run_cpu(predictions_path, tracks_dbm_path):
 
 def run_gpu(predictions_path, tracks_dbm_path, gpus=None):
     """Extract the same slabs with Brook on the selected GPUs (``surface_tracks_gpu.py``)."""
+    check_vertical_slab_grid(tracks_dbm_path)
     import surface_tracks_gpu
     return surface_tracks_gpu.run(
         predictions_path, tracks_dbm_path, z_min=z_min, z_max=z_max, geometry=geometry(),
@@ -426,6 +459,27 @@ def write_packed_store(tracks_dbm_path):
             tracks_dbm_path, force=True, show_progress=True)
 
 
+def check_downsample_factor(tracks_dbm_path, factor):
+    record = tracks_dbm_path + '.downsample_factor'
+    with dbm.open(tracks_dbm_path, 'c') as tracks_db:
+        resuming = bool(tracks_db.keys())
+    if resuming:
+        try:
+            with open(record) as f:
+                written = int(f.read())
+        except (OSError, ValueError):
+            raise SystemExit(f'{tracks_dbm_path} holds slabs, but {record} does not give the '
+                             f'--downsample-factor they were extracted with; write that factor '
+                             f'to {record} to resume, or pass a new --out') from None
+        if written != factor:
+            raise SystemExit(f'{tracks_dbm_path} holds slabs extracted with --downsample-factor '
+                             f'{written}; resume it with that factor or pass a new --out')
+        return
+    with open(record + '.tmp', 'w') as f:
+        f.write(f'{factor}\n')
+    os.replace(record + '.tmp', record)
+
+
 def parse_args(argv=None):
     from runners.run_single import parse_gpu_ids
 
@@ -446,6 +500,12 @@ def parse_args(argv=None):
     parser.add_argument(
         '--z-max', metavar='Z', type=int, default=z_max,
         help='z voxel where the extraction ends, exclusive (default: %(default)s)',
+    )
+    parser.add_argument(
+        '--downsample-factor', metavar='N', type=int, default=downsample_factor,
+        help='max-pool factor applied to the labelled components before skeletonizing; '
+             'use 1 when neighbouring sheets are only a few voxels apart. An existing DBM '
+             'resumes only with the factor it was written with (default: %(default)s)',
     )
     parser.add_argument(
         '--backend', choices=BACKENDS, default=skeleton_backend,
@@ -484,6 +544,13 @@ def parse_args(argv=None):
                 f'{option} or set {name} at the top of extract_surface_tracks.py')
     if args.z_min < 0 or args.z_min >= args.z_max:
         parser.error('--z-min must be non-negative and less than --z-max')
+    # Otherwise horizontal and vertical tracks are sampled on mostly disjoint grids.
+    ds = args.downsample_factor
+    if (not 1 <= ds <= min(z_chunk_depth_h, yx_chunk_thickness_v)
+            or z_chunk_stride_h % ds or yx_stride_v % ds):
+        parser.error(f'--downsample-factor must be at most the slab thickness '
+                     f'({min(z_chunk_depth_h, yx_chunk_thickness_v)}) and divide the slab '
+                     f'strides ({z_chunk_stride_h} and {yx_stride_v})')
     if args.backend == 'cpu' and args.gpus is not None:
         parser.error('--gpus applies to the GPU backend only, not to --backend cpu')
     cpu_opts = ('slab_workers', 'kimimaro_parallel')
@@ -499,17 +566,16 @@ def parse_args(argv=None):
 
 
 def main(argv=None):
-    # The slab functions above read the z range from the module configuration.
-    global z_min, z_max, slab_workers, kimimaro_parallel
+    # The slab functions above read the z range and downsample factor from the module configuration.
+    global z_min, z_max, downsample_factor, slab_workers, kimimaro_parallel
     args = parse_args(argv)
     z_min, z_max = args.z_min, args.z_max
+    downsample_factor = args.downsample_factor
     slab_workers, kimimaro_parallel = args.slab_workers, args.kimimaro_parallel
-
-    assert z_chunk_depth_h >= downsample_factor
-    assert yx_chunk_thickness_v >= downsample_factor
 
     backend = select_backend(args.backend, gpus=args.gpus)
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
+    check_downsample_factor(args.out, args.downsample_factor)
     if backend == 'gpu':
         run_gpu(args.predictions, args.out, gpus=args.gpus)
     else:
