@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import platform
 import subprocess
@@ -380,6 +381,46 @@ def _select_and_expand_crop(
     )
 
 
+# Each output store records the tiling its chunks were predicted with, because
+# resume reuses every stored chunk and inference.json is shared by the directory.
+TILING_ATTR = "fiber_inference_tiling"
+
+
+def _store_has_chunks(store: Path) -> bool:
+    """Whether a local Zarr v2 store holds any chunk (metadata files start with '.')."""
+    return any(
+        not name.startswith(".") for _dirpath, _dirs, files in os.walk(store) for name in files
+    )
+
+
+def _refuse_other_tiling(stores: list[Path], tiling: dict[str, int]) -> None:
+    """Refuse stores holding chunks predicted with another or an unrecorded tiling.
+
+    Stores without chunks (such as after an interruption during setup) are adopted.
+    """
+    def describe(value: object) -> str:
+        return " ".join(f"{k}={v}" for k, v in value.items()) if isinstance(value, dict) else repr(value)
+
+    for store in stores:
+        try:
+            recorded = json.loads((store / ".zattrs").read_text()).get(TILING_ATTR)
+        except (OSError, ValueError, AttributeError):
+            recorded = None
+        if recorded == tiling or not _store_has_chunks(store):
+            continue
+        if recorded is None:
+            raise ValueError(
+                f"{store} holds prediction chunks but records no tiling (written before tilings "
+                "were recorded), so they cannot be reused safely; use a new output path or "
+                "remove the store."
+            )
+        raise ValueError(
+            f"{store} holds prediction chunks from tiling {describe(recorded)}, but this run "
+            f"uses {describe(tiling)}; rerun with the recorded tiling to resume, or use a new "
+            "output path or remove the store."
+        )
+
+
 def run_fiber_trace_3d_inference(
     *,
     config_path: str | Path | None = None,
@@ -537,27 +578,44 @@ def run_fiber_trace_3d_inference(
         emit_width="width" in annotation_heads,
         emit_normals="normal" in annotation_heads,
     )
+    # Stored chunks are reused as complete, so a store's chunks must come from this tiling.
+    tiling = {
+        "tile_size": int(tile_size_i), "overlap": int(overlap), "border": int(border),
+        "input_scaledown": int(input_sd), "output_scaledown": int(output_sd_input),
+        "ome_chunk": int(ome_chunk),
+    }
+    if output_format == "compact":
+        tiled_stores = [output_manifest]
+    else:
+        tiled_stores = sorted({Path(OmeZarrOutputAdapter.channel_path(channel))
+                               for product in predict_adapter.output_products
+                               for channel in product.channels})
+    _refuse_other_tiling(tiled_stores, tiling)
     if output_format == "compact":
         from lasagna.lasagna_volume import VALIDITY_BY_CHUNKS
+        from vc_reader.reader import create_group
         products = predict_adapter.output_products
         output_adapter = CompactOutputAdapter(root=output_manifest, products=products, n_levels=n_levels,
             validity_channel=VALIDITY_BY_CHUNKS, blank_invalid=blank_invalid)
         output_adapter.prepare(base_shape_zyx=base_shape_zyx, ome_chunk=int(ome_chunk),
             ome_compressor=ome_compressor, crop=crop_xyzwhd,
             provenance="../inference.json", extra_fields={"width_encoding": "uint8-base-voxels" if width_uint8_base else "float32-input-voxels"})
+        create_group(output_manifest).attrs[TILING_ATTR] = tiling
     else:
         output_adapter = OmeZarrOutputAdapter(
             products=predict_adapter.output_products,
             n_levels=n_levels,
         )
         output_adapter.blank_invalid = blank_invalid
-        create_product_omezarr_groups(
+        channel_groups = create_product_omezarr_groups(
             products=predict_adapter.output_products,
             base_shape_zyx=base_shape_zyx,
             n_levels=n_levels,
             ome_chunk=int(ome_chunk),
             ome_compressor=ome_compressor,
         )
+        for group in channel_groups.values():
+            group.attrs[TILING_ATTR] = tiling
         write_lasagna_product_manifest(
             output_path=output_manifest,
             products=predict_adapter.output_products,
