@@ -161,7 +161,6 @@ def get_skeleton_tracks(cc_labels, offset_zyx, verbose=False, skeletonize=None):
 
     Any function with Kimimaro's signature can be passed, e.g. ``brook.skeletonize``.
     """
-    import networkx as nx
     kwargs = skeletonize_kwargs()
     if skeletonize is None:
         import kimimaro
@@ -177,33 +176,29 @@ def get_skeleton_tracks(cc_labels, offset_zyx, verbose=False, skeletonize=None):
         in_place=True,
     )
     offset = np.asarray(offset_zyx, dtype=np.int64)
+    if path_mode == 'interjoint':
+        # fast_tracks walks every skeleton as extract_inter_branch_paths does on its networkx graph,
+        # without building one (compiled with numba where it is installed): the same tracks, in
+        # the same order
+        import fast_tracks
+        return fast_tracks.tracks_from_skeletons(skeletons.values(), offset)
+    assert path_mode == 'maximal_chain', f'unknown path_mode {path_mode!r}'
     tracks = []
     for skeleton in skeletons.values():
-        if path_mode == 'interjoint':
-            graph = nx.Graph()
-            graph.add_edges_from(skeleton.edges)
-            for path_vertex_indices in extract_inter_branch_paths(graph):
-                if len(path_vertex_indices) < 10:
-                    continue
-                coords = skeleton.vertices[path_vertex_indices].astype(np.int64)
-                tracks.append((coords + offset).astype(np.int32))
-        elif path_mode == 'maximal_chain':
-            while True:
-                if len(skeleton.edges) == 0:
-                    break
-                paths = skeleton.interjoint_paths()
-                longest_path_vertex_zyxs = max(paths, key=len)
-                if len(longest_path_vertex_zyxs) < 10:
-                    break
-                coords = longest_path_vertex_zyxs.astype(np.int64)
-                tracks.append((coords + offset).astype(np.int32))
-                longest_path_vertex_indices = set(np.where((longest_path_vertex_zyxs[:, None, :] == skeleton.vertices[None, :, :]).all(axis=-1))[1])
-                skeleton.edges = np.asarray(
-                    [edge for edge in skeleton.edges if edge[0] not in longest_path_vertex_indices and edge[1] not in longest_path_vertex_indices],
-                    dtype=np.uint32,
-                )
-        else:
-            assert False, f'unknown path_mode {path_mode!r}'
+        while True:
+            if len(skeleton.edges) == 0:
+                break
+            paths = skeleton.interjoint_paths()
+            longest_path_vertex_zyxs = max(paths, key=len)
+            if len(longest_path_vertex_zyxs) < 10:
+                break
+            coords = longest_path_vertex_zyxs.astype(np.int64)
+            tracks.append((coords + offset).astype(np.int32))
+            longest_path_vertex_indices = set(np.where((longest_path_vertex_zyxs[:, None, :] == skeleton.vertices[None, :, :]).all(axis=-1))[1])
+            skeleton.edges = np.asarray(
+                [edge for edge in skeleton.edges if edge[0] not in longest_path_vertex_indices and edge[1] not in longest_path_vertex_indices],
+                dtype=np.uint32,
+            )
     return tracks
 
 

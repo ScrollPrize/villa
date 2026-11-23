@@ -196,9 +196,28 @@ def _random_slab(rng):
 
 
 def _original_tracks(skeletons, offset_zyx):
-    """The original per-slab loop (``get_skeleton_tracks``) on the given skeletons."""
-    return est.get_skeleton_tracks(
-        None, offset_zyx, skeletonize=lambda labels, **kwargs: skeletons)
+    """The original per-slab loop of ``get_skeleton_tracks``, with networkx, on the given skeletons."""
+    import networkx as nx
+    offset = np.asarray(offset_zyx, dtype=np.int64)
+    tracks = []
+    for skeleton in skeletons.values():
+        graph = nx.Graph()
+        graph.add_edges_from(skeleton.edges)
+        for path in est.extract_inter_branch_paths(graph):
+            if len(path) >= 10:
+                tracks.append((skeleton.vertices[path].astype(np.int64) + offset).astype(np.int32))
+    return tracks
+
+
+def test_cpu_slab_tracks_match_networkx(monkeypatch):
+    # get_skeleton_tracks walks the skeletons with fast_tracks; it must write what the networkx loop wrote
+    monkeypatch.setattr(est, 'path_mode', 'interjoint')
+    rng = np.random.default_rng(11)
+    for _ in range(20):
+        skeletons = _random_slab(rng)
+        offset = tuple(int(x) for x in rng.integers(0, 20000, 3))
+        got = est.get_skeleton_tracks(None, offset, skeletonize=lambda labels, **kwargs: skeletons)
+        assert pickle.dumps(got) == pickle.dumps(_original_tracks(skeletons, offset))
 
 
 @pytest.mark.parametrize('engine', ENGINES)
