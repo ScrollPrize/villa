@@ -33,6 +33,7 @@ from pathlib import Path
 import pickle
 import random
 import shutil
+import sys
 import tempfile
 import time
 import uuid
@@ -1458,6 +1459,12 @@ def main() -> int:
         raise SystemExit("--count must be positive")
     if args.workers < 1:
         raise SystemExit("--workers must be positive")
+    if args.workers > 1 and "fork" not in mp.get_all_start_methods():
+        # The default is min(8, cpu_count), so without this every plain run
+        # would exit on Windows. The workers share the graph by fork.
+        print(f"WARNING: fork multiprocessing is unavailable; using 1 worker "
+              f"instead of {args.workers}", file=sys.stderr)
+        args.workers = 1
     if args.min_side <= 0 or args.max_side < args.min_side:
         raise SystemExit("require 0 < --min-side <= --max-side")
     if (args.max_recenters < 0 or args.max_local_recenters < 0
@@ -1549,8 +1556,6 @@ def main() -> int:
             cursor += batch_size
             progress.set_postfix(attempted=len(results), failed=len(results) - successes)
     else:
-        if "fork" not in mp.get_all_start_methods():
-            raise SystemExit("multiple workers require the fork multiprocessing start method")
         context = mp.get_context("fork")
         with context.Pool(min(args.workers, len(tasks))) as pool:
             while successes < args.count and cursor < len(tasks):
