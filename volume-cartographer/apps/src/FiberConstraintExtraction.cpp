@@ -14,6 +14,10 @@
 #include "FiberNormalSamplingBenchmark.hpp"
 #include "FiberConstraintSources.hpp"
 #include "vc/fiber_tracer/FiberAxialAlignment.hpp"
+#include "vc/fiber_tracer/FiberBendSeeds.hpp"
+#include "vc/fiber_tracer/FiberStripNormals.hpp"
+#include <vc_object_store/objects/FiberConstraintGraph.hpp>
+#include <vc_object_store/objects/FiberGraphSolveExtension.hpp>
 #include <vc_reader/zarr.hpp>
 #include <vc_reader/array.hpp>
 #include "vc/core/util/Umbilicus.hpp"
@@ -361,6 +365,71 @@ int runFiberConstraintExtraction(int argc, char** argv)
         std::filesystem::create_directories(output.parent_path());
         vcr::zarr::atomicWrite(output,result.dump(2)+"\n");
         std::cout<<"crossing axes "<<result.dump()<<std::endl;
+        return 0;
+    }
+    if(cfg.contains("bend_seeds_output")) {
+        // Bend-surface seeds (FiberBendSeeds.hpp) over the smoothed, resampled chains of the
+        // loaded fibers, with the families of the classification run in bend_seed_classes.
+        // Output: magic VCBSEED1, u64 count, then per seed 16 doubles: midpoint (3), the two
+        // directions (3 + 3), angle (degrees), node distance, family, and the two fibers'
+        // indices in the order of <output>.json's ids.
+        const auto seedsStarted=Clock::now();
+        vc::objects::OpenOptions classOptions;classOptions.readOnly=true;
+        auto classes=vc::objects::ObjectCollection::open(cfg.at("bend_seed_classes").get<std::string>(),classOptions);
+        const auto classTxn=classes.read();
+        const auto results=vc::objects::readFiberGraphResultColumns(classes,classTxn,
+            vc::objects::selectFiberGraphRun(classes,classTxn,"classification"));
+        constexpr size_t familyColumn=0;
+        static_assert(std::string_view(vc::objects::FiberGraphResultColumns::names[familyColumn])=="family");
+        std::map<vc::objects::FiberGraphUuid,int> familyOf;
+        for(size_t r=0;r<results.fiberUuids.size();++r)
+            if(results.valid[r][familyColumn]!=0)familyOf[results.fiberUuids[r]]=int(results.integers[r][familyColumn]);
+        vc::fiber_tracer::FiberStripNormalOptions chainOptions;
+        chainOptions.smoothingSigma=cfg.value("strip_smoothing_sigma",chainOptions.smoothingSigma);
+        chainOptions.resampleSpacing=cfg.value("strip_resample_spacing",chainOptions.resampleSpacing);
+        std::vector<std::vector<vc::fiber_tracer::FiberBendNode>> perFiber(lines.size());
+        cv::parallel_for_(cv::Range(0,int(lines.size())),[&](const cv::Range& range){
+            for(int fi=range.start;fi<range.end;++fi){
+                const size_t i=size_t(fi);
+                const auto family=familyOf.find(vc::objects::fiberGraphUuid(ids[i]));
+                if(family==familyOf.end())continue;
+                const auto chain=vc::fiber_tracer::fiberStripChain(lines[i].pointsBaseXYZ,chainOptions);
+                for(size_t k=0;k<chain.points.size();++k){
+                    cv::Vec3d t=chain.points[std::min(k+1,chain.points.size()-1)]-chain.points[k>0?k-1:0];
+                    const double length=cv::norm(t);
+                    if(!(length>0.))continue;
+                    perFiber[i].push_back({chain.points[k],t/length,std::int64_t(i),family->second});
+                }
+            }
+        },threads);
+        std::vector<vc::fiber_tracer::FiberBendNode> nodes;
+        for(const auto& list:perFiber)nodes.insert(nodes.end(),list.begin(),list.end());
+        vc::fiber_tracer::FiberBendSeedOptions seedOptions;
+        seedOptions.radius=cfg.value("bend_seed_radius",seedOptions.radius);
+        seedOptions.minAngleDegrees=cfg.value("bend_seed_min_angle",seedOptions.minAngleDegrees);
+        seedOptions.threads=unsigned(threads);
+        const auto seeds=vc::fiber_tracer::fiberBendSeeds(nodes,seedOptions);
+        const auto seedsPath=std::filesystem::path(cfg.at("bend_seeds_output").get<std::string>());
+        std::filesystem::create_directories(seedsPath.parent_path());
+        std::ofstream file(seedsPath,std::ios::binary);
+        if(!file)throw std::runtime_error("bend seeds: cannot write "+seedsPath.string());
+        const char magic[8]={'V','C','B','S','E','E','D','1'};file.write(magic,sizeof magic);
+        const uint64_t count=seeds.size();file.write(reinterpret_cast<const char*>(&count),sizeof count);
+        for(const auto& seed:seeds){
+            const std::array<double,16> v{seed.point[0],seed.point[1],seed.point[2],seed.directionA[0],seed.directionA[1],seed.directionA[2],
+                seed.directionB[0],seed.directionB[1],seed.directionB[2],seed.angleDegrees,seed.distance,double(seed.family),
+                double(seed.fiberA),double(seed.fiberB),0.,0.};
+            file.write(reinterpret_cast<const char*>(v.data()),sizeof v);
+        }
+        if(!file)throw std::runtime_error("bend seeds: write failed "+seedsPath.string());
+        std::ofstream(seedsPath.string()+".json")<<Json{{"record_doubles",16},{"ids",ids}}.dump();
+        Json result={{"config",cfg},{"bend_seeds_output",seedsPath.string()},{"selected_fibers",lines.size()},{"nodes",nodes.size()},
+            {"seeds",seeds.size()},{"radius",seedOptions.radius},{"min_angle_degrees",seedOptions.minAngleDegrees},
+            {"load_seconds",loadSeconds},{"seed_seconds",seconds(seedsStarted)},{"wall_seconds",seconds(started)},{"resources",processResources()}};
+        const auto output=std::filesystem::path(cfg.at("output").get<std::string>());
+        std::filesystem::create_directories(output.parent_path());
+        vcr::zarr::atomicWrite(output,result.dump(2)+"\n");
+        std::cout<<"bend seeds "<<result.dump()<<std::endl;
         return 0;
     }
     if(cfg.value("geometry_only",false)) {

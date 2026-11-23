@@ -559,6 +559,36 @@ Json extractFiberConstraintChunks(const Json& cfg,Json& metadata,
             },int(workers));
             writeFiberStripSamples(cfg.at("strip_samples_output").get<std::string>(),ids,samples);
         }
+        if(cfg.contains("strip_targets_output")){
+            // Diagnostic: every chain node's targets next to the solved normal. Doubles per
+            // node: fiber index, arc, point (3), solved normal (3, zero if invalid), prediction
+            // axis (3) and weight, crossing axis (3) and weight, signed axis (3) and weight,
+            // fixed flag. The fiber ids go to <output>.json in index order.
+            if(!targets)throw std::invalid_argument("strip_targets_output needs fused axis targets");
+            const std::string output=cfg.at("strip_targets_output").get<std::string>();
+            std::vector<std::vector<double>> rows(lines.size());
+            cv::parallel_for_(cv::Range(0,int(lines.size())),[&](const cv::Range& range){
+                for(int fi=range.start;fi<range.end;++fi){
+                    const size_t i=size_t(fi);const auto& g=geometries[i];const auto& list=(*targets)[i];
+                    const auto chain=vc::fiber_tracer::fiberStripChain(polylines[i],options);
+                    if(chain.arc.size()!=list.size())continue;
+                    for(size_t k=0;k<list.size();++k){
+                        const double arc=std::min(chain.arc[k],g.length());
+                        const auto n=stripNormalAt(*strips,i,g,arc);
+                        const cv::Vec3d normal=n.valid?n.normal:cv::Vec3d(0,0,0),point=chain.points[k];
+                        const auto& t=list[k];
+                        rows[i].insert(rows[i].end(),{double(i),arc,point[0],point[1],point[2],normal[0],normal[1],normal[2],
+                            t.axis[0],t.axis[1],t.axis[2],t.weight,t.crossing[0],t.crossing[1],t.crossing[2],t.crossingWeight,
+                            t.signedAxis[0],t.signedAxis[1],t.signedAxis[2],t.signedWeight,t.fixed?1.:0.});
+                    }
+                }
+            },int(workers));
+            std::ofstream file(output,std::ios::binary);
+            if(!file)throw std::runtime_error("cannot write "+output);
+            for(const auto& r:rows)file.write(reinterpret_cast<const char*>(r.data()),std::streamsize(r.size()*sizeof(double)));
+            if(!file)throw std::runtime_error("write failed "+output);
+            std::ofstream(output+".json")<<Json{{"record_doubles",21},{"ids",ids}}.dump();
+        }
         std::cout<<"strip normals "<<metadata["strip_normals"].dump()<<std::endl;
     }
     std::map<Cell,size_t> cells;
