@@ -59,7 +59,8 @@ def fake_fit(pipeline, params):
         "schema_version": "1.2.0", "fixed_volume": "fixed.zarr", "fit": fit_id,
         "transformation_matrix": [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0]],
         "deformation": {"of": fit_id}}) + "\n")
-    (out / "fit.json").write_text(json.dumps({"fit": fit_id, "fine_um": 2.0}) + "\n")
+    (out / "fit.json").write_text(json.dumps({"fit": fit_id, "fine_um": 2.0, "model": "test",
+                                              "points": {"ids": []}}) + "\n")
     return ["work/fit/transform.json", "work/fit/fit.json"]
 
 
@@ -133,7 +134,8 @@ def decide(directory, publish):
 def new_pair(root, name="a", pair="A"):
     directory = root / name
     record = rec.Record(directory)
-    record.write(rec.PAIR, {"pair": pair, "coarse_side": "fixed"})
+    record.write(rec.PAIR, {"pair": pair, "coarse_side": "fixed", "fixed": {"url": "fixed.zarr", "voxel_um": 8.0},
+                            "moving": {"url": "moving.zarr", "voxel_um": 2.0}})
     (directory / "work").mkdir(parents=True, exist_ok=True)
     return directory
 
@@ -394,7 +396,9 @@ def _fs_calls_under(directory, at_call, action):
 
 
 @pytest.mark.parametrize("redone_first", [False, True])
-def test_a_publish_nothing_store_during_a_release_leaves_it_whole_and_consistent(tmp_path, fake_stages, redone_first):
+@pytest.mark.parametrize("switch_to", ["nothing", "affine"])
+def test_a_publish_nothing_store_during_a_release_leaves_it_whole_and_consistent(tmp_path, fake_stages, redone_first,
+                                                                                switch_to):
     """Release must be all-or-nothing. (b) a partial release directory left when a `publish
     nothing` store completes during selection. Swept over every file access of the release."""
     for at_call in range(1, 80):
@@ -406,7 +410,7 @@ def test_a_publish_nothing_store_during_a_release_leaves_it_whole_and_consistent
             drain(directory)
 
         def store_nothing(directory=directory):
-            decide(directory, "nothing")
+            decide(directory, switch_to)
             drain(directory)
         install, restore, state = _fs_calls_under(directory, at_call, store_nothing)
         out = case / "out"
@@ -425,8 +429,10 @@ def test_a_publish_nothing_store_during_a_release_leaves_it_whole_and_consistent
                 folder = out / entry["folder"]
                 assert {name: release.sha256(folder / name) for name in entry["files"]} == entry["files"]
                 transform = json.loads((folder / rec.TRANSFORM).read_text())
-                assert entry["decision"]["publish"] == "bend" and "deformation" in transform
-                assert json.loads((folder / rec.FINAL_REVIEW).read_text())["decision"]["publish"] == "bend"
+                publish = entry["decision"]["publish"]
+                assert publish in ("bend", "affine") and ("deformation" in transform) == (publish == "bend")
+                assert json.loads((folder / rec.FINAL_REVIEW).read_text())["decision"]["publish"] == publish
+                assert json.loads((folder / rec.FIT).read_text())["decision"]["publish"] == publish
         if not state["done"]:
             break                                            # every access has been tried
     assert at_call > 5
@@ -746,3 +752,271 @@ def test_a_rewrite_keeps_the_existing_mode_throughout_the_save(tmp_path, umask, 
     record.write(rec.HOLDOUT, {"patches": [{"id": "p1"}]})
     assert seen == [existing, existing]
     assert stat.S_IMODE((tmp_path / rec.HOLDOUT).stat().st_mode) == existing
+
+
+# --------------------------------------------- the redo / store / release state machine
+# Each interleaving of redo, failed redo, store (finished, failed, publishing nothing),
+# a changed decision, a new fit round, a newer record and release that can happen.
+
+def _left_out(index, source):
+    return [item["why"] for item in index["left_out"] if item["source"] == source]
+
+
+def test_interleaving_redo_then_release_before_store(tmp_path, fake_stages):
+    """The post-Redo release check must reject a transform whose fit or publication variant
+    differs from what was reviewed."""
+    root = tmp_path / "records"
+    directory = stored_pair(root)
+    pipeline_stages.pipeline(directory).redo("store")
+    pairs, index = released(tmp_path, [root], "redone")
+    assert pairs == {} and "store it again" in _left_out(index, "records/a")[0]
+    drain(directory)
+    assert "A" in released(tmp_path, [root], "stored")[0]
+
+
+def test_interleaving_failed_store_after_redo_then_store_again(tmp_path, fake_stages, monkeypatch):
+    """A failed store must not write a stamp under the current Redo marker."""
+    root = tmp_path / "records"
+    directory = stored_pair(root)
+    pipeline_stages.pipeline(directory).redo("store")
+    real = rec.filelock.replace
+    monkeypatch.setattr(rec.filelock, "replace", lambda source, target: (_ for _ in ()).throw(
+        PermissionError(13, "held", str(target))) if Path(target).name == "fit.json" else real(source, target))
+    assert pipeline_stages.pipeline(directory).run_stage("store")["status"] == "failed"
+    monkeypatch.setattr(rec.filelock, "replace", real)
+    assert released(tmp_path, [root], "failed")[0] == {}   # transform new, fit.json old: torn
+    pipeline = pipeline_stages.pipeline(directory)
+    assert pipeline.states()["store"] == engine.FAILED
+    pipeline._write_stamp("store", {})                      # what `volreg redo store` would clear
+    pipeline.redo("store")
+    drain(directory)
+    assert "A" in released(tmp_path, [root], "again")[0]
+
+
+def test_interleaving_redo_then_decide_nothing_then_store(tmp_path, fake_stages):
+    """The post-Redo release check must reject a transform whose fit or publication variant
+    differs from what was reviewed."""
+    root = tmp_path / "records"
+    directory = stored_pair(root)
+    pipeline_stages.pipeline(directory).redo("store")
+    drain(directory)
+    decide(directory, "nothing")
+    pairs, index = released(tmp_path, [root], "stale")     # store has not run: held, not bend
+    assert pairs == {} and "store it again" in _left_out(index, "records/a")[0]
+    drain(directory)
+    pairs, index = released(tmp_path, [root], "nothing")
+    assert pairs == {} and _left_out(index, "records/a") == ["decided to publish nothing"]
+    assert not (directory / rec.TRANSFORM).exists()
+
+
+def test_interleaving_a_redo_before_a_chosen_store_publishes_nothing(tmp_path, fake_stages, monkeypatch):
+    """A failed store must not write a stamp under the current Redo marker (a store a redo
+    overtakes does not publish or stamp)."""
+    root = tmp_path / "records"
+    directory = stored_pair(root)
+    pipeline_stages.pipeline(directory).redo("store")
+    real = pipeline_stages.run_store
+
+    def overtaken(pipeline, params):
+        pipeline_stages.pipeline(pipeline.directory).redo("store")
+        return real(pipeline, params)
+    monkeypatch.setattr(pipeline_stages, "run_store", overtaken)
+    before = (directory / rec.TRANSFORM).read_bytes()
+    assert pipeline_stages.pipeline(directory).run_stage("store")["status"] == "superseded"
+    assert (directory / rec.TRANSFORM).read_bytes() == before
+    assert pipeline_stages.pipeline(directory).stamp("store") is None
+    assert released(tmp_path, [root], "overtaken")[0] == {}
+    monkeypatch.setattr(pipeline_stages, "run_store", real)
+    drain(directory)
+    assert "A" in released(tmp_path, [root], "stored")[0]
+
+
+def test_interleaving_a_redo_after_store_wrote_but_before_its_stamp(tmp_path, fake_stages, monkeypatch):
+    """The post-Redo release check must reject a transform whose fit or publication variant
+    differs from what was reviewed (files written, then a redo, then no stamp)."""
+    root = tmp_path / "records"
+    directory = stored_pair(root)
+    pipeline_stages.pipeline(directory).redo("store")
+    real = pipeline_stages.run_store
+
+    def then_redo(pipeline, params):
+        written = real(pipeline, params)
+        pipeline_stages.pipeline(pipeline.directory).redo("fit")
+        return written
+    monkeypatch.setattr(pipeline_stages, "run_store", then_redo)
+    assert pipeline_stages.pipeline(directory).run_stage("store")["status"] == "superseded"
+    monkeypatch.setattr(pipeline_stages, "run_store", real)
+    assert released(tmp_path, [root], "unstamped")[0] == {}
+
+
+def test_interleaving_a_decision_changed_while_store_runs(tmp_path, fake_stages, monkeypatch):
+    """The post-Redo release check must reject a transform whose fit or publication variant
+    differs from what was reviewed (what is released matches the decision it is listed under)."""
+    root = tmp_path / "records"
+    directory = stored_pair(root)
+    pipeline_stages.pipeline(directory).redo("store")
+    real = pipeline_stages.run_store
+
+    def decided_meanwhile(pipeline, params):
+        decide(pipeline.directory, "affine")
+        return real(pipeline, params)
+    monkeypatch.setattr(pipeline_stages, "run_store", decided_meanwhile)
+    assert pipeline_stages.pipeline(directory).run_stage("store")["status"] == "ok"
+    monkeypatch.setattr(pipeline_stages, "run_store", real)
+    assert pipeline_stages.pipeline(directory).states()["store"] == STALE
+    pairs, _index = released(tmp_path, [root], "meanwhile")
+    assert pairs["A"]["decision"]["publish"] == "affine"
+    assert "deformation" not in released_transform(tmp_path, "meanwhile")
+
+
+def test_interleaving_new_fit_round_without_a_redo_keeps_the_reviewed_record(tmp_path, fake_stages):
+    """Preserve eligibility for legacy records with no Redo history (and a new fit round
+    from more fit patches is not stored under the older fit's decision)."""
+    root = tmp_path / "records"
+    directory = stored_pair(root)                           # f001, no redo
+    pipeline_stages.more(rec.Record(directory), 0, 5, BY)
+    pipeline = drain(directory)                             # f002 fitted; store refuses it
+    assert _fit_id(pipeline) == "f002" and pipeline.states()["store"] == engine.FAILED
+    assert "decide again" in pipeline.stamp("store")["error"]
+    pairs, _index = released(tmp_path, [root], "legacy")
+    assert pairs["A"]["decision"]["fit"] == "f001" and released_transform(tmp_path, "legacy")["fit"] == "f001"
+    row = Reviews(root, BY, auto_advance=False).fits()["fits"][0]
+    assert row["state"] == "store: failed"                 # not "finished"
+    decide(directory, "affine")
+    drain(directory)
+    pairs, _index = released(tmp_path, [root], "decided")
+    assert pairs["A"]["decision"] | {"at": None, "by": None} == {
+        "fit": "f002", "publish": "affine", "reason": "", "override": None, "at": None, "by": None}
+    transform = released_transform(tmp_path, "decided")
+    assert transform["fit"] == "f002" and "deformation" not in transform
+
+
+def test_interleaving_newer_record_redone_and_stored_again(tmp_path, fake_stages):
+    """Hold back older outputs while the newest record is unresolved (and release it once
+    it is resolved)."""
+    root, older, newer = _two_records(tmp_path)
+    pipeline_stages.pipeline(newer).redo("fit")
+    drain(newer)
+    assert released(tmp_path, [root], "pending")[0] == {}  # its new round is not answered
+    decide(newer, "bend")
+    drain(newer)
+    pairs, index = released(tmp_path, [root], "resolved")
+    assert pairs["A"]["source"] == "records/a2" and pairs["A"]["decision"]["fit"] == "f002"
+    assert _left_out(index, "records/a1") == ["superseded by records/a2"]
+
+
+def test_interleaving_both_records_redone(tmp_path, fake_stages):
+    """Hold back older outputs while the newest record is unresolved."""
+    root, older, newer = _two_records(tmp_path)
+    pipeline_stages.pipeline(older).redo("store")
+    pipeline_stages.pipeline(newer).redo("store")
+    assert released(tmp_path, [root], "both")[0] == {}
+    drain(older)
+    assert released(tmp_path, [root], "older-done")[0] == {}
+    drain(newer)
+    assert released(tmp_path, [root], "both-done")[0]["A"]["source"] == "records/a2"
+
+
+def test_interleaving_failed_redo_whose_rollback_cannot_put_a_stamp_back(tmp_path, fake_stages, monkeypatch):
+    """An aborted Redo must leave stage state and release eligibility consistent."""
+    root = tmp_path / "records"
+    directory = stored_pair(root)
+    real = filelock.replace
+
+    def flaky(source, target):
+        if Path(source).name == "store.json" and Path(target).parent.name == "history":
+            raise PermissionError(13, "held", str(source))
+        if Path(target).name == "fit.json" and Path(source).parent.name == "history":
+            raise PermissionError(13, "held", str(target))  # fit's stamp cannot go back
+        return real(source, target)
+    monkeypatch.setattr(engine.filelock, "replace", flaky)
+    with pytest.raises(PermissionError):
+        pipeline_stages.pipeline(directory).redo("fit")
+    monkeypatch.setattr(engine.filelock, "replace", real)
+    pipeline = pipeline_stages.pipeline(directory)
+    failed = [event for event in pipeline.record.events() if event["kind"] == "redo-failed"][-1]
+    assert failed["not_restored"] == ["fit"]
+    assert pipeline.states()["fit"] == READY and pipeline.redo_mark("store") == 0
+    # Nothing was marked: the stored record is still the reviewed one, and released as such.
+    assert "A" in released(tmp_path, [root], "rollback")[0]
+    assert released_transform(tmp_path, "rollback")["fit"] == "f001"
+    drain(directory)                                        # f002; store refuses the old decision
+    assert pipeline_stages.pipeline(directory).states()["store"] == engine.FAILED
+    assert "A" in released(tmp_path, [root], "refit")[0]
+    assert released_transform(tmp_path, "refit")["fit"] == "f001"
+
+
+def test_interleaving_release_into_a_folder_that_appears_meanwhile(tmp_path, fake_stages, monkeypatch):
+    """Release must be all-or-nothing."""
+    root = tmp_path / "records"
+    stored_pair(root)
+    real = Path.write_bytes
+
+    def racing(self, data):
+        (tmp_path / "out").mkdir(exist_ok=True)
+        (tmp_path / "out" / "theirs").write_text("x")
+        return real(self, data)
+    monkeypatch.setattr(Path, "write_bytes", racing)
+    with pytest.raises(FileExistsError):
+        release.release(tmp_path / "out", [root])
+    assert sorted(p.name for p in (tmp_path / "out").iterdir()) == ["theirs"]
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["out", "records"]
+
+
+def _claim_and_die(directory, held):
+    pipeline = make(Path(directory))
+    claim = open(pipeline.claim_path("fit"), "a+b")
+    assert filelock.try_lock(claim, filelock.OWNER_OFFSET)
+    Path(held).write_text("up")
+    os._exit(1)
+
+
+def test_interleaving_a_worker_that_died_after_its_claim(tmp_path, lock_kind):
+    """A status read must distinguish a live worker from another reader while preserving
+    single ownership and crash recovery."""
+    pipeline = make(tmp_path)
+    pipeline.run_stage("draw")
+    pipeline.lock_path("fit").parent.mkdir(parents=True, exist_ok=True)
+    held = tmp_path / "held"
+    worker = CONTEXT.Process(target=_claim_and_die, args=(str(tmp_path), str(held)))
+    worker.start()
+    worker.join(30)
+    assert held.exists() and pipeline.state("fit") == READY
+    assert pipeline.run_stage("fit")["status"] == "ok"
+
+
+def test_interleaving_a_second_worker_while_the_first_waits_for_a_reader(tmp_path, lock_kind):
+    """A status read must distinguish a live worker from another reader while preserving
+    single ownership and crash recovery."""
+    pipeline = make(tmp_path)
+    for name in ("draw", "fit"):
+        pipeline.run_stage(name)
+    pipeline.redo("fit")
+    held, go, out = tmp_path / "held", tmp_path / "go", tmp_path / "out"
+    reader = CONTEXT.Process(target=_paused_reader, args=(str(tmp_path), str(held), str(go), lock_kind))
+    reader.start()
+    first = None
+    try:
+        while not held.exists():
+            time.sleep(0.02)
+        first = CONTEXT.Process(target=_worker, args=(str(tmp_path), str(out), lock_kind))
+        first.start()
+        deadline = time.time() + 30
+        while time.time() < deadline:                       # the first has claimed the stage
+            probe = open(pipeline.claim_path("fit"), "a+b") if pipeline.claim_path("fit").exists() else None
+            if probe:
+                free = filelock.try_lock(probe, filelock.OWNER_OFFSET)
+                if free:
+                    filelock.unlock(probe, filelock.OWNER_OFFSET)
+                probe.close()
+                if not free:
+                    break
+            time.sleep(0.05)
+        with pytest.raises(RuntimeError, match="already running"):
+            make(tmp_path).run_stage("fit")
+    finally:
+        go.write_text("go")
+        reader.join(30)
+        if first is not None:
+            first.join(60)
+    assert out.read_text() == "ok"
