@@ -104,8 +104,7 @@ OpenDataLasagnaPreparation prepareOpenDataLasagna(const vcr::catalog::OpenDataSa
                 OpenDataLasagnaPreparation::Dataset dataset{
                     cached.manifest.string(), cached.kind == vc::lasagna::CatalogDatasetKind::FiberInference, {}};
                 for (auto& prepared : vc::lasagna::prepareLasagnaProjectVolumes(cached.dataset, dataset.manifest)) {
-                    dataset.volumes.push_back(
-                        {std::move(prepared.location), std::move(prepared.tags), std::move(prepared.volume)});
+                    dataset.volumes.push_back(std::move(prepared));
                 }
                 preparation.datasets.push_back(std::move(dataset));
             } catch (const std::exception& error) {

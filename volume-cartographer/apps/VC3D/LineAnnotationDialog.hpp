@@ -174,6 +174,7 @@ public:
     void setLasagnaDatasetOptions(
         std::vector<std::pair<std::string, std::string>> options,
         const std::string& selectedLocation);
+    void setNormalSource(const std::string& source);
     void setFiberInferenceDatasetOptions(
         std::vector<std::pair<std::string, std::string>> options,
         const std::string& selectedLocation);
@@ -331,6 +332,7 @@ signals:
         vc3d::line_annotation::FiberOptimizationMode mode);
     void lasagnaDatasetSelectionChanged(const std::string& location);
     void fiberInferenceDatasetSelectionChanged(const std::string& location);
+    void normalSourceSelectionChanged(const std::string& source);
     void extrapolationDistanceChanged(int distanceVx);
     void breakExtrapolationDistanceChanged(int distanceVx);
 
@@ -580,6 +582,8 @@ private:
     QComboBox* _fiberOptimizationCombo = nullptr;
     QMenu* _lasagnaDatasetMenu = nullptr;
     QMenu* _fiberInferenceDatasetMenu = nullptr;
+    QMenu* _normalSourceMenu = nullptr;
+    std::string _normalSource = "lasagna";
     bool _modelOnlySession = false;
     QDoubleSpinBox* _fiberFollowConfidenceSpin = nullptr;
     QAction* _fiberFollowEnabledAction = nullptr;

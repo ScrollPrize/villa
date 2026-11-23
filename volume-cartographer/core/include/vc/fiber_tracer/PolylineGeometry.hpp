@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstddef>
+#include <array>
+#include <cstdint>
 #include <optional>
 #include <utility>
 #include <vector>
@@ -52,6 +54,25 @@ struct BoxClippedLineSegment {
     double beginFraction = 0.0;
     double endFraction = 1.0;
 };
+
+// A spatial piece refers to the ORIGINAL curve's arc coordinates; its ends
+// are not new scientific fiber endpoints. Adjacent pieces share one boundary
+// record, including its exact arc position and sampled coordinate.
+struct PolylineGridBoundary {
+    double arc = 0.;
+    cv::Vec3d point{0.,0.,0.};
+};
+struct PolylineGridPiece {
+    std::array<std::int64_t,3> cell{}; // XYZ, half-open cells
+    std::size_t beginBoundary = 0, endBoundary = 0;
+};
+struct PolylineGridPartition {
+    std::vector<PolylineGridBoundary> boundaries;
+    std::vector<PolylineGridPiece> pieces; // source arc order, including reentries
+};
+
+[[nodiscard]] PolylineGridPartition partitionPolylineArcGrid(
+    const PolylineArcGeometry& geometry, double coreSizeBaseVoxels);
 
 [[nodiscard]] bool pointInHalfOpenBox(
     const cv::Vec3d& point,

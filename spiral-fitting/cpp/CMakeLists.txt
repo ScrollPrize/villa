@@ -31,6 +31,11 @@ function(vc_spiral_module target source output_name)
         # build serial, the documented no-OpenMP fallback.
         # MSVC's <cmath> only defines M_PI behind this macro.
         target_compile_definitions(${target} PRIVATE _USE_MATH_DEFINES)
+    elseif(APPLE)
+        # No OpenMP on macOS either, for the same import abort: torch's macOS
+        # wheels load their own libomp.dylib, and Homebrew's libomp linked
+        # here would be a second OpenMP runtime (OMP Error #15 at
+        # `import torch, vc_spiral...`). The kernels build serial.
     elseif(OpenMP_CXX_FOUND)
         target_link_libraries(${target} PRIVATE OpenMP::OpenMP_CXX)
     endif()
@@ -43,7 +48,6 @@ endfunction()
 vc_spiral_module(vc_spiral_sampling spiral_sampling.cpp spiral_sampling)
 vc_spiral_module(vc_spiral_track_crossings track_crossings.cpp track_crossings)
 vc_spiral_module(vc_spiral_track_store track_store.cpp track_store)
-vc_spiral_module(vc_spiral_surface_index surface_index.cpp surface_index)
 
 target_compile_options(vc_spiral_track_crossings PRIVATE
     $<$<AND:$<CONFIG:RelWithDebInfo>,$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>>:-O3>

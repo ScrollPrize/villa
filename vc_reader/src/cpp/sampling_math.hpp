@@ -14,6 +14,12 @@
 #define VCR_SAMPLE_HD
 #endif
 namespace vcr::sampling {
+// Identity policy for the existing optimized scalar interpolation traversal.
+struct LinearInterpolation {
+    static constexpr bool custom = false;
+    static constexpr bool clamp_boundary = false;
+    static constexpr std::size_t components = 1;
+};
 template<class Coordinate, class Fraction>
 VCR_SAMPLE_HD inline void splitCoordinate(Coordinate q, std::int64_t base, std::int64_t& low, Fraction& fraction)
 {

@@ -49,14 +49,23 @@ inline QJsonObject normalizedSpiralReloadRequest(
 // whose requested value differs is on the service-advertised allowlist
 // (schema.model_stage_keys). Returns "model" or "all".
 //
+// The fit inputs are a selection in run.config (object_store_* selectors,
+// fit_volume_uuid, approval and refresh settings), none of which is a model
+// key, so changing the selection is the whole build; the request's paths
+// name only inputs the service reads outside its object store. A rebuild
+// that reloads the inputs (``reloadInputs``, the service's "inputs":
+// "reload") is the whole build whatever changed.
+//
 // Deliberately compares the requests as sent, not their effective values,
 // because that is what the service diffs; an advisory answer that disagreed
 // with the service could tell the user their uncommitted inputs survive a
 // rebuild that in fact discards them.
 inline QString spiralRebuildStage(const QJsonObject& current,
                                   const QJsonObject& loaded,
-                                  const QSet<QString>& modelStageKeys)
+                                  const QSet<QString>& modelStageKeys,
+                                  bool reloadInputs = false)
 {
+    if (reloadInputs) return QStringLiteral("all");
     // Empty defaults and no run-mutable keys leave run.config exactly as each
     // request carries it; the call is here for the preview-default expansion,
     // which is a wire-representation difference rather than a real one.

@@ -7,7 +7,6 @@ import test from 'node:test';
 import {
   ResponderUrlResolutionError,
   AUTOMATION_ERROR_FALLBACK,
-  createExactShaActivationGate,
   createFilePageFacade,
   formatAutomationError,
   resolveGoogleResponderUri,
@@ -16,34 +15,32 @@ import {
 } from './automation-cli.mjs';
 import { runCli } from './cli.mjs';
 import { PROGRESS_PRIZE_MARKERS } from './markdown.mjs';
-import { ROLLOVER_FAULTS, RolloverFaultError } from './rollover.mjs';
 
 const PRIVATE = Object.freeze({
   token: 'private-wif-access-token',
-  folder: 'private-staging-folder-id',
-  drive: 'private-staging-drive-id',
+  folder: 'private-production-folder-id',
+  drive: 'private-production-drive-id',
   form: 'private-production-editor-form-id',
-  account: 'staging-bot@private.example',
-  admin: 'staging-break-glass@private.example',
-  group: 'staging-editors@private.example',
-  archive: 'private-staging-archive-id',
+  account: 'production-bot@private.example',
+  reader: 'staging-bot@private.example',
+  admin: 'production-break-glass@private.example',
+  group: 'production-editors@private.example',
 });
 const RESPONDER = 'https://docs.google.com/forms/d/e/publicResponder123/viewform';
 const SHORT_RESPONDER = 'https://forms.gle/PublicShort123';
-const SHA = '0123456789abcdef0123456789abcdef01234567';
 
 function productionEnv(overrides = {}) {
   return {
     GOOGLE_ACCESS_TOKEN: PRIVATE.token,
     GITHUB_EVENT_NAME: 'workflow_dispatch',
     PROGRESS_PRIZE_ENVIRONMENT: 'production',
-    PROGRESS_PRIZE_FOLDER_ID: 'private-production-folder-id',
-    PROGRESS_PRIZE_DRIVE_ID: 'private-production-drive-id',
-    PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL: 'production-break-glass@private.example',
-    PROGRESS_PRIZE_SERVICE_ACCOUNT_EMAIL: 'production-bot@private.example',
-    PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL: PRIVATE.account,
+    PROGRESS_PRIZE_FOLDER_ID: PRIVATE.folder,
+    PROGRESS_PRIZE_DRIVE_ID: PRIVATE.drive,
+    PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL: PRIVATE.admin,
+    PROGRESS_PRIZE_SERVICE_ACCOUNT_EMAIL: PRIVATE.account,
+    PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL: PRIVATE.reader,
     PROGRESS_PRIZE_SOURCE_FORM_ID: PRIVATE.form,
-    PROGRESS_PRIZE_EDITOR_GROUP_EMAIL: 'production-editors@private.example',
+    PROGRESS_PRIZE_EDITOR_GROUP_EMAIL: PRIVATE.group,
     PROGRESS_PRIZE_BRANCH: 'codex/progress-prize-2026-08',
     PROGRESS_PRIZE_TARGET_BRANCH: 'main',
     PROGRESS_PRIZE_DEFAULT_TARGET_BRANCH: 'main',
@@ -51,41 +48,10 @@ function productionEnv(overrides = {}) {
   };
 }
 
-function stagingEnv(overrides = {}) {
-  return {
-    GOOGLE_ACCESS_TOKEN: PRIVATE.token,
-    GITHUB_EVENT_NAME: 'workflow_dispatch',
-    PROGRESS_PRIZE_ENVIRONMENT: 'staging',
-    PROGRESS_PRIZE_FOLDER_ID: PRIVATE.folder,
-    PROGRESS_PRIZE_STAGING_FOLDER_ID: PRIVATE.folder,
-    PROGRESS_PRIZE_ARCHIVE_FOLDER_ID: PRIVATE.archive,
-    PROGRESS_PRIZE_DRIVE_ID: PRIVATE.drive,
-    PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL: PRIVATE.admin,
-    PROGRESS_PRIZE_SERVICE_ACCOUNT_EMAIL: PRIVATE.account,
-    PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL: PRIVATE.account,
-    PROGRESS_PRIZE_SOURCE_FORM_ID: PRIVATE.form,
-    PROGRESS_PRIZE_EDITOR_GROUP_EMAIL: PRIVATE.group,
-    PROGRESS_PRIZE_BRANCH: 'staging/progress-prize-rehearsal',
-    PROGRESS_PRIZE_TARGET_BRANCH: 'staging/progress-prize-base',
-    PROGRESS_PRIZE_DEFAULT_TARGET_BRANCH: 'main',
-    PROGRESS_PRIZE_SMOKE_BRANCH_PREFIX: 'staging/progress-prize-',
-    PROGRESS_PRIZE_SMOKE_DATE: '2026-07-20',
-    ...overrides,
-  };
-}
-
 function fakeRolloverFactory({ result, capture }) {
   return (dependencies) => {
     capture.dependencies = dependencies;
-    return Object.fromEntries([
-      'validate',
-      'bootstrapStagingSource',
-      'prepare',
-      'activate',
-      'reconcileActive',
-      'verify',
-      'cleanup',
-    ].map((method) => [method, async (input) => {
+    return Object.fromEntries(['validate', 'prepare', 'verify'].map((method) => [method, async (input) => {
       capture.method = method;
       capture.input = input;
       return typeof result === 'function' ? result(method, input, dependencies) : result;
@@ -157,7 +123,7 @@ test('automation failure diagnostics are single-line, bounded, and fully redacte
     '\n\u0085\u2028::warning title=unsafe::injected',
     'multibyte-\u00e9\u00e9\u00e9\u00e9',
     'x'.repeat(10_000),
-  ].join(' ')), { env: stagingEnv() });
+  ].join(' ')), { env: productionEnv() });
 
   assert.match(diagnostic, /^progress-prizes: /);
   assert.ok(Buffer.byteLength(diagnostic, 'utf8') <= 600);
@@ -192,78 +158,11 @@ test('automation failure diagnostics are single-line, bounded, and fully redacte
     forgedOpaqueId,
     'private-user@localhost',
     '::warning title=unsafe::injected',
-  ].join(' ') + '\n'), { env: stagingEnv() });
+  ].join(' ') + '\n'), { env: productionEnv() });
   assert.match(forged, /^progress-prizes: /);
   assert.doesNotMatch(forged, /https?:\/\/|::|@/);
   assert.equal(forged.includes(PRIVATE.token), false);
   assert.equal(forged.includes(forgedOpaqueId), false);
-});
-
-test('automation diagnostics expose only allowlisted staging fault labels', () => {
-  for (const step of Object.values(ROLLOVER_FAULTS)) {
-    const expected = `progress-prizes: Injected staging rollover failure at ${step}`;
-    const diagnostic = formatAutomationError(new RolloverFaultError(step), {
-      env: stagingEnv(),
-    });
-    assert.equal(diagnostic, expected);
-    assert.equal(
-      safeAutomationDiagnostic(Buffer.from(`${diagnostic}\n`), { env: stagingEnv() }),
-      expected,
-    );
-
-    const plainError = new Error(`Injected staging rollover failure at ${step}`);
-    assert.equal(
-      formatAutomationError(plainError, { env: stagingEnv() }),
-      AUTOMATION_ERROR_FALLBACK,
-    );
-
-    const spoofedError = new Error(plainError.message);
-    spoofedError.name = 'RolloverFaultError';
-    spoofedError.step = step;
-    assert.equal(
-      formatAutomationError(spoofedError, { env: stagingEnv() }),
-      AUTOMATION_ERROR_FALLBACK,
-    );
-
-    const sanitizedImitation = new Error(`\u0000Injected staging rollover failure at ${step}`);
-    const imitationDiagnostic = formatAutomationError(sanitizedImitation, {
-      env: stagingEnv(),
-    });
-    assert.notEqual(imitationDiagnostic, expected);
-    if (step === ROLLOVER_FAULTS.AFTER_COPY) {
-      assert.equal(imitationDiagnostic, AUTOMATION_ERROR_FALLBACK);
-    }
-  }
-
-  const privateStep = 'private-long-fault-step';
-  const diagnostic = formatAutomationError(new RolloverFaultError(privateStep), {
-    env: stagingEnv(),
-  });
-  assert.equal(diagnostic.includes(privateStep), false);
-  assert.match(diagnostic, /\[REDACTED\]/);
-
-  const privateTyped = new RolloverFaultError(PRIVATE.form);
-  const privateTypedDiagnostic = formatAutomationError(privateTyped, { env: stagingEnv() });
-  assert.equal(privateTypedDiagnostic.includes(PRIVATE.form), false);
-
-  const mutatedKnownError = new RolloverFaultError(ROLLOVER_FAULTS.AFTER_CLOSE_SOURCE);
-  mutatedKnownError.message = PRIVATE.token;
-  assert.equal(
-    formatAutomationError(mutatedKnownError, { env: stagingEnv() }),
-    `progress-prizes: Injected staging rollover failure at ${ROLLOVER_FAULTS.AFTER_CLOSE_SOURCE}`,
-  );
-
-  const forged = safeAutomationDiagnostic(Buffer.from(
-    `progress-prizes: Injected staging rollover failure at ${privateStep}\n`,
-  ), { env: stagingEnv() });
-  assert.equal(forged.includes(privateStep), false);
-  assert.match(forged, /\[REDACTED\]/);
-
-  const suffixed = safeAutomationDiagnostic(Buffer.from(
-    `progress-prizes: Injected staging rollover failure at ${ROLLOVER_FAULTS.AFTER_CLOSE_SOURCE} ${PRIVATE.token}\n`,
-  ), { env: stagingEnv() });
-  assert.equal(suffixed.includes(ROLLOVER_FAULTS.AFTER_CLOSE_SOURCE), false);
-  assert.equal(suffixed.includes(PRIVATE.token), false);
 });
 
 test('automation failure formatter fails closed for hostile errors and environments', () => {
@@ -274,7 +173,7 @@ test('automation failure formatter fails closed for hostile errors and environme
     },
   });
   assert.equal(
-    formatAutomationError(hostileError, { env: stagingEnv() }),
+    formatAutomationError(hostileError, { env: productionEnv() }),
     'progress-prizes: Automation failed without a safe diagnostic',
   );
   assert.equal(
@@ -283,7 +182,7 @@ test('automation failure formatter fails closed for hostile errors and environme
     }),
     'progress-prizes: Automation failed without a safe diagnostic',
   );
-  const multibyte = formatAutomationError(new Error('\u20ac'.repeat(1_000)), { env: stagingEnv() });
+  const multibyte = formatAutomationError(new Error('\u20ac'.repeat(1_000)), { env: productionEnv() });
   assert.ok(Buffer.byteLength(multibyte, 'utf8') <= 600);
 });
 
@@ -292,7 +191,7 @@ test('automation CLI subprocess emits only one bounded redacted diagnostic line'
   const cli = fileURLToPath(new URL('./automation-cli.mjs', import.meta.url));
   const child = spawnSync(process.execPath, [cli, 'prepare', `--${unknownOpaqueId}`], {
     encoding: 'utf8',
-    env: { ...process.env, ...stagingEnv() },
+    env: { ...process.env, ...productionEnv() },
   });
   assert.equal(child.status, 1);
   assert.equal(child.stdout, '');
@@ -323,7 +222,7 @@ test('file page facade keeps file IO local and resolves canonical URLs without f
   assert.equal(calls[1][3], 'utf8');
 });
 
-test('production-only guards reject staging controls before token access, client creation, file IO, or network', async () => {
+test('production-only guards reject retired controls before token access, client creation, file IO, or network', async () => {
   for (const [argv, env, expected] of [
     [
       ['validate', '--source-cycle', '2026-07', '--simulated-now', '2026-07-20T12:00:00Z'],
@@ -331,9 +230,9 @@ test('production-only guards reject staging controls before token access, client
       /simulated time is forbidden in production/,
     ],
     [
-      ['prepare', '--target-cycle', '2026-08', '--fault', 'after-copy'],
+      ['prepare', '--target-cycle', '2026-08', '--environment', 'staging'],
       productionEnv({ GOOGLE_ACCESS_TOKEN: undefined }),
-      /fault injection is forbidden in production/,
+      /run only in production/,
     ],
     [
       ['prepare', '--target-cycle', '2026-08'],
@@ -344,14 +243,34 @@ test('production-only guards reject staging controls before token access, client
       /alternate target branch/,
     ],
     [
-      [
-        'bootstrap',
-        '--source-cycle', '2026-07',
-        '--target-cycle', '2026-08',
-        '--allow-activation-rewind',
-      ],
+      ['prepare', '--target-cycle', '2026-08', '--fault', 'after-copy'],
       productionEnv({ GOOGLE_ACCESS_TOKEN: undefined }),
-      /activation rewind is forbidden in production/,
+      /Unknown option --fault/,
+    ],
+    [
+      ['verify', '--target-cycle', '2026-08', '--mode', 'active'],
+      productionEnv({ GOOGLE_ACCESS_TOKEN: undefined }),
+      /Unknown option --mode/,
+    ],
+    [
+      ['verify', '--target-cycle', '2026-08', '--dry-run'],
+      productionEnv({ GOOGLE_ACCESS_TOKEN: undefined }),
+      /--dry-run is accepted only by prepare/,
+    ],
+    [
+      ['prepare', '--target-cycle', '2026-08', '--source-cycle', '2026-06'],
+      productionEnv({ GOOGLE_ACCESS_TOKEN: undefined }),
+      /Source cycle must be 2026-07/,
+    ],
+    [
+      ['activate', '--target-cycle', '2026-08'],
+      productionEnv({ GOOGLE_ACCESS_TOKEN: undefined }),
+      /Command must be one of/,
+    ],
+    [
+      ['reconcile-active', '--target-cycle', '2026-08'],
+      productionEnv({ GOOGLE_ACCESS_TOKEN: undefined }),
+      /Command must be one of/,
     ],
   ]) {
     let clientCalls = 0;
@@ -374,137 +293,17 @@ test('production-only guards reject staging controls before token access, client
   }
 });
 
-test('activation rewind controls fail closed before token access, client creation, file IO, or network', async () => {
-  for (const [argv, env, expected] of [
-    [
-      ['prepare', '--target-cycle', '2026-08', '--allow-activation-rewind'],
-      stagingEnv({ GOOGLE_ACCESS_TOKEN: undefined }),
-      /accepted only by bootstrap/,
-    ],
-    [
-      ['bootstrap', '--source-cycle', '2026-07', '--allow-activation-rewind'],
-      stagingEnv({ GOOGLE_ACCESS_TOKEN: undefined }),
-      /Missing required option --target-cycle/,
-    ],
-    [
-      ['bootstrap', '--target-cycle', '2026-08', '--allow-activation-rewind'],
-      stagingEnv({ GOOGLE_ACCESS_TOKEN: undefined }),
-      /Missing required option --source-cycle/,
-    ],
-    [
-      [
-        'bootstrap',
-        '--source-cycle', '2026-07',
-        '--target-cycle', '2026-09',
-        '--allow-activation-rewind',
-      ],
-      stagingEnv({ GOOGLE_ACCESS_TOKEN: undefined }),
-      /must immediately follow the source cycle/,
-    ],
-    [
-      [
-        'bootstrap',
-        '--source-cycle', '2026-08',
-        '--target-cycle', '2026-09',
-        '--allow-activation-rewind',
-      ],
-      stagingEnv({ GOOGLE_ACCESS_TOKEN: undefined }),
-      /restricted to the initial 2026-07 source cycle/,
-    ],
-    [
-      [
-        'bootstrap',
-        '--source-cycle', '2026-07',
-        '--target-cycle', '2026-08',
-        '--allow-activation-rewind',
-      ],
-      stagingEnv({ GOOGLE_ACCESS_TOKEN: undefined, GITHUB_EVENT_NAME: 'schedule' }),
-      /manually dispatched staging run/,
-    ],
-    [
-      [
-        'bootstrap',
-        '--source-cycle', '2026-07',
-        '--target-cycle', '2026-08',
-        '--allow-activation-rewind',
-      ],
-      stagingEnv({ GOOGLE_ACCESS_TOKEN: undefined, PROGRESS_PRIZE_SERVICE_ACCOUNT_EMAIL: 'wrong@example.org' }),
-      /staging service account/,
-    ],
-    [
-      [
-        'bootstrap',
-        '--source-cycle', '2026-07',
-        '--target-cycle', '2026-08',
-        '--allow-activation-rewind',
-      ],
-      stagingEnv({ GOOGLE_ACCESS_TOKEN: undefined, PROGRESS_PRIZE_FOLDER_ID: 'wrong-folder' }),
-      /staging folder/,
-    ],
-    [
-      [
-        'bootstrap',
-        '--source-cycle', '2026-07',
-        '--target-cycle', '2026-08',
-        '--allow-activation-rewind',
-      ],
-      stagingEnv({ GOOGLE_ACCESS_TOKEN: undefined, PROGRESS_PRIZE_BRANCH: 'feature/not-smoke' }),
-      /smoke branch prefix/,
-    ],
-    [
-      [
-        'bootstrap',
-        '--source-cycle', '2026-07',
-        '--target-cycle', '2026-08',
-        '--allow-activation-rewind=true',
-      ],
-      stagingEnv({ GOOGLE_ACCESS_TOKEN: undefined }),
-      /does not accept a value/,
-    ],
-    [
-      [
-        'bootstrap',
-        '--source-cycle', '2026-07',
-        '--target-cycle', '2026-08',
-        '--allow-activation-rewind', 'false',
-      ],
-      stagingEnv({ GOOGLE_ACCESS_TOKEN: undefined }),
-      /Unexpected positional argument/,
-    ],
-  ]) {
-    let clientCalls = 0;
-    let fileCalls = 0;
-    let fetchCalls = 0;
-    await assert.rejects(
-      runAutomationCli(argv, {
-        env,
-        googleFactory: () => { clientCalls += 1; return {}; },
-        read: async () => { fileCalls += 1; return ''; },
-        write: async () => { fileCalls += 1; },
-        fetchImpl: async () => { fetchCalls += 1; return new Response(); },
-        output: () => {},
-      }),
-      expected,
-    );
-    assert.equal(clientCalls, 0);
-    assert.equal(fileCalls, 0);
-    assert.equal(fetchCalls, 0);
-  }
-});
-
-test('staging prepare passes only the configured editor group ACL and emits no private value', async () => {
+test('prepare passes only the configured source and editor group ACL and emits no private value', async () => {
   const capture = {};
   const outputs = [];
   const appends = [];
-  const env = stagingEnv({ GITHUB_OUTPUT: '/private/github-output-file' });
+  const env = productionEnv({ GITHUB_OUTPUT: '/private/github-output-file' });
   const summary = await runAutomationCli([
     'prepare',
     '--target-cycle', '2026-08',
     '--source-cycle', '2026-07',
-    '--simulated-now', '2026-07-26T12:00:00Z',
-    '--fault', 'after-copy',
     '--dry-run',
-    '--file', 'smoke-prize-page.md',
+    '--file', 'prize-page.md',
   ], {
     env,
     googleFactory: ({ accessToken }) => {
@@ -532,11 +331,11 @@ test('staging prepare passes only the configured editor group ACL and emits no p
     role: 'writer',
     emailAddress: PRIVATE.group,
   }]);
-  assert.equal(capture.input.sourceFormId, undefined);
+  assert.equal(capture.input.sourceFormId, PRIVATE.form);
   assert.equal(capture.input.dryRun, true);
-  assert.equal(capture.input.faultInjection, 'after-copy');
-  assert.equal(capture.dependencies.runtime.stagingFolderId, PRIVATE.folder);
+  assert.equal(capture.input.preparationDays, 7);
   assert.equal(capture.dependencies.runtime.driveAdminEmail, PRIVATE.admin);
+  assert.equal(capture.dependencies.page.file.endsWith('prize-page.md'), true);
   assert.equal(summary.privateEcho, '[REDACTED] [REDACTED] [REDACTED] [REDACTED]');
   assert.equal(outputs.length, 1);
   for (const privateValue of Object.values(PRIVATE)) {
@@ -554,7 +353,7 @@ test('CLI requires the private Drive administrator before token or I/O access', 
   let fileCalls = 0;
   await assert.rejects(
     runAutomationCli(['prepare', '--target-cycle', '2026-08', '--dry-run'], {
-      env: stagingEnv({
+      env: productionEnv({
         GOOGLE_ACCESS_TOKEN: undefined,
         PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL: undefined,
       }),
@@ -574,7 +373,7 @@ test('GitHub output fields use fixed keys and reject newline injection before wr
   const capture = {};
   await assert.rejects(
     runAutomationCli(['prepare', '--target-cycle', '2026-08', '--dry-run'], {
-      env: stagingEnv({ GITHUB_OUTPUT: '/tmp/github-output' }),
+      env: productionEnv({ GITHUB_OUTPUT: '/tmp/github-output' }),
       googleFactory: () => ({}),
       rolloverFactory: fakeRolloverFactory({
         capture,
@@ -590,65 +389,6 @@ test('GitHub output fields use fixed keys and reject newline injection before wr
     /expected YYYY-MM/,
   );
   assert.deepEqual(appends, []);
-});
-
-test('activation requires the preview-verified exact SHA and binds the gate invocation to it', async () => {
-  const mismatched = stagingEnv({
-    PROGRESS_PRIZE_HEAD_SHA: SHA,
-    PROGRESS_PRIZE_VERIFIED_SHA: 'f'.repeat(40),
-  });
-  let clientCalls = 0;
-  await assert.rejects(
-    runAutomationCli([
-      'activate',
-      '--target-cycle', '2026-08',
-      '--simulated-now', '2026-08-01T07:00:01Z',
-    ], {
-      env: mismatched,
-      googleFactory: () => { clientCalls += 1; return {}; },
-      output: () => {},
-    }),
-    /exact verified commit SHA/,
-  );
-  assert.equal(clientCalls, 0);
-
-  const capture = {};
-  await runAutomationCli([
-    'activate',
-    '--target-cycle', '2026-08',
-    '--simulated-now', '2026-08-01T07:00:01Z',
-    '--head-sha', SHA.toUpperCase(),
-    '--verified-sha', SHA,
-  ], {
-    env: stagingEnv(),
-    googleFactory: () => ({}),
-    rolloverFactory: fakeRolloverFactory({
-      capture,
-      result: async (_method, input, dependencies) => {
-        assert.equal(await dependencies.activationGate({ headSha: input.headSha }), true);
-        assert.equal(await dependencies.activationGate({ headSha: 'f'.repeat(40) }), false);
-        return {
-          status: 'active',
-          sourceCycle: '2026-07',
-          targetCycle: '2026-08',
-          responderUri: RESPONDER,
-        };
-      },
-    }),
-    output: () => {},
-  });
-  assert.equal(capture.method, 'activate');
-  assert.equal(capture.input.headSha, SHA);
-});
-
-test('exact SHA gate accepts env-only workflow wiring', async () => {
-  const activation = createExactShaActivationGate({
-    PROGRESS_PRIZE_HEAD_SHA: SHA.toUpperCase(),
-    PROGRESS_PRIZE_VERIFIED_SHA: SHA,
-  });
-  assert.equal(activation.headSha, SHA);
-  assert.equal(await activation.gate({ headSha: SHA }), true);
-  assert.equal(await activation.gate({ headSha: '0'.repeat(40) }), false);
 });
 
 test('top-level CLI keeps page validate compatibility and routes source-cycle validate to Google', async () => {
@@ -671,140 +411,25 @@ test('top-level CLI keeps page validate compatibility and routes source-cycle va
   });
   assert.equal(capture.method, 'validate');
   assert.equal(capture.input.sourceFormId, PRIVATE.form);
-  assert.equal(capture.dependencies.runtime.stagingServiceAccountEmail, PRIVATE.account);
+  assert.equal(capture.dependencies.runtime.stagingServiceAccountEmail, PRIVATE.reader);
 });
 
-test('bootstrap, reconcile, verify, and cleanup commands map to service operations', async () => {
-  for (const [argv, method, expectedMode] of [
-    [
-      ['bootstrap', '--source-cycle', '2026-07', '--dry-run'],
-      'bootstrapStagingSource',
-      undefined,
-    ],
-    [
-      ['reconcile-active', '--target-cycle', '2026-08', '--source-cycle', '2026-07'],
-      'reconcileActive',
-      undefined,
-    ],
-    [
-      ['verify', '--target-cycle', '2026-08', '--mode', 'active'],
-      'verify',
-      'active',
-    ],
-    [
-      ['cleanup', '--target-cycle', '2026-08'],
-      'cleanup',
-      undefined,
-    ],
-  ]) {
-    const capture = {};
-    await runAutomationCli(argv, {
-      env: stagingEnv(),
-      googleFactory: () => ({}),
-      rolloverFactory: fakeRolloverFactory({
-        capture,
-        result: { status: 'valid', targetCycle: '2026-08' },
-      }),
-      output: () => {},
-    });
-    assert.equal(capture.method, method);
-    if (expectedMode !== undefined) assert.equal(capture.input.mode, expectedMode);
-  }
-});
-
-test('reconcile-active is manual-only and rejects staging controls before token or I/O', async () => {
-  for (const [argv, env, expected] of [
-    [
-      ['reconcile-active', '--target-cycle', '2026-08'],
-      productionEnv({ GOOGLE_ACCESS_TOKEN: undefined, GITHUB_EVENT_NAME: 'schedule' }),
-      /manual workflow_dispatch/,
-    ],
-    [
-      [
-        'reconcile-active',
-        '--target-cycle', '2026-08',
-        '--simulated-now', '2026-08-06T12:00:00Z',
-      ],
-      stagingEnv({ GOOGLE_ACCESS_TOKEN: undefined }),
-      /rejects --simulated-now/,
-    ],
-    [
-      ['reconcile-active', '--target-cycle', '2026-08', '--fault', 'after-copy'],
-      stagingEnv({ GOOGLE_ACCESS_TOKEN: undefined }),
-      /--fault is accepted only/,
-    ],
-    [
-      ['reconcile-active', '--target-cycle', '2026-08', '--dry-run'],
-      stagingEnv({ GOOGLE_ACCESS_TOKEN: undefined }),
-      /--dry-run is accepted only/,
-    ],
-  ]) {
-    let clientCalls = 0;
-    let fileCalls = 0;
-    await assert.rejects(
-      runAutomationCli(argv, {
-        env,
-        googleFactory: () => { clientCalls += 1; return {}; },
-        read: async () => { fileCalls += 1; return ''; },
-        write: async () => { fileCalls += 1; },
-        output: () => {},
-      }),
-      expected,
-    );
-    assert.equal(clientCalls, 0);
-    assert.equal(fileCalls, 0);
-  }
-});
-
-test('production reconcile-active passes only the protected source and editor group', async () => {
+test('verify maps to the read-only service operation with the protected source', async () => {
   const capture = {};
-  await runAutomationCli([
-    'reconcile-active',
-    '--target-cycle', '2026-08',
-    '--source-cycle', '2026-07',
-  ], {
+  await runAutomationCli(['verify', '--target-cycle', '2026-08', '--source-cycle', '2026-07'], {
     env: productionEnv({ PROGRESS_PRIZE_BRANCH: 'main' }),
     googleFactory: () => ({}),
     rolloverFactory: fakeRolloverFactory({
       capture,
-      result: {
-        action: 'reconcile-active',
-        status: 'active',
-        sourceCycle: '2026-07',
-        targetCycle: '2026-08',
-        responderUri: RESPONDER,
-      },
+      result: { status: 'valid', sourceCycle: '2026-07', targetCycle: '2026-08' },
     }),
     output: () => {},
   });
-  assert.equal(capture.method, 'reconcileActive');
+  assert.equal(capture.method, 'verify');
   assert.equal(capture.input.sourceFormId, PRIVATE.form);
   assert.deepEqual(capture.input.collaboratorPermissions, [{
     type: 'group',
     role: 'writer',
-    emailAddress: 'production-editors@private.example',
+    emailAddress: PRIVATE.group,
   }]);
-});
-
-test('bootstrap routes the explicit staging activation rewind and consecutive target cycle', async () => {
-  const capture = {};
-  await runAutomationCli([
-    'bootstrap',
-    '--source-cycle', '2026-07',
-    '--target-cycle', '2026-08',
-    '--allow-activation-rewind',
-  ], {
-    env: stagingEnv(),
-    googleFactory: () => ({}),
-    rolloverFactory: fakeRolloverFactory({
-      capture,
-      result: { status: 'active', cycle: '2026-07' },
-    }),
-    output: () => {},
-  });
-  assert.equal(capture.method, 'bootstrapStagingSource');
-  assert.equal(capture.input.sourceCycle, '2026-07');
-  assert.equal(capture.input.targetCycle, '2026-08');
-  assert.equal(capture.input.allowActivationRewind, true);
-  assert.equal(capture.dependencies.runtime.environment, 'staging');
 });

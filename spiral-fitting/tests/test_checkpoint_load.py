@@ -52,11 +52,11 @@ def _live_context():
     """A stand-in for the live fit the preflight compares against."""
     return SimpleNamespace(
         lasagna_scale=4,
-        normal_zarr_group="4",
+        lasagna_group="4",
         spiral_outward_sense="CW",
         z_direction_is_top_to_bottom=False,
         base_shape_zyx=(100, 200, 300),
-        paths=SimpleNamespace(dataset_root="/data/scroll1"),
+        paths=SimpleNamespace(volume_uuid="volume-1"),
         winding_model_mode=False,
         winding_inference=None,
         config=dict(CONFIG),
@@ -84,7 +84,7 @@ def _checkpoint(**overrides):
         "spiral_outward_sense": "CW",
         "z_begin": 1000,
         "z_end": 2000,
-        "input_manifest": {"dataset_root": "/data/scroll1"},
+        "input_manifest": {"volume_uuid": "volume-1"},
     }
     payload.update(overrides)
     return payload
@@ -162,14 +162,14 @@ class CheckpointPreflightTests(unittest.TestCase):
         self.assertFalse(missing.accepted)
         self.assertIn("'optimiser'", missing.message())
 
-    def test_scroll_and_dataset_identity_invariants(self):
+    def test_scroll_and_input_identity_invariants(self):
         for override, expected in (
                 ({"lasagna_scale": 2}, "lasagna_scale"),
                 ({"lasagna_group": "8"}, "Lasagna group"),
                 ({"spiral_outward_sense": "CCW"}, "outward sense"),
                 ({"z_direction_is_top_to_bottom": True}, "z direction"),
-                ({"input_manifest": {"dataset_root": "/data/other"}},
-                 "written against dataset"),
+                ({"input_manifest": {"volume_uuid": "volume-2"}},
+                 "inputs are in the volume"),
         ):
             with self.subTest(override=override):
                 verdict = _inspect(_checkpoint(**override))
@@ -277,10 +277,9 @@ class SparseStoreDdpTests(unittest.TestCase):
             dist=fit_spiral.DistributedContext(
                 rank=rank, world_size=2, local_rank=rank),
             grad_mag_spacing_enabled=False,
-            normal_nx_zarr_path='/data/nx',
-            normal_ny_zarr_path='/data/ny',
-            grad_mag_zarr_path=None,
-            normal_zarr_group='4',
+            lasagna_source=SimpleNamespace(identity='run-1'),
+            cache_path='/cache',
+            build_lasagna_packs=True,
         )
 
     def test_nonzero_rank_waits_for_rank_zero_without_building(self):
@@ -312,6 +311,18 @@ class SparseStoreDdpTests(unittest.TestCase):
 
         build.assert_called_once()
         broadcast.assert_called_once()
+
+    def test_a_service_never_builds(self):
+        context = self._context(rank=0)
+        context.build_lasagna_packs = False
+        with mock.patch.object(
+                fit_spiral, 'ensure_fit_sparse_stores') as build, \
+             mock.patch.object(
+                 fit_spiral.torch.distributed, 'broadcast_object_list') as broadcast:
+            fit_spiral.FitContext._ensure_sparse_volume_stores(
+                context, use_normals=True, progress=NullProgressReporter())
+        build.assert_not_called()
+        broadcast.assert_not_called()
 
 
 class _StubContext(fit_spiral.FitContext):

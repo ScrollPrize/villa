@@ -12,6 +12,9 @@
 #include <filesystem>
 #include <fstream>
 #include <thread>
+#include <map>
+#include <mutex>
+#include <cstdint>
 #include <set>
 
 namespace fs = std::filesystem;
@@ -149,12 +152,70 @@ std::string datasetPath(const Json& dataset)
 }
 }  // namespace
 
+namespace {
+// A public array's document, like a kept group, is trusted once read: each
+// open would otherwise repeat a request (~0.1 s) for a document that does not
+// change. Keyed by the array's place in the decoded cache (so an S3 location
+// and its HTTPS alias share an entry); forgetKeptMetadata, opening a Writer
+// and this process writing an array's metadata drop it. A forget bumps the
+// epoch, so a read that started before it does not keep what it fetched.
+std::mutex knownArraysMutex;
+std::map<std::string, Json> knownArrays;
+std::uint64_t knownArraysEpoch = 0;
+
+std::optional<std::string> knownArrayPath(const std::string& location, const Access& access)
+{
+    if (!isRemote(location))
+        return std::nullopt;
+    try {
+        auto spelled = stripSlashes(location);
+        // s3+<region>:// is the same bucket as s3://.
+        if (spelled.starts_with("s3+"))
+            if (const auto scheme = spelled.find("://"); scheme != std::string::npos)
+                spelled = "s3" + spelled.substr(scheme);
+        // decodedCachePath drops a query; a slash before it goes here.
+        return stripSlashes(decodedCachePath({}, access.cacheUrl(spelled)).generic_string());
+    } catch (const std::invalid_argument&) {
+        return std::nullopt;
+    }
+}
+
+std::optional<std::string> knownArrayKey(const std::string& location, const OpenOptions& options)
+{
+    // A custom endpoint is another server, whatever bucket name it serves.
+    if (options.offline || !options.access.endpoint.empty() || !isPublicLocation(location))
+        return std::nullopt;
+    return knownArrayPath(location, options.access);
+}
+}  // namespace
+
+void detail::forgetKnownArrays(const std::string& location, const Access& access)
+{
+    const auto path = knownArrayPath(location, access);
+    if (!path)
+        return;
+    const auto below = *path + "/";
+    std::lock_guard lock(knownArraysMutex);
+    ++knownArraysEpoch;
+    knownArrays.erase(*path);
+    for (auto it = knownArrays.lower_bound(below); it != knownArrays.end() && it->first.starts_with(below);)
+        it = knownArrays.erase(it);
+}
+
 // A root array's metadata, when the location is one.
 std::optional<Json> readArrayDocument(const std::string& location, const OpenOptions& options)
 {
     if (options.offline && isRemote(location))
         return cachedSourceZarray(options.cacheDirs, options.access.cacheUrl(location), {}, {},
                                   options.vc3dVolumeDir);
+    const auto knownKey = knownArrayKey(location, options);
+    std::uint64_t epoch = 0;
+    if (knownKey) {
+        std::lock_guard lock(knownArraysMutex);
+        if (const auto it = knownArrays.find(*knownKey); it != knownArrays.end())
+            return it->second;
+        epoch = knownArraysEpoch;
+    }
     if (keptGroup(location, options))
         return std::nullopt;
     const auto read = reader(options);
@@ -162,6 +223,11 @@ std::optional<Json> readArrayDocument(const std::string& location, const OpenOpt
     if (!root) {
         const auto v3 = readJsonNode(read, location, "zarr.json");
         if (v3 && v3->value("node_type", "") == "array") root = v3;
+    }
+    if (root && knownKey) {
+        std::lock_guard lock(knownArraysMutex);
+        if (epoch == knownArraysEpoch)
+            knownArrays.emplace(*knownKey, *root);
     }
     return root;
 }
@@ -261,6 +327,7 @@ OpenedArray openArray(const std::string& input, const OpenOptions& options, Arra
         spec.write_layer = out.writer;
         // A shared decoded cache must not let quantized reads satisfy an exact reader.
         spec.identity = Json::array({keyUrl, options.allowLossyCache}).dump();
+        spec.channel_identity = keyUrl;
     } else {
         std::error_code ec;
         root = fs::absolute(location, ec).lexically_normal().string();
@@ -760,6 +827,7 @@ std::vector<PyramidLevelInfo> pyramidLevels(const std::string& input, const Open
 void forgetKeptMetadata(const std::string& location, const OpenOptions& options)
 {
     forgetVolumeMetadata();
+    detail::forgetKnownArrays(location, options.access);
     for (const auto& dir : keptFolders(location, options)) {
         std::error_code ec;
         fs::remove(dir / kKeptGroup, ec);

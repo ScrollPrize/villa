@@ -31,8 +31,8 @@ def _skip_reason():
         return 'set RUN_HEADLESS_FIT=1 to run the rebuild-equivalence build (GPU)'
     with open(SPEC_PATH) as spec_file:
         spec = json.load(spec_file)
-    if not os.path.isdir(spec['dataset_path']):
-        return f'dataset not available at {spec["dataset_path"]}'
+    if not os.path.isfile(spec['inputs']):
+        return f'input manifest not available at {spec["inputs"]}'
     return None
 
 

@@ -251,6 +251,10 @@ struct StoredControlPoint : cv::Vec3d {
     // Serialized as the control point's optional "tags" array; omitted when
     // empty so untagged fibers are written exactly as before.
     std::vector<std::string> tags;
+    // The identity of the session control this one was snapshot from
+    // (LineControlPoint::identity; 0 when it was not taken from a session):
+    // which live control a saved one is, once the save returns. Not persisted.
+    uint64_t sessionIdentity = 0;
 
     StoredControlPoint() = default;
     explicit StoredControlPoint(const cv::Vec3d& position) : cv::Vec3d(position) {}
@@ -517,6 +521,11 @@ struct FiberModeOptimizationRequest {
     // Ordinary line annotation retains open geometry outside the controls.
     // Spiral 2D annotation uses the controls as inclusive bounds.
     bool retainOpenTails = true;
+    // Cspline-only annotation (LineAnnotationCsplineOnly.hpp): no normal
+    // sampler is required, every attempted span is Cspline (spans outside
+    // dirtySegments / globalGoalsOnly keep their geometry) and both open
+    // tails are rays.
+    bool csplineOnly = false;
     // CT + model session: no Lasagna initialization, normal field or fallback.
     // The builder supplies measured model/CT normals after geometry is complete.
     std::function<vc::lasagna::LineModel(const std::vector<cv::Vec3d>&)> modelLineBuilder;

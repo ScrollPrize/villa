@@ -2,6 +2,7 @@ find_package(Threads REQUIRED)
 find_package(CURL REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(BLOSC REQUIRED IMPORTED_TARGET blosc)
+pkg_check_modules(BLOSC2 REQUIRED IMPORTED_TARGET blosc2>=2.13)
 pkg_check_modules(ZSTD REQUIRED IMPORTED_TARGET libzstd)
 pkg_check_modules(LZ4 REQUIRED IMPORTED_TARGET liblz4)
 find_package(SQLite3 3.24 REQUIRED)
@@ -11,7 +12,7 @@ find_package(TIFF REQUIRED)
 find_package(PNG REQUIRED)
 find_package(JPEG REQUIRED)
 if(NOT TARGET vc_delta3d::vc_delta3d)
-    find_package(vc_delta3d 0.3 CONFIG QUIET)
+    find_package(vc_delta3d 0.3.2 CONFIG QUIET)
 endif()
 if(NOT TARGET vc_delta3d::vc_delta3d)
     include(FetchContent)
@@ -20,7 +21,7 @@ if(NOT TARGET vc_delta3d::vc_delta3d)
     set(VC_DELTA3D_INSTALL_CPP ON CACHE BOOL "" FORCE)
     FetchContent_Declare(vc_delta3d
         GIT_REPOSITORY https://github.com/ScrollPrize/vc-delta3d.git
-        GIT_TAG 45339743b450ff707d21fb742dc1b3b2bf99306d) # ScrollPrize/vc-delta3d#7
+        GIT_TAG v0.3.2)
     include("${CMAKE_CURRENT_LIST_DIR}/FetchDelta3D.cmake")
     vc_fetch_delta3d()
 endif()
@@ -36,13 +37,13 @@ else()
     add_library(vc_reader_native STATIC)
 endif()
 target_sources(vc_reader_native PRIVATE
+    "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/decoder_context.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/cache.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/projection/mask.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/projection/transfer.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/sampling/resident.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/display/display.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/display/slab.cpp"
-    "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/publication.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/native_reader.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/pathfinding/pathfinding.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/composite/reduce.cpp"
@@ -83,7 +84,7 @@ target_compile_features(vc_reader_native PUBLIC cxx_std_20)
 target_include_directories(vc_reader_native PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_LIST_DIR}/../include>
     $<INSTALL_INTERFACE:include>)
-target_link_libraries(vc_reader_native PUBLIC vc_reader::thinning vc_reader::headers CURL::libcurl PkgConfig::BLOSC PkgConfig::ZSTD PkgConfig::LZ4
+target_link_libraries(vc_reader_native PUBLIC vc_reader::thinning vc_reader::headers CURL::libcurl PkgConfig::BLOSC PkgConfig::BLOSC2 PkgConfig::ZSTD PkgConfig::LZ4
     SQLite::SQLite3 vc_delta3d::vc_delta3d ZLIB::ZLIB vc_reader::volcomp vc_reader::sftp Threads::Threads nlohmann_json::nlohmann_json
     PRIVATE vc_reader::catalog TIFF::TIFF PNG::PNG JPEG::JPEG)
 

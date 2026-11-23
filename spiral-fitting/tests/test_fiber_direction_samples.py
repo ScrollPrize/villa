@@ -81,6 +81,84 @@ def test_load_filters_z_and_decodes_axis(tmp_path):
     assert samples["presence"].tolist() == [200]
 
 
+def _write_artifact(path, **metadata):
+    np.savez_compressed(
+        path,
+        position_zyx=np.asarray([[5, 2, 3]], dtype=np.float32),
+        nx=np.asarray([128], dtype=np.uint8), ny=np.asarray([128], dtype=np.uint8),
+        presence=np.asarray([200], dtype=np.uint8),
+        metadata_json=np.asarray(json.dumps({
+            "artifact_type": "fiber_direction_samples",
+            "format_version": FORMAT_VERSION, **metadata})))
+
+
+def test_a_window_outside_the_extraction_is_refused(tmp_path):
+    import pytest
+
+    _write_artifact(tmp_path / "f.npz", z_roi=[0, 20])
+    assert load_fiber_direction_samples(tmp_path / "f.npz", 0, 10) is not None
+    with pytest.raises(ValueError, match=r"z \[0, 20\), not the fit's \[10, 30\)"):
+        load_fiber_direction_samples(tmp_path / "f.npz", 10, 30)
+
+
+def write_fiber_dataset(directory, presence, nx, ny, chunk=4):
+    """A local fiber-inference dataset: presence/nx/ny Zarr v2 directory
+    arrays of uncompressed chunks (a presence chunk with nothing in it left
+    unwritten, as absent) and its manifest. Returns the manifest's path."""
+    directory = Path(directory)
+    groups = {}
+    for name, values in (("presence", presence), ("nx", nx), ("ny", ny)):
+        array = directory / f"{name}.zarr" / "0"
+        array.mkdir(parents=True)
+        (array / ".zarray").write_text(json.dumps({
+            "zarr_format": 2, "shape": list(values.shape), "chunks": [chunk] * 3,
+            "dtype": "|u1", "compressor": None, "fill_value": 0, "order": "C",
+            "filters": None, "dimension_separator": "."}))
+        for index in np.ndindex(*(-(-size // chunk) for size in values.shape)):
+            block = values[tuple(slice(i * chunk, (i + 1) * chunk) for i in index)]
+            if name != "presence" or block.any():
+                (array / ".".join(map(str, index))).write_bytes(block.tobytes())
+        groups[name] = {"zarr": f"{name}.zarr/0", "scaledown": 0, "channels": [name]}
+    manifest = directory / "f.lasagna.json"
+    manifest.write_text(json.dumps({"version": 2, "source_to_base": 1.0,
+                                    "groups": groups}))
+    return manifest
+
+
+def _fiber_volumes():
+    presence = np.zeros((8, 8, 8), dtype=np.uint8)
+    nx = np.full((8, 8, 8), 128, dtype=np.uint8)
+    ny = np.full((8, 8, 8), 128, dtype=np.uint8)
+    presence[1, 1, 1], nx[1, 1, 1], ny[1, 1, 1] = 200, 10, 20
+    presence[5, 6, 2], nx[5, 6, 2], ny[5, 6, 2] = 255, 30, 40
+    presence[5, 6, 3] = 100  # below the threshold
+    return presence, nx, ny
+
+
+def test_a_local_dataset_is_extracted_into_the_cache_by_its_identity(tmp_path):
+    import fiber_direction_samples as module
+    from lasagna_source import fiber_directions_path, local_manifest_identity
+
+    manifest = write_fiber_dataset(tmp_path / "fibers", *_fiber_volumes())
+    lines = []
+    module.extract(str(manifest), None, cache=tmp_path / "cache", output_scale=0.5,
+                   workers=2, log=lines.append)
+    target = Path(fiber_directions_path(tmp_path / "cache",
+                                        local_manifest_identity(manifest), 0.5))
+    samples = load_fiber_direction_samples(target, 0, 16)
+    order = np.argsort(samples["presence"])
+    # One prediction voxel is two output voxels at output scale 0.5.
+    assert samples["position_zyx"][order].tolist() == [[2, 2, 2], [10, 12, 4]]
+    assert samples["nx"][order].tolist() == [10, 30]
+    assert samples["ny"][order].tolist() == [20, 40]
+    assert samples["metadata"]["z_roi"] == [0, 16]
+    assert any(line.startswith("wrote 2 samples") for line in lines)
+
+    # Adopted elsewhere, the artifact keeps the identity it was extracted under.
+    assert module.adopt(target, tmp_path / "other") == Path(fiber_directions_path(
+        tmp_path / "other", local_manifest_identity(manifest), 0.5))
+
+
 class _IdentityTransform(torch.nn.Module):
     def __init__(self):
         super().__init__()

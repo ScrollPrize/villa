@@ -100,6 +100,7 @@ public:
     /// opened, or selection is locked while growth runs.
     bool activateSurfaceById(const std::string& surfaceId,
                              QString* errorMessage = nullptr);
+    void setSelectionChangeGuard(std::function<bool()> guard) { _selectionChangeGuard = std::move(guard); }
     void resetTagUi();
 
     bool isCurrentOnlyFilterEnabled() const;
@@ -167,7 +168,8 @@ private:
     SurfaceTreeWidgetItem* itemFor(const std::string& id) const;
     // Open the selected surface and announce it.
     // Opens the surface (unless `opened` already holds it) and announces it.
-    void activate(const std::string& id, bool preserveEditing, std::optional<SurfaceCatalog::Opened> opened = std::nullopt);
+    bool activate(const std::string& id, bool preserveEditing, std::optional<SurfaceCatalog::Opened> opened = std::nullopt);
+    bool prepareSelectionChange();
     void fetchThenActivate(const std::string& id, bool preserveEditing);
 
     void connectFilterSignals();
@@ -201,6 +203,7 @@ private:
     bool cycleVisibleSegment(int direction);
 
     UiRefs _ui;
+    std::function<bool()> _selectionChangeGuard;
     CState* _state{nullptr};
     SurfaceCatalog* _catalog{nullptr};
     ViewerManager* _viewerManager{nullptr};

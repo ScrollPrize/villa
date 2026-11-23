@@ -306,10 +306,10 @@ def create_demand_store(cache, source_identity, model_identity, geometry, effect
                                        'allow_tf32': settings['allow_tf32']}
     products = adapter.output_products
     from lasagna.compact_zarr import CompactOutputAdapter
-    validity = next(c.name for p in products for c in p.channels if c.name == "presence" or c.name.endswith("_presence"))
+    from lasagna.lasagna_volume import VALIDITY_BY_CHUNKS
     output = CompactOutputAdapter(root=cache / "prediction.zarr", products=products,
-        n_levels=level + power + 1, validity_channel=validity,
-        blank_invalid=settings.get("blank_invalid", True))
+        n_levels=level + power + 1, validity_channel=VALIDITY_BY_CHUNKS,
+        blank_invalid=settings.get("blank_invalid", False))
     def prepare_output():
         output.prepare(base_shape_zyx=source_identity["base_shape"], ome_chunk=geometry.chunk,
             ome_compressor=settings.get("compressor", "blosc-zstd"), provenance="../inference.json",
@@ -370,7 +370,7 @@ def resolve_inference_model(cache_root, checkpoint, model_config, settings, devi
     if settings.get('emit_width'):
         model_identity['width_channel'] = ('uint8-base-voxels-v1' if settings.get('width_uint8_base', True) else 'float32-input-voxels-v1')
     model_identity['prediction_format'] = 'lasagna-v3-czyx'
-    model_identity['blank_invalid'] = bool(settings.get('blank_invalid', True))
+    model_identity['blank_invalid'] = bool(settings.get('blank_invalid', False))
     if settings.get('emit_normals'):
         model_identity['sheet_normal_channels'] = 'six-sigmoid-compact-axis-u8-v1'
     return dict(snapshot=snapshot, effective=effective, settings=settings,
