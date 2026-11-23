@@ -317,7 +317,7 @@ class Pipeline:
                     if owned >= 5:
                         raise RuntimeError(f"{name} is already running")
                 time.sleep(0.02 * (owned + 1))
-            handle.seek(0)      # try_lock left it at the locked byte on Windows
+            handle.seek(0)
             parts = handle.read().decode(errors="replace").split()
             if parts and OS_LOCK not in parts and self._legacy_alive(parts):
                 raise RuntimeError(f"{name} is already running")

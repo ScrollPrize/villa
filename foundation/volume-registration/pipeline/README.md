@@ -58,10 +58,13 @@ Two things behave differently from the first runs:
 | `score` | auto | the bend and the affine against your answers, and the bar |
 | `blind` | auto | draws and renders a blind round of bend against affine on the patches lining up or partly |
 | `final-review` | you | the blind picks, then the decision; publishing what misses the bar needs a reason, and is stored as an override |
-| `store` | auto | writes the decided transform and its scores into the record |
+| `store` | auto | writes the decided transform and its scores into the record; after a new fit it fails until the new fit is decided |
 
 A job that finishes starts whatever its result made ready, and so does an answer or a
-decision on the review page. So a pair moves on by itself until you are next.
+decision on the review page. So a pair moves on by itself until you are next. Jobs started
+from a `uv run --with-requirements` go back through the same uv (`UV`, which uv sets, or
+`uv` on PATH), since uv deletes that environment when the command ends; with no uv to be
+found nothing is started, and the command says so.
 
 ## Review UI
 
@@ -129,7 +132,10 @@ wins over a migrated one of the same pair. Each pair keeps `pair.json`, `holdout
 stay behind. `index.json` lists each pair's source, decision, score, answer counts and file
 hashes, and what its record does not hold (a migrated record has no code commit or decision
 time, for example); nothing is filled in. Undecided and superseded records are listed as
-left out. `check` runs on a release as on any records folder:
+left out. A pipeline record redone after its decision was stored is left out until its
+store has run again under the decision it now holds; while it is its pair's newest
+decision, the pair's older records are held back too. The release is written beside `OUT`
+and moved there whole, so a failed release leaves nothing. `check` runs on a release as on any records folder:
 
     uv run --python 3.12 --with-requirements requirements.txt python -m volreg.cli release OUT RECORDS [RECORDS ...]
 
