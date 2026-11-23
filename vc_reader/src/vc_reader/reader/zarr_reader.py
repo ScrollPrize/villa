@@ -108,6 +108,12 @@ class ZarrReader:
         from .cuda import CudaReader
         return CudaReader(self, cache_bytes=cache_bytes, device=device, pool=pool, channel=channel)
 
+    def metal(self, *, cache_bytes=1 << 30, device='mps'):
+        """Apple GPU adapter for uint8 ZYX arrays (:class:`vc_reader.reader.metal.MetalReader`): crops sampled by a
+        Metal kernel from a bounded chunk cache in unified memory, returned as PyTorch MPS tensors."""
+        from .metal import MetalReader
+        return MetalReader(self, cache_bytes=cache_bytes, device=device)
+
     def grid_level(self, *, working_scale=(1, 1, 1), working_offset=(0, 0, 0), cuda=None, map=None):
         """This array as a :mod:`vc_reader.grid` level.
 
