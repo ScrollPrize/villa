@@ -1,6 +1,8 @@
 #pragma once
 #include "vc_object_store/objects/FiberImportExtension.hpp"
 #include <map>
+#include <optional>
+#include <string>
 
 namespace vc::objects {
 class ObjectCollection;
@@ -34,6 +36,11 @@ struct FiberGraphResultColumns {
 };
 FiberGraphResultColumns readFiberGraphResultColumns(const ObjectCollection&,const CollectionTxn&,
                                                    const std::string& runUuid);
+// The one run of `stage` in the store, or `selected` after checking it is a run
+// of that stage. Never picks the latest of several: throws std::invalid_argument
+// when the choice is missing or ambiguous.
+std::string selectFiberGraphRun(const ObjectCollection&,const CollectionTxn&,const std::string& stage,
+                                const std::optional<std::string>& selected={});
 
 // Named construction for workflow writers, using the same typed SQL values as
 // the batch API. Missing nullable fields become NULL; unknown fields fail.

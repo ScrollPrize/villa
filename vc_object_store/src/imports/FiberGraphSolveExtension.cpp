@@ -140,6 +140,28 @@ ExtensionTable fiberGraphSolveTable(FiberGraphTable kind)
     return table;
 }
 
+std::string selectFiberGraphRun(const ObjectCollection& store,const CollectionTxn& txn,const std::string& stage,
+                                const std::optional<std::string>& selected)
+{
+    const auto runs=fiberGraphSolveTable(FiberGraphTable::Runs);
+    const auto tables=store.extensionTables(txn);
+    if(std::none_of(tables.begin(),tables.end(),[&](const auto& t){return t.name==runs.name;}))
+        throw std::invalid_argument("fiber graph: no "+stage+" run");
+    std::vector<std::string> candidates;
+    store.scanExtensionRows(txn,runs.name,[&](const ExtensionRow& row){
+        if(std::get<std::string>(row[1])==stage)candidates.push_back(extensionUuid(row[0]));return true;
+    });
+    if(selected){
+        const auto wanted=extensionUuid(extensionUuid(*selected));
+        if(std::find(candidates.begin(),candidates.end(),wanted)==candidates.end())
+            throw std::invalid_argument("fiber graph: selected run is not a "+stage+" run");
+        return wanted;
+    }
+    if(candidates.size()!=1)throw std::invalid_argument("fiber graph: expected one "+stage+" run, found "+
+        std::to_string(candidates.size())+"; select one");
+    return candidates.front();
+}
+
 FiberGraphResultColumns readFiberGraphResultColumns(const ObjectCollection& store,const CollectionTxn& txn,
                                                    const std::string& runUuid)
 {
