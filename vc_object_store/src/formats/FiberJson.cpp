@@ -55,6 +55,18 @@ void version3Coordinates(Json& root)
         if (key.starts_with("vc_open_data_")) openData.push_back(key);
     for (const auto& key : openData) root.erase(key);
 }
+
+// VC3D's version 4 files from before the store name their frame the version 3 way. Only a
+// level-0 frame is read; others import unbound or take coordinate_context, as before.
+bool version4Level0Frame(const Json& root)
+{
+    const auto space = root.value("vc_open_data_coordinate_space", Json{});
+    if (root.contains("coordinates") || !space.is_string()) return false;
+    const auto text = space.get<std::string>();
+    const auto slash = text.find('/');
+    return slash != std::string::npos && slash + 4 < text.size() && text.ends_with("@L0")
+        && root.value("vc_open_data_source_coordinate_scale_factor", 1.0) == 1.0;
+}
 }
 
 GeometrySource decodeFiberJson(const std::string& text)
@@ -65,9 +77,7 @@ GeometrySource decodeFiberJson(const std::string& text)
     if (version != 1 && version != 3 && version != 4)
         throw std::runtime_error("Fiber transfer requires version 1, 3 or 4");
     if (version == 1) version1Fields(root);
-    // VC3D's version 4 files from before the store still name their frame the version 3 way.
-    if (version < 4 || (!root.contains("coordinates") && root.contains("vc_open_data_coordinate_space")))
-        version3Coordinates(root);
+    if (version < 4 || version4Level0Frame(root)) version3Coordinates(root);
     detail::validateSourceTopology("fiber", root);
     GeometrySource p;
     p.object.uuid = util::canonicalUuid(root.at("uuid").get<std::string>());
