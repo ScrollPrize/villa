@@ -604,6 +604,34 @@ class NonFiniteGradCheckTests(unittest.TestCase):
         self.assertEqual(int((bad.grad == 0).sum()), 2)
         self.assertTrue(torch.equal(good.grad, torch.full_like(good, 2.0)))
 
+    @unittest.skipUnless(torch.backends.mps.is_available(), 'requires MPS')
+    def test_fused_mps_sanitizer_matches_eager_counts_and_cells(self):
+        # grad_metal's one-dispatch-per-parameter sanitizer, over three steps:
+        # the counters count steps (not cells), and only nonfinite cells change
+        from grad_metal import NonfiniteGradSanitizer
+        bad = torch.nn.Parameter(torch.ones(1, 3, 40, 40, 40, device='mps'))
+        good = torch.nn.Parameter(torch.ones(4, device='mps'))
+        named = [('bad', bad), ('good', good)]
+        steps = torch.zeros((), device='mps')
+        by_param = {name: torch.zeros((), device='mps') for name, _ in named}
+        sanitizer = NonfiniteGradSanitizer(named, by_param, steps)
+        self.assertTrue(sanitizer.available())
+        for step in range(3):
+            bad.grad = torch.full_like(bad, 3.0)
+            good.grad = torch.full_like(good, 2.0)
+            if step != 1:
+                bad.grad[0, 0, 2, 2, 2] = float('nan')
+                bad.grad[0, 1, 0, 0, 0] = float('inf')
+                bad.grad[0, 2, 39, 39, 39] = float('-inf')
+            sanitizer()
+            expected_zeros = 0 if step == 1 else 3
+            self.assertEqual(int((bad.grad == 0).sum()), expected_zeros)
+            self.assertEqual(int((bad.grad == 3.0).sum()), bad.numel() - expected_zeros)
+            self.assertTrue(torch.equal(good.grad, torch.full_like(good, 2.0)))
+        self.assertEqual(steps.item(), 2.0)
+        self.assertEqual(by_param['bad'].item(), 2.0)
+        self.assertEqual(by_param['good'].item(), 0.0)
+
     def test_sanitizer_runs_before_clipping_and_smoothing(self):
         # Clipping would clamp an infinity to a finite bound and hide it from
         # the nonfinite counters; smoothing would spread one NaN over every

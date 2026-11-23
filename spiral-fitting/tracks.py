@@ -24,6 +24,7 @@ from scipy.spatial import cKDTree
 from tqdm import tqdm
 
 import prefetch
+import track_loss_metal
 from dt_targets import snap_dt_target, strip_dt_target_in_sample_frame
 from spiral_progress import progress_or_null
 from service_http import sha256_file
@@ -2290,8 +2291,12 @@ def _attach_device_resident_points(bundle, device):
     bitwise identical either way; this only changes where the gather runs.
     Disable with VC_DISABLE_TRACK_DEVICE_POINTS=1 (the host path stays the
     fallback whenever the copies would crowd device memory).
+
+    Also keeps a host copy of the resampled lengths, so the sampler knows each
+    batch's point count without reading it back from the device.
     """
-    if device.type != 'cuda':
+    bundle['lengths_cpu'] = bundle['lengths'].cpu()
+    if device.type not in ('cuda', 'mps'):
         return
     if os.environ.get('VC_DISABLE_TRACK_DEVICE_POINTS') == '1':
         return
@@ -2299,7 +2304,11 @@ def _attach_device_resident_points(bundle, device):
     source_local = bundle['flat_source_local_cpu']
     needed = (coordinates.numel() * coordinates.element_size()
               + source_local.numel() * source_local.element_size())
-    free_bytes, _total_bytes = torch.cuda.mem_get_info(device)
+    if device.type == 'cuda':
+        free_bytes, _total_bytes = torch.cuda.mem_get_info(device)
+    else:
+        # unified memory: bound the copies by Metal's working-set budget
+        free_bytes = torch.mps.recommended_max_memory()
     if needed > 0.2 * free_bytes:
         return
     bundle['flat_zyx'] = coordinates.to(device=device)
@@ -2584,6 +2593,8 @@ def _draw_track_sample(
     device = prepared_tracks['device']
     num_tracks = int(prepared_tracks['lengths'].numel())
     sampling_probabilities = prepared_tracks.get('sampling_probabilities')
+    # host copy of the primary ids, when they are drawn on the host
+    primary_cpu_tensor = None
     if sampling_probabilities is None:
         primary_track_idx = torch.randint(
             num_tracks, (k,), device=device, generator=generator)
@@ -2591,9 +2602,16 @@ def _draw_track_sample(
         # MPS multinomial asks Metal for one oversized buffer (83 GB for
         # 144k tracks x 5k samples) and aborts; draw on the CPU instead.
         # The MPS path never passes a generator, so the CPU draw follows
-        # the globally seeded CPU RNG and stays reproducible.
-        primary_track_idx = torch.multinomial(
-            sampling_probabilities.cpu(), k, replacement=True).to(device)
+        # the globally seeded CPU RNG and stays reproducible. The host copy
+        # of the probabilities is kept, since reading it back every step
+        # waits for the whole GPU queue.
+        cached = prepared_tracks.get('_sampling_probabilities_host')
+        if cached is None or cached[0] is not sampling_probabilities:
+            cached = (sampling_probabilities, sampling_probabilities.cpu())
+            prepared_tracks['_sampling_probabilities_host'] = cached
+        primary_cpu_tensor = torch.multinomial(cached[1], k, replacement=True)
+        # uploaded below, with the rest of the batch on the host-planned path
+        primary_track_idx = None
     else:
         primary_track_idx = torch.multinomial(
             sampling_probabilities, k, replacement=True, generator=generator)
@@ -2601,13 +2619,13 @@ def _draw_track_sample(
     crossing_index = prepared_tracks.get('crossing_index')
     crossing_csr = prepared_tracks.get('crossing_csr')
     has_crossings = crossing_index is not None or crossing_csr is not None
-    partner_group = torch.empty(0, dtype=torch.int64, device=device)
-    partner_slot = torch.empty(0, dtype=torch.int64, device=device)
-    partner_track_idx = torch.empty(0, dtype=torch.int64, device=device)
-    selected_self_sample = torch.empty(
-        0, dtype=torch.int64, device=device)
-    selected_partner_sample = torch.empty(
-        0, dtype=torch.int64, device=device)
+    # partner selection runs on the host; keep its results there until the
+    # device needs them, so the host-planned MPS path can upload them at once
+    partner_track_cpu = np.empty(0, dtype=np.int64)
+    partner_group_cpu = np.empty(0, dtype=np.int64)
+    partner_slot_cpu = np.empty(0, dtype=np.int64)
+    self_sample_cpu = np.empty(0, dtype=np.int64)
+    partner_sample_cpu = np.empty(0, dtype=np.int64)
     if has_crossings and max_crossings > 0:
         seed = int(torch.randint(
             0, (1 << 63) - 1, (1,), dtype=torch.int64,
@@ -2616,7 +2634,8 @@ def _draw_track_sample(
         # which the native sampler's uint64 seed rejects. No-op elsewhere.
         seed &= (1 << 63) - 1
         primary_cpu = np.asarray(
-            primary_track_idx.detach().cpu(), dtype=np.int32)
+            primary_cpu_tensor if primary_cpu_tensor is not None
+            else primary_track_idx.detach().cpu(), dtype=np.int32)
         native = _load_native_track_crossings()
         if crossing_index is not None:
             result = native.sample_crossing_partners(
@@ -2627,23 +2646,34 @@ def _draw_track_sample(
                 crossing_csr, primary_cpu, max_crossings, seed)
         selected_cpu = np.asarray(result['partners'], dtype=np.int32)
         valid_cpu = selected_cpu >= 0
-        selected = torch.from_numpy(selected_cpu).to(device=device)
-        valid = selected >= 0
-        partner_track_idx = selected[valid].to(torch.int64)
-        partner_group = torch.arange(k, device=device)[:, None].expand_as(
-            selected)[valid]
-        partner_slot = torch.arange(
-            selected.shape[1], device=device)[None, :].expand_as(selected)[valid]
-        record_samples = resampled['crossing_record_sample_cpu']
-        selected_self_sample = record_samples[
-            torch.from_numpy(
-                np.asarray(result['records'], dtype=np.int32)[valid_cpu]).long()
-        ].to(device=device)
-        selected_partner_sample = record_samples[
-            torch.from_numpy(
-                np.asarray(
-                    result['partner_records'], dtype=np.int32)[valid_cpu]).long()
-        ].to(device=device)
+        # mask on the host: a device boolean mask reads its count back, which
+        # waits for the GPU queue; the values are the same integers
+        partner_group_cpu, partner_slot_cpu = np.nonzero(valid_cpu)
+        partner_group_cpu = partner_group_cpu.astype(np.int64)
+        partner_slot_cpu = partner_slot_cpu.astype(np.int64)
+        partner_track_cpu = selected_cpu[valid_cpu].astype(np.int64)
+        record_samples = np.asarray(resampled['crossing_record_sample_cpu'])
+        self_sample_cpu = record_samples[np.asarray(
+            result['records'], dtype=np.int32)[valid_cpu]].astype(np.int64)
+        partner_sample_cpu = record_samples[np.asarray(
+            result['partner_records'], dtype=np.int32)[valid_cpu]].astype(np.int64)
+
+    if (primary_cpu_tensor is not None
+            and track_loss_metal.host_planned_sample_available(resampled, device)):
+        return _host_planned_track_sample(
+            prepared_tracks, resampled, k, target_points, max_crossings,
+            np.asarray(primary_cpu_tensor, dtype=np.int64), partner_track_cpu,
+            partner_group_cpu, partner_slot_cpu, self_sample_cpu,
+            partner_sample_cpu, device)
+
+    if primary_track_idx is None:
+        primary_track_idx = primary_cpu_tensor.to(device)
+    partner_track_idx = torch.from_numpy(partner_track_cpu).to(device=device)
+    partner_group = torch.from_numpy(partner_group_cpu).to(device=device)
+    partner_slot = torch.from_numpy(partner_slot_cpu).to(device=device)
+    selected_self_sample = torch.from_numpy(self_sample_cpu).to(device=device)
+    selected_partner_sample = torch.from_numpy(
+        partner_sample_cpu).to(device=device)
 
     track_idx = torch.cat([primary_track_idx, partner_track_idx])
     group_id = torch.cat([
@@ -2701,6 +2731,51 @@ def _draw_track_sample(
         'partner_cross_flat': partner_cross_flat,
         'partner_rows': partner_rows,
     }
+
+
+def _host_planned_track_sample(
+        prepared_tracks, resampled, k, target_points, max_crossings,
+        primary_cpu, partner_track_cpu, partner_group_cpu, partner_slot_cpu,
+        self_sample_cpu, partner_sample_cpu, device):
+    """_draw_track_sample's batch layout, planned on the host for MPS.
+
+    The row layout follows from the host-side track ids and the host copy of
+    the resampled lengths, so it is built with numpy and sent in one upload;
+    one Metal dispatch then writes the per-point and per-target indices and
+    gathers the points (track_loss_metal.build_track_sample). The values are
+    the eager path's, integer for integer and bit for bit (the same float32
+    linspace and round-half-even for the target positions). The eager path
+    runs ~15 MPS ops whose shapes change every step, so MPS compiles a graph
+    for each and waits on the queue for the point count; this path compiles
+    none and never reads back from the device.
+    """
+    track_cpu = np.concatenate([primary_cpu, partner_track_cpu])
+    rows = len(track_cpu)
+    row_lengths_cpu = np.asarray(resampled['lengths_cpu'])[track_cpu]
+    row_starts_cpu = np.zeros(rows + 1, dtype=np.int64)
+    np.cumsum(row_lengths_cpu, out=row_starts_cpu[1:])
+    partner_rows_cpu = np.arange(k, rows, dtype=np.int64)
+    host = {
+        'track_idx': track_cpu,
+        'row_starts': row_starts_cpu,
+        'row_lengths': row_lengths_cpu.astype(np.int64),
+        'group_id': np.concatenate([np.arange(k, dtype=np.int64), partner_group_cpu]),
+        'row_slot': np.concatenate([np.zeros(k, dtype=np.int64), partner_slot_cpu + 1]),
+        'partner_rows': partner_rows_cpu,
+        'primary_cross_flat': row_starts_cpu[partner_group_cpu] + self_sample_cpu,
+        'partner_cross_flat': row_starts_cpu[partner_rows_cpu] + partner_sample_cpu,
+        # the fused radius loss walks each group's partner rows from these
+        'partner_offsets': np.searchsorted(
+            partner_group_cpu, np.arange(k + 1), side='left').astype(np.int64),
+    }
+    sample = track_loss_metal.upload_host_arrays(prepared_tracks, host, device)
+    built = track_loss_metal.build_track_sample(
+        sample['row_starts'], sample['track_idx'], resampled,
+        target_points, int(row_starts_cpu[-1]), prepared_tracks)
+    sample.update(built)
+    sample['num_groups'] = k
+    sample['group_width'] = max_crossings + 1
+    return sample
 
 
 def _sample_prepared_track_points(
@@ -2915,30 +2990,41 @@ def iter_track_losses(slice_to_spiral_transform, dr_per_winding, prepared_tracks
     num_groups = sample['num_groups']
     sampled_spiral = _transform_shape_bucketed(
         slice_to_spiral_transform, sampled_scroll)
-    theta, _, shifted_radii = get_theta_and_radii(sampled_spiral[..., 1:], dr_per_winding)
-    shifted_radii, crossing_adjustments = _unwrap_ragged_track_radii(
-        theta, shifted_radii, dr_per_winding, row_id, row_starts,
-    )
-
-    # Every appended partner is put into its primary track's unwrap frame at
-    # their exact shared voxel.  A single group target can then constrain all
-    # points on both complete tracks to one winding.
-    if sample['partner_rows'].numel() > 0:
-        row_alignment = _crossing_row_alignments(
-            shifted_radii, sample['primary_cross_flat'],
-            sample['partner_cross_flat'], sample['partner_rows'],
-            len(track_idx))
-        flat_alignment = row_alignment[row_id]
-        shifted_radii = shifted_radii + flat_alignment
-        crossing_adjustments = crossing_adjustments + flat_alignment
-
     dt_hinge_margin = dr_per_winding.detach() * cfg['track_dt_loss_margin']
-    target_values = shifted_radii[sample['target_flat_idx']]
-    radius_loss, group_radius_targets, diagnostic_radius = \
-        _grouped_same_radius_loss(
-            shifted_radii, target_values, row_id, group_id,
-            sample['row_slot'], num_groups, sample['group_width'],
-            dr_per_winding, cfg)
+    fused = (not diagnostics_enabled()
+             and track_loss_metal.track_radius_metal_available(
+                 sampled_spiral, dr_per_winding, cfg))
+    if fused:
+        # one dispatch forward and one backward instead of ~50 eager ops each;
+        # the detached intermediates feed the DT target below
+        radius_loss, shifted_radii, crossing_adjustments, theta, \
+            group_radius_targets = track_loss_metal.track_radius_loss_metal(
+                sampled_spiral, dr_per_winding, sample, cfg)
+        target_values = shifted_radii[sample['target_flat_idx']]
+    else:
+        theta, _, shifted_radii = get_theta_and_radii(sampled_spiral[..., 1:], dr_per_winding)
+        shifted_radii, crossing_adjustments = _unwrap_ragged_track_radii(
+            theta, shifted_radii, dr_per_winding, row_id, row_starts,
+        )
+
+        # Every appended partner is put into its primary track's unwrap frame at
+        # their exact shared voxel.  A single group target can then constrain all
+        # points on both complete tracks to one winding.
+        if sample['partner_rows'].numel() > 0:
+            row_alignment = _crossing_row_alignments(
+                shifted_radii, sample['primary_cross_flat'],
+                sample['partner_cross_flat'], sample['partner_rows'],
+                len(track_idx))
+            flat_alignment = row_alignment[row_id]
+            shifted_radii = shifted_radii + flat_alignment
+            crossing_adjustments = crossing_adjustments + flat_alignment
+
+        target_values = shifted_radii[sample['target_flat_idx']]
+        radius_loss, group_radius_targets, diagnostic_radius = \
+            _grouped_same_radius_loss(
+                shifted_radii, target_values, row_id, group_id,
+                sample['row_slot'], num_groups, sample['group_width'],
+                dr_per_winding, cfg)
     if diagnostics_enabled():
         diagnostic_radius_target = group_radius_targets[group_id[row_id]]
         diagnostic_target_radii = radius_from_unwrapped_shifted(
