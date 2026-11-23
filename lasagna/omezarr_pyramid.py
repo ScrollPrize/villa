@@ -410,10 +410,9 @@ def _moment_pool2x_normals(nx_u8: np.ndarray, ny_u8: np.ndarray, *, validity: np
 	oz, oy, ox = (z + 1) // 2, (y + 1) // 2, (x + 1) // 2
 	if nx_u8.size == 0:
 		return np.empty((oz, oy, ox), dtype=np.uint8), np.empty((oz, oy, ox), dtype=np.uint8)
-	if nx_u8.dtype != np.uint8 or ny_u8.dtype != np.uint8:
-		return _moment_pool2x_normals_general(nx_u8, ny_u8, validity=validity)
-
-	comp_lut, nz_lut, uniform_nx, uniform_ny, zero_nx, zero_ny = _get_normal_luts()
+	general = nx_u8.dtype != np.uint8 or ny_u8.dtype != np.uint8
+	if not general:
+		comp_lut, nz_lut, uniform_nx, uniform_ny, zero_nx, zero_ny = _get_normal_luts()
 	nx_out = np.empty((oz, oy, ox), dtype=np.uint8)
 	ny_out = np.empty((oz, oy, ox), dtype=np.uint8)
 	inv8 = np.float32(0.125)
@@ -427,8 +426,7 @@ def _moment_pool2x_normals(nx_u8: np.ndarray, ny_u8: np.ndarray, *, validity: np
 		sval = None if validity is None else validity[z0:z1]
 		sz, sy, sx = snx.shape
 
-		if (sz & 1) or (sy & 1) or (sx & 1):
-			# Small Z-slab with odd boundary dimension: exact general pooling + fast 3x3 solver.
+		if general or (sz & 1) or (sy & 1) or (sx & 1):
 			onx, ony = _moment_pool2x_normals_general(snx, sny, validity=sval)
 			nx_out[oz0:oz1] = onx
 			ny_out[oz0:oz1] = ony
