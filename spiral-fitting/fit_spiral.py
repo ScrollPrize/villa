@@ -723,11 +723,24 @@ def get_run_dt_resume_iteration(run_start, requested_iterations,
     return int(run_start) + suppressed
 
 
-def get_dt_loss_eligibility(cfg, iteration, run_dt_resume_iteration=None):
-    """Return whether the patch DT loss is eligible at ``iteration``."""
+def winding_solve_identity(solve):
+    """What identifies a fit's winding solve (fiber_solve_inputs.WindingSolve)
+    in a checkpoint: the run and the store positions it was read at; None
+    without one."""
+    if solve is None:
+        return None
+    return {'run_uuid': solve.run_uuid,
+            'fiber_store_position': dict(solve.fiber_store_position),
+            'run_store_position': dict(solve.run_store_position)}
+
+
+def get_dt_loss_eligibility(cfg, iteration, run_dt_resume_iteration=None,
+                            start_key='loss_start_patch_dt'):
+    """Return whether a DT loss starting after ``cfg[start_key]`` (the patch
+    DT loss by default) is eligible at ``iteration``."""
     run_eligible = (run_dt_resume_iteration is None
                     or iteration >= run_dt_resume_iteration)
-    return run_eligible and iteration > cfg['loss_start_patch_dt']
+    return run_eligible and iteration > cfg[start_key]
 
 
 def get_exponential_lr_at_step(
@@ -1131,7 +1144,8 @@ class FitContext:
           using_tracks, filter_tracks_by_shell
         - fibers: fiber_solve (fiber_solve_inputs.WindingSolve, or None when
           the inputs name no winding solve); its c and w_s are set once the
-          model exists (_measure_fiber_seam_offset)
+          model exists (_measure_fiber_seam_offset), and the model stage
+          builds the fiber CC loss on it (fiber_cc_loss, None when off)
         - misc: umbilicus, scroll_zarr, shell_envelope,
           dense_spacing_mode, grad_mag_spacing_enabled
         """
@@ -1195,7 +1209,7 @@ class FitContext:
         print(f' loaded {len(verified_patches)} patches from the object store')
         self._report_object_store_inputs(self.object_store_inputs)
         # The fibers of the winding solve the inputs name (none in a session
-        # whose inputs name no solve). No loss reads them yet.
+        # whose inputs name no solve); the model stage builds their loss.
         fiber_solve = self._load_winding_solve() if self.paths.winding_solve_fibers else None
 
         # ==========================================================================
@@ -1437,14 +1451,52 @@ class FitContext:
 
     def _measure_fiber_seam_offset(self):
         """c, the solve's seam against Spiral's theta = 0 under the step-0
-        transform, and w_s at the kept fiber points (set_seam_offset)."""
+        transform, and w_s at the kept fiber points (set_seam_offset); then
+        the fiber CC loss over them (None when no fiber point is in the z
+        window)."""
         from fiber_solve_inputs import undeformed_theta
+        from fiber_cc_loss import FiberCCLoss
+        self.fiber_cc_loss = None
         if self.fiber_solve is None:
             return
         line = self.fiber_solve.set_seam_offset(
             undeformed_theta(self.spiral_and_transform, self.fiber_solve.zyx))
-        if self.dist.is_main_process:
-            self.input_log(line)
+        log = self.input_log if self.dist.is_main_process else (lambda line: None)
+        log(line)
+        self.fiber_cc_loss = FiberCCLoss.build(
+            self.fiber_solve, self.config, self.device, log=log)
+
+    def _report_fiber_winding_consistency(self):
+        """Log the windings the fiber labels claim in the z range beside the
+        shell index and the first output winding, warning when they reach
+        past the shell index (no dense sampler models those windings)."""
+        fiber_windings = self._fiber_range_windings()
+        if fiber_windings is None or not len(fiber_windings) or not self.dist.is_main_process:
+            return
+        low, high = int(fiber_windings.min()), int(fiber_windings.max())
+        print(f'fiber labels in the z range: windings [{low}, {high}] (largest component); '
+              f'shell_outer_winding_idx {self.shell_outer_winding_idx}, '
+              f'output_first_winding {self.config["output_first_winding"]}')
+        if self.shell_outer_winding_idx is not None and high > self.shell_outer_winding_idx:
+            print(f'WARNING: fiber labels reach winding {high}, beyond shell_outer_winding_idx '
+                  f'{self.shell_outer_winding_idx}: the fiber loss pulls those points past the '
+                  'outermost winding the dense losses model')
+
+    def _fiber_loss_active(self):
+        """Whether the fiber CC loss is on: built (fibers in the z window)
+        and weighted. A zero weight turns fibers off everywhere: loss, health
+        metrics and winding-range / shell-index inference."""
+        return (getattr(self, 'fiber_cc_loss', None) is not None
+                and float(self.config['loss_weight_fiber']) > 0)
+
+    def _fiber_range_windings(self):
+        """The fiber labels in the z range that winding-range and shell-index
+        inference read (the largest component's, fiber_cc_loss), or None
+        when the fiber loss is off."""
+        if not self._fiber_loss_active():
+            return None
+        fiber_loss = self.fiber_cc_loss
+        return fiber_loss.range_windings(self.z_begin, self.z_end)
 
     def _resume_input_pins(self):
         """The pins (object_store_inputs.InputPins) the resumed checkpoint's
@@ -1519,6 +1571,7 @@ class FitContext:
             self.config,
             self.z_begin,
             self.z_end,
+            fiber_windings=self._fiber_range_windings(),
         )
 
     def _warn_if_dense_losses_structurally_disabled(self):
@@ -2032,6 +2085,7 @@ class FitContext:
             self.config, shell_active, self._infer_outer_winding_idx_for_this_run)
         for note in outer_winding_notes:
             print(note)
+        self._report_fiber_winding_consistency()
 
         self._dense_inactive_warned = set()
 
@@ -2232,7 +2286,7 @@ class FitContext:
         'slice_to_spiral_transform', 'dr_per_winding',
         'dt_target_cache_manager', 'dist_grad_params', 'dist_grad_named',
         'step_timer', 'nonfinite_grad_steps', 'nonfinite_grad_by_param',
-        'run_dt_resume_iteration',
+        'run_dt_resume_iteration', 'fiber_cc_loss',
     )
 
     def rebuild_model_state(self):
@@ -2326,6 +2380,9 @@ class FitContext:
         if inputs is not None and inputs.manifest is not None:
             manifest['object_store'] = inputs.manifest
             manifest['object_store_digest'] = inputs.digest
+        solve = winding_solve_identity(getattr(self, 'fiber_solve', None))
+        if solve is not None:
+            manifest['winding_solve'] = solve
         return manifest
 
     def save_checkpoint(self, path, completed_iterations):
@@ -2465,6 +2522,23 @@ class FitContext:
             reasons.extend(resume_problems(
                 checkpoint.get('input_manifest'), inputs,
                 allow_changed=self.config['object_store_allow_changed_inputs']))
+        # The winding solve the fiber loss reads: the same run, read at the
+        # same fiber-store and run-store positions.
+        solve = winding_solve_identity(getattr(self, 'fiber_solve', None))
+        if solve is not None:
+            recorded = (checkpoint.get('input_manifest') or {}).get('winding_solve')
+            recorded = recorded if isinstance(recorded, Mapping) else None
+            if recorded != solve:
+                problem = ('checkpoint records no winding solve' if recorded is None else
+                           'checkpoint winding solve differs from this fit\'s in '
+                           + ', '.join(key for key in sorted(set(recorded) | set(solve))
+                                       if recorded.get(key) != solve.get(key)))
+                if self.config['object_store_allow_changed_inputs']:
+                    print(f'WARNING: {problem}; resuming anyway '
+                          '(object_store_allow_changed_inputs)')
+                else:
+                    reasons.append(f'{problem}; set object_store_allow_changed_inputs '
+                                   'to resume anyway')
         # The reference volume the inputs were resolved in; a checkpoint from
         # before inputs recorded it is identified by its object-store inputs.
         checkpoint_volume = str(
@@ -2769,6 +2843,10 @@ class FitContext:
     def clear_interactive_run_state(self):
         """Clear every transient state installed for one interactive Run."""
         self.clear_dt_loss_schedule()
+        # The fiber DT targets are recomputed at the next Run's first
+        # eligible step, never carried across Runs.
+        if getattr(self, 'fiber_cc_loss', None) is not None:
+            self.fiber_cc_loss.reset_targets()
 
     def export_preview(self, generation_path, surface_id, *, diagnostics=False):
         """Write one preview generation; optionally with its loss overlays.
@@ -2814,6 +2892,7 @@ class FitContext:
                 input_extent_transform=live_transform,
                 patch_atlas=self.patch_atlas,
                 patch_satisfaction_evaluation=splice_evaluation,
+                fiber_windings=self._fiber_range_windings(),
             )
             # The same identity the checkpoint written at this boundary
             # carries, so the host can pair the two later, and the inputs it
@@ -2833,7 +2912,7 @@ class FitContext:
                     'patch_radius', 'patch_dt',
                     'sym_dirichlet',
                     'dense_normals', 'dense_spacing',
-                    'track_radius',
+                    'track_radius', 'fiber',
                 )
             }
             if self._winding_model_mode_active():
@@ -2895,6 +2974,10 @@ class FitContext:
                 if self.prepared_main_tracks is not None:
                     get_track_radius_loss(
                         transform, dr, self.prepared_main_tracks, self.config)
+                if self._fiber_loss_active():
+                    # The equal-radius targets: no DT-target refresh here.
+                    self.fiber_cc_loss.loss(
+                        transform, dr, self.config, iteration=0, dt_active=False)
             # This block is a one-shot consumer: no later sampler call would
             # drain its deferred unset-potential verdicts, so resolve them
             # before the diagnostics are published.
@@ -3102,6 +3185,14 @@ class FitContext:
             self.preview_extent_tracks = (
                 (self.prepared_main_tracks['flat_zyx_cpu'],)
                 if self.prepared_main_tracks is not None else ())
+        fiber_loss = getattr(self, 'fiber_cc_loss', None)
+        if fiber_loss is not None and changed & {
+                'fiber_vertical_radial_offset_enabled',
+                'fiber_vertical_radial_offset_voxels',
+        }:
+            # The per-point offsets come from each fiber's family and these
+            # settings; the DT targets computed against the old ones go.
+            fiber_loss.refill_vertical_offsets(self.config)
         if 'theta_crossing_map_update_interval' in changed:
             # refresh_if_due observes the changed interval on the next step and
             # resets its cadence without rebuilding immutable topology.
@@ -3330,6 +3421,29 @@ class FitContext:
             backward_family({'track_radius': (
                 track_radius_loss * self.config['loss_weight_track_radius'])})
             del track_radius_loss
+
+        if self.fiber_cc_loss is not None:
+            fiber_weight = float(self.config['loss_weight_fiber'])
+            fiber_loss = (
+                self.fiber_cc_loss.loss(
+                    self.slice_to_spiral_transform, self.dr_per_winding, self.config,
+                    iteration=iteration,
+                    dt_active=get_dt_loss_eligibility(
+                        self.config, iteration, self.run_dt_resume_iteration,
+                        start_key='loss_start_fiber_dt'))
+                if fiber_weight > 0 else torch.zeros([], device=self.dr_per_winding.device))
+            backward_family({'fiber': fiber_loss * fiber_weight})
+            del fiber_loss
+            # The label health checks, at the metrics cadence, on their own
+            # generator (so they never move the training RNG streams).
+            if fiber_weight > 0 and iteration % 200 == 0:
+                fiber_metrics = self.fiber_cc_loss.metrics(
+                    self.slice_to_spiral_transform, self.dr_per_winding.detach(), iteration)
+                log_metrics.update(fiber_metrics)
+                if self.dist.is_main_process:
+                    for line in self.fiber_cc_loss.metrics_lines(
+                            fiber_metrics, self.config, f'step {iteration}'):
+                        print(line)
 
         shell_metrics = {}
         if (self.shell_map is not None
@@ -3711,6 +3825,14 @@ class FitContext:
                 scroll_slices_for_visualisation = None
                 prediction_slices_for_visualisation = None
                 quad_label_map = None
+            if self._fiber_loss_active():
+                fiber_metrics = self.fiber_cc_loss.metrics(
+                    self.spiral_and_transform.get_slice_to_spiral_transform(),
+                    self.spiral_and_transform.get_dr_per_winding().detach(),
+                    self.num_training_steps)
+                for line in self.fiber_cc_loss.metrics_lines(
+                        fiber_metrics, self.config, suffix):
+                    print(line)
             progress.begin(
                 'finalizing', 'Computing satisfaction metrics and outputs')
             save_overlay_and_print_satisfaction(
@@ -3741,6 +3863,7 @@ class FitContext:
                 run_tag=self.run_tag,
                 save_png_visualizations=self.config.get('output_save_png_visualizations', False),
                 progress=progress,
+                fiber_windings=self._fiber_range_windings(),
             )
             progress.finish()
             progress.clear()
@@ -3916,6 +4039,7 @@ if __name__ == '__main__':
             'sample_count_patches_per_step',
             'sample_count_patches_per_step_for_dt',
             'sample_count_tracks_per_step',
+            'sample_count_fiber_ccs',
             'sample_count_dense_normal_points',
             'sample_count_fiber_direction_points',
             'sample_count_winding_model_relative_pairs',

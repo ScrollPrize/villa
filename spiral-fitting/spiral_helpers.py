@@ -232,8 +232,13 @@ def compute_winding_range_and_input_extents(
     z_end,
     authoritative_zyx_lines=(),
     point_budget=None,
+    fiber_windings=None,
 ):
     """Compute output winding range plus max observed radius/winding per patch.
+
+    ``fiber_windings`` are winding labels the fiber solve gives points in
+    the z range (fiber_cc_loss.FiberCCLoss.range_windings); they widen the
+    range like observed windings.
 
     ``point_budget`` caps how many points of each input kind are actually
     transformed (per patch for patches, in total for tracks). ``None``
@@ -375,6 +380,9 @@ def compute_winding_range_and_input_extents(
             flush_pending_track_points()
     flush_pending_track_points()
 
+    if fiber_windings is not None and len(fiber_windings):
+        update_from_winding_indices(torch.as_tensor(np.asarray(fiber_windings)).clamp_min(0))
+
     first_winding = cfg['output_first_winding']
     if min_w is None:
         output_winding_range = (first_winding, first_winding)
@@ -391,6 +399,7 @@ def _infer_shell_outer_winding_idx(
     cfg,
     z_begin,
     z_end,
+    fiber_windings=None,
 ):
     _, patch_extents = compute_winding_range_and_input_extents(
         slice_to_spiral_transform,
@@ -405,6 +414,15 @@ def _infer_shell_outer_winding_idx(
         if max_w is None:
             continue
         observed_max = max_w if observed_max is None else max(observed_max, max_w)
+    # The fiber solve's labels (its largest component's, after the outlier
+    # drop) claim windings too.
+    patch_max = observed_max
+    if fiber_windings is not None and len(fiber_windings):
+        fiber_max = int(np.max(fiber_windings))
+        observed_max = fiber_max if observed_max is None else max(observed_max, fiber_max)
+        print(f'shell_outer_winding_idx inferred from the outermost winding: patches '
+              f'{patch_max}, fiber labels {fiber_max}, plus margin '
+              f'{cfg["shell_outer_winding_margin"]}')
     if observed_max is None:
         observed_max = cfg['output_first_winding']
     return int(observed_max + cfg['shell_outer_winding_margin'])
@@ -859,6 +877,7 @@ def save_combined_preview(
     input_extent_transform=None,
     patch_atlas=None,
     patch_satisfaction_evaluation=None,
+    fiber_windings=None,
 ):
     """Write the authoritative connected preview used by VC3D and Lasagna.
 
@@ -905,6 +924,7 @@ def save_combined_preview(
             z_end,
             authoritative_zyx_lines=tracks,
             point_budget=ESTIMATED_WINDING_RANGE_POINT_BUDGET,
+            fiber_windings=fiber_windings,
         )
     first_winding = 10
     last_winding = int(exclusive_upper) - 1

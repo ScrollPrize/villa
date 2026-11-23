@@ -16,8 +16,8 @@ At startup (read_winding_solve), for every fiber with a run row:
 
 Once the model exists, WindingSolve.set_seam_offset measures ``c``, the
 offset between the solve's seam and Spiral's theta = 0 under the step-0
-transform, and sets ``w_s = w - c`` at the kept points. Nothing reads these
-inputs as a loss yet.
+transform, and sets ``w_s = w - c`` at the kept points; fiber_cc_loss reads
+them.
 """
 import dataclasses
 import json
@@ -215,8 +215,9 @@ class WindingSolve:
     decimation) are ``piece_offsets`` int64 [K + 1] into the points and
     ``piece_fiber`` int64 [K].
 
-    ``c``, ``c_spread_p99`` and ``w_s`` (= w - c, float64 [P]) are None until
-    set_seam_offset.
+    ``c``, ``c_spread_p99``, ``w_s`` (= w - c, float64 [P]) and ``n0``
+    (int64 [P], each point's sheet label round(w_s - theta_0 / 2pi) under the
+    step-0 transform) are None until set_seam_offset.
     """
     fibers_path: str
     run_store_path: str
@@ -251,6 +252,7 @@ class WindingSolve:
     c: float = None
     c_spread_p99: float = None
     w_s: np.ndarray = None
+    n0: np.ndarray = None
 
     def fiber_name(self, index):
         return str(uuid.UUID(bytes=self.fiber_uuid[index].tobytes()))
@@ -279,13 +281,15 @@ class WindingSolve:
 
     def set_seam_offset(self, theta0):
         """Measure c, the circular median over the kept points of
-        phi_seam - theta_0 / 2pi (phi_seam = w mod 1), and set w_s = w - c.
+        phi_seam - theta_0 / 2pi (phi_seam = w mod 1), and set w_s = w - c
+        and the undeformed sheet labels n0.
         ``theta0`` is Spiral's wrapped angle at the kept points under the
         step-0 transform (undeformed_theta). Refuses the solve when the 99th
         percentile of the deviation from c exceeds SEAM_OFFSET_SPREAD_MAX
         turns (a wrong handedness or fiber scale). Returns the log line."""
         if not len(self.w):
             self.c, self.c_spread_p99, self.w_s = None, None, self.w.copy()
+            self.n0 = np.zeros(0, dtype=np.int64)
             return 'winding solve: no fiber point in the z window; c not measured'
         c, deviation = circular_median(
             np.mod(self.w, 1.0) - np.asarray(theta0, dtype=np.float64) / (2 * np.pi))
@@ -297,6 +301,8 @@ class WindingSolve:
                 f'{spread:.3f} turns (at most {SEAM_OFFSET_SPREAD_MAX}); check the '
                 'handedness, the umbilicus and the fiber store\'s scale')
         self.c, self.c_spread_p99, self.w_s = c, spread, self.w - c
+        self.n0 = np.round(
+            self.w_s - np.asarray(theta0, dtype=np.float64) / (2 * np.pi)).astype(np.int64)
         return (f'winding solve: c = {c:.3f} turns (seam vs Spiral theta = 0), '
                 f'99th-percentile deviation {spread:.4f} turns over {len(self.w):,} points')
 

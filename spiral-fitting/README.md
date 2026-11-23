@@ -458,8 +458,62 @@ under the step-0 transform, is the circular median of `φ − θ₀/2π` over th
 kept points, and `w_s = w − c`. A spread whose 99th percentile exceeds 0.05
 turns (a wrong handedness or fiber scale) refuses the solve. The log reports
 the counts (fibers, dropped fibers, components, the largest one, kept fibers,
-pieces and points), the largest step of `w` and `c`. No loss reads the fibers
-yet.
+pieces and points), the largest step of `w` and `c`.
+
+### Fiber loss
+
+`fiber_cc_loss.py` turns each connected component (CC) of the solve into one
+loss term (`loss_weight_fiber`; 0 turns fibers off entirely: no loss, no
+health metrics, no part in range or shell inference). Only the solve's integer is
+trusted, read in the model's own angle θ at each point:
+`n = round(w_s − θ/2π)`, `ρ = w_s − θ/2π − n` (points with |ρ| > 0.4 are
+rejected), and `s = (shifted − offset·stretch)/dr − n`. Spiral's winding
+label `shifted/dr` steps at θ = 0 where `n` does, so `s` is constant over a
+correctly placed CC. Per sampled point, Huber on the error (quadratic below
+`fiber_huber_delta_turns`, then linear):
+
+- the largest CC: `|s − c0|` from step 0, with the integer gauge
+  `c0 = fiber_largest_cc_min_winding − n_low`;
+- every other CC: `|s − median(s)|` over the step's accepted samples (at
+  least two), then after `loss_start_fiber_dt` `|s − T_CC|`, with
+  `T_CC = round(median s)` over all its accepted points, refreshed every
+  `fiber_dt_target_update_interval` steps and at start or resume (nothing is
+  checkpointed); the log counts the targets that change.
+
+Sampling: `sample_count_fiber_ccs` draws per step pick a CC by its number of
+fibers in the z window (so the largest CC gets nearly all of them), then
+`sample_count_points_per_fiber_cc` points in it, each a fiber uniformly and a
+point uniformly along it.
+
+Gauge and outlier drop, at build, from each fiber's whole-fiber label range
+`[floor(w_min − c), floor(w_max − c)]` (the z window plays no part): a
+largest-CC fiber whose minimum lies more than `fiber_outlier_margin_turns`
+below the `fiber_largest_cc_min_percentile`-th percentile of the minima, or
+whose maximum lies that far above the matching high percentile of the
+maxima, is dropped from everything (loss, metrics, inference). `n_low` is
+the smallest minimum of the kept fibers. The log reports the dropped count,
+the kept range, `n_low`, `c0`, and how many kept fibers have their minimum
+at `n_low` and at `n_low + 1` (the gauge often rests on a few fibers). The
+largest CC's labels `n0 + c0` (`n0` under the step-0 transform) in the z
+range also feed winding-range and shell-index inference; the log reports the
+windings they reach beside `shell_outer_winding_idx` and
+`output_first_winding`, and warns when they reach past the shell index.
+
+Vertical fibers (the run's family 1) can be targeted
+`fiber_vertical_radial_offset_voxels` further out along the sheet normal
+(`fiber_vertical_radial_offset_enabled`), converted to spiral radius by the
+transform's local normal stretch; a run-boundary change refills the offsets
+and drops the cached DT targets.
+
+Every 200 steps (and after the fit) the log reports the label health checks
+on a fixed sample drawn from their own generator: the rejected fraction, the
+largest CC's mean `|s − c0|` (and signed median), and the share of
+consecutive accepted point pairs whose change in `n` differs from Spiral's
+winding step at θ = 0 (the model's angle drifted past half a turn); `fiber_rejected_fraction_warn`
+and `fiber_label_step_mismatch_warn` set the warnings. A run whose z window
+holds no fiber point runs without the fiber loss. A checkpoint records the
+solve (run UUID and both store positions) and resumes only against the same
+one unless `object_store_allow_changed_inputs`.
 
 ### Frames and units
 

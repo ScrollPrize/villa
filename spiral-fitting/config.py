@@ -45,14 +45,19 @@ _NULL_TYPES = {
 # erodes patches before they reach the resident pools, the patch-loss z
 # margin decides which attachments materialization keeps (and is recorded in
 # the input manifest), the dense-spacing mode decides which dense stores
-# are opened, and the fiber point spacing decides which fiber points are
-# kept. Nothing retained by a resident session can re-derive their effect, so
-# they demand a full rebuild.
+# are opened, the fiber point spacing decides which fiber points are kept,
+# and the fiber gauge settings decide which fibers are dropped and the
+# winding labels the shell index is inferred from at build. Nothing retained
+# by a resident session can re-derive their effect, so they demand a full
+# rebuild.
 _PREPARED_INPUT_FIELDS = {
     "patch_erode_patches",
     "patch_loss_z_margin",
     "dense_spacing_mode",
     "fiber_min_point_spacing",
+    "fiber_largest_cc_min_winding",
+    "fiber_largest_cc_min_percentile",
+    "fiber_outlier_margin_turns",
 }
 
 # The discretised outer-shell lookup/atlas. These are ordinary run-boundary
@@ -73,6 +78,7 @@ _SCALE_WITH_Z_FIELDS = {
     "sample_count_patches_per_step",
     "sample_count_patches_per_step_for_dt",
     "sample_count_tracks_per_step",
+    "sample_count_fiber_ccs",
     "sample_count_dense_normal_points",
     "sample_count_fiber_direction_points",
     "sample_count_regularisation_points",
@@ -350,6 +356,8 @@ def _field_spec(key, default):
                     "output_num_slices_for_visualization",
                     "theta_crossing_map_update_interval",
                     "dt_target_update_interval",
+                    "fiber_dt_target_update_interval",
+                    "sample_count_fiber_ccs",
                 } else 0),
             maximum=(1_000_000 if key == "output_num_slices_for_visualization"
                      else 16 if key == "fit_volume_level"
@@ -442,6 +450,10 @@ class Config:
         self.sample_count_points_per_patch = 800
         self.sample_count_tracks_per_step = 48000
         self.sample_count_track_points_per_step = 96
+        # Fiber CC loss draws: this many components (by fiber count), then
+        # this many (fiber, point) picks in each.
+        self.sample_count_fiber_ccs = 1024
+        self.sample_count_points_per_fiber_cc = 16
         self.sample_count_dense_normal_points = 60000
         self.sample_count_fiber_direction_points = 60000
         self.sample_count_regularisation_points = 4500
@@ -475,6 +487,19 @@ class Config:
         # The winding solve's fiber points in the z window are thinned along
         # each fiber to at least this spacing (fiber_solve_inputs).
         self.fiber_min_point_spacing = 16.0
+        # The fiber CC loss (fiber_cc_loss): the largest component's gauge
+        # and outlier drop, the Huber width, the other components' DT-target
+        # cadence, the vertical fibers' outward shift and the label health
+        # warnings.
+        self.fiber_largest_cc_min_winding = 1
+        self.fiber_largest_cc_min_percentile = 0.5
+        self.fiber_outlier_margin_turns = 10.0
+        self.fiber_huber_delta_turns = 1.5
+        self.fiber_dt_target_update_interval = 100
+        self.fiber_vertical_radial_offset_enabled = False
+        self.fiber_vertical_radial_offset_voxels = 4.0
+        self.fiber_rejected_fraction_warn = 0.01
+        self.fiber_label_step_mismatch_warn = 0.001
         self.track_min_sample_spacing = 20.0
         self.track_max_sample_spacing = 60.0
         self.track_length_bin_weights = [0.0, 0.15, 0.85]
@@ -497,6 +522,7 @@ class Config:
         self.loss_weight_patch_radius = 8.0
         self.loss_weight_patch_dt = 4.0
         self.loss_weight_track_radius = 50.0
+        self.loss_weight_fiber = 5.0
         self.loss_weight_sym_dirichlet = 10.0
         self.loss_weight_dense_normals = 100.0
         self.loss_weight_fiber_directions = 0.0
@@ -510,6 +536,7 @@ class Config:
         self.optimizer_weight_decay_gap_expander = 0.01
         self.optimizer_weight_decay_flow_field = 0.0
         self.loss_start_patch_dt = 25000
+        self.loss_start_fiber_dt = 25000
         self.dt_target_mode = "strip_median"
         self.dt_target_floating_threshold = 0.25
         # Backward-compatible alias. FitContext phase-locks whole-object DT
@@ -611,6 +638,8 @@ class Config:
                     or type(item) not in (int, float)
                     for item_key, item in value.items()):
                 raise ValueError(f"Invalid dictionary value for {key}")
+        if values["fiber_huber_delta_turns"] <= 0:
+            raise ValueError("fiber_huber_delta_turns must be positive")
         if values["model_gap_expander_capacity_windings"] < 3:
             raise ValueError(
                 "model_gap_expander_capacity_windings must be at least 3")

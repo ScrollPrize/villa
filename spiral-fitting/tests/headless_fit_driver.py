@@ -48,6 +48,7 @@ Z_RANGE_SCALED_COUNT_KEYS = (
     'sample_count_patches_per_step',
     'sample_count_patches_per_step_for_dt',
     'sample_count_tracks_per_step',
+    'sample_count_fiber_ccs',
     'sample_count_dense_normal_points',
     'sample_count_regularisation_points',
     'sample_count_shell_samples',

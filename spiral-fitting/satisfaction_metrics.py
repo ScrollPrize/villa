@@ -694,6 +694,7 @@ def save_overlay_and_print_satisfaction(
     run_tag=None,
     save_png_visualizations=False,
     progress=None,
+    fiber_windings=None,
 ):
     if progress is not None:
         progress.begin(
@@ -801,6 +802,7 @@ def save_overlay_and_print_satisfaction(
             slice_to_spiral_transform, dr_per_winding, [],
             cfg, z_begin, z_end,
             authoritative_zyx_lines=tracks,
+            fiber_windings=fiber_windings,
         )
         winding_range = track_range
         if patch_evaluation.patch_winding_min is not None:
