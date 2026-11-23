@@ -224,6 +224,23 @@ Use `include_sgd:false`, `exact_lp:false`, `capacity_scales:[]` and
 `uv_methods:["irls"]` for IRLS only followed by fixed-label U/V fitting.
 These filters must match when reusing a `prepared_root`.
 
+### Sign reliability and fold diagnostics
+
+`vc_fiber_sign` with `support_output` solves nothing. It reads the store's normal-sign run (`sign_run` selects one when there are several) and reports how well each fiber's sign is tied to the rest of the crossing graph, over the sign solve's crossings and weights (`support_min_weight`, default 0.1, drops weak crossings; crossings that disagree with the signs support nothing). The output file (magic `VCSUPP1`, u64 fibers, per fiber a 16-byte uuid, u64 n and n samples of four doubles) holds per sample, every `support_spacing` voxels (default 64) of arc:
+
+- arc position;
+- missed chain length (voxels) and missed crossing cost (sum of 1 / weight): the bridges between the sample and the largest 2-edge-connected component, where a single unnoticed flip suffices (`fiberSignSupport`);
+- local cut (`fiberSignCut`): the smallest total crossing weight that separates the fiber piece, alone or with fibers around it, from the graph beyond its neighbourhood (`support_cut_hops` 2, `support_cut_fibers` 200), capped at `support_cut_cap` (4). Fibers are split at chain bridges, which weigh `support_cut_chain_length` (50 voxels) / length.
+
+The JSON summary next to it carries the calibration (`fiberSignCalibration`): flips per voxel of chain and wrong crossings per unit of 1 / weight, measured where every flip is detectable, with per-bin bounds (`calibration_min_bin_flips`).
+
+On PHerc0332 (239,064 fibers), against the 985 fibers whose signed normal flips between eleven runs with different extraction settings, a local cut below 2 flags 20 % of the fibers and catches 91 % of the flipping ones; adding the fibers whose disagreeing crossing weight is at least 10 % of their crossing weight catches 96 % at the same share. The bridge terms add only fiber tails, where no crossing can detect a flip.
+
+The remaining sign conflicts sit at sharp folds, not at wrongly signed islands: around two thirds of the disagreeing strong crossings, the fibers within 400 voxels fall into two internally parallel groups whose mean normals are about 100° apart (never near 180°), 90 % of them within 256 voxels of a fiber end. The hinges lie mostly across the scroll axis, so the folds show in vertical sections, not in z slices. The strip-normal fit follows its inputs there; a crossing between the two sides counts as a disagreement although both normals are right. Two extraction options serve that analysis:
+
+- `strip_targets_output` (fused extraction): every chain node's solved normal next to its prediction axis, crossing axis and signed neighbour target with their weights (21 doubles per node; fiber ids in `<output>.json`).
+- `bend_seeds_output` with `bend_seed_classes` (a store with a classification run): pairs of same-family chain nodes of different fibers within `bend_seed_radius` (100) whose directions differ by at least `bend_seed_min_angle` (45°), then exits (`fiberBendSeeds`; magic `VCBSEED1`, u64 count, 16 doubles per pair). On PHerc0332 these pairs do not mark the folds: they mostly pick up fibers at different angles within one sheet. The predicted sheet normals averaged over 128-voxel cells do follow the folds.
+
 ### Normal-source reader cache
 
 Native extraction/orientation defaults to `normal_cache_mode: "auto"` with `normal_cache_fraction: 0.5`; compound workflows also request `normal_channel_cache: true`. Auto mode uses one shared vc_reader decoded-cache budget for the normal and winding datasets, including all channels. Its target is `fraction * (available_memory + resident_cache_bytes)`; subsequent budget changes use the reader's default 10-second EMA, capped by current headroom. It adjusts to memory pressure rather than allocating a separate fraction per volume. An explicit `normal_cache_mode: "fixed"` selects the `normal_cache_bytes` budget when required by another caller; the workflow and extraction performance comparisons use 50% auto, not cache-size sweeps. The general vc_reader library cache default is unchanged. This is a cache budget, not a process memory limit: active sampling buffers and cache entries still held by in-flight readers can temporarily occupy additional RAM.
