@@ -152,8 +152,13 @@ See [NVIDIA's DGX Spark memory guidance](https://docs.nvidia.com/dgx/dgx-spark/k
 Fits run on CUDA whenever it is available. Without it they run on Apple's MPS
 backend, and without that on the CPU; `FIT_SPIRAL_DEVICE=cuda|mps|cpu` (or `cuda:1`)
 picks one explicitly (`devices.py`). A distributed (torchrun) fit needs CUDA or
-the CPU: torch.distributed has no MPS backend. The Triton kernels are CUDA only, so MPS and the
-CPU use the PyTorch paths, and the CUDA startup check is skipped.
+the CPU: torch.distributed has no MPS backend. The Triton kernels are CUDA only, and the CUDA
+startup check is skipped elsewhere. On MPS, the track radius loss, the track batch sampler and the
+nonfinite-gradient sanitize run as Metal kernels (`track_loss_metal.py`, `grad_metal.py`), so a
+step compiles no per-shape graphs and does not wait on the GPU for tensor shapes; everything else,
+and the CPU, use the PyTorch paths. `FIT_SPIRAL_METAL=0` turns the Metal kernels off, and
+`FIT_SPIRAL_METAL_TRACKS=0` turns off only the track loss and sampler.
+`tests/test_track_radius_metal.py` checks the fused loss against the eager one.
 
 MPS has no float64. Device tensors that are float64 on CUDA take their dtype
 from `devices.float_hi()`, which is float32 on MPS;
