@@ -6,13 +6,13 @@ The stages that read the volumes work on one session of `cores/fit_session.py` i
 a person judged stays what is scored.
 """
 
-import fcntl
 import json
 import shutil
 from contextlib import contextmanager
 
 import numpy as np
 
+from . import filelock
 from . import migrate
 from . import record as rec
 from . import render
@@ -33,11 +33,11 @@ def session_lock(pipeline):
     path = pipeline.work("session.lock")
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
+        filelock.lock_exclusive(handle)
         try:
             yield
         finally:
-            fcntl.flock(handle, fcntl.LOCK_UN)
+            filelock.unlock(handle)
 
 
 # The cache directory tag (bford.ca/cachedir): backups run with --exclude-caches skip a

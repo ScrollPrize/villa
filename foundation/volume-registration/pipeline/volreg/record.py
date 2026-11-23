@@ -12,12 +12,13 @@ Files other than `events.jsonl` are replaced whole, in one step, so a reader nev
 a file. Coordinates are ZYX level-0 voxels of their own volume, as in the cores.
 """
 
-import fcntl
 import json
 import os
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+
+from . import filelock
 
 SCHEMA = "volreg-record/1"
 
@@ -91,11 +92,11 @@ class Record:
         log, so a page and a job doing it at once cannot lose each other's answers."""
         self.directory.mkdir(parents=True, exist_ok=True)
         with open(self.directory / ".lock", "w") as handle:
-            fcntl.flock(handle, fcntl.LOCK_EX)
+            filelock.lock_exclusive(handle)
             try:
                 yield
             finally:
-                fcntl.flock(handle, fcntl.LOCK_UN)
+                filelock.unlock(handle)
 
     def log(self, kind, **fields):
         """Append one event; `at` defaults to now. Never rewrites what is there."""
