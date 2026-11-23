@@ -19,6 +19,8 @@ def main(argv=None):
     serve.add_argument("--gpus", nargs="+", required=True, help="explicit managed NVIDIA GPU UUIDs")
     serve.add_argument("--cpu-cores", type=int, required=True, help="logical CPU capacity")
     serve.add_argument("--reserve-bytes", type=int, default=1024**3)
+    serve.add_argument("--share-buffer-bytes", type=int, default=16 * 1024**3,
+                       help="VRAM kept free on a GPU shared with unowned work")
     serve.add_argument("--allow-uid", type=int, action="append", default=[])
     serve.add_argument("--controller-uid", type=int, action="append", default=[])
     serve.add_argument("--shared-group", action="store_true")
@@ -63,7 +65,8 @@ def main(argv=None):
         inventory = nvidia_inventory(args.cpu_cores, args.gpus, args.reserve_bytes)
         with Server(args.socket, inventory, allowed_uids=[os.getuid(), *args.allow_uid],
                     controller_uids=[os.getuid(), *args.controller_uid], shared_group=args.shared_group,
-                    monitor=NvidiaMonitor(inventory, args.reserve_bytes)) as server:
+                    monitor=NvidiaMonitor(inventory, args.reserve_bytes,
+                                          share_buffer=args.share_buffer_bytes)) as server:
             while True:
                 try:
                     server.step()

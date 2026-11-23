@@ -210,8 +210,9 @@ class Server:
                 return {p["pid"] for t in self.engine.tasks.values() if t["granted"]["gpus"]
                         for p in t["processes"] if self.engine.inspect(p, t["uid"]) == "alive"}
             blocked = self.monitor.poll(owned)
-            if blocked != self.engine.blocked_gpus:
-                self.engine.update_blocked_gpus(blocked)
+            capacity = getattr(self.monitor, "capacity", {})
+            if blocked != self.engine.blocked_gpus or capacity != self.engine.gpu_capacity:
+                self.engine.update_blocked_gpus(blocked, capacity)
                 save_journal(self.journal, self.engine.state)
 
     def _after_io(self):

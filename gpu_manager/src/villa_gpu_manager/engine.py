@@ -31,6 +31,8 @@ class Engine:
         self.max_tasks = max_tasks
         self.draining = False
         self.blocked_gpus = set()
+        # Managed bytes of GPUs shared with unowned work (NvidiaMonitor.capacity); absent: the whole inventory.
+        self.gpu_capacity = {}
         self.allowed_gpus = set(inventory["gpus"])
         self.epoch = str(uuid.uuid4())
         self.state = copy.deepcopy(state) if state is not None else {
@@ -101,11 +103,21 @@ class Engine:
                     and hmac.compare_digest(body["token"], task["token"]), "task authentication failed", "forbidden")
         return task
 
+    def _available(self):
+        """Inventory for new work: shared GPUs offer their capacity, never less than what is already granted."""
+        gpus = {}
+        for gpu, size in self.inventory["gpus"].items():
+            granted = sum(t["granted"]["gpus"].get(gpu, 0) for t in self.tasks.values())
+            gpus[gpu] = min(size, max(self.gpu_capacity.get(gpu, size), granted))
+        return {"cpu_cores": self.inventory["cpu_cores"], "gpus": gpus}
+
     def _reconcile(self):
         reasons = {}
+        # An override is an explicit controller decision over the whole inventory.
+        available = self.inventory if self.state["override"] is not None else self._available()
         desired = ({key: (task["granted"] if not task["pausable"] and not any(task["paused"].values()) else empty())
                     for key, task in self.tasks.items()} if self.draining
-                   else targets(self.tasks, self.inventory, self.state["override"], reasons,
+                   else targets(self.tasks, available, self.state["override"], reasons,
                                 allowed_gpus=self.allowed_gpus))
         for key, task in self.tasks.items():
             task["target"] = copy.deepcopy(desired[key])
@@ -144,7 +156,7 @@ class Engine:
             if (exclusive and any(a != empty() for a in others)) or old_exclusive:
                 task["reason"] = "waiting_for_release"
                 continue
-            if fits(others + [task["target"]], self.inventory):
+            if fits(others + [task["target"]], available):
                 task["generation"] += 1
                 task["granted"] = copy.deepcopy(task["target"])
                 task["preferred_gpus"] = list(task["granted"]["gpus"])
@@ -404,8 +416,9 @@ class Engine:
         self.draining = True
         self._reconcile()
 
-    def update_blocked_gpus(self, gpu_uuids):
+    def update_blocked_gpus(self, gpu_uuids, capacity=None):
         self.blocked_gpus = set(gpu_uuids)
+        self.gpu_capacity = dict(capacity or {})
         self._reconcile()
 
     def scan_processes(self):

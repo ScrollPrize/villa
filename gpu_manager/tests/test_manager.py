@@ -319,6 +319,62 @@ def test_driver_monitor_external_memory():
     assert monitor.parse(xml, set()) == {"GPU-a"}
 
 
+def _driver_xml(total, used, processes=()):
+    listed = "".join(f"<process_info><pid>{pid}</pid><used_memory>{size} MiB</used_memory></process_info>"
+                     for pid, size in processes)
+    return (f"<nvidia_smi_log><gpu><uuid>GPU-a</uuid><fb_memory_usage><total>{total} MiB</total>"
+            f"<used>{used} MiB</used></fb_memory_usage><processes>{listed}</processes></gpu></nvidia_smi_log>").encode()
+
+
+def test_driver_monitor_shares_a_gpu_after_warmup_by_its_unowned_peak(monkeypatch):
+    import villa_gpu_manager.processes as module
+    from villa_gpu_manager.processes import NvidiaMonitor
+    MiB = 1024**2
+    clock = [1000.0]
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
+    m = NvidiaMonitor({"cpu_cores": 1, "gpus": {"GPU-a": 79 * MiB}}, MiB, share_buffer=16 * MiB,
+                      share_window=300, share_warmup=60)
+    # 24 MiB of unowned use: blocked until a minute of history exists.
+    assert m.parse(_driver_xml(80, 24), set()) == {"GPU-a"} and m.capacity == {}
+    clock[0] += 59
+    assert m.parse(_driver_xml(80, 24), set()) == {"GPU-a"}
+    clock[0] += 1
+    assert m.parse(_driver_xml(80, 24), set()) == set()
+    assert m.capacity == {"GPU-a": (80 - 24 - 16) * MiB}
+    # Managed processes do not count; a higher unowned peak holds for the window.
+    clock[0] += 15
+    assert m.parse(_driver_xml(80, 70, [(7, 30)]), {7}) == set()
+    assert m.capacity == {"GPU-a": (80 - 40 - 16) * MiB}
+    for _ in range(20):
+        clock[0] += 15
+        m.parse(_driver_xml(80, 24), set())
+        assert m.capacity == {"GPU-a": (80 - 40 - 16) * MiB}
+    clock[0] += 15
+    m.parse(_driver_xml(80, 24), set())
+    assert m.capacity == {"GPU-a": (80 - 24 - 16) * MiB}
+    # No room left beside the buffer: blocked. Unowned use gone for the whole window: the full inventory.
+    clock[0] += 15
+    assert m.parse(_driver_xml(80, 70), set()) == {"GPU-a"}
+    clock[0] += 301
+    assert m.parse(_driver_xml(80, 0), set()) == set() and m.capacity == {"GPU-a": 79 * MiB}
+
+
+def test_shared_gpu_capacity_limits_new_grants_but_keeps_existing_ones():
+    e = engine()
+    e.update_blocked_gpus([], {"GPU-a": 50, "GPU-b": 30})
+    a = register(e, max_gpus=1, max_vram_bytes_per_gpu=100)
+    assert e.tasks[a["task"]["task_id"]]["granted"]["gpus"] == {"GPU-a": 50}
+    report(e, a, "applied")
+    # Unowned use grows: the grant stays, nothing new fits beside it.
+    e.update_blocked_gpus([], {"GPU-a": 20, "GPU-b": 10})
+    assert e.tasks[a["task"]["task_id"]]["granted"]["gpus"] == {"GPU-a": 50}
+    assert e.tasks[a["task"]["task_id"]]["phase"] == "applied"
+    b = register(e, max_gpus=1)
+    assert e.tasks[b["task"]["task_id"]]["phase"] == "waiting"
+    e.update_blocked_gpus([], {"GPU-a": 50, "GPU-b": 25})
+    assert e.tasks[b["task"]["task_id"]]["granted"]["gpus"] == {"GPU-b": 25}
+
+
 def test_new_descendant_cannot_register_between_scans():
     e = engine()
     register(e)

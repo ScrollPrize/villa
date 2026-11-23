@@ -102,8 +102,8 @@ def _state_owner(sock, inventory, state, epoch, parent_identity, journal,
                 collector.request()
             if monitor is not None:
                 blocked = monitor.poll(owned)
-                if blocked != engine.blocked_gpus:
-                    engine.update_blocked_gpus(blocked)
+                if blocked != engine.blocked_gpus or monitor.capacity != engine.gpu_capacity:
+                    engine.update_blocked_gpus(blocked, monitor.capacity)
                     save_journal(journal, engine.state)
                     channel.send("summary", summary())
             for _ in range(16):
@@ -187,8 +187,7 @@ class ProcessServer(Server):
         self.channel = _Channel(parent, max_frame=IPC_LIMIT)
         state = self.engine.state
         state["_controllers"] = list(self.controllers)
-        monitor_config = None if self.monitor is None else {
-            "reserve_bytes": self.monitor.reserve, "interval": self.monitor.interval}
+        monitor_config = None if self.monitor is None else self.monitor.config()
         self.backend = mp.get_context("spawn").Process(target=_state_owner, args=(child,
             self.inventory, state, self.engine.epoch, process_identity(), self.journal,
             monitor_config, self.scan_seconds, self.collector_target, _LockDescriptor(self.lock)))

@@ -1,5 +1,6 @@
 """Process identities and peer credentials without creating a CUDA context."""
 
+import collections
 import os
 from pathlib import Path
 import socket
@@ -121,11 +122,23 @@ def parse_nvidia_memory(data, gpu_uuids=None):
 
 
 class NvidiaMonitor:
-    """Poll a diagnostic subprocess without blocking the socket event loop."""
+    """Poll a diagnostic subprocess without blocking the socket event loop.
 
-    def __init__(self, inventory, reserve_bytes, interval=60):
+    Tracks each GPU's unowned memory (driver use minus the managed tasks'
+    processes) over `share_window` seconds. A GPU whose unowned peak stays
+    within the reserve offers its whole managed inventory. One with more
+    unowned use is shared: managed work may take its total minus that peak
+    minus `share_buffer`, once `share_warmup` seconds of history exist.
+    `capacity` holds the managed bytes of every GPU that is not blocked.
+    """
+
+    def __init__(self, inventory, reserve_bytes, interval=15, share_buffer=16 * 1024**3,
+                 share_window=300, share_warmup=60):
         self.inventory, self.reserve = inventory, reserve_bytes
         self.interval = interval
+        self.share_buffer, self.share_window, self.share_warmup = share_buffer, share_window, share_warmup
+        self.history = {gpu: collections.deque() for gpu in inventory["gpus"]}  # (monotonic time, unowned bytes)
+        self.capacity = {}
         self.process = None
         self.next_probe = 0
         self.started = 0
@@ -136,6 +149,13 @@ class NvidiaMonitor:
         self.last_error = None
         self.last_poll_at = None
         self.poll_gap = 0.0
+
+    def config(self):
+        return {"reserve_bytes": self.reserve, "interval": self.interval, "share_buffer": self.share_buffer,
+                "share_window": self.share_window, "share_warmup": self.share_warmup}
+
+    def _fail_closed(self):
+        self.blocked, self.capacity = set(self.inventory["gpus"]), {}
 
     def _read_available(self):
         while len(self.buffer) <= 1024**2:
@@ -159,7 +179,7 @@ class NvidiaMonitor:
                 self.started = now
             except OSError as error:
                 self.last_error = f"{type(error).__name__}: {error}"
-                self.blocked = set(self.inventory["gpus"])
+                self._fail_closed()
                 self.next_probe = now + self.interval
         if self.process is not None:
             self._read_available()
@@ -167,7 +187,7 @@ class NvidiaMonitor:
             if not exited and (now - self.started > 10 or len(self.buffer) > 1024**2):
                 self.last_error = f"driver query timeout/size limit: age={now - self.started:.1f}s bytes={len(self.buffer)}"
                 self.process.kill()
-                self.blocked = set(self.inventory["gpus"])
+                self._fail_closed()
             if exited or self.process.poll() is not None:
                 try:
                     # Bytes can arrive after EAGAIN but before poll observes
@@ -181,7 +201,7 @@ class NvidiaMonitor:
                     self.last_error = None
                 except (ValueError, ET.ParseError, TypeError) as error:
                     self.last_error = f"{type(error).__name__}: {error} (bytes={len(self.buffer)}, age={now - self.started:.1f}s)"
-                    self.blocked = set(self.inventory["gpus"])
+                    self._fail_closed()
                 self.process.stdout.close()
                 self.process = None
                 self.next_probe = now + self.interval
@@ -189,15 +209,28 @@ class NvidiaMonitor:
 
     def parse(self, data, owned_pids):
         self.last_snapshot = parse_nvidia_memory(data, self.inventory["gpus"])
-        self.last_snapshot_at = time.monotonic()
-        blocked = set(self.inventory["gpus"])
+        now = self.last_snapshot_at = time.monotonic()
+        blocked, capacity = set(self.inventory["gpus"]), {}
         for key, device in self.last_snapshot.items():
             if key not in blocked:
                 continue
             total, used = device["total"], device["used"]
             owned = sum(size for pid, size in device["processes"].items() if pid in owned_pids)
-            if total >= self.inventory["gpus"][key] + self.reserve and used - owned <= self.reserve:
-                blocked.remove(key)
+            history = self.history[key]
+            history.append((now, max(0, used - owned)))
+            while history[0][0] < now - self.share_window:
+                history.popleft()
+            if total < self.inventory["gpus"][key] + self.reserve:
+                continue
+            peak = max(unowned for _, unowned in history)
+            if peak <= self.reserve:
+                capacity[key] = self.inventory["gpus"][key]
+            elif now - history[0][0] >= self.share_warmup and total - peak - self.share_buffer > 0:
+                capacity[key] = min(self.inventory["gpus"][key], total - peak - self.share_buffer)
+            else:
+                continue
+            blocked.remove(key)
+        self.capacity = capacity
         return blocked
 
     def close(self):

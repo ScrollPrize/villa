@@ -159,8 +159,12 @@ Ctrl-C forces shutdown, retaining reservations in the journal. Pausable clients
 detect server loss and unload at a safe boundary. Non-pausable clients retain
 their grant and reconnect; graceful drain waits for them to finish. Forced shutdown is not successful
 draining. `--reserve-bytes` defaults to 1 GiB per GPU; reserve external/driver use
-explicitly. The nonblocking driver monitor blocks new grants when observed
-unowned usage exceeds that reserve or GPU inventory becomes unverifiable.
+explicitly. The nonblocking driver monitor tracks each GPU's unowned usage over
+the last five minutes. While its peak stays within the reserve the GPU offers
+its whole managed inventory. Above it the GPU is shared: new grants may take
+its total memory minus that peak minus `--share-buffer-bytes` (default 16 GiB),
+once one minute of history exists. Existing grants are never shrunk by unowned
+usage. New grants are blocked while GPU inventory is unverifiable.
 
 ## Client responsibilities
 
