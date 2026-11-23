@@ -90,16 +90,36 @@ def in_uv_build_env(executable):
     return re.search(r"[\\/]builds-v\d*[\\/]", str(executable)) is not None
 
 
+class CannotLaunch(RuntimeError):
+    """A background job could not be started with what it needs."""
+
+
+def uv_executable():
+    """The uv to start a job through, by absolute path: the one running this process (`uv
+    run` names itself in `UV`), else the one on PATH; None if there is neither."""
+    named = os.environ.get("UV")
+    if named and Path(named).is_file():
+        return str(Path(named).absolute())
+    return shutil.which("uv")
+
+
 def python():
     """How a background job starts Python. `uv run --with-requirements` runs in an
     environment it deletes when it exits, so a job started from a `volreg run` that has
-    since finished would find no interpreter; such a job goes through `uv run` again (or, with
-    no uv to be found, the base interpreter the environment was made from)."""
+    since finished would find no interpreter; such a job goes through `uv run` again, by the
+    uv that ran this (which need not be on PATH), with the requirements the README's command
+    gives. With no uv to be found, CannotLaunch says what to do: the base interpreter the
+    environment was made from has none of the requirements."""
     if not in_uv_build_env(sys.executable):
         return [sys.executable]
-    uv = shutil.which("uv")
+    uv = uv_executable()
     if uv is None:
-        return [getattr(sys, "_base_executable", None) or sys.executable]
+        raise CannotLaunch(
+            "volreg runs in a temporary uv environment, which uv deletes when this command "
+            "exits, and no uv was found to start background jobs through (UV is not set and "
+            "uv is not on PATH). Put uv on PATH, or set UV to the uv executable, or run volreg "
+            "from an environment that lasts (python -m venv, then pip install -r "
+            "requirements.txt); nothing was started.")
     requirements = Path(__file__).resolve().parent.parent / "requirements.txt"
     return [uv, "run", "-q", "--python", f"{sys.version_info.major}.{sys.version_info.minor}",
             "--with-requirements", str(requirements), "python"]
@@ -127,15 +147,25 @@ def new_pair(directory, start, volumes, name, by):
 
 
 def advance(pair):
-    """Start every stage of a pair that can run, each as a background `volreg job`."""
+    """Start every stage of a pair that can run, each as a background `volreg job`. How a
+    job starts Python is settled before the first one starts: if it cannot be, CannotLaunch
+    is raised and nothing has started."""
     pipeline = pipeline_stages.pipeline(pair)
-    command = python() + ["-m", "volreg.cli", "job", str(pair)]
-    _states, started = pipeline.advance(lambda name: pipeline.start(name, command + [name]))
+    command = []
+
+    def launch(name):
+        if not command:
+            command.extend(python() + ["-m", "volreg.cli", "job", str(pair)])
+        pipeline.start(name, command + [name])
+    _states, started = pipeline.advance(launch)
     return pipeline, started
 
 
 def run(args):
-    pipeline, started = advance(args.pair)
+    try:
+        pipeline, started = advance(args.pair)
+    except CannotLaunch as error:
+        sys.exit(f"{args.pair}: {error}")
     print(f"{args.pair}: started {', '.join(started) if started else 'nothing'}")
     show(pipeline)
 
@@ -263,13 +293,19 @@ def main(argv=None):
         # the same stage; its lock lets only one run.
         code = engine.main_job(pipeline_stages.pipeline(args.pair), args.stage)
         if code == 0:
-            advance(args.pair)
+            try:
+                advance(args.pair)
+            except CannotLaunch as error:
+                print(f"{args.pair}: {error}", file=sys.stderr)
         return code
     elif args.command == "import":
         pipeline = pipeline_stages.pipeline(args.pair)
         with pipeline_stages.session_lock(pipeline):
             print(migration.import_session(args.session, args.record, args.pair))
-        advance(args.pair)
+        try:
+            advance(args.pair)
+        except CannotLaunch as error:
+            sys.exit(f"{args.pair}: imported, but {error}")
     elif args.command == "release":
         index = releasing.release(args.out, args.records)
         for pair in index["pairs"]:
@@ -284,29 +320,29 @@ def main(argv=None):
         affected = pipeline_stages.pipeline(args.pair).redo(args.stage)
         print(f"will run again: {', '.join(affected)}")
     elif args.command == "more":
-        record = rec.Record(args.pair)
-        params = record.read(pipeline_stages.PARAMS) if record.exists(pipeline_stages.PARAMS) else {}
-        params.pop("schema", None)
-        defaults = {stage.name: stage.params for stage in pipeline_stages.stages()}
-        for stage, extra in (("holdout", args.holdout), ("fit", args.fit)):
-            if extra:
-                current = params.get(stage, {}).get("patches", defaults[stage]["patches"])
-                params.setdefault(stage, {})["patches"] = current + extra
-        record.write(pipeline_stages.PARAMS, params)
-        record.log("more", holdout=args.holdout, fit=args.fit, by=reviewer(args))
+        try:
+            params = pipeline_stages.more(rec.Record(args.pair), args.holdout, args.fit, reviewer(args))
+        except ValueError as error:
+            parser.error(str(error))
         print(params)
     elif args.command == "revisit":
         record = rec.Record(args.pair)
-        final = record.read(rec.FINAL_REVIEW) if record.exists(rec.FINAL_REVIEW) else {}
-        final.pop("schema", None)
-        items = final.setdefault("revisit", [])
+        by = reviewer(args)
+        # Under the lock the views are rewritten under, so a blind round or a decision
+        # written meanwhile is not lost.
+        with record.lock():
+            final = record.read(rec.FINAL_REVIEW) if record.exists(rec.FINAL_REVIEW) else {}
+            final.pop("schema", None)
+            items = final.setdefault("revisit", [])
+            if args.done is not None:
+                items[args.done - 1]["done"] = {"at": rec.now(), "by": by}
+            else:
+                items.append({"text": args.text, "at": rec.now(), "by": by, "done": None})
+            record.write(rec.FINAL_REVIEW, final)
         if args.done is not None:
-            items[args.done - 1]["done"] = {"at": rec.now(), "by": reviewer(args)}
-            record.log("revisit-done", item=args.done, by=reviewer(args))
+            record.log("revisit-done", item=args.done, by=by)
         else:
-            items.append({"text": args.text, "at": rec.now(), "by": reviewer(args), "done": None})
-            record.log("revisit", text=args.text, by=reviewer(args))
-        record.write(rec.FINAL_REVIEW, final)
+            record.log("revisit", text=args.text, by=by)
         for index, item in enumerate(items, 1):
             print(f"{index}. {'done' if item['done'] else 'open'}: {item['text']}")
     elif args.command == "answer":

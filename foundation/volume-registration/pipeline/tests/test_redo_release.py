@@ -490,7 +490,9 @@ def test_a_paused_status_reader_does_not_stop_advance_launching_a_ready_stage(tm
     """A status read must distinguish a live worker from another reader while preserving
     single ownership and crash recovery."""
     pipeline = make(tmp_path)
-    pipeline.run_stage("draw")
+    for name in ("draw", "fit"):
+        pipeline.run_stage(name)
+    pipeline.redo("fit")                                    # ready again; its lock file is there
     held, go, out = tmp_path / "held", tmp_path / "go", tmp_path / "out"
     reader = CONTEXT.Process(target=_paused_reader, args=(str(tmp_path), str(held), str(go), lock_kind))
     reader.start()

@@ -14,7 +14,8 @@ a file. Coordinates are ZYX level-0 voxels of their own volume, as in the cores.
 
 import json
 import os
-import tempfile
+import secrets
+import stat
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -79,17 +80,13 @@ class Record:
         target.parent.mkdir(parents=True, exist_ok=True)
         if isinstance(data, dict) and name.endswith(".json") and name != TRANSFORM:
             data = {"schema": SCHEMA} | data
-        # A scratch file of its own, so two writers never share one; it takes the mode the
-        # file has, or the usual one for a new file (mkstemp makes it private).
-        descriptor, scratch = tempfile.mkstemp(dir=target.parent, prefix=target.name + ".",
-                                               suffix=".tmp")
+        descriptor, scratch = _scratch(target)
         try:
             with os.fdopen(descriptor, "w") as handle:
                 json.dump(data, handle, indent=1)
                 handle.write("\n")
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.chmod(scratch, (target.stat().st_mode & 0o777) if target.exists() else 0o644)
             filelock.replace(scratch, target)
         except BaseException:
             filelock.unlink(scratch, missing_ok=True)
@@ -235,6 +232,36 @@ class Record:
                 final["status"] = "decided"
             self.write(FINAL_REVIEW, final)
             return final
+
+
+def _scratch(target):
+    """A new scratch file beside `target`, of its own so two writers never share one, open
+    for writing and already with the mode the record will have: the file's own mode on a
+    rewrite (set before anything is written, so a private record is never readable by
+    others, even half written), or for a new file the usual mode under the umask, as `open`
+    would give it."""
+    try:
+        mode = stat.S_IMODE(os.stat(target).st_mode)
+    except FileNotFoundError:
+        mode = None
+    while True:
+        scratch = target.with_name(f"{target.name}.{secrets.token_hex(6)}.tmp")
+        try:
+            # A rewrite starts private and then takes the file's mode; a new file gets 0o666
+            # less the umask from the system.
+            descriptor = os.open(scratch, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
+                                 0o600 if mode is not None else 0o666)
+            break
+        except FileExistsError:
+            continue
+    try:
+        if mode is not None and hasattr(os, "fchmod") and os.name != "nt":
+            os.fchmod(descriptor, mode)
+    except BaseException:
+        os.close(descriptor)
+        filelock.unlink(scratch, missing_ok=True)
+        raise
+    return descriptor, scratch
 
 
 def holdout_units(held):

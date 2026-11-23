@@ -23,6 +23,8 @@ from .engine import Pipeline, Stage
 from .scoring import BAR, bar_check, score
 
 PARAMS = "params.json"
+# The lock a read-change-write of `params.json` is done under, by the review page and the CLI.
+SETTINGS_LOCK = ".settings.lock"
 # Draws of the hold-out stage, at most, to make up for patches that cannot be measured.
 HOLDOUT_DRAWS = 4
 SESSION = "session"
@@ -414,15 +416,23 @@ def final_decided(pipeline, params):
 
 def run_store(pipeline, params):
     """Put the decided fit into the record: the transform as it will be published (without
-    its bend when the decision says affine), how it was fitted, and its scores."""
+    its bend when the decision says affine), how it was fitted, its scores, and the decision
+    it was stored under. Only the fit the decision is about: after a new fit (a redo, more
+    fit patches) the old decision is not taken for it, and the store fails until the new
+    fit is decided."""
     decision = pipeline.record.read(rec.FINAL_REVIEW)["decision"]
     fit = json.loads(pipeline.work("fit", "fit.json").read_text())
+    if decision["fit"] != fit["fit"]:
+        raise RuntimeError(f"the decision is about {decision['fit']}, but the fit is {fit['fit']} "
+                           f"now: judge its blind round and decide again")
     scores = json.loads(pipeline.work("scores.json").read_text())
     stamp = pipeline.stamp("fit") or {}
+    stored = fit | scores | {"code": stamp.get("code"),
+                             "decision": {key: decision[key] for key in ("fit", "publish")}}
     if decision["publish"] == "nothing":
         with pipeline.publishing("store"):
             filelock.unlink(pipeline.record.path(rec.TRANSFORM), missing_ok=True)
-            pipeline.record.write(rec.FIT, fit | scores | {"code": stamp.get("code")})
+            pipeline.record.write(rec.FIT, stored)
         return [rec.FIT]
     transform = json.loads(pipeline.work("fit", "transform.json").read_text())
     if decision["publish"] == "affine":
@@ -432,7 +442,7 @@ def run_store(pipeline, params):
     transform["fixed_volume"] = volume_name(transform["fixed_volume"])
     with pipeline.publishing("store"):
         pipeline.record.write(rec.TRANSFORM, transform)
-        pipeline.record.write(rec.FIT, fit | scores | {"code": stamp.get("code")})
+        pipeline.record.write(rec.FIT, stored)
     return [rec.TRANSFORM, rec.FIT]
 
 
@@ -463,6 +473,30 @@ def stages():
               complete=final_decided, identity=final_identity),
         Stage("store", "store the decided fit", needs=("final-review",), run=run_store),
     ]
+
+
+def more(record, holdout, fit, by):
+    """Ask for `holdout` and `fit` more patches: read, checked and written under the settings
+    lock, so a save from the review page at the same time is not lost, and logged with what
+    was saved. Returns the settings."""
+    extras = {"holdout": holdout, "fit": fit}
+    for stage, extra in extras.items():
+        if isinstance(extra, bool) or not isinstance(extra, int) or extra < 0:
+            raise ValueError(f"more {stage} patches must be a whole number, 0 or more, not {extra!r}")
+    defaults = {stage.name: stage.params for stage in stages()}
+    with record.lock(SETTINGS_LOCK):
+        params = record.read(PARAMS) if record.exists(PARAMS) else {}
+        params.pop("schema", None)
+        saved = {}
+        for stage, extra in extras.items():
+            if extra:
+                current = params.get(stage, {}).get("patches", defaults[stage]["patches"])
+                params.setdefault(stage, {})["patches"] = current + extra
+                saved[stage] = {"patches": current + extra}
+        if saved:
+            record.write(PARAMS, params)
+        record.log("more", holdout=holdout, fit=fit, saved=saved, by=by)
+    return params
 
 
 def pipeline(directory):

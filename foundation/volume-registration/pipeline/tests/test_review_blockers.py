@@ -51,11 +51,30 @@ class FakeMsvcrt:
             raise
 
 
+def fake_shared(handle, offset):
+    """LockFileEx's shared byte lock, over a POSIX shared record lock."""
+    import fcntl
+    try:
+        fcntl.lockf(handle.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB, 1, offset)
+        return True
+    except OSError as exc:
+        if exc.errno in (errno.EAGAIN, errno.EACCES):
+            return False
+        raise
+
+
+def fake_unlock_shared(handle, offset):
+    import fcntl
+    fcntl.lockf(handle.fileno(), fcntl.LOCK_UN, 1, offset)
+
+
 def as_windows_locks(monkeypatch):
     if WINDOWS:
-        return      # the real msvcrt, process_token and pid_alive
+        return      # the real msvcrt, LockFileEx, process_token and pid_alive
     monkeypatch.setattr(filelock, "fcntl", None)
     monkeypatch.setattr(filelock, "msvcrt", FakeMsvcrt, raising=False)
+    monkeypatch.setattr(filelock, "_windows_shared", fake_shared)
+    monkeypatch.setattr(filelock, "_windows_unlock_shared", fake_unlock_shared)
     monkeypatch.setattr(filelock, "process_token", lambda pid=None: 4242 if pid is None else None)
     monkeypatch.setattr(filelock, "pid_alive", lambda pid, token=None: pid == os.getpid())
 
@@ -210,9 +229,17 @@ def test_release_leaves_out_a_transform_that_predates_a_redo(tmp_path):
     index = release.release(tmp_path / "out2", [root])
     assert index["pairs"] == []
     assert "a redo came after" in index["left_out"][0]["why"]
-    # Stored again after the redo: released again.
-    pipeline._write_stamp("store", {"status": "ok", "redo_mark": pipeline.redo_mark("store")})
+    # Stored again after the redo, as run_store writes it (under its decision), and stamped
+    # as run_stage stamps it: released again.
+    record.write(rec.FIT, record.read(rec.FIT) | {"fit": "f002", "decision": {"fit": "f002", "publish": "bend"}})
+    outputs = [rec.TRANSFORM, rec.FIT]
+    pipeline._write_stamp("store", {"status": "ok", "redo_mark": pipeline.redo_mark("store"),
+                                    "outputs": outputs,
+                                    "output_digest": engine.digest_files(record.directory, outputs)})
     assert release.release(tmp_path / "out3", [root])["pairs"][0]["pair"] == "A"
+    # A stamp from a failed store, or one that does not match the files, is not enough.
+    pipeline._write_stamp("store", {"status": "failed", "failed_under_redo_mark": pipeline.redo_mark("store")})
+    assert release.release(tmp_path / "out4", [root])["pairs"] == []
 
 
 # ------------------------------------------------------------------------ 2. background launch
@@ -229,6 +256,7 @@ def test_a_uv_build_environment_is_found_with_either_separator(path, temporary):
 
 
 def test_a_job_from_a_temporary_uv_environment_relaunches_through_uv(monkeypatch):
+    monkeypatch.delenv("UV", raising=False)
     monkeypatch.setattr(sys, "executable", "C:\\x\\uv\\cache\\builds-v0\\.tmp1\\Scripts\\python.exe")
     monkeypatch.setattr(cli.shutil, "which", lambda name: "C:\\tools\\uv.exe")
     command = cli.python()
@@ -236,11 +264,14 @@ def test_a_job_from_a_temporary_uv_environment_relaunches_through_uv(monkeypatch
     assert "--with-requirements" in command and "builds-v" not in " ".join(command)
 
 
-def test_without_uv_a_temporary_environment_falls_back_to_the_base_interpreter(monkeypatch):
+def test_without_uv_a_temporary_environment_is_refused_not_run_without_its_requirements(monkeypatch):
+    """The base interpreter has none of the requirements: no fallback to it."""
+    monkeypatch.delenv("UV", raising=False)
     monkeypatch.setattr(sys, "executable", "/home/u/.cache/uv/builds-v0/.t/bin/python")
     monkeypatch.setattr(sys, "_base_executable", "/usr/bin/python3.12", raising=False)
     monkeypatch.setattr(cli.shutil, "which", lambda name: None)
-    assert cli.python() == ["/usr/bin/python3.12"]
+    with pytest.raises(cli.CannotLaunch, match="uv"):
+        cli.python()
 
 
 def test_an_ordinary_interpreter_is_used_as_it_is(monkeypatch):

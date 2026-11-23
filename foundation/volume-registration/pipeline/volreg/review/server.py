@@ -54,10 +54,10 @@ TEST_STRETCHES = 5
 EDITABLE = {"holdout": {"patches": "hold-out patches"},
             "fit": {"patches": "fit patches", "passes": "passes"},
             "blind": {"count": "patches in a round"}}
+# The lock a read-change-write of `params.json` is done under.
+SETTINGS_LOCK = pipeline_stages.SETTINGS_LOCK
 # Settings that only extend what is there: a hold-out set, fit patches or a blind round
 # already drawn stays, so a smaller number would change nothing.
-# The lock a read-change-write of `params.json` is done under.
-SETTINGS_LOCK = ".settings.lock"
 GROW_ONLY = {("holdout", "patches"), ("fit", "patches"), ("blind", "count")}
 
 
@@ -156,18 +156,7 @@ class Reviews:
         return {"affected": affected}
 
     def more(self, name, holdout, fit):
-        record = self.record(name)
-        with record.lock(SETTINGS_LOCK):
-            params = record.read(pipeline_stages.PARAMS) if record.exists(pipeline_stages.PARAMS) else {}
-            params.pop("schema", None)
-            defaults = {stage.name: stage.params for stage in pipeline_stages.stages()}
-            for stage, extra in (("holdout", holdout), ("fit", fit)):
-                if extra:
-                    current = params.get(stage, {}).get("patches", defaults[stage]["patches"])
-                    params.setdefault(stage, {})["patches"] = current + int(extra)
-            record.write(pipeline_stages.PARAMS, params)
-            record.log("more", holdout=holdout, fit=fit, by=self.reviewer)
-        return params
+        return pipeline_stages.more(self.record(name), int(holdout or 0), int(fit or 0), self.reviewer)
 
     # ------------------------------------------------------------------ the hold-out set
 

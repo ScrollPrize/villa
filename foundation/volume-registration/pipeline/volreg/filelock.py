@@ -3,7 +3,8 @@
 The lock lives as long as the handle: closing it releases the lock, which is
 what `fcntl.flock` did before this module existed. `try_lock` is the same without
 waiting; a job's lock file is held that way for the job's whole life, so whoever can
-take it knows the job is gone.
+take it knows the job is gone. Whoever only asks takes it shared (`shared=True`): askers
+do not stop each other, and a held exclusive lock still refuses them.
 
 Windows also refuses to replace or delete a file while anyone has it open (Python
 opens files without delete sharing), and `os.kill(pid, 0)` is not a liveness check
@@ -40,17 +41,20 @@ def lock_exclusive(handle):
         time.sleep(0.05)
 
 
-def try_lock(handle, offset=0):
+def try_lock(handle, offset=0, shared=False):
     """Take the exclusive lock if nobody holds it, without waiting; whether it was taken.
+    `shared`: take it beside other shared holders, refused only while it is held exclusive.
     `offset` is the byte that is locked on Windows (POSIX locks the whole file)."""
     if fcntl is not None:
         try:
-            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(handle, (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | fcntl.LOCK_NB)
             return True
         except OSError as exc:
             if exc.errno not in (errno.EACCES, errno.EAGAIN):
                 raise
             return False
+    if shared:
+        return _windows_shared(handle, offset)
     handle.seek(offset)
     try:
         msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
@@ -61,12 +65,53 @@ def try_lock(handle, offset=0):
         return False
 
 
-def unlock(handle, offset=0):
+def unlock(handle, offset=0, shared=False):
     if fcntl is not None:
         fcntl.flock(handle, fcntl.LOCK_UN)
         return
+    if shared:
+        _windows_unlock_shared(handle, offset)
+        return
     handle.seek(offset)
     msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+
+
+# msvcrt has no shared lock; LockFileEx has, on the same byte ranges msvcrt locks.
+_LOCKFILE_FAIL_IMMEDIATELY = 0x1
+_ERROR_LOCK_VIOLATION = 33
+_ERROR_IO_PENDING = 997
+
+
+def _overlapped(offset):
+    import ctypes
+    from ctypes import wintypes
+
+    class Overlapped(ctypes.Structure):
+        _fields_ = [("Internal", ctypes.c_size_t), ("InternalHigh", ctypes.c_size_t),
+                    ("Offset", wintypes.DWORD), ("OffsetHigh", wintypes.DWORD),
+                    ("hEvent", wintypes.HANDLE)]
+    return Overlapped(0, 0, offset & 0xFFFFFFFF, offset >> 32, None)
+
+
+def _windows_shared(handle, offset):
+    import ctypes
+    kernel = _kernel32()
+    overlapped = _overlapped(offset)
+    if kernel.LockFileEx(msvcrt.get_osfhandle(handle.fileno()), _LOCKFILE_FAIL_IMMEDIATELY, 0,
+                         1, 0, ctypes.byref(overlapped)):
+        return True
+    code = ctypes.get_last_error()
+    if code in (_ERROR_LOCK_VIOLATION, _ERROR_IO_PENDING):
+        return False
+    raise ctypes.WinError(code)
+
+
+def _windows_unlock_shared(handle, offset):
+    import ctypes
+    overlapped = _overlapped(offset)
+    if not _kernel32().UnlockFileEx(msvcrt.get_osfhandle(handle.fileno()), 0, 1, 0,
+                                    ctypes.byref(overlapped)):
+        raise ctypes.WinError(ctypes.get_last_error())
 
 
 # How long a replace or delete waits for a reader to let go. Villa's readers hold a file
@@ -123,6 +168,10 @@ def _kernel32():
         kernel.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
         kernel.GetCurrentProcess.restype = wintypes.HANDLE
         kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel.LockFileEx.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD,
+                                      wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p]
+        kernel.UnlockFileEx.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD,
+                                        wintypes.DWORD, ctypes.c_void_p]
         _kernel = kernel
     return _kernel
 

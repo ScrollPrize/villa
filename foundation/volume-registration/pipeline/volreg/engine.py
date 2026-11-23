@@ -45,6 +45,9 @@ DONE, STALE, RUNNING, FAILED, READY, WAITING, BLOCKED = (
 # What a job writes after its pid in the lock file once it holds the file's OS lock; a lock
 # file without it is an older one, whose pid alone says whether the job lives.
 OS_LOCK = "os-lock"
+# How long a job that has claimed its stage waits for status readers to let go of the lock
+# file. A reader holds it shared for the length of one read.
+READER_WAIT_SECONDS = 60.0
 
 
 class Superseded(Exception):
@@ -85,12 +88,17 @@ class Stage:
 
 def digest_files(directory, paths):
     """One digest over files, in order; a missing file counts as empty, by name."""
+    return digest_contents((path, (Path(directory) / path).read_bytes()
+                            if (Path(directory) / path).is_file() else None) for path in paths)
+
+
+def digest_contents(named):
+    """`digest_files` over contents already read: (path, bytes or None if missing) pairs."""
     hasher = hashlib.sha256()
-    for path in paths:
+    for path, content in named:
         hasher.update(str(path).encode() + b"\0")
-        target = Path(directory) / path
-        if target.is_file():
-            hasher.update(target.read_bytes())
+        if content is not None:
+            hasher.update(content)
         hasher.update(b"\1")
     return hasher.hexdigest()
 
@@ -150,6 +158,9 @@ class Pipeline:
     def lock_path(self, name):
         return self.work("stages", f"{name}.lock")
 
+    def claim_path(self, name):
+        return self.work("stages", f"{name}.claim")
+
     def log_path(self, name):
         return self.work("stages", f"{name}.log")
 
@@ -172,18 +183,19 @@ class Pipeline:
 
     def running(self, name):
         """Whether a job holds the stage's lock and is alive. A job holds the OS lock on its
-        lock file for its whole life, so a lock nobody can take belongs to no one; only a lock
+        lock file for its whole life, exclusive; whoever asks takes it shared, so askers never
+        read each other as the job, and a lock that is free belongs to no one. Only a lock
         file from before that (no `os-lock` in it) is judged by its pid (on Windows also what
         tells it from a later process with the same pid); nothing is signalled."""
         try:
             with open(self.lock_path(name), "r+b") as handle:
-                if not filelock.try_lock(handle, filelock.OWNER_OFFSET):
+                if not filelock.try_lock(handle, filelock.OWNER_OFFSET, shared=True):
                     return True
                 try:
-                    handle.seek(0)      # try_lock left it at the locked byte on Windows
+                    handle.seek(0)
                     parts = handle.read().decode(errors="replace").split()
                 finally:
-                    filelock.unlock(handle, filelock.OWNER_OFFSET)
+                    filelock.unlock(handle, filelock.OWNER_OFFSET, shared=True)
         except FileNotFoundError:
             return False
         if not parts or OS_LOCK in parts:
@@ -243,19 +255,23 @@ class Pipeline:
                     self._started[name] = self.redo_mark(name)
                     inputs, params = self.inputs(name), self.stage_params(name)
                 stamp = {"stage": name, "inputs": inputs, "params": params, "code": code_version(),
-                         "started": rec.now(), "redo_mark": self._started[name]}
+                         "started": rec.now()}
                 self.record.log("job-started", stage=name, params=params)
                 try:
                     written = list(stage.run(self, params) or [])
+                    # The redo mark is a finished result's only: a release takes a stamp under
+                    # the current mark as the stage having published since the last redo.
                     stamp |= {"status": "ok", "finished": rec.now(), "outputs": written,
-                              "output_digest": digest_files(self.directory, written)}
+                              "output_digest": digest_files(self.directory, written),
+                              "redo_mark": self._started[name]}
                     self.record.log("job-finished", stage=name, outputs=written)
                 except Superseded:
                     raise
                 except Exception as error:   # noqa: BLE001 - a stage's failure is recorded, not raised
                     stamp |= {"status": "failed", "finished": rec.now(),
                               "error": f"{type(error).__name__}: {error}",
-                              "traceback": traceback.format_exc()}
+                              "traceback": traceback.format_exc(),
+                              "failed_under_redo_mark": self._started[name]}
                     self.record.log("job-failed", stage=name, error=stamp["error"])
                 with self._launch_guard():
                     self._require_current(name)
@@ -270,22 +286,37 @@ class Pipeline:
         return stamp
 
     def _take_lock(self, name):
-        """The stage's lock file, open and OS-locked, with this process's pid in it; or
-        RuntimeError if a job holds it. The lock is the owner's: one that cannot be taken
-        has a live owner, and one that can has none, however the last owner ended."""
+        """The stage, owned: its claim file and its lock file open and OS-locked, with this
+        process's pid in the lock file; or RuntimeError if a job holds it. Only jobs touch the
+        claim, so whoever takes it is the one owner. The lock file is what readers ask, shared:
+        the owner waits out a reader in the middle of a read, and a lock held exclusive is a
+        live owner from before claims (or one between its claim and its lock), so it is not
+        taken over. A lock that can be taken has no owner, however the last one ended."""
         lock = self.lock_path(name)
         lock.parent.mkdir(parents=True, exist_ok=True)
-        with open(lock, "ab"):
-            pass
-        handle = open(lock, "r+b")
+        claim = open(self.claim_path(name), "a+b")
         try:
-            # Someone asking whether the job runs holds the lock for an instant: try again.
-            for attempt in range(5):
-                if filelock.try_lock(handle, filelock.OWNER_OFFSET):
-                    break
-                time.sleep(0.05 * (attempt + 1))
-            else:
+            if not filelock.try_lock(claim, filelock.OWNER_OFFSET):
                 raise RuntimeError(f"{name} is already running")
+            with open(lock, "ab"):
+                pass
+            handle = open(lock, "r+b")
+        except BaseException:
+            claim.close()
+            raise
+        try:
+            owned, deadline = 0, time.monotonic() + READER_WAIT_SECONDS
+            while not filelock.try_lock(handle, filelock.OWNER_OFFSET):
+                if filelock.try_lock(handle, filelock.OWNER_OFFSET, shared=True):
+                    filelock.unlock(handle, filelock.OWNER_OFFSET, shared=True)
+                    owned = 0       # only readers have it: wait for them
+                    if time.monotonic() > deadline:
+                        raise RuntimeError(f"{name}: a status reader holds its lock file")
+                else:
+                    owned += 1      # held exclusive: an owner, unless it is let go of at once
+                    if owned >= 5:
+                        raise RuntimeError(f"{name} is already running")
+                time.sleep(0.02 * (owned + 1))
             handle.seek(0)      # try_lock left it at the locked byte on Windows
             parts = handle.read().decode(errors="replace").split()
             if parts and OS_LOCK not in parts and self._legacy_alive(parts):
@@ -297,8 +328,9 @@ class Pipeline:
             handle.flush()
         except BaseException:
             handle.close()
+            claim.close()
             raise
-        return handle
+        return _Owned(handle, claim)
 
     @staticmethod
     def _legacy_alive(parts):
@@ -308,16 +340,25 @@ class Pipeline:
             return False
 
     @staticmethod
-    def _release_lock(handle):
+    def _release_lock(owned):
+        """Let go of the claim first, then the lock: until the lock goes, readers still see
+        the job, and the next job to claim waits for the lock rather than being refused."""
+        handle, claim = owned
         try:
-            handle.seek(0)
-            handle.truncate()
-            handle.flush()
+            try:
+                filelock.unlock(claim, filelock.OWNER_OFFSET)
+            finally:
+                claim.close()
         finally:
             try:
-                filelock.unlock(handle, filelock.OWNER_OFFSET)
+                handle.seek(0)
+                handle.truncate()
+                handle.flush()
             finally:
-                handle.close()
+                try:
+                    filelock.unlock(handle, filelock.OWNER_OFFSET)
+                finally:
+                    handle.close()
 
     # ------------------------------------------------------------- redo and queued jobs
 
@@ -431,10 +472,11 @@ class Pipeline:
     def redo(self, name):
         """Make a stage and everything after it that depends on it run again. Its stamp is
         kept beside, so what it was is not lost. Jobs already chosen see the redo (the mark
-        below) and give up instead of publishing. All or nothing: if a stamp cannot be moved
-        (a reader has it open for longer than a replace waits), those already moved go back
-        -- unless a newer stamp has taken the place, which is left alone -- and the error is
-        raised."""
+        below) and give up instead of publishing. All or nothing: the stamps are moved
+        first and the mark is written last, so a redo that stops part way (a reader has a
+        stamp or the marks open for longer than a replace waits) has not marked anything;
+        the stamps already moved go back -- unless a newer stamp has taken the place, which
+        is left alone -- and the failure is logged and raised."""
         affected = self.downstream(name)
         history = self.work("stages", "history")
         moved = []
@@ -442,29 +484,42 @@ class Pipeline:
             marks = self.redo_marks()
             marks["seq"] += 1
             marks["stages"].update({stage: marks["seq"] for stage in affected})
-            scratch = self._redo_path().with_name("redo.json.tmp")
-            scratch.parent.mkdir(parents=True, exist_ok=True)
-            scratch.write_text(json.dumps(marks) + "\n")
-            filelock.replace(scratch, self._redo_path())
             try:
                 for stage in affected:
                     stamp = self.stamp_path(stage)
                     if stamp.exists():
                         history.mkdir(parents=True, exist_ok=True)
-                        kept = history / f"{stage}.{rec.now().replace(':', '')}.json"
+                        kept = self._history_name(history, stage)
                         filelock.replace(stamp, kept)
                         moved.append((stamp, kept))
-            except BaseException:
+                scratch = self._redo_path().with_name("redo.json.tmp")
+                scratch.parent.mkdir(parents=True, exist_ok=True)
+                scratch.write_text(json.dumps(marks) + "\n")
+                filelock.replace(scratch, self._redo_path())
+            except BaseException as error:
+                not_back = []
                 for stamp, kept in reversed(moved):
                     if stamp.exists():
                         continue   # finished again since: that one is newer than what was kept
                     try:
                         filelock.replace(kept, stamp)
                     except OSError:
-                        pass   # put back what can be; the error that matters is the first
+                        not_back.append(stamp.stem)   # put back what can be; it runs again
+                self.record.log("redo-failed", stage=name, affected=affected,
+                                error=f"{type(error).__name__}: {error}", not_restored=not_back)
                 raise
         self.record.log("redo", stage=name, affected=affected)
         return affected
+
+    @staticmethod
+    def _history_name(history, stage):
+        """A new file in the history for a stamp, never one already there."""
+        base = f"{stage}.{rec.now().replace(':', '')}"
+        kept, number = history / f"{base}.json", 1
+        while kept.exists():
+            number += 1
+            kept = history / f"{base}.{number}.json"
+        return kept
 
     def downstream(self, name):
         found = [name]
@@ -472,6 +527,13 @@ class Pipeline:
             if any(need in found for need in self.stages[other].needs) and other not in found:
                 found.append(other)
         return [stage for stage in found if not self.stages[stage].human]
+
+
+class _Owned(tuple):
+    """A job's hold on its stage: the lock file and the claim, open and locked."""
+
+    def __new__(cls, handle, claim):
+        return super().__new__(cls, (handle, claim))
 
 
 def main_job(pipeline, name):
