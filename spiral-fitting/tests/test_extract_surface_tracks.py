@@ -458,9 +458,10 @@ def test_cpu_backend_writes_the_track_format(monkeypatch, tmp_path):
     # h keys by z, then vy keys by y, then vx keys by x, over the yx range occupied in
     # the 20 sampled z slices (every 8th here)
     ys, xs = np.nonzero((volume[8:168:8] > 0).any(axis=0))
+    y0, x0 = ys.min() - ys.min() % 4, xs.min() - xs.min() % 4
     order = ([f'h:{z}' for z in range(8, 168, 8)]
-             + [f'vy:{w}' for w in range(ys.min(), ys.max(), 24)]
-             + [f'vx:{w}' for w in range(xs.min(), xs.max(), 24)])
+             + [f'vy:{w}' for w in range(y0, ys.max(), 24)]
+             + [f'vx:{w}' for w in range(x0, xs.max(), 24)])
     assert sorted(entries) == sorted(order)
     assert _write_order(out) in (None, order)
     n_tracks = 0
@@ -474,14 +475,23 @@ def test_cpu_backend_writes_the_track_format(monkeypatch, tmp_path):
     assert n_tracks > 50
     # Every slab of this volume crosses a sheet piece above the dust threshold, so none is empty. (An empty
     # entry here used to mean pieces that passed prepare_cc_labels' dust filter but were dropped again by the
-    # skeletonizer, which got the threshold in full-resolution voxels.)
-    assert pickle.dumps([]) not in entries.values()
+    # skeletonizer, which got the threshold in full-resolution voxels.) A vy slab wholly inside the block's
+    # y range 196..230 is the exception: there the block joins the sheets into one component above
+    # max_area_threshold.
+    inside_block = {f'vy:{w}' for w in range(y0, ys.max(), 24)
+                    if 196 <= w and w + est.yx_chunk_thickness_v <= 230}
+    assert pickle.dumps([]) not in [v for key, v in entries.items() if key not in inside_block]
 
     # Resume: keys already present are not recomputed.
     with dbm.open(str(out), 'w') as database:
         database['h:16'] = pickle.dumps(['kept'])
     est.run_cpu('synthetic', str(out))
     assert _read_dbm(out) == {**entries, 'h:16': pickle.dumps(['kept'])}
+
+    with dbm.open(str(out), 'w') as database:
+        database[f'vx:{xs.min()}'] = pickle.dumps([])
+    with pytest.raises(SystemExit, match='vx slabs off the 4-voxel grid'):
+        est.run_cpu('synthetic', str(out))
 
 
 def test_cpu_slabs_thinner_than_downsample_factor_have_no_tracks(monkeypatch):
