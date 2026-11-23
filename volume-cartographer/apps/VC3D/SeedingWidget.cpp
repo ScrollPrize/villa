@@ -925,26 +925,22 @@ void SeedingWidget::finalizePathLabelWraps(bool shiftHeld)
         computeDistanceTransform();
     }
 
-    // Create a new target collection.
+    // addPoint creates the target only once a complete query produces hits.
     std::string newColName = _point_collection->generateNewCollectionName("wraps");
-    uint64_t newColId = _point_collection->addCollection(newColName);
 
     int addedPoints = 0;
     if (usePatchIntersections) {
         addedPoints = findPatchIntersectionsAlongPathToCollection(currentPath, newColName);
     } else {
         findPeaksAlongPathToCollection(currentPath, newColName);
-        const auto& collections = _point_collection->getAllCollections();
-        const auto it = collections.find(newColId);
-        if (it != collections.end()) {
-            addedPoints = static_cast<int>(it->second.points.size());
-        }
+        if (const auto id = _point_collection->getCollectionId(newColName))
+            addedPoints = static_cast<int>(_point_collection->getAllCollections().at(*id).points.size());
     }
 
     if (addedPoints > 0) {
         // Auto fill winding annotations in chosen direction.
         _point_collection->autoFillWindingNumbers(
-            newColId,
+            _point_collection->getCollectionId(newColName).value(),
             shiftHeld ? VCCollection::WindingFillMode::Decremental : VCCollection::WindingFillMode::Incremental
         );
     }
@@ -1094,6 +1090,7 @@ int SeedingWidget::findPatchIntersectionsAlongPathToCollection(const PathPrimiti
                 const auto crossings = SurfaceCatalog::region(*_surfaceCatalog->session(), _surfaceCatalog->sources(),
                                                               _surfaceCatalog->voxels(),
                                                               vc3d::store::regionSlice(*region), {});
+                crossings.requireComplete();
                 for (const auto& run : crossings.runs) {
                     auto& out = intersections[run.objectUuid];
                     for (size_t i = 1; i < run.points.size(); ++i)
@@ -1102,6 +1099,8 @@ int SeedingWidget::findPatchIntersectionsAlongPathToCollection(const PathPrimiti
                 }
             } catch (const std::exception& error) {
                 Logger()->warn("Relative winding surface query failed: {}", error.what());
+                QMessageBox::warning(this, tr("Winding annotations not created"), QString::fromUtf8(error.what()));
+                return 0;
             }
         }
     }

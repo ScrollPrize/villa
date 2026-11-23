@@ -391,6 +391,7 @@ void createObjectArray(const fs::path& path,const Index& shape,const Index& chun
 }
 ArrayInventory inventory(const fs::path& path,const Access& access,bool strict)
 {
+    detail::forgetKnownArrays(path.string(), access);
     OpenOptions options; options.access = access;
     const auto metadata = readArrayDocument(path.string(), options);
     if (!metadata) throw NotFound("no Zarr array at " + path.string());
@@ -463,6 +464,8 @@ Writer Writer::create(const fs::path& path, const CreateOptions& options, const 
 Writer Writer::open(const fs::path& path, const Access& access)
 {
     Store store(path, access);
+    // A writer works on the array as published now, not as this process last read it.
+    detail::forgetKnownArrays(path.string(), access);
     OpenOptions options; options.access = access;
     const auto stored = readArrayDocument(path.string(), options);
     if (!stored) throw NotFound("no Zarr array to write at " + path.string());

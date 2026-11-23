@@ -403,7 +403,7 @@ test('ambiguous and malformed automation PR state fails closed', async (t) => {
 test('dispatch body is fixed, consecutive, prepared, and numeric', () => {
   assert.deepEqual(
     buildProductionDispatch({
-      operation: 'activate',
+      operation: 'ready',
       sourceCycle: '2026-12',
       targetCycle: '2027-01',
       requestId: 123456,
@@ -411,10 +411,9 @@ test('dispatch body is fixed, consecutive, prepared, and numeric', () => {
     {
       ref: 'main',
       inputs: {
-        operation: 'activate',
+        operation: 'ready',
         'source-cycle': '2026-12',
         'target-cycle': '2027-01',
-        'verify-mode': 'prepared',
         'request-id': '123456',
       },
       return_run_details: true,
@@ -473,7 +472,6 @@ test('dispatch posts only the fixed production request and validates exact child
         operation: 'validate',
         'source-cycle': '2026-07',
         'target-cycle': '2026-08',
-        'verify-mode': 'prepared',
         'request-id': '9988',
       },
       return_run_details: true,
@@ -565,7 +563,7 @@ test('dedupe CLI writes only public enums and run identifiers to GITHUB_OUTPUT',
   let appended;
   const result = await runSchedulerCli([
     'dedupe',
-    '--operation', 'activate',
+    '--operation', 'ready',
     '--target-cycle', TARGET_CYCLE,
   ], {
     env: { GITHUB_TOKEN: TOKEN, GITHUB_OUTPUT: '/tmp/github-output' },
@@ -612,7 +610,7 @@ test('dispatch CLI suppresses a run that appears after an idle dedupe without PO
   let dedupeOutput = '';
   const dedupe = await runSchedulerCli([
     'dedupe',
-    '--operation', 'activate',
+    '--operation', 'ready',
     '--target-cycle', TARGET_CYCLE,
   ], {
     env: { GITHUB_TOKEN: TOKEN, GITHUB_OUTPUT: '/tmp/dedupe-output' },
@@ -628,7 +626,7 @@ test('dispatch CLI suppresses a run that appears after an idle dedupe without PO
   let dispatchOutput = '';
   const dispatch = await runSchedulerCli([
     'dispatch',
-    '--operation', 'activate',
+    '--operation', 'ready',
     '--source-cycle', '2026-07',
     '--target-cycle', TARGET_CYCLE,
     '--request-id', '20260721',
@@ -676,7 +674,7 @@ test('dispatch CLI exposes only the positive child ID and exact public URLs', as
   let output = '';
   await runSchedulerCli([
     'dispatch',
-    '--operation', 'activate',
+    '--operation', 'ready',
     '--source-cycle', '2026-07',
     '--target-cycle', TARGET_CYCLE,
     '--request-id', '445566',

@@ -7,7 +7,7 @@ import sqlite3
 import pytest
 
 from vesuvius.neural_tracing.fiber_trace_3d.constraint_extraction import run_native_constraints
-from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fiber_catalog, open_store
+from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fiber_catalog, open_store, fiber_source_version
 
 
 def test_existing_store_constraint_export(tmp_path):
@@ -33,6 +33,7 @@ def test_existing_store_constraint_export(tmp_path):
     result = json.loads(Path(config['output']).read_text())
     assert result['selected_fibers'] > 0 and result['points'] >= 2
     assert result['normal_alignment'] is False
+    assert result['fiber_source'] == fiber_source_version(fibers)
     with open_store(fibers) as store:
         assert result['fibers_store_uuid'] == store.uuid
     assert catalog[0]['id'] in result['selected_ids'] and result['selected_ids'] == sorted(result['selected_ids'])

@@ -32,5 +32,5 @@ std::vector<GeometryChunkChange> decodeGeometryDelta(sqlite3*, const std::string
                                                     const nlohmann::json& manifest);
 void applyGeometryDelta(std::vector<uint8_t>&, const GeometryChunkChange&, bool reverse = false);
 void clearGeometryMaterialization(sqlite3*, const std::string& objectUuid);
-void materializeGeometry(sqlite3*, const std::string& objectUuid, const std::string& revision);
+void restoreGeometryReference(sqlite3*, const std::string& objectUuid, const std::string& revision);
 }

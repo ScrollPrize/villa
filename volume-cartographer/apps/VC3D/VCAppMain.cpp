@@ -50,6 +50,10 @@
 #else
 #include <dlfcn.h>
 #include <sys/resource.h>
+#include <cerrno>
+#if defined(__APPLE__)
+#include <climits>  // OPEN_MAX
+#endif
 #endif
 #ifdef __linux__
 #include <sys/syscall.h>
@@ -87,6 +91,38 @@ static void setThreadPoliciesEarly()
 __attribute__((section(".preinit_array"), used))
 static auto preinitFn = &setThreadPoliciesEarly;
 #endif
+
+// Raise the soft limit on open files to 65536 (or the hard limit, if lower). Remote volumes,
+// Lasagna datasets and the object store each keep files and HTTP connections
+// open; the 1024 that Linux desktops start a process with ran out while placing
+// control points on a fibre with remote normals, and every later open() failed
+// (a Lasagna manifest that could not be read, an OpenGL context the NVIDIA
+// driver could not keep). The soft limit stays a bounded number: children
+// inherit it, and some close every descriptor up to it. VC3D's own code and
+// vc_reader use poll()/libcurl, never select(), so descriptors above FD_SETSIZE
+// are safe.
+static void raiseOpenFileLimit()
+{
+#ifndef _WIN32
+    constexpr rlim_t kWanted = 65536;
+    rlimit limit{};
+    if (::getrlimit(RLIMIT_NOFILE, &limit) != 0)
+        return;
+    rlim_t target = kWanted;
+    if (limit.rlim_max != RLIM_INFINITY)
+        target = std::min(target, limit.rlim_max);
+#if defined(__APPLE__)
+    // macOS refuses a soft limit above OPEN_MAX even when the hard one is unlimited.
+    target = std::min<rlim_t>(target, OPEN_MAX);
+#endif
+    if (limit.rlim_cur == RLIM_INFINITY || limit.rlim_cur >= target)
+        return;
+    limit.rlim_cur = target;
+    if (::setrlimit(RLIMIT_NOFILE, &limit) != 0)
+        std::fprintf(stderr, "VC3D: could not raise the open-file limit to %llu: %s\n",
+                     static_cast<unsigned long long>(target), std::strerror(errno));
+#endif
+}
 
 static bool hasCliFlag(int argc, char* argv[], const char* flag)
 {
@@ -157,6 +193,7 @@ auto main(int argc, char* argv[]) -> int
 #endif
 
     vc::crash::install();
+    raiseOpenFileLimit();
 
 #ifndef __linux__
     // On non-Linux, preinit_array is unavailable so set env vars at start of main.

@@ -406,7 +406,7 @@ def test_demand_late_chunks_reverse_completion_matches_sequential(tmp_path, dtyp
         products=sequential_adapter.output_products,
         output_regions_zyx={"identity": (0, 0, 0, *geometry.output_shape)},
         full_output_shapes_zyx={"identity": geometry.output_shape},
-        input_zarr_path=str(tmp_path / "input.zarr"),
+
         output_scaledown_base={"identity": scale}, tile_size=geometry.tile, overlap=geometry.overlap, border=geometry.border,
         tmp_dir=str(tmp_path), flush_workers=0,
         accumulator_workers=0, product_accumulator_dtype=dtype)

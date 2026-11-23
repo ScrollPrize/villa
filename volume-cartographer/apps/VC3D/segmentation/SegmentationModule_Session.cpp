@@ -39,6 +39,9 @@ bool SegmentationModule::beginEditingSession(std::shared_ptr<QuadSurface> surfac
         return false;
     }
 
+    // A previous stop may have failed to save. Do not replace its loaded
+    // correction state until that write succeeds, even for the same surface.
+    if (!saveCorrections()) return false;
     if (!prepareEditingDestination(surface)) return false;
     // Editing starts from the revision on screen and holds the object until it ends.
     const auto storeEdit = storeEditFor(surface.get());
@@ -392,38 +395,54 @@ void SegmentationModule::applyCorrectionAnchorOffset(float offsetX, float offset
 void SegmentationModule::loadCorrections(QuadSurface* surface)
 {
     _correctionsSurfaceId.clear();
+    _correctionsSnapshot.reset();
     if (!_pointCollection) {
         return;
     }
     std::map<uint64_t, nlohmann::json> stored;
     if (const auto storeEdit = storeEditFor(surface)) {
         try {
-            stored = vc3d::corrections::read(*_state->objectStoreSession(), storeEdit->pin().attachment, storeEdit->uuid(),
+            _correctionsSnapshot = vc3d::corrections::read(*_state->objectStoreSession(), storeEdit->pin().attachment, storeEdit->uuid(),
                                              storeEdit->view());
+            stored = _correctionsSnapshot->collections;
+            storeEdit->watchAttachedCollections(_correctionsSnapshot->baseline);
             _correctionsSurfaceId = storeEdit->uuid();
         } catch (const std::exception& error) {
             emit statusMessageRequested(tr("Cannot read correction points: %1").arg(QString::fromUtf8(error.what())), kStatusLong);
         }
     }
     _pointCollection->replaceAnchoredCollections(stored);
+    if (_correctionsSnapshot)
+        for (const auto& collection : _correctionsSnapshot->baseline.collections)
+            _pointCollection->reservePointIds(uint64_t(collection.nextPointId));
 }
 
-void SegmentationModule::saveCorrections()
+bool SegmentationModule::saveCorrections()
 {
     if (_correctionsSaveTimer && _correctionsSaveTimer->isActive()) {
         _correctionsSaveTimer->stop();
     }
-    if (!_pointCollection || _correctionsSurfaceId.empty() || !_storeEdit || _storeEdit->uuid() != _correctionsSurfaceId ||
+    if (!_pointCollection || !_correctionsSnapshot || _correctionsSurfaceId.empty() || !_storeEdit || _storeEdit->uuid() != _correctionsSurfaceId ||
         !_state || !_state->annotationVolume()) {
-        return;
+        return true;
     }
     try {
-        vc3d::corrections::write(*_state->objectStoreSession(), _storeEdit->pin().attachment, _correctionsSurfaceId,
-                                 _pointCollection->anchoredCollections(), *_state->annotationVolume(), _storeEdit->view());
+        vc3d::corrections::write(*_state->objectStoreSession(), _storeEdit->pin().attachment, *_correctionsSnapshot,
+                                 _pointCollection->anchoredCollections(), *_state->annotationVolume(), _storeEdit.get());
+        return true;
     } catch (const std::exception& error) {
         qCWarning(lcSegModule) << "Saving correction points failed:" << error.what();
         emit statusMessageRequested(tr("Failed to save correction points: %1").arg(QString::fromUtf8(error.what())), kStatusLong);
+        return false;
     }
+}
+
+void SegmentationModule::saveGrowthAnnotation(const vc3d::corrections::GrowthAnnotation& annotation)
+{
+    if (!_storeEdit || _storeEdit->uuid() != annotation.surfaceUuid || !_state || !_state->annotationVolume())
+        throw std::runtime_error("Growth annotation has no active surface editor");
+    vc3d::corrections::writeGrowthAnnotation(*_state->objectStoreSession(), _storeEdit->pin().attachment,
+        annotation, *_state->annotationVolume(), _storeEdit.get());
 }
 
 vc::objects::CoordinateJson SegmentationModule::editCoordinates(const SurfaceStoreEdit& storeEdit) const
@@ -431,7 +450,7 @@ vc::objects::CoordinateJson SegmentationModule::editCoordinates(const SurfaceSto
     if (const auto& view = storeEdit.view()) return vc::objects::volumeCoordinates(view->volume, view->scale);
     vc::objects::CoordinateJson coordinates = nlohmann::json::object();
     _state->objectStoreSession()->readStore(storeEdit.pin().attachment, [&](const vc::objects::StoreReader& reader, const auto&) {
-        if (const auto object = reader.currentObject(storeEdit.uuid()))
+        if (const auto object = reader.selectedObject(storeEdit.uuid(), {}, {}, storeEdit.pin().reference()))
             coordinates = nlohmann::json::parse(object->record.meta).value("coordinates", nlohmann::json::object());
     });
     return coordinates;
@@ -471,11 +490,11 @@ void SegmentationModule::offerRecoveredDraft(const QString& objectUuid)
     } else {
         if (!state->base)
             text += QStringLiteral("\n\n") + tr("The version they were made on is not known; restoring them replaces "
-                                                 "the surface's current geometry (version %1).").arg(pin.version);
-        else if (state->base->generation != pin.generation || state->base->version != pin.version)
+                                                 "the surface's current geometry (version %1).").arg(pin.reference().version);
+        else if (*state->base != pin.reference())
             text += QStringLiteral("\n\n") + tr("The surface was saved since they were made (version %1, now %2); "
                                                  "restoring them replaces those changes.")
-                                                  .arg(state->base->version).arg(pin.version);
+                                                  .arg(state->base->version).arg(pin.reference().version);
         if (!state->conflict.empty())
             text += QStringLiteral("\n\n") + tr("Their last save conflicted: %1").arg(QString::fromStdString(state->conflict));
         restore = box.addButton(tr("Restore"), QMessageBox::AcceptRole);

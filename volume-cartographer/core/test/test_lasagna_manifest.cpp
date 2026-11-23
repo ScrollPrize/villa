@@ -13,6 +13,9 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
+#include <string>
+#include <vector>
 #include "vc_reader/zarr.hpp"
 
 namespace fs = std::filesystem;
@@ -110,6 +113,31 @@ TEST_CASE("LasagnaDatasetManifest parses channel groups from canonical Lasagna J
     CHECK(manifest.raw.contains("grad_mag_encode_scale"));
 
     fs::remove_all(dir);
+}
+
+TEST_CASE("LasagnaDatasetManifest resolves validity declarations")
+{
+    using vc::lasagna::LasagnaDatasetManifest;
+    // Legacy manifests keep their historical validity channel.
+    CHECK(LasagnaDatasetManifest::parseText(R"({"version":2,"groups":{
+        "pred":{"zarr":"pred.zarr","channels":["grad_mag","nx","ny"]}}})").validityChannel=="grad_mag");
+    CHECK(LasagnaDatasetManifest::parseText(R"({"version":2,"groups":{
+        "pred":{"zarr":"pred.zarr","channels":["presence","nx","ny","sheet_grad_mag"]}}})").validityChannel=="presence");
+    CHECK(LasagnaDatasetManifest::parseText(R"({"version":2,"groups":{
+        "pred":{"zarr":"pred.zarr","channels":["nx","ny"]}}})").validityChannel.empty());
+    // Declared channels and the chunk marker.
+    const auto declared=LasagnaDatasetManifest::parseText(R"({"version":2,"validity_channel":"presence","groups":{
+        "pred":{"zarr":"pred.zarr","channels":["presence","grad_mag","nx","ny"]}}})");
+    CHECK(declared.validityChannel=="presence");
+    CHECK_FALSE(declared.validityByChunks());
+    const auto chunks=LasagnaDatasetManifest::parseText(R"({"version":3,"validity_channel":"chunks","groups":{
+        "sd0":{"zarr":"sd0/0","scaledown":0,"channels":["presence","nx","ny"]}}})");
+    CHECK(chunks.validityByChunks());
+    CHECK_THROWS(LasagnaDatasetManifest::parseText(R"({"version":2,"validity_channel":"missing","groups":{
+        "pred":{"zarr":"pred.zarr","channels":["nx","ny"]}}})"));
+    // An embedded v3 manifest requires the declaration.
+    CHECK_THROWS(LasagnaDatasetManifest::parseText(R"({"lasagna":{"version":3,"validity_channel":"chunks","groups":{
+        "sd0":{"zarr":"sd0/0","scaledown":0,"channels":["nx","chunks"]}}}})"));
 }
 
 TEST_CASE("LasagnaDataset wraps manifest and reports missing normal source")
@@ -216,6 +244,48 @@ TEST_CASE("LasagnaDataset recognizes a validated remote cache marker")
         })";
     }
     CHECK_THROWS(vc::lasagna::LasagnaDataset::open(manifestPath));
+    fs::remove_all(dir);
+}
+
+TEST_CASE("A remote dataset's local copy caches the provenance record it names")
+{
+    const auto dir = makeTmpDir("remote-provenance");
+    const auto manifestPath = dir / "dataset.lasagna.json";
+    {
+        std::ofstream out(manifestPath);
+        out << R"({"version":2,"groups":{},"provenance":"inference.json"})";
+    }
+    std::vector<std::string> fetched;
+    const auto fetcher = [&](const std::string& location, const fs::path& temporary) {
+        fetched.push_back(location);
+        std::ofstream(temporary) << R"({"run_uuid":"run-1"})";
+    };
+
+    // Without the marker the manifest is a local dataset's: nothing to fetch.
+    vc::lasagna::cacheLasagnaProvenance(vc::lasagna::LasagnaDataset::open(manifestPath).manifest(), fetcher);
+    CHECK(fetched.empty());
+
+    {
+        std::ofstream out(dir / vc::lasagna::kLasagnaRemoteMarker);
+        out << R"({
+          "artifact_url":"https://example.test/lasagna/",
+          "manifest_file":"dataset.lasagna.json"
+        })";
+    }
+    const auto manifest = vc::lasagna::LasagnaDataset::open(manifestPath).manifest();
+    vc::lasagna::cacheLasagnaProvenance(manifest, fetcher);
+    CHECK(fetched == std::vector<std::string>{"https://example.test/lasagna/inference.json"});
+    std::ifstream record(dir / "inference.json");
+    CHECK(std::string(std::istreambuf_iterator<char>(record), {}) == R"({"run_uuid":"run-1"})");
+    vc::lasagna::cacheLasagnaProvenance(manifest, fetcher);
+    CHECK(fetched.size() == 1);
+
+    {
+        std::ofstream out(manifestPath);
+        out << R"({"version":2,"groups":{},"provenance":"../inference.json"})";
+    }
+    CHECK_THROWS(vc::lasagna::cacheLasagnaProvenance(
+        vc::lasagna::LasagnaDataset::open(manifestPath).manifest(), fetcher));
     fs::remove_all(dir);
 }
 

@@ -1,4 +1,5 @@
 #include "internal/SurfaceDrafts.hpp"
+#include "vc_object_store/objects/ResidentSurface.hpp"
 #include "internal/ReadRequest.hpp"
 #include "internal/VolumeFrames.hpp"
 #include <algorithm>
@@ -200,5 +201,21 @@ std::optional<SurfaceProximityHit> draftNearest(const std::string& uuid, const S
     const auto hit = nearest.take();
     if (!hit) return std::nullopt;
     return SurfaceProximityHit{uuid, "", hit->grid, hit->point, hit->distance};
+}
+}
+
+namespace vc::objects {
+ResidentSurface::ResidentSurface(const vc::geometry::Surface& surface)
+    : data_(detail::makeSurfaceDraft(surface, nlohmann::json::object(), std::nullopt)) {}
+
+RegionResult ResidentSurface::region(const std::string& identity, const RegionSlice& slice,
+                                    const RegionCancel& cancel, uint64_t outputByteBudget) const
+{
+    RegionOptions options;
+    options.kind = "surface";
+    options.outputByteBudget = outputByteBudget;
+    RegionResult result;
+    detail::draftRegion(identity, *data_, {}, slice, options, cancel, result);
+    return result;
 }
 }

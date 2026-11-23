@@ -32,7 +32,7 @@ def collection(db):
 
 
 def link_request(status, plan):
-    return dict(command_version=1, request=str(uuid.uuid4()), store=status["store"], generation=status["generation"],
+    return dict(command_version=3, request=str(uuid.uuid4()), store=status["store"], generation=status["generation"],
                 author="py", expected_objects={}, expected_relationships={}, read_dependencies={},
                 expected_commit_sequence=None, operations=[{"op": vos.LINK_OBJECTS_OPERATION, "plan": plan}])
 
@@ -80,6 +80,22 @@ def test_link_objects_refuses_a_bad_plan(db):
     assert db.object(vos.link_marker_uuid()) is None
 
 
+def test_submit_retains_store_through_reentrant_progress(db):
+    plane(db), plane(db)
+    closes = []
+
+    def progress(*_):
+        with pytest.raises(RuntimeError, match="cannot close"):
+            db.close()
+        closes.append(True)
+
+    receipt = db.submit(link_request(db.status(), {
+        "detectors": [{"detector": "surface-overlap", "params": {}}], "marker": {},
+    }), progress=progress)
+    assert closes
+    assert receipt["commit_sequence"] == db.status()["commit_sequence"]
+
+
 def test_link_objects_fails_when_a_detector_cannot_run(db):
     plane(db), plane(db), collection(db)
     put(db, "track", [array("points", [[1, 1, 20], [8, 8, 20], [16, 16, 20]], "<i4")], {"family": "h"},
@@ -100,3 +116,25 @@ def test_link_objects_fails_when_a_detector_cannot_run(db):
         db.submit(link_request(db.status(), throwing))
     assert db.status()["commit_sequence"] == before
     assert db.object(vos.link_marker_uuid()) is None
+
+
+def test_link_objects_numbers_the_commits_changes_in_order(db, db_path):
+    # Every change of the commit gets the next position: the publisher keeps
+    # the count itself instead of counting the commit's rows on each insert.
+    import sqlite3
+    size, tracks = 6, []
+    for i in range(size):
+        for key, points, family in ((i, [[x, 10 * i + 5, 20] for x in range(10 * size)], "horizontal"),
+                                    (100 + i, [[10 * i + 5, y, 20] for y in range(10 * size)], "vertical")):
+            tracks.append(put(db, "track", [array("points", points, "<i4")], {"family": family},
+                              track={"dataset_ref": "grid", "external_key": str(key), "family": family}))
+    plan = {"detectors": [{"detector": "track-track", "params": {"track_uuids": tracks}}], "marker": {}}
+    receipt = db.submit(link_request(db.status(), plan))
+    assert len(receipt["relationships"]) == size * size
+    with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as sql:
+        rows = sql.execute("SELECT position,record_kind,record_uuid FROM store_changes WHERE seq=? ORDER BY position",
+                           (receipt["commit_sequence"],)).fetchall()
+    assert [row[0] for row in rows] == list(range(len(rows)))
+    assert len({row[2] for row in rows}) == len(rows)
+    assert sum(row[1] == "relationship" for row in rows) == size * size
+    assert sum(row[1] == "object" for row in rows) == len(tracks) + 1  # the tracks and the link marker

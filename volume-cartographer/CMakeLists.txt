@@ -307,6 +307,14 @@ if(NOT MSVC AND CMAKE_BUILD_TYPE STREQUAL "QuickBuild")
     # and macro definitions that no automated test job consumes.
     set(_dbg -g1 -fno-omit-frame-pointer -fasynchronous-unwind-tables)
 endif()
+# Builds nobody debugs (static analysis, throwaway compile checks) can drop debug
+# info: -g3 makes up a large share of compile time and peak memory for the
+# template-heavy sources. -g0 last also overrides CMake's -g for Debug.
+option(VC_DEBUG_INFO "Emit debug info (GCC/Clang); OFF for analysis-only builds" ON)
+if(NOT VC_DEBUG_INFO AND NOT MSVC)
+    list(FILTER _dbg EXCLUDE REGEX "^-g|^-fstandalone-debug$|^-fno-eliminate-unused-debug-types$")
+    list(APPEND _dbg -g0)
+endif()
 if(MSVC)
     add_compile_options(${_dbg})
 else()
@@ -692,6 +700,13 @@ foreach(_dir IN LISTS _vc_install_dirs)
                  PROPERTY BUILDSYSTEM_TARGETS)
     foreach(_tgt IN LISTS _dir_targets)
         get_target_property(_tgt_type ${_tgt} TYPE)
+        # EXCLUDE_FROM_ALL targets (developer benchmarks, ad-hoc tests) are not
+        # built by the default build, so installing them would make cpack fail
+        # on a missing file.
+        get_target_property(_tgt_excluded ${_tgt} EXCLUDE_FROM_ALL)
+        if(_tgt_excluded)
+            continue()
+        endif()
         if(_tgt_type STREQUAL "EXECUTABLE" OR _tgt_type STREQUAL "SHARED_LIBRARY")
             if(WIN32)
                 # Register each binary in a dependency set so the packaging

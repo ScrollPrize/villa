@@ -15,8 +15,7 @@ without copies.
 - **Versions everything.** Every object and relationship has a stable UUID and
   a numbered version, starting at 1, advancing once per transaction that
   changes it. A historical reference is
-  `(store, generation, object, version)`; old revisions stay readable forever
-  and restore is a new checked edit, never a moved head.
+  `(store, generation, object, version)`; with history enabled, retained revisions stay readable and restore is a new checked edit, never a moved head.
 - **Checked writes.** A write names the versions it read. If another writer
   moved them first, the write conflicts and commits nothing.
 - **Graph edges.** Relationships (same-winding/same-surface links, fiber
@@ -39,6 +38,12 @@ without copies.
 - **Local or hosted.** One writer can serve a store with `vc_object_server`;
   C++ (through `ObjectStoreSession`) and Python clients then use the same API
   without opening the database file.
+
+## Immutable and large-scale stores
+
+Schema 22 supports current-only storage (`history_enabled=False`), optional spatial indexing, sealing, [store_references, overlays and independent shards](docs/collections.md), and optional [packed SQLite containers](docs/packed-stores.md). Current record versions and the store commit sequence remain available with history disabled; requests for unavailable history fail explicitly. A lineage UUID is not a numeric change counter. Spatial queries require the spatial index.
+
+For large immutable datasets, the C++ [initial batch construction API](docs/initial-import.md) accepts objects, geometry and relationships from a shared parallel streaming source. See the [format and policy reference](docs/store-format.md), [schema integration contract](docs/schema-integration.md) and [shared API contract](docs/store-api-contract.md). The redesigned lazy/delta history layout remains deferred.
 
 ## Examples
 
@@ -132,7 +137,23 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 VC_OBJECT_STORE_BUILD_PYTHON_PATH=build/python 
   /path/to/python -m pytest vc_object_store/tests/python -q
 ```
 
-Older stores (schema 16–19; the runtime opens schema 20) convert with
+On macOS the Python module is built without OpenMP, so from Python
+`link_tracks_to_tracks(workers=...)` runs on one worker there. `vc_object_links` and
+`vc_object_server` built beside it keep OpenMP when CMake finds it (Apple's clang
+needs `-DOpenMP_ROOT=$(brew --prefix libomp)`), so `--track-workers` and hosted
+`track-track` requests run the workers they ask for.
+
+On macOS the Python module links Homebrew's OpenCV, whose OpenBLAS loads Homebrew's
+`libomp.dylib`, while torch's wheels bring their own copy. When torch is installed,
+`import vc_object_store` loads and starts torch's copy first and keeps the copy
+`_native` brings to one thread, so torch and `vc_object_store` can be imported in
+either order. It sets `KMP_DUPLICATE_LIB_OK=TRUE` (unless you set it) only while the
+two copies start, so later loads and child processes keep OpenMP's check for a second
+runtime. If another `libomp.dylib` was loaded before torch's when `vc_object_store` is
+imported, or `KMP_DUPLICATE_LIB_OK` is set to a false value, the import arranges nothing
+and OpenMP's own check reports it (`python/vc_object_store/__init__.py`).
+
+Older upstream stores (schema 16–21; the runtime opens schema 22) convert with
 `vc_object_convert old.vcobj new.vcobj`, which also writes a revision mapping
 and a report beside the destination. Native directory export currently
 requires Linux `renameat2` or macOS `renamex_np`.

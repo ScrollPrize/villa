@@ -11,6 +11,7 @@
 #include "vc_reader/computed.hpp"
 #include "vc_reader/reader.hpp"
 #include "vc_reader/zarr.hpp"
+#include "zarr/files.hpp"
 #include "vc_reader/zarr_metadata.hpp"
 #include "vc_reader/zarr_write.hpp"
 #include "output_pool.hpp"
@@ -209,6 +210,11 @@ NB_MODULE(_reader, m)
 
     nb::class_<vcr::MemoryCache>(m, "MemoryCache", "Byte-bounded LRU of decoded chunks, shareable between arrays.")
         .def(nb::init<std::size_t>(), "max_bytes"_a)
+        .def_static("automatic", &vcr::MemoryCache::automatic, "fraction"_a = 0.5, "smoothing_seconds"_a = 10.)
+        .def_prop_ro("is_auto", &vcr::MemoryCache::is_auto)
+        .def_prop_ro("fraction", &vcr::MemoryCache::fraction)
+        .def_prop_ro("smoothing_seconds", &vcr::MemoryCache::smoothing_seconds)
+        .def("refresh_budget", &vcr::MemoryCache::refresh_budget)
         .def_prop_ro("max_bytes", &vcr::MemoryCache::max_bytes)
         .def_prop_ro("nbytes", &vcr::MemoryCache::nbytes)
         .def_prop_ro("hits", &vcr::MemoryCache::hits)
@@ -649,6 +655,10 @@ NB_MODULE(_reader, m)
     m.def("forget_volume_metadata", &vcr::zarr::forgetVolumeMetadata);
     m.def("is_array_node", &vcr::zarr::isArrayNode, "location"_a, "options"_a, nb::call_guard<nb::gil_scoped_release>());
     m.def("forget_kept_metadata", &vcr::zarr::forgetKeptMetadata, "location"_a, "options"_a);
+    m.def("forget_known_arrays", [](const std::string& location, const OpenOptions& options) {
+        vcr::zarr::detail::forgetKnownArrays(location, options.access);
+    }, "location"_a, "options"_a,
+       "Drops the array documents this process read at or below a location (not the kept metadata on disk).");
     m.def("level_voxel_size_zyx", [](std::optional<double> voxel_size, const nb::object& documents, const std::string& level_key) {
         vcr::zarr::StoreMetadata metadata;
         metadata.voxelSizeUm = voxel_size;
@@ -921,6 +931,10 @@ NB_MODULE(_reader, m)
         }, "path"_a, "location"_a, "access"_a);
 
     nb::class_<vcr::Array>(m, "Array")
+        .def("request_channel_cache", &vcr::Array::request_channel_cache, "channels"_a,
+             "Enable channel caching for every reader of this array; accumulate relevant leading-axis channels.")
+        .def_prop_ro("cache_channels", &vcr::Array::cache_channels)
+        .def_prop_ro("channel_cache_enabled", &vcr::Array::channel_cache_enabled)
         .def(
             "read_many",
             [](vcr::Array& a, const std::vector<vcr::Index>& starts, const std::vector<vcr::Index>& sizes,
@@ -1093,6 +1107,8 @@ NB_MODULE(_reader, m)
             d["remote_fetches"] = s.remote_fetches.load();
             d["remote_missing"] = s.remote_missing.load();
             d["remote_bytes"] = s.remote_bytes.load();
+            d["channel_read_bytes"] = s.channel_read_bytes.load();
+            d["channel_decoded_bytes"] = s.channel_decoded_bytes.load();
             d["write_errors"] = s.write_errors.load();
             d["last_write_error"] = a.last_write_error();
             d["corrupt"] = s.corrupt.load();

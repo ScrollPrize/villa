@@ -11,7 +11,7 @@ set(VC_DELTA3D_INSTALL_CPP OFF)
 set(VC_DELTA3D_MODERN_SMOKE ON)
 FetchContent_Declare(vc_delta3d
     GIT_REPOSITORY https://github.com/ScrollPrize/vc-delta3d.git
-    GIT_TAG 45339743b450ff707d21fb742dc1b3b2bf99306d)
+    GIT_TAG v0.3.2)
 vc_fetch_delta3d()
 foreach(target vc_delta3d vc_ng_fixed32 vc_ng_fixed64 vc_ng_fixed128 vc_ng_fixed256)
     foreach(property AUTOMOC AUTOUIC AUTORCC)

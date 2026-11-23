@@ -13,17 +13,17 @@ import numpy as np
 import torch
 
 from fit_session import (AUTOSAVE_CHECKPOINT_NAME, AUTOSAVE_METADATA_NAME,
-                         AUTOSAVE_METADATA_SCHEMA, PclInputSpec, PclRole,
-                         ScrollSpecError, SessionState, SpiralInputPaths,
-                         load_scroll_spec, resolve_dataset_root,
-                         resolve_logical_dbm, validate_checkpoint_container)
+                         AUTOSAVE_METADATA_SCHEMA,
+                         ScrollSpecError, SessionScroll, SessionState,
+                         SpiralInputPaths, SpiralProject,
+                         validate_checkpoint_container)
 import spiral_runtime
 from spiral_progress import NullProgressReporter
 from spiral_runtime import (CommandBarrier, CommandBarrierViolation,
                             ConfigureCommand,
                             DtLossScheduleCommand,
                             DistributedInteractiveFitSession,
-                            FileStoreRendezvous, InputBatchCommand,
+                            FileStoreRendezvous,
                             InteractiveFitSession,
                             SaveCheckpointCommand, collective_view)
 import spiral_helpers
@@ -41,111 +41,80 @@ def _zip_checkpoint_bytes(payload=b"payload"):
     return buffer.getvalue()
 
 
-def write_scroll_spec(root, **extra):
-    document = {
-        "schema_version": 1,
-        "name": "s1",
-        "voxel_size_um": 9.6,
-        "spiral_outward_sense": "CW",
-        **extra,
-    }
-    (Path(root) / "spiral-scroll.json").write_text(json.dumps(document))
+class ProjectScrollTests(unittest.TestCase):
+    UMBILICUS = {"reference": {
+        "store": "11111111-1111-4111-8111-111111111111",
+        "generation": "22222222-2222-4222-8222-222222222222",
+        "object": "33333333-3333-4333-8333-333333333333", "version": 1},
+        "points_zyx": [[0, 1, 2], [10, 1, 2]]}
+    LASAGNA = {"location": "/d/p.lasagna.json", "identity": "run-1", "group": "4",
+               "normal_x": "/d/nx.ome.zarr", "normal_y": "/d/ny.ome.zarr"}
+
+    def scroll(self, lasagna=None, **facts):
+        block = {"name": "p", "volumes": {"v": {**facts, "umbilicus": self.UMBILICUS}}}
+        if lasagna is not None:
+            block["lasagna"] = lasagna
+        return SessionScroll(SpiralProject.from_mapping(block))
+
+    def test_the_project_round_trips_and_rejects_malformed_blocks(self):
+        project = SpiralProject.from_mapping({
+            "name": "p", "lasagna": self.LASAGNA,
+            "fiber_inference": {"location": "/d/f.lasagna.json", "identity": "run-2"},
+            "volumes": {"v": {"voxel_size_um": 2.0, "lasagna_scale": 4, "fiber_scale": 4,
+                              "umbilicus": self.UMBILICUS}}})
+        self.assertEqual(project.volumes["v"].fiber_scale, 4.0)
+        self.assertEqual(SpiralProject.from_mapping(project.to_mapping()), project)
+        for block, message in (
+                ({"volumes": {}}, "project.name"),
+                ({"name": "p", "volumes": []}, "keyed by volume"),
+                ({"name": "p", "volumes": {"v": {"voxel_size_um": -1}}}, "positive"),
+                ({"name": "p", "volumes": {"v": {"lasagna_scale": 0.5}}}, "positive integer"),
+                ({"name": "p", "volumes": {"v": {"fiber_scale": 0}}}, "fiber_scale"),
+                ({"name": "p", "volumes": {}, "fiber_inference": {"location": "x"}},
+                 "fiber_inference"),
+                ({"name": "p", "volumes": {}, "lasagna": {"location": "x"}}, "stores"),
+                ({"name": "p", "volumes": {}, "lasagna": {**self.LASAGNA, "identity": "../x"}},
+                 "identity"),
+                ({"name": "p", "volumes": {"v": {"umbilicus": {
+                    **self.UMBILICUS, "points_zyx": [[0, 1, 2]]}}}}, "two or more")):
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(ScrollSpecError, message):
+                    SpiralProject.from_mapping(block)
+
+    def test_the_scroll_is_the_project_volumes_and_the_sense_setting(self):
+        # The catalog orientation decides the sense; a setting must agree.
+        oriented = self.scroll(voxel_size_um=3.0, z_direction_is_top_to_bottom=True,
+                               left_handed_coordinates=False)
+        scroll = oriented.resolve("v")
+        self.assertEqual((scroll.name, scroll.voxel_size_um, scroll.spiral_outward_sense,
+                          scroll.umbilicus_coordinate_scale), ("p", 3.0, "ACW", 1.0))
+        self.assertEqual(oriented.resolve("v", "ACW").spiral_outward_sense, "ACW")
+        with self.assertRaisesRegex(ScrollSpecError, "contradicts the catalog"):
+            oriented.resolve("v", "CW")
+        # Without an orientation the setting gives it, and must be set.
+        bare = self.scroll(voxel_size_um=3.0)
+        self.assertEqual(bare.resolve("v", "CW").spiral_outward_sense, "CW")
+        with self.assertRaisesRegex(ScrollSpecError, "set the fit setting spiral_outward_sense"):
+            bare.resolve("v")
+        with self.assertRaisesRegex(ScrollSpecError, "voxel_size_um"):
+            self.scroll().resolve("v", "CW")
+        with self.assertRaisesRegex(ScrollSpecError, "not a volume of the project"):
+            bare.resolve("w", "CW")
+
+    def test_a_fit_reading_lasagna_takes_the_volumes_scale(self):
+        scroll = self.scroll(self.LASAGNA, voxel_size_um=3.0, lasagna_scale=8).resolve(
+            "v", "CW", lasagna=True)
+        self.assertEqual(scroll.lasagna_scale, 8)
+        with self.assertRaisesRegex(ScrollSpecError, "no scale relative to the fit volume"):
+            self.scroll(self.LASAGNA, voxel_size_um=3.0).resolve("v", "CW", lasagna=True)
+        with self.assertRaisesRegex(ScrollSpecError, "selects no Lasagna dataset"):
+            self.scroll(voxel_size_um=3.0, lasagna_scale=8).resolve("v", "CW", lasagna=True)
+        with self.assertRaisesRegex(ScrollSpecError, "multichannel"):
+            self.scroll({"location": "s3://b/p.lasagna.json", "error": "multichannel"},
+                        voxel_size_um=3.0, lasagna_scale=8).resolve("v", "CW", lasagna=True)
 
 
-class ScrollSpecTests(unittest.TestCase):
-    def test_missing_file_names_the_conventional_filename(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            with self.assertRaisesRegex(ScrollSpecError, "spiral-scroll.json"):
-                load_scroll_spec(temporary)
-
-    def test_schema_version_is_required(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            (Path(temporary) / "spiral-scroll.json").write_text(json.dumps({
-                "name": "s1", "voxel_size_um": 9.6,
-                "spiral_outward_sense": "CW"}))
-            with self.assertRaisesRegex(ScrollSpecError, "schema_version"):
-                load_scroll_spec(temporary)
-
-    def test_unknown_top_level_keys_are_ignored(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            write_scroll_spec(
-                temporary,
-                base_shape_zyx=[18946, 8174, 8174],
-                future_extension={"enabled": True})
-            spec = load_scroll_spec(temporary)
-            self.assertEqual(spec.name, "s1")
-            self.assertEqual(spec.base_shape_zyx, (18946, 8174, 8174))
-            self.assertNotIn("future_extension", spec.manifest())
-
-    def test_unknown_path_override_keys_are_rejected(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            write_scroll_spec(temporary, paths={"scroll_zarr": "volume.zarr"})
-            with self.assertRaisesRegex(
-                    ScrollSpecError, r"unknown path override keys: \['scroll_zarr'\]"):
-                load_scroll_spec(temporary)
-
-    def test_required_physical_facts_and_defaults(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            (Path(temporary) / "spiral-scroll.json").write_text(json.dumps({
-                "schema_version": 1, "name": "s1"}))
-            with self.assertRaisesRegex(
-                    ScrollSpecError,
-                    r"missing required keys: \['spiral_outward_sense', "
-                    r"'voxel_size_um'\]"):
-                load_scroll_spec(temporary)
-            write_scroll_spec(temporary)
-            spec = load_scroll_spec(temporary)
-            self.assertEqual(spec.name, "s1")
-            self.assertEqual(spec.spiral_outward_sense, "CW")
-            self.assertIsNone(spec.base_shape_zyx)
-            self.assertEqual(spec.umbilicus_coordinate_scale, 1.0)
-            self.assertEqual(spec.normal_zarr_group, "4")
-            self.assertEqual(spec.lasagna_scale, 4)
-            self.assertEqual(spec.path_overrides, ())
-
-    def test_base_shape_is_validated_and_preserved(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            write_scroll_spec(temporary, base_shape_zyx=[100, 200, 300])
-            spec = load_scroll_spec(temporary)
-            self.assertEqual(spec.base_shape_zyx, (100, 200, 300))
-            for invalid in ([100, 200], [100, 0, 300], [100, 2.5, 300]):
-                write_scroll_spec(temporary, base_shape_zyx=invalid)
-                with self.assertRaisesRegex(ScrollSpecError, "base_shape_zyx"):
-                    load_scroll_spec(temporary)
-
-    def test_relative_path_overrides_resolve_against_dataset_root(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            write_scroll_spec(
-                temporary,
-                paths={"umbilicus": "annotations/umbilicus.json",
-                       "tracks_dbm": "/elsewhere/tracks.dbm"})
-            spec = load_scroll_spec(temporary)
-            self.assertEqual(
-                spec.path_override("umbilicus"),
-                str(Path(temporary).resolve() / "annotations" / "umbilicus.json"))
-            self.assertEqual(spec.path_override("tracks_dbm"),
-                             "/elsewhere/tracks.dbm")
-
-    def test_dataset_resolution_requires_and_honors_the_spec(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            (root / "annotations").mkdir()
-            (root / "annotations" / "umbilicus.json").write_text("{}")
-            (root / "verified_patches").mkdir()
-            missing = resolve_dataset_root(root)
-            self.assertIn("scroll_spec", missing.missing_required)
-            self.assertTrue(any("spiral-scroll.json" in warning
-                                for warning in missing.warnings))
-            write_scroll_spec(
-                root, paths={"umbilicus": "annotations/umbilicus.json"})
-            result = resolve_dataset_root(root)
-            self.assertTrue(result.ok)
-            self.assertEqual(result.scroll_spec["name"], "s1")
-            self.assertEqual(result.resolved["umbilicus"],
-                             str(root.resolve() / "annotations" / "umbilicus.json"))
-
-
-class DatasetResolverTests(unittest.TestCase):
+class CheckpointContainerTests(unittest.TestCase):
     def test_truncated_torch_checkpoint_is_rejected_before_loading(self):
         with tempfile.TemporaryDirectory() as temporary:
             checkpoint = Path(temporary) / "truncated.ckpt"
@@ -159,44 +128,6 @@ class DatasetResolverTests(unittest.TestCase):
             torch.save({"value": 1}, checkpoint, _use_new_zipfile_serialization=False)
             with self.assertRaisesRegex(ValueError, "Legacy pickle checkpoints are not supported"):
                 validate_checkpoint_container(checkpoint)
-
-    def test_conventional_resolution_and_logical_dbm_suffix(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            write_scroll_spec(root)
-            (root / "umbilicus.json").write_text("{}")
-            (root / "verified_patches").mkdir()
-            (root / "fibers").mkdir()
-            (root / "tracks").mkdir()
-            (root / "tracks" / "only.dbm.db").write_bytes(b"")
-            (root / "abs_winding.json").write_text("{}")
-            (root / "relative_windings.json").write_text("{}")
-            (root / "same_windings.json").write_text("{}")
-            (root / "drawn_control_points.json").write_text("{}")
-            result = resolve_dataset_root(root)
-            self.assertTrue(result.ok)
-            self.assertEqual(result.resolved["tracks_dbm"], str(root / "tracks" / "only.dbm"))
-            self.assertEqual(result.resolved["verified_patches"],
-                             str(root / "verified_patches"))
-            self.assertEqual(result.resolved["fibers"], str(root / "fibers"))
-            self.assertEqual([item["role"] for item in result.pcl_inputs],
-                             ["absolute", "relative", "same_winding",
-                              "drawn_control_points"])
-            self.assertEqual(resolve_logical_dbm(root / "tracks" / "only.dbm.db"),
-                             str(root / "tracks" / "only.dbm"))
-
-    def test_dbm_ambiguity_is_deterministic(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            write_scroll_spec(root)
-            (root / "umbilicus.json").write_text("{}")
-            (root / "verified_patches").mkdir()
-            (root / "tracks").mkdir()
-            for name in ("z.dbm.db", "a.dbm.db"):
-                (root / "tracks" / name).write_bytes(b"")
-            result = resolve_dataset_root(root)
-            self.assertEqual(result.ambiguities["tracks_dbm"], [
-                str(root / "tracks" / "a.dbm"), str(root / "tracks" / "z.dbm")])
 
 
 class HandoffTests(unittest.TestCase):
@@ -697,7 +628,6 @@ class ProtocolTests(unittest.TestCase):
                          ["dt_loss_schedule"])
         session.wait_for_iteration(100)
         self.assertEqual(calls, [(100, 100, schedule)])
-        self.assertEqual(session._iteration_in_progress, 100)
 
     def test_failed_run_setup_cancels_schedule_and_clears_run_state(self):
         session = self._idle_session(completed=10)
@@ -747,8 +677,9 @@ class ProtocolTests(unittest.TestCase):
 
     def test_command_from_another_epoch_fail_stops_the_rank(self):
         session = self._idle_session(rank=1, world_size=2)
-        session._commands.append(InputBatchCommand(
-            session_generation=0, epoch=99, records=[]))
+        session._commands.append(DtLossScheduleCommand(
+            session_generation=0, epoch=99, run_start=0,
+            requested_iterations=1, schedule={}))
         with self.assertRaisesRegex(CommandBarrierViolation,
                                     "from epoch 99 while in epoch 0"):
             session.wait_for_iteration(0)
@@ -1021,20 +952,6 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(
             session._run_config["optimizer_num_training_steps"], 30_250)
 
-    def _running_session(self, completed, target, reserved=None, epoch=7):
-        session = self._idle_session(completed=completed)
-        session._state = SessionState.Running
-        session._target = target
-        session._pending = target - completed
-        session._iteration_in_progress = None
-        session._live_reservation_iteration = reserved
-        session._live_reservation_epoch = epoch
-        session._warnings = []
-        session._error = None
-        session._publish_status = lambda: None
-        session._progress_reporter = lambda: NullProgressReporter()
-        return session
-
     def test_run_configuration_applies_active_host_values_exactly(self):
         session = InteractiveFitSession.__new__(InteractiveFitSession)
         session._condition = threading.Condition()
@@ -1083,7 +1000,7 @@ class ProtocolTests(unittest.TestCase):
         session._status_callback = None
         session._autosave_on_pause = autosave_on_pause
         session.paths = SpiralInputPaths.from_mapping({
-            "dataset_root": "/datasets/scroll1",
+            "volume_uuid": "volume-1",
             "output_directory": str(output_path),
         })
 
@@ -1117,7 +1034,7 @@ class ProtocolTests(unittest.TestCase):
                 (Path(output) / AUTOSAVE_METADATA_NAME).read_text())
             self.assertEqual(metadata["schema"], AUTOSAVE_METADATA_SCHEMA)
             self.assertEqual(metadata["session_namespace"], str(output))
-            self.assertEqual(metadata["dataset_root"], "/datasets/scroll1")
+            self.assertEqual(metadata["volume_uuid"], "volume-1")
             self.assertEqual(metadata["completed_iterations"], 10)
             self.assertEqual(metadata["checkpoint"], AUTOSAVE_CHECKPOINT_NAME)
 
@@ -1270,6 +1187,32 @@ class ProtocolTests(unittest.TestCase):
         session._run_export_preview(command)
         self.assertTrue(session._automatic_previews_disabled)
         self.assertIn("preview OOM", "\n".join(session._warnings))
+
+    def test_a_preview_records_the_configuration_it_was_captured_under(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            session = InteractiveFitSession.__new__(InteractiveFitSession)
+            session._condition = threading.Condition()
+            session._preview_generation = 0
+            session._completed = 10
+            session._preview_session_id = "spiral-1-test"
+            session.paths = SimpleNamespace(output_directory=temporary)
+            session._publish_status = lambda: None
+            session._applied_config = {"loss_weight": 1.0}
+
+            def export_preview(path, surface_id, diagnostics=False):
+                # A live configure lands while the preview is exported.
+                session._applied_config["loss_weight"] = 2.0
+                Path(path).mkdir(parents=True)
+                manifest_path = Path(path) / "manifest.json"
+                manifest_path.write_text("{}")
+                return {"manifest_path": str(manifest_path)}
+            session._context = SimpleNamespace(export_preview=export_preview)
+
+            session._publish_preview()
+
+            manifest = json.loads(Path(session._preview_manifest).read_text())
+            self.assertEqual(manifest["applied_config"], {"loss_weight": 1.0})
+            self.assertEqual(manifest["source_fit_iteration"], 10)
 
     def test_preview_capture_barriers_surround_rank_zero_export(self):
         session = self._idle_session(completed=10)

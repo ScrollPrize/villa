@@ -65,6 +65,15 @@ void ProjectDocument::validate(const nlohmann::json& data) {
         for (const auto& entry : data.at(key)) {
             if (entry.at("location").get<std::string>().empty()) throw std::invalid_argument("Empty resource location");
             (void)entry.at("tags").get<std::vector<std::string>>();
+            if (entry.contains("channels")) {
+                if (std::string_view(key) != "volumes")
+                    throw std::invalid_argument("Only volume entries can declare display channels");
+                const auto channels = entry.at("channels").get<std::vector<std::string>>();
+                std::set<std::string> names;
+                for (const auto& name : channels)
+                    if (name.empty() || !names.insert(name).second)
+                        throw std::invalid_argument("Empty or duplicate volume channel name");
+            }
         }
     }
     if (!data.at("view").is_object()) throw std::invalid_argument("Project view must be an object");

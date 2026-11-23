@@ -126,8 +126,12 @@ int runSurfacePanelStoreTests()
         require(panel.activateSurfaceById(plain, &error), "activating a bound surface opens it");
         require(activated.size() == 1 && activated.back() && (*activated.back()->rawPointsPtr())(1, 2) == cv::Vec3f(2, 1, 2),
                 "activation hands out the stored geometry");
-        require(panel.opened() && panel.opened()->editable && panel.opened()->pin.object.objectUuid == plain,
+        require(panel.opened() && panel.opened()->editable && panel.opened()->pin.reference().objectUuid == plain,
                 "the opened surface is pinned and editable");
+        panel.setSelectionChangeGuard([] { return false; });
+        require(!panel.activateSurfaceById(approved, &error) && panel.opened()->pin.reference().objectUuid == plain && activated.size() == 1,
+                "failed pending saves veto selection before replacing the displayed surface");
+        panel.setSelectionChangeGuard({});
         require(!panel.activateSurfaceById(unbound, &error), "unbound surfaces do not open");
 
         require(panel.setTagChecked(SurfacePanelController::Tag::Approved, true), "tag checkboxes are enabled for the selection");
@@ -169,8 +173,8 @@ int runSurfacePanelStoreTests()
         state.objectStoreSession()->setGeometryFetcher(vc::objects::kCatalogMetaKey,
             [&](ObjectStore& store, const std::string& uuid, const ObjectStoreSession::FetchWrite& write) {
                 { std::lock_guard lock(fetchedMutex); fetched.push_back(uuid); }
-                const auto version = store.currentVersion(store.read(), uuid);
-                write({{uuid, version}}, [&](ObjectStore& db, WriteTxn& txn) {
+                const auto selected = store.currentObjectRevision(store.read(), uuid)->reference();
+                write({{uuid, selected}}, [&](ObjectStore& db, WriteTxn& txn) {
                     const auto geometry = db.putGeometry(txn, uuid, quad_surface_geometry(grid));
                     db.setMeta(txn, uuid, "catalog_geometry_revision", nlohmann::json(geometry).dump());
                     db.setMeta(txn, uuid, "catalog_write", "\"fetched\"");
@@ -418,9 +422,30 @@ int runViewerRegressionTests()
             PlaneSurface plane({8, 8, 8}, {1, 0, 0});
             const auto slab = StoreSurfaceOverlayController::planeSlab(plane);
             require(slab.has_value(), "the plane slab is valid");
-            const auto crossings = overlay.draftRuns({scaled->id}, *slab);
+            const auto crossings = SurfaceCatalog::RegionInput{state.objectStoreSession(), {}, VolumeVoxels(voxels),
+                RegionOptions{.uuids = std::vector<std::string>{scaled->id}}, {}}.region(vc3d::store::regionSlice(*slab)).runs;
             require(!crossings.empty() && std::abs(crossings.front().points.front()[2] - 8) < 1e-5,
                     "the selected surface has plane intersections");
+            state.objectStoreSession()->clearDraft(scaled->id);
+            state.setSurface("test plane", std::make_shared<PlaneSurface>(cv::Vec3f(8, 8, 8), cv::Vec3f(1, 0, 0)));
+            overlay.setSurfaces({scaled->id});
+            StoreSurfaceOverlayController::OverlayBuilder selectedLines(idle);
+            overlay.collectPrimitives(idle, selectedLines);
+            const auto& selectedView = *overlay._views.at(idle);
+            pump([&] { return !selectedView.region.busy && selectedView.runs.contains("") && !selectedView.runs.at("").empty(); },
+                 "displayed plane intersections complete asynchronously");
+            require(std::abs(selectedView.runs.at("").front().points.front()[2] - 8) < 1e-5,
+                    "plane overlays use the displayed grid rather than querying the UUID's current head");
+            auto anotherSelection = std::make_shared<QuadSurface>(scaled->rawPoints().clone(), scaled->scale());
+            anotherSelection->id = scaled->id;
+            for (auto& p : *anotherSelection->rawPointsPtr()) p[2] = 6;
+            state.setSurface("segmentation", anotherSelection, false, true);
+            StoreSurfaceOverlayController::OverlayBuilder switchedLines(idle);
+            overlay.collectPrimitives(idle, switchedLines);
+            pump([&] { return !selectedView.region.busy && selectedView.runs.contains("") && !selectedView.runs.at("").empty(); },
+                 "changed displayed plane intersections complete asynchronously");
+            require(std::abs(selectedView.runs.at("").front().points.front()[2] - 6) < 1e-5,
+                    "same-UUID selection changes replace orthogonal-plane intersections");
             viewer->quiesceForClose();
         }
         std::cerr << "viewer regression tests passed\n";

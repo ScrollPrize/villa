@@ -43,7 +43,8 @@ fi
 packages=(
     build-essential ca-certificates cmake gfortran git ninja-build pkg-config
     qt6-base-dev libboost-program-options-dev libceres-dev libsuitesparse-dev
-    libopencv-dev libopencv-contrib-dev libblosc-dev libzstd-dev libcurl4-openssl-dev
+    libopencv-dev libopencv-contrib-dev libblosc-dev libblosc2-dev libzstd-dev libcurl4-openssl-dev
+    libconcurrentqueue-dev
     nlohmann-json3-dev libavahi-client-dev libsqlite3-dev libssl-dev
     liblz4-dev libtiff-dev libpng-dev libjpeg-dev zlib1g-dev
     libopenblas-dev liblapack-dev liblapacke-dev libomp-dev
