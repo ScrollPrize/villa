@@ -187,6 +187,64 @@ def test_validate_segments_reports_content_despite_unrelated_metadata_failure(
     assert validate_segments.main([str(root), "--workers", "1", "--no-progress"]) == 1
 
 
+def test_validate_segments_parallel_label_checks_dtypes_and_closes_zarr(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "labels"
+    seg_a = root / "scroll" / "seg_a"
+    seg_b = root / "scroll" / "seg_b"
+    seg_a.mkdir(parents=True)
+    seg_b.mkdir(parents=True)
+
+    _write_group(seg_a / "seg_a.zarr", {"0": np.zeros((1, 16, 16), dtype=np.uint8)}, chunks=(1, 16, 16))
+    _write_group(seg_b / "seg_b.zarr", {"0": np.zeros((1, 16, 16), dtype=np.uint8)}, chunks=(1, 16, 16))
+
+    # seg_a: valid uint8 (0, 1, 255) and valid uint16 (0, 255)
+    valid_u8 = np.zeros((16, 16), dtype=np.uint8)
+    valid_u8[0, 0] = 1
+    valid_u8[1, 1] = 255
+    valid_u16 = np.zeros((16, 16), dtype=np.uint16)
+    valid_u16[2, 2] = 255
+    tifffile.imwrite(seg_a / "seg_a_inklabels.tif", valid_u8)
+    tifffile.imwrite(seg_a / "seg_a_supervision_mask.tif", valid_u16)
+
+    # seg_b: non-binary uint8 (2, 128) and non-binary uint16 (300)
+    bad_u8 = np.zeros((16, 16), dtype=np.uint8)
+    bad_u8[0, 0] = 128
+    bad_u8[0, 1] = 2
+    bad_u16 = np.zeros((16, 16), dtype=np.uint16)
+    bad_u16[3, 3] = 300
+    tifffile.imwrite(seg_b / "seg_b_inklabels.tif", bad_u8)
+    tifffile.imwrite(seg_b / "seg_b_supervision_mask.tif", bad_u16)
+
+    closed_nodes = 0
+    real_open_node = validate_segments.open_node
+
+    def tracking_open_node(path):
+        node = real_open_node(path)
+        orig_close = node.close
+
+        def wrapped_close():
+            nonlocal closed_nodes
+            closed_nodes += 1
+            return orig_close()
+
+        node.close = wrapped_close
+        return node
+
+    # Verify parallel label validation matches single-threaded results deterministically and closes Zarr nodes.
+    with patch.object(validate_segments, "open_node", side_effect=tracking_open_node):
+        serial = validate_segments.validate_root(root, workers=1, show_progress=False)
+        parallel = validate_segments.validate_root(root, workers=4, show_progress=False)
+
+    assert closed_nodes >= 4
+    assert parallel == serial
+    by_name = {res.segment_dir.name: res.issues for res in parallel}
+    assert by_name["seg_a"] == ()
+    assert any("non-binary values: 2, 128" in i.message for i in by_name["seg_b"])
+    assert any("non-binary values: 300" in i.message for i in by_name["seg_b"])
+
+
 def test_merge_predictions_exports_expected_values_reruns_and_rejects_invalid_inputs(
     tmp_path: Path,
 ) -> None:
