@@ -395,6 +395,23 @@ class AtlasLines3D:
 	atlas_winding_model_ranges: tuple[tuple[int, float, float], ...] = ()  # (winding, model_w_start, model_w_end)
 
 
+
+_DEVICE_F32: dict[tuple[str, tuple[float, ...]], torch.Tensor] = {}
+
+
+def _device_f32(values, device: torch.device) -> torch.Tensor:
+	"""A small float32 constant on `device`, made once per (device, values).
+
+	Every sample call needs the volume origin and inverse spacing on the device; creating them each call
+	is a host-to-device upload per call, which on MPS waits for the queue.
+	"""
+	key = (str(device), tuple(float(v) for v in values))
+	t = _DEVICE_F32.get(key)
+	if t is None:
+		t = torch.tensor(key[1], dtype=torch.float32, device=device)
+		_DEVICE_F32[key] = t
+	return t
+
 @dataclass(frozen=True)
 class FitData3D:
 	cos: torch.Tensor | None       # (1, 1, Z, Y, X) uint8 on GPU, or None if skipped
@@ -636,7 +653,7 @@ class FitData3D:
 		from sparse_cache import SparseChunkGroupCache
 
 		dev = xyz_fullres.device
-		offset = torch.tensor(self.origin_fullres, dtype=torch.float32, device=dev)
+		offset = _device_f32(self.origin_fullres, dev)
 		_want = channels
 
 		# Collect raw samples from each cache group
@@ -650,7 +667,7 @@ class FitData3D:
 			if not selected:
 				continue
 			sp = self._spacing_for(cache.channels[0])
-			inv_scale = torch.tensor([1.0 / s for s in sp], dtype=torch.float32, device=dev)
+			inv_scale = _device_f32(tuple(1.0 / s for s in sp), dev)
 			# (C, D, H, W) raw interpolated values
 			try:
 				sampled = cache.grid_sample(

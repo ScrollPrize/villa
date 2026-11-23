@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import json
 import math
 import os
@@ -3476,6 +3477,9 @@ def optimize(
 			"""Evaluate all loss terms, handling both single and multi-loss returns."""
 			total = torch.zeros((), device=next(model.parameters()).device, dtype=torch.float32)
 			tv: dict[str, float] = {}
+			# per-term values are read back together at the end: one device-to-host transfer per
+			# evaluation instead of one per term, each of which waits for the queue on GPU devices
+			tv_pending: dict[str, torch.Tensor] = {}
 			if stage_uses_cyl_loss:
 				opt_loss_cyl.reset_candidate_terms()
 			D = res_.xyz_lr.shape[0]
@@ -3579,7 +3583,7 @@ def optimize(
 						w = _need_term(sub_name, eff_)
 						if w == 0.0:
 							continue
-						tv[sub_name] = float(lv.detach().cpu())
+						tv_pending[sub_name] = lv.detach()
 						total = total + w * lv
 					if name == "atlas_line":
 						tv.update(opt_loss_atlas_line.last_stats())
@@ -3593,9 +3597,9 @@ def optimize(
 						"flatten_avg_offset",
 						"flatten_orient",
 					)
-					tv[name] = float(lv.detach().cpu())
+					tv_pending[name] = lv.detach()
 					if is_flatten_term:
-						tv[f"{name}_contrib"] = float((lv * w).detach().cpu())
+						tv_pending[f"{name}_contrib"] = (lv * w).detach()
 					if name == "pred_dt":
 						tv.update(opt_loss_pred_dt.flow_gate_last_stats())
 					if name == "cyl_outside":
@@ -3607,6 +3611,11 @@ def optimize(
 					if _flatten_diagnostics and name in ("flatten_sdir", "flatten_avg_offset", "flatten_orient"):
 						tv.update(opt_loss_flatten.last_stats())
 					total = total + w * lv
+			if tv_pending:
+				# keep float64 terms in float64: auto-steps compares relative changes of 1e-5
+				dtype = functools.reduce(torch.promote_types, (v.dtype for v in tv_pending.values()))
+				values = torch.stack([v.reshape(()).to(dtype) for v in tv_pending.values()]).cpu().tolist()
+				tv.update(zip(tv_pending.keys(), values, strict=True))
 			display_loss: float | None = None
 			if stage_uses_cyl_loss and not bool(getattr(res_, "cyl_shell_mode", False)):
 				best_idx, display_loss, display_tv = opt_loss_cyl.display_stats(eff_)

@@ -68,14 +68,18 @@ def _directional_step_penalty(
 	direction_valid: torch.Tensor,
 ) -> torch.Tensor:
 	if torch.is_tensor(target):
-		target_t = target.to(device=diff.device, dtype=diff.dtype)
+		target_t = target.to(device=diff.device, dtype=diff.dtype).clamp_min(1.0e-12)
+		target_sq = target_t.square()
 	else:
-		target_t = diff.new_tensor(float(target))
-	target_t = target_t.clamp_min(1.0e-12)
+		# Python scalars, not new_tensor: a fresh device constant is an upload that waits for the queue on
+		# MPS. Both are rounded on a host tensor of the same dtype, so the arithmetic matches the old path
+		host = torch.tensor(float(target), dtype=diff.dtype).clamp_min(1.0e-12)
+		target_t = float(host)
+		target_sq = float(host.square())
 	length = _edge_length(diff)
 	projected = (diff * direction).sum(dim=-1, keepdim=True).abs()
-	short = torch.relu(target_t - projected).square() / target_t.square()
-	long = torch.relu(length - target_t).square() / target_t.square()
+	short = torch.relu(target_t - projected).square() / target_sq
+	long = torch.relu(length - target_t).square() / target_sq
 	directional = short + long
 
 	rel = (length - target_t) / target_t
