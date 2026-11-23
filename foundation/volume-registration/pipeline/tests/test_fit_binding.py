@@ -474,7 +474,7 @@ def test_an_unanswered_round_is_refused_over_http(tmp_path, stand_ins, server):
 def test_the_blind_page_sends_the_round_and_fit_it_shows():
     """A decision must apply to the fit and completed round shown to the reviewer, including
     when a page stays open across Redo. (What the page sends.)"""
-    page_source = (Path(pipeline_stages.__file__).parent / "review" / "blind.html").read_text()
+    page_source = (Path(pipeline_stages.__file__).parent / "review" / "blind.html").read_text(encoding="utf-8")
     call = page_source[page_source.index("/decide`"):]
     call = call[:call.index("})")]
     assert "round: state.round.id" in call and "fit: state.fit" in call

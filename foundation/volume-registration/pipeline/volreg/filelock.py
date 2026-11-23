@@ -123,6 +123,12 @@ def _retry(action):
             delay = min(delay * 2, 0.1)
 
 
+def retry(action):
+    """`action()`, asked again on Windows while it is refused (PermissionError) because the
+    file is being replaced or held open by another process."""
+    return _retry(action)
+
+
 def replace(source, target):
     """`os.replace`, retried on Windows while a reader has `target` open."""
     _retry(lambda: os.replace(source, target))

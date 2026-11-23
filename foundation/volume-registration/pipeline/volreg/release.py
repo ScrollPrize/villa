@@ -34,6 +34,7 @@ import shutil
 import time
 from pathlib import Path
 
+from . import filelock
 from . import record as rec
 from .engine import digest_contents
 
@@ -71,7 +72,8 @@ class Snapshot:
             now = {}
             for name in names:
                 try:
-                    now[name] = record.path(name).read_bytes()
+                    # a read that lands while Windows replaces the file is refused; ask again
+                    now[name] = filelock.retry(record.path(name).read_bytes)
                 except FileNotFoundError:
                     pass
             if now == before:
