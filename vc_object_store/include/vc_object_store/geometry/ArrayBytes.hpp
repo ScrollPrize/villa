@@ -24,14 +24,20 @@ template<class T> void copyScalars(std::span<const uint8_t> bytes, std::span<T> 
     }
 }
 
-template<class T> std::vector<uint8_t> scalarBytes(std::span<const T> values)
+template<class T> void copyScalarBytes(std::span<const T> values,std::span<uint8_t> bytes)
 {
     static_assert(std::is_trivially_copyable_v<T>);
-    std::vector<uint8_t> bytes(values.size_bytes());
+    if(bytes.size()!=values.size_bytes())throw std::runtime_error("invalid scalar byte output size");
     if (!bytes.empty()) std::memcpy(bytes.data(), values.data(), bytes.size());
     if constexpr (std::endian::native != std::endian::little)
         for (size_t i = 0; i < bytes.size(); i += sizeof(T))
             std::reverse(bytes.begin() + i, bytes.begin() + i + sizeof(T));
+}
+
+template<class T> std::vector<uint8_t> scalarBytes(std::span<const T> values)
+{
+    std::vector<uint8_t> bytes(values.size_bytes());
+    copyScalarBytes(values,std::span<uint8_t>(bytes));
     return bytes;
 }
 

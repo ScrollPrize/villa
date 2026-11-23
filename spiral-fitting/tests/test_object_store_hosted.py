@@ -4,6 +4,7 @@ the store-location design), read as a store file gives them.
 
 Needs VC_OBJECT_SERVER naming a vc_object_server binary; skipped otherwise.
 """
+import contextlib
 import dataclasses
 import json
 import os
@@ -11,6 +12,7 @@ import re
 import subprocess
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 pytest.importorskip('vc_object_store')
@@ -25,11 +27,10 @@ pytestmark = [pytest.mark.skipif(not SERVER, reason='set VC_OBJECT_SERVER to a v
               pytest.mark.usefixtures('cpu')]
 
 
-@pytest.fixture()
-def served(tmp_path):
-    """The walk store served by a vc_object_server subprocess: ``(endpoint,
-    path)``. The file stays readable read-only beside the server."""
-    path = write_walk_store(tmp_path / 'served.vcobj')
+@contextlib.contextmanager
+def serving(path, tmp_path):
+    """The endpoint of a vc_object_server subprocess serving the store file
+    ``path``, which stays readable read-only beside it."""
     server = subprocess.Popen(
         [SERVER, path, '--port', '0', '--strip-cache', str(tmp_path / 'strips')],
         stderr=subprocess.PIPE, text=True)
@@ -37,10 +38,19 @@ def served(tmp_path):
         line = server.stderr.readline()
         port = re.search(r':(\d+)\s*$', line)
         assert port, line
-        yield f'http://127.0.0.1:{port.group(1)}', path
+        yield f'http://127.0.0.1:{port.group(1)}'
     finally:
         server.terminate()
         assert server.wait(timeout=30) == 0
+
+
+@pytest.fixture()
+def served(tmp_path):
+    """The walk store served by a vc_object_server subprocess: ``(endpoint,
+    path)``."""
+    path = write_walk_store(tmp_path / 'served.vcobj')
+    with serving(path, tmp_path) as endpoint:
+        yield endpoint, path
 
 
 def quiet(line):
@@ -246,3 +256,87 @@ def test_commits_write_to_the_served_store(served, tmp_path):
         assert again['reused'] and again['surface_uuid'] == surface['uuid']
     finally:
         fit.state.close()
+
+
+def test_changed_relationship_kinds_are_read_in_one_selection(served, tmp_path):
+    """A served store tells the kinds of changed relationships in one
+    projected selection by UUID; one it no longer holds has none."""
+    endpoint, path = served
+    prepare(endpoint, cache=str(tmp_path / 'cache'))
+    linked = sorted(edge[0] for edge in edges(path))
+    absent = '5d0f6c1e-8d2a-4c57-9f10-6a5e4d3c2b1a'
+    with osi.open_store(fit_config(endpoint, 'service'), read_only=True) as store:
+        selections = []
+        select = store.select_edges
+
+        def recording(**query):
+            selections.append(query)
+            return select(**query)
+        store.select_edges = recording
+        store.edge = None  # never one edge at a time
+        kinds = osi._edge_kinds(store, sorted([*linked, absent]))
+    assert kinds == {uuid: 'point-surface' for uuid in linked} and len(linked) == 3
+    assert selections == [{'edge_uuids': sorted([*linked, absent]), 'include_retired': True,
+                           'fields': ['uuid', 'kind']}]
+
+
+def test_tracks_and_their_crossings_through_the_endpoint(tmp_path):
+    """A fit computes the crossings of a served store's tracks as of a store
+    file's: the tracks are read as objects, at their pinned versions."""
+    from object_store_fixture import put_track
+    path = write_walk_store(tmp_path / 'tracks.vcobj')
+    with ObjectStore.open(path, author='ingest') as db:
+        for key, (start, axis, family) in enumerate((
+                ((40, 60, 50), 2, 'horizontal'), ((40, 55, 55), 1, 'vertical'),
+                ((40, 55, 70), 1, 'vertical'))):
+            points = np.tile(np.asarray(start), (31, 1))
+            points[:, axis] += np.arange(31)
+            put_track(db, points, key, family)
+    cache = tmp_path / 'cache'
+    with serving(path, tmp_path) as endpoint:
+        hosted = osi.load_fit_inputs(fit_config(endpoint, 'service', input_use_tracks=True),
+                                     log=quiet, cache_directory=str(cache))
+        # The service validates the track versions with the other inputs
+        # and resolves their dataset; a second read (warm record cache)
+        # asks it again.
+        again = osi.load_fit_inputs(fit_config(endpoint, 'service', input_use_tracks=True),
+                                    log=quiet, cache_directory=str(cache))
+        assert again.digest == hosted.digest
+        assert len({obj.dataset for obj in hosted.snapshot.objects_of('track')}) == 1
+    assert hosted.counts['tracks'] == 3 and hosted.counts['track crossings'] == 2
+    assert len(hosted.snapshot.objects_of('track')) == 3
+    local = osi.load_fit_inputs(
+        fit_config(path, 'service', input_use_tracks=True, object_store_refresh_links=False),
+        log=quiet, cache_directory=str(cache))
+    assert hosted.digest == local.digest
+    assert hosted.manifest['derived_inputs'] == local.manifest['derived_inputs']
+    for name in ('offsets', 'partners', 'self_local', 'partner_local', 'positions', 'clearances'):
+        np.testing.assert_array_equal(hosted.tracks.crossings[name], local.tracks.crossings[name])
+    # One cache file serves both: its key holds no store location.
+    assert len(list((cache / osi.TRACK_CROSSING_CACHE_DIRECTORY).glob('*.vcobj'))) == 1
+
+
+def test_a_pinned_track_a_history_off_store_no_longer_retains_is_refused(tmp_path):
+    """Pins of a history-off served store: once a pinned track is edited its
+    old version is gone, and the pinned read fails although the handle's
+    record cache still holds it."""
+    from object_store_fixture import put_track
+    path = tmp_path / 'tracks.vcobj'
+    with ObjectStore.create(str(path), author='ingest', history_enabled=False) as db:
+        tracks = []
+        for key, (start, axis, family) in enumerate((
+                ((40, 60, 50), 2, 'horizontal'), ((40, 55, 55), 1, 'vertical'))):
+            points = np.tile(np.asarray(start), (31, 1))
+            points[:, axis] += np.arange(31)
+            tracks.append(put_track(db, points, key, family))
+    config = fit_config(path, 'service', input_use_tracks=True, object_store_refresh_links=False)
+    with serving(path, tmp_path) as endpoint:
+        config = dict(config, object_store_location=endpoint)
+        with osi.open_store(config, cache_directory=str(tmp_path / 'cache')) as store:
+            request = osi.request_from_config(config)
+            pins = osi.read_snapshot(store, request).pins()
+            pinned = dataclasses.replace(request, pins=pins)
+            assert len(osi.read_snapshot(store, pinned).objects_of('track')) == 2  # warm
+            set_meta(store, tracks[0], 'review_note', 'seen')
+            with pytest.raises(Exception, match='not retained|no longer available'):
+                osi.read_snapshot(store, pinned)

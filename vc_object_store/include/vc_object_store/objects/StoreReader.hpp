@@ -54,7 +54,15 @@ public:
     // Capture exact objects and their relationship membership together. Root-local
     // history can replay numbered records; inherited membership requires the
     // requested root commit still to be current. Otherwise fail closed.
-    virtual SelectedInputs selectedInputs(const std::vector<ObjectVersion>&, const StoreStatus& position) const = 0;
+    // `relationshipVersions`, a subset of the selection, limits the
+    // relationships to those of these objects (relationshipsAt of the
+    // subset): every selected object is still validated and returned, but
+    // the relationships of the others are not enumerated (a solver that
+    // derives the links of some inputs itself, as a fit does its tracks'
+    // crossings). Selected tracks come with their
+    // datasets (SelectedInputs::trackDatasets).
+    virtual SelectedInputs selectedInputs(const std::vector<ObjectVersion>&, const StoreStatus& position,
+        const std::optional<std::vector<ObjectVersion>>& relationshipVersions = std::nullopt) const = 0;
     GraphReadView graphReadViewAt(const std::vector<ObjectVersion>&, const EdgeSelection& = {}) const;
     // Expand through recorded relationship endpoints, without current-head reads.
     // Explicit selections win. Other endpoints use the newest referenced version
@@ -88,6 +96,13 @@ public:
     // IDs respecting retained history. Call under a checked edit's read snapshot.
     std::vector<int64_t> assignGeometryPointIds(const std::string& objectUuid, const std::string& arrayName,
                                                std::vector<int64_t> ids) const;
+    // A hint: these revisions' descriptors, arrays and point annotations are
+    // about to be read. A hosted reader fetches what it has not cached in a
+    // few batched requests; a local reader does nothing. Never changes what
+    // the reads return.
+    virtual void prefetchGeometry(const std::vector<std::string>& /*revisionUuids*/,
+                                  const std::vector<std::string>& /*arrays*/,
+                                  const std::vector<std::string>& /*annotations*/) const {}
     virtual VolumeTransforms volumeTransforms() const = 0;
     // Complete listings (every page when the selection has no limit), with
     // the projections of ObjectStore::selectObjects/selectEdges.
@@ -191,7 +206,8 @@ public:
     std::optional<std::filesystem::path> resolveStoragePath(const std::string&,
         const std::optional<std::filesystem::path>& = std::nullopt) const override;
     std::vector<SelectedRelationship> relationshipsAt(const std::vector<ObjectVersion>&) const override;
-    SelectedInputs selectedInputs(const std::vector<ObjectVersion>&, const StoreStatus&) const override;
+    SelectedInputs selectedInputs(const std::vector<ObjectVersion>&, const StoreStatus&,
+        const std::optional<std::vector<ObjectVersion>>& relationshipVersions = std::nullopt) const override;
     std::optional<GeometryRevision> currentGeometry(const std::string& objectUuid) const override;
     std::optional<GeometryRevision> geometryRevision(const std::string& revisionUuid) const override;
     std::optional<ObjectRevision> objectAtGeometry(const std::string& revisionUuid) const override;

@@ -56,7 +56,8 @@ class PhysicalFile {
     sqlite3_file* file_ = nullptr;
     std::mutex mutex_;
 public:
-    PhysicalFile(const std::filesystem::path& path, bool writable, bool create = false) : path_(path.string())
+    PhysicalFile(const std::filesystem::path& path, bool writable, bool create = false)
+        : path_((create ? std::filesystem::absolute(path) : std::filesystem::canonical(path)).string())
     {
         auto* vfs = sqlite3_vfs_find(nullptr);
         if (!vfs) throw std::runtime_error("no default SQLite VFS");
@@ -67,9 +68,16 @@ public:
         int actual = 0;
         const auto result = vfs->xOpen(vfs, path_.c_str(), file_, flags, &actual);
         if (result != SQLITE_OK) {
+            const int openErrno = errno;
+            std::array<char, 512> detail{};
+            const int osError = vfs->xGetLastError
+                ? vfs->xGetLastError(vfs, int(detail.size()), detail.data()) : 0;
             if (file_->pMethods) file_->pMethods->xClose(file_);
             file_ = nullptr;
-            check(result, "open packed backing file");
+            throw std::runtime_error("open packed backing file " + path_ + ": SQLite I/O error "
+                + std::to_string(result) + ", OS error " + std::to_string(osError)
+                + ", errno " + std::to_string(openErrno) + " (" + std::strerror(openErrno)
+                + ") " + detail.data());
         }
     }
     ~PhysicalFile() { if (file_) file_->pMethods->xClose(file_); }
@@ -98,7 +106,7 @@ public:
             if (result != SQLITE_OK) {
                 const int callErrno = errno;
                 int osError = 0; file_->pMethods->xFileControl(file_, SQLITE_FCNTL_LAST_ERRNO, &osError);
-                throw std::runtime_error("write packed backing file: SQLite I/O error " + std::to_string(result)
+                throw std::runtime_error("write packed backing file " + path_ + ": SQLite I/O error " + std::to_string(result)
                     + ", OS error " + std::to_string(osError) + ", errno " + std::to_string(callErrno) + ", offset " + std::to_string(offset) + ", bytes " + std::to_string(n));
             }
             p += n; offset += n; count -= n;
@@ -262,6 +270,12 @@ struct BuildState {
     std::exception_ptr failure;
     std::uint64_t next = headerBytes, clock = 0;
     std::size_t resident = 0;
+    void reportResident() {
+        if(!options.memoryStats)return;
+        options.memoryStats->residentBytes.store(resident,std::memory_order_relaxed);
+        auto peak=options.memoryStats->peakResidentBytes.load(std::memory_order_relaxed);
+        while(peak<resident&&!options.memoryStats->peakResidentBytes.compare_exchange_weak(peak,resident,std::memory_order_relaxed)){}
+    }
     bool stopping = false, finalized = false, closing = false, compactExport = false;
 
     ~BuildState()
@@ -309,6 +323,7 @@ struct BuildState {
             lru.erase(block->lru);
             std::vector<char>().swap(block->data);
             resident -= options.extentBytes;
+            reportResident();
         }
     }
     void retire(const std::shared_ptr<Block>& block, std::unique_lock<std::mutex>& lock)
@@ -378,13 +393,14 @@ struct BuildState {
             // Reserve under the shared budget lock, but first-touch zeroing is
             // private to this member. Other shards need not wait for MiB fills.
             resident+=options.extentBytes;
+            reportResident();
             std::vector<char> bytes;lock.unlock();
             try{detail::GeometryPhase allocate("packed.memory.allocate");bytes.assign(options.extentBytes,0);}
-            catch(...){lock.lock();resident-=options.extentBytes;failure=std::current_exception();throw;}
+            catch(...){lock.lock();resident-=options.extentBytes;reportResident();failure=std::current_exception();throw;}
             {detail::GeometryPhase wait("packed.memory.global_wait");lock.lock();}
-            try{healthy();}catch(...){resident-=options.extentBytes;throw;}
+            try{healthy();}catch(...){resident-=options.extentBytes;reportResident();throw;}
             block->data=std::move(bytes);
-        }else {block->data.assign(options.extentBytes,0);resident+=options.extentBytes;}
+        }else {block->data.assign(options.extentBytes,0);resident+=options.extentBytes;reportResident();}
         lru.push_front(block); block->lru = lru.begin();
         if (block->persisted && !overwrite) file->read(block->data.data(), block->data.size(), block->physical);
         block->touched = ++clock;
@@ -844,7 +860,7 @@ std::filesystem::path packedDatabasePath(const std::filesystem::path& container,
     auto directory = readDirectory(container);
     const auto uuid = databaseUuid.empty() ? directory.root : util::canonicalUuid(databaseUuid);
     if (!directory.members.contains(uuid)) throw std::runtime_error("database UUID missing from packed container");
-    return std::string(readPrefix) + hexEncode(std::filesystem::absolute(container).lexically_normal().string()) + "/" + uuid;
+    return std::string(readPrefix) + hexEncode(std::filesystem::canonical(container).string()) + "/" + uuid;
 }
 std::filesystem::path packedContainerPath(const std::filesystem::path& locator)
 {

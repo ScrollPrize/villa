@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(vc_object_store VERSION 0.1.0 LANGUAGES CXX)
+project(vc_object_store VERSION 0.1.0 LANGUAGES C CXX)
 set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
 if(APPLE)
     set(CMAKE_INSTALL_RPATH "@loader_path/../lib")
@@ -32,14 +32,35 @@ endif()
 if(VC_OBJECT_STORE_BUILD_ADAPTERS)
     find_package(OpenCV REQUIRED COMPONENTS core)
 endif()
+set(VC_OBJECT_STORE_DETECTORS_OPENMP OFF)
 if(VC_OBJECT_STORE_BUILD_LINKING)
     if(NOT VC_OBJECT_STORE_BUILD_ADAPTERS)
         message(FATAL_ERROR "Relationship detectors require adapters")
     endif()
-    find_package(OpenMP REQUIRED)
+    if(APPLE AND VC_OBJECT_STORE_BUILD_PYTHON)
+        # The Python module is imported next to torch, whose macOS wheels load
+        # their own libomp.dylib; linking Homebrew's libomp into it would put a
+        # second OpenMP runtime in the process (OMP Error #15 at import). So the
+        # module links a serial copy of the detectors (TrackCrossings.cpp has a
+        # serial path; see src/CMakeLists.txt), and the native tools and the
+        # server keep OpenMP when it is found. Apple's clang finds it with a
+        # hint such as -DOpenMP_ROOT=$(brew --prefix libomp).
+        find_package(OpenMP QUIET COMPONENTS CXX)
+        if(OpenMP_CXX_FOUND)
+            set(VC_OBJECT_STORE_DETECTORS_OPENMP ON)
+        else()
+            message(STATUS "vc_object_store: OpenMP not found, so vc_object_links and "
+                           "vc_object_server find track crossings on one worker")
+        endif()
+    else()
+        find_package(OpenMP REQUIRED)
+        set(VC_OBJECT_STORE_DETECTORS_OPENMP ON)
+    endif()
 endif()
 add_subdirectory(src)
 if(VC_OBJECT_STORE_BUILD_BENCHMARKS)
+    add_executable(vc_bench_fiber_graph_read benchmarks/fiber_graph_read.cpp)
+    target_link_libraries(vc_bench_fiber_graph_read PRIVATE vc_objects)
     add_executable(vc_bench_prepared_import benchmarks/prepared_import.cpp)
     target_link_libraries(vc_bench_prepared_import PRIVATE vc_objects)
     target_include_directories(vc_bench_prepared_import PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
@@ -48,7 +69,11 @@ if(VC_OBJECT_STORE_BUILD_TOOLS OR VC_OBJECT_STORE_BUILD_TESTS)
     add_executable(vc_object_import_afv apps/vc_object_import_afv.cpp)
     target_link_libraries(vc_object_import_afv PRIVATE vc_objects ${CMAKE_DL_LIBS})
     target_include_directories(vc_object_import_afv PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
-    install(TARGETS vc_object_import_afv RUNTIME DESTINATION bin)
+    # A tests-only build (VC3D with VC_TESTING) builds the tool for the tests
+    # but does not install it: such a build need not build it before packaging.
+    if(VC_OBJECT_STORE_BUILD_TOOLS)
+        install(TARGETS vc_object_import_afv RUNTIME DESTINATION bin)
+    endif()
 endif()
 if(VC_OBJECT_STORE_BUILD_TESTS)
     enable_testing()

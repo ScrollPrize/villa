@@ -6,6 +6,7 @@
 #include "vc_object_store/objects/StoreReader.hpp"
 #include <vc_reader/native/atomic_file.hpp>
 #include "vc_object_store/Uuid.hpp"
+#include "vc_object_store/SqliteRuntime.hpp"
 #include "geometry/GeometryInternal.hpp"
 #include "support/SqliteMutexProfile.hpp"
 #include "vc_object_store/objects/imports/ParallelImportStream.hpp"
@@ -79,6 +80,19 @@ Json importNative(const Json& config,const std::filesystem::path& input,const st
 {
     using namespace vc::objects::imports;
     const bool storeReference=config.contains("geometry_collection"),hasEdges=config.contains("constraints");
+    std::optional<std::array<double,6>> sourceBounds;
+    if(config.contains("source_bounds_xyz")) {
+        sourceBounds=config.at("source_bounds_xyz").get<std::array<double,6>>();
+        if(storeReference||hasEdges)throw std::invalid_argument("Spatial source selection is for fiber imports only");
+        for(int k=0;k<3;++k)if(!std::isfinite((*sourceBounds)[k])||!std::isfinite((*sourceBounds)[k+3])||
+            !((*sourceBounds)[k]<(*sourceBounds)[k+3]))throw std::invalid_argument("Invalid source selection bounds");
+    }
+    const auto selected=[&](const AfvFiber& fiber) {
+        if(!sourceBounds)return true;
+        for(int k=0;k<3;++k)if((*fiber.detail.bbox)[k]>(*sourceBounds)[k+3] ||
+            (*fiber.detail.bbox)[k+3]<(*sourceBounds)[k])return false;
+        return true;
+    };
     const auto integerOption=[&](const char* key,uint64_t fallback,uint64_t maximum,bool allowZero=false){
         const auto it=config.find(key);if(it==config.end())return fallback;
         if(!it->is_number_integer()||(!it->is_number_unsigned()&&it->get<int64_t>()<0))
@@ -125,8 +139,7 @@ Json importNative(const Json& config,const std::filesystem::path& input,const st
     if(storeReference)options.dependencies={std::filesystem::absolute(config.at("geometry_collection").get<std::string>())};
     options.shards.clear();
     const int64_t reservation=INT64_MAX/workers;
-    for(int i=0;i<workers;++i)options.shards.push_back({{int64_t(i)*reservation+1,int64_t(i+1)*reservation},
-        {int64_t(i)*reservation+1,int64_t(i+1)*reservation}});
+    for(int i=0;i<workers;++i)options.shards.push_back({{int64_t(i)*reservation+1,int64_t(i+1)*reservation}});
     std::atomic<int64_t> sourceFibers{0},sourcePoints{0},sourceEdges{0};
     std::vector<std::unique_ptr<AfvSource>> fiberReaders(readers);
     std::vector<std::unique_ptr<AfcSource>> edgeReaders(readers);
@@ -157,6 +170,7 @@ Json importNative(const Json& config,const std::filesystem::path& input,const st
             if(part->uuid()!=sourceUuid)throw std::runtime_error("AFV source identity changed");}
         part->selectRange(range[0],range[1]);AfvFiber fiber;int64_t n=0,points=0;
         while(part->next(fiber)) {
+            if(!selected(fiber))continue;
             checkCancelled();++n;points+=fiber.detail.linePointCount;
             const auto xyzBytes=fiber.xyz.size();auto row=afvInitialRecord(fiber,sourceUuid,coordinates);const auto uuid=row.record.uuid;
             const auto bytes=xyzBytes+row.record.meta.size()+row.record.name.size()+sizeof(InitialObjectRecord)+extensionPayloadBytes(row.extensions);
@@ -197,7 +211,9 @@ Json importNative(const Json& config,const std::filesystem::path& input,const st
         // All writers have joined. Check their existing counters while every
         // destination is still private; no source scan or store readback.
         for(const auto& c:counts){fibers+=c.fibers;points+=c.points;nedges+=c.edges;}
-        if(!storeReference&&(fibers!=(limit?std::min(limit,source.fiberCount()):source.fiberCount())||(!limit&&points!=source.pointCount())))
+        if(!storeReference && sourceBounds && (fibers!=sourceFibers.load() || points!=sourcePoints.load()))
+            throw std::runtime_error("Selected fiber aggregate totals differ from producer");
+        if(!storeReference&&!sourceBounds&&(fibers!=(limit?std::min(limit,source.fiberCount()):source.fiberCount())||(!limit&&points!=source.pointCount())))
             throw std::runtime_error("initial fiber aggregate totals differ from source");
         if(hasEdges && fiberEnd==INT64_MAX && nedges!=(edgeLimit?std::min(edgeLimit,edgeSource->constraintCount()):edgeSource->constraintCount()))
             throw std::runtime_error("initial constraint aggregate totals differ from source");
@@ -259,6 +275,7 @@ Json importNative(const Json& config,const std::filesystem::path& input,const st
             AfvSource part(input,range[0],range[1]);AfvFiber fiber;
             while(part.next(fiber)){
                 checkCancelled();
+                if(!selected(fiber))continue;
                 const ObjectKey key{"",util::nameUuid(sourceUuid,"fiber:"+std::to_string(fiber.id))};
                 const auto value=joined.object(txn,key);const auto g=joined.currentGeometry(txn,key);
                 verifyFiberData(value?&value->record:nullptr,bool(g),fiber,[&](const char* name){return joined.readGeometryArray(txn,key,name);});
@@ -318,7 +335,11 @@ Json importNative(const Json& config,const std::filesystem::path& input,const st
         {"persistence_seconds",imported.persistenceSeconds},{"validation_seconds",validationSeconds},{"readback_verified",verify},
         {"total_seconds",seconds(start)},{"output_bytes",bytes},{"peak_rss_bytes",benchmark::peakRssBytes()},{"per_shard",perShard}};
     if(storeReference){result["geometry_collection"]=options.dependencies.front().string();result["geometry_copied"]=false;}
-    if(!storeReference&&hasEdges&&edgeLimit){
+    if(sourceBounds) {
+        result["source_bounds_xyz"]=*sourceBounds;
+        result["estimated_full_import_seconds"]=nullptr;
+        result["estimate_basis"]="spatial subset; source scan includes omitted fibers, so record-count extrapolation is not valid";
+    }else if(!storeReference&&hasEdges&&edgeLimit){
         result["estimated_full_import_seconds"]=nullptr;
         result["estimate_basis"]="unavailable for combined import with constraint_limit: fiber and relation sampling fractions differ; do not scale both phases by fiber count";
     }else{
@@ -343,16 +364,14 @@ int main(int argc,char** argv)
             benchmark::sqlite_profile::install(config.value("profile_sqlite_stacks",false),config.value("profile_stack_interval",uint64_t(65536)));
         // Benchmark-only opt-in. Do not alter the application's SQLite global
         // allocator configuration inside ObjectStore or a worker thread.
-        if(!config.value("sqlite_memory_statistics",true) && sqlite3_config(SQLITE_CONFIG_MEMSTATUS,0)!=SQLITE_OK)
-            throw std::runtime_error("SQLite was already initialized; cannot disable memory statistics");
         const auto pageBulk=config.value("sqlite_pagecache_bulk_bytes",int64_t(0));
         if(pageBulk<0 || pageBulk>int64_t(INT_MAX)*1024)
             throw std::invalid_argument("invalid SQLite page-cache allocation size");
         // A null buffer with negative N selects an independent initial bulk
         // allocation per cache, not the shared process-wide page buffer. This
         // avoids allocator-lock traffic without changing SQLite's page format.
-        if(pageBulk && sqlite3_config(SQLITE_CONFIG_PAGECACHE,nullptr,0,-int((pageBulk+1023)/1024))!=SQLITE_OK)
-            throw std::runtime_error("SQLite was already initialized; cannot configure page-cache allocation");
+        configureSqliteRuntime(config.value("sqlite_memory_statistics",true)?std::optional<bool>{}:std::optional<bool>{false},
+                               size_t(pageBulk));
         const auto input=std::filesystem::absolute(config.at("source").get<std::string>());
         const auto output=std::filesystem::absolute(config.at("output").get<std::string>());
         if (std::filesystem::exists(output) || std::filesystem::is_symlink(output)) throw std::runtime_error("output exists");

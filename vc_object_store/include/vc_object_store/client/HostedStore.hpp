@@ -19,6 +19,7 @@
 #include "vc_object_store/objects/Transactions.hpp"
 
 #include <memory>
+#include <map>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -124,6 +125,19 @@ public:
     // ObjectStore::geometryPointAnnotations.
     nlohmann::json geometryPointAnnotations(const std::string& revisionUuid, const std::string& arrayName);
     int64_t nextGeometryPointId(const std::string& objectUuid, const std::string& arrayName);
+    // Many geometry revisions in one request: each descriptor (nullopt when
+    // the store has no such revision), the named arrays and point annotations
+    // it has. Answers a non-empty prefix of `revisions` (the reply is bounded);
+    // nullopt when the host predates this query.
+    struct GeometryBatchEntry {
+        std::string uuid;
+        std::optional<GeometryRevision> descriptor;
+        std::map<std::string, std::vector<uint8_t>> arrays;
+        std::map<std::string, nlohmann::json> annotations;
+    };
+    std::optional<std::vector<GeometryBatchEntry>> geometryBatch(const std::vector<std::string>& revisions,
+                                                                 const std::vector<std::string>& arrays,
+                                                                 const std::vector<std::string>& annotations);
     // ObjectStore::componentOf / neighbours on the host (GraphQuery).
     std::vector<std::string> traverse(const GraphQuery&, StoreStatus* asOf = nullptr);
     int64_t objectCount(const std::string& kind, bool includeRetired = false, StoreStatus* asOf = nullptr);
@@ -132,7 +146,8 @@ public:
     // Every recorded revision of an object (empty when it never existed).
     std::vector<ObjectRevision> objectHistory(const std::string& objectUuid, StoreStatus* asOf = nullptr, bool ifRetained = false);
     std::vector<SelectedRelationship> relationshipsAt(const std::vector<ObjectVersion>&, StoreStatus* asOf = nullptr);
-    SelectedInputs selectedInputs(const std::vector<ObjectVersion>&, const StoreStatus&);
+    SelectedInputs selectedInputs(const std::vector<ObjectVersion>&, const StoreStatus&,
+        const std::optional<std::vector<ObjectVersion>>& relationshipVersions = std::nullopt);
     // Budgets above the server's limits are clamped; the result's stop reason
     // reports a budget stop (complete() is false).
     RegionResult geometryRegion(const RegionSlice&, const RegionOptions& = {}, StoreStatus* asOf = nullptr);

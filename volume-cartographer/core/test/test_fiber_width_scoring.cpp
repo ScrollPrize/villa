@@ -27,16 +27,20 @@ TEST_CASE("packed uint8 base widths are converted into tracing coordinates") {
     vcr::zarr::writeAttributes(root, nlohmann::json::parse(R"({"lasagna":{"version":3,"source_to_base":1,"base_shape_zyx":[8,8,8],"validity_channel":"presence","width_encoding":"uint8-base-voxels","groups":{"sd1":{"zarr":"sd1/1","scaledown":1,"channels":["presence","nx","ny","width"]}}}})"));
     vc::lasagna::LasagnaDatasetOpenOptions open;
     open.workingToBaseScale = 2;
-    const auto dataset = vc::lasagna::LasagnaDataset::open(root, open);
-    FiberPredictionFieldOptions options; options.enableWidth = true;
-    FiberPredictionField field(dataset, options);
-    std::vector<float> widths;
-    field.sampleWidths({cv::Vec3f{1,1,1}}, widths);
-    REQUIRE(widths.size() == 1);
-    CHECK(widths[0] == doctest::Approx(40));
-    const auto sample = field.sample(cv::Vec3d{1,1,1}, cv::Vec3d{1,0,0});
-    REQUIRE(sample.options.size() == 1);
-    CHECK(sample.options[0].presence == doctest::Approx(1));
+    for (const auto& input : {root, root / ".zattrs"}) {
+        const auto dataset = vc::lasagna::LasagnaDataset::open(input, open);
+        CHECK(dataset.manifest().raw.at("width_encoding") == "uint8-base-voxels");
+        CHECK_FALSE(dataset.manifest().raw.contains("lasagna"));
+        FiberPredictionFieldOptions options; options.enableWidth = true;
+        FiberPredictionField field(dataset, options);
+        std::vector<float> widths;
+        field.sampleWidths({cv::Vec3f{1,1,1}}, widths);
+        REQUIRE(widths.size() == 1);
+        CHECK(widths[0] == doctest::Approx(40));
+        const auto sample = field.sample(cv::Vec3d{1,1,1}, cv::Vec3d{1,0,0});
+        REQUIRE(sample.options.size() == 1);
+        CHECK(sample.options[0].presence == doctest::Approx(1));
+    }
     fs::remove_all(root);
 }
 namespace {

@@ -368,19 +368,19 @@ void routedPartitionsPrecedeTheirBases()
     {
         auto base=ObjectStore::create(basePath,directOptions());auto write=base.write();
         base.upsertObject(write,fiber(a,1));base.upsertObject(write,fiber(b,2));
-        EdgeRecord e;e.uuid=edgeUuid;e.aUuid=a;e.bUuid=b;e.kind="routing";e.meta=R"({"quality":1})";
+        EdgeRecord e;e.uuid=edgeUuid;e.aUuid=a;e.bUuid=b;e.kind="declared_reference";e.meta=R"({"quality":1})";
         e.aAnchor.wholeGeometry=e.bAnchor.wholeGeometry=true;
         base.addEdge(write,e);base.seal(write);write.commit();
     }
     InitialImportOptions options;options.store=directOptions();options.dependencies={basePath};
-    options.shards={InitialShardSpec{{1,100},{1,100}},InitialShardSpec{{101,200},{101,200}}};
+    options.shards={InitialShardSpec{{1,100}},InitialShardSpec{{101,200}}};
     const auto result=importInitialCollection(directory.path/"routed",options,
         [&](size_t i,InitialShardImport& shard){
             if(i!=1)return;
             const std::array rows{InitialObjectRecord{fiber(a,9),{},geometry()}};shard.appendObjects(rows);
             bool supplied=false;shard.importEdges([&](auto& batch){
                 if(supplied)return false;supplied=true;
-                EdgeRecord e;e.uuid=edgeUuid;e.kind="routing";e.meta=R"({"quality":9})";
+                EdgeRecord e;e.uuid=edgeUuid;e.kind="declared_reference";e.meta=R"({"quality":9})";
                 e.aAnchor.wholeGeometry=e.bAnchor.wholeGeometry=true;
                 batch.push_back({{shard.storeUuid(),a},{{},b},e});
                 return true;
@@ -393,6 +393,20 @@ void routedPartitionsPrecedeTheirBases()
         require(Json::parse(collection.edge(read,{{},edgeUuid})->record.meta).at("quality")==9,
             "selected later shard edge must precede inherited edge with same UUID");
         require(collection.object(read,{{},b}).has_value(),"unselected shard dependencies remain visible");
+        size_t objectCount=0;
+        collection.scanObjects(read,[&](const CollectionObject& row){
+            ++objectCount;
+            if(row.key.objectUuid==a)require(Json::parse(row.record.meta).at("quality")==9,
+                "object scans resolve later-shard replacements like keyed reads");
+            return true;
+        });
+        require(objectCount==2,"object scans deduplicate base and partition records");
+        const auto byKind=collection.edgesByKind(read,"declared_reference");
+        const auto adjacent=collection.edgesOf(read,{{},a});
+        require(byKind.size()==1&&adjacent.size()==1&&
+            Json::parse(byKind.front().record.meta).at("quality")==9&&
+            Json::parse(adjacent.front().record.meta).at("quality")==9,
+            "edge kind and adjacency scans resolve later-shard replacements like keyed reads");
     }
     auto overlay=ObjectCollection::create(directory.path/"overlay",{result.path},directOptions());
     {auto write=overlay.write();overlay.setMeta(write,{{},a},"quality","11");write.commit();}
@@ -413,7 +427,7 @@ void siblingReferences()
     for (const bool packed : {false, true}) {
         InitialImportOptions options;options.uuidHashRouting=false;
         options.store = directOptions();
-        options.shards = {InitialShardSpec{{1,100},{1,100}}, InitialShardSpec{{101,200},{101,200}}};
+        options.shards = {InitialShardSpec{{1,100}}, InitialShardSpec{{101,200}}};
         if (packed) {
             PackedStoreOptions settings;
             settings.memoryFirst = true;
@@ -471,7 +485,7 @@ void siblingReferences()
 
     InitialImportOptions failed;failed.uuidHashRouting=false;
     failed.store = directOptions();
-    failed.shards = {InitialShardSpec{{1,100},{1,100}}, InitialShardSpec{{101,200},{101,200}}};
+    failed.shards = {InitialShardSpec{{1,100}}, InitialShardSpec{{101,200}}};
     for (const bool failObjectPhase : {false, true}) {
         const auto output = directory.path / (failObjectPhase ? "object-phase-failure" : "malformed-edge");
         mustFail([&] {

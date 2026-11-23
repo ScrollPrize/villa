@@ -145,53 +145,49 @@ the run JSON alone does not register its external identity.
 
 ## Prefetch and inference
 
-Download exactly one OME-Zarr group into the configured cache:
+Inference reads its input level straight from Open Data through `vc_reader`,
+with `<cache_dir>/volumes` as the vc_reader disk cache; chunks are kept
+decoded there at `<cache_dir>/volumes/s3/<bucket>/<key>/<level>/` and reused
+by later runs. Fill the cache with one level ahead of time:
 
 ```bash
-las_manager volume prefetch PHerc0332/20260411134726-2.400um-0.2m-78keV-masked.zarr 1 --workers 512
+las_manager volume prefetch PHerc0332/20260411134726-2.400um-0.2m-78keV-masked.zarr 1 --connections 512
 ```
-
-The OME root is stored at
-`<cache_dir>/volumes/<sample>/<long_id>/`; inference reads its numbered group.
-Downloader `_download` metadata is retained, and the existing Lasagna
-downloader performs all listing, resume, and transfer work.
 
 Launch either backend with a stable snapshot and volume selector:
 
 ```bash
-las_manager inference run fiber3d/my-run/best.pt PHerc0332/20260411134726-2.400um-0.2m-78keV-masked.zarr 1 --download-workers 512 -- --devices all
-las_manager inference run lasagna/cos-run/model_best.pt PHerc0332/20260411134726-2.400um-0.2m-78keV-masked.zarr 1 --download-workers 512 -- --devices all
+las_manager inference run fiber3d/my-run/best.pt PHerc0332/20260411134726-2.400um-0.2m-78keV-masked.zarr 1 --input-connections 512 -- --devices all
+las_manager inference run lasagna/cos-run/model_best.pt PHerc0332/20260411134726-2.400um-0.2m-78keV-masked.zarr 1 --input-connections 512 -- --devices all
 las_manager inference ls
 las_manager run ls
 las_manager tmux attach fiber-PHerc0332
 ```
 
 The command reserves a concise run directory, launches tmux, prints the path,
-and returns immediately. Inside tmux, prefetch completes before the GPU child
-starts, so downloader activity cannot collide with inference workers. Follow it
-with `las_manager run ls`, `las_manager tmux attach <run>`, or inspect
-`<run>/run.log`. `--no-prefetch` skips this up-front phase, initializes only the
-local source descriptor, and leaves the backend's crop-aware on-demand
-downloading enabled during inference. `--download-workers` applies to either
-mode. An explicit backend `--no-download` after `--` still wins. Arguments
-after `--` are passed unchanged to the selected backend.
+and returns immediately. Inside tmux, the prefetch phase fills the cache before
+the GPU child starts, so fetching cannot collide with inference workers. Follow
+it with `las_manager run ls`, `las_manager tmux attach <run>`, or inspect
+`<run>/run.log`. `--no-prefetch` skips this up-front phase and leaves the
+backend's read-ahead to fetch what each tile needs. `--input-connections`
+applies to either mode. The backend receives `--input <s3 level url>
+--input-disk-cache-dir <cache_dir>/volumes` plus `--input-connections` and
+`--read-ahead-tiles`; arguments after `--` are passed unchanged to the selected
+backend and override them.
 
-For a full volume that cannot remain entirely in the cache, replace the bulk
-prefetch phase with the shared rolling selected-scale cache:
+For a full volume that cannot remain entirely in the cache, bound the cache
+instead of prefetching:
 
 ```bash
 las_manager inference run fiber3d/my-run/best.pt \
   PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr 0 \
-  --live-fetch --download-workers 512
+  --input-disk-cache-gib 10240 --input-connections 512
 ```
 
-This initializes only the remote source descriptor, then launches inference
-immediately. Defaults are `--live-cache-gib 10240` and
-`--live-fetch-ahead-tiles 10000`. Chunks are cached decoded in `<ome
-root>/.live_cache`; past the target the least recently used are removed. The
-settings and final cache counters are copied from
-portable inference provenance into manager run metadata. `--live-fetch` is
-full-volume only and rejects backend/configured `--no-download`.
+This skips the prefetch phase and launches inference immediately; past the
+bound the least recently used cached chunks are removed. The input settings
+and final reader counters are copied from portable inference provenance
+(`inference.input`) into manager run metadata (`input`).
 This includes output-format overrides such as `--ome-compressor none`; newly
 created outputs otherwise use the shared Blosc/Zstd default. Resumed arrays
 retain their persisted compressor; compact resumes reject incompatible codec

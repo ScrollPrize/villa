@@ -38,9 +38,16 @@ struct ConsumedRelationshipIdentity {
     std::string family, a, b;
 };
 
+bool trackCrossing(const Json& relationship)
+{
+    return relationship.is_object() && relationship.value("family", Json()) == Json("track_crossing");
+}
+
 // The manifest's consumed relationships against the ones the current heads
 // of the fitted objects give, by record UUID. With `scope`, only those
 // relationships are compared, from the heads of their fitted endpoints.
+// No track is read as an endpoint, and the track crossings an older fit's
+// manifest lists are not compared (FitInputs::crossingsNotCompared).
 void compareRelationships(const StoreReader& reader, const Json& manifest,
                           const std::vector<StoreInputPin>& pins, const std::set<std::string>* scope,
                           const std::map<std::string, vc::objects::RelationshipVersion>& references, FitInputs& result)
@@ -64,10 +71,13 @@ void compareRelationships(const StoreReader& reader, const Json& manifest,
     // The fitted endpoints at their current versions.
     std::vector<vc::objects::ObjectVersion> heads;
     for (const auto& uuid : endpoints) {
-        if (!kinds.contains(uuid)) continue;
+        const auto kind = kinds.find(uuid);
+        if (kind == kinds.end() || kind->second == "track") continue;
         if (const auto current = reader.currentObject(uuid); current && !current->deleted)
             heads.push_back(current->reference());
     }
+    // Exactly what relationshipsAt is asked for below.
+    for (const auto& head : heads) result.relationshipEndpoints.insert(head.objectUuid);
     std::map<std::string, ConsumedRelationshipIdentity> consumed;
     try {
         const bool approvedOnly = manifest.value("approved_links_only", false);
@@ -85,6 +95,7 @@ void compareRelationships(const StoreReader& reader, const Json& manifest,
         return;
     }
     for (const auto& entry : fitted) {
+        if (trackCrossing(entry)) continue;
         FitRelationship link{entry.at("uuid").get<std::string>(), entry.value("family", std::string()),
                              LinkState::Dropped, entry.value("a", std::string()), entry.value("b", std::string())};
         if (!inScope(link.uuid)) continue;
@@ -284,6 +295,14 @@ std::vector<StoreInputPin> objectPins(const Json& document,const vc::objects::Ma
 }
 }
 
+std::size_t uncomparedTrackCrossings(const Json& document)
+{
+    if (!document.is_object() || !document.contains("manifest") || !document.at("manifest").is_object()) return 0;
+    const auto relationships = document.at("manifest").find("relationships");
+    if (relationships == document.at("manifest").end() || !relationships->is_array()) return 0;
+    return std::size_t(std::count_if(relationships->begin(), relationships->end(), trackCrossing));
+}
+
 std::vector<StoreInputPin> manifestPins(const Json& document)
 {
     return objectPins(document,vc::objects::manifestReferences(document.at("manifest")));
@@ -319,6 +338,7 @@ Json adapterMetadata(const std::string& kind, const Json& meta,
 FitInputs readFitInputs(const StoreReader& reader, const Json& document)
 {
     FitInputs result;
+    result.crossingsNotCompared = uncomparedTrackCrossings(document);
     vc::objects::ManifestReferences references;
     if (!sameStore(reader, document, result, references)) return result;
     const auto pins = objectPins(document,references);
@@ -332,21 +352,27 @@ FitInputChanges readFitInputChanges(const StoreReader& reader, const Json& docum
                                     const std::set<std::string>& relationshipUuids)
 {
     FitInputChanges changes;
+    changes.inputs.crossingsNotCompared = uncomparedTrackCrossings(document);
     vc::objects::ManifestReferences references;
     if (!sameStore(reader, document, changes.inputs, references)) return changes;
     const auto pins = objectPins(document,references);
     for (const auto& pin : pins)
         if (objectUuids.contains(pin.uuid)) readObject(reader, pin, changes.inputs.volumeUuid, changes.inputs);
     // A changed object's links: the fitted ones, and the ones it has now.
+    // Not a track's: its crossings are neither enumerated nor read.
     changes.checkedRelationships = relationshipUuids;
     for (const auto& entry : document.at("manifest").value("relationships", Json::array()))
-        if (objectUuids.contains(entry.value("a", std::string()))
-            || objectUuids.contains(entry.value("b", std::string())))
+        if (!trackCrossing(entry)
+            && (objectUuids.contains(entry.value("a", std::string()))
+                || objectUuids.contains(entry.value("b", std::string()))))
             changes.checkedRelationships.insert(entry.at("uuid").get<std::string>());
     vc::objects::EdgeSelection incident;
     incident.endpointUuids = std::vector<std::string>();
     for (const auto& pin : pins)
-        if (!pin.outerShell && objectUuids.contains(pin.uuid)) incident.endpointUuids->push_back(pin.uuid);
+        if (!pin.outerShell && pin.kind != "track" && objectUuids.contains(pin.uuid)) {
+            incident.endpointUuids->push_back(pin.uuid);
+            changes.inputs.relationshipEndpoints.insert(pin.uuid);
+        }
     incident.includeRetired = true;
     if (!incident.endpointUuids->empty())
         for (const auto& edge : reader.selectEdges(incident, std::vector<std::string>{"uuid"}))
@@ -369,6 +395,10 @@ void applyFitInputChanges(FitInputs& inputs, FitInputChanges changes)
     replaceByUuid(inputs.fibers, changes.inputs.fibers);
     replaceByUuid(inputs.tracks, changes.inputs.tracks);
     if (changes.inputs.outerShell) inputs.outerShell = std::move(changes.inputs.outerShell);
+    // Both reads are of one manifest: a read that failed before reaching it
+    // must not erase the caveat.
+    inputs.crossingsNotCompared = std::max(inputs.crossingsNotCompared, changes.inputs.crossingsNotCompared);
+    inputs.relationshipEndpoints = std::move(changes.inputs.relationshipEndpoints);
     for (auto& link : changes.inputs.relationships) {
         const auto found = std::find_if(inputs.relationships.begin(), inputs.relationships.end(),
                                         [&](const auto& old) { return old.uuid == link.uuid; });

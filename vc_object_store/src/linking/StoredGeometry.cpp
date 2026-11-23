@@ -88,7 +88,9 @@ std::filesystem::path StoredGeometry::sourcePath(const objects::ObjectRecord& ob
 {
     const auto path = db_.resolveStoragePath(txn(), object.uuid);
     if (!path) throw std::invalid_argument("object has no external source: " + object.uuid);
-    return std::filesystem::weakly_canonical(*path);
+    // For a track, its dataset's identity: the one a selection reports
+    // (ObjectStore::trackDatasets).
+    return objects::trackDatasetIdentity(*path);
 }
 std::vector<objects::ObjectRecord> StoredGeometry::select(const std::string& kind,
     const std::vector<std::string>& uuids)

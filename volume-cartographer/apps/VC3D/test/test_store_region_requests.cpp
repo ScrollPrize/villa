@@ -16,7 +16,7 @@ private slots:
         auto db = ObjectStore::create(directory.filePath("graph.vcobj").toStdString(), options);
         const auto a = util::newUuid(), b = util::newUuid(), c = util::newUuid();
         auto link = [&](auto& txn, const auto& first, const auto& second) {
-            EdgeRecord edge; edge.kind="related"; edge.aUuid=first; edge.bUuid=second;
+            EdgeRecord edge; edge.kind="parallel"; edge.aUuid=first; edge.bUuid=second;
             edge.aAnchor.wholeGeometry=edge.bAnchor.wholeGeometry=true;
             db.addEdge(txn,edge);
         };
@@ -37,7 +37,7 @@ private slots:
         auto txn=db.read();
         cv=db.currentObjectRevision(txn,c)->reference();
         LocalStoreReader reader(db,txn);
-        EdgeSelection edges; edges.kind="related";
+        EdgeSelection edges; edges.kind="parallel";
         const auto graph=reader.graphReadViewAround({av,cv},edges);
         QCOMPARE(graph.objectUuids.size(),size_t{3});
         QCOMPARE(graph.edgeUuids.size(),size_t{2});

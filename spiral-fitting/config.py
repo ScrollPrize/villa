@@ -676,10 +676,11 @@ class Config:
         self.output_num_slices_for_visualization = 20
         # Patches, fibers, point collections and tracks come from one
         # vc_object_store database (object_store_inputs.load_fit_inputs).
-        # Startup refreshes the store's automatic PCL-patch, fiber-patch,
-        # patch-overlap and track-crossing links, writing them back as
+        # Startup refreshes the store's automatic PCL-patch, fiber-patch and
+        # patch-overlap links, writing them back as
         # object_store_author, unless refresh_links is off; approved_links_only
-        # consumes only approved relationships. A checkpoint resumes only
+        # consumes only approved relationships. Track crossings are computed
+        # by the fit from the selected tracks, not read from the store. A checkpoint resumes only
         # against identical inputs and frames unless allow_changed_inputs.
         # A store file on this host, or the endpoint of the vc_object_server
         # serving one (object_store_inputs.open_store).

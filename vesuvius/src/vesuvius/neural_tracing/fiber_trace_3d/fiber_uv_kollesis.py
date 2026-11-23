@@ -11,6 +11,7 @@ import numpy as np
 from scipy.special import softmax
 
 from . import fiber_uv_layout as uv
+from .fiber_graph_store import FiberGraph, store_digest
 
 
 def conditional_abs(samples, weights, targets):
@@ -71,7 +72,7 @@ class Maps:
 def verify_signature(cfg):
     signature = json.loads(Path(cfg['tensor_cache']).with_suffix('.json').read_text())['signature']
     for key in ('database', 'stage1'):
-        if uv.sha256_file(cfg[key]) != signature[key]:
+        if (store_digest if key=='database' else uv.sha256_file)(cfg[key]) != signature[key]:
             raise ValueError(f'{key} differs from frozen tensor input')
     return signature
 
@@ -89,31 +90,29 @@ def event_geometry(cfg, d, root):
             return src['geometry'].copy()
     geom = np.full((len(d['event_ids']), 3), np.nan)
     found = np.zeros(len(geom), bool)
-    fields = ['id', 'ax', 'ay', 'az', 'bx', 'by', 'bz']
-    for name in ('normal_a', 'normal_b'):
-        fields.extend(f"json_extract({name},'$.xyz[{axis}]')" for axis in range(3))
     started = time.monotonic()
-    with uv._ro(cfg['database']) as db:
-        cursor = db.execute('SELECT '+','.join(fields)+' FROM constraints ORDER BY id')
-        while rows := cursor.fetchmany(65536):
-            a = np.asarray(rows, dtype=float)
-            pos = np.searchsorted(d['event_ids'], a[:, 0].astype(np.int64))
-            good = pos < len(geom)
-            good &= d['event_ids'][pos.clip(max=len(geom)-1)] == a[:, 0]
-            a = a[good]; pos = pos[good]
-            c = a[:, 4:7]-a[:, 1:4]
-            na, nb = a[:, 7:10], a[:, 10:13]
-            la, lb = np.linalg.norm(na, axis=1), np.linalg.norm(nb, axis=1)
-            na = na/np.maximum(la[:, None], 1e-12); nb = nb/np.maximum(lb[:, None], 1e-12)
-            pa = (c*na).sum(1); pb = (c*nb).sum(1)
-            normal = (abs(pa)+abs(pb))/2
-            transverse = np.sqrt(np.maximum(0, (c*c).sum(1)-(pa*pa+pb*pb)/2))
-            agreement = abs((na*nb).sum(1))
-            geom[pos] = np.column_stack((normal, transverse, agreement))
-            geom[pos[(la < 1e-8) | (lb < 1e-8)]] = np.nan
-            found[pos] = True
-            if int(found.sum())//1000000 != int((found.sum()-len(pos)))//1000000:
-                print(f'kollesis geometry {found.sum():,}/{len(geom):,} elapsed={time.monotonic()-started:.1f}s', flush=True)
+    graph=FiberGraph(cfg['database'])
+    for batch in graph.batches():
+        if not len(geom):break
+        event_ids=graph.event_ids[batch]
+        pos = np.searchsorted(d['event_ids'], event_ids)
+        good = pos < len(geom)
+        good &= d['event_ids'][pos.clip(max=len(geom)-1)] == event_ids
+        pos = pos[good]
+        c = (graph.point_b[batch]-graph.point_a[batch])[good]
+        na, nb = graph.normal_a[batch][good], graph.normal_b[batch][good]
+        la, lb = np.linalg.norm(na, axis=1), np.linalg.norm(nb, axis=1)
+        na = na/np.maximum(la[:, None], 1e-12); nb = nb/np.maximum(lb[:, None], 1e-12)
+        pa = (c*na).sum(1); pb = (c*nb).sum(1)
+        normal = (abs(pa)+abs(pb))/2
+        transverse = np.sqrt(np.maximum(0, (c*c).sum(1)-(pa*pa+pb*pb)/2))
+        agreement = abs((na*nb).sum(1))
+        geom[pos] = np.column_stack((normal, transverse, agreement))
+        invalid=(la < 1e-8) | (lb < 1e-8) | ~graph.valid_a[batch][good] | ~graph.valid_b[batch][good]
+        geom[pos[invalid]] = np.nan
+        found[pos] = True
+        if int(found.sum())//1000000 != int((found.sum()-len(pos)))//1000000:
+            print(f'kollesis geometry {found.sum():,}/{len(geom):,} elapsed={time.monotonic()-started:.1f}s', flush=True)
     if not found.all():
         raise ValueError('Missing original event geometry')
     np.savez(target, geometry=geom, event_ids=d['event_ids'], database_hash=signature['database'])

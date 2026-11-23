@@ -13,6 +13,7 @@
 #include <string_view>
 #include <unordered_map>
 #include <utility>
+#include <set>
 #include <vector>
 
 #include <opencv2/core/mat.hpp>
@@ -96,6 +97,13 @@ public:
     void setStoreSelection(const std::string& kind, const std::string& id);
     // Called before a source is changed or detached; failure leaves it unchanged.
     std::function<bool()> prepareStoreSwitch;
+    // The same for a change that only affects the routes of these object kinds
+    // (a selection change, or a store reference removed or replaced that these
+    // kinds select); unset: prepareStoreSwitch.
+    std::function<bool(const std::set<std::string>& kinds)> prepareStoreKindsSwitch;
+    bool prepareStoreSwitchForKinds(const std::set<std::string>& kinds);
+    // The object kinds whose selection names this store reference.
+    std::set<std::string> kindsSelecting(const std::string& id) const;
     void pollObjectStoreChanges();
     // Crash recovery of the session's drafts (not started until the
     // application gives it a directory; the object-store owner's).

@@ -1,6 +1,7 @@
 """Rebuild real GT events from frozen native evidence, without source writes."""
 import json
 import os
+import uuid
 from pathlib import Path
 
 import numpy as np
@@ -32,10 +33,10 @@ def test_rebuild_real_gt_events_and_reuse(tmp_path, monkeypatch):
             Path(cfg['normal_curves_output']).symlink_to(cache / 'frozen_gt_normals', target_is_directory=True)
         else:
             name = Path(cfg['output']).stem
-            Path(cfg['database']).symlink_to(cache / (name + '.sqlite'))
+            Path(cfg['database']).symlink_to(cache / (name + '.vcobj'))
             Path(cfg['output']).symlink_to(cache / (name + '.json'))
             if name == 'orient':
-                assert cfg['orient_database'] == str(output / 'extract.sqlite')
+                assert cfg['orient_database'] == str(output / 'extract.vcobj')
     from vesuvius.neural_tracing.fiber_trace_3d import constraint_extraction
     monkeypatch.setattr(constraint_extraction, 'run_native_constraints', recorded_native)
     settings = dict(output_root=str(output), configs=list(inputs['configs']),
@@ -96,12 +97,12 @@ def test_build_real_gt_cache_from_scratch_and_score(tmp_path):
     # historical binary; do not relax that guard or alter the original database.
     from vesuvius.neural_tracing.fiber_trace_3d.constraint_extraction import run_native_constraints
     extraction = json.loads((local_gt / 'extract_config.json').read_text())
-    extraction.update(database=str(local_gt / 'raw.sqlite'),
+    extraction.update(database=str(local_gt / 'raw.vcobj'),
                       output=str(local_gt / 'raw.json'))
     extraction_path = local_gt / 'prepare_extraction.json'
     extraction_path.write_text(json.dumps(extraction))
     run_native_constraints(extraction_path, dict(native_binary=binary))
-    # Exercise the read-only SQLite audit too, with a non-ASCII database path.
+    # Exercise the read-only graph-store audit too, with a non-ASCII store path.
     audit = dict(extraction, compare_database=extraction['database'],
                  output=str(local_gt / 'audit.json'))
     del audit['database']
@@ -110,7 +111,7 @@ def test_build_real_gt_cache_from_scratch_and_score(tmp_path):
     run_native_constraints(audit_path, dict(native_binary=binary))
     assert json.loads(Path(audit['output']).read_text())['all_measurements_match_database']
     orientation = json.loads((local_gt / 'orient_config.json').read_text())
-    orientation.update(database=str(local_gt / 'oriented.sqlite'),
+    orientation.update(database=str(local_gt / 'oriented.vcobj'),
                        output=str(local_gt / 'oriented.json'),
                        orient_database=extraction['database'])
     orientation_path = local_gt / 'prepare_orientation.json'
@@ -118,8 +119,29 @@ def test_build_real_gt_cache_from_scratch_and_score(tmp_path):
     run_native_constraints(orientation_path, dict(native_binary=binary))
     config['database'] = orientation['database']
     (local_gt / 'uv_whole/config.json').write_text(json.dumps(config))
+    # Candidate geometry is identical, but identities must be distinct from
+    # trusted GT objects: a global UUID denotes one object, not one cohort.
+    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import read_polylines, write_initial_fibers, fiber_volume
+    data=score.arrays(config['tensor_cache'])
+    source_ids=np.unique(data['source_id'])
+    mapped=sorted(str(uuid.uuid5(uuid.NAMESPACE_OID,'gt-self-check:'+str(fid))) for fid in source_ids)
+    assert not set(mapped)&set(source_ids)
+    mapping=dict(zip(source_ids,mapped))
+    candidate_store=tmp_path/'candidate.vcobj'
+    write_initial_fibers(candidate_store,[(dict(row,id=mapping[row['id']]),xyz)
+        for row,xyz in read_polylines(config['fibers'],source_ids)],
+        volume=fiber_volume(config['fibers']),workers=2,packed=True)
+    candidate_data=dict(data,source_id=np.array([mapping[fid] for fid in data['source_id']]))
+    if 'ids' in data:candidate_data['ids']=np.array([mapping[fid] for fid in data['ids']])
+    candidate_tensor=tmp_path/'candidate_tensors.npz';np.savez(candidate_tensor,**candidate_data)
+    candidate_solve=tmp_path/'candidate_solve';candidate_solve.mkdir()
+    saved=score.arrays(gt/'uv_whole/solution.npz')
+    saved['source_id']=candidate_data['source_id']
+    np.savez(candidate_solve/'solution.npz',**saved)
+    candidate_config=dict(config,fibers=str(candidate_store),tensor_cache=str(candidate_tensor),
+                          output_root=str(candidate_solve))
     candidate = tmp_path / 'candidate.json'
-    candidate.write_text(json.dumps(dict(fiber_uv_layout=config)))
+    candidate.write_text(json.dumps(dict(fiber_uv_layout=candidate_config)))
     root = tmp_path / 'cross-π-纤维'
     settings = dict(output_root=str(root), configs=[str(candidate)], gt_root=str(local_gt),
                     extract_template=str(local_gt / 'extract_config.json'),
@@ -127,15 +149,15 @@ def test_build_real_gt_cache_from_scratch_and_score(tmp_path):
                     native_binary=binary, events_only=True, threads=2)
     result = score.run(settings)
     assert result['events']
-    assert (root / 'combined.vcobj').exists() and (root / 'orient.sqlite').exists()
+    assert (root / 'combined.vcobj').exists() and (root / 'orient.vcobj').exists()
     assert (root / 'frozen_gt_normals/index.json').exists()
     spec = dict(root=str(root), gt_root=str(local_gt), events='cross_events.json')
-    rebuilt = score.FrozenGTScorer(spec, config)
-    values = rebuilt.score(gt / 'uv_whole/solution.npz', config)
+    rebuilt = score.FrozenGTScorer(spec, candidate_config)
+    values = rebuilt.score(candidate_solve / 'solution.npz', candidate_config)
     assert values['gt_enabled_events'] > 0
     (root / 'events-list.json').write_text(json.dumps(result['events']))
-    legacy = score.FrozenGTScorer(dict(spec, events='events-list.json'), config)
-    assert values == legacy.score(gt / 'uv_whole/solution.npz', config)
+    legacy = score.FrozenGTScorer(dict(spec, events='events-list.json'), candidate_config)
+    assert values == legacy.score(candidate_solve / 'solution.npz', candidate_config)
     assert score.run(settings) == result
     # The original direct-score branch must also work without a frozen-cache flag.
     direct = score.run(dict(settings, events_only=False))

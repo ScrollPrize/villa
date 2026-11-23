@@ -52,7 +52,7 @@ public:
 
     // The one service API version this build speaks; the handshake refuses
     // anything else. Reported to the user so a mismatch is self-explanatory.
-    static constexpr int kApiVersion = 47;
+    static constexpr int kApiVersion = 48;
 
     // The object store a service reads its fit inputs from, beside the one
     // attached in this VC3D. Inputs are displayed as fitted, and saved edits

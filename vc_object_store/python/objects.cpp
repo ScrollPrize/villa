@@ -1,12 +1,20 @@
 #include "StorageBindings.hpp"
+#include "vc_object_store/SqliteRuntime.hpp"
 #include "internal/ObjectVersionJson.hpp"
 #include "AfvBindings.hpp"
 #include "ExtensionBindings.hpp"
+#include "CollectionBindings.hpp"
 #include "ObjectReadBindings.hpp"
+#include "PolylineArcBindings.hpp"
+#include "FiberWindingBindings.hpp"
+#include "FiberUvEventBindings.hpp"
+#include "FiberUvExportBindings.hpp"
+#include "FiberAxialBindings.hpp"
 #include "TypedGeometryBindings.hpp"
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
 #include "vc_object_store/objects/StoreReader.hpp"
 #include "vc_object_store/objects/RelationshipInputs.hpp"
+#include "vc_object_store/objects/TrackDatasets.hpp"
 #include "vc_object_store/objects/ManifestReferences.hpp"
 #include "vc_object_store/objects/AttachedDocument.hpp"
 #include "vc_object_store/objects/SurfaceCreate.hpp"
@@ -88,6 +96,14 @@ nb::dict selectedInputsToPy(const vo::SelectedInputs& selected)
     nb::list objects;
     for (const auto& object : selected.objects) objects.append(objectRevisionToPy(object));
     nb::dict result; result["objects"] = objects; result["relationships"] = relationshipsToPy(selected.relationships);
+    // Millions of tracks name a handful of datasets: one str per dataset.
+    std::vector<nb::str> names;
+    for (const auto& dataset : selected.trackDatasets.datasets) names.emplace_back(dataset.c_str(), dataset.size());
+    nb::dict datasets;
+    for (size_t index = 0; index < selected.trackDatasets.objects.size(); ++index)
+        if (const auto dataset = selected.trackDatasets.objects[index]; dataset >= 0)
+            datasets[selected.objects[index].objectUuid.c_str()] = names[size_t(dataset)];
+    result["track_datasets"] = datasets;
     return result;
 }
 // Convert native results after the transaction (and any GIL release) ends.
@@ -98,13 +114,20 @@ std::vector<vo::ObjectVersion> objectVersionsFromPy(const nb::handle& refs)
     return vo::detail::objectVersionsFrom(nlohmann::json::parse(jsonDumps(refs)));
 }
 
+const char* const kSelectedInputsDoc =
+    "The objects at these numbered references with the relationships among them, and each selected track's "
+    "dataset ('track_datasets': {uuid: dataset}), guarded against a store that moved from `position`. "
+    "`relationship_refs`, a subset of `refs`, limits the relationships to those of these objects "
+    "(None: of all of them); every object is validated and returned either way.";
 template<class Read>
-nb::dict readSelectedInputs(const nb::list& refs, const nb::dict& position, Read&& read)
+nb::dict readSelectedInputs(const nb::list& refs, const nb::dict& position, const nb::object& relationshipRefs, Read&& read)
 {
     const auto versions = objectVersionsFromPy(refs);
     const auto snapshot = vo::detail::storePositionFrom(nlohmann::json::parse(jsonDumps(position)));
+    std::optional<std::vector<vo::ObjectVersion>> subset;
+    if (!relationshipRefs.is_none()) subset = objectVersionsFromPy(relationshipRefs);
     vo::SelectedInputs result;
-    { nb::gil_scoped_release release; result = read(versions, snapshot); }
+    { nb::gil_scoped_release release; result = read(versions, snapshot, subset); }
     return selectedInputsToPy(result);
 }
 
@@ -588,9 +611,10 @@ void bindHostedStore(nb::module_& m)
             { nb::gil_scoped_release release; history = self.objectHistory(uuid, nullptr, ifRetained); }
             return toPy(history);
         }, nb::arg("object_uuid"), nb::arg("if_retained") = false)
-        .def("selected_inputs", [](Hosted& self, const nb::list& refs, const nb::dict& position) {
-            return readSelectedInputs(refs, position, [&](const auto& versions, const auto& snapshot) { return self.selectedInputs(versions, snapshot); });
-        }, nb::arg("refs"), nb::arg("position"))
+        .def("selected_inputs", [](Hosted& self, const nb::list& refs, const nb::dict& position, const nb::object& relationshipRefs) {
+            return readSelectedInputs(refs, position, relationshipRefs, [&](const auto& versions, const auto& snapshot, const auto& subset) {
+                return self.selectedInputs(versions, snapshot, subset); });
+        }, nb::arg("refs"), nb::arg("position"), nb::arg("relationship_refs") = nb::none(), kSelectedInputsDoc)
         .def("relationships_at_versions", [](Hosted& self, const nb::list& refs) {
             const auto versions = objectVersionsFromPy(refs);
             std::vector<vo::SelectedRelationship> revisions;
@@ -769,13 +793,15 @@ void bindSessionOperations(nb::class_<vo::ObjectStoreSession> session)
             return jsonLoads(annotations.dump());
         }, nb::arg("attachment"), nb::arg("revision_uuid"), nb::arg("array_name"),
            "Per-point annotations of a sequence array (as ObjectStore.geometry_point_annotations).")
-        .def("selected_inputs", [](Session& self, const vo::AttachmentIdentity& attachment, const nb::list& refs, const nb::dict& position) {
-            return readSelectedInputs(refs, position, [&](const auto& versions, const auto& snapshot) {
+        .def("selected_inputs", [](Session& self, const vo::AttachmentIdentity& attachment, const nb::list& refs, const nb::dict& position,
+                                   const nb::object& relationshipRefs) {
+            return readSelectedInputs(refs, position, relationshipRefs, [&](const auto& versions, const auto& snapshot, const auto& subset) {
                 vo::SelectedInputs result;
-                self.readStore(attachment, [&](const vo::StoreReader& reader, const auto&) { result = reader.selectedInputs(versions, snapshot); });
+                self.readStore(attachment, [&](const vo::StoreReader& reader, const auto&) {
+                    result = reader.selectedInputs(versions, snapshot, subset); });
                 return result;
             });
-        }, nb::arg("attachment"), nb::arg("refs"), nb::arg("position"))
+        }, nb::arg("attachment"), nb::arg("refs"), nb::arg("position"), nb::arg("relationship_refs") = nb::none(), kSelectedInputsDoc)
         .def("relationships_at_versions", [](Session& self, const vo::AttachmentIdentity& attachment, const nb::list& refs) {
             const auto versions = objectVersionsFromPy(refs);
             std::vector<vo::SelectedRelationship> revisions;
@@ -1009,6 +1035,39 @@ NB_MODULE(_native, m)
         }
         return nb::make_tuple(selected, exclusions);
     }, nb::arg("relationships"), nb::arg("endpoint_kinds"), nb::arg("approved_only") = false);
+    m.def("group_track_datasets", [](const std::vector<std::string>& uuids, const nb::list& datasets,
+                                     const std::vector<std::string>& externalKeys, const std::vector<std::string>& families) {
+        if (datasets.size() != uuids.size() || externalKeys.size() != uuids.size() || families.size() != uuids.size())
+            throw std::invalid_argument("group_track_datasets: the columns differ in length");
+        // Tracks share their dataset's str (selected_inputs' track_datasets):
+        // each distinct one is converted once.
+        std::map<PyObject*, std::string> names;
+        std::vector<vo::TrackDatasetRow> rows(uuids.size());
+        for (size_t row = 0; row < rows.size(); ++row) {
+            const nb::handle dataset = datasets[row];
+            auto name = names.find(dataset.ptr());
+            if (name == names.end()) name = names.emplace(dataset.ptr(), nb::cast<std::string>(dataset)).first;
+            rows[row] = {uuids[row], name->second, externalKeys[row], families[row]};
+        }
+        std::vector<vo::TrackDatasetGroup> groups;
+        { nb::gil_scoped_release release; groups = vo::groupTrackDatasets(rows); }
+        const auto bytes = [](const auto& values) {
+            return nb::bytes(reinterpret_cast<const char*>(values.data()), values.size() * sizeof(values[0]));
+        };
+        nb::list result;
+        for (const auto& group : groups) {
+            const std::vector<int64_t> indices(group.rows.begin(), group.rows.end());
+            nb::dict item; item["dataset"] = group.dataset; item["rows"] = bytes(indices);
+            item["source_ids"] = bytes(group.sourceIds); item["families"] = bytes(group.families);
+            result.append(item);
+        }
+        return result;
+    }, nb::arg("uuids"), nb::arg("datasets"), nb::arg("external_keys"), nb::arg("families"),
+       "How tracks are prepared for crossing detection (as the store's track-track detector prepares them): "
+       "groups ordered by dataset, each {'dataset', 'rows': int64 indices of the input by ascending source ID, "
+       "'source_ids': uint64, 'families': int8 (0 horizontal, 1 vertical, -1 none)} as native-endian bytes. "
+       "Raises for a missing dataset, a non-canonical external key, a source ID repeated in a dataset and an "
+       "unknown family.");
     m.def("canonical_uuid", &vo::util::canonicalUuid, nb::arg("uuid"));
     m.def("manifest_references", [](const nb::dict& manifest) {
         const auto selected=vo::manifestReferences(nlohmann::json::parse(jsonDumps(manifest)));
@@ -1026,6 +1085,11 @@ NB_MODULE(_native, m)
     m.def("object_versions_from_json", [](const std::string& text) {
         return jsonLoads(vo::detail::objectVersionsJson(vo::detail::objectVersionsFrom(nlohmann::json::parse(text))).dump());
     }, nb::arg("json"), "Decode an array of exact references with the shared native codec.");
+    m.def("object_references_digest",[](const nb::list& references,const std::string& domain){
+        const auto selected=objectVersionsFromPy(references);
+        nb::gil_scoped_release release;return vo::objectReferencesDigest(selected,domain);
+    },nb::arg("references"),nb::arg("domain")="fibers_digest v3",
+       "SHA-256 over UUID-ordered complete owning-store/generation/object/version references.");
     m.def("relationship_version_from_json", [](const std::string& text) {
         return jsonLoads(vo::relationshipVersionToJson(vo::relationshipVersionFromJson(text)));
     }, nb::arg("json"), "Decode a complete selected relationship reference.");
@@ -1033,6 +1097,19 @@ NB_MODULE(_native, m)
         const auto ref=vo::transactionReceiptFromJson(jsonDumps(receipt)).objectReference(uuid);
         return ref?jsonLoads(vo::objectVersionToJson(*ref)):nb::none();
     },nb::arg("receipt"),nb::arg("object_uuid"),"Exact committed reference, including unchanged inherited inputs.");
+    m.def("receipt_object_references", [](const nb::dict& receipt,const std::vector<std::string>& uuids) {
+        // Decodes the receipt once: receipt_object_reference decodes it on
+        // every call, which a receipt of millions of entries cannot afford
+        // per object.
+        const auto decoded=vo::transactionReceiptFromJson(jsonDumps(receipt));
+        nb::dict result;
+        for(const auto& uuid:uuids){
+            const auto ref=decoded.objectReference(uuid);
+            result[nb::str(uuid.c_str())]=ref?jsonLoads(vo::objectVersionToJson(*ref)):nb::none();
+        }
+        return result;
+    },nb::arg("receipt"),nb::arg("object_uuids"),
+       "receipt_object_reference of each UUID, as {uuid: reference or None}, decoding the receipt once.");
     m.def("object_reference", [](const nb::dict& record) {
         vo::ObjectRecord value;
         value.uuid=nb::cast<std::string>(record["uuid"]);
@@ -1077,6 +1154,7 @@ NB_MODULE(_native, m)
 
     bindAfvSource(m);
     bindExtensionHelpers(m);
+    bindCollectionApi(m);
     m.def("artifact_manifest_json", [](const nb::list& files) {
         std::vector<vo::ArtifactFile> parsed;
         for (const auto& f : files) {
@@ -1115,6 +1193,10 @@ NB_MODULE(_native, m)
 
     m.doc() = "Revisioned objects and relationships, with owned geometry and typed snapshot views.";
 
+    m.def("configure_sqlite_runtime",&vo::configureSqliteRuntime,
+        nb::arg("memory_statistics")=nb::none(),nb::arg("pagecache_bulk_bytes")=0,
+        "Explicit process-startup allocator configuration before any SQLite initialization. Never closes or reconfigures active connections.");
+
     m.def("enable_history", [](const std::filesystem::path& path) {
         nb::gil_scoped_release release; vo::changeHistoryMode(path, vo::HistoryMode::On);
     }, nb::arg("path"), "Offline history enablement; close all handles first. Current geometry identities are preserved.");
@@ -1123,6 +1205,11 @@ NB_MODULE(_native, m)
     }, nb::arg("path"), "Explicitly remove all retained history and disable future history; close all handles first.");
 
     bindGraphReadView(m);
+    bindPolylineArcIndex(m);
+    bindFiberWinding(m);
+    bindFiberUvEvents(m);
+    bindFiberUvExport(m);
+    bindFiberAxial(m);
     bindGeometryRegion(m);
     bindHostedStore(m);
     bindSessionOperations(bindObjectStoreSession(m));
@@ -1150,12 +1237,14 @@ NB_MODULE(_native, m)
                     nb::arg("geometry_cache_bytes") = 16 * 1024 * 1024,
                     nb::arg("spatial_cache_bytes") = 16 * 1024 * 1024, nb::arg("catalog") = nb::none(),
                     nb::kw_only(), nb::arg("history_enabled") = true, nb::arg("spatial_index") = true,
+                    nb::arg("edge_adjacency_index") = true, nb::arg("edge_columns") = std::nullopt,
                     "Create a new object database at path (refuses existing files).")
         .def_static("open", &PyObjectStore::open, nb::arg("path"), nb::arg("author") = std::nullopt,
                     nb::arg("read_only") = false, nb::arg("hostname") = std::nullopt,
                     nb::arg("reader_pool_size") = 4,
                     nb::arg("geometry_cache_bytes") = 16 * 1024 * 1024,
                     nb::arg("spatial_cache_bytes") = 16 * 1024 * 1024, nb::arg("catalog") = nb::none(),
+                    nb::arg("position") = std::nullopt,
                     "Open an existing object database. author is required unless read_only.")
         .def("geometry_snapshot", [](PyObjectStore& self) {
             self.require();
@@ -1369,11 +1458,64 @@ NB_MODULE(_native, m)
            nb::arg("tag") = std::nullopt, nb::arg("limit") = std::nullopt,
            nb::arg("after_uuid") = std::nullopt, nb::arg("fields") = std::nullopt, nb::arg("include_retired") = false,
            nb::arg("adjacent") = std::nullopt, nb::arg("applicable_only") = false)
+        .def("selected_reference_digest",[](PyObjectStore& self,const std::optional<std::string>& kind,
+                                            const std::optional<std::vector<std::string>>& ids,const std::string& domain){
+            if(ids&&ids->empty()){
+                self.require();nb::gil_scoped_release release;
+                return vo::objectReferencesDigest({},domain);
+            }
+            vo::ObjectSelection selection;selection.kind=kind;if(ids)selection.uuids=*ids;
+            return self.withRead<true>([&](vo::ObjectStore& store,vo::ReadTxn& txn){
+                return store.selectedReferenceDigest(txn,selection,domain);
+            });
+        },nb::arg("object_kind")=std::nullopt,nb::arg("object_uuids")=std::nullopt,
+           nb::arg("domain")="fibers_digest v3",
+           "Stream live selected references into SHA-256 in one snapshot, without Python rows or geometry reads.")
+        .def("geometry_array_counts", [](PyObjectStore& self, const std::string& kind, const std::string& name,
+                                         const std::optional<int64_t>& limit) {
+            auto counts=std::make_unique<vo::ObjectStore::GeometryArrayCounts>(
+                self.withRead<true>([&](vo::ObjectStore& store,vo::ReadTxn& txn){
+                    return store.geometryArrayCounts(txn,kind,name,limit);
+                }));
+            auto* raw=counts.release();
+            nb::capsule owner(raw,[](void* p) noexcept {delete static_cast<vo::ObjectStore::GeometryArrayCounts*>(p);});
+            nb::dict result;
+            result["object_uuid"]=nb::ndarray<const uint8_t,nb::numpy,nb::ndim<2>>(
+                reinterpret_cast<const uint8_t*>(raw->uuids.data()),{raw->uuids.size(),size_t(16)},owner);
+            result["count"]=nb::ndarray<const int64_t,nb::numpy,nb::ndim<1>>(
+                raw->counts.data(),{raw->counts.size()},owner);
+            // One contiguous text column for clients with existing U36 keys;
+            // no millions of individual Python strings/dictionaries.
+            std::string text;text.reserve(raw->uuids.size()*36);
+            for(const auto& key:raw->uuids)text+=vo::fiberGraphUuid(key);
+            result["uuid_ascii"]=nb::bytes(text.data(),text.size());
+            return result;
+        },nb::arg("object_kind"),nb::arg("array_name"),nb::arg("limit")=std::nullopt,
+           "UUID-ordered binary UUID/count NumPy columns from selected descriptors, without reading coordinate chunks.")
+        .def("geometry_read", [](PyObjectStore& self,const std::optional<std::string>& kind,
+            const std::vector<std::string>& ids,const std::optional<std::string>& volume,
+            const std::optional<int64_t>& limit,const std::optional<std::string>& after,
+            const std::optional<nb::dict>& expected) {
+            self.require();
+            const auto position=expected?std::optional(vo::detail::storePositionFrom(nlohmann::json::parse(jsonDumps(*expected)))):std::nullopt;
+            auto view=std::make_unique<PyGraphReadView>();view->store=self.db;
+            vo::ObjectSelection selection;selection.kind=kind;selection.uuids=ids;selection.volume=volume;
+            selection.limit=limit;selection.afterUuid=after;
+            {nb::gil_scoped_release release;
+                view->txn=std::make_unique<vo::ReadTxn>(view->store->read());
+                view->graph=std::make_shared<vo::GraphReadView>(view->store->geometryReadView(*view->txn,selection,position));
+            }
+            return view.release();
+        },nb::rv_policy::take_ownership,nb::arg("object_kind")=std::nullopt,
+           nb::arg("object_uuids")=std::vector<std::string>{},nb::arg("volume")=std::nullopt,
+           nb::arg("limit")=std::nullopt,nb::arg("after_uuid")=std::nullopt,nb::arg("expected_position")=std::nullopt,
+           "Current selected metadata and geometry in one pinned read, without relationship/history queries. Explicit versions use graph_read.")
         .def("graph_read", [](PyObjectStore& self, const std::optional<std::string>& kind,
             const std::vector<std::string>& ids, const std::optional<std::string>& edgeKind,
             const std::vector<std::string>& states, const std::optional<std::array<double, 6>>& bbox,
             const std::optional<std::string>& tag, bool includeRetired, std::optional<bool> adjacent,
-            bool applicableOnly, const std::optional<nb::list>& versionRefs) {
+            bool applicableOnly, const std::optional<nb::list>& versionRefs,
+            const std::optional<int64_t>& edgeLimit) {
             self.require();
             if (versionRefs && (kind || !ids.empty() || bbox || includeRetired))
                 throw std::invalid_argument("versions specifies the complete graph object selection; cannot combine with object filters or include_retired");
@@ -1381,7 +1523,7 @@ NB_MODULE(_native, m)
             auto view = std::make_unique<PyGraphReadView>(); view->store = self.db;
             vo::ObjectSelection objects; objects.kind = kind; objects.uuids = ids; objects.bbox = bbox; objects.includeRetired = includeRetired;
             vo::EdgeSelection edges; edges.kind = edgeKind; edges.approvalStates = states; edges.tag = tag;
-            edges.adjacent = adjacent; edges.applicableOnly = applicableOnly;
+            edges.adjacent = adjacent; edges.applicableOnly = applicableOnly;edges.limit=edgeLimit;
             { nb::gil_scoped_release release;
               view->txn = std::make_unique<vo::ReadTxn>(view->store->read());
               view->graph = std::make_shared<vo::GraphReadView>(versions ? view->store->graphReadViewAt(*view->txn, *versions, edges)
@@ -1392,8 +1534,10 @@ NB_MODULE(_native, m)
            nb::arg("approval_states") = std::vector<std::string>{"approved"},
            nb::arg("bbox") = std::nullopt, nb::arg("edge_tag") = std::nullopt, nb::arg("include_retired") = false,
            nb::arg("adjacent") = std::nullopt, nb::arg("applicable_only") = false, nb::arg("versions") = std::nullopt,
+           nb::arg("edge_limit")=std::nullopt,
            "Pin a store graph read view; use as a context manager and close before checkpointing. versions: "
-           "numbered references {store, generation, object, version}, the complete closed object selection.")
+           "numbered references {store, generation, object, version}, the complete closed object selection. "
+           "edge_limit=0 reads the selected geometry without enumerating relationships.")
         .def("select_objects", [](PyObjectStore& self, const std::optional<std::string>& kind,
             const std::optional<std::string>& tag, const std::vector<std::string>& ids,
             const std::optional<std::string>& connected, const std::vector<std::string>& edgeKinds,
@@ -1609,14 +1753,14 @@ NB_MODULE(_native, m)
             const auto versions = objectVersionsFromPy(refs);
             return toPy(self.withRead<true>([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.objectsAtVersions(txn, versions); }));
         }, nb::arg("refs"), "Numbered references {store, generation, object, version}, answered in order (None where not recorded).")
-        .def("selected_inputs", [](PyObjectStore& self, const nb::list& refs, const nb::dict& position) {
+        .def("selected_inputs", [](PyObjectStore& self, const nb::list& refs, const nb::dict& position, const nb::object& relationshipRefs) {
             return self.withStore([&](auto& db) {
-                return readSelectedInputs(refs, position, [&](const auto& versions, const auto& snapshot) {
+                return readSelectedInputs(refs, position, relationshipRefs, [&](const auto& versions, const auto& snapshot, const auto& subset) {
                     auto txn = db.read();
-                    return vo::LocalStoreReader(db, txn).selectedInputs(versions, snapshot);
+                    return vo::LocalStoreReader(db, txn).selectedInputs(versions, snapshot, subset);
                 });
             });
-        }, nb::arg("refs"), nb::arg("position"))
+        }, nb::arg("refs"), nb::arg("position"), nb::arg("relationship_refs") = nb::none(), kSelectedInputsDoc)
         .def("relationships_at_versions", [](PyObjectStore& self, const nb::list& refs) {
             const auto versions = objectVersionsFromPy(refs);
             const auto revisions = self.withRead<true>([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.relationshipsAt(txn, versions); });

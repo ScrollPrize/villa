@@ -11,6 +11,7 @@ on:
       - 'volume-cartographer/**'
       - 'vc_object_store/**'
       - 'vc_reader/**'
+      - 'spiral-fitting/**'
       - '.github/workflows/vc3d-ci.yml'
 
 permissions:
@@ -35,6 +36,7 @@ jobs:
       cli: ${{ steps.filter.outputs.cli }}
       flatboi: ${{ steps.filter.outputs.flatboi }}
       mcp: ${{ steps.filter.outputs.mcp }}
+      spiral: ${{ steps.filter.outputs.spiral }}
     steps:
       - name: Checkout Villa
         id: checkout
@@ -98,6 +100,7 @@ jobs:
               - 'volume-cartographer/Dockerfile*'
               - 'volume-cartographer/cmake/**'
               - 'volume-cartographer/core/**'
+              - 'volume-cartographer/apps/CMakeLists.txt'
               - 'volume-cartographer/apps/VC3D/**'
               - 'volume-cartographer/utils/**'
               - 'volume-cartographer/libs/**'
@@ -130,6 +133,11 @@ jobs:
             mcp:
               - 'volume-cartographer/tools/vc3d-mcp/**'
               - '.github/workflows/vc3d-ci.yml'
+            spiral:
+              - 'spiral-fitting/**'
+              - 'vc_object_store/**'
+              - 'vc_reader/**'
+              - '.github/workflows/vc3d-ci.yml'
 
   skip:
     name: Skip (no volume-cartographer changes)
@@ -146,16 +154,16 @@ jobs:
     if: needs.changes.outputs.test_core == 'true'
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 20
-    # Published by vc3d-publish-ghcr.yml; deps recipe hash: 675836fc3d478d17.
+    # Published by vc3d-publish-ghcr.yml; deps recipe hash: 6309e96d71462b0a.
     container:
-      image: ghcr.io/scrollprize/villa/volume-cartographer@sha256:1bebf104edbd6c290ddbaf8036c919635259f3722e8eddb31340b240baf1ed68
+      image: ghcr.io/scrollprize/villa/volume-cartographer@sha256:9407753393547c422c9689cb8da6b6f4415cc91ad8fa4d89eb476a3df540d7f8
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
     env:
       SCCACHE_GHA_ENABLED: 'true'
       SCCACHE_IGNORE_SERVER_IO_ERROR: '1'
-      SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-linux-ubuntu-26.04-deps-675836fc3d478d17-clang-quickbuild-o0
+      SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-linux-ubuntu-26.04-deps-6309e96d71462b0a-clang-quickbuild-o0
     steps:
       - name: Checkout Villa
         id: checkout
@@ -210,6 +218,11 @@ jobs:
             xvfb-run -a -s '-screen 0 1280x1024x24' \
             ctest --test-dir build/ci-fast-core --output-on-failure \
             --parallel 4 -L '^vc-core$'
+          # The store's own tests carry no shard label. The track crossing
+          # cache store (the spiral fitter's cache) is built and run here.
+          cmake --build build/ci-fast-core --target test_track_crossing_store --parallel 4
+          ctest --test-dir build/ci-fast-core --output-on-failure \
+            --no-tests=error -R '^object_store_track_crossing_store$'
           sccache --show-stats
 
   test-specialized:
@@ -219,14 +232,14 @@ jobs:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 20
     container:
-      image: ghcr.io/scrollprize/villa/volume-cartographer@sha256:1bebf104edbd6c290ddbaf8036c919635259f3722e8eddb31340b240baf1ed68
+      image: ghcr.io/scrollprize/villa/volume-cartographer@sha256:9407753393547c422c9689cb8da6b6f4415cc91ad8fa4d89eb476a3df540d7f8
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
     env:
       SCCACHE_GHA_ENABLED: 'true'
       SCCACHE_IGNORE_SERVER_IO_ERROR: '1'
-      SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-linux-ubuntu-26.04-deps-675836fc3d478d17-clang-quickbuild-o0
+      SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-linux-ubuntu-26.04-deps-6309e96d71462b0a-clang-quickbuild-o0
     steps:
       - name: Checkout Villa
         id: checkout
@@ -278,14 +291,14 @@ jobs:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 20
     container:
-      image: ghcr.io/scrollprize/villa/volume-cartographer@sha256:1bebf104edbd6c290ddbaf8036c919635259f3722e8eddb31340b240baf1ed68
+      image: ghcr.io/scrollprize/villa/volume-cartographer@sha256:9407753393547c422c9689cb8da6b6f4415cc91ad8fa4d89eb476a3df540d7f8
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
     env:
       SCCACHE_GHA_ENABLED: 'true'
       SCCACHE_IGNORE_SERVER_IO_ERROR: '1'
-      SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-linux-ubuntu-26.04-deps-675836fc3d478d17-clang-quickbuild-o0
+      SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-linux-ubuntu-26.04-deps-6309e96d71462b0a-clang-quickbuild-o0
     steps:
       - name: Checkout Villa
         id: checkout
@@ -328,7 +341,12 @@ jobs:
             -DVC_QUICKBUILD_OPT_LEVEL=0 -DVC_USE_SCCACHE=ON \
             -DVC_TESTING=ON -DVC_BUILD_APPS=ON \
             -DVC_BUILD_FLATBOI=OFF
-          cmake --build build/ci-fast-vc3d --target VC3D --parallel 4
+          # Packaging only runs on main; catch install rules naming files the
+          # default build skips (cpack: "file INSTALL cannot find") here.
+          python3 scripts/check_install_rules.py build/ci-fast-vc3d
+          # vc_object_server_app: the controller test's hosted part runs
+          # against it (and fails without it).
+          cmake --build build/ci-fast-vc3d --target VC3D vc_object_server_app --parallel 4
           python3 -m venv build/ci-fast-vc3d/smoke-venv
           build/ci-fast-vc3d/smoke-venv/bin/pip install ../vc_reader
           QT_QPA_PLATFORM=offscreen build/ci-fast-vc3d/smoke-venv/bin/python apps/VC3D/agent_bridge/test/smoke_offscreen.py \
@@ -346,14 +364,14 @@ jobs:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 20
     container:
-      image: ghcr.io/scrollprize/villa/volume-cartographer@sha256:1bebf104edbd6c290ddbaf8036c919635259f3722e8eddb31340b240baf1ed68
+      image: ghcr.io/scrollprize/villa/volume-cartographer@sha256:9407753393547c422c9689cb8da6b6f4415cc91ad8fa4d89eb476a3df540d7f8
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
     env:
       SCCACHE_GHA_ENABLED: 'true'
       SCCACHE_IGNORE_SERVER_IO_ERROR: '1'
-      SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-linux-ubuntu-26.04-deps-675836fc3d478d17-clang-quickbuild-o0
+      SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-linux-ubuntu-26.04-deps-6309e96d71462b0a-clang-quickbuild-o0
     steps:
       - name: Checkout Villa
         id: checkout
@@ -407,14 +425,14 @@ jobs:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 20
     container:
-      image: ghcr.io/scrollprize/villa/volume-cartographer@sha256:1bebf104edbd6c290ddbaf8036c919635259f3722e8eddb31340b240baf1ed68
+      image: ghcr.io/scrollprize/villa/volume-cartographer@sha256:9407753393547c422c9689cb8da6b6f4415cc91ad8fa4d89eb476a3df540d7f8
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
     env:
       SCCACHE_GHA_ENABLED: 'true'
       SCCACHE_IGNORE_SERVER_IO_ERROR: '1'
-      SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-linux-ubuntu-26.04-deps-675836fc3d478d17-clang-quickbuild-o0
+      SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-linux-ubuntu-26.04-deps-6309e96d71462b0a-clang-quickbuild-o0
     steps:
       - name: Checkout Villa
         id: checkout
@@ -557,9 +575,82 @@ jobs:
           python -m pip install -e .
           python -m unittest discover -p 'test*.py'
 
+  spiral-store-tests:
+    name: Spiral object-store track tests
+    needs: changes
+    if: needs.changes.outputs.spiral == 'true'
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash
+        working-directory: ./spiral-fitting
+    steps:
+      - name: Checkout Villa
+        uses: actions/checkout@v4
+        timeout-minutes: 4
+        with:
+          sparse-checkout: |
+            spiral-fitting
+            vc_object_store
+            vc_reader
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          # Native dependency closure of the Python builds of vc_object_store
+          # and vc_reader (as in test-vesuvius.yml) and of vc_spiral.
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            curl \
+            git \
+            libblosc-dev \
+            libblosc2-dev \
+            libboost-dev \
+            libceres-dev \
+            libconcurrentqueue-dev \
+            libcurl4-openssl-dev \
+            libeigen3-dev \
+            liblz4-dev \
+            libopencv-contrib-dev \
+            libopencv-dev \
+            libsuitesparse-dev \
+            libjpeg-dev \
+            libpng-dev \
+            libtiff-dev \
+            libzstd-dev \
+            ninja-build \
+            nlohmann-json3-dev \
+            pkg-config \
+            qt6-base-dev \
+            zlib1g-dev
+      - name: Install uv and restore dependency cache
+        uses: astral-sh/setup-uv@v10.3.3
+        with:
+          enable-cache: true
+          prune-cache: false
+          cache-suffix: spiral-fitting
+          cache-dependency-glob: |
+            .github/workflows/vc3d-ci.yml
+            spiral-fitting/uv.lock
+            spiral-fitting/pyproject.toml
+            spiral-fitting/cpp/**
+            vc_object_store/pyproject.toml
+            vc_reader/**
+      # The CUDA-only extraction backend is not needed; torch itself still
+      # comes from the index pyproject.toml names. The tests run on the CPU.
+      - name: Sync dependencies
+        run: uv sync --locked --no-group cuda
+      # Object-store tracks through the fitter: selection, dataset grouping,
+      # computed crossings and their cache store (vc_object_store and the
+      # vc_spiral kernel are built by the sync above).
+      - name: Run the object-store track tests
+        env:
+          FIT_SPIRAL_DEVICE: cpu
+        run: uv run --no-sync python -m pytest -q tests/test_object_store_tracks.py
+
   ci:
     name: CI
-    needs: [changes, skip, test-core, test-specialized, vc3d-compile-smoke, cli-compile, flatboi-compile, mcp-test, macos-build]
+    needs: [changes, skip, test-core, test-specialized, vc3d-compile-smoke, cli-compile, flatboi-compile, mcp-test, macos-build, spiral-store-tests]
     if: always()
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 15
@@ -575,12 +666,13 @@ jobs:
           R_FLATBOI: ${{ needs.flatboi-compile.result }}
           R_MCP_TEST: ${{ needs.mcp-test.result }}
           R_MACOS: ${{ needs.macos-build.result }}
+          R_SPIRAL: ${{ needs.spiral-store-tests.result }}
         run: |
           set -e
-          echo "changes=$R_CHANGES skip=$R_SKIP core=$R_TEST_CORE specialized=$R_TEST_SPECIALIZED vc3d=$R_VC3D cli=$R_CLI flatboi=$R_FLATBOI mcp=$R_MCP_TEST macos=$R_MACOS"
+          echo "changes=$R_CHANGES skip=$R_SKIP core=$R_TEST_CORE specialized=$R_TEST_SPECIALIZED vc3d=$R_VC3D cli=$R_CLI flatboi=$R_FLATBOI mcp=$R_MCP_TEST macos=$R_MACOS spiral=$R_SPIRAL"
           # All non-skipped jobs must succeed (or be skipped legitimately).
           fail=0
-          for r in "$R_CHANGES" "$R_SKIP" "$R_TEST_CORE" "$R_TEST_SPECIALIZED" "$R_VC3D" "$R_CLI" "$R_FLATBOI" "$R_MCP_TEST" "$R_MACOS"; do
+          for r in "$R_CHANGES" "$R_SKIP" "$R_TEST_CORE" "$R_TEST_SPECIALIZED" "$R_VC3D" "$R_CLI" "$R_FLATBOI" "$R_MCP_TEST" "$R_MACOS" "$R_SPIRAL"; do
             case "$r" in
               success|skipped) ;;
               *) fail=1 ;;

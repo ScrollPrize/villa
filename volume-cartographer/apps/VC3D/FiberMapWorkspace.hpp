@@ -32,6 +32,7 @@
 
 class CState;
 class LineAnnotationController;
+struct FiberMapSnapshotDecodeState;
 class QCheckBox;
 class QDockWidget;
 class QDoubleSpinBox;
@@ -257,6 +258,10 @@ private:
     // memoization cache - moved out of the workspace at start, moved back
     // only on a validated publish.
     void startRebuild(bool fullRebuild, bool automatic);
+    // The second half of a rebuild start: after the snapshot's store reads
+    // ran on the rebuild worker, finish the snapshot on the GUI and launch the
+    // layout job.
+    void continueRebuild();
     // Watcher-delivered completion: validate against the current world,
     // publish or discard, then run the one epilogue.
     void applyRebuild(const std::shared_ptr<RebuildJobResult>& job);
@@ -580,6 +585,17 @@ private:
     // users, and a bounded, private teardown in the destructor.
     QThreadPool _rebuildPool;
     QFutureWatcher<std::shared_ptr<RebuildJobResult>>* _rebuildWatcher = nullptr;
+    // The snapshot's store reads (LineAnnotationController::decodeFiberMapSnapshot)
+    // run on _rebuildPool before the layout job; the start's parameters wait here.
+    QFutureWatcher<void>* _snapshotWatcher = nullptr;
+    std::shared_ptr<FiberMapSnapshotDecodeState> _snapshotDecode;
+    struct PendingRebuild {
+        bool fullRebuild = false;
+        bool automatic = false;
+        uint64_t epoch = 0;
+        vc3d::fiber_map::UmbilicusDependency umbilicusDependency;
+    };
+    std::optional<PendingRebuild> _pendingRebuild;
     QTimer* _progressMarquee = nullptr;
     QPushButton* _progressButton = nullptr;
     qint64 _progressPhase = 0;

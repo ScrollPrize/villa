@@ -7,7 +7,6 @@ namespace vc::objects {
 
 struct InitialShardSpec {
     std::array<int64_t,2> objectIds{1,INT64_MAX};
-    std::array<int64_t,2> edgeIds{1,INT64_MAX};
 };
 struct InitialImportOptions {
     OpenOptions store=[] {OpenOptions o;o.history=HistoryMode::Off;o.spatialIndex=false;return o;}();
@@ -17,6 +16,9 @@ struct InitialImportOptions {
     // then fan out instead of claiming a routing contract they cannot honor.
     bool uuidHashRouting = true;
     std::vector<std::filesystem::path> dependencies;
+    // Optional exact source publications already consumed by the producer.
+    // Unspecified dependencies are captured at construction time.
+    std::vector<ExtensionSource> dependencyPins;
     std::optional<PackedStoreOptions> packed;
     InitialEdgeImportOptions edges;
     // Optional extension definitions instantiated independently on each shard.
@@ -38,6 +40,9 @@ struct InitialImportResult {
     std::string storeUuid;
     std::vector<InitialShardResult> shards;
     double ingestionSeconds=0,manifestSeconds=0,persistenceSeconds=0,totalSeconds=0;
+    // Final snapshot identity already known at seal time; no reader reopen.
+    std::string generation;
+    int64_t commitSequence=0;
 };
 
 // Available only during the producer callback, on its assigned worker thread.
@@ -55,6 +60,11 @@ public:
     void checkCancelled() const;
     std::vector<InitialObjectIdentity> appendObjects(std::span<const InitialObjectRecord>);
     std::vector<InitialObjectIdentity> appendObjectRefs(std::span<const InitialObjectRecord* const>);
+    // Extension-only derived rows may reference owners in sealed dependencies;
+    // no copied objects, endpoint directories or extra ownership tables.
+    void appendExtensionRows(const std::string&,std::span<const ExtensionRow>);
+    int64_t transferStagedExtensionRows(const std::string&,
+        const std::function<void(ExtensionRow&)>&,std::size_t batchRows=4096);
     int64_t importEdges(const std::function<bool(std::vector<InitialCollectionEdge>&)>&);
 private:
     struct Impl;

@@ -1,6 +1,7 @@
 // Diagnostic benchmark, NOT a second supported object-store implementation.
 // Source decoding and UUID generation finish before any import timer starts.
 #include "vc_object_store/objects/AfvSource.hpp"
+#include "vc_object_store/SqliteRuntime.hpp"
 #include "vc_object_store/objects/InitialImport.hpp"
 #include "vc_object_store/objects/imports/ParallelImportStream.hpp"
 #include "geometry/GeometryInternal.hpp"
@@ -295,7 +296,7 @@ Json native(Prepared& data,const fs::path& path,bool storeReference,bool packed,
     for(auto& row:data.objects){restore.ids.push_back(row.id);row.id.reset();}
     opt.shards.clear();const auto reservation=INT64_MAX/int64_t(workers);
     for(size_t i=0;i<workers;++i){
-        const std::array<int64_t,2> range{int64_t(i)*reservation+1,int64_t(i+1)*reservation};opt.shards.push_back({range,range});
+        const std::array<int64_t,2> range{int64_t(i)*reservation+1,int64_t(i+1)*reservation};opt.shards.push_back({range});
     }
     const auto partitionSeconds=elapsed(partitionStart);
     if(packed){opt.packed.emplace();opt.packed->disposableBulk=true;opt.packed->memoryFirst=true;
@@ -399,7 +400,7 @@ Json native(Prepared& data,const fs::path& path,bool storeReference,bool packed,
 }
 int main(int argc,char** argv){try{
     require(argc==2,"usage: vc_bench_prepared_import CONFIG.json");
-    sqlite3_config(SQLITE_CONFIG_MEMSTATUS,0);
+    configureSqliteRuntime(false);
     std::ifstream input(argv[1]);const auto config=Json::parse(input);
     Json cases=config.value("cases",Json::array());
     if(!config.contains("cases"))cases.push_back({{"variant",config.at("variant")}});

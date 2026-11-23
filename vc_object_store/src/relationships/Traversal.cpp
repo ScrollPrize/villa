@@ -2,6 +2,10 @@
 #include "internal/History.hpp"
 #include "geometry/GeometryToken.hpp"
 #include "internal/RecordResolver.hpp"
+#include "internal/ObjectScan.hpp"
+#include "geometry/GeometryDelta.hpp"
+#include "vc_object_store/objects/GeometryCoordinates.hpp"
+#include "vc_object_store/objects/EdgeKinds.hpp"
 #include "vc_object_store/objects/StoreReader.hpp"
 
 namespace vc::objects {
@@ -56,7 +60,7 @@ public:
     {
         const auto sources=querySources(db);many_=sources.size()>1;
         std::string filter=" AND state=0"+fiberAdjacencySql(adjacent);
-        if(kinds.empty())filter+=" AND kind<>'"+std::string(kAttachmentEdgeKind)+"'";
+        if(kinds.empty())filter+=" AND kind<>"+std::to_string(edgeKindCode(kAttachmentEdgeKind));
         else {
             filter+=" AND kind IN (";
             for(size_t i=0;i<kinds.size();++i)filter+=(i?",?":"?")+std::to_string(i+2);
@@ -64,10 +68,12 @@ public:
         }
         if(!many_&&!includeRetired)filter+=" AND "+activeEdgeSql();
         for(auto* source:sources) {
+            requireAdjacencyIndex(source);
+            const auto table=edgeReadSource(source)+" AS edges";
             auto rows=std::make_unique<Statement>(source,
-                "SELECT id,b_uuid,uuid FROM edges INDEXED BY edges_a WHERE a_uuid=?1"+filter+
-                " UNION SELECT id,a_uuid,uuid FROM edges INDEXED BY edges_b WHERE b_uuid=?1"+filter+" ORDER BY id");
-            for(size_t i=0;i<kinds.size();++i)rows->bind(int(i)+2,kinds[i]);
+                "SELECT uuid,b_uuid FROM "+table+" WHERE a_uuid=?1"+filter+
+                " UNION SELECT uuid,a_uuid FROM "+table+" WHERE b_uuid=?1"+filter+" ORDER BY 1");
+            for(size_t i=0;i<kinds.size();++i)rows->bind(int(i)+2,edgeKindCode(kinds[i]));
             queries_.emplace_back(source,std::move(rows));
         }
     }
@@ -88,12 +94,12 @@ public:
             rows->resetKeepingBindings();rows->bind(1,parseUuid(uuid));
             while(rows->row()) {
                 checkTraversalCancelled(cancel_);
-                const auto edge=rows->uuid(2),next=rows->uuid(1);
+                const auto edge=rows->uuid(0),next=rows->uuid(1);
                 if(!many_)accept(edge,next);
                 else if(edgeSource(db_,edge)==source)merged.emplace_back(edge,next);
             }
         }
-        // Preserve existing ordering: local internal IDs, collection UUIDs.
+        // UUID order is stable across physical partitions and UUID-only edge tables.
         std::sort(merged.begin(),merged.end());
         for(const auto& [edge,next]:merged)accept(edge,next);
     }
@@ -258,6 +264,65 @@ GraphReadView ObjectStore::graphReadView(const Txn& txn, const ObjectSelection& 
     return result;
 }
 
+GraphReadView ObjectStore::geometryReadView(const Txn& txn,const ObjectSelection& selection,
+                                         const std::optional<StoreStatus>& expectedPosition) const
+{
+    return geometryReadViewImpl(txn,selection,expectedPosition,false);
+}
+
+GraphReadView ObjectStore::geometryReadViewImpl(const Txn& txn,const ObjectSelection& selection,
+    const std::optional<StoreStatus>& expectedPosition,bool trustedCurrent) const
+{
+    requirePublishedGraphRead(txn);
+    auto* db=static_cast<sqlite3*>(connection(txn));
+    if(selection.minLength||selection.bbox||selection.connectedTo||!selection.edgeKinds.empty()||
+       selection.orderBy!="uuid"||selection.afterLength||selection.includeUnbound)
+        throw std::invalid_argument("geometry read supports UUID-ordered metadata selection, not measured/connected filters");
+    if(selection.offset<0||(selection.limit&&*selection.limit<0)||(selection.afterUuid&&selection.offset))
+        throw std::invalid_argument("geometry read has invalid pagination");
+    if(selection.volume&&selection.coordinates)
+        throw std::invalid_argument("geometry read volume and coordinates filters are exclusive");
+    if(!std::isfinite(selection.targetScale)||selection.targetScale<=0)
+        throw std::invalid_argument("geometry read target scale must be finite and positive");
+    if(expectedPosition){
+        const auto current=status(txn);
+        if(expectedPosition->commitSequence<0||current.storeUuid!=util::canonicalUuid(expectedPosition->storeUuid)||
+           current.generation!=util::canonicalUuid(expectedPosition->generation)||current.commitSequence!=expectedPosition->commitSequence)
+            throw StoreBusy("geometry read: source position changed");
+    }
+    auto physical=selection;physical.volume.reset();physical.limit.reset();physical.offset=0;
+    std::optional<VolumeTransforms> transforms=selection.transforms?std::optional(*selection.transforms):std::nullopt;
+    GraphReadView result;result.selectedObjects.emplace();result.selectedRelationships.emplace();
+    int64_t skipped=0;
+    if(!selection.limit||*selection.limit>0)
+        scanVisibleObjectRows(db,physical,trustedCurrent?ObjectFields(std::set<std::string>{"meta","storage_kind","storage_ref","data_checksum"}):std::nullopt,
+            [&](ObjectRecord&& row,std::optional<SelectedGeometryHead> head){
+            if(selection.volume){
+                const auto metadata=nlohmann::json::parse(row.meta);
+                if(!geometryScaleToVolume(metadata,*selection.volume)){
+                    if(!transforms)transforms=volumeTransforms(txn);
+                    if(!transforms->toVolume(metadata,*selection.volume,selection.targetScale))return true;
+                }
+            }
+            if(skipped<selection.offset){++skipped;return true;}
+            if(head&&!trustedCurrent)(void)loadGeometryManifest(head->source,head->reference,head->manifest,row.dataChecksum.value_or(""));
+            ObjectRevision selected;
+            selected.metadataComplete=!trustedCurrent; // trusted batch metadata is a projection, not a complete edit reference
+            selected.storeUuid=row.versionStoreUuid;selected.generation=row.versionGeneration;
+            selected.objectUuid=row.uuid;selected.version=row.version.value_or(0);
+            selected.commitSequence=row.commitSequence;
+            if(head)selected.geometryRevision=head->reference;
+            selected.record=std::move(row);
+            result.objectUuids.push_back(selected.objectUuid);result.versions.push_back(selected.version);
+            result.geometryRevisions.push_back(selected.geometryRevision);result.selectedObjects->push_back(std::move(selected));
+            return !selection.limit||result.objectUuids.size()<size_t(*selection.limit);
+        });
+    // The empty graph's indexing is useful to existing bounded geometry views;
+    // no relationship tables or numbered history are consulted.
+    result.offsets.resize(result.objectUuids.size()+1,0);
+    return result;
+}
+
 GraphReadView ObjectStore::graphReadViewAt(const Txn& txn, const std::vector<ObjectVersion>& versions,
                                          const EdgeSelection& edges) const
 {
@@ -289,9 +354,12 @@ GraphReadView StoreReader::graphReadViewAt(const std::vector<ObjectVersion>& ver
     }
     auto graphEdges = edges;
     if (!graphEdges.kind) graphEdges.attachments = false;
-    for (auto& selected : relationshipsAt(versions))
-        if (selected.applicable && matchesEdgeSelection(selected.relationship.record, graphEdges))
-            result.selectedRelationships->push_back(std::move(selected.relationship));
+    // A zero relationship limit is an explicit geometry-only selection. Do
+    // not enumerate incident evidence merely to discard every row afterward.
+    if(!edges.limit||*edges.limit!=0)
+        for (auto& selected : relationshipsAt(versions))
+            if (selected.applicable && matchesEdgeSelection(selected.relationship.record, graphEdges))
+                result.selectedRelationships->push_back(std::move(selected.relationship));
     auto& relationships = *result.selectedRelationships;
     std::sort(relationships.begin(), relationships.end(), [](const auto& a, const auto& b) { return a.record.uuid < b.record.uuid; });
     if (edges.limit && relationships.size() > static_cast<size_t>(*edges.limit)) relationships.resize(*edges.limit);
