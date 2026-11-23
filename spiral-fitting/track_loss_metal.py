@@ -18,7 +18,9 @@ by term, with two differences in evaluation order that change rounding only:
   takes one cumsum over the whole batch and subtracts the row start's value.
   Both sum the same multiples of dr; the per-row sum is the more exact.
 - Group sums (target mean, p-norm numerator) run sequentially in row and
-  point order instead of torch's reduction trees.
+  point order instead of torch's reduction trees; the target mean sums
+  offsets from the group's first value, which keeps it as close to float64
+  as the eager mean.
 
 Gradients match the eager autograd's subgradient conventions: abs and relu
 give zero at zero, clamp(min=0) passes the gradient where its input >= 0, and
@@ -145,7 +147,14 @@ kernel void track_radius_fwd(
         }
     }
 
-    // mean of the finite target values over every row of the group
+    // mean of the finite target values over every row of the group, summed
+    // as offsets from the first one: a group's values lie within a winding
+    // of each other, so the offsets are small and their running sum stays
+    // exact to a few ulps, where summing the raw values (~hundreds of
+    // voxels, up to group rows x target points of them) in sequence would
+    // lose more than torch's pairwise reduction
+    float pivot = 0.0f;
+    bool have_pivot = false;
     float total = 0.0f;
     float count = 0.0f;
     for (long j = 0; j < rows; ++j) {
@@ -153,12 +162,16 @@ kernel void track_radius_fwd(
         for (long k = 0; k < target_points; ++k) {
             float v = unwrapped[target_flat[r * target_points + k]];
             if (isfinite(v)) {
-                total += v;
+                if (!have_pivot) {
+                    pivot = v;
+                    have_pivot = true;
+                }
+                total += v - pivot;
                 count += 1.0f;
             }
         }
     }
-    float target = total / max(count, 1.0f);
+    float target = count > 0.0f ? pivot + total / count : 0.0f;
     targets[g] = target;
 
     float hinge_margin = dr * margin;
