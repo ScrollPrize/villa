@@ -5,7 +5,14 @@ nanobind_add_module(vc_object_bindings NOMINSIZE objects.cpp)
 # Self-contained module: no project shared libraries, so no install RPATH into site-packages.
 set_target_properties(vc_object_bindings PROPERTIES OUTPUT_NAME _native LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/vc_object_store"
     INSTALL_RPATH "")
-target_link_libraries(vc_object_bindings PRIVATE vc_object_geometry vc_object_links opencv_core nlohmann_json::nlohmann_json)
+# The serial detectors where they are built (macOS with OpenMP found; see
+# src/CMakeLists.txt), so the module never links an OpenMP runtime there.
+if(TARGET vc_object_links_serial)
+    set(_vc_python_detectors vc_object_links_serial)
+else()
+    set(_vc_python_detectors vc_object_links)
+endif()
+target_link_libraries(vc_object_bindings PRIVATE vc_object_geometry ${_vc_python_detectors} opencv_core nlohmann_json::nlohmann_json)
 target_include_directories(vc_object_bindings PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../src")
 target_compile_features(vc_object_bindings PRIVATE cxx_std_23)
 foreach(module __init__.py surfaces.py documents.py locations.py derivation.py selected.py)

@@ -710,6 +710,12 @@ def _gpu_worker(device, node, cfg, tasks, results, data, turn):
             if not bool(pred.any()):
                 out[key] = None
                 continue
+            if min(pred.shape) < ds:
+                # A slab thinner than one max-pool cell (the last ribbon clipped at z_max, e.g. 2 of
+                # 4 slices) has nothing left after the ds crop, so it has no tracks, as on the CPU
+                # path; prepare() would index an empty bincount.
+                out[key] = None
+                continue
             samples.append(prepare(pred, ds, lo_count, hi_count))
             keys.append(key)
             del pred
@@ -1297,6 +1303,8 @@ class _Job:
             say(f'yx range (full-res): {min_yx} .. {max_yx}')
             for axis, prefix in (('y', 'vy'), ('x', 'vx')):
                 lo, hi = (min_yx[0], max_yx[0]) if axis == 'y' else (min_yx[1], max_yx[1])
+                # Start the slabs on the downsample grid (see extract_vertical in extract_surface_tracks.py).
+                lo -= lo % ds
                 along = Y if axis == 'y' else X
                 keys = []
                 for w in range(lo, hi, geo['yx_stride_v']):
