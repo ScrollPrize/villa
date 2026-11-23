@@ -101,7 +101,7 @@ For opt-in memory-pressure-aware budgets and selective compound-channel reads, s
 
 | Need | C++ API | Implementation | Python |
 | --- | --- | --- | --- |
-| Read tifxyz: metadata, shape, mask, windows, whole surface; list a folder | `tifxyz.hpp`: `tifxyz::read`, `Reader`, `readMetadata`, `parseMetadata`, `storedShape`, `readMask`, `list`, `vertexValid`, `fullExtent` | `tifxyz/tifxyz.cpp` | `tifxyz.py`: `read`, `read_metadata`, `stored_shape`, `read_mask`, `list_surfaces`, `full_extent` |
+| Read tifxyz: metadata, shape, mask, windows, whole surface; list a folder | `tifxyz.hpp`: `tifxyz::read`, `Reader`, `readMetadata`, `parseMetadata`, `storedShape`, `readMask`, `list`, `vertexValid`, `fullExtent`, `measureSpacing`, `checkScale` (vertex spacing against scale) | `tifxyz/tifxyz.cpp` | `tifxyz.py`: `read`, `read_metadata`, `stored_shape`, `read_mask`, `list_surfaces`, `full_extent` |
 | Write tifxyz with channels and rollback | `tifxyz.hpp`: `tifxyz::write`, `WriteOptions`, `Channel` | `tifxyz/tifxyz.cpp` | `tifxyz.write` |
 | In-memory surface: bounds, retargeting to another level, positions, normals and tangents | `tifxyz.hpp`: `tifxyz::Surface` | `tifxyz/tifxyz.cpp` | `tifxyz.Surface` |
 | Bilinear or bicubic Hermite interpolation of a vertex grid, with normals and tangents | `grid.hpp`: `grid::Surface`, `resample`, `pointsAt`, `snapshot`, `Raster`, `Interpolation` | `grid/grid.cpp`, `grid/points.hpp` | `tifxyz.Surface.resample`, `.points_at` |

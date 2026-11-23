@@ -336,24 +336,8 @@ std::array<std::int64_t, 2> storedShape(const std::string& location, const sourc
 
 namespace {
 
-// Median of neighbour distances along one axis; at most about 2^20 pairs, taken on a fixed stride.
-std::optional<double> medianStep(const float* xyz, std::int64_t rows, std::int64_t cols, bool alongRows)
+std::optional<double> median(std::vector<double>& d)
 {
-    const std::int64_t pairs = alongRows ? (rows - 1) * cols : rows * (cols - 1);
-    if (rows <= 0 || cols <= 0 || pairs <= 0) return std::nullopt;
-    const std::int64_t stride = std::max<std::int64_t>(1, pairs / (std::int64_t(1) << 20));
-    std::vector<double> d;
-    d.reserve(std::size_t(pairs / stride + 1));
-    for (std::int64_t k = 0; k < pairs; k += stride) {
-        std::int64_t r, c, r2, c2;
-        if (alongRows) r = k / cols, c = k % cols, r2 = r + 1, c2 = c;
-        else r = k / (cols - 1), c = k % (cols - 1), r2 = r, c2 = c + 1;
-        const float* a = xyz + (std::size_t(r) * std::size_t(cols) + std::size_t(c)) * 3;
-        const float* b = xyz + (std::size_t(r2) * std::size_t(cols) + std::size_t(c2)) * 3;
-        if (!vertexValid(a) || !vertexValid(b)) continue;
-        const double dx = double(a[0]) - b[0], dy = double(a[1]) - b[1], dz = double(a[2]) - b[2];
-        d.push_back(std::sqrt(dx * dx + dy * dy + dz * dz));
-    }
     if (d.empty()) return std::nullopt;
     auto mid = d.begin() + std::ptrdiff_t(d.size() / 2);
     std::nth_element(d.begin(), mid, d.end());
@@ -362,23 +346,56 @@ std::optional<double> medianStep(const float* xyz, std::int64_t rows, std::int64
 
 }  // namespace
 
-GridSpacing measureSpacing(const float* xyz, std::int64_t rows, std::int64_t cols)
+GridSpacing measureSpacing(const float* xyz, std::int64_t rows, std::int64_t cols, const SpacingOptions& options)
 {
-    return {medianStep(xyz, rows, cols, true), medianStep(xyz, rows, cols, false)};
-}
-
-double ScaleCheck::worst() const
-{
-    double out = 0;
-    for (const auto& d : deviation)
-        if (d) out = std::max(out, std::abs(*d));
+    GridSpacing out;
+    if (rows <= 0 || cols <= 0) return out;
+    const std::size_t stride = options.rowStride ? options.rowStride : std::size_t(cols) * 3;
+    const auto at = [&](std::int64_t r, std::int64_t c) { return xyz + std::size_t(r) * stride + std::size_t(c) * 3; };
+    const auto ok = [&](std::int64_t r, std::int64_t c) {
+        return options.valid ? options.valid[std::size_t(r) * std::size_t(cols) + std::size_t(c)] != 0 : vertexValid(at(r, c));
+    };
+    // One axis: pairs (r, c)-(r + dr, c + dc) on a lattice with the same step in both directions, so a
+    // subsample covers the whole grid instead of aliasing with its width.
+    const auto axis = [&](std::int64_t dr, std::int64_t dc) {
+        std::vector<double> d;
+        const std::int64_t pairs = (rows - dr) * (cols - dc);
+        if (pairs <= 0) return d;
+        std::int64_t step = 1;
+        if (options.maxPairs > 0 && pairs > options.maxPairs)
+            step = std::int64_t(std::ceil(std::sqrt(double(pairs) / double(options.maxPairs))));
+        for (std::int64_t r = 0; r + dr < rows; r += step)
+            for (std::int64_t c = 0; c + dc < cols; c += step) {
+                if (!ok(r, c) || !ok(r + dr, c + dc)) continue;
+                const float* a = at(r, c);
+                const float* b = at(r + dr, c + dc);
+                // Float differences, squares summed in double: the same arithmetic as cv::norm(b - a) on Vec3f, so
+                // callers that used it get identical values.
+                const float x = b[0] - a[0], y = b[1] - a[1], z = b[2] - a[2];
+                double s = 0;
+                s += double(x) * double(x);
+                s += double(y) * double(y);
+                s += double(z) * double(z);
+                const double v = std::sqrt(s);
+                if (std::isfinite(v) && v > 0) d.push_back(v);
+            }
+        return d;
+    };
+    auto alongRows = axis(1, 0), alongCols = axis(0, 1);
+    std::vector<double> both;
+    both.reserve(alongRows.size() + alongCols.size());
+    both.insert(both.end(), alongRows.begin(), alongRows.end());
+    both.insert(both.end(), alongCols.begin(), alongCols.end());
+    out.rows = median(alongRows);
+    out.cols = median(alongCols);
+    out.both = median(both);
     return out;
 }
 
-ScaleCheck checkScale(const float* xyz, std::int64_t rows, std::int64_t cols, const std::array<double, 2>& scale)
+ScaleCheck checkScale(const float* xyz, std::int64_t rows, std::int64_t cols, const std::array<double, 2>& scale, SpacingOptions options)
 {
     ScaleCheck out;
-    out.measured = measureSpacing(xyz, rows, cols);
+    out.measured = measureSpacing(xyz, rows, cols, options);
     if (out.measured.rows) out.deviation[0] = *out.measured.rows * scale[0] - 1;
     if (out.measured.cols) out.deviation[1] = *out.measured.cols * scale[1] - 1;
     return out;

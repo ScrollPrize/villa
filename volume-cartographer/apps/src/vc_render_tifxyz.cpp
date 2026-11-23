@@ -52,6 +52,9 @@ using Affine = vcr::catalog::Affine;
 // Logging infrastructure
 // ============================================================
 
+// Relative difference between a surface's scale and its measured vertex spacing above which it is reported
+// (and, with --strict-scale, not rendered). Keep the --strict-scale help text in step.
+static constexpr double kScaleTolerance = 0.10;
 static FILE* g_logFile = nullptr;       // non-null when --log-path active
 static std::string g_logPrefix;         // e.g. "[part 2/8] " — prepended when logging to file
 static bool g_flipNormals = false;      // negate surface normals (--flip-normals); reverses slice ordering along the normal
@@ -849,9 +852,9 @@ int main(int argc, char *argv[])
         // left-handed frame. So --flip-normals is usually what we want: it negates N so the
         // slice stack grows in front of the sheet rather than behind it.
         ("flip-normals", po::bool_switch()->default_value(false), "Negate surface normals (reverses slice ordering along the normal)")
-        // The output size comes from meta.json scale. A surface whose measured vertex spacing is more than 10% off
-        // that scale is rendered anyway with a warning; this switch skips it instead.
-        ("strict-scale", po::bool_switch()->default_value(false), "Skip a surface whose meta.json scale disagrees with its measured vertex spacing by more than 10%")
+        // The output size comes from the surface's scale (meta.json). A surface whose measured vertex spacing is more
+        // than kScaleTolerance off that scale is rendered anyway with a warning; this switch stops with an error instead.
+        ("strict-scale", po::bool_switch()->default_value(false), "Stop with an error instead of rendering a surface whose scale disagrees with its measured vertex spacing by more than 10%")
         // How the surface itself is resampled, as opposed to how the volume is
         // sampled along the normal (trilinear slices, nearest-voxel composites).
         ("surface-interpolation", po::value<std::string>()->default_value("bicubic"),
@@ -1356,29 +1359,40 @@ int main(int argc, char *argv[])
         }
         catch (...) { logPrintf(stderr, "Error loading: %s\n", seg_folder.string().c_str()); return false; }
 
-        // meta.json scale sets the output size below; check it against the grid it describes.
+        // The scale sets the output size below; check it against the grid it describes. Valid vertices are the
+        // ones this renderer uses (finite, not the -1 marker).
         {
-            const cv::Mat_<cv::Vec3f> grid = surf->rawPointsPtr()->isContinuous() ? *surf->rawPointsPtr() : surf->rawPointsPtr()->clone();
-            // QuadSurface keeps scale as (x, y) = (columns, rows); vcr::tifxyz takes (rows, columns).
-            const auto check = vcr::tifxyz::checkScale(reinterpret_cast<const float*>(grid.ptr()), grid.rows, grid.cols,
-                                                       {double(surf->_scale[1]), double(surf->_scale[0])});
-            if (check.worst() > 0.10) {
-                const char* names[2] = {"rows", "columns"};
-                const std::optional<double> spacing[2] = {check.measured.rows, check.measured.cols};
-                const double scales[2] = {double(surf->_scale[1]), double(surf->_scale[0])};
-                for (int a = 0; a < 2; ++a)
-                    if (check.deviation[a] && std::abs(*check.deviation[a]) > 0.10)
-                        logPrintf(stderr, "Warning: %s: meta.json scale %.6g means one vertex every %.3g voxels along %s, "
-                                  "but neighbouring vertices are %.3g voxels apart (%+.0f%%); the output will be %s along that axis.\n",
-                                  seg_folder.string().c_str(), scales[a], 1.0 / scales[a], names[a], *spacing[a],
-                                  100.0 * *check.deviation[a], *check.deviation[a] > 0 ? "squeezed" : "stretched");
-                if (strictScale) {
-                    logPrintf(stderr, "Skipping %s (--strict-scale).\n", seg_folder.string().c_str());
-                    return false;
+            const auto& points = *surf->rawPointsPtr();
+            std::vector<std::uint8_t> valid(std::size_t(points.rows) * std::size_t(points.cols));
+            for (int j = 0; j < points.rows; ++j)
+                for (int i = 0; i < points.cols; ++i) {
+                    const cv::Vec3f& p = points(j, i);
+                    valid[std::size_t(j) * std::size_t(points.cols) + std::size_t(i)] =
+                        p[0] != -1.0f && std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]);
                 }
+            // QuadSurface keeps scale as (x, y) = (columns, rows); vcr::tifxyz takes (rows, columns).
+            const std::array<double, 2> scale = {double(surf->_scale[1]), double(surf->_scale[0])};
+            vcr::tifxyz::SpacingOptions options;
+            options.valid = valid.data();
+            options.rowStride = points.step1();
+            options.maxPairs = std::int64_t(1) << 20;
+            const auto check = vcr::tifxyz::checkScale(reinterpret_cast<const float*>(points.ptr()), points.rows, points.cols, scale, options);
+            const char* names[2] = {"rows", "columns"};
+            const std::optional<double> spacing[2] = {check.measured.rows, check.measured.cols};
+            bool off = false;
+            for (int a = 0; a < 2; ++a)
+                if (check.deviation[a] && std::abs(*check.deviation[a]) > kScaleTolerance) {
+                    off = true;
+                    logPrintf(stderr, "Warning: %s: surface scale %.6g means one vertex every %.3g voxels along %s, "
+                              "but neighbouring vertices are %.3g voxels apart (%+.0f%%); the output will be %s along that axis.\n",
+                              seg_folder.string().c_str(), scale[a], 1.0 / scale[a], names[a], *spacing[a],
+                              100.0 * *check.deviation[a], *check.deviation[a] > 0 ? "squeezed" : "stretched");
+                }
+            if (off && strictScale) {
+                logPrintf(stderr, "Not rendering %s (--strict-scale).\n", seg_folder.string().c_str());
+                return false;
             }
         }
-
 
         // Replace sentinel -1 with NaN
         auto* raw_points = surf->rawPointsPtr();

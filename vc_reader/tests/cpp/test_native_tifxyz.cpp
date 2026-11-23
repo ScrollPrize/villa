@@ -38,7 +38,7 @@ static tifxyz::Surface plane(int rows, int cols, double scale, const std::string
     return tifxyz::Surface(rows, cols, std::move(xyz), {}, std::move(metadata));
 }
 
-// checkScale: the plane's vertices are 3 voxels apart along rows and 2 along columns.
+// measureSpacing / checkScale: the plane's vertices are 3 voxels apart along rows and 2 along columns.
 static void scaleCheck()
 {
     auto surface = plane(40, 50, 0.05, "");
@@ -46,19 +46,55 @@ static void scaleCheck()
     const auto exact = tifxyz::checkScale(xyz, 40, 50, {1.0 / 3, 0.5});
     CHECK(exact.measured.rows && std::abs(*exact.measured.rows - 3) < 1e-9);
     CHECK(exact.measured.cols && std::abs(*exact.measured.cols - 2) < 1e-9);
-    CHECK(exact.worst() < 1e-9);
+    CHECK(std::abs(*exact.deviation[0]) < 1e-9 && std::abs(*exact.deviation[1]) < 1e-9);
+    // 39 x 50 pairs of 3 and 40 x 49 of 2: the lower median of both is 2.
+    CHECK(exact.measured.both && std::abs(*exact.measured.both - 2) < 1e-9);
     const auto off = tifxyz::checkScale(xyz, 40, 50, {0.25, 0.25});
     CHECK(std::abs(*off.deviation[0] + 0.25) < 1e-9 && std::abs(*off.deviation[1] + 0.5) < 1e-9);
-    CHECK(std::abs(off.worst() - 0.5) < 1e-9);
-    // Invalid vertices (negative marker, NaN) are left out; a single row has no spacing along rows.
+
+    // Invalid vertices (negative marker, NaN) and zero distances (collapsed vertices) are left out.
     std::vector<float> holes(surface.xyz());
     for (int c = 0; c < 50; c += 2) holes[(std::size_t(7) * 50 + std::size_t(c)) * 3] = -1;
     holes[(std::size_t(8) * 50 + 3) * 3 + 2] = std::nanf("");
-    CHECK(tifxyz::checkScale(holes.data(), 40, 50, {1.0 / 3, 0.5}).worst() < 1e-9);
+    for (int r = 20; r < 40; ++r)
+        for (int c = 0; c < 50; ++c) {
+            float* p = &holes[(std::size_t(r) * 50 + std::size_t(c)) * 3];
+            p[0] = 10, p[1] = 20, p[2] = 30;  // the lower half collapsed onto one point
+        }
+    const auto collapsed = tifxyz::measureSpacing(holes.data(), 40, 50);
+    CHECK(std::abs(*collapsed.rows - 3) < 1e-9 && std::abs(*collapsed.cols - 2) < 1e-9);
+
+    // An explicit validity array and a row stride (a padded buffer) give the same result.
+    std::vector<float> padded(std::size_t(40) * 52 * 3, 7.0f);
+    std::vector<std::uint8_t> valid(std::size_t(40) * 50, 1);
+    for (int r = 0; r < 40; ++r) std::copy_n(&xyz[std::size_t(r) * 150], 150, &padded[std::size_t(r) * 156]);
+    valid[5 * 50 + 5] = 0;
+    tifxyz::SpacingOptions options;
+    options.valid = valid.data();
+    options.rowStride = 52 * 3;
+    const auto strided = tifxyz::measureSpacing(padded.data(), 40, 50, options);
+    CHECK(std::abs(*strided.rows - 3) < 1e-9 && std::abs(*strided.cols - 2) < 1e-9);
+
+    // A lattice subsample of a large grid still covers it: the right half is twice as far apart along columns,
+    // so a subsample that aliased onto the left columns would report 2.
+    const int rows = 300, cols = 4000;
+    std::vector<float> wide(std::size_t(rows) * cols * 3);
+    for (int r = 0; r < rows; ++r)
+        for (int c = 0; c < cols; ++c) {
+            float* p = &wide[(std::size_t(r) * cols + std::size_t(c)) * 3];
+            p[0] = c < cols / 4 ? float(c) * 2 : float(cols / 4) * 2 + float(c - cols / 4) * 4, p[1] = float(r) * 3, p[2] = 5;
+        }
+    tifxyz::SpacingOptions lattice;
+    lattice.maxPairs = 10000;
+    const auto sampled = tifxyz::measureSpacing(wide.data(), rows, cols, lattice);
+    CHECK(std::abs(*sampled.cols - 4) < 1e-9 && std::abs(*sampled.rows - 3) < 1e-9);
+
+    // A single row has no spacing along rows; an empty grid has none at all.
     const auto row = tifxyz::checkScale(xyz, 1, 50, {1.0 / 3, 0.5});
     CHECK(!row.measured.rows && !row.deviation[0] && row.measured.cols);
     std::vector<float> none(std::size_t(4) * 5 * 3, -1.0f);
-    CHECK(tifxyz::checkScale(none.data(), 4, 5, {1, 1}).worst() == 0);
+    const auto empty = tifxyz::checkScale(none.data(), 4, 5, {1, 1});
+    CHECK(!empty.deviation[0] && !empty.deviation[1] && !empty.measured.both);
 }
 
 int main()
