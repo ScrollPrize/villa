@@ -33,8 +33,7 @@ def lock_exclusive(handle):
     if fcntl is not None:
         fcntl.flock(handle, fcntl.LOCK_EX)
         return
-    # msvcrt locks one byte range and gives up after ~10 s (LK_LOCK); wait on
-    # contention only, any other error is real and must surface.
+    # Wait on contention only; any other error is real and must surface.
     while True:
         if try_lock(handle):
             return
@@ -53,31 +52,20 @@ def try_lock(handle, offset=0, shared=False):
             if exc.errno not in (errno.EACCES, errno.EAGAIN):
                 raise
             return False
-    if shared:
-        return _windows_shared(handle, offset)
-    handle.seek(offset)
-    try:
-        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-        return True
-    except OSError as exc:
-        if exc.errno not in (errno.EACCES, errno.EDEADLK):
-            raise
-        return False
+    return _windows_lock(handle, offset, shared)
 
 
 def unlock(handle, offset=0, shared=False):
     if fcntl is not None:
         fcntl.flock(handle, fcntl.LOCK_UN)
         return
-    if shared:
-        _windows_unlock_shared(handle, offset)
-        return
-    handle.seek(offset)
-    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    _windows_unlock(handle, offset)
 
 
-# msvcrt has no shared lock; LockFileEx has, on the same byte ranges msvcrt locks.
+# One byte locked with LockFileEx, the call under msvcrt.locking, which has no shared lock
+# (and whose errno on a refusal is not reliable under Wine); the Win32 error is.
 _LOCKFILE_FAIL_IMMEDIATELY = 0x1
+_LOCKFILE_EXCLUSIVE_LOCK = 0x2
 _ERROR_LOCK_VIOLATION = 33
 _ERROR_IO_PENDING = 997
 
@@ -93,12 +81,12 @@ def _overlapped(offset):
     return Overlapped(0, 0, offset & 0xFFFFFFFF, offset >> 32, None)
 
 
-def _windows_shared(handle, offset):
+def _windows_lock(handle, offset, shared):
     import ctypes
-    kernel = _kernel32()
+    flags = _LOCKFILE_FAIL_IMMEDIATELY | (0 if shared else _LOCKFILE_EXCLUSIVE_LOCK)
     overlapped = _overlapped(offset)
-    if kernel.LockFileEx(msvcrt.get_osfhandle(handle.fileno()), _LOCKFILE_FAIL_IMMEDIATELY, 0,
-                         1, 0, ctypes.byref(overlapped)):
+    if _kernel32().LockFileEx(msvcrt.get_osfhandle(handle.fileno()), flags, 0, 1, 0,
+                              ctypes.byref(overlapped)):
         return True
     code = ctypes.get_last_error()
     if code in (_ERROR_LOCK_VIOLATION, _ERROR_IO_PENDING):
@@ -106,7 +94,7 @@ def _windows_shared(handle, offset):
     raise ctypes.WinError(code)
 
 
-def _windows_unlock_shared(handle, offset):
+def _windows_unlock(handle, offset):
     import ctypes
     overlapped = _overlapped(offset)
     if not _kernel32().UnlockFileEx(msvcrt.get_osfhandle(handle.fileno()), 0, 1, 0,

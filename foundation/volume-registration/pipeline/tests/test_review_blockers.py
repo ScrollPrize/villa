@@ -1,6 +1,6 @@
 """Redo against queued jobs, background launch, stale-lock recovery, settings saves, volume
 names. Windows-only branches are run on any system by putting the Windows primitive in their
-place (a `msvcrt` over POSIX byte locks, `windows()` answering yes)."""
+place (LockFileEx over POSIX byte locks, `windows()` answering yes)."""
 
 import errno
 import json
@@ -30,32 +30,14 @@ REVIEWER = {"handle": "test", "email": "test@example.org"}
 
 # ------------------------------------------------------------------- a Windows byte lock
 
-class FakeMsvcrt:
-    """`msvcrt.locking` over POSIX record locks: a byte at the handle's position, locked or
-    refused at once. Process-wide, as Windows byte locks are per handle but contend the same
-    way between processes."""
-    LK_LOCK, LK_NBLCK, LK_UNLCK = 1, 2, 0
-
-    @staticmethod
-    def locking(fd, mode, nbytes):
-        import fcntl
-        position = os.lseek(fd, 0, os.SEEK_CUR)
-        try:
-            if mode == FakeMsvcrt.LK_UNLCK:
-                fcntl.lockf(fd, fcntl.LOCK_UN, nbytes, position)
-            else:
-                fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB, nbytes, position)
-        except OSError as exc:
-            if exc.errno in (errno.EAGAIN, errno.EACCES):
-                raise OSError(errno.EACCES, "locked") from None
-            raise
-
-
-def fake_shared(handle, offset):
-    """LockFileEx's shared byte lock, over a POSIX shared record lock."""
+def fake_windows_lock(handle, offset, shared):
+    """LockFileEx on one byte, refused at once, over a POSIX record lock on that byte.
+    Process-wide, as Windows byte locks are per handle but contend the same way between
+    processes."""
     import fcntl
     try:
-        fcntl.lockf(handle.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB, 1, offset)
+        fcntl.lockf(handle.fileno(), (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | fcntl.LOCK_NB,
+                    1, offset)
         return True
     except OSError as exc:
         if exc.errno in (errno.EAGAIN, errno.EACCES):
@@ -63,18 +45,17 @@ def fake_shared(handle, offset):
         raise
 
 
-def fake_unlock_shared(handle, offset):
+def fake_windows_unlock(handle, offset):
     import fcntl
     fcntl.lockf(handle.fileno(), fcntl.LOCK_UN, 1, offset)
 
 
 def as_windows_locks(monkeypatch):
     if WINDOWS:
-        return      # the real msvcrt, LockFileEx, process_token and pid_alive
+        return      # the real LockFileEx, process_token and pid_alive
     monkeypatch.setattr(filelock, "fcntl", None)
-    monkeypatch.setattr(filelock, "msvcrt", FakeMsvcrt, raising=False)
-    monkeypatch.setattr(filelock, "_windows_shared", fake_shared)
-    monkeypatch.setattr(filelock, "_windows_unlock_shared", fake_unlock_shared)
+    monkeypatch.setattr(filelock, "_windows_lock", fake_windows_lock)
+    monkeypatch.setattr(filelock, "_windows_unlock", fake_windows_unlock)
     monkeypatch.setattr(filelock, "process_token", lambda pid=None: 4242 if pid is None else None)
     monkeypatch.setattr(filelock, "pid_alive", lambda pid, token=None: pid == os.getpid())
 
