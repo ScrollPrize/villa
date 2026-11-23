@@ -9,6 +9,8 @@ import numpy as np
 
 from vesuvius.ink_detection.types import Patch, Segment
 
+_VALIDATION_READ_BLOCK = 4096
+
 
 def _label_tile_is_empty(label_tile: np.ndarray) -> bool:
     tile = np.asarray(label_tile)
@@ -301,7 +303,6 @@ def find_segment_patches(
 
     ink_plane = np.asarray(inklabels[ink_surface])
     supervision_plane = np.asarray(supervision[surface])
-    validation_plane = None if validation is None else np.asarray(validation[validation_surface])
 
     _, xyxys, _ = build_patch_index(
         ink_plane,
@@ -321,23 +322,32 @@ def find_segment_patches(
     min_cov = finding.min_labeled_coverage
     ink_unsigned = np.issubdtype(ink_plane.dtype, np.unsignedinteger)
 
-    val_flags = (
-        None
-        if validation_plane is None
-        else _validation_patch_flags(validation_plane, xyxys, size=size, stride=stride)
-    )
+    n = xyxys.shape[0]
+    val_flags = np.zeros(n, dtype=np.bool_)
+    val_training = np.ones(n, dtype=np.bool_)
+    if validation is not None and n:
+        # Read validation per block of candidates so distant groups do not load the gaps between them.
+        keys = (xyxys[:, 1] // _VALIDATION_READ_BLOCK) * (supervision_plane.shape[1] + 1) + xyxys[:, 0] // _VALIDATION_READ_BLOCK
+        order = np.argsort(keys, kind="stable")
+        for sel in np.split(order, np.flatnonzero(np.diff(keys[order])) + 1):
+            boxes = xyxys[sel]
+            vx0, vy0 = (int(v) for v in boxes[:, :2].min(axis=0))
+            vx1, vy1 = (int(v) for v in boxes[:, 2:].max(axis=0))
+            crop = np.asarray(validation[validation_surface, vy0:vy1, vx0:vx1])
+            local = boxes - [vx0, vy0, vx0, vy0]
+            flags = _validation_patch_flags(crop, local, size=size, stride=stride)
+            val_flags[sel] = flags
+            for i, (x, y, _, _) in zip(sel[flags].tolist(), local[flags].tolist()):
+                supervision_patch = supervision_plane[y + vy0 : y + vy0 + ph, x + vx0 : x + vx0 + pw]
+                val_training[i] = np.any(supervision_patch & ~crop[y : y + ph, x : x + pw])
 
     for idx, (x1, y1, _, _) in enumerate(xyxys.tolist()):
         y1 = int(y1)
         x1 = int(x1)
         bbox = (z0, y1, x1, z1, y1 + ph, x1 + pw)
         # build_patch_index only emits patches fully covered by nonzero supervision_plane.
-        has_training = True
-        has_validation = False if val_flags is None else bool(val_flags[idx])
-        if has_validation:
-            supervision_patch = supervision_plane[y1 : y1 + ph, x1 : x1 + pw]
-            validation_patch = validation_plane[y1 : y1 + ph, x1 : x1 + pw]
-            has_training = bool(np.any(supervision_patch & ~validation_patch))
+        has_training = bool(val_training[idx])
+        if val_flags[idx]:
             held_out.append(
                 Patch(
                     segment=segment,
