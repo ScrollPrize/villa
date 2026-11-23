@@ -139,6 +139,8 @@ ScaffoldMeasuredOptions measuredOptionsFrom(const Json& cfg)
     options.perpendicularWeight = weights.value("perpendicular", options.perpendicularWeight);
     options.parallelWeight = weights.value("parallel", options.parallelWeight);
     options.enclosureWeight = weights.value("enclosure", options.enclosureWeight);
+    options.signWeight = weights.value("sign", options.signWeight);
+    options.crossingConfidence = weights.value("crossing_confidence", options.crossingConfidence);
     options.perpendicularOffset = section.value("perpendicular_offset", options.perpendicularOffset);
     options.windingScale = section.value("winding_scale", options.windingScale);
     options.enclosures = section.value("enclosures", options.enclosures);
@@ -254,6 +256,8 @@ Json constraintJson(const ScaffoldGraph& graph, const ScaffoldConstraint& constr
 {
     Json value{{"a", graph.fibers[std::size_t(constraint.a)].uuid},
                {"b", graph.fibers[std::size_t(constraint.b)].uuid},
+               {"kind", vc::fiber_graph::scaffoldConstraintKindName(constraint.kind)},
+               {"winding_distance", std::isfinite(constraint.windingDistance) ? Json(constraint.windingDistance) : Json(nullptr)},
                {"arc_a_vx", constraint.arcA},
                {"arc_b_vx", constraint.arcB},
                {"step", constraint.step},
@@ -326,6 +330,7 @@ int run(const std::string& configPath)
         }
         measuredOptions = measuredOptionsFrom(cfg);
         signOptions = signOptionsFrom(cfg);
+        measuredOptions->confidence = signOptions->sign;
         std::unique_ptr<vc::lasagna::LasagnaNormalSampler> sampler;
         ScaffoldWindingDistances distances;
         if (eventOptions->measureWindingDistances) {
@@ -359,6 +364,7 @@ int run(const std::string& configPath)
         // every vertex, weighted by its presence, pulls the strip normals.
         // The annotation's anchors still win at the nodes they fix.
         ScaffoldAxisSampler axisSampler;
+        vc::fiber_graph::ScaffoldNeighbourSource neighbourSource;
         const auto normalSource = cfg.value("normals", Json::object()).value("source", std::string{"geometry"});
         std::shared_ptr<vc::lasagna::LasagnaDataset> predictionDataset, sheetDataset;
         std::shared_ptr<vc::lasagna::LasagnaNormalSampler> sheetSampler;
@@ -405,8 +411,25 @@ int run(const std::string& configPath)
                 }
                 return out;
             };
+        } else if (normalSource == "neighbours") {
+            // The signed normals of a resolved fiber volume, around every fiber.
+            const auto section = cfg.value("neighbours", Json::object());
+            if (!section.contains("samples"))
+                throw std::invalid_argument("normals.source neighbours needs neighbours.samples");
+            auto& neighbour = normalOptions->neighbours;
+            neighbour.weight = section.value("weight", neighbour.weight);
+            neighbour.sigma = section.value("sigma", neighbour.sigma);
+            neighbour.minimumCoverage = section.value("minimum_coverage", neighbour.minimumCoverage);
+            neighbour.fieldCrossings = section.value("field_crossings", neighbour.fieldCrossings);
+            neighbour.scaffoldCrossings = section.value("scaffold_crossings", neighbour.scaffoldCrossings);
+            neighbour.crossing.weight = section.value("crossing_weight", neighbour.crossing.weight);
+            neighbourSource = vc::fiber_graph::openScaffoldNeighbourSource(section.at("samples").get<std::string>(),
+                                                                           neighbour.variant.radius);
+            neighbour.field = neighbourSource.field.get();
+            neighbour.identity = neighbourSource.identity;
+            neighbour.volume = neighbourSource.volume;
         } else if (normalSource != "geometry") {
-            throw std::invalid_argument("normals.source must be geometry or fused");
+            throw std::invalid_argument("normals.source must be geometry, fused or neighbours");
         }
         auto started = Clock::now();
         normals.emplace(graph, geometry, *normalOptions, axisSampler);
@@ -469,7 +492,11 @@ int run(const std::string& configPath)
                                    result.constraintsByKind[std::size_t(ScaffoldConstraintKind::Perpendicular)]},
                                   {"parallel", result.constraintsByKind[std::size_t(ScaffoldConstraintKind::Parallel)]},
                                   {"enclosure",
-                                   result.constraintsByKind[std::size_t(ScaffoldConstraintKind::Enclosure)]}}},
+                                   result.constraintsByKind[std::size_t(ScaffoldConstraintKind::Enclosure)]},
+                                  {"sign_at_least",
+                                   result.constraintsByKind[std::size_t(ScaffoldConstraintKind::SignAtLeast)]},
+                                  {"sign_at_most",
+                                   result.constraintsByKind[std::size_t(ScaffoldConstraintKind::SignAtMost)]}}},
         {"timings", Json{{"store_read_seconds", readSeconds},
                          {"geometry_seconds", geometrySeconds},
                          {"normals_seconds", normalSeconds},
@@ -510,6 +537,15 @@ int run(const std::string& configPath)
                                   {"nodes_with_axis", normalReport.nodesWithAxis},
                                   {"mean_axis_weight", normalReport.meanAxisWeight},
                                   {"prediction_seconds", normalReport.predictionSeconds},
+                                  {"neighbour_samples", normalReport.neighbourSamples},
+                                  {"neighbour_samples_answered", normalReport.neighbourSamplesAnswered},
+                                  {"neighbour_nodes", normalReport.neighbourNodes},
+                                  {"neighbour_fibers_covered", normalReport.neighbourCoveredFibers},
+                                  {"neighbour_fibers_faced", normalReport.neighbourFacedFibers},
+                                  {"crossings_field", normalReport.fieldCrossings},
+                                  {"crossings_scaffold", normalReport.scaffoldCrossings},
+                                  {"crossed_nodes", normalReport.crossedNodes},
+                                  {"neighbour_seconds", normalReport.neighbourSeconds},
                                   {"seconds", normalReport.seconds}};
         summary["events"] = Json{{"reused_pairs", eventReport.reusedPairs},
                                  {"reused_events", eventReport.reusedEvents},
@@ -557,6 +593,7 @@ int run(const std::string& configPath)
                                    {"skipped_untagged", measuredReport.skippedUntagged},
                                    {"skipped_self", measuredReport.skippedSelf},
                                    {"skipped_family_mismatch", measuredReport.skippedFamilyMismatch},
+                                   {"sign_constraints", measuredReport.signConstraints},
                                    {"enclosure_pairs", measuredReport.enclosurePairs},
                                    {"enclosure_arcs", measuredReport.enclosureArcs},
                                    {"enclosure_one_sided", measuredReport.enclosureOneSided},
@@ -578,6 +615,7 @@ int run(const std::string& configPath)
         if (measure) {
             stages.normalOptions = &*normalOptions;
             stages.normals = &normals->report();
+            stages.normalRows = normals->cacheRows();
             stages.eventOptions = &*eventOptions;
             stages.events = &eventReport;
             stages.measuredOptions = &*measuredOptions;

@@ -110,6 +110,7 @@ ScaffoldRunRows scaffoldSolveRunRows(const ScaffoldGraph& graph, const ScaffoldS
         // Which normals the run used: the prediction states a sheet axis only
         // on a fused run, so its own count is the honest answer.
         settings.emplace("normals_fused", stages.normals && stages.normals->predictedVertices > 0);
+        settings.emplace("normals_neighbours", stages.normalOptions->neighbours.field != nullptr);
         settings.emplace("normals_twist_weight", stages.normalOptions->strip.twistWeight);
         settings.emplace("normals_lateral_weight", stages.normalOptions->strip.lateralWeight);
         settings.emplace("normals_smoothing_sigma", stages.normalOptions->strip.smoothingSigma);
@@ -134,6 +135,8 @@ ScaffoldRunRows scaffoldSolveRunRows(const ScaffoldGraph& graph, const ScaffoldS
         settings.emplace("weight_perpendicular", stages.measuredOptions->perpendicularWeight);
         settings.emplace("weight_parallel", stages.measuredOptions->parallelWeight);
         settings.emplace("weight_enclosure", stages.measuredOptions->enclosureWeight);
+        settings.emplace("weight_sign", stages.measuredOptions->signWeight);
+        settings.emplace("weight_crossing_confidence", stages.measuredOptions->crossingConfidence);
         settings.emplace("perpendicular_offset", stages.measuredOptions->perpendicularOffset);
         settings.emplace("winding_scale", stages.measuredOptions->windingScale);
         settings.emplace("enclosures", stages.measuredOptions->enclosures);
@@ -164,6 +167,24 @@ ScaffoldRunRows scaffoldSolveRunRows(const ScaffoldGraph& graph, const ScaffoldS
     add(FiberGraphTable::Runs,
         {objects::fiberGraphRunRow(record.runUuid, record.stage, "scaffold_lemon_" + backend, settings).values});
     add(FiberGraphTable::Inputs, {objects::fiberGraphInputRow(record.runUuid, "input_0", record.input).values});
+    // The normals the run used, by reference: one row per fiber.
+    if (stages.normals) {
+        if (stages.normalRows.size() != graph.fibers.size())
+            throw std::invalid_argument("scaffold run: the run solved normals but states no normals row per fiber");
+        std::vector<ExtensionRow> references;
+        references.reserve(graph.fibers.size());
+        for (std::size_t i = 0; i < graph.fibers.size(); ++i) {
+            const auto& fiber = graph.fibers[i];
+            if (stages.normalRows[i].empty() || !fiber.version)
+                throw std::runtime_error("scaffold run: the normals of fiber " + fiber.uuid + " (" + fiber.name +
+                                         ") have no stored row, so the run cannot reference them");
+            references.push_back(objects::fiberScaffoldRunNormalsRow(
+                {record.runUuid, fiber.uuid, *fiber.version, stages.normalRows[i]}));
+        }
+        const auto table = objects::fiberScaffoldRunNormalsTable();
+        out.tables.push_back(table);
+        out.rows.emplace_back(table.name, std::move(references));
+    }
 
     std::vector<ExtensionRow> fibers;
     fibers.reserve(graph.fibers.size());
@@ -236,6 +257,10 @@ ScaffoldRunRows scaffoldSolveRunRows(const ScaffoldGraph& graph, const ScaffoldS
     count("perpendicular_constraints", result.constraintsByKind[std::size_t(ScaffoldConstraintKind::Perpendicular)], "constraints");
     count("parallel_constraints", result.constraintsByKind[std::size_t(ScaffoldConstraintKind::Parallel)], "constraints");
     count("enclosure_constraints", result.constraintsByKind[std::size_t(ScaffoldConstraintKind::Enclosure)], "constraints");
+    count("sign_constraints",
+          result.constraintsByKind[std::size_t(ScaffoldConstraintKind::SignAtLeast)] +
+              result.constraintsByKind[std::size_t(ScaffoldConstraintKind::SignAtMost)],
+          "constraints");
     if (stages.normals) {
         count("normal_fibers_solved", stages.normals->solved, "fibers");
         count("normal_fibers_reused", stages.normals->reused, "fibers");
@@ -245,6 +270,17 @@ ScaffoldRunRows scaffoldSolveRunRows(const ScaffoldGraph& graph, const ScaffoldS
         count("normal_anchors_manual", stages.normals->manualAnchors, "anchors");
         count("normal_anchors_approved_piece", stages.normals->approvedPieceAnchors, "anchors");
         count("normal_anchors_adjacent_link", stages.normals->adjacentLinkAnchors, "anchors");
+        if (stages.normalOptions && stages.normalOptions->neighbours.field) {
+            count("neighbour_samples", stages.normals->neighbourSamples, "samples");
+            count("neighbour_samples_answered", stages.normals->neighbourSamplesAnswered, "samples");
+            count("neighbour_nodes", stages.normals->neighbourNodes, "nodes");
+            count("neighbour_fibers_covered", stages.normals->neighbourCoveredFibers, "fibers");
+            count("neighbour_fibers_faced", stages.normals->neighbourFacedFibers, "fibers");
+            count("crossings_field", stages.normals->fieldCrossings, "crossings");
+            count("crossings_scaffold", stages.normals->scaffoldCrossings, "crossings");
+            count("crossed_nodes", stages.normals->crossedNodes, "nodes");
+            metric("neighbour_seconds", stages.normals->neighbourSeconds, "seconds");
+        }
         metric("normals_seconds", stages.normals->seconds, "seconds");
     }
     if (stages.events) {
@@ -404,6 +440,9 @@ std::vector<ScaffoldStoredRun> readScaffoldRuns(const objects::StoreReader& read
                     entry.createdAtUnix = settings["created_at_unix"].get<std::int64_t>();
                 if (settings.contains("normals_fused") && settings["normals_fused"].is_boolean())
                     entry.normalSource = settings["normals_fused"].get<bool>() ? "fused" : "geometry";
+                if (settings.contains("normals_neighbours") && settings["normals_neighbours"].is_boolean() &&
+                    settings["normals_neighbours"].get<bool>())
+                    entry.normalSource = "neighbours";
                 if (settings.contains("sign_backend_ceres") && settings["sign_backend_ceres"].is_boolean())
                     entry.signBackend = settings["sign_backend_ceres"].get<bool>() ? "ceres" : "irls";
             }
@@ -503,45 +542,20 @@ std::vector<ScaffoldStoredResidual> readResidualRows(const objects::StoreReader&
 }
 } // namespace
 
-std::optional<std::vector<double>> readScaffoldFiberNormals(const objects::StoreReader& reader,
-                                                            const std::string& fiberUuid, bool fused,
-                                                            std::size_t linePoints)
+std::vector<double> readScaffoldRunFiberNormals(const objects::StoreReader& reader, const std::string& runUuid,
+                                                const std::string& fiberUuid, std::size_t linePoints)
 {
-    if (fiberUuid.empty()) throw std::invalid_argument("scaffold run: a fiber UUID is required");
-    // Columns as fiberScaffoldNormalsTable declares them; the rows of one
-    // fiber are a primary-key prefix.
-    const auto table = objects::fiberScaffoldNormalsTable();
-    const auto column = [&](const char* name) {
-        for (std::size_t i = 0; i < table.columns.size(); ++i)
-            if (table.columns[i].name == name) return i;
-        throw std::logic_error("scaffold run: the normals table has no such column");
-    };
-    const auto versionAt = column("fiber_version"), inputsAt = column("inputs"), normalsAt = column("normals"),
-               computedAt = column("computed_at");
-    const std::vector<ExtensionValue> prefix{uuidValue(fiberUuid)};
-    std::optional<std::vector<double>> best;
-    std::int64_t bestVersion = -1;
-    std::string bestComputed;
-    try {
-        reader.scanExtensionRows(table.name, [&](const ExtensionRow& row) {
-            const auto& blob = std::get<std::vector<std::uint8_t>>(row.at(normalsAt));
-            if (blob.size() != linePoints * 3 * sizeof(double)) return true;
-            // A fused row states the prediction it read (scaffoldNormalInputs).
-            const auto& inputs = std::get<std::string>(row.at(inputsAt));
-            if ((inputs.find("prediction=") != std::string::npos) != fused) return true;
-            const auto version = std::get<std::int64_t>(row.at(versionAt));
-            const auto& computed = std::get<std::string>(row.at(computedAt));
-            if (best && std::tie(version, computed) <= std::tie(bestVersion, bestComputed)) return true;
-            bestVersion = version;
-            bestComputed = computed;
-            best.emplace(linePoints * 3);
-            std::memcpy(best->data(), blob.data(), blob.size());
-            return true;
-        }, prefix);
-    } catch (const std::invalid_argument&) {
-        // No such table in this store: no measured run ever cached a normal.
-    }
-    return best;
+    if (runUuid.empty() || fiberUuid.empty())
+        throw std::invalid_argument("scaffold run: a run and a fiber UUID are required");
+    const auto row = objects::readFiberScaffoldRunNormals(reader, runUuid, fiberUuid);
+    if (row.normals.size() != linePoints * 3 * sizeof(double))
+        throw std::runtime_error("the run's normals cover " + std::to_string(row.normals.size() / (3 * sizeof(double))) +
+                                 " line points of fiber " + fiberUuid + " at version " +
+                                 std::to_string(row.fiberVersion) + ", the fiber now has " +
+                                 std::to_string(linePoints) + ": it was edited since the run; solve again");
+    std::vector<double> normals(linePoints * 3);
+    std::memcpy(normals.data(), row.normals.data(), row.normals.size());
+    return normals;
 }
 
 std::map<std::string, ScaffoldStoredWinding> readScaffoldWindings(const objects::StoreReader& reader,

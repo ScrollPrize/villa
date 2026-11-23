@@ -12038,6 +12038,13 @@ std::vector<cv::Vec3f> LineAnnotationController::orientedLineNormalsForSession(
             std::nth_element(distances.begin(), distances.begin() + distances.size() / 2, distances.end());
             // Half of the line within 64 voxels of the solve's: the same frame.
             if (distances[distances.size() / 2] <= 64.f * 64.f) return normals;
+            // The fiber is under review against a solve whose line is
+            // somewhere else: no other normals stand in for the solve's.
+            throw std::runtime_error(
+                "the solve's normals for this fiber lie " +
+                std::to_string(std::sqrt(double(distances[distances.size() / 2]))) +
+                " voxels (median) from its line here: the solve ran in another volume or scale than the one "
+                "open, or the fiber moved since; open the solve's volume or solve again");
         }
     }
 
@@ -12121,7 +12128,15 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
     // normals oriented away from the scroll center so the bottom strip's
     // vertical, the display ups, and the cut views all agree per fiber and
     // across rebuilds.
-    std::vector<cv::Vec3f> orientedNormals = orientedLineNormalsForSession(session);
+    std::vector<cv::Vec3f> orientedNormals;
+    try {
+        orientedNormals = orientedLineNormalsForSession(session);
+    } catch (const std::exception& ex) {
+        session.error = ex.what();
+        showError(tr("Could not create line annotation views: %1").arg(QString::fromStdString(session.error)),
+                  session.suppressErrorDialogs);
+        return false;
+    }
     session.displayField = displayFieldForSession(session, orientedNormals);
     for (const size_t index : session.displayField.resetControls)
         session.controlPoints[index].displayNormal.reset();
@@ -12160,7 +12175,12 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
             viewConfig.controlPointLinePositions.push_back(control.linePosition);
         }
         viewConfig.orientedPointNormals = orientedNormals;
-        if (hasManualNormals)
+        // The strip is built from the display normals where the fiber has
+        // any: its manual normals, or - for a fiber under review against a
+        // scaffold solve - that solve's normals, which are then the strip's
+        // normals and, through it, the cut views'.
+        const bool underSolveReview = session.fiberId != 0 && _solverLineNormals.contains(session.fiberId);
+        if (hasManualNormals || underSolveReview)
             viewConfig.displayPointNormals = session.displayField.normals;
         // Only lineUpVectors is consumed below; skip the per-line-point
         // PlaneSurface allocations.

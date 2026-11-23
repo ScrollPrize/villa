@@ -1,4 +1,5 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+#include <algorithm>
 #include <doctest/doctest.h>
 
 #include "vc/core/util/PlaneSurface.hpp"
@@ -59,6 +60,22 @@ void checkVec(const cv::Vec3f& actual, const cv::Vec3d& expected)
     CHECK(actual[0] == doctest::Approx(expected[0]));
     CHECK(actual[1] == doctest::Approx(expected[1]));
     CHECK(actual[2] == doctest::Approx(expected[2]));
+}
+
+// The cut up at every line point is the strip's own normal there: the
+// direction the side slice's rows are offset in at that point's column.
+void checkUpsAreTheStripNormal(const vc::lasagna::LineViewSurfaces& views)
+{
+    const auto side = views.lineSideSlice->rawPoints();
+    for (size_t i = 0; i < views.lineUpVectors.size(); ++i) {
+        const double column = views.stripPositionMap.originalPositionToStripGridColumn(static_cast<double>(i));
+        const int col = std::clamp(static_cast<int>(std::llround(column)), 0, side.cols - 1);
+        cv::Vec3f stripNormal = side(side.rows - 1, col) - side(0, col);
+        stripNormal /= static_cast<float>(cv::norm(stripNormal));
+        const cv::Vec3f up = views.lineUpVectors[i];
+        CHECK(cv::norm(up) == doctest::Approx(1.0));
+        CHECK(std::abs(up.dot(stripNormal)) > 0.999);
+    }
 }
 
 bool finitePoint(const cv::Vec3f& point)
@@ -278,22 +295,12 @@ TEST_CASE("LineViewBuilder flips frames and ups to agree with oriented point nor
     }
 }
 
-TEST_CASE("LineViewBuilder oriented point normals pin ups against a moving display anchor")
+TEST_CASE("LineViewBuilder oriented point normals pin the ups whatever the display anchor")
 {
-    // Alternating sampled normals: without hints the display anchor picks the
-    // global up sign, so anchors 1 and 2 produce opposite ups.
+    // Alternating sampled normals. The ups are the strip's normals; the
+    // caller's oriented normals decide their sign, and the display anchor
+    // does not enter.
     auto line = alternatingNormalLine();
-
-    line.displayFrameAnchorIndex = 1;
-    const auto anchorOne = vc::lasagna::buildLineViewSurfaces(line);
-    line.displayFrameAnchorIndex = -1;
-    const auto anchorFallback = vc::lasagna::buildLineViewSurfaces(line);
-
-    REQUIRE(anchorOne.lineUpVectors.size() == 5);
-    REQUIRE(anchorFallback.lineUpVectors.size() == 5);
-    checkVec(anchorOne.lineUpVectors[0], {0.0, 0.0, -1.0});
-    checkVec(anchorFallback.lineUpVectors[0], {0.0, 0.0, 1.0});
-
     vc::lasagna::LineViewConfig config;
     config.orientedPointNormals.assign(5, {0.0f, 0.0f, 1.0f});
     line.displayFrameAnchorIndex = 1;
@@ -301,11 +308,13 @@ TEST_CASE("LineViewBuilder oriented point normals pin ups against a moving displ
     line.displayFrameAnchorIndex = -1;
     const auto pinnedFallback = vc::lasagna::buildLineViewSurfaces(line, config);
 
+    REQUIRE(pinnedOne.lineUpVectors.size() == 5);
     REQUIRE(pinnedOne.lineUpVectors.size() == pinnedFallback.lineUpVectors.size());
     for (size_t i = 0; i < pinnedOne.lineUpVectors.size(); ++i) {
         checkVec(pinnedOne.lineUpVectors[i], toVec3d(pinnedFallback.lineUpVectors[i]));
         checkVec(pinnedOne.lineUpVectors[i], {0.0, 0.0, 1.0});
     }
+    checkUpsAreTheStripNormal(pinnedOne);
 }
 
 TEST_CASE("LineViewBuilder diagnostics flag sampled normal axis jumps")
@@ -324,22 +333,22 @@ TEST_CASE("LineViewBuilder diagnostics flag sampled normal axis jumps")
     CHECK(diagnostics.issues.front().reason == "sampled_normal_axis_jump");
 }
 
-TEST_CASE("LineViewBuilder uses transported up vectors for cross-slice orientation")
+TEST_CASE("LineViewBuilder orients every cut by the strip's own normal")
 {
+    // Sampled normals that turn along the line: the strip turns with them,
+    // and so does the up of every cut. Nothing else orients a cut.
     auto line = simpleLine();
     line.points[0].sampledNormal = normal({0.0, 1.0, 0.0});
-    line.points[1].sampledNormal = normal({0.0, 0.0, 1.0});
-    line.points[2].sampledNormal = normal({0.0, 1.0, 0.0});
+    line.points[1].sampledNormal = normal({0.0, 0.7071067811865476, 0.7071067811865476});
+    line.points[2].sampledNormal = normal({0.0, 0.0, 1.0});
 
     const auto views = vc::lasagna::buildLineViewSurfaces(line);
 
     REQUIRE(views.lineUpVectors.size() == 3);
-    for (const auto& up : views.lineUpVectors) {
-        checkVec(up, {0.0, 0.0, 1.0});
-    }
-    for (const auto& slice : views.lineZSlices) {
-        REQUIRE(slice);
-        checkVec(slice->basisY(), {0.0, 0.0, 1.0});
+    checkUpsAreTheStripNormal(views);
+    for (size_t i = 0; i < views.lineZSlices.size(); ++i) {
+        REQUIRE(views.lineZSlices[i]);
+        checkVec(views.lineZSlices[i]->basisY(), toVec3d(views.lineUpVectors[i]));
     }
 }
 

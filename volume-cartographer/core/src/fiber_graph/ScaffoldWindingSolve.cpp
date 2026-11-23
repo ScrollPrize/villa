@@ -82,14 +82,17 @@ std::vector<std::int64_t> solveComponents(std::size_t nodes, const std::vector<W
                 }
         std::vector<std::int64_t> a, b, target;
         std::vector<double> weight;
+        std::vector<int> side;
         a.reserve(grouped[component].size());
         for (const auto* arc : grouped[component]) {
             a.push_back(local[std::size_t(arc->a)]);
             b.push_back(local[std::size_t(arc->b)]);
             target.push_back(arc->target);
             weight.push_back(arc->weight);
+            side.push_back(arc->side);
         }
-        const auto flow = geometry::solveWindingMinCostFlow(std::int64_t(members.size()), a, b, target, weight, options);
+        const auto flow =
+            geometry::solveWindingMinCostFlow(std::int64_t(members.size()), a, b, target, weight, side, options);
         std::int64_t minimum = flow.winding[0];
         for (std::size_t i = 1; i < members.size(); ++i) minimum = std::min(minimum, flow.winding[i]);
         for (std::size_t i = 0; i < members.size(); ++i) winding[std::size_t(members[i])] = flow.winding[i] - minimum;
@@ -266,8 +269,15 @@ const char* scaffoldConstraintKindName(ScaffoldConstraintKind kind)
         case ScaffoldConstraintKind::Perpendicular: return "perpendicular";
         case ScaffoldConstraintKind::Parallel: return "parallel";
         case ScaffoldConstraintKind::Enclosure: return "enclosure";
+        case ScaffoldConstraintKind::SignAtLeast: return "sign_at_least";
+        case ScaffoldConstraintKind::SignAtMost: return "sign_at_most";
     }
     throw std::invalid_argument("scaffold winding: unknown constraint kind");
+}
+
+int scaffoldConstraintSide(ScaffoldConstraintKind kind)
+{
+    return kind == ScaffoldConstraintKind::SignAtLeast ? 1 : kind == ScaffoldConstraintKind::SignAtMost ? -1 : 0;
 }
 
 std::optional<std::int64_t> adjacentStep(ScaffoldFamily a, ScaffoldFamily b)
@@ -281,11 +291,12 @@ std::vector<WindingArc> aggregateWindingArcs(std::vector<WindingArc> arcs)
 {
     if (arcs.empty()) return arcs;
     std::stable_sort(arcs.begin(), arcs.end(), [](const WindingArc& x, const WindingArc& y) {
-        return std::tie(x.a, x.b, x.target) < std::tie(y.a, y.b, y.target);
+        return std::tie(x.a, x.b, x.target, x.side) < std::tie(y.a, y.b, y.target, y.side);
     });
     std::size_t out = 0;
     for (std::size_t i = 1; i < arcs.size(); ++i) {
-        if (arcs[out].a == arcs[i].a && arcs[out].b == arcs[i].b && arcs[out].target == arcs[i].target)
+        if (arcs[out].a == arcs[i].a && arcs[out].b == arcs[i].b && arcs[out].target == arcs[i].target &&
+            arcs[out].side == arcs[i].side)
             arcs[out].weight += arcs[i].weight;
         else
             arcs[++out] = arcs[i];
@@ -512,10 +523,15 @@ ScaffoldSolveResult solveScaffoldWinding(const ScaffoldGraph& graph, const Scaff
             throw std::invalid_argument("scaffold winding: a constraint names an unknown fiber pair");
         if (!std::isfinite(constraint.weight) || constraint.weight < 0)
             throw std::invalid_argument("scaffold winding: a constraint weight is negative or nonfinite");
+        // A bound is not a relation an approval can hold rigid.
+        if (constraint.approved && scaffoldConstraintSide(constraint.kind) != 0)
+            throw std::invalid_argument("scaffold winding: a sign constraint cannot be approved");
     }
     std::vector<WindingArc> arcs;
     for (const auto& constraint : result.constraints)
-        if (constraint.weight > 0) arcs.push_back({constraint.a, constraint.b, constraint.target, constraint.weight});
+        if (constraint.weight > 0)
+            arcs.push_back({constraint.a, constraint.b, constraint.target, constraint.weight,
+                            scaffoldConstraintSide(constraint.kind)});
     result.arcs = aggregateWindingArcs(arcs);
     if (result.arcs.empty()) throw std::invalid_argument("scaffold winding: no usable winding constraints");
 
@@ -565,7 +581,8 @@ ScaffoldSolveResult solveScaffoldWinding(const ScaffoldGraph& graph, const Scaff
         const auto a = representative[std::size_t(arc.a)], b = representative[std::size_t(arc.b)];
         if (a == b) continue;
         const auto target = arc.target + offset[std::size_t(arc.a)] - offset[std::size_t(arc.b)];
-        contracted.push_back(a < b ? WindingArc{a, b, target, arc.weight} : WindingArc{b, a, -target, arc.weight});
+        contracted.push_back(a < b ? WindingArc{a, b, target, arc.weight, arc.side}
+                                   : WindingArc{b, a, -target, arc.weight, -arc.side});
     }
     const auto solved =
         solveComponents(nodes, aggregateWindingArcs(contracted), options.flow, &result.quantization, options.monitor);
@@ -587,8 +604,8 @@ ScaffoldSolveResult solveScaffoldWinding(const ScaffoldGraph& graph, const Scaff
     for (const auto count : members) if (count == 1) ++result.isolatedFibers;
 
     for (const auto& arc : result.arcs) {
-        const double residual =
-            std::abs(double(result.winding[std::size_t(arc.b)] - result.winding[std::size_t(arc.a)] - arc.target));
+        const double residual = double(geometry::windingArcResidual(
+            result.winding[std::size_t(arc.b)] - result.winding[std::size_t(arc.a)], arc.target, arc.side));
         result.objective += arc.weight * residual;
         result.maxResidual = std::max(result.maxResidual, residual);
         if (residual > 0) ++result.violatedArcs;
@@ -602,9 +619,12 @@ ScaffoldSolveResult solveScaffoldWinding(const ScaffoldGraph& graph, const Scaff
     std::vector<double> residual(result.constraints.size(), 0.);
     for (std::size_t i = 0; i < result.constraints.size(); ++i) {
         const auto& constraint = result.constraints[i];
-        residual[i] = std::abs(
-            double(result.winding[std::size_t(constraint.b)] - result.winding[std::size_t(constraint.a)] - constraint.target));
-        if (residual[i] == 0) {
+        const auto step = result.winding[std::size_t(constraint.b)] - result.winding[std::size_t(constraint.a)];
+        residual[i] =
+            double(geometry::windingArcResidual(step, constraint.target, scaffoldConstraintSide(constraint.kind)));
+        // A cycle is a chain of relations that hold exactly: a bound the
+        // solve keeps with room to spare ties nothing down.
+        if (residual[i] == 0 && step == constraint.target) {
             search.incident[std::size_t(constraint.a)].push_back(std::int64_t(i));
             search.incident[std::size_t(constraint.b)].push_back(std::int64_t(i));
         }

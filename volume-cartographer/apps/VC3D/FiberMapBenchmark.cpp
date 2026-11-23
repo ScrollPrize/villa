@@ -8,6 +8,8 @@
 // per-stage log line ("fiber map rebuild: ...") is on the same output.
 #include "CWindow.hpp"
 #include "FiberMapScaffoldSolve.hpp"
+
+#include <set>
 #include "FiberMapWorkspace.hpp"
 #include "MenuActionController.hpp"
 #include "VCSettings.hpp"
@@ -125,10 +127,39 @@ int runFiberMapBenchmark(const QString& project, bool followSolve, int runs, con
                 const auto line = columns.join(QStringLiteral(" | "));
                 bool all = true;
                 for (const auto& needle : needles) all = all && line.contains(needle);
-                if (all) std::cout << "  " << (depth ? "    child: " : "row: ") << line.toStdString() << std::endl;
+                if (all) {
+                    std::cout << "  " << (depth ? "    child: " : "row: ") << line.toStdString() << std::endl;
+                    // What selecting the row asks the map to draw.
+                    const auto highlight = panel->highlightOf(item);
+                    for (const auto& span : highlight.spans)
+                        std::cout << "        span " << span.fiberUuid.substr(0, 8) << " controls " << span.controlFrom
+                                  << "-" << span.controlTo << " positions " << span.positionFrom << "-"
+                                  << span.positionTo << std::endl;
+                    for (const auto& error : highlight.errors) std::cout << "        ERROR " << error << std::endl;
+                }
                 for (int child = 0; child < item->childCount(); ++child) walk(item->child(child), depth + 1);
             };
             for (int row = 0; row < list->topLevelItemCount(); ++row) walk(list->topLevelItem(row), 0);
+            // The normals a stretch of this solve would be opened with: read
+            // through the run's own reference, for every fiber the list names.
+            if (auto* controller = map->findChild<vc3d::fiber_map::ScaffoldSolveController*>()) {
+                std::set<std::string> fibers;
+                const std::function<void(QTreeWidgetItem*)> collect = [&](QTreeWidgetItem* item) {
+                    for (const auto& span : panel->highlightOf(item).spans) fibers.insert(span.fiberUuid);
+                    for (int child = 0; child < item->childCount(); ++child) collect(item->child(child));
+                };
+                for (int row = 0; row < list->topLevelItemCount(); ++row) collect(list->topLevelItem(row));
+                std::size_t resolved = 0;
+                QString firstError;
+                for (const auto& uuid : fibers) {
+                    QString why;
+                    if (controller->runFiberNormals(uuid, &why)) ++resolved;
+                    else if (firstError.isEmpty()) firstError = why;
+                }
+                std::cout << "  solve normals resolved for " << resolved << " of " << fibers.size() << " fibers"
+                          << (firstError.isEmpty() ? std::string() : "; first error: " + firstError.toStdString())
+                          << std::endl;
+            }
         }
         return 0;
     }

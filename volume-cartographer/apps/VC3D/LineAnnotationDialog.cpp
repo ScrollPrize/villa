@@ -6016,55 +6016,6 @@ cv::Vec3f LineAnnotationDialog::interpolatedLineUp(double linePosition, const cv
     return normalizedOrNan(up);
 }
 
-cv::Vec3f LineAnnotationDialog::interpolatedOrientedNormal(double linePosition) const
-{
-    const cv::Vec3f nan{std::numeric_limits<float>::quiet_NaN(),
-                        std::numeric_limits<float>::quiet_NaN(),
-                        std::numeric_limits<float>::quiet_NaN()};
-    const auto& normals = _generatedViews.hasManualDisplayNormals && !_generatedViews.displayLineNormals.empty()
-        ? _generatedViews.displayLineNormals : _generatedViews.lineNormals;
-    if (normals.empty() || !std::isfinite(linePosition)) {
-        return nan;
-    }
-
-    const double position = std::clamp(
-        linePosition, 0.0, static_cast<double>(normals.size() - 1));
-    const int lower = static_cast<int>(std::floor(position));
-    const int upper = std::min<int>(lower + 1, static_cast<int>(normals.size()) - 1);
-    const cv::Vec3f lowerNormal = normals[static_cast<size_t>(lower)];
-    cv::Vec3f upperNormal = normals[static_cast<size_t>(upper)];
-    if (!finitePoint(lowerNormal) || !finitePoint(upperNormal) ||
-        cv::norm(lowerNormal) <= 1.0e-6f ||
-        cv::norm(upperNormal) <= 1.0e-6f) {
-        return nan;
-    }
-    if (lowerNormal.dot(upperNormal) < 0.0f) {
-        upperNormal = -upperNormal;
-    }
-
-    const float t = static_cast<float>(position - static_cast<double>(lower));
-    return normalizedOrNan(lowerNormal * (1.0f - t) + upperNormal * t);
-}
-
-cv::Vec3f LineAnnotationDialog::interpolatedLineNormal(double linePosition,
-                                                       const cv::Vec3f& tangent) const
-{
-    const cv::Vec3f nan{std::numeric_limits<float>::quiet_NaN(),
-                        std::numeric_limits<float>::quiet_NaN(),
-                        std::numeric_limits<float>::quiet_NaN()};
-    cv::Vec3f up = interpolatedOrientedNormal(linePosition);
-    if (!finitePoint(up)) {
-        return nan;
-    }
-    up -= tangent * up.dot(tangent);
-    // A tiny projection means the sheet normal runs nearly along the tangent
-    // (extreme bend): the direction is unstable, so let the caller fall back.
-    if (cv::norm(up) <= 0.1f) {
-        return nan;
-    }
-    return normalizedOrNan(up);
-}
-
 bool LineAnnotationDialog::updatePlaneSurface(PlaneSurface* plane, double linePosition) const
 {
     if (!plane) {
@@ -6072,16 +6023,10 @@ bool LineAnnotationDialog::updatePlaneSurface(PlaneSurface* plane, double linePo
     }
     const cv::Vec3f origin = interpolatedLinePoint(linePosition);
     const cv::Vec3f tangent = interpolatedLineTangent(linePosition);
-    // Display up for the cut: the sampled sheet normal, sign-oriented away
-    // from the scroll center (with the scene's y-down rendering this shows
-    // the sheet horizontal with the fiber's center-facing surface at the top
-    // of the view) -- and the orientation is a pure function of the line
-    // position. The transported line up remains the fallback where samples
-    // are missing or, at extreme bends, nearly parallel to the tangent.
-    cv::Vec3f upHint = interpolatedLineNormal(linePosition, tangent);
-    if (!finitePoint(upHint)) {
-        upHint = interpolatedLineUp(linePosition, tangent);
-    }
+    // The cut's up is the strip's own normal at this line position (the
+    // normal of the ribbon the strip views draw), and nothing else: the strip
+    // and its cuts are one frame, so they cannot disagree.
+    const cv::Vec3f upHint = interpolatedLineUp(linePosition, tangent);
     if (!finitePoint(origin) || !finitePoint(tangent) || !finitePoint(upHint) ||
         cv::norm(tangent) <= 1.0e-6f ||
         cv::norm(upHint) <= 1.0e-6f) {
@@ -6116,18 +6061,15 @@ bool LineAnnotationDialog::updateSidePlaneSurface(PlaneSurface* plane, double li
         return false;
     }
     // The side cut is the current cut's frame rotated a quarter turn: the
-    // plane spanned by the line tangent and the (away-from-center oriented)
-    // sheet normal, viewed with the fiber vertical. A windowed PCA fit of
+    // plane spanned by the line tangent and the strip's normal, viewed with
+    // the fiber vertical. A windowed PCA fit of
     // the line was used here before, but its plane tumbles where the fiber's
     // cross-fiber wander is nearly isotropic (no well-defined local fiber
     // plane); the sheet frame is always defined and keeps both cut views
     // consistent. normal = sheetNormal x tangent puts the stored sheet
     // normal on the view's x axis, so the direction shown at the top of the
     // current cut (toward the scroll center) points screen-left.
-    cv::Vec3f sheetNormal = interpolatedLineNormal(linePosition, tangent);
-    if (!finitePoint(sheetNormal)) {
-        sheetNormal = interpolatedLineUp(linePosition, tangent);
-    }
+    const cv::Vec3f sheetNormal = interpolatedLineUp(linePosition, tangent);
     if (!finitePoint(sheetNormal) || cv::norm(sheetNormal) <= 1.0e-6f) {
         return false;
     }

@@ -169,6 +169,10 @@ int runFiberConstraintExtraction(int argc, char** argv)
         std::cout<<"neighbour normals "<<inferFiberNeighbourNormals(cfg).dump()<<std::endl;
         return 0;
     }
+    if(cfg.contains("signed_strip_samples_output")) {
+        std::cout<<"signed strip samples "<<writeSignedFiberStripSamples(cfg).dump()<<std::endl;
+        return 0;
+    }
     if(!cfg.value("sqlite_memory_statistics",true) && sqlite3_config(SQLITE_CONFIG_MEMSTATUS,0)!=SQLITE_OK)
         throw std::runtime_error("SQLite memory statistics must be configured before opening any store");
     for(const auto* key:{"sqlite_serialize_memory","sqlite_in_memory","sqlite_page_size","sqlite_insert_batch_rows"})

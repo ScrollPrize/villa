@@ -115,7 +115,7 @@ struct ScaffoldSignOptions {
 };
 
 struct ScaffoldSignResult {
-    // Per fiber: the multiplier that turns its gauge normal into the inward
+    // Per fiber: the multiplier that turns its gauge normal into the outward
     // one, as the winding assembly's `normalSign` column.
     std::vector<std::int64_t> sign;
     // Per fiber: what decided that sign.
@@ -155,7 +155,23 @@ struct ScaffoldMeasuredOptions {
     // Per-type weights, the names the automatic winding stage uses. A zero
     // weight omits that type's arcs; enclosures are derived from the signed
     // perpendicular events whatever the perpendicular weight is.
-    double perpendicularWeight = 1.0, parallelWeight = 1.0, enclosureWeight = 1.0;
+    double perpendicularWeight = 1.0, parallelWeight = 0.0, enclosureWeight = 0.0;
+    // The local sign every signed perpendicular crossing states on its own: the
+    // V fiber lies outside the H fiber there, or inside, which bounds the
+    // pair's H->V step from one side (the bound an enclosure needs from both).
+    // Each becomes a sign constraint of this weight, costing only when the
+    // solve breaks it; zero states none. It needs no winding separation.
+    // The defaults - perpendicular 1, sign 100, parallel and enclosure 0 -
+    // are the scaffold workflow's.
+    double signWeight = 100.0;
+    // The confidence of one crossing, exactly as the sign stage weights it
+    // (fiber_tracer::fiberSignEventWeight: |dot|^power of its two normal axes
+    // times the winding-distance factor, min(1, 1/d^2) by default). It scales
+    // the perpendicular, parallel and sign weight of that crossing, so an
+    // oblique or far crossing still counts but gives way to the clean near
+    // ones. An enclosure is a statement about a pair and keeps its weight.
+    bool crossingConfidence = true;
+    fiber_tracer::FiberSignOptions confidence{};
     // Half a winding between an H and a V fiber of the same sheet pair, and
     // the scale the measured separations are read in.
     double perpendicularOffset = 0.5, windingScale = 1.0;
@@ -168,6 +184,8 @@ struct ScaffoldMeasuredReport {
     // under Split, rounded to the nearer integer under Rounded.
     std::int64_t fractional = 0;
     std::int64_t perpendicular = 0, parallel = 0;
+    // sign constraints stated (ScaffoldMeasuredOptions::signWeight).
+    std::int64_t signConstraints = 0;
     std::int64_t skippedInvalid = 0, skippedUntagged = 0, skippedSelf = 0, skippedFamilyMismatch = 0;
     std::int64_t enclosurePairs = 0, enclosureArcs = 0, enclosureOneSided = 0, enclosureContradictory = 0,
                  enclosureNonunique = 0;

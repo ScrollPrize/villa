@@ -1,4 +1,5 @@
 #pragma once
+#include "vc/fiber_tracer/FiberCrossingAxes.hpp"
 #include <opencv2/core.hpp>
 #include <filesystem>
 #include <string>
@@ -7,13 +8,7 @@
 // Geometry of every perpendicular crossing of a fiber, extracted once from a
 // crossing search store (the extractor's own graph, normal-free) so normal
 // solves need neither the partner fibers nor a new search.
-struct FiberCrossingAxis {
-    double arc = 0.;                // own arc, base voxels
-    cv::Vec3d axis{0., 0., 0.};     // unit own tangent x partner tangent (sign-free)
-    double gap = 0.;                // |offset|
-    cv::Vec3d offset{0., 0., 0.};   // partner point - own point
-    cv::Vec3d ownTangent{0., 0., 0.};
-};
+using FiberCrossingAxis = vc::fiber_tracer::FiberCrossingAxis;
 
 // One entry list per fiber of `ids`; `lines` are the fibers' polylines (all
 // fibers referenced by the store must be among them). Writes a binary file.

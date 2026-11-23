@@ -976,9 +976,26 @@ LineViewSurfaces buildLineViewSurfaces(const LineModel& line, const LineViewConf
     if (config.buildLineZSlices) {
         surfaces.lineZSlices.reserve(line.points.size());
     }
+    // The cut plane's up at a line point is the strip's own normal there: the
+    // normal of the ribbon that is drawn, read at the point's strip column.
+    // Nothing else orients a cut view, so the strip and its cuts cannot
+    // disagree.
+    const auto stripNormalAt = [&](size_t i) {
+        const double column = std::clamp(positionMap.originalPositionToStripGridColumn(static_cast<double>(i)),
+                                         0.0, static_cast<double>(ribbonFrames.size() - 1));
+        const size_t low = std::min(static_cast<size_t>(column), ribbonFrames.size() - 1);
+        const size_t high = std::min(low + 1, ribbonFrames.size() - 1);
+        const double t = column - static_cast<double>(low);
+        const cv::Vec3d blended = ribbonFrames[low].meshNormal * (1.0 - t) + ribbonFrames[high].meshNormal * t;
+        const cv::Vec3d inPlane = projectToTangentPlane(blended, pointTangent(line, i));
+        const double length = cv::norm(inPlane);
+        // A tangent that happens to lie along the blended normal leaves nothing
+        // to project: the nearer ribbon normal is the strip's normal there.
+        return length > 1e-9 ? cv::Vec3d(inPlane / length) : ribbonFrames[t < 0.5 ? low : high].meshNormal;
+    };
     surfaces.lineUpVectors.reserve(line.points.size());
     for (size_t i = 0; i < line.points.size(); ++i) {
-        const cv::Vec3f up = toVec3f(frameData.transportedUpVectors[i]);
+        const cv::Vec3f up = toVec3f(stripNormalAt(i));
         if (config.buildLineZSlices) {
             const cv::Vec3f origin = toVec3f(line.points[i].position);
             const cv::Vec3f tangent = toVec3f(pointTangent(line, i));

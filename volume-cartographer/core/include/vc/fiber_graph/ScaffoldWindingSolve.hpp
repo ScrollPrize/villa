@@ -10,7 +10,9 @@
 //
 // The solve minimizes sum_e weight_e * |k_b - k_a - target_e| exactly, as a
 // capacitated minimum-cost circulation (LEMON), one connected component at a
-// time with its own gauge (minimum winding 0).
+// time with its own gauge (minimum winding 0). a sign constraint enters the
+// same sum with a one-sided term: weight_e * max(0, target_e - (k_b - k_a))
+// for "at least", and the mirror for "at most".
 //
 // A violated constraint alone does not say which annotation is wrong: the
 // winding is overdetermined only along cycles. For each violated constraint
@@ -31,10 +33,13 @@
 
 namespace vc::fiber_graph {
 
-// Aggregated L1 arc as the flow solver takes it (a < b).
+// Aggregated L1 arc as the flow solver takes it (a < b). `side` 0 is an
+// equation; +1 a lower bound (k_b - k_a at least the target), -1 an upper
+// bound, each costing only when violated (geometry::windingArcResidual).
 struct WindingArc {
     std::int64_t a = 0, b = 0, target = 0;
     double weight = 0;
+    int side = 0;
 };
 
 // Perpendicular and Parallel: one encounter of two fibers, the geometry's own
@@ -42,10 +47,18 @@ struct WindingArc {
 // annotation link refined onto the same encounter (`ScaffoldConstraint::link`
 // names the source; the link's step replaces the measurement). Enclosure: the
 // exact H->V step the signed order of a pair's perpendicular crossings bounds
-// from both sides (ScaffoldConstraints.hpp).
-enum class ScaffoldConstraintKind : int { Perpendicular = 1, Parallel = 2, Enclosure = 3 };
+// from both sides (ScaffoldConstraints.hpp). SignAtLeast and SignAtMost:
+// the bound one signed perpendicular crossing alone states - the step
+// k_b - k_a is at least, or at most, the target. a sign constraint costs
+// only when the solve breaks the bound; it is not an equation.
+enum class ScaffoldConstraintKind : int {
+    Perpendicular = 1, Parallel = 2, Enclosure = 3, SignAtLeast = 4, SignAtMost = 5
+};
+inline constexpr std::size_t kScaffoldConstraintKinds = 6;
 
 const char* scaffoldConstraintKindName(ScaffoldConstraintKind);
+// 0 for an equation, +1 for SignAtLeast, -1 for SignAtMost.
+int scaffoldConstraintSide(ScaffoldConstraintKind);
 
 // One asserted winding relation, before aggregation, with the anchors it was
 // asserted at: the residual analysis needs them to name the pieces a cycle
@@ -155,7 +168,7 @@ void scaffoldPieceControls(const ScaffoldGraph&, const ScaffoldGeometry&, Scaffo
 
 struct ScaffoldResidual {
     std::int64_t constraint = 0;
-    double residual = 0; // |k_b - k_a - target| in windings
+    double residual = 0; // |k_b - k_a - target| in windings; for a sign constraint, how far past its bound
     double cost = 0;     // weight * residual
     // Hops of the shortest cycle through this constraint over satisfied
     // constraints, -1 when the two fibers are not otherwise connected (the
@@ -198,7 +211,7 @@ struct ScaffoldSolveResult {
     std::vector<ScaffoldConstraint> constraints;
     // Constraints per kind, indexed by ScaffoldConstraintKind (map links
     // included), and how many of them came from a map link.
-    std::array<std::int64_t, 4> constraintsByKind{};
+    std::array<std::int64_t, kScaffoldConstraintKinds> constraintsByKind{};
     std::int64_t linkConstraints = 0;
     std::vector<WindingArc> arcs; // aggregated, as solved
     std::vector<std::int64_t> winding, component; // per fiber; unconstrained fibers get their own component

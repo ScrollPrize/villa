@@ -149,6 +149,11 @@ struct ScaffoldSolveController::SolveJob {
     vc::fiber_graph::ScaffoldCacheSink cacheSink;
     // What the fused run's prediction is called; empty when it reads none.
     std::string predictionIdentity;
+    // A neighbours run: the signed strip samples next to the fiber store,
+    // and the controller's opened copy of them (kept between runs).
+    std::filesystem::path neighbourPath;
+    std::shared_ptr<ScaffoldSolveController::NeighbourNormals> neighbours;
+    vc::fiber_graph::ScaffoldNeighbourSource neighbourSource;
     // Outputs.
     QString error;
     bool cancelled = false;
@@ -161,10 +166,16 @@ struct ScaffoldSolveController::SolveJob {
 ScaffoldSolveController::ScaffoldSolveController(CState* state, QObject* parent)
     : QObject(parent)
     , _state(state)
+    , _neighbours(std::make_shared<NeighbourNormals>())
 {
 }
 
 ScaffoldSolveController::~ScaffoldSolveController() = default;
+
+std::filesystem::path ScaffoldSolveController::neighbourNormalsPath(const std::filesystem::path& fiberStore)
+{
+    return fiberStore.string() + ".neighbour_normals.vcstrip";
+}
 
 void ScaffoldSolveController::setWindingSampler(WindingSamplerResolver resolver)
 {
@@ -180,6 +191,23 @@ std::optional<vc::objects::AttachmentIdentity> ScaffoldSolveController::attachme
 {
     if (!_state) return std::nullopt;
     return _state->storeFor("fiber");
+}
+
+QString ScaffoldSolveController::anchorSpanProblem(const std::string& fiberUuid, double arc) const
+{
+    const auto name = QString::fromStdString(fiberUuid).left(8);
+    if (!_approvalsLoaded)
+        return tr("fiber %1: the fibers' control points were not read from the store").arg(name);
+    const auto found = _approvals.find(fiberUuid);
+    if (found == _approvals.end())
+        return tr("fiber %1 is not among the %2 fibers read from the store (frame '%3')")
+            .arg(name).arg(_approvals.size()).arg(QString::fromStdString(_frameVolume));
+    const auto& entry = found->second;
+    if (entry.controlArcs.size() < 2)
+        return tr("fiber %1: its %2 control points could not be placed on its line in frame '%3' (%4 control arcs)")
+            .arg(name).arg(entry.controlIds.size()).arg(QString::fromStdString(_frameVolume)).arg(entry.controlArcs.size());
+    if (!std::isfinite(arc)) return tr("fiber %1: the run states no arc there").arg(name);
+    return {};
 }
 
 ScaffoldAnchorSpan ScaffoldSolveController::anchorSpan(const std::string& fiberUuid, double arc) const
@@ -340,7 +368,6 @@ std::optional<ScaffoldSolveController::RunFiberNormals> ScaffoldSolveController:
     const auto store = attachment();
     const auto session = _state ? _state->objectStoreSession() : nullptr;
     if (!store || !session) return fail(tr("no object store is attached"));
-    const bool fused = view->run.normalSource == "fused";
     const double sign = double(*winding->second.normalSign);
     std::optional<RunFiberNormals> out;
     QString reason;
@@ -358,21 +385,18 @@ std::optional<ScaffoldSolveController::RunFiberNormals> ScaffoldSolveController:
             // The solve reads the annotated line only; its normals are per
             // point of that.
             const auto range = vc::geometry::annotatedLineRange(content.controlPoints, content.linePoints);
-            const auto gauge = vc::fiber_graph::readScaffoldFiberNormals(reader, fiberUuid, fused, range.size());
-            if (!gauge) {
-                reason = tr("the store holds no %1 normals for this fiber as it is now; solve again")
-                             .arg(fused ? tr("fused") : tr("geometry"));
-                return;
-            }
+            // The normals row the run itself references: no search, and an
+            // error when the reference does not resolve.
+            const auto gauge = vc::fiber_graph::readScaffoldRunFiberNormals(reader, view->run.runUuid, fiberUuid, range.size());
             out.emplace();
             out->points.reserve(range.size());
             out->normals.reserve(range.size());
             for (std::size_t i = 0; i < range.size(); ++i) {
                 const auto& point = content.linePoints[range.begin + i];
                 out->points.emplace_back(float(point[0]), float(point[1]), float(point[2]));
-                // The run's inward normal, turned outward for the views.
-                out->normals.emplace_back(float(-sign * (*gauge)[3 * i]), float(-sign * (*gauge)[3 * i + 1]),
-                                          float(-sign * (*gauge)[3 * i + 2]));
+                // The run's signed normal: outward, as the views take it.
+                out->normals.emplace_back(float(sign * gauge[3 * i]), float(sign * gauge[3 * i + 1]),
+                                          float(sign * gauge[3 * i + 2]));
             }
         });
     } catch (const std::exception& problem) {
@@ -468,6 +492,10 @@ void ScaffoldSolveController::startSolve(const ScaffoldSolveRequest& request)
     _job = std::make_shared<SolveJob>();
     _job->openSampler = std::move(openSampler);
     _job->openAxes = std::move(openAxes);
+    if (request.measureCrossings && request.normalSource == "neighbours") {
+        _job->neighbourPath = neighbourNormalsPath(session->path(*store));
+        _job->neighbours = _neighbours;
+    }
     _job->request = request;
     _job->attachment = store;
     _job->session = session;
@@ -498,7 +526,7 @@ void ScaffoldSolveController::startSolve(const ScaffoldSolveRequest& request)
             // them on, and a fused run its prediction: both are opened here,
             // and a run that cannot have them stops before it reads a fiber.
             if (job->request.measureCrossings &&
-                (job->request.measureWindingDistances || job->request.normalSource == "fused")) {
+                (job->request.measureWindingDistances || job->request.normalSource != "geometry")) {
                 job->monitor.enter("opening the datasets");
                 if (job->request.measureWindingDistances) {
                     QString error;
@@ -521,13 +549,32 @@ void ScaffoldSolveController::startSolve(const ScaffoldSolveRequest& request)
                             : error.toStdString());
                 }
                 job->monitor.checkpoint();
+                if (job->request.normalSource == "neighbours") {
+                    // Read once and kept: the file is the whole volume's
+                    // normals, and a second run reads the same one.
+                    std::error_code missing;
+                    const auto written = std::filesystem::last_write_time(job->neighbourPath, missing);
+                    if (missing)
+                        throw std::runtime_error("No full-volume normals next to the fiber store: " +
+                                                 job->neighbourPath.string() + " is missing.");
+                    const std::lock_guard<std::mutex> guard(job->neighbours->mutex);
+                    if (!job->neighbours->source.field || job->neighbours->path != job->neighbourPath ||
+                        job->neighbours->written != written) {
+                        job->neighbours->source = {};
+                        job->neighbours->source = vc::fiber_graph::openScaffoldNeighbourSource(job->neighbourPath);
+                        job->neighbours->path = job->neighbourPath;
+                        job->neighbours->written = written;
+                    }
+                    job->neighbourSource = job->neighbours->source;
+                }
+                job->monitor.checkpoint();
             }
             job->cacheSink.author = job->session->newRequest(*job->attachment).author;
             job->cacheSink.computedAt = QDateTime::currentDateTimeUtc().toString(Qt::ISODate).toStdString();
             const bool opens = job->request.measureCrossings &&
-                               (job->request.measureWindingDistances || job->request.normalSource == "fused");
+                               (job->request.measureWindingDistances || job->request.normalSource != "geometry");
             job->monitor.expectStages((job->request.measureCrossings
-                                           ? (job->request.normalSource == "fused" ? 13 : 12)
+                                           ? (job->request.normalSource != "geometry" ? 13 : 12)
                                            : 4) + (opens ? 1 : 0));
             ScaffoldSolveOptions options;
             options.links.useLinks = job->request.useLinks;
@@ -566,6 +613,9 @@ void ScaffoldSolveController::startSolve(const ScaffoldSolveRequest& request)
                     normalOptions.cache = &cache;
                     normalOptions.sink = &job->cacheSink;
                     normalOptions.predictionIdentity = job->predictionIdentity;
+                    normalOptions.neighbours.field = job->neighbourSource.field.get();
+                    normalOptions.neighbours.identity = job->neighbourSource.identity;
+                    normalOptions.neighbours.volume = job->neighbourSource.volume;
                     eventOptions.cache = &cache;
                     eventOptions.sink = &job->cacheSink;
                     normalOptions.linkApprovalStates = job->request.approvalStates;
@@ -581,11 +631,14 @@ void ScaffoldSolveController::startSolve(const ScaffoldSolveRequest& request)
                     measuredOptions.perpendicularWeight = job->request.perpendicularWeight;
                     measuredOptions.parallelWeight = job->request.parallelWeight;
                     measuredOptions.enclosureWeight = job->request.enclosureWeight;
+                    measuredOptions.signWeight = job->request.signWeight;
                     signOptions.sign.backend = job->request.signBackend == "ceres"
                                                    ? vc::fiber_tracer::FiberSignBackend::Ceres
                                                    : vc::fiber_tracer::FiberSignBackend::Irls;
                     signOptions.sign.threads = int(options.workers);
                     signOptions.monitor = &job->monitor;
+                    // One crossing, one confidence: the winding weights take the sign stage's own term.
+                    measuredOptions.confidence = signOptions.sign;
                     ScaffoldWindingDistances distances;
                     if (auto sampler = job->sampler)
                         distances = [sampler](const std::vector<std::pair<cv::Vec3d, cv::Vec3d>>& connectors,
@@ -601,6 +654,7 @@ void ScaffoldSolveController::startSolve(const ScaffoldSolveRequest& request)
                                                      vc::objects::readFiberConstraintApprovals(reader), approvals);
                     stages.normalOptions = &normalOptions;
                     stages.normals = &normals->report();
+                    stages.normalRows = normals->cacheRows();
                     stages.eventOptions = &eventOptions;
                     stages.events = &eventReport;
                     stages.measuredOptions = &measuredOptions;
@@ -638,6 +692,12 @@ void ScaffoldSolveController::startSolve(const ScaffoldSolveRequest& request)
                                         .arg(measuredReport.used)
                                         .arg(measuredReport.enclosureArcs)
                                         .arg(signs.decided);
+                if (normals && normalOptions.neighbours.field)
+                    job->summary += QObject::tr("; full-volume neighbours faced %1 fibers and answered %2 of %3 \n"
+                                                "samples")
+                                        .arg(normals->report().neighbourFacedFibers)
+                                        .arg(normals->report().neighbourSamplesAnswered)
+                                        .arg(normals->report().neighbourSamples);
                 // A crossing whose geometry and whose H/V tags disagree is
                 // dropped, and that is a question about the tagging: say so
                 // rather than leaving it in the gap between read and used.
@@ -875,10 +935,11 @@ ScaffoldSolverPanel::ScaffoldSolverPanel(ScaffoldSolveController* controller, QW
     statesLayout->setContentsMargins(0, 0, 0, 0);
     _approvedCheck = new QCheckBox(tr("approved"), states);
     _approvedCheck->setObjectName(QStringLiteral("fiberMapSolveApprovedLinks"));
-    _approvedCheck->setChecked(true);
+    // The scaffold workflow's default run uses no links: the crossings alone.
+    _approvedCheck->setChecked(false);
     _pendingCheck = new QCheckBox(tr("pending"), states);
     _pendingCheck->setObjectName(QStringLiteral("fiberMapSolvePendingLinks"));
-    _pendingCheck->setChecked(true);
+    _pendingCheck->setChecked(false);
     statesLayout->addWidget(_approvedCheck);
     statesLayout->addWidget(_pendingCheck);
     statesLayout->addStretch(1);
@@ -935,6 +996,7 @@ ScaffoldSolverPanel::ScaffoldSolverPanel(ScaffoldSolveController* controller, QW
                                    "normals, the signs those crossings decide, and the perpendicular,\n"
                                    "parallel and enclosure relations they assert. This reads the volume and\n"
                                    "takes seconds rather than milliseconds."));
+    _crossingsCheck->setChecked(true);
     form->addRow(tr("Crossings"), _crossingsCheck);
 
     _windingDistanceCheck = new QCheckBox(tr("Measure winding separations"), this);
@@ -965,16 +1027,31 @@ ScaffoldSolverPanel::ScaffoldSolverPanel(ScaffoldSolveController* controller, QW
         tr("Cost of one winding of error on an enclosure relation: the exact step a pair's\n"
            "crossings bound from both sides. Zero leaves enclosures out."));
     form->addRow(tr("Enclosure weight"), _enclosureWeightSpin);
+    _signWeightSpin = weightSpin("fiberMapSolveSignWeight",
+        tr("Cost of one winding past the bound a signed perpendicular crossing states on its\n"
+           "own: the V fiber lies outside the H fiber there, or inside. Every such crossing\n"
+           "bounds its pair's step from one side and costs only when the solve breaks the\n"
+           "bound (an enclosure is a pair bounded from both sides). It needs no winding\n"
+           "separation. Zero states none."));
+    _signWeightSpin->setValue(100.0);
+    _parallelWeightSpin->setValue(0.0);
+    _enclosureWeightSpin->setValue(0.0);
+    form->addRow(tr("Sign weight"), _signWeightSpin);
 
     _normalSourceCombo = new QComboBox(this);
     _normalSourceCombo->setObjectName(QStringLiteral("fiberMapSolveNormalSource"));
+    _normalSourceCombo->addItem(tr("full-volume neighbours"), QStringLiteral("neighbours"));
     _normalSourceCombo->addItem(tr("fiber geometry"), QStringLiteral("geometry"));
     _normalSourceCombo->addItem(tr("fused prediction"), QStringLiteral("fused"));
     _normalSourceCombo->setToolTip(tr("Where the fibers' normals come from. The geometry alone gives every\n"
                                       "fiber a strip normal; the fused source also pulls each node towards\n"
                                       "the sheet axis the package's fiber-inference prediction states there,\n"
                                       "weighted by its presence. Fused reads the prediction volume along\n"
-                                      "every fiber, which takes a minute on a large scaffold."));
+                                      "every fiber, which takes a minute on a large scaffold.\n"
+                                      "Full-volume neighbours pulls each fiber towards the signed normals of\n"
+                                      "the automatic fibers around it, as the whole-volume sign resolution\n"
+                                      "left them, and faces the fiber by them. It reads the file\n"
+                                      "<fiber store>.neighbour_normals.vcstrip next to the fiber store."));
     form->addRow(tr("Normals"), _normalSourceCombo);
 
     _signBackendCombo = new QComboBox(this);
@@ -1147,7 +1224,7 @@ void ScaffoldSolverPanel::updateEnabled()
         _runButton->setToolTip(tr("Nothing would constrain the windings: select a link state, or measure the\n"
                                   "fibers' crossings."));
     for (auto* widget : std::initializer_list<QWidget*>{_windingDistanceCheck, _perpendicularWeightSpin,
-                                                        _parallelWeightSpin, _enclosureWeightSpin,
+                                                        _parallelWeightSpin, _enclosureWeightSpin, _signWeightSpin,
                                                         _normalSourceCombo, _signBackendCombo})
         widget->setEnabled(crossings);
 }
@@ -1170,6 +1247,7 @@ ScaffoldSolveRequest ScaffoldSolverPanel::request() const
     request.perpendicularWeight = _perpendicularWeightSpin->value();
     request.parallelWeight = _parallelWeightSpin->value();
     request.enclosureWeight = _enclosureWeightSpin->value();
+    request.signWeight = _signWeightSpin->value();
     request.normalSource = _normalSourceCombo->currentData().toString().toStdString();
     request.signBackend = _signBackendCombo->currentData().toString().toStdString();
     request.workers = std::size_t(std::max(1, QThread::idealThreadCount()));
@@ -1543,6 +1621,8 @@ void ScaffoldApprovalPanel::rebuild()
         case std::int64_t(ScaffoldConstraintKind::Perpendicular): return tr("perpendicular");
         case std::int64_t(ScaffoldConstraintKind::Parallel): return tr("parallel");
         case std::int64_t(ScaffoldConstraintKind::Enclosure): return tr("enclosure");
+        case std::int64_t(ScaffoldConstraintKind::SignAtLeast): return tr("sign (at least)");
+        case std::int64_t(ScaffoldConstraintKind::SignAtMost): return tr("sign (at most)");
         default: return tr("constraint");
         }
     };
@@ -1588,8 +1668,12 @@ void ScaffoldApprovalPanel::rebuild()
         // be looked at; a link states its anchors the same way.
         const auto where = tr("%1 / %2").arg(spanText(spans[0], residual.arcA), spanText(spans[1], residual.arcB));
         const auto approvedConstraint = measured && _controller && _controller->constraintApproved(residual);
+        const bool signConstraint = residual.kind == std::int64_t(ScaffoldConstraintKind::SignAtLeast) ||
+                           residual.kind == std::int64_t(ScaffoldConstraintKind::SignAtMost);
+        // A bound is evidence, not a relation: there is nothing to approve.
         const auto state = !measured
             ? tr("link")
+            : signConstraint ? tr("sign")
             : (approvedConstraint ? tr("approved")
                                   : (spans[0].geometryApproved && spans[1].geometryApproved ? tr("approvable")
                                                                                             : tr("blocked")));
@@ -1628,7 +1712,12 @@ void ScaffoldApprovalPanel::rebuild()
     // (scaffoldApprovalSegments). Recomputed here, so approving one shrinks
     // or removes the ones that overlapped it.
     static const std::map<std::string, ScaffoldApprovalSpans> noApprovals;
-    const auto segments = scaffoldApprovalSegments(view->residuals, _controller ? _controller->approvals() : noApprovals);
+    // The stretches of the fibers this run solved: all of their unapproved
+    // geometry, the accused parts first.
+    std::map<std::string, ScaffoldApprovalSpans> runFibers;
+    for (const auto& [uuid, spans] : _controller ? _controller->approvals() : noApprovals)
+        if (view->windings.contains(uuid)) runFibers.emplace(uuid, spans);
+    const auto segments = scaffoldApprovalSegments(view->residuals, runFibers);
     // A control position as text: a whole number on a control point, two
     // decimals between two of them - never a range the segment does not have.
     const auto positionText = [](double position) {
@@ -1646,12 +1735,38 @@ void ScaffoldApprovalPanel::rebuild()
         entry.row.fiberUuid = segment.fiberUuid;
         entry.row.arcFrom = segment.arcFrom;
         entry.row.arcTo = segment.arcTo;
-        const bool placed = segment.controlFrom >= 0 && segment.controlTo > segment.controlFrom;
+        // A stretch of no length is a point - two constraints of one cycle
+        // meeting the fiber at the same place - and is placed like any other.
+        // A stretch with length whose two ends land on one control position lies
+        // outside the fiber's control points (the run is older than the
+        // annotation): that one is not placed, and selecting it says so.
+        const bool point = segment.controlFrom >= 0 && segment.controlTo == segment.controlFrom && !(segment.length() > 0);
+        const bool placed = segment.controlFrom >= 0 && (segment.controlTo > segment.controlFrom || point);
+        // What the row draws and opens: the segment's exact control positions,
+        // and the control points bracketing them outward. A point is shown by
+        // the span it lies on.
+        if (placed) {
+            entry.row.positionFrom = segment.controlFrom;
+            entry.row.positionTo = segment.controlTo;
+            std::int64_t from = std::int64_t(std::floor(segment.controlFrom));
+            std::int64_t to = std::max(std::int64_t(std::ceil(segment.controlTo)), from + 1);
+            // On the fiber's last control point the covering span is the last one.
+            if (_controller) {
+                const auto found = _controller->approvals().find(segment.fiberUuid);
+                if (found != _controller->approvals().end() && found->second.controlArcs.size() >= 2) {
+                    const auto last = std::int64_t(found->second.controlArcs.size()) - 1;
+                    if (to > last) { to = last; from = std::min(from, last - 1); }
+                }
+            }
+            entry.row.controlFrom = from;
+            entry.row.controlTo = to;
+        }
         // The solve reads only the annotated line (first to last control), so
         // a placed segment always lies between two control positions.
-        const QString where = placed
-            ? tr("cp %1-%2").arg(positionText(segment.controlFrom), positionText(segment.controlTo))
-            : tr("%1-%2 vx").arg(segment.arcFrom, 0, 'f', 0).arg(segment.arcTo, 0, 'f', 0);
+        const QString where = point
+            ? tr("cp %1").arg(positionText(segment.controlFrom))
+            : placed ? tr("cp %1-%2").arg(positionText(segment.controlFrom), positionText(segment.controlTo))
+                     : tr("%1-%2 vx").arg(segment.arcFrom, 0, 'f', 0).arg(segment.arcTo, 0, 'f', 0);
         QStringList loops;
         for (const auto number : segment.cycles) loops << QString::number(number);
         entry.text << tr("stretch") << label(segment.fiberUuid) << where << QString()
@@ -1835,18 +1950,39 @@ ScaffoldHighlight ScaffoldApprovalPanel::highlightOf(const QTreeWidgetItem* item
     const auto* residual = residualOf(item);
     if (!row->fiberUuid.empty()) highlight.fiberUuids.push_back(row->fiberUuid);
     if (!row->otherUuid.empty()) highlight.fiberUuids.push_back(row->otherUuid);
+    // Every row names stretches. One that cannot be stated is an error with
+    // its reason, never the whole fiber.
     if (row->kind == Row::Kind::Piece) {
-        if (row->controlFrom >= 0 && row->controlTo > row->controlFrom)
+        if (row->controlFrom >= 0 && row->controlTo > row->controlFrom) {
             highlight.spans.push_back(
                 {row->fiberUuid, row->controlFrom, row->controlTo, row->positionFrom, row->positionTo});
+        } else {
+            auto why = _controller ? _controller->anchorSpanProblem(row->fiberUuid, row->arcFrom) : tr("no solve controller");
+            if (why.isEmpty())
+                why = tr("fiber %1: the stretch does not lie between the fiber's control points as they are now "
+                         "(the run is older than the annotation; solve again)")
+                          .arg(QString::fromStdString(row->fiberUuid).left(8));
+            highlight.errors.push_back(tr("stretch at arc %1-%2 vx: %3")
+                                           .arg(row->arcFrom, 0, 'f', 0).arg(row->arcTo, 0, 'f', 0).arg(why).toStdString());
+        }
     } else if (residual) {
         // A constraint is drawn as the two pieces its anchors lie on, which
         // is what makes it visible on the map at all.
         const auto spans = coveringSpans(*residual);
         const std::array<std::string, 2> uuids{residual->fiberA, residual->fiberB};
-        for (std::size_t side = 0; side < 2; ++side)
-            if (spans[side].known)
+        const std::array<double, 2> arcs{residual->arcA, residual->arcB};
+        for (std::size_t side = 0; side < 2; ++side) {
+            if (spans[side].known) {
                 highlight.spans.push_back({uuids[side], spans[side].controlFrom, spans[side].controlTo});
+                continue;
+            }
+            auto why = _controller ? _controller->anchorSpanProblem(uuids[side], arcs[side]) : tr("no solve controller");
+            if (why.isEmpty()) why = tr("fiber %1: no span covers the anchor").arg(QString::fromStdString(uuids[side]).left(8));
+            highlight.errors.push_back(
+                tr("constraint anchor at arc %1 vx: %2").arg(arcs[side], 0, 'f', 0).arg(why).toStdString());
+        }
+    } else {
+        highlight.errors.push_back(tr("this row names no stretch and no constraint").toStdString());
     }
     return highlight;
 }
@@ -1862,7 +1998,16 @@ void ScaffoldApprovalPanel::activateRow(QTreeWidgetItem* item)
 {
     const auto* row = rowOf(item);
     if (!row || row->kind != Row::Kind::Piece) return;
-    if (row->fiberUuid.empty() || row->controlFrom < 0 || row->controlTo <= row->controlFrom) return;
+    if (row->fiberUuid.empty() || row->controlFrom < 0 || row->controlTo <= row->controlFrom) {
+        // A stretch without a control range cannot be opened, and says why.
+        const auto highlight = highlightOf(item);
+        QStringList reasons;
+        for (const auto& error : highlight.errors) reasons << QString::fromStdString(error);
+        if (_controller)
+            emit _controller->statusMessage(tr("ERROR: stretch not opened - %1")
+                                                .arg(reasons.isEmpty() ? tr("it has no control range") : reasons.join(QStringLiteral("; "))));
+        return;
+    }
     emit pieceActivated(row->fiberUuid, row->controlFrom, row->controlTo, row->arcFrom, row->arcTo);
 }
 

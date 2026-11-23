@@ -32,6 +32,18 @@ constexpr double kPi = std::numbers::pi;
 
 double radians(double degrees) { return degrees * kPi / 180.; }
 
+// Every relation type at weight 1, no sign constraints and no crossing
+// confidence: the tests below state what each relation asserts, not how the
+// scaffold workflow weights it by default.
+ScaffoldMeasuredOptions unitWeights()
+{
+    ScaffoldMeasuredOptions options;
+    options.perpendicularWeight = options.parallelWeight = options.enclosureWeight = 1.;
+    options.signWeight = 0.;
+    options.crossingConfidence = false;
+    return options;
+}
+
 Point polar(double radius, double degrees, double z)
 {
     return {radius * std::cos(radians(degrees)), radius * std::sin(radians(degrees)), z};
@@ -148,8 +160,11 @@ ScaffoldWindingDistances constantDistance(double turns)
     };
 }
 
-// Two fibers, both in the inward gauge.
-const std::vector<std::int64_t> kInwardSigns{1, 1};
+// Two fibers, both in the outward gauge.
+const std::vector<std::int64_t> kOutwardSigns{1, 1};
+// The same two as the bulk winding assembly takes them: turned the way the
+// winding falls, which in these scrolls (handedness +1) is inward.
+const std::vector<std::int64_t> kFallingSigns{-1, -1};
 
 ScaffoldEventOptions withoutDistances()
 {
@@ -267,15 +282,15 @@ TEST_CASE("a fractional separation is split or rounded as the mode says")
     REQUIRE_FALSE(crossings.empty());
 
     ScaffoldMeasuredReport splitReport;
-    ScaffoldMeasuredOptions split;
+    ScaffoldMeasuredOptions split = unitWeights();
     split.separations = ScaffoldSeparationMode::Split;
     const auto splitArcs =
-        scaffoldMeasuredConstraints(scaffold.graph, geometry, crossings, kInwardSigns, split, splitReport);
+        scaffoldMeasuredConstraints(scaffold.graph, geometry, crossings, kOutwardSigns, split, splitReport);
     ScaffoldMeasuredReport roundedReport;
-    ScaffoldMeasuredOptions rounded;
+    ScaffoldMeasuredOptions rounded = unitWeights();
     rounded.separations = ScaffoldSeparationMode::Rounded;
     const auto roundedArcs =
-        scaffoldMeasuredConstraints(scaffold.graph, geometry, crossings, kInwardSigns, rounded, roundedReport);
+        scaffoldMeasuredConstraints(scaffold.graph, geometry, crossings, kOutwardSigns, rounded, roundedReport);
 
     CHECK(splitReport.used == roundedReport.used);
     CHECK(splitReport.fractional == roundedReport.fractional);
@@ -299,7 +314,7 @@ TEST_CASE("a fractional separation is split or rounded as the mode says")
                         roundedArcs[i].event == roundedArcs[j].event);
 }
 
-TEST_CASE("an adjacent link fixes the inward normal of both of its fibers")
+TEST_CASE("an adjacent link fixes the outward normal of both of its fibers")
 {
     Scaffold scaffold;
     const auto horizontal = scaffold.fiber(ScaffoldFamily::Horizontal, arcLine(300., 20., 70., 0., 40));
@@ -317,21 +332,23 @@ TEST_CASE("an adjacent link fixes the inward normal of both of its fibers")
     CHECK(normals.signSources()[horizontal] == ScaffoldSignSource::AdjacentLink);
     CHECK(normals.fixedSigns()[vertical] == 1);
 
-    // The V fiber lies inside the H fiber, so both inward normals point from
-    // the H anchor towards the V anchor: here exactly the inward radial.
-    const Point inward{-std::cos(radians(45.)), -std::sin(radians(45.)), 0.};
-    for (const auto& anchor : normals.anchors()) CHECK(dot(anchor.inward, inward) == doctest::Approx(1.).epsilon(1e-6));
+    // The V fiber lies one winding below the H fiber and, in this scroll
+    // (handedness +1, the winding falls inward), inside it: the outward
+    // normal of both points from the V anchor towards the H anchor, here
+    // exactly the outward radial.
+    const Point radial{std::cos(radians(45.)), std::sin(radians(45.)), 0.};
+    for (const auto& anchor : normals.anchors()) CHECK(dot(anchor.outward, radial) == doctest::Approx(1.).epsilon(1e-6));
     const auto solvedH = normals.at(horizontal, geometry.project(horizontal, anchorH).arc);
     const auto solvedV = normals.at(vertical, geometry.project(vertical, anchorV).arc);
     REQUIRE(solvedH);
     REQUIRE(solvedV);
-    CHECK(dot(*solvedH, inward) > 0.99);
-    CHECK(dot(*solvedV, inward) > 0.99);
-    // An inward field disagrees with the outward radial prior.
-    CHECK(normals.radialAgreement()[horizontal] < -0.9);
+    CHECK(dot(*solvedH, radial) > 0.99);
+    CHECK(dot(*solvedV, radial) > 0.99);
+    // Every signed normal points outward, so it agrees with the outward radial prior.
+    CHECK(normals.radialAgreement()[horizontal] > 0.9);
 }
 
-TEST_CASE("a manual display normal is read outward and fixes the gauge inward")
+TEST_CASE("a manual display normal is read outward and fixes the gauge outward")
 {
     Scaffold scaffold;
     const auto horizontal = scaffold.fiber(ScaffoldFamily::Horizontal, arcLine(300., 20., 70., 0., 40));
@@ -344,9 +361,9 @@ TEST_CASE("a manual display normal is read outward and fixes the gauge inward")
     const auto arc = geometry.controlArc(horizontal, 2);
     const auto solved = normals.at(horizontal, arc);
     REQUIRE(solved);
-    // The stored direction points outward; the gauge is the inward one.
-    CHECK(dot(*solved, outward(control)) < -0.99);
-    CHECK(normals.radialAgreement()[horizontal] < -0.9);
+    // The stored direction points outward, and so does the gauge.
+    CHECK(dot(*solved, outward(control)) > 0.99);
+    CHECK(normals.radialAgreement()[horizontal] > 0.9);
 }
 
 TEST_CASE("an unanchored fiber keeps no sign of its own")
@@ -360,6 +377,126 @@ TEST_CASE("an unanchored fiber keeps no sign of its own")
     CHECK(normals.fixedSigns()[0] == 0);
     CHECK(normals.signSources()[0] == ScaffoldSignSource::None);
     CHECK(normals.solved(0));
+}
+
+// A neighbour field of two arcs beside an H fiber at radius 300, their
+// signed normals radial: `facing` +1 outward, -1 inward.
+vc::fiber_tracer::FiberNeighbourField radialField(double facing, double radiusOffset = 0.)
+{
+    std::vector<std::vector<vc::fiber_tracer::FiberStripSample>> fibers;
+    for (const double radius : {280. + radiusOffset, 320. + radiusOffset}) {
+        std::vector<vc::fiber_tracer::FiberStripSample> samples;
+        for (double degrees = 15.; degrees <= 75.; degrees += 2.) {
+            const auto point = polar(radius, degrees, 0.);
+            const auto normal = outward(point);
+            samples.push_back({radians(degrees - 15.) * radius, {point[0], point[1], point[2]},
+                               {facing * normal[0], facing * normal[1], 0.}, {0., 0., 0.}});
+        }
+        fibers.push_back(std::move(samples));
+    }
+    return vc::fiber_tracer::FiberNeighbourField(std::move(fibers), {1, 1}, 384.);
+}
+
+TEST_CASE("neighbour normals face a fiber no anchor fixed")
+{
+    Scaffold scaffold;
+    const auto horizontal = scaffold.fiber(ScaffoldFamily::Horizontal, arcLine(300., 20., 70., 0., 40));
+    const ScaffoldGeometry geometry(scaffold.graph);
+    const auto middle = geometry.controlArc(horizontal, 2);
+    for (const double facing : {1., -1.}) {
+        const auto field = radialField(facing);
+        ScaffoldNormalOptions options;
+        options.neighbours.field = &field;
+        options.neighbours.identity = "test field";
+        options.neighbours.volume = "test-volume";
+        const ScaffoldNormals normals(scaffold.graph, geometry, options);
+        CHECK(normals.report().neighbourSamples > 0);
+        CHECK(normals.report().neighbourSamplesAnswered == normals.report().neighbourSamples);
+        CHECK(normals.report().neighbourFacedFibers == 1);
+        CHECK(normals.signSources()[horizontal] == ScaffoldSignSource::Neighbours);
+        CHECK(normals.fixedSigns()[horizontal] == 1);
+        const auto solved = normals.at(horizontal, middle);
+        REQUIRE(solved);
+        CHECK(facing * dot(*solved, outward(scaffold.graph.fibers[horizontal].content.controlPoints[2])) > 0.99);
+    }
+}
+
+TEST_CASE("crossings by the field's fibers and by the scaffold's own give the crossing axis")
+{
+    Scaffold scaffold;
+    const auto horizontal = scaffold.fiber(ScaffoldFamily::Horizontal, arcLine(300., 20., 70., 0., 40));
+    // A V fiber of the scaffold crossing the H fiber 10 voxels outside it.
+    scaffold.fiber(ScaffoldFamily::Vertical, verticalLine(310., 45., -150., 150., 30));
+    const ScaffoldGeometry geometry(scaffold.graph);
+    // The field: the two arcs beside the H fiber, and a vertical fiber crossing it at 30 degrees.
+    auto fibers = std::vector<std::vector<vc::fiber_tracer::FiberStripSample>>{};
+    {
+        std::vector<vc::fiber_tracer::FiberStripSample> vertical;
+        for (double z = -160.; z <= 160.; z += 16.) {
+            const auto point = polar(292., 30., z);
+            const auto normal = outward(point);
+            vertical.push_back({z + 160., {point[0], point[1], point[2]}, {normal[0], normal[1], 0.}, {0., 0., 0.}});
+        }
+        fibers.push_back(std::move(vertical));
+    }
+    const vc::fiber_tracer::FiberNeighbourField field(std::move(fibers), {1}, 384.);
+    ScaffoldNormalOptions options;
+    options.neighbours.field = &field;
+    options.neighbours.identity = "test field";
+    options.neighbours.volume = "test-volume";
+    {
+        const ScaffoldNormals normals(scaffold.graph, geometry, options);
+        CHECK(normals.report().fieldCrossings == 1);    // the H fiber by the field's vertical fiber
+        CHECK(normals.report().scaffoldCrossings == 2); // the H and the V fiber by each other
+        CHECK(normals.report().crossedNodes > 0);
+        const auto solved = normals.at(horizontal, geometry.controlArc(horizontal, 2));
+        REQUIRE(solved);
+        // Own tangent x a vertical tangent is radial: the crossing axis the normal lies along.
+        CHECK(std::abs(dot(*solved, outward(scaffold.graph.fibers[horizontal].content.controlPoints[2]))) > 0.99);
+    }
+    {
+        options.neighbours.fieldCrossings = options.neighbours.scaffoldCrossings = false;
+        const ScaffoldNormals normals(scaffold.graph, geometry, options);
+        CHECK(normals.report().fieldCrossings == 0);
+        CHECK(normals.report().scaffoldCrossings == 0);
+        CHECK(normals.report().crossedNodes == 0);
+    }
+}
+
+TEST_CASE("an anchor outranks the neighbour normals, and a field elsewhere is refused")
+{
+    Scaffold scaffold;
+    const auto horizontal = scaffold.fiber(ScaffoldFamily::Horizontal, arcLine(300., 20., 70., 0., 40));
+    const auto vertical = scaffold.fiber(ScaffoldFamily::Vertical, verticalLine(250., 45., -150., 150., 30));
+    scaffold.link(horizontal, vertical, polar(300., 45., 0.), polar(250., 45., 0.), true);
+    const ScaffoldGeometry geometry(scaffold.graph);
+    ScaffoldNormalOptions options;
+    options.neighbours.identity = "test field";
+    options.neighbours.volume = "test-volume";
+    {
+        // A field facing inward against the adjacent link's outward anchor: the link wins.
+        const auto field = radialField(-1.);
+        options.neighbours.field = &field;
+        const ScaffoldNormals normals(scaffold.graph, geometry, options);
+        CHECK(normals.signSources()[horizontal] == ScaffoldSignSource::AdjacentLink);
+        CHECK(normals.report().neighbourFacedFibers == 0);
+        const auto solved = normals.at(horizontal, geometry.project(horizontal, polar(300., 45., 0.)).arc);
+        REQUIRE(solved);
+        CHECK(dot(*solved, outward(polar(300., 45., 0.))) > 0.99);
+    }
+    {
+        // No field fiber within reach of any scaffold fiber.
+        const auto field = radialField(1., 5000.);
+        options.neighbours.field = &field;
+        CHECK_THROWS(ScaffoldNormals(scaffold.graph, geometry, options));
+    }
+    {
+        // A field in another volume's voxels.
+        const auto field = radialField(1.);
+        options.neighbours.field = &field;
+        options.neighbours.volume = "another-volume";
+        CHECK_THROWS(ScaffoldNormals(scaffold.graph, geometry, options));
+    }
 }
 
 TEST_CASE("an H and a V fiber that pass each other cross perpendicularly")
@@ -393,7 +530,7 @@ TEST_CASE("an H and a V fiber that pass each other cross perpendicularly")
     // Without a measured separation no arc is asserted, but the signed order
     // still witnesses the pair's enclosure.
     ScaffoldMeasuredReport measuredReport;
-    const auto measured = scaffoldMeasuredConstraints(scaffold.graph, geometry, events, kInwardSigns, {}, measuredReport);
+    const auto measured = scaffoldMeasuredConstraints(scaffold.graph, geometry, events, kOutwardSigns, unitWeights(), measuredReport);
     CHECK(measuredReport.used == 0);
     CHECK(measuredReport.withoutDistance == report.events);
     CHECK(measuredReport.enclosurePairs == 1);
@@ -420,7 +557,7 @@ TEST_CASE("a measured separation asserts the integer step of a crossing")
     CHECK(report.withDistance == report.events);
 
     ScaffoldMeasuredReport measuredReport;
-    const auto measured = scaffoldMeasuredConstraints(scaffold.graph, geometry, events, kInwardSigns, {}, measuredReport);
+    const auto measured = scaffoldMeasuredConstraints(scaffold.graph, geometry, events, kOutwardSigns, unitWeights(), measuredReport);
     CHECK(measuredReport.used == report.events);
     CHECK(measuredReport.perpendicular == report.events);
     REQUIRE_FALSE(measured.empty());
@@ -459,9 +596,9 @@ TEST_CASE("a pair that crosses twice in opposite order fixes its enclosure exact
     REQUIRE(report.events >= 2);
 
     ScaffoldMeasuredReport measuredReport;
-    ScaffoldMeasuredOptions measuredOptions;
+    ScaffoldMeasuredOptions measuredOptions = unitWeights();
     const auto measured =
-        scaffoldMeasuredConstraints(scaffold.graph, geometry, events, kInwardSigns, measuredOptions, measuredReport);
+        scaffoldMeasuredConstraints(scaffold.graph, geometry, events, kOutwardSigns, measuredOptions, measuredReport);
     INFO("pairs=" << measuredReport.enclosurePairs << " arcs=" << measuredReport.enclosureArcs << " one_sided="
                   << measuredReport.enclosureOneSided << " contradictory=" << measuredReport.enclosureContradictory
                   << " nonunique=" << measuredReport.enclosureNonunique);
@@ -472,6 +609,36 @@ TEST_CASE("a pair that crosses twice in opposite order fixes its enclosure exact
     CHECK(measured.front().weight == doctest::Approx(measuredOptions.enclosureWeight));
     CHECK(measured.front().a == std::int64_t(std::min(spiral, vertical)));
     CHECK(measured.front().b == std::int64_t(std::max(spiral, vertical)));
+
+    // The same crossings as sign constraints: each states its own bound,
+    // one from below and one from above, and together they leave the solve
+    // exactly the step the enclosure states.
+    ScaffoldMeasuredOptions boundOptions = unitWeights();
+    boundOptions.enclosureWeight = 0.;
+    boundOptions.signWeight = 10.;
+    ScaffoldMeasuredReport boundReport;
+    const auto bounds =
+        scaffoldMeasuredConstraints(scaffold.graph, geometry, events, kOutwardSigns, boundOptions, boundReport);
+    CHECK(boundReport.signConstraints == std::int64_t(bounds.size()));
+    CHECK(boundReport.enclosureArcs == 0);
+    std::int64_t atLeast = 0, atMost = 0;
+    for (const auto& bound : bounds) {
+        CHECK(bound.weight == doctest::Approx(10.));
+        CHECK(bound.a == measured.front().a);
+        CHECK(bound.b == measured.front().b);
+        if (bound.kind == ScaffoldConstraintKind::SignAtLeast) ++atLeast;
+        else if (bound.kind == ScaffoldConstraintKind::SignAtMost) ++atMost;
+        else FAIL("a sign weight states only sign constraints here");
+    }
+    CHECK(atLeast >= 1);
+    CHECK(atMost >= 1);
+    ScaffoldSolveOptions solveOptions;
+    solveOptions.links.useLinks = false;
+    solveOptions.links.approvalStates.clear();
+    const auto solved = solveScaffoldWinding(scaffold.graph, geometry, solveOptions, bounds);
+    CHECK(solved.violatedConstraints == 0);
+    CHECK(solved.winding[std::size_t(measured.front().b)] - solved.winding[std::size_t(measured.front().a)] ==
+          measured.front().target);
 }
 
 TEST_CASE("the sign solve decides the gauge of a fiber no anchor fixed")
@@ -502,11 +669,11 @@ TEST_CASE("the sign solve decides the gauge of a fiber no anchor fixed")
     // H fiber.
     const auto solved = normals.at(vertical, geometry.project(vertical, polar(260., 45., 0.)).arc);
     REQUIRE(solved);
-    const Point inward{-std::cos(radians(45.)), -std::sin(radians(45.)), 0.};
+    const Point radial{std::cos(radians(45.)), std::sin(radians(45.)), 0.};
     // A straight V fiber's gauge direction is arbitrary within the plane
     // perpendicular to it - only its sign is decided here, and the decided
-    // one points to the inward half space.
-    CHECK(dot(*solved, inward) * double(signs.sign[vertical]) > 0.5);
+    // one points to the outward half space.
+    CHECK(dot(*solved, radial) * double(signs.sign[vertical]) > 0.5);
     CHECK(signs.fixedDisagreements == 0);
 }
 
@@ -629,12 +796,12 @@ TEST_CASE("a scaffold's measured relations are the ones the bulk assembly builds
     const auto events = scaffoldEvents(scaffold.graph, geometry, normals, eventOptions, constantDistance(0.75), report);
     REQUIRE(report.events >= 2);
 
-    ScaffoldMeasuredOptions measuredOptions;
+    ScaffoldMeasuredOptions measuredOptions = unitWeights();
     measuredOptions.perpendicularWeight = 2.;
     measuredOptions.parallelWeight = 3.;
     ScaffoldMeasuredReport measuredReport;
     const auto measured =
-        scaffoldMeasuredConstraints(scaffold.graph, geometry, events, kInwardSigns, measuredOptions, measuredReport);
+        scaffoldMeasuredConstraints(scaffold.graph, geometry, events, kOutwardSigns, measuredOptions, measuredReport);
 
     // The same events as the bulk preparation's columns.
     std::vector<std::int64_t> a, b;
@@ -667,7 +834,7 @@ TEST_CASE("a scaffold's measured relations are the ones the bulk assembly builds
     input.a = {a.data(), a.size(), 1};
     input.b = {b.data(), b.size(), 1};
     input.family = family;
-    input.normalSign = kInwardSigns;
+    input.normalSign = kFallingSigns;
     input.arcA = {arcA.data(), arcA.size(), 1};
     input.arcB = {arcB.data(), arcB.size(), 1};
     input.distance = {distance.data(), distance.size(), 1};
@@ -727,7 +894,7 @@ TEST_CASE("an approval row marks the measured constraint it names")
     ScaffoldEventReport report;
     const auto events = scaffoldEvents(scaffold.graph, geometry, normals, {}, constantDistance(1.), report);
     ScaffoldMeasuredReport measuredReport;
-    auto measured = scaffoldMeasuredConstraints(scaffold.graph, geometry, events, kInwardSigns, {}, measuredReport);
+    auto measured = scaffoldMeasuredConstraints(scaffold.graph, geometry, events, kOutwardSigns, unitWeights(), measuredReport);
     REQUIRE_FALSE(measured.empty());
     for (const auto& constraint : measured) CHECK_FALSE(constraint.approved);
 

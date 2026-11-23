@@ -549,14 +549,9 @@ private:
                                    PlaneSurface* plane) const;
     cv::Vec3f interpolatedLinePoint(double linePosition) const;
     cv::Vec3f interpolatedLineTangent(double linePosition) const;
+    // The strip's own normal at a line position (GeneratedViews::lineUpVectors),
+    // perpendicular to the tangent: the one up direction of every cut view.
     cv::Vec3f interpolatedLineUp(double linePosition, const cv::Vec3f& tangent) const;
-    // Interpolated sampled sheet normal (oriented away from the scroll
-    // center, see GeneratedViews::lineNormals). NaN when samples are missing.
-    cv::Vec3f interpolatedOrientedNormal(double linePosition) const;
-    // The same normal projected perpendicular to the tangent. NaN when the
-    // projection is unstable (normal nearly parallel to the tangent, i.e.
-    // extreme bends).
-    cv::Vec3f interpolatedLineNormal(double linePosition, const cv::Vec3f& tangent) const;
     bool updatePlaneSurface(PlaneSurface* plane, double linePosition) const;
     bool updateSidePlaneSurface(PlaneSurface* plane, double linePosition) const;
     bool handleKeyPress(QKeyEvent* event);

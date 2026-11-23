@@ -27,11 +27,13 @@
 #include <opencv2/core.hpp>
 
 #include <array>
+#include <filesystem>
 #include <functional>
 #include <map>
 #include <chrono>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -72,12 +74,17 @@ struct ScaffoldSolveRequest {
     // annotation, their signs from the crossings, and the perpendicular,
     // parallel and enclosure relations they assert.
     bool measureCrossings = false;
-    double perpendicularWeight = 1.0, parallelWeight = 1.0, enclosureWeight = 1.0;
+    double perpendicularWeight = 1.0, parallelWeight = 0.0, enclosureWeight = 0.0;
+    // Weight of the local sign constraint every signed perpendicular crossing
+    // states (ScaffoldMeasuredOptions::signWeight); zero states none.
+    double signWeight = 100.0;
     // Measure each connector's winding separation on the bound normal
     // dataset. Off keeps the crossings as enclosure evidence only.
     bool measureWindingDistances = true;
     // "geometry": the fibers' own strip normals. "fused": those pulled
     // towards the sheet axis the package's fiber-inference prediction states.
+    // "neighbours": those pulled towards, and faced by, the signed normals of
+    // a resolved fiber volume (ScaffoldSolveController::neighbourNormalsPath).
     std::string normalSource = "geometry";
     std::string signBackend = "irls";
     std::size_t workers = 1;
@@ -129,10 +136,10 @@ public:
     void setFrame(const std::string& volume);
     // The normals the selected run used along one fiber: its annotated line in
     // the runs' frame and, per point, the solved strip normal with the run's
-    // whole-fiber sign, turned to point away from the scroll centre (the
-    // annotation views' convention). nullopt, with the reason, when the
-    // selected run solved no normals or the store no longer holds them for
-    // the fiber as it is now.
+    // whole-fiber sign, which points away from the scroll centre (the one
+    // convention of every signed normal). They are read through the run's own
+    // reference to its normals row. nullopt, with the reason, when the run
+    // solved no normals for the fiber or the reference does not resolve.
     struct RunFiberNormals {
         std::vector<cv::Vec3f> points, normals;
     };
@@ -140,6 +147,8 @@ public:
     // The span of a fiber covering an anchor arc, and whether it is approved.
     // Answers from the loaded piece approvals, so it needs loadApprovals().
     [[nodiscard]] ScaffoldAnchorSpan anchorSpan(const std::string& fiberUuid, double arc) const;
+    // Why anchorSpan() knows no span there; empty when it does.
+    [[nodiscard]] QString anchorSpanProblem(const std::string& fiberUuid, double arc) const;
 
     // The winding density a run measures its separations on. The workspace
     // binds the package's Lasagna normal dataset; a run that would measure
@@ -162,6 +171,19 @@ public:
         std::function<vc::fiber_graph::ScaffoldAxisSampler(QString* error, std::string* identity)>;
     using AxisSamplerResolver = std::function<AxisSamplerOpener()>;
     void setAxisSampler(AxisSamplerResolver);
+
+    // The signed strip samples a neighbours run reads: a file of this name
+    // next to the fiber store (`vc_fiber_constraints`,
+    // `signed_strip_samples_output`). Fixed for now; the run is refused when
+    // the file is missing.
+    [[nodiscard]] static std::filesystem::path neighbourNormalsPath(const std::filesystem::path& fiberStore);
+    // The opened file, kept between runs and re-read when it changed.
+    struct NeighbourNormals {
+        std::mutex mutex;
+        std::filesystem::path path;
+        std::filesystem::file_time_type written{};
+        vc::fiber_graph::ScaffoldNeighbourSource source;
+    };
 
     // Approval of a *measured* constraint (a crossing). A link's approval is
     // its edge record's review state and is not touched here.
@@ -227,6 +249,7 @@ private:
     QFutureWatcher<void>* _watcher = nullptr;
     WindingSamplerResolver _windingSampler;
     AxisSamplerResolver _axisSampler;
+    std::shared_ptr<NeighbourNormals> _neighbours;
 };
 
 // The solver dock: what a run uses, and the Run button.
@@ -271,6 +294,7 @@ private:
     QDoubleSpinBox* _perpendicularWeightSpin = nullptr;
     QDoubleSpinBox* _parallelWeightSpin = nullptr;
     QDoubleSpinBox* _enclosureWeightSpin = nullptr;
+    QDoubleSpinBox* _signWeightSpin = nullptr;
     QComboBox* _normalSourceCombo = nullptr;
     QComboBox* _signBackendCombo = nullptr;
     QComboBox* _backendCombo = nullptr;
@@ -360,6 +384,10 @@ public:
     using LabelLookup = std::function<QString(const std::string& fiberUuid)>;
     void setLabelLookup(LabelLookup);
 
+public:
+    // What a row names on the map: the stretches drawn, or why one cannot be.
+    [[nodiscard]] ScaffoldHighlight highlightOf(const QTreeWidgetItem*) const;
+
 signals:
     void highlightRequested(const ScaffoldHighlight& highlight);
     // The row under the mouse, or an empty highlight when it left the list:
@@ -417,8 +445,6 @@ private:
     void activateRow(QTreeWidgetItem* item);
     // The row an item names, or null when the item is stale.
     [[nodiscard]] const Row* rowOf(const QTreeWidgetItem*) const;
-    // What a row names on the map: its fibers and the stretches drawn.
-    [[nodiscard]] ScaffoldHighlight highlightOf(const QTreeWidgetItem*) const;
     bool eventFilter(QObject* watched, QEvent* event) override;
     // The residual a row names, when the row is a constraint of the selected
     // run; null for a stretch or a row of another run.

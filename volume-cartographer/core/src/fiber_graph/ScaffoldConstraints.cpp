@@ -401,7 +401,8 @@ std::vector<ScaffoldConstraint> scaffoldMeasuredConstraints(const ScaffoldGraph&
                                                            const ScaffoldMeasuredOptions& options,
                                                            ScaffoldMeasuredReport& report)
 {
-    for (const auto weight : {options.perpendicularWeight, options.parallelWeight, options.enclosureWeight})
+    for (const auto weight :
+         {options.perpendicularWeight, options.parallelWeight, options.enclosureWeight, options.signWeight})
         if (!std::isfinite(weight) || weight < 0)
             throw std::invalid_argument("scaffold constraints: a measured weight is negative or nonfinite");
     if (!std::isfinite(options.perpendicularOffset) || !std::isfinite(options.windingScale) || options.windingScale < 0)
@@ -413,6 +414,7 @@ std::vector<ScaffoldConstraint> scaffoldMeasuredConstraints(const ScaffoldGraph&
 
     report = ScaffoldMeasuredReport{};
     report.events = std::int64_t(events.size());
+    const auto fallingSign = std::int64_t(scaffoldFallingWindingSign(graph));
     std::vector<ScaffoldConstraint> constraints;
     // One signed bound on the H->V step of a pair, with the event that
     // witnessed it: an accepted enclosure keeps that event's anchors so the
@@ -457,8 +459,9 @@ std::vector<ScaffoldConstraint> scaffoldMeasuredConstraints(const ScaffoldGraph&
         input.b = event.b;
         input.familyA = familyIndex(familyA);
         input.familyB = familyIndex(familyB);
-        input.signA = normalSign[std::size_t(event.a)];
-        input.signB = normalSign[std::size_t(event.b)];
+        // The relation orders two fibers by the direction their winding falls in.
+        input.signA = normalSign[std::size_t(event.a)] * fallingSign;
+        input.signB = normalSign[std::size_t(event.b)] * fallingSign;
         input.arcA = event.arcA;
         input.arcB = event.arcB;
         input.distance = event.distance * options.windingScale;
@@ -467,13 +470,33 @@ std::vector<ScaffoldConstraint> scaffoldMeasuredConstraints(const ScaffoldGraph&
                            event.pointB[2] - event.pointA[2]};
         input.normalA = event.normalA;
         input.normalB = event.normalB;
-        input.weight = event.parallel ? options.parallelWeight : options.perpendicularWeight;
-        input.enclosure = options.enclosures && options.enclosureWeight > 0;
+        const double confidence = options.crossingConfidence
+            ? fiber_tracer::fiberSignEventWeight((event.normalA[0] * event.normalB[0] + event.normalA[1] * event.normalB[1]) +
+                                                     event.normalA[2] * event.normalB[2],
+                                                 input.distance, options.confidence)
+            : 1.;
+        input.weight = (event.parallel ? options.parallelWeight : options.perpendicularWeight) * confidence;
+        const bool enclosures = options.enclosures && options.enclosureWeight > 0;
+        input.enclosure = enclosures || options.signWeight > 0;
         input.perpendicularOffset = options.perpendicularOffset;
 
         const auto relation = geometry::windingEventRelation(geometry.packed(), input);
         if (relation.withoutDistance) ++report.withoutDistance;
-        if (relation.hasEnclosure) bounds.push_back({relation.enclosure, std::int64_t(index), relation.transport});
+        if (relation.hasEnclosure && enclosures)
+            bounds.push_back({relation.enclosure, std::int64_t(index), relation.transport});
+        // The local sign this crossing states on its own: the H -> V step is at
+        // least (the V fiber outside) or at most its bound, stated in node order.
+        if (relation.hasEnclosure && options.signWeight > 0) {
+            const auto& bound = relation.enclosure;
+            const bool ordered = bound.h < bound.v;
+            const int side = ordered ? bound.sign : -bound.sign;
+            const geometry::winding_graph_detail::Arc arc{ordered ? bound.h : bound.v, ordered ? bound.v : bound.h,
+                                                          ordered ? bound.bound : -bound.bound,
+                                                          options.signWeight * confidence};
+            append(arc, event, std::int64_t(index), relation.transport,
+                   side > 0 ? ScaffoldConstraintKind::SignAtLeast : ScaffoldConstraintKind::SignAtMost);
+            ++report.signConstraints;
+        }
         if (!relation.usable) continue;
         const auto kind = event.parallel ? ScaffoldConstraintKind::Parallel : ScaffoldConstraintKind::Perpendicular;
         if (relation.hasUpper) ++report.fractional;
@@ -546,6 +569,9 @@ objects::FiberConstraintKind scaffoldConstraintStoreKind(ScaffoldConstraintKind 
         case ScaffoldConstraintKind::Perpendicular: return objects::FiberConstraintKind::Perpendicular;
         case ScaffoldConstraintKind::Parallel: return objects::FiberConstraintKind::Parallel;
         case ScaffoldConstraintKind::Enclosure: return objects::FiberConstraintKind::Enclosure;
+        case ScaffoldConstraintKind::SignAtLeast:
+        case ScaffoldConstraintKind::SignAtMost:
+            throw std::invalid_argument("scaffold constraints: a sign constraint has no approval");
     }
     throw std::invalid_argument("scaffold constraints: unknown constraint kind");
 }
@@ -657,6 +683,7 @@ void applyScaffoldConstraintApprovals(const ScaffoldGraph& graph, const Scaffold
     };
     for (auto& constraint : measured) {
         if (constraint.link >= 0) continue; // a map link's approval is its edge record's state
+        if (scaffoldConstraintSide(constraint.kind) != 0) continue; // a bound is never approved
         const auto found = index.find(scaffoldConstraintIdentity(graph, constraint));
         if (found == index.end()) continue;
         matched[found->second] = 1;
@@ -701,13 +728,14 @@ std::vector<ScaffoldNormalFlip> scaffoldLinkNormalFlips(const ScaffoldGraph& gra
         const auto& constraint = constraints[index];
         if (constraint.link < 0 || constraint.kind == ScaffoldConstraintKind::Enclosure) continue;
         ++report.checked;
-        const auto inward = [&](std::int64_t fiber, double arc) -> std::optional<geometry::Point> {
+        // The signed normal turned the way the winding falls, which is what orders two fibers.
+        const auto falling = [&](std::int64_t fiber, double arc) -> std::optional<geometry::Point> {
             const auto normal = normals.at(std::size_t(fiber), arc);
             if (!normal) return std::nullopt;
-            const double sign = double(normalSign[std::size_t(fiber)]);
+            const double sign = double(normalSign[std::size_t(fiber)]) * scaffoldFallingWindingSign(graph);
             return geometry::Point{(*normal)[0] * sign, (*normal)[1] * sign, (*normal)[2] * sign};
         };
-        const auto normalA = inward(constraint.a, constraint.arcA), normalB = inward(constraint.b, constraint.arcB);
+        const auto normalA = falling(constraint.a, constraint.arcA), normalB = falling(constraint.b, constraint.arcB);
         int observed = 0, expected = 1;
         if (normalA && normalB) {
             if (constraint.kind == ScaffoldConstraintKind::Parallel) {

@@ -88,10 +88,9 @@
     require(spanA.controlFrom == 3 && spanA.controlTo == 4, "arc 35 lies between controls 3 and 4");
     require(!spanA.geometryApproved && !spanB.geometryApproved, "nothing is approved yet");
 
-    // A segment whose ends are on no control point: the dock states them as
-    // control positions, and opening it hands the annotation the line points
-    // at exactly those arcs - where the lock controls are then inserted
-    // (LineAnnotationPieceLockTest covers the insertion itself).
+    // The dock's stretches end on control points: the accused stretch lies in
+    // one that covers it, and opening it hands the annotation the line points
+    // of those controls.
     {
         ScaffoldStoredResidual accusing = residual;
         vc::fiber_graph::ScaffoldStoredPiece stretch;
@@ -100,27 +99,19 @@
         stretch.arcTo = 27.6;
         accusing.cycleHops = 2;
         accusing.pieces = {stretch};
-        vc3d::fiber_map::ScaffoldSegmentOptions noSnap;
-        noSnap.snapVx = 1.0;       // the controls are 10 vx apart: none is within reach
-        noSnap.minSegmentVx = 1.0;
-        const auto segments = vc3d::fiber_map::scaffoldApprovalSegments({accusing}, solves.approvals(), noSnap);
-        require(segments.size() == 1, "one accused stretch is one segment");
-        const auto& segment = segments.front();
-        require(segment.arcFrom == 12.4 && segment.arcTo == 27.6, "nothing snapped: no control point is within reach");
-        require(std::abs(segment.controlFrom - 1.24) < 1e-9 && std::abs(segment.controlTo - 2.76) < 1e-9,
-                "the ends are control positions between controls 1-2 and 2-3");
-        const auto first = controller.storedLineIndexAtArc(horizontal.id, segment.arcFrom);
-        const auto last = controller.storedLineIndexAtArc(horizontal.id, segment.arcTo);
-        require(first && last && *first == 12 && *last == 28, "the piece opens on the line points at those arcs");
+        const auto segments = vc3d::fiber_map::scaffoldApprovalSegments({accusing}, solves.approvals());
+        const auto found = std::find_if(segments.begin(), segments.end(), [&](const auto& segment) {
+            return segment.fiberUuid == horizontal.uuid && segment.cost > 0;
+        });
+        require(found != segments.end(), "the accused stretch lies in one of the fiber's stretches");
+        require(found->arcFrom <= 12.4 && found->arcTo >= 27.6, "that stretch covers the whole accusation");
+        require(found->controlFrom == std::round(found->controlFrom) && found->controlTo == std::round(found->controlTo),
+                "its ends are control points");
+        const auto onControl = controller.storedLineIndexAtArc(horizontal.id, found->arcFrom);
+        require(onControl && *onControl == std::int64_t(std::llround(found->arcFrom)),
+                "a stretch's end is an existing control's line point");
         const auto controls = controller.storedControlSummaries(horizontal.id);
         require(controls.size() == 8, "the fiber's controls are untouched until the piece is edited");
-        // With the default reach the same stretch snaps outward to controls 1 and 3.
-        const auto snapped = vc3d::fiber_map::scaffoldApprovalSegments({accusing}, solves.approvals());
-        require(snapped.size() == 1 && snapped.front().arcFrom == 10.0 && snapped.front().arcTo == 30.0 &&
-                    snapped.front().controlFrom == 1.0 && snapped.front().controlTo == 3.0,
-                "within reach the ends move outward onto control points");
-        const auto onControl = controller.storedLineIndexAtArc(horizontal.id, snapped.front().arcFrom);
-        require(onControl && *onControl == 10, "a snapped end is an existing control's line point");
     }
 
     // Approval is refused while the pieces are not approved, and nothing is

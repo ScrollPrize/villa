@@ -1,7 +1,7 @@
 #include "FiberConstraintChunks.hpp"
 #include "FiberCrossingAxes.hpp"
 #include "FiberNeighbourNormals.hpp"
-#include "FiberGapFalloff.hpp"
+#include "vc/fiber_tracer/FiberGapFalloff.hpp"
 #include "vc/fiber_tracer/FiberStripNormals.hpp"
 #include "vc/lasagna/ChannelSampler.hpp"
 #include "ChunkSaturationWindow.hpp"
@@ -417,69 +417,25 @@ Json extractFiberConstraintChunks(const Json& cfg,Json& metadata,
                 const auto scales=cfg.value("crossing_gap_scales",std::vector<double>{64.,64.,64.});
                 const double predictionPower=cfg.value("crossing_prediction_power",0.),
                     predictionMin=cfg.value("crossing_prediction_min",0.),coherencePower=cfg.value("crossing_coherence_power",0.);
-                const GapFalloff falloff=parseGapFalloff(gapFalloff);
-                if(gapFrame!="isotropic"&&gapFrame!="crossing"&&gapFrame!="prediction")
-                    throw std::invalid_argument("crossing_gap_frame must be isotropic, crossing or prediction");
-                if(scales.size()!=3||!(scales[0]>0.&&scales[1]>0.&&scales[2]>0.)||predictionPower<0.||coherencePower<0.)
-                    throw std::invalid_argument("crossing_gap_scales must be 3 positive values (own tangent, side, normal), crossing powers >= 0");
-                // Falloff of the scaled gap g (dimensionless).
-                const std::array<double,3> frameScales{scales[0],scales[1],scales[2]};
-                const auto gapFactor=[&](double g){return gapFalloffFactor(falloff,g);};
-                const auto scaledGap=[&](const cv::Vec3d& d,const cv::Vec3d& t,const cv::Vec3d& n){return scaledFrameGap(d,t,n,frameScales);};
+                vc::fiber_tracer::FiberCrossingTargetOptions crossingOptions;
+                crossingOptions.weight=crossingWeight;crossingOptions.sigma=sigma;
+                crossingOptions.falloff=parseGapFalloff(gapFalloff);
+                crossingOptions.frame=gapFrame=="isotropic"?vc::fiber_tracer::FiberCrossingGapFrame::Isotropic
+                    :gapFrame=="crossing"?vc::fiber_tracer::FiberCrossingGapFrame::Crossing
+                    :gapFrame=="prediction"?vc::fiber_tracer::FiberCrossingGapFrame::Prediction
+                    :throw std::invalid_argument("crossing_gap_frame must be isotropic, crossing or prediction");
+                if(scales.size()!=3)throw std::invalid_argument("crossing_gap_scales must be 3 positive values (own tangent, side, normal), crossing powers >= 0");
+                crossingOptions.scales={scales[0],scales[1],scales[2]};
+                crossingOptions.predictionPower=predictionPower;crossingOptions.predictionMin=predictionMin;crossingOptions.coherencePower=coherencePower;
                 size_t unknown=0;
                 const auto crossings=readFiberCrossingAxes(cfg.at("crossing_axes").get<std::string>(),ids,unknown);
                 std::atomic<size_t> usedTotal{0},crossedTotal{0},predictionTotal{0},crossingTotal{0};
                 cv::parallel_for_(cv::Range(0,int(crossings.size())),[&](const cv::Range& range){
                 for(int fi=range.start;fi<range.end;++fi){
                     const size_t i=size_t(fi);
-                    size_t used=0,crossedNodes=0,predictionFrames=0,crossingFrames=0;
-                    const auto& chain=chains[i];
-                    if(chain.points.empty()||crossings[i].empty())continue;
-                    std::vector<cv::Matx33d> scatter(chain.points.size(),cv::Matx33d::zeros());std::vector<double> sum(chain.points.size(),0.);
-                    for(const auto& entry:crossings[i]){
-                        const double arc=entry.arc,length=cv::norm(entry.axis);
-                        const cv::Vec3d e=length>0.?entry.axis/length:entry.axis;
-                        const cv::Vec3d offset=entry.offset;
-                        cv::Vec3d ownTangent=entry.ownTangent;
-                        if(cv::norm(ownTangent)>0.)ownTangent/=cv::norm(ownTangent);
-                        double w=1.;
-                        if(gapFalloff!="none"&&gapFrame=="isotropic")w*=gapFactor(entry.gap/scales[0]);
-                        if(gapFalloff!="none"&&gapFrame=="crossing")w*=gapFactor(scaledGap(offset,ownTangent,e));
-                        if(!(length>0.)||!(w>0.))continue;
-                        ++used;
-                        const auto lo=std::lower_bound(chain.arc.begin(),chain.arc.end(),arc-2*sigma);
-                        for(auto k=size_t(lo-chain.arc.begin());k<chain.arc.size()&&chain.arc[k]<=arc+2*sigma;++k){
-                            const auto& node=(*targets)[i][k];
-                            double agree=1.;
-                            if(node.weight>0.&&cv::norm(node.axis)>0.){
-                                agree=std::abs(e.dot(node.axis))/cv::norm(node.axis);
-                                if(agree<predictionMin)continue;
-                            }
-                            double frameWeight=1.;
-                            if(gapFalloff!="none"&&gapFrame=="prediction"){
-                                // Joint frame: the prediction axis (no crossing information) as normal, the own
-                                // tangent made perpendicular to it; the crossing frame where the node has no axis.
-                                cv::Vec3d n=e,t=ownTangent;
-                                if(node.weight>0.&&cv::norm(node.axis)>0.){
-                                    const cv::Vec3d m=node.axis/cv::norm(node.axis),u=ownTangent-ownTangent.dot(m)*m;
-                                    if(cv::norm(u)>1e-6){n=m;t=u/cv::norm(u);++predictionFrames;}else ++crossingFrames;
-                                }else ++crossingFrames;
-                                frameWeight=gapFactor(scaledGap(offset,t,n));
-                            }
-                            const double d=chain.arc[k]-arc,f=w*frameWeight*std::pow(agree,predictionPower)*std::exp(-0.5*d*d/(sigma*sigma));
-                            scatter[k]+=f*(e*e.t());sum[k]+=f;
-                        }
-                    }
-                    for(size_t k=0;k<chain.points.size();++k){
-                        if(!(sum[k]>0.))continue;
-                        cv::Vec3d eigenvalues;cv::Matx33d eigenvectors;cv::eigen(scatter[k],eigenvalues,eigenvectors);
-                        auto& target=(*targets)[i][k];
-                        target.crossing=cv::Vec3d(eigenvectors(0,0),eigenvectors(0,1),eigenvectors(0,2));
-                        const double trace=eigenvalues[0]+eigenvalues[1]+eigenvalues[2];
-                        const double coherence=trace>0.?std::max(0.,eigenvalues[0]-eigenvalues[1])/trace:0.;
-                        target.crossingWeight=crossingWeight*std::min(1.,sum[k])*std::pow(coherence,coherencePower);++crossedNodes;
-                    }
-                    usedTotal+=used;crossedTotal+=crossedNodes;predictionTotal+=predictionFrames;crossingTotal+=crossingFrames;
+                    vc::fiber_tracer::FiberCrossingTargetCounts counts;
+                    vc::fiber_tracer::setFiberCrossingTargets(chains[i],crossings[i],crossingOptions,(*targets)[i],&counts);
+                    usedTotal+=counts.used;crossedTotal+=counts.crossedNodes;predictionTotal+=counts.predictionFrames;crossingTotal+=counts.crossingFrames;
                 }
                 },int(workers));
                 const size_t used=usedTotal.load(),crossedNodes=crossedTotal.load(),predictionFrames=predictionTotal.load(),crossingFrames=crossingTotal.load();
@@ -499,24 +455,8 @@ Json extractFiberConstraintChunks(const Json& cfg,Json& metadata,
                 std::atomic<size_t> nodesTotal{0};
                 cv::parallel_for_(cv::Range(0,int(lines.size())),[&](const cv::Range& range){
                     for(int fi=range.start;fi<range.end;++fi){
-                        const size_t i=size_t(fi);const auto& chain=chains[i];const auto& list=inferred[i];
-                        if(chain.points.empty()||list.empty())continue;
-                        size_t nodes=0;
-                        for(size_t k=0;k<chain.points.size();++k){
-                            cv::Vec3d mean{0,0,0};double sum=0.;
-                            const auto lo=std::lower_bound(list.begin(),list.end(),chain.arc[k]-3*sigma,[](const auto& a,double x){return a.arc<x;});
-                            for(auto it=lo;it!=list.end()&&it->arc<=chain.arc[k]+3*sigma;++it){
-                                const double d=it->arc-chain.arc[k],f=std::exp(-0.5*d*d/(sigma*sigma));
-                                mean+=f*it->normal;sum+=f;
-                            }
-                            const double length=cv::norm(mean);
-                            if(!(sum>0.)||!(length>0.))continue;
-                            auto& target=(*targets)[i][k];
-                            target.signedAxis=mean/length;
-                            target.signedWeight=neighbourWeight*std::min(1.,sum)*length/sum;
-                            ++nodes;
-                        }
-                        nodesTotal+=nodes;
+                        const size_t i=size_t(fi);
+                        nodesTotal+=vc::fiber_tracer::setFiberNeighbourTargets(chains[i],inferred[i],neighbourWeight,sigma,(*targets)[i]);
                     }
                 },int(workers));
                 fusion["neighbours"]=Json{{"weight",neighbourWeight},{"sigma",sigma},{"nodes",nodesTotal.load()},{"for_unknown_fibers",unknown}};

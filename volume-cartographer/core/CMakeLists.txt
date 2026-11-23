@@ -159,6 +159,8 @@ add_library(vc_fiber_tracer
     src/fiber_tracer/FiberTraceBeliefPropagation.cpp
     src/fiber_tracer/FiberTraceConstraints.cpp
     src/fiber_tracer/FiberStripNormals.cpp
+    src/fiber_tracer/FiberNeighbourNormals.cpp
+    src/fiber_tracer/FiberCrossingAxes.cpp
     src/fiber_tracer/FiberNormalSign.cpp
     src/fiber_tracer/FiberSignSupport.cpp
     src/fiber_tracer/FiberBendSeeds.cpp

@@ -11,6 +11,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <fstream>
+#include <optional>
 #include <span>
 #include <cmath>
 #include <cstring>
@@ -71,6 +73,37 @@ std::optional<std::pair<std::int64_t, std::int64_t>> adjacentPair(const Scaffold
 
 } // namespace
 
+ScaffoldNeighbourSource openScaffoldNeighbourSource(const std::filesystem::path& signedSamples, const double radius)
+{
+    // The statement written next to the file says what it is; a strip samples
+    // file without one is unsigned as far as anyone can tell.
+    const auto statementPath = signedSamples.string() + ".json";
+    std::ifstream in(statementPath);
+    if (!in) throw std::runtime_error("neighbour normals: no statement " + statementPath);
+    const auto statement = nlohmann::json::parse(in, nullptr, false);
+    if (!statement.is_object() || statement.value("format", std::string{}) != "signed_strip_samples")
+        throw std::runtime_error("neighbour normals: " + statementPath + " does not state signed strip samples");
+    auto file = fiber_tracer::readFiberStripSampleFile(signedSamples);
+    std::vector<int> signs(file.samples.size(), 1);
+    ScaffoldNeighbourSource source;
+    source.coordinateSpace = statement.value("coordinate_space", std::string{});
+    source.volume = statement.value("volume_uuid", std::string{});
+    if (source.volume.empty())
+        throw std::runtime_error("neighbour normals: " + statementPath + " names no volume_uuid");
+    auto field = std::make_shared<fiber_tracer::FiberNeighbourField>(std::move(file.samples), std::move(signs), radius);
+    source.identity = "sign_run " + statement.value("sign_run", std::string{}) + " store " +
+                      statement.value("sign_store", std::string{}) + " samples " + std::to_string(field->sampleCount());
+    source.field = std::move(field);
+    return source;
+}
+
+double scaffoldFallingWindingSign(const ScaffoldGraph& graph)
+{
+    if (graph.handedness != 1 && graph.handedness != -1)
+        throw std::invalid_argument("scaffold normals: the scroll's winding handedness is not stated");
+    return graph.handedness > 0 ? -1. : 1.;
+}
+
 const char* scaffoldSignSourceName(ScaffoldSignSource source)
 {
     switch (source) {
@@ -78,6 +111,7 @@ const char* scaffoldSignSourceName(ScaffoldSignSource source)
         case ScaffoldSignSource::Manual: return "manual";
         case ScaffoldSignSource::ApprovedPiece: return "approved_piece";
         case ScaffoldSignSource::AdjacentLink: return "adjacent_link";
+        case ScaffoldSignSource::Neighbours: return "neighbours";
         case ScaffoldSignSource::Crossings: return "crossings";
     }
     throw std::invalid_argument("scaffold normals: unknown sign source");
@@ -124,8 +158,8 @@ ScaffoldNormals::ScaffoldNormals(const ScaffoldGraph& graph, const ScaffoldGeome
                 ScaffoldNormalAnchor anchor;
                 anchor.fiber = std::int64_t(i);
                 anchor.arc = geometry.controlArc(i, control);
-                // The format's display normals point outward.
-                anchor.inward = pointOf(-*normal);
+                // The format's display normals point outward, as every signed normal does.
+                anchor.outward = pointOf(*normal);
                 anchor.source = kind;
                 anchor.control = std::int64_t(control);
                 anchor.weight = options.anchorWeight;
@@ -155,15 +189,19 @@ ScaffoldNormals::ScaffoldNormals(const ScaffoldGraph& graph, const ScaffoldGeome
             const auto arcV = geometry.project(std::size_t(vertical), anchorV).arc;
             const auto pointH = geometry.packed().sample(horizontal, arcH).point;
             const auto pointV = geometry.packed().sample(vertical, arcV).point;
-            // The V fiber lies one winding inside the H fiber: both inward
+            // The V fiber lies one winding below the H fiber, so the direction
+            // from the H anchor to the V anchor is the one of falling winding:
+            // outward in a scroll whose winding falls outward (handedness -1),
+            // inward otherwise. The anchor states the outward normal. Both
             // normals point from the H anchor towards the V anchor.
-            const auto inward = fiber_tracer::displayUnit(vectorOf(pointV) - vectorOf(pointH));
-            if (!inward) { ++report_.degenerateAnchors; continue; }
+            const auto falling = fiber_tracer::displayUnit(vectorOf(pointV) - vectorOf(pointH));
+            if (!falling) { ++report_.degenerateAnchors; continue; }
+            const auto outward = *falling * scaffoldFallingWindingSign(graph);
             for (const auto [fiber, arc] : {std::pair{horizontal, arcH}, std::pair{vertical, arcV}}) {
                 ScaffoldNormalAnchor anchor;
                 anchor.fiber = fiber;
                 anchor.arc = arc;
-                anchor.inward = pointOf(*inward);
+                anchor.outward = pointOf(outward);
                 anchor.source = ScaffoldSignSource::AdjacentLink;
                 anchor.link = std::int64_t(index);
                 anchor.weight = options.anchorWeight;
@@ -296,24 +334,6 @@ ScaffoldNormals::ScaffoldNormals(const ScaffoldGraph& graph, const ScaffoldGeome
     std::stable_sort(anchors_.begin(), anchors_.end(), [](const ScaffoldNormalAnchor& x, const ScaffoldNormalAnchor& y) {
         return std::tie(x.fiber, x.source, x.arc) < std::tie(y.fiber, y.source, y.arc);
     });
-    for (const auto& anchor : anchors_) {
-        const auto fiber = std::size_t(anchor.fiber);
-        const auto& arcs = chainArcs[fiber];
-        if (arcs.empty()) continue;
-        const auto upper = std::lower_bound(arcs.begin(), arcs.end(), anchor.arc);
-        std::size_t at = std::size_t(upper - arcs.begin());
-        if (at >= arcs.size()) at = arcs.size() - 1;
-        else if (at > 0 && anchor.arc - arcs[at - 1] < arcs[at] - anchor.arc) at = at - 1;
-        if (claimed[fiber][at]) continue;
-        claimed[fiber][at] = 1;
-        targets[fiber][at] = {vectorOf(anchor.inward), anchor.weight, true};
-        if (signSources_[fiber] == ScaffoldSignSource::None ||
-            int(anchor.source) < int(signSources_[fiber]))
-            signSources_[fiber] = anchor.source;
-    }
-    for (std::size_t i = 0; i < fibers; ++i)
-        if (signSources_[i] != ScaffoldSignSource::None) fixedSigns_[i] = 1;
-
     // What each fiber would be solved from, which is the key its normals are
     // cached under: the fiber's own version, the parameters, and every record
     // that anchors it, by version. A fiber anchored by a record whose version
@@ -322,7 +342,9 @@ ScaffoldNormals::ScaffoldNormals(const ScaffoldGraph& graph, const ScaffoldGeome
     std::vector<std::vector<std::string>> anchoredBy(fibers);
     std::vector<char> cacheable(fibers, 1);
     for (std::size_t i = 0; i < fibers; ++i)
-        if (!graph.fibers[i].version || (fused && options.predictionIdentity.empty())) cacheable[i] = 0;
+        if (!graph.fibers[i].version || (fused && options.predictionIdentity.empty()) ||
+            (options.neighbours.field && options.neighbours.identity.empty()))
+            cacheable[i] = 0;
     for (const auto& anchor : anchors_) {
         const auto fiber = std::size_t(anchor.fiber);
         if (anchor.link >= 0) {
@@ -344,6 +366,151 @@ ScaffoldNormals::ScaffoldNormals(const ScaffoldGraph& graph, const ScaffoldGeome
     const auto frame = graph.volume + "@" + std::to_string(graph.scale);
     for (std::size_t i = 0; i < fibers; ++i)
         if (cacheable[i]) inputs[i] = scaffoldNormalInputs(options, frame, fused, anchoredBy[i]);
+    // Which fibers the cache already answers. Nothing is inferred or solved
+    // for those: the neighbour stage below runs for the others only.
+    std::vector<char> cachedAhead(fibers, 0);
+    for (std::size_t i = 0; i < fibers; ++i) {
+        const auto& fiber = graph.fibers[i];
+        const auto* row = options.cache && cacheable[i] ? options.cache->normals(fiber.uuid, *fiber.version, inputs[i])
+                                                        : nullptr;
+        cachedAhead[i] = row != nullptr && row->normals.size() == std::size_t(fiber.pointCount) * 3 * sizeof(double);
+    }
+    // Neighbour normals: the field is asked along every fiber's annotated
+    // line, and what it states becomes the signed soft target of the chain
+    // nodes around each sample. The sign stage's signed normals face the way
+    // this gauge does (the side an ordinary link's V fiber lies on), so they
+    // are taken as given.
+    std::vector<char> neighbourCovered(fibers, 0);
+    if (const auto* field = options.neighbours.field) {
+        const auto neighbourStarted = std::chrono::steady_clock::now();
+        const auto& neighbour = options.neighbours;
+        if (neighbour.volume != graph.volume || graph.scale != 1.)
+            throw std::runtime_error("scaffold normals: the neighbour normal field is in the voxels of volume " +
+                                     neighbour.volume + ", the run in those of volume " + graph.volume + " at scale " +
+                                     std::to_string(graph.scale) + "; solve in the field's volume");
+        if (!(neighbour.sampleSpacing > 0))
+            throw std::invalid_argument("scaffold normals: the neighbour sample spacing must be positive");
+        if (monitor) {
+            monitor->checkpoint();
+            monitor->enter("neighbour normals",
+                           std::int64_t(std::count(cachedAhead.begin(), cachedAhead.end(), char(0))));
+        }
+        std::vector<std::int64_t> asked(fibers, 0), answered(fibers, 0), nodes(fibers, 0);
+        std::vector<std::int64_t> fieldCrossed(fibers, 0), scaffoldCrossed(fibers, 0), crossedNodes(fibers, 0);
+        // The samples every fiber is asked at, along its annotated line.
+        std::vector<std::vector<fiber_tracer::FiberStripSample>> queries(fibers);
+        objects::parallelFor(fibers, std::max<std::size_t>(1, options.workers), [&](std::size_t i) {
+            const auto& chain = chains[i];
+            const auto& line = lines[i];
+            if (chain.points.empty() || chain.vertexArc.size() != line.size() || line.size() < 2) return;
+            auto& query = queries[i];
+            std::size_t segment = 0;
+            for (double arc = 0.; arc <= chain.vertexArc.back(); arc += neighbour.sampleSpacing) {
+                while (segment + 2 < line.size() && chain.vertexArc[segment + 1] < arc) ++segment;
+                const double span = chain.vertexArc[segment + 1] - chain.vertexArc[segment];
+                const double t = span > 0 ? std::clamp((arc - chain.vertexArc[segment]) / span, 0., 1.) : 0.;
+                fiber_tracer::FiberStripSample sample;
+                sample.arc = arc;
+                sample.point = line[segment] * (1. - t) + line[segment + 1] * t;
+                // The prediction axis of the nearest chain node, where a fused run read one.
+                const auto at = std::lower_bound(chain.arc.begin(), chain.arc.end(), arc);
+                std::size_t node = std::size_t(at - chain.arc.begin());
+                if (node == chain.arc.size()) node = chain.arc.size() - 1;
+                else if (node > 0 && arc - chain.arc[node - 1] < chain.arc[node] - arc) --node;
+                const auto& target = targets[i][node];
+                if (target.weight > 0 && cv::norm(target.axis) > 0) sample.prediction = target.axis / cv::norm(target.axis);
+                query.push_back(sample);
+            }
+        });
+        // The scaffold's own fibers as a field of their own, for the crossings among them.
+        std::optional<fiber_tracer::FiberNeighbourField> scaffold;
+        if (neighbour.scaffoldCrossings)
+            scaffold.emplace(queries, std::vector<int>(fibers, 1), neighbour.variant.radius);
+        objects::parallelFor(fibers, std::max<std::size_t>(1, options.workers), [&](std::size_t i) {
+            const auto& chain = chains[i];
+            const auto& query = queries[i];
+            if (cachedAhead[i] != 0) return;  // its normals are read, not solved
+            if (monitor && monitor->cancelled()) return;
+            if (query.empty()) {
+                if (monitor) monitor->advance();
+                return;
+            }
+            // The crossing axes first: they read a node's prediction axis, nothing the neighbours set.
+            std::vector<fiber_tracer::FiberCrossingAxis> crossings;
+            if (neighbour.fieldCrossings) {
+                crossings = field->crossings(query);
+                fieldCrossed[i] = std::int64_t(crossings.size());
+            }
+            if (scaffold) {
+                const auto own = scaffold->crossings(query, std::int64_t(i));
+                scaffoldCrossed[i] = std::int64_t(own.size());
+                crossings.insert(crossings.end(), own.begin(), own.end());
+            }
+            fiber_tracer::FiberCrossingTargetCounts counts;
+            fiber_tracer::setFiberCrossingTargets(chain, crossings, neighbour.crossing, targets[i], &counts);
+            crossedNodes[i] = std::int64_t(counts.crossedNodes);
+            const auto estimates = field->infer(query, std::span<const fiber_tracer::FiberNeighbourVariant>(&neighbour.variant, 1));
+            std::vector<fiber_tracer::FiberStripSample> inferred;
+            inferred.reserve(query.size());
+            for (std::size_t s = 0; s < query.size(); ++s) {
+                if (!(estimates[s].count > 0)) continue;
+                inferred.push_back({query[s].arc, query[s].point, estimates[s].axis, query[s].prediction});
+            }
+            asked[i] = std::int64_t(query.size());
+            answered[i] = std::int64_t(inferred.size());
+            nodes[i] = std::int64_t(
+                fiber_tracer::setFiberNeighbourTargets(chain, inferred, neighbour.weight, neighbour.sigma, targets[i]));
+            if (double(nodes[i]) >= neighbour.minimumCoverage * double(chain.points.size()) && nodes[i] > 0)
+                neighbourCovered[i] = 1;
+            if (monitor) monitor->advance();
+        });
+        if (monitor) monitor->checkpoint();
+        for (std::size_t i = 0; i < fibers; ++i) {
+            report_.neighbourSamples += asked[i];
+            report_.neighbourSamplesAnswered += answered[i];
+            report_.neighbourNodes += nodes[i];
+            report_.neighbourCoveredFibers += neighbourCovered[i];
+            report_.fieldCrossings += fieldCrossed[i];
+            report_.scaffoldCrossings += scaffoldCrossed[i];
+            report_.crossedNodes += crossedNodes[i];
+        }
+        // A field that answers nowhere along the scaffold is the wrong field
+        // or the wrong frame, not a run without neighbours.
+        if (report_.neighbourSamples > 0 && report_.neighbourSamplesAnswered == 0)
+            throw std::runtime_error("scaffold normals: the neighbour normal field has no fiber within " +
+                                     std::to_string(neighbour.variant.radius) + " voxels of any of the " +
+                                     std::to_string(report_.neighbourSamples) +
+                                     " samples along the scaffold's fibers; it does not cover these fibers, or it "
+                                     "is in another frame than theirs");
+        report_.neighbourSeconds =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - neighbourStarted).count();
+    }
+    for (const auto& anchor : anchors_) {
+        const auto fiber = std::size_t(anchor.fiber);
+        const auto& arcs = chainArcs[fiber];
+        if (arcs.empty()) continue;
+        const auto upper = std::lower_bound(arcs.begin(), arcs.end(), anchor.arc);
+        std::size_t at = std::size_t(upper - arcs.begin());
+        if (at >= arcs.size()) at = arcs.size() - 1;
+        else if (at > 0 && anchor.arc - arcs[at - 1] < arcs[at] - anchor.arc) at = at - 1;
+        if (claimed[fiber][at]) continue;
+        claimed[fiber][at] = 1;
+        targets[fiber][at] = {vectorOf(anchor.outward), anchor.weight, true};
+        if (signSources_[fiber] == ScaffoldSignSource::None ||
+            int(anchor.source) < int(signSources_[fiber]))
+            signSources_[fiber] = anchor.source;
+    }
+    // A fiber no anchor fixed takes its facing from the neighbour normals
+    // where they cover it: the strip solve faces the fiber by the majority of
+    // its signed targets.
+    for (std::size_t i = 0; i < fibers; ++i)
+        if (signSources_[i] == ScaffoldSignSource::None && neighbourCovered[i] != 0) {
+            signSources_[i] = ScaffoldSignSource::Neighbours;
+            ++report_.neighbourFacedFibers;
+        }
+    for (std::size_t i = 0; i < fibers; ++i)
+        if (signSources_[i] != ScaffoldSignSource::None) fixedSigns_[i] = 1;
+
     cacheRows_.assign(fibers, std::string{});
 
     // The fibers this run has to solve: the rest come from the cache.
@@ -455,7 +622,20 @@ ScaffoldNormals::ScaffoldNormals(const ScaffoldGraph& graph, const ScaffoldGeome
             ++report_.cached;
         }
     }
-    // An anchored fiber's gauge is the inward one by construction; the
+    // A solve has a normal for every fiber it reads: a fiber whose geometry
+    // carries none (fewer than three distinct points) cannot be in it.
+    if (report_.degenerate > 0) {
+        std::string names;
+        std::int64_t listed = 0;
+        for (std::size_t i = 0; i < fibers && listed < 8; ++i)
+            if (solved_[i] == 0) {
+                names += (listed++ ? ", " : "") + graph.fibers[i].name + " (" + graph.fibers[i].uuid + ")";
+            }
+        throw std::runtime_error("scaffold normals: " + std::to_string(report_.degenerate) +
+                                 " fibers have no strip normal (too few distinct line points): " + names +
+                                 "; fix or remove them, or leave them out of the run's scope");
+    }
+    // An anchored fiber's gauge is the outward one by construction; the
     // others are decided by the sign solve.
     for (std::size_t i = 0; i < fibers; ++i) {
         if (signSources_[i] == ScaffoldSignSource::None) ++report_.unanchoredFibers;

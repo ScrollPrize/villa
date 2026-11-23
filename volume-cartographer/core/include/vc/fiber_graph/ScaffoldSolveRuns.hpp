@@ -45,6 +45,11 @@ struct ScaffoldRunRows {
 struct ScaffoldRunStages {
     const ScaffoldNormalOptions* normalOptions = nullptr;
     const ScaffoldNormalReport* normals = nullptr;
+    // Per fiber, the stored normals row the run used (ScaffoldNormals::cacheRows).
+    // A run that solved normals references every one of them: a fiber whose
+    // normals have no stored row fails the rows, since nothing could later say
+    // which normals the run's stretches are about.
+    std::span<const std::string> normalRows;
     const ScaffoldEventOptions* eventOptions = nullptr;
     const ScaffoldEventReport* events = nullptr;
     const ScaffoldMeasuredOptions* measuredOptions = nullptr;
@@ -73,7 +78,7 @@ struct ScaffoldStoredRun {
     std::string runUuid, stage, method, settingsJson;
     // Read out of the settings, for the columns the docks show: when the run
     // was made (Unix seconds UTC, 0 when the run recorded none), which
-    // normals it used ("geometry" or "fused") and which sign backend
+    // normals it used ("geometry", "fused" or "neighbours") and which sign backend
     // ("irls", "ceres", or empty for a run that solved no signs).
     std::int64_t createdAtUnix = 0;
     std::string normalSource, signBackend;
@@ -109,13 +114,13 @@ std::vector<ScaffoldStoredResidual> readScaffoldResiduals(const objects::StoreRe
 // The run's normal flip suspects (kScaffoldNormalFlipRowKind), in stored order.
 std::vector<ScaffoldStoredResidual> readScaffoldNormalFlips(const objects::StoreReader&, const std::string& runUuid);
 
-// The gauge strip normals last solved for one fiber (XYZ per annotated line
-// point), from the store's derived-result rows: the newest row of the fiber's
-// highest version that was solved from the given source (`fused`: with the
-// prediction's sheet axis) and covers exactly `linePoints` points. nullopt
-// when the store holds none - no measured run solved this fiber as it is now.
-std::optional<std::vector<double>> readScaffoldFiberNormals(const objects::StoreReader&, const std::string& fiberUuid,
-                                                            bool fused, std::size_t linePoints);
+// The strip normals a run used for one fiber (XYZ per annotated line point),
+// by the run's own reference to its normals row - never a search among a
+// fiber's rows. Throws std::runtime_error with the reason when the run
+// references none, the row is gone, or it does not cover exactly
+// `linePoints` points (the fiber was edited since).
+std::vector<double> readScaffoldRunFiberNormals(const objects::StoreReader&, const std::string& runUuid,
+                                                const std::string& fiberUuid, std::size_t linePoints);
 
 // Per-fiber windings of one run, by fiber UUID.
 struct ScaffoldStoredWinding {

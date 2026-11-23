@@ -461,6 +461,73 @@ TEST_CASE("a link on a tail or on a gap span asserts nothing")
     CHECK(report.used == 1);
 }
 
+TEST_CASE("a sign constraint bounds the step from one side and costs only when broken")
+{
+    Builder builder;
+    const auto a = builder.fiber(ScaffoldFamily::Horizontal, 100.);
+    const auto b = builder.fiber(ScaffoldFamily::Vertical, 110.);
+    const ScaffoldGeometry geometry(builder.graph);
+    ScaffoldSolveOptions options;
+    options.links.useLinks = false;
+    options.links.approvalStates.clear();
+    // A measured crossing says the step is 0; a sign constraint of weight 10
+    // says something about it.
+    const auto solve = [&](ScaffoldConstraintKind kind, std::int64_t bound) {
+        ScaffoldConstraint measured, oneSided;
+        measured.kind = ScaffoldConstraintKind::Perpendicular;
+        measured.a = oneSided.a = std::int64_t(a);
+        measured.b = oneSided.b = std::int64_t(b);
+        measured.target = 0;
+        measured.weight = 1.;
+        oneSided.kind = kind;
+        oneSided.target = bound;
+        oneSided.weight = 10.;
+        const std::vector<ScaffoldConstraint> constraints{measured, oneSided};
+        return solveScaffoldWinding(builder.graph, geometry, options, constraints);
+    };
+    {
+        // At least 1: the bound outweighs the crossing, which is the one violated.
+        const auto result = solve(ScaffoldConstraintKind::SignAtLeast, 1);
+        CHECK(result.winding[b] - result.winding[a] == 1);
+        CHECK(result.objective == doctest::Approx(1.));
+        REQUIRE(result.residuals.size() == 1);
+        CHECK(result.constraints[std::size_t(result.residuals.front().constraint)].kind ==
+              ScaffoldConstraintKind::Perpendicular);
+        CHECK(result.constraintsByKind[std::size_t(ScaffoldConstraintKind::SignAtLeast)] == 1);
+    }
+    {
+        // At least -3: the crossing's step already keeps it, at no cost.
+        const auto result = solve(ScaffoldConstraintKind::SignAtLeast, -3);
+        CHECK(result.winding[b] - result.winding[a] == 0);
+        CHECK(result.objective == doctest::Approx(0.));
+        CHECK(result.violatedConstraints == 0);
+    }
+    {
+        // At most -2: the mirror.
+        const auto result = solve(ScaffoldConstraintKind::SignAtMost, -2);
+        CHECK(result.winding[b] - result.winding[a] == -2);
+        CHECK(result.objective == doctest::Approx(2.));
+    }
+    {
+        // A bound alone, broken by nothing, still joins the two fibers.
+        ScaffoldConstraint oneSided;
+        oneSided.kind = ScaffoldConstraintKind::SignAtMost;
+        oneSided.a = std::int64_t(a);
+        oneSided.b = std::int64_t(b);
+        oneSided.target = 4;
+        oneSided.weight = 10.;
+        const std::vector<ScaffoldConstraint> constraints{oneSided};
+        const auto result = solveScaffoldWinding(builder.graph, geometry, options, constraints);
+        CHECK(result.components == 1);
+        CHECK(result.violatedConstraints == 0);
+        CHECK(result.winding[b] - result.winding[a] <= 4);
+        // An approved bound is refused: a bound is not a relation to hold rigid.
+        auto approved = constraints;
+        approved.front().approved = true;
+        CHECK_THROWS(solveScaffoldWinding(builder.graph, geometry, options, approved));
+    }
+}
+
 TEST_CASE("links switched off solve on the measured constraints alone")
 {
     Builder builder;

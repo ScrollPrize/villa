@@ -129,19 +129,29 @@ library states those exactly as the automatic pipeline does
 
 - **normals** (`ScaffoldNormals.hpp`). Each fiber gets a strip normal from its
   own geometry (`solveFiberStripNormals`), which is an axis without a sign.
+  One convention holds for every signed normal, here and in the whole-volume
+  pipeline: it points outward, away from the umbilicus. The winding relations
+  order two fibers by the direction the winding falls in, which is the
+  outward one where the scroll's winding falls outward (handedness -1) and
+  the inward one otherwise; `scaffoldFallingWindingSign` is that single
+  conversion. A fiber whose geometry carries no normal (fewer than three
+  distinct points) fails the run: a solve has a normal for every fiber.
   The annotation fixes the sign where it states one, in this precedence: a
   control point's `display_normal` with source `manual`; the display normals
-  of the spans approved for the normals aspect; an adjacent link, whose two
-  anchors say which way is inward (the V fiber lies one winding inside the H
-  fiber, so both inward normals point from the H anchor towards the V one).
-  The fiber format states display normals outward, so the inward target is
-  their negation; the adjacent-link anchor assumes no convention at all.
+  of the spans approved for the normals aspect (both stored outward, taken as
+  they are); an adjacent link, whose two anchors give the direction of
+  falling winding (the V fiber lies one winding below the H fiber) and with
+  it the outward normal of both fibers.
   With a prediction bound (*variant B*) every chain node is also pulled
   towards the sheet axis the fiber-inference volume states there: the axes
   are sampled at the fibers' own vertices, which lie in the sheet, weighted
   by the prediction's presence between `presence_floor` (weight 0) and
   `presence_full` (weight 1), and gathered per node as the principal axis of
   their weighted outer products. The anchors still win at the nodes they fix.
+  With a neighbour normal field (`normals.source: neighbours`, see *Neighbour
+  normals* below) every chain node is pulled towards the signed normal the
+  automatic fibers around it state, and a fiber no anchor fixed takes its
+  facing from them.
 - **crossings** (`ScaffoldConstraints.hpp`). `extractFiberTraceConstraints`
   runs on the annotation's own polylines, which stay whole (no piece
   splitting). The geometry decides whether a crossing is parallel or
@@ -169,9 +179,127 @@ library states those exactly as the automatic pipeline does
   sides that agree fixes its step exactly: the *enclosure* relation. Weights
   are `weights.perpendicular`, `weights.parallel` and `weights.enclosure`.
 
+- **sign** (`weights.sign`, 100 by default). The signed order of one
+  perpendicular crossing is a bound on its own: the V fiber lies outside the H
+  fiber there, so the pair's H->V step is at least the crossing's transport,
+  or inside, so it is at most that minus one. An enclosure needs a pair
+  bounded from both sides that agree; a sign constraint states each bound
+  as it is (`ScaffoldConstraintKind::SignAtLeast` / `SignAtMost`), with a
+  one-sided cost `weight * max(0, bound - step)` that is zero while the bound
+  holds. It needs no winding separation. The flow solve takes it as an arc
+  with one of its two capacity ends removed
+  (`solveWindingMinCostFlow` with a side per arc), so the optimum stays exact.
+  The bounds are those of the Python min-flow experiment's `sign_only` graph
+  (`fiber_min_flow_benchmark.graph`) for perpendicular crossings; that
+  experiment also states one for signed parallel crossings, which this
+  does not. A sign constraint is never approved, and it counts as part of a
+  residual cycle only where it holds with equality.
+
+- **crossing confidence.** A crossing's perpendicular, parallel and sign
+  weight is its type's weight times the confidence the sign stage gives the
+  same crossing (`fiberSignEventWeight`): dot² of its two normal axes times
+  min(1, 1/d²) of its winding distance d. A clean near crossing keeps its
+  weight; an oblique or far one still counts but gives way. Enclosures keep
+  their weight.
+
+The defaults are the scaffold workflow's run: no parallel and no enclosure
+relations, perpendicular weight 1, sign weight 100, crossing confidence on;
+the dock starts with no link state ticked and the crossings measured.
+
 Every kind lands in the same constraint list, so the solve, the contraction of
 approved constraints and the residual analysis treat a crossing exactly like a
 link.
+
+Measured on the PHerc0332 scaffold with neighbour normals, no links and
+perpendicular weight 1 (1,423 perpendicular constraints, 1,423 sign
+constraints), against the links-only solution (216 fibers comparable):
+
+| sign weight | fibers placed differently from the links | violated perpendicular | violated sign |
+|---|---|---|---|
+| 0 | 13 | 406 | - |
+| 10 | 4 | 424 | 2 |
+| 100 | 2 | 437 | 1 |
+
+### Neighbour normals
+
+The whole-volume pipeline resolves the normal and its sign for every automatic
+fiber (strip solve, sign stage). A scaffold fiber lies among those fibers, so
+its normal can be read off them instead of being solved from its own geometry
+and signed by the scaffold's few crossings:
+
+1. The full-volume extraction writes its solved normals at a regular arc
+   spacing (`strip_samples_output`, vesuvius `docs/fiber_workflows.md`).
+2. `vc_fiber_constraints` with `signed_strip_samples_output` multiplies every
+   sample by its fiber's sign of a sign store's normal-sign run (`strip_samples`,
+   `sign_store`, optional `sign_run`) and writes the signed samples with a
+   statement next to them (`<output>.json`: `coordinate_space`, `volume_uuid` -
+   the volume the points are voxels of, as the scaffold store names it - the
+   sign store and run, the counts).
+3. A run with `normals.source: neighbours` opens that file
+   (`openScaffoldNeighbourSource`) and asks the field every 16 voxels along
+   each fiber's annotated line (`FiberNeighbourField::infer`, the full-volume
+   pipeline's own fiber frame: crossing scales 128 / 32 / 128, parallel scales
+   192 / 192 / 64, radius 384; a parallel contact is measured in the frame of
+   an isotropic first estimate, since a scaffold fiber carries no prediction
+   axis). The answers become signed soft targets of the strip solve (weight
+   300, Gaussian sigma 32 along the arc), exactly as the full-volume extraction
+   uses its own neighbour normals.
+
+4. The same run adds the whole-volume strip solve's crossing term
+   (`setFiberCrossingTargets`, weight 100, sigma 64, Cauchy falloff of the gap
+   scaled 64 / 32 / 1024): where another fiber crosses, the normal lies along
+   own tangent x partner tangent, both tangents those of the fibers
+   themselves. The crossings of a scaffold fiber by the field's fibers are
+   found in the field's own grid (`FiberNeighbourField::crossings`: a contact
+   where the two tangents meet at more than 30 degrees), those by the
+   scaffold's other fibers the same way in a field of the scaffold's own
+   samples. Both are on by default (`neighbours.field_crossings`,
+   `neighbours.scaffold_crossings`). Against the whole-volume run: the contact
+   is the closest pair of samples 16 voxels apart rather than a refined
+   crossing, within the field's radius of 384 voxels rather than 512, and a
+   scaffold fiber carries no prediction axis, so the gap is measured in the
+   crossing's own frame and no crossing is weighted by its agreement with a
+   prediction.
+
+Annotation anchors still win at the nodes they fix. A fiber without an anchor
+whose chain nodes got a target on at least a quarter of its length is faced by
+the field (`ScaffoldSignSource::Neighbours`) and held in the sign solve like an
+anchored one; a fiber the field does not cover is left to the crossings. The
+field must be in the run's frame: a run in another volume or at another scale
+is refused, and so is a field with no fiber within its radius of any scaffold
+fiber. The signed normals are taken as given: the sign stage faces them the
+way this gauge faces an anchored fiber (on PHerc0332 the order of 194 of the
+196 map links confirms the normals solved from the field, one contradicts).
+
+Measured on the PHerc0332 scaffold (`objects-v22.vcobj`, 292 fibers) with the
+field of the full-volume run (239,064 fibers, 15,326,161 samples, 1.2 GB),
+enclosure relations only:
+
+| | geometry normals | neighbour normals |
+|---|---|---|
+| fibers faced before the sign solve | 46 (adjacent links) | 292 (46 links, 246 neighbours) |
+| fibers left undecided | 19 | 0 |
+| strict crossings, of those disagreeing | 415, 0 | 575, 0 |
+| map links whose order the normals confirm (of 196) | 190, 1 against, 5 open | 194, 1 against, 1 open |
+| exact enclosure relations (contradictory pairs) | 160 (1) | 160 (1) |
+
+The strip solve runs at the whole-volume pipeline's stiffness (twist 300).
+Against the former scaffold value of 1000, with neighbour normals: the map
+links' order is confirmed on 194 of 196 links either way (2 against at 300,
+1 against and 1 open at 1000), 576 against 575 strict crossings with none
+disagreeing, 161 against 160 exact enclosure relations.
+
+With the crossing term (555,674 crossings by the field's fibers, 9,352 among
+the scaffold's own, a crossing axis on 92,935 of the 93,261 chain nodes) the
+same checks read: 194 of 196 link orders confirmed, 585 strict crossings with
+none disagreeing, 160 exact enclosure relations; the default solve's weighted
+residual falls from 312.5 to 306.0 turns with the same 441 violated
+constraints. It adds 4 s to the neighbour stage with 32 workers.
+
+The neighbour stage takes 9.6 s with 32 workers (AMD EPYC 7J13) and 31 s with
+8, and the run peaks at 3.9 GB with 8 workers: the field is held in memory.
+Normals solved from a field are cached like the others, keyed by the field's
+sign run and sample count and the inference parameters.
 
 ## Solve
 
@@ -256,11 +384,15 @@ vc_scaffold_solve config.json
 | `constraints.winding_step` | `8` | voxels per integration step |
 | `constraints.maximum_winding_distance`, `.enforce_maximum_winding` | `1.5`, `false` | turns, and whether to reject beyond it |
 | `constraints.perpendicular_offset`, `.winding_scale`, `.enclosures` | `0.5`, `1`, `true` | relation conventions |
-| `weights.perpendicular`, `.parallel`, `.enclosure` | `1`, `1`, `1` | weight per measured arc |
+| `weights.perpendicular`, `.parallel`, `.enclosure` | `1`, `0`, `0` | weight per measured arc |
+| `weights.sign` | `100` | weight per sign constraint (one per signed perpendicular crossing) |
+| `weights.crossing_confidence` | `true` | scale a crossing's perpendicular, parallel and sign weight by the sign stage's term, dot² × min(1, 1/d²) |
 | `winding.manifest`, `winding.remote_cache` | — | the Lasagna normal dataset the separations are measured on |
-| `normals.twist_weight`, `.lateral_weight`, `.smoothing_sigma`, `.resample_spacing` | `1000`, `1`, `64`, `64` | the strip solve; the measurements below say why these and not the tracer's |
+| `normals.twist_weight`, `.lateral_weight`, `.smoothing_sigma`, `.resample_spacing` | `300`, `1`, `64`, `64` | the strip solve, at the whole-volume pipeline's settings |
 | `normals.manual_display_normals`, `.approved_pieces`, `.adjacent_links` | `true` | which anchors fix a sign |
-| `normals.source` | `geometry` | `geometry` (variant A) or `fused` (variant B) |
+| `normals.source` | `geometry` | `geometry` (variant A), `fused` (variant B) or `neighbours` |
+| `neighbours.samples` | — | the signed strip samples a `neighbours` run reads |
+| `neighbours.weight`, `.sigma`, `.minimum_coverage` | `300`, `32`, `0.25` | the signed target's weight, its arc sigma, and the share of a fiber the field must cover to face it |
 | `normals.axis_weight`, `.presence_floor`, `.presence_full` | `100`, `0`, `128` | the fused axis term and its presence mapping |
 | `prediction.manifest`, `prediction.remote_cache` | — | the fiber-inference dataset a fused run reads |
 | `sign.solve`, `sign.backend` | `true`, `irls` | decide unanchored signs; `irls` or `ceres` |
@@ -288,6 +420,16 @@ constraints (`_residuals`) and the cycle stretches they accuse
 where the scaffold lives, and the fiber map's solves list is the set of run
 rows. `scaffoldSolveRunRows` builds the rows and the caller submits them, so
 VC3D writes them through its own checked request.
+
+A run that solved normals references, per fiber, the normals row it used
+(`ext_fiber_scaffold_run_normals`: run, fiber, fiber version, normals row).
+`readScaffoldRunFiberNormals` follows that reference and nothing else: a
+stretch opened from a run shows that run's normals, and when the reference
+does not resolve - a run saved before runs referenced their normals, a row
+that is gone, a fiber edited since - the stretch is not opened and the reason
+is stated. There is no search for a fiber's "current" normals, and no other
+normals stand in. The same holds in the annotation views: solve normals whose
+line lies elsewhere than the open one (another volume or scale) are an error.
 
 `readScaffoldRuns`, `readScaffoldResiduals` and `readScaffoldWindings` read
 them back through any StoreReader; Python reads the same rows through
@@ -421,8 +563,10 @@ Three docks (`FiberMapScaffoldSolve.hpp`, with the Qt-free ranking in
 - **Graph solver.** Which links a run uses (by review state, and whether
   automatic links count), the link weight, the LEMON backend and *fix approved
   subgraphs* (on by default). *Measure the fibers' crossings* adds the measured
-  stages: where the normals come from (the fibers' geometry, or that fused
-  with the package's fiber-inference prediction), the per-type weights, the
+  stages: where the normals come from (the full volume's neighbour normals,
+  the fibers' geometry, or that fused with the package's fiber-inference
+  prediction), the per-type weights (perpendicular, parallel, enclosure and
+  order), the
   sign backend, and whether the winding separations are measured at all. The
   *scope* is the whole scaffold or the map's selected network (the selection
   grown to the networks it touches); a scope that resolves to nothing refuses
@@ -439,6 +583,11 @@ Three docks (`FiberMapScaffoldSolve.hpp`, with the Qt-free ranking in
   refuses to build when neither states the sense: it is never decided from the
   geometry. The run is saved in the store, and its one-line report lands in
   the map's status line.
+  *Full-volume neighbours* is the first choice of the normals combo. It
+  reads `<fiber store>.neighbour_normals.vcstrip` (and its `.json` statement)
+  from the fiber store's directory - a fixed name for now - once, and keeps
+  it for later runs until the file changes. Without the file the run is
+  refused and names the path it looked for.
 - **Solves.** Every run saved in the store, newest first, with its method,
   fibers, components, arcs, weighted L1, violated constraints, largest
   residual, *sign!* (`sign_fixed_disagreements`: anchored fibers whose sign the
@@ -472,26 +621,30 @@ Three docks (`FiberMapScaffoldSolve.hpp`, with the Qt-free ranking in
   component was solved on its own, so its violations can only be explained by
   its own annotation.
 
-  The stretch rows are *segments*, not the stored stretches. Cycles that
-  leave a fiber at different crossings accuse nearly the same piece of it, so
-  listing every stored stretch would ask for that piece many times over. Per
-  fiber, the accused stretches are taken in order of cost per voxel and what
-  each adds that no earlier segment and no approved piece covers becomes a
-  new segment, or - within 500 voxels of a segment's original extent, so
-  absorptions never chain - part of that segment. A segment shorter than 100
-  voxels joins the one it touches. Approved geometry is subtracted: only the
-  unapproved part is offered, reaching 50 voxels back into the piece it
-  continues (*extends approved*). Ends move outward to a control point within
-  750 voxels and the boundary two touching segments share moves to one inside
-  both; they never move inward. An end that is on no control point is stated
-  as a control position - `cp 3.42` is 42 % of the way from control point 3
-  to 4 - and the control points an edit needs there are inserted when the
-  piece is edited or saved. A segment's *cost* is the sum of the shares of
-  every constraint accusing it and *cost/kvx* the densest of them, per 1000
-  voxels; *cost per voxel* is the default order. The segments are computed
-  from the run's rows and the current approvals, so approving one shrinks or
-  removes the ones that overlapped it without a new solve. The dock places
-  the run's arcs against control arcs measured in the run's own frame.
+  The stretch rows are not the run's stored stretches. Every fiber the run
+  solved is cut into stretches over all of its unapproved geometry, accused
+  or not - in the end all of it has to be approved, and the run only says
+  where to start. Stretches end on control points: each run of unapproved
+  control spans is cut into the fewest stretches of at most 2,000 voxels (a
+  single longer span is a stretch of its own), and among those cuttings the
+  one whose cuts split the least accused weight is taken, so a stretch a
+  cycle accuses stays whole where it can. An accusation only adds cost to
+  the stretches it lies in, by length; one of no length (two constraints of
+  a cycle meeting the fiber at one point) adds its cost to the stretch
+  holding that point and is never a row. A stretch nothing accuses costs
+  nothing and sorts last. Approved geometry is not offered again; a stretch
+  continuing an approved piece reaches 50 voxels back into it (*extends
+  approved*). A segment's *cost* is the sum of the shares of every
+  constraint accusing it and *cost/kvx* that cost per 1000 voxels of the
+  stretch; *cost per voxel* is the default order. The stretches are computed
+  from the run's rows and the current approvals, so approving one removes it
+  without a new solve. What a run accuses outside a fiber's present control
+  points stays a row without a control range, and selecting it is an error
+  that says the run is older than the annotation.
+
+  A row only ever shows a stretch: selection, hover and opening have no
+  whole-fiber form, and a stretch that cannot be resolved reports why in the
+  status line (a stretch spanning a whole fiber is still drawn as one).
 
   Each constraint row carries the two pieces its anchors lie on as child
   rows, with their approval state: those are what has to be approved before
@@ -621,8 +774,9 @@ measured separations:
 The first column is the tracer's own strip defaults (twist weight 100,
 smoothing and resampling 32 voxels), which a hand-drawn polyline is too
 sparse and too noisy for; the scaffold's defaults are therefore the second
-column's (twist weight 1000, smoothing and resampling 64 voxels), and
-`ScaffoldNormalOptions` states them. With those, the fiber geometry alone
+column's (twist weight 1000, smoothing and resampling 64 voxels). The
+default has since moved to the whole-volume pipeline's twist 300 (see
+*Neighbour normals*). With those, the fiber geometry alone
 decides the normals about as well as the prediction does: the prediction adds
 one exact enclosure relation and costs 79 s of an 83 s run to read along all
 851,285 line points, against 0.26 s for the geometry-only strip solve.

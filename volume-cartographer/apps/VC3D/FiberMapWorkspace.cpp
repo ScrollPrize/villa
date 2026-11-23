@@ -4416,41 +4416,76 @@ void FiberMapWorkspace::updateFollowedSolve()
     }
 }
 
+// The spans of a highlight that the map can draw, and why each of the others
+// cannot be drawn. A row of the approval list names stretches only: nothing
+// here ever stands a whole fiber in for one.
+std::vector<FiberMapWorkspace::HighlightSpan> FiberMapWorkspace::resolveScaffoldHighlight(
+    const vc3d::fiber_map::ScaffoldHighlight& highlight, QStringList& errors) const
+{
+    std::vector<HighlightSpan> spans;
+    for (const auto& error : highlight.errors) errors << QString::fromStdString(error);
+    if (!_layoutBuilt || _layout.fibers.empty()) {
+        errors << tr("the map has no layout yet; press Update");
+        return spans;
+    }
+    for (const auto& span : highlight.spans) {
+        const auto name = QString::fromStdString(span.fiberUuid).left(8);
+        const auto found = _fiberIdByUuid.find(span.fiberUuid);
+        if (found == _fiberIdByUuid.end()) {
+            errors << tr("fiber %1 is not known to the map; press Update").arg(name);
+            continue;
+        }
+        const auto entry = _entries.find(found->second);
+        if (entry == _entries.end()) {
+            errors << tr("fiber %1 is not drawn on the map (the layout left it out)").arg(name);
+            continue;
+        }
+        if (span.controlFrom < 0 || span.controlTo <= span.controlFrom) {
+            errors << tr("fiber %1: invalid control range %2 to %3").arg(name).arg(span.controlFrom).arg(span.controlTo);
+            continue;
+        }
+        const HighlightSpan resolved{found->second, span.controlFrom, span.controlTo, span.positionFrom, span.positionTo};
+        if (pathOfSpan(entry->fiber, resolved).isEmpty()) {
+            errors << tr("fiber %1: controls %2 to %3 (positions %4 to %5) draw nothing; the map places %6 control "
+                         "points on this fiber")
+                          .arg(name).arg(span.controlFrom).arg(span.controlTo).arg(span.positionFrom).arg(span.positionTo)
+                          .arg(entry->fiber.controlArclength.size());
+            continue;
+        }
+        spans.push_back(resolved);
+    }
+    if (spans.empty() && errors.isEmpty()) errors << tr("the row names no stretch");
+    return spans;
+}
+
+void FiberMapWorkspace::reportScaffoldHighlightErrors(const QStringList& errors)
+{
+    if (errors.isEmpty()) return;
+    const auto message = tr("ERROR: stretch not shown - %1").arg(errors.join(QStringLiteral("; ")));
+    Logger()->error("fiber map approval highlight: {}", message.toStdString());
+    setOperationStatus(message);
+}
+
 void FiberMapWorkspace::showScaffoldHighlight(const vc3d::fiber_map::ScaffoldHighlight& highlight)
 {
     _highlightSpans.clear();
-    // The dock asked for spans: that stays true even when none of them can be
-    // resolved, so a missing control range can never fall back to the fiber
-    // selection's halo and network glow.
-    const bool spanSelection = !highlight.spans.empty();
-    std::vector<uint64_t> fibers;
-    for (const auto& uuid : highlight.fiberUuids) {
-        const auto found = _fiberIdByUuid.find(uuid);
-        if (found == _fiberIdByUuid.end()) continue;
-        if (_entries.find(found->second) == _entries.end()) continue;
-        fibers.push_back(found->second);
-    }
-    if (fibers.empty()) {
-        setOperationStatus(tr("That fiber is not on the map; press Update"));
-        rebuildApprovalOverlay();
+    if (highlight.empty()) {
+        setSelectedFibers({}, true);
+        rebuildHighlightOverlay();
         return;
     }
-    // The map selects at most two fibers, which is exactly a constraint's pair.
-    if (fibers.size() > 2) fibers.resize(2);
-    for (const auto& span : highlight.spans) {
-        const auto found = _fiberIdByUuid.find(span.fiberUuid);
-        if (found == _fiberIdByUuid.end() || _entries.find(found->second) == _entries.end()) continue;
-        if (span.controlFrom < 0 || span.controlTo <= span.controlFrom) continue;
-        _highlightSpans.push_back(
-            {found->second, span.controlFrom, span.controlTo, span.positionFrom, span.positionTo});
-    }
-    if (spanSelection && _highlightSpans.empty())
-        setOperationStatus(tr("That stretch has no control range on this map; nothing to draw"));
-    setSelectedFibers(fibers, spanSelection);
+    QStringList errors;
+    _highlightSpans = resolveScaffoldHighlight(highlight, errors);
+    // The fibers of the spans that are drawn, for the status line and the
+    // strip views. Always a span selection: no halo, no network glow.
+    std::vector<uint64_t> fibers;
+    for (const auto& span : _highlightSpans)
+        if (std::find(fibers.begin(), fibers.end(), span.fiber) == fibers.end()) fibers.push_back(span.fiber);
+    setSelectedFibers(fibers, true);
     rebuildHighlightOverlay();
-    // Bring what the row names into view: the spans it draws, or the fibers
-    // when it names none. Zoom out only when the current scale cannot hold
-    // the extent, the same rule the error list uses.
+    reportScaffoldHighlightErrors(errors);
+    // Bring the drawn spans into view. Focus only: the view is centred on
+    // them and the zoom is the user's.
     QRectF extent;
     for (const auto& span : _highlightSpans) {
         const auto entry = _entries.find(span.fiber);
@@ -4458,14 +4493,6 @@ void FiberMapWorkspace::showScaffoldHighlight(const vc3d::fiber_map::ScaffoldHig
         const auto bounds = pathOfSpan(entry->fiber, span).boundingRect();
         extent = extent.isNull() ? bounds : extent.united(bounds);
     }
-    if (extent.isNull())
-        for (const auto fiber : fibers) {
-            const auto entry = _entries.find(fiber);
-            if (entry == _entries.end()) continue;
-            const auto bounds = fiberBounds(entry->fiber);
-            extent = extent.isNull() ? bounds : extent.united(bounds);
-        }
-    // Focus only: the view is centred on it and the zoom is the user's.
     if (_view && !extent.isNull()) _view->centerOn(extent.center());
 }
 
@@ -4476,29 +4503,15 @@ void FiberMapWorkspace::showScaffoldHover(const vc3d::fiber_map::ScaffoldHighlig
         delete item;
     }
     _hoverItems.clear();
-    if (!_layoutBuilt || _layout.fibers.empty()) return;
-    // The stretches the row names, or its whole fibers when it names none.
+    if (highlight.empty()) return;
+    QStringList errors;
+    const auto spans = resolveScaffoldHighlight(highlight, errors);
+    reportScaffoldHighlightErrors(errors);
     QPainterPath hovered;
-    for (const auto& span : highlight.spans) {
-        const auto found = _fiberIdByUuid.find(span.fiberUuid);
-        if (found == _fiberIdByUuid.end()) continue;
-        const auto entry = _entries.find(found->second);
-        if (entry == _entries.end()) continue;
-        hovered.addPath(pathOfSpan(entry->fiber, span));
+    for (const auto& span : spans) {
+        const auto entry = _entries.find(span.fiber);
+        if (entry != _entries.end()) hovered.addPath(pathOfSpan(entry->fiber, span));
     }
-    if (hovered.isEmpty())
-        for (const auto& uuid : highlight.fiberUuids) {
-            const auto found = _fiberIdByUuid.find(uuid);
-            if (found == _fiberIdByUuid.end()) continue;
-            const auto entry = _entries.find(found->second);
-            if (entry == _entries.end()) continue;
-            for (std::size_t run = 0; run < entry->fiber.runs.size(); ++run) {
-                const auto points = vc3d::fiber_map::displayRunPoints(entry->fiber, run);
-                if (points.size() < 2) continue;
-                hovered.moveTo(points.front());
-                for (std::size_t i = 1; i < points.size(); ++i) hovered.lineTo(points[i]);
-            }
-        }
     if (hovered.isEmpty()) return;
     // Apart from the selection's solid red: a dashed cyan line over a dark
     // casing, so it reads on any fiber colour and next to a selected stretch.
@@ -4576,8 +4589,13 @@ void FiberMapWorkspace::openScaffoldPiece(const std::string& fiberUuid, std::int
             shared->normals = std::move(normals->normals);
             _controller->setSolverLineNormals(fiberId, std::move(shared));
         } else {
+            // A stretch is reviewed against the normals of its solve. Without
+            // them it is not opened: no other normals stand in.
             _controller->setSolverLineNormals(fiberId, nullptr);
-            setOperationStatus(tr("The annotation shows its own normals: %1").arg(why));
+            const auto message = tr("ERROR: stretch not opened - the solve's normals for this fiber cannot be read: %1").arg(why);
+            Logger()->error("fiber map: {}", message.toStdString());
+            setOperationStatus(message);
+            return;
         }
     }
     emit openFiberPieceRequested(fiberId, plan);

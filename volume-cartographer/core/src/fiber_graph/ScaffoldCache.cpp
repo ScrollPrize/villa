@@ -45,6 +45,36 @@ std::string scaffoldNormalInputs(const ScaffoldNormalOptions& options, const std
         s.number("presence_floor", options.presenceFloor);
         s.number("presence_full", options.presenceFull);
     }
+    if (options.neighbours.field) {
+        const auto& n = options.neighbours;
+        s.words("neighbours", n.identity);
+        s.number("neighbour_weight", n.weight);
+        s.number("neighbour_sigma", n.sigma);
+        s.number("neighbour_spacing", n.sampleSpacing);
+        s.number("neighbour_coverage", n.minimumCoverage);
+        s.integer("neighbour_falloff", int(n.variant.falloff));
+        s.integer("neighbour_frame", int(n.variant.frame));
+        for (const double v : n.variant.scales) s.number("neighbour_scale", v);
+        for (const double v : n.variant.parallelScales) s.number("neighbour_parallel_scale", v);
+        s.number("neighbour_radius", n.variant.radius);
+        s.number("neighbour_first_sigma", n.variant.firstSigma);
+        s.flag("neighbour_fiber_cap", n.variant.fiberCap);
+        s.flag("neighbour_estimated_frame", n.variant.estimatedParallelFrame);
+        s.flag("crossings_field", n.fieldCrossings);
+        s.flag("crossings_scaffold", n.scaffoldCrossings);
+        if (n.fieldCrossings || n.scaffoldCrossings) {
+            s.number("crossing_weight", n.crossing.weight);
+            s.number("crossing_sigma", n.crossing.sigma);
+            s.integer("crossing_falloff", int(n.crossing.falloff));
+            s.integer("crossing_frame", int(n.crossing.frame));
+            for (const double v : n.crossing.scales) s.number("crossing_scale", v);
+            s.number("crossing_prediction_power", n.crossing.predictionPower);
+            s.number("crossing_prediction_min", n.crossing.predictionMin);
+            s.number("crossing_coherence_power", n.crossing.coherencePower);
+            s.number("crossing_angle_power", n.crossing.anglePower);
+            s.number("crossing_end_taper", n.crossing.endTaper);
+        }
+    }
     // Which records may anchor is decided by these; which did is `anchors`.
     for (const auto& anchor : anchors) s.words("by", anchor);
     return s.text;

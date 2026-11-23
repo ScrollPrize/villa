@@ -215,6 +215,11 @@ private:
         double positionFrom = -1, positionTo = -1;
     };
     std::vector<HighlightSpan> _highlightSpans;
+    // The spans of an approval-list highlight the map can draw; `errors`
+    // gets the reason for every one it cannot. Never a whole fiber.
+    [[nodiscard]] std::vector<HighlightSpan> resolveScaffoldHighlight(const vc3d::fiber_map::ScaffoldHighlight& highlight,
+                                                                      QStringList& errors) const;
+    void reportScaffoldHighlightErrors(const QStringList& errors);
     // Set while the selection came from the approval dock: the fibers are
     // selected for their spans, so the network keeps its plain look and only
     // the span's own control points are marked.
