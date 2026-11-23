@@ -38,6 +38,29 @@ static tifxyz::Surface plane(int rows, int cols, double scale, const std::string
     return tifxyz::Surface(rows, cols, std::move(xyz), {}, std::move(metadata));
 }
 
+// checkScale: the plane's vertices are 3 voxels apart along rows and 2 along columns.
+static void scaleCheck()
+{
+    auto surface = plane(40, 50, 0.05, "");
+    const float* xyz = surface.xyz().data();
+    const auto exact = tifxyz::checkScale(xyz, 40, 50, {1.0 / 3, 0.5});
+    CHECK(exact.measured.rows && std::abs(*exact.measured.rows - 3) < 1e-9);
+    CHECK(exact.measured.cols && std::abs(*exact.measured.cols - 2) < 1e-9);
+    CHECK(exact.worst() < 1e-9);
+    const auto off = tifxyz::checkScale(xyz, 40, 50, {0.25, 0.25});
+    CHECK(std::abs(*off.deviation[0] + 0.25) < 1e-9 && std::abs(*off.deviation[1] + 0.5) < 1e-9);
+    CHECK(std::abs(off.worst() - 0.5) < 1e-9);
+    // Invalid vertices (negative marker, NaN) are left out; a single row has no spacing along rows.
+    std::vector<float> holes(surface.xyz());
+    for (int c = 0; c < 50; c += 2) holes[(std::size_t(7) * 50 + std::size_t(c)) * 3] = -1;
+    holes[(std::size_t(8) * 50 + 3) * 3 + 2] = std::nanf("");
+    CHECK(tifxyz::checkScale(holes.data(), 40, 50, {1.0 / 3, 0.5}).worst() < 1e-9);
+    const auto row = tifxyz::checkScale(xyz, 1, 50, {1.0 / 3, 0.5});
+    CHECK(!row.measured.rows && !row.deviation[0] && row.measured.cols);
+    std::vector<float> none(std::size_t(4) * 5 * 3, -1.0f);
+    CHECK(tifxyz::checkScale(none.data(), 4, 5, {1, 1}).worst() == 0);
+}
+
 int main()
 {
     const auto root = fs::temp_directory_path() / ("vc_reader_tifxyz_" + std::to_string(::getpid()));
@@ -247,5 +270,6 @@ int main()
         CHECK(mapping.shape == (std::vector<std::int64_t>{3000, 200}) && mapping.dtype == "|u1" && mapping.offset > 0);
     }
     fs::remove_all(root);
+    scaleCheck();
     return 0;
 }

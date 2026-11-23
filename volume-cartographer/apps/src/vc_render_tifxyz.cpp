@@ -7,6 +7,7 @@
 #include "vc/core/util/Surface.hpp"
 #include <vc_reader/image_write.hpp>
 #include <vc_reader/source_reader.hpp>
+#include <vc_reader/tifxyz.hpp>
 #include "vc/core/util/StreamOperators.hpp"
 
 #include "vc/core/types/Volume.hpp"
@@ -848,6 +849,9 @@ int main(int argc, char *argv[])
         // left-handed frame. So --flip-normals is usually what we want: it negates N so the
         // slice stack grows in front of the sheet rather than behind it.
         ("flip-normals", po::bool_switch()->default_value(false), "Negate surface normals (reverses slice ordering along the normal)")
+        // The output size comes from meta.json scale. A surface whose measured vertex spacing is more than 10% off
+        // that scale is rendered anyway with a warning; this switch skips it instead.
+        ("strict-scale", po::bool_switch()->default_value(false), "Skip a surface whose meta.json scale disagrees with its measured vertex spacing by more than 10%")
         // How the surface itself is resampled, as opposed to how the volume is
         // sampled along the normal (trilinear slices, nearest-voxel composites).
         ("surface-interpolation", po::value<std::string>()->default_value("bicubic"),
@@ -1089,6 +1093,7 @@ int main(int argc, char *argv[])
     int flip_axis = parsed["flip"].as<int>();
     g_flipNormals = parsed["flip-normals"].as<bool>();
     const bool quickTif = parsed["quick-tif"].as<bool>();
+    const bool strictScale = parsed["strict-scale"].as<bool>();
 
     // --- Load affines ---
     Affine affineTransform;
@@ -1350,6 +1355,29 @@ int main(int argc, char *argv[])
                               : load_quad_from_tifxyz(seg_folder);
         }
         catch (...) { logPrintf(stderr, "Error loading: %s\n", seg_folder.string().c_str()); return false; }
+
+        // meta.json scale sets the output size below; check it against the grid it describes.
+        {
+            const cv::Mat_<cv::Vec3f> grid = surf->rawPointsPtr()->isContinuous() ? *surf->rawPointsPtr() : surf->rawPointsPtr()->clone();
+            // QuadSurface keeps scale as (x, y) = (columns, rows); vcr::tifxyz takes (rows, columns).
+            const auto check = vcr::tifxyz::checkScale(reinterpret_cast<const float*>(grid.ptr()), grid.rows, grid.cols,
+                                                       {double(surf->_scale[1]), double(surf->_scale[0])});
+            if (check.worst() > 0.10) {
+                const char* names[2] = {"rows", "columns"};
+                const std::optional<double> spacing[2] = {check.measured.rows, check.measured.cols};
+                const double scales[2] = {double(surf->_scale[1]), double(surf->_scale[0])};
+                for (int a = 0; a < 2; ++a)
+                    if (check.deviation[a] && std::abs(*check.deviation[a]) > 0.10)
+                        logPrintf(stderr, "Warning: %s: meta.json scale %.6g means one vertex every %.3g voxels along %s, "
+                                  "but neighbouring vertices are %.3g voxels apart (%+.0f%%); the output will be %s along that axis.\n",
+                                  seg_folder.string().c_str(), scales[a], 1.0 / scales[a], names[a], *spacing[a],
+                                  100.0 * *check.deviation[a], *check.deviation[a] > 0 ? "squeezed" : "stretched");
+                if (strictScale) {
+                    logPrintf(stderr, "Skipping %s (--strict-scale).\n", seg_folder.string().c_str());
+                    return false;
+                }
+            }
+        }
 
 
         // Replace sentinel -1 with NaN

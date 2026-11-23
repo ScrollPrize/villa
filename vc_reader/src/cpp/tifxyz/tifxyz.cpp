@@ -334,6 +334,56 @@ std::array<std::int64_t, 2> storedShape(const std::string& location, const sourc
     return {reader->shape()[0], reader->shape()[1]};
 }
 
+namespace {
+
+// Median of neighbour distances along one axis; at most about 2^20 pairs, taken on a fixed stride.
+std::optional<double> medianStep(const float* xyz, std::int64_t rows, std::int64_t cols, bool alongRows)
+{
+    const std::int64_t pairs = alongRows ? (rows - 1) * cols : rows * (cols - 1);
+    if (rows <= 0 || cols <= 0 || pairs <= 0) return std::nullopt;
+    const std::int64_t stride = std::max<std::int64_t>(1, pairs / (std::int64_t(1) << 20));
+    std::vector<double> d;
+    d.reserve(std::size_t(pairs / stride + 1));
+    for (std::int64_t k = 0; k < pairs; k += stride) {
+        std::int64_t r, c, r2, c2;
+        if (alongRows) r = k / cols, c = k % cols, r2 = r + 1, c2 = c;
+        else r = k / (cols - 1), c = k % (cols - 1), r2 = r, c2 = c + 1;
+        const float* a = xyz + (std::size_t(r) * std::size_t(cols) + std::size_t(c)) * 3;
+        const float* b = xyz + (std::size_t(r2) * std::size_t(cols) + std::size_t(c2)) * 3;
+        if (!vertexValid(a) || !vertexValid(b)) continue;
+        const double dx = double(a[0]) - b[0], dy = double(a[1]) - b[1], dz = double(a[2]) - b[2];
+        d.push_back(std::sqrt(dx * dx + dy * dy + dz * dz));
+    }
+    if (d.empty()) return std::nullopt;
+    auto mid = d.begin() + std::ptrdiff_t(d.size() / 2);
+    std::nth_element(d.begin(), mid, d.end());
+    return *mid;
+}
+
+}  // namespace
+
+GridSpacing measureSpacing(const float* xyz, std::int64_t rows, std::int64_t cols)
+{
+    return {medianStep(xyz, rows, cols, true), medianStep(xyz, rows, cols, false)};
+}
+
+double ScaleCheck::worst() const
+{
+    double out = 0;
+    for (const auto& d : deviation)
+        if (d) out = std::max(out, std::abs(*d));
+    return out;
+}
+
+ScaleCheck checkScale(const float* xyz, std::int64_t rows, std::int64_t cols, const std::array<double, 2>& scale)
+{
+    ScaleCheck out;
+    out.measured = measureSpacing(xyz, rows, cols);
+    if (out.measured.rows) out.deviation[0] = *out.measured.rows * scale[0] - 1;
+    if (out.measured.cols) out.deviation[1] = *out.measured.cols * scale[1] - 1;
+    return out;
+}
+
 Metadata parseMetadata(const json& document, const std::string& location)
 {
     Metadata out;
