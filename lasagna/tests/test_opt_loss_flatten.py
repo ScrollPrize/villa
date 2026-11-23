@@ -1127,6 +1127,9 @@ class FlattenLossTest(unittest.TestCase):
 				base_step=base_step,
 			)
 			fused.step()
+			# the fused kernel must really run where one exists, not the PyTorch step after a silent fallback
+			expected = {"cuda": "triton", "mps": "metal"}.get(device.type, "torch")
+			self.assertEqual(fused.last_backend, expected)
 
 			for scale_i, (p, before) in enumerate(zip(fused_params, fused_before, strict=True)):
 				max_norm = torch.linalg.vector_norm((p - before).detach(), dim=0).max()
@@ -1148,6 +1151,10 @@ class FlattenLossTest(unittest.TestCase):
 	@unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for the Triton fused optimizer test")
 	def test_fused_clamped_adam_matches_reference_on_cuda(self) -> None:
 		self._assert_fused_clamped_adam_matches_reference(torch.device("cuda"))
+
+	@unittest.skipUnless(torch.backends.mps.is_available(), "MPS is required for the Metal fused optimizer test")
+	def test_fused_clamped_adam_matches_reference_on_mps(self) -> None:
+		self._assert_fused_clamped_adam_matches_reference(torch.device("mps"))
 
 	def test_orient_regularizer_allows_positive_area_stretch(self) -> None:
 		opt_loss_flatten.configure(orient_min_det=0.0, reset_history=True)

@@ -8,7 +8,7 @@ Each part provides `add_args(parser)` + `from_args(args)`:
 
 - **data**: [`cli_data.py`](../cli_data.py)
   - `--input` path to `.lasagna.json` volume manifest
-  - `--device` (default `cuda`)
+  - `--device` (default `cuda`; `mps` runs on an Apple GPU with Metal samplers, `cpu` uses plain PyTorch)
   - `--seed cx cy cz` seed point in fullres voxels
   - `--model-w`, `--model-h` model extent in fullres voxels
   - `--winding-volume` optional winding volume zarr path

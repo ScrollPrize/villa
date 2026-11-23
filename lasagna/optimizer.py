@@ -2642,7 +2642,7 @@ def optimize(
 		if isinstance(opt, FlattenClampedAdam) and not is_cyl_shelling_stage:
 			print(
 				f"[optimizer] {label}: fused_flatten_adam_clamp=1 "
-				f"(Triton CUDA with PyTorch fallback)",
+				f"(Triton on CUDA, Metal on MPS, PyTorch elsewhere)",
 				flush=True,
 			)
 		if flatten_renorm_interval > 0 and not is_cyl_shelling_stage:

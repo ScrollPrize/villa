@@ -33,6 +33,23 @@ Verify the selected PyTorch build and GPU access:
 python -c 'import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())'
 ```
 
+### Apple silicon (MPS)
+
+On a Mac the bootstrap selects the CPU build, which includes PyTorch's MPS
+backend. Pass `--device mps` to `fit.py` to run fits on the Apple GPU. Volume
+fits sample the streamed uint8 chunks with native Metal kernels
+(`u8_sample_metal.py`, compiled at first use through
+`torch.mps.compile_shader`, so no Xcode or C++ build is needed), and flatten
+fits with `fused_flatten_adam_clamp` use a Metal clamped-Adam step
+(`flatten_clamped_adam_metal.py`). Set `LASAGNA_METAL=0` to use the plain
+PyTorch versions of both instead, which are much slower on MPS but useful for
+comparison. `--device cpu` also runs every fit mode, with the same PyTorch
+code.
+
+`compile_flatten` needs PyTorch 2.15 or newer on MPS: older Inductor versions
+generate Metal that fails to compile, and the fit then falls back to eager
+mode with a warning.
+
 The install exposes these commands, including the native Fiberlet processor
 packaged by the sibling Volume Cartographer Python distribution:
 
