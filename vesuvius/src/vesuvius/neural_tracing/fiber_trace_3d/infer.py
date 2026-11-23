@@ -393,10 +393,13 @@ def _store_has_chunks(store: Path) -> bool:
     )
 
 
-def _refuse_other_tiling(stores: list[Path], tiling: dict[str, int]) -> None:
+def _refuse_other_tiling(
+    stores: list[Path], tiling: dict[str, int], adopt_unrecorded: bool = False,
+) -> None:
     """Refuse stores holding chunks predicted with another or an unrecorded tiling.
 
-    Stores without chunks (such as after an interruption during setup) are adopted.
+    Stores without chunks (such as after an interruption during setup) are adopted,
+    as are stores without a recorded tiling when the caller vouches for them.
     """
     def describe(value: object) -> str:
         return " ".join(f"{k}={v}" for k, v in value.items()) if isinstance(value, dict) else repr(value)
@@ -406,13 +409,13 @@ def _refuse_other_tiling(stores: list[Path], tiling: dict[str, int]) -> None:
             recorded = json.loads((store / ".zattrs").read_text()).get(TILING_ATTR)
         except (OSError, ValueError, AttributeError):
             recorded = None
-        if recorded == tiling or not _store_has_chunks(store):
+        if recorded == tiling or (recorded is None and adopt_unrecorded) or not _store_has_chunks(store):
             continue
         if recorded is None:
             raise ValueError(
                 f"{store} holds prediction chunks but records no tiling (written before tilings "
-                "were recorded), so they cannot be reused safely; use a new output path or "
-                "remove the store."
+                "were recorded), so they cannot be reused safely; pass --adopt-unrecorded-tiling "
+                "if they were predicted with this tiling, or use a new output path or remove the store."
             )
         raise ValueError(
             f"{store} holds prediction chunks from tiling {describe(recorded)}, but this run "
@@ -458,6 +461,7 @@ def run_fiber_trace_3d_inference(
     output_format: str = "compact",
     blank_invalid: bool = False,
     width_uint8_base: bool = True,
+    adopt_unrecorded_tiling: bool = False,
     provenance_context_path: str | Path | None = None,
 ) -> None:
     if int(input_connections) <= 0:
@@ -590,7 +594,7 @@ def run_fiber_trace_3d_inference(
         tiled_stores = sorted({Path(OmeZarrOutputAdapter.channel_path(channel))
                                for product in predict_adapter.output_products
                                for channel in product.channels})
-    _refuse_other_tiling(tiled_stores, tiling)
+    _refuse_other_tiling(tiled_stores, tiling, adopt_unrecorded_tiling)
     if output_format == "compact":
         from lasagna.lasagna_volume import VALIDITY_BY_CHUNKS
         from vc_reader.reader import create_group
@@ -852,6 +856,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--overlap", type=int, default=32,
                         help="Tile overlap in input voxels; must be >= 2 * --border.")
     parser.add_argument("--border", type=int, default=16, help="Hard discard border at tile edges.")
+    parser.add_argument("--adopt-unrecorded-tiling", action="store_true",
+                        help="Resume output stores that record no tiling as if predicted with this tiling; "
+                             "only for chunks you know were.")
     parser.add_argument(
         "--inference-scaledown-power", type=int, default=None,
         help="Total power-of-two output reduction relative to input, including model stride. "
@@ -994,6 +1001,7 @@ def main(argv: list[str] | None = None) -> int:
         output_format=args.output_format,
         blank_invalid=args.blank_invalid,
         width_uint8_base=args.width_uint8_base,
+        adopt_unrecorded_tiling=args.adopt_unrecorded_tiling,
         device=args.device,
         devices=args.devices,
         crop_xyzwhd=tuple(int(v) for v in args.crop_xyzwhd) if args.crop_xyzwhd else None,

@@ -152,7 +152,9 @@ and managed Lasagna inference write portable provenance.
 
 New Fiber and Lasagna outputs default to the [compact schema v3](docs/volume_schema_v3.md):
 one Zarr store, an embedded manifest, and resolution-based full-channel chunks.
-Existing sidecar outputs remain resumable. Fiber output declares
+Existing sidecar outputs remain resumable; Fiber outputs written before stores
+recorded their tiling resume only with `--adopt-unrecorded-tiling`, to be passed
+only when they were predicted with the same tiling. Fiber output declares
 `validity_channel: chunks` (every stored chunk is a complete prediction; the
 input region is widened to the output chunk grid) and rounds/clamps width to
 uint8 base-volume voxels; `--blank-invalid` additionally zeroes the other

@@ -1084,6 +1084,25 @@ def test_fiber_inference_refuses_resume_of_store_without_tiling(
     assert json.loads((output.parent / "inference.json").read_text())["inference"]["overlap"] == 16
 
 
+@pytest.mark.parametrize("name", ["fiber.zarr", "fiber.lasagna.json"])
+def test_fiber_inference_adopts_store_without_tiling_on_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str,
+) -> None:
+    run = _constant_fiber_cli(tmp_path, monkeypatch)
+    output = tmp_path / "out" / name
+    assert run(output, "--crop", "0", "0", "0", "32", "32", "32") == 0
+    _drop_tiling_records(output.parent)
+    crop_chunks = _finest_chunks(output)
+    assert len(crop_chunks) == 1
+
+    assert run(output, "--adopt-unrecorded-tiling") == 0
+
+    after = _finest_chunks(output)
+    assert len(after) == 8 and crop_chunks.items() <= after.items()
+    assert int((_presence(output) == 0).sum()) == 0
+    assert run(output) == 0
+
+
 @pytest.mark.parametrize("keep_manifest", [True, False])
 def test_fiber_inference_refuses_legacy_resume_with_other_tiling(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, keep_manifest: bool,
