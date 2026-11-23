@@ -49,10 +49,17 @@ def exact_reference():
     """On recent NVIDIA GPUs, PyTorch rounds cuDNN convolutions with TF32 by default,
     so the reference and its backward pass would be less precise than the native code."""
     torch = pytest.importorskip("torch")
-    allow_tf32 = torch.backends.cudnn.allow_tf32
-    torch.backends.cudnn.allow_tf32 = False
-    yield
-    torch.backends.cudnn.allow_tf32 = allow_tf32
+    # Recent PyTorch refuses to read allow_tf32 once fp32_precision was set, so use the new switch when it exists.
+    if hasattr(torch.backends.cudnn, "conv"):
+        precision = torch.backends.cudnn.conv.fp32_precision
+        torch.backends.cudnn.conv.fp32_precision = "ieee"
+        yield
+        torch.backends.cudnn.conv.fp32_precision = precision
+    else:
+        allow_tf32 = torch.backends.cudnn.allow_tf32
+        torch.backends.cudnn.allow_tf32 = False
+        yield
+        torch.backends.cudnn.allow_tf32 = allow_tf32
 
 
 @pytest.mark.parametrize("dim", [2, 3])
