@@ -480,6 +480,31 @@ Flat inference has a narrower preprocessing contract than training. It accepts
 with `divisor: 255`. Other normalization modes are rejected rather than being
 silently replaced with robust normalization.
 
+### Automatically grown surfaces: rotate upright first
+
+Hand-made segments follow the standard orientation, with grid rows running down
+the scroll axis (+z) and text lines horizontal. Surfaces grown automatically, for
+example with `vc_grow_seg_from_seed`, come out at an arbitrary in-plane angle.
+Training augments with flips and 90° turns only, so text at, say, 40° is outside
+what the models have seen. `upright` takes the angle from the segment's own
+`z.tif`, rotates every layer of the rendered surface volume so z runs straight
+down the rows, and maps the prediction back onto the original canvas:
+
+```bash
+uv run python -m vesuvius.ink_detection.inference.upright angle seg.tifxyz
+uv run python -m vesuvius.ink_detection.inference.upright rotate seg.tifxyz seg.zarr seg_upright.zarr
+uv run --extra models python -m vesuvius.ink_detection.inference.infer \
+  seg_upright.zarr checkpoint.pth pred_upright.tif
+uv run python -m vesuvius.ink_detection.inference.upright back seg_upright.zarr pred_upright.tif pred.tif
+```
+
+`rotate` writes a bare level-0 array with the angle and both canvas shapes in its
+attributes; `back` reads them, so `pred.tif` lines up with masks and overlays made
+for `seg.zarr`. Only the in-plane rotation changes: the layer order is untouched,
+so `--direction` means the same on the rotated volume, and mirrored grids stay
+mirrored (training includes flips). The rotated canvas is larger than the
+original; the padding is zero.
+
 ## Native 3D inference
 
 A tifxyz directory must contain `x.tif`, `y.tif`, `z.tif`, and
