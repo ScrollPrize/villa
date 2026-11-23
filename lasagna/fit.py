@@ -344,6 +344,13 @@ def _parse_init_grow_config(args_cfg: dict | None, *, target_depth: int) -> Init
 
 
 def _require_torch_device_available(device: torch.device) -> None:
+	if device.type == "mps" and not torch.backends.mps.is_available():
+		raise RuntimeError(
+			"MPS device was requested, but PyTorch cannot access an Apple GPU "
+			"(needs Apple silicon and a PyTorch build with MPS). Refusing to "
+			"continue because falling back to CPU would make fit smoke/perf runs "
+			"misleading."
+		)
 	if device.type != "cuda":
 		return
 	if not torch.cuda.is_available():

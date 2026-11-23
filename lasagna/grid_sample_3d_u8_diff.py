@@ -1,5 +1,9 @@
-"""Differentiable CUDA uint8 3D grid_sample with gradients w.r.t. sample positions."""
+"""Differentiable uint8 3D grid_sample with gradients w.r.t. sample positions.
 
+CUDA runs the JIT-built kernel, MPS the Metal port (``u8_sample_metal``), and the CPU ``F.grid_sample``.
+"""
+
+import os
 from pathlib import Path
 
 import torch
@@ -53,14 +57,21 @@ def grid_sample_3d_u8_diff(
     """Trilinear 3D grid_sample on uint8 volume, differentiable w.r.t. grid positions.
 
     Args:
-        volume: (C, Z, Y, X) uint8 CUDA
-        grid: (D, H, W, 3) float32 CUDA — fullres coordinates (x, y, z)
-        offset: (3,) float32 CUDA — origin in fullres coords
-        inv_scale: (3,) float32 CUDA — 1.0 / spacing per axis
+        volume: (C, Z, Y, X) uint8 on CUDA, MPS or the CPU
+        grid: (D, H, W, 3) float32, same device — fullres coordinates (x, y, z)
+        offset: (3,) float32 — origin in fullres coords
+        inv_scale: (3,) float32 — 1.0 / spacing per axis
 
     Returns:
-        (C, D, H, W) float32 CUDA — raw interpolated values (not decoded)
+        (C, D, H, W) float32 — raw interpolated values (not decoded)
     """
+    if volume.device.type == "mps":
+        # torch's MPS grid_sample has no 3D backward before 2.15, so MPS always takes a uint8-native path
+        if os.environ.get("LASAGNA_METAL", "1") != "0":
+            from u8_sample_metal import dense_sample
+        else:
+            from u8_sample_torch import dense_sample
+        return dense_sample(volume, grid, offset, inv_scale, diff=True)
     if volume.device.type != "cuda":
         return _grid_sample_3d_u8_diff_cpu(volume, grid, offset, inv_scale)
     return _GridSample3DU8Diff.apply(volume, grid, offset, inv_scale)
