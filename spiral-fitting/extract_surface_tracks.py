@@ -17,17 +17,20 @@ DBM to recompute it. With --packed-store (default:
 ``write_native_packed_store``), the adjacent packed store read by
 ``fit_spiral.py`` is written at the end.
 
-Two backends write the same keys in the same format:
+Three backends write the same keys in the same format:
 
-  gpu  Brook (brook-cu12) and cuCIM on NVIDIA GPUs of compute capability 8.0 or
-       newer, Linux x86-64 only, one process per GPU (``surface_tracks_gpu.py``).
-  cpu  Kimimaro on the CPU, several slabs at once in worker processes
-       (--slab-workers); vc_reader labels connected components on the CPU.
+  gpu    Brook (brook-cu12) and cuCIM on NVIDIA GPUs of compute capability 8.0 or
+         newer, Linux x86-64 only, one process per GPU (``surface_tracks_gpu.py``).
+  metal  teasar on Apple GPUs, when it is installed. A slab teasar declines
+         runs on Kimimaro instead.
+  cpu    Kimimaro on the CPU, several slabs at once in worker processes
+         (--slab-workers); vc_reader labels connected components on the CPU.
 
-Brook implements Kimimaro's algorithm on the GPU; its skeletons are close to
-Kimimaro's but not guaranteed to be identical. ``--backend auto`` uses the GPU
-backend when a compatible GPU is present and ``path_mode`` is ``'interjoint'``,
-and Kimimaro otherwise.
+Brook and teasar implement TEASAR skeletonization on the GPU; their skeletons
+are close to Kimimaro's but not identical. ``--backend auto`` uses the first of
+gpu, metal and cpu that can run. Both GPU backends need ``path_mode``
+``'interjoint'``, and metal also needs one of the slab configurations teasar
+supports (``TEASAR_SETTINGS``).
 
 Example:
 
@@ -55,7 +58,7 @@ import numpy as np
 predictions_zarr_path = 's3://<bucket>/<volpkg>/volumes/<surface-predictions>.zarr/0'
 tracks_dbm_path = '/path/to/<dataset>/tracks/<name>.dbm'
 write_native_packed_store = True
-skeleton_backend = 'auto'  # 'gpu' = Brook, 'cpu' = Kimimaro, 'auto' = gpu when it can run, else cpu
+skeleton_backend = 'auto'  # 'gpu' = Brook, 'metal' = teasar, 'cpu' = Kimimaro, 'auto' = the first that can run
 
 # All wrt the original (full-resolution) volume; downsampling is applied internally after CC extraction
 downsample_factor = 4
@@ -76,8 +79,26 @@ kimimaro_parallel = 'auto'
 # Kimimaro spawns a new pool of processes for every slab, which on Windows and macOS takes far
 # longer than the work they share out, so there a slab gets one even when slabs run one at a time
 _SERIAL_KIMIMARO_PARALLEL = 8 if sys.platform.startswith('linux') else 1
+# Metal backend: the order in which teasar traces a piece's targets. 'kimimaro' follows
+# Kimimaro's, so the tracks stay compatible with the CPU backend's; 'best' is teasar's own order,
+# whose skeletons differ from Kimimaro's. While a teasar release does not implement 'kimimaro',
+# the run uses the CPU backend instead
+metal_target_order = 'kimimaro'
+METAL_TARGET_ORDERS = ('kimimaro', 'best')
 
-BACKENDS = ('auto', 'gpu', 'cpu')
+BACKENDS = ('auto', 'gpu', 'metal', 'cpu')
+# The slab configurations teasar supports, by the name it gives each: the whole geometry() must
+# equal one of them, slab depths and strides included, since teasar checks the shapes it is given
+TEASAR_SETTINGS = {
+    'published_0211': dict(downsample_factor=2, z_chunk_depth_h=2, z_chunk_stride_h=8,
+                           yx_chunk_thickness_v=4, yx_stride_v=16, dust_threshold=400,
+                           max_area_threshold=640_000),
+    'villa_default': dict(downsample_factor=4, z_chunk_depth_h=4, z_chunk_stride_h=16,
+                          yx_chunk_thickness_v=4, yx_stride_v=64, dust_threshold=400,
+                          max_area_threshold=640_000),
+}
+# teasar's limit on the pooled voxels of one call; slabs are packed into calls in order up to it
+TEASAR_CALL_POOLED_VOXELS = 2 ** 26
 # An unfilled placeholder such as '<bucket>' in a configured path.
 _PLACEHOLDER = re.compile(r'<[^<>/]+>')
 
@@ -557,6 +578,186 @@ def run_gpu(predictions_path, tracks_dbm_path, gpus=None):
         skeletonize_kwargs=skeletonize_kwargs(), open_array=open_predictions, gpus=gpus)
 
 
+def teasar_settings_name():
+    """The name of the teasar settings set equal to the current configuration, or None."""
+    current = geometry()
+    return next((name for name, values in TEASAR_SETTINGS.items() if values == current), None)
+
+
+def metal_available():
+    """``(ok, reason)`` for the metal backend in the current configuration."""
+    if path_mode != 'interjoint':
+        return False, f"the metal backend supports path_mode 'interjoint' only, not {path_mode!r}"
+    if teasar_settings_name() is None:
+        return False, ('teasar supports only the slab configurations in TEASAR_SETTINGS '
+                       f'({", ".join(TEASAR_SETTINGS)})')
+    try:
+        import teasar
+    except ImportError as exc:
+        return False, f'teasar cannot be imported ({exc})'
+    return teasar.check_available()
+
+
+def _slab_shape(shape, index):
+    # The shape of array[index] for a job's index: one slice, or one per axis.
+    index = index if isinstance(index, tuple) else (index,)
+    index = index + (slice(None),) * (len(shape) - len(index))
+    return tuple(len(range(*s.indices(n))) for s, n in zip(index, shape))
+
+
+def _pooled_voxels(shape):
+    return int(np.prod([n // downsample_factor for n in shape]))
+
+
+class MetalSlabs:
+    """Tracks of slab jobs on a teasar device, with Kimimaro for each slab teasar declines.
+
+    teasar's labels equal ``prepare_cc_labels``' bit for bit, so a declined slab is skeletonized
+    from them without being read again.
+    """
+
+    def __init__(self, device, teasar, settings):
+        self.device = device
+        self.teasar = teasar
+        self.settings = settings
+        kwargs = skeletonize_kwargs()
+        self.skeletonize_kwargs = dict(
+            settings=settings, anisotropy=kwargs['anisotropy'],
+            scale=kwargs['teasar_params']['scale'], const=kwargs['teasar_params']['const'],
+            dust_threshold=kwargs['dust_threshold'], fix_borders=kwargs['fix_borders'],
+            fix_branching=kwargs['fix_branching'], target_order=metal_target_order)
+        self.declined = 0
+
+    def accepts_settings(self):
+        """Whether teasar accepts these skeletonize settings, the target order included; checked
+        once on an empty slab, since teasar checks settings before any work."""
+        try:
+            self.device.skeletonize([np.zeros((1, 1, 1), np.uint32)], **self.skeletonize_kwargs)
+        except self.teasar.UnsupportedSettings:
+            return False
+        return True
+
+    def batches(self, predictions_zarr_array, jobs):
+        """Jobs packed in order into calls of at most TEASAR_CALL_POOLED_VOXELS pooled voxels."""
+        batch, total = [], 0
+        for job in jobs:
+            n = _pooled_voxels(_slab_shape(predictions_zarr_array.shape, job[1]))
+            if batch and total + n > TEASAR_CALL_POOLED_VOXELS:
+                yield batch
+                batch, total = [], 0
+            batch.append(job)
+            total += n
+        if batch:
+            yield batch
+
+    def labels(self, predictions):
+        """Pooled labels of one binarized slab, or None when teasar declines it."""
+        try:
+            return self.device.prepare_labels(
+                predictions, downsample_factor, max(1, dust_threshold // downsample_factor ** 3),
+                max(1, max_area_threshold // downsample_factor ** 3), settings=self.settings)
+        except (self.teasar.UnsupportedSettings, self.teasar.InputTooLarge):
+            return None
+
+    def tracks(self, predictions_zarr_array, batch):
+        """Pickled tracks of each job of ``batch``, in order."""
+        results = [None] * len(batch)
+        pending = []  # (position, labels, offset) of the slabs left for one skeletonize call
+        for i, (_, index, offset) in enumerate(batch):
+            predictions = binarize(predictions_zarr_array[index])
+            if predictions.max() == 0:
+                results[i] = pickle.dumps([])
+                continue
+            if min(predictions.shape) < downsample_factor:
+                results[i] = _slab_tracks(predictions_zarr_array, index, offset)
+                continue
+            labels = self.labels(predictions)
+            del predictions
+            if labels is None:
+                self.declined += 1
+                results[i] = _slab_tracks(predictions_zarr_array, index, offset)
+                continue
+            pending.append((i, labels, offset))
+        for (i, _, _), data in zip(pending, self.skeletonize(pending)):
+            results[i] = data
+        return results
+
+    def skeletonize(self, slabs):
+        """Pickled tracks of ``(position, labels, offset)`` slabs, in order, falling back to
+        Kimimaro slab by slab as teasar's exceptions direct."""
+        if not slabs:
+            return []
+        teasar = self.teasar
+        try:
+            packed = self.device.skeletonize([labels for _, labels, _ in slabs],
+                                             **self.skeletonize_kwargs)
+        except teasar.UnsupportedSettings:
+            # a settings refusal applies to every slab of the call
+            return [self.kimimaro(slab) for slab in slabs]
+        except (teasar.OutputTooLarge, teasar.SomaUnsupported) as exc:
+            # the slabs before exc.slab fit in one call; a slab whose output is too large on its
+            # own, or that has a soma, runs on Kimimaro, and the rest continue in a new call
+            k = exc.slab
+            if k > 0 and isinstance(exc, teasar.OutputTooLarge):
+                return self.skeletonize(slabs[:k]) + self.skeletonize(slabs[k:])
+            return (self.skeletonize(slabs[:k]) + [self.kimimaro(slabs[k])]
+                    + self.skeletonize(slabs[k + 1:]))
+        except teasar.InputTooLarge:
+            if len(slabs) == 1:
+                return [self.kimimaro(slabs[0])]
+            return [data for slab in slabs for data in self.skeletonize([slab])]
+        import fast_tracks
+        return [pickle.dumps(fast_tracks.tracks_from_packed(
+                    p.v_off, p.e_off, p.vertices, p.edges, np.asarray(offset, np.int64)))
+                for p, (_, _, offset) in zip(packed, slabs)]
+
+    def kimimaro(self, slab):
+        self.declined += 1
+        _, labels, offset = slab
+        return pickle.dumps(get_skeleton_tracks(labels, offset_zyx=offset))
+
+
+def run_metal(predictions_path, tracks_dbm_path):
+    """Extract every slab with teasar on the Mac's GPU, and Kimimaro for slabs it declines."""
+    import teasar
+    from tqdm import tqdm
+    check_vertical_slab_grid(tracks_dbm_path)
+    settings = teasar_settings_name()
+    with teasar.Device() as device:
+        slabs = MetalSlabs(device, teasar, settings)
+        if slabs.accepts_settings():
+            print(f'opening {predictions_path}')
+            predictions_zarr_array = open_predictions(predictions_path)
+            with dbm.open(tracks_dbm_path, 'c') as tracks_db:
+                print('finding yx range for vertical passes')
+                min_yx, max_yx = find_yx_range(predictions_zarr_array)
+                print(f'  yx range (full-res): {min_yx} .. {max_yx}')
+                jobs = (horizontal_jobs(predictions_zarr_array, tracks_db)
+                        + vertical_jobs(predictions_zarr_array, tracks_db, 'y', min_yx, max_yx)
+                        + vertical_jobs(predictions_zarr_array, tracks_db, 'x', min_yx, max_yx))
+                jobs = [j for j in jobs if j[0] not in tracks_db]
+                print(f'extracting {len(jobs)} slabs on {device.name} (teasar '
+                      f'{teasar.__version__}, settings {settings!r}, target order '
+                      f'{metal_target_order!r})')
+                with tqdm(total=len(jobs), desc='slabs') as progress:
+                    for batch in slabs.batches(predictions_zarr_array, jobs):
+                        # keys are written in job order once their call returns, so a run
+                        # resumes as the CPU backend's does
+                        results = slabs.tracks(predictions_zarr_array, batch)
+                        for (key, _, _), data in zip(batch, results):
+                            tracks_db[key] = data
+                        progress.update(len(batch))
+            if slabs.declined:
+                print(f'  {slabs.declined} slab(s) ran on Kimimaro, which teasar declined')
+            return
+
+    # every call would decline, and the CPU backend runs slabs in parallel where the fallback
+    # inside this loop cannot
+    print(f'teasar {teasar.__version__} does not support target order {metal_target_order!r}; '
+          'extracting with the CPU backend (Kimimaro) instead')
+    run_cpu(predictions_path, tracks_dbm_path)
+
+
 def _have_kimimaro():
     return importlib.util.find_spec('kimimaro') is not None
 
@@ -569,10 +770,10 @@ def _kimimaro_missing(context):
 
 
 def select_backend(requested, gpus=None):
-    """Return ``'gpu'`` or ``'cpu'`` for ``requested`` (``'auto'``, ``'gpu'`` or ``'cpu'``).
+    """Return ``'gpu'``, ``'metal'`` or ``'cpu'`` for ``requested`` (one of ``BACKENDS``).
 
     Prints the backend and the reason; raises ``SystemExit`` when the requested
-    backend cannot run. With ``gpus`` given, ``'auto'`` does not fall back to the CPU.
+    backend cannot run. With ``gpus`` given, ``'auto'`` does not fall back to metal or the CPU.
     """
     if requested not in BACKENDS:
         raise SystemExit(f'unknown backend {requested!r}; expected one of {", ".join(BACKENDS)}')
@@ -581,6 +782,14 @@ def select_backend(requested, gpus=None):
             raise _kimimaro_missing('--backend cpu was requested')
         print('backend: cpu (Kimimaro), as requested')
         return 'cpu'
+    if requested == 'metal':
+        ok, reason = metal_available()
+        if not ok:
+            raise SystemExit(f'--backend metal was requested, but it cannot run: {reason}')
+        if not _have_kimimaro():
+            raise _kimimaro_missing('The metal backend runs slabs teasar declines on Kimimaro')
+        print(f'backend: metal (teasar), as requested: {reason}')
+        return 'metal'
 
     # The GPU backend turns skeletons into tracks with fast_tracks, which implements
     # the 'interjoint' walk only.
@@ -608,7 +817,11 @@ def select_backend(requested, gpus=None):
         raise SystemExit(f'--gpus was given, but the GPU backend cannot run: {reason}')
     if not _have_kimimaro():
         raise _kimimaro_missing(f'The GPU backend cannot run ({reason})')
-    print(f'backend: cpu (Kimimaro), because {reason}')
+    metal_ok, metal_reason = metal_available()
+    if metal_ok:
+        print(f'backend: metal (teasar), because {reason}: {metal_reason}')
+        return 'metal'
+    print(f'backend: cpu (Kimimaro), because {reason}, and {metal_reason}')
     return 'cpu'
 
 
@@ -680,8 +893,8 @@ def parse_args(argv=None):
     )
     parser.add_argument(
         '--backend', choices=BACKENDS, default=skeleton_backend,
-        help='Brook on NVIDIA GPUs, Kimimaro on the CPU, or auto: the GPU backend '
-             'when it can run, else Kimimaro (default: %(default)s)',
+        help='Brook on NVIDIA GPUs, teasar on Apple GPUs, Kimimaro on the CPU, or auto: '
+             'the first of gpu, metal and cpu that can run (default: %(default)s)',
     )
     parser.add_argument(
         '--gpus', metavar='DEVICE[,DEVICE...]', type=parse_gpu_ids,
@@ -701,6 +914,13 @@ def parse_args(argv=None):
         '--kimimaro-parallel', metavar='N|auto', type=_count_or_auto, default=kimimaro_parallel,
         help='CPU backend: Kimimaro processes per slab. auto: 1 with more than one slab worker, '
              f'else {_SERIAL_KIMIMARO_PARALLEL} on this OS (default: %(default)s)',
+    )
+    parser.add_argument(
+        '--metal-target-order', choices=METAL_TARGET_ORDERS, default=metal_target_order,
+        help="metal backend: the order teasar traces each skeleton's branches in; kimimaro "
+             "keeps the tracks compatible with the CPU backend's, and runs on the CPU backend "
+             "while teasar does not implement it; best is teasar's own order, whose skeletons "
+             "differ from Kimimaro's (default: %(default)s)",
     )
     parser.add_argument(
         '--packed-store', action=argparse.BooleanOptionalAction,
@@ -725,11 +945,15 @@ def parse_args(argv=None):
         parser.error(f'--downsample-factor must be at most the slab thickness '
                      f'({min(z_chunk_depth_h, yx_chunk_thickness_v)}) and divide the slab '
                      f'strides ({z_chunk_stride_h} and {yx_stride_v})')
-    if args.backend == 'cpu' and args.gpus is not None:
-        parser.error('--gpus applies to the GPU backend only, not to --backend cpu')
+    if args.backend in ('cpu', 'metal') and args.gpus is not None:
+        parser.error(f'--gpus applies to the GPU backend only, not to --backend {args.backend}')
     cpu_opts = ('slab_workers', 'kimimaro_parallel')
     if args.backend != 'cpu' and any(getattr(args, k) != parser.get_default(k) for k in cpu_opts):
         parser.error('--slab-workers and --kimimaro-parallel apply to --backend cpu only')
+    if (args.backend in ('cpu', 'gpu')
+            and args.metal_target_order != parser.get_default('metal_target_order')):
+        parser.error(f'--metal-target-order applies to the metal backend only, not to '
+                     f'--backend {args.backend}')
     if args.slab_workers == 'auto' and '://' in args.predictions:
         args.slab_workers = 1
     if any(count != 'auto' and count < 1 for count in (args.slab_workers, args.kimimaro_parallel)):
@@ -741,8 +965,9 @@ def parse_args(argv=None):
 
 def main(argv=None):
     # The slab functions above read the z range and downsample factor from the module configuration.
-    global z_min, z_max, downsample_factor, slab_workers, kimimaro_parallel
+    global z_min, z_max, downsample_factor, slab_workers, kimimaro_parallel, metal_target_order
     args = parse_args(argv)
+    metal_target_order = args.metal_target_order
     z_min, z_max = args.z_min, args.z_max
     downsample_factor = args.downsample_factor
     slab_workers, kimimaro_parallel = args.slab_workers, args.kimimaro_parallel
@@ -752,6 +977,8 @@ def main(argv=None):
     check_downsample_factor(args.out, args.downsample_factor)
     if backend == 'gpu':
         run_gpu(args.predictions, args.out, gpus=args.gpus)
+    elif backend == 'metal':
+        run_metal(args.predictions, args.out)
     else:
         run_cpu(args.predictions, args.out)
 

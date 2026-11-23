@@ -1591,7 +1591,7 @@ backend reads a local zarr v2 array in the layout of the surface predictions
 (uint8, blosc, `/` chunk keys) straight from its chunk files instead. The z
 range is half-open (`[z-min, z-max)`).
 
-Two backends write the same keys in the same format:
+Three backends write the same keys in the same format:
 
 - `gpu`: Brook (`brook-cu12`) and cuCIM on NVIDIA GPUs, one worker process
   per GPU. It needs Linux x86-64, GPUs of compute capability 8.0 or newer
@@ -1604,6 +1604,8 @@ Two backends write the same keys in the same format:
   (`nvidia-smi` indices, PCI bus order); UUID and MIG entries are not accepted,
   so pass `--gpus` instead. With `--gpus`, `--backend auto` does not fall back
   to Kimimaro when the GPU backend cannot run.
+- `metal`: teasar on Apple GPUs, when it is installed in the
+  same environment. Slabs teasar declines run on Kimimaro.
 - `cpu`: Kimimaro, with slabs in parallel worker processes (see
   [CPU surface-track extraction](#cpu-surface-track-extraction)). `uv sync` installs it on every platform
   except Linux x86-64, where it is the optional `cpu` extra
@@ -1612,10 +1614,28 @@ Two backends write the same keys in the same format:
 `--backend auto` (the default) picks the GPU backend when its check passes
 (platform, packages, and the NVIDIA driver version and the compute capability
 of the selected GPUs, as reported by `nvidia-smi`) and `path_mode` is
-`'interjoint'`, and Kimimaro otherwise. The
-script prints the backend it uses and why. `--backend gpu` and `--backend cpu`
-stop with the reason when that backend cannot run. The GPU backend implements
-only the `'interjoint'` path mode.
+`'interjoint'`, then the metal backend when its check passes, and Kimimaro
+otherwise. The script prints the backend it uses and why. `--backend gpu`,
+`--backend metal` and `--backend cpu` stop with the reason when that backend
+cannot run. Both GPU backends implement only the `'interjoint'` path mode.
+
+The metal backend runs connected-component labelling, pooling, the size
+filter and skeletonization on the Mac's GPU with teasar, and walks the
+skeletons into tracks with `fast_tracks.py`. teasar supports the two slab
+configurations in `TEASAR_SETTINGS`: the defaults at the top of the script,
+and the published PHerc0211 configuration (downsample 2, 2-voxel ribbons every
+8, 4-voxel slabs every 16). Any other configuration uses Kimimaro. A slab
+teasar declines (a slab over its size limits, a call whose output would be
+too large, or a setting it does not support) runs on Kimimaro from the labels
+teasar already computed, and the run prints how many did. Keys are written in
+the same order as with the CPU backend, so a run resumes the same way.
+
+`--metal-target-order` sets the order teasar traces each skeleton's branches
+in. The default, `kimimaro`, follows Kimimaro's order, so the tracks stay
+compatible with the CPU backend's; while the installed teasar does not
+implement it, the run says so and extracts with the CPU backend instead.
+`best` is teasar's own order: its skeletons are close to Kimimaro's but not
+identical, as with Brook.
 
 Brook implements Kimimaro's skeletonization on the GPU. Its skeletons are close
 to Kimimaro's but not always identical, so the two backends' DBMs agree closely

@@ -693,3 +693,226 @@ def test_one_voxel_wide_slab_is_skeletonized():
     labels[0, 0, 16:] = 1
     tracks = est.get_skeleton_tracks(labels, (0, 0, 0))
     assert [len(t) for t in tracks] == [16]
+
+
+# ------------------------------------------------------------------------------------------
+# Metal backend (teasar), with a stand-in module
+
+class _Packed:
+    def __init__(self, skeletons):
+        verts = [np.asarray(s.vertices, np.float32).reshape(-1, 3) for s in skeletons]
+        edges = [np.asarray(s.edges, np.uint32).reshape(-1, 2) for s in skeletons]
+        self.v_off = np.concatenate([[0], np.cumsum([len(v) for v in verts])]).astype(np.int64)
+        self.e_off = np.concatenate([[0], np.cumsum([len(e) for e in edges])]).astype(np.int64)
+        self.vertices = np.concatenate(verts) if verts else np.zeros((0, 3), np.float32)
+        self.edges = np.concatenate(edges) if edges else np.zeros((0, 2), np.uint32)
+
+
+def _fake_teasar(kimimaro, settings_name, failures=(), target_orders=('kimimaro', 'best')):
+    """A ``teasar`` module whose device runs villa's own CPU stages, so its tracks equal the CPU
+    backend's. ``failures`` maps a skeletonize call number to the exception that call raises;
+    ``target_orders`` are the orders it accepts. Calls on all-zero slabs are not counted."""
+    module = types.ModuleType('teasar')
+    module.__version__ = '0.0.test'
+
+    class UnsupportedSettings(NotImplementedError):
+        pass
+
+    class SomaUnsupported(NotImplementedError):
+        def __init__(self, slab):
+            super().__init__(f'slab {slab}')
+            self.slab = slab
+
+    class InputTooLarge(ValueError):
+        pass
+
+    class OutputTooLarge(ValueError):
+        def __init__(self, slab):
+            super().__init__(f'slab {slab}')
+            self.slab = slab
+
+    for cls in (UnsupportedSettings, SomaUnsupported, InputTooLarge, OutputTooLarge):
+        setattr(module, cls.__name__, cls)
+    calls = module.calls = []  # the number of slabs of each skeletonize call
+
+    class Device:
+        name = 'Fake GPU'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def prepare_labels(self, binary, downsample, min_count, max_count, *, settings):
+            assert settings == settings_name
+            assert (downsample, min_count, max_count) == (
+                est.downsample_factor, max(1, est.dust_threshold // downsample ** 3),
+                max(1, est.max_area_threshold // downsample ** 3))
+            return est.prepare_cc_labels(binary)
+
+        def skeletonize(self, labels_list, *, settings, anisotropy, scale, const, dust_threshold,
+                        fix_borders, fix_branching, target_order):
+            assert settings == settings_name and target_order == est.metal_target_order
+            if target_order not in target_orders:
+                raise UnsupportedSettings(f'target_order {target_order!r}')
+            if not any(labels.any() for labels in labels_list):
+                return [_Packed([]) for _ in labels_list]
+            calls.append(len(labels_list))
+            failure = dict(failures).get(len(calls))
+            if failure is not None:
+                raise failure(module)
+            out = []
+            for labels in labels_list:
+                borders = fix_borders and sorted(labels.shape)[1] != 1
+                skeletons = kimimaro.skeletonize(
+                    labels, teasar_params={'scale': scale, 'const': const},
+                    anisotropy=anisotropy, dust_threshold=dust_threshold,
+                    fix_branching=fix_branching, fix_borders=borders, fill_holes=False,
+                    parallel=1, in_place=True, progress=False)
+                out.append(_Packed(list(skeletons.values())))
+            return out
+
+    module.Device = Device
+    module.check_available = lambda: (True, 'Fake GPU')
+    return module
+
+
+def _metal_setup(monkeypatch, failures=(), target_order='kimimaro',
+                 target_orders=('kimimaro', 'best')):
+    kimimaro = pytest.importorskip('kimimaro')
+    pytest.importorskip('cc3d')
+    _small_configuration(monkeypatch)
+    monkeypatch.setattr(est, 'TEASAR_SETTINGS', {'small': est.geometry()})
+    monkeypatch.setattr(est, 'metal_target_order', target_order)
+    volume = synthetic_predictions()
+    monkeypatch.setattr(est, 'open_predictions', lambda path: volume)
+
+    def skeletonize(labels, **kwargs):
+        return kimimaro.skeletonize(labels, **{**kwargs, 'parallel': 1})
+    monkeypatch.setattr(est, 'get_skeleton_tracks',
+                        functools.partial(est.get_skeleton_tracks, skeletonize=skeletonize))
+    teasar = _fake_teasar(kimimaro, 'small', failures, target_orders)
+    monkeypatch.setitem(sys.modules, 'teasar', teasar)
+    return teasar
+
+
+@pytest.mark.parametrize('failures, calls', [
+    # one call per batch of at most 2^14 pooled voxels: 4 h ribbons of 1 x 58 x 61
+    ((), None),
+    # the slabs before the one that overflows run again in one call, the rest in another
+    ({1: lambda t: t.OutputTooLarge(2)}, 'split'),
+    # a slab with a soma runs on Kimimaro; those before and after it run on in new calls
+    ({1: lambda t: t.SomaUnsupported(1)}, 'soma'),
+    ({1: lambda t: t.OutputTooLarge(0)}, 'first'),
+    ({1: lambda t: t.InputTooLarge('too large')}, 'singly'),
+    ({1: lambda t: t.UnsupportedSettings('no')}, 'settings'),
+])
+@pytest.mark.parametrize('target_order', est.METAL_TARGET_ORDERS)
+def test_metal_backend_matches_cpu(monkeypatch, tmp_path, capsys, failures, calls, target_order):
+    teasar = _metal_setup(monkeypatch, failures, target_order)
+    est.run_cpu('synthetic', str(tmp_path / 'cpu.dbm'))
+    expected = _read_dbm(tmp_path / 'cpu.dbm')
+
+    monkeypatch.setattr(est, 'TEASAR_CALL_POOLED_VOXELS', 2 ** 14)
+    est.run_metal('synthetic', str(tmp_path / 'metal.dbm'))
+    assert _read_dbm(tmp_path / 'metal.dbm') == expected
+    assert _write_order(tmp_path / 'metal.dbm') == _write_order(tmp_path / 'cpu.dbm')
+
+    first = teasar.calls[0]
+    assert first == 4
+    rest = teasar.calls[1:]
+    if calls == 'split':
+        assert rest[:2] == [2, 2]
+    elif calls == 'soma':
+        assert rest[:2] == [1, 2]
+    elif calls == 'first':
+        assert rest[0] == 3
+    elif calls == 'singly':
+        assert rest[:4] == [1, 1, 1, 1]
+    declined = {'soma': 1, 'first': 1, 'settings': 4}.get(calls)
+    out = capsys.readouterr().out
+    if declined:
+        assert f'{declined} slab(s) ran on Kimimaro' in out
+    else:
+        assert 'ran on Kimimaro' not in out
+
+    # Resume: keys already present are not recomputed.
+    with dbm.open(str(tmp_path / 'metal.dbm'), 'w') as database:
+        database['h:16'] = pickle.dumps(['kept'])
+    n = len(teasar.calls)
+    est.run_metal('synthetic', str(tmp_path / 'metal.dbm'))
+    assert _read_dbm(tmp_path / 'metal.dbm') == {**expected, 'h:16': pickle.dumps(['kept'])}
+    assert len(teasar.calls) == n
+
+
+def test_villa_defaults_are_a_teasar_settings_set():
+    assert est.teasar_settings_name() == 'villa_default'
+
+
+def test_auto_selects_metal_without_brook(monkeypatch, capsys):
+    monkeypatch.setitem(sys.modules, 'surface_tracks_gpu', _fake_gpu_module(False, 'no NVIDIA GPU'))
+    monkeypatch.setattr(est, '_have_kimimaro', lambda: True)
+    monkeypatch.setitem(sys.modules, 'teasar', types.SimpleNamespace(
+        check_available=lambda: (True, 'Apple M4 Pro')))
+    assert est.select_backend('auto') == 'metal'
+    assert est.select_backend('metal') == 'metal'
+    assert 'metal (teasar), because no NVIDIA GPU: Apple M4 Pro' in capsys.readouterr().out
+
+    # a configuration teasar does not support goes to Kimimaro, and fails metal outright
+    monkeypatch.setattr(est, 'yx_stride_v', 32)
+    assert est.select_backend('auto') == 'cpu'
+    assert 'TEASAR_SETTINGS' in capsys.readouterr().out
+    with pytest.raises(SystemExit, match='--backend metal was requested'):
+        est.select_backend('metal')
+
+
+def test_metal_requested_without_teasar(monkeypatch):
+    monkeypatch.setitem(sys.modules, 'teasar', None)  # makes teasar unimportable
+    monkeypatch.setattr(est, '_have_kimimaro', lambda: True)
+    with pytest.raises(SystemExit, match='teasar cannot be imported'):
+        est.select_backend('metal')
+
+
+def test_metal_needs_kimimaro_for_declined_slabs(monkeypatch):
+    monkeypatch.setitem(sys.modules, 'teasar', types.SimpleNamespace(
+        check_available=lambda: (True, 'Apple M4 Pro')))
+    monkeypatch.setattr(est, '_have_kimimaro', lambda: False)
+    with pytest.raises(SystemExit, match='slabs teasar declines'):
+        est.select_backend('metal')
+
+
+def test_gpus_with_metal_backend_is_rejected(capsys):
+    with pytest.raises(SystemExit):
+        est.parse_args(['--predictions', 'p.zarr', '--out', 't.dbm', '--backend', 'metal',
+                        '--gpus', '0'])
+    assert 'not to --backend metal' in capsys.readouterr().err
+
+
+def test_metal_backend_without_the_target_order_uses_cpu(monkeypatch, tmp_path, capsys):
+    # a teasar that does not implement the default order yet: the whole run goes to the CPU
+    # backend, with its slab workers, rather than every call declining
+    teasar = _metal_setup(monkeypatch, target_orders=('best',))
+    runs = []
+    run_cpu = est.run_cpu
+    monkeypatch.setattr(est, 'run_cpu', lambda *args: (runs.append(args), run_cpu(*args)))
+    est.run_metal('synthetic', str(tmp_path / 'metal.dbm'))
+    assert runs == [('synthetic', str(tmp_path / 'metal.dbm'))]
+    assert teasar.calls == []
+    assert "does not support target order 'kimimaro'" in capsys.readouterr().out
+    run_cpu('synthetic', str(tmp_path / 'cpu.dbm'))
+    assert _read_dbm(tmp_path / 'metal.dbm') == _read_dbm(tmp_path / 'cpu.dbm')
+
+
+def test_metal_target_order_reaches_the_backend(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(est, 'metal_target_order', est.metal_target_order)  # main() sets it
+    monkeypatch.setattr(est, 'select_backend', lambda requested, gpus=None: 'metal')
+    seen = []
+    monkeypatch.setattr(est, 'run_metal', lambda *args: seen.append(est.metal_target_order))
+    argv = ['--predictions', 'p.zarr', '--out', str(tmp_path / 't.dbm'), '--no-packed-store']
+    with pytest.raises(SystemExit):
+        est.parse_args([*argv, '--backend', 'cpu', '--metal-target-order', 'best'])
+    assert 'applies to the metal backend only' in capsys.readouterr().err
+    est.main([*argv, '--metal-target-order', 'best'])
+    est.main([*argv, '--metal-target-order', 'kimimaro'])
+    assert seen == ['best', 'kimimaro']
