@@ -85,6 +85,8 @@ The store chain is `import → extract → hvb → sign → winding → uv`. `wi
 | `umbilicus` | path or `store` | The legacy umbilicus document, or the input store's own umbilicus object (which retains that document's metadata). |
 | `handedness` | `+1`, `-1` | The scroll's winding direction for seam transport: `+1` when the winding index grows with increasing angle around the umbilicus, `-1` otherwise. Normally not set here: the stage reads it from the store umbilicus object's `winding_handedness` meta (`vc_wgraph handedness -i store.vcobj --set -1`), else from the open-data catalog orientation (`-1` when exactly one of `z_direction_is_top_to_bottom` and `left_handed_coordinates` holds, as VC3D reads it). A volume whose handedness is stated nowhere is an error, never a guess. The run records the value used. |
 
+Not yet in this stage, and planned as options: the scaffold solve (`vc_scaffold_solve`, volume-cartographer `docs/fiber_map_scaffold_solve.md`) also states a one-sided *sign constraint* per signed perpendicular crossing (the V fiber outside or inside the H fiber bounds the pair's step from one side) and scales every crossing's weight by the sign stage's confidence, dot² × min(1, 1/d²). Here the perpendicular and parallel weights are flat and only pairs bounded from both sides enter, as enclosures.
+
 Extraction with `winding_distances: false` (no winding manifest, see [fiber workflows](fiber_workflows.md)) yields measurements without distances: they contribute no parallel/perpendicular arcs (counted as `without_distance`) but still witness enclosures and feed the sign stage, where an unmeasured distance counts as within one winding.
 
 ### Sign stage weights
