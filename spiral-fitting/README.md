@@ -90,17 +90,30 @@ track fit is not automatically equivalent to a new store-backed fit.
 Kimimaro skeletonization. The local `vc-reader` dependency requires its native
 build prerequisites (see [vc_reader](../vc_reader/README.md)).
 
-Use `--slab-workers N --kimimaro-parallel 1` to process multiple slabs concurrently
-with local predictions. Each worker holds a slab in RAM; the default is
-one worker and eight Kimimaro processes per slab (one on Windows, where starting
-eight processes for every slab is much slower than using one).
+Slabs run in parallel in worker processes, each with one Kimimaro process and
+its own slab in RAM. `--slab-workers auto`, the default, starts one worker per
+CPU, as many as fit in half of the RAM at about 16 bytes per voxel of the
+largest slab plus 256 MB (a full-width ribbon of a 7948 × 7948 scroll at
+downsample 2 peaked at 1.8 GB), and one slab at a time when the predictions are
+remote or Kimimaro runs several processes per slab. Kimimaro starts its own
+processes anew for every slab, so on macOS and Windows a slab gets one by
+default; on Linux the default stays one worker with eight Kimimaro processes per
+slab. `--slab-workers N` sets the count, for example to leave memory for other
+work.
 
 ```sh
+python extract_surface_tracks.py --backend cpu --predictions /data/predictions.zarr \
+  --out /data/tracks.dbm --z-min 9048 --z-max 9548
 python extract_surface_tracks.py --backend cpu --predictions /data/predictions.zarr \
   --out /data/tracks.dbm --z-min 9048 --z-max 9548 \
   --slab-workers 4 --kimimaro-parallel 1
 python -m pytest -q tests/test_cc_labels.py tests/test_extract_surface_tracks.py
 ```
+
+The CPU backend turns skeletons into tracks with `fast_tracks.py`, as the GPU
+backend does: compiled with numba where `uv sync` installs it (Linux x86-64 and
+macOS arm64), and with its vectorized NumPy engine elsewhere. With one Kimimaro
+process per slab the DBM does not depend on the number of slab workers.
 
 ## CUDA startup check
 
@@ -1586,7 +1599,8 @@ Two backends write the same keys in the same format:
   (`nvidia-smi` indices, PCI bus order); UUID and MIG entries are not accepted,
   so pass `--gpus` instead. With `--gpus`, `--backend auto` does not fall back
   to Kimimaro when the GPU backend cannot run.
-- `cpu`: Kimimaro, one slab at a time. `uv sync` installs it on every platform
+- `cpu`: Kimimaro, with slabs in parallel worker processes (see
+  [CPU surface-track extraction](#cpu-surface-track-extraction)). `uv sync` installs it on every platform
   except Linux x86-64, where it is the optional `cpu` extra
   (`uv sync --extra cpu`) for machines without a compatible GPU.
 
@@ -1600,9 +1614,10 @@ only the `'interjoint'` path mode.
 
 Brook implements Kimimaro's skeletonization on the GPU. Its skeletons are close
 to Kimimaro's but not always identical, so the two backends' DBMs agree closely
-rather than byte for byte (see the measurements below). Kimimaro collects the
-skeletons of its 8 worker processes as they finish, so the order of the tracks
-within a key can also differ between two CPU runs.
+rather than byte for byte (see the measurements below). With several Kimimaro
+processes per slab (Linux's default of 8), Kimimaro collects their skeletons as
+they finish, so the order of the tracks within a key can also differ between two
+CPU runs; with one per slab (the default on macOS and Windows) it cannot.
 
 Every key (`h:{z}`, `vy:{y}`, `vx:{x}`) holds a pickled list of `(N, 3)` int32
 ZYX arrays in full-resolution voxels, and an empty slab holds an empty list.
