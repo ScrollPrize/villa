@@ -37,6 +37,13 @@ double fiberSignWindingDistanceFactor(const double distance, const FiberSignDist
     return 1.0 / std::max(turns * turns, 1e-12);
 }
 
+double fiberSignEventWeight(const double dot, const double windingDistance, const FiberSignOptions& options)
+{
+    const double magnitude = std::abs(dot);
+    return magnitude * fiberSignWindingDistanceFactor(windingDistance, options.distanceWeight)
+           * std::pow(std::max(magnitude, 1e-12), options.dotWeightPower - 1.0);
+}
+
 namespace
 {
 
@@ -412,9 +419,7 @@ Problem build(const std::vector<double>& agreement, const std::vector<FiberSignE
         problem.dot[e] = dot;
         problem.distance[e] = event.windingDistance;
         problem.target[e] = dot < 0.0 ? 1.0 : 0.0;
-        const double factor = fiberSignWindingDistanceFactor(event.windingDistance, options.distanceWeight)
-                              * std::pow(std::max(std::abs(dot), 1e-12), options.dotWeightPower - 1.0);
-        problem.rawWeight[e] = std::abs(dot) * factor;
+        problem.rawWeight[e] = fiberSignEventWeight(dot, event.windingDistance, options);
         total += problem.rawWeight[e];
         if (event.a == event.b) ++result.selfEvents;
         if (std::isfinite(event.windingDistance)) ++result.eventsWithWindingDistance;

@@ -190,6 +190,8 @@ struct FiberSignResult {
 [[nodiscard]] double fiberSignCost(double residual, double epsilon);
 // The winding-distance factor of one event.
 [[nodiscard]] double fiberSignWindingDistanceFactor(double distance, FiberSignDistanceWeight mode);
+// The weight of one crossing: |dot|^dotWeightPower times the winding-distance factor.
+[[nodiscard]] double fiberSignEventWeight(double dot, double windingDistance, const FiberSignOptions& options);
 
 // `agreement` holds one radial prior per fiber in [-1, 1] (0 where none is
 // known). `fixedSigns`, when not empty, holds one entry per fiber: 0 to solve
