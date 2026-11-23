@@ -268,8 +268,14 @@ kernel void track_radius_bwd(
         }
     }
 
-    // unwrapped = shifted + detached adjustment, so d/d shifted = d/d unwrapped
-    float grad_dr = 0.0f;
+    // unwrapped = shifted + detached adjustment, so d/d shifted = d/d unwrapped;
+    // d/d dr is -sum(gs * theta) / 2pi, and the group loss is invariant to
+    // shifting every radius in the group, so the gs sum is near 0 and the
+    // float32 sum of gs * theta cancels: summing gs * (theta - pivot) and
+    // adding pivot * sum(gs) is exact in real arithmetic and keeps terms small
+    float pivot = 0.0f;
+    bool have_pivot = false;
+    float sum_gs = 0.0f, sum_gs_theta = 0.0f;
     for (long j = 0; j < rows; ++j) {
         long r = group_row(g, j, n_groups, partner_offsets);
         for (long i = row_starts[r]; i < row_starts[r + 1]; ++i) {
@@ -278,7 +284,12 @@ kernel void track_radius_bwd(
             float r2 = p.y * p.y + p.x * p.x;
             float radius = precise::sqrt(r2);
             float g_theta = -gs * dr / TWO_PI_F;
-            grad_dr += -gs * p.theta / TWO_PI_F;
+            if (!have_pivot) {
+                pivot = p.theta;
+                have_pivot = true;
+            }
+            sum_gs += gs;
+            sum_gs_theta += gs * (p.theta - pivot);
             float gy = gs * p.y / radius + g_theta * p.x / r2;
             float gx = gs * p.x / radius - g_theta * p.y / r2;
             grad_spiral[3 * i + 0] = 0.0f;
@@ -286,7 +297,7 @@ kernel void track_radius_bwd(
             grad_spiral[3 * i + 2] = p.x_live ? gx : 0.0f;
         }
     }
-    grad_dr_partial[g] = grad_dr;
+    grad_dr_partial[g] = -(sum_gs_theta + pivot * sum_gs) / TWO_PI_F;
 }
 
 // tracks._draw_track_sample's per-point and per-target indices for one row,
