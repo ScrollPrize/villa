@@ -8,7 +8,12 @@ step is villa's flat inference (``infer.py``): checkpoint loading, per-patch
 normalization, the patch grid with its edge-flush last position, layer
 selection and reversal, the forward call and its autocast, the sigmoid, the
 blend window and the uint8 truncation. A preview pixel therefore equals the
-pixel ``infer.py --roi`` writes for the same input array and settings.
+pixel ``infer.py --roi`` writes for the same input array and settings, with
+two exceptions. With a pyramid input or ``--mask-path``, ``infer.py`` skips
+patches that look empty at low resolution, and the server does not. Patches
+computed in different batches can round differently, so with ``--batch-size``
+above 1 a preview can differ from the TIFF, or from an earlier preview of the
+same view, by a gray level at a few pixels.
 
 Run it with::
 
@@ -444,10 +449,13 @@ class PreviewEngine:
                 else:
                     missing.append(block)
             if missing:
-                top = min(block.y0 for block in missing)
-                left = min(block.x0 for block in missing)
-                bottom = max(block.y0 + block.valid_h for block in missing)
-                right = max(block.x0 + block.valid_w for block in missing)
+                # After an upload, ask for every patch: cached ones may be
+                # evicted again before the next upload arrives.
+                need = blocks if request.stack is not None else missing
+                top = min(block.y0 for block in need)
+                left = min(block.x0 for block in need)
+                bottom = max(block.y0 + block.valid_h for block in need)
+                right = max(block.x0 + block.valid_w for block in need)
                 raise PreviewError(
                     409,
                     {
@@ -621,13 +629,13 @@ class PreviewRequestHandler(BaseHTTPRequestHandler):
             body_read = True
             reply = engine.preview(engine.attach_body(request, body))
         except Exception as exc:
-            if not body_read:
-                self._discard_body(length)
             if isinstance(exc, PreviewError):
                 self._send_json(exc.status, exc.payload)
             else:  # the server stays up and reports the failure
                 LOGGER.exception("Preview request failed")
                 self._send_json(500, {"error": f"{type(exc).__name__}: {exc}"})
+            if not body_read:
+                self._discard_body(length)
             return
         self._send(200, reply.body, reply.content_type, reply.headers)
 

@@ -170,8 +170,13 @@ The server listens on 127.0.0.1 only. It uses flat inference's own checkpoint
 loading, normalization, patch grid (`--overlap`, `--stride`), layer selection,
 blend window (`--blend-mode`), CUDA autocast dtype (`--amp-dtype`) and uint8
 truncation, so a preview pixel equals the pixel `infer.py --roi` writes for the
-same input array and settings, edges included. `torch.compile` is off unless
-`--compile` is given. `--cache-mb` caps the patch cache (default 256 MiB),
+same input array and settings, edges included, with two exceptions. With a
+pyramid input or `--mask-path`, `infer.py` skips patches that are empty in a
+low-resolution occupancy scan, and the server does not, so the two can differ
+there. Patches computed in different batches can round differently, so with
+`--batch-size` above 1 a preview can differ from the TIFF, or from an earlier
+preview of the same view, by a gray level at a few pixels.
+`torch.compile` is off unless `--compile` is given. `--cache-mb` caps the patch cache (default 256 MiB),
 `--max-view-px` the view size and `--max-upload-mb` (default 1024 MiB) the
 layer upload a view may need: every patch that touches the view, at 2 bytes
 per voxel (1 for a checkpoint that needs uint8 layers). A preview equals a map only where the uploaded
@@ -202,7 +207,9 @@ starts at canvas pixel (0, 0)):
     set to that rectangle, `dtype` (`uint8` or `uint16`) and a body of
     `D * sh * sw` voxels, layers first, C order, little-endian. Patches are
     cached by `(key, variant, row, column)`, so a pan uploads only the new
-    strip.
+    strip. If an upload still leaves patches missing, for example because the
+    cache evicted them, the 409 asks for every patch that touches the view, so
+    the next upload completes it.
   - `400`, `404`, `413` (a view over `max_view_px`, a view whose patches could
     need an upload over `max_upload_mb`, or an upload larger than the view
     plus one patch on each side) and `500` return JSON `{"error": TEXT}`; the

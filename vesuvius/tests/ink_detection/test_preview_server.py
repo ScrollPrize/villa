@@ -275,6 +275,34 @@ def test_pan_reuses_cached_tiles_and_needs_only_the_new_strip():
     assert health["cache"]["tiles"] == len(set(old) | set(new))
 
 
+def test_an_upload_short_after_eviction_is_asked_for_the_whole_view():
+    configured = tiny_configured()
+    stack = random_stack(seed=2)
+    engine = preview_server.PreviewEngine(configured)
+    first, panned = (2, 3, 24, 30), (2 + 2 * STRIDE, 3, 24, 30)
+    x, y, w, h = panned
+    blocks = infer.iter_blocks(CANVAS_HW, PATCH, STRIDE, roi_bounds=(y, y + h, x, x + w))
+    with serving(engine) as port:
+        fetch(port, stack, first)
+        params = view_params(stack, panned)
+        status, _, data = call(port, "POST", "/preview", params)
+        assert status == 409
+        engine.cache = preview_server.TileCache(engine.cache.cap_bytes)  # another viewer evicted everything
+        status, _, data = call(port, "POST", "/preview", *upload(stack, json.loads(data)["need"], params))
+        assert status == 409
+        assert json.loads(data)["need"] == {
+            "x": min(b.x0 for b in blocks), "y": min(b.y0 for b in blocks),
+            "w": max(b.x0 + b.valid_w for b in blocks) - min(b.x0 for b in blocks),
+            "h": max(b.y0 + b.valid_h for b in blocks) - min(b.y0 for b in blocks),
+        }
+        status, _, data = call(port, "POST", "/preview", *upload(stack, json.loads(data)["need"], params))
+        assert status == 200
+    np.testing.assert_array_equal(
+        np.frombuffer(data, dtype="<f4").reshape(h, w),
+        villa_roi_reference(configured, stack, (y, y + h, x, x + w)),
+    )
+
+
 @pytest.mark.parametrize("shift,should_match", [(STRIDE // 2, False), (STRIDE, True)])
 def test_displaced_grid_control(shift, should_match):
     """The same pixels on a grid moved by half a stride must not equal the reference."""
@@ -372,6 +400,13 @@ def test_canvas_and_upload_limits_are_checked_before_any_work():
         with socket.create_connection(("127.0.0.1", port), timeout=10) as connection:
             connection.sendall(f"POST /preview?{urlencode(thin)} HTTP/1.1\r\nHost: test\r\n"
                                f"Content-Length: {length}\r\n\r\n".encode())
+            assert connection.recv(64).startswith(b"HTTP/1.0 413")
+        # A body small enough to drain is not awaited either.
+        wide = {"key": "wide", "cw": 4097, "ch": 4097, "x": 0, "y": 0, "w": 4097, "h": 4097,
+                "sx": 0, "sy": 0, "sw": 1, "sh": 1}
+        with socket.create_connection(("127.0.0.1", port), timeout=10) as connection:
+            connection.sendall(f"POST /preview?{urlencode(wide)} HTTP/1.1\r\nHost: test\r\n"
+                               f"Content-Length: {DEPTH}\r\n\r\n".encode())
             assert connection.recv(64).startswith(b"HTTP/1.0 413")
         status, _, data = call(port, "POST", "/preview", {k: v for k, v in thin.items() if not k.startswith("s")
                                                           and k != "dtype"})
