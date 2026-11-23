@@ -148,9 +148,8 @@ class StepPrefetcher:
             result, evt = self.run_job(job)
         self._pending[key] = self._ensure_executor().submit(self.run_job, job)
         torch.cuda.current_stream().wait_event(evt)
-        # CUDA tensors may be nested in per-loss metadata containers (for
-        # example PackedWalks). Record every one on the
-        # consumer stream so the caching allocator cannot recycle its
+        # CUDA tensors may be nested in per-loss metadata containers. Record
+        # every one on the consumer stream so the caching allocator cannot recycle its
         # side-stream allocation while consumer kernels are still using it.
         for t in _iter_tensors(result):
             if t.is_cuda:

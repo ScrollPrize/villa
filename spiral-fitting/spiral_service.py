@@ -240,8 +240,6 @@ class ObjectStoreBinding:
     def config(self):
         """The service-owned configuration a session request receives."""
         return {"object_store_location": self.location,
-                "object_store_author": self.author,
-                "object_store_link_timeout_s": self.link_timeout_s,
                 "object_store_input_position": None}
 
     def open(self, *, read_only=False, cache_directory=None):
@@ -249,8 +247,12 @@ class ObjectStoreBinding:
 
         Writes use the service's author; local files can be opened read-only.
         """
-        from object_store_inputs import open_store
-        return open_store(self.config(), read_only=read_only, cache_directory=cache_directory)
+        from object_store_inputs import HOSTED_CACHE_DIRECTORY
+        from vc_object_store.locations import open_store
+        return open_store(self.location, author=self.author, read_only=read_only,
+                          link_timeout_s=self.link_timeout_s,
+                          cache_directory=(os.path.join(cache_directory, HOSTED_CACHE_DIRECTORY)
+                                           if cache_directory else None))
 
     def head(self):
         """``(commit_sequence, error)``: the store's head, read now (not the
@@ -275,8 +277,7 @@ class ObjectStoreBinding:
 # naming one is refused, as the scroll-specification keys are, rather than
 # quietly overruled: a client cannot repoint the inputs a service reads, or
 # choose the position a build pins (it asks with ``inputs_position``).
-SERVICE_OWNED_CONFIG_KEYS = ("object_store_location", "object_store_author",
-                             "object_store_link_timeout_s", "object_store_input_position")
+SERVICE_OWNED_CONFIG_KEYS = ("object_store_location", "object_store_input_position")
 
 
 # What /bindings tells a client this service supports, so it can enable or
@@ -1085,9 +1086,8 @@ class ServiceState:
         """What the launch configuration selects from the bound store.
 
         Patches and tracks with their revision pins, labels and frames,
-        plus counts, consumed relationship families,
-        exclusions and the fit volume (object_store_inputs.snapshot_summary).
-        Read-only: no link refresh, no materialization and no Torch. The
+        plus counts and the fit volume (object_store_inputs.snapshot_summary).
+        Read-only: no materialization and no Torch. The
         result is reused until the store's files change.
 
         Reading a large store takes minutes. Without ``wait`` (GET
@@ -1754,8 +1754,7 @@ class ServiceState:
                 "error", f"The inputs could not be updated; the fit is unchanged: {cause}",
                 severity="error", source="service", operation="updating_inputs")
         try:
-            prepared = self._prepare_position(config, paths, scroll, minimum,
-                                              incremental=True)
+            prepared = self._prepare_position(config, paths, scroll, minimum)
         except BaseException as exc:
             refused(exc, "linking")
             return
@@ -1801,8 +1800,7 @@ class ServiceState:
                     self.session_request = {**self.session_request, "run": run}
                 self._input_position = {
                     **prepared.position.provenance(), "requested": requested,
-                    "head": prepared.head, "attempts": prepared.attempts,
-                    "source": "update",
+                    "head": prepared.head, "source": "update",
                     "input_generation": result.get("input_generation")}
             self._input_update = None
             self.status_generation += 1
@@ -1936,7 +1934,7 @@ class ServiceState:
                     paths, run, preview, scroll, minimum, checkpoint_pins=pins)
             run = self._pin_run(run, pins)
             record = {**pins.position.provenance(), "requested": None, "head": None,
-                      "attempts": 0, "source": "checkpoint"}
+                      "source": "checkpoint"}
         # Use the fit volume recorded in the checkpoint's inputs.
         project = scroll.project
         try:
@@ -2076,32 +2074,19 @@ class ServiceState:
             preparation["progress"]["elapsed_seconds"] = time.monotonic() - started
         return preparation
 
-    def _prepare_position(self, config, paths, scroll, minimum, *, volume=False,
-                          incremental=False):
-        """Link and pin a position for ``config`` on the bound store; with
-        ``volume``, also the fit volume pinned there (``(prepared,
-        volume)``). ``incremental`` (an input update) links only objects
-        selected since the store's last refresh, when nothing else changed."""
-        from fit_session import lasagna_normal_inputs
+    def _prepare_position(self, config, paths, scroll, minimum, *, volume=False):
+        """Pin a position for ``config`` on the bound store; with ``volume``,
+        also the fit volume pinned there (``(prepared, volume)``)."""
         from object_store_inputs import (fit_volume_at, prepare_position,
                                          request_from_config)
         self._prepare_lasagna_packs(paths, config)
-        lasagna = lasagna_normal_inputs(
-            load_lasagna_source(paths.lasagna) if paths.lasagna else None,
-            config, scroll.lasagna_scale, paths.cache_directory)
-
-        def log(line):
-            self.events.append("log", line, source="service",
-                               operation="preparing_inputs")
         request = request_from_config(config)
         progress = self._input_progress()
         with self._store_write_lock:
             try:
                 with self.object_store.open(cache_directory=paths.cache_directory) as store:
-                    prepared = prepare_position(
-                        store, config, request, lasagna=lasagna,
-                        minimum=minimum, log=log,
-                        incremental=incremental, progress=progress)
+                    prepared = prepare_position(store, request, minimum=minimum,
+                                                progress=progress)
                     if not volume:
                         return prepared
                     return prepared, fit_volume_at(store, request, prepared,
@@ -2145,12 +2130,12 @@ class ServiceState:
         paths, run, _, _ = self._prepare_session_request(request, restore_checkpoint_z=True)
         if not paths.lasagna:
             return {"packs": []}
-        return {"packs": sorted(_lasagna_pack_kinds(
-            self._effective_config(paths, run), load_lasagna_source(paths.lasagna)))}
+        from fit_session import lasagna_packs_required
+        return {"packs": sorted(lasagna_packs_required(self._effective_config(paths, run)))}
 
     def _prepare_lasagna_packs(self, paths, config):
         """Unless it requires prepared packs, a host builds missing pools
-        before linking: from local arrays, or from remote ones whose objects
+        before pinning the inputs: from local arrays, or from remote ones whose objects
         vc_reader lists (s3://, or a virtual-hosted Amazon S3 URL) and first
         fetches whole into the cache (beside the pack, removed once it is
         built; an interrupted fetch resumes)."""
@@ -2158,8 +2143,9 @@ class ServiceState:
             return
         from lasagna_source import is_remote_location
         from remote_zarr import is_listable
+        from fit_session import lasagna_packs_required
         source = load_lasagna_source(paths.lasagna)
-        kinds = _lasagna_pack_kinds(config, source)
+        kinds = lasagna_packs_required(config)
         if not kinds:
             return
         for kind in sorted(kinds):
@@ -2203,8 +2189,7 @@ class ServiceState:
                                        operation="preparing_inputs")
                 record = {**prepared.position.provenance(),
                           "requested": None if minimum is None else minimum.provenance(),
-                          "head": prepared.head, "attempts": prepared.attempts,
-                          "source": "prepared"}
+                          "head": prepared.head, "source": "prepared"}
                 run = self._pin_run(run, prepared.pins)
             else:
                 run = self._pin_run(run, checkpoint_pins)
@@ -2214,7 +2199,7 @@ class ServiceState:
                 paths, scroll = self._resolve_session_scroll(scroll, volume, paths, config)
                 self._prepare_lasagna_packs(paths, config)
                 record = {**checkpoint_pins.position.provenance(), "requested": None,
-                          "head": None, "attempts": 0, "source": "checkpoint"}
+                          "head": None, "source": "checkpoint"}
         except BaseException as exc:
             cause = _cause(exc)
             with self.lock:
@@ -3875,18 +3860,6 @@ def _fetched_lasagna_arrays(arrays, sidecar, progress):
     yield local
     if root.exists():
         shutil.rmtree(root, ignore_errors=True)
-
-
-def _lasagna_pack_kinds(config, source):
-    """The Lasagna pack kinds a build of ``config`` reads from ``source``:
-    the fit's (lasagna_packs_required), and normals for the link refresh
-    even when their dense loss is disabled."""
-    from fit_session import lasagna_packs_required, input_source_enabled
-    kinds = set(lasagna_packs_required(config))
-    if (input_source_enabled(config, "normals")
-            and source.stores.get("normal_x") and source.stores.get("normal_y")):
-        kinds.add("normals")
-    return kinds
 
 
 _UPLOAD_ID = r"[0-9a-f]{32}"

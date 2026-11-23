@@ -4,8 +4,8 @@ an object store, with the resident runtime faked.
 
     python protocol_client_service.py --store STORE.vcobj --root DIR --port-file FILE
 
-The store file is shared with the client on this host. Builds link and pin
-positions of it as a real service's do.
+The store file is shared with the client on this host. Builds pin positions
+of it as a real service's do.
 The faked session freezes inputs the way a real one does: it reads the
 store's default selection (at the pinned position) read-only, writes the run directory's
 object_store_inputs.json and reports its digest, summary and manifest path,
@@ -107,13 +107,12 @@ class FrozenInputsRuntime(FakeRuntime):
     def _freeze(self, position):
         import object_store_inputs as osi
         config = self.applied
-        with osi.open_store(config, read_only=True) as store:
+        with osi.open_store(config) as store:
             request = osi.request_from_config(config)
             if position is not None:
                 request = dataclasses.replace(request, pins=osi.InputPins.from_provenance(position))
             snapshot = osi.read_snapshot(store, request)
         manifest = snapshot.manifest()
-        manifest['link_refresh'] = {'enabled': False}
         self.position = manifest['position']
         self.digest = osi.manifest_digest(manifest)
         run_directory = Path(self.paths.output_directory) / 'run'
@@ -124,8 +123,7 @@ class FrozenInputsRuntime(FakeRuntime):
             'digest': self.digest, 'store_uuid': snapshot.store_uuid,
             'volume_uuid': snapshot.volume_uuid,
             'selection': {kind: manifest['selection'][kind]['count'] for kind in osi.KINDS},
-            'relationships': {}, 'excluded_relationships': {}, 'constraints': {},
-            'link_refresh': False}
+            'constraints': {}}
         if self.status_callback is not None:
             # A real session reports each status change through this; the
             # service publishes the input manifest artifact from it.

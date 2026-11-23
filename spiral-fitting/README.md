@@ -15,7 +15,7 @@ those from a matching native object-store build.
 
 | Input | Command-line fit | Service fit |
 | --- | --- | --- |
-| Patches, tracks and their relationships | `--object-store` | Service's bound store |
+| Patches and tracks | `--object-store` (read-only) | Service's bound store |
 | Outer shell | Store surface tagged `spiral-outer-shell` | Same |
 | Scroll facts and umbilicus | `--inputs` manifest's `scroll` and `umbilicus` | VC3D project |
 | Lasagna fields | Manifest's `lasagna.manifest` and the cache; missing packs may be built | Project-selected dataset; packs must already be cached |
@@ -50,7 +50,7 @@ FIT_SPIRAL_OUT_DIR=/data/spiral-output \
 FIT_SPIRAL_CONFIG_OVERRIDES='{"z_begin":9000,"z_end":9100,"input_use_tracks":true}' \
   .venv/bin/python fit_spiral.py \
   --inputs /data/spiral-inputs.json --object-store /data/scroll.vcobj \
-  --object-store-author "$USER" --cache /data/spiral-cache
+  --cache /data/spiral-cache
 
 .venv/bin/python spiral_service.py \
   --port 8765 --object-store /data/scroll.vcobj \
@@ -65,11 +65,9 @@ another host that VC3D should edit against needs its store served by
 `vc_object_server` and bound by endpoint; see **Object store, positions and
 input updates**.
 
-Startup normally writes refreshed relationships.
-`object_store_refresh_links: false` consumes existing relationships instead.
-Track crossings are no relationships of the fit: it computes them itself from
-the selected tracks' stored points (see **Object-store inputs**), whatever
-`object_store_refresh_links` says. Track selection uses
+The fit opens the store read-only and writes nothing to it. It reads no
+relationship between objects: track crossings are computed from the selected
+tracks' stored points (see **Object-store inputs**). Track selection uses
 `object_store_track_uuids` / `object_store_track_tags`, like the other kinds.
 Remove the retired `track_scale_factor` config setting; each stored track
 now declares its frame. Track databases are never input paths.
@@ -309,12 +307,12 @@ Migrating a dataset directory: write a manifest beside it naming its
 
 ## Object-store inputs
 
-`fit_spiral.py` reads patches and tracks, and the relationships between
-them, from a `vc_object_store` database (`object_store_inputs.py`). It never
-reads patch directories or track databases, and never links patches itself:
-the store's detectors do. Track crossings are the exception: the fit computes
-them from the selected tracks. Point collections and fibers in the store are
-not read. The other inputs (umbilicus,
+`fit_spiral.py` reads patches, tracks and the outer shell from a
+`vc_object_store` database (`object_store_inputs.py`), opened read-only: the
+fit writes nothing to the store and reads no relationship between objects. It
+never reads patch directories or track databases. Track crossings are
+computed by the fit from the selected tracks. Point collections and fibers in
+the store are not read. The other inputs (umbilicus,
 lasagna normal/gradient stores, fiber directions, winding inference) are
 named by the input manifest (`--inputs`; see "Input manifest").
 
@@ -349,84 +347,41 @@ extracted from the fit volume itself).
 What the fit reads of an ingest: tifxyz patches (`--surface`, one directory
 each, stored as kind `surface`), the outer shell (a tifxyz surface tagged
 `spiral-outer-shell`) and tracks (`--tracks`, one object per track, keyed by
-its packed store and source ID). `patch-overlap-pcls.json` is not ingested:
-the store's overlap detector replaces it. Ingest is not repeated to update a
-store; edit objects through the store's API instead.
+its packed store and source ID). Ingest is not repeated to update a store;
+edit objects through the store's API instead.
 
 ### Running a fit
 
 The command-line fit reads its inputs from the store named by `--object-store`
 (required: a store file, or the endpoint of the `vc_object_server` serving one,
-`http://host:port` or `ssh://host:port`; the config keys `object_store_location`,
-`object_store_author` and `object_store_link_timeout_s` are set from the command
-line, and `FIT_SPIRAL_CONFIG_OVERRIDES` cannot name them). A served store links
-on its server, so `--object-store-link-timeout` must cover the longest link
-refresh (the server's `--request-deadline`):
+`http://host:port` or `ssh://host:port`; the config key `object_store_location`
+is set from the command line, and `FIT_SPIRAL_CONFIG_OVERRIDES` cannot name it):
 
 ```sh
 FIT_SPIRAL_CONFIG_OVERRIDES='{"z_begin": 9000, "z_end": 9100}' \
-  python fit_spiral.py --inputs spiral-inputs.json --object-store dataset.vcobj \
-  --object-store-author me
+  python fit_spiral.py --inputs spiral-inputs.json --object-store dataset.vcobj
 ```
-
-`--object-store-author` is optional: it defaults to `$USER`, then `$USERNAME`,
-then `spiral-fit` if neither is set to a nonempty value. Pass it explicitly to
-override that identity. The service keeps its `spiral-service@<host>` default.
 
 At startup rank 0 resolves the selection (`object_store_{patch,track}_{uuids,tags}`;
 unset selects every active object, an empty list none; `input_use_*` toggles
-off select none), validates every selected object's frame, then refreshes the
-patch-overlap links as
-`--object-store-author`,
-writing them back to the store. Tracks are not linked: the store's
-`track-track` detector is not run and no `crossing` relationship is written. Detectors whose object kinds are not all
-selected are skipped. `input_use_patch_overlaps: false` skips the
-patch-overlap detector and adds no overlap pairs to the fit (a rebuild
-setting). The refresh is one `link_objects` request of the store: every
-detector runs under one read snapshot and their links commit together with
-the link marker, so a detector failure stops the fit before training and
-writes nothing. `object_store_refresh_links: false` reads the store's
-current relationships read-only.
-
-The link marker is one `link_marker` record of the store, updated in the
-links' own commit (two concurrent refreshes conflict): the position, the fit
-volume, the link parameters, normal source and detector versions, and the
-selection. The next refresh skips the detectors when the marker's inputs
-match, the selection is the same or smaller, and nothing since its position
-touched a selected surface, a detector relationship (same-surface) or a
-volume registration. Changed tracks and
-live `crossing` relationships do not relink (no detector reads them); a
-deleted relationship, whose kind the store no longer tells, does. A marker
-written before API 48 (with a track selection) is replaced by one full
-refresh. A service input update
-links only objects added since (pairs with a new object, partners found by
-stored bounds); those links are approximate, and the next startup refreshes
-in full. `object_store_full_link_refresh: true` always runs every detector.
-Each detector's mode and duration are logged, and its progress shows in the
-service's `input_preparation.progress` (stderr for a CLI fit).
-
-Pending and approved relationships are used
-and rejected ones never; `object_store_approved_links_only` uses approved ones
-only (refresh still runs, so new links stay pending and unused).
+off select none), validates every selected object's frame and pins the
+store's head.
 
 The outer shell is the one active surface tagged `spiral-outer-shell` (two are
 an error). It is never a patch: the default and tag selections leave it out,
-and naming it in `object_store_patch_uuids` is refused, so no detector links
-it. It is read with the selection, in the same fit volume, and it is part
+and naming it in `object_store_patch_uuids` is refused. It is read with the selection, in the same fit volume, and it is part
 of the input manifest (at its version) and digest; a fit with shell losses or
 winding-model supervision refuses a store without one, and with
 `input_use_outer_shell` off it is not read. An input update that changes the
 shell is refused (the fit consumed it at build): rebuild instead.
 
-After refresh every rank reads the same frozen snapshot and materializes it:
-patch grids, patch overlaps as same-surface point pairs (`pcl_patch_overlap_*`, sampling
-group `patch_overlaps`), and the tracks lying entirely inside the z window
-with the crossing CSR the fit computes from every selected track, from which it
-builds its track crossing graph (see **Track crossings** below). No
-relationship of a track is read: `crossing` and track-surface relationships
-are not used. Overlap pairs on patch quads the losses do not sample
-are dropped and reported. The ranks' input digests must agree. The log prints
-the selection, consumed relationships and constraint counts; `python
+Every rank then reads the same frozen snapshot and materializes it: patch
+grids, the outer shell, and the tracks lying entirely inside the z window
+with the crossing CSR the fit computes from every selected track, from which
+it builds its track crossing graph (see **Track crossings** below). No
+relationship is read: `crossing`, track-surface and patch-overlap
+relationships are not used. The ranks' input digests must agree. The log
+prints the selection and constraint counts; `python
 object_store_inputs.py dataset.vcobj --z-begin Z0 --z-end Z1` prints the same
 report without training.
 
@@ -465,50 +420,35 @@ leave `.building-*` or `.compact-*` files beside it, which are safe to delete.
 The input manifest records the crossings as
 `derived_inputs.track_crossing` (`source`, `algorithm`, `parameters`, `count`,
 `sha256`), which a resume and an input update compare. `crossing`
-relationships a store holds, and approvals, rejections or edits of them, no
-longer affect fitting, and `object_store_approved_links_only` does not apply
-to crossings. A checkpoint written before API 48, whose manifest lists its
-crossings as relationships, resumes only with
-`object_store_allow_changed_inputs`.
+relationships a store holds, and approvals, rejections or edits of them, do
+not affect fitting.
 
 The inputs are a **position** of the store, `{store, generation,
 commit_sequence}` (its UUID, its history generation and one of its commits,
 as `status()` reports them), the same whether the store is a file or served
-by `vc_object_server`. Startup reads the head, refreshes the links over the
-selection as one checked request that expects every object the detectors
-read, and pins the links' commit: the selected objects at the numbered
-versions it left them, which later commits never change. A commit touching
-one of those objects (or the marker) between the snapshot and the write
-conflicts, and startup reads the new head and relinks (bounded; unrelated
-commits do not interfere). `object_store_input_position` reads a position
-exactly, without linking (a served store needs the pinned versions with
-it). The manifest records the position (outside the digest: equal inputs
-at two positions are equal) and the link parameters and normal source, so a
-later change of either shows the fit's links as stale.
+by `vc_object_server`. Startup reads the head and pins it: the selected
+objects at their numbered versions there, which later commits never change.
+`object_store_input_position` reads a position exactly (a served store needs
+the pinned versions with it). The manifest records the position (outside the
+digest: equal inputs at two positions are equal).
 
 Object pins carry the shared `{store, generation, object, version}` reference
 unchanged, including the selected source owner in a referenced collection.
 Older numeric pin maps are decoded once using their recorded original
-store/generation, not a later current-owner lookup. Link requests use the
-existing command-v2 complete-reference guards; database schema remains 21.
+store/generation, not a later current-owner lookup.
 
-The inputs are frozen for the fit: settings that would relink or re-derive
-them (`config.OBJECT_STORE_PCL_KEYS`, selection and frame settings) need a
-new fit. Each run writes `object_store_inputs.json`
-(store, selection, the version and scale of every object and the version of
-every consumed relationship, the fit volume, external-input frames,
-materialization settings, and the refresh mode with its fiber-patch normal
-source) and checkpoints carry the same manifest and digest; a resume whose
+The inputs are frozen for the fit: settings that would re-derive them
+(`patch_loss_z_margin`, selection and frame settings) need a new fit. Each
+run writes `object_store_inputs.json` (store, selection, the version and scale
+of every object, the fit volume, external-input frames and materialization
+settings) and checkpoints carry the same manifest and digest; a resume whose
 inputs differ is refused unless `object_store_allow_changed_inputs`.
 
 The digest identifies inputs by content, not by store history: an object by
 its geometry revision and a hash of the metadata the adapter reads
-(`metadata_sha256`: its frame, erosion and track family), a relationship
-by its record, approval, generation, endpoint geometry revisions and a hash
-of its anchors and metadata (`content_sha256`). The manifest keeps each object's and relationship's
-numbered `version`, outside the digest, to read the inputs back exactly. A
-checkpoint written before these identities is compared on geometry
-revisions and relationship generations, with a warning.
+(`metadata_sha256`: its frame, erosion and track family). The manifest keeps
+each object's numbered `version`, outside the digest, to read the inputs
+back exactly.
 
 ### Frames and units
 
@@ -527,10 +467,9 @@ positions and clearances converted to fit voxels.
 `fit_volume_level` (default 0) fits at a pyramid level of the reference
 volume instead: a fit voxel is 2^level reference voxels, so the z range and
 every setting above are in that level's voxels. Object frames, the scroll's
-facts (shape, voxel size, umbilicus and Lasagna scales), the store's overlap
-pairs and the fiber directions a service extracts are converted to it; link
-refresh still works in the reference volume's own voxels, and exported
-surfaces and previews are written back in them. The winding-inference
+facts (shape, voxel size, umbilicus and Lasagna scales) and the fiber
+directions a service extracts are converted to it, and exported surfaces and
+previews are written back in the reference volume's own voxels. The winding-inference
 artifact and a `scroll_zarr` array are read as they are, so they must already
 be at that level. A checkpoint resumes only at the level it was written at.
 
@@ -543,28 +482,25 @@ From the repository root, with `vc_object_store`'s Python module on the path
 PYTHONPATH=spiral-fitting:$VC_OBJECT_STORE_BUILD/python spiral-fitting/.venv/bin/python -m pytest -q \
   spiral-fitting/tests/test_object_store_inputs.py \
   spiral-fitting/tests/test_object_store_materialize.py \
-  spiral-fitting/tests/test_object_store_overlaps.py \
   spiral-fitting/tests/test_object_store_tracks.py \
   spiral-fitting/tests/test_object_store_startup.py \
   spiral-fitting/tests/test_object_store_positions.py \
-  spiral-fitting/tests/test_object_store_lazy_relink.py \
   spiral-fitting/tests/test_object_store_hosted.py
 ```
 
 These build small stores (`tests/object_store_fixture.py`; shared fixtures in
-`tests/conftest.py`) and cover selection, frames and scales, refresh and its
-idempotency, aggregated failures, read-only and approved-only modes, two-rank
-startup (a rank-local failure, manifest mismatch), resume refusal, positions
-linked and pinned (including edits racing the link refresh), lazy and
-incremental relinking, the same links, pins, service binding and commits
-through a `vc_object_server` endpoint (`test_object_store_hosted.py` runs a
+`tests/conftest.py`) and cover selection, frames and scales, aggregated
+failures, read-only reads, two-rank startup (a rank-local failure, manifest
+mismatch), resume refusal, pinned positions (including edits racing the
+selection read), the same pins, service binding and commits through a
+`vc_object_server` endpoint (`test_object_store_hosted.py` runs a
 server subprocess when `VC_OBJECT_SERVER` names the binary and is skipped
 otherwise), tracks and
 the crossings computed from them (equal to the links the store's `track-track`
 detector publishes for the same tracks), and the runtime constraints against
 `tests/data/object_store_reference.json`, which the removed file loader
-produced from the same fixture. An opt-in startup test refreshes and
-materializes a real store (give it a scratch copy: it writes links):
+produced from the same fixture. An opt-in startup test pins and
+materializes a real store (read-only):
 
 ```sh
 OBJECT_STORE_SMOKE_STORE=/scratch/dataset.vcobj OBJECT_STORE_SMOKE_Z=9000:9100 \
@@ -621,8 +557,8 @@ python spiral_service.py --object-store /path/to/store --output /path/to/output 
 
 The project supplies the dataset identity, array paths and scale. Missing packs
 are built from accessible local arrays, or from HTTP(S) ones, with shared
-packing locks and progress reporting, before link refresh or replacement of the
-resident fit. Checkpoint resumes prepare missing packs too, retaining their
+packing locks and progress reporting, before the inputs are read or the
+resident fit is replaced. Checkpoint resumes prepare missing packs too, retaining their
 recorded input position. Existing packs are reused without needing the source
 arrays. A packing failure leaves the resident session intact. The same default
 extracts missing fiber-direction samples (see "Fiber direction samples"). A fit
@@ -844,8 +780,7 @@ authenticated HTTP protocol:
   tunnels are ever required.
 
 In every mode the service — not the client — owns the host paths: it is
-launched with `--object-store` (patches, tracks and
-their links; see [Object-store inputs](#object-store-inputs)), `--output` (all
+launched with `--object-store` (patches and tracks; see [Object-store inputs](#object-store-inputs)), `--output` (all
 generated state), the optional `--cache` (derived host caches; default
 `$XDG_CACHE_HOME/vc3d/spiral`, i.e. `~/.cache/vc3d/spiral`) and the optional
 `--winding-inference` (below), resolves them once at startup, and advertises
@@ -880,8 +815,8 @@ and rebuild carries a `project` block (`fit_session.SpiralProject`):
   of the `nx`, `ny` and `grad_mag` channels (one-channel arrays sharing one
   array name, e.g. `s_nx.ome.zarr/4`; local paths or remote locations), or
   why the fit cannot read it (an unreadable dataset, multichannel arrays).
-  The fit and its startup link refresh read the identity's pools from the
-  service's cache, never the stores;
+  The fit reads the identity's pools from the service's cache, never the
+  stores;
 - for each store volume its volumes' annotations are kept in (a catalog
   volume once, whatever its working level): the facts the project knows
   exactly (`voxel_size_um`; a catalog volume's `z_direction_is_top_to_bottom`,
@@ -903,9 +838,7 @@ the one its inputs were read in). The build fits that project volume:
   (the file the fit reads) and loads its pools from its cache at the volume's
   `lasagna_scale` (see "Lasagna inputs must be packed first"). A fit whose
   losses need normals or gradient magnitudes the project cannot give, or
-  whose pools the cache lacks, is refused before anything is linked. The
-  startup link refresh reads the normals pack too (`normal_pool`).
-  The command-line fit builds its normals pack before refreshing.
+  whose pools the cache lacks, is refused before its inputs are read.
 - **Umbilicus.** The project's, written under the output directory
   (`project-inputs/umbilicus-<identity-hash>.json`) as the file the fit reads, at
   coordinate scale 1. The file retains the complete source reference; its
@@ -931,10 +864,8 @@ renamed project, another Lasagna dataset) rereads everything.
 `--object-store STORE` binds the service to one store location for its lifetime:
 a store file on its host, or the endpoint of the `vc_object_server` serving one
 (a file a server holds is refused; bind its endpoint). `--object-store-author
-NAME` names the author of the links it writes (default `spiral-service@<host>`)
-and `--object-store-link-timeout SECONDS` how long a served store's link refresh
-may take (its server's `--request-deadline`). `object_store_location`,
-`object_store_author`, `object_store_link_timeout_s` and
+NAME` names the author of the commits it writes (default
+`spiral-service@<host>`). `object_store_location` and
 `object_store_input_position` are service-owned configuration: `/configuration`
 lists them under `service_owned`, a request that leaves them out or repeats
 the bound values is accepted, and a request naming another value is refused.
@@ -954,26 +885,18 @@ commits need it served (vc_object_server) and attached here."*
 service as `http://127.0.0.1:PORT` when both run on one host) is attached by
 clients anywhere: VC3D attaches `ssh://host:PORT` (or `http(s)://`), routes
 the Spiral kinds to it, and the whole editing workflow works as on a shared
-file. The link refresh then runs on the server: its `--request-deadline`
-and the service's `--object-store-link-timeout` must both cover the longest
-refresh (minutes for a scroll-sized store), its fiber-patch normal source (a
-Lasagna pack under the service's cache, or a CT path) must be readable by
-the server, and the input summary's `fiber_patch_normals` names the source
-used. A file a server holds refuses the service's writable open: bind the
+file. A file a server holds refuses the service's writable open: bind the
 endpoint. Read-only opens of such a file still work. See the store's
 [serving instructions](../vc_object_store/docs/hosted.md#serving-a-store).
 
-The service writes only detector links and its commits, only during a
-build, an update or a commit, and is the only detector writer for its
-selection (a command-line refresh of the same store would conflict with it).
+The service writes only its commits.
 
 ```sh
-vc_object_server /data/scroll.vcobj --port 9800 --request-deadline 1800
-python spiral_service.py --output OUT --object-store http://127.0.0.1:9800 \
-    --object-store-link-timeout 1800
+vc_object_server /data/scroll.vcobj --port 9800
+python spiral_service.py --output OUT --object-store http://127.0.0.1:9800
 ```
 
-Each build (Initialize Fit, a full Rebuild Fit) links and pins a position,
+Each build (Initialize Fit, a full Rebuild Fit) pins a position,
 including at least the request's `inputs_position` (the position a client's
 saved edits reached: `{store, generation, commit_sequence}`, with the
 `request_uuid` of the last save's receipt, which the service's store must
@@ -982,12 +905,12 @@ receipt the store lacks is refused), before tearing anything down: a failure the
 the resident fit untouched and is reported in `input_preparation_error`. A
 checkpoint resumes at the position it recorded. A model-only rebuild keeps the
 position. `POST /session/update-inputs {"inputs_position", "expected_input_generation"}`
-updates a resident fit in place: the service links and pins a position, then
+updates a resident fit in place: the service pins a position, then
 every rank reads it, prepares its inputs without touching resident state,
 releases the old inputs' device state and installs the new ones at an
 iteration boundary. The model, optimiser, scheduler and iteration are kept;
 status reports `input_update` while one runs and `input_generation`
-afterwards. A refusal (while linking or preparing, on any rank) leaves the fit
+afterwards. A refusal (while pinning or preparing, on any rank) leaves the fit
 as it was; a failure after the release fails the session
 (`input_preparation_error.recovery_required`): rebuild it or load a
 checkpoint.
@@ -1005,11 +928,10 @@ keeps the inputs and one that changes anything else rereads them; the
 response's `inputs` says which happened.
 
 Status carries `input_digest` (the content digest of the fit's selection),
-`input_summary` (counts per kind and relationship, the volume, whether links
-were refreshed and which fiber-patch normal source they used) and
+`input_summary` (counts per kind, the volume and the constraint counts) and
 `input_position` (store, generation, commit_sequence, the requested position,
-the head it was linked at, and where it came from). Every build and update
-publishes the selection, with each object's and relationship's version pins,
+the head it was pinned at, and where it came from). Every build and update
+publishes the selection, with each object's version pins,
 as an `input_manifest` artifact
 (`object_store_inputs.json`). Previews, the preview index and autosave
 metadata record the digest and position of the inputs they were made from. A
@@ -1224,8 +1146,8 @@ project's datasets' identities. It defaults to `$XDG_CACHE_HOME/vc3d/spiral`
 through it. The headless `fit_spiral.py` CLI accepts the same `--cache` with the same default
 (`FIT_SPIRAL_CACHE_DIR` still overrides it for the CLI).
 
-The service never writes its bound inputs; its only store writes are the
-link refreshes, as `--object-store-author`.
+The service never writes its bound inputs; its only store writes are its
+commits, as `--object-store-author`.
 
 ### Connecting from VC3D
 
@@ -1301,9 +1223,9 @@ read-only, and the service rejects a session request that carries
 Optional supervision sources have rebuild-scoped boolean switches in Advanced
 config. Set an `input_use_*` key to `false` to skip validation, loading,
 sampling, and losses for that source without changing its tuned weights or
-sample counts. Available switches cover verified patches, tracks, patch
-overlaps, fiber directions, normals, gradient magnitude, winding inference,
-and the outer shell. For example:
+sample counts. Available switches cover verified patches, tracks, fiber
+directions, normals, gradient magnitude, winding inference, and the outer
+shell. For example:
 
 ```json
 {
@@ -1754,7 +1676,7 @@ artifact there, and copy the file to the service's cache:
 ```
 
 A build whose loss needs them, on a service that does not extract them,
-refuses a cache without them before linking.
+refuses a cache without them before reading its inputs.
 
 Both `input_use_fiber_directions` and `loss_weight_fiber_directions` default
 to off/zero; set the toggle true and the weight above zero to enable the

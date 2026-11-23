@@ -323,7 +323,6 @@ def run_mutable_config(config: Mapping[str, Any]) -> dict[str, Any]:
 _INPUT_TOGGLE_KEYS = {
     "verified_patches": "input_use_verified_patches",
     "tracks": "input_use_tracks",
-    "patch_overlaps": "input_use_patch_overlaps",
     "fiber_directions": "input_use_fiber_directions",
     "normals": "input_use_normals",
     "gradient_magnitude": "input_use_gradient_magnitude",
@@ -516,20 +515,6 @@ class SpiralInputPaths:
         result = asdict(self)
         result["provenance"] = json.loads(json.dumps(self.provenance))
         return result
-
-
-def lasagna_normal_inputs(source: LasagnaSource | None, config: Mapping[str, Any], scale,
-                          cache_directory: str | os.PathLike[str] | None):
-    """A fit's lasagna normals as object_store_inputs.fiber_normal_source
-    takes them, or None when it has none (no dataset, input_use_normals off,
-    or no normals pack of the dataset in the cache): the pack and its
-    array's downsampling relative to the fit volume."""
-    if source is None or not cache_directory or not input_source_enabled(config, "normals"):
-        return None
-    pack = source.pack_directory(cache_directory, "normals")
-    if not os.path.isfile(os.path.join(pack, "meta.json")):
-        return None
-    return {'pool': pack, 'scale': scale}
 
 
 # Run-block keys the scroll (a service session's project) owns, mapped to the

@@ -1,4 +1,4 @@
-"""Selection, frames and relationship filtering of object-store fit inputs."""
+"""Selection and frames of object-store fit inputs."""
 import json
 from types import SimpleNamespace
 
@@ -18,26 +18,15 @@ def _grid(z=20.0, size=6, scale=1):
                     axis=-1)
 
 
-def _overlapping(db, shifts, **record):
-    """Patches in the plane y=100, ``shifts`` voxels along x, and the
-    store's overlap edges between them: (patch UUIDs, {frozenset of the two
-    patches: edge UUID})."""
-    patches = [put_patch(db, plane(dx=dx), (0.25, 0.25), **record) for dx in shifts]
-    db.link_surface_overlaps(volume_uuid=VOLUME)
-    return patches, {frozenset((edge['a'], edge['b'])): edge['uuid']
-                     for edge in db.edges_by_kind('same-surface')}
-
-
 def _track(db, **record):
     return put_track(db, [[30, 12, 10 + i] for i in range(6)], 0, 'horizontal', **record)
 
 
 def request(**selectors):
     volume = selectors.pop('volume', None)
-    approved = selectors.pop('approved', False)
     return osi.InputRequest(
         {kind: osi.Selector(**value) for kind, value in selectors.items()},
-        volume, approved)
+        volume)
 
 
 @pytest.mark.parametrize('value', [True, 1.5, '1', -1, 2**63])
@@ -49,39 +38,6 @@ def test_saved_positions_use_native_validation(db, value):
     with pytest.raises((ValueError, RuntimeError), match='commit_sequence'):
         osi.InputPins.from_manifest({'position': position})
     assert osi.InputPosition.from_provenance(dict(db.status(), commit_sequence=0)).commit_sequence == 0
-
-
-@pytest.mark.parametrize('history_enabled', [False, True])
-def test_snapshot_uses_numbered_relationship_versions_without_record_generations(tmp_path, history_enabled):
-    from vc_object_store import ObjectStore, relationship_reference
-
-    with ObjectStore.create(str(tmp_path / 'input.vcobj'), author='test',
-                            history_enabled=history_enabled) as store:
-        _, edges = _overlapping(store, (0.0, 8.0))
-        [edge] = edges.values()
-        snapshot = osi.read_snapshot(store, request())
-        [relationship] = snapshot.relationships
-        assert relationship.uuid == edge
-        assert relationship.version == store.edge(edge)['version']
-        selected = store.relationships_at_versions(snapshot.request.pins.refs())[0]
-        assert relationship.reference == relationship_reference(selected)
-        assert relationship.provenance()['reference'] == relationship.reference
-        assert relationship.reference['store'] == store.status()['store']
-        assert 'generation' not in relationship.provenance()
-        assert snapshot.manifest()['position']['generation'] == store.status()['generation']
-        # A pinned current snapshot works even without historical storage.
-        import dataclasses
-        again = osi.read_snapshot(store, dataclasses.replace(
-            request(), pins=snapshot.request.pins))
-        assert again.digest() == snapshot.digest()
-        changed_reference = dict(relationship.reference, store='11111111-1111-4111-8111-111111111111')
-        changed = dataclasses.replace(relationship, reference=changed_reference)
-        assert changed.provenance()['reference'] != relationship.provenance()['reference']
-        assert changed.provenance()['content_sha256'] == relationship.provenance()['content_sha256']
-        # Publication provenance does not redefine consumed-content identity.
-        manifest = snapshot.manifest()
-        manifest['relationships'] = [changed.provenance()]
-        assert osi.manifest_digest(manifest) == snapshot.digest()
 
 
 def test_default_selection_reads_every_active_object_in_uuid_order(db):
@@ -148,7 +104,7 @@ def test_selection_preserves_inherited_source_identity_and_manifest_pins(db):
 
 
 def test_reference_only_pins_validate_boundary_and_carry_reference_unchanged(db):
-    from vc_object_store import object_reference, TransactionConflict
+    from vc_object_store import object_reference
     patch = put_patch(db, _grid())
     reference = object_reference(db.object(patch))
     value = dict(position=osi.InputPosition.of_status(db.status()).provenance(),
@@ -158,17 +114,6 @@ def test_reference_only_pins_validate_boundary_and_carry_reference_unchanged(db)
     assert pins.provenance()['references'] is pins.references
     assert 'objects' not in pins.provenance()
     assert osi.InputPins.from_provenance(pins.provenance()).refs() == [reference]
-    command = osi.link_request(db.status(), {}, author='test', read_references=pins.refs())
-    assert command['command_version'] == 3
-    assert command['read_dependencies'][patch] is pins.references[patch]
-    assert 'expected_object_references' not in command
-    command['operations'] = []
-    db.submit(command)
-    assert object_reference(db.object(patch)) == reference
-    wrong_owner = osi.link_request(db.status(), {}, author='test', read_references=[dict(reference, store=patch)])
-    wrong_owner['operations'] = []
-    with pytest.raises(TransactionConflict):
-        db.submit(wrong_owner)
     with pytest.raises(ValueError, match='inconsistent exact input reference'):
         osi.InputPins.from_provenance(dict(value, references={VOLUME: reference}))
     with pytest.raises(ValueError):
@@ -190,19 +135,6 @@ def test_saved_pin_selection_arrays_are_validated_once(db, bad):
     with pytest.raises(ValueError, match='arrays'):
         osi.InputPins.from_provenance(value)
     assert osi.InputPins.from_provenance(dict(value, selection={'surface': []})).refs() == []
-
-
-def test_marker_read_passes_complete_receipt_reference_unchanged():
-    reference = dict(store='11111111-1111-4111-8111-111111111111',
-                     generation='22222222-2222-4222-8222-222222222222',
-                     object='33333333-3333-4333-8333-333333333333', version=7)
-    class Reader:
-        def objects_at_versions(self, refs):
-            assert refs == [reference]
-            assert refs[0] is reference
-            return [dict(record=dict(meta=dict(commit_sequence=9)))]
-    assert osi._link_marker_at(Reader(), reference) == dict(commit_sequence=9)
-    assert osi._link_marker_at(Reader(), None) is None
 
 
 def test_explicit_selectors_tags_and_empty_matches(db):
@@ -295,45 +227,20 @@ def test_a_fit_level_converts_frames_to_its_voxels(db):
                                [0.25 * 4, 0.5 * 4])
 
 
-def test_relationship_filtering_and_endpoint_order(db):
-    (a, b, c, outside_patch), edges = _overlapping(db, (0.0, 2.0, 4.0, 6.0))
-    pending = edges[frozenset((a, b))]
-    approved = edges[frozenset((a, c))]
-    db.set_approval(approved, 'approved')
-    rejected = edges[frozenset((b, c))]
-    db.set_approval(rejected, 'rejected')
-    outside = {edges[frozenset((patch, outside_patch))] for patch in (a, b, c)}
-
-    snapshot = osi.read_snapshot(db, request(surface={'uuids': (a, b, c)}))
-    consumed = {rel.uuid: rel for rel in snapshot.relationships}
-    assert set(consumed) == {pending, approved}
-    assert not outside & set(consumed)
-    assert snapshot.exclusions == {'rejected': 1, 'endpoint outside selection': 3}
-    edge = consumed[pending]
-    assert (edge.family, edge.a, edge.b) == ('patch_overlap', *sorted([a, b]))
-
-    approved_only = osi.read_snapshot(db, request(
-        surface={'uuids': (a, b, c)}, approved=True))
-    assert [rel.uuid for rel in approved_only.relationships] == [approved]
-    assert approved_only.exclusions['pending (approved-only)'] == 1
-
-
 def test_manifest_records_frames_and_its_digest_follows_inputs(db, tmp_path):
-    (patch, other), edges = _overlapping(db, (0.0, 8.0))
-    [edge] = edges.values()
+    patch, other = (put_patch(db, plane(dx=dx), (0.25, 0.25)) for dx in (0.0, 8.0))
     track = _track(db, coordinates=frame(2))
     snapshot = osi.read_snapshot(db, request())
     manifest = snapshot.manifest()
     assert manifest['units'] == osi.FIT_UNITS
     assert {obj['uuid']: obj['scale_factor'] for obj in manifest['objects']} == {
         patch: 1, other: 1, track: 2}
-    assert manifest['relationships'][0]['uuid'] == edge
     incomplete = json.loads(json.dumps(manifest))
-    incomplete['relationships'][0].pop('reference')
+    incomplete['objects'][0].pop('reference')
     for read in (osi.InputPins.from_manifest, osi.manifest_digest):
         with pytest.raises(ValueError, match='regenerate'):
             read(incomplete)
-    assert osi.validated_manifest_references({'relationships': []}) == {}
+    assert osi.validated_manifest_references({'objects': []}) == {}
     original = manifest['objects'][0]
     conflicting = dict(original, version=original['version'] + 1,
                        reference=dict(original['reference'], version=original['version'] + 1))
@@ -351,14 +258,12 @@ def test_manifest_records_frames_and_its_digest_follows_inputs(db, tmp_path):
     discovery = osi.InputPins.from_provenance({'position': snapshot.position.provenance()})
     assert not discovery.pinned
     assert snapshot.digest() == osi.read_snapshot(db, request()).digest()
-    db.set_approval(edge, 'approved')
-    assert snapshot.digest() != osi.read_snapshot(db, request()).digest()
+    assert snapshot.digest() != osi.read_snapshot(db, request(surface={'uuids': (patch,)})).digest()
 
     report = tmp_path / 'report.json'
     assert osi.main([db.path, '--json', str(report)]) == 0
     written = json.loads(report.read_text())
     assert written['manifest']['volume_uuid'] == VOLUME
-    assert any('patch_overlap 1' in line for line in written['report'])
 
 
 def test_manifest_validation_reuses_decoded_references(db, monkeypatch):

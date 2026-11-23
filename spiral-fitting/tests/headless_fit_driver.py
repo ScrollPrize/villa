@@ -131,14 +131,12 @@ def _checkpoint_structure(checkpoint):
 
 
 def _canonicalize_satisfied(satisfied):
-    """Sort entry lists by identity: patch/PCL load order is not
-    deterministic run-to-run, only the set of entries is."""
+    """Sort the patch entries by id: patch load order is not deterministic
+    run-to-run, only the set of entries is."""
     canonical = dict(satisfied)
-    for key, identity in (('patches', 'id'), ('pcls', 'name')):
-        entries = canonical.get(key)
-        if isinstance(entries, list):
-            canonical[key] = sorted(
-                entries, key=lambda entry: str(entry.get(identity)))
+    entries = canonical.get('patches')
+    if isinstance(entries, list):
+        canonical['patches'] = sorted(entries, key=lambda entry: str(entry.get('id')))
     return canonical
 
 
@@ -146,20 +144,15 @@ def _satisfied_aggregates(satisfied):
     """Aggregate satisfaction metrics: per-entry values are noisy (patch
     areas are quantized in coarse cells), but sums over hundreds of entries
     carry a tight regression signal."""
-    aggregates = {}
-    for key, satisfied_field, total_field in (
-            ('patches', 'satisfied_area', 'total_area'),
-            ('pcls', 'satisfied_points', 'total_points')):
-        entries = satisfied.get(key) or []
-        total_satisfied = sum(entry[satisfied_field] for entry in entries)
-        total = sum(entry[total_field] for entry in entries)
-        aggregates[key] = {
-            'num_entries': len(entries),
-            'sum_satisfied': total_satisfied,
-            'sum_total': total,
-            'overall_fraction': (total_satisfied / total) if total else None,
-        }
-    return aggregates
+    entries = satisfied.get('patches') or []
+    total_satisfied = sum(entry['satisfied_area'] for entry in entries)
+    total = sum(entry['total_area'] for entry in entries)
+    return {'patches': {
+        'num_entries': len(entries),
+        'sum_satisfied': total_satisfied,
+        'sum_total': total,
+        'overall_fraction': (total_satisfied / total) if total else None,
+    }}
 
 
 def run(spec_path, result_path, out_dir):

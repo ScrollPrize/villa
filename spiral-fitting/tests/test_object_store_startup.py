@@ -1,5 +1,5 @@
-"""Startup lifecycle of object-store fit inputs: link refresh, frozen reads,
-rank agreement, external frames and resume validation."""
+"""Startup lifecycle of object-store fit inputs: pinned positions, frozen
+reads, rank agreement, external frames and resume validation."""
 import hashlib
 import dataclasses
 import json
@@ -15,7 +15,7 @@ from vc_object_store import ObjectStore  # noqa: E402
 import object_store_inputs as osi  # noqa: E402
 import object_store_reference as reference  # noqa: E402
 from object_store_fixture import (  # noqa: E402
-    VOLUME, edges, fit_config, names)
+    VOLUME, fit_config, names)
 
 pytestmark = pytest.mark.usefixtures('cpu')
 
@@ -80,93 +80,25 @@ def test_umbilicus_requires_reference_and_preserves_materialized_source(tmp_path
         SpiralProject.from_mapping(project(umbilicus=UMBILICUS))
 
 
-def test_default_refresh_writes_links_and_freezes_the_inputs(store_path):
-    log = []
-    inputs = load(store_path, log)
-    linked = edges(store_path)
-    assert len(linked) == 1
-    assert inputs.counts['patch overlaps'] == 1
-    assert any(line.startswith('link refresh patch_overlap: 1 created') for line in log)
-    assert inputs.manifest['link_refresh']['enabled']
-    assert inputs.manifest['materialization']['pcl_patch_overlap_max_pairs'] == 16
-    # A rerun finds the links current (the store's link marker) and runs no
-    # detector: same relationships, same frozen inputs.
-    rerun = []
-    again = load(store_path, rerun)
-    assert edges(store_path) == linked
-    assert again.digest == inputs.digest
-    assert any(line.startswith('link refresh: skip: unchanged since commit') for line in rerun)
-    assert not any('running' in line for line in rerun)
-    # A forced full refresh reconciles idempotently.
-    forced = []
-    load(store_path, forced, object_store_full_link_refresh=True)
-    assert any('1 unchanged' in line for line in forced)
-    with pytest.raises(osi.LinkRefreshError, match='object_store_author is required'):
-        load(store_path, object_store_author=None)
-
-
-def test_no_refresh_mode_never_writes(store_path):
+def test_a_fit_never_writes_the_store(store_path):
     before = _sha256(store_path)
     log = []
-    inputs = load(store_path, log, object_store_refresh_links=False,
-                  object_store_author=None)
+    inputs = load(store_path, log)
     assert _sha256(store_path) == before
-    assert edges(store_path) == []
-    assert inputs.counts['patch overlaps'] == 0
-    assert any(line.startswith('link refresh: off; pinning commit') for line in log)
-    assert not inputs.manifest['link_refresh']['enabled']
-    assert 'WARNING: no patch_overlap relationships are consumed' in '\n'.join(inputs.report())
+    assert any(line.startswith('pinning commit') for line in log)
+    assert len(inputs.patches) == 3
 
 
-def test_empty_selectors_skip_detectors_without_writing(store_path):
+def test_empty_selectors_select_nothing(store_path):
     log = []
     inputs = load(store_path, log, object_store_patch_uuids=[],
                   object_store_track_tags=['absent'], fit_volume_uuid=VOLUME)
-    assert 'link refresh patch_overlap: skipped (no selected surfaces)' in log
-    assert edges(store_path) == []
     assert inputs.snapshot.objects_of('surface') == []
     # Input toggles select nothing either.
     request = osi.request_from_config(fit_config(
         store_path, input_use_verified_patches=False, input_use_tracks=False))
     assert request.selector('surface') == osi.Selector(uuids=())
     assert request.selector('track') == osi.Selector(uuids=())
-
-
-def test_subset_refresh_leaves_relationships_outside_the_selection(store_path):
-    load(store_path)
-    uuids = names(store_path)
-    outside = [edge for edge in edges(store_path) if uuids['walk'] in edge[1:3]]
-    assert len(outside) == 1
-    # A refresh over {near, far} must neither touch nor remove the edge to
-    # the unselected walk patch.
-    inputs = load(store_path, object_store_patch_uuids=[uuids['near'], uuids['far']])
-    assert [edge for edge in edges(store_path) if uuids['walk'] in edge[1:3]] == outside
-    assert inputs.snapshot.relationships == []
-
-
-def test_normal_source_prefers_lasagna_then_ct_then_none():
-    config = reference.fit_config()
-    assert osi.fiber_normal_source(config).kind == 'none'
-    config.update(object_store_normal_ct_path='/ct.zarr',
-                  object_store_normal_ct_level=2,
-                  object_store_normal_ct_downsampling=4.0)
-    with pytest.raises(osi.ObjectStoreInputError, match='needs object_store_normal_ct_volume_uuid'):
-        osi.fiber_normal_source(config, volume_uuid=VOLUME)
-    config['object_store_normal_ct_volume_uuid'] = 'other'
-    with pytest.raises(osi.ObjectStoreInputError, match='not the fit volume'):
-        osi.fiber_normal_source(config, volume_uuid=VOLUME)
-    config['object_store_normal_ct_volume_uuid'] = VOLUME
-    ct = osi.fiber_normal_source(config, volume_uuid=VOLUME)
-    assert (ct.kind, ct.ct_volume, dict(ct.parameters)) == (
-        'ct', '/ct.zarr/2', {'ct_level': 0, 'ct_to_base_scale': 4.0})
-    # The store reads the normals pack the fitter loads, never the arrays.
-    lasagna = osi.fiber_normal_source(
-        config, {'pool': '/cache/lasagna/run-1/normals_g4', 'scale': 4},
-        volume_uuid=VOLUME)
-    assert lasagna.kind == 'lasagna' and lasagna.ct_volume == ''
-    assert dict(lasagna.parameters) == {
-        'ct_level': 0, 'ct_to_base_scale': 4.0,
-        'normal_pool': '/cache/lasagna/run-1/normals_g4'}
 
 
 # ---------------------------------------------------------------------------
@@ -183,8 +115,7 @@ def _rank_worker(rank, world_size, rendezvous, configs, results):
         inputs = osi.load_fit_inputs(
             configs[rank], dist=DistributedContext(rank, world_size, rank),
             log=lambda line: None)
-        result = {'digest': inputs.digest,
-                  'overlaps': inputs.counts['patch overlaps']}
+        result = {'digest': inputs.digest}
     except osi.ObjectStoreInputError as error:
         result = {'error': error.problems}
     finally:
@@ -195,7 +126,7 @@ def _rank_worker(rank, world_size, rendezvous, configs, results):
 
 def test_a_rank_local_read_failure_reaches_every_rank(store_path, tmp_path):
     from cpu_service import two_ranks
-    # Rank 1 alone cannot open its store, after rank 0 refreshed.
+    # Rank 1 alone cannot open its store, after rank 0 pinned it.
     first, second = two_ranks(_rank_worker, tmp_path, [
         fit_config(store_path), fit_config(str(tmp_path / 'absent.vcobj'))])
     assert 'error' in first and first == second
@@ -205,7 +136,7 @@ def test_a_rank_local_read_failure_reaches_every_rank(store_path, tmp_path):
 def test_ranks_with_different_inputs_refuse_to_train(store_path, tmp_path):
     from cpu_service import two_ranks
     first, second = two_ranks(_rank_worker, tmp_path, [
-        fit_config(store_path), fit_config(store_path, pcl_patch_overlap_max_pairs=4)])
+        fit_config(store_path), fit_config(store_path, patch_loss_z_margin=4)])
     assert first == second
     assert 'ranks read different object-store inputs' in first['error'][0]
 
@@ -230,21 +161,12 @@ def test_resume_refuses_changed_inputs_and_frames(store_path):
     assert 'resuming anyway' in warnings[0]
     [problem] = osi.resume_problems({}, inputs)
     assert 'records no object-store inputs' in problem
-    # Refreshed relationships are inputs too.
-    edge = edges(store_path)[0][0]
-    with ObjectStore.open(store_path, author='reviewer') as db:
-        db.set_approval(edge, 'approved')
-    [problem] = osi.resume_problems(recorded, load(store_path))
-    assert 'relationships' in problem
-    # How links were refreshed is provenance, not an input.
-    quiet = load(store_path, object_store_refresh_links=False)
-    assert quiet.digest == load(store_path).digest
 
 
 def test_a_copy_of_the_store_gives_one_digest(store_path, tmp_path):
     """A copied store file: the same inputs under the same identity."""
     import shutil
-    linked = load(store_path, object_store_author='alice')
+    linked = load(store_path)
     assert linked.manifest['position']['commit_sequence'] > 0
     copy = str(tmp_path / 'copy.vcobj')
     shutil.copyfile(store_path, copy)
@@ -256,9 +178,8 @@ def test_a_copy_of_the_store_gives_one_digest(store_path, tmp_path):
     versions = lambda snapshot: {entry['uuid']: entry['version']
                                  for entry in snapshot.manifest()['objects']}
     assert versions(a) == versions(b) and a.digest() == b.digest()
-    assert len(a.manifest()['relationships']) == 1
     # Reading the pinned position gives one manifest from either file.
-    pinned = load(copy, object_store_author='bob', object_store_refresh_links=False)
+    pinned = load(copy)
     assert pinned.manifest['position'] == linked.manifest['position']
     assert pinned.counts == linked.counts and pinned.digest == linked.digest
     assert osi.manifest_differences(linked.manifest, pinned.manifest) == []
@@ -275,10 +196,10 @@ def test_digest_covers_the_metadata_the_adapter_reads(store_path):
     walk = names(store_path)['walk']
     with ObjectStore.open(store_path, author='reviewer') as db:
         db.set_meta(walk, 'review_note', 'checked')
-    assert load(store_path, object_store_refresh_links=False).digest == inputs.digest
+    assert load(store_path).digest == inputs.digest
     with ObjectStore.open(store_path, author='reviewer') as db:
         db.set_meta(walk, 'source', {'spiral_patch_erode_cells': 2})
-    changed = load(store_path, object_store_refresh_links=False)
+    changed = load(store_path)
     assert changed.digest != inputs.digest
     # The manifest carries the values read, which clients compare directly.
     [entry] = [e for e in changed.manifest['objects'] if e['uuid'] == walk]
@@ -286,36 +207,6 @@ def test_digest_covers_the_metadata_the_adapter_reads(store_path):
     assert osi.content_sha256(entry['metadata']) == entry['metadata_sha256']
     [problem] = osi.resume_problems({'object_store': inputs.manifest}, changed)
     assert 'objects' in problem
-
-
-def test_unrecognized_relationship_content_is_not_silently_discarded(store_path):
-    inputs = load(store_path)
-    recorded = json.loads(json.dumps(inputs.manifest))
-    assert recorded['relationships']
-    for entry in recorded['relationships']:
-        entry['generation'] = 7
-    assert 'relationships' in osi.resume_problems({'object_store': recorded}, inputs)[0]
-    recorded['relationships'][0]['content_sha256'] = 'different-content'
-    [problem] = osi.resume_problems({'object_store': recorded}, inputs)
-    assert 'relationships' in problem
-
-
-def test_a_checkpoint_without_relationship_references_requires_regeneration(store_path):
-    inputs = load(store_path)
-    legacy = json.loads(json.dumps(inputs.manifest))
-    # The manifest such a checkpoint recorded: no metadata hashes, no
-    # relationship content, and revision UUIDs instead of numbered versions.
-    for entry in legacy['objects']:
-        del entry['metadata_sha256']
-        del entry['version']
-        entry['object_revision'] = 'another-store'
-    legacy['relationships'] = [
-        {key: entry[key] for key in ('uuid', 'kind', 'family', 'approval_state')}
-        | {'generation': 1, 'revision': 'another'}
-        for entry in legacy['relationships']]
-    for allow_changed in (False, True):
-        with pytest.raises(ValueError, match='regenerate'):
-            osi.resume_problems({'object_store': legacy}, inputs, allow_changed=allow_changed)
 
 
 def test_checkpoint_preflight_checks_the_object_store_inputs(store_path):
@@ -365,9 +256,9 @@ def test_fit_context_loads_frozen_inputs_from_its_configuration(store_path, tmp_
     context._write_object_store_manifest()
     with open(os.path.join(context.out_path, 'object_store_inputs.json')) as stream:
         assert json.load(stream)['digest'] == inputs.digest
-    # Settings that would relink or re-derive the frozen inputs are refused.
+    # Settings that would re-derive the frozen inputs are refused.
     with pytest.raises(ValueError, match='object-store inputs are frozen'):
-        context.apply_config({'pcl_patch_overlap_max_pairs': 4},
+        context.apply_config({'patch_loss_z_margin': 4},
                              current_iteration=0)
 
 
@@ -421,10 +312,10 @@ def test_a_resumed_fit_reads_the_checkpoints_pinned_inputs(store_path, tmp_path)
 @pytest.mark.skipif(not os.environ.get('OBJECT_STORE_SMOKE_STORE'),
                     reason='set OBJECT_STORE_SMOKE_STORE to a copy of an ingested dataset store')
 def test_real_data_startup_smoke():
-    """Refresh and materialize a real ingested store over a z window.
+    """Pin and materialize a real ingested store over a z window.
 
-    OBJECT_STORE_SMOKE_STORE names a store the test may write links to (a
-    scratch copy); OBJECT_STORE_SMOKE_Z (default 9000:9200) is the window.
+    OBJECT_STORE_SMOKE_STORE names the store (read-only);
+    OBJECT_STORE_SMOKE_Z (default 9000:9200) is the window.
     """
     path = os.environ['OBJECT_STORE_SMOKE_STORE']
     z_begin, z_end = map(int, os.environ.get('OBJECT_STORE_SMOKE_Z', '9000:9200').split(':'))

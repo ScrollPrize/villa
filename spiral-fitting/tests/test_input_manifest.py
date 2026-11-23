@@ -224,8 +224,7 @@ def test_the_cli_fit_refuses_store_objects_of_another_volume(tmp_path, monkeypat
 
     def context(volume):
         return FitContext(
-            FitConfig({**reference.fit_config(), 'object_store_location': store,
-                       'object_store_author': 'cli'}),
+            FitConfig({**reference.fit_config(), 'object_store_location': store}),
             scroll=reference.scroll_spec(),
             paths=SpiralInputPaths(volume_uuid=volume, umbilicus=umbilicus),
             cache_dir=str(tmp_path / 'cache'), out_base_dir=str(tmp_path / 'out'),

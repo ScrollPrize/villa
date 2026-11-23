@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import math
 from pathlib import Path
 
 
@@ -34,15 +33,11 @@ _NULL_TYPES = {
     "track_max_tortuosity": "number",
     "loss_start_track_dt": "integer",
     "object_store_location": "string",
-    "object_store_author": "string",
-    "object_store_link_timeout_s": "integer",
     "object_store_input_position": "mapping",
     "object_store_patch_uuids": "strings",
     "object_store_patch_tags": "strings",
     "object_store_track_uuids": "strings",
     "object_store_track_tags": "strings",
-    "object_store_normal_ct_path": "string",
-    "object_store_normal_ct_volume_uuid": "string",
     "fit_volume_uuid": "string",
     "spiral_outward_sense": "string",
 }
@@ -107,7 +102,6 @@ _INPUT_TOGGLE_KEYS = frozenset({
     "input_use_verified_patches",
     "input_use_tracks",
     "input_use_fiber_directions",
-    "input_use_patch_overlaps",
     "input_use_normals",
     "input_use_gradient_magnitude",
     "input_use_winding_inference",
@@ -242,34 +236,17 @@ _INPUT_GATE_KEYS = _INPUT_TOGGLE_KEYS | {
     "input_disable_patches",
 }
 
-# pcl_ settings that shape the frozen object-store inputs (patch-overlap
-# materialization). A resident fit cannot re-derive them; they are a
-# rebuild, and FitContext.apply_config refuses them.
-OBJECT_STORE_PCL_KEYS = frozenset({
-    "pcl_patch_overlap_pair_spacing",
-    "pcl_patch_overlap_max_pairs",
-})
-
 # The object-store input selection and frames decide what host preparation
-# reads, refreshes and materializes (object_store_inputs.load_fit_inputs).
+# reads and materializes (object_store_inputs.load_fit_inputs).
 OBJECT_STORE_INPUT_KEYS = frozenset({
     "object_store_location",
-    "object_store_author",
-    "object_store_link_timeout_s",
     "object_store_input_position",
-    "object_store_refresh_links",
-    "object_store_full_link_refresh",
-    "object_store_approved_links_only",
     "object_store_allow_changed_inputs",
     "object_store_patch_uuids",
     "object_store_patch_tags",
     "object_store_patch_exclude_uuids",
     "object_store_track_uuids",
     "object_store_track_tags",
-    "object_store_normal_ct_path",
-    "object_store_normal_ct_level",
-    "object_store_normal_ct_downsampling",
-    "object_store_normal_ct_volume_uuid",
     "fit_volume_uuid",
     "fit_volume_level",
 })
@@ -278,7 +255,6 @@ NEW_FIT_KEYS = frozenset(
     set(_Z_RANGE_KEYS)
     | _MODEL_STRUCTURE_KEYS
     | OBJECT_STORE_INPUT_KEYS
-    | OBJECT_STORE_PCL_KEYS
     | _INPUT_GATE_KEYS
     | _PREPARED_INPUT_FIELDS
     | {"optimizer_random_seed", "track_inner_exclusion_radius",
@@ -373,7 +349,6 @@ def _field_spec(key, default):
                     "output_num_slices_for_visualization",
                     "theta_crossing_map_update_interval",
                     "dt_target_update_interval",
-                    "pcl_patch_overlap_max_pairs",
                 } else 0),
             maximum=(1_000_000 if key == "output_num_slices_for_visualization"
                      else 16 if key == "fit_volume_level"
@@ -492,21 +467,11 @@ class Config:
         self.input_use_verified_patches = True
         self.input_use_tracks = False
         self.input_use_fiber_directions = False
-        # Patch-overlap links: refreshed by the store's overlap detector and
-        # materialized as same-surface point pairs. Off skips both.
-        self.input_use_patch_overlaps = True
         self.input_use_normals = True
         self.input_use_gradient_magnitude = True
         self.input_use_winding_inference = True
         self.input_use_outer_shell = True
         self.input_disable_patches = False
-        # Object-store patch overlaps become same-surface point pairs sampled
-        # this many reference-volume voxels apart, at most max_pairs per edge
-        # (object_store_inputs.materialize_patch_overlaps). Each edge weighs
-        # the same in the 'patch_overlaps' sampling group however many pairs
-        # it yields.
-        self.pcl_patch_overlap_pair_spacing = 8.0
-        self.pcl_patch_overlap_max_pairs = 16
         self.track_min_sample_spacing = 20.0
         self.track_max_sample_spacing = 60.0
         self.track_length_bin_weights = [0.0, 0.15, 0.85]
@@ -569,32 +534,20 @@ class Config:
         self.output_save_png_visualizations = False
         self.output_num_slices_for_visualization = 20
         # Patches and tracks come from one vc_object_store database
-        # (object_store_inputs.load_fit_inputs). Startup refreshes the
-        # store's automatic patch-overlap links, writing them back as
-        # object_store_author, unless refresh_links is off; approved_links_only
-        # consumes only approved relationships. Track crossings are computed
-        # by the fit from the selected tracks, not read from the store. A checkpoint resumes only
-        # against identical inputs and frames unless allow_changed_inputs.
+        # (object_store_inputs.load_fit_inputs), opened read-only: the fit
+        # writes nothing to it and reads no relationship between objects.
+        # Track crossings are computed by the fit from the selected tracks. A
+        # checkpoint resumes only against identical inputs and frames unless
+        # allow_changed_inputs.
         # A store file on this host, or the endpoint of the vc_object_server
         # serving one (object_store_inputs.open_store).
         self.object_store_location = None
-        self.object_store_author = None
-        # How long one link_objects request of a served store may take: its
-        # detectors run on the server, which answers when they are done. Set
-        # with the server's --request-deadline; None is the default 300 s.
-        self.object_store_link_timeout_s = None
         # The inputs are a position of the store ({store, generation,
-        # commit_sequence}). None links and pins the store's head at load
+        # commit_sequence}). None pins the store's head at load
         # (object_store_inputs.prepare_position); a position is read exactly
-        # as pinned, without linking. The service sets it from the position
-        # it prepared; a client never does.
+        # as pinned. The service sets it from the position it prepared; a
+        # client never does.
         self.object_store_input_position = None
-        self.object_store_refresh_links = True
-        # A refresh skips the detectors when the store's link marker shows the
-        # links current, and an input update links only new objects; true
-        # always runs every detector over the whole selection.
-        self.object_store_full_link_refresh = False
-        self.object_store_approved_links_only = False
         self.object_store_allow_changed_inputs = False
         # Object selection per kind: None selects every active object with
         # geometry; otherwise the listed UUIDs plus objects carrying any
@@ -602,19 +555,10 @@ class Config:
         self.object_store_patch_uuids = None
         self.object_store_patch_tags = None
         # Selected patches left out of the fit entirely (e.g. an evaluation
-        # hold-out): no draws, overlaps or trusted geometry.
+        # hold-out): no draws or trusted geometry.
         self.object_store_patch_exclude_uuids = None
         self.object_store_track_uuids = None
         self.object_store_track_tags = None
-        # CT structure-tensor normals for fiber-patch link refresh when the fit
-        # loads no lasagna normals: a CT zarr whose group object_store_normal_
-        # ct_level is downsampled by object_store_normal_ct_downsampling
-        # relative to the fit volume, which object_store_normal_ct_volume_uuid
-        # must name.
-        self.object_store_normal_ct_path = None
-        self.object_store_normal_ct_level = 0
-        self.object_store_normal_ct_downsampling = 1.0
-        self.object_store_normal_ct_volume_uuid = None
         # The reference volume every fit coordinate is a voxel of; None infers
         # it from the selected objects' declared frames.
         self.fit_volume_uuid = None
@@ -671,10 +615,6 @@ class Config:
                     or type(item) not in (int, float)
                     for item_key, item in value.items()):
                 raise ValueError(f"Invalid dictionary value for {key}")
-        for key in ("object_store_normal_ct_downsampling",):
-            if values[key] is not None and not (
-                    math.isfinite(values[key]) and values[key] > 0):
-                raise ValueError(f"{key} must be finite and positive")
         if values["model_gap_expander_capacity_windings"] < 3:
             raise ValueError(
                 "model_gap_expander_capacity_windings must be at least 3")

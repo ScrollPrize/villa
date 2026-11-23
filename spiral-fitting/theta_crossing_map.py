@@ -1,4 +1,4 @@
-"""Cached theta=0 crossings for patch and point-collection topology.
+"""Cached theta=0 crossings for patch topology.
 
 The map deliberately stores topology, not transformed geometry.  Node geometry
 is supplied by small source adapters and is materialised only while refreshing
@@ -89,9 +89,8 @@ class ThetaCrossingMap:
         self.node_theta = torch.empty(0, dtype=torch.float32, device=self.device)
         self.crossings = torch.empty(0, dtype=torch.int8, device=self.device)
         # Patch quad centres opt into an unwrap tree.  The resulting integer
-        # potential is root-relative and is refreshed from the same cached
-        # edge crossings as sampled walks.  INT32_MIN marks non-tree nodes
-        # (for example PCL topology, which continues to use explicit walks).
+        # potential is root-relative and is refreshed from the cached edge
+        # crossings.  INT32_MIN marks nodes outside every tree.
         self._unset_potential = torch.iinfo(torch.int32).min
         self.node_winding_potential = torch.empty(
             0, dtype=torch.int32, device=self.device)
@@ -371,10 +370,6 @@ class ThetaCrossingMap:
             directions.reshape(original_shape).to(return_device),
         )
 
-    def resolve_walks(self, node_ids):
-        node_ids = torch.as_tensor(node_ids, dtype=torch.int64, device=self.device)
-        return self.resolve_edges(torch.stack([node_ids[..., :-1], node_ids[..., 1:]], dim=-1))
-
     def _set_interval(self, interval):
         interval = self._validate_interval(interval)
         if interval != self.update_interval:
@@ -482,7 +477,7 @@ class ThetaCrossingMap:
             # Patch atlases keep their trees in compact native storage.  The
             # callback expands only one bounded chunk of IDs at a time; branch
             # steps are computed straight from theta, so patch edges never
-            # enter the explicit PCL/fiber edge table above.
+            # enter the explicit edge table above.
             # The node-sized event table is only read back in chunks: keep it on the host.
             for source in self._potential_sources:
                 if source.count == 0:
@@ -618,39 +613,10 @@ class ThetaCrossingMap:
                 - (local_delta < -np.pi).to(torch.int32))
         return values
 
-    def adjustments_from_potentials(
-        self, node_ids, sampled_theta, dr_per_winding, *,
-        reference_node_ids=None, reference_patch_node_ids=None,
-    ):
-        """Adjust unordered patch samples using cached per-node potentials.
-
-        Ordinary rows retain the patch tree's root-relative frame. Annotation-led
-        rows instead use the exact PCL reference node and its attached patch
-        quad, preserving the absolute/relative winding frame without an
-        explicit sampled walk from the annotation.
-        """
+    def adjustments_from_potentials(self, node_ids, sampled_theta, dr_per_winding):
+        """Adjust unordered patch samples using cached per-node potentials:
+        every row keeps its patch tree's root-relative frame."""
         values = self.winding_potentials(node_ids, sampled_theta)
-        has_reference = reference_node_ids is not None
-        if has_reference != (reference_patch_node_ids is not None):
-            raise ValueError(
-                'reference node and reference patch node must be supplied together')
-        if has_reference:
-            references = torch.as_tensor(
-                reference_node_ids, dtype=torch.int64, device=self.device)
-            patch_references = torch.as_tensor(
-                reference_patch_node_ids, dtype=torch.int64, device=self.device)
-            expected_shape = values.shape[:-1]
-            if references.shape != expected_shape or patch_references.shape != expected_shape:
-                raise ValueError('reference IDs must match the sample row shape')
-            patch_potential = self.winding_potentials(patch_references)
-            reference_delta = (
-                self.node_theta[patch_references] - self.node_theta[references])
-            reference_step = (
-                (reference_delta > np.pi).to(torch.int32)
-                - (reference_delta < -np.pi).to(torch.int32))
-            values = (
-                values - patch_potential[..., None]
-                + reference_step[..., None])
         return values.to(dr_per_winding.dtype) * dr_per_winding.detach()
 
     def potential_inconsistencies(self):
@@ -747,64 +713,3 @@ class ThetaCrossingMap:
     def potential_consistency(self):
         """Return aggregate cycle/path-independence diagnostics."""
         return self.potential_inconsistencies()[0]
-
-    def adjustments(
-            self, packed_walks, sampled_theta, dr_per_winding, *,
-            return_walk_start_adjustment=False):
-        """Gather cumulative crossing adjustments for packed sampled walks.
-
-        Inputs are row-major. Packed edge IDs/directions describe each dense
-        node step, and pick positions index nodes in that walk. A nonnegative
-        correction-node ID connects a cached patch quad centre to its current
-        fractional pick. Ordinary rows are reanchored at their first pick. A
-        row with a nonnegative reference-node ID is instead transported from
-        that exact node through the start of the dense walk; relative/absolute
-        winding losses use this to retain the annotated PCL point's frame even
-        when the random samples omit the walk origin. When requested, the second
-        return value is the dense walk origin's adjustment in that output frame.
-        """
-        if self.last_refresh_iteration is None and self.node_theta.numel() != self.num_nodes:
-            raise RuntimeError('ThetaCrossingMap must be refreshed before use')
-        edge_ids = packed_walks.edge_ids
-        directions = packed_walks.directions
-        steps = self.crossings[edge_ids].to(torch.int32) * directions.to(torch.int32)
-        steps = steps * packed_walks.edge_valid.to(torch.int32)
-        cumulative = torch.cat([
-            torch.zeros((*steps.shape[:-1], 1), dtype=torch.int32, device=self.device),
-            steps.cumsum(dim=-1),
-        ], dim=-1)
-        picked = torch.gather(cumulative, -1, packed_walks.pick_positions)
-        correction_node_ids = packed_walks.correction_node_ids
-        sampled_theta = sampled_theta.detach().to(device=self.device)
-        correction_mask = correction_node_ids >= 0
-        centre_theta = self.node_theta[correction_node_ids.clamp_min(0)]
-        local_delta = sampled_theta - centre_theta
-        local = ((local_delta > np.pi).to(torch.int32)
-                 - (local_delta < -np.pi).to(torch.int32))
-        picked = picked + torch.where(
-            correction_mask, local, torch.zeros_like(local))
-
-        reference_node_ids = packed_walks.reference_node_ids
-        reference_mask = reference_node_ids >= 0
-        reference_theta = self.node_theta[reference_node_ids.clamp_min(0)]
-        start_theta = self.node_theta[packed_walks.walk_start_node_ids]
-        reference_delta = start_theta - reference_theta
-        reference_step = (
-            (reference_delta > np.pi).to(torch.int32)
-            - (reference_delta < -np.pi).to(torch.int32))
-        walk_start_adjustment = torch.where(
-            reference_mask, reference_step, -picked[..., 0])
-        picked = picked + torch.where(
-            reference_mask, reference_step, torch.zeros_like(reference_step)
-        )[..., None]
-        picked = picked - torch.where(
-            reference_mask[..., None], torch.zeros_like(picked[..., :1]),
-            picked[..., :1])
-        result = picked.to(dr_per_winding.dtype) * dr_per_winding.detach()
-        if return_walk_start_adjustment:
-            return (
-                result,
-                walk_start_adjustment.to(dr_per_winding.dtype)
-                * dr_per_winding.detach(),
-            )
-        return result

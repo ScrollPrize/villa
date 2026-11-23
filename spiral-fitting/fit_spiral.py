@@ -40,14 +40,14 @@ from ddp_helpers import (
     maybe_init_distributed,
     process_context,
 )
-from config import (CHECKPOINT_MODEL_SHAPE_KEYS, OBJECT_STORE_PCL_KEYS,
-                    Config, FitConfig, SHELL_ATLAS_KEYS)
+from config import (CHECKPOINT_MODEL_SHAPE_KEYS, Config, FitConfig,
+                    SHELL_ATLAS_KEYS)
 from checkpoint_migrations import (expand_gap_checkpoint_capacity,
                                    tolerate_checkpoint_config)
 from devices import fit_device
 from fit_session import (AUTOSAVE_INTERVAL_ITERATIONS, check_fit_volume,
                          fit_level_scale, input_source_enabled, lasagna_enabled,
-                         lasagna_normal_inputs, outer_shell_required,
+                         outer_shell_required,
                          resolve_lasagna_scale, scroll_at_fit_level,
                          shell_losses_enabled, winding_inference_enabled)
 from lazy_moment_adamw import LazyMomentAdamW, robust_clip_
@@ -824,12 +824,12 @@ def realign_optimizer_lr_schedule(
     return lr_scheduler, horizon
 
 
-# Settings that shape the frozen object-store inputs (the link refresh or the
-# materialized constraints). The inputs are frozen for a fit, so apply_config
-# refuses them at a Run boundary.
-_OBJECT_STORE_FROZEN_KEYS = OBJECT_STORE_PCL_KEYS | {
+# Settings that shape the frozen object-store inputs (the materialized
+# constraints). The inputs are frozen for a fit, so apply_config refuses them
+# at a Run boundary.
+_OBJECT_STORE_FROZEN_KEYS = frozenset({
     'patch_loss_z_margin',
-}
+})
 
 
 PATCH_SAMPLING_KEYS = frozenset({
@@ -941,13 +941,13 @@ class FitContext:
         self.paths = paths
         self.interactive_driver = interactive_driver
         # object_store_inputs.FitInputs materialized from a frozen object-store
-        # snapshot: patches and point constraints with the store's links. When
-        # None, load_host_inputs refreshes and reads the store the config
-        # specifies (object_store_location).
+        # snapshot: patches, tracks and the outer shell. When None,
+        # load_host_inputs pins and reads the store the config specifies
+        # (object_store_location).
         self.object_store_inputs = object_store_inputs
         # Receives each line the object-store adapter reports while it
-        # refreshes, freezes and derives the inputs (selection, refresh
-        # outcomes, constraint counts); the CLI prints them, a resident
+        # pins, freezes and derives the inputs (selection, position,
+        # constraint counts); the CLI prints them, a resident
         # session also publishes them.
         self.input_log = input_log or print
         self.progress = progress
@@ -1114,10 +1114,10 @@ class FitContext:
     def load_host_inputs(self):
         """Load and prepare every host-side input for a fit.
 
-        Seeds the host RNG streams, then reads patches, tracks and their
-        relationships from the object store
-        (object_store_inputs.load_fit_inputs: one link refresh, then a frozen
-        snapshot), builds the track crossing graph; builds the sampling caches,
+        Seeds the host RNG streams, then reads patches, tracks and the outer
+        shell from the object store (object_store_inputs.load_fit_inputs: a
+        frozen snapshot of a pinned position), builds the track crossing
+        graph; builds the sampling caches,
         host-prepared patch atlases, the trusted-geometry index and the
         whole-object DT target samples. Requires no device state: the
         patch atlases are moved as part of device-state setup, and the CUDA
@@ -1183,8 +1183,7 @@ class FitContext:
         # ==========================================================================
 
         # Patches, tracks and the outer shell come only from the object
-        # store, linked by its detectors; nothing here reads them from files
-        # or links them.
+        # store; nothing here reads them from files.
         if self.object_store_inputs is None:
             if not self.config['object_store_location']:
                 raise RuntimeError(
@@ -1416,15 +1415,6 @@ class FitContext:
         """The Lasagna array group, or None when no dataset is configured."""
         return self.lasagna_source.group if self.lasagna_source is not None else None
 
-    def _lasagna_normal_inputs(self):
-        """The fit's lasagna normals as object_store_inputs.fiber_normal_source
-        takes them, or None when the fit loads none. Link refresh works in the
-        fit volume's own voxels, not the fit level's."""
-        return lasagna_normal_inputs(
-            self.lasagna_source, self.config,
-            self.lasagna_scale * self.fit_level_scale if self.lasagna_scale else None,
-            self.cache_path)
-
     def _external_input_frames(self):
         """Frames of the inputs read outside the object store, for the input
         manifest. Each is declared in fit-volume voxels: the umbilicus by its
@@ -1443,23 +1433,14 @@ class FitContext:
         return frames
 
     def _load_object_store_inputs(self):
-        """Refresh and freeze this fit's object-store inputs
+        """Pin and freeze this fit's object-store inputs
         (object_store_inputs.load_fit_inputs) and report them."""
         from object_store_inputs import load_fit_inputs
-        # The link refresh reads the normals pack: one that may be built is
-        # built first.
-        source = self.lasagna_source
-        if (source is not None and input_source_enabled(self.config, 'normals')
-                and source.stores.get('normal_x') and source.stores.get('normal_y')):
-            self._ensure_sparse_volume_stores(
-                use_normals=True, use_spacing=False,
-                progress=progress_or_null(self.progress))
         progress_or_null(self.progress).begin(
             'loading', 'Reading object-store inputs',
             detail=os.path.basename(str(self.config['object_store_location'])))
         return load_fit_inputs(
-            self.config, lasagna=self._lasagna_normal_inputs(),
-            external_frames=self._external_input_frames(), dist=self.dist,
+            self.config, external_frames=self._external_input_frames(), dist=self.dist,
             cache_directory=self.cache_path, log=self.input_log,
             pins=self._resume_input_pins())
 
@@ -2998,7 +2979,7 @@ class FitContext:
         if frozen:
             raise ValueError(
                 'object-store inputs are frozen for this fit; '
-                f'{sorted(frozen)} would relink, reload or re-derive them')
+                f'{sorted(frozen)} would reload or re-derive them')
         if any(key.startswith('track_') for key in changed):
             # Validate combined bounds before changing participation or any
             # other resident derivation: restoring config alone cannot undo
@@ -3511,15 +3492,14 @@ class FitContext:
     def load_replacement_inputs(self, position):
         """Every rank: read and materialize the inputs at ``position`` (the
         pins' provenance: object_store_inputs.InputPins, the position and
-        the versions the links left the objects at) exactly as pinned
+        the object versions there) exactly as pinned
         (object_store_inputs.load_fit_inputs, which checks that the ranks
         agree on their digest). Allocates host memory only."""
         from object_store_inputs import load_fit_inputs
         config = dict(self.config)
         config['object_store_input_position'] = dict(position)
         return load_fit_inputs(
-            config, lasagna=self._lasagna_normal_inputs(),
-            external_frames=self._external_input_frames(), dist=self.dist,
+            config, external_frames=self._external_input_frames(), dist=self.dist,
             cache_directory=self.cache_path, log=self.input_log)
 
     def prepare_input_replacement(self, inputs):
@@ -3899,21 +3879,10 @@ if __name__ == '__main__':
     parser.add_argument(
         '--object-store', required=True, metavar='STORE',
         help='Object store the fit reads patch, track and '
-             'outer-shell inputs from, and writes refreshed links to: a store '
+             'outer-shell inputs from, read-only: a store '
              'file (.vcobj), or the endpoint of the vc_object_server serving one '
              '(http://host:port, or ssh://host:port, with sftp:// as an alias, for '
-             "a server on another host's loopback port). A file a server holds is "
-             'refused: pass its endpoint')
-    parser.add_argument(
-        '--object-store-author', metavar='NAME',
-        default=os.environ.get('USER') or os.environ.get('USERNAME') or 'spiral-fit',
-        help='Author of the links the startup refresh writes '
-             '(default: $USER, then $USERNAME, then spiral-fit)')
-    parser.add_argument(
-        '--object-store-link-timeout', type=int, default=300, metavar='SECONDS',
-        help='How long one link refresh of a served store may take: its detectors '
-             'run on vc_object_server, which answers when they are done; set it '
-             "with that server's --request-deadline (both default to 300)")
+             "a server on another host's loopback port)")
     parser.add_argument(
         '--cache', default=None,
         help='Directory for derived host caches, shared with the interactive '
@@ -3931,12 +3900,10 @@ if __name__ == '__main__':
 
     overrides = get_env_config_overrides()
     # Configure store access through CLI flags, not environment overrides.
-    owned = sorted({'object_store_location', 'object_store_author',
-                    'object_store_link_timeout_s'} & set(overrides))
-    if owned:
+    if 'object_store_location' in overrides:
         raise SystemExit(
-            f'FIT_SPIRAL_CONFIG_OVERRIDES cannot set {", ".join(owned)}: '
-            'use --object-store / --object-store-author / --object-store-link-timeout')
+            'FIT_SPIRAL_CONFIG_OVERRIDES cannot set object_store_location: '
+            'use --object-store')
     # The fit setting spiral_outward_sense stands in for a sense the
     # manifest's scroll does not decide, and must agree with one it does.
     try:
@@ -3961,8 +3928,6 @@ if __name__ == '__main__':
         config.update(scroll_spec_config_defaults(scroll_spec, config))
         config.update(overrides)
         config['object_store_location'] = cli_args.object_store
-        config['object_store_author'] = cli_args.object_store_author
-        config['object_store_link_timeout_s'] = cli_args.object_store_link_timeout
         # Report missing required inputs before building anything.
         input_errors = validate_fit_inputs(
             input_paths, config, missing={
@@ -3977,15 +3942,9 @@ if __name__ == '__main__':
                 + '\n  '.join(f'{error["field"]}: {error["message"]}'
                               for error in input_errors))
         # Check store access before loading the large supervision volumes.
-        # Link refresh needs write access; use the endpoint if a server owns
-        # the file. Pinned inputs only need read access. This check does not
-        # refresh links.
         from object_store_inputs import open_store
-        reads_position = (config['object_store_input_position'] is not None
-                          or (os.environ.get('FIT_SPIRAL_RESUME_PATH')
-                              and not config['object_store_allow_changed_inputs']))
         try:
-            with open_store(config, read_only=not config['object_store_refresh_links'] or reads_position):
+            with open_store(config):
                 pass
         except Exception as exc:
             parser.error(f'cannot open --object-store {cli_args.object_store}: {exc}')

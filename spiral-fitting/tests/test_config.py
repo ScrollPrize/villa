@@ -55,7 +55,7 @@ def test_input_participation_toggles_are_rebuild_scoped_booleans():
     expected = {
         "input_use_verified_patches",
         "input_use_tracks",
-        "input_use_fiber_directions", "input_use_patch_overlaps",
+        "input_use_fiber_directions",
         "input_use_normals",
         "input_use_gradient_magnitude",
         "input_use_winding_inference", "input_use_outer_shell",
@@ -74,7 +74,6 @@ def test_input_participation_toggles_are_rebuild_scoped_booleans():
         assert catalog["schema"]["fields"][key]["description"]
     assert rebuild_stage(["model_num_flow_stages",
                           "input_use_tracks"]) == "all"
-    assert rebuild_stage(["input_use_patch_overlaps"]) == "all"
 
 
 def test_z_range_is_advertised_as_owned_by_the_run_controls():

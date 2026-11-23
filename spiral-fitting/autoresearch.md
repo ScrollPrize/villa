@@ -10,7 +10,7 @@ To set up a new experiment, work with the user to:
 2. **Create the branch**: `git checkout -b autoresearch/<tag>` from current HEAD (any working copy changes should be left intact, assuming they are not in `fit_spiral.py` or its helper modules).
 3. **Read the in-scope files**: Only this 'spiral' subfolder of the repo is relevant. Read these for full context before you start:
    - `fit_spiral.py` — the main file you modify. Losses, optimization, flow model, config, etc.
-   - `object_store_inputs.py` — reads patches and tracks (and their links) from the object store.
+   - `object_store_inputs.py` — reads patches, tracks and the outer shell from the object store (read-only).
    - `losses.py`, `spiral_helpers.py`, `geom_utils.py`, `transforms.py`, `flow_fields.py` — fitting-side helper modules on the fit path (`flow_fields.py` is used via `transforms.py`) and NOT used by the metric/render pipeline. These are also fair game to edit (see scope below).
    - `tifxyz.py` — helper for loading/saving grid-topo quad-mesh patches. Read it for context, but it is **frozen** (see scope): it is shared with `render_ink.py`, so editing it changes the metric.
    - `runners/run_single.py` — the pipeline runner you launch (fit → render ink → score ink). You do NOT edit this or the scoring scripts; just understand what it does.
@@ -64,7 +64,7 @@ Each experiment is one full pipeline run, driven by `run_single.py`, which chain
 - `--gpus 0,1,2,3` — the GPU subset for this run: one fit rank per GPU, and the pin is passed straight through to every step. `CUDA_VISIBLE_DEVICES` alone is not enough: without `--gpus` the fit runs as a single process.
 - `--output <out_dir>/<tag>` — this run's output dir, which must be new or empty. The runner sets `FIT_SPIRAL_OUT_DIR` from it.
 - `--config <file>` — a JSON object of config overrides. The runner sets `FIT_SPIRAL_CONFIG_OVERRIDES` from it and drops that variable from its own environment.
-- `--inputs` (the fit's input manifest; see the README's "Input manifest"), `--object-store` (the fit's input store) and `--ink-volume` (required), `--object-store-author` (optional; defaults to `$USER`, then `$USERNAME`, then `spiral-fit`), and `--no-wandb`: the runner sets `WANDB_MODE` itself, so exporting `WANDB_MODE=disabled` does not turn W&B off.
+- `--inputs` (the fit's input manifest; see the README's "Input manifest"), `--object-store` (the fit's input store) and `--ink-volume` (required), and `--no-wandb`: the runner sets `WANDB_MODE` itself, so exporting `WANDB_MODE=disabled` does not turn W&B off.
 
 **Run two experiments at a time, each on four GPUs.** On an 8-GPU box that means one run with `--gpus 0,1,2,3` and one with `--gpus 4,5,6,7`, launched concurrently. Each run is fully self-contained on its four GPUs (fit, render, and score all stay within the pin), so the two never collide.
 

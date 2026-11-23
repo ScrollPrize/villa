@@ -119,11 +119,6 @@ def add_common_arguments(
              "the endpoint of the vc_object_server serving one (fit_spiral.py --object-store)",
     )
     parser.add_argument(
-        "--object-store-author",
-        default=None,
-        help="author of refreshed links (default: fit CLI's $USER / $USERNAME / spiral-fit)",
-    )
-    parser.add_argument(
         "--output",
         type=Path,
         default=DEFAULT_OUTPUT,
@@ -356,8 +351,6 @@ def fit_command(
         "--object-store",
         str(args.object_store),
     ]
-    if args.object_store_author is not None:
-        script_args += ["--object-store-author", args.object_store_author]
     if gpu_ids is not None and len(gpu_ids) > 1:
         return [
             sys.executable,

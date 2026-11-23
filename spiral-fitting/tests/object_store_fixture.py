@@ -113,20 +113,11 @@ def names(path):
                 for record in db.objects_by_kind(kind)}
 
 
-def edges(path, kind='same-surface'):
-    """A store's edges of ``kind``, sorted, with their review state."""
-    from vc_object_store import ObjectStore
-    with ObjectStore.open(str(path), read_only=True) as db:
-        return sorted((edge['uuid'], edge['a'], edge['b'], edge['approval_state'],
-                       edge['version'], edge['changed_at'])
-                      for edge in db.edges_by_kind(kind))
-
-
-def fit_config(path, author='fitter', **overrides):
+def fit_config(path, **overrides):
     """The reference fit configuration reading the store at ``path``."""
     import object_store_reference as reference
     config = reference.fit_config()
-    config.update(object_store_location=str(path), object_store_author=author)
+    config.update(object_store_location=str(path))
     config.update(overrides)
     return config
 

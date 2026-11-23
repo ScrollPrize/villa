@@ -140,8 +140,6 @@ def child_command(
         "--config", str(config), "--resume", "--gpus",
         ",".join(map(str, group)), "--vc-render-bin", str(args.vc_render_bin),
     ]
-    if args.object_store_author is not None:
-        command.extend(["--object-store-author", args.object_store_author])
     if args.seeds is not None:
         command.extend(["--seeds", ",".join(map(str, args.seeds))])
     if args.run_id is not None:

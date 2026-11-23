@@ -93,8 +93,7 @@ def test_a_service_s_source_document_round_trips(tmp_path):
     assert load_lasagna_source(write_manifest(tmp_path)).group == '4'
 
 
-def test_packs_live_under_the_identity(tmp_path):
-    from fit_session import lasagna_normal_inputs
+def test_packs_live_under_the_identity():
     source = LasagnaSource(identity='run-1', location='', group='4',
                            stores={'normal_x': '/nx', 'normal_y': '/ny'})
     assert source.pack_directory('/cache', 'normals') == '/cache/lasagna/run-1/normals_g4'
@@ -103,15 +102,6 @@ def test_packs_live_under_the_identity(tmp_path):
         source.arrays('grad_mag')
     with pytest.raises(LasagnaSourceError, match='identity'):
         LasagnaSource(identity='../x', location='', group='4')
-    # The link refresh reads the normals pack when the cache has it.
-    config = {'input_use_normals': True}
-    assert lasagna_normal_inputs(source, config, 4, tmp_path) is None
-    pack = tmp_path / 'lasagna' / 'run-1' / 'normals_g4'
-    pack.mkdir(parents=True)
-    (pack / 'meta.json').write_text('{}')
-    assert lasagna_normal_inputs(source, config, 4, tmp_path) == {'pool': str(pack), 'scale': 4}
-    assert lasagna_normal_inputs(source, {'input_use_normals': False}, 4, tmp_path) is None
-    assert lasagna_normal_inputs(None, config, 4, tmp_path) is None
 
 
 def test_shape_pairing_matches_vc3d_s_dyadic_rule():

@@ -563,7 +563,6 @@ def test_one_gpu_pins_entire_pipeline_without_distributed_launch(
         run_single.sys.executable, str(run_single.SPIRAL_DIR / "fit_spiral.py")]
     fit = calls[0][0]
     assert fit[fit.index("--object-store") + 1] == str(tmp_path / "inputs.vcobj")
-    assert "--object-store-author" not in fit
     assert all(env["CUDA_VISIBLE_DEVICES"] == "3" for _command, env in calls)
 
 

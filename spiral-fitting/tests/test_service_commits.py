@@ -34,8 +34,8 @@ SESSION = 'spiral-1-0123456789'
 
 def _fit(binding, tmp_path):
     """A service bound to ``binding``, with a stand-in session whose inputs
-    were read (linked and pinned) from its store."""
-    config = fit_config(binding.location, object_store_author='svc')
+    were read (pinned) from its store."""
+    config = fit_config(binding.location)
     inputs = osi.load_fit_inputs(config, log=lambda line: None)
     assert inputs.manifest['position'] is not None
     output = tmp_path / 'output'
@@ -257,13 +257,10 @@ def test_lasagna_in_the_fit_volumes_frame_is_committed(fit):
     assert result['state'] == 'done', result['error']
 
 
-def test_a_commit_leaves_the_links_current(fit):
-    # A committed fit is a surface, but never selected: the next refresh
-    # neither links it nor treats the links as stale.
+def test_a_committed_fit_is_not_selected(fit):
+    # A committed fit is a surface, but never selected.
     assert commit(fit, fit.generation())['state'] == 'done'
-    lines = []
-    inputs = osi.load_fit_inputs(fit.config, log=lines.append)
-    assert any(line.startswith('link refresh: skip') for line in lines), lines
+    inputs = osi.load_fit_inputs(fit.config, log=lambda line: None)
     assert inputs.manifest['position'] != fit.inputs.manifest['position']
     assert inputs.manifest['selection'] == fit.inputs.manifest['selection']
 
@@ -354,8 +351,8 @@ def test_only_a_preview_of_this_session_is_committed(fit):
     assert fit.state.status()['commit'] is None
 
 
-def test_a_commit_waits_for_a_link_refresh(fit):
-    # A refresh holds the store-write lock while it links.
+def test_a_commit_waits_for_the_store_write_lock(fit):
+    # Another store writer holds the store-write lock.
     with fit.state._store_write_lock:
         fit.state.commit({'artifact': fit.generation()})
         time.sleep(0.2)

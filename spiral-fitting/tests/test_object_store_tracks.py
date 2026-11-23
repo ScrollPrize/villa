@@ -2,7 +2,6 @@
 them."""
 import contextlib
 import dataclasses
-import json
 import pathlib
 import threading
 import types
@@ -17,7 +16,7 @@ import object_store_inputs as osi  # noqa: E402
 import object_store_reference as reference  # noqa: E402
 import tracks as tracks_module  # noqa: E402
 from object_store_fixture import (  # noqa: E402
-    array, crossing_edge, fit_config, frame, put_patch, put_track, shared_edit,
+    array, crossing_edge, fit_config, frame, put_patch, put_track,
     write_reference_store, write_walk_store)
 
 
@@ -286,12 +285,7 @@ def test_track_links_are_not_consumed(db):
                  'meta': {'track_surface': {}}})
     crossing_edge(db, track, 4, 4.0, other, 4, 4.0, 4.0)
     snapshot = osi.read_snapshot(db, osi.InputRequest())
-    assert snapshot.relationships == []
-    # The surface's link to a track is seen from the surface, whose other
-    # endpoint the read does not hold; the crossing is not seen at all.
-    assert snapshot.exclusions == {'inapplicable': 1}
-    # Tracks without consumed relationships are no missing family.
-    assert osi.empty_family_warnings(snapshot) == []
+    assert 'relationships' not in snapshot.manifest()
     assert not any('crossing' in line for line in osi.snapshot_report(snapshot))
 
 
@@ -327,24 +321,23 @@ class _Recording:
 def _manifest(store, config):
     snapshot = osi.read_snapshot(store, osi.request_from_config(config))
     inputs = osi.materialize_from_config(store, snapshot, config)
-    return osi.input_manifest(snapshot, config, osi.NormalSource('none'), tracks=inputs.tracks), inputs
+    return osi.input_manifest(snapshot, config, tracks=inputs.tracks), inputs
 
 
 def test_crossing_links_of_a_store_change_nothing_and_are_never_read(db):
-    patch = put_patch(db, np.stack(np.meshgrid(
+    put_patch(db, np.stack(np.meshgrid(
         np.arange(36.0, 46.0), [60.0], np.arange(50.0, 60.0), indexing='ij'),
         axis=-1).reshape(10, 10, 3), (1, 1))
-    tracks = _lattice(db, z=40)
+    _lattice(db, z=40)
     config = {**reference.fit_config(), 'input_use_tracks': True}
     before, without = _manifest(db, config)
     assert db.link_tracks_to_tracks()['edges_created'] == 9
     recording = _Recording(db)
     after, with_links = _manifest(recording, config)
-    assert recording.endpoints == {patch}
-    assert not recording.endpoints & set(tracks)
+    assert recording.endpoints == set()
     assert osi._compared(after) == osi._compared(before)
     assert osi.manifest_digest(after) == osi.manifest_digest(before)
-    assert after['relationships'] == [] and after['derived_inputs'] == before['derived_inputs']
+    assert after['derived_inputs'] == before['derived_inputs']
     assert after['derived_inputs']['track_crossing']['count'] == 9
     _assert_same_crossings(with_links.tracks.crossings, without.tracks.crossings)
 
@@ -925,10 +918,8 @@ def test_the_manifest_records_the_derived_crossings(tmp_path):
     assert derived['source'] == 'computed' and derived['count'] == 9 and len(derived['sha256']) == 64
     assert derived['algorithm'] == tracks_module.TRACK_CROSSING_ALGORITHM
     assert derived['parameters'] == tracks_module.TRACK_CROSSING_PARAMETERS
-    assert not [rel for rel in inputs.manifest['relationships'] if rel['family'] == 'track_crossing']
     summary = osi.input_summary(inputs)
     assert summary['constraints']['track crossings'] == 9
-    assert 'track_crossing' not in summary['relationships']
     assert 'track crossings 9' in '\n'.join(inputs.report())
     assert not any('track_crossing' in line for line in inputs.report())
     # Tracks without a crossing record a count of zero; no tracks, nothing.
@@ -954,7 +945,7 @@ def test_the_fit_caches_its_crossings_under_its_cache(tmp_path, computes):
 def test_derived_crossings_identify_the_tracks_of_a_fit(tmp_path):
     path = _track_store(tmp_path / 'fit.vcobj')
     inputs = _load(path)
-    again = _load(path, object_store_refresh_links=False)
+    again = _load(path)
     assert osi.track_identity(again.manifest) == osi.track_identity(inputs.manifest)
     assert osi.track_identity(inputs.manifest)['derived']['count'] == 9
     assert len(osi.track_identity(inputs.manifest)['objects']) == 6
@@ -966,180 +957,6 @@ def test_derived_crossings_identify_the_tracks_of_a_fit(tmp_path):
     assert osi.manifest_differences(inputs.manifest, changed) == ['derived_inputs.track_crossing']
     limits = _load(path, track_crossing_precompute_max=0, track_max_track_crossing_per_step=0)
     assert osi.track_identity(limits.manifest) == osi.track_identity(inputs.manifest)
-
-
-def test_a_checkpoint_with_crossing_relationships_reports_changed_inputs(tmp_path):
-    """A checkpoint of a fit that read its crossings as relationships (no
-    derived crossings, one track_crossing entry each) is of other inputs."""
-    path = _track_store(tmp_path / 'fit.vcobj')
-    inputs = _load(path)
-    a, b = sorted(entry['uuid'] for entry in inputs.manifest['objects'] if entry['kind'] == 'track')[:2]
-    recorded = {key: value for key, value in inputs.manifest.items() if key != 'derived_inputs'}
-    recorded['relationships'] = [*recorded['relationships'], {
-        'uuid': '5d0f6c1e-8d2a-4c57-9f10-6a5e4d3c2b1a', 'kind': 'crossing',
-        'family': 'track_crossing', 'approval_state': 'pending', 'a': a, 'b': b,
-        'a_geometry_revision': None, 'b_geometry_revision': None, 'content_sha256': '0' * 64,
-        'version': 1, 'reference': {
-            'store': inputs.manifest['store']['uuid'],
-            'generation': inputs.manifest['store']['generation'],
-            'relationship': '5d0f6c1e-8d2a-4c57-9f10-6a5e4d3c2b1a', 'version': 1}}]
-    [problem] = osi.resume_problems({'object_store': recorded}, inputs)
-    assert 'derived_inputs' in problem and 'relationships' in problem
-    assert 'object_store_allow_changed_inputs' in problem
-    assert osi.track_identity(recorded) != osi.track_identity(inputs.manifest)
-    warnings = []
-    assert osi.resume_problems({'object_store': recorded}, inputs, allow_changed=True,
-                               log=warnings.append) == []
-    assert 'derived_inputs' in warnings[0]
-
-
-def _prepare(path, **options):
-    """prepare_position; returns (prepared, the refresh's mode)."""
-    config = fit_config(path, 'service', input_use_tracks=True)
-    log = []
-    with ObjectStore.open(path, author='service') as store:
-        prepared = osi.prepare_position(store, config, osi.request_from_config(config),
-                                        log=log.append, **options)
-    [line] = [line for line in log if line.startswith('link refresh: ')
-              and line.split(': ')[1] in ('skip', 'full', 'incremental')]
-    return prepared, line.split(': ')[1]
-
-
-def test_the_link_refresh_links_no_tracks(tmp_path):
-    path = _track_store(tmp_path / 'fit.vcobj')
-    config = fit_config(path, 'service', input_use_tracks=True)
-    with ObjectStore.open(path, author='service') as store:
-        snapshot = osi.read_snapshot(store, osi.request_from_config(config))
-        assert len(snapshot.objects_of('track')) == 6
-        planned = osi.link_plan(snapshot, config)
-        assert osi.link_marker_selection(snapshot).keys() == {'surface'}
-    assert [outcome.detector for outcome in planned.outcomes] == ['patch_overlap']
-    steps = planned.plan['detectors']
-    assert [step['detector'] for step in steps] == ['surface-overlap']
-    assert 'track' not in str(steps)
-    prepared, mode = _prepare(path)
-    assert mode == 'full'
-    with ObjectStore.open(path, read_only=True) as db:
-        marker = osi.read_link_marker(db)
-        assert db.edges_by_kind('crossing') == []
-    assert marker['version'] == osi.LINK_MARKER_VERSION == 3
-    assert 'track' not in marker['selection']
-    assert sorted(marker['key_parts']['detectors']) == ['surface-overlap']
-    assert [step['detector'] for step in marker['detectors']] == ['surface-overlap']
-    assert len(prepared.pins.selection['track']) == 6
-
-
-def _add_crossing(db):
-    tracks = {record['track']['external_key']: record['uuid'] for record in db.objects_by_kind('track')}
-    crossing_edge(db, tracks['0'], 5, 5.0, tracks['1'], 5, 5.0, 5.0)
-
-
-def _approve_crossing(db):
-    db.set_approval(db.edges_by_kind('crossing')[0]['uuid'], 'approved')
-
-
-def _remove_crossing(db):
-    db.remove_edge(db.edges_by_kind('crossing')[0]['uuid'])
-
-
-def _edit_track(db):
-    db.set_meta(db.objects_by_kind('track')[0]['uuid'], 'review_note', 'edited')
-
-
-def _move_track(db):
-    _move_last_point(db, db.objects_by_kind('track')[0]['uuid'])
-
-
-def _link_tracks(db):
-    db.link_tracks_to_tracks()
-
-
-def _approve_link(db):
-    db.set_approval(db.edges_by_kind('same-surface')[0]['uuid'], 'approved')
-
-
-def test_tracks_and_crossing_links_do_not_stale_the_links(tmp_path):
-    """Crossing links (the store's detector, or a review of one) and changed
-    tracks leave the fit's links current; a deleted relationship, whose kind
-    the store no longer tells, and a consumed kind still relink in full."""
-    path = _track_store(tmp_path / 'fit.vcobj')
-    assert _prepare(path)[1] == 'full'
-    for change in (_add_crossing, _approve_crossing, _edit_track, _move_track, _link_tracks):
-        shared_edit(path, change)
-        assert _prepare(path)[1] == 'skip', change
-    shared_edit(path, _remove_crossing)
-    assert _prepare(path)[1] == 'full'
-    assert _prepare(path)[1] == 'skip'
-    shared_edit(path, _approve_link)
-    assert _prepare(path)[1] == 'full'
-
-
-def test_a_marker_of_the_old_format_is_replaced():
-    position = osi.InputPosition('store', 'generation', 7)
-    selection = {kind: {'count': 0, 'sha256': osi._uuids_sha256([]), 'uuids': []}
-                 for kind in osi.LINKED_KINDS}
-    key_parts = {'volume_uuid': 'volume'}
-    marker = {'version': osi.LINK_MARKER_VERSION, 'store': 'store', 'generation': 'generation',
-              'key': osi.content_sha256(key_parts), 'key_parts': key_parts, 'exact': True,
-              'commit_sequence': 7, 'selection': selection}
-
-    def plan(marker):
-        return osi.plan_link_refresh(marker, position, 7, lambda after: [], key_parts, selection,
-                                     set(), incremental=False)
-    assert plan(marker).mode == 'skip'
-    # A marker a fit with the track-track detector wrote: version 2, with a
-    # track selection.
-    old = {**marker, 'version': 2, 'selection': {**selection, 'track': {
-        'count': 0, 'sha256': osi._uuids_sha256([]), 'selector': {'uuids': None, 'tags': None}}}}
-    assert plan(old) == osi.LinkPlan('full', 'the link marker has another format')
-
-
-class _Served:
-    """A store file behind the reading interface of a served store: edges
-    are selected by UUID in one request, never read one by one."""
-    endpoint = 'http://store.invalid'
-
-    def __init__(self, store):
-        self._store = store
-        self.selections = []
-
-    def __getattr__(self, name):
-        return getattr(self._store, name)
-
-    def edge(self, uuid):
-        raise AssertionError('a served store reads no edge by itself')
-
-    def select_edges(self, edge_kind=None, edge_uuids=None, endpoint_uuids=None,
-                     include_retired=False, fields=None):
-        assert edge_kind is None and endpoint_uuids is None and include_retired
-        self.selections.append((list(edge_uuids), list(fields)))
-        found = [self._store.edge(uuid) for uuid in edge_uuids]
-        return [{field: edge[field] for field in fields} for edge in found if edge is not None]
-
-
-def test_changed_relationships_are_classified_in_one_projected_read(tmp_path):
-    path = _track_store(tmp_path / 'fit.vcobj')
-    prepared, _ = _prepare(path)
-    shared_edit(path, _link_tracks)
-    shared_edit(path, _approve_crossing)
-    removed = []
-
-    def remove(db):
-        removed.append(db.edges_by_kind('crossing')[-1]['uuid'])
-        db.remove_edge(removed[0])
-    shared_edit(path, remove)
-    with ObjectStore.open(path, read_only=True) as db:
-        served = _Served(db)
-        head = int(db.status()['commit_sequence'])
-        changes = osi.changes_after(served, prepared.position, head)
-        live = {edge['uuid'] for edge in db.edges_by_kind('crossing')}
-    relationships = [change for change in changes if change.record_kind == 'relationship']
-    [(uuids, fields)] = served.selections
-    assert fields == ['uuid', 'kind'] and set(uuids) == live | set(removed) and len(live) == 8
-    assert {change.kind for change in relationships if change.uuid in live} == {'crossing'}
-    assert {change.kind for change in relationships if change.uuid in removed} == {None}
-    tracks = [change for change in changes if change.record_kind == 'object']
-    assert tracks and {change.kind for change in tracks} == {'track'}
 
 
 def test_a_fit_prepares_store_tracks_with_their_crossings(db, tmp_path):

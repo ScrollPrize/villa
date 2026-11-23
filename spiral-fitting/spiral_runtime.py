@@ -557,7 +557,7 @@ def merge_session_config(checkpoint, run_config, warn):
     window, then the request's known advanced overrides (``warn`` names
     unknown ones). Returns ``(config, checkpoint profile config or None,
     advanced overrides)``. Shared by the build and by the service's input
-    preparation, which must refresh links with the configuration the build
+    preparation, which must pin the inputs with the configuration the build
     will apply.
     """
     config = Config().as_dict()

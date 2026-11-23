@@ -1,6 +1,6 @@
-"""Positions of object-store fit inputs: link-then-pin (prepare_position) on
-a store an editor writes as well, pinned reads whatever the store's head,
-and link staleness."""
+"""Positions of object-store fit inputs: pinning the head (prepare_position)
+of a store an editor writes as well, and pinned reads whatever the store's
+head."""
 import dataclasses
 
 import pytest
@@ -15,10 +15,9 @@ pytestmark = pytest.mark.usefixtures('cpu')
 
 
 def prepare(path, config=None, **options):
-    config = config or fit_config(path, 'service')
-    with ObjectStore.open(path, author='service') as opened:
-        return osi.prepare_position(opened, config, osi.request_from_config(config),
-                                    log=lambda line: None, **options)
+    config = config or fit_config(path)
+    with ObjectStore.open(path, read_only=True) as opened:
+        return osi.prepare_position(opened, osi.request_from_config(config), **options)
 
 
 def read(path, request):
@@ -27,7 +26,7 @@ def read(path, request):
 
 
 def pinned(path, pins):
-    return dataclasses.replace(osi.request_from_config(fit_config(path, 'service')), pins=pins)
+    return dataclasses.replace(osi.request_from_config(fit_config(path)), pins=pins)
 
 
 def position_of(path, commit_sequence):
@@ -36,21 +35,17 @@ def position_of(path, commit_sequence):
                                    commit_sequence=commit_sequence)
 
 
-def test_prepare_links_commits_and_pins_a_position(shared):
+def test_prepare_pins_the_head(shared):
     walk = names(shared)['walk']
     edited = shared_edit(shared, lambda db: db.set_meta(
         walk, 'source', {'spiral_patch_erode_cells': 2}))
     prepared = prepare(shared, minimum=position_of(shared, edited))
-    assert prepared.attempts == 1 and prepared.head == edited
-    assert prepared.position.commit_sequence > edited  # the links were committed on top
-    assert any('links committed at commit' in line for line in prepared.lines)
-    assert prepared.position.commit_sequence == head(shared)
-    # The pins hold every selected object at the version the links left it.
+    assert prepared.head == edited == prepared.position.commit_sequence == head(shared)
+    # The pins hold every selected object at its version there.
     assert set(prepared.pins.references) == set(names(shared).values())
     # Later commits do not change N: every reader reads the same inputs at it.
     request = pinned(shared, prepared.pins)
     before = read(shared, request)
-    assert len(before.relationships) == 1
     assert before.manifest()['position'] == prepared.position.provenance()
     shared_edit(shared, lambda db: db.set_meta(walk, 'source', {'spiral_patch_erode_cells': 3}))
     with ObjectStore.open(shared, read_only=True) as db:
@@ -64,12 +59,9 @@ def test_prepare_links_commits_and_pins_a_position(shared):
     by_position = read(shared, pinned(shared, osi.InputPins(prepared.position)))
     assert by_position.digest() == before.digest()
     assert by_position.request.pins.references == prepared.pins.references
-    # The edit of a selected object relinks: the marker's commit follows the
-    # head. Then nothing is new: the links are current, N = H.
+    # The next preparation pins the new head.
     again = prepare(shared)
-    assert again.position.commit_sequence == again.head + 1
-    third = prepare(shared)
-    assert third.position == again.position and third.head == again.position.commit_sequence
+    assert again.position.commit_sequence == again.head == head(shared)
 
 
 def test_a_commit_while_reading_the_selection_rereads_it(shared, monkeypatch):
@@ -84,7 +76,7 @@ def test_a_commit_while_reading_the_selection_rereads_it(shared, monkeypatch):
             edits.append(shared_edit(shared, lambda db: db.set_meta(walk, 'review_note', 'mid-read')))
         return original(store, kind, selector, records)
     monkeypatch.setattr(osi, 'resolve_selector', racing)
-    request = osi.request_from_config(fit_config(shared, 'service'))
+    request = osi.request_from_config(fit_config(shared))
     with ObjectStore.open(shared, read_only=True) as db:
         selected = osi.resolve_selection(db, request)
         assert edits and selected.position.commit_sequence == edits[0] == head(shared)
@@ -93,83 +85,10 @@ def test_a_commit_while_reading_the_selection_rereads_it(shared, monkeypatch):
         by_position = osi.resolve_selection(
             db, dataclasses.replace(request, pins=osi.InputPins(selected.position)))
         assert by_position.references == selected.references
-    # With link refresh off the pins are that capture, nothing later.
-    config = fit_config(shared, 'service', object_store_refresh_links=False)
-    prepared = prepare(shared, config)
+    # The pins are that capture, nothing later.
+    prepared = prepare(shared)
     assert prepared.position.commit_sequence == head(shared)
     assert prepared.pins.references[walk] == selected.references[walk]
-
-
-def test_a_refresh_survives_another_run_moving_the_marker(shared, monkeypatch):
-    """A second link run committing before the first reads its marker: the
-    first still reports from the marker its own commit wrote."""
-    walk = names(shared)['walk']
-    original = osi._link_marker_at
-    moved = []
-
-    def racing(store, reference):
-        if not moved:
-            moved.append(reference)
-            shared_edit(shared, lambda db: db.set_meta(walk, 'review_note', 'relinked'))
-            moved.append(prepare(shared).position.commit_sequence)
-        return original(store, reference)
-    monkeypatch.setattr(osi, '_link_marker_at', racing)
-    prepared = prepare(shared)
-    assert prepared.attempts == 1 and len(prepared.pins.references) == len(names(shared))
-    assert prepared.position.commit_sequence < moved[1] == head(shared)
-    with ObjectStore.open(shared, read_only=True) as db:
-        assert osi.read_link_marker(db)['commit_sequence'] == moved[1]
-
-
-def _racing(monkeypatch, edit, every=False):
-    """Run ``edit`` once the first (or every) refresh has read its snapshot
-    and planned its detectors, before its links commit."""
-    original = osi.link_plan
-    edits = []
-
-    def racing(*args, **kwargs):
-        planned = original(*args, **kwargs)
-        if every or not edits:
-            edits.append(edit(len(edits)))
-        return planned
-    monkeypatch.setattr(osi, 'link_plan', racing)
-    return edits
-
-
-def test_a_commit_while_linking_relinks(shared, monkeypatch):
-    walk = names(shared)['walk']
-    edits = _racing(monkeypatch, lambda n: shared_edit(
-        shared, lambda db: db.set_meta(walk, 'review_note', 'saved')))
-    prepared = prepare(shared)
-    assert prepared.attempts == 2 and prepared.head >= edits[0]
-    assert any('relinking' in line for line in prepared.lines)
-    # Between the head and N only the service wrote.
-    with ObjectStore.open(shared, read_only=True) as db:
-        status = db.status()
-        page = db.changes_since({'store': status['store'], 'generation': status['generation'],
-                                 'sequence': prepared.head})
-        assert {commit['author'] for commit in page['commits']
-                if commit['sequence'] <= prepared.position.commit_sequence} <= {'service'}
-    snapshot = read(shared, pinned(shared, prepared.pins))
-    assert snapshot.objects[walk].meta['review_note'] == 'saved'
-
-
-def test_continuous_edits_fail_the_update_cleanly(shared, monkeypatch):
-    walk = names(shared)['walk']
-    _racing(monkeypatch, lambda n: shared_edit(
-        shared, lambda db: db.set_meta(walk, 'review_note', str(n))), every=True)
-    with pytest.raises(osi.PositionError) as error:
-        prepare(shared, attempts=3)
-    text = '\n'.join(error.value.problems)
-    assert 'inputs kept changing' in text
-    # Nothing the service linked was written: a conflict commits nothing.
-    with ObjectStore.open(shared, read_only=True) as db:
-        assert db.edges_by_kind('same-surface') == []
-        assert osi.read_link_marker(db) is None
-    # Once the edits stop, the next update links afresh.
-    monkeypatch.undo()
-    prepared = prepare(shared)
-    assert len(read(shared, pinned(shared, prepared.pins)).relationships) == 1
 
 
 def test_positions_ahead_of_the_head_or_of_another_store_are_refused(shared):
@@ -188,11 +107,11 @@ def test_positions_ahead_of_the_head_or_of_another_store_are_refused(shared):
 def test_selectors_resolve_at_the_pins(shared):
     far = names(shared)['far']
     tagged = shared_edit(shared, lambda db: db.upsert_object({**db.object(far), 'tags': ['reviewed']}))
-    config = fit_config(shared, 'service', object_store_patch_tags=['reviewed'],
+    config = fit_config(shared, object_store_patch_tags=['reviewed'],
                         object_store_patch_uuids=[])
     request = osi.request_from_config(config)
-    with ObjectStore.open(shared, author='service') as db:
-        prepared = osi.prepare_position(db, config, request, log=lambda line: None)
+    with ObjectStore.open(shared, read_only=True) as db:
+        prepared = osi.prepare_position(db, request)
     assert prepared.selected['surface'] == [far] and prepared.head >= tagged
     shared_edit(shared, lambda db: db.upsert_object({**db.object(far), 'tags': []}))
     with ObjectStore.open(shared, read_only=True) as db:
@@ -203,11 +122,53 @@ def test_selectors_resolve_at_the_pins(shared):
         assert osi.resolve_selection(db, request)['surface'] == []
 
 
-def test_changed_normals_mark_links_stale(shared):
-    config = fit_config(shared, 'service')
-    inputs = osi.load_fit_inputs(config, log=lambda line: None)
-    none = osi.fiber_normal_source(config)
-    assert osi.stale_link_reasons(inputs.manifest, config, none) == []
-    lasagna = {'pool': '/cache/lasagna/run-1/normals_g4', 'scale': 4}
-    assert osi.stale_link_reasons(inputs.manifest, config, osi.fiber_normal_source(
-        config, lasagna)) == ['the fiber-patch normal source changed']
+
+# ---------------------------------------------------------------------------
+# Reads at pins use the numbered history of the pinned versions alone; a
+# position without versions reads the current state when it is the head,
+# else the versions live at the position's commit.
+# ---------------------------------------------------------------------------
+
+class Recording:
+    """A store whose reads of the state at a past commit (versions_at) are
+    counted; ``after_listing`` runs after each current-state listing (to
+    write while a read is in flight)."""
+
+    def __init__(self, store, after_listing=None):
+        self._store, self._after_listing = store, after_listing
+        self.history_reads = 0
+
+    def versions_at(self, *args, **kwargs):
+        self.history_reads += 1
+        return self._store.versions_at(*args, **kwargs)
+
+    def select_objects(self, *args, **kwargs):
+        rows = self._store.select_objects(*args, **kwargs)
+        if self._after_listing is not None:
+            self._after_listing()
+        return rows
+
+    def __getattr__(self, name):
+        return getattr(self._store, name)
+
+
+@pytest.mark.parametrize('during_read', [False, True])
+def test_a_position_overtaken_by_a_write_is_read_from_history(shared, during_read):
+    # Written before the read, or while it lists the current state (which
+    # then falls back to history).
+    prepared = prepare(shared)
+    request = pinned(shared, osi.InputPins(prepared.position))
+    near = names(shared)['near']
+    writes = []
+
+    def write():
+        if not writes:
+            writes.append(shared_edit(shared, lambda db: db.set_meta(near, 'review_note', 'later')))
+    if not during_read:
+        write()
+    with ObjectStore.open(shared, read_only=True) as db:
+        store = Recording(db, after_listing=write if during_read else None)
+        snapshot = osi.read_snapshot(store, request)
+        assert writes and store.history_reads > 0
+    assert 'review_note' not in snapshot.objects[near].meta
+    assert snapshot.request.pins.references == prepared.pins.references

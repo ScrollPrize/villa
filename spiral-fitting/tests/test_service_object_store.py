@@ -75,8 +75,6 @@ def test_binding_resolves_the_store_once_and_records_its_uuid(store_path, tmp_pa
         assert binding.generation == db.status()['generation']
     assert binding.location == str(Path(store_path).resolve()) and not binding.served
     assert binding.config() == {'object_store_location': binding.location,
-                                'object_store_author': 'svc',
-                                'object_store_link_timeout_s': 300,
                                 'object_store_input_position': None}
     assert spiral_service.bind_object_store(store_path).author.startswith('spiral-service@')
     garbage = tmp_path / 'garbage.vcobj'
@@ -107,11 +105,9 @@ def test_clients_cannot_choose_the_binding_or_host_input_paths(host, store_path,
     # values (an echoed session request) are not a choice.
     for request in (state.startup_session_request(),
                     {'run': {'z_begin': 0, 'z_end': 10, 'config': {
-                        **NO_DENSE, 'object_store_location': None,
-                        'object_store_author': 'spiral-test'}}}):
+                        **NO_DENSE, 'object_store_location': None}}}):
         paths, run, _, _ = state._prepare_session_request(with_project(request))
         assert run.config['object_store_location'] == state.object_store.location
-        assert run.config['object_store_author'] == 'spiral-test'
         assert not {'verified_patches', 'fibers', 'pcls'} & set(paths.manifest())
     # The winding-inference artifact is bound at launch, not named by a request.
     body = initialize_body()
@@ -130,8 +126,7 @@ def test_the_binding_wins_over_a_resumed_checkpoints_store(host, store_path,
     from spiral_runtime import InteractiveFitSession
 
     stored = Config().as_dict()
-    stored.update(object_store_location='/written/against/another.vcobj',
-                  object_store_author='someone-else')
+    stored.update(object_store_location='/written/against/another.vcobj')
     monkeypatch.setattr(checkpoint_io, 'load_checkpoint_cpu',
                         lambda path: {'cfg': copy.deepcopy(stored)})
     state = service(host, store_path)
@@ -150,7 +145,6 @@ def test_the_binding_wins_over_a_resumed_checkpoints_store(host, store_path,
     session._publish_status = lambda: None
     config = session._resolve_session_config(1)
     assert config['object_store_location'] == state.object_store.location
-    assert config['object_store_author'] == 'spiral-test'
 
 
 # ---------------------------------------------------------------------------
@@ -372,12 +366,11 @@ def test_bindings_advertise_the_store_and_its_selection(host, filled_store):
     assert {kind: entry['count'] for kind, entry in inputs['selection'].items()} == {
         'surface': 2, 'track': 0}
     assert inputs['selection']['surface']['scales'] == [[1.0, 1], [2.0, 1]]
-    assert inputs['relationships'] == {}
     by_name = {entry['name']: entry for entry in inputs['objects']}
     with ObjectStore.open(filled_store, read_only=True) as db:
         assert by_name['far']['geometry_revision'] == \
             db.current_geometry(by_name['far']['uuid'])['uuid']
-        # Discovery writes nothing: no refresh ran.
+        # Discovery writes nothing.
         assert db.status()['commit_sequence'] == status['commit_sequence']
     # It follows the store's changes, and reports a selection a fit refuses.
     assert state.startup_inputs() is state.startup_inputs()
@@ -625,7 +618,7 @@ def test_the_lasagna_dataset_is_the_projects(host, store_path):
         service(host, store_path).initialize, body({**lasagna, 'identity': 'run-1'}))
 
 
-def test_local_service_packs_before_linking_and_reuses_cache(host, store_path, tmp_path,
+def test_local_service_packs_before_pinning_and_reuses_cache(host, store_path, tmp_path,
                                                            monkeypatch):
     import numpy as np
     from test_sparse_cuda_cache import write_raw_pack_source
@@ -638,7 +631,7 @@ def test_local_service_packs_before_linking_and_reuses_cache(host, store_path, t
         path = tmp_path / channel
         write_raw_pack_source(path / '0', np.full((16, 16, 16), 128, dtype=np.uint8))
         lasagna[channel] = str(path)
-    body = initialize_body(loss_weight_dense_spacing=1) | {
+    body = initialize_body(loss_weight_dense_spacing=1, loss_weight_dense_normals=1) | {
         'project': project(lasagna=lasagna, lasagna_scale=2)}
     state = service(host, store_path, build_missing_lasagna_packs=True)
     original = osi.prepare_position
@@ -707,7 +700,7 @@ def test_a_service_packs_remote_arrays_as_it_packs_local_ones(host, store_path, 
 
     def built(dataset):
         _built(service(host, store_path, build_missing_lasagna_packs=True),
-               initialize_body(loss_weight_dense_spacing=1) | {
+               initialize_body(loss_weight_dense_spacing=1, loss_weight_dense_normals=1) | {
                    'project': project(lasagna=dataset, lasagna_scale=2)})
         return host.cache / 'lasagna' / dataset['identity']
     from_local, from_remote = built(local), built(remote)
@@ -722,30 +715,19 @@ def test_a_service_packs_remote_arrays_as_it_packs_local_ones(host, store_path, 
 @pytest.mark.parametrize('location, refused', [
     ('https://data.example/array', 'its objects cannot be listed'),
     ('/missing/array', 'not an accessible local array')])
-def test_pack_failure_preserves_resident_before_link_refresh(host, store_path,
+def test_pack_failure_preserves_resident_before_pinning(host, store_path,
                                                             monkeypatch, location, refused):
     import object_store_inputs as osi
     state = service(host, store_path, build_missing_lasagna_packs=True)
     resident = SimpleNamespace(status=lambda: {"state": SessionState.Idle})
     state.session = resident
-    monkeypatch.setattr(osi, 'prepare_position', lambda *a, **k: pytest.fail('must not link'))
+    monkeypatch.setattr(osi, 'prepare_position', lambda *a, **k: pytest.fail('must not pin'))
     lasagna = {'location': '/local.lasagna.json', 'identity': 'missing-test',
                'group': '0', 'normal_x': location, 'normal_y': location}
-    failure = _built(state, initialize_body() | {
+    failure = _built(state, initialize_body(loss_weight_dense_normals=1) | {
         'project': project(lasagna=lasagna, lasagna_scale=2)})
     assert refused in failure['message']
     assert state.session is resident
-
-
-def test_lasagna_pack_kinds_follow_the_resolved_config():
-    source = SimpleNamespace(stores={'normal_x': 'x', 'normal_y': 'y', 'gradient_magnitude': 'g'})
-    config = Config().as_dict()
-    kinds = spiral_service._lasagna_pack_kinds
-    assert kinds({**config, 'dense_spacing_mode': 'winding_model'}, source) == {'normals'}
-    assert kinds({**config, 'dense_spacing_mode': 'grad_mag'}, source) == {'normals', 'grad_mag'}
-    # Normals without their loss: still read by the link refresh.
-    assert kinds({**config, 'dense_spacing_mode': 'winding_model',
-                  'loss_weight_dense_normals': 0}, source) == {'normals'}
 
 
 def test_fiber_directions_are_the_project_datasets_cached_samples(host, store_path, tmp_path):

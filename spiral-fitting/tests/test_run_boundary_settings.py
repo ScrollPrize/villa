@@ -85,8 +85,6 @@ def test_fiber_direction_weight_needs_resident_samples():
 # --- frozen object-store inputs ---------------------------------------------------
 
 @pytest.mark.parametrize('key, value', [
-    ('pcl_patch_overlap_pair_spacing', 5.0),
-    ('pcl_patch_overlap_max_pairs', 3),
     ('patch_loss_z_margin', 2),
 ])
 def test_settings_shaping_the_frozen_inputs_are_refused(key, value):
@@ -113,7 +111,7 @@ def test_frozen_setting_rejects_lr_changes_without_mutating_optimizer(exponentia
 
     with pytest.raises(ValueError, match='object-store inputs are frozen'):
         context.apply_config({
-            'pcl_patch_overlap_pair_spacing': 5.0,
+            'patch_loss_z_margin': 2,
             'optimizer_learning_rate': 0.5,
             'optimizer_lr_final_factor': 0.2,
             'optimizer_num_training_steps': horizon_before + 100,

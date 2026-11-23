@@ -1,5 +1,5 @@
-"""Spiral on a store served by vc_object_server: the fit's inputs, link
-refresh, pins and commits through an endpoint (cases C3, C4, S3 and S5 of
+"""Spiral on a store served by vc_object_server: the fit's inputs, pins and
+commits through an endpoint (cases C3, C4, S3 and S5 of
 the store-location design), read as a store file gives them.
 
 Needs VC_OBJECT_SERVER naming a vc_object_server binary; skipped otherwise.
@@ -20,7 +20,7 @@ from vc_object_store import ObjectStore, object_reference  # noqa: E402
 
 import object_store_inputs as osi  # noqa: E402
 import spiral_service  # noqa: E402
-from object_store_fixture import edges, fit_config, head, names, write_walk_store  # noqa: E402
+from object_store_fixture import fit_config, head, names, write_walk_store  # noqa: E402
 
 SERVER = os.environ.get('VC_OBJECT_SERVER')
 pytestmark = [pytest.mark.skipif(not SERVER, reason='set VC_OBJECT_SERVER to a vc_object_server binary'),
@@ -58,10 +58,9 @@ def quiet(line):
 
 
 def prepare(location, config=None, cache=None, **options):
-    config = config or fit_config(location, 'service')
+    config = config or fit_config(location)
     with osi.open_store(config, cache_directory=cache) as store:
-        return osi.prepare_position(store, config, osi.request_from_config(config), log=quiet,
-                                    **options)
+        return osi.prepare_position(store, osi.request_from_config(config), **options)
 
 
 def set_meta(store, uuid, key, value, request='7b9d0c2e-5a1f-4f6b-9c3d-2e1f0a9b8c7d'):
@@ -77,8 +76,8 @@ def set_meta(store, uuid, key, value, request='7b9d0c2e-5a1f-4f6b-9c3d-2e1f0a9b8
 
 
 def read_at(location, pins):
-    config = fit_config(location, 'service')
-    with osi.open_store(config, read_only=True) as store:
+    config = fit_config(location)
+    with osi.open_store(config) as store:
         return osi.read_snapshot(store, dataclasses.replace(osi.request_from_config(config), pins=pins))
 
 
@@ -86,68 +85,50 @@ def read_at(location, pins):
 # C3: the fit's inputs through an endpoint
 # ---------------------------------------------------------------------------
 
-def test_links_and_pins_through_the_endpoint_as_through_the_file(served, tmp_path):
+def test_pins_through_the_endpoint_as_through_the_file(served, tmp_path):
     endpoint, path = served
     before = head(path)
     prepared = prepare(endpoint, cache=str(tmp_path / 'cache'))
-    # The link refresh ran on the server as one link_objects request and
-    # committed the links with the marker; the pins are at its commit.
-    assert prepared.head == before
-    assert prepared.position.commit_sequence == before + 1 == head(path)
-    assert len(edges(path)) == 1
+    # The pins are at the head; nothing is written.
+    assert prepared.head == prepared.position.commit_sequence == before == head(path)
     assert set(prepared.pins.references) == set(names(path).values())
-    assert any('links committed at commit' in line for line in prepared.lines)
-    # Served: one stage, no detector progress.
-    with osi.open_store(fit_config(endpoint, 'service'), read_only=True) as store:
+    with osi.open_store(fit_config(endpoint)) as store:
         assert osi.is_served(store)
-        marker = osi.read_link_marker(store)
-    assert marker['commit_sequence'] == prepared.position.commit_sequence
     # The pinned snapshot reads the same through the endpoint and the file.
     hosted = read_at(endpoint, prepared.pins)
     local = read_at(path, prepared.pins)
     assert hosted.digest() == local.digest()
     assert hosted.manifest()['store']['location'] == endpoint
     assert osi._compared(hosted.manifest())['objects'] == osi._compared(local.manifest())['objects']
-    # A rerun finds the links current and writes nothing.
     again = prepare(endpoint, cache=str(tmp_path / 'cache'))
-    assert again.position == prepared.position and head(path) == before + 1
+    assert again.position == prepared.position and head(path) == before
 
 
 def test_the_fit_loads_frozen_inputs_through_the_endpoint(served, tmp_path):
     endpoint, path = served
     cache = tmp_path / 'cache'
-    hosted = osi.load_fit_inputs(fit_config(endpoint, 'service'), log=quiet, cache_directory=str(cache))
+    hosted = osi.load_fit_inputs(fit_config(endpoint), log=quiet, cache_directory=str(cache))
     # The served store's persistent cache lives under the fit's cache.
     assert (cache / osi.HOSTED_CACHE_DIRECTORY).is_dir()
-    # The file beside the server opens read-only: the links are current, so
-    # a read of its head is the same frozen selection.
-    local = osi.load_fit_inputs(fit_config(path, 'service', object_store_refresh_links=False), log=quiet)
+    # The file beside the server opens read-only: a read of its head is the
+    # same frozen selection.
+    local = osi.load_fit_inputs(fit_config(path), log=quiet)
     assert hosted.digest == local.digest
     assert hosted.counts == local.counts
-    assert osi.input_summary(hosted)['fiber_patch_normals'] == {'kind': 'none', 'ct_volume': None}
     # The pins the fit froze read the same inputs again (a resume, a rank).
     pins = osi.InputPins.from_manifest(hosted.manifest)
     again = osi._compared(read_at(endpoint, pins).manifest())
     frozen = osi._compared(hosted.manifest)
-    assert again['objects'] == frozen['objects'] and again['relationships'] == frozen['relationships']
-
-
-def test_links_off_reads_the_head_without_writing(served, tmp_path):
-    endpoint, path = served
-    before = head(path)
-    prepared = prepare(endpoint, fit_config(endpoint, 'service', object_store_refresh_links=False))
-    assert prepared.position.commit_sequence == before == head(path)
-    assert edges(path) == []
-    assert prepared.pins.pinned
+    assert again['objects'] == frozen['objects']
 
 
 def test_a_position_alone_needs_its_versions_through_an_endpoint(served, tmp_path):
     endpoint, path = served
     prepared = prepare(endpoint)
-    config = fit_config(endpoint, 'service')
     walk = names(path)['walk']
     # The file is the server's: edits go through the endpoint.
-    with osi.open_store(config) as store:
+    from vc_object_store.locations import open_store
+    with open_store(endpoint, author='editor') as store:
         set_meta(store, walk, 'sampling_group', 'later')
     with pytest.raises(osi.ObjectStoreInputError, match='served store'):
         read_at(endpoint, osi.InputPins(prepared.position))
@@ -163,12 +144,9 @@ def test_a_served_file_refuses_writers_and_names_the_endpoint(served, tmp_path):
     endpoint, path = served
     with pytest.raises(spiral_service.ObjectStoreBindingError, match='served by vc_object_server'):
         spiral_service.bind_object_store(path, 'svc')
-    # The command-line fit's writable open (a link refresh) is refused too;
-    # a read-only open of the file still works beside the server.
-    with pytest.raises(Exception):
-        with osi.open_store(fit_config(path, 'fitter')):
-            pass
-    with osi.open_store(fit_config(path, 'fitter'), read_only=True) as store:
+    # The command-line fit's read-only open of the file works beside the
+    # server.
+    with osi.open_store(fit_config(path)) as store:
         assert store.status()['commit_sequence'] == head(path)
 
 
@@ -203,8 +181,7 @@ def test_the_service_binds_the_endpoint(served, host):
         status = db.status()
     assert binding.served and binding.location == endpoint
     assert binding.uuid == status['store'] and binding.generation == status['generation']
-    assert binding.config() == {'object_store_location': endpoint, 'object_store_author': 'spiral-test',
-                                'object_store_link_timeout_s': 7, 'object_store_input_position': None}
+    assert binding.config() == {'object_store_location': endpoint, 'object_store_input_position': None}
     assert binding.head() == (status['commit_sequence'], None)
     advertised = state.binding_advertisement()
     assert advertised['object_store'] == {
@@ -254,28 +231,6 @@ def test_commits_write_to_the_served_store(served, tmp_path):
         fit.state.close()
 
 
-def test_changed_relationship_kinds_are_read_in_one_selection(served, tmp_path):
-    """A served store tells the kinds of changed relationships in one
-    projected selection by UUID; one it no longer holds has none."""
-    endpoint, path = served
-    prepare(endpoint, cache=str(tmp_path / 'cache'))
-    linked = sorted(edge[0] for edge in edges(path))
-    absent = '5d0f6c1e-8d2a-4c57-9f10-6a5e4d3c2b1a'
-    with osi.open_store(fit_config(endpoint, 'service'), read_only=True) as store:
-        selections = []
-        select = store.select_edges
-
-        def recording(**query):
-            selections.append(query)
-            return select(**query)
-        store.select_edges = recording
-        store.edge = None  # never one edge at a time
-        kinds = osi._edge_kinds(store, sorted([*linked, absent]))
-    assert kinds == {uuid: 'same-surface' for uuid in linked} and len(linked) == 1
-    assert selections == [{'edge_uuids': sorted([*linked, absent]), 'include_retired': True,
-                           'fields': ['uuid', 'kind']}]
-
-
 def test_tracks_and_their_crossings_through_the_endpoint(tmp_path):
     """A fit computes the crossings of a served store's tracks as of a store
     file's: the tracks are read as objects, at their pinned versions."""
@@ -290,19 +245,19 @@ def test_tracks_and_their_crossings_through_the_endpoint(tmp_path):
             put_track(db, points, key, family)
     cache = tmp_path / 'cache'
     with serving(path, tmp_path) as endpoint:
-        hosted = osi.load_fit_inputs(fit_config(endpoint, 'service', input_use_tracks=True),
+        hosted = osi.load_fit_inputs(fit_config(endpoint, input_use_tracks=True),
                                      log=quiet, cache_directory=str(cache))
         # The service validates the track versions with the other inputs
         # and resolves their dataset; a second read (warm record cache)
         # asks it again.
-        again = osi.load_fit_inputs(fit_config(endpoint, 'service', input_use_tracks=True),
+        again = osi.load_fit_inputs(fit_config(endpoint, input_use_tracks=True),
                                     log=quiet, cache_directory=str(cache))
         assert again.digest == hosted.digest
         assert len({obj.dataset for obj in hosted.snapshot.objects_of('track')}) == 1
     assert hosted.counts['tracks'] == 3 and hosted.counts['track crossings'] == 2
     assert len(hosted.snapshot.objects_of('track')) == 3
     local = osi.load_fit_inputs(
-        fit_config(path, 'service', input_use_tracks=True, object_store_refresh_links=False),
+        fit_config(path, input_use_tracks=True),
         log=quiet, cache_directory=str(cache))
     assert hosted.digest == local.digest
     assert hosted.manifest['derived_inputs'] == local.manifest['derived_inputs']
@@ -325,7 +280,7 @@ def test_a_pinned_track_a_history_off_store_no_longer_retains_is_refused(tmp_pat
             points = np.tile(np.asarray(start), (31, 1))
             points[:, axis] += np.arange(31)
             tracks.append(put_track(db, points, key, family))
-    config = fit_config(path, 'service', input_use_tracks=True, object_store_refresh_links=False)
+    config = fit_config(path, input_use_tracks=True)
     with serving(path, tmp_path) as endpoint:
         config = dict(config, object_store_location=endpoint)
         with osi.open_store(config, cache_directory=str(tmp_path / 'cache')) as store:

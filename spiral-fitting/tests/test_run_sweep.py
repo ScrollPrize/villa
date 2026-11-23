@@ -14,7 +14,6 @@ def test_child_command_forwards_optional_wandb_group(tmp_path):
         "--config-folder", str(tmp_path / "configs"),
         "--sweep-config", str(tmp_path / "sweep.json"),
         "--wandb-group", "experiment",
-        "--object-store-author", "sweeper",
     ])
 
     command = run_sweep.child_command(
@@ -22,7 +21,6 @@ def test_child_command_forwards_optional_wandb_group(tmp_path):
 
     assert command[command.index("--wandb-group") + 1] == "experiment"
     assert command[command.index("--object-store") + 1] == str(tmp_path / "inputs.vcobj")
-    assert command[command.index("--object-store-author") + 1] == "sweeper"
 
 
 def test_sweep_parser_supports_opt_in_overwrite(tmp_path):

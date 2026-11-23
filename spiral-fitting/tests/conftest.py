@@ -29,7 +29,7 @@ def shared(tmp_path):
 @pytest.fixture()
 def device_stubs(monkeypatch):
     """Stub the CUDA-only stages of fit_spiral.FitContext and count the
-    object-store input loads (each one's ``object_store_refresh_links``)."""
+    object-store input loads (each one's ``object_store_location``)."""
     import fit_spiral
     import object_store_inputs as osi
     from cpu_service import stub_device_stages
@@ -42,7 +42,7 @@ def device_stubs(monkeypatch):
     load = osi.load_fit_inputs
 
     def counted(config, **kwargs):
-        loads.append(config['object_store_refresh_links'])
+        loads.append(config['object_store_location'])
         return load(config, **kwargs)
     monkeypatch.setattr(osi, 'load_fit_inputs', counted)
     return loads

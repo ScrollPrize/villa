@@ -21,7 +21,6 @@ import spiral_service  # noqa: E402
 from cpu_service import (  # noqa: E402
     RUN, request, service_bindings, settle, stub_device_stages, two_ranks,
     wait_until, write_inputs)
-from object_store_fixture import edges  # noqa: E402
 from service_project import with_project  # noqa: E402
 
 pytestmark = pytest.mark.usefixtures('cpu')
@@ -44,15 +43,13 @@ def test_the_runtime_reads_the_bound_store_and_reports_it(state, store_path,
     assert status['state'] == 'Idle', status['error']
     context = state.session._context
     assert context.config['object_store_location'] == state.object_store.location
-    assert context.config['object_store_author'] == 'svc'
-    assert device_stubs == [True]
-    assert len(edges(store_path)) == 1
+    assert len(device_stubs) == 1
     inputs = context.object_store_inputs
-    # The service linked and pinned a position of the shared store first
-    # (its lines are preparation events); the runtime read that position.
+    # The service pinned a position of the shared store first (its lines
+    # are preparation events); the runtime read that position.
     preparing = [event['text'] for event in state.events.read_after(0)['events']
                  if event.get('operation') == 'preparing_inputs']
-    assert any(line.startswith('link refresh patch_overlap: 1 created') for line in preparing)
+    assert any(line.startswith('pinning commit') for line in preparing)
     assert status['input_position']['source'] == 'prepared'
     # The adapter's report is in the status and in the event stream.
     report = status['input_report']
@@ -66,7 +63,6 @@ def test_the_runtime_reads_the_bound_store_and_reports_it(state, store_path,
     assert status['input_digest'] == inputs.digest
     summary = status['input_summary']
     assert summary['selection'] == {'surface': 3, 'track': 0}
-    assert summary['relationships'] == {'patch_overlap': 1}
     manifest = status['input_manifest']
     assert manifest['object_store_digest'] == inputs.digest
     assert not {'verified_patches', 'fibers', 'pcls'} & set(manifest)
@@ -128,17 +124,16 @@ def _rank_session(rank, world_size, rendezvous, root, config, results):
 
 
 def _two_rank_sessions(tmp_path, store, **overrides):
-    config = {**RUN, 'object_store_location': store, 'object_store_author': 'svc', **overrides}
+    config = {**RUN, 'object_store_location': store, **overrides}
     return two_ranks(_rank_session, tmp_path, str(write_inputs(tmp_path / 'inputs')), config)
 
 
-def test_two_rank_sessions_refresh_once_and_both_start(store_path, tmp_path):
+def test_two_rank_sessions_pin_once_and_both_start(store_path, tmp_path):
     first, second = _two_rank_sessions(tmp_path, store_path)
     assert first['state'] == second['state'] == 'Idle', (first, second)
-    assert len(edges(store_path)) == 1
-    # Rank 0 refreshed and reported; rank 1 only read the frozen inputs.
-    assert any('1 created' in line for line in first['report'])
-    assert not any('link refresh' in line for line in second['report'])
+    # Rank 0 pinned and reported; rank 1 only read the frozen inputs.
+    assert any(line.startswith('pinning commit') for line in first['report'])
+    assert not any(line.startswith('pinning commit') for line in second['report'])
 
 
 # ---------------------------------------------------------------------------
@@ -150,19 +145,19 @@ def test_a_model_rebuild_keeps_the_inputs_and_a_reload_rereads_them(
     state.initialize(with_project(request()))
     first = settle(state)['input_digest']
     context = state.session._context
-    inputs, linked = context.object_store_inputs, edges(store_path)
+    inputs = context.object_store_inputs
     walk = next(entry['uuid'] for entry in state.startup_inputs()['objects']
                 if entry['name'] == 'walk')
     with ObjectStore.open(store_path, author='editor') as db:
         db.set_meta(walk, 'source', {'spiral_patch_erode_cells': 2})
     # A model-stage rebuild keeps the frozen inputs: it neither rereads the
-    # store, refreshes links nor sees the edit.
+    # store nor sees the edit.
     response = state.rebuild(with_project(request(model_num_flow_stages=3)))
     assert (response['stage'], response['inputs']) == ('model', 'keep')
     assert settle(state)['input_digest'] == first
     assert state.session._context is context and context.object_store_inputs is inputs
     assert context.config['model_num_flow_stages'] == 3
-    assert device_stubs == [True] and edges(store_path) == linked
+    assert len(device_stubs) == 1
     response = state.rebuild(with_project({**request(), 'inputs': 'reload'}))
     assert (response['stage'], response['inputs']) == ('all', 'reload')
     reloaded = settle(state)
@@ -173,20 +168,19 @@ def test_a_model_rebuild_keeps_the_inputs_and_a_reload_rereads_them(
 
 
 def test_settings_that_shape_the_inputs_need_a_full_rebuild(state, device_stubs):
-    from config import OBJECT_STORE_PCL_KEYS, Config, rebuild_stage
-    for key in sorted(OBJECT_STORE_PCL_KEYS) + ['patch_loss_z_margin']:
-        assert rebuild_stage({key}) == 'all', key
+    from config import Config, rebuild_stage
+    assert rebuild_stage({'patch_loss_z_margin'}) == 'all'
     state.initialize(with_project(request()))
     status = settle(state)
     configuration = {**Config().as_dict(), **status['applied_config'],
-                     'pcl_patch_overlap_max_pairs': 9}
+                     'patch_loss_z_margin': 9}
     with pytest.raises(spiral_service.ApiError, match='requires rebuilding'):
         state.run({'iterations': 1, 'configuration': configuration,
                    'expected_session_revision': state.session_revision,
                    'dt_loss_schedule': {'enabled': False, 'last_fraction': 0.0}})
-    response = state.rebuild(with_project(request(pcl_patch_overlap_max_pairs=9)))
+    response = state.rebuild(with_project(request(patch_loss_z_margin=9)))
     assert (response['stage'], response['inputs']) == ('all', 'reload')
-    assert settle(state)['applied_config']['pcl_patch_overlap_max_pairs'] == 9
+    assert settle(state)['applied_config']['patch_loss_z_margin'] == 9
     assert len(device_stubs) == 2
 
 
@@ -240,41 +234,24 @@ def test_checkpoint_refusals_name_the_input_remedies(state, tmp_path, device_stu
 @pytest.fixture()
 def varied_store(tmp_path):
     """Every case the selection must agree on: patches at unit and
-    non-unit scales, and approved, pending, rejected and stale links."""
-    from object_store_fixture import VOLUME, array, frame, plane, put_patch
+    non-unit scales, one of them with a later geometry revision."""
+    from object_store_fixture import array, frame, plane, put_patch
     path = str(tmp_path / 'varied.vcobj')
     with ObjectStore.create(path, author='ingest', hostname='host') as db:
-        near = put_patch(db, plane(100.0), (0.25, 0.25), name='near')
-        beside = put_patch(db, plane(100.0, dx=8.0), (0.25, 0.25), name='beside')
-        third = put_patch(db, plane(100.0, dx=4.0), (0.25, 0.25), name='third')
+        put_patch(db, plane(100.0), (0.25, 0.25), name='near')
+        put_patch(db, plane(100.0, dx=8.0), (0.25, 0.25), name='beside')
+        put_patch(db, plane(100.0, dx=4.0), (0.25, 0.25), name='third')
         far = put_patch(db, plane(140.0), (0.25, 0.25), coordinates=frame(2), name='far',
                         tags=['far'])
         put_patch(db, plane(140.0, dx=8.0), (0.25, 0.25), name='far_beside', tags=['far'])
-        db.link_surface_overlaps(volume_uuid=VOLUME)
-        overlaps = {frozenset((edge['a'], edge['b'])): edge['uuid']
-                    for edge in db.edges_by_kind('same-surface')}
-        db.set_approval(overlaps[frozenset((near, beside))], 'approved')
-        db.set_approval(overlaps[frozenset((near, third))], 'rejected')
-        # Moving the far patch while keeping its links bound to the recorded
-        # geometry leaves the link to it stale.
         moved = {'kind': 'surface', 'attributes': {'scale': [0.125, 0.125]},
                  'arrays': [array('points', plane(141.0)[..., ::-1] * 2, '<f4')]}
-
-        def keep_recorded(edge):
-            edge = db.edge(edge['uuid'])
-            return {'edge_uuid': edge['uuid'],
-                    'expected_version': edge['version'],
-                    'action': 'keep_recorded',
-                    'a_revision': db.current_geometry(edge['a'])['uuid'],
-                    'b_revision': db.current_geometry(edge['b'])['uuid']}
-        db.put_geometry(far, moved, expected_version=db.current_version(far),
-                        edge_edits=[keep_recorded(edge) for edge in
-                                    db.affected_geometry_edges(far, moved)])
+        db.put_geometry(far, moved, expected_version=db.current_version(far))
     return path
 
 
 @pytest.mark.parametrize('selection', [
-    {'object_store_approved_links_only': True},
+    {},
     {'object_store_track_uuids': [], 'object_store_patch_tags': ['far']},
 ])
 def test_the_cli_and_the_service_freeze_the_same_inputs(varied_store, tmp_path,
@@ -285,7 +262,7 @@ def test_the_cli_and_the_service_freeze_the_same_inputs(varied_store, tmp_path,
     state = spiral_service.ServiceState(
         bindings=service_bindings(tmp_path),
         object_store=spiral_service.bind_object_store(varied_store, 'svc'))
-    config = {**RUN, 'object_store_refresh_links': False, **selection}
+    config = {**RUN, **selection}
     try:
         state.initialize(with_project(request(**config)))
         assert settle(state)['state'] == 'Idle', state.status()['error']
@@ -293,8 +270,7 @@ def test_the_cli_and_the_service_freeze_the_same_inputs(varied_store, tmp_path,
         umbilicus = str(tmp_path / 'cli-umbilicus.json')
         reference.write_umbilicus(umbilicus)
         cli = FitContext(
-            FitConfig({**reference.fit_config(), **config, 'object_store_location': varied_store,
-                       'object_store_author': 'cli'}),
+            FitConfig({**reference.fit_config(), **config, 'object_store_location': varied_store}),
             scroll=reference.scroll_spec(), paths=SpiralInputPaths(umbilicus=umbilicus),
             cache_dir=str(tmp_path / 'cli-cache'), out_base_dir=str(tmp_path / 'cli-out'),
             input_log=lambda line: None)
@@ -305,15 +281,11 @@ def test_the_cli_and_the_service_freeze_the_same_inputs(varied_store, tmp_path,
     assert served.object_store_inputs.counts == cli.object_store_inputs.counts
     assert len(served.verified_patches) == len(cli.verified_patches)
     manifest = served.object_store_inputs.manifest
-    excluded = manifest['excluded_relationships']
     scales = {entry['name']: entry['scale_factor'] for entry in manifest['objects']}
     assert scales['far'] == 2.0
     if 'object_store_patch_tags' in selection:
         # Explicit selectors select what they name, not everything.
         assert 'near' not in scales
         assert manifest['selection']['track']['count'] == 0
-        assert manifest['relationships'] == []
     else:
-        assert excluded['inapplicable'] == 1 and excluded['rejected'] == 1
-        assert excluded['pending (approved-only)'] == 1
-        assert len(manifest['relationships']) == 1
+        assert 'near' in scales
