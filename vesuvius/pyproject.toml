@@ -67,6 +67,7 @@ models = [
 
     # Data pipeline / I/O and compression
     "fastremap>=1.15",
+    "numcodecs>=0.15.1,<0.17",  # fiber_trace_3d route and stream imports decode Zstd-packed pages
     "opencv-python-headless>=4.11.0.86",
 ]
 # Rendering and geometry utilities
@@ -154,6 +155,7 @@ all = [
 
     # Data pipeline / I/O and compression
     "fastremap>=1.15",
+    "numcodecs>=0.15.1,<0.17",
 ]
 
 [project.urls]
