@@ -299,7 +299,9 @@ def _run_slabs(predictions_zarr_array, tracks_db, jobs, desc):
         _worker_array = None
 
 
-def extract_horizontal(predictions_zarr_array, tracks_db):
+def horizontal_jobs(predictions_zarr_array, tracks_db):
+    """(key, index, offset) jobs of the horizontal ribbons; ribbons too thin to have tracks are
+    written as empty at once."""
     z_limit = predictions_zarr_array.shape[0]
     jobs = []
     for z_chunk_min in range(z_min, z_max, z_chunk_stride_h):
@@ -314,7 +316,12 @@ def extract_horizontal(predictions_zarr_array, tracks_db):
                 tracks_db[key] = pickle.dumps([])
             continue
         jobs.append((key, slice(z_chunk_min, z_chunk_max), (z_chunk_min, 0, 0)))
-    _run_slabs(predictions_zarr_array, tracks_db, jobs, 'horizontal ribbons')
+    return jobs
+
+
+def extract_horizontal(predictions_zarr_array, tracks_db):
+    _run_slabs(predictions_zarr_array, tracks_db, horizontal_jobs(predictions_zarr_array, tracks_db),
+               'horizontal ribbons')
 
 
 def find_yx_range(predictions_zarr_array):
@@ -336,7 +343,9 @@ def find_yx_range(predictions_zarr_array):
     return min_yx, max_yx
 
 
-def extract_vertical(predictions_zarr_array, tracks_db, axis, min_yx, max_yx):
+def vertical_jobs(predictions_zarr_array, tracks_db, axis, min_yx, max_yx):
+    """(key, index, offset) jobs of the vertical slabs along ``axis``; slabs too thin to have
+    tracks are written as empty at once."""
     # axis='y': iterate over y, slicing zx slabs. axis='x': iterate over x, slicing zy slabs.
     # min_yx / max_yx / yx_stride_v and w are all in full-resolution units; the slab thickness
     # in full-res voxels is yx_chunk_thickness_v * downsample_factor.
@@ -358,7 +367,7 @@ def extract_vertical(predictions_zarr_array, tracks_db, axis, min_yx, max_yx):
     z_range_min = min(z_min, z_limit)
     z_range_max = min(z_max, z_limit)
     if z_range_max <= z_range_min:
-        return
+        return []
     shape_along = predictions_zarr_array.shape[axis_idx]
 
     jobs = []
@@ -377,6 +386,11 @@ def extract_vertical(predictions_zarr_array, tracks_db, axis, min_yx, max_yx):
             index = (slice(z_range_min, z_range_max), slice(None), slice(w, w_max))  # (z, y, t)
             offset_zyx = (z_range_min, 0, w)
         jobs.append((db_key, index, offset_zyx))
+    return jobs
+
+
+def extract_vertical(predictions_zarr_array, tracks_db, axis, min_yx, max_yx):
+    jobs = vertical_jobs(predictions_zarr_array, tracks_db, axis, min_yx, max_yx)
     _run_slabs(predictions_zarr_array, tracks_db, jobs, f'vertical {axis}-stride slabs')
 
 
@@ -405,18 +419,17 @@ def run_cpu(predictions_path, tracks_dbm_path):
 
     with dbm.open(tracks_dbm_path, 'c') as tracks_db:
 
-        print('extracting horizontal ribbons')
-        extract_horizontal(predictions_zarr_array, tracks_db)
-
         print('finding yx range for vertical passes')
         min_yx, max_yx = find_yx_range(predictions_zarr_array)
         print(f'  yx range (full-res): {min_yx} .. {max_yx}')
 
-        print('extracting vertical zx-plane tracks')
-        extract_vertical(predictions_zarr_array, tracks_db, axis='y', min_yx=min_yx, max_yx=max_yx)
-
-        print('extracting vertical zy-plane tracks')
-        extract_vertical(predictions_zarr_array, tracks_db, axis='x', min_yx=min_yx, max_yx=max_yx)
+        # All three passes go through one pool, so workers start once and no pass waits for
+        # the last slabs of the one before it. Keys are still written in pass order.
+        jobs = (horizontal_jobs(predictions_zarr_array, tracks_db)
+                + vertical_jobs(predictions_zarr_array, tracks_db, 'y', min_yx, max_yx)
+                + vertical_jobs(predictions_zarr_array, tracks_db, 'x', min_yx, max_yx))
+        print('extracting horizontal ribbons, then zx- and zy-plane slabs')
+        _run_slabs(predictions_zarr_array, tracks_db, jobs, 'slabs')
 
 
 def run_gpu(predictions_path, tracks_dbm_path, gpus=None):
