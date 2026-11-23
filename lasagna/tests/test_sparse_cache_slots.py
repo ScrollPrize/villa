@@ -76,3 +76,32 @@ def test_unloaded_chunks_sample_as_zero(tmp_path, device):
 	cache.prefetch(xyz, (0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
 	cache.sync()
 	assert float(cache.grid_sample(xyz, off, inv, diff=True).sum()) == pytest.approx(200.0)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_sync_between_forward_and_backward(tmp_path, device):
+	# anticipatory pulls prefetch and sync chunks after a differentiable sample and before its backward; the
+	# backward must still run and give the gradient it would have without the extra sync
+	values = np.random.default_rng(3).integers(0, 256, (70, 70, 70), dtype=np.uint8)
+	pts = np.random.default_rng(4).uniform(2, 30, (2, 5, 7, 3)).astype(np.float32)
+	far = np.random.default_rng(5).uniform(40, 66, (2, 5, 7, 3)).astype(np.float32)
+	off = torch.zeros(3, device=device)
+	inv = torch.ones(3, device=device)
+	grads = []
+	for extra_sync in (False, True):
+		cache = _cache(tmp_path / str(extra_sync), values, device)
+		xyz = torch.from_numpy(pts).to(device)
+		cache.prefetch(xyz, (0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
+		cache.sync()
+		slots_before = cache.n_slots
+		g = xyz.clone().requires_grad_(True)
+		out = cache.grid_sample(g, off, inv, diff=True)
+		if extra_sync:
+			# new chunks: the table gains entries and the pool fills (or grows) in place
+			cache.prefetch(torch.from_numpy(far).to(device), (0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
+			cache.sync()
+			assert cache.n_slots > slots_before
+		out.backward(torch.ones_like(out))
+		grads.append(g.grad.cpu())
+	assert float(grads[0].abs().max()) > 0.0
+	torch.testing.assert_close(grads[1], grads[0], rtol=0, atol=0)

@@ -191,8 +191,9 @@ kernel void sparse_bwd(device const int* table [[buffer(0)]],
 // dense (C, Z, Y, X) volume: each out-of-range corner reads as zero
 inline void dense_corners(device const uchar* vol, constant Dims& d, float3 p, thread float* f,
                           thread long* idx, thread bool* ok) {
-    // a non-finite or huge coordinate fails every range check below; its fractions are zeroed so no
-    // NaN weight meets a zero corner (CUDA's backward would return NaN there, the sparse kernels 0)
+    // a non-finite or huge coordinate samples as zero (fin masks every corner); its fractions are zeroed so no
+    // NaN weight meets a zero corner. CUDA's dense kernels differ for NaN: (int)NaN is 0 there, so its corners
+    // pass and the sample is NaN; the sparse kernels give 0 as here
     bool fin = isfinite(p.x) && isfinite(p.y) && isfinite(p.z)
             && fabs(p.x) < 1.0e9f && fabs(p.y) < 1.0e9f && fabs(p.z) < 1.0e9f;
     if (!fin) p = float3(0.0f);
@@ -409,12 +410,18 @@ class _SparseSampleDiff(torch.autograd.Function):
 		offset = _f3(offset, grid.device)
 		inv_scale = _f3(inv_scale, grid.device)
 		out = _sparse_fwd(table, pool, grid, offset, inv_scale, u8=False)
-		ctx.save_for_backward(table, pool, grid, offset, inv_scale)
+		# the cache writes its table and pool in place when a sync loads chunks, which may happen between this
+		# forward and its backward (anticipatory pulls); saved tensors would fail autograd's version check there.
+		# Kept as attributes, as the CUDA wrapper keeps its chunk table: slots are only appended, so every slot
+		# this forward read still holds the same chunk, and a grown pool leaves this reference intact
+		ctx.table, ctx.pool = table, pool
+		ctx.save_for_backward(grid, offset, inv_scale)
 		return out
 
 	@staticmethod
 	def backward(ctx, grad_output):
-		table, pool, grid, offset, inv_scale = ctx.saved_tensors
+		grid, offset, inv_scale = ctx.saved_tensors
+		table, pool = ctx.table, ctx.pool
 		C = int(pool.shape[1])
 		dims, n = _dims((*(int(v) for v in table.shape), C), grid)
 		grad_grid = torch.empty(*grid.shape, dtype=torch.float32, device=grid.device)

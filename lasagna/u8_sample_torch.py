@@ -123,8 +123,9 @@ def dense_sample(
 	D, H, W, _ = grid.shape
 	C, Z, Y, X = (int(v) for v in volume.shape)
 	p = _local_coords(grid if diff else grid.detach(), offset, inv_scale)
-	# CUDA's corner checks all fail for a non-finite point; zero it here so no NaN reaches the
-	# weights, where 0 * NaN would poison the backward pass
+	# a non-finite point samples as zero (masked below); its coordinates are zeroed so no NaN reaches the
+	# weights, where 0 * NaN would poison the backward pass. CUDA's dense kernels differ for NaN: (int)NaN is
+	# 0 there, so its corners pass and the sample is NaN
 	finite = torch.isfinite(p).all(dim=1)
 	p = torch.where(finite.unsqueeze(1), p, torch.zeros_like(p))
 	l0 = torch.floor(p.detach())
