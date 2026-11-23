@@ -61,6 +61,8 @@ def test_max_area_equal_cc3d(monkeypatch):
 
 def _run(out_dir, name, volume, **opts):
     pytest.importorskip('kimimaro')
+    # one slab at a time unless a test asks for workers: spawned workers would not see monkeypatches
+    opts = {'slab_workers': 1, **opts}
     out = str(Path(out_dir) / f'{name}.dbm')
     saved = {k: getattr(est, k) for k in ('z_min', 'z_max', *opts)}
     try:
@@ -138,3 +140,35 @@ def test_real_scroll_labels_equal_cc3d(axis):
     want = _reference_labels(slab)
     assert np.count_nonzero(want)
     np.testing.assert_array_equal(est.prepare_cc_labels(slab), want)
+
+
+def test_auto_slab_workers(monkeypatch):
+    # auto: one worker per CPU and per slab, as many as half of the RAM holds, and 1 when Kimimaro
+    # runs several processes per slab
+    monkeypatch.setattr(est, 'kimimaro_parallel', 1)
+    monkeypatch.setattr(est, 'z_min', 0)
+    monkeypatch.setattr(est, 'z_max', 1000)
+    monkeypatch.setattr(est, 'z_chunk_depth_h', 2)
+    monkeypatch.setattr(est.os, 'cpu_count', lambda: 14)
+    monkeypatch.setattr(est.os, 'process_cpu_count', lambda: 14, raising=False)
+    gib = 2**30
+    monkeypatch.setattr(est, '_physical_memory', lambda: 64 * gib)
+    assert est.auto_slab_workers((1000, 1000, 1000), 500) == 14
+    assert est.auto_slab_workers((1000, 1000, 1000), 3) == 3
+    # a 2 x 8000 x 8000 ribbon is the largest slab: 16 B a voxel and 256 MiB, about 2.2 GiB a worker
+    assert est.auto_slab_workers((1000, 8000, 8000), 500) == 14
+    monkeypatch.setattr(est, '_physical_memory', lambda: 16 * gib)
+    assert est.auto_slab_workers((1000, 8000, 8000), 500) == 3
+    monkeypatch.setattr(est, '_physical_memory', lambda: None)
+    assert est.auto_slab_workers((1000, 8000, 8000), 500) == 14
+    monkeypatch.setattr(est, 'kimimaro_parallel', 8)
+    assert est.auto_slab_workers((1000, 1000, 1000), 500) == 1
+
+
+def test_slab_workers_argument():
+    base = ['--predictions', 'p.zarr', '--out', 't.dbm', '--backend', 'cpu', '--kimimaro-parallel', '1']
+    assert est.parse_args(base).slab_workers == 'auto'
+    assert est.parse_args([*base, '--slab-workers', '3']).slab_workers == 3
+    assert est.parse_args([*base, '--predictions', 's3://b/p.zarr']).slab_workers == 1
+    with pytest.raises(SystemExit):
+        est.parse_args([*base, '--slab-workers', 'many'])
