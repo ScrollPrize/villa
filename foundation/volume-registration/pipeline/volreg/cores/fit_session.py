@@ -52,6 +52,7 @@ from .transform_io import (
     matrix_swap_xyz_zyx,
     points_swap_xyz_zyx,
     read_transform_json,
+    volume_name,
     write_transform_json,
 )
 from .volumes import open_volume_levels
@@ -1142,7 +1143,7 @@ class Session:
             raise ValueError("nothing has been fitted yet")
         with open(self.directory / record["transform"]) as handle:
             data = json.load(handle)
-        data["fixed_volume"] = data["fixed_volume"].rstrip("/").rsplit("/", 1)[-1]
+        data["fixed_volume"] = volume_name(data["fixed_volume"])
         if not affine_only:
             with open(out, "w") as handle:
                 json.dump(data, handle, indent=2)

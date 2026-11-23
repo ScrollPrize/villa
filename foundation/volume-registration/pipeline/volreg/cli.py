@@ -19,6 +19,8 @@ The reviewer is taken from --handle and --email, or VOLREG_HANDLE and VOLREG_EMA
 import argparse
 import json
 import os
+import re
+import shutil
 import sys
 from pathlib import Path
 
@@ -82,14 +84,24 @@ def show(pipeline):
         print(line)
 
 
+def in_uv_build_env(executable):
+    """Whether an interpreter lives in an environment `uv run --with-requirements` deletes
+    on exit: under uv's cache, in `builds-v<N>`, whichever separator the path uses."""
+    return re.search(r"[\\/]builds-v\d*[\\/]", str(executable)) is not None
+
+
 def python():
     """How a background job starts Python. `uv run --with-requirements` runs in an
     environment it deletes when it exits, so a job started from a `volreg run` that has
-    since finished would find no interpreter; such a job goes through `uv run` again."""
-    if "/uv/builds-v" not in sys.executable:
+    since finished would find no interpreter; such a job goes through `uv run` again (or, with
+    no uv to be found, the base interpreter the environment was made from)."""
+    if not in_uv_build_env(sys.executable):
         return [sys.executable]
+    uv = shutil.which("uv")
+    if uv is None:
+        return [getattr(sys, "_base_executable", None) or sys.executable]
     requirements = Path(__file__).resolve().parent.parent / "requirements.txt"
-    return ["uv", "run", "-q", "--python", f"{sys.version_info.major}.{sys.version_info.minor}",
+    return [uv, "run", "-q", "--python", f"{sys.version_info.major}.{sys.version_info.minor}",
             "--with-requirements", str(requirements), "python"]
 
 

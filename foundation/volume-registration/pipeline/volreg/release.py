@@ -33,6 +33,17 @@ def is_pipeline(record):
     return record.path("work").exists()
 
 
+def redone(record):
+    """Whether a pipeline record's published transform predates a redo: the store stage has
+    not finished since a redo of it or of anything it rests on. (A record with no redo in its
+    history, or one that is not the pipeline's, is as it was.)"""
+    if not is_pipeline(record):
+        return False
+    from . import stages   # not at the top: stages reads what this module reads
+    pipeline = stages.pipeline(record.directory)
+    return (pipeline.stamp("store") or {}).get("redo_mark", 0) < pipeline.redo_mark("store")
+
+
 def newness(record):
     """Order of the decisions of one pair: a pipeline record after a migrated one, then by
     the decision's time."""
@@ -99,6 +110,10 @@ def release(out, roots):
                     open_items = [item["text"] for item in final.get("revisit") or []
                                   if not item.get("done")]
                     pending[record.read(rec.PAIR)["pair"]] = (source, open_items)
+            elif redone(record):
+                left_out.append({"source": source, "pair": record.read(rec.PAIR)["pair"],
+                                 "why": "a redo came after its decision was stored; store it again"})
+                pending[record.read(rec.PAIR)["pair"]] = (source, ["store it again"])
             elif decision["publish"] == "nothing" or not record.exists(rec.TRANSFORM):
                 left_out.append({"source": source, "pair": record.read(rec.PAIR)["pair"],
                                  "why": "decided to publish nothing"})

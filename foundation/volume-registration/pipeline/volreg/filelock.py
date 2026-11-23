@@ -1,7 +1,9 @@
 """Blocking exclusive lock on an open file, and the file steps that differ on Windows.
 
 The lock lives as long as the handle: closing it releases the lock, which is
-what `fcntl.flock` did before this module existed.
+what `fcntl.flock` did before this module existed. `try_lock` is the same without
+waiting; a job's lock file is held that way for the job's whole life, so whoever can
+take it knows the job is gone.
 
 Windows also refuses to replace or delete a file while anyone has it open (Python
 opens files without delete sharing), and `os.kill(pid, 0)` is not a liveness check
@@ -21,28 +23,49 @@ except ImportError:  # Windows has no fcntl
     import msvcrt
 
 
+# Where a job's ownership lock sits on Windows: a byte far past anything written to the file,
+# since Windows byte locks are mandatory and would stop others reading the pid.
+OWNER_OFFSET = 2 ** 30
+
+
 def lock_exclusive(handle):
     if fcntl is not None:
         fcntl.flock(handle, fcntl.LOCK_EX)
         return
     # msvcrt locks one byte range and gives up after ~10 s (LK_LOCK); wait on
     # contention only, any other error is real and must surface.
-    handle.seek(0)
     while True:
-        try:
-            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        if try_lock(handle):
             return
+        time.sleep(0.05)
+
+
+def try_lock(handle, offset=0):
+    """Take the exclusive lock if nobody holds it, without waiting; whether it was taken.
+    `offset` is the byte that is locked on Windows (POSIX locks the whole file)."""
+    if fcntl is not None:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
         except OSError as exc:
-            if exc.errno not in (errno.EACCES, errno.EDEADLK):
+            if exc.errno not in (errno.EACCES, errno.EAGAIN):
                 raise
-            time.sleep(0.05)
+            return False
+    handle.seek(offset)
+    try:
+        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        return True
+    except OSError as exc:
+        if exc.errno not in (errno.EACCES, errno.EDEADLK):
+            raise
+        return False
 
 
-def unlock(handle):
+def unlock(handle, offset=0):
     if fcntl is not None:
         fcntl.flock(handle, fcntl.LOCK_UN)
         return
-    handle.seek(0)
+    handle.seek(offset)
     msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
 
 

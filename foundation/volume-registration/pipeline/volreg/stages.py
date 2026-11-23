@@ -18,6 +18,7 @@ from . import record as rec
 from . import render
 from .cores import fit_session as fs
 from .cores import session_overview
+from .cores.transform_io import volume_name
 from .engine import Pipeline, Stage
 from .scoring import BAR, bar_check, score
 
@@ -419,17 +420,19 @@ def run_store(pipeline, params):
     scores = json.loads(pipeline.work("scores.json").read_text())
     stamp = pipeline.stamp("fit") or {}
     if decision["publish"] == "nothing":
-        filelock.unlink(pipeline.record.path(rec.TRANSFORM), missing_ok=True)
-        pipeline.record.write(rec.FIT, fit | scores | {"code": stamp.get("code")})
+        with pipeline.publishing("store"):
+            filelock.unlink(pipeline.record.path(rec.TRANSFORM), missing_ok=True)
+            pipeline.record.write(rec.FIT, fit | scores | {"code": stamp.get("code")})
         return [rec.FIT]
     transform = json.loads(pipeline.work("fit", "transform.json").read_text())
     if decision["publish"] == "affine":
         transform = {key: value for key, value in transform.items() if key != "deformation"}
         if transform.get("schema_version") in ("1.2.0", "1.3.0"):
             transform["schema_version"] = "1.1.0" if transform.get("fit") else "1.0.0"
-    transform["fixed_volume"] = transform["fixed_volume"].rstrip("/").rsplit("/", 1)[-1]
-    pipeline.record.write(rec.TRANSFORM, transform)
-    pipeline.record.write(rec.FIT, fit | scores | {"code": stamp.get("code")})
+    transform["fixed_volume"] = volume_name(transform["fixed_volume"])
+    with pipeline.publishing("store"):
+        pipeline.record.write(rec.TRANSFORM, transform)
+        pipeline.record.write(rec.FIT, fit | scores | {"code": stamp.get("code")})
     return [rec.TRANSFORM, rec.FIT]
 
 

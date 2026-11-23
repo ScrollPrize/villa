@@ -56,6 +56,8 @@ EDITABLE = {"holdout": {"patches": "hold-out patches"},
             "blind": {"count": "patches in a round"}}
 # Settings that only extend what is there: a hold-out set, fit patches or a blind round
 # already drawn stays, so a smaller number would change nothing.
+# The lock a read-change-write of `params.json` is done under.
+SETTINGS_LOCK = ".settings.lock"
 GROW_ONLY = {("holdout", "patches"), ("fit", "patches"), ("blind", "count")}
 
 
@@ -120,21 +122,23 @@ class Reviews:
         allowed = EDITABLE.get(stage, {})
         if not values or set(values) - set(allowed):
             raise ValueError(f"{stage} has no setting {sorted(set(values) - set(allowed))}")
-        current = self.pipeline(name).stage_params(stage)
-        clean = {}
-        for key, value in values.items():
-            value = int(value)
-            if value < 1:
-                raise ValueError(f"{allowed[key]} must be at least 1")
-            if (stage, key) in GROW_ONLY and value < current[key]:
-                raise ValueError(f"{allowed[key]} can only grow: there are {current[key]} already")
-            clean[key] = value
         record = self.record(name)
-        params = record.read(pipeline_stages.PARAMS) if record.exists(pipeline_stages.PARAMS) else {}
-        params.pop("schema", None)
-        params.setdefault(stage, {}).update(clean)
-        record.write(pipeline_stages.PARAMS, params)
-        record.log("params", stage=stage, values=clean, by=self.reviewer)
+        # Read, check and write on the same current state: another save waits its turn.
+        with record.lock(SETTINGS_LOCK):
+            current = self.pipeline(name).stage_params(stage)
+            clean = {}
+            for key, value in values.items():
+                value = int(value)
+                if value < 1:
+                    raise ValueError(f"{allowed[key]} must be at least 1")
+                if (stage, key) in GROW_ONLY and value < current[key]:
+                    raise ValueError(f"{allowed[key]} can only grow: there are {current[key]} already")
+                clean[key] = value
+            params = record.read(pipeline_stages.PARAMS) if record.exists(pipeline_stages.PARAMS) else {}
+            params.pop("schema", None)
+            params.setdefault(stage, {}).update(clean)
+            record.write(pipeline_stages.PARAMS, params)
+            record.log("params", stage=stage, values=clean, by=self.reviewer)
         self.advance(name)
         return params
 
@@ -153,15 +157,16 @@ class Reviews:
 
     def more(self, name, holdout, fit):
         record = self.record(name)
-        params = record.read(pipeline_stages.PARAMS) if record.exists(pipeline_stages.PARAMS) else {}
-        params.pop("schema", None)
-        defaults = {stage.name: stage.params for stage in pipeline_stages.stages()}
-        for stage, extra in (("holdout", holdout), ("fit", fit)):
-            if extra:
-                current = params.get(stage, {}).get("patches", defaults[stage]["patches"])
-                params.setdefault(stage, {})["patches"] = current + int(extra)
-        record.write(pipeline_stages.PARAMS, params)
-        record.log("more", holdout=holdout, fit=fit, by=self.reviewer)
+        with record.lock(SETTINGS_LOCK):
+            params = record.read(pipeline_stages.PARAMS) if record.exists(pipeline_stages.PARAMS) else {}
+            params.pop("schema", None)
+            defaults = {stage.name: stage.params for stage in pipeline_stages.stages()}
+            for stage, extra in (("holdout", holdout), ("fit", fit)):
+                if extra:
+                    current = params.get(stage, {}).get("patches", defaults[stage]["patches"])
+                    params.setdefault(stage, {})["patches"] = current + int(extra)
+            record.write(pipeline_stages.PARAMS, params)
+            record.log("more", holdout=holdout, fit=fit, by=self.reviewer)
         return params
 
     # ------------------------------------------------------------------ the hold-out set

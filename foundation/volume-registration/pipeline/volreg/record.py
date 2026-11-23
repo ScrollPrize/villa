@@ -14,6 +14,7 @@ a file. Coordinates are ZYX level-0 voxels of their own volume, as in the cores.
 
 import json
 import os
+import tempfile
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -78,20 +79,29 @@ class Record:
         target.parent.mkdir(parents=True, exist_ok=True)
         if isinstance(data, dict) and name.endswith(".json") and name != TRANSFORM:
             data = {"schema": SCHEMA} | data
-        scratch = target.with_name(target.name + ".tmp")
-        with open(scratch, "w") as handle:
-            json.dump(data, handle, indent=1)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        filelock.replace(scratch, target)
+        # A scratch file of its own, so two writers never share one; it takes the mode the
+        # file has, or the usual one for a new file (mkstemp makes it private).
+        descriptor, scratch = tempfile.mkstemp(dir=target.parent, prefix=target.name + ".",
+                                               suffix=".tmp")
+        try:
+            with os.fdopen(descriptor, "w") as handle:
+                json.dump(data, handle, indent=1)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(scratch, (target.stat().st_mode & 0o777) if target.exists() else 0o644)
+            filelock.replace(scratch, target)
+        except BaseException:
+            filelock.unlink(scratch, missing_ok=True)
+            raise
 
     @contextmanager
-    def lock(self):
+    def lock(self, name=".lock"):
         """Held while a view (`holdout.json`, `final-review.json`) is rewritten from the
-        log, so a page and a job doing it at once cannot lose each other's answers."""
+        log, so a page and a job doing it at once cannot lose each other's answers. Another
+        `name` is another lock, for what is read, changed and written back (the settings)."""
         self.directory.mkdir(parents=True, exist_ok=True)
-        with open(self.directory / ".lock", "w") as handle:
+        with open(self.directory / name, "w") as handle:
             filelock.lock_exclusive(handle)
             try:
                 yield
