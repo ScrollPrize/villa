@@ -1,0 +1,544 @@
+"""Round 5 of the review: Store and Release coherence, and decisions bound to the fit and
+the completed round the reviewer saw.
+
+Each test opens with the requirement it checks, quoted from the review. Pauses are made
+with hooks put into the stage's own process; where the review ran Store in a process of its
+own, so do these tests (forked where the system can fork, spawned on Windows, where every
+worker sets up the stand-in stages itself)."""
+
+import builtins
+import json
+import shutil
+import threading
+import time
+import urllib.error
+import urllib.request
+from http.server import ThreadingHTTPServer
+from pathlib import Path
+
+import pytest
+
+from volreg import cli, engine, filelock, release
+from volreg import record as rec
+from volreg import stages as pipeline_stages
+from volreg.engine import DONE, FAILED
+from volreg.review.server import Reviews, handler_for
+
+from test_review_blockers import CONTEXT, REVIEWER
+import test_redo_release as fakes
+from test_redo_release import _fit_id, drain, new_pair, pick_all, released, released_transform
+
+BY = REVIEWER
+STORE_COHERENCE = ("Store must use the transform, metadata, and scores for one reviewed fit. Release "
+                   "must require a complete matching result and preserve eligibility for coherent "
+                   "legacy records.")
+DECISION_BINDING = ("A decision must apply to the fit and completed round shown to the reviewer, "
+                    "including when a page stays open across Redo.")
+WAIT = 30
+
+
+def install_fakes():
+    """The stand-in stages of test_redo_release, set without pytest's monkeypatch: what a
+    spawned worker does for itself."""
+    for name, fake in (("run_capture", fakes.fake_capture), ("run_holdout", fakes.fake_holdout),
+                       ("run_fit", fakes.fake_fit), ("run_recheck", fakes.fake_recheck),
+                       ("run_score", fakes.fake_score), ("run_blind", fakes.fake_blind)):
+        setattr(pipeline_stages, name, fake)
+
+
+@pytest.fixture
+def stand_ins(monkeypatch):
+    for name, fake in (("run_capture", fakes.fake_capture), ("run_holdout", fakes.fake_holdout),
+                       ("run_fit", fakes.fake_fit), ("run_recheck", fakes.fake_recheck),
+                       ("run_score", fakes.fake_score), ("run_blind", fakes.fake_blind)):
+        monkeypatch.setattr(pipeline_stages, name, fake)
+
+
+# ----------------------------------------------------------------------- the review page
+
+def page(directory):
+    """What the blind page shows: the round's id and, once every item is answered, its fit."""
+    shown = Reviews(directory.parent, BY, auto_advance=False).blind(directory.name)
+    return shown["round"]["id"], shown.get("fit") or (shown["round"].get("candidates") or [None])[0]
+
+
+def decide_shown(directory, publish, shown, reason=""):
+    """A decision sent the way the page sends it: for the round and fit it showed."""
+    round_id, fit_id = shown
+    reviews = Reviews(directory.parent, BY, auto_advance=False)
+    try:
+        return reviews.decide(directory.name, publish, reason, round_id=round_id, fit_id=fit_id)
+    except TypeError:                     # a server that takes no round or fit
+        return reviews.decide(directory.name, publish, reason)
+
+
+def decide(directory, publish):
+    pick_all(directory)
+    return decide_shown(directory, publish, page(directory))
+
+
+def stored_pair(root, name="a", pair="A", publish="bend"):
+    directory = new_pair(root, name, pair)
+    drain(directory)
+    decide(directory, publish)
+    pipeline = drain(directory)
+    assert pipeline.states()["store"] == DONE
+    return directory
+
+
+class Server:
+    """The review server on a free port, for what goes through HTTP."""
+
+    def __init__(self, root):
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler_for(Reviews(root, BY, auto_advance=False)))
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+
+    def post(self, path, body):
+        request = urllib.request.Request(f"http://127.0.0.1:{self.httpd.server_port}{path}",
+                                         data=json.dumps(body).encode(), method="POST",
+                                         headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(request, timeout=WAIT) as response:
+                return response.status, json.loads(response.read())
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read())
+
+    def close(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+@pytest.fixture
+def server(tmp_path):
+    root = tmp_path / "records"
+    root.mkdir()
+    running = Server(root)
+    yield running
+    running.close()
+
+
+# ------------------------------------------------------------------- pausing a worker
+
+def _wait_for(path, timeout=WAIT):
+    deadline = time.time() + timeout
+    while not Path(path).exists():
+        if time.time() > deadline:
+            raise AssertionError(f"{path} never appeared")
+        time.sleep(0.02)
+
+
+def _hold(held, go):
+    Path(held).write_text("held")
+    deadline = time.time() + WAIT
+    while not Path(go).exists() and time.time() < deadline:
+        time.sleep(0.02)
+
+
+def _store_paused_after_record_write(directory, count, held, go, out):
+    """Run Store with a pause after its `count`-th write of a file under the record's fit/."""
+    install_fakes()
+    directory = Path(directory)
+    real, seen = filelock.replace, [0]
+
+    def replace(source, target):
+        result = real(source, target)
+        if Path(target).parent == directory / "fit":
+            seen[0] += 1
+            if seen[0] == int(count):
+                _hold(held, go)
+        return result
+    filelock.replace = replace
+    stamp = pipeline_stages.pipeline(directory).run_stage("store")
+    Path(out).write_text(json.dumps({"status": stamp["status"], "error": stamp.get("error")}))
+
+
+def _store_paused_after_reading_fit(directory, held, go, out):
+    """Run Store with a pause right after it has read the fit's metadata (work/fit/fit.json)."""
+    install_fakes()
+    target = (Path(directory) / "work" / "fit" / "fit.json").resolve()
+    real_text, real_bytes, paused = Path.read_text, Path.read_bytes, [False]
+
+    def after(path):
+        if not paused[0] and Path(path).resolve() == target:
+            paused[0] = True
+            _hold(held, go)
+
+    def read_text(self, *args, **kwargs):
+        result = real_text(self, *args, **kwargs)
+        after(self)
+        return result
+
+    def read_bytes(self):
+        result = real_bytes(self)
+        after(self)
+        return result
+    Path.read_text, Path.read_bytes = read_text, read_bytes
+    stamp = pipeline_stages.pipeline(directory).run_stage("store")
+    Path(out).write_text(json.dumps({"status": stamp["status"], "error": stamp.get("error")}))
+
+
+def start_worker(target, *args):
+    worker = CONTEXT.Process(target=target, args=tuple(str(arg) for arg in args))
+    worker.start()
+    return worker
+
+
+def finish(worker, go, out):
+    Path(go).write_text("go")
+    worker.join(WAIT)
+    assert worker.exitcode == 0
+    return json.loads(Path(out).read_text())
+
+
+def assert_release_matches_its_decision(out, pair="A"):
+    """Whatever a release holds for a pair is one fit and one variant: the decision's."""
+    index = json.loads((out / "index.json").read_text())
+    for entry in index["pairs"]:
+        if entry["pair"] != pair:
+            continue
+        decision = entry["decision"]
+        fit = json.loads((out / pair / rec.FIT).read_text())
+        transform = json.loads((out / pair / rec.TRANSFORM).read_text())
+        assert fit["fit"] == decision["fit"]
+        assert transform["fit"] == decision["fit"]                 # the stand-in fit names itself
+        assert fit.get("under", decision["fit"]) == decision["fit"]   # so do its scores
+        assert ("deformation" in transform) == (decision["publish"] == "bend")
+
+
+# ===================================================== blocker 1: Store and Release coherence
+
+def test_a_new_fit_decided_but_not_yet_stored_is_not_released_with_the_old_fits_files(tmp_path, stand_ins):
+    """Store must use the transform, metadata, and scores for one reviewed fit. Release must
+    require a complete matching result and preserve eligibility for coherent legacy records.
+    (a) `more --fit`, approve f002, release before Store finishes."""
+    root = tmp_path / "records"
+    directory = stored_pair(root)                               # f001 stored, no redo
+    pipeline_stages.more(rec.Record(directory), 0, 5, BY)
+    drain(directory)                                            # f002 and its round
+    pick_all(directory)
+    decide_shown(directory, "bend", page(directory))            # f002 approved; store not run
+    assert _fit_id(pipeline_stages.pipeline(directory)) == "f002"
+    pairs, index = released(tmp_path, [root], "early")
+    assert_release_matches_its_decision(tmp_path / "out-early")
+    assert pairs == {} and [item for item in index["left_out"] if item["source"] == "records/a"]
+    drain(directory)
+    pairs, _index = released(tmp_path, [root], "stored")
+    assert pairs["A"]["decision"]["fit"] == "f002"
+    assert_release_matches_its_decision(tmp_path / "out-stored")
+
+
+def test_a_store_paused_between_its_writes_is_not_released_half_done(tmp_path, stand_ins):
+    """Store must use the transform, metadata, and scores for one reviewed fit. Release must
+    require a complete matching result and preserve eligibility for coherent legacy records.
+    (b) a bend-to-affine Store paused between its writes, released meanwhile."""
+    root = tmp_path / "records"
+    directory = stored_pair(root, publish="bend")
+    pick_all(directory)
+    decide_shown(directory, "affine", page(directory))
+    held, go, out = tmp_path / "held", tmp_path / "go", tmp_path / "out.json"
+    worker = start_worker(_store_paused_after_record_write, directory, 1, held, go, out)
+    try:
+        _wait_for(held)
+        pairs, index = released(tmp_path, [root], "paused")
+        assert_release_matches_its_decision(tmp_path / "out-paused")
+        assert pairs == {}
+    finally:
+        result = finish(worker, go, out)
+    assert result["status"] == "ok"
+    pairs, _index = released(tmp_path, [root], "after")
+    assert pairs["A"]["decision"]["publish"] == "affine"
+    assert "deformation" not in released_transform(tmp_path, "after")
+
+
+def test_a_store_paused_while_a_new_fit_is_scored_does_not_mix_the_two(tmp_path, stand_ins):
+    """Store must use the transform, metadata, and scores for one reviewed fit. Release must
+    require a complete matching result and preserve eligibility for coherent legacy records.
+    (c) Store paused after reading f001's metadata while a refit from `more --fit` scores f002."""
+    root = tmp_path / "records"
+    directory = stored_pair(root)
+    pipeline_stages.pipeline(directory).redo("store")           # store runs again under f001's decision
+    held, go, out = tmp_path / "held", tmp_path / "go", tmp_path / "out.json"
+    worker = start_worker(_store_paused_after_reading_fit, directory, held, go, out)
+    try:
+        _wait_for(held)
+        pipeline_stages.more(rec.Record(directory), 0, 5, BY)
+        drain(directory)                                         # f002 fitted, rechecked, scored
+        assert _fit_id(pipeline_stages.pipeline(directory)) == "f002"
+    finally:
+        result = finish(worker, go, out)
+    assert result["status"] != "ok"                              # nothing stamped as stored
+    stored = rec.Record(directory).read(rec.FIT)
+    transform = json.loads((directory / rec.TRANSFORM).read_text())
+    assert stored["fit"] == transform["fit"] == stored.get("under", stored["fit"])
+    released(tmp_path, [root], "mixed")
+    assert_release_matches_its_decision(tmp_path / "out-mixed")
+
+
+def test_a_metadata_write_that_fails_after_the_transform_is_not_released(tmp_path, stand_ins, monkeypatch):
+    """Store must use the transform, metadata, and scores for one reviewed fit. Release must
+    require a complete matching result and preserve eligibility for coherent legacy records.
+    (d) no Redo: the second of Store's writes fails, after the first replaced its file."""
+    root = tmp_path / "records"
+    directory = stored_pair(root, publish="bend")
+    pick_all(directory)
+    decide_shown(directory, "affine", page(directory))
+    real, seen = filelock.replace, [0]
+
+    def failing(source, target):
+        if Path(target).parent == directory / "fit":
+            seen[0] += 1
+            if seen[0] == 2:
+                raise PermissionError(13, "a reader has it open", str(target))
+        return real(source, target)
+    monkeypatch.setattr(filelock, "replace", failing)
+    stamp = pipeline_stages.pipeline(directory).run_stage("store")
+    monkeypatch.setattr(filelock, "replace", real)
+    assert stamp["status"] == "failed"
+    assert not pipeline_stages.pipeline(directory).redo_marks()["stages"]     # no redo anywhere
+    pairs, _index = released(tmp_path, [root], "torn")
+    assert_release_matches_its_decision(tmp_path / "out-torn")
+    assert pairs == {}
+
+
+def _as_main_stored_it(directory):
+    """Rewrite a stored pair as main's Store leaves it: fit.json is the fit, its scores and
+    the code, nothing else; the store stamp has no redo mark; there is no redo file."""
+    record = rec.Record(directory)
+    stored = record.read(rec.FIT)
+    work_fit = json.loads((directory / "work" / "fit" / "fit.json").read_text())
+    scores = json.loads((directory / "work" / "scores.json").read_text())
+    scores.pop("scored", None)
+    main = work_fit | scores | {"code": stored.get("code")}
+    main.pop("schema", None)
+    record.write(rec.FIT, main)
+    pipeline = pipeline_stages.pipeline(directory)
+    stamp = pipeline.stamp("store")
+    outputs = [rec.TRANSFORM, rec.FIT]
+    pipeline._write_stamp("store", {key: value for key, value in stamp.items() if key != "redo_mark"}
+                          | {"outputs": outputs, "output_digest": engine.digest_files(directory, outputs)})
+    redo = directory / "work" / "stages" / "redo.json"
+    if redo.exists():
+        redo.unlink()
+
+
+def test_a_legacy_record_whose_decision_changed_before_store_is_not_released_as_the_old_variant(tmp_path, stand_ins):
+    """Store must use the transform, metadata, and scores for one reviewed fit. Release must
+    require a complete matching result and preserve eligibility for coherent legacy records.
+    (e) a main-created record releases its old bend after the decision changed to affine."""
+    root = tmp_path / "records"
+    directory = stored_pair(root, publish="bend")
+    _as_main_stored_it(directory)
+    pairs, _index = released(tmp_path, [root], "legacy")
+    assert pairs["A"]["decision"]["publish"] == "bend"           # coherent legacy: still released
+    pick_all(directory)
+    decide_shown(directory, "affine", page(directory))          # store not run yet
+    pairs, index = released(tmp_path, [root], "changed")
+    assert_release_matches_its_decision(tmp_path / "out-changed")
+    assert pairs == {}
+    drain(directory)
+    pairs, _index = released(tmp_path, [root], "restored")
+    assert pairs["A"]["decision"]["publish"] == "affine"
+    assert "deformation" not in released_transform(tmp_path, "restored")
+
+
+def test_check_verifies_the_binding_not_just_the_score(tmp_path, stand_ins, capsys):
+    """Store must use the transform, metadata, and scores for one reviewed fit. Release must
+    require a complete matching result and preserve eligibility for coherent legacy records.
+    (`volreg check` passed in the one-voxel case because it recomputed the copied transform's
+    score: it must check that the parts belong together.)"""
+    root = tmp_path / "records"
+    directory = stored_pair(root, publish="affine")
+    _scorable(directory)
+    released(tmp_path, [root], "good")
+    out = tmp_path / "out-good"
+    assert cli.main(["check", str(out)]) == 0
+    tampered = tmp_path / "tampered"
+    shutil.copytree(out, tampered)
+    transform = json.loads((tampered / "A" / rec.TRANSFORM).read_text())
+    transform["fit"] = "f002"                                    # another fit, the same matrix
+    (tampered / "A" / rec.TRANSFORM).write_text(json.dumps(transform, indent=1) + "\n")
+    capsys.readouterr()
+    assert cli.main(["check", str(tampered)]) == 1
+    assert "f002" in capsys.readouterr().out
+
+
+def _scorable(directory):
+    """Give a stored stand-in pair a hold-out patch the scorer can place and stored scores it
+    agrees with, so `volreg check` can recompute them (the fake fit's affine is the identity)."""
+    from volreg.scoring import bar_check, score
+    record = rec.Record(directory)
+    held = record.read(rec.HOLDOUT)
+    for patch in held["patches"]:
+        patch |= {"centre_zyx": [0, 0, 0], "fine_zyx": [0.5, 0, 0]}
+    held.pop("schema", None)
+    record.write(rec.HOLDOUT, held)
+    stored = record.read(rec.FIT)
+    stored.pop("schema", None)
+    transform = record.read(rec.TRANSFORM)
+    for variant in ("bend", "affine"):
+        value = score(transform, held, True, 2.0, affine_only=True)
+        stored["scores"][variant] = value | {"bar": bar_check(value)}
+    stored_override = record.read(rec.FINAL_REVIEW)
+    assert stored_override["decision"]["publish"] == "affine"
+    record.write(rec.FIT, stored)
+    # The store's own record of what it wrote, so the redo check still sees its writes.
+    pipeline = pipeline_stages.pipeline(directory)
+    stamp = pipeline.stamp("store")
+    pipeline._write_stamp("store", stamp | {"output_digest": engine.digest_files(directory, stamp["outputs"])})
+    final = record.read(rec.FINAL_REVIEW)
+    final["decision"]["override"] = {"by": BY, "reason": "too few lines up", "bar_missed": ["enough"]}
+    final.pop("schema", None)
+    record.write(rec.FINAL_REVIEW, final)
+
+
+# ============================================================ blocker 2: decision binding
+
+def _decided_then_redone(root):
+    directory = stored_pair(root)
+    pick_all(directory)
+    shown = page(directory)                                     # the page as it was loaded
+    assert shown == ("c001", "f001")
+    pipeline_stages.pipeline(directory).redo("fit")
+    return directory, shown
+
+
+def test_a_page_left_open_across_redo_cannot_decide_while_the_new_fit_is_made(tmp_path, stand_ins):
+    """A decision must apply to the fit and completed round shown to the reviewer, including
+    when a page stays open across Redo. (The fit is being made again.)"""
+    directory, shown = _decided_then_redone(tmp_path / "records")
+    with pytest.raises(ValueError):
+        decide_shown(directory, "affine", shown)
+    assert rec.Record(directory).read(rec.FINAL_REVIEW)["decision"]["publish"] == "bend"
+
+
+def test_a_page_left_open_across_redo_cannot_approve_the_new_fit(tmp_path, stand_ins):
+    """A decision must apply to the fit and completed round shown to the reviewer, including
+    when a page stays open across Redo. (f002 written while f001's round is the latest
+    answered one; then f002's round drawn and left unanswered.)"""
+    root = tmp_path / "records"
+    directory, shown = _decided_then_redone(root)
+    pipeline = pipeline_stages.pipeline(directory)
+    pipeline.run_stage("fit")                                   # f002 is written; no new round yet
+    assert _fit_id(pipeline) == "f002"
+    with pytest.raises(ValueError):
+        decide_shown(directory, "bend", shown)
+    drain(directory)                                            # f002's round, unanswered
+    with pytest.raises(ValueError):
+        decide_shown(directory, "bend", shown)
+    decision = rec.Record(directory).read(rec.FINAL_REVIEW)["decision"]
+    assert decision["fit"] == "f001"
+    pipeline = drain(directory)
+    assert pipeline.states()["store"] != DONE or rec.Record(directory).read(rec.FIT)["fit"] == "f001"
+    pairs, _index = released(tmp_path, [root], "unanswered")
+    assert "A" not in pairs or pairs["A"]["decision"]["fit"] == "f001"
+
+
+def test_an_old_round_sent_over_http_is_refused_with_a_conflict(tmp_path, stand_ins, server):
+    """A decision must apply to the fit and completed round shown to the reviewer, including
+    when a page stays open across Redo. (The old round's id sent through the endpoint after
+    the new round is complete.)"""
+    root = tmp_path / "records"
+    directory = stored_pair(root)
+    pipeline_stages.pipeline(directory).redo("fit")
+    drain(directory)
+    pick_all(directory)                                          # c002, f002's round, complete
+    assert page(directory) == ("c002", "f002")
+    for body in ({"round": "c001", "fit": "f001"}, {"round": "c001", "fit": "f002"},
+                 {"round": "c002", "fit": "f001"}, {}):
+        status, reply = server.post("/api/pairs/a/decide", {"publish": "affine", "reason": ""} | body)
+        assert status == 409, (body, status, reply)
+        assert "reload" in reply["error"]
+    assert rec.Record(directory).read(rec.FINAL_REVIEW)["decision"]["fit"] == "f001"
+    status, reply = server.post("/api/pairs/a/decide", {"publish": "affine", "reason": "",
+                                                        "round": "c002", "fit": "f002"})
+    assert status == 200, reply
+    decision = rec.Record(directory).read(rec.FINAL_REVIEW)["decision"]
+    assert (decision["fit"], decision["publish"], decision.get("round")) == ("f002", "affine", "c002")
+
+
+def test_an_unanswered_round_is_refused_over_http(tmp_path, stand_ins, server):
+    """A decision must apply to the fit and completed round shown to the reviewer, including
+    when a page stays open across Redo. (A round with an unanswered item is not complete.)"""
+    directory = new_pair(tmp_path / "records")
+    drain(directory)
+    status, reply = server.post("/api/pairs/a/decide", {"publish": "bend", "reason": "",
+                                                        "round": "c001", "fit": "f001"})
+    assert status == 409 and "round" in reply["error"]
+    assert not rec.Record(directory).read(rec.FINAL_REVIEW).get("decision")
+
+
+def test_the_blind_page_sends_the_round_and_fit_it_shows():
+    """A decision must apply to the fit and completed round shown to the reviewer, including
+    when a page stays open across Redo. (What the page sends.)"""
+    page_source = (Path(pipeline_stages.__file__).parent / "review" / "blind.html").read_text()
+    call = page_source[page_source.index("/decide`"):]
+    call = call[:call.index("})")]
+    assert "round: state.round.id" in call and "fit: state.fit" in call
+
+
+def test_the_blind_api_names_the_fit_of_a_completed_round(tmp_path, stand_ins):
+    """A decision must apply to the fit and completed round shown to the reviewer, including
+    when a page stays open across Redo. (The page has the fit to send.)"""
+    directory = new_pair(tmp_path / "records")
+    drain(directory)
+    shown = Reviews(directory.parent, BY, auto_advance=False).blind(directory.name)
+    assert shown.get("fit") is None                              # not before the round is done
+    pick_all(directory)
+    shown = Reviews(directory.parent, BY, auto_advance=False).blind(directory.name)
+    assert shown["fit"] == "f001" and shown["round"]["id"] == "c001"
+
+
+def _redo_in_another_process(directory, done):
+    install_fakes()
+    pipeline_stages.pipeline(directory).redo("fit")
+    Path(done).write_text(str(time.time()))
+
+
+def test_no_redo_can_come_between_a_decisions_check_and_its_write(tmp_path, stand_ins, monkeypatch):
+    """A decision must apply to the fit and completed round shown to the reviewer, including
+    when a page stays open across Redo. (The check is made under the lock the write is made
+    under: a Redo waits for both.)"""
+    root = tmp_path / "records"
+    directory = new_pair(root)
+    drain(directory)
+    pick_all(directory)
+    shown = page(directory)
+    held, go, done = tmp_path / "held", tmp_path / "go", tmp_path / "done"
+    real = rec.Record.log
+
+    def paused(self, kind, **fields):
+        if kind == "decision":
+            _hold(held, go)
+        return real(self, kind, **fields)
+    monkeypatch.setattr(rec.Record, "log", paused)
+    deciding = threading.Thread(target=decide_shown, args=(directory, "bend", shown))
+    deciding.start()
+    _wait_for(held)
+    redo = start_worker(_redo_in_another_process, directory, done)
+    time.sleep(1.0)
+    redone_while_deciding = done.exists()
+    Path(go).write_text("go")
+    deciding.join(WAIT)
+    redo.join(WAIT)
+    assert not redone_while_deciding
+    kinds = [event["kind"] for event in rec.Record(directory).events() if event["kind"] in ("decision", "redo")]
+    assert kinds == ["decision", "redo"]
+
+
+# ============================================== non-blocking: status of a read-only copy
+
+def test_status_reads_a_pipeline_whose_stage_lock_cannot_be_opened_for_writing(tmp_path, stand_ins, monkeypatch, capsys):
+    """`volreg status` on a readable pipeline copy with a read-only stage lock lists its
+    status, as main does, instead of raising PermissionError."""
+    root = tmp_path / "records"
+    directory = stored_pair(root)
+    real = builtins.open
+
+    def read_only(file, mode="r", *args, **kwargs):
+        if str(file).endswith(".lock") and any(flag in mode for flag in "wa+"):
+            raise PermissionError(13, "read-only", str(file))
+        return real(file, mode, *args, **kwargs)
+    monkeypatch.setattr(builtins, "open", read_only)
+    cli.main(["status", str(root)])
+    assert "finished" in capsys.readouterr().out
