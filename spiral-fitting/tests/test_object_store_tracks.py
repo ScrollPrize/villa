@@ -1011,12 +1011,11 @@ def test_the_link_refresh_links_no_tracks(tmp_path):
     with ObjectStore.open(path, author='service') as store:
         snapshot = osi.read_snapshot(store, osi.request_from_config(config))
         assert len(snapshot.objects_of('track')) == 6
-        planned = osi.link_plan(snapshot, config, osi.NormalSource('none'))
-        assert osi.link_marker_selection(snapshot).keys() == {'surface', 'point_collection', 'fiber'}
-    assert [outcome.detector for outcome in planned.outcomes] == [
-        'pcl_patch', 'fiber_patch', 'patch_overlap']
+        planned = osi.link_plan(snapshot, config)
+        assert osi.link_marker_selection(snapshot).keys() == {'surface'}
+    assert [outcome.detector for outcome in planned.outcomes] == ['patch_overlap']
     steps = planned.plan['detectors']
-    assert [step['detector'] for step in steps] == ['point-collection-surface', 'surface-overlap']
+    assert [step['detector'] for step in steps] == ['surface-overlap']
     assert 'track' not in str(steps)
     prepared, mode = _prepare(path)
     assert mode == 'full'
@@ -1025,10 +1024,8 @@ def test_the_link_refresh_links_no_tracks(tmp_path):
         assert db.edges_by_kind('crossing') == []
     assert marker['version'] == osi.LINK_MARKER_VERSION == 3
     assert 'track' not in marker['selection']
-    assert sorted(marker['key_parts']['detectors']) == [
-        'fiber-surface', 'point-collection-surface', 'surface-overlap']
-    assert [step['detector'] for step in marker['detectors']] == [
-        'point-collection-surface', 'surface-overlap']
+    assert sorted(marker['key_parts']['detectors']) == ['surface-overlap']
+    assert [step['detector'] for step in marker['detectors']] == ['surface-overlap']
     assert len(prepared.pins.selection['track']) == 6
 
 
@@ -1058,7 +1055,7 @@ def _link_tracks(db):
 
 
 def _approve_link(db):
-    db.set_approval(db.edges_by_kind('point-surface')[0]['uuid'], 'approved')
+    db.set_approval(db.edges_by_kind('same-surface')[0]['uuid'], 'approved')
 
 
 def test_tracks_and_crossing_links_do_not_stale_the_links(tmp_path):
@@ -1154,7 +1151,7 @@ def test_a_fit_prepares_store_tracks_with_their_crossings(db, tmp_path):
     from fit_spiral import FitContext
     from tracks import PackedTrackCollection, prepare_main_phase_tracks
 
-    write_reference_store(db, reference.load_reference(), fibers=False)
+    write_reference_store(db)
     _lattice(db, z=40)
     config = reference.fit_config()
     # The tracks toggle selects them (by tag when given), and none when off.

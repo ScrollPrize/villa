@@ -28,23 +28,17 @@ _ENUMS = {
 }
 
 _NULL_TYPES = {
-    "pcl_sampling_weights": "dictionary",
     "patch_sampling_name_weights": "dictionary",
     "object_store_patch_exclude_uuids": "strings",
     "track_length_bin_weights": "vector",
     "track_max_tortuosity": "number",
     "loss_start_track_dt": "integer",
-    "loss_start_unattached_pcl_dt": "integer",
     "object_store_location": "string",
     "object_store_author": "string",
     "object_store_link_timeout_s": "integer",
     "object_store_input_position": "mapping",
     "object_store_patch_uuids": "strings",
     "object_store_patch_tags": "strings",
-    "object_store_pcl_uuids": "strings",
-    "object_store_pcl_tags": "strings",
-    "object_store_fiber_uuids": "strings",
-    "object_store_fiber_tags": "strings",
     "object_store_track_uuids": "strings",
     "object_store_track_tags": "strings",
     "object_store_normal_ct_path": "string",
@@ -82,9 +76,6 @@ SHELL_ATLAS_KEYS = frozenset({
 _SCALE_WITH_Z_FIELDS = {
     "sample_count_patches_per_step",
     "sample_count_patches_per_step_for_dt",
-    "sample_count_relative_winding_pcls",
-    "sample_count_absolute_winding_pcls",
-    "sample_count_unattached_pcls_per_step",
     "sample_count_tracks_per_step",
     "sample_count_dense_normal_points",
     "sample_count_fiber_direction_points",
@@ -98,7 +89,7 @@ _SCALE_WITH_Z_FIELDS = {
 
 # z_begin/z_end are deliberately heavyweight settings, always classified as
 # new-fit settings so nothing treats them as cheap run-boundary knobs:
-#   - host input filtering: patches, PCLs, unattached strips, and tracks are
+#   - host input filtering: patches and tracks are
 #     loaded/kept only where they intersect [z_begin, z_end);
 #   - dense-store coverage: the Lasagna normal/grad-mag brick pools are
 #     materialised for exactly this z window;
@@ -115,12 +106,7 @@ _Z_RANGE_KEYS = frozenset({"z_begin", "z_end"})
 _INPUT_TOGGLE_KEYS = frozenset({
     "input_use_verified_patches",
     "input_use_tracks",
-    "input_use_fibers",
     "input_use_fiber_directions",
-    "input_use_pcl_absolute",
-    "input_use_pcl_relative",
-    "input_use_pcl_same_winding",
-    "input_use_pcl_drawn_control_points",
     "input_use_patch_overlaps",
     "input_use_normals",
     "input_use_gradient_magnitude",
@@ -256,27 +242,12 @@ _INPUT_GATE_KEYS = _INPUT_TOGGLE_KEYS | {
     "input_disable_patches",
 }
 
-# pcl_ settings that shape the frozen object-store inputs: the startup link
-# refresh (object_store_inputs.refresh_links), materialization and the point
-# views derived from them. A resident fit cannot re-derive them; they are a
+# pcl_ settings that shape the frozen object-store inputs (patch-overlap
+# materialization). A resident fit cannot re-derive them; they are a
 # rebuild, and FitContext.apply_config refuses them.
 OBJECT_STORE_PCL_KEYS = frozenset({
-    "pcl_link_distance_tolerance",
-    "pcl_link_window_points",
-    "pcl_link_window_min_points",
-    "pcl_fiber_min_point_spacing",
     "pcl_patch_overlap_pair_spacing",
     "pcl_patch_overlap_max_pairs",
-    "pcl_use_fiber_links",
-    "pcl_unattached_pcl_min_point_spacing",
-})
-
-_RUN_MUTABLE_PCL_KEYS = frozenset({
-    "pcl_vertical_fiber_radial_offset_enabled",
-    "pcl_vertical_fiber_radial_offset_voxels",
-    "pcl_rel_winding_adjacent_patches_only",
-    "pcl_stratified_pcl_sampling",
-    "pcl_sampling_weights",
 })
 
 # The object-store input selection and frames decide what host preparation
@@ -293,10 +264,6 @@ OBJECT_STORE_INPUT_KEYS = frozenset({
     "object_store_patch_uuids",
     "object_store_patch_tags",
     "object_store_patch_exclude_uuids",
-    "object_store_pcl_uuids",
-    "object_store_pcl_tags",
-    "object_store_fiber_uuids",
-    "object_store_fiber_tags",
     "object_store_track_uuids",
     "object_store_track_tags",
     "object_store_normal_ct_path",
@@ -315,8 +282,7 @@ NEW_FIT_KEYS = frozenset(
     | _INPUT_GATE_KEYS
     | _PREPARED_INPUT_FIELDS
     | {"optimizer_random_seed", "track_inner_exclusion_radius",
-       "pcl_vertical_fiber_min_auto_certainty",
-       "pcl_vertical_fiber_min_z_fraction", "spiral_outward_sense"}
+       "spiral_outward_sense"}
 )
 
 _AUDITED_PREFIXES = ("model_", "input_", "pcl_", "object_store_")
@@ -325,7 +291,7 @@ _AUDITED_PREFIXES = ("model_", "input_", "pcl_", "object_store_")
 def _runtime_impact(key):
     if key in NEW_FIT_KEYS:
         return "new_fit"
-    if key in _RUN_MUTABLE_MODEL_KEYS or key in _RUN_MUTABLE_PCL_KEYS:
+    if key in _RUN_MUTABLE_MODEL_KEYS:
         return "run_boundary"
     if key.startswith(_AUDITED_PREFIXES):
         return "new_fit"
@@ -338,7 +304,7 @@ def unaudited_prefixed_keys(keys):
     Such a key is reported as "new_fit" by construction; this exists so the
     tests (and anyone adding a setting) can see the omission explicitly.
     """
-    tables = NEW_FIT_KEYS | _RUN_MUTABLE_MODEL_KEYS | _RUN_MUTABLE_PCL_KEYS
+    tables = NEW_FIT_KEYS | _RUN_MUTABLE_MODEL_KEYS
     return sorted(key for key in keys
                   if key.startswith(_AUDITED_PREFIXES) and key not in tables)
 
@@ -407,8 +373,6 @@ def _field_spec(key, default):
                     "output_num_slices_for_visualization",
                     "theta_crossing_map_update_interval",
                     "dt_target_update_interval",
-                    "pcl_link_window_points",
-                    "pcl_link_window_min_points",
                     "pcl_patch_overlap_max_pairs",
                 } else 0),
             maximum=(1_000_000 if key == "output_num_slices_for_visualization"
@@ -487,9 +451,8 @@ class Config:
         self.model_gap_expander_softplus_bias = 4.0
         self.model_linear_z_resolution = 48
         self.model_initial_dr_per_winding = 16.0
-        # Patch/PCL theta=0 topology is transformed only on this cadence. Patch
-        # samples use cached node potentials; generic PCL/track walks gather
-        # cached signed crossings.
+        # Patch theta=0 topology is transformed only on this cadence. Patch
+        # samples use cached node potentials.
         self.theta_crossing_map_update_interval = 100
         self.patch_radius_loss_margin = 0.025
         self.patch_radius_loss_inv = False
@@ -501,12 +464,6 @@ class Config:
         self.sample_count_patches_per_step = 360
         self.sample_count_patches_per_step_for_dt = 240
         self.sample_count_points_per_patch = 800
-        self.sample_count_relative_winding_pcls = 48
-        self.sample_count_relative_winding_patch_pairs_per_pcl = 4
-        self.sample_count_absolute_winding_pcls = 48
-        self.sample_count_absolute_winding_points_per_pcl = 4
-        self.sample_count_unattached_pcls_per_step = 84
-        self.sample_count_unattached_pcl_points_per_step = 32
         self.sample_count_tracks_per_step = 48000
         self.sample_count_track_points_per_step = 96
         self.sample_count_dense_normal_points = 60000
@@ -534,12 +491,7 @@ class Config:
         # re-enabling a source restores its previous tuning.
         self.input_use_verified_patches = True
         self.input_use_tracks = False
-        self.input_use_fibers = True
         self.input_use_fiber_directions = False
-        self.input_use_pcl_absolute = True
-        self.input_use_pcl_relative = True
-        self.input_use_pcl_same_winding = True
-        self.input_use_pcl_drawn_control_points = True
         # Patch-overlap links: refreshed by the store's overlap detector and
         # materialized as same-surface point pairs. Off skips both.
         self.input_use_patch_overlaps = True
@@ -548,30 +500,6 @@ class Config:
         self.input_use_winding_inference = True
         self.input_use_outer_shell = True
         self.input_disable_patches = False
-        self.pcl_rel_winding_adjacent_patches_only = True
-        self.pcl_stratified_pcl_sampling = True
-        self.pcl_sampling_weights = None
-        self.pcl_fiber_min_point_spacing = 40.0
-        self.pcl_unattached_pcl_min_point_spacing = 16.0
-        # The object store's point-surface link detector, run by the startup
-        # link refresh (object_store_inputs.refresh_links; see
-        # descriptions.json): a point attaches to a patch surface within this
-        # many reference-volume voxels; window_min_points > 1 additionally
-        # requires that many of a centred window of window_points consecutive
-        # points to lie within tolerance of a candidate before it is eligible.
-        self.pcl_link_distance_tolerance = 2.5
-        self.pcl_link_window_points = 1
-        self.pcl_link_window_min_points = 1
-        # Cross-fiber links (the store's fiber_branch relationships):
-        # same-winding continuations between fibers, or adjacent-winding
-        # links between an H and a V fiber (the V one winding inside). When
-        # on, linked fibers
-        # merge into per-component cross-patch pcls with an explicit fiber
-        # graph (winding ties propagate through junctions whether or not the
-        # junction points attach to patches), and the unattached-strip loss
-        # samples chain walks that hop fibers at junctions. Pending branches
-        # are used unless object_store_approved_links_only.
-        self.pcl_use_fiber_links = True
         # Object-store patch overlaps become same-surface point pairs sampled
         # this many reference-volume voxels apart, at most max_pairs per edge
         # (object_store_inputs.materialize_patch_overlaps). Each edge weighs
@@ -579,29 +507,6 @@ class Config:
         # it yields.
         self.pcl_patch_overlap_pair_spacing = 8.0
         self.pcl_patch_overlap_max_pairs = 16
-        # Vertical/horizontal classification of fiber strips, used for radial
-        # offsets. VC3D's manual tag wins, then its automatic
-        # tag when the recorded certainty (0..1) reaches the threshold, then a
-        # geometric fallback: a strip whose z extent is at least this fraction
-        # of its path length is vertical.
-        self.pcl_vertical_fiber_min_z_fraction = 0.8
-        self.pcl_vertical_fiber_min_auto_certainty = 0.5
-        # Vertical fibers lie on the back face of the papyrus sheet (the face
-        # away from the umbilicus), a few voxels off the horizontal-fiber
-        # front face the fit targets, along the sheet normal in the
-        # increasing-winding direction of the fitted spiral (the scan-space
-        # winding gradient, not the line to the umbilicus). When enabled,
-        # vertical strips' radius and DT targets sit this many scroll voxels
-        # along that normal outside the winding instead of on it (positive =
-        # increasing winding), so a vertical fiber is satisfied where it
-        # physically is. The
-        # distance is physical: it is converted to spiral radius per point by
-        # the transform's local stretch along the normal (and, after a
-        # constraint bake, by the frozen stack's accumulated stretch), not
-        # applied as a constant in spiral space. Horizontal strips are
-        # untouched.
-        self.pcl_vertical_fiber_radial_offset_enabled = False
-        self.pcl_vertical_fiber_radial_offset_voxels = 4.0
         self.track_min_sample_spacing = 20.0
         self.track_max_sample_spacing = 60.0
         self.track_length_bin_weights = [0.0, 0.15, 0.85]
@@ -628,14 +533,6 @@ class Config:
         self.loss_weight_dense_spacing_density = 12.0
         self.loss_weight_patch_radius = 8.0
         self.loss_weight_patch_dt = 4.0
-        self.loss_weight_rel_winding = 5.0
-        self.loss_weight_abs_winding = 5.0
-        self.loss_weight_unattached_pcl_radius = 2.0
-        self.loss_weight_unattached_pcl_dt = 4.0
-        # Probability of hopping onto the linked fiber at each junction while
-        # sampling a chain walk through a link component in the
-        # unattached-strip loss.
-        self.loss_fiber_link_branch_probability = 0.5
         self.loss_weight_track_radius = 50.0
         self.loss_weight_track_dt = 10.0
         self.loss_weight_sym_dirichlet = 10.0
@@ -652,9 +549,6 @@ class Config:
         self.optimizer_weight_decay_flow_field = 0.0
         self.loss_start_patch_dt = 25000
         self.loss_start_track_dt = 25000
-        # First iteration after which the unattached-PCL (fiber strip) DT snap
-        # acts. None follows loss_start_patch_dt, the historical coupling.
-        self.loss_start_unattached_pcl_dt = None
         self.dt_target_mode = "strip_median"
         self.dt_target_floating_threshold = 0.25
         # Backward-compatible alias. FitContext phase-locks whole-object DT
@@ -674,10 +568,9 @@ class Config:
         self.shell_min_confidence = 0.25
         self.output_save_png_visualizations = False
         self.output_num_slices_for_visualization = 20
-        # Patches, fibers, point collections and tracks come from one
-        # vc_object_store database (object_store_inputs.load_fit_inputs).
-        # Startup refreshes the store's automatic PCL-patch, fiber-patch and
-        # patch-overlap links, writing them back as
+        # Patches and tracks come from one vc_object_store database
+        # (object_store_inputs.load_fit_inputs). Startup refreshes the
+        # store's automatic patch-overlap links, writing them back as
         # object_store_author, unless refresh_links is off; approved_links_only
         # consumes only approved relationships. Track crossings are computed
         # by the fit from the selected tracks, not read from the store. A checkpoint resumes only
@@ -709,12 +602,8 @@ class Config:
         self.object_store_patch_uuids = None
         self.object_store_patch_tags = None
         # Selected patches left out of the fit entirely (e.g. an evaluation
-        # hold-out): no draws, attachments, overlaps or trusted geometry.
+        # hold-out): no draws, overlaps or trusted geometry.
         self.object_store_patch_exclude_uuids = None
-        self.object_store_pcl_uuids = None
-        self.object_store_pcl_tags = None
-        self.object_store_fiber_uuids = None
-        self.object_store_fiber_tags = None
         self.object_store_track_uuids = None
         self.object_store_track_tags = None
         # CT structure-tensor normals for fiber-patch link refresh when the fit

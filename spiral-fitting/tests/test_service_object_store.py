@@ -335,20 +335,15 @@ def test_release_during_construction_closes_the_installed_fitter(host, store_pat
 
 @pytest.fixture()
 def filled_store(tmp_path):
-    """Two patches, an absolute PCL attached to one, a fiber at scale 2."""
+    """Two patches, the far one at scale 2."""
     import numpy as np
-    from object_store_fixture import (frame, pcl_patch_edge, put_fiber,
-                                      put_patch, put_pcl)
+    from object_store_fixture import frame, put_patch
     path = tmp_path / 'filled.vcobj'
     rows, cols = np.mgrid[:6, :6]
     grid = np.stack([10.0 + rows, np.full(rows.shape, 50.0), 20.0 + cols], -1)
     with ObjectStore.create(str(path), author='ingest', hostname='host') as db:
-        near = put_patch(db, grid, name='near')
-        put_patch(db, grid + [0, 30, 0], name='far')
-        pcl = put_pcl(db, {7: ([11, 50, 21], 3.0)}, absolute=True, name='abs')
-        pcl_patch_edge(db, pcl, 7, near, (1.0, 1.0))
-        put_fiber(db, [[10, 40, 20], [12, 40, 22], [14, 40, 24]], [0, 2],
-                  coordinates=frame(2), name='fiber')
+        put_patch(db, grid, name='near')
+        put_patch(db, grid + [0, 30, 0], coordinates=frame(2), name='far')
     return str(path)
 
 
@@ -375,16 +370,15 @@ def test_bindings_advertise_the_store_and_its_selection(host, filled_store):
     inputs = advertised['inputs']
     assert inputs['ok'] and inputs['volume_uuid'] == VOLUME
     assert {kind: entry['count'] for kind, entry in inputs['selection'].items()} == {
-        'surface': 2, 'point_collection': 1, 'fiber': 1, 'track': 0}
-    assert inputs['selection']['fiber']['scales'] == [[2.0, 1]]
-    assert inputs['relationships'] == {'pcl_patch': 1}
+        'surface': 2, 'track': 0}
+    assert inputs['selection']['surface']['scales'] == [[1.0, 1], [2.0, 1]]
+    assert inputs['relationships'] == {}
     by_name = {entry['name']: entry for entry in inputs['objects']}
-    assert by_name['abs']['pcl_role'] == 'absolute' and 'pcl_role' not in by_name['near']
     with ObjectStore.open(filled_store, read_only=True) as db:
-        assert by_name['fiber']['geometry_revision'] == \
-            db.current_geometry(by_name['fiber']['uuid'])['uuid']
+        assert by_name['far']['geometry_revision'] == \
+            db.current_geometry(by_name['far']['uuid'])['uuid']
         # Discovery writes nothing: no refresh ran.
-        assert len(db.edges_by_kind('point-surface')) == 1
+        assert db.status()['commit_sequence'] == status['commit_sequence']
     # It follows the store's changes, and reports a selection a fit refuses.
     assert state.startup_inputs() is state.startup_inputs()
     with ObjectStore.open(filled_store, author='editor') as db:

@@ -1084,8 +1084,8 @@ class ServiceState:
     def startup_inputs(self, *, wait=True, head=None):
         """What the launch configuration selects from the bound store.
 
-        Patches, PCLs and fibers with their revision pins, labels, frames
-        and metadata PCL roles, plus counts, consumed relationship families,
+        Patches and tracks with their revision pins, labels and frames,
+        plus counts, consumed relationship families,
         exclusions and the fit volume (object_store_inputs.snapshot_summary).
         Read-only: no link refresh, no materialization and no Torch. The
         result is reused until the store's files change.
@@ -2100,7 +2100,7 @@ class ServiceState:
                 with self.object_store.open(cache_directory=paths.cache_directory) as store:
                     prepared = prepare_position(
                         store, config, request, lasagna=lasagna,
-                        minimum=minimum, cache_directory=paths.cache_directory, log=log,
+                        minimum=minimum, log=log,
                         incremental=incremental, progress=progress)
                     if not volume:
                         return prepared

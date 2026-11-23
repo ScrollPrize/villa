@@ -27,7 +27,6 @@ def test_excluded_patches_are_left_out_of_the_fit(store_path):
         store_path, object_store_patch_exclude_uuids=[near]), log=lambda _: None)
     assert near in kept.patches and near not in inputs.patches
     assert inputs.counts['patches excluded'] == 1
-    assert inputs.counts['pcl attachments'] < kept.counts['pcl attachments']
 
 
 def test_tracks_with_both_endpoints_inside_the_core_are_dropped():

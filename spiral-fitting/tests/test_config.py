@@ -54,10 +54,8 @@ def test_input_participation_toggles_are_rebuild_scoped_booleans():
     catalog = Config.catalog()
     expected = {
         "input_use_verified_patches",
-        "input_use_tracks", "input_use_fibers",
-        "input_use_fiber_directions", "input_use_pcl_absolute",
-        "input_use_pcl_relative", "input_use_pcl_same_winding",
-        "input_use_pcl_drawn_control_points", "input_use_patch_overlaps",
+        "input_use_tracks",
+        "input_use_fiber_directions", "input_use_patch_overlaps",
         "input_use_normals",
         "input_use_gradient_magnitude",
         "input_use_winding_inference", "input_use_outer_shell",
@@ -75,8 +73,8 @@ def test_input_participation_toggles_are_rebuild_scoped_booleans():
         assert catalog["schema"]["fields"][key]["runtime_impact"] == "new_fit", key
         assert catalog["schema"]["fields"][key]["description"]
     assert rebuild_stage(["model_num_flow_stages",
-                          "input_use_pcl_same_winding"]) == "all"
-    assert rebuild_stage(["input_use_pcl_absolute"]) == "all"
+                          "input_use_tracks"]) == "all"
+    assert rebuild_stage(["input_use_patch_overlaps"]) == "all"
 
 
 def test_z_range_is_advertised_as_owned_by_the_run_controls():
@@ -134,24 +132,14 @@ def test_interactive_runtime_impacts_match_resident_capabilities():
                    "track_exclusion_radius",
                })
     # Settings that shape the frozen object-store inputs (link refresh,
-    # materialization, point views) are a rebuild; these only reweight or
-    # re-target the retained views.
-    run_mutable_pcl = {
-        "pcl_vertical_fiber_radial_offset_enabled", "pcl_vertical_fiber_radial_offset_voxels",
-        "pcl_rel_winding_adjacent_patches_only",
-        "pcl_stratified_pcl_sampling", "pcl_sampling_weights",
-    }
+    # materialization) are a rebuild.
     for key, field in fields.items():
         if key.startswith("pcl_"):
-            expected = "run_boundary" if key in run_mutable_pcl else "new_fit"
-            assert field["runtime_impact"] == expected, key
+            assert field["runtime_impact"] == "new_fit", key
         # input_ keys are participation gates and a rebuild.
         if key.startswith("input_"):
             assert field["runtime_impact"] == "new_fit", key
     assert unaudited_prefixed_keys(fields) == []
-
-    # The vertical-fiber radial offset is refilled onto retained strips at a
-    # Run boundary; every other pcl_ setting shapes prepared inputs.
 
 def test_rebuild_stage_is_model_only_for_the_allowlist():
     assert rebuild_stage([]) == "model"
@@ -196,12 +184,9 @@ def test_no_allowlisted_key_is_named_while_loading_host_inputs():
     source = "".join(inspect.getsource(member) for member in (
         context.load_host_inputs,
         context._load_object_store_inputs,
-        context._derive_object_store_point_inputs,
         context._prepare_patch_sampling_cache,
-        context._rebuild_pcl_sampling_strata,
         object_store_inputs.load_fit_inputs,
         object_store_inputs.materialize_from_config,
-        object_store_inputs.derive_point_views,
     ))
     # The positive control: both keys the audit disqualified are named here,
     # so a scan that stops matching fails rather than silently passing.

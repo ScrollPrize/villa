@@ -15,7 +15,7 @@ those from a matching native object-store build.
 
 | Input | Command-line fit | Service fit |
 | --- | --- | --- |
-| Patches, PCLs, fibers, tracks and their relationships | `--object-store` | Service's bound store |
+| Patches, tracks and their relationships | `--object-store` | Service's bound store |
 | Outer shell | Store surface tagged `spiral-outer-shell` | Same |
 | Scroll facts and umbilicus | `--inputs` manifest's `scroll` and `umbilicus` | VC3D project |
 | Lasagna fields | Manifest's `lasagna.manifest` and the cache; missing packs may be built | Project-selected dataset; packs must already be cached |
@@ -26,7 +26,7 @@ those from a matching native object-store build.
    tracks, first run `python convert_track_store.py /data/scroll/tracks/input.dbm`,
    then ingest that DBM with its packed mirror using `vc_object_ingest --tracks`.
    Existing stores need only the track ingest, not another import of their
-   patches/PCLs/fibers. Frames declare stored coordinates per reference-volume
+   patches. Frames declare stored coordinates per reference-volume
    voxel; use the real scale for each source. Fits do not read DBMs,
    `.vctracks` directories or `.crossings.npz` sidecars after ingest.
 2. For CLI use, write an input manifest naming the fit volume, its facts
@@ -162,7 +162,7 @@ pass each (default 256, oldest evicted first).
 by path; nothing is discovered in a dataset directory and no filename is
 inferred. Relative paths resolve against the manifest's own directory, so a
 fit runs the same from any working directory; files may have any names and
-live anywhere. Geometry (patches, PCLs, fibers, tracks and the outer shell)
+live anywhere. Geometry (patches, tracks and the outer shell)
 is read from `--object-store` only and has no manifest entry. A service
 session takes the scroll's facts and inputs from the VC3D project and its own
 launch bindings instead; see
@@ -309,12 +309,12 @@ Migrating a dataset directory: write a manifest beside it naming its
 
 ## Object-store inputs
 
-`fit_spiral.py` reads patches, fibers, point collections (PCLs) and tracks,
-and the relationships between them, from a `vc_object_store` database
-(`object_store_inputs.py`). It never reads patch directories, fiber JSONs,
-PCL documents or track databases, and never links points to patches itself:
+`fit_spiral.py` reads patches and tracks, and the relationships between
+them, from a `vc_object_store` database (`object_store_inputs.py`). It never
+reads patch directories or track databases, and never links patches itself:
 the store's detectors do. Track crossings are the exception: the fit computes
-them from the selected tracks. The other inputs (umbilicus,
+them from the selected tracks. Point collections and fibers in the store are
+not read. The other inputs (umbilicus,
 lasagna normal/gradient stores, fiber directions, winding inference) are
 named by the input manifest (`--inputs`; see "Input manifest").
 
@@ -327,19 +327,13 @@ coordinates = reference-volume voxels × the scale factor), and VC3D-era files
 need identities derived from one UUID namespace per dataset
 (`--derive-uuids`; generate it once, record it with the dataset, and reuse
 it, so the same files always map to the same objects). For the conventional
-Spiral layout, where patches and PCLs are in fit-volume voxels and version-3
-fibers without `coordinate_base_shape_zyx` are at 4× that scale, that is two
-runs, one per frame:
+Spiral layout, where patches are in fit-volume voxels:
 
 ```sh
 NS=<dataset uuid namespace>   # e.g. python3 -c 'import uuid; print(uuid.uuid4())', once
 ingest="vc_object_ingest --db dataset.vcobj --author $USER --derive-uuids $NS --volume-uuid VOLUME"
 patches=(); for p in dataset/verified_patches/*/; do patches+=(--surface "$p"); done
-$ingest --scale-factor 1 --renumber-point-ids "${patches[@]}" \
-    --point-collections dataset/abs_winding.json \
-    --point-collections dataset/relative_windings.json \
-    --point-collections dataset/same_windings.json
-$ingest --scale-factor 4 --drop-dangling-branches --fiber dataset/fibers
+$ingest --scale-factor 1 "${patches[@]}"
 $ingest --scale-factor 1 --tag spiral-outer-shell --surface dataset/outer_shell
 python convert_track_store.py dataset/tracks/2um_ds2_ps256_surf_v2.dbm
 $ingest --scale-factor S --tracks dataset/tracks/2um_ds2_ps256_surf_v2.dbm
@@ -347,28 +341,17 @@ $ingest --scale-factor S --tracks dataset/tracks/2um_ds2_ps256_surf_v2.dbm
 
 `VOLUME` names the reference volume (its catalog `metadata.json` id, or any
 stable name such as `s1-reference`); the fit infers it from the objects, and
-the input manifest's `volume_uuid` must name the same one. Fibers
-declaring `coordinate_base_shape_zyx` need the scale that domain implies
-instead of 4. Tracks are read from the DBM's packed `.vctracks` mirror (see
-"Packing large track databases"); `S` is their stored voxels per fit-volume
-voxel (1 when they were extracted from the fit volume itself). The two repair
-flags handle the 2026-10 Spiral dataset's defects
-(branches to fiber files that do not exist; `same_windings.json` collections
-that each number their points from 0) and are recorded on the objects.
+the input manifest's `volume_uuid` must name the same one. Tracks are read
+from the DBM's packed `.vctracks` mirror (see "Packing large track
+databases"); `S` is their stored voxels per fit-volume voxel (1 when they were
+extracted from the fit volume itself).
 
-What the ingest covers: tifxyz patches (`--surface`, one directory each,
-stored as kind `surface`), the outer shell (a tifxyz surface tagged
-`spiral-outer-shell`), the PCL role documents, and the fiber directory with
-its same-winding and adjacent-winding branches
-(which become `fiber_branch` relationships; the fit ties an adjacent branch's
-V fiber one winding inside its H fiber, and leaves out one whose fibers are
-not one H and one V), and tracks (`--tracks`, one object per track, keyed by
-its packed store and source ID). A collection is absolute-winding when its
-`meta.source.winding_is_absolute` is true, which the ingest sets for a
-document named `abs_winding.json`; otherwise its points' `wind_a` annotations
-make it relative, and none make it same-winding. `patch-overlap-pcls.json` is
-not ingested: the store's overlap detector replaces it. Ingest is not repeated
-to update a store; edit objects through the store's API instead.
+What the fit reads of an ingest: tifxyz patches (`--surface`, one directory
+each, stored as kind `surface`), the outer shell (a tifxyz surface tagged
+`spiral-outer-shell`) and tracks (`--tracks`, one object per track, keyed by
+its packed store and source ID). `patch-overlap-pcls.json` is not ingested:
+the store's overlap detector replaces it. Ingest is not repeated to update a
+store; edit objects through the store's API instead.
 
 ### Running a fit
 
@@ -390,10 +373,10 @@ FIT_SPIRAL_CONFIG_OVERRIDES='{"z_begin": 9000, "z_end": 9100}' \
 then `spiral-fit` if neither is set to a nonempty value. Pass it explicitly to
 override that identity. The service keeps its `spiral-service@<host>` default.
 
-At startup rank 0 resolves the selection (`object_store_{patch,pcl,fiber,track}_{uuids,tags}`;
+At startup rank 0 resolves the selection (`object_store_{patch,track}_{uuids,tags}`;
 unset selects every active object, an empty list none; `input_use_*` toggles
 off select none), validates every selected object's frame, then refreshes the
-PCL-patch, fiber-patch and patch-overlap links as
+patch-overlap links as
 `--object-store-author`,
 writing them back to the store. Tracks are not linked: the store's
 `track-track` detector is not run and no `crossing` relationship is written. Detectors whose object kinds are not all
@@ -410,15 +393,14 @@ links' own commit (two concurrent refreshes conflict): the position, the fit
 volume, the link parameters, normal source and detector versions, and the
 selection. The next refresh skips the detectors when the marker's inputs
 match, the selection is the same or smaller, and nothing since its position
-touched a selected surface, point collection or fiber, a detector relationship
-(point-surface, same-surface) or a volume registration. Changed tracks and
+touched a selected surface, a detector relationship (same-surface) or a
+volume registration. Changed tracks and
 live `crossing` relationships do not relink (no detector reads them); a
 deleted relationship, whose kind the store no longer tells, does. A marker
 written before API 48 (with a track selection) is replaced by one full
 refresh. A service input update
 links only objects added since (pairs with a new object, partners found by
-stored bounds); those links are approximate (an existing PCL keeps its old
-surface link alongside one to a new surface), and the next startup refreshes
+stored bounds); those links are approximate, and the next startup refreshes
 in full. `object_store_full_link_refresh: true` always runs every detector.
 Each detector's mode and duration are logged, and its progress shows in the
 service's `input_preparation.progress` (stderr for a CLI fit).
@@ -436,20 +418,13 @@ winding-model supervision refuses a store without one, and with
 `input_use_outer_shell` off it is not read. An input update that changes the
 shell is refused (the fit consumed it at build): rebuild instead.
 
-Fiber-patch refresh uses the fit's lasagna normals when `input_use_normals` is
-on and the normal stores exist (whatever the dense-normal loss weight), else
-`object_store_normal_ct_*` structure-tensor normals, else the fiber centerline
-alone (with a warning). The log names the source.
-
 After refresh every rank reads the same frozen snapshot and materializes it:
-patch grids, PCL points by stable ID with their `wind_a`, fibers trimmed and
-decimated with every patch contact and branch endpoint kept, branch links,
-patch overlaps as same-surface point pairs (`pcl_patch_overlap_*`, sampling
+patch grids, patch overlaps as same-surface point pairs (`pcl_patch_overlap_*`, sampling
 group `patch_overlaps`), and the tracks lying entirely inside the z window
 with the crossing CSR the fit computes from every selected track, from which it
 builds its track crossing graph (see **Track crossings** below). No
 relationship of a track is read: `crossing` and track-surface relationships
-are not used. Attachments on patch quads the losses do not sample
+are not used. Overlap pairs on patch quads the losses do not sample
 are dropped and reported. The ranks' input digests must agree. The log prints
 the selection, consumed relationships and constraint counts; `python
 object_store_inputs.py dataset.vcobj --z-begin Z0 --z-end Z1` prints the same
@@ -518,8 +493,8 @@ store/generation, not a later current-owner lookup. Link requests use the
 existing command-v2 complete-reference guards; database schema remains 21.
 
 The inputs are frozen for the fit: settings that would relink or re-derive
-them (`config.OBJECT_STORE_PCL_KEYS`, the PCL role toggles, selection and
-frame settings) need a new fit. Each run writes `object_store_inputs.json`
+them (`config.OBJECT_STORE_PCL_KEYS`, selection and frame settings) need a
+new fit. Each run writes `object_store_inputs.json`
 (store, selection, the version and scale of every object and the version of
 every consumed relationship, the fit volume, external-input frames,
 materialization settings, and the refresh mode with its fiber-patch normal
@@ -528,10 +503,9 @@ inputs differ is refused unless `object_store_allow_changed_inputs`.
 
 The digest identifies inputs by content, not by store history: an object by
 its geometry revision and a hash of the metadata the adapter reads
-(`metadata_sha256`: its frame, erosion, PCL role and sampling group, fiber
-classification), a relationship by its record, approval, generation,
-endpoint geometry revisions and a hash of its anchors and metadata
-(`content_sha256`). The manifest keeps each object's and relationship's
+(`metadata_sha256`: its frame, erosion and track family), a relationship
+by its record, approval, generation, endpoint geometry revisions and a hash
+of its anchors and metadata (`content_sha256`). The manifest keeps each object's and relationship's
 numbered `version`, outside the digest, to read the inputs back exactly. A
 checkpoint written before these identities is compared on geometry
 revisions and relationship generations, with a warning.
@@ -569,7 +543,6 @@ From the repository root, with `vc_object_store`'s Python module on the path
 PYTHONPATH=spiral-fitting:$VC_OBJECT_STORE_BUILD/python spiral-fitting/.venv/bin/python -m pytest -q \
   spiral-fitting/tests/test_object_store_inputs.py \
   spiral-fitting/tests/test_object_store_materialize.py \
-  spiral-fitting/tests/test_object_store_fibers.py \
   spiral-fitting/tests/test_object_store_overlaps.py \
   spiral-fitting/tests/test_object_store_tracks.py \
   spiral-fitting/tests/test_object_store_startup.py \
@@ -871,7 +844,7 @@ authenticated HTTP protocol:
   tunnels are ever required.
 
 In every mode the service — not the client — owns the host paths: it is
-launched with `--object-store` (patches, point collections, fibers, tracks and
+launched with `--object-store` (patches, tracks and
 their links; see [Object-store inputs](#object-store-inputs)), `--output` (all
 generated state), the optional `--cache` (derived host caches; default
 `$XDG_CACHE_HOME/vc3d/spiral`, i.e. `~/.cache/vc3d/spiral`) and the optional
@@ -931,8 +904,7 @@ the one its inputs were read in). The build fits that project volume:
   `lasagna_scale` (see "Lasagna inputs must be packed first"). A fit whose
   losses need normals or gradient magnitudes the project cannot give, or
   whose pools the cache lacks, is refused before anything is linked. The
-  startup link refresh reads the normals pack too (`normal_pool`); without
-  one in the cache it refreshes fiber links centerline-only, with a warning.
+  startup link refresh reads the normals pack too (`normal_pool`).
   The command-line fit builds its normals pack before refreshing.
 - **Umbilicus.** The project's, written under the output directory
   (`project-inputs/umbilicus-<identity-hash>.json`) as the file the fit reads, at
@@ -1329,22 +1301,20 @@ read-only, and the service rejects a session request that carries
 Optional supervision sources have rebuild-scoped boolean switches in Advanced
 config. Set an `input_use_*` key to `false` to skip validation, loading,
 sampling, and losses for that source without changing its tuned weights or
-sample counts. Available switches cover verified patches, tracks,
-fibers, each PCL role (`absolute`, `relative`, `same_winding`, and
-`drawn_control_points`), normals, gradient magnitude, winding inference, and
-the outer shell. For example:
+sample counts. Available switches cover verified patches, tracks, patch
+overlaps, fiber directions, normals, gradient magnitude, winding inference,
+and the outer shell. For example:
 
 ```json
 {
   "input_use_tracks": false,
-  "input_use_fibers": false,
-  "input_use_pcl_drawn_control_points": false
+  "input_use_outer_shell": false
 }
 ```
 
-Every role switch requires a whole-fit rebuild: the switches select the
-fit's frozen object-store inputs, and a disabled role's store content is
-simply not selected. Disabling a prerequisite also disables its dependent
+Every switch requires a whole-fit rebuild: the object-store switches select
+the fit's frozen inputs, and a disabled source's store content is simply not
+selected. Disabling a prerequisite also disables its dependent
 supervision: winding inference needs the outer shell.
 
 Patches, point collections and fibers cannot be added to or edited in a
@@ -1793,59 +1763,3 @@ names as `fiber_directions` (a service, the cached one) and samples
 `sample_count_fiber_direction_points` observations per step.
 Positions and directions constrain only local fitted-sheet orientation; they
 do not attach a sample to a particular winding.
-
-## Fiber classification
-
-Each fiber strip is tagged at load time (`spiral_helpers.classify_fiber_hv`):
-VC3D's manual H/V tag wins, then its automatic tag when the recorded certainty
-reaches `pcl_vertical_fiber_min_auto_certainty`, then a geometric fallback that
-calls a strip vertical when its z extent is at least
-`pcl_vertical_fiber_min_z_fraction` of its path length. The fit log reports the
-vertical / horizontal / untagged split.
-
-## Vertical-fiber radial offset
-
-Papyrus carries its horizontal fibers on the front face of the sheet (the face
-toward the umbilicus and the lower-winding neighbour) and its vertical fibers
-on the back face, so the two fiber classes sit a few voxels apart along the
-sheet normal and at most one of them can lie on the face the fit targets. The
-strip losses read every fiber as lying *on* the fitted winding, which leaves a
-permanent residual on vertical strips and on every vertical-to-horizontal link
-junction. With `pcl_vertical_fiber_radial_offset_enabled` set, vertical strips
-(as classified by `spiral_helpers.classify_fiber_hv`, see above) carry a
-per-point target offset of `pcl_vertical_fiber_radial_offset_voxels` (default
-4, positive = outward) along the sheet normal of the fitted spiral (the
-scan-space gradient of the fitted winding, not the straight line to the
-umbilicus): the radius loss, the whole-strip DT target, the DT snap, and the
-satisfaction metric all expect those points that far outside the winding, on
-its back face, instead of on it. Horizontal strips and regular point
-collections are never offset.
-
-The offset is a physical scroll-space distance, not a spiral-space constant.
-In spiral space the fitted sheet's normal is the radial direction, so the
-offset acts on the shifted radius, but the scroll-to-spiral map is not an
-isometry (the gap expander rescales the radial coordinate per gap and the flow
-stretches locally), so each point's offset is multiplied by the transform's
-local stretch along the sheet normal, `|J^T n|`
-(`sample_spiral.get_radial_normal_stretch`; the same `J^T` covector transport
-the dense-normals loss uses). `J^T n` is the scan-space gradient of the fitted
-winding, so a positive offset displaces the expected fiber position along it:
-the increasing-winding direction of the fitted spiral at that point, away from
-the umbilicus, which coincides with the line from the umbilicus only where the
-sheet happens to be perpendicular to it. The loss evaluates that stretch for its sampled
-points each step under `no_grad`, the DT target cache and the satisfaction
-metric for the points they read. After a constraint bake the resident geometry
-lives in the frozen stack's output frame, so each vertical strip and fiber
-catalog point also carries `radial_offset_bake_scale`, the product of every
-frozen epoch's normal stretch at the pre-bake point
-(`fit_spiral.accumulate_radial_offset_bake_scale`); ingested inputs pick it up
-when they are pushed through the stack, re-materialised strips inherit it from
-the catalog, and the final scroll-space export drops it because the composed
-transform's Jacobian then carries the whole stretch. The offset travels with
-the strip bundle (`radial_offsets`, resident-frame voxels after the bake
-scale) next to the winding annotations, so linked components mixing both fiber
-classes read as one winding. Unlike the other `pcl_` settings, both keys are
-Run-scoped: a Run that changes them refills every retained strip's offsets from
-its stored vertical/horizontal tag and rebuilds the strip bundle and DT target
-caches, so no fit rebuild is needed. VC3D's spiral panel exposes them as a
-checkbox and a voxel distance next to the fibers path.

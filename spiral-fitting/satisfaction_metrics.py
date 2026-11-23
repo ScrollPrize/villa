@@ -8,15 +8,12 @@ import torch
 
 from devices import scatter_reduce_
 from sample_spiral import (
-    get_radial_normal_stretch,
     get_theta_and_radii,
     get_theta_crossing_step_adjustments,
-    radius_from_unwrapped_shifted,
 )
 from spiral_helpers import (
     compute_winding_range_and_input_extents,
     save_mesh,
-    _segmented_median_per_strip,
     _warn_if_inputs_exceed_flow_bounds,
 )
 from tracks import get_track_satisfied_counts_in_chunks
@@ -668,185 +665,6 @@ def get_patch_satisfied_areas(
     return satisfied_patches, satisfied_areas, total_areas, satisfied_quad_masks, boundary_satisfied_patches, target_winding_idx_per_patch
 
 
-def _build_strip_spiral_context(slice_to_spiral_transform, dr_per_winding, flat, num_strips):
-    # Shared front-half of the per-strip satisfaction pass: given a flat bundle
-    # from the caller, transform points into spiral space, unwrap theta across
-    # strip boundaries, and produce the per-point normalised
-    # shifted-radius (`unwrapped_shifted - windings * dr - radial_offsets`, the
-    # offsets converted from input-frame voxels along the sheet normal to spiral
-    # radius by the transform's local normal stretch; positive = the fiber sits
-    # outside its winding, on the sheet's back face). Returns
-    # `(ctx, lengths_cpu, num_strips)` where `ctx` is None when there are no
-    # points; downstream target-winding selectors (median / mode) operate on
-    # `ctx['normalised_radii']` and feed the picked per-strip target through
-    # `_strip_satisfaction_from_target`.
-    spiral_tolerance = dr_per_winding.detach() * metrics_config['satisfaction_radius_tolerance']
-    scan_tolerance = metrics_config['satisfaction_distance_tolerance']
-    dr = dr_per_winding.detach()
-    device = dr_per_winding.device
-    S = num_strips
-
-    if flat is None or flat['total'] == 0:
-        lengths_cpu = flat['lengths_cpu'] if flat is not None else torch.zeros(S, dtype=torch.int64)
-        return None, lengths_cpu, S
-
-    chunk = 65536
-
-    def transform_in_chunks(zyxs, fn):
-        if zyxs.shape[0] <= chunk:
-            return fn(zyxs)
-        pieces = []
-        for st in range(0, zyxs.shape[0], chunk):
-            pieces.append(fn(zyxs[st:st + chunk]))
-        return torch.cat(pieces, dim=0)
-
-    zyxs = flat['zyxs']
-    windings = flat['windings']
-    radial_offsets = flat.get('radial_offsets')
-    if radial_offsets is None:
-        radial_offsets = torch.zeros_like(windings)
-    strip_id = flat['strip_id']
-    starts = flat['starts']
-    lengths = flat['lengths']
-    lengths_cpu = flat['lengths_cpu']
-    T = flat['total']
-
-    with torch.no_grad():
-        spiral_zyxs = transform_in_chunks(zyxs, slice_to_spiral_transform)
-        if bool((radial_offsets != 0).any()):
-            radial_offsets = radial_offsets * get_radial_normal_stretch(
-                slice_to_spiral_transform, zyxs, spiral_zyx=spiral_zyxs,
-                chunk_size=chunk)
-        theta, _, shifted_radii = get_theta_and_radii(spiral_zyxs[..., 1:], dr_per_winding)
-
-        # Segmented version of _unwrap_track_shifted_radii: build
-        # adjustments via a global cumsum where step_adj is zeroed across strip
-        # boundaries, then subtract each strip's start value so each strip
-        # starts at 0 in its own frame.
-        if T > 1:
-            same_strip = strip_id[1:] == strip_id[:-1]
-            step_adj = get_theta_crossing_step_adjustments(theta, dr)
-            step_adj = torch.where(same_strip, step_adj, torch.zeros_like(step_adj))
-            cumsum_inner = torch.cumsum(step_adj, dim=0)
-            cumsum_flat = torch.cat([
-                torch.zeros(1, device=device, dtype=cumsum_inner.dtype),
-                cumsum_inner,
-            ], dim=0)
-            adjustments = cumsum_flat - cumsum_flat[starts[:-1][strip_id]]
-        else:
-            adjustments = torch.zeros_like(shifted_radii)
-        unwrapped_shifted = shifted_radii + adjustments
-
-        normalised_radii = unwrapped_shifted - windings * dr - radial_offsets
-
-    ctx = {
-        'spiral_tolerance': spiral_tolerance,
-        'scan_tolerance': scan_tolerance,
-        'dr': dr,
-        'device': device,
-        'S': S,
-        'T': T,
-        'transform_in_chunks': transform_in_chunks,
-        'slice_to_spiral_transform': slice_to_spiral_transform,
-        'zyxs': zyxs,
-        'windings': windings,
-        'radial_offsets': radial_offsets,
-        'strip_id': strip_id,
-        'starts': starts,
-        'lengths': lengths,
-        'lengths_cpu': lengths_cpu,
-        'spiral_zyxs': spiral_zyxs,
-        'theta': theta,
-        'adjustments': adjustments,
-        'unwrapped_shifted': unwrapped_shifted,
-        'normalised_radii': normalised_radii,
-    }
-    return ctx, lengths_cpu, S
-
-
-def _strip_satisfaction_from_target(ctx, target_normalised_per_strip):
-    # Given a per-strip target normalised shifted-radius, count points whose
-    # spiral-space radius and scan-space distance both fall within the
-    # satisfaction tolerances. Returns
-    # `(satisfied_counts_cpu, per_point_satisfaction_cpu_list)`.
-    dr = ctx['dr']
-    device = ctx['device']
-    S = ctx['S']
-    strip_id = ctx['strip_id']
-    windings = ctx['windings']
-    radial_offsets = ctx['radial_offsets']
-    theta = ctx['theta']
-    adjustments = ctx['adjustments']
-    unwrapped_shifted = ctx['unwrapped_shifted']
-    spiral_zyxs = ctx['spiral_zyxs']
-    zyxs = ctx['zyxs']
-    lengths_cpu = ctx['lengths_cpu']
-    spiral_tolerance = ctx['spiral_tolerance']
-    scan_tolerance = ctx['scan_tolerance']
-    transform_in_chunks = ctx['transform_in_chunks']
-    slice_to_spiral_transform = ctx['slice_to_spiral_transform']
-
-    with torch.no_grad():
-        target_normalised = target_normalised_per_strip[strip_id]
-        target_shifted = target_normalised + windings * dr + radial_offsets
-        spiral_in_band = (unwrapped_shifted - target_shifted).abs() <= spiral_tolerance
-
-        target_radii = radius_from_unwrapped_shifted(
-            theta, target_shifted, adjustments, dr,
-        )
-        target_spiral_zyxs = torch.stack([
-            spiral_zyxs[..., 0],
-            torch.sin(theta) * target_radii,
-            torch.cos(theta) * target_radii,
-        ], dim=-1)
-        target_scroll_zyxs = transform_in_chunks(target_spiral_zyxs, slice_to_spiral_transform.inv)
-        scan_distances = torch.linalg.norm(target_scroll_zyxs - zyxs, dim=-1)
-        scan_in_band = scan_distances <= scan_tolerance
-
-        satisfied = spiral_in_band & scan_in_band
-
-        satisfied_counts_dev = torch.zeros(S, dtype=torch.int64, device=device)
-        satisfied_counts_dev.scatter_add_(0, strip_id, satisfied.to(torch.int64))
-        satisfied_counts = satisfied_counts_dev.cpu()
-
-        per_point_satisfaction = list(torch.split(satisfied.cpu(), lengths_cpu.tolist()))
-
-    return satisfied_counts, per_point_satisfaction
-
-
-def get_unattached_pcl_satisfied_counts(slice_to_spiral_transform, dr_per_winding, pcl_strips, get_flat_bundle):
-    # For each unattached pcl, treat its id-sorted points as a strip (so theta=0
-    # crossings can be unwrapped, mirroring the patch row-walk in
-    # get_patch_satisfied_areas), pick the snapped median normalised shifted-radius
-    # as the target winding, then count points that satisfy both the same spiral-
-    # space radius tolerance and the same scan-space distance tolerance used for
-    # quad satisfaction. Returns three values: (satisfied_count_per_pcl,
-    # total_count_per_pcl, per_point_satisfaction) — the first two are 1-D int64
-    # tensors, and per_point_satisfaction is a list of CPU bool tensors (one per
-    # pcl, of length N for that pcl; empty pcls get an empty tensor).
-    #
-    # All strips are processed in a single batched pass: points are concatenated
-    # into one flat (T, 3) tensor, the scan->spiral transform runs once over
-    # everything, then unwrap / median / satisfaction are done with segmented
-    # cumsum and a single composite-key sort (no Python-level per-strip loop).
-    flat = get_flat_bundle(pcl_strips, dr_per_winding.device)
-    ctx, lengths_cpu, S = _build_strip_spiral_context(
-        slice_to_spiral_transform, dr_per_winding, flat, len(pcl_strips),
-    )
-    if ctx is None:
-        per_point = [torch.zeros([int(n.item())], dtype=torch.bool) for n in lengths_cpu]
-        return torch.zeros(S, dtype=torch.int64), lengths_cpu.clone(), per_point
-
-    dr = ctx['dr']
-
-    with torch.no_grad():
-        medians = _segmented_median_per_strip(ctx)
-        target_normalised_per_strip = torch.round(medians / dr) * dr
-
-    satisfied_counts, per_point_satisfaction = _strip_satisfaction_from_target(ctx, target_normalised_per_strip)
-    return satisfied_counts, lengths_cpu.clone(), per_point_satisfaction
-
-
 def save_overlay_and_print_satisfaction(
     suffix,
     *,
@@ -856,7 +674,6 @@ def save_overlay_and_print_satisfaction(
     patches_list,
     patches_dict,
     patch_atlas,
-    unattached_pcl_strips,
     tracks,
     out_path,
     cfg,
@@ -873,7 +690,6 @@ def save_overlay_and_print_satisfaction(
     z_to_umbilicus_yx,
     render_volume_scale,
     voxel_size_um,
-    get_or_build_unattached_pcl_flat,
     z_direction_is_top_to_bottom,
     run_tag=None,
     save_png_visualizations=False,
@@ -923,35 +739,8 @@ def save_overlay_and_print_satisfaction(
         'total_area': total_area,
         'satisfied_area_fraction': satisfied_area_ratio,
     }
-    unattached_pcl_per_point_satisfied = []
-    unattached_pcl_fully_satisfied = torch.zeros(len(unattached_pcl_strips), dtype=torch.bool)
-    if unattached_pcl_strips:
-        if progress is not None:
-            progress.begin(
-                'finalizing', 'Evaluating point collections',
-                detail=f'{len(unattached_pcl_strips):,} collections')
-        unattached_pcl_satisfied_counts, unattached_pcl_total_counts, unattached_pcl_per_point_satisfied = get_unattached_pcl_satisfied_counts(
-            slice_to_spiral_transform, dr_per_winding, unattached_pcl_strips, get_or_build_unattached_pcl_flat,
-        )
-        unattached_pcl_fully_satisfied = (unattached_pcl_satisfied_counts == unattached_pcl_total_counts)
-        fully_satisfied_pcls = int(unattached_pcl_fully_satisfied.sum().item())
-        num_pcls = len(unattached_pcl_strips)
-        fully_satisfied_ratio = fully_satisfied_pcls / max(num_pcls, 1)
-        print(f'satisfied_unattached_pcls = {fully_satisfied_pcls}/{num_pcls} ({fully_satisfied_ratio * 100:.1f}%)')
-        satisfied_points = int(unattached_pcl_satisfied_counts.sum().item())
-        total_points = int(unattached_pcl_total_counts.sum().item())
-        satisfied_point_ratio = satisfied_points / max(total_points, 1)
-        print(f'satisfied_unattached_pcl_points = {satisfied_points}/{total_points} ({satisfied_point_ratio * 100:.1f}%)')
-        satisfaction_summary.update({
-            'satisfied_unattached_pcls': fully_satisfied_pcls,
-            'total_unattached_pcls': num_pcls,
-            'satisfied_unattached_pcls_fraction': fully_satisfied_ratio,
-            'satisfied_unattached_pcl_points': satisfied_points,
-            'total_unattached_pcl_points': total_points,
-            'satisfied_unattached_pcl_points_fraction': satisfied_point_ratio,
-        })
     if tracks:
-        # Free the patch/pcl eval tensors before the (much larger) track eval,
+        # Free the patch eval tensors before the (much larger) track eval,
         # and chunk the track eval so the full track set does not have to be
         # materialised on the GPU at once. Guard against OOM so that a failure
         # to compute the secondary track metric never prevents the mesh/overlay
@@ -998,26 +787,8 @@ def save_overlay_and_print_satisfaction(
             'fraction': fraction,
         })
     patch_satisfaction_entries.sort(key=lambda e: e['fraction'])
-    pcl_satisfaction_entries = []
-    if unattached_pcl_strips:
-        sat_counts = unattached_pcl_satisfied_counts.tolist()
-        tot_counts = unattached_pcl_total_counts.tolist()
-        for strip, sc, tc in zip(unattached_pcl_strips, sat_counts, tot_counts):
-            fraction = sc / tc if tc > 0 else 0.0
-            pcl_satisfaction_entries.append({
-                'id': strip.get('id'),
-                'name': strip.get('name'),
-                'source_file': strip.get('source_file'),
-                'satisfied_points': int(sc),
-                'total_points': int(tc),
-                'fraction': fraction,
-            })
-        pcl_satisfaction_entries.sort(key=lambda e: e['fraction'])
     with open(f'{out_path}/satisfied_{suffix}.json', 'w') as f:
-        json.dump({
-            'patches': patch_satisfaction_entries,
-            'pcls': pcl_satisfaction_entries,
-        }, f, indent=2)
+        json.dump({'patches': patch_satisfaction_entries}, f, indent=2)
     with open(f'{out_path}/satisfaction_metrics_{suffix}.json', 'w') as f:
         json.dump({'summary': satisfaction_summary}, f, indent=2)
     need_overlay = (save_png_visualizations
@@ -1025,15 +796,13 @@ def save_overlay_and_print_satisfaction(
     need_mesh = os.environ.get('FIT_SPIRAL_SKIP_SAVE_MESH') != '1'
     winding_range = None
     patch_extents = patch_evaluation.patch_extents
-    pcl_extents = [(None, None)] * len(unattached_pcl_strips)
     if need_overlay or need_mesh:
-        pcl_track_range, _, pcl_extents = compute_winding_range_and_input_extents(
+        track_range, _ = compute_winding_range_and_input_extents(
             slice_to_spiral_transform, dr_per_winding, [],
-            unattached_pcl_strips, cfg, z_begin, z_end,
-            get_or_build_unattached_pcl_flat,
+            cfg, z_begin, z_end,
             authoritative_zyx_lines=tracks,
         )
-        winding_range = pcl_track_range
+        winding_range = track_range
         if patch_evaluation.patch_winding_min is not None:
             margin = cfg['output_winding_margin']
             patch_range = (
@@ -1053,7 +822,6 @@ def save_overlay_and_print_satisfaction(
             progress.begin('finalizing', 'Rendering satisfaction overlay')
         _warn_if_inputs_exceed_flow_bounds(
             list(patches_dict.keys()), patch_extents,
-            unattached_pcl_strips, pcl_extents,
             flow_field_radius,
             cfg,
         )
@@ -1080,7 +848,6 @@ def save_overlay_and_print_satisfaction(
             zs_for_visualisation, slice_yx,
             scroll_slices_for_visualisation, prediction_slices_for_visualisation,
             quad_label_map, quad_status_flat,
-            unattached_pcl_strips, unattached_pcl_per_point_satisfied, unattached_pcl_fully_satisfied,
             z_to_umbilicus_yx,
             winding_range,
             tracks,
@@ -1089,9 +856,8 @@ def save_overlay_and_print_satisfaction(
         )
     if need_mesh:
         save_mesh(
-            slice_to_spiral_transform, dr_per_winding, patches_list, unattached_pcl_strips,
+            slice_to_spiral_transform, dr_per_winding, patches_list,
             out_path, cfg, z_begin, z_end, voxel_size_um,
-            get_or_build_unattached_pcl_flat,
             winding_range=winding_range,
             patch_satisfaction_evaluation=patch_evaluation,
             patch_atlas=patch_atlas,

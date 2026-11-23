@@ -10,7 +10,7 @@ To set up a new experiment, work with the user to:
 2. **Create the branch**: `git checkout -b autoresearch/<tag>` from current HEAD (any working copy changes should be left intact, assuming they are not in `fit_spiral.py` or its helper modules).
 3. **Read the in-scope files**: Only this 'spiral' subfolder of the repo is relevant. Read these for full context before you start:
    - `fit_spiral.py` — the main file you modify. Losses, optimization, flow model, config, etc.
-   - `object_store_inputs.py`, `pcl_views.py` — read patches, point collections and fibers (and their links to patches) from the object store, and turn them into the training views the losses consume.
+   - `object_store_inputs.py` — reads patches and tracks (and their links) from the object store.
    - `losses.py`, `spiral_helpers.py`, `geom_utils.py`, `transforms.py`, `flow_fields.py` — fitting-side helper modules on the fit path (`flow_fields.py` is used via `transforms.py`) and NOT used by the metric/render pipeline. These are also fair game to edit (see scope below).
    - `tifxyz.py` — helper for loading/saving grid-topo quad-mesh patches. Read it for context, but it is **frozen** (see scope): it is shared with `render_ink.py`, so editing it changes the metric.
    - `runners/run_single.py` — the pipeline runner you launch (fit → render ink → score ink). You do NOT edit this or the scoring scripts; just understand what it does.
@@ -29,12 +29,12 @@ A better fit — one that produces a more coherent, correctly-flattened surface 
 
 We also track **`overall_fg_fraction`** (foreground pixels ÷ total strip pixels) as a **secondary / sanity metric**. It guards against gaming: if a change balloons `total_fg_pixels` only by inflating the surface with garbage geometry, the fraction will collapse. Note that *duplicated* coverage is not caught this way: a repeated winding scales foreground and total pixels together, so the fraction holds steady while `total_fg_pixels` rises. Treat a big `total_fg_pixels` gain that comes with a large fraction *drop* with suspicion — that is probably noise, not ink. A change that lifts both, or lifts total while holding fraction roughly steady, is a real win.
 
-**Also keep an eye on the satisfaction metrics.** `fit_spiral.py` prints some geometry-fit metrics — `satisfied_patches`, `satisfied_area`, `satisfied_unattached_pcls`, `satisfied_unattached_pcl_points` — near the end of its log (`<out_dir>/logs/<tag>.fit.log`). These are **not the objective** (ink coverage is), but they are a useful *diagnostic* for what a change did to the underlying fit. Track how they move alongside ink coverage: if ink coverage climbs while the satisfaction metrics hold up (or improve), you have a genuinely better fit; if ink coverage climbs while the satisfaction metrics fall off a cliff, be suspicious that you are contorting the surface to catch stray ink rather than fitting the scroll better. They are a cross-check, not a target — do not optimise them directly, and never let them override the ink-coverage decision.
+**Also keep an eye on the satisfaction metrics.** `fit_spiral.py` prints some geometry-fit metrics — `satisfied_patches`, `satisfied_area` — near the end of its log (`<out_dir>/logs/<tag>.fit.log`). These are **not the objective** (ink coverage is), but they are a useful *diagnostic* for what a change did to the underlying fit. Track how they move alongside ink coverage: if ink coverage climbs while the satisfaction metrics hold up (or improve), you have a genuinely better fit; if ink coverage climbs while the satisfaction metrics fall off a cliff, be suspicious that you are contorting the surface to catch stray ink rather than fitting the scroll better. They are a cross-check, not a target — do not optimise them directly, and never let them override the ink-coverage decision.
 
 ## Scope — what you can and cannot change
 
 **What you CAN do:**
-- Modify `fit_spiral.py` **and the fitting-side helper modules on the fit path that the metric/render pipeline does not use** — namely `losses.py`, `spiral_helpers.py`, `geom_utils.py`, `transforms.py`, `flow_fields.py`, `pcl_views.py` (and, if you need them, the other fit-only imports: `sample_spiral.py`, `tracks.py`, `umbilicus.py`, `ddp_helpers.py`, `lasagna_data.py`). Everything about the *fit* is fair game: losses, optimizer, hyperparameters, flow field, diffeomorphism, initialization, sampling, etc.
+- Modify `fit_spiral.py` **and the fitting-side helper modules on the fit path that the metric/render pipeline does not use** — namely `losses.py`, `spiral_helpers.py`, `geom_utils.py`, `transforms.py`, `flow_fields.py` (and, if you need them, the other fit-only imports: `sample_spiral.py`, `tracks.py`, `umbilicus.py`, `ddp_helpers.py`, `lasagna_data.py`). Everything about the *fit* is fair game: losses, optimizer, hyperparameters, flow field, diffeomorphism, initialization, sampling, etc.
 - Create/modify your own helper *shell/python scripts* for driving the loop (batch launchers, summarizers, etc.).
 
 **What you CANNOT do:**
@@ -106,10 +106,10 @@ and writes the same numbers as JSON to `.../ink_metric/metrics.json`:
 
 When an experiment is done, log it to `results_<tag>.tsv` (tab-separated, NOT comma-separated — commas break in descriptions). Do NOT commit this file; leave it untracked.
 
-Header + 9 columns:
+Header + 8 columns:
 
 ```
-commit	total_fg_px	ink_fraction	num_strips	sat_patches	sat_pcls	time_s	status	description
+commit	total_fg_px	ink_fraction	num_strips	sat_patches	time_s	status	description
 ```
 
 1. git commit hash (short, 7 chars)
@@ -117,24 +117,23 @@ commit	total_fg_px	ink_fraction	num_strips	sat_patches	sat_pcls	time_s	status	de
 3. `overall_fg_fraction` as a percentage (e.g. 12.5) — use 0 for crashes
 4. `num_strips` scored (e.g. 42) — sanity check that the render produced the expected strips; use 0 for crashes
 5. `satisfied_patches` % from the fit log (e.g. 13.6) — diagnostic cross-check, not a target; use 0 for crashes
-6. `satisfied_unattached_pcls` % from the fit log (e.g. 40.0) — diagnostic cross-check, not a target; use 0 for crashes
-7. wall-clock time in seconds (whole pipeline)
-8. status: `keep`, `discard`, or `crash`
-9. short text description of what this experiment tried
+6. wall-clock time in seconds (whole pipeline)
+7. status: `keep`, `discard`, or `crash`
+8. short text description of what this experiment tried
 
-Columns 5–6 just record how the geometry fit moved (grep them from `<out_dir>/logs/<tag>.fit.log`) so you can eyeball them next to ink coverage; they never decide `keep`/`discard` on their own.
+Column 5 just records how the geometry fit moved (grep it from `<out_dir>/logs/<tag>.fit.log`) so you can eyeball it next to ink coverage; it never decides `keep`/`discard` on their own.
 
 Example:
 
 ```
-commit	total_fg_px	ink_fraction	num_strips	sat_patches	sat_pcls	time_s	status	description
-a1b2c3d	1180000	11.8	42	13.6	40.0	1850	keep	baseline
-b2c3d4e	1265000	12.6	42	14.1	41.2	1900	keep	increase LR to 0.04 (ink +7%, sat steady)
-c3d4e5f	1310000	9.1	58	6.2	22.0	1980	discard	looser winding tol — more strips but fraction+sat tanked (noise)
-d4e5f6g	0	0	0	0	0	410	crash	double model width (OOM)
+commit	total_fg_px	ink_fraction	num_strips	sat_patches	time_s	status	description
+a1b2c3d	1180000	11.8	42	13.6	1850	keep	baseline
+b2c3d4e	1265000	12.6	42	14.1	1900	keep	increase LR to 0.04 (ink +7%, sat steady)
+c3d4e5f	1310000	9.1	58	6.2	1980	discard	looser winding tol — more strips but fraction+sat tanked (noise)
+d4e5f6g	0	0	0	0	410	crash	double model width (OOM)
 ```
 
-When deciding `keep` vs `discard`: `total_fg_pixels` is the primary signal; `overall_fg_fraction` is the guard; the two satisfaction columns are a diagnostic cross-check. A `total_fg_pixels` gain with a stable-or-rising fraction is a keep. A `total_fg_pixels` gain bought with a large fraction drop — or with the satisfaction metrics collapsing — is likely gaming/noise → discard. Prefer changes whose gain reproduces across seeds.
+When deciding `keep` vs `discard`: `total_fg_pixels` is the primary signal; `overall_fg_fraction` is the guard; the satisfaction column is a diagnostic cross-check. A `total_fg_pixels` gain with a stable-or-rising fraction is a keep. A `total_fg_pixels` gain bought with a large fraction drop — or with the satisfaction metrics collapsing — is likely gaming/noise → discard. Prefer changes whose gain reproduces across seeds.
 
 ## The experiment loop
 
@@ -159,7 +158,7 @@ You are a completely autonomous researcher. If an idea works, keep; if not, disc
 - DO NOT type ad-hoc inspection one-liners (`for d in ...; do grep ... $(...); done`, `cat .../metrics.json | ...`, `python -c "import json; ..."`, etc.). Every new variant is a new prompt, and JSON-parsing one-liners are especially tempting here — resist them.
 - INSTEAD, keep everything down to **two fixed-form helper scripts plus one fixed git command**, and invoke each with an *identical command string* every time. All the logic that needs substitution/loops/pipes/JSON-parsing lives *inside* the script file (substitution inside a committed `.sh`/`.py` is fine — only the command string you submit is matched):
   - `launch.sh` — reads a `batch.txt` manifest (`<gpus> <tag>` per line, e.g. `0,1,2,3 jul9a` / `4,5,6,7 jul9b`); for each line it runs `python runners/run_single.py --gpus <gpus> --output <out_dir>/<tag> --inputs ... --object-store ... --ink-volume ... --no-wandb` in the background with all output redirected to `<out_dir>/logs/<tag>.log`, then `wait`s for both. One `bash launch.sh` launches the whole batch; one completion notification covers it.
-  - `summarize.sh` — scan each run's `metrics.json` and fit logs and print a TSV row (total_fg_px, fraction, num_strips, sat_patches, sat_pcls). Use this instead of ad-hoc `grep`/`cat`/`python -c` over the JSON.
+  - `summarize.sh` — scan each run's `metrics.json` and fit logs and print a TSV row (total_fg_px, fraction, num_strips, sat_patches). Use this instead of ad-hoc `grep`/`cat`/`python -c` over the JSON.
   - Commit with the fixed string `git add -A && git commit -F COMMIT_MSG.txt` — no wrapper script needed, because the *command* is already identical every time (only `COMMIT_MSG.txt`'s contents change). A raw `git commit -m "..."` with a unique message would be a new string and prompt, so always route the message through the file.
 - CREATE AND EDIT ALL DATA FILES WITH THE Write/Edit TOOLS, never with `printf >`/`echo >`/`mkdir` in Bash. This includes **appending each result row to `results_<tag>.tsv`** — do it with Edit, not a shell script. The Write/Edit tools never trigger a Bash approval prompt and avoid minting a unique command string per file. Same for `batch.txt`, `COMMIT_MSG.txt`, any config-override files, and the two helper scripts themselves.
 - To inspect progress, prefer reading the background task's output / a run's log or `metrics.json` with the Read tool, or run `summarize.sh`. Do not use external tools like `pgrep`/`ps`/`nvidia-smi` in ad-hoc form (also prompt). Poll internally / rely on the background-completion notifications.

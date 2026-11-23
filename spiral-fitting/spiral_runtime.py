@@ -1379,9 +1379,7 @@ class InteractiveFitSession:
             self._transition_locked(SessionState.Loading, "Inputs prepared")
         self._publish_status()
         command.complete(position=command.position, digest=inputs.digest,
-                         patches=candidate.num_verified_patches,
-                         cross_patch_pcls=len(candidate.cross_patch_pcls),
-                         unattached_strips=len(candidate.unattached_pcl_strips))
+                         patches=candidate.num_verified_patches)
 
     def _run_inputs_install(self, command):
         """Replace the resident inputs with the prepared ones. Reached only

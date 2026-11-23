@@ -1,7 +1,6 @@
 """Run-boundary application of settings that used to demand a rebuild.
 
-Each test builds a FitContext piecemeal (the pattern test_fiber_supervision
-uses) and drives FitContext.apply_config the way the interactive runtime does.
+Each test builds a FitContext piecemeal and drives FitContext.apply_config the way the interactive runtime does.
 """
 import copy
 from types import SimpleNamespace
@@ -12,7 +11,7 @@ import pytest
 import torch
 
 from config import Config
-from fit_spiral import FitContext, _UnattachedPclStripList
+from fit_spiral import FitContext
 
 
 def _context(**overrides):
@@ -28,16 +27,10 @@ def _context(**overrides):
     context.prepared_main_tracks = None
     context.verified_patches = {}
     context.verified_patches_list = []
-    context.cross_patch_pcls = []
-    context.unattached_pcl_strips = _UnattachedPclStripList()
-    context.unattached_strip_sampling_groups = []
-    context.resolved_links = []
-    context.link_components = []
     context.fiber_direction_samples = None
     context.dt_target_cache_manager = SimpleNamespace(
         update_interval=100, reset=Mock())
     context.theta_crossing_map = SimpleNamespace(invalidate=Mock())
-    context._rebuild_pcl_sampling_strata = Mock()
     context._refresh_trusted_geometry = Mock()
     context._build_theta_crossing_map = Mock(return_value=[])
     context._make_shell_polar_map = Mock(return_value='rebuilt shell map')
@@ -89,36 +82,12 @@ def test_fiber_direction_weight_needs_resident_samples():
         {'loss_weight_fiber_directions': 0.0}, current_iteration=0)
 
 
-# --- sampling weights ------------------------------------------------------------
-
-def test_sampling_weights_rebuild_the_strata_after_validating_every_group():
-    context = _context()
-    context.cross_patch_pcls = [{'sampling_group': 'relative.json'}]
-    context.unattached_strip_sampling_groups = ['fibers']
-    with pytest.raises(KeyError, match='fibers'):
-        context.apply_config(
-            {'pcl_sampling_weights': {'relative': 1.0}}, current_iteration=0)
-    assert context.config['pcl_sampling_weights'] is None
-    context._rebuild_pcl_sampling_strata.assert_not_called()
-
-    context.apply_config(
-        {'pcl_sampling_weights': {'relative': 1.0, 'fibers': 2.0}},
-        current_iteration=0)
-    context._rebuild_pcl_sampling_strata.assert_called_once_with()
-    context._rebuild_pcl_sampling_strata.reset_mock()
-    context.apply_config({'pcl_sampling_weights': None}, current_iteration=0)
-    context._rebuild_pcl_sampling_strata.assert_called_once_with()
-
-
 # --- frozen object-store inputs ---------------------------------------------------
 
 @pytest.mark.parametrize('key, value', [
-    ('pcl_use_fiber_links', False),
-    ('pcl_fiber_min_point_spacing', 5.0),
-    ('pcl_unattached_pcl_min_point_spacing', 2.5),
-    ('pcl_link_distance_tolerance', 3.0),
-    ('pcl_link_window_points', 3),
-    ('input_use_pcl_same_winding', False),
+    ('pcl_patch_overlap_pair_spacing', 5.0),
+    ('pcl_patch_overlap_max_pairs', 3),
+    ('patch_loss_z_margin', 2),
 ])
 def test_settings_shaping_the_frozen_inputs_are_refused(key, value):
     context = _context()
@@ -126,7 +95,6 @@ def test_settings_shaping_the_frozen_inputs_are_refused(key, value):
     with pytest.raises(ValueError, match='object-store inputs are frozen'):
         context.apply_config({key: value}, current_iteration=0)
     assert context.config == config_before
-    context._rebuild_pcl_sampling_strata.assert_not_called()
 
 
 @pytest.mark.parametrize('exponential', [False, True])
@@ -145,7 +113,7 @@ def test_frozen_setting_rejects_lr_changes_without_mutating_optimizer(exponentia
 
     with pytest.raises(ValueError, match='object-store inputs are frozen'):
         context.apply_config({
-            'pcl_fiber_min_point_spacing': 5.0,
+            'pcl_patch_overlap_pair_spacing': 5.0,
             'optimizer_learning_rate': 0.5,
             'optimizer_lr_final_factor': 0.2,
             'optimizer_num_training_steps': horizon_before + 100,

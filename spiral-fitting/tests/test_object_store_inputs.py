@@ -9,7 +9,7 @@ pytest.importorskip('vc_object_store')
 import object_store_inputs as osi  # noqa: E402
 from config import Config  # noqa: E402
 from object_store_fixture import (  # noqa: E402
-    VOLUME, array, branch, frame, pcl_patch_edge, put_fiber, put_patch, put_pcl)
+    VOLUME, array, frame, plane, put_patch, put_track)
 
 
 def _grid(z=20.0, size=6, scale=1):
@@ -18,8 +18,18 @@ def _grid(z=20.0, size=6, scale=1):
                     axis=-1)
 
 
-def _line(n=6, z=30.0):
-    return [[z, 12.0, 10.0 + 4 * i] for i in range(n)]
+def _overlapping(db, shifts, **record):
+    """Patches in the plane y=100, ``shifts`` voxels along x, and the
+    store's overlap edges between them: (patch UUIDs, {frozenset of the two
+    patches: edge UUID})."""
+    patches = [put_patch(db, plane(dx=dx), (0.25, 0.25), **record) for dx in shifts]
+    db.link_surface_overlaps(volume_uuid=VOLUME)
+    return patches, {frozenset((edge['a'], edge['b'])): edge['uuid']
+                     for edge in db.edges_by_kind('same-surface')}
+
+
+def _track(db, **record):
+    return put_track(db, [[30, 12, 10 + i] for i in range(6)], 0, 'horizontal', **record)
 
 
 def request(**selectors):
@@ -41,25 +51,14 @@ def test_saved_positions_use_native_validation(db, value):
     assert osi.InputPosition.from_provenance(dict(db.status(), commit_sequence=0)).commit_sequence == 0
 
 
-def test_dense_fiber_without_synthetic_controls_materializes_whole_line(db):
-    fid = put_fiber(db, _line(), [])
-    snapshot = osi.read_snapshot(db, request())
-    fibers, links, counts = osi.materialize_fibers(db, snapshot, {}, min_point_spacing=0)
-    assert counts['fibers'] == 1 and links == []
-    assert fibers[fid]['metadata']['fiber_num_control_points'] == 0
-    assert list(fibers[fid]['points']) == list(range(6))
-    np.testing.assert_allclose([p['zyx'] for p in fibers[fid]['points'].values()], _line())
-
-
 @pytest.mark.parametrize('history_enabled', [False, True])
 def test_snapshot_uses_numbered_relationship_versions_without_record_generations(tmp_path, history_enabled):
     from vc_object_store import ObjectStore, relationship_reference
 
     with ObjectStore.create(str(tmp_path / 'input.vcobj'), author='test',
                             history_enabled=history_enabled) as store:
-        surface = put_patch(store, _grid())
-        collection = put_pcl(store, {3: ([20.0, 14.0, 14.0], None)})
-        edge = pcl_patch_edge(store, collection, 3, surface, (1.0, 1.0))
+        _, edges = _overlapping(store, (0.0, 8.0))
+        [edge] = edges.values()
         snapshot = osi.read_snapshot(store, request())
         [relationship] = snapshot.relationships
         assert relationship.uuid == edge
@@ -87,13 +86,11 @@ def test_snapshot_uses_numbered_relationship_versions_without_record_generations
 
 def test_default_selection_reads_every_active_object_in_uuid_order(db):
     patches = sorted(put_patch(db, _grid(z)) for z in (10.0, 20.0, 30.0))
-    pcl = put_pcl(db, {3: ([20.0, 14.0, 14.0], None)})
-    fiber = put_fiber(db, _line(), [0, 5])
+    track = _track(db)
     db.upsert_object({'kind': 'surface', 'name': 'placeholder'})
     snapshot = osi.read_snapshot(db, request())
     assert [obj.uuid for obj in snapshot.objects_of('surface')] == patches
-    assert [obj.uuid for obj in snapshot.objects_of('point_collection')] == [pcl]
-    assert [obj.uuid for obj in snapshot.objects_of('fiber')] == [fiber]
+    assert [obj.uuid for obj in snapshot.objects_of('track')] == [track]
     assert snapshot.volume_uuid == VOLUME
     assert snapshot.volume_source == 'inferred'
     assert snapshot.notes == ['skipped 1 surfaces without geometry']
@@ -115,8 +112,8 @@ def test_selection_preserves_inherited_source_identity_and_manifest_pins(db):
     import dataclasses
     from vc_object_store import object_reference
 
-    fiber = put_fiber(db, _line(), [0, 5])
-    source = object_reference(db.object(fiber))
+    patch = put_patch(db, _grid())
+    source = object_reference(db.object(patch))
     class Attachment:
         def __getattr__(self, name):
             return getattr(db, name)
@@ -142,40 +139,40 @@ def test_selection_preserves_inherited_source_identity_and_manifest_pins(db):
     assert again.digest() == snapshot.digest()
     with pytest.raises(ValueError, match='regenerate'):
         osi.InputPins.from_provenance(dict(position=osi.InputPosition.of_status(db.status()).provenance(),
-                                          objects={fiber: source['version']}))
+                                          objects={patch: source['version']}))
     original = dict(source)
     with pytest.raises(ValueError, match='regenerate'):
         osi.InputPins.from_provenance(dict(position=dict(store=owner, generation=generation,
-                                                       commit_sequence=0), objects={fiber: 1}))
+                                                       commit_sequence=0), objects={patch: 1}))
     assert source == original
 
 
 def test_reference_only_pins_validate_boundary_and_carry_reference_unchanged(db):
     from vc_object_store import object_reference, TransactionConflict
-    fiber = put_fiber(db, _line(), [0, 5])
-    reference = object_reference(db.object(fiber))
+    patch = put_patch(db, _grid())
+    reference = object_reference(db.object(patch))
     value = dict(position=osi.InputPosition.of_status(db.status()).provenance(),
-                 references={fiber: reference}, selection={'fiber': [fiber]})
+                 references={patch: reference}, selection={'surface': [patch]})
     pins = osi.InputPins.from_provenance(value)
-    assert pins.refs()[0] is pins.references[fiber]
+    assert pins.refs()[0] is pins.references[patch]
     assert pins.provenance()['references'] is pins.references
     assert 'objects' not in pins.provenance()
     assert osi.InputPins.from_provenance(pins.provenance()).refs() == [reference]
     command = osi.link_request(db.status(), {}, author='test', read_references=pins.refs())
     assert command['command_version'] == 3
-    assert command['read_dependencies'][fiber] is pins.references[fiber]
+    assert command['read_dependencies'][patch] is pins.references[patch]
     assert 'expected_object_references' not in command
     command['operations'] = []
     db.submit(command)
-    assert object_reference(db.object(fiber)) == reference
-    wrong_owner = osi.link_request(db.status(), {}, author='test', read_references=[dict(reference, store=fiber)])
+    assert object_reference(db.object(patch)) == reference
+    wrong_owner = osi.link_request(db.status(), {}, author='test', read_references=[dict(reference, store=patch)])
     wrong_owner['operations'] = []
     with pytest.raises(TransactionConflict):
         db.submit(wrong_owner)
     with pytest.raises(ValueError, match='inconsistent exact input reference'):
         osi.InputPins.from_provenance(dict(value, references={VOLUME: reference}))
     with pytest.raises(ValueError):
-        osi.InputPins.from_provenance(dict(value, references={fiber: dict(reference, version=0)}))
+        osi.InputPins.from_provenance(dict(value, references={patch: dict(reference, version=0)}))
 
 
 @pytest.mark.parametrize('bad', [[], None, '', 1, True])
@@ -189,10 +186,10 @@ def test_saved_pin_maps_are_not_coerced_to_empty(db, bad):
 @pytest.mark.parametrize('bad', [{}, None, '', 1, True])
 def test_saved_pin_selection_arrays_are_validated_once(db, bad):
     value = dict(position=osi.InputPosition.of_status(db.status()).provenance(),
-                 references={}, selection={'fiber': bad})
+                 references={}, selection={'surface': bad})
     with pytest.raises(ValueError, match='arrays'):
         osi.InputPins.from_provenance(value)
-    assert osi.InputPins.from_provenance(dict(value, selection={'fiber': []})).refs() == []
+    assert osi.InputPins.from_provenance(dict(value, selection={'surface': []})).refs() == []
 
 
 def test_marker_read_passes_complete_receipt_reference_unchanged():
@@ -214,19 +211,19 @@ def test_explicit_selectors_tags_and_empty_matches(db):
     put_patch(db, _grid(30.0))
     snapshot = osi.read_snapshot(db, request(
         surface={'uuids': (b,), 'tags': ('keep',)},
-        fiber={'tags': ('absent',)}, volume=VOLUME))
+        track={'tags': ('absent',)}, volume=VOLUME))
     assert [obj.uuid for obj in snapshot.objects_of('surface')] == sorted([a, b])
     # A selector matching nothing selects nothing, never everything.
-    assert snapshot.objects_of('fiber') == []
-    assert snapshot.manifest()['selection']['fiber']['count'] == 0
+    assert snapshot.objects_of('track') == []
+    assert snapshot.manifest()['selection']['track']['count'] == 0
 
 
 def test_explicit_selection_problems_are_reported_together(db):
     missing = '00000000-0000-4000-8000-00000000dead'
     empty = db.upsert_object({'kind': 'surface', 'name': 'placeholder'})
-    pcl = put_pcl(db, {0: ([20.0, 14.0, 14.0], None)})
+    track = _track(db)
     with pytest.raises(osi.ObjectStoreInputError) as error:
-        osi.read_snapshot(db, request(surface={'uuids': (missing, pcl)}))
+        osi.read_snapshot(db, request(surface={'uuids': (missing, track)}))
     assert len(error.value.problems) == 2
     with pytest.raises(osi.ObjectStoreInputError, match='has no geometry'):
         osi.read_snapshot(db, request(surface={'uuids': (empty,)}))
@@ -238,7 +235,7 @@ def test_the_volume_is_inferred_configured_or_refused(db):
         osi.read_snapshot(db, request())
     assert osi.read_snapshot(db, request(volume=VOLUME)).objects == {}
     put_patch(db, _grid())
-    put_pcl(db, {0: ([20.0, 14.0, 14.0], None)})
+    _track(db)
     assert osi.read_snapshot(db, request()).volume_source == 'inferred'
     explicit = osi.read_snapshot(db, request(volume=VOLUME))
     assert (explicit.volume_uuid, explicit.volume_source) == (VOLUME, 'configured')
@@ -254,8 +251,7 @@ def test_the_volume_is_inferred_configured_or_refused(db):
 def test_every_object_without_a_frame_is_reported(db):
     put_patch(db, _grid())
     first = put_patch(db, _grid(30.0), coordinates=None, name='first')
-    second = put_pcl(db, {0: ([20.0, 14.0, 14.0], None)},
-                     coordinates={'volume_uuid': VOLUME}, name='second')
+    second = _track(db, coordinates={'volume_uuid': VOLUME}, name='second')
     with pytest.raises(osi.ObjectStoreInputError) as error:
         osi.read_snapshot(db, request())
     problems = '\n'.join(error.value.problems)
@@ -300,48 +296,37 @@ def test_a_fit_level_converts_frames_to_its_voxels(db):
 
 
 def test_relationship_filtering_and_endpoint_order(db):
-    patch = put_patch(db, _grid())
-    other_patch = put_patch(db, _grid(40.0))
-    pcl = put_pcl(db, {0: ([20.0, 10.0, 10.0], None), 1: ([20.0, 14.0, 14.0], None),
-                       2: ([20.0, 18.0, 18.0], None)})
-    a = put_fiber(db, _line(), [0, 5], [10, 20])
-    b = put_fiber(db, _line(z=34.0), [0, 5], [30, 40])
-    pending = pcl_patch_edge(db, pcl, 0, patch, (0.0, 0.0))
-    approved = pcl_patch_edge(db, pcl, 1, patch, (1.0, 1.0))
+    (a, b, c, outside_patch), edges = _overlapping(db, (0.0, 2.0, 4.0, 6.0))
+    pending = edges[frozenset((a, b))]
+    approved = edges[frozenset((a, c))]
     db.set_approval(approved, 'approved')
-    rejected = pcl_patch_edge(db, pcl, 2, patch, (2.0, 2.0))
+    rejected = edges[frozenset((b, c))]
     db.set_approval(rejected, 'rejected')
-    outside = pcl_patch_edge(db, pcl, 1, other_patch, (1.0, 1.0))
-    ordinary = branch(db, b, 30, a, 20)
-    adjacent = branch(db, a, 10, b, 40, adjacent=True)
+    outside = {edges[frozenset((patch, outside_patch))] for patch in (a, b, c)}
 
-    snapshot = osi.read_snapshot(db, request(surface={'uuids': (patch,)}))
+    snapshot = osi.read_snapshot(db, request(surface={'uuids': (a, b, c)}))
     consumed = {rel.uuid: rel for rel in snapshot.relationships}
-    assert set(consumed) == {pending, approved, ordinary, adjacent}
-    assert outside not in consumed
-    assert snapshot.exclusions == {'rejected': 1, 'endpoint outside selection': 1}
-    assert consumed[adjacent].family == 'fiber_branch'
+    assert set(consumed) == {pending, approved}
+    assert not outside & set(consumed)
+    assert snapshot.exclusions == {'rejected': 1, 'endpoint outside selection': 3}
     edge = consumed[pending]
-    assert (edge.family, edge.a, edge.b) == ('pcl_patch', patch, pcl)
-    assert edge.b_anchor['points'][0]['array'] == 'point_ids'
-    fiber_edge = consumed[ordinary]
-    assert (fiber_edge.a, fiber_edge.b) == tuple(sorted([a, b]))
+    assert (edge.family, edge.a, edge.b) == ('patch_overlap', *sorted([a, b]))
 
     approved_only = osi.read_snapshot(db, request(
-        surface={'uuids': (patch,)}, approved=True))
+        surface={'uuids': (a, b, c)}, approved=True))
     assert [rel.uuid for rel in approved_only.relationships] == [approved]
-    assert approved_only.exclusions['pending (approved-only)'] == 3
+    assert approved_only.exclusions['pending (approved-only)'] == 1
 
 
 def test_manifest_records_frames_and_its_digest_follows_inputs(db, tmp_path):
-    patch = put_patch(db, _grid(), coordinates=frame(2))
-    pcl = put_pcl(db, {0: ([20.0, 14.0, 14.0], None)})
-    edge = pcl_patch_edge(db, pcl, 0, patch, (1.0, 1.0))
+    (patch, other), edges = _overlapping(db, (0.0, 8.0))
+    [edge] = edges.values()
+    track = _track(db, coordinates=frame(2))
     snapshot = osi.read_snapshot(db, request())
     manifest = snapshot.manifest()
     assert manifest['units'] == osi.FIT_UNITS
     assert {obj['uuid']: obj['scale_factor'] for obj in manifest['objects']} == {
-        patch: 2, pcl: 1}
+        patch: 1, other: 1, track: 2}
     assert manifest['relationships'][0]['uuid'] == edge
     incomplete = json.loads(json.dumps(manifest))
     incomplete['relationships'][0].pop('reference')
@@ -373,7 +358,7 @@ def test_manifest_records_frames_and_its_digest_follows_inputs(db, tmp_path):
     assert osi.main([db.path, '--json', str(report)]) == 0
     written = json.loads(report.read_text())
     assert written['manifest']['volume_uuid'] == VOLUME
-    assert any('pcl_patch 1' in line for line in written['report'])
+    assert any('patch_overlap 1' in line for line in written['report'])
 
 
 def test_manifest_validation_reuses_decoded_references(db, monkeypatch):

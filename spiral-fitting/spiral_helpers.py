@@ -6,7 +6,6 @@ import scipy.ndimage
 import torch
 from tqdm import tqdm
 
-from devices import float_hi, scatter_reduce_
 from fit_session import fit_level_scale
 from sample_spiral import get_spiral_yxs, get_theta_and_radii
 from surface_orientation import GridLayout, export_metadata
@@ -120,51 +119,6 @@ def scale_and_split_counts(config, z_begin, z_end, count_keys, world_size=None):
     return scale, num_slices, split_divisor
 
 
-def _decimate_ordered_points_min_spacing(points, min_spacing, return_indices=False,
-                                         force_keep=None):
-    # force_keep: original indices that must survive regardless of spacing (used to
-    # keep cross-fiber link endpoints exact). Keeping a few extra, more closely
-    # spaced points is harmless to the strip/winding losses.
-    force_keep = set(force_keep or ())
-    if min_spacing <= 0 or len(points) <= 1:
-        keep = list(range(len(points)))
-        return (points, np.asarray(keep, dtype=np.int64)) if return_indices else points
-
-    keep = [0]
-    last_kept = points[0]
-    for i in range(1, len(points)):
-        if i in force_keep or np.linalg.norm(points[i] - last_kept) >= min_spacing:
-            keep.append(i)
-            last_kept = points[i]
-    if return_indices:
-        return points[keep], np.asarray(keep, dtype=np.int64)
-    return points[keep]
-
-
-def fiber_control_span(control_xyz, line_xyz):
-    """The fiber polyline fitted against, trimmed to its control-point span.
-
-    Maps each control point to its nearest line point (exact coincidence in
-    practice) and trims the polyline to the span between the first and last
-    mapped control. Returns ``(points, span_begin, control_line_indices)``:
-    the trimmed points, the line index of their first point, and each
-    control's untrimmed line index. Without a usable dense polyline (legacy or
-    degenerate fiber) the control points themselves are the polyline.
-    """
-    num_control_points = len(control_xyz)
-    if not num_control_points:
-        return line_xyz, 0, np.empty(0, dtype=np.int64)
-    if len(line_xyz) >= num_control_points and num_control_points >= 1:
-        squared_distances = (
-            (line_xyz[None, :, :] - control_xyz[:, None, :]) ** 2).sum(axis=-1)
-        control_line_indices = squared_distances.argmin(axis=1)
-        span_begin = int(control_line_indices.min())
-        span_end = int(control_line_indices.max())
-        return (line_xyz[span_begin:span_end + 1], span_begin,
-                control_line_indices)
-    return control_xyz, 0, np.arange(num_control_points)
-
-
 def classify_fiber_hv(hv_classification, zyxs, *, min_z_fraction,
                       min_auto_certainty):
     """Return 'V', 'H', or None for one fiber polyline.
@@ -200,373 +154,6 @@ def classify_fiber_hv(hv_classification, zyxs, *, min_z_fraction,
     if z_fraction <= 1.0 - min_z_fraction:
         return 'H'
     return None
-
-
-def point_attachments(point):
-    """The patch attachments of a physical point.
-
-    A point attached to several patches lists them in ``attachments``;
-    otherwise its single attachment, if any, is ``on_patch``.
-    """
-    if 'attachments' in point:
-        return point['attachments']
-    on_patch = point.get('on_patch')
-    return [] if on_patch is None else [on_patch]
-
-
-def build_link_components(resolved_links):
-    """Connected components of collections joined by cross-fiber links.
-
-    Returns a list of (member_cids, member_links): member_cids in BFS order from
-    the component's first-seen collection, member_links the resolved links whose
-    endpoints both lie in the component."""
-    adjacency = {}
-    for link in resolved_links:
-        adjacency.setdefault(link['a_coll'], []).append(link)
-        adjacency.setdefault(link['b_coll'], []).append(link)
-    components = []
-    seen = set()
-    for seed in adjacency:
-        if seed in seen:
-            continue
-        member_cids = []
-        member_links = []
-        seen_links = set()
-        queue = [seed]
-        seen.add(seed)
-        while queue:
-            cid = queue.pop(0)
-            member_cids.append(cid)
-            for link in adjacency[cid]:
-                if id(link) not in seen_links:
-                    seen_links.add(id(link))
-                    member_links.append(link)
-                other = link['b_coll'] if link['a_coll'] == cid else link['a_coll']
-                if other not in seen:
-                    seen.add(other)
-                    queue.append(other)
-        components.append((member_cids, member_links))
-    return components
-
-
-class Chain:
-    """Traversal interface every pcl carries as pcl['chain'].
-
-    Consumers go through this and never assume the pcl's id-sorted point order
-    is chain-valid (it is not for merged fiber-link components, whose chains
-    route through their fiber graph). Two entry points:
-      - zyxs_between(p1, p2): ordered (N, 3) [z, y, x] chain from p1 to p2 with
-        every consecutive pair |dtheta| < pi apart, for sequential theta=0
-        unwrapping;
-      - iter_chain(): a chain-valid point sequence covering the whole pcl (may
-        revisit points; consumers wanting each adjacency once must dedupe)."""
-
-    def zyxs_between(self, p1, p2):
-        return self._zyxs(self.points_between(p1, p2))
-
-    def points_between(self, p1, p2):
-        raise NotImplementedError
-
-    def iter_chain(self):
-        raise NotImplementedError
-
-    @staticmethod
-    def _zyxs(points):
-        return np.stack([p['zyx'] for p in points], axis=0).astype(np.float32)
-
-
-class SequenceChain(Chain):
-    """Chain for an ordinary (single-sequence) pcl: id-sorted point order.
-
-    Holds a reference to the pcl dict; the sorted view is cached against the
-    identity and length of pcl['points'], so both replacing the points dict
-    wholesale (as the z-roi trims do) and adding/removing keys in place
-    invalidate it. Same-size in-place key replacement would go undetected --
-    don't do that; replace the dict instead."""
-
-    def __init__(self, pcl):
-        self.pcl = pcl
-        self._source = None
-        self._source_len = -1
-        self._ordered = None
-        self._index_of = None
-
-    def _sorted(self):
-        points = self.pcl['points']
-        if self._source is not points or self._source_len != len(points):
-            self._source = points
-            self._source_len = len(points)
-            self._ordered = [p for _, p in sorted(points.items(), key=lambda kv: int(kv[0]))]
-            self._index_of = {id(p): k for k, p in enumerate(self._ordered)}
-        return self._ordered, self._index_of
-
-    def points_between(self, p1, p2):
-        ordered, index_of = self._sorted()
-        i1, i2 = index_of[id(p1)], index_of[id(p2)]
-        if i1 <= i2:
-            return ordered[i1:i2 + 1]
-        return list(reversed(ordered[i2:i1 + 1]))
-
-    def iter_chain(self):
-        return self._sorted()[0]
-
-
-class ComponentChain(Chain):
-    """Chain for a merged fiber-link component: routes through the fiber graph.
-
-    member_sorted[m] is member m's points in int-id order; pos_of maps
-    id(point) -> (member, position); tree_parent[m] is None for the root else
-    (parent_member, pos_in_parent, pos_in_m) for the link joining m to its
-    spanning-tree parent; extra_edges are the loop-closing link edges not in the
-    spanning tree, as (m_a, pos_a, m_b, pos_b). zyxs_between routes through the
-    tree only (any route is winding-equivalent when the annotations are
-    consistent); iter_chain also crosses every extra edge once, so tour-walking
-    consumers (holonomy detection in find_inconsistent_windings) see each link
-    cycle's constraint. Junction hop endpoints are nearly coincident, so every
-    consecutive chain pair satisfies the |dtheta| < pi unwrap assumption."""
-
-    def __init__(self, member_sorted, pos_of, tree_parent, extra_edges=()):
-        self.member_sorted = member_sorted
-        self.pos_of = pos_of
-        self.tree_parent = tree_parent
-        self.extra_edges = list(extra_edges)
-
-    def _path_to_root(self, m):
-        path = [m]
-        while self.tree_parent[m] is not None:
-            m = self.tree_parent[m][0]
-            path.append(m)
-        return path
-
-    def _hop_positions(self, m_from, m_to):
-        # Positions (leave in m_from, arrive in m_to) of the tree link between
-        # two adjacent members, whichever of the two is the tree child.
-        tree_parent = self.tree_parent
-        if tree_parent[m_to] is not None and tree_parent[m_to][0] == m_from:
-            _, pos_parent, pos_child = tree_parent[m_to]
-            return pos_parent, pos_child
-        assert tree_parent[m_from] is not None and tree_parent[m_from][0] == m_to
-        _, pos_parent, pos_child = tree_parent[m_from]
-        return pos_child, pos_parent
-
-    def _member_segment(self, m, pos_from, pos_to):
-        points = self.member_sorted[m]
-        if pos_from <= pos_to:
-            return points[pos_from:pos_to + 1]
-        return list(reversed(points[pos_to:pos_from + 1]))
-
-    def points_between(self, p1, p2):
-        # Within-member index ranges concatenated across the spanning-tree path
-        # from p1's member to p2's, hopping fibers at each junction.
-        m1, i1 = self.pos_of[id(p1)]
-        m2, i2 = self.pos_of[id(p2)]
-        if m1 == m2:
-            member_path = [m1]
-        else:
-            up1 = self._path_to_root(m1)
-            up2 = self._path_to_root(m2)
-            in_up2 = {m: k for k, m in enumerate(up2)}
-            lca_idx1 = next(k for k, m in enumerate(up1) if m in in_up2)
-            lca = up1[lca_idx1]
-            member_path = up1[:lca_idx1 + 1] + list(reversed(up2[:in_up2[lca]]))
-        chain = []
-        pos = i1
-        for m_from, m_to in zip(member_path, member_path[1:]):
-            leave, arrive = self._hop_positions(m_from, m_to)
-            chain.extend(self._member_segment(m_from, pos, leave))
-            pos = arrive
-        chain.extend(self._member_segment(member_path[-1], pos, i2))
-        return chain
-
-    def iter_chain(self):
-        # Euler tour of the member tree: walk each member end-to-end and back,
-        # detouring into each child at its junction position (and returning), so
-        # every consecutive pair of tour points is either an adjacent same-fiber
-        # pair or a nearly-coincident junction hop. Loop-closing (non-tree) link
-        # edges are also crossed once each, at the first visit of either
-        # endpoint: hop across, re-walk the far member without further detours
-        # (its own subtree and edges are covered by the main tour), and hop
-        # back. Adjustment-accumulating consumers thereby see every link
-        # cycle's constraint, not just the spanning tree's.
-        children = {m: {} for m in self.tree_parent}
-        root = None
-        for m, parent in self.tree_parent.items():
-            if parent is None:
-                root = m
-            else:
-                parent_m, pos_in_parent, pos_in_child = parent
-                children[parent_m].setdefault(pos_in_parent, []).append((m, pos_in_child))
-        extra_at = {}
-        for k, (m_a, pos_a, m_b, pos_b) in enumerate(self.extra_edges):
-            extra_at.setdefault((m_a, pos_a), []).append((k, m_b, pos_b))
-            extra_at.setdefault((m_b, pos_b), []).append((k, m_a, pos_a))
-        crossed = set()
-        out = []
-
-        def tour(m, enter_pos, detour=True):
-            points = self.member_sorted[m]
-            n = len(points)
-            kids = children[m]
-            seen_pos = set()
-            walk = (list(range(enter_pos, -1, -1)) + list(range(1, n))
-                    + list(range(n - 2, enter_pos - 1, -1)))
-            for pos in walk:
-                out.append(points[pos])
-                if not detour or pos in seen_pos:
-                    continue
-                seen_pos.add(pos)
-                for child, child_pos in kids.get(pos, []):
-                    tour(child, child_pos)
-                    out.append(points[pos])  # hop back through the junction
-                for k, other, other_pos in extra_at.get((m, pos), []):
-                    if k in crossed:
-                        continue
-                    crossed.add(k)
-                    tour(other, other_pos, detour=False)
-                    out.append(points[pos])  # hop back through the junction
-
-        tour(root, 0)
-        return out
-
-
-def _index_component_members(members):
-    """Per-member id-sorted point lists and the id(point) -> (member, pos) map."""
-    member_sorted = [
-        sorted(pcl['points'].values(), key=lambda point: int(point['id']))
-        for _, pcl in members
-    ]
-    pos_of = {}
-    for m, points in enumerate(member_sorted):
-        for pos, point in enumerate(points):
-            pos_of[id(point)] = (m, pos)
-    return member_sorted, pos_of
-
-
-def _component_link_edges(members, member_links, point_collections, pos_of):
-    """Member-indexed undirected link edges (m_a, pos_a, m_b, pos_b), deduped;
-    links whose endpoints fall outside `members` (or within one member) drop."""
-    member_index = {cid: m for m, (cid, _) in enumerate(members)}
-    edges = []
-    seen = set()
-    for link in member_links:
-        m_a = member_index.get(link['a_coll'])
-        m_b = member_index.get(link['b_coll'])
-        if m_a is None or m_b is None or m_a == m_b:
-            continue
-        pa = point_collections[link['a_coll']]['points'][link['a_point']]
-        pb = point_collections[link['b_coll']]['points'][link['b_point']]
-        edge = (m_a, pos_of[id(pa)][1], m_b, pos_of[id(pb)][1])
-        key = frozenset([(edge[0], edge[1]), (edge[2], edge[3])])
-        if key in seen:
-            continue
-        seen.add(key)
-        edges.append(edge)
-    return edges
-
-
-def _link_spanning_tree(num_members, link_edges):
-    """BFS spanning tree over members from member 0 along the link edges.
-
-    Returns (tree_parent, extra_edges): tree_parent as ComponentChain expects it
-    (covering only the members reachable from 0), extra_edges the loop-closing
-    non-tree edges whose members are both reachable."""
-    adjacency = {m: [] for m in range(num_members)}
-    for k, (m_a, pos_a, m_b, pos_b) in enumerate(link_edges):
-        adjacency[m_a].append((k, m_b, pos_a, pos_b))
-        adjacency[m_b].append((k, m_a, pos_b, pos_a))
-    tree_parent = {0: None}
-    tree_edge_ids = set()
-    queue = [0]
-    while queue:
-        m = queue.pop(0)
-        for k, neighbour, pos_m, pos_n in adjacency[m]:
-            if neighbour not in tree_parent:
-                tree_parent[neighbour] = (m, pos_m, pos_n)
-                tree_edge_ids.add(k)
-                queue.append(neighbour)
-    extra_edges = [edge for k, edge in enumerate(link_edges)
-                   if k not in tree_edge_ids
-                   and edge[0] in tree_parent and edge[2] in tree_parent]
-    return tree_parent, extra_edges
-
-
-def merge_linked_point_collections(point_collections, link_components,
-                                   cross_patch_point_collections):
-    """Fold link-connected collections into merged cross-patch component pcls.
-
-    link_components is the shared decomposition from build_link_components
-    over fiber branch links; member points carry their fiber's winding
-    offset in the component (pcl_views.fiber_winding_offsets).
-    For each link component, removes the member collections from the cross-patch
-    pool and (when the union holds >= 2 attached points) adds one merged pcl
-    whose points are the union of all member points, renumbered member-major.
-    The merged pcl carries the same uniform chain interface as ordinary pcls
-    (pcl['chain'], see Chain) -- a ComponentChain routing through the fiber
-    graph, since its id-sorted point order is NOT chain-valid across members.
-    'link_member_cids' records the member collection ids for diagnostics.
-
-    Returns (cross_patch_point_collections, num_merged); the input dict is
-    modified in place and also returned."""
-    num_merged = 0
-    for member_cids, member_links in link_components:
-        members = [(cid, point_collections[cid]) for cid in member_cids
-                   if cid in point_collections]
-        if len(members) < 2:
-            continue
-        member_sorted, pos_of = _index_component_members(members)
-        link_edges = _component_link_edges(members, member_links, point_collections, pos_of)
-        tree_parent, extra_edges = _link_spanning_tree(len(members), link_edges)
-        if len(tree_parent) < len(members):
-            # Members whose links resolved against collections outside
-            # point_collections can leave the component disconnected; keep only
-            # the part reachable from the first member merged and leave the rest
-            # as-is. Rebuild the indices/edges/tree from the subset rather than
-            # remapping in place.
-            print(f'WARNING: fiber-link component {member_cids} not fully '
-                  f'connected after loading; merging only the reachable part')
-            members = [members[m] for m in sorted(tree_parent)]
-            member_sorted, pos_of = _index_component_members(members)
-            link_edges = _component_link_edges(members, member_links, point_collections, pos_of)
-            tree_parent, extra_edges = _link_spanning_tree(len(members), link_edges)
-        # Merged keys are fresh member-major ordinals, but the point dicts are the
-        # members' own (shared, not copied -- they also live on in the unattached
-        # pool) and keep their member-local 'id', which stays meaningful for
-        # tracing a point back to its source fiber. So on a merged pcl key !=
-        # point['id']: never index merged_points by a point's 'id'.
-        merged_points = {}
-        for points in member_sorted:
-            for point in points:
-                merged_points[len(merged_points)] = point
-        for cid, _ in members:
-            cross_patch_point_collections.pop(cid, None)
-        num_attached = sum(len(point_attachments(point))
-                           for point in merged_points.values())
-        if num_attached < 2:
-            continue
-        merged_id = f'fibercomp:{num_merged}'
-        rep = members[0][1]
-        logical_members = [
-            pcl.get('metadata', {}).get('logical_input_id')
-            for _, pcl in members
-            if pcl.get('metadata', {}).get('logical_input_id') is not None
-        ]
-        if extra_edges:
-            print(f'fiber-link component {merged_id} '
-                  f'({[cid for cid, _ in members]}): {len(extra_edges)} '
-                  f'loop-closing link(s) beyond the spanning tree')
-        cross_patch_point_collections[merged_id] = {
-            'id': merged_id,
-            'name': merged_id,
-            'sampling_group': rep.get('sampling_group', 'fibers'),
-            'metadata': {'winding_is_absolute': False,
-                         'input_role': 'fiber_link_component',
-                         'logical_input_ids': logical_members},
-            'points': merged_points,
-            'link_member_cids': [cid for cid, _ in members],
-            'chain': ComponentChain(member_sorted, pos_of, tree_parent, extra_edges),
-        }
-        num_merged += 1
-    return cross_patch_point_collections, num_merged
 
 
 def _huber_abs(residual, delta):
@@ -640,24 +227,21 @@ def compute_winding_range_and_input_extents(
     slice_to_spiral_transform,
     dr_per_winding,
     patches,
-    unattached_pcl_strips,
     cfg,
     z_begin,
     z_end,
-    get_or_build_unattached_pcl_flat,
     authoritative_zyx_lines=(),
     point_budget=None,
 ):
-    """Compute output winding range plus max observed radius/winding per patch and PCL.
+    """Compute output winding range plus max observed radius/winding per patch.
 
     ``point_budget`` caps how many points of each input kind are actually
-    transformed (per patch for patches, in total for PCL strips and for
-    tracks). ``None`` transforms every point, which is what a run's
-    authoritative output needs; a budget trades a fraction of a winding of
-    accuracy for a bounded, dataset-size-independent cost, which is what an
-    interactive preview needs. Per-patch and per-strip extents are estimated
-    from the same subsample, so a caller that needs them exactly must leave the
-    budget unset.
+    transformed (per patch for patches, in total for tracks). ``None``
+    transforms every point, which is what a run's authoritative output needs;
+    a budget trades a fraction of a winding of accuracy for a bounded,
+    dataset-size-independent cost, which is what an interactive preview needs.
+    Per-patch extents are estimated from the same subsample, so a caller that
+    needs them exactly must leave the budget unset.
     """
     device = dr_per_winding.device
     dr = dr_per_winding.detach()
@@ -716,34 +300,6 @@ def compute_winding_range_and_input_extents(
             float(radius.max().item()),
             int(winding_indices.max().item()),
         )
-
-    pcl_extents = [(None, None)] * len(unattached_pcl_strips)
-    if unattached_pcl_strips:
-        flat = get_or_build_unattached_pcl_flat(unattached_pcl_strips, device)
-        if flat is not None and flat['total'] > 0:
-            zyxs = flat['zyxs']
-            strip_id = flat['strip_id']
-            num_strips = flat['num_strips']
-            in_roi = (zyxs[:, 0] >= z_begin) & (zyxs[:, 0] < z_end)
-            if in_roi.any():
-                zyxs_roi = _stride_to_budget(zyxs[in_roi], point_budget)
-                strip_id_roi = _stride_to_budget(strip_id[in_roi], point_budget)
-                spiral_zyxs = transform_in_chunks(zyxs_roi)
-                _, radius, shifted_radius = get_theta_and_radii(spiral_zyxs[..., 1:], dr_per_winding)
-                winding_indices = (shifted_radius / dr).round().to(torch.int64).clamp_min(0)
-                update_from_winding_indices(winding_indices)
-                per_strip_max_r = torch.zeros(num_strips, dtype=torch.float32, device=device)
-                per_strip_max_w = torch.full((num_strips,), -1, dtype=torch.int64, device=device)
-                strip_has_roi = torch.zeros(num_strips, dtype=torch.bool, device=device)
-                per_strip_max_r.scatter_reduce_(0, strip_id_roi, radius.to(torch.float32), reduce='amax')
-                scatter_reduce_(per_strip_max_w, strip_id_roi, winding_indices, 'amax')
-                strip_has_roi.scatter_(0, strip_id_roi, torch.ones_like(strip_id_roi, dtype=torch.bool))
-                per_strip_max_r_cpu = per_strip_max_r.cpu().tolist()
-                per_strip_max_w_cpu = per_strip_max_w.cpu().tolist()
-                strip_has_roi_cpu = strip_has_roi.cpu().tolist()
-                for k in range(num_strips):
-                    if strip_has_roi_cpu[k]:
-                        pcl_extents[k] = (per_strip_max_r_cpu[k], per_strip_max_w_cpu[k])
 
     # Tracks are authoritative fit geometry too.  Including them makes
     # tracks-only/disable-patches sessions derive the same output upper bound
@@ -825,31 +381,27 @@ def compute_winding_range_and_input_extents(
     else:
         margin = cfg['output_winding_margin']
         output_winding_range = (max(min_w - margin, first_winding), max_w + 1 + margin)
-    return output_winding_range, patch_extents, pcl_extents
+    return output_winding_range, patch_extents
 
 
 def _infer_shell_outer_winding_idx(
     slice_to_spiral_transform,
     dr_per_winding,
     patches,
-    unattached_pcl_strips,
     cfg,
     z_begin,
     z_end,
-    get_or_build_unattached_pcl_flat,
 ):
-    _, patch_extents, pcl_extents = compute_winding_range_and_input_extents(
+    _, patch_extents = compute_winding_range_and_input_extents(
         slice_to_spiral_transform,
         dr_per_winding,
         patches,
-        unattached_pcl_strips,
         cfg,
         z_begin,
         z_end,
-        get_or_build_unattached_pcl_flat,
     )
     observed_max = None
-    for _, max_w in patch_extents + pcl_extents:
+    for _, max_w in patch_extents:
         if max_w is None:
             continue
         observed_max = max_w if observed_max is None else max(observed_max, max_w)
@@ -943,8 +495,6 @@ def _structurally_disabled_dense_weight_keys(cfg, shell_outer_winding_idx):
 def _warn_if_inputs_exceed_flow_bounds(
     patch_ids,
     patch_extents,
-    unattached_pcl_strips,
-    pcl_extents,
     flow_field_radius,
     cfg,
 ):
@@ -962,38 +512,23 @@ def _warn_if_inputs_exceed_flow_bounds(
         if max_w >= gap_expander_num_windings:
             over_winding_patches.append((pid, max_w))
 
-    over_radius_pcls = []
-    over_winding_pcls = []
-    for k, (strip, (max_r, max_w)) in enumerate(zip(unattached_pcl_strips, pcl_extents)):
-        if max_r is None:
-            continue
-        name = strip.get('name') or strip.get('id') or strip.get('source_file') or f'#{k}'
-        if max_r > flow_field_radius:
-            over_radius_pcls.append((name, max_r))
-        if max_w >= gap_expander_num_windings:
-            over_winding_pcls.append((name, max_w))
-
-    def _print_offenders(kind, value_label, threshold_label, patches, pcls, fmt):
-        if not (patches or pcls):
+    def _print_offenders(kind, value_label, threshold_label, patches, fmt):
+        if not patches:
             return
-        print(f'WARNING: {len(patches)} patch(es) and {len(pcls)} unattached pcl(s) have {value_label} exceeding {threshold_label}:')
+        print(f'WARNING: {len(patches)} patch(es) have {value_label} exceeding {threshold_label}:')
         for pid, v in sorted(patches, key=lambda e: -e[1])[:10]:
             print(f'  patch {pid}: max {kind} {fmt(v)}')
         if len(patches) > 10:
             print(f'  ... and {len(patches) - 10} more patches')
-        for name, v in sorted(pcls, key=lambda e: -e[1])[:10]:
-            print(f'  pcl {name}: max {kind} {fmt(v)}')
-        if len(pcls) > 10:
-            print(f'  ... and {len(pcls) - 10} more pcls')
 
     _print_offenders(
         'spiral radius', 'spiral-space radius', f'flow_bounds_radius ({flow_field_radius})',
-        over_radius_patches, over_radius_pcls, lambda v: f'{v:.1f}',
+        over_radius_patches, lambda v: f'{v:.1f}',
     )
     _print_offenders(
         'winding idx', 'winding index',
         f'gap_expander_capacity_windings ({gap_expander_num_windings})',
-        over_winding_patches, over_winding_pcls, lambda v: f'{v}',
+        over_winding_patches, lambda v: f'{v}',
     )
 
 
@@ -1209,13 +744,11 @@ def save_mesh(
     slice_to_spiral_transform,
     dr_per_winding,
     patches,
-    unattached_pcl_strips,
     out_path,
     cfg,
     z_begin,
     z_end,
     voxel_size_um,
-    get_or_build_unattached_pcl_flat,
     *,
     winding_range,
     patch_satisfaction_evaluation,
@@ -1312,13 +845,11 @@ def save_combined_preview(
     slice_to_spiral_transform,
     dr_per_winding,
     patches,
-    unattached_pcl_strips,
     generation_path,
     cfg,
     z_begin,
     z_end,
     voxel_size_um,
-    get_or_build_unattached_pcl_flat,
     tracks=(),
     *,
     surface_id,
@@ -1334,7 +865,7 @@ def save_combined_preview(
     The preview's outer bound is the configured ``shell_outer_winding_idx``
     whenever there is one: it is the winding every dense sampler already
     integrates out to, so the model is defined there, and taking it directly
-    skips a pass that transformed every patch, PCL and track point through the
+    skips a pass that transformed every patch and track point through the
     flow ODE to derive a bound the configuration already states. Only a run
     that leaves the index unset derives the bound, and then from a bounded
     sample rather than from every point.
@@ -1365,15 +896,13 @@ def save_combined_preview(
     if configured_outer is not None:
         exclusive_upper = int(configured_outer) + 1
     else:
-        (_, exclusive_upper), _, _ = compute_winding_range_and_input_extents(
+        (_, exclusive_upper), _ = compute_winding_range_and_input_extents(
             input_extent_transform,
             dr_per_winding,
             patches,
-            unattached_pcl_strips,
             cfg,
             z_begin,
             z_end,
-            get_or_build_unattached_pcl_flat,
             authoritative_zyx_lines=tracks,
             point_budget=ESTIMATED_WINDING_RANGE_POINT_BUDGET,
         )
@@ -1489,36 +1018,3 @@ def erode_patch_valid_region(patch, num_cells):
         return False
     patch.__post_init__()
     return True
-
-
-def _segmented_median_per_strip(ctx):
-    # Segmented median: sort the flat values with a composite key
-    # (strip_id-major, normalised_radii-minor) so values for each strip end
-    # up contiguous and sorted within their range.
-    normalised_radii = ctx['normalised_radii']
-    strip_id = ctx['strip_id']
-    starts = ctx['starts']
-    lengths = ctx['lengths']
-    S = ctx['S']
-    device = ctx['device']
-    if normalised_radii.numel() == 0:
-        return torch.zeros(S, dtype=normalised_radii.dtype, device=device)
-
-    if float_hi(device) != torch.float64:
-        # The composite key below needs float64 to keep the value bits. A
-        # value sort followed by a stable strip sort gives the same order.
-        order = torch.argsort(normalised_radii)
-        order = order[torch.argsort(strip_id[order], stable=True)]
-        return normalised_radii[order][starts[:-1] + (lengths - 1) // 2]
-
-    val_min = normalised_radii.min().to(torch.float64)
-    val_max = normalised_radii.max().to(torch.float64)
-    val_range = (val_max - val_min) + 1.0
-    composite = (
-        strip_id.to(torch.float64) * val_range
-        + (normalised_radii.to(torch.float64) - val_min)
-    )
-    order = torch.argsort(composite)
-    sorted_norm = normalised_radii[order]
-    median_indices = starts[:-1] + (lengths - 1) // 2
-    return sorted_norm[median_indices]

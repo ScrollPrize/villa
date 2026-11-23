@@ -13,7 +13,7 @@ def cpu(monkeypatch):
 
 @pytest.fixture()
 def store_path(tmp_path):
-    """A closed store with two patches and a PCL touching each of them."""
+    """A closed store with three patches, two of them overlapping."""
     from object_store_fixture import write_walk_store
     return write_walk_store(tmp_path / 'fit.vcobj')
 

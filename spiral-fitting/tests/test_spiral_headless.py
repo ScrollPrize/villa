@@ -196,15 +196,13 @@ class PreviewRangeTests(unittest.TestCase):
 
         transform = CountingIdentity()
         tracks = [np.array([[50, 0, x]], dtype=np.float32) for x in range(70_000)]
-        winding_range, patch_extents, pcl_extents = compute_winding_range_and_input_extents(
+        winding_range, patch_extents = compute_winding_range_and_input_extents(
             transform,
             torch.tensor(10.0),
-            [],
             [],
             {"output_first_winding": 10, "output_winding_margin": 4},
             0,
             100,
-            lambda *_: None,
             authoritative_zyx_lines=tracks,
         )
 
@@ -213,7 +211,6 @@ class PreviewRangeTests(unittest.TestCase):
         self.assertEqual(transform.calls, 1)
         self.assertEqual(winding_range, (10, 7005))
         self.assertEqual(patch_extents, [])
-        self.assertEqual(pcl_extents, [])
 
     def test_a_point_budget_bounds_the_transformed_track_points(self):
         class CountingIdentity:
@@ -233,14 +230,13 @@ class PreviewRangeTests(unittest.TestCase):
             dtype=torch.float32)]
         cfg = {"output_first_winding": 10, "output_winding_margin": 4}
         exact = CountingIdentity()
-        exact_range, _, _ = compute_winding_range_and_input_extents(
-            exact, dr_per_winding, [], [], cfg, 0, 100, lambda *_: None,
+        exact_range, _ = compute_winding_range_and_input_extents(
+            exact, dr_per_winding, [], cfg, 0, 100,
             authoritative_zyx_lines=tracks)
         budgeted = CountingIdentity()
-        budgeted_range, _, _ = compute_winding_range_and_input_extents(
-            budgeted, dr_per_winding, [], [], cfg, 0, 100,
-            lambda *_: None, authoritative_zyx_lines=tracks,
-            point_budget=1000)
+        budgeted_range, _ = compute_winding_range_and_input_extents(
+            budgeted, dr_per_winding, [], cfg, 0, 100,
+            authoritative_zyx_lines=tracks, point_budget=1000)
 
         self.assertEqual(exact.points, 200_000)
         self.assertLessEqual(budgeted.points, 1000)
@@ -259,9 +255,8 @@ class PreviewWindingBoundTests(unittest.TestCase):
 
     def _export(self, cfg):
         return spiral_helpers.save_combined_preview(
-            object(), torch.tensor(500.0), [], [], "/unused", cfg,
+            object(), torch.tensor(500.0), [], "/unused", cfg,
             z_begin=0, z_end=100, voxel_size_um=9.6,
-            get_or_build_unattached_pcl_flat=lambda *_: None,
             surface_id="surface", z_direction_is_top_to_bottom=None)
 
     def test_a_configured_shell_index_is_taken_without_deriving_it(self):
@@ -275,7 +270,7 @@ class PreviewWindingBoundTests(unittest.TestCase):
             with self.assertRaises(self._Stop):
                 self._export(cfg)
 
-        # No pass over the patch, PCL and track points: the configured index
+        # No pass over the patch and track points: the configured index
         # is the bound, and every dense sampler already integrates to it.
         extents.assert_not_called()
         self.assertEqual(spiral_yxs.call_args.args[0], 131)
@@ -286,7 +281,7 @@ class PreviewWindingBoundTests(unittest.TestCase):
                "model_flow_bounds_z_margin": 0}
         with mock.patch.object(
                 spiral_helpers, "compute_winding_range_and_input_extents",
-                return_value=((10, 61), [], [])) as extents, \
+                return_value=((10, 61), [])) as extents, \
              mock.patch.object(spiral_helpers, "get_spiral_yxs",
                                side_effect=self._Stop) as spiral_yxs:
             with self.assertRaises(self._Stop):

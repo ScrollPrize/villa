@@ -13,7 +13,7 @@ from vc_object_store import ObjectStore  # noqa: E402
 
 import object_store_inputs as osi  # noqa: E402
 from object_store_fixture import (  # noqa: E402
-    fit_config as _fit_config, names, on_plane, plane, put_patch, put_pcl, shared_edit)
+    fit_config as _fit_config, names, plane, put_patch, shared_edit)
 
 pytestmark = pytest.mark.usefixtures('cpu')
 
@@ -56,7 +56,7 @@ def marker(path):
         return osi.read_link_marker(db)
 
 
-def edge_uuids(path, kind='point-surface'):
+def edge_uuids(path, kind='same-surface'):
     with ObjectStore.open(path, read_only=True) as db:
         return {edge['uuid'] for edge in db.edges_by_kind(kind)}
 
@@ -92,24 +92,24 @@ def _edit_walk(db):
 
 
 def _approve_link(db):
-    db.set_approval(db.edges_by_kind('point-surface')[0]['uuid'], 'approved')
+    db.set_approval(db.edges_by_kind('same-surface')[0]['uuid'], 'approved')
 
 
 def _remove_link(db):
-    db.remove_edge(db.edges_by_kind('point-surface')[0]['uuid'])
+    db.remove_edge(db.edges_by_kind('same-surface')[0]['uuid'])
 
 
-def _retire_far(db):
+def _retire_walk(db):
     # A selected object leaving the store: its links go first (the change the
     # marker sees), then the object.
-    far = _names_in(db)['far']
-    for edge in db.edges_of(far):
+    walk = _names_in(db)['walk']
+    for edge in db.edges_of(walk):
         db.remove_edge(edge['uuid'])
-    with db.write(expected_versions=db.select_expected_versions({far: db.current_version(far)})) as write:
-        write.retire_object(far)
+    with db.write(expected_versions=db.select_expected_versions({walk: db.current_version(walk)})) as write:
+        write.retire_object(walk)
 
 
-@pytest.mark.parametrize('change', [_edit_walk, _approve_link, _remove_link, _retire_far])
+@pytest.mark.parametrize('change', [_edit_walk, _approve_link, _remove_link, _retire_walk])
 def test_store_changes_force_a_full_refresh(shared, detectors, change):
     run(shared)
     shared_edit(shared, change)
@@ -118,7 +118,6 @@ def test_store_changes_force_a_full_refresh(shared, detectors, change):
 
 
 @pytest.mark.parametrize('overrides', [
-    {'pcl_link_distance_tolerance': 3.0},
     {'object_store_full_link_refresh': True},
 ])
 def test_configuration_forces_a_full_refresh(shared, detectors, overrides):
@@ -129,7 +128,7 @@ def test_configuration_forces_a_full_refresh(shared, detectors, overrides):
 
 def test_a_detector_version_bump_forces_a_full_refresh(shared, detectors, monkeypatch):
     run(shared)
-    bumped = {**vos.detector_versions(), 'point-collection-surface': 99}
+    bumped = {**vos.detector_versions(), 'surface-overlap': 99}
     monkeypatch.setattr(vos, 'detector_versions', lambda: bumped)
     _, log = run(shared)
     assert plan(log) == 'full' and detectors == [None, None]
@@ -141,20 +140,19 @@ def test_an_input_update_links_only_new_objects(shared, detectors):
 
     def add(db):
         put_patch(db, plane(260.0), (0.25, 0.25), name='lone')
-        put_pcl(db, on_plane(100.0, (20.0, 60.0)), name='extra')
+        put_patch(db, plane(140.0, dx=8.0), (0.25, 0.25), name='extra')
     shared_edit(shared, add)
     uuids = names(shared)
     prepared, log = run(shared, incremental=True)
     assert plan(log) == 'incremental'
-    assert detectors[-1] == {'surface': [uuids['lone']], 'point_collection': [uuids['extra']]}
-    assert any('pcl_patch: 1 created' in line and 'incremental over 2 new' in line
+    assert detectors[-1] == {'surface': sorted([uuids['lone'], uuids['extra']])}
+    assert any('patch_overlap: 1 created' in line and 'incremental over 2 new' in line
                for line in prepared.lines)
-    assert any('patch_overlap: 0 created' in line for line in prepared.lines)
     after = edge_uuids(shared)
-    assert before < after  # nothing removed; the new collection is linked
+    assert before < after  # nothing removed; the new patch is linked
     with ObjectStore.open(shared, read_only=True) as db:
         [added] = [db.edge(uuid) for uuid in after - before]
-    assert {added['a'], added['b']} == {uuids['extra'], uuids['near']}
+    assert {added['a'], added['b']} == {uuids['extra'], uuids['far']}
     assert not marker(shared)['exact']
     # Nothing new since: an update skips; a startup after an incremental
     # refresh runs in full, and agrees with it.
@@ -162,7 +160,7 @@ def test_an_input_update_links_only_new_objects(shared, detectors):
     assert plan(log) == 'skip'
     prepared, log = run(shared)
     assert plan(log) == 'full'
-    assert any(line.startswith('link refresh pcl_patch: 0 created, 0 updated, 4 unchanged, '
+    assert any(line.startswith('link refresh patch_overlap: 0 created, 0 updated, 2 unchanged, '
                                '0 stale removed') for line in prepared.lines), prepared.lines
     assert marker(shared)['exact']
 
@@ -171,7 +169,7 @@ def test_an_update_after_an_edit_of_an_existing_object_runs_in_full(shared, dete
     run(shared)
 
     def add_and_edit(db):
-        put_pcl(db, on_plane(100.0, (20.0, 60.0)), name='extra')
+        put_patch(db, plane(260.0), (0.25, 0.25), name='extra')
         db.set_meta(_names_in(db)['near'], 'review_note', 'edited')
     shared_edit(shared, add_and_edit)
     _, log = run(shared, incremental=True)
@@ -181,11 +179,9 @@ def test_an_update_after_an_edit_of_an_existing_object_runs_in_full(shared, dete
 def test_patch_overlaps_off_skip_their_detector_and_turning_them_on_relinks(shared, detectors):
     prepared, log = run(shared, fit_config(shared, input_use_patch_overlaps=False))
     assert 'link refresh patch_overlap: skipped (input_use_patch_overlaps is off)' in prepared.lines
-    _, log = run(shared, fit_config(shared, input_use_patch_overlaps=False))
-    assert plan(log) == 'skip'
     prepared, log = run(shared)
     assert plan(log) == 'full'
-    assert any(line.startswith('link refresh patch_overlap: 0 created') for line in prepared.lines)
+    assert any(line.startswith('link refresh patch_overlap: 1 created') for line in prepared.lines)
 
 
 def test_the_store_reads_are_progress_stages(shared):
@@ -200,7 +196,7 @@ def test_the_store_reads_are_progress_stages(shared):
     position = prepared.position.commit_sequence
     assert stages[0] == 'Reading the selected inputs'
     assert stages[-1] == f'Reading the inputs at commit {position}'
-    assert 'link refresh pcl_patch' in stages
+    assert 'link refresh patch_overlap' in stages
     assert progress.snapshot() is None  # every stage cleared
 
 

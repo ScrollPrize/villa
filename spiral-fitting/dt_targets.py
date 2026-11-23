@@ -1,6 +1,6 @@
 """Whole-object DT target determination.
 
-The DT losses (patch, unattached-pcl strip, track) pull every sampled point towards a
+The DT losses (patch, track) pull every sampled point towards a
 single integer-winding target per object. Historically that target was
 round(median(this step's sampled strip) / dr): recomputed from a small fresh sample
 every step, so an object sitting roughly halfway between two windings flip-flops its
@@ -21,16 +21,14 @@ Frames: unwrapped shifted radii are only defined up to an integer number of wind
 (the choice of unwrap reference point). Patches reuse the shared theta map's root
 frame directly; their target cache is invalidated whenever that map refreshes.
 Every ordered strip cache retains the same two endpoint anchors. Tracks transfer
-through the first endpoint, which their sampler always includes. PCL component walks
-carry whichever endpoint they started from through the forward transform, without
-including that anchor in the loss samples.
+through the first endpoint, which their sampler always includes.
 """
 
 import numpy as np
 import torch
 
 from spiral_sampling import load_spiral_sampling
-from sample_spiral import get_radial_normal_stretch, get_theta_and_radii
+from sample_spiral import get_theta_and_radii
 
 
 _spiral_sampling = load_spiral_sampling()
@@ -200,30 +198,6 @@ def strip_dt_target_in_sample_frame(
         torch.zeros(sample_local_idx.shape[0], dtype=torch.bool, device=device),
     )
     valid = valid & (sample_local_idx[:, 0] == 0) & sample_mask[:, 0]
-    return torch.where(valid[:, None], target, median_target)
-
-
-def endpoint_strip_dt_target_in_sample_frame(
-    sample_radii, dr_per_winding, cache, cache_idx,
-    sample_anchor_theta, sample_anchor_adjustment, anchor_at_end,
-    sample_mask=None,
-):
-    """Choose a strip target, transferring a cached one through its endpoint.
-
-    PCL component walks begin at either endpoint of one member strip. The
-    endpoint is transformed alongside the loss samples but is not itself a
-    loss position. ``sample_anchor_adjustment`` expresses that walk origin in
-    the unchanged first-loss-pick unwrap frame. With no whole-object cache,
-    retain the sampled-median target; carrying the endpoint is harmless.
-    """
-    median_target, _ = _sample_median_target(
-        sample_radii, sample_mask, dr_per_winding)
-    if cache is None:
-        return median_target
-    target, valid = _target_through_strip_endpoint(
-        sample_radii, dr_per_winding, cache, cache_idx,
-        sample_anchor_theta, sample_anchor_adjustment, anchor_at_end,
-    )
     return torch.where(valid[:, None], target, median_target)
 
 
@@ -587,18 +561,12 @@ def _merge_endpoint_strip_caches(caches):
 @torch.no_grad()
 def compute_strip_dt_target_cache(
     slice_to_spiral_transform, dr_per_winding, zyxs, starts,
-    windings=None, floating_threshold=0.25, num_points_per_strip=None, max_stride=None,
-    chunk_size=65536, max_total_points=None, radial_offsets=None,
+    floating_threshold=0.25, num_points_per_strip=None, max_stride=None,
+    chunk_size=65536, max_total_points=None,
 ):
-    # Whole-strip DT target determination for ordered point strips (unattached-pcl
-    # strips and tracks), given their flat concatenated bundle: zyxs (N, 3) and
-    # starts (T+1,) both on device, plus per-point winding-annotation offsets
-    # `windings` (N,; None => zeros, i.e. tracks) and per-point radial target
-    # offsets `radial_offsets` in input-frame voxels along the sheet normal (N,;
-    # None => zeros; vertical fiber strips sit on the sheet's back face, so a
-    # positive offset places the fiber outside its winding), which
-    # are converted to spiral radius per point by the transform's local normal
-    # stretch (sample_spiral.get_radial_normal_stretch). Long strips are decimated to at
+    # Whole-strip DT target determination for ordered point strips (tracks),
+    # given their flat concatenated bundle: zyxs (N, 3) and starts (T+1,) both
+    # on device. Long strips are decimated to at
     # approximately num_points_per_strip evenly-spaced points. max_stride is a hard
     # upper bound, in voxels, on the gap between retained points; strip points are
     # nominally at ~voxel spacing, so it is applied directly as an index stride, and
@@ -606,8 +574,7 @@ def compute_strip_dt_target_cache(
     # retained. This bounds the sampling distance underlying the theta-unwrap
     # adjacency assumption in the same way patch sampling bounds its grid stride
     # (there converted to grid cells via patch.scale). Values are unwrapped per
-    # strip (segmented cumsum) and
-    # annotation-normalised. The returned cache always has the same representation:
+    # strip (segmented cumsum). The returned cache always has the same representation:
     # one target and two endpoint frame anchors per strip on the loss device. All
     # interior refresh samples are discarded.
     device = dr_per_winding.device
@@ -643,9 +610,6 @@ def compute_strip_dt_target_cache(
             sub = compute_strip_dt_target_cache(
                 slice_to_spiral_transform, dr_per_winding,
                 zyxs[p0:p1], starts[s0:s1 + 1] - starts[s0],
-                windings=windings[p0:p1] if windings is not None else None,
-                radial_offsets=(radial_offsets[p0:p1]
-                                if radial_offsets is not None else None),
                 floating_threshold=floating_threshold,
                 num_points_per_strip=num_points_per_strip,
                 max_stride=max_stride, chunk_size=chunk_size,
@@ -683,25 +647,13 @@ def compute_strip_dt_target_cache(
         # zyxs may live in host RAM (tracks keep the full point cloud on CPU);
         # gather there, then move only the decimated sample to the device.
         zyxs = zyxs[src.to(zyxs.device)].to(device)
-        if windings is not None:
-            windings = windings[src.to(windings.device)].to(device)
-        if radial_offsets is not None:
-            radial_offsets = radial_offsets[src.to(radial_offsets.device)].to(device)
         starts = new_starts
         lengths = counts
     else:
         strip_id = torch.repeat_interleave(torch.arange(num_strips, device=device), lengths)
         zyxs = zyxs.to(device)
-        if windings is not None:
-            windings = windings.to(device)
-        if radial_offsets is not None:
-            radial_offsets = radial_offsets.to(device)
 
     spiral_zyxs = _transform_in_chunks(slice_to_spiral_transform, zyxs, chunk_size)
-    if radial_offsets is not None and bool((radial_offsets != 0).any()):
-        radial_offsets = radial_offsets * get_radial_normal_stretch(
-            slice_to_spiral_transform, zyxs, spiral_zyx=spiral_zyxs,
-            chunk_size=chunk_size)
     theta, _, shifted = get_theta_and_radii(spiral_zyxs[..., 1:], dr_per_winding)
     dr = dr_per_winding.detach()
 
@@ -722,10 +674,6 @@ def compute_strip_dt_target_cache(
     else:
         adjustments = torch.zeros_like(shifted, dtype=torch.int32)
     values = shifted + adjustments.to(shifted.dtype) * dr
-    if windings is not None:
-        values = values - windings * dr
-    if radial_offsets is not None:
-        values = values - radial_offsets
 
     # Determine the same ambiguity-aware whole-object target as patches, using
     # segmented sorts to obtain per-strip medians without a GPU-synchronising loop.

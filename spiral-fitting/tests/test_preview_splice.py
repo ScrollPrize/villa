@@ -56,9 +56,8 @@ def export(patches, evaluation, atlas):
     with mock.patch.object(spiral_helpers, "save_combined_tifxyz",
                            side_effect=capture):
         spiral_helpers.save_combined_preview(
-            IdentityTransform(), torch.tensor(DR), patches, [],
+            IdentityTransform(), torch.tensor(DR), patches,
             "/unused", cfg, z_begin=0, z_end=40, voxel_size_um=9.6,
-            get_or_build_unattached_pcl_flat=lambda *_: None,
             surface_id="surface", z_direction_is_top_to_bottom=None,
             patch_atlas=atlas,
             patch_satisfaction_evaluation=evaluation)

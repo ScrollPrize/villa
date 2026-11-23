@@ -46,13 +46,13 @@ def test_the_runtime_reads_the_bound_store_and_reports_it(state, store_path,
     assert context.config['object_store_location'] == state.object_store.location
     assert context.config['object_store_author'] == 'svc'
     assert device_stubs == [True]
-    assert len(edges(store_path)) == 3
+    assert len(edges(store_path)) == 1
     inputs = context.object_store_inputs
     # The service linked and pinned a position of the shared store first
     # (its lines are preparation events); the runtime read that position.
     preparing = [event['text'] for event in state.events.read_after(0)['events']
                  if event.get('operation') == 'preparing_inputs']
-    assert any(line.startswith('link refresh pcl_patch: 3 created') for line in preparing)
+    assert any(line.startswith('link refresh patch_overlap: 1 created') for line in preparing)
     assert status['input_position']['source'] == 'prepared'
     # The adapter's report is in the status and in the event stream.
     report = status['input_report']
@@ -65,9 +65,8 @@ def test_the_runtime_reads_the_bound_store_and_reports_it(state, store_path,
     # project's umbilicus by path.
     assert status['input_digest'] == inputs.digest
     summary = status['input_summary']
-    assert summary['selection'] == {'surface': 2, 'point_collection': 1, 'fiber': 0,
-                                    'track': 0}
-    assert summary['relationships'] == {'pcl_patch': 3}
+    assert summary['selection'] == {'surface': 3, 'track': 0}
+    assert summary['relationships'] == {'patch_overlap': 1}
     manifest = status['input_manifest']
     assert manifest['object_store_digest'] == inputs.digest
     assert not {'verified_patches', 'fibers', 'pcls'} & set(manifest)
@@ -93,21 +92,6 @@ def test_the_runtime_reads_the_bound_store_and_reports_it(state, store_path,
     metadata = json.loads(autosave.with_name('checkpoint_autosave.json').read_text())
     assert metadata['input_digest'] == inputs.digest
     assert metadata['input_position'] == inputs.manifest['position']
-
-
-def test_input_refusals_reach_status_and_events(state, store_path, device_stubs):
-    # Linking a position fails before any build: nothing is torn down.
-    state.initialize(with_project(request(pcl_link_window_min_points=5)))
-    wait_until(lambda: not state._building, 60)
-    status = state.status()
-    assert status['state'] == 'Uninitialized' and device_stubs == []
-    failure = status['input_preparation_error']
-    assert any('point-collection-surface' in line and 'nothing was written' in line
-               for line in failure['problems'])
-    assert 'LinkRefreshError' in failure['message']
-    [error] = [event for event in state.events.read_after(0)['events']
-               if event['kind'] == 'error']
-    assert error['text'].startswith('The inputs could not be prepared')
 
 
 # ---------------------------------------------------------------------------
@@ -151,18 +135,10 @@ def _two_rank_sessions(tmp_path, store, **overrides):
 def test_two_rank_sessions_refresh_once_and_both_start(store_path, tmp_path):
     first, second = _two_rank_sessions(tmp_path, store_path)
     assert first['state'] == second['state'] == 'Idle', (first, second)
-    assert len(edges(store_path)) == 3
+    assert len(edges(store_path)) == 1
     # Rank 0 refreshed and reported; rank 1 only read the frozen inputs.
-    assert any('3 created' in line for line in first['report'])
+    assert any('1 created' in line for line in first['report'])
     assert not any('link refresh' in line for line in second['report'])
-
-
-def test_a_refresh_failure_stops_both_ranks_before_either_starts(store_path, tmp_path):
-    outcome = _two_rank_sessions(tmp_path, store_path, pcl_link_window_min_points=5)
-    for rank in outcome:
-        assert rank['state'] == 'Error' and not rank['ever_idle']
-        assert any('point-collection-surface' in line for line in rank['input_problems'])
-    assert outcome[0]['input_problems'] == outcome[1]['input_problems']
 
 
 # ---------------------------------------------------------------------------
@@ -178,7 +154,7 @@ def test_a_model_rebuild_keeps_the_inputs_and_a_reload_rereads_them(
     walk = next(entry['uuid'] for entry in state.startup_inputs()['objects']
                 if entry['name'] == 'walk')
     with ObjectStore.open(store_path, author='editor') as db:
-        db.set_meta(walk, 'sampling_group', 'reviewed')
+        db.set_meta(walk, 'source', {'spiral_patch_erode_cells': 2})
     # A model-stage rebuild keeps the frozen inputs: it neither rereads the
     # store, refreshes links nor sees the edit.
     response = state.rebuild(with_project(request(model_num_flow_stages=3)))
@@ -198,21 +174,19 @@ def test_a_model_rebuild_keeps_the_inputs_and_a_reload_rereads_them(
 
 def test_settings_that_shape_the_inputs_need_a_full_rebuild(state, device_stubs):
     from config import OBJECT_STORE_PCL_KEYS, Config, rebuild_stage
-    for key in sorted(OBJECT_STORE_PCL_KEYS) + ['input_use_pcl_relative',
-                                                'input_use_pcl_same_winding',
-                                                'patch_loss_z_margin']:
+    for key in sorted(OBJECT_STORE_PCL_KEYS) + ['patch_loss_z_margin']:
         assert rebuild_stage({key}) == 'all', key
     state.initialize(with_project(request()))
     status = settle(state)
     configuration = {**Config().as_dict(), **status['applied_config'],
-                     'pcl_link_window_points': 9}
+                     'pcl_patch_overlap_max_pairs': 9}
     with pytest.raises(spiral_service.ApiError, match='requires rebuilding'):
         state.run({'iterations': 1, 'configuration': configuration,
                    'expected_session_revision': state.session_revision,
                    'dt_loss_schedule': {'enabled': False, 'last_fraction': 0.0}})
-    response = state.rebuild(with_project(request(pcl_link_window_points=9)))
+    response = state.rebuild(with_project(request(pcl_patch_overlap_max_pairs=9)))
     assert (response['stage'], response['inputs']) == ('all', 'reload')
-    assert settle(state)['applied_config']['pcl_link_window_points'] == 9
+    assert settle(state)['applied_config']['pcl_patch_overlap_max_pairs'] == 9
     assert len(device_stubs) == 2
 
 
@@ -265,28 +239,22 @@ def test_checkpoint_refusals_name_the_input_remedies(state, tmp_path, device_stu
 
 @pytest.fixture()
 def varied_store(tmp_path):
-    """Every case the selection must agree on: absolute, relative and
-    same-winding PCLs by metadata and annotations, a patch and a fiber at
+    """Every case the selection must agree on: patches at unit and
     non-unit scales, and approved, pending, rejected and stale links."""
-    from object_store_fixture import (array, frame, pcl_patch_edge, plane, put_fiber,
-                                      put_patch, put_pcl)
+    from object_store_fixture import VOLUME, array, frame, plane, put_patch
     path = str(tmp_path / 'varied.vcobj')
     with ObjectStore.create(path, author='ingest', hostname='host') as db:
         near = put_patch(db, plane(100.0), (0.25, 0.25), name='near')
-        far = put_patch(db, plane(140.0), (0.25, 0.25), coordinates=frame(2), name='far')
-        absolute = put_pcl(db, {1: ([12.0, 100.0, 48.0], 4.0)}, absolute=True,
-                           name='absolute')
-        relative = put_pcl(db, {3: ([16.0, 100.0, 52.0], 1.0),
-                                9: ([20.0, 140.0, 56.0], 2.0)}, name='relative')
-        same = put_pcl(db, {5: ([24.0, 100.0, 60.0], None),
-                            6: ([28.0, 100.0, 64.0], None)}, name='same')
-        db.set_approval(pcl_patch_edge(db, absolute, 1, near, (2.0, 2.0)), 'approved')
-        pcl_patch_edge(db, relative, 3, near, (3.0, 3.0))
-        db.set_approval(pcl_patch_edge(db, same, 5, near, (5.0, 5.0)), 'rejected')
-        pcl_patch_edge(db, same, 6, near, (6.0, 6.0))
-        pcl_patch_edge(db, relative, 9, far, (4.0, 4.0))
-        put_fiber(db, [[10, 120, 40], [14, 120, 44], [18, 120, 48]], [0, 2],
-                  coordinates=frame(2), name='fiber')
+        beside = put_patch(db, plane(100.0, dx=8.0), (0.25, 0.25), name='beside')
+        third = put_patch(db, plane(100.0, dx=4.0), (0.25, 0.25), name='third')
+        far = put_patch(db, plane(140.0), (0.25, 0.25), coordinates=frame(2), name='far',
+                        tags=['far'])
+        put_patch(db, plane(140.0, dx=8.0), (0.25, 0.25), name='far_beside', tags=['far'])
+        db.link_surface_overlaps(volume_uuid=VOLUME)
+        overlaps = {frozenset((edge['a'], edge['b'])): edge['uuid']
+                    for edge in db.edges_by_kind('same-surface')}
+        db.set_approval(overlaps[frozenset((near, beside))], 'approved')
+        db.set_approval(overlaps[frozenset((near, third))], 'rejected')
         # Moving the far patch while keeping its links bound to the recorded
         # geometry leaves the link to it stale.
         moved = {'kind': 'surface', 'attributes': {'scale': [0.125, 0.125]},
@@ -307,7 +275,7 @@ def varied_store(tmp_path):
 
 @pytest.mark.parametrize('selection', [
     {'object_store_approved_links_only': True},
-    {'object_store_fiber_uuids': [], 'object_store_pcl_tags': []},
+    {'object_store_track_uuids': [], 'object_store_patch_tags': ['far']},
 ])
 def test_the_cli_and_the_service_freeze_the_same_inputs(varied_store, tmp_path,
                                                         device_stubs, selection):
@@ -335,21 +303,17 @@ def test_the_cli_and_the_service_freeze_the_same_inputs(varied_store, tmp_path,
         state.close()
     assert served.object_store_inputs.digest == cli.object_store_inputs.digest
     assert served.object_store_inputs.counts == cli.object_store_inputs.counts
-    assert len(served.cross_patch_pcls) == len(cli.cross_patch_pcls)
-    assert len(served.unattached_pcl_strips) == len(cli.unattached_pcl_strips)
+    assert len(served.verified_patches) == len(cli.verified_patches)
     manifest = served.object_store_inputs.manifest
     excluded = manifest['excluded_relationships']
     scales = {entry['name']: entry['scale_factor'] for entry in manifest['objects']}
     assert scales['far'] == 2.0
-    if 'object_store_fiber_uuids' in selection:
-        # Explicitly empty selectors select nothing, not everything.
-        assert 'fiber' not in scales and 'absolute' not in scales
-        assert manifest['selection']['fiber']['count'] == 0
+    if 'object_store_patch_tags' in selection:
+        # Explicit selectors select what they name, not everything.
+        assert 'near' not in scales
+        assert manifest['selection']['track']['count'] == 0
         assert manifest['relationships'] == []
     else:
         assert excluded['inapplicable'] == 1 and excluded['rejected'] == 1
-        assert excluded['pending (approved-only)'] == 2
-        assert scales['fiber'] == 2.0
-        roles = {pcl['name']: pcl['metadata']['winding_is_absolute']
-                 for pcl in served.object_store_inputs.point_collections.values()}
-        assert roles == {'absolute': True, 'relative': False, 'same': False}
+        assert excluded['pending (approved-only)'] == 1
+        assert len(manifest['relationships']) == 1

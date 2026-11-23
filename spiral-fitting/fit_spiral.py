@@ -72,10 +72,6 @@ from checkpoint_io import load_checkpoint_cpu, model_state_sha256
 from fiber_direction_samples import load_fiber_direction_samples
 from spiral_sampling import load_spiral_sampling
 from geom_utils import bilinear_atlas_lookup, grid_sample_border, interp1d
-from pcl_views import (
-    _UnattachedPclStripList,
-    vertical_fiber_radial_offset,
-)
 from dt_targets import (
     DtTargetCacheManager,
     compute_patch_dt_target_cache,
@@ -95,23 +91,17 @@ from tracks import (
 from track_graph import TrackGraph
 from umbilicus import thaumato_umbilicus_z_to_yx, json_umbilicus_z_to_yx
 from sample_spiral import (
-    get_radial_normal_stretch,
     get_spiral_points,
     get_theta,
     get_winding_xy,
 )
 from losses import (
-    build_pcl_sampling_strata,
-    pcl_sampling_group_weight,
     get_fiber_direction_loss,
     get_min_spacing_loss,
     iter_lasagna_losses,
-    get_patch_abs_winding_loss,
     get_patch_and_umbilicus_losses,
-    get_patch_rel_winding_loss,
     get_shell_outer_loss,
     get_symmetric_dirichlet_loss,
-    get_unattached_pcl_strip_losses,
 )
 from loss_maps import (LossMapRecorder, attach_loss_maps_to_manifest,
                        capture_loss_maps)
@@ -128,7 +118,6 @@ from spiral_helpers import (
 from satisfaction_metrics import (
     evaluate_patch_satisfaction_packed,
     get_patch_satisfied_areas as _get_patch_satisfied_areas,
-    get_unattached_pcl_satisfied_counts as _get_unattached_pcl_satisfied_counts,
     metrics_config,
     save_overlay_and_print_satisfaction,
 )
@@ -723,96 +712,6 @@ def subsample_rows(points, max_points, generator):
     return points[order.sort().values]
 
 
-def _build_strip_flat_bundle(strip_arrays, device):
-    # Concatenate per-strip (zyxs, windings, radial_offsets[, bake_scale]) arrays
-    # into one flat GPU tensor so the downstream computations can run a single
-    # transform call plus segmented reductions instead of per-strip Python loops.
-    # `strip_arrays` is a sequence of `(zyxs_np, windings_np, radial_offsets_np)`
-    # triples or `(..., radial_offset_bake_scale_np)` quadruples; radial_offsets
-    # may be None for zeros and the bake scale None for ones. The bundle's
-    # `radial_offsets` is the physical offset (scroll voxels along the sheet
-    # normal) times the per-point bake scale, i.e. the offset in the resident
-    # frame's voxels; consumers convert it to spiral radius through the live
-    # transform's local normal stretch. `has_radial_offsets` lets them skip
-    # that work when every offset is zero. Returns None when there are no points.
-    triples = [tuple(t) for t in strip_arrays]
-    if len(triples) == 0:
-        return None
-    lengths_np = np.fromiter((len(t[0]) for t in triples), dtype=np.int64, count=len(triples))
-    starts_np = np.empty(len(triples) + 1, dtype=np.int64)
-    starts_np[0] = 0
-    np.cumsum(lengths_np, out=starts_np[1:])
-    total = int(starts_np[-1])
-    if total == 0:
-        return None
-    zyxs_flat = np.concatenate([t[0] for t in triples], axis=0).astype(np.float32, copy=False)
-    windings_flat = np.concatenate([t[1] for t in triples], axis=0).astype(np.float32, copy=False)
-    offsets_flat = np.concatenate([
-        t[2] if len(t) > 2 and t[2] is not None else np.zeros(len(t[0]), dtype=np.float32)
-        for t in triples], axis=0).astype(np.float32, copy=False)
-    if any(len(t) > 3 and t[3] is not None for t in triples):
-        scale_flat = np.concatenate([
-            t[3] if len(t) > 3 and t[3] is not None else np.ones(len(t[0]), dtype=np.float32)
-            for t in triples], axis=0).astype(np.float32, copy=False)
-        offsets_flat = offsets_flat * scale_flat
-    strip_id_np = np.repeat(np.arange(len(triples), dtype=np.int64), lengths_np)
-    return {
-        'zyxs': torch.from_numpy(zyxs_flat).to(device=device),
-        'windings': torch.from_numpy(windings_flat).to(device=device),
-        'radial_offsets': torch.from_numpy(offsets_flat).to(device=device),
-        'has_radial_offsets': bool(np.any(offsets_flat != 0)),
-        'strip_id': torch.from_numpy(strip_id_np).to(device=device),
-        'starts': torch.from_numpy(starts_np).to(device=device),
-        'starts_cpu': torch.from_numpy(starts_np),
-        'lengths': torch.from_numpy(lengths_np).to(device=device),
-        'lengths_cpu': torch.from_numpy(lengths_np),
-        'num_strips': len(triples),
-        'total': total,
-    }
-
-
-def accumulate_radial_offset_bake_scale(slice_to_spiral_transform, zyxs,
-                                        previous=None, *, device=None):
-    """Fold one frozen epoch's normal stretch into a per-point bake scale.
-
-    The vertical-fiber radial offset is a physical distance along the sheet
-    normal in scroll voxels. A constraint bake rewrites the resident geometry
-    through a frozen transform that is not an isometry, so the same distance
-    measured in the baked frame is the scroll distance times that transform's
-    local stretch along the normal, ``|J^T n|`` at the pre-bake point
-    (sample_spiral.get_radial_normal_stretch). ``zyxs`` (N, 3) are the points
-    *before* this bake in the frame the transform reads; ``previous`` (N,) is
-    the scale accumulated over earlier epochs (None => ones). Returns the
-    updated (N,) float32 array. Successive epochs multiply, which is exact
-    when each epoch's stretch is evaluated for the normal direction that epoch
-    saw (the radial direction of its own output frame, as here) and treats
-    later epochs' rotation of that direction as second order.
-    """
-    stretch = get_radial_normal_stretch(
-        slice_to_spiral_transform,
-        torch.from_numpy(np.ascontiguousarray(zyxs, dtype=np.float32)),
-        device=device).numpy()
-    if previous is None:
-        return stretch
-    return np.asarray(previous, dtype=np.float32) * stretch
-
-
-def get_or_build_unattached_pcl_flat(pcl_strips, device):
-    # Reuse a cached `.flat` bundle on the strip list when available (set up at the
-    # top of fit_spiral_3d); otherwise build it now and try to cache for next call.
-    flat = getattr(pcl_strips, 'flat', None)
-    if flat is None and len(pcl_strips) > 0:
-        flat = _build_strip_flat_bundle(
-            ((s['zyxs'], s['windings'], s.get('radial_offsets'),
-              s.get('radial_offset_bake_scale')) for s in pcl_strips),
-            device)
-        try:
-            pcl_strips.flat = flat
-        except AttributeError:
-            pass
-    return flat
-
-
 def get_run_dt_resume_iteration(run_start, requested_iterations,
                                 last_fraction):
     """Return the first Run iteration eligible for directional DT losses.
@@ -833,18 +732,10 @@ def get_dt_loss_eligibility(cfg, iteration, run_dt_resume_iteration=None):
     patch_start = cfg['loss_start_patch_dt']
     track_start = (patch_start if cfg['loss_start_track_dt'] is None
                    else cfg['loss_start_track_dt'])
-    unattached_start = get_unattached_pcl_dt_start(cfg)
     return {
         'verified_patch': run_eligible and iteration > patch_start,
         'track': run_eligible and iteration > track_start,
-        'unattached_pcl': run_eligible and iteration > unattached_start,
     }
-
-
-def get_unattached_pcl_dt_start(cfg):
-    """The unattached-PCL DT start: its own key, else the verified-patch start."""
-    start = cfg['loss_start_unattached_pcl_dt']
-    return cfg['loss_start_patch_dt'] if start is None else start
 
 
 def get_exponential_lr_at_step(
@@ -933,12 +824,10 @@ def realign_optimizer_lr_schedule(
     return lr_scheduler, horizon
 
 
-# Settings that shape the frozen object-store inputs (the link refresh, the
-# materialized constraints or the point views derived from them). The inputs
-# are frozen for a fit, so apply_config refuses them at a Run boundary.
+# Settings that shape the frozen object-store inputs (the link refresh or the
+# materialized constraints). The inputs are frozen for a fit, so apply_config
+# refuses them at a Run boundary.
 _OBJECT_STORE_FROZEN_KEYS = OBJECT_STORE_PCL_KEYS | {
-    'input_use_pcl_relative',
-    'input_use_pcl_same_winding',
     'patch_loss_z_margin',
 }
 
@@ -1007,8 +896,8 @@ class FitContext:
         # scale, Lasagna scale). paths is the resolved
         # SpiralInputPaths for this fit: the interactive runtime passes the
         # service's per-session selection; the CLI resolves its input
-        # manifest (fit_session.load_input_manifest). Patches, PCLs, fibers,
-        # tracks and the outer shell are not paths: they come from the object
+        # manifest (fit_session.load_input_manifest). Patches, tracks and
+        # the outer shell are not paths: they come from the object
         # store (config object_store_location), whose selected objects must be in
         # paths.volume_uuid (check_fit_volume).
         #
@@ -1176,139 +1065,6 @@ class FitContext:
             raise ValueError('every patch has sampling weight 0')
         return weights / weights.sum()
 
-    def _rebuild_pcl_sampling_strata(self):
-        """Rebuild the per-family sampling strata in place.
-
-        Mutates self.pcl_sampling_strata (never rebinds it) so every
-        holder of the dict observes the rebuilt strata; called again by
-        the interactive path whenever it appends pcls.
-        """
-        # Weight merged fiber-link components by their member-pcl count: each
-        # draw samples at most sample_count_relative_winding_patch_pairs_per_pcl
-        # patch pairs regardless of pcl size, so without this a component would
-        # get ~1/N the pair-sampling pressure its N members had before merging.
-        # A collection's explicit sampling_member_weight (patch-overlap pairs,
-        # which share one edge's weight) takes precedence, and pairs sharing a
-        # sampling_unit (their edge) are drawn edge first, then pair.
-        self.pcl_sampling_strata['cross_patch'] = build_pcl_sampling_strata(
-            [pcl['sampling_group'] if len(pcl['points']) > 1 else None
-             for pcl in self.cross_patch_pcls],
-            self.config,
-            member_weights=[pcl.get('sampling_member_weight')
-                            or len(pcl.get('link_member_cids', ())) or 1
-                            for pcl in self.cross_patch_pcls],
-            member_units=[pcl.get('sampling_unit')
-                          for pcl in self.cross_patch_pcls],
-        )
-        self._rebuild_unattached_components()
-        # Weight each component by its member count so a linked component keeps
-        # the per-strip sampling pressure its members had before merging (each
-        # sampled walk covers only one random path through the component).
-        self.pcl_sampling_strata['unattached'] = build_pcl_sampling_strata(
-            self.unattached_component_groups, self.config,
-            member_weights=[len(members) for members in self.unattached_components])
-
-    def _rebuild_unattached_components(self):
-        """Rebuild the unattached link-component view in place.
-
-        Each entry of self.unattached_components is the list of member strip
-        indices connected by fiber links (singletons for unlinked
-        strips). The 'unattached' sampling strata index these components; each
-        step the loss samples a chain *walk* through a chosen component -- along
-        a strip, optionally hopping to the linked strip at each junction -- and
-        applies the ordinary constant-winding strip target along the walk (the
-        junction hop is a regular |dtheta| < pi step, so the sequential theta=0
-        unwrap handles the seam). unattached_component_edges[c] lists component
-        c's junctions as (strip_a, pos_a, strip_b, pos_b) with pos_* row indices
-        into the strips' (decimated) point arrays.
-
-        All three lists are mutated in place (never rebound) so the training-loop
-        closures keep the same list objects across interactive rebuilds.
-        """
-        self.unattached_components.clear()
-        self.unattached_component_groups.clear()
-        self.unattached_component_edges.clear()
-        strip_by_coll = {strip['id']: idx
-                         for idx, strip in enumerate(self.unattached_pcl_strips)}
-        # Strip-level view of the shared link_components decomposition. A link's
-        # junction survives here only when both endpoints survived the z-roi trim
-        # (they are exempt from decimation; see the strip loop in
-        # load_host_inputs); a walk simply never crosses a dropped junction, so a
-        # component with trimmed links degrades to islands sampled independently
-        # within one entry.
-        in_linked_component = set()
-        for member_cids, member_links in self.link_components:
-            comp_members = [strip_by_coll[cid] for cid in member_cids if cid in strip_by_coll]
-            if not comp_members:
-                continue
-            in_linked_component.update(comp_members)
-            edges = []
-            for link in member_links:
-                a = strip_by_coll.get(link['a_coll'])
-                b = strip_by_coll.get(link['b_coll'])
-                if a is None or b is None or a == b:
-                    continue
-                pos_a = self.unattached_pcl_strips[a].get('link_points', {}).get(link['a_point'])
-                pos_b = self.unattached_pcl_strips[b].get('link_points', {}).get(link['b_point'])
-                if pos_a is None or pos_b is None:
-                    continue
-                edges.append((a, pos_a, b, pos_b))
-            self.unattached_components.append(comp_members)
-            self.unattached_component_groups.append(
-                self.unattached_strip_sampling_groups[comp_members[0]])
-            self.unattached_component_edges.append(edges)
-        for idx in range(len(self.unattached_pcl_strips)):
-            if idx not in in_linked_component:
-                self.unattached_components.append([idx])
-                self.unattached_component_groups.append(
-                    self.unattached_strip_sampling_groups[idx])
-                self.unattached_component_edges.append([])
-
-    def _install_point_views(self, cross_patch_pcls, unattached_pcl_strips,
-                             unattached_strip_sampling_groups, *,
-                             resolved_links, link_components):
-        """Install derived point-collection views and their sampling strata."""
-        print(
-            f'pcls: {len(cross_patch_pcls)} cross-patch, '
-            f'{len(unattached_pcl_strips)} unattached'
-        )
-        if self.config['pcl_stratified_pcl_sampling'] or self.config['pcl_sampling_weights'] is not None:
-            def _group_counts(groups):
-                counts = {}
-                for group in groups:
-                    counts[group] = counts.get(group, 0) + 1
-                entries = []
-                for group, count in sorted(counts.items(), key=lambda kv: str(kv[0])):
-                    key = os.path.splitext(os.path.basename(str(group)))[0]
-                    if self.config['pcl_sampling_weights'] is None:
-                        entries.append(f'{key}: {count}')
-                    else:
-                        entries.append(
-                            f'{key} (w={pcl_sampling_group_weight(group, self.config)}): {count}')
-                return ', '.join(entries)
-            print(f'  cross-patch sampling groups: {_group_counts(pcl["sampling_group"] for pcl in cross_patch_pcls)}')
-            print(f'  unattached sampling groups: {_group_counts(unattached_strip_sampling_groups)}')
-
-        # Per-step sampling pools for the rel-winding and unattached-strip losses:
-        # pool indices grouped into strata by sampling group (see
-        # build_pcl_sampling_strata; stratification is controlled by the legacy
-        # boolean or the weighted config). Single-point pcls (possible only for
-        # winding_is_absolute pcls) can't form a cross-patch pair, so they are
-        # excluded from the rel-winding pool. Rebuilt whenever the interactive
-        # path appends pcls (see _rebuild_pcl_sampling_strata).
-        self.cross_patch_pcls = cross_patch_pcls
-        self.unattached_pcl_strips = unattached_pcl_strips
-        self.unattached_strip_sampling_groups = unattached_strip_sampling_groups
-        self.resolved_links = resolved_links
-        self.link_components = link_components
-        # The unattached loss consumes strips through these link components; see
-        # _rebuild_unattached_components, which fills them from link_components.
-        self.unattached_components = []
-        self.unattached_component_groups = []
-        self.unattached_component_edges = []
-        self.pcl_sampling_strata = {}
-        self._rebuild_pcl_sampling_strata()
-
     def check_cuda_ready(self):
         """Create the CUDA context before input reads increase host cache pressure."""
         if self.device.type != 'cuda':
@@ -1358,12 +1114,12 @@ class FitContext:
     def load_host_inputs(self):
         """Load and prepare every host-side input for a fit.
 
-        Seeds the host RNG streams, then reads patches, point collections,
-        fibers, tracks and their relationships from the object store
+        Seeds the host RNG streams, then reads patches, tracks and their
+        relationships from the object store
         (object_store_inputs.load_fit_inputs: one link refresh, then a frozen
-        snapshot), builds the track crossing graph, classifies the point
-        constraints; builds the sampling caches, host-prepared patch atlases, the
-        trusted-geometry index and the whole-object DT target samples. Requires no device state: the
+        snapshot), builds the track crossing graph; builds the sampling caches,
+        host-prepared patch atlases, the trusted-geometry index and the
+        whole-object DT target samples. Requires no device state: the
         patch atlases are moved as part of device-state setup, and the CUDA
         stores, model, and optimiser are built later by
         build_device_state().
@@ -1378,10 +1134,6 @@ class FitContext:
         - patches: verified_patches (+ verified_patches_list,
           num_verified_patches), shell_patch
         - object_store_inputs: the materialized snapshot (provenance)
-        - point collections: cross_patch_pcls, unattached_pcl_strips,
-          unattached_strip_sampling_groups, pcl_sampling_strata,
-          resolved_links, link_components,
-          unattached_components / _component_groups / _component_edges
         - sampling: patch_sampling_probabilities, patch_atlas
         - trusted geometry: trusted_geometry_tree
         - tracks: tracks, track_families, track_source_ids,
@@ -1430,14 +1182,14 @@ class FitContext:
         # Outer shell and object-store inputs
         # ==========================================================================
 
-        # Patches, PCLs, fibers, tracks and the outer shell come only from the
-        # object store, linked by its detectors; nothing here reads them from
-        # files or links them.
+        # Patches, tracks and the outer shell come only from the object
+        # store, linked by its detectors; nothing here reads them from files
+        # or links them.
         if self.object_store_inputs is None:
             if not self.config['object_store_location']:
                 raise RuntimeError(
-                    'patches, fibers and point collections are read from an '
-                    'object store: set object_store_location')
+                    'patches and tracks are read from an object store: set '
+                    'object_store_location')
             self.object_store_inputs = self._load_object_store_inputs()
         check_fit_volume(self.paths, self.object_store_inputs.manifest.get('volume_uuid')
                          if self.object_store_inputs.manifest is not None else None)
@@ -1450,9 +1202,7 @@ class FitContext:
         filter_tracks_by_shell = track_inputs is not None and shell_patch is not None
         verified_patches = dict(self.object_store_inputs.patches)
         print(f' loaded {len(verified_patches)} patches from the object store')
-        self._derive_object_store_point_inputs(
-            verified_patches, self.object_store_inputs)
-        unattached_pcl_strips = self.unattached_pcl_strips
+        self._report_object_store_inputs(self.object_store_inputs)
 
         # ==========================================================================
         # dense-spacing mode, shell envelope, and tracks
@@ -1532,12 +1282,10 @@ class FitContext:
             and bool(tracks)
         )
         patch_inputs = self._prepare_patch_inputs(
-            verified_patches, unattached_pcl_strips, using_tracks=using_tracks)
+            verified_patches, using_tracks=using_tracks)
 
         # Loaded host inputs, kept as inspectable attributes (ownership
-        # class (b): host-prepared inputs and caches). cross_patch_pcls,
-        # unattached_pcl_strips, unattached_strip_sampling_groups, and
-        # pcl_sampling_strata were assigned above, before the strata build.
+        # class (b): host-prepared inputs and caches).
         self.umbilicus = umbilicus
         self.scroll_zarr = scroll_zarr
         self.fiber_direction_samples = fiber_direction_samples
@@ -1571,11 +1319,11 @@ class FitContext:
         self.dt_target_whole_object = self.config['dt_target_mode'] == 'whole_object_quantile'
         self._prepare_dt_target_samples(self.verified_patches_list)
 
-    def _prepare_patch_inputs(self, verified_patches, unattached_pcl_strips, *, using_tracks):
+    def _prepare_patch_inputs(self, verified_patches, *, using_tracks):
         """The patch-derived host inputs: the patch list and its sampling
         probabilities, the host patch atlas (geometry stays on the host until
         materialize()), and the trusted-geometry tree over the patches'
-        vertices and the unattached strips, which only track exclusion reads.
+        vertices, which only track exclusion reads.
         Returns them by attribute name; allocates no device memory."""
         progress = progress_or_null(self.progress)
 
@@ -1603,23 +1351,23 @@ class FitContext:
                 f"({_startup_resource_suffix()})")
 
         # ==========================================================================================
-        # trusted geometry (verified patches and pcls) kdtree / tracks masking
+        # trusted geometry (verified patches) kdtree / tracks masking
         # ==========================================================================================
 
-        # The trusted anchor cloud (verified patch vertices + pcl strips) drives
-        # the DBM-track exclusion in tracks.py, and nothing else: it is built
+        # The trusted anchor cloud (verified patch vertices) drives the
+        # DBM-track exclusion in tracks.py, and nothing else: it is built
         # only when tracks are used. The cloud is consumed only by a CPU
         # cKDTree, so it is built directly on the CPU.
         trusted_geometry_tree = None
         if using_tracks:
-            verified_patches_and_pcls_np = np.ascontiguousarray(
-                self._trusted_geometry_cloud(verified_patches_list, unattached_pcl_strips).numpy(),
+            verified_patches_np = np.ascontiguousarray(
+                self._trusted_geometry_cloud(verified_patches_list).numpy(),
                 dtype=np.float32)
-            if verified_patches_and_pcls_np.shape[0] > 0:
+            if verified_patches_np.shape[0] > 0:
                 progress.begin(
                     'loading', 'Building trusted-geometry index',
-                    detail=f'{len(verified_patches_and_pcls_np):,} points')
-                trusted_geometry_tree = cKDTree(verified_patches_and_pcls_np)
+                    detail=f'{len(verified_patches_np):,} points')
+                trusted_geometry_tree = cKDTree(verified_patches_np)
         return {
             'verified_patches_list': verified_patches_list,
             'patch_sampling_probabilities': patch_sampling_probabilities,
@@ -1628,42 +1376,24 @@ class FitContext:
             'trusted_geometry_tree': trusted_geometry_tree,
         }
 
-    def _trusted_geometry_cloud(self, patches, strips):
+    def _trusted_geometry_cloud(self, patches):
         """The trusted anchor points (CPU float32, (N, 3)): every valid patch
-        vertex and every strip point in the z window, in patch then strip
-        order."""
+        vertex in the z window, in patch order."""
         trusted_counts = []
         for patch in patches:
             z_flat = patch.zyxs.reshape(-1, 3).to(dtype=torch.float32)
             valid_flat = patch.valid_vertex_mask.reshape(-1)
             z_in_roi = (z_flat[:, 0] >= self.z_begin) & (z_flat[:, 0] < self.z_end)
             trusted_counts.append(int((valid_flat & z_in_roi).sum()))
-        for strip in strips:
-            zyxs_np = np.asarray(strip['zyxs'])
-            trusted_counts.append(int((
-                (zyxs_np[..., 0] >= self.z_begin)
-                & (zyxs_np[..., 0] < self.z_end)).sum()))
         cloud = torch.empty((sum(trusted_counts), 3), dtype=torch.float32)
         trusted_offset = 0
-        count_index = 0
-        for patch in patches:
-            count = trusted_counts[count_index]
-            count_index += 1
+        for patch, count in zip(patches, trusted_counts):
             if count:
                 z_flat = patch.zyxs.reshape(-1, 3).to(dtype=torch.float32)
                 valid_flat = patch.valid_vertex_mask.reshape(-1)
                 selected = valid_flat & (z_flat[:, 0] >= self.z_begin) \
                     & (z_flat[:, 0] < self.z_end)
                 cloud[trusted_offset:trusted_offset + count].copy_(z_flat[selected])
-                trusted_offset += count
-        for strip in strips:
-            count = trusted_counts[count_index]
-            count_index += 1
-            if count:
-                zyxs = torch.from_numpy(strip['zyxs']).to(dtype=torch.float32)
-                selected = (zyxs[..., 0] >= self.z_begin) \
-                    & (zyxs[..., 0] < self.z_end)
-                cloud[trusted_offset:trusted_offset + count].copy_(zyxs[selected])
                 trusted_offset += count
         return cloud
 
@@ -1754,56 +1484,19 @@ class FitContext:
             self.input_log(f'resuming at the checkpoint\'s pinned {pins.position.describe()}')
         return pins
 
-    def _derive_object_store_point_inputs(self, verified_patches, inputs):
-        """Install point views derived from object-store attachments.
-
-        Uses object_store_inputs.derive_point_views, as the constraints
-        report does, so both apply the same validation.
-        """
-        from object_store_inputs import derive_point_views
-        views = derive_point_views(inputs, verified_patches, self.config)
+    def _report_object_store_inputs(self, inputs):
+        """Log the materialized object-store inputs (FitInputs.report)."""
         if self.dist.is_main_process:
-            for line in inputs.report() + views.report():
+            for line in inputs.report():
                 self.input_log(line)
-        self._install_point_views(
-            views.cross_patch, views.strips, views.strip_groups,
-            resolved_links=views.resolved_links,
-            link_components=views.link_components)
-
-    def _vertical_fiber_radial_offset(self):
-        """Radial target offset (voxels) applied to vertical fiber strips; 0 when off."""
-        return vertical_fiber_radial_offset(self.config)
 
     def _refresh_trusted_geometry(self):
-        """Rebuild the trusted-geometry tree from the active patches and strips."""
+        """Rebuild the trusted-geometry tree from the active patches."""
         trusted = self._trusted_geometry_from_active_inputs()
         trusted_np = np.ascontiguousarray(
             trusted.cpu().numpy(), dtype=np.float32)
         self.trusted_geometry_tree = (
             cKDTree(trusted_np) if len(trusted_np) else None)
-
-    def _refill_vertical_fiber_radial_offsets(self):
-        """Re-derive every strip's per-point radial target offset from its
-        retained vertical/horizontal tag and the current config.
-
-        The offset (scroll voxels along the sheet normal) is written into each
-        strip's ``radial_offsets`` array when the strip is materialised and
-        then, times the strip's ``radial_offset_bake_scale``, concatenated
-        into the cached ``.flat`` GPU bundle that the strip losses, DT
-        targets, and satisfaction metric read. A Run-boundary change to the
-        offset therefore refills those arrays, drops the cached bundle, and
-        resets the DT target caches that were computed against the old
-        offsets; the bake scale is untouched. Strips without a tag (regular
-        point collections, horizontal fibers) stay at zero.
-        """
-        offset = self._vertical_fiber_radial_offset()
-        for strip in self.unattached_pcl_strips:
-            strip['radial_offsets'] = np.full(
-                len(strip['zyxs']),
-                offset if strip.get('is_vertical') else 0.0,
-                dtype=np.float32)
-        self.unattached_pcl_strips.flat = None
-        self.dt_target_cache_manager.reset()
 
     def _winding_model_mode_active(self):
         return self.winding_model_mode and self.winding_inference is not None
@@ -1840,11 +1533,9 @@ class FitContext:
             self.spiral_and_transform.get_slice_to_spiral_transform(),
             self.spiral_and_transform.get_dr_per_winding(),
             self.verified_patches_list,
-            self.unattached_pcl_strips,
             self.config,
             self.z_begin,
             self.z_end,
-            get_or_build_unattached_pcl_flat,
         )
 
     def _warn_if_dense_losses_structurally_disabled(self):
@@ -2155,58 +1846,11 @@ class FitContext:
         self._density_inactive_warned = set()
 
     def _make_theta_crossing_map(self):
-        """Construct the shared patch/PCL source topology."""
+        """Construct the shared patch source topology."""
         crossing_map = ThetaCrossingMap(
             self.device,
             self.config['theta_crossing_map_update_interval'])
         self.patch_atlas.register_theta_topology(crossing_map)
-
-        flat = get_or_build_unattached_pcl_flat(
-            self.unattached_pcl_strips, self.device)
-        if flat is not None:
-            start = crossing_map.register_nodes(
-                flat['total'],
-                lambda lo, hi, points=flat['zyxs']: points[lo:hi])
-            starts = flat['starts_cpu'].numpy()
-            for strip_idx, strip in enumerate(self.unattached_pcl_strips):
-                node_ids = start + np.arange(
-                    starts[strip_idx], starts[strip_idx + 1], dtype=np.int64)
-                strip['_theta_node_ids'] = node_ids
-                if len(node_ids) > 1:
-                    crossing_map.register_edges(
-                        np.stack([node_ids[:-1], node_ids[1:]], axis=1))
-            for edges in self.unattached_component_edges:
-                junctions = []
-                for strip_a, pos_a, strip_b, pos_b in edges:
-                    junctions.append((
-                        self.unattached_pcl_strips[strip_a]['_theta_node_ids'][pos_a],
-                        self.unattached_pcl_strips[strip_b]['_theta_node_ids'][pos_b]))
-                if junctions:
-                    crossing_map.register_edges(junctions)
-
-        points = []
-        seen = set()
-        for pcl in self.cross_patch_pcls:
-            for point in pcl['points'].values():
-                if id(point) not in seen:
-                    seen.add(id(point))
-                    points.append(point)
-        if points:
-            point_zyxs = torch.as_tensor(
-                np.stack([p['zyx'] for p in points]).astype(np.float32),
-                device=self.device)
-            start = crossing_map.register_nodes(
-                len(points), lambda lo, hi, values=point_zyxs: values[lo:hi])
-            for local, point in enumerate(points):
-                point['_theta_node_id'] = start + local
-            for pcl in self.cross_patch_pcls:
-                chain = list(pcl['chain'].iter_chain())
-                if len(chain) > 1:
-                    ids = np.fromiter(
-                        (p['_theta_node_id'] for p in chain), dtype=np.int64)
-                    crossing_map.register_edges(
-                        np.stack([ids[:-1], ids[1:]], axis=1))
-
         return crossing_map
 
     def _write_non_liftable_patch_report(self):
@@ -2229,11 +1873,6 @@ class FitContext:
             in_roi = (points[:, 0] >= self.z_begin) & (points[:, 0] < self.z_end)
             if bool((valid & in_roi).any()):
                 pieces.append(points[valid & in_roi])
-        for strip in self.unattached_pcl_strips:
-            points = torch.from_numpy(strip['zyxs']).to(dtype=torch.float32)
-            in_roi = (points[:, 0] >= self.z_begin) & (points[:, 0] < self.z_end)
-            if bool(in_roi.any()):
-                pieces.append(points[in_roi])
         return torch.cat(pieces, dim=0) if pieces else torch.empty((0, 3))
 
     def _exclude_non_liftable_patches(self, verified_ids, report):
@@ -2258,13 +1897,6 @@ class FitContext:
             if self.verified_patches_list else np.empty(0, dtype=np.float32))
         self.num_verified_patches = len(self.verified_patches_list)
         self.patch_atlas = self.patch_atlas.replaced(self.verified_patches)
-
-        if rejected_verified and self.cross_patch_pcls:
-            for pcl in self.cross_patch_pcls:
-                points_by_patch = pcl.get('points_by_patch', {})
-                for patch_id in rejected_verified:
-                    points_by_patch.pop(patch_id, None)
-            self._rebuild_pcl_sampling_strata()
 
         if rejected_verified and self.interactive_driver is not None:
             # Track exclusion masks prepared later must not retain geometry
@@ -2301,7 +1933,7 @@ class FitContext:
                 self.slice_to_spiral_transform)
 
     def _build_theta_crossing_map(self):
-        """Rebuild, refresh, and validate shared patch/PCL theta topology."""
+        """Rebuild, refresh, and validate shared patch theta topology."""
         started_at = time.perf_counter()
         self.theta_crossing_map = self._make_theta_crossing_map()
         self.theta_crossing_map.force_refresh(self.slice_to_spiral_transform)
@@ -3194,13 +2826,11 @@ class FitContext:
                 live_transform,
                 dr_per_winding,
                 self.verified_patches_list,
-                self.unattached_pcl_strips,
                 generation_path,
                 self.config,
                 self.z_begin,
                 self.z_end,
                 self.voxel_size_um,
-                get_or_build_unattached_pcl_flat,
                 tracks=self.preview_extent_tracks,
                 surface_id=surface_id,
                 z_direction_is_top_to_bottom=self.z_direction_is_top_to_bottom,
@@ -3227,9 +2857,8 @@ class FitContext:
                 name: self.config.get(f'loss_weight_{name}', 0.0)
                 for name in (
                     'patch_radius', 'patch_dt',
-                    'sym_dirichlet', 'rel_winding', 'abs_winding',
+                    'sym_dirichlet',
                     'dense_normals', 'dense_spacing',
-                    'unattached_pcl_radius', 'unattached_pcl_dt',
                     'track_radius', 'track_dt',
                 )
             }
@@ -3267,18 +2896,6 @@ class FitContext:
                         transform, dr, self.shell_outer_winding_idx,
                         self.config['sample_count_regularisation_points'],
                         cfg=self.config, z_begin=self.z_begin, z_end=self.z_end)
-                if self.config['loss_weight_rel_winding'] > 0 and self.cross_patch_pcls:
-                    get_patch_rel_winding_loss(
-                        transform, dr, self.verified_patches, self.patch_atlas,
-                        self.cross_patch_pcls, self.pcl_sampling_strata['cross_patch'],
-                        crossing_map=self.theta_crossing_map,
-                        cfg=self.config, z_begin=self.z_begin, z_end=self.z_end)
-                if self.config['loss_weight_abs_winding'] > 0 and self.cross_patch_pcls:
-                    get_patch_abs_winding_loss(
-                        transform, dr, self.verified_patches, self.patch_atlas,
-                        self.cross_patch_pcls,
-                        crossing_map=self.theta_crossing_map,
-                        cfg=self.config, z_begin=self.z_begin, z_end=self.z_end)
                 if self.lasagna_volume is not None and (
                         (self.dense_normals_enabled
                          and self.config['loss_weight_dense_normals'] > 0)
@@ -3301,19 +2918,6 @@ class FitContext:
                         self.config,
                         self.z_begin, self.z_end,
                         generator=preview_generator)
-                if self.unattached_pcl_strips:
-                    get_unattached_pcl_strip_losses(
-                        transform, dr, self.unattached_pcl_strips,
-                        self.unattached_components,
-                        self.unattached_component_edges,
-                        self.pcl_sampling_strata['unattached'],
-                        get_or_build_unattached_pcl_flat,
-                        self.config['sample_count_unattached_pcls_per_step'],
-                        self.config['sample_count_unattached_pcl_points_per_step'],
-                        compute_dt=self.config['loss_weight_unattached_pcl_dt'] > 0,
-                        crossing_map=self.theta_crossing_map,
-                        cfg=self.config,
-                    )
                 if self.prepared_main_tracks is not None:
                     for _loss_name, _loss_value in iter_track_losses(
                             transform, dr, self.prepared_main_tracks, self.config,
@@ -3451,12 +3055,6 @@ class FitContext:
                 raise ValueError(
                     'loss_weight_fiber_directions > 0 needs resident '
                     'fiber-direction samples; rebuild with that input enabled')
-            rebuild_strata = 'pcl_sampling_weights' in changed
-            if rebuild_strata and self.config['pcl_sampling_weights'] is not None:
-                build_pcl_sampling_strata(
-                    [pcl['sampling_group'] for pcl in self.cross_patch_pcls]
-                    + list(self.unattached_strip_sampling_groups),
-                    self.config)
             if changed & PATCH_SAMPLING_KEYS:
                 self.patch_sampling_probabilities = self._patch_sampling_probabilities(
                     self.verified_patches_list)
@@ -3524,9 +3122,6 @@ class FitContext:
                  'track_max_track_crossing_per_step'}
                     & changed):
                 configure_prepared_track_sampling(target_tracks, config)
-
-            if rebuild_strata:
-                self._rebuild_pcl_sampling_strata()
         except Exception:
             self.config.update(old_values)
             raise
@@ -3541,11 +3136,6 @@ class FitContext:
             self.preview_extent_tracks = (
                 (self.prepared_main_tracks['flat_zyx_cpu'],)
                 if self.prepared_main_tracks is not None else ())
-        if changed & {
-                'pcl_vertical_fiber_radial_offset_enabled',
-                'pcl_vertical_fiber_radial_offset_voxels',
-        }:
-            self._refill_vertical_fiber_radial_offsets()
         if 'theta_crossing_map_update_interval' in changed:
             # refresh_if_due observes the changed interval on the next step and
             # resets its cadence without rebuilding immutable topology.
@@ -3622,10 +3212,8 @@ class FitContext:
             self.config, iteration, self.run_dt_resume_iteration)
         compute_patch_dt = dt_eligibility['verified_patch']
         compute_track_dt = dt_eligibility['track']
-        compute_unattached_pcl_dt = dt_eligibility['unattached_pcl']
 
         patch_dt_target_cache = None
-        unattached_pcl_dt_target_cache = None
         track_dt_target_cache = None
         if self.dt_target_whole_object:
             if compute_patch_dt and self.config['loss_weight_patch_dt'] > 0 and self.verified_patches_list:
@@ -3635,24 +3223,10 @@ class FitContext:
                     self.theta_crossing_map,
                     self.config['dt_target_floating_threshold'],
                 ))
-            if compute_unattached_pcl_dt and self.config['loss_weight_unattached_pcl_dt'] > 0 and self.unattached_pcl_strips:
-                pcl_flat = get_or_build_unattached_pcl_flat(self.unattached_pcl_strips, self.device)
-                if pcl_flat is not None:
-                    unattached_pcl_dt_target_cache = self.dt_target_cache_manager.get('unattached_pcl', iteration, lambda: compute_strip_dt_target_cache(
-                        self.slice_to_spiral_transform, self.dr_per_winding,
-                        pcl_flat['zyxs'], pcl_flat['starts'],
-                        windings=pcl_flat['windings'],
-                        radial_offsets=pcl_flat.get('radial_offsets'),
-                        floating_threshold=self.config['dt_target_floating_threshold'],
-                        num_points_per_strip=self.config['sample_count_dt_target_points_per_strip'],
-                        max_stride=self.config['dt_target_max_stride'],
-                        max_total_points=5_000_000,
-                    ))
             if compute_track_dt and self.config['loss_weight_track_dt'] > 0 and self.prepared_main_tracks is not None:
                 track_dt_target_cache = self.dt_target_cache_manager.get('track', iteration, lambda: compute_strip_dt_target_cache(
                     self.slice_to_spiral_transform, self.dr_per_winding,
                     self.prepared_main_tracks['flat_zyx_cpu'], self.prepared_main_tracks['offsets'],
-                    windings=None,
                     floating_threshold=self.config['dt_target_floating_threshold'],
                     num_points_per_strip=self.config['sample_count_dt_target_points_per_strip'],
                     max_stride=self.config['dt_target_max_stride'],
@@ -3698,33 +3272,6 @@ class FitContext:
                     self.config['sample_count_regularisation_points'],
                     cfg=self.config, z_begin=self.z_begin, z_end=self.z_end,
                 ) * self.config['loss_weight_sym_dirichlet'],
-            })
-
-        if self.config['loss_weight_rel_winding'] > 0 and self.cross_patch_pcls:
-            backward_family({
-                'rel_winding': get_patch_rel_winding_loss(
-                    self.slice_to_spiral_transform,
-                    self.dr_per_winding,
-                    self.verified_patches,
-                    self.patch_atlas,
-                    self.cross_patch_pcls,
-                    self.pcl_sampling_strata['cross_patch'],
-                    crossing_map=self.theta_crossing_map,
-                    cfg=self.config, z_begin=self.z_begin, z_end=self.z_end,
-                ) * self.config['loss_weight_rel_winding'],
-            })
-
-        if self.config['loss_weight_abs_winding'] > 0 and self.cross_patch_pcls:
-            backward_family({
-                'abs_winding': get_patch_abs_winding_loss(
-                    self.slice_to_spiral_transform,
-                    self.dr_per_winding,
-                    self.verified_patches,
-                    self.patch_atlas,
-                    self.cross_patch_pcls,
-                    crossing_map=self.theta_crossing_map,
-                    cfg=self.config, z_begin=self.z_begin, z_end=self.z_end,
-                ) * self.config['loss_weight_abs_winding'],
             })
 
         if (
@@ -3818,32 +3365,6 @@ class FitContext:
             backward_family({'min_spacing': min_spacing_loss * min_spacing_weight})
             log_metrics.update(min_spacing_metrics)
             del min_spacing_loss, min_spacing_metrics
-
-        if (
-            (self.config['loss_weight_unattached_pcl_radius'] > 0
-             or self.config['loss_weight_unattached_pcl_dt'] > 0)
-            and self.unattached_pcl_strips
-        ):
-            unattached_loss_values = get_unattached_pcl_strip_losses(
-                self.slice_to_spiral_transform,
-                self.dr_per_winding,
-                self.unattached_pcl_strips,
-                self.unattached_components,
-                self.unattached_component_edges,
-                self.pcl_sampling_strata['unattached'],
-                get_or_build_unattached_pcl_flat,
-                self.config['sample_count_unattached_pcls_per_step'],
-                self.config['sample_count_unattached_pcl_points_per_step'],
-                compute_dt=compute_unattached_pcl_dt,
-                dt_target_cache=unattached_pcl_dt_target_cache,
-                crossing_map=self.theta_crossing_map,
-                cfg=self.config,
-            )
-            backward_family({
-                'unattached_pcl_radius': unattached_loss_values[0] * self.config['loss_weight_unattached_pcl_radius'],
-                'unattached_pcl_dt': unattached_loss_values[1] * self.config['loss_weight_unattached_pcl_dt'],
-            })
-            del unattached_loss_values
 
         if self.prepared_main_tracks is not None:
             for track_loss_name, track_loss_value in iter_track_losses(
@@ -3984,10 +3505,7 @@ class FitContext:
     _INPUT_HOST_ATTRIBUTES = (
         'object_store_inputs', 'verified_patches', 'verified_patches_list',
         'num_verified_patches', 'patch_sampling_probabilities', 'patch_atlas',
-        'trusted_geometry_tree', 'cross_patch_pcls', 'unattached_pcl_strips',
-        'unattached_strip_sampling_groups', 'resolved_links', 'link_components',
-        'unattached_components', 'unattached_component_groups',
-        'unattached_component_edges', 'pcl_sampling_strata',
+        'trusted_geometry_tree',
     )
 
     def load_replacement_inputs(self, position):
@@ -4007,7 +3525,7 @@ class FitContext:
     def prepare_input_replacement(self, inputs):
         """Derive every input-dependent host structure for ``inputs``
         (FitInputs at the candidate position) without touching the resident
-        fit: the point views, patch atlas (host side), sampling caches,
+        fit: the patch atlas (host side), sampling caches,
         trusted geometry and DT samples, on a shallow copy of this context.
         The host RNG streams are restored afterwards, so training draws as if
         nothing had been prepared.
@@ -4046,13 +3564,13 @@ class FitContext:
             candidate = copy.copy(self)
             # The copy must not keep the old inputs' device state alive
             # through install: the theta topology's closures hold the old
-            # atlas and strips.
+            # atlas.
             candidate.theta_crossing_map = None
             candidate.object_store_inputs = inputs
             verified_patches = dict(inputs.patches)
-            candidate._derive_object_store_point_inputs(verified_patches, inputs)
+            candidate._report_object_store_inputs(inputs)
             patch_inputs = candidate._prepare_patch_inputs(
-                verified_patches, candidate.unattached_pcl_strips, using_tracks=self.using_tracks)
+                verified_patches, using_tracks=self.using_tracks)
             for name, value in patch_inputs.items():
                 setattr(candidate, name, value)
             candidate.verified_patches = verified_patches
@@ -4072,17 +3590,14 @@ class FitContext:
         """Install a prepared candidate's inputs into the resident fit.
 
         Destructive from its first line: the old inputs' device state (the
-        materialized patch atlas, the theta topology, DT target caches and
-        the strips' flat bundle) is released before the replacement's is
-        built, so the two never hold device memory together. The model,
-        optimiser, scheduler, iteration count and RNG streams are kept.
+        materialized patch atlas, the theta topology and DT target caches)
+        is released before the replacement's is built, so the two never hold
+        device memory together. The model, optimiser, scheduler, iteration
+        count and RNG streams are kept.
         Any failure raises InputReplacementFailed: the fit is then unusable
         until an explicit rebuild or checkpoint load.
         """
         try:
-            strips = getattr(self, 'unattached_pcl_strips', None)
-            if strips is not None and hasattr(strips, 'flat'):
-                strips.flat = None
             self.patch_atlas = None
             self.theta_crossing_map = None
             if getattr(self, 'dt_target_cache_manager', None) is not None:
@@ -4262,7 +3777,6 @@ class FitContext:
                 patches_list=self.verified_patches_list,
                 patches_dict=self.verified_patches,
                 patch_atlas=self.patch_atlas,
-                unattached_pcl_strips=self.unattached_pcl_strips,
                 tracks=self.tracks,
                 out_path=self.out_path,
                 cfg=self.config,
@@ -4279,7 +3793,6 @@ class FitContext:
                 z_to_umbilicus_yx=self.umbilicus,
                 render_volume_scale=self.render_volume_scale,
                 voxel_size_um=self.voxel_size_um,
-                get_or_build_unattached_pcl_flat=get_or_build_unattached_pcl_flat,
                 z_direction_is_top_to_bottom=self.z_direction_is_top_to_bottom,
                 run_tag=self.run_tag,
                 save_png_visualizations=self.config.get('output_save_png_visualizations', False),
@@ -4385,7 +3898,7 @@ if __name__ == '__main__':
              'resolve against its directory')
     parser.add_argument(
         '--object-store', required=True, metavar='STORE',
-        help='Object store the fit reads patch, PCL, fiber, track and '
+        help='Object store the fit reads patch, track and '
              'outer-shell inputs from, and writes refreshed links to: a store '
              'file (.vcobj), or the endpoint of the vc_object_server serving one '
              '(http://host:port, or ssh://host:port, with sftp:// as an alias, for '
@@ -4479,9 +3992,6 @@ if __name__ == '__main__':
         z_range_scaled_count_keys = (
             'sample_count_patches_per_step',
             'sample_count_patches_per_step_for_dt',
-            'sample_count_relative_winding_pcls',
-            'sample_count_absolute_winding_pcls',
-            'sample_count_unattached_pcls_per_step',
             'sample_count_tracks_per_step',
             'sample_count_dense_normal_points',
             'sample_count_fiber_direction_points',

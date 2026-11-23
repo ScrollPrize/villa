@@ -33,9 +33,8 @@ def export_preview(path, z_direction_is_top_to_bottom):
     cfg = {"shell_outer_winding_idx": WINDINGS[-1], "output_step_size": STEP,
            "model_flow_bounds_z_margin": 0}
     return spiral_helpers.save_combined_preview(
-        IdentityTransform(), torch.tensor(DR), [], [], path, cfg,
+        IdentityTransform(), torch.tensor(DR), [], path, cfg,
         z_begin=0, z_end=Z_END, voxel_size_um=9.6,
-        get_or_build_unattached_pcl_flat=lambda *_: None,
         surface_id="surface",
         z_direction_is_top_to_bottom=z_direction_is_top_to_bottom)
 
@@ -172,9 +171,8 @@ def test_a_fit_level_preview_is_written_in_the_volume_voxels(tmp_path):
         cfg = {"shell_outer_winding_idx": WINDINGS[-1], "output_step_size": STEP,
                "model_flow_bounds_z_margin": 0, "fit_volume_level": level}
         return spiral_helpers.save_combined_preview(
-            IdentityTransform(), torch.tensor(DR), [], [], path, cfg,
+            IdentityTransform(), torch.tensor(DR), [], path, cfg,
             z_begin=0, z_end=Z_END, voxel_size_um=9.6,
-            get_or_build_unattached_pcl_flat=lambda *_: None,
             surface_id="surface", z_direction_is_top_to_bottom=True,
             base_shape_zyx=[400, 400, 400])
 

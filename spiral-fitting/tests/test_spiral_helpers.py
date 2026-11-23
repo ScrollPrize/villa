@@ -15,10 +15,8 @@ from spiral_helpers import (
 )
 from fit_spiral import (
     get_dt_loss_eligibility,
-    get_unattached_pcl_dt_start,
     get_run_dt_resume_iteration,
 )
-from pcl_views import fiber_training_views, prepare_fiber_catalog
 from tifxyz import load_tifxyz
 
 
@@ -40,120 +38,18 @@ class RunDtLossScheduleTests(unittest.TestCase):
         cfg = Config({
             'loss_start_patch_dt': 10,
             'loss_start_track_dt': 20,
-            'loss_start_unattached_pcl_dt': 25,
         }).as_dict()
         resume = 15
         self.assertEqual(get_dt_loss_eligibility(cfg, 14, resume), {
             'verified_patch': False,
             'track': False,
-            'unattached_pcl': False,
         })
         # Existing loss starts remain strict `iteration > start` checks.
         at_starts = get_dt_loss_eligibility(cfg, 20, resume)
         self.assertTrue(at_starts['verified_patch'])
-        self.assertFalse(at_starts['unattached_pcl'])
         self.assertFalse(at_starts['track'])
-        self.assertFalse(get_dt_loss_eligibility(cfg, 25, resume)['unattached_pcl'])
-        self.assertTrue(get_dt_loss_eligibility(cfg, 26, resume)['unattached_pcl'])
         after_all = get_dt_loss_eligibility(cfg, 31, resume)
         self.assertTrue(all(after_all.values()))
-
-    def test_unattached_pcl_dt_start_follows_patch_start_when_unset(self):
-        cfg = Config({'loss_start_patch_dt': 10}).as_dict()
-        self.assertIsNone(cfg['loss_start_unattached_pcl_dt'])
-        self.assertEqual(get_unattached_pcl_dt_start(cfg), 10)
-        self.assertFalse(get_dt_loss_eligibility(cfg, 10)['unattached_pcl'])
-        self.assertTrue(get_dt_loss_eligibility(cfg, 11)['unattached_pcl'])
-        decoupled = Config({'loss_start_patch_dt': 10,
-                            'loss_start_unattached_pcl_dt': 0}).as_dict()
-        self.assertEqual(get_unattached_pcl_dt_start(decoupled), 0)
-        self.assertTrue(get_dt_loss_eligibility(decoupled, 1)['unattached_pcl'])
-        self.assertFalse(get_dt_loss_eligibility(decoupled, 1)['verified_patch'])
-
-
-class FiberLinkViewTests(unittest.TestCase):
-    """Fiber training views over store-resolved same-winding branch links."""
-
-    @staticmethod
-    def _fiber(collection_id, x_offset, attached=True):
-        points = {
-            point_id: {
-                "id": point_id,
-                "collectionId": collection_id,
-                "p": [x_offset + point_id, 0.0, 0.0],
-                "zyx": np.asarray([0.0, 0.0, x_offset + point_id],
-                                  dtype=np.float32),
-                "winding_annotation": float("nan"),
-                **({"attachments": [{"id": f"patch-{collection_id}",
-                                     "ij": [0.0, float(point_id)]}]}
-                   if attached else {}),
-            }
-            for point_id in range(2)
-        }
-        return {"id": collection_id, "metadata": {}, "points": points}
-
-    @staticmethod
-    def _link(a_coll, a_point, b_coll, b_point):
-        return {"a_coll": a_coll, "a_point": a_point,
-                "b_coll": b_coll, "b_point": b_point, "pending": False}
-
-    def _views(self, catalog, links, spacing=0):
-        fibers = prepare_fiber_catalog(catalog)
-        patches = {f"patch-{cid}": object() for cid in fibers}
-        return fiber_training_views(
-            fibers, links, patches, z_begin=-10, z_end=10, z_margin=0,
-            min_point_spacing=spacing)
-
-    def _catalog(self):
-        return {"a": self._fiber(10, 0), "b": self._fiber(11, 10),
-                "c": self._fiber(12, 20)}
-
-    def test_branching_and_loop_closing_links_merge_one_component(self):
-        links = [self._link(10, 0, 11, 0), self._link(10, 1, 12, 0),
-                 self._link(11, 1, 12, 1)]
-
-        cross, strips, groups, components = self._views(self._catalog(), links)
-
-        self.assertEqual(len(cross), 1)
-        self.assertEqual(cross[0]["metadata"]["logical_input_ids"],
-                         ["a", "b", "c"])
-        self.assertEqual(len(components), 1)
-        self.assertEqual(len(strips), 3)
-        self.assertEqual(groups, ["fibers"] * 3)
-        self.assertEqual(len(cross[0]["chain"].extra_edges), 1)
-
-    def test_link_endpoints_survive_strip_decimation(self):
-        links = [self._link(10, 0, 11, 0), self._link(11, 1, 12, 0)]
-
-        _, strips, _, _ = self._views(self._catalog(), links, spacing=1000)
-
-        strips_by_id = {strip["id"]: strip for strip in strips}
-        self.assertIn(0, strips_by_id[10]["link_points"])
-        self.assertEqual(set(strips_by_id[11]["link_points"]), {0, 1})
-        self.assertIn(0, strips_by_id[12]["link_points"])
-
-    def test_unlinked_fibers_stay_separate_and_keep_their_strips(self):
-        cross, strips, _, components = self._views(self._catalog(), [])
-
-        self.assertEqual(components, [])
-        self.assertEqual(len(cross), 3)
-        # Every fiber keeps its strip, attached or not.
-        self.assertEqual(sorted(strip["id"] for strip in strips), [10, 11, 12])
-
-    def test_views_are_deterministic(self):
-        links = [self._link(11, 0, 10, 0)]
-
-        first = self._views(self._catalog(), links)
-        second = self._views(self._catalog(), links)
-
-        self.assertEqual(first[3], second[3])
-        self.assertEqual(
-            [pcl["metadata"] for pcl in first[0]],
-            [pcl["metadata"] for pcl in second[0]])
-        for left, right in zip(first[1], second[1]):
-            self.assertEqual(left["id"], right["id"])
-            self.assertEqual(left["link_points"], right["link_points"])
-            np.testing.assert_array_equal(left["zyxs"], right["zyxs"])
 
 
 class TifxyzMetadataTests(unittest.TestCase):

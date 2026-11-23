@@ -38,7 +38,8 @@ def position_of(path, commit_sequence):
 
 def test_prepare_links_commits_and_pins_a_position(shared):
     walk = names(shared)['walk']
-    edited = shared_edit(shared, lambda db: db.set_meta(walk, 'sampling_group', 'reviewed'))
+    edited = shared_edit(shared, lambda db: db.set_meta(
+        walk, 'source', {'spiral_patch_erode_cells': 2}))
     prepared = prepare(shared, minimum=position_of(shared, edited))
     assert prepared.attempts == 1 and prepared.head == edited
     assert prepared.position.commit_sequence > edited  # the links were committed on top
@@ -49,16 +50,16 @@ def test_prepare_links_commits_and_pins_a_position(shared):
     # Later commits do not change N: every reader reads the same inputs at it.
     request = pinned(shared, prepared.pins)
     before = read(shared, request)
-    assert len(before.relationships) == 3
+    assert len(before.relationships) == 1
     assert before.manifest()['position'] == prepared.position.provenance()
-    shared_edit(shared, lambda db: db.set_meta(walk, 'sampling_group', 'later'))
+    shared_edit(shared, lambda db: db.set_meta(walk, 'source', {'spiral_patch_erode_cells': 3}))
     with ObjectStore.open(shared, read_only=True) as db:
-        assert db.object(walk)['meta']['sampling_group'] == 'later'
+        assert db.object(walk)['meta']['source'] == {'spiral_patch_erode_cells': 3}
     after = read(shared, request)
     assert after.digest() == before.digest()
     assert osi._compared(after.manifest())['objects'] == osi._compared(before.manifest())['objects']
     [entry] = [e for e in before.manifest()['objects'] if e['uuid'] == walk]
-    assert entry['metadata']['sampling_group'] == 'reviewed'
+    assert entry['metadata']['spiral_patch_erode_cells'] == 2
     # A position alone (no versions) reads the same state from the history.
     by_position = read(shared, pinned(shared, osi.InputPins(prepared.position)))
     assert by_position.digest() == before.digest()
@@ -163,12 +164,12 @@ def test_continuous_edits_fail_the_update_cleanly(shared, monkeypatch):
     assert 'inputs kept changing' in text
     # Nothing the service linked was written: a conflict commits nothing.
     with ObjectStore.open(shared, read_only=True) as db:
-        assert db.edges_by_kind('point-surface') == []
+        assert db.edges_by_kind('same-surface') == []
         assert osi.read_link_marker(db) is None
     # Once the edits stop, the next update links afresh.
     monkeypatch.undo()
     prepared = prepare(shared)
-    assert len(read(shared, pinned(shared, prepared.pins)).relationships) == 3
+    assert len(read(shared, pinned(shared, prepared.pins)).relationships) == 1
 
 
 def test_positions_ahead_of_the_head_or_of_another_store_are_refused(shared):
@@ -202,15 +203,11 @@ def test_selectors_resolve_at_the_pins(shared):
         assert osi.resolve_selection(db, request)['surface'] == []
 
 
-def test_changed_link_parameters_or_normals_mark_links_stale(shared):
+def test_changed_normals_mark_links_stale(shared):
     config = fit_config(shared, 'service')
     inputs = osi.load_fit_inputs(config, log=lambda line: None)
     none = osi.fiber_normal_source(config)
     assert osi.stale_link_reasons(inputs.manifest, config, none) == []
-    changed = fit_config(shared, 'service', pcl_link_distance_tolerance=
-                         config['pcl_link_distance_tolerance'] * 2)
-    [reason] = osi.stale_link_reasons(inputs.manifest, changed, none)
-    assert reason.startswith('pcl_link_distance_tolerance changed')
     lasagna = {'pool': '/cache/lasagna/run-1/normals_g4', 'scale': 4}
     assert osi.stale_link_reasons(inputs.manifest, config, osi.fiber_normal_source(
         config, lasagna)) == ['the fiber-patch normal source changed']

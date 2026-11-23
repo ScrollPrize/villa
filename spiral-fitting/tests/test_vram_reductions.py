@@ -412,7 +412,7 @@ class DevicePatchAtlasTests(unittest.TestCase):
         self.assertEqual(atlas.patch_ids_for_theta_nodes([10, 999]), [])
 
     def test_fit_context_gate_excludes_patch_and_writes_its_uuid(self):
-        from fit_spiral import FitContext, _UnattachedPclStripList
+        from fit_spiral import FitContext
 
         # Construct a 2x2 quad-centre field whose theta values make the
         # diagonal/local-edge graph non-liftable.  Vertex values are recovered
@@ -456,9 +456,6 @@ class DevicePatchAtlasTests(unittest.TestCase):
             context.num_verified_patches = 1
             context.patch_atlas = self.PatchAtlas(
                 context.verified_patches, device='cpu').materialize()
-            context.cross_patch_pcls = []
-            context.unattached_pcl_strips = _UnattachedPclStripList()
-            context.unattached_component_edges = []
             context.interactive_driver = None
 
             warnings = context._build_theta_crossing_map()

@@ -61,7 +61,7 @@ def prepare(location, config=None, cache=None, **options):
     config = config or fit_config(location, 'service')
     with osi.open_store(config, cache_directory=cache) as store:
         return osi.prepare_position(store, config, osi.request_from_config(config), log=quiet,
-                                    cache_directory=cache, **options)
+                                    **options)
 
 
 def set_meta(store, uuid, key, value, request='7b9d0c2e-5a1f-4f6b-9c3d-2e1f0a9b8c7d'):
@@ -94,17 +94,14 @@ def test_links_and_pins_through_the_endpoint_as_through_the_file(served, tmp_pat
     # committed the links with the marker; the pins are at its commit.
     assert prepared.head == before
     assert prepared.position.commit_sequence == before + 1 == head(path)
-    assert len(edges(path)) == 3
+    assert len(edges(path)) == 1
     assert set(prepared.pins.references) == set(names(path).values())
     assert any('links committed at commit' in line for line in prepared.lines)
-    # Served: one stage, no detector progress; the strip cache is the server's.
+    # Served: one stage, no detector progress.
     with osi.open_store(fit_config(endpoint, 'service'), read_only=True) as store:
         assert osi.is_served(store)
-        assert osi.strip_cache_directory(store, str(tmp_path / 'cache')) is None
         marker = osi.read_link_marker(store)
     assert marker['commit_sequence'] == prepared.position.commit_sequence
-    for step in marker['detectors']:
-        assert 'cache_directory' not in step['params']
     # The pinned snapshot reads the same through the endpoint and the file.
     hosted = read_at(endpoint, prepared.pins)
     local = read_at(path, prepared.pins)
@@ -122,7 +119,6 @@ def test_the_fit_loads_frozen_inputs_through_the_endpoint(served, tmp_path):
     hosted = osi.load_fit_inputs(fit_config(endpoint, 'service'), log=quiet, cache_directory=str(cache))
     # The served store's persistent cache lives under the fit's cache.
     assert (cache / osi.HOSTED_CACHE_DIRECTORY).is_dir()
-    assert not (cache / osi.STRIP_CACHE_DIRECTORY).exists()
     # The file beside the server opens read-only: the links are current, so
     # a read of its head is the same frozen selection.
     local = osi.load_fit_inputs(fit_config(path, 'service', object_store_refresh_links=False), log=quiet)
@@ -221,7 +217,7 @@ def test_the_service_binds_the_endpoint(served, host):
     inputs = state.startup_inputs()
     assert inputs['ok'] and inputs['store']['location'] == endpoint
     assert {kind: entry['count'] for kind, entry in inputs['selection'].items()} == {
-        'surface': 2, 'point_collection': 1, 'fiber': 0, 'track': 0}
+        'surface': 3, 'track': 0}
     assert state.startup_inputs() is inputs
     near = names(path)['near']
     with binding.open() as store:
@@ -275,7 +271,7 @@ def test_changed_relationship_kinds_are_read_in_one_selection(served, tmp_path):
         store.select_edges = recording
         store.edge = None  # never one edge at a time
         kinds = osi._edge_kinds(store, sorted([*linked, absent]))
-    assert kinds == {uuid: 'point-surface' for uuid in linked} and len(linked) == 3
+    assert kinds == {uuid: 'same-surface' for uuid in linked} and len(linked) == 1
     assert selections == [{'edge_uuids': sorted([*linked, absent]), 'include_retired': True,
                            'fields': ['uuid', 'kind']}]
 
