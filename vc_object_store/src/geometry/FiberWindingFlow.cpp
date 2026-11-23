@@ -91,8 +91,19 @@ WindingFlowResult solveWindingMinCostFlow(int64_t nodes, std::span<const int64_t
                                           std::span<const int64_t> target, std::span<const double> weight,
                                           const WindingFlowOptions& options)
 {
+    return solveWindingMinCostFlow(nodes, a, b, target, weight, std::span<const int>{}, options);
+}
+
+WindingFlowResult solveWindingMinCostFlow(int64_t nodes, std::span<const int64_t> a, std::span<const int64_t> b,
+                                          std::span<const int64_t> target, std::span<const double> weight,
+                                          std::span<const int> side, const WindingFlowOptions& options)
+{
     const auto started = Clock::now();
     auto result = quantize(nodes, a, b, target, weight, options.capacityScale);
+    if (!side.empty() && side.size() != a.size()) throw std::invalid_argument("winding flow arc columns differ in length");
+    for (const int s : side)
+        if (s < -1 || s > 1) throw std::invalid_argument("winding flow arc side must be -1, 0 or +1");
+    const auto sideOf = [&](size_t i) { return side.empty() ? 0 : side[i]; };
 #ifndef VC_OBJECT_STORE_HAS_LEMON
     (void)options;
     throw std::runtime_error("vc_object_store was built without LEMON (VC_OBJECT_STORE_WITH_LEMON=OFF)");
@@ -103,16 +114,21 @@ WindingFlowResult solveWindingMinCostFlow(int64_t nodes, std::span<const int64_t
     for (size_t i = 0; i < result.arcs; ++i) if (result.capacity[i] > 0) order.push_back(i);
     std::stable_sort(order.begin(), order.end(), [&](size_t x, size_t y) { return a[x] < a[y]; });
     std::vector<int> sortedA(order.size()), sortedB(order.size());
-    std::vector<int64_t> capacity(order.size()), cost(order.size());
+    // The flow of an arc lies in [-capacity, capacity]: its lower end prices a
+    // step above the target, its upper end a step below it. A one-sided arc
+    // keeps only the end that prices its violated side.
+    std::vector<int64_t> lower(order.size()), upper(order.size()), cost(order.size());
     for (size_t k = 0; k < order.size(); ++k) {
         const auto i = order[k];
-        sortedA[k] = int(a[i]); sortedB[k] = int(b[i]); capacity[k] = result.capacity[i]; cost[k] = target[i];
+        sortedA[k] = int(a[i]); sortedB[k] = int(b[i]); cost[k] = target[i];
+        lower[k] = sideOf(i) > 0 ? 0 : -result.capacity[i];
+        upper[k] = sideOf(i) < 0 ? 0 : result.capacity[i];
     }
     const auto built = Clock::now();
     std::vector<int64_t> potential(static_cast<size_t>(nodes));
     std::vector<int64_t> flow(order.size());
     lemon_detail::solveCirculation(options.backend == WindingFlowBackend::NetworkSimplex ? 0 : 1, int(nodes), order.size(),
-                                   sortedA.data(), sortedB.data(), capacity.data(), cost.data(), potential.data(), flow.data());
+                                   sortedA.data(), sortedB.data(), lower.data(), upper.data(), cost.data(), potential.data(), flow.data());
     const auto solved = Clock::now();
     // Potentials of nodes without retained arcs are arbitrary: pin them to 0.
     std::vector<bool> touched(result.nodes, false);
@@ -121,7 +137,8 @@ WindingFlowResult solveWindingMinCostFlow(int64_t nodes, std::span<const int64_t
     for (size_t k = 0; k < order.size(); ++k) result.flow[order[k]] = flow[k];
     long double quantized = 0, objective = 0;
     for (size_t i = 0; i < result.arcs; ++i) {
-        const auto residual = std::abs(result.winding[size_t(b[i])] - result.winding[size_t(a[i])] - target[i]);
+        const auto residual =
+            windingArcResidual(result.winding[size_t(b[i])] - result.winding[size_t(a[i])], target[i], sideOf(i));
         quantized += (long double)result.capacity[i] * (long double)residual;
         objective += (long double)weight[i] * (long double)residual;
     }

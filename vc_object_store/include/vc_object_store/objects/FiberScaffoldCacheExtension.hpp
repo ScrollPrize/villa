@@ -39,6 +39,7 @@ class StoreReader;
 
 inline constexpr const char* kFiberScaffoldNormalsTable = "ext_fiber_strip_normals";
 inline constexpr const char* kFiberScaffoldCrossingsTable = "ext_fiber_pair_crossings";
+inline constexpr const char* kFiberScaffoldRunNormalsTable = "ext_fiber_scaffold_run_normals";
 inline constexpr const char* kFiberScaffoldCacheExtension = "fiber-scaffold-cache";
 inline constexpr int64_t kFiberScaffoldCacheFormat = 1;
 
@@ -90,6 +91,23 @@ struct FiberScaffoldCrossingRow {
 // `eventIndex == kFiberScaffoldNoCrossings`: otherwise an empty answer would
 // be re-extracted on every run.
 inline constexpr int64_t kFiberScaffoldNoCrossings = -1;
+
+// The normals a solve run used for one fiber: the run names the fiber's
+// normals row by its identity. Reading a run's normals is following this
+// reference, never a search among the rows of a fiber.
+struct FiberScaffoldRunNormalsRow {
+    std::string runUuid, fiberUuid;
+    int64_t fiberVersion = 0;
+    std::string normalsUuid;
+};
+
+[[nodiscard]] ExtensionTable fiberScaffoldRunNormalsTable();
+[[nodiscard]] ExtensionRow fiberScaffoldRunNormalsRow(const FiberScaffoldRunNormalsRow&);
+// The normals row a run references for a fiber. Throws std::runtime_error,
+// saying which link is missing, when the run references none for that fiber
+// or the row it names is not in the store.
+[[nodiscard]] FiberScaffoldNormalsRow readFiberScaffoldRunNormals(const StoreReader&, const std::string& runUuid,
+                                                                  const std::string& fiberUuid);
 
 [[nodiscard]] ExtensionTable fiberScaffoldNormalsTable();
 [[nodiscard]] ExtensionTable fiberScaffoldCrossingsTable();

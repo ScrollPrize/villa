@@ -115,6 +115,59 @@ void invalidInputIsRejected()
     require(parseWindingFlowBackend("cost_scaling") == WindingFlowBackend::CostScaling, "parse");
     mustFail([] { parseWindingFlowBackend("simplex"); }, "unknown backend name");
 }
+
+// One-sided arcs: a lower bound costs only below its target, an upper bound
+// only above it.
+void oneSidedArcsBoundFromOneSide()
+{
+    for (auto backend : {WindingFlowBackend::NetworkSimplex, WindingFlowBackend::CostScaling}) {
+        WindingFlowOptions options; options.backend = backend; options.capacityScale = 1;
+        // An equation k1 - k0 = 0 of weight 1 against a bound of weight 3.
+        const std::vector<int64_t> a{0, 0}, b{1, 1};
+        const std::vector<double> weight{1., 3.};
+        const auto step = [&](int64_t target, int side) {
+            const std::vector<int64_t> targets{0, target};
+            const std::vector<int> sides{0, side};
+            const auto r = solveWindingMinCostFlow(2, a, b, targets, weight, sides, options);
+            return std::pair{r.winding[1] - r.winding[0], r.objective};
+        };
+        // At least 2: the bound wins, the equation pays 2.
+        require(step(2, 1) == std::pair<int64_t, double>{2, 2.}, "violated lower bound is enforced");
+        // At least -2: already met at 0, costs nothing.
+        require(step(-2, 1) == std::pair<int64_t, double>{0, 0.}, "met lower bound is free");
+        // At most -2: the bound wins. At most 2: free.
+        require(step(-2, -1) == std::pair<int64_t, double>{-2, 2.}, "violated upper bound is enforced");
+        require(step(2, -1) == std::pair<int64_t, double>{0, 0.}, "met upper bound is free");
+    }
+    // Random graphs with mixed sides against brute force.
+    std::mt19937 random(7);
+    for (int trial = 0; trial < 40; ++trial) {
+        Graph g{4, {}, {}, {}, {}};
+        std::vector<int> sides;
+        for (int e = 0; e < 7; ++e) {
+            const auto x = int64_t(random() % 4), y = int64_t((x + 1 + random() % 3) % 4);
+            g.a.push_back(x); g.b.push_back(y); g.target.push_back(int64_t(random() % 5) - 2);
+            g.weight.push_back(double(1 + random() % 3)); sides.push_back(int(random() % 3) - 1);
+        }
+        std::vector<int64_t> k(4, -6); k[0] = 0;
+        double best = 1e300;
+        while (true) {
+            double cost = 0;
+            for (size_t e = 0; e < g.a.size(); ++e)
+                cost += g.weight[e] * double(windingArcResidual(k[size_t(g.b[e])] - k[size_t(g.a[e])], g.target[e], sides[e]));
+            best = std::min(best, cost);
+            size_t n = 1;
+            while (n < k.size() && k[n] == 6) { k[n] = -6; ++n; }
+            if (n == k.size()) break;
+            ++k[n];
+        }
+        for (auto backend : {WindingFlowBackend::NetworkSimplex, WindingFlowBackend::CostScaling}) {
+            WindingFlowOptions options; options.backend = backend; options.capacityScale = 1;
+            const auto r = solveWindingMinCostFlow(g.nodes, g.a, g.b, g.target, g.weight, sides, options);
+            require(r.objective == best, "one-sided optimum matches brute force");
+        }
+    }
+}
 } // namespace
 
 int main()
@@ -126,6 +179,7 @@ int main()
         zeroCapacityArcsAreDroppedNotClamped();
         backendsMatchBruteForceOnRandomGraphs();
         invalidInputIsRejected();
+        oneSidedArcsBoundFromOneSide();
     } catch (const std::exception& error) {
         std::cerr << "test_fiber_winding_flow: " << error.what() << '\n';
         return EXIT_FAILURE;

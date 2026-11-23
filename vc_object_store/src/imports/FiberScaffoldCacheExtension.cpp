@@ -91,6 +91,81 @@ ExtensionTable fiberScaffoldNormalsTable()
     return table;
 }
 
+ExtensionTable fiberScaffoldRunNormalsTable()
+{
+    ExtensionTable table;
+    table.name = kFiberScaffoldRunNormalsTable;
+    table.extension = kFiberScaffoldCacheExtension;
+    table.formatVersion = kFiberScaffoldCacheFormat;
+    table.provisioning = R"({"references":"ext_fiber_strip_normals by fiber_uuid, fiber_version, normals_uuid"})";
+    table.keySpace = "objects";
+    table.versioned = false;
+    table.columns = {required("run_uuid", Type::Blob), required("fiber_uuid", Type::Blob),
+                     required("fiber_version", Type::Integer), required("normals_uuid", Type::Blob)};
+    table.primaryKey = {"run_uuid", "fiber_uuid"};
+    table.indexes = {};
+    return table;
+}
+
+ExtensionRow fiberScaffoldRunNormalsRow(const FiberScaffoldRunNormalsRow& row)
+{
+    if (row.runUuid.empty() || row.fiberUuid.empty() || row.normalsUuid.empty() || row.fiberVersion <= 0)
+        throw std::invalid_argument("fiber scaffold cache: a run's normals reference needs the run, the fiber, its "
+                                    "version and the normals row");
+    return {extensionUuid(row.runUuid), extensionUuid(row.fiberUuid), row.fiberVersion, extensionUuid(row.normalsUuid)};
+}
+
+FiberScaffoldNormalsRow readFiberScaffoldRunNormals(const StoreReader& reader, const std::string& runUuid,
+                                                    const std::string& fiberUuid)
+{
+    const std::string what = "run " + runUuid + ", fiber " + fiberUuid;
+    std::optional<FiberScaffoldRunNormalsRow> reference;
+    const std::vector<ExtensionValue> referenceKey{extensionUuid(runUuid), extensionUuid(fiberUuid)};
+    try {
+        reader.scanExtensionRows(kFiberScaffoldRunNormalsTable, [&](const ExtensionRow& row) {
+            if (row.size() < 4) throw std::runtime_error("fiber scaffold cache: short run normals row");
+            reference = FiberScaffoldRunNormalsRow{extensionUuid(row[0]), extensionUuid(row[1]),
+                                                   integer(row[2], "fiber version"), extensionUuid(row[3])};
+            return false;
+        }, referenceKey);
+    } catch (const std::invalid_argument&) {
+        throw std::runtime_error("the store has no table of the normals its runs used (" + what +
+                                 "): the run was saved before runs referenced their normals; solve again");
+    }
+    if (!reference)
+        throw std::runtime_error("the run references no normals for this fiber (" + what +
+                                 "): it was saved before runs referenced their normals, or it did not solve "
+                                 "this fiber; solve again");
+    std::optional<FiberScaffoldNormalsRow> found;
+    const std::vector<ExtensionValue> normalsKey{extensionUuid(fiberUuid), ExtensionValue{reference->fiberVersion},
+                                                 extensionUuid(reference->normalsUuid)};
+    try {
+    reader.scanExtensionRows(kFiberScaffoldNormalsTable, [&](const ExtensionRow& row) {
+        if (row.size() < 10) throw std::runtime_error("fiber scaffold cache: short normals row");
+        FiberScaffoldNormalsRow entry;
+        entry.fiberUuid = extensionUuid(row[0]);
+        entry.fiberVersion = integer(row[1], "fiber version");
+        entry.normalsUuid = extensionUuid(row[2]);
+        entry.inputs = text(row[3], "inputs");
+        entry.signSource = integer(row[4], "sign source");
+        entry.sign = integer(row[5], "sign");
+        entry.converged = integer(row[6], "converged") != 0;
+        entry.normals = blob(row[7], "normals");
+        entry.author = text(row[8], "author");
+        entry.computedAt = text(row[9], "computed at");
+        found = std::move(entry);
+        return false;
+    }, normalsKey);
+    } catch (const std::invalid_argument&) {
+        // No normals table at all: the row the run names cannot be there.
+    }
+    if (!found)
+        throw std::runtime_error("the normals row " + reference->normalsUuid + " the run references (" + what +
+                                 ", fiber version " + std::to_string(reference->fiberVersion) +
+                                 ") is not in the store");
+    return *found;
+}
+
 ExtensionTable fiberScaffoldCrossingsTable()
 {
     ExtensionTable table;
