@@ -352,7 +352,7 @@ def check_vertical_slab_grid(tracks_dbm_path):
     grid: resuming it would add aligned slabs beside its old ones."""
     if not dbm.whichdb(tracks_dbm_path):
         return
-    with dbm.open(tracks_dbm_path, 'r') as tracks_db:
+    with dbm.open(tracks_dbm_path, 'w') as tracks_db:
         keys = [key.decode() for key in tracks_db.keys()]
     for prefix in ('vy', 'vx'):
         starts = sorted(int(key.split(':')[1]) for key in keys if key.startswith(f'{prefix}:'))
