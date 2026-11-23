@@ -89,16 +89,19 @@ def open_predictions(path):
 
 
 def downsample_maxpool(x, factor):
+    """Max over ``factor``-sized cells, cropping each axis to a multiple of ``factor``."""
     if factor == 1:
         return x
-    cropped = tuple(s - s % factor for s in x.shape)
-    x = x[tuple(slice(0, s) for s in cropped)]
-    reshape = []
-    for s in x.shape:
-        reshape += [s // factor, factor]
-    x = x.reshape(reshape)
-    for axis in range(len(reshape) - 1, 0, -2):
-        x = np.max(x, axis=axis)
+    x = x[tuple(slice(0, s - s % factor) for s in x.shape)]
+    # one axis at a time, as an element-wise maximum of strided views: a max over a length-factor
+    # inner axis of a reshaped array is several times slower, and each pass shrinks the next
+    for axis in range(x.ndim):
+        def phase(i):
+            return x[(slice(None),) * axis + (slice(i, None, factor),)]
+        out = np.maximum(phase(0), phase(1))
+        for i in range(2, factor):
+            np.maximum(out, phase(i), out=out)
+        x = out
     return x
 
 
@@ -208,8 +211,12 @@ def prepare_cc_labels(predictions_binary):
     import cc3d
     from vc_reader.geometry import label_components
     cc_labels, _ = label_components(predictions_binary, connectivity=6)
-    # cc3d.dust and Kimimaro expect unsigned label arrays.
-    cc_labels = cc_labels.astype(np.uint32, copy=False)
+    # cc3d.dust and Kimimaro expect unsigned label arrays; labels are non-negative, so a view of
+    # vc_reader's int32 labels saves a full-resolution copy
+    if cc_labels.dtype == np.int32:
+        cc_labels = cc_labels.view(np.uint32)
+    else:
+        cc_labels = cc_labels.astype(np.uint32, copy=False)
     cc_labels = downsample_maxpool(cc_labels, downsample_factor)
     scale = downsample_factor ** 3
     cc3d.dust(
@@ -223,12 +230,20 @@ def prepare_cc_labels(predictions_binary):
 
 def _slab_tracks(predictions_zarr_array, index, offset_zyx):
     # Pickled tracks of one slab (read, binarize, CC, skeletonize), as stored in the DBM.
-    predictions = predictions_zarr_array[index]
-    predictions = (predictions > 0).astype(np.uint8)
+    predictions = binarize(predictions_zarr_array[index])
     if predictions.max() == 0:
         return pickle.dumps([])
     cc_labels = prepare_cc_labels(predictions)
+    # the full-resolution slab is the largest array of a slab; free it before skeletonizing
+    del predictions
     return pickle.dumps(get_skeleton_tracks(cc_labels, offset_zyx=offset_zyx))
+
+
+def binarize(predictions):
+    """``(predictions > 0)`` as uint8, in place for the uint8 arrays zarr returns."""
+    if predictions.dtype == np.uint8 and predictions.flags.writeable and predictions.flags.owndata:
+        return np.minimum(predictions, 1, out=predictions)
+    return (predictions > 0).astype(np.uint8)
 
 
 _worker_array = None  # the opened array, inherited by forked workers
