@@ -396,11 +396,11 @@ def test_import_and_parse_args_stay_lazy():
 
 def test_cpu_options_on_every_os(monkeypatch):
     # The slab workers are forked on Linux and spawned elsewhere, so --slab-workers is accepted
-    # on every OS. Kimimaro starts its processes anew for every slab, which is slow on Windows:
-    # there a slab gets one by default.
+    # on every OS. Kimimaro spawns its processes anew for every slab, which is slow on Windows and
+    # macOS: there a slab gets one by default.
     argv = ['--predictions', 'p.zarr', '--out', 't.dbm', '--backend', 'cpu']
     est.parse_args(argv)  # imports what parse_args needs, on the real OS
-    for platform, kimimaro_parallel in (('linux', 8), ('darwin', 8), ('win32', 1)):
+    for platform, kimimaro_parallel in (('linux', 8), ('darwin', 1), ('win32', 1)):
         monkeypatch.setattr(sys, 'platform', platform)
         spec = importlib.util.spec_from_file_location(f'est_{platform}', est.__file__)
         module = importlib.util.module_from_spec(spec)
