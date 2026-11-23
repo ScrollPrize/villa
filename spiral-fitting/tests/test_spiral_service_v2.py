@@ -65,10 +65,8 @@ class FakeSession:
             "sample_count_patches_per_step": 360,
             "loss_weight_patch_radius": 8.0,
             "loss_start_patch_dt": 25_000,
-            "loss_start_track_dt": 10_000,
             "output_save_png_visualizations": False,
             "track_length_bin_weights": None,
-            "track_max_track_crossing_per_step": 0,
             "track_min_sample_spacing": 20.0,
             "track_max_sample_spacing": 60.0,
         }
@@ -82,7 +80,6 @@ class FakeSession:
             "optimizer_learning_rate": 3e-5,
             "sample_count_patches_per_step": 360,
             "loss_weight_patch_radius": 8.0,
-            "track_crossing_precompute_max": 8,
         }
         self.saved = []
         self.autosave_calls = []
@@ -112,7 +109,6 @@ class FakeSession:
             "error": None, "preview_manifest_path": None, "preview_generation": 0,
             "supports_input_incorporation": True,
             "run_config": dict(self.run_config),
-            "run_config_limits": {"track_max_track_crossing_per_step": 8},
             "default_advanced_config": dict(self.default_advanced_config),
             "progress": self.progress,
         }
@@ -2013,10 +2009,8 @@ class UploadTests(unittest.TestCase):
         config = {
             "sample_count_patches_per_step": 240,
             "loss_weight_patch_radius": 3.5,
-            "loss_start_track_dt": None,
             "output_save_png_visualizations": True,
             "track_length_bin_weights": [0.2, 0.3, 0.5],
-            "track_max_track_crossing_per_step": 3,
             "track_min_sample_spacing": 12.0,
             "track_max_sample_spacing": 32.0,
         }

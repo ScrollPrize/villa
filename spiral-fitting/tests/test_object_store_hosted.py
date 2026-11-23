@@ -231,9 +231,9 @@ def test_commits_write_to_the_served_store(served, tmp_path):
         fit.state.close()
 
 
-def test_tracks_and_their_crossings_through_the_endpoint(tmp_path):
-    """A fit computes the crossings of a served store's tracks as of a store
-    file's: the tracks are read as objects, at their pinned versions."""
+def test_tracks_through_the_endpoint(tmp_path):
+    """A fit reads a served store's tracks as a store file's: as objects, at
+    their pinned versions."""
     from object_store_fixture import put_track
     path = write_walk_store(tmp_path / 'tracks.vcobj')
     with ObjectStore.open(path, author='ingest') as db:
@@ -254,17 +254,15 @@ def test_tracks_and_their_crossings_through_the_endpoint(tmp_path):
                                     log=quiet, cache_directory=str(cache))
         assert again.digest == hosted.digest
         assert len({obj.dataset for obj in hosted.snapshot.objects_of('track')}) == 1
-    assert hosted.counts['tracks'] == 3 and hosted.counts['track crossings'] == 2
+    assert hosted.counts['tracks'] == 3
     assert len(hosted.snapshot.objects_of('track')) == 3
     local = osi.load_fit_inputs(
         fit_config(path, input_use_tracks=True),
         log=quiet, cache_directory=str(cache))
     assert hosted.digest == local.digest
-    assert hosted.manifest['derived_inputs'] == local.manifest['derived_inputs']
-    for name in ('offsets', 'partners', 'self_local', 'partner_local', 'positions', 'clearances'):
-        np.testing.assert_array_equal(hosted.tracks.crossings[name], local.tracks.crossings[name])
-    # One cache file serves both: its key holds no store location.
-    assert len(list((cache / osi.TRACK_CROSSING_CACHE_DIRECTORY).glob('*.vcobj'))) == 1
+    np.testing.assert_array_equal(hosted.tracks.tracks.offsets, local.tracks.tracks.offsets)
+    np.testing.assert_array_equal(hosted.tracks.tracks.coordinates,
+                                  local.tracks.tracks.coordinates)
 
 
 def test_a_pinned_track_a_history_off_store_no_longer_retains_is_refused(tmp_path):

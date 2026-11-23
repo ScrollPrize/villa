@@ -1,6 +1,5 @@
 import colorsys
 import dbm
-import hashlib
 import importlib
 import itertools
 import json
@@ -24,7 +23,6 @@ from scipy.spatial import cKDTree
 from tqdm import tqdm
 
 import prefetch
-from dt_targets import snap_dt_target, strip_dt_target_in_sample_frame
 from spiral_progress import progress_or_null
 from service_http import sha256_file
 from loss_maps import diagnostics_enabled, record_loss_samples
@@ -38,10 +36,8 @@ from sample_spiral import (
 
 
 TRACK_CROSSING_CACHE_VERSION = 1
-# The exact-crossing kernel (vc_spiral.track_crossings, the implementation the
-# object store's track-track detector shares) and the parameters it runs
-# with. A change to either changes the crossings a fit computes.
-TRACK_CROSSING_ALGORITHM = 'vc_spiral.track_crossings/1'
+# The parameters the exact-crossing kernel (vc_spiral.track_crossings) runs
+# with, recorded in the crossing cache's metadata.
 TRACK_CROSSING_PARAMETERS = {
     'angle_degrees': 30.0,
     'tangent_radius_voxels': 12.0,
@@ -587,26 +583,6 @@ def validate_track_sampling_config(config):
             raise ValueError('track_max_tortuosity must be null or a finite number >= 1')
         max_tortuosity = float(max_tortuosity)
 
-    max_crossings = config.get('track_max_track_crossing_per_step', 0)
-    if (isinstance(max_crossings, bool) or not isinstance(max_crossings, (int, float))
-            or not math.isfinite(float(max_crossings))
-            or not float(max_crossings).is_integer() or int(max_crossings) < 0):
-        raise ValueError('max_track_crossing_per_step must be a non-negative integer')
-
-    crossing_precompute_max = config.get('track_crossing_precompute_max', 8)
-    if (isinstance(crossing_precompute_max, bool)
-            or not isinstance(crossing_precompute_max, (int, float))
-            or not math.isfinite(float(crossing_precompute_max))
-            or not float(crossing_precompute_max).is_integer()
-            or int(crossing_precompute_max) < 0):
-        raise ValueError('track_crossing_precompute_max must be a non-negative integer')
-    # Existing profiles may already request more than the default ceiling.
-    # Honor that initial value by preparing at least as many slots; the
-    # resident session still rejects later Run requests above what it prepared.
-    crossing_precompute_max = max(
-        int(crossing_precompute_max), int(max_crossings))
-
-
     sample_spacings = {}
     for key, default in (
             ('track_min_sample_spacing', 20.0),
@@ -626,8 +602,6 @@ def validate_track_sampling_config(config):
     return {
         'length_bin_weights': weights,
         'max_tortuosity': max_tortuosity,
-        'max_crossings': int(max_crossings),
-        'crossing_precompute_max': crossing_precompute_max,
         'min_sample_spacing': sample_spacings['track_min_sample_spacing'],
         'max_sample_spacing': sample_spacings['track_max_sample_spacing'],
     }
@@ -653,13 +627,9 @@ def _track_tortuosities(tracks, arclengths):
     return result
 
 
-def _filter_tracks_by_endpoints(
-        tracks, keep_endpoints, track_families, max_points_per_chunk,
-        return_indices, label):
+def _filter_tracks_by_endpoints(tracks, keep_endpoints, max_points_per_chunk, label):
     """Keep the tracks for which ``keep_endpoints`` (float32 (N, 2, 3) first
     and last points -> bool (N,)) is true; packed or list tracks."""
-    if track_families is not None and len(track_families) != len(tracks):
-        raise ValueError('track_families must be parallel to tracks')
     keep = np.zeros(len(tracks), dtype=bool)
     tracks_per_chunk = max(1, int(max_points_per_chunk) // 2)
     packed = isinstance(tracks, PackedTrackCollection)
@@ -684,31 +654,15 @@ def _filter_tracks_by_endpoints(
         filtered_tracks = tracks.subset(kept_indices)
     else:
         filtered_tracks = [tracks[index] for index in kept_indices]
-    filtered_families = None
-    if track_families is not None:
-        filtered_families = (np.asarray(track_families)[kept_indices] if packed
-                             else [track_families[index] for index in kept_indices])
     print(f'{label}: kept {len(filtered_tracks)} / {len(tracks)} tracks; '
           f'excluded {len(tracks) - len(filtered_tracks)}')
-    result = (filtered_tracks, filtered_families)
-    if return_indices:
-        return (*result, kept_indices)
-    return result
+    return filtered_tracks
 
 
-def _unfiltered(tracks, track_families, return_indices):
-    result = (tracks, track_families)
-    if return_indices:
-        return (*result, np.arange(len(tracks), dtype=np.int64))
-    return result
-
-
-def filter_tracks_to_outer_shell(
-        tracks, shell_envelope, track_families=None, max_points_per_chunk=500_000,
-        return_indices=False):
+def filter_tracks_to_outer_shell(tracks, shell_envelope, max_points_per_chunk=500_000):
     """Drop tracks whose two endpoints are outside the shell envelope."""
     if shell_envelope is None or not tracks:
-        return _unfiltered(tracks, track_families, return_indices)
+        return tracks
 
     def inside(endpoints):
         with torch.no_grad():
@@ -716,18 +670,17 @@ def filter_tracks_to_outer_shell(
                 torch.from_numpy(endpoints.reshape(-1, 3)))
             return (radius <= target_radius).view(-1, 2).any(dim=1).cpu().numpy()
     return _filter_tracks_by_endpoints(
-        tracks, inside, track_families, max_points_per_chunk, return_indices,
+        tracks, inside, max_points_per_chunk,
         'outer-shell track filter (entirely outside tracks excluded)')
 
 
 def filter_tracks_inside_umbilicus_radius(
-        tracks, umbilicus_z_to_yx, min_radius, track_families=None,
-        max_points_per_chunk=500_000, return_indices=False):
+        tracks, umbilicus_z_to_yx, min_radius, max_points_per_chunk=500_000):
     """Drop tracks whose two endpoints both lie within ``min_radius`` voxels
     of the umbilicus axis (``umbilicus_z_to_yx``: z -> (y, x)), so a crushed
     core does not supervise the innermost windings."""
     if min_radius <= 0 or not tracks:
-        return _unfiltered(tracks, track_families, return_indices)
+        return tracks
 
     def outside(endpoints):
         points = endpoints.reshape(-1, 3).astype(np.float64)
@@ -735,7 +688,7 @@ def filter_tracks_inside_umbilicus_radius(
         radius = np.hypot(points[:, 1] - centre[:, 0], points[:, 2] - centre[:, 1])
         return (radius >= min_radius).reshape(-1, 2).any(axis=1)
     return _filter_tracks_by_endpoints(
-        tracks, outside, track_families, max_points_per_chunk, return_indices,
+        tracks, outside, max_points_per_chunk,
         f'inner-radius track filter (both endpoints within {min_radius:g} of the umbilicus)')
 
 
@@ -763,19 +716,9 @@ def configure_prepared_track_sampling(prepared_tracks, config):
     """Apply Run-scoped track policies to an already prepared track pool."""
     if prepared_tracks is None:
         return
-    current = {
-        'track_length_bin_weights': prepared_tracks.get('length_bin_weights'),
-        'track_max_track_crossing_per_step': prepared_tracks.get('active_max_crossings', 0),
-        'track_crossing_precompute_max': prepared_tracks.get(
-            'crossing_precompute_max', 0),
-    }
-    current.update({
-        key: config[key] for key in current
-        if key in config
-    })
-    policy = validate_track_sampling_config(current)
-
     if 'track_length_bin_weights' in config:
+        policy = validate_track_sampling_config(
+            {'track_length_bin_weights': config['track_length_bin_weights']})
         weights = policy['length_bin_weights']
         if weights is None:
             prepared_tracks.pop('sampling_probabilities', None)
@@ -789,15 +732,6 @@ def configure_prepared_track_sampling(prepared_tracks, config):
             prepared_tracks['sampling_probabilities_cpu'] = np.asarray(
                 probabilities.detach().cpu(), dtype=np.float64)
             prepared_tracks['length_bin_weights'] = weights.tolist()
-
-    maximum = policy['max_crossings']
-    prepared_maximum = prepared_tracks.get('crossing_precompute_max', 0)
-    if maximum > prepared_maximum:
-        raise ValueError(
-            f'max_track_crossing_per_step={maximum} exceeds the session\'s '
-            f'prepared crossing ceiling ({prepared_maximum}); reload with a larger '
-            'track_crossing_precompute_max')
-    prepared_tracks['active_max_crossings'] = maximum
 
 
 def _track_tangent(track, raw_index, radius_voxels=12.0):
@@ -1593,18 +1527,6 @@ def _validate_crossing_partner_csr(csr, require_sorted_source_ids=False):
         raise ValueError('crossing cache contains non-finite geometry')
 
 
-def crossing_csr_sha256(csr):
-    """SHA-256 of a crossing CSR in canonical encoding: its arrays in
-    CROSSING_CSR_ARRAYS order, each as its name, length and little-endian
-    bytes of the fixed dtype."""
-    digest = hashlib.sha256()
-    for name, dtype in CROSSING_CSR_ARRAYS:
-        values = np.ascontiguousarray(csr[name], dtype=dtype)
-        digest.update(f'{name}:{values.size}\n'.encode())
-        digest.update(values.data)
-    return digest.hexdigest()
-
-
 def write_crossing_csr_file(destination, csr, metadata):
     """Atomically write a crossing CSR and its JSON ``metadata`` as an npz:
     a uniquely named temporary beside ``destination``, then a rename, so
@@ -1702,60 +1624,9 @@ def load_track_crossing_cache(path, warn=True, expected_z_range=None):
     return csr
 
 
-def _restrict_crossing_partner_csr(csr, source_ids):
-    """Remap a whole-DB crossing graph onto the fit's surviving track rows."""
-    _validate_crossing_partner_csr(csr, require_sorted_source_ids=True)
-    source_ids = np.asarray(source_ids, dtype=np.uint64)
-    cached_source_ids = np.asarray(csr['source_ids'], dtype=np.uint64)
-    rows = np.searchsorted(cached_source_ids, source_ids)
-    valid_rows = rows < len(cached_source_ids)
-    if not np.all(valid_rows):
-        raise ValueError('crossing cache does not contain every selected track')
-    if not np.array_equal(cached_source_ids[rows], source_ids):
-        raise ValueError('crossing cache does not match selected track identities')
-
-    global_to_local = np.full(len(cached_source_ids), -1, dtype=np.int64)
-    global_to_local[rows] = np.arange(len(rows), dtype=np.int64)
-    old_offsets = np.asarray(csr['offsets'], dtype=np.int64)
-    counts = old_offsets[rows + 1] - old_offsets[rows]
-    expanded_rows = np.repeat(rows, counts)
-    expanded_local_rows = np.repeat(np.arange(len(rows), dtype=np.int64), counts)
-    expanded_starts = np.repeat(old_offsets[rows], counts)
-    local_starts = np.repeat(np.cumsum(np.r_[0, counts[:-1]]), counts)
-    edge_indices = expanded_starts + (
-        np.arange(int(counts.sum()), dtype=np.int64) - local_starts)
-    partner_rows = np.asarray(csr['partners'], dtype=np.int64)[edge_indices]
-    remapped_partners = global_to_local[partner_rows]
-    keep = remapped_partners >= 0
-    kept_local_rows = expanded_local_rows[keep]
-    new_counts = np.bincount(kept_local_rows, minlength=len(rows))
-    new_offsets = np.empty(len(rows) + 1, dtype=np.int64)
-    new_offsets[0] = 0
-    np.cumsum(new_counts, out=new_offsets[1:])
-    kept_edges = edge_indices[keep]
-    result = {
-        'source_ids': source_ids.copy(),
-        'offsets': new_offsets,
-        'partners': remapped_partners[keep].astype(np.int32, copy=False),
-        'self_local': np.asarray(csr['self_local'])[kept_edges].copy(),
-        'partner_local': np.asarray(csr['partner_local'])[kept_edges].copy(),
-        'positions': np.asarray(csr['positions'])[kept_edges].copy(),
-        'clearances': np.asarray(csr['clearances'])[kept_edges].copy(),
-    }
-    _validate_crossing_partner_csr(result)
-    return result
-
-
 def _unwrap_track_shifted_radii(theta, shifted_radii, dr_per_winding):
     # Compatibility wrapper for callers/tests that only need the unwrapped values.
     return unwrap_shifted_radii(theta, shifted_radii, dr_per_winding)[0]
-
-
-def _aggregate_dt_track_losses(track_losses, across_p):
-    if track_losses.numel() == 0:
-        return torch.zeros([], device=track_losses.device)
-    return ((track_losses ** across_p).sum() / track_losses.numel()) ** (1 / across_p)
-
 
 
 def _build_track_flat_bundle(tracks, device):
@@ -2035,11 +1906,7 @@ def _track_points_far_from_anchors_mask(track_zyx, anchor_tree, threshold,
 
 def prepare_main_phase_tracks(
         tracks, anchor_scroll_zyxs, exclusion_radius, device, anchor_tree=None,
-        sampling_config=None, track_families=None, track_source_ids=None,
-        track_graph=None, progress=None):
-    # Crossings come only from ``track_graph`` (the object store's crossing
-    # links, keyed by track_source_ids); without one no crossing index is
-    # built.
+        sampling_config=None, progress=None):
     if not tracks:
         return None
     if sampling_config is not None and 'length_bin_weights' in sampling_config:
@@ -2048,23 +1915,10 @@ def prepare_main_phase_tracks(
         policy = validate_track_sampling_config(sampling_config or {})
     weights = policy['length_bin_weights']
     max_tortuosity = policy['max_tortuosity']
-    max_crossings = policy['max_crossings']
-    crossing_precompute_max = policy['crossing_precompute_max']
 
     input_track_count = len(tracks)
     packed_input = isinstance(tracks, PackedTrackCollection)
     working_tracks = tracks if packed_input else list(tracks)
-    working_families = (
-        np.asarray(track_families) if packed_input and track_families is not None
-        else (list(track_families) if track_families is not None else None))
-    working_source_ids = (
-        np.asarray(track_source_ids, dtype=np.uint64)
-        if track_source_ids is not None else None)
-    if (working_source_ids is not None
-            and working_source_ids.shape != (len(working_tracks),)):
-        raise ValueError('track_source_ids must be parallel to tracks')
-    if track_graph is not None and working_source_ids is None:
-        raise ValueError('a track graph requires stable track_source_ids')
     arclengths = (working_tracks.selected_arclengths
                   if packed_input else _polyline_arclengths(working_tracks))
     if max_tortuosity is not None:
@@ -2073,11 +1927,6 @@ def prepare_main_phase_tracks(
         keep = np.flatnonzero(tortuosities <= max_tortuosity)
         working_tracks = (working_tracks.subset(keep) if packed_input else
                           [working_tracks[index] for index in keep])
-        if working_families is not None:
-            working_families = (working_families[keep] if packed_input else
-                                [working_families[index] for index in keep])
-        if working_source_ids is not None:
-            working_source_ids = working_source_ids[keep]
         arclengths = arclengths[keep]
         print(
             f'track tortuosity <= {max_tortuosity:g}: kept '
@@ -2090,9 +1939,7 @@ def prepare_main_phase_tracks(
     if anchor_tree is None:
         anchor_tree = _build_anchor_kdtree(anchor_scroll_zyxs)
 
-    def finish_prepared(
-            flat_zyx_np, lengths_new, surviving_indices,
-            crossing_csr_override=None):
+    def finish_prepared(flat_zyx_np, lengths_new, surviving_indices):
         offsets_new = np.empty(len(lengths_new) + 1, dtype=np.int64)
         offsets_new[0] = 0
         np.cumsum(lengths_new, out=offsets_new[1:])
@@ -2108,79 +1955,10 @@ def prepare_main_phase_tracks(
             'resampled_cache': {},
             'arclengths_cpu': arclengths[surviving_indices],
             'length_bin_weights': None,
-            'active_max_crossings': 0,
-            'crossing_precompute_max': (
-                crossing_precompute_max if track_graph is not None else 0),
         }
-        if crossing_precompute_max > 0 and track_graph is not None:
-            crossing_index = None
-            restricted_csr = crossing_csr_override
-            native = _load_native_track_crossings()
-            if restricted_csr is None:
-                print(
-                    f'track crossings: using TrackGraph for '
-                    f'{len(surviving_indices)} surviving tracks')
-                eligible_source_ids = working_source_ids[surviving_indices]
-                try:
-                    if (native is not None
-                            and hasattr(
-                                native, 'prepare_cached_crossing_index')):
-                        crossing_index = native.prepare_cached_crossing_index(
-                            np.asarray(
-                                track_graph['source_ids'],
-                                dtype=np.uint64),
-                            np.asarray(
-                                track_graph['offsets'],
-                                dtype=np.int64),
-                            np.asarray(
-                                track_graph['partners'],
-                                dtype=np.int32),
-                            np.asarray(
-                                track_graph['self_local'],
-                                dtype=np.int32),
-                            np.asarray(
-                                track_graph['partner_local'],
-                                dtype=np.int32),
-                            np.asarray(
-                                eligible_source_ids, dtype=np.uint64),
-                            np.asarray(lengths_new, dtype=np.int32))
-                    else:
-                        restricted_csr = _restrict_crossing_partner_csr(
-                            track_graph, eligible_source_ids)
-                    print(
-                        f'track crossings: used the crossing CSR for '
-                        f'{len(eligible_source_ids)} surviving tracks')
-                except (ValueError, RuntimeError) as error:
-                    raise ValueError(
-                        'the track crossings do not cover the selected '
-                        f'tracks: {error}') from error
-            if crossing_index is None and restricted_csr is not None:
-                if (native is not None
-                        and hasattr(native, 'prepare_crossing_index')):
-                    crossing_index = native.prepare_crossing_index(
-                        np.asarray(restricted_csr['offsets'], dtype=np.int64),
-                        np.asarray(restricted_csr['partners'], dtype=np.int32),
-                        np.asarray(
-                            restricted_csr['self_local'], dtype=np.int32),
-                        np.asarray(
-                            restricted_csr['partner_local'], dtype=np.int32),
-                        np.asarray(lengths_new, dtype=np.int32))
-                else:
-                    prepared['crossing_csr'] = restricted_csr
-            if crossing_index is not None:
-                prepared['crossing_index'] = crossing_index
-                stats = dict(native.crossing_index_stats(crossing_index))
-                prepared['crossing_index_stats'] = stats
-                print(
-                    'track crossing index: '
-                    f"{int(stats['connected_tracks'])}/{len(lengths_new)} "
-                    'tracks connected, '
-                    f"{int(stats['directed_crossings'])} directed crossings, "
-                    f"{int(stats['memory_bytes']) / (1 << 20):.1f} MiB")
         configure_prepared_track_sampling(prepared, {
             'track_length_bin_weights': (
                 None if weights is None else weights.tolist()),
-            'track_max_track_crossing_per_step': max_crossings,
         })
         return prepared
 
@@ -2253,77 +2031,47 @@ def prepare_main_phase_tracks(
     del surviving_points
     lengths_new = new_lengths[surviving].astype(np.int64)
     compact_zyx_np = flat_zyx_np[keep_np]
-    crossing_csr_override = None
-    if track_graph is not None:
-        if int(keep_np.sum()) >= np.iinfo(np.int32).max:
-            raise ValueError(
-                'point-clipped track output exceeds the int32 crossing limit')
-        old_point_to_new = np.cumsum(
-            keep_np, dtype=np.int32) - np.int32(1)
-        old_point_to_new[~keep_np] = -1
-        output_offsets = np.empty(len(lengths_new) + 1, dtype=np.int64)
-        output_offsets[0] = 0
-        np.cumsum(lengths_new, out=output_offsets[1:])
-        crossing_csr_override = track_graph.clipped_csr(
-            working_source_ids, input_offsets, surviving,
-            old_point_to_new, output_offsets)
-        del old_point_to_new
-        print(
-            f'track crossings: remapped TrackGraph after point exclusion '
-            f'({len(crossing_csr_override["partners"])} directed crossings)')
     del keep_np, flat_zyx_np
     print(
         f'track radius loss: {len(surviving)}/{num_tracks_orig} tracks survive exclusion '
         f'(radius {exclusion_radius:.1f}); {int(lengths_new.sum())} points retained'
     )
-    return finish_prepared(
-        compact_zyx_np, lengths_new, surviving,
-        crossing_csr_override=crossing_csr_override)
+    return finish_prepared(compact_zyx_np, lengths_new, surviving)
 
 
 def _attach_device_resident_points(bundle, device):
-    """Attach device copies of the resampled points when memory allows.
+    """Attach a device copy of the resampled points when memory allows.
 
     The per-step point gather then runs on the device instead of a host
     gather behind two full stream synchronisations (`flat_idx.cpu()` and the
-    pinned staging round-trip). The copies are exact, so sampled batches are
+    pinned staging round-trip). The copy is exact, so sampled batches are
     bitwise identical either way; this only changes where the gather runs.
     Disable with VC_DISABLE_TRACK_DEVICE_POINTS=1 (the host path stays the
-    fallback whenever the copies would crowd device memory).
+    fallback whenever the copy would crowd device memory).
     """
     if device.type != 'cuda':
         return
     if os.environ.get('VC_DISABLE_TRACK_DEVICE_POINTS') == '1':
         return
     coordinates = bundle['flat_zyx_cpu']
-    source_local = bundle['flat_source_local_cpu']
-    needed = (coordinates.numel() * coordinates.element_size()
-              + source_local.numel() * source_local.element_size())
+    needed = coordinates.numel() * coordinates.element_size()
     free_bytes, _total_bytes = torch.cuda.mem_get_info(device)
     if needed > 0.2 * free_bytes:
         return
     bundle['flat_zyx'] = coordinates.to(device=device)
-    bundle['flat_source_local'] = source_local.to(device=device)
 
 
-def _gather_sampled_track_points(
-        prepared_tracks, resampled, flat_idx, target_flat_idx,
-        num_rows, target_points, device):
-    """Gather sampled coordinates and per-target source indices.
+def _gather_sampled_track_points(prepared_tracks, resampled, flat_idx, device):
+    """Gather sampled coordinates.
 
-    Uses the device-resident copies when the bundle carries them (see
+    Uses the device-resident copy when the bundle carries one (see
     _attach_device_resident_points); otherwise gathers on the host through
     the cached pinned staging buffer.
     """
     flat_zyx = resampled.get('flat_zyx')
     if flat_zyx is not None:
-        sampled_scroll = flat_zyx[flat_idx]
-        target_source_idx = resampled['flat_source_local'][
-            flat_idx[target_flat_idx.reshape(-1)]].reshape(
-                num_rows, target_points)
-        return sampled_scroll, target_source_idx
-    flat_idx_cpu = flat_idx.cpu()
-    sampled_cpu = resampled['flat_zyx_cpu'][flat_idx_cpu]
+        return flat_zyx[flat_idx]
+    sampled_cpu = resampled['flat_zyx_cpu'][flat_idx.cpu()]
     if device.type == 'cuda':
         staging = prepared_tracks.get('staging')
         if staging is None or staging.shape != sampled_cpu.shape:
@@ -2331,17 +2079,12 @@ def _gather_sampled_track_points(
                 sampled_cpu.shape, dtype=torch.float32, pin_memory=True)
             prepared_tracks['staging'] = staging
         staging.copy_(sampled_cpu)
-        sampled_scroll = staging.to(device=device, non_blocking=False)
-    else:
-        sampled_scroll = sampled_cpu.to(device=device)
-    target_source_idx = resampled['flat_source_local_cpu'][
-        flat_idx_cpu[target_flat_idx.reshape(-1).cpu()]].reshape(
-            num_rows, target_points).to(device=device)
-    return sampled_scroll, target_source_idx
+        return staging.to(device=device, non_blocking=False)
+    return sampled_cpu.to(device=device)
 
 
 def _build_resampled_track_bundle(prepared_tracks, min_spacing, max_spacing):
-    """Resample complete tracks between mandatory polyline anchors."""
+    """Resample complete tracks between their two endpoints."""
     min_spacing = float(min_spacing)
     max_spacing = float(max_spacing)
     cache_key = (min_spacing, max_spacing)
@@ -2352,36 +2095,24 @@ def _build_resampled_track_bundle(prepared_tracks, min_spacing, max_spacing):
     flat_source = prepared_tracks['flat_zyx_cpu'].numpy()
     offsets = prepared_tracks['offsets_cpu'].numpy()
     num_tracks = len(offsets) - 1
-    crossing_index = prepared_tracks.get('crossing_index')
-    crossing_csr = prepared_tracks.get('crossing_csr')
 
     native = _load_native_track_crossings()
     if native is not None and hasattr(native, 'resample_tracks'):
-        resample_kwargs = {
-            'minimum_spacing': min_spacing,
-            'maximum_spacing': max_spacing,
-            'workers': min(32, os.cpu_count() or 1),
-        }
-        if crossing_index is not None:
-            resample_kwargs['crossing_index'] = crossing_index
         result = native.resample_tracks(
             np.asarray(flat_source, dtype=np.float32),
             np.asarray(offsets, dtype=np.int64),
-            **resample_kwargs)
+            minimum_spacing=min_spacing,
+            maximum_spacing=max_spacing,
+            workers=min(32, os.cpu_count() or 1))
         sampled_lengths = np.asarray(result['lengths'])
         device = prepared_tracks['device']
         bundle = {
             'flat_zyx_cpu': torch.from_numpy(
                 np.asarray(result['coordinates'])).contiguous(),
-            'flat_source_local_cpu': torch.from_numpy(
-                np.asarray(result['source_local'])).contiguous(),
             'offsets': torch.from_numpy(
                 np.asarray(result['offsets'])).to(device=device),
             'lengths': torch.from_numpy(sampled_lengths).to(device=device),
         }
-        if 'crossing_record_sample' in result:
-            bundle['crossing_record_sample_cpu'] = torch.from_numpy(
-                np.asarray(result['crossing_record_sample'])).contiguous()
         _attach_device_resident_points(bundle, device)
         prepared_tracks['resampled_cache'].clear()
         prepared_tracks['resampled_cache'][cache_key] = bundle
@@ -2395,24 +2126,12 @@ def _build_resampled_track_bundle(prepared_tracks, min_spacing, max_spacing):
             f'track point spacing: {int(sampled_lengths.sum())} cached points, '
             f'observed {observed_min_text}-{maximum_observed_spacing:.2f} voxels '
             f'(limits {min_spacing:g}-{max_spacing:g}; '
-            f'{undersized_anchor_gaps} mandatory-anchor exceptions; native)'
+            f'{undersized_anchor_gaps} short-track exceptions; native)'
         )
         return bundle
 
-    mandatory = [set() for _ in range(num_tracks)]
-    if crossing_csr is not None:
-        crossing_offsets = crossing_csr['offsets']
-        crossing_self = crossing_csr['self_local']
-        for track_id in range(num_tracks):
-            mandatory[track_id].update(
-                map(int, crossing_self[
-                    int(crossing_offsets[track_id]):
-                    int(crossing_offsets[track_id + 1])]))
-
     sampled_parts = []
-    source_index_parts = []
     sampled_lengths = np.empty(num_tracks, dtype=np.int64)
-    local_maps = []
     minimum_observed_spacing = math.inf
     maximum_observed_spacing = 0.0
     undersized_anchor_gaps = 0
@@ -2422,11 +2141,7 @@ def _build_resampled_track_bundle(prepared_tracks, min_spacing, max_spacing):
         cumulative = np.r_[0.0, np.cumsum(steps)]
         total = float(cumulative[-1])
         if total > 0:
-            anchor_indices = np.fromiter(
-                sorted({0, len(track) - 1, *mandatory[track_id]}),
-                dtype=np.int64,
-            )
-            anchor_positions = np.unique(cumulative[anchor_indices])
+            anchor_positions = np.unique(cumulative[[0, len(track) - 1]])
             position_parts = []
             for anchor_left, anchor_right in zip(
                     anchor_positions[:-1], anchor_positions[1:]):
@@ -2438,8 +2153,8 @@ def _build_resampled_track_bundle(prepared_tracks, min_spacing, max_spacing):
                         anchor_left, anchor_right, min_intervals + 1,
                         dtype=np.float64)
                 else:
-                    # An endpoint or exact crossing makes both bounds
-                    # geometrically impossible. Keep the maximum hard and put
+                    # A short track makes both bounds geometrically
+                    # impossible. Keep the maximum hard and put
                     # the one short residual directly beside the right anchor.
                     segment = np.r_[
                         anchor_left
@@ -2459,10 +2174,6 @@ def _build_resampled_track_bundle(prepared_tracks, min_spacing, max_spacing):
                 track[left] * (1.0 - alpha[:, None])
                 + track[right] * alpha[:, None]
             ).astype(np.float32)
-            nearest_right = (
-                np.abs(cumulative[right] - positions)
-                < np.abs(positions - cumulative[left]))
-            source_indices = np.where(nearest_right, right, left).astype(np.int64)
             observed = np.diff(positions)
             minimum_observed_spacing = min(
                 minimum_observed_spacing,
@@ -2476,17 +2187,9 @@ def _build_resampled_track_bundle(prepared_tracks, min_spacing, max_spacing):
                 observed < min_spacing - 1.e-9))
         else:
             sampled = track[:1].copy()
-            positions = np.zeros(1, dtype=np.float64)
-            source_indices = np.zeros(1, dtype=np.int64)
 
         sampled_parts.append(sampled)
-        source_index_parts.append(source_indices)
         sampled_lengths[track_id] = len(sampled)
-        local_maps.append({
-            original_index: int(np.argmin(np.abs(
-                positions - cumulative[original_index])))
-            for original_index in mandatory[track_id]
-        })
 
     sampled_offsets = np.empty(num_tracks + 1, dtype=np.int64)
     sampled_offsets[0] = 0
@@ -2494,22 +2197,9 @@ def _build_resampled_track_bundle(prepared_tracks, min_spacing, max_spacing):
     device = prepared_tracks['device']
     bundle = {
         'flat_zyx_cpu': torch.from_numpy(np.concatenate(sampled_parts)).contiguous(),
-        'flat_source_local_cpu': torch.from_numpy(
-            np.concatenate(source_index_parts)).contiguous(),
         'offsets': torch.from_numpy(sampled_offsets).to(device=device),
         'lengths': torch.from_numpy(sampled_lengths).to(device=device),
     }
-    if crossing_csr is not None:
-        crossing_record_sample = np.empty(
-            len(crossing_csr['self_local']), dtype=np.int32)
-        for track_id in range(num_tracks):
-            begin = int(crossing_csr['offsets'][track_id])
-            end = int(crossing_csr['offsets'][track_id + 1])
-            for record in range(begin, end):
-                crossing_record_sample[record] = local_maps[track_id][
-                    int(crossing_csr['self_local'][record])]
-        bundle['crossing_record_sample_cpu'] = torch.from_numpy(
-            crossing_record_sample).contiguous()
 
     _attach_device_resident_points(bundle, device)
     # Run-scoped spacing edits can request a different density. Keep the cache
@@ -2524,134 +2214,32 @@ def _build_resampled_track_bundle(prepared_tracks, min_spacing, max_spacing):
         f'track point spacing: {int(sampled_lengths.sum())} cached points, '
         f'observed {observed_min_text}-{maximum_observed_spacing:.2f} voxels '
         f'(limits {min_spacing:g}-{max_spacing:g}; '
-        f'{undersized_anchor_gaps} mandatory-anchor exceptions)'
+        f'{undersized_anchor_gaps} short-track exceptions)'
     )
     return bundle
 
 
-def _sample_crossing_csr(csr, primaries, maximum, seed):
-    """Reference sampler for environments without the native crossing index."""
-    primaries = np.asarray(primaries, dtype=np.int32)
-    maximum = int(maximum)
-    shape = (len(primaries), maximum)
-    partners = np.full(shape, -1, dtype=np.int32)
-    records = np.full(shape, -1, dtype=np.int32)
-    partner_records = np.full(shape, -1, dtype=np.int32)
-    offsets = np.asarray(csr['offsets'], dtype=np.int64)
-    csr_partners = np.asarray(csr['partners'], dtype=np.int32)
-    self_local = np.asarray(csr['self_local'], dtype=np.int32)
-    partner_local = np.asarray(csr['partner_local'], dtype=np.int32)
-    for row, primary in enumerate(primaries):
-        begin, end = int(offsets[primary]), int(offsets[primary + 1])
-        count = min(maximum, end - begin)
-        if count <= 0:
-            continue
-        rng = np.random.default_rng(
-            (int(seed) + 0x9e3779b97f4a7c15 * (row + 1)) & ((1 << 64) - 1))
-        selected = rng.choice(
-            np.arange(begin, end, dtype=np.int32), size=count, replace=False)
-        for slot, record in enumerate(selected):
-            record = int(record)
-            partner = int(csr_partners[record])
-            reciprocal = -1
-            for candidate in range(
-                    int(offsets[partner]), int(offsets[partner + 1])):
-                if (int(csr_partners[candidate]) == int(primary)
-                        and int(self_local[candidate])
-                            == int(partner_local[record])
-                        and int(partner_local[candidate])
-                            == int(self_local[record])):
-                    reciprocal = candidate
-                    break
-            if reciprocal < 0:
-                raise ValueError(
-                    'crossing CSR requires reciprocal directed records')
-            partners[row, slot] = partner
-            records[row, slot] = record
-            partner_records[row, slot] = reciprocal
-    return {
-        'partners': partners,
-        'records': records,
-        'partner_records': partner_records,
-    }
-
-
 def _draw_track_sample(
-        prepared_tracks, resampled, k, target_points, max_crossings,
-        generator=None):
+        prepared_tracks, resampled, k, target_points, generator=None):
     # Track selection and ragged gather stay vectorized.  Every selected row
     # contains the entire spacing-bounded resample of that track.
     device = prepared_tracks['device']
     num_tracks = int(prepared_tracks['lengths'].numel())
     sampling_probabilities = prepared_tracks.get('sampling_probabilities')
     if sampling_probabilities is None:
-        primary_track_idx = torch.randint(
+        track_idx = torch.randint(
             num_tracks, (k,), device=device, generator=generator)
     elif device.type == 'mps':
         # MPS multinomial asks Metal for one oversized buffer (83 GB for
         # 144k tracks x 5k samples) and aborts; draw on the CPU instead.
         # The MPS path never passes a generator, so the CPU draw follows
         # the globally seeded CPU RNG and stays reproducible.
-        primary_track_idx = torch.multinomial(
+        track_idx = torch.multinomial(
             sampling_probabilities.cpu(), k, replacement=True).to(device)
     else:
-        primary_track_idx = torch.multinomial(
+        track_idx = torch.multinomial(
             sampling_probabilities, k, replacement=True, generator=generator)
 
-    crossing_index = prepared_tracks.get('crossing_index')
-    crossing_csr = prepared_tracks.get('crossing_csr')
-    has_crossings = crossing_index is not None or crossing_csr is not None
-    partner_group = torch.empty(0, dtype=torch.int64, device=device)
-    partner_slot = torch.empty(0, dtype=torch.int64, device=device)
-    partner_track_idx = torch.empty(0, dtype=torch.int64, device=device)
-    selected_self_sample = torch.empty(
-        0, dtype=torch.int64, device=device)
-    selected_partner_sample = torch.empty(
-        0, dtype=torch.int64, device=device)
-    if has_crossings and max_crossings > 0:
-        seed = int(torch.randint(
-            0, (1 << 63) - 1, (1,), dtype=torch.int64,
-            device=device, generator=generator).item())
-        # MPS randint with this bound wraps to int32 and can go negative,
-        # which the native sampler's uint64 seed rejects. No-op elsewhere.
-        seed &= (1 << 63) - 1
-        primary_cpu = np.asarray(
-            primary_track_idx.detach().cpu(), dtype=np.int32)
-        native = _load_native_track_crossings()
-        if crossing_index is not None:
-            result = native.sample_crossing_partners(
-                crossing_index, primary_cpu, maximum=int(max_crossings),
-                seed=seed)
-        else:
-            result = _sample_crossing_csr(
-                crossing_csr, primary_cpu, max_crossings, seed)
-        selected_cpu = np.asarray(result['partners'], dtype=np.int32)
-        valid_cpu = selected_cpu >= 0
-        selected = torch.from_numpy(selected_cpu).to(device=device)
-        valid = selected >= 0
-        partner_track_idx = selected[valid].to(torch.int64)
-        partner_group = torch.arange(k, device=device)[:, None].expand_as(
-            selected)[valid]
-        partner_slot = torch.arange(
-            selected.shape[1], device=device)[None, :].expand_as(selected)[valid]
-        record_samples = resampled['crossing_record_sample_cpu']
-        selected_self_sample = record_samples[
-            torch.from_numpy(
-                np.asarray(result['records'], dtype=np.int32)[valid_cpu]).long()
-        ].to(device=device)
-        selected_partner_sample = record_samples[
-            torch.from_numpy(
-                np.asarray(
-                    result['partner_records'], dtype=np.int32)[valid_cpu]).long()
-        ].to(device=device)
-
-    track_idx = torch.cat([primary_track_idx, partner_track_idx])
-    group_id = torch.cat([
-        torch.arange(k, device=device), partner_group,
-    ])
-    row_slot = torch.cat([
-        torch.zeros(k, dtype=torch.int64, device=device), partner_slot + 1,
-    ])
     row_lengths = resampled['lengths'][track_idx]
     row_starts = torch.zeros(
         len(track_idx) + 1, dtype=torch.int64, device=device)
@@ -2670,20 +2258,8 @@ def _draw_track_sample(
         target_local = torch.round(
             fractions[None, :] * (row_lengths[:, None] - 1)).to(torch.int64)
     target_flat_idx = row_starts[:-1, None] + target_local
-    sampled_scroll, target_source_idx = _gather_sampled_track_points(
-        prepared_tracks, resampled, flat_idx, target_flat_idx,
-        len(track_idx), target_points, device)
-
-    primary_cross_flat = torch.empty(0, dtype=torch.int64, device=device)
-    partner_cross_flat = torch.empty(0, dtype=torch.int64, device=device)
-    partner_rows = torch.empty(0, dtype=torch.int64, device=device)
-    if partner_track_idx.numel() > 0:
-        self_cross_local = selected_self_sample
-        partner_cross_local = selected_partner_sample
-        partner_rows = torch.arange(
-            k, len(track_idx), dtype=torch.int64, device=device)
-        primary_cross_flat = row_starts[partner_group] + self_cross_local
-        partner_cross_flat = row_starts[partner_rows] + partner_cross_local
+    sampled_scroll = _gather_sampled_track_points(
+        prepared_tracks, resampled, flat_idx, device)
 
     return {
         'track_idx': track_idx,
@@ -2691,50 +2267,32 @@ def _draw_track_sample(
         'row_id': row_id,
         'row_starts': row_starts,
         'row_lengths': row_lengths,
-        'group_id': group_id,
-        'row_slot': row_slot,
-        'num_groups': k,
-        'group_width': max_crossings + 1,
         'target_flat_idx': target_flat_idx,
-        'target_source_idx': target_source_idx,
-        'primary_cross_flat': primary_cross_flat,
-        'partner_cross_flat': partner_cross_flat,
-        'partner_rows': partner_rows,
     }
 
 
 def _sample_prepared_track_points(
         prepared_tracks, num_tracks_per_step, num_points_per_track,
-        min_sample_spacing=20.0, max_sample_spacing=60.0,
-        max_crossings=None):
+        min_sample_spacing=20.0, max_sample_spacing=60.0):
     device = prepared_tracks['device']
     num_tracks = int(prepared_tracks['lengths'].numel())
     if num_tracks == 0 or num_tracks_per_step <= 0 or num_points_per_track <= 0:
         return None
     k = min(int(num_tracks_per_step), num_tracks)
-    prepared_crossings = int(prepared_tracks.get('crossing_precompute_max', 0))
-    if max_crossings is None:
-        max_crossings = prepared_tracks.get('active_max_crossings', 0)
-    max_crossings = int(max_crossings)
-    if max_crossings < 0 or max_crossings > prepared_crossings:
-        raise ValueError(
-            f'max crossings must lie in [0, {prepared_crossings}] for this session')
     resampled = _build_resampled_track_bundle(
         prepared_tracks, min_sample_spacing, max_sample_spacing)
-
 
     if prefetch.prefetch_enabled() and device.type == 'cuda':
         pf = prefetch.get_prefetcher()
         generator = pf.torch_rng('tracks', device)
         return pf.pop_or_run(
             ('tracks', k, num_points_per_track, float(min_sample_spacing),
-             float(max_sample_spacing), max_crossings),
+             float(max_sample_spacing)),
             lambda: _draw_track_sample(
-                prepared_tracks, resampled, k, num_points_per_track,
-                max_crossings, generator),
+                prepared_tracks, resampled, k, num_points_per_track, generator),
         )
     return _draw_track_sample(
-        prepared_tracks, resampled, k, num_points_per_track, max_crossings)
+        prepared_tracks, resampled, k, num_points_per_track)
 
 
 @geom_utils.maybe_compile
@@ -2790,38 +2348,27 @@ def _unwrap_ragged_track_radii(
     return shifted_radii + adjustments, adjustments
 
 
-def _grouped_radius_targets(
-        target_values, group_id, row_slot, num_groups, group_width,
-        use_median):
-    """One robust target for every primary track and all crossing partners."""
-    points_per_row = target_values.shape[1]
-    values = torch.full(
-        [num_groups, group_width, points_per_row], torch.inf,
-        device=target_values.device, dtype=target_values.dtype)
-    values[group_id, row_slot] = target_values
-    valid = torch.isfinite(values)
+def _per_track_radius_targets(target_values, use_median):
+    """One robust radius target per sampled track, from its target points."""
+    valid = torch.isfinite(target_values)
     if not use_median:
-        return torch.where(valid, values, torch.zeros_like(values)).sum(
-            dim=(1, 2)) / valid.sum(dim=(1, 2)).clamp(min=1)
+        return torch.where(valid, target_values, torch.zeros_like(target_values)).sum(
+            dim=1) / valid.sum(dim=1).clamp(min=1)
 
-    flattened = values.flatten(1).sort(dim=-1).values
-    counts = valid.sum(dim=(1, 2))
+    ordered = target_values.sort(dim=-1).values
+    counts = valid.sum(dim=1)
     median_index = torch.div(counts - 1, 2, rounding_mode='floor')
-    return flattened.gather(1, median_index[:, None]).squeeze(1)
+    return ordered.gather(1, median_index[:, None]).squeeze(1)
 
 
-def _grouped_same_radius_loss(
-        shifted_radii, target_values, row_id, group_id, row_slot,
-        num_groups, group_width, dr_per_winding, cfg):
+def _per_track_radius_loss(
+        shifted_radii, target_values, row_id, dr_per_winding, cfg):
     target_mode = cfg['track_radius_target']
     if target_mode not in ('mean', 'median'):
         raise ValueError(
             f"track_radius_target must be 'mean' or 'median', got {target_mode!r}")
-    targets = _grouped_radius_targets(
-        target_values, group_id, row_slot, num_groups, group_width,
-        target_mode == 'median')
-    flat_group_id = group_id[row_id]
-    deviations = (shifted_radii - targets[flat_group_id]).abs()
+    targets = _per_track_radius_targets(target_values, target_mode == 'median')
+    deviations = (shifted_radii - targets[row_id]).abs()
     hinged = F.relu(
         deviations
         - dr_per_winding.detach() * cfg['track_radius_loss_margin'])
@@ -2830,29 +2377,16 @@ def _grouped_same_radius_loss(
         per_point = hinged
     else:
         per_point = (hinged + 1.e-5) ** within_p
+    num_tracks = target_values.shape[0]
     sums = torch.zeros(
-        num_groups, device=shifted_radii.device, dtype=shifted_radii.dtype)
+        num_tracks, device=shifted_radii.device, dtype=shifted_radii.dtype)
     counts = torch.zeros_like(sums)
-    sums.scatter_add_(0, flat_group_id, per_point)
-    counts.scatter_add_(0, flat_group_id, torch.ones_like(per_point))
-    per_group = sums / counts.clamp(min=1)
+    sums.scatter_add_(0, row_id, per_point)
+    counts.scatter_add_(0, row_id, torch.ones_like(per_point))
+    per_track = sums / counts.clamp(min=1)
     if within_p != 1.0:
-        per_group = per_group ** (1.0 / within_p)
-    return per_group.mean(), targets, hinged
-
-
-def _crossing_row_alignments(
-        shifted_radii, primary_cross_flat, partner_cross_flat,
-        partner_rows, row_count):
-    # Each partner is shifted into its primary's unwrap frame by the radius
-    # difference at their shared voxel.
-    row_alignment = torch.zeros(
-        row_count, device=shifted_radii.device, dtype=shifted_radii.dtype)
-    row_alignment[partner_rows] = (
-        shifted_radii[primary_cross_flat]
-        - shifted_radii[partner_cross_flat]
-    ).detach()
-    return row_alignment
+        per_track = per_track ** (1.0 / within_p)
+    return per_track.mean(), targets, hinged
 
 
 def _mps_shape_bucket(count):
@@ -2882,68 +2416,33 @@ def _transform_shape_bucketed(transform, points):
     return transform(torch.cat([points, pad]))[:count]
 
 
-def iter_track_losses(slice_to_spiral_transform, dr_per_winding, prepared_tracks, cfg, compute_dt=True, dt_target_cache=None):
-    """Yield radius then DT losses so the caller can backward them separately.
-
-    The DT target is detached before its inverse transform, so its graph does
-    not depend on the radius-loss forward graph.  Yielding at that boundary
-    prevents both large transform graphs from being resident together.
-    """
+def get_track_radius_loss(slice_to_spiral_transform, dr_per_winding, prepared_tracks, cfg):
+    """The track radius loss: every point of each sampled track on one winding."""
     device = dr_per_winding.device
-    zero = torch.zeros([], device=device)
     if prepared_tracks is None:
-        yield 'track_radius', zero
-        yield 'track_dt', zero
-        return
+        return torch.zeros([], device=device)
     sample = _sample_prepared_track_points(
         prepared_tracks,
         cfg['sample_count_tracks_per_step'],
         cfg['sample_count_track_points_per_step'],
         cfg.get('track_min_sample_spacing', 20.0),
         cfg.get('track_max_sample_spacing', 60.0),
-        cfg.get('track_max_track_crossing_per_step', 0),
     )
     if sample is None:
-        yield 'track_radius', zero
-        yield 'track_dt', zero
-        return
-    track_idx = sample['track_idx']
-    sampled_scroll = sample['sampled_scroll']
+        return torch.zeros([], device=device)
     row_id = sample['row_id']
-    row_starts = sample['row_starts']
-    group_id = sample['group_id']
-    num_groups = sample['num_groups']
     sampled_spiral = _transform_shape_bucketed(
-        slice_to_spiral_transform, sampled_scroll)
+        slice_to_spiral_transform, sample['sampled_scroll'])
     theta, _, shifted_radii = get_theta_and_radii(sampled_spiral[..., 1:], dr_per_winding)
-    shifted_radii, crossing_adjustments = _unwrap_ragged_track_radii(
-        theta, shifted_radii, dr_per_winding, row_id, row_starts,
+    shifted_radii, unwrap_adjustments = _unwrap_ragged_track_radii(
+        theta, shifted_radii, dr_per_winding, row_id, sample['row_starts'],
     )
-
-    # Every appended partner is put into its primary track's unwrap frame at
-    # their exact shared voxel.  A single group target can then constrain all
-    # points on both complete tracks to one winding.
-    if sample['partner_rows'].numel() > 0:
-        row_alignment = _crossing_row_alignments(
-            shifted_radii, sample['primary_cross_flat'],
-            sample['partner_cross_flat'], sample['partner_rows'],
-            len(track_idx))
-        flat_alignment = row_alignment[row_id]
-        shifted_radii = shifted_radii + flat_alignment
-        crossing_adjustments = crossing_adjustments + flat_alignment
-
-    dt_hinge_margin = dr_per_winding.detach() * cfg['track_dt_loss_margin']
     target_values = shifted_radii[sample['target_flat_idx']]
-    radius_loss, group_radius_targets, diagnostic_radius = \
-        _grouped_same_radius_loss(
-            shifted_radii, target_values, row_id, group_id,
-            sample['row_slot'], num_groups, sample['group_width'],
-            dr_per_winding, cfg)
+    radius_loss, radius_targets, diagnostic_radius = _per_track_radius_loss(
+        shifted_radii, target_values, row_id, dr_per_winding, cfg)
     if diagnostics_enabled():
-        diagnostic_radius_target = group_radius_targets[group_id[row_id]]
         diagnostic_target_radii = radius_from_unwrapped_shifted(
-            theta, diagnostic_radius_target, crossing_adjustments,
-            dr_per_winding,
+            theta, radius_targets[row_id], unwrap_adjustments, dr_per_winding,
         )
         diagnostic_target_spiral = torch.stack([
             sampled_spiral[..., 0],
@@ -2954,59 +2453,7 @@ def iter_track_losses(slice_to_spiral_transform, dr_per_winding, prepared_tracks
             'track_radius', sampled_spiral, diagnostic_radius,
             display_spiral_zyx=diagnostic_target_spiral,
         )
-
-    if not compute_dt:
-        yield 'track_radius', radius_loss
-        del radius_loss, sampled_spiral, theta, shifted_radii, crossing_adjustments
-        yield 'track_dt', zero
-        return
-
-    if dt_target_cache is None:
-        target_shifted_per_group = snap_dt_target(
-            group_radius_targets[:, None], dr_per_winding)
-    else:
-        # Primary rows occupy [0, num_groups). Their cached whole-track target
-        # becomes the target of every crossing partner in the aligned group.
-        target_shifted_per_group = strip_dt_target_in_sample_frame(
-            target_values[:num_groups],
-            sample['target_source_idx'][:num_groups],
-            theta[sample['target_flat_idx'][:num_groups]],
-            crossing_adjustments[sample['target_flat_idx'][:num_groups]],
-            dr_per_winding, dt_target_cache, track_idx[:num_groups],
-        )
-    target_shifted_radii = target_shifted_per_group[group_id[row_id], 0]
-    target_radii = radius_from_unwrapped_shifted(
-        theta, target_shifted_radii, crossing_adjustments, dr_per_winding,
-    )
-    target_spiral_zyxs = torch.stack([
-        sampled_spiral[..., 0],
-        torch.sin(theta) * target_radii,
-        torch.cos(theta) * target_radii,
-    ], dim=-1).detach()
-
-    yield 'track_radius', radius_loss
-    # The caller has now released the radius graph.  Keep only detached DT
-    # inputs before constructing the inverse-transform graph.
-    del radius_loss, sampled_spiral, theta, shifted_radii, crossing_adjustments
-    del target_radii, target_shifted_radii
-    target_scroll_zyxs = _transform_shape_bucketed(
-        slice_to_spiral_transform.inv, target_spiral_zyxs)
-
-    within_p = cfg['track_dt_within_track_norm_p']
-    across_p = cfg['track_dt_norm_p']
-    point_distances = torch.linalg.norm(sampled_scroll - target_scroll_zyxs, dim=-1)
-    point_distances = F.relu(point_distances - dt_hinge_margin) + 1.e-5
-    flat_group_id = group_id[row_id]
-    sums = torch.zeros(
-        num_groups, device=device, dtype=point_distances.dtype)
-    counts = torch.zeros_like(sums)
-    sums.scatter_add_(0, flat_group_id, point_distances ** within_p)
-    counts.scatter_add_(0, flat_group_id, torch.ones_like(point_distances))
-    group_losses = (sums / counts.clamp(min=1)) ** (1 / within_p)
-    dt_loss = _aggregate_dt_track_losses(group_losses, across_p)
-    record_loss_samples('track_dt', target_spiral_zyxs, point_distances, None)
-
-    yield 'track_dt', dt_loss
+    return radius_loss
 
 
 def render_spiral_on_tracks_for_slice(

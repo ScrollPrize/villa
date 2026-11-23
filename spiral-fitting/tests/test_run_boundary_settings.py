@@ -132,8 +132,8 @@ def test_frozen_setting_rejects_lr_changes_without_mutating_optimizer(exponentia
 # --- tracks ---------------------------------------------------------------------
 
 @pytest.mark.parametrize('settings, error', [
-    ({'track_max_track_crossing_per_step': -1}, 'max_track_crossing_per_step'),
-    ({'track_crossing_precompute_max': 1.5}, 'track_crossing_precompute_max'),
+    ({'track_max_tortuosity': 0.9}, 'track_max_tortuosity'),
+    ({'track_min_sample_spacing': 0}, 'track_min_sample_spacing'),
 ])
 def test_invalid_track_policy_is_rejected_before_any_change(settings, error):
     context = _context(input_use_tracks=True)
@@ -147,15 +147,11 @@ def test_invalid_track_policy_is_rejected_before_any_change(settings, error):
     assert context.prepared_main_tracks == {}
 
 
-def test_track_crossing_settings_reprepare_the_retained_tracks(monkeypatch):
+def test_track_preparation_settings_reprepare_the_retained_tracks(monkeypatch):
     import fit_spiral
     context = _context(input_use_tracks=True)
     context.tracks = ['a track']
     context.trusted_geometry_tree = None
-    context.track_families = None
-    context.track_source_ids = None
-    context.track_crossing_cache = None
-    context.track_graph = None
     context.progress = None
     context.device = torch.device('cpu')
     prepared = {'flat_zyx_cpu': torch.zeros((1, 3))}
@@ -165,11 +161,11 @@ def test_track_crossing_settings_reprepare_the_retained_tracks(monkeypatch):
         fit_spiral, 'configure_prepared_track_sampling', Mock())
 
     context.apply_config(
-        {'track_crossing_precompute_max': 12},
+        {'track_max_tortuosity': 3.0},
         current_iteration=0)
     prepare.assert_called_once()
     policy = prepare.call_args.kwargs['sampling_config']
-    assert policy['crossing_precompute_max'] == 12
+    assert policy['max_tortuosity'] == 3.0
     assert context.prepared_main_tracks is prepared
 
 # --- integration steps ------------------------------------------------------------

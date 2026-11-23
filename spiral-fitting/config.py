@@ -31,7 +31,6 @@ _NULL_TYPES = {
     "object_store_patch_exclude_uuids": "strings",
     "track_length_bin_weights": "vector",
     "track_max_tortuosity": "number",
-    "loss_start_track_dt": "integer",
     "object_store_location": "string",
     "object_store_input_position": "mapping",
     "object_store_patch_uuids": "strings",
@@ -448,7 +447,6 @@ class Config:
         self.sample_count_winding_model_density_pairs = 128000
         self.sample_count_minimum_spacing_independent_samples = 2000
         self.sample_count_patch_dt_target_points = 256
-        self.sample_count_dt_target_points_per_strip = 512
         self.sample_count_shell_samples = 24576
         # Exponent applied to patch areas when building patch sampling
         # probabilities: 0 = uniform, 1 = proportional to area.
@@ -476,8 +474,6 @@ class Config:
         self.track_max_sample_spacing = 60.0
         self.track_length_bin_weights = [0.0, 0.15, 0.85]
         self.track_max_tortuosity = None
-        self.track_crossing_precompute_max = 8
-        self.track_max_track_crossing_per_step = 2
         self.track_exclusion_radius = 16.0
         # Tracks with both endpoints closer than this to the umbilicus axis
         # are dropped at load; 0 keeps every track.
@@ -485,9 +481,6 @@ class Config:
         self.track_radius_target = "mean"
         self.track_radius_loss_margin = 0.025
         self.track_radius_within_norm_p = 6.0
-        self.track_dt_within_track_norm_p = 3.0
-        self.track_dt_norm_p = 0.5
-        self.track_dt_loss_margin = 0.025
         self.dense_grad_mag_encode_scale = 1000.0
         self.dense_grad_mag_factor = 0.25
         self.dense_spacing_integration_steps = 8
@@ -499,7 +492,6 @@ class Config:
         self.loss_weight_patch_radius = 8.0
         self.loss_weight_patch_dt = 4.0
         self.loss_weight_track_radius = 50.0
-        self.loss_weight_track_dt = 10.0
         self.loss_weight_sym_dirichlet = 10.0
         self.loss_weight_dense_normals = 100.0
         self.loss_weight_fiber_directions = 0.0
@@ -513,7 +505,6 @@ class Config:
         self.optimizer_weight_decay_gap_expander = 0.01
         self.optimizer_weight_decay_flow_field = 0.0
         self.loss_start_patch_dt = 25000
-        self.loss_start_track_dt = 25000
         self.dt_target_mode = "strip_median"
         self.dt_target_floating_threshold = 0.25
         # Backward-compatible alias. FitContext phase-locks whole-object DT

@@ -36,5 +36,5 @@ def test_tracks_with_both_endpoints_inside_the_core_are_dropped():
     tracks = [np.array([[0, 10, 0], [1, 20, 0]], np.float32),    # both inside 50
               np.array([[0, 10, 0], [1, 80, 0]], np.float32),    # one outside
               np.array([[0, 90, 0], [1, 0, 95]], np.float32)]    # both outside
-    kept, families = filter_tracks_inside_umbilicus_radius(tracks, centre, 50.0, ['a', 'b', 'c'])
-    assert families == ['b', 'c'] and len(kept) == 2
+    kept = filter_tracks_inside_umbilicus_radius(tracks, centre, 50.0)
+    assert len(kept) == 2 and kept[0] is tracks[1] and kept[1] is tracks[2]

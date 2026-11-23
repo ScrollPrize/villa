@@ -34,22 +34,13 @@ class RunDtLossScheduleTests(unittest.TestCase):
             resume = get_run_dt_resume_iteration(10, iterations, fraction)
             self.assertEqual(10 + iterations - resume, eligible)
 
-    def test_schedule_composes_with_strict_family_start_thresholds(self):
-        cfg = Config({
-            'loss_start_patch_dt': 10,
-            'loss_start_track_dt': 20,
-        }).as_dict()
+    def test_schedule_composes_with_strict_start_threshold(self):
+        cfg = Config({'loss_start_patch_dt': 20}).as_dict()
         resume = 15
-        self.assertEqual(get_dt_loss_eligibility(cfg, 14, resume), {
-            'verified_patch': False,
-            'track': False,
-        })
-        # Existing loss starts remain strict `iteration > start` checks.
-        at_starts = get_dt_loss_eligibility(cfg, 20, resume)
-        self.assertTrue(at_starts['verified_patch'])
-        self.assertFalse(at_starts['track'])
-        after_all = get_dt_loss_eligibility(cfg, 31, resume)
-        self.assertTrue(all(after_all.values()))
+        self.assertFalse(get_dt_loss_eligibility(cfg, 14, resume))
+        # The loss start remains a strict `iteration > start` check.
+        self.assertFalse(get_dt_loss_eligibility(cfg, 20, resume))
+        self.assertTrue(get_dt_loss_eligibility(cfg, 21, resume))
 
 
 class TifxyzMetadataTests(unittest.TestCase):

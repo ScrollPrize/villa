@@ -66,15 +66,15 @@ another host that VC3D should edit against needs its store served by
 input updates**.
 
 The fit opens the store read-only and writes nothing to it. It reads no
-relationship between objects: track crossings are computed from the selected
-tracks' stored points (see **Object-store inputs**). Track selection uses
+relationship between objects, and tracks only enter the track radius loss
+(see **Object-store inputs**). Track selection uses
 `object_store_track_uuids` / `object_store_track_tags`, like the other kinds.
 Remove the retired `track_scale_factor` config setting; each stored track
 now declares its frame. Track databases are never input paths.
 
 Save drafts into the store, then **Update Fit Inputs** to adopt eligible
-geometry changes without resetting optimization. Changes to tracks, their
-crossings, the outer shell, the volume or prepared-input settings require
+geometry changes without resetting optimization. Changes to tracks, the
+outer shell, the volume or prepared-input settings require
 **Rebuild with Current Inputs**. With tracks enabled and
 `track_exclusion_radius > 0` (default 16), input replacement also requires a
 rebuild because the exclusion masks depend on the trusted geometry. Saved
@@ -310,9 +310,8 @@ Migrating a dataset directory: write a manifest beside it naming its
 `fit_spiral.py` reads patches, tracks and the outer shell from a
 `vc_object_store` database (`object_store_inputs.py`), opened read-only: the
 fit writes nothing to the store and reads no relationship between objects. It
-never reads patch directories or track databases. Track crossings are
-computed by the fit from the selected tracks. Point collections and fibers in
-the store are not read. The other inputs (umbilicus,
+never reads patch directories or track databases. Point collections and
+fibers in the store are not read. The other inputs (umbilicus,
 lasagna normal/gradient stores, fiber directions, winding inference) are
 named by the input manifest (`--inputs`; see "Input manifest").
 
@@ -376,52 +375,23 @@ winding-model supervision refuses a store without one, and with
 shell is refused (the fit consumed it at build): rebuild instead.
 
 Every rank then reads the same frozen snapshot and materializes it: patch
-grids, the outer shell, and the tracks lying entirely inside the z window
-with the crossing CSR the fit computes from every selected track, from which
-it builds its track crossing graph (see **Track crossings** below). No
+grids, the outer shell, and the tracks lying entirely inside the z window. No
 relationship is read: `crossing`, track-surface and patch-overlap
 relationships are not used. The ranks' input digests must agree. The log
 prints the selection and constraint counts; `python
 object_store_inputs.py dataset.vcobj --z-begin Z0 --z-end Z1` prints the same
 report without training.
 
-**Track crossings.** A fit's crossings are a function of its selected track
-revisions alone: exact shared voxels of opposite-family tracks, found with the
-native kernel `vc_spiral.track_crossings` (required for store tracks) and its
-fixed parameters (30 degrees, tangent radius 12 voxels, cluster radius 4 point
-indices, one representative per pair), the implementation the store's
-`track-track` detector shares. Tracks pair only within their dataset, in
-numeric `external_key` order; the dataset of a track (its owning store's
-directory / its `dataset_ref`, resolved), the grouping, the order and their
-checks are the store's, shared with that detector (`selected_inputs`'
-`track_datasets`, `vc_object_store.group_track_datasets`), so two spellings of
-one path are one dataset and one file name beside two source stores is two. An
-`external_key` that is no canonical decimal source ID
-or repeats within its dataset, a family other than `horizontal`, `vertical` or
-blank (blank: no crossings), coordinates outside `[0, 2^20)` and a dataset
-whose tracks declare different frame scales are input errors; nothing is
-dropped silently. Crossings are computed automatically at startup, whatever the
-fit's crossing limits, and cached under the fit's cache
-directory as `track_crossings/v2/<key>.vcobj`, keyed by the track revisions
-(not by the store's commit, the fit level or a frame scale), so the next fit of
-the same tracks loads them. That file is itself a small object store, local to
-the cache and never served: a sealed, history-off collection with one
-`crossing` edge per pair of crossing tracks and one row of the
-`ext_track_crossings` table (point index and arclength on each track, and the
-clearance, in stored voxels), written with the store's sharded streaming
-importer and read back as columns (`vc_object_store/docs/extensions.md`). It
-names the tracks by UUID and records the store position they were read at; it
-holds no tracks. A cache that cannot be read is recomputed and replaced, and
-one that cannot be written (a read-only cache directory, a filesystem without
-hard links) only costs the computation again: neither fails a fit. Processes
-that miss one cache together (the ranks of a distributed fit) take its
-`.lock`: one computes, the others wait and load its store. A crashed write can
-leave `.building-*` or `.compact-*` files beside it, which are safe to delete.
-The input manifest records the crossings as
-`derived_inputs.track_crossing` (`source`, `algorithm`, `parameters`, `count`,
-`sha256`), which a resume and an input update compare. `crossing`
-relationships a store holds, and approvals, rejections or edits of them, do
-not affect fitting.
+**Tracks.** Tracks are ordered by dataset, then numeric `external_key`; the
+dataset of a track (its owning store's directory / its `dataset_ref`,
+resolved), the grouping, the order and their checks are the store's
+(`selected_inputs`' `track_datasets`, `vc_object_store.group_track_datasets`),
+so two spellings of one path are one dataset and one file name beside two
+source stores is two. An `external_key` that is no canonical decimal source ID
+or repeats within its dataset and a family other than `horizontal`,
+`vertical` or blank are input errors; nothing is dropped silently. Each
+sampled track enters only the track radius loss, which holds all its points on
+one winding; no track is linked to another.
 
 The inputs are a **position** of the store, `{store, generation,
 commit_sequence}` (its UUID, its history generation and one of its commits,
@@ -461,8 +431,8 @@ error; nothing is assumed to be at scale 1. The umbilicus keeps its
 input-manifest coordinate scale and lasagna stores their
 `lasagna_scale`; the outer shell, fiber directions and winding inference are
 in fit-volume voxels. Tracks declare their frames like every other object;
-their crossings are found on the stored integer voxels and their arclength
-positions and clearances converted to fit voxels.
+their arclengths and tortuosities are measured on the stored integer voxels
+and converted to fit voxels.
 
 `fit_volume_level` (default 0) fits at a pyramid level of the reference
 volume instead: a fit voxel is 2^level reference voxels, so the z range and
@@ -495,9 +465,7 @@ mismatch), resume refusal, pinned positions (including edits racing the
 selection read), the same pins, service binding and commits through a
 `vc_object_server` endpoint (`test_object_store_hosted.py` runs a
 server subprocess when `VC_OBJECT_SERVER` names the binary and is skipped
-otherwise), tracks and
-the crossings computed from them (equal to the links the store's `track-track`
-detector publishes for the same tracks), and the runtime constraints against
+otherwise), tracks, and the runtime constraints against
 `tests/data/object_store_reference.json`, which the removed file loader
 produced from the same fixture. An opt-in startup test pins and
 materializes a real store (read-only):
@@ -915,8 +883,8 @@ as it was; a failure after the release fails the session
 (`input_preparation_error.recovery_required`): rebuild it or load a
 checkpoint.
 
-Tracks and their crossings are consumed at build. If either changes, an
-input update is refused: use **Rebuild with Current Inputs**. The same
+Tracks are consumed at build. If they change, an input update is refused:
+use **Rebuild with Current Inputs**. The same
 applies to outer-shell changes and to input updates while tracks use
 trusted-geometry exclusion (`track_exclusion_radius > 0`).
 
@@ -1523,14 +1491,8 @@ bypassing DBM and pickle decoding.
 
 ## Caching exact track crossings
 
-A fit computes its track crossings automatically from the tracks it selects
-in the object store, with the same exact-crossing kernel, and caches them
-under its cache directory (`track_crossings/v2/<key>.vcobj`; see **Track
-crossings** under the object-store inputs). It does not read the store's
-`crossing` relationships, so approving, rejecting or editing stored crossings
-no longer affects fitting, and no build step is needed for it.
-`grow_track_graph.py` instead reads crossings from a CSR sidecar beside
-the DBM; build it once:
+A fit uses no track crossings. `grow_track_graph.py` reads them from a CSR
+sidecar beside the DBM; build it once:
 
 ```sh
 python build_track_crossings.py \

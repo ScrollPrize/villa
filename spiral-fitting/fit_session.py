@@ -265,15 +265,10 @@ from surface_orientation import spiral_outward_sense_for
 # "object_store_input_position" (service-owned) is a position. Commits
 # report "version" (no "pushed"/"push_error", no "pending_commits"). The
 # project's umbilicus is {uuid, generation, version, points_zyx}.
-# 48: the fit computes track crossings itself from the selected tracks'
-# stored points, and reads no relationship of a track. The link refresh runs
-# no track-track detector, the link marker records no track selection, and
-# the input manifest lists no track_crossing relationships: it records the
-# crossings as "derived_inputs": {"track_crossing": {source, algorithm,
-# parameters, count, sha256}} (present when tracks are selected), which the
-# input digest covers. A client compares tracks, never crossing
-# relationships; a manifest of an older fit that lists them cannot be
-# compared on its crossings.
+# 48: the fit reads no relationship of a track. The link refresh runs no
+# track-track detector, the link marker records no track selection, and the
+# input manifest lists no track_crossing relationships. A client compares
+# tracks, never crossing relationships.
 API_VERSION = 48
 
 

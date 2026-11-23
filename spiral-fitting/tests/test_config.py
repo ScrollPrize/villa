@@ -118,18 +118,11 @@ def test_interactive_runtime_impacts_match_resident_capabilities():
     mutable_tracks = {
         "track_min_sample_spacing", "track_max_sample_spacing",
         "track_length_bin_weights", "track_max_tortuosity",
-        "track_max_track_crossing_per_step",
         "track_radius_target", "track_radius_loss_margin",
-        "track_radius_within_norm_p", "track_dt_within_track_norm_p",
-        "track_dt_norm_p", "track_dt_loss_margin",
+        "track_radius_within_norm_p", "track_exclusion_radius",
     }
     assert all(fields[key]["runtime_impact"] == "run_boundary"
                for key in mutable_tracks)
-    assert all(fields[key]["runtime_impact"] == "run_boundary"
-               for key in {
-                   "track_crossing_precompute_max",
-                   "track_exclusion_radius",
-               })
     # Settings that shape the frozen object-store inputs (link refresh,
     # materialization) are a rebuild.
     for key, field in fields.items():

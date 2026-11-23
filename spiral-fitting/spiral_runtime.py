@@ -635,7 +635,6 @@ class InteractiveFitSession:
         self.requested_config = dict(run.config)
         self._applied_config = None
         self._run_config = None
-        self._run_config_limits = None
         self._default_advanced_config = None
         self._status_callback = status_callback
         # Receives (rank, status) pairs; the in-process session is rank 0.
@@ -757,9 +756,6 @@ class InteractiveFitSession:
             }
             if self._run_config is not None:
                 result["run_config"] = copy.deepcopy(self._run_config)
-            if self._run_config_limits is not None:
-                result["run_config_limits"] = copy.deepcopy(
-                    self._run_config_limits)
             if self._default_advanced_config is not None:
                 result["default_advanced_config"] = copy.deepcopy(
                     self._default_advanced_config)
@@ -1020,7 +1016,6 @@ class InteractiveFitSession:
         with self._condition:
             self._applied_config = copy.deepcopy(config)
             self._run_config = run_mutable_config(config)
-            self._run_config_limits = self._run_config_limits_for(config)
             self._default_advanced_config = default_advanced_config
         self._publish_status()
         return config
@@ -1529,15 +1524,6 @@ class InteractiveFitSession:
         if collective_failure is not None:
             raise collective_failure
 
-    @staticmethod
-    def _run_config_limits_for(config):
-        """Per-Run ceilings the resident prepared pools impose."""
-        return {
-            'track_max_track_crossing_per_step': max(
-                int(config.get('track_crossing_precompute_max', 0)),
-                int(config.get('track_max_track_crossing_per_step', 0))),
-        }
-
     def _run_configuration(self, command):
         """Apply validated Run-scoped settings on the fitter thread."""
         config = command.config
@@ -1587,10 +1573,6 @@ class InteractiveFitSession:
                     self._run_config.update(config)
                     self.requested_config.update(config)
                     self.input_manifest.update(path_changes)
-                    # A crossing-ceiling change re-prepared the track pool
-                    # with the new ceiling; advertise it.
-                    self._run_config_limits = self._run_config_limits_for(
-                        self._applied_config)
             with self._condition:
                 self._config_revision += 1
                 if command.epoch is not None:

@@ -75,7 +75,6 @@ from geom_utils import bilinear_atlas_lookup, grid_sample_border, interp1d
 from dt_targets import (
     DtTargetCacheManager,
     compute_patch_dt_target_cache,
-    compute_strip_dt_target_cache,
     prepare_patch_dt_target_samples,
 )
 from tracks import (
@@ -84,11 +83,10 @@ from tracks import (
     filter_tracks_inside_umbilicus_radius,
     filter_tracks_to_outer_shell,
     get_track_satisfied_counts_in_chunks,
-    iter_track_losses,
+    get_track_radius_loss,
     prepare_main_phase_tracks,
     validate_track_sampling_config,
 )
-from track_graph import TrackGraph
 from umbilicus import thaumato_umbilicus_z_to_yx, json_umbilicus_z_to_yx
 from sample_spiral import (
     get_spiral_points,
@@ -726,16 +724,10 @@ def get_run_dt_resume_iteration(run_start, requested_iterations,
 
 
 def get_dt_loss_eligibility(cfg, iteration, run_dt_resume_iteration=None):
-    """Return DT eligibility for every directional DT loss family."""
+    """Return whether the patch DT loss is eligible at ``iteration``."""
     run_eligible = (run_dt_resume_iteration is None
                     or iteration >= run_dt_resume_iteration)
-    patch_start = cfg['loss_start_patch_dt']
-    track_start = (patch_start if cfg['loss_start_track_dt'] is None
-                   else cfg['loss_start_track_dt'])
-    return {
-        'verified_patch': run_eligible and iteration > patch_start,
-        'track': run_eligible and iteration > track_start,
-    }
+    return run_eligible and iteration > cfg['loss_start_patch_dt']
 
 
 def get_exponential_lr_at_step(
@@ -1116,8 +1108,7 @@ class FitContext:
 
         Seeds the host RNG streams, then reads patches, tracks and the outer
         shell from the object store (object_store_inputs.load_fit_inputs: a
-        frozen snapshot of a pinned position), builds the track crossing
-        graph; builds the sampling caches,
+        frozen snapshot of a pinned position); builds the sampling caches,
         host-prepared patch atlases, the trusted-geometry index and the
         whole-object DT target samples. Requires no device state: the
         patch atlases are moved as part of device-state setup, and the CUDA
@@ -1136,10 +1127,8 @@ class FitContext:
         - object_store_inputs: the materialized snapshot (provenance)
         - sampling: patch_sampling_probabilities, patch_atlas
         - trusted geometry: trusted_geometry_tree
-        - tracks: tracks, track_families, track_source_ids,
-          track_graph, track_reload_source /
-          _families / _source_ids, track_sampling_config, using_tracks,
-          filter_tracks_by_shell
+        - tracks: tracks, track_reload_source, track_sampling_config,
+          using_tracks, filter_tracks_by_shell
         - misc: umbilicus, scroll_zarr, shell_envelope,
           dense_spacing_mode, grad_mag_spacing_enabled
         """
@@ -1234,52 +1223,25 @@ class FitContext:
             )
 
         track_sampling_config = validate_track_sampling_config(self.config)
-        track_families = None
-        track_source_ids = None
-        track_graph = None
         track_reload_source = None
-        track_reload_families = None
-        track_reload_source_ids = None
         if track_inputs is not None:
-            # The store's tracks lying in the z window, in fit voxels, with
-            # the crossings computed from them (materialize_tracks).
+            # The store's tracks lying in the z window, in fit voxels
+            # (materialize_tracks).
             tracks = track_inputs.tracks
-            if track_sampling_config['crossing_precompute_max'] > 0:
-                progress.begin(
-                    'loading', 'Building track crossing graph',
-                    detail=f'{len(track_inputs.crossings["partners"]) // 2:,} crossings')
-                track_graph = TrackGraph(track_inputs.crossings)
-                print(
-                    f'built TrackGraph: {len(track_graph)} tracks, '
-                    f'{track_graph.edge_count} crossings in '
-                    f'{track_graph.build_seconds:.1f}s')
-                track_families = tracks.selected_family_codes
-                track_source_ids = tracks.selected_source_ids
             track_reload_source = tracks
-            track_reload_families = track_families
-            track_reload_source_ids = track_source_ids
             if filter_tracks_by_shell:
                 progress.begin(
                     'loading', 'Filtering tracks to outer shell',
                     detail=f'{len(tracks):,} tracks')
-                tracks, track_families, kept_track_indices = filter_tracks_to_outer_shell(
-                    tracks, shell_envelope, track_families, return_indices=True)
-                if track_source_ids is not None:
-                    track_source_ids = track_source_ids[kept_track_indices]
+                tracks = filter_tracks_to_outer_shell(tracks, shell_envelope)
             if self.config['track_inner_exclusion_radius'] > 0:
-                tracks, track_families, kept_track_indices = filter_tracks_inside_umbilicus_radius(
-                    tracks, umbilicus, self.config['track_inner_exclusion_radius'],
-                    track_families, return_indices=True)
-                if track_source_ids is not None:
-                    track_source_ids = track_source_ids[kept_track_indices]
+                tracks = filter_tracks_inside_umbilicus_radius(
+                    tracks, umbilicus, self.config['track_inner_exclusion_radius'])
             print(f'loaded {len(tracks)} tracks within z-roi [{self.z_begin}, {self.z_end})')
         else:
             tracks = None
 
-        using_tracks = (
-            (self.config['loss_weight_track_radius'] > 0 or self.config['loss_weight_track_dt'] > 0)
-            and bool(tracks)
-        )
+        using_tracks = self.config['loss_weight_track_radius'] > 0 and bool(tracks)
         patch_inputs = self._prepare_patch_inputs(
             verified_patches, using_tracks=using_tracks)
 
@@ -1299,12 +1261,7 @@ class FitContext:
         self.grad_mag_spacing_enabled = grad_mag_spacing_enabled
         self.track_sampling_config = track_sampling_config
         self.tracks = tracks
-        self.track_families = track_families
-        self.track_source_ids = track_source_ids
-        self.track_graph = track_graph
         self.track_reload_source = track_reload_source
-        self.track_reload_families = track_reload_families
-        self.track_reload_source_ids = track_reload_source_ids
         self.using_tracks = using_tracks
         for name, value in patch_inputs.items():
             setattr(self, name, value)
@@ -2144,18 +2101,8 @@ class FitContext:
                 self.device,
                 anchor_tree=self.trusted_geometry_tree,
                 sampling_config=self.track_sampling_config,
-                track_families=self.track_families,
-                track_source_ids=self.track_source_ids,
-                track_graph=self.track_graph,
                 progress=self.progress,
             )
-            # The crossing graph is setup-only. The prepared bundle now owns only
-            # its fixed-width training tables, so release the graph promptly.
-            if interactive_driver is None:
-                self.track_graph = None
-                # The store's crossing CSR backs the graph: release it too.
-                if self.object_store_inputs.tracks is not None:
-                    self.object_store_inputs.tracks.crossings = None
             # With the usual zero exclusion radius, the training bundle already
             # contains every authoritative track point as one flat CPU tensor.  Reuse it
             # for preview bounds instead of walking millions of short NumPy tracks.
@@ -2840,7 +2787,7 @@ class FitContext:
                     'patch_radius', 'patch_dt',
                     'sym_dirichlet',
                     'dense_normals', 'dense_spacing',
-                    'track_radius', 'track_dt',
+                    'track_radius',
                 )
             }
             if self._winding_model_mode_active():
@@ -2900,10 +2847,8 @@ class FitContext:
                         self.z_begin, self.z_end,
                         generator=preview_generator)
                 if self.prepared_main_tracks is not None:
-                    for _loss_name, _loss_value in iter_track_losses(
-                            transform, dr, self.prepared_main_tracks, self.config,
-                            compute_dt=self.config['loss_weight_track_dt'] > 0):
-                        pass
+                    get_track_radius_loss(
+                        transform, dr, self.prepared_main_tracks, self.config)
             # This block is a one-shot consumer: no later sampler call would
             # drain its deferred unset-potential verdicts, so resolve them
             # before the diagnostics are published.
@@ -3021,7 +2966,6 @@ class FitContext:
             reprepare_tracks = bool(changed & {
                 'track_max_tortuosity',
                 'track_exclusion_radius',
-                'track_crossing_precompute_max',
             })
             shell_atlas_keys = SHELL_ATLAS_KEYS
             if (changed & shell_atlas_keys
@@ -3090,18 +3034,13 @@ class FitContext:
                     self.tracks, None, float(self.config['track_exclusion_radius']),
                     self.device, anchor_tree=self.trusted_geometry_tree,
                     sampling_config=validate_track_sampling_config(self.config),
-                    track_families=self.track_families,
-                    track_source_ids=self.track_source_ids,
-                    track_graph=self.track_graph,
                     progress=self.progress)
                 replace_prepared_tracks = True
 
             target_tracks = (
                 rebuilt_tracks
                 if replace_prepared_tracks else self.prepared_main_tracks)
-            if ({'track_length_bin_weights',
-                 'track_max_track_crossing_per_step'}
-                    & changed):
+            if 'track_length_bin_weights' in changed:
                 configure_prepared_track_sampling(target_tracks, config)
         except Exception:
             self.config.update(old_values)
@@ -3189,13 +3128,10 @@ class FitContext:
         )
         log_metrics['run_dt_suppressed'] = float(run_dt_suppressed)
 
-        dt_eligibility = get_dt_loss_eligibility(
+        compute_patch_dt = get_dt_loss_eligibility(
             self.config, iteration, self.run_dt_resume_iteration)
-        compute_patch_dt = dt_eligibility['verified_patch']
-        compute_track_dt = dt_eligibility['track']
 
         patch_dt_target_cache = None
-        track_dt_target_cache = None
         if self.dt_target_whole_object:
             if compute_patch_dt and self.config['loss_weight_patch_dt'] > 0 and self.verified_patches_list:
                 patch_dt_target_cache = self.dt_target_cache_manager.get('patch', iteration, lambda: compute_patch_dt_target_cache(
@@ -3203,15 +3139,6 @@ class FitContext:
                     self.verified_patches_list, self.patch_atlas,
                     self.theta_crossing_map,
                     self.config['dt_target_floating_threshold'],
-                ))
-            if compute_track_dt and self.config['loss_weight_track_dt'] > 0 and self.prepared_main_tracks is not None:
-                track_dt_target_cache = self.dt_target_cache_manager.get('track', iteration, lambda: compute_strip_dt_target_cache(
-                    self.slice_to_spiral_transform, self.dr_per_winding,
-                    self.prepared_main_tracks['flat_zyx_cpu'], self.prepared_main_tracks['offsets'],
-                    floating_threshold=self.config['dt_target_floating_threshold'],
-                    num_points_per_strip=self.config['sample_count_dt_target_points_per_strip'],
-                    max_stride=self.config['dt_target_max_stride'],
-                    max_total_points=5_000_000,
                 ))
 
         patch_loss_values = get_patch_and_umbilicus_losses(
@@ -3348,23 +3275,15 @@ class FitContext:
             del min_spacing_loss, min_spacing_metrics
 
         if self.prepared_main_tracks is not None:
-            for track_loss_name, track_loss_value in iter_track_losses(
+            track_radius_loss = get_track_radius_loss(
                 self.slice_to_spiral_transform,
                 self.dr_per_winding,
                 self.prepared_main_tracks,
                 self.config,
-                compute_dt=compute_track_dt,
-                dt_target_cache=track_dt_target_cache,
-            ):
-                weight = (
-                    self.config['loss_weight_track_radius']
-                    if track_loss_name == 'track_radius'
-                    else self.config['loss_weight_track_dt']
-                )
-                backward_family({track_loss_name: track_loss_value * weight})
-                # Release before the generator builds the next loss's graph,
-                # or both large transform graphs are resident at peak.
-                del track_loss_value
+            )
+            backward_family({'track_radius': (
+                track_radius_loss * self.config['loss_weight_track_radius'])})
+            del track_radius_loss
 
         shell_metrics = {}
         if (self.shell_map is not None
@@ -3513,8 +3432,8 @@ class FitContext:
         Raises InputReplacementRefused when the inputs cannot replace these
         without changing more than supervision: another fit volume or
         external frames (the model's frame), track exclusion masks that
-        depend on the trusted geometry, or other tracks or crossings than the
-        fit prepared. Returns the candidate for replace_inputs().
+        depend on the trusted geometry, or other tracks than the fit
+        prepared. Returns the candidate for replace_inputs().
         """
         current = getattr(self, 'object_store_inputs', None)
         if current is None or current.manifest is None:
@@ -3529,11 +3448,10 @@ class FitContext:
         if self.using_tracks and float(self.config['track_exclusion_radius']) > 0:
             problems.append('track exclusion masks depend on the trusted geometry of the '
                             'inputs (track_exclusion_radius > 0)')
-        # Tracks and their crossings are consumed at build (the prepared
-        # track tables).
+        # Tracks are consumed at build (the prepared track tables).
         from object_store_inputs import track_identity
         if track_identity(current.manifest) != track_identity(inputs.manifest):
-            problems.append('the tracks or their crossings differ from the fit\'s')
+            problems.append('the tracks differ from the fit\'s')
         if problems:
             raise InputReplacementRefused(
                 'the inputs cannot replace this fit\'s; rebuild it instead: ' + '; '.join(problems))

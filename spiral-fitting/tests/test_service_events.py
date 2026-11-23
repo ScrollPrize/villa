@@ -252,7 +252,6 @@ class RuntimeEventPlumbingTests(unittest.TestCase):
         session._context = None
         session.input_manifest = {}
         session._run_config = None
-        session._run_config_limits = None
         session._default_advanced_config = None
         session._applied_config = None
         received = []

@@ -1,10 +1,6 @@
-"""Tracks read from an object store, and the crossings the fit computes from
-them."""
-import contextlib
+"""Tracks read from an object store."""
 import dataclasses
 import pathlib
-import threading
-import types
 
 import numpy as np
 import pytest
@@ -14,15 +10,12 @@ from vc_object_store import ObjectStore  # noqa: E402
 
 import object_store_inputs as osi  # noqa: E402
 import object_store_reference as reference  # noqa: E402
-import tracks as tracks_module  # noqa: E402
 from object_store_fixture import (  # noqa: E402
     array, crossing_edge, fit_config, frame, put_patch, put_track,
     write_reference_store, write_walk_store)
 
 
 pytestmark = pytest.mark.usefixtures('cpu')
-
-CSR_ARRAYS = ('offsets', 'partners', 'self_local', 'partner_local', 'positions', 'clearances')
 
 
 def _line(start, axis, length):
@@ -45,153 +38,23 @@ def _lattice(db, z=10, **options):
     return tracks
 
 
-def _materialize_tracks(db, z_begin=0, z_end=64, cache_directory=None,
-                        workers=None, **request):
+def _materialize_tracks(db, z_begin=0, z_end=64, **request):
     snapshot = osi.read_snapshot(db, osi.InputRequest(**request))
-    return osi.materialize_tracks(db, snapshot, z_begin=z_begin, z_end=z_end,
-                                  cache_directory=cache_directory,
-                                  workers=workers)
-
-
-def _move_last_point(db, uuid):
-    """Another geometry revision of a track: its last point one voxel on."""
-    revision = db.current_object_revision(uuid)['geometry_revision']
-    points = osi.read_geometry(db, revision, ['points'])[0]['points']
-    moved = points[-1:].copy()
-    moved[0, 2] += 1
-    edits = [{'array': 'points', 'element_offset': len(points) - 1, 'data': moved.tobytes()}]
-    version = db.current_version(uuid)
-    # Links anchored on the track (the store's own crossings) are kept.
-    kept = []
-    for affected in db.affected_geometry_edit_edges(uuid, edits, version):
-        edge = db.edge(affected['uuid'])
-        kept.append({'edge_uuid': edge['uuid'], 'expected_version': edge['version'],
-                     'action': 'retain',
-                     'a_revision': db.current_geometry(edge['a'])['uuid'],
-                     'b_revision': db.current_geometry(edge['b'])['uuid']})
-    db.edit_geometry(uuid, edits, version, edge_edits=kept)
-    assert db.current_object_revision(uuid)['geometry_revision'] != revision
-
-
-def _assert_same_crossings(found, expected):
-    for name in CSR_ARRAYS:
-        np.testing.assert_array_equal(found[name], expected[name], err_msg=name)
-
-
-def _link_crossings(db, order):
-    """The crossing CSR (stored voxels) of the store's crossing edges over
-    the tracks ``order`` (UUIDs by row): what a fit read from the links the
-    store's track-track detector published."""
-    row = {uuid: index for index, uuid in enumerate(order)}
-    records = []
-    for edge in db.edges_by_kind('crossing'):
-        meta = edge['meta']['track_crossing']
-        ends = [(row[uuid], anchor['points'][0]['index'][0],
-                 float(meta['endpoints'][uuid]['arclength_voxels']))
-                for uuid, anchor in ((edge['a'], edge['a_anchor']), (edge['b'], edge['b_anchor']))]
-        clearance = float(meta['clearance_voxels'])
-        (a, a_local, a_position), (b, b_local, b_position) = ends
-        records.append((a, b, a_local, b_local, a_position, clearance))
-        records.append((b, a, b_local, a_local, b_position, clearance))
-    table = np.array(records, dtype=np.float64).reshape(-1, 6)
-    table = table[np.lexsort((table[:, 1], table[:, 0]))]
-    offsets = np.zeros(len(order) + 1, dtype=np.int64)
-    np.cumsum(np.bincount(table[:, 0].astype(np.int64), minlength=len(order)), out=offsets[1:])
-    return {'offsets': offsets, 'partners': table[:, 1].astype(np.int32),
-            'self_local': table[:, 2].astype(np.int32),
-            'partner_local': table[:, 3].astype(np.int32),
-            'positions': table[:, 4].copy(), 'clearances': table[:, 5].copy()}
-
-
-def _varied_tracks(db):
-    """Tracks of both families with a pair that crosses in two clusters, a
-    repeated voxel at a crossing, a blank family, an empty track and a track
-    leaving the [0, 64) z window; returns their UUIDs by row."""
-    horizontal = _line((10, 60, 50), 2, 40)
-    # Up along y at x=55, across at y=65, back down at x=75: two crossings
-    # of the horizontal track, with the first crossing's voxel stored twice.
-    up, down = _line((10, 55, 55), 1, 10), _line((10, 55, 75), 1, 10)[::-1]
-    twice = np.concatenate([up[:6], up[5:], _line((10, 65, 56), 2, 18), down])
-    return [
-        put_track(db, horizontal, 0, 'horizontal'),
-        put_track(db, twice, 1, 'vertical'),
-        put_track(db, _line((10, 50, 62), 1, 20), 2, ''),
-        put_track(db, np.empty((0, 3), dtype=np.int64), 3, 'vertical'),
-        # Along z through the horizontal track's voxel (10, 60, 85), to z=100.
-        put_track(db, _line((2, 60, 85), 0, 98), 4, 'vertical'),
-        put_track(db, _line((10, 70, 50), 2, 40), 5, 'horizontal'),
-        put_track(db, _line((10, 52, 80), 1, 30), 6, 'vertical'),
-    ]
-
-
-def test_computed_crossings_are_the_ones_the_stores_detector_links(db):
-    """The crossings a fit computes from its tracks are the ones the store's
-    track-track detector publishes as links for the same tracks."""
-    order = _varied_tracks(db)
-    computed, counts = _materialize_tracks(db)
-    assert counts['tracks'] == 5 and counts['tracks outside the z window'] == 1
-    report = db.link_tracks_to_tracks()
-    assert report['edges_created'] > 0 and not report['problems']
-    linked = _link_crossings(db, order)
-    assert len(linked['partners']) // 2 == report['edges_created'] == counts['track crossings']
-    _assert_same_crossings(computed.crossings, linked)
-    # One representative for the pair crossing twice; the blank family and
-    # the empty track have none; the z-excluded track keeps its row.
-    partners = [computed.crossings['partners'][begin:end].tolist() for begin, end in zip(
-        computed.crossings['offsets'][:-1], computed.crossings['offsets'][1:])]
-    assert partners == [[1, 4, 6], [0], [], [], [0], [6], [0, 5]]
-    assert computed.tracks.selected_source_ids.tolist() == [0, 1, 2, 5, 6]
-    assert computed.derived['source'] == 'computed'
-    assert computed.derived['count'] == counts['track crossings']
-    # The store's crossing links are not read: the same crossings with them.
-    again, _ = _materialize_tracks(db)
-    _assert_same_crossings(again.crossings, computed.crossings)
-    assert again.derived == computed.derived
-
-
-def test_crossings_do_not_depend_on_the_worker_count(db):
-    _varied_tracks(db)
-    _lattice(db, dataset='lattice.vctracks')
-    one, _ = _materialize_tracks(db, workers=1)
-    many, _ = _materialize_tracks(db, workers=4)
-    _assert_same_crossings(one.crossings, many.crossings)
-    assert one.derived == many.derived and one.derived['count'] > 9
-
-
-def test_tracks_pair_only_within_their_dataset(db):
-    """Two datasets reusing the source keys, each with one crossing of its
-    own at a voxel all four tracks share."""
-    put_track(db, _line((10, 60, 50), 2, 40), 0, 'horizontal', dataset='a.vctracks')
-    put_track(db, _line((10, 55, 55), 1, 32), 1, 'vertical', dataset='a.vctracks')
-    put_track(db, _line((10, 60, 40), 2, 50), 0, 'horizontal', dataset='b.vctracks')
-    put_track(db, _line((10, 50, 55), 1, 37), 1, 'vertical', dataset='b.vctracks')
-    inputs, counts = _materialize_tracks(db)
-    crossings = inputs.crossings
-    assert counts['track crossings'] == 2
-    # Global rows, partners remapped to them, each track's own point indices.
-    assert crossings['source_ids'].tolist() == [0, 1, 2, 3]
-    assert crossings['offsets'].tolist() == [0, 1, 2, 3, 4]
-    assert crossings['partners'].tolist() == [1, 0, 3, 2]
-    assert crossings['self_local'].tolist() == [5, 5, 15, 10]
-    assert crossings['partner_local'].tolist() == [5, 5, 10, 15]
-    assert crossings['positions'].tolist() == [5.0, 5.0, 15.0, 10.0]
-    assert inputs.tracks.selected_source_ids.tolist() == [0, 1, 2, 3]
+    return osi.materialize_tracks(db, snapshot, z_begin=z_begin, z_end=z_end)
 
 
 def test_spellings_of_one_dataset_are_one_group(db):
     """The store resolves a track's dataset (its owning store's directory /
     its dataset_ref), as its track-track detector does: two spellings of one
-    path are one dataset, and their tracks cross."""
+    path are one dataset."""
     put_track(db, _line((10, 60, 50), 2, 40), 0, 'horizontal', dataset='tracks.vctracks')
     put_track(db, _line((10, 55, 55), 1, 32), 1, 'vertical', dataset='./tracks.vctracks')
     snapshot = osi.read_snapshot(db, osi.InputRequest())
     [dataset] = {obj.dataset for obj in snapshot.objects_of('track')}
     assert dataset.endswith('/tracks.vctracks') and '/./' not in dataset
     inputs, counts = _materialize_tracks(db)
-    assert counts['track crossings'] == 1
-    assert inputs.crossings['partners'].tolist() == [1, 0]
-    # The store's own detector pairs them too.
-    assert db.link_tracks_to_tracks()['edges_created'] == 1
+    assert counts['tracks'] == 2
+    assert inputs.tracks.selected_source_ids.tolist() == [0, 1]
 
 
 def test_a_track_placeholder_does_not_stop_a_selection(db):
@@ -204,7 +67,7 @@ def test_a_track_placeholder_does_not_stop_a_selection(db):
     assert placeholder not in snapshot.objects and len(snapshot.objects_of('track')) == 6
     assert any('without geometry' in note for note in snapshot.notes)
     _, counts = _materialize_tracks(db)
-    assert counts['track crossings'] == 9
+    assert counts['tracks'] == 6
     db.put_geometry(placeholder, {'kind': 'track', 'attributes': {}, 'arrays': [
         array('points', np.asarray(_line((10, 60, 50), 2, 4))[:, ::-1], '<i4')]})
     with pytest.raises(osi.ObjectStoreInputError, match=f'track {placeholder} has no dataset_ref'):
@@ -213,15 +76,15 @@ def test_a_track_placeholder_does_not_stop_a_selection(db):
 
 def test_one_file_name_in_two_source_stores_is_two_datasets(tmp_path):
     """Tracks an overlay inherits from two stores that each name
-    ``tracks.vctracks`` beside themselves belong to two datasets: they do
-    not cross, and the stores may reuse source IDs."""
+    ``tracks.vctracks`` beside themselves belong to two datasets, and the
+    stores may reuse source IDs."""
     from vc_object_store import write_extension_store
     owners = {}
     for name, families in (('one', ('horizontal', 'vertical')), ('two', ('vertical', 'horizontal'))):
         (tmp_path / name).mkdir()
         with ObjectStore.create(str(tmp_path / name / 'base.vcobj'), author='ingest') as base:
             # Source ID 0 is the same line in both stores, in opposite
-            # families: one dataset would cross them at every voxel.
+            # families: one dataset would refuse the repeated key.
             owners[put_track(base, _line((10, 60, 50), 2, 40), 0, families[0])] = name
             owners[put_track(base, _line((10, 55, 55), 1, 32), 1, families[1])] = name
             base.seal()
@@ -234,11 +97,8 @@ def test_one_file_name_in_two_source_stores_is_two_datasets(tmp_path):
         datasets = {obj.uuid: obj.dataset for obj in snapshot.objects_of('track')}
         assert {uuid: pathlib.Path(dataset).parent.name for uuid, dataset in datasets.items()} == owners
         inputs, counts = osi.materialize_tracks(db, snapshot, z_begin=0, z_end=64)
-    assert counts['tracks'] == 4 and counts['track crossings'] == 2
-    crossings = inputs.crossings
-    # Each store's two tracks cross each other, and nothing else.
-    assert crossings['offsets'].tolist() == [0, 1, 2, 3, 4]
-    assert crossings['partners'].tolist() == [1, 0, 3, 2]
+    assert counts['tracks'] == 4
+    assert inputs.tracks.selected_source_ids.tolist() == [0, 1, 2, 3]
 
 
 def test_tracks_keep_their_window_order_and_frame(db):
@@ -263,14 +123,6 @@ def test_tracks_keep_their_window_order_and_frame(db):
     np.testing.assert_array_equal(collection[1], _line((40, 120, 100), 2, 40) / 2)
     assert collection.selected_arclengths.tolist() == [10.0, 20.0]
     assert collection.selected_tortuosities.tolist() == [1.0, 1.0]
-    # The CSR spans every selected track; positions and clearance are fit voxels.
-    crossings = inputs.crossings
-    assert crossings['offsets'].tolist() == [0, 0, 1, 2]
-    assert crossings['partners'].tolist() == [2, 1]
-    assert crossings['self_local'].tolist() == [10, 30]
-    assert crossings['partner_local'].tolist() == [30, 10]
-    assert crossings['positions'].tolist() == [5.0, 15.0]
-    assert crossings['clearances'].tolist() == [5.0, 5.0]
 
 
 def test_track_links_are_not_consumed(db):
@@ -321,7 +173,7 @@ class _Recording:
 def _manifest(store, config):
     snapshot = osi.read_snapshot(store, osi.request_from_config(config))
     inputs = osi.materialize_from_config(store, snapshot, config)
-    return osi.input_manifest(snapshot, config, tracks=inputs.tracks), inputs
+    return osi.input_manifest(snapshot, config), inputs
 
 
 def test_crossing_links_of_a_store_change_nothing_and_are_never_read(db):
@@ -337,9 +189,7 @@ def test_crossing_links_of_a_store_change_nothing_and_are_never_read(db):
     assert recording.endpoints == set()
     assert osi._compared(after) == osi._compared(before)
     assert osi.manifest_digest(after) == osi.manifest_digest(before)
-    assert after['derived_inputs'] == before['derived_inputs']
-    assert after['derived_inputs']['track_crossing']['count'] == 9
-    _assert_same_crossings(with_links.tracks.crossings, without.tracks.crossings)
+    assert len(with_links.tracks.tracks) == len(without.tracks.tracks) == 6
 
 
 def test_tracks_are_read_under_the_selected_inputs_guard(db):
@@ -373,7 +223,7 @@ def test_tracks_are_read_under_the_selected_inputs_guard(db):
 # Input errors: nothing is dropped silently
 # ---------------------------------------------------------------------------
 
-def _crossing_pair(db, **second):
+def _track_pair(db, **second):
     put_track(db, _line((10, 60, 50), 2, 40), 0, 'horizontal')
     options = {'key': 1, 'family': 'vertical', **second}
     return put_track(db, _line((10, 55, 55), 1, 32), options.pop('key'), options.pop('family'),
@@ -385,19 +235,18 @@ def _crossing_pair(db, **second):
     ({'key': '07'}, 'must be a canonical decimal source ID: 07'),
     ({'key': 'seven'}, 'must be a canonical decimal source ID: seven'),
     ({'key': str(1 << 64)}, 'must be a canonical decimal source ID'),
-    ({'coordinates': frame(2)}, "tracks.vctracks' are in different frames"),
 ])
-def test_track_metadata_crossings_cannot_use_is_refused(db, second, problem):
-    uuid = _crossing_pair(db, **second)
+def test_invalid_track_metadata_is_refused(db, second, problem):
+    uuid = _track_pair(db, **second)
     with pytest.raises(osi.ObjectStoreInputError) as error:
         _materialize_tracks(db)
-    assert problem in str(error.value) and (uuid in str(error.value) or 'frames' in problem)
+    assert problem in str(error.value) and uuid in str(error.value)
 
 
 def test_a_source_key_is_one_track_of_its_dataset(db):
-    _crossing_pair(db, key=0, dataset='other.vctracks')
+    _track_pair(db, key=0, dataset='other.vctracks')
     _, counts = _materialize_tracks(db)
-    assert counts['tracks'] == 2 and counts['track crossings'] == 0
+    assert counts['tracks'] == 2
     # One store refuses the same key twice in a dataset; tracks of several
     # owners could still bring it.
     tracks = osi.read_snapshot(db, osi.InputRequest()).objects_of('track')
@@ -409,11 +258,9 @@ def test_a_source_key_is_one_track_of_its_dataset(db):
         osi._ordered_tracks(tracks)
 
 
-def test_track_points_crossings_cannot_index_are_refused(db, monkeypatch):
-    _crossing_pair(db)
-    far = put_track(db, _line((10, 60, (1 << 20) - 3), 2, 6), 2, 'horizontal')
-    with pytest.raises(osi.ObjectStoreInputError, match=f'track {far} has coordinates outside'):
-        _materialize_tracks(db)
+def test_track_points_of_another_shape_are_refused(db, monkeypatch):
+    _track_pair(db)
+    far = put_track(db, _line((10, 60, 90), 2, 6), 2, 'horizontal')
     read = osi.read_geometry
 
     def flat(store, revision, names, optional=()):
@@ -424,475 +271,8 @@ def test_track_points_crossings_cannot_index_are_refused(db, monkeypatch):
         _materialize_tracks(db)
 
 
-def test_store_tracks_need_the_native_crossing_kernel(db, monkeypatch):
-    _crossing_pair(db)
-    monkeypatch.setenv('VC_DISABLE_NATIVE_TRACK_CROSSINGS', '1')
-    with pytest.raises(osi.ObjectStoreInputError, match='native kernel vc_spiral.track_crossings'):
-        _materialize_tracks(db)
-
-
 # ---------------------------------------------------------------------------
-# The crossing cache
-# ---------------------------------------------------------------------------
-
-@pytest.fixture()
-def computes(monkeypatch):
-    """The number of crossing computations."""
-    calls = []
-    compute = osi._compute_track_crossings
-
-    def counted(*args, **kwargs):
-        calls.append(1)
-        return compute(*args, **kwargs)
-    monkeypatch.setattr(osi, '_compute_track_crossings', counted)
-    return calls
-
-
-def _cache_files(cache):
-    directory = cache / osi.TRACK_CROSSING_CACHE_DIRECTORY
-    return sorted(directory.glob('*.vcobj')) if directory.is_dir() else []
-
-
-def _cached_selection(db):
-    """(ordered tracks, the crossing key) of the store's current selection."""
-    snapshot = osi.read_snapshot(db, osi.InputRequest())
-    tracks, rows = osi._ordered_tracks(snapshot.objects_of('track'))
-    return tracks, osi._track_crossing_key(tracks, rows)
-
-
-def test_crossings_are_cached_by_the_track_revisions(db, tmp_path, computes):
-    cache = tmp_path / 'cache'
-    tracks = _lattice(db)
-    first, _ = _materialize_tracks(db, cache_directory=str(cache))
-    [cached] = _cache_files(cache)
-    assert cached.suffix == '.vcobj' and cached.is_file() and len(computes) == 1
-    again, _ = _materialize_tracks(db, cache_directory=str(cache))
-    assert len(computes) == 1 and again.derived == first.derived
-    _assert_same_crossings(again.crossings, first.crossings)
-    # A store commit that leaves the tracks' geometry alone is still a hit.
-    uuid = next(iter(tracks))
-    db.set_meta(uuid, 'review_note', 'seen')
-    db.link_tracks_to_tracks()
-    _materialize_tracks(db, cache_directory=str(cache))
-    assert len(computes) == 1 and _cache_files(cache) == [cached]
-    # Another geometry revision of one track is another key.
-    _move_last_point(db, uuid)
-    changed, _ = _materialize_tracks(db, cache_directory=str(cache))
-    assert len(computes) == 2 and len(_cache_files(cache)) == 2
-    assert changed.derived['count'] == first.derived['count']
-
-
-def test_the_cache_is_a_sealed_store_of_the_crossing_pairs(db, tmp_path):
-    """What the cache holds: one row per crossing pair, keyed by track
-    UUIDs, with the selection's key, the CSR's checksum and the store
-    position the tracks were read at."""
-    from vc_object_store import CollectionReader
-    _lattice(db)
-    inputs, _ = _materialize_tracks(db, cache_directory=str(tmp_path / 'cache'))
-    [cached] = _cache_files(tmp_path / 'cache')
-    tracks, key = _cached_selection(db)
-    status = db.status()
-    with CollectionReader(str(cached)) as reader:
-        info = reader.track_crossing_info()
-        columns = reader.track_crossing_columns()
-        tables = reader.extension_tables()  # one per shard
-    assert info['key'] == key and info['checksum'] == inputs.derived['sha256']
-    assert info['algorithm'] == tracks_module.TRACK_CROSSING_ALGORITHM
-    assert info['parameters'] == tracks_module.TRACK_CROSSING_PARAMETERS
-    assert info['tracks'] == len(tracks) == 6 and info['crossings'] == inputs.derived['count'] == 9
-    assert info['based_on'] == [{'store_uuid': str(status['store']), 'generation': str(status['generation']),
-                                 'commit_sequence': int(status['commit_sequence'])}]
-    assert tables and all(table['name'] == 'ext_track_crossings' and not table['versioned']
-                          and table['format_version'] == 1 for table in tables)
-    assert len(columns['a']) == 9 and columns['a'].shape == (9, 16)
-    uuids = {bytes.fromhex(obj.uuid.replace('-', '')) for obj in tracks}
-    assert all(bytes(a) < bytes(b) and {bytes(a), bytes(b)} <= uuids
-               for a, b in zip(columns['a'], columns['b']))
-    # The pairs are the computed table, whatever row order the tracks have.
-    rebuilt = osi._crossings_from_columns(columns, osi._track_uuid_bytes(tracks))
-    assert tracks_module.crossing_csr_sha256(rebuilt) == inputs.derived['sha256']
-
-
-def test_cached_pairs_find_their_rows_by_the_whole_uuid():
-    """Rows are looked up by UUID halves: tracks whose UUIDs share the first
-    half are still told apart, and an unknown track is refused."""
-    high = bytes(range(8))
-    names = [high + bytes([0] * 7 + [low]) for low in (9, 3, 250, 4)] + [bytes([200 + i] * 16) for i in range(3)]
-    uuids = np.frombuffer(b''.join(names), dtype=np.uint8).reshape(-1, 16)
-    pairs = [(1, 0), (3, 2), (1, 2), (5, 0), (4, 6)]  # rows; a < b by UUID bytes below
-
-    def columns(pairs):
-        ordered = [sorted(pair, key=lambda row: names[row]) for pair in pairs]
-        return {'a': uuids[[a for a, _ in ordered]], 'b': uuids[[b for _, b in ordered]],
-                'local_a': np.array([10 * a for a, _ in ordered], dtype=np.int32),
-                'local_b': np.array([10 * b for _, b in ordered], dtype=np.int32),
-                'position_a': np.array([a + 0.5 for a, _ in ordered]),
-                'position_b': np.array([b + 0.5 for _, b in ordered]),
-                'clearance': np.arange(len(ordered), dtype=np.float64)}
-    csr = osi._crossings_from_columns(columns(pairs), uuids)
-    tracks_module._validate_crossing_partner_csr(csr)
-    rows = np.repeat(np.arange(len(names)), np.diff(csr['offsets']))
-    assert sorted(zip(rows.tolist(), csr['partners'].tolist())) == sorted(
-        pair for a, b in pairs for pair in ((a, b), (b, a)))
-    np.testing.assert_array_equal(csr['self_local'], 10 * rows)
-    np.testing.assert_array_equal(csr['partner_local'], 10 * csr['partners'])
-    np.testing.assert_array_equal(csr['positions'], rows + 0.5)
-    back = osi._crossing_columns(csr, uuids)
-    again = osi._crossings_from_columns(dict(zip(
-        ('a', 'b', 'local_a', 'local_b', 'position_a', 'position_b', 'clearance'), back)), uuids)
-    assert tracks_module.crossing_csr_sha256(again) == tracks_module.crossing_csr_sha256(csr)
-    for unknown in (high + bytes([0] * 7 + [5]), high + bytes([0] * 7 + [251]), bytes(16), bytes([255] * 16)):
-        foreign = columns(pairs[:1])
-        foreign['b'] = np.frombuffer(unknown, dtype=np.uint8).reshape(1, 16)
-        with pytest.raises(ValueError, match='not selected'):
-            osi._crossings_from_columns(foreign, uuids)
-
-
-def test_a_track_known_only_by_half_its_uuid_is_not_selected():
-    """Distinct upper halves find the row by themselves; the lower half
-    still has to be the track's."""
-    names = [bytes([10 * (row + 1)] * 8) + bytes([row + 1] * 8) for row in range(4)]
-    uuids = np.frombuffer(b''.join(names), dtype=np.uint8).reshape(-1, 16)
-    columns = {'a': uuids[[0, 1]], 'b': uuids[[2, 3]],
-               'local_a': np.array([1, 2], dtype=np.int32), 'local_b': np.array([3, 4], dtype=np.int32),
-               'position_a': np.array([1.0, 2.0]), 'position_b': np.array([3.0, 4.0]),
-               'clearance': np.array([0.5, 0.25])}
-    csr = osi._crossings_from_columns(columns, uuids[[3, 1, 0, 2]])  # rows in another order
-    np.testing.assert_array_equal(csr['partners'], [1, 0, 3, 2])
-    np.testing.assert_array_equal(csr['self_local'], [4, 2, 1, 3])
-    for half in (slice(0, 8), slice(8, 16)):
-        foreign = {**columns, 'b': columns['b'].copy()}
-        foreign['b'][1, half] = 7
-        with pytest.raises(ValueError, match='not selected'):
-            osi._crossings_from_columns(foreign, uuids)
-
-
-def test_rows_are_found_quickly_among_uuids_sharing_a_prefix():
-    """Sequential UUIDs under one fixed prefix (every track shares the upper
-    half): each lookup is still one binary search, not a walk through them."""
-    import time
-    count = 300_000
-    uuids = np.zeros((count, 16), dtype=np.uint8)
-    uuids[:, :8] = np.frombuffer(bytes(range(16, 24)), dtype=np.uint8)
-    uuids[:, 8:] = np.arange(count, dtype='>u8').view(np.uint8).reshape(count, 8)
-    rows = np.random.default_rng(0).permutation(count)
-    uuids = uuids[rows]  # row order is not UUID order
-    a = np.arange(0, count - 1, dtype=np.int64)
-    first, second = uuids[a], uuids[a + 1]
-    swap = (first.view('S16').ravel() > second.view('S16').ravel())
-    columns = {'a': np.where(swap[:, None], second, first), 'b': np.where(swap[:, None], first, second),
-               'local_a': np.zeros(len(a), dtype=np.int32), 'local_b': np.zeros(len(a), dtype=np.int32),
-               'position_a': np.zeros(len(a)), 'position_b': np.zeros(len(a)),
-               'clearance': np.zeros(len(a))}
-    started = time.monotonic()
-    csr = osi._crossings_from_columns(columns, uuids)
-    assert time.monotonic() - started < 20  # the walk took minutes here
-    degree = np.diff(csr['offsets'])
-    assert degree.sum() == 2 * len(a) and degree.min() == 1 and degree.max() == 2
-    found = set(zip(np.repeat(np.arange(count), degree).tolist(), csr['partners'].tolist()))
-    assert all((row, row + 1) in found and (row + 1, row) in found for row in range(0, count - 1, 997))
-    columns['b'] = columns['b'].copy()
-    columns['b'][12345, 15] ^= 0xff
-    columns['b'][12345, 9] = 0xee  # a low half no track has, under the shared prefix
-    with pytest.raises(ValueError, match='not selected'):
-        osi._crossings_from_columns(columns, uuids)
-
-
-def test_isolated_tracks_keep_their_empty_rows(db, tmp_path, computes):
-    """Tracks without a crossing are rows all the same, from a cache too."""
-    _lattice(db)
-    put_track(db, _line((50, 5, 5), 2, 20), 99, 'horizontal')
-    first, _ = _materialize_tracks(db, cache_directory=str(tmp_path / 'cache'))
-    again, _ = _materialize_tracks(db, cache_directory=str(tmp_path / 'cache'))
-    assert len(computes) == 1 and len(first.crossings['offsets']) == 8
-    assert 0 in np.diff(first.crossings['offsets'])
-    _assert_same_crossings(again.crossings, first.crossings)
-
-
-def _rewrite(db, path, change):
-    """Replaces the cache store by one of a changed CSR, checksum, key or
-    selection: a store that is whole but not this selection's crossings."""
-    tracks, key = _cached_selection(db)
-    csr, sha256 = osi._load_track_crossings(str(path), key, tracks)
-    csr = {name: values.copy() for name, values in csr.items()}
-    if change == 'checksum':
-        csr['positions'] = csr['positions'] + 1.0
-    elif change == 'rows':
-        tracks = tracks[:2]
-        csr = osi._empty_crossings(2)
-    elif change == 'key':
-        key = '0' * 64
-    elif change == 'foreign':
-        # The same crossings between tracks of which one is not selected.
-        tracks = [types.SimpleNamespace(uuid='00000000-0000-4000-8000-000000000001'), *tracks[1:]]
-    path.unlink()
-    osi._store_track_crossings(str(path), key, csr, sha256, tracks)
-    assert path.is_file()
-
-
-def _damage(db, path, damage):
-    data = path.read_bytes()
-    if damage == 'garbage':
-        path.write_bytes(b'not a store at all')
-    elif damage == 'empty':
-        path.write_bytes(b'')
-    elif damage == 'truncated':
-        path.write_bytes(data[:len(data) // 2])
-    elif damage == 'directory':
-        path.unlink()
-        path.mkdir()
-        (path / 'collection.vcobj').write_bytes(b'')
-    else:
-        _rewrite(db, path, damage)
-
-
-@pytest.mark.parametrize('damage', ['garbage', 'empty', 'truncated', 'checksum', 'rows', 'key',
-                                    'foreign'])
-def test_a_damaged_cache_store_is_a_miss_and_is_rebuilt(db, tmp_path, computes, capsys, damage):
-    cache = tmp_path / 'cache'
-    _lattice(db)
-    first, _ = _materialize_tracks(db, cache_directory=str(cache))
-    [cached] = _cache_files(cache)
-    _damage(db, cached, damage)
-    again, _ = _materialize_tracks(db, cache_directory=str(cache))
-    assert len(computes) == 2 and 'ignoring invalid track crossing cache' in capsys.readouterr().out
-    assert again.derived == first.derived
-    _assert_same_crossings(again.crossings, first.crossings)
-    # The bad store was replaced by a good one: the next fit reads it.
-    assert _cache_files(cache) == [cached]
-    third, _ = _materialize_tracks(db, cache_directory=str(cache))
-    assert len(computes) == 2 and 'ignoring' not in capsys.readouterr().out
-    _assert_same_crossings(third.crossings, first.crossings)
-
-
-def test_crossings_that_are_no_table_of_pairs_are_not_cached(db, tmp_path, capsys):
-    _lattice(db)
-    _materialize_tracks(db, cache_directory=str(tmp_path / 'cache'))
-    [cached] = _cache_files(tmp_path / 'cache')
-    tracks, key = _cached_selection(db)
-    csr, sha256 = osi._load_track_crossings(str(cached), key, tracks)
-    lopsided = {**csr, 'clearances': csr['clearances'] + np.arange(len(csr['clearances']))}
-    cached.unlink()
-    osi._store_track_crossings(str(cached), key, lopsided, sha256, tracks)
-    assert not cached.exists() and 'not caching the track crossings' in capsys.readouterr().out
-
-
-def test_an_unusable_cache_does_not_fail_the_fit(db, tmp_path, computes, capsys, monkeypatch):
-    """A cache that cannot be read or written leaves the computed crossings
-    in use; a bad store is deleted only by the process holding the lock."""
-    cache = tmp_path / 'cache'
-    _lattice(db)
-    first, _ = _materialize_tracks(db, cache_directory=str(cache))
-    [cached] = _cache_files(cache)
-    cached.write_bytes(b'not a store at all')
-
-    @contextlib.contextmanager
-    def unlocked(path):
-        yield False
-    with monkeypatch.context() as patch:
-        patch.setattr(osi, '_track_crossing_lock', unlocked)
-        again, _ = _materialize_tracks(db, cache_directory=str(cache))
-    assert len(computes) == 2 and cached.read_bytes() == b'not a store at all'
-    _assert_same_crossings(again.crossings, first.crossings)
-
-    def refuse(*args, **kwargs):
-        raise RuntimeError('the store cannot publish here')
-    import vc_object_store
-    with monkeypatch.context() as patch:
-        patch.setattr(vc_object_store, 'write_track_crossing_store', refuse)
-        third, _ = _materialize_tracks(db, cache_directory=str(cache))
-    assert len(computes) == 3 and not cached.exists()
-    assert 'cannot write the track crossing cache' in capsys.readouterr().out
-    _assert_same_crossings(third.crossings, first.crossings)
-
-
-@pytest.mark.parametrize('stage', ['columns', 'write'])
-def test_a_failed_allocation_while_caching_keeps_the_computed_crossings(
-        db, tmp_path, computes, capsys, monkeypatch, stage):
-    cache = tmp_path / 'cache'
-    _lattice(db)
-    reference_inputs, _ = _materialize_tracks(db)
-
-    def exhausted(*args, **kwargs):
-        raise MemoryError('std::bad_alloc')
-    import vc_object_store
-    with monkeypatch.context() as patch:
-        if stage == 'columns':
-            patch.setattr(osi, '_crossing_columns', exhausted)
-        else:
-            patch.setattr(vc_object_store, 'write_track_crossing_store', exhausted)
-        inputs, _ = _materialize_tracks(db, cache_directory=str(cache))
-    assert len(computes) == 2 and not _cache_files(cache)
-    assert 'cannot write the track crossing cache' in capsys.readouterr().out
-    assert inputs.derived == reference_inputs.derived
-    _assert_same_crossings(inputs.crossings, reference_inputs.crossings)
-
-
-@pytest.mark.parametrize('stage', ['columns', 'rebuild'])
-def test_a_failed_allocation_while_reading_the_cache_is_a_miss(
-        db, tmp_path, computes, capsys, monkeypatch, stage):
-    cache = tmp_path / 'cache'
-    _lattice(db)
-    first, _ = _materialize_tracks(db, cache_directory=str(cache))
-    [cached] = _cache_files(cache)
-    from vc_object_store import CollectionReader
-
-    def store_uuid():
-        # Every import is a new store: its identity, not the file's inode
-        # (which a filesystem may reuse), says the store was replaced.
-        with CollectionReader(str(cached)) as reader:
-            return reader.source['store_uuid']
-    kept = store_uuid()
-    calls = []
-
-    def exhausted(*args, **kwargs):
-        calls.append(1)
-        raise MemoryError('std::bad_alloc')
-    with monkeypatch.context() as patch:
-        if stage == 'columns':
-            patch.setattr(CollectionReader, 'track_crossing_columns', exhausted)
-        else:
-            patch.setattr(osi, '_crossings_from_columns', exhausted)
-        again, _ = _materialize_tracks(db, cache_directory=str(cache))
-    # Both reads of the fit and the one before replacement failed: the fit
-    # computed its crossings, and the store nobody could read was replaced.
-    assert len(computes) == 2 and len(calls) == 3
-    assert 'ignoring invalid track crossing cache' in capsys.readouterr().out
-    _assert_same_crossings(again.crossings, first.crossings)
-    assert _cache_files(cache) == [cached] and store_uuid() != kept
-    third, _ = _materialize_tracks(db, cache_directory=str(cache))
-    assert len(computes) == 2
-    _assert_same_crossings(third.crossings, first.crossings)
-
-
-def test_a_good_store_published_meanwhile_is_not_replaced(db, tmp_path, computes, monkeypatch, capsys):
-    """The process holding the lock found a bad store and computed; a
-    process that could not lock published a good one in the meantime. The
-    replacement re-reads the destination first and keeps it."""
-    cache = tmp_path / 'cache'
-    _lattice(db)
-    first, _ = _materialize_tracks(db, cache_directory=str(tmp_path / 'first'))
-    [good] = _cache_files(tmp_path / 'first')
-    tracks, key = _cached_selection(db)
-    csr, sha256 = osi._load_track_crossings(str(good), key, tracks)
-    path = cache / osi.TRACK_CROSSING_CACHE_DIRECTORY / good.name
-    path.parent.mkdir(parents=True)
-    path.write_bytes(b'not a store at all')
-    compute = osi._compute_track_crossings
-
-    def published_meanwhile(*args, **kwargs):
-        result = compute(*args, **kwargs)
-        path.write_bytes(good.read_bytes())  # the competitor's valid store
-        return result
-    monkeypatch.setattr(osi, '_compute_track_crossings', published_meanwhile)
-    again, _ = _materialize_tracks(db, cache_directory=str(cache))
-    monkeypatch.undo()
-    assert path.read_bytes() == good.read_bytes()  # kept, not rebuilt
-    assert 'cannot write' not in capsys.readouterr().out
-    _assert_same_crossings(again.crossings, first.crossings)
-    # The replace path itself: a bad destination goes, a good one stays.
-    osi._store_track_crossings(str(path), key, csr, sha256, tracks, replace=True)
-    assert path.read_bytes() == good.read_bytes()
-    path.write_bytes(b'not a store at all')
-    osi._store_track_crossings(str(path), key, csr, sha256, tracks, replace=True)
-    assert path.read_bytes() != b'not a store at all'
-    assert osi._load_track_crossings(str(path), key, tracks)[1] == sha256
-
-
-def test_a_process_that_waited_for_the_crossings_reads_them(db, tmp_path, computes, monkeypatch):
-    """Ranks that miss one cache store together: one computes, the rest wait
-    for its store."""
-    from service_files import ExclusiveFileLock
-    _lattice(db)
-    first, _ = _materialize_tracks(db, cache_directory=str(tmp_path / 'first'))
-    [written] = _cache_files(tmp_path / 'first')
-    path = tmp_path / 'cache' / osi.TRACK_CROSSING_CACHE_DIRECTORY / written.name
-    path.parent.mkdir(parents=True)
-    snapshot = osi.read_snapshot(db, osi.InputRequest())
-    result, waiting = [], threading.Event()
-
-    def said(*args, **kwargs):
-        if args and 'waiting for another process' in str(args[0]):
-            waiting.set()
-    monkeypatch.setattr(osi, 'print', said, raising=False)
-    with ExclusiveFileLock(f'{path}.lock'):  # another process computes
-        waiter = threading.Thread(target=lambda: result.append(osi.materialize_tracks(
-            db, snapshot, z_begin=0, z_end=64, cache_directory=str(tmp_path / 'cache'))))
-        waiter.start()
-        assert waiting.wait(30) and not result  # it found the lock held
-        path.write_bytes(written.read_bytes())  # ... and publishes its store
-    waiter.join(30)
-    assert not waiter.is_alive() and len(computes) == 1
-    assert result[0][0].derived == first.derived
-    _assert_same_crossings(result[0][0].crossings, first.crossings)
-
-
-def test_concurrent_writers_leave_one_complete_cache_store(db, tmp_path):
-    _lattice(db)
-    inputs, _ = _materialize_tracks(db, cache_directory=str(tmp_path / 'first'))
-    [written] = _cache_files(tmp_path / 'first')
-    tracks, key = _cached_selection(db)
-    csr, sha256 = osi._load_track_crossings(str(written), key, tracks)
-    path = tmp_path / 'cache' / osi.TRACK_CROSSING_CACHE_DIRECTORY / written.name
-    start = threading.Barrier(8)
-
-    def write():
-        start.wait()
-        for _ in range(5):
-            osi._store_track_crossings(str(path), key, csr, sha256, tracks)
-    writers = [threading.Thread(target=write) for _ in range(8)]
-    for writer in writers:
-        writer.start()
-    for writer in writers:
-        writer.join()
-    assert _cache_files(tmp_path / 'cache') == [path]
-    loaded, loaded_sha256 = osi._load_track_crossings(str(path), key, tracks)
-    assert loaded_sha256 == sha256 == inputs.derived['sha256']
-    for name in CSR_ARRAYS:
-        np.testing.assert_array_equal(loaded[name], csr[name], err_msg=name)
-
-
-def test_a_warm_cache_serves_another_fit_level_and_frame_scale(db, tmp_path, computes):
-    """The cache holds stored voxels: the same file gives another fit level,
-    and tracks redeclared in another frame scale, their own fit voxels."""
-    cache = str(tmp_path / 'cache')
-    tracks = _lattice(db)
-    full, _ = _materialize_tracks(db, cache_directory=cache)
-    assert len(computes) == 1 and full.crossings['positions'].max() > 0
-    half, _ = _materialize_tracks(db, cache_directory=cache, fit_volume_level=1)
-    for uuid in tracks:
-        db.set_meta(uuid, 'coordinates', frame(4))
-    quarter, _ = _materialize_tracks(db, cache_directory=cache)
-    assert len(computes) == 1
-    for scaled, factor in ((half, 0.5), (quarter, 0.25)):
-        assert scaled.derived == full.derived
-        for name in ('offsets', 'partners', 'self_local', 'partner_local'):
-            np.testing.assert_array_equal(scaled.crossings[name], full.crossings[name])
-        for name in ('positions', 'clearances'):
-            np.testing.assert_array_equal(scaled.crossings[name], full.crossings[name] * factor)
-
-
-def test_crossings_do_not_depend_on_the_crossing_limits(db, tmp_path, computes):
-    """The crossings are inputs of the fit, not of its run settings: with
-    both crossing limits 0 they are computed and recorded all the same, so
-    changing the limits later leaves the fit's inputs as they were."""
-    cache = tmp_path / 'cache'
-    _lattice(db, z=40)
-    config = {**reference.fit_config(), 'input_use_tracks': True}
-    snapshot = osi.read_snapshot(db, osi.request_from_config(config))
-
-    def tracks(precompute, per_step):
-        return osi.materialize_from_config(db, snapshot, {
-            **config, 'track_crossing_precompute_max': precompute,
-            'track_max_track_crossing_per_step': per_step}, str(cache))
-    off, on = tracks(0, 0), tracks(8, 2)
-    assert off.counts['track crossings'] == on.counts['track crossings'] == 9
-    assert len(computes) == 1
-    assert off.tracks.derived == on.tracks.derived and off.tracks.derived['source'] == 'computed'
-
-
-# ---------------------------------------------------------------------------
-# Manifest, identity and the link refresh
+# Manifest and identity
 # ---------------------------------------------------------------------------
 
 def _track_store(path, lattice=True):
@@ -911,58 +291,18 @@ def _load(path, **overrides):
                                log=lambda line: None)
 
 
-def test_the_manifest_records_the_derived_crossings(tmp_path):
-    inputs = _load(_track_store(tmp_path / 'fit.vcobj'))
-    derived = inputs.manifest['derived_inputs']['track_crossing']
-    assert derived == inputs.tracks.derived
-    assert derived['source'] == 'computed' and derived['count'] == 9 and len(derived['sha256']) == 64
-    assert derived['algorithm'] == tracks_module.TRACK_CROSSING_ALGORITHM
-    assert derived['parameters'] == tracks_module.TRACK_CROSSING_PARAMETERS
-    summary = osi.input_summary(inputs)
-    assert summary['constraints']['track crossings'] == 9
-    assert 'track crossings 9' in '\n'.join(inputs.report())
-    assert not any('track_crossing' in line for line in inputs.report())
-    # Tracks without a crossing record a count of zero; no tracks, nothing.
-    lone = _load(_track_store(tmp_path / 'lone.vcobj', lattice=False))
-    assert lone.manifest['derived_inputs']['track_crossing']['count'] == 0
-    assert len(lone.manifest['derived_inputs']['track_crossing']['sha256']) == 64
-    none = osi.load_fit_inputs(fit_config(tmp_path / 'fit.vcobj'), log=lambda line: None)
-    assert none.tracks is None and 'derived_inputs' not in none.manifest
-
-
-def test_the_fit_caches_its_crossings_under_its_cache(tmp_path, computes):
-    path = _track_store(tmp_path / 'fit.vcobj')
-    cache = tmp_path / 'cache'
-    first = osi.load_fit_inputs(fit_config(path, input_use_tracks=True), log=lambda line: None,
-                                cache_directory=str(cache))
-    [cached] = _cache_files(cache)
-    again = osi.load_fit_inputs(fit_config(path, input_use_tracks=True), log=lambda line: None,
-                                cache_directory=str(cache))
-    assert len(computes) == 1 and again.digest == first.digest
-    assert _cache_files(cache) == [cached]
-
-
-def test_derived_crossings_identify_the_tracks_of_a_fit(tmp_path):
+def test_the_track_identity_of_a_fit(tmp_path):
     path = _track_store(tmp_path / 'fit.vcobj')
     inputs = _load(path)
     again = _load(path)
     assert osi.track_identity(again.manifest) == osi.track_identity(inputs.manifest)
-    assert osi.track_identity(inputs.manifest)['derived']['count'] == 9
-    assert len(osi.track_identity(inputs.manifest)['objects']) == 6
-    # Other derived crossings of the same tracks are other inputs.
-    changed = {**inputs.manifest, 'derived_inputs': {'track_crossing': {
-        **inputs.manifest['derived_inputs']['track_crossing'], 'sha256': '0' * 64}}}
-    assert osi.track_identity(changed) != osi.track_identity(inputs.manifest)
-    assert osi.manifest_digest(changed) != inputs.digest
-    assert osi.manifest_differences(inputs.manifest, changed) == ['derived_inputs.track_crossing']
-    limits = _load(path, track_crossing_precompute_max=0, track_max_track_crossing_per_step=0)
-    assert osi.track_identity(limits.manifest) == osi.track_identity(inputs.manifest)
+    assert len(osi.track_identity(inputs.manifest)) == 6
+    assert 'derived_inputs' not in inputs.manifest
 
 
-def test_a_fit_prepares_store_tracks_with_their_crossings(db, tmp_path):
-    """A fit reads the tracks, computes their crossings, builds its crossing
-    graph and prepares the crossing index from it, after point exclusion as
-    well."""
+def test_a_fit_prepares_store_tracks(db, tmp_path):
+    """A fit reads the tracks and prepares them, with and without point
+    exclusion."""
     from config import FitConfig
     from fit_session import SpiralInputPaths
     from fit_spiral import FitContext
@@ -988,16 +328,12 @@ def test_a_fit_prepares_store_tracks_with_their_crossings(db, tmp_path):
     context.load_host_inputs()
     assert isinstance(context.tracks, PackedTrackCollection)
     assert len(context.tracks) == 6
-    assert context.track_graph.edge_count == 9
     for radius in (0.0, 2.0):
         prepared = prepare_main_phase_tracks(
             context.tracks, None, radius, 'cpu',
             anchor_tree=context.trusted_geometry_tree,
-            sampling_config=context.track_sampling_config,
-            track_families=context.track_families,
-            track_source_ids=context.track_source_ids,
-            track_graph=context.track_graph)
-        assert int(prepared['crossing_index_stats']['directed_crossings']) == 18
+            sampling_config=context.track_sampling_config)
+        assert prepared['lengths'].numel() == 6
 
     # Switched off, the fit reads no tracks even when they were materialized.
     off = dataclasses.replace(inputs)
@@ -1007,4 +343,4 @@ def test_a_fit_prepares_store_tracks_with_their_crossings(db, tmp_path):
         paths=SpiralInputPaths(umbilicus=umbilicus),
         cache_dir=str(tmp_path / 'cache'), object_store_inputs=off)
     context.load_host_inputs()
-    assert context.tracks is None and context.track_graph is None
+    assert context.tracks is None

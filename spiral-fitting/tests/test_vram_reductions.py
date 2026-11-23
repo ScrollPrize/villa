@@ -13,15 +13,13 @@ from flow_fields import CartesianFlowField, CylindricalFlowField, sample_field
 from checkpoint_io import load_checkpoint_cpu
 from tifxyz import Patch
 from transforms import SpiralAndTransform
-from track_graph import TrackGraph
 from tracks import (
-    _build_crossing_partner_csr,
-    _grouped_same_radius_loss,
     _pack_track_points,
+    _per_track_radius_loss,
     _sample_prepared_track_points,
     configure_prepared_track_sampling,
     filter_tracks_to_outer_shell,
-    iter_track_losses,
+    get_track_radius_loss,
     prepare_main_phase_tracks,
     validate_track_sampling_config,
 )
@@ -684,14 +682,12 @@ class CpuTrackStorageTests(unittest.TestCase):
         crossing = np.array([[10, 6, 0], [10, 4, 0]], dtype=np.float32)
         outside = np.array([[10, 6, 0], [10, 7, 0]], dtype=np.float32)
 
-        tracks, families = filter_tracks_to_outer_shell(
-            [inside, crossing, outside], RadiusFiveShell(),
-            ['horizontal', 'vertical', 'vertical'], max_points_per_chunk=2)
+        tracks = filter_tracks_to_outer_shell(
+            [inside, crossing, outside], RadiusFiveShell(), max_points_per_chunk=2)
 
         self.assertEqual(len(tracks), 2)
         np.testing.assert_array_equal(tracks[0], inside)
         np.testing.assert_array_equal(tracks[1], crossing)
-        self.assertEqual(families, ['horizontal', 'vertical'])
 
     def test_zero_exclusion_fast_path_drops_short_tracks_without_reordering(self):
         tracks = [
@@ -724,7 +720,6 @@ class CpuTrackStorageTests(unittest.TestCase):
             sampling_config={
                 'track_length_bin_weights': None,
                 'track_max_tortuosity': None,
-                'track_max_track_crossing_per_step': 0,
             },
         )
 
@@ -734,8 +729,7 @@ class CpuTrackStorageTests(unittest.TestCase):
         configured_sample = _sample_prepared_track_points(configured, 3, 4)
         for key in (
                 'track_idx', 'sampled_scroll', 'row_id', 'row_starts',
-                'row_lengths', 'group_id', 'target_flat_idx',
-                'target_source_idx'):
+                'row_lengths', 'target_flat_idx'):
             torch.testing.assert_close(configured_sample[key], legacy_sample[key])
 
     def test_short_tracks_preserve_endpoints_without_forcing_target_count(self):
@@ -793,7 +787,6 @@ class CpuTrackStorageTests(unittest.TestCase):
             sampling_config={
                 'track_length_bin_weights': [0.15, 0.25, 0.60],
                 'track_max_tortuosity': None,
-                'track_max_track_crossing_per_step': 0,
             },
         )
 
@@ -846,129 +839,6 @@ class CpuTrackStorageTests(unittest.TestCase):
         self.assertEqual(filtered['lengths'].numel(), 1)
         np.testing.assert_array_equal(filtered['flat_zyx_cpu'].numpy(), straight)
 
-    @staticmethod
-    def _crossings(tracks, families):
-        """The crossing graph a fit builds from the store's crossing links,
-        here found by Spiral's own exact-crossing builder."""
-        csr = _build_crossing_partner_csr(tracks, families)
-        return {'track_families': families, 'track_source_ids': csr['source_ids'],
-                'track_graph': TrackGraph(csr)}
-
-    def test_crossing_partners_are_sampled_from_all_exact_partners(self):
-        primary = self._line_track(20, z=10, y=10, axis=2)
-
-        def vertical_at(x):
-            track = np.zeros((21, 3), dtype=np.float32)
-            track[:, 0] = 10
-            track[:, 1] = np.arange(21, dtype=np.float32)
-            track[:, 2] = x
-            return track
-
-        tracks = [
-            primary,
-            vertical_at(4),
-            vertical_at(10),
-            vertical_at(16),
-            primary.copy(),  # Opposite provenance, but parallel: reject it.
-        ]
-        prepared = prepare_main_phase_tracks(
-            tracks, None, 0.0, 'cpu',
-            sampling_config={
-                'track_length_bin_weights': None,
-                'track_max_tortuosity': None,
-                'track_crossing_precompute_max': 2,
-                'track_max_track_crossing_per_step': 2,
-            },
-            **self._crossings(
-                tracks, ['horizontal', 'vertical', 'vertical', 'vertical', 'vertical']),
-        )
-
-        self.assertIn('crossing_index', prepared)
-        self.assertEqual(
-            int(prepared['crossing_index_stats']['directed_crossings']), 6)
-
-        configure_prepared_track_sampling(prepared, {
-            'track_max_track_crossing_per_step': 1,
-        })
-
-        # Force primary track zero so the first draw uses the Run-scoped limit.
-        prepared['sampling_probabilities'] = torch.tensor([1., 0., 0., 0., 0.])
-        torch.manual_seed(123)
-        first = _sample_prepared_track_points(prepared, 1, 4)
-        torch.manual_seed(123)
-        repeated = _sample_prepared_track_points(prepared, 1, 4)
-        np.testing.assert_array_equal(
-            first['track_idx'].numpy(), repeated['track_idx'].numpy())
-        self.assertEqual(first['track_idx'][0], 0)
-        self.assertIn(int(first['track_idx'][1]), {1, 2, 3})
-        sample = first
-        self.assertEqual(sample['row_lengths'].shape, (2,))
-        self.assertEqual(sample['group_id'].tolist(), [0, 0])
-        self.assertEqual(sample['group_width'], 2)
-
-        configure_prepared_track_sampling(prepared, {
-            'track_max_track_crossing_per_step': 2,
-        })
-        sample = _sample_prepared_track_points(prepared, 1, 4)
-        self.assertEqual(sample['track_idx'][0], 0)
-        self.assertEqual(len(set(sample['track_idx'][1:].tolist())), 2)
-        self.assertTrue(set(sample['track_idx'][1:].tolist()) <= {1, 2, 3})
-        self.assertEqual(sample['group_width'], 3)
-        for primary_flat, partner_flat in zip(
-                sample['primary_cross_flat'], sample['partner_cross_flat']):
-            torch.testing.assert_close(
-                sample['sampled_scroll'][primary_flat],
-                sample['sampled_scroll'][partner_flat],
-            )
-
-        configure_prepared_track_sampling(prepared, {
-            'track_max_track_crossing_per_step': 1,
-        })
-        observed = set()
-        for seed in range(32):
-            torch.manual_seed(seed)
-            draw = _sample_prepared_track_points(prepared, 1, 4)
-            observed.add(int(draw['track_idx'][1]))
-        self.assertEqual(observed, {1, 2, 3})
-
-    def test_crossing_index_uses_first_local_index_for_repeated_voxel(self):
-        horizontal = np.array([
-            [10, 10, 0],
-            [10, 10, 1],
-            [10, 10, 2],
-            [10, 10, 1],
-            [10, 10, 2],
-            [10, 10, 3],
-        ], dtype=np.float32)
-        vertical = np.array([
-            [10, 8, 2],
-            [10, 9, 2],
-            [10, 10, 2],
-            [10, 11, 2],
-            [10, 12, 2],
-        ], dtype=np.float32)
-        same_family = vertical.copy()
-        tracks = [horizontal, vertical, same_family]
-        prepared = prepare_main_phase_tracks(
-            tracks, None, 0.0, 'cpu',
-            sampling_config={
-                'track_crossing_precompute_max': 1,
-                'track_max_track_crossing_per_step': 1,
-            },
-            **self._crossings(tracks, ['horizontal', 'vertical', 'vertical']),
-        )
-
-        self.assertEqual(
-            int(prepared['crossing_index_stats']['directed_crossings']), 4)
-        prepared['sampling_probabilities'] = torch.tensor([1., 0., 0.])
-        sample = _sample_prepared_track_points(prepared, 1, 4)
-        self.assertEqual(sample['track_idx'][0], 0)
-        self.assertIn(int(sample['track_idx'][1]), {1, 2})
-        torch.testing.assert_close(
-            sample['sampled_scroll'][sample['primary_cross_flat'][0]],
-            sample['sampled_scroll'][sample['partner_cross_flat'][0]],
-        )
-
     def test_track_point_packing_is_chunk_independent(self):
         points = np.array([
             [0, 0, 0],
@@ -985,24 +855,52 @@ class CpuTrackStorageTests(unittest.TestCase):
         np.testing.assert_array_equal(
             _pack_track_points(points, chunk_size=len(points)), expected)
 
-    def test_crossing_group_uses_one_radius_target_for_both_tracks(self):
-        shifted = torch.tensor([0., 0., 10., 10.])
-        target_values = shifted.reshape(2, 2)
-        row_id = torch.tensor([0, 0, 1, 1])
-        group_id = torch.tensor([0, 0])
-        row_slot = torch.tensor([0, 1])
+    def test_each_sampled_track_has_its_own_radius_target(self):
+        shifted = torch.tensor([0., 0., 10., 10., 0., 10.])
+        row_id = torch.tensor([0, 0, 1, 1, 2, 2])
+        target_values = shifted.reshape(3, 2)
         cfg = {
             'track_radius_target': 'mean',
             'track_radius_loss_margin': 0.0,
             'track_radius_within_norm_p': 1.0,
         }
 
-        loss, targets, _ = _grouped_same_radius_loss(
-            shifted, target_values, row_id, group_id, row_slot,
-            1, 2, torch.tensor(10.0), cfg)
+        loss, targets, _ = _per_track_radius_loss(
+            shifted, target_values, row_id, torch.tensor(10.0), cfg)
 
-        torch.testing.assert_close(targets, torch.tensor([5.0]))
-        torch.testing.assert_close(loss, torch.tensor(5.0))
+        torch.testing.assert_close(targets, torch.tensor([0.0, 10.0, 5.0]))
+        torch.testing.assert_close(loss, torch.tensor(5.0 / 3))
+
+    def test_track_radius_loss_backpropagates_and_respects_its_margin(self):
+        offset = torch.tensor(0.0, requires_grad=True)
+        # A radial track: one angle, radius 40..70, so its shifted radii differ.
+        track = np.stack([
+            np.full(31, 10.0), np.zeros(31), np.arange(40.0, 71.0)],
+            axis=-1).astype(np.float32)
+        prepared = prepare_main_phase_tracks([track], None, 0.0, 'cpu')
+        config = {
+            'sample_count_tracks_per_step': 1,
+            'sample_count_track_points_per_step': 4,
+            'track_radius_loss_margin': 0.025,
+            'track_radius_target': 'mean',
+            'track_radius_within_norm_p': 3.0,
+            'track_min_sample_spacing': 5.0,
+            'track_max_sample_spacing': 10.0,
+        }
+        dr = torch.tensor(20.0)
+
+        loss = get_track_radius_loss(
+            lambda points: points * (1.0 + offset), dr, prepared, config)
+        loss.backward()
+        self.assertGreater(float(loss), 0.0)
+        self.assertTrue(torch.isfinite(offset.grad))
+        self.assertNotEqual(float(offset.grad), 0.0)
+
+        tolerant = get_track_radius_loss(
+            lambda points: points, dr, prepared,
+            {**config, 'track_radius_loss_margin': 10.0,
+             'track_radius_within_norm_p': 1.0})
+        self.assertEqual(float(tolerant), 0.0)
 
     def test_sampling_policy_defaults_to_20_and_60_voxel_spacing(self):
         policy = validate_track_sampling_config({})
@@ -1014,12 +912,6 @@ class CpuTrackStorageTests(unittest.TestCase):
             validate_track_sampling_config({'track_length_bin_weights': [1, 2]})
         with self.assertRaisesRegex(ValueError, '>= 1'):
             validate_track_sampling_config({'track_max_tortuosity': 0.9})
-        with self.assertRaisesRegex(ValueError, 'non-negative integer'):
-            validate_track_sampling_config({'track_max_track_crossing_per_step': 1.5})
-        with self.assertRaisesRegex(ValueError, 'non-negative integer'):
-            validate_track_sampling_config({
-                'track_crossing_precompute_max': -1,
-            })
         with self.assertRaisesRegex(ValueError, 'finite number > 0'):
             validate_track_sampling_config({'track_max_sample_spacing': 0})
         with self.assertRaisesRegex(ValueError, 'finite number > 0'):
@@ -1029,60 +921,6 @@ class CpuTrackStorageTests(unittest.TestCase):
                 'track_min_sample_spacing': 61,
                 'track_max_sample_spacing': 60,
             })
-
-    def test_staged_track_backward_matches_combined_backward(self):
-        class Translation:
-            def __init__(self, parameter, sign=1.0):
-                self.parameter = parameter
-                self.sign = sign
-
-            def __call__(self, points):
-                return points + self.parameter * self.sign
-
-            @property
-            def inv(self):
-                return Translation(self.parameter, -self.sign)
-
-        tracks = [
-            np.array([[1, 5, 8], [2, 6, 9], [3, 7, 10], [4, 8, 11]], dtype=np.float32),
-            np.array([[5, 9, 12], [6, 10, 13], [7, 11, 14], [8, 12, 15]], dtype=np.float32),
-        ]
-        prepared = prepare_main_phase_tracks(tracks, None, 0.0, 'cpu')
-        config = {
-            'sample_count_tracks_per_step': 2,
-            'sample_count_track_points_per_step': 4,
-            'track_radius_loss_margin': 0.025,
-            'track_radius_target': 'mean',
-            'track_radius_within_norm_p': 3.0,
-            'track_dt_loss_margin': 0.025,
-            'track_dt_within_track_norm_p': 3.0,
-            'track_dt_norm_p': 0.5,
-        }
-        dr = torch.tensor(10.0)
-
-        combined_parameter = torch.tensor(0.2, requires_grad=True)
-        torch.manual_seed(12)
-        combined_parts = list(iter_track_losses(
-            Translation(combined_parameter), dr, prepared, config, compute_dt=True,
-        ))
-        sum(value for _, value in combined_parts).backward()
-
-        staged_parameter = torch.tensor(0.2, requires_grad=True)
-        torch.manual_seed(12)
-        staged_parts = []
-        for name, value in iter_track_losses(
-            Translation(staged_parameter), dr, prepared, config, compute_dt=True,
-        ):
-            staged_parts.append((name, value.detach()))
-            value.backward()
-
-        self.assertEqual([name for name, _ in staged_parts], ['track_radius', 'track_dt'])
-        torch.testing.assert_close(
-            torch.stack([value for _, value in staged_parts]),
-            torch.stack([value.detach() for _, value in combined_parts]),
-        )
-        torch.testing.assert_close(staged_parameter.grad, combined_parameter.grad)
-
 
 class LazyPatchCacheTests(unittest.TestCase):
     def test_large_derived_tensors_are_lazy_and_releasable(self):

@@ -2,8 +2,7 @@
 """Build an exact-crossing CSR sidecar beside a Spiral tracks DBM.
 
 The default output is ``TRACKS_DBM.crossings.npz``, which
-``grow_track_graph.py`` reads. (A fit takes its crossings from the object
-store's track-crossing links instead.)
+``grow_track_graph.py`` reads. (A fit uses no track crossings.)
 
 Example:
 

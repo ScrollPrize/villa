@@ -100,7 +100,6 @@ def _session(completed=5):
     session._preview_manifest = None
     session._preview_generation = 0
     session._run_config = None
-    session._run_config_limits = None
     session._default_advanced_config = None
     return session
 
