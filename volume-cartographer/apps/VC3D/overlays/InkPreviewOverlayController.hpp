@@ -196,6 +196,7 @@ private:
     std::optional<InFlight> _flight;
     quint64 _nextFlightId{0};
     bool _rerun{false};
+    bool _sampling{false};  // one sampling worker at a time: each may build a whole layer surface
     std::shared_ptr<InkPreviewSnapshot> _snapshot;
     int _requestsStarted{0};
     QRect _lastRequested;

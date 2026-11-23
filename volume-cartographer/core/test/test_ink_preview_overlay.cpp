@@ -128,7 +128,7 @@ public:
     void setNormalMaxArrows(int) override {}
 
     const CompositeRenderSettings& compositeRenderSettings() const override { return compositeSettings_; }
-    bool isCompositeEnabled() const override { return false; }
+    bool isCompositeEnabled() const override { return compositeSettings_.enabled; }
     bool isPlaneCompositeEnabled() const override { return false; }
     void setCompositeRenderSettings(const CompositeRenderSettings& settings) override { compositeSettings_ = settings; }
     void setVolumeWindow(float, float) override {}
@@ -857,6 +857,95 @@ TEST_CASE("a server whose 409 depth disagrees with its health is asked once more
     CHECK(previewCount.load() == 3);
     CHECK(healthCount.load() == 2);
     CHECK(preview.statusText().contains(QStringLiteral("but asks for 7")));
+}
+
+TEST_CASE("the volumetric composite hides the preview, and the flat view resumes it")
+{
+    Scene scene;
+    ProbePreviewController preview(&scene.state);
+    preview.setHealthForTesting(testHealth());
+    preview.setLevelsForTesting("preview-volume", {{0, 1.0f, 9.0}});
+    preview.setEnabled(true);
+    preview.images(&scene.viewer);
+    preview.showForTesting(&scene.viewer, QRect(0, 0, 100, 50), cv::Mat_<uint8_t>(50, 100, uint8_t(200)));
+    REQUIRE(preview.images(&scene.viewer).size() == 1);
+
+    CompositeRenderSettings volumetric;
+    volumetric.enabled = true;
+    volumetric.params.volumetric = true;
+    scene.viewer.setCompositeRenderSettings(volumetric);
+    CHECK(preview.images(&scene.viewer).empty());
+    preview.settleForTesting();
+    CHECK(preview.statusText().contains(QStringLiteral("volumetric")));
+
+    scene.viewer.setCompositeRenderSettings({});
+    preview.images(&scene.viewer);
+    CHECK(preview.settlePendingForTesting());
+    preview.setEnabled(false);
+}
+
+TEST_CASE("a view that changed while a request failed is requested next")
+{
+    using vc::test::LoopbackHttpServer;
+    Scene scene;
+    bool sampleFails = false;
+    SUBCASE("the server fails") {}
+    SUBCASE("sampling fails")
+    {
+        sampleFails = true;
+        const fs::path meta = scene.data.root / "ct.zarr" / "0" / ".zarray";
+        std::ifstream in(meta);
+        auto zarray = nlohmann::json::parse(in);
+        in.close();
+        zarray["dtype"] = "<f4";
+        std::ofstream(meta) << zarray.dump();
+    }
+    std::mutex mutex;
+    std::vector<std::string> xs;
+    LoopbackHttpServer server;
+    server.setHandler([&](const LoopbackHttpServer::Request& request) -> std::optional<LoopbackHttpServer::Response> {
+        LoopbackHttpServer::Response response;
+        if (request.path == "/health") {
+            response.body = R"({"service": "ink-preview", "api": 1, "backend": "fake", "model": "test-model",)"
+                            R"( "patch": 64, "stride": 32, "depth": 5, "voxel_um": 9.0, "max_view_px": 16777216})";
+            return response;
+        }
+        {
+            std::lock_guard lock(mutex);
+            xs.push_back(request.query.at("x"));
+        }
+        QThread::msleep(300);
+        if (sampleFails) {
+            response.status = 409;
+            response.body = nlohmann::json{{"need", {{"x", std::stoi(request.query.at("x"))},
+                                                     {"y", std::stoi(request.query.at("y"))},
+                                                     {"w", std::stoi(request.query.at("w"))},
+                                                     {"h", std::stoi(request.query.at("h"))}}},
+                                           {"depth", kDepth}, {"missing", 1}}
+                                .dump();
+        } else {
+            response.status = 500;
+            response.body = R"({"error": "failed"})";
+        }
+        return response;
+    });
+    const auto requests = [&] {
+        std::lock_guard lock(mutex);
+        return xs;
+    };
+    ProbePreviewController preview(&scene.state);
+    preview.clientForTesting()->setServerUrl(QUrl(QString::fromStdString(server.url())));
+    preview.setEnabled(true);
+    REQUIRE(waitFor([&] { return preview.health().has_value(); }));
+    preview.setLevelsForTesting("preview-volume", {{0, 1.0f, 9.0}});
+    preview.images(&scene.viewer);
+    REQUIRE(waitFor([&] { return requests().size() == 1; }));
+
+    // A pan that still overlaps the running request waits for it, and its failure.
+    scene.viewer.setCamera(2.0, QPointF(-200.0, 0.0));
+    preview.images(&scene.viewer);
+    REQUIRE(waitFor([&] { return requests().size() == 2; }, 3000));
+    CHECK(requests()[1] != requests()[0]);
 }
 
 // The ctest test_ink_preview_overlay_server (--server): one preview from the server

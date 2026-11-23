@@ -23,8 +23,6 @@
 #include <bit>
 #include <cmath>
 #include <cstring>
-#include <map>
-#include <mutex>
 #include <stdexcept>
 #include <utility>
 
@@ -41,6 +39,19 @@ constexpr int kMaxKeyLength = 200;
 vc::RenderLevelMap levelMap(const OpenedVolumes::Level& opened, int level)
 {
     return level == 0 ? vc::RenderLevelMap{} : vc::renderLevelMap(opened.working, opened.array->placement);
+}
+
+// A remote scan keeps its ID at every working level, while its levels are numbered from the working level.
+std::string workingVolumeId(const Volume& volume)
+{
+    const int base = volume.baseScaleLevel();
+    return base == 0 ? volume.id() : volume.id() + "#vc-base-scale=" + std::to_string(base);
+}
+
+// The volumetric composite draws the surface through a camera that the canvas placement does not follow.
+bool volumetricView(VolumeViewerBase* viewer)
+{
+    return viewer->isCompositeEnabled() && viewer->compositeRenderSettings().params.volumetric;
 }
 
 bool sampleableType(const vcr::ElementType& type)
@@ -64,16 +75,16 @@ struct Sampled {
 // A copy of the segmentation surface's grid taken on the GUI thread, which workers
 // sample while the user goes on editing the original. The copy has the stored
 // surface's origin (an origin moved in memory does not move the canvas); its layer
-// surface is built once per level of one volume, on a worker. A level's layer surface
-// holds that volume's placement of the level, so another volume takes another
+// surface is built for one level of one volume at a time, on a worker. A level's layer
+// surface holds that volume's placement of the level, so another volume takes another
 // snapshot (which shares the copy of the grid).
 struct InkPreviewSnapshot {
     std::string surfaceId;
     quint64 edit = 0;
     std::string volumeId;
     std::shared_ptr<const QuadSurface> surface;
-    std::mutex mutex;
-    std::map<int, std::shared_ptr<const vc::RenderSurface>> layers;
+    int level = 0;
+    std::shared_ptr<const vc::RenderSurface> layers;
 };
 
 namespace {
@@ -97,17 +108,15 @@ Sampled sampleLayers(const std::shared_ptr<OpenedVolumes>& opened,
         if (array.meta.shape.size() != 3 || !sampleableType(array.meta.type)) {
             throw std::runtime_error("the live preview samples 3-D uint8 or uint16 volumes");
         }
-        std::shared_ptr<const vc::RenderSurface> layers;
-        {
-            std::lock_guard lock(snapshot->mutex);
-            auto& slot = snapshot->layers[level];
-            if (!slot) {
-                slot = std::make_shared<const vc::RenderSurface>(vc::renderSurface(
-                    *snapshot->surface, vcr::grid::Interpolation::Bicubic, 1.0f, false, vcr::catalog::Affine{},
-                    levelMap(opened_level, level)));
-            }
-            layers = slot;
+        // One worker samples at a time, so the snapshot's layer surface needs no lock.
+        if (!snapshot->layers || snapshot->level != level) {
+            snapshot->layers.reset();  // before the build: one level's surface at the peak
+            snapshot->layers = std::make_shared<const vc::RenderSurface>(vc::renderSurface(
+                *snapshot->surface, vcr::grid::Interpolation::Bicubic, 1.0f, false, vcr::catalog::Affine{},
+                levelMap(opened_level, level)));
+            snapshot->level = level;
         }
+        const auto layers = snapshot->layers;
         // The level alone: no coarser level, no GPU reader, and its placement is in `layers`.
         vcr::grid::Level plain;
         plain.array = array.array.get();
@@ -266,7 +275,7 @@ std::optional<InkPreviewOverlayController::Frame> InkPreviewOverlayController::f
 {
     const auto volume = viewer ? viewer->currentVolume() : nullptr;
     const auto level = resolvedLevel();
-    if (!_health || !volume || volume->id() != _levelsVolumeId || !level) {
+    if (!_health || !volume || workingVolumeId(*volume) != _levelsVolumeId || !level) {
         return std::nullopt;
     }
     const auto info = std::find_if(_levels.begin(), _levels.end(), [&](const LevelInfo& l) { return l.level == *level; });
@@ -279,7 +288,7 @@ std::optional<InkPreviewOverlayController::Frame> InkPreviewOverlayController::f
 
     Frame frame;
     frame.surfaceId = surface.id;
-    frame.volumeId = volume->id();
+    frame.volumeId = workingVolumeId(*volume);
     frame.level = *level;
     // The canvas of vc_render_tifxyz --scale 1 --group-idx level: its render scale is the
     // level's voxel scale, as the tool computes it.
@@ -347,6 +356,14 @@ void InkPreviewOverlayController::collectPrimitives(VolumeViewerBase* viewer, Ov
     }
     auto* surface = dynamic_cast<QuadSurface*>(viewer->currentSurface());
     _target = viewer;
+    if (volumetricView(viewer)) {
+        const QString volumetric = QStringLiteral("volumetric");
+        if (_seenKey != volumetric) {
+            _seenKey = volumetric;
+            _settle->start();
+        }
+        return;
+    }
     const auto frame = frameFor(viewer, *surface);
 
     // A change of what is on screen restarts the settle timer; the request starts when it fires.
@@ -406,6 +423,7 @@ void InkPreviewOverlayController::setEnabled(bool enabled)
         _health.reset();
         _depthRecheckKey.clear();
         _shown.reset();
+        _snapshot.reset();
         _seenKey.clear();
         setStatus({});
     }
@@ -546,7 +564,7 @@ void InkPreviewOverlayController::ensureHealth()
 
 void InkPreviewOverlayController::ensureLevels(const std::shared_ptr<Volume>& volume)
 {
-    const std::string id = volume->id();
+    const std::string id = workingVolumeId(*volume);
     if (_levelsPendingId == id) {
         return;
     }
@@ -591,8 +609,9 @@ void InkPreviewOverlayController::startRequest()
         return;
     }
     auto* surface = dynamic_cast<QuadSurface*>(viewer->currentSurface());
-    if (viewer->isCompositeEnabled() && viewer->compositeRenderSettings().params.volumetric) {
+    if (volumetricView(viewer)) {
         cancelFlight();
+        dropShown();
         setStatus(tr("The live preview is not drawn in the volumetric view."));
         return;
     }
@@ -601,7 +620,7 @@ void InkPreviewOverlayController::startRequest()
         setStatus(tr("No volume is open."), true);
         return;
     }
-    if (volume->id() != _levelsVolumeId) {
+    if (workingVolumeId(*volume) != _levelsVolumeId) {
         ensureLevels(volume);
         return;
     }
@@ -643,6 +662,10 @@ void InkPreviewOverlayController::startRequest()
         cancelFlight();
     }
     if (_shown && _shown->frame.key == frame->key && _shown->reversed == _reversed && _shown->rect.contains(*visible)) {
+        return;
+    }
+    if (_sampling) {
+        // A cancelled request's worker is still sampling; it restarts the settle timer when done.
         return;
     }
 
@@ -717,7 +740,7 @@ void InkPreviewOverlayController::onReply(quint64 id, const InkPreviewClient::Re
         }
         if (_flight->uploads >= 2) {
             setStatus(tr("The server asked again for layers it was sent; its cache may be too small for the view."), true);
-            finishFlight(false);
+            finishFlight(true);
             return;
         }
         sampleNeed(reply.need);
@@ -729,7 +752,7 @@ void InkPreviewOverlayController::onReply(quint64 id, const InkPreviewClient::Re
             _health.reset();
         }
         setStatus(reply.error, true);
-        finishFlight(false);
+        finishFlight(true);
         return;
     }
 }
@@ -741,7 +764,7 @@ void InkPreviewOverlayController::sampleNeed(const QRect& need)
     const auto volume = surface ? viewer->currentVolume() : nullptr;
     const auto opened = _state ? _state->openedVolumes() : nullptr;
     if (!surface || !volume || !opened || surface->id != _flight->frame.surfaceId ||
-        volume->id() != _flight->frame.volumeId || _edit != _flight->edit) {
+        workingVolumeId(*volume) != _flight->frame.volumeId || _edit != _flight->edit) {
         // The voxels under the view changed while the server answered: ask again for the new ones.
         cancelFlight();
         _settle->start();
@@ -749,12 +772,12 @@ void InkPreviewOverlayController::sampleNeed(const QRect& need)
     }
 
     if (_snapshot && _snapshot->surfaceId == surface->id && _snapshot->edit == _edit &&
-        _snapshot->volumeId != volume->id()) {
+        _snapshot->volumeId != _flight->frame.volumeId) {
         // The same grid on another volume: its levels are placed differently.
         auto snapshot = std::make_shared<InkPreviewSnapshot>();
         snapshot->surfaceId = _snapshot->surfaceId;
         snapshot->edit = _snapshot->edit;
-        snapshot->volumeId = volume->id();
+        snapshot->volumeId = _flight->frame.volumeId;
         snapshot->surface = _snapshot->surface;
         _snapshot = std::move(snapshot);
     }
@@ -770,7 +793,7 @@ void InkPreviewOverlayController::sampleNeed(const QRect& need)
         auto snapshot = std::make_shared<InkPreviewSnapshot>();
         snapshot->surfaceId = surface->id;
         snapshot->edit = _edit;
-        snapshot->volumeId = volume->id();
+        snapshot->volumeId = _flight->frame.volumeId;
         snapshot->surface = std::move(copy);
         _snapshot = std::move(snapshot);
     }
@@ -787,18 +810,23 @@ void InkPreviewOverlayController::sampleNeed(const QRect& need)
                   .arg(need.height())
                   .arg(offsets.size())
                   .arg(level));
+    _sampling = true;
     runInBackground<Sampled>(this,
         [opened, volume, level, snapshot, canvas, pixels, offsets, cancel]() {
             return sampleLayers(opened, volume, level, snapshot, canvas, pixels, offsets, cancel);
         },
         [this, id, need](Sampled sampled) {
+            _sampling = false;
             if (!_flight || _flight->id != id) {
+                if (_enabled) {
+                    _settle->start();
+                }
                 return;
             }
             if (!sampled.error.isEmpty()) {
                 // Nothing new is drawn: no fill and no other level stands in for chunks that could not be read.
                 setStatus(tr("Could not sample the layers: %1").arg(sampled.error), true);
-                finishFlight(false);
+                finishFlight(true);
                 return;
             }
             InkPreviewClient::Upload upload;

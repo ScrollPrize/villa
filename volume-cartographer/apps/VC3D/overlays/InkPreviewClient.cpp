@@ -81,8 +81,10 @@ QString InkPreviewClient::redirectError(int http) const
 QString InkPreviewClient::transportError(QNetworkReply* reply) const
 {
     // cancel() deletes the replies it drops, so a cancelled reply that gets here hit its timeout.
+    // Newer Qt reports the transfer timeout as TimeoutError.
     const int timeoutMs = reply->request().transferTimeout();
-    if (reply->error() == QNetworkReply::OperationCanceledError && timeoutMs > 0) {
+    const auto error = reply->error();
+    if ((error == QNetworkReply::OperationCanceledError || error == QNetworkReply::TimeoutError) && timeoutMs > 0) {
         return tr("The ink preview server at %1 did not answer within %2 s.").arg(_url.toString(), seconds(timeoutMs));
     }
     return tr("No ink preview server answers at %1: %2").arg(_url.toString(), reply->errorString());

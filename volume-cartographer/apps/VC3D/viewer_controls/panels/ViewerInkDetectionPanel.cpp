@@ -363,5 +363,10 @@ void ViewerInkDetectionPanel::populatePreviewLevels()
             current = _previewLevelCombo->count() - 1;
         }
     }
+    // A chosen level this volume lacks stays chosen; the status says so.
+    if (current == 0 && preview->levelChoice() != InkPreviewOverlayController::kAutoLevel) {
+        _previewLevelCombo->addItem(QString::number(preview->levelChoice()), preview->levelChoice());
+        current = _previewLevelCombo->count() - 1;
+    }
     _previewLevelCombo->setCurrentIndex(current);
 }

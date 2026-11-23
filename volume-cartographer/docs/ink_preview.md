@@ -82,9 +82,9 @@ is smaller) are not requested. The preview is
 drawn in the segmentation view only, and not with the volumetric composite.
 
 Every request carries a key that changes whenever the voxels under the canvas
-could change: the segment, each edit of it, the volume, the level and the layer
-offsets. The server caches by key, so it never serves output computed from an
-older geometry.
+could change: the segment, each edit of it, the volume and its working level,
+the level and the layer offsets. The server caches by key, so it never serves
+output computed from an older geometry.
 
 ### Memory and time
 
@@ -101,7 +101,9 @@ worker then builds the layer surface of the chosen level from the copy (about
 46 bytes per vertex). For a segment of 12 million vertices that is about
 700 MB, about 0.1 s on the GUI thread and about 5 s on the worker, measured on
 one Linux build; the first preview after an edit of a large segment waits for
-it.
+it. One worker samples at a time: a request waits for a cancelled one's worker to
+finish. VC3D keeps one copy and the layer surface of one level, and releases them
+when the preview is turned off.
 
 ## The reversed view
 
