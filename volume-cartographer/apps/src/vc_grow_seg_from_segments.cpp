@@ -496,14 +496,12 @@ static double median_surface_step_vx(const QuadSurface& surface)
     if (!points || points->empty()) {
         return 1.0;
     }
-    // Valid as before: not the -1 marker; vcr::tifxyz::measureSpacing skips nonfinite and zero distances.
-    std::vector<std::uint8_t> valid(static_cast<size_t>(points->rows) * static_cast<size_t>(points->cols));
-    for (int y = 0; y < points->rows; ++y)
-        for (int x = 0; x < points->cols; ++x)
-            valid[static_cast<size_t>(y) * static_cast<size_t>(points->cols) + static_cast<size_t>(x)] = (*points)(y, x)[0] != -1.0f;
+    // Valid as before: x is not the -1 marker (no finiteness check); measureSpacing skips nonfinite and zero distances.
     vcr::tifxyz::SpacingOptions options;
-    options.valid = valid.data();
+    options.invalidMarker = -1.0f;
+    options.requireFinite = false;
     options.rowStride = points->step1();
+    options.medians = vcr::tifxyz::kSpacingBoth;
     return vcr::tifxyz::measureSpacing(reinterpret_cast<const float*>(points->ptr()), points->rows, points->cols, options).both.value_or(1.0);
 }
 

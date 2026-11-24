@@ -1360,20 +1360,14 @@ int main(int argc, char *argv[])
         catch (...) { logPrintf(stderr, "Error loading: %s\n", seg_folder.string().c_str()); return false; }
 
         // The scale sets the output size below; check it against the grid it describes. Valid vertices are the
-        // ones this renderer uses (finite, not the -1 marker).
+        // ones this renderer uses (not the -1 marker, all coordinates finite).
         {
             const auto& points = *surf->rawPointsPtr();
-            std::vector<std::uint8_t> valid(std::size_t(points.rows) * std::size_t(points.cols));
-            for (int j = 0; j < points.rows; ++j)
-                for (int i = 0; i < points.cols; ++i) {
-                    const cv::Vec3f& p = points(j, i);
-                    valid[std::size_t(j) * std::size_t(points.cols) + std::size_t(i)] =
-                        p[0] != -1.0f && std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]);
-                }
             // QuadSurface keeps scale as (x, y) = (columns, rows); vcr::tifxyz takes (rows, columns).
             const std::array<double, 2> scale = {double(surf->_scale[1]), double(surf->_scale[0])};
             vcr::tifxyz::SpacingOptions options;
-            options.valid = valid.data();
+            options.invalidMarker = -1.0f;
+            options.requireFinite = true;
             options.rowStride = points.step1();
             options.maxPairs = std::int64_t(1) << 20;
             const auto check = vcr::tifxyz::checkScale(reinterpret_cast<const float*>(points.ptr()), points.rows, points.cols, scale, options);

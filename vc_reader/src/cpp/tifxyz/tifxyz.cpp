@@ -336,11 +336,12 @@ std::array<std::int64_t, 2> storedShape(const std::string& location, const sourc
 
 namespace {
 
-std::optional<double> median(std::vector<double>& d)
+// The lower median of [first, last); reorders only that range.
+std::optional<double> median(std::vector<double>::iterator first, std::vector<double>::iterator last)
 {
-    if (d.empty()) return std::nullopt;
-    auto mid = d.begin() + std::ptrdiff_t(d.size() / 2);
-    std::nth_element(d.begin(), mid, d.end());
+    if (first == last) return std::nullopt;
+    auto mid = first + (last - first) / 2;
+    std::nth_element(first, mid, last);
     return *mid;
 }
 
@@ -353,17 +354,33 @@ GridSpacing measureSpacing(const float* xyz, std::int64_t rows, std::int64_t col
     const std::size_t stride = options.rowStride ? options.rowStride : std::size_t(cols) * 3;
     const auto at = [&](std::int64_t r, std::int64_t c) { return xyz + std::size_t(r) * stride + std::size_t(c) * 3; };
     const auto ok = [&](std::int64_t r, std::int64_t c) {
-        return options.valid ? options.valid[std::size_t(r) * std::size_t(cols) + std::size_t(c)] != 0 : vertexValid(at(r, c));
+        const float* p = at(r, c);
+        if (!options.invalidMarker) return vertexValid(p);
+        return p[0] != *options.invalidMarker &&
+               (!options.requireFinite || (std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2])));
     };
     // One axis: pairs (r, c)-(r + dr, c + dc) on a lattice with the same step in both directions, so a
     // subsample covers the whole grid instead of aliasing with its width.
-    const auto axis = [&](std::int64_t dr, std::int64_t dc) {
-        std::vector<double> d;
+    const auto stepOf = [&](std::int64_t dr, std::int64_t dc) {
         const std::int64_t pairs = (rows - dr) * (cols - dc);
-        if (pairs <= 0) return d;
-        std::int64_t step = 1;
         if (options.maxPairs > 0 && pairs > options.maxPairs)
-            step = std::int64_t(std::ceil(std::sqrt(double(pairs) / double(options.maxPairs))));
+            return std::int64_t(std::ceil(std::sqrt(double(pairs) / double(options.maxPairs))));
+        return std::int64_t(1);
+    };
+    const auto latticePairs = [&](std::int64_t dr, std::int64_t dc) -> std::size_t {
+        if (rows - dr <= 0 || cols - dc <= 0) return 0;
+        const std::int64_t step = stepOf(dr, dc);
+        return std::size_t((rows - dr + step - 1) / step) * std::size_t((cols - dc + step - 1) / step);
+    };
+    const unsigned want = options.medians;
+    const bool needRows = want & (kSpacingRows | kSpacingBoth), needCols = want & (kSpacingCols | kSpacingBoth);
+    // All distances go into one buffer: those along rows first, then those along columns. Reserved for every
+    // lattice pair so it never reallocates; pages past the valid pairs are never written.
+    std::vector<double> d;
+    d.reserve((needRows ? latticePairs(1, 0) : 0) + (needCols ? latticePairs(0, 1) : 0));
+    const auto axis = [&](std::int64_t dr, std::int64_t dc) {
+        if (rows - dr <= 0 || cols - dc <= 0) return;
+        const std::int64_t step = stepOf(dr, dc);
         for (std::int64_t r = 0; r + dr < rows; r += step)
             for (std::int64_t c = 0; c + dc < cols; c += step) {
                 if (!ok(r, c) || !ok(r + dr, c + dc)) continue;
@@ -379,22 +396,21 @@ GridSpacing measureSpacing(const float* xyz, std::int64_t rows, std::int64_t col
                 const double v = std::sqrt(s);
                 if (std::isfinite(v) && v > 0) d.push_back(v);
             }
-        return d;
     };
-    auto alongRows = axis(1, 0), alongCols = axis(0, 1);
-    std::vector<double> both;
-    both.reserve(alongRows.size() + alongCols.size());
-    both.insert(both.end(), alongRows.begin(), alongRows.end());
-    both.insert(both.end(), alongCols.begin(), alongCols.end());
-    out.rows = median(alongRows);
-    out.cols = median(alongCols);
-    out.both = median(both);
+    if (needRows) axis(1, 0);
+    const std::size_t nRows = d.size();
+    if (needCols) axis(0, 1);
+    // The per-axis medians reorder only their own part, so the median of the whole buffer is unaffected.
+    if (want & kSpacingRows) out.rows = median(d.begin(), d.begin() + std::ptrdiff_t(nRows));
+    if (want & kSpacingCols) out.cols = median(d.begin() + std::ptrdiff_t(nRows), d.end());
+    if (want & kSpacingBoth) out.both = median(d.begin(), d.end());
     return out;
 }
 
 ScaleCheck checkScale(const float* xyz, std::int64_t rows, std::int64_t cols, const std::array<double, 2>& scale, SpacingOptions options)
 {
     ScaleCheck out;
+    options.medians |= kSpacingRows | kSpacingCols;
     out.measured = measureSpacing(xyz, rows, cols, options);
     if (out.measured.rows) out.deviation[0] = *out.measured.rows * scale[0] - 1;
     if (out.measured.cols) out.deviation[1] = *out.measured.cols * scale[1] - 1;

@@ -64,16 +64,40 @@ static void scaleCheck()
     const auto collapsed = tifxyz::measureSpacing(holes.data(), 40, 50);
     CHECK(std::abs(*collapsed.rows - 3) < 1e-9 && std::abs(*collapsed.cols - 2) < 1e-9);
 
-    // An explicit validity array and a row stride (a padded buffer) give the same result.
+    // A row stride (a padded buffer) gives the same result.
     std::vector<float> padded(std::size_t(40) * 52 * 3, 7.0f);
-    std::vector<std::uint8_t> valid(std::size_t(40) * 50, 1);
     for (int r = 0; r < 40; ++r) std::copy_n(&xyz[std::size_t(r) * 150], 150, &padded[std::size_t(r) * 156]);
-    valid[5 * 50 + 5] = 0;
     tifxyz::SpacingOptions options;
-    options.valid = valid.data();
     options.rowStride = 52 * 3;
     const auto strided = tifxyz::measureSpacing(padded.data(), 40, 50, options);
     CHECK(std::abs(*strided.rows - 3) < 1e-9 && std::abs(*strided.cols - 2) < 1e-9);
+
+    // The -1 marker rule (QuadSurface): only x == -1 is invalid, so a grid lying at y < 0 still counts, where
+    // vertexValid finds no valid vertex. requireFinite changes nothing here because nonfinite distances are skipped
+    // either way.
+    std::vector<float> marked(surface.xyz());
+    for (std::size_t i = 1; i < marked.size(); i += 3) marked[i] -= 1000;
+    marked[(std::size_t(9) * 50 + 4) * 3] = -1;
+    marked[(std::size_t(11) * 50 + 6) * 3 + 2] = std::nanf("");
+    tifxyz::SpacingOptions marker;
+    marker.invalidMarker = -1.0f;
+    const auto byMarker = tifxyz::measureSpacing(marked.data(), 40, 50, marker);
+    CHECK(std::abs(*byMarker.rows - 3) < 1e-9 && std::abs(*byMarker.cols - 2) < 1e-9);
+    marker.requireFinite = false;
+    const auto byMarkerOnly = tifxyz::measureSpacing(marked.data(), 40, 50, marker);
+    CHECK(*byMarker.rows == *byMarkerOnly.rows && *byMarker.cols == *byMarkerOnly.cols && *byMarker.both == *byMarkerOnly.both);
+    const auto byDefault = tifxyz::measureSpacing(marked.data(), 40, 50);
+    CHECK(!byDefault.rows && !byDefault.cols && !byDefault.both);
+    marker.medians = tifxyz::kSpacingRows;
+    const auto rowsOnly = tifxyz::measureSpacing(marked.data(), 40, 50, marker);
+    CHECK(rowsOnly.rows && *rowsOnly.rows == *byMarker.rows && !rowsOnly.cols && !rowsOnly.both);
+
+    // Only the median over both axes, as vc_grow_seg_from_segments asks: the same value as with all three.
+    tifxyz::SpacingOptions bothOnly;
+    bothOnly.medians = tifxyz::kSpacingBoth;
+    const auto onlyBoth = tifxyz::measureSpacing(holes.data(), 40, 50, bothOnly);
+    const auto all = tifxyz::measureSpacing(holes.data(), 40, 50);
+    CHECK(!onlyBoth.rows && !onlyBoth.cols && onlyBoth.both && *onlyBoth.both == *all.both);
 
     // A lattice subsample of a large grid still covers it: the right half is twice as far apart along columns,
     // so a subsample that aliased onto the left columns would report 2.
