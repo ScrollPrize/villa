@@ -299,13 +299,29 @@ void testContext(const fs::path& root, const std::string& backend)
     // cells reached: (5 + 7 wide) grid positions need 7 x 9 vertices, 63 cells
     const auto tight = render(63 * 80, start, size);
     const auto equal = [](float a, float b) { return (std::isnan(a) && std::isnan(b)) || std::fabs(a - b) < 1e-3f; };
-    bool budgetFree = full.size() == tight.size();
-    for (std::size_t k = 0; budgetFree && k < full.size(); ++k) budgetFree = equal(full[k], tight[k]);
-    require(budgetFree, "a patch renders the same at the default budget and at the budget of its cells");
+    // the ring is charged to the budget with the cells: at the budget of the cells alone it does not fit and the render is made on the cells
+    // (a read or budget error of the ring leaves them to render), so the pixels are close to the render with the ring, not equal to it
+    require(full.size() == tight.size(), "a patch renders at the budget of its cells");
+    float worst = 0;
+    for (std::size_t k = 0; k < full.size(); ++k) {
+        require(std::isnan(full[k]) == std::isnan(tight[k]), "the same pixels are valid with and without the ring");
+        if (!std::isnan(full[k])) worst = std::max(worst, std::fabs(full[k] - tight[k]));
+    }
+    require(worst < 2.f, "a patch at the budget of its cells is close to the render with the ring");
     // an error in the cells themselves is not hidden by the retry on the cells: a budget below the cells still refuses the render
     bool refused = false;
     try { (void)render(40 * 80, start, size); } catch (const std::runtime_error&) { refused = true; }
     require(refused, "a work budget the cells do not fit still refuses the render");
+    {   // the ring is charged to the work budget like any window, so a window that does not fit is never kept: a later linear render of the
+        // window the ring made (rows 2..12, columns 3..15, found by the pixels below) is refused at that budget, not served from the cache
+        auto options = optionsFor(backend);
+        options.samplingWorkBytes = 63 * 80;
+        SampleReader reader(reference, none, std::nullopt, options);
+        (void)reader.renderSurface(surface, start, size, {0});
+        raises<std::runtime_error>([&] { (void)reader.renderSurface(surface, {4, 6}, {18, 22}, {0}, vcr::grid::Interpolation::Linear); },
+                                   "a window over the work budget is not served from a cache filled by a bicubic render");
+        reader.close();
+    }
     const auto large = render(0, {4, 6}, {18, 22});
     bool same = true;
     for (std::int64_t j = 0; j < size[0]; ++j)

@@ -199,12 +199,12 @@ Geometry::Geometry(AlignedEngine::Impl& o, const Surface& s) : owner(o), surface
     }
 }
 
-std::shared_ptr<const GeometryTile> Geometry::tile(const Pair& start, const Pair& size, std::size_t budgetCells)
+std::shared_ptr<const GeometryTile> Geometry::tile(const Pair& start, const Pair& size)
 {
     const auto cacheKey = "geometry|" + key + "|" + std::to_string(start[0]) + "," + std::to_string(start[1]) + "|" + std::to_string(size[0]) + "," + std::to_string(size[1]);
     if (const auto* cached = owner.tiles.get(cacheKey)) return std::static_pointer_cast<const GeometryTile>(*cached);
     const auto cells = std::size_t(size[0] * size[1]);
-    if ((budgetCells ? budgetCells : cells) * 80 > owner.workBytes) throw DecodeBudgetError("geometry tile exceeds sampling_work_bytes");
+    if (cells * 80 > owner.workBytes) throw DecodeBudgetError("geometry tile exceeds sampling_work_bytes");
     owner.largestGeometryCells = std::max(owner.largestGeometryCells, std::size_t(std::max(size[0], size[1])));
     auto out = std::make_shared<GeometryTile>();
     out->rows = size[0];
@@ -369,14 +369,14 @@ std::optional<Patch> patchOf(Geometry& geom, const Pair& start, const Pair& size
     if (c1 - c0 < 2 || r1 - r0 < 2) return std::nullopt;
     // Two more vertices around the window, where the grid has them: the Hermite derivatives of its cells
     // (centred differences, one sided only at the grid's own border or next to a hole) then equal the whole
-    // grid's, so a patch renders as the same pixels of any larger patch, and with the same signed normals.
-    // Only the cells are charged to the work budget: the answer must not change with the budget, and the
-    // context is a fixed ring, a small share of any window large enough for the budget to matter.
+    // grid's, so a patch renders as the same pixels of any larger patch. The window with its ring is charged to
+    // the work budget like any window; when it does not fit, the render is made on the cells alone, and the sign
+    // of its normals is the same either way (SurfaceOptions::core).
     const std::int64_t halo = context ? 2 : 0;
     const auto hc0 = std::max<std::int64_t>(0, c0 - halo), hc1 = std::min<std::int64_t>(cols, c1 + halo);
     const auto hr0 = std::max<std::int64_t>(0, r0 - halo), hr1 = std::min<std::int64_t>(rows, r1 + halo);
     Patch patch;
-    patch.tile = geom.tile({hr0, hc0}, {hr1 - hr0, hc1 - hc0}, std::size_t((r1 - r0) * (c1 - c0)));
+    patch.tile = geom.tile({hr0, hc0}, {hr1 - hr0, hc1 - hc0});
     patch.raster = grid::Raster{x0 - double(hc0), y0 - double(hr0), sx, sy, int(size[1]), int(size[0]), kx, ky};
     if (hr0 != r0 || hr1 != r1 || hc0 != c0 || hc1 != c1) patch.core = {int(r0 - hr0), int(r1 - hr0), int(c0 - hc0), int(c1 - hc0)};
     return patch;
@@ -502,12 +502,17 @@ SampleResult SampleReader::renderSurface(const Surface& surface, const Pair& sta
         }
         return result;
     };
-    // The CUDA sampler does not take the sign of a normal from the cells alone: without the ring it renders as before.
-    if (interpolation == grid::Interpolation::Bicubic && s.backend != "cuda") {
+    if (interpolation == grid::Interpolation::Bicubic) {
         try { return attempt(true); }
         catch (const Cancelled&) { throw; }  // a stopped read is not retried
-        catch (const std::runtime_error&) {}  // a read or budget error (CacheMiss, DecodeBudgetError, HTTP): the ring was optional
-        catch (const std::bad_alloc&) {}
+        catch (const std::exception&) {
+            // The ring was optional: a read or budget error (CacheMiss, DecodeBudgetError, HTTP, a request that needs
+            // more CUDA bricks than the cache holds) leaves the cells to render, and an error in the cells themselves
+            // comes back from the render below.
+#ifdef VC_READER_CUDA
+            if (s.backend == "cuda") grid::cuda::forgetKeptData();  // the ring's geometry on the device goes before the retry
+#endif
+        }
     }
     return attempt(false);
 }

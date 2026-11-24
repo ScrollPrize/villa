@@ -671,6 +671,7 @@ device::Storage upload(const void* data, std::size_t bytes, int deviceId)
 // stay there: uploading a whole grid per frame or tile costs far more than sampling it.
 struct DeviceGrid {
     device::Storage xyz, valid, piece, normals, du, dv, duv;
+    device::Storage du0, dv0, duv0;  // the derivatives of the core alone (SurfaceOptions::core), when there is one
 };
 struct KeptGrid {
     std::uint64_t serial;
@@ -708,6 +709,9 @@ std::shared_ptr<const DeviceGrid> deviceGrid(const Surface::Impl& impl, int id)
     grid->du = upload(host.du, bicubic ? vertices * 12 : 0, id);
     grid->dv = upload(host.dv, bicubic ? vertices * 12 : 0, id);
     grid->duv = upload(host.duv, bicubic ? vertices * 12 : 0, id);
+    grid->du0 = upload(host.du0, host.du0 ? vertices * 12 : 0, id);
+    grid->dv0 = upload(host.dv0, host.du0 ? vertices * 12 : 0, id);
+    grid->duv0 = upload(host.duv0, host.du0 ? vertices * 12 : 0, id);
     device::complete();  // other threads' streams may read it as soon as it is listed
     kept.push_front({impl.serial, id, grid});
     return grid;
@@ -865,6 +869,13 @@ Result sample(const Surface& surface, const Raster& raster, const Request& reque
         base.grid.du = static_cast<const float*>(grid->du->ptr);
         base.grid.dv = static_cast<const float*>(grid->dv->ptr);
         base.grid.duv = static_cast<const float*>(grid->duv->ptr);
+        if (host.du0) {
+            base.grid.du0 = static_cast<const float*>(grid->du0->ptr);
+            base.grid.dv0 = static_cast<const float*>(grid->dv0->ptr);
+            base.grid.duv0 = static_cast<const float*>(grid->duv0->ptr);
+            for (int k = 0; k < 4; ++k)
+                base.grid.core[k] = host.core[k];
+        }
     }
     const auto centre = centreOf(surface, raster);
     return sampleDevice(raster.width, raster.height, request, readers, base, centre.data());
