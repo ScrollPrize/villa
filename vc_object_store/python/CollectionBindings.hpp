@@ -256,6 +256,11 @@ inline void bindCollectionApi(nb::module_& module) {
 
     // These records are already decoded/prepared. Native source imports use
     // the same InitialImport and ParallelImportStream, not another SQL writer.
+    module.def("pack_collection",[](const std::filesystem::path& source,const std::filesystem::path& destination){
+        nb::gil_scoped_release release;vo::packObjectCollection(source,destination);
+    },"source"_a,"destination"_a,
+      "Package a sealed collection and its complete dependency closure into one new, portable container "
+      "(packObjectCollection): store identities, lineage and commit sequences are kept, only physical locators change.");
     module.def("import_initial_records",[](const std::filesystem::path& destination,const nb::sequence& objects,
             const nb::sequence& edges,const nb::sequence& definitions,const std::vector<std::filesystem::path>& dependencies,
             size_t workers,bool packed,bool edgeAdjacencyIndex,

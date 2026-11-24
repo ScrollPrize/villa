@@ -6,6 +6,7 @@ import pytest
 
 from vesuvius.neural_tracing.fiber_trace_3d.fiber_wgraph_geometry import (
     _contract_fixed_groups, aggregate_arcs, arc_residual, fixed_object_groups, fixed_object_settings,
+    scaffold_reference_arcs, scaffold_reference_settings,
 )
 
 
@@ -98,3 +99,24 @@ def test_one_sided_constraints_keep_their_side_through_contraction_and_aggregati
     # Cost per unit weight: an equation both ways, a one-sided constraint only on its wrong side.
     step = np.array([2., 2., 2., 5., 5.]); target = np.array([4., 4., 4., 4., 4.]); side = np.array([0, 1, -1, 1, -1])
     assert list(arc_residual(step, target, side)) == [2., 2., 0., 0., 1.]
+
+
+def test_scaffold_reference_states_cross_constraints_against_one_extra_node(tmp_path):
+    # Scaffold fibers s0 (winding 5) and s1 (winding 7) form the largest component; s2 is alone.
+    (tmp_path / 'windings.json').write_text(json.dumps(dict(ids=['s0', 's1', 's2'], selected_winding=[5, 7, 40], component=[0, 0, 1])))
+    # Rows: scaffold, volume, kind, target, weight, distance, scored, step, residual, arc, arc.
+    rows = np.array([[0, 0, 1, 2, .5, 1, 1, 0, 0, 0, 0],      # s0 -> v0 perpendicular, 2 windings
+                     [1, 1, 4, -1, 50., 1, 1, 0, 0, 0, 0],    # s1 -> v1 at least -1 (written with sign weight 100)
+                     [1, 2, 5, 3, 100., 1, 1, 0, 0, 0, 0],    # s1 -> a fiber outside the graph
+                     [2, 0, 1, 9, 1., 1, 1, 0, 0, 0, 0]], float)  # s2: not in the largest component
+    rows.tofile(tmp_path / 'cross.bin')
+    (tmp_path / 'cross.bin.json').write_text(json.dumps(dict(scaffold=['s0', 's1', 's2'], volume=['v0', 'v1', 'gone'])))
+    reference = scaffold_reference_settings(dict(scaffold_reference=dict(constraints=str(tmp_path / 'cross.bin'), windings=str(tmp_path / 'windings.json'))))
+    arcs, report = scaffold_reference_arcs(reference, ['v1', 'v0'], dict(perpendicular=1., parallel=.1, sign=4.))
+    assert report['scaffold_fibers'] == 2 and report['used'] == 2 and report['outside_graph'] == 1
+    # The extra node is index 2; v0 is node 1 and v1 node 0. Targets are the scaffold winding plus the stated step.
+    assert list(arcs['a']) == [2, 2] and list(arcs['b']) == [1, 0]
+    assert list(arcs['target']) == [5 + 2, 7 - 1] and list(arcs['side']) == [0, 1]
+    assert list(arcs['weight']) == [.5, 50. * 4 / 100]
+    with pytest.raises(ValueError, match='use one'):
+        scaffold_reference_settings(dict(scaffold_reference=dict(constraints='a', windings='b'), fixed_object=dict(windings='c')))

@@ -73,7 +73,63 @@ def winding_settings(config):
                 dot_weight_power=dot_power,winding_distance_weight=distance_weight,
                 crossing_filter=bool(config.get('crossing_filter',False)),
                 fixed_object=fixed_object_settings(config),
+                scaffold_reference=scaffold_reference_settings(config),
                 manual_links=link_settings(config) if weights['manual']>0 else None)
+
+
+SCAFFOLD_REFERENCE_KINDS=dict(perpendicular=1,parallel=2,sign_at_least=4,sign_at_most=5)
+
+
+def scaffold_reference_settings(config):
+    """``scaffold_reference``: a separately solved scaffold that takes part as one fixed object, through
+    the crossings between its fibers and the volume's (no union graph).
+
+    ``constraints`` is the dump ``vc_scaffold_solve`` writes for ``field_comparison`` (with its
+    ``.json`` of fiber ids), ``windings`` that run's ``windings_output``. Only the scaffold's largest
+    component is used. ``file_weights`` states the perpendicular / parallel / sign weights the dump
+    was written with (default 1 / 0 / 100), so its rows can be re-weighted with this stage's own."""
+    reference=config.get('scaffold_reference')
+    if reference is None:return None
+    if config.get('fixed_object') is not None:
+        raise ValueError('scaffold_reference and fixed_object are two ways of fixing the scaffold; use one')
+    unknown=set(reference)-{'constraints','windings','file_weights'}
+    if unknown:raise ValueError('Unknown scaffold_reference settings: '+', '.join(sorted(unknown)))
+    for key in ('constraints','windings'):
+        if not isinstance(reference.get(key),str) or not reference[key]:
+            raise ValueError(f'scaffold_reference needs {key}')
+    weights=dict(perpendicular=1.,parallel=0.,sign=100.);weights.update(reference.get('file_weights') or {})
+    return dict(constraints=reference['constraints'],windings=reference['windings'],file_weights=weights)
+
+
+def scaffold_reference_arcs(reference,ids,weights):
+    """The scaffold's cross constraints as arcs to one extra node (index ``len(ids)``).
+
+    The scaffold is solved: fiber s sits at winding w_s, so "volume fiber v is t windings from s"
+    states the step from the scaffold's node to v as w_s + t, an equation or one-sided as the crossing
+    is. The evidence of each crossing stays; its type weight becomes this stage's."""
+    constraints=Path(reference['constraints'])
+    names=json.loads(Path(str(constraints)+'.json').read_text())
+    solved=json.loads(Path(reference['windings']).read_text())
+    if list(solved['ids'])!=list(names['scaffold']):raise ValueError('scaffold_reference: the windings and the constraints name different scaffold fibers')
+    winding=np.asarray(solved['selected_winding'],np.int64);component=np.asarray(solved['component'],np.int64)
+    largest=np.bincount(component-component.min()).argmax()+component.min()
+    rows=np.fromfile(constraints).reshape(-1,11)
+    scaffold=rows[:,0].astype(np.int64);kind=rows[:,2].astype(np.int64)
+    position={str(fiber):index for index,fiber in enumerate(np.asarray(ids).tolist())}
+    node=np.array([position.get(fiber,-1) for fiber in names['volume']],np.int64)[rows[:,1].astype(np.int64)]
+    K=SCAFFOLD_REFERENCE_KINDS;written=reference['file_weights']
+    scale=np.zeros(len(rows))
+    for name,code,type_weight in (('perpendicular',K['perpendicular'],weights['perpendicular']),('parallel',K['parallel'],weights['parallel']),
+                                  ('sign',K['sign_at_least'],weights['sign']),('sign',K['sign_at_most'],weights['sign'])):
+        if written[name]>0:scale[kind==code]=type_weight/written[name]
+    use=(component[scaffold]==largest)&(node>=0)&(scale>0)
+    side=np.where(kind==K['sign_at_least'],1,np.where(kind==K['sign_at_most'],-1,0))
+    report=dict(scaffold_fibers=int((component==largest).sum()),constraints=int(len(rows)),used=int(use.sum()),
+                equations=int((use&(side==0)).sum()),sign_constraints=int((use&(side!=0)).sum()),
+                volume_fibers=int(len(np.unique(node[use]))),outside_graph=int((node<0).sum()))
+    extra=len(ids)
+    return dict(a=np.full(int(use.sum()),extra,np.int64),b=node[use],target=(winding[scaffold]+rows[:,3].astype(np.int64))[use],
+                weight=(rows[:,4]*scale)[use],side=side[use]),report
 
 
 def fixed_object_settings(config):
@@ -406,6 +462,12 @@ def _assemble_arcs(config,settings,graph,paths,ids,family,normal_sign):
         links,report=manual_link_arcs(read_links(base),ids,family,paths,settings['manual_links'])
         counts['manual']=report
         part(links['a'],links['b'],links['target'],links['weight']*weights['manual'])
+    nodes=len(ids)
+    if settings.get('scaffold_reference'):
+        arcs,report=scaffold_reference_arcs(settings['scaffold_reference'],ids,weights)
+        if not len(arcs['a']):raise ValueError('scaffold_reference: no cross constraint reaches the graph')
+        part(arcs['a'],arcs['b'],arcs['target'],arcs['weight'],arcs['side'])
+        counts['scaffold_reference']=report;nodes+=1
     merged={key:np.concatenate([entry[key] for entry in parts]) for key in ('a','b','target','weight','side')}
     positive=merged['weight']>0
     merged={key:value[positive] for key,value in merged.items()}
@@ -416,6 +478,7 @@ def _assemble_arcs(config,settings,graph,paths,ids,family,normal_sign):
         merged=_contract_fixed_groups(merged,root,offset,fixed_report)
         if not len(merged['a']):raise ValueError('No winding constraints left outside the fixed groups')
     g=aggregate_arcs(merged['a'],merged['b'],merged['target'],merged['weight'],merged['side'])
+    g['nodes']=nodes
     return g,counts,(root,offset)
 
 
@@ -427,6 +490,7 @@ def _flat_settings(settings,counts,config):
     flat['normal_dot_weight_power']=float(settings['dot_weight_power'])
     flat['winding_distance_damped']=settings['winding_distance_weight']=='inverse_square'
     flat['fixed_object']=settings.get('fixed_object') is not None
+    flat['scaffold_reference']=settings.get('scaffold_reference') is not None
     if settings['optimizer']=='lemon':
         flat.update(lemon_capacity_scale=int(settings['lemon']['capacity_scale']))
     else:
@@ -465,7 +529,9 @@ def _solve_winding_direct(config):
     timings['native_winding_graph']=time.monotonic()-phase
     with CollectionReader(config['database']) as source:
         if source.source!=input_source:raise ValueError('Source changed during winding preparation')
-    n=len(ids)
+    fibers=len(ids)
+    # One more node than fibers when a solved scaffold takes part as a fixed object (scaffold_reference).
+    n=int(g.pop('nodes'))
     del graph,paths
     phase=time.monotonic()
     _,component=connected_components(coo_matrix((np.ones(len(g['a'])),(g['a'],g['b'])),shape=(n,n)),directed=False)
@@ -508,6 +574,15 @@ def _solve_winding_direct(config):
         x[members]=x[fixed_root[members]]+fixed_offset[members]
         component[members]=component[fixed_root[members]]
         residual=arc_residual(labels[g['b']]-labels[g['a']],g['target'],g['side'])
+    if n>fibers:
+        # The scaffold's node is the origin of its component: the volume's windings there are the
+        # scaffold's own numbering. Then it leaves; only fibers are results.
+        labels=np.asarray(labels,np.int64).copy();x=np.asarray(x,float).copy()
+        attached=np.asarray(component)==np.asarray(component)[fibers]
+        labels[attached]-=labels[fibers];x[attached]-=x[fibers]
+        counts['scaffold_reference']['attached_fibers']=int(attached.sum())-1
+        labels=labels[:fibers];x=x[:fibers];component=np.asarray(component)[:fibers]
+        n=fibers
     timings['solve']=time.monotonic()-phase
     summary=dict(fibers=n,arcs=len(g['a']),one_sided_arcs=int((g['side']!=0).sum()),seconds=timings['solve'],method=method,
         weighted_l1=float(np.dot(g['weight'],residual)),mean_residual=float(residual.mean()),
