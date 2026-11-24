@@ -1,5 +1,6 @@
 #include "vc/core/util/GridStore.hpp"
 #include "vc/core/util/LineSegList.hpp"
+#include "vc/core/util/RemoteGridFile.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -142,6 +143,16 @@ public:
         }
 
         if (read_only_) {
+            if (remote_) {
+                // Buckets that could not be fetched are not read: GridStore
+                // caches what it decodes, and their bytes are not in place.
+                try {
+                    remote_->ensureBuckets(range.startX, range.startY, range.endX, range.endY);
+                } catch (const std::exception& e) {
+                    RemoteGridFile::reportFailure(remote_->url() + ": " + e.what());
+                    return;
+                }
+            }
             for (int y = range.startY; y <= range.endY; ++y) {
                 for (int x = range.startX; x <= range.endX; ++x) {
                     int index = y * grid_size_.width + x;
@@ -207,6 +218,7 @@ public:
     std::vector<std::shared_ptr<std::vector<cv::Point>>> get_all() const {
         std::vector<std::shared_ptr<std::vector<cv::Point>>> result;
         if (read_only_) {
+            if (remote_) remote_->ensureAll();
             std::unordered_set<size_t> all_offsets;
             size_t num_buckets = grid_size_.width * grid_size_.height;
             for(size_t i = 0; i < num_buckets; ++i) {
@@ -261,6 +273,7 @@ public:
 
     size_t numSegments() const {
         if (read_only_) {
+            if (remote_) remote_->ensureAll();
             std::unordered_set<size_t> all_offsets;
             size_t num_buckets = grid_size_.width * grid_size_.height;
             for(size_t i = 0; i < num_buckets; ++i) {
@@ -459,6 +472,26 @@ public:
         }
     }
 
+    void prefetch(const cv::Rect& rect) const {
+        if (!remote_) return;
+        const QueryBucketRange range = queryBucketRange(rect);
+        if (range.empty) return;
+        try {
+            remote_->ensureBuckets(range.startX, range.startY, range.endX, range.endY, /*foreground=*/false);
+        } catch (const std::exception&) {
+            // The query that needs these buckets fetches them again and reports a failure.
+        }
+    }
+
+    void load_remote(std::shared_ptr<RemoteGridFile> remote) {
+        read_only_ = true;
+        remote_ = std::move(remote);
+        mmapped_data_ = std::make_unique<MmappedData>();
+        mmapped_data_->data = remote_->data();
+        mmapped_data_->size = remote_->size();
+        parse_header(/*read_meta=*/false);
+    }
+
     void load_mmap(const std::string& path) {
         read_only_ = true;
         mmapped_data_ = std::make_unique<MmappedData>();
@@ -480,6 +513,10 @@ public:
 
         mmapped_data_->map.open(path);
         mmapped_data_->data = mmapped_data_->map.data();
+        parse_header(/*read_meta=*/true);
+    }
+
+    void parse_header(bool read_meta) {
 
         const char* current = static_cast<const char*>(mmapped_data_->data);
         const char* end = current + mmapped_data_->size;
@@ -590,7 +627,7 @@ public:
         }
         // For v3, we don't need to read descriptors. The bucket indices are read on-demand.
 
-        if (version >= 2 && json_meta_size > 0) {
+        if (read_meta && version >= 2 && json_meta_size > 0) {
             const char* meta_start = static_cast<const char*>(mmapped_data_->data) + json_meta_offset;
             if (meta_start + json_meta_size > end) {
                 throw std::runtime_error("Invalid GridStore file: metadata out of bounds.");
@@ -878,6 +915,7 @@ private:
     uint32_t paths_offset_in_file_;
     uint32_t buckets_offset_in_file_;
     std::unique_ptr<MmappedData> mmapped_data_;
+    std::shared_ptr<RemoteGridFile> remote_;
     mutable std::mutex bucket_mutex_;
     mutable std::mutex seglist_mutex_;
     mutable std::unordered_map<size_t, SegCacheEntry> seglist_cache_;
@@ -913,6 +951,15 @@ GridStore::GridStore(const std::string& path)
     : pimpl_(std::make_unique<GridStoreImpl>(cv::Rect(), 1)) { // Use a dummy cell_size to avoid division by zero
     pimpl_->load_mmap(path);
     meta = pimpl_->meta_;
+}
+
+GridStore::GridStore(std::shared_ptr<RemoteGridFile> remote)
+    : pimpl_(std::make_unique<GridStoreImpl>(cv::Rect(), 1)) {
+    pimpl_->load_remote(std::move(remote));
+}
+
+void GridStore::prefetch(const cv::Rect& rect) const {
+    pimpl_->prefetch(rect);
 }
 
 GridStore::~GridStore() = default;

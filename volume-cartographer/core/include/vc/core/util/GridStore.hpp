@@ -9,6 +9,8 @@
 
 namespace vc::core::util {
 
+class RemoteGridFile;
+
 class GridStore {
 public:
     struct SaveOptions {
@@ -34,11 +36,18 @@ public:
 
     GridStore(const cv::Rect& bounds, int cell_size);
     explicit GridStore(const std::string& path);
+    // A read-only store over a remote file read a part at a time: each query
+    // first fetches what its region needs (see RemoteGridFile). Its `meta` is
+    // not read.
+    explicit GridStore(std::shared_ptr<RemoteGridFile> remote);
     ~GridStore();
 
     void add(const std::vector<cv::Point>& points);
     std::vector<std::shared_ptr<std::vector<cv::Point>>> get(const cv::Rect& query_rect) const;
     std::vector<std::shared_ptr<std::vector<cv::Point>>> get(const cv::Point2f& center, float radius) const;
+    // Fetch what queries inside `rect` will read, ahead of them. A no-op for
+    // a store that is not remote.
+    void prefetch(const cv::Rect& rect) const;
     void forEach(const cv::Rect& query_rect,
                  QueryScratch& scratch,
                  const std::function<void(const std::shared_ptr<std::vector<cv::Point>>&)>& visitor) const;

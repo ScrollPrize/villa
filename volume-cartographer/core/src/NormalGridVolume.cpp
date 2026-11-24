@@ -3,6 +3,9 @@
 
 #include <nlohmann/json.hpp>
 #include "vc/core/util/RemoteCacheSettings.hpp"
+#include "vc/core/util/RemoteGridFile.hpp"
+
+#include <future>
 
 #include <vc_reader/source_reader.hpp>
 #include <vc_reader/zarr.hpp>
@@ -10,6 +13,11 @@
  #include <filesystem>
  #include <fstream>
 #include <algorithm>
+#include <array>
+#ifndef _WIN32
+#include <sys/resource.h>
+#endif
+#include <deque>
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
@@ -201,7 +209,8 @@
          // the store does not have is remembered in grid_cache as a null entry.
          bool remote = false;
          std::string remote_url;
-         mutable std::unique_ptr<vcr::sources::EncodedFiles> files;
+         // Shared with the range fetchers of grids, which may outlive this object.
+         mutable std::shared_ptr<vcr::sources::EncodedFiles> files;
          mutable std::atomic<uint64_t> fetch_failures{0};
          mutable std::mutex fetch_error_mutex;
          mutable std::string last_fetch_error;
@@ -210,12 +219,52 @@
          // open on its own background thread. No queue: a neighbour already cached, already
          // in flight, or over the in-flight limit is simply not started; the file cache's
          // per-file lock makes a tracer thread that needs one of them wait for that download.
-         static constexpr int readahead_radius = 4;
-         static constexpr int readahead_limit = 16;
+         int readahead_radius = 4;
+         int readahead_limit = 16;
          mutable std::mutex readahead_mutex;
          mutable std::condition_variable readahead_cv;
          mutable std::unordered_set<uint64_t> readahead_inflight;
          mutable int readahead_running = 0;
+
+         // Range reads (VC_NORMAL_GRID_RANGE_READS=1, streaming stores only): a grid
+         // file that is not cached whole is read a part at a time instead of being
+         // downloaded (EncodedFiles::readRanges, with the store's access), into a
+         // sparse mirror beside where the whole file would go (RemoteGridFile), or
+         // into memory when the disk is under the cache's free-space floor. Queries
+         // fetch the tiles of buckets they need; read-ahead fetches the same tile on
+         // the neighbouring slices. A file the range reader cannot open (a store
+         // without range support, a file that is not GridStore v3) is downloaded
+         // whole, as without the option.
+         bool range_reads = false;
+         uint64_t range_min_free_bytes = 0;
+         // Under readahead_mutex: (plane, slice, tile) keys read-ahead was started
+         // from, and those it has prefetched.
+         mutable std::unordered_set<uint64_t> range_ahead_triggered, range_ahead_fetched;
+         static constexpr float range_ahead_margin = 144.0f;  // query radius 80 + one bucket
+         // Each plane's file layout, learnt from its first file (under readahead_mutex).
+         mutable std::array<std::optional<RemoteGridFile::Layout>, 3> plane_layouts;
+         // Range-read opens in flight (range_file). Under readahead_mutex.
+         mutable std::unordered_map<uint64_t, std::shared_future<std::optional<std::shared_ptr<RemoteGridFile>>>> range_opening;
+         // Mirrors opened so far, by slice (null: the store does not have it), so
+         // read-ahead warms a mirror without putting grids in grid_cache. Only the
+         // tracer's own lookups add to grid_cache, as with whole files, so what it
+         // holds and evicts does not depend on read-ahead timing (the tracer's
+         // path caches follow grid objects, and eviction order changes results).
+         // Holds no descriptors. Capped by count and by the bytes the files hold
+         // in memory (VC_NORMAL_GRID_RANGE_MEMORY_BYTES, default 1 GiB), the
+         // oldest dropped first: a dropped file is replayed from its pack when
+         // opened again, with nothing fetched (grids in grid_cache keep theirs).
+         // Under readahead_mutex.
+         mutable std::unordered_map<uint64_t, std::shared_ptr<RemoteGridFile>> range_files;
+         mutable std::deque<uint64_t> range_files_order;
+         static constexpr size_t kRangeFilesCap = 8192;
+         uint64_t range_memory_cap = uint64_t(1) << 30;
+         // Every file still alive (held by a grid in grid_cache, say), so a slice
+         // dropped from range_files is never opened a second time while its first
+         // file lives: tiles read ahead into one must be seen by the other.
+         // Under readahead_mutex.
+         mutable std::unordered_map<uint64_t, std::weak_ptr<RemoteGridFile>> range_live;
+         mutable std::string last_range_fallback;  // under fetch_error_mutex
 
          pimpl(const std::string& path, int requested_level) : base_path(path) {
             load_remote_marker();
@@ -275,6 +324,13 @@
         ~pimpl() {
             std::unique_lock<std::mutex> lock(readahead_mutex);
             readahead_cv.wait(lock, [&] { return readahead_running == 0; });
+            if (range_reads && std::getenv("VC_NORMAL_GRID_RANGE_STATS")) {
+                const auto st = RemoteGridFile::globalStats();
+                std::cerr << "range-read stats: opens " << st.opens << ", requests " << st.requests << ", bytes " << st.bytes
+                          << ", tiles loaded " << st.tilesLoaded << " (foreground " << st.fgLoads << ", read-ahead " << st.bgLoads
+                          << "), foreground wait " << st.fgWaitNs / 1e9 << " s, failures " << st.failures
+                          << ", in memory " << st.inMemory << ", tiles used by queries " << st.tilesUsed << std::endl;
+            }
         }
 
         static uint64_t slice_key(int plane_idx, int slice_idx) {
@@ -342,9 +398,42 @@
                 return;
             }
             const fs::path root = streamingCacheRoot(base_path, remote_url);
-            files = std::make_unique<vcr::sources::EncodedFiles>([root](const std::string& location) {
+            range_min_free_bytes = static_cast<uint64_t>(
+                std::max<std::int64_t>(0, vc::settings::remoteOpenOptions(root).cacheMinFreeBytes.value_or(0)));
+            const char* rr = std::getenv("VC_NORMAL_GRID_RANGE_READS");
+            range_reads = rr && std::string(rr) == "1";
+            if (const auto cap = env_bytes("VC_NORMAL_GRID_RANGE_MEMORY_BYTES")) range_memory_cap = *cap;
+            // Range reads are many small requests, so latency, not bandwidth, bounds
+            // them: they read further ahead with more in flight than whole files
+            // (measured on a 150 ms, 6 MB/s link: 64 in flight took 1.6-1.9x as
+            // long as 128). vc_reader shares connections, DNS answers and TLS
+            // sessions across its handles, so this many do not each reconnect.
+            // VC3D's download parallelism, when set, still decides the connections.
+            int connections = 0;
+            if (range_reads) {
+                readahead_radius = static_cast<int>(env_size("VC_NORMAL_GRID_RANGE_AHEAD", 12));
+                readahead_limit = static_cast<int>(env_size("VC_NORMAL_GRID_RANGE_THREADS", 128));
+#ifndef _WIN32
+                // Each request in flight holds a few descriptors (its connection and
+                // libcurl's wakeup pair); past the open-file limit, connects and even
+                // DNS lookups fail. Stay within an eighth of it (32 at macOS's
+                // default 256; VC3D raises its own limit at startup).
+                rlimit files{};
+                if (::getrlimit(RLIMIT_NOFILE, &files) == 0 && files.rlim_cur != RLIM_INFINITY) {
+                    const int fit = static_cast<int>(std::min<rlim_t>(files.rlim_cur / 8, 1 << 20));
+                    if (fit < readahead_limit) {
+                        readahead_limit = std::max(8, fit);
+                        std::cerr << "normal-grid range reads: " << readahead_limit << " in flight (open-file limit "
+                                  << files.rlim_cur << "; raise it, e.g. ulimit -n 10240, for faster reads)" << std::endl;
+                    }
+                }
+#endif
+                connections = vc::settings::remoteDownloadParallelism().value_or(std::max(readahead_limit, 16));
+            }
+            files = std::make_shared<vcr::sources::EncodedFiles>([root, connections](const std::string& location) {
                 auto options = vc::settings::remoteOpenOptions(root);
                 options.access = vcr::zarr::resolveAccess(location);
+                if (connections) options.connections = connections;
                 return options;
             });
         }
@@ -445,10 +534,221 @@
 
             int slice_idx = static_cast<int>(std::round(coord / sparse_volume)) * sparse_volume;
 
+            if (range_reads) {
+                range_read_ahead(point, plane_idx, slice_idx);
+                const cv::Point2f p = in_plane(point, plane_idx);
+                const int m = static_cast<int>(range_ahead_margin);
+                return get_grid(plane_idx, slice_idx, cv::Rect(int(p.x) - m, int(p.y) - m, 2 * m, 2 * m));
+            }
             return get_grid(plane_idx, slice_idx);
         }
 
-        std::shared_ptr<const GridStore> get_grid(int plane_idx, int slice_idx) const {
+        // In-plane coordinates of `point` on plane_idx's slices, in grid pixels.
+        cv::Point2f in_plane(const cv::Point3f& point, int plane_idx) const {
+            const float s = static_cast<float>(coordinate_scale);
+            switch (plane_idx) {
+                case 0: return {point.x * s, point.y * s};
+                case 1: return {point.x * s, point.z * s};
+                default: return {point.y * s, point.z * s};
+            }
+        }
+
+        // Range reads: fetch, on background threads, the tiles of the region the
+        // tracer queries around `point`, on this slice and the readahead_radius
+        // slices on each side (the region moves little from slice to slice).
+        // Started once per 128-px cell, so a tile is fetched while the tracer
+        // nears it, and each tile of a slice is fetched once. (Measured: a wider
+        // region costs more bytes than it saves waiting; a narrower one, the
+        // query radius alone, saves few bytes and leaves the tracer waiting.)
+        void range_read_ahead(const cv::Point3f& point, int plane_idx, int slice_idx) const {
+            const cv::Point2f p = in_plane(point, plane_idx);
+            if (p.x < 0 || p.y < 0) return;
+            constexpr int cell_px = 128;
+            auto key_of = [plane_idx](int slice, int a, int b) {
+                return (uint64_t(plane_idx) << 62) ^ (uint64_t(uint32_t(slice)) << 32) ^ (uint64_t(uint32_t(a) & 0xffff) << 16) ^
+                       uint64_t(uint32_t(b) & 0xffff);
+            };
+            const uint64_t here = key_of(slice_idx, int(p.x) / cell_px, int(p.y) / cell_px);
+            thread_local uint64_t last_key = ~0ull;
+            thread_local const void* last_owner = nullptr;
+            if (last_key == here && last_owner == this) return;
+            last_key = here;
+            last_owner = this;
+            std::lock_guard<std::mutex> lock(readahead_mutex);
+            if (range_ahead_triggered.count(here)) return;
+            // Tiles in the plane's bucket grid (origin bx, by), so a tile here is a tile of the file.
+            int ox = 0, oy = 0, tile_px = RemoteGridFile::kTileBuckets * 64;
+            if (const auto& layout = plane_layouts[plane_idx]) {
+                ox = int(layout->bx), oy = int(layout->by), tile_px = RemoteGridFile::kTileBuckets * int(layout->cell);
+            }
+            const float reach = range_ahead_margin;
+            const int tx0 = std::max(0, int(std::floor((p.x - reach - ox) / tile_px)));
+            const int tx1 = std::max(0, int(std::floor((p.x + reach - ox) / tile_px)));
+            const int ty0 = std::max(0, int(std::floor((p.y - reach - oy) / tile_px)));
+            const int ty1 = std::max(0, int(std::floor((p.y + reach - oy) / tile_px)));
+            const int ptx = int(std::floor((p.x - ox) / tile_px)), pty = int(std::floor((p.y - oy) / tile_px));
+            std::vector<std::pair<int, int>> tiles{{ptx, pty}};  // the point's own tile first
+            for (int ty = ty0; ty <= ty1; ++ty)
+                for (int tx = tx0; tx <= tx1; ++tx)
+                    if (tx != ptx || ty != pty) tiles.push_back({tx, ty});
+            bool complete = true;  // every tile started or fetched already
+            for (int distance = 0; distance <= readahead_radius; ++distance) {
+                for (const int sign : {1, -1}) {
+                    if (distance == 0 && sign < 0) continue;
+                    const int slice = slice_idx + sign * distance * sparse_volume;
+                    if (slice < 0) continue;
+                    for (const auto& [tx, ty] : tiles) {
+                        if (tx < 0 || ty < 0) continue;
+                        const uint64_t key = key_of(slice, tx, ty);
+                        if (range_ahead_fetched.count(key)) continue;
+                        if (readahead_running >= readahead_limit) {
+                            complete = false;  // over the limit: a later query here tries again
+                            continue;
+                        }
+                        range_ahead_fetched.insert(key);
+                        ++readahead_running;
+                        const cv::Rect rect(ox + tx * tile_px, oy + ty * tile_px, tile_px, tile_px);
+                        std::thread([this, plane_idx, slice, rect] {
+                            try {
+                                std::error_code ec;
+                                if (!fs::exists(fs::path(base_path) / relative_grid_path(plane_idx, slice), ec)) {
+                                    const auto file = range_file(plane_idx, slice, rect);
+                                    if (file && *file) {
+                                        const auto b = bucket_rect((*file)->layout(), rect);
+                                        (*file)->ensureBuckets(b.x0, b.y0, b.x1, b.y1, /*foreground=*/false);
+                                    }
+                                }
+                            } catch (const std::exception&) {
+                                // The tracer's own query fetches again and reports failures.
+                            }
+                            std::lock_guard<std::mutex> done(readahead_mutex);
+                            --readahead_running;
+                            readahead_cv.notify_all();
+                        }).detach();
+                    }
+                }
+            }
+            if (complete) range_ahead_triggered.insert(here);
+            else last_key = ~0ull;
+        }
+
+        // Range reads: the mirror of the grid at (plane, slice), opened once and
+        // kept in range_files. nullopt: read it whole instead; a null mirror: the
+        // store does not have it. Concurrent opens of one slice (the tracer and
+        // read-ahead) share one opener. `first_px`: the region the first query reads.
+        using RangeOpen = std::optional<std::shared_ptr<RemoteGridFile>>;
+        RangeOpen range_file(int plane_idx, int slice_idx, std::optional<cv::Rect> first_px) const {
+            const uint64_t open_key = slice_key(plane_idx, slice_idx);
+            std::promise<RangeOpen> promise;
+            std::shared_future<RangeOpen> waiting;
+            {
+                std::lock_guard<std::mutex> lock(readahead_mutex);
+                if (auto known = range_files.find(open_key); known != range_files.end()) return known->second;
+                if (auto live = range_live.find(open_key); live != range_live.end()) {
+                    if (auto file = live->second.lock()) {
+                        remember_range_file_locked(open_key, file);
+                        return RangeOpen(file);
+                    }
+                    range_live.erase(live);
+                }
+                auto it = range_opening.find(open_key);
+                if (it != range_opening.end()) waiting = it->second;
+                else range_opening.emplace(open_key, promise.get_future().share());
+            }
+            if (waiting.valid()) return waiting.get();
+            RangeOpen result;
+            try {
+                result = open_range_now(plane_idx, relative_grid_path(plane_idx, slice_idx), first_px);
+            } catch (...) {
+                // nullopt: read whole
+            }
+            promise.set_value(result);
+            std::lock_guard<std::mutex> lock(readahead_mutex);
+            range_opening.erase(open_key);
+            if (result) {
+                if (*result) range_live[open_key] = *result;
+                remember_range_file_locked(open_key, *result);
+            }
+            return result;
+        }
+
+        // Caller holds readahead_mutex.
+        void remember_range_file_locked(uint64_t open_key, const std::shared_ptr<RemoteGridFile>& file) const {
+            if (range_files.emplace(open_key, file).second) {
+                range_files_order.push_back(open_key);
+                uint64_t held = 0;
+                for (const auto& [key, open] : range_files)
+                    if (open) held += open->residentBytes();
+                while (range_files_order.size() > 1 &&
+                       (range_files_order.size() > kRangeFilesCap || held > range_memory_cap)) {
+                    const auto oldest = range_files.find(range_files_order.front());
+                    if (oldest->second) held -= std::min(held, oldest->second->residentBytes());
+                    range_files.erase(oldest);
+                    range_files_order.pop_front();
+                }
+            }
+            if (range_live.size() > 2 * range_files.size() + 1024)
+                std::erase_if(range_live, [](const auto& entry) { return entry.second.expired(); });
+        }
+
+        RangeOpen open_range_now(int plane_idx, const std::string& rel, std::optional<cv::Rect> first_px) const {
+            const std::string grid_path = (fs::path(base_path) / rel).string();
+            std::optional<RemoteGridFile::Layout> layout;
+            {
+                std::lock_guard<std::mutex> lock(readahead_mutex);
+                layout = plane_layouts[plane_idx];
+            }
+            const std::string location = remote_url + "/" + rel;
+            RemoteGridFile::Options options;
+            options.min_free_bytes = range_min_free_bytes;
+            options.charge = [files = files, location](const std::string& path, uint64_t bytes) {
+                return files->chargeFile(location, path, static_cast<std::int64_t>(bytes));
+            };
+            if (layout) {
+                options.layout = &*layout;
+                if (first_px && layout->cell) options.first = bucket_rect(*layout, *first_px);
+            }
+            auto fetcher = [files = files, location](const std::vector<std::pair<uint64_t, uint64_t>>& ranges,
+                                                     const std::string& version) {
+                try {
+                    auto read = files->readRanges(location, ranges, version);
+                    return RemoteGridFile::Fetched{std::move(read.parts), std::move(read.version)};
+                } catch (const vcr::zarr::NotFound& e) {
+                    throw RemoteGridFile::NotFound(e.what());
+                } catch (const vcr::sources::EncodedFiles::Changed& e) {
+                    throw RemoteGridFile::Changed(e.what());
+                }
+            };
+            try {
+                auto remote_file = std::make_shared<RemoteGridFile>(location, grid_path, std::move(fetcher), options);
+                if (!layout) {
+                    std::lock_guard<std::mutex> lock(readahead_mutex);
+                    if (!plane_layouts[plane_idx]) plane_layouts[plane_idx] = remote_file->layout();
+                }
+                return remote_file;
+            } catch (const RemoteGridFile::NotFound&) {
+                return std::shared_ptr<RemoteGridFile>();
+            } catch (const std::exception& e) {
+                std::lock_guard<std::mutex> lock(fetch_error_mutex);
+                const std::string message = "normal-grid range read of " + rel + " unavailable, downloading it whole: " + e.what();
+                if (message != last_range_fallback) {
+                    last_range_fallback = message;
+                    std::cerr << message << std::endl;
+                }
+                return std::nullopt;
+            }
+        }
+
+        // Grid pixels to the buckets of a file with `layout`, inclusive.
+        static RemoteGridFile::BucketRect bucket_rect(const RemoteGridFile::Layout& layout, const cv::Rect& px) {
+            const int c = static_cast<int>(layout.cell);
+            auto floor_div = [c](int v) { return v >= 0 ? v / c : -((-v + c - 1) / c); };
+            return {floor_div(px.x - int(layout.bx)), floor_div(px.y - int(layout.by)),
+                    floor_div(px.br().x - 1 - int(layout.bx)), floor_div(px.br().y - 1 - int(layout.by))};
+        }
+
+        std::shared_ptr<const GridStore> get_grid(int plane_idx, int slice_idx,
+                                                  std::optional<cv::Rect> first_px = std::nullopt) const {
             cv::Vec2i key(plane_idx, slice_idx);
 
             // Use shared_lock for read-only cache lookup (hot path)
@@ -482,18 +782,31 @@
             const std::string rel = relative_grid_path(plane_idx, slice_idx);
             std::string grid_path = (fs::path(base_path) / rel).string();
 
+            std::shared_ptr<GridStore> grid_store;
             std::optional<vcr::sources::EncodedFiles::Opened> pinned;
-            if (remote) {
-                std::error_code ec;
-                if (!fs::exists(fs::path(base_path) / rel, ec)) read_ahead(plane_idx, slice_idx);
+            std::error_code exists_ec;
+            if (range_reads && !fs::exists(fs::path(base_path) / rel, exists_ec)) {
+                if (auto opened = range_file(plane_idx, slice_idx, first_px)) {
+                    if (!*opened) {  // the store does not have it
+                        std::unique_lock<std::shared_mutex> lock(mutex);
+                        insert_locked(key, nullptr);
+                        return nullptr;
+                    }
+                    grid_store = std::make_shared<GridStore>(std::move(*opened));
+                }
             }
-            if (!ensure_local_file(rel, &pinned)) {
-                std::unique_lock<std::shared_mutex> lock(mutex);
-                insert_locked(key, nullptr);
-                return nullptr;
+            if (!grid_store) {
+                if (remote && !range_reads) {
+                    std::error_code ec;
+                    if (!fs::exists(fs::path(base_path) / rel, ec)) read_ahead(plane_idx, slice_idx);
+                }
+                if (!ensure_local_file(rel, &pinned)) {
+                    std::unique_lock<std::shared_mutex> lock(mutex);
+                    insert_locked(key, nullptr);
+                    return nullptr;
+                }
+                grid_store = std::make_shared<GridStore>(grid_path);
             }
- 
-            auto grid_store = std::make_shared<GridStore>(grid_path);
 
             // if (plane_idx == 0) { // XY plane
             //     if (!grid_store->meta.contains("umbilicus_x") || !grid_store->meta.contains("umbilicus_y")) {

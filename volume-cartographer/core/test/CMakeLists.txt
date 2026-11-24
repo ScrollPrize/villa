@@ -419,6 +419,8 @@ vc_add_test(NAME test_gridstore_branches)
 
 vc_add_test(NAME test_gridstore_malformed)
 
+vc_add_test(NAME test_remote_grid_file)
+
 vc_add_test(NAME test_normalgridtools)
 
 # Live S3: PHerc 0139 catalog/object-store identity. Soft-skips when offline;

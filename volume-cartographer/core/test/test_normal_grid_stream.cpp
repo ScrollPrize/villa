@@ -10,9 +10,11 @@
 #include "vc/core/util/GridStore.hpp"
 #include "vc/core/util/AnonymousPages.hpp"
 #include "vc/core/util/NormalGridVolume.hpp"
+#include "vc/core/util/RemoteGridFile.hpp"
 
 #include <vc_reader/zarr.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
@@ -197,4 +199,126 @@ TEST_CASE("Streaming store: a marker directory outside the cache layout is refus
     REQUIRE(vc::core::util::writeNormalGridsRemoteMarker(elsewhere, s.url));
     CHECK_THROWS_WITH_AS(NormalGridVolume(elsewhere.string()), doctest::Contains("must be cached at <root>/"), std::runtime_error);
     CHECK(s.fetches("metadata.json") == 0);
+}
+
+namespace {
+// VC_NORMAL_GRID_RANGE_READS=1 for one scope.
+struct RangeReads {
+    RangeReads() { setenv("VC_NORMAL_GRID_RANGE_READS", "1", 1); }
+    ~RangeReads() { unsetenv("VC_NORMAL_GRID_RANGE_READS"); }
+};
+
+std::vector<std::vector<cv::Point>> points(const std::vector<std::shared_ptr<std::vector<cv::Point>>>& paths)
+{
+    std::vector<std::vector<cv::Point>> out;
+    for (const auto& p : paths) out.push_back(*p);
+    return out;
+}
+}  // namespace
+
+TEST_CASE("Range reads: grids are read in parts, never downloaded whole, and answer as whole files do")
+{
+    Streamed s;
+    RangeReads on;
+    std::atomic<int> wholeGets{0};
+    s.server.setHandler([&](const LoopbackHttpServer::Request& request) -> std::optional<LoopbackHttpServer::Response> {
+        if (request.path.ends_with(".grid") && request.header("range").empty()) ++wholeGets;
+        return std::nullopt;
+    });
+    {
+    NormalGridVolume volume(s.dir.string());
+    const auto grid = volume.get_grid(0, 0);
+    REQUIRE(grid != nullptr);
+    CHECK_FALSE(fs::exists(s.dir / "xy" / "000000.grid"));
+    CHECK(fs::is_regular_file(s.dir / "xy" / "000000.grid.ranges"));
+    vc::core::util::GridStore whole((s.store / "xy" / "000000.grid").string());
+    for (const auto& rect : {cv::Rect(0, 0, 100, 100), cv::Rect(0, 0, 5, 5), cv::Rect(8, 8, 3, 3), cv::Rect(50, 50, 40, 40)})
+        CHECK(points(grid->get(rect)) == points(whole.get(rect)));
+
+    // A slice the store does not have: one request, then remembered.
+    CHECK(volume.get_grid(0, 42) == nullptr);
+    CHECK(volume.get_grid(0, 42) == nullptr);
+    CHECK(s.fetches("xy/000042.grid") == 1);
+
+    // query_nearest drives the read-ahead of the neighbouring slices' same region.
+    REQUIRE(volume.query_nearest(cv::Point3f(5.f, 5.f, 2.f), 0) != nullptr);
+    CHECK(volume.cacheStats().fetchFailures == 0);
+    }  // the destructor waits for read-ahead
+    CHECK(wholeGets == 0);
+    CHECK(fs::is_regular_file(s.dir / "xy" / "000003.grid.ranges"));
+    CHECK_FALSE(fs::exists(s.dir / "xy" / "000003.grid"));
+    CHECK(s.temporaries().empty());
+
+    // A later volume replays the pack: nothing fetched again.
+    const auto before = s.fetches("xy/000000.grid");
+    NormalGridVolume again(s.dir.string());
+    REQUIRE(again.get_grid(0, 0) != nullptr);
+    (void)again.get_grid(0, 0)->get(cv::Rect(0, 0, 100, 100));
+    CHECK(s.fetches("xy/000000.grid") == before);
+}
+
+TEST_CASE("Range reads: under a tiny memory cap read-ahead files are dropped and replayed, answers unchanged")
+{
+    Streamed s;
+    RangeReads on;
+    setenv("VC_NORMAL_GRID_RANGE_MEMORY_BYTES", "1", 1);
+    {
+        NormalGridVolume volume(s.dir.string());
+        for (int slice = 0; slice < 8; ++slice) {
+            REQUIRE(volume.query_nearest(cv::Point3f(5.f, 5.f, float(slice)), 0) != nullptr);
+            const auto grid = volume.get_grid(0, slice);
+            REQUIRE(grid != nullptr);
+            vc::core::util::GridStore whole((s.store / "xy" / gridName(slice)).string());
+            CHECK(points(grid->get(cv::Rect(0, 0, 100, 100))) == points(whole.get(cv::Rect(0, 0, 100, 100))));
+        }
+        CHECK(volume.cacheStats().fetchFailures == 0);
+    }
+    unsetenv("VC_NORMAL_GRID_RANGE_MEMORY_BYTES");
+    // What was dropped from memory is still in the packs: nothing is fetched again.
+    std::vector<std::size_t> before;
+    for (int slice = 0; slice < 8; ++slice) before.push_back(s.fetches("xy/" + gridName(slice)));
+    NormalGridVolume again(s.dir.string());
+    for (int slice = 0; slice < 8; ++slice) {
+        const auto grid = again.get_grid(0, slice);
+        REQUIRE(grid != nullptr);
+        (void)grid->get(cv::Rect(0, 0, 100, 100));
+        CHECK(s.fetches("xy/" + gridName(slice)) == before[slice]);
+    }
+}
+
+TEST_CASE("Range reads: a store that ignores Range is downloaded whole, as without the option")
+{
+    Streamed s;
+    RangeReads on;
+    s.server.setHandler([&](const LoopbackHttpServer::Request& request) -> std::optional<LoopbackHttpServer::Response> {
+        if (!request.path.ends_with(".grid") || !fs::exists(s.store / request.path.substr(4))) return std::nullopt;
+        std::ifstream in(s.store / request.path.substr(4), std::ios::binary);
+        return LoopbackHttpServer::Response{200, std::string(std::istreambuf_iterator<char>(in), {}), {}, false};
+    });
+    NormalGridVolume volume(s.dir.string());
+    const auto grid = volume.get_grid(0, 0);
+    REQUIRE(grid != nullptr);
+    CHECK(fs::is_regular_file(s.dir / "xy" / "000000.grid"));
+    vc::core::util::GridStore whole((s.store / "xy" / "000000.grid").string());
+    CHECK(points(grid->get(cv::Rect(0, 0, 100, 100))) == points(whole.get(cv::Rect(0, 0, 100, 100))));
+}
+
+TEST_CASE("Range reads: under the free-space floor grids are read into memory, not left out")
+{
+    Streamed s;
+    RangeReads on;
+    { NormalGridVolume warm(s.dir.string()); }  // the store's metadata is cached whole, as before
+    writeIni(s.config, 1000000000ULL);  // more free space than any disk has
+    const auto inMemory = vc::core::util::RemoteGridFile::globalStats().inMemory;
+    {
+    NormalGridVolume starved(s.dir.string());
+    const auto grid = starved.get_grid(1, 0);
+    REQUIRE(grid != nullptr);
+    vc::core::util::GridStore whole((s.store / "xz" / "000000.grid").string());
+    CHECK(points(grid->get(cv::Rect(0, 0, 100, 100))) == points(whole.get(cv::Rect(0, 0, 100, 100))));
+    CHECK(starved.cacheStats().fetchFailures == 0);
+    }
+    CHECK(vc::core::util::RemoteGridFile::globalStats().inMemory > inMemory);
+    CHECK_FALSE(fs::exists(s.dir / "xz" / "000000.grid"));
+    CHECK_FALSE(fs::exists(s.dir / "xz" / "000000.grid.ranges"));
 }
