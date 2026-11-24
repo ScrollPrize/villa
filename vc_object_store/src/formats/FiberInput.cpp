@@ -50,6 +50,7 @@ std::vector<Prepared> fibers(const std::filesystem::path& path, const std::vecto
     std::set<std::string> existing, incoming;
     for (const auto& uuid : available) existing.insert(util::canonicalUuid(uuid));
     std::vector<Prepared> batch;
+    size_t embedded = 0;
     const auto add = [&](const Json& document, const fs::path& source) {
         auto decoded = fiberDocument(document, source, options);
         if (!incoming.insert(decoded.object.uuid).second) throw std::runtime_error("duplicate fiber UUID in import");
@@ -63,6 +64,7 @@ std::vector<Prepared> fibers(const std::filesystem::path& path, const std::vecto
                 !root.at("point_collections").is_array()) throw std::runtime_error("expected fiber JSON or fiber collection");
             for (const auto& document : root.at("point_collections"))
                 add(document, source.parent_path() / (util::canonicalUuid(document.at("uuid").get<std::string>()) + ".json"));
+            embedded = batch.size();
         }
     };
     if (fs::is_directory(path)) {
@@ -77,8 +79,9 @@ std::vector<Prepared> fibers(const std::filesystem::path& path, const std::vecto
     } else read(path);
     if (batch.empty()) throw std::runtime_error("no fibers were found");
     // Versions 1 and 3 name branch targets only by file; they resolve through the peer file's UUID.
-    // So do version-4 branches that VC3D saved with a branch_file but no target_uuid, as in the
-    // published fiber annotations. Reciprocal declarations are reconciled by the relationship importer.
+    // So do version-4 branches that VC3D saved in fiber files with a branch_file but no target_uuid,
+    // as in the published fiber annotations; a collection's branch_file names no file beside it.
+    // Reciprocal declarations are reconciled by the relationship importer.
     std::map<fs::path, std::string> fileUuids;
     for (size_t i = 0; i < batch.size(); ++i) {
         const auto source = fs::path(batch[i].object.storageRef);
@@ -90,7 +93,7 @@ std::vector<Prepared> fibers(const std::filesystem::path& path, const std::vecto
             auto kept = Json::array();
             bool rewrite = legacy;
             for (auto branch : metadata.value(key, Json::array())) {
-                const bool byFile = legacy || (!branch.contains("target_uuid") && branch.contains("branch_file"));
+                const bool byFile = legacy || (i >= embedded && !branch.contains("target_uuid") && branch.contains("branch_file"));
                 rewrite = rewrite || byFile;
                 const auto peerPath = [&] {
                     return source.parent_path() / fs::path(branch.at("branch_file").get<std::string>()).filename();

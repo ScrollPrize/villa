@@ -38,7 +38,7 @@ void version1Fields(Json& root)
 
 // Version 3 names its frame "SAMPLE/VOLUME_ID@Lk". Only level 0 (scale factor 1) is
 // exactly the store's {volume_uuid, scale_factor 1}; other levels are refused.
-void version3Coordinates(Json& root)
+void version3Coordinates(Json& root, bool keepOpenData = false)
 {
     if (root.contains("vc_open_data_coordinate_space")) {
         const auto space = root.at("vc_open_data_coordinate_space").get<std::string>();
@@ -50,6 +50,7 @@ void version3Coordinates(Json& root)
         root["coordinates"] = mergeGeometryCoordinates(root.value("coordinates", Json::object()),
             {{"volume_uuid", space.substr(slash + 1, level - slash - 1)}, {"scale_factor", 1}});
     }
+    if (keepOpenData) return;
     std::vector<std::string> openData;
     for (const auto& [key, value] : root.items())
         if (key.starts_with("vc_open_data_")) openData.push_back(key);
@@ -77,7 +78,8 @@ GeometrySource decodeFiberJson(const std::string& text)
     if (version != 1 && version != 3 && version != 4)
         throw std::runtime_error("Fiber transfer requires version 1, 3 or 4");
     if (version == 1) version1Fields(root);
-    if (version < 4 || version4Level0Frame(root)) version3Coordinates(root);
+    if (version < 4) version3Coordinates(root);
+    else if (version4Level0Frame(root)) version3Coordinates(root, true);
     detail::validateSourceTopology("fiber", root);
     GeometrySource p;
     p.object.uuid = util::canonicalUuid(root.at("uuid").get<std::string>());
