@@ -1,8 +1,10 @@
 #create_st.py
 import argparse
+import heapq
 import sys
 import torch
 from torch import nn
+import torch.nn.functional as F
 import numpy as np
 from pathlib import Path
 from typing import Optional, Union
@@ -548,6 +550,105 @@ def _eigh_3x3_analytical_f64(
     return w3, v9
 
 
+_COHERENCE_CELL_SIZE = 16
+
+
+def _align_vector_field_coherent_(v: torch.Tensor, cell_size: int = _COHERENCE_CELL_SIZE) -> None:
+    """In-place sign alignment of a (3, dz, dy, dx) unit vector field for local coherence.
+
+    Pools local 3x3 outer-product scatter matrices onto a coarse grid (cell_size^3 voxels),
+    orients the coarse principal axes via a maximum-coherence spanning tree seeded with a
+    deterministic hemisphere sign, trilinearly upsamples the guide field one channel at a
+    time (bounded workspace), and aligns each voxel's sign to the local guide. Zero voxels
+    stay exact +0.0.
+    """
+    _, dz, dy, dx = v.shape
+    gz = max(1, (dz + cell_size - 1) // cell_size)
+    gy = max(1, (dy + cell_size - 1) // cell_size)
+    gx = max(1, (dx + cell_size - 1) // cell_size)
+
+    if gz * gy * gx == 1:
+        vf = v.reshape(3, -1)
+        C = torch.empty((3, 3), dtype=torch.float64)
+        for i in range(3):
+            for j in range(i, 3):
+                val = float(torch.dot(vf[i], vf[j]).item())
+                C[i, j] = val
+                C[j, i] = val
+        if float(C.abs().sum().item()) == 0.0:
+            return
+        _, evecs = torch.linalg.eigh(C)
+        ref = evecs[:, 2]
+        if float((ref[0] + 0.37139068 * ref[1] + 0.13130643 * ref[2]).item()) < 0.0:
+            ref = -ref
+        ref = ref.to(device=v.device, dtype=v.dtype)
+        dot = ref[0] * v[0] + ref[1] * v[1] + ref[2] * v[2]
+    else:
+        pooled = torch.empty((6, gz, gy, gx), dtype=torch.float32, device=v.device)
+        for k, (i, j) in enumerate(((0, 0), (0, 1), (0, 2), (1, 1), (1, 2), (2, 2))):
+            prod = (v[i] * v[j]).unsqueeze(0).unsqueeze(0)
+            pooled[k] = F.adaptive_avg_pool3d(prod, (gz, gy, gx))[0, 0]
+        pf = pooled.reshape(6, -1).cpu().double()
+        n_cells = pf.shape[1]
+        M = torch.empty((n_cells, 3, 3), dtype=torch.float64)
+        M[:, 0, 0] = pf[0]
+        M[:, 0, 1] = pf[1]
+        M[:, 0, 2] = pf[2]
+        M[:, 1, 0] = pf[1]
+        M[:, 1, 1] = pf[3]
+        M[:, 1, 2] = pf[4]
+        M[:, 2, 0] = pf[2]
+        M[:, 2, 1] = pf[4]
+        M[:, 2, 2] = pf[5]
+        evals, evecs = torch.linalg.eigh(M)
+        top = evecs[:, :, 2].numpy().reshape(gz, gy, gx, 3)
+        strength = (evals[:, 2] - evals[:, 1]).numpy().reshape(gz, gy, gx)
+        energy = evals.sum(dim=1).numpy().reshape(gz, gy, gx)
+        top[energy <= 0.0] = 0.0
+
+        visited = np.zeros((gz, gy, gx), dtype=bool)
+        nbrs = ((-1, 0, 0), (1, 0, 0), (0, -1, 0), (0, 1, 0), (0, 0, -1), (0, 0, 1))
+        while True:
+            rem = np.where(~visited & (energy > 0.0), strength, -1.0)
+            if float(rem.max()) < 0.0:
+                break
+            sz, sy, sx = np.unravel_index(int(np.argmax(rem)), (gz, gy, gx))
+            r0 = top[sz, sy, sx]
+            if float(r0[0] + 0.37139068 * r0[1] + 0.13130643 * r0[2]) < 0.0:
+                top[sz, sy, sx] = -r0
+            visited[sz, sy, sx] = True
+            pq: list[tuple[float, int, int, int, int, int, int]] = []
+            for dz0, dy0, dx0 in nbrs:
+                nz, ny, nx = sz + dz0, sy + dy0, sx + dx0
+                if 0 <= nz < gz and 0 <= ny < gy and 0 <= nx < gx and not visited[nz, ny, nx] and energy[nz, ny, nx] > 0.0:
+                    w = abs(float(np.dot(top[sz, sy, sx], top[nz, ny, nx])))
+                    heapq.heappush(pq, (-w, nz, ny, nx, sz, sy, sx))
+            while pq:
+                _, cz, cy, cx, pz, py, px = heapq.heappop(pq)
+                if visited[cz, cy, cx]:
+                    continue
+                visited[cz, cy, cx] = True
+                if float(np.dot(top[cz, cy, cx], top[pz, py, px])) < 0.0:
+                    top[cz, cy, cx] = -top[cz, cy, cx]
+                for dz0, dy0, dx0 in nbrs:
+                    nz, ny, nx = cz + dz0, cy + dy0, cx + dx0
+                    if 0 <= nz < gz and 0 <= ny < gy and 0 <= nx < gx and not visited[nz, ny, nx] and energy[nz, ny, nx] > 0.0:
+                        w = abs(float(np.dot(top[cz, cy, cx], top[nz, ny, nx])))
+                        heapq.heappush(pq, (-w, nz, ny, nx, cz, cy, cx))
+
+        guide = torch.from_numpy(top.transpose(3, 0, 1, 2).copy()).to(device=v.device, dtype=v.dtype).unsqueeze(0)
+        dot = torch.zeros((dz, dy, dx), dtype=v.dtype, device=v.device)
+        for c in range(3):
+            gc = F.interpolate(guide[:, c : c + 1], size=(dz, dy, dx), mode="trilinear", align_corners=False)[0, 0]
+            dot.addcmul_(v[c], gc)
+
+    tie = (dot == 0.0) & ((v[0] + 0.37139068 * v[1] + 0.13130643 * v[2]) < 0.0)
+    flip = (dot < 0.0) | tie
+    if bool(flip.any().item()):
+        for c in range(3):
+            v[c] = torch.where(flip, -v[c], v[c])
+
+
 def _compute_eigenvectors_impl(block: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     _, dz, dy, dx = block.shape
     N = dz * dy * dx
@@ -570,7 +671,17 @@ def _compute_eigenvectors_impl(block: torch.Tensor) -> tuple[torch.Tensor, torch
         eigvals_flat[:, bi] = wi
         eigvecs_flat[:, bi] = vi
 
-    return eigvals_flat.view(3, dz, dy, dx), eigvecs_flat.view(9, dz, dy, dx)
+    eigvecs_3d = eigvecs_flat.view(9, dz, dy, dx)
+    v0 = eigvecs_3d[0:3]
+    v2 = eigvecs_3d[6:9]
+    _align_vector_field_coherent_(v2)
+    _align_vector_field_coherent_(v0)
+    # Recompute v1 = v2 x v0 so all three eigenvector fields are locally coherent and right-handed.
+    eigvecs_3d[3] = v2[1] * v0[2] - v2[2] * v0[1]
+    eigvecs_3d[4] = v2[2] * v0[0] - v2[0] * v0[2]
+    eigvecs_3d[5] = v2[0] * v0[1] - v2[1] * v0[0]
+
+    return eigvals_flat.view(3, dz, dy, dx), eigvecs_3d
 
 
 def _compute_eigenvectors(block: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
