@@ -337,7 +337,7 @@ public:
         is_valid_ = !collections_.empty();
     }
 
-    void init(const cv::Mat_<cv::Vec3f> &points) {
+    void init(const cv::Mat_<cv::Vec3f>& points, const cv::Rect& resume_area) {
         if (!is_valid_ || points.empty()) {
             is_valid_ = false;
             return;
@@ -347,18 +347,21 @@ public:
 
         for (auto& collection : collections_) {
             if (collection.anchor2d_.has_value()) {
-                // Use the provided 2D anchor directly - this is the drag-and-drop case
-                cv::Vec2f anchor = collection.anchor2d_.value();
-
-                // Bounds check: skip collections where anchor2d is outside surface bounds
-                if (anchor[0] < 0 || anchor[0] >= points.cols ||
-                    anchor[1] < 0 || anchor[1] >= points.rows) {
+                const cv::Vec2f source_anchor = *collection.anchor2d_;
+                if (!(source_anchor[0] >= 0 && source_anchor[0] < resume_area.width &&
+                      source_anchor[1] >= 0 && source_anchor[1] < resume_area.height)) {
                     std::cout << "Warning: skipping correction with out-of-bounds anchor2d: "
-                              << anchor << " (surface size: " << points.cols << "x" << points.rows << ")" << std::endl;
+                              << source_anchor << " (resume surface size: "
+                              << resume_area.width << "x" << resume_area.height << ")" << std::endl;
                     continue;
                 }
 
-                std::cout << "using provided anchor2d: " << anchor << std::endl;
+                // Anchors are stored in resume-surface coordinates, while points
+                // and the local solver use the padded work grid.
+                const cv::Vec2f anchor = source_anchor + cv::Vec2f(
+                    static_cast<float>(resume_area.x), static_cast<float>(resume_area.y));
+                std::cout << "using provided anchor2d: " << source_anchor
+                          << " (work grid: " << anchor << ")" << std::endl;
 
                 // Convert 2D grid location to pointer coordinates
                 // pointer coords are relative to center: ptr = grid_loc - center
@@ -2512,7 +2515,8 @@ QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const nlo
         resume_pad_x = (w - resume_points.cols) / 2;
         resume_pad_y = (h - resume_points.rows) / 2;
 
-        used_area = cv::Rect(resume_pad_x, resume_pad_y, resume_points.cols, resume_points.rows);
+        const cv::Rect resume_area(resume_pad_x, resume_pad_y, resume_points.cols, resume_points.rows);
+        used_area = resume_area;
         // Stay within the requested expansion (none with disable_grid_expansion, as in
         // VC3D Fill) and two cells from the work grid edge, which add_losses requires.
         resume_growth_limit = cv::Rect(resume_pad_x - resume_extra_cols, resume_pad_y - resume_extra_rows,
@@ -2610,7 +2614,7 @@ QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const nlo
             use_growth_scale ? (1.0f / static_cast<float>(growth_scale_factor)) : 1.0f);
 
         if (trace_data.point_correction.isValid()) {
-            trace_data.point_correction.init(trace_params.dpoints);
+            trace_data.point_correction.init(trace_params.dpoints, resume_area);
 
             std::cout << "Resuming with " << trace_data.point_correction.all_grid_locs().size() << " correction points." << std::endl;
             cv::Mat mask = resume_surf->channel("mask", SURF_CHANNEL_NORESIZE);
