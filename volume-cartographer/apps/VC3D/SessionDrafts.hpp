@@ -45,6 +45,8 @@ public:
 
     // Apply the recovered grid and validity together before the editor saves it.
     static void restoreSurface(QuadSurface& surface, const vc::geometry::Surface& draft);
+    // Preserve the grid and explicit growth exclusions in a recoverable draft.
+    static vc::geometry::Surface surfaceForDraft(QuadSurface& surface);
 
     // Resolve, in the background, pending saves of attached stores: those
     // recovered at start, and those still pending one tick after they were

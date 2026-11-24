@@ -127,7 +127,7 @@ void SurfaceStoreEdit::save(QuadSurface& surface, const cv::Rect& rect, const st
             if(transformed) {
                 vc::geometry::Surface desired;
                 desired.rows=points.rows;desired.columns=points.cols;
-                for(const auto& p:points)desired.points.push_back({p[0],p[1],p[2]});
+                for(const auto& p:surface.pointsForStorage())desired.points.push_back({p[0],p[1],p[2]});
                 for(const auto& array:data.arrays)if(array.name=="valid")desired.validity=array.bytes;
                 const auto canonical=vc::geometry::encode(transformed->canonicalSurface(desired));
                 data.arrays.front()=canonical.arrays.front();

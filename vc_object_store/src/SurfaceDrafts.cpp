@@ -70,6 +70,7 @@ std::shared_ptr<const SurfaceDraft> makeSurfaceDraft(const vc::geometry::Surface
     draft->columns = surface.columns;
     draft->coordinates = geometryCoordinates(coordinates);
     draft->attachment = attachment;
+    draft->channels = std::make_shared<const std::vector<GeometryArray>>(surface.channels);
     for (const auto& rect : surfaceTiles(surface.rows, surface.columns)) {
         SurfaceDraft::Tile tile{rect, std::nullopt, nullptr};
         auto data = std::make_shared<SurfaceDraft::TileData>();
@@ -93,6 +94,7 @@ vc::geometry::Surface draftGrid(const SurfaceDraft& draft)
     vc::geometry::Surface surface{draft.rows, draft.columns, {1, 1}, {}};
     surface.points.resize(count);
     surface.validity.assign(count, 1);
+    if (draft.channels) surface.channels = *draft.channels;
     for (const auto& tile : draft.tiles)
         for (int64_t r = 0; r < tile.rect.rows; ++r)
             for (int64_t c = 0; c < tile.rect.columns; ++c) {

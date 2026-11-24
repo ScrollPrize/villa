@@ -460,6 +460,10 @@ public:
     };
     // Coordinates hidden by the input validity mask, indexed in the raw grid.
     std::vector<MaskedVertex> maskedVertices;
+    // Per-vertex input mask using the store's reduction for oversampled masks.
+    cv::Mat_<uint8_t> vertexMask();
+    // Retain coordinates behind the mask only when writing a surface.
+    cv::Mat_<cv::Vec3f> pointsForStorage();
     // Loads a registered channel that has no data yet (e.g. from its stored
     // geometry revision) on first access.
     void setChannelLoader(std::function<cv::Mat(const std::string&)> loader) { _channelLoader = std::move(loader); }

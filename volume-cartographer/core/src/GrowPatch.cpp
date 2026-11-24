@@ -226,12 +226,9 @@ static std::unique_ptr<QuadSurface> make_growth_scale_resume_surface(QuadSurface
     scaled->path = source.path;
     scaled->meta = source.meta;
     scaled->setDpi(source.dpi());
-    for (const auto& vertex : source.maskedVertices)
-        if (vertex.cell.x % factor == 0 && vertex.cell.y % factor == 0)
-            scaled->maskedVertices.push_back({{vertex.cell.x / factor, vertex.cell.y / factor}, vertex.coords});
-
     const cv::Size dst_size = scaled_points.size();
     for (const std::string& name : source.channelNames()) {
+        if (name == "growth_exclusions") continue;
         cv::Mat channel = source.channel(name, SURF_CHANNEL_NORESIZE);
         if (!channel.empty()) {
             scaled->setChannel(name, downsample_channel_for_growth(channel, dst_size, name));
@@ -291,6 +288,89 @@ static QuadSurface* make_output_scale_surface(QuadSurface* coarse,
     }
 
     delete coarse;
+    return output;
+}
+
+struct GrowthExclusion {
+    cv::Point cell;
+    cv::Vec3f coords;
+    uint16_t generation;
+};
+
+static std::vector<GrowthExclusion> read_growth_exclusions(QuadSurface& source)
+{
+    const auto mask = source.vertexMask();
+    const auto marker = source.channel("growth_exclusions", SURF_CHANNEL_NORESIZE);
+    if (mask.empty() && marker.empty()) return {};
+
+    const auto points = source.pointsForStorage();
+    if (!marker.empty() && (marker.size() != points.size() || marker.type() != CV_8UC1))
+        throw std::runtime_error("growth_exclusions must be an 8-bit channel at the surface grid resolution");
+    const cv::Mat_<uint16_t> generations = source.channel("generations");
+    std::vector<GrowthExclusion> exclusions;
+    for (int r = 0; r < points.rows; ++r) {
+        for (int c = 0; c < points.cols; ++c) {
+            if (!mask.empty() && mask(r, c) != 0) continue;
+            const bool marked = !marker.empty() && marker.at<uint8_t>(r, c) != 0;
+            const auto point = points(r, c);
+            if (marked || (!mask.empty() && vc::geometry::validSurfacePoint(point)))
+                exclusions.push_back({{c, r}, point, generations.empty() ? uint16_t(0) : generations(r, c)});
+        }
+    }
+    return exclusions;
+}
+
+static bool sampled_at_growth_scale(const cv::Point& cell, int factor)
+{
+    return cell.x % factor == 0 && cell.y % factor == 0;
+}
+
+static QuadSurface* finish_resume_surface(QuadSurface* working, const cv::Vec2f& scale, int factor,
+                                          const cv::Size& size, const cv::Point& offset,
+                                          const std::vector<GrowthExclusion>& input_exclusions,
+                                          bool corrected)
+{
+    auto exclusions = input_exclusions;
+    if (factor > 1 && !exclusions.empty()) {
+        auto& working_points = *working->rawPointsPtr();
+        const cv::Rect bounds(cv::Point{}, working_points.size());
+        const cv::Mat_<uint16_t> generations = working->channel("generations", SURF_CHANNEL_NORESIZE);
+        for (auto& exclusion : exclusions) {
+            if (!sampled_at_growth_scale(exclusion.cell, factor)) continue;
+            const cv::Point cell(exclusion.cell.x / factor + offset.x, exclusion.cell.y / factor + offset.y);
+            if (!bounds.contains(cell)) continue;
+            auto& point = working_points(cell);
+            if (corrected && vc::geometry::validSurfacePoint(point)) {
+                exclusion.coords = point;
+                exclusion.generation = generations(cell);
+            }
+            point = {-1, -1, -1};
+        }
+    }
+
+    auto* output = make_output_scale_surface(working, scale, factor, size);
+    auto& points = *output->rawPointsPtr();
+    const cv::Rect bounds(cv::Point{}, points.size());
+    cv::Mat_<uint8_t> mask(points.size());
+    std::transform(points.begin(), points.end(), mask.begin(),
+                   [](const auto& p) { return vc::geometry::validSurfacePoint(p) ? 255 : 0; });
+    cv::Mat_<uint8_t> marker(points.size(), uint8_t(0));
+    cv::Mat_<uint16_t> generations = output->channel("generations", SURF_CHANNEL_NORESIZE);
+    for (const auto& exclusion : exclusions) {
+        const cv::Point cell = exclusion.cell + factor * offset;
+        if (!bounds.contains(cell)) continue;
+        auto& point = points(cell);
+        const bool keep_solved = factor == 1 && corrected && vc::geometry::validSurfacePoint(point);
+        const auto coords = keep_solved ? point : exclusion.coords;
+        if (vc::geometry::validSurfacePoint(coords))
+            output->maskedVertices.push_back({cell, coords});
+        if (!keep_solved) generations(cell) = exclusion.generation;
+        point = {-1, -1, -1};
+        mask(cell) = 0;
+        marker(cell) = 255;
+    }
+    output->setChannel("mask", mask);
+    output->setChannel("growth_exclusions", marker);
     return output;
 }
 
@@ -1868,6 +1948,8 @@ QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const nlo
     const int growth_scale_factor = 1 << growth_scale_level;
     const bool use_growth_scale = resume_surf && growth_scale_factor > 1;
     const cv::Vec2f output_surface_scale = resume_surf ? resume_surf->scale() : cv::Vec2f(1.0f, 1.0f);
+    const auto input_exclusions = resume_surf ? read_growth_exclusions(*resume_surf) : std::vector<GrowthExclusion>{};
+    const bool corrected_resume = !corrections.getAllCollections().empty();
     std::unique_ptr<QuadSurface> growth_scale_resume_surf;
     cv::Mat growth_scale_allowed_mask;
     const cv::Mat* effective_allowed_growth_mask = allowed_growth_mask;
@@ -1894,6 +1976,15 @@ QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const nlo
                       << effective_allowed_growth_mask->rows
                       << ", cells=" << cv::countNonZero(*effective_allowed_growth_mask)
                       << std::endl;
+        }
+    }
+
+    cv::Mat_<uint8_t> working_exclusions;
+    if (!corrected_resume && !input_exclusions.empty()) {
+        working_exclusions = cv::Mat_<uint8_t>(resume_surf->rawPoints().size(), uint8_t(0));
+        for (const auto& exclusion : input_exclusions) {
+            if (sampled_at_growth_scale(exclusion.cell, growth_scale_factor))
+                working_exclusions(exclusion.cell.y / growth_scale_factor, exclusion.cell.x / growth_scale_factor) = 1;
         }
     }
 
@@ -2312,11 +2403,11 @@ QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const nlo
             surf,
             use_growth_scale ? growth_scale_factor : 1,
             true);
-        return make_output_scale_surface(
+        return finish_resume_surface(
             surf,
             output_surface_scale,
             use_growth_scale ? growth_scale_factor : 1,
-            exact_output_size);
+            exact_output_size, {}, input_exclusions, corrected_resume);
     }
 
     
@@ -2441,58 +2532,12 @@ QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const nlo
             surf->meta["grid_offset"] = std::move(off_arr);
         }
 
-        // Preserve explicit input exclusions without copying zeros from old padding.
-        if (resume_surf) {
-            const auto old_mask = resume_surf->channel("mask", SURF_CHANNEL_NORESIZE);
-            auto* new_points = surf->rawPointsPtr();
-            if (!old_mask.empty() && new_points && !new_points->empty()) {
-                const auto* old_points = std::as_const(*resume_surf).rawPointsPtr();
-                std::vector<uint8_t> reduced_mask;
-                cv::Mat_<uint8_t> input_mask = old_mask;
-                if (old_mask.size() != old_points->size()) {
-                    cv::Mat_<double> mask_values;
-                    old_mask.convertTo(mask_values, CV_64F);
-                    reduced_mask = vc::geometry::validityFromMask(
-                        {mask_values.ptr<double>(), mask_values.total()}, old_mask.rows, old_mask.cols,
-                        old_points->rows, old_points->cols);
-                    input_mask = cv::Mat_<uint8_t>(old_points->rows, old_points->cols, reduced_mask.data());
-                }
-                cv::Mat_<uint8_t> new_mask(new_points->size());
-                std::transform(new_points->begin(), new_points->end(), new_mask.begin(),
-                               [](const auto& p) { return vc::geometry::validSurfacePoint(p) ? 255 : 0; });
-                const cv::Mat_<uint16_t> input_generations = resume_surf->channel("generations");
-                cv::Mat_<uint16_t> new_generations = surf->channel("generations", SURF_CHANNEL_NORESIZE);
+        if (!resume_surf) return surf;
 
-                const cv::Point offset(resume_pad_x - used_area_safe.x, resume_pad_y - used_area_safe.y);
-                const cv::Rect input_grid(cv::Point(), old_points->size());
-                const cv::Rect output_grid(cv::Point(), new_points->size());
-                const auto preserve_exclusion = [&](const cv::Point& cell, const cv::Vec3f& coords) {
-                    const cv::Point target = cell + offset;
-                    if (!input_grid.contains(cell) || !output_grid.contains(target))
-                        return;
-                    if (input_mask(cell) == 0) {
-                        new_mask(target) = 0;
-                        (*new_points)(target) = coords;
-                        new_generations(target) = input_generations.empty() ? 0 : input_generations(cell);
-                    }
-                };
-                // Some loaders retain masked coordinates directly in the grid.
-                for (int r = 0; r < old_points->rows; ++r)
-                    for (int c = 0; c < old_points->cols; ++c)
-                        if (input_mask(r, c) == 0 && vc::geometry::validSurfacePoint((*old_points)(r, c)))
-                            preserve_exclusion({c, r}, (*old_points)(r, c));
-                for (const auto& vertex : resume_surf->maskedVertices)
-                    preserve_exclusion(vertex.cell, vertex.coords);
-
-                surf->setChannel("mask", new_mask);
-            }
-        }
-
-        return make_output_scale_surface(
-            surf,
-            output_surface_scale,
-            use_growth_scale ? growth_scale_factor : 1,
-            exact_growth_output_size_for_fill(surf));
+        const cv::Point offset(resume_pad_x - used_area_safe.x, resume_pad_y - used_area_safe.y);
+        return finish_resume_surface(surf, output_surface_scale, growth_scale_factor,
+                                     exact_growth_output_size_for_fill(surf), offset,
+                                     input_exclusions, corrected_resume);
     };
 
     cv::Vec3f vx = {1,0,0};
@@ -2566,7 +2611,7 @@ QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const nlo
                 int target_y = resume_pad_y + j;
                 int target_x = resume_pad_x + i;
                 uint16_t gen = resume_generations.at<uint16_t>(j, i);
-                if (resume_points(j,i)[0] == -1) {
+                if (resume_points(j,i)[0] == -1 || (!working_exclusions.empty() && working_exclusions(j, i))) {
                     continue;
                 }
 
@@ -3145,6 +3190,10 @@ QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const nlo
             if (!trace_data.allowed_growth_mask.empty() &&
                 (!point_in_bounds(trace_data.allowed_growth_mask, p) ||
                  trace_data.allowed_growth_mask(p) == 0)) {
+                return;
+            }
+            const cv::Vec2i input_cell(p[0] - resume_pad_y, p[1] - resume_pad_x);
+            if (point_in_bounds(working_exclusions, input_cell) && working_exclusions(input_cell)) {
                 return;
             }
 

@@ -28,6 +28,8 @@ Every point collection in vc3d should be one broken area. The first point placed
 
 The correction feature will solve an area around each collection of points, Often tracing errors start at a certain location and then spread, so to minimize the annotation effort simply annotate a small area around the initial error and then mask out the full error area. The solver will keep the area around the convex hull of the correction points, hence after correction the surface can now grow along the correct surface.
 
+When a correction solves a position at a masked vertex, the saved surface keeps that position and the vertex stays excluded. GrowPatch records these deliberate exclusions in the grid-resolution `growth_exclusions` channel. A value of 255 marks an excluded cell. This preserves the exclusion through a change in growth scale even if the cell has no XYZ sample in the working grid.
+
 ## Useful Parameters
 
 ### config json for vc_grow_seg_from_seed

@@ -567,6 +567,37 @@ std::vector<std::string> QuadSurface::channelNames() const
     return names;
 }
 
+cv::Mat_<uint8_t> QuadSurface::vertexMask()
+{
+    const auto mask = channel("mask", SURF_CHANNEL_NORESIZE);
+    if (mask.empty() || mask.size() == _points->size()) return mask;
+
+    cv::Mat_<double> values;
+    mask.convertTo(values, CV_64F);
+    const auto validity = vc::geometry::validityFromMask({values.ptr<double>(), values.total()},
+                                                        mask.rows, mask.cols, _points->rows, _points->cols);
+    cv::Mat_<uint8_t> result(_points->size());
+    std::copy(validity.begin(), validity.end(), result.begin());
+    return result;
+}
+
+cv::Mat_<cv::Vec3f> QuadSurface::pointsForStorage()
+{
+    ensureLoaded();
+    if (maskedVertices.empty()) return *_points;
+    const auto mask = vertexMask();
+    if (mask.empty()) return *_points;
+
+    auto points = _points->clone();
+    const cv::Rect bounds(cv::Point{}, points.size());
+    for (const auto& vertex : maskedVertices) {
+        if (bounds.contains(vertex.cell) && mask(vertex.cell) == 0 &&
+            !vc::geometry::validSurfacePoint(points(vertex.cell)))
+            points(vertex.cell) = vertex.coords;
+    }
+    return points;
+}
+
 bool QuadSurface::channelLoaded(const std::string& name) const
 {
     const auto found = _channels.find(name);
@@ -1038,9 +1069,10 @@ void QuadSurface::saveWithUuid(const std::filesystem::path& destination, const s
     std::lock_guard<std::recursive_mutex> lock(vcr::files::directoryMutex(destination));
     std::vector<std::uint8_t> valid;
     (void)gridVertices(valid);
+    const auto points = pointsForStorage();
     std::vector<float> xyz(_points->total() * 3);
     for (int row = 0; row < _points->rows; ++row)
-        std::copy_n(reinterpret_cast<const float*>(_points->ptr(row)), _points->cols * 3,
+        std::copy_n(reinterpret_cast<const float*>(points.ptr(row)), _points->cols * 3,
                     xyz.data() + std::size_t(row) * _points->cols * 3);
     vcr::tifxyz::Metadata metadata;
     metadata.uuid = uuid;

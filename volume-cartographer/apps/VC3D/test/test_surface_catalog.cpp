@@ -11,6 +11,7 @@
 #include "vc/core/util/StoreSurfaces.hpp"
 #include "segmentation/SurfaceCorrections.hpp"
 #include "segmentation/SurfaceStoreEdit.hpp"
+#include "segmentation/SurfaceGridEdit.hpp"
 #include "SessionDrafts.hpp"
 #ifdef VC3D_TEST_HOSTED
 #include <vc_object_store/server/Server.hpp>
@@ -457,6 +458,103 @@ void checkReferencedSurfaceSelections(const fs::path& directory)
 
 // Optional real-data check: copy one stored surface, checkpoint a mask edit,
 // recover it in a new session, then verify that saving preserves every XYZ.
+void checkGrowthExclusionSaves(const fs::path& directory)
+{
+    const auto path = directory / "growth-exclusions.vcobj";
+    const auto checkpoint = directory / "growth-exclusion-drafts";
+    OpenOptions options; options.author = "growth-exclusion-test";
+    { auto store = ObjectStore::create(path, options); }
+    ObjectRecord record; record.uuid = util::newUuid(); record.kind = "surface";
+    record.meta = nlohmann::json{{"coordinates", volumeCoordinates("vol", 1)}}.dump();
+    {
+        auto session = std::make_shared<ObjectStoreSession>();
+        const auto attachment = session->attach(path, options);
+        SessionDrafts drafts(session);
+        require(drafts.start(checkpoint, 0), "growth drafts directory opens");
+        cv::Mat_<cv::Vec3f> initial(3, 3, cv::Vec3f(-1, -1, -1));
+        for (int r = 0; r < 2; ++r)
+            for (int c = 0; c < 3; ++c) initial(r, c) = {float(c), float(r), 10.f};
+        QuadSurface original(initial, {1.f, 1.f});
+        original.setChannel("mask", original.validMask());
+        storeSurface(*session, attachment, record, quad_surface_geometry(original));
+        auto opened = SurfaceCatalog::open(session, attachment, {"vol", 1}, record.uuid);
+        SurfaceStoreEdit edit(session, opened.pin, opened.view);
+
+        // First replace the grid with a larger one, then grow within its existing padding.
+        for (const bool sameSize : {false, true}) {
+            cv::Mat_<cv::Vec3f> points(4, 3, cv::Vec3f(-1, -1, -1));
+            for (int r = 0; r < 3; ++r)
+                for (int c = 0; c < 3; ++c) points(r, c) = {float(c), float(r), 10.f};
+            points(0, 0) = points(0, 1) = {-1, -1, -1};
+            points(3, 1) = {1, 3, 10};
+            if (sameSize) points(3, 2) = {2, 3, 10};
+            QuadSurface result(points, {1.f, 1.f});
+            result.setChannel("mask", result.validMask());
+            cv::Mat_<uint8_t> exclusions(4, 3, uint8_t{0});
+            exclusions(0, 0) = exclusions(0, 1) = 255;
+            result.setChannel("growth_exclusions", exclusions);
+            result.setChannel("generations", cv::Mat_<uint16_t>(4, 3, uint16_t{5}));
+            result.maskedVertices.push_back({{0, 0}, {0, 0, 10}});
+
+            result.rawPoints().copyTo(*opened.surface->rawPointsPtr());
+            opened.surface->invalidateCache();
+            segmentation::applyGrowthChannels(*opened.surface, result);
+            require((*opened.surface->rawPointsPtr())(0, 0) == cv::Vec3f(-1, -1, -1),
+                    "growth keeps excluded coordinates hidden in the GUI");
+            const auto draft = SessionDrafts::surfaceForDraft(*opened.surface);
+            session->setDraft(record.uuid, draft, volumeCoordinates("vol", 1), attachment, edit.pin().reference());
+            edit.save(*opened.surface, {0, 0, 3, 4}, {"mask", "growth_exclusions", "generations"},
+                      session->draftRevision(record.uuid));
+
+            auto reloaded = SurfaceCatalog::open(session, attachment, {"vol", 1}, record.uuid);
+            require((*reloaded.surface->rawPointsPtr())(2, 1) == cv::Vec3f(1, 2, 10) &&
+                    (*reloaded.surface->rawPointsPtr())(3, 1) == cv::Vec3f(1, 3, 10),
+                    "GUI growth saves points in old padding and beyond the old grid");
+            require((*reloaded.surface->rawPointsPtr())(0, 0) == cv::Vec3f(-1, -1, -1) &&
+                    reloaded.surface->channel("growth_exclusions").at<uint8_t>(0, 1) == 255,
+                    "GUI save retains exclusions with or without stored coordinates");
+            if (sameSize)
+                require((*reloaded.surface->rawPointsPtr())(3, 2) == cv::Vec3f(2, 3, 10),
+                        "same-grid GUI save persists a newly valid point");
+            session->readStore(attachment, [&](const StoreReader& reader, const auto&) {
+                const auto stored = load_quad_from_store(reader, record.uuid, std::nullopt, false);
+                require((*stored->rawPointsPtr())(0, 0) == cv::Vec3f(0, 0, 10),
+                        "GUI save retains hidden XYZ separately from displayed geometry");
+            });
+        }
+        (*opened.surface->rawPointsPtr())(2, 2)[2] = 11;
+        (*opened.surface->rawPointsPtr())(1, 2) = {-1, -1, -1};
+        opened.surface->channel("generations", SURF_CHANNEL_NORESIZE).at<uint16_t>(3, 2) = 7;
+        session->setDraft(record.uuid, SessionDrafts::surfaceForDraft(*opened.surface), volumeCoordinates("vol", 1),
+                          attachment, edit.pin().reference());
+        require(drafts.checkpointNow(), "GUI growth draft checkpoints");
+    }
+    auto session = std::make_shared<ObjectStoreSession>();
+    SessionDrafts drafts(session);
+    require(drafts.start(checkpoint, 0), "GUI growth checkpoint reopens");
+    const auto attachment = session->attach(path, options);
+    const auto contents = session->draftContents(record.uuid);
+    require(contents.has_value(), "GUI growth checkpoint contains its draft");
+    auto opened = SurfaceCatalog::open(session, attachment, {"vol", 1}, record.uuid);
+    SessionDrafts::restoreSurface(*opened.surface, contents->surface);
+    require((*opened.surface->rawPointsPtr())(0, 0) == cv::Vec3f(-1, -1, -1),
+            "checkpoint recovery keeps retained masked coordinates hidden");
+    require(opened.surface->channel("growth_exclusions").at<uint8_t>(0, 1) == 255,
+            "checkpoint recovery retains exclusions without coordinates");
+    require((*opened.surface->rawPointsPtr())(3, 2) == cv::Vec3f(2, 3, 10),
+            "checkpoint recovery retains newly grown points");
+    require((*opened.surface->rawPointsPtr())(2, 2) == cv::Vec3f(2, 2, 11),
+            "checkpoint recovery retains the unsaved edit after growth");
+    require(opened.surface->channel("generations").at<uint16_t>(3, 2) == 7,
+            "checkpoint recovery retains the generation of new growth");
+    require(opened.surface->pointsForStorage()(1, 2) == cv::Vec3f(-1, -1, -1),
+            "checkpoint recovery does not bring back a deleted vertex");
+    SurfaceStoreEdit edit(session, opened.pin, opened.view);
+    edit.save(*opened.surface, {0, 0, 3, 4}, {"mask", "growth_exclusions", "generations"}, contents->revision);
+    require((*SurfaceCatalog::open(session, attachment, {"vol", 1}, record.uuid).surface->rawPointsPtr())(0, 0) ==
+                cv::Vec3f(-1, -1, -1), "recovered growth remains masked after another GUI save");
+}
+
 void checkDraftRecovery(const fs::path& sourcePath, const fs::path& directory)
 {
     OpenOptions writable; writable.author = "draft-recovery-test";
@@ -526,6 +624,7 @@ int main(int argc, char** argv)
         checkCorrectionSnapshots(fs::path(dir.path().toStdString()));
         checkToolMappingGuards(fs::path(dir.path().toStdString()));
         checkSelectedRegionInput(fs::path(dir.path().toStdString()));
+        checkGrowthExclusionSaves(fs::path(dir.path().toStdString()));
         if (argc > 1) checkDraftRecovery(argv[1], fs::path(dir.path().toStdString()));
         const std::filesystem::path volumeRoot1 = fs::path(dir.path().toStdString()) / "ct.zarr";
         const vcr::zarr::CreateOptions levelZero1{.shape = {4, 4, 4}, .chunks = {4, 4, 4}, .compressor = "", .overwrite = true};

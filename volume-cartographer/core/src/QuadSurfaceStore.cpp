@@ -153,7 +153,7 @@ std::vector<vc::objects::TransactionOperation> create_quad_operations(const std:
 
 vc::geometry::Surface quad_surface_grid(QuadSurface& surface)
 {
-    const auto& points = *surface.rawPointsPtr();
+    const auto points = surface.pointsForStorage();
     vc::geometry::Surface geometry{points.rows, points.cols, {surface._scale[0], surface._scale[1]}, {}};
     geometry.points.reserve(points.total());
     for (const auto& p : points)
@@ -182,7 +182,7 @@ std::optional<vc::objects::EditGeometryOp> quad_rect_edit(const vc::objects::Tra
     const auto& revision = view.revision();
     if (revision.kind != "surface") throw std::runtime_error("not a stored surface: " + revision.objectUuid);
     const auto shape = pointsShape(revision);
-    const auto& points = *surface.rawPointsPtr();
+    const auto points = validity ? surface.pointsForStorage() : surface.rawPoints();
     if (points.rows != shape[0] || points.cols != shape[1])
         throw std::runtime_error("surface grid differs from the stored grid; resize it first");
     const auto area = rect & cv::Rect(0, 0, points.cols, points.rows);

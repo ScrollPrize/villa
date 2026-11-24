@@ -8,6 +8,7 @@
 #include <QtConcurrent/QtConcurrent>
 
 #include <algorithm>
+#include <cstring>
 
 using namespace vc::objects;
 
@@ -68,16 +69,54 @@ void SessionDrafts::restoreSurface(QuadSurface& surface, const vc::geometry::Sur
     auto* grid = surface.rawPointsPtr();
     if (!grid || grid->rows != draft.rows || grid->cols != draft.columns)
         throw std::invalid_argument("Recovered draft grid differs from the open surface");
+    const auto retainedPoints = surface.pointsForStorage();
+    const auto retainedMask = surface.vertexMask();
+    cv::Mat_<uint8_t> exclusions = surface.channel("growth_exclusions", SURF_CHANNEL_NORESIZE);
+    if (exclusions.empty()) exclusions = cv::Mat_<uint8_t>(grid->rows, grid->cols, uint8_t{0});
+    else exclusions = exclusions.clone();
+    cv::Mat_<uint16_t> generations;
+    const std::vector<int64_t> shape{draft.rows, draft.columns};
+    for (const auto& channel : draft.channels) {
+        if (channel.name == "growth_exclusions") {
+            if (channel.dtype != "|u1" || channel.shape != shape)
+                throw std::invalid_argument("Recovered growth exclusions differ from the surface grid");
+            std::copy(channel.bytes.begin(), channel.bytes.end(), exclusions.begin());
+        } else if (channel.name == "generations") {
+            if (channel.dtype != "<u2" || channel.shape != shape)
+                throw std::invalid_argument("Recovered generations differ from the surface grid");
+            generations.create(grid->rows, grid->cols);
+            std::memcpy(generations.data, channel.bytes.data(), channel.bytes.size());
+        }
+    }
     cv::Mat_<uint8_t> mask(grid->rows, grid->cols);
+    surface.maskedVertices.clear();
     for (int r = 0; r < grid->rows; ++r)
         for (int c = 0; c < grid->cols; ++c) {
             const auto i = std::size_t(r) * grid->cols + c;
             const auto& p = draft.points[i];
-            (*grid)(r, c) = cv::Vec3f(p[0], p[1], p[2]);
             mask(r, c) = draft.validity.empty() || draft.validity[i] ? 255 : 0;
+            cv::Vec3f retained(p[0], p[1], p[2]);
+            if (!vc::geometry::validSurfacePoint(retained) && !retainedMask.empty() && retainedMask(r, c) == 0)
+                retained = retainedPoints(r, c);
+            if (!mask(r, c) && vc::geometry::validSurfacePoint(retained))
+                surface.maskedVertices.push_back({{c, r}, retained});
+            (*grid)(r, c) = mask(r, c) ? cv::Vec3f(p[0], p[1], p[2]) : cv::Vec3f(-1, -1, -1);
         }
     surface.setChannel("mask", mask);
+    surface.setChannel("growth_exclusions", exclusions);
+    if (!generations.empty()) surface.setChannel("generations", generations);
     surface.invalidateCache();
+}
+
+vc::geometry::Surface SessionDrafts::surfaceForDraft(QuadSurface& surface)
+{
+    auto draft = quad_surface_grid(surface);
+    if (!surface.channel("growth_exclusions", SURF_CHANNEL_NORESIZE).empty()) {
+        std::vector<std::string> channels{"growth_exclusions"};
+        if (!surface.channel("generations", SURF_CHANNEL_NORESIZE).empty()) channels.push_back("generations");
+        draft.channels = quad_channels_operation(surface.id, surface, channels, {}, int(draft.rows), int(draft.columns)).channels;
+    }
+    return draft;
 }
 
 bool SessionDrafts::checkpointNow()

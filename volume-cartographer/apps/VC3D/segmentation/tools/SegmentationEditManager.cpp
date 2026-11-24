@@ -1,6 +1,7 @@
 #include "SegmentationEditManager.hpp"
 
 #include "../../ViewerManager.hpp"
+#include "../../SessionDrafts.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 
@@ -102,7 +103,7 @@ void SegmentationEditManager::publishWholeDraft()
     }
     // Only the first publication sets the base (saves move it on) and may
     // hold the committed surface.
-    _draft->session->setDraft(_baseSurface->id, quad_surface_grid(*_baseSurface), _draft->coordinates,
+    _draft->session->setDraft(_baseSurface->id, SessionDrafts::surfaceForDraft(*_baseSurface), _draft->coordinates,
                               _draft->attachment, std::exchange(_draft->base, std::nullopt));
     if (std::exchange(_draft->saved, false))
         _draft->session->markDraftSaved(_baseSurface->id, _draft->session->draftRevision(_baseSurface->id));

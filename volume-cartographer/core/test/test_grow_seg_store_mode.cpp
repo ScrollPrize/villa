@@ -17,6 +17,7 @@
 #include <filesystem>
 #include <fstream>
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/tracer/Tracer.hpp"
 #include <vc_object_store/Uuid.hpp>
 
 #include <opencv2/core.hpp>
@@ -24,6 +25,8 @@
 #include <cstdlib>
 #include <regex>
 #include <sstream>
+#include <tuple>
+#include <utility>
 
 namespace fs = std::filesystem;
 using namespace vc::objects;
@@ -55,6 +58,27 @@ void writeSheets(const fs::path& dir, const std::vector<int>& centres)
         for (int z = centre - 4; z <= centre + 4; ++z)
             std::fill_n(sheet.begin() + size_t(z) * 128 * 128, 128 * 128, uint8_t(255 - 20 * std::abs(z - centre)));
     vcr::zarr::Writer::open(dir / "volume.zarr" / "0").writeRegion({0, 0, 0}, {128, 128, 128}, sheet.data());
+}
+
+// Odd dimensions exercise a coarse grid whose extent is not an exact multiple
+// of the scale factor. Empty padding and one excluded, populated cell coexist.
+void writeMaskedPlane(const fs::path& path, cv::Point excluded, float hiddenZ = 64.f)
+{
+    cv::Mat_<cv::Vec3f> points(13, 15, cv::Vec3f(-1, -1, -1));
+    cv::Mat_<uint8_t> mask(points.size(), uint8_t(0));
+    cv::Mat_<uint16_t> generations(points.size(), uint16_t(0));
+    for (int r = 2; r < points.rows - 2; ++r)
+        for (int c = 2; c < points.cols - 2; ++c) {
+            points(r, c) = {float(20 + 4 * c), float(20 + 4 * r), 64.f};
+            mask(r, c) = 255;
+            generations(r, c) = 1;
+        }
+    points(excluded)[2] = hiddenZ;
+    mask(excluded) = 0;
+    QuadSurface surface(points, {0.25f, 0.25f});
+    surface.setChannel("mask", mask);
+    surface.setChannel("generations", generations);
+    surface.save(path, true);
 }
 }
 
@@ -257,6 +281,111 @@ TEST_CASE("A TIFXYZ import resumes with an optional GrowPatch anchor")
             CHECK(seed_points == 1);
         }
     }
+    std::error_code ignored;
+    fs::remove_all(dir, ignored);
+}
+
+TEST_CASE("Coarse interpolation does not use an excluded vertex's hidden coordinates")
+{
+    const fs::path dir = fs::temp_directory_path() / ("vc-grow-coarse-hidden-" + util::newUuid());
+    writeSheets(dir, {64});
+    const cv::Point excluded(4, 4);  // sampled by the factor-two working grid
+    writeMaskedPlane(dir / "low", excluded, 64.f);
+    writeMaskedPlane(dir / "high", excluded, 364.f);
+    auto low = load_quad_from_tifxyz(dir / "low");
+    auto high = load_quad_from_tifxyz(dir / "high");
+    REQUIRE(low->rawPointsPtr()->at<cv::Vec3f>(excluded) == cv::Vec3f(-1, -1, -1));
+    REQUIRE(high->rawPointsPtr()->at<cv::Vec3f>(excluded) == cv::Vec3f(-1, -1, -1));
+    vcr::zarr::OpenOptions openOptions;
+    openOptions.memoryCache = std::make_shared<vcr::MemoryCache>(16 * 1024 * 1024);
+    auto volume = vcr::zarr::openPyramidLevel((dir / "volume.zarr").string(), 0, openOptions);
+    const nlohmann::json params{{"generations", 1}, {"growth_scale", 1}, {"resume_opt", "skip"},
+                                {"disable_grid_expansion", true}, {"thread_limit", 1}, {"min_area_cm", 0}};
+    // With no added generation this isolates output interpolation from solving.
+    std::unique_ptr<QuadSurface> a(tracer(*volume.array, 1.f, {64, 64, 64}, params, 1.f, low.get()));
+    std::unique_ptr<QuadSurface> b(tracer(*volume.array, 1.f, {64, 64, 64}, params, 1.f, high.get()));
+    REQUIRE(a);
+    REQUIRE(b);
+    const auto& aPoints = *std::as_const(*a).rawPointsPtr();
+    const auto& bPoints = *std::as_const(*b).rawPointsPtr();
+    REQUIRE(aPoints.size() == bPoints.size());
+    CHECK(a->meta.at("grid_offset") == b->meta.at("grid_offset"));
+    int compared = 0;
+    for (int r = 0; r < aPoints.rows; ++r)
+        for (int c = 0; c < aPoints.cols; ++c) {
+            const bool aValid = vc::geometry::validSurfacePoint(aPoints(r, c));
+            const bool bValid = vc::geometry::validSurfacePoint(bPoints(r, c));
+            CHECK(aValid == bValid);
+            if (aValid && bValid) {
+                CHECK(aPoints(r, c) == bPoints(r, c));
+                ++compared;
+            }
+        }
+    CHECK(compared > 20);
+    const auto offset = a->meta.at("grid_offset").get<std::vector<int>>();
+    const cv::Point target = excluded + cv::Point(offset[0], offset[1]);
+    REQUIRE(cv::Rect(cv::Point(), aPoints.size()).contains(target));
+    CHECK(aPoints(target) == cv::Vec3f(-1, -1, -1));
+    CHECK(bPoints(target) == cv::Vec3f(-1, -1, -1));
+    std::error_code ignored;
+    fs::remove_all(dir, ignored);
+}
+
+TEST_CASE("An off-lattice exclusion survives coarse store output and full-resolution resume")
+{
+    const char* tool = std::getenv("VC_GROW_SEG_FROM_SEED_BIN");
+    REQUIRE(tool);
+    const fs::path dir = fs::temp_directory_path() / ("vc-grow-coarse-exclusion-" + util::newUuid());
+    writeSheets(dir, {64});
+    const cv::Point excluded(2, 5);  // left edge, skipped by factor-two sampling
+    writeMaskedPlane(dir / "source", excluded);
+    OpenOptions options; options.author = "grow-store-test";
+    const auto dbPath = dir / "objects.vcobj";
+    std::string imported;
+    {
+        auto store = ObjectStore::create(dbPath, options);
+        const auto report = ingestGeometrySource(store, "surface", dir / "source", {},
+            R"({"volume_uuid":"test-volume","scale_factor":1})");
+        REQUIRE(report.problems.empty());
+        REQUIRE(report.uuids.size() == 1);
+        imported = report.uuids.front();
+    }
+    nlohmann::json params{{"generations", 3}, {"growth_scale", 1}, {"growth_directions", {"right"}},
+                          {"thread_limit", 1}, {"min_area_cm", 0}};
+    std::ofstream(dir / "params.json") << params;
+    const std::string common = std::string("\"") + tool + "\" --volume \"" + (dir / "volume.zarr").string() +
+        "\" --params \"" + (dir / "params.json").string() + "\" --store \"" + dbPath.string() +
+        "\" --volume-uuid test-volume --rng-seed 1 --resume-opt skip --surface ";
+    const auto coarse = run(common + imported, dir / "coarse.log");
+    cv::Point coarseCell;
+    int coarseValid = 0;
+    const auto checkExcluded = [&](const std::string& uuid, cv::Point sourceCell) {
+        auto store = ObjectStore::open(dbPath, options);
+        auto txn = store.read();
+        const LocalStoreReader reader(store, txn);
+        const auto selected = reader.currentObject(uuid);
+        REQUIRE(selected && selected->geometryRevision);
+        const auto metadata = nlohmann::json::parse(selected->record.meta);
+        const auto offset = metadata.at("grid_offset").get<std::vector<int>>();
+        const cv::Point target = sourceCell + cv::Point(offset[0], offset[1]);
+        const auto surface = load_quad_from_store(reader, uuid);
+        REQUIRE(cv::Rect(cv::Point(), surface->rawPointsPtr()->size()).contains(target));
+        CHECK(surface->rawPointsPtr()->at<cv::Vec3f>(target) == cv::Vec3f(-1, -1, -1));
+        CHECK(reader.readGeometryRectangle(*selected->geometryRevision, "growth_exclusions", target.y, target.x, 1, 1) ==
+              std::vector<uint8_t>{255});
+        CHECK(reader.readGeometryRectangle(*selected->geometryRevision, "valid", target.y, target.x, 1, 1) ==
+              std::vector<uint8_t>{0});
+        return std::pair(target, surface->countValidPoints());
+    };
+    std::tie(coarseCell, coarseValid) = checkExcluded(coarse, excluded);
+    // Reopen at the original resolution, growing back towards the excluded edge.
+    params["growth_scale"] = 0;
+    params["generations"] = 5;
+    params["growth_directions"] = {"left"};
+    std::ofstream(dir / "params.json") << params;
+    const auto fine = run(common + coarse, dir / "fine.log");
+    const auto [fineCell, fineValid] = checkExcluded(fine, coarseCell);
+    CHECK(fineValid > coarseValid);
     std::error_code ignored;
     fs::remove_all(dir, ignored);
 }

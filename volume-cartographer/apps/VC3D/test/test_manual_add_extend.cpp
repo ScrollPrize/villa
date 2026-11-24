@@ -241,7 +241,10 @@ void TestManualAddExtend::clearPendingDropsTheExtension()
 void TestManualAddExtend::resizeSurfaceGridKeepsChannelsAligned()
 {
     auto points = flatSheet(4, 5, cv::Rect(0, 0, 5, 4));
+    const auto hidden = points(1, 1);
+    points(1, 1) = kInvalid;
     QuadSurface surface(points, cv::Vec2f(0.5f, 0.5f));
+    surface.maskedVertices.push_back({{1, 1}, hidden});
     cv::Mat_<uint8_t> approval(4, 5, static_cast<uint8_t>(0));
     approval(0, 0) = 255;
     surface.setChannel("approval", approval);
@@ -262,15 +265,21 @@ void TestManualAddExtend::resizeSurfaceGridKeepsChannelsAligned()
     cv::Mat grownFine = surface.channel("fine", SURF_CHANNEL_NORESIZE);
     QCOMPARE(grownFine.size(), cv::Size(20, 10));
     QCOMPARE(grownFine.at<uint8_t>(2, 4), static_cast<uint8_t>(7));
+    QCOMPARE(surface.maskedVertices.size(), std::size_t{1});
+    QCOMPARE(surface.maskedVertices.front().cell, cv::Point(3, 2));
+    QCOMPARE(surface.maskedVertices.front().coords, hidden);
 
     // Shrinking by the same amounts restores the original grid exactly.
     QVERIFY(segmentation::resizeSurfaceGrid(surface, -1, 0, -2, -3));
     QCOMPARE(surface.rawPointsPtr()->size(), points.size());
     QCOMPARE(cv::norm(*surface.rawPointsPtr() - points, cv::NORM_INF), 0.0);
     QCOMPARE(cv::norm(surface.channel("approval", SURF_CHANNEL_NORESIZE), approval, cv::NORM_INF), 0.0);
+    QCOMPARE(surface.maskedVertices.front().cell, cv::Point(1, 1));
 
     QVERIFY(!segmentation::resizeSurfaceGrid(surface, -4, 0, 0, 0));
     QCOMPARE(surface.rawPointsPtr()->size(), points.size());
+    QVERIFY(segmentation::resizeSurfaceGrid(surface, -2, 0, 0, 0));
+    QVERIFY(surface.maskedVertices.empty());
 }
 
 void TestManualAddExtend::resizeSurfaceGridRejectsLossyChannels()

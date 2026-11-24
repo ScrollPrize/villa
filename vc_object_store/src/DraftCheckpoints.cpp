@@ -109,6 +109,12 @@ DraftDirectory::Loaded DraftDirectory::load()
         draft.coordinates = d.at("coordinates");
         files_[uuid] = d.at("file").get<std::string>();
         draft.surface = decodeDraft(readFile(directory_ / d.at("file").get<std::string>()), d.at("rows"), d.at("columns"));
+        for (const auto& channel : jsonArrayField(d, "channels")) {
+            const auto bytes = readFile(directory_ / channel.at("file").get<std::string>());
+            draft.surface.channels.push_back({channel.at("name"), channel.at("dtype"), channel.at("shape"),
+                                              std::vector<uint8_t>(bytes.begin(), bytes.end())});
+        }
+        draft.surface.validate();
         if (!d.at("store").is_null()) draft.meta.storeUuid = d.at("store").get<std::string>();
         draft.meta.base = versionFrom(d.at("base"));
         if (!d.at("submitted_revision").is_null()) draft.meta.submittedRevision = d.at("submitted_revision").get<uint64_t>();
@@ -127,13 +133,15 @@ uint64_t DraftDirectory::write(const std::vector<Capture>& drafts, const std::ve
     const auto sequence = sequence_ + 1;
     std::map<std::string, std::string> files;
     std::map<std::string, uint64_t> written;
+    std::set<std::string> channelFiles;
     Json entries = Json::object();
     for (const auto& capture : drafts) {
         const auto& draft = *capture.draft;
         auto file = files_.contains(capture.objectUuid) && written_.contains(capture.objectUuid) &&
                     written_.at(capture.objectUuid) == draft.revision
             ? files_.at(capture.objectUuid) : std::string();
-        if (file.empty()) {
+        const bool writeFiles = file.empty();
+        if (writeFiles) {
             file = "draft-" + capture.objectUuid + "-" + std::to_string(sequence) + ".bin";
             const auto bytes = encodeDraft(draft);
             writeDurably(directory_ / file, bytes.data(), bytes.size());
@@ -146,6 +154,17 @@ uint64_t DraftDirectory::write(const std::vector<Capture>& drafts, const std::ve
             {"submitted_revision", nullable(capture.meta.submittedRevision)},
             {"pending_request", nullable(capture.meta.pendingRequest)}, {"conflict", capture.meta.conflict},
             {"submitted_as_stored", capture.meta.submittedRevision == draft.revision}};
+        auto& channels = entries[capture.objectUuid]["channels"] = Json::array();
+        if (draft.channels) {
+            for (size_t i = 0; i < draft.channels->size(); ++i) {
+                const auto& channel = (*draft.channels)[i];
+                const auto channelFile = file + ".channel-" + std::to_string(i);
+                if (writeFiles) writeDurably(directory_ / channelFile, channel.bytes.data(), channel.bytes.size());
+                channelFiles.insert(channelFile);
+                channels.push_back({{"name", channel.name}, {"dtype", channel.dtype}, {"shape", channel.shape},
+                                    {"file", channelFile}});
+            }
+        }
     }
     Json requests = Json::array();
     for (const auto& p : pending) requests.push_back({{"request", p.requestUuid}, {"store", p.storeUuid}, {"drafts", p.drafts}});
@@ -155,7 +174,7 @@ uint64_t DraftDirectory::write(const std::vector<Capture>& drafts, const std::ve
     files_ = std::move(files);
     written_ = std::move(written);
     // What the new checkpoint no longer names.
-    std::set<std::string> keep;
+    std::set<std::string> keep = std::move(channelFiles);
     for (const auto& [object, file] : files_) keep.insert(file);
     std::set<std::string> requestsKept;
     for (const auto& p : pending) requestsKept.insert("request-" + p.requestUuid);

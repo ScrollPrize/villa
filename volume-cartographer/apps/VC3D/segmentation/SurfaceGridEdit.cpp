@@ -84,6 +84,13 @@ bool resizeSurfaceGrid(QuadSurface& surface, int top, int bottom, int left, int 
     for (const auto& [name, channel] : resizedChannels) {
         surface.setChannel(name, channel);
     }
+    const cv::Rect resizedBounds(0, 0, newCols, newRows);
+    std::vector<QuadSurface::MaskedVertex> maskedVertices;
+    for (const auto& vertex : surface.maskedVertices) {
+        const auto cell = vertex.cell + cv::Point(left, top);
+        if (resizedBounds.contains(cell)) maskedVertices.push_back({cell, vertex.coords});
+    }
+    surface.maskedVertices = std::move(maskedVertices);
     *points = cv::Mat_<cv::Vec3f>(resized);
     surface.invalidateCache();
     return true;
@@ -125,6 +132,21 @@ bool markMaskCellsValid(QuadSurface& surface, const std::vector<cv::Point>& cell
         surface.invalidateCache();
     }
     return changed;
+}
+
+void applyGrowthChannels(QuadSurface& surface, QuadSurface& result)
+{
+    const auto generations = result.channel("generations", SURF_CHANNEL_NORESIZE);
+    if (!generations.empty()) surface.setChannel("generations", generations);
+
+    auto mask = result.channel("mask", SURF_CHANNEL_NORESIZE);
+    if (mask.empty()) mask = surface.validMask();
+    surface.setChannel("mask", mask);
+
+    auto exclusions = result.channel("growth_exclusions", SURF_CHANNEL_NORESIZE);
+    if (exclusions.empty()) exclusions = cv::Mat_<uint8_t>(surface.rawPointsPtr()->size(), uint8_t{0});
+    surface.setChannel("growth_exclusions", exclusions);
+    surface.maskedVertices = result.maskedVertices;
 }
 
 } // namespace segmentation

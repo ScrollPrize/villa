@@ -25,4 +25,9 @@ bool resizeSurfaceGrid(QuadSurface& surface, int top, int bottom, int left, int 
 // exists and was changed.
 bool markMaskCellsValid(QuadSurface& surface, const std::vector<cv::Point>& cells);
 
+// Install the channels that describe a tracer's replacement grid, including
+// explicit exclusions and their retained coordinates, before it is saved.
+// The destination's vertices must already have been replaced by the result's.
+void applyGrowthChannels(QuadSurface& surface, QuadSurface& result);
+
 } // namespace segmentation

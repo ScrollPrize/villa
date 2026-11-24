@@ -27,6 +27,8 @@ struct SurfaceDraft {
     uint64_t revision = 0;  // session-unique, set when it is installed
     CoordinateJson coordinates;
     std::optional<AttachmentIdentity> attachment;
+    // Immutable annexed channels are shared by successive tiled vertex edits.
+    std::shared_ptr<const std::vector<GeometryArray>> channels;
     std::vector<Tile> tiles;
     // The tiles with bounds (`bounded[i]` is the tile of index box i).
     BoundsIndex index;
@@ -37,7 +39,7 @@ struct SurfaceDraft {
 
 std::shared_ptr<const SurfaceDraft> makeSurfaceDraft(const vc::geometry::Surface&, const CoordinateJson& coordinates,
                                                      const std::optional<AttachmentIdentity>&);
-// The draft's whole grid: points and its valid channel (scale is not kept: {1, 1}).
+// The draft's whole grid and channels (scale is not kept: {1, 1}).
 vc::geometry::Surface draftGrid(const SurfaceDraft&);
 std::shared_ptr<const SurfaceDraft> editSurfaceDraft(const SurfaceDraft&, int64_t row, int64_t column, int64_t rows,
                                                      int64_t columns, std::span<const vc::geometry::SurfacePoint>,
