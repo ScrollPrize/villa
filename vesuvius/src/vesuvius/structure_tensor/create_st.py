@@ -1,10 +1,8 @@
 #create_st.py
 import argparse
-import heapq
 import sys
 import torch
 from torch import nn
-import torch.nn.functional as F
 import numpy as np
 from pathlib import Path
 from typing import Optional, Union
@@ -369,7 +367,6 @@ class ChunkDataset(Dataset):
 
 
 _EIGH_BATCH_SIZE = 65536
-_SQRT3 = 1.7320508075688772
 
 
 def _is_gpu_solver_error(err: BaseException) -> bool:
@@ -402,253 +399,6 @@ def _eigh_and_sanitize(M: torch.Tensor):
     return w, v
 
 
-def _eigh_3x3_analytical_f64(
-    x0: torch.Tensor,
-    x1: torch.Tensor,
-    x2: torch.Tensor,
-    x3: torch.Tensor,
-    x4: torch.Tensor,
-    x5: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Solve batched 3x3 symmetric eigensystems in float64 using Cardano + row cross-products.
-
-    Inputs are finite 1D tensors of length K representing the upper triangle
-    ``[Jzz, Jzy, Jzx, Jyy, Jyx, Jxx]``. Near-degenerate or poorly conditioned
-    voxels delegate to ``_eigh_and_sanitize`` (which includes CUDA/ROCm CPU fallback).
-    Returns ``(eigvals_3xK, eigvecs_9xK)`` in float32 with ascending eigenvalues.
-    """
-    a = x0.to(torch.float64)
-    d = x1.to(torch.float64)
-    e = x2.to(torch.float64)
-    b = x3.to(torch.float64)
-    f = x4.to(torch.float64)
-    c = x5.to(torch.float64)
-
-    scale = torch.maximum(
-        torch.maximum(a.abs(), b.abs()),
-        torch.maximum(c.abs(), torch.maximum(d.abs(), torch.maximum(e.abs(), f.abs()))),
-    ).clamp_min(1e-30)
-    inv_s = 1.0 / scale
-    a = a * inv_s
-    d = d * inv_s
-    e = e * inv_s
-    b = b * inv_s
-    f = f * inv_s
-    c = c * inv_s
-
-    p1 = d * d + e * e + f * f
-    q = (a + b + c) * (1.0 / 3.0)
-    aq = a - q
-    bq = b - q
-    cq = c - q
-    p = torch.sqrt(((aq * aq + bq * bq + cq * cq) + 2.0 * p1) * (1.0 / 6.0))
-    inv_p = torch.where(p > 0.0, 1.0 / torch.where(p > 0.0, p, torch.ones_like(p)), torch.zeros_like(p))
-
-    b00 = aq * inv_p
-    b11 = bq * inv_p
-    b22 = cq * inv_p
-    b01 = d * inv_p
-    b02 = e * inv_p
-    b12 = f * inv_p
-    det_b = (
-        b00 * (b11 * b22 - b12 * b12)
-        - b01 * (b01 * b22 - b12 * b02)
-        + b02 * (b01 * b12 - b11 * b02)
-    )
-    phi = torch.acos(torch.clamp(0.5 * det_b, -1.0, 1.0)) * (1.0 / 3.0)
-    cos_phi = torch.cos(phi)
-    sin_phi = torch.sqrt(torch.clamp(1.0 - cos_phi * cos_phi, min=0.0))
-
-    # Ascending eigenvalues: l0 <= l1 <= l2
-    l2 = q + 2.0 * p * cos_phi
-    l0 = q + p * (-cos_phi - _SQRT3 * sin_phi)
-    l1 = 3.0 * q - l0 - l2
-
-    def _null_vec(lam: torch.Tensor):
-        a0 = a - lam
-        b0 = b - lam
-        c0 = c - lam
-        u0x = d * f - e * b0
-        u0y = e * d - a0 * f
-        u0z = a0 * b0 - d * d
-        n0 = u0x * u0x + u0y * u0y + u0z * u0z
-
-        u1x = d * c0 - e * f
-        u1y = e * e - a0 * c0
-        u1z = a0 * f - d * e
-        n1 = u1x * u1x + u1y * u1y + u1z * u1z
-
-        u2x = b0 * c0 - f * f
-        u2y = f * e - d * c0
-        u2z = d * f - b0 * e
-        n2 = u2x * u2x + u2y * u2y + u2z * u2z
-
-        use1 = n1 > n0
-        vx = torch.where(use1, u1x, u0x)
-        vy = torch.where(use1, u1y, u0y)
-        vz = torch.where(use1, u1z, u0z)
-        nm = torch.where(use1, n1, n0)
-
-        use2 = n2 > nm
-        vx = torch.where(use2, u2x, vx)
-        vy = torch.where(use2, u2y, vy)
-        vz = torch.where(use2, u2z, vz)
-        nm = torch.where(use2, n2, nm)
-        return vx, vy, vz, nm
-
-    v2x, v2y, v2z, n2 = _null_vec(l2)
-    v0x, v0y, v0z, n0 = _null_vec(l0)
-
-    degen = (p <= 1e-9) | ((l2 - l1) <= 1e-6) | ((l1 - l0) <= 1e-6) | (n2 <= 1e-22) | (n0 <= 1e-22)
-    inv_n2 = torch.rsqrt(torch.where(degen, torch.ones_like(n2), n2))
-    v2x = v2x * inv_n2
-    v2y = v2y * inv_n2
-    v2z = v2z * inv_n2
-
-    inv_n0 = torch.rsqrt(torch.where(degen, torch.ones_like(n0), n0))
-    v0x = v0x * inv_n0
-    v0y = v0y * inv_n0
-    v0z = v0z * inv_n0
-    # One Gram-Schmidt orthogonalization step ensures machine-precision orthogonality.
-    dot02 = v0x * v2x + v0y * v2y + v0z * v2z
-    v0x = v0x - dot02 * v2x
-    v0y = v0y - dot02 * v2y
-    v0z = v0z - dot02 * v2z
-    n0_gs = v0x * v0x + v0y * v0y + v0z * v0z
-    degen = degen | (n0_gs <= 0.5)
-    inv_n0_gs = torch.rsqrt(torch.where(degen, torch.ones_like(n0_gs), n0_gs))
-    v0x = v0x * inv_n0_gs
-    v0y = v0y * inv_n0_gs
-    v0z = v0z * inv_n0_gs
-
-    v1x = v2y * v0z - v2z * v0y
-    v1y = v2z * v0x - v2x * v0z
-    v1z = v2x * v0y - v2y * v0x
-
-    w3 = torch.stack((l0 * scale, l1 * scale, l2 * scale), dim=0).float()
-    v9 = torch.stack((v0x, v0y, v0z, v1x, v1y, v1z, v2x, v2y, v2z), dim=0).float()
-
-    n_degen = int(degen.sum().item())
-    if n_degen > 0:
-        idx = torch.nonzero(degen, as_tuple=False).squeeze(1)
-        Md = torch.empty((n_degen, 3, 3), dtype=torch.float64, device=x0.device)
-        Md[:, 0, 0] = x0[idx]
-        Md[:, 0, 1] = x1[idx]
-        Md[:, 0, 2] = x2[idx]
-        Md[:, 1, 0] = Md[:, 0, 1]
-        Md[:, 1, 1] = x3[idx]
-        Md[:, 1, 2] = x4[idx]
-        Md[:, 2, 0] = Md[:, 0, 2]
-        Md[:, 2, 1] = Md[:, 1, 2]
-        Md[:, 2, 2] = x5[idx]
-        wd, vd = _eigh_and_sanitize(Md)
-        w3[:, idx] = wd.transpose(0, 1)
-        v9[:, idx] = vd.permute(0, 2, 1).reshape(n_degen, 9).transpose(0, 1)
-
-    w3 = torch.nan_to_num(w3, nan=0.0, posinf=0.0, neginf=0.0)
-    v9 = torch.nan_to_num(v9, nan=0.0, posinf=0.0, neginf=0.0)
-    return w3, v9
-
-
-_COHERENCE_CELL_SIZE = 16
-
-
-def _align_vector_field_coherent_(v: torch.Tensor, cell_size: int = _COHERENCE_CELL_SIZE) -> None:
-    """In-place sign alignment of a (3, dz, dy, dx) unit vector field for local coherence.
-
-    Pools local 3x3 outer-product scatter matrices onto a coarse grid (cell_size^3 voxels),
-    orients the coarse principal axes via a maximum-coherence spanning tree seeded with a
-    deterministic hemisphere sign, trilinearly upsamples the guide field one channel at a
-    time (bounded workspace), and aligns each voxel's sign to the local guide. Zero voxels
-    stay exact +0.0.
-    """
-    _, dz, dy, dx = v.shape
-    gz = max(1, (dz + cell_size - 1) // cell_size)
-    gy = max(1, (dy + cell_size - 1) // cell_size)
-    gx = max(1, (dx + cell_size - 1) // cell_size)
-
-    if gz * gy * gx == 1:
-        vf = v.reshape(3, -1)
-        C = torch.empty((3, 3), dtype=torch.float64)
-        for i in range(3):
-            for j in range(i, 3):
-                val = float(torch.dot(vf[i], vf[j]).item())
-                C[i, j] = val
-                C[j, i] = val
-        if float(C.abs().sum().item()) == 0.0:
-            return
-        _, evecs = torch.linalg.eigh(C)
-        ref = evecs[:, 2]
-        if float((ref[0] + 0.37139068 * ref[1] + 0.13130643 * ref[2]).item()) < 0.0:
-            ref = -ref
-        ref = ref.to(device=v.device, dtype=v.dtype)
-        dot = ref[0] * v[0] + ref[1] * v[1] + ref[2] * v[2]
-    else:
-        pooled = torch.empty((6, gz, gy, gx), dtype=torch.float32, device=v.device)
-        for k, (i, j) in enumerate(((0, 0), (0, 1), (0, 2), (1, 1), (1, 2), (2, 2))):
-            prod = (v[i] * v[j]).unsqueeze(0).unsqueeze(0)
-            pooled[k] = F.adaptive_avg_pool3d(prod, (gz, gy, gx))[0, 0]
-        pf = pooled.reshape(6, -1).cpu().double()
-        n_cells = pf.shape[1]
-        M = torch.empty((n_cells, 3, 3), dtype=torch.float64)
-        M[:, 0, 0] = pf[0]
-        M[:, 0, 1] = pf[1]
-        M[:, 0, 2] = pf[2]
-        M[:, 1, 0] = pf[1]
-        M[:, 1, 1] = pf[3]
-        M[:, 1, 2] = pf[4]
-        M[:, 2, 0] = pf[2]
-        M[:, 2, 1] = pf[4]
-        M[:, 2, 2] = pf[5]
-        evals, evecs = torch.linalg.eigh(M)
-        top = evecs[:, :, 2].numpy().reshape(gz, gy, gx, 3)
-        strength = (evals[:, 2] - evals[:, 1]).numpy().reshape(gz, gy, gx)
-        energy = evals.sum(dim=1).numpy().reshape(gz, gy, gx)
-        top[energy <= 0.0] = 0.0
-
-        visited = np.zeros((gz, gy, gx), dtype=bool)
-        nbrs = ((-1, 0, 0), (1, 0, 0), (0, -1, 0), (0, 1, 0), (0, 0, -1), (0, 0, 1))
-        while True:
-            rem = np.where(~visited & (energy > 0.0), strength, -1.0)
-            if float(rem.max()) < 0.0:
-                break
-            sz, sy, sx = np.unravel_index(int(np.argmax(rem)), (gz, gy, gx))
-            r0 = top[sz, sy, sx]
-            if float(r0[0] + 0.37139068 * r0[1] + 0.13130643 * r0[2]) < 0.0:
-                top[sz, sy, sx] = -r0
-            visited[sz, sy, sx] = True
-            pq: list[tuple[float, int, int, int, int, int, int]] = []
-            for dz0, dy0, dx0 in nbrs:
-                nz, ny, nx = sz + dz0, sy + dy0, sx + dx0
-                if 0 <= nz < gz and 0 <= ny < gy and 0 <= nx < gx and not visited[nz, ny, nx] and energy[nz, ny, nx] > 0.0:
-                    w = abs(float(np.dot(top[sz, sy, sx], top[nz, ny, nx])))
-                    heapq.heappush(pq, (-w, nz, ny, nx, sz, sy, sx))
-            while pq:
-                _, cz, cy, cx, pz, py, px = heapq.heappop(pq)
-                if visited[cz, cy, cx]:
-                    continue
-                visited[cz, cy, cx] = True
-                if float(np.dot(top[cz, cy, cx], top[pz, py, px])) < 0.0:
-                    top[cz, cy, cx] = -top[cz, cy, cx]
-                for dz0, dy0, dx0 in nbrs:
-                    nz, ny, nx = cz + dz0, cy + dy0, cx + dx0
-                    if 0 <= nz < gz and 0 <= ny < gy and 0 <= nx < gx and not visited[nz, ny, nx] and energy[nz, ny, nx] > 0.0:
-                        w = abs(float(np.dot(top[cz, cy, cx], top[nz, ny, nx])))
-                        heapq.heappush(pq, (-w, nz, ny, nx, cz, cy, cx))
-
-        guide = torch.from_numpy(top.transpose(3, 0, 1, 2).copy()).to(device=v.device, dtype=v.dtype).unsqueeze(0)
-        dot = torch.zeros((dz, dy, dx), dtype=v.dtype, device=v.device)
-        for c in range(3):
-            gc = F.interpolate(guide[:, c : c + 1], size=(dz, dy, dx), mode="trilinear", align_corners=False)[0, 0]
-            dot.addcmul_(v[c], gc)
-
-    tie = (dot == 0.0) & ((v[0] + 0.37139068 * v[1] + 0.13130643 * v[2]) < 0.0)
-    flip = (dot < 0.0) | tie
-    if bool(flip.any().item()):
-        for c in range(3):
-            v[c] = torch.where(flip, -v[c], v[c])
-
-
 def _compute_eigenvectors_impl(block: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     _, dz, dy, dx = block.shape
     N = dz * dy * dx
@@ -665,23 +415,15 @@ def _compute_eigenvectors_impl(block: torch.Tensor) -> tuple[torch.Tensor, torch
 
     for start in range(0, K, _EIGH_BATCH_SIZE):
         bi = nz_idx[start : start + _EIGH_BATCH_SIZE]
-        wi, vi = _eigh_3x3_analytical_f64(
-            x[0, bi], x[1, bi], x[2, bi], x[3, bi], x[4, bi], x[5, bi]
-        )
-        eigvals_flat[:, bi] = wi
-        eigvecs_flat[:, bi] = vi
+        M = torch.empty((bi.numel(), 3, 3), dtype=torch.float64, device=block.device)
+        M[:, 0, 0] = x[0, bi]; M[:, 0, 1] = x[1, bi]; M[:, 0, 2] = x[2, bi]
+        M[:, 1, 0] = x[1, bi]; M[:, 1, 1] = x[3, bi]; M[:, 1, 2] = x[4, bi]
+        M[:, 2, 0] = x[2, bi]; M[:, 2, 1] = x[4, bi]; M[:, 2, 2] = x[5, bi]
+        wi, vi = _eigh_and_sanitize(M)
+        eigvals_flat[:, bi] = wi.transpose(0, 1)
+        eigvecs_flat[:, bi] = vi.permute(0, 2, 1).reshape(-1, 9).transpose(0, 1)
 
-    eigvecs_3d = eigvecs_flat.view(9, dz, dy, dx)
-    v0 = eigvecs_3d[0:3]
-    v2 = eigvecs_3d[6:9]
-    _align_vector_field_coherent_(v2)
-    _align_vector_field_coherent_(v0)
-    # Recompute v1 = v2 x v0 so all three eigenvector fields are locally coherent and right-handed.
-    eigvecs_3d[3] = v2[1] * v0[2] - v2[2] * v0[1]
-    eigvecs_3d[4] = v2[2] * v0[0] - v2[0] * v0[2]
-    eigvecs_3d[5] = v2[0] * v0[1] - v2[1] * v0[0]
-
-    return eigvals_flat.view(3, dz, dy, dx), eigvecs_3d
+    return eigvals_flat.view(3, dz, dy, dx), eigvecs_flat.view(9, dz, dy, dx)
 
 
 def _compute_eigenvectors(block: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

@@ -1,4 +1,4 @@
-"""Regression tests for sparse/analytical 3x3 structure tensor eigensolve and AMD ROCm solver fallback."""
+"""Regression tests for sparse 3x3 structure tensor eigensolve and AMD ROCm solver fallback."""
 from __future__ import annotations
 
 from unittest import mock
@@ -118,6 +118,10 @@ def test_compute_eigenvectors_accuracy_and_orthonormality_across_scales(scale):
     w, v = _compute_eigenvectors(block)
     rw, rv = _reference_eigh_block(block)
 
+    # Active voxels keep main's per-voxel eigh output, including eigenvector signs
+    assert torch.equal(w, rw)
+    assert torch.equal(v, rv)
+
     # Exact zero match
     nz = ~zero_mask.view(dz, dy, dx)
     assert torch.equal(w[:, ~nz], torch.zeros_like(w[:, ~nz]))
@@ -211,86 +215,3 @@ def test_fa_confidence_quantization_matches_reference():
 
     np.testing.assert_array_equal(_fa(w.numpy()), _fa(rw.numpy()))
 
-
-def _build_smooth_tensor_block(n_field: torch.Tensor, u_field: torch.Tensor) -> torch.Tensor:
-    """Build a positive-definite 6-channel structure tensor block with known (u, v, n) frame."""
-    n = n_field / n_field.norm(dim=0, keepdim=True).clamp_min(1e-12)
-    u = u_field - (u_field * n).sum(dim=0, keepdim=True) * n
-    u = u / u.norm(dim=0, keepdim=True).clamp_min(1e-12)
-    v = torch.cross(n, u, dim=0)
-    # Distinct eigenvalues: l0=1, l1=4, l2=10
-    lam = (1.0, 4.0, 10.0)
-    vecs = (u, v, n)
-    comps = ((0, 0), (0, 1), (0, 2), (1, 1), (1, 2), (2, 2))
-    out = []
-    for i, j in comps:
-        s = sum(lk * vk[i] * vk[j] for lk, vk in zip(lam, vecs))
-        out.append(s)
-    return torch.stack(out, dim=0).float()
-
-
-@pytest.mark.parametrize(
-    "case",
-    [
-        "xy_cross_product_switch",
-        "xz_opposite_sign_switch",
-    ],
-)
-def test_compute_eigenvectors_smooth_field_preserves_local_sign_coherence(case):
-    """Regression test: smooth PD fields crossing row cross-product boundaries must not flip sign."""
-    sz = 11
-    t = torch.linspace(-0.25, 0.25, sz)
-    zz, yy, xx = torch.meshgrid(t, t, t, indexing="ij")
-    if case == "xy_cross_product_switch":
-        # Normal smoothly crosses |n_y| == |n_x| with opposite signs (triggers u1/u2 switch)
-        n_field = torch.stack((0.15 + 0.05 * zz, 0.70 + 0.4 * xx, -0.70 + 0.4 * xx), dim=0)
-        u_field = torch.stack((torch.ones_like(xx), 0.1 * yy, 0.1 * zz), dim=0)
-    else:
-        # Normal smoothly crosses opposite-signed z and x components (triggers u0/u2 switch)
-        n_field = torch.stack((0.70 + 0.4 * xx, 0.12 + 0.05 * yy, -0.70 + 0.4 * xx), dim=0)
-        u_field = torch.stack((0.1 * xx, torch.ones_like(yy), 0.1 * zz), dim=0)
-
-    block = _build_smooth_tensor_block(n_field, u_field)
-    _, eigvecs = _compute_eigenvectors(block)
-    oriented = _orient_eigenvectors_right_handed(eigvecs)
-
-    # Every adjacent pair across x, y, z must remain coherently aligned (no 180-deg sign flip)
-    for k in range(3):
-        vec = oriented[k]
-        assert float((vec[:, :, :, 1:] * vec[:, :, :, :-1]).sum(0).min().item()) > 0.95
-        assert float((vec[:, :, 1:, :] * vec[:, :, :-1, :]).sum(0).min().item()) > 0.95
-        assert float((vec[:, 1:, :, :] * vec[:, :-1, :, :]).sum(0).min().item()) > 0.95
-
-    # Local Gaussian-like averaging (matching compute_vf signed smoothing) must retain full confidence
-    center_n = oriented[2, :, 3:8, 3:8, 3:8].mean(dim=(1, 2, 3))
-    conf_u8 = int(round(min(1.0, float(center_n.norm().item())) * 255.0))
-    assert conf_u8 >= 250, f"local cancellation detected: conf_u8={conf_u8}"
-
-
-def test_compute_eigenvectors_multiscale_curved_block_with_empty_holes():
-    """Verify coarse-grid MST alignment handles curved >90-deg fields and empty mask holes."""
-    dz, dy, dx = 24, 24, 24
-    ang = torch.linspace(0.0, 2.0, dx)  # ~115 degrees rotation across x
-    zz, yy, xx = torch.meshgrid(
-        torch.linspace(-0.1, 0.1, dz),
-        torch.linspace(-0.1, 0.1, dy),
-        ang,
-        indexing="ij",
-    )
-    n_field = torch.stack((0.05 * zz, torch.cos(xx), torch.sin(xx)), dim=0)
-    u_field = torch.stack((torch.ones_like(xx), 0.05 * yy, torch.zeros_like(xx)), dim=0)
-    block = _build_smooth_tensor_block(n_field, u_field)
-    # Carve an empty zero hole in the corner
-    block[:, :6, :6, :6] = 0.0
-
-    _, eigvecs = _compute_eigenvectors(block)
-    oriented = _orient_eigenvectors_right_handed(eigvecs)
-
-    # Zero hole must remain exact zero
-    assert torch.equal(oriented[:, :, :6, :6, :6], torch.zeros_like(oriented[:, :, :6, :6, :6]))
-    # Nonzero region along x must have zero adjacent normal reversals
-    n = oriented[2]
-    active = block.abs().sum(dim=0) > 0
-    adj_x = active[:, :, 1:] & active[:, :, :-1]
-    min_dot_x = float((n[:, :, :, 1:] * n[:, :, :, :-1]).sum(0)[adj_x].min().item())
-    assert min_dot_x > 0.95, f"unexpected normal reversal across curved block: min_dot_x={min_dot_x}"
