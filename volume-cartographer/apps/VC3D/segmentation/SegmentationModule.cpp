@@ -2880,7 +2880,8 @@ std::shared_ptr<SurfaceStoreEdit> SegmentationModule::storeEditFor(QuadSurface* 
     return _storeEdit;
 }
 
-bool SegmentationModule::saveSurface(QuadSurface* surface, bool vertices, const std::vector<std::string>& channels)
+bool SegmentationModule::saveSurface(QuadSurface* surface, bool vertices, const std::vector<std::string>& channels,
+                                     const std::optional<std::string>& geometryRevision)
 {
     const auto storeEdit = surface ? storeEditFor(surface) : nullptr;
     if (!storeEdit) {
@@ -2898,7 +2899,7 @@ bool SegmentationModule::saveSurface(QuadSurface* surface, bool vertices, const 
         }
         const auto* points = surface->rawPointsPtr();
         storeEdit->save(*surface, vertices && points ? cv::Rect(0, 0, points->cols, points->rows) : cv::Rect(), loaded,
-                        _state->objectStoreSession()->draftRevision(surface->id));
+                        _state->objectStoreSession()->draftRevision(surface->id), geometryRevision);
         return true;
     } catch (const std::exception& error) {
         qCWarning(lcSegModule) << "Saving surface channels failed:" << error.what();
