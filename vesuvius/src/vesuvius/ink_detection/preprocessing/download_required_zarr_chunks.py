@@ -611,7 +611,7 @@ def _iter_segment_dirs(dataset_dir: Path) -> Iterable[Path]:
     for segment_dir in sorted(dataset_dir.iterdir()):
         if not segment_dir.is_dir() or segment_dir.name == "unused":
             continue
-        if not any(segment_dir.rglob("x.tif")):
+        if not any(segment_dir.rglob("*.tif")):
             continue
         yield segment_dir
 
