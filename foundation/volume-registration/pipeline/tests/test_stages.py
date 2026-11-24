@@ -10,6 +10,7 @@ from scipy import ndimage
 from volreg import record as rec
 from volreg import stages as pipeline_stages
 from volreg.engine import DONE, FAILED, READY, STALE, WAITING
+from volreg.scoring import bar_failures
 
 PAD = 32
 # Tall enough along z for each of the hold-out set's five stretches to hold whole blocks.
@@ -114,7 +115,10 @@ def test_a_pair_through_every_stage(tmp_path, stores):
     pipeline.redo("blind"); pipeline.run_stage("blind")
     assert len(record.read(rec.FINAL_REVIEW)["rounds"]) == 1
 
-    record.decide({"fit": fit["fit"], "publish": "affine", "reason": "test", "override": None},
+    # The affine misses the bar here: published, it is an override naming what it misses.
+    missed = bar_failures(json.loads(pipeline.work("scores.json").read_text())["scores"]["affine"])
+    record.decide({"fit": fit["fit"], "publish": "affine", "reason": "test",
+                   "override": {"by": REVIEWER, "reason": "test", "bar_missed": missed} if missed else None},
                   REVIEWER)
     assert pipeline.states()["final-review"] == DONE
     assert pipeline.run_stage("store")["status"] == "ok"

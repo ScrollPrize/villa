@@ -76,6 +76,11 @@ def stamp_as_done(directory):
                                      "output_digest": engine.digest_files(directory, written)})
 
 
+def basis(record):
+    """The basis of the scores there are, as a page showing them sends it."""
+    return pipeline_stages.reviewed_unit(pipeline_stages.pipeline(record.directory)).basis
+
+
 def test_holdout_answers_and_notes_go_to_the_log(pairs):
     reviews, record = pairs
     state = reviews.holdout("pair-a")
@@ -108,7 +113,7 @@ def test_the_blind_mapping_stays_hidden_until_every_item_is_answered(pairs):
     assert all("revealed" not in item for item in state["round"]["items"])
     reviews.pick("pair-a", "c001", 0, 1)        # item 0, option B: the bend
     with pytest.raises(Conflict, match="unanswered"):
-        reviews.decide("pair-a", "bend", "", "c001", "f002")    # the round is not finished
+        reviews.decide("pair-a", "bend", "", "c001", "f002", basis(record))    # the round is not finished
     assert state["fit"] is None
     reviews.pick("pair-a", "c001", 1, "unsure")
     state = reviews.blind("pair-a")
@@ -122,13 +127,14 @@ def test_publishing_what_misses_the_bar_needs_a_reason_and_is_an_override(pairs)
     stamp_as_done(record.directory)
     reviews.pick("pair-a", "c001", 0, 1)
     reviews.pick("pair-a", "c001", 1, 0)
+    shown = reviews.blind("pair-a")["basis"]
     with pytest.raises(ValueError, match="misses the bar"):
-        reviews.decide("pair-a", "affine", "", "c001", "f002")
-    reviews.decide("pair-a", "affine", "the bend is not visible", "c001", "f002")
+        reviews.decide("pair-a", "affine", "", "c001", "f002", shown)
+    reviews.decide("pair-a", "affine", "the bend is not visible", "c001", "f002", shown)
     decision = record.read(rec.FINAL_REVIEW)["decision"]
     assert decision["publish"] == "affine" and decision["override"]["bar_missed"] == ["median"]
     assert decision["round"] == "c001"
-    reviews.decide("pair-a", "bend", "", "c001", "f002")       # passes: no reason needed, no override
+    reviews.decide("pair-a", "bend", "", "c001", "f002", shown)   # passes: no reason needed, no override
     assert record.read(rec.FINAL_REVIEW)["decision"]["override"] is None
 
 

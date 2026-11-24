@@ -131,9 +131,9 @@ async function pick(choice) {
 
 for (const b of document.querySelectorAll("[data-publish]")) b.onclick = async () => {
   try {
-    // The round and fit shown: the server refuses the decision if either is no longer current.
+    // The round, fit and scores shown: the server refuses the decision if any is no longer current.
     await call(`${API}/decide`, {publish: b.dataset.publish, round: state.round.id, fit: state.fit,
-                                 reason: $("reason").value.trim()});
+                                 basis: state.basis, reason: $("reason").value.trim()});
     $("error").textContent = ""; await load();
   } catch (e) { $("error").textContent = e.message; }
 };

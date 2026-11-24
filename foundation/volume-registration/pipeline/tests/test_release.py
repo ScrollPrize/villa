@@ -20,7 +20,7 @@ def make(root, name, pair, at, pipeline, publish="bend", decided=True):
     record.write(rec.FINAL_REVIEW, {"rounds": [{"id": "c001", "items": [{"patch": "p0001", "choice": 0}]}],
                                     "decision": decision if decided else None,
                                     "revisit": [] if decided else [{"text": "deferred", "done": None}]})
-    score = {"lines_up": 25, "median_fine_voxels": 1.0, "p90_fine_voxels": 2.0, "far": 0,
+    score = {"lines_up": 1, "median_fine_voxels": 1.0, "p90_fine_voxels": 2.0, "far": 0,
              "median_um": 1.0, "p90_um": 2.0, "bar": {"passes": True}}
     fit = {"scores": {"bend": score, "affine": score}, "bar": {"version": "test"}}
     if pipeline:

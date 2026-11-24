@@ -21,6 +21,7 @@ from volreg import record as rec
 from volreg import stages as pipeline_stages
 from volreg.engine import DONE, READY, STALE
 from volreg.review.server import Reviews
+from volreg.scoring import answers_digest
 
 from test_review_blockers import CONTEXT, REVIEWER, WINDOWS, as_windows_locks, lock_kind, make  # noqa: F401
 
@@ -77,10 +78,12 @@ def _score():
 def fake_score(pipeline, params):
     """Scores of the fit as run_score reads it, naming it as run_score does."""
     unit = pipeline_stages.fit_unit(pipeline)
+    held = pipeline.record.read(rec.HOLDOUT)
     pipeline.work("scores.json").write_text(json.dumps({
         "bar": {"version": "test"}, "scores": {"bend": _score(), "affine": _score()},
         "drift": {}, "under": unit.fit_id,
-        "scored": {"fit": unit.fit_id, "fit_digest": unit.digest}}) + "\n")
+        "scored": {"fit": unit.fit_id, "fit_digest": unit.digest,
+                   "answers_sha256": answers_digest(held)}}) + "\n")
     return ["work/scores.json"]
 
 
@@ -133,7 +136,7 @@ def decide(directory, publish):
     pick_all(directory)
     reviews = Reviews(directory.parent, BY, auto_advance=False)
     shown = reviews.blind(directory.name)
-    reviews.decide(directory.name, publish, "", shown["round"]["id"], shown["fit"])
+    reviews.decide(directory.name, publish, "", shown["round"]["id"], shown["fit"], shown.get("basis"))
 
 
 def new_pair(root, name="a", pair="A"):
@@ -890,9 +893,10 @@ def test_interleaving_new_fit_round_without_a_redo_keeps_the_reviewed_record(tmp
     decide(directory, "affine")
     drain(directory)
     pairs, _index = released(tmp_path, [root], "decided")
-    assert pairs["A"]["decision"] | {"at": None, "by": None} == {
+    assert pairs["A"]["decision"]["basis"]                  # the scores it was made on
+    assert pairs["A"]["decision"] | {"at": None, "by": None, "basis": None} == {
         "fit": "f002", "publish": "affine", "reason": "", "override": None, "at": None, "by": None,
-        "round": "c002"}
+        "round": "c002", "basis": None}
     transform = released_transform(tmp_path, "decided")
     assert transform["fit"] == "f002" and "deformation" not in transform
 

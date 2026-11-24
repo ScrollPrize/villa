@@ -30,7 +30,7 @@ from . import record as rec
 from . import release as releasing
 from . import stages as pipeline_stages
 from .cores.transform_io import read_transform_json
-from .scoring import bar_check, score
+from .scoring import bar_check, bar_failures, score
 
 
 def records(paths):
@@ -199,18 +199,36 @@ def status(args):
         print(line)
 
 
+def same_score(result, stored):
+    """Whether a recomputed score is the stored one: the same units, and (when any line up)
+    the same distances. A score with no unit lining up has no distances to compare."""
+    if result.get("lines_up", 0) != stored.get("lines_up", 0):
+        return False
+    if "per_unit" in stored and set(stored["per_unit"]) != set(result.get("per_unit") or {}):
+        return False
+    if not result.get("lines_up"):
+        return True
+    keys = ("median_fine_voxels", "p90_fine_voxels", "worst_fine_voxels")
+    return all(isinstance(stored.get(key), (int, float)) and abs(result[key] - stored[key]) < 1e-9
+               for key in keys)
+
+
 def check(args):
     """Check that the stored transform, its metadata and its scores are the one result the
     decision names (the fit, the variant, the transform's digest: see `release.stored_mismatch`),
-    then recompute the published transform's score from the record alone and compare it with
-    the stored one, and check the decision against the bar. Exit 1 on any mismatch."""
+    that those scores are of the hold-out answers the record holds and are what its decision
+    and any override were made on (`release.scores_problem`), then recompute the published
+    transform's score from the record alone and compare it with the stored one, and check the
+    decision against the bar. Exit 1 on any mismatch; a record with no unit lining up is
+    checked as any other, never raising."""
     failed = 0
     for record in records(args.records):
         final = record.read(rec.FINAL_REVIEW) if record.exists(rec.FINAL_REVIEW) else {}
         decision = final.get("decision")
         if not decision or not record.exists(rec.FIT):
             continue
-        mismatch = releasing.stored_mismatch(record, decision, legacy_too=is_pipeline(record))
+        mismatch = releasing.stored_mismatch(record, decision, legacy_too=is_pipeline(record)) or (
+            decision["publish"] != "nothing" and releasing.scores_problem(record, decision))
         if mismatch or decision["publish"] == "nothing":
             failed += bool(mismatch)
             print(f"{record.directory.name:18s} {decision['publish']:6s} of {decision['fit']}  "
@@ -220,17 +238,17 @@ def check(args):
         result = score(record.read(rec.TRANSFORM), record.read(rec.HOLDOUT),
                        pair["coarse_side"] == "fixed", fit["fine_um"])
         stored = fit["scores"][decision["publish"]]
-        same = all(abs(result[key] - stored[key]) < 1e-9 for key in
-                   ("median_fine_voxels", "p90_fine_voxels", "worst_fine_voxels")) \
-            and result["lines_up"] == stored["lines_up"]
-        passes = bar_check(result)["passes"]
-        consistent = passes or bool(decision.get("override"))
+        same = same_score(result, stored)
+        missed = bar_failures(result | {"bar": bar_check(result)})
+        covered = set((decision.get("override") or {}).get("bar_missed") or [])
+        consistent = set(missed) <= covered
         failed += not (same and consistent)
-        print(f"{record.directory.name:18s} {decision['publish']:6s} "
-              f"{result['median_fine_voxels']:.2f}/{result['p90_fine_voxels']:.2f} on {result['lines_up']}"
+        measured = (f"{result['median_fine_voxels']:.2f}/{result['p90_fine_voxels']:.2f} on {result['lines_up']}"
+                    if result.get("lines_up") else "no unit lines up")
+        print(f"{record.directory.name:18s} {decision['publish']:6s} {measured}"
               f"  {'same as stored' if same else 'DIFFERS FROM STORED'}"
-              f"  bar {'passes' if passes else 'missed'}"
-              f"{'' if passes else (' (override)' if decision.get('override') else ' NO OVERRIDE')}")
+              f"  bar {'passes' if not missed else 'missed: ' + ', '.join(missed)}"
+              f"{'' if not missed else (' (override)' if consistent else ' NOT COVERED BY AN OVERRIDE')}")
     return 1 if failed else 0
 
 
@@ -299,7 +317,16 @@ def main(argv=None):
         # A job that finished starts what its result made ready, so a pair moves on by
         # itself until a person is next. Two jobs finishing at once may both try to start
         # the same stage; its lock lets only one run.
-        code = engine.main_job(pipeline_stages.pipeline(args.pair), args.stage)
+        try:
+            pipeline = pipeline_stages.pipeline(args.pair)
+        except Exception as error:   # noqa: BLE001 - recorded as the stage's failure
+            # The pair's settings cannot be read (held past the wait for a replace, say): the
+            # stage fails as a job does, under its lock, instead of being left ready with no
+            # job on it.
+            engine.Pipeline(args.pair, pipeline_stages.stages()).fail_unstarted(args.stage, error)
+            print(f"{args.stage}: failed before it began: {type(error).__name__}: {error}", file=sys.stderr)
+            return 1
+        code = engine.main_job(pipeline, args.stage)
         if code == 0:
             try:
                 advance(args.pair)

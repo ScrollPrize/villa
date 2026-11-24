@@ -84,11 +84,14 @@ class Record:
         return self.path(name).exists()
 
     def read(self, name):
-        with open(self.path(name)) as handle:
-            return json.load(handle)
+        """A record file, as JSON. Windows refuses to open a file while another process holds
+        it to replace or delete it; the read is asked again for as long as a replace waits for
+        a reader (`filelock.retry`), so a read that lands during a write goes through, and a
+        refusal that lasts surfaces."""
+        return json.loads(self.read_bytes(name))
 
     def read_bytes(self, name):
-        return self.path(name).read_bytes()
+        return filelock.retry(self.path(name).read_bytes)
 
     def write(self, name, data):
         """Replace a file in one step, with the schema stamped in."""
@@ -150,8 +153,8 @@ class Record:
     def events(self):
         if not self.exists(EVENTS):
             return []
-        with open(self.path(EVENTS)) as handle:
-            return [json.loads(line) for line in handle if line.strip()]
+        content = filelock.retry(self.path(EVENTS).read_bytes).decode()
+        return [json.loads(line) for line in content.splitlines() if line.strip()]
 
     # ------------------------------------------------------------------ the answers
 
@@ -183,7 +186,20 @@ class Record:
         with self.lock():
             return self._refresh_holdout(patches, fields)
 
+    def current_holdout(self):
+        """`holdout.json` with the latest answers and notes from the log, as it is about to be
+        written, read under the record lock: an answer logged and not yet written into
+        `holdout.json` is in it, so what is checked against the answers is checked against
+        the newest ones."""
+        with self.lock():
+            return self._merged_holdout(None, {})
+
     def _refresh_holdout(self, patches, fields):
+        held = self._merged_holdout(patches, fields)
+        self.write(HOLDOUT, held)
+        return held
+
+    def _merged_holdout(self, patches, fields):
         held = self.read(HOLDOUT) if self.exists(HOLDOUT) else {"patches": []}
         held |= fields
         if patches is not None:
@@ -197,7 +213,6 @@ class Record:
             for octant in patch.get("octants") or []:
                 octant["answer"] = latest.get(f"{patch['id']}.{octant['index']}")
         held.pop("schema", None)
-        self.write(HOLDOUT, held)
         return held
 
 
@@ -234,7 +249,8 @@ class Record:
 
     def decide(self, decision, reviewer, check=None):
         """The final decision: `{"fit", "publish", "reason", "override"}` and, from the review
-        page, the `round` it was made on; logged, then shown. `check(final)`, given
+        page, the `round` it was made on and the `basis` of the scores it was made on (see
+        `scoring.basis`); logged, then shown. `check(final)`, given
         `final-review.json` as it stands, raises if the decision does not apply to it; it is
         called under the record lock the decision is then written under, so no round can be
         added or answered between the check and the write."""
@@ -261,8 +277,8 @@ class Record:
                     picks[(event["round"], event["item"])] = event["choice"]
                 elif event["kind"] == "decision":
                     decision = {key: event[key] for key in ("fit", "publish", "reason", "override")
-                                } | {"by": event.get("by"), "at": event["at"]} | (
-                                    {"round": event["round"]} if event.get("round") else {})
+                                } | {"by": event.get("by"), "at": event["at"]} | {
+                                    key: event[key] for key in ("round", "basis") if event.get(key)}
             for round_ in final["rounds"]:
                 for index, item in enumerate(round_["items"]):
                     if (round_["id"], index) in picks:

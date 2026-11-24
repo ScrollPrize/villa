@@ -407,7 +407,8 @@ def test_c_an_answer_edited_after_the_decision_before_store_is_not_stored(tmp_pa
     decide_on(directory, "bend", page(directory))
     answer(directory, "p0011", "no")
     pipeline = pipeline_stages.pipeline(directory)
-    assert pipeline.run_stage("store")["status"] == "failed"     # chosen before the rescore
+    assert pipeline.run_stage("store")["status"] in ("failed", "superseded")   # chosen before the rescore
+    assert not rec.Record(directory).exists(rec.FIT)
     pipeline = drain(directory)
     assert pipeline.states()["store"] == FAILED
     assert released(tmp_path, [root], "edited")[0] == {}
@@ -556,6 +557,7 @@ def test_l_a_record_stored_by_main_stays_eligible_until_an_answer_changes(tmp_pa
     fit.pop("schema", None)
     fit.pop("bend", None)
     rec.Record(directory).write(rec.FIT, fit)
+    _without_basis(directory)                                   # main's decisions name no scores
     _restamp_store(directory)
     assert "A" in released(tmp_path, [root], "main")[0]
     assert check(root, capsys)[0] == 0
@@ -579,16 +581,22 @@ def test_l_a_record_stored_by_round_five_stays_eligible_until_an_answer_changes(
         fit["stored"].pop(key, None)
         fit["scored"].pop(key, None)
     record.write(rec.FIT, fit)
-    final = record.read(rec.FINAL_REVIEW)
-    final.pop("schema", None)
-    final["decision"].pop("basis", None)
-    record.write(rec.FINAL_REVIEW, final)
+    _without_basis(directory)
     _restamp_store(directory)
     assert "A" in released(tmp_path, [root], "round5")[0]
     assert check(root, capsys)[0] == 0
     answer(directory, "p0009", "no")
     assert released(tmp_path, [root], "edited")[0] == {}
     assert check(root, capsys)[0] == 1
+
+
+def _without_basis(directory):
+    """The decision as a server that named no scores wrote it."""
+    record = rec.Record(directory)
+    final = record.read(rec.FINAL_REVIEW)
+    final.pop("schema", None)
+    final["decision"].pop("basis", None)
+    record.write(rec.FINAL_REVIEW, final)
 
 
 def _restamp_store(directory):

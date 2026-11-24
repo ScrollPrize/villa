@@ -29,8 +29,8 @@ migrated records, say, which have no pipeline to drive.
     POST /api/pairs/<pair>/note               {"patch": ..., "text": ...}
     POST /api/pairs/<pair>/pick               {"round": ..., "index": i, "choice": i or "unsure"/"none"}
     POST /api/pairs/<pair>/decide             {"publish": bend|affine|nothing, "reason": ...,
-                                               "round": ..., "fit": ...}   (the round and fit shown;
-                                               409 if either is no longer current)
+                                               "round": ..., "fit": ..., "basis": ...}   (the round,
+                                               fit and scores shown; 409 if any is no longer current)
 """
 
 import argparse
@@ -44,6 +44,7 @@ from .. import cli
 from .. import engine
 from .. import record as rec
 from .. import stages as pipeline_stages
+from ..scoring import answers_digest
 from . import viewer
 
 HERE = Path(__file__).resolve().parent
@@ -245,7 +246,15 @@ class Reviews:
             return {"round": None, "decision": final.get("decision")}
         round_ = rounds[-1]
         done, tally = tally_of(round_)
-        scores = pipeline.work("scores.json")
+        # The scores shown are those of the current fit, read whole with the answers they
+        # were made of; `basis` names them, and the page sends it with its decision. None
+        # while they are being made again: no decision can be made on them then.
+        unit = None
+        if done:
+            try:
+                unit = pipeline_stages.reviewed_unit(pipeline)
+            except pipeline_stages.Incoherent:
+                unit = None
         return {
             "pair": pipeline.record.read(rec.PAIR)["pair"], "done": done,
             # The fit the round is about, once it is answered: what a decision on it is for.
@@ -256,7 +265,8 @@ class Reviews:
                                 | ({"revealed": item["options"]} if done else {})
                                 for item in round_["items"]]},
             "tally": tally if done else None,
-            "scores": json.loads(scores.read_text()) if done and scores.exists() else None,
+            "scores": unit.scores if unit else None,
+            "basis": unit.basis if unit else None,
             "decision": final.get("decision"),
             "revisit": [item for item in final.get("revisit") or [] if not item.get("done")],
         }
@@ -279,20 +289,24 @@ class Reviews:
     def pick(self, name, round_id, index, choice):
         self.record(name).blind_pick(round_id, int(index), choice, self.reviewer)
 
-    def decide(self, name, publish, reason, round_id=None, fit_id=None):
-        """The decision on the round and fit the page showed (`round_id`, `fit_id`), checked
-        against the bar: publishing a variant that misses it is an override, which needs a
-        reason and names what it missed.
+    def decide(self, name, publish, reason, round_id=None, fit_id=None, basis=None):
+        """The decision on the round, fit and scores the page showed (`round_id`, `fit_id`,
+        and `basis`, which names the scores with the bar's verdict on them and the hold-out
+        answers they were made of), checked against the bar: publishing a variant that misses
+        it is an override, which needs a reason and names what it missed -- in the scores the
+        page showed, the only ones a decision can be made on. The decision keeps the basis.
 
         Conflict unless the round is the newest one, every item of it is answered, and it is
         about the current fit, whose blind round is done (nothing it rests on is being made
-        again), with scores of that fit. All of it is checked while no job can stamp a result
-        or a redo begin (`Pipeline.steady`), and the round under the record lock the decision
-        is written under: a page left open across a redo, or an old round's id, is refused,
-        never applied to the fit there is now."""
+        again), with scores of that fit, made of the answers there are, and they are the
+        scores the page showed. All of it is checked while no job can stamp a result or a redo
+        begin (`Pipeline.steady`), and the round and the answers under the record lock the
+        decision is written under, which an answer is logged under too: a page left open
+        across a redo or a rescoring, an old round's id, or an answer changed while the
+        decision is made, is refused, never applied to the scores there are now."""
         pipeline = self.pipeline(name)
-        if not round_id or not fit_id:
-            raise Conflict("the page did not say which round and fit it shows: reload it and decide again")
+        if not round_id or not fit_id or not basis:
+            raise Conflict("the page did not say which round, fit and scores it shows: reload it and decide again")
         with pipeline.steady():
             state = pipeline.states()["blind"]
             if state != engine.DONE:
@@ -314,17 +328,26 @@ class Reviews:
                 if fit_id != rounds[-1]["candidates"][0] or fit_id != unit.fit_id:
                     raise Conflict(f"the page shows {fit_id}, but the current fit is {unit.fit_id}: "
                                    f"reload the page")
+                if answers_digest(pipeline.record.current_holdout()) != unit.answers_sha256:
+                    raise Conflict("a hold-out answer changed since these scores were made: reload the "
+                                   "page once they are made again, and decide on what it shows then")
+                if basis != unit.basis:
+                    raise Conflict("the page shows other scores than the current ones (an answer changed, "
+                                   "and they were made again): reload the page, and decide on what it "
+                                   "shows then")
 
             scores = unit.scores["scores"]
             override = None
             if publish in ("bend", "affine") and not scores[publish]["bar"]["passes"]:
                 if not (reason or "").strip():
-                    check(pipeline.record.read(rec.FINAL_REVIEW))   # a stale page hears that first
+                    with pipeline.record.lock():
+                        check(pipeline.record.read(rec.FINAL_REVIEW))   # a stale page hears that first
                     raise ValueError(f"the {publish} misses the bar: give a reason to publish it anyway")
-                missed = [part for part, ok in scores[publish]["bar"]["checks"].items() if not ok]
+                missed = pipeline_stages.bar_failures(scores[publish])
                 override = {"by": self.reviewer, "reason": reason, "bar_missed": missed}
             pipeline.record.decide({"fit": fit_id, "publish": publish, "reason": reason or "",
-                                    "override": override, "round": round_id}, self.reviewer, check=check)
+                                    "override": override, "round": round_id, "basis": unit.basis},
+                                   self.reviewer, check=check)
         self.advance(name)
 
     # ---------------------------------------------------------------------- pictures
@@ -491,7 +514,7 @@ def handler_for(reviews):
                     self.send_json({"ok": True})
                 elif action == "decide":
                     reviews.decide(name, body["publish"], body.get("reason"), body.get("round"),
-                                   body.get("fit"))
+                                   body.get("fit"), body.get("basis"))
                     self.send_json({"ok": True})
                 else:
                     raise KeyError(action)

@@ -59,18 +59,30 @@ def stand_ins(monkeypatch):
 
 # ----------------------------------------------------------------------- the review page
 
+class Shown(tuple):
+    """The round and fit a page shows, as a pair, with the `basis` of the scores it shows."""
+
+    def __new__(cls, round_id, fit_id, basis=None):
+        shown = super().__new__(cls, (round_id, fit_id))
+        shown.basis = basis
+        return shown
+
+
 def page(directory):
-    """What the blind page shows: the round's id and, once every item is answered, its fit."""
+    """What the blind page shows: the round's id and, once every item is answered, its fit,
+    and the scores it shows (by their basis)."""
     shown = Reviews(directory.parent, BY, auto_advance=False).blind(directory.name)
-    return shown["round"]["id"], shown.get("fit") or (shown["round"].get("candidates") or [None])[0]
+    return Shown(shown["round"]["id"], shown.get("fit") or (shown["round"].get("candidates") or [None])[0],
+                 shown.get("basis"))
 
 
 def decide_shown(directory, publish, shown, reason=""):
-    """A decision sent the way the page sends it: for the round and fit it showed."""
+    """A decision sent the way the page sends it: for the round, fit and scores it showed."""
     round_id, fit_id = shown
     reviews = Reviews(directory.parent, BY, auto_advance=False)
     try:
-        return reviews.decide(directory.name, publish, reason, round_id=round_id, fit_id=fit_id)
+        return reviews.decide(directory.name, publish, reason, round_id=round_id, fit_id=fit_id,
+                              basis=getattr(shown, "basis", None))
     except TypeError:                     # a server that takes no round or fit
         return reviews.decide(directory.name, publish, reason)
 
@@ -316,6 +328,10 @@ def _as_main_stored_it(directory):
     main.pop("schema", None)
     main["bend"] = {"regularisation": 1.0, "effective_parameters": 3.0}   # run_fit's, for a fit with a bend
     record.write(rec.FIT, main)
+    final = record.read(rec.FINAL_REVIEW)                       # main's decisions name no scores
+    final.pop("schema", None)
+    final["decision"].pop("basis", None)
+    record.write(rec.FINAL_REVIEW, final)
     pipeline = pipeline_stages.pipeline(directory)
     stamp = pipeline.stamp("store")
     outputs = [rec.TRANSFORM, rec.FIT]
@@ -385,6 +401,11 @@ def _scorable(directory):
         stored["scores"][variant] = value | {"bar": bar_check(value)}
     stored_override = record.read(rec.FINAL_REVIEW)
     assert stored_override["decision"]["publish"] == "affine"
+    # As a store of these scores, on these answers, binds them.
+    from volreg.scoring import answers_digest, basis
+    stored["stored"]["answers_sha256"] = answers_digest(held)
+    stored["stored"]["basis"] = basis(stored["stored"]["fit_digest"], stored["scores"], stored.get("bar"),
+                                      stored["stored"]["answers_sha256"])
     record.write(rec.FIT, stored)
     # The store's own record of what it wrote, so the redo check still sees its writes.
     pipeline = pipeline_stages.pipeline(directory)
@@ -392,6 +413,7 @@ def _scorable(directory):
     pipeline._write_stamp("store", stamp | {"output_digest": engine.digest_files(directory, stamp["outputs"])})
     final = record.read(rec.FINAL_REVIEW)
     final["decision"]["override"] = {"by": BY, "reason": "too few lines up", "bar_missed": ["enough"]}
+    final["decision"]["basis"] = stored["stored"]["basis"]
     final.pop("schema", None)
     record.write(rec.FINAL_REVIEW, final)
 
@@ -455,7 +477,8 @@ def test_an_old_round_sent_over_http_is_refused_with_a_conflict(tmp_path, stand_
         assert "reload" in reply["error"]
     assert rec.Record(directory).read(rec.FINAL_REVIEW)["decision"]["fit"] == "f001"
     status, reply = server.post("/api/pairs/a/decide", {"publish": "affine", "reason": "",
-                                                        "round": "c002", "fit": "f002"})
+                                                        "round": "c002", "fit": "f002",
+                                                        "basis": page(directory).basis})
     assert status == 200, reply
     decision = rec.Record(directory).read(rec.FINAL_REVIEW)["decision"]
     assert (decision["fit"], decision["publish"], decision.get("round")) == ("f002", "affine", "c002")
@@ -466,8 +489,9 @@ def test_an_unanswered_round_is_refused_over_http(tmp_path, stand_ins, server):
     when a page stays open across Redo. (A round with an unanswered item is not complete.)"""
     directory = new_pair(tmp_path / "records")
     drain(directory)
+    scores = pipeline_stages.reviewed_unit(pipeline_stages.pipeline(directory)).basis   # current
     status, reply = server.post("/api/pairs/a/decide", {"publish": "bend", "reason": "",
-                                                        "round": "c001", "fit": "f001"})
+                                                        "round": "c001", "fit": "f001", "basis": scores})
     assert status == 409 and "round" in reply["error"]
     assert not rec.Record(directory).read(rec.FINAL_REVIEW).get("decision")
 

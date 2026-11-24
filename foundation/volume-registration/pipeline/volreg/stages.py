@@ -21,8 +21,8 @@ from . import render
 from .cores import fit_session as fs
 from .cores import session_overview
 from .cores.transform_io import volume_name
-from .engine import Pipeline, Stage, digest_contents
-from .scoring import BAR, bar_check, score
+from .engine import Pipeline, Stage, digest_contents, digest_json
+from .scoring import BAR, answers_digest, bar_check, bar_failures, basis, score
 
 PARAMS = "params.json"
 # The lock a read-change-write of `params.json` is done under, by the review page and the CLI.
@@ -43,7 +43,8 @@ class Incoherent(RuntimeError):
 class FitUnit:
     """One finished fit as its job wrote it, read and checked against its stamp: the files
     are the ones the job finished with, not a mix of them and a later fit's. With
-    `reviewed_unit`, also the scores made of exactly this fit."""
+    `reviewed_unit`, also the scores made of exactly this fit, and the hold-out answers they
+    were made of."""
     fit_id: str
     fit: dict
     transform: dict
@@ -51,11 +52,17 @@ class FitUnit:
     code: dict
     scores: dict = None
     scores_sha256: str = None
+    answers_sha256: str = None      # `scoring.answers_digest` of the answers the scores used
+
+    @property
+    def basis(self):
+        """What a decision on these scores is made on (`scoring.basis`)."""
+        return basis(self.digest, self.scores.get("scores"), self.scores.get("bar"), self.answers_sha256)
 
 
 def _read_bytes(pipeline, path):
     try:
-        return (pipeline.directory / path).read_bytes()
+        return filelock.retry((pipeline.directory / path).read_bytes)
     except FileNotFoundError:
         return None
 
@@ -88,7 +95,11 @@ def fit_unit(pipeline):
 def reviewed_unit(pipeline):
     """`fit_unit`, with the scores of that same fit: `scores.json` names the fit it scored (by
     the fit stamp's digest), or, written before it did, its stamps chain to that fit (score on
-    recheck, recheck on the fit). Incoherent if they are another fit's or are being written."""
+    recheck, recheck on the fit). Incoherent if they are another fit's or are being written.
+
+    With the answers they were made of: `scores.json` names them (`answers_sha256`), or,
+    written before it did, the score stamp that wrote them ran on the answers there are now,
+    whose digest is then taken. Incoherent if not: they are of answers since changed."""
     unit = fit_unit(pipeline)
     content = _read_bytes(pipeline, SCORES)
     if content is None:
@@ -109,8 +120,47 @@ def reviewed_unit(pipeline):
                 and (score.get("inputs") or {}).get("needs", {}).get("recheck") == recheck.get("output_digest")
                 and (recheck.get("inputs") or {}).get("needs", {}).get("fit") == unit.digest):
             raise Incoherent(f"the scores are not those of {unit.fit_id} as it is now")
+    answers = (scored or {}).get("answers_sha256")
+    if answers is None:
+        stamp = _stamp(pipeline, "score")
+        held = pipeline.record.read(rec.HOLDOUT) if pipeline.record.exists(rec.HOLDOUT) else {"patches": []}
+        if not (stamp.get("status") == "ok" and stamp.get("outputs") == [SCORES]
+                and digest_contents([(SCORES, content)]) == stamp.get("output_digest")
+                and (stamp.get("inputs") or {}).get("needs", {}).get("judge-holdout")
+                == digest_json(answers_of(held))):
+            raise Incoherent("the scores are not of the hold-out answers there are now: they are being made again")
+        answers = answers_digest(held)
     unit.scores, unit.scores_sha256 = scores, hashlib.sha256(content).hexdigest()
+    unit.answers_sha256 = answers
     return unit
+
+
+def approval_problem(decision, unit, scored_at=None):
+    """Why a decision does not cover the scores of `unit` (`reviewed_unit`), or None.
+
+    A decision made on the review page names the basis of the scores it was made on
+    (`scoring.basis`): it covers those scores only, not ones made since (an answer changed,
+    the fit scored again). One from before decisions named it covers the scores there are if
+    they were finished (`scored_at`, the score stamp's) by the time it was made. Either way a
+    variant that misses the bar is published only on an override naming exactly the parts
+    it misses: an override given for one failure is not taken for another."""
+    if decision.get("basis") is not None:
+        if decision["basis"] != unit.basis:
+            return ("the decision was made on other scores than the current ones (an answer changed, "
+                    "or the fit was scored again)")
+    elif decision.get("at") and scored_at and scored_at > decision["at"]:
+        return "the decision was made before the current scores were"
+    publish = decision["publish"]
+    if publish not in ("bend", "affine"):
+        return None
+    if publish not in unit.scores.get("scores") or {}:
+        return f"there is no score of the {publish}"
+    missed = bar_failures(unit.scores["scores"][publish])
+    named = sorted(set((decision.get("override") or {}).get("bar_missed") or []))
+    if missed != named:
+        return (f"the {publish} misses {', '.join(missed) or 'nothing'} of the bar, but the decision's "
+                f"override names {', '.join(named) or 'nothing'}")
+    return None
 
 
 @contextmanager
@@ -374,8 +424,13 @@ def holdout_identity(pipeline):
     """What judging the hold-out set decided: the answer per unit, nothing else."""
     if not pipeline.record.exists(rec.HOLDOUT):
         return {}
+    return answers_of(pipeline.record.read(rec.HOLDOUT))
+
+
+def answers_of(held):
+    """The answer per unit of a hold-out set as `holdout.json` holds it."""
     found = {}
-    for patch in pipeline.record.read(rec.HOLDOUT)["patches"]:
+    for patch in held["patches"]:
         found[patch["id"]] = (patch.get("answer") or {}).get("answer")
         for octant in patch.get("octants") or []:
             found[f"{patch['id']}.{octant['index']}"] = (octant.get("answer") or {}).get("answer")
@@ -388,9 +443,11 @@ def final_identity(pipeline):
         return {}
     final = pipeline.record.read(rec.FINAL_REVIEW)
     decision = final.get("decision") or {}
+    # The basis only where a decision names it, so one from before is what it was.
     return {"picks": {round_["id"]: [item["choice"] for item in round_["items"]]
                       for round_ in final.get("rounds") or []},
-            "decision": {key: decision.get(key) for key in ("fit", "publish", "override")}}
+            "decision": {key: decision.get(key) for key in ("fit", "publish", "override")}
+            | ({"basis": decision["basis"]} if decision.get("basis") else {})}
 
 
 def holdout_judged(pipeline, params):
@@ -425,10 +482,11 @@ def run_score(pipeline, params):
              # was given to a picture that may be off, so they are worth judging again.
              "judge_again": [patch_id for patch_id in recheck["flagged"] if patch_id in lining_up]}
     out = pipeline.work("scores.json")
-    # Which fit was scored, to the byte: Store and the decision take these scores only
-    # with that fit.
+    # Which fit was scored, to the byte, and on which answers: Store and the decision take
+    # these scores only with that fit, and only while those are the answers.
     out.write_text(json.dumps({"bar": BAR, "scores": scores, "drift": drift,
-                               "scored": {"fit": unit.fit_id, "fit_digest": unit.digest}},
+                               "scored": {"fit": unit.fit_id, "fit_digest": unit.digest,
+                                          "answers_sha256": answers_digest(held)}},
                               indent=1) + "\n")
     return [SCORES]
 
@@ -548,15 +606,30 @@ def run_store(pipeline, params):
                            f"now: judge its blind round and decide again")
     if decision.get("round") and decided_round_problem(final, decision):
         raise RuntimeError(f"{decided_round_problem(final, decision)}: decide again")
+    answers = answers_digest(pipeline.record.read(rec.HOLDOUT) if pipeline.record.exists(rec.HOLDOUT)
+                             else {"patches": []})
+    if answers != unit.answers_sha256:
+        raise Incoherent("a hold-out answer changed since the scores were made: once they are made "
+                         "again, decide again on them")
+    problem = approval_problem(decision, unit, _stamp(pipeline, "score").get("finished"))
+    if problem:
+        raise RuntimeError(f"{problem}: decide again on the scores there are")
     publish = decision["publish"]
     content = None if publish == "nothing" else rec.dumps(published(unit.transform, publish))
     binding = {"fit": unit.fit_id, "publish": publish, "round": decision.get("round"),
                "transform_sha256": content and hashlib.sha256(content).hexdigest(),
-               "fit_digest": unit.digest, "scores_sha256": unit.scores_sha256}
+               "fit_digest": unit.digest, "scores_sha256": unit.scores_sha256,
+               "answers_sha256": answers, "basis": unit.basis}
     stored = unit.fit | unit.scores | {"code": unit.code,
                                        "decision": {key: decision[key] for key in ("fit", "publish")},
                                        "stored": binding}
-    with pipeline.publishing("store"):
+    # Under the record lock an answer is logged under: one logged since the scores were
+    # read is seen here, and one logged after is newer than this store, which a release
+    # then sees in `holdout.json`.
+    with pipeline.publishing("store"), pipeline.record.lock():
+        if answers_digest(pipeline.record.current_holdout()) != answers:
+            raise Incoherent("a hold-out answer changed as the decided fit was being stored: once the "
+                             "scores are made again, decide again on them")
         pipeline.record.write(rec.FIT, stored)
         if content is None:
             filelock.unlink(pipeline.record.path(rec.TRANSFORM), missing_ok=True)
@@ -590,7 +663,9 @@ def stages():
                                      "answers": [rec.LINES_UP, "partly"]}),
         Stage("final-review", "judge the final fit", needs=("blind",),
               complete=final_decided, identity=final_identity),
-        Stage("store", "store the decided fit", needs=("final-review",), run=run_store),
+        # Store rests on the scores as well as the decision: scores made again (an answer
+        # changed) run it again, and it fails until the decision is made on them.
+        Stage("store", "store the decided fit", needs=("final-review", "score"), run=run_store),
     ]
 
 

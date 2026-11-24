@@ -19,6 +19,7 @@ from volreg import stages as pipeline_stages
 from volreg.cores.transform_io import volume_name
 from volreg.engine import DONE, Pipeline, Stage, Superseded
 from volreg.review.server import Reviews
+from volreg.scoring import answers_digest
 
 # Fork where there is one; Windows spawns, which the workers below allow for (module-level
 # targets, picklable arguments, everything they need passed in or built there).
@@ -560,6 +561,8 @@ def test_store_names_a_windows_volume_by_its_zarr(tmp_path):
     pipeline._write_stamp("fit", {"status": "ok", "outputs": outputs,
                                   "output_digest": engine.digest_files(pipeline.directory, outputs)})
     unit = pipeline_stages.fit_unit(pipeline)
-    (work / "scores.json").write_text(json.dumps({"scores": {}, "scored": {"fit": "f001", "fit_digest": unit.digest}}))
+    passing = {"bar": {"passes": True, "checks": {}}}
+    (work / "scores.json").write_text(json.dumps({"scores": {"bend": passing}, "scored": {
+        "fit": "f001", "fit_digest": unit.digest, "answers_sha256": answers_digest({"patches": []})}}))
     pipeline_stages.run_store(pipeline, {})
     assert record.read(rec.TRANSFORM)["fixed_volume"] == "coarse.zarr"

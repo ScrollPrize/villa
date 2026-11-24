@@ -36,6 +36,7 @@ from pathlib import Path
 
 from . import filelock
 from . import record as rec
+from . import scoring
 from .engine import digest_contents
 
 SCHEMA = "volreg-release/1"
@@ -179,12 +180,65 @@ def stored_mismatch(record, decision, legacy_too=True):
     return None
 
 
+def scores_problem(record, decision):
+    """Why the scores a record publishes are not those of the hold-out answers it holds, or
+    not what its decision and any override cover, or None. Recomputed from the files as they
+    are (a Record or a Snapshot), not taken from what Store said.
+
+    A store binds the answers its scores used (`answers_sha256`, see `scoring.answers_digest`)
+    and the basis the decision was checked against (`scoring.basis`): both must still be what
+    the record's own `holdout.json` and `fit.json` give, and a decision that names its basis
+    must name that one. A record stored before stores bound them (by main, an earlier version,
+    or migrated from the first runs) is checked on what it holds: the published variant's
+    score must name the units the answers line up (`per_unit`), or count as many. Either way
+    the published variant must pass the bar, or the decision's override must name every part
+    it misses."""
+    publish = decision.get("publish")
+    if publish not in ("bend", "affine") or not record.exists(rec.FIT):
+        return None
+    stored = record.read(rec.FIT)
+    held = record.read(rec.HOLDOUT) if record.exists(rec.HOLDOUT) else {"patches": []}
+    used = scoring.answers_digest(held)
+    binding = stored.get("stored") or {}
+    result = (stored.get("scores") or {}).get(publish)
+    if result is None:
+        return f"it stores no score for the {publish}; store it again with `volreg redo <pair> store`"
+    again = "the decision is made again on the new scores, and stored"
+    if binding.get("answers_sha256") is not None:
+        if binding["answers_sha256"] != used:
+            return (f"a hold-out answer changed since it was stored, so its scores are not those of "
+                    f"the answers it holds; it is released once {again}")
+        basis = scoring.basis(binding.get("fit_digest"), stored.get("scores"), stored.get("bar"), used)
+        if binding.get("basis") != basis:
+            return "its scores are not the ones it was stored with; store it again with `volreg redo <pair> store`"
+        if decision.get("basis") is not None and decision["basis"] != basis:
+            return f"its decision was made on other scores than it stores; it is released once {again}"
+    elif decision.get("basis") is not None:
+        return ("its decision names the scores it was made on, and its store does not; store it again "
+                "with `volreg redo <pair> store`")
+    units = {unit[0] for unit in scoring.answers_used(held)}
+    named = result.get("per_unit")
+    if (named is not None and set(named) != units) or result.get("lines_up", 0) != len(units):
+        return (f"its {publish} score is on {result.get('lines_up', 0)} units lining up, but its hold-out "
+                f"answers line up {len(units)} (an answer changed since it was scored); it is released "
+                f"once {again}")
+    missed = scoring.bar_failures(result)
+    covered = set((decision.get("override") or {}).get("bar_missed") or [])
+    if not set(missed) <= covered:
+        return (f"its {publish} misses the bar ({', '.join(missed)}) and its decision's override does not "
+                f"name {', '.join(sorted(set(missed) - covered))}; decide again")
+    return None
+
+
 def unreleasable(record, decision):
     """Why a decided record cannot be released as it stands, or None: a redo since its store
-    (`not_stored_since_redo`), or a stored result that is not the one its decision names
-    (`stored_mismatch`; a migrated record has nothing to check but what a store bound)."""
+    (`not_stored_since_redo`), a stored result that is not the one its decision names
+    (`stored_mismatch`; a migrated record has nothing to check but what a store bound), or
+    scores that are not those of its answers, or not covered by its decision
+    (`scores_problem`)."""
     return not_stored_since_redo(record) or (
-        decision["publish"] != "nothing" and stored_mismatch(record, decision, legacy_too=is_pipeline(record)))
+        decision["publish"] != "nothing" and (stored_mismatch(record, decision, legacy_too=is_pipeline(record))
+                                              or scores_problem(record, decision)))
 
 
 def newness(record):

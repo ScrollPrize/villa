@@ -3,7 +3,17 @@
 Needs nothing but the record: each hold-out patch answered "lines up" carries its coarse
 centre and the fine point its own measurement put it at, and a transform maps one to the
 other. How far it lands from that point, in fine level-0 voxels, is the patch's score.
+
+A score is only as good as the answers it was made of, and a decision only covers the scores
+it was made on. `answers_digest` names the answers a score used (the units answered "lines
+up", where they sit), and `basis` names what a reviewer decides on: the scores of a fit, with
+the bar's verdict on each variant, and those answers. The review page, the decision, Store
+and Release all carry the basis, so none of them can pair an approval with other scores, or
+scores with other answers.
 """
+
+import hashlib
+import json
 
 import numpy as np
 
@@ -47,6 +57,43 @@ def lining_up(holdout):
                 units.append((f"{patch['id']}.{octant['index']}", octant["centre_zyx"],
                               octant["fine_zyx"]))
     return units
+
+
+def answers_used(holdout):
+    """What a score rests on: `[id, coarse centre, fine point]` of every unit answered "lines
+    up", by id. Like `lining_up`, but for any record (a unit's points are None where it has
+    none), and in an order of its own."""
+    found = []
+    for patch in holdout.get("patches") or []:
+        units = [(patch["id"], patch)] + [(f"{patch['id']}.{octant['index']}", octant)
+                                          for octant in patch.get("octants") or []]
+        for unit_id, unit in units:
+            if (unit.get("answer") or {}).get("answer") == LINES_UP:
+                found.append([unit_id, unit.get("centre_zyx"), unit.get("fine_zyx")])
+    return sorted(found, key=lambda unit: unit[0])
+
+
+def answers_digest(holdout):
+    """The digest of `answers_used`: which answers, and so which units, a score was made of.
+    A note, a picture, or another answer than "lines up" changed into another one that is not
+    either, leaves it as it was, since the score does not change."""
+    return hashlib.sha256(json.dumps(answers_used(holdout), sort_keys=True).encode()).hexdigest()
+
+
+def basis(fit_digest, scores, bar, answers):
+    """What a decision is made on, as one digest: the fit (by its stamp's digest), its scores
+    for every variant with the bar's verdict on each (`scores`, as `scores.json` holds them),
+    the bar, and the answers they used (`answers_digest`)."""
+    return hashlib.sha256(json.dumps({"fit_digest": fit_digest, "scores": scores, "bar": bar,
+                                      "answers": answers}, sort_keys=True).encode()).hexdigest()
+
+
+def bar_failures(result):
+    """The parts of the bar a stored score misses, as its own check recorded them, sorted. A
+    score said to miss the bar without saying where misses "bar"."""
+    bar = (result or {}).get("bar") or {}
+    missed = sorted(part for part, ok in (bar.get("checks") or {}).items() if not ok)
+    return missed or (["bar"] if bar.get("passes") is False else [])
 
 
 def score(transform, holdout, fixed_is_coarse, fine_um, affine_only=False, units=None):
