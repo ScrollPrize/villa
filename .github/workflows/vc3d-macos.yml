@@ -173,6 +173,32 @@ jobs:
           fi
           echo "vc_tifxyz2obj OK (exit $rc)"
 
+          # flatboi: two SLIM iterations on a PHerc 0172 test segment from the
+          # checkout. Starting is not enough here: with the bundled OpenMP build
+          # of OpenBLAS 0.3.33, flatboi crashed in its first PaStiX
+          # factorization when more than one solver worker ran (#2489). Pin the
+          # worker count so the check does not depend on the runner's core
+          # count, and drop any inherited OMP_NUM_THREADS so flatboi's own macOS
+          # default is what runs.
+          segment="$GITHUB_WORKSPACE/volume-cartographer/core/test/data/segments/20241113070770"
+          flat_dir=$(mktemp -d "$RUNNER_TEMP/flatboi-smoke.XXXXXX")
+          set +e
+          env -u OMP_NUM_THREADS PASTIX_NUM_THREADS=6 \
+            "$bin/flatboi" "$segment" --output="$flat_dir/flat" 2
+          rc=$?
+          set -e
+          if [[ $rc -ne 0 ]]; then
+            echo "::error::flatboi failed two SLIM iterations on a test segment (exit $rc)"
+            exit 1
+          fi
+          # After that crash's "Negative diagonal term", flatboi has also exited
+          # 0 without writing anything, so check for the surface too.
+          if [[ ! -f "$flat_dir/flat/x.tif" ]]; then
+            echo "::error::flatboi exited 0 but wrote no surface for the test segment"
+            exit 1
+          fi
+          echo "flatboi OK (two SLIM iterations, 6 PaStiX workers)"
+
           # GUI app: Homebrew's macOS Qt package ships the native Cocoa
           # platform plugin, not the offscreen plugin. --version exits without
           # showing a window while still exercising the packaged Qt framework
@@ -198,7 +224,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: VC3D-macos-crash-reports
-          path: ~/Library/Logs/DiagnosticReports/VC3D*
+          path: |
+            ~/Library/Logs/DiagnosticReports/VC3D*
+            ~/Library/Logs/DiagnosticReports/flatboi*
           if-no-files-found: ignore
 
   release-macos:
