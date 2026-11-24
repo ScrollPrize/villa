@@ -2,7 +2,7 @@
 with a random frame model and a synthetic planar CT: on the CPU the batched geometry and engine give predict's
 heights, frames and positions exactly, and infer_all.py's batched mode (``--workers``) writes the strips and index
 records of its per-fiber loop; on a GPU, crops sampled by vc_reader's CUDA reader (``crops='gpu'``) give the strips of
-CPU crops within float rounding."""
+CPU crops within float rounding, and batched mode with CPU crops keeps the frame model on the CPU, as fiber by fiber."""
 import dataclasses
 from argparse import Namespace
 import json
@@ -95,6 +95,51 @@ def test_gpu_crops_match_cpu_crops(tmp_path):
         np.testing.assert_allclose(got[0], heights, rtol=0, atol=.125)
 
 
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='needs a CUDA device')
+def test_cuda_workers_with_cpu_crops_match_per_fiber(tmp_path):
+    """``--device cuda`` with the default CPU crops, per fiber and batched (``--workers 2``): the frame model runs on
+    the CPU in both, so frames and kept nodes are the same, and strips agree within the bf16 bar."""
+    path, volume, fiber, arcs = strip_run(tmp_path)
+    predictor = StripPredictor(str(path), 'cuda', None, BATCH, volume=volume)
+    heights, _, frames, positions = predictor.predict(fiber, arcs)
+    got = batched(predictor, fiber, arcs)
+    np.testing.assert_array_equal(got[2], positions)
+    np.testing.assert_array_equal(got[1], frames)
+    np.testing.assert_allclose(got[0], heights, rtol=0, atol=.125)
+
+    _, common = infer_all_run(tmp_path, path, volume, fiber, 'cuda')
+    infer_all.main([*common, '--out', str(tmp_path/'per_fiber')])
+    infer_all.main([*common, '--out', str(tmp_path/'batched'), '--workers', '2'])
+    assert index_records(tmp_path/'batched') == index_records(tmp_path/'per_fiber')
+    per_fiber, batched_files = strips_written(tmp_path/'per_fiber'), strips_written(tmp_path/'batched')
+    assert sorted(per_fiber) == sorted(batched_files)
+    for name, value in per_fiber.items():
+        if isinstance(value, np.ndarray):
+            np.testing.assert_array_equal(batched_files[name] == -1, value == -1, err_msg=name)
+            np.testing.assert_allclose(batched_files[name], value, rtol=0, atol=.125, err_msg=name)
+        elif name.endswith('trace.json'):
+            assert batched_files[name] == value, name
+
+def infer_all_run(tmp_path, path, volume, fiber, device):
+    """A two-fiber store for ``strip_run``'s checkpoint, in base voxels (the CT's grid scale is 4): its fiber and one
+    beside it traced the other way. Returns the fiber ids and infer_all.py's options for it on ``device``."""
+    ids = ['00000000-0000-4000-8000-000000000001', '10000000-0000-4000-8000-000000000002']
+    shifted = fiber.points[::-1]+(0., 4., 0.)
+    write_fibers(tmp_path/'fibers.vcobj', [(dict(id=fid, name=fid, family='H'), 4.*points)
+                                           for fid, points in zip(ids, (fiber.points, shifted))], volume='test')
+    return ids, ['--checkpoint', str(path), '--frame-checkpoint', volume.frame_checkpoint, '--fibers',
+                 str(tmp_path/'fibers.vcobj'), '--device', device, '--batch', str(BATCH), '--threads', '1',
+                 '--min-length-mm', '0', '--trim', '8']
+
+
+def index_records(out):
+    """OUT's index records by fiber, without their seconds."""
+    lines = (out/'index'/'shard_0.jsonl').read_text().splitlines()
+    return sorted(({k: v for k, v in json.loads(line).items() if k != 'seconds'} for line in lines),
+                  key=lambda r: r['fiber'])
+
+
 def strips_written(out):
     """Every file under OUT/strips by path: TIFF arrays, and the JSON of the rest (meta.json without its fresh uuid)."""
     files = {}
@@ -110,22 +155,10 @@ def test_infer_all_batched_writes_the_per_fiber_strips(tmp_path):
     """infer_all.py on a two-fiber store, fiber by fiber and with ``--workers 2`` (spawned CPU workers): the same
     strips, expected errors, trace.json and index records apart from seconds; a rerun resumes past both."""
     path, volume, fiber, arcs = strip_run(tmp_path, strip_uncertainty=True)
-    # fibers in base voxels (the CT's grid scale is 4): the test fiber and one beside it traced the other way
-    ids = ['00000000-0000-4000-8000-000000000001', '10000000-0000-4000-8000-000000000002']
-    shifted = fiber.points[::-1]+(0., 4., 0.)
-    write_fibers(tmp_path/'fibers.vcobj', [(dict(id=fid, name=fid, family='H'), 4.*points)
-                                           for fid, points in zip(ids, (fiber.points, shifted))], volume='test')
-    common = ['--checkpoint', str(path), '--frame-checkpoint', volume.frame_checkpoint, '--fibers',
-              str(tmp_path/'fibers.vcobj'), '--device', 'cpu', '--batch', str(BATCH), '--threads', '1',
-              '--min-length-mm', '0', '--trim', '8']
+    ids, common = infer_all_run(tmp_path, path, volume, fiber, 'cpu')
     infer_all.main([*common, '--out', str(tmp_path/'per_fiber')])
     infer_all.main([*common, '--out', str(tmp_path/'batched'), '--workers', '2'])
-
-    def records(out):
-        lines = (out/'index'/'shard_0.jsonl').read_text().splitlines()
-        return sorted(({k: v for k, v in json.loads(line).items() if k != 'seconds'} for line in lines),
-                      key=lambda r: r['fiber'])
-    expected, got = records(tmp_path/'per_fiber'), records(tmp_path/'batched')
+    expected, got = index_records(tmp_path/'per_fiber'), index_records(tmp_path/'batched')
     assert [r['fiber'] for r in expected] == ids
     assert [(r['decisions'], r['family'], r['path']) for r in expected] == [
         (len(arcs), 'H', f'strips/{fid[:2]}/fiber_{fid}') for fid in ids]

@@ -295,7 +295,8 @@ decisions/s. Running the shards as clients of an NVIDIA MPS daemon (`nvidia-cuda
 
 `--workers N` switches a shard to batched mode (`sheet_strip/batched.py`; CUDA or the CPU). N CPU worker processes
 build each decision's geometry, then stitch and write the strips. The shard's own process samples the crops (on the GPU with
-`--crops gpu`) and runs the frame and strip models over the decisions of many fibers at once. Outputs are the same
+`--crops gpu`) and runs the frame and strip models over the decisions of many fibers at once, the strip model on the
+device and the frame model where the per-fiber loop runs it (the GPU with `--crops gpu`, else the CPU). Outputs are the same
 files and index records as fiber by fiber. Records are appended in the order fibers finish, and a record's `seconds`
 is the time since the shard's previous record, because fibers overlap. Without `--across-fibers` both models run each
 fiber's decisions in batches of `--batch`, as the per-fiber loop does, and on the CPU the strips are identical to the

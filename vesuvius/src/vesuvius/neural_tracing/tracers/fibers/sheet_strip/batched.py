@@ -7,8 +7,8 @@ the CPU, then the strip model. Here the same decisions are split around the fram
 - ``StripGeometry.plan`` (worker): the decisions as ``predict`` builds them, without training labels
   (``decision_on_path(labels=False)``) or identity evidence, which are never model inputs, and with the seed heading
   resolved as ``predict`` does; returns the frame model's inputs (``FrameRequest``).
-- ``StripEngine.frame_outputs`` (GPU process): frame-model crops from vc_reader's CUDA or Metal reader and the frame model on
-  the GPU, over the requests of many fibers.
+- ``StripEngine.frame_outputs`` (GPU process): the frame model over the requests of many fibers, on the GPU with crops
+  from vc_reader's CUDA or Metal reader (``crops='gpu'``), else on the CPU with CPU crops, as ``predict`` runs it.
 - ``StripGeometry.finish`` (worker): the learned frame, the crop axis of the previous prediction, the references,
   path features, tube points and crop orientation (``StripInputs``), as the observation builder sets them.
 - ``StripEngine.heights`` (GPU process): the strip crops on the GPU and the strip model, by default the decisions of
@@ -147,9 +147,10 @@ TUBE_POINTS = 2048  # infer.StripPredictor.predict's tube buffer
 
 
 class StripEngine:
-    """The model half of ``StripPredictor.predict`` over the decisions of many fibers per call: crops and both
-    models on ``predictor``'s device. Crops come from vc_reader's CUDA or Metal reader with ``crops='gpu'``, else from
-    the CPU sampler (on the CPU, the engine then reproduces ``predict``)."""
+    """The model half of ``StripPredictor.predict`` over the decisions of many fibers per call: the strip model on
+    ``predictor``'s device, and the frame model on its own predictor's (as ``predict`` runs it: the GPU with
+    ``crops='gpu'``, else the CPU). Crops come from vc_reader's CUDA or Metal reader with ``crops='gpu'``, else from the
+    CPU sampler (on the CPU, the engine then reproduces ``predict``)."""
 
     def __init__(self, predictor, batch=4, frame_chunk=64, across_fibers=False, compile_mode=None):
         """``compile_mode``: a torch.compile mode for the strip model after the tube render (with ``across_fibers``:
@@ -179,16 +180,18 @@ class StripEngine:
             return out[:, -1].float(), None if scale is None else scale.float()
         self.strip_model = strip_model if compile_mode is None else torch.compile(strip_model, mode=compile_mode)
         self.device = torch.device(predictor.device)
-        self.frame_model = predictor.builder.frames().model
+        frames = predictor.builder.frames()
+        self.frame_model, self.frame_device = frames.model, frames.device
 
-    def crops(self, items, crop):
-        """(B, 1, D, H, W) z-scored float32 crops of ``items`` on the engine's device: from the predictor's GPU crop
-        backend with ``crops='gpu'`` (vc_reader's CUDA or Metal reader), else from the CPU sampler."""
+    def crops(self, items, crop, device=None):
+        """(B, 1, D, H, W) z-scored float32 crops of ``items``: from the predictor's GPU crop backend with
+        ``crops='gpu'`` (vc_reader's CUDA or Metal reader, on the engine's device), else from the CPU sampler, moved to
+        ``device`` (default: the engine's)."""
         from vesuvius.neural_tracing.tracers.shared.crop_sampling.crops import scalar_crops
         p = self.predictor
         if p.gpu_crops is not None:
             return p.gpu_crops(items, p.ct, p.spec, crop)
-        return scalar_crops(items, p.ct, p.spec, crop).to(self.device)
+        return scalar_crops(items, p.ct, p.spec, crop).to(device or self.device)
 
     def frame_outputs(self, requests):
         """Frame-model outputs (heading, normal; each (K, 3) float32 per request, crop-local) of ``requests``, in
@@ -211,9 +214,10 @@ class StripEngine:
         with torch.no_grad():
             for part in parts:
                 items = [dict(pos=a, frame=b) for a, b in zip(positions[part], frames[part])]
-                patch = self.crops(items, crop)
-                out = self.frame_model.forward_outputs(patch, paths[part].to(self.device),
-                                                       families[part].to(self.device))
+                # with CPU crops the frame model stays on the CPU, as in predict, while the strip model runs on the GPU
+                patch = self.crops(items, crop, self.frame_device)
+                out = self.frame_model.forward_outputs(patch, paths[part].to(self.frame_device),
+                                                       families[part].to(self.frame_device))
                 heading.append(out['heading'])
                 normal.append(out['normal'])
         heading, normal = (torch.cat(v).float().cpu().numpy() for v in (heading, normal))
