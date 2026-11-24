@@ -138,8 +138,38 @@ public:
         return idle_.size();
     }
 
+    // DNS answers and TLS sessions shared by every handle in the process: many
+    // requests in parallel to one host (range reads) otherwise each look the
+    // host up and negotiate TLS from scratch whenever a handle is new. (Open
+    // connections are not shared: libcurl does not support sharing them between
+    // handles running at once on different threads.)
+    CURLSH* share() const noexcept { return share_; }
+
 private:
-    CurlHandles() : owner_(pid()) { idle_.reserve(kMaxIdle); }
+    CurlHandles() : owner_(pid())
+    {
+        idle_.reserve(kMaxIdle);
+        share_ = curl_share_init();
+        if (share_) {
+            curl_share_setopt(share_, CURLSHOPT_LOCKFUNC, &CurlHandles::lock_share);
+            curl_share_setopt(share_, CURLSHOPT_UNLOCKFUNC, &CurlHandles::unlock_share);
+            curl_share_setopt(share_, CURLSHOPT_USERDATA, this);
+            curl_share_setopt(share_, CURLSHOPT_SHARE, CURL_LOCK_DATA_DNS);
+            curl_share_setopt(share_, CURLSHOPT_SHARE, CURL_LOCK_DATA_SSL_SESSION);
+        }
+    }
+
+    static void lock_share(CURL*, curl_lock_data data, curl_lock_access, void* self) noexcept
+    {
+        static_cast<CurlHandles*>(self)->share_locks_[static_cast<std::size_t>(data) % kShareLocks].lock();
+    }
+    static void unlock_share(CURL*, curl_lock_data data, void* self) noexcept
+    {
+        static_cast<CurlHandles*>(self)->share_locks_[static_cast<std::size_t>(data) % kShareLocks].unlock();
+    }
+    static constexpr std::size_t kShareLocks = 16;
+    CURLSH* share_ = nullptr;
+    std::mutex share_locks_[kShareLocks];
 
     static long pid()
     {
@@ -293,6 +323,7 @@ private:
             Transfer transfer{write, body_status, begin_body};
             transfer.any_status = any_status;
             curl_easy_reset(h);
+            if (CURLSH* shared = lease.pool.share()) curl_easy_setopt(h, CURLOPT_SHARE, shared);
             curl_easy_setopt(h, CURLOPT_URL, url.c_str());
             if (options_.bypass_proxy) curl_easy_setopt(h, CURLOPT_PROXY, "");
             curl_easy_setopt(h, CURLOPT_PATH_AS_IS, options_.path_as_is ? 1L : 0L);

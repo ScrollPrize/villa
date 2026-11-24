@@ -10,6 +10,9 @@
 #include <atomic>
 #include <iostream>
 #include <sqlite3.h>
+#ifndef _WIN32
+#include <sys/stat.h>
+#endif
 #include <algorithm>
 #include <limits>
 #include <map>
@@ -281,6 +284,41 @@ public:
             } catch (...) {} // Preserve the original I/O error; startup reclaims abandoned reservations.
             throw;
         }
+    }
+
+    // A file its owner writes in place under the root, such as a sparse mirror
+    // holding parts of a remote file: charges its `bytes` (what it occupies, not
+    // its apparent size) against the budget, newest, evicting older files to make
+    // room, and registers it, so it is evicted and found at startup like the
+    // files open_file downloads. Called again as the file grows. False, charging
+    // nothing new, when it would not fit or would leave the disk under its floor.
+    bool account_file(const std::string& path, std::int64_t bytes)
+    {
+        check_path(path);
+        if (bytes < 0) throw std::invalid_argument("negative file size");
+        std::lock_guard lock(mutex_);
+        if (!reconciled_) transaction([&] { reconcile(); });
+        bool charged = false;
+        transaction([&] {
+            std::int64_t before = 0;
+            {
+                Statement s(db_, "SELECT size FROM chunks WHERE path=?");
+                s.text(1, path);
+                if (s.step()) before = sqlite3_column_int64(s.get(), 0);
+            }
+            if (bytes > before && !leaves_free_space(static_cast<std::size_t>(bytes - before)))
+                return;
+            const auto available = number("SELECT max_bytes FROM budget WHERE id=1") - reserved_bytes();
+            if (bytes > available)
+                return;
+            record(path, bytes);  // the newest entry, so the last one eviction takes
+            Statement f(db_, "INSERT OR IGNORE INTO files(path) VALUES(?)");
+            f.text(1, path);
+            f.step();
+            evict_to(available);
+            charged = true;
+        });
+        return charged;
     }
 
 private:
@@ -570,7 +608,7 @@ private:
                 std::error_code ec;
                 if (std::filesystem::is_regular_file(std::filesystem::symlink_status(path, ec)))
                     files.emplace_back(std::filesystem::last_write_time(path), path.string(),
-                                       std::filesystem::file_size(path));
+                                       occupied_bytes(path));
             }
         }
         std::sort(files.begin(), files.end());
@@ -579,6 +617,19 @@ private:
         exec("DELETE FROM files WHERE path NOT IN (SELECT path FROM chunks);");
         evict();
         reconciled_ = true;
+    }
+
+    // What a file occupies on disk: its size, or less for a sparse file
+    // (account_file's mirrors), whose holes take no space.
+    static std::int64_t occupied_bytes(const std::filesystem::path& path)
+    {
+        const auto size = static_cast<std::int64_t>(std::filesystem::file_size(path));
+#ifndef _WIN32
+        struct stat st{};
+        if (::stat(path.c_str(), &st) == 0)
+            return std::min<std::int64_t>(size, static_cast<std::int64_t>(st.st_blocks) * 512);
+#endif
+        return size;
     }
 
     template<class Entries> void scan(const std::filesystem::path& base, Entries& files)
