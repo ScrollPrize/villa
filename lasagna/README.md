@@ -220,6 +220,60 @@ lasagna-prefill s3://vesuvius-challenge-open-data/PHerc0125/volumes/example.zarr
 CuPy remains an optional acceleration path and is not required for the
 preprocessing commands above.
 
+## Apple-silicon Macs (MPS) and CPU-only machines
+
+The 3D fit runs on CUDA, on Apple-silicon GPUs and on the CPU. Pass `--device mps` or `--device cpu` to `fit.py`; for
+the fit service, set `device` in the job config's `args`. The default stays `cuda`. Without CUDA the fit stops rather
+than fall back silently; on a Mac its error names `--device mps`. PyPI's macOS PyTorch wheels include MPS. The
+service's `/export_vis` takes `device` from its request body, also defaulting to `cuda`; VC3D's vis export doesn't set
+it, so that export still needs a CUDA service.
+
+How the volumes are read:
+- **CUDA and ROCm** (`device.type == "cuda"`) keep the device-pointer chunk cache and its `.cu` kernels, unchanged.
+- **Every other device** uses `sparse_pool_cache.PooledChunkGroupCache`:
+  - it reads the same padded 34³ chunks into one pooled tensor, with an int32 slot table;
+  - it samples them with Metal kernels on MPS;
+  - otherwise it uses torch ops that follow the `.cu` kernels term by term.
+  - On MPS the Metal and torch-ops samplers give bitwise identical results.
+
+`LASAGNA_METAL` picks the MPS samplers, both the chunk cache's and the dense `grid_sample_3d_u8*`:
+
+| value | MPS samplers |
+|---|---|
+| unset | Metal when the kernels compile (the chunk cache's must also pass a known-answer self-check); otherwise torch ops, with the reason printed once |
+| `0` | torch ops |
+| `1` | Metal, or an error |
+| anything else | an error |
+
+- The cache's start-up line names what runs: `sampler=metal`, `sampler=metal (contraction: compiler default)` (the
+  compiler rejected the no-contraction pragma, so Metal isn't bitwise equal to torch ops), `sampler=torch
+  (LASAGNA_METAL=0)` or `sampler=torch (metal unavailable: ...)`.
+- A chunk-cache call its Metal kernels can't take, such as a dispatch beyond their size limits, falls back to torch
+  ops with a warning. Under `LASAGNA_METAL=1` it raises instead.
+- The dense Metal samplers have neither the self-check nor a size fallback: they run whenever their shader compiles.
+  `LASAGNA_METAL=0` gives their torch ops.
+- On the CPU only the chunk cache reads the variable: `1` raises there, as does an invalid value. The dense samplers
+  ignore it off MPS, and CUDA never reads it.
+
+What to expect:
+- **Memory.** Nothing is evicted: every chunk a fit touches stays loaded until the fit ends, as with the CUDA cache.
+  - A loaded chunk costs 39 KB per channel (34³ uint8 with its halo).
+  - On a Mac this is the machine's RAM.
+  - The cylinder initialisation (`configs/init_cyl.json`) keeps touching new chunks as its shells move. On PHerc0826
+    with `--model-h 300` (on the CPU) it loaded about 20 chunks per channel per iteration, reaching about 10,500
+    chunks per channel and a 1.9 GB process footprint after 250 iterations. Its full step counts keep growing past
+    that.
+  - A 1,500-step refine with the cos data loss on a 17×553 mesh peaked at 1.7 GB on the CPU and 3.5 GB on MPS
+    (process footprint, which on MPS includes the GPU's buffers). 60-iteration runs of the same refine, on meshes up
+    to 33×1105, stayed at or below 1.5 GB on the CPU and 2.4 GB on MPS.
+- **Speed.** On MPS the fit is bound by per-operation overhead across the whole optimisation, not only by sampling.
+  It pays off on larger meshes. On a 64 GB M5 Pro, a refine with the cos data loss ran faster on MPS (Metal) than on
+  4 CPU threads at about 144k samples per call (31 vs 46 ms per iteration) and 4.8x faster at about 583k (33 vs
+  157 ms). At about 23k the CPU was faster (14 vs 29 ms), and so is the cylinder initialisation.
+- **`cyl_outside`.** It builds a C++ extension that needs the Eigen headers and libigl 2.6 or newer (for
+  `WindingNumberAABB<Scalar, Index>`; volume-cartographer pins commit ae8f959e in `cmake/FetchLibigl.cmake`), on every
+  platform. Point `LIBIGL_INCLUDE_DIR` and `EIGEN_INCLUDE_DIR` at them. The build needs more than 5.6 GB of RAM.
+
 ## Design decisions
 
 - Minimal dependencies: PyTorch, tifffile, TensorBoard, single in-repo U-Net implementation.
