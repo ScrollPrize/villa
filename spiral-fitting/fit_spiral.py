@@ -40,7 +40,7 @@ from ddp_helpers import (
     maybe_init_distributed,
     process_context,
 )
-from config import (CHECKPOINT_MODEL_SHAPE_KEYS, OBJECT_STORE_PCL_KEYS,
+from config import (CHECKPOINT_MODEL_SHAPE_KEYS, OBJECT_STORE_PCL_KEYS, check_overrides,
                     Config, FitConfig, SHELL_ATLAS_KEYS)
 from checkpoint_migrations import (expand_gap_checkpoint_capacity,
                                    tolerate_checkpoint_config)
@@ -203,6 +203,8 @@ def get_env_config_overrides():
     unknown_keys = sorted(set(overrides) - set(Config().as_dict()))
     if unknown_keys:
         raise KeyError(f'unknown FIT_SPIRAL_CONFIG_OVERRIDES keys: {unknown_keys}')
+    # The checks a configuration gets everywhere else (a checkpoint, the service): a value one refuses all refuse.
+    check_overrides(overrides)
     return overrides
 
 
@@ -2674,7 +2676,8 @@ class FitContext:
         return model_state_sha256(
             self.spiral_and_transform.state_dict(),
             getattr(self, 'frozen_epochs', None) or (),
-            getattr(self, 'z_begin', None), getattr(self, 'z_end', None))
+            getattr(self, 'z_begin', None), getattr(self, 'z_end', None),
+            umbilicus_smoothing_sigma=self.config.get('umbilicus_smoothing_sigma'))
 
     def _checkpoint_payload(self, completed_iterations):
         return {

@@ -670,7 +670,8 @@ def build_seed_rays(args, device="cuda:0"):
     if spiral_dir not in sys.path:
         sys.path.insert(0, spiral_dir)
     from transforms import SpiralAndTransform
-    from umbilicus import json_umbilicus_z_to_yx
+    from umbilicus import (LEGACY_UMBILICUS_SMOOTHING_SIGMA, json_umbilicus_z_to_yx,
+                           umbilicus_zyx_table)
     from sample_spiral import get_spiral_yxs
 
     checkpoint = _load_checkpoint_cfg(args.fit_checkpoint)
@@ -705,11 +706,11 @@ def build_seed_rays(args, device="cuda:0"):
             raise FileNotFoundError("pass --umbilicus or set SPIRAL_DATASET")
 
     device = torch.device(device)
-    z_values = np.arange(z_begin, z_end)
-    centre = json_umbilicus_z_to_yx(umbilicus_path, coordinate_scale=1.0)
-    umbilicus_zyx = torch.from_numpy(np.concatenate(
-        [z_values[:, None], centre(z_values)], axis=-1
-    ).astype(np.float32)).to(device)
+    # The checkpoint's own axis: the curve smoothed with the width it was fitted with (checkpoints from before
+    # the setting existed were fitted with the legacy width), so the rays start where the fit put them.
+    umbilicus_zyx = torch.from_numpy(umbilicus_zyx_table(
+        json_umbilicus_z_to_yx(umbilicus_path, coordinate_scale=1.0), z_begin, z_end,
+        cfg.get("umbilicus_smoothing_sigma", LEGACY_UMBILICUS_SMOOTHING_SIGMA))).to(device)
     radius = int(cfg["model_flow_bounds_radius"])
     margin = int(cfg["model_flow_bounds_z_margin"])
     model = SpiralAndTransform(
