@@ -45,6 +45,7 @@ class SpatialPatchGrid:
             'skipped_empty': 0,
             'num_cells': 0
         }
+        self._cell_arrays = {}  # grid cell -> NumPy view of its entries, see _cell_candidates
 
     def _validate_zarr_format(self, logits_path):
         """Validate zarr v2 format with expected 5D chunk layout (1, C, Z, Y, X).
@@ -209,12 +210,19 @@ class SpatialPatchGrid:
         # Step 2: Filter to only relevant parts if chunks provided
         if chunks:
             print(f"  Filtering to relevant parts based on {len(chunks)} chunks...")
+            # One vectorized bbox test per part instead of a Python loop over
+            # every (chunk, part) pair.
+            bounds = np.array(
+                [(c['z_start'], c['z_end'], c['y_start'], c['y_end'], c['x_start'], c['x_end'])
+                 for c in chunks], dtype=np.int64)
             relevant_parts = set()
-            for chunk in chunks:
-                for part_id in part_ids:
-                    bbox = self.bbox_cache.get(part_id)
-                    if bbox and self._bbox_intersects_chunk(bbox, chunk):
-                        relevant_parts.add(part_id)
+            for part_id in part_ids:
+                bbox = self.bbox_cache.get(part_id)
+                if bbox and bool(np.any(
+                        (bbox['z_max'] > bounds[:, 0]) & (bbox['z_min'] < bounds[:, 1]) &
+                        (bbox['y_max'] > bounds[:, 2]) & (bbox['y_min'] < bounds[:, 3]) &
+                        (bbox['x_max'] > bounds[:, 4]) & (bbox['x_min'] < bounds[:, 5]))):
+                    relevant_parts.add(part_id)
 
             relevant_parts = sorted(relevant_parts)
             print(f"  Reduced from {len(part_ids)} to {len(relevant_parts)} relevant parts")
@@ -240,32 +248,7 @@ class SpatialPatchGrid:
 
         # Build spatial grid
         print(f"  Building spatial grid (cell size {self.grid_size}^3, non-empty patches only)...")
-        pZ, pY, pX = patch_size
-
-        for part_id, coords_np in self.coords_cache.items():
-            non_empty_mask = self.non_empty_cache.get(part_id, None)
-
-            for patch_idx in range(len(coords_np)):
-                # Skip empty patches
-                if non_empty_mask is not None and not non_empty_mask[patch_idx]:
-                    self.stats['skipped_empty'] += 1
-                    continue
-
-                z, y, x = coords_np[patch_idx].tolist()
-
-                # Find grid cells this patch intersects
-                gz_min, gy_min, gx_min = z // self.grid_size, y // self.grid_size, x // self.grid_size
-                gz_max = (z + pZ) // self.grid_size
-                gy_max = (y + pY) // self.grid_size
-                gx_max = (x + pX) // self.grid_size
-
-                # Add to all overlapping cells
-                for gz in range(gz_min, gz_max + 1):
-                    for gy in range(gy_min, gy_max + 1):
-                        for gx in range(gx_min, gx_max + 1):
-                            self.grid[(gz, gy, gx)].append((part_id, patch_idx))
-
-                self.stats['total_patches'] += 1
+        self._build_grid(patch_size)
 
         self.stats['num_cells'] = len(self.grid)
 
@@ -273,6 +256,135 @@ class SpatialPatchGrid:
             avg = sum(len(v) for v in self.grid.values()) / self.stats['num_cells'] if self.stats['num_cells'] > 0 else 0
             print(f"  ✓ Grid complete: {self.stats['num_cells']} cells, {self.stats['total_patches']} non-empty patches")
             print(f"    Skipped {self.stats['skipped_empty']} empty patches, avg {avg:.1f} patches/cell")
+
+    def _build_grid(self, patch_size):
+        """Fill `self.grid` from `coords_cache` / `non_empty_cache`.
+
+        Vectorized, but the grid it produces is the one the per-patch loop built:
+        same cells, in the same insertion order, each listing the same
+        (part_id, patch_idx) entries in the same order.
+        """
+        gs = self.grid_size
+        size = np.asarray(patch_size, dtype=np.int64)
+        cells, entries = [], []
+        for part_id, coords_np in self.coords_cache.items():
+            non_empty_mask = self.non_empty_cache.get(part_id, None)
+            coords = np.asarray(coords_np)
+            if coords.ndim != 2 or coords.shape[1] != 3 or coords.dtype.kind not in 'iu':
+                # Flush what is pending so insertion order is kept, then take the scalar path.
+                self._insert_cells(cells, entries)
+                cells, entries = [], []
+                self._build_grid_scalar(part_id, coords_np, non_empty_mask, patch_size)
+                continue
+
+            n = len(coords)
+            if non_empty_mask is None:
+                keep = np.arange(n)
+            else:
+                mask = np.asarray(non_empty_mask[:n], dtype=bool)
+                if len(mask) < n:
+                    raise IndexError(
+                        f"non-empty mask of part {part_id} has {len(mask)} entries for {n} patches")
+                keep = np.flatnonzero(mask)
+                self.stats['skipped_empty'] += n - len(keep)
+            self.stats['total_patches'] += len(keep)
+            if len(keep) == 0:
+                continue
+
+            origin = coords[keep].astype(np.int64)
+            first = origin // gs
+            span = (origin + size) // gs - first + 1          # cells per axis, >= 1
+            per_patch = span.prod(axis=1)
+            owner = np.repeat(np.arange(len(keep)), per_patch)
+            # Position of each (patch, cell) pair inside its patch, in gz, gy, gx order.
+            local = np.arange(len(owner)) - np.repeat(np.cumsum(per_patch) - per_patch, per_patch)
+            sy, sx = span[owner, 1], span[owner, 2]
+            offset = np.stack([local // (sy * sx), (local // sx) % sy, local % sx], axis=1)
+            cells.append(first[owner] + offset)
+            patch_idx = keep[owner].tolist()
+            entries.extend(zip([part_id] * len(patch_idx), patch_idx))
+        self._insert_cells(cells, entries)
+
+    def _insert_cells(self, cells, entries):
+        """Append `entries[i]` to grid cell `cells[i]`, creating cells in first-seen order."""
+        if not entries:
+            return
+        cells = np.concatenate(cells, axis=0)
+        low = cells.min(axis=0)
+        dims = (cells.max(axis=0) - low + 1).tolist()
+        if dims[0] * dims[1] * dims[2] < 2 ** 62:
+            # One integer per cell sorts much faster than rows do.
+            shifted = cells - low
+            keys = (shifted[:, 0] * dims[1] + shifted[:, 1]) * dims[2] + shifted[:, 2]
+            _, first_seen, inverse = np.unique(keys, return_index=True, return_inverse=True)
+        else:
+            _, first_seen, inverse = np.unique(cells, axis=0, return_index=True, return_inverse=True)
+        inverse = inverse.reshape(-1)
+        unique_cells = cells[first_seen]
+        order = np.argsort(inverse, kind='stable')            # keeps entry order inside a cell
+        bounds = np.concatenate([[0], np.cumsum(np.bincount(inverse, minlength=len(unique_cells)))])
+        entry_array = np.empty(len(entries), dtype=object)
+        entry_array[:] = entries
+        unique_cells = unique_cells.tolist()
+        for cell in np.argsort(first_seen, kind='stable').tolist():
+            members = order[bounds[cell]:bounds[cell + 1]]
+            self.grid[tuple(unique_cells[cell])].extend(entry_array[members].tolist())
+
+    def _build_grid_scalar(self, part_id, coords_np, non_empty_mask, patch_size):
+        """Per-patch grid insertion, for coordinates the vectorized path does not take."""
+        pZ, pY, pX = patch_size
+        for patch_idx in range(len(coords_np)):
+            # Skip empty patches
+            if non_empty_mask is not None and not non_empty_mask[patch_idx]:
+                self.stats['skipped_empty'] += 1
+                continue
+
+            z, y, x = coords_np[patch_idx].tolist()
+
+            # Find grid cells this patch intersects
+            gz_min, gy_min, gx_min = z // self.grid_size, y // self.grid_size, x // self.grid_size
+            gz_max = (z + pZ) // self.grid_size
+            gy_max = (y + pY) // self.grid_size
+            gx_max = (x + pX) // self.grid_size
+
+            # Add to all overlapping cells
+            for gz in range(gz_min, gz_max + 1):
+                for gy in range(gy_min, gy_max + 1):
+                    for gx in range(gx_min, gx_max + 1):
+                        self.grid[(gz, gy, gx)].append((part_id, patch_idx))
+
+            self.stats['total_patches'] += 1
+
+    def _cell_candidates(self, cell):
+        """Arrays for one grid cell: (parts, part_number, patch_idx, coords), or None.
+
+        Built from `self.grid` on first use and rebuilt when the cell's list is replaced
+        or changes length; entries are not expected to be swapped in place after that.
+        None means the cell has to be scanned entry by entry (non-integer coordinates).
+        """
+        entries = self.grid.get(cell)
+        if not entries:
+            return ()
+        cache = self._cell_arrays
+        cached = cache.get(cell)
+        if cached is not None and cached[0] is entries and cached[1] == len(entries):
+            return cached[2]
+
+        parts = list(dict.fromkeys(entry[0] for entry in entries))
+        number = {part_id: i for i, part_id in enumerate(parts)}
+        part_number = np.fromiter((number[entry[0]] for entry in entries), dtype=np.int64, count=len(entries))
+        patch_idx = np.fromiter((entry[1] for entry in entries), dtype=np.int64, count=len(entries))
+        coords = np.empty((len(entries), 3), dtype=np.int64)
+        arrays = (parts, part_number, patch_idx, coords)
+        for i, part_id in enumerate(parts):
+            part_coords = np.asarray(self.coords_cache[part_id])
+            if part_coords.ndim != 2 or part_coords.shape[1] != 3 or part_coords.dtype.kind not in 'iu':
+                arrays = None
+                break
+            selected = part_number == i
+            coords[selected] = part_coords[patch_idx[selected]]
+        cache[cell] = (entries, len(entries), arrays)
+        return arrays
 
     def get_chunk_patches(self, chunk_info):
         """
@@ -292,6 +404,55 @@ class SpatialPatchGrid:
         pZ, pY, pX = self.patch_size
 
         # Find overlapping grid cells
+        gz_min, gy_min, gx_min = z_start // self.grid_size, y_start // self.grid_size, x_start // self.grid_size
+        gz_max = (z_end - 1) // self.grid_size
+        gy_max = (y_end - 1) // self.grid_size
+        gx_max = (x_end - 1) // self.grid_size
+
+        # Per overlapping cell, in the order the scalar scan visits them: the
+        # entries that really intersect the chunk (grid cells are coarse).
+        hits = []
+        for gz in range(gz_min, gz_max + 1):
+            for gy in range(gy_min, gy_max + 1):
+                for gx in range(gx_min, gx_max + 1):
+                    arrays = self._cell_candidates((gz, gy, gx))
+                    if arrays is None:
+                        return self._get_chunk_patches_scalar(chunk_info)
+                    if not arrays:
+                        continue
+                    parts, part_number, patch_idx, coords = arrays
+                    z, y, x = coords[:, 0], coords[:, 1], coords[:, 2]
+                    keep = np.flatnonzero(
+                        (z + pZ > z_start) & (z < z_end) &
+                        (y + pY > y_start) & (y < y_end) &
+                        (x + pX > x_start) & (x < x_end))
+                    if len(keep):
+                        hits.append((parts, part_number[keep], patch_idx[keep], coords[keep]))
+
+        result = {}
+        if not hits:
+            return result
+        seen = set()  # a patch spanning several cells is listed in each of them
+        for parts, part_number, patch_idx, coords in hits:
+            rows = zip(part_number.tolist(), patch_idx.tolist(), *coords.T.tolist())
+            for number, idx, z, y, x in rows:
+                part_id = parts[number]
+                if (part_id, idx) in seen:
+                    continue
+                seen.add((part_id, idx))
+                patches = result.get(part_id)
+                if patches is None:
+                    patches = result[part_id] = []
+                patches.append((idx, z, y, x))
+        return result
+
+    def _get_chunk_patches_scalar(self, chunk_info):
+        """Entry-by-entry `get_chunk_patches`, for coordinates that are not integer arrays."""
+        z_start, z_end = chunk_info['z_start'], chunk_info['z_end']
+        y_start, y_end = chunk_info['y_start'], chunk_info['y_end']
+        x_start, x_end = chunk_info['x_start'], chunk_info['x_end']
+        pZ, pY, pX = self.patch_size
+
         gz_min, gy_min, gx_min = z_start // self.grid_size, y_start // self.grid_size, x_start // self.grid_size
         gz_max = (z_end - 1) // self.grid_size
         gy_max = (y_end - 1) // self.grid_size
@@ -379,8 +540,64 @@ def _write_blended_chunk(output_store, chunk_info, chunk_logits, chunk_weights, 
 _worker_state = {}
 
 
+# Decoded patches one worker may hold while it blends a batch of chunks.
+DEFAULT_PATCH_CACHE_BYTES = 256 * 1024 * 1024
+
+
+class _PatchCache:
+    """Decoded logit patches a batch of chunks still needs, bounded in bytes.
+
+    With overlapping patches every patch is blended into several output chunks. When
+    those chunks are processed as one batch, the patch is read and decompressed once
+    and kept until its last chunk in the batch has used it; `expect` counts those uses
+    up front. A patch that does not fit under `max_bytes` is simply not kept and is
+    read again by its next chunk, so the cache never grows past its budget.
+    """
+
+    def __init__(self, max_bytes):
+        self.max_bytes = int(max_bytes)
+        self.nbytes = 0
+        self.patches = {}    # (part_id, patch_idx) -> decoded patch
+        self.remaining = {}  # (part_id, patch_idx) -> uses left in the batch
+        self.hits = 0
+
+    def expect(self, key):
+        self.remaining[key] = self.remaining.get(key, 0) + 1
+
+    def fetch(self, key, read):
+        """The patch for `key` and whether `read()` had to be called for it."""
+        patch = self.patches.get(key)
+        was_read = patch is None
+        if was_read:
+            patch = read()
+        else:
+            self.hits += 1
+        left = self.remaining.get(key, 0) - 1
+        if left > 0:
+            self.remaining[key] = left
+            if was_read and self.nbytes + patch.nbytes <= self.max_bytes:
+                self.patches[key] = patch
+                self.nbytes += patch.nbytes
+        else:
+            self.remaining.pop(key, None)
+            if not was_read:
+                self.nbytes -= self.patches.pop(key).nbytes
+        return patch, was_read
+
+    def skip(self, key):
+        """Count a use that turned out not to need the patch."""
+        left = self.remaining.get(key, 0) - 1
+        if left > 0:
+            self.remaining[key] = left
+        else:
+            self.remaining.pop(key, None)
+            patch = self.patches.pop(key, None)
+            if patch is not None:
+                self.nbytes -= patch.nbytes
+
+
 def _init_worker(part_files, output_path, gaussian_map, patch_size, num_classes, is_s3,
-                 finalize_config=None):
+                 finalize_config=None, patch_cache_bytes=DEFAULT_PATCH_CACHE_BYTES):
     """Initialize per-worker process state with cached zarr stores.
 
     Called once when each worker process starts. Zarr stores (and their
@@ -390,6 +607,7 @@ def _init_worker(part_files, output_path, gaussian_map, patch_size, num_classes,
     Args:
         finalize_config: Optional FinalizeConfig. When set, chunks are finalized
             (softmax + uint8) inline instead of writing float16 blended logits.
+        patch_cache_bytes: Budget of the patch cache `process_chunk_batch` uses; 0 disables it.
     """
     _worker_state.update({
         'part_files': part_files,
@@ -400,10 +618,12 @@ def _init_worker(part_files, output_path, gaussian_map, patch_size, num_classes,
         'logits_stores': {},
         'output_store': ZarrWriter.open(output_path, skip_empty=True),
         'finalize_config': finalize_config,
+        'patch_cache_bytes': patch_cache_bytes,
+        'scratch': None,
     })
 
 
-def process_chunk(chunk_info, chunk_patches, epsilon=1e-8):
+def process_chunk(chunk_info, chunk_patches, epsilon=1e-8, patch_cache=None):
     """
     Process a single chunk using worker-cached zarr stores.
 
@@ -414,6 +634,8 @@ def process_chunk(chunk_info, chunk_patches, epsilon=1e-8):
         chunk_patches: Dict {part_id: [(patch_idx, z, y, x), ...]} precomputed
                        for this chunk (non-empty, intersecting patches only)
         epsilon: Small value for numerical stability
+        patch_cache: Optional _PatchCache shared by the chunks of a batch (see
+                     process_chunk_batch). Without it every patch is read from its store.
     """
     part_files = _worker_state['part_files']
     gaussian_map = _worker_state['gaussian_map']
@@ -437,6 +659,12 @@ def process_chunk(chunk_info, chunk_patches, epsilon=1e-8):
     chunk_logits = np.zeros(chunk_shape, dtype=np.float32)
     chunk_weights = np.zeros(weights_shape, dtype=np.float32)
 
+    # Reused buffer for `logits * weight`. Only used when that product is float32
+    # anyway, so the sums below are the ones the allocating expression gives.
+    scratch = _worker_state.get('scratch')
+    if scratch is None or scratch.shape != (num_classes, pZ, pY, pX):
+        scratch = _worker_state['scratch'] = np.empty((num_classes, pZ, pY, pX), dtype=np.float32)
+
     patches_processed = 0
     patches_skipped_empty = 0
     num_patch_reads = 0
@@ -454,6 +682,8 @@ def process_chunk(chunk_info, chunk_patches, epsilon=1e-8):
             if (z + pZ <= z_start or z >= z_end or
                 y + pY <= y_start or y >= y_end or
                 x + pX <= x_start or x >= x_end):
+                if patch_cache is not None:
+                    patch_cache.skip((part_id, patch_idx))
                 continue
 
             iz_start = max(z, z_start) - z_start
@@ -477,11 +707,17 @@ def process_chunk(chunk_info, chunk_patches, epsilon=1e-8):
                 slice(px_start, px_end)
             )
 
-            logit_patch = logits_store[patch_idx][patch_slice]
-            num_patch_reads += 1
+            if patch_cache is None:
+                logit_patch = logits_store[patch_idx][patch_slice]
+                num_patch_reads += 1
+            else:
+                full_patch, was_read = patch_cache.fetch(
+                    (part_id, patch_idx), lambda: logits_store[patch_idx])
+                logit_patch = full_patch[patch_slice]
+                num_patch_reads += was_read
 
             # Skip patches with no values - don't let empty patches contribute to weights
-            if not np.any(logit_patch != 0):
+            if not np.any(logit_patch):
                 patches_skipped_empty += 1
                 continue
 
@@ -491,7 +727,12 @@ def process_chunk(chunk_info, chunk_patches, epsilon=1e-8):
                 slice(px_start, px_end)
             ]
 
-            weighted_patch = logit_patch * weight_patch[np.newaxis, :, :, :]
+            if np.result_type(logit_patch.dtype, weight_patch.dtype) == np.float32:
+                dz, dy, dx = pz_end - pz_start, py_end - py_start, px_end - px_start
+                weighted_patch = scratch.ravel()[:num_classes * dz * dy * dx].reshape(num_classes, dz, dy, dx)
+                np.multiply(logit_patch, weight_patch[np.newaxis, :, :, :], out=weighted_patch)
+            else:
+                weighted_patch = logit_patch * weight_patch[np.newaxis, :, :, :]
 
             chunk_logits[
                 :,  # All classes
@@ -519,6 +760,77 @@ def process_chunk(chunk_info, chunk_patches, epsilon=1e-8):
         'num_patch_reads': num_patch_reads,
         'bytes_read_uncompressed': num_patch_reads * bytes_per_read,
     }
+
+
+def process_chunk_batch(work_items, epsilon=1e-8):
+    """Process neighbouring chunks in one task, reading each shared patch once.
+
+    Every chunk is blended by `process_chunk` exactly as when it is submitted alone,
+    with its patches in the same order, so the output is the same bit for bit. The
+    only difference is where a patch comes from: one the batch needs again is kept
+    in a bounded `_PatchCache` instead of being read and decompressed per chunk.
+
+    Must be called from a worker initialized with _init_worker.
+
+    Args:
+        work_items: List of {'chunk_info': ..., 'chunk_patches': ...} as process_chunk takes them
+        epsilon: Small value for numerical stability
+    """
+    cache_bytes = _worker_state.get('patch_cache_bytes', DEFAULT_PATCH_CACHE_BYTES)
+    patch_cache = None
+    if cache_bytes and len(work_items) > 1:
+        patch_cache = _PatchCache(cache_bytes)
+        for item in work_items:
+            for part_id, patches in item['chunk_patches'].items():
+                for patch in patches:
+                    patch_cache.expect((part_id, patch[0]))
+
+    totals = {
+        'chunks': len(work_items),
+        'patches_processed': 0,
+        'patches_skipped_empty': 0,
+        'num_patch_reads': 0,
+        'bytes_read_uncompressed': 0,
+        'patch_cache_hits': 0,
+    }
+    for item in work_items:
+        result = process_chunk(item['chunk_info'], item['chunk_patches'], epsilon, patch_cache)
+        for key in ('patches_processed', 'patches_skipped_empty', 'num_patch_reads', 'bytes_read_uncompressed'):
+            totals[key] += result[key]
+    if patch_cache is not None:
+        totals['patch_cache_hits'] = patch_cache.hits
+    return totals
+
+
+def group_chunk_work_items(chunk_work_items, output_chunks, num_workers):
+    """Split per-chunk work items into batches of neighbouring chunks.
+
+    Chunks are grouped into blocks of the output chunk grid, at most 2 x 2 x 4 chunks
+    (Z, Y, X), which is where overlapping patches are shared. The block shrinks when
+    there is too little work to keep every worker busy with several batches, down to
+    one chunk per batch. Batches and the chunks inside them keep the input order.
+
+    Args:
+        chunk_work_items: List of {'chunk_info': ..., 'chunk_patches': ...}
+        output_chunks: Spatial chunk size (Z, Y, X) of the output
+        num_workers: Number of worker processes that will take the batches
+    """
+    if not chunk_work_items:
+        return []
+    wanted = min(len(chunk_work_items), 4 * max(1, int(num_workers)))
+    batches = []
+    for block in ((2, 2, 4), (2, 2, 2), (1, 2, 2), (1, 1, 2), (1, 1, 1)):
+        grouped = {}
+        for item in chunk_work_items:
+            info = item['chunk_info']
+            key = (info['z_start'] // output_chunks[0] // block[0],
+                   info['y_start'] // output_chunks[1] // block[1],
+                   info['x_start'] // output_chunks[2] // block[2])
+            grouped.setdefault(key, []).append(item)
+        batches = list(grouped.values())
+        if len(batches) >= wanted:
+            break
+    return batches
 
 # --- Utility Functions ---
 def calculate_chunks(volume_shape, output_chunks=None, z_range=None):
@@ -794,7 +1106,8 @@ def merge_inference_outputs(
         verbose: bool = True,
         num_parts: int = 1,  # Number of parts to split processing into
         global_part_id: int = 0,  # Part ID for this process (0-indexed)
-        finalize_config=None):  # Optional FinalizeConfig — fuse finalization when set
+        finalize_config=None,  # Optional FinalizeConfig — fuse finalization when set
+        patch_cache_mb: int = DEFAULT_PATCH_CACHE_BYTES // (1024 * 1024)):  # Per-worker patch cache
     """
     Args:
         parent_dir: Directory containing logits_part_X.zarr and coordinates_part_X.zarr.
@@ -810,6 +1123,9 @@ def merge_inference_outputs(
         global_part_id: Part ID for this process (0-indexed). Used for Z-axis partitioning.
         finalize_config: Optional FinalizeConfig. When provided, softmax + uint8 quantization
             is applied inline after blending (fused mode), skipping the intermediate float16 array.
+        patch_cache_mb: Memory each worker may use to keep decoded patches that several
+            neighbouring chunks share, so they are read once per batch. 0 submits every
+            chunk on its own and reads each patch once per chunk. The output is the same.
     """
 
     tqdm_kwargs = get_tqdm_kwargs()
@@ -966,6 +1282,13 @@ def merge_inference_outputs(
     print(f"  To process: {len(chunk_work_items)}")
     print(f"  Total patch assignments: {total_patch_assignments}")
 
+    patch_cache_bytes = max(0, int(patch_cache_mb)) * 1024 * 1024
+    if patch_cache_bytes:
+        work_batches = group_chunk_work_items(chunk_work_items, output_chunks[1:], num_workers)
+    else:
+        work_batches = [[item] for item in chunk_work_items]
+    print(f"  Batches of neighbouring chunks: {len(work_batches)}")
+
     # --- 9. Process Chunks in Parallel ---
     print("\n--- Accumulating Weighted Patches ---")
 
@@ -975,6 +1298,7 @@ def merge_inference_outputs(
     total_patches_skipped_empty = 0
     total_patch_reads = 0
     total_bytes_read = 0
+    total_patch_cache_hits = 0
     chunks_completed = 0
     wall_start = time.perf_counter()
 
@@ -996,32 +1320,31 @@ def merge_inference_outputs(
     with ProcessPoolExecutor(
         max_workers=num_workers,
         initializer=_init_worker,
-        initargs=(part_files, output_path, gaussian_map, patch_size, num_classes, is_s3, finalize_config)
-    ) as executor:
-        future_to_chunk = {
-            executor.submit(
-                process_chunk,
-                chunk_info=item['chunk_info'],
-                chunk_patches=item['chunk_patches']
-            ): item for item in chunk_work_items
-        }
+        initargs=(part_files, output_path, gaussian_map, patch_size, num_classes, is_s3, finalize_config,
+                  patch_cache_bytes)
+    ) as executor, tqdm(total=len(chunk_work_items), desc="Processing Chunks", **tqdm_kwargs) as progress:
+        # Submit the heaviest batches first (LPT) so lighter boundary batches fill the tail.
+        ordered_batches = sorted(
+            work_batches,
+            key=lambda b: sum(len(v) for item in b for v in item['chunk_patches'].values()),
+            reverse=True,
+        )
+        futures = [executor.submit(process_chunk_batch, batch) for batch in ordered_batches]
 
-        for future in tqdm(
-            as_completed(future_to_chunk),
-            total=len(chunk_work_items),
-            desc="Processing Chunks",
-            **tqdm_kwargs,
-        ):
+        for future in as_completed(futures):
             try:
                 result = future.result()
                 total_patches_processed += result['patches_processed']
                 total_patches_skipped_empty += result.get('patches_skipped_empty', 0)
                 total_patch_reads += result.get('num_patch_reads', 0)
                 total_bytes_read += result.get('bytes_read_uncompressed', 0)
+                total_patch_cache_hits += result.get('patch_cache_hits', 0)
 
-                chunks_completed += 1
+                reported = chunks_completed // 100
+                chunks_completed += result['chunks']
+                progress.update(result['chunks'])
 
-                if chunks_completed % 100 == 0:
+                if chunks_completed // 100 > reported:
                     print_progress_stats()
             except Exception as e:
                 print(f"Error processing chunk: {e}")
@@ -1044,6 +1367,7 @@ def merge_inference_outputs(
         gb_read = total_bytes_read / (1024**3)
         avg_bytes = total_bytes_read / total_patch_reads
         print(f"  Zarr chunk reads: {total_patch_reads}")
+        print(f"  Patches reused from the batch cache: {total_patch_cache_hits}")
         print(f"  Avg chunk size (uncompressed): {avg_bytes / 1024:.1f} KB")
         print(f"  Total data (uncompressed): {gb_read:.2f} GB")
         print(f"  Wall throughput: {gb_read / wall_elapsed:.2f} GB/s ({num_workers} workers)")
