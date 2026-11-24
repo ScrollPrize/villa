@@ -240,16 +240,17 @@ class InkDataset(Dataset):
                     return find_subtiling_patches(segment, self._open)
                 return find_default_patches(segment, self._open)
             except Exception as exc:
-                raise RuntimeError(
-                    "Failed finding patches for "
+                # One defective segment (e.g. an explicitly configured
+                # mirror whose stores are still syncing) must not abort
+                # patch finding for the whole run: warn and skip it. The
+                # run still fails loudly below if no segment yields patches.
+                warnings.warn(
+                    "Skipping segment "
                     f"dataset_idx={segment.dataset_idx!r}, "
-                    f"segment={segment.segment_relpath!r}, "
-                    f"image_volume={segment.image_volume!r}, "
-                    f"volume_scale={segment.scale!r}, "
-                    f"supervision_mask={segment.supervision_mask!r}, "
-                    f"inklabels={segment.inklabels!r}, "
-                    f"validation_mask={segment.validation_mask!r}"
-                ) from exc
+                    f"segment={segment.segment_relpath!r}: {exc}",
+                    stacklevel=2,
+                )
+                return [], []
 
         training: list[Patch] = []
         validation: list[Patch] = []
@@ -263,6 +264,12 @@ class InkDataset(Dataset):
                 training.extend(segment_training)
                 validation.extend(segment_validation)
         patches = training + validation
+        if not patches and self.segments:
+            raise RuntimeError(
+                "Failed finding patches: no segment yielded any patches "
+                f"({len(self.segments)} segment(s) discovered; see warnings "
+                "above for skipped segments)"
+            )
         save_patch_cache(path, patches)
         return patches
 
