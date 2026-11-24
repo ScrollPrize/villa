@@ -366,11 +366,16 @@ std::optional<Patch> patchOf(Geometry& geom, const Pair& start, const Pair& size
     const auto c0 = std::max<std::int64_t>(0, std::int64_t(std::floor(minX))), c1 = std::min<std::int64_t>(cols, std::int64_t(std::floor(maxX)) + 2);
     const auto r0 = std::max<std::int64_t>(0, std::int64_t(std::floor(minY))), r1 = std::min<std::int64_t>(rows, std::int64_t(std::floor(maxY)) + 2);
     if (c1 - c0 < 2 || r1 - r0 < 2) return std::nullopt;
-    // Two more vertices around the window: the Hermite derivatives of its cells (centred
-    // differences, one sided only at the grid's own border or next to a hole) then equal
-    // the whole grid's, so a patch renders as the same pixels of any larger patch.
-    const auto hc0 = std::max<std::int64_t>(0, c0 - 2), hc1 = std::min<std::int64_t>(cols, c1 + 2);
-    const auto hr0 = std::max<std::int64_t>(0, r0 - 2), hr1 = std::min<std::int64_t>(rows, r1 + 2);
+    // Up to two more vertices around the window, where the grid has them: the Hermite derivatives of
+    // its cells (centred differences, one sided only at the grid's own border or next to a hole)
+    // then equal the whole grid's, so a patch renders as the same pixels of any larger patch. Fewer
+    // when the window with its halo would not fit the work budget a window of the cells alone fits.
+    std::int64_t halo = 2, hc0 = c0, hc1 = c1, hr0 = r0, hr1 = r1;
+    for (;; --halo) {
+        hc0 = std::max<std::int64_t>(0, c0 - halo), hc1 = std::min<std::int64_t>(cols, c1 + halo);
+        hr0 = std::max<std::int64_t>(0, r0 - halo), hr1 = std::min<std::int64_t>(rows, r1 + halo);
+        if (halo == 0 || std::size_t((hr1 - hr0) * (hc1 - hc0)) * 80 <= geom.owner.workBytes) break;
+    }
     Patch patch;
     patch.tile = geom.tile({hr0, hc0}, {hr1 - hr0, hc1 - hc0});
     patch.raster = grid::Raster{x0 - double(hc0), y0 - double(hr0), sx, sy, int(size[1]), int(size[0]), kx, ky};

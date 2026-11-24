@@ -213,6 +213,14 @@ void testSurface(const fs::path& root, const std::string& backend)
     const auto image = values<std::uint8_t>(rendered["image"].data);
     require(rendered["image"].data.shape == Index{1, 1, 2, 3}, "layers, patch");
     require(image[0] == 0 || image[0] == std::uint8_t(((5 * 22 + 3) * 24 + 4) & 255), "sampled at the sheet");
+    {   // A work budget that fits only the cells the patch reaches: the halo shrinks instead of the render failing.
+        auto tight = optionsFor(backend);
+        tight.samplingWorkBytes = 12 * 80;
+        SampleReader squeezed(reference, targets, std::nullopt, tight);
+        const auto small = squeezed.renderSurface(surface, {1, 1}, {2, 3}, {0});
+        require(values<std::uint8_t>(small["image"].data) == image, "halo shrinks to the work budget");
+        squeezed.close();
+    }
     const auto inkValues = values<std::uint8_t>(rendered["ink"].data);
     require(inkValues[0] == ink[std::size_t(1 * 9 + 1)], "surface label at its own pixels");
     raises<std::invalid_argument>([&] { (void)reader.renderSurface(surface, {0, 0}, {1, 1}, {}); }, "no offsets");
