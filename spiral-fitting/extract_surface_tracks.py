@@ -435,6 +435,27 @@ _WORKER_BYTES_PER_VOXEL = 16
 # 1536 x 1536, 8 workers ran about 1.8x faster than 4 on Linux x86-64 and 1.2x faster than 6 on an
 # Apple M4 Pro, at about 0.37 GB each; more than 8 was not measured, while each adds a slab's memory
 _MAX_AUTO_SLAB_WORKERS = 8
+# Memory --slab-workers auto leaves free: available memory is read once, at the start of a run that
+# can take hours, so this keeps room for the parent process (about 0.3 GB on the crop above) and for
+# whatever the user opens meanwhile. A 16 GB Mac with 8 GB available keeps 4 GB free: ten workers'
+# worth on that crop, and one worker on full-width 7948 x 7948 ribbons
+_MEMORY_RESERVE_BYTES = 4 * 2**30
+
+
+def _windows_memory_status():
+    # GlobalMemoryStatusEx's report, or None when it fails
+    import ctypes
+
+    class _MemoryStatus(ctypes.Structure):
+        _fields_ = [('dwLength', ctypes.c_ulong), ('dwMemoryLoad', ctypes.c_ulong),
+                    ('ullTotalPhys', ctypes.c_ulonglong), ('ullAvailPhys', ctypes.c_ulonglong),
+                    ('ullTotalPageFile', ctypes.c_ulonglong), ('ullAvailPageFile', ctypes.c_ulonglong),
+                    ('ullTotalVirtual', ctypes.c_ulonglong), ('ullAvailVirtual', ctypes.c_ulonglong),
+                    ('ullAvailExtendedVirtual', ctypes.c_ulonglong)]
+    status = _MemoryStatus(dwLength=ctypes.sizeof(_MemoryStatus))
+    if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+        return status
+    return None
 
 
 def _physical_memory():
@@ -444,25 +465,39 @@ def _physical_memory():
     except (AttributeError, ValueError, OSError):
         pass
     if sys.platform == 'win32':
-        import ctypes
-
-        class _MemoryStatus(ctypes.Structure):
-            _fields_ = [('dwLength', ctypes.c_ulong), ('dwMemoryLoad', ctypes.c_ulong),
-                        ('ullTotalPhys', ctypes.c_ulonglong), ('ullAvailPhys', ctypes.c_ulonglong),
-                        ('ullTotalPageFile', ctypes.c_ulonglong), ('ullAvailPageFile', ctypes.c_ulonglong),
-                        ('ullTotalVirtual', ctypes.c_ulonglong), ('ullAvailVirtual', ctypes.c_ulonglong),
-                        ('ullAvailExtendedVirtual', ctypes.c_ulonglong)]
-        status = _MemoryStatus(dwLength=ctypes.sizeof(_MemoryStatus))
-        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
-            return status.ullTotalPhys
+        status = _windows_memory_status()
+        return status.ullTotalPhys if status else None
     return None
+
+
+def _available_memory():
+    # Bytes of RAM new processes can take now without swapping (free plus reclaimable), or None
+    # when unknown. psutil comes with Kimimaro outside Windows.
+    if sys.platform == 'win32':
+        status = _windows_memory_status()
+        return status.ullAvailPhys if status else None
+    try:
+        import psutil
+    except ImportError:
+        return None
+    return psutil.virtual_memory().available
+
+
+def _slab_worker_memory():
+    # Bytes the slab workers of --slab-workers auto may take: the available memory less
+    # _MEMORY_RESERVE_BYTES, half of the RAM when only that is known, or None when neither is
+    available = _available_memory()
+    if available is not None:
+        return max(0, available - _MEMORY_RESERVE_BYTES)
+    total = _physical_memory()
+    return total // 2 if total else None
 
 
 def auto_slab_workers(shape, n_jobs):
     """Slab workers for ``--slab-workers auto``: one for every two CPUs, at most
-    ``_MAX_AUTO_SLAB_WORKERS``, as many as fit in half of the RAM with the largest slab of this
-    extraction, at most one per slab, and 1 when ``--kimimaro-parallel`` asks for several Kimimaro
-    processes per slab."""
+    ``_MAX_AUTO_SLAB_WORKERS``, as many as fit with the largest slab of this extraction in the
+    available memory less ``_MEMORY_RESERVE_BYTES``, at most one per slab, and 1 when
+    ``--kimimaro-parallel`` asks for several Kimimaro processes per slab."""
     if kimimaro_parallel != 'auto' and kimimaro_parallel > 1 or n_jobs <= 1:
         return 1
     cpus = os.process_cpu_count() if hasattr(os, 'process_cpu_count') else os.cpu_count()
@@ -471,10 +506,10 @@ def auto_slab_workers(shape, n_jobs):
                   z_range * yx_chunk_thickness_v * shape[2],
                   z_range * shape[1] * yx_chunk_thickness_v)
     workers = min((cpus or 1) // 2, _MAX_AUTO_SLAB_WORKERS, n_jobs)
-    memory = _physical_memory()
-    if memory:
+    memory = _slab_worker_memory()
+    if memory is not None:
         per_worker = _WORKER_BASE_BYTES + _WORKER_BYTES_PER_VOXEL * largest
-        workers = min(workers, int(memory // 2 // per_worker))
+        workers = min(workers, memory // per_worker)
     return max(1, workers)
 
 
@@ -658,8 +693,9 @@ def parse_args(argv=None):
         '--slab-workers', metavar='N|auto', type=_count_or_auto, default=slab_workers,
         help='CPU backend: slabs processed at once in worker processes, each holding its own '
              'slab in memory; local predictions only. auto: one for every two CPUs, at most '
-             f'{_MAX_AUTO_SLAB_WORKERS}, as many as half of the RAM holds, and 1 with '
-             '--kimimaro-parallel > 1 or remote predictions (default: %(default)s)',
+             f'{_MAX_AUTO_SLAB_WORKERS}, as many as the available memory holds less '
+             f'{_MEMORY_RESERVE_BYTES // 2**30} GB, and 1 with --kimimaro-parallel > 1 or remote '
+             'predictions (default: %(default)s)',
     )
     parser.add_argument(
         '--kimimaro-parallel', metavar='N|auto', type=_count_or_auto, default=kimimaro_parallel,

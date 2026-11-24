@@ -143,8 +143,8 @@ def test_real_scroll_labels_equal_cc3d(axis):
 
 
 def test_auto_slab_workers(monkeypatch):
-    # auto: one worker for every two CPUs, at most 8 and one per slab, as many as half of the RAM
-    # holds, and 1 when --kimimaro-parallel asks for several Kimimaro processes per slab
+    # auto: one worker for every two CPUs, at most 8 and one per slab, as many as the available
+    # memory less 4 GiB holds, and 1 when --kimimaro-parallel asks for several Kimimaro processes
     monkeypatch.setattr(est, 'kimimaro_parallel', 'auto')
     monkeypatch.setattr(est, 'z_min', 0)
     monkeypatch.setattr(est, 'z_max', 1000)
@@ -153,16 +153,27 @@ def test_auto_slab_workers(monkeypatch):
     monkeypatch.setattr(est.os, 'cpu_count', lambda: cpus)
     monkeypatch.setattr(est.os, 'process_cpu_count', lambda: cpus, raising=False)
     gib = 2**30
-    monkeypatch.setattr(est, '_physical_memory', lambda: 64 * gib)
+    available, total = 64 * gib, 64 * gib
+    monkeypatch.setattr(est, '_available_memory', lambda: available)
+    monkeypatch.setattr(est, '_physical_memory', lambda: total)
     assert est.auto_slab_workers((1000, 1000, 1000), 500) == 8
     cpus = 14
     assert est.auto_slab_workers((1000, 1000, 1000), 500) == 7
     assert est.auto_slab_workers((1000, 1000, 1000), 3) == 3
     # a 2 x 8000 x 8000 ribbon is the largest slab: 16 B a voxel and 256 MiB, about 2.2 GiB a worker
     assert est.auto_slab_workers((1000, 8000, 8000), 500) == 7
-    monkeypatch.setattr(est, '_physical_memory', lambda: 16 * gib)
+    available = 16 * gib
+    assert est.auto_slab_workers((1000, 8000, 8000), 500) == 5
+    available = 6 * gib
+    assert est.auto_slab_workers((1000, 8000, 8000), 500) == 1
+    # 2 GiB to spare at about 0.31 GiB a worker
+    assert est.auto_slab_workers((1000, 1000, 1000), 500) == 6
+    available = 3 * gib
+    assert est.auto_slab_workers((1000, 1000, 1000), 500) == 1
+    # available memory unknown: half of the RAM
+    available, total = None, 16 * gib
     assert est.auto_slab_workers((1000, 8000, 8000), 500) == 3
-    monkeypatch.setattr(est, '_physical_memory', lambda: None)
+    total = None
     assert est.auto_slab_workers((1000, 8000, 8000), 500) == 7
     cpus = 3
     assert est.auto_slab_workers((1000, 1000, 1000), 500) == 1

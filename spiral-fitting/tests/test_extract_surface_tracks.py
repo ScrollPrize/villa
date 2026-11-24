@@ -412,7 +412,7 @@ def test_cpu_defaults_on_every_os(monkeypatch, tmp_path, platform, serial):
         spec = importlib.util.spec_from_file_location(f'est_{platform}', est.__file__)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        module._physical_memory = lambda: 64 * 2**30
+        module._available_memory = lambda: 64 * 2**30
         module.select_backend = lambda requested, gpus=None: requested
         resolved = []
         module.run_cpu = lambda *args: resolved.append(module.cpu_parallelism((1000, 1000, 1000), 384))
