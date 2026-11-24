@@ -245,8 +245,8 @@ def test_an_answer_logged_whose_rewrite_of_holdout_json_failed_holds_back_the_pa
 def test_a_legacy_record_whose_log_is_ahead_of_holdout_json_is_held_back(tmp_path, scored, capsys):
     """Release must hold back the pair and its older candidates when a logged answer
     invalidates the score. Exported releases must remain checkable from their shipped
-    files. (The same for a record stored before stores bound their answers: an answer that
-    keeps the count, "partly" to "no" on a unit that does not line up, is not a problem.)"""
+    files. (The same for a record stored before stores bound their answers: any logged
+    answer its holdout.json does not hold is enough, whatever it does to the count.)"""
     root = tmp_path / "records"
     directory = stored(root)
     record = rec.Record(directory)
@@ -415,7 +415,7 @@ def test_the_viewer_rides_out_a_replace_of_the_session(tmp_path, monkeypatch):
     as_windows_locks(monkeypatch)
     session = tmp_path / "session"
     session.mkdir()
-    (session / "session.json").write_text(json.dumps({"schema": pipeline_stages.fs.SCHEMA}))
+    (session / "session.json").write_text(json.dumps({"schema": pipeline_stages.fs.SCHEMA, "patches": []}))
     refused = refuse_opens_of(monkeypatch, session / "session.json", lambda: 3)
     loaded = pipeline_stages.fs.Session.load(session)
     assert refused[0] == 3 and loaded.directory == session

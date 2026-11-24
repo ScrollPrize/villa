@@ -312,20 +312,18 @@ def test_release_rides_out_a_replace_and_still_checks_the_answers(tmp_path, scor
 
 # ------------------------------------------------- found by an independent review of the fix
 
-def test_an_answer_logged_whose_rewrite_of_holdout_json_failed_heals_on_the_next_decision(tmp_path, scored):
+def test_an_answer_logged_whose_rewrite_of_holdout_json_failed_is_scored_again(tmp_path, scored):
     """The saved approval and any override must cover the scores being published, and the
     release must contain the answers those scores used. Coherent legacy and migrated records
     must remain eligible. (`volreg answer` logged the answer, and its rewrite of holdout.json
-    failed -- refused past the wait on Windows, or the process stopped. The decision is
-    refused, and holdout.json is rewritten from the log, so the scores are made again and
-    the pair is not stuck.)"""
+    failed -- refused past the wait on Windows, or the process stopped. Since round 7 the
+    log is what the stages read the answers from: the scores are stale at once, made again,
+    and the pair is not stuck.)"""
     root = tmp_path / "records"
     directory = scored_pair(root)
     rec.Record(directory).log("holdout-answer", unit="p0004", answer="no", by=BY)
-    drain(directory)
-    with pytest.raises(Conflict):
-        decide_on(directory, "bend", page(directory))
-    pipeline = drain(directory)                                  # scored again, on 19
+    assert pipeline_stages.pipeline(directory).states()["score"] == STALE
+    drain(directory)                                             # scored again, on 19
     fresh = page(directory)
     assert fresh["scores"]["scores"]["bend"]["lines_up"] == 19
     decide_on(directory, "bend", fresh, "19 will do")

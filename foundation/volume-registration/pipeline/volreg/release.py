@@ -67,7 +67,9 @@ class Snapshot:
     @classmethod
     def take(cls, record):
         """The snapshot, or None if the record never stood still long enough to read."""
-        names = FILES + ((STORE_STAMP, REDO_MARKS) if is_pipeline(record) else ())
+        # The event log too, for a pipeline record: the answers' and decisions' only source,
+        # which `scores_problem` checks the files against. Read, never released.
+        names = FILES + ((STORE_STAMP, REDO_MARKS, rec.EVENTS) if is_pipeline(record) else ())
         before = None
         for attempt in range(READS):
             now = {}
@@ -102,6 +104,10 @@ class Snapshot:
 
     def sha256(self, name):
         return hashlib.sha256(self.contents[name]).hexdigest()
+
+    def events(self):
+        content = self.contents.get(rec.EVENTS, b"").decode()
+        return [json.loads(line) for line in content.splitlines() if line.strip()]
 
 
 def not_stored_since_redo(record):
@@ -192,7 +198,14 @@ def scores_problem(record, decision):
     or migrated from the first runs) is checked on what it holds: the published variant's
     score must name the units the answers line up (`per_unit`), or count as many. Either way
     the published variant must pass the bar, or the decision's override must name every part
-    it misses."""
+    it misses.
+
+    A pipeline record is checked against its event log as well, the answers' and decisions'
+    only source: an answer logged that its `holdout.json` does not hold (the rewrite after
+    it failed) means the scores are not of the answers there are, and a decision that names
+    no scores must be one the log shows was made on the scores stored
+    (`scoring.legacy_approval_problem`). A released pair has no event log, and is checked on
+    its shipped files alone."""
     publish = decision.get("publish")
     if publish not in ("bend", "affine") or not record.exists(rec.FIT):
         return None
@@ -204,6 +217,17 @@ def scores_problem(record, decision):
     if result is None:
         return f"it stores no score for the {publish}; store it again with `volreg redo <pair> store`"
     again = "the decision is made again on the new scores, and stored"
+    events = record.events() if is_pipeline(record) and record.exists(rec.EVENTS) else None
+    if events is not None:
+        behind = rec.answers_behind(held, events)
+        if behind:
+            return (f"its event log holds hold-out answers its holdout.json does not ({', '.join(behind)}: "
+                    f"the rewrite after them failed), so its scores are not of the answers there are; it is "
+                    f"released once {again}")
+        if decision.get("basis") is None and any(event["kind"] == "decision" for event in events):
+            problem = scoring.legacy_approval_problem(events, decision)
+            if problem:
+                return f"its decision names no scores, and {problem}; it is released once {again}"
     if binding.get("answers_sha256") is not None:
         if binding["answers_sha256"] != used:
             return (f"a hold-out answer changed since it was stored, so its scores are not those of "

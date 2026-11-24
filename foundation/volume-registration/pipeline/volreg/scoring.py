@@ -88,6 +88,69 @@ def basis(fit_digest, scores, bar, answers):
                                       "answers": answers}, sort_keys=True).encode()).hexdigest()
 
 
+def legacy_approval_problem(events, decision):
+    """Why a record's event log (`events`, in the order written) does not show which scores
+    a decision from before decisions named their scores covers, or None if it shows they are
+    the scores there are.
+
+    Such a decision (a legacy approval) has no basis, and its time is in whole seconds, as
+    the scores' is: a score finished in the same second, or a stale page sent again after a
+    rescore, cannot be told from the scores the page showed by the clock. The log can tell
+    what the page could have shown. A page shows a blind round, so it was loaded after its
+    round was drawn, and it showed the scores finished by then, or later ones. The decision
+    covers the scores there are only if nothing those scores rest on changed since that
+    round was drawn: no answer changed whether a unit lines up (even if changed back), and
+    the hold-out set was not drawn again. Otherwise the page may have shown other scores
+    than the ones there are, and the decision is made again on them.
+
+    Which round: the first time the round the decision names was logged (`blind-round`),
+    from the start of the blind job that drew it; for a decision that names no round (main
+    named none), or a log that does not show it, the first blind job after the last fit. The
+    decision must be the last one the log holds (the same fit, variant, override and round),
+    logged after that round was drawn. Line order, not the clock: the log is appended under
+    the record lock, so its order is the order things happened in."""
+    logged = [index for index, event in enumerate(events) if event["kind"] == "decision"]
+    if not logged:
+        return "its event log holds no decision"
+    last = events[logged[-1]]
+    if (any(last.get(key) != decision.get(key) for key in ("fit", "publish", "override"))
+            or (last.get("round") or None) != (decision.get("round") or None)):
+        return "it is not the last decision its event log holds"
+
+    def job(index, kind, stage):
+        return events[index]["kind"] == kind and events[index].get("stage") == stage
+
+    drawn = None
+    if decision.get("round"):
+        named = next((index for index, event in enumerate(events)
+                      if event["kind"] == "blind-round" and event.get("round") == decision["round"]), None)
+        if named is not None:
+            drawn = next((index for index in range(named, -1, -1) if job(index, "job-started", "blind")), named)
+    if drawn is None:
+        fitted = max((index for index in range(len(events)) if job(index, "job-finished", "fit")), default=-1)
+        drawn = next((index for index in range(fitted + 1, len(events)) if job(index, "job-started", "blind")),
+                     None)
+    if drawn is None or logged[-1] < drawn:
+        return "its event log does not show the blind round it was made on"
+    finished = max((index for index in range(drawn) if job(index, "job-finished", "score")), default=None)
+    if finished is None:
+        return "its event log does not show the scores its blind round was drawn on"
+    since = max((index for index in range(finished) if job(index, "job-started", "score")), default=0)
+    if any(job(index, "job-started", "holdout") for index in range(since, len(events))):
+        return "the hold-out set was drawn again after the blind round it was made on"
+    lining = {}
+    for index, event in enumerate(events):
+        if event["kind"] != "holdout-answer":
+            continue
+        up = event.get("answer") == LINES_UP
+        if index < since:
+            lining[event["unit"]] = up
+        elif up != lining.get(event["unit"], False):
+            return (f"an answer changed whether {event['unit']} lines up after the blind round it was "
+                    f"made on was drawn, so the scores it saw may not be the ones there are")
+    return None
+
+
 def bar_failures(result):
     """The parts of the bar a stored score misses, as its own check recorded them, sorted. A
     score said to miss the bar without saying where misses "bar"."""

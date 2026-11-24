@@ -22,7 +22,7 @@ from .cores import fit_session as fs
 from .cores import session_overview
 from .cores.transform_io import volume_name
 from .engine import Pipeline, Stage, digest_contents, digest_json
-from .scoring import BAR, answers_digest, bar_check, bar_failures, basis, score
+from .scoring import BAR, answers_digest, bar_check, bar_failures, basis, legacy_approval_problem, score
 
 PARAMS = "params.json"
 # The lock a read-change-write of `params.json` is done under, by the review page and the CLI.
@@ -123,7 +123,7 @@ def reviewed_unit(pipeline):
     answers = (scored or {}).get("answers_sha256")
     if answers is None:
         stamp = _stamp(pipeline, "score")
-        held = pipeline.record.read(rec.HOLDOUT) if pipeline.record.exists(rec.HOLDOUT) else {"patches": []}
+        held = pipeline.record.logged_holdout() if pipeline.record.exists(rec.HOLDOUT) else {"patches": []}
         if not (stamp.get("status") == "ok" and stamp.get("outputs") == [SCORES]
                 and digest_contents([(SCORES, content)]) == stamp.get("output_digest")
                 and (stamp.get("inputs") or {}).get("needs", {}).get("judge-holdout")
@@ -135,15 +135,19 @@ def reviewed_unit(pipeline):
     return unit
 
 
-def approval_problem(decision, unit, scored_at=None):
+def approval_problem(decision, unit, scored_at=None, events=None):
     """Why a decision does not cover the scores of `unit` (`reviewed_unit`), or None. A
     decision to publish nothing publishes no score, so it covers any.
 
     A decision made on the review page names the basis of the scores it was made on
     (`scoring.basis`): it covers those scores only, not ones made since (an answer changed,
-    the fit scored again). One from before decisions named it covers the scores there are if
-    they were finished (`scored_at`, the score stamp's) by the time it was made. Either way a
-    variant that misses the bar is published only on an override naming exactly the parts
+    the fit scored again). One from before decisions named it (a legacy approval) covers the
+    scores there are only if the record's event log (`events`) shows they are the ones its
+    page could have shown (`scoring.legacy_approval_problem`): the clock cannot, since a
+    score finished in the same second as the decision has the same time. A record whose log
+    holds no decision (written before decisions were logged) is held to the old rule: the
+    scores were finished (`scored_at`, the score stamp's) by the time it was made. Either way
+    a variant that misses the bar is published only on an override naming exactly the parts
     it misses: an override given for one failure is not taken for another."""
     if decision["publish"] not in ("bend", "affine"):
         return None
@@ -151,6 +155,10 @@ def approval_problem(decision, unit, scored_at=None):
         if decision["basis"] != unit.basis:
             return ("the decision was made on other scores than the current ones (an answer changed, "
                     "or the fit was scored again)")
+    elif events is not None and any(event["kind"] == "decision" for event in events):
+        problem = legacy_approval_problem(events, decision)
+        if problem:
+            return f"the decision names no scores, and {problem}"
     elif decision.get("at") and scored_at and scored_at > decision["at"]:
         return "the decision was made before the current scores were"
     publish = decision["publish"]
@@ -424,10 +432,12 @@ def run_recheck(pipeline, params):
 
 
 def holdout_identity(pipeline):
-    """What judging the hold-out set decided: the answer per unit, nothing else."""
+    """What judging the hold-out set decided: the answer per unit, nothing else, as the
+    event log holds them (`Record.logged_holdout`): an answer logged whose rewrite of
+    `holdout.json` failed makes the scores of the answers before it stale."""
     if not pipeline.record.exists(rec.HOLDOUT):
         return {}
-    return answers_of(pipeline.record.read(rec.HOLDOUT))
+    return answers_of(pipeline.record.logged_holdout())
 
 
 def answers_of(held):
@@ -457,7 +467,7 @@ def holdout_judged(pipeline, params):
     """Enough hold-out patches line up, or every one is answered."""
     if not pipeline.record.exists(rec.HOLDOUT):
         return False
-    patches = pipeline.record.read(rec.HOLDOUT)["patches"]
+    patches = pipeline.record.logged_holdout()["patches"]
     answered = [patch for patch in patches if patch.get("answer")]
     lines_up = sum(patch["answer"]["answer"] == rec.LINES_UP for patch in answered) + sum(
         (octant.get("answer") or {}).get("answer") == rec.LINES_UP
@@ -470,7 +480,7 @@ def run_score(pipeline, params):
     pair = pipeline.record.read(rec.PAIR)
     unit = fit_unit(pipeline)          # the transform and its metadata, of one fit
     transform, fit = unit.transform, unit.fit
-    held = pipeline.record.read(rec.HOLDOUT)
+    held = pipeline.record.logged_holdout()     # the answers the log holds, if the file is behind
     fixed_is_coarse = pair["coarse_side"] == "fixed"
     scores = {name: score(transform, held, fixed_is_coarse, fit["fine_um"], affine_only=name == "affine")
               for name in ("bend", "affine")}
@@ -522,7 +532,7 @@ def run_blind(pipeline, params):
         grown = {"id": round_id, "at": rec.now(), "candidates": candidates, "test_only": True,
                  "items": []}
         rounds.append(grown)
-    held = {patch["id"]: patch for patch in pipeline.record.read(rec.HOLDOUT)["patches"]}
+    held = {patch["id"]: patch for patch in pipeline.record.logged_holdout()["patches"]}
     shown = {item["patch"] for item in grown["items"]}
     eligible = {patch_id for patch_id, patch in held.items()
                 if (patch.get("answer") or {}).get("answer") in params["answers"]}
@@ -609,12 +619,13 @@ def run_store(pipeline, params):
                            f"now: judge its blind round and decide again")
     if decision.get("round") and decided_round_problem(final, decision):
         raise RuntimeError(f"{decided_round_problem(final, decision)}: decide again")
-    answers = answers_digest(pipeline.record.read(rec.HOLDOUT) if pipeline.record.exists(rec.HOLDOUT)
+    answers = answers_digest(pipeline.record.logged_holdout() if pipeline.record.exists(rec.HOLDOUT)
                              else {"patches": []})
     if answers != unit.answers_sha256:
         raise Incoherent("a hold-out answer changed since the scores were made: once they are made "
                          "again, decide again on them")
-    problem = approval_problem(decision, unit, _stamp(pipeline, "score").get("finished"))
+    problem = approval_problem(decision, unit, _stamp(pipeline, "score").get("finished"),
+                               pipeline.record.events())
     if problem:
         raise RuntimeError(f"{problem}: decide again on the scores there are")
     publish = decision["publish"]

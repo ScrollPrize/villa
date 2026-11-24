@@ -172,13 +172,16 @@ class Record:
 
     def answers(self):
         """The latest answer per hold-out unit, from the event log."""
-        latest = {}
-        for event in self.events():
-            if event["kind"] == "holdout-answer":
-                latest[event["unit"]] = (None if event["answer"] is None else
-                                         {"answer": event["answer"], "at": event["at"],
-                                          "by": event.get("by")})
-        return latest
+        return latest_answers(self.events())
+
+    def logged_holdout(self):
+        """`holdout.json` with the answers the event log holds (`with_logged_answers`): what
+        the stages that rest on the answers read, so an answer logged whose rewrite of
+        `holdout.json` failed is in it, and the scores made of the file before are stale.
+        Writes nothing and takes no lock: status and the review page read it. The file is
+        read before the log, so an answer logged in between is in what is returned."""
+        held = self.read(HOLDOUT)
+        return with_logged_answers(held, self.events())
 
     def refresh_holdout(self, patches=None, **fields):
         """Rewrite `holdout.json` with `patches` (or the ones it holds), `fields`, and the
@@ -327,6 +330,53 @@ def _scratch(target):
         filelock.unlink(scratch, missing_ok=True)
         raise
     return descriptor, scratch
+
+
+def latest_answers(events):
+    """The latest answer per hold-out unit in `events` (a record's event log, in order):
+    `{"answer", "at", "by"}`, or None where it was taken back."""
+    latest = {}
+    for event in events:
+        if event["kind"] == "holdout-answer":
+            latest[event["unit"]] = (None if event["answer"] is None else
+                                     {"answer": event["answer"], "at": event["at"],
+                                      "by": event.get("by")})
+    return latest
+
+
+def _answered_units(held):
+    """Each unit of a hold-out set with where its answer is kept: `(id, patch or octant)`."""
+    for patch in held.get("patches") or []:
+        yield patch["id"], patch
+        for octant in patch.get("octants") or []:
+            yield f"{patch['id']}.{octant['index']}", octant
+
+
+def answers_behind(held, events):
+    """The units whose answer in `held` (a `holdout.json`) is not the latest one the event
+    log holds for them, sorted: an answer logged whose rewrite of `holdout.json` failed. A
+    unit the log never answered is not behind: its answer in the file is the only one there
+    is (a record written before answers were logged, or by hand in a test)."""
+    latest = latest_answers(events)
+    return sorted(unit_id for unit_id, unit in _answered_units(held)
+                  if unit_id in latest and (unit.get("answer") or {}).get("answer")
+                  != (latest[unit_id] or {}).get("answer"))
+
+
+def with_logged_answers(held, events):
+    """`held` (a `holdout.json`) with the latest logged answer of every unit whose answer
+    there is not it (`answers_behind`); everything else as it is, so a file in step with its
+    log comes back unchanged, to the byte. The event log is the answers' only source:
+    `holdout.json` is rewritten from it, and a rewrite that failed leaves the file behind."""
+    behind = set(answers_behind(held, events))
+    if not behind:
+        return held
+    latest = latest_answers(events)
+    held = json.loads(json.dumps(held))
+    for unit_id, unit in _answered_units(held):
+        if unit_id in behind:
+            unit["answer"] = latest[unit_id]
+    return held
 
 
 def holdout_units(held):
