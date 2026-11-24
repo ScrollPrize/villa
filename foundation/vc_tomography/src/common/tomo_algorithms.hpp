@@ -77,10 +77,9 @@ void run(B& b, const TomoArgs& a, const float* rows, const float* weights, float
     const int NG = b.n_angles, N = b.g.N;
     const std::size_t NS = static_cast<std::size_t>(NG) * b.g.n_det, NP = static_cast<std::size_t>(N) * N;
     const std::string& alg = a.algorithm;
-    if (alg == "sirt" && (a.norm != 2 || !std::isfinite(a.relax) || a.relax <= 0.f || a.relax >= 2.f))
-        throw Error("sirt requires norm=rowsum and finite 0 < relax < 2");
+    if (alg == "sirt" && (!std::isfinite(a.relax) || a.relax <= 0.f || a.relax >= 2.f))
+        throw Error("sirt requires finite 0 < relax < 2");
     b.pj = a.projector;
-    b.norm = a.norm;
     std::vector<int32_t> all(NG);
     for (int i = 0; i < NG; ++i) all[i] = i;
     const int32_t* sel = b.ints(all);

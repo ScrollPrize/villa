@@ -116,5 +116,6 @@ def test_overrides_and_text():
     assert filters.parse_chain(filters.chain_text(c)) == c
     s = filters.sweep_sets(["paganin.delta_beta=250,500", "unsharp.coeff=0"])
     assert s == [{"paganin.delta_beta": 250, "unsharp.coeff": 0}, {"paganin.delta_beta": 500, "unsharp.coeff": 0}]
+    assert [filters.set_name(c) for c in s] == ["db250_us_coeff0", "db500_us_coeff0"]
     with pytest.raises(KeyError):
         filters.override(c, {"median.radius": 1})

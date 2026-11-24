@@ -48,8 +48,6 @@
 //   mend_threshold, log_clip_min, log_clip_max, block_angles, grid_size (0: 2 x axis rounded to even, + 1),
 //   ghbp_legs, ghbp_reduction_steps, clip_outer_circle, axis_source_meters, x_interp, z_interp, angle_interp,
 //   sharp_f, sharp_band.
-// Older names: detector_smear (sharpness_weighting); removed with the calibration they belonged to, and refused by
-// name: z_translation_scale, companion_registration, stationary_registration, axis_refinement, rolling_shutter.
 #include <array>
 #include <functional>
 #include <optional>
@@ -218,8 +216,7 @@ std::pair<std::string, std::string> geometry_calibration_file(const std::string&
 // tiles (vc_tomography_calibration geometry's file, "model": "joint"), of which `tile` names a scan as its layout does:
 // the scan is then reconstructed under its own parameters, its place, height and rotation against the anchor left
 // out (geometry::Calibration::own_poses), and the slice h holds the model's height z = h + row_origin of the sample
-// as this scan holds it. Or it is the tiles' description of python/vc_tomography/mosaic.py (geometry.hpp, TileGeometry),
-// which nothing makes any more. The intensity side is the pair's: the scan's own darks and
+// as this scan holds it. The intensity side is the pair's: the scan's own darks and
 // flats taken to the nominal ring current, a weight map from the flats with a taper at the detector's far edge and
 // across the axis.
 struct TileOptions {

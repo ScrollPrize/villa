@@ -114,7 +114,7 @@ HR_HD void ray_span(const Geom& g, const AngleC& k, float t0, int& lo, int& hi) 
 }
 
 // forward: sum over the box pixels of chord x x[pixel] for ray (k, d); VAL: accumulate x (else only len2);
-// L2: also the ray's norm: 1 sum of squared chords (|a_i|^2), 2 sum of chords (row sum). Walks the major axis M (X when walking columns); within one major step the ray
+// L2: also the ray's norm, the sum of its chords (row sum). Walks the major axis M (X when walking columns); within one major step the ray
 // covers a minor interval of width 2h <= 1, i.e. one or two pixels, and its length 1 / |pb| splits between them in
 // proportion (the exact chord lengths, = chord_k). xT (optional): the box transposed ([ix - ox][iy - oy]), read when
 // walking columns so neighbouring rays read neighbouring addresses. lane / nl: this thread takes steps
@@ -133,8 +133,6 @@ struct BoxReader {
 // i.e. cells i0 and i1 (i1 == i0: one cell), with chord lengths w0 + w1 = 1 / max(|cos|, |sin|) split in proportion.
 // Cell i covers [i - c - 1/2, i - c + 1/2) (half-open: a ray on a boundary belongs to the upper cell). The forward
 // projector and the backprojector both call this, so their matrices are identical, boundary rays included.
-// Scalar-templated chord geometry is also used by the Fresnel wave sampler.
-// Keep float aliases for the existing reconstruction kernels.
 template<class T> struct ChordRayT { T t0i, pai, h, L, Lf; };
 using ChordRay = ChordRayT<float>;
 template<class T>
@@ -159,7 +157,7 @@ HR_HD void chord_cells(const ChordRayT<T>& r, T c, T Mc, int& i0, int& i1, T& w0
     }
 }
 
-template <bool VAL, int L2, class RD>
+template <bool VAL, bool L2, class RD>
 HR_HD float project_ray_steps_rd(const RD& rd, const Geom& g, const AngleC& k, float t0, int s0, int s1, int mlo, int mhi,
                                  int nl, float* len2) {
     const bool cols = k.walk_cols;
@@ -177,37 +175,30 @@ HR_HD float project_ray_steps_rd(const RD& rd, const Geom& g, const AngleC& k, f
         chord_cells(cr, g.c, Mc, i0, i1, w0, w1);
         if (i0 >= q0 && i0 < q1 && (!g.clip || in_disk(Mc, static_cast<float>(i0) - g.c, g))) {
             if (VAL) acc += w0 * rd(base + static_cast<std::size_t>(i0 - q0) * qs, cols);
-            if (L2) l2 += L2 == 1 ? w0 * w0 : w0;
+            if (L2) l2 += w0;
         }
         if (i1 != i0 && i1 >= q0 && i1 < q1 && (!g.clip || in_disk(Mc, static_cast<float>(i1) - g.c, g))) {
             if (VAL) acc += w1 * rd(base + static_cast<std::size_t>(i1 - q0) * qs, cols);
-            if (L2) l2 += L2 == 1 ? w1 * w1 : w1;
+            if (L2) l2 += w1;
         }
     }
     if (L2) *len2 = l2;
     return acc;
 }
 
-template <bool VAL, int L2>
+template <bool VAL, bool L2>
 HR_HD float project_ray_steps(const float* x, const float* xT, const Geom& g, const AngleC& k, float t0, int s0, int s1,
                               int mlo, int mhi, int nl, float* len2) {
     return project_ray_steps_rd<VAL, L2>(BoxReader{x, xT}, g, k, t0, s0, s1, mlo, mhi, nl, len2);
 }
 
-template <bool VAL, int L2>
+template <bool VAL, bool L2>
 HR_HD float project_ray(const float* x, const float* xT, const Geom& g, const AngleC& k, int d, float* len2, int lane = 0,
                         int nl = 1) {
     const float t0 = static_cast<float>(d) - g.rot;
     int s0, s1;
     ray_span(g, k, t0, s0, s1);
     return project_ray_steps<VAL, L2>(x, xT, g, k, t0, s0, s1, s0 + lane, s1, nl, len2);
-}
-
-// whether ray (k, d) crosses the box (and the disk)
-HR_HD bool ray_hits(const Geom& g, const AngleC& k, int d) {
-    int s0, s1;
-    ray_span(g, k, static_cast<float>(d) - g.rot, s0, s1);
-    return s1 > s0;
 }
 
 // ---------------------------------------------------------------- separable footprint (SF)

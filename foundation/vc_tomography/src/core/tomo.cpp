@@ -57,7 +57,6 @@ TomoArgs tomo_args(const std::string& algorithm, const FilterParams& p) {
         }
         else if (sirt && k == "norm") {
             if (v != "rowsum") throw Error("sirt: norm must be rowsum; len2 has no supported stable relaxation bound");
-            a.norm = 2;
         } else
             throw Error(err);
     }

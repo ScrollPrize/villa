@@ -78,8 +78,6 @@ Json legacy_json() {
     return d;
 }
 
-const std::vector<std::string> kRemoved = {"z_translation_scale", "companion_registration", "stationary_registration", "axis_refinement", "rolling_shutter"};
-
 using io::lower;
 using io::number_of;
 using io::real_of;
@@ -379,21 +377,6 @@ std::string update_parameters(const std::string& params_text, const std::string&
     Json params = Json::parse(params_text);
     Json kw = Json::parse(changes_text);
     if (!params.is(Json::Object) || !kw.is(Json::Object)) throw Error("parameters are a JSON object");
-    if (const Json* smear = member(kw, "detector_smear")) {  // (the name of sharpness_weighting until 2026-11-11)
-        const Json v = *smear;
-        drop(kw, "detector_smear");
-        if (!member(kw, "sharpness_weighting")) kw.put("sharpness_weighting", v);
-    }
-    std::vector<std::string> gone;
-    for (const auto& kv : kw.object)
-        if (std::find(kRemoved.begin(), kRemoved.end(), kv.first) != kRemoved.end()) gone.push_back(kv.first);
-    if (!gone.empty()) {
-        std::sort(gone.begin(), gone.end());
-        std::string list;
-        for (const auto& g : gone) list += (list.empty() ? "" : ", ") + g;
-        throw KeyError("[" + list + "]: removed with the calibration they belonged to; the geometry calibration (the parameter geometry, vc_tomography_calibration "
-                    "geometry) holds what they stood for");
-    }
     const Json defaults = defaults_json(), legacy = legacy_json();
     Json regular = Json::dict();
     std::vector<std::pair<std::string, Json>> filter_changes;

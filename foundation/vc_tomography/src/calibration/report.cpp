@@ -35,9 +35,9 @@ void assess_residuals(Finding& f, const std::vector<double>& residuals, double t
     f.verdict = r.above_target ? "fails" : "unverified";
 }
 
-Finding& Report::add(std::string requirement, std::string scan, std::string quantity) {
+Finding& Report::add(std::string topic, std::string scan, std::string quantity) {
     Finding f;
-    f.requirement = std::move(requirement);
+    f.topic = std::move(topic);
     f.scan = std::move(scan);
     f.quantity = std::move(quantity);
     f.verdict = "note";
@@ -73,7 +73,7 @@ std::string Report::json() const {
       << number(position_target_px) << ", \"findings\": [\n";
     for (std::size_t i = 0; i < findings.size(); ++i) {
         const Finding& f = findings[i];
-        o << "  {\"requirement\": " << quoted(f.requirement) << ", \"scan\": " << quoted(f.scan)
+        o << "  {\"topic\": " << quoted(f.topic) << ", \"scan\": " << quoted(f.scan)
           << ", \"quantity\": " << quoted(f.quantity) << ",\n   \"stated\": " << quoted(f.stated)
           << ",\n   \"found\": " << quoted(f.found) << ",\n   \"verdict\": " << quoted(f.verdict)
           << ", \"requires_follow_up\": " << (f.verdict == "verified" ? "false" : "true")
@@ -99,7 +99,7 @@ std::string Report::json() const {
 std::string Report::text() const {
     std::ostringstream o;
     for (const Finding& f : findings) {
-        o << "[" << f.verdict << "] " << f.requirement << " " << f.scan << " - " << f.quantity << "\n";
+        o << "[" << f.verdict << "] " << f.topic << " " << f.scan << " - " << f.quantity << "\n";
         if (!f.stated.empty()) o << "    stated: " << f.stated << "\n";
         if (!f.found.empty()) o << "    found:  " << f.found << "\n";
         if (!f.note.empty()) o << "    note:   " << f.note << "\n";

@@ -159,18 +159,6 @@ double two_numbers(const Json& j, const std::string& key, const std::string& whe
     return v[i];
 }
 
-// a course given at knots `knots` (equally spaced), a line between them and beyond the ends
-struct Knots {
-    std::vector<double> at;
-    double value(const std::vector<double>& v, double frame) const {
-        const double x = (frame - at[0]) / (at[1] - at[0]);
-        const long last = static_cast<long>(at.size()) - 2;
-        const long i = std::clamp(static_cast<long>(std::floor(x)), 0L, last);
-        const double w = x - static_cast<double>(i);
-        return v[static_cast<std::size_t>(i)] * (1.0 - w) + v[static_cast<std::size_t>(i) + 1] * w;
-    }
-};
-
 }  // namespace
 
 // ---------------------------------------------------------------- the map
@@ -214,8 +202,8 @@ Calibration Calibration::parse(const std::string& json_text) {
     c.doc_ = std::make_shared<const Json>(Json::parse(json_text));
     if (!c.doc_->is(Json::Object)) throw Error("geometry: the calibration is not an object");
     if (!is_joint(*c.doc_))
-        throw Error("geometry: the calibration is not a joint one (\"model\": \"joint\"); files of the earlier two-scan step are no longer read: "
-                    "make the calibration again with vc_tomography_calibration geometry");
+        throw Error("geometry: the calibration is not a joint one (\"model\": \"joint\"): "
+                    "make it with vc_tomography_calibration geometry");
     return c;
 }
 Calibration Calibration::load(const std::string& path) { return parse(io::read_text(path)); }
@@ -279,14 +267,7 @@ Poses joint_scan_poses(const Json& cal, int rows, std::size_t s, const std::vect
     const double roll = number(par, "roll", "the parameters");
     // the pitch of the rotation axis towards the beam, where the calibration has it (a mosaic's tiles give it)
     const Json* leans = par.find("pitch");
-    double pitch = leans && leans->is(Json::Number) ? leans->number : 0.0;
-    // Older mosaic writers stored a zero placeholder and saved the fitted pitch only in the tile report.
-    if (const Json* tiles = cal.find("tiles"); tiles && pitch == 0.0) {
-        const Json* saved = tiles->find("pitch_in_parameters");
-        const Json* measured = tiles->find("pitch_measured");
-        if (!(saved && saved->is(Json::Bool) && saved->boolean) && measured && measured->is(Json::Number) && std::isfinite(measured->number))
-            pitch = measured->number;
-    }
+    const double pitch = leans && leans->is(Json::Number) ? leans->number : 0.0;
     const Json& stage = member(par, "stage", "the parameters");
     const double lift[2] = {two_numbers(stage, "height_once", "the stage", 0), two_numbers(stage, "height_once", "the stage", 1)};
     const double sway[2] = {two_numbers(stage, "axis_twice", "the stage", 0), two_numbers(stage, "axis_twice", "the stage", 1)};
@@ -541,79 +522,6 @@ Terms reconstruction_terms(const Poses& pose, const std::vector<double>& H, doub
     t.slope_row = (rows - 1) / 2.0;
     t.scale_col = pose.scale_col;
     return t;
-}
-
-// ---------------------------------------------------------------- the tiles of a mosaic
-
-TileGeometry TileGeometry::parse(const std::string& json_text) {
-    TileGeometry g;
-    g.doc_ = std::make_shared<const Json>(Json::parse(json_text));
-    if (!g.doc_->is(Json::Object)) throw Error("geometry: the tiles' description is not an object");
-    return g;
-}
-TileGeometry TileGeometry::load(const std::string& path) { return parse(io::read_text(path)); }
-
-TileGeometry::Pose TileGeometry::frame_pose(const std::string& tile, const std::vector<double>& angle_deg, const std::vector<double>& frame, double row) const {
-    const Json& cal = *doc_;
-    const Json& t = member(member(cal, "tiles", "the description"), tile, "the tiles");
-    Knots K{numbers(member(cal, "layout", "the description"), "knot_frames", "the layout")};
-    if (K.at.size() < 2) throw Error("geometry: fewer than two knots");
-    if (angle_deg.size() != frame.size()) throw Error("geometry: the angles and the frames differ in length");
-    const double v0 = number(member(cal, "map", "the description"), "v0", "the map");
-    const double rho = number(member(cal, "row_time", "the description"), "rad_per_row", "the rows' timing");
-    const auto T = numbers(cal, "angle_course_rad", "the description");
-    const auto C = numbers(t, "column_course", "the tile"), Rc = numbers(t, "height_course", "the tile");
-    if (T.size() != K.at.size() || C.size() != K.at.size() || Rc.size() != K.at.size()) throw Error("geometry: a course is not given at the knots");
-    const Json* yj = t.find("yaw_rad");
-    const double yaw = yj && yj->is(Json::Number) ? yj->number : 0.0;
-    const auto place = numbers(t, "place_px", "the tile");
-    if (place.size() < 2) throw Error("geometry: a tile's place is not two numbers");
-    const double a = number(t, "axis_column", "the tile"), h = number(t, "height_rows", "the tile");
-    const double at_row = (row < 0 ? v0 : row) - v0;
-    Pose out;
-    const std::size_t n = frame.size();
-    out.angle_deg.resize(n), out.column.resize(n), out.height_rows.resize(n);
-    for (std::size_t k = 0; k < n; ++k) {
-        const double th = radians(angle_deg[k]) + K.value(T, frame[k]) + rho * at_row + yaw;
-        out.angle_deg[k] = degrees(th);
-        out.column[k] = a + place[0] * std::cos(th) + place[1] * std::sin(th) + K.value(C, frame[k]);
-        out.height_rows[k] = h + K.value(Rc, frame[k]);
-    }
-    return out;
-}
-
-Terms TileGeometry::reconstruction_terms(const std::string& tile, const std::vector<double>& angle_deg, const std::vector<double>& Hrec,
-                                         const std::vector<double>& frame, double rot_center, double row_origin) const {
-    const Json& cal = *doc_;
-    const Json& lay = member(cal, "layout", "the description");
-    const Json& t = member(member(cal, "tiles", "the description"), tile, "the tiles");
-    const std::size_t n = frame.size();
-    if (Hrec.size() != n) throw Error("geometry: the heights and the frames differ in length");
-    const Pose p = frame_pose(tile, angle_deg, frame);  // at the middle row
-    const auto place = numbers(t, "place_px", "the tile");
-    const double scale = number(cal, "axial_scale", "the description"), sign = number(lay, "row_sign", "the layout");
-    const double per_row = number(member(cal, "row_time", "the description"), "rad_per_row", "the rows' timing") / radians(std::fabs(number(lay, "step_deg", "the layout")));  // frames per row
-    const double chi = number(cal, "rows_slope_opposite", "the description"), psi = number(cal, "axis_roll_rad", "the description");
-    std::vector<double> row(n), travel(n);
-    for (std::size_t k = 0; k < n; ++k) row[k] = (1.0 + scale) * Hrec[k] + p.height_rows[k];  // content at height w is on the row w + row
-    travel_per_frame(row.data(), n, travel.data());
-    Terms out;
-    out.angles_deg = p.angle_deg;
-    out.row_offset.resize(n), out.col_offset.resize(n), out.row_scale.resize(n);
-    for (std::size_t k = 0; k < n; ++k) {
-        const double th = radians(p.angle_deg[k]);
-        const double axis = p.column[k] - (place[0] * std::cos(th) + place[1] * std::sin(th));
-        const double z_pix = sign * (Hrec[k] - Hrec[0]);
-        out.row_offset[k] = static_cast<float>(-(row[k] + row_origin) - z_pix);
-        out.col_offset[k] = static_cast<float>(axis - rot_center);
-        out.row_scale[k] = static_cast<float>(-travel[k] * per_row);
-    }
-    out.row_slope.assign(n, static_cast<float>(-chi));
-    out.col_slope.assign(n, static_cast<float>(psi));
-    out.col_scale.assign(n, 0.0f);
-    out.slope_col = rot_center;
-    out.slope_row = (number(lay, "rows", "the layout") - 1) / 2.0;
-    return out;
 }
 
 }  // namespace vc_tomography::geometry

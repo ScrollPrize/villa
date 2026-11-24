@@ -5,7 +5,8 @@ frames and the acquisition record directly, measures the scan's geometry and int
 writes slices or OME-Zarr volumes.
 
 It is a C++20 library with Python bindings (nanobind). Every image operation has a CPU implementation
-(OpenMP, FFTW) and a CUDA implementation (cuFFT) with the same results. Least-squares fitting uses Ceres.
+(OpenMP, FFTW) and a CUDA implementation (cuFFT) that agree; the exceptions (such as the CUDA gridrec, which is not
+bit-reproducible between runs) are noted in [Reconstructing a scan](docs/reconstruction.md). Least-squares fitting uses Ceres.
 
 ## Scans it can reconstruct
 
@@ -28,6 +29,7 @@ projection store (a multiscale Zarr copy of the frames).
 | `vc_tomography_composite` | Renders max and mean composites along a tifxyz surface, from a reconstructed volume or directly from the projections. |
 | `vc_tomography_download_projections` | Downloads the frames for a slab of a scan, optionally at reduced resolution, optionally straight into a projection store. |
 | `vc_tomography_projections_zarr` | Combines downloaded reduced-resolution copies into one multiscale projection store. |
+| `python -m vc_tomography.fetch_band` | Fetches a thin band of slices at full resolution over SFTP, as a sparse mirror of the scans' raw data (only the frame chunks holding the band's rows). |
 
 `networks/denoising/` holds a Noise2Inverse denoiser for reconstructed volumes (needs the `denoise` extra; see
 [Denoising](docs/denoising.md)). `evaluation/` holds scripts that compare reconstruction methods and
@@ -39,3 +41,5 @@ measure resolution.
 - [Reconstructing a scan](docs/reconstruction.md)
 - [Calibration and alignment](docs/calibration.md)
 - [Denoising](docs/denoising.md)
+- Worked examples, one real scan each, as standalone HTML pages (open them in a browser): [helical pair](docs/explained/helical_pair.html),
+  [multi-column scan](docs/explained/multi_column.html), [I12 grid](docs/explained/i12_grid.html), [mosaic](docs/explained/mosaic.html)

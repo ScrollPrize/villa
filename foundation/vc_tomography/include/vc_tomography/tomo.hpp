@@ -34,7 +34,6 @@ struct TomoArgs {
     std::string algorithm = "sirt";
     int num_iter = 1;
     float relax = 1.f;                       // sirt relaxation
-    int norm = 2;                           // row sums; squared ray norms are no longer supported by SIRT
     bool confidence_weights = false;       // false: validity mask; true: nonnegative measurement confidence
     std::string filter_name = "shepp";       // gridrec
     std::vector<float> filter_par = {0.5f, 8.f};

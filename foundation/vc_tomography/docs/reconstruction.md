@@ -49,7 +49,8 @@ vc_tomography_reconstruct PROJ --z 900 1700 --uint8 --levels 4 --tag block_pagan
 ```
 
 The first run on an acquisition also runs both calibrations. On PHerc0343P (two scans of 48 000 frames each,
-RTX 5090) the geometry calibration takes about 2.5 minutes with the frames in the page cache and 5 minutes without.
+RTX 5090) the geometry calibration takes about 2 minutes 20 seconds with the frames in the page cache and 5 minutes
+without.
 
 ## Outputs
 
@@ -253,7 +254,7 @@ travel for fine detail. The blend happens in the ramp-filtered detector rows bef
   and each tile's `exposure_gate_rad`. Sinogram debug arrays describe the ordinary full-field pass.
   The exposure mode caches aligned tile rows for reuse and limits the number of heights processed together
   on large canvases. A cropped reconstruction evaluates only the regions intersecting the crop.
-- `--set tile_rebin=false` selects the previous direct blend, using the weighted mean angle of each folded bin. Use `--set tile_rebin=true` to
+- `--set tile_rebin=false` blends the tiles directly, using the weighted mean angle of each folded bin. Use `--set tile_rebin=true` to
   interpolate onto a common parallel-ray angle grid. The first tile sets the grid phase for each slice.
   With `beam_divergence` enabled and a calibrated fan, the canvas first interpolates each detector
   column to its parallel-ray direction using the single-tile FBP's small-fan model. It then places each measured row at its own angle and interpolates
@@ -306,7 +307,7 @@ vc_tomography_download_projections \
 - `--reduce` lists the levels to store: 1, 2 or 3 for a half, a quarter or an eighth. More than one level
   requires `--zarr`.
 - `--remote NAME:PATH` reads files that are not local over SFTP from an rclone remote, fetching only the bytes the
-  reduced decode needs.
+  reduced decode needs. Needs paramiko (the `remote` extra: `uv sync --extra remote`).
 - `--plan-only` prints the selection and its size without downloading. Running the same command again resumes.
 
 `vc_tomography_projections_zarr STORE.zarr DIR [DIR ...]` builds a store from earlier downloads made without
@@ -361,7 +362,8 @@ options. `vc_tomography.band.BandComposite` computes surface composites from the
 
 - Slices are reconstructed one at a time in a parallel-beam model. Effects that move a ray out of its slice (beam
   divergence along the axis, tilt of the rotation axis toward the beam) are measured by the geometry calibration
-  but not applied. `manifest.json` lists them under `provenance.geometry.measured_not_applied`.
+  but not applied, except the mosaic canvas's shift of each view's rows by the pitch (see above). `manifest.json`
+  lists them under `provenance.geometry.measured_not_applied`.
 - A mosaic is reconstructed as one slice only by FBP, and written only as TIFF.
 - Parameter sweeps run only on CUDA.
 - Only xy slices are produced.

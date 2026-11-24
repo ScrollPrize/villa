@@ -5,3 +5,7 @@ __pycache__/
 *.so
 /outputs
 development_notes/
+/tests/data
+.agents/
+.codex/
+.pytest_cache/

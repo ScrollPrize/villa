@@ -2,7 +2,6 @@
 Paganin DC, rebalance, ramp padding, mending, calibration cache) and the legacy reference mode."""
 import json
 import os
-from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -106,8 +105,7 @@ def test_merged_frame_from_the_geometry_calibration():
 
 
 def test_calibration_parameters():
-    """the geometry calibration is named by parameters every mode keeps; those of the calibration it replaced are
-    refused by name"""
+    """the geometry calibration is named by parameters every mode keeps"""
     r = bare_recon()
     assert DEFAULTS["geometry"] == "" and set(CALIBRATION_KEYS) == {"geometry", "row_time_us"}
     assert not set(CALIBRATION_KEYS) & set(LEGACY_REFERENCE)
@@ -116,9 +114,6 @@ def test_calibration_parameters():
     assert r.params["geometry"] == "/somewhere/geometry.json" and r.params["row_time_us"] == "-19.87"
     r._update({"mode": "corrected"})
     assert r.params["geometry"] == "/somewhere/geometry.json" and r.params["backprojector"] == "fbp"
-    for gone in ("z_translation_scale", "companion_registration", "stationary_registration", "axis_refinement", "rolling_shutter"):
-        with pytest.raises(KeyError, match="geometry calibration"):
-            bare_recon()._update({gone: "auto"})
     with pytest.raises(ValueError, match="geometry"):      # neither given nor a cache directory to make it in
         _core.geometry_calibration_file("", "", ["/data/HA/HA.h5", "/data/TA/TA.h5"])
 

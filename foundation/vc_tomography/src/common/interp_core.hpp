@@ -101,12 +101,6 @@ HR_HD float bspline3_outer(float t) {   // 1 <= t <= 2 (2 - t is 0 or >= 1e-7: d
     const float u = 2.f - t;
     return hd::div6(hd::mul(u, hd::mul(u, u)));
 }
-HR_HD float bspline3(float t) {
-    t = fabsf(t);
-    if (t < 1.f) return bspline3_inner(t);
-    if (t < 2.f) return bspline3_outer(t);
-    return 0.f;
-}
 
 HR_HD float bspline5(float t) {
     t = fabsf(t);

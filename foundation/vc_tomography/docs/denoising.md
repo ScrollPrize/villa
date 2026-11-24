@@ -21,7 +21,7 @@ trained weights are not in the repository.
 The network needs PyTorch, which is an optional extra of the package:
 
 ```bash
-uv sync --python 3.12 --extra denoise
+uv sync --python 3.12 --extra test --extra denoise
 ```
 
 Every script runs in this one environment.
@@ -101,15 +101,8 @@ python networks/denoising/masked_volume.py SCANS --cache CACHE --geometry geomet
 
 ## Trained networks
 
-None are in the repository. Each is a `model.pt` of about 52 MB, kept with its scan's reconstruction outputs.
-
-| Name | Scan | Trained on | Rated error (1: the input unchanged, 0: perfect) |
-|---|---|---|---|
-| `model_long_paganin175_60min` | PHerc. 172, Diamond I12, 7.91 µm | 23 slabs, noise-split pairs and the two rows of scans as pairs; 60 min | 0.13, against the other row of scans |
-| `model_343p_60min` | PHerc0343P, ESRF BM18, 8.64 µm | 6 noise-split pairs, starting from the PHerc. 172 weights; 60 min | 0.30, on a held-out pair |
-| `model_343p_auto_finetune_30min` | The same, with `sharpness_weighting=auto` | The network above, 30 min more | 0.30 |
-
-The PHerc. 172 network rates 0.90 on PHerc0343P, which is why each scan needs its own.
+None are in the repository (a `model.pt` is about 52 MB). Train one per scan: a network trained on PHerc. 172
+rated 0.90 on PHerc0343P (1: the input unchanged, 0: perfect), against 0.30 for one trained on PHerc0343P itself.
 
 ## Tests
 

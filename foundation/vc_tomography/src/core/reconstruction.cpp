@@ -644,9 +644,6 @@ TileReconstruction tile_reconstructor(const std::string& master, const std::stri
     check_reduce(o.reduce);
     const Json cal = Json::parse(description);
     const Json& L = member(cal, "layout");
-    // a joint geometry calibration (vc_tomography_calibration geometry), of which `label` names a scan; or the tiles' description
-    const Json* model = cal.find("model");
-    const bool joint = model && model->is(Json::String) && model->string == "joint";
     TileReconstruction out;
     out.reduce = o.reduce;
     out.scan = calibration::open_scan(master);
@@ -659,21 +656,10 @@ TileReconstruction tile_reconstructor(const std::string& master, const std::stri
             red.flats.size() != pixels * scan.flats.size())
             throw Error("tile " + label + ": supplied darks and flats must match the detector dimensions and flat series count");
     }
-    std::optional<geometry::Calibration> joined;
-    std::size_t joint_scan = 0;
-    if (!joint) {
-        const auto& tiles = member(L, "tiles").array;
-        std::size_t k = 0;
-        while (k < tiles.size() && tiles[k].string != label) ++k;
-        if (k == tiles.size()) throw Error("the description has no tile '" + label + "'");
-        const auto& range = member(L, "frames_on_disk").array.at(k).array;
-        out.first_frame = static_cast<std::int64_t>(range.at(0).number);
-        out.end_frame = static_cast<std::int64_t>(range.at(1).number);
-    } else {
-        joined = geometry::Calibration::parse(description);
-        joint_scan = joined->scan_named(label);
-        if (joined->rows() != rows_full || joined->cols() != cols_full) throw Error("the geometry calibration is of frames of another size than " + scan.name + "'s");
-    }
+    // a joint geometry calibration (vc_tomography_calibration geometry), of which `label` names a scan
+    const geometry::Calibration joined = geometry::Calibration::parse(description);
+    const std::size_t joint_scan = joined.scan_named(label);
+    if (joined.rows() != rows_full || joined.cols() != cols_full) throw Error("the geometry calibration is of frames of another size than " + scan.name + "'s");
     // the helix among the scan's projections (they are kept one stretch after the other)
     std::int64_t before = 0;
     {
@@ -689,8 +675,8 @@ TileReconstruction tile_reconstructor(const std::string& master, const std::stri
         }
         if (!found) throw Error(scan.name + ": no helix among the projections");
     }
-    if (joint) {  // the helix' frames the calibration was made on
-        const std::array<std::size_t, 2> on_disk = joined->frames_on_disk(joint_scan);
+    {  // the helix' frames the calibration was made on
+        const std::array<std::size_t, 2> on_disk = joined.frames_on_disk(joint_scan);
         if (static_cast<std::int64_t>(on_disk[0]) < before) throw Error("the geometry calibration's helix does not start where " + scan.name + "'s does: it was made from another scan");
         out.first_frame = static_cast<std::int64_t>(on_disk[0]) - before, out.end_frame = static_cast<std::int64_t>(on_disk[1]) - before;
     }
@@ -719,7 +705,7 @@ TileReconstruction tile_reconstructor(const std::string& master, const std::stri
         file_index = source.file_index, frame_index = source.frame_index;
         say(o.log, "[" + label + "] projections from " + o.projections);
     }
-    const double axis_column = joint ? joined->axis_column(joint_scan) : member(member(member(cal, "tiles"), label), "axis_column").number;
+    const double axis_column = joined.axis_column(joint_scan);
     const int f = 1 << o.reduce;
     // The slice's grid has its centre on a pixel or between two, and the reconstruction puts the axis there: the axis'
     // column is rounded to half a pixel of the reconstruction (the rest goes into every frame's column offset), so
@@ -764,12 +750,12 @@ TileReconstruction tile_reconstructor(const std::string& master, const std::stri
     const calibration::DarksFlats& red = out.reduced;
     double step_deg = 0, rad_per_row = 0;  // the angle per frame; the angle between the exposure of one stored row and the next
     bool rows_from_middle = false;         // ... the rows counted from the middle row to both ends
-    if (joint) {
+    {
         // the scan's own frame: its poses under the calibration with its place and height left out (geometry.hpp)
         const std::size_t n_all = scan.unwrapped_angles_deg.size();
         std::vector<double> all_angle(scan.unwrapped_angles_deg.begin(), scan.unwrapped_angles_deg.end()), all_height(n_all);
         for (std::size_t i = 0; i < n_all; ++i) all_height[i] = row_sign * scan.z_translation_m[i] / scan.pixel_size_m;
-        const geometry::Poses all = joined->own_poses(joint_scan, all_angle, all_height);
+        const geometry::Poses all = joined.own_poses(joint_scan, all_angle, all_height);
         geometry::Poses own;
         const auto part = [&](const std::vector<double>& v) {
             return std::vector<double>(v.begin() + static_cast<std::ptrdiff_t>(before + out.first_frame), v.begin() + static_cast<std::ptrdiff_t>(before + out.end_frame));
@@ -786,11 +772,6 @@ TileReconstruction tile_reconstructor(const std::string& master, const std::stri
         step_deg = recorded_angle_step(angle);
         rad_per_row = member(member(cal, "row_time"), "frames_per_row").number * step_deg * (M_PI / 180.0);
         rows_from_middle = own.rows_from_middle = all.rows_from_middle;
-    } else {
-        out.row_origin = o.row_origin ? *o.row_origin : -(1.0 + member(cal, "axial_scale").number) * height_rows[height_rows.size() / 2];
-        out.terms = geometry::TileGeometry::parse(description).reconstruction_terms(label, angle, height_rows, frame, rot_center, out.row_origin);
-        step_deg = std::fabs(member(L, "step_deg").number);
-        rad_per_row = member(member(cal, "row_time"), "rad_per_row").number;
     }
     geometry::Terms& T = out.terms;
     geometry::Map map = geometry::parse_map(member(cal, "map").text());
@@ -868,8 +849,7 @@ TileReconstruction tile_reconstructor(const std::string& master, const std::stri
     cfg.sharpness_weighting.clear();
     cfg.rolling_shutter = rad_per_row / (step_deg * (M_PI / 180.0)) * (rows - 1);
     cfg.rolling_shutter_from_middle = rows_from_middle;
-    // (a joint calibration states the beam's divergence; the earlier description of a mosaic's tiles has none)
-    cfg.fan_per_column = joint && truth(member(p, "beam_divergence")) ? joined->fan() * f : 0.0;
+    cfg.fan_per_column = truth(member(p, "beam_divergence")) ? joined.fan() * f : 0.0;
     std::vector<ScanData> scans;
     scans.push_back(std::move(d));
     out.reconstructor = std::make_shared<SliceReconstructor>(std::move(scans), cfg);

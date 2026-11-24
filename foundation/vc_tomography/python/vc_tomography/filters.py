@@ -24,21 +24,12 @@ import json
 
 from . import _core
 
-# default: no projection filters (no Paganin, no unsharp). The reference (Night Rail BM18) chain is REFERENCE_CHAIN.
-DEFAULT_CHAIN: list = []
-REFERENCE_CHAIN = [{"type": "paganin", "delta_beta": 1000.0}, {"type": "unsharp", "sigma": 1.2, "coeff": 4.0}]
-
 _python_filters: dict = {}
 
 
 def register(name, fn):
     """Make fn usable as {"type": "python", "fn": name, ...}."""
     _python_filters[name] = fn
-
-
-def _value(v):
-    """a value as --set reads it: a whole number, a real, or the text (vc_tomography::parse_value)"""
-    return json.loads(_core.parse_value(str(v)))
 
 
 def parse_chain(text):
@@ -64,21 +55,10 @@ def is_filter_key(key):
 
 def sweep_sets(items):
     """['paganin.delta_beta=250,500', 'unsharp.coeff=0,4'] -> [{...}, {...}] (lists zipped position by position;
-    one-value lists apply to every set)."""
-    cols = {}
-    for item in items:
-        key, vals = item.split("=", 1)
-        cols[key] = [_value(v) for v in vals.split(",")] if key != "filters" else vals.split(";")
-    n = max(len(v) for v in cols.values())
-    for k, v in cols.items():
-        if len(v) not in (1, n):
-            raise ValueError("--sweep lists must have one length (or one value)")
-    return [{k: (v[i] if len(v) > 1 else v[0]) for k, v in cols.items()} for i in range(n)]
+    one-value lists apply to every set; filters=CHAIN1;CHAIN2 sweeps whole chains). (vc_tomography::surface::sweep_sets)"""
+    return json.loads(_core.sweep_sets(list(items)))
 
 
 def set_name(changes):
-    def short(k):
-        return (k.replace("mtf_paganin.", "mp_").replace("paganin.delta_beta", "db").replace("unsharp.", "us_")
-                .replace(".", "_"))
-    return "_".join(f"{short(k)}{v:g}" if isinstance(v, (int, float)) else f"{short(k)}{v}"
-                    for k, v in changes.items())
+    """a parameter set's folder name: {"paganin.delta_beta": 500} -> "db500" (vc_tomography::surface::set_name)"""
+    return _core.set_name(json.dumps(changes))

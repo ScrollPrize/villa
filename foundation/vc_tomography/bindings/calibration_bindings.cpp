@@ -376,7 +376,7 @@ void bind_calibration(nb::module_& m) {
           "frames"_a = 32, "rows"_a = 256, "blocks"_a = 8, "threads"_a = 0, "device"_a = "auto", "position_target"_a = default_position_target_px, "columns"_a = 0, "column_fraction"_a = 0.5,
           "Verify what the acquisition record of one scan, or of the two scans of one acquisition (axis inside the field first), states: against itself "
           "(checks 'record') and against the raw frames ('inventory', 'series', 'beam', 'views'). Returns the report as JSON: a list of findings, each with "
-          "the requirement it bears on, what the record states, what was found and a verdict (verified, fails, unverified, note). Any sampled residual above "
+          "its topic, what the record states, what was found and a verdict (verified, fails, unverified, note). Any sampled residual above "
           "the position target fails; smaller residuals still require follow-up. `device` ('cpu', 'cuda', 'auto') "
           "is where the blocks of the view checks are registered.");
     m.def("calibration_assess_residuals", [](const std::vector<double>& residuals, double target, const std::string& unit) {

@@ -229,7 +229,6 @@ void accumulate(const AccumScanView& s, const ContributorList& c, const AccumPar
 }
 #ifdef VC_TOMOGRAPHY_WITH_CUDA
 namespace cuda {
-struct DeviceContributors;  // opaque
 void accumulate(const AccumScanView& s, const ContributorList& c, const AccumParams& p, float* R, float* RW,
                 void* stream = nullptr, const float* weight2 = nullptr, float* R2 = nullptr, float* RW2 = nullptr);
 }  // namespace cuda

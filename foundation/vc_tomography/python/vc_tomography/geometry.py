@@ -423,12 +423,6 @@ def rolling_shutter_of(cal):
     return _core.GeometryCalibration(_text(cal)).rolling_shutter
 
 
-def overlap_centre_of(cal):
-    """The middle of the columns both scans of a calibration hold, in the first scan's columns."""
-    from . import _core
-    return _core.GeometryCalibration(_text(cal)).overlap_centre
-
-
 # ---------------------------------------------------------------- the step
 
 def calibrate_geometry(scans, row_time=None, device="auto", order=3, threads=8, log=print, patch=128, reduce=0, projections="", rows_from_middle=False, radial_map=False):

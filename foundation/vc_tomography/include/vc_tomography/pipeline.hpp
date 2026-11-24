@@ -79,11 +79,11 @@ struct ReconConfig {
     // over a whole number of steps and, with a rolling shutter, by the rows between them. The sinogram then has as
     // many rows as bins the chunk's projections span (at most 16 turns), and gridding, filters and backprojection
     // cost in proportion. It needs the exact backprojector (fbp, bands): the others use nearest. The exposure arc
-    // (exposure_arc below) is not deconvolved with it: disabled for now.
+    // (exposure_arc below) is not deconvolved with it.
     std::string angle_interp = "nearest";
     // continuous rotation: fraction of the angular step between projections swept during one exposure (0: none, or
     // step scans). > 0: that box blur along the angle is deconvolved in every sinogram (sino.hpp angular_fir).
-    // Not with angle_interp "views", where it is disabled for now (SliceReconstructor::exposure_arc_bins() is then 0).
+    // Not with angle_interp "views", where it is ignored (SliceReconstructor::exposure_arc_bins() is then 0).
     double exposure_arc = 0;
     // Rolling shutter: the detector's rows are read one after another while the sample turns, so the angle of a
     // recording depends on its row. rolling_shutter = the time from the read-out of the first row to that of the

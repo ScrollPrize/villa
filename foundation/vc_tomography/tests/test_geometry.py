@@ -23,8 +23,8 @@ def test_reconstruction_terms_hold_the_poses():
         assert np.allclose(t["angles_deg"], p["angle_deg"])
 
 
-def test_files_of_the_two_scan_step_are_refused():
-    """a calibration of the earlier two-scan step (a motion stage, no "model": "joint") is no longer read"""
+def test_files_without_the_joint_model_are_refused():
+    """a calibration file without "model": "joint" (here one with a motion stage) is refused"""
     old = dict(layout=dict(rows=200, cols=240, frames=[dict(rest1=10, helix=20, rest2=10)] * 2, row_sign=-1.0, coarse_move=70),
                row_time=dict(seconds_per_row=-2e-5, frame_period_s=0.033), poses=dict(motion={}))
     with pytest.raises((ValueError, RuntimeError), match="joint"):

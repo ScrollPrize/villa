@@ -10,7 +10,8 @@ Required:
 - CMake 3.24 or newer and a C++20 compiler
 - Ceres 2.2 or newer, built with EigenSparse (`apt install libceres-dev`, `brew install ceres-solver`;
   `-DCeres_DIR=...` for a separate installation)
-- FFTW3 (float and double), HDF5 (C library), zlib, libcurl
+- FFTW3 (float and double), HDF5 (C library), OpenMP, pkg-config
+- vc_reader's own dependencies (it is built with vc_tomography)
 - Python 3.10 or newer
 
 Optional:

@@ -8,8 +8,7 @@
 //    stored; intensity conversion uses the scan's own dark and mean flat (frames.hpp). Registration also
 //    pre-aligns the recorded per-frame row displacement before estimating residuals.
 //
-// A finding names the requirement it bears on by its number in
-// development_notes/calibration/00_reconstruction_requirements.md.
+// A finding names its topic: what of the record it bears on (frames, axis_column, flat_level, ...).
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -34,7 +33,7 @@ struct ResidualCheck {
 };
 
 struct Finding {
-    std::string requirement;  // "5.4.5"
+    std::string topic;        // "axial_travel"
     std::string scan;         // "HA", "TA", "HA+TA"
     std::string quantity;
     std::string stated;       // what the record states
@@ -56,7 +55,7 @@ void assess_residuals(Finding& finding, const std::vector<double>& residuals, do
 struct Report {
     double position_target_px = default_position_target_px;
     std::vector<Finding> findings;
-    Finding& add(std::string requirement, std::string scan, std::string quantity);
+    Finding& add(std::string topic, std::string scan, std::string quantity);
     std::string json() const;
     std::string text() const;
 };

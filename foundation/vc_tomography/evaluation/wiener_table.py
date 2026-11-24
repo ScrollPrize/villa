@@ -4,8 +4,8 @@
         --curves RUN --pair half0 half1 [--filtered base] [--z_interp lanczos3]
 
 The transfer T(nu, theta) of an UNFILTERED reconstruction (detector blur x phase contrast x what the gridding does):
-  --transfer   its in-plane transfer G(nu), JSON with "frequency" and SUBSET: {"G", "valid"}, e.g. from a thin film
-               of the sample (stage notes of "Fast MBIR for scroll tomography": film_transfer_table.py). A smooth
+  --transfer   its in-plane transfer G(nu), JSON with "frequency" and SUBSET: {"G", "valid"}, e.g. measured on a thin
+               film of the sample. A smooth
                model is fitted to it, G = (1 + A (2 pi nu)^2) (a exp(-2 pi^2 s1^2 nu^2) + (1 - a) exp(-2 pi^2 s2^2
                nu^2)), which carries it to nu = 0 and beyond the last measured frequency.
   --sharp      the same measured where the detector is sharpest: the bins of "by_column" / NAME of that file whose

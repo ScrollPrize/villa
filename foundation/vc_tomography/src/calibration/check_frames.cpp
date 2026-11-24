@@ -142,7 +142,7 @@ Inventory check_inventory(const Record& rec, Frames& frames, Report& rep, int st
         }
     }
     {
-        Finding& f = rep.add("4.1", scan, "every frame on disk against the statistics recorded for it at acquisition");
+        Finding& f = rep.add("frames", scan, "every frame on disk against the statistics recorded for it at acquisition");
         f.stated = "sum, min, max and mean of each frame over the statistics rectangle";
         f.found = fmt("%lld frames read, %lld compared, %lld differ", static_cast<long long>(frames_read), static_cast<long long>(compared), static_cast<long long>(mismatched));
         if (!first_bad.empty()) f.found += ": " + join(first_bad, "; ");
@@ -317,7 +317,7 @@ void check_dark_pair(const Record& rec, const FlatField& ff, const Record& other
             std::int64_t moved = 0;
             for (std::size_t p = 0; p < np; ++p)
                 if (std::fabs(diff[p] - d.mean) > 6 * std::sqrt(dark->variance[p] / dark->n + dark2->variance[p] / dark2->n) + 1e-9) ++moved;
-            Finding& f = rep.add("8.1.2", rec.label + "+" + other->label, "dark level per pixel in the two scans");
+            Finding& f = rep.add("dark_level", rec.label + "+" + other->label, "dark level per pixel in the two scans");
             f.stated = "a dark series at the start of each scan, none at the end";
             f.found = fmt("second minus first: %+.3f counts on average; %.3f counts rms from pixel to pixel where the noise of the two means gives %.3f; %lld pixels changed by more than six times their noise",
                           d.mean, d.sd, sigma, static_cast<long long>(moved));
@@ -429,7 +429,7 @@ void check_series(const Record& rec, Frames& frames, const FlatField& ff, Report
                                 s.entry.c_str(), level, current, level / current, (l1 / l0 - 1) * 100, (c1 / c0 - 1) * 100, s.epoch.size() == n ? s.epoch.back() - s.epoch.front() : NAN));
         }
         if (!recorded && !parts.empty()) {
-            Finding& f = rep.add("8.2.3", scan, "flat level against the ring current (whole frames)");
+            Finding& f = rep.add("flat_level", scan, "flat level against the ring current (whole frames)");
             f.stated = "ring current read with every flat";
             f.found = join(parts, "; ");
             f.verdict = "unverified";

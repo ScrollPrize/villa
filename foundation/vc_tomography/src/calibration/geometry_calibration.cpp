@@ -1340,7 +1340,6 @@ std::string calibrate_geometry(const std::vector<std::string>& scans, const Opti
                              .set("motors_orientation", count(tiles->orientation))  // places_from_motors'
                              .set("orientation_scores", scores)
                              .set("pitch_measured", num(solution.parameters.pitch))
-                             .set("pitch_in_parameters", Json::of_bool(true))
                              .set("solves", Json::of(std::string("all with the map's radial terms; each tile's own parameters from its own views; the shared terms and places with a scale per tile"))));
     }
     return cal.text();

@@ -98,13 +98,6 @@ HR_HD double dmul(double a, double b) {
     return a * b;
 #endif
 }
-HR_HD double ddiv(double a, double b) {
-#if defined(__CUDA_ARCH__)
-    return __ddiv_rn(a, b);
-#else
-    return a / b;
-#endif
-}
 // a * b + c in double precision, as muladd: one rounding under CUDA (whose consumer devices are slow in double
 // precision), two on the CPU. The two differ by a rounding of double precision: for sums that end in single precision.
 HR_HD double dmuladd(double a, double b, double c) {

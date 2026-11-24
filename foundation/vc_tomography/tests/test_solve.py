@@ -1,8 +1,7 @@
-"""Known answers and independent objectives for the Ceres named-equation interface."""
+"""Known answers and independent objectives for the Ceres sparse least-squares solver (_core.calibration_solve)."""
 import numpy as np
 import pytest
 from vc_tomography import _core
-from vc_tomography.solve import Problem, fit_line
 
 
 def _lstsq(A, y):
@@ -65,30 +64,23 @@ def test_explicit_fixed_parameters_and_rank_failure():
     s = _core.calibration_solve(*args, fixed=[13], fixed_value=[3.])
     assert s["usable"] and s["x"][13] == 3. and s["x"][12] == 0
     np.testing.assert_allclose(s["residual"], y-A[:, :12]@_lstsq(A[:, :12], y), atol=1e-8)
-    p = Problem(); p.unknowns("b", 2)
-    e = p.equations([1.,2.]); e.add("b", 0, 1); e.add("b", 1, 2)
-    with pytest.raises(ValueError, match="RANK_DEFICIENT"):
-        p.solve()
-    p.fix("b", 1, 2.)
-    assert p.solve()["b"] == pytest.approx([-2.5,2.])
+    # two equations, two dependent unknowns: rank deficient until one is fixed
+    r, c, v, y = np.array([0, 1, 0, 1]), np.array([0, 0, 1, 1]), np.array([1., 1., 2., 2.]), np.array([1., 2.])
+    assert _core.calibration_solve(r, c, v, y, 2)["termination"] == "RANK_DEFICIENT"
+    s = _core.calibration_solve(r, c, v, y, 2, fixed=[1], fixed_value=[2.])
+    assert s["usable"] and s["x"] == pytest.approx([-2.5, 2.])
 
 
-def test_named_heldout_and_cancelled_duplicates():
-    p = Problem(); p.unknowns("slope", 1); p.unknowns("offset", 1); p.unknowns("unused", 1)
-    t = np.linspace(0,10,200); held = np.arange(200)%4 == 0
-    y = .25*t+2
-    e = p.equations(y, fit=~held)
-    e.add("slope", 0, t).add("offset", 0, 1)
-    e.add("unused", 0, 5).add("unused", 0, -5)
-    p.fix("offset", 0, 2.)
-    s = p.solve()
-    assert s["slope"] == pytest.approx([.25], abs=1e-10)
-    assert s.rank == 1 and s.diagnostics["unused"] == 1
-    assert abs(s.left(e)).max() < 1e-9 and np.all(s.weight[held] == 0)
-    # Held-out equations do not establish rank or support.
-    p = Problem(); p.unknowns("a", 1); p.equations([1.], fit=False).add("a", 0, 1.)
-    with pytest.raises(ValueError, match="INSUFFICIENT_SUPPORT"):
-        p.solve()
+def test_cancelled_duplicates_leave_an_unused_unknown():
+    t = np.linspace(0, 10, 200)
+    rows = np.arange(200)
+    row = np.concatenate([rows, rows, rows, rows])
+    col = np.repeat([0, 1, 2, 2], 200)
+    value = np.concatenate([t, np.ones(200), np.full(200, 5.), np.full(200, -5.)])
+    s = _core.calibration_solve(row, col, value, .25*t+2, 3, fixed=[1], fixed_value=[2.])
+    assert s["usable"] and s["x"][0] == pytest.approx(.25, abs=1e-10)
+    assert s["rank"] == 1 and s["unused"] == 1
+    assert abs(np.asarray(s["residual"])).max() < 1e-9
 
 
 def test_input_errors_and_iteration_limit():
@@ -107,20 +99,18 @@ def test_input_errors_and_iteration_limit():
 
 def test_large_encoder_line_and_unavailable_fits():
     x = 1e12 + np.arange(1000)
-    slope, intercept = fit_line(x, 3.25*(x-1e12)+7)
-    assert slope == pytest.approx(3.25, abs=1e-10)
-    assert intercept == pytest.approx(7-3.25e12, abs=.002)
+    fit = _core.calibration_fit_line(x.tolist(), (3.25*(x-1e12)+7).tolist())
+    assert fit["usable"]
+    assert fit["slope"] == pytest.approx(3.25, abs=1e-10)
+    assert fit["intercept"] == pytest.approx(7-3.25e12, abs=.002)
     for x,y in [([1],[2]), ([1,1,1],[2,3,4]), ([],[])]:
         assert not _core.calibration_fit_line(x,y)["usable"]
-        with pytest.raises(ValueError): fit_line(x,y)
 
 
 def test_all_fixed_and_constant_equations():
-    p = Problem(); p.unknowns("a", 1)
-    p.fix("a", 0, 2.)
-    p.equations([3., 4.]).add("a", 0, 1.)
-    p.equations([5.])
-    s = p.solve(huber=1.)
-    assert s.rank == 0 and s["a"][0] == 2.
-    assert s.residual == pytest.approx([1.,2.,5.])
-    assert s.cost == pytest.approx(.5+1.5+4.5)
+    # equations 0 and 1 hold the fixed unknown; equation 2 holds no unknown at all
+    s = _core.calibration_solve(np.array([0, 1]), np.array([0, 0]), np.array([1., 1.]), np.array([3., 4., 5.]), 1,
+                                fixed=[0], fixed_value=[2.], huber=1.)
+    assert s["rank"] == 0 and s["x"][0] == 2.
+    assert s["residual"] == pytest.approx([1., 2., 5.])
+    assert s["cost"] == pytest.approx(.5+1.5+4.5)

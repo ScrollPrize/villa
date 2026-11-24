@@ -50,7 +50,7 @@ void check_record(const Record& rec, Report& rep, double eps, double radius_px) 
 
     // ------------------------------------------------------------------ 4.1 frame counts
     {
-        Finding& f = rep.add("4.1", scan, "frame counts of the stretches");
+        Finding& f = rep.add("frames", scan, "frame counts of the stretches");
         f.stated = fmt("sequence: %g darks, %g flats per series, %g projections per %g deg, nb_turns %g",
                        T.number("scan/dark_n"), T.number("scan/flat_n"), T.number("scan/tomo_n"), T.number("scan/scan_range"),
                        T.number("scan/nb_turns", NAN));
@@ -83,7 +83,7 @@ void check_record(const Record& rec, Report& rep, double eps, double radius_px) 
     }
     // ------------------------------------------------------------------ 4.1 frame -> file map
     {
-        Finding& f = rep.add("4.1", scan, "map from frame to file");
+        Finding& f = rep.add("frames", scan, "map from frame to file");
         std::int64_t files = 0, missing = 0, gaps = 0, on_disk = 0, mapped_on_disk = 0;
         bool have_counts = true;
         std::vector<std::string> held;
@@ -186,7 +186,7 @@ void check_record(const Record& rec, Report& rep, double eps, double radius_px) 
     }
     // ------------------------------------------------------------------ 4.1 arrival times in the frame files
     {
-        Finding& f = rep.add("4.1", scan, "arrival time of each frame at the detector software (frame files)");
+        Finding& f = rep.add("frames", scan, "arrival time of each frame at the detector software (frame files)");
         std::vector<std::string> parts;
         bool have = false, ok = true;
         double worst = 0;
@@ -230,7 +230,7 @@ void check_record(const Record& rec, Report& rep, double eps, double radius_px) 
     }
     // ------------------------------------------------------------------ 4.2 roles
     {
-        Finding& f = rep.add("4.2", scan, "role of each stretch");
+        Finding& f = rep.add("stretch_roles", scan, "role of each stretch");
         std::vector<std::string> parts;
         bool ok = true, absent = false;
         for (const Stretch& s : rec.stretches) {
@@ -250,7 +250,7 @@ void check_record(const Record& rec, Report& rep, double eps, double radius_px) 
     }
     // ------------------------------------------------------------------ 4.4 the stretches
     {
-        Finding& f = rep.add("4.4", scan, "stretches of projections and their extent");
+        Finding& f = rep.add("stretches", scan, "stretches of projections and their extent");
         std::vector<std::string> parts;
         for (int i : proj) {
             const Stretch& s = rec.stretches[i];
@@ -268,7 +268,7 @@ void check_record(const Record& rec, Report& rep, double eps, double radius_px) 
     }
     // ------------------------------------------------------------------ 4.5 the clocks
     {
-        Finding& f = rep.add("4.5", scan, "Unix time against the hardware timer at each trigger");
+        Finding& f = rep.add("clocks", scan, "Unix time against the hardware timer at each trigger");
         std::vector<std::string> parts;
         bool ok = !proj.empty(), monotonic = true;
         double last = -1;
@@ -292,7 +292,7 @@ void check_record(const Record& rec, Report& rep, double eps, double radius_px) 
     }
     // ------------------------------------------------------------------ 4.7 monitors
     {
-        Finding& f = rep.add("4.7", scan, "beam monitor readings");
+        Finding& f = rep.add("beam_monitor", scan, "beam monitor readings");
         std::vector<std::string> parts;
         for (const Stretch& s : rec.stretches) {
             const Monitor& m = s.monitor;
@@ -317,7 +317,7 @@ void check_record(const Record& rec, Report& rep, double eps, double radius_px) 
     }
     // ------------------------------------------------------------------ 4.8 detector configuration
     {
-        Finding& f = rep.add("4.8", scan, "detector configuration: master file against the frame files");
+        Finding& f = rep.add("detector_config", scan, "detector configuration: master file against the frame files");
         const auto& bin = T.numbers(det + "binning");
         const auto& roi = T.numbers(det + "roi");
         const auto& flip = T.numbers(det + "flipping");
@@ -411,7 +411,7 @@ void check_record(const Record& rec, Report& rep, double eps, double radius_px) 
         const Line steps = fit_line(index, angle, 0, n);
         const double nominal = s.scan_parameters.number("step_size", tol.step_deg);
         const double end_error = (n - 1) * (nominal - steps.slope);
-        Finding& f = rep.add("5.4.1", scan, "rotation angle of each projection, stretch " + s.entry);
+        Finding& f = rep.add("rotation_angle", scan, "rotation angle of each projection, stretch " + s.entry);
         f.stated = fmt("%s_trig, %s, %s_delta per projection; commanded step %.6g deg", rec.rotation[0].c_str(), s.rot_center_name.c_str(), rec.rotation[0].c_str(), nominal);
         f.found = fmt("derived angles reproduce the raw counts to %.1e deg (trig), %.1e deg (arc), %.1e deg (center); %.6g deg per count = %.1f counts per turn; "
                       "step %.7f deg per frame, departure from a uniform step at most %.2e deg (rms %.2e); counting frames at %.6g deg is off by %.4f deg at the end of the stretch (%.2f px at R)",
@@ -474,7 +474,7 @@ void check_record(const Record& rec, Report& rep, double eps, double radius_px) 
             f.note = "verdict: the derived heights are the raw encoder counts. Rows follow only through the stated pixel size";
         }
         {
-            Finding& f = rep.add("5.4.5", scan, "travel along the axis per turn, stretch " + s.entry);
+            Finding& f = rep.add("axial_travel", scan, "travel along the axis per turn, stretch " + s.entry);
             f.stated = fmt("commanded: z_step %.6g mm per turn (scan), %.6g mm per turn (slave step x frames per turn)", commanded, slave);
             f.found = fmt("encoder against encoder: %.5f mm per turn = %.3f rows at %.4g um (commanded: %.3f rows); difference %.3f rows per turn against a tolerance of %.4f",
                           travel.slope, travel.slope / px_mm, px_mm * 1e3, commanded / px_mm, (travel.slope - commanded) / px_mm,
@@ -485,7 +485,7 @@ void check_record(const Record& rec, Report& rep, double eps, double radius_px) 
             f.numbers = {{"mm_per_turn", travel.slope}, {"rows_per_turn", travel.slope / px_mm}, {"commanded_mm_per_turn", commanded}};
         }
         {
-            Finding& f = rep.add("5.4.10", scan, "steadiness of the travel along the axis, stretch " + s.entry);
+            Finding& f = rep.add("axial_travel_steadiness", scan, "steadiness of the travel along the axis, stretch " + s.entry);
             f.stated = "the latched heights";
             f.found = fmt("against a constant travel per turn (fitted from frame %zu on): frames 0-99 %+.3f rows, frames 200-299 %+.3f rows, last 100 frames %+.3f rows; "
                           "scatter %.3f rows rms (%.3f to %+.3f), of which %.3f rows rms repeat once per turn",
@@ -508,7 +508,7 @@ void check_record(const Record& rec, Report& rep, double eps, double radius_px) 
         // travel per frame of whichever stretch moves along the axis
         const auto& zm = !a.z_center.empty() ? za : zb;
         const double per_frame = (zm.back() - zm.front()) / (zm.size() - 1);
-        Finding& f = rep.add("5.4.6", scan, "boundary between stretches " + a.entry + " and " + b.entry);
+        Finding& f = rep.add("stretch_boundary", scan, "boundary between stretches " + a.entry + " and " + b.entry);
         f.stated = fmt("angle %.4f -> %.4f deg; height %.4f -> %.4f mm (%s)", aa.back(), ab.front(), za.back(), zb.front(),
                        a.z_center.empty() || b.z_center.empty() ? "one side from the stage's position at rest, the other latched" : "both latched");
         f.found = fmt("angle gap %.4f deg where one step is %.4f deg: %.4f deg more than a step (%.2f px at R); height step %.2f um where one frame travels %.2f um: %+.2f rows off a continuous series",
@@ -518,7 +518,7 @@ void check_record(const Record& rec, Report& rep, double eps, double radius_px) 
     }
     // ------------------------------------------------------------------ 5.3.1 nominal axis column
     {
-        Finding& f = rep.add("5.3.1", scan, "axis column from the lateral stage (nominal)");
+        Finding& f = rep.add("axis_column", scan, "axis column from the lateral stage (nominal)");
         const Stretch& s = rec.stretches[proj.empty() ? 0 : proj[0]];
         const double y = positioner(s, rec.translation_y[1]);
         f.stated = fmt("%s = %.4f mm at the start of %s", rec.translation_y[1].c_str(), y, s.entry.c_str());
@@ -560,7 +560,7 @@ void check_record(const Record& rec, Report& rep, double eps, double radius_px) 
     }
     // ------------------------------------------------------------------ 8.2.3 flats against the ring current
     {
-        Finding& f = rep.add("8.2.3", scan, "flat level against the ring current (recorded statistics)");
+        Finding& f = rep.add("flat_level", scan, "flat level against the ring current (recorded statistics)");
         const double dark = recorded_dark_level(rec);
         std::vector<std::string> parts;
         std::vector<double> per_ma;
@@ -591,7 +591,7 @@ void check_record(const Record& rec, Report& rep, double eps, double radius_px) 
     }
     // ------------------------------------------------------------------ 8.2.4 refills
     {
-        Finding& f = rep.add("8.2.4", scan, "rises of the ring current during the projections");
+        Finding& f = rep.add("ring_current", scan, "rises of the ring current during the projections");
         std::vector<std::string> parts;
         for (int i : proj) {
             const Stretch& s = rec.stretches[i];
@@ -642,7 +642,7 @@ void check_record_pair(const Record& a, const Record& b, Report& rep, double eps
 
     // ------------------------------------------------------------------ 4.3 which is which
     {
-        Finding& f = rep.add("4.3", scan, "the scans of the acquisition and what differs between them");
+        Finding& f = rep.add("scans", scan, "the scans of the acquisition and what differs between them");
         // every motor position that differs at the start of the first projection stretch
         std::vector<std::string> diff;
         if (!pa.empty() && !pb.empty()) {
@@ -660,7 +660,7 @@ void check_record_pair(const Record& a, const Record& b, Report& rep, double eps
     }
     // ------------------------------------------------------------------ 6.1.1 lateral move
     {
-        Finding& f = rep.add("6.1.1", scan, "lateral move between the scans (stage reading)");
+        Finding& f = rep.add("lateral_move", scan, "lateral move between the scans (stage reading)");
         const std::string y = a.translation_y[1];
         const double ya = positioner(a.stretches[pa.at(0)], y), yb = positioner(b.stretches[pb.at(0)], y);
         bool constant = true;
@@ -682,7 +682,7 @@ void check_record_pair(const Record& a, const Record& b, Report& rep, double eps
         for (std::size_t i = 0; i < aa.size(); ++i) da[i] = ab[i] - aa[i], dz[i] = zb[i] - za[i], dt[i] = sb.epoch_trig[i] - sa.epoch_trig[i];
         const Spread sda = spread(da), sdz = spread(dz), sdt = spread(dt);
         {
-            Finding& f = rep.add("6.2.1", scan, "angle of the two scans at equal projection index, stretch " + sa.entry);
+            Finding& f = rep.add("scan_angles", scan, "angle of the two scans at equal projection index, stretch " + sa.entry);
             f.stated = "the encoder angles of both scans";
             const double worst = std::max(std::fabs(sda.min), std::fabs(sda.max));
             f.found = fmt("difference %+.2e deg on average, at most %.2e deg (%.3f px at R); target %.6g deg", sda.mean, worst, worst / kDegPerRad * tol.R, tol.angle_deg());
@@ -698,14 +698,14 @@ void check_record_pair(const Record& a, const Record& b, Report& rep, double eps
             f.numbers = {{"mean_mm", sdz.mean}, {"rms_mm", sdz.sd}};
         }
         {
-            Finding& f = rep.add("6.2.4", scan, "time between corresponding projections, stretch " + sa.entry);
+            Finding& f = rep.add("scan_timing", scan, "time between corresponding projections, stretch " + sa.entry);
             f.stated = "epoch_trig of both scans";
             f.found = fmt("%.1f s (%.4f to %.4f)", sdt.mean, sdt.min, sdt.max);
         }
     }
     // ------------------------------------------------------------------ 8.1.2 dark level of the two scans
     {
-        Finding& f = rep.add("8.1.2", scan, "recorded dark level of the two scans");
+        Finding& f = rep.add("dark_level", scan, "recorded dark level of the two scans");
         const double da = recorded_dark_level(a), db = recorded_dark_level(b);
         f.stated = "per-frame mean of the dark frames (middle rows)";
         f.found = fmt("%.3f and %.3f counts: %+.3f", da, db, db - da);
@@ -758,7 +758,7 @@ void check_record_tiles(const std::vector<Record>& recs, Report& rep, double eps
 
     // ------------------------------------------------------------------ 4.3 which is which
     {
-        Finding& f = rep.add("4.3", all, "the scans of the acquisition and what differs between them");
+        Finding& f = rep.add("scans", all, "the scans of the acquisition and what differs between them");
         std::map<std::string, std::vector<double>> values;
         bool comparable = true;
         std::vector<std::string> names;
@@ -808,7 +808,7 @@ void check_record_tiles(const std::vector<Record>& recs, Report& rep, double eps
     const double reach = std::max(axis, cols - 1 - axis);
     double lever = reach;
     if (placed) {
-        Finding& f = rep.add("6.1.1", all, "place of the sample on the rotation stage in each scan (stage readings)");
+        Finding& f = rep.add("lateral_move", all, "place of the sample on the rotation stage in each scan (stage readings)");
         const std::string mu = tomo_motor(first, "sample_u"), mv = tomo_motor(first, "sample_v");
         std::vector<std::string> parts;
         bool constant = true;
@@ -929,7 +929,7 @@ void check_record_tiles(const std::vector<Record>& recs, Report& rep, double eps
         }
         if (angle_parts.empty()) continue;
         {
-            Finding& f = rep.add("6.2.1", all, "angle of the scans at equal projection index, stretch " + sa.entry);
+            Finding& f = rep.add("scan_angles", all, "angle of the scans at equal projection index, stretch " + sa.entry);
             f.stated = "the encoder angles of every scan";
             f.found = fmt("against %s [deg]: %s; at most %.2e deg = %.3f px at the lever arm of %.0f px; target %.6g deg", first.label.c_str(), join(angle_parts, "; ").c_str(), worst_angle,
                           worst_angle / kDegPerRad * tol.R, tol.R, tol.angle_deg());
@@ -943,7 +943,7 @@ void check_record_tiles(const std::vector<Record>& recs, Report& rep, double eps
             f.found = fmt("minus %s: %s", first.label.c_str(), join(height_parts, "; ").c_str());
         }
         {
-            Finding& f = rep.add("6.2.4", all, "time between corresponding projections, stretch " + sa.entry);
+            Finding& f = rep.add("scan_timing", all, "time between corresponding projections, stretch " + sa.entry);
             f.stated = "epoch_trig of every scan";
             f.found = fmt("after %s: %s", first.label.c_str(), join(time_parts, "; ").c_str());
         }

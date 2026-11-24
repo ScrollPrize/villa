@@ -5,7 +5,7 @@ build-backend = "scikit_build_core.build"
 [project]
 name = "vc_tomography"
 version = "0.1.0"
-description = "Compact helical (extended-FOV) tomography reconstruction: C++ core, CPU + CUDA kernels, nanobind bindings"
+description = "Tomographic reconstruction from raw synchrotron projections (helical pairs, multi-column scans, grids, mosaics): C++ core, CPU + CUDA kernels, nanobind bindings"
 requires-python = ">=3.10"
 dependencies = ["numpy>=1.24", "h5py>=3.8", "tifffile", "vc-reader"]
 
@@ -13,8 +13,9 @@ dependencies = ["numpy>=1.24", "h5py>=3.8", "tifffile", "vc-reader"]
 vc_tomography_download_projections = "vc_tomography.download_projections:main"
 
 [project.optional-dependencies]
-test = ["pytest", "tifffile", "h5py", "hdf5plugin"]
+test = ["pytest", "hdf5plugin"]
 denoise = ["torch>=2.12,<3"]
+remote = ["paramiko"]
 
 [tool.uv.sources]
 vc-reader = { path = "../../vc_reader" }

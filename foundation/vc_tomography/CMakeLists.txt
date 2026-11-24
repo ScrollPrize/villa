@@ -45,9 +45,6 @@ pkg_check_modules(FFTW3F REQUIRED IMPORTED_TARGET fftw3f)
 pkg_check_modules(FFTW3 REQUIRED IMPORTED_TARGET fftw3)   # double precision: filter construction
 find_library(FFTW3F_OMP_LIB NAMES fftw3f_omp HINTS ${FFTW3F_LIBRARY_DIRS} REQUIRED)
 find_package(HDF5 REQUIRED COMPONENTS C)
-find_package(ZLIB REQUIRED)   # zlib chunks of Zarr arrays (zarr.hpp)
-
-find_package(CURL REQUIRED)   # Zarr arrays at http(s):// and s3:// locations (reference volumes)
 
 # vc_reader's native library (surfaces, volume sampling, image files, Zarr): an installed package, or the sibling
 # checkout built statically into vc_tomography (its Python modules and install rules stay out of vc_tomography's).
@@ -95,8 +92,9 @@ if(VC_TOMOGRAPHY_OPENJPH)
       URL_HASH SHA256=5cb1ebe18e5ee1322d23ff2130b37562d447d1ad5586c3d16cf84be3ae30f719
       DOWNLOAD_EXTRACT_TIMESTAMP TRUE
       SOURCE_SUBDIR vc_tomography_unused)
-    # Add explicitly with EXCLUDE_FROM_ALL (also on CMake 3.24) to avoid
-    # installing OpenJPH's headers, archive and package files into our wheel.
+    # SOURCE_SUBDIR names a directory that does not exist, so FetchContent_MakeAvailable only downloads OpenJPH;
+    # it is added below with EXCLUDE_FROM_ALL (FetchContent_Declare takes EXCLUDE_FROM_ALL only from CMake 3.28),
+    # which keeps OpenJPH's headers, archive and package files out of the wheel.
     FetchContent_MakeAvailable(openjph)
     add_subdirectory("${openjph_SOURCE_DIR}" "${openjph_BINARY_DIR}" EXCLUDE_FROM_ALL)
     if(VC_TOMOGRAPHY_PYTHON)
@@ -120,7 +118,7 @@ if(VC_TOMOGRAPHY_CPU_ARCH)
 endif()
 target_link_libraries(vc_tomography
   PUBLIC OpenMP::OpenMP_CXX Ceres::ceres
-  PRIVATE PkgConfig::FFTW3F PkgConfig::FFTW3 ${FFTW3F_OMP_LIB} HDF5::HDF5 ZLIB::ZLIB CURL::libcurl vc_reader::reader)
+  PRIVATE PkgConfig::FFTW3F PkgConfig::FFTW3 ${FFTW3F_OMP_LIB} HDF5::HDF5 vc_reader::reader)
 # (vc_reader's headers are not written for -Wextra)
 set_source_files_properties(src/io/projection_store.cpp src/io/reference.cpp src/io/zarr.cpp PROPERTIES COMPILE_OPTIONS "-Wno-extra;-Wno-missing-field-initializers")
 if(VC_TOMOGRAPHY_OPENJPEG AND OPENJP2_FOUND)
@@ -141,7 +139,6 @@ if(VC_TOMOGRAPHY_WITH_CUDA)
   target_link_libraries(vc_tomography PUBLIC CUDA::cudart PRIVATE CUDA::cufft)
 endif()
 
-# ---------------------------------------------------------------- tools
 # ---------------------------------------------------------------- surfaces (vc_reader; C++20 as vc_reader is)
 file(GLOB VC_TOMOGRAPHY_SURFACE_SOURCES CONFIGURE_DEPENDS src/surface/*.cpp)
 add_library(vc_tomography_surfaces STATIC ${VC_TOMOGRAPHY_SURFACE_SOURCES})
@@ -152,14 +149,14 @@ target_compile_options(vc_tomography_surfaces PRIVATE -O3 -Wall -Wno-missing-fie
 set_target_properties(vc_tomography_surfaces PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(vc_tomography_surfaces PUBLIC vc_tomography vc_reader::reader)
 
-# vc_tomography_calibration: checks an acquisition record against itself and against the raw frames (src/calibration)
+# vc_tomography_calibration: the geometry and intensity calibrations, and checks of an acquisition record (src/calibration)
 option(VC_TOMOGRAPHY_TOOLS "Build the command-line tools" ON)
 if(VC_TOMOGRAPHY_TOOLS)
   add_executable(vc_tomography_calibration tools/vc_tomography_calibration.cpp)
   target_include_directories(vc_tomography_calibration PRIVATE src)
   target_link_libraries(vc_tomography_calibration PRIVATE vc_tomography)
   target_compile_options(vc_tomography_calibration PRIVATE -O2 -Wall -Wextra)
-  # vc_tomography_reconstruct: slices and volumes of a scan pair from its raw folders (vc_tomography/reconstruction.hpp)
+  # vc_tomography_reconstruct: slices and volumes from the scans' raw folders (vc_tomography/reconstruction.hpp)
   add_executable(vc_tomography_reconstruct tools/vc_tomography_reconstruct.cpp)
   target_include_directories(vc_tomography_reconstruct PRIVATE src)
   target_link_libraries(vc_tomography_reconstruct PRIVATE vc_tomography vc_reader::reader)

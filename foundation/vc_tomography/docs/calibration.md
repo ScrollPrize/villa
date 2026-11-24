@@ -148,9 +148,7 @@ reconstructing a mosaic read this file (see [Reconstructing a scan](reconstructi
   PHercParis4 mosaic's camera configuration.
 - **Pitch.** The tilt of the rotation axis towards the beam is measured from the tiles at equal angle and stored in
   `parameters.pitch` (radians). Reconstruction shifts each view's detector row to the depth of the common
-  sample origin. Rays still have a depth-dependent height within the specimen. For older mosaic files with a
-  zero placeholder, reconstruction reads `tiles.pitch_measured`. Files with `tiles.pitch_in_parameters: true`
-  use the parameter value, including an explicit zero.
+  sample origin. Rays still have a depth-dependent height within the specimen.
 - **Not solved.** The tiles' rotations against each other, and the beam's divergence.
 
 On the 19 tiles of PHercParis4 at a quarter from a projection store (`--reduce 2 --projections projections.zarr`,

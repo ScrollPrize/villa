@@ -33,16 +33,9 @@ import numpy as np
 from . import _core
 from .sld import sld_config  # noqa: F401  (re-exported: the scintillator model is a parameter)
 
-MODES = ("corrected", "legacy_reference")
 DEFAULTS = json.loads(_core.reconstruction_default_parameters())
 LEGACY_REFERENCE = json.loads(_core.reconstruction_legacy_parameters())
 CALIBRATION_KEYS = tuple(_core.reconstruction_calibration_keys())
-# parameters of the calibration the geometry calibration replaced (2026-11-12): named in the error for older configs
-REMOVED = ("z_translation_scale", "companion_registration", "stationary_registration", "axis_refinement", "rolling_shutter")
-# uint8 display window of the reference workflow (legacy reference units); the same physical window in
-# attenuation (cm^-1) is twice as wide
-REFERENCE_WINDOW = (-0.03, 0.145)
-CONVENTIONS = {m: json.loads(_core.reconstruction_mode_conventions(m)) for m in MODES}
 
 
 def display_window(mode):
@@ -213,7 +206,7 @@ def _build_identity():
         import hashlib
         from pathlib import Path
         digest = hashlib.sha256()
-        for path in sorted(Path(__file__).parent.rglob("*.py")) + sorted(Path(__file__).parent.rglob("*.h")):
+        for path in sorted(Path(__file__).parent.rglob("*.py")):
             digest.update(str(path.relative_to(Path(__file__).parent)).encode())
             digest.update(path.read_bytes())
         out["python_source_sha256"] = digest.hexdigest()

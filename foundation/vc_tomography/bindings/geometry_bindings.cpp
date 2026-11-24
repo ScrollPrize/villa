@@ -125,18 +125,4 @@ void bind_geometry(nb::module_& m) {
              "axis"_a, "row"_a, "heights_rows"_a, "first_frame"_a = std::vector<std::size_t>(), "quantum"_a = 0.25,
              "the merged frame of any number of scans: the axis in the first scan's columns, every other scan's (rows, columns) from it, and per other scan its "
              "(axis column, rows) unrounded");
-
-    nb::class_<hg::TileGeometry>(m, "TileGeometry", "The geometry of a mosaic's tiles (vc_tomography/geometry.hpp), from its JSON text.")
-        .def("__init__", [](hg::TileGeometry* self, const std::string& json_text) { new (self) hg::TileGeometry(hg::TileGeometry::parse(json_text)); }, "json_text"_a)
-        .def("frame_pose",
-             [](const hg::TileGeometry& g, const std::string& tile, DoubleIn angle_deg, DoubleIn frame, double row) {
-                 const auto p = g.frame_pose(tile, vec(angle_deg), vec(frame), row);
-                 return nb::make_tuple(vc_tomography::py::to_numpy(p.angle_deg), vc_tomography::py::to_numpy(p.column), vc_tomography::py::to_numpy(p.height_rows));
-             },
-             "tile"_a, "angle_deg"_a, "frame"_a, "row"_a = -1.0)
-        .def("reconstruction_terms",
-             [](const hg::TileGeometry& g, const std::string& tile, DoubleIn angle_deg, DoubleIn height_rows, DoubleIn frame, double rot_center, double row_origin) {
-                 return terms_dict(g.reconstruction_terms(tile, vec(angle_deg), vec(height_rows), vec(frame), rot_center, row_origin));
-             },
-             "tile"_a, "angle_deg"_a, "height_rows"_a, "frame"_a, "rot_center"_a, "row_origin"_a = 0.0);
 }

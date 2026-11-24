@@ -2,13 +2,12 @@
 // A geometry calibration as the reconstruction reads it: the detector's map, where every frame holds the sample
 // (poses), and the per-projection terms the reconstruction is given (helical.hpp, ScanTrajectory).
 //
-// Two kinds of description are read, both JSON as the calibration steps save them:
+// The description is JSON as the calibration step saves it:
 //
 //   Calibration   a helical acquisition of scans that share their place on the rotation stage (one scan, or
 //                 several moved sideways): vc_tomography_calibration geometry's file ("model": "joint";
-//                 geometry_calibration.hpp states the model), any number of scans. Files of the earlier
-//                 two-scan step (with a motion stage) are refused.
-//   TileGeometry  the tiles of a mosaic (python/vc_tomography/mosaic.py states its form; nothing makes one at present)
+//                 geometry_calibration.hpp states the model), any number of scans. Files without
+//                 "model": "joint" are refused.
 //
 // Nothing here reads frames: the record's angle and height of every frame are given by the caller.
 #include <array>
@@ -169,31 +168,6 @@ class Calibration {
     // rows in its vector (a grid's second row lies a row's step from the first).
     MergedLayout merged_layout(const std::vector<Poses>& poses, const std::vector<std::vector<double>>& heights_rows,
                                const std::vector<std::size_t>& first_frame = {}, double quantum = 0.25) const;
-
-  private:
-    std::shared_ptr<const Json> doc_;
-};
-
-// The tiles of a mosaic: for the frame f of a tile at the record's angle (courses are lines between their knots)
-//     th = th_record(f) + T(f) + yaw + rad_per_row (v - v0)      the angle at which the row v was exposed
-//     u  = a + c1 cos th + s1 sin th + C(f)                       where the sample's origin falls on the detector
-//     H  = h + R(f)                                               how far the sample lies from the record along the axis
-class TileGeometry {
-  public:
-    static TileGeometry parse(const std::string& json_text);
-    static TileGeometry load(const std::string& path);
-
-    struct Pose {
-        std::vector<double> angle_deg, column, height_rows;  // th [deg], u, H per frame
-    };
-    // angle_deg, frame: the record's angle and the frame number of each frame. row < 0: the middle row.
-    Pose frame_pose(const std::string& tile, const std::vector<double>& angle_deg, const std::vector<double>& frame,
-                    double row = -1) const;
-    // One tile's frames as the reconstruction's terms, in the tile's own frame: the slice's centre is the tile's
-    // rotation axis, and the slice h is the same height of the sample in every tile (row_origin, rows, moves
-    // that numbering). height_rows: the record's height in rows (row_sign x height / pixel) of each frame.
-    Terms reconstruction_terms(const std::string& tile, const std::vector<double>& angle_deg, const std::vector<double>& height_rows,
-                               const std::vector<double>& frame, double rot_center, double row_origin = 0) const;
 
   private:
     std::shared_ptr<const Json> doc_;

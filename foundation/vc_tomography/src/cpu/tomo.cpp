@@ -170,7 +170,6 @@ struct CpuBackend final : TomoWorkspace {
     std::vector<float> l2, xT, sf_rows, sf_cols;
     int have_l2 = -1;    // projector the cached ray norms belong to
     int pj = tomo_core::Chord;
-    int norm = 1;        // SIRT ray norm: 1 |a_i|^2, 2 row sum
 
     CpuBackend(const TomoGeom& t, const float* ang) : key(t), n_angles(t.n_angles), angles(ang, ang + t.n_angles) {
         gfull.N = t.N; gfull.n_det = t.n_det; gfull.c = 0.5f * (t.N - 1); gfull.rot = t.rot; gfull.R = t.R;
@@ -240,11 +239,10 @@ struct CpuBackend final : TomoWorkspace {
     }
     // ray norms over the disk; SF row sums: the projection of the all-ones image
     const float* len2() {
-        if (have_l2 != pj * 4 + norm) {
+        if (have_l2 != pj) {
             const int ND = g.n_det;
             l2.resize(static_cast<std::size_t>(n_angles) * ND);
             if (pj == tomo_core::SF) {
-                if (norm != 2) throw Error("sf projector: only row-sum ray norms");
                 const std::vector<float> ones(static_cast<std::size_t>(g.W) * g.H, 1.f);
                 std::vector<int32_t> all(n_angles);
                 for (int i = 0; i < n_angles; ++i) all[i] = i;
@@ -252,10 +250,9 @@ struct CpuBackend final : TomoWorkspace {
             } else {
 #pragma omp parallel for schedule(dynamic, 64)
                 for (long q = 0; q < static_cast<long>(n_angles) * ND; ++q)
-                    norm == 2 ? (void)tomo_core::project_ray<false, 2>(nullptr, nullptr, gfull, ak[q / ND], static_cast<int>(q % ND), &l2[q])
-                              : (void)tomo_core::project_ray<false, 1>(nullptr, nullptr, gfull, ak[q / ND], static_cast<int>(q % ND), &l2[q]);
+                    tomo_core::project_ray<false, true>(nullptr, nullptr, gfull, ak[q / ND], static_cast<int>(q % ND), &l2[q]);
             }
-            have_l2 = pj * 4 + norm;
+            have_l2 = pj;
         }
         return l2.data();
     }

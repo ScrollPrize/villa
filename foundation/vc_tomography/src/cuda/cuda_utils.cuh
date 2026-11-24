@@ -259,13 +259,6 @@ void copy_rows(T* dst, const T* s, std::size_t width, std::size_t rows, std::siz
     }
 }
 
-// Device rows -> pageable host memory through the staging buffer.
-template <class T>
-void download_rows(T* dst, const T* src, std::size_t src_pitch, std::size_t width, std::size_t rows, PinnedBuffer<T>& stage,
-                   std::size_t dst_pitch = 0) {
-    copy_rows(dst, download_block(src, src_pitch, width, rows, stage), width, rows, dst_pitch);
-}
-
 // RAII stream
 class Stream {
   public:

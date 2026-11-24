@@ -1,6 +1,5 @@
 """Baseline modes, output units and opt-in previews without raw-data dependencies."""
 import json
-from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -11,9 +10,19 @@ from vc_tomography import to_uint8
 from vc_tomography.recon import CALIBRATION_KEYS, DEFAULTS, HelicalRecon, LEGACY_REFERENCE
 
 
-@pytest.mark.parametrize("recipe", ["343p_baselines.json", "343p_corrected_baselines.json"])
-def test_baseline_paganin_uses_reference_sharpening(recipe):
-    cfg = json.loads((Path(compare.__file__).parent / recipe).read_text())
+BASELINES = {
+    "params": {"mode": "corrected", "filters": []},
+    "methods": [
+        {"name": "fbp_no_paganin", "backprojector": "fbp"},
+        {"name": "fbp_paganin_unsharp", "backprojector": "fbp",
+         "params": {"filters": [{"type": "paganin", "delta_beta": 1000.0}, {"type": "unsharp", "sigma": 1.2, "coeff": 4.0}]}},
+        {"name": "legacy_reference", "mode": "legacy_reference", "backprojector": "ghbp"},
+    ],
+}
+
+
+def test_baseline_paganin_uses_reference_sharpening():
+    cfg = BASELINES
     for method in cfg["methods"]:
         r = object.__new__(HelicalRecon)
         r.params = dict(DEFAULTS)

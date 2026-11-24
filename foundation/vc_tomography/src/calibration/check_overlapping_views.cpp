@@ -174,7 +174,7 @@ void check_views(const Record& first, Frames& first_frames, const FlatField& fir
             }
         }
         row_sign = corr[0] >= corr[1] ? 1.0 : -1.0;
-        Finding& f = rep.add("5.1.6", first.label, "sense of the detector's rows against the axis stage");
+        Finding& f = rep.add("detector_sense", first.label, "sense of the detector's rows against the axis stage");
         f.stated = fmt("data_axes and flipping, without their conventions; %s decreases through the helix", first.translation_z[1].c_str());
         f.found = fmt("a turn at rest registers on the helix with correlation %.3f if a larger %s puts the sample on higher rows, and %.3f if on lower rows: a larger %s = %s rows",
                       corr[0], first.translation_z[1].c_str(), corr[1], first.translation_z[1].c_str(), row_sign > 0 ? "higher" : "lower");
@@ -259,7 +259,7 @@ void check_views(const Record& first, Frames& first_frames, const FlatField& fir
         const double nominal = cols / 2.0 + positioner(s, first.translation_y[1]) / px_mm;
         const Line axis_trend = fit_line(at, axis, 0, at.size()), D_trend = fit_line(at, D, 0, at.size());
         {
-            Finding& f = rep.add("5.3.1", first.label, "column of the rotation axis from opposite views, stretch " + s.entry);
+            Finding& f = rep.add("axis_column", first.label, "column of the rotation axis from opposite views, stretch " + s.entry);
             f.stated = fmt("nominal only: %s = %.4f mm, column %.2f if %s = 0 is the middle column", first.translation_y[1].c_str(), positioner(s, first.translation_y[1]),
                            nominal, first.translation_y[1].c_str());
             std::vector<std::string> per_band;
@@ -281,7 +281,7 @@ void check_views(const Record& first, Frames& first_frames, const FlatField& fir
             f.numbers.insert(f.numbers.begin(), {{"axis_column", sa.mean}, {"axis_sem", sa.sem()}, {"axis_sd", sa.sd}, {"nominal", nominal}});
         }
         {
-            Finding& f = rep.add("5.4.1", first.label, "angle over half a turn from opposite views, stretch " + s.entry);
+            Finding& f = rep.add("rotation_angle", first.label, "angle over half a turn from opposite views, stretch " + s.entry);
             f.stated = fmt("encoder: the opposite view of frame p is %.4f frames after p", sqa.mean - sq.mean);
             f.found = fmt("registered: %.4f frames after p; measured minus stated %s = %+.5f deg; target %.6g frames (%.6g deg)", sqa.mean, pm(sq, "frames").c_str(),
                           sq.mean * tol.step_deg, tol.angle_frames(), tol.angle_deg());
@@ -291,7 +291,7 @@ void check_views(const Record& first, Frames& first_frames, const FlatField& fir
             f.numbers = {{"residual_frames", sq.mean}, {"residual_sem", sq.sem()}, {"residual_sd", sq.sd}};
         }
         {
-            Finding& f = rep.add("4.4", first.label, "height of opposite views in the turn at rest, stretch " + s.entry);
+            Finding& f = rep.add("stretches", first.label, "height of opposite views in the turn at rest, stretch " + s.entry);
             f.stated = fmt("%s does not move during the stretch", first.translation_z[1].c_str());
             std::vector<std::string> per_band;
             for (std::size_t bi = 0; bi < bands.size(); ++bi)
@@ -383,7 +383,7 @@ void check_views(const Record& first, Frames& first_frames, const FlatField& fir
                     f.numbers = {{"offset_frames", lq.intercept}, {"frames_per_row", lq.slope}, {"mean_frames", sq.mean}, {"rms_frames", lq.rms}};
                 }
                 {
-                    Finding& f = rep.add("5.4.7", rec.label, "lateral position of the helix against the " + which);
+                    Finding& f = rep.add("lateral_position", rec.label, "lateral position of the helix against the " + which);
                     f.stated = fmt("not stated; %s is the same in both stretches", rec.translation_y[1].c_str());
                     f.found = fmt("columns: %s, %+.3f to %+.3f; as a line in the row displacement: %+.4f px at zero, %+.3e px per row (%+.3f px at %.0f rows; rms %.4f)",
                                   pm(su, "px").c_str(), su.min, su.max, lu.intercept, lu.slope, lu.intercept + lu.slope * far, far, lu.rms);
@@ -446,7 +446,7 @@ void check_views(const Record& first, Frames& first_frames, const FlatField& fir
                         f.numbers = {{"residual_frames", sq.mean}, {"residual_sem", sq.sem()}};
                     }
                     {
-                        Finding& f = rep.add("5.4.7", rec.label, "lateral position a turn apart, helix " + sh.entry);
+                        Finding& f = rep.add("lateral_position", rec.label, "lateral position a turn apart, helix " + sh.entry);
                         f.stated = "not stated";
                         f.found = fmt("columns: %s over %.0f rows of travel = %+.2e px per row", pm(su, "px").c_str(), sP.mean, su.mean / sP.mean);
                         f.found += harmonics_text(hu, "px");
@@ -498,7 +498,7 @@ void check_views(const Record& first, Frames& first_frames, const FlatField& fir
                     corr[c] = std::max(0.0, m.correlation);
                 }
                 col_sign = corr[0] >= corr[1] ? 1.0 : -1.0;
-                Finding& f = rep.add("5.1.6", both, "sense of the detector's columns against the lateral stage");
+                Finding& f = rep.add("detector_sense", both, "sense of the detector's columns against the lateral stage");
                 f.stated = fmt("%s %.4f -> %.4f mm", y.c_str(), positioner(sa, y), positioner(sb, y));
                 f.found = fmt("the second scan registers on the first with correlation %.3f if its content lies %d columns higher, and %.3f if lower: a larger %s = %s columns",
                               corr[0], M, corr[1], y.c_str(), (col_sign > 0) == (move_px > 0) ? "higher" : "lower");

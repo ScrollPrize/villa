@@ -1,6 +1,6 @@
-// vc_tomography_reconstruct: slices of an extended-FOV helical acquisition (a scan pair, or the scan with the rotation
-// axis in its field and several moved sideways beside it) from the raw projection folders, or from a projection
-// store of them (vc_tomography::Reconstruction, vc_tomography/reconstruction.hpp).
+// vc_tomography_reconstruct: slices of an acquisition (a helical pair, a scan with the rotation axis in its field and
+// several moved sideways beside it, a grid of circular scans, or a mosaic's tiles) from the raw projection folders,
+// or from a projection store of them (vc_tomography::Reconstruction, vc_tomography/reconstruction.hpp).
 //
 // Two modes:
 //

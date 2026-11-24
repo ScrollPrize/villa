@@ -1,4 +1,4 @@
-// Python bindings of vc_tomography/surface_composite.hpp: BandComposite (python/vc_tomography/band.py).
+// Python bindings of vc_tomography/surface_composite.hpp: BandComposite (python/vc_tomography/band.py), parameter sweeps.
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
 #include <nanobind/stl/array.h>
@@ -19,6 +19,9 @@ using vc_tomography::py::json_loads;
 using vc_tomography::py::to_numpy_object;
 
 void bind_surface(nb::module_& m) {
+    m.def("sweep_sets", &hs::sweep_sets, "items"_a,
+          "--sweep KEY=V1,V2,... items as parameter sets: a JSON list of objects' text (vc_tomography::surface::sweep_sets)");
+    m.def("set_name", &hs::set_name, "changes"_a, "a parameter set's folder name, e.g. db500_us_coeff2 (vc_tomography::surface::set_name)");
     nb::class_<hs::BandComposite>(m, "BandComposite",
                                   "Surface layers reconstructed where their points lie (vc_tomography::surface::BandComposite, surface_composite.hpp)")
         .def(

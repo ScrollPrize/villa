@@ -153,27 +153,3 @@ def ghbp(sino, angles_rad, N, rot_center, axis_source_meters=1e9, voxel_size_mic
         final[(xx - c) ** 2 + (yy - c) ** 2 > r2] = 0.0
     return final.astype(np.float32)
 
-
-def exact_pixel_driven(sino, angles_nabu, N, rot_center, scale_factor=1.0, rows=None, cols=None):
-    """float64 voxel-driven parallel backprojection, linear interpolation, zero outside the
-    detector (GHBP edge convention). h = rc + (col-c)cos(A) - (row-c)sin(A), A = nabu angles."""
-    sino = np.asarray(sino, np.float64)
-    nb = sino.shape[1]
-    c = (N - 1) * 0.5
-    A = np.asarray(angles_nabu, np.float64)
-    ca, sa = np.cos(A), np.sin(A)
-    rows = np.asarray(rows, np.float64)
-    cols = np.asarray(cols, np.float64)
-    out = np.zeros(rows.size)
-    ka = np.arange(len(A))
-    for s0 in range(0, rows.size, 1000):
-        r = rows[s0:s0 + 1000, None] - c
-        q = cols[s0:s0 + 1000, None] - c
-        h = rot_center + q * ca[None] - r * sa[None]
-        i0 = np.floor(h).astype(np.int64)
-        f = h - i0
-        i1 = i0 + 1
-        v0 = np.where((i0 >= 0) & (i0 < nb), sino[ka[None], np.clip(i0, 0, nb - 1)], 0.0)
-        v1 = np.where((i1 >= 0) & (i1 < nb), sino[ka[None], np.clip(i1, 0, nb - 1)], 0.0)
-        out[s0:s0 + 1000] = (v0 * (1 - f) + v1 * f).sum(1)
-    return scale_factor * out

@@ -60,11 +60,10 @@ __global__ void project_warp_kernel(const float* __restrict__ x, const float* __
     }
 }
 
-template <int L2>
 __global__ void len2_kernel(const AngleC* __restrict__ ak, int n_angles, Geom g, float* l2) {
     const std::size_t total = static_cast<std::size_t>(n_angles) * g.n_det;
     VC_TOMOGRAPHY_GRID_STRIDE(q, total)
-        tomo_core::project_ray<false, L2>(nullptr, nullptr, g, ak[q / g.n_det], static_cast<int>(q % g.n_det), &l2[q]);
+        tomo_core::project_ray<false, true>(nullptr, nullptr, g, ak[q / g.n_det], static_cast<int>(q % g.n_det), &l2[q]);
 }
 
 // SF model (tomo_core.hpp): one thread per cell boundary. A warp walks 32 consecutive boundaries of one angle in
@@ -261,7 +260,6 @@ struct CudaBackend final : TomoWorkspace {
     DeviceBuffer<float> l2, xT, sf_rows, sf_cols, ones;
     int have_l2 = -1;    // projector the cached ray norms belong to
     int pj = tomo_core::Chord;
-    int norm = 1;        // SIRT ray norm: 1 |a_i|^2, 2 row sum
     // gridrec state
     int gr_pdim = 0, gr_chunk = 0;
     DeviceBuffer<float> gr_wtbl, gr_winv;
@@ -333,11 +331,10 @@ struct CudaBackend final : TomoWorkspace {
     }
     // ray norms over the disk; SF row sums: the projection of the all-ones image
     const float* len2() {
-        if (have_l2 != pj * 4 + norm) {
+        if (have_l2 != pj) {
             const std::size_t rays = static_cast<std::size_t>(n_angles) * g.n_det;
             l2.ensure(rays);
             if (pj == tomo_core::SF) {
-                if (norm != 2) throw Error("sf projector: only row-sum ray norms");
                 ones.resize(static_cast<std::size_t>(g.W) * g.H);
                 fill(ones.data(), 1.f, ones.size());
                 std::vector<int32_t> all(n_angles);
@@ -345,13 +342,11 @@ struct CudaBackend final : TomoWorkspace {
                 project(ones.data(), ints(all), n_angles, tomo_algos::StoreEpi{l2.data()});
                 VC_TOMOGRAPHY_CUDA_CHECK(cudaDeviceSynchronize());
                 ones.reset();
-            } else if (norm == 2) {
-                len2_kernel<2><<<grid_for(rays), 256>>>(ak.data(), n_angles, gfull, l2.data());
             } else {
-                len2_kernel<1><<<grid_for(rays), 256>>>(ak.data(), n_angles, gfull, l2.data());
+                len2_kernel<<<grid_for(rays), 256>>>(ak.data(), n_angles, gfull, l2.data());
             }
             VC_TOMOGRAPHY_CUDA_CHECK(cudaGetLastError());
-            have_l2 = pj * 4 + norm;
+            have_l2 = pj;
         }
         return l2.data();
     }
