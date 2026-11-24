@@ -19,7 +19,10 @@ static float min_dist(const cv::Vec2i &p, const std::vector<cv::Vec2i> &list)
     return dist;
 }
 
-static cv::Point2i extract_point_min_dist(std::vector<cv::Vec2i> &cands, const std::vector<cv::Vec2i> &blocked, int &idx, float dist)
+// The one selection loop of both modes: the first candidate, from `idx` on, for which `eligible(candidate)` holds is taken out of `cands`
+// (its slot is tombstoned and the cursor moves past it); {-1,-1} when no candidate is eligible.
+template <class Eligible>
+static cv::Point2i extract_point_if(std::vector<cv::Vec2i> &cands, int &idx, const Eligible &eligible)
 {
     for(int i=0;i<cands.size();i++) {
         cv::Vec2i p = cands[(i + idx) % cands.size()];
@@ -27,7 +30,7 @@ static cv::Point2i extract_point_min_dist(std::vector<cv::Vec2i> &cands, const s
         if (p[0] == -1)
             continue;
 
-        if (min_dist(p, blocked) >= dist) {
+        if (eligible(p)) {
             cands[(i + idx) % cands.size()] = {-1,-1};
             idx = (i + idx + 1) % cands.size();
 
@@ -38,31 +41,22 @@ static cv::Point2i extract_point_min_dist(std::vector<cv::Vec2i> &cands, const s
     return {-1,-1};
 }
 
-// The first candidate, from `idx` on, that does not conflict with any of the blocked points; it is taken out of `cands`.
+// Eligibility by distance: no blocked point closer than `dist`.
+static cv::Point2i extract_point_min_dist(std::vector<cv::Vec2i> &cands, const std::vector<cv::Vec2i> &blocked, int &idx, float dist)
+{
+    return extract_point_if(cands, idx, [&](const cv::Vec2i &p) { return min_dist(p, blocked) >= dist; });
+}
+
+// Eligibility by predicate: `conflict(candidate, blocked point)` is false for every blocked point other than the candidate itself.
 template <class Conflict>
 static cv::Point2i extract_point_without_conflict(std::vector<cv::Vec2i> &cands, const std::vector<cv::Vec2i> &blocked, int &idx, const Conflict &conflict)
 {
-    for(int i=0;i<cands.size();i++) {
-        cv::Vec2i p = cands[(i + idx) % cands.size()];
-
-        if (p[0] == -1)
-            continue;
-
-        bool free = true;
+    return extract_point_if(cands, idx, [&](const cv::Vec2i &p) {
         for (const auto &o : blocked)
-            if (o[0] != -1 && o != p && conflict(p, o)) {
-                free = false;
-                break;
-            }
-        if (free) {
-            cands[(i + idx) % cands.size()] = {-1,-1};
-            idx = (i + idx + 1) % cands.size();
-
-            return p;
-        }
-    }
-
-    return {-1,-1};
+            if (o[0] != -1 && o != p && conflict(p, o))
+                return false;
+        return true;
+    });
 }
 
 //collection of points which can be retrieved with minimum distance requirement, or, with a predicate, without conflicts
