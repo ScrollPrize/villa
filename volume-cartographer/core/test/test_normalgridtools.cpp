@@ -558,3 +558,34 @@ TEST_CASE("fit_umbilicus_along_z: no estimates or no window gives NaN")
     CHECK(std::isnan(fit_umbilicus_along_z({}, {0.0}, 1000.0)[0][0]));
     CHECK(std::isnan(fit_umbilicus_along_z({{0.0, 1.0, 2.0}}, {0.0}, 0.0)[0][0]));
 }
+
+TEST_CASE("median: the middle value, the mean of the middle two for an even count, NaN when empty")
+{
+    using vc::core::util::median;
+    CHECK(median({3.0, 1.0, 2.0}) == 2.0);
+    CHECK(median({4.0, 1.0, 3.0, 2.0}) == 2.5);
+    CHECK(median({7.0}) == 7.0);
+    CHECK(median({1.0, 1.0, 2.0, 2.0}) == 1.5);
+    CHECK(median({-2.0, 5.0}) == 1.5);
+    CHECK(std::isnan(median({})));
+
+    // The same value as the sort-based median vc_gen_umbilicus used before. (A tie between 0.0 and
+    // -0.0 can come out with either sign, as it already could between the two old helpers.)
+    auto sorted_median = [](std::vector<double> v) {
+        std::sort(v.begin(), v.end());
+        const size_t mid = v.size() / 2;
+        return v.size() % 2 == 1 ? v[mid] : 0.5 * (v[mid - 1] + v[mid]);
+    };
+    std::mt19937 rng(7);
+    std::uniform_real_distribution<double> value(-1e4, 1e4);
+    std::uniform_int_distribution<int> count(1, 60);
+    for (int trial = 0; trial < 2000; ++trial) {
+        std::vector<double> v(static_cast<size_t>(count(rng)));
+        for (auto& x : v) {
+            x = trial % 3 == 0 ? std::round(value(rng) / 1000.0) : value(rng);  // ties on every third trial
+        }
+        const double a = median(v);
+        const double b = sorted_median(v);
+        CHECK(a == b);
+    }
+}

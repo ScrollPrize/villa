@@ -59,6 +59,15 @@ std::vector<cv::Vec2d> fit_umbilicus_along_z(const std::vector<cv::Vec3d>& estim
                                              double half_width,
                                              int robustness_iterations = 3);
 
+/**
+ * @brief Median of `values`: the middle value, or the mean of the two middle values
+ * when the count is even. An empty input gives NaN. The values must not be NaN.
+ *
+ * vc_gen_umbilicus writes each slice's control point with it, and fit_umbilicus_along_z
+ * uses it for the residual scale and for slices that fall back to their own estimates.
+ */
+double median(std::vector<double> values);
+
 // Adds each trace to the grid, resampled so that consecutive kept points are at
 // least `spiral_step` apart. Traces that end up with fewer than two points are
 // skipped.

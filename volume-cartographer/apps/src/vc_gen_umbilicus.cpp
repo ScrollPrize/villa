@@ -68,6 +68,7 @@ using vc::core::util::GridStore;
 using vc::core::util::NormalGridVolume;
 using vc::core::util::align_and_extract_umbilicus;
 using vc::core::util::fit_umbilicus_along_z;
+using vc::core::util::median;
 
 namespace {
 
@@ -155,16 +156,6 @@ std::vector<int> parseSlices(const std::string& spec)
         }
     }
     return slices;
-}
-
-double median(std::vector<double> values)
-{
-    if (values.empty()) {
-        return std::numeric_limits<double>::quiet_NaN();
-    }
-    std::sort(values.begin(), values.end());
-    const size_t mid = values.size() / 2;
-    return values.size() % 2 == 1 ? values[mid] : 0.5 * (values[mid - 1] + values[mid]);
 }
 
 void writeCsv(const fs::path& path, const std::vector<Estimate>& estimates, double scale)

@@ -320,18 +320,21 @@ bool local_linear(const std::vector<cv::Vec3d>& e, const std::vector<double>& w,
     return true;
 }
 
-double median_of(std::vector<double> v)
+} // namespace
+
+double median(std::vector<double> values)
 {
-    const size_t n = v.size();
-    std::nth_element(v.begin(), v.begin() + n / 2, v.end());
-    const double hi = v[n / 2];
+    const size_t n = values.size();
+    if (n == 0) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    std::nth_element(values.begin(), values.begin() + n / 2, values.end());
+    const double hi = values[n / 2];
     if (n % 2 == 1) {
         return hi;
     }
-    return 0.5 * (hi + *std::max_element(v.begin(), v.begin() + n / 2));
+    return 0.5 * (hi + *std::max_element(values.begin(), values.begin() + n / 2));
 }
-
-} // namespace
 
 std::vector<cv::Vec2d> fit_umbilicus_along_z(const std::vector<cv::Vec3d>& estimates,
                                              const std::vector<double>& query_z,
@@ -360,7 +363,7 @@ std::vector<cv::Vec2d> fit_umbilicus_along_z(const std::vector<cv::Vec3d>& estim
                 found.push_back(residual[i]);
             }
         }
-        const double s = found.empty() ? 0.0 : median_of(found);
+        const double s = found.empty() ? 0.0 : median(found);
         if (!(s > 0.0)) {
             break;
         }
@@ -385,7 +388,7 @@ std::vector<cv::Vec2d> fit_umbilicus_along_z(const std::vector<cv::Vec3d>& estim
             }
         }
         if (!xs.empty()) {
-            result[q] = cv::Vec2d(median_of(xs), median_of(ys));
+            result[q] = cv::Vec2d(median(xs), median(ys));
         }
     }
     return result;
