@@ -481,6 +481,9 @@ def run_score(pipeline, params):
     unit = fit_unit(pipeline)          # the transform and its metadata, of one fit
     transform, fit = unit.transform, unit.fit
     held = pipeline.record.logged_holdout()     # the answers the log holds, if the file is behind
+    # The answers these scores are made of, for the stamp: if one changed after the job read
+    # its inputs and changes back before it ends, the scores are stale, not done.
+    pipeline.ran_on("score", "judge-holdout", digest_json(answers_of(held)))
     fixed_is_coarse = pair["coarse_side"] == "fixed"
     scores = {name: score(transform, held, fixed_is_coarse, fit["fine_um"], affine_only=name == "affine")
               for name in ("bend", "affine")}

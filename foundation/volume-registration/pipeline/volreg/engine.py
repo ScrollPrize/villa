@@ -134,6 +134,7 @@ class Pipeline:
                     raise ValueError(f"{stage.name} needs {need}, which must come before it")
         self.params = params or {}
         self._started = {}      # stage -> its redo mark when this process's job began
+        self._ran_on = {}       # stage -> {need: digest} its running job said it read (`ran_on`)
         self._guard_depth = 0
 
     # ---------------------------------------------------------------------- the files
@@ -282,6 +283,7 @@ class Pipeline:
                 stamp = {"stage": name, "inputs": inputs, "params": params, "code": code_version(),
                          "started": rec.now()}
                 self.record.log("job-started", stage=name, params=params)
+                self._ran_on.pop(name, None)
                 try:
                     written = list(stage.run(self, params) or [])
                     # The redo mark is a finished result's only: a release takes a stamp
@@ -289,6 +291,11 @@ class Pipeline:
                     stamp |= {"status": "ok", "finished": rec.now(), "outputs": written,
                               "output_digest": digest_files(self.directory, written),
                               "redo_mark": self._started[name]}
+                    # What the run said it read, where that is not what the job read as it
+                    # began (`ran_on`): the stamp describes the result, so one made of answers
+                    # changed and changed back while it ran is stale, not done.
+                    ran = self._ran_on.get(name) or {}
+                    stamp["inputs"] = inputs | {"needs": inputs["needs"] | ran}
                     self.record.log("job-finished", stage=name, outputs=written)
                 except Superseded:
                     raise
@@ -306,9 +313,18 @@ class Pipeline:
                 return {"stage": name, "status": "superseded", "error": str(why)}
             finally:
                 self._started.pop(name, None)
+                self._ran_on.pop(name, None)
         finally:
             self._release_lock(handle)
         return stamp
+
+    def ran_on(self, name, need, digest):
+        """Said by stage `name`'s run, while it runs: it read need `need` as `digest` (what
+        `output_digest(need)` gives for what it read). The job's stamp takes it for that need
+        in place of the digest read as the job began: something it rests on can change after
+        the job read its inputs and before the run reads it, and change back by the time the
+        run ends, and then only the run knows what its result was made of."""
+        self._ran_on.setdefault(name, {})[need] = digest
 
     def _unstarted_failure(self, name, error, settings_read=True):
         """The stamp of a job that failed before its stage began: what it needs, or the
