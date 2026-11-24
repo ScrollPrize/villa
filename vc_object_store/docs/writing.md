@@ -3,7 +3,7 @@
 New content enters a store three ways: objects and geometry created directly
 in code, native files ([ingestion](ingestion.md)), and files attached to an
 object version ([artifacts](#artifacts)). All of it publishes through the same
-checked transaction model: a write names the numbered versions it read, and a
+checked transaction model: a write names the complete references it read, and a
 stale expectation conflicts without writing anything. Exports and project
 records are covered here too. Changing existing geometry is
 [editing](editing.md).
@@ -11,7 +11,9 @@ records are covered here too. Changing existing geometry is
 ## Checked transactions
 
 ```python
-observed = {u: store.current_version(u) for u in (a, b)}
+from vc_object_store import object_reference
+
+observed = {u: object_reference(store.object(u)) for u in (a, b)}
 with store.write(expected_versions=observed) as tx:
     tx.set_meta(a, "review_note", "checked")
     tx.set_meta(edge, "confidence", 0.9)
@@ -22,9 +24,9 @@ print(tx.receipt["commit_sequence"], tx.receipt["objects"])
 
 | Argument | Meaning |
 | --- | --- |
-| `expected_versions` | `{uuid: version}` for every object changed; `None` expects absence (creation — preselect the UUID) |
+| `expected_versions` | `{uuid: complete_reference}` for every object changed; `None` expects no live record (creation — preselect the UUID) |
 | `expected_relationships` | Same, for relationships |
-| `read_dependencies` | Versions of records read but not changed; checked, never versioned |
+| `read_dependencies` | Complete references of records read but not changed; checked, never versioned |
 | `expected_commit_sequence` | Guards a query's complete membership/absence; any intervening commit conflicts |
 | `request_uuid`, `author` | Retry identity and attribution (see [typed requests](#typed-requests-submit)) |
 
@@ -41,6 +43,16 @@ Plain `store.write()` with no expectations serializes read/modify/write under
 the writer lock, but cannot protect a read made before it. Standalone Python
 mutations (`store.set_meta`, `store.put_geometry`, ...) each commit their own
 transaction.
+
+For a loaded object in a collection, use `expectObject(request, selected.reference())`: it carries the complete store/lineage/object/version identity and checks it under the writer lock. Equal numeric versions from different owners are not interchangeable. `expectRead(request, reference)` guards a read without requesting a write; `expectRelationship(request, relationship.reference())` guards the selected relationship identity. All three use one `RecordSelection` representation, including preparations and fetch callbacks. `expectObject(request, selectedRevision)` also distinguishes an exact deleted version from the weaker `nullopt` expectation of no live record. `currentObjectExpectation(reader, uuid)` selects that winning state without a history fallback; `reader.currentObject(uuid, true)` explicitly includes tombstones while ordinary current reads hide them.
+
+Command encoding 3 carries full references directly in `expected_objects`, `expected_relationships` and `read_dependencies`. An exact tombstone is `{reference: <shared reference>, deleted: true}`; a null value means no live record. Object references use `{store,generation,object,version}`; relationship references use `{store,generation,relationship,version}`. There is no automatic format selection or parallel numeric/reference map.
+
+Python checked writes accept full reference dictionaries as values of `expected_versions`, `expected_relationships` and `read_dependencies`, or null for no live record. Numeric guards are not a second request format. Explicit manual numeric selection uses `store.select_expected_versions(numbers, relationships=False)` (C++ `selectCurrentExpectations` or `writeNumbered`): it checks the live counters in one snapshot and immediately returns full references. Already selected consumers must retain their original references instead. For artifact writes, `session.publish_artifacts(attachment, reference, files, author="")` retains the selected source identity across upload and submission. Native editors additionally retain loaded coordinate-mapping/write-lineage guards through `PinnedObject`.
+
+Serialized transaction commands use format 3 only, with the same complete references in every guard map. Formats 1 and 2, numeric-only guards and the former separate reference map are rejected. An old unresolved durable request might already have committed: reconcile its outcome before explicitly regenerating it; never silently upgrade or resubmit it under the same request UUID. Incomplete saved application pins/manifests likewise require regeneration, not inferred ownership. This does not change the database schema or the explicit upstream store-conversion workflow.
+
+Editable `AttachedCollection` values carry both the loaded reference and the coordinate mapping used to display their points. Preserve both through UI edits. `writeVolumeCollections` checks both before applying inverse coordinate edits; reloading is required if either the object or its registration changed. Unrelated store commits do not invalidate the mapping.
 
 ## Creating objects and geometry
 
@@ -144,8 +156,8 @@ const auto receipt = store.submit(r); // receipt.objects[objectUuid] == 4
   dict or text with payloads keyed by SHA-256. Missing payloads raise/return
   their hashes: stage them and resubmit the identical request.
 - Helpers fill in the expectations an edit depends on:
-  `expectRelationshipEndpoints` (far ends of an edited object's
-  relationships), `editCurrentRequest` / session `editCurrent` (edit existing
+  `expectRelationshipEndpoints(reader, request)` (complete owner/lineage/version
+  guards for far ends of an edited object's relationships), `editCurrentRequest` / session `editCurrent` (edit existing
   objects at current versions, relationships kept as recorded),
   `bindCoordinatesOperation`, `volumeTransformRecord`,
   `volumeTransformChoiceRecord`, `attachmentEdge`, `createSurfaceOperations`.
@@ -218,7 +230,7 @@ manifest = vos.artifact_manifest_json(
 The shared commit path refuses a changed manifest that is malformed or names
 bytes the store does not hold, whichever API wrote it. Through a session the
 same works on any attachment: `artifacts(attachment, object, version)`,
-`publish_artifacts(attachment, object, expected_version, {name: path}, author)`
+`publish_artifacts(attachment, reference, {name: path}, author)`
 (bytes stored durably, then named in one checked request),
 `materialize_artifacts` (write a version's files under a local directory,
 each atomic and verified), and `artifact_file` (one artifact as a cached local
@@ -226,6 +238,12 @@ file). CLI tools publish through `ToolObjects::publishArtifacts`, expecting
 the version they read. Hosted clients get `putArtifact` / `fetchArtifact`
 (verified, atomic). The older mutable per-object artifact directories are no
 longer read or written, and their contents are not migrated.
+
+All three session artifact readers accept `reference={store, generation, object, version}` (C++: the optional `ObjectVersion` argument). This selects the exact manifest through the shared version resolver, including a retained referenced version after an overlay edit or deletion. It cannot be combined with `version`/`generation` and must name the requested object. The older number-only selectors use the current owner's history; they do not identify a different source owner. Geometry and model-checkpoint consumers must carry the same complete reference to both reads.
+
+## Derived geometry versus copying a store
+
+Python writers of newly computed geometry can use `vc_object_store.derivation.derived_metadata(metadata, policy=..., reference=...)`. The default `portable` policy preserves application metadata but rejects managed `vcobj_extensions` and `artifacts` descriptors: JSON alone cannot copy their payloads. Explicit `geometry_only` removes those managed descriptors and records the policy and complete selected source reference in `meta.derivation`. It does not copy relationships or history. Use the shared collection-copy API when those data must be preserved. This policy is shared by the neural fiber writer/snapping workflow; callers must not independently strip or reinterpret managed descriptors.
 
 ## Projects
 
@@ -246,12 +264,11 @@ with ObjectStore.open("project.vcobj", author="reviewer") as store:
 
 Resource kinds are `volume`, `normal_grid`, and `lasagna_dataset`; a resource
 is shared, or one `owner`'s alone (`project_resources(kind, viewer=...)`).
-`vos.project_resource_uuid(kind, location, owner="")` is the deterministic
-identity `add_project_resource` returns.
+`vos.project_resource_uuid(kind, location, owner="")` is the deterministic identity for a new resource. Updating a matching legacy resource keeps its original UUID; use the UUID returned by `add_project_resource` or by the resource listing.
 
 Documents attached to objects (point-collection documents such as growth
 corrections) go through `documents.attach_document(location, ...)` /
 `attached_document` / `point_collections` — one checked request each, on a
 file or endpoint alike; their edges are `attachment` edges, not graph links
 (see [graph edges](graph-edges.md#attachments-are-not-graph-links)).
-`copyProject` copies the artifact directory with the database.
+`copyProject` uses the shared [collection copy](collections.md#independent-import-shards) API: the mutable root, referenced/sharded databases and artifact payloads are copied as one portable bundle, not just the attached physical file.

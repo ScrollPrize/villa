@@ -1,4 +1,5 @@
 #include "SpiralUpdatedDrafts.hpp"
+#include <vc_object_store/objects/Transactions.hpp>
 
 #include <QtTest/QtTest>
 
@@ -14,6 +15,16 @@ class SpiralUpdatedDraftsTest : public QObject
                                         {QStringLiteral("resaved"), 1}, {QStringLiteral("edited"), 1}};
 
 private slots:
+    void equalCountersFromAnotherOwnerDoNotConsumeDrafts()
+    {
+        const vc::objects::ObjectVersion selected{"base-a", "lineage", "object", 7};
+        auto replacement = selected;
+        replacement.storeUuid = "base-b";
+        const QHash<QString, vc::objects::ObjectVersion> refs{{"draft", selected}};
+        const auto ids = vc3d::spiralDraftsIncludedByUpdate({}, 8, refs,
+            [&](const QString&) { return replacement; }, [](const QString&) { return true; });
+        QVERIFY(ids.isEmpty());
+    }
     void aPositionedUpdateIncludesTheDraftsSavedBeforeIt()
     {
         auto ids = vc3d::spiralDraftsIncludedByUpdate({}, 7, saved, version, unchanged);

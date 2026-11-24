@@ -58,8 +58,14 @@ def test_mixed_pcl_scales_selection_anchors_and_sentinels(db):
         assert edge["meta"]["point_collection_surface"]["ij"] == [10, 10]
         assert edge["meta"]["settings"]["point_scale"] == 1 / scale
         assert edge["meta"]["coordinate_frame"]["objects"][uid] == {"coordinates": frame(scale)}
+    linked = {uid: db.object(uid) for uid in before}
+    for uid, previous in before.items():
+        current = linked[uid]
+        assert current["version"] == previous["version"] + bool(db.edges_of(uid))
+        assert {**current, "version": previous["version"],
+                "commit_sequence": previous["commit_sequence"]} == previous
     assert db.link_point_collections_to_surfaces(volume_uuid=VOLUME)["edges_skipped_existing"] == 2
-    assert {uid: db.object(uid) for uid in before} == before
+    assert {uid: db.object(uid) for uid in before} == linked
     # The hole at grid (0,0) remains invalid after scaling (it must not become -0.5).
     hole = collection(db, points=((-0.5, -0.5, -0.5),))
     assert db.link_point_collections_to_surfaces(volume_uuid=VOLUME, collection_uuids=[hole],

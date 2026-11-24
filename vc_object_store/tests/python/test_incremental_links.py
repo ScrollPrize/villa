@@ -155,4 +155,3 @@ def test_progress_reaches_python_and_its_errors_do_not_stop_a_detector(db):
         raise RuntimeError("progress display failed")
     # Reported as unraisable (a warning under pytest); the detector finishes.
     assert db.link_surface_overlaps(progress=broken)["edges_skipped_existing"] == 1
-

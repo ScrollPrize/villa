@@ -12,6 +12,7 @@
 #include <limits>
 #include <future>
 #include <thread>
+#include <tuple>
 #include <functional>
 #include <map>
 #include <set>
@@ -968,9 +969,9 @@ private:
     const LoadedSurface& surface(const OverlapEdgeView& edge, const std::string& uuid,
                                  const std::optional<std::string>& revision)
     {
-        const auto key = uuid + "@" + revision.value_or("");
-        if (const auto found = surfaces_.find(key); found != surfaces_.end()) return found->second;
         const auto object = edge.object(uuid);
+        const auto key = std::pair{object.reference(), revision};
+        if (const auto found = surfaces_.find(key); found != surfaces_.end()) return found->second;
         double scale;
         try {
             scale = objects::geometryScaleToFrame(nlohmann::json::parse(object.meta), params_.volumeUuid);
@@ -995,7 +996,7 @@ private:
     detail::GeometryLoader load_;
     const OverlapCorrespondenceParams& params_;
     SurfaceOverlapParams loading_;
-    std::map<std::string, LoadedSurface> surfaces_;
+    std::map<std::pair<objects::ObjectVersion,std::optional<std::string>>, LoadedSurface> surfaces_;
 };
 
 template <typename Edge>
@@ -1042,23 +1043,23 @@ std::vector<OverlapCorrespondences> materializeOverlapCorrespondences(objects::O
 
 namespace {
 std::vector<OverlapCorrespondences> materializePinned(OverlapMaterializer& materializer,
-    const std::vector<OverlapEdgeAt>& edges)
+    const objects::StoreReader& reader, const std::vector<OverlapEdgeAt>& edges)
 {
     return materializeEach<OverlapEdgeAt>(materializer, edges, [](const OverlapEdgeAt& edge) { return edge.uuid; },
-        [](const OverlapEdgeAt& edge) {
+        [&reader](const OverlapEdgeAt& edge) {
+            const auto selected = reader.objectsAtVersions({edge.a, edge.b});
+            if (!selected[0] || !selected[1] || selected[0]->deleted || selected[1]->deleted ||
+                !selected[0]->geometryRevision || !selected[1]->geometryRevision)
+                throw std::runtime_error("overlap endpoint version is unavailable");
             OverlapEdgeView view;
-            view.uuid = edge.uuid; view.aUuid = edge.aUuid; view.bUuid = edge.bUuid;
+            view.uuid = edge.uuid; view.aUuid = selected[0]->objectUuid; view.bUuid = selected[1]->objectUuid;
             view.wholeGeometry = edge.wholeGeometry;
             view.meta = edge.meta;
-            view.object = [&edge](const std::string& uuid) {
-                objects::ObjectRecord record;
-                record.uuid = uuid;
-                record.kind = "surface";
-                record.meta = uuid == edge.aUuid ? edge.aObjectMeta : edge.bObjectMeta;
-                return record;
+            view.object = [a = selected[0]->record, b = selected[1]->record](const std::string& uuid) {
+                return uuid == a.uuid ? a : b;
             };
-            view.aGeometryRevision = edge.aGeometryRevision;
-            view.bGeometryRevision = edge.bGeometryRevision;
+            view.aGeometryRevision = selected[0]->geometryRevision;
+            view.bGeometryRevision = selected[1]->geometryRevision;
             return view;
         });
 }
@@ -1072,7 +1073,7 @@ std::vector<OverlapCorrespondences> materializeOverlapCorrespondences(objects::O
         [&inputs](const objects::ObjectRecord& object, const std::optional<std::string>& revision) {
             return inputs.load(object, revision);
         }, params);
-    return materializePinned(materializer, edges);
+    return materializePinned(materializer, objects::LocalStoreReader(db, inputs.txn()), edges);
 }
 
 std::vector<OverlapCorrespondences> materializeOverlapCorrespondences(const objects::StoreReader& reader,
@@ -1082,7 +1083,7 @@ std::vector<OverlapCorrespondences> materializeOverlapCorrespondences(const obje
         [&reader](const objects::ObjectRecord& object, const std::optional<std::string>& revision) {
             return detail::loadGeometrySnapshot(reader, object, revision);
         }, params);
-    return materializePinned(materializer, edges);
+    return materializePinned(materializer, reader, edges);
 }
 
 }  // namespace vc::object_links

@@ -45,7 +45,7 @@ public:
     // The numbered version of every object selected so far: what a checked
     // write publishing links over them expects (every endpoint of a published
     // relationship must be expected).
-    objects::VersionSelection expectations() const;
+    objects::RecordSelection expectations() const;
     // Stored (conservative) bounds of an object's current geometry in working
     // voxels: the params' volume, else source XYZ * explicitScale. nullopt
     // when the store records none.
@@ -56,11 +56,12 @@ public:
     std::set<std::string> objectsNear(const std::string& kind, const Box& box, double margin,
                                       const CoordinateParams& params, double explicitScale = 1.0);
     const objects::ReadTxn& txn() const;
+    // Source identity through the same pinned store snapshot as geometry.
+    std::filesystem::path sourcePath(const objects::ObjectRecord& object) const;
 private:
     objects::ObjectStore& db_;
     std::optional<objects::ReadTxn> read_;
-    std::map<std::string, int64_t> generations_;
-    std::map<std::string, int64_t> versions_;
+    objects::RecordSelection versions_;
     std::map<std::string, std::string> revisions_;
 };
 
@@ -86,14 +87,36 @@ std::optional<std::set<std::string>> newAmong(const std::optional<std::vector<st
 // edges stay). Nothing is removed when no new object survived.
 StaleEdgeScope incrementalScope(const std::string& edgeKind, const std::vector<std::string>& selected,
     const std::set<std::string>& fresh, const std::set<std::string>& failed);
+// Marks the write transaction failed when the scope is left by an exception:
+// the transaction's commit then throws and rolls everything back, so a
+// caller that catches the error cannot commit what was written before it.
+class FailTransactionOnError {
+public:
+    explicit FailTransactionOnError(objects::WriteTxn& txn);
+    FailTransactionOnError(const FailTransactionOnError&) = delete;
+    FailTransactionOnError& operator=(const FailTransactionOnError&) = delete;
+    ~FailTransactionOnError();
+
+private:
+    void* db_; // the transaction's sqlite3 connection
+    int exceptions_;
+};
 DetectorReport commitStoredCandidates(objects::ObjectStore& db, const StoredGeometry& inputs,
     objects::WriteTxn& txn, const std::string& detectorName, int detectorVersion,
     const std::vector<LinkCandidate>& candidates, bool replaceStalePending,
-    const StaleEdgeScope* staleScope, const objects::util::ProgressCallback& progress);
+    const StaleEdgeScope* staleScope, const objects::util::ProgressCallback& progress,
+    bool transactionRollsBack = false);
 // Commit a detection in the caller's write transaction (commitStoredCandidates
 // with its scope); the counts join detection.report, which is returned.
+// transactionRollsBack: the caller ensures that txn is rolled back as a whole
+// when this throws (it owns txn, or holds a FailTransactionOnError), so the
+// commit takes no savepoint of its own. Writing the candidates also marks txn
+// failed when it throws; the input validation before it does not. Stored
+// results of a successful run are the same either way; the savepoint makes
+// large commits quadratic (see commitCandidatesImpl).
 DetectorReport commitDetection(objects::ObjectStore& db, const StoredGeometry& inputs, objects::WriteTxn& txn,
-    const Detection& detection, const objects::util::ProgressCallback& progress);
+    const Detection& detection, const objects::util::ProgressCallback& progress,
+    bool transactionRollsBack = false);
 // Commit a detection in a write transaction of its own, the way the
 // standalone detectors publish: nothing when it is not to be published.
 DetectorReport publishDetection(objects::ObjectStore& db, const StoredGeometry& inputs, const Detection& detection,

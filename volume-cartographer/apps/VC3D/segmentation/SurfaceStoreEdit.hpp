@@ -5,6 +5,7 @@
 #include <vc_object_store/objects/GeometryCoordinates.hpp>
 #include <vc_object_store/store/GeometryViews.hpp>
 #include <vc_object_store/objects/ObjectStoreSession.hpp>
+#include <vc_object_store/objects/AttachedDocument.hpp>
 #include <opencv2/core/types.hpp>
 #include <memory>
 #include <mutex>
@@ -32,14 +33,24 @@ public:
     // not change since. When a hosted store does not answer, the save stays
     // pending and the next save first resolves it (its receipt, or the
     // identical request again), so saves never skip one another.
+    // With `geometryRevision` (the geometry `surface` was derived from), the
+    // save is refused unless this edit is still at that geometry, also when a
+    // previous save committed or was resolved meanwhile.
     void save(QuadSurface& surface, const cv::Rect& rect, const std::vector<std::string>& channels = {},
-              std::optional<uint64_t> draftRevision = std::nullopt);
+              std::optional<uint64_t> draftRevision = std::nullopt,
+              const std::optional<std::string>& geometryRevision = std::nullopt);
 
     vc::objects::PinnedObject pin() const;
     // The pin the edit started from (the opened surface's).
     const vc::objects::PinnedObject& origin() const { return _origin; }
     const std::string& uuid() const { return _uuid; }
     const std::optional<vc::objects::ViewFrame>& view() const { return _view; }
+    // One editor owns both the surface and its loaded attached collections.
+    // All its writes share the loaded membership guard and repin together.
+    void watchAttachedCollections(const vc::objects::AttachedCollectionsSnapshot&);
+    void saveAttachedCollections(vc::objects::AttachedCollectionsSnapshot&,
+        const std::vector<vc::objects::AttachedCollection>&, const nlohmann::json& coordinates);
+    vc::objects::TransactionReceipt submitAttached(vc::objects::TransactionRequest);
 
 private:
     std::shared_ptr<vc::objects::ObjectStoreSession> _session;
@@ -51,4 +62,6 @@ private:
     void settlePending();
     void repin(const vc::objects::TransactionReceipt&);
     const std::optional<vc::objects::ViewFrame> _view;
+    std::optional<vc::objects::AttachedCollectionsSnapshot> _collections;
+    void guardAttached(vc::objects::TransactionRequest&) const;
 };

@@ -4,6 +4,7 @@
 
 #include <vc_object_store/objects/GeometryCoordinates.hpp>
 #include <vc_object_store/objects/StoreReader.hpp>
+#include <vc_object_store/Uuid.hpp>
 
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -78,22 +79,13 @@ StoredFit readStoredFit(const std::shared_ptr<vc::objects::ObjectStoreSession>& 
                         const vc::objects::AttachmentIdentity& attachment, const std::string& uuid,
                         const std::optional<std::string>& geometryRevision)
 {
-    auto present = [&]() {
-        bool found = false;
-        session->readStore(attachment, [&](const vc::objects::StoreReader& reader, const auto&) {
-            const auto current = reader.currentObject(uuid);
-            found = current && !current->deleted;
-        });
-        return found;
-    };
-    if (!present()) throw std::runtime_error("The committed fit " + uuid + " is not in the attached object store");
-    session->ensureGeometry(attachment, uuid);
-
+    if(!geometryRevision)session->ensureGeometry(attachment,uuid);
     StoredFit fit;
     Json meta;
     session->readStore(attachment, [&](const vc::objects::StoreReader& reader, const auto&) {
-        const auto current = reader.currentObject(uuid);
-        if (!current || current->deleted || !committedFit(current->record))
+        const auto current = geometryRevision?reader.objectAtGeometry(*geometryRevision):reader.currentObject(uuid);
+        if (!current || current->deleted) throw std::runtime_error("The committed fit " + uuid + " is not in the attached object store");
+        if (current->objectUuid!=vc::objects::util::canonicalUuid(uuid) || !committedFit(current->record))
             throw std::runtime_error(uuid + " is not a committed Spiral fit (a surface tagged spiral-fit)");
         const auto& record = current->record;
         meta = Json::parse(record.meta);
@@ -104,12 +96,8 @@ StoredFit readStoredFit(const std::shared_ptr<vc::objects::ObjectStoreSession>& 
         // Committed in its fit volume's own voxels: read as stored.
         if (fit.volume.empty() || vc::objects::geometryScaleToVolume(meta, fit.volume) != 1.0)
             throw std::runtime_error("The committed fit is not bound to its fit volume at scale 1");
-        const auto revision = geometryRevision ? reader.geometryRevision(*geometryRevision)
-                                               : reader.currentGeometry(uuid);
-        if (!revision || revision->objectUuid != fit.uuid)
-            throw std::runtime_error("The committed fit has no such geometry revision");
-        fit.geometryRevision = revision->uuid;
-        fit.surface = std::shared_ptr<QuadSurface>(load_quad_from_store(reader, uuid, revision->uuid));
+        fit.surface = std::shared_ptr<QuadSurface>(load_quad_from_store(reader, *current));
+        fit.geometryRevision = *current->geometryRevision;
     });
     fit.surface->setChannelLoader(store_channel_loader(session, attachment, fit.geometryRevision));
 

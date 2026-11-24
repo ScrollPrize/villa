@@ -1,6 +1,7 @@
 #include <vc_object_store/objects/StoreReader.hpp>
 #include <vc_object_store/objects/TransactionJson.hpp>
 #include <vc_object_store/objects/VolumeTransforms.hpp>
+#include <vc_object_store/objects/ObjectCollection.hpp>
 #include <utility>
 // The VC3D surface catalog over a real object store: rows of the current
 // volume's surfaces kept current from commit events, opening a surface in the
@@ -15,6 +16,7 @@
 #include <vc_object_store/server/Server.hpp>
 #endif
 #include "vc/core/PointCollections.hpp"
+#include "vc/core/StoredCollection.hpp"
 #include <vc_object_store/geometry/Geometry.hpp>
 #include <vc_object_store/store/GeometryViews.hpp>
 #include <vc_object_store/objects/GeometryCoordinates.hpp>
@@ -55,6 +57,236 @@ void storeSurface(ObjectStoreSession& session, const AttachmentIdentity& attachm
     session.submit(attachment, request);
 }
 
+void checkSelectedRegionInput(const fs::path& directory)
+{
+    const auto path = directory / "selected-region.vcobj";
+    OpenOptions open; open.author = "selected-region-test";
+    { auto store = ObjectStore::create(path, open); }
+    auto session = std::make_shared<ObjectStoreSession>();
+    const auto attachment = session->attach(path, open);
+    const auto grid = [](float z) {
+        return vc::geometry::Surface{2, 2, {1, 1}, {{0,0,z}, {2,0,z}, {0,2,z}, {2,2,z}}};
+    };
+    ObjectRecord a; a.uuid = util::newUuid(); a.kind = "surface";
+    a.meta = nlohmann::json{{"coordinates", volumeCoordinates("vol", 1)}}.dump();
+    ObjectRecord b = a; b.uuid = util::newUuid();
+    storeSurface(*session, attachment, a, vc::geometry::encode(grid(1)));
+    storeSurface(*session, attachment, b, vc::geometry::encode(grid(2)));
+    session->setDraft(a.uuid, grid(4), volumeCoordinates("vol", 1));
+    session->setDraft(b.uuid, grid(6), volumeCoordinates("vol", 1));
+    RegionSlice slice;
+    slice.origin = {0, 1, 0}; slice.u = {1, 0, 0}; slice.v = {0, 0, 1}; slice.normal = {0, 1, 0};
+    slice.localBounds = {-1, -1, -1, 3, 10, 1};
+    RegionOptions options; options.uuids = {a.uuid, b.uuid};
+    SurfaceCatalog::RegionInput input{session, {attachment}, {"vol", 1}, options,
+        {{a.uuid, std::make_shared<ResidentSurface>(grid(8))}}};
+    const auto zFor = [](const auto& result, const auto& uuid, double z) {
+        return std::any_of(result.runs.begin(), result.runs.end(), [&](const auto& run) {
+            return run.objectUuid == uuid && !run.points.empty() && std::abs(run.points.front()[2] - z) < 1e-5;
+        });
+    };
+    auto result = input.region(slice);
+    require(result.complete && result.runs.size() == 2 && zFor(result, a.uuid, 8) && zFor(result, b.uuid, 6),
+            "one query preserves displayed geometry over drafts, and drafts over stored heads");
+    session->clearDraft(b.uuid);
+    result = input.region(slice);
+    require(result.runs.size() == 2 && zFor(result, b.uuid, 2), "the same input queries stored geometry without a draft");
+    input.options.uuids = {a.uuid};
+    result = input.region(slice);
+    require(result.runs.size() == 1 && zFor(result, a.uuid, 8), "resident-only input never queries all stored surfaces");
+    auto changed = input;
+    changed.displayed[a.uuid] = std::make_shared<ResidentSurface>(grid(9));
+    require(zFor(changed.region(slice), a.uuid, 9) && zFor(input.region(slice), a.uuid, 8),
+            "same-UUID selection changes do not mutate an in-flight input's displayed geometry");
+    result = input.region(slice, [] { return true; });
+    require(!result.complete && result.runs.empty(), "cancelled selected queries cannot install geometry");
+    input.displayed.clear(); input.options.uuids = std::vector<std::string>{};
+    require(input.region(slice).runs.empty(), "an empty selection stays empty");
+}
+
+void checkCorrectionSnapshots(const fs::path& directory)
+{
+    SurfaceCatalog::Crossings crossings;
+    crossings.requireComplete();
+    auto rejectsIncomplete = [&] {
+        bool rejected = false;
+        try { crossings.requireComplete(); } catch (const std::runtime_error&) { rejected = true; }
+        require(rejected, "partial/remote surface queries cannot be used for persistent annotations");
+    };
+    crossings.complete = false;
+    rejectsIncomplete();
+    crossings.complete = true;
+    crossings.remote.emplace_back(AttachmentIdentity{}, util::newUuid());
+    rejectsIncomplete();
+    for (const bool history : {false, true}) for (const bool referenced : {false, true}) {
+        std::string phase = "loaded corrections";
+        try {
+        OpenOptions options; options.author = "correction-test"; options.history = history ? HistoryMode::On : HistoryMode::Off;
+        const auto path = directory / (std::string("corrections-") + std::to_string(history) + std::to_string(referenced) + ".vcobj");
+        { auto store = ObjectStore::create(path, options); }
+        ObjectStoreSession session;
+        auto attachment = session.attach(path, options);
+        ObjectRecord surface; surface.uuid = util::newUuid(); surface.kind = "surface";
+        surface.meta = nlohmann::json{{"coordinates", volumeCoordinates("volume", 1)}}.dump();
+        auto request = session.newRequest(attachment);
+        request.expectedObjects[surface.uuid] = std::nullopt;
+        request.operations.push_back(CreateObjectOp{objectRecordJson(surface)});
+        request.operations.push_back(PutGeometryOp{surface.uuid,
+            vc::geometry::encode(vc::geometry::Surface{2, 2, {1, 1}, {{0,0,1}, {1,0,1}, {0,1,1}, {1,1,1}}}), {}});
+        session.submit(attachment, request);
+        auto first = vc3d::corrections::read(session, attachment, surface.uuid);
+        std::map<uint64_t, nlohmann::json> data{{1, {{"uuid", util::newUuid()}, {"name", "fix"},
+            {"points", {{"7", {{"p", {1., 2., 3.}}}}}}}}};
+        vc3d::corrections::write(session, attachment, first, data, {"volume"});
+        if (referenced) {
+            session.detach(attachment);
+            { auto base = ObjectStore::open(path, options); auto txn = base.write(); base.seal(txn); txn.commit(); }
+            const auto overlay = fs::path(path.string() + ".overlay");
+            { auto collection = ObjectCollection::create(overlay, {path}, options); }
+            attachment = session.attach(overlay, options);
+        }
+        first = vc3d::corrections::read(session, attachment, surface.uuid);
+        const auto unchangedOwner = first.baseline.owner;
+        const auto unchangedCommit = first.baseline.snapshot.commitSequence;
+        vc3d::corrections::write(session, attachment, first, first.collections, {"volume"});
+        require(first.baseline.owner == unchangedOwner && first.baseline.snapshot.commitSequence == unchangedCommit,
+                "no-op correction save preserves ownership and the loaded commit baseline");
+        auto pending = first.collections;
+        pending.at(1)["points"]["7"]["p"] = {2., 3., 4.};
+        bool failedSave = false;
+        try { vc3d::corrections::write(session, attachment, first, pending, {"volume", 0}); }
+        catch (const std::exception&) { failedSave = true; }
+        require(failedSave && first.baseline.owner == unchangedOwner && first.collections != pending,
+                "failed correction persistence retains the loaded baseline for retry");
+        // Editing restart must save successfully before reloading this data.
+        vc3d::corrections::write(session, attachment, first, pending, {"volume"});
+        first = vc3d::corrections::read(session, attachment, surface.uuid);
+        require(first.collections == pending, "successful retry then reload preserves previously unsaved correction edits");
+        auto stale = vc3d::corrections::read(session, attachment, surface.uuid);
+        data.at(1)["points"]["7"]["p"] = {4., 5., 6.};
+        vc3d::corrections::write(session, attachment, first, data, {"volume"});
+        const auto staleOwner = stale.baseline.owner;
+        const auto staleCommit = stale.baseline.snapshot.commitSequence;
+        const auto savedCollections = vc3d::corrections::read(session, attachment, surface.uuid).collections;
+        vc3d::corrections::write(session, attachment, stale, stale.collections, {"volume"});
+        require(stale.baseline.owner == staleOwner && stale.baseline.snapshot.commitSequence == staleCommit &&
+                vc3d::corrections::read(session, attachment, surface.uuid).collections == savedCollections,
+                "unchanged stale UI requests no write and does not refresh its loaded baseline");
+        auto staleEdit = stale.collections;
+        staleEdit.at(1)["points"]["7"]["p"] = {7., 8., 9.};
+        bool rejected = false;
+        try { vc3d::corrections::write(session, attachment, stale, staleEdit, {"volume"}); }
+        catch (const TransactionConflict&) { rejected = true; }
+        require(rejected, "JSON correction editing retains the loaded object references");
+        stale = first;
+        data.emplace(2, nlohmann::json{{"uuid", util::newUuid()}, {"name", "new"}, {"points", nlohmann::json::object()}});
+        vc3d::corrections::write(session, attachment, first, data, {"volume"});
+        rejected = false;
+        try { vc3d::corrections::write(session, attachment, stale, {}, {"volume"}); }
+        catch (const TransactionConflict&) { rejected = true; }
+        const auto remaining = vc3d::corrections::read(session, attachment, surface.uuid).collections.size();
+        if (!rejected || remaining != 2)
+            throw std::runtime_error("stale correction membership guard: history=" + std::to_string(history) +
+                " referenced=" + std::to_string(referenced) + " rejected=" + std::to_string(rejected) + " remaining=" + std::to_string(remaining));
+        stale = first;
+        vc3d::corrections::write(session, attachment, first, {}, {"volume"});
+        staleEdit = stale.collections;
+        staleEdit.at(1)["points"]["7"]["p"] = {7., 8., 9.};
+        rejected = false;
+        try { vc3d::corrections::write(session, attachment, stale, staleEdit, {"volume"}); }
+        catch (const TransactionConflict&) { rejected = true; }
+        require(rejected, "a stale editor cannot resurrect removed corrections");
+        require(vc3d::corrections::read(session, attachment, surface.uuid).collections.empty(), "receipt baseline supports subsequent saves");
+
+        // The two editors and growth evidence share one loaded baseline: own
+        // writes advance it; an unrelated external write must not be hidden.
+        auto sharedSession = std::shared_ptr<ObjectStoreSession>(&session, [](auto*) {});
+        phase = "coordinated surface save";
+        const auto opened = SurfaceCatalog::open(sharedSession, attachment, {"volume", 1}, surface.uuid);
+        SurfaceStoreEdit editor(sharedSession, opened.pin, opened.view);
+        auto coordinated = vc3d::corrections::read(session, attachment, surface.uuid);
+        editor.watchAttachedCollections(coordinated.baseline);
+        (*opened.surface->rawPointsPtr())(0,0)[2] += 1;
+        editor.save(*opened.surface, {0,0,2,2});
+        data = {{1, {{"uuid", util::newUuid()}, {"name", "coordinated"},
+            {"points", {{"7", {{"p", {1., 2., 3.}}}}, {"8", {{"p", {4., 5., 6.}}}}}}}}};
+        vc3d::corrections::write(session, attachment, coordinated, data, {"volume"}, &editor);
+        require(editor.pin().reference() == coordinated.baseline.owner, "correction write repins the surface editor");
+        phase = "coordinated correction removal";
+        data.at(1)["points"].erase("8");
+        vc3d::corrections::write(session, attachment, coordinated, data, {"volume"}, &editor);
+        (*opened.surface->rawPointsPtr())(0,0)[2] += 1;
+        phase = "surface save after corrections";
+        editor.save(*opened.surface, {0,0,2,2});
+        phase = "coordinated growth evidence";
+        vc3d::corrections::GrowthAnnotation annotation; annotation.surfaceUuid = surface.uuid;
+        vc3d::corrections::writeGrowthAnnotation(session, attachment, annotation, {"volume"}, &editor);
+        data.at(1)["points"]["7"]["p"] = {2., 3., 4.};
+        vc3d::corrections::write(session, attachment, coordinated, data, {"volume"}, &editor);
+
+        const auto reloaded = vc3d::corrections::read(session, attachment, surface.uuid);
+        phase = "retained point append";
+        PointCollections reopened;
+        auto unanchored = reloaded.collections.at(1);
+        require(reopened.replaceUnanchoredCollections({unanchored}), "reopen point collection");
+        for (const auto& collection : reloaded.baseline.collections) reopened.reservePointIds(collection.nextPointId);
+        reopened.addPoint("coordinated", {7,8,9});
+        const auto& points = reopened.getAllCollections().begin()->second.points;
+        const auto newId = std::max_element(points.begin(), points.end(), [](const auto& a, const auto& b) { return a.first < b.first; })->first;
+        require(newId > 8, "reopening after deletion does not reuse a retained structural ID");
+        auto appended = reloaded;
+        auto appendData = reloaded.collections;
+        appendData.at(1)["points"][std::to_string(newId)] = {{"p", {7.,8.,9.}}};
+        vc3d::corrections::write(session, attachment, appended, appendData, {"volume"});
+        data.at(1)["points"]["7"]["p"] = {3., 4., 5.};
+        rejected = false;
+        try { vc3d::corrections::write(session, attachment, coordinated, data, {"volume"}, &editor); }
+        catch (const TransactionConflict&) { rejected = true; }
+        require(rejected, "coordinated editor never refreshes away another writer's edit");
+        if (history) {
+            phase = "historical evidence";
+            attachDocument(session, attachment, surface.uuid, {{"records", {{{"p", {1.,2.,3.}}, {"value", 1}}}}},
+                {"result", "records", "p"}, "results", volumeCoordinates("volume", 1));
+            auto evidence = attachedCollections(session, attachment, surface.uuid, "result");
+            const auto oldOwner = evidence.owner;
+            evidence.collections.front().annotations[0]["value"] = 2;
+            replaceAttachedCollections(session, attachment, evidence, evidence.collections, volumeCoordinates("volume", 1));
+            require(attachedDocument(session, attachment, oldOwner, "result")->at("records")[0]["value"] == 1,
+                    "historical owner resolves historical attached evidence");
+            const auto currentEvidence = attachedDocument(session, attachment, evidence.owner, "result");
+            const auto actual = attachedCollections(session, attachment, surface.uuid, "result");
+            if (!currentEvidence || currentEvidence->at("records")[0]["value"] != 2)
+                throw std::runtime_error("current owner resolves updated attached evidence (old owner v" + std::to_string(oldOwner.version) +
+                    ", new v" + std::to_string(evidence.owner.version) + ", actual=" + actual.collections.front().annotations.dump() +
+                    ", document=" + (currentEvidence ? currentEvidence->dump() : "missing") + ")");
+            require(attachedDocument(session, attachment, surface.uuid, "result") == currentEvidence,
+                    "UUID-only document reads keep their current-head semantics");
+        }
+        phase = "coordinate dialog baseline";
+        ObjectRecord prompt; prompt.uuid = util::newUuid(); prompt.kind = "surface";
+        auto creation = session.newRequest(attachment);
+        creation.expectedObjects[prompt.uuid] = std::nullopt;
+        creation.operations = {CreateObjectOp{objectRecordJson(prompt)}};
+        session.submit(attachment, creation);
+        const auto shown = *session.currentObject(attachment, prompt.uuid);
+        session.editCurrent(attachment, {prompt.uuid}, [](const StoreReader&, const std::string& uuid) {
+            return std::vector<TransactionOperation>{SetMetaOp{uuid, "coordinates", volumeCoordinates("volume", 2).dump()}};
+        });
+        auto binding = session.newRequest(attachment);
+        session.readStore(attachment, [&](const StoreReader& reader, const auto&) {
+            editCurrentRequest(reader, binding, {prompt.uuid}, {bindCoordinatesOperation(shown.record, "volume", 3)});
+        });
+        expectObject(binding, shown.reference());
+        rejected = false;
+        try { session.submit(attachment, binding); } catch (const TransactionConflict&) { rejected = true; }
+        require(rejected, "coordinate binding rejects a changed declaration after the dialog's selection");
+        } catch (const std::exception& error) {
+            throw std::runtime_error("history=" + std::to_string(history) + " referenced=" + std::to_string(referenced) +
+                " phase=" + phase + ": " + error.what());
+        }
+    }
+}
+
 void checkHistoryGenerationSaves(const fs::path& directory)
 {
     const auto path = directory / "generation.vcobj";
@@ -80,7 +312,7 @@ void checkHistoryGenerationSaves(const fs::path& directory)
     require(rejected, "surface opened before reset rejects edits");
 
     opened = SurfaceCatalog::open(session, attachment, {"vol", 1}, record.uuid);
-    require(opened.pin.generation != opened.pin.writeGeneration, "reopened surface retains its publication generation");
+    require(opened.pin.reference().generation != opened.pin.writeGeneration, "reopened surface retains its publication generation");
     SurfaceStoreEdit current(session, opened.pin);
     const auto publication = opened.pin.reference();
     // An explicit unchanged channel submits a no-op transaction and exercises repinning.
@@ -88,11 +320,11 @@ void checkHistoryGenerationSaves(const fs::path& directory)
     require(current.pin().reference() == publication, "no-op save preserves the historical reference");
     (*opened.surface->rawPointsPtr())(0, 0)[2] = 3;
     current.save(*opened.surface, {0, 0, 2, 2}, {});
-    require(current.pin().version == publication.version + 1 &&
-            current.pin().generation == current.pin().writeGeneration, "reopened surface saves in the active generation");
+    require(current.pin().reference().version == publication.version + 1 &&
+            current.pin().reference().generation == current.pin().writeGeneration, "reopened surface saves in the active generation");
     (*opened.surface->rawPointsPtr())(0, 0)[2] = 4;
     current.save(*opened.surface, {0, 0, 2, 2}, {});
-    require(current.pin().version == publication.version + 2, "subsequent surface saves use the new pin");
+    require(current.pin().reference().version == publication.version + 2, "subsequent surface saves use the new pin");
 
     StoreSurfaces tool(path, "generation-test");
     auto loaded = tool.load(record.uuid);
@@ -106,6 +338,121 @@ void checkHistoryGenerationSaves(const fs::path& directory)
     (*loaded->rawPointsPtr())(0, 0)[2] = 6;
     require(tool.update(record.uuid, *loaded) == publication.version + 3,
             "reloaded tool input saves in the active generation");
+}
+
+void checkToolMappingGuards(const fs::path& directory)
+{
+    for(const auto& points:{R"({"1":{"p":[1,2,3]},"01":{"p":[4,5,6]}})",R"({"1junk":{"p":[1,2,3]}})"}){
+        bool rejected=false;
+        try{vc::storedCollection({{"uuid",util::newUuid()},{"points",nlohmann::json::parse(points)}});}
+        catch(const std::exception&){rejected=true;}
+        require(rejected,"GUI collection adapter shares strict point-map decoding");
+    }
+    for (bool history : {false, true}) for (bool referenced : {false, true}) {
+        OpenOptions options; options.author = "tool-mapping"; options.history = history ? HistoryMode::On : HistoryMode::Off;
+        const auto base = directory / ("tool-mapping-" + std::to_string(history) + std::to_string(referenced) + ".vcobj");
+        ObjectRecord surface; surface.uuid = util::newUuid(); surface.kind = "surface";
+        surface.meta = nlohmann::json{{"coordinates", volumeCoordinates("source", 1)}}.dump();
+        {
+            auto source = ObjectStore::create(base, options);
+            auto transaction = source.write();
+            source.upsertObject(transaction, surface);
+            source.putGeometry(transaction, surface.uuid, vc::geometry::encode(vc::geometry::Surface{2, 2, {1, 1},
+                {{1,1,1},{2,1,1},{1,2,1},{2,2,1}}}));
+            if (referenced) source.seal(transaction);
+            transaction.commit();
+        }
+        auto path = base;
+        if (referenced) {
+            path = directory / (base.filename().string() + ".overlay");
+            auto overlay = ObjectCollection::create(path, {base}, options);
+        }
+        StoreSurfaces tool(path, "mapping-test");
+        const auto attachment = tool.objects().attachment();
+        const auto registration = registerVolumeTransform(*tool.objects().session(), attachment,
+            "source", "target", VolumeAffine::identity(), "identity");
+        auto loaded = tool.load(surface.uuid, true, VolumeVoxels{"target", 1});
+        std::optional<StoreStatus> before,after;
+        tool.objects().session()->readStore(attachment,[&](const StoreReader& reader,const auto&){before=reader.status();});
+        const auto unchanged=tool.update(surface.uuid,*loaded);
+        tool.objects().session()->readStore(attachment,[&](const StoreReader& reader,const auto&){after=reader.status();});
+        require(before->commitSequence==after->commitSequence,"checked no-op preserves commit sequence and ownership");
+        tool.objects().session()->editCurrent(attachment,{surface.uuid},[&](const auto&,const auto&){
+            return std::vector<TransactionOperation>{SetMetaOp{surface.uuid,"external","true"}};
+        });
+        bool staleRejected=false;
+        try{tool.update(surface.uuid,*loaded);}catch(const TransactionConflict&){staleRejected=true;}
+        require(staleRejected,"unchanged tool grid still validates its loaded object reference");
+        loaded=tool.load(surface.uuid,true,VolumeVoxels{"target",1});
+        require(tool.update(surface.uuid,*loaded)==unchanged+1,"reloaded no-op returns the selected version");
+        (*loaded->rawPointsPtr())(0,0)[2] += 1;
+        tool.update(surface.uuid, *loaded);
+        loaded = tool.load(surface.uuid, true, VolumeVoxels{"target", 1});
+        VolumeAffine moved; moved(0,3) = 10;
+        tool.objects().session()->editCurrent(attachment, {registration}, [&](const StoreReader& reader, const std::string& uuid) {
+            return std::vector<TransactionOperation>{UpdateObjectOp{objectRecordJson(
+                volumeTransformRecord(reader.currentObject(uuid)->record, "source", "target", moved, "moved"))}};
+        });
+        bool rejected = false;
+        try { tool.update(surface.uuid, *loaded); } catch (const TransactionConflict&) { rejected = true; }
+        require(rejected, "tool edits check the mapping actually used to load the grid");
+        rejected = false;
+        try { tool.objects().publishArtifacts(surface.uuid, {}); } catch (const TransactionConflict&) { rejected = true; }
+        require(rejected, "artifact results retain the same loaded mapping guard as geometry edits");
+        loaded = tool.load(surface.uuid, true, VolumeVoxels{"target", 1});
+        tool.objects().publishArtifacts(surface.uuid, {});
+        auto stored = tool.load(surface.uuid);
+        require((*stored->rawPointsPtr())(0,0)[2] == 2, "mapping conflict leaves surface geometry unchanged");
+    }
+}
+
+void checkReferencedSurfaceSelections(const fs::path& directory)
+{
+    OpenOptions options; options.author = "surface-reference-test"; options.history = HistoryMode::Off;
+    const auto base = directory / "surface-base.vcobj", overlay = directory / "surface-overlay.vcobj";
+    ObjectVersion original, other;
+    {
+        auto store = ObjectStore::create(base, options);
+        auto txn = store.write();
+        for (auto* ref : {&original, &other}) {
+            ObjectRecord record; record.kind = "surface"; record.name = "original";
+            record.meta = R"({"coordinates":{"volume_uuid":"vol","scale_factor":1}})";
+            const auto uuid = store.upsertObject(txn, record);
+            vc::geometry::Surface grid{1, 1, {1, 1}, {{2, 4, 6}}};
+            store.putGeometry(txn, uuid, vc::geometry::encode(grid));
+            ref->objectUuid = uuid;
+        }
+        txn.commit();
+        { auto read = store.read(); for (auto* ref : {&original, &other}) *ref = store.currentObjectRevision(read, ref->objectUuid)->reference(); }
+        auto seal = store.write(); store.seal(seal); seal.commit();
+    }
+    { auto collection = ObjectCollection::create(overlay, {base}, options); }
+    auto session = std::make_shared<ObjectStoreSession>();
+    const auto attachment = session->attach(overlay, options);
+    VolumeAffine shifted;
+    shifted(0,3)=-3; shifted(2,3)=-7;
+    registerVolumeTransform(*session,attachment,"vol","negative",shifted,"negative target coordinates");
+    const auto translated = SurfaceCatalog::open(session,attachment,{"negative",1},original.objectUuid,original);
+    require((*translated.surface->rawPointsPtr())(0,0)==cv::Vec3f(-1,4,-1) &&
+            translated.surface->validMask()(0,0),
+            "native materialization preserves valid negative target coordinates");
+    const auto open = [&](const ObjectVersion& ref) { return SurfaceCatalog::open(session, attachment, {"vol", 1}, original.objectUuid, ref); };
+    require(open(original).editable, "exact current inherited surface remains editable");
+    bool rejected = false;
+    try { open(other); } catch (const std::exception&) { rejected = true; }
+    require(rejected, "same-number reference for a different object is rejected");
+    auto wrongOwner = original; wrongOwner.storeUuid = util::newUuid(); rejected = false;
+    try { open(wrongOwner); } catch (const std::exception&) { rejected = true; }
+    require(rejected, "same-number reference for a different owner is rejected");
+    {
+        auto store = ObjectStore::open(overlay, options); auto txn = store.write();
+        store.setMeta(txn, original.objectUuid, "coordinates", R"({"volume_uuid":"vol","scale_factor":2})"); txn.commit();
+        auto deletion = store.write(); store.deleteObject(deletion, original.objectUuid); deletion.commit();
+    }
+    const auto past = open(original);
+    require(!past.current && !past.editable && past.pin.reference() == original &&
+            (*past.surface->rawPointsPtr())(0, 0) == cv::Vec3f(2, 4, 6),
+            "deleted overlays retain exact source geometry and metadata as a read-only view");
 }
 
 // Optional real-data check: copy one stored surface, checkpoint a mask edit,
@@ -175,6 +522,10 @@ int main(int argc, char** argv)
     try {
         QTemporaryDir dir;
         checkHistoryGenerationSaves(fs::path(dir.path().toStdString()));
+        checkReferencedSurfaceSelections(fs::path(dir.path().toStdString()));
+        checkCorrectionSnapshots(fs::path(dir.path().toStdString()));
+        checkToolMappingGuards(fs::path(dir.path().toStdString()));
+        checkSelectedRegionInput(fs::path(dir.path().toStdString()));
         if (argc > 1) checkDraftRecovery(argv[1], fs::path(dir.path().toStdString()));
         const std::filesystem::path volumeRoot1 = fs::path(dir.path().toStdString()) / "ct.zarr";
         const vcr::zarr::CreateOptions levelZero1{.shape = {4, 4, 4}, .chunks = {4, 4, 4}, .compressor = "", .overwrite = true};
@@ -261,7 +612,7 @@ int main(int argc, char** argv)
             auto& grid = *edited.surface->rawPointsPtr();
             grid(1, 1) = {5.f, 5.f, 5.f};
             edit.save(*edited.surface, cv::Rect(1, 1, 1, 1));
-            require(edit.pin().version == edited.pin.version + 1 && edit.pin().geometryRevision != edited.pin.geometryRevision,
+            require(edit.pin().reference().version == edited.pin.reference().version + 1 && edit.pin().geometryRevision != edited.pin.geometryRevision,
                     "saves re-pin from the receipt");
             require((*catalog.open(native).surface->rawPointsPtr())(1, 1) == cv::Vec3f(5, 5, 5), "vertex edits reach the store");
             // The mask brush: validity 0 and the sentinel in memory; stored coordinates survive.
@@ -294,9 +645,10 @@ int main(int argc, char** argv)
             const auto fix = points.getCollectionId("fix").value();
             points.setCollectionAnchor2d(fix, cv::Vec2f(1.5f, 0.5f));
             const auto saved = points.anchoredCollections();
-            vc3d::corrections::write(*session, attachment, half, saved, {volume->id()});
+            auto correctionSnapshot = vc3d::corrections::read(*session, attachment, half);
+            vc3d::corrections::write(*session, attachment, correctionSnapshot, saved, {volume->id()});
             auto stored = vc3d::corrections::read(*session, attachment, half);
-            require(stored.size() == 1 && stored.begin()->first == fix, "corrections round-trip by collection id");
+            require(stored.collections.size() == 1 && stored.collections.begin()->first == fix, "corrections round-trip by collection id");
             session->readStore(attachment, [&](const vc::objects::StoreReader& reader, const auto&) {
                 const auto uuid = reader.neighbours(half, std::string(vc::objects::kAttachmentEdgeKind)).at(0);
                 require(nlohmann::json::parse(reader.currentObject(uuid)->record.meta)["role"] == "corrections" &&
@@ -304,21 +656,21 @@ int main(int argc, char** argv)
                         "corrections are attached data, not graph links");
             });
             PointCollections reloaded;
-            require(reloaded.replaceAnchoredCollections(stored), "stored corrections load");
+            require(reloaded.replaceAnchoredCollections(stored.collections), "stored corrections load");
             const auto& collection = reloaded.getAllCollections().at(fix);
             require(collection.uuid == points.getAllCollections().at(fix).uuid && collection.anchor2d == cv::Vec2f(1.5f, 0.5f) &&
                     collection.points.size() == 1 && collection.points.begin()->second.p == cv::Vec3f(1, 2, 3),
                     "corrections keep identity, anchor and points");
             points.addPoint("fix", {4, 5, 6});
-            vc3d::corrections::write(*session, attachment, half, points.anchoredCollections(), {volume->id()});
-            require(vc3d::corrections::read(*session, attachment, half).at(fix).at("points").size() == 2, "corrections update in place");
+            vc3d::corrections::write(*session, attachment, correctionSnapshot, points.anchoredCollections(), {volume->id()});
+            require(vc3d::corrections::read(*session, attachment, half).collections.at(fix).at("points").size() == 2, "corrections update in place");
             {
                 const auto firstPoint = points.getAllCollections().at(fix).points.begin()->second;
                 auto movedPoint = firstPoint;
                 movedPoint.p = {7, 8, 9};
                 points.updatePoint(movedPoint);
-                vc3d::corrections::write(*session, attachment, half, points.anchoredCollections(), {volume->id()});
-                const auto stored = vc3d::corrections::read(*session, attachment, half).at(fix);
+                vc3d::corrections::write(*session, attachment, correctionSnapshot, points.anchoredCollections(), {volume->id()});
+                const auto stored = vc3d::corrections::read(*session, attachment, half).collections.at(fix);
                 const auto& moved = stored.at("points").at(std::to_string(firstPoint.id)).at("p");
                 require(moved[0].get<double>() == 7 && moved[2].get<double>() == 9, "moved correction points keep their id");
             }
@@ -329,16 +681,17 @@ int main(int argc, char** argv)
                 auto shown = vc3d::corrections::read(*session, attachment, half, coarse);
                 const auto& ordered = points.getAllCollections().at(fix).points;
                 const auto firstId = std::to_string(ordered.begin()->first), secondId = std::to_string(std::next(ordered.begin())->first);
-                require(shown.at(fix).at("points").at(firstId).at("p")[0].get<double>() == 3.5, "corrections read through the view");
-                shown.at(fix)["points"][secondId]["p"] = nlohmann::json::parse("[1.0, 1.0, 1.0]");
-                vc3d::corrections::write(*session, attachment, half, shown, {volume->id()}, coarse);
-                const auto stored = vc3d::corrections::read(*session, attachment, half).at(fix).at("points");
+                require(shown.collections.at(fix).at("points").at(firstId).at("p")[0].get<double>() == 3.5, "corrections read through the view");
+                shown.collections.at(fix)["points"][secondId]["p"] = nlohmann::json::parse("[1.0, 1.0, 1.0]");
+                vc3d::corrections::write(*session, attachment, shown, shown.collections, {volume->id()});
+                const auto stored = vc3d::corrections::read(*session, attachment, half).collections.at(fix).at("points");
                 require(stored.at(firstId).at("p")[0].get<double>() == 7 && stored.at(secondId).at("p")[0].get<double>() == 2,
                         "corrections save back to their stored frame");
             }
-            vc3d::corrections::write(*session, attachment, half, {}, {volume->id()});
-            require(vc3d::corrections::read(*session, attachment, half).empty(), "dropped corrections are retired");
-            require(vc3d::corrections::read(*session, attachment, native).empty(), "corrections belong to one surface");
+            correctionSnapshot = vc3d::corrections::read(*session, attachment, half);
+            vc3d::corrections::write(*session, attachment, correctionSnapshot, {}, {volume->id()});
+            require(vc3d::corrections::read(*session, attachment, half).collections.empty(), "dropped corrections are retired");
+            require(vc3d::corrections::read(*session, attachment, native).collections.empty(), "corrections belong to one surface");
             vc3d::corrections::GrowthAnnotation annotation;
             annotation.surfaceUuid = half;
             annotation.beforeGeometry = "before";
@@ -353,7 +706,7 @@ int main(int argc, char** argv)
                     vc::geometry::decode(reader.readGeometryData(reader.currentGeometry(annotationUuid)->uuid)));
                 require(points.ids == std::vector<int64_t>{1, 2}, "annotation points keep placement order");
             });
-            require(vc3d::corrections::read(*session, attachment, half).empty(), "annotations are not corrections");
+            require(vc3d::corrections::read(*session, attachment, half).collections.empty(), "annotations are not corrections");
         }
 
         session->tagObjects(attachment, {native}, {"reviewed"}, {"approved"});
@@ -498,9 +851,9 @@ int main(int argc, char** argv)
             remoteSession.setGeometryFetcher("published",
                 [&](ObjectStore& store, const std::string& uuid, const ObjectStoreSession::FetchWrite& write) {
                     if (uuid == ids[2]) throw std::runtime_error("test fetch failure");
-                    const auto version = store.currentVersion(store.read(), uuid);
+                    const auto selected = store.currentObjectRevision(store.read(), uuid)->reference();
                     ++fetchCount;
-                    write({{uuid, version}}, [&](auto& db, auto& txn) {
+                    write({{uuid, selected}}, [&](auto& db, auto& txn) {
                         db.putGeometry(txn, uuid, quad_surface_geometry(grid));
                     });
                 });
@@ -575,7 +928,7 @@ int main(int argc, char** argv)
                 edit.save(surface, cv::Rect(1, 0, 1, 1), {}, durable->draftRevision(native));
                 saved = edit.pin().reference();
                 const auto state = durable->draftState(native);
-                require(saved.version == pin.version + 1 && state && state->saved && state->base == saved &&
+                require(saved.version == pin.reference().version + 1 && state && state->saved && state->base == saved &&
                         drafts.checkpointNow(), "the save keeps the draft as saved");
                 const auto files = [&] {
                     std::size_t n = 0;
@@ -656,7 +1009,7 @@ int main(int argc, char** argv)
             }
             require(hostedCatalog.rows().size() == 1 && hostedCatalog.row(uuid), "hosted surfaces are listed");
             auto opened = hostedCatalog.open(uuid);
-            require(opened.editable && opened.pin.version == 1, "hosted surfaces open editable");
+            require(opened.editable && opened.pin.reference().version == 1, "hosted surfaces open editable");
             SurfaceStoreEdit edit(hostedSession, opened.pin);
             auto& points = *opened.surface->rawPointsPtr();
             const auto vertexAt = [&](int row, int column) {
@@ -669,7 +1022,7 @@ int main(int argc, char** argv)
             };
             points(1, 1) = {4.f, 4.f, 4.f};
             edit.save(*opened.surface, cv::Rect(1, 1, 1, 1));
-            require(edit.pin().version == 2 && vertexAt(1, 1) == cv::Vec3f(4, 4, 4), "hosted save");
+            require(edit.pin().reference().version == 2 && vertexAt(1, 1) == cv::Vec3f(4, 4, 4), "hosted save");
 
             // The service goes away: the check reports it, a save fails before
             // sending anything (its reads need the service), and nothing is pending.
@@ -679,7 +1032,7 @@ int main(int argc, char** argv)
             points(0, 0) = {6.f, 6.f, 6.f};
             bool failed = false;
             try { edit.save(*opened.surface, cv::Rect(0, 0, 1, 1)); } catch (const std::exception&) { failed = true; }
-            require(failed && hostedSession->pendingSubmissions().empty() && edit.pin().version == 2,
+            require(failed && hostedSession->pendingSubmissions().empty() && edit.pin().reference().version == 2,
                     "a save without the service fails cleanly");
             service = std::make_unique<server::Server>(hostedPath, serverOptions);
             service->start();
@@ -687,7 +1040,7 @@ int main(int argc, char** argv)
             require(hostedSession->freshness(hosted)->error.empty(), "current again");
             points(2, 2) = {9.f, 9.f, 9.f};
             edit.save(*opened.surface, cv::Rect(0, 0, 3, 3));
-            require(edit.pin().version == 3 && vertexAt(0, 0) == cv::Vec3f(6, 6, 6) && vertexAt(2, 2) == cv::Vec3f(9, 9, 9),
+            require(edit.pin().reference().version == 3 && vertexAt(0, 0) == cv::Vec3f(6, 6, 6) && vertexAt(2, 2) == cv::Vec3f(9, 9, 9),
                     "the next save carries the edits");
             hostedSession->detach(hosted);
         }

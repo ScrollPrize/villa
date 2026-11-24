@@ -597,7 +597,7 @@ void MenuActionController::resetOpenDataProject()
             for (const auto& store : original->document().data().at("stores")) data["stores"].push_back(store);
             original->document().replace(std::move(data));
             auto package = VolumePkg::open(original->path(), {.catalog = vcr::catalog::cachedManifest(vcr::catalog::catalogCacheFile(std::string(vcr::catalog::kDefaultManifestUrl)))});
-            _window->CloseVolume();
+            if (!_window->CloseVolume()) throw std::runtime_error("Pending edits prevented reset");
             _window->_state->setVpkg(std::move(package));
             _window->refreshCurrentVolumePackageUi();
         } catch (const std::exception& error) {
@@ -964,7 +964,13 @@ void MenuActionController::finishOpenDataSampleOpen(OpenDataOpenTaskResult task,
         // active surface alive beside this sample's package. With nothing
         // open, CloseVolume() is a no-op.
         cancelOpenDataVolumePrefills();
-        _window->CloseVolume();
+        if (!_window->CloseVolume()) {
+            if (outcomeOut) {
+                outcomeOut->success = false;
+                outcomeOut->error = tr("Pending edits prevented closing the current project");
+            }
+            return;
+        }
         _window->_state->setVpkg(pkg);
     }
     if (!pkg->path().empty()) {
@@ -1493,6 +1499,13 @@ void MenuActionController::beginRotateSurfaceTransform()
         QMessageBox::information(_window,
                                  QObject::tr("Rotate Surface"),
                                  QObject::tr("Select a segmentation surface before rotating."));
+        return;
+    }
+    // Rotate shows an unsaved preview: an edit session's autosave would publish it outside Apply.
+    if (_window->_segmentationModule && _window->_segmentationModule->editingEnabled()) {
+        QMessageBox::information(_window,
+                                 QObject::tr("Rotate Surface"),
+                                 QObject::tr("Turn off segmentation editing before rotating the segment."));
         return;
     }
     // Rotation saves back to the store the surface was opened from.

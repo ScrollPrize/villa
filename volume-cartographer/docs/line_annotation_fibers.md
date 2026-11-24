@@ -91,15 +91,14 @@ choose the **Fiber inference** role. The browser accepts directories as well as
 JSON manifests, locally or remotely. In the annotation
 window's menu, **Tracing / annotation normals** selects:
 
-- **Predicted fiber normals** — requires `sheet_nx`, `sheet_ny`, and
-  `sheet_grad_mag`; reports an error rather
-  than silently falling back when they are unavailable.
+- **Predicted fiber normals** — requires `sheet_nx` and `sheet_ny`; reports an
+  error rather than silently falling back when they are unavailable.
 - **Lasagna normals** — explicitly uses the external Lasagna dataset even when
   the fiber volume supplies normals.
 
 There is no Automatic option. Attaching the first dataset initializes an unset
 project choice to **Predicted fiber normals** when the selected fiber dataset
-contains `sheet_nx`, `sheet_ny`, and `sheet_grad_mag`; otherwise it selects
+contains `sheet_nx` and `sheet_ny`; otherwise it selects
 **Lasagna normals**. An existing Lasagna selection is preserved. Subsequent
 attachments and dataset changes never override the saved choice. User changes
 are persisted in the `.vcproj` view field `annotation_normal_source` (`fiber`

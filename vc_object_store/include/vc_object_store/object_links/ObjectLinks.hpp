@@ -234,19 +234,17 @@ std::vector<OverlapCorrespondences> materializeOverlapCorrespondences(objects::O
 
 // An overlap edge as a reader saw it at some earlier state (a pinned input position,
 // say): the edge record's stored endpoint order, whole-geometry anchors and
-// metadata, and each endpoint's object metadata and geometry revision then.
+// metadata, and each endpoint's complete object version. Metadata, geometry and
+// transforms are resolved together through the reader, including referenced owners.
 // The caller has decided the edge applies at that state; it is not checked
 // for staleness against the store's current state.
 struct OverlapEdgeAt {
-    std::string uuid, aUuid, bUuid;
+    std::string uuid;
     bool wholeGeometry = true;  // both anchors
     std::string meta;           // the edge's metadata JSON (its fit and pose)
-    std::string aObjectMeta, bObjectMeta;
-    std::string aGeometryRevision, bGeometryRevision;
+    objects::ObjectVersion a, b;
 };
-// Point pairs from these records and geometry revisions instead of the
-// store's current ones (the revisions must be in this store); otherwise as
-// above.
+// Point pairs from these selected states instead of the store's current ones.
 std::vector<OverlapCorrespondences> materializeOverlapCorrespondences(objects::ObjectStore& db,
     const std::vector<OverlapEdgeAt>& edges, const OverlapCorrespondenceParams& params);
 // The same over any reader (a session's local or hosted attachment): the
@@ -341,7 +339,8 @@ struct TrackTrackParams {
     bool replaceStalePending = true;
 };
 // Opposite-family stored tracks sharing voxels within the same dataset.
-// datasetRef is an identity/grouping label, never a path to open. Raw local point
+// Dataset locators are resolved against their owning stores for grouping, but
+// no external track data is opened: detection uses stored geometry. Raw local point
 // indices and source XYZ anchor each crossing. Failure/cancellation writes nothing.
 DetectorReport linkTracksToTracks(objects::ObjectStore& db, const TrackTrackParams& params = {},
                                   const std::atomic_bool* cancel = nullptr);

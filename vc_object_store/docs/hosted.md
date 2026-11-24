@@ -122,7 +122,7 @@ const auto attachment = session.attach("objects.vcobj", options);
 auto request = session.newRequest(attachment);
 session.readStore(attachment, [&](const vc::objects::StoreReader& reader, const auto& cancel) {
     if (cancel.load()) return;
-    request.expectedObjects[objectUuid] = reader.currentObject(objectUuid)->version;
+    request.expectedObjects[objectUuid] = reader.currentObject(objectUuid)->reference();
 });
 request.operations.push_back(vc::objects::SetMetaOp{objectUuid, "review_note", R"("checked")"});
 session.submit(attachment, request); // TransactionConflict when the object moved on
@@ -184,12 +184,14 @@ feed reports them changed, all within `cacheBytes` — cached data stays
 readable while the host is unreachable, but listings and spatial queries
 always need the host.
 
-Underneath, every publishing transaction appends to one ordered feed:
-`status()` (`storeUuid`, `generation`, `commitSequence`, `feedStart`) and
+With history enabled, every publishing transaction appends to one ordered feed:
+`status()` (`storeUuid`, `generation`, `commitSequence`, `feedStart`, `historyEnabled`) and
 `changes_since(cursor, max_changes)` return whole commits (continuing inside
 a commit only when it alone exceeds the page). A cursor from another
 generation, the future, or before `feedStart` comes back invalid — revalidate
 cached heads and rerun queries.
+
+History-off stores keep numbered current versions and the commit sequence, but not a replayable feed. Sessions detect a lineage/sequence change and emit `revalidate` without fabricated change entries; hosted snapshots validate that the sequence stayed fixed during their reads. Explicit historical requests remain unavailable. A lineage UUID and commit sequence are distinct from the session-local attachment generation.
 
 ## What differs on a hosted attachment
 
@@ -263,6 +265,7 @@ bytes, `Content-Length` required; 400 hash/length mismatch, 411 no length,
 | `GET /v1/objects/{uuid}/versions/{n}?store&generation` | that numbered revision or 404 |
 | `GET /v1/objects/{uuid}/history` | every recorded revision, or 404 |
 | `GET /v1/geometry/{revision}` | geometry descriptor (immutable) |
+| `GET /v1/geometry/{revision}/object` | latest retained object metadata naming that geometry, or 404; not immutable, use an exact object reference to pin metadata |
 | `GET /v1/geometry/{revision}/arrays/{name}?offset&count` | array bytes; 413 above the response limit |
 | `GET /v1/geometry/{revision}/annotations/{name}` | per-point annotations (exact JSON, immutable) |
 | `PUT /v1/artifacts/{sha256}` (bytes) | kept durably by the store |

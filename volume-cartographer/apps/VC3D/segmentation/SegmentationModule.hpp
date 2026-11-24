@@ -36,6 +36,7 @@
 #include "SegmentationPushPullConfig.hpp"
 #include "SegmentationUndoHistory.hpp"
 #include "SegmentationAutosaveState.hpp"
+#include "SurfaceCorrections.hpp"
 
 namespace segmentation { class CorrectionsState; }
 
@@ -122,7 +123,9 @@ public:
     void setStorePinResolver(StorePinResolver resolver) { _storePinResolver = std::move(resolver); }
     // Synchronously publish `surface` to its store object: its changed vertices
     // (with `vertices`) and its loaded `channels` (every channel when empty).
-    bool saveSurface(QuadSurface* surface, bool vertices = true, const std::vector<std::string>& channels = {});
+    // With `geometryRevision`, only over that stored geometry (SurfaceStoreEdit::save).
+    bool saveSurface(QuadSurface* surface, bool vertices = true, const std::vector<std::string>& channels = {},
+                     const std::optional<std::string>& geometryRevision = std::nullopt);
     // The store revisions the surface's edits continue from.
     std::optional<vc::objects::PinnedObject> storePin(QuadSurface* surface);
     void endEditingSession();
@@ -135,7 +138,8 @@ public:
     void applyCorrectionAnchorOffset(float offsetX, float offsetY);
     // The active surface's correction point collections in the store.
     void loadCorrections(QuadSurface* surface);
-    void saveCorrections();
+    bool saveCorrections();
+    void saveGrowthAnnotation(const vc3d::corrections::GrowthAnnotation&);
 
     void attachViewer(VolumeViewerBase* viewer);
     void detachViewer(VolumeViewerBase* viewer);
@@ -557,6 +561,7 @@ private:
     static constexpr int kCorrectionsSaveDelayMs = 2000;
     QTimer* _correctionsSaveTimer{nullptr};
     std::string _correctionsSurfaceId;
+    std::optional<vc3d::corrections::Snapshot> _correctionsSnapshot;
     void scheduleCorrectionsAutoSave();
     void performCorrectionsAutoSave();
 

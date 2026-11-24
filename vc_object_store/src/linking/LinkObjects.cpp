@@ -321,7 +321,11 @@ objects::PreparedOperation prepareLinkObjects(objects::ObjectStore& store, const
     {
         // The marker's version under the same snapshot: concurrent link runs
         // conflict on it even when they read disjoint objects.
-        result.expectedObjects[linkMarkerUuid()] = store.currentVersion(prepared->inputs->txn(), linkMarkerUuid());
+        const auto marker = store.currentObjectRevision(prepared->inputs->txn(), linkMarkerUuid());
+        if (marker) {
+            result.expectedObjects[linkMarkerUuid()] = marker->reference();
+            result.expectedObjects[linkMarkerUuid()].deleted = marker->deleted;
+        } else result.expectedObjects[linkMarkerUuid()] = std::nullopt;
     }
     // A detector that could not run (a bad normal source, missing inputs,
     // ...) fails the request: no step's links are published and the marker
@@ -359,11 +363,16 @@ objects::PreparedOperation prepareLinkObjects(objects::ObjectStore& store, const
     for (const auto& [uuid, version] : prepared->inputs->expectations()) result.expectedObjects[uuid] = version;
     const auto progress = options.progress;
     result.apply = [prepared, progress](objects::ObjectStore& db, objects::WriteTxn& txn) {
+        // The callback is public and txn may be a caller's own: whatever
+        // fails below, links or marker, fails txn as a whole, so no caller
+        // can commit links without their marker.
+        const detail::FailTransactionOnError failTransaction(txn);
         auto steps = Json::array();
         for (std::size_t i = 0; i < prepared->detections.size(); ++i) {
             const auto& detection = prepared->detections[i];
+            // No savepoint per detection (see commitCandidatesImpl).
             const auto report = detail::commitDetection(db, *prepared->inputs, txn, detection,
-                                                        stepProgress(progress, detection.detector));
+                                                        stepProgress(progress, detection.detector), true);
             Json step{{"detector", prepared->plan.steps[i].detector}, {"params", prepared->plan.steps[i].params},
                       {"report", detectorReportJson(report)}};
             if (!prepared->plan.steps[i].ctVolume.empty()) step["ct_volume"] = prepared->plan.steps[i].ctVolume;

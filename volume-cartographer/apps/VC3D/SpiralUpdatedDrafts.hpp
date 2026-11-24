@@ -18,10 +18,10 @@ namespace vc3d {
 // here, so the drafts never reached the fit. A draft whose object moved on
 // (saved again meanwhile) or whose drawing changed stays a drawing whose
 // next save replaces its object.
+template<class Version, class Current, class Unchanged>
 inline QStringList spiralDraftsIncludedByUpdate(
-    const QString& updateError, qint64 requested, const QHash<QString, int64_t>& saved,
-    const std::function<int64_t(const QString&)>& currentVersion,
-    const std::function<bool(const QString&)>& drawingUnchanged)
+    const QString& updateError, qint64 requested, const QHash<QString, Version>& saved,
+    const Current& currentVersion, const Unchanged& drawingUnchanged)
 {
     QStringList ids;
     if (!updateError.isEmpty() || requested < 0) return ids;

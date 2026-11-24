@@ -72,6 +72,32 @@ def _grid(z0=4.0, size=8, step=4.0):
                      40.0 + cols * step], axis=-1)
 
 
+@pytest.mark.parametrize('mask', [False, True])
+def test_raw_surface_validity_uses_shared_reader(db, mask):
+    from types import SimpleNamespace
+    points = np.full((2, 3, 3), 10., dtype='<f4')
+    points[0, 0] = [-1, -1, -1]
+    points[0, 1] = [10, -1, 10]
+    points[0, 2] = [10, 10, np.nan]
+    points[1, 0] = [10, 10, 0]
+    arrays = [dict(name='points', dtype='<f4', shape=list(points.shape), data=points.tobytes())]
+    if mask:
+        valid = np.ones((2, 3), dtype='u1')
+        valid[1, 1] = 0
+        arrays.append(dict(name='valid', dtype='|u1', shape=[2, 3], data=valid.tobytes()))
+    uid = db.upsert_object(dict(kind='surface', meta={'coordinates': frame(2)}))
+    revision = db.put_geometry(uid, dict(kind='surface', attributes=dict(scale=[1, 1]), arrays=arrays))
+    selected = SimpleNamespace(uuid=uid, geometry_revision=revision,
+                               frame=osi.ObjectFrame('vol', 2, .5))
+    actual, invalid, scale = osi._surface_zyxs(db, selected, 'surface')
+    with db.geometry_snapshot() as snapshot:
+        _, expected_valid = snapshot.surface(uid, revision).read_arrays()
+    np.testing.assert_array_equal(invalid, ~expected_valid)
+    np.testing.assert_array_equal(actual[invalid], -1)
+    np.testing.assert_allclose(actual[~invalid], 5)
+    assert scale == [2, 2]
+
+
 @pytest.mark.parametrize('scale', [0.5, 1, 4])
 def test_patch_frames_invalid_vertices_and_erosion(db, scale):
     import torch
@@ -143,7 +169,7 @@ def test_absolute_role_comes_from_metadata_not_names(db):
     edges = {uid: pcl_patch_edge(db, uid, 0, patch, (1.0, 1.0))
              for uid in (absolute, relative, unannotated)}
     inputs = materialize(db)
-    by_uuid = {pcl['metadata']['object_uuid']: pcl
+    by_uuid = {pcl['metadata']['reference']['object']: pcl
                for pcl in inputs.point_collections.values()}
     assert by_uuid[absolute]['metadata']['winding_is_absolute']
     assert by_uuid[absolute]['sampling_group'] == osi.ABSOLUTE_PCL_GROUP

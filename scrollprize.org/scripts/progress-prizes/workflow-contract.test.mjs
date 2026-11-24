@@ -6,14 +6,14 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 import {
-  activationCommitNeedsRefresh,
   assertAutomationBranch,
   assertDeterministicPageDelta,
   assertPullBinding,
   assertSinglePageCommit,
   gateSnapshot,
   isTrustedPreviewRun,
-  resolveProductionActivationState,
+  pageCommitParent,
+  resolveRolloverState,
   safeDiagnosticCode,
   waitForPullBinding,
 } from '../../../.github/progress-prizes-github.mjs';
@@ -117,56 +117,8 @@ test('every literal Progress Prize run block has valid Bash syntax after YAML in
   }
 });
 
-test('composite production activation guard requires an exact immutable base lease', async () => {
-  const action = await googleAction();
-  const guard = literalRunScripts(action)[0]?.source;
-  const valid = {
-    REPOSITORY: 'ScrollPrize/villa',
-    REPOSITORY_ID: '890972577',
-    REPOSITORY_OWNER_ID: '121906140',
-    REF: 'refs/heads/main',
-    AUTOMATION_ENVIRONMENT: 'production',
-    EVENT_NAME: 'workflow_dispatch',
-    OPERATION: 'activate',
-    SIMULATED_NOW: '',
-    FAULT: '',
-    EXPECT_FAULT: 'false',
-    DRY_RUN: 'false',
-    ALLOW_ACTIVATION_REWIND: 'false',
-    VERIFY_MODE: 'prepared',
-    BRANCH: 'codex/progress-prize-2026-08',
-    TARGET_BRANCH: 'main',
-    SOURCE_CYCLE: '2026-07',
-    TARGET_CYCLE: '2026-08',
-    HEAD_SHA: 'a'.repeat(40),
-    BASE_SHA: 'b'.repeat(40),
-  };
-  const run = (override = {}) => spawnSync('bash', ['--noprofile', '--norc'], {
-    input: guard,
-    encoding: 'utf8',
-    env: { ...valid, ...override },
-  });
-
-  assert.equal(run().status, 0);
-  for (const override of [
-    { BASE_SHA: '' },
-    { BASE_SHA: 'not-a-sha' },
-    { EVENT_NAME: 'schedule' },
-    { BRANCH: 'main' },
-    { TARGET_BRANCH: 'release' },
-    { SIMULATED_NOW: '2026-08-01T07:01:00.000Z' },
-    { FAULT: 'after-close-source' },
-    { DRY_RUN: 'true' },
-    { VERIFY_MODE: 'invalid' },
-  ]) {
-    assert.notEqual(run(override).status, 0, JSON.stringify(override));
-  }
-});
-
-test('composite action rejects retired staging inputs before authentication', async () => {
-  const action = await googleAction();
-  const guard = literalRunScripts(action)[0]?.source;
-  const valid = {
+function guardEnvironment(overrides = {}) {
+  return {
     REPOSITORY: 'ScrollPrize/villa',
     REPOSITORY_ID: '890972577',
     REPOSITORY_OWNER_ID: '121906140',
@@ -174,87 +126,59 @@ test('composite action rejects retired staging inputs before authentication', as
     AUTOMATION_ENVIRONMENT: 'production',
     EVENT_NAME: 'workflow_dispatch',
     OPERATION: 'prepare',
-    SIMULATED_NOW: '',
-    FAULT: '',
-    EXPECT_FAULT: 'false',
     DRY_RUN: 'false',
-    ALLOW_ACTIVATION_REWIND: 'false',
-    VERIFY_MODE: 'prepared',
-    BRANCH: 'codex/progress-prize-2026-08',
-    TARGET_BRANCH: 'main',
-    SOURCE_CYCLE: '2026-07',
-    TARGET_CYCLE: '2026-08',
-    HEAD_SHA: '',
-    BASE_SHA: '',
-  };
-  const run = (override = {}) => spawnSync('bash', ['--noprofile', '--norc'], {
-    input: guard,
-    encoding: 'utf8',
-    env: { ...valid, ...override },
-  });
-
-  for (const override of [
-    { AUTOMATION_ENVIRONMENT: 'staging' },
-    { AUTOMATION_ENVIRONMENT: 'staging', SIMULATED_NOW: '2026-08-01T07:01:00.000Z' },
-    { AUTOMATION_ENVIRONMENT: 'staging', FAULT: 'after-copy' },
-    { AUTOMATION_ENVIRONMENT: 'staging', FAULT: 'after-copy', EXPECT_FAULT: 'true' },
-    {
-      AUTOMATION_ENVIRONMENT: 'staging',
-      OPERATION: 'bootstrap',
-      TARGET_CYCLE: '2026-08',
-      ALLOW_ACTIVATION_REWIND: 'true',
-    },
-  ]) {
-    assert.notEqual(run(override).status, 0, JSON.stringify(override));
-  }
-});
-
-test('composite reconcile-active guard is manual, real-clock, and marker-only', async () => {
-  const action = await googleAction();
-  const guard = literalRunScripts(action)[0]?.source;
-  const valid = {
-    REPOSITORY: 'ScrollPrize/villa',
-    REPOSITORY_ID: '890972577',
-    REPOSITORY_OWNER_ID: '121906140',
-    REF: 'refs/heads/main',
-    AUTOMATION_ENVIRONMENT: 'production',
-    EVENT_NAME: 'workflow_dispatch',
-    OPERATION: 'reconcile-active',
-    SIMULATED_NOW: '',
-    FAULT: '',
-    EXPECT_FAULT: 'false',
-    DRY_RUN: 'false',
-    ALLOW_ACTIVATION_REWIND: 'false',
-    VERIFY_MODE: 'active',
     BRANCH: 'main',
     TARGET_BRANCH: 'main',
     SOURCE_CYCLE: '2026-07',
     TARGET_CYCLE: '2026-08',
     HEAD_SHA: '',
-    BASE_SHA: '',
+    ...overrides,
   };
+}
+
+test('composite action guard accepts only production validate, prepare, and verify', async () => {
+  const action = await googleAction();
+  const guard = literalRunScripts(action)[0]?.source;
   const run = (override = {}) => spawnSync('bash', ['--noprofile', '--norc'], {
     input: guard,
     encoding: 'utf8',
-    env: { ...valid, ...override },
+    env: guardEnvironment(override),
   });
 
   assert.equal(run().status, 0);
+  assert.equal(run({ OPERATION: 'validate' }).status, 0);
+  assert.equal(run({ OPERATION: 'prepare', DRY_RUN: 'true' }).status, 0);
+  assert.equal(run({ OPERATION: 'verify', BRANCH: 'codex/progress-prize-2026-08' }).status, 0);
+  assert.equal(run({ OPERATION: 'verify', HEAD_SHA: 'a'.repeat(40) }).status, 0);
   for (const override of [
+    { REPOSITORY_ID: '1' },
+    { REF: 'refs/heads/feature' },
     { EVENT_NAME: 'schedule' },
-    { EVENT_NAME: 'pull_request' },
-    { REF: 'refs/pull/123/merge' },
-    { SIMULATED_NOW: '2026-08-06T12:00:00.000Z' },
-    { FAULT: 'after-copy' },
-    { EXPECT_FAULT: 'true', FAULT: 'after-copy' },
-    { DRY_RUN: 'true' },
-    { ALLOW_ACTIVATION_REWIND: 'true' },
+    { AUTOMATION_ENVIRONMENT: 'staging' },
+    { OPERATION: 'activate' },
+    { OPERATION: 'reconcile-active' },
+    { OPERATION: 'bootstrap' },
+    { OPERATION: 'cleanup' },
+    { OPERATION: 'verify', DRY_RUN: 'true' },
+    { DRY_RUN: 'maybe' },
     { HEAD_SHA: 'a'.repeat(40) },
-    { BASE_SHA: 'b'.repeat(40) },
-    { TARGET_BRANCH: 'feature/test' },
+    { OPERATION: 'verify', HEAD_SHA: 'not-a-sha' },
+    { TARGET_BRANCH: 'release' },
+    { BRANCH: 'feature/other' },
+    { TARGET_CYCLE: '' },
+    { OPERATION: 'validate', SOURCE_CYCLE: '' },
+    { SOURCE_CYCLE: '2026-13' },
   ]) {
     assert.notEqual(run(override).status, 0, JSON.stringify(override));
   }
+});
+
+test('composite action carries no retired staging, fault, or activation controls', async () => {
+  const action = await googleAction();
+  assert.doesNotMatch(action, /simulated-now|expect-fault|allow-activation-rewind|verify-mode/);
+  assert.doesNotMatch(action, /staging-folder-id|archive-folder-id|github-token|base-sha/);
+  assert.doesNotMatch(action, /progress-prizes-github\.mjs|Wait for the real production cutoff/);
+  assert.doesNotMatch(action, /reconcile|activate|bootstrap|cleanup/);
 });
 
 test('Vercel verification runs trusted default-branch code and requires GitHub association', async () => {
@@ -308,7 +232,7 @@ test('PR preparation discovers by immutable head and waits for exact SHA converg
     'utf8',
   );
   const start = helper.indexOf('async function ensurePull(options)');
-  const end = helper.indexOf('async function merge(options)', start);
+  const end = helper.indexOf('async function ready(options)', start);
   assert.ok(start >= 0 && end > start);
   const ensurePull = helper.slice(start, end);
   assert.match(ensurePull, /pulls\?state=open&head=/);
@@ -391,7 +315,31 @@ test('trusted branch and exact-check gate helpers reject ambiguous automation st
       total_count: 2,
       check_runs: [
         successfulChecks.check_runs[0],
-        { name: 'Failing check', status: 'completed', conclusion: 'failure' },
+        { name: 'Unrelated cancelled workflow', status: 'completed', conclusion: 'cancelled' },
+      ],
+    },
+    previewRun,
+    expectedSha,
+  }).ready, true, 'unrelated repository checks never block the rollover');
+  assert.equal(gateSnapshot({
+    statuses,
+    checks: {
+      total_count: 2,
+      check_runs: [
+        { ...successfulChecks.check_runs[0], conclusion: 'failure' },
+        successfulChecks.check_runs[1],
+      ],
+    },
+    previewRun,
+    expectedSha,
+  }).ready, false);
+  assert.equal(gateSnapshot({
+    statuses,
+    checks: {
+      total_count: 2,
+      check_runs: [
+        { ...successfulChecks.check_runs[0], app: { slug: 'third-party-app' } },
+        successfulChecks.check_runs[1],
       ],
     },
     previewRun,
@@ -582,33 +530,33 @@ test('the GitHub helper binds the PR and exact deterministic page-only commit', 
     files: [{ filename: 'scrollprize.org/docs/34_prizes.md', status: 'modified' }],
   };
   assert.equal(assertSinglePageCommit(commit, { headSha, baseSha }), commit);
-  assert.equal(activationCommitNeedsRefresh(commit, { headSha, baseSha }), false);
+  assert.equal(pageCommitParent(commit, { headSha }), baseSha);
   assert.throws(() => assertSinglePageCommit({
     ...commit,
     files: [...commit.files, { filename: '.github/workflows/untrusted.yml', status: 'added' }],
   }, { headSha, baseSha }), /one page-only commit/);
-  assert.equal(activationCommitNeedsRefresh({
+  assert.equal(pageCommitParent({
     ...commit,
     parents: [{ sha: 'c'.repeat(40) }],
-  }, { headSha, baseSha }), true);
-  assert.throws(() => activationCommitNeedsRefresh({
+  }, { headSha }), 'c'.repeat(40), 'an older parent is fine; merging is manual');
+  assert.throws(() => pageCommitParent({
     ...commit,
     files: [...commit.files, { filename: '.github/workflows/untrusted.yml', status: 'added' }],
-  }, { headSha, baseSha }), /Only a page-only commit/);
-  assert.throws(() => activationCommitNeedsRefresh({
+  }, { headSha }), /one page-only commit/);
+  assert.throws(() => pageCommitParent({
     ...commit,
     parents: [{ sha: baseSha }, { sha: 'c'.repeat(40) }],
-  }, { headSha, baseSha }), /Only a page-only commit/);
+  }, { headSha }), /one page-only commit/);
 });
 
-test('production activation-state recovery distinguishes exact, stale, and completed state', async () => {
+test('rollover-state distinguishes a pending draft, a ready PR, and a merged page', async () => {
   const head = 'codex/progress-prize-2026-08';
   const base = 'main';
   const headSha = 'a'.repeat(40);
   const baseSha = 'b'.repeat(40);
-  const staleSha = 'c'.repeat(40);
   const pull = {
     number: 42,
+    draft: true,
     state: 'open',
     head: {
       ref: head,
@@ -621,158 +569,62 @@ test('production activation-state recovery distinguishes exact, stale, and compl
       repo: { id: 890972577, full_name: 'ScrollPrize/villa' },
     },
   };
-  const exactCommit = {
-    sha: headSha,
-    parents: [{ sha: baseSha }],
-    files: [{ filename: 'scrollprize.org/docs/34_prizes.md', status: 'modified' }],
-  };
-  const options = { head, base, cycle: '2026-08', expectedBaseSha: baseSha };
+  const mainRef = async () => ({ ref: 'refs/heads/main', object: { type: 'commit', sha: baseSha } });
+  const options = { head, base, cycle: '2026-08' };
 
-  const pending = await resolveProductionActivationState(options, {
-    listPulls: async () => [pull],
-    readCommit: async () => exactCommit,
-    readMainRef: async () => ({
-      ref: 'refs/heads/main',
-      object: { type: 'commit', sha: baseSha },
-    }),
-  });
-  assert.deepEqual(pending, {
+  assert.deepEqual(await resolveRolloverState(options, { listPulls: async () => [pull] }), {
     state: 'pending',
     headSha,
-    baseSha,
     pullNumber: '42',
-    refreshRequired: false,
+    draft: true,
   });
-
-  const stale = await resolveProductionActivationState(options, {
-    listPulls: async () => [pull],
-    readCommit: async () => ({ ...exactCommit, parents: [{ sha: staleSha }] }),
-    readMainRef: async () => ({
-      ref: 'refs/heads/main',
-      object: { type: 'commit', sha: baseSha },
-    }),
-  });
-  assert.equal(stale.refreshRequired, true);
-
-  const incidentRegression = await resolveProductionActivationState(options, {
-    listPulls: async () => [{
-      ...pull,
-      base: { ...pull.base, sha: 'd'.repeat(40) },
-    }],
-    readCommit: async () => ({ ...exactCommit, parents: [{ sha: staleSha }] }),
-    readMainRef: async () => ({
-      ref: 'refs/heads/main',
-      object: { type: 'commit', sha: baseSha },
-    }),
-  });
-  assert.deepEqual(incidentRegression, {
-    state: 'pending',
-    headSha,
-    baseSha,
-    pullNumber: '42',
-    refreshRequired: true,
-  });
-
-  const completed = await resolveProductionActivationState(options, {
+  assert.deepEqual(
+    await resolveRolloverState(options, { listPulls: async () => [{ ...pull, draft: false }] }),
+    { state: 'pending', headSha, pullNumber: '42', draft: false },
+  );
+  assert.deepEqual(await resolveRolloverState(options, {
     listPulls: async () => [],
-    readMainRef: async () => ({
-      ref: 'refs/heads/main',
-      object: { type: 'commit', sha: baseSha },
-    }),
+    readMainRef: mainRef,
     readPage: async () => ({ cycle: '2026-08' }),
-  });
-  assert.deepEqual(completed, {
+  }), {
     state: 'completed',
     headSha: baseSha,
-    baseSha,
     pullNumber: '',
-    refreshRequired: false,
+    draft: false,
   });
-});
-
-test('production activation-state recovery fails closed on ambiguous or drifting state', async () => {
-  const head = 'codex/progress-prize-2026-08';
-  const base = 'main';
-  const headSha = 'a'.repeat(40);
-  const baseSha = 'b'.repeat(40);
-  const pull = {
-    number: 42,
-    state: 'open',
-    head: {
-      ref: head,
-      sha: headSha,
-      repo: { id: 890972577, full_name: 'ScrollPrize/villa' },
-    },
-    base: {
-      ref: base,
-      sha: baseSha,
-      repo: { id: 890972577, full_name: 'ScrollPrize/villa' },
-    },
-  };
-  const options = { head, base, cycle: '2026-08', expectedBaseSha: baseSha };
 
   await assert.rejects(
-    resolveProductionActivationState(options, { listPulls: async () => [pull, pull] }),
+    resolveRolloverState(options, { listPulls: async () => [pull, pull] }),
     (error) => safeDiagnosticCode(error) === 'ambiguous-pr',
   );
   await assert.rejects(
-    resolveProductionActivationState(options, {
-      listPulls: async () => [pull],
-      readMainRef: async () => ({
-        ref: 'refs/heads/main',
-        object: { type: 'commit', sha: 'c'.repeat(40) },
-      }),
+    resolveRolloverState(options, {
+      listPulls: async () => [],
+      readMainRef: async () => ({ ref: 'refs/heads/main', object: { type: 'tag', sha: baseSha } }),
     }),
-    (error) => safeDiagnosticCode(error) === 'main-ref-moved',
+    (error) => safeDiagnosticCode(error) === 'invalid-main-ref',
   );
   await assert.rejects(
-    resolveProductionActivationState(options, {
+    resolveRolloverState(options, {
       listPulls: async () => [],
-      readMainRef: async () => ({
-        ref: 'refs/heads/main',
-        object: { type: 'commit', sha: baseSha },
-      }),
+      readMainRef: mainRef,
       readPage: async () => ({ cycle: '2026-07' }),
     }),
     (error) => safeDiagnosticCode(error) === 'completed-state-missing',
   );
-
   await assert.rejects(
-    resolveProductionActivationState(options, {
+    resolveRolloverState(options, {
       listPulls: async () => [{
         ...pull,
         head: { ...pull.head, repo: { id: 123, full_name: 'untrusted/fork' } },
       }],
-      readMainRef: async () => ({
-        ref: 'refs/heads/main',
-        object: { type: 'commit', sha: baseSha },
-      }),
     }),
     (error) => safeDiagnosticCode(error) === 'invalid-pr-association',
-  );
-
-  await assert.rejects(
-    resolveProductionActivationState(options, {
-      listPulls: async () => [pull],
-      readCommit: async () => ({
-        sha: headSha,
-        parents: [{ sha: baseSha }],
-        files: [
-          { filename: 'scrollprize.org/docs/34_prizes.md', status: 'modified' },
-          { filename: '.github/workflows/untrusted.yml', status: 'added' },
-        ],
-      }),
-      readMainRef: async () => ({
-        ref: 'refs/heads/main',
-        object: { type: 'commit', sha: baseSha },
-      }),
-    }),
-    (error) => safeDiagnosticCode(error) === 'invalid-page-head',
   );
 });
 
 test('GitHub coordination diagnostics are bounded to an allowlist', () => {
-  assert.equal(safeDiagnosticCode({ diagnosticCode: 'main-ref-moved' }), 'main-ref-moved');
+  assert.equal(safeDiagnosticCode({ diagnosticCode: 'ambiguous-pr' }), 'ambiguous-pr');
   assert.equal(safeDiagnosticCode({
     diagnosticCode: 'private-id-from-api-body',
     message: 'sensitive response body',

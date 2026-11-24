@@ -4,6 +4,7 @@
 #include "geometry/GeometrySnapshot.hpp"
 #include "geometry/Dependencies.hpp"
 #include "imports/SourceIdentityIndex.hpp"
+#include "internal/JsonFields.hpp"
 #include <cmath>
 #include <map>
 #include <set>
@@ -33,6 +34,16 @@ bool sameDirection(const Anchor& left, const Anchor& right)
         if (std::abs((*left.direction)[axis] - (*right.direction)[axis]) > 1e-9) return false;
     return true;
 }
+}
+void validateSourceTopology(const std::string& kind, const Json& source)
+{
+    if (kind == "fiber")
+        for (const auto* key : {"branches", "adjacent_branches"}) jsonArrayField(source, key, true);
+    if (kind == "point_collection") {
+        jsonArrayField(source, "windings_linked", true);
+        for (const auto& point : jsonArrayField(source, "point_attributes", true))
+            if (point.is_object()) jsonArrayField(point, "links", true);
+    }
 }
 int64_t importSourceRelationships(ObjectStore& db, WriteTxn& txn, const std::vector<SourceRecord>& sources)
 {

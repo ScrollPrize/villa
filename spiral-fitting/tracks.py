@@ -1,5 +1,6 @@
 import colorsys
 import dbm
+import hashlib
 import importlib
 import itertools
 import json
@@ -11,6 +12,8 @@ import shutil
 import struct
 from pathlib import Path
 import tempfile
+import uuid
+import zipfile
 
 import kornia
 import numpy as np
@@ -35,6 +38,24 @@ from sample_spiral import (
 
 
 TRACK_CROSSING_CACHE_VERSION = 1
+# The exact-crossing kernel (vc_spiral.track_crossings, the implementation the
+# object store's track-track detector shares) and the parameters it runs
+# with. A change to either changes the crossings a fit computes.
+TRACK_CROSSING_ALGORITHM = 'vc_spiral.track_crossings/1'
+TRACK_CROSSING_PARAMETERS = {
+    'angle_degrees': 30.0,
+    'tangent_radius_voxels': 12.0,
+    'cluster_local_index_radius': 4,
+}
+# The crossing CSR's arrays, in their stored order and dtypes.
+CROSSING_CSR_ARRAYS = (
+    ('source_ids', '<u8'), ('offsets', '<i8'), ('partners', '<i4'),
+    ('self_local', '<i4'), ('partner_local', '<i4'),
+    ('positions', '<f8'), ('clearances', '<f8'),
+)
+# What reading a damaged or foreign crossing CSR file raises: a cache miss.
+CROSSING_CSR_FILE_ERRORS = (
+    OSError, EOFError, KeyError, TypeError, ValueError, zipfile.BadZipFile)
 TRACK_CROSSING_CACHE_SUFFIX = '.crossings.npz'
 TRACK_STORE_SUFFIX = '.vctracks'
 TRACK_STORE_VERSION = 1
@@ -632,78 +653,90 @@ def _track_tortuosities(tracks, arclengths):
     return result
 
 
+def _filter_tracks_by_endpoints(
+        tracks, keep_endpoints, track_families, max_points_per_chunk,
+        return_indices, label):
+    """Keep the tracks for which ``keep_endpoints`` (float32 (N, 2, 3) first
+    and last points -> bool (N,)) is true; packed or list tracks."""
+    if track_families is not None and len(track_families) != len(tracks):
+        raise ValueError('track_families must be parallel to tracks')
+    keep = np.zeros(len(tracks), dtype=bool)
+    tracks_per_chunk = max(1, int(max_points_per_chunk) // 2)
+    packed = isinstance(tracks, PackedTrackCollection)
+    if packed:
+        candidates = np.arange(len(tracks), dtype=np.int64)
+    else:
+        candidates = np.asarray(
+            [index for index, track in enumerate(tracks) if len(track)], dtype=np.int64)
+    for start in range(0, len(candidates), tracks_per_chunk):
+        batch = candidates[start:start + tracks_per_chunk]
+        if packed:
+            rows = tracks.rows[batch]
+            endpoints = np.stack((
+                tracks.coordinates[tracks.offsets[rows]],
+                tracks.coordinates[tracks.offsets[rows + 1] - 1]), axis=1)
+        else:
+            endpoints = np.stack([
+                np.stack([tracks[index][0], tracks[index][-1]]) for index in batch])
+        keep[batch] = keep_endpoints(endpoints.astype(np.float32, copy=False))
+    kept_indices = np.flatnonzero(keep)
+    if packed:
+        filtered_tracks = tracks.subset(kept_indices)
+    else:
+        filtered_tracks = [tracks[index] for index in kept_indices]
+    filtered_families = None
+    if track_families is not None:
+        filtered_families = (np.asarray(track_families)[kept_indices] if packed
+                             else [track_families[index] for index in kept_indices])
+    print(f'{label}: kept {len(filtered_tracks)} / {len(tracks)} tracks; '
+          f'excluded {len(tracks) - len(filtered_tracks)}')
+    result = (filtered_tracks, filtered_families)
+    if return_indices:
+        return (*result, kept_indices)
+    return result
+
+
+def _unfiltered(tracks, track_families, return_indices):
+    result = (tracks, track_families)
+    if return_indices:
+        return (*result, np.arange(len(tracks), dtype=np.int64))
+    return result
+
+
 def filter_tracks_to_outer_shell(
         tracks, shell_envelope, track_families=None, max_points_per_chunk=500_000,
         return_indices=False):
     """Drop tracks whose two endpoints are outside the shell envelope."""
     if shell_envelope is None or not tracks:
-        result = (tracks, track_families)
-        if return_indices:
-            return (*result, np.arange(len(tracks), dtype=np.int64))
-        return result
-    if track_families is not None and len(track_families) != len(tracks):
-        raise ValueError('track_families must be parallel to tracks')
+        return _unfiltered(tracks, track_families, return_indices)
 
-    if isinstance(tracks, PackedTrackCollection):
-        keep = np.zeros(len(tracks), dtype=bool)
-        tracks_per_chunk = max(1, int(max_points_per_chunk) // 2)
-        for start in range(0, len(tracks), tracks_per_chunk):
-            local_rows = np.arange(
-                start, min(start + tracks_per_chunk, len(tracks)),
-                dtype=np.int64)
-            rows = tracks.rows[local_rows]
-            begin = tracks.offsets[rows]
-            end = tracks.offsets[rows + 1] - 1
-            endpoints = np.stack((
-                tracks.coordinates[begin], tracks.coordinates[end]), axis=1)
-            with torch.no_grad():
-                target_radius, radius, _confidence, _valid = shell_envelope.lookup(
-                    torch.from_numpy(endpoints.reshape(-1, 3)))
-                endpoint_inside = (radius <= target_radius).view(-1, 2).any(dim=1)
-            keep[local_rows] = endpoint_inside.cpu().numpy()
-        kept_indices = np.flatnonzero(keep)
-        filtered_tracks = tracks.subset(kept_indices)
-        filtered_families = (
-            np.asarray(track_families)[kept_indices]
-            if track_families is not None else None)
-        print(
-            f'outer-shell track filter: kept {len(filtered_tracks)} / {len(tracks)} '
-            f'tracks; excluded {len(tracks) - len(filtered_tracks)} entirely '
-            'outside tracks (packed)')
-        result = (filtered_tracks, filtered_families)
-        if return_indices:
-            return (*result, kept_indices)
-        return result
-
-    keep = np.zeros(len(tracks), dtype=bool)
-    nonempty = np.asarray(
-        [index for index, track in enumerate(tracks) if len(track)], dtype=np.int64)
-    tracks_per_chunk = max(1, int(max_points_per_chunk) // 2)
-    for start in range(0, len(nonempty), tracks_per_chunk):
-        batch_indices = nonempty[start:start + tracks_per_chunk]
-        endpoints = np.stack([
-            np.stack([tracks[index][0], tracks[index][-1]])
-            for index in batch_indices
-        ]).astype(np.float32, copy=False)
+    def inside(endpoints):
         with torch.no_grad():
             target_radius, radius, _confidence, _valid = shell_envelope.lookup(
                 torch.from_numpy(endpoints.reshape(-1, 3)))
-            endpoint_inside = (radius <= target_radius).view(-1, 2).any(dim=1)
-        keep[batch_indices] = endpoint_inside.cpu().numpy()
+            return (radius <= target_radius).view(-1, 2).any(dim=1).cpu().numpy()
+    return _filter_tracks_by_endpoints(
+        tracks, inside, track_families, max_points_per_chunk, return_indices,
+        'outer-shell track filter (entirely outside tracks excluded)')
 
-    kept_indices = np.flatnonzero(keep)
-    filtered_tracks = [tracks[index] for index in kept_indices]
-    filtered_families = (
-        [track_families[index] for index in kept_indices]
-        if track_families is not None else None)
-    print(
-        f'outer-shell track filter: kept {len(filtered_tracks)} / {len(tracks)} tracks; '
-        f'excluded {len(tracks) - len(filtered_tracks)} entirely outside tracks'
-    )
-    result = (filtered_tracks, filtered_families)
-    if return_indices:
-        return (*result, kept_indices)
-    return result
+
+def filter_tracks_inside_umbilicus_radius(
+        tracks, umbilicus_z_to_yx, min_radius, track_families=None,
+        max_points_per_chunk=500_000, return_indices=False):
+    """Drop tracks whose two endpoints both lie within ``min_radius`` voxels
+    of the umbilicus axis (``umbilicus_z_to_yx``: z -> (y, x)), so a crushed
+    core does not supervise the innermost windings."""
+    if min_radius <= 0 or not tracks:
+        return _unfiltered(tracks, track_families, return_indices)
+
+    def outside(endpoints):
+        points = endpoints.reshape(-1, 3).astype(np.float64)
+        centre = np.asarray(umbilicus_z_to_yx(points[:, 0]), dtype=np.float64)
+        radius = np.hypot(points[:, 1] - centre[:, 0], points[:, 2] - centre[:, 1])
+        return (radius >= min_radius).reshape(-1, 2).any(axis=1)
+    return _filter_tracks_by_endpoints(
+        tracks, outside, track_families, max_points_per_chunk, return_indices,
+        f'inner-radius track filter (both endpoints within {min_radius:g} of the umbilicus)')
 
 
 def _length_bin_probabilities(arclengths, weights, device):
@@ -1560,6 +1593,57 @@ def _validate_crossing_partner_csr(csr, require_sorted_source_ids=False):
         raise ValueError('crossing cache contains non-finite geometry')
 
 
+def crossing_csr_sha256(csr):
+    """SHA-256 of a crossing CSR in canonical encoding: its arrays in
+    CROSSING_CSR_ARRAYS order, each as its name, length and little-endian
+    bytes of the fixed dtype."""
+    digest = hashlib.sha256()
+    for name, dtype in CROSSING_CSR_ARRAYS:
+        values = np.ascontiguousarray(csr[name], dtype=dtype)
+        digest.update(f'{name}:{values.size}\n'.encode())
+        digest.update(values.data)
+    return digest.hexdigest()
+
+
+def write_crossing_csr_file(destination, csr, metadata):
+    """Atomically write a crossing CSR and its JSON ``metadata`` as an npz:
+    a uniquely named temporary beside ``destination``, then a rename, so
+    concurrent writers never expose a partial file."""
+    destination = Path(destination)
+    temporary = destination.with_name(
+        f'{destination.name}.tmp-{os.getpid()}-{uuid.uuid4().hex}')
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with temporary.open('xb') as stream:
+            np.savez(
+                stream,
+                metadata=np.asarray(json.dumps(metadata, sort_keys=True)),
+                **{name: np.asarray(csr[name], dtype=dtype)
+                   for name, dtype in CROSSING_CSR_ARRAYS})
+        os.replace(temporary, destination)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+    return destination
+
+
+def read_crossing_csr_file(path):
+    """``(metadata, csr)`` of a file write_crossing_csr_file wrote. Raises
+    one of CROSSING_CSR_FILE_ERRORS when it cannot be read or does not hold
+    the arrays in their dtypes."""
+    with np.load(path, allow_pickle=False) as stored:
+        metadata = json.loads(str(stored['metadata'].item()))
+        csr = {name: stored[name] for name, _ in CROSSING_CSR_ARRAYS}
+    if not isinstance(metadata, dict):
+        raise ValueError('crossing cache metadata is not an object')
+    for name, dtype in CROSSING_CSR_ARRAYS:
+        if csr[name].dtype != np.dtype(dtype):
+            raise ValueError(f'crossing cache {name} has dtype {csr[name].dtype}')
+    return metadata, csr
+
+
 def write_track_crossing_cache(
         path, csr, destination=None, source_signature=None,
         z_lo=None, z_hi=None):
@@ -1573,34 +1657,10 @@ def write_track_crossing_cache(
         'version': TRACK_CROSSING_CACHE_VERSION,
         'db_signature': [list(item) for item in signature],
         'db_digest': _tracks_db_digest(path, signature),
-        'angle_degrees': 30.0,
-        'tangent_radius_voxels': 12.0,
-        'cluster_local_index_radius': 4,
+        **TRACK_CROSSING_PARAMETERS,
         'z_range': [z_lo, z_hi],
     }
-    temporary = destination.with_name(
-        destination.name + f'.tmp-{os.getpid()}')
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        with temporary.open('wb') as stream:
-            np.savez(
-                stream,
-                metadata=np.asarray(json.dumps(metadata, sort_keys=True)),
-                source_ids=np.asarray(csr['source_ids'], dtype=np.uint64),
-                offsets=np.asarray(csr['offsets'], dtype=np.int64),
-                partners=np.asarray(csr['partners'], dtype=np.int32),
-                self_local=np.asarray(csr['self_local'], dtype=np.int32),
-                partner_local=np.asarray(csr['partner_local'], dtype=np.int32),
-                positions=np.asarray(csr['positions'], dtype=np.float64),
-                clearances=np.asarray(csr['clearances'], dtype=np.float64),
-            )
-        os.replace(temporary, destination)
-    finally:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
-    return destination
+    return write_crossing_csr_file(destination, csr, metadata)
 
 
 def load_track_crossing_cache(path, warn=True, expected_z_range=None):
@@ -1614,30 +1674,23 @@ def load_track_crossing_cache(path, warn=True, expected_z_range=None):
     if not cache_path.is_file():
         return None
     try:
-        with np.load(cache_path, allow_pickle=False) as stored:
-            metadata = json.loads(str(stored['metadata'].item()))
-            if metadata.get('version') != TRACK_CROSSING_CACHE_VERSION:
-                raise ValueError(
-                    f"unsupported version {metadata.get('version')!r}")
-            expected_signature = [list(item) for item in _tracks_db_signature(path)]
-            stored_signature = metadata.get('db_signature')
-            if not (_db_signatures_match(stored_signature, expected_signature)
-                    or _db_contents_match(stored_signature, metadata.get('db_digest'),
-                                          path, expected_signature)):
-                raise ValueError('tracks DBM has changed since the cache was built')
-            if (expected_z_range is not None
-                    and metadata.get('z_range', [None, None])
-                    != list(expected_z_range)):
-                raise ValueError(
-                    'crossing cache was built for a different z range')
-            csr = {
-                name: stored[name]
-                for name in (
-                    'source_ids', 'offsets', 'partners', 'self_local',
-                    'partner_local', 'positions', 'clearances')
-            }
+        metadata, csr = read_crossing_csr_file(cache_path)
+        if metadata.get('version') != TRACK_CROSSING_CACHE_VERSION:
+            raise ValueError(
+                f"unsupported version {metadata.get('version')!r}")
+        expected_signature = [list(item) for item in _tracks_db_signature(path)]
+        stored_signature = metadata.get('db_signature')
+        if not (_db_signatures_match(stored_signature, expected_signature)
+                or _db_contents_match(stored_signature, metadata.get('db_digest'),
+                                      path, expected_signature)):
+            raise ValueError('tracks DBM has changed since the cache was built')
+        if (expected_z_range is not None
+                and metadata.get('z_range', [None, None])
+                != list(expected_z_range)):
+            raise ValueError(
+                'crossing cache was built for a different z range')
         _validate_crossing_partner_csr(csr, require_sorted_source_ids=True)
-    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+    except CROSSING_CSR_FILE_ERRORS as error:
         if warn:
             print(f'WARNING: ignoring invalid track crossing cache '
                   f'{cache_path}: {error}')

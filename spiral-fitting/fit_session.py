@@ -208,7 +208,7 @@ from surface_orientation import spiral_outward_sense_for
 # (neither /dataset nor a load request names a track database); the fit reads
 # the selected tracks (object_store_track_uuids/_tags, input_use_tracks) and
 # their crossing links, which its link refresh makes. The input manifest lists
-# tracks and track_crossing relationships like any other input.
+# tracks and track_crossing relationships like any other input (until 48).
 # 45: explicit inputs. A service has no dataset: --dataset, spiral-scroll.json
 # and conventional-directory discovery are gone. GET /dataset is replaced by
 # GET /bindings, which advertises the service's host bindings ("bindings":
@@ -265,7 +265,16 @@ from surface_orientation import spiral_outward_sense_for
 # "object_store_input_position" (service-owned) is a position. Commits
 # report "version" (no "pushed"/"push_error", no "pending_commits"). The
 # project's umbilicus is {uuid, generation, version, points_zyx}.
-API_VERSION = 47
+# 48: the fit computes track crossings itself from the selected tracks'
+# stored points, and reads no relationship of a track. The link refresh runs
+# no track-track detector, the link marker records no track selection, and
+# the input manifest lists no track_crossing relationships: it records the
+# crossings as "derived_inputs": {"track_crossing": {source, algorithm,
+# parameters, count, sha256}} (present when tracks are selected), which the
+# input digest covers. A client compares tracks, never crossing
+# relationships; a manifest of an older fit that lists them cannot be
+# compared on its crossings.
+API_VERSION = 48
 
 
 class SessionState(str, Enum):
@@ -984,21 +993,20 @@ PROJECT_INPUT_KEYS = (*PROJECT_LASAGNA_INPUTS, *VOLUME_INPUT_KEYS)
 @dataclass(frozen=True)
 class ProjectUmbilicus:
     """A volume's umbilicus in the project's umbilicus store: its object,
-    the numbered version (and history generation) VC3D read and its points
+    its owning store, numbered version and history generation, and its points
     in the volume's own voxels (ZYX)."""
 
-    uuid: str
-    generation: str
-    version: int
+    reference: dict
     points_zyx: tuple[tuple[float, float, float], ...]
 
     def manifest(self) -> dict[str, Any]:
-        return {"uuid": self.uuid, "generation": self.generation, "version": self.version,
-                "points": len(self.points_zyx)}
+        return {**self.source(), "points": len(self.points_zyx)}
+
+    def source(self) -> dict[str, Any]:
+        return {"reference": self.reference}
 
     def to_mapping(self) -> dict[str, Any]:
-        return {"uuid": self.uuid, "generation": self.generation, "version": self.version,
-                "points_zyx": [list(point) for point in self.points_zyx]}
+        return {**self.source(), "points_zyx": [list(point) for point in self.points_zyx]}
 
 
 @dataclass(frozen=True)
@@ -1237,11 +1245,11 @@ def _checked_fiber_inference(value: Any) -> ProjectFiberInference | None:
 def _checked_umbilicus(value: Any, source: str) -> ProjectUmbilicus:
     if not isinstance(value, Mapping):
         raise ScrollSpecError(f"{source}: umbilicus must be an object")
-    uuid = str(value.get("uuid") or "").strip()
-    generation = str(value.get("generation") or "").strip()
-    version = value.get("version")
-    if not uuid or type(version) is not int or version <= 0:
-        raise ScrollSpecError(f"{source}: umbilicus needs its uuid and numbered version")
+    reference = value.get("reference")
+    if reference is None:
+        raise ScrollSpecError(f"{source}: umbilicus needs a complete reference; regenerate the project inputs")
+    from vc_object_store import object_version_from_json
+    reference = object_version_from_json(json.dumps(reference))
     points = value.get("points_zyx")
     try:
         points = tuple(tuple(float(coordinate) for coordinate in point) for point in points)
@@ -1252,7 +1260,7 @@ def _checked_umbilicus(value: Any, source: str) -> ProjectUmbilicus:
                               for point in points):
         raise ScrollSpecError(
             f"{source}: umbilicus points_zyx must be two or more finite ZYX points")
-    return ProjectUmbilicus(uuid=uuid, generation=generation, version=int(version), points_zyx=points)
+    return ProjectUmbilicus(reference=reference, points_zyx=points)
 
 
 @dataclass(frozen=True)
@@ -1359,11 +1367,11 @@ def write_project_umbilicus(directory: str | os.PathLike[str], volume_uuid: str,
     was built with."""
     target = Path(directory)
     target.mkdir(parents=True, exist_ok=True)
-    path = target / f"umbilicus-{umbilicus.uuid}-v{umbilicus.version}.json"
+    identity = hashlib.sha256(json.dumps(umbilicus.to_mapping(), sort_keys=True).encode()).hexdigest()
+    path = target / f"umbilicus-{identity}.json"
     document = {
         "control_points": [{"z": z, "y": y, "x": x} for z, y, x in umbilicus.points_zyx],
-        "source": {"volume_uuid": volume_uuid, "object_uuid": umbilicus.uuid,
-                   "generation": umbilicus.generation, "version": umbilicus.version},
+        "source": {"volume_uuid": volume_uuid, **umbilicus.source()},
     }
     temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
     temporary.write_text(json.dumps(document), encoding="utf-8")

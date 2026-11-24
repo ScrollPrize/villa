@@ -182,8 +182,7 @@ private:
     // replace only their overlays (vc3d::spiral::readFitInputChanges).
     void loadFitInputChanges();
     void installFitInputChanges(vc3d::spiral::FitInputChanges changes);
-    InputSurfaceEntry fitSurfaceEntry(const vc3d::spiral::FitSurface& entry,
-                                      const QString& category = QStringLiteral("verified")) const;
+    InputSurfaceLoadResult fitSurfaceChanges(const vc3d::spiral::FitInputs& inputs) const;
     void rebuildFitPclDocuments();
     void rebuildFitFibers();
     void showFitInputProblems(const vc3d::spiral::FitInputs& inputs);
@@ -236,7 +235,7 @@ private:
     // (dropped once an input update includes them).
     struct SavedObject {
         std::string uuid;
-        int64_t version = 0;
+        vc::objects::ObjectVersion reference;
     };
     QHash<QString, SavedObject> _brushPatches;
     QHash<QString, SavedObject> _savedCollections;
@@ -245,8 +244,8 @@ private:
     QStringList _savedPatchIds;
     // Those saved when the input update in flight began, with the version
     // saved: one saved again or edited since stays a local drawing.
-    QHash<QString, int64_t> _updatingDrafts;
-    QHash<QString, int64_t> _updatingPatches;
+    QHash<QString, vc::objects::ObjectVersion> _updatingDrafts;
+    QHash<QString, vc::objects::ObjectVersion> _updatingPatches;
     void updateSurfaceIntersections();
     void ensureInitialFocus();
     void initializePreviewFocus();

@@ -4,6 +4,7 @@ import hashlib
 import dataclasses
 import json
 import os
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -27,6 +28,56 @@ def _sha256(path):
 def load(path, log=None, **overrides):
     lines = [] if log is None else log
     return osi.load_fit_inputs(fit_config(path, **overrides), log=lines.append)
+
+
+def test_umbilicus_owner_survives_request_manifest_and_commit(tmp_path):
+    import threading
+    import uuid
+    from fit_session import SpiralProject
+    from spiral_service import ServiceState
+    from service_project import project, UMBILICUS
+
+    manifests = []
+    for owner in (str(uuid.uuid4()), str(uuid.uuid4())):
+        selected = dict(reference=dict(store=owner, generation=UMBILICUS['generation'],
+                                       object=UMBILICUS['uuid'], version=UMBILICUS['version']),
+                        points_zyx=UMBILICUS['points_zyx'])
+        parsed = SpiralProject.from_mapping(project(umbilicus=selected))
+        assert parsed.to_mapping()['volumes'][VOLUME]['umbilicus'] == selected
+        manifest = parsed.record(VOLUME)
+        assert manifest['umbilicus']['reference']['store'] == owner
+        manifests.append(manifest)
+        input_path = tmp_path / 'inputs.json'
+        input_path.write_text(json.dumps({'manifest': {'volume_uuid': VOLUME}}))
+        state = SimpleNamespace(lock=threading.RLock(), session_id='s',
+                                session=SimpleNamespace(status=lambda: dict(
+                                    input_manifest_path=str(input_path), input_digest='digest')),
+                                session_request={'project': dict(umbilicus=selected)},
+                                object_store=SimpleNamespace(author='test'))
+        context = ServiceState._commit_context(state, 's', 1, 'hash')
+        assert context.umbilicus == {'reference': selected['reference']}
+    assert manifests[0] != manifests[1]
+
+
+def test_umbilicus_requires_reference_and_preserves_materialized_source(tmp_path):
+    from fit_session import SpiralProject, ScrollSpecError, write_project_umbilicus
+    from service_project import project, UMBILICUS
+
+    selected = SpiralProject.from_mapping(project()).volumes[VOLUME].umbilicus
+    assert selected.reference == dict(store=UMBILICUS['store'], object=UMBILICUS['uuid'],
+                                      generation=UMBILICUS['generation'], version=UMBILICUS['version'])
+    first = write_project_umbilicus(tmp_path, VOLUME, selected)
+    assert json.loads(Path(first).read_text())['source']['reference'] == selected.reference
+    other = dataclasses.replace(selected, reference=dict(selected.reference, store=selected.reference['object']))
+    second = write_project_umbilicus(tmp_path, VOLUME, other)
+    assert first != second
+    assert json.loads(Path(first).read_text())['source']['reference'] == selected.reference
+    legacy = dict(UMBILICUS)
+    legacy.pop('store')
+    with pytest.raises(ScrollSpecError, match='regenerate'):
+        SpiralProject.from_mapping(project(umbilicus=legacy))
+    with pytest.raises(ScrollSpecError, match='regenerate'):
+        SpiralProject.from_mapping(project(umbilicus=UMBILICUS))
 
 
 def test_default_refresh_writes_links_and_freezes_the_inputs(store_path):
@@ -316,7 +367,19 @@ def test_digest_covers_the_metadata_the_adapter_reads(store_path):
     assert 'objects' in problem
 
 
-def test_a_checkpoint_before_content_identity_compares_geometry(store_path):
+def test_unrecognized_relationship_content_is_not_silently_discarded(store_path):
+    inputs = load(store_path)
+    recorded = json.loads(json.dumps(inputs.manifest))
+    assert recorded['relationships']
+    for entry in recorded['relationships']:
+        entry['generation'] = 7
+    assert 'relationships' in osi.resume_problems({'object_store': recorded}, inputs)[0]
+    recorded['relationships'][0]['content_sha256'] = 'different-content'
+    [problem] = osi.resume_problems({'object_store': recorded}, inputs)
+    assert 'relationships' in problem
+
+
+def test_a_checkpoint_without_relationship_references_requires_regeneration(store_path):
     inputs = load(store_path)
     legacy = json.loads(json.dumps(inputs.manifest))
     # The manifest such a checkpoint recorded: no metadata hashes, no
@@ -326,16 +389,12 @@ def test_a_checkpoint_before_content_identity_compares_geometry(store_path):
         del entry['version']
         entry['object_revision'] = 'another-store'
     legacy['relationships'] = [
-        {key: entry[key] for key in ('uuid', 'kind', 'family', 'approval_state',
-                                     'generation')} | {'revision': 'another'}
+        {key: entry[key] for key in ('uuid', 'kind', 'family', 'approval_state')}
+        | {'generation': 1, 'revision': 'another'}
         for entry in legacy['relationships']]
-    warnings = []
-    assert osi.resume_problems({'object_store': legacy}, inputs,
-                               log=warnings.append) == []
-    assert 'compared on geometry revisions' in warnings[0]
-    legacy['objects'][0]['geometry_revision'] = 'older-geometry'
-    [problem] = osi.resume_problems({'object_store': legacy}, inputs)
-    assert 'objects' in problem
+    for allow_changed in (False, True):
+        with pytest.raises(ValueError, match='regenerate'):
+            osi.resume_problems({'object_store': legacy}, inputs, allow_changed=allow_changed)
 
 
 def test_checkpoint_preflight_checks_the_object_store_inputs(store_path):

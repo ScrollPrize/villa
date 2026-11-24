@@ -1748,6 +1748,12 @@ void SpiralPanel::updateFitInputs()
                 .arg(links.isEmpty() ? tr("none") : links.join(QStringLiteral(", ")),
                      summary.value(QStringLiteral("link_refresh")).toBool()
                          ? tr("refreshed at startup") : tr("as stored, not refreshed"));
+    if (const auto tracks = selection.value(QStringLiteral("track")).toInteger(); tracks > 0)
+        text += tr("\nTracks: %1; %2 crossings computed by the fit from its tracks (crossing "
+                   "relationships of the store are not read)")
+                    .arg(tracks)
+                    .arg(summary.value(QStringLiteral("constraints")).toObject()
+                             .value(QStringLiteral("track crossings")).toInteger());
     if (!_inputFreshness.isEmpty()) text += QStringLiteral("\n") + _inputFreshness;
     _fitInputs->setText(text);
 }
@@ -2017,14 +2023,15 @@ void SpiralPanel::applySessionScroll(const QJsonObject& request)
 {
     const QJsonObject scroll = request.value(QStringLiteral("scroll")).toObject();
     const QJsonObject project = request.value(QStringLiteral("project")).toObject();
+    const auto umbilicus = project.value(QStringLiteral("umbilicus")).toObject();
+    const auto umbilicusSource = umbilicus.value(QStringLiteral("reference")).toObject();
     _scrollSummary->setText(
         tr("%1 — volume %2, %3 µm/voxel, outward %4; umbilicus version %5")
             .arg(scroll.value(QStringLiteral("name")).toString(),
                  project.value(QStringLiteral("volume")).toString())
             .arg(scroll.value(QStringLiteral("voxel_size_um")).toDouble(), 0, 'g', 4)
             .arg(scroll.value(QStringLiteral("spiral_outward_sense")).toString(),
-                 QString::number(project.value(QStringLiteral("umbilicus")).toObject()
-                                     .value(QStringLiteral("version")).toInteger())));
+                 QString::number(umbilicusSource.value(QStringLiteral("version")).toInteger())));
     const QJsonObject lasagna = project.value(QStringLiteral("lasagna")).toObject();
     _lasagnaSummary->setText(
         lasagna.isEmpty()

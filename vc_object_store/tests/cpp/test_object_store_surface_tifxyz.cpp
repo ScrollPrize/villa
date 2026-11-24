@@ -4,6 +4,7 @@
 #include "vc_object_store/geometry/Geometry.hpp"
 #include "vc_object_store/object_links/ObjectLinks.hpp"
 #include "vc_object_store/objects/GeometryExport.hpp"
+#include "vc_object_store/objects/ObjectCollection.hpp"
 #include "vc_object_store/objects/GeometryIngest.hpp"
 #include "vc_object_store/objects/ObjectStoreSession.hpp"
 #include "vc_object_store/objects/ObjectStoreSession.hpp"
@@ -305,6 +306,24 @@ int main() try
         strictIdentity.uuidNamespace = util::newUuid();
         require(ingestGeometrySource(strictStore, "fiber", fibers, {}, "{}", {}, strictIdentity).ingested == 1,
                 "a namespace admits it");
+    }
+    // Historical export uses the selected object's store timeline, not the
+    // overlay's (which has no corresponding publication).
+    {
+        const auto base=directory.path/"export-base.vcobj",overlay=directory.path/"export-overlay.vcobj";
+        std::string fiber;ObjectVersion old;
+        {auto source=ObjectStore::create(base,options);
+            {auto w=source.write();ObjectRecord r;r.kind="fiber";fiber=source.upsertObject(w,r);
+                vc::geometry::Fiber line;line.linePoints={{1,2,3},{5,2,3}};
+                source.putGeometry(w,fiber,vc::geometry::encode(line));w.commit();}
+            {auto r=source.read();old=source.currentObjectRevision(r,fiber)->reference();}
+            {auto w=source.write();source.setMeta(w,fiber,"note","true");source.seal(w);w.commit();}}
+        {auto collection=ObjectCollection::create(overlay,{base},options);}
+        auto target=ObjectStore::open(overlay,options);
+        const auto output=directory.path/"inherited-export.json";
+        require(exportGeometry(target,fiber,output,old)==old,"export preserves inherited exact version");
+        std::ifstream file(output);const auto json=nlohmann::json::parse(file);
+        require(json.at("line_points").size()==2,"inherited historical export contains selected geometry");
     }
     std::cout << "surface tifxyz workflow passed\n";
     return 0;

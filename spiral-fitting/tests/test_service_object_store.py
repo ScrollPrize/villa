@@ -22,7 +22,7 @@ from cpu_service import wait_until  # noqa: E402
 from fit_session import SessionState, SpiralInputPaths  # noqa: E402
 from object_store_fixture import VOLUME  # noqa: E402
 from service_http import ApiError  # noqa: E402
-from service_project import FACTS, UMBILICUS, project, with_project  # noqa: E402
+from service_project import FACTS, UMBILICUS, SELECTED_UMBILICUS, project, with_project  # noqa: E402
 
 # The project has no Lasagna stores and the store no shell, so runs turn off
 # the losses that would need them.
@@ -405,7 +405,8 @@ def test_an_unreachable_served_store_has_no_summary_and_caches_none(host, monkey
         raise ConnectionRefusedError('connection refused')
     monkeypatch.setattr(spiral_service.ObjectStoreBinding, 'open', refused)
     binding = spiral_service.ObjectStoreBinding(
-        'http://127.0.0.1:1', 'store-uuid', 'generation-1', 'svc', served=True)
+        'http://127.0.0.1:1', '11111111-2222-4333-8444-555555555555',
+        '11111111-2222-4333-8444-666666666666', 'svc', served=True)
     assert binding.head() == (None, 'ConnectionRefusedError: connection refused')
     state = spiral_service.ServiceState(
         bindings=host.bindings, object_store=binding,
@@ -418,7 +419,7 @@ def test_an_unreachable_served_store_has_no_summary_and_caches_none(host, monkey
     assert state._startup_inputs is None and state._startup_inputs_reading is None
     assert 'cannot be read' in refusal(state.startup_inputs)
     assert 'cannot be read' in refusal(state._inputs_position, {
-        'store': 'store-uuid', 'generation': 'generation-1', 'commit_sequence': 1})
+        'store': binding.uuid, 'generation': binding.generation, 'commit_sequence': 1})
 
 
 def test_bindings_never_wait_for_the_store_to_be_read(host, filled_store,
@@ -537,8 +538,9 @@ def test_the_build_reads_the_project_of_its_fit_volume(host, store_path, tmp_pat
     assert request['project'] == {
         'name': 's1', 'volume': VOLUME, 'voxel_size_um': 9.6,
         'z_direction_is_top_to_bottom': False, 'left_handed_coordinates': False,
-        'umbilicus': {'uuid': UMBILICUS['uuid'], 'generation': UMBILICUS['generation'],
-                      'version': UMBILICUS['version'], 'points': 2}}
+        'umbilicus': {'reference': dict(store=UMBILICUS['store'], object=UMBILICUS['uuid'],
+                                        generation=UMBILICUS['generation'], version=UMBILICUS['version']),
+                      'points': 2}}
     assert request['scroll']['umbilicus_coordinate_scale'] == 1.0
     assert request['paths']['volume_uuid'] == VOLUME
     assert 'dataset_root' not in request['paths']
@@ -587,7 +589,7 @@ def test_the_fit_volume_must_be_a_project_volume_with_an_umbilicus(host, store_p
     assert 'has no umbilicus for any of its volumes' in refusal(
         state.initialize, initialize_body() | {'project': project(umbilicus=None)})
     body = initialize_body(fit_volume_uuid=VOLUME) | {'project': project(umbilicus=None)}
-    body['project']['volumes']['other-volume'] = {**FACTS, 'umbilicus': UMBILICUS}
+    body['project']['volumes']['other-volume'] = {**FACTS, 'umbilicus': SELECTED_UMBILICUS}
     assert f'has no umbilicus for the fit volume {VOLUME}' in refusal(state.initialize, body)
     assert not state._building
 
@@ -822,7 +824,9 @@ def test_a_changed_project_volume_rebuilds_everything(host, store_path):
     _built(state, initialize_body())
     state.session = SimpleNamespace(status=lambda: {'state': SessionState.Idle,
                                                     'input_generation': 0})
-    changed = {**UMBILICUS, 'version': UMBILICUS['version'] + 1}
+    from service_project import SELECTED_UMBILICUS
+    changed = {**SELECTED_UMBILICUS,
+               'reference': {**SELECTED_UMBILICUS['reference'], 'version': UMBILICUS['version'] + 1}}
     for request, stage in ((initialize_body(), 'model'),
                            (initialize_body() | {'project': project(umbilicus=changed)}, 'all'),
                            (initialize_body() | {'project': project(name='renamed')}, 'all')):

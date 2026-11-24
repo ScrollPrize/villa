@@ -9,6 +9,7 @@
 #include <optional>
 #include <filesystem>
 #include <functional>
+#include <algorithm>
 
 #include <nlohmann/json.hpp>
 #include <vc_object_store/Uuid.hpp>
@@ -124,6 +125,10 @@ public:
    // Parses every collection before installing any; anchored ones are skipped.
    // Returns false (changing nothing) on malformed input.
    bool replaceUnanchoredCollections(const std::vector<nlohmann::json>& collections);
+
+   // Store-backed callers provide the retained allocation floor, not just the
+   // maximum ID visible in a restored/current collection.
+   void reservePointIds(uint64_t firstUnused) { _next_point_id = std::max(_next_point_id, firstUnused); }
 
    // Apply grid offset to all anchor2d values (for surface growth remapping)
    void applyAnchorOffset(float offsetX, float offsetY);

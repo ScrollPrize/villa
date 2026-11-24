@@ -121,6 +121,11 @@ class HostedStoreHandle:
     def relationships_at_versions(self, refs):
         return self.session.relationships_at_versions(self._require(), list(refs))
 
+    def selected_inputs(self, refs, position, relationship_refs=None):
+        return self.session.selected_inputs(
+            self._require(), list(refs), position,
+            None if relationship_refs is None else list(relationship_refs))
+
     def select_objects(self, object_kind=None, tag=None, object_uuids=(), fields=None, include_retired=False,
                        limit=None):
         """Objects by kind, tag and UUID (``ObjectStore.select_objects``'s arguments this handle covers);

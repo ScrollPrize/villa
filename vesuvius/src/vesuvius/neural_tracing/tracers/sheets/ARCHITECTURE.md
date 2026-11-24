@@ -349,6 +349,8 @@ Horizontal fibers of PHercParis4 are matched to the patches they lie on (`script
 `data.fiber_runs`). The fibers are a fiber store's (a VC object store; keyed `fiber:<UUID>`) plus VC3D fiber JSONs
 (`json:<file stem>`), matched within +-2 vx along the patch normal.
 
+Each store-fiber match records its complete `fiber_reference` (store, generation, object and version). Sheet-strip indexing validates that producer reference against its selected catalog before reusing arc positions with current fiber geometry; missing or stale references require regenerating matches. The completed index still records the shared catalog digest for ordinal validation by training. Fully materialized sheet episodes continue using the saved samples without reconnecting them to current fibers.
+
 * **Fiber-seeded episodes (25%, `data.fiber_fraction`).** The seed row is a random stretch of a matched fiber,
   sampled at the 60 vx point spacing. The GT window is rotated so its front axis follows the fiber's course on the
   patch grid, and the episode advances perpendicular to it, either way (`EpisodeSampler._fiber_attempt`, at least

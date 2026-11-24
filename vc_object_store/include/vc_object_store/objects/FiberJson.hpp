@@ -33,4 +33,9 @@ std::string fiberVersionJson(const StoreReader&, const ObjectVersion&,
 std::map<std::string, std::string> fiberNetworkJson(
     const StoreReader&, const std::vector<ObjectVersion>&,
     const std::vector<std::string>& roots = {}, uint64_t byteBudget = 64 * 1024 * 1024);
+// Export the current graph from the caller's pinned read transaction. Works
+// with either history policy; no synthetic historical revisions are created.
+std::map<std::string, std::string> currentFiberNetworkJson(
+    const ObjectStore&, const Txn&, const std::vector<std::string>& roots = {},
+    uint64_t byteBudget = 64 * 1024 * 1024);
 }

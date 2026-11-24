@@ -295,7 +295,7 @@ def varied_store(tmp_path):
         def keep_recorded(edge):
             edge = db.edge(edge['uuid'])
             return {'edge_uuid': edge['uuid'],
-                    'expected_generation': edge['generation'],
+                    'expected_version': edge['version'],
                     'action': 'keep_recorded',
                     'a_revision': db.current_geometry(edge['a'])['uuid'],
                     'b_revision': db.current_geometry(edge['b'])['uuid']}

@@ -105,7 +105,7 @@ def _retire_far(db):
     far = _names_in(db)['far']
     for edge in db.edges_of(far):
         db.remove_edge(edge['uuid'])
-    with db.write(expected_versions={far: db.current_version(far)}) as write:
+    with db.write(expected_versions=db.select_expected_versions({far: db.current_version(far)})) as write:
         write.retire_object(far)
 
 
@@ -279,4 +279,4 @@ def test_a_position_overtaken_by_a_write_is_read_from_history(shared, during_rea
         snapshot = osi.read_snapshot(store, request)
         assert writes and store.history_reads > 0
     assert 'review_note' not in snapshot.objects[near].meta
-    assert snapshot.request.pins.objects == prepared.pins.objects
+    assert snapshot.request.pins.references == prepared.pins.references

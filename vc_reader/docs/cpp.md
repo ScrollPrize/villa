@@ -28,6 +28,8 @@ For CUDA, set `VC_READER_ENABLE_CUDA=ON` and choose
 auto-detection when the option is omitted. The toolkit supplies CUDA Runtime
 and cuFFT. No Python development files are needed when Python is disabled.
 
+Native headers and shared CPU scheduling require Boost headers; the MPMC queue does not link a Boost runtime library. Install `libboost-dev` on Ubuntu or `boost` with Homebrew. The installed headers target propagates the dependency to C++ consumers.
+
 Reader dependencies are libcurl, c-blosc, zstd, zlib, LZ4, SQLite, libtiff, libpng,
 libjpeg, nlohmann-json, and VC-Delta3D. The volcomp codec is vendored under `third_party/volcomp`. CMake uses an installed VC-Delta3D package or fetches its pinned
 revision. A transforms-only build uses `VC_READER_BUILD_READER=OFF` and needs

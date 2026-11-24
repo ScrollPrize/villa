@@ -1,8 +1,37 @@
 """Opt-in ingest repairs for dataset defects: dangling fiber branches and colliding PCL point IDs."""
 import json
+import pytest
 
 from test_derived_uuids import NAMESPACE, derived, edit_v3_fiber, write_v3_fibers
 from vc_object_store import ObjectStore
+
+
+@pytest.mark.parametrize('field', ['branches', 'adjacent_branches'])
+@pytest.mark.parametrize('bad', [{}, None, '', 1, True])
+def test_fiber_topology_array_is_validated_before_normalization(tmp_path, field, bad):
+    directory = tmp_path / 'fibers'
+    names = write_v3_fibers(directory)
+    path = directory / (names[0] + '.json')
+    document = json.loads(path.read_text())
+    document[field] = bad
+    path.write_text(json.dumps(document))
+    with ObjectStore.create(str(tmp_path / 'bad.vcobj'), author='test') as store:
+        report = store.ingest_geometry_source('fiber', directory, uuid_namespace=NAMESPACE)
+        assert report['ingested'] == 0 and 'array' in ' '.join(report['problems']), report
+
+
+@pytest.mark.parametrize('field', ['links', 'windings_linked'])
+@pytest.mark.parametrize('bad', [{}, None, '', 1, True])
+def test_collection_topology_arrays_are_validated_at_ingress(tmp_path, field, bad):
+    point = {'p': [0, 0, 0]}
+    collection = {'name': 'test', 'points': {'0': point}}
+    (point if field == 'links' else collection)[field] = bad
+    source = tmp_path / 'points.json'
+    source.write_text(json.dumps({'vc_pointcollections_json_version': '1', 'collections': {'1': collection}}))
+    with ObjectStore.create(str(tmp_path / 'bad.vcobj'), author='test') as store:
+        report = store.ingest_geometry_source('point_collection', source, uuid_namespace=NAMESPACE)
+        assert report['ingested'] == 0 and 'array' in ' '.join(report['problems']), report
+        assert store.object_count('point_collection') == 0
 
 
 def add_dangling_branch(directory, name, target="missing.json"):
@@ -83,6 +112,44 @@ def test_renumbering_refuses_documents_with_point_links(tmp_path):
         report = store.ingest_geometry_source("point_collection", source, uuid_namespace=NAMESPACE,
                                               renumber_point_ids=True)
         assert report["ingested"] == 0 and "point links" in " ".join(report["problems"]), report
+
+
+def test_maximum_point_id_needs_no_successor_until_repair(tmp_path):
+    source = tmp_path / "maximum.json"
+    maximum = 2**63 - 1
+    document = {"vc_pointcollections_json_version": "1", "collections": {
+        "1": {"name": "maximum", "points": {str(maximum): {"p": [0, 0, 0]}}},
+    }}
+    source.write_text(json.dumps(document))
+    with ObjectStore.create(str(tmp_path / "maximum.vcobj"), author="test") as store:
+        report = store.ingest_geometry_source("point_collection", source, uuid_namespace=NAMESPACE)
+        assert report["ingested"] == 1 and not report["problems"], report
+        with store.geometry_snapshot() as snapshot:
+            geometry = snapshot.point_collection(derived("point_collection:maximum:1")).load()
+            assert list(geometry.ids) == [maximum]
+    document["collections"]["2"] = {"name": "collision", "points": {str(maximum): {"p": [1, 0, 0]}}}
+    source.write_text(json.dumps(document))
+    with ObjectStore.create(str(tmp_path / "exhausted.vcobj"), author="test") as store:
+        report = store.ingest_geometry_source("point_collection", source, uuid_namespace=NAMESPACE,
+                                              renumber_point_ids=True)
+        assert report["ingested"] == 0 and "ID range exhausted" in " ".join(report["problems"]), report
+        assert store.object_count("point_collection") == 0
+    # Two repaired points may consume the last two IDs exactly; no successor
+    # is required after assigning the final representable ID.
+    document["collections"] = {
+        "1": {"name": "high", "points": {str(maximum - 2): {"p": [0, 0, 0]}}},
+        "2": {"name": "first", "points": {"0": {"p": [1, 0, 0]}}},
+        "3": {"name": "second", "points": {"0": {"p": [2, 0, 0]}}},
+    }
+    source.write_text(json.dumps(document))
+    with ObjectStore.create(str(tmp_path / "last_ids.vcobj"), author="test") as store:
+        report = store.ingest_geometry_source("point_collection", source, uuid_namespace=NAMESPACE,
+                                              renumber_point_ids=True)
+        assert report["ingested"] == 3 and not report["problems"], report
+        with store.geometry_snapshot() as snapshot:
+            ids = [list(snapshot.point_collection(derived(f"point_collection:maximum:{cid}")).load().ids)
+                   for cid in ("1", "2", "3")]
+        assert ids == [[maximum - 2], [maximum - 1], [maximum]]
 
 
 def test_v3_pending_auto_branches_survive_shared_reconciliation(tmp_path):

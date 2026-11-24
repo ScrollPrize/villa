@@ -228,6 +228,61 @@ class FlattenLossTest(unittest.TestCase):
 
 		self.assertFalse(bool(mask.any()))
 
+	def test_forward_inversion_finds_containing_cell_beyond_nearest_centres(self) -> None:
+		# One long UV cell followed by many unit cells. Output pixels at the far
+		# end of the long cell have dozens of closer cell centres, so a fixed
+		# k-nearest-centre candidate search leaves holes inside a valid triangle.
+		n_small = 60
+		w = n_small + 2
+		xyz = _flat_grid(2, w)
+		cols = torch.cat([torch.zeros(1), 100.0 + torch.arange(n_small + 1, dtype=torch.float32)])
+		uv = torch.stack(
+			[
+				torch.tensor([0.0, 2.0]).view(2, 1).expand(2, w),
+				cols.view(1, w).expand(2, w),
+			],
+			dim=-1,
+		).contiguous()
+
+		map_yx, sampled, mask = fit_model.Model3D._flatten_invert_forward_uv_map(
+			xyz,
+			torch.ones(1, w - 1, dtype=torch.bool),
+			uv,
+			output_margin=0.0,
+			min_shape=(2, 2),
+		)
+
+		self.assertEqual(tuple(mask.shape), (3, 100 + n_small + 1))
+		self.assertTrue(bool(mask[1].all()))
+		# Inside the long cell the source column runs linearly from 0 to 1.
+		expected = torch.arange(101, dtype=torch.float32) / 100.0
+		self.assertTrue(torch.allclose(map_yx[1, :101, 1], expected, atol=1.0e-5))
+		self.assertTrue(torch.allclose(sampled[0, 1, :101, 0], expected, atol=1.0e-5))
+
+	def test_forward_inversion_keeps_pixels_rounded_onto_triangle_edge(self) -> None:
+		if fit_model.numpy_float_hi != np.float32:
+			self.skipTest("rounding case is specific to float32 output points")
+		# Output column 1 is at 32768.001953125, which rounds to the float32
+		# vertex 32768.0 that closes the last half-pixel cell.
+		uv = torch.stack(
+			[
+				torch.tensor([0.0, 0.5]).view(2, 1).expand(2, 3),
+				torch.tensor([32767.001953125, 32767.501953125, 32768.001953125]).view(1, 3).expand(2, 3),
+			],
+			dim=-1,
+		).contiguous()
+
+		_map_yx, _sampled, mask = fit_model.Model3D._flatten_invert_forward_uv_map(
+			_flat_grid(2, 3),
+			torch.ones(1, 2, dtype=torch.bool),
+			uv,
+			output_margin=0.0,
+			min_shape=(2, 2),
+		)
+
+		self.assertEqual(tuple(mask.shape), (2, 2))
+		self.assertTrue(bool(mask[0].all()))
+
 	def test_flatten_stage_defaults_disable_volume_losses(self) -> None:
 		stages = optimizer.load_stages_cfg({
 			"args": {"model-init": "flatten"},

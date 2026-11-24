@@ -1,4 +1,5 @@
 #include <vc_reader/sampling.hpp>
+#include <vc_reader/compact_normal.hpp>
 #include "vc/lasagna/ChannelSampler.hpp"
 #include "vc/core/util/CudaSampling.hpp"
 #include "vc/core/util/PortableTensor.hpp"
@@ -7,8 +8,11 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <mutex>
+#include <shared_mutex>
 #include <stdexcept>
 #include <type_traits>
+#include <unordered_map>
 
 #include <opencv2/core.hpp>
 #include "vc_reader/array.hpp"
@@ -172,13 +176,7 @@ decodedCompactNormalTable()
     return axis;
 }
 
-// A byte channel's value: uint8, or float32 holding an integer in [0, 255].
-[[nodiscard]] uint8_t byteValue(double value)
-{
-    if (!std::isfinite(value) || value < 0 || value > 255)
-        throw std::runtime_error("invalid packed encoded byte value");
-    return static_cast<uint8_t>(std::lround(value));
-}
+using vc::lasagna::encodedLasagnaByteValue;
 
 // The distinct cubes (lower corners x, y, z) of a batch and each point's cube:
 // nearby candidate points share few cubes, which are read once.
@@ -242,6 +240,23 @@ struct CornerCoordinates {
     void prefetch(size_t) const {}
 };
 
+// Interleave requested channels at each spatial corner so the reader's chunk
+// planner sees them together, including when it splits a large point batch.
+struct ChannelCornerCoordinates {
+    using value_type = int64_t;
+    static constexpr size_t kDimensions = 4;
+    CornerCoordinates spatial;
+    const std::vector<int64_t>* channels;
+    int64_t base(size_t) const { return 0; }
+    const int64_t* operator()(size_t p, int64_t* c) const
+    {
+        c[0] = (*channels)[p % channels->size()];
+        spatial(p / channels->size(), c + 1);
+        return c;
+    }
+    void prefetch(size_t) const {}
+};
+
 // Spatial corners on the selected scalar GPU reader; false on a GPU failure.
 inline bool readCornersOnDevice(const LasagnaChannelBinding& binding, const CornerCoordinates& coords, size_t n,
                                 uint8_t* out)
@@ -270,11 +285,22 @@ void readCorners(const LasagnaChannelBinding& binding,
         binding.packed ? int64_t(binding.channelIndex) : -1};
     const size_t n = lower.size() * 8;
     out.resize(n);
+    if (binding.chunkValidity) {
+        if (!binding.inventory)
+            throw std::logic_error("chunk-validity binding without a chunk inventory");
+        int64_t xyz[4];
+        for (size_t p = 0; p < n; ++p) {
+            const int64_t* zyx = coords(p, xyz);
+            if (coords.channel >= 0) ++zyx;
+            out[p] = binding.inventory->storedAt(zyx[2], zyx[1], zyx[0]) ? T(255) : T(0);
+        }
+        return;
+    }
     if (binding.float32) {
         std::vector<float> values(n);
         binding.array->sample_nearest_coordinates(coords, n, reinterpret_cast<uint8_t*>(values.data()));
         for (size_t i = 0; i < n; ++i)
-            out[i] = std::is_same_v<T, uint8_t> ? T(byteValue(values[i])) : T(values[i]);
+            out[i] = std::is_same_v<T, uint8_t> ? T(encodedLasagnaByteValue(values[i])) : T(values[i]);
     } else {
         std::vector<uint8_t> values(n);
         if (!(binding.cuda && readCornersOnDevice(binding, coords, n, values.data())))
@@ -350,7 +376,7 @@ LasagnaChannelBinding bindLasagnaChannel(
     }
     auto& opened = arrays.arrays[group];
     if (!opened)
-        opened = std::make_shared<vcr::zarr::OpenedArray>(openLasagnaGroupArray(*group, arrays.cache));
+        opened = std::make_shared<vcr::zarr::OpenedArray>(openLasagnaGroupArray(*group, arrays.cache,arrays.readerThreads));
     const auto& meta = opened->meta;
     LasagnaChannelBinding binding;
     binding.group = group;
@@ -364,7 +390,7 @@ LasagnaChannelBinding bindLasagnaChannel(
     binding.packed = meta.shape.size() == 4 && meta.chunks.size() == 4;
     if ((binding.packed && manifest.version != 3 && !manifest.raw.value("packed_channel_view", false)) ||
         (!binding.packed && (meta.shape.size() != 3 || meta.chunks.size() != 3)) ||
-        (binding.packed && (size_t(meta.shape[0]) != group->channels.size() || meta.chunks[0] != meta.shape[0]))) {
+        (binding.packed && size_t(meta.shape[0]) != group->channels.size())) {
         throw std::runtime_error("Lasagna channel '" + std::string(channel) +
                                  "' must reference a 3D (Z,Y,X) zarr");
     }
@@ -380,9 +406,127 @@ LasagnaChannelBinding bindLasagnaChannel(
         binding.chunksZYX[0] == 0 || binding.chunksZYX[1] == 0 || binding.chunksZYX[2] == 0) {
         throw std::runtime_error("Lasagna channel '" + std::string(channel) + "' has empty zarr shape/chunks");
     }
+    if (binding.packed && arrays.channelCache)
+        binding.array->request_channel_cache({int64_t(binding.channelIndex)});
     binding.cuda = vc::cuda::toolReader(*opened,
         binding.packed ? std::optional<std::int64_t>(binding.channelIndex) : std::nullopt);
     return binding;
+}
+
+struct LasagnaChunkInventory::State {
+    std::shared_ptr<vcr::Array> array;
+    vcr::Index prefix;  // packed arrays: the channel chunk index
+    std::array<int64_t, 3> gridXYZ{1, 1, 1};
+    std::shared_mutex mutex;
+    std::unordered_map<uint64_t, bool> stored;
+};
+
+LasagnaChunkInventory::LasagnaChunkInventory(std::shared_ptr<vcr::Array> array, size_t channelIndex)
+    : state_(std::make_unique<State>())
+{
+    if (!array)
+        throw std::invalid_argument("chunk inventory requires an array");
+    const auto& spec = array->spec();
+    const size_t rank = spec.shape.size();
+    if (rank != 3 && rank != 4)
+        throw std::invalid_argument("chunk inventory requires a (Z,Y,X) or (C,Z,Y,X) array");
+    const size_t first = rank - 3;
+    if (rank == 4) {
+        if (spec.chunks[0] <= 0)
+            throw std::invalid_argument("packed array has an empty channel chunk");
+        state_->prefix = {int64_t(channelIndex) / spec.chunks[0]};
+    }
+    const auto& grid = array->chunk_grid();
+    for (size_t axis = 0; axis < 3; ++axis) {
+        chunkXYZ_[2 - axis] = spec.chunks[first + axis];
+        state_->gridXYZ[2 - axis] = grid[first + axis];
+    }
+    state_->array = std::move(array);
+}
+
+LasagnaChunkInventory::~LasagnaChunkInventory() = default;
+
+bool LasagnaChunkInventory::storedChunk(int64_t cx, int64_t cy, int64_t cz)
+{
+    auto& s = *state_;
+    if (cx < 0 || cy < 0 || cz < 0 || cx >= s.gridXYZ[0] || cy >= s.gridXYZ[1] || cz >= s.gridXYZ[2])
+        return false;
+    const uint64_t key = (uint64_t(cz) << 42) | (uint64_t(cy) << 21) | uint64_t(cx);
+    {
+        std::shared_lock lock(s.mutex);
+        if (const auto it = s.stored.find(key); it != s.stored.end())
+            return it->second;
+    }
+    vcr::Index index = s.prefix;
+    index.insert(index.end(), {cz, cy, cx});
+    // A chunk the caches and the source do not hold reads as fill: not stored.
+    const bool stored = bool(s.array->chunk(index));
+    std::unique_lock lock(s.mutex);
+    s.stored.emplace(key, stored);
+    return stored;
+}
+
+bool LasagnaChunkInventory::storedAt(int64_t x, int64_t y, int64_t z)
+{
+    if (x < 0 || y < 0 || z < 0)
+        return false;
+    return storedChunk(x / chunkXYZ_[0], y / chunkXYZ_[1], z / chunkXYZ_[2]);
+}
+
+LasagnaChannelBinding bindLasagnaValidity(
+    const LasagnaDatasetManifest& manifest,
+    const LasagnaChannelBinding& lattice,
+    LasagnaGroupArrays& arrays)
+{
+    if (manifest.validityChannel.empty())
+        throw std::runtime_error("Lasagna dataset declares no validity channel");
+    // A validity channel may lie on its own grid (Lasagna grad_mag at another
+    // scaledown); callers that need one grid check sameLasagnaSamplingGrid.
+    if (!manifest.validityByChunks())
+        return bindLasagnaChannel(manifest, manifest.validityChannel, arrays);
+    LasagnaChannelBinding binding = lattice;
+    binding.cuda = nullptr;
+    binding.float32 = false;
+    binding.chunkValidity = true;
+    binding.inventory = std::make_shared<LasagnaChunkInventory>(lattice.array, lattice.channelIndex);
+    return binding;
+}
+
+void readLasagnaChunkValidityBox(
+    const LasagnaChannelBinding& binding,
+    const std::array<int64_t, 3>& originXYZ,
+    const std::array<int64_t, 3>& shapeXYZ,
+    std::vector<uint8_t>& out)
+{
+    if (!binding.chunkValidity || !binding.inventory)
+        throw std::invalid_argument("chunk validity box requires a chunk-validity binding");
+    for (int axis = 0; axis < 3; ++axis)
+        if (shapeXYZ[axis] <= 0)
+            throw std::invalid_argument("chunk validity box must have positive shape");
+    const size_t voxels = size_t(shapeXYZ[0]) * size_t(shapeXYZ[1]) * size_t(shapeXYZ[2]);
+    out.assign(voxels, uint8_t{0});
+    const auto& chunk = binding.inventory->chunkShapeXYZ();
+    const std::array<int64_t, 3> last{int64_t(binding.shapeZYX[2]), int64_t(binding.shapeZYX[1]), int64_t(binding.shapeZYX[0])};
+    // Fill chunk by chunk: one inventory query per chunk the box touches.
+    const auto floorDiv = [](int64_t v, int64_t c) { return v >= 0 ? v / c : -((-v + c - 1) / c); };
+    for (int64_t cz = floorDiv(originXYZ[2], chunk[2]); cz * chunk[2] < originXYZ[2] + shapeXYZ[2]; ++cz)
+        for (int64_t cy = floorDiv(originXYZ[1], chunk[1]); cy * chunk[1] < originXYZ[1] + shapeXYZ[1]; ++cy)
+            for (int64_t cx = floorDiv(originXYZ[0], chunk[0]); cx * chunk[0] < originXYZ[0] + shapeXYZ[0]; ++cx) {
+                if (cx < 0 || cy < 0 || cz < 0 || !binding.inventory->storedChunk(cx, cy, cz))
+                    continue;
+                const int64_t x0 = std::max(originXYZ[0], cx * chunk[0]);
+                const int64_t x1 = std::min({originXYZ[0] + shapeXYZ[0], (cx + 1) * chunk[0], last[0]});
+                const int64_t y0 = std::max(originXYZ[1], cy * chunk[1]);
+                const int64_t y1 = std::min({originXYZ[1] + shapeXYZ[1], (cy + 1) * chunk[1], last[1]});
+                const int64_t z0 = std::max(originXYZ[2], cz * chunk[2]);
+                const int64_t z1 = std::min({originXYZ[2] + shapeXYZ[2], (cz + 1) * chunk[2], last[2]});
+                for (int64_t z = z0; z < z1; ++z)
+                    for (int64_t y = y0; y < y1; ++y) {
+                        if (x1 <= x0) continue;
+                        auto* row = out.data() + (size_t(z - originXYZ[2]) * size_t(shapeXYZ[1]) + size_t(y - originXYZ[1])) * size_t(shapeXYZ[0]);
+                        std::fill(row + (x0 - originXYZ[0]), row + (x1 - originXYZ[0]), uint8_t{255});
+                    }
+            }
 }
 
 std::vector<LasagnaChannelBinding> bindLasagnaEmbeddingChannels(
@@ -449,7 +593,41 @@ void sampleLasagnaChannelCornerBatch(
         points.push_back(index);
     }
     std::vector<uint8_t> values;
+    std::vector<bool> read(bindings.size(), false);
     for (size_t b = 0; b < bindings.size(); ++b) {
+        if (read[b]) continue;
+        const auto& binding = *bindings[b];
+        if (binding.packed && !binding.cuda && !binding.chunkValidity) {
+            std::vector<size_t> group;
+            std::vector<int64_t> channels;
+            for (size_t j = b; j < bindings.size(); ++j) {
+                if (!read[j] && !bindings[j]->cuda && !bindings[j]->chunkValidity && bindings[j]->array == binding.array) {
+                    group.push_back(j);
+                    channels.push_back(int64_t(bindings[j]->channelIndex));
+                    read[j] = true;
+                }
+            }
+            const ChannelCornerCoordinates coords{{&cubes.lower,
+                {int64_t(binding.shapeZYX[2])-1, int64_t(binding.shapeZYX[1])-1,
+                 int64_t(binding.shapeZYX[0])-1}, -1}, &channels};
+            const size_t count = cubes.lower.size() * 8 * group.size();
+            values.resize(count);
+            if (binding.float32) {
+                std::vector<float> floats(count);
+                binding.array->sample_nearest_coordinates(coords, count,
+                    reinterpret_cast<uint8_t*>(floats.data()));
+                for (size_t i = 0; i < count; ++i) values[i] = encodedLasagnaByteValue(floats[i]);
+            } else {
+                binding.array->sample_nearest_coordinates(coords, count, values.data());
+            }
+            for (size_t j = 0; j < group.size(); ++j)
+                for (size_t i = 0; i < points.size(); ++i)
+                    for (size_t k = 0; k < 8; ++k)
+                        samples.values[group[j]][points[i]][k] =
+                            values[(size_t(cubes.of[i]) * 8 + k) * group.size() + j];
+            continue;
+        }
+        read[b] = true;
         readCorners(*bindings[b], cubes.lower, values);
         auto& out = samples.values[b];
         for (size_t i = 0; i < points.size(); ++i)
@@ -480,6 +658,12 @@ void readLasagnaChannelBox(
     std::vector<float> floats;
     for (size_t b = 0; b < bindings.size(); ++b) {
         const auto& binding = *bindings[b];
+        if (binding.chunkValidity) {
+            readLasagnaChunkValidityBox(binding, originXYZ, shapeXYZ, bytes);
+            for (size_t i = 0; i < voxels; ++i)
+                interleaved[i * bindings.size() + b] = bytes[i];
+            continue;
+        }
         vcr::Index start{originXYZ[2], originXYZ[1], originXYZ[0]};
         vcr::Index size{shapeXYZ[2], shapeXYZ[1], shapeXYZ[0]};
         if (binding.packed) {
@@ -490,7 +674,7 @@ void readLasagnaChannelBox(
             floats.resize(voxels);
             binding.array->read_many({start}, {size}, {reinterpret_cast<uint8_t*>(floats.data())}, vcr::Array::Bounds::Strict);
             for (size_t i = 0; i < voxels; ++i)
-                interleaved[i * bindings.size() + b] = byteValue(floats[i]);
+                interleaved[i * bindings.size() + b] = encodedLasagnaByteValue(floats[i]);
         } else {
             bytes.resize(voxels);
             binding.array->read_many({start}, {size}, {bytes.data()}, vcr::Array::Bounds::Strict);
@@ -574,8 +758,8 @@ LasagnaCompactTensor accumulateCompactTensor(
         if (weight <= 0.0 || skip(k))
             continue;
         const auto& decoded =
-            normalTable[(static_cast<size_t>(byteValue(nxValues[k])) << 8) |
-                        static_cast<size_t>(byteValue(nyValues[k]))];
+            normalTable[(static_cast<size_t>(encodedLasagnaByteValue(nxValues[k])) << 8) |
+                        static_cast<size_t>(encodedLasagnaByteValue(nyValues[k]))];
         if (!decoded.valid)
             continue;
         const double nx = decoded.x;
@@ -615,7 +799,7 @@ std::optional<cv::Vec3d> lasagnaCompactAxisCube(
     const std::array<double, 8>* validity)
 {
     return finalizeLasagnaCompactTensor(accumulateCompactTensor(nxValues, nyValues, fraction,
-        [&](size_t k) { return validity && byteValue((*validity)[k]) == 0; }));
+        [&](size_t k) { return validity && encodedLasagnaByteValue((*validity)[k]) == 0; }));
 }
 
 LasagnaCompactTensor accumulateLasagnaCompactTensorCorners(
@@ -639,6 +823,11 @@ std::optional<double> sampleLasagnaChannel(
     const cv::Vec3d point = volumePoint / binding.spacing;
     if (!insideGrid(binding, point[0], point[1], point[2]))
         return std::nullopt;
+    if (binding.chunkValidity) {
+        LasagnaCubes cubes;
+        readLasagnaCubes(binding, std::span(&volumePoint, 1), cubes);
+        return vcr::sampling::trilinear(cubes.values[0], cubes.fractionsXYZ[0]);
+    }
     double coordinates[4];
     double* zyx = coordinates;
     if (binding.packed) *zyx++ = double(binding.channelIndex);
@@ -697,7 +886,7 @@ void sampleLasagnaVectorBatch(const std::vector<LasagnaChannelBinding>& channels
         auto& vector = vectors[i];
         if (validity && !mask.valid[i]) continue;
         const bool masked = validity && std::any_of(mask.values[i].begin(), mask.values[i].end(),
-                                                    [](double v) { return byteValue(v) == 0; });
+                                                    [](double v) { return encodedLasagnaByteValue(v) == 0; });
         double norm2 = 0;
         for (size_t c = 0; c < channels.size(); ++c) {
             if (!cubes[c].valid[i]) { vector.clear(); break; }
@@ -706,7 +895,7 @@ void sampleLasagnaVectorBatch(const std::vector<LasagnaChannelBinding>& channels
             std::optional<double> value = vcr::sampling::trilinear(values, f.val);
             if (masked) {
                 std::array<uint8_t, 8> valid{};
-                for (size_t k = 0; k < 8; ++k) valid[k] = byteValue(mask.values[i][k]) != 0;
+                for (size_t k = 0; k < 8; ++k) valid[k] = encodedLasagnaByteValue(mask.values[i][k]) != 0;
                 double sampled;
                 value = vcr::sampling::maskedTrilinear(values, valid, f.val, sampled, vcr::sampling::Accumulation::Weighted)
                     ? std::optional<double>(sampled) : std::nullopt;
@@ -783,29 +972,14 @@ double decodeCompactNormalComponent(double raw)
 
 cv::Vec3d decodeCompactNormalFromRaw(double rawNx, double rawNy)
 {
-    const double nx = decodeCompactNormalComponent(rawNx);
-    const double ny = decodeCompactNormalComponent(rawNy);
-    const double nzSq = std::max(0.0, 1.0 - nx * nx - ny * ny);
-    return normalizedOrZero({nx, ny, std::sqrt(nzSq)});
+    const auto normal=vcr::normal::decodeCompactAxis(rawNx,rawNy);
+    return {normal[0],normal[1],normal[2]};
 }
 
 std::optional<std::array<uint8_t, 2>>
 encodeCompactNormalToRaw(const cv::Vec3d& input)
 {
-    cv::Vec3d normal = normalizedOrZero(input);
-    const double norm2 = normal.dot(normal);
-    if (!(norm2 > kEpsilon * kEpsilon) ||
-        !std::isfinite(normal[0]) || !std::isfinite(normal[1]) ||
-        !std::isfinite(normal[2])) {
-        return std::nullopt;
-    }
-    if (normal[2] < 0.0)
-        normal *= -1.0;
-    const auto encode = [](double component) {
-        const long raw = std::lround(component * 127.0 + 128.0);
-        return static_cast<uint8_t>(std::clamp(raw, 0L, 255L));
-    };
-    return std::array<uint8_t, 2>{encode(normal[0]), encode(normal[1])};
+    return vcr::normal::encodeCompactAxis({input[0],input[1],input[2]});
 }
 
 cv::Vec3d principalCompactTensorAxis(const cv::Matx33d& tensor, const cv::Vec3d& hint)

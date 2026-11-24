@@ -8,15 +8,17 @@ from vc_object_store import surfaces
 from vc_reader import tifxyz
 
 
-def read_surface(path, surface_uuid, *, volume, version=None, generation=None):
+def read_surface(path, surface_uuid, *, volume, version=None, generation=None, reference=None):
     """The surface (its current version, or numbered ``version`` in ``generation``, default the store's active one)
-    in voxels of ``volume``. ``extra['store_version']`` is the {generation, version} read.
+    in voxels of ``volume``. ``reference`` selects a complete source-owned version independently of the current
+    head. ``extra['store_version']`` is the complete {store, generation, object, version} read.
 
     Missing vertices, by the store's rule (coordinates and the ``valid`` array), are -1. Raises when the surface
     (version) does not exist or does not map to ``volume``."""
-    grid = surfaces.read_surface(path, surface_uuid, volume=volume, version=version, generation=generation)
+    grid = surfaces.read_surface(path, surface_uuid, volume=volume, version=version, generation=generation,
+                                 reference=reference)
     extra = dict(grid.record['meta'])
-    extra['store_version'] = dict(generation=grid.generation, version=grid.version)
+    extra['store_version'] = grid.reference
     return tifxyz.Surface(grid.points, mask=grid.valid, scale=tuple(grid.scale), uuid=surface_uuid, extra=extra)
 
 

@@ -410,6 +410,12 @@ class ThetaCrossingMap:
         # table before it is replaced.
         self._drain_potential_checks(blocking=True)
         self._finalize_topology()
+        # Release the old node tables before building new ones (one set on the
+        # device, not two); invalidate so a failed refresh is due again.
+        self.invalidate()
+        self.node_theta = torch.empty(0, dtype=torch.float32, device=self.device)
+        self.node_winding_potential = torch.empty(
+            0, dtype=torch.int32, device=self.device)
         theta = torch.empty(self.num_nodes, dtype=torch.float32, device=self.device)
         with torch.no_grad():
             for source in self._sources:
@@ -477,11 +483,13 @@ class ThetaCrossingMap:
             # callback expands only one bounded chunk of IDs at a time; branch
             # steps are computed straight from theta, so patch edges never
             # enter the explicit PCL/fiber edge table above.
+            # The node-sized event table is only read back in chunks: keep it on the host.
             for source in self._potential_sources:
                 if source.count == 0:
                     continue
                 events = torch.zeros(
-                    source.count + 1, dtype=torch.int32, device=self.device)
+                    source.count + 1, dtype=torch.int32,
+                    device=self.topology_device)
                 for lo in range(0, source.count, self.chunk_size):
                     hi = min(source.count, lo + self.chunk_size)
                     nodes_np, parents_np, exits_np = source.get_tree_chunk(lo, hi)
@@ -490,7 +498,8 @@ class ThetaCrossingMap:
                     parents = torch.as_tensor(
                         parents_np, dtype=torch.int64, device=self.device)
                     exits = torch.as_tensor(
-                        exits_np, dtype=torch.int64, device=self.device)
+                        exits_np, dtype=torch.int64,
+                        device=self.topology_device)
                     expected = hi - lo
                     if (nodes.numel() != expected
                             or parents.numel() != expected
@@ -502,9 +511,10 @@ class ThetaCrossingMap:
                         - theta[source.start + parents])
                     steps = (
                         (delta > np.pi).to(torch.int32)
-                        - (delta < -np.pi).to(torch.int32))
+                        - (delta < -np.pi).to(torch.int32)
+                    ).to(self.topology_device)
                     entries = torch.arange(
-                        lo, hi, dtype=torch.int64, device=self.device)
+                        lo, hi, dtype=torch.int64, device=self.topology_device)
                     events.index_add_(0, entries, steps)
                     events.index_add_(0, exits, -steps)
                 torch.cumsum(events, dim=0, dtype=torch.int32, out=events)
@@ -514,7 +524,8 @@ class ThetaCrossingMap:
                     nodes_np, _, _ = source.get_tree_chunk(lo, hi)
                     nodes = torch.as_tensor(
                         nodes_np, dtype=torch.int64, device=self.device)
-                    node_potential[source.start + nodes] = ordered_potential[lo:hi]
+                    node_potential[source.start + nodes] = (
+                        ordered_potential[lo:hi].to(self.device))
             self.node_winding_potential = node_potential
             # One sync per refresh so the common all-registered case skips
             # the per-call unset check below (that check's .any() would

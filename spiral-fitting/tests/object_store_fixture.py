@@ -238,7 +238,7 @@ def edges(path, kind='point-surface'):
     from vc_object_store import ObjectStore
     with ObjectStore.open(str(path), read_only=True) as db:
         return sorted((edge['uuid'], edge['a'], edge['b'], edge['approval_state'],
-                       edge['generation'], edge['changed_at'])
+                       edge['version'], edge['changed_at'])
                       for edge in db.edges_by_kind(kind))
 
 

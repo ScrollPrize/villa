@@ -53,6 +53,7 @@ if (const char* source = std::getenv("VC3D_FIBER_CACHE_TEST_STORE")) {
     live->fiberFileName = original.fileName; live->fiberUsername = original.username;
     live->fiberStartedAt = original.startedAt; live->fiberSequence = original.sequence;
     live->storePin = original.storePin; live->coordinateIdentity = original.coordinateIdentity;
+    live->graphCommit = original.graphCommit;
     live->frame = original.frame; live->fiberOptimizationMode = original.optimizationMode;
     live->fiberTags = original.tags; live->fiberManualHvTag = original.manualHvTag;
     live->fiberWidth = original.width; live->fiberWidthGapFraction = original.widthGapFraction;

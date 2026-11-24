@@ -2,24 +2,18 @@
 #include "vc_object_store/geometry/ArrayBytes.hpp"
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
+#include "vc_object_store/geometry/PointMap.hpp"
+#include "imports/SourceRelationships.hpp"
 #include <algorithm>
-#include <charconv>
 #include <iterator>
 #include <map>
 #include <set>
 #include <cmath>
+#include <limits>
 namespace vc::objects::formats {
 using Json = nlohmann::json;
 namespace fs = std::filesystem;
 namespace {
-int64_t pointId(const std::string& key)
-{
-    int64_t id;
-    const auto [end, error] = std::from_chars(key.data(), key.data() + key.size(), id);
-    if (error != std::errc{} || end != key.data() + key.size() || id < 0)
-        throw std::runtime_error("invalid numeric point ID");
-    return id;
-}
 // Collections sharing a point ID with another collection of the document. Point IDs
 // are document-scoped identities, so these cannot be ingested as written.
 std::set<std::string> collidingCollections(const Json& collections, int64_t& largest)
@@ -28,7 +22,7 @@ std::set<std::string> collidingCollections(const Json& collections, int64_t& lar
     for (const auto& [collectionId, document] : collections.items()) {
         if (!document.at("points").is_object()) throw std::runtime_error("points must be an object");
         for (const auto& [key, value] : document.at("points").items()) {
-            const auto id = pointId(key);
+            const auto id = geometry::pointIdFromString(key);
             largest = std::max(largest, id);
             owners[id].push_back(collectionId);
         }
@@ -44,9 +38,8 @@ std::vector<Prepared> collections(const fs::path& source, const SourceIngestOpti
     const auto root = readJson(source);
     if (root.value("vc_pointcollections_json_version", "") != "1" || !root.at("collections").is_object())
         throw std::runtime_error("expected vc_pointcollections JSON version 1");
-    int64_t nextId = -1;
-    const auto colliding = collidingCollections(root.at("collections"), nextId);
-    ++nextId;
+    int64_t largestId = -1;
+    const auto colliding = collidingCollections(root.at("collections"), largestId);
     if (!colliding.empty()) {
         if (!options.renumberCollidingPointIds) {
             std::string named;
@@ -70,13 +63,8 @@ std::vector<Prepared> collections(const fs::path& source, const SourceIngestOpti
         p.object = sourceObject(original, "point_collection", source);
         if (!seen.insert(p.object.uuid).second) throw std::runtime_error("duplicate collection UUID");
         p.object.name = original.value("name", ""); p.geometry.kind = "point_collection";
-        std::map<int64_t, Json> ordered;
-        if (!original.at("points").is_object()) throw std::runtime_error("points must be an object");
-        for (const auto& [key, value] : original.at("points").items())
-            if (!ordered.emplace(pointId(key), value).second) throw std::runtime_error("duplicate numeric point ID");
+        auto decoded = geometry::decodePointMap(original.at("points"));
         const bool renumber = colliding.contains(collectionId);
-        std::vector<int64_t> ids;
-        std::vector<std::array<double, 3>> coordinates;
         auto attributes = original; attributes.erase("points");
         const auto localCoordinates = mergeGeometryCoordinates(
             documentCoordinates, sourceGeometryCoordinates(original));
@@ -87,17 +75,15 @@ std::vector<Prepared> collections(const fs::path& source, const SourceIngestOpti
         if (!attributes.contains("winding_is_absolute") && source.filename() == "abs_winding.json")
             attributes["winding_is_absolute"] = true;
         if (renumber) attributes["point_ids_renumbered"] = true;
-        attributes["point_attributes"] = Json::array();
-        for (const auto& [id, entry] : ordered) {
-            if (!entry.at("p").is_array() || entry.at("p").size() != 3) throw std::runtime_error("invalid XYZ point");
-            auto xyz = entry.at("p").get<std::array<double, 3>>();
-            for (double value : xyz) if (!std::isfinite(value)) throw std::runtime_error("non-finite point");
-            auto extra = entry; extra.erase("p");
-            if (renumber) extra["source_point_id"] = id;
-            ids.push_back(renumber ? nextId++ : id); coordinates.push_back(xyz);
-            attributes["point_attributes"].push_back(std::move(extra));
+        for (size_t i=0;renumber&&i<decoded.points.ids.size();++i) {
+            decoded.annotations[i]["source_point_id"] = decoded.points.ids[i];
+            if (renumber && largestId == std::numeric_limits<int64_t>::max())
+                throw std::runtime_error("cannot renumber point IDs: numeric ID range exhausted");
+            decoded.points.ids[i] = ++largestId;
         }
-        p.geometry = vc::geometry::encode(vc::geometry::PointCollection{std::move(ids), std::move(coordinates)});
+        attributes["point_attributes"] = std::move(decoded.annotations);
+        detail::validateSourceTopology("point_collection", attributes);
+        p.geometry = vc::geometry::encode(decoded.points);
         p.source = std::move(attributes);
         result.push_back(std::move(p));
     }

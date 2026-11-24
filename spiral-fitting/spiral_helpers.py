@@ -152,6 +152,8 @@ def fiber_control_span(control_xyz, line_xyz):
     degenerate fiber) the control points themselves are the polyline.
     """
     num_control_points = len(control_xyz)
+    if not num_control_points:
+        return line_xyz, 0, np.empty(0, dtype=np.int64)
     if len(line_xyz) >= num_control_points and num_control_points >= 1:
         squared_distances = (
             (line_xyz[None, :, :] - control_xyz[:, None, :]) ** 2).sum(axis=-1)
@@ -1161,10 +1163,15 @@ def _build_spliced_overlay(
             quad_spirals[..., 1:], dr_per_winding)
         vertex_winding = (vertex_shifted / dr).round().to(torch.float32)
 
-        packed_ids = packed_ids_cpu.to(device=device)
-        quad_target_w = patch_evaluation.target_winding_indices[packed_ids]
+        # The evaluation's per-quad tensors may live on the host (after an
+        # out-of-memory fallback): gather there, move only the batch.
+        quad_target_w = patch_evaluation.target_winding_indices[
+            packed_ids_cpu.to(device=patch_evaluation.target_winding_indices.device)
+        ].to(device=device)
         target_w_float = quad_target_w.to(torch.float32)
-        center_theta = patch_evaluation.center_theta[packed_ids]
+        center_theta = patch_evaluation.center_theta[
+            packed_ids_cpu.to(device=patch_evaluation.center_theta.device)
+        ].to(device=device)
         reference_full = center_theta + target_w_float * (2 * np.pi)
         vertex_full = vertex_theta + vertex_winding * (2 * np.pi)
         vertex_full -= torch.round(

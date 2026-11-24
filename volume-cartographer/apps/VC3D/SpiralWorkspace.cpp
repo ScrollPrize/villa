@@ -1,4 +1,5 @@
 #include "SpiralWorkspace.hpp"
+#include <vc_object_store/objects/TransactionJson.hpp>
 
 #include "SpiralPreviewWindings.hpp"
 #include "SpiralUpdatedDrafts.hpp"
@@ -380,8 +381,8 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
         if (phase != QStringLiteral("linking")) return;
         _updatingDrafts.clear();
         _updatingPatches.clear();
-        for (const auto& id : _savedDraftIds) _updatingDrafts[id] = _savedCollections.value(id).version;
-        for (const auto& id : _savedPatchIds) _updatingPatches[id] = _brushPatches.value(id).version;
+        for (const auto& id : _savedDraftIds) _updatingDrafts[id] = _savedCollections.value(id).reference;
+        for (const auto& id : _savedPatchIds) _updatingPatches[id] = _brushPatches.value(id).reference;
     });
     connect(_service, &SpiralServiceManager::inputUpdateFinished, this,
             [this](const SpiralServiceManager::InputUpdate& update) {
@@ -394,11 +395,11 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                 // one was edited or saved again meanwhile (then it stays a
                 // drawing whose next save replaces its object). An update
                 // of a service's store not attached here includes none.
-                auto included = [this, &update](const QHash<QString, int64_t>& saved,
+                auto included = [this, &update](const QHash<QString, vc::objects::ObjectVersion>& saved,
                                                 const QHash<QString, SavedObject>& objects) {
                     return vc3d::spiralDraftsIncludedByUpdate(
                         update.error, update.requested, saved,
-                        [&objects](const QString& id) { return objects.value(id).version; },
+                        [&objects](const QString& id) { return objects.value(id).reference; },
                         [this](const QString& id) { return _brush->savedUnchanged(id); });
                 };
                 const QStringList fittedDrafts = included(drafts, _savedCollections);
@@ -1104,7 +1105,7 @@ void SpiralWorkspace::submitReadyDrafts(bool updateAfter)
         vc3d::spiral::BrushPatchSave save;
         std::optional<vc3d::spiral::SavedBrushPatch> written;
         QString error;
-        int64_t theirs = 0;  // refused: the version another editor saved
+        vc::objects::ObjectVersion theirs;  // refused: the state another editor saved
     };
     struct Result {
         std::vector<PatchJob> patches;
@@ -1113,7 +1114,7 @@ void SpiralWorkspace::submitReadyDrafts(bool updateAfter)
         std::vector<vc3d::spiral::SavedPointCollection> collections;
         QString collectionError;
         std::string changedUuid;  // refused: the object and its version now
-        int64_t changedTo = 0;
+        vc::objects::ObjectVersion changedTo;
         QString lastRequest;  // the receipt of the last commit written
     };
     auto result = std::make_shared<Result>();
@@ -1126,7 +1127,7 @@ void SpiralWorkspace::submitReadyDrafts(bool updateAfter)
             continue;
         }
         const SavedObject previous = known == _brushPatches.cend() ? SavedObject{} : *known;
-        result->patches.push_back({patch.id, {previous.uuid, previous.version, patch.id.toStdString(),
+        result->patches.push_back({patch.id, {previous.uuid, previous.reference, patch.id.toStdString(),
                                               patch.surface, remove}, std::nullopt, {}});
     }
     for (const auto& collection : collections) {
@@ -1145,7 +1146,7 @@ void SpiralWorkspace::submitReadyDrafts(bool updateAfter)
         } else if (const auto known = _savedCollections.constFind(collection.id);
                    known != _savedCollections.cend()) {
             // Saved before but not in the fit yet: replace that object.
-            vc3d::spiral::setPointCollectionObject(result->drafts.back(), known->uuid, known->version);
+            vc3d::spiral::setPointCollectionObject(result->drafts.back(), known->reference);
         }
         result->savedIds << collection.id;
     }
@@ -1167,14 +1168,14 @@ void SpiralWorkspace::submitReadyDrafts(bool updateAfter)
             if (!job.written) {
                 // Saving again replaces their version knowingly: it starts
                 // from the version the refusal named.
-                if (job.theirs != 0 && _brushPatches.contains(job.id))
-                    _brushPatches[job.id].version = job.theirs;
+                if (job.theirs.version != 0 && _brushPatches.contains(job.id))
+                    _brushPatches[job.id].reference = job.theirs;
                 _brush->finalizationFailed(job.id, job.error);
                 errors << tr("%1: %2").arg(job.id, job.error);
                 continue;
             }
             if (job.save.remove) _brushPatches.remove(job.id);
-            else _brushPatches[job.id] = {job.written->uuid, job.written->version};
+            else _brushPatches[job.id] = {job.written->uuid, job.written->reference};
             _brush->finalizationSucceeded(job.id);
             if (!_savedPatchIds.contains(job.id)) _savedPatchIds << job.id;
             saved << job.id;
@@ -1185,15 +1186,15 @@ void SpiralWorkspace::submitReadyDrafts(bool updateAfter)
                 // version the refusal named.
                 for (auto& saved : _savedCollections)
                     if (!result->changedUuid.empty() && saved.uuid == result->changedUuid)
-                        saved.version = result->changedTo;
+                        saved.reference = result->changedTo;
                 for (const auto& id : result->ids) _brush->finalizationFailed(id, result->collectionError);
                 errors << tr("point collections: %1").arg(result->collectionError);
             } else {
                 for (std::size_t i = 0; i < result->collections.size(); ++i) {
                     const QString& id = result->savedIds[int(i)];
                     if (result->fitted.contains(id)) continue;
-                    if (result->collections[i].version == 0) _savedCollections.remove(id);
-                    else _savedCollections[id] = {result->collections[i].uuid, result->collections[i].version};
+                    if (result->collections[i].reference.version == 0) _savedCollections.remove(id);
+                    else _savedCollections[id] = {result->collections[i].uuid, result->collections[i].reference};
                 }
                 for (const auto& id : result->ids) _brush->finalizationSucceeded(id);
                 // Edits of fitted collections are shown from the store now;
@@ -1822,7 +1823,7 @@ void SpiralWorkspace::noteStoreChanges(const vc::objects::StoreSessionEvent& eve
 {
     if (!_fitDocument || event.kind != vc::objects::StoreSessionEvent::Kind::Committed
         || !event.touches({"surface", "point_collection", "fiber", "track", "point-surface",
-                           "same-surface", "fiber_branch", "crossing"}))
+                           "same-surface", "fiber_branch"}))
         return;
     const auto before = _changedOtherInputs.size();
     std::vector<std::string> otherSurfaces;
@@ -1831,11 +1832,12 @@ void SpiralWorkspace::noteStoreChanges(const vc::objects::StoreSessionEvent& eve
         const bool object = change.kind == "surface" || change.kind == "point_collection" || change.kind == "fiber"
             || change.kind == "track";
         // A fitted input, or a link that may involve one, is read again by
-        // itself. Other inputs only matter to a rebuild.
+        // itself. Other inputs only matter to a rebuild. Track crossings are
+        // no links of a fit (it computes them from its tracks): a crossing
+        // relationship's change is not read.
         if (object && _fitRecords.contains(uuid))
             _pendingObjectChanges.insert(change.recordUuid);
-        else if (change.kind == "point-surface" || change.kind == "same-surface" || change.kind == "fiber_branch"
-                 || change.kind == "crossing")
+        else if (change.kind == "point-surface" || change.kind == "same-surface" || change.kind == "fiber_branch")
             _pendingLinkChanges.insert(change.recordUuid);
         else if (change.kind == "surface")
             otherSurfaces.push_back(change.recordUuid);
@@ -1887,14 +1889,31 @@ void SpiralWorkspace::updateInputFreshness()
     if (!_changedOtherInputs.isEmpty())
         notes << tr("%n other surface(s), collection(s) or fiber(s) changed, which a "
                     "rebuild's selection may include", "", int(_changedOtherInputs.size()));
+    // A fit computes its track crossings from its tracks. One made before
+    // that read them as relationships, which are not compared: say so rather
+    // than imply they were checked.
+    const QString uncompared = inputs.crossingsNotCompared
+        ? QStringLiteral(" ") + tr("The %n track crossing(s) this fit read as store relationships are not "
+                                   "compared; a rebuild computes its crossings from its tracks.", "",
+                                   int(std::min<std::size_t>(inputs.crossingsNotCompared,
+                                                             std::numeric_limits<int>::max())))
+        : QString();
+    if (notes.isEmpty() && !inputs.problems.empty()) {
+        // A read that failed compared nothing: it does not say "as fitted".
+        _panel->setInputFreshness(tr("The fit's inputs could not be compared with the attached store: %1")
+                                      .arg(QString::fromStdString(inputs.problems.front())) + uncompared);
+        return;
+    }
     if (notes.isEmpty()) {
-        _panel->setInputFreshness(tr("The attached store holds the fit's inputs as fitted"));
+        _panel->setInputFreshness(inputs.crossingsNotCompared
+            ? tr("The attached store holds the fit's other inputs as fitted.") + uncompared
+            : tr("The attached store holds the fit's inputs as fitted"));
         return;
     }
     // The overlays follow the store; the resident fit does not.
     _panel->setInputFreshness(tr("Stale: %1. The overlays show the store as it is now; "
                                  "Rebuild Fit reads it.")
-                                  .arg(notes.join(QStringLiteral("; "))));
+                                  .arg(notes.join(QStringLiteral("; "))) + uncompared);
 }
 
 void SpiralWorkspace::clearFitInputs(const QString& reason)
@@ -1974,6 +1993,8 @@ void SpiralWorkspace::loadFitInputs()
             });
         } catch (const std::exception& error) {
             inputs->problems.push_back(error.what());
+            // A failed read still says what the manifest cannot be compared on.
+            inputs->crossingsNotCompared = vc3d::spiral::uncomparedTrackCrossings(document);
         }
         return inputs;
     }));
@@ -1988,12 +2009,8 @@ void SpiralWorkspace::installFitInputs(
     _fitInputs = inputs;
     _installedFitInputGeneration = generation;
     updateInputFreshness();
-    InputSurfaceLoadResult surfaces;
+    auto surfaces = fitSurfaceChanges(*inputs);
     surfaces.categories = {QStringLiteral("verified"), QStringLiteral("shell")};
-    for (const auto& entry : inputs->surfaces)
-        if (entry.surface) surfaces.surfaces.push_back(fitSurfaceEntry(entry));
-    if (inputs->outerShell && inputs->outerShell->surface)
-        surfaces.surfaces.push_back(fitSurfaceEntry(*inputs->outerShell, QStringLiteral("shell")));
     installInputSurfaces(surfaces, _inputSurfaceGeneration);
     rebuildFitPclDocuments();
     rebuildFitFibers();
@@ -2002,17 +2019,23 @@ void SpiralWorkspace::installFitInputs(
     if (!_pendingObjectChanges.empty() || !_pendingLinkChanges.empty()) _fitInputReload->start();
 }
 
-SpiralWorkspace::InputSurfaceEntry SpiralWorkspace::fitSurfaceEntry(const vc3d::spiral::FitSurface& entry,
-                                                                    const QString& category) const
+SpiralWorkspace::InputSurfaceLoadResult SpiralWorkspace::fitSurfaceChanges(const vc3d::spiral::FitInputs& inputs) const
 {
-    const QString uuid = QString::fromStdString(entry.pin.uuid);
-    // Keyed and coloured by object UUID, which survives renames.
-    const QString id = QStringLiteral("spiral/%1/%2/%3")
-                           .arg(category, QString::fromStdString(_fitInputs->digest).left(12), uuid);
-    // The CState key is display-specific, but store queries need the actual
-    // object UUID. Do not turn a committed input into a session draft.
-    entry.surface->id = entry.pin.uuid;
-    return {category, id, uuid, entry.surface};
+    InputSurfaceLoadResult result;
+    const auto add = [&](const vc3d::spiral::FitSurface& entry) {
+        const QString category = entry.pin.outerShell ? QStringLiteral("shell") : QStringLiteral("verified");
+        const QString uuid = QString::fromStdString(entry.pin.uuid);
+        const QString id = QStringLiteral("spiral/%1/%2/%3")
+                               .arg(category, QString::fromStdString(inputs.digest).left(12), uuid);
+        if (entry.surface) {
+            // The display key differs from the UUID used by store queries.
+            entry.surface->id = entry.pin.uuid;
+            result.surfaces.push_back({category, id, uuid, entry.surface});
+        } else result.removedIds << id;
+    };
+    for (const auto& entry : inputs.surfaces) add(entry);
+    if (inputs.outerShell) add(*inputs.outerShell);
+    return result;
 }
 
 void SpiralWorkspace::rebuildFitPclDocuments()
@@ -2039,8 +2062,8 @@ void SpiralWorkspace::rebuildFitPclDocuments()
             {QStringLiteral("name"), QString::fromStdString(entry.pin.name)},
             {QStringLiteral("points"), points},
             {QStringLiteral("metadata"), QJsonObject{
-                {QStringLiteral("object_uuid"), QString::fromStdString(entry.pin.uuid)},
-                {QLatin1String(vc3d::spiral::kLocalObjectVersionKey), QJsonValue(qint64(entry.version))},
+                {QLatin1String(vc3d::spiral::kObjectReferenceKey), QJsonDocument::fromJson(
+                    QByteArray::fromStdString(vc::objects::objectVersionToJson(entry.reference))).object()},
                 {QStringLiteral("winding_is_absolute"), entry.absolute}}}};
     }
     const QString digest = QString::fromStdString(_fitInputs->digest).left(12);
@@ -2079,6 +2102,8 @@ void SpiralWorkspace::showFitInputProblems(const vc3d::spiral::FitInputs& inputs
     add(inputs.surfaces);
     add(inputs.pointCollections);
     add(inputs.fibers);
+    if (inputs.outerShell && !inputs.outerShell->problem.empty())
+        notes << QString::fromStdString(inputs.outerShell->problem);
     if (!notes.isEmpty()) statusBar()->showMessage(notes.join(QStringLiteral("; ")), 15000);
 }
 
@@ -2126,16 +2151,7 @@ void SpiralWorkspace::installFitInputChanges(vc3d::spiral::FitInputChanges chang
 {
     // Only what changed is replaced: one surface, the PCL overlays when a
     // collection changed, the fiber overlay when a fiber did.
-    InputSurfaceLoadResult surfaces;
-    for (const auto& entry : changes.inputs.surfaces) {
-        if (entry.surface) {
-            surfaces.surfaces.push_back(fitSurfaceEntry(entry));
-        } else {
-            surfaces.removedIds << QStringLiteral("spiral/verified/%1/%2")
-                                       .arg(QString::fromStdString(_fitInputs->digest).left(12),
-                                            QString::fromStdString(entry.pin.uuid));
-        }
-    }
+    const auto surfaces = fitSurfaceChanges(changes.inputs);
     const bool collectionsChanged = !changes.inputs.pointCollections.empty();
     const bool fibersChanged = !changes.inputs.fibers.empty();
     showFitInputProblems(changes.inputs);

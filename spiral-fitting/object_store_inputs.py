@@ -16,7 +16,10 @@ the fitter's runtime inputs in three stages:
    (materialize_* below).
 
 The store's automatic detectors are authoritative: their relationships are
-consumed as they are, never relinked by proximity here.
+consumed as they are, never relinked by proximity here. Track crossings are
+the exception: they are no relationships of the fit. It computes them from
+the selected tracks' stored points (materialize_tracks) and ignores any
+crossing relationship the store holds.
 
     python object_store_inputs.py STORE [--volume V] \
         [--z-begin Z0 --z-end Z1 [--config FIT.json]]
@@ -40,6 +43,7 @@ import time
 from collections import Counter
 
 import numpy as np
+from vc_object_store.selected import SelectedObject, SelectedRecord
 
 KINDS = ('surface', 'point_collection', 'fiber', 'track')
 # The tag of the scroll's outer shell: a surface the fit reads on its own
@@ -51,20 +55,6 @@ SPIRAL_FIT_TAG = 'spiral-fit'
 KIND_LABELS = {'surface': 'surfaces', 'point_collection': 'point collections',
                'fiber': 'fibers', 'track': 'tracks'}
 
-# Relationship families the fitter consumes, keyed by (edge kind, endpoint
-# kinds in KINDS order). Surface overlaps and fiber-surface contacts share the
-# detectors' 'same-surface' edge kind and differ by endpoint kinds. Family
-# names are Spiral's roles and keep the fitter's "patch" vocabulary. Track
-# crossings feed the track graph; track-surface edges ('same-surface' between
-# a surface and a track) constrain nothing in the fit and are excluded.
-FAMILIES = {
-    ('point-surface', ('surface', 'point_collection')): 'pcl_patch',
-    ('same-surface', ('surface', 'fiber')): 'fiber_patch',
-    ('same-surface', ('surface', 'surface')): 'patch_overlap',
-    ('fiber_branch', ('fiber', 'fiber')): 'fiber_branch',
-    ('crossing', ('track', 'track')): 'track_crossing',
-}
-
 # The coordinates the fitter works in, recorded with every provenance.
 FIT_UNITS = 'reference-volume voxels (ZYX)'
 
@@ -72,9 +62,9 @@ FIT_UNITS = 'reference-volume voxels (ZYX)'
 # or relationship's numbered version moves with every change to it, those
 # the adapter does not read included (a review note, a relationship of a
 # selected object), so versions resolve the inputs exactly but are left out
-# of the digest. Geometry revisions, record UUIDs, content generations and
+# of the digest. Geometry revisions, record UUIDs, consumed content and
 # approval states define them.
-VERSION_FIELDS = {'objects': ('version',), 'relationships': ('version',)}
+VERSION_FIELDS = {'objects': ('version', 'reference'), 'relationships': ('version', 'reference')}
 
 
 class ObjectStoreInputError(ValueError):
@@ -152,7 +142,8 @@ class InputPosition:
             return None
         if 'position' in value and 'commit_sequence' not in value:
             value = value['position']
-        return cls(str(value['store']), str(value['generation']), int(value['commit_sequence']))
+        from vc_object_store import store_position_from_json
+        return cls.of_status(store_position_from_json(json.dumps(value)))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -160,17 +151,18 @@ class InputPins:
     """What a fit reads exactly: the selected objects (and the outer shell)
     at the numbered versions they had when the links were made, and the
     position (the links' commit) that state belongs to. Reads at pins use
-    the store's numbered history (objects_at_versions,
-    relationships_at_versions: the relationships between pinned versions are
-    exact, since a relationship change versions both endpoints), so they do
-    not depend on the store's head.
+    the store's numbered history. Inherited endpoints do not pin overlay
+    membership; such selections cannot replay after an overlay commit.
 
-    ``objects`` may be empty (a position alone, e.g. a configuration's
+    ``references`` may be empty (a position alone, e.g. a configuration's
     object_store_input_position): the versions are then those at the
     store's head when the head is that position, else read from the
-    store's history at the position's publication (local stores)."""
+    store's history at the position's publication (local stores).
+    ``references`` retains each selected version's actual source owner, which
+    may differ from the attached store. Unqualified numeric pins must be
+    regenerated; the attached store cannot recover their original owner."""
     position: InputPosition
-    objects: dict = dataclasses.field(default_factory=dict)  # {uuid: version}
+    references: dict = dataclasses.field(default_factory=dict)  # {uuid: complete reference}
     selection: dict = dataclasses.field(default_factory=dict)  # {kind: sorted UUIDs}
     outer_shell: str = None
 
@@ -181,18 +173,46 @@ class InputPins:
 
     def provenance(self):
         return {'position': self.position.provenance(),
-                'objects': dict(sorted(self.objects.items())),
                 'selection': {kind: list(self.selection.get(kind, ())) for kind in KINDS},
-                'outer_shell': self.outer_shell}
+                'outer_shell': self.outer_shell, 'references': self.references}
+
+    @staticmethod
+    def _decode_reference(uuid, reference):
+        """Validate a complete selected reference at the provenance boundary."""
+        from vc_object_store import object_version_from_json
+        if reference is None:
+            raise ValueError(f'input {uuid} has no complete reference; regenerate the input pins')
+        reference = object_version_from_json(json.dumps(reference))
+        if reference['object'] != uuid:
+            raise ValueError(f'inconsistent exact input reference for {uuid}')
+        return reference
 
     @classmethod
     def from_provenance(cls, value):
         if value is None:
             return None
         position = InputPosition.from_provenance(value)
-        if 'objects' not in value:
+        # This application-owned saved schema has maps of native references and
+        # per-kind UUID arrays. Do not normalize malformed containers to empties.
+        if not isinstance(value.get('references', {}), dict) or not isinstance(value.get('selection', {}), dict):
+            raise ValueError('input pin references and selection must be maps')
+        if any(not isinstance(uuids, list) for uuids in value.get('selection', {}).values()):
+            raise ValueError('input pin selection values must be arrays')
+        if 'objects' in value:
+            raise ValueError('numeric input pins are unsupported; regenerate the input pins')
+        if 'references' not in value:
+            if value.get('selection') or value.get('outer_shell'):
+                raise ValueError('selected inputs have no complete references; regenerate the input pins')
             return cls(position)
-        return cls(position, {str(k): int(v) for k, v in value['objects'].items()},
+        references = value['references']
+        references = {uuid: cls._decode_reference(uuid, reference)
+                      for uuid, reference in references.items()}
+        selected = {uuid for values in value.get('selection', {}).values() for uuid in values}
+        if value.get('outer_shell'):
+            selected.add(value['outer_shell'])
+        if not selected.issubset(references):
+            raise ValueError('selected inputs have no complete references; regenerate the input pins')
+        return cls(position, references,
                    {kind: sorted(value.get('selection', {}).get(kind, ())) for kind in KINDS},
                    value.get('outer_shell'))
 
@@ -200,24 +220,19 @@ class InputPins:
     def from_manifest(cls, manifest):
         """The pins an input manifest (InputSnapshot.manifest) records, or
         None when it contains no position."""
+        references = validated_manifest_references(manifest or {})
         position = InputPosition.from_provenance((manifest or {}).get('position'))
         if position is None:
             return None
-        objects, selection = {}, {kind: [] for kind in KINDS}
-        for entry in manifest.get('objects') or ():
-            objects[entry['uuid']] = int(entry['version'])
-            selection[entry['kind']].append(entry['uuid'])
         shell = manifest.get('outer_shell') or None
-        if shell:
-            objects[shell['uuid']] = int(shell['version'])
-        return cls(position, objects, {kind: sorted(uuids) for kind, uuids in selection.items()},
+        entries = manifest.get('objects') or ()
+        return cls(position, references,
+                   {kind: sorted(entry['uuid'] for entry in entries if entry['kind'] == kind) for kind in KINDS},
                    shell['uuid'] if shell else None)
 
     def refs(self, uuids=None):
         """Numbered references of ``uuids`` (default: every pinned object)."""
-        return [{'store': self.position.store, 'generation': self.position.generation,
-                 'object': uuid, 'version': self.objects[uuid]}
-                for uuid in (self.objects if uuids is None else uuids)]
+        return [self.references[uuid] for uuid in (self.references if uuids is None else uuids)]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -300,6 +315,11 @@ def adapter_metadata(kind, meta, fiber=None, track=None):
     everything materialization reads, so its hash identifies the object's
     input content in any copy of the store. Other metadata (review notes, ingest
     diagnostics) does not reach the fit and does not change the digest.
+
+    This fit-protocol projection is mirrored by VC3D's ``adapterMetadata``;
+    ``test_spiral_store_inputs`` checks parity for coordinates, source tuning,
+    sampling group and fiber/track family fields. These are Spiral semantics,
+    not store identity/placement rules, so they do not belong in vcobj's schema.
     """
     meta = meta or {}
     source = meta.get('source') or {}
@@ -321,17 +341,12 @@ def adapter_metadata(kind, meta, fiber=None, track=None):
 
 
 @dataclasses.dataclass
-class StoredObject:
-    uuid: str
-    kind: str
-    name: str
-    meta: dict
-    tags: list
-    version: int
-    geometry_revision: str
+class StoredObject(SelectedObject):
     frame: ObjectFrame = None
-    fiber: dict = None
-    track: dict = None
+    # A track's dataset as its owning store resolves it (selected_inputs'
+    # track_datasets): what its crossings are grouped by. Not an input of
+    # its own: the track's reference and dataset_ref determine it.
+    dataset: str = None
 
     @property
     def metadata_sha256(self):
@@ -342,7 +357,7 @@ class StoredObject:
         with an object's current metadata as values; ``metadata_sha256`` is
         its identity in the digest."""
         return {'uuid': self.uuid, 'kind': self.kind, 'name': self.name,
-                'version': self.version,
+                'version': self.version, 'reference': self.reference,
                 'geometry_revision': self.geometry_revision,
                 'metadata': adapter_metadata(self.kind, self.meta, self.fiber, self.track),
                 'metadata_sha256': self.metadata_sha256,
@@ -353,12 +368,10 @@ class StoredObject:
 class StoredRelationship:
     """A consumed relationship with endpoints ordered by kind (KINDS order;
     UUID order between objects of one kind), not by stored order."""
-    uuid: str
-    version: int
+    reference: dict
     kind: str
     family: str
     approval_state: str
-    generation: int
     a: str
     b: str
     a_anchor: dict
@@ -368,14 +381,21 @@ class StoredRelationship:
     b_geometry_revision: str = None
     stored_order: tuple = None  # (a, b) as the record stores them
 
+    @property
+    def uuid(self):
+        return self.reference['relationship']
+
+    @property
+    def version(self):
+        return self.reference['version']
+
     def provenance(self):
         """Identity by content: the shared record, its endpoints' geometry
         and a hash of the anchors and metadata materialization reads.
-        ``version`` (its numbered version) only pins it."""
-        return {'uuid': self.uuid, 'version': self.version,
+        The complete reference pins the publication independently of content."""
+        return {'uuid': self.uuid, 'version': self.version, 'reference': self.reference,
                 'kind': self.kind, 'family': self.family,
                 'approval_state': self.approval_state,
-                'generation': self.generation,
                 'a': self.a, 'a_geometry_revision': self.a_geometry_revision,
                 'b': self.b, 'b_geometry_revision': self.b_geometry_revision,
                 'content_sha256': content_sha256(
@@ -407,10 +427,9 @@ class InputSnapshot:
     def pins(self):
         """The snapshot's objects at the versions it read, as the pins of
         ``position`` (the store's head when it read the current state)."""
-        objects = {obj.uuid: obj.version for obj in self.objects.values()}
-        if self.outer_shell is not None:
-            objects[self.outer_shell.uuid] = self.outer_shell.version
-        return InputPins(self.position, objects,
+        return InputPins(self.position,
+                         {obj.uuid: obj.reference for obj in [*self.objects.values(), self.outer_shell]
+                          if obj is not None},
                          {kind: sorted(obj.uuid for obj in self.objects_of(kind)) for kind in KINDS},
                          None if self.outer_shell is None else self.outer_shell.uuid)
 
@@ -449,20 +468,20 @@ def attached_data(record):
     """Whether an object is data attached to another (``meta.role``, e.g. fit
     results) rather than a fit input. The store's PCL-surface detector refuses
     such collections, so they are never selected as inputs."""
-    return record['kind'] == 'point_collection' and 'role' in (record.get('meta') or {})
+    return record.kind == 'point_collection' and 'role' in record.meta
 
 
 def outer_shell(record):
     """Whether an object is the scroll's outer shell (OUTER_SHELL_TAG): read
     on its own, never as a patch."""
-    return record['kind'] == 'surface' and OUTER_SHELL_TAG in (record.get('tags') or ())
+    return record.kind == 'surface' and OUTER_SHELL_TAG in record.tags
 
 
 def spiral_fit(record):
     """Whether an object is a committed Spiral fit (SPIRAL_FIT_TAG). Taking
     one in would make a fit's own output its next input, and change the input
     digest the commit recorded."""
-    return record['kind'] == 'surface' and SPIRAL_FIT_TAG in (record.get('tags') or ())
+    return record.kind == 'surface' and SPIRAL_FIT_TAG in record.tags
 
 
 def fit_input(record):
@@ -471,7 +490,7 @@ def fit_input(record):
 
 
 def resolve_selector(store, kind, selector, records=None):
-    """``{UUID: version}`` of the objects ``selector`` selects among active
+    """``{UUID: reference}`` of the objects ``selector`` selects among active
     objects, at the numbered versions read.
 
     Default and tag selections leave out attached data, the outer shell and
@@ -480,13 +499,13 @@ def resolve_selector(store, kind, selector, records=None):
     the store's current objects."""
     def matching(tag=None):
         if records is not None:
-            return {uuid: record['version'] for uuid, record in records.items()
-                    if record['kind'] == kind and not record.get('retired')
-                    and (tag is None or tag in (record.get('tags') or ()))
+            return {uuid: record.reference for uuid, record in records.items()
+                    if record.kind == kind and not record.retired
+                    and (tag is None or tag in record.tags)
                     and fit_input(record)}
         query = {} if tag is None else {'tag': tag}
-        return {record['uuid']: record['version'] for record in store.select_objects(
-            object_kind=kind, fields=['uuid', 'kind', 'meta', 'tags'], **query)
+        return {record.uuid: record.reference for record in map(SelectedRecord, store.select_objects(
+            object_kind=kind, fields=['uuid', 'kind', 'meta', 'tags'], **query))
             if fit_input(record)}
 
     if selector.is_default:
@@ -498,13 +517,13 @@ def resolve_selector(store, kind, selector, records=None):
         if record is None:
             problems.append(f'selected {kind} {uuid} does not exist'
                             + ('' if records is None else ' at this position'))
-        elif record['kind'] != kind:
-            problems.append(f'selected {kind} {uuid} is a {record["kind"]}')
-        elif record.get('retired'):
+        elif record.kind != kind:
+            problems.append(f'selected {kind} {uuid} is a {record.kind}')
+        elif record.retired:
             problems.append(f'selected {kind} {uuid} is retired')
         elif attached_data(record):
             problems.append(f'selected {kind} {uuid} is attached data with role '
-                            f'{record["meta"]["role"]!r}, not a fit input')
+                            f'{record.meta["role"]!r}, not a fit input')
         elif outer_shell(record):
             problems.append(f'selected {kind} {uuid} is the outer shell (tagged '
                             f'{OUTER_SHELL_TAG}), not a patch')
@@ -512,7 +531,7 @@ def resolve_selector(store, kind, selector, records=None):
             problems.append(f'selected {kind} {uuid} is a committed Spiral fit (tagged '
                             f'{SPIRAL_FIT_TAG}), not a fit input')
         else:
-            selected[record['uuid']] = record['version']
+            selected[record.uuid] = record.reference
     if problems:
         raise ObjectStoreInputError(problems)
     for tag in selector.tags or ():
@@ -526,7 +545,7 @@ def current_record(store, uuid):
     revision = store.current_object_revision(uuid)
     if revision is None or revision.get('deleted'):
         return None
-    return {**revision['record'], 'version': revision['version']}
+    return SelectedObject(revision)
 
 
 def declared_coordinates(meta):
@@ -575,12 +594,6 @@ def object_frame(meta, volume_uuid, fit_scale=1):
                        float(geometry_scale_to_frame(meta, volume_uuid)) / fit_scale)
 
 
-def _relationship_family(record, kinds):
-    endpoint_kinds = tuple(sorted((kinds[record['a']], kinds[record['b']]),
-                                  key=KINDS.index))
-    return FAMILIES.get((record['kind'], endpoint_kinds))
-
-
 def adjacent_winding_offset(fiber_a, fiber_b):
     """W_b - W_a an adjacent-winding branch between two fiber objects
     asserts: the vertical fiber lies one winding inside the horizontal one.
@@ -589,16 +602,6 @@ def adjacent_winding_offset(fiber_a, fiber_b):
     adjacentWindingOffset)."""
     families = tuple((fiber.fiber or {}).get('family') for fiber in (fiber_a, fiber_b))
     return {('H', 'V'): -1, ('V', 'H'): 1}.get(families)
-
-
-def _ordered_endpoints(entry, kinds):
-    """(a, a_anchor, a geometry pin, b, b_anchor, b geometry pin) of a view
-    relationship, ordered by kind, then UUID."""
-    record = entry['record']
-    ends = [(record[side], record[f'{side}_anchor'],
-             entry.get(f'{side}_geometry_revision')) for side in ('a', 'b')]
-    ends.sort(key=lambda end: (KINDS.index(kinds[end[0]]), end[0]))
-    return (*ends[0], *ends[1])
 
 
 def filter_relationships(view_relationships, objects, approved_links_only):
@@ -610,37 +613,25 @@ def filter_relationships(view_relationships, objects, approved_links_only):
     approved-only mode). Adjacent-winding fiber branches are consumed like
     ordinary ones; materialize_fibers signs them.
     """
+    from vc_object_store import relationship_reference, fitting_relationship_inputs
+
     kinds = {uuid: obj.kind for uuid, obj in objects.items()}
-    consumed, exclusions = [], Counter()
-    for entry in view_relationships:
+    selected, exclusions = fitting_relationship_inputs(view_relationships, kinds, approved_links_only)
+    consumed = []
+    for selection in selected:
+        entry = view_relationships[selection['index']]
         record = entry['record']
-        if record['a'] not in kinds or record['b'] not in kinds:
-            exclusions['endpoint outside selection'] += 1
-            continue
-        if not entry['applicable']:
-            exclusions['inapplicable'] += 1
-            continue
-        family = _relationship_family(record, kinds)
-        if family is None:
-            exclusions[f'unused kind {record["kind"]}'] += 1
-            continue
-        state = record['approval_state']
-        if state == 'rejected':
-            exclusions['rejected'] += 1
-            continue
-        if approved_links_only and state != 'approved':
-            exclusions[f'{state} (approved-only)'] += 1
-            continue
-        a, a_anchor, a_geometry, b, b_anchor, b_geometry = _ordered_endpoints(entry, kinds)
+        a, b = ('b', 'a') if selection['reversed'] else ('a', 'b')
         consumed.append(StoredRelationship(
-            uuid=record['uuid'], version=int(entry['version']), kind=record['kind'],
-            family=family, approval_state=state,
-            generation=record['generation'], a=a, b=b, a_anchor=a_anchor,
-            b_anchor=b_anchor, meta=record['meta'] or {},
-            a_geometry_revision=a_geometry, b_geometry_revision=b_geometry,
+            reference=relationship_reference(entry), kind=record['kind'],
+            family=selection['family'], approval_state=record['approval_state'],
+            a=record[a], b=record[b], a_anchor=record[f'{a}_anchor'],
+            b_anchor=record[f'{b}_anchor'], meta=record['meta'] or {},
+            a_geometry_revision=entry.get(f'{a}_geometry_revision'),
+            b_geometry_revision=entry.get(f'{b}_geometry_revision'),
             stored_order=(record['a'], record['b'])))
     consumed.sort(key=lambda rel: (rel.family, rel.a, rel.b, rel.uuid))
-    return consumed, exclusions
+    return consumed, Counter(exclusions)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -650,7 +641,7 @@ class SelectedObjects:
     (store.status()) the versions were read at. ``uuids`` is what callers
     index: ``selected['surface']``."""
     uuids: dict
-    versions: dict
+    references: dict
     position: InputPosition
     outer_shell: str = None
 
@@ -658,7 +649,7 @@ class SelectedObjects:
         return self.uuids[kind]
 
     def pins(self):
-        return InputPins(self.position, dict(self.versions),
+        return InputPins(self.position, self.references,
                          {kind: list(self.uuids[kind]) for kind in KINDS}, self.outer_shell)
 
 
@@ -701,7 +692,7 @@ def _records_at_position(store, position):
     for revision in store.objects_at_versions(refs):
         if revision is None or revision.get('deleted'):
             continue
-        records[revision['object_uuid']] = {**revision['record'], 'version': revision['version']}
+        records[revision['object_uuid']] = SelectedObject(revision)
     return records
 
 
@@ -715,7 +706,7 @@ def _pinned_records(store, pins):
                 f'pinned object {ref["object"]} has no version {ref["version"]} in this store'])
         if revision.get('deleted'):
             continue
-        records[revision['object_uuid']] = {**revision['record'], 'version': revision['version']}
+        records[revision['object_uuid']] = SelectedObject(revision)
     return records
 
 
@@ -725,7 +716,7 @@ CAPTURE_ATTEMPTS = 8
 
 
 def _capture_current(store, request):
-    """``(status, {kind: {UUID: version}}, shells)`` of the request's
+    """``(status, {kind: {UUID: reference}}, shell_references)`` of the request's
     selection among the store's current objects and the surfaces tagged
     OUTER_SHELL_TAG, all at the head ``status`` names. The queries are
     separate reads, so the head is read before and after them: a commit in
@@ -734,9 +725,10 @@ def _capture_current(store, request):
     for _ in range(CAPTURE_ATTEMPTS):
         status = store.status()
         selected = {kind: resolve_selector(store, kind, request.selector(kind)) for kind in KINDS}
-        shells = [] if request.outer_shell == 'off' else [
-            (record['uuid'], record['version']) for record in store.select_objects(
-                object_kind='surface', tag=OUTER_SHELL_TAG, fields=['uuid'])]
+        shells = []
+        if request.outer_shell != 'off':
+            for record in map(SelectedRecord, store.select_objects(object_kind='surface', tag=OUTER_SHELL_TAG, fields=['uuid'])):
+                shells.append(record.reference)
         after = store.status()
         if (after['generation'], after['commit_sequence']) == (status['generation'], status['commit_sequence']):
             return status, selected, shells
@@ -745,20 +737,20 @@ def _capture_current(store, request):
 
 
 def _shells_among(request, records, uuid=None):
-    """``[(UUID, version)]`` of the outer shells among ``records`` (the
+    """Complete references of the outer shells among ``records`` (the
     state at a position), or of the one pinned as ``uuid``."""
     if request.outer_shell == 'off':
         return []
     if uuid is not None:
         records = {uuid: records[uuid]} if uuid in records else {}
-    return [(record['uuid'], record['version']) for record in records.values()
-            if outer_shell(record) and not record.get('retired')]
+    return [record.reference for record in records.values()
+            if outer_shell(record) and not record.retired]
 
 
 def _one_shell(shells):
     if len(shells) > 1:
         raise ObjectStoreInputError([
-            f'{len(shells)} surfaces are tagged {OUTER_SHELL_TAG} ({", ".join(sorted(s for s, _ in shells))}); '
+            f'{len(shells)} surfaces are tagged {OUTER_SHELL_TAG} ({", ".join(sorted(s["object"] for s in shells))}); '
             'the outer shell must be one'])
     return shells[0] if shells else None
 
@@ -803,21 +795,12 @@ def resolve_selection(store, request):
             records = _records_at_position(store, position)
             selected, shells = resolve(records), _shells_among(request, records)
     shell = _one_shell(shells)
-    versions = {uuid: version for by_kind in selected.values() for uuid, version in by_kind.items()}
+    references = {uuid: ref for by_kind in selected.values() for uuid, ref in by_kind.items()}
     if shell is not None:
-        versions[shell[0]] = shell[1]
-    return SelectedObjects({kind: sorted(selected[kind]) for kind in KINDS}, versions, position,
-                           None if shell is None else shell[0])
-
-
-def resolve_outer_shell(store, request):
-    """``(UUID, version)`` of the active surface tagged OUTER_SHELL_TAG at
-    the request's pins (or now), or None; several are an error. A request
-    that reads no shell gives None. resolve_selection reads it with the
-    selection, in one capture."""
-    selected = resolve_selection(store, request)
-    shell = selected.outer_shell
-    return None if shell is None else (shell, selected.versions[shell])
+        references[shell['object']] = shell
+    return SelectedObjects({kind: sorted(selected[kind]) for kind in KINDS},
+                           references, position,
+                           None if shell is None else shell['object'])
 
 
 def read_snapshot(store, request, selected=None):
@@ -829,9 +812,13 @@ def read_snapshot(store, request, selected=None):
     earlier, so one startup reads exactly the objects it refreshed. Every
     object is read at the version the selection resolved it at
     (objects_at_versions), and the relationships between those versions
-    (relationships_at_versions) are exact whatever the store's head.
+    (relationships_at_versions) are guarded against moving overlay membership.
+    One native read (selected_inputs) validates and returns every object; of
+    the tracks it enumerates no relationship (``relationship_refs``), since
+    the fit computes their crossings itself, and it reports each track's
+    dataset as the store resolves it.
     Every selected object must declare a frame in the fit volume; all frame
-    problems are reported together. The outer shell (resolve_outer_shell) is
+    problems are reported together. The selected outer shell is
     read alongside, in the same volume, but is not among ``objects``.
     """
     if selected is None:
@@ -841,15 +828,18 @@ def read_snapshot(store, request, selected=None):
         raise ObjectStoreInputError([
             f'the fit needs the outer shell, and no surface is tagged {OUTER_SHELL_TAG}'])
     position = selected.position
-    pins = InputPins(position, selected.versions)
+    pins = selected.pins()
+    tracks = frozenset(selected['track'])
     refs = pins.refs()
-    revisions = {}
-    for ref, revision in zip(refs, store.objects_at_versions(refs)):
-        if revision is None or revision.get('deleted'):
-            raise ObjectStoreInputError([
-                f'selected object {ref["object"]} is not at version {ref["version"]} of this store'])
-        revisions[revision['object_uuid']] = revision
-    relationships_read = store.relationships_at_versions(refs)
+    if tracks:
+        captured = store.selected_inputs(
+            refs, position.provenance(),
+            relationship_refs=[ref for ref in refs if ref['object'] not in tracks])
+    else:
+        captured = store.selected_inputs(refs, position.provenance())
+    revisions = {revision['object_uuid']: revision for revision in captured['objects']}
+    relationships_read = captured['relationships']
+    track_datasets = captured.get('track_datasets') or {}
 
     notes, problems = [], []
     usable = []
@@ -888,12 +878,7 @@ def read_snapshot(store, request, selected=None):
             problems.append(f'{record["kind"]} {record["uuid"]} '
                             f'({record["name"]!r}): {error}')
             return None
-        return StoredObject(
-            uuid=record['uuid'], kind=record['kind'], name=record['name'],
-            meta=record['meta'] or {}, tags=list(record.get('tags') or ()),
-            version=int(revision['version']),
-            geometry_revision=revision['geometry_revision'], frame=frame,
-            fiber=record.get('fiber'), track=record.get('track'))
+        return StoredObject(revision, frame, track_datasets.get(record['uuid']))
 
     objects = {}
     for revision in usable:
@@ -906,8 +891,7 @@ def read_snapshot(store, request, selected=None):
     relationships, exclusions = filter_relationships(
         relationships_read, objects, request.approved_links_only)
     pinned_request = request if request.pins is not None and request.pins.pinned \
-        else dataclasses.replace(request, pins=InputPins(
-            position, selected.versions, {kind: list(selected[kind]) for kind in KINDS}, shell))
+        else dataclasses.replace(request, pins=selected.pins())
     return InputSnapshot(
         store_location=store_location(store), store_uuid=position.store,
         store_generation=position.generation, volume_uuid=volume_uuid,
@@ -1070,14 +1054,11 @@ def _surface_zyxs(store, obj, what):
     points = arrays['points']
     if points.ndim != 3 or points.shape[-1] != 3:
         raise ObjectStoreInputError([f'{what} {obj.uuid} points have shape {points.shape}'])
-    invalid = np.all(points == -1, axis=-1)
-    if 'valid' in arrays:
-        # The store's per-vertex validity channel (ingested from mask.tif):
-        # zero marks a hole even where coordinates remain.
-        if arrays['valid'].shape != invalid.shape:
-            raise ObjectStoreInputError(
-                [f'{what} {obj.uuid} validity has shape {arrays["valid"].shape}'])
-        invalid |= arrays['valid'] == 0
+    from vc_object_store import Surface
+    validity = arrays.get('valid')
+    surface = Surface.from_arrays(np.ascontiguousarray(points, dtype='<f4'), attributes['scale'],
+                                  None if validity is None else np.ascontiguousarray(validity, dtype='u1'))
+    invalid = ~surface.valid_mask()
     return (obj.frame.xyz_to_fit_zyx(points, invalid), invalid,
             obj.frame.grid_scale_to_fit(attributes['scale']))
 
@@ -1095,7 +1076,7 @@ def materialize_outer_shell(store, snapshot):
 
 
 def materialize_patches(store, snapshot, *, z_begin, z_end, z_margin,
-                        erode_cells_default):
+                        erode_cells_default, exclude_uuids=()):
     """Fit-frame patches of the snapshot, keyed by UUID; and drop counts.
 
     Grid rows and columns are the stored ones: nothing is cropped or
@@ -1103,7 +1084,9 @@ def materialize_patches(store, snapshot, *, z_begin, z_end, z_margin,
     vertices keep the -1 sentinel. A patch's own erosion request is
     ``meta.source.spiral_patch_erode_cells``, as in its tifxyz metadata.
     Each patch carries its loss sampling mask (``z_margin`` is the fit's
-    patch_loss_z_margin), so attachments can be checked against it.
+    patch_loss_z_margin), so attachments can be checked against it, and its
+    object name (``name``) for the name-keyed sampling weights. Patches in
+    ``exclude_uuids`` are left out like patches outside the z window.
     """
     import torch
     from spiral_helpers import (patch_intersects_z_roi, patch_sampling_quad_mask,
@@ -1111,7 +1094,11 @@ def materialize_patches(store, snapshot, *, z_begin, z_end, z_margin,
     from tifxyz import Patch
 
     patches, counts = {}, Counter()
+    exclude_uuids = frozenset(exclude_uuids)
     for obj in snapshot.objects_of('surface'):
+        if obj.uuid in exclude_uuids:
+            counts['patches excluded'] += 1
+            continue
         zyxs, invalid, scale = _surface_zyxs(store, obj, 'patch')
         valid_quads = (~invalid[:-1, :-1] & ~invalid[1:, :-1]
                        & ~invalid[:-1, 1:] & ~invalid[1:, 1:])
@@ -1121,6 +1108,7 @@ def materialize_patches(store, snapshot, *, z_begin, z_end, z_margin,
         erosion = (obj.meta.get('source') or {}).get('spiral_patch_erode_cells')
         patch = Patch(torch.from_numpy(zyxs), torch.tensor(scale),
                       None, None, obj.uuid, erosion)
+        patch.name = obj.name
         if not patch_intersects_z_roi(patch, z_begin, z_end):
             counts['patches outside z ROI'] += 1
             continue
@@ -1274,8 +1262,7 @@ def materialize_point_collections(store, snapshot, patches, first_id=0,
                 'winding_is_absolute': absolute,
                 'input_role': 'absolute' if absolute else 'object_store',
                 'resident_collection_id': cid,
-                'object_uuid': obj.uuid,
-                'object_version': obj.version,
+                'reference': obj.reference,
                 'geometry_revision': obj.geometry_revision,
             },
         }
@@ -1368,8 +1355,8 @@ def materialize_fibers(store, snapshot, patches, *, min_point_spacing,
             obj.frame.xyz_to_fit_zyx(arrays['line_points'])[:, ::-1])
         controls = np.ascontiguousarray(
             obj.frame.xyz_to_fit_zyx(arrays['control_points'])[:, ::-1])
-        if len(controls) < 1:
-            raise ObjectStoreInputError([f'fiber {obj.uuid} has no control points'])
+        if not len(controls) and not len(line):
+            raise ObjectStoreInputError([f'fiber {obj.uuid} has no points'])
         own_contacts = contacts[obj.uuid]
         polyline, span_begin, control_line = fiber_control_span(controls, line)
         if polyline is controls:
@@ -1421,8 +1408,7 @@ def materialize_fibers(store, snapshot, patches, *, min_point_spacing,
             'color': [0.0, 0.0, 0.0], 'source_file': None,
             'metadata': {
                 'hv_classification': hv,
-                'object_version': obj.version,
-                'object_uuid': obj.uuid,
+                'reference': obj.reference,
                 'geometry_revision': obj.geometry_revision,
                 'fiber_num_control_points': len(controls),
             },
@@ -1488,14 +1474,12 @@ def materialize_patch_overlaps(store, snapshot, patches, *, pair_spacing,
     def pinned(rel):
         a, b = rel.stored_order or (rel.a, rel.b)
         anchors = {rel.a: rel.a_anchor, rel.b: rel.b_anchor}
-        return {'uuid': rel.uuid, 'a': a, 'b': b,
+        return {'uuid': rel.uuid,
                 'whole_geometry': all(bool((anchors[end] or {}).get('whole_geometry'))
                                       for end in (a, b)),
                 'meta': json.dumps(rel.meta),
-                'a_object_meta': json.dumps(snapshot.objects[a].meta),
-                'b_object_meta': json.dumps(snapshot.objects[b].meta),
-                'a_geometry_revision': snapshot.objects[a].geometry_revision,
-                'b_geometry_revision': snapshot.objects[b].geometry_revision}
+                'a_reference': snapshot.objects[a].reference,
+                'b_reference': snapshot.objects[b].reference}
     fit_scale = snapshot.request.fit_scale
     results = store.overlap_correspondences_at(
         [pinned(rel) for rel in edges.values()], snapshot.volume_uuid,
@@ -1553,7 +1537,7 @@ def materialize_patch_overlaps(store, snapshot, patches, *, pair_spacing,
                     'input_role': 'patch_overlap',
                     'resident_collection_id': cid,
                     'edge_uuid': rel.uuid,
-                    'edge_version': rel.version,
+                    'edge_reference': rel.reference,
                     'pair_distance': float(pair['distance']) / fit_scale,
                 },
             }
@@ -1576,70 +1560,390 @@ class TrackInputs:
     its row among every selected track. ``crossings`` is the exact-crossing
     CSR over every selected track (rows are source ids): partner rows,
     crossing point indices on both tracks, and the crossing's arclength
-    position and clearance in fit voxels.
+    position and clearance in fit voxels. ``derived`` says how the crossings
+    were derived from the tracks (the manifest's
+    ``derived_inputs.track_crossing``).
     """
     tracks: object
     crossings: dict
+    derived: dict = None
 
 
 # Stored track family -> the crossing kernel's family code.
 TRACK_FAMILY_CODES = {'horizontal': 0, 'vertical': 1}
+# Under the fit's cache directory: the crossings computed for a selection of
+# track revisions (materialize_tracks), in stored voxels.
+TRACK_CROSSING_CACHE_DIRECTORY = os.path.join('track_crossings', 'v2')
+TRACK_CROSSING_CACHE_FORMAT = 2
+# What reading or writing a crossing cache store raises, the store's native
+# errors included: a miss, or a cache left unwritten; never a failed fit.
+TRACK_CROSSING_STORE_ERRORS = (OSError, RuntimeError, ValueError, KeyError, TypeError,
+                               MemoryError)  # a failed allocation, the store's included
+# Stored track coordinates the crossing kernel can index: [0, 2**20).
+TRACK_COORDINATE_LIMIT = 1 << 20
 
 
-def _track_order(obj):
-    """Tracks sort by dataset, then numeric source key, then UUID."""
-    track = obj.track or {}
-    key = str(track.get('external_key') or '')
-    return (str(track.get('dataset_ref') or ''), not key.isdigit(),
-            int(key) if key.isdigit() else 0, key, obj.uuid)
+@dataclasses.dataclass
+class _CrossingRows:
+    """What the crossings of ordered tracks (_ordered_tracks) depend on
+    besides their points: per row the kernel's family code, the numeric
+    source key and the stored -> fit scale, and the groups (``(dataset,
+    first row, end row)``) tracks pair within."""
+    families: np.ndarray
+    keys: np.ndarray
+    to_fit: np.ndarray
+    groups: list
 
 
-def _track_crossing_csr(snapshot, tracks, lengths, problems):
-    """The crossing CSR of the snapshot's track crossings over ``tracks``."""
-    row = {obj.uuid: index for index, obj in enumerate(tracks)}
-    records = []
-    for rel in snapshot.relationships_of('track_crossing'):
-        meta = rel.meta.get('track_crossing') or {}
-        endpoints = meta.get('endpoints') or {}
-        ends = []
-        for uuid, anchor in ((rel.a, rel.a_anchor), (rel.b, rel.b_anchor)):
-            local = _anchor_index(anchor, 'points')
-            arclength = (endpoints.get(uuid) or {}).get('arclength_voxels')
-            if local is None or arclength is None:
-                problems.append(f'track crossing {rel.uuid} lacks a point anchor '
-                                f'or arclength for {uuid}')
-            elif not 0 <= local < lengths[row[uuid]]:
-                problems.append(f'track crossing {rel.uuid} anchors point {local} '
-                                f'outside the {lengths[row[uuid]]} points of {uuid}')
-            else:
-                ends.append((row[uuid], local,
-                             float(arclength) * tracks[row[uuid]].frame.to_fit))
-        clearance = meta.get('clearance_voxels')
-        if clearance is None:
-            problems.append(f'track crossing {rel.uuid} lacks its clearance')
-        if len(ends) < 2 or clearance is None:
-            continue
-        clearance = float(clearance) * tracks[ends[0][0]].frame.to_fit
-        (a, a_local, a_position), (b, b_local, b_position) = ends
-        records.append((a, b, a_local, b_local, a_position, clearance))
-        records.append((b, a, b_local, a_local, b_position, clearance))
-    table = np.array(records, dtype=np.float64).reshape(-1, 6)
-    table = table[np.lexsort((table[:, 1], table[:, 0]))]
-    rows = table[:, 0].astype(np.int64)
-    offsets = np.zeros(len(tracks) + 1, dtype=np.int64)
-    np.cumsum(np.bincount(rows, minlength=len(tracks)), out=offsets[1:])
+def _ordered_tracks(tracks):
+    """``(tracks in crossing order, their _CrossingRows)``.
+
+    Tracks pair only within a dataset, and are consecutive rows of it in
+    source-ID order. The grouping, the order and their validation are the
+    store's (vc_object_store.group_track_datasets, which its track-track
+    detector uses; the dataset of a track is the one the store resolved for
+    the selection): a track without a dataset, an ``external_key`` that is
+    no canonical decimal uint64 or repeats in its dataset and a family
+    other than horizontal, vertical or blank are input errors. So is a
+    dataset in more than one frame scale, which only a fit can tell."""
+    from vc_object_store import group_track_datasets
+    tracks = list(tracks)
+    undeclared = [obj.uuid for obj in tracks
+                  if not obj.dataset and not (obj.track or {}).get('dataset_ref')]
+    if undeclared:
+        raise ObjectStoreInputError([f'track {uuid} has no dataset_ref' for uuid in undeclared])
+    unresolved = [obj.uuid for obj in tracks if not obj.dataset]
+    if unresolved:
+        raise ObjectStoreInputError([
+            f'the store did not resolve the dataset of {len(unresolved)} selected track(s) '
+            f'(first: {unresolved[0]}); a served store needs a vc_object_server of this version'])
+    try:
+        groups = group_track_datasets(
+            [obj.uuid for obj in tracks], [obj.dataset for obj in tracks],
+            [str((obj.track or {}).get('external_key') or '') for obj in tracks],
+            [str((obj.track or {}).get('family') or '') for obj in tracks])
+    except RuntimeError as error:
+        raise ObjectStoreInputError([str(error)]) from error
+    order = [np.frombuffer(group['rows'], dtype=np.int64) for group in groups]
+    ordered = [tracks[row] for rows in order for row in rows.tolist()]
+    families = np.concatenate(
+        [np.frombuffer(group['families'], dtype=np.int8) for group in groups]
+        or [np.empty(0, dtype=np.int8)]).astype(np.int8)
+    keys = np.concatenate(
+        [np.frombuffer(group['source_ids'], dtype=np.uint64) for group in groups]
+        or [np.empty(0, dtype=np.uint64)]).astype(np.uint64)
+    to_fit = np.array([obj.frame.to_fit for obj in ordered], dtype=np.float64)
+    bounds, begin, problems = [], 0, []
+    for group, rows in zip(groups, order):
+        end = begin + len(rows)
+        bounds.append((group['dataset'], begin, end))
+        scales = sorted(set(to_fit[begin:end].tolist()))
+        if len(scales) > 1:
+            problems.append(f'the tracks of dataset {group["dataset"]!r} are in different frames '
+                            f'(stored -> fit scales {scales}); their crossings need one')
+        begin = end
+    if problems:
+        raise ObjectStoreInputError(problems)
+    return ordered, _CrossingRows(families, keys, to_fit, bounds)
+
+
+def _empty_crossings(rows):
     return {
-        'source_ids': np.arange(len(tracks), dtype=np.uint64),
-        'offsets': offsets,
-        'partners': table[:, 1].astype(np.int32),
-        'self_local': table[:, 2].astype(np.int32),
-        'partner_local': table[:, 3].astype(np.int32),
-        'positions': table[:, 4].copy(),
-        'clearances': table[:, 5].copy(),
+        'source_ids': np.arange(rows, dtype=np.uint64),
+        'offsets': np.zeros(rows + 1, dtype=np.int64),
+        'partners': np.empty(0, dtype=np.int32),
+        'self_local': np.empty(0, dtype=np.int32),
+        'partner_local': np.empty(0, dtype=np.int32),
+        'positions': np.empty(0, dtype=np.float64),
+        'clearances': np.empty(0, dtype=np.float64),
     }
 
 
-def materialize_tracks(store, snapshot, *, z_begin, z_end):
+def _compute_track_crossings(tracks, points, rows, workers=None):
+    """The exact-crossing CSR over ordered tracks in stored voxels, from
+    their stored ZYX points (``points[row]``, int32), with Spiral's crossing
+    builder (tracks._build_crossing_partner_csr on the native kernel, the
+    implementation the store's track-track detector shares) run once per
+    group. Rows are the tracks' rows; partners are sorted within a row; the
+    point indices are the stored ones. ``points`` is emptied group by group."""
+    from tracks import _build_crossing_partner_csr, _load_native_track_crossings
+    if _load_native_track_crossings() is None:
+        raise ObjectStoreInputError([
+            'the crossings of object-store tracks need the native kernel '
+            'vc_spiral.track_crossings, which is not available'])
+    limit = np.iinfo(np.int32).max
+    if len(tracks) > limit:
+        raise ObjectStoreInputError([f'{len(tracks)} tracks exceed the crossing index ({limit})'])
+    parts = []
+    for dataset, begin, end in rows.groups:
+        group = points[begin:end]
+        points[begin:end] = [None] * (end - begin)
+        families = rows.families[begin:end]
+        offsets = np.zeros(end - begin + 1, dtype=np.int64)
+        np.cumsum([len(track) for track in group], out=offsets[1:])
+        if offsets[-1] > np.iinfo(np.uint32).max:
+            raise ObjectStoreInputError([
+                f'the tracks of dataset {dataset!r} have {offsets[-1]} points, more than '
+                f'the crossing kernel indexes ({np.iinfo(np.uint32).max})'])
+        # Crossings pair opposite families: without both there are none.
+        if not (np.any(families == 0) and np.any(families == 1)):
+            continue
+        flat = np.concatenate(group)
+        del group
+        try:
+            csr = _build_crossing_partner_csr(
+                [flat[offsets[row]:offsets[row + 1]] for row in range(end - begin)],
+                families, flat_points=flat, offsets=offsets,
+                source_ids=rows.keys[begin:end], workers=workers)
+        except (RuntimeError, ValueError) as error:
+            raise ObjectStoreInputError([
+                f'the crossings of the tracks of dataset {dataset!r} cannot be computed: '
+                f'{error}']) from error
+        del flat
+        parts.append((begin, csr))
+    # Groups are consecutive rows and the kernel orders each group's records
+    # by row, then partner row: the merged CSR is their concatenation.
+    merged = _empty_crossings(len(tracks))
+    if not parts:
+        return merged
+    counts = np.zeros(len(tracks), dtype=np.int64)
+    for begin, csr in parts:
+        counts[begin:begin + len(csr['offsets']) - 1] = np.diff(csr['offsets'])
+    np.cumsum(counts, out=merged['offsets'][1:])
+    for name in ('partners', 'self_local', 'partner_local', 'positions', 'clearances'):
+        columns = [csr[name] + begin if name == 'partners' and begin else csr[name]
+                   for begin, csr in parts]
+        merged[name] = (columns[0] if len(columns) == 1 else np.concatenate(columns)).astype(
+            merged[name].dtype, copy=False)
+    return merged
+
+
+def _track_crossing_key(tracks, rows):
+    """What the crossings of ordered tracks are a function of, as a digest:
+    the kernel and its parameters, and per row the track, its geometry
+    revision, its family code and its group. Neither the store's commit nor
+    a frame scale: the cached crossings are in stored voxels."""
+    from tracks import TRACK_CROSSING_ALGORITHM, TRACK_CROSSING_PARAMETERS
+    digest = hashlib.sha256(json.dumps(
+        {'format': TRACK_CROSSING_CACHE_FORMAT, 'algorithm': TRACK_CROSSING_ALGORITHM,
+         'parameters': TRACK_CROSSING_PARAMETERS}, sort_keys=True).encode())
+    group = np.zeros(len(tracks), dtype=np.int64)
+    for index, (_, begin, end) in enumerate(rows.groups):
+        group[begin:end] = index
+    for row, obj in enumerate(tracks):
+        digest.update(f'\n{obj.uuid} {obj.geometry_revision} {rows.families[row]} '
+                      f'{group[row]}'.encode())
+    return digest.hexdigest()
+
+
+def _track_crossing_cache_path(cache_directory, key):
+    return os.path.join(cache_directory, TRACK_CROSSING_CACHE_DIRECTORY, f'{key}.vcobj')
+
+
+def _track_uuid_bytes(tracks):
+    """The tracks' UUIDs as uint8[N, 16], by row."""
+    return np.frombuffer(b''.join(bytes.fromhex(obj.uuid.replace('-', '')) for obj in tracks),
+                         dtype=np.uint8).reshape(len(tracks), 16)
+
+
+def _crossing_columns(csr, uuids):
+    """One row per crossing pair of a CSR: (a, b UUID bytes, local_a, local_b,
+    position_a, position_b, clearance), from the slots whose partner is the
+    later row and their reverse slots. None when the CSR is not the kernel's
+    symmetric table (each pair in both rows, one clearance), which a store
+    of pairs could not give back."""
+    count = len(uuids)
+    rows = np.repeat(np.arange(count, dtype=np.int64), np.diff(csr['offsets']))
+    partners = csr['partners'].astype(np.int64)
+    forward = partners > rows
+    key = rows * count + partners  # ascending: rows ascend, partners ascend within a row
+    wanted = partners[forward] * count + rows[forward]
+    reverse = np.searchsorted(key, wanted)
+    if (2 * int(forward.sum()) != len(partners) or len(key) and (
+            reverse.max(initial=0) >= len(key) or not np.array_equal(key[reverse], wanted))):
+        return None
+    columns = (uuids[rows[forward]], uuids[partners[forward]],
+               csr['self_local'][forward], csr['partner_local'][forward],
+               csr['positions'][forward], csr['positions'][reverse], csr['clearances'][forward])
+    if (not np.array_equal(csr['self_local'][reverse], columns[3])
+            or not np.array_equal(csr['partner_local'][reverse], columns[2])
+            or not np.array_equal(csr['clearances'][reverse], columns[6])):
+        return None
+    return tuple(np.ascontiguousarray(column) for column in columns)
+
+
+def _crossings_from_columns(columns, uuids):
+    """The CSR over the rows of ``uuids`` that the pairs of a crossing store
+    are: each pair in both its rows, partners ascending within a row. A pair
+    naming a track that is not among ``uuids`` raises ValueError."""
+    count = len(uuids)
+
+    def halves(column):
+        # A UUID as two big-endian integers: (high, low) orders like its bytes.
+        pair = np.ascontiguousarray(column, dtype=np.uint8).reshape(-1, 16).view('>u8')
+        return pair[:, 0].astype(np.uint64), pair[:, 1].astype(np.uint64)
+    high, low = halves(uuids)
+    # Every lookup is a binary search of whole UUIDs. Halves are ranked
+    # among the tracks' own, so a (high, low) pair is one integer key that
+    # orders like the UUID; UUIDs sharing a half cost nothing extra.
+    highs, high_rank = np.unique(high, return_inverse=True)
+    lows, low_rank = np.unique(low, return_inverse=True)
+    names = high_rank.astype(np.int64) * len(lows) + low_rank
+    order = np.argsort(names, kind='stable')
+    names = names[order]
+
+    def rank(values, wanted):
+        found = np.searchsorted(values, wanted)
+        known = found < len(values)
+        known[known] = values[found[known]] == wanted[known]
+        return found, known
+
+    distinct = len(highs) == count  # the usual case: no two tracks share a high half
+    high_order = np.argsort(high, kind='stable') if distinct else None
+
+    def rows_of(column):
+        wanted_high, wanted_low = halves(column)
+        if distinct:  # the high half finds the row; the low half confirms it
+            found, known = rank(highs, wanted_high)
+            rows = high_order[np.minimum(found, count - 1)] if count else found
+            if not (known.all() and np.array_equal(low[rows], wanted_low)):
+                raise ValueError('it names a track that is not selected')
+            return rows
+        (high_rank, high_known), (low_rank, low_known) = rank(highs, wanted_high), rank(lows, wanted_low)
+        known = high_known & low_known
+        wanted = np.where(known, high_rank.astype(np.int64) * len(lows) + low_rank, -1)
+        found, named = rank(names, wanted)
+        if not (known & named).all():
+            raise ValueError('it names a track that is not selected')
+        return order[found]
+    a, b = rows_of(columns['a']), rows_of(columns['b'])
+    rows, partners = np.concatenate([a, b]), np.concatenate([b, a])
+    slots = np.argsort(rows * count + partners, kind='stable')  # by row, then partner
+    both = lambda first, second: np.concatenate([columns[first], columns[second]])[slots]
+    return {
+        'source_ids': np.arange(count, dtype=np.uint64),
+        'offsets': np.concatenate([[0], np.cumsum(np.bincount(rows, minlength=count))]).astype(np.int64),
+        'partners': partners[slots].astype(np.int32),
+        'self_local': both('local_a', 'local_b').astype(np.int32),
+        'partner_local': both('local_b', 'local_a').astype(np.int32),
+        'positions': both('position_a', 'position_b').astype(np.float64),
+        'clearances': both('clearance', 'clearance').astype(np.float64),
+    }
+
+
+def _crossing_store_workers(workers, limit=32):
+    return max(1, min(limit, int(workers or os.cpu_count() or 1)))
+
+
+def _load_track_crossings(path, key, tracks, workers=None, *, warn=True):
+    """``(CSR in stored voxels, its sha256)`` the crossing store at ``path``
+    holds for ``key`` over ``tracks`` (ordered), or None. A missing store is
+    a miss; so is one that cannot be read, is of another key, algorithm or
+    track count, names a track that is not selected, or whose crossings are
+    not the ones its checksum was taken of (the checksum of the CSR as it
+    was computed, crossing_csr_sha256), with a warning: it is rebuilt."""
+    from tracks import (TRACK_CROSSING_ALGORITHM, _validate_crossing_partner_csr,
+                        crossing_csr_sha256)
+    if not os.path.lexists(path):
+        return None
+    try:
+        from vc_object_store import CollectionReader
+        with CollectionReader(path) as reader:
+            info = reader.track_crossing_info()
+            if info['key'] != key or info['algorithm'] != TRACK_CROSSING_ALGORITHM:
+                raise ValueError('it was built for other tracks')
+            if info['tracks'] != len(tracks):
+                raise ValueError(f'it holds {info["tracks"]} rows, not {len(tracks)}')
+            columns = reader.track_crossing_columns(_crossing_store_workers(workers))
+        csr = _crossings_from_columns(columns, _track_uuid_bytes(tracks))
+        _validate_crossing_partner_csr(csr)
+        sha256 = crossing_csr_sha256(csr)
+        if sha256 != info['checksum']:
+            raise ValueError('its crossings do not match its checksum')
+    except TRACK_CROSSING_STORE_ERRORS as error:
+        if warn:
+            print(f'WARNING: ignoring invalid track crossing cache {path}: {error}')
+        return None
+    return csr, sha256
+
+
+def _store_track_crossings(path, key, csr, sha256, tracks, position=None, *, replace=False,
+                           workers=None):
+    """Publishes the crossings as the sealed crossing store ``path``
+    (vc_object_store.write_track_crossing_store: one edge and one compact
+    row per pair, built with the sharded streaming importer), recording
+    ``key``, the CSR's checksum and the store ``position`` the tracks were
+    read at. A store already there is left alone, unless ``replace``: the
+    caller holds the cache's lock and found that store unusable. It is then
+    read once more, here, immediately before it would be deleted: a process
+    that could not take the lock may have published a good one since, which
+    is kept. Nothing a cache cannot do fails the fit: the computed crossings
+    stay in use."""
+    from tracks import TRACK_CROSSING_ALGORITHM, TRACK_CROSSING_PARAMETERS
+    absent = False  # the destination was ours to write
+    try:
+        if os.path.lexists(path):
+            if not replace or _load_track_crossings(path, key, tracks, workers, warn=False):
+                return
+            os.remove(path)
+        absent = True
+        columns = _crossing_columns(csr, _track_uuid_bytes(tracks))
+        if columns is None:
+            print(f'WARNING: not caching the track crossings at {path}: they are not one '
+                  'symmetric table of pairs')
+            return
+        info = {'algorithm': TRACK_CROSSING_ALGORITHM, 'parameters': dict(TRACK_CROSSING_PARAMETERS),
+                'key': key, 'checksum': sha256, 'tracks': len(tracks)}
+        if position is not None:
+            info['based_on'] = [{'store_uuid': position.store, 'generation': position.generation,
+                                 'commit_sequence': position.commit_sequence}]
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        from vc_object_store import write_track_crossing_store
+        # Shards and writers: more than eight did not write 6.6M pairs faster.
+        write_track_crossing_store(path, *columns, info,
+                                   workers=_crossing_store_workers(workers, limit=8))
+    except TRACK_CROSSING_STORE_ERRORS as error:
+        if not (absent and os.path.lexists(path)):  # else another process published it meanwhile
+            print(f'WARNING: cannot write the track crossing cache {path}: {error}')
+
+
+@contextlib.contextmanager
+def _track_crossing_lock(path):
+    """Holds the cache store's lock (service_files.ExclusiveFileLock), and
+    gives whether it is held: of the processes that miss one cache store at
+    once (the ranks of a distributed fit), one computes the crossings and
+    the others wait for its store instead of each holding the kernel's
+    buffers. Where the cache cannot be written nothing is held (False) and
+    each computes."""
+    from service_files import ExclusiveFileLock, FileLockUnavailable
+    lock = ExclusiveFileLock(f'{path}.lock')
+    try:
+        try:
+            lock.acquire()
+        except FileLockUnavailable:
+            print('track crossings: waiting for another process that computes them')
+            lock.acquire(timeout=None)
+    except OSError:
+        yield False
+        return
+    try:
+        yield True
+    finally:
+        lock.release()
+
+
+def _track_crossing_provenance(csr, sha256):
+    """The manifest's ``derived_inputs.track_crossing``: the crossings are
+    computed from the selected tracks; their count and the checksum of the
+    CSR in stored voxels identify them."""
+    from tracks import TRACK_CROSSING_ALGORITHM, TRACK_CROSSING_PARAMETERS
+    return {'source': 'computed', 'algorithm': TRACK_CROSSING_ALGORITHM,
+            'parameters': dict(TRACK_CROSSING_PARAMETERS),
+            'count': len(csr['partners']) // 2, 'sha256': sha256}
+
+
+def materialize_tracks(store, snapshot, *, z_begin, z_end,
+                       cache_directory=None, workers=None):
     """The snapshot's tracks and crossings (TrackInputs), or None without
     tracks; and counts.
 
@@ -1647,38 +1951,88 @@ def materialize_tracks(store, snapshot, *, z_begin, z_end):
     z_end)``. Arclengths and tortuosities are measured on the stored integer
     voxels, as the packed track store measures them, then converted to fit
     voxels.
-    """
-    from tracks import PackedTrackCollection
 
-    tracks = sorted(snapshot.objects_of('track'), key=_track_order)
+    The crossings are computed here, from the stored points of every
+    selected track (those outside the z window included), and are a function
+    of the selected track revisions alone: exact shared voxels of
+    opposite-family tracks of one dataset (_ordered_tracks,
+    _compute_track_crossings). Crossing relationships a store holds are not
+    read. ``cache_directory`` (the fit's cache) keeps them, in stored
+    voxels, for the next fit of the same track revisions, as a sealed store
+    of the crossing pairs (_store_track_crossings); ``workers`` bounds the
+    kernel's threads and the cache store's writers and readers. They are computed whatever the fit's crossing
+    limits, so a fit's inputs do not depend on its run settings.
+    """
+    from tracks import PackedTrackCollection, crossing_csr_sha256
+
     counts = Counter()
-    if not tracks:
+    if not snapshot.objects_of('track'):
         return None, counts
-    problems = []
-    lengths = np.zeros(len(tracks), dtype=np.int64)
-    kept, stored, fit, families, scales = [], [], [], [], []
-    for index, obj in enumerate(tracks):
-        arrays, _ = read_geometry(store, obj.geometry_revision, ['points'])
-        xyz = arrays['points']
-        if xyz.ndim != 2 or xyz.shape[1] != 3:
-            problems.append(f'track {obj.uuid} points have shape {xyz.shape}')
-            continue
-        lengths[index] = len(xyz)
-        if not len(xyz):
-            continue
-        z = xyz[:, 2].astype(np.float64) * obj.frame.to_fit
-        if z.min() < z_begin or z.max() >= z_end:
-            counts['tracks outside the z window'] += 1
-            continue
-        family = (obj.track or {}).get('family') or ''
-        kept.append(index)
-        stored.append(np.ascontiguousarray(xyz[:, ::-1], dtype=np.int32))
-        fit.append(obj.frame.xyz_to_fit_zyx(xyz))
-        families.append(TRACK_FAMILY_CODES.get(family, -1))
-        scales.append(obj.frame.to_fit)
-    crossings = _track_crossing_csr(snapshot, tracks, lengths, problems)
-    if problems:
-        raise ObjectStoreInputError(problems)
+    cached = cache_path = key = None
+    tracks, rows = _ordered_tracks(snapshot.objects_of('track'))
+    if cache_directory:
+        key = _track_crossing_key(tracks, rows)
+        cache_path = _track_crossing_cache_path(cache_directory, key)
+        cached = _load_track_crossings(cache_path, key, tracks, workers)
+    with contextlib.ExitStack() as computing:
+        locked = False
+        if cache_path is not None and cached is None:
+            # One process computes a missing store; one that waited reads it.
+            locked = computing.enter_context(_track_crossing_lock(cache_path))
+            cached = _load_track_crossings(cache_path, key, tracks, workers)
+        # Every selected track's stored points, when the crossings are computed.
+        selection = [None] * len(tracks) if cached is None else None
+        problems = []
+        kept, stored, fit, families, scales = [], [], [], [], []
+        for index, obj in enumerate(tracks):
+            arrays, _ = read_geometry(store, obj.geometry_revision, ['points'])
+            xyz = arrays['points']
+            if xyz.ndim != 2 or xyz.shape[1] != 3:
+                problems.append(f'track {obj.uuid} points have shape {xyz.shape}')
+                continue
+            zyx = np.ascontiguousarray(xyz[:, ::-1], dtype=np.int32)
+            if selection is not None:
+                if len(xyz) and not (xyz.min() >= 0 and xyz.max() < TRACK_COORDINATE_LIMIT):
+                    problems.append(f'track {obj.uuid} has coordinates outside '
+                                    f'[0, {TRACK_COORDINATE_LIMIT}), which crossings cannot index')
+                if len(xyz) > np.iinfo(np.int32).max:
+                    problems.append(f'track {obj.uuid} has {len(xyz)} points, more than '
+                                    'crossings can index')
+                selection[index] = zyx
+            if not len(xyz):
+                continue
+            z = xyz[:, 2].astype(np.float64) * obj.frame.to_fit
+            if z.min() < z_begin or z.max() >= z_end:
+                counts['tracks outside the z window'] += 1
+                continue
+            family = (obj.track or {}).get('family') or ''
+            kept.append(index)
+            stored.append(zyx)
+            fit.append(obj.frame.xyz_to_fit_zyx(xyz))
+            families.append(TRACK_FAMILY_CODES.get(family, -1))
+            scales.append(obj.frame.to_fit)
+        if problems:
+            raise ObjectStoreInputError(problems)
+        if cached is None:
+            started = time.monotonic()
+            csr = _compute_track_crossings(tracks, selection, rows, workers)
+            sha256 = crossing_csr_sha256(csr)
+            if cache_path is not None:
+                # A store still there failed both reads: under the lock it is replaced.
+                _store_track_crossings(cache_path, key, csr, sha256, tracks, snapshot.position,
+                                       replace=locked, workers=workers)
+            print(f'track crossings: {len(csr["partners"]) // 2} computed from '
+                  f'{len(tracks)} tracks in {time.monotonic() - started:.1f} s')
+        else:
+            csr, sha256 = cached
+            print(f'track crossings: {len(csr["partners"]) // 2} read from the cache '
+                  f'{cache_path}')
+    del selection
+    derived = _track_crossing_provenance(csr, sha256)
+    # Stored voxels -> fit voxels, by each row's (its group's) frame.
+    scale = np.repeat(rows.to_fit, np.diff(csr['offsets']))
+    csr = {**csr, 'positions': csr['positions'] * scale,
+           'clearances': csr['clearances'] * scale}
 
     track_lengths = np.array([len(points) for points in stored], dtype=np.int64)
     offsets = np.zeros(len(stored) + 1, dtype=np.int64)
@@ -1706,13 +2060,14 @@ def materialize_tracks(store, snapshot, *, z_begin, z_end):
         points, offsets, np.asarray(kept, dtype=np.uint64),
         np.asarray(families, dtype=np.int8), arclengths, tortuosities)
     counts['tracks'] = len(kept)
-    counts['track crossings'] = len(crossings['partners']) // 2
-    return TrackInputs(collection, crossings), counts
+    counts['track crossings'] = derived['count']
+    return TrackInputs(collection, csr, derived), counts
 
 
 def materialize(store, snapshot, *, z_begin, z_end, z_margin,
                 erode_cells_default, fiber_min_point_spacing=0.0,
-                overlap_pair_spacing=8.0, overlap_max_pairs=16, patch_overlaps=True):
+                overlap_pair_spacing=8.0, overlap_max_pairs=16, patch_overlaps=True,
+                exclude_patch_uuids=(), cache_directory=None):
     """Every runtime input of a frozen snapshot.
 
     Fibers are decimated to ``fiber_min_point_spacing`` (the fitter's
@@ -1720,10 +2075,11 @@ def materialize(store, snapshot, *, z_begin, z_end, z_margin,
     ``overlap_max_pairs`` pairs ``overlap_pair_spacing`` voxels apart.
     Resident ids number PCLs, then fibers, then overlap pairs;
     ``patch_overlaps`` False (input_use_patch_overlaps off) makes none.
+    ``cache_directory`` is materialize_tracks' cache.
     """
     patches, counts = materialize_patches(
         store, snapshot, z_begin=z_begin, z_end=z_end, z_margin=z_margin,
-        erode_cells_default=erode_cells_default)
+        erode_cells_default=erode_cells_default, exclude_uuids=exclude_patch_uuids)
     dropped = []
     point_collections, pcl_counts = materialize_point_collections(
         store, snapshot, patches, dropped=dropped)
@@ -1742,7 +2098,9 @@ def materialize(store, snapshot, *, z_begin, z_end, z_margin,
         overlaps = {}
         counts['patch overlaps unused (input_use_patch_overlaps off)'] = len(
             snapshot.relationships_of('patch_overlap'))
-    tracks, track_counts = materialize_tracks(store, snapshot, z_begin=z_begin, z_end=z_end)
+    tracks, track_counts = materialize_tracks(
+        store, snapshot, z_begin=z_begin, z_end=z_end,
+        cache_directory=cache_directory)
     counts.update(track_counts)
     return FitInputs(snapshot, patches, point_collections, fibers,
                      fiber_links, counts, dropped_attachments=dropped,
@@ -1751,8 +2109,9 @@ def materialize(store, snapshot, *, z_begin, z_end, z_margin,
                      tracks=tracks)
 
 
-def materialize_from_config(store, snapshot, config):
-    """materialize() with the fit configuration's window and settings."""
+def materialize_from_config(store, snapshot, config, cache_directory=None):
+    """materialize() with the fit configuration's window and settings.
+    ``cache_directory`` is the fit's cache."""
     return materialize(
         store, snapshot, z_begin=config['z_begin'], z_end=config['z_end'],
         z_margin=config['patch_loss_z_margin'],
@@ -1760,7 +2119,9 @@ def materialize_from_config(store, snapshot, config):
         fiber_min_point_spacing=config['pcl_fiber_min_point_spacing'],
         overlap_pair_spacing=config['pcl_patch_overlap_pair_spacing'],
         overlap_max_pairs=config['pcl_patch_overlap_max_pairs'],
-        patch_overlaps=bool(config['input_use_patch_overlaps']))
+        patch_overlaps=bool(config['input_use_patch_overlaps']),
+        exclude_patch_uuids=config['object_store_patch_exclude_uuids'] or (),
+        cache_directory=cache_directory)
 
 
 @dataclasses.dataclass
@@ -1941,7 +2302,6 @@ def empty_family_warnings(snapshot):
         'pcl_patch': count['surface'] and count['point_collection'],
         'fiber_patch': count['surface'] and count['fiber'],
         'patch_overlap': count['surface'] > 1,
-        'track_crossing': count['track'] > 1,
     }
     families = Counter(rel.family for rel in snapshot.relationships)
     excluded = sum(snapshot.exclusions.values())
@@ -2080,15 +2440,18 @@ def fiber_normal_source(config, lasagna=None, volume_uuid=None):
 
 # The store's detector identities (meta.detector.name) of the refresh's steps.
 DETECTOR_NAMES = {'pcl_patch': 'point-collection-surface', 'fiber_patch': 'fiber-surface',
-                  'patch_overlap': 'surface-overlap', 'track_crossing': 'track-track'}
+                  'patch_overlap': 'surface-overlap'}
 
 # Detectors the refresh runs, with the object kinds each needs selected.
+# None links tracks: a fit computes their crossings itself
+# (materialize_tracks), so the store's track-track detector is not run.
 DETECTORS = (
     ('pcl_patch', ('surface', 'point_collection')),
     ('fiber_patch', ('surface', 'fiber')),
     ('patch_overlap', ('surface',)),
-    ('track_crossing', ('track',)),
 )
+# The object kinds the refresh's detectors link.
+LINKED_KINDS = tuple(kind for kind in KINDS if any(kind in kinds for _, kinds in DETECTORS))
 
 
 # Detectors that link incrementally (refresh_links ``new``), with the object
@@ -2160,11 +2523,9 @@ def link_plan(snapshot, config, normal_source, cache_directory=None, new=None, m
     A detector runs only when every object kind it needs is selected, with
     exactly the selected UUIDs, so its writes and stale-link removal stay
     within the selection. ``new`` ({kind: UUIDs}) makes the run incremental:
-    each detector that supports it examines only pairs with a new object of
-    its kinds (the store's new_uuids), and is skipped when none is new;
-    track crossings are skipped (an incremental refresh requires unchanged
-    tracks). ``cache_directory`` is the fiber strip cache of a local store;
-    a served store keeps its own.
+    each detector examines only pairs with a new object of its kinds (the
+    store's new_uuids), and is skipped when none is new. ``cache_directory``
+    is the fiber strip cache of a local store; a served store keeps its own.
     """
     selected = {kind: [obj.uuid for obj in snapshot.objects_of(kind)] for kind in KINDS}
     volume = snapshot.volume_uuid
@@ -2196,11 +2557,6 @@ def link_plan(snapshot, config, normal_source, cache_directory=None, new=None, m
             'detector': 'surface-overlap',
             'params': dict(volume_uuid=volume, surface_uuids=selected['surface'],
                            **options('patch_overlap'))},
-        # Crossings are exact shared voxels of the stored tracks, found with
-        # the store's default angle, tangent and clustering parameters.
-        'track_crossing': lambda: {
-            'detector': 'track-track',
-            'params': dict(track_uuids=selected['track'], workers=os.cpu_count() or 1)},
     }
     outcomes, detectors = [], []
     for detector, kinds in DETECTORS:
@@ -2209,8 +2565,6 @@ def link_plan(snapshot, config, normal_source, cache_directory=None, new=None, m
             outcome = RefreshOutcome(detector, skipped='no selected ' + ' or '.join(empty))
         elif detector == 'patch_overlap' and not config['input_use_patch_overlaps']:
             outcome = RefreshOutcome(detector, skipped='input_use_patch_overlaps is off')
-        elif new is not None and detector not in INCREMENTAL_KINDS:
-            outcome = RefreshOutcome(detector, skipped='incremental refresh: its inputs are unchanged')
         elif new is not None and not fresh(detector):
             outcome = RefreshOutcome(detector, skipped='incremental refresh: no new ' + ' or '.join(
                 KIND_LABELS[kind] for kind in INCREMENTAL_KINDS[detector]))
@@ -2234,20 +2588,26 @@ class LinkPlanned:
         return [outcome for outcome in self.outcomes if outcome.skipped is None]
 
 
-def link_request(status, plan, author=None, read_versions=None):
+def link_request(status, plan, author=None, read_references=None):
     """The checked request submitting a link plan to the store at ``status``
     (store.status()): the detectors read under a snapshot and the links
     commit expecting every object they read at its version, so a commit in
-    between conflicts and nothing is written. ``read_versions`` ({UUID:
-    version}: the selection as the caller read it before planning) are read
+    between conflicts and nothing is written. ``read_references`` (complete
+    references of the selection as the caller read it before planning) are read
     dependencies of the commit, so an edit of a selected object between
     that read and the commit conflicts too, and the pins stay exact."""
     import uuid as uuid_module
     import vc_object_store as vos
-    request = {'command_version': 1, 'request': str(uuid_module.uuid4()),
+    dependencies = {}
+    for reference in read_references or ():
+        uuid = reference['object']
+        if uuid in dependencies and dependencies[uuid] != reference:
+            raise ValueError(f'conflicting selected input references for {uuid}')
+        dependencies[uuid] = reference
+    request = {'command_version': 3, 'request': str(uuid_module.uuid4()),
                'store': status['store'], 'generation': status['generation'],
                'expected_objects': {}, 'expected_relationships': {},
-               'read_dependencies': dict(read_versions or {}),
+               'read_dependencies': dependencies,
                'expected_commit_sequence': None,
                'operations': [{'op': vos.LINK_OBJECTS_OPERATION, 'plan': plan}]}
     if author:
@@ -2265,12 +2625,12 @@ def is_conflict(error):
     return isinstance(error, RuntimeError) and 'conflict' in str(error).lower()
 
 
-def submit_link_plan(store, planned, author=None, progress=None, log=None, read_versions=None):
+def submit_link_plan(store, planned, author=None, progress=None, log=None, read_references=None):
     """Run a plan (link_plan) on the store as one ``link_objects`` request:
     returns ``(receipt, outcomes)`` with each run detector's report from the
     link marker the commit wrote. Raises LinkRefreshError when a detector
     could not run (nothing is written), and lets a conflict propagate for
-    the caller to relink from the new head (is_conflict). ``read_versions``
+    the caller to relink from the new head (is_conflict). ``read_references``
     are read dependencies of the commit (link_request)."""
     import vc_object_store as vos
     runs = planned.runs
@@ -2280,7 +2640,7 @@ def submit_link_plan(store, planned, author=None, progress=None, log=None, read_
         for outcome in runs:
             log(f'link refresh {outcome.detector}: running ({outcome.mode})')
     started = time.monotonic()
-    request = link_request(store.status(), planned.plan, author, read_versions)
+    request = link_request(store.status(), planned.plan, author, read_references)
     if progress is not None and is_served(store):
         # The detectors run on vc_object_server, which reports no progress
         # over the wire: one stage shows the request is running.
@@ -2297,7 +2657,7 @@ def submit_link_plan(store, planned, author=None, progress=None, log=None, read_
             progress.clear()
     # The marker as this commit wrote it (the receipt versions it): another
     # link run may have moved the current marker on already.
-    marker = _link_marker_at(store, request, (receipt.get('objects') or {}).get(vos.link_marker_uuid()))
+    marker = _link_marker_at(store, vos.receipt_object_reference(receipt, vos.link_marker_uuid()))
     reports = [step['report'] for step in (marker or {}).get('detectors') or ()]
     committed = receipt['commit_sequence']
     if marker is None:
@@ -2328,11 +2688,13 @@ def refresh_report(outcomes):
 # Link marker: skip the detectors when the links are current
 # ---------------------------------------------------------------------------
 
-LINK_MARKER_VERSION = 2
+# 3: no track selection and no track-track detector version (the refresh
+# links no tracks). A marker of another version is replaced by a full refresh.
+LINK_MARKER_VERSION = 3
 # Edge kinds the detectors write (link_plan runs them with their defaults):
 # any change to one since a refresh (a manual link, an approval, a deletion)
-# forces the next one to run in full.
-DETECTOR_EDGE_KINDS = frozenset({'point-surface', 'same-surface', 'crossing'})
+# forces the next one to run in full. Track crossings are not among them.
+DETECTOR_EDGE_KINDS = frozenset({'point-surface', 'same-surface'})
 # Records that change how detectors map stored coordinates into the volume.
 FRAME_RECORD_KINDS = frozenset({'volume_transform', 'volume_transform_choice'})
 # Changes between the marker and the head that a plan examines one by one;
@@ -2346,19 +2708,14 @@ def read_link_marker(store):
     links' commit_sequence and each detector's report), or None."""
     from vc_object_store import link_marker_uuid
     record = current_record(store, link_marker_uuid())
-    return None if record is None else dict(record.get('meta') or {})
+    return None if record is None else dict(record.meta)
 
 
-def _link_marker_at(store, request, version):
-    """The link marker's metadata at a numbered ``version`` of the store
-    ``request`` (a checked request) names, or None when the version is
-    None or absent."""
-    from vc_object_store import link_marker_uuid
-    if version is None:
+def _link_marker_at(store, reference):
+    """Read exactly the marker selected by the committing receipt."""
+    if reference is None:
         return None
-    [revision] = store.objects_at_versions([{
-        'store': request['store'], 'generation': request['generation'],
-        'object': link_marker_uuid(), 'version': int(version)}])
+    [revision] = store.objects_at_versions([reference])
     if revision is None or revision.get('deleted'):
         return None
     return dict(revision['record'].get('meta') or {})
@@ -2371,10 +2728,11 @@ def link_marker_key_parts(volume_uuid, config, normal_source):
     records them with their digest (``key``), so a mismatch reports what
     changed."""
     from vc_object_store import detector_versions
+    versions = detector_versions()
     return {
         'volume_uuid': volume_uuid,
         'link_refresh': link_refresh_provenance(config, normal_source),
-        'detectors': detector_versions(),
+        'detectors': {name: versions[name] for name in sorted(DETECTOR_NAMES.values())},
         # Off leaves the overlap links unrefreshed: turning it on relinks.
         'patch_overlaps': bool(config['input_use_patch_overlaps']),
     }
@@ -2414,18 +2772,13 @@ def _uuids_sha256(uuids):
 
 
 def link_marker_selection(snapshot):
-    """The snapshot's selection as a marker records it: per kind the count
-    and digest of the sorted UUIDs, and the UUIDs themselves except for
-    tracks (which only the digest and selector describe)."""
+    """The snapshot's selection of the kinds the refresh links
+    (LINKED_KINDS: no tracks) as a marker records it: per kind the count,
+    the digest of the sorted UUIDs and the UUIDs themselves."""
     selection = {}
-    for kind in KINDS:
+    for kind in LINKED_KINDS:
         uuids = sorted(obj.uuid for obj in snapshot.objects_of(kind))
-        entry = {'count': len(uuids), 'sha256': _uuids_sha256(uuids)}
-        if kind == 'track':
-            entry['selector'] = snapshot.request.selector(kind).provenance()
-        else:
-            entry['uuids'] = uuids
-        selection[kind] = entry
+        selection[kind] = {'count': len(uuids), 'sha256': _uuids_sha256(uuids), 'uuids': uuids}
     return selection
 
 
@@ -2448,7 +2801,8 @@ def changes_after(store, position, head):
     change feed; None when the feed no longer reaches the position
     (another generation, or before its start), and a whole-store refresh
     is the only safe plan. Each change records its kind
-    (StoreChange), read in batches."""
+    (StoreChange), read in batches; a relationship that is deleted or
+    cannot be read has none."""
     cursor = {'store': position.store, 'generation': position.generation,
               'sequence': position.commit_sequence}
     raw = []
@@ -2479,12 +2833,29 @@ def changes_after(store, position, head):
         for change, revision in zip(batch, store.objects_at_versions(refs)):
             if revision is not None:
                 kinds[change.uuid] = revision['record']['kind']
-    for change in raw:
-        if change.record_kind == 'relationship' and not change.deleted:
-            edge = store.edge(change.uuid)
-            if edge is not None:
-                kinds[change.uuid] = edge['kind']
+    kinds.update(_edge_kinds(store, sorted({
+        change.uuid for change in raw
+        if change.record_kind == 'relationship' and not change.deleted})))
     return [dataclasses.replace(change, kind=kinds.get(change.uuid)) for change in raw]
+
+
+def _edge_kinds(store, uuids):
+    """{UUID: edge kind} of the live relationships among ``uuids``. A served
+    store answers one projected selection per batch (UUID and kind alone);
+    a store file has no selection by UUID and reads each record in
+    process."""
+    kinds = {}
+    if not is_served(store):
+        for uuid in uuids:
+            edge = store.edge(uuid)
+            if edge is not None:
+                kinds[uuid] = edge['kind']
+        return kinds
+    for start in range(0, len(uuids), 1000):
+        for edge in store.select_edges(edge_uuids=uuids[start:start + 1000],
+                                       include_retired=True, fields=['uuid', 'kind']):
+            kinds[edge['uuid']] = edge['kind']
+    return kinds
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2507,11 +2878,13 @@ def plan_link_refresh(marker, position, head, changes, key_parts, selection, sel
     generation the refresh reads), was written by a full refresh (any
     refresh, for an input update: ``incremental``) with the same key
     (``key_parts``, link_marker_key_parts), the current ``selection`` is
-    the marker's or a subset of it (tracks: the same), and every record
-    changed since its commit (``changes(after)``: StoreChange list up to
-    ``head``, or None when unknown) is an object outside ``selected`` (the
-    current selection's UUIDs) and no detector relationship or volume
-    registration. With ``incremental``, objects selected since the marker
+    the marker's or a subset of it, and every record changed since its
+    commit (``changes(after)``: StoreChange list up to ``head``, or None
+    when unknown) is an object outside ``selected`` (the UUIDs of the
+    current selection's linked objects: tracks, which no detector reads,
+    are not among them) and no detector relationship or volume
+    registration; a relationship whose kind cannot be read (a deleted one)
+    counts as a detector's. With ``incremental``, objects selected since the marker
     (created or newly selected) are linked incrementally, provided no other
     selected object changed. Anything else refreshes in full.
     """
@@ -2534,12 +2907,8 @@ def plan_link_refresh(marker, position, head, changes, key_parts, selection, sel
     if linked > head:
         return full(f'the link marker is at commit {linked}, after the head {head}')
     recorded = marker['selection']
-    if selection['track']['sha256'] != recorded['track']['sha256']:
-        return full('the track selection changed')
     new = {}
-    for kind in KINDS:
-        if kind == 'track':
-            continue
+    for kind in LINKED_KINDS:
         added = sorted(set(selection[kind]['uuids']) - set(recorded[kind]['uuids']))
         if added and not incremental:
             return full(f'{len(added)} {KIND_LABELS[kind]} selected since commit {linked}')
@@ -2609,7 +2978,9 @@ def _refresh(store, snapshot, config, lasagna, cache_directory, log, *, head, in
         plan = plan_link_refresh(
             read_link_marker(store), position, head,
             lambda after: changes_after(store, dataclasses.replace(position, commit_sequence=after), head),
-            key_parts, selection, snapshot.objects, incremental=incremental)
+            key_parts, selection,
+            {uuid for uuid, obj in snapshot.objects.items() if obj.kind in LINKED_KINDS},
+            incremental=incremental)
     log(plan.line())  # as decided, before any detector runs
     if plan.mode == 'skip':
         return LinkResult([f'link refresh: skipped every detector ({plan.reason})'], plan, None,
@@ -2628,21 +2999,24 @@ def _refresh(store, snapshot, config, lasagna, cache_directory, log, *, head, in
     started = time.monotonic()
     pins = snapshot.pins()
     receipt, outcomes = submit_link_plan(store, planned, author=author, progress=progress, log=log,
-                                         read_versions=pins.objects)
+                                         read_references=pins.refs())
     lines = refresh_report(outcomes) + [
         f'link refresh: {plan.mode} refresh ({plan.reason}) took {time.monotonic() - started:.1f} s']
     if receipt is None:
         return LinkResult(lines, plan, None, pins)
     # The links' commit versions every endpoint it touched: the pins are
     # those versions, at the links' commit.
-    objects = dict(pins.objects)
-    for uuid, version in (receipt.get('objects') or {}).items():
-        if uuid in objects and version is not None:
-            objects[uuid] = int(version)
+    references = dict(pins.references)
+    from vc_object_store import receipt_object_references
+    touched = [uuid for uuid, version in (receipt.get('objects') or {}).items()
+               if uuid in references and version is not None]
+    # One call: the receipt of a large link commit has millions of entries
+    # and is decoded per call.
+    references.update(receipt_object_references(receipt, touched))
     lines.append(f'links committed at commit {receipt["commit_sequence"]} (linked at {head})')
     return LinkResult(lines, plan, receipt, dataclasses.replace(
         pins, position=dataclasses.replace(position, commit_sequence=int(receipt['commit_sequence'])),
-        objects=objects))
+        references=references))
 
 
 @contextlib.contextmanager
@@ -2835,10 +3209,14 @@ MATERIALIZATION_KEYS = (
 )
 
 
-def input_manifest(snapshot, config, normal_source, external_frames=None):
+def input_manifest(snapshot, config, normal_source, external_frames=None, tracks=None):
     """The snapshot manifest extended with materialization settings,
-    external-input frames and the link-refresh mode."""
+    external-input frames, the link-refresh mode and, with ``tracks`` (the
+    materialized TrackInputs), the crossings derived from them
+    (``derived_inputs.track_crossing``)."""
     manifest = snapshot.manifest()
+    if tracks is not None:
+        manifest['derived_inputs'] = {'track_crossing': tracks.derived}
     manifest['materialization'] = {key: config[key] for key in MATERIALIZATION_KEYS}
     manifest['external_frames'] = dict(sorted((external_frames or {}).items()))
     manifest['link_refresh'] = link_refresh_provenance(config, normal_source)
@@ -2883,16 +3261,26 @@ def stale_link_reasons(manifest, config, normal_source):
     return reasons
 
 
+def validated_manifest_references(manifest):
+    """Validate saved evidence once and retain the decoded object references."""
+    from vc_object_store import manifest_references
+    return manifest_references(manifest)['objects']
+
+
 def _compared(manifest):
     """The manifest without what does not define the inputs: the store's
     location and history generation, the version pins (VERSION_FIELDS), how
     links were refreshed (their results are recorded) and the position they
     were read at (equal inputs at two positions are equal). A copy of a
     store holding the same inputs compares equal."""
+    validated_manifest_references(manifest)
     manifest = dict(manifest)
     manifest['store'] = {'uuid': (manifest.get('store') or {}).get('uuid')}
     manifest.pop('link_refresh', None)
     manifest.pop('position', None)
+    if manifest.get('outer_shell'):
+        manifest['outer_shell'] = {key: value for key, value in manifest['outer_shell'].items()
+                                   if key != 'reference'}
     for section, fields in VERSION_FIELDS.items():
         if section in manifest:
             manifest[section] = [
@@ -2901,42 +3289,16 @@ def _compared(manifest):
     return manifest
 
 
-# Identities a manifest recorded before objects carried metadata hashes and
-# relationships their content: geometry revisions, relationship generations
-# and approval states only.
-_GEOMETRY_IDENTITY = {
-    'objects': ('uuid', 'kind', 'name', 'geometry_revision', 'scale_factor'),
-    'relationships': ('uuid', 'kind', 'family', 'approval_state', 'generation'),
-}
-
-
-def records_content_identity(manifest):
-    """Whether a manifest identifies objects and relationships by content
-    (metadata hashes, relationship content), as every manifest written since
-    replica-independent digests does."""
-    objects = (manifest or {}).get('objects') or ()
-    return all('metadata_sha256' in entry for entry in objects)
-
-
-def _geometry_identity(manifest):
-    manifest = dict(manifest)
-    for section, fields in _GEOMETRY_IDENTITY.items():
-        if section in manifest:
-            manifest[section] = [{key: entry.get(key) for key in fields}
-                                 for entry in manifest[section] or ()]
-    return manifest
-
-
 def track_identity(manifest):
-    """The tracks and track crossings a manifest records, by content
-    (VERSION_FIELDS left out): a fit consumes them at build, so two
-    manifests with different ones need a rebuild."""
+    """The tracks a manifest records, by content (VERSION_FIELDS left
+    out), and the crossings derived from them
+    (``derived_inputs.track_crossing``): a fit consumes them at build, so
+    two manifests with different ones need a rebuild."""
     compared = _compared(manifest)
     return {
         'objects': [entry for entry in compared.get('objects') or ()
                     if entry.get('kind') == 'track'],
-        'relationships': [entry for entry in compared.get('relationships') or ()
-                          if entry.get('family') == 'track_crossing'],
+        'derived': (compared.get('derived_inputs') or {}).get('track_crossing'),
     }
 
 
@@ -2997,18 +3359,8 @@ def resume_problems(checkpoint_input_manifest, inputs, allow_changed=False, log=
         problem = 'checkpoint records no object-store inputs'
     else:
         current = inputs.manifest
-        legacy = not records_content_identity(recorded)
-        if legacy:
-            # Written before inputs were identified by content: its object
-            # revisions name another copy's (or this store's older) records,
-            # and it holds no metadata hashes, so compare what it does hold.
-            recorded, current = _geometry_identity(recorded), _geometry_identity(current)
         differences = manifest_differences(recorded, current)
         if not differences:
-            if legacy:
-                log('WARNING: the checkpoint predates content-identified object-store '
-                    'inputs (metadata hashes, relationship content); compared on '
-                    'geometry revisions and relationship generations only')
             return []
         problem = ('checkpoint object-store inputs differ from this fit\'s in '
                    + ', '.join(differences))
@@ -3066,8 +3418,8 @@ def load_fit_inputs(config, *, lasagna=None, external_frames=None, dist=None,
         with open_store(config, read_only=True, cache_directory=cache_directory) as store:
             snapshot = read_snapshot(store, request)
             normal = fiber_normal_source(config, lasagna, snapshot.volume_uuid)
-            inputs = materialize_from_config(store, snapshot, config)
-        inputs.manifest = input_manifest(snapshot, config, normal, external_frames)
+            inputs = materialize_from_config(store, snapshot, config, cache_directory)
+        inputs.manifest = input_manifest(snapshot, config, normal, external_frames, inputs.tracks)
         inputs.digest = manifest_digest(inputs.manifest)
         outcome = {'digest': inputs.digest}
     except ObjectStoreInputError as error:

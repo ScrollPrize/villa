@@ -74,12 +74,15 @@ VC3D works on surfaces in a VC object store, never on tifxyz directories. Start 
 a store file, or the endpoint of the `vc_object_server` that hosts the store (`http://host:8750`, e.g. through an SSH
 tunnel), so a service on another machine works on the store VC3D attached; `/health` reports its `store_uuid`. VC3D
 starts its internal service on its attached store (file or endpoint) with `--shared-store`. A VC3D request names that store
-(`store_uuid`) and the volume it works in (`volume_uuid`); its surface references are
-`{"type": "surface", "uuid": ..., "generation": ..., "version": ...}` (the version optional) in `external_surfaces`, the atlas
+(`store_uuid`) and the volume it works in (`volume_uuid`); its selected surface references are
+`{"type": "surface", "reference": {"store": ..., "generation": ..., "object": ..., "version": ...}}` in `external_surfaces`, the atlas
 `base.ref`, and `model` (the model checkpoint a fit published with that surface: its `model.pt` artifact, read as a
 local copy in the service's object cache, `<object store dir>/artifacts/<sha256>/model.pt`).
-The fit reads the surfaces directly (`fit.py --store --volume-uuid`,
-references `vcobj:<uuid>[@<generation>/<version>]`), and the export creates new surfaces in the store
+The fit reads the surfaces directly (`fit.py --store --volume-uuid`).
+Structured configurations retain the same reference dictionary through geometry and checkpoint reads.
+CLI locators `vcobj:<uuid>[@[<store>/]<generation>/<version>]`, current `{"type":"surface","uuid":...}`
+and previously saved flattened JSON selectors are decoded once by the shared native input API; there is no Lasagna tuple API.
+The export creates new surfaces in the store
 (`fit2tifxyz.py --store LOCATION --volume-uuid UUID [--tag TAG]`): the `d` and flow-gate channels are surface
 channels, `model.pt`/`model_params.json`/mask debug files are published as the surface's artifacts (written to a
 temporary directory, then stored with the surface's version in one checked request), and the

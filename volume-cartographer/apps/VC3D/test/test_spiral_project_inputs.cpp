@@ -61,9 +61,11 @@ void describesTheVolumesAndTheirUmbilici(const fs::path& directory)
     require(entry.value("z_direction_is_top_to_bottom").toBool(), "a known orientation");
     require(!entry.contains("left_handed_coordinates"), "an unknown fact is left out");
     const QJsonObject umbilicus = entry.value("umbilicus").toObject();
-    require(!umbilicus.value("uuid").toString().isEmpty()
-                && !umbilicus.value("generation").toString().isEmpty()
-                && umbilicus.value("version").isDouble(),
+    const auto reference = umbilicus.value("reference").toObject();
+    require(!reference.value("object").toString().isEmpty()
+                && !reference.value("store").toString().isEmpty()
+                && !reference.value("generation").toString().isEmpty()
+                && reference.value("version").isDouble(),
             "the umbilicus object and its generation and version read");
     require(umbilicus.value("points_zyx").toArray()
                 == QJsonArray{QJsonArray{0, 20, 10}, QJsonArray{100, 22, 12}},

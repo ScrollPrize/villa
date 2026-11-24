@@ -1,4 +1,3 @@
-import itertools
 import os
 from dataclasses import dataclass
 
@@ -790,6 +789,22 @@ def _physical_point(entry):
     return entry.get('physical', entry)
 
 
+def _random_patch_pairs(patch_ids, count):
+    """Up to count distinct unordered pairs of patch_ids, uniformly at random.
+
+    Draws pairs directly instead of listing all n*(n-1)/2: a point collection
+    in a merged fiber-link component can touch thousands of patches."""
+    n = len(patch_ids)
+    count = min(count, n * (n - 1) // 2)
+    pairs = {}
+    while len(pairs) < count:
+        a = np.random.randint(n)
+        b = np.random.randint(n - 1)
+        b += b >= a
+        pairs[(min(a, b), max(a, b))] = None
+    return [(patch_ids[a], patch_ids[b]) for a, b in pairs]
+
+
 def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding,
                                patches_dict, patch_atlas, point_collections,
                                sampling_strata, *, crossing_map, cfg,
@@ -806,18 +821,15 @@ def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding,
     for pcl_idx in _choose_pcl_indices(sampling_strata, num_pcls, cfg):
         pcl = point_collections[pcl_idx]
         patch_ids = list(pcl['points_by_patch'])
+        pair_count = cfg['sample_count_relative_winding_patch_pairs_per_pcl']
         if cfg['pcl_rel_winding_adjacent_patches_only']:
             candidates = list(zip(patch_ids, patch_ids[1:]))
+            pairs = [candidates[i] for i in np.random.choice(
+                len(candidates), min(len(candidates), pair_count),
+                replace=False)]
         else:
-            candidates = list(itertools.combinations(patch_ids, 2))
-        pair_count = min(
-            len(candidates),
-            cfg['sample_count_relative_winding_patch_pairs_per_pcl'])
-        if pair_count <= 0:
-            continue
-        for pair_idx in np.random.choice(
-                len(candidates), pair_count, replace=False):
-            pid1, pid2 = candidates[pair_idx]
+            pairs = _random_patch_pairs(patch_ids, pair_count)
+        for pid1, pid2 in pairs:
             p1s = pcl['points_by_patch'][pid1]
             p2s = pcl['points_by_patch'][pid2]
             p1 = p1s[np.random.randint(len(p1s))]
