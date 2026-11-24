@@ -50,7 +50,7 @@ SurfaceGrid readSurfaceGrid(const StoreReader& reader,const ObjectRevision& sele
             for(auto value:tile.points[i])grid.points.push_back(valid?float(value):-1.0f);
         }
     };
-    if(transformed)copy(transformed->readTile(0,0,canonical.rows(),canonical.columns()));
+    if(transformed)copy(transformed->readTile(0,0,canonical.rows(),canonical.columns(),applyValidity));
     else copy(canonical.readTile(0,0,canonical.rows(),canonical.columns()));
     grid.record = selected.record;
     grid.geometryRevision = *selected.geometryRevision;

@@ -324,7 +324,8 @@ std::vector<geometry::Point> TransformedGeometryView::points(const std::string& 
     for(auto& p:result)p=mapping_.apply(p);
     return result;
 }
-TransformedSurfaceTile TransformedGeometryView::readTile(int64_t row,int64_t column,int64_t rows,int64_t columns) const {
+TransformedSurfaceTile TransformedGeometryView::readTile(int64_t row, int64_t column, int64_t rows, int64_t columns,
+                                                          bool applyValidity) const {
     const auto* surface=std::get_if<SurfaceView>(&source_);
     if(!surface)throw std::invalid_argument("not a surface");
     const auto source=surface->readTile(row,column,rows,columns);
@@ -339,7 +340,8 @@ TransformedSurfaceTile TransformedGeometryView::readTile(int64_t row,int64_t col
         const bool valid=source.valid(i/columns,i%columns);
         const auto& p=source.points[i];
         result.validity.push_back(valid?255:0);
-        result.points.push_back(valid?mapping_.apply({p[0],p[1],p[2]}):geometry::Point{-1,-1,-1});
+        const bool showPoint = valid || (!applyValidity && geometry::validSurfacePoint(p));
+        result.points.push_back(showPoint ? mapping_.apply({p[0], p[1], p[2]}) : geometry::Point{-1, -1, -1});
     }
     return result;
 }

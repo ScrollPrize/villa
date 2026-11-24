@@ -454,6 +454,12 @@ public:
 
     void setChannel(const std::string& name, const cv::Mat& channel);
     cv::Mat channel(const std::string& name, int flags = 0);
+    struct MaskedVertex {
+        cv::Point cell;
+        cv::Vec3f coords;
+    };
+    // Coordinates hidden by the input validity mask, indexed in the raw grid.
+    std::vector<MaskedVertex> maskedVertices;
     // Loads a registered channel that has no data yet (e.g. from its stored
     // geometry revision) on first access.
     void setChannelLoader(std::function<cv::Mat(const std::string&)> loader) { _channelLoader = std::move(loader); }

@@ -133,8 +133,18 @@ TEST_CASE("A neighbor copy projects and refines in one run and creates one surfa
     fs::remove_all(dir, ignored);
 }
 
-TEST_CASE("A TIFXYZ import keeps the GrowPatch anchor when resumed")
+TEST_CASE("A TIFXYZ import resumes with an optional GrowPatch anchor")
 {
+    bool request_anchor = false;
+    bool mask_seed = false;
+    SUBCASE("Default resume does not activate the imported anchor") {}
+    SUBCASE("Default resume preserves a deliberately masked seed") { mask_seed = true; }
+    SUBCASE("An explicit anchor survives growth, saving and reloading") { request_anchor = true; }
+    SUBCASE("An explicit anchor rejects a deliberately masked seed") {
+        request_anchor = true;
+        mask_seed = true;
+    }
+
     const char* tool = std::getenv("VC_GROW_SEG_FROM_SEED_BIN");
     REQUIRE(tool);
     const fs::path dir = fs::temp_directory_path() / ("vc-grow-import-anchor-" + util::newUuid());
@@ -149,9 +159,25 @@ TEST_CASE("A TIFXYZ import keeps the GrowPatch anchor when resumed")
                          (dir / "tifxyz").string() + "\" --segment-name anchored > \"" +
                          (dir / "grow.log").string() + "\" 2>&1").c_str()) == 0);
 
+    cv::Point seed_grid(-1, -1);
+    if (mask_seed) {
+        auto surface = load_quad_from_tifxyz(dir / "tifxyz");
+        auto mask = surface->validMask();
+        for (const auto [row, col, point] : surface->validPoints()) {
+            if (point == cv::Vec3f(64, 64, 64)) {
+                seed_grid = {col, row};
+                mask(row, col) = 0;
+            }
+        }
+        REQUIRE(seed_grid.x >= 0);
+        surface->setChannel("mask", mask);
+        surface->save(dir / "tifxyz", true);
+    }
+
     OpenOptions options; options.author = "grow-store-test";
     const auto dbPath = dir / "objects.vcobj";
     std::string imported;
+    int initial_valid = 0;
     {
         auto store = ObjectStore::create(dbPath, options);
         const auto report = ingestGeometrySource(store, "surface", dir / "tifxyz", {},
@@ -159,18 +185,70 @@ TEST_CASE("A TIFXYZ import keeps the GrowPatch anchor when resumed")
         REQUIRE(report.problems.empty());
         REQUIRE(report.uuids.size() == 1);
         imported = report.uuids.front();
+        auto txn = store.read();
+        const auto meta = nlohmann::json::parse(store.objectByUuid(txn, imported)->meta);
+        CHECK_FALSE(meta.contains("seed_anchor"));
+        CHECK(meta.at("source").at("seed_anchor").at("xyz") == anchor);
+        initial_valid = load_quad_from_store(vc::objects::LocalStoreReader(store, txn), imported)->countValidPoints();
     }
 
     params["generations"] = 5;
+    if (!request_anchor) params.erase("seed_anchor_xyz");
     std::ofstream(dir / "resume.json") << params;
-    const auto resumed = run(common + " --params \"" + (dir / "resume.json").string() + "\" --store \"" +
-        dbPath.string() + "\" --volume-uuid test-volume --resume-opt skip --surface " + imported, dir / "resume.log");
-    {
-        auto store = ObjectStore::open(dbPath, options);
-        auto txn = store.read();
-        const auto object = store.objectByUuid(txn, resumed);
-        REQUIRE(object.has_value());
-        CHECK(nlohmann::json::parse(object->meta).at("seed_anchor").at("xyz") == anchor);
+    const std::string resume_command = common + " --params \"" + (dir / "resume.json").string() + "\" --store \"" +
+        dbPath.string() + "\" --volume-uuid test-volume --resume-opt skip --surface ";
+    if (request_anchor && mask_seed) {
+        CHECK(std::system((resume_command + imported + " > \"" + (dir / "resume.log").string() + "\" 2>&1").c_str()) != 0);
+        std::stringstream output;
+        output << std::ifstream(dir / "resume.log").rdbuf();
+        CHECK(output.str().find("seed anchor was lost or moved") != std::string::npos);
+    } else {
+        const auto resumed = run(resume_command + imported, dir / "resume.log");
+        int resumed_valid = 0;
+        {
+            auto store = ObjectStore::open(dbPath, options);
+            auto txn = store.read();
+            const auto object = store.objectByUuid(txn, resumed);
+            REQUIRE(object.has_value());
+            const auto meta = nlohmann::json::parse(object->meta);
+            auto surface = load_quad_from_store(vc::objects::LocalStoreReader(store, txn), resumed);
+            resumed_valid = surface->countValidPoints();
+            CHECK(resumed_valid > initial_valid);
+            if (request_anchor) {
+                CHECK(meta.at("seed_anchor").at("xyz") == anchor);
+            } else {
+                CHECK_FALSE(meta.contains("seed_anchor"));
+            }
+            if (mask_seed) {
+                const auto offset = meta.at("grid_offset").get<std::vector<int>>();
+                const auto mask = surface->channel("mask", SURF_CHANNEL_NORESIZE);
+                REQUIRE_FALSE(mask.empty());
+                CHECK(mask.at<uint8_t>(seed_grid.y + offset[1], seed_grid.x + offset[0]) == 0);
+            }
+        }
+
+        if (request_anchor) {
+            // Reopening the just-written native result must retain its opt-in contract.
+            params.erase("seed_anchor_xyz");
+            std::ofstream(dir / "resume.json") << params;
+            CHECK(std::system((resume_command + resumed + " > \"" + (dir / "guard.log").string() + "\" 2>&1").c_str()) != 0);
+            std::stringstream output;
+            output << std::ifstream(dir / "guard.log").rdbuf();
+            CHECK(output.str().find("anchored resume requires seed_anchor_xyz") != std::string::npos);
+            params["seed_anchor_xyz"] = anchor;
+            params["generations"] = 6;
+            std::ofstream(dir / "resume.json") << params;
+            const auto reloaded = run(resume_command + resumed, dir / "reload.log");
+            auto store = ObjectStore::open(dbPath, options);
+            auto txn = store.read();
+            CHECK(nlohmann::json::parse(store.objectByUuid(txn, reloaded)->meta).at("seed_anchor").at("xyz") == anchor);
+            auto surface = load_quad_from_store(vc::objects::LocalStoreReader(store, txn), reloaded);
+            CHECK(surface->countValidPoints() > resumed_valid);
+            int seed_points = 0;
+            for (const auto [row, col, point] : surface->validPoints())
+                if (point == cv::Vec3f(64, 64, 64)) ++seed_points;
+            CHECK(seed_points == 1);
+        }
     }
     std::error_code ignored;
     fs::remove_all(dir, ignored);

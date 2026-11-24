@@ -504,6 +504,10 @@ int main() try {
     {
         auto masked = ObjectStore::create(directory.path / "masked-grid.vcobj", options);
         auto txn = masked.write(); ObjectRecord record; record.kind = "surface";
+        record.meta = R"({"coordinates":{"volume_uuid":"masked-source","scale_factor":1}})";
+        VolumeAffine translation;
+        translation(0, 3) = 10; translation(1, 3) = -3; translation(2, 3) = 20;
+        masked.registerVolumeTransform(txn, "masked-source", "masked-target", translation, "masked grid regression");
         const auto uuid = masked.upsertObject(txn, record);
         vc::geometry::Surface shape{1, 2, {1, 1}, {{2, 4, 6}, {8, 10, 12}}};
         shape.validity = {0, 1};
@@ -515,6 +519,15 @@ int main() try {
         require(visible.points == std::vector<float>{-1,-1,-1,8,10,12} &&
                 editable.points == std::vector<float>{2,4,6,8,10,12} && visible.valid == editable.valid,
                 "shared surface materialization masks for display but preserves coordinates for editing");
+        const auto transformed = GeometrySnapshot(reader).surface(selected).viewTransformedAt("masked-target");
+        const auto transformedVisible = readSurfaceGrid(reader, selected, &transformed);
+        const auto transformedEditable = readSurfaceGrid(reader, selected, &transformed, false);
+        require(transformedVisible.points == std::vector<float>{-1,-1,-1,18,7,32} &&
+                transformedEditable.points == std::vector<float>{12,1,26,18,7,32},
+                "transformed surface materialization preserves masked coordinates only for editing");
+        require(transformedVisible.valid == std::vector<uint8_t>{0,255} &&
+                transformedEditable.valid == transformedVisible.valid,
+                "retaining transformed masked coordinates does not make the vertex valid");
     }
     std::cout<<"object volume transformation checks passed\n";return 0;
 }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}

@@ -282,6 +282,7 @@ void QuadSurface::ensureLoaded()
     _scale = loaded->_scale;
     _center = loaded->_center;
     _channels = std::move(loaded->_channels);
+    maskedVertices = std::move(loaded->maskedVertices);
 
     // Keep existing bbox and meta if already set, otherwise take from loaded
     if (_bbox.low[0] == 0 && _bbox.high[0] == 0) {
@@ -1116,13 +1117,22 @@ std::unique_ptr<QuadSurface> load_quad_from_tifxyz_impl(
     const auto stored = requestedRegion ? reader.window({requestedRegion->y, requestedRegion->x, requestedRegion->height, requestedRegion->width}) : reader.whole();
     auto points = std::make_unique<cv::Mat_<cv::Vec3f>>(int(stored.rows), int(stored.cols));
     std::memcpy(points->data, stored.xyz.data(), stored.xyz.size() * sizeof(float));
-    // Invalid vertices: vc_reader's rule and the mask, and the store's (z > 0).
-    for (int j = 0; j < points->rows; ++j)
-        for (int i = 0; i < points->cols; ++i)
-            if (!stored.valid[std::size_t(j) * std::size_t(stored.cols) + std::size_t(i)] || !vc::geometry::validSurfacePoint((*points)(j, i)))
-                (*points)(j, i) = cv::Vec3f(-1.f, -1.f, -1.f);
+    std::vector<QuadSurface::MaskedVertex> maskedVertices;
+    for (int j = 0; j < points->rows; ++j) {
+        for (int i = 0; i < points->cols; ++i) {
+            auto& point = (*points)(j, i);
+            if (!vc::geometry::validSurfacePoint(point)) {
+                point = {-1, -1, -1};
+            } else if (!stored.valid[std::size_t(j) * stored.cols + i]) {
+                if (!requestedRegion)
+                    maskedVertices.push_back({{i, j}, point});
+                point = {-1, -1, -1};
+            }
+        }
+    }
 
     auto surf = std::make_unique<QuadSurface>(points.release(), scale);
+    surf->maskedVertices = std::move(maskedVertices);
     if (!requestedRegion) surf->path = path;
     surf->id   = path.filename().string();
     surf->meta = metadata;

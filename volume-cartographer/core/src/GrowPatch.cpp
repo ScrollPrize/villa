@@ -226,6 +226,9 @@ static std::unique_ptr<QuadSurface> make_growth_scale_resume_surface(QuadSurface
     scaled->path = source.path;
     scaled->meta = source.meta;
     scaled->setDpi(source.dpi());
+    for (const auto& vertex : source.maskedVertices)
+        if (vertex.cell.x % factor == 0 && vertex.cell.y % factor == 0)
+            scaled->maskedVertices.push_back({{vertex.cell.x / factor, vertex.cell.y / factor}, vertex.coords});
 
     const cv::Size dst_size = scaled_points.size();
     for (const std::string& name : source.channelNames()) {
@@ -1844,15 +1847,17 @@ QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const nlo
     if (resume_surf) {
         const auto& metadata = resume_surf->meta;
         if (const auto anchor = metadata.find("seed_anchor"); anchor != metadata.end()) {
+            if (!anchor_requested)
+                throw std::runtime_error("anchored resume requires seed_anchor_xyz");
             saved_anchor = &*anchor;
-        } else if (const auto source = metadata.find("source"); source != metadata.end() && source->is_object()) {
-            // TIFXYZ import keeps the original file metadata under source.
-            if (const auto imported_anchor = source->find("seed_anchor"); imported_anchor != source->end())
-                saved_anchor = &*imported_anchor;
+        } else if (anchor_requested) {
+            // An import records the original anchor as provenance. Use it only on request.
+            if (const auto source = metadata.find("source"); source != metadata.end() && source->is_object()) {
+                if (const auto imported_anchor = source->find("seed_anchor"); imported_anchor != source->end())
+                    saved_anchor = &*imported_anchor;
+            }
         }
     }
-    if (saved_anchor && !anchor_requested)
-        throw std::runtime_error("anchored resume requires seed_anchor_xyz");
     if (anchor_requested && (scale != 1.0f ||
             params.value("growth_scale", 0) != 0 || params.contains("neural_socket") ||
             params.value("cell_reopt_mode", false) || params.value("rewind_gen", -1) != -1 ||
@@ -2436,58 +2441,47 @@ QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const nlo
             surf->meta["grid_offset"] = std::move(off_arr);
         }
 
-        // Preserve approval and mask channels from resume surface with correct offset
-        // Note: These channels are stored at raw points resolution, not scaled size
+        // Preserve explicit input exclusions without copying zeros from old padding.
         if (resume_surf) {
-            const int offset_row = resume_pad_y - used_area_safe.y;
-            const int offset_col = resume_pad_x - used_area_safe.x;
-
-            // Get raw points size (channels are stored at this resolution)
-            const cv::Mat_<cv::Vec3f>* new_points = surf->rawPointsPtr();
-            if (!new_points || new_points->empty()) {
-                return make_output_scale_surface(
-                    surf,
-                    output_surface_scale,
-                    use_growth_scale ? growth_scale_factor : 1,
-                    exact_growth_output_size_for_fill(surf));
-            }
-            const cv::Size raw_size = new_points->size();
-
-            // Preserve mask channel (single channel uint8)
-            // Layer 0 of mask.tif is the validity mask - it can mask out points that have
-            // valid coordinates but shouldn't be used (human corrections).
-            // Strategy:
-            // 1. Generate fresh validity mask from new surface points (255 if valid, 0 if -1,-1,-1)
-            // 2. Overlay old mask values at correct offset (preserving human edits)
-            cv::Mat old_mask = resume_surf->channel("mask", SURF_CHANNEL_NORESIZE);
-            if (!old_mask.empty()) {
-                // Start with validity mask based on actual point data
-                cv::Mat_<uint8_t> new_mask(raw_size, static_cast<uint8_t>(0));
-                for (int r = 0; r < new_points->rows; ++r) {
-                    for (int c = 0; c < new_points->cols; ++c) {
-                        const cv::Vec3f& p = (*new_points)(r, c);
-                        if (p[0] != -1.0f) {
-                            new_mask(r, c) = 255;  // Valid point
-                        }
-                    }
+            const auto old_mask = resume_surf->channel("mask", SURF_CHANNEL_NORESIZE);
+            auto* new_points = surf->rawPointsPtr();
+            if (!old_mask.empty() && new_points && !new_points->empty()) {
+                const auto* old_points = std::as_const(*resume_surf).rawPointsPtr();
+                std::vector<uint8_t> reduced_mask;
+                cv::Mat_<uint8_t> input_mask = old_mask;
+                if (old_mask.size() != old_points->size()) {
+                    cv::Mat_<double> mask_values;
+                    old_mask.convertTo(mask_values, CV_64F);
+                    reduced_mask = vc::geometry::validityFromMask(
+                        {mask_values.ptr<double>(), mask_values.total()}, old_mask.rows, old_mask.cols,
+                        old_points->rows, old_points->cols);
+                    input_mask = cv::Mat_<uint8_t>(old_points->rows, old_points->cols, reduced_mask.data());
                 }
+                cv::Mat_<uint8_t> new_mask(new_points->size());
+                std::transform(new_points->begin(), new_points->end(), new_mask.begin(),
+                               [](const auto& p) { return vc::geometry::validSurfacePoint(p) ? 255 : 0; });
 
-                // Now overlay the old mask values (preserving human edits that masked out valid points)
-                for (int r = 0; r < old_mask.rows; ++r) {
-                    for (int c = 0; c < old_mask.cols; ++c) {
-                        int new_r = r + offset_row;
-                        int new_c = c + offset_col;
-                        if (new_r >= 0 && new_r < new_mask.rows &&
-                            new_c >= 0 && new_c < new_mask.cols) {
-                            // Preserve the old mask value (including human edits that set 0 on valid points)
-                            new_mask(new_r, new_c) = old_mask.at<uint8_t>(r, c);
-                        }
+                const cv::Point offset(resume_pad_x - used_area_safe.x, resume_pad_y - used_area_safe.y);
+                const cv::Rect input_grid(cv::Point(), old_points->size());
+                const cv::Rect output_grid(cv::Point(), new_points->size());
+                const auto preserve_exclusion = [&](const cv::Point& cell, const cv::Vec3f& coords) {
+                    const cv::Point target = cell + offset;
+                    if (!input_grid.contains(cell) || !output_grid.contains(target))
+                        return;
+                    if (input_mask(cell) == 0) {
+                        new_mask(target) = 0;
+                        (*new_points)(target) = coords;
                     }
-                }
+                };
+                // Some loaders retain masked coordinates directly in the grid.
+                for (int r = 0; r < old_points->rows; ++r)
+                    for (int c = 0; c < old_points->cols; ++c)
+                        if (input_mask(r, c) == 0 && vc::geometry::validSurfacePoint((*old_points)(r, c)))
+                            preserve_exclusion({c, r}, (*old_points)(r, c));
+                for (const auto& vertex : resume_surf->maskedVertices)
+                    preserve_exclusion(vertex.cell, vertex.coords);
+
                 surf->setChannel("mask", new_mask);
-                std::cout << "Preserved mask (" << old_mask.cols << "x" << old_mask.rows << " -> "
-                          << new_mask.cols << "x" << new_mask.rows
-                          << ") with offset (" << offset_row << ", " << offset_col << ")" << std::endl;
             }
         }
 

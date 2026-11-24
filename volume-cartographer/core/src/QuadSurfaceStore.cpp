@@ -93,10 +93,24 @@ std::unique_ptr<QuadSurface> load_quad_from_store(const vc::objects::StoreReader
 std::unique_ptr<QuadSurface> load_quad_from_store(const vc::objects::StoreReader& reader,
     const vc::objects::ObjectRevision& selected,bool applyValidity,const vc::objects::TransformedGeometryView* transformed)
 {
-    auto grid=vc::objects::readSurfaceGrid(reader,selected,transformed,applyValidity);
+    auto grid=vc::objects::readSurfaceGrid(reader,selected,transformed,false);
     auto points=std::make_unique<cv::Mat_<cv::Vec3f>>(int(grid.rows),int(grid.columns));
     std::memcpy(points->data,grid.points.data(),grid.points.size()*sizeof(float));
+    std::vector<QuadSurface::MaskedVertex> maskedVertices;
+    if (applyValidity && !grid.valid.empty()) {
+        for (int r = 0; r < points->rows; ++r) {
+            for (int c = 0; c < points->cols; ++c) {
+                auto& point = (*points)(r, c);
+                if (grid.valid[std::size_t(r) * points->cols + c] == 0) {
+                    if (vc::geometry::validSurfacePoint(point))
+                        maskedVertices.push_back({{c, r}, point});
+                    point = {-1, -1, -1};
+                }
+            }
+        }
+    }
     auto surface=std::make_unique<QuadSurface>(points.release(),cv::Vec2f(float(grid.scale[0]),float(grid.scale[1])));
+    surface->maskedVertices = std::move(maskedVertices);
     surface->id = grid.record.uuid;
     surface->meta = nlohmann::json::parse(grid.record.meta);
     surface->setComponents(surface_components(surface->meta));

@@ -152,7 +152,9 @@ public:
         int64_t rows, int64_t columns, const std::vector<geometry::SurfacePoint>& desired,
         const std::vector<uint8_t>* validity = nullptr) const;
     std::vector<geometry::Point> points(const std::string& array,int64_t start,int64_t count) const;
-    TransformedSurfaceTile readTile(int64_t row,int64_t column,int64_t rows,int64_t columns) const;
+    // With applyValidity=false, transform all present coordinates and return validity separately.
+    TransformedSurfaceTile readTile(int64_t row, int64_t column, int64_t rows, int64_t columns,
+                                    bool applyValidity = true) const;
     // Encode only explicitly changed positions; unchanged values reuse their
     // original bytes. Track edits round to nearest, with ties away from zero.
     std::vector<GeometryArrayEdit> coordinateEdits(const std::string& array,int64_t start,
