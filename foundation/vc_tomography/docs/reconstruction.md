@@ -29,6 +29,9 @@ field of view, comes first. A column recorded under another sample name (for exa
 ```
 
 Only `pixel_size_um` is required. `source_sample_distance_m` lets the calibration measure the beam's divergence.
+`height_stage` names the motor that sets the sample's height (default `<stage>_y1`), or a list of stacked motors
+whose positions add up to it (`["ss1_y1", "ss1_y3"]` for PHerc0051.04.08, where each moved between two of the scans).
+`propagation_distance_m` is needed for Paganin and the other phase filters.
 `fan_sense` is the sign of the divergence relative to the recorded angle (`-1` at I12, `1` at BM18; default `1`).
 
 ## Quick start

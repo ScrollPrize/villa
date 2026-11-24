@@ -107,6 +107,12 @@ vc_tomography_calibration geometry r1c1.nxs r1c2.nxs r1c3.nxs r2c1.nxs r2c2.nxs 
   the detector map. This option fits the map as a single radial lens distortion instead (one unknown).
 - A circular scan does not travel along the axis, so its axial scale and axis slope are held fixed.
 - Only the rows lit by the beam (above 0.12 of the brightest row's mean flat) are used.
+- Scans above each other that share too few lit rows for blocks of 256 rows (PHerc0051.04.08: 262 rows, 11 mm
+  apart) are compared in blocks of 128 rows, one at each end of the shared rows.
+- A single column of scans (all at one place across the beam): the axis is near one edge, so opposite views cover
+  only the columns near it, and comparisons between heights use the same columns in both scans. Nothing then
+  measures how the rows bend across the rest of the detector, and a map fitted with `--radial-map` or `--order N`
+  extrapolates those terms (on PHerc0051.04.08 to 18 px, which the reconstruction refuses). Use `--order 0` there.
 
 #### BM18 mosaic tiles
 

@@ -200,6 +200,23 @@ void read_supplement(Master& m) {
         number("fan_sense", m.fan_sense);
         if (std::isfinite(m.fan_sense) && m.fan_sense != 1.0 && m.fan_sense != -1.0) throw Error(path + ": 'fan_sense' is 1 or -1");
         if (const Json* v = doc.find("height_stage"); v && v->is(Json::String)) m.height_stage = v->string;
+        else if (v && v->is(Json::Array)) {
+            // stacked stages: the height is the sum of their positions, held as one motor named "a+b"
+            std::string name;
+            double sum = 0.0;
+            for (const Json& motor : v->array) {
+                if (!motor.is(Json::String)) throw Error(path + ": 'height_stage' names motors");
+                const auto it = m.positions.find(motor.string);
+                if (it == m.positions.end()) throw Error(path + ": 'height_stage' names " + motor.string + ", which " + m.path + " does not record");
+                name += (name.empty() ? "" : "+") + motor.string;
+                sum += it->second;
+            }
+            if (name.empty()) throw Error(path + ": 'height_stage' names no motor");
+            m.height_stage = name;
+            m.positions[name] = sum;
+        } else if (v && !v->is(Json::Null)) {
+            throw Error(path + ": 'height_stage' is a motor's name or a list of them");
+        }
         if (const Json* v = doc.find("stages_on_rotation"); v && v->is(Json::Array))
             for (const Json& name : v->array)
                 if (name.is(Json::String)) on_rotation.push_back(name.string);

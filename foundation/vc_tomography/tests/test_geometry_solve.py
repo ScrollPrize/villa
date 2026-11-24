@@ -976,6 +976,23 @@ def test_plan_of_a_grid_of_circular_scans_stays_in_the_lit_rows():
     assert min(p["row_a"] for p in G.plan_comparisons(acq) if (p["scan_a"], p["scan_b"]) == (0, 3)) < lit[0]
 
 
+def test_plan_of_scans_above_each_other_sharing_few_rows():
+    """Diamond I12's PHerc0051.04.08: three circular scans in one column, 11 mm (1390 rows) apart, the beam lighting
+    rows 201 to 1852 of 2160: neighbours share 262 lit rows, too few for blocks of 256 rows and their margins. They are
+    compared in blocks of 128 rows at both ends of the rows where such a block fits, so that the patches lie at
+    different distances from the detector's middle row (the rows' timing between the scans is measured from that)."""
+    rows, cols, N, up, lit = 2160, 2560, 7200, 1390, (201, 1853)
+    turn = lambda height: [dict(name="rest1", angle_deg=np.arange(N + 1) * 360.0 / N, rows=np.full(N + 1, float(height)))]
+    scans = [dict(name=str(130049 + k), axis=330.0, stretches=turn(k * up)) for k in range(3)]
+    plan = G.plan_comparisons(dict(rows=rows, cols=cols, per_turn=N, row_sign=-1.0, width=512, scans=scans, lit_rows=lit))
+    assert {(p["kind"], p["scan_a"], p["scan_b"]) for p in plan} == {("opposite", 0, 0), ("opposite", 1, 1), ("opposite", 2, 2), ("pair", 0, 1), ("pair", 1, 2)}
+    pairs = [p for p in plan if p["kind"] == "pair"]
+    assert {p["rows"] for p in pairs} == {128}
+    assert {p["row_a"] for p in pairs} == {lit[0], lit[1] - 128 - 40 - up}            # 201 and 295
+    for p in pairs:
+        assert lit[0] <= p["row_a"] + up - 40 and p["row_a"] + up + p["rows"] + 40 <= lit[1]
+
+
 def test_plan_of_tiles_follows_their_places():
     """Two tiles of a mosaic as Paris4's at a quarter: 1736 px apart, the axis 77 columns from the detector's edge.
     At equal angle the second holds the first's rays (d_k - d_j) . (cos th, sin th) columns further on, which leaves

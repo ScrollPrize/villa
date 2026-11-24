@@ -18,7 +18,7 @@ STEP, EXPOSURE, PERIOD_MS = 5.0, 0.02, 40.0
 
 
 def _write(root, number, title, in_beam=-8.0, snapshot_x=None, height=48.5, flats_at_end=0, short_record=False,
-           supplement=dict(pixel_size_um=7.91, energy_kev=53, propagation_distance_m=None), lit=None):
+           supplement=dict(pixel_size_um=7.91, energy_kev=53, propagation_distance_m=None), lit=None, motors=None):
     # lit: (first, end): the rows the beam lights; the flats' other rows hold 6 % of it above the dark
     root.mkdir(parents=True, exist_ok=True)
     key = [2] * N_DARK + [1] * N_FLAT + [0] * N_PROJ + [1] * flats_at_end
@@ -63,7 +63,7 @@ def _write(root, number, title, in_beam=-8.0, snapshot_x=None, height=48.5, flat
         t["sample/rotation_angle"] = inst["zebraSM1/zebraSM1"]
         t["control/data"] = current
         b = e.create_group("before_scan")
-        for name, value in dict(ss1_x=in_beam if snapshot_x is None else snapshot_x, ss1_y1=height, ss1_y2=10.4861, ss1_tx=-0.4, ss1_tz=0.2, ss1_theta=366.275).items():
+        for name, value in dict(dict(ss1_x=in_beam if snapshot_x is None else snapshot_x, ss1_y1=height, ss1_y2=10.4861, ss1_tx=-0.4, ss1_tz=0.2, ss1_theta=366.275), **(motors or {})).items():
             b["ss1/" + name] = value
         b["ring_current"] = np.array([251.5])
         b["flyscan_cfg/tomography_translation"] = "ss1_x"
@@ -127,6 +127,26 @@ def test_the_pixel_size_must_be_given(tmp_path):
     (tmp_path / "vc_tomography_acquisition.json").write_text('{"pixel_size_um": 3.24, "source_sample_distance_m": 51, "propagation_distance_m": 0.5}')
     s = bliss.open_scan(str(master))
     assert s.pixel_size_m == 3.24 * 1e-6 and s.distance_m == 0.5 and np.isnan(s.energy_kev)
+
+
+def test_a_height_from_stacked_stages(tmp_path):
+    """PHerc0051.04.08 at I12 (130049..130051): ss1_y1 moves between the first two scans and ss1_y3 between the last
+    two. The supplement names both and the height is their sum."""
+    supplement = dict(pixel_size_um=7.91, height_stage=["ss1_y1", "ss1_y3"])
+    heights = {}
+    for number, y1, y3 in ((130049, 23.9927, 13.0008), (130050, 12.9964, 13.0007), (130051, 12.9963, 1.9989)):
+        master, *_ = _write(tmp_path / str(number), number, f"s_{number}", height=y1, motors=dict(ss1_y3=y3), supplement=supplement)
+        s = bliss.open_scan(str(master))
+        np.testing.assert_array_equal(s.z_translation_m, np.full(N_PROJ, (y1 + y3) * 1e-3))
+        heights[number] = s.z_translation_m[0] * 1e3
+    assert [round(heights[n + 1] - heights[n], 2) for n in (130049, 130050)] == [-11.0, -11.0]
+    # one name still names one motor; a motor the master does not hold, or a list of other things, is an error
+    master, *_ = _write(tmp_path / "one", 130052, "s_one", height=23.9927, motors=dict(ss1_y3=13.0008), supplement=dict(pixel_size_um=7.91, height_stage="ss1_y3"))
+    np.testing.assert_array_equal(bliss.open_scan(str(master)).z_translation_m, np.full(N_PROJ, 13.0008e-3))
+    for bad, match in ((["ss1_y1", "ss1_y4"], "names ss1_y4, which .* does not record"), (["ss1_y1", 3], "names motors"), ([], "names no motor"), (3, "a motor's name or a list")):
+        (tmp_path / "one" / "vc_tomography_acquisition.json").write_text(json.dumps(dict(pixel_size_um=7.91, height_stage=bad)))
+        with pytest.raises(ValueError, match=match):
+            bliss.open_scan(str(master))
 
 
 def test_discover_a_folder_of_masters(tmp_path):

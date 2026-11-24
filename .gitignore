@@ -93,3 +93,4 @@ dinovol/cufile.log
 /dinovol/perf_results
 /volume-cartographer/benchmarks/saved
 /foundation/vc_tomography/tests/data
+*.log

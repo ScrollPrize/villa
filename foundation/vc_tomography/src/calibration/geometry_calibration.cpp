@@ -133,6 +133,16 @@ std::vector<std::int64_t> bands_of(int Nr, int nr, int L0, int L1, int most) {
     return whole(linspace(a0, a1, count));
 }
 
+// As bands_of, for a pair of scans that share too few rows for side-by-side bands: one band at each end of the
+// rows where the block fits (they overlap), so the patches lie at different distances from the detector's middle
+// row, which the rows' timing between the scans is measured from.
+std::vector<std::int64_t> end_bands_of(int Nr, int nr, int L0, int L1) {
+    const int m = 40, a0 = std::max(L0, L0 + m - Nr), a1 = std::min(L1 - nr, L1 - nr - m - Nr);
+    if (a1 < a0) return {};
+    if (a1 == a0) return {a0};
+    return {a0, a1};
+}
+
 // a block of `frames` frames, rows x cols, of scan_a's stretch_a at frame_a against scan_b's stretch_b (frame_a +
 // hint), at the rows row_a and the columns col_a, col_b
 ViewRequest block_request(int scan_a, int stretch_a, int scan_b, int stretch_b, std::int64_t frame_a, std::int64_t hint, int rows, int cols,
@@ -805,10 +815,15 @@ std::vector<Planned> plan(const Acquisition& acq, const PlanCounts& n) {
                     for (const std::int64_t p : positions) {
                         const int Nr = static_cast<int>(std::lround(sb.course.rows[static_cast<std::size_t>(p + 16)] - sa.course.rows[static_cast<std::size_t>(p + 16)]));
                         if (std::abs(move) < 48 && std::abs(Nr) < 48) continue;  // a pattern fixed to the detector would register
-                        for (const std::int64_t row_a : bands(Nr, nrows))
+                        // where the two share too few lit rows for blocks of nrows: blocks of 128 rows at both ends of
+                        // the rows they share
+                        int nr = nrows;
+                        std::vector<std::int64_t> rows_a = bands(Nr, nr);
+                        if (rows_a.empty() && nr > 128) nr = 128, rows_a = end_bands_of(Nr, nr, L0, L1);
+                        for (const std::int64_t row_a : rows_a)
                             for (const std::int64_t ca : windows)
                                 add_between("pair", j, a, k, b,
-                                            block_request(j, sa.index, k, sb.index, p, 0, nrows, W, static_cast<int>(row_a), static_cast<int>(ca), static_cast<int>(ca) + move),
+                                            block_request(j, sa.index, k, sb.index, p, 0, nr, W, static_cast<int>(row_a), static_cast<int>(ca), static_cast<int>(ca) + move),
                                             true);
                     }
                 }

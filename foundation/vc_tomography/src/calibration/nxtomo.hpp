@@ -37,7 +37,8 @@
 //    "source_sample_distance_m": 51,         optional
 //    "fan_sense": -1,                        optional, 1 or -1 (default 1): the sense of the beam's divergence against
 //                                            the recorded angle (Acquisition::fan); -1 at Diamond I12
-//    "height_stage": "ss1_y1",               optional: the motor that sets the height of the sample in the beam
+//    "height_stage": "ss1_y1",               optional: the motor that sets the height of the sample in the beam, or a
+//                                            list of stacked motors (["ss1_y1", "ss1_y3"]) whose positions add up to it
 //    "stages_on_rotation": ["ss1_tx", "ss1_tz"]}   optional: the two stages that move the sample on the rotation
 //
 // height_stage defaults to <prefix>_y1 or <prefix>_y and stages_on_rotation to <prefix>_tx, <prefix>_tz, with
