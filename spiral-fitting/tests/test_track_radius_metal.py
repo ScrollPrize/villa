@@ -34,6 +34,9 @@ CFG = {
 DR = 37.5
 TARGET_POINTS = 96
 FACTOR = 4.0
+# float32 grad_dr errors measured over 20 seeds: fused <= 3.1, eager <= 2.2 in
+# units of eps32 * sum|g_shifted * theta| / 2pi
+DR_ULPS = 8.0
 SEEDS = range(7, 7 + int(os.environ.get('TRACK_RADIUS_SEEDS', '4')))
 
 
@@ -126,6 +129,28 @@ def _run(fn, spiral, dr_value, sample, dtype, device):
             dr.grad.cpu().double())
 
 
+def _dr_condition(spiral, sample):
+    """float64 sum|d loss / d shifted * theta| / 2pi, grad_dr's rounding scale"""
+    spiral = spiral.double().detach().requires_grad_(True)
+    dr = torch.tensor(DR, dtype=torch.float64)
+    theta, _, shifted = get_theta_and_radii(spiral[..., 1:], dr)
+    shifted.retain_grad()
+    unwrapped, _ = _unwrap_ragged_track_radii(
+        theta, shifted, dr, sample['row_id'], sample['row_starts'])
+    if sample['partner_rows'].numel() > 0:
+        alignment = _crossing_row_alignments(
+            unwrapped, sample['primary_cross_flat'],
+            sample['partner_cross_flat'], sample['partner_rows'],
+            len(sample['track_idx']))
+        unwrapped = unwrapped + alignment[sample['row_id']]
+    loss, _, _ = _grouped_same_radius_loss(
+        unwrapped, unwrapped[sample['target_flat_idx']], sample['row_id'],
+        sample['group_id'], sample['row_slot'], sample['num_groups'],
+        sample['group_width'], dr, CFG)
+    loss.backward()
+    return (shifted.grad * theta.detach()).abs().sum().item() / (2 * math.pi)
+
+
 def _fused(spiral, dr, sample):
     return track_loss_metal.track_radius_loss_metal(spiral, dr, sample, CFG)[0]
 
@@ -140,9 +165,12 @@ def test_fused_matches_eager(seed):
     ref = _run(_eager, spiral, DR, sample, torch.float64, 'cpu')
     eager = _run(_eager, spiral, DR, sample, torch.float32, 'mps')
     fused = _run(_fused, spiral, DR, sample, torch.float32, 'mps')
+    dr_floor = DR_ULPS * torch.finfo(torch.float32).eps * _dr_condition(spiral, sample)
     for name, r, e, f in zip(('loss', 'grad_spiral', 'grad_dr'), ref, eager, fused):
         scale = r.abs().max().item()
         floor = 1e-6 * max(scale, 1e-12)
+        if name == 'grad_dr':
+            floor = max(floor, dr_floor)
         bound = FACTOR * _spread(e, r) + floor
         assert _spread(f, r) <= bound, (
             f'{name}: fused {_spread(f, r):.3e} vs eager {_spread(e, r):.3e} '
