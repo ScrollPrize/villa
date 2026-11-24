@@ -223,7 +223,14 @@ TEST_CASE("A TIFXYZ import resumes with an optional GrowPatch anchor")
                 const auto offset = meta.at("grid_offset").get<std::vector<int>>();
                 const auto mask = surface->channel("mask", SURF_CHANNEL_NORESIZE);
                 REQUIRE_FALSE(mask.empty());
-                CHECK(mask.at<uint8_t>(seed_grid.y + offset[1], seed_grid.x + offset[0]) == 0);
+                const cv::Point target(seed_grid.x + offset[0], seed_grid.y + offset[1]);
+                CHECK(mask.at<uint8_t>(target) == 0);
+                const vc::objects::LocalStoreReader reader(store, txn);
+                const auto selected = reader.currentObject(resumed);
+                REQUIRE(selected && selected->geometryRevision);
+                const auto array = reader.readGeometryRectangle(*selected->geometryRevision, "generations",
+                                                                target.y, target.x, 1, 1);
+                CHECK(array == std::vector<uint8_t>{1, 0});
             }
         }
 

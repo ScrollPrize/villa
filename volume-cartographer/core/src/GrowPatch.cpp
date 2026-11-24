@@ -2460,6 +2460,8 @@ QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const nlo
                 cv::Mat_<uint8_t> new_mask(new_points->size());
                 std::transform(new_points->begin(), new_points->end(), new_mask.begin(),
                                [](const auto& p) { return vc::geometry::validSurfacePoint(p) ? 255 : 0; });
+                const cv::Mat_<uint16_t> input_generations = resume_surf->channel("generations");
+                cv::Mat_<uint16_t> new_generations = surf->channel("generations", SURF_CHANNEL_NORESIZE);
 
                 const cv::Point offset(resume_pad_x - used_area_safe.x, resume_pad_y - used_area_safe.y);
                 const cv::Rect input_grid(cv::Point(), old_points->size());
@@ -2471,6 +2473,7 @@ QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const nlo
                     if (input_mask(cell) == 0) {
                         new_mask(target) = 0;
                         (*new_points)(target) = coords;
+                        new_generations(target) = input_generations.empty() ? 0 : input_generations(cell);
                     }
                 };
                 // Some loaders retain masked coordinates directly in the grid.
