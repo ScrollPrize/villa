@@ -94,12 +94,14 @@ int fallbackLevels(const std::vector<Level>& levels, int start, int width, int h
 std::array<float, 18> magnificationPoints(const Raster& raster)
 {
     // Off-centre points too: the view's centre may be over a hole or a boundary.
+    // Spanning the pixel indices, the points stay over the sampled footprint.
+    const double w = std::max(raster.width - 1, 0), h = std::max(raster.height - 1, 0);
     std::array<float, 18> xy{};
     std::size_t i = 0;
     for (const double y : {0.25, 0.5, 0.75})
         for (const double x : {0.25, 0.5, 0.75}) {
-            xy[i++] = float(raster.x0 + x * raster.width * raster.sx + y * raster.height * raster.kx);
-            xy[i++] = float(raster.y0 + x * raster.width * raster.ky + y * raster.height * raster.sy);
+            xy[i++] = float(raster.x0 + x * w * raster.sx + y * h * raster.kx);
+            xy[i++] = float(raster.y0 + x * w * raster.ky + y * h * raster.sy);
         }
     return xy;
 }
