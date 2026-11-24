@@ -1,9 +1,28 @@
-"""Copy the source Zarr chunks selected by tifxyz label-patch geometry."""
+"""Copy the source Zarr chunks selected by tifxyz label-patch geometry.
+
+v2 — targeted flat-discovery fix for PR #2677 (review: villa-review, 24/11/2026).
+
+The downloader plans native (tifxyz) chunk downloads, so it needs tifxyz
+geometry for every segment it plans: the tifxyz reader opens the
+coordinate TIFFs by name. v1 admitted any folder containing a .tif, so a
+sibling preview folder aborted the whole plan at label lookup, and a
+newly admitted folder with usable labels but no geometry reached the
+tifxyz reader and failed there. v2 restores the native geometry check
+(x.tif directly in the segment directory, as main had it) and makes the
+per-segment planning resilient: one defective neighbour is warned about
+and skipped, never fatal to the plan. A flat Zarr-only mirror (no tifxyz)
+is skipped with a warning — the downloader cannot plan native crops
+without coordinates; such mirrors are a training-discovery matter, not a
+download matter. An unfinished mirror (label stores present but empty)
+is skipped the same way and picked up on a later run once its stores
+are filled.
+"""
 
 import argparse
 import json
 import multiprocessing as mp
 import shutil
+import warnings
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
 from typing import Iterable
@@ -25,7 +44,11 @@ from vesuvius.ink_detection.data.patch_finding_default import (
     surface_patch_bbox,
 )
 from vesuvius.ink_detection.data.patch_finding_subtiling import build_patch_index
-from vesuvius.ink_detection.data.segment import discover_segment_labels
+from vesuvius.ink_detection.data.segment import (
+    discover_segment_labels,
+    has_tifxyz_geometry,
+    zarr_store_has_chunks,
+)
 from vesuvius.ink_detection.types import Segment
 from vesuvius.ink_detection.volume_io import normalized_source_path, open_volume, open_volume_root
 from vesuvius.utils.cli import HyphenUnderscoreParser
@@ -608,10 +631,31 @@ def copy_chunks_to_output(
 
 
 def _iter_segment_dirs(dataset_dir: Path) -> Iterable[Path]:
+    """Yield segment directories that carry native tifxyz geometry.
+
+    The downloader plans native crops, so a directory is plannable only
+    when the tifxyz reader can open its coordinates (x.tif directly in the
+    directory). A folder with any other TIFF — a preview image, a label
+    TIFF — is not a native segment and is skipped; a flat Zarr-only mirror
+    is skipped too, with a warning when the folder looks like a segment
+    attempt, since no native crop can be planned from it.
+    """
     for segment_dir in sorted(dataset_dir.iterdir()):
         if not segment_dir.is_dir() or segment_dir.name == "unused":
             continue
-        if not any(segment_dir.rglob("*.tif")):
+        if not has_tifxyz_geometry(segment_dir):
+            looks_segment_like = any(
+                path.suffix.lower() in {".tif", ".tiff", ".zarr"}
+                or (path.is_dir() and path.suffix.lower() == ".zarr")
+                for path in segment_dir.iterdir()
+            )
+            if looks_segment_like:
+                warnings.warn(
+                    f"{segment_dir}: skipping download planning: no tifxyz "
+                    "geometry (x.tif); native chunk planning needs the "
+                    "coordinate TIFFs.",
+                    stacklevel=2,
+                )
             continue
         yield segment_dir
 
@@ -826,24 +870,53 @@ def _build_dataset_download_patches(
     source = data_config.datasets[0]
     patches: list[dict] = []
     candidate_bbox_count = 0
+    skipped = 0
     for segment_dir in _iter_segment_dirs(dataset_dir):
-        segment = Segment(
-            data_config=data_config,
-            source=source,
-            dataset_idx=0,
-            segment_relpath=segment_dir.relative_to(dataset_dir).as_posix(),
-            segment_dir=segment_dir,
-            segment_name=segment_dir.name,
-            image_volume=str(source_spec.volume_path),
-        )
-        segment = discover_segment_labels(segment, extension=".zarr", required=True)
-        segment_patches, segment_candidate_count = _build_segment_download_patches(
-            segment,
-            patch_filter=patch_filter,
-        )
+        try:
+            segment = Segment(
+                data_config=data_config,
+                source=source,
+                dataset_idx=0,
+                segment_relpath=segment_dir.relative_to(dataset_dir).as_posix(),
+                segment_dir=segment_dir,
+                segment_name=segment_dir.name,
+                image_volume=str(source_spec.volume_path),
+            )
+            segment = discover_segment_labels(segment, extension=".zarr", required=True)
+            # Unfinished mirror: the label stores exist by name but hold no
+            # chunks yet (first-sync state). Skip it now; it is picked up
+            # on a later run once its stores are filled. Without this
+            # check the candidate search below raises "contains no nonzero
+            # voxels" and aborts the whole plan.
+            for label_path in (segment.inklabels, segment.supervision_mask):
+                if label_path is not None and not zarr_store_has_chunks(label_path):
+                    raise ValueError(
+                        f"{label_path} holds no chunks yet (unfinished mirror)"
+                    )
+            segment_patches, segment_candidate_count = _build_segment_download_patches(
+                segment,
+                patch_filter=patch_filter,
+            )
+        except (ValueError, KeyError, OSError, RuntimeError) as exc:
+            # One defective neighbour must never abort the whole download
+            # plan: warn, skip it, and plan the remaining segments.
+            warnings.warn(
+                f"{segment_dir}: skipping download planning: {exc}",
+                stacklevel=2,
+            )
+            skipped += 1
+            continue
         patches.extend(segment_patches)
         candidate_bbox_count += int(segment_candidate_count)
 
+    if not patches and skipped:
+        warnings.warn(
+            "no download patches planned: "
+            f"{skipped} segment director{'y' if skipped == 1 else 'ies'} "
+            "skipped (see warnings above); unfinished mirrors are picked up "
+            "once their stores are filled.",
+            stacklevel=2,
+        )
     return patches, int(candidate_bbox_count)
 
 
