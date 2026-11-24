@@ -1630,7 +1630,7 @@ too large, or a setting it does not support) runs on Kimimaro from the labels
 teasar already computed, and the run prints how many did. Keys are written in
 the same order as with the CPU backend, so a run resumes the same way.
 
-`--metal-target-order` sets the order teasar traces each skeleton's branches
+`--teasar-target-order` sets the order teasar traces each skeleton's branches
 in. The default, `kimimaro`, follows Kimimaro's order, so the tracks stay
 compatible with the CPU backend's; while the installed teasar does not
 implement it, the run says so and extracts with the CPU backend instead.

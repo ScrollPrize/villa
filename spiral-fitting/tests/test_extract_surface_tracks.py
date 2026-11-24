@@ -753,7 +753,7 @@ def _fake_teasar(kimimaro, settings_name, failures=(), target_orders=('kimimaro'
 
         def skeletonize(self, labels_list, *, settings, anisotropy, scale, const, dust_threshold,
                         fix_borders, fix_branching, target_order):
-            assert settings == settings_name and target_order == est.metal_target_order
+            assert settings == settings_name and target_order == est.teasar_target_order
             if target_order not in target_orders:
                 raise UnsupportedSettings(f'target_order {target_order!r}')
             if not any(labels.any() for labels in labels_list):
@@ -784,7 +784,7 @@ def _metal_setup(monkeypatch, failures=(), target_order='kimimaro',
     pytest.importorskip('cc3d')
     _small_configuration(monkeypatch)
     monkeypatch.setattr(est, 'TEASAR_SETTINGS', {'small': est.geometry()})
-    monkeypatch.setattr(est, 'metal_target_order', target_order)
+    monkeypatch.setattr(est, 'teasar_target_order', target_order)
     volume = synthetic_predictions()
     monkeypatch.setattr(est, 'open_predictions', lambda path: volume)
 
@@ -808,7 +808,7 @@ def _metal_setup(monkeypatch, failures=(), target_order='kimimaro',
     ({1: lambda t: t.InputTooLarge('too large')}, 'singly'),
     ({1: lambda t: t.UnsupportedSettings('no')}, 'settings'),
 ])
-@pytest.mark.parametrize('target_order', est.METAL_TARGET_ORDERS)
+@pytest.mark.parametrize('target_order', est.TEASAR_TARGET_ORDERS)
 def test_metal_backend_matches_cpu(monkeypatch, tmp_path, capsys, failures, calls, target_order):
     teasar = _metal_setup(monkeypatch, failures, target_order)
     est.run_cpu('synthetic', str(tmp_path / 'cpu.dbm'))
@@ -904,15 +904,15 @@ def test_metal_backend_without_the_target_order_uses_cpu(monkeypatch, tmp_path, 
     assert _read_dbm(tmp_path / 'metal.dbm') == _read_dbm(tmp_path / 'cpu.dbm')
 
 
-def test_metal_target_order_reaches_the_backend(monkeypatch, tmp_path, capsys):
-    monkeypatch.setattr(est, 'metal_target_order', est.metal_target_order)  # main() sets it
+def test_teasar_target_order_reaches_the_backend(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(est, 'teasar_target_order', est.teasar_target_order)  # main() sets it
     monkeypatch.setattr(est, 'select_backend', lambda requested, gpus=None: 'metal')
     seen = []
-    monkeypatch.setattr(est, 'run_metal', lambda *args: seen.append(est.metal_target_order))
+    monkeypatch.setattr(est, 'run_metal', lambda *args: seen.append(est.teasar_target_order))
     argv = ['--predictions', 'p.zarr', '--out', str(tmp_path / 't.dbm'), '--no-packed-store']
     with pytest.raises(SystemExit):
-        est.parse_args([*argv, '--backend', 'cpu', '--metal-target-order', 'best'])
+        est.parse_args([*argv, '--backend', 'cpu', '--teasar-target-order', 'best'])
     assert 'applies to the metal backend only' in capsys.readouterr().err
-    est.main([*argv, '--metal-target-order', 'best'])
-    est.main([*argv, '--metal-target-order', 'kimimaro'])
+    est.main([*argv, '--teasar-target-order', 'best'])
+    est.main([*argv, '--teasar-target-order', 'kimimaro'])
     assert seen == ['best', 'kimimaro']

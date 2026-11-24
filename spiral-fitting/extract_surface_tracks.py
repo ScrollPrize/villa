@@ -83,8 +83,8 @@ _SERIAL_KIMIMARO_PARALLEL = 8 if sys.platform.startswith('linux') else 1
 # Kimimaro's, so the tracks stay compatible with the CPU backend's; 'best' is teasar's own order,
 # whose skeletons differ from Kimimaro's. While a teasar release does not implement 'kimimaro',
 # the run uses the CPU backend instead
-metal_target_order = 'kimimaro'
-METAL_TARGET_ORDERS = ('kimimaro', 'best')
+teasar_target_order = 'kimimaro'
+TEASAR_TARGET_ORDERS = ('kimimaro', 'best')
 
 BACKENDS = ('auto', 'gpu', 'metal', 'cpu')
 # The slab configurations teasar supports, by the name it gives each: the whole geometry() must
@@ -625,7 +625,7 @@ class MetalSlabs:
             settings=settings, anisotropy=kwargs['anisotropy'],
             scale=kwargs['teasar_params']['scale'], const=kwargs['teasar_params']['const'],
             dust_threshold=kwargs['dust_threshold'], fix_borders=kwargs['fix_borders'],
-            fix_branching=kwargs['fix_branching'], target_order=metal_target_order)
+            fix_branching=kwargs['fix_branching'], target_order=teasar_target_order)
         self.declined = 0
 
     def accepts_settings(self):
@@ -738,7 +738,7 @@ def run_metal(predictions_path, tracks_dbm_path):
                 jobs = [j for j in jobs if j[0] not in tracks_db]
                 print(f'extracting {len(jobs)} slabs on {device.name} (teasar '
                       f'{teasar.__version__}, settings {settings!r}, target order '
-                      f'{metal_target_order!r})')
+                      f'{teasar_target_order!r})')
                 with tqdm(total=len(jobs), desc='slabs') as progress:
                     for batch in slabs.batches(predictions_zarr_array, jobs):
                         # keys are written in job order once their call returns, so a run
@@ -753,7 +753,7 @@ def run_metal(predictions_path, tracks_dbm_path):
 
     # every call would decline, and the CPU backend runs slabs in parallel where the fallback
     # inside this loop cannot
-    print(f'teasar {teasar.__version__} does not support target order {metal_target_order!r}; '
+    print(f'teasar {teasar.__version__} does not support target order {teasar_target_order!r}; '
           'extracting with the CPU backend (Kimimaro) instead')
     run_cpu(predictions_path, tracks_dbm_path)
 
@@ -916,7 +916,7 @@ def parse_args(argv=None):
              f'else {_SERIAL_KIMIMARO_PARALLEL} on this OS (default: %(default)s)',
     )
     parser.add_argument(
-        '--metal-target-order', choices=METAL_TARGET_ORDERS, default=metal_target_order,
+        '--teasar-target-order', choices=TEASAR_TARGET_ORDERS, default=teasar_target_order,
         help="metal backend: the order teasar traces each skeleton's branches in; kimimaro "
              "keeps the tracks compatible with the CPU backend's, and runs on the CPU backend "
              "while teasar does not implement it; best is teasar's own order, whose skeletons "
@@ -951,8 +951,8 @@ def parse_args(argv=None):
     if args.backend != 'cpu' and any(getattr(args, k) != parser.get_default(k) for k in cpu_opts):
         parser.error('--slab-workers and --kimimaro-parallel apply to --backend cpu only')
     if (args.backend in ('cpu', 'gpu')
-            and args.metal_target_order != parser.get_default('metal_target_order')):
-        parser.error(f'--metal-target-order applies to the metal backend only, not to '
+            and args.teasar_target_order != parser.get_default('teasar_target_order')):
+        parser.error(f'--teasar-target-order applies to the metal backend only, not to '
                      f'--backend {args.backend}')
     if args.slab_workers == 'auto' and '://' in args.predictions:
         args.slab_workers = 1
@@ -965,9 +965,9 @@ def parse_args(argv=None):
 
 def main(argv=None):
     # The slab functions above read the z range and downsample factor from the module configuration.
-    global z_min, z_max, downsample_factor, slab_workers, kimimaro_parallel, metal_target_order
+    global z_min, z_max, downsample_factor, slab_workers, kimimaro_parallel, teasar_target_order
     args = parse_args(argv)
-    metal_target_order = args.metal_target_order
+    teasar_target_order = args.teasar_target_order
     z_min, z_max = args.z_min, args.z_max
     downsample_factor = args.downsample_factor
     slab_workers, kimimaro_parallel = args.slab_workers, args.kimimaro_parallel
