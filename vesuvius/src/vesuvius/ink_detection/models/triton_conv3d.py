@@ -9,6 +9,9 @@ kernels do not cover runs the ordinary ``nn.Conv3d`` forward.
 
 from __future__ import annotations
 
+import threading
+import warnings
+
 import torch
 from torch import nn
 
@@ -20,6 +23,10 @@ except ImportError:  # CPU-only, macOS and Windows installs
 
 
 SUPPORTED_CHANNELS = 16
+
+# The autotuners keep per-call state, so DataParallel replicas must not launch concurrently.
+_launch_lock = threading.Lock()
+_device_works: dict[torch.device, bool] = {}
 
 if triton is not None:
 
@@ -110,7 +117,12 @@ def _conv_rows(x2, wm, B, D, H, W, Cin, Cout):
     y = torch.empty(B * D * H * W, Cout, device=x2.device, dtype=torch.float16)
     BK = max(16, min(64, triton.next_power_of_2(Cin)))
     grid = lambda META: (triton.cdiv(B * D * H * W, META["BM"]), triton.cdiv(Cout, META["BN"]))
-    _conv3d_k3_kernel[grid](x2, wm, y, B, D, H, W, Cin, Cout, BK=BK)
+    with _launch_lock, torch.cuda.device(x2.device):
+        try:
+            _conv3d_k3_kernel[grid](x2, wm, y, B, D, H, W, Cin, Cout, BK=BK)
+        finally:
+            # The autotuner keeps the arguments, and so the tensors, when a launch raises.
+            _conv3d_k3_kernel.nargs = None
     return y
 
 
@@ -121,7 +133,8 @@ def _wgrad_rows(x2, g2, B, D, H, W, Cin, Cout):
     splits = max(1, min(256, M // 8192))
     MCH = triton.cdiv(triton.cdiv(M, splits), 128) * 128
     grid = lambda META: (27, triton.cdiv(Cin, META["BC"]), triton.cdiv(Cout, META["BN"]) * triton.cdiv(M, MCH))
-    _conv3d_k3_wgrad_kernel[grid](x2, g2, dw, B, D, H, W, Cin, Cout, MCH)
+    with _launch_lock, torch.cuda.device(x2.device):
+        _conv3d_k3_wgrad_kernel[grid](x2, g2, dw, B, D, H, W, Cin, Cout, MCH)
     return dw.view(3, 3, 3, Cin, Cout).permute(4, 3, 0, 1, 2).contiguous()
 
 
@@ -179,6 +192,16 @@ class TritonConv3d(nn.Conv3d):
         )
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        if self._uses_triton(input):
+        if not self._uses_triton(input) or _device_works.get(input.device) is False:
+            return super().forward(input)
+        if input.device in _device_works:
             return _Conv3dK3Function.apply(input, self.weight)
-        return super().forward(input)
+        try:
+            output = _Conv3dK3Function.apply(input, self.weight)
+        except RuntimeError as exc:
+            # e.g. a Triton build that cannot compile for this GPU architecture
+            warnings.warn(f"Triton stem convolution failed on {input.device}, using torch: {exc}")
+            _device_works[input.device] = False
+            return super().forward(input)
+        _device_works[input.device] = True
+        return output

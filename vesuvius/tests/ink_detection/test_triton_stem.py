@@ -8,6 +8,7 @@ from torch import nn
 
 from vesuvius.ink_detection.config import InkConfig
 from vesuvius.ink_detection.models.model import make_model
+from vesuvius.ink_detection.models import triton_conv3d
 from vesuvius.ink_detection.models.triton_conv3d import TritonConv3d, triton
 
 from .helpers import config_mapping
@@ -29,6 +30,26 @@ def test_triton_conv_falls_back_to_torch_on_cpu(channels):
     assert not conv._uses_triton(x)
     torch.testing.assert_close(conv(x), reference(x), rtol=0, atol=0)
     assert conv.state_dict().keys() == reference.state_dict().keys()
+
+
+def test_triton_conv_falls_back_to_torch_when_the_kernel_fails(monkeypatch):
+    reference, conv = _paired_convs()
+    x = torch.randn(1, 16, 3, 8, 8)
+    calls = 0
+
+    def unsupported(*args):
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("unsupported target")
+
+    monkeypatch.setattr(TritonConv3d, "_uses_triton", lambda self, input: True)
+    monkeypatch.setattr(triton_conv3d._Conv3dK3Function, "apply", unsupported)
+    monkeypatch.setattr(triton_conv3d, "_device_works", {})
+
+    with pytest.warns(UserWarning, match="unsupported target"):
+        torch.testing.assert_close(conv(x), reference(x), rtol=0, atol=0)
+    torch.testing.assert_close(conv(x), reference(x), rtol=0, atol=0)
+    assert calls == 1
 
 
 def test_stem_conv_backend_defaults_to_torch_and_rejects_unknown_names():
