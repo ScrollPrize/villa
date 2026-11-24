@@ -1,3 +1,5 @@
+#include "portable_random.hpp"
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -182,13 +184,14 @@ int uniform_int(Rng& rng, int upper_exclusive)
 {
     if (upper_exclusive <= 0)
         throw std::runtime_error("cannot sample an empty range");
-    return std::uniform_int_distribution<int>(0, upper_exclusive - 1)(rng);
+    return static_cast<int>(vc_spiral::uniform_below(
+        rng, static_cast<uint64_t>(upper_exclusive)));
 }
 
 template <typename Rng>
 float uniform_float(Rng& rng)
 {
-    return std::generate_canonical<float, 24>(rng);
+    return vc_spiral::uniform_unit_float(rng);
 }
 
 class PatchSamplingAtlas {
