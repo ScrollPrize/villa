@@ -2260,5 +2260,32 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 			self.assertEqual(provenance["artifacts"][1]["path"], "result_cos.ome.zarr")
 
 
+	def test_predict3d_cudnn_benchmark_is_opt_in(self):
+		seen = []
+
+		def fake_run(**kwargs):
+			seen.append(torch.backends.cudnn.benchmark)
+			raise RuntimeError("stop after setup")
+
+		with tempfile.TemporaryDirectory() as td:
+			root = Path(td)
+			input_path = root / "volume.ome.zarr" / "1"
+			input_path.mkdir(parents=True)
+			checkpoint = root / "model.pt"
+			torch.save({"state_dict": {}, "patch_size": 256}, checkpoint)
+			argv = ["--input", str(input_path), "--output", str(root / "result.lasagna.json"),
+				"--unet-checkpoint", str(checkpoint)]
+			old = torch.backends.cudnn.benchmark
+			try:
+				with mock.patch.object(preprocess_wrapper, "run_preprocess_3d", side_effect=fake_run), 					 mock.patch.object(preprocess_wrapper, "InputLevel", return_value=types.SimpleNamespace(
+						 shape=(8, 8, 8), remote=False, reader=None, close=lambda: None, snapshot=lambda: {})), 					 mock.patch.object(preprocess_wrapper, "_resolve_base_shape", return_value=(16, 16, 16)), 					 mock.patch.object(preprocess_wrapper, "_predict3d_repository_state", return_value={"revision": "abc", "dirty": False}):
+					for extra in ([], ["--cudnn-benchmark"]):
+						torch.backends.cudnn.benchmark = False
+						with self.assertRaisesRegex(RuntimeError, "stop after setup"):
+							preprocess_wrapper.main_predict3d(argv + extra)
+			finally:
+				torch.backends.cudnn.benchmark = old
+		self.assertEqual(seen, [False, True])
+
 if __name__ == "__main__":
 	unittest.main()

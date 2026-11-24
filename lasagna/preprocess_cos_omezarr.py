@@ -2615,6 +2615,9 @@ def main_predict3d(argv: list[str] | None = None) -> int:
 		help="Threads reading and decoding the input (default: 16).")
 	p.add_argument("--profile-pipeline", action="store_true",
 		help="Print detailed loader, CPU preparation, CUDA, transfer, and coordinator stage timings.")
+	p.add_argument("--cudnn-benchmark", action="store_true",
+		help="Set torch.backends.cudnn.benchmark. On ROCm this makes MIOpen search and save "
+		"the fastest conv kernels; the first run is slower, later runs reuse the saved kernels.")
 	p.add_argument("--product-accumulator-dtype", choices=("float16", "float32"), default="float16",
 		help="Raw product ring dtype; float16 halves product backing (default: float16).")
 	p.add_argument("--accumulator-workers", type=int, default=DEFAULT_ACCUMULATOR_WORKERS,
@@ -2669,6 +2672,8 @@ def main_predict3d(argv: list[str] | None = None) -> int:
 		p.error("--input-cache-gib must be finite and >= 0")
 	if int(args.input_io_threads) <= 0:
 		p.error("--input-io-threads must be > 0")
+	if args.cudnn_benchmark:
+		torch.backends.cudnn.benchmark = True
 
 	try:
 		from inference_provenance import (
