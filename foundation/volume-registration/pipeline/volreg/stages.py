@@ -136,7 +136,8 @@ def reviewed_unit(pipeline):
 
 
 def approval_problem(decision, unit, scored_at=None):
-    """Why a decision does not cover the scores of `unit` (`reviewed_unit`), or None.
+    """Why a decision does not cover the scores of `unit` (`reviewed_unit`), or None. A
+    decision to publish nothing publishes no score, so it covers any.
 
     A decision made on the review page names the basis of the scores it was made on
     (`scoring.basis`): it covers those scores only, not ones made since (an answer changed,
@@ -144,6 +145,8 @@ def approval_problem(decision, unit, scored_at=None):
     they were finished (`scored_at`, the score stamp's) by the time it was made. Either way a
     variant that misses the bar is published only on an override naming exactly the parts
     it misses: an override given for one failure is not taken for another."""
+    if decision["publish"] not in ("bend", "affine"):
+        return None
     if decision.get("basis") is not None:
         if decision["basis"] != unit.basis:
             return ("the decision was made on other scores than the current ones (an answer changed, "
@@ -153,7 +156,7 @@ def approval_problem(decision, unit, scored_at=None):
     publish = decision["publish"]
     if publish not in ("bend", "affine"):
         return None
-    if publish not in unit.scores.get("scores") or {}:
+    if publish not in (unit.scores.get("scores") or {}):
         return f"there is no score of the {publish}"
     missed = bar_failures(unit.scores["scores"][publish])
     named = sorted(set((decision.get("override") or {}).get("bar_missed") or []))

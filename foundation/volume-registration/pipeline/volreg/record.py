@@ -187,12 +187,21 @@ class Record:
             return self._refresh_holdout(patches, fields)
 
     def current_holdout(self):
-        """`holdout.json` with the latest answers and notes from the log, as it is about to be
-        written, read under the record lock: an answer logged and not yet written into
-        `holdout.json` is in it, so what is checked against the answers is checked against
-        the newest ones."""
+        """`holdout.json` with the latest answers and notes from the log, read under the
+        record lock: an answer logged and not yet written into `holdout.json` is in it, so
+        what is checked against the answers is checked against the newest ones. If
+        `holdout.json` is behind the log -- its rewrite after an answer failed (refused past
+        the wait on Windows, or the process stopped) -- it is rewritten here, so the stages
+        that rest on it see the answer and run again, instead of waiting on a rewrite that
+        never comes."""
         with self.lock():
-            return self._merged_holdout(None, {})
+            held = self._merged_holdout(None, {})
+            on_file = self.read(HOLDOUT) if self.exists(HOLDOUT) else None
+            if on_file is not None:
+                on_file.pop("schema", None)
+                if on_file != held:
+                    self.write(HOLDOUT, held)
+            return held
 
     def _refresh_holdout(self, patches, fields):
         held = self._merged_holdout(patches, fields)

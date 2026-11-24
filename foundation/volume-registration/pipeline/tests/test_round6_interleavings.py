@@ -308,3 +308,72 @@ def test_release_rides_out_a_replace_and_still_checks_the_answers(tmp_path, scor
     directory = stored(root)
     refused = refuse_opens_of(monkeypatch, directory / rec.HOLDOUT, lambda: 3)
     assert "A" in released(tmp_path, [root], "busy")[0] and refused[0] == 3
+
+
+# ------------------------------------------------- found by an independent review of the fix
+
+def test_an_answer_logged_whose_rewrite_of_holdout_json_failed_heals_on_the_next_decision(tmp_path, scored):
+    """The saved approval and any override must cover the scores being published, and the
+    release must contain the answers those scores used. Coherent legacy and migrated records
+    must remain eligible. (`volreg answer` logged the answer, and its rewrite of holdout.json
+    failed -- refused past the wait on Windows, or the process stopped. The decision is
+    refused, and holdout.json is rewritten from the log, so the scores are made again and
+    the pair is not stuck.)"""
+    root = tmp_path / "records"
+    directory = scored_pair(root)
+    rec.Record(directory).log("holdout-answer", unit="p0004", answer="no", by=BY)
+    drain(directory)
+    with pytest.raises(Conflict):
+        decide_on(directory, "bend", page(directory))
+    pipeline = drain(directory)                                  # scored again, on 19
+    fresh = page(directory)
+    assert fresh["scores"]["scores"]["bend"]["lines_up"] == 19
+    decide_on(directory, "bend", fresh, "19 will do")
+    assert drain(directory).states()["store"] == DONE
+    assert_published_coherently(released(tmp_path, [root], "healed") and tmp_path / "out-healed")
+
+
+def test_store_heals_holdout_json_when_its_rewrite_failed(tmp_path, scored):
+    """The saved approval and any override must cover the scores being published, and the
+    release must contain the answers those scores used. Coherent legacy and migrated records
+    must remain eligible. (The same, with the decision made before: Store refuses, and the
+    pair moves on to be scored and decided again.)"""
+    root = tmp_path / "records"
+    directory = scored_pair(root)
+    decide_on(directory, "bend", page(directory))
+    rec.Record(directory).log("holdout-answer", unit="p0004", answer="no", by=BY)
+    pipeline = drain(directory)
+    assert pipeline.states()["store"] == FAILED and "decide again" in pipeline.stamp("store")["error"]
+    assert page(directory)["scores"]["scores"]["bend"]["lines_up"] == 19
+
+
+def test_publishing_nothing_after_a_redo_survives_an_answer_edit(tmp_path, scored):
+    """The saved approval and any override must cover the scores being published, and the
+    release must contain the answers those scores used. Coherent legacy and migrated records
+    must remain eligible. (Nothing is published, so no scores need covering: an answer edit
+    does not fail Store, and the pair's older record stays released.)"""
+    from test_approval_coherence import _migrated
+    root, old = tmp_path / "records", tmp_path / "first-runs"
+    _migrated(old, "a", "A", 20)
+    directory = scored_pair(root)
+    pipeline_stages.pipeline(directory).redo("recheck")
+    drain(directory)
+    decide_on(directory, "nothing", page(directory))
+    assert drain(directory).states()["store"] == DONE
+    assert "A" in released(tmp_path, [old, root], "before")[0]
+    answer(directory, "p0003", "no")
+    assert drain(directory).states()["store"] == DONE
+    assert "A" in released(tmp_path, [old, root], "after")[0]
+
+
+def test_the_fits_page_and_holdout_page_ride_out_a_replace(tmp_path, scored, monkeypatch):
+    """Routine record reads must recover from temporary sharing conflicts and still surface
+    persistent errors. (The fits page reads the stored fit.json; the hold-out page the scores.)"""
+    as_windows_locks(monkeypatch)
+    root = tmp_path / "records"
+    directory = stored(root)
+    refused = refuse_opens_of(monkeypatch, directory / rec.FIT, lambda: 2)
+    reviews = Reviews(root, BY, auto_advance=False)
+    assert reviews.fits()["fits"][0]["pair"] == "A" and refused[0] == 2
+    refused = refuse_opens_of(monkeypatch, directory / "work" / "scores.json", lambda: 2)
+    assert reviews.holdout("a")["scores"] and refused[0] == 2

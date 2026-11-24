@@ -42,6 +42,7 @@ from urllib.parse import parse_qs, urlparse
 
 from .. import cli
 from .. import engine
+from .. import filelock
 from .. import record as rec
 from .. import stages as pipeline_stages
 from ..scoring import answers_digest
@@ -216,8 +217,7 @@ class Reviews:
         return {"pair": pipeline.record.read(rec.PAIR)["pair"], "octants": octants,
                 "answers": list(rec.ANSWERS), "units": units, "progress": progress,
                 "target": target, "next": following, "done": done,
-                "scores": json.loads(scores.read_text()) if scores.exists() and (done or reveal)
-                else None,
+                "scores": read_json(scores) if done or reveal else None,
                 "score_stale": pipeline.states()["score"] != engine.DONE}
 
     def viewer(self, name, unit):
@@ -375,7 +375,11 @@ def tally_of(round_):
 
 
 def read_json(path):
-    return json.loads(path.read_text()) if path.exists() else None
+    """A JSON file, or None; a read refused while Windows replaces the file is asked again."""
+    try:
+        return json.loads(filelock.retry(path.read_bytes))
+    except FileNotFoundError:
+        return None
 
 
 def fit_row(path, driven, folder):
