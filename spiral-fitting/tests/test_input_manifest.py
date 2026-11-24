@@ -239,7 +239,9 @@ def test_the_cli_fit_refuses_store_objects_of_another_volume(tmp_path, monkeypat
 
     def context(volume):
         return FitContext(
-            FitConfig({**reference.fit_config(), 'object_store_location': store}),
+            # The fixture's run has no measured crossings to cut.
+            FitConfig({**reference.fit_config(), 'object_store_location': store,
+                       'fiber_constraint_cut_turns': None}),
             scroll=reference.scroll_spec(),
             paths=SpiralInputPaths(volume_uuid=volume, umbilicus=umbilicus,
                                    winding_solve_fibers=solve['fibers'],

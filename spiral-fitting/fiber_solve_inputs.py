@@ -14,6 +14,11 @@ At startup (read_winding_solve), for every fiber with a run row:
 - the vertices inside the fit's z window are kept, as one or more pieces per
   fiber, decimated along each piece to ``fiber_min_point_spacing``.
 
+With ``fiber_constraint_cut_turns`` positive, the components the fit uses
+are not the run's: the crossings the run solved from are rebuilt, those it
+violates by more than that many turns are cut and the components found again
+(fiber_constraint_cut).
+
 Once the model exists, WindingSolve.set_seam_offset measures ``c``, the
 offset between the solve's seam and Spiral's theta = 0 under the step-0
 transform, and sets ``w_s = w - c`` at the kept points; fiber_cc_loss reads
@@ -22,6 +27,7 @@ them.
 import dataclasses
 import json
 import math
+import time
 import uuid
 
 import numpy as np
@@ -199,14 +205,19 @@ class WindingSolve:
     are dropped):
     ``fiber_uuid`` uint8 [F, 16], ``family`` int8 [F] (FAMILY_H / FAMILY_V),
     ``selected_winding`` int64 [F] (W, at the first vertex),
-    ``component`` int64 [F] (the run's CC id), ``fiber_cc`` int64 [F] (its
-    index into the per-CC arrays), and ``w_min`` / ``w_max`` float64 [F], the
+    ``component`` int64 [F] (the run's CC id), ``fiber_cc`` int64 [F] (the
+    index of the CC the fit uses into the per-CC arrays), and ``w_min`` /
+    ``w_max`` float64 [F], the
     extremes of w over the whole fiber (the undeformed sheet labels n0 of
     its points lie in [floor(w_min - c), floor(w_max - c)]).
 
-    Per CC, C of them in component-id order: ``cc_component`` int64 [C],
-    ``cc_fiber_count`` int64 [C]; ``largest_cc`` is the index of the CC with
-    the most fibers.
+    Per CC the fit uses, C of them in component-id order: ``cc_component``
+    int64 [C], ``cc_fiber_count`` int64 [C]; ``largest_cc`` is the index of
+    the CC with the most fibers. They are the run's components, or with
+    ``constraint_cut`` (fiber_constraint_cut.cut_components: the threshold,
+    the counts, the log lines and the checkpoint identity) the components
+    left after cutting the crossings the solve violates most, numbered in
+    order of their first fiber.
 
     Kept points, P of them, grouped by fiber in fiber order and along each
     fiber in stored order, all inside the z window: ``zyx`` float32 [P, 3]
@@ -253,6 +264,7 @@ class WindingSolve:
     c_spread_p99: float = None
     w_s: np.ndarray = None
     n0: np.ndarray = None
+    constraint_cut: dict = None
 
     def fiber_name(self, index):
         return str(uuid.UUID(bytes=self.fiber_uuid[index].tobytes()))
@@ -270,7 +282,9 @@ class WindingSolve:
             f'disabled; '
             f'{int((self.family == FAMILY_H).sum()):,} H, '
             f'{int((self.family == FAMILY_V).sum()):,} V',
-            f'winding solve: {len(self.cc_component):,} components, largest '
+            *(self.constraint_cut['lines'] if self.constraint_cut else []),
+            f'winding solve: {len(self.cc_component):,} components'
+            + (' after the constraint cut' if self.constraint_cut else '') + ', largest '
             f'{int(self.cc_fiber_count[self.largest_cc]):,} fibers, '
             f'{int((self.cc_fiber_count == 1).sum()):,} single fibers; '
             f'largest step of w between consecutive vertices {self.max_step_turns:.3f} turns',
@@ -341,17 +355,22 @@ def _consumed_position(run_reader, fiber_source, fibers_path):
 
 def read_winding_solve(*, fibers_path, run_store_path, run_uuid, volume_uuid,
                        fit_scale, axis_xyz, spiral_outward_sense, z_window,
-                       min_point_spacing, chunk_fibers=READ_CHUNK_FIBERS):
+                       min_point_spacing, constraint_cut_turns=None,
+                       chunk_fibers=READ_CHUNK_FIBERS):
     """Read one winding solve (WindingSolve) for a fit.
 
     ``axis_xyz`` is the umbilicus as (N, 3) XYZ in ``volume_uuid``'s own voxels;
     the fibers are read in the same voxels (the store maps their declared
     frames), so their angles around it are the solve's. Kept points are
     converted to fit voxels (``fit_scale`` volume voxels each) and kept
-    inside ``z_window`` = [z0, z1) of fit z.
+    inside ``z_window`` = [z0, z1) of fit z. A positive
+    ``constraint_cut_turns`` (fiber_constraint_cut_turns) cuts the crossings
+    the solve violates by more than that many turns and uses the components
+    of the rest (fiber_constraint_cut); None or non-positive keeps the run's.
     """
-    from vc_object_store import CollectionReader, ObjectStore
+    from vc_object_store import CollectionReader, ObjectStore, pack_winding_geometry
     from object_store_inputs import ObjectFrame
+    from fiber_constraint_cut import cut_enabled
 
     handedness = handedness_for(spiral_outward_sense)
     run_uuid = str(uuid.UUID(run_uuid))
@@ -390,8 +409,18 @@ def read_winding_solve(*, fibers_path, run_store_path, run_uuid, volume_uuid,
     family = values[:, index['family']].astype(np.int8)
     selected_winding = values[:, index['selected_winding']].astype(np.int64)
     component = values[:, index['component']].astype(np.int64)
-    cc_component, fiber_cc, cc_fiber_count = np.unique(
-        component, return_inverse=True, return_counts=True)
+    # The run's measured crossings, read before the fibers' geometry (the
+    # read's transient memory is the step's peak), and the whole fibers'
+    # packed geometry, for rebuilding them (fiber_constraint_cut).
+    cutting = cut_enabled(constraint_cut_turns)
+    packed, measurements, read_seconds = None, None, 0.0
+    if cutting:
+        from fiber_constraint_cut import read_measurements
+        started = time.perf_counter()
+        packed = []
+        with CollectionReader(run_store_path) as reader:
+            measurements = read_measurements(reader, run_uuid, settings, fiber_uuid, volume_uuid)
+        read_seconds = time.perf_counter() - started
 
     with ObjectStore.open(str(fibers_path), read_only=True, position=position) as store:
         store_fiber_count = int(store.object_count('fiber'))
@@ -420,6 +449,13 @@ def read_winding_solve(*, fibers_path, run_store_path, run_uuid, volume_uuid,
                 name=lambda i: name(begin + i))
             w_min[begin:end] = np.minimum.reduceat(w, first)
             w_max[begin:end] = np.maximum.reduceat(w, first)
+            if cutting:
+                xyz = np.ascontiguousarray(xyz, dtype=np.float64)
+                columns = pack_winding_geometry(offsets, xyz, np.ascontiguousarray(
+                    axis_xyz, dtype=np.float64), SEAM_ANGLE, handedness, first_owner=begin)
+                packed.append([counts, xyz, np.asarray(columns['arc']),
+                               np.asarray(columns['turns'])])
+                del columns
             steps = np.abs(np.diff(w))
             steps[first[1:] - 1] = 0.0
             max_step = max(max_step, float(steps.max(initial=0.0)))
@@ -445,6 +481,18 @@ def read_winding_solve(*, fibers_path, run_store_path, run_uuid, volume_uuid,
             piece_fiber.append(owner[keep][np.searchsorted(piece, pieces)])
             del zyx, w
 
+    constraint_cut = None
+    if cutting:
+        constraint_cut = _cut_constraints(
+            measurements, family, selected_winding, component, packed, axis_xyz, handedness,
+            constraint_cut_turns, read_seconds)
+        del packed, measurements
+        fit_component = constraint_cut.pop('component')
+    else:
+        fit_component = component
+    cc_component, fiber_cc, cc_fiber_count = np.unique(
+        fit_component, return_inverse=True, return_counts=True)
+
     def joined(parts, dtype, shape=(0,)):
         return np.concatenate(parts).astype(dtype) if parts else np.empty(shape, dtype)
 
@@ -463,4 +511,45 @@ def read_winding_solve(*, fibers_path, run_store_path, run_uuid, volume_uuid,
         zyx=joined(kept_zyx, np.float32, (0, 3)), w=joined(kept_w, np.float64),
         point_fiber=joined(kept_fiber, np.int64),
         piece_offsets=np.concatenate([[0], np.cumsum(joined(piece_lengths, np.int64))]),
-        piece_fiber=joined(piece_fiber, np.int64))
+        piece_fiber=joined(piece_fiber, np.int64), constraint_cut=constraint_cut)
+
+
+def _cut_constraints(measurements, family, selected_winding, component, packed, axis_xyz,
+                     handedness, cut_turns, read_seconds):
+    """Rebuild the run's crossings from its ``measurements``
+    (fiber_constraint_cut.read_measurements) over the packed whole-fiber
+    geometry (``packed``: per read chunk, the fibers' point counts, XYZ, arc
+    and turns; both emptied here), cut the most violated and find the
+    components again. ``read_seconds`` is the measurement read's time, for
+    the log. Returns the cut's dict with its log ``lines``, checkpoint
+    ``identity`` and fit ``component`` per fiber."""
+    from fiber_constraint_cut import (build_crossings, cut_components, cut_report,
+                                      partition_sha256, violation)
+    started = time.perf_counter()
+
+    def take(column, dtype, shape=(0,)):
+        # One column at a time, each chunk's part released once joined.
+        if not packed:
+            return np.zeros(shape, dtype)
+        joined = np.ascontiguousarray(np.concatenate([part[column] for part in packed]),
+                                      dtype=dtype)
+        for part in packed:
+            part[column] = None
+        return joined
+
+    counts = take(0, np.int64)
+    geometry = (np.concatenate([[0], np.cumsum(counts)]).astype(np.int64),
+                take(2, np.float64), take(1, np.float64, (0, 3)), take(3, np.int64))
+    packed.clear()
+    crossings = build_crossings(measurements, family, geometry, axis_xyz, handedness)
+    del geometry
+    cut = cut_components(component, crossings['a'], crossings['b'],
+                         violation(selected_winding, crossings['a'], crossings['b'],
+                                   crossings['target']), cut_turns)
+    for key in ('a', 'b', 'target'):
+        del crossings[key]
+    cut['lines'] = cut_report(cut, crossings,
+                              seconds=read_seconds + time.perf_counter() - started)
+    cut['identity'] = {'turns': float(cut_turns),
+                       'components_sha256': partition_sha256(cut['component'])}
+    return cut

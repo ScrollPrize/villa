@@ -31,6 +31,7 @@ _NULL_TYPES = {
     "object_store_patch_exclude_uuids": "strings",
     "track_length_bin_weights": "vector",
     "track_max_tortuosity": "number",
+    "fiber_constraint_cut_turns": "number",
     "object_store_location": "string",
     "object_store_input_position": "mapping",
     "object_store_patch_uuids": "strings",
@@ -46,8 +47,9 @@ _NULL_TYPES = {
 # margin decides which attachments materialization keeps (and is recorded in
 # the input manifest), the dense-spacing mode decides which dense stores
 # are opened, the fiber point spacing decides which fiber points are kept,
-# and the fiber gauge settings decide which fibers are dropped and the
-# winding labels the shell index is inferred from at build. Nothing retained
+# the constraint cut decides the fiber components, and the fiber gauge
+# settings decide which fibers are dropped and the winding labels the shell
+# index is inferred from at build. Nothing retained
 # by a resident session can re-derive their effect, so they demand a full
 # rebuild.
 _PREPARED_INPUT_FIELDS = {
@@ -55,6 +57,7 @@ _PREPARED_INPUT_FIELDS = {
     "patch_loss_z_margin",
     "dense_spacing_mode",
     "fiber_min_point_spacing",
+    "fiber_constraint_cut_turns",
     "fiber_largest_cc_min_winding",
     "fiber_largest_cc_min_percentile",
     "fiber_outlier_margin_turns",
@@ -487,8 +490,12 @@ class Config:
         # The winding solve's fiber points in the z window are thinned along
         # each fiber to at least this spacing (fiber_solve_inputs).
         self.fiber_min_point_spacing = 16.0
+        # Crossings of the winding solve it violates by more than this many
+        # turns are cut and its components found again
+        # (fiber_constraint_cut); None or 0 keeps the run's components.
+        self.fiber_constraint_cut_turns = 4.0
         # The fiber CC loss (fiber_cc_loss): the largest component's gauge
-        # and outlier drop, the Huber width, the other components' DT-target
+        # and outlier backstop, the Huber width, the other components' DT-target
         # cadence, the vertical fibers' outward shift and the label health
         # warnings.
         self.fiber_largest_cc_min_winding = 1

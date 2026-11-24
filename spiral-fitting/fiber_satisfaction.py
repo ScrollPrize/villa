@@ -25,7 +25,10 @@ adds to satisfaction_metrics_<suffix>.json's summary; and
 
     fiber_uuid           uint8 [F, 16]  the solve's fiber UUID bytes
                                         (uuid.UUID(bytes=row.tobytes()))
-    component            int64 [F]      the run's component (CC) id
+    component            int64 [F]      the fit's component (CC) id: the run's,
+                                        or with the constraint cut
+                                        (fiber_constraint_cut) the recomputed
+                                        component's index
     largest              bool [F]       in the largest CC
     point_count          int32 [F]      points the loss holds
     accepted_count       int32 [F]      of which accepted

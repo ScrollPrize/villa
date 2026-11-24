@@ -38,7 +38,9 @@ def test_a_short_fit_with_the_fiber_loss_has_finite_losses(tmp_path, monkeypatch
               'optimizer_num_training_steps': 20, 'model_flow_bounds_radius': 256,
               'loss_start_fiber_dt': 10, 'fiber_dt_target_update_interval': 5,
               'fiber_vertical_radial_offset_enabled': True,
-              'sample_count_fiber_ccs': 8, 'sample_count_points_per_fiber_cc': 8}
+              'sample_count_fiber_ccs': 8, 'sample_count_points_per_fiber_cc': 8,
+              # The fixture's run has no measured crossings to cut.
+              'fiber_constraint_cut_turns': None}
     lines = []
     fit = FitContext(
         FitConfig(config), scroll=reference.scroll_spec(),

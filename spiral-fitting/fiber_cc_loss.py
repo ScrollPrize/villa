@@ -24,13 +24,19 @@ fiber_huber_delta_turns, linear above):
   refreshed every fiber_dt_target_update_interval steps (stateless: computed
   again at start or resume).
 
+The CCs are the solve's, or those left after cutting the crossings the
+solve violates by more than fiber_constraint_cut_turns
+(fiber_constraint_cut), which takes a mislabelled group out of the largest.
+
 The gauge: per fiber, its sheet labels lie in [floor(w_min - c),
-floor(w_max - c)] (whole fiber). Largest-CC fibers whose minimum lies more
-than fiber_outlier_margin_turns below the fiber_largest_cc_min_percentile-th
-percentile of the minima (or whose maximum lies that far above the matching
-high percentile of the maxima) are dropped everywhere. ``n_low`` is the
-smallest minimum of the kept ones, and c0 = fiber_largest_cc_min_winding -
-n_low, so the innermost kept sheet is that winding.
+floor(w_max - c)] (whole fiber). As a backstop after the cut, largest-CC
+fibers whose minimum lies more than fiber_outlier_margin_turns below the
+fiber_largest_cc_min_percentile-th percentile of the minima (or whose
+maximum lies that far above the matching high percentile of the maxima) are
+dropped everywhere: a fiber left below the gauge would ask for a winding
+below the innermost. ``n_low`` is the smallest minimum of the kept ones, and
+c0 = fiber_largest_cc_min_winding - n_low, so the innermost kept sheet is
+that winding.
 """
 import math
 
@@ -85,7 +91,7 @@ def vertical_radial_offset(config):
 
 
 def largest_cc_gauge(solve, config):
-    """The largest CC's outlier drop and gauge, from whole-fiber label extremes.
+    """The largest CC's outlier backstop and gauge, from whole-fiber label extremes.
 
     Returns a dict: ``dropped`` bool [F] (largest-CC fibers dropped), ``n_low``,
     ``c0``, the percentiles, the kept label range and how many kept fibers
@@ -254,7 +260,8 @@ class FiberCCLoss:
         low, high = gauge['kept_range']
         largest = self.cc_fiber_count[self.largest_local] if self.largest_local >= 0 else 0
         return [
-            f'fiber loss: largest component: dropped {dropped:,} outlier fibers (whole-fiber sheet '
+            f'fiber loss: largest component: the outlier backstop dropped {dropped:,} fibers '
+            f'(whole-fiber sheet '
             f'labels outside [{gauge["p_low"]:g} - {gauge["margin"]:g}, {gauge["p_high"]:g} + '
             f'{gauge["margin"]:g}], the {gauge["percentile"]:g}th-percentile minimum and '
             f'maximum); kept labels [{low}, {high}]',

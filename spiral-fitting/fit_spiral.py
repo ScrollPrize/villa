@@ -725,13 +725,18 @@ def get_run_dt_resume_iteration(run_start, requested_iterations,
 
 def winding_solve_identity(solve):
     """What identifies a fit's winding solve (fiber_solve_inputs.WindingSolve)
-    in a checkpoint: the run and the store positions it was read at; None
-    without one."""
+    in a checkpoint: the run and the store positions it was read at, and with
+    a constraint cut its threshold and the components it left (whose indices
+    the fiber loss's per-component targets use); None without one."""
     if solve is None:
         return None
-    return {'run_uuid': solve.run_uuid,
-            'fiber_store_position': dict(solve.fiber_store_position),
-            'run_store_position': dict(solve.run_store_position)}
+    identity = {'run_uuid': solve.run_uuid,
+                'fiber_store_position': dict(solve.fiber_store_position),
+                'run_store_position': dict(solve.run_store_position)}
+    cut = getattr(solve, 'constraint_cut', None)
+    if cut is not None:
+        identity['constraint_cut'] = dict(cut['identity'])
+    return identity
 
 
 def get_dt_loss_eligibility(cfg, iteration, run_dt_resume_iteration=None,
@@ -1442,7 +1447,8 @@ class FitContext:
             volume_uuid=self.paths.volume_uuid, fit_scale=self.fit_level_scale,
             axis_xyz=axis_zyx[:, ::-1], spiral_outward_sense=self.spiral_outward_sense,
             z_window=(self.z_begin - margin, self.z_end + margin),
-            min_point_spacing=self.config['fiber_min_point_spacing'])
+            min_point_spacing=self.config['fiber_min_point_spacing'],
+            constraint_cut_turns=self.config['fiber_constraint_cut_turns'])
         if self.dist.is_main_process:
             for line in solve.report():
                 self.input_log(line)
@@ -2572,6 +2578,11 @@ class FitContext:
                            'checkpoint winding solve differs from this fit\'s in '
                            + ', '.join(key for key in sorted(set(recorded) | set(solve))
                                        if recorded.get(key) != solve.get(key)))
+                if recorded is not None and (recorded.get('constraint_cut')
+                                             != solve.get('constraint_cut')):
+                    problem += (f' (checkpoint constraint cut {recorded.get("constraint_cut")}, '
+                                f'this fit\'s {solve.get("constraint_cut")}; '
+                                'fiber_constraint_cut_turns sets it, null for none)')
                 if self.config['object_store_allow_changed_inputs']:
                     print(f'WARNING: {problem}; resuming anyway '
                           '(object_store_allow_changed_inputs)')
