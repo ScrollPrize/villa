@@ -237,6 +237,16 @@ auto main(int argc, char* argv[]) -> int
     if (auto fn = reinterpret_cast<void(*)(int)>(dlsym(RTLD_DEFAULT, "kmp_set_blocktime")))
         fn(0);
 
+    // omp_set_num_threads(1) below only binds the main thread: a QThreadPool
+    // worker that reaches a parallel region would still get a team of every
+    // core. LLVM OpenMP can set the process-wide default instead, so worker
+    // threads stay at one thread too and explicit num_threads clauses still
+    // apply. Child processes do not inherit this default; the tools VC3D starts
+    // get the OMP_NUM_THREADS that setThreadPoliciesEarly() exports, unless
+    // their dialog sets a thread count.
+    if (auto fn = reinterpret_cast<void(*)(const char*)>(dlsym(RTLD_DEFAULT, "kmp_set_defaults")))
+        fn("OMP_NUM_THREADS=1");
+
     // Also call openblas_set_num_threads(1) at runtime in case the env var
     // was too late for this particular build's init order.
     if (auto fn = reinterpret_cast<void(*)(int)>(dlsym(RTLD_DEFAULT, "openblas_set_num_threads")))

@@ -125,6 +125,9 @@ required_formulae=(
   # expects. Accelerate.framework's BLAS hides those symbols when linked
   # with -fuse-ld=lld + thin LTO, so we force PaStiX onto OpenBLAS instead.
   openblas
+  # OpenMP runtime. CMake links this formula rather than the copy in the llvm
+  # keg, because OpenBLAS already loads it and two copies crash the process.
+  libomp
   scotch
   hwloc
   # gcc stays in the deps list: OpenBLAS/lapack carry a libgfortran runtime

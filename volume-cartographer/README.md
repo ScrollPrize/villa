@@ -135,6 +135,11 @@ To build from source on macOS, use the Homebrew LLVM build helper:
 scripts/build_macos.sh --install-deps
 ```
 
+The build links Homebrew's `libomp`, so the `vc_*` tools run their OpenMP
+regions on every core, as the Linux build does; `OMP_NUM_THREADS` or a tool's
+own thread option caps them. VC3D itself keeps OpenMP at one thread and runs
+its work on its own thread pool.
+
 After dependencies are installed, rebuilds can use:
 
 ```bash
