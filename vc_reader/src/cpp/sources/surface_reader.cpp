@@ -348,6 +348,7 @@ void checkBudget(AlignedEngine::Impl& s, const Triple& shape, const std::optiona
 struct Patch {
     std::shared_ptr<const GeometryTile> tile;
     grid::Raster raster;
+    std::array<int, 4> core{0, 0, 0, 0};  // the vertices of the cells inside the tile (all zero: the tile is the cells)
 };
 std::optional<Patch> patchOf(Geometry& geom, const Pair& start, const Pair& size, bool context)
 {
@@ -377,13 +378,15 @@ std::optional<Patch> patchOf(Geometry& geom, const Pair& start, const Pair& size
     Patch patch;
     patch.tile = geom.tile({hr0, hc0}, {hr1 - hr0, hc1 - hc0}, std::size_t((r1 - r0) * (c1 - c0)));
     patch.raster = grid::Raster{x0 - double(hc0), y0 - double(hr0), sx, sy, int(size[1]), int(size[0]), kx, ky};
+    if (hr0 != r0 || hr1 != r1 || hc0 != c0 || hc1 != c1) patch.core = {int(r0 - hr0), int(r1 - hr0), int(c0 - hc0), int(c1 - hc0)};
     return patch;
 }
 // The vcr::grid surface over a tile's vertices: normals in the surface's physical space.
-std::unique_ptr<grid::Surface> gridSurface(const Geometry& geom, const GeometryTile& tile, grid::Interpolation interpolation)
+std::unique_ptr<grid::Surface> gridSurface(const Geometry& geom, const GeometryTile& tile, grid::Interpolation interpolation, const std::array<int, 4>& core = {0, 0, 0, 0})
 {
     grid::SurfaceOptions options;
     options.interpolation = interpolation;
+    options.core = core;
     options.flipNormals = geom.flipNormals;
     if (geom.surface.spacingUm) {
         const auto& spacing = *geom.surface.spacingUm;
@@ -471,7 +474,7 @@ SampleResult SampleReader::renderSurface(const Surface& surface, const Pair& sta
     const auto attempt = [&](bool context) {
         SampleResult result = base;
         const auto patch = patchOf(*geom, start, size, context);
-        const auto sheet = patch ? gridSurface(*geom, *patch->tile, interpolation) : nullptr;
+        const auto sheet = patch ? gridSurface(*geom, *patch->tile, interpolation, patch->core) : nullptr;
         const grid::Raster raster = patch ? patch->raster : grid::Raster{};
         const std::vector<float> layers(offsetsUm.begin(), offsetsUm.end());
         for (auto& [name, target] : s.targets) {
@@ -499,7 +502,8 @@ SampleResult SampleReader::renderSurface(const Surface& surface, const Pair& sta
         }
         return result;
     };
-    if (interpolation == grid::Interpolation::Bicubic) {
+    // The CUDA sampler does not take the sign of a normal from the cells alone: without the ring it renders as before.
+    if (interpolation == grid::Interpolation::Bicubic && s.backend != "cuda") {
         try { return attempt(true); }
         catch (const Cancelled&) { throw; }  // a stopped read is not retried
         catch (const std::runtime_error&) {}  // a read or budget error (CacheMiss, DecodeBudgetError, HTTP): the ring was optional

@@ -47,6 +47,12 @@ struct GridView {
     const float* du = nullptr;
     const float* dv = nullptr;
     const float* duv = nullptr;
+    // The derivatives the vertices of `core` (rows [core[0], core[1]), columns [core[2], core[3])) would have
+    // as a surface of their own: a cell on the core's border takes the sign of its normal from them.
+    const float* du0 = nullptr;
+    const float* dv0 = nullptr;
+    const float* duv0 = nullptr;
+    int core[4]{0, 0, 0, 0};
     bool triangles = false;
 };
 
@@ -116,6 +122,30 @@ VCR_POINTS_HD VCR_POINTS_FLATTEN inline bool point(const PointMap& g, const Grid
     if (rowTangent) geometry::store(rowTangent, dv);
     if (!step) return true;
     V n = geometry::cross(geometry::linear(g.physical, du), geometry::linear(g.physical, dv)) * g.orientation;
+    if (v.du0 && !v.normals && !v.triangles) {
+        // A cell of the core with a vertex on the core's border has other derivatives there when the core is a
+        // surface of its own (one sided, not centred). The sign of the normal follows those, so it is the same
+        // with or without the vertices around the core; every other cell has the same derivatives either way.
+        const bool inside = row >= v.core[0] && row + 1 < v.core[1] && col >= v.core[2] && col + 1 < v.core[3];
+        const bool border = row == v.core[0] || row + 2 == v.core[1] || col == v.core[2] || col + 2 == v.core[3];
+        if (inside && border) {
+            const detail::Hermite bx = detail::hermite(u), by = detail::hermite(w);
+            const auto D = [&](const float* d, int k) { return vector(d + 3 * at[k]); };
+            const V q0 = p[0] * bx.p0 + D(v.du0, 0) * bx.m0 + p[1] * bx.p1 + D(v.du0, 1) * bx.m1;
+            const V q1 = p[2] * bx.p0 + D(v.du0, 2) * bx.m0 + p[3] * bx.p1 + D(v.du0, 3) * bx.m1;
+            const V r0 = D(v.dv0, 0) * bx.p0 + D(v.duv0, 0) * bx.m0 + D(v.dv0, 1) * bx.p1 + D(v.duv0, 1) * bx.m1;
+            const V r1 = D(v.dv0, 2) * bx.p0 + D(v.duv0, 2) * bx.m0 + D(v.dv0, 3) * bx.p1 + D(v.duv0, 3) * bx.m1;
+            const V q0u = p[0] * bx.dp0 + D(v.du0, 0) * bx.dm0 + p[1] * bx.dp1 + D(v.du0, 1) * bx.dm1;
+            const V q1u = p[2] * bx.dp0 + D(v.du0, 2) * bx.dm0 + p[3] * bx.dp1 + D(v.du0, 3) * bx.dm1;
+            const V r0u = D(v.dv0, 0) * bx.dp0 + D(v.duv0, 0) * bx.dm0 + D(v.dv0, 1) * bx.dp1 + D(v.duv0, 1) * bx.dm1;
+            const V r1u = D(v.dv0, 2) * bx.dp0 + D(v.duv0, 2) * bx.dm0 + D(v.dv0, 3) * bx.dp1 + D(v.duv0, 3) * bx.dm1;
+            const V du0 = q0u * by.p0 + r0u * by.m0 + q1u * by.p1 + r1u * by.m1;
+            const V dv0 = q0 * by.dp0 + r0 * by.dm0 + q1 * by.dp1 + r1 * by.dm1;
+            const V n0 = geometry::cross(geometry::linear(g.physical, du0), geometry::linear(g.physical, dv0)) * g.orientation;
+            if (geometry::finite(n0) && geometry::dot(n, n0) < 0)
+                n = n * -1.f;
+        }
+    }
     if (v.normals) {
         V m[4];
         for (int k = 0; k < 4; ++k)

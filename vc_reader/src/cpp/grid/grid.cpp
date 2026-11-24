@@ -83,6 +83,7 @@ struct Surface::Impl {
     std::vector<std::uint8_t> valid;    // per vertex (bool-sized)
     std::vector<int> piece;             // per column; empty: one piece
     std::vector<float> du, dv, duv;     // per vertex, bicubic mode
+    std::vector<float> du0, dv0, duv0;  // the same for the core vertices as a surface of their own (options.core)
     std::vector<float> packed, packedNormals;  // without row padding, when stride != cols * 3
 
     const float* xyz() const { return packed.empty() ? v.xyz : packed.data(); }
@@ -101,6 +102,13 @@ struct Surface::Impl {
             g.du = du.data();
             g.dv = dv.data();
             g.duv = duv.data();
+            if (!du0.empty()) {
+                g.du0 = du0.data();
+                g.dv0 = dv0.data();
+                g.duv0 = duv0.data();
+                for (int k = 0; k < 4; ++k)
+                    g.core[k] = options.core[std::size_t(k)];
+            }
         }
         return g;
     }
@@ -127,6 +135,54 @@ struct Surface::Impl {
         Derivatives d{view(), v.rows, v.cols};
         for(std::size_t i=0;i<n;++i)d.firstAt(int(i),du.data(),dv.data());
         for(std::size_t i=0;i<n;++i)d.mixedAt(int(i),duv.data());
+        buildCoreDerivatives();
+    }
+
+    // The derivatives of the core vertices taken as a surface of their own (one sided at the core's border), copied
+    // into arrays of the whole grid; the others keep the whole grid's. Only cells on the core's border read them.
+    void buildCoreDerivatives()
+    {
+        const auto& c = options.core;
+        if (c[0] == 0 && c[1] == 0 && c[2] == 0 && c[3] == 0)
+            return;
+        if (c[0] < 0 || c[2] < 0 || c[1] <= c[0] || c[3] <= c[2] || c[1] > v.rows || c[3] > v.cols)
+            throw std::invalid_argument("surface core outside the vertices");
+        if (c[0] == 0 && c[1] == v.rows && c[2] == 0 && c[3] == v.cols)
+            return;  // the core is the whole grid: nothing differs
+        const int R = c[1] - c[0], C = c[3] - c[2];
+        std::vector<float> sub(std::size_t(R) * std::size_t(C) * 3);
+        std::vector<std::uint8_t> subValid(std::size_t(R) * std::size_t(C));
+        for (int r = 0; r < R; ++r)
+            for (int k = 0; k < C; ++k) {
+                const std::size_t from = index(c[0] + r, c[2] + k), to = std::size_t(r) * std::size_t(C) + std::size_t(k);
+                std::copy_n(xyz() + 3 * from, 3, sub.data() + 3 * to);
+                subValid[to] = valid[from];
+            }
+        std::vector<int> subPiece;
+        if (!piece.empty())
+            subPiece.assign(piece.begin() + c[2], piece.begin() + c[3]);
+        GridView sv;
+        sv.xyz = sub.data();
+        sv.valid = reinterpret_cast<const bool*>(subValid.data());
+        sv.piece = subPiece.empty() ? nullptr : subPiece.data();
+        std::vector<float> sdu(sub.size()), sdv(sub.size()), sduv(sub.size());
+        Derivatives d{sv, R, C};
+        const std::size_t m = std::size_t(R) * std::size_t(C);
+        for (std::size_t i = 0; i < m; ++i) d.firstAt(int(i), sdu.data(), sdv.data());
+        sv.du = sdu.data();
+        sv.dv = sdv.data();
+        Derivatives e{sv, R, C};
+        for (std::size_t i = 0; i < m; ++i) e.mixedAt(int(i), sduv.data());
+        du0 = du;
+        dv0 = dv;
+        duv0 = duv;
+        for (int r = 0; r < R; ++r)
+            for (int k = 0; k < C; ++k) {
+                const std::size_t from = std::size_t(r) * std::size_t(C) + std::size_t(k), to = index(c[0] + r, c[2] + k);
+                std::copy_n(sdu.data() + 3 * from, 3, du0.data() + 3 * to);
+                std::copy_n(sdv.data() + 3 * from, 3, dv0.data() + 3 * to);
+                std::copy_n(sduv.data() + 3 * from, 3, duv0.data() + 3 * to);
+            }
     }
 
     // Positions and normals of the raster pixels i0 <= i < i0 + w, j0 <= j < j0 + h, into
