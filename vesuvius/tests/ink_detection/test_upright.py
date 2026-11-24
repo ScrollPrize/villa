@@ -1,8 +1,8 @@
 import numpy as np
 import tifffile
-import zarr
 from scipy import ndimage as ndi
 from vc_reader import images
+from vc_reader.reader import ZarrWriter, open_node
 
 from vesuvius.ink_detection.inference import upright
 
@@ -20,6 +20,7 @@ def _tilted_segment(tmp_path, tilt_deg, mirror=False):
     seg.mkdir()
     for name, arr in (("x", c * 20.0), ("y", r * 20.0), ("z", z)):
         tifffile.imwrite(seg / f"{name}.tif", arr.astype(np.float32))
+    (seg / "meta.json").write_text('{"scale": [0.05, 0.05]}')
     return seg
 
 
@@ -36,20 +37,30 @@ def test_angle_puts_z_down_the_rows(tmp_path):
 
 def test_rotate_then_back_restores_the_canvas(tmp_path):
     seg = _tilted_segment(tmp_path, 40.0)
-    rng = np.random.default_rng(0)
-    layers = ndi.gaussian_filter(rng.random((4, 120, 160)), (0, 3, 3))
-    layers = (255 * (layers - layers.min()) / np.ptp(layers)).astype(np.uint8)
+    r, c = np.mgrid[0:120, 0:160].astype(np.float32)
+    layers = np.stack([r, c, 0.7 * r + 1.3 * c, r - c])   # linear ramps survive bilinear resampling exactly
     render = tmp_path / "render.zarr"
-    zarr.open_array(str(render), mode="w", shape=layers.shape, chunks=(4, 64, 64), dtype=np.uint8)[:] = layers
+    ZarrWriter.create(render, shape=layers.shape, chunks=(4, 64, 64), dtype=np.float32, auth=None)[:] = layers
     up = tmp_path / "up.zarr"
     meta = upright.rotate_volume(seg, render, up)
     assert meta["orig_shape"] == [120, 160]
     # stand-in for a prediction on the upright volume: its middle layer
     pred = tmp_path / "pred_up.tif"
-    tifffile.imwrite(pred, np.asarray(zarr.open_array(str(up), mode="r")[2]))
+    tifffile.imwrite(pred, np.asarray(open_node(str(up))[2]))
     back = tmp_path / "pred.tif"
     assert upright.rotate_back(up, pred, back) == (120, 160)
-    restored = np.squeeze(np.asarray(images.read(back))).astype(np.float64)
+    restored = np.squeeze(np.asarray(images.read(back)))
     inner = (slice(25, 95), slice(35, 125))           # away from the corners that rotate off the canvas
-    r = np.corrcoef(restored[inner].ravel(), layers[2][inner].astype(np.float64).ravel())[0, 1]
-    assert r > 0.98
+    np.testing.assert_allclose(restored[inner], layers[2][inner], atol=1e-3)
+
+
+def test_back_is_exact_at_quarter_turns(tmp_path):
+    img = np.random.default_rng(0).integers(1, 255, (7, 9)).astype(np.uint8)
+    for angle in (90.0, -90.0, 180.0):
+        rot = ndi.rotate(img, angle, reshape=True, order=1)
+        up = tmp_path / f"up{angle}.zarr"
+        dst = ZarrWriter.create(up, shape=(1,) + rot.shape, chunks=(1, 16, 16), dtype=np.uint8, auth=None)
+        dst.attrs[upright.ATTR] = {"angle_deg": angle, "orig_shape": list(img.shape), "rot_shape": list(rot.shape)}
+        tifffile.imwrite(tmp_path / "pred_up.tif", rot)
+        upright.rotate_back(up, tmp_path / "pred_up.tif", tmp_path / "pred.tif")
+        np.testing.assert_array_equal(np.squeeze(np.asarray(images.read(tmp_path / "pred.tif"))), img)

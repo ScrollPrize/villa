@@ -21,19 +21,22 @@ import argparse
 from pathlib import Path
 
 import numpy as np
-import zarr
 from scipy import ndimage as ndi
-from vc_reader import images
+from scipy import special
+from vc_reader import images, tifxyz
+from vc_reader.reader import ZarrWriter
+
+from vesuvius.ink_detection.volume_io import open_volume, open_volume_root
 
 ATTR = "upright"
 TILE = 256
 
 
 def read_z(segment: str | Path) -> tuple[np.ndarray, np.ndarray]:
-    """The z grid of a tifxyz segment and its validity mask (invalid points are -1 or non-finite)."""
-    z = np.squeeze(np.asarray(images.read(Path(segment) / "z.tif"))).astype(np.float64)
-    valid = np.isfinite(z) & (z > 0)
-    return z, valid
+    """The z grid of a tifxyz segment and the vertices the renderer uses (``mask.tif`` applied, z > 0)."""
+    surface = tifxyz.read(segment)
+    z = np.asarray(surface.xyz[..., 2], dtype=np.float64)
+    return z, np.asarray(surface.valid) & (z > 0)
 
 
 def find_angle(z: np.ndarray, valid: np.ndarray, step_deg: float = 1.0) -> tuple[float, float, float]:
@@ -62,20 +65,17 @@ def find_angle(z: np.ndarray, valid: np.ndarray, step_deg: float = 1.0) -> tuple
     return best[1], best[2], best[3]
 
 
-def _level0(path: str | Path, resolution: str = "0"):
-    node = zarr.open(str(path), mode="r")
-    return node if isinstance(node, zarr.Array) else node[resolution]
-
-
 def rotate_volume(segment: str | Path, render: str | Path, out: str | Path, resolution: str = "0") -> dict:
     """Write ``out`` (a bare zarr array, layers first) with every layer of ``render`` rotated upright."""
+    src = open_volume(render, resolution, root_array_is_requested_level=True)
+    if len(src.shape) != 3 or int(np.argmin(src.shape)) != 0:
+        raise ValueError(f"rotate needs a layers-first render (layers, height, width), got shape {tuple(src.shape)}")
+    layers, height, width = src.shape
     z, valid = read_z(segment)
     angle, down, side = find_angle(z, valid)
-    src = _level0(render, resolution)
-    layers, height, width = src.shape
     first = ndi.rotate(np.asarray(src[0]), angle, reshape=True, order=1)
-    dst = zarr.open_array(str(out), mode="w", shape=(layers,) + first.shape,
-                          chunks=(layers, 128, 128), dtype=src.dtype)
+    dst = ZarrWriter.create(out, shape=(layers,) + first.shape, chunks=(layers, 128, 128),
+                            dtype=src.dtype, overwrite=True, auth=None)
     dst[0] = first
     for k in range(1, layers):
         dst[k] = ndi.rotate(np.asarray(src[k]), angle, reshape=True, order=1)
@@ -87,17 +87,18 @@ def rotate_volume(segment: str | Path, render: str | Path, out: str | Path, reso
 
 def rotate_back(upright: str | Path, prediction: str | Path, out: str | Path) -> tuple[int, int]:
     """Map a prediction made on the upright volume back onto the original render canvas."""
-    meta = zarr.open_array(str(upright), mode="r").attrs[ATTR]
+    meta = open_volume_root(upright).attrs[ATTR]
     pred = np.squeeze(np.asarray(images.read(Path(prediction))))
     dtype = pred.dtype
-    a = pred.astype(np.float32)
     rh, rw = meta["rot_shape"]
-    if a.shape != (rh, rw):
-        a = ndi.zoom(a, (rh / a.shape[0], rw / a.shape[1]), order=1)
-    b = ndi.rotate(a, -meta["angle_deg"], reshape=True, order=1)
+    if pred.shape != (rh, rw):
+        raise ValueError(f"prediction is {pred.shape}, expected the full upright canvas {(rh, rw)} (--roi is not supported)")
     h, w = meta["orig_shape"]
-    y0, x0 = (b.shape[0] - h) // 2, (b.shape[1] - w) // 2
-    b = b[y0:y0 + h, x0:x0 + w]
+    # Inverse of the forward ndi.rotate about the pixel centers; cosdg/sindg keep quarter turns exact, as there.
+    c, s = special.cosdg(meta["angle_deg"]), special.sindg(meta["angle_deg"])
+    inv = np.array([[c, -s], [s, c]])
+    offset = (np.array([rh, rw]) - 1) / 2 - inv @ ((np.array([h, w]) - 1) / 2)
+    b = ndi.affine_transform(pred.astype(np.float32), inv, offset, output_shape=(h, w), order=1)
     if np.issubdtype(dtype, np.integer):
         info = np.iinfo(dtype)
         b = np.clip(np.rint(b), info.min, info.max)

@@ -491,17 +491,18 @@ what the models have seen. `upright` takes the angle from the segment's own
 down the rows, and maps the prediction back onto the original canvas:
 
 ```bash
-uv run python -m vesuvius.ink_detection.inference.upright angle seg.tifxyz
-uv run python -m vesuvius.ink_detection.inference.upright rotate seg.tifxyz seg.zarr seg_upright.zarr
+uv run --extra models python -m vesuvius.ink_detection.inference.upright angle seg.tifxyz
+uv run --extra models python -m vesuvius.ink_detection.inference.upright rotate seg.tifxyz seg.zarr seg_upright.zarr
 uv run --extra models python -m vesuvius.ink_detection.inference.infer \
   seg_upright.zarr checkpoint.pth pred_upright.tif
-uv run python -m vesuvius.ink_detection.inference.upright back seg_upright.zarr pred_upright.tif pred.tif
+uv run --extra models python -m vesuvius.ink_detection.inference.upright back seg_upright.zarr pred_upright.tif pred.tif
 ```
 
-`rotate` writes a bare level-0 array with the angle and both canvas shapes in its
-attributes; `back` reads them, so `pred.tif` lines up with masks and overlays made
-for `seg.zarr`. Only the in-plane rotation changes: the layer order is untouched,
-so `--direction` means the same on the rotated volume, and mirrored grids stay
+`rotate` takes a layers-first render and writes a bare level-0 array with the
+angle and both canvas shapes in its attributes; `back` reads them, so a full-frame
+`pred.tif` (not `--roi`) lines up with masks and overlays made for `seg.zarr`.
+Only the in-plane rotation changes: the layer order is untouched, so
+`--direction` means the same on the rotated volume, and mirrored grids stay
 mirrored (training includes flips). The rotated canvas is larger than the
 original; the padding is zero.
 
