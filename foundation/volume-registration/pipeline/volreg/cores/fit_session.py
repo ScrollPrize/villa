@@ -289,8 +289,9 @@ class Session:
     @classmethod
     def load(cls, directory):
         directory = Path(directory)
-        with open(directory / "session.json") as handle:
-            state = json.load(handle)
+        # Read as the record files are: a read that lands while Windows replaces the file is
+        # refused, and asked again, so the viewer does not answer 500 meanwhile.
+        state = json.loads(filelock.retry((directory / "session.json").read_bytes))
         if state.get("schema") != SCHEMA:
             raise ValueError(f"unknown session schema {state.get('schema')!r}")
         return cls(directory, state)
