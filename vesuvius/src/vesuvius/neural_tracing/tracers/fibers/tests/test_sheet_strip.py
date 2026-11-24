@@ -367,13 +367,16 @@ def test_transfer_to_single_lattice_keeps_what_it_can():
     assert torch.isfinite(heights).all() and not hasattr(target, 'coarse_cnn')
 
 
-def test_optimize_for_mps_swaps_the_checkpoint_cnn():
+def test_optimize_for_mps_swaps_the_checkpoint_cnn(monkeypatch):
     # fiber_strip_small_v1's CNN: its pooled skips store sizes as lists and its identity skips are lambdas, which the
     # Metal kernels must still accept instead of silently falling back to the slower MPS layers
+    import platform
+
     from vesuvius.neural_tracing.tracers.models.blocks import CropCNN
     from vesuvius.neural_tracing.tracers.models.mps import optimize_for_mps
     from vesuvius.neural_tracing.tracers.models.mps_cnn import MetalCropCNN
 
+    monkeypatch.setattr(platform, 'mac_ver', lambda: ('26.0', ('', '', ''), 'arm64'))
     model = torch.nn.Module()
     model.cnn = CropCNN((12, 24, 64), (2, 2, 1), (1, 2, 2), activation='leaky_relu', in_channels=2, context=64)
     optimize_for_mps(model)
@@ -382,6 +385,21 @@ def test_optimize_for_mps_swaps_the_checkpoint_cnn():
     assert MetalCropCNN.covers(model.cnn)
     stem = CropCNN((12, 24, 64), (2, 2, 1), (1, 2, 2), stem=True, activation='leaky_relu', in_channels=2, context=64)
     assert not MetalCropCNN.suits(stem)
+
+
+def test_optimize_for_mps_keeps_the_cnn_on_mps_layers_below_macos_26(monkeypatch):
+    # mps_cnn.metal includes <metal_tensor> (Metal 4), which macOS 15 can't compile: the CNN must stay a CropCNN
+    import platform
+
+    from vesuvius.neural_tracing.tracers.models.blocks import CropCNN
+    from vesuvius.neural_tracing.tracers.models.mps import FusedBasicBlockD, optimize_for_mps
+
+    monkeypatch.setattr(platform, 'mac_ver', lambda: ('15.7.3', ('', '', ''), 'arm64'))
+    model = torch.nn.Module()
+    model.cnn = CropCNN((12, 24, 64), (2, 2, 1), (1, 2, 2), activation='leaky_relu', in_channels=2, context=64)
+    optimize_for_mps(model)
+    assert type(model.cnn) is CropCNN
+    assert any(type(m) is FusedBasicBlockD for m in model.cnn.modules())
 
 
 def test_patch_token_tables_match_grid_sample():

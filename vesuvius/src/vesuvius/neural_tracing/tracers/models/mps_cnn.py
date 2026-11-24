@@ -8,6 +8,7 @@ the module's own; any structure the kernels do not cover runs the stock forward.
 """
 from __future__ import annotations
 
+import platform
 from importlib import resources
 
 import torch
@@ -20,6 +21,14 @@ from vesuvius.neural_tracing.tracers.models.blocks import CropCNN
 from vesuvius.neural_tracing.tracers.models.mps import DepthTapConv3d, DirectConv3d, FusedBasicBlockD
 
 _LIBRARIES = {}
+
+
+def metal_tensor_ops():
+    """Whether this Mac's Metal has the tensor ops ``mps_cnn.metal`` includes (``<metal_tensor>``, Metal 4): macOS 26
+    and later. Below that :func:`~vesuvius.neural_tracing.tracers.models.mps.optimize_for_mps` keeps the CropCNN on
+    the MPS layers, whose strips match within float noise (mean 2.3e-6 over 234,375 nodes, same kept nodes)"""
+    release = platform.mac_ver()[0]
+    return bool(release) and int(release.split('.')[0]) >= 26
 
 
 def _library():
@@ -105,7 +114,7 @@ class MetalCropCNN(CropCNN):
 
     @staticmethod
     def suits(module):
-        return type(module) is CropCNN and MetalCropCNN.covers(module)
+        return type(module) is CropCNN and metal_tensor_ops() and MetalCropCNN.covers(module)
 
     @staticmethod
     def covers(module):

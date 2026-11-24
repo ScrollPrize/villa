@@ -88,7 +88,8 @@ class EvenAdaptiveAvgPool3d(nn.AdaptiveAvgPool3d):
 
 def optimize_for_mps(model):
     """Swap layers of ``model`` in place for MPS ones with the same parameters and outputs: a CropCNN the Metal kernels
-    cover for :class:`~vesuvius.neural_tracing.tracers.models.mps_cnn.MetalCropCNN`; single-lattice PatchTokens for
+    cover for :class:`~vesuvius.neural_tracing.tracers.models.mps_cnn.MetalCropCNN` (macOS 26 and later, whose Metal
+    has the tensor ops it needs); single-lattice PatchTokens for
     :class:`~vesuvius.neural_tracing.tracers.models.mps_tokens.MetalPatchTokens`; stride-1 3x3x3 Conv3d for
     :class:`DepthTapConv3d` (or :class:`DirectConv3d` when it has few channels), AdaptiveAvgPool3d for
     :class:`EvenAdaptiveAvgPool3d` and InstanceNorm/LeakyReLU ResNet-D blocks for :class:`FusedBasicBlockD`, which
