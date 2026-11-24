@@ -9,6 +9,8 @@
 #include <opencv2/imgcodecs.hpp>
 
 #ifdef VC_BENCH_VC_READER
+#include "vc/core/types/Volume.hpp"
+
 #include <vc_reader/zarr.hpp>
 #endif
 
@@ -160,12 +162,14 @@ int main(int argc, char** argv)
         if (prefetch && source.remote) {
             // The tool caches the metadata of the levels it renders from only, and a
             // cached run opens the volume offline, which reads every level's.
-            vcr::zarr::OpenOptions options;
-            options.cacheDirs = {source.cacheRoot.string()};
+            // The volume is opened as the tool opens it, so the URL, credentials and cache match.
+            ::setenv("VC3D_CONFIG_DIR", vc3dConfig.c_str(), 1);
+            const auto volume = Volume::NewFromUrl(source.location);
+            auto options = volume->sourceOpenOptions();
             options.cacheWrites = true;
-            options.access = vcr::zarr::resolveAccess(source.location);
-            for (const auto& level : vcr::zarr::pyramidLevels(source.location, options))
-                (void)vcr::zarr::openPyramidLevel(source.location, level.level, options);
+            const auto location = volume->sourceLocation();
+            for (const auto& level : vcr::zarr::pyramidLevels(location, options))
+                (void)vcr::zarr::openPyramidLevel(location, level.level, options);
         }
 #endif
 
