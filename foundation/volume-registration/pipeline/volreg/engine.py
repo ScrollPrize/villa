@@ -259,40 +259,45 @@ class Pipeline:
         handle = self._take_lock(name)
         try:
             try:
-                try:
-                    with self._launch_guard():
+                with self._launch_guard():
+                    try:
                         # Under the stage's lock, and with no redo half done: what it needs
                         # must still be done, as it was when the job was chosen.
                         self._require_needs(name)
                         self._started[name] = self.redo_mark(name)
                         inputs, params = self.inputs(name), self.stage_params(name)
-                except Superseded:
-                    raise
-                except Exception as error:   # noqa: BLE001 - recorded as the stage's failure
-                    # What it needs could not be read (a record file held past the wait for a
-                    # replace, say): the job fails as a stage does, so the stage is not left
-                    # ready with no job on it, and the error is there to be seen.
-                    stamp = self._unstarted_failure(name, error)
-                else:
-                    stamp = {"stage": name, "inputs": inputs, "params": params, "code": code_version(),
-                             "started": rec.now()}
-                    self.record.log("job-started", stage=name, params=params)
-                    try:
-                        written = list(stage.run(self, params) or [])
-                        # The redo mark is a finished result's only: a release takes a stamp
-                        # under the current mark as the stage having published since the last redo.
-                        stamp |= {"status": "ok", "finished": rec.now(), "outputs": written,
-                                  "output_digest": digest_files(self.directory, written),
-                                  "redo_mark": self._started[name]}
-                        self.record.log("job-finished", stage=name, outputs=written)
                     except Superseded:
                         raise
-                    except Exception as error:   # noqa: BLE001 - a stage's failure is recorded, not raised
-                        stamp |= {"status": "failed", "finished": rec.now(),
-                                  "error": f"{type(error).__name__}: {error}",
-                                  "traceback": traceback.format_exc(),
-                                  "failed_under_redo_mark": self._started[name]}
-                        self.record.log("job-failed", stage=name, error=stamp["error"])
+                    except Exception as error:   # noqa: BLE001 - recorded as the stage's failure
+                        # What it needs could not be read (a record file held past the wait
+                        # for a replace, say): the job fails as a stage does, so the stage is
+                        # not left ready with no job on it, and the error is there to be seen.
+                        # Recorded in the same hold of the guard the read failed in: a redo
+                        # waits for it, then moves this stamp with the rest, so the stage is
+                        # ready to run again. Recorded after the hold, a redo that came
+                        # between (it finished while the read waited) would be undone by it.
+                        stamp = self._unstarted_failure(name, error)
+                        self._write_stamp(name, stamp)
+                        return stamp
+                stamp = {"stage": name, "inputs": inputs, "params": params, "code": code_version(),
+                         "started": rec.now()}
+                self.record.log("job-started", stage=name, params=params)
+                try:
+                    written = list(stage.run(self, params) or [])
+                    # The redo mark is a finished result's only: a release takes a stamp
+                    # under the current mark as the stage having published since the last redo.
+                    stamp |= {"status": "ok", "finished": rec.now(), "outputs": written,
+                              "output_digest": digest_files(self.directory, written),
+                              "redo_mark": self._started[name]}
+                    self.record.log("job-finished", stage=name, outputs=written)
+                except Superseded:
+                    raise
+                except Exception as error:   # noqa: BLE001 - a stage's failure is recorded, not raised
+                    stamp |= {"status": "failed", "finished": rec.now(),
+                              "error": f"{type(error).__name__}: {error}",
+                              "traceback": traceback.format_exc(),
+                              "failed_under_redo_mark": self._started[name]}
+                    self.record.log("job-failed", stage=name, error=stamp["error"])
                 with self._launch_guard():
                     self._require_current(name)
                     self._write_stamp(name, stamp)
@@ -327,14 +332,27 @@ class Pipeline:
             pass            # the stamp says it; a log that cannot be written must not hide it
         return stamp
 
-    def fail_unstarted(self, name, error):
+    def fail_unstarted(self, name, error, again=None):
         """Record that a job for stage `name` failed before it could begin (its pipeline could
         not even be read), under the stage's lock, as `run_stage` records a failure. Returns
-        the stamp; RuntimeError if a job holds the stage."""
+        the stamp; RuntimeError if a job holds the stage.
+
+        With `again`, the read that failed: it is made once more first, under the stage's
+        lock and in the hold of the launch guard the failure would be recorded in, where no
+        redo can come between. If it succeeds, nothing is recorded and None is returned (the
+        read waited out a replace, or a redo that came while it waited): the job goes on. If
+        it fails, the failure is recorded in that same hold, so a redo after it moves it and
+        the stage is ready to run again, and a redo before it was seen by the read."""
         handle = self._take_lock(name)
         try:
-            stamp = self._unstarted_failure(name, error, settings_read=False)
             with self._launch_guard():
+                if again is not None:
+                    try:
+                        again()
+                        return None
+                    except Exception as later:   # noqa: BLE001 - recorded as the stage's failure
+                        error = later
+                stamp = self._unstarted_failure(name, error, settings_read=False)
                 self._write_stamp(name, stamp)
             return stamp
         finally:

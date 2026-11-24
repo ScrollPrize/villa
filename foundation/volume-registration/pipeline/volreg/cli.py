@@ -322,10 +322,15 @@ def main(argv=None):
         except Exception as error:   # noqa: BLE001 - recorded as the stage's failure
             # The pair's settings cannot be read (held past the wait for a replace, say): the
             # stage fails as a job does, under its lock, instead of being left ready with no
-            # job on it.
-            engine.Pipeline(args.pair, pipeline_stages.stages()).fail_unstarted(args.stage, error)
-            print(f"{args.stage}: failed before it began: {type(error).__name__}: {error}", file=sys.stderr)
-            return 1
+            # job on it. They are read once more where no redo can come between; read, the
+            # job goes on, and a failure is recorded where a redo after it clears it.
+            loaded = []
+            stamp = engine.Pipeline(args.pair, pipeline_stages.stages()).fail_unstarted(
+                args.stage, error, again=lambda: loaded.append(pipeline_stages.pipeline(args.pair)))
+            if stamp is not None:
+                print(f"{args.stage}: failed before it began: {stamp['error']}", file=sys.stderr)
+                return 1
+            pipeline = loaded[0]
         code = engine.main_job(pipeline, args.stage)
         if code == 0:
             try:
