@@ -1,4 +1,5 @@
 #pragma once
+#include <functional>
 #include <vector>
 #include <opencv2/core/matx.hpp>
 #include <opencv2/core/types.hpp>
@@ -37,13 +38,49 @@ static cv::Point2i extract_point_min_dist(std::vector<cv::Vec2i> &cands, const s
     return {-1,-1};
 }
 
-//collection of points which can be retrieved with minimum distance requirement
+// The first candidate, from `idx` on, that does not conflict with any of the blocked points; it is taken out of `cands`.
+template <class Conflict>
+static cv::Point2i extract_point_without_conflict(std::vector<cv::Vec2i> &cands, const std::vector<cv::Vec2i> &blocked, int &idx, const Conflict &conflict)
+{
+    for(int i=0;i<cands.size();i++) {
+        cv::Vec2i p = cands[(i + idx) % cands.size()];
+
+        if (p[0] == -1)
+            continue;
+
+        bool free = true;
+        for (const auto &o : blocked)
+            if (o[0] != -1 && o != p && conflict(p, o)) {
+                free = false;
+                break;
+            }
+        if (free) {
+            cands[(i + idx) % cands.size()] = {-1,-1};
+            idx = (i + idx + 1) % cands.size();
+
+            return p;
+        }
+    }
+
+    return {-1,-1};
+}
+
+//collection of points which can be retrieved with minimum distance requirement, or, with a predicate, without conflicts
 class OmpThreadPointCol
 {
 public:
     OmpThreadPointCol(float dist, const std::vector<cv::Vec2i> &src) :
         _thread_count(omp_get_max_threads()),
         _dist(dist),
+        _points(src),
+        _thread_points(_thread_count,{-1,-1}),
+        _thread_idx(_thread_count, -1) {};
+
+    // Points are retrieved only while `conflicts(candidate, point being worked on by another thread)` is false for all of them.
+    OmpThreadPointCol(std::function<bool(const cv::Vec2i&, const cv::Vec2i&)> conflicts, const std::vector<cv::Vec2i> &src) :
+        _thread_count(omp_get_max_threads()),
+        _dist(0),
+        _conflicts(std::move(conflicts)),
         _points(src),
         _thread_points(_thread_count,{-1,-1}),
         _thread_idx(_thread_count, -1) {};
@@ -64,8 +101,9 @@ public:
 #pragma omp critical
         {
             _thread_points[t_id] = {-1,-1};
-            _thread_points[t_id] = extract_point_min_dist(
-                _points, _thread_points, _thread_idx[t_id], _dist);
+            _thread_points[t_id] = _conflicts
+                ? extract_point_without_conflict(_points, _thread_points, _thread_idx[t_id], _conflicts)
+                : extract_point_min_dist(_points, _thread_points, _thread_idx[t_id], _dist);
         }
         return _thread_points[t_id];
     }
@@ -73,6 +111,7 @@ public:
 protected:
     int _thread_count;
     float _dist;
+    std::function<bool(const cv::Vec2i&, const cv::Vec2i&)> _conflicts;
     std::vector<cv::Vec2i> _points;
     std::vector<cv::Vec2i> _thread_points;
     std::vector<int> _thread_idx;

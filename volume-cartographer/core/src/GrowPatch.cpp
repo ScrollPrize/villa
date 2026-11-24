@@ -3228,7 +3228,9 @@ QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const nlo
 
             // Build a structure that allows parallel iteration over cands, while avoiding any two threads simultaneously
             // considering two points that are too close to each other...
-            OmpThreadPointCol cands_threadcol(local_opt_r*2+1, cands);
+            // Two solves run together only when neither reads a vertex the other moves (a loss reads up to two cells away).
+            const LocalSolveConflicts solve_conflicts(local_opt_r);
+            OmpThreadPointCol cands_threadcol([&solve_conflicts](const cv::Vec2i &a, const cv::Vec2i &b) { return solve_conflicts(a, b); }, cands);
 
             // ...then start iterating over candidates in parallel using the above to yield points
             #pragma omp parallel

@@ -556,7 +556,7 @@ vc_add_test(NAME test_growth_config
     INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/..)
 
 vc_add_test(NAME test_growpatch_straight_loss
-    LIBS doctest::doctest opencv_core
+    LIBS doctest::doctest opencv_core OpenMP::OpenMP_CXX
     INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/..)
 
 vc_add_test(NAME test_growth_helpers
