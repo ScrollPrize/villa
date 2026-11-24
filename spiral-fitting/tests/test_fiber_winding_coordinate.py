@@ -152,7 +152,8 @@ def test_sheet_label_and_winding_offset_are_constant_along_a_sheet(sense):
         c=c, w_min=np.array([w.min()]), w_max=np.array([w.max()]),
         fiber_cc=np.array([0]), largest_cc=0, point_fiber=np.zeros(count, dtype=np.int64),
         piece_offsets=np.array([0, count]), zyx=zyx.astype(np.float32), w_s=w - c,
-        family=np.array([0]),
+        family=np.array([0]), fiber_uuid=np.zeros((1, 16), dtype=np.uint8),
+        cc_component=np.array([0]), run_uuid='run',
         n0=np.round(w - c - undeformed_theta(model, zyx) / (2 * np.pi)).astype(np.int64))
     offset = int(np.round(np.median(s)))
     n_low = int(np.floor(w.min() - c))

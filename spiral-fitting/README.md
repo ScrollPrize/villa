@@ -515,6 +515,20 @@ holds no fiber point runs without the fiber loss. A checkpoint records the
 solve (run UUID and both store positions) and resumes only against the same
 one unless `object_store_allow_changed_inputs`.
 
+At the end of the fit, beside the patch satisfaction pass, a fiber
+satisfaction pass (`fiber_satisfaction.py`) measures every point the loss
+holds, with the loss's own `s`: a point is satisfied when accepted and within
+half a turn of its target (`c0` in the largest CC; in another CC
+`round(median s)` over all its accepted points, computed in the pass); a fiber
+when all its points are; another CC when all its fibers are. It logs
+`satisfied_fibers = …` lines (all, largest CC, other CCs; fiber counts,
+point-weighted and per-point fractions), `satisfied_fiber_other_ccs`, the largest
+CC's exact health statistics, and how many cached DT targets differ from the
+pass's. The numbers join `satisfaction_metrics_<suffix>.json`'s summary; the
+per-fiber verdicts (fiber UUID, component, counts, satisfied fraction, target,
+mean signed offset) go to `fiber_satisfied_<suffix>.npz`. With the fiber loss
+off nothing is written.
+
 ### Frames and units
 
 The fit's unit is the reference-volume voxel (ZYX), whatever the stored

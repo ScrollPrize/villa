@@ -1489,6 +1489,45 @@ class FitContext:
         return (getattr(self, 'fiber_cc_loss', None) is not None
                 and float(self.config['loss_weight_fiber']) > 0)
 
+    def _fiber_satisfaction(self, suffix):
+        """The whole-set fiber satisfaction pass (fiber_satisfaction) at the
+        end of a stage: logs its lines, writes fiber_satisfied_<suffix>.npz
+        and returns the summary for satisfaction_metrics_<suffix>.json; None
+        (no file) when the fiber loss is off, or when the pass runs out of
+        CUDA memory (logged; the patch pass and mesh export still run). Main
+        process only."""
+        if not self._fiber_loss_active():
+            solve = getattr(self, 'fiber_solve', None)
+            if solve is None:
+                return None
+            if getattr(self, 'fiber_cc_loss', None) is not None:
+                reason = 'the fiber loss is off: loss_weight_fiber is 0'
+            elif solve.c is None:
+                reason = 'no fiber point lies in the z window'
+            else:
+                reason = 'every fiber point in the z window belongs to a dropped fiber'
+            print(f'fiber satisfaction: skipped ({reason})')
+            return None
+        from fiber_satisfaction import (
+            evaluate_fiber_satisfaction, fiber_satisfaction_lines, write_fiber_satisfaction)
+        try:
+            result = evaluate_fiber_satisfaction(
+                self.fiber_cc_loss,
+                self.spiral_and_transform.get_slice_to_spiral_transform(),
+                self.spiral_and_transform.get_dr_per_winding().detach())
+        except torch.OutOfMemoryError:
+            result = None
+        if self.device.type == 'cuda':
+            torch.cuda.empty_cache()
+        if result is None:
+            print('WARNING: skipped the fiber satisfaction metrics '
+                  '(CUDA OOM during fiber evaluation)')
+            return None
+        for line in fiber_satisfaction_lines(result):
+            print(line)
+        write_fiber_satisfaction(result, self.out_path, suffix)
+        return result.summary
+
     def _fiber_range_windings(self):
         """The fiber labels in the z range that winding-range and shell-index
         inference read (the largest component's, fiber_cc_loss), or None
@@ -3835,6 +3874,7 @@ class FitContext:
                     print(line)
             progress.begin(
                 'finalizing', 'Computing satisfaction metrics and outputs')
+            fiber_summary = self._fiber_satisfaction(suffix)
             save_overlay_and_print_satisfaction(
                 suffix,
                 spiral_and_transform=self.spiral_and_transform,
@@ -3864,6 +3904,7 @@ class FitContext:
                 save_png_visualizations=self.config.get('output_save_png_visualizations', False),
                 progress=progress,
                 fiber_windings=self._fiber_range_windings(),
+                extra_summary=fiber_summary,
             )
             progress.finish()
             progress.clear()

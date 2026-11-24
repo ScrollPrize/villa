@@ -695,7 +695,13 @@ def save_overlay_and_print_satisfaction(
     save_png_visualizations=False,
     progress=None,
     fiber_windings=None,
+    extra_summary=None,
 ):
+    """The end-of-stage patch (and track) satisfaction pass and its outputs.
+
+    ``extra_summary`` (scalars, e.g. the fiber satisfaction pass's) is added
+    to satisfaction_metrics_<suffix>.json's summary.
+    """
     if progress is not None:
         progress.begin(
             'finalizing', 'Evaluating verified patches',
@@ -777,6 +783,8 @@ def save_overlay_and_print_satisfaction(
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             print('WARNING: skipped satisfied_tracks metric (CUDA OOM during track evaluation)')
+    if extra_summary:
+        satisfaction_summary.update(extra_summary)
     patch_ids = list(patches_dict.keys())
     patch_satisfaction_entries = []
     for pid, sat_area_t, tot_area_t in zip(patch_ids, satisfied_areas.tolist(), total_areas.tolist()):

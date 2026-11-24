@@ -129,6 +129,15 @@ def _group_median(group, values, mask, num_groups):
     return sorted_values[middle], counts
 
 
+def whole_winding_targets(group, s, ok, num_groups):
+    """Per group, round(median s) over its accepted points (``ok``), NaN for
+    a group with none; and the accepted count. The DT targets T_CC and the
+    satisfaction pass's targets are this."""
+    median, count = _group_median(group, s, ok, num_groups)
+    nan = torch.full_like(median, float('nan'))
+    return torch.where(count > 0, torch.round(median), nan), count
+
+
 class _Table:
     """Sampling tables over items (points or consecutive-point pairs) grouped
     by fiber: CC by its fiber count, a fiber uniformly within it, then an
@@ -184,6 +193,13 @@ class FiberCCLoss:
         ccs, fiber_cc = np.unique(solve.fiber_cc[fibers], return_inverse=True)
         self.num_cc = len(ccs)
         self.cc_fiber_count = np.bincount(fiber_cc, minlength=self.num_cc)
+        # Per kept fiber (points are grouped by fiber, in this order) and per
+        # CC, for the whole-set satisfaction pass (fiber_satisfaction).
+        self.fiber_cc = fiber_cc
+        self.fiber_point_count = fiber_count
+        self.fiber_uuid = solve.fiber_uuid[fibers]
+        self.cc_component = solve.cc_component[ccs]
+        self.run_uuid = solve.run_uuid
         largest_local = np.flatnonzero(ccs == solve.largest_cc)
         self.largest_local = int(largest_local[0]) if len(largest_local) else -1
 
@@ -279,21 +295,28 @@ class FiberCCLoss:
             shifted = shifted - self.offset[index] * stretch
         return spiral, theta, n, rho, shifted - n * dr
 
+    def evaluate_points(self, transform, dr, index):
+        """``(s, ok)`` at points ``index`` (int64 tensor), under no_grad in
+        chunks of CHUNK points: s in turns (float32) and the phase
+        acceptance (bool)."""
+        values, masks = [], []
+        with torch.no_grad():
+            for begin in range(0, index.numel(), CHUNK):
+                _, _, _, rho, s_vox = self._evaluate(transform, dr, index[begin:begin + CHUNK])
+                values.append(s_vox / dr)
+                masks.append(accepted(rho))
+        if not values:
+            return (torch.zeros(0, device=self.device),
+                    torch.zeros(0, dtype=torch.bool, device=self.device))
+        return torch.cat(values), torch.cat(masks)
+
     def refresh_targets(self, transform, dr, iteration):
         """T_CC = round(median s) over each non-largest CC's accepted points;
         NaN for a CC with none. Logs how many targets changed."""
         targets = torch.full((self.num_cc,), float('nan'), device=self.device)
         if self.other_points.numel():
-            values, masks = [], []
-            with torch.no_grad():
-                for begin in range(0, self.other_points.numel(), CHUNK):
-                    index = self.other_points[begin:begin + CHUNK]
-                    _, _, _, rho, s_vox = self._evaluate(transform, dr, index)
-                    values.append(s_vox / dr)
-                    masks.append(accepted(rho))
-                median, count = _group_median(
-                    self.other_point_cc, torch.cat(values), torch.cat(masks), self.num_cc)
-            targets = torch.where(count > 0, torch.round(median), targets)
+            s, ok = self.evaluate_points(transform, dr, self.other_points)
+            targets, _ = whole_winding_targets(self.other_point_cc, s, ok, self.num_cc)
             targets[self.cc_is_largest] = float('nan')
         previous = self.targets
         has = torch.isfinite(targets)

@@ -1,6 +1,7 @@
 """A short CPU fit with the fiber CC loss: one patch, two fibers in two
 components of a winding run, 20 steps through the equal-winding and DT
-phases with the vertical-fiber offset on; every loss stays finite."""
+phases with the vertical-fiber offset on; every loss stays finite, and the
+end-of-stage fiber satisfaction pass covers both fibers."""
 import math
 
 import numpy as np
@@ -60,6 +61,13 @@ def test_a_short_fit_with_the_fiber_loss_has_finite_losses(tmp_path, monkeypatch
             assert metrics['fiber_label_step_mismatch'] == 0.0
     # The other component's whole-winding target was refreshed in the DT phase.
     assert any(line.startswith('fiber DT targets (step 11)') for line in lines)
+    # The end-of-stage fiber satisfaction pass over both fibers.
+    summary = fit._fiber_satisfaction('fitted')
+    assert summary['total_fibers'] == 2 and summary['total_fiber_other_ccs'] == 1
+    assert summary['fiber_cached_targets'] == 1
+    with np.load(f'{fit.out_path}/fiber_satisfied_fitted.npz') as saved:
+        assert len(saved['fiber_uuid']) == 2
+        assert saved['point_count'].sum() == summary['fiber_points']
     # A checkpoint names the solve, and resumes only against it.
     payload = fit._checkpoint_payload(20)
     assert payload['input_manifest']['winding_solve']['run_uuid'] == solve['run_uuid']
