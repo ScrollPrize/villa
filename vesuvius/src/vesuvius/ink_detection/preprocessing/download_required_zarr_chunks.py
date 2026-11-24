@@ -1,21 +1,26 @@
 """Copy the source Zarr chunks selected by tifxyz label-patch geometry.
 
-v2 — targeted flat-discovery fix for PR #2677 (review: villa-review, 24/11/2026).
+v3 — targeted fixes for PR #2677 (review: villa-review, 24/11/2026, second
+review of the v2 head at 8d50b31), on top of the v2 flat-discovery fix.
 
-The downloader plans native (tifxyz) chunk downloads, so it needs tifxyz
-geometry for every segment it plans: the tifxyz reader opens the
-coordinate TIFFs by name. v1 admitted any folder containing a .tif, so a
-sibling preview folder aborted the whole plan at label lookup, and a
-newly admitted folder with usable labels but no geometry reached the
-tifxyz reader and failed there. v2 restores the native geometry check
-(x.tif directly in the segment directory, as main had it) and makes the
-per-segment planning resilient: one defective neighbour is warned about
-and skipped, never fatal to the plan. A flat Zarr-only mirror (no tifxyz)
-is skipped with a warning — the downloader cannot plan native crops
-without coordinates; such mirrors are a training-discovery matter, not a
-download matter. An unfinished mirror (label stores present but empty)
-is skipped the same way and picked up on a later run once its stores
-are filled.
+1. Sparse labels are no longer dropped. villa's label writer omits
+   fill-only chunks, so a valid all-background ink store looks exactly
+   like an unfinished mirror to a chunk-presence gate. v3 distinguishes
+   the three states of a store — unreadable (no metadata), readable
+   without chunks, ready — and uses the neighbouring store to decide:
+   an ink store that is readable without chunks is sparse (admitted)
+   when the supervision store has chunks; a supervision store without
+   chunks can yield no supervised patches, so the segment still waits.
+   An ink store with no metadata at all is unreadable: the segment
+   waits.
+2. An incomplete plan no longer destroys existing output. When patches
+   are empty AND segments were skipped, planning now raises
+   RuntimeError instead of returning a 0-chunk plan, and
+   copy_chunks_to_output refuses to --overwrite an existing output
+   with an incomplete plan. The resume path is preserved: after the
+   labels are restored, a plain retry reuses the stored complete plan
+   (exact-plan checks still reject a partial stored plan), and
+   --overwrite with a complete plan replaces it normally.
 """
 
 import argparse
@@ -48,6 +53,7 @@ from vesuvius.ink_detection.data.segment import (
     discover_segment_labels,
     has_tifxyz_geometry,
     zarr_store_has_chunks,
+    zarr_store_has_metadata,
 )
 from vesuvius.ink_detection.types import Segment
 from vesuvius.ink_detection.volume_io import normalized_source_path, open_volume, open_volume_root
@@ -90,6 +96,12 @@ class DatasetChunkPlan:
     chunk_shapes_by_scale: dict[int, tuple[int, int, int]]
     array_shapes_by_scale: dict[int, tuple[int, int, int]]
     chunk_ids_by_scale: dict[int, tuple[tuple[int, int, int], ...]]
+    # Names of segments skipped at planning time (unfinished mirrors,
+    # unreadable labels, ...). A non-empty value means the plan is
+    # incomplete: it must never overwrite an existing output, and a
+    # 0-patch plan with skipped segments is a planning failure, not a
+    # plan (see _build_dataset_download_patches).
+    skipped_segments: tuple[str, ...] = ()
 
     @property
     def total_bytes(self) -> int:
@@ -546,7 +558,23 @@ def copy_chunks_to_output(
     tqdm_desc: str,
     overwrite: bool,
     recompress: str,
+    incomplete: bool = False,
 ) -> dict[str, dict[int, int]]:
+    """Copy planned chunks into the sparse output store.
+
+    ``incomplete`` marks a plan built while segments were skipped: such
+    a plan must never replace an existing output with --overwrite,
+    because the skipped segments' chunks are missing from it and the
+    stored plan would then be rejected as modified on retry. The
+    refusal happens before any mutation, so the existing output is
+    preserved and the run can be retried after the labels are restored.
+    """
+    if incomplete and overwrite and output_path.exists():
+        raise ValueError(
+            f"Refusing to overwrite existing output {output_path} with an "
+            "incomplete plan (segments were skipped at planning time); "
+            "restore the skipped segments' labels and retry"
+        )
     source_group = open_volume_root(
         volume_path, auth_json_path=volume_auth_json
     )
@@ -843,7 +871,7 @@ def _build_dataset_download_patches(
     patch_finding_stride: int | None,
     patch_finding_filter_empty_tile: bool,
     label_version: str | None,
-) -> tuple[list[dict], int]:
+) -> tuple[list[dict], int, tuple[str, ...]]:
     config = {
         "patch_size": [int(v) for v in patch_size_zyx],
         "patch_overlap": float(overlap_fraction),
@@ -871,6 +899,7 @@ def _build_dataset_download_patches(
     patches: list[dict] = []
     candidate_bbox_count = 0
     skipped = 0
+    skipped_segments: list[str] = []
     for segment_dir in _iter_segment_dirs(dataset_dir):
         try:
             segment = Segment(
@@ -883,16 +912,30 @@ def _build_dataset_download_patches(
                 image_volume=str(source_spec.volume_path),
             )
             segment = discover_segment_labels(segment, extension=".zarr", required=True)
-            # Unfinished mirror: the label stores exist by name but hold no
-            # chunks yet (first-sync state). Skip it now; it is picked up
-            # on a later run once its stores are filled. Without this
-            # check the candidate search below raises "contains no nonzero
-            # voxels" and aborts the whole plan.
-            for label_path in (segment.inklabels, segment.supervision_mask):
-                if label_path is not None and not zarr_store_has_chunks(label_path):
-                    raise ValueError(
-                        f"{label_path} holds no chunks yet (unfinished mirror)"
-                    )
+            # Unfinished mirror: a label store that cannot be opened at
+            # all (no metadata — first-sync state) is unfinished, and a
+            # supervision store without chunks holds no supervised voxels,
+            # so the segment can yield no patches. Skip it now; it is
+            # picked up on a later run once its stores are filled.
+            # An ink store that is READABLE without chunks is NOT
+            # unfinished: the label writer omits fill-only chunks, so a
+            # valid all-background ink store has metadata and no chunks.
+            # It stays eligible whenever the selected filter allows
+            # background examples (the supervision store above proves
+            # the segment is synchronised).
+            if segment.supervision_mask is not None and not zarr_store_has_chunks(
+                segment.supervision_mask
+            ):
+                raise ValueError(
+                    f"{segment.supervision_mask} holds no chunks yet "
+                    "(unfinished mirror)"
+                )
+            if segment.inklabels is not None and not zarr_store_has_metadata(
+                segment.inklabels
+            ):
+                raise ValueError(
+                    f"{segment.inklabels} is unreadable (unfinished mirror)"
+                )
             segment_patches, segment_candidate_count = _build_segment_download_patches(
                 segment,
                 patch_filter=patch_filter,
@@ -905,19 +948,25 @@ def _build_dataset_download_patches(
                 stacklevel=2,
             )
             skipped += 1
+            skipped_segments.append(segment_dir.name)
             continue
         patches.extend(segment_patches)
         candidate_bbox_count += int(segment_candidate_count)
 
-    if not patches and skipped:
-        warnings.warn(
+    if not patches and skipped_segments:
+        # A 0-patch plan built while segments were skipped is a planning
+        # failure, not a plan: returning it would let --overwrite replace
+        # a usable stored mirror with 0 chunks, and a later retry would
+        # then reject the modified plan. Fail loudly so the existing
+        # output is preserved and the run can be retried after the
+        # labels are restored.
+        raise RuntimeError(
             "no download patches planned: "
             f"{skipped} segment director{'y' if skipped == 1 else 'ies'} "
-            "skipped (see warnings above); unfinished mirrors are picked up "
-            "once their stores are filled.",
-            stacklevel=2,
+            f"skipped ({', '.join(skipped_segments)}); fix the skipped "
+            "segments (or remove them) and retry"
         )
-    return patches, int(candidate_bbox_count)
+    return patches, int(candidate_bbox_count), tuple(skipped_segments)
 
 
 def _debug_patch_chunk_mapping(
@@ -994,7 +1043,7 @@ def build_dataset_chunk_plan(
             f"Requested scale {source_spec.volume_scale} is missing from source group {source_spec.volume_path!r}."
         )
 
-    patches, candidate_bbox_count = _build_dataset_download_patches(
+    patches, candidate_bbox_count, skipped_segments = _build_dataset_download_patches(
         dataset_dir=dataset_dir,
         source_spec=source_spec,
         patch_size_zyx=patch_size_zyx,
@@ -1048,6 +1097,7 @@ def build_dataset_chunk_plan(
         chunk_shapes_by_scale=chunk_shapes_by_scale,
         array_shapes_by_scale=array_shapes_by_scale,
         chunk_ids_by_scale=chunk_ids_by_scale,
+        skipped_segments=tuple(skipped_segments),
     )
 
 
@@ -1241,6 +1291,13 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     for plan in plans:
+        if plan.skipped_segments:
+            warnings.warn(
+                f"[{plan.dataset_name}] plan is incomplete: skipped segments "
+                f"({', '.join(plan.skipped_segments)}) are missing from it; "
+                "the output will not be overwritten if it already exists.",
+                stacklevel=2,
+            )
         copy_stats = copy_chunks_to_output(
             volume_path=plan.volume_path,
             volume_scale=plan.volume_scale,
@@ -1251,6 +1308,7 @@ def main(argv: list[str] | None = None) -> int:
             tqdm_desc=f"Downloading {plan.dataset_name}",
             overwrite=bool(args.overwrite),
             recompress=str(args.recompress),
+            incomplete=bool(plan.skipped_segments),
         )
         copied_counts_by_scale = copy_stats["copied_counts_by_scale"]
         existing_counts_by_scale = copy_stats["existing_counts_by_scale"]
