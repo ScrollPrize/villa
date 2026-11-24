@@ -167,7 +167,7 @@ def gather_segments(config: InkDataConfig) -> tuple[Segment, ...]:
                 source.surface_volume_paths or source.surface_volume_path is not None
             )
             if (native_mode or not explicit_surface) and not any(
-                segment_dir.rglob("x.tif")
+                segment_dir.rglob("*.tif")
             ):
                 continue
             relpath = segment_dir.relative_to(source.segments_path).as_posix()
