@@ -22,7 +22,6 @@ the CPU, then the strip model. Here the same decisions are split around the fram
 from __future__ import annotations
 
 from dataclasses import dataclass
-import math
 import multiprocessing
 import queue
 import time
@@ -154,12 +153,19 @@ class StripEngine:
 
     def __init__(self, predictor, batch=4, frame_chunk=64, across_fibers=False, compile_mode=None):
         """``compile_mode``: a torch.compile mode for the strip model after the tube render (with ``across_fibers``:
-        every batch is then padded to ``batch`` decisions so the compiled graph keeps one shape)."""
+        every batch is then padded to ``batch`` decisions so the compiled graph keeps one shape). Compiling turns on
+        inductor's ``emulate_precision_casts`` for the whole process."""
         import torch
         self.predictor, self.batch, self.frame_chunk = predictor, batch, frame_chunk
         self.across_fibers = across_fibers
         if compile_mode is not None and not across_fibers:
             raise ValueError('A compiled strip model needs across_fibers (one batch shape)')
+        if compile_mode is not None:
+            import torch._inductor.config
+            # fused kernels otherwise skip eager's intermediate bf16 roundings: plain compile made strips measurably
+            # worse than eager against stock on PHerc0211 fibres, while emulated casts stayed within noise. A
+            # global, since torch.compile takes a mode or inductor options, not both
+            torch._inductor.config.emulate_precision_casts = True
         model = predictor.model
 
         def strip_model(x, hist, hmask):
@@ -180,17 +186,24 @@ class StripEngine:
 
     def frame_outputs(self, requests):
         """Frame-model outputs (heading, normal; each (K, 3) float32 per request, crop-local) of ``requests``, in
-        chunks of ``frame_chunk`` decisions as HeadingPredictor.predict_frames_batched runs them."""
+        chunks of ``frame_chunk`` decisions as HeadingPredictor.predict_frames_batched runs them: each request's
+        decisions in chunks of their own, as ``predict`` batches them (``frame_chunk`` = its ``batch``), or with
+        ``across_fibers`` consecutive chunks of all of them."""
         import torch
         positions = np.concatenate([r.positions for r in requests])
         frames = np.concatenate([r.frames for r in requests])
         paths = torch.from_numpy(np.concatenate([r.paths for r in requests]))
         families = torch.from_numpy(np.concatenate([r.families for r in requests]))
+        bounds = np.cumsum([0]+[len(r.positions) for r in requests])
+        # a decision's frame can change in the last bits with the batch it runs in, so only predict's batches
+        # reproduce predict exactly
+        spans = [(0, len(positions))] if self.across_fibers else list(zip(bounds[:-1], bounds[1:]))
+        chunk = self.frame_chunk
+        parts = [slice(a, min(a+chunk, hi)) for lo, hi in spans for a in range(lo, hi, chunk)]
         crop = self.frame_model.cfg.patch
         heading, normal = [], []
         with torch.no_grad():
-            for start in range(0, len(positions), self.frame_chunk):
-                part = slice(start, start+self.frame_chunk)
+            for part in parts:
                 items = [dict(pos=a, frame=b) for a, b in zip(positions[part], frames[part])]
                 patch = self.crops(items, crop)
                 out = self.frame_model.forward_outputs(patch, paths[part].to(self.device),
@@ -198,7 +211,6 @@ class StripEngine:
                 heading.append(out['heading'])
                 normal.append(out['normal'])
         heading, normal = (torch.cat(v).float().cpu().numpy() for v in (heading, normal))
-        bounds = np.cumsum([0]+[len(r.positions) for r in requests])
         return [(heading[a:b], normal[a:b]) for a, b in zip(bounds[:-1], bounds[1:])]
 
     def heights(self, inputs, crop_chunk=32):

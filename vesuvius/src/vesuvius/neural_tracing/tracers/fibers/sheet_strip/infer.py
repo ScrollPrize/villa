@@ -185,11 +185,11 @@ class StripPredictor:
     loaded once; ``predict`` runs one fiber's decisions."""
 
     def __init__(self, checkpoint=DEFAULT_CHECKPOINT, device='cuda', umbilicus=None, batch=16, volume=None,
-                 crops='cpu', gpu_chunks=1024):
+                 crops='cpu', gpu_chunks=1024, memory_cache=3 << 30):
         """``checkpoint``: a file or a Hugging Face repo (module notes); ``volume``: parsed CT and frame-model options
         (runtime.add_volume_arguments; None: the checkpoint's). ``source`` is what outputs record as the checkpoint.
         ``crops='gpu'``: crops and the frame model on the CUDA ``device`` (a device cache of ``gpu_chunks`` CT
-        chunks); the default builds them on the CPU."""
+        chunks); the default builds them on the CPU. ``memory_cache``: bytes of CT chunks the CPU reader keeps."""
         path = resolve_checkpoint(checkpoint)
         self.source = checkpoint_source(checkpoint, path)
         self.model, self.cfg, self.ck = load_strip_model(path, device)
@@ -207,7 +207,7 @@ class StripPredictor:
         if self.cfg.strip_orientation:
             self.umbilicus = load_umbilicus(umbilicus or find_umbilicus(checkpoint, path, self.data.get('umbilicus')))
         self.ct = open_zarr(self.spec.ct_zarr, level=self.spec.ct_level, cache_dir=self.spec.cache_dir,
-                            memory_cache=3 << 30)
+                            memory_cache=memory_cache)
         self.cuda = None
         if crops == 'gpu':
             # The CPU work per decision is mostly crop building (the frame model's crops and forward, the strip

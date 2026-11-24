@@ -3,7 +3,7 @@ without scoring or renders).
 
     python -m vesuvius.neural_tracing.tracers.fibers.sheet_strip.infer_all --fibers FIBERS.vcobj --out OUT \\
         [--checkpoint scrollprize/fiber_strip_small_v1] [--min-length-mm 2.5] [--base-voxel-um 2.4] [--step 8] \\
-        [--blend 16] [--trim 75] [--shard K N]
+        [--blend 16] [--trim 75] [--shard K N] [--workers N [--across-fibers [--compile MODE]] --crops gpu]
 
 ``--checkpoint`` and the CT, frame-model and umbilicus options are infer.py's (a Hugging Face repo by default).
 
@@ -19,11 +19,21 @@ strip). Each finished fiber appends a line to OUT/index/shard_K.jsonl (fiber UUI
 checkpoint, the complete input reference, the mean expected error, seconds); an unchanged fiber already in it is skipped, so a stopped shard resumes where it
 left off, also with another checkpoint (run.json lists every checkpoint used). Lengths: the store catalog's, in base
 voxels of ``--base-voxel-um``.
+
+``--workers N`` runs the shard through sheet_strip/batched.py instead of fiber by fiber: N CPU worker processes build
+the decisions' geometry and write the strips, and this process runs the crops (``--crops gpu``: on the GPU) and both
+models over the decisions of many fibers at once. Strips and index records are written as above, in the order fibers
+finish; a record's seconds is the time since the shard's previous record, since fibers overlap. The strip model runs
+each fiber's decisions in batches of ``--batch`` as the per-fiber loop does (on the CPU, the same heights), or with
+``--across-fibers`` in batches of ``--batch`` decisions from any fibers (faster at a large batch; bf16 heights move by
+the batch size's rounding). ``--compile MODE`` compiles the strip model (torch.compile, with ``--across-fibers``),
+with inductor emulating eager's bf16 casts.
 """
 from __future__ import annotations
 
 import argparse
 import json
+from dataclasses import dataclass
 from pathlib import Path
 import time
 
@@ -31,9 +41,11 @@ import numpy as np
 from vc_reader import images
 import torch
 
+from vesuvius.neural_tracing.tracers.fibers.sheet_strip.batched import (
+    FiberJob, StripEngine, StripGeometry, run, stitched_strip)
 from vesuvius.neural_tracing.tracers.fibers.sheet_strip.infer import (
-    BLEND, MIN_HEAD_ARC, STEP, TRIM, StripPredictor, add_checkpoint_arguments, orient_decisions, recorded_file, stitch,
-    stitch_values, trim_ends)
+    BLEND, MIN_HEAD_ARC, STEP, TRIM, StripPredictor, add_checkpoint_arguments, recorded_file,
+    trim_ends)  # noqa: F401  trim_ends: imported from here by callers
 from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import FiberStore, fiber_volume
 from vesuvius.neural_tracing.tracers.shared.io import atomic_write
 from vesuvius.neural_tracing.tracers.sheets.tracing.inference import write_surface
@@ -50,22 +62,25 @@ def pending_fibers(catalog, chosen, completed):
     return [c for c in chosen if completed.get(catalog[c]['id']) != catalog[c]['reference']]
 
 
+# a worker reads the CT only for its fibers' seed headings (the structure tensor around each seed)
+WORKER_CT_CACHE = 1 << 28
+VOLUME_OPTIONS = ('ct', 'ct_level', 'ct_grid_scale', 'grid_scale', 'cache_dir', 'frame_checkpoint')
+
+
+def decision_arcs(fiber, step=STEP):
+    """Arclengths (trace voxels) of a fiber's decisions: every ``step`` from the first head with enough trace."""
+    return np.arange(MIN_HEAD_ARC, fiber.length+1e-9, step)
+
+
 def strip_of_fiber(predictor, fiber, step=STEP, blend=BLEND, trim=0.):
     """The stitched strip of a fiber (rows (R, Nv, 3) trace voxels, kept nodes, expected |error| per node in voxels
     or None) and its decision arclengths; nodes within ``trim`` trace voxels of the fiber's ends, or beyond them, are
     not kept."""
-    arcs = np.arange(MIN_HEAD_ARC, fiber.length+1e-9, step)
+    arcs = decision_arcs(fiber, step)
     heights, scales, frames, positions = predictor.predict(fiber, arcs)
-    oriented, oriented_frames, flipped = orient_decisions(heights, frames)
-    rows, weight, _ = stitch(oriented, oriented_frames, positions, arcs, predictor.f, predictor.v, blend)
-    f = predictor.f
-    keep = trim_ends(weight > 0, arcs[0]+f[0], f[1]-f[0], fiber.length, trim)
-    expected = None
-    if scales is not None:
-        error = np.exp(np.where(flipped[:, None, None], scales[:, :, ::-1], scales))/predictor.trace_per_patch
-        expected = stitch_values(error, arcs, predictor.f, blend)
+    grid = (predictor.f, predictor.v, predictor.trace_per_patch)
+    rows, keep, expected = stitched_strip(grid, fiber, arcs, heights, scales, frames, positions, blend, trim)
     return rows, keep, expected, arcs
-
 
 
 def display_grid(rows, keep, expected, family):
@@ -87,6 +102,119 @@ def display_grid(rows, keep, expected, family):
                   across_reversed=bool(flip_columns))
     return (*arrays, layout)
 
+
+@dataclass(frozen=True)
+class StripWriter:
+    """Writes a fiber's stitched strip under ``out`` (tifxyz, trace.json provenance, expected_error.tif) and returns
+    its index record without ``seconds``; the per-fiber loop and the batched workers both write through it."""
+    out: Path
+    checkpoint: str
+    checkpoint_step: object
+    fibers: str
+    decision_step: float
+    blend: float
+    trim: float
+    trace_per_patch: float
+    first_row: float
+    row_step: float
+    column_step: float
+    base_voxel_um: float
+    voxel_size_um: float
+
+    @classmethod
+    def of(cls, args, predictor, fibers_path):
+        f, v, tpp = predictor.f, predictor.v, predictor.trace_per_patch
+        return cls(args.out, predictor.source, predictor.ck.get('step'), str(fibers_path), args.step, args.blend,
+                   args.trim, tpp, float(f[0]), (f[1]-f[0])/tpp, (v[1]-v[0])/tpp, args.base_voxel_um,
+                   args.voxel_size_um)
+
+    def write(self, catalog_index, row, rows, keep, expected, arcs):
+        """``rows``, ``keep``, ``expected`` and ``arcs`` as ``strip_of_fiber`` returns them for catalog ``row``."""
+        tpp = self.trace_per_patch
+        fiber_id, family = row['id'], row['family']
+        out = self.out/'strips'/fiber_id[:2]/f'fiber_{fiber_id}'
+        nodes = int(keep.sum())
+        rows, keep, expected, layout = display_grid(rows, keep, expected, family)
+        provenance = dict(checkpoint=self.checkpoint, step=self.checkpoint_step, source_reference=row['reference'],
+                          fibers=self.fibers, fiber=fiber_id, family=family, decision_step=self.decision_step,
+                          blend=self.blend, trim_patch_voxels=self.trim, units='patch voxels', trace_per_patch=tpp,
+                          first_row_arc_patch_voxels=float((arcs[0]+self.first_row)/tpp), **layout)
+        along_columns = layout['fiber_along'] == 'columns'
+        steps = (self.column_step, self.row_step) if along_columns else (self.row_step, self.column_step)
+        write_surface(out, rows/tpp, keep, *steps, provenance, overwrite=True, voxel_size_um=self.voxel_size_um,
+                      mmap_layout=True)
+        record = dict(fiber=fiber_id, catalog=int(catalog_index), family=family, source_reference=row['reference'],
+                      length_mm=float(row['length'])*self.base_voxel_um/1000., decisions=len(arcs),
+                      nodes=nodes, path=str(out.relative_to(self.out)), checkpoint=self.checkpoint)
+        if expected is not None:
+            images.write_tiff(out/'expected_error.tif', np.where(keep, expected, np.nan).astype(np.float32))
+            record['expected_error_vox'] = float(np.nanmean(np.where(keep, expected, np.nan)))
+        return record
+
+
+class StoreJob(FiberJob):
+    """The fibers of a store by catalog index for ``batched.run``, written by ``writer``. Picklable for the spawned
+    workers: the store drops its handle when pickled, and each worker opens its own. ``predictor_args``: the
+    StripPredictor arguments (checkpoint, umbilicus, batch, volume options) each worker loads its geometry from."""
+
+    def __init__(self, fibers, writer, predictor_args):
+        self.fibers, self.writer, self.predictor_args = fibers, writer, predictor_args
+
+    def geometry(self):
+        checkpoint, umbilicus, batch, volume = self.predictor_args
+        # a CPU predictor for the checkpoint's configuration and CT reader; no crops or models run in a worker
+        predictor = StripPredictor(checkpoint, 'cpu', umbilicus, batch, volume, memory_cache=WORKER_CT_CACHE)
+        return StripGeometry.of(predictor)
+
+    def load(self, key):
+        fiber = self.fibers[key]
+        return fiber, decision_arcs(fiber, self.writer.decision_step)
+
+    def write(self, key, fiber, arcs, strip, raw):
+        return self.writer.write(key, self.fibers.catalog[key], *strip, arcs)
+
+    def failed(self, key, error):
+        raise error  # a seed without a usable CT orientation stops the run, as it stops the per-fiber loop
+
+
+def batched_engine(args, predictor):
+    """The StripEngine of ``--workers`` runs; SystemExit for options it cannot run."""
+    try:
+        StripGeometry.of(predictor)
+        # both models in batches of --batch, as predict runs them
+        engine = StripEngine(predictor, batch=args.batch, frame_chunk=args.batch, across_fibers=args.across_fibers,
+                             compile_mode=args.compile)
+    except ValueError as error:
+        raise SystemExit(str(error))
+    # the frame model (the only fp32 convolutions) without TF32, as on the CPU and in the measured runs
+    torch.backends.cudnn.allow_tf32 = False
+    return engine
+
+
+def run_batched(engine, job, todo, workers, append, report):
+    """The catalog indices ``todo`` through ``batched.run``, each record appended as its fiber finishes with the time
+    since the previous record as its seconds: fibers overlap, so the column sums to the shard's wall time, as the
+    per-fiber loop's does. ``report`` sees the progress every 50 fibers and at the end."""
+    if not todo:
+        return
+    writer = job.writer
+    last, reported = [time.time()], [0]
+
+    def on_record(key, record):
+        now = time.time()
+        append(record, now-last[0])
+        last[0] = now
+
+    def log(count, total, decisions, seconds):
+        # run calls this every pass of its loop; a pass may finish several fibers
+        if count > reported[0] and (count//50 > reported[0]//50 or count == total):
+            reported[0] = count
+            report(count, decisions, seconds)
+
+    run(engine, job, todo, workers=workers, blend=writer.blend, trim=writer.trim*writer.trace_per_patch,
+        on_record=on_record, log=log)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     add_checkpoint_arguments(ap)
@@ -103,7 +231,22 @@ def main(argv=None):
     ap.add_argument('--batch', type=int, default=32)
     ap.add_argument('--threads', type=int, default=2)
     ap.add_argument('--voxel-size-um', type=float, default=9.6, help='patch voxel size, for area_cm2 in meta.json')
+    ap.add_argument('--workers', type=int, default=0,
+                    help='batched mode (sheet_strip/batched.py): CPU worker processes building the geometry while this '
+                         'process runs crops and models over many fibers (default 0: fiber by fiber)')
+    ap.add_argument('--across-fibers', action='store_true',
+                    help='with --workers: strip-model batches of --batch decisions from any fibers (default: each '
+                         "fiber's own)")
+    ap.add_argument('--compile', metavar='MODE',
+                    help='with --across-fibers: torch.compile the strip model in this mode (e.g. '
+                         'max-autotune-no-cudagraphs), with inductor emulating eager precision casts')
     args = ap.parse_args(argv)
+    if args.workers < 0:
+        raise SystemExit('--workers must be 0 (fiber by fiber) or more')
+    if args.across_fibers and not args.workers:
+        raise SystemExit('--across-fibers needs --workers')
+    if args.compile and not args.across_fibers:
+        raise SystemExit('--compile needs --across-fibers (one batch shape)')
     torch.set_num_threads(args.threads)
     k, n = args.shard
     try:
@@ -111,7 +254,8 @@ def main(argv=None):
                                    gpu_chunks=args.gpu_chunks)
     except ValueError as error:
         raise SystemExit(str(error))
-    f, v, tpp = predictor.f, predictor.v, predictor.trace_per_patch
+    engine = batched_engine(args, predictor) if args.workers else None
+    f, tpp = predictor.f, predictor.trace_per_patch
     df = f[1]-f[0]
     if abs(args.step/df-round(args.step/df)) > 1e-6 or args.step <= 0:
         raise SystemExit(f'--step must be a positive multiple of the strip row spacing {df:g}')
@@ -139,41 +283,34 @@ def main(argv=None):
         min_length_mm=args.min_length_mm, base_voxel_um=args.base_voxel_um, decision_step=args.step,
         blend=args.blend, trim_patch_voxels=args.trim, shards=n, units='patch voxels', trace_per_patch=tpp),
         indent=1)+'\n').encode())
-    row_step, column_step = df/tpp, (v[1]-v[0])/tpp
+    writer = StripWriter.of(args, predictor, fibers_path)
     started, decisions = time.time(), 0
     todo = pending_fibers(fibers.catalog, chosen, done)
     print(f'[shard {k}/{n}] {len(chosen)} fibers, {len(chosen)-len(todo)} done already', flush=True)
     with open(log_path, 'a') as log:
+        def append(record, seconds):
+            log.write(json.dumps(dict(record, seconds=round(seconds, 2)))+'\n')
+            log.flush()
+
+        def report(count, decisions, seconds):
+            print(f'[shard {k}/{n}] {count}/{len(todo)} fibers, {decisions} decisions, '
+                  f'{decisions/max(seconds, 1e-9):.1f} decisions/s', flush=True)
+
+        if engine is not None:
+            volume = argparse.Namespace(**{key: getattr(args, key) for key in VOLUME_OPTIONS})
+            volume.cache_dir = predictor.spec.cache_dir  # as resolved here, so workers neither resolve nor announce it
+            job = StoreJob(fibers, writer, (args.checkpoint, args.umbilicus, args.batch, volume))
+            run_batched(engine, job, todo, args.workers, append, report)
+            return
         for count, catalog_index in enumerate(todo, 1):
             tick = time.time()
-            row = fibers.catalog[catalog_index]
-            fiber_id, family, length = row['id'], row['family'], row['length']
-            fiber = fibers[catalog_index]
-            rows, keep, expected, arcs = strip_of_fiber(predictor, fiber, args.step, args.blend, args.trim*tpp)
-            out = args.out/'strips'/fiber_id[:2]/f'fiber_{fiber_id}'
-            nodes = int(keep.sum())
-            rows, keep, expected, layout = display_grid(rows, keep, expected, family)
-            provenance = dict(checkpoint=checkpoint, step=predictor.ck.get('step'), source_reference=row['reference'],
-                              fibers=str(fibers_path), fiber=fiber_id, family=family, decision_step=args.step,
-                              blend=args.blend, trim_patch_voxels=args.trim, units='patch voxels', trace_per_patch=tpp,
-                              first_row_arc_patch_voxels=float((arcs[0]+f[0])/tpp), **layout)
-            steps = (column_step, row_step) if layout['fiber_along'] == 'columns' else (row_step, column_step)
-            write_surface(out, rows/tpp, keep, *steps, provenance, overwrite=True, voxel_size_um=args.voxel_size_um,
-                          mmap_layout=True)
-            record = dict(fiber=fiber_id, catalog=int(catalog_index), family=family, source_reference=row['reference'],
-                          length_mm=float(length)*args.base_voxel_um/1000., decisions=len(arcs),
-                          nodes=nodes, path=str(out.relative_to(args.out)), checkpoint=checkpoint)
-            if expected is not None:
-                images.write_tiff(out/'expected_error.tif', np.where(keep, expected, np.nan).astype(np.float32))
-                record['expected_error_vox'] = float(np.nanmean(np.where(keep, expected, np.nan)))
-            record['seconds'] = round(time.time()-tick, 2)
-            log.write(json.dumps(record)+'\n')
-            log.flush()
+            rows, keep, expected, arcs = strip_of_fiber(predictor, fibers[catalog_index], args.step, args.blend,
+                                                        args.trim*tpp)
+            append(writer.write(catalog_index, fibers.catalog[catalog_index], rows, keep, expected, arcs),
+                   time.time()-tick)
             decisions += len(arcs)
             if count % 50 == 0 or count == len(todo):
-                rate = decisions/(time.time()-started)
-                print(f'[shard {k}/{n}] {count}/{len(todo)} fibers, {decisions} decisions, {rate:.1f} decisions/s',
-                      flush=True)
+                report(count, decisions, time.time()-started)
 
 
 if __name__ == '__main__':
