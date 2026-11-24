@@ -1,5 +1,6 @@
 """Differentiable CUDA uint8 3D grid_sample with gradients w.r.t. sample positions."""
 
+import importlib
 from pathlib import Path
 
 import torch
@@ -61,9 +62,19 @@ def grid_sample_3d_u8_diff(
     Returns:
         (C, D, H, W) float32 CUDA — raw interpolated values (not decoded)
     """
+    if volume.device.type == "mps":
+        # Metal kernels, or torch ops under LASAGNA_METAL=0 (F.grid_sample has no 3D backward on MPS).
+        return _ops().mps_dense_backend()[0].grid_sample_3d_u8_diff(volume, grid, offset, inv_scale)
     if volume.device.type != "cuda":
         return _grid_sample_3d_u8_diff_cpu(volume, grid, offset, inv_scale)
     return _GridSample3DU8Diff.apply(volume, grid, offset, inv_scale)
+
+
+def _ops():
+    """grid_sample_3d_u8_ops (the dense torch ops and the MPS backend choice), imported by name: fit_data
+    executes this file afresh on every call, and one module keeps one backend choice and one compiled Metal
+    library per process."""
+    return importlib.import_module("grid_sample_3d_u8_ops")
 
 
 def _grid_sample_3d_u8_diff_cpu(
