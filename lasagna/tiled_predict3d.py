@@ -56,8 +56,8 @@ DEFAULT_PREFETCH_TILES_PER_GPU = 4
 DEFAULT_INPUT_CACHE_BYTES = 4 << 30
 DEFAULT_INPUT_IO_THREADS = 16
 DEFAULT_ACCUMULATOR_WORKERS = min(32, max(1, os.cpu_count() or 1))
-DEFAULT_OME_COMPRESSOR = "blosc-zstd"
-OME_COMPRESSOR_CHOICES = (DEFAULT_OME_COMPRESSOR, "vc-delta3d", "none")
+DEFAULT_OME_COMPRESSOR = "vc-delta3d"
+OME_COMPRESSOR_CHOICES = (DEFAULT_OME_COMPRESSOR, "blosc-zstd", "none")
 _BLOSC_ZSTD_CONFIG = {
 	"id": "blosc",
 	"cname": "zstd",
@@ -1346,7 +1346,7 @@ def _omezarr_level_shape(
 def omezarr_compressor_config(name: str, ndim: int = 3) -> dict[str, Any] | None:
 	"""Return the exact Zarr-v2 compressor metadata for a public CLI choice, for ZYX or (``ndim`` 4) CZYX arrays."""
 	value = str(name).strip().lower()
-	if value == DEFAULT_OME_COMPRESSOR:
+	if value == "blosc-zstd":
 		return dict(_BLOSC_ZSTD_CONFIG)
 	if value == "vc-delta3d":
 		return {"id": value, "quant": 1, **({"channel_axis": "first"} if ndim == 4 else {})}

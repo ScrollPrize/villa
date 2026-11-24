@@ -344,12 +344,13 @@ runner:
 lasagna-preprocess predict3d ... --devices all
 ```
 
-New Fiber and Lasagna `predict3d` OME-Zarr arrays use the same Zarr-v2
-Blosc/Zstd compressor (`clevel=3`, byte shuffle) at every pyramid level.
-Existing arrays keep their compressor when inference resumes; a mismatch is
-reported. `--ome-compressor vc-delta3d` stores uint8 output losslessly with
-Delta3D instead: smaller, but slower to write and read, and float32 channels
-are rejected. Use `--ome-compressor none` only when uncompressed compatibility
+New Fiber and Lasagna `predict3d` OME-Zarr arrays use lossless Delta3D
+(`vc-delta3d`, its `fast` preset) at every pyramid level. It is smaller but
+slower to write and read than `--ome-compressor blosc-zstd` (`clevel=3`, byte
+shuffle). Float32 arrays (Fiber `--no-width-uint8-base`) need `blosc-zstd`.
+Existing unpacked arrays keep their compressor when inference resumes and a
+mismatch is reported; a packed output resumes only with the compressor it was
+created with. Use `--ome-compressor none` only when uncompressed compatibility
 output is required.
 
 Use a subset with `--devices cuda:0,cuda:2`. Input tiles are read in the

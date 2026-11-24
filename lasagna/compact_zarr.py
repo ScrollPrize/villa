@@ -54,7 +54,8 @@ def _create_array(group, name, shape, chunks, dtype, codec):
             raise ValueError(f"existing packed array has incompatible layout: {group.path}/{name}")
         if (array.filters or array.compressor != codec
                 or array.meta.separator != "/" or array.fill_value != 0):
-            raise ValueError(f"existing packed array has incompatible encoding: {group.path}/{name}")
+            raise ValueError(f"existing packed array has incompatible encoding: {group.path}/{name} "
+                             f"(compressor {array.compressor}, requested {codec})")
         return
     from lasagna.tiled_predict3d import _writer_codec
     group.create_array(name, shape=shape, chunks=chunks, dtype=dtype, separator="/", **_writer_codec(codec))

@@ -2667,9 +2667,8 @@
   remain outside `artifacts/`.
 - Lasagna manifests preserve a relative `provenance` reference and unknown
   forward-compatible top-level fields across load/save.
-- Newly created Fiber and Lasagna inference OME-Zarr arrays use the shared
-  exact Zarr-v2 compressor `{id: blosc, cname: zstd, clevel: 3, shuffle: 1,
-  blocksize: 0}` at every generated level. Both direct CLIs expose the same
+- Newly created Fiber and Lasagna inference OME-Zarr arrays use lossless
+  `vc-delta3d` (`quant: 1`, its `fast` preset) at every generated level. Both direct CLIs expose the same
   `--ome-compressor` compatibility override. Resume never rewrites an existing
   array's codec; requested/actual mismatches are reported, while provenance
   inventories the codec actually persisted per level.

@@ -10,6 +10,7 @@ import subprocess
 import time
 from typing import Any
 
+import numpy as np
 import torch
 import vc_reader
 
@@ -533,6 +534,8 @@ def run_fiber_trace_3d_inference(
         emit_width="width" in annotation_heads,
         emit_normals="normal" in annotation_heads,
     )
+    if ome_compressor == "vc-delta3d" and any(np.dtype(p.dtype) != np.uint8 for p in predict_adapter.output_products):
+        raise ValueError("vc-delta3d stores uint8 output only; float32 widths need --ome-compressor blosc-zstd")
     if output_format == "compact":
         from lasagna.lasagna_volume import VALIDITY_BY_CHUNKS
         products = predict_adapter.output_products
