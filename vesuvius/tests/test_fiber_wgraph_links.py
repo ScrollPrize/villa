@@ -95,7 +95,7 @@ def test_project_arc_finds_nearest_segment_and_distance():
 
 def test_winding_settings_validation():
     default=winding_settings({})
-    assert default['optimizer']=='irls' and default['weights']==dict(parallel=1.,perpendicular=1.,enclosure=0.,manual=0.)
+    assert default['optimizer']=='irls' and default['weights']==dict(parallel=1.,perpendicular=1.,enclosure=0.,sign=0.,manual=0.)
     assert default['manual_links'] is None and default['automatic']
     with pytest.raises(ValueError,match='replaced by weights.perpendicular'):
         winding_settings(dict(perpendicular_relative_weight=2.))

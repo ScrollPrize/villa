@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 
 from vesuvius.neural_tracing.fiber_trace_3d.fiber_wgraph_geometry import (
-    _contract_fixed_groups, fixed_object_groups, fixed_object_settings,
+    _contract_fixed_groups, aggregate_arcs, arc_residual, fixed_object_groups, fixed_object_settings,
 )
 
 
@@ -36,7 +36,8 @@ def test_arcs_move_to_the_root_and_internal_ones_are_dropped(tmp_path):
     settings = dict(fixed_object=windings(tmp_path, ['a', 'b'], [10, 12], [0, 0]))
     root, offset, report = fixed_object_groups(settings, ids)
     merged = dict(a=np.array([0, 1, 0, 1], np.int64), b=np.array([1, 2, 2, 0], np.int64),
-                  target=np.array([2, 1, 4, -3], np.int64), weight=np.array([1., 2., 3., 4.]))
+                  target=np.array([2, 1, 4, -3], np.int64), weight=np.array([1., 2., 3., 4.]),
+                  side=np.zeros(4, np.int64))
     out = _contract_fixed_groups(merged, root, offset, report)
     # The a-b arcs are internal: the group already fixes that relation, and
     # one of them disagrees with it by one turn.
@@ -77,3 +78,23 @@ def test_classification_modes_are_validated():
         # solves no signs needs the tags alone.
         winding_settings(dict(weights=dict(parallel=0, perpendicular=0, enclosure=0, manual=1),
                               classification='run+record', normal_sign='none'))
+
+
+def test_one_sided_constraints_keep_their_side_through_contraction_and_aggregation(tmp_path):
+    ids = ['a', 'b', 'c']
+    settings = dict(fixed_object=windings(tmp_path, ['a', 'b'], [10, 12], [0, 0]))
+    root, offset, report = fixed_object_groups(settings, ids)
+    # b -> c at least 1; a -> c at most 4 (twice); a -> b at least 3 is internal and broken by one turn.
+    merged = dict(a=np.array([1, 0, 0, 0], np.int64), b=np.array([2, 2, 2, 1], np.int64),
+                  target=np.array([1, 4, 4, 3], np.int64), weight=np.array([2., 3., 5., 7.]),
+                  side=np.array([1, -1, -1, 1], np.int64))
+    out = _contract_fixed_groups(merged, root, offset, report)
+    assert report['internal_arcs'] == 1 and report['internal_disagreement_turns'] == 1.
+    g = aggregate_arcs(out['a'], out['b'], out['target'], out['weight'], out['side'])
+    assert list(zip(g['a'], g['b'], g['side'], g['target'], g['weight'])) == [(0, 2, -1, 4, 8.), (0, 2, 1, 3, 2.)]
+    # Stated against node order a one-sided constraint is turned round; an equation only changes sign.
+    g = aggregate_arcs([2, 2], [0, 0], [-3, 5], [1., 1.], [1, 0])
+    assert list(zip(g['a'], g['b'], g['side'], g['target'])) == [(0, 2, -1, 3), (0, 2, 0, -5)]
+    # Cost per unit weight: an equation both ways, a one-sided constraint only on its wrong side.
+    step = np.array([2., 2., 2., 5., 5.]); target = np.array([4., 4., 4., 4., 4.]); side = np.array([0, 1, -1, 1, -1])
+    assert list(arc_residual(step, target, side)) == [2., 2., 0., 0., 1.]

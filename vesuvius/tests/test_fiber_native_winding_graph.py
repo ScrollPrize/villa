@@ -164,6 +164,42 @@ def test_native_enclosure_relations_match_python_reference(workers):
             data.valid_a,data.valid_b,data.valid_connector,parallel_weight=0.,perpendicular_weight=0.)
 
 
+@pytest.mark.parametrize('workers',[1,4])
+def test_native_sign_constraints_state_each_signed_crossing_one_sided(workers):
+    """Every signed perpendicular crossing bounds its pair's H->V step from one side: the same bound
+    an enclosure needs from both, stated in node order with a side."""
+    paths,native,data,mapping,family,signs=fixture()
+    d=filtered_events(data,mapping,family,signs);paths.data=d
+    a,ta=paths.ends('a');b,tb=paths.ends('b');connector=paths.seam.segments(a,b)
+    expected={}
+    for e,(i,j) in enumerate(zip(d['i'],d['j'])):
+        if d['parallel'][e] or d['family'][i]==d['family'][j] or not d['sign'][e]:continue
+        forward=d['family'][i]==0
+        h,v=(int(i),int(j)) if forward else (int(j),int(i))
+        sign=int(d['sign'][e])*(1 if forward else -1)
+        shift=int(connector[e]-tb[e]+ta[e])*(1 if forward else -1)
+        bound=shift if sign>0 else shift-1
+        key=(h,v,sign,bound) if h<v else (v,h,-sign,-bound)
+        expected[key]=expected.get(key,0.)+3.
+    arguments=(data.i,data.j,mapping,family,signs,data.arc_a,data.arc_b,data.distance,data.parallel,
+               data.normal_a,data.normal_b,data.connector,data.valid_a,data.valid_b,data.valid_connector)
+    actual=native.prepare_winding_graph(*arguments,workers=workers,constraint_batch=97,read_batch=19,sign_weight=3.)
+    got={(int(x),int(y),int(side),int(t)):float(w) for x,y,side,t,w in
+         zip(actual['sign_a'],actual['sign_b'],actual['sign_side'],actual['sign_target'],actual['sign_weight'])}
+    assert got==pytest.approx(expected) and len(expected)>0
+    assert actual['sign_constraints']==sum(round(w/3.) for w in expected.values())
+    assert all(x<y for x,y,_,_ in got)
+    # The equations are unchanged by asking for sign constraints, and sign constraints alone are a valid request.
+    plain=native.prepare_winding_graph(*arguments,workers=workers,constraint_batch=97,read_batch=19)
+    for name in ('a','b','target','weight'):np.testing.assert_array_equal(actual[name],plain[name])
+    assert 'sign_a' not in plain
+    only=native.prepare_winding_graph(*arguments,workers=workers,parallel_weight=0.,perpendicular_weight=0.,sign_weight=1.)
+    assert len(only['a'])==0 and len(only['sign_a'])==len(expected)
+    # The evidence of the crossing scales its sign constraint like its equation.
+    weighted=native.prepare_winding_graph(*arguments,workers=workers,sign_weight=3.,dot_weight_power=2.,damp_by_winding_distance=True)
+    assert 0<float(np.sum(weighted['sign_weight']))<float(np.sum(actual['sign_weight']))
+
+
 def test_native_enclosure_accepts_exact_pair_with_one_turn_apart_witnesses():
     """One outward and one inward witness whose anchors coincide one turn apart give an exact H->V step."""
     from vesuvius.neural_tracing.fiber_trace_3d.fiber_enclosure_graph import extract_relations

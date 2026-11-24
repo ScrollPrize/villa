@@ -442,6 +442,18 @@ std::vector<ScaffoldConstraint> scaffoldMeasuredConstraints(const ScaffoldGraph&
         constraints.push_back(constraint);
     };
 
+    geometry::WindingConstraintOptions shared;
+    shared.windingScale = options.windingScale;
+    shared.perpendicularOffset = options.perpendicularOffset;
+    shared.perpendicularWeight = options.perpendicularWeight;
+    shared.parallelWeight = options.parallelWeight;
+    shared.signWeight = options.signWeight;
+    shared.enclosures = options.enclosures && options.enclosureWeight > 0;
+    // The crossing's evidence, exactly as the sign stage weights it.
+    shared.dotWeightPower = options.crossingConfidence ? options.confidence.dotWeightPower : 0.;
+    shared.dampByWindingDistance =
+        options.crossingConfidence && options.confidence.distanceWeight == fiber_tracer::FiberSignDistanceWeight::InverseSquare;
+
     for (std::size_t index = 0; index < events.size(); ++index) {
         const auto& event = events[index];
         if (event.a == event.b) { ++report.skippedSelf; continue; }
@@ -464,37 +476,23 @@ std::vector<ScaffoldConstraint> scaffoldMeasuredConstraints(const ScaffoldGraph&
         input.signB = normalSign[std::size_t(event.b)] * fallingSign;
         input.arcA = event.arcA;
         input.arcB = event.arcB;
-        input.distance = event.distance * options.windingScale;
+        input.distance = event.distance;
         input.parallel = event.parallel;
         input.connector = {event.pointB[0] - event.pointA[0], event.pointB[1] - event.pointA[1],
                            event.pointB[2] - event.pointA[2]};
         input.normalA = event.normalA;
         input.normalB = event.normalB;
-        const double confidence = options.crossingConfidence
-            ? fiber_tracer::fiberSignEventWeight((event.normalA[0] * event.normalB[0] + event.normalA[1] * event.normalB[1]) +
-                                                     event.normalA[2] * event.normalB[2],
-                                                 input.distance, options.confidence)
-            : 1.;
-        input.weight = (event.parallel ? options.parallelWeight : options.perpendicularWeight) * confidence;
-        const bool enclosures = options.enclosures && options.enclosureWeight > 0;
-        input.enclosure = enclosures || options.signWeight > 0;
-        input.perpendicularOffset = options.perpendicularOffset;
-
-        const auto relation = geometry::windingEventRelation(geometry.packed(), input);
+        // The same per-crossing constraints the traced volume's winding stage
+        // builds (vc_object_store geometry/FiberWindingGraph.hpp).
+        const auto built = geometry::windingEventConstraints(geometry.packed(), input, shared);
+        const auto& relation = built.relation;
         if (relation.withoutDistance) ++report.withoutDistance;
-        if (relation.hasEnclosure && enclosures)
+        if (relation.hasEnclosure && shared.enclosures)
             bounds.push_back({relation.enclosure, std::int64_t(index), relation.transport});
-        // The local sign this crossing states on its own: the H -> V step is at
-        // least (the V fiber outside) or at most its bound, stated in node order.
-        if (relation.hasEnclosure && options.signWeight > 0) {
-            const auto& bound = relation.enclosure;
-            const bool ordered = bound.h < bound.v;
-            const int side = ordered ? bound.sign : -bound.sign;
-            const geometry::winding_graph_detail::Arc arc{ordered ? bound.h : bound.v, ordered ? bound.v : bound.h,
-                                                          ordered ? bound.bound : -bound.bound,
-                                                          options.signWeight * confidence};
+        if (built.hasSign) {
+            const geometry::winding_graph_detail::Arc arc{built.sign.a, built.sign.b, built.sign.target, built.sign.weight};
             append(arc, event, std::int64_t(index), relation.transport,
-                   side > 0 ? ScaffoldConstraintKind::SignAtLeast : ScaffoldConstraintKind::SignAtMost);
+                   built.sign.side > 0 ? ScaffoldConstraintKind::SignAtLeast : ScaffoldConstraintKind::SignAtMost);
             ++report.signConstraints;
         }
         if (!relation.usable) continue;
@@ -504,7 +502,7 @@ std::vector<ScaffoldConstraint> scaffoldMeasuredConstraints(const ScaffoldGraph&
             // The nearer integer with the event's whole weight.
             auto nearer = relation.hasUpper && relation.upper.weight > relation.lower.weight ? relation.upper
                                                                                             : relation.lower;
-            nearer.weight = input.weight;
+            nearer.weight = built.weight;
             append(nearer, event, std::int64_t(index), relation.transport, kind);
             ++report.expanded;
         } else {
@@ -519,47 +517,23 @@ std::vector<ScaffoldConstraint> scaffoldMeasuredConstraints(const ScaffoldGraph&
         if (event.parallel) ++report.parallel; else ++report.perpendicular;
     }
 
-    // Exact enclosure relations: a pair is accepted when its largest lower
-    // bound equals its smallest upper bound. Rejections are counted, never
-    // turned into a weaker arc.
-    std::stable_sort(bounds.begin(), bounds.end(), [](const Bound& x, const Bound& y) {
-        if (x.bound.h != y.bound.h) return x.bound.h < y.bound.h;
-        if (x.bound.v != y.bound.v) return x.bound.v < y.bound.v;
-        if (x.bound.sign != y.bound.sign) return x.bound.sign < y.bound.sign;
-        return x.bound.bound < y.bound.bound;
-    });
-    for (std::size_t i = 0; i < bounds.size();) {
-        std::size_t j = i;
-        bool lowerSeen = false, upperSeen = false;
-        std::int64_t lower = 0, upper = 0;
-        std::size_t witness = i;
-        for (; j < bounds.size() && bounds[j].bound.h == bounds[i].bound.h && bounds[j].bound.v == bounds[i].bound.v; ++j) {
-            if (bounds[j].bound.sign > 0) {
-                if (!lowerSeen || bounds[j].bound.bound > lower) { lower = bounds[j].bound.bound; witness = j; }
-                lowerSeen = true;
-            } else {
-                upper = upperSeen ? std::min(upper, bounds[j].bound.bound) : bounds[j].bound.bound;
-                upperSeen = true;
-            }
-        }
-        ++report.enclosurePairs;
-        if (!lowerSeen || !upperSeen) ++report.enclosureOneSided;
-        else if (lower > upper) ++report.enclosureContradictory;
-        else if (lower < upper) ++report.enclosureNonunique;
-        else {
+    // Exact enclosure relations, accepted by the shared rule. An accepted
+    // pair keeps the anchors of the crossing that set its lower bound.
+    const auto counts = geometry::acceptWindingEnclosures(
+        bounds, [](const Bound& entry) { return entry.bound; }, [&](std::int64_t step, std::size_t witness) {
             const auto& chosen = bounds[witness];
-            const auto& event = events[std::size_t(chosen.event)];
             const auto h = chosen.bound.h, v = chosen.bound.v;
-            // The accepted step is stated H -> V; the constraint is stated in
-            // node order.
+            // The accepted step is stated H -> V; the constraint in node order.
             const bool ordered = h < v;
-            geometry::winding_graph_detail::Arc arc{ordered ? h : v, ordered ? v : h, ordered ? lower : -lower,
-                                                    options.enclosureWeight};
-            append(arc, event, chosen.event, chosen.transport, ScaffoldConstraintKind::Enclosure);
-            ++report.enclosureArcs;
-        }
-        i = j;
-    }
+            const geometry::winding_graph_detail::Arc arc{ordered ? h : v, ordered ? v : h, ordered ? step : -step,
+                                                          options.enclosureWeight};
+            append(arc, events[std::size_t(chosen.event)], chosen.event, chosen.transport, ScaffoldConstraintKind::Enclosure);
+        });
+    report.enclosurePairs += std::int64_t(counts.pairs);
+    report.enclosureOneSided += std::int64_t(counts.oneSided);
+    report.enclosureContradictory += std::int64_t(counts.contradictory);
+    report.enclosureNonunique += std::int64_t(counts.nonunique);
+    report.enclosureArcs += std::int64_t(counts.accepted);
     return constraints;
 }
 

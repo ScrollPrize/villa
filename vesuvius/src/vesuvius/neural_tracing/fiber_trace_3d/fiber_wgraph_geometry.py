@@ -11,8 +11,8 @@ import time
 
 import numpy as np
 
-WEIGHT_TYPES=('parallel','perpendicular','enclosure','manual')
-DEFAULT_WEIGHTS=dict(parallel=1.,perpendicular=1.,enclosure=0.,manual=0.)
+WEIGHT_TYPES=('parallel','perpendicular','enclosure','sign','manual')
+DEFAULT_WEIGHTS=dict(parallel=1.,perpendicular=1.,enclosure=0.,sign=0.,manual=0.)
 LEMON_BACKENDS=('network_simplex','cost_scaling')
 
 
@@ -51,9 +51,9 @@ def winding_settings(config):
         raise ValueError('classification must be run, record or run+record')
     if record_family not in ('any','manual','automatic'):raise ValueError('record_family must be any, manual or automatic')
     if normal_sign not in ('run','none'):raise ValueError('normal_sign must be run or none')
-    automatic=any(weights[name]>0 for name in ('parallel','perpendicular','enclosure'))
+    automatic=any(weights[name]>0 for name in ('parallel','perpendicular','enclosure','sign'))
     if normal_sign=='none' and automatic:
-        raise ValueError('normal_sign none requires zero parallel, perpendicular and enclosure weights (manual links only)')
+        raise ValueError('normal_sign none requires zero parallel, perpendicular, enclosure and sign weights (manual links only)')
     if normal_sign=='none' and classification!='record':
         raise ValueError('normal_sign none needs classification record; there is no run to pin')
     if not automatic and weights['manual']<=0:raise ValueError('All constraint weights are zero')
@@ -307,12 +307,12 @@ def _contract_fixed_groups(merged,root,offset,report):
     fixes: it is dropped and counted, with the turns it disagrees by, so a
     scaffold that contradicts the constraints cannot hide.
     """
-    a=merged['a'];b=merged['b'];target=merged['target'];weight=merged['weight']
+    a=merged['a'];b=merged['b'];target=merged['target'];weight=merged['weight'];side=merged['side']
     rootA=root[a];rootB=root[b]
     inA=rootA>=0;inB=rootB>=0
     internal=inA&inB&(rootA==rootB)
     if internal.any():
-        residual=np.abs(target[internal]-(offset[b[internal]]-offset[a[internal]]))
+        residual=arc_residual(offset[b[internal]]-offset[a[internal]],target[internal],side[internal])
         report.update(internal_arcs=int(internal.sum()),
                       internal_weight=float(weight[internal].sum()),
                       internal_disagreeing_arcs=int((residual>0).sum()),
@@ -320,7 +320,7 @@ def _contract_fixed_groups(merged,root,offset,report):
     else:
         report.update(internal_arcs=0,internal_weight=0.,internal_disagreeing_arcs=0,internal_disagreement_turns=0.)
     keep=~internal
-    a=a[keep];b=b[keep];target=target[keep];weight=weight[keep]
+    a=a[keep];b=b[keep];target=target[keep];weight=weight[keep];side=side[keep]
     rootA=root[a];rootB=root[b]
     # k_member = k_root + offset, so an arc that leaves the group takes the
     # member's offset into its target.
@@ -328,14 +328,42 @@ def _contract_fixed_groups(merged,root,offset,report):
     target=target+np.where(movedA,offset[a],0)-np.where(movedB,offset[b],0)
     a=np.where(movedA,rootA,a);b=np.where(movedB,rootB,b)
     report.update(rewritten_arcs=int((movedA|movedB).sum()),remaining_arcs=int(len(a)))
-    return dict(a=a,b=b,target=target,weight=weight)
+    return dict(a=a,b=b,target=target,weight=weight,side=side)
+
+
+def arc_residual(step,target,side):
+    """What a constraint costs per unit weight: |step - target| for an equation (side 0); for a
+    one-sided sign constraint only the part on the wrong side (step at least the target for side +1,
+    at most it for side -1)."""
+    difference=np.asarray(step,float)-np.asarray(target,float)
+    return np.where(side==0,np.abs(difference),np.maximum(-np.asarray(side,float)*difference,0.))
+
+
+def aggregate_arcs(a,b,target,weight,side):
+    """Sum identical constraints in node order (a < b): equations by (a, b, target), one-sided ones by
+    (a, b, side, target). A one-sided constraint stated against node order is turned round."""
+    a,b,target,weight,side=(np.asarray(x) for x in (a,b,target,weight,side))
+    swap=a>b
+    a,b=np.minimum(a,b),np.maximum(a,b);target=np.where(swap,-target,target);side=np.where(swap,-side,side)
+    if not len(a):return dict(a=a,b=b,target=target,weight=weight,side=side)
+    order=np.lexsort((target,side,b,a));a=a[order];b=b[order];target=target[order];side=side[order]
+    starts=np.r_[0,np.flatnonzero((np.diff(a)!=0)|(np.diff(b)!=0)|(np.diff(side)!=0)|(np.diff(target)!=0))+1]
+    return dict(a=a[starts],b=b[starts],target=target[starts],side=side[starts],
+                weight=np.add.reduceat(np.asarray(weight,dtype=np.float64)[order],starts))
 
 
 def _assemble_arcs(config,settings,graph,paths,ids,family,normal_sign):
-    """Automatic, enclosure and manual arcs with their type weights, aggregated."""
+    """Automatic, enclosure, sign and manual constraints with their type weights, aggregated.
+
+    Every constraint is (a, b, target, weight, side) in node order: side 0 states the step b - a
+    equals the target, +1 that it is at least the target, -1 at most (the one-sided sign
+    constraints)."""
     from .fiber_packed_priors import _geometry
-    from .fiber_min_flow import aggregate_l1_edges
     weights=settings['weights'];parts=[];counts={}
+    def part(a,b,target,weight,side=None):
+        a=np.asarray(a,np.int64)
+        parts.append(dict(a=a,b=np.asarray(b,np.int64),target=np.asarray(target,np.int64),weight=np.asarray(weight,np.float64),
+                          side=np.zeros(len(a),np.int64) if side is None else np.asarray(side,np.int64)))
     if settings['automatic']:
         g=_geometry(paths).prepare_winding_graph(
             graph.i,graph.j,np.ascontiguousarray(paths.graph_index,dtype=np.int64),family,normal_sign,
@@ -346,18 +374,19 @@ def _assemble_arcs(config,settings,graph,paths,ids,family,normal_sign):
             parallel_weight=weights['parallel'],perpendicular_weight=weights['perpendicular'],
             dot_weight_power=settings['dot_weight_power'],
             damp_by_winding_distance=settings['winding_distance_weight']=='inverse_square',
-            enclosures=weights['enclosure']>0,
+            sign_weight=weights['sign'],enclosures=weights['enclosure']>0,
             constraint_batch=int(config.get('constraint_batch',500000)),
             read_batch=int(config.get('read_batch',32768)),
             workers=int(config.get('workers',32)))
         counts['automatic']=dict(read=int(g['read']),used=int(g['used']),expanded=int(g['expanded']),arcs=len(g['a']),
                                  without_distance=int(g.get('without_distance',0)))
-        parts.append(dict(a=g['a'],b=g['b'],target=g['target'],weight=g['weight']))
+        part(g['a'],g['b'],g['target'],g['weight'])
+        if weights['sign']>0:
+            part(g['sign_a'],g['sign_b'],g['sign_target'],g['sign_weight'],g['sign_side'])
+            counts['sign']=dict(constraints=int(g['sign_constraints']),arcs=len(g['sign_a']))
         if weights['enclosure']>0:
-            h=np.asarray(g['enclosure_a'],np.int64);v=np.asarray(g['enclosure_b'],np.int64);t=np.asarray(g['enclosure_target'],np.int64)
-            swap=h>v
-            parts.append(dict(a=np.where(swap,v,h),b=np.where(swap,h,v),target=np.where(swap,-t,t),
-                              weight=np.full(len(h),weights['enclosure'])))
+            h=np.asarray(g['enclosure_a'],np.int64)
+            part(h,g['enclosure_b'],g['enclosure_target'],np.full(len(h),weights['enclosure']))
             counts['enclosure']={k:int(v) for k,v in g['enclosure_counts'].items()}
     if weights['manual']>0:
         from .fiber_wgraph_links import read_links,manual_link_arcs
@@ -365,20 +394,17 @@ def _assemble_arcs(config,settings,graph,paths,ids,family,normal_sign):
         if base is None:raise ValueError('Manual links need the resolved geometry store')
         links,report=manual_link_arcs(read_links(base),ids,family,paths,settings['manual_links'])
         counts['manual']=report
-        parts.append(dict(links,weight=links['weight']*weights['manual']))
-    merged={key:np.concatenate([np.asarray(part[key]) for part in parts]) for key in ('a','b','target','weight')}
+        part(links['a'],links['b'],links['target'],links['weight']*weights['manual'])
+    merged={key:np.concatenate([entry[key] for entry in parts]) for key in ('a','b','target','weight','side')}
     positive=merged['weight']>0
     merged={key:value[positive] for key,value in merged.items()}
     if not len(merged['a']):raise ValueError('No usable winding constraints')
     root,offset,fixed_report=fixed_object_groups(settings,ids)
     if fixed_report is not None:counts['fixed_object']=fixed_report
     if root is not None:
-        merged={key:np.asarray(value) for key,value in merged.items()}
-        merged['a']=merged['a'].astype(np.int64);merged['b']=merged['b'].astype(np.int64)
-        merged['target']=merged['target'].astype(np.int64)
         merged=_contract_fixed_groups(merged,root,offset,fixed_report)
         if not len(merged['a']):raise ValueError('No winding constraints left outside the fixed groups')
-    g=aggregate_l1_edges(merged['a'].astype(np.int64),merged['b'].astype(np.int64),merged['target'].astype(np.int64),merged['weight'])
+    g=aggregate_arcs(merged['a'],merged['b'],merged['target'],merged['weight'],merged['side'])
     return g,counts,(root,offset)
 
 
@@ -438,20 +464,27 @@ def _solve_winding_direct(config):
         if not winding_min_cost_flow_available():raise RuntimeError('vc_object_store was built without LEMON (VC_OBJECT_STORE_WITH_LEMON)')
         print(json.dumps(dict(stage='lemon_solve_started',backend=settings['lemon']['backend'],nodes=n,arcs=len(g['a']))),flush=True)
         flow=solve_winding_min_cost_flow(n,g['a'],g['b'],g['target'],g['weight'],
-            backend=settings['lemon']['backend'],capacity_scale=settings['lemon']['capacity_scale'])
+            backend=settings['lemon']['backend'],capacity_scale=settings['lemon']['capacity_scale'],
+            side=g['side'] if g['side'].any() else None)
         labels=np.asarray(flow['winding'],np.int64);x=labels.astype(float)
-        residual=np.abs(labels[g['b']]-labels[g['a']]-g['target']).astype(float)
+        residual=arc_residual(labels[g['b']]-labels[g['a']],g['target'],g['side'])
         counts['quantization']=dict(flow['quantization']);counts['lemon']=dict(flow['timing'],objective=float(flow['objective']))
         method='lemon_'+settings['lemon']['backend']
     else:
         import torch
         from .fiber_linear_irls import solve_l1,round_components
         torch.set_num_threads(config.get('torch_threads',4))
-        x,residual=solve_l1(n,g['a'],g['b'],g['target'],g['weight'],np.zeros(n),
+        # The solver states a one-sided constraint as "step at least the target": an at-most one is
+        # the same constraint read from b to a.
+        most=g['side']<0
+        x,_=solve_l1(n,np.where(most,g['b'],g['a']),np.where(most,g['a'],g['b']),np.where(most,-g['target'],g['target']),
+            g['weight'],np.zeros(n),
             config.get('prior_weight',1e-6),dev='cuda',irls=config.get('irls',15),
-            cg_iters=config.get('cg',500),eps=config.get('eps',.05),log=lambda x:print(x,flush=True))
+            cg_iters=config.get('cg',500),eps=config.get('eps',.05),log=lambda x:print(x,flush=True),
+            ineq=g['side']!=0 if g['side'].any() else None)
         if not np.isfinite(x).all():raise RuntimeError('IRLS returned nonfinite winding potentials')
         labels=round_components(x,component)
+        residual=arc_residual(x[g['b']]-x[g['a']],g['target'],g['side'])
         method='linear_irls'
     if fixed_root is not None:
         # The group moved as one: its members sit where their root does, each
@@ -463,9 +496,9 @@ def _solve_winding_direct(config):
         labels[members]=labels[fixed_root[members]]+fixed_offset[members]
         x[members]=x[fixed_root[members]]+fixed_offset[members]
         component[members]=component[fixed_root[members]]
-        residual=np.abs(labels[g['b']]-labels[g['a']]-g['target']).astype(float)
+        residual=arc_residual(labels[g['b']]-labels[g['a']],g['target'],g['side'])
     timings['solve']=time.monotonic()-phase
-    summary=dict(fibers=n,arcs=len(g['a']),seconds=timings['solve'],method=method,
+    summary=dict(fibers=n,arcs=len(g['a']),one_sided_arcs=int((g['side']!=0).sum()),seconds=timings['solve'],method=method,
         weighted_l1=float(np.dot(g['weight'],residual)),mean_residual=float(residual.mean()),
         max_residual=float(residual.max()),expanded_arcs_within_half_turn_percent=float(100*np.mean(residual<=.5)),
         # Distinct labels, not the largest plus one: a fixed group's members

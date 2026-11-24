@@ -2,6 +2,7 @@
 #include "vc_object_store/geometry/FiberCrossingWeight.hpp"
 #include "vc_object_store/geometry/FiberWinding.hpp"
 #include <queue>
+#include <tuple>
 
 namespace vc::geometry {
 
@@ -34,7 +35,10 @@ struct FiberWindingGraphInput {
 // Per-type constraint weights. A zero weight omits that type's arcs; the
 // enclosure pass derives exact H->V relations from signed perpendicular
 // events regardless of the perpendicular weight.
-struct FiberWindingGraphOptions {
+// What a measured crossing is turned into, the same for every consumer: the
+// traced volume's winding stage and a manual scaffold's solve build their
+// constraints from these options through windingEventConstraints below.
+struct WindingConstraintOptions {
     double windingScale=1,perpendicularOffset=.5,perpendicularWeight=1,parallelWeight=1;
     // How much each crossing counts as evidence, on top of its type weight
     // (FiberCrossingWeight.hpp, the rule the sign solve uses): |dot|^power,
@@ -42,7 +46,16 @@ struct FiberWindingGraphOptions {
     // separation. Power 0 without damping is the flat per-type weight.
     double dotWeightPower=0;
     bool dampByWindingDistance=false;
+    // Collect the signed enclosure bound of every perpendicular crossing.
     bool enclosures=false;
+    // The local sign every signed perpendicular crossing states on its own:
+    // the V fiber lies outside the H fiber there, or inside, which bounds the
+    // pair's H->V step from one side. Each becomes a one-sided constraint of
+    // this weight times the crossing's evidence, costing only when a solve
+    // breaks it; zero states none. It needs no winding separation.
+    double signWeight=0;
+};
+struct FiberWindingGraphOptions : WindingConstraintOptions {
     size_t constraintBatch=500000,readBatch=32768,workers=32;
     // Also return one row per usable event with its fractional target, for a
     // readout that scores a solve against the measurements themselves.
@@ -52,6 +65,12 @@ struct FiberWindingL1Columns {
     std::unique_ptr<int64_t[]> a,b,target;
     std::unique_ptr<double[]> weight;
     size_t arcs{},read{},used{},expanded{},withoutDistance{};
+    // One-sided sign constraints (WindingConstraintOptions::signWeight), in
+    // node order a < b: the step b - a is at least (side +1) or at most
+    // (side -1) the target. Identical ones are summed.
+    std::unique_ptr<int64_t[]> signA,signB,signTarget,signSide;
+    std::unique_ptr<double[]> signWeight;
+    size_t signArcs{},signConstraints{};
     // Enclosure relations (unweighted, H node -> V node, exact integer step),
     // present when FiberWindingGraphOptions::enclosures is set.
     std::unique_ptr<int64_t[]> enclosureA,enclosureB,enclosureTarget;
@@ -198,6 +217,87 @@ inline WindingEventRelation windingEventRelation(const PackedFiberGeometry& geom
     return out;
 }
 
+// A one-sided statement on the step between two nodes in node order (a < b):
+// b - a is at least the target (side +1) or at most it (side -1).
+struct WindingSignConstraint {
+    int64_t a=0,b=0,target=0;
+    double weight=0;
+    int side=0;
+};
+// Everything one measured crossing contributes under the options: its
+// relation (the equality arcs of its measured separation and its enclosure
+// bound), the weight of its type times its evidence, and its sign constraint.
+struct WindingEventConstraints {
+    WindingEventRelation relation;
+    // |dot|^power times the distance damping; 1 when both are off.
+    double evidence=1;
+    // Type weight times evidence: what the equality arcs carry in total.
+    double weight=0;
+    bool hasSign=false;
+    WindingSignConstraint sign{};
+};
+// `event` states the crossing as measured: its `distance` is unscaled, and
+// its weight, enclosure flag and perpendicular offset are set here.
+inline WindingEventConstraints windingEventConstraints(const PackedFiberGeometry& geometry,WindingEvent event,
+    const WindingConstraintOptions& options)
+{
+    WindingEventConstraints out;
+    event.distance*=options.windingScale;
+    const double dot=event.normalA[0]*event.normalB[0]+event.normalA[1]*event.normalB[1]+event.normalA[2]*event.normalB[2];
+    out.evidence=fiberCrossingDotWeight(dot,options.dotWeightPower)
+                *(options.dampByWindingDistance?fiberCrossingDistanceFactor(event.distance):1.);
+    out.weight=(event.parallel?options.parallelWeight:options.perpendicularWeight)*out.evidence;
+    event.weight=out.weight;
+    event.enclosure=options.enclosures||options.signWeight>0;
+    event.perpendicularOffset=options.perpendicularOffset;
+    out.relation=windingEventRelation(geometry,event);
+    if(out.relation.hasEnclosure&&options.signWeight>0){
+        // The H -> V step is at least its bound (the V fiber outside) or at
+        // most it; stated in node order.
+        const auto& bound=out.relation.enclosure;
+        const bool ordered=bound.h<bound.v;
+        out.sign={ordered?bound.h:bound.v,ordered?bound.v:bound.h,ordered?bound.bound:-bound.bound,
+                  options.signWeight*out.evidence,ordered?bound.sign:-bound.sign};
+        out.hasSign=true;
+    }
+    return out;
+}
+
+// The exact H -> V relations of the pairs bounded from both sides: a pair is
+// accepted when its largest lower bound equals its smallest upper bound.
+// `bounds` carries one entry per witnessing crossing and is sorted here;
+// `accept(step, witness)` receives the accepted step and the index (into the
+// sorted bounds) of the crossing that set the lower bound. Rejections are
+// counted, never turned into a weaker constraint.
+struct WindingEnclosureCounts {size_t pairs{},accepted{},oneSided{},contradictory{},nonunique{};};
+template<class Bound,class BoundOf,class Accept>
+WindingEnclosureCounts acceptWindingEnclosures(std::vector<Bound>& bounds,BoundOf&& boundOf,Accept&& accept)
+{
+    using winding_graph_detail::EnclosureBound;
+    std::stable_sort(bounds.begin(),bounds.end(),[&](const Bound& x,const Bound& y){
+        return winding_graph_detail::enclosureBefore(boundOf(x),boundOf(y));});
+    WindingEnclosureCounts counts;
+    for(size_t i=0;i<bounds.size();){
+        size_t j=i,witness=i;bool lowerSeen=false,upperSeen=false;int64_t lower=0,upper=0;
+        const EnclosureBound first=boundOf(bounds[i]);
+        for(;j<bounds.size();++j){
+            const EnclosureBound bound=boundOf(bounds[j]);
+            if(bound.h!=first.h||bound.v!=first.v)break;
+            if(bound.sign>0){
+                if(!lowerSeen||bound.bound>lower){lower=bound.bound;witness=j;}
+                lowerSeen=true;
+            }else{upper=upperSeen?std::min(upper,bound.bound):bound.bound;upperSeen=true;}
+        }
+        ++counts.pairs;
+        if(!lowerSeen||!upperSeen)++counts.oneSided;
+        else if(lower>upper)++counts.contradictory;
+        else if(lower<upper)++counts.nonunique;
+        else{accept(lower,witness);++counts.accepted;}
+        i=j;
+    }
+    return counts;
+}
+
 inline FiberWindingL1Columns prepareFiberWindingGraph(const PackedFiberGeometry& geometry,
     const FiberWindingGraphInput& in,const FiberWindingGraphOptions& options={})
 {
@@ -207,10 +307,11 @@ inline FiberWindingL1Columns prepareFiberWindingGraph(const PackedFiberGeometry&
        !std::isfinite(options.windingScale)||options.windingScale<0||
        !std::isfinite(options.perpendicularOffset)||!std::isfinite(options.perpendicularWeight)||options.perpendicularWeight<0||
        !std::isfinite(options.parallelWeight)||options.parallelWeight<0||
-       !std::isfinite(options.dotWeightPower)||options.dotWeightPower<0)
+       !std::isfinite(options.dotWeightPower)||options.dotWeightPower<0||
+       !std::isfinite(options.signWeight)||options.signWeight<0)
         throw std::invalid_argument("invalid winding graph preparation settings");
-    if(options.perpendicularWeight<=0&&options.parallelWeight<=0&&!options.enclosures)
-        throw std::invalid_argument("winding graph preparation needs a positive parallel or perpendicular weight, or enclosures");
+    if(options.perpendicularWeight<=0&&options.parallelWeight<=0&&!options.enclosures&&options.signWeight<=0)
+        throw std::invalid_argument("winding graph preparation needs a positive parallel, perpendicular or sign weight, or enclosures");
     if(in.b.count!=m||in.arcA.count!=m||in.arcB.count!=m||in.distance.count!=m||
        in.parallel.size()!=m||in.validA.size()!=m||in.validB.size()!=m||in.validConnector.size()!=m||
        in.normalA.size()!=m*3||in.normalB.size()!=m*3||in.connector.size()!=m*3||in.normalSign.size()!=n||
@@ -228,7 +329,7 @@ inline FiberWindingL1Columns prepareFiberWindingGraph(const PackedFiberGeometry&
         if(owner<-1||(owner>=0&&uint64_t(owner)>=n))throw std::invalid_argument("winding node outside catalog");
         return owner;
     };
-    struct Job {std::vector<Arc> arcs;std::vector<EnclosureBound> enclosures;
+    struct Job {std::vector<Arc> arcs;std::vector<EnclosureBound> enclosures;std::vector<WindingSignConstraint> signs;
                 std::vector<int64_t> eventA,eventB;std::vector<double> eventTarget,eventMeasured,eventDistance,eventWeight;
                 size_t used{},expanded{},withoutDistance{};};
     const size_t jobs=(m+options.constraintBatch-1)/options.constraintBatch;
@@ -247,23 +348,15 @@ inline FiberWindingL1Columns prepareFiberWindingGraph(const PackedFiberGeometry&
                 event.a=a;event.b=b;event.familyA=in.family[a];event.familyB=in.family[b];
                 event.signA=in.normalSign[a];event.signB=in.normalSign[b];
                 event.arcA=in.arcA[k];event.arcB=in.arcB[k];
-                event.distance=in.distance[k]*options.windingScale;
+                event.distance=in.distance[k];
                 event.parallel=in.parallel[k];
                 event.connector=point(in.connector,k);
                 event.normalA=point(in.normalA,k);event.normalB=point(in.normalB,k);
-                // The type weight, scaled by how square the crossing is and
-                // damped by how far apart in winding it is (both off by
-                // default, which is the flat per-type weight).
-                const double dot=event.normalA[0]*event.normalB[0]+event.normalA[1]*event.normalB[1]
-                                +event.normalA[2]*event.normalB[2];
-                event.weight=(event.parallel?options.parallelWeight:options.perpendicularWeight)
-                            *fiberCrossingDotWeight(dot,options.dotWeightPower)
-                            *(options.dampByWindingDistance?fiberCrossingDistanceFactor(event.distance):1.);
-                event.enclosure=options.enclosures;
-                event.perpendicularOffset=options.perpendicularOffset;
-                const auto relation=windingEventRelation(geometry,event);
+                const auto constraints=windingEventConstraints(geometry,event,options);
+                const auto& relation=constraints.relation;
                 part.withoutDistance+=relation.withoutDistance;
-                if(relation.hasEnclosure)part.enclosures.push_back(relation.enclosure);
+                if(relation.hasEnclosure&&options.enclosures)part.enclosures.push_back(relation.enclosure);
+                if(constraints.hasSign)part.signs.push_back(constraints.sign);
                 if(!relation.usable)continue;
                 batch.push_back(relation.lower);
                 if(relation.hasUpper)upper.push_back(relation.upper);
@@ -271,7 +364,7 @@ inline FiberWindingL1Columns prepareFiberWindingGraph(const PackedFiberGeometry&
                     part.eventA.push_back(relation.lower.a);part.eventB.push_back(relation.lower.b);
                     part.eventTarget.push_back(relation.fractionalTarget);
                     part.eventMeasured.push_back(relation.measuredTarget);
-                    part.eventDistance.push_back(event.distance);part.eventWeight.push_back(event.weight);
+                    part.eventDistance.push_back(event.distance*options.windingScale);part.eventWeight.push_back(constraints.weight);
                 }
                 ++part.used;
             }
@@ -288,26 +381,36 @@ inline FiberWindingL1Columns prepareFiberWindingGraph(const PackedFiberGeometry&
         // upper bound. Rejections are counted, never silently dropped arcs.
         std::vector<EnclosureBound> bounds;
         for(auto& part:parts){bounds.insert(bounds.end(),part.enclosures.begin(),part.enclosures.end());std::vector<EnclosureBound>().swap(part.enclosures);}
-        std::sort(bounds.begin(),bounds.end(),enclosureBefore);
         std::vector<Arc> relations;
-        for(size_t i=0;i<bounds.size();){
-            size_t j=i;bool lowerSeen=false,upperSeen=false;int64_t lower=0,upper=0;
-            for(;j<bounds.size()&&bounds[j].h==bounds[i].h&&bounds[j].v==bounds[i].v;++j){
-                if(bounds[j].sign>0){lower=lowerSeen?std::max(lower,bounds[j].bound):bounds[j].bound;lowerSeen=true;}
-                else{upper=upperSeen?std::min(upper,bounds[j].bound):bounds[j].bound;upperSeen=true;}
-            }
-            ++out.enclosurePairs;
-            if(!lowerSeen||!upperSeen)++out.enclosureOneSided;
-            else if(lower>upper)++out.enclosureContradictory;
-            else if(lower<upper)++out.enclosureNonunique;
-            else relations.push_back(Arc{bounds[i].h,bounds[i].v,lower,1.});
-            i=j;
-        }
+        const auto counts=acceptWindingEnclosures(bounds,[](const EnclosureBound& bound){return bound;},
+            [&](int64_t step,size_t witness){relations.push_back(Arc{bounds[witness].h,bounds[witness].v,step,1.});});
+        out.enclosurePairs=counts.pairs;out.enclosureOneSided=counts.oneSided;
+        out.enclosureContradictory=counts.contradictory;out.enclosureNonunique=counts.nonunique;
         out.enclosureArcs=relations.size();
         out.enclosureA=std::make_unique_for_overwrite<int64_t[]>(out.enclosureArcs);
         out.enclosureB=std::make_unique_for_overwrite<int64_t[]>(out.enclosureArcs);
         out.enclosureTarget=std::make_unique_for_overwrite<int64_t[]>(out.enclosureArcs);
         for(size_t i=0;i<out.enclosureArcs;++i){out.enclosureA[i]=relations[i].a;out.enclosureB[i]=relations[i].b;out.enclosureTarget[i]=relations[i].target;}
+    }
+    if(options.signWeight>0){
+        std::vector<WindingSignConstraint> signs;
+        for(auto& part:parts){signs.insert(signs.end(),part.signs.begin(),part.signs.end());std::vector<WindingSignConstraint>().swap(part.signs);}
+        out.signConstraints=signs.size();
+        const auto key=[](const WindingSignConstraint& x){return std::tuple{x.a,x.b,x.side,x.target};};
+        std::stable_sort(signs.begin(),signs.end(),[&](const auto& x,const auto& y){return key(x)<key(y);});
+        size_t kept=0;
+        for(size_t i=0;i<signs.size();++i){
+            if(kept&&key(signs[kept-1])==key(signs[i]))signs[kept-1].weight+=signs[i].weight;
+            else signs[kept++]=signs[i];
+        }
+        signs.resize(kept);out.signArcs=kept;
+        out.signA=std::make_unique_for_overwrite<int64_t[]>(kept);out.signB=std::make_unique_for_overwrite<int64_t[]>(kept);
+        out.signTarget=std::make_unique_for_overwrite<int64_t[]>(kept);out.signSide=std::make_unique_for_overwrite<int64_t[]>(kept);
+        out.signWeight=std::make_unique_for_overwrite<double[]>(kept);
+        for(size_t i=0;i<kept;++i){
+            out.signA[i]=signs[i].a;out.signB[i]=signs[i].b;out.signTarget[i]=signs[i].target;
+            out.signSide[i]=signs[i].side;out.signWeight[i]=signs[i].weight;
+        }
     }
     if(options.eventTargets){
         for(const auto& part:parts)out.events+=part.eventA.size();
@@ -331,7 +434,7 @@ inline FiberWindingL1Columns prepareFiberWindingGraph(const PackedFiberGeometry&
             std::vector<double>().swap(part.eventWeight);
         }
     }
-    if(!out.used&&!out.enclosureArcs)throw std::invalid_argument("no usable winding constraints");
+    if(!out.used&&!out.enclosureArcs&&!out.signArcs)throw std::invalid_argument("no usable winding constraints");
     // Merge independent sorted job outputs in disjoint A-node ranges. Equal
     // keys are summed in the same job order as concatenation+stable lexsort.
     const size_t ranges=std::min(std::max(size_t(1),n),options.workers);
