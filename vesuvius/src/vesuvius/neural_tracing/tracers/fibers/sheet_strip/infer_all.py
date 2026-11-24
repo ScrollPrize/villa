@@ -107,7 +107,8 @@ def main(argv=None):
     torch.set_num_threads(args.threads)
     k, n = args.shard
     try:
-        predictor = StripPredictor(args.checkpoint, args.device, args.umbilicus, args.batch, args)
+        predictor = StripPredictor(args.checkpoint, args.device, args.umbilicus, args.batch, args, crops=args.crops,
+                                   gpu_chunks=args.gpu_chunks)
     except ValueError as error:
         raise SystemExit(str(error))
     f, v, tpp = predictor.f, predictor.v, predictor.trace_per_patch

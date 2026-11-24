@@ -286,9 +286,10 @@ def make_sample(fiber: TracedFiber, t: float, reverse: bool, cfg: SampleConfig, 
     return decision_on_path(fiber, t, reverse, cfg, path, arcs, category, sigma, details, rng)
 
 
-def decision_on_path(fiber, t, reverse, cfg, path, arcs, category, sigma, details, rng=None):
+def decision_on_path(fiber, t, reverse, cfg, path, arcs, category, sigma, details, rng=None, labels=True):
     """The tracer decision whose head ends an observed path (``path``, sampled at traversal arclengths ``arcs``
-    ending at ``t``): crop heading, history, seed reference and labels exactly as ``make_sample`` builds them."""
+    ending at ``t``): crop heading, history, seed reference and labels exactly as ``make_sample`` builds them.
+    ``labels=False`` (inference) leaves out the labels and trace facts; the model inputs are unchanged."""
     p, s = traversal_curve(fiber, reverse)
     pos = path[-1]
     # Only the CT seed axis's sign comes from the direction of travel.
@@ -296,15 +297,16 @@ def decision_on_path(fiber, t, reverse, cfg, path, arcs, category, sigma, detail
     heading = trace_heading(path, 0, seed_direction)
     frame = frame_from_heading(heading)  # provisional basis; CT resolves crop roll before sampling
     hist, hmask = trace_history(list(path), cfg.n_history)
-    item = dict(_frame_label_context=(fiber, t, reverse, cfg),
-                observed_path=path, seed_pos=path[0].copy(), seed_tangent=seed_direction,
+    item = dict(observed_path=path, seed_pos=path[0].copy(), seed_tangent=seed_direction,
                 seed_age=float(arclength(path)[-1]), seed_valid=True, seed_heading_family=fiber.tag,
                 trace_noise_sigma=sigma, trace_prefix_length=float(arcs[-1]-arcs[0]), startup=category,
                 excursion=bool(details), heading_start=0, travelled=float(arclength(path)[-1]),
-                pos=pos, frame=frame, hist_local=(hist-pos) @ frame, hmask=hmask.astype(np.float32),
-                trace_facts=constructed_facts(fiber, t, reverse, pos, cfg), **details,
-                **continuation_targets(fiber, t, reverse, pos, frame, cfg))
-    supervise(item)
+                pos=pos, frame=frame, hist_local=(hist-pos) @ frame, hmask=hmask.astype(np.float32), **details)
+    if labels:
+        # without the label context, later frame changes (data/targets.refresh_frame_targets) skip the labels too
+        item.update(_frame_label_context=(fiber, t, reverse, cfg), trace_facts=constructed_facts(fiber, t, reverse, pos, cfg),
+                    **continuation_targets(fiber, t, reverse, pos, frame, cfg))
+        supervise(item)
     if linear12_heading(path, 0) is None:
         item['_pending_seed_heading'] = (fiber, t, reverse, cfg)
     if cfg.prediction_window and rng is not None and len(path) > 1:

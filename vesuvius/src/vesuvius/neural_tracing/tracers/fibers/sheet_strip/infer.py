@@ -51,14 +51,14 @@ from vc_reader.reader import open_zarr
 from vesuvius.neural_tracing.tracers.fibers.data.observations import IdentityObservationBuilder, IdentitySampling
 from vesuvius.neural_tracing.tracers.fibers.data.samples import STARTUP_CATEGORIES, SampleConfig, decision_on_path
 from vesuvius.neural_tracing.tracers.fibers.frames.ct import oriented_seed_heading
-from vesuvius.neural_tracing.tracers.fibers.frames.learned import prediction_window
+from vesuvius.neural_tracing.tracers.fibers.frames.learned import frame_predictor, prediction_window
 from vesuvius.neural_tracing.tracers.fibers.sheet_strip.data import (
     RunFibers, StripBuilder, StripIndex, crop_orientation, load_umbilicus, polyline_points)
 from vesuvius.neural_tracing.tracers.fibers.sheet_strip.model import strip_grid
 from vesuvius.neural_tracing.tracers.fibers.sheet_strip.targets import strip_targets
 from vesuvius.neural_tracing.tracers.fibers.sheet_strip.train import load_strip_model, with_tube
 from vesuvius.neural_tracing.tracers.fibers.tracing.runtime import (
-    add_volume_arguments, configure_volume, resolve_checkpoint)
+    add_volume_arguments, configure_volume, gpu_crop_backend, gpu_frame_predictor, resolve_checkpoint)
 from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import FiberStore, fiber_volume
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.normalization import prepare_normalization
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolumeSpec
@@ -85,6 +85,12 @@ def add_checkpoint_arguments(ap):
     ap.add_argument('--umbilicus', help="umbilicus.json for models reading the crop orientation (default: the "
                                         f"checkpoint run's, else {UMBILICUS_NAME} next to the checkpoint)")
     ap.add_argument('--device', default='cuda')
+    ap.add_argument('--crops', choices=('cpu', 'gpu'), default='cpu',
+                    help="cpu (default): crops from the CPU sampler and the frame model on the CPU; gpu: crops sampled "
+                         "by vc_reader's CUDA reader and the frame model on the --device GPU (same crops to 1e-4, "
+                         "strips within the batch-size tolerance below)")
+    ap.add_argument('--gpu-chunks', type=int, default=1024,
+                    help="with --crops gpu: CT chunks in the CUDA reader's device cache (2 MiB each for 128^3 uint8)")
 
 
 def recorded_file(path):
@@ -116,13 +122,14 @@ def trim_ends(keep, first_arc, row_step, length, margin):
     return keep & ((arc >= margin) & (arc <= length-margin))[:, None]
 
 
-def decision_item(fiber, t, sample_cfg, n_history, window):
-    """The decision at arclength ``t`` of a fiber traced exactly up to its head, its crop axis from the fiber ahead."""
+def decision_item(fiber, t, sample_cfg, n_history, window, labels=True):
+    """The decision at arclength ``t`` of a fiber traced exactly up to its head, its crop axis from the fiber ahead
+    (``labels=False``: without the training labels, which no model input reads)."""
     p, s = fiber.points, fiber.s
     count = int(min(t//sample_cfg.history_step, n_history))
     arcs = t-np.arange(count, -1, -1)*sample_cfg.history_step
     item = decision_on_path(fiber, t, False, sample_cfg, interp_at(p, s, arcs), arcs,
-                            STARTUP_CATEGORIES.index('established'), 0., {})
+                            STARTUP_CATEGORIES.index('established'), 0., {}, labels=labels)
     if window:
         item['prev_prediction'] = interp_at(p, s, np.minimum(t+np.arange(1., window+1e-9), s[-1]))
     item['fiber_ref'] = (0, float(t), False)
@@ -177,9 +184,12 @@ class StripPredictor:
     """A sheet-strip checkpoint and what its decisions need (frame model and crop builder, CT volume, umbilicus),
     loaded once; ``predict`` runs one fiber's decisions."""
 
-    def __init__(self, checkpoint=DEFAULT_CHECKPOINT, device='cuda', umbilicus=None, batch=16, volume=None):
+    def __init__(self, checkpoint=DEFAULT_CHECKPOINT, device='cuda', umbilicus=None, batch=16, volume=None,
+                 crops='cpu', gpu_chunks=1024):
         """``checkpoint``: a file or a Hugging Face repo (module notes); ``volume``: parsed CT and frame-model options
-        (runtime.add_volume_arguments; None: the checkpoint's). ``source`` is what outputs record as the checkpoint."""
+        (runtime.add_volume_arguments; None: the checkpoint's). ``source`` is what outputs record as the checkpoint.
+        ``crops='gpu'``: crops and the frame model on the CUDA ``device`` (a device cache of ``gpu_chunks`` CT
+        chunks); the default builds them on the CPU."""
         path = resolve_checkpoint(checkpoint)
         self.source = checkpoint_source(checkpoint, path)
         self.model, self.cfg, self.ck = load_strip_model(path, device)
@@ -198,6 +208,17 @@ class StripPredictor:
             self.umbilicus = load_umbilicus(umbilicus or find_umbilicus(checkpoint, path, self.data.get('umbilicus')))
         self.ct = open_zarr(self.spec.ct_zarr, level=self.spec.ct_level, cache_dir=self.spec.cache_dir,
                             memory_cache=3 << 30)
+        self.cuda = None
+        if crops == 'gpu':
+            # The CPU work per decision is mostly crop building (the frame model's crops and forward, the strip
+            # crop and its normalization); on the GPU the CPU keeps only the decisions' geometry
+            if not str(device).startswith('cuda'):
+                raise ValueError('--crops gpu needs a CUDA --device')
+            self.cuda, sampler = gpu_crop_backend(self.ct, device, gpu_chunks)
+            self.builder.crop_images = sampler
+            self.builder.frame_model = gpu_frame_predictor(frame_predictor(self.cfg), device, sampler)
+        elif crops != 'cpu':
+            raise ValueError(f'Unknown crop backend {crops!r}')
         self.rng = np.random.default_rng(0)
         c = self.cfg.fine  # the crop's farthest point from its head, plus a sample
         self.crop_reach = math.sqrt((max(c.behind, c.depth-c.behind)*c.spacing)**2+2*((c.width-1)/2*c.spacing)**2)+c.spacing
@@ -434,7 +455,8 @@ def main(argv=None):
         render_saved(args.out, open_zarr(spec.ct_zarr, level=spec.ct_level, cache_dir=spec.cache_dir), spec)
         return
     try:
-        predictor = StripPredictor(args.checkpoint, args.device, args.umbilicus, args.batch, volume=args)
+        predictor = StripPredictor(args.checkpoint, args.device, args.umbilicus, args.batch, volume=args,
+                                   crops=args.crops, gpu_chunks=args.gpu_chunks)
     except ValueError as error:
         raise SystemExit(str(error))
     cfg, ck, data, spec = predictor.cfg, predictor.ck, predictor.data, predictor.spec

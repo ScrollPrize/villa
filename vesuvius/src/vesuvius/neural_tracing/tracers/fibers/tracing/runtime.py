@@ -113,20 +113,33 @@ def configure_volume(args, spec, model_cfg, checkpoint):
         print(f'CT chunk cache: {spec.cache_dir} (pass --cache-dir to choose another)', flush=True)
 
 
+def gpu_crop_backend(ct, device, slots):
+    """vc_reader's CUDA reader of ``ct`` (a device cache of ``slots`` CT chunks) and a crop backend reading it
+    (``cuda_scalar_crops``: the CPU sampler's values on the GPU)."""
+    import numpy as np
+    import torch
+    from vesuvius.neural_tracing.tracers.shared.crop_sampling.crops import cuda_scalar_crops
+    index = torch.device(device).index
+    cuda = ct.cuda(cache_bytes=slots*int(np.prod(ct.chunks)),
+                   device=torch.cuda.current_device() if index is None else index)
+    return cuda, lambda items, ct, spec, crop: cuda_scalar_crops(items, cuda, spec, crop)
+
+
+def gpu_frame_predictor(predictor, device, crops):
+    """A copy of the frame model ``predictor`` on ``device`` reading ``crops``, so a shared CPU predictor is
+    unchanged; None without a frame model."""
+    import copy
+    from vesuvius.neural_tracing.tracers.fibers.heading_model.model import HeadingPredictor
+    if predictor is None:
+        return None
+    return HeadingPredictor(copy.deepcopy(predictor.model), device, crops)
+
+
 def use_gpu_crops(tracer, device, slots):
     """Follower and frame-model crops sampled on the GPU by vc_reader's CUDA reader (``cuda_scalar_crops``, a device
     cache of ``slots`` CT chunks), and the frame model on the GPU: a copy, so a shared CPU predictor is unchanged.
     Returns the CUDA reader."""
-    import copy
-    import numpy as np
-    import torch
-    from vesuvius.neural_tracing.tracers.fibers.heading_model.model import HeadingPredictor
-    from vesuvius.neural_tracing.tracers.shared.crop_sampling.crops import cuda_scalar_crops
-    index = torch.device(device).index
-    cuda = tracer.ct.cuda(cache_bytes=slots*int(np.prod(tracer.ct.chunks)),
-                          device=torch.cuda.current_device() if index is None else index)
-    crops = lambda items, ct, spec, crop: cuda_scalar_crops(items, cuda, spec, crop)
+    cuda, crops = gpu_crop_backend(tracer.ct, device, slots)
     tracer.observations.crop_images = crops
-    if tracer.frame_predictor is not None:
-        tracer.frame_predictor = HeadingPredictor(copy.deepcopy(tracer.frame_predictor.model), device, crops)
+    tracer.frame_predictor = gpu_frame_predictor(tracer.frame_predictor, device, crops)
     return cuda

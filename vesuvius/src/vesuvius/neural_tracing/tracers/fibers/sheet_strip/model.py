@@ -139,10 +139,10 @@ def tube_offsets(sigma, reach=3.):
 
 
 @torch.no_grad()
-def render_tube(points, valid, crop, sigma, out=None):
+def render_tube(points, valid, crop, sigma, out=None, chunk=1 << 14):
     """A Gaussian tube (B, 1, D, H, W) of peak 1 and ``sigma`` samples around crop-local (a, b, c) curve points
     (B, P, 3) spaced at most half a sample apart: each sample takes its largest Gaussian weight over the points.
-    ``valid`` (B, P) marks the points."""
+    ``valid`` (B, P) marks the points. The batch's valid points render together, ``chunk`` at a time."""
     b = len(points)
     height = crop.height or crop.width
     shape = (crop.depth, height, crop.width)
@@ -152,16 +152,17 @@ def render_tube(points, valid, crop, sigma, out=None):
     out = points.new_zeros((b, 1, *shape), dtype=torch.float32) if out is None else out.zero_()
     flat = out.view(-1)
     limit = torch.tensor(shape, device=points.device)
-    for row in range(b):  # bounded memory: one crop's points x offsets at a time
-        centre = index[row][valid[row]]
-        if not len(centre):
-            continue
+    rows, columns = valid.nonzero(as_tuple=True)
+    centres = index[rows, columns]
+    for start in range(0, len(rows), chunk):  # bounded memory: chunk points x offsets at a time
+        centre, row = centres[start:start+chunk], rows[start:start+chunk]
         sample = centre.round().long()[:, None]+offsets  # (P, K, 3)
         weight = torch.exp(-((sample.float()-centre[:, None])**2).sum(-1)/(2*sigma*sigma))
         inside = ((sample >= 0) & (sample < limit)).all(-1)
-        sample, weight = sample[inside], weight[inside]
-        linear = ((row*shape[0]+sample[:, 0])*shape[1]+sample[:, 1])*shape[2]+sample[:, 2]
-        flat.scatter_reduce_(0, linear, weight, 'amax')
+        linear = ((row[:, None]*shape[0]+sample[..., 0])*shape[1]+sample[..., 1])*shape[2]+sample[..., 2]
+        # samples outside the crop add weight 0 at index 0, which no max changes: no mask, so no host sync
+        flat.scatter_reduce_(0, torch.where(inside, linear, 0).view(-1), torch.where(inside, weight, 0.).view(-1),
+                             'amax')
     return out
 
 
