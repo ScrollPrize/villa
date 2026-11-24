@@ -2891,7 +2891,7 @@ QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const nlo
             std::atomic<int> done = 0;
             LocalOptTimingAccumulator timing_accum;
             if (!opt_local.empty()) {
-                OmpThreadPointCol opt_local_threadcol(opt_step*2+1, opt_local);
+                OmpThreadPointCol opt_local_threadcol(LocalSolveConflicts(opt_radius), opt_local);
                 int total = opt_local.size();
                 auto start_time = std::chrono::high_resolution_clock::now();
 
@@ -3360,7 +3360,7 @@ QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const nlo
             int done = 0;
 
             if (!opt_local.empty()) {
-                OmpThreadPointCol opt_local_threadcol(17, opt_local);
+                OmpThreadPointCol opt_local_threadcol(LocalSolveConflicts(8), opt_local);
 
 #pragma omp parallel
                 while (true)

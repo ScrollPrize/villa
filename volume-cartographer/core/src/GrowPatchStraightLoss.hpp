@@ -36,31 +36,28 @@ inline constexpr int kLossReach = 2;
 // when a vertex one moves is read (or moved) by the other. Solves that do not conflict can run on two threads at once.
 class LocalSolveConflicts {
 public:
-    explicit LocalSolveConflicts(int radius) : radius_(radius), span_(2 * radius + kLossReach), table_(size_t(2 * span_ + 1) * size_t(2 * span_ + 1), 0)
+    explicit LocalSolveConflicts(int radius) : radius_(radius), span_(2 * radius + kLossReach), half_width_(2 * span_ + 1, -1)
     {
-        std::vector<cv::Vec2i> disc;
+        // Rows y1 and y2 of the two discs come within reach where |dy - (y1 - y2)| and |dx| - both half-widths are <= kLossReach.
+        std::vector<int> row_half_width(2 * radius + 1, 0);
         for (int y = -radius; y <= radius; ++y)
-            for (int x = -radius; x <= radius; ++x)
-                if (y * y + x * x <= radius * radius)
-                    disc.push_back({y, x});
-        for (int dy = -span_; dy <= span_; ++dy)
-            for (int dx = -span_; dx <= span_; ++dx) {
-                bool conflict = false;
-                for (size_t i = 0; i < disc.size() && !conflict; ++i)
-                    for (size_t j = 0; j < disc.size() && !conflict; ++j)
-                        conflict = std::max(std::abs(disc[i][0] - (dy + disc[j][0])), std::abs(disc[i][1] - (dx + disc[j][1]))) <= kLossReach;
-                table_[index(dy, dx)] = conflict;
-            }
+            while ((row_half_width[y + radius] + 1) * (row_half_width[y + radius] + 1) + y * y <= radius * radius)
+                ++row_half_width[y + radius];
+        for (int y1 = -radius; y1 <= radius; ++y1)
+            for (int y2 = -radius; y2 <= radius; ++y2)
+                for (int r = -kLossReach; r <= kLossReach; ++r) {
+                    int &w = half_width_[y1 - y2 + r + span_];
+                    w = std::max(w, row_half_width[y1 + radius] + row_half_width[y2 + radius] + kLossReach);
+                }
     }
     bool operator()(const cv::Vec2i &a, const cv::Vec2i &b) const
     {
         const int dy = b[0] - a[0], dx = b[1] - a[1];
-        return std::abs(dy) <= span_ && std::abs(dx) <= span_ && table_[index(dy, dx)];
+        return std::abs(dy) <= span_ && std::abs(dx) <= half_width_[dy + span_];
     }
     int radius() const { return radius_; }
 
 private:
-    size_t index(int dy, int dx) const { return size_t(dy + span_) * size_t(2 * span_ + 1) + size_t(dx + span_); }
     int radius_, span_;
-    std::vector<char> table_;
+    std::vector<int> half_width_;
 };

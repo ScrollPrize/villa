@@ -135,11 +135,11 @@ TEST_CASE("local solves: threads taking candidates together are never in conflic
     for (int y = 4; y < 70; ++y)
         for (int x = 4; x < 70; ++x)
             cands.push_back({y, x});
+    omp_set_num_threads(8);
     OmpThreadPointCol col([&conflicts](const cv::Vec2i &a, const cv::Vec2i &b) { return conflicts(a, b); }, cands);
     std::mutex mutex;
     std::vector<cv::Vec2i> in_flight;
     std::atomic<int> taken{0}, violations{0};
-    omp_set_num_threads(8);
 #pragma omp parallel
     {
         while (true) {
