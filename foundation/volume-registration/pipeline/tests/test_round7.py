@@ -198,6 +198,121 @@ def test_a_legacy_approval_of_a_record_with_no_unit_lining_up_stays_eligible(tmp
     assert check(root, capsys)[0] == 0
 
 
+def nineteen_when_drawn(root, name="a", pair="A"):
+    """A pair whose blind round is drawn on nineteen: p0001 answered "partly" before
+    anything ran (logged, as `volreg answer` logs it), so every score is on nineteen."""
+    from test_redo_release import new_pair
+    directory = new_pair(root, name, pair)
+    rec.Record(directory).log("holdout-answer", unit="p0001", answer="partly", by=BY)
+    drain(directory)
+    pick_all(directory)
+    assert page(directory)["scores"]["scores"]["bend"]["lines_up"] == 19
+    return directory
+
+
+def test_a_legacy_approval_of_the_score_its_round_was_drawn_on_stays_eligible(tmp_path, scored, monkeypatch, capsys):
+    """The upgrade path must establish which score the saved approval covers, while
+    preserving coherent legacy records. (The control for the review's first sequence: the
+    approval for 19, on a round drawn on 19, and no rescore after it. Same second.)"""
+    monkeypatch.setattr(rec, "now", Clock())
+    root = tmp_path / "records"
+    directory = nineteen_when_drawn(root)
+    rec.Record(directory).decide(legacy_decision(directory, "bend", ["enough"], "19 will do"), BY)
+    assert drain(directory).states()["store"] == DONE
+    assert "A" in released(tmp_path, [root], "control")[0]
+    assert_published_coherently(tmp_path / "out-control")
+    assert check(root, capsys)[0] == 0
+
+
+def test_the_same_approval_and_a_rescore_in_its_second_is_refused_for_the_rescore(tmp_path, scored, monkeypatch, capsys):
+    """The upgrade path must establish which score the saved approval covers, while
+    preserving coherent legacy records. (The review's first sequence, on a round drawn on
+    19: only the answer that takes 19 to 18, in the approval's second, separates it from the
+    control above, and that answer is what Store names.)"""
+    monkeypatch.setattr(rec, "now", Clock())
+    root = tmp_path / "records"
+    directory = nineteen_when_drawn(root)
+    rec.Record(directory).decide(legacy_decision(directory, "bend", ["enough"], "19 will do"), BY)
+    answer(directory, "p0002", "partly")
+    pipeline = drain(directory)
+    assert page(directory)["scores"]["scores"]["bend"]["lines_up"] == 18
+    error = pipeline.stamp("store")["error"]
+    assert pipeline.states()["store"] == FAILED and "decide again" in error and "p0002" in error
+    assert released(tmp_path, [root], "rescored")[0] == {}
+
+
+def test_a_legacy_approval_after_a_rescore_on_a_round_drawn_before_it_is_held_back(tmp_path, scored, monkeypatch, capsys):
+    """The upgrade path must establish which score the saved approval covers, while
+    preserving coherent legacy records. (What this costs: blind keeps one round per fit, so
+    a round drawn on 20 is still the round after the rescore on 19. An approval for 19 sent
+    then may have come from a page loaded before the rescore -- the review's second
+    sequence -- and the log cannot tell, so it is held back, and one decision on the page as
+    it is stores it.)"""
+    monkeypatch.setattr(rec, "now", Clock())
+    root = tmp_path / "records"
+    directory = scored_on_nineteen(root)
+    rec.Record(directory).decide(legacy_decision(directory, "bend", ["enough"], "19 will do"), BY)
+    pipeline = drain(directory)
+    error = pipeline.stamp("store")["error"]
+    assert pipeline.states()["store"] == FAILED and "decide again" in error and "p0001" in error
+    decide_on(directory, "bend", page(directory), "19 will do")
+    assert drain(directory).states()["store"] == DONE
+    assert check(root, capsys)[0] == 0
+
+
+# The event log's own sequences, for `legacy_approval_problem` alone (the fake blind stage
+# logs no `blind-round`; the real one does, with the round's id).
+def blind(round_id=None):
+    started = [{"kind": "job-started", "stage": "blind"}]
+    drawn = [{"kind": "blind-round", "round": round_id}] if round_id else []
+    return started + drawn + [{"kind": "job-finished", "stage": "blind"}]
+
+
+def job(stage):
+    return [{"kind": "job-started", "stage": stage}, {"kind": "job-finished", "stage": stage}]
+
+
+def said(unit, value):
+    return [{"kind": "holdout-answer", "unit": unit, "answer": value}]
+
+
+def decided(round_id="c001", fit="f001"):
+    return [{"kind": "decision", "fit": fit, "publish": "bend", "override": None, "round": round_id}]
+
+
+START = job("holdout") + said("p0001", "lines-up") + said("p0002", "lines-up") + job("fit")
+
+
+@pytest.mark.parametrize("events, round_id, problem", [
+    (START + job("score") + blind("c001") + decided(), "c001", None),
+    (START + job("score") + blind() + decided(None), None, None),                     # main named no round
+    (START + job("score") + blind("c001") + said("p0002", "no") + job("score") + decided(), "c001", "p0002 lines up"),
+    (START + job("score") + blind("c001") + said("p0002", "no") + said("p0002", "lines-up") + decided(), "c001",
+     "p0002 lines up"),                                                               # changed and back
+    (START + said("p0002", "partly") + job("score") + blind("c001") + said("p0002", "no") + decided(), "c001",
+     None),                                                                           # partly to no: not lining up either way
+    (START + job("score") + blind("c001") + job("holdout") + job("score") + decided(), "c001", "drawn again"),
+    (START + job("score") + decided() + blind("c001"), "c001", "does not show the blind round"),
+    (START + blind("c001") + decided(), "c001", "does not show the scores"),
+    (START + job("score") + blind("c001") + decided() + decided("c001", fit="f002"), "c001", "not the last decision"),
+    (START + job("score") + blind("c001") + job("score") + blind("c002") + decided("c002"), "c002", None),
+    (said("p0001", "lines-up"), "c001", "holds no decision"),
+])
+def test_which_scores_the_event_log_shows_a_legacy_approval_was_made_on(events, round_id, problem):
+    """The upgrade path must establish which score the saved approval covers, while
+    preserving coherent legacy records. (The rule on hand-written logs: the round named,
+    or main's unnamed one; an answer that changes whether a unit lines up after the round's
+    score began, even changed back; one that does not; the hold-out set drawn again; a
+    decision logged before its round, or a round with no score before it; a decision that
+    is not the last one logged; a log with no decision.)"""
+    from volreg.scoring import legacy_approval_problem
+    found = legacy_approval_problem(events, decided(round_id)[0])
+    if problem is None:
+        assert found is None
+    else:
+        assert found is not None and problem in found
+
+
 # ======================================================= 2. the event log is the answers' source
 
 def test_an_answer_logged_whose_rewrite_of_holdout_json_failed_holds_back_the_pair(tmp_path, scored, monkeypatch, capsys):
