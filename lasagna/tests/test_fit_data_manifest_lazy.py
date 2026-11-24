@@ -273,7 +273,7 @@ class FitDataManifestLazyTests(unittest.TestCase):
 
 	def test_streaming_source_keeps_complete_local_zarr(self) -> None:
 		with tempfile.TemporaryDirectory() as td:
-			root = Path(td)
+			root = Path(td).resolve()
 			_write_u8_zarr(root / "surface.zarr", (3, 4, 5, 6))
 			manifest = _write_manifest(root, groups=_surface_group())
 			vol = LasagnaVolume.load(manifest)

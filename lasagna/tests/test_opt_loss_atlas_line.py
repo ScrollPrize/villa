@@ -267,7 +267,7 @@ class AtlasLineLossTest(unittest.TestCase):
 				root = opt_loss_atlas_line.write_debug_objs(stage="atlas_init_relax", step=0)
 			finally:
 				os.chdir(old_cwd)
-			self.assertEqual(root, Path(td) / "atlas_debug_objs" / "atlas_init_relax_step000000")
+			self.assertEqual(root, Path(td).resolve() / "atlas_debug_objs" / "atlas_init_relax_step000000")
 			wdir = root / "winding_000"
 			self.assertTrue((wdir / "model_surface.obj").exists())
 			self.assertIn("\nf ", (wdir / "model_surface.obj").read_text(encoding="utf-8"))
@@ -309,7 +309,7 @@ class AtlasLineLossTest(unittest.TestCase):
 				root = opt_loss_atlas_line.write_debug_objs(stage="atlas_init_relax", step=0)
 			finally:
 				os.chdir(old_cwd)
-			self.assertEqual(root, Path(td) / "atlas_debug_objs" / "atlas_init_relax_step000000")
+			self.assertEqual(root, Path(td).resolve() / "atlas_debug_objs" / "atlas_init_relax_step000000")
 			self.assertFalse((root / "winding_000").exists())
 			w0 = root / "atlas_winding_+000"
 			w1 = root / "atlas_winding_+001"
