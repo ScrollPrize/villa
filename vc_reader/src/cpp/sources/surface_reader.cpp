@@ -348,6 +348,7 @@ void checkBudget(AlignedEngine::Impl& s, const Triple& shape, const std::optiona
 struct Patch {
     std::shared_ptr<const GeometryTile> tile;
     grid::Raster raster;
+    std::int64_t halo = 0;  // vertices read around the cells reached (at most 2)
 };
 std::optional<Patch> patchOf(Geometry& geom, const Pair& start, const Pair& size)
 {
@@ -379,13 +380,15 @@ std::optional<Patch> patchOf(Geometry& geom, const Pair& start, const Pair& size
     Patch patch;
     patch.tile = geom.tile({hr0, hc0}, {hr1 - hr0, hc1 - hc0});
     patch.raster = grid::Raster{x0 - double(hc0), y0 - double(hr0), sx, sy, int(size[1]), int(size[0]), kx, ky};
+    patch.halo = halo;
     return patch;
 }
 // The vcr::grid surface over a tile's vertices: normals in the surface's physical space.
-std::unique_ptr<grid::Surface> gridSurface(const Geometry& geom, const GeometryTile& tile, grid::Interpolation interpolation)
+std::unique_ptr<grid::Surface> gridSurface(const Geometry& geom, const GeometryTile& tile, grid::Interpolation interpolation, bool secondOrderEdges = true)
 {
     grid::SurfaceOptions options;
     options.interpolation = interpolation;
+    options.secondOrderEdges = secondOrderEdges;
     options.flipNormals = geom.flipNormals;
     if (geom.surface.spacingUm) {
         const auto& spacing = *geom.surface.spacingUm;
@@ -467,7 +470,7 @@ SampleResult SampleReader::renderSurface(const Surface& surface, const Pair& sta
     result.metadata["surface"] = {{"id", surface.id}, {"uv_start", start}, {"uv_size", size}, {"offsets_um", offsetsUm},
                                   {"coordinate_frame", surfaceFrame(surface)}, {"reference_frame", s.referenceFrame}, {"array_to_level0", s.referenceMap.forward.json()}};
     const auto patch = patchOf(*geom, start, size);
-    const auto sheet = patch ? gridSurface(*geom, *patch->tile, interpolation) : nullptr;
+    const auto sheet = patch ? gridSurface(*geom, *patch->tile, interpolation, patch->halo >= 2) : nullptr;
     const grid::Raster raster = patch ? patch->raster : grid::Raster{};
     const std::vector<float> layers(offsetsUm.begin(), offsetsUm.end());
     for (auto& [name, target] : s.targets) {

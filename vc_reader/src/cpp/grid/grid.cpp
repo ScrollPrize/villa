@@ -124,7 +124,7 @@ struct Surface::Impl {
     {
         const std::size_t n = std::size_t(v.rows) * v.cols;
         du.resize(n*3); dv.resize(n*3); duv.resize(n*3);
-        Derivatives d{view(), v.rows, v.cols};
+        Derivatives d{view(), v.rows, v.cols, options.secondOrderEdges};
         for(std::size_t i=0;i<n;++i)d.firstAt(int(i),du.data(),dv.data());
         for(std::size_t i=0;i<n;++i)d.mixedAt(int(i),duv.data());
     }

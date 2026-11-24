@@ -64,6 +64,10 @@ struct SurfaceOptions {
     // Negate the patch normals (a grid whose rows and columns are mirrored against the
     // convention). Vertex normals given in `Vertices` keep their sign.
     bool flipNormals = false;
+    // Bicubic derivatives at a hole or the grid border may use the second order one sided step.
+    // False for a window of a larger grid whose context was cut to fit a budget: it keeps the
+    // first order steps there, as a window without context always did.
+    bool secondOrderEdges = true;
 };
 
 // A raster laid over the grid: pixel (i, j) sits at grid column x0 + i * sx + j * kx,
