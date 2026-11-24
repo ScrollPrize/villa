@@ -83,6 +83,25 @@ def test_eigh_and_sanitize_falls_back_to_cpu_on_cuda_and_rocm_errors(error_msg):
     assert torch.all(w[:, 1:] >= w[:, :-1])
 
 
+def test_eigh_and_sanitize_falls_back_to_numpy_when_cpu_torch_lacks_lapack():
+    M = torch.tensor([[[3.0, 0.5, 0.1], [0.5, 2.0, 0.2], [0.1, 0.2, 1.0]]], dtype=torch.float64)
+    calls = {"n": 0}
+
+    def no_lapack_eigh(tensor):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("rocSOLVER syevd failed on gfx906")
+        raise RuntimeError("linalg.eigh: Calling torch.linalg.eigh on a CPU tensor requires compiling PyTorch with LAPACK.")
+
+    with mock.patch("torch.linalg.eigh", side_effect=no_lapack_eigh):
+        w, v = _eigh_and_sanitize(M)
+    assert calls["n"] == 2
+    assert torch.isfinite(w).all() and torch.isfinite(v).all()
+    assert torch.all(w[:, 1:] >= w[:, :-1])
+    w_ref, _ = torch.linalg.eigh(M)
+    assert torch.allclose(w, w_ref.float(), atol=1e-5, rtol=1e-5)
+
+
 def test_eigh_and_sanitize_reraises_non_solver_runtime_error():
     M = torch.eye(3, dtype=torch.float64).unsqueeze(0)
     with mock.patch("torch.linalg.eigh", side_effect=RuntimeError("unrelated failure")):

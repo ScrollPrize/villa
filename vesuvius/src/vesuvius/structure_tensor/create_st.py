@@ -387,10 +387,18 @@ def _eigh_and_sanitize(M: torch.Tensor):
         w, v = torch.linalg.eigh(M)
     except RuntimeError as err:
         # Work around sporadic CUDA/ROCm GPU solver failures by retrying on CPU
+        # (falling back to NumPy's LAPACK if PyTorch was built without CPU LAPACK).
         if not _is_gpu_solver_error(err):
             raise
         M_cpu = M.cpu()
-        w_cpu, v_cpu = torch.linalg.eigh(M_cpu)
+        try:
+            w_cpu, v_cpu = torch.linalg.eigh(M_cpu)
+        except RuntimeError as cpu_err:
+            if "lapack" not in str(cpu_err).lower():
+                raise
+            w_np, v_np = np.linalg.eigh(M_cpu.numpy())
+            w_cpu = torch.from_numpy(w_np)
+            v_cpu = torch.from_numpy(v_np)
         w = w_cpu.to(M.device)
         v = v_cpu.to(M.device)
     # sanitize once
