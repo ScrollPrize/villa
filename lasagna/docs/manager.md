@@ -189,7 +189,7 @@ bound the least recently used cached chunks are removed. The input settings
 and final reader counters are copied from portable inference provenance
 (`inference.input`) into manager run metadata (`input`).
 This includes output-format overrides such as `--ome-compressor blosc-zstd`; newly
-created outputs otherwise use lossless Delta3D.
+created packed uint8 outputs otherwise use lossless Delta3D, and others Blosc/Zstd.
 Resumed arrays retain their persisted compressor; compact resumes reject incompatible codec
 or layout requests. `inference.json` inventories the
 actual compressor of every generated level.

@@ -201,7 +201,7 @@ def test_compact_options_and_resume_encoding(tmp_path):
     width = product("width", ["width"], dtype=np.float32)
     output = CompactOutputAdapter(root=tmp_path / "p.zarr", products=(p,width),
                                   n_levels=1, validity_channel="presence", blank_invalid=False)
-    kwargs = dict(base_shape_zyx=(4,4,4), ome_chunk=4,
+    kwargs = dict(base_shape_zyx=(4,4,4), ome_chunk=4, ome_compressor=None,
                   extra_fields={"width_encoding": "float32-input-voxels"})
     output.prepare(**kwargs)
     data = np.full((4,4,4), 128, np.uint8)
@@ -240,7 +240,7 @@ def test_delta3d_output_matches_blosc_and_resumes(tmp_path, n_levels):
             output.write_products_chunk([(p, {n: a[box] for n, a in data.items()})], chunk_origin_zyx=origin)
             assert output.validate_chunk(origin)
         output.build_pyramids(workers=1)
-        output.prepare(base_shape_zyx=(64, 64, 40), ome_chunk=32, ome_compressor=compressor)
+        output.prepare(base_shape_zyx=(64, 64, 40), ome_chunk=32, ome_compressor=None)
         stores[compressor] = root / "sd0"
     for level in range(n_levels):
         blosc, delta3d = (open_zarr(stores[c] / str(level)) for c in ("blosc-zstd", "vc-delta3d"))
@@ -248,6 +248,18 @@ def test_delta3d_output_matches_blosc_and_resumes(tmp_path, n_levels):
         np.testing.assert_array_equal(delta3d[:], blosc[:])
     with pytest.raises(ValueError, match="incompatible encoding"):
         output.prepare(base_shape_zyx=(64, 64, 40), ome_chunk=32)
+
+
+@pytest.mark.parametrize("compressor", ["blosc-zstd", "none"])
+def test_resume_adds_levels_with_stored_codec(tmp_path, compressor):
+    p = product("fiber", ["presence"])
+    kwargs = dict(root=tmp_path / "p.zarr", products=(p,), validity_channel="chunks")
+    CompactOutputAdapter(**kwargs, n_levels=2).prepare(base_shape_zyx=(16,16,16), ome_chunk=4,
+                                                       ome_compressor=compressor)
+    output = CompactOutputAdapter(**kwargs, n_levels=3)
+    output.prepare(base_shape_zyx=(16,16,16), ome_chunk=4, ome_compressor=None)
+    output.prepare(base_shape_zyx=(16,16,16), ome_chunk=4, ome_compressor=compressor)
+    assert open_zarr(tmp_path / "p.zarr/sd0/2").compressor == open_zarr(tmp_path / "p.zarr/sd0/0").compressor
 
 
 def test_packed_provenance(tmp_path):

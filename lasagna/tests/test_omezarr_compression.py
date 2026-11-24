@@ -15,7 +15,6 @@ from lasagna.tiled_predict3d import (
 )
 
 
-EXPECTED_DELTA3D = {"id": "vc-delta3d", "quant": 1}
 EXPECTED_ZSTD = {
     "id": "blosc",
     "cname": "zstd",
@@ -29,14 +28,13 @@ def _metadata(root: Path, level: int) -> dict:
     return json.loads((root / str(level) / ".zarray").read_text(encoding="utf-8"))
 
 
-def test_new_omezarr_levels_use_exact_shared_delta3d_and_open(tmp_path: Path):
+def test_new_omezarr_levels_use_exact_shared_zstd_and_open(tmp_path: Path):
     root = tmp_path / "fiber.ome.zarr"
     group = _create_omezarr(str(root), (9, 10, 11), 0, 3, 4, "presence")
 
-    assert omezarr_compressor_config(DEFAULT_OME_COMPRESSOR) == EXPECTED_DELTA3D
-    assert omezarr_compressor_config("blosc-zstd") == EXPECTED_ZSTD
+    assert omezarr_compressor_config(DEFAULT_OME_COMPRESSOR) == EXPECTED_ZSTD
     for level in range(3):
-        assert _metadata(root, level)["compressor"] == EXPECTED_DELTA3D
+        assert _metadata(root, level)["compressor"] == EXPECTED_ZSTD
         assert tuple(group[str(level)].shape) == tuple(open_zarr(root / str(level)).shape)
 
     group["0"][0:1, 0:1, 0:1] = np.asarray([[[17]]], dtype=np.uint8)

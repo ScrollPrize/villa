@@ -344,14 +344,15 @@ runner:
 lasagna-preprocess predict3d ... --devices all
 ```
 
-New Fiber and Lasagna `predict3d` OME-Zarr arrays use lossless Delta3D
+New packed Fiber and Lasagna `predict3d` uint8 arrays use lossless Delta3D
 (`vc-delta3d`, its `fast` preset) at every pyramid level. It is smaller but
-slower to write and read than `--ome-compressor blosc-zstd` (`clevel=3`, byte
-shuffle). Float32 arrays (Fiber `--no-width-uint8-base`) need `blosc-zstd`.
-Existing unpacked arrays keep their compressor when inference resumes and a
-mismatch is reported; a packed output resumes only with the compressor it was
-created with. Use `--ome-compressor none` only when uncompressed compatibility
-output is required.
+slower to write and read than Blosc/Zstd (`clevel=3`, byte shuffle), which
+float32 arrays (Fiber `--no-width-uint8-base`) and `--output-format legacy`
+use unless `--ome-compressor` says otherwise. Existing arrays keep their
+compressor when inference resumes; for unpacked arrays a mismatch with
+`--ome-compressor` is reported, and a packed output rejects it. Use
+`--ome-compressor none` only when uncompressed compatibility output is
+required.
 
 Use a subset with `--devices cuda:0,cuda:2`. Input tiles are read in the
 background through `vc_reader` outside GPU workers. The tile Cartesian product
