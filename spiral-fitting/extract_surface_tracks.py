@@ -21,8 +21,8 @@ Two backends write the same keys in the same format:
 
   gpu  Brook (brook-cu12) and cuCIM on NVIDIA GPUs of compute capability 8.0 or
        newer, Linux x86-64 only, one process per GPU (``surface_tracks_gpu.py``).
-  cpu  Kimimaro on the CPU, one slab at a time, or several with
-       --slab-workers; vc_reader labels connected components on the CPU.
+  cpu  Kimimaro on the CPU, several slabs at once in worker processes
+       (--slab-workers); vc_reader labels connected components on the CPU.
 
 Brook implements Kimimaro's algorithm on the GPU; its skeletons are close to
 Kimimaro's but not guaranteed to be identical. ``--backend auto`` uses the GPU
@@ -70,10 +70,12 @@ path_mode = 'interjoint'  # 'interjoint' = every chain between branch/terminal n
 # CPU backend: slabs processed at once by worker processes; 'auto' picks the count from the CPUs
 # and memory (auto_slab_workers), and is 1 when kimimaro_parallel > 1 or predictions are remote
 slab_workers = 'auto'
-# CPU backend: Kimimaro processes per slab. Kimimaro spawns a new pool of them for every slab,
-# which on Windows and macOS takes far longer than the work they share out; use --slab-workers
-# there to run slabs in parallel instead.
-kimimaro_parallel = 8 if sys.platform.startswith('linux') else 1
+# CPU backend: Kimimaro processes per slab; 'auto' is 1 when several slab workers run, and
+# _SERIAL_KIMIMARO_PARALLEL when slabs run one at a time (cpu_parallelism)
+kimimaro_parallel = 'auto'
+# Kimimaro spawns a new pool of processes for every slab, which on Windows and macOS takes far
+# longer than the work they share out, so there a slab gets one even when slabs run one at a time
+_SERIAL_KIMIMARO_PARALLEL = 8 if sys.platform.startswith('linux') else 1
 
 BACKENDS = ('auto', 'gpu', 'cpu')
 # An unfilled placeholder such as '<bucket>' in a configured path.
@@ -162,12 +164,16 @@ def geometry():
     )
 
 
-def get_skeleton_tracks(cc_labels, offset_zyx, verbose=False, skeletonize=None):
+def get_skeleton_tracks(cc_labels, offset_zyx, verbose=False, skeletonize=None, parallel=None):
     """Tracks of one slab; ``skeletonize`` defaults to ``kimimaro.skeletonize``.
 
     Any function with Kimimaro's signature can be passed, e.g. ``brook.skeletonize``.
+    ``parallel`` is the number of Kimimaro processes; None takes ``kimimaro_parallel`` as for
+    slabs run one at a time.
     """
     kwargs = skeletonize_kwargs()
+    if parallel is None:
+        parallel = _SERIAL_KIMIMARO_PARALLEL if kimimaro_parallel == 'auto' else kimimaro_parallel
     if skeletonize is None:
         import kimimaro
         skeletonize = kimimaro.skeletonize
@@ -177,7 +183,7 @@ def get_skeleton_tracks(cc_labels, offset_zyx, verbose=False, skeletonize=None):
         cc_labels,
         **kwargs,
         progress=verbose,
-        parallel=kimimaro_parallel,
+        parallel=parallel,
         parallel_chunk_size=250,
         in_place=True,
     )
@@ -231,7 +237,7 @@ def prepare_cc_labels(predictions_binary):
     return cc_labels
 
 
-def _slab_tracks(predictions_zarr_array, index, offset_zyx):
+def _slab_tracks(predictions_zarr_array, index, offset_zyx, kimimaro_processes):
     # Pickled tracks of one slab (read, binarize, CC, skeletonize), as stored in the DBM.
     predictions = binarize(predictions_zarr_array[index])
     if predictions.max() == 0:
@@ -239,7 +245,8 @@ def _slab_tracks(predictions_zarr_array, index, offset_zyx):
     cc_labels = prepare_cc_labels(predictions)
     # the full-resolution slab is the largest array of a slab; free it before skeletonizing
     del predictions
-    return pickle.dumps(get_skeleton_tracks(cc_labels, offset_zyx=offset_zyx))
+    return pickle.dumps(get_skeleton_tracks(cc_labels, offset_zyx=offset_zyx,
+                                            parallel=kimimaro_processes))
 
 
 def binarize(predictions):
@@ -252,8 +259,7 @@ def binarize(predictions):
 _worker_array = None  # the opened array, inherited by forked workers
 # Module settings the slab workers read. Spawned workers re-import this file, so they get
 # the parent's values (possibly set from the command line) through _worker_init.
-_WORKER_SETTINGS = ('downsample_factor', 'dust_threshold', 'max_area_threshold', 'path_mode',
-                    'kimimaro_parallel')
+_WORKER_SETTINGS = ('downsample_factor', 'dust_threshold', 'max_area_threshold', 'path_mode')
 
 
 def _worker_init(array, settings):
@@ -262,9 +268,9 @@ def _worker_init(array, settings):
     globals().update(settings)
 
 
-def _worker_slab(job):
+def _worker_slab(kimimaro_processes, job):
     key, index, offset_zyx = job
-    return key, _slab_tracks(_worker_array, index, offset_zyx)
+    return key, _slab_tracks(_worker_array, index, offset_zyx, kimimaro_processes)
 
 
 def _run_slabs(predictions_zarr_array, tracks_db, jobs, desc):
@@ -274,15 +280,14 @@ def _run_slabs(predictions_zarr_array, tracks_db, jobs, desc):
     jobs = [j for j in jobs if j[0] not in tracks_db]
     if not jobs:
         return
-    workers = slab_workers
-    if workers == 'auto':
-        workers = auto_slab_workers(predictions_zarr_array.shape, len(jobs))
-    print(f'  {len(jobs)} slabs, {workers} slab worker(s) with {kimimaro_parallel} Kimimaro '
+    workers, processes = cpu_parallelism(predictions_zarr_array.shape, len(jobs))
+    print(f'  {len(jobs)} slabs, {workers} slab worker(s) with {processes} Kimimaro '
           f'process(es) each')
     if workers <= 1:
         for key, index, offset in tqdm(jobs, desc=desc):
-            tracks_db[key] = _slab_tracks(predictions_zarr_array, index, offset)
+            tracks_db[key] = _slab_tracks(predictions_zarr_array, index, offset, processes)
         return
+    import functools
     import multiprocessing
     from concurrent.futures import ProcessPoolExecutor
     global _worker_array
@@ -298,7 +303,8 @@ def _run_slabs(predictions_zarr_array, tracks_db, jobs, desc):
             workers, mp_context=multiprocessing.get_context('spawn'),
             initializer=_worker_init, initargs=(predictions_zarr_array, settings))
     try:
-        for key, data in tqdm(pool.map(_worker_slab, jobs), total=len(jobs), desc=desc):
+        slabs = pool.map(functools.partial(_worker_slab, processes), jobs)
+        for key, data in tqdm(slabs, total=len(jobs), desc=desc):
             tracks_db[key] = data
     finally:
         # On an error or Ctrl-C, drop the slabs not started yet; running slabs finish first.
@@ -423,6 +429,12 @@ def check_vertical_slab_grid(tracks_dbm_path):
 # ribbon peaked at 1.8 GB, a 1532 x 7948 x 4 slab at 1.0 GB
 _WORKER_BASE_BYTES = 256 * 2**20
 _WORKER_BYTES_PER_VOXEL = 16
+# --slab-workers auto starts one worker for every two CPUs, and at most this many. A worker keeps
+# more than one CPU busy (8 workers kept about 11 of 24 busy on Linux x86-64), so half of the CPUs
+# fills the machine without oversubscribing it. On PHerc0211 at downsample 2, 1532 slices of
+# 1536 x 1536, 8 workers ran about 1.8x faster than 4 on Linux x86-64 and 1.2x faster than 6 on an
+# Apple M4 Pro, at about 0.37 GB each; more than 8 was not measured, while each adds a slab's memory
+_MAX_AUTO_SLAB_WORKERS = 8
 
 
 def _physical_memory():
@@ -447,22 +459,37 @@ def _physical_memory():
 
 
 def auto_slab_workers(shape, n_jobs):
-    """Slab workers for ``--slab-workers auto``: one per CPU, as many as fit in half of the RAM
-    with the largest slab of this extraction, at most one per slab, and 1 when Kimimaro runs
-    several processes per slab itself."""
-    if kimimaro_parallel > 1 or n_jobs <= 1:
+    """Slab workers for ``--slab-workers auto``: one for every two CPUs, at most
+    ``_MAX_AUTO_SLAB_WORKERS``, as many as fit in half of the RAM with the largest slab of this
+    extraction, at most one per slab, and 1 when ``--kimimaro-parallel`` asks for several Kimimaro
+    processes per slab."""
+    if kimimaro_parallel != 'auto' and kimimaro_parallel > 1 or n_jobs <= 1:
         return 1
     cpus = os.process_cpu_count() if hasattr(os, 'process_cpu_count') else os.cpu_count()
     z_range = max(0, min(z_max, shape[0]) - min(z_min, shape[0]))
     largest = max(z_chunk_depth_h * shape[1] * shape[2],
                   z_range * yx_chunk_thickness_v * shape[2],
                   z_range * shape[1] * yx_chunk_thickness_v)
-    workers = min(cpus or 1, n_jobs)
+    workers = min((cpus or 1) // 2, _MAX_AUTO_SLAB_WORKERS, n_jobs)
     memory = _physical_memory()
     if memory:
         per_worker = _WORKER_BASE_BYTES + _WORKER_BYTES_PER_VOXEL * largest
         workers = min(workers, int(memory // 2 // per_worker))
     return max(1, workers)
+
+
+def cpu_parallelism(shape, n_jobs):
+    """(slab workers, Kimimaro processes per slab) for ``n_jobs`` slabs of an array of ``shape``:
+    ``slab_workers`` and ``kimimaro_parallel`` with ``'auto'`` resolved. A set value always wins;
+    auto Kimimaro processes are 1 when several slab workers run, since the workers already keep
+    the CPUs busy, and ``_SERIAL_KIMIMARO_PARALLEL`` when slabs run one at a time."""
+    workers = slab_workers
+    if workers == 'auto':
+        workers = auto_slab_workers(shape, n_jobs)
+    processes = kimimaro_parallel
+    if processes == 'auto':
+        processes = 1 if workers > 1 else _SERIAL_KIMIMARO_PARALLEL
+    return workers, processes
 
 
 def run_cpu(predictions_path, tracks_dbm_path):
@@ -580,7 +607,7 @@ def check_downsample_factor(tracks_dbm_path, factor):
     os.replace(record + '.tmp', record)
 
 
-def _slab_workers_arg(value):
+def _count_or_auto(value):
     if value == 'auto':
         return value
     try:
@@ -628,16 +655,16 @@ def parse_args(argv=None):
              '(default: all visible GPUs)',
     )
     parser.add_argument(
-        '--slab-workers', metavar='N|auto', type=_slab_workers_arg, default=slab_workers,
+        '--slab-workers', metavar='N|auto', type=_count_or_auto, default=slab_workers,
         help='CPU backend: slabs processed at once in worker processes, each holding its own '
-             'slab in memory; local predictions only. auto: one per CPU, as many as half of the '
-             'RAM holds, and 1 with --kimimaro-parallel > 1 or remote predictions '
-             '(default: %(default)s)',
+             'slab in memory; local predictions only. auto: one for every two CPUs, at most '
+             f'{_MAX_AUTO_SLAB_WORKERS}, as many as half of the RAM holds, and 1 with '
+             '--kimimaro-parallel > 1 or remote predictions (default: %(default)s)',
     )
     parser.add_argument(
-        '--kimimaro-parallel', metavar='N', type=int, default=kimimaro_parallel,
-        help='CPU backend: Kimimaro processes per slab; use 1 with --slab-workers > 1 '
-             '(default: %(default)s)',
+        '--kimimaro-parallel', metavar='N|auto', type=_count_or_auto, default=kimimaro_parallel,
+        help='CPU backend: Kimimaro processes per slab. auto: 1 with more than one slab worker, '
+             f'else {_SERIAL_KIMIMARO_PARALLEL} on this OS (default: %(default)s)',
     )
     parser.add_argument(
         '--packed-store', action=argparse.BooleanOptionalAction,
@@ -669,7 +696,7 @@ def parse_args(argv=None):
         parser.error('--slab-workers and --kimimaro-parallel apply to --backend cpu only')
     if args.slab_workers == 'auto' and '://' in args.predictions:
         args.slab_workers = 1
-    if args.slab_workers != 'auto' and args.slab_workers < 1 or args.kimimaro_parallel < 1:
+    if any(count != 'auto' and count < 1 for count in (args.slab_workers, args.kimimaro_parallel)):
         parser.error('--slab-workers and --kimimaro-parallel must be at least 1')
     if args.slab_workers != 'auto' and args.slab_workers > 1 and '://' in args.predictions:
         parser.error('--slab-workers > 1 needs local predictions; workers cannot share a remote store')

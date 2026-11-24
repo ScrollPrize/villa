@@ -394,20 +394,38 @@ def test_import_and_parse_args_stay_lazy():
                    check=True, timeout=120)
 
 
-def test_cpu_options_on_every_os(monkeypatch):
-    # The slab workers are forked on Linux and spawned elsewhere, so --slab-workers is accepted
-    # on every OS. Kimimaro spawns its processes anew for every slab, which is slow on Windows and
-    # macOS: there a slab gets one by default.
-    argv = ['--predictions', 'p.zarr', '--out', 't.dbm', '--backend', 'cpu']
+@pytest.mark.parametrize('platform, serial', [('linux', 8), ('darwin', 1), ('win32', 1)])
+def test_cpu_defaults_on_every_os(monkeypatch, tmp_path, platform, serial):
+    # With no CPU flags, slabs run in one worker for every two CPUs with one Kimimaro process
+    # each, on every OS (workers are forked on Linux and spawned elsewhere), and a set
+    # --slab-workers or --kimimaro-parallel always wins. Kimimaro spawns its processes anew for
+    # every slab, which is slow on Windows and macOS, so there a slab run alone gets one too.
+    argv = ['--predictions', 'p.zarr', '--out', str(tmp_path / 't.dbm'), '--backend', 'cpu',
+            '--no-packed-store']
     est.parse_args(argv)  # imports what parse_args needs, on the real OS
-    for platform, kimimaro_parallel in (('linux', 8), ('darwin', 1), ('win32', 1)):
-        monkeypatch.setattr(sys, 'platform', platform)
+    monkeypatch.setattr(sys, 'platform', platform)
+    monkeypatch.setattr(os, 'cpu_count', lambda: 14)
+    monkeypatch.setattr(os, 'process_cpu_count', lambda: 14, raising=False)
+
+    def run(*flags):
+        # a fresh module each time: the defaults are set on import, and main() overwrites them
         spec = importlib.util.spec_from_file_location(f'est_{platform}', est.__file__)
         module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)  # the defaults are set on import
-        assert module.parse_args(argv).kimimaro_parallel == kimimaro_parallel
-        args = module.parse_args([*argv, '--slab-workers', '4', '--kimimaro-parallel', '1'])
-        assert (args.slab_workers, args.kimimaro_parallel) == (4, 1)
+        spec.loader.exec_module(module)
+        module._physical_memory = lambda: 64 * 2**30
+        module.select_backend = lambda requested, gpus=None: requested
+        resolved = []
+        module.run_cpu = lambda *args: resolved.append(module.cpu_parallelism((1000, 1000, 1000), 384))
+        module.main([*argv, *flags])
+        return resolved[0]
+
+    assert run() == (7, 1)
+    assert run('--slab-workers', '4') == (4, 1)
+    assert run('--slab-workers', '1') == (1, serial)
+    assert run('--kimimaro-parallel', '1') == (7, 1)
+    assert run('--kimimaro-parallel', '4') == (1, 4)
+    assert run('--slab-workers', '3', '--kimimaro-parallel', '2') == (3, 2)
+    assert run('--predictions', 's3://b/p.zarr') == (1, serial)
 
 
 def test_command_line_reaches_the_backend(monkeypatch, tmp_path):

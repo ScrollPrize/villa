@@ -91,22 +91,26 @@ Kimimaro skeletonization. The local `vc-reader` dependency requires its native
 build prerequisites (see [vc_reader](../vc_reader/README.md)).
 
 Slabs run in parallel in worker processes, each with one Kimimaro process and
-its own slab in RAM. `--slab-workers auto`, the default, starts one worker per
-CPU, as many as fit in half of the RAM at about 16 bytes per voxel of the
-largest slab plus 256 MB (a full-width ribbon of a 7948 × 7948 scroll at
-downsample 2 peaked at 1.8 GB), and one slab at a time when the predictions are
-remote or Kimimaro runs several processes per slab. Kimimaro starts its own
-processes anew for every slab, so on macOS and Windows a slab gets one by
-default; on Linux the default stays one worker with eight Kimimaro processes per
-slab. `--slab-workers N` sets the count, for example to leave memory for other
-work.
+its own slab in RAM, on every platform. `--slab-workers auto`, the default,
+starts one worker for every two CPUs, at most 8 (each worker keeps more than one
+CPU busy, and more than 8 has not been measured). It starts only as many as fit
+in half of the RAM at about 16 bytes per voxel of the largest slab plus 256 MB
+(a full-width ribbon of a 7948 × 7948 scroll at downsample 2 peaked at 1.8 GB;
+1536 × 1536 crops take about 0.4 GB a worker), and runs one slab at a time when
+the predictions are remote. `--kimimaro-parallel auto`, also the default, gives
+each slab one Kimimaro process when several workers run. When slabs run one at
+a time, Linux gives each slab 8; Kimimaro starts its processes anew for every
+slab, which is slow on macOS and Windows, so there a slab still gets one. A set
+`--slab-workers N` or `--kimimaro-parallel N` always wins; with
+`--kimimaro-parallel` above 1 and no `--slab-workers`, slabs run one at a time.
+Pass `--slab-workers N` to leave CPUs or memory for other work.
 
 ```sh
 python extract_surface_tracks.py --backend cpu --predictions /data/predictions.zarr \
   --out /data/tracks.dbm --z-min 9048 --z-max 9548
 python extract_surface_tracks.py --backend cpu --predictions /data/predictions.zarr \
   --out /data/tracks.dbm --z-min 9048 --z-max 9548 \
-  --slab-workers 4 --kimimaro-parallel 1
+  --slab-workers 4
 python -m pytest -q tests/test_cc_labels.py tests/test_extract_surface_tracks.py
 ```
 
@@ -1615,9 +1619,10 @@ only the `'interjoint'` path mode.
 Brook implements Kimimaro's skeletonization on the GPU. Its skeletons are close
 to Kimimaro's but not always identical, so the two backends' DBMs agree closely
 rather than byte for byte (see the measurements below). With several Kimimaro
-processes per slab (Linux's default of 8), Kimimaro collects their skeletons as
-they finish, so the order of the tracks within a key can also differ between two
-CPU runs; with one per slab (the default on macOS and Windows) it cannot.
+processes per slab (Linux's default when slabs run one at a time), Kimimaro
+collects their skeletons as they finish, so the order of the tracks within a key
+can also differ between two CPU runs; with one per slab (the default whenever
+several slab workers run) it cannot.
 
 Every key (`h:{z}`, `vy:{y}`, `vx:{x}`) holds a pickled list of `(N, 3)` int32
 ZYX arrays in full-resolution voxels, and an empty slab holds an empty list.
