@@ -156,7 +156,8 @@ struct Geometry {
     std::optional<Target> explicitMask, normals;
     std::array<float, 9> normalTransform{};
     std::string key;
-    [[nodiscard]] std::shared_ptr<const GeometryTile> tile(const std::array<std::int64_t, 2>& start, const std::array<std::int64_t, 2>& size);
+    // budgetCells: the cells charged to the work budget when the tile holds context around the cells a render needs (0: all of them).
+    [[nodiscard]] std::shared_ptr<const GeometryTile> tile(const std::array<std::int64_t, 2>& start, const std::array<std::int64_t, 2>& size, std::size_t budgetCells = 0);
     std::optional<Target> auxiliary(const std::optional<Shared<Source>>& source);
 };
 std::shared_ptr<Geometry> geometryOf(AlignedEngine::Impl& impl, const Surface& surface);

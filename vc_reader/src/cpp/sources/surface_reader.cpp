@@ -199,12 +199,12 @@ Geometry::Geometry(AlignedEngine::Impl& o, const Surface& s) : owner(o), surface
     }
 }
 
-std::shared_ptr<const GeometryTile> Geometry::tile(const Pair& start, const Pair& size)
+std::shared_ptr<const GeometryTile> Geometry::tile(const Pair& start, const Pair& size, std::size_t budgetCells)
 {
     const auto cacheKey = "geometry|" + key + "|" + std::to_string(start[0]) + "," + std::to_string(start[1]) + "|" + std::to_string(size[0]) + "," + std::to_string(size[1]);
     if (const auto* cached = owner.tiles.get(cacheKey)) return std::static_pointer_cast<const GeometryTile>(*cached);
     const auto cells = std::size_t(size[0] * size[1]);
-    if (cells * 80 > owner.workBytes) throw DecodeBudgetError("geometry tile exceeds sampling_work_bytes");
+    if ((budgetCells ? budgetCells : cells) * 80 > owner.workBytes) throw DecodeBudgetError("geometry tile exceeds sampling_work_bytes");
     owner.largestGeometryCells = std::max(owner.largestGeometryCells, std::size_t(std::max(size[0], size[1])));
     auto out = std::make_shared<GeometryTile>();
     out->rows = size[0];
@@ -349,7 +349,7 @@ struct Patch {
     std::shared_ptr<const GeometryTile> tile;
     grid::Raster raster;
 };
-std::optional<Patch> patchOf(Geometry& geom, const Pair& start, const Pair& size)
+std::optional<Patch> patchOf(Geometry& geom, const Pair& start, const Pair& size, bool context)
 {
     const auto& m = geom.fromUv.forward;
     const double u = double(start[1]), v = double(start[0]);
@@ -366,13 +366,16 @@ std::optional<Patch> patchOf(Geometry& geom, const Pair& start, const Pair& size
     const auto c0 = std::max<std::int64_t>(0, std::int64_t(std::floor(minX))), c1 = std::min<std::int64_t>(cols, std::int64_t(std::floor(maxX)) + 2);
     const auto r0 = std::max<std::int64_t>(0, std::int64_t(std::floor(minY))), r1 = std::min<std::int64_t>(rows, std::int64_t(std::floor(maxY)) + 2);
     if (c1 - c0 < 2 || r1 - r0 < 2) return std::nullopt;
-    // Two more vertices around the window: the Hermite derivatives of its cells (centred
-    // differences, one sided only at the grid's own border or next to a hole) then equal
-    // the whole grid's, so a patch renders as the same pixels of any larger patch.
-    const auto hc0 = std::max<std::int64_t>(0, c0 - 2), hc1 = std::min<std::int64_t>(cols, c1 + 2);
-    const auto hr0 = std::max<std::int64_t>(0, r0 - 2), hr1 = std::min<std::int64_t>(rows, r1 + 2);
+    // Two more vertices around the window, where the grid has them: the Hermite derivatives of its cells
+    // (centred differences, one sided only at the grid's own border or next to a hole) then equal the whole
+    // grid's, so a patch renders as the same pixels of any larger patch, and with the same signed normals.
+    // Only the cells are charged to the work budget: the answer must not change with the budget, and the
+    // context is a fixed ring, a small share of any window large enough for the budget to matter.
+    const std::int64_t halo = context ? 2 : 0;
+    const auto hc0 = std::max<std::int64_t>(0, c0 - halo), hc1 = std::min<std::int64_t>(cols, c1 + halo);
+    const auto hr0 = std::max<std::int64_t>(0, r0 - halo), hr1 = std::min<std::int64_t>(rows, r1 + halo);
     Patch patch;
-    patch.tile = geom.tile({hr0, hc0}, {hr1 - hr0, hc1 - hc0});
+    patch.tile = geom.tile({hr0, hc0}, {hr1 - hr0, hc1 - hc0}, std::size_t((r1 - r0) * (c1 - c0)));
     patch.raster = grid::Raster{x0 - double(hc0), y0 - double(hr0), sx, sy, int(size[1]), int(size[0]), kx, ky};
     return patch;
 }
@@ -461,34 +464,48 @@ SampleResult SampleReader::renderSurface(const Surface& surface, const Pair& sta
     result.metadata = s.metadata.is_null() ? json::object() : s.metadata;
     result.metadata["surface"] = {{"id", surface.id}, {"uv_start", start}, {"uv_size", size}, {"offsets_um", offsetsUm},
                                   {"coordinate_frame", surfaceFrame(surface)}, {"reference_frame", s.referenceFrame}, {"array_to_level0", s.referenceMap.forward.json()}};
-    const auto patch = patchOf(*geom, start, size);
-    const auto sheet = patch ? gridSurface(*geom, *patch->tile, interpolation) : nullptr;
-    const grid::Raster raster = patch ? patch->raster : grid::Raster{};
-    const std::vector<float> layers(offsetsUm.begin(), offsetsUm.end());
-    for (auto& [name, target] : s.targets) {
-        auto out = renderVolume(s, target, sheet.get(), raster, size, layers, toReference);
-        for (auto& [key, child] : target.companions) out.masks.emplace_back(key, renderVolume(s, child, sheet.get(), raster, size, layers, toReference).data);
-        result.targets.emplace_back(name, std::move(out));
-    }
-    // Surface-registered targets are read at the patch's own UV pixels.
-    const auto uv = patchUv(size);
-    const auto count = uv.size() / 2;
-    const std::array<double, 3> uvOrigin{double(start[1]), double(start[0]), 0};
-    for (const auto& [name, target] : s.surfaceTargets) {
-        const auto local = pixelPoints(uv.data(), count, target.mapping.forward, uvOrigin);
-        auto [values, valid] = s.samplePoints(target, local.points, local.base);
-        TargetResult out;
-        out.data = values.reshaped({target.channels, size[0], size[1]});
-        out.valid = valid.reshaped({1, size[0], size[1]});
-        for (const auto& [key, child] : target.companions) {
-            const auto p = pixelPoints(uv.data(), count, child.mapping.forward, uvOrigin);
-            auto [maskValues, unused] = s.samplePoints(child, p.points, p.base);
-            (void)unused;
-            out.masks.emplace_back(key, maskValues.reshaped({child.channels, size[0], size[1]}));
+    const SampleResult base = result;
+    // The context ring around the cells (bicubic only) is optional: when reading it or sampling with it fails (an
+    // unavailable chunk, a sampling budget the extra points exceed), the render is repeated on the cells alone, so a
+    // render the cells can serve is never refused because of it, and an error in the cells themselves still surfaces.
+    const auto attempt = [&](bool context) {
+        SampleResult result = base;
+        const auto patch = patchOf(*geom, start, size, context);
+        const auto sheet = patch ? gridSurface(*geom, *patch->tile, interpolation) : nullptr;
+        const grid::Raster raster = patch ? patch->raster : grid::Raster{};
+        const std::vector<float> layers(offsetsUm.begin(), offsetsUm.end());
+        for (auto& [name, target] : s.targets) {
+            auto out = renderVolume(s, target, sheet.get(), raster, size, layers, toReference);
+            for (auto& [key, child] : target.companions) out.masks.emplace_back(key, renderVolume(s, child, sheet.get(), raster, size, layers, toReference).data);
+            result.targets.emplace_back(name, std::move(out));
         }
-        result.targets.emplace_back(name, std::move(out));
+        // Surface-registered targets are read at the patch's own UV pixels.
+        const auto uv = patchUv(size);
+        const auto count = uv.size() / 2;
+        const std::array<double, 3> uvOrigin{double(start[1]), double(start[0]), 0};
+        for (const auto& [name, target] : s.surfaceTargets) {
+            const auto local = pixelPoints(uv.data(), count, target.mapping.forward, uvOrigin);
+            auto [values, valid] = s.samplePoints(target, local.points, local.base);
+            TargetResult out;
+            out.data = values.reshaped({target.channels, size[0], size[1]});
+            out.valid = valid.reshaped({1, size[0], size[1]});
+            for (const auto& [key, child] : target.companions) {
+                const auto p = pixelPoints(uv.data(), count, child.mapping.forward, uvOrigin);
+                auto [maskValues, unused] = s.samplePoints(child, p.points, p.base);
+                (void)unused;
+                out.masks.emplace_back(key, maskValues.reshaped({child.channels, size[0], size[1]}));
+            }
+            result.targets.emplace_back(name, std::move(out));
+        }
+        return result;
+    };
+    if (interpolation == grid::Interpolation::Bicubic) {
+        try { return attempt(true); }
+        catch (const Cancelled&) { throw; }  // a stopped read is not retried
+        catch (const std::runtime_error&) {}  // a read or budget error (CacheMiss, DecodeBudgetError, HTTP): the ring was optional
+        catch (const std::bad_alloc&) {}
     }
-    return result;
+    return attempt(false);
 }
 
 Surface SampleReader::surfaceNamed(const std::string& id) const
