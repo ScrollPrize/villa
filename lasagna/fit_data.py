@@ -1350,6 +1350,7 @@ def load_3d_streaming(
 	dense channel tensors set to None and sparse_caches populated instead.
 	"""
 	from sparse_cache import READER_MEMORY_CACHE_BYTES, SparseChunkGroupCache
+	from sparse_pool_cache import POOLED_READER_MEMORY_CACHE_BYTES, PooledChunkGroupCache
 
 	vol = LasagnaVolume.load(path, require_umbilicus=require_umbilicus)
 	gmag_enc = vol.grad_mag_encode_scale / vol.grad_mag_factor
@@ -1362,7 +1363,7 @@ def load_3d_streaming(
 	_skip = skip_channels or set()
 
 	# Build sparse caches per group
-	sparse_caches: dict[str, SparseChunkGroupCache] = {}
+	sparse_caches: dict[str, SparseChunkGroupCache | PooledChunkGroupCache] = {}
 	channel_spacing: dict[str, tuple[float, float, float]] = {}
 
 	# Track finest scaledown for origin alignment
@@ -1380,7 +1381,10 @@ def load_3d_streaming(
 
 		source = resolve_streaming_zarr_source(vol, group)
 		zarr_path = source.zarr_path
-		reader = open_zarr(zarr_path, memory_cache=READER_MEMORY_CACHE_BYTES)
+		# Off CUDA the pooled cache keeps every chunk in host memory already, so the reader's
+		# decoded-chunk cache only has to serve halo re-reads between syncs.
+		memory_cache = READER_MEMORY_CACHE_BYTES if torch.device(device).type == "cuda" else POOLED_READER_MEMORY_CACHE_BYTES
+		reader = open_zarr(zarr_path, memory_cache=memory_cache)
 		shape = tuple(int(v) for v in reader.shape)
 		Z, Y, X, is_3d = _validate_group_zarr_shape(
 			vol=vol,
@@ -1396,7 +1400,10 @@ def load_3d_streaming(
 			ch_idx = group.channels.index(ch)
 			channel_indices[ch] = ch_idx
 
-		cache = SparseChunkGroupCache(
+		# CUDA (ROCm included) keeps its device-pointer cache and .cu kernels; every
+		# other device (CPU, MPS) gets the pooled cache with torch-op/Metal samplers.
+		cache_cls = SparseChunkGroupCache if torch.device(device).type == "cuda" else PooledChunkGroupCache
+		cache = cache_cls(
 			channels=channels,
 			reader=reader,
 			vol_shape_zyx=(Z, Y, X),
