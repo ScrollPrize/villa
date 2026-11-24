@@ -175,7 +175,8 @@ def test_a_job_that_cannot_read_its_settings_fails_through_its_failure_handler(t
     persistent errors. (`volreg job`, before the pipeline is even built.)"""
     as_windows_locks(monkeypatch)
     directory = scored_up_to_score(tmp_path)
-    rec.Record(directory).write(pipeline_stages.PARAMS, {"blind": {"count": 20}})
+    # A setting of the stage itself: a stamp that took the defaults for it would not match.
+    rec.Record(directory).write(pipeline_stages.PARAMS, {"score": {"note": "a setting"}})
     monkeypatch.setattr(filelock, "RETRY_SECONDS", 0.2)
     held = [True]
     refuse_opens_of(monkeypatch, directory / pipeline_stages.PARAMS, lambda: 10 ** 9 if held[0] else 0)

@@ -305,17 +305,20 @@ class Pipeline:
             self._release_lock(handle)
         return stamp
 
-    def _unstarted_failure(self, name, error):
+    def _unstarted_failure(self, name, error, settings_read=True):
         """The stamp of a job that failed before its stage began: what it needs, or the
         pair's settings, could not be read. Its inputs are recorded if they can be read now
-        (then it is failed as any job is, until they change); if not, none are, and it is
-        failed until the stage is redone. The failure is logged as any job's is."""
+        (then it is failed as any job is, until they change); if not, or if the pair's
+        settings could not be read (`settings_read`), so that inputs read now would be the
+        defaults' and never match, none are, and it is failed until the stage is redone. The
+        failure is logged as any job's is."""
         stamp = {"stage": name, "inputs": None, "params": None, "code": code_version(),
                  "started": rec.now(), "status": "failed", "finished": rec.now(),
                  "error": f"{type(error).__name__}: {error}", "traceback": traceback.format_exc(),
                  "failed_before_start": True, "failed_under_redo_mark": self._started.get(name)}
         try:
-            stamp |= {"inputs": self.inputs(name), "params": self.stage_params(name)}
+            if settings_read:
+                stamp |= {"inputs": self.inputs(name), "params": self.stage_params(name)}
         except Exception:   # noqa: BLE001 - still unreadable: no inputs, failed until redone
             pass
         try:
@@ -330,7 +333,7 @@ class Pipeline:
         the stamp; RuntimeError if a job holds the stage."""
         handle = self._take_lock(name)
         try:
-            stamp = self._unstarted_failure(name, error)
+            stamp = self._unstarted_failure(name, error, settings_read=False)
             with self._launch_guard():
                 self._write_stamp(name, stamp)
             return stamp
