@@ -15,6 +15,7 @@
 #include "FiberConstraintSources.hpp"
 #include "vc/fiber_tracer/FiberAxialAlignment.hpp"
 #include "vc/fiber_tracer/FiberBendSeeds.hpp"
+#include "vc/fiber_tracer/FiberPredictionNormals.hpp"
 #include "vc/fiber_tracer/FiberStripNormals.hpp"
 #include <vc_object_store/objects/FiberConstraintGraph.hpp>
 #include <vc_object_store/objects/FiberGraphSolveExtension.hpp>
@@ -478,6 +479,240 @@ int runFiberConstraintExtraction(int argc, char** argv)
             :std::make_unique<vc::lasagna::LasagnaGroupArrays>(samplerOptions.maxCachedBytes,samplerOptions.channelCache);
         presenceArrays->readerThreads=samplerOptions.readerThreads;
         presence=vc::lasagna::bindLasagnaChannel(predictionManifest,"presence",*presenceArrays);
+    }
+    if(cfg.contains("prediction_normals_output")) {
+        // Experiment: normals from the fiber prediction close to the fiber
+        // (FiberPredictionNormals.hpp). Per fiber the annotated line is sampled every
+        // prediction_normal_spacing voxels within prediction_normal_arc_range (widened by the
+        // largest `along`); around each sample the prediction is read on a cubic grid of
+        // prediction_normal_step voxels within the largest ellipse axis. Each entry of
+        // prediction_normal_variants gives one estimate per sample:
+        //   height, width  the ellipse
+        //   along          the scatters of the samples within this arc distance are summed
+        //                  with a Gaussian of sigma along/2 (0: the sample alone)
+        //   mode           "sample": ellipse of each prediction sample's own normal;
+        //                  "two_pass": a first isotropic estimate, then the ellipse of that estimate;
+        //                  "condense": "sample", then `iterations` rounds that weight every
+        //                  prediction sample by |normal . previous estimate|^power;
+        //                  "track": a running estimate from the best supported sample outwards
+        //                  (trackFiberPredictionNormals; `along` is its decay length, `power` its agreement power)
+        //   Options of the along-fiber sum (modes sample, two_pass, condense):
+        //   min_support    the window grows from 0 only until the summed weight within it reaches this
+        //                  (at most `along`); 0: always `along`
+        //   turn           each neighbour's scatter is turned with the fiber direction before it is added
+        //   slice_power    the sum is repeated with each neighbour weighted by |its own axis . first sum|^slice_power
+        //   balance        the samples on either side of a first estimate's plane get equal summed weight
+        //   presence_base  share of the sample weight that does not depend on presence (1: ignored)
+        //   strip          > 0: the estimates become sign-free targets of a strip solve over the sampled arc
+        //                  range, with this axis weight times min(1, support / strip_support)
+        // Output doubles per sample: fiber index, arc, point (3), tangent (3), then per variant
+        // axis (3), weight, coherence, count.
+        if(normalSource!="fused")throw std::invalid_argument("prediction_normals_output requires normal_source fused");
+        const vc::lasagna::LasagnaNormalSampler directions(vc::lasagna::LasagnaDataset(predictionManifest),samplerOptions);
+        struct Variant{double height,width,along,power;std::string mode;int iterations;
+            double minSupport,slicePower,presenceBase,strip,stripSupport;bool turn,balance;};
+        std::vector<Variant> variants;
+        for(const auto& v:cfg.at("prediction_normal_variants")){
+            Variant variant{v.at("height").get<double>(),v.at("width").get<double>(),v.value("along",0.),v.value("power",4.),
+                v.value("mode",std::string("sample")),v.value("iterations",2),
+                v.value("min_support",0.),v.value("slice_power",0.),v.value("presence_base",cfg.value("prediction_normal_presence_base",1.)),
+                v.value("strip",0.),v.value("strip_support",10.),v.value("turn",false),v.value("balance",false)};
+            if(variant.mode!="sample"&&variant.mode!="two_pass"&&variant.mode!="condense"&&variant.mode!="track")
+                throw std::invalid_argument("prediction_normal_variants mode must be sample, two_pass, condense or track");
+            if(!(variant.along>=0.)||variant.iterations<1)throw std::invalid_argument("prediction_normal_variants: invalid along or iterations");
+            variants.push_back(std::move(variant));
+        }
+        if(variants.empty())throw std::invalid_argument("prediction_normal_variants is empty");
+        const double sampleSpacing=cfg.value("prediction_normal_spacing",32.),step=cfg.value("prediction_normal_step",4.);
+        const double tangentSpan=cfg.value("prediction_normal_tangent_span",64.);
+        const auto arcRange=cfg.value("prediction_normal_arc_range",std::array<double,2>{0.,std::numeric_limits<double>::infinity()});
+        vc::fiber_tracer::FiberPredictionNormalOptions base;
+        base.presenceFloor=cfg.value("fused_presence_floor",base.presenceFloor);
+        base.presenceFull=cfg.value("fused_presence_full",base.presenceFull);
+        base.minAlignment=cfg.value("prediction_normal_min_alignment",base.minAlignment);
+        double radius=0.,reachAlong=0.;
+        for(const auto& v:variants){radius=std::max({radius,v.height,v.width});reachAlong=std::max(reachAlong,v.along);}
+        std::vector<cv::Vec3d> grid;
+        const int reach=int(std::ceil(radius/step));
+        for(int z=-reach;z<=reach;++z)for(int y=-reach;y<=reach;++y)for(int x=-reach;x<=reach;++x){
+            const cv::Vec3d offset(x*step,y*step,z*step);
+            if(cv::norm(offset)<=radius)grid.push_back(offset);
+        }
+        struct Node{size_t fiber;double arc;cv::Vec3d point,tangent;};
+        std::vector<Node> nodes;
+        for(size_t i=0;i<lines.size();++i){
+            const auto geometry=makePolylineArcGeometry(lines[i].pointsBaseXYZ);
+            const double first=std::ceil(std::max(0.,arcRange[0]-reachAlong)/sampleSpacing)*sampleSpacing;
+            for(double arc=first;arc<=std::min(geometry.length(),arcRange[1]+reachAlong);arc+=sampleSpacing){
+                cv::Vec3d tangent=samplePolylineArc(geometry,std::min(geometry.length(),arc+tangentSpan)).point-samplePolylineArc(geometry,std::max(0.,arc-tangentSpan)).point;
+                const double length=cv::norm(tangent);
+                if(!(length>0.))continue;
+                nodes.push_back({i,arc,samplePolylineArc(geometry,arc).point,tangent/length});
+            }
+        }
+        // The prediction samples of every node.
+        using Sample=vc::fiber_tracer::FiberPredictionNormalSample;
+        using Scatter=vc::fiber_tracer::FiberPredictionNormalScatter;
+        using Frame=vc::fiber_tracer::FiberPredictionNormalFrame;
+        std::vector<std::vector<Sample>> samples(nodes.size());
+        cv::parallel_for_(cv::Range(0,int(nodes.size())),[&](const cv::Range& range){
+            for(int n=range.start;n<range.end;++n){
+                const auto& node=nodes[size_t(n)];
+                std::vector<cv::Vec3d> points(grid.size());std::vector<cv::Vec3f> pointsF(grid.size());
+                for(size_t g=0;g<grid.size();++g){points[g]=node.point+grid[g];pointsF[g]=cv::Vec3f(points[g]);}
+                std::vector<vc::lasagna::NormalSampleWithDerivative> sheet,direction;
+                (void)normals.sampleNormalBatch(points,false,1,sheet);
+                (void)directions.sampleNormalBatch(points,false,1,direction);
+                std::vector<std::vector<float>> presenceValues;
+                vc::lasagna::sampleLasagnaVectorBatch({*presence},pointsF,presenceValues,false);
+                auto& list=samples[size_t(n)];list.reserve(grid.size());
+                for(size_t g=0;g<grid.size();++g){
+                    if(!sheet[g].sample.valid||!direction[g].sample.valid||presenceValues[g].empty())continue;
+                    list.push_back({grid[g],direction[g].sample.normal,sheet[g].sample.normal,double(presenceValues[g][0])});
+                }
+            }
+        },threads);
+        const size_t record=8+6*variants.size();
+        std::vector<double> rows(nodes.size()*record,0.);
+        for(size_t n=0;n<nodes.size();++n){
+            double* row=&rows[n*record];
+            row[0]=double(nodes[n].fiber);row[1]=nodes[n].arc;
+            for(int k=0;k<3;++k){row[2+k]=nodes[n].point[k];row[5+k]=nodes[n].tangent[k];}
+        }
+        for(size_t s=0;s<variants.size();++s){
+            const auto& variant=variants[s];
+            auto shape=base;shape.height=variant.height;shape.width=variant.width;shape.presenceBase=variant.presenceBase;
+            // One pass: every node's scatter (in `frame`, about the previous estimates), summed along the fiber.
+            std::vector<vc::fiber_tracer::FiberPredictionNormalEstimate> estimates(nodes.size());
+            const auto pass=[&](Frame frame,double power){
+                std::vector<Scatter> own(nodes.size());
+                cv::parallel_for_(cv::Range(0,int(nodes.size())),[&](const cv::Range& range){
+                    for(int n=range.start;n<range.end;++n){
+                        const auto& node=nodes[size_t(n)];const auto& list=samples[size_t(n)];
+                        auto& out=own[size_t(n)];
+                        out=vc::fiber_tracer::fiberPredictionNormalScatter(node.tangent,list,shape,frame,estimates[size_t(n)].axis,power);
+                        if(!variant.balance)continue;
+                        // Both sides of the plane of this first estimate, each scaled to the weaker side's weight.
+                        const cv::Vec3d plane=vc::fiber_tracer::fiberPredictionNormal(out).axis;
+                        if(!(plane.dot(plane)>0.))continue;
+                        std::array<std::vector<Sample>,2> sides;
+                        for(const auto& sample:list)sides[sample.offset.dot(plane)>0.?1:0].push_back(sample);
+                        std::array<Scatter,2> part;
+                        for(int k=0;k<2;++k)part[k]=vc::fiber_tracer::fiberPredictionNormalScatter(node.tangent,sides[k],shape,frame,estimates[size_t(n)].axis,power);
+                        const double weaker=std::min(part[0].weight,part[1].weight);
+                        if(!(weaker>0.))continue;   // one side is empty: nothing to balance against
+                        out=part[0].scaled(weaker/part[0].weight);out+=part[1].scaled(weaker/part[1].weight);
+                    }
+                },threads);
+                std::vector<vc::fiber_tracer::FiberPredictionNormalEstimate> next(nodes.size());
+                for(size_t n=0;n<nodes.size();++n){
+                    // The window: `along`, or the smallest reach whose summed weight is min_support.
+                    double window=variant.along;
+                    if(variant.minSupport>0.&&variant.along>0.){
+                        std::vector<std::pair<double,double>> near;
+                        for(size_t m=0;m<nodes.size();++m)if(nodes[m].fiber==nodes[n].fiber&&std::abs(nodes[m].arc-nodes[n].arc)<=variant.along)
+                            near.push_back({std::abs(nodes[m].arc-nodes[n].arc),own[m].weight});
+                        std::sort(near.begin(),near.end());
+                        double sum=0.;window=variant.along;
+                        for(const auto& [distance,weight]:near){sum+=weight;if(sum>=variant.minSupport){window=distance;break;}}
+                    }
+                    const auto gather=[&](const cv::Vec3d* agree){
+                        Scatter sum;
+                        for(size_t m=0;m<nodes.size();++m){
+                            if(nodes[m].fiber!=nodes[n].fiber)continue;
+                            const double distance=std::abs(nodes[m].arc-nodes[n].arc);
+                            if(distance>window)continue;
+                            const double sigma=window/2.;
+                            double factor=m==n||!(sigma>0.)?1.:std::exp(-0.5*distance*distance/(sigma*sigma));
+                            Scatter part=variant.turn&&m!=n?vc::fiber_tracer::turned(own[m],vc::fiber_tracer::fiberDirectionTurn(nodes[m].tangent,nodes[n].tangent)):own[m];
+                            if(agree){
+                                const cv::Vec3d axis=vc::fiber_tracer::fiberPredictionNormal(part).axis;
+                                factor*=std::pow(std::abs(axis.dot(*agree)),variant.slicePower);
+                            }
+                            sum+=part.scaled(factor);
+                        }
+                        return sum;
+                    };
+                    auto sum=gather(nullptr);
+                    if(variant.slicePower>0.){
+                        const cv::Vec3d first=vc::fiber_tracer::fiberPredictionNormal(sum).axis;
+                        if(first.dot(first)>0.)sum=gather(&first);
+                    }
+                    next[n]=vc::fiber_tracer::fiberPredictionNormal(sum);
+                }
+                estimates=std::move(next);
+            };
+            if(variant.mode=="track"){
+                // Per fiber: its nodes are consecutive and ascend in arc.
+                for(size_t first=0;first<nodes.size();){
+                    size_t last=first;while(last<nodes.size()&&nodes[last].fiber==nodes[first].fiber)++last;
+                    std::vector<double> arcs;std::vector<cv::Vec3d> tangents;
+                    for(size_t n=first;n<last;++n){arcs.push_back(nodes[n].arc);tangents.push_back(nodes[n].tangent);}
+                    vc::fiber_tracer::FiberPredictionNormalTrackOptions trackOptions;
+                    trackOptions.length=variant.along;trackOptions.agreementPower=variant.power;
+                    size_t seed=0;
+                    const auto tracked=vc::fiber_tracer::trackFiberPredictionNormals(arcs,tangents,
+                        std::span<const std::vector<Sample>>(samples.data()+first,last-first),shape,trackOptions,&seed);
+                    std::cout<<"prediction normals track fiber="<<nodes[first].fiber<<" seed_arc="<<(seed<arcs.size()?arcs[seed]:-1.)<<std::endl;
+                    for(size_t n=first;n<last;++n)estimates[n]=tracked[n-first];
+                    first=last;
+                }
+            }
+            else if(variant.mode=="two_pass"){pass(Frame::Isotropic,0.);pass(Frame::Given,0.);}
+            else{
+                if(variant.balance)pass(Frame::Sample,0.);   // the first estimate whose plane splits the sides
+                pass(Frame::Sample,0.);
+                if(variant.mode=="condense")for(int k=0;k<variant.iterations;++k)pass(Frame::Sample,variant.power);
+            }
+            if(variant.strip>0.){
+                // The estimates as sign-free targets of a strip solve over each fiber's sampled arc range.
+                for(size_t first=0;first<nodes.size();){
+                    size_t last=first;while(last<nodes.size()&&nodes[last].fiber==nodes[first].fiber)++last;
+                    const auto geometry=makePolylineArcGeometry(lines[nodes[first].fiber].pointsBaseXYZ);
+                    const double begin=nodes[first].arc,end=nodes[last-1].arc;
+                    const auto piece=slicePolylineArc(geometry,begin,end);
+                    vc::fiber_tracer::FiberStripNormalOptions stripOptions;
+                    stripOptions.twistWeight=cfg.value("strip_twist_weight",300.);
+                    stripOptions.smoothingSigma=cfg.value("prediction_normal_strip_sigma",64.);
+                    stripOptions.resampleSpacing=cfg.value("prediction_normal_strip_spacing",64.);
+                    stripOptions.axisWeight=variant.strip;
+                    const auto chain=vc::fiber_tracer::fiberStripChain(piece,stripOptions);
+                    std::vector<vc::fiber_tracer::FiberStripAxisTarget> stripTargets(chain.points.size());
+                    for(size_t k=0;k<chain.points.size();++k){
+                        size_t nearest=first;
+                        for(size_t n=first;n<last;++n)if(std::abs(nodes[n].arc-begin-chain.arc[k])<std::abs(nodes[nearest].arc-begin-chain.arc[k]))nearest=n;
+                        if(!(estimates[nearest].weight>0.))continue;
+                        stripTargets[k].axis=estimates[nearest].axis;
+                        stripTargets[k].weight=std::min(1.,estimates[nearest].weight/variant.stripSupport);
+                    }
+                    const auto solved=vc::fiber_tracer::solveFiberStripNormals(piece,stripOptions,&stripTargets);
+                    if(solved.normals.size()!=piece.size())throw std::runtime_error("prediction normals: strip solve gave no normals");
+                    for(size_t n=first;n<last;++n){
+                        size_t vertex=0;
+                        for(size_t j=0;j<chain.vertexArc.size();++j)if(std::abs(chain.vertexArc[j]-(nodes[n].arc-begin))<std::abs(chain.vertexArc[vertex]-(nodes[n].arc-begin)))vertex=j;
+                        estimates[n].axis=solved.normals[vertex];
+                    }
+                    first=last;
+                }
+            }
+            for(size_t n=0;n<nodes.size();++n){
+                double* out=&rows[n*record]+8+6*s;
+                for(int k=0;k<3;++k)out[k]=estimates[n].axis[k];
+                out[3]=estimates[n].weight;out[4]=estimates[n].coherence;out[5]=estimates[n].count;
+            }
+        }
+        const auto outputPath=std::filesystem::path(cfg.at("prediction_normals_output").get<std::string>());
+        std::filesystem::create_directories(outputPath.parent_path());
+        std::ofstream file(outputPath,std::ios::binary);
+        if(!file)throw std::runtime_error("cannot write "+outputPath.string());
+        file.write(reinterpret_cast<const char*>(rows.data()),std::streamsize(rows.size()*sizeof(double)));
+        if(!file)throw std::runtime_error("write failed "+outputPath.string());
+        Json result={{"record_doubles",record},{"ids",ids},{"variants",cfg.at("prediction_normal_variants")},{"samples",nodes.size()},
+            {"grid_points",grid.size()},{"spacing",sampleSpacing},{"step",step},{"min_alignment",base.minAlignment},
+            {"presence_floor",base.presenceFloor},{"presence_full",base.presenceFull},{"wall_seconds",seconds(started)}};
+        vcr::zarr::atomicWrite(outputPath.string()+".json",result.dump(1)+"\n");
+        std::cout<<"prediction normals samples="<<nodes.size()<<" grid_points="<<grid.size()<<std::endl;
+        return 0;
     }
     std::unique_ptr<vc::lasagna::LasagnaNormalSampler> separateWindings;
     if(windingInput)separateWindings=std::make_unique<vc::lasagna::LasagnaNormalSampler>(windingInput->dataset,samplerOptions);

@@ -164,6 +164,7 @@ add_library(vc_fiber_tracer
     src/fiber_tracer/FiberNormalSign.cpp
     src/fiber_tracer/FiberSignSupport.cpp
     src/fiber_tracer/FiberBendSeeds.cpp
+    src/fiber_tracer/FiberPredictionNormals.cpp
     src/fiber_tracer/FiberTraceWindingBeliefPropagation.cpp
     src/fiber_tracer/FiberTraceWindingLeastSquares.cpp
     src/fiber_tracer/FiberTraceWindingOrderedCuts.cpp
