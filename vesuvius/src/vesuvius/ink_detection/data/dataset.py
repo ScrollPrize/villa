@@ -1,4 +1,35 @@
-"""Ink sample assembly for flat, full_3d, and full_3d_single_wrap modes."""
+"""Ink sample assembly for flat, full_3d, and full_3d_single_wrap modes.
+
+v3 (PR #2677) — two targeted fixes on top of the v2 resilience patch
+(a segment that fails patch finding no longer aborts the run):
+
+1. A failed segment is excluded from later sample assembly. Without
+   this, a segment skipped at discovery time is still listed in
+   ``self.segments`` and ``_segments_by_volume``, so ``_merge_intersecting``
+   reopens its (unfinished) supervision store at the first sample of a
+   neighbouring segment and the run fails there instead of at discovery
+   time. A failed segment from a held-out source (``split ==
+   "validation"``) re-raises its original error at discovery time,
+   exactly as main did: held-out patches must be complete or the run
+   must fail, never silently partial.
+
+2. The patch-cache coverage check also runs in unlabeled mode.
+   ``load_patch_cache`` only verifies that every discovered segment is
+   represented by at least one cached patch in labeled modes; in
+   unlabeled mode a cache written when only one segment was ready was
+   reused after a second segment's stores were filled, returning 16
+   patches for one segment instead of 32 for both. The check is done
+   here (this file) rather than in ``patch_cache.py`` to keep the fix
+   inside the three files of this PR. A segment that yields no
+   unlabeled patches raises in ``find_segment_unlabeled_patches``
+   ("contains no nonzero projected data"), so a discovered segment with
+   no cached patch can only mean the cache predates it — the check
+   cannot misfire on a legitimately empty segment. The only cost is
+   that a dataset with a permanently failing segment re-discovers
+   patches on every run (the failed segment is excluded after
+   discovery, so the saved cache never covers it); correctness wins
+   over that re-discovery cost.
+"""
 
 from __future__ import annotations
 
@@ -229,16 +260,38 @@ class InkDataset(Dataset):
             cached = load_patch_cache(
                 path, config=self.config, segments=self.segments
             )
+            if cached is not None and self.config.discovery_mode == "unlabeled":
+                # load_patch_cache only verifies segment coverage in
+                # labeled modes; in unlabeled mode a cache written when
+                # a single segment was ready would otherwise be reused
+                # after a second segment's stores were filled. A
+                # discovered segment with no cached patch means the
+                # cache predates it (an unlabeled segment that yields
+                # no patches raises at discovery time instead).
+                covered = {patch.segment.cache_key for patch in cached}
+                if any(
+                    segment.cache_key not in covered
+                    for segment in self.segments
+                ):
+                    cached = None
             if cached is not None:
                 return cached
 
         def process(segment: Segment):
             try:
                 if self.config.discovery_mode == "unlabeled":
-                    return find_segment_unlabeled_patches(segment, self._open)
-                if self.config.patch_finding.kind == "subtiling":
-                    return find_subtiling_patches(segment, self._open)
-                return find_default_patches(segment, self._open)
+                    training, validation = find_segment_unlabeled_patches(
+                        segment, self._open
+                    )
+                elif self.config.patch_finding.kind == "subtiling":
+                    training, validation = find_subtiling_patches(
+                        segment, self._open
+                    )
+                else:
+                    training, validation = find_default_patches(
+                        segment, self._open
+                    )
+                return training, validation, None
             except Exception as exc:
                 # One defective segment (e.g. an explicitly configured
                 # mirror whose stores are still syncing) must not abort
@@ -250,26 +303,48 @@ class InkDataset(Dataset):
                     f"segment={segment.segment_relpath!r}: {exc}",
                     stacklevel=2,
                 )
-                return [], []
+                return [], [], (segment, exc)
 
         training: list[Patch] = []
         validation: list[Patch] = []
+        failed: list[tuple[Segment, Exception]] = []
         # Discovery threads are not DataLoader workers: dataloader_workers 0 still needs one.
         with ThreadPoolExecutor(
             max_workers=max(1, self.config.dataloader_workers)
         ) as executor:
-            for segment_training, segment_validation in executor.map(
+            for segment_training, segment_validation, segment_failed in executor.map(
                 process, self.segments
             ):
                 training.extend(segment_training)
                 validation.extend(segment_validation)
+                if segment_failed is not None:
+                    failed.append(segment_failed)
         patches = training + validation
+        for segment, exc in failed:
+            if segment.source.split == "validation":
+                # A held-out segment that fails patch finding must fail
+                # the run at discovery time, as main did: its patches
+                # are the validation set, and a partial validation set
+                # must never be reported as complete.
+                raise exc
         if not patches and self.segments:
             raise RuntimeError(
                 "Failed finding patches: no segment yielded any patches "
                 f"({len(self.segments)} segment(s) discovered; see warnings "
                 "above for skipped segments)"
             )
+        if failed:
+            # Exclude failed segments from later sample assembly: a
+            # segment skipped here is still listed in self.segments, so
+            # _merge_intersecting would reopen its (unfinished)
+            # supervision store at the first sample of a neighbouring
+            # segment and fail there instead of at discovery time.
+            failed_keys = {segment.cache_key for segment, _ in failed}
+            self.segments = [
+                segment
+                for segment in self.segments
+                if segment.cache_key not in failed_keys
+            ]
         save_patch_cache(path, patches)
         return patches
 
