@@ -36,6 +36,7 @@ import torch
 from checkpoint_io import load_checkpoint_cpu
 from sample_spiral import get_spiral_yxs
 from tifxyz import save_combined_tifxyz
+from devices import fit_device
 from transforms import SpiralAndTransform
 from umbilicus import json_umbilicus_z_to_yx
 
@@ -459,8 +460,9 @@ def _parse_args(argv=None):
         "--lasagna-dir", type=Path,
         help="Lasagna repository containing fit_service.py (auto-detected)")
     parser.add_argument(
-        "--device", default="cuda",
-        help="Torch device used to reconstruct the Spiral surface (default: cuda)")
+        "--device", default=None,
+        help="Torch device used to reconstruct the Spiral surface "
+             "(default: cuda, else mps, else cpu)")
     parser.add_argument(
         "--voxel-size-um", type=float, default=9.6,
         help="source voxel size written to TIFXYZ metadata (default: 9.6)")
@@ -482,7 +484,7 @@ def main(argv=None) -> int:
         raise ValueError("--voxel-size-um must be positive")
     if args.chunk_size <= 0:
         raise ValueError("--chunk-size must be positive")
-    device = torch.device(args.device)
+    device = fit_device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA is unavailable; pass --device cpu if intentional")
 
