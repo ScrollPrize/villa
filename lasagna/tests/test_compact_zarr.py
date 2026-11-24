@@ -222,6 +222,34 @@ def test_compact_options_and_resume_encoding(tmp_path):
         output.prepare(**kwargs)
 
 
+@pytest.mark.parametrize("n_levels", [1, 3])
+def test_delta3d_output_matches_blosc_and_resumes(tmp_path, n_levels):
+    p = product("fiber", ["presence", "nx", "ny", "width", "sheet_nx", "sheet_ny"])
+    rng = np.random.default_rng(3)
+    data = {name: rng.integers(0, 40, (64, 64, 40), dtype=np.uint8) for name in p.channel_names}
+    for values in data.values():
+        values[:32, :32, :32] = 0  # a stored all-zero chunk
+    stores = {}
+    for compressor in ("blosc-zstd", "vc-delta3d"):
+        root = tmp_path / f"{compressor}.zarr"
+        output = CompactOutputAdapter(root=root, products=(p,), n_levels=n_levels, validity_channel="chunks")
+        output.prepare(base_shape_zyx=(64, 64, 40), ome_chunk=32, ome_compressor=compressor)
+        for origin in np.ndindex(2, 2, 2):
+            origin = tuple(32 * i for i in origin)
+            box = tuple(slice(o, o + 32) for o in origin)
+            output.write_products_chunk([(p, {n: a[box] for n, a in data.items()})], chunk_origin_zyx=origin)
+            assert output.validate_chunk(origin)
+        output.build_pyramids(workers=1)
+        output.prepare(base_shape_zyx=(64, 64, 40), ome_chunk=32, ome_compressor=compressor)
+        stores[compressor] = root / "sd0"
+    for level in range(n_levels):
+        blosc, delta3d = (open_zarr(stores[c] / str(level)) for c in ("blosc-zstd", "vc-delta3d"))
+        assert delta3d.compressor == {"id": "vc-delta3d", "quant": 1, "channel_axis": "first"}
+        np.testing.assert_array_equal(delta3d[:], blosc[:])
+    with pytest.raises(ValueError, match="incompatible encoding"):
+        output.prepare(base_shape_zyx=(64, 64, 40), ome_chunk=32)
+
+
 def test_packed_provenance(tmp_path):
     from lasagna.inference_provenance import structural_inventory
     p = product("fiber", ["presence", "nx", "ny"])

@@ -57,7 +57,7 @@ DEFAULT_INPUT_CACHE_BYTES = 4 << 30
 DEFAULT_INPUT_IO_THREADS = 16
 DEFAULT_ACCUMULATOR_WORKERS = min(32, max(1, os.cpu_count() or 1))
 DEFAULT_OME_COMPRESSOR = "blosc-zstd"
-OME_COMPRESSOR_CHOICES = (DEFAULT_OME_COMPRESSOR, "none")
+OME_COMPRESSOR_CHOICES = (DEFAULT_OME_COMPRESSOR, "vc-delta3d", "none")
 _BLOSC_ZSTD_CONFIG = {
 	"id": "blosc",
 	"cname": "zstd",
@@ -1343,11 +1343,13 @@ def _omezarr_level_shape(
 	return z, y, x
 
 
-def omezarr_compressor_config(name: str) -> dict[str, Any] | None:
-	"""Return the exact Zarr-v2 compressor metadata for a public CLI choice."""
+def omezarr_compressor_config(name: str, ndim: int = 3) -> dict[str, Any] | None:
+	"""Return the exact Zarr-v2 compressor metadata for a public CLI choice, for ZYX or (``ndim`` 4) CZYX arrays."""
 	value = str(name).strip().lower()
 	if value == DEFAULT_OME_COMPRESSOR:
 		return dict(_BLOSC_ZSTD_CONFIG)
+	if value == "vc-delta3d":
+		return {"id": value, "quant": 1, **({"channel_axis": "first"} if ndim == 4 else {})}
 	if value == "none":
 		return None
 	raise ValueError(
@@ -1360,6 +1362,8 @@ def _writer_codec(config: dict[str, Any] | None) -> dict[str, Any]:
 	"""ZarrWriter.create arguments for a compressor config of omezarr_compressor_config."""
 	if config is None:
 		return {"compressor": None}
+	if config["id"] == "vc-delta3d":  # lossless, channel-first 4-D arrays: ZarrWriter's only form
+		return {"compressor": config["id"]}
 	return {"compressor": config["id"], "cname": config["cname"], "shuffle": config["shuffle"], "level": config["clevel"]}
 
 

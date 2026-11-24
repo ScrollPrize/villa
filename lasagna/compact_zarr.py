@@ -215,7 +215,7 @@ class CompactOutputAdapter:
         manifest.provenance_json = provenance
         manifest.extra_fields.update(extra_fields or {})
         manifest.extra_fields["blank_invalid"] = self.blank_invalid
-        codec = omezarr_compressor_config(ome_compressor)
+        codec = omezarr_compressor_config(ome_compressor, ndim=4)
         for n, products in self.by_level.items():
             channels = [c.name for p in products for c in p.channels]
             manifest.groups[f"sd{n}"] = ChannelGroup(f"sd{n}/{n}", n, channels)
