@@ -1,4 +1,5 @@
 #include "FiberNeighbourNormals.hpp"
+#include "vc/fiber_tracer/FiberRibbonCrossings.hpp"
 #include "vc/fiber_tracer/FiberGapFalloff.hpp"
 #include <vc_object_store/objects/FiberConstraintGraph.hpp>
 #include <vc_object_store/objects/FiberGraphSolveExtension.hpp>
@@ -229,6 +230,128 @@ Json writeSignedFiberStripSamples(const Json& cfg)
                    {"fibers", fibers},
                    {"samples", samples},
                    {"unsigned_fibers_left_out", unsignedFibers}};
+    std::ofstream(output.string() + ".json") << statement.dump(1) << "\n";
+    return statement;
+}
+
+nlohmann::json writeFiberRibbonCrossings(const nlohmann::json& cfg)
+{
+    using Json = nlohmann::json;
+    const auto strip = vc::fiber_tracer::readFiberStripSampleFile(cfg.at("strip_samples").get<std::string>());
+    vc::fiber_tracer::FiberRibbonOptions options;
+    options.halfHeight = cfg.value("ribbon_half_height", options.halfHeight);
+    options.maxTangentCosine = cfg.value("ribbon_max_tangent_cosine", options.maxTangentCosine);
+    options.threads = cfg.value("workers", 0u);
+    auto crossings = vc::fiber_tracer::fiberRibbonCrossings(strip.samples, options);
+    const double arcGap = cfg.value("ribbon_encounter_arc_gap", 3000.0);
+    const auto encounters = vc::fiber_tracer::fiberRibbonEncounters(crossings, arcGap);
+    std::vector<double> rows;
+    rows.reserve(crossings.size() * 11);
+    for (const auto& c : crossings)
+        rows.insert(rows.end(), {double(c.ribbon), double(c.fiber), c.ribbonArc, c.fiberArc, c.height, double(c.direction),
+                                 c.tangentCosine, c.normalDot, c.point[0], c.point[1], c.point[2]});
+    const std::filesystem::path output = cfg.at("ribbon_crossings_output").get<std::string>();
+    std::ofstream out(output, std::ios::binary);
+    out.write(reinterpret_cast<const char*>(rows.data()), std::streamsize(rows.size() * sizeof(double)));
+    if (!out) throw std::runtime_error("ribbon crossings: cannot write " + output.string());
+    {
+        std::vector<double> table;
+        table.reserve(encounters.size() * 7);
+        for (const auto& e : encounters)
+            table.insert(table.end(), {double(e.ribbon), double(e.fiber), double(e.first), double(e.count), double(e.closest),
+                                       double(e.left), double(e.remaining)});
+        std::ofstream file(output.string() + ".encounters", std::ios::binary);
+        file.write(reinterpret_cast<const char*>(table.data()), std::streamsize(table.size() * sizeof(double)));
+        if (!file) throw std::runtime_error("ribbon crossings: cannot write the encounters of " + output.string());
+    }
+    Json statement{{"format", "ribbon_crossings"}, {"columns", 11}, {"fibers", strip.samples.size()},
+                   {"crossings", crossings.size()}, {"encounters", encounters.size()}, {"encounter_columns", 7}, {"encounter_arc_gap", arcGap}, {"half_height", options.halfHeight},
+                   {"max_tangent_cosine", options.maxTangentCosine}};
+    std::ofstream(output.string() + ".json") << statement.dump(1) << "\n";
+    return statement;
+}
+
+nlohmann::json writeFiberCrossingFilter(const nlohmann::json& cfg)
+{
+    using Json = nlohmann::json;
+    using namespace vc::fiber_tracer;
+    const auto strip = readFiberStripSampleFile(cfg.at("strip_samples").get<std::string>());
+    FiberRibbonOptions surface;
+    surface.halfHeight = cfg.value("ribbon_half_height", 512.0);
+    surface.maxTangentCosine = 1.0;  // the event is the crossing; its further passages have no angle limit
+    surface.threads = cfg.value("workers", 0u);
+    auto crossings = fiberRibbonCrossings(strip.samples, surface);
+    const double arcGap = cfg.value("ribbon_encounter_arc_gap", 3000.0);
+    const auto encounters = fiberRibbonEncounters(crossings, arcGap);
+
+    vc::objects::OpenOptions storeOptions;
+    storeOptions.readOnly = true;
+    auto store = vc::objects::ObjectCollection::open(cfg.at("database").get<std::string>(), storeOptions);
+    const auto txn = store.read();
+    const auto columns = vc::objects::readFiberGraphColumns(store, txn, cfg.value("workers", size_t{32}));
+    std::map<vc::objects::FiberGraphUuid, std::int64_t> stripIndex;
+    for (size_t f = 0; f < strip.ids.size(); ++f) stripIndex[strip.ids[f]] = std::int64_t(f);
+    std::vector<std::int64_t> node(columns.nodes, -1);
+    for (size_t n = 0; n < columns.nodes; ++n)
+        if (const auto found = stripIndex.find(columns.fiberUuids[n]); found != stripIndex.end()) node[n] = found->second;
+
+    std::vector<FiberCrossingEventView> views;
+    std::vector<size_t> rows;
+    size_t withoutStrip = 0;
+    for (size_t e = 0; e < columns.events; ++e) {
+        if (columns.parallel[e] != 0 || columns.validA[e] == 0 || columns.validB[e] == 0) continue;
+        const auto a = node[size_t(columns.endpoints[e][0])], b = node[size_t(columns.endpoints[e][1])];
+        if (a < 0 || b < 0) { ++withoutStrip; continue; }
+        rows.push_back(e);
+        views.push_back({a, b, columns.arcs[e][0], columns.arcs[e][1]});
+        views.push_back({b, a, columns.arcs[e][1], columns.arcs[e][0]});
+    }
+    if (withoutStrip != 0)
+        throw std::runtime_error("crossing filter: " + std::to_string(withoutStrip) +
+                                 " events lie on fibers the strip samples do not hold; they belong to another extraction");
+    FiberCrossingFilterOptions filter;
+    filter.matchTolerance = cfg.value("crossing_filter_match_tolerance", filter.matchTolerance);
+    filter.minimumDot = cfg.value("crossing_filter_minimum_dot", filter.minimumDot);
+    filter.nearHeight = cfg.value("crossing_filter_near_height", filter.nearHeight);
+    const auto verdicts = fiberCrossingVerdicts(crossings, encounters, views, filter);
+    // One record per sign event: id, finding bits (1 matched, 2 multiple, 4 nothing left, 8 mixed,
+    // 16 mixed near, 32 several left) and the |normal dot| of the nearest alternative crossing (0: none).
+    struct Record { std::int64_t event, findings; double alternative; };
+    static_assert(sizeof(Record) == 24);
+    std::vector<Record> table;
+    table.reserve(rows.size());
+    size_t nothingLeft = 0, mixed = 0, mixedNear = 0, severalLeft = 0, multiple = 0, unmatched = 0, alternatives = 0;
+    for (size_t r = 0; r < rows.size(); ++r) {
+        const auto& first = verdicts[2 * r];
+        const auto& second = verdicts[2 * r + 1];
+        const bool nothing = first.nothingLeft || second.nothingLeft, both = first.mixed || second.mixed,
+                   bothNear = first.mixedNear || second.mixedNear, several = first.severalLeft || second.severalLeft;
+        nothingLeft += nothing; mixed += both; mixedNear += bothNear; severalLeft += several;
+        multiple += first.multiple || second.multiple;
+        unmatched += !first.matched && !second.matched;
+        // Of the two surfaces' alternatives the one nearer its fiber.
+        const auto& nearer = second.alternativeDot != 0.0 &&
+            (first.alternativeDot == 0.0 || second.alternativeHeight < first.alternativeHeight) ? second : first;
+        alternatives += nearer.alternativeDot != 0.0;
+        table.push_back({columns.eventIds[rows[r]],
+                         (first.matched || second.matched ? 1 : 0) | (first.multiple || second.multiple ? 2 : 0) |
+                             (nothing ? 4 : 0) | (both ? 8 : 0) | (bothNear ? 16 : 0) | (several ? 32 : 0),
+                         nearer.alternativeDot});
+    }
+    std::sort(table.begin(), table.end(), [](const Record& x, const Record& y) { return x.event < y.event; });
+    const std::filesystem::path output = cfg.at("crossing_filter_output").get<std::string>();
+    {
+        std::ofstream out(output, std::ios::binary);
+        out.write(reinterpret_cast<const char*>(table.data()), std::streamsize(table.size() * sizeof(Record)));
+        if (!out) throw std::runtime_error("crossing filter: cannot write " + output.string());
+    }
+    Json statement{{"format", "fiber_crossing_filter"}, {"version", 2}, {"store", store.uuid(txn)},
+                   {"events", columns.events}, {"sign_events", rows.size()}, {"record_bytes", sizeof(Record)},
+                   {"multiple", multiple}, {"nothing_left", nothingLeft}, {"mixed", mixed}, {"mixed_near", mixedNear},
+                   {"several_left", severalLeft}, {"alternatives", alternatives},
+                   {"without_surface_crossing", unmatched}, {"surface_crossings", crossings.size()},
+                   {"half_height", surface.halfHeight}, {"encounter_arc_gap", arcGap},
+                   {"match_tolerance", filter.matchTolerance}, {"minimum_dot", filter.minimumDot}};
     std::ofstream(output.string() + ".json") << statement.dump(1) << "\n";
     return statement;
 }

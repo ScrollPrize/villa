@@ -170,6 +170,14 @@ int runFiberConstraintExtraction(int argc, char** argv)
         std::cout<<"neighbour normals "<<inferFiberNeighbourNormals(cfg).dump()<<std::endl;
         return 0;
     }
+    if(cfg.contains("crossing_filter_output")) {
+        std::cout<<"crossing filter "<<writeFiberCrossingFilter(cfg).dump()<<std::endl;
+        return 0;
+    }
+    if(cfg.contains("ribbon_crossings_output")) {
+        std::cout<<"ribbon crossings "<<writeFiberRibbonCrossings(cfg).dump()<<std::endl;
+        return 0;
+    }
     if(cfg.contains("signed_strip_samples_output")) {
         std::cout<<"signed strip samples "<<writeSignedFiberStripSamples(cfg).dump()<<std::endl;
         return 0;

@@ -264,8 +264,23 @@ def _run_direct_stage(stage, config):
         settings.update(database=str(base),fixed_keep=True)
         data,stats=normal.prepare(settings,graph=graph,return_arrays=True,prior=prior)
         data['keep']=keep
-        expected_ids=graph.ids;del graph,prior,classifications
+        expected_ids=graph.ids
+        first_pass=None
+        if normal.crossing_filter_path(settings,base) is not None:
+            # Two passes. The first has no signs to go by and only drops what the normal surfaces
+            # call undecidable; its signs then choose, per disagreeing crossing, the closest
+            # crossing of the encounter that agrees.
+            first_pass,first=solve_stage(dict(settings,output_root=str(root/'first-pass')),'normal_sign',
+                                         data=data,stats=stats,return_solution=True)
+            if not np.array_equal(first['ids'],expected_ids):raise ValueError('First-pass fiber identities differ')
+            signs=np.where(keep>.5,first['normal_sign'],0)
+            data,stats=normal.prepare(settings,graph=graph,return_arrays=True,prior=prior,signs=signs)
+            data['keep']=keep
+            print(json.dumps(dict(stage='sign_second_pass',crossing_filter_dropped=stats['crossing_filter_dropped'],
+                                  crossing_filter_replaced=stats['crossing_filter_replaced'])),flush=True)
+        del graph,prior,classifications
         summary,saved=solve_stage(settings,'normal_sign',data=data,stats=stats,return_solution=True)
+        if first_pass is not None:summary=dict(summary,first_pass=first_pass)
         if not np.array_equal(saved['broken'],keep<=.5):raise RuntimeError('Sign alignment changed classification')
         ids=saved['ids']
         if not np.array_equal(ids,expected_ids):raise ValueError('Normal-sign output fiber identities differ')

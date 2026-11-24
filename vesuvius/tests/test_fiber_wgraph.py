@@ -149,8 +149,14 @@ def test_native_extraction_accepts_tracer_store_without_import_dispatch(tmp_path
     source=tmp_path/'tracing'/'fibers.vcobj'
     config=cli.stage_config('extract',input_path=str(source),output_path=str(tmp_path/'constraints.vcobj'))
     cli.run_stage('extract',config)
-    assert len(calls)==1
+    # The default profile follows the extraction with the sign stage's multi-crossing filter.
+    assert len(calls)==2
+    (_,stage,binary,step),_=calls[1]
+    assert stage=='crossing_filter' and binary=='vc_fiber_constraints'
+    assert step==dict(database=str(tmp_path/'constraints.vcobj'),strip_samples=str(tmp_path/'constraints.strip-samples.bin'),
+                      crossing_filter_output=str(tmp_path/'constraints.crossing-filter.bin'),workers=32)
     (workflow,stage,binary,settings),kwargs=calls[0]
+    assert 'crossing_filter' not in settings and settings['strip_samples_output']==step['strip_samples']
     assert stage=='extract' and binary=='vc_fiber_constraints'
     assert settings['fibers']==str(source)
     assert 'source' not in settings  # No AFV importer or implicit converter.

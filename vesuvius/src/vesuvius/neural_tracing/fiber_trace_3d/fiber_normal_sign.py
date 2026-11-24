@@ -79,13 +79,64 @@ def metrics(u, v, a, i, j, dot, distance=None, factor=None):
                     **strict)
 
 
-def prepare(config, *, graph=None, return_arrays=False, prior=None):
-    """Convert fixed evidence once; no geometry or model evaluation in optimization."""
+CROSSING_FILTER_SUFFIX = '.crossing-filter.bin'
+
+
+def crossing_filter_path(config, database):
+    """The extraction's multi-crossing filter (``vc_fiber_constraints`` with ``crossing_filter_output``),
+    or None when the stage runs without one. ``crossing_filter: auto`` names the file the extract stage
+    writes next to its store; a missing file is an error, never a silent unfiltered solve."""
+    selected = config.get('crossing_filter')
+    if selected is None or selected is False:
+        return None
+    database = Path(database)
+    path = database.with_name(database.stem+CROSSING_FILTER_SUFFIX) if selected in (True, 'auto') else Path(selected)
+    if not path.exists() or not Path(str(path)+'.json').exists():
+        raise FileNotFoundError(f'No crossing filter {path}; run the extract stage with crossing_filter, or set crossing_filter to false')
+    return path
+
+
+CROSSING_FINDINGS = dict(nothing_left=4, mixed=8, mixed_near=16, several_left=32)
+# Without signs a crossing can only be dropped. Nothing left: the partner passes the normal surface and
+# returns. Mixed: the encounter holds strong crossings of both relations, so it decides no sign.
+CROSSING_FIRST_PASS = ('nothing_left', 'mixed')
+
+
+def read_crossing_filter(path, graph):
+    """Per event of the graph: the finding bits and the |dot| of the nearest crossing stating the
+    other relation (0 where there is none or the event is not in the filter)."""
+    statement = json.loads(Path(str(path)+'.json').read_text())
+    if statement.get('format') != 'fiber_crossing_filter' or statement.get('version') != 2:
+        raise ValueError(f'{path} is not a version 2 crossing filter')
+    if str(statement['store']) != str(graph.source['store_uuid']) or int(statement['events']) != len(graph.event_ids):
+        raise ValueError('Crossing filter was computed for another extraction store')
+    records = np.fromfile(path, dtype=np.dtype([('event', '<i8'), ('findings', '<i8'), ('alternative', '<f8')]))
+    if len(records) != int(statement['sign_events']):
+        raise ValueError('Crossing filter file and statement differ')
+    at = np.clip(np.searchsorted(records['event'], graph.event_ids), 0, max(len(records)-1, 0))
+    known = records['event'][at] == graph.event_ids if len(records) else np.zeros(len(graph.event_ids), bool)
+    findings = np.where(known, records['findings'][at], 0) if len(records) else np.zeros(len(graph.event_ids), np.int64)
+    alternative = np.where(known, records['alternative'][at], 0.) if len(records) else np.zeros(len(graph.event_ids))
+    return findings, alternative
+
+
+def prepare(config, *, graph=None, return_arrays=False, prior=None, signs=None):
+    """Convert fixed evidence once; no geometry or model evaluation in optimization.
+
+    With a crossing filter the evidence depends on the pass. Without ``signs`` (first pass) the events
+    with a finding of ``crossing_filter_first_pass`` are dropped. With the whole-fiber ``signs`` of a
+    first pass (per graph fiber, +1/-1, 0 unknown) only the nothing-left events are dropped, and an
+    event that disagrees under those signs takes the dot of the closest crossing that agrees, where
+    its encounter has one."""
     started = time.monotonic()
     db_path, prior_path = Path(config['database']), Path(config['priors'])
-    signature = dict(version=3, database_sha256=store_digest(db_path), priors_sha256=sha256_file(prior_path))
+    filter_path = crossing_filter_path(config, db_path)
+    signature = dict(version=5, database_sha256=store_digest(db_path), priors_sha256=sha256_file(prior_path),
+                     crossing_filter_sha256=sha256_file(filter_path) if filter_path else None)
     cache = Path(config.get('tensor_cache',Path(config.get('output_root','.'))/'tensors.npz'))
     stamp = cache.with_suffix('.json')
+    if signs is not None and not return_arrays:
+        raise ValueError('A signed pass is prepared in memory')
     if not return_arrays and cache.exists() and stamp.exists() and json.loads(stamp.read_text())['signature'] == signature:
         return cache
     prior = json.loads(prior_path.read_text()) if prior is None else prior
@@ -104,9 +155,29 @@ def prepare(config, *, graph=None, return_arrays=False, prior=None):
     eligible = ~graph.parallel
     valid = eligible & graph.valid_a & graph.valid_b
     total = int(eligible.sum())
+    filtered = replaced = 0
+    alternative = None
+    if signs is not None and not filter_path:
+        raise ValueError('A signed pass needs the crossing filter')
+    if filter_path:
+        findings, alternative = read_crossing_filter(filter_path, graph)
+        rules = ('nothing_left',) if signs is not None else tuple(config.get('crossing_filter_first_pass', CROSSING_FIRST_PASS))
+        if set(rules)-set(CROSSING_FINDINGS):
+            raise ValueError('Unknown crossing filter finding in crossing_filter_first_pass')
+        listed = (findings & sum(CROSSING_FINDINGS[rule] for rule in rules)) != 0
+        filtered = int((valid & listed).sum())
+        valid = valid & ~listed
     event_ids = graph.event_ids[valid]
     indices = np.column_stack((graph.i[valid], graph.j[valid]))
     dot = np.sum(graph.normal_a[valid]*graph.normal_b[valid], axis=1)
+    if signs is not None:
+        signs = np.asarray(signs, dtype=np.float64)
+        if len(signs) != len(graph.ids):
+            raise ValueError('First-pass signs do not cover the graph fibers')
+        other = alternative[valid]
+        swap = (dot*signs[indices[:,0]]*signs[indices[:,1]] < 0) & (other > 0)
+        dot = np.where(swap, -np.sign(dot)*other, dot)
+        replaced = int(swap.sum())
     dot=dot.astype(np.float32)
     if not np.isfinite(dot).all() or np.any(abs(dot)>1.000001):
         raise ValueError('Invalid normal dot products')
@@ -118,7 +189,8 @@ def prepare(config, *, graph=None, return_arrays=False, prior=None):
               prior=a,i=indices[:,0],j=indices[:,1],dot=dot,distance=distance,event_ids=event_ids)
     degree=np.bincount(indices.ravel(),minlength=len(ids))
     stats=dict(signature=signature,fibers=len(ids),perpendicular_events=total,
-               used_events=len(dot),invalid_events_skipped=total-len(dot),
+               used_events=len(dot),invalid_events_skipped=total-len(dot)-filtered,
+               crossing_filter_dropped=filtered,crossing_filter_replaced=replaced,
                events_with_winding_distance=int(np.isfinite(distance).sum()),
                isolated_fibers=int((degree==0).sum()),tensor_bytes=0,
                seconds=time.monotonic()-started)

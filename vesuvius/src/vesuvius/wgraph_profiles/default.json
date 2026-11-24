@@ -14,10 +14,13 @@
       "chunk_size_base_voxels": 2048,
       "normal_cache_mode": "auto",
       "normal_cache_fraction": 0.5,
-      "normal_channel_cache": true
+      "normal_channel_cache": true,
+      "crossing_filter": true
     },
     "hvb": {},
-    "sign": {},
+    "sign": {
+      "crossing_filter": "auto"
+    },
     "winding": {},
     "uv": {}
   }

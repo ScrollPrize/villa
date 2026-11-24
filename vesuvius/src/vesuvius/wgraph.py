@@ -116,6 +116,9 @@ def stage_config(stage: str, selector='default', *, input_path=None, output_path
     elif stage == 'extract':
         config.setdefault('output', str(output.with_name(output.stem+'.extraction.json')))
         config.setdefault('normal_prior_output', str(output.with_name(output.stem+'.outward-priors.json')))
+        if config.get('crossing_filter'):
+            # The filter step reads the strip normals the extraction solved.
+            config.setdefault('strip_samples_output', str(output.with_name(output.stem+'.strip-samples.bin')))
     return config
 
 
@@ -126,7 +129,20 @@ def _run_native(stage: str, config: dict):
         from lasagna.inference_provenance import sha256_file
         settings['umbilicus_sha256'] = sha256_file(settings['umbilicus'])
     binary = {'import': 'vc_object_import_afv', 'extract': 'vc_fiber_constraints'}[stage]
-    return native_step(settings, stage, binary, settings, timeout=settings.get('native_timeout_seconds'))
+    crossing_filter = settings.pop('crossing_filter', False) if stage == 'extract' else False
+    result = native_step(settings, stage, binary, settings, timeout=settings.get('native_timeout_seconds'))
+    if crossing_filter:
+        # The multi-crossing filter of the sign stage: one more native pass over the finished store,
+        # written where the sign stage's ``crossing_filter: auto`` looks for it.
+        from vesuvius.neural_tracing.fiber_trace_3d.fiber_normal_sign import CROSSING_FILTER_SUFFIX
+        database = Path(settings['database'])
+        step = dict(database=str(database), strip_samples=settings['strip_samples_output'],
+                    crossing_filter_output=str(database.with_name(database.stem+CROSSING_FILTER_SUFFIX)),
+                    workers=settings.get('workers', 32))
+        if isinstance(crossing_filter, dict):
+            step.update(crossing_filter)
+        native_step(settings, 'crossing_filter', binary, step, timeout=settings.get('native_timeout_seconds'))
+    return result
 
 
 def run_stage(stage: str, config: dict):

@@ -1,3 +1,4 @@
+from pathlib import Path
 import torch
 import pytest
 import json
@@ -91,6 +92,39 @@ def test_cached_tensor_identity_and_invalid_edges(tmp_path):
     prior.write_text(json.dumps(dict(payload,source_store=dict(graph.source,commit_sequence=-1))))
     with pytest.raises(ValueError,match='another store snapshot'):
         prepare(config)
+
+
+def test_crossing_filter_passes(tmp_path):
+    from vesuvius.neural_tracing.fiber_trace_3d.fiber_graph_store import FiberGraph
+    path=measured_store(tmp_path,[(0,11,12,False,.5),(1,11,23,False,.5),(2,12,23,False,.5)])
+    ids=list(map(uid,[11,12,23]));graph=FiberGraph(path)
+    prior=tmp_path/'prior.json'
+    prior.write_text(json.dumps(dict(format='fiber-outward-priors',source_store=graph.source,source_ids=ids,agreement=[1.,-1.,0.])))
+    config=dict(database=str(path),priors=str(prior),crossing_filter='auto')
+    with pytest.raises(FileNotFoundError,match='No crossing filter'):
+        prepare(config,graph=graph,return_arrays=True)
+    listed=Path(path).with_name(Path(path).stem+'.crossing-filter.bin')
+    # Event 0: nothing left. Event 1: mixed, with an alternative of |dot| 0.5. Event 2: no finding.
+    np.asarray([(0,4,0.),(1,8,.5),(2,0,0.)],dtype=[('event','<i8'),('findings','<i8'),('alternative','<f8')]).tofile(listed)
+    statement=dict(format='fiber_crossing_filter',version=2,store=graph.source['store_uuid'],events=len(graph.event_ids),sign_events=3)
+    Path(str(listed)+'.json').write_text(json.dumps(statement))
+    plain,_=prepare(dict(config,crossing_filter=False),graph=graph,return_arrays=True)
+    assert plain['event_ids'].tolist()==[0,1,2] and plain['dot'].tolist()==[1.,1.,1.]
+    # First pass: sign-free, drops nothing-left and mixed.
+    data,stats=prepare(config,graph=graph,return_arrays=True)
+    assert data['event_ids'].tolist()==[2] and stats['crossing_filter_dropped']==2 and stats['invalid_events_skipped']==0
+    assert prepare(dict(config,crossing_filter_first_pass=['nothing_left']),graph=graph,return_arrays=True)[0]['event_ids'].tolist()==[1,2]
+    # Second pass: only nothing-left is dropped. Under signs that make event 1 disagree it takes its
+    # agreeing alternative; under signs it agrees with it stays as it is.
+    data,stats=prepare(config,graph=graph,return_arrays=True,signs=[1,1,-1])
+    assert data['event_ids'].tolist()==[1,2] and data['dot'].tolist()==[-.5,1.] and stats['crossing_filter_replaced']==1
+    data,stats=prepare(config,graph=graph,return_arrays=True,signs=[1,1,1])
+    assert data['dot'].tolist()==[1.,1.] and stats['crossing_filter_replaced']==0
+    with pytest.raises(ValueError,match='needs the crossing filter'):
+        prepare(dict(config,crossing_filter=False),graph=graph,return_arrays=True,signs=[1,1,1])
+    Path(str(listed)+'.json').write_text(json.dumps(dict(statement,events=99)))
+    with pytest.raises(ValueError,match='another extraction store'):
+        prepare(config,graph=graph,return_arrays=True)
 
 
 def test_winding_distance_factor_and_strict_metric():
