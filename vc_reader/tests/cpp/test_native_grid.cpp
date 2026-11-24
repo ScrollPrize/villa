@@ -277,6 +277,22 @@ void testCoreSign()
         rejected = true;
     }
     require(rejected, "a core outside the vertices is refused");
+    // A fold where the context's centred tangents at vertex (2, 2) are parallel: the core's own normal is kept.
+    std::vector<float> fold(7 * 7 * 3, 0.f);
+    for (int r = 0; r < 7; ++r)
+        for (int c = 0; c < 7; ++c) {
+            fold[std::size_t((r * 7 + c) * 3)] = float(c);
+            fold[std::size_t((r * 7 + c) * 3 + 1)] = float(r);
+        }
+    fold[std::size_t((2 * 7 + 1) * 3 + 1)] = 1;  // (2, 1) to (1, 1, 0)
+    fold[std::size_t((1 * 7 + 2) * 3)] = 0;      // (1, 2) to (0, 2, 0)
+    fold[std::size_t((1 * 7 + 2) * 3 + 1)] = 2;
+    auto folded = plain;
+    folded.core = {2, 4, 2, 4};
+    float p[3], n[3];
+    vcr::grid::Surface({fold.data(), 7, 7, 21}, folded).resample({2, 2, 1, 1, 1, 1}, p, n);
+    require(p[0] == 2 && p[1] == 2 && std::fabs(n[0]) < 1e-6f && std::fabs(n[1]) < 1e-6f && std::fabs(n[2] - 1) < 1e-6f,
+            "a fold that leaves the context no normal keeps the core's");
 }
 
 int main()

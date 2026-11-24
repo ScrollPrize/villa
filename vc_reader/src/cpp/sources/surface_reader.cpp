@@ -368,17 +368,19 @@ std::optional<Patch> patchOf(Geometry& geom, const Pair& start, const Pair& size
     const auto r0 = std::max<std::int64_t>(0, std::int64_t(std::floor(minY))), r1 = std::min<std::int64_t>(rows, std::int64_t(std::floor(maxY)) + 2);
     if (c1 - c0 < 2 || r1 - r0 < 2) return std::nullopt;
     // Two more vertices around the window, where the grid has them: the Hermite derivatives of its cells
-    // (centred differences, one sided only at the grid's own border or next to a hole) then equal the whole
-    // grid's, so a patch renders as the same pixels of any larger patch. The window with its ring is charged to
-    // the work budget like any window; when it does not fit, the render is made on the cells alone, and the sign
-    // of its normals is the same either way (SurfaceOptions::core).
+    // (centred differences, one sided only at the grid's own border or next to a hole) then match the whole
+    // grid's instead of turning one sided at the window's edge.
     const std::int64_t halo = context ? 2 : 0;
     const auto hc0 = std::max<std::int64_t>(0, c0 - halo), hc1 = std::min<std::int64_t>(cols, c1 + halo);
     const auto hr0 = std::max<std::int64_t>(0, r0 - halo), hr1 = std::min<std::int64_t>(rows, r1 + halo);
+    const bool ring = hr0 != r0 || hr1 != r1 || hc0 != c0 || hc1 != c1;
+    // A ring adds the core's own derivatives (SurfaceOptions::core); CUDA keeps the host geometry beside its device copy.
+    if (ring && std::size_t((hr1 - hr0) * (hc1 - hc0)) * (geom.owner.backend == "cuda" ? 240 : 120) > geom.owner.workBytes)
+        throw DecodeBudgetError("geometry tile with its context exceeds sampling_work_bytes");
     Patch patch;
     patch.tile = geom.tile({hr0, hc0}, {hr1 - hr0, hc1 - hc0});
     patch.raster = grid::Raster{x0 - double(hc0), y0 - double(hr0), sx, sy, int(size[1]), int(size[0]), kx, ky};
-    if (hr0 != r0 || hr1 != r1 || hc0 != c0 || hc1 != c1) patch.core = {int(r0 - hr0), int(r1 - hr0), int(c0 - hc0), int(c1 - hc0)};
+    if (ring) patch.core = {int(r0 - hr0), int(r1 - hr0), int(c0 - hc0), int(c1 - hc0)};
     return patch;
 }
 // The vcr::grid surface over a tile's vertices: normals in the surface's physical space.

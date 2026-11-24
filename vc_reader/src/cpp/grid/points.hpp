@@ -142,8 +142,12 @@ VCR_POINTS_HD VCR_POINTS_FLATTEN inline bool point(const PointMap& g, const Grid
             const V du0 = q0u * by.p0 + r0u * by.m0 + q1u * by.p1 + r1u * by.m1;
             const V dv0 = q0 * by.dp0 + r0 * by.dm0 + q1 * by.dp1 + r1 * by.dm1;
             const V n0 = geometry::cross(geometry::linear(g.physical, du0), geometry::linear(g.physical, dv0)) * g.orientation;
-            if (geometry::finite(n0) && geometry::dot(n, n0) < 0)
-                n = n * -1.f;
+            if (geometry::finite(n0)) {
+                if (!geometry::finite(n) || (n.x == 0 && n.y == 0 && n.z == 0))
+                    n = n0;  // at a fold the context can leave no normal where the core alone has one
+                else if (geometry::dot(n, n0) < 0)
+                    n = n * -1.f;
+            }
         }
     }
     if (v.normals) {
