@@ -420,14 +420,17 @@ def run(engine, job, keys, *, workers=8, in_flight=3, frame_batch=256, strip_bat
             for proc in procs:
                 if not proc.is_alive() and proc.exitcode not in (0, None):
                     raise RuntimeError(f'worker {proc.pid} died with exit code {proc.exitcode}')
-            idle = not frames_waiting or not strips_waiting
+            # every fiber in flight waits on the engine: nothing else will arrive, so both kinds of work run now
+            # (otherwise frames waiting for strips to clear and strips waiting for frames to clear never run)
+            stalled = len(frames_waiting)+len(strips_waiting) >= sum(load)
+            idle = not frames_waiting or not strips_waiting or stalled
             if frames_waiting and (sum(len(r.positions) for _, r in frames_waiting) >= frame_batch or idle):
                 outputs = engine.frame_outputs([r for _, r in frames_waiting])
                 for (key, _), out in zip(frames_waiting, outputs):
                     inboxes[owner[key]].put(('frames', key, out))
                 frames_waiting.clear()
             if strips_waiting and (sum(len(s.positions) for _, s in strips_waiting) >= strip_batch or
-                                   not frames_waiting):
+                                   not frames_waiting or stalled):
                 outputs = engine.heights([s for _, s in strips_waiting])
                 for (key, _), out in zip(strips_waiting, outputs):
                     inboxes[owner[key]].put(('heights', key, out, grid, (blend, trim)))
