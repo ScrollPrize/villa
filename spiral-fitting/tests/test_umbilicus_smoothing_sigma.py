@@ -95,6 +95,12 @@ def test_checkpoint_fitted_around_another_axis_is_refused():
     unsmoothed = load._live_context()
     unsmoothed.config['umbilicus_smoothing_sigma'] = 0.
     assert not load._inspect(load._checkpoint(cfg=legacy), unsmoothed).accepted
+    # a narrower window would smooth around another axis than the checkpoint's model domain
+    narrower = load._live_context()
+    narrower.z_begin = 1200
+    assert load._inspect(load._checkpoint(), narrower).accepted
+    narrower.config['umbilicus_smoothing_sigma'] = 30.
+    assert 'umbilicus_smoothing_sigma' in load._inspect(load._checkpoint(cfg=narrower.config), narrower).message()
 
 
 def test_surface_identity_follows_the_axis_but_the_legacy_digest_is_unchanged():
@@ -102,6 +108,8 @@ def test_surface_identity_follows_the_axis_but_the_legacy_digest_is_unchanged():
     plain = model_state_sha256(state, (), 3100, 4100)
     assert model_state_sha256(state, (), 3100, 4100, umbilicus_smoothing_sigma=75.) == plain  # same surface, same digest
     assert model_state_sha256(state, (), 3100, 4100, umbilicus_smoothing_sigma=0.) != plain
+    assert (model_state_sha256(state, (), 3100, 4100, umbilicus_smoothing_sigma=-0.)
+            == model_state_sha256(state, (), 3100, 4100, umbilicus_smoothing_sigma=0))
     assert (model_state_sha256(state, (), 3100, 4100, umbilicus_smoothing_sigma=30.)
             != model_state_sha256(state, (), 3100, 4100, umbilicus_smoothing_sigma=0.))
 

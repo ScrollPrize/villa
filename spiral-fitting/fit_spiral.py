@@ -93,7 +93,8 @@ from tracks import (
     validate_track_sampling_config,
 )
 from track_graph import TrackGraph
-from umbilicus import thaumato_umbilicus_z_to_yx, json_umbilicus_z_to_yx, smooth_umbilicus_z_to_yx
+from umbilicus import (LEGACY_UMBILICUS_SMOOTHING_SIGMA, thaumato_umbilicus_z_to_yx,
+                       json_umbilicus_z_to_yx, smooth_umbilicus_z_to_yx)
 from sample_spiral import (
     get_radial_normal_stretch,
     get_spiral_points,
@@ -2144,7 +2145,7 @@ class FitContext:
                 verify=os.environ.get(
                     'FIT_SPIRAL_VERIFY_WINDING_INFERENCE', '1') != '0',
                 z_range=(self.z_begin, self.z_end),
-                z_to_umbilicus_yx=self.umbilicus,
+                z_to_umbilicus_yx=self.umbilicus_z_to_yx(),
             )
             print(
                 'loaded winding inference: '
@@ -2935,6 +2936,16 @@ class FitContext:
                     f'not the live model domain [{self.model_z_begin}, '
                     f'{self.model_z_end}); rebuild the fit to change the model '
                     'domain')
+            elif (domain != (int(self.z_begin), int(self.z_end))
+                  and self.config['umbilicus_smoothing_sigma'] != LEGACY_UMBILICUS_SMOOTHING_SIGMA):
+                # The readers smooth over the model domain, this run over its window.
+                reasons.append(
+                    f'umbilicus_smoothing_sigma='
+                    f'{self.config["umbilicus_smoothing_sigma"]!r} smooths the '
+                    f'umbilicus over the run window [{self.z_begin}, '
+                    f'{self.z_end}), not the checkpoint model z-domain '
+                    f'[{domain[0]}, {domain[1]}) it was fitted around; resume '
+                    'with the checkpoint window')
         else:
             reasons.append(
                 'checkpoint does not record a model z-domain, so it cannot be '

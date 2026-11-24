@@ -62,6 +62,8 @@ def _live_context():
         config=dict(CONFIG),
         model_z_begin=1000,
         model_z_end=2000,
+        z_begin=1000,
+        z_end=2000,
         spiral_and_transform=SimpleNamespace(
             state_dict=lambda: dict(MODEL_STATE)),
         optimiser=SimpleNamespace(

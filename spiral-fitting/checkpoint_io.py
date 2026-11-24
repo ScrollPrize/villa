@@ -70,7 +70,7 @@ def model_state_sha256(state_dict, frozen_epochs=(), z_begin=None,
     if (umbilicus_smoothing_sigma is not None
             and float(umbilicus_smoothing_sigma) != LEGACY_UMBILICUS_SMOOTHING_SIGMA):
         digest.update(
-            f"umbilicus_smoothing_sigma|{float(umbilicus_smoothing_sigma)!r}\n"
+            f"umbilicus_smoothing_sigma|{abs(float(umbilicus_smoothing_sigma))!r}\n"
             .encode("utf-8"))
     _feed_state_dict(digest, "live/", state_dict)
     for index, snapshot in enumerate(frozen_epochs or ()):

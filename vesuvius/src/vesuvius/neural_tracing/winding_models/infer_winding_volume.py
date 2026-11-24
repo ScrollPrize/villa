@@ -770,6 +770,7 @@ def build_seed_rays(args, device="cuda:0"):
                   for i in range(0, flat.shape[0], TRANSFORM_CHUNK)]
         scroll_flat = torch.cat(pieces).numpy().astype(np.float64)
 
+    umbilicus_yx = umbilicus_zyx[:, 1:].cpu().numpy().astype(np.float64)
     origins, directions, windings = [], [], []
     cursor = 0
     for winding, nz, ntheta in layout:
@@ -782,7 +783,7 @@ def build_seed_rays(args, device="cuda:0"):
         norm = np.linalg.norm(normal, axis=-1, keepdims=True)
         # Orient outward: away from the umbilicus in the yx plane.
         z_idx = np.clip(grid[..., 0].astype(int) - z_begin, 0, z_end - z_begin - 1)
-        umb_yx = centre(z_idx + z_begin)
+        umb_yx = umbilicus_yx[z_idx]
         radial = grid[..., 1:] - umb_yx
         sign = np.sign(np.einsum("...c,...c", normal[..., 1:], radial))
         sign[sign == 0] = 1.0
