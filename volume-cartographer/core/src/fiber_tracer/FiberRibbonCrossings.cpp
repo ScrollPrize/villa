@@ -48,6 +48,66 @@ cv::Vec3d unit(const cv::Vec3d& v)
     return n > 0.0 ? v / n : v;
 }
 
+// One span of a ribbon between two samples: its four corners and frame.
+struct RibbonSpan {
+    const FiberStripSample* s0 = nullptr;
+    const FiberStripSample* s1 = nullptr;
+    cv::Vec3d n0, n1, a, b, c, d, along, tangent;
+    double along2 = 0.0;
+    bool valid = false;
+};
+
+RibbonSpan ribbonSpan(const FiberStripSample& s0, const FiberStripSample& s1, const double halfHeight)
+{
+    RibbonSpan span;
+    if (!(cv::norm(s0.normal) > 0.0) || !(cv::norm(s1.normal) > 0.0)) return span;
+    span.s0 = &s0;
+    span.s1 = &s1;
+    span.n0 = unit(s0.normal);
+    span.n1 = unit(s1.normal);
+    span.a = s0.point - halfHeight * span.n0;
+    span.b = s1.point - halfHeight * span.n1;
+    span.c = s1.point + halfHeight * span.n1;
+    span.d = s0.point + halfHeight * span.n0;
+    span.along = s1.point - s0.point;
+    span.tangent = unit(span.along);
+    span.along2 = span.along.dot(span.along);
+    span.valid = span.along2 > 0.0;
+    return span;
+}
+
+// The passages of the fiber segment q0 -> q1 through one ribbon span. Both
+// triangles are wound the same way, so their normals are tangent x normal on a
+// regular span and turn over where the ribbon folds back on itself; a segment
+// may pass through both.
+template <class Emit>
+void spanCrossings(const RibbonSpan& span, const FiberStripSample& q0, const FiberStripSample& q1,
+                   const double maxTangentCosine, Emit&& emit)
+{
+    for (int half = 0; half < 2; ++half) {
+        const cv::Vec3d& second = half == 0 ? span.b : span.c;
+        const cv::Vec3d& third = half == 0 ? span.c : span.d;
+        const auto t = hitTriangle(q0.point, q1.point, span.a, second, third);
+        if (!t) continue;
+        const cv::Vec3d direction = unit(q1.point - q0.point);
+        const double cosine = span.tangent.dot(direction);
+        if (std::abs(cosine) > maxTangentCosine) continue;
+        const cv::Vec3d facing = (second - span.a).cross(third - span.a);
+        const cv::Vec3d hit = q0.point + *t * (q1.point - q0.point);
+        const double u = std::clamp((hit - span.s0->point).dot(span.along) / span.along2, 0.0, 1.0);
+        const cv::Vec3d normal = unit(span.n0 + u * (span.n1 - span.n0));
+        FiberRibbonCrossing crossing;
+        crossing.ribbonArc = span.s0->arc + u * (span.s1->arc - span.s0->arc);
+        crossing.fiberArc = q0.arc + *t * (q1.arc - q0.arc);
+        crossing.height = (hit - (span.s0->point + u * span.along)).dot(normal);
+        crossing.direction = direction.dot(facing) >= 0.0 ? 1 : -1;
+        crossing.tangentCosine = cosine;
+        crossing.normalDot = normal.dot(unit(q0.normal + *t * (q1.normal - q0.normal)));
+        crossing.point = hit;
+        emit(crossing);
+    }
+}
+
 }  // namespace
 
 std::vector<FiberRibbonCrossing> fiberRibbonCrossings(const std::span<const std::vector<FiberStripSample>> fibers,
@@ -102,19 +162,14 @@ std::vector<FiberRibbonCrossing> fiberRibbonCrossings(const std::span<const std:
         for (std::int64_t c; (c = next.fetch_add(1)) < chunks;) {
             auto& out = found[c];
             for (std::int64_t r = c * chunk; r < std::min((c + 1) * chunk, count); ++r) {
-                const auto& s0 = fibers[segments[r].fiber][segments[r].first];
-                const auto& s1 = fibers[segments[r].fiber][segments[r].first + 1];
-                if (!(cv::norm(s0.normal) > 0.0) || !(cv::norm(s1.normal) > 0.0)) continue;
-                const cv::Vec3d n0 = unit(s0.normal), n1 = unit(s1.normal);
-                const cv::Vec3d a = s0.point - options.halfHeight * n0, b = s1.point - options.halfHeight * n1,
-                                cc = s1.point + options.halfHeight * n1, d = s0.point + options.halfHeight * n0;
+                const auto span = ribbonSpan(fibers[segments[r].fiber][segments[r].first],
+                                             fibers[segments[r].fiber][segments[r].first + 1], options.halfHeight);
+                if (!span.valid) continue;
                 std::int64_t low[3], high[3];
                 for (int k = 0; k < 3; ++k) {
-                    low[k] = cellAxis(std::min({a[k], b[k], cc[k], d[k]}) - reach, k);
-                    high[k] = cellAxis(std::max({a[k], b[k], cc[k], d[k]}) + reach, k);
+                    low[k] = cellAxis(std::min({span.a[k], span.b[k], span.c[k], span.d[k]}) - reach, k);
+                    high[k] = cellAxis(std::max({span.a[k], span.b[k], span.c[k], span.d[k]}) + reach, k);
                 }
-                const cv::Vec3d along = s1.point - s0.point, tangent = unit(along);
-                const double along2 = along.dot(along);
                 for (std::int64_t x = low[0]; x <= high[0]; ++x)
                     for (std::int64_t y = low[1]; y <= high[1]; ++y) {
                         const std::int64_t last = packCell(x, y, high[2]);
@@ -122,35 +177,12 @@ std::vector<FiberRibbonCrossing> fiberRibbonCrossings(const std::span<const std:
                         for (; k < count && sorted[k] <= last; ++k) {
                             const Segment& other = segments[order[k]];
                             if (other.fiber == segments[r].fiber) continue;
-                            const auto& q0 = fibers[other.fiber][other.first];
-                            const auto& q1 = fibers[other.fiber][other.first + 1];
-                            // Both triangles are wound the same way, so their normals are
-                            // tangent x normal on a regular span and turn over where the
-                            // ribbon folds back on itself. A segment may pass through both.
-                            for (int half = 0; half < 2; ++half) {
-                            const cv::Vec3d& second = half == 0 ? b : cc;
-                            const cv::Vec3d& third = half == 0 ? cc : d;
-                            const cv::Vec3d facing = (second - a).cross(third - a);
-                            const auto t = hitTriangle(q0.point, q1.point, a, second, third);
-                            if (!t) continue;
-                            const cv::Vec3d direction = unit(q1.point - q0.point);
-                            const double cosine = tangent.dot(direction);
-                            if (std::abs(cosine) > options.maxTangentCosine) continue;
-                            const cv::Vec3d hit = q0.point + *t * (q1.point - q0.point);
-                            const double u = std::clamp((hit - s0.point).dot(along) / along2, 0.0, 1.0);
-                            const cv::Vec3d normal = unit(n0 + u * (n1 - n0));
-                            FiberRibbonCrossing crossing;
-                            crossing.ribbon = segments[r].fiber;
-                            crossing.fiber = other.fiber;
-                            crossing.ribbonArc = s0.arc + u * (s1.arc - s0.arc);
-                            crossing.fiberArc = q0.arc + *t * (q1.arc - q0.arc);
-                            crossing.height = (hit - (s0.point + u * along)).dot(normal);
-                            crossing.direction = direction.dot(facing) >= 0.0 ? 1 : -1;
-                            crossing.tangentCosine = cosine;
-                            crossing.normalDot = normal.dot(unit(q0.normal + *t * (q1.normal - q0.normal)));
-                            crossing.point = hit;
-                            out.push_back(crossing);
-                            }
+                            spanCrossings(span, fibers[other.fiber][other.first], fibers[other.fiber][other.first + 1],
+                                          options.maxTangentCosine, [&](FiberRibbonCrossing crossing) {
+                                              crossing.ribbon = segments[r].fiber;
+                                              crossing.fiber = other.fiber;
+                                              out.push_back(crossing);
+                                          });
                         }
                     }
             }
@@ -281,6 +313,65 @@ std::vector<FiberCrossingVerdict> fiberCrossingVerdicts(const std::span<const Fi
         }
     }
     return verdicts;
+}
+
+std::vector<FiberRibbonCrossing> fiberPairRibbonCrossings(const std::span<const FiberStripSample> ribbon,
+                                                          const std::span<const FiberStripSample> fiber,
+                                                          const FiberRibbonOptions& options)
+{
+    if (!(options.halfHeight > 0.0) || !(options.maxSegmentLength > 0.0) ||
+        !(options.maxTangentCosine > 0.0 && options.maxTangentCosine <= 1.0))
+        throw std::invalid_argument("ribbon crossings need a positive height and segment length and a cosine in (0, 1]");
+    std::vector<FiberRibbonCrossing> crossings;
+    // A segment can only reach a span whose middle lies within the ribbon's
+    // half diagonal plus both half lengths of it.
+    const double reach = options.halfHeight + 2.0 * options.maxSegmentLength;
+    for (std::size_t r = 0; r + 1 < ribbon.size(); ++r) {
+        const double length = cv::norm(ribbon[r + 1].point - ribbon[r].point);
+        if (!(length > 0.0) || length > options.maxSegmentLength) continue;
+        const auto span = ribbonSpan(ribbon[r], ribbon[r + 1], options.halfHeight);
+        if (!span.valid) continue;
+        const cv::Vec3d middle = 0.5 * (ribbon[r].point + ribbon[r + 1].point);
+        for (std::size_t f = 0; f + 1 < fiber.size(); ++f) {
+            const cv::Vec3d offset = 0.5 * (fiber[f].point + fiber[f + 1].point) - middle;
+            if (offset.dot(offset) > reach * reach) continue;
+            const double segment = cv::norm(fiber[f + 1].point - fiber[f].point);
+            if (!(segment > 0.0) || segment > options.maxSegmentLength) continue;
+            spanCrossings(span, fiber[f], fiber[f + 1], options.maxTangentCosine,
+                          [&](const FiberRibbonCrossing& crossing) { crossings.push_back(crossing); });
+        }
+    }
+    return crossings;
+}
+
+FiberCrossingFindings fiberCrossingFindings(const std::span<const FiberStripSample> a,
+                                            const std::span<const FiberStripSample> b, const double arcA,
+                                            const double arcB, const FiberRibbonOptions& surface,
+                                            const FiberCrossingFilterOptions& filter, const double encounterArcGap)
+{
+    namespace finding = vc::geometry::crossing_finding;
+    FiberCrossingFindings out;
+    double alternativeHeight = 0.0;
+    // Each fiber's surface is asked about the other fiber; a finding holds
+    // when either states it, and of two alternatives the one nearer its fiber.
+    for (int view = 0; view < 2; ++view) {
+        auto crossings = fiberPairRibbonCrossings(view == 0 ? a : b, view == 0 ? b : a, surface);
+        if (crossings.empty()) continue;
+        const auto encounters = fiberRibbonEncounters(crossings, encounterArcGap);
+        const FiberCrossingEventView event{0, 0, view == 0 ? arcA : arcB, view == 0 ? arcB : arcA};
+        const auto verdict = fiberCrossingVerdicts(crossings, encounters, std::span(&event, 1), filter)[0];
+        if (verdict.matched) out.findings |= finding::Matched;
+        if (verdict.multiple) out.findings |= finding::Multiple;
+        if (verdict.nothingLeft) out.findings |= finding::NothingLeft;
+        if (verdict.mixed) out.findings |= finding::Mixed;
+        if (verdict.mixedNear) out.findings |= finding::MixedNear;
+        if (verdict.severalLeft) out.findings |= finding::SeveralLeft;
+        if (verdict.alternativeDot != 0.0 && (out.alternative == 0.0 || verdict.alternativeHeight < alternativeHeight)) {
+            out.alternative = verdict.alternativeDot;
+            alternativeHeight = verdict.alternativeHeight;
+        }
+    }
+    return out;
 }
 
 }  // namespace vc::fiber_tracer

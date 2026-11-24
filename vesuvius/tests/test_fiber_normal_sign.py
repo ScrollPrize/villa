@@ -95,19 +95,21 @@ def test_cached_tensor_identity_and_invalid_edges(tmp_path):
 
 
 def test_crossing_filter_passes(tmp_path):
+    from vc_object_store import CROSSING_FINDINGS
     from vesuvius.neural_tracing.fiber_trace_3d.fiber_graph_store import FiberGraph
     path=measured_store(tmp_path,[(0,11,12,False,.5),(1,11,23,False,.5),(2,12,23,False,.5)])
     ids=list(map(uid,[11,12,23]));graph=FiberGraph(path)
     prior=tmp_path/'prior.json'
     prior.write_text(json.dumps(dict(format='fiber-outward-priors',source_store=graph.source,source_ids=ids,agreement=[1.,-1.,0.])))
-    config=dict(database=str(path),priors=str(prior),crossing_filter='auto')
-    with pytest.raises(FileNotFoundError,match='No crossing filter'):
+    config=dict(database=str(path),priors=str(prior),crossing_filter=True)
+    # This store's extraction recorded no findings: filtering is an error, never a silent unfiltered solve.
+    assert not graph.has_crossing_findings and not graph.crossing_findings.any()
+    with pytest.raises(ValueError,match='needs an extraction with crossing_findings'):
         prepare(config,graph=graph,return_arrays=True)
-    listed=Path(path).with_name(Path(path).stem+'.crossing-filter.bin')
     # Event 0: nothing left. Event 1: mixed, with an alternative of |dot| 0.5. Event 2: no finding.
-    np.asarray([(0,4,0.),(1,8,.5),(2,0,0.)],dtype=[('event','<i8'),('findings','<i8'),('alternative','<f8')]).tofile(listed)
-    statement=dict(format='fiber_crossing_filter',version=2,store=graph.source['store_uuid'],events=len(graph.event_ids),sign_events=3)
-    Path(str(listed)+'.json').write_text(json.dumps(statement))
+    graph.has_crossing_findings=True
+    graph.crossing_findings=np.asarray([CROSSING_FINDINGS['nothing_left'],CROSSING_FINDINGS['mixed'],0],np.uint8)
+    graph.crossing_alternative=np.asarray([0.,.5,0.])
     plain,_=prepare(dict(config,crossing_filter=False),graph=graph,return_arrays=True)
     assert plain['event_ids'].tolist()==[0,1,2] and plain['dot'].tolist()==[1.,1.,1.]
     # First pass: sign-free, drops nothing-left and mixed.
@@ -120,11 +122,8 @@ def test_crossing_filter_passes(tmp_path):
     assert data['event_ids'].tolist()==[1,2] and data['dot'].tolist()==[-.5,1.] and stats['crossing_filter_replaced']==1
     data,stats=prepare(config,graph=graph,return_arrays=True,signs=[1,1,1])
     assert data['dot'].tolist()==[1.,1.] and stats['crossing_filter_replaced']==0
-    with pytest.raises(ValueError,match='needs the crossing filter'):
+    with pytest.raises(ValueError,match='needs crossing_filter'):
         prepare(dict(config,crossing_filter=False),graph=graph,return_arrays=True,signs=[1,1,1])
-    Path(str(listed)+'.json').write_text(json.dumps(dict(statement,events=99)))
-    with pytest.raises(ValueError,match='another extraction store'):
-        prepare(config,graph=graph,return_arrays=True)
 
 
 def test_winding_distance_factor_and_strict_metric():

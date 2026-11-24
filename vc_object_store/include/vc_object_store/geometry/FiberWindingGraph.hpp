@@ -1,4 +1,5 @@
 #pragma once
+#include "vc_object_store/geometry/FiberCrossingFilter.hpp"
 #include "vc_object_store/geometry/FiberCrossingWeight.hpp"
 #include "vc_object_store/geometry/FiberWinding.hpp"
 #include <queue>
@@ -31,6 +32,11 @@ struct FiberWindingGraphInput {
     WindingGraphColumn<double> arcA,arcB,distance;
     std::span<const bool> parallel,validA,validB,validConnector;
     std::span<const double> normalA,normalB,connector; // XYZ triples, unexpanded
+    // The crossings' normal-surface findings, as the extraction stored them
+    // with the constraints; empty for a build that does not filter
+    // (WindingConstraintOptions::crossingFilter is set from their presence).
+    std::span<const uint8_t> crossingFindings;
+    std::span<const double> crossingAlternative;
 };
 // Per-type constraint weights. A zero weight omits that type's arcs; the
 // enclosure pass derives exact H->V relations from signed perpendicular
@@ -54,6 +60,12 @@ struct WindingConstraintOptions {
     // this weight times the crossing's evidence, costing only when a solve
     // breaks it; zero states none. It needs no winding separation.
     double signWeight=0;
+    // Pass every perpendicular crossing through the shared rule
+    // (fiberCrossingUse) under the two fibers' signs before it states
+    // anything: a crossing the rule drops, or one that would have to take
+    // another crossing's dot (which has no measured separation), yields no
+    // constraint.
+    bool crossingFilter=false;
 };
 struct FiberWindingGraphOptions : WindingConstraintOptions {
     size_t constraintBatch=500000,readBatch=32768,workers=32;
@@ -65,6 +77,8 @@ struct FiberWindingL1Columns {
     std::unique_ptr<int64_t[]> a,b,target;
     std::unique_ptr<double[]> weight;
     size_t arcs{},read{},used{},expanded{},withoutDistance{};
+    // Crossings the findings took out (FiberWindingGraphInput::crossingFindings).
+    size_t crossingFiltered{};
     // One-sided sign constraints (WindingConstraintOptions::signWeight), in
     // node order a < b: the step b - a is at least (side +1) or at most
     // (side -1) the target. Identical ones are summed.
@@ -139,6 +153,10 @@ struct WindingEvent {
     double weight=0;
     bool enclosure=false; // collect the signed enclosure bound of this event
     double perpendicularOffset=.5;
+    // The crossing's normal-surface findings (FiberCrossingFilter.hpp); zero
+    // for none recorded.
+    uint8_t crossingFindings=0;
+    double crossingAlternative=0;
 };
 // What one event contributes: its signed order, the arcs of the fractional
 // target expansion in node order (a < b) and its enclosure bound.
@@ -235,6 +253,8 @@ struct WindingEventConstraints {
     double weight=0;
     bool hasSign=false;
     WindingSignConstraint sign{};
+    // The crossing filter took the crossing out (WindingConstraintOptions::crossingFilter).
+    bool filtered=false;
 };
 // `event` states the crossing as measured: its `distance` is unscaled, and
 // its weight, enclosure flag and perpendicular offset are set here.
@@ -244,6 +264,10 @@ inline WindingEventConstraints windingEventConstraints(const PackedFiberGeometry
     WindingEventConstraints out;
     event.distance*=options.windingScale;
     const double dot=event.normalA[0]*event.normalB[0]+event.normalA[1]*event.normalB[1]+event.normalA[2]*event.normalB[2];
+    if(options.crossingFilter&&!event.parallel){
+        const auto use=fiberCrossingUse(event.crossingFindings,event.crossingAlternative,dot,int(event.signA*event.signB));
+        if(!use.used||use.replaced){out.filtered=true;return out;}
+    }
     out.evidence=fiberCrossingDotWeight(dot,options.dotWeightPower)
                 *(options.dampByWindingDistance?fiberCrossingDistanceFactor(event.distance):1.);
     out.weight=(event.parallel?options.parallelWeight:options.perpendicularWeight)*out.evidence;
@@ -315,7 +339,8 @@ inline FiberWindingL1Columns prepareFiberWindingGraph(const PackedFiberGeometry&
     if(in.b.count!=m||in.arcA.count!=m||in.arcB.count!=m||in.distance.count!=m||
        in.parallel.size()!=m||in.validA.size()!=m||in.validB.size()!=m||in.validConnector.size()!=m||
        in.normalA.size()!=m*3||in.normalB.size()!=m*3||in.connector.size()!=m*3||in.normalSign.size()!=n||
-       in.a.stride<1||in.b.stride<1||in.arcA.stride<1||in.arcB.stride<1||in.distance.stride<1)
+       in.a.stride<1||in.b.stride<1||in.arcA.stride<1||in.arcB.stride<1||in.distance.stride<1||
+       (!in.crossingFindings.empty()&&in.crossingFindings.size()!=m)||in.crossingAlternative.size()!=in.crossingFindings.size())
         throw std::invalid_argument("winding graph input columns differ");
     vc::objects::parallelFor((n+4095)/4096,options.workers,[&](size_t block){
         for(size_t i=block*4096;i<std::min(n,(block+1)*4096);++i)
@@ -329,9 +354,11 @@ inline FiberWindingL1Columns prepareFiberWindingGraph(const PackedFiberGeometry&
         if(owner<-1||(owner>=0&&uint64_t(owner)>=n))throw std::invalid_argument("winding node outside catalog");
         return owner;
     };
+    // The input carries findings exactly when the build filters by them.
+    WindingConstraintOptions shared=options;shared.crossingFilter=!in.crossingFindings.empty();
     struct Job {std::vector<Arc> arcs;std::vector<EnclosureBound> enclosures;std::vector<WindingSignConstraint> signs;
                 std::vector<int64_t> eventA,eventB;std::vector<double> eventTarget,eventMeasured,eventDistance,eventWeight;
-                size_t used{},expanded{},withoutDistance{};};
+                size_t used{},expanded{},withoutDistance{},crossingFiltered{};};
     const size_t jobs=(m+options.constraintBatch-1)/options.constraintBatch;
     std::vector<Job> parts(jobs);
     vc::objects::parallelFor(jobs,options.workers,[&](size_t job){
@@ -352,7 +379,9 @@ inline FiberWindingL1Columns prepareFiberWindingGraph(const PackedFiberGeometry&
                 event.parallel=in.parallel[k];
                 event.connector=point(in.connector,k);
                 event.normalA=point(in.normalA,k);event.normalB=point(in.normalB,k);
-                const auto constraints=windingEventConstraints(geometry,event,options);
+                if(!in.crossingFindings.empty()){event.crossingFindings=in.crossingFindings[k];event.crossingAlternative=in.crossingAlternative[k];}
+                const auto constraints=windingEventConstraints(geometry,event,shared);
+                if(constraints.filtered){++part.crossingFiltered;continue;}
                 const auto& relation=constraints.relation;
                 part.withoutDistance+=relation.withoutDistance;
                 if(relation.hasEnclosure&&options.enclosures)part.enclosures.push_back(relation.enclosure);
@@ -374,7 +403,7 @@ inline FiberWindingL1Columns prepareFiberWindingGraph(const PackedFiberGeometry&
         aggregate(part.arcs);
     });
     FiberWindingL1Columns out;out.read=m;
-    for(const auto& part:parts){out.used+=part.used;out.expanded+=part.expanded;out.withoutDistance+=part.withoutDistance;}
+    for(const auto& part:parts){out.used+=part.used;out.expanded+=part.expanded;out.withoutDistance+=part.withoutDistance;out.crossingFiltered+=part.crossingFiltered;}
     if(options.enclosures){
         // Exact relations need every bound of a pair: gather, sort by pair,
         // then accept pairs whose largest lower bound equals the smallest

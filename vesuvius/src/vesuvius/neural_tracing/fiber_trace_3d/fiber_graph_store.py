@@ -227,6 +227,10 @@ class FiberGraph:
         self.distance=data['distance'];self.parallel=data['parallel'].view(bool)
         self.valid_a=data['valid_a'].view(bool);self.valid_b=data['valid_b'].view(bool)
         self.valid_connector=data['valid_connector'].view(bool)
+        # What the fibers' normal surfaces found about each crossing, when the extraction
+        # recorded it with the constraints (vc_object_store geometry/FiberCrossingFilter.hpp).
+        self.has_crossing_findings=bool(data['has_crossing_findings'])
+        self.crossing_findings=data['crossing_findings'];self.crossing_alternative=data['crossing_alternative']
 
     @property
     def fiber_a(self):return _IndexedFiberIds(self.ids,self.i)

@@ -1,6 +1,7 @@
 #pragma once
 #include "vc_object_store/geometry/FiberWinding.hpp"
 #include "vc_object_store/geometry/FiberWindingGraph.hpp"
+#include "vc_object_store/geometry/FiberCrossingFilter.hpp"
 #include "vc_object_store/geometry/FiberWindingFlow.hpp"
 #include "FiberUvEventBindings.hpp"
 #include <nanobind/ndarray.h>
@@ -126,6 +127,8 @@ void bindFiberWinding(nb::module_& module){
             WindingI64 graphToCatalog,WindingI64 family,WindingI64 signs,WindingArc arcA,WindingArc arcB,
             WindingArc distance,WindingFlag parallel,WindingXYZ normalA,WindingXYZ normalB,WindingXYZ connector,
             WindingFlag validA,WindingFlag validB,WindingFlag validConnector,
+            std::optional<nb::ndarray<const uint8_t,nb::ndim<1>,nb::c_contig,nb::device::cpu>> crossingFindings,
+            std::optional<WindingF64> crossingAlternative,
             double scale,double offset,double parallelWeight,double perpendicularWeight,
             double dotWeightPower,bool dampByWindingDistance,double signWeight,bool enclosures,bool eventTargets,
             size_t constraintBatch,size_t readBatch,size_t workers){
@@ -139,6 +142,12 @@ void bindFiberWinding(nb::module_& module){
                 windingSpan(parallel),windingSpan(validA),windingSpan(validB),windingSpan(validConnector),
                 std::span(normalA.data(),normalA.shape(0)*3),std::span(normalB.data(),normalB.shape(0)*3),
                 std::span(connector.data(),connector.shape(0)*3)};
+            if(bool(crossingFindings)!=bool(crossingAlternative))
+                throw std::invalid_argument("crossing findings and alternatives come together");
+            if(crossingFindings){
+                input.crossingFindings=std::span(crossingFindings->data(),crossingFindings->shape(0));
+                input.crossingAlternative=windingSpan(*crossingAlternative);
+            }
             vc::geometry::FiberWindingGraphOptions options;
             options.windingScale=scale;options.perpendicularOffset=offset;
             options.perpendicularWeight=perpendicularWeight;options.parallelWeight=parallelWeight;
@@ -155,6 +164,7 @@ void bindFiberWinding(nb::module_& module){
             result["weight"]=uvOwnedColumn(std::move(output.weight),output.arcs);
             result["read"]=output.read;result["used"]=output.used;result["expanded"]=output.expanded;
             result["without_distance"]=output.withoutDistance;
+            result["crossing_filtered"]=output.crossingFiltered;
             if(signWeight>0){
                 // Node order a < b: the step b - a is at least (side +1) or at most (side -1) the target.
                 result["sign_a"]=uvOwnedColumn(std::move(output.signA),output.signArcs);
@@ -184,9 +194,35 @@ void bindFiberWinding(nb::module_& module){
         },"i"_a,"j"_a,"graph_to_catalog"_a,"family"_a,"normal_sign"_a,"arc_a"_a,"arc_b"_a,
           "distance"_a,"parallel"_a,"normal_a"_a,"normal_b"_a,"connector"_a,
           "valid_a"_a,"valid_b"_a,"valid_connector"_a,
+          "crossing_findings"_a=nb::none(),"crossing_alternative"_a=nb::none(),
           "lasagna_winding_scale"_a=1.,"perpendicular_offset"_a=.5,"parallel_weight"_a=1.,"perpendicular_weight"_a=1.,
           "dot_weight_power"_a=0.,"damp_by_winding_distance"_a=false,"sign_weight"_a=0.,
           "enclosures"_a=false,"event_targets"_a=false,"constraint_batch"_a=500000,"read_batch"_a=32768,"workers"_a=32);
+    module.def("fiber_crossing_use",[](nb::ndarray<const uint8_t,nb::ndim<1>,nb::c_contig,nb::device::cpu> findings,
+                                       WindingF64 alternative,WindingF64 dot,WindingI64 signProduct,int unsignedDrop){
+        const size_t n=findings.shape(0);
+        if(alternative.shape(0)!=n||dot.shape(0)!=n||signProduct.shape(0)!=n||unsignedDrop<0||unsignedDrop>255)
+            throw std::invalid_argument("invalid crossing use arrays");
+        auto used=std::make_unique_for_overwrite<uint8_t[]>(n);auto replaced=std::make_unique_for_overwrite<uint8_t[]>(n);
+        auto value=std::make_unique_for_overwrite<double[]>(n);
+        for(size_t i=0;i<n;++i){
+            const auto use=vc::geometry::fiberCrossingUse(findings(i),alternative(i),dot(i),int(signProduct(i)),uint8_t(unsignedDrop));
+            used[i]=use.used;replaced[i]=use.replaced;value[i]=use.dot;
+        }
+        nb::dict result;
+        result["used"]=uvOwnedColumn(std::move(used),n);result["replaced"]=uvOwnedColumn(std::move(replaced),n);
+        result["dot"]=uvOwnedColumn(std::move(value),n);
+        return result;
+    },"findings"_a,"alternative"_a,"dot"_a,"sign_product"_a,"unsigned_drop"_a=int(vc::geometry::kCrossingFirstPassDrop),
+      "The shared rule for a measured crossing and its normal-surface findings (geometry/FiberCrossingFilter.hpp): "
+      "whether it takes part, the dot to use, and whether that dot is another crossing's. sign_product 0: no signs yet.");
+    {
+        nb::dict bits;
+        bits["matched"]=int(vc::geometry::crossing_finding::Matched);bits["multiple"]=int(vc::geometry::crossing_finding::Multiple);
+        bits["nothing_left"]=int(vc::geometry::crossing_finding::NothingLeft);bits["mixed"]=int(vc::geometry::crossing_finding::Mixed);
+        bits["mixed_near"]=int(vc::geometry::crossing_finding::MixedNear);bits["several_left"]=int(vc::geometry::crossing_finding::SeveralLeft);
+        module.attr("CROSSING_FINDINGS")=bits;
+    }
     module.def("fiber_signed_order",[](WindingXYZ connector,WindingXYZ a,WindingXYZ b,double minimum,size_t workers){
         const size_t n=connector.shape(0);
         if(connector.shape(1)!=3||a.shape(1)!=3||b.shape(1)!=3||a.shape(0)!=n||b.shape(0)!=n||!std::isfinite(minimum))

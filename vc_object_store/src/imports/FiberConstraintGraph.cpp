@@ -46,7 +46,7 @@ void requireFormat(const ExtensionTableInfo& info){
 }
 static std::vector<CompactFiberConstraint> readCompactFiberConstraintGraphImpl(const ObjectCollection& store,const CollectionTxn& txn,size_t workers,
     const std::function<void(const char*,size_t,size_t)>& progress,std::vector<FiberGraphNodeColumn>* nodes=nullptr,
-    std::string* targetVolume=nullptr){
+    std::string* targetVolume=nullptr,bool* crossingFindings=nullptr){
     using namespace detail;if(!workers)throw std::invalid_argument("graph read workers must be positive");
     const auto parts=CollectionScanAccess::partitions(store,txn);
     struct Edge {FiberGraphUuid a,b;int state=0,kind=-1,measurementOwner=INT_MAX;};
@@ -67,6 +67,7 @@ static std::vector<CompactFiberConstraint> readCompactFiberConstraintGraphImpl(c
         schema=info;data[n].schema=std::move(info);
     }
     if(!schema)throw std::invalid_argument("store has no fiber constraint measurements");
+    if(crossingFindings)*crossingFindings=nlohmann::json::parse(schema->provisioning).value("crossing_findings",false);
     std::string volume;std::optional<std::vector<FiberGraphUuid>> selected;
     if(nodes){
         const auto provisioning=nlohmann::json::parse(schema->provisioning);
@@ -163,7 +164,7 @@ static std::vector<CompactFiberConstraint> readCompactFiberConstraintGraphImpl(c
     }
     parallelFor(parts.size(),workers,[&](size_t n){if(!data[n].schema)return;auto* db=parts[n].db;auto& rows=data[n].rows;
         Statement count(db,std::string("SELECT count(*) FROM ")+kFiberConstraintTable);count.row();rows.reserve(count.i64(0));
-        Statement scan(db,std::string("SELECT edge_uuid,arc_a,arc_b,normal_a,normal_b,connector,winding_distance FROM ")+kFiberConstraintTable);size_t local=0;
+        Statement scan(db,std::string("SELECT edge_uuid,arc_a,arc_b,normal_a,normal_b,connector,winding_distance,extra FROM ")+kFiberConstraintTable);size_t local=0;
         while(scan.row()){
             CompactFiberConstraint r;r.uuid=scan.blob16(0);r.measurementPartition=n;const auto [owner,edge]=edgeOwner(r.uuid);(void)owner;
             if(!edge||edge->state!=0||(edge->kind!=0&&edge->kind!=1)||!active(edge->a)||!active(edge->b))
@@ -175,7 +176,16 @@ static std::vector<CompactFiberConstraint> readCompactFiberConstraintGraphImpl(c
             r.normalA=decodeFiberDirection(a);r.normalB=decodeFiberDirection(b);r.connector=decodeFiberDirection(c);
             r.validA=a[2]!=0;r.validB=b[2]!=0;r.validConnector=c[2]!=0;
             // Byte 0 is a relation without a winding distance (NaN), still a graph edge.
-            const auto distance=blob(scan,6,1);r.windingDistance=decodeFiberWindingDistance(distance);rows.push_back(r);
+            const auto distance=blob(scan,6,1);r.windingDistance=decodeFiberWindingDistance(distance);
+            if(!scan.isNull(7)){
+                // The row's optional extra object; `crossing` is [finding bits, alternative |dot|].
+                const auto extra=nlohmann::json::parse(scan.text(7));
+                if(const auto crossing=extra.find("crossing");crossing!=extra.end()){
+                    if(!crossing->is_array()||crossing->size()!=2)throw std::invalid_argument("invalid crossing findings in a fiber measurement");
+                    r.crossingFindings=uint8_t((*crossing)[0].get<int64_t>());r.crossingAlternative=(*crossing)[1].get<double>();
+                }
+            }
+            rows.push_back(r);
             if(++local%1000000==0)report("measurements",readRows.fetch_add(1000000)+1000000,n);
         }report("measurements",readRows.fetch_add(local%1000000)+local%1000000,n);
     });
@@ -197,7 +207,7 @@ std::vector<CompactFiberConstraint> readCompactFiberConstraintGraph(const Object
 FiberGraphColumns readFiberGraphColumns(const ObjectCollection& store,const CollectionTxn& txn,size_t workers,
     const std::function<void(const char*,size_t,size_t)>& progress){
     FiberGraphColumns out;std::vector<FiberGraphNodeColumn> nodes;
-    auto records=readCompactFiberConstraintGraphImpl(store,txn,workers,progress,&nodes,&out.volume);
+    auto records=readCompactFiberConstraintGraphImpl(store,txn,workers,progress,&nodes,&out.volume,&out.hasCrossingFindings);
     const size_t n=nodes.size(),m=records.size();
     if(progress)progress("column_projection",0,workers);
     out.nodes=n;out.events=m;
@@ -208,6 +218,7 @@ FiberGraphColumns readFiberGraphColumns(const ObjectCollection& store,const Coll
     out.connector=std::make_unique_for_overwrite<std::array<double,3>[]>(m);out.distance=std::make_unique_for_overwrite<double[]>(m);
     out.parallel=std::make_unique_for_overwrite<uint8_t[]>(m);out.validA=std::make_unique_for_overwrite<uint8_t[]>(m);
     out.validB=std::make_unique_for_overwrite<uint8_t[]>(m);out.validConnector=std::make_unique_for_overwrite<uint8_t[]>(m);
+    out.crossingFindings=std::make_unique_for_overwrite<uint8_t[]>(m);out.crossingAlternative=std::make_unique_for_overwrite<double[]>(m);
     parallelFor((n+4095)/4096,workers,[&](size_t task){
         for(size_t i=task*4096;i<std::min(n,(task+1)*4096);++i){out.fiberUuids[i]=nodes[i].uuid;out.lengths[i]=nodes[i].length;}
     });
@@ -221,6 +232,7 @@ FiberGraphColumns readFiberGraphColumns(const ObjectCollection& store,const Coll
             out.edgeUuids[i]=r.uuid;out.eventIds[i]=int64_t(r.runtimeIndex);out.endpoints[i]={index(r.a),index(r.b)};
             out.arcs[i]={r.arcA,r.arcB};out.normalA[i]=r.normalA;out.normalB[i]=r.normalB;out.connector[i]=r.connector;
             out.distance[i]=r.windingDistance;out.parallel[i]=r.parallel;out.validA[i]=r.validA;out.validB[i]=r.validB;out.validConnector[i]=r.validConnector;
+            out.crossingFindings[i]=r.crossingFindings;out.crossingAlternative[i]=r.crossingAlternative;
         }
     });
     if(progress)progress("columns_complete",m,workers);

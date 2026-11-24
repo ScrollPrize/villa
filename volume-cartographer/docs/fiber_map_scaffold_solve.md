@@ -387,6 +387,7 @@ vc_scaffold_solve config.json
 | `weights.perpendicular`, `.parallel`, `.enclosure` | `1`, `0`, `0` | weight per measured arc |
 | `weights.sign` | `100` | weight per sign constraint (one per signed perpendicular crossing) |
 | `weights.crossing_confidence` | `true` | scale a crossing's perpendicular, parallel and sign weight by the sign stage's term, dot² × min(1, 1/d²) |
+| `constraints.crossing_filter` | `true` | follow every perpendicular crossing through its two fibers' normal surfaces and apply the shared crossing rule (vc_object_store `geometry/FiberCrossingFilter.hpp`, the one the traced volume's sign and winding stages use): the sign solve drops crossings with nothing left or mixed relations, the constraints drop crossings with nothing left and those that disagree under the solved signs but have an agreeing crossing in the same encounter |
 | `winding.manifest`, `winding.remote_cache` | — | the Lasagna normal dataset the separations are measured on |
 | `normals.twist_weight`, `.lateral_weight`, `.smoothing_sigma`, `.resample_spacing` | `300`, `1`, `64`, `64` | the strip solve, at the whole-volume pipeline's settings |
 | `normals.manual_display_normals`, `.approved_pieces`, `.adjacent_links` | `true` | which anchors fix a sign |

@@ -22,6 +22,7 @@
 #include "vc/fiber_graph/ScaffoldRunMonitor.hpp"
 #include "vc/fiber_graph/ScaffoldWindingSolve.hpp"
 #include "vc/fiber_tracer/FiberNormalSign.hpp"
+#include "vc/fiber_tracer/FiberRibbonCrossings.hpp"
 #include "vc/fiber_tracer/FiberTraceConstraints.hpp"
 #include "vc_object_store/objects/FiberConstraintApprovalExtension.hpp"
 
@@ -46,6 +47,11 @@ struct ScaffoldEvent {
     double distance = std::numeric_limits<double>::quiet_NaN();
     double closestDistance = 0; // voxels between the two anchors
     double parallelScore = 0, perpendicularScore = 0;
+    // What the two fibers' normal surfaces find about a perpendicular
+    // crossing (vc/fiber_tracer/FiberRibbonCrossings.hpp), in the form the
+    // traced volume's extraction stores with its constraints.
+    std::uint8_t crossingFindings = 0;
+    double crossingAlternative = 0;
 };
 
 struct ScaffoldEventOptions {
@@ -68,6 +74,20 @@ struct ScaffoldEventOptions {
     // thrown away rather than a bad measurement caught.
     double maximumWindingDistance = 1.5;
     bool enforceMaximumWindingDistance = false;
+    // Follow every perpendicular crossing through its two fibers' normal
+    // surfaces and record what is found (ScaffoldEvent::crossingFindings),
+    // with the traced volume's own surface and matching parameters.
+    bool crossingFindings = true;
+    fiber_tracer::FiberRibbonOptions crossingSurface = [] {
+        fiber_tracer::FiberRibbonOptions surface;
+        surface.halfHeight = 512.0;
+        surface.maxTangentCosine = 1.0;
+        return surface;
+    }();
+    fiber_tracer::FiberCrossingFilterOptions crossingFilter;
+    double crossingEncounterArcGap = 3000.0;
+    // Arc spacing of the strip normals the surfaces are built from, voxels.
+    double crossingSampleSpacing = 16.0;
     std::size_t workers = 0; // 0: the extractor's own default
     // Optional progress and cancellation. The extraction itself is one call
     // into the tracer, so a run can be taken back before and after it, not
@@ -91,6 +111,9 @@ struct ScaffoldEventReport {
     // Crossings dropped because one of their two points lies on a gap span
     // or too close to one to be certified.
     std::int64_t rejectedGap = 0;
+    // Perpendicular crossings followed through the normal surfaces, and those
+    // with a finding beyond the single matching passage.
+    std::int64_t crossingsAsked = 0, crossingsWithFindings = 0;
     double seconds = 0;
 };
 
@@ -110,11 +133,16 @@ struct ScaffoldSignOptions {
     // crossings. Off leaves them at their geometry gauge, which only means
     // something when every fiber carries an anchor.
     bool solve = true;
+    // Leave out the crossings the shared rule drops while no signs exist
+    // (vc_object_store geometry/FiberCrossingFilter.hpp: nothing left, mixed).
+    bool crossingFilter = true;
     // Optional progress and cancellation, checked before the solve starts.
     ScaffoldRunMonitor* monitor = nullptr;
 };
 
 struct ScaffoldSignResult {
+    // Crossings the shared crossing rule left out of the sign solve.
+    std::int64_t crossingFiltered = 0;
     // Per fiber: the multiplier that turns its gauge normal into the outward
     // one, as the winding assembly's `normalSign` column.
     std::vector<std::int64_t> sign;
@@ -172,6 +200,10 @@ struct ScaffoldMeasuredOptions {
     // ones. An enclosure is a statement about a pair and keeps its weight.
     bool crossingConfidence = true;
     fiber_tracer::FiberSignOptions confidence{};
+    // Pass every perpendicular crossing through the shared rule under the
+    // solved signs before it states a constraint (the traced volume's
+    // winding stage does the same with `crossing_filter`).
+    bool crossingFilter = true;
     // Half a winding between an H and a V fiber of the same sheet pair, and
     // the scale the measured separations are read in.
     double perpendicularOffset = 0.5, windingScale = 1.0;
@@ -180,6 +212,8 @@ struct ScaffoldMeasuredOptions {
 
 struct ScaffoldMeasuredReport {
     std::int64_t events = 0, used = 0, expanded = 0, withoutDistance = 0;
+    // Crossings the shared crossing rule took out (ScaffoldMeasuredOptions::crossingFilter).
+    std::int64_t crossingFiltered = 0;
     // Crossings whose separation was fractional: split into two constraints
     // under Split, rounded to the nearer integer under Rounded.
     std::int64_t fractional = 0;

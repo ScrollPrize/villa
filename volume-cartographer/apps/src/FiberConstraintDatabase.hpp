@@ -1,4 +1,5 @@
 #pragma once
+#include "vc/fiber_tracer/FiberRibbonCrossings.hpp"
 #include "vc/fiber_tracer/FiberTraceConstraints.hpp"
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
 #include "vc/core/util/Umbilicus.hpp"
@@ -57,6 +58,17 @@ struct FiberConstraintDatabaseOptions {
     // Synchronous push producer: borrowed normals for this worker's current
     // batch, indexed from zero. Never reread completed chunk samples.
     std::function<const FiberConstraintNormalSamples*(std::size_t)> batchNormalSamples;
+    // The fitted strip normals of every source fiber at a regular arc spacing,
+    // borrowed. When supplied, each perpendicular crossing is followed
+    // through its two fibers' normal surfaces (vc/fiber_tracer/
+    // FiberRibbonCrossings.hpp) and what is found is stored with its row, for
+    // every later stage's filter (vc_object_store geometry/FiberCrossingFilter.hpp).
+    const std::vector<std::vector<vc::fiber_tracer::FiberStripSample>>* crossingSamples=nullptr;
+    vc::fiber_tracer::FiberRibbonOptions crossingSurface=[] {
+        vc::fiber_tracer::FiberRibbonOptions o;o.halfHeight=512.;o.maxTangentCosine=1.;return o;
+    }();
+    vc::fiber_tracer::FiberCrossingFilterOptions crossingFilter;
+    double crossingEncounterArcGap=3000.;
     // Transfer transient measurements after local-frame reconciliation. Native
     // edges are inserted immediately; only corrected standard-v2 measurements
     // are persisted. The callback runs on each existing shard writer.

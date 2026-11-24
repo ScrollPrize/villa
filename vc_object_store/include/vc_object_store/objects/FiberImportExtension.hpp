@@ -1,4 +1,5 @@
 #pragma once
+#include <utility>
 #include "vc_object_store/objects/Extensions.hpp"
 #include <nlohmann/json_fwd.hpp>
 
@@ -54,6 +55,12 @@ struct FiberConstraintData {
     std::array<FiberConstraintNormal,2> normals;
     std::optional<std::string> extra;
     std::optional<std::array<std::array<double,3>,2>> measuredPoints;
+    // What the fibers' normal surfaces found about a crossing
+    // (geometry/FiberCrossingFilter.hpp): the finding bits and the |dot| of the
+    // nearest crossing of the other relation. Stored with the row (in its
+    // `extra` object, key `crossing`) when set; a store whose rows carry them
+    // states `crossing_findings` in the table's provisioning.
+    std::optional<std::pair<int64_t,double>> crossing;
 };
 InitialExtensionRow fiberConstraintRow(const std::string& edgeUuid,int64_t sourceId,
     int64_t sourceFiberA,int64_t sourceFiberB,bool sourceReversed,FiberConstraintData data);

@@ -132,3 +132,52 @@ TEST_CASE("verdicts: single, unmatched, nothing left, mixed")
     CHECK(both.alternativeHeight == doctest::Approx(80.0));
     CHECK(one.alternativeDot == 0.0);
 }
+
+TEST_CASE("findings of one measured crossing, from both fibers' surfaces")
+{
+    namespace finding = vc::geometry::crossing_finding;
+    FiberRibbonOptions surface;
+    surface.halfHeight = 200.0;
+    surface.maxTangentCosine = 1.0;
+    const auto a = surfaceFiber();
+
+    // The pair pass finds what the whole-volume pass finds.
+    const auto fold = [] {
+        auto samples = path({{320.5, -100.0, 120.0}, {320.5, 100.0, 120.0}, {320.5, 100.0, 80.0}, {320.5, -100.0, 80.0},
+                             {320.5, -100.0, 40.0}, {320.5, 100.0, 40.0}}, {0.0, 0.0, 1.0});
+        for (auto& sample : samples)
+            if (std::abs(sample.point[2] - 80.0) < 1.0) sample.normal = {0.0, 0.0, -1.0};
+        return samples;
+    }();
+    CHECK(fiberPairRibbonCrossings(a, fold, surface).size() == run(fold).crossings.size());
+
+    const auto single = path({{320.5, -100.0, 50.0}, {320.5, 100.0, 50.0}}, {0.0, 0.0, 1.0});
+    const auto one = fiberCrossingFindings(a, single, 320.5, 100.0, surface);
+    CHECK((one.findings & finding::Matched) != 0);
+    CHECK((one.findings & (finding::Multiple | finding::NothingLeft | finding::Mixed | finding::SeveralLeft)) == 0);
+    CHECK(one.alternative == 0.0);
+    // The rule keeps it with or without signs.
+    CHECK(vc::geometry::fiberCrossingUse(one.findings, one.alternative, 1.0, 0).used);
+
+    const auto dip = path({{320.5, -100.0, 60.0}, {320.5, 100.0, 60.0}, {320.5, 100.0, 90.0}, {320.5, -100.0, 90.0}},
+                          {0.0, 0.0, 1.0});
+    const auto none = fiberCrossingFindings(a, dip, 320.5, 100.0, surface);
+    CHECK((none.findings & finding::NothingLeft) != 0);
+    CHECK_FALSE(vc::geometry::fiberCrossingUse(none.findings, none.alternative, 1.0, 0).used);
+    CHECK_FALSE(vc::geometry::fiberCrossingUse(none.findings, none.alternative, 1.0, 1).used);
+
+    // The measured crossing is the passage at 120 (agreeing); the limb at 80 opposes.
+    const auto mixed = fiberCrossingFindings(a, fold, 320.5, 100.0, surface);
+    CHECK((mixed.findings & finding::Mixed) != 0);
+    CHECK(mixed.alternative == doctest::Approx(1.0));
+    // Without signs a mixed encounter decides nothing; with signs it is kept, and
+    // where the measured crossing disagrees it takes the agreeing alternative.
+    CHECK_FALSE(vc::geometry::fiberCrossingUse(mixed.findings, mixed.alternative, 1.0, 0).used);
+    const auto agreeing = vc::geometry::fiberCrossingUse(mixed.findings, mixed.alternative, 1.0, 1);
+    CHECK(agreeing.used);
+    CHECK_FALSE(agreeing.replaced);
+    const auto disagreeing = vc::geometry::fiberCrossingUse(mixed.findings, mixed.alternative, 1.0, -1);
+    CHECK(disagreeing.used);
+    CHECK(disagreeing.replaced);
+    CHECK(disagreeing.dot == doctest::Approx(-1.0));
+}

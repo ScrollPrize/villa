@@ -137,6 +137,7 @@ ScaffoldRunRows scaffoldSolveRunRows(const ScaffoldGraph& graph, const ScaffoldS
         settings.emplace("weight_enclosure", stages.measuredOptions->enclosureWeight);
         settings.emplace("weight_sign", stages.measuredOptions->signWeight);
         settings.emplace("weight_crossing_confidence", stages.measuredOptions->crossingConfidence);
+        settings.emplace("crossing_filter", stages.measuredOptions->crossingFilter);
         settings.emplace("perpendicular_offset", stages.measuredOptions->perpendicularOffset);
         settings.emplace("winding_scale", stages.measuredOptions->windingScale);
         settings.emplace("enclosures", stages.measuredOptions->enclosures);

@@ -15,13 +15,15 @@
       "normal_cache_mode": "auto",
       "normal_cache_fraction": 0.5,
       "normal_channel_cache": true,
-      "crossing_filter": true
+      "crossing_findings": true
     },
     "hvb": {},
     "sign": {
-      "crossing_filter": "auto"
+      "crossing_filter": true
     },
-    "winding": {},
+    "winding": {
+      "crossing_filter": true
+    },
     "uv": {}
   }
 }

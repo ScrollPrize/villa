@@ -11,6 +11,10 @@ struct CompactFiberConstraint {
     double arcA=0,arcB=0,windingDistance=0;
     bool parallel=false,validA=false,validB=false,validConnector=false;
     size_t measurementPartition=0;
+    // The crossing's normal-surface findings (geometry/FiberCrossingFilter.hpp);
+    // zero when the row carries none.
+    uint8_t crossingFindings=0;
+    double crossingAlternative=0;
 };
 struct FiberGraphNodeColumn {
     FiberGraphUuid uuid{};
@@ -27,6 +31,12 @@ struct FiberGraphColumns {
     std::unique_ptr<std::array<double,3>[]> normalA,normalB,connector;
     std::unique_ptr<double[]> distance;
     std::unique_ptr<uint8_t[]> parallel,validA,validB,validConnector;
+    // Whether the extraction recorded normal-surface findings with its
+    // crossings (the table's provisioning says so), and per event the finding
+    // bits and the alternative crossing's |dot| (zeros without any).
+    bool hasCrossingFindings=false;
+    std::unique_ptr<uint8_t[]> crossingFindings;
+    std::unique_ptr<double[]> crossingAlternative;
 };
 // Numeric projection only. Output is UUID ordered and gets dense runtime indices;
 // source indices/endpoint XYZ are not part of the compact persisted format.

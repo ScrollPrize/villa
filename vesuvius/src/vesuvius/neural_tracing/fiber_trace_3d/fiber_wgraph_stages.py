@@ -266,7 +266,7 @@ def _run_direct_stage(stage, config):
         data['keep']=keep
         expected_ids=graph.ids
         first_pass=None
-        if normal.crossing_filter_path(settings,base) is not None:
+        if settings.get('crossing_filter'):
             # Two passes. The first has no signs to go by and only drops what the normal surfaces
             # call undecidable; its signs then choose, per disagreeing crossing, the closest
             # crossing of the encounter that agrees.

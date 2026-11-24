@@ -170,6 +170,8 @@ nlohmann::json streamFiberConstraintDatabase(const std::filesystem::path& output
     if(metadata.contains("winding_manifest"))
         provisioning["winding_source_sha256"]=vcr::sources::snapshotSha256({
             {"manifest",metadata.at("winding_manifest")},{"provenance",metadata.at("winding_provenance")}});
+    // The rows carry their crossings' normal-surface findings.
+    if(settings.crossingSamples)provisioning["crossing_findings"]=true;
     constraintDefinition.provisioning=provisioning.dump();
     options.extensions.push_back(std::move(constraintDefinition));
     resultDefinitions(options,pin);
@@ -187,7 +189,7 @@ nlohmann::json streamFiberConstraintDatabase(const std::filesystem::path& output
     vo::imports::ParallelImportOptions queueOptions;
     queueOptions.shards=settings.workers;queueOptions.readers=settings.preparationWorkers;
     vo::imports::ParallelImportStream stream(queueOptions);
-    struct Stats {size_t events=0,invalid=0,parallel=0,skippedDistance=0;double sampling=0,encoding=0,claiming=0;};
+    struct Stats {size_t events=0,invalid=0,parallel=0,skippedDistance=0,crossingsAsked=0,crossingsStored=0;double sampling=0,encoding=0,claiming=0;};
     std::vector<Stats> stats(producer?producerWorkers:queueOptions.readers);
     size_t claimed=0;bool eof=false;std::mutex sourceMutex;
     std::atomic<size_t> completed{0};
@@ -241,6 +243,14 @@ nlohmann::json streamFiberConstraintDatabase(const std::filesystem::path& output
                 data.values={c.arcABaseVoxels,c.arcBBaseVoxels,c.parallelScore,c.perpendicularScore,
                     c.windingDistance,c.parallelWindingDistance,c.evidenceWeight};
                 data.measuredPoints=measuredPoints;
+                if(settings.crossingSamples&&!parallel&&data.normals[0].valid.value_or(0)&&data.normals[1].valid.value_or(0)){
+                    const auto found=vc::fiber_tracer::fiberCrossingFindings(settings.crossingSamples->at(a),settings.crossingSamples->at(b),
+                        c.arcABaseVoxels,c.arcBBaseVoxels,settings.crossingSurface,settings.crossingFilter,settings.crossingEncounterArcGap);
+                    // A single passage is the ordinary case and stores nothing.
+                    if((found.findings&~vc::geometry::crossing_finding::Matched)||found.alternative>0.)
+                        data.crossing=std::pair<int64_t,double>{found.findings,found.alternative};
+                    ++counters.crossingsAsked;counters.crossingsStored+=bool(data.crossing);
+                }
                 edge.extensions.push_back(vo::fiberConstraintRow(edge.record.uuid,event,a,b,reversed,std::move(data)));
                 if(settings.finalizeMeasurements){
                     // Exact source arcs and source indices are TEMP-only; final
@@ -331,6 +341,9 @@ nlohmann::json streamFiberConstraintDatabase(const std::filesystem::path& output
     for(size_t i=0;i<transferRows.size();++i){transferred+=transferRows[i];transferWorkerSeconds+=transferSeconds[i];transferMaximumSeconds=std::max(transferMaximumSeconds,transferSeconds[i]);}
     return {{"format","vcobj"},{"schema_version",22},{"path",result.path.string()},{"run_uuid",run},
         {"measurement_format",vo::kFiberConstraintFormat},{"skipped_winding_distance",skippedDistance.load()},
+        {"crossing_findings",Json{{"enabled",bool(settings.crossingSamples)},
+            {"asked",std::accumulate(stats.begin(),stats.end(),size_t{0},[](size_t sum,const Stats& s){return sum+s.crossingsAsked;})},
+            {"stored",std::accumulate(stats.begin(),stats.end(),size_t{0},[](size_t sum,const Stats& s){return sum+s.crossingsStored;})}}},
         {"measurement_staging",bool(settings.finalizeMeasurements)},
         {"measurement_transfer_rows",transferred},{"measurement_transfer_worker_seconds",transferWorkerSeconds},
         {"measurement_transfer_max_shard_seconds",transferMaximumSeconds},

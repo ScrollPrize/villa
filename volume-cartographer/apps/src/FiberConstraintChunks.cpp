@@ -221,6 +221,7 @@ Json extractFiberConstraintChunks(const Json& cfg,Json& metadata,
     for(auto& task:preparation)try{task.get();}catch(...){if(!preparationFailure)preparationFailure=std::current_exception();}
     if(preparationFailure)std::rethrow_exception(preparationFailure);
     std::unique_ptr<StripNormals> strips;
+    std::unique_ptr<std::vector<std::vector<FiberStripSample>>> stripSamples;
     const auto normalSource=cfg.value("normal_source",std::string("lasagna"));
     if(normalSource=="geometry"||normalSource=="fused"){
         const auto stripStarted=Clock::now();
@@ -471,13 +472,15 @@ Json extractFiberConstraintChunks(const Json& cfg,Json& metadata,
             {"max_iterations",options.maxIterations},{"fibers",lines.size()},{"degenerate_fibers",degenerate},
             {"unconverged_fibers",unconverged},{"final_cost",cost},{"seconds",elapsed(stripStarted)}};
         if(!fusion.is_null())metadata["strip_normals"]["fusion"]=fusion;
-        if(cfg.contains("strip_samples_output")){
-            // The solved normals at a regular arc spacing, for neighbour-normal inference.
+        if(cfg.contains("strip_samples_output")||cfg.value("crossing_findings",false)){
+            // The solved normals at a regular arc spacing: for neighbour-normal inference
+            // (strip_samples_output) and for the crossings' normal-surface findings.
             const double step=cfg.value("strip_samples_spacing",16.);
             if(!(step>0.))throw std::invalid_argument("strip_samples_spacing must be positive");
             // With the fused prediction, each sample also carries the unit prediction axis
             // of its nearest chain node (zero where the node has none).
-            std::vector<std::vector<FiberStripSample>> samples(lines.size());
+            stripSamples=std::make_unique<std::vector<std::vector<FiberStripSample>>>(lines.size());
+            auto& samples=*stripSamples;
             cv::parallel_for_(cv::Range(0,int(lines.size())),[&](const cv::Range& range){
                 for(int fi=range.start;fi<range.end;++fi){
                     const size_t i=size_t(fi);const auto& g=geometries[i];
@@ -497,7 +500,7 @@ Json extractFiberConstraintChunks(const Json& cfg,Json& metadata,
                     }
                 }
             },int(workers));
-            writeFiberStripSamples(cfg.at("strip_samples_output").get<std::string>(),ids,samples);
+            if(cfg.contains("strip_samples_output"))writeFiberStripSamples(cfg.at("strip_samples_output").get<std::string>(),ids,samples);
         }
         if(cfg.contains("strip_targets_output")){
             // Diagnostic: every chain node's targets next to the solved normal. Doubles per
@@ -555,6 +558,17 @@ Json extractFiberConstraintChunks(const Json& cfg,Json& metadata,
     double geometrySeconds=0.;FiberTraceConstraintReport geometryReport;
     std::optional<Json> benchmarkResult;
     databaseOptions.batchNormalSamples=[&](size_t worker){return workerNormals.at(worker);};
+    if(cfg.value("crossing_findings",false)){
+        // Every perpendicular crossing is followed through its two fibers' normal
+        // surfaces and the findings are stored with its constraint row.
+        if(!stripSamples)throw std::invalid_argument("crossing_findings needs solved strip normals (a strip normal source)");
+        databaseOptions.crossingSamples=stripSamples.get();
+        databaseOptions.crossingSurface.halfHeight=cfg.value("crossing_surface_half_height",databaseOptions.crossingSurface.halfHeight);
+        databaseOptions.crossingEncounterArcGap=cfg.value("crossing_encounter_arc_gap",databaseOptions.crossingEncounterArcGap);
+        databaseOptions.crossingFilter.matchTolerance=cfg.value("crossing_match_tolerance",databaseOptions.crossingFilter.matchTolerance);
+        databaseOptions.crossingFilter.minimumDot=cfg.value("crossing_minimum_dot",databaseOptions.crossingFilter.minimumDot);
+        databaseOptions.crossingFilter.nearHeight=cfg.value("crossing_near_height",databaseOptions.crossingFilter.nearHeight);
+    }
     std::promise<void> framesDone;auto framesReady=framesDone.get_future().share();
     std::vector<size_t> fusionInvalidated(databaseOptions.workers);
     // Per-piece frame bookkeeping is TEMP-only and removed by the transfer API.

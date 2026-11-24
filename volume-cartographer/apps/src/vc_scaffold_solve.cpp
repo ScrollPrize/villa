@@ -127,6 +127,9 @@ ScaffoldEventOptions eventOptionsFrom(const Json& cfg)
     options.maximumWindingDistance = section.value("maximum_winding_distance", options.maximumWindingDistance);
     options.enforceMaximumWindingDistance =
         section.value("enforce_maximum_winding", options.enforceMaximumWindingDistance);
+    // constraints.crossing_filter (default on): follow every perpendicular crossing through its
+    // fibers' normal surfaces and apply the shared crossing rule in the sign solve and the constraints.
+    options.crossingFindings = section.value("crossing_filter", options.crossingFindings);
     options.workers = cfg.value("workers", std::size_t{1});
     return options;
 }
@@ -144,6 +147,7 @@ ScaffoldMeasuredOptions measuredOptionsFrom(const Json& cfg)
     options.perpendicularOffset = section.value("perpendicular_offset", options.perpendicularOffset);
     options.windingScale = section.value("winding_scale", options.windingScale);
     options.enclosures = section.value("enclosures", options.enclosures);
+    options.crossingFilter = section.value("crossing_filter", options.crossingFilter);
     // "split" (the automatic stage's two weighted integers) or "rounded" (one
     // constraint at the nearer integer, what the scaffold dock runs).
     const auto separations = section.value("separations", std::string{"split"});
@@ -159,6 +163,7 @@ ScaffoldSignOptions signOptionsFrom(const Json& cfg)
     const auto section = cfg.value("sign", Json::object());
     ScaffoldSignOptions options;
     options.solve = section.value("solve", options.solve);
+    options.crossingFilter = cfg.value("constraints", Json::object()).value("crossing_filter", options.crossingFilter);
     const auto backend = section.value("backend", std::string{"irls"});
     if (backend == "irls") options.sign.backend = FiberSignBackend::Irls;
     else if (backend == "ceres") options.sign.backend = FiberSignBackend::Ceres;

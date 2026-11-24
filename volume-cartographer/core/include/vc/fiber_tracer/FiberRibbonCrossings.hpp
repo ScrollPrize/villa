@@ -1,6 +1,7 @@
 #pragma once
 
 #include "vc/fiber_tracer/FiberNeighbourNormals.hpp"
+#include "vc_object_store/geometry/FiberCrossingFilter.hpp"
 
 #include <cstdint>
 #include <span>
@@ -119,5 +120,28 @@ struct FiberCrossingFilterOptions {
 [[nodiscard]] std::vector<FiberCrossingVerdict> fiberCrossingVerdicts(
     std::span<const FiberRibbonCrossing> crossings, std::span<const FiberRibbonEncounter> encounters,
     std::span<const FiberCrossingEventView> views, const FiberCrossingFilterOptions& options = {});
+
+// The crossings of one fiber with one other fiber's ribbon, without the grid
+// of the whole-volume pass: every span against every segment within reach.
+// `ribbon` and `fiber` indices of the result are zero.
+[[nodiscard]] std::vector<FiberRibbonCrossing> fiberPairRibbonCrossings(
+    std::span<const FiberStripSample> ribbon, std::span<const FiberStripSample> fiber,
+    const FiberRibbonOptions& options = {});
+
+// What the normal surfaces of the two fibers of one measured crossing find
+// about it, in the form the constraint stores and every stage's filter reads
+// (vc_object_store geometry/FiberCrossingFilter.hpp): the finding bits, and
+// the |normal dot| of the nearest strong crossing of the other relation.
+struct FiberCrossingFindings {
+    std::uint8_t findings = 0;
+    double alternative = 0.0;
+};
+// `a` and `b` are the two fibers' strip samples (the normals need no sign),
+// `arcA` and `arcB` the measured crossing. `surface.maxTangentCosine` should be
+// 1: the measured crossing is the perpendicular one, its further passages
+// have no angle limit.
+[[nodiscard]] FiberCrossingFindings fiberCrossingFindings(
+    std::span<const FiberStripSample> a, std::span<const FiberStripSample> b, double arcA, double arcB,
+    const FiberRibbonOptions& surface, const FiberCrossingFilterOptions& filter = {}, double encounterArcGap = 3000.0);
 
 }  // namespace vc::fiber_tracer

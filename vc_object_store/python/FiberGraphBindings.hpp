@@ -31,6 +31,10 @@ nb::dict fiberGraphColumnsToPy(vo::FiberGraphColumns columns,size_t workers)
     result["connector"]=nb::ndarray<const double,nb::numpy,nb::ndim<2>>(
         reinterpret_cast<const double*>(raw->connector.get()),{raw->events,size_t(3)},owner);
     result["distance"]=nb::ndarray<const double,nb::numpy,nb::ndim<1>>(raw->distance.get(),{raw->events},owner);
+    // The crossings' normal-surface findings (geometry/FiberCrossingFilter.hpp), when the extraction recorded them.
+    result["has_crossing_findings"]=raw->hasCrossingFindings;
+    result["crossing_findings"]=nb::ndarray<const uint8_t,nb::numpy,nb::ndim<1>>(raw->crossingFindings.get(),{raw->events},owner);
+    result["crossing_alternative"]=nb::ndarray<const double,nb::numpy,nb::ndim<1>>(raw->crossingAlternative.get(),{raw->events},owner);
     result["parallel"]=nb::ndarray<const uint8_t,nb::numpy,nb::ndim<1>>(raw->parallel.get(),{raw->events},owner);
     result["valid_a"]=nb::ndarray<const uint8_t,nb::numpy,nb::ndim<1>>(raw->validA.get(),{raw->events},owner);
     result["valid_b"]=nb::ndarray<const uint8_t,nb::numpy,nb::ndim<1>>(raw->validB.get(),{raw->events},owner);

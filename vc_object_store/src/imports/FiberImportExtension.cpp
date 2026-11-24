@@ -121,7 +121,14 @@ InitialExtensionRow fiberConstraintRow(const std::string& uuid,int64_t id,int64_
     if(reversed){std::swap(arcs[0],arcs[1]);std::swap(normals[0],normals[1]);for(auto& x:connector)x=-x;}
     InitialExtensionRow out{kFiberConstraintTable,{extensionUuid(uuid),encodeFiberArc(arcs[0]),encodeFiberArc(arcs[1]),
         encodeFiberDirection(normals[0]),encodeFiberDirection(normals[1]),encodeFiberDirection(connector),std::vector<uint8_t>{*code},std::monostate{}}};
-    if(data.extra){auto value=Json::parse(*data.extra);if(!value.is_object())throw std::invalid_argument("fiber extra must be a JSON object");if(!value.empty())out.values.back()=value.dump();}
+    Json extra=Json::object();
+    if(data.extra){extra=Json::parse(*data.extra);if(!extra.is_object())throw std::invalid_argument("fiber extra must be a JSON object");}
+    if(data.crossing){
+        if(data.crossing->first<0||data.crossing->first>255||!std::isfinite(data.crossing->second)||data.crossing->second<0)
+            throw std::invalid_argument("invalid crossing findings");
+        extra["crossing"]=Json::array({data.crossing->first,data.crossing->second});
+    }
+    if(!extra.empty())out.values.back()=extra.dump();
     return out;
 }
 InitialExtensionRow fiberConstraintRow(const std::string& uuid,int64_t id,int64_t a,int64_t b,bool reversed,

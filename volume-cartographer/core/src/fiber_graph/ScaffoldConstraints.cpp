@@ -4,6 +4,8 @@
 
 #include "vc_object_store/geometry/FiberWindingGraph.hpp"
 
+#include <atomic>
+#include <thread>
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -313,6 +315,52 @@ std::vector<ScaffoldEvent> scaffoldEvents(const ScaffoldGraph& graph, const Scaf
         ++report.rejectedGap;
         return true;
     });
+    if (options.crossingFindings) {
+        // The strip normals of every fiber at a regular arc spacing, then each
+        // perpendicular crossing through its two fibers' surfaces. Computed on
+        // every run: the findings depend on the run's normals, not only on the
+        // geometry the cache keys the crossings by.
+        if (!(options.crossingSampleSpacing > 0))
+            throw std::invalid_argument("scaffold constraints: the crossing sample spacing must be positive");
+        std::vector<std::vector<fiber_tracer::FiberStripSample>> samples(graph.fibers.size());
+        std::vector<char> needed(graph.fibers.size(), 0);
+        for (const auto& event : events)
+            if (!event.parallel && event.validA && event.validB && event.a != event.b)
+                needed[std::size_t(event.a)] = needed[std::size_t(event.b)] = 1;
+        const auto threads = std::max<std::size_t>(1, options.workers ? options.workers : std::thread::hardware_concurrency());
+        const auto parallel = [&](std::size_t count, const auto& body) {
+            std::atomic<std::size_t> next{0};
+            std::vector<std::thread> pool;
+            const auto work = [&] { for (std::size_t i; (i = next.fetch_add(1)) < count;) body(i); };
+            for (std::size_t t = 1; t < std::min(threads, count); ++t) pool.emplace_back(work);
+            work();
+            for (auto& thread : pool) thread.join();
+        };
+        parallel(graph.fibers.size(), [&](std::size_t fiber) {
+            if (!needed[fiber]) return;
+            const double length = geometry.arcLength(fiber);
+            for (double arc = 0; arc <= length; arc += options.crossingSampleSpacing) {
+                const auto normal = normals.at(fiber, arc);
+                if (!normal) continue;
+                const auto point = geometry.packed().sample(std::int64_t(fiber), arc).point;
+                samples[fiber].push_back({arc, {point[0], point[1], point[2]}, {(*normal)[0], (*normal)[1], (*normal)[2]}, {0, 0, 0}});
+            }
+        });
+        std::atomic<std::int64_t> asked{0}, found{0};
+        parallel(events.size(), [&](std::size_t index) {
+            auto& event = events[index];
+            if (event.parallel || !event.validA || !event.validB || event.a == event.b) return;
+            const auto findings = fiber_tracer::fiberCrossingFindings(
+                samples[std::size_t(event.a)], samples[std::size_t(event.b)], event.arcA, event.arcB,
+                options.crossingSurface, options.crossingFilter, options.crossingEncounterArcGap);
+            event.crossingFindings = findings.findings;
+            event.crossingAlternative = findings.alternative;
+            ++asked;
+            found += (findings.findings & ~geometry::crossing_finding::Matched) != 0;
+        });
+        report.crossingsAsked = asked.load();
+        report.crossingsWithFindings = found.load();
+    }
     report.events = std::int64_t(events.size());
     report.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
     return events;
@@ -343,6 +391,12 @@ ScaffoldSignResult scaffoldNormalSigns(const ScaffoldGraph& graph, const Scaffol
         entry.dot = std::clamp(event.normalA[0] * event.normalB[0] + event.normalA[1] * event.normalB[1] +
                                    event.normalA[2] * event.normalB[2],
                                -1., 1.);
+        // No signs yet: the shared rule can only drop what decides none.
+        if (options.crossingFilter &&
+            !geometry::fiberCrossingUse(event.crossingFindings, event.crossingAlternative, entry.dot, 0).used) {
+            ++result.crossingFiltered;
+            continue;
+        }
         entry.windingDistance = event.distance;
         signEvents.push_back(entry);
     }
@@ -448,6 +502,7 @@ std::vector<ScaffoldConstraint> scaffoldMeasuredConstraints(const ScaffoldGraph&
     shared.perpendicularWeight = options.perpendicularWeight;
     shared.parallelWeight = options.parallelWeight;
     shared.signWeight = options.signWeight;
+    shared.crossingFilter = options.crossingFilter;
     shared.enclosures = options.enclosures && options.enclosureWeight > 0;
     // The crossing's evidence, exactly as the sign stage weights it.
     shared.dotWeightPower = options.crossingConfidence ? options.confidence.dotWeightPower : 0.;
@@ -482,9 +537,12 @@ std::vector<ScaffoldConstraint> scaffoldMeasuredConstraints(const ScaffoldGraph&
                            event.pointB[2] - event.pointA[2]};
         input.normalA = event.normalA;
         input.normalB = event.normalB;
+        input.crossingFindings = event.crossingFindings;
+        input.crossingAlternative = event.crossingAlternative;
         // The same per-crossing constraints the traced volume's winding stage
         // builds (vc_object_store geometry/FiberWindingGraph.hpp).
         const auto built = geometry::windingEventConstraints(geometry.packed(), input, shared);
+        if (built.filtered) { ++report.crossingFiltered; continue; }
         const auto& relation = built.relation;
         if (relation.withoutDistance) ++report.withoutDistance;
         if (relation.hasEnclosure && shared.enclosures)

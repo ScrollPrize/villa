@@ -71,6 +71,7 @@ def winding_settings(config):
     return dict(optimizer=optimizer,weights=weights,lemon=dict(backend=lemon['backend'],capacity_scale=int(lemon['capacity_scale'])),
                 classification=classification,record_family=record_family,normal_sign=normal_sign,automatic=automatic,
                 dot_weight_power=dot_power,winding_distance_weight=distance_weight,
+                crossing_filter=bool(config.get('crossing_filter',False)),
                 fixed_object=fixed_object_settings(config),
                 manual_links=link_settings(config) if weights['manual']>0 else None)
 
@@ -365,10 +366,19 @@ def _assemble_arcs(config,settings,graph,paths,ids,family,normal_sign):
         parts.append(dict(a=a,b=np.asarray(b,np.int64),target=np.asarray(target,np.int64),weight=np.asarray(weight,np.float64),
                           side=np.zeros(len(a),np.int64) if side is None else np.asarray(side,np.int64)))
     if settings['automatic']:
+        findings=alternative=None
+        if settings['crossing_filter']:
+            # The shared rule for the crossings' stored normal-surface findings, applied by the native
+            # builder under the signs this stage has.
+            if not graph.has_crossing_findings:
+                raise ValueError('crossing_filter needs an extraction with crossing_findings; set crossing_filter to false to run without')
+            findings=np.ascontiguousarray(graph.crossing_findings,dtype=np.uint8)
+            alternative=np.ascontiguousarray(graph.crossing_alternative,dtype=np.float64)
         g=_geometry(paths).prepare_winding_graph(
             graph.i,graph.j,np.ascontiguousarray(paths.graph_index,dtype=np.int64),family,normal_sign,
             graph.arc_a,graph.arc_b,graph.distance,graph.parallel,
             graph.normal_a,graph.normal_b,graph.connector,graph.valid_a,graph.valid_b,graph.valid_connector,
+            crossing_findings=findings,crossing_alternative=alternative,
             lasagna_winding_scale=float(config.get('lasagna_winding_scale',1.)),
             perpendicular_offset=float(config.get('perpendicular_offset',.5)),
             parallel_weight=weights['parallel'],perpendicular_weight=weights['perpendicular'],
@@ -379,7 +389,8 @@ def _assemble_arcs(config,settings,graph,paths,ids,family,normal_sign):
             read_batch=int(config.get('read_batch',32768)),
             workers=int(config.get('workers',32)))
         counts['automatic']=dict(read=int(g['read']),used=int(g['used']),expanded=int(g['expanded']),arcs=len(g['a']),
-                                 without_distance=int(g.get('without_distance',0)))
+                                 without_distance=int(g.get('without_distance',0)),
+                                 crossing_filtered=int(g.get('crossing_filtered',0)))
         part(g['a'],g['b'],g['target'],g['weight'])
         if weights['sign']>0:
             part(g['sign_a'],g['sign_b'],g['sign_target'],g['sign_weight'],g['sign_side'])
