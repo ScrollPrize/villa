@@ -77,7 +77,10 @@ there are now, and they are the ones the page showed. So an answer changed while
 is made, or a page left open while the pair is scored again, cannot approve scores nobody
 saw, and a reason typed on it cannot become an override for a failure it never showed. The
 decision keeps the basis. Store stores only the scores it names (and, for a decision from
-before decisions named one, only scores finished before it), and only with an override that
+before decisions named one, only the scores the event log shows it was made on: it must be
+the last decision logged, after the blind round it names, and no hold-out job or answer that
+changes whether a unit lines up may come after the score that round was drawn from; the
+log's order tells apart what the clock's whole seconds cannot), and only with an override that
 names exactly the parts of the bar they miss; it binds the answers and the basis into
 `fit.json` too. Store rests on the scores as well as the decision, so new scores run it
 again, and it fails until the decision is made on them. (A pair stored before this shows
@@ -168,7 +171,11 @@ scores used: the units its `holdout.json` answers "lines up" must be the ones it
 score is on (and, for a record whose store bound them, its answers and basis must be the
 ones bound, and its decision's), and a score below the bar needs an override naming what it
 misses. A record whose answers changed after it was stored is left out (and holds its pair's
-older records back) until it is decided and stored again. The release is written beside `OUT`
+older records back) until it is decided and stored again. So is a pipeline record whose event
+log holds an answer its `holdout.json` does not (the rewrite after it failed: the log is the
+answers' source, and Score reads them from it), and one whose decision names no scores and
+whose log does not show the scores it was made on. The event log is read for this, not
+released, so a release is checked on its shipped files alone. The release is written beside `OUT`
 and moved there whole, so a failed release leaves nothing. `check` runs on a release as on any records folder, and checks that binding and those answers before it
 recomputes the score; a record where no unit lines up is checked like any other:
 
