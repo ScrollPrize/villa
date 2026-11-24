@@ -315,6 +315,16 @@ void testResample()
                 46.1f, 59.3f, 93.5f, 57.1f, 61.2f, 77.3f, 72.5f, 62.2f, 71.5f, 117.9f, 92.8f, 139.9f, 172.9f, 135.0f, 241.6f, NAN, NAN, NAN,};
             require(tilt(block, 6, 6, 2.95, 2.50) < limit, "bicubic normal in a border cell next to a far vertex");
         }
+        {  // PHerc0306B w074 at a border column, in a cell that folds: 6 x 6 vertices at grid column 3.05, row 63.2
+            const float block[] = {
+                NAN, NAN, NAN, 129.3f, 17.5f, 0.0f, 110.0f, 22.0f, 3.3f, 90.9f, 26.9f, 6.5f, 71.5f, 31.0f, 9.5f, 52.0f, 34.4f, 12.1f,
+                NAN, NAN, NAN, 130.9f, 10.8f, 19.1f, 111.7f, 15.2f, 22.5f, 92.3f, 19.9f, 25.6f, 73.1f, 24.4f, 28.6f, 53.4f, 27.4f, 31.1f,
+                NAN, NAN, NAN, 127.0f, 0.0f, 53.2f, 109.5f, 5.2f, 51.8f, 91.0f, 10.0f, 53.4f, 74.4f, 17.4f, 47.7f, 54.9f, 20.7f, 50.1f,
+                NAN, NAN, NAN, 96.0f, 12.3f, 44.4f, 86.1f, 10.0f, 58.4f, 68.8f, 11.4f, 65.9f, 55.6f, 10.2f, 78.6f, 48.3f, 9.6f, 88.7f,
+                NAN, NAN, NAN, 78.6f, 23.7f, 26.2f, 62.0f, 23.6f, 37.3f, 46.6f, 21.9f, 48.7f, 29.3f, 20.1f, 58.6f, 13.1f, 16.1f, 68.7f,
+                NAN, NAN, NAN, 68.1f, 31.4f, 10.5f, 51.3f, 31.4f, 21.3f, 34.3f, 29.9f, 31.5f, 17.1f, 26.9f, 41.1f, 0.0f, 22.2f, 50.1f,};
+            require(tilt(block, 6, 6, 1.05, 2.2) < 1.5708f, "bicubic normal keeps its side in a folded border cell");
+        }
         {  // z = column^2 with vertex (1, 1) masked: the cell (2, 2) beside the diagonal hole stays exact
             float quadratic[5 * 5 * 3];
             std::uint8_t valid[25];

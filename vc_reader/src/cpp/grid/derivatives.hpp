@@ -34,12 +34,22 @@ struct Derivatives {
         if(lo)return get(p,r,c)-get(p,r-dr,c-dc);
         return {0,0,0};
     }
+    VCR_DERIV_HD geometry::V normal(int r,int c) const { return geometry::cross(plain(v.xyz,r,c,true),plain(v.xyz,r,c,false)); }
+    // Main's normals at the corners of the cells around a vertex share a side. Where they do not,
+    // the cell folds and any turn of a tangent can flip its normal inside, so main's tangents stay.
+    VCR_DERIV_HD bool unfolded(int r,int c) const {
+        geometry::V n=normal(r,c);
+        for(int y=r-1;y<=r+1;++y)for(int x=c-1;x<=c+1;++x)
+            if(ok(y,x)&&same(x,c)&&geometry::dot(normal(y,x),n)<0)return false;
+        return true;
+    }
     // The second order tangent t of a vertex's positions replaces the secant s only where it stays
     // within about 6 degrees of it and keeps the cross product with the other axis' tangent w on the
     // secant's side, above half its size: a small turn of a tangent can still flip the patch normal
     // on a skewed or folded cell, and a flipped normal sends a signed layer to the other side of
     // the sheet. On a smooth sheet the correction is a fraction of the step's turn, far inside both.
     VCR_DERIV_HD geometry::V oriented(geometry::V t,geometry::V s,const float* p,int r,int c,bool column) const {
+        if(!unfolded(r,c))return s;
         if(p!=v.xyz)return t;
         if(geometry::dot(t,s)<.995f*sqrtf(geometry::dot(t,t)*geometry::dot(s,s)))return s;
         geometry::V w=plain(v.xyz,r,c,!column),cs=geometry::cross(s,w),ct=geometry::cross(t,w);

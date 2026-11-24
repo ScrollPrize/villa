@@ -65,8 +65,7 @@ struct SurfaceOptions {
     // convention). Vertex normals given in `Vertices` keep their sign.
     bool flipNormals = false;
     // Bicubic derivatives at a hole or the grid border may use the second order one sided step.
-    // False for a window of a larger grid whose context was cut to fit a budget: it keeps the
-    // first order steps there, as a window without context always did.
+    // False for a window cut from a larger grid.
     bool secondOrderEdges = true;
 };
 

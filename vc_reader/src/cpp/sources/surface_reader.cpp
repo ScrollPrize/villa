@@ -348,7 +348,7 @@ void checkBudget(AlignedEngine::Impl& s, const Triple& shape, const std::optiona
 struct Patch {
     std::shared_ptr<const GeometryTile> tile;
     grid::Raster raster;
-    std::int64_t halo = 0;  // vertices read around the cells reached (at most 2)
+    bool whole = false;
 };
 std::optional<Patch> patchOf(Geometry& geom, const Pair& start, const Pair& size)
 {
@@ -367,20 +367,10 @@ std::optional<Patch> patchOf(Geometry& geom, const Pair& start, const Pair& size
     const auto c0 = std::max<std::int64_t>(0, std::int64_t(std::floor(minX))), c1 = std::min<std::int64_t>(cols, std::int64_t(std::floor(maxX)) + 2);
     const auto r0 = std::max<std::int64_t>(0, std::int64_t(std::floor(minY))), r1 = std::min<std::int64_t>(rows, std::int64_t(std::floor(maxY)) + 2);
     if (c1 - c0 < 2 || r1 - r0 < 2) return std::nullopt;
-    // Up to two more vertices around the window, where the grid has them: the Hermite derivatives of
-    // its cells (centred differences, one sided only at the grid's own border or next to a hole)
-    // then equal the whole grid's, so a patch renders as the same pixels of any larger patch. Fewer
-    // when the window with its halo would not fit the work budget a window of the cells alone fits.
-    std::int64_t halo = 2, hc0 = c0, hc1 = c1, hr0 = r0, hr1 = r1;
-    for (;; --halo) {
-        hc0 = std::max<std::int64_t>(0, c0 - halo), hc1 = std::min<std::int64_t>(cols, c1 + halo);
-        hr0 = std::max<std::int64_t>(0, r0 - halo), hr1 = std::min<std::int64_t>(rows, r1 + halo);
-        if (halo == 0 || std::size_t((hr1 - hr0) * (hc1 - hc0)) * 80 <= geom.owner.workBytes) break;
-    }
     Patch patch;
-    patch.tile = geom.tile({hr0, hc0}, {hr1 - hr0, hc1 - hc0});
-    patch.raster = grid::Raster{x0 - double(hc0), y0 - double(hr0), sx, sy, int(size[1]), int(size[0]), kx, ky};
-    patch.halo = halo;
+    patch.tile = geom.tile({r0, c0}, {r1 - r0, c1 - c0});
+    patch.raster = grid::Raster{x0 - double(c0), y0 - double(r0), sx, sy, int(size[1]), int(size[0]), kx, ky};
+    patch.whole = c0 == 0 && r0 == 0 && c1 == cols && r1 == rows;
     return patch;
 }
 // The vcr::grid surface over a tile's vertices: normals in the surface's physical space.
@@ -470,7 +460,7 @@ SampleResult SampleReader::renderSurface(const Surface& surface, const Pair& sta
     result.metadata["surface"] = {{"id", surface.id}, {"uv_start", start}, {"uv_size", size}, {"offsets_um", offsetsUm},
                                   {"coordinate_frame", surfaceFrame(surface)}, {"reference_frame", s.referenceFrame}, {"array_to_level0", s.referenceMap.forward.json()}};
     const auto patch = patchOf(*geom, start, size);
-    const auto sheet = patch ? gridSurface(*geom, *patch->tile, interpolation, patch->halo >= 2) : nullptr;
+    const auto sheet = patch ? gridSurface(*geom, *patch->tile, interpolation, patch->whole) : nullptr;
     const grid::Raster raster = patch ? patch->raster : grid::Raster{};
     const std::vector<float> layers(offsetsUm.begin(), offsetsUm.end());
     for (auto& [name, target] : s.targets) {
