@@ -871,10 +871,57 @@ def test_interleaving_a_decision_changed_while_store_runs(tmp_path, fake_stages,
     monkeypatch.setattr(pipeline_stages, "run_store", decided_meanwhile)
     assert pipeline_stages.pipeline(directory).run_stage("store")["status"] == "ok"
     monkeypatch.setattr(pipeline_stages, "run_store", real)
-    assert pipeline_stages.pipeline(directory).states()["store"] == STALE
+    assert pipeline_stages.pipeline(directory).states()["store"] == DONE
     pairs, _index = released(tmp_path, [root], "meanwhile")
     assert pairs["A"]["decision"]["publish"] == "affine"
     assert "deformation" not in released_transform(tmp_path, "meanwhile")
+
+
+def test_interleaving_a_decision_switched_and_back_while_store_runs(tmp_path, fake_stages, monkeypatch):
+    """The completion stamp and saved result must correspond to the same approval. (bend,
+    then affine before Store reads it, then bend again before Store writes.)"""
+    root = tmp_path / "records"
+    directory = stored_pair(root)
+    pipeline_stages.pipeline(directory).redo("store")
+    real_store, real_unit, steps = pipeline_stages.run_store, pipeline_stages.reviewed_unit, []
+
+    def store(pipeline, params):
+        decide(pipeline.directory, "affine")
+        steps.append("affine")
+        return real_store(pipeline, params)
+
+    def unit(pipeline):
+        if steps == ["affine"]:
+            steps.append("bend")
+            decide(pipeline.directory, "bend")
+        return real_unit(pipeline)
+    monkeypatch.setattr(pipeline_stages, "run_store", store)
+    monkeypatch.setattr(pipeline_stages, "reviewed_unit", unit)
+    assert pipeline_stages.pipeline(directory).run_stage("store")["status"] == "ok"
+    monkeypatch.setattr(pipeline_stages, "run_store", real_store)
+    monkeypatch.setattr(pipeline_stages, "reviewed_unit", real_unit)
+    assert pipeline_stages.pipeline(directory).states()["store"] == STALE
+    assert drain(directory).states()["store"] == DONE
+    assert released(tmp_path, [root], "back")[0]["A"]["decision"]["publish"] == "bend"
+
+
+def test_a_decision_whose_view_rewrite_failed_is_stored_before_release(tmp_path, fake_stages, monkeypatch):
+    """A failed save must have one consistent outcome: the logged decision takes effect."""
+    root = tmp_path / "records"
+    directory = stored_pair(root, publish="affine")
+    real = rec.Record.refresh_final
+
+    def refused(self, rounds=None):
+        raise PermissionError(13, "The process cannot access the file", rec.FINAL_REVIEW)
+    monkeypatch.setattr(rec.Record, "refresh_final", refused)
+    with pytest.raises(PermissionError):
+        decide(directory, "nothing")
+    monkeypatch.setattr(rec.Record, "refresh_final", real)
+    assert pipeline_stages.pipeline(directory).states()["store"] == STALE
+    assert released(tmp_path, [root], "behind")[0] == {}
+    assert cli.main(["check", str(root)]) == 1
+    assert drain(directory).states()["store"] == DONE
+    assert "publish nothing" in released(tmp_path, [root], "caught-up")[1]["left_out"][0]["why"]
 
 
 def test_interleaving_new_fit_round_without_a_redo_keeps_the_reviewed_record(tmp_path, fake_stages):

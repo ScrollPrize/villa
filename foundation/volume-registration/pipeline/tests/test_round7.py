@@ -22,8 +22,8 @@ from volreg import record as rec
 from volreg import stages as pipeline_stages
 from volreg.engine import DONE, FAILED, READY, STALE
 
-from test_approval_coherence import (BY, answer, assert_published_coherently, check, decide_on, decision,
-                                     drain, page, scored, scored_pair, stored)  # noqa: F401 - a fixture
+from test_approval_coherence import (BY, _without_basis, answer, assert_published_coherently, check, decide_on,
+                                     decision, drain, page, scored, scored_pair, stored)  # noqa: F401 - a fixture
 from test_redo_release import fake_stages, pick_all, released  # noqa: F401 - a fixture
 from test_review_blockers import as_windows_locks
 from test_sharing_conflicts import refuse_opens_of, scored_up_to_score
@@ -139,7 +139,8 @@ def test_two_identical_legacy_approvals_do_not_cover_the_score_between_them(tmp_
     pipeline = drain(directory)
     assert pipeline.states()["store"] == FAILED and "decide again" in pipeline.stamp("store")["error"]
     assert released(tmp_path, [root], "twice")[0] == {}
-    assert check(root, capsys)[0] == 0                           # nothing stored, nothing to check
+    code, out = check(root, capsys)
+    assert code == 1 and "nothing is stored for its decision yet" in out
 
 
 def test_a_record_stored_under_a_legacy_approval_of_other_scores_is_held_back(tmp_path, scored, monkeypatch, capsys):
@@ -370,10 +371,7 @@ def test_a_legacy_record_whose_log_is_ahead_of_holdout_json_is_held_back(tmp_pat
     for key in ("answers_sha256", "basis"):
         fit["stored"].pop(key, None)
     record.write(rec.FIT, fit)
-    final = record.read(rec.FINAL_REVIEW)
-    final.pop("schema", None)
-    final["decision"].pop("basis", None)
-    record.write(rec.FINAL_REVIEW, final)
+    _without_basis(directory)
     pipeline = pipeline_stages.pipeline(directory)
     stamp = pipeline.stamp("store")
     pipeline._write_stamp("store", stamp | {"output_digest": engine.digest_files(directory, stamp["outputs"])})
@@ -445,7 +443,6 @@ def _redo_while_it_fails(monkeypatch, directory):
 def test_a_redo_after_a_prerequisite_read_failed_leaves_the_stage_to_run_again(tmp_path, fake_stages, monkeypatch):
     """A failure from work invalidated by Redo must leave the stage eligible to run again.
     (A prerequisite read timed out; `redo score` came before the failure stamp.)"""
-    as_windows_locks(monkeypatch)
     directory = scored_up_to_score(tmp_path)
     pipeline = pipeline_stages.pipeline(directory)
 
@@ -464,7 +461,6 @@ def test_a_redo_after_a_prerequisite_read_failed_leaves_the_stage_to_run_again(t
 def test_a_redo_after_reading_the_redo_marks_failed_leaves_the_stage_to_run_again(tmp_path, fake_stages, monkeypatch):
     """A failure from work invalidated by Redo must leave the stage eligible to run again.
     (The same with redo.json the read that timed out.)"""
-    as_windows_locks(monkeypatch)
     directory = scored_up_to_score(tmp_path)
     pipeline = pipeline_stages.pipeline(directory)
     refusals = [1]

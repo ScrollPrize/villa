@@ -316,6 +316,20 @@ def test_a_metadata_write_that_fails_after_the_transform_is_not_released(tmp_pat
     assert pairs == {}
 
 
+def edit_decisions(directory, edit):
+    """Rewrite the decisions in a record's event log with `edit(event)`, and final-review.json
+    from them, as if they had been made so."""
+    record = rec.Record(directory)
+    events = [edit(event) if event["kind"] == "decision" else event for event in record.events()]
+    record.path(rec.EVENTS).write_text("".join(json.dumps(event) + "\n" for event in events))
+    record.refresh_final()
+
+
+def _without_basis(directory):
+    """The decision as a server that named no scores made it."""
+    edit_decisions(directory, lambda event: {key: value for key, value in event.items() if key != "basis"})
+
+
 def _as_main_stored_it(directory):
     """Rewrite a stored pair as main's Store leaves it: fit.json is the fit, its scores and
     the code, nothing else; the store stamp has no redo mark; there is no redo file."""
@@ -328,10 +342,7 @@ def _as_main_stored_it(directory):
     main.pop("schema", None)
     main["bend"] = {"regularisation": 1.0, "effective_parameters": 3.0}   # run_fit's, for a fit with a bend
     record.write(rec.FIT, main)
-    final = record.read(rec.FINAL_REVIEW)                       # main's decisions name no scores
-    final.pop("schema", None)
-    final["decision"].pop("basis", None)
-    record.write(rec.FINAL_REVIEW, final)
+    _without_basis(directory)                                   # main's decisions name no scores
     pipeline = pipeline_stages.pipeline(directory)
     stamp = pipeline.stamp("store")
     outputs = [rec.TRANSFORM, rec.FIT]
@@ -411,11 +422,9 @@ def _scorable(directory):
     pipeline = pipeline_stages.pipeline(directory)
     stamp = pipeline.stamp("store")
     pipeline._write_stamp("store", stamp | {"output_digest": engine.digest_files(directory, stamp["outputs"])})
-    final = record.read(rec.FINAL_REVIEW)
-    final["decision"]["override"] = {"by": BY, "reason": "too few lines up", "bar_missed": ["enough"]}
-    final["decision"]["basis"] = stored["stored"]["basis"]
-    final.pop("schema", None)
-    record.write(rec.FINAL_REVIEW, final)
+    edit_decisions(directory, lambda event: event | {
+        "override": {"by": BY, "reason": "too few lines up", "bar_missed": ["enough"]},
+        "basis": stored["stored"]["basis"]})
 
 
 # ============================================================ blocker 2: decision binding

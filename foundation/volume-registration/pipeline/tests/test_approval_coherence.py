@@ -19,7 +19,7 @@ from volreg.review.server import Conflict, Reviews
 from volreg.scoring import bar_check, score
 
 import test_redo_release as fakes
-from test_fit_binding import Server, _as_main_stored_it
+from test_fit_binding import Server, _as_main_stored_it, _without_basis
 from test_redo_release import new_pair, pick_all, released
 from test_review_blockers import REVIEWER
 
@@ -412,7 +412,8 @@ def test_c_an_answer_edited_after_the_decision_before_store_is_not_stored(tmp_pa
     pipeline = drain(directory)
     assert pipeline.states()["store"] == FAILED
     assert released(tmp_path, [root], "edited")[0] == {}
-    assert check(root, capsys)[0] == 0                          # nothing stored, nothing to differ
+    code, out = check(root, capsys)
+    assert code == 1 and "nothing is stored for its decision yet" in out
 
 
 def test_c_an_answer_edited_while_store_writes_is_not_stored_under_the_old_scores(tmp_path, scored, monkeypatch, capsys):
@@ -588,15 +589,6 @@ def test_l_a_record_stored_by_round_five_stays_eligible_until_an_answer_changes(
     answer(directory, "p0009", "no")
     assert released(tmp_path, [root], "edited")[0] == {}
     assert check(root, capsys)[0] == 1
-
-
-def _without_basis(directory):
-    """The decision as a server that named no scores wrote it."""
-    record = rec.Record(directory)
-    final = record.read(rec.FINAL_REVIEW)
-    final.pop("schema", None)
-    final["decision"].pop("basis", None)
-    record.write(rec.FINAL_REVIEW, final)
 
 
 def _restamp_store(directory):

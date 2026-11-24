@@ -275,6 +275,12 @@ class Record:
             self.refresh_final()
 
 
+    def logged_final(self):
+        """`final-review.json` with the picks and decision the event log holds
+        (`with_logged_final`), as `logged_holdout` is for the answers. Writes nothing and
+        takes no lock."""
+        return with_logged_final(self.read(FINAL_REVIEW), self.events())
+
     def refresh_final(self, rounds=None):
         """Rewrite `final-review.json` with the latest picks and decision from the log. Rounds
         and anything else it holds (a migrated decision, open questions) are kept."""
@@ -283,23 +289,31 @@ class Record:
             final.pop("schema", None)
             if rounds is not None:
                 final["rounds"] = rounds
-            picks, decision = {}, None
-            for event in self.events():
-                if event["kind"] == "blind-pick" and not event.get("migrated"):
-                    picks[(event["round"], event["item"])] = event["choice"]
-                elif event["kind"] == "decision":
-                    decision = {key: event[key] for key in ("fit", "publish", "reason", "override")
-                                } | {"by": event.get("by"), "at": event["at"]} | {
-                                    key: event[key] for key in ("round", "basis") if event.get(key)}
-            for round_ in final["rounds"]:
-                for index, item in enumerate(round_["items"]):
-                    if (round_["id"], index) in picks:
-                        item["choice"] = picks[(round_["id"], index)]
-            if decision:
-                final["decision"] = decision
-                final["status"] = "decided"
+            final = with_logged_final(final, self.events())
             self.write(FINAL_REVIEW, final)
             return final
+
+
+def with_logged_final(final, events):
+    """`final` (a `final-review.json`) with the latest picks and decision in `events`, as
+    `refresh_final` writes it; everything else as it is."""
+    final = json.loads(json.dumps(final))
+    picks, decision = {}, None
+    for event in events:
+        if event["kind"] == "blind-pick" and not event.get("migrated"):
+            picks[(event["round"], event["item"])] = event["choice"]
+        elif event["kind"] == "decision":
+            decision = {key: event[key] for key in ("fit", "publish", "reason", "override")
+                        } | {"by": event.get("by"), "at": event["at"]} | {
+                            key: event[key] for key in ("round", "basis") if event.get(key)}
+    for round_ in final.get("rounds") or []:
+        for index, item in enumerate(round_["items"]):
+            if (round_["id"], index) in picks:
+                item["choice"] = picks[(round_["id"], index)]
+    if decision:
+        final["decision"] = decision
+        final["status"] = "decided"
+    return final
 
 
 def _scratch(target):

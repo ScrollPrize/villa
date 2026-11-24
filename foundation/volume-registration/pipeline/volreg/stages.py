@@ -451,10 +451,19 @@ def answers_of(held):
 
 
 def final_identity(pipeline):
-    """What the final review decided: the picks of each round and the decision."""
+    """What the final review decided, as the event log holds it (`final_identity_of`). A
+    `final-review.json` behind the log (the rewrite after a decision failed) is a change too,
+    so Store runs and rewrites it."""
     if not pipeline.record.exists(rec.FINAL_REVIEW):
         return {}
-    final = pipeline.record.read(rec.FINAL_REVIEW)
+    on_file = pipeline.record.read(rec.FINAL_REVIEW)
+    final = rec.with_logged_final(on_file, pipeline.record.events())
+    behind = final.get("decision") != on_file.get("decision")
+    return final_identity_of(final) | ({"behind": True} if behind else {})
+
+
+def final_identity_of(final):
+    """The picks of each round and the decision of a `final-review.json`."""
     decision = final.get("decision") or {}
     # The basis only where a decision names it, so one from before is what it was.
     return {"picks": {round_["id"]: [item["choice"] for item in round_["items"]]
@@ -575,7 +584,7 @@ def final_decided(pipeline, params):
     a decision from before decisions named their round, as before."""
     if not pipeline.record.exists(rec.FINAL_REVIEW):
         return False
-    final = pipeline.record.read(rec.FINAL_REVIEW)
+    final = pipeline.record.logged_final()
     decision = final.get("decision")
     if not decision:
         return False
@@ -614,7 +623,10 @@ def run_store(pipeline, params):
     digest of the transform stored with it, and it is written first, so a store that stops
     before the transform leaves a `fit.json` that names another transform than the one
     there, which no release takes."""
-    final = pipeline.record.read(rec.FINAL_REVIEW)
+    final = pipeline.record.logged_final()
+    # The decision this is stored under, for the stamp: if it changed after the job read its
+    # inputs and changes back before it ends, the result is stale, not done.
+    pipeline.ran_on("store", "final-review", digest_json(final_identity_of(final)))
     decision = final["decision"]
     unit = reviewed_unit(pipeline)
     if decision["fit"] != unit.fit_id:
@@ -647,6 +659,8 @@ def run_store(pipeline, params):
         if answers_digest(pipeline.record.current_holdout()) != answers:
             raise Incoherent("a hold-out answer changed as the decided fit was being stored: once the "
                              "scores are made again, decide again on them")
+        if pipeline.record.logged_final() != pipeline.record.read(rec.FINAL_REVIEW):
+            pipeline.record.refresh_final()
         pipeline.record.write(rec.FIT, stored)
         if content is None:
             filelock.unlink(pipeline.record.path(rec.TRANSFORM), missing_ok=True)

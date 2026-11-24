@@ -20,6 +20,7 @@ from volreg.review.server import Conflict, Reviews
 from test_approval_coherence import (BY, _answer_during_the_decision, _as_main_stored_it, _restamp_store,
                                      _without_basis, answer, assert_published_coherently, check, decide_on,
                                      decision, drain, install, page, scored, scored_pair, stored)  # noqa: F401
+from test_fit_binding import edit_decisions
 from test_redo_release import released
 from test_review_blockers import CONTEXT, as_windows_locks, lock_kind  # noqa: F401 - a fixture
 from test_sharing_conflicts import refuse_opens_of
@@ -194,10 +195,7 @@ def test_check_on_a_zero_unit_record_without_an_override_answers_and_fails(tmp_p
     Store left it: `volreg check` says so, and does not raise.)"""
     root = tmp_path / "records"
     directory = stored(root, "affine", zero=True, reason="nothing lines up")
-    final = rec.Record(directory).read(rec.FINAL_REVIEW)
-    final.pop("schema", None)
-    final["decision"]["override"] = None
-    rec.Record(directory).write(rec.FINAL_REVIEW, final)
+    edit_decisions(directory, lambda event: event | {"override": None})
     code, out = check(root, capsys)
     assert code == 1 and "override" in out
     assert released(tmp_path, [root], "zero")[0] == {}

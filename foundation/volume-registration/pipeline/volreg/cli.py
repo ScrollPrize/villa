@@ -223,11 +223,12 @@ def check(args):
     checked as any other, never raising."""
     failed = 0
     for record in records(args.records):
-        final = record.read(rec.FINAL_REVIEW) if record.exists(rec.FINAL_REVIEW) else {}
-        decision = final.get("decision")
-        if not decision or not record.exists(rec.FIT):
+        decision = releasing.decision_of(record)
+        if not decision or not (record.exists(rec.FIT)
+                                or decision["publish"] != "nothing" and is_pipeline(record)):
             continue
-        mismatch = releasing.stored_mismatch(record, decision, legacy_too=is_pipeline(record)) or (
+        mismatch = releasing.decision_behind(record, decision) or releasing.stored_mismatch(
+            record, decision, legacy_too=is_pipeline(record)) or (
             decision["publish"] != "nothing" and releasing.scores_problem(record, decision))
         if mismatch or decision["publish"] == "nothing":
             failed += bool(mismatch)

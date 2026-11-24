@@ -254,13 +254,32 @@ def scores_problem(record, decision):
     return None
 
 
+def decision_of(record):
+    """A record's decision: a pipeline record's is the latest its event log holds, the
+    decisions' only source; any other's is the one in its final-review.json."""
+    final = record.read(rec.FINAL_REVIEW) if record.exists(rec.FINAL_REVIEW) else {}
+    if is_pipeline(record):
+        final = rec.with_logged_final(final, record.events())
+    return final.get("decision")
+
+
+def decision_behind(record, decision):
+    """Why a record's final-review.json does not hold `decision`, its `decision_of`, or None."""
+    final = record.read(rec.FINAL_REVIEW) if record.exists(rec.FINAL_REVIEW) else {}
+    if final.get("decision") != decision:
+        return ("its event log holds a newer decision than its final-review.json (the rewrite after it "
+                "failed); it is released once its store runs again")
+    return None
+
+
 def unreleasable(record, decision):
-    """Why a decided record cannot be released as it stands, or None: a redo since its store
+    """Why a decided record cannot be released as it stands, or None: a final-review.json
+    behind its event log (`decision_behind`), a redo since its store
     (`not_stored_since_redo`), a stored result that is not the one its decision names
     (`stored_mismatch`; a migrated record has nothing to check but what a store bound), or
     scores that are not those of its answers, or not covered by its decision
     (`scores_problem`)."""
-    return not_stored_since_redo(record) or (
+    return decision_behind(record, decision) or not_stored_since_redo(record) or (
         decision["publish"] != "nothing" and (stored_mismatch(record, decision, legacy_too=is_pipeline(record))
                                               or scores_problem(record, decision)))
 
@@ -268,8 +287,7 @@ def unreleasable(record, decision):
 def newness(record):
     """Order of the decisions of one pair: a pipeline record after a migrated one, then by
     the decision's time."""
-    decision = record.read(rec.FINAL_REVIEW)["decision"]
-    return is_pipeline(record), decision.get("at") or ""
+    return is_pipeline(record), decision_of(record).get("at") or ""
 
 
 def not_recorded(record):
@@ -330,7 +348,7 @@ def release(out, roots):
                 continue
             name = record.read(rec.PAIR)["pair"]
             final = record.read(rec.FINAL_REVIEW) if record.exists(rec.FINAL_REVIEW) else {}
-            decision = final.get("decision")
+            decision = decision_of(record)
             why = decision and unreleasable(record, decision)
             if not decision:
                 left_out.append({"source": source, "pair": name,
