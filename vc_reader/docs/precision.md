@@ -44,6 +44,13 @@ with one reducer shared by CPU and CUDA (`composite/reducer.hpp`), evaluated unf
 agree exactly; Beer-Lambert's `expf` can differ between the host and CUDA in its
 last bits.
 
+Elastic field construction (`cuda/elastic.cu`) and spatial-transform sampling
+(`cuda/geometry.cu`) are also compiled unfused (`--fmad=false`), so a GPU fused
+multiply-add cannot move a displacement or coordinate across a nearest-neighbour
+label tie. The CPU transform sources keep the compiler's default contraction
+(unfused on x86-64 without an FMA-capable `-march`). Other differences, such as
+reduction order, can still select a neighbouring label.
+
 ## Tie rules
 
 `src/cpp/rounding.hpp` holds the only two tie rules, shared by CPU and CUDA, and

@@ -147,4 +147,8 @@ if(VC_READER_ENABLE_CUDA)
     target_compile_options(vc_reader_transform_cuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
     target_link_libraries(vc_reader_transform_cuda PUBLIC vc_reader::thinning vc_reader::headers CUDA::cudart CUDA::cufft)
     target_link_libraries(vc_reader_transforms INTERFACE vc_reader::transforms_cuda)
+    # Unfused float32 arithmetic: a fused multiply-add can move an elastic displacement
+    # or a sampling coordinate across a nearest-neighbour label tie.
+    set_source_files_properties(src/cpp/transforms/cuda/elastic.cu src/cpp/transforms/cuda/geometry.cu
+        PROPERTIES COMPILE_OPTIONS "--fmad=false")
 endif()
