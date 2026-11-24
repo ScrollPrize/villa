@@ -574,6 +574,17 @@ def _load_chunk_digests(output_path: Path) -> dict[int, dict[tuple[int, int, int
     return digests
 
 
+def _truncate_torn_digest_tail(output_path: Path) -> None:
+    """Drop an unterminated last record so appended records start on their own line."""
+    digest_path = output_path / DOWNLOAD_DIGESTS_FILE
+    if not digest_path.is_file():
+        return
+    data = digest_path.read_bytes()
+    keep = data.rfind(b"\n") + 1
+    if keep < len(data):
+        os.truncate(digest_path, keep)
+
+
 def _verification_sample(
     chunk_ids: Iterable[tuple[int, int, int]],
     sample_count: int,
@@ -673,6 +684,7 @@ def copy_chunks_to_output(
             completed_chunk_ids_by_scale=completed_chunk_ids_by_scale,
             sample_count=int(resume_verify_chunks),
         )
+        _truncate_torn_digest_tail(output_path)
     else:
         output_root = _create_output_arrays(source_group, output_path, recompress)
         output_root.attrs[DOWNLOAD_PLAN_ATTR] = plan
@@ -1245,7 +1257,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "When resuming an existing output, re-read this many already-copied chunks per "
             "scale from the source and compare them with the digests recorded when they were "
             "copied; a mismatch means the source changed in place and the run stops. "
-            "0 disables the check, -1 checks every completed chunk."
+            "0 disables the check, -1 checks every completed chunk that has a recorded digest. "
+            "Changes in unchecked chunks go undetected."
         ),
     )
     parser.add_argument(

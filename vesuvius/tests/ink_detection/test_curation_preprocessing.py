@@ -641,6 +641,25 @@ def test_digest_sidecar_ignores_a_torn_final_line(tmp_path: Path) -> None:
     assert download_required_zarr_chunks._load_chunk_digests(output_path) == {0: {(1, 2, 3): "aa"}}
 
 
+def test_downloader_resume_after_a_torn_digest_record_keeps_the_sidecar_readable(
+    tmp_path: Path,
+) -> None:
+    source_path, output_path, source, kwargs = _interrupted_sparse_copy(
+        tmp_path, resume_verify_chunks=0
+    )
+    with open(output_path / download_required_zarr_chunks.DOWNLOAD_DIGESTS_FILE, "a") as f:
+        f.write('{"scale":0,"chunk_id":[1,1')
+    download_required_zarr_chunks.copy_chunks_to_output(**kwargs)
+
+    download_required_zarr_chunks.copy_chunks_to_output(**{**kwargs, "resume_verify_chunks": -1})
+    assert download_required_zarr_chunks._load_chunk_digests(output_path) == {
+        0: {
+            (0, 0, 0): download_required_zarr_chunks._chunk_digest(source[0:2, 0:2, 0:2]),
+            (1, 1, 1): download_required_zarr_chunks._chunk_digest(source[2:4, 2:4, 2:4]),
+        }
+    }
+
+
 def test_resume_verification_sample_is_deterministic_and_spread() -> None:
     chunk_ids = [(z, 0, 0) for z in range(100)]
     sample = download_required_zarr_chunks._verification_sample(reversed(chunk_ids), 5)
