@@ -105,7 +105,11 @@ uv run --extra models python -m vesuvius.ink_detection.preprocessing.download_re
 
 The downloader always creates an explicit Zarr-v2 store and records its source,
 array schemas, exact chunk plan, and completed chunks in root attributes before
-allowing resume. Prediction merging aggregates every non-merged prediction
+allowing resume. It also records a digest of every copied chunk's source values
+in `.vesuvius_ink_download_digests.jsonl`; on resume it re-reads
+`--resume-verify-chunks` completed chunks per scale (default 8; 0 off, -1 all)
+and stops if the source changed in place, instead of mixing two source versions
+in one copy. Prediction merging aggregates every non-merged prediction
 image per direction and fails when it produces no output. Label cleaning and
 composite TIFF publication are transactional.
 Every long option also accepts the opposite hyphen/underscore spelling.

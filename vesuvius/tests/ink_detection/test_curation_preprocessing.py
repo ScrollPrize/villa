@@ -532,3 +532,128 @@ def test_downloader_records_only_completed_writes_and_resumes_after_failure(
         open_group(output_path)["0"][2:4, 2:4, 2:4],
         source[2:4, 2:4, 2:4],
     )
+
+
+def _interrupted_sparse_copy(tmp_path: Path, **overrides):
+    """Copy one of two planned chunks, then fail, leaving a resumable output."""
+    source_path = tmp_path / "source.zarr"
+    output_path = tmp_path / "output.zarr"
+    source = np.arange(64, dtype=np.uint8).reshape(4, 4, 4)
+    _write_group(source_path, {"0": source}, chunks=(2, 2, 2))
+    kwargs = {
+        "volume_path": str(source_path),
+        "volume_scale": 0,
+        "volume_auth_json": None,
+        "output_path": output_path,
+        "chunk_ids_by_scale": {0: ((0, 0, 0), (1, 1, 1))},
+        "worker_count": 1,
+        "tqdm_desc": "test",
+        "overwrite": False,
+        "recompress": "fast",
+        **overrides,
+    }
+    original_copy = download_required_zarr_chunks._copy_one_chunk
+    call_count = 0
+
+    def fail_second(chunk_id):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 2:
+            raise OSError("injected chunk failure")
+        return original_copy(chunk_id)
+
+    with patch.object(download_required_zarr_chunks, "_copy_one_chunk", side_effect=fail_second):
+        with pytest.raises(OSError, match="injected chunk failure"):
+            download_required_zarr_chunks.copy_chunks_to_output(**kwargs)
+    return source_path, output_path, source, kwargs
+
+
+def _rewrite_source_in_place(source_path: Path, source: np.ndarray) -> np.ndarray:
+    # Same path, same schema, new values in the already-copied chunk (0, 0, 0):
+    # what a re-uploaded volume looks like to a resumed download.
+    changed = source.copy()
+    changed[0:2, 0:2, 0:2] = 200
+    _write_group(source_path, {"0": changed}, chunks=(2, 2, 2))
+    return changed
+
+
+def test_downloader_records_a_source_digest_for_every_completed_chunk(tmp_path: Path) -> None:
+    source_path, output_path, source, kwargs = _interrupted_sparse_copy(tmp_path)
+    download_required_zarr_chunks.copy_chunks_to_output(**kwargs)
+
+    digests = download_required_zarr_chunks._load_chunk_digests(output_path)
+    assert digests == {
+        0: {
+            (0, 0, 0): download_required_zarr_chunks._chunk_digest(source[0:2, 0:2, 0:2]),
+            (1, 1, 1): download_required_zarr_chunks._chunk_digest(source[2:4, 2:4, 2:4]),
+        }
+    }
+    # The sidecar is not a Zarr node and does not disturb the output group.
+    assert sorted(open_group(output_path).array_keys()) == ["0"]
+
+
+def test_downloader_resume_rejects_a_source_changed_in_place(tmp_path: Path) -> None:
+    source_path, output_path, source, kwargs = _interrupted_sparse_copy(tmp_path)
+    changed = _rewrite_source_in_place(source_path, source)
+
+    with pytest.raises(ValueError, match="Source volume changed"):
+        download_required_zarr_chunks.copy_chunks_to_output(**kwargs)
+    # Nothing new was copied, so the output still holds only the original version.
+    progress = open_group(output_path).attrs[download_required_zarr_chunks.DOWNLOAD_PROGRESS_ATTR]
+    assert progress["completed_chunk_ids_by_scale"] == {"0": [[0, 0, 0]]}
+
+    download_required_zarr_chunks.copy_chunks_to_output(**{**kwargs, "overwrite": True})
+    output = np.asarray(open_group(output_path)["0"])
+    np.testing.assert_array_equal(output[0:2, 0:2, 0:2], changed[0:2, 0:2, 0:2])
+    np.testing.assert_array_equal(output[2:4, 2:4, 2:4], changed[2:4, 2:4, 2:4])
+
+
+def test_downloader_resume_check_can_be_disabled(tmp_path: Path) -> None:
+    source_path, output_path, source, kwargs = _interrupted_sparse_copy(
+        tmp_path, resume_verify_chunks=0
+    )
+    _rewrite_source_in_place(source_path, source)
+    stats = download_required_zarr_chunks.copy_chunks_to_output(**kwargs)
+    assert stats["existing_counts_by_scale"] == {0: 1}
+
+
+def test_downloader_resumes_outputs_written_before_digests_existed(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    source_path, output_path, source, kwargs = _interrupted_sparse_copy(tmp_path)
+    (output_path / download_required_zarr_chunks.DOWNLOAD_DIGESTS_FILE).unlink()
+
+    stats = download_required_zarr_chunks.copy_chunks_to_output(**kwargs)
+    assert stats == {
+        "copied_counts_by_scale": {0: 1},
+        "existing_counts_by_scale": {0: 1},
+    }
+    assert "no recorded source digest" in capsys.readouterr().out
+
+
+def test_digest_sidecar_ignores_a_torn_final_line(tmp_path: Path) -> None:
+    output_path = tmp_path / "out.zarr"
+    output_path.mkdir()
+    (output_path / download_required_zarr_chunks.DOWNLOAD_DIGESTS_FILE).write_text(
+        download_required_zarr_chunks._digest_record(0, (1, 2, 3), "aa")
+        + '{"scale":0,"chunk_id":[4,5'
+    )
+    assert download_required_zarr_chunks._load_chunk_digests(output_path) == {0: {(1, 2, 3): "aa"}}
+
+
+def test_resume_verification_sample_is_deterministic_and_spread() -> None:
+    chunk_ids = [(z, 0, 0) for z in range(100)]
+    sample = download_required_zarr_chunks._verification_sample(reversed(chunk_ids), 5)
+    assert sample == [(0, 0, 0), (25, 0, 0), (50, 0, 0), (74, 0, 0), (99, 0, 0)]
+    assert download_required_zarr_chunks._verification_sample(chunk_ids, -1) == chunk_ids
+    assert download_required_zarr_chunks._verification_sample(chunk_ids, 0) == []
+
+
+def test_digest_sidecar_rejects_corruption_before_the_last_line(tmp_path: Path) -> None:
+    output_path = tmp_path / "out.zarr"
+    output_path.mkdir()
+    (output_path / download_required_zarr_chunks.DOWNLOAD_DIGESTS_FILE).write_text(
+        "not json\n" + download_required_zarr_chunks._digest_record(0, (1, 2, 3), "aa")
+    )
+    with pytest.raises(ValueError, match="corrupt at line 1"):
+        download_required_zarr_chunks._load_chunk_digests(output_path)
