@@ -38,6 +38,13 @@ std::vector<ScaffoldEvent> scaffoldEvents(const ScaffoldGraph& graph, const Scaf
                                     "bind a Lasagna normal dataset or turn the measurement off");
     report = ScaffoldEventReport{};
     const auto started = std::chrono::steady_clock::now();
+    if (options.normalAt && (options.cache || options.sink))
+        throw std::invalid_argument("scaffold constraints: events with their own normal source are not cached");
+    if (options.crossQueryPrefix >= graph.fibers.size() && options.crossQueryPrefix)
+        throw std::invalid_argument("scaffold constraints: the cross query prefix leaves no fibers to search against");
+    const auto normalOf = [&](std::size_t fiber, double arc) {
+        return options.normalAt ? options.normalAt(fiber, arc) : normals.at(fiber, arc);
+    };
 
     std::vector<fiber_tracer::FiberletCropTraceLine> lines(graph.fibers.size());
     for (std::size_t i = 0; i < graph.fibers.size(); ++i) {
@@ -73,6 +80,7 @@ std::vector<ScaffoldEvent> scaffoldEvents(const ScaffoldGraph& graph, const Scaf
     config.maximumWindingDistance = options.maximumWindingDistance;
     config.enforceMaximumWindingDistance = options.enforceMaximumWindingDistance;
     config.parallelThreads = options.workers;
+    config.crossQueryPrefix = options.crossQueryPrefix;
 
     // The extraction reports its own phases (prepare, spatial_index, search,
     // candidate_order, score, deduplicate); each becomes a stage of the run,
@@ -184,8 +192,8 @@ std::vector<ScaffoldEvent> scaffoldEvents(const ScaffoldGraph& graph, const Scaf
         // The pipeline's own verdict and its matching separation.
         event.parallel = constraint.parallelScore > constraint.perpendicularScore;
         event.distance = event.parallel ? constraint.parallelWindingDistance : constraint.windingDistance;
-        const auto normalA = normals.at(std::size_t(event.a), event.arcA);
-        const auto normalB = normals.at(std::size_t(event.b), event.arcB);
+        const auto normalA = normalOf(std::size_t(event.a), event.arcA);
+        const auto normalB = normalOf(std::size_t(event.b), event.arcB);
         event.validA = normalA.has_value();
         event.validB = normalB.has_value();
         if (normalA) event.normalA = *normalA;
@@ -229,8 +237,8 @@ std::vector<ScaffoldEvent> scaffoldEvents(const ScaffoldGraph& graph, const Scaf
             const geometry::Point connector{event.pointB[0] - event.pointA[0], event.pointB[1] - event.pointA[1],
                                             event.pointB[2] - event.pointA[2]};
             event.closestDistance = length(connector);
-            const auto normalA = normals.at(std::size_t(event.a), event.arcA);
-            const auto normalB = normals.at(std::size_t(event.b), event.arcB);
+            const auto normalA = normalOf(std::size_t(event.a), event.arcA);
+            const auto normalB = normalOf(std::size_t(event.b), event.arcB);
             event.validA = normalA.has_value();
             event.validB = normalB.has_value();
             if (normalA) event.normalA = *normalA;
@@ -340,7 +348,7 @@ std::vector<ScaffoldEvent> scaffoldEvents(const ScaffoldGraph& graph, const Scaf
             if (!needed[fiber]) return;
             const double length = geometry.arcLength(fiber);
             for (double arc = 0; arc <= length; arc += options.crossingSampleSpacing) {
-                const auto normal = normals.at(fiber, arc);
+                const auto normal = normalOf(fiber, arc);
                 if (!normal) continue;
                 const auto point = geometry.packed().sample(std::int64_t(fiber), arc).point;
                 samples[fiber].push_back({arc, {point[0], point[1], point[2]}, {(*normal)[0], (*normal)[1], (*normal)[2]}, {0, 0, 0}});

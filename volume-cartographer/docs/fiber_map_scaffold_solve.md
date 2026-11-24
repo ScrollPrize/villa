@@ -794,3 +794,20 @@ turns on a 7-hop cycle, is violated under every sign configuration measured,
 including the 32 % disagreement one; the 1-turn violations move when the
 signs improve. A residual that survives the signs is the kind the approval
 dock is for.
+
+## Comparing a scaffold solve with a traced volume's winding solve
+
+`vc_scaffold_solve` with a `field_comparison` section scores the run's scaffold solve against the winding solve of a resolved fiber volume, without a union store and without extracting the volume again. The two solves share no fiber; what relates them are the crossings between a scaffold fiber and a fiber of the volume.
+
+| Key | Meaning |
+|---|---|
+| `field_comparison.samples` | the volume's signed strip samples: its fibers as polylines with their signed normals |
+| `field_comparison.winding_store` | the volume's winding result store (families and solved windings); `winding_run` selects a run when it holds several |
+| `field_comparison.weights` | optional `perpendicular` / `parallel` / `sign` weights of the cross constraints (default 1 / 0 / 100), independent of the scaffold solve's own weights, so a links-only solve can be compared too |
+| `field_comparison.output` | the cross constraints as doubles, 11 per row (scaffold fiber, volume fiber, kind, target, weight, winding distance, scored, step, residual, the two arcs), and `<output>.json` with the fiber ids and the summary |
+
+- The crossings are extracted between the two sets only (the extractor's bipartite mode), with the run's event options, and turned into constraints by the shared assembly, with rounded separations so that every crossing is one statement. The crossing findings and the crossing filter apply as in the solve.
+- The scaffold side uses the run's normals and solved signs. With `normals.source: neighbours` reading the same volume, those are the normals and facing transferred from the volume, which is what makes the signed order of a cross crossing meaningful. The volume side uses its signed strip normals.
+- The two solutions have independent gauges, one per component each. Every pair (scaffold component, volume component) joined by cross equations gets the integer offset that most of its equation weight agrees on; a constraint is scored against that. The summary states, per constraint type, how many are met, off by one winding and off by more, and per component pair its offset and the share of weight agreeing with it.
+- `constraints.enabled` is required: the comparison needs the run's normals and signs.
+

@@ -15,6 +15,10 @@
 // enclosures only.
 #include "vc/fiber_graph/ScaffoldCache.hpp"
 #include "vc/fiber_graph/ScaffoldConstraints.hpp"
+#include <vc_object_store/objects/ObjectCollection.hpp>
+#include <vc_object_store/objects/FiberGraphSolveExtension.hpp>
+#include <vc_object_store/objects/FiberConstraintGraph.hpp>
+#include "vc/fiber_graph/ScaffoldFieldComparison.hpp"
 #include "vc/fiber_graph/ScaffoldSolveRuns.hpp"
 #include "vc/fiber_graph/ScaffoldWindingSolve.hpp"
 #include "vc/lasagna/ChannelSampler.hpp"
@@ -31,6 +35,7 @@
 #include <format>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -324,6 +329,8 @@ int run(const std::string& configPath)
     ScaffoldApprovalReport approvalReport;
     std::vector<ScaffoldConstraint> measured;
     double normalSeconds = 0, eventSeconds = 0, signSeconds = 0, measuredSeconds = 0;
+    std::unique_ptr<vc::lasagna::LasagnaNormalSampler> sampler;
+    ScaffoldWindingDistances distances;
     if (measure) {
         normalOptions = normalOptionsFrom(cfg);
         eventOptions = eventOptionsFrom(cfg);
@@ -336,8 +343,6 @@ int run(const std::string& configPath)
         measuredOptions = measuredOptionsFrom(cfg);
         signOptions = signOptionsFrom(cfg);
         measuredOptions->confidence = signOptions->sign;
-        std::unique_ptr<vc::lasagna::LasagnaNormalSampler> sampler;
-        ScaffoldWindingDistances distances;
         if (eventOptions->measureWindingDistances) {
             const auto section = cfg.value("winding", Json::object());
             if (!section.contains("manifest"))
@@ -451,6 +456,114 @@ int run(const std::string& configPath)
         measuredSeconds = seconds(started);
     }
     const auto result = solveScaffoldWinding(graph, geometry, options, measured);
+    // field_comparison: this scaffold solve against the winding solve of a resolved fiber volume,
+    // through the crossings between the two (vc/fiber_graph/ScaffoldFieldComparison.hpp).
+    //   samples       the volume's signed strip samples (its fibers and their signed normals)
+    //   winding_store the volume's winding result store (families and solved windings)
+    //   winding_run   optional run UUID when the store holds several
+    //   weights       optional perpendicular / parallel / sign weights of the cross constraints
+    //                 (default 1 / 0 / 100)
+    //   output        the constraints as doubles, 11 per row: scaffold fiber, volume fiber, kind,
+    //                 target, weight, winding distance, placed, step, residual, arc on the scaffold
+    //                 fiber, arc on the volume fiber; `<output>.json` names the fibers
+    Json fieldComparison;
+    if (cfg.contains("field_comparison")) {
+        if (!measure || !normals)
+            throw std::invalid_argument("field_comparison needs constraints.enabled: it uses the run's normals and signs");
+        const auto section = cfg.at("field_comparison");
+        const auto started = Clock::now();
+        auto file = vc::fiber_tracer::readFiberStripSampleFile(section.at("samples").get<std::string>());
+        vc::objects::OpenOptions storeOptions;
+        storeOptions.readOnly = true;
+        auto store = vc::objects::ObjectCollection::open(section.at("winding_store").get<std::string>(), storeOptions);
+        const auto txn = store.read();
+        const std::string run = vc::objects::selectFiberGraphRun(store, txn, "winding",
+            section.contains("winding_run") ? std::optional<std::string>(section.at("winding_run").get<std::string>())
+                                            : std::nullopt);
+        const auto solved = vc::objects::readFiberGraphResultColumns(store, txn, run);
+        // Columns: family, enabled, normal_sign, selected_winding, component.
+        std::map<vc::objects::FiberGraphUuid, std::size_t> rowOf;
+        for (std::size_t r = 0; r < solved.fiberUuids.size(); ++r) rowOf[solved.fiberUuids[r]] = r;
+        ScaffoldFieldVolume volume;
+        const auto fibers = file.ids.size();
+        volume.uuids.resize(fibers);
+        volume.family.assign(fibers, -1);
+        volume.winding.assign(fibers, 0);
+        volume.component.assign(fibers, -1);
+        volume.solved.assign(fibers, 0);
+        std::int64_t unknown = 0;
+        for (std::size_t f = 0; f < fibers; ++f) {
+            volume.uuids[f] = vc::objects::fiberGraphUuid(file.ids[f]);
+            const auto found = rowOf.find(file.ids[f]);
+            if (found == rowOf.end()) { ++unknown; continue; }
+            const auto& values = solved.integers[found->second];
+            const auto& valid = solved.valid[found->second];
+            if (valid[0] && valid[1] && values[1] != 0) volume.family[f] = int(values[0]);
+            if (valid[3] && valid[4]) {
+                volume.winding[f] = values[3];
+                volume.component[f] = values[4];
+                volume.solved[f] = 1;
+            }
+        }
+        volume.samples = std::move(file.samples);
+        ScaffoldFieldComparisonOptions comparisonOptions;
+        comparisonOptions.events = *eventOptions;
+        // The cross constraints are weighed on their own, whatever the scaffold solve itself used
+        // (a links-only solve has no measured weights): the measured defaults, perpendicular 1 and
+        // sign 100, or field_comparison.weights; the crossing evidence and filter are the run's.
+        comparisonOptions.measured = *measuredOptions;
+        {
+            const ScaffoldMeasuredOptions defaults;
+            const auto weights = section.value("weights", Json::object());
+            comparisonOptions.measured.perpendicularWeight = weights.value("perpendicular", defaults.perpendicularWeight);
+            comparisonOptions.measured.parallelWeight = weights.value("parallel", defaults.parallelWeight);
+            comparisonOptions.measured.signWeight = weights.value("sign", defaults.signWeight);
+            comparisonOptions.measured.enclosureWeight = 0;
+        }
+        const auto comparison = compareScaffoldWithField(graph, *normals, signs.sign, result.winding, result.component,
+                                                         volume, comparisonOptions, distances);
+        const std::string output = section.at("output").get<std::string>();
+        std::vector<double> rows;
+        rows.reserve(comparison.constraints.size() * 11);
+        struct Tally { std::int64_t count = 0, placed = 0, met = 0, offOne = 0, offMore = 0; double weight = 0, metWeight = 0; };
+        std::map<std::string, Tally> tallies;
+        for (const auto& row : comparison.constraints) {
+            rows.insert(rows.end(), {double(row.scaffold), double(row.field), double(int(row.kind)), double(row.target),
+                                     row.weight, row.windingDistance, double(row.placed), double(row.step), row.residual,
+                                     row.arcScaffold, row.arcField});
+            const bool sign = row.kind == ScaffoldConstraintKind::SignAtLeast || row.kind == ScaffoldConstraintKind::SignAtMost;
+            auto& tally = tallies[sign ? "sign" : row.kind == ScaffoldConstraintKind::Parallel ? "parallel" : "perpendicular"];
+            ++tally.count;
+            if (!row.placed) continue;
+            ++tally.placed;
+            tally.weight += row.weight;
+            if (row.residual == 0) { ++tally.met; tally.metWeight += row.weight; }
+            else if (row.residual <= 1) ++tally.offOne;
+            else ++tally.offMore;
+        }
+        std::ofstream(output, std::ios::binary)
+            .write(reinterpret_cast<const char*>(rows.data()), std::streamsize(rows.size() * sizeof(double)));
+        Json kinds = Json::object();
+        for (const auto& [name, tally] : tallies)
+            kinds[name] = Json{{"constraints", tally.count}, {"placed", tally.placed}, {"met", tally.met},
+                               {"off_by_one", tally.offOne}, {"off_by_more", tally.offMore},
+                               {"weight", tally.weight}, {"met_weight", tally.metWeight}};
+        Json offsets = Json::array();
+        for (const auto& offset : comparison.offsets)
+            offsets.push_back(Json{{"scaffold_component", offset.scaffoldComponent}, {"volume_component", offset.fieldComponent},
+                                   {"offset", offset.offset}, {"equations", offset.equations}, {"weight", offset.weight},
+                                   {"agreeing_weight", offset.agreeingWeight}});
+        fieldComparison = Json{{"winding_run", run}, {"volume_fibers", std::int64_t(fibers)},
+                               {"volume_fibers_searched", comparison.fieldFibers}, {"volume_fibers_without_result", unknown},
+                               {"crossings", comparison.events.events}, {"perpendicular", comparison.events.perpendicular},
+                               {"parallel", comparison.events.parallel}, {"crossing_filtered", comparison.measured.crossingFiltered},
+                               {"constraints", std::int64_t(comparison.constraints.size())}, {"kinds", kinds},
+                               {"offsets", offsets}, {"output", output}, {"columns", 11},
+                               {"seconds", seconds(started)}};
+        Json names{{"scaffold", Json::array()}, {"volume", volume.uuids}, {"summary", fieldComparison}};
+        for (const auto& fiber : graph.fibers) names["scaffold"].push_back(fiber.uuid);
+        std::ofstream(output + ".json") << names.dump() << "\n";
+    }
     std::vector<ScaffoldNormalFlip> flips;
     ScaffoldNormalFlipReport flipReport;
     if (normals) flips = scaffoldLinkNormalFlips(graph, geometry, *normals, signs.sign, result.constraints, flipReport);
@@ -665,6 +778,7 @@ int run(const std::string& configPath)
         residuals.push_back(std::move(value));
     }
     summary["residuals"] = residuals;
+    if (!fieldComparison.is_null()) summary["field_comparison"] = fieldComparison;
     Json pieces = Json::array();
     for (const auto& score : result.pieces) {
         Json value = pieceJson(graph, score.piece);

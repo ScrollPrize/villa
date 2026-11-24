@@ -27,6 +27,8 @@
 #include "vc_object_store/objects/FiberConstraintApprovalExtension.hpp"
 
 #include <cstdint>
+#include <functional>
+#include <optional>
 #include <limits>
 #include <span>
 #include <vector>
@@ -89,6 +91,14 @@ struct ScaffoldEventOptions {
     // Arc spacing of the strip normals the surfaces are built from, voxels.
     double crossingSampleSpacing = 16.0;
     std::size_t workers = 0; // 0: the extractor's own default
+    // Two fiber sets in one graph: the fibers [0, crossQueryPrefix) are
+    // searched only against the others, never among themselves or the others
+    // among themselves (the extractor's bipartite mode). Zero: every pair.
+    std::size_t crossQueryPrefix = 0;
+    // The normal of a fiber at an arc, replacing the ScaffoldNormals lookup:
+    // for a graph whose fibers take their normals from more than one source.
+    // Events extracted this way are not cached.
+    std::function<std::optional<geometry::Point>(std::size_t fiber, double arc)> normalAt;
     // Optional progress and cancellation. The extraction itself is one call
     // into the tracer, so a run can be taken back before and after it, not
     // during it.
