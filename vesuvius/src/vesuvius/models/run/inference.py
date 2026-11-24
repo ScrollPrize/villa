@@ -1355,6 +1355,9 @@ def build_parser():
                       help='Normalization scheme (instance_zscore, global_zscore, instance_minmax, percentile_minmax, ct, none)')
     parser.add_argument('--device', type=str, default=None,
                         help='Device to use (cuda, mps, cpu). Default: cuda, then mps, then cpu')
+    parser.add_argument('--cudnn_benchmark', action='store_true',
+                        help='Set torch.backends.cudnn.benchmark. On ROCm, MIOpen searches for and saves the '
+                             'fastest conv kernels; the first run is slower, later runs reuse them.')
     parser.add_argument('--num_workers', type=int, default=4,
                       help='Number of DataLoader workers. Use 0 in low /dev/shm environments (e.g. Docker).')
     parser.add_argument('--writer_workers', type=int, default=None,
@@ -1433,6 +1436,8 @@ def main():
 
     parser = build_parser()
     args = parser.parse_args()
+    if args.cudnn_benchmark:
+        torch.backends.cudnn.benchmark = True
     
     # Parse optional patch size if provided
     patch_size = None
