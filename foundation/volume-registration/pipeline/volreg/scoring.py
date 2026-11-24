@@ -105,10 +105,12 @@ def legacy_approval_problem(events, decision):
 
     Which round: the first time the round the decision names was logged (`blind-round`),
     from the start of the blind job that drew it; for a decision that names no round (main
-    named none), or a log that does not show it, the first blind job after the last fit. The
-    decision must be the last one the log holds (the same fit, variant, override and round),
-    logged after that round was drawn. Line order, not the clock: the log is appended under
-    the record lock, so its order is the order things happened in."""
+    named none), or a log that does not show it, the first blind job after the last fit before
+    it. The decision must be the last one the log holds (the same fit, variant, override and
+    round), logged after that round was drawn. One that names no round must also follow
+    rounds of its fit alone: main's page sent no fit, and approved the fit there was. Line
+    order, not the clock: the log is appended under the record lock, so its order is the
+    order things happened in."""
     logged = [index for index, event in enumerate(events) if event["kind"] == "decision"]
     if not logged:
         return "its event log holds no decision"
@@ -116,6 +118,12 @@ def legacy_approval_problem(events, decision):
     if (any(last.get(key) != decision.get(key) for key in ("fit", "publish", "override"))
             or (last.get("round") or None) != (decision.get("round") or None)):
         return "it is not the last decision its event log holds"
+    if not decision.get("round"):
+        fits = {(event.get("candidates") or [None])[0] for event in events[:logged[-1]]
+                if event["kind"] == "blind-round"}
+        if fits != {decision.get("fit")}:
+            return (f"its event log does not show rounds of {decision.get('fit')} alone drawn before it, so "
+                    f"the page it was sent from may have shown another fit")
 
     def job(index, kind, stage):
         return events[index]["kind"] == kind and events[index].get("stage") == stage
@@ -127,7 +135,7 @@ def legacy_approval_problem(events, decision):
         if named is not None:
             drawn = next((index for index in range(named, -1, -1) if job(index, "job-started", "blind")), named)
     if drawn is None:
-        fitted = max((index for index in range(len(events)) if job(index, "job-finished", "fit")), default=-1)
+        fitted = max((index for index in range(logged[-1]) if job(index, "job-finished", "fit")), default=-1)
         drawn = next((index for index in range(fitted + 1, len(events)) if job(index, "job-started", "blind")),
                      None)
     if drawn is None or logged[-1] < drawn:

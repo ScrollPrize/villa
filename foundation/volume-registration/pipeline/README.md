@@ -78,7 +78,8 @@ is made, or a page left open while the pair is scored again, cannot approve scor
 saw, and a reason typed on it cannot become an override for a failure it never showed. The
 decision keeps the basis. Store stores only the scores it names (and, for a decision from
 before decisions named one, only the scores the event log shows it was made on: it must be
-the last decision logged, after the blind round it names, and no hold-out job or answer that
+the last decision logged, after the blind round it names (one that names none, after rounds
+of its fit alone), and no hold-out job or answer that
 changes whether a unit lines up may come after the score that round was drawn from; the
 log's order tells apart what the clock's whole seconds cannot), and only with an override that
 names exactly the parts of the bar they miss; it binds the answers and the basis into

@@ -104,7 +104,7 @@ class Reviews:
                      "stages": [self.stage_entry(pipeline, name, states[name])
                                 for name in pipeline.order]}
             if pipeline.record.exists(rec.HOLDOUT):
-                entry["holdout"] = self.progress(pipeline.record.read(rec.HOLDOUT), False)
+                entry["holdout"] = self.progress(pipeline.record.logged_holdout(), False)
                 entry["target"] = pipeline.stage_params("judge-holdout")["min_lines_up"]
             if pipeline.record.exists(rec.FINAL_REVIEW):
                 final = pipeline.record.read(rec.FINAL_REVIEW)
@@ -204,7 +204,7 @@ class Reviews:
 
     def holdout(self, name, octants=False, reveal=False):
         pipeline = self.pipeline(name)
-        held = pipeline.record.read(rec.HOLDOUT)
+        held = pipeline.record.logged_holdout()
         units = self.units(held, octants)
         progress = self.progress(held, octants)
         target = pipeline.stage_params("judge-holdout")["min_lines_up"]

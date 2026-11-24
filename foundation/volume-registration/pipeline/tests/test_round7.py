@@ -261,12 +261,11 @@ def test_a_legacy_approval_after_a_rescore_on_a_round_drawn_before_it_is_held_ba
     assert check(root, capsys)[0] == 0
 
 
-# The event log's own sequences, for `legacy_approval_problem` alone (the fake blind stage
-# logs no `blind-round`; the real one does, with the round's id).
-def blind(round_id=None):
-    started = [{"kind": "job-started", "stage": "blind"}]
-    drawn = [{"kind": "blind-round", "round": round_id}] if round_id else []
-    return started + drawn + [{"kind": "job-finished", "stage": "blind"}]
+# The event log's own sequences, for `legacy_approval_problem` alone.
+def blind(round_id, fit="f001"):
+    return [{"kind": "job-started", "stage": "blind"},
+            {"kind": "blind-round", "round": round_id, "candidates": [fit, fit + "-affine"]},
+            {"kind": "job-finished", "stage": "blind"}]
 
 
 def job(stage):
@@ -286,7 +285,13 @@ START = job("holdout") + said("p0001", "lines-up") + said("p0002", "lines-up") +
 
 @pytest.mark.parametrize("events, round_id, problem", [
     (START + job("score") + blind("c001") + decided(), "c001", None),
-    (START + job("score") + blind() + decided(None), None, None),                     # main named no round
+    (START + job("score") + blind("c001") + decided(None), None, None),               # main named no round
+    (START + job("score") + blind("c001")[:1] + decided(None) + blind("c001")[1:], None,
+     "alone"),                                                                        # sent while its round was drawn
+    (START + job("score") + blind("c000", "f000") + job("fit") + job("score") + blind("c001") + decided(None),
+     None, "alone"),                                                                  # a page of f000's round may have sent it
+    (START + job("score") + blind("c001") + decided(None) + job("fit") + job("score") + blind("c002", "f002"),
+     None, None),                                                                     # a fit after it
     (START + job("score") + blind("c001") + said("p0002", "no") + job("score") + decided(), "c001", "p0002 lines up"),
     (START + job("score") + blind("c001") + said("p0002", "no") + said("p0002", "lines-up") + decided(), "c001",
      "p0002 lines up"),                                                               # changed and back
@@ -304,8 +309,9 @@ def test_which_scores_the_event_log_shows_a_legacy_approval_was_made_on(events, 
     preserving coherent legacy records. (The rule on hand-written logs: the round named,
     or main's unnamed one; an answer that changes whether a unit lines up after the round's
     score began, even changed back; one that does not; the hold-out set drawn again; a
-    decision logged before its round, or a round with no score before it; a decision that
-    is not the last one logged; a log with no decision.)"""
+    decision logged before its round, or a round with no score before it; main's after
+    another fit's round, or before a fit; a decision that is not the last one logged; a log
+    with no decision.)"""
     from volreg.scoring import legacy_approval_problem
     found = legacy_approval_problem(events, decided(round_id)[0])
     if problem is None:
@@ -356,6 +362,21 @@ def test_an_answer_logged_whose_rewrite_of_holdout_json_failed_holds_back_the_pa
     assert released(tmp_path, [old, root], "after")[0]["A"]["source"] == "records/a"
     assert_published_coherently(tmp_path / "out-after")
     assert check(root, capsys)[0] == 0
+
+
+def test_the_holdout_page_shows_an_answer_logged_whose_rewrite_of_holdout_json_failed(tmp_path, scored, monkeypatch):
+    """The page and index must calculate progress and the next patch from the same logged
+    answers that drive the stages."""
+    from volreg.review.server import Reviews
+    directory = scored_pair(tmp_path / "records")
+    restore = refuse_replace_of(monkeypatch, rec.HOLDOUT)
+    with pytest.raises(PermissionError):
+        answer(directory, "p0007", "clear")
+    restore()
+    reviews = Reviews(directory.parent, BY, auto_advance=False)
+    shown = reviews.holdout(directory.name)
+    assert not shown["done"] and shown["next"] == "p0007" and shown["progress"]["lines_up"] == 19
+    assert reviews.pairs()["pairs"][0]["holdout"]["lines_up"] == 19
 
 
 def test_a_legacy_record_whose_log_is_ahead_of_holdout_json_is_held_back(tmp_path, scored, capsys):

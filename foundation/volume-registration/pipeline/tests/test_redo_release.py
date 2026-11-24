@@ -98,6 +98,7 @@ def fake_blind(pipeline, params):
                             "items": [{"patch": "p0001", "options": [[candidates[0]], [candidates[1]]],
                                        "choice": None}]}]
         pipeline.record.refresh_final(rounds)
+        pipeline.record.log("blind-round", round=rounds[-1]["id"], candidates=candidates, items=1)
     return [rec.FINAL_REVIEW]
 
 
