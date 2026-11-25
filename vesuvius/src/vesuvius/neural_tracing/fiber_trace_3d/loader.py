@@ -1454,7 +1454,15 @@ def _normalize_image(volume: torch.Tensor, valid_mask: torch.Tensor, mode: str) 
         return volume
     if mode_l not in {"zscore", "minmax"}:
         raise ValueError(f"unsupported image_normalization {mode!r}")
-    return _MASKED_NORMALIZE[mode_l]({"image": volume[None], "valid": valid[None]}, targets=_MASKED_TARGETS)["image"][0]
+    device = volume.device
+    if device.type == "mps":
+        # vc_reader runs masked normalization on CPU or CUDA.
+        volume = volume.cpu()
+        valid = valid.cpu()
+    normalized = _MASKED_NORMALIZE[mode_l](
+        {"image": volume[None], "valid": valid[None]}, targets=_MASKED_TARGETS
+    )["image"][0]
+    return normalized.to(device) if device.type == "mps" else normalized
 
 def _gaussian_kernel1d(sigma: float, *, device: torch.device) -> torch.Tensor:
     """Retained shared 1D kernel helper for trace-to-control-point smoothing."""
