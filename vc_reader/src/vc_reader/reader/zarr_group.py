@@ -72,6 +72,9 @@ class ZarrGroup:
                                          allow_lossy_cache=allow_lossy_cache, memory_cache=memory_cache,
                                          threads=threads, connections=connections, read_mode=read_mode,
                                          offline=offline)
+        if refresh and is_remote(settings["location"]) and not settings["offline"]:
+            # Its arrays, opened later through it, are read as published now too.
+            _reader.forget_known_arrays(settings["location"], _open_options(settings, cache))
         group = cls(_reader.Group.open(settings["location"], _open_options(settings, cache)), settings, cache)
         group._metadata = StoreMetadata.from_json(group._group.metadata_json(refresh))
         return group
@@ -235,7 +238,10 @@ def open_node(location: str | os.PathLike[str], **kwargs: Any) -> ZarrReader | Z
     """The array or group at ``location``, whichever it is; the arguments of :meth:`ZarrGroup.open`."""
     settings, _ = _make_settings(location, auth=kwargs.get("auth", "auto"), cache_dir=kwargs.get("cache_dir"),
                                  offline=kwargs.get("offline", False))
-    if _reader.is_array_node(settings["location"], _open_options(settings, None)):
+    options = _open_options(settings, None)
+    if kwargs.get("refresh") and is_remote(settings["location"]) and not settings["offline"]:
+        _reader.forget_known_arrays(settings["location"], options)  # the node may have changed type
+    if _reader.is_array_node(settings["location"], options):
         return ZarrReader.open(location, **kwargs)
     return ZarrGroup.open(location, **kwargs)
 

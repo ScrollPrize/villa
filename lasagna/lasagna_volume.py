@@ -17,6 +17,8 @@ from pathlib import Path
 
 
 LASAGNA_VOLUME_VERSION = 2
+# validity_channel value meaning: a voxel is valid iff its stored native chunk exists.
+VALIDITY_BY_CHUNKS = "chunks"
 
 
 @dataclass
@@ -67,6 +69,11 @@ class LasagnaVolume:
 	@property
 	def base_directory(self) -> Path:
 		return self.path if self.version == 3 else self.path.parent
+
+	@property
+	def validity_by_chunks(self) -> bool:
+		"""Whether validity is the existence of stored chunks rather than a channel's zero value."""
+		return self.validity_channel == VALIDITY_BY_CHUNKS
 
 	# --- queries ---
 
@@ -138,6 +145,8 @@ class LasagnaVolume:
 			d["umbilicus_json"] = self.umbilicus_json
 		if self.init_shell_dir:
 			d["init_shell_dir"] = self.init_shell_dir
+		if self.validity_channel:
+			d["validity_channel"] = self.validity_channel
 		if self.crops:
 			d["crops"] = [list(c) for c in self.crops]
 		if self.base_shape_zyx is not None:
@@ -263,8 +272,11 @@ class LasagnaVolume:
 			if not isinstance(channels, list) or not channels or any(not isinstance(c, str) or not c for c in channels):
 				raise ValueError("invalid v3 channels")
 			names.extend(channels)
-		if len(set(names)) != len(names) or d.get("validity_channel") not in names:
-			raise ValueError("v3 requires unique channels and a declared validity_channel")
+		validity = d.get("validity_channel")
+		if len(set(names)) != len(names) or not (validity == VALIDITY_BY_CHUNKS or validity in names):
+			raise ValueError("v3 requires unique channels and a validity_channel naming a channel or 'chunks'")
+		if VALIDITY_BY_CHUNKS in names:
+			raise ValueError("'chunks' is reserved for validity_channel and cannot name a channel")
 		if "blank_invalid" in d and type(d["blank_invalid"]) is not bool:
 			raise ValueError("blank_invalid must be boolean")
 		if "width_encoding" in d and d["width_encoding"] not in ("uint8-base-voxels", "float32-input-voxels"):

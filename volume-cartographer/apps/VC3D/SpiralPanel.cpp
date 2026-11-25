@@ -1748,6 +1748,12 @@ void SpiralPanel::updateFitInputs()
                 .arg(links.isEmpty() ? tr("none") : links.join(QStringLiteral(", ")),
                      summary.value(QStringLiteral("link_refresh")).toBool()
                          ? tr("refreshed at startup") : tr("as stored, not refreshed"));
+    if (const auto tracks = selection.value(QStringLiteral("track")).toInteger(); tracks > 0)
+        text += tr("\nTracks: %1; %2 crossings computed by the fit from its tracks (crossing "
+                   "relationships of the store are not read)")
+                    .arg(tracks)
+                    .arg(summary.value(QStringLiteral("constraints")).toObject()
+                             .value(QStringLiteral("track crossings")).toInteger());
     if (!_inputFreshness.isEmpty()) text += QStringLiteral("\n") + _inputFreshness;
     _fitInputs->setText(text);
 }

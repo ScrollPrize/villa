@@ -1,6 +1,7 @@
 #pragma once
 // Scroll-centered views over one metadata-only index: what a sample has, how its
 // assets relate, and which sources describe them. Nothing here touches storage.
+#include "vc_reader/exception_type.hpp"
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -23,11 +24,11 @@ inline constexpr double kDefaultResolutionRelTol = 0.005;
 inline constexpr int kPyramidLevels = 6;
 
 // A query matched nothing.
-struct NotFoundError : std::runtime_error {
+struct VCR_EXCEPTION_TYPE NotFoundError : std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 // A query matched more than one item.
-struct AmbiguousMatchError : std::runtime_error {
+struct VCR_EXCEPTION_TYPE AmbiguousMatchError : std::runtime_error {
     AmbiguousMatchError(const std::string& message, std::vector<std::string> matches)
         : std::runtime_error(message), candidates(std::move(matches)) {}
     std::vector<std::string> candidates;

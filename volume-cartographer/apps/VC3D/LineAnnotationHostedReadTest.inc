@@ -571,8 +571,8 @@
                             return vc3d::line_annotation::hasControlPointTag(control.tags, vc3d::line_annotation::kBreakTag);
                         }) && ungapped.storePin == live->storePin, "the gap is removed again");
             }
-            // The install gives a published control its id by position when a
-            // control placed meanwhile shifted the order.
+            // The install gives a published control its id by its session
+            // identity when a control placed meanwhile shifted the order.
             {
                 require(live->controlPoints.size() >= 2 && live->optimizedLine.points.size() >= 2, "C has a line");
                 const auto last = live->controlPoints.back();

@@ -3,6 +3,7 @@
 #include "../storage_transform.hpp"
 #include "vc_reader/zarr_metadata.hpp"
 #include "vc_reader/array.hpp"
+#include "vc_reader/native/utf8_path.hpp"
 #include "files.hpp"
 
 #include <algorithm>
@@ -12,6 +13,9 @@
 #include <filesystem>
 #include <fstream>
 #include <thread>
+#include <map>
+#include <mutex>
+#include <cstdint>
 #include <set>
 
 namespace fs = std::filesystem;
@@ -44,7 +48,7 @@ std::vector<std::string> localNumberedChildren(const fs::path& root)
     std::vector<std::string> paths;
     if (fs::is_directory(root))
         for (const auto& child : fs::directory_iterator(root)) {
-            const auto name = child.path().filename().string();
+            const auto name = utf8String(child.path().filename());
             if (digits(name) && child.is_directory() &&
                 (fs::exists(child.path() / ".zarray") || fs::exists(child.path() / "zarr.json")))
                 paths.push_back(name);
@@ -149,12 +153,70 @@ std::string datasetPath(const Json& dataset)
 }
 }  // namespace
 
+namespace {
+// A public array's document, like a kept group, is trusted once read: each
+// open would otherwise repeat a request (~0.1 s) for a document that does not
+// change. Keyed by the array's place in the decoded cache (so an S3 location
+// and its HTTPS alias share an entry); forgetKeptMetadata, opening a Writer
+// and this process writing an array's metadata drop it. A forget bumps the
+// epoch, so a read that started before it does not keep what it fetched.
+std::mutex knownArraysMutex;
+std::map<std::string, Json> knownArrays;
+std::uint64_t knownArraysEpoch = 0;
+
+std::optional<std::string> knownArrayPath(const std::string& location, const Access& access)
+{
+    if (!isRemote(location))
+        return std::nullopt;
+    try {
+        auto spelled = stripSlashes(location);
+        // s3+<region>:// is the same bucket as s3://.
+        if (spelled.starts_with("s3+"))
+            if (const auto scheme = spelled.find("://"); scheme != std::string::npos)
+                spelled = "s3" + spelled.substr(scheme);
+        // decodedCachePath drops a query; a slash before it goes here.
+        return stripSlashes(utf8GenericString(decodedCachePath({}, access.cacheUrl(spelled))));
+    } catch (const std::invalid_argument&) {
+        return std::nullopt;
+    }
+}
+
+std::optional<std::string> knownArrayKey(const std::string& location, const OpenOptions& options)
+{
+    // A custom endpoint is another server, whatever bucket name it serves.
+    if (options.offline || !options.access.endpoint.empty() || !isPublicLocation(location))
+        return std::nullopt;
+    return knownArrayPath(location, options.access);
+}
+}  // namespace
+
+void detail::forgetKnownArrays(const std::string& location, const Access& access)
+{
+    const auto path = knownArrayPath(location, access);
+    if (!path)
+        return;
+    const auto below = *path + "/";
+    std::lock_guard lock(knownArraysMutex);
+    ++knownArraysEpoch;
+    knownArrays.erase(*path);
+    for (auto it = knownArrays.lower_bound(below); it != knownArrays.end() && it->first.starts_with(below);)
+        it = knownArrays.erase(it);
+}
+
 // A root array's metadata, when the location is one.
 std::optional<Json> readArrayDocument(const std::string& location, const OpenOptions& options)
 {
     if (options.offline && isRemote(location))
         return cachedSourceZarray(options.cacheDirs, options.access.cacheUrl(location), {}, {},
                                   options.vc3dVolumeDir);
+    const auto knownKey = knownArrayKey(location, options);
+    std::uint64_t epoch = 0;
+    if (knownKey) {
+        std::lock_guard lock(knownArraysMutex);
+        if (const auto it = knownArrays.find(*knownKey); it != knownArrays.end())
+            return it->second;
+        epoch = knownArraysEpoch;
+    }
     if (keptGroup(location, options))
         return std::nullopt;
     const auto read = reader(options);
@@ -162,6 +224,11 @@ std::optional<Json> readArrayDocument(const std::string& location, const OpenOpt
     if (!root) {
         const auto v3 = readJsonNode(read, location, "zarr.json");
         if (v3 && v3->value("node_type", "") == "array") root = v3;
+    }
+    if (root && knownKey) {
+        std::lock_guard lock(knownArraysMutex);
+        if (epoch == knownArraysEpoch)
+            knownArrays.emplace(*knownKey, *root);
     }
     return root;
 }
@@ -264,7 +331,7 @@ OpenedArray openArray(const std::string& input, const OpenOptions& options, Arra
         spec.channel_identity = keyUrl;
     } else {
         std::error_code ec;
-        root = fs::absolute(location, ec).lexically_normal().string();
+        root = utf8String(fs::absolute(utf8Path(location), ec).lexically_normal());
         if (ec)
             root = location;
         while (root.size() > 1 && root.back() == '/')
@@ -318,7 +385,7 @@ void keepAttributes(const OpenedArray& array, const OpenOptions& options)
         return;
     try {
         // The .zattrs of a decoded cache belongs to the cache, not the source.
-        (void)detail::writeCacheMetadata(fs::path(array.layers[std::size_t(array.writer)].root) / kSourceAttributes,
+        (void)detail::writeCacheMetadata(utf8Path(array.layers[std::size_t(array.writer)].root) / kSourceAttributes,
                                          array.attributes.dump(), options.cacheDirs, options.vc3dVolumeDir,
                                          options.cacheMaxBytes, options.cacheMinFreeBytes);
     } catch (const std::exception&) {
@@ -334,7 +401,7 @@ const Json& arrayAttributes(OpenedArray& array, const OpenOptions& options)
     if (options.offline && isRemote(array.location)) {
         auto dirs = cachedNodeDirs(options.cacheDirs, options.access.cacheUrl(array.location));
         if (options.vc3dVolumeDir && !array.levelKey.empty())
-            dirs.insert(dirs.begin(), *options.vc3dVolumeDir / array.levelKey);
+            dirs.insert(dirs.begin(), *options.vc3dVolumeDir / utf8Path(array.levelKey));
         for (const auto& dir : dirs) {
             std::ifstream in(dir / kSourceAttributes);
             if (in) {
@@ -408,7 +475,7 @@ Group Group::open(const std::string& input, OpenOptions options)
         if (read(location, ".zarray"))
             throw std::invalid_argument(location + " is an array, not a group");
         // Zarr v2 permits implicit parent groups in local hierarchies.
-        if (remote || localNumberedChildren(location).empty())
+        if (remote || localNumberedChildren(utf8Path(location)).empty())
             throw NotFound("no Zarr group at " + location + " (.zgroup/zarr.json not found)");
     }
     Json attrs = zattrs ? Json::parse(*zattrs) : Json::object();
@@ -508,7 +575,7 @@ std::vector<std::string> Group::keys()
     const auto meta = consolidated();
     const auto scan = [&](const fs::path& directory, bool skipHidden) {
         for (const auto& entry : fs::directory_iterator(directory)) {
-            const auto name = entry.path().filename().string();
+            const auto name = utf8String(entry.path().filename());
             if (entry.is_directory() && !(skipHidden && name.starts_with(".")) && isLocalZarrNode(entry.path()))
                 names.insert(name);
         }
@@ -523,7 +590,7 @@ std::vector<std::string> Group::keys()
                 names.insert(key.substr(0, slash));
         }
     } else if (!isRemote(location_)) {
-        scan(location_, false);
+        scan(utf8Path(location_), false);
     } else if (options_.offline) {
         for (const auto& d : cachedNodeDirs(options_.cacheDirs, options_.access.cacheUrl(location_)))
             scan(d, true);
@@ -553,7 +620,7 @@ std::vector<std::string> Group::levels(int probeLevels)
     }
     std::vector<std::string> candidates;
     if (!isRemote(location_)) {
-        candidates = localNumberedChildren(location_);
+        candidates = localNumberedChildren(utf8Path(location_));
     }
     const auto meta = consolidated();
     if (meta && meta->is_object()) {
@@ -761,6 +828,7 @@ std::vector<PyramidLevelInfo> pyramidLevels(const std::string& input, const Open
 void forgetKeptMetadata(const std::string& location, const OpenOptions& options)
 {
     forgetVolumeMetadata();
+    detail::forgetKnownArrays(location, options.access);
     for (const auto& dir : keptFolders(location, options)) {
         std::error_code ec;
         fs::remove(dir / kKeptGroup, ec);

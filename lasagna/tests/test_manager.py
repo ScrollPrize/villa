@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from types import SimpleNamespace
 import subprocess
 import sys
 from dataclasses import replace
@@ -161,15 +162,52 @@ def test_published_normal_discovery_skips_http_root_and_preserves_region(monkeyp
     ]
     record = next(item for item in index_lasagna_predictions(cache) if item.role == "normal")
     calls = []
-    def listing(bucket, prefix, **kwargs):
-        calls.append((bucket, prefix, kwargs))
-        return [prefix + "normal.lasagna.json"]
-    monkeypatch.setattr("lasagna.scripts.download_omezarr.list_s3_prefix", listing)
+    class Listing:
+        def __init__(self, location, **kwargs):
+            calls.append((location, kwargs))
+        def list_page(self, continuation_token=""):
+            pages = {
+                "": {"objects": [], "children": ["cos.ome.zarr"], "next_continuation_token": "next"},
+                "next": {
+                    "objects": [{"key": "inference.json"}, {"key": "normal.lasagna.json"}],
+                    "children": ["nx.ome.zarr"], "next_continuation_token": "",
+                },
+            }
+            return pages[continuation_token]
+    monkeypatch.setattr(manager_fiberlets, "ObjectStore", Listing)
     assert manager_fiberlets._discover_published_manifest(record) == (
         f"https://public.s3.{region}.amazonaws.com/"
         "PHerc0001/representations/predictions/lasagna/normals/normal.lasagna.json")
-    assert calls[0][0] == "public"
-    assert calls[0][2] == {"anon": True, "region": region}
+    assert calls == [(
+        f"s3+{region}://public/PHerc0001/representations/predictions/lasagna/normals", {"auth": None},
+    )]
+
+
+@pytest.mark.parametrize("objects,children,result", [
+    (["inference.json"], ["run.zarr"], "run.zarr/.zattrs"),
+    (["a.lasagna.json"], ["nx.ome.zarr", "ny.ome.zarr"], "a.lasagna.json"),
+    (["inference.json"], ["a.zarr", "b.zarr"], "found 0 and 2"),
+    (["a.lasagna.json", "b.lasagna.json"], [], "found 2 and 0"),
+])
+def test_published_normal_discovery_finds_the_embedded_manifest(monkeypatch, objects, children, result):
+    record = next(item for item in index_lasagna_predictions(prediction_catalog()) if item.role == "normal")
+
+    class Listing:
+        def __init__(self, location, **kwargs):
+            pass
+
+        def list_page(self, continuation_token=""):
+            return {
+                "objects": [{"key": key} for key in objects], "children": children,
+                "next_continuation_token": "",
+            }
+
+    monkeypatch.setattr(manager_fiberlets, "ObjectStore", Listing)
+    if result.startswith("found"):
+        with pytest.raises(ValueError, match=result):
+            manager_fiberlets._discover_published_manifest(record)
+    else:
+        assert manager_fiberlets._discover_published_manifest(record) == f"{record.artifact_url}/{result}"
 
 
 def test_published_normal_rejects_absolute_http_origin_even_with_s3_root():
@@ -483,6 +521,7 @@ def test_volume_table_prefetched_scales_require_chunk_data(tmp_path):
         group.mkdir(parents=True)
         (group / ".zarray").write_text("{}", encoding="utf-8")
     (root / "2" / "0.0.0").write_bytes(b"chunk")
+    (root / "3" / "0.0.0.missing").write_bytes(b"")
     nested = root / "10" / "0" / "0"
     nested.mkdir(parents=True)
     (nested / "0").write_bytes(b"chunk")
@@ -522,7 +561,7 @@ def test_contextual_help_prints_selected_parser_without_config(monkeypatch, caps
     assert exit_info.value.code == 0
     output = capsys.readouterr().out
     assert "usage: las_manager volume prefetch" in output
-    assert "--workers" in output
+    assert "--connections" in output
 
 
 def test_contextual_completion_commands_options_and_values(tmp_path, monkeypatch):
@@ -819,24 +858,36 @@ def test_cli_config_init_and_volume_list(tmp_path, monkeypatch, capsys):
     ]
 
 
-def test_prefetch_reuses_downloader_and_root_convention(tmp_path, monkeypatch):
+def test_prefetch_fills_the_vc_reader_cache_of_the_requested_level(tmp_path, monkeypatch):
+    from vc_reader._reader import PrefillStatus
+    from vc_reader.reader import ZarrReader
+
     config = configured(tmp_path)
     record = index_volumes(CatalogCache(sample_catalog(), {"sha256": "digest"}))[0]
-    calls = []
+    opened = []
+
+    class FakeReader:
+        def prefill(self, *, progress=None):
+            progress(3, 3)
+            return SimpleNamespace(
+                status=PrefillStatus.Completed, message="", total_chunks=3,
+                fetched_chunks=2, empty_chunks=1, error_chunks=0,
+            )
+
+        def close(self):
+            opened.append("closed")
+
     monkeypatch.setattr(
-        "lasagna.scripts.download_omezarr.download",
-        lambda **kwargs: calls.append(kwargs) or 0,
+        ZarrReader, "open",
+        classmethod(lambda cls, location, **kwargs: opened.append((location, kwargs)) or FakeReader()),
     )
-    result = prefetch_volume(config, record, 2, workers=17, remote_inventory=False)
+    result = prefetch_volume(config, record, 2, connections=17)
     assert result == volume_cache_root(config, record) / "2"
-    assert calls == [{
-        "source": record.s3_url,
-        "dest": str(volume_cache_root(config, record)),
-        "scales": [2],
-        "workers": 17,
-        "anon": True,
-        "remote_inventory": False,
-    }]
+    assert result == tmp_path / "cache" / "volumes" / "s3" / "public" / "PHerc0001" / "volumes" / record.long_id / "2"
+    assert opened == [
+        (f"{record.s3_url.rstrip('/')}/2", {"cache_dir": str(tmp_path / "cache" / "volumes"), "connections": 17, "auth": None}),
+        "closed",
+    ]
 
 
 class FakeTmux:
@@ -859,27 +910,41 @@ class FakeTmux:
         return window_id == "@99"
 
 
+def _compact_manifest(channels: list[str]) -> dict:
+    return {
+        "version": 3, "source_to_base": 1.0, "base_shape_zyx": [100, 80, 60],
+        "validity_channel": "chunks", "grad_mag_encode_scale": 1000.0, "grad_mag_factor": 0.25,
+        "provenance": "../inference.json",
+        "groups": {"sd2": {"zarr": "sd2/2", "scaledown": 2, "channels": channels}},
+    }
+
+
 def _completed_prediction_run(
     config: ManagerConfig, *, name: str, kind: str, channels: list[str],
-    sample_id: str = "PHerc0001", volume_id: str = "20260101000001",
+    sample_id: str = "PHerc0001", volume_id: str = "20260101000001", compact: bool = False,
 ) -> Path:
     run_dir = Path(config.output_dir) / name
     artifacts = run_dir / "artifacts"
     artifacts.mkdir(parents=True)
     manifest = artifacts / f"{name}.lasagna.json"
-    manifest.write_text(json.dumps({
-        "version": 2,
-        "source_to_base": 1.0,
-        "base_shape_zyx": [100, 80, 60],
-        "groups": {
-            channel: {
-                "zarr": f"{channel}.ome.zarr/2",
-                "scaledown": 2,
-                "channels": [channel],
-            }
-            for channel in channels
-        },
-    }), encoding="utf-8")
+    if compact:
+        manifest = artifacts / f"{name}.zarr" / ".zattrs"
+        manifest.parent.mkdir()
+        manifest.write_text(json.dumps({"lasagna": _compact_manifest(channels)}), encoding="utf-8")
+    else:
+        manifest.write_text(json.dumps({
+            "version": 2,
+            "source_to_base": 1.0,
+            "base_shape_zyx": [100, 80, 60],
+            "groups": {
+                channel: {
+                    "zarr": f"{channel}.ome.zarr/2",
+                    "scaledown": 2,
+                    "channels": [channel],
+                }
+                for channel in channels
+            },
+        }), encoding="utf-8")
     atomic_json(artifacts / "inference.json", {
         "schema_version": 1,
         "artifact_kind": kind,
@@ -902,7 +967,7 @@ def _completed_prediction_run(
             "snapshot": f"{name}-training/snapshots/best.pt",
             "sha256": "a" * 64,
         },
-        "artifacts": [{"kind": "manifest", "path": manifest.name}],
+        "artifacts": [{"kind": "manifest", "path": manifest.relative_to(artifacts).as_posix()}],
     })
     atomic_json(run_dir / "metadata.json", {
         "run_uuid": f"{name}-uuid", "run_name": name,
@@ -1137,6 +1202,63 @@ def test_fiberlet_launch_auto_resolves_and_caches_published_normals(
     assert resume_fiberlet(config, record["run_name"], tmux=FakeTmux()) == run_dir
 
 
+def test_fiberlet_inputs_accept_compact_runs(tmp_path):
+    config = configured(tmp_path)
+    for name, kind, channels in (
+        ("fiber-source", "fiber3d-prediction", ["presence", "nx", "ny", "width"]),
+        ("normal-source", "lasagna", ["grad_mag", "nx", "ny"]),
+    ):
+        _completed_prediction_run(config, name=name, kind=kind, channels=channels, compact=True)
+    fiber, normal = resolve_fiberlet_inputs(config, "fiber-source", "normal-source")
+    assert fiber["manifest"]["version"] == normal["manifest"]["version"] == 3
+    assert fiber["manifest_path"].parts[-2:] == ("fiber-source.zarr", ".zattrs")
+
+    attrs = json.loads(normal["manifest_path"].read_text())
+    attrs["lasagna"]["groups"]["sd2"]["zarr"] = "elsewhere"
+    normal["manifest_path"].write_text(json.dumps(attrs))
+    with pytest.raises(ValueError, match="invalid v3 resolution group"):
+        resolve_fiberlet_inputs(config, "fiber-source", "normal-source")
+
+
+@pytest.mark.parametrize("shape,chunks,error", [
+    ([3, 25, 20, 15], [3, 64, 64, 64], None),
+    ([2, 25, 20, 15], [2, 64, 64, 64], "whole chunks"),
+    ([3, 25, 20, 15], [1, 64, 64, 64], "whole chunks"),
+    ([25, 20, 15], [64, 64, 64], "valid 4D"),
+])
+def test_published_compact_normal_caches_beside_its_marker(tmp_path, monkeypatch, shape, chunks, error):
+    config = configured(tmp_path)
+    cache = prediction_catalog()
+    entry = next(
+        item for item in cache.document["samples"]["PHerc0001"]["volumes"]["one"]["data"]
+        if item.get("parameters", {}).get("model_id") == "20260419180421"
+    )
+    entry["creation_info"] = {}
+    record = next(item for item in index_lasagna_predictions(cache) if item.role == "normal")
+    base = record.artifact_url + "/run.zarr"
+    served = {
+        base + "/.zattrs": json.dumps({"lasagna": _compact_manifest(["grad_mag", "nx", "ny"])}).encode(),
+        base + "/sd2/2/.zarray": json.dumps({"shape": shape, "chunks": chunks, "dtype": "|u1"}).encode(),
+    }
+    requests = []
+    monkeypatch.setattr(manager_fiberlets, "_discover_published_manifest", lambda record: base + "/.zattrs")
+    monkeypatch.setattr(manager_fiberlets, "_remote_bytes", lambda url: requests.append(url) or served[url])
+    if error is not None:
+        with pytest.raises(ValueError, match=error):
+            manager_fiberlets._published_dependency(config, record)
+        return
+    normal = manager_fiberlets._published_dependency(config, record)
+    assert normal["manifest"]["version"] == 3
+    path = normal["manifest_path"]
+    assert path.parts[-2:] == ("run.zarr", ".zattrs") and path.is_file()
+    marker = json.loads((path.parents[1] / "lasagna-remote.json").read_text())
+    assert marker["manifest_file"] == "run.zarr/.zattrs"
+    assert marker["artifact_url"] == record.artifact_url
+    assert sorted(requests) == sorted(served)
+    assert manager_fiberlets._published_dependency(config, record) == normal
+    assert len(requests) == len(served)
+
+
 def test_fiberlet_auto_normal_reports_missing_publication(tmp_path):
     config = configured(tmp_path)
     _completed_prediction_run(
@@ -1274,15 +1396,19 @@ def test_launch_writes_backend_neutral_record_and_argv(tmp_path):
         "prefetch": "pending", "inference": "created", "staging_upload": "not_started",
         "atlas_ingest": "not_started", "atlas_publication": "not_started",
     }
-    assert command["prefetch"]["scale"] == 2
-    assert command["prefetch"]["workers"] == 64
+    assert command["prefetch"]["location"] == f"{volume.s3_url.rstrip('/')}/2"
+    assert command["prefetch"]["connections"] == 64
+    assert command["prefetch"]["cache_dir"] == str(tmp_path / "cache" / "volumes")
     assert metadata["source"]["scale"] == 2
     assert metadata["artifacts"]["manifest"].startswith("artifacts/")
     assert command["resolved_argv"][-2:] == ["--devices", "all"]
     assert any(value.endswith("best model.pt") for value in command["resolved_argv"])
     assert not any(value.endswith("fiber_config.json") for value in command["resolved_argv"])
     assert "--provenance-context" in command["resolved_argv"]
-    assert "--no-download" in command["resolved_argv"]
+    argv = command["resolved_argv"]
+    assert argv[argv.index("--input") + 1] == f"{volume.s3_url.rstrip('/')}/2"
+    assert argv[argv.index("--input-disk-cache-dir") + 1] == str(tmp_path / "cache" / "volumes")
+    assert metadata["source"]["location"] == f"{volume.s3_url.rstrip('/')}/2"
     context = json.loads((run_dir / "provenance_context.json").read_text())
     assert context["run_uuid"] == metadata["run_uuid"]
     assert context["source"]["requested_group"] == 2
@@ -1321,7 +1447,7 @@ def test_run_config_params_precede_explicit_backend_overrides(tmp_path):
 
 
 @pytest.mark.parametrize("backend", ["fiber3d", "lasagna"])
-def test_no_prefetch_delegates_downloads_to_backend(tmp_path, backend):
+def test_no_prefetch_leaves_fetching_to_the_backend(tmp_path, backend):
     config, fiber_snapshot = _snapshot_and_config(tmp_path)
     snapshot = fiber_snapshot
     if backend == "lasagna":
@@ -1334,32 +1460,20 @@ def test_no_prefetch_delegates_downloads_to_backend(tmp_path, backend):
     volume = index_volumes(CatalogCache(sample_catalog(), {"sha256": "digest"}))[0]
     run_dir = launch_inference(
         config, snapshot, volume, 1, original_argv=["inference", "run"],
-        prefetch=False, download_workers=321, tmux=FakeTmux(),
+        prefetch=False, input_connections=321, tmux=FakeTmux(),
     )
     command = json.loads((run_dir / "command.json").read_text())
     metadata = json.loads((run_dir / "metadata.json").read_text())
-    assert "--no-download" not in command["resolved_argv"]
-    worker_index = command["resolved_argv"].index("--download-workers")
-    assert command["resolved_argv"][worker_index + 1] == "321"
+    argv = command["resolved_argv"]
+    assert argv[argv.index("--input-connections") + 1] == "321"
+    assert "--input-disk-cache-gib" not in argv
     assert command["prefetch"] is None
     assert metadata["lifecycle"]["prefetch"] == "skipped"
-    cache_attrs = json.loads((volume_cache_root(config, volume) / ".zattrs").read_text())
-    assert cache_attrs["_download"] == {"source": volume.s3_url, "anon": True}
-
-
-def test_no_prefetch_respects_explicit_backend_no_download(tmp_path):
-    config, snapshot = _snapshot_and_config(tmp_path)
-    volume = index_volumes(CatalogCache(sample_catalog(), {"sha256": "digest"}))[0]
-    run_dir = launch_inference(
-        config, snapshot, volume, 1, original_argv=["inference", "run"],
-        prefetch=False, extra_args=("--no-download",), tmux=FakeTmux(),
-    )
-    argv = json.loads((run_dir / "command.json").read_text())["resolved_argv"]
-    assert argv[-1] == "--no-download"
+    assert not volume_cache_root(config, volume).exists()
 
 
 @pytest.mark.parametrize("backend", ["fiber3d", "lasagna"])
-def test_live_fetch_skips_bulk_prefetch_and_records_shared_backend_options(tmp_path, backend):
+def test_bounded_input_cache_skips_prefetch_and_records_backend_options(tmp_path, backend):
     config, fiber_snapshot = _snapshot_and_config(tmp_path)
     snapshot = fiber_snapshot
     if backend == "lasagna":
@@ -1370,35 +1484,31 @@ def test_live_fetch_skips_bulk_prefetch_and_records_shared_backend_options(tmp_p
     volume = index_volumes(CatalogCache(sample_catalog(), {"sha256": "digest"}))[0]
     run_dir = launch_inference(
         config, snapshot, volume, 1, original_argv=["inference", "run"],
-        prefetch=False, live_fetch=True, live_cache_gib=12.5,
-        live_fetch_ahead_tiles=4321, download_workers=123, tmux=FakeTmux(),
+        prefetch=False, input_disk_cache_gib=12.5,
+        read_ahead_tiles=4321, input_connections=123, tmux=FakeTmux(),
     )
     command = json.loads((run_dir / "command.json").read_text())
     metadata = json.loads((run_dir / "metadata.json").read_text())
     argv = command["resolved_argv"]
     assert command["prefetch"] is None
-    assert "--no-download" not in argv
-    assert argv[argv.index("--live-cache-gib") + 1] == "12.5"
-    assert argv[argv.index("--live-fetch-ahead-tiles") + 1] == "4321"
-    assert argv[argv.index("--download-workers") + 1] == "123"
-    assert metadata["live_fetch"] == {
-        "enabled": True, "cache_target_gib": 12.5,
-        "lookahead_tiles": 4321, "download_workers": 123,
+    assert argv[argv.index("--input-disk-cache-gib") + 1] == "12.5"
+    assert argv[argv.index("--read-ahead-tiles") + 1] == "4321"
+    assert argv[argv.index("--input-connections") + 1] == "123"
+    assert metadata["input"] == {
+        "disk_cache_dir": str(tmp_path / "cache" / "volumes"), "disk_cache_gib": 12.5,
+        "connections": 123, "read_ahead_tiles": 4321,
     }
-    cache_attrs = json.loads((volume_cache_root(config, volume) / ".zattrs").read_text())
-    assert cache_attrs["_download"]["source"] == volume.s3_url
 
 
-def test_live_fetch_rejects_backend_no_download_before_source_initialization(tmp_path):
+def test_bounded_input_cache_rejects_the_prefetch_phase(tmp_path):
     config, snapshot = _snapshot_and_config(tmp_path)
-    config = replace(config, params=("--no-download",))
     volume = index_volumes(CatalogCache(sample_catalog(), {"sha256": "digest"}))[0]
-    with pytest.raises(ValueError, match="conflicts with --no-download"):
+    with pytest.raises(ValueError, match="mutually exclusive"):
         launch_inference(
             config, snapshot, volume, 1, original_argv=["inference", "run"],
-            prefetch=False, live_fetch=True, tmux=FakeTmux(),
+            prefetch=True, input_disk_cache_gib=1.0, tmux=FakeTmux(),
         )
-    assert not (volume_cache_root(config, volume) / ".zattrs").exists()
+    assert not volume_cache_root(config, volume).exists()
 
 
 def test_lasagna_launch_reuses_shared_run_and_tmux_workflow(tmp_path):
@@ -1424,7 +1534,7 @@ def test_lasagna_launch_reuses_shared_run_and_tmux_workflow(tmp_path):
     assert command[1:4] == ["-m", "preprocess_cos_omezarr", "predict3d"]
     assert command[command.index("--input") + 1].endswith("/1")
     assert "--provenance-context" in command
-    assert "--no-download" in command
+    assert "--input-disk-cache-dir" in command
     assert command[-2:] == ["--devices", "all"]
     assert "--tile-size" not in command
     assert "--border" not in command
@@ -1454,19 +1564,27 @@ def test_inference_run_returns_after_detached_launch_without_foreground_prefetch
     monkeypatch.setattr(manager_cli, "launch_inference", fake_launch)
     assert main([
         "inference", "run", snapshot.selector, volume.selector,
-        "--download-workers", "511",
+        "--input-connections", "511",
     ]) == 0
     assert capsys.readouterr().out.strip() == str(tmp_path / "reserved-run")
     assert calls[0][1]["prefetch"] is True
-    assert calls[0][1]["download_workers"] == 511
+    assert calls[0][1]["input_connections"] == 511
     assert calls[0][0][3] == 2
     assert main([
         "inference", "run", snapshot.selector, volume.selector, "2",
-        "--no-prefetch", "--download-workers", "333",
+        "--no-prefetch", "--input-connections", "333",
     ]) == 0
     capsys.readouterr()
     assert calls[1][1]["prefetch"] is False
-    assert calls[1][1]["download_workers"] == 333
+    assert calls[1][1]["input_connections"] == 333
+    assert main([
+        "inference", "run", snapshot.selector, volume.selector, "2",
+        "--input-disk-cache-gib", "2.5", "--read-ahead-tiles", "9",
+    ]) == 0
+    capsys.readouterr()
+    assert calls[2][1]["prefetch"] is False
+    assert calls[2][1]["input_disk_cache_gib"] == 2.5
+    assert calls[2][1]["read_ahead_tiles"] == 9
 
 
 def test_backend_alias_commands_require_snapshot_and_force_backend(
@@ -1564,9 +1682,9 @@ def test_runner_prefetches_before_inference_and_preserves_options(tmp_path, monk
         "artifacts": {"provenance": "artifacts/inference.json", "inventory": []},
     })
     request = {
-        "version": 1, "source": "s3://bucket/volume.zarr",
-        "destination": str(run_dir / "cache"), "scale": 3, "workers": 511,
-        "anon": True, "remote_inventory": False,
+        "version": 2, "location": "s3://bucket/volume.zarr/3",
+        "cache_dir": str(run_dir / "cache"), "cached_level": str(run_dir / "cache" / "s3" / "bucket" / "volume.zarr" / "3"),
+        "connections": 511,
     }
 
     def fake_prefetch(value):
@@ -1574,7 +1692,7 @@ def test_runner_prefetches_before_inference_and_preserves_options(tmp_path, monk
         print("prefetch stdout progress", flush=True)
         print("prefetch stderr progress", file=sys.stderr, flush=True)
         marker.write_text("ready", encoding="utf-8")
-        return Path(value["destination"]) / str(value["scale"])
+        return Path(value["cached_level"])
 
     script = (
         "from pathlib import Path; import json; "
@@ -1638,9 +1756,9 @@ def test_runner_copies_direct_inference_inventory(tmp_path):
     })
     atomic_json(run_dir / "artifacts" / "inference.json", {
         "status": "completed", "artifacts": [{"kind": "manifest", "path": "x.json"}],
-        "inference": {"live_fetch": {
-            "enabled": True, "cache_target_gib": 10240.0,
-            "final_stats": {"downloaded_chunks": 12},
+        "inference": {"input": {
+            "remote": True, "disk_cache_gib": 10240.0,
+            "final_stats": {"fetched_chunks": 12},
         }},
     })
 
@@ -1648,7 +1766,7 @@ def test_runner_copies_direct_inference_inventory(tmp_path):
     metadata = json.loads((run_dir / "metadata.json").read_text())
     assert metadata["status"] == "completed"
     assert metadata["artifacts"]["inventory"] == [{"kind": "manifest", "path": "x.json"}]
-    assert metadata["live_fetch"]["final_stats"]["downloaded_chunks"] == 12
+    assert metadata["input"]["final_stats"]["fetched_chunks"] == 12
 
 
 def test_runner_rejects_zero_exit_without_completed_provenance(tmp_path):

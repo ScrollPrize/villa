@@ -138,8 +138,17 @@ std::string relationshipQueryResultToJson(const StoreStatus&, const std::vector<
 std::vector<SelectedRelationship> relationshipQueryResultFromJson(const std::string&, StoreStatus* asOf);
 std::string selectedInputsToJson(const StoreStatus&, const SelectedInputs&);
 SelectedInputs selectedInputsFromJson(const std::string&);
-std::string selectedInputsRequestToJson(const std::vector<ObjectVersion>&, const StoreStatus&);
-std::pair<std::vector<ObjectVersion>, StoreStatus> selectedInputsRequestFromJson(const std::string&);
+// `relationshipVersions` (StoreReader::selectedInputs) travels as the optional
+// key relationship_versions, sent only when given: a server that predates it
+// refuses the request rather than enumerate every relationship.
+struct SelectedInputsRequest {
+    std::vector<ObjectVersion> versions;
+    StoreStatus position;
+    std::optional<std::vector<ObjectVersion>> relationshipVersions;
+};
+std::string selectedInputsRequestToJson(const std::vector<ObjectVersion>&, const StoreStatus&,
+    const std::optional<std::vector<ObjectVersion>>& relationshipVersions = std::nullopt);
+SelectedInputsRequest selectedInputsRequestFromJson(const std::string&);
 
 std::string regionQueryRequestToJson(const RegionSlice&, const RegionOptions&);
 std::pair<RegionSlice, RegionOptions> regionQueryRequestFromJson(const std::string&);

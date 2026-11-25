@@ -66,7 +66,7 @@ def _write_tifxyz(
 	tifffile.imwrite(path / "x.tif", x)
 	tifffile.imwrite(path / "y.tif", y)
 	tifffile.imwrite(path / "z.tif", z)
-	(path / "meta.json").write_text(json.dumps({"scale": [1.0, 1.0, 1.0]}) + "\n", encoding="utf-8")
+	(path / "meta.json").write_text(json.dumps({"scale": [1.0, 1.0]}) + "\n", encoding="utf-8")
 
 
 def _atlas21_fixture_root() -> Path:

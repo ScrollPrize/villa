@@ -748,7 +748,11 @@ ImageFile::~ImageFile() = default;
 TiffMapping tiffMapping(const std::string& path)
 {
     const auto refuse = [&](const std::string& why) { return std::invalid_argument(path + " cannot be memory-mapped: " + why); };
+#ifdef _WIN32  // TIFFOpen would read the name in the system code page
+    std::unique_ptr<TIFF, decltype(&TIFFClose)> handle(TIFFOpenW(utf8Path(path).c_str(), "r"), TIFFClose);
+#else
     std::unique_ptr<TIFF, decltype(&TIFFClose)> handle(TIFFOpen(path.c_str(), "r"), TIFFClose);
+#endif
     if (!handle) throw refuse("not a readable TIFF");
     TIFF* tif = handle.get();
     const auto page = readPage(tif);
