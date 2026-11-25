@@ -26,8 +26,9 @@ Three backends write the same keys in the same format:
   cpu    Kimimaro on the CPU, several slabs at once in worker processes
          (--slab-workers); vc_reader labels connected components on the CPU.
 
-Brook and teasar implement TEASAR skeletonization on the GPU; their skeletons
-are close to Kimimaro's but not identical. ``--backend auto`` uses the first of
+Brook implements TEASAR skeletonization on the GPU. teasar prepares the labels
+on the GPU and, with the default target order, skeletonizes on host threads.
+Their skeletons are close to Kimimaro's but not identical. ``--backend auto`` uses the first of
 gpu, metal and cpu that can run. Both GPU backends need ``path_mode``
 ``'interjoint'``, and metal also needs one of the slab configurations teasar
 supports (``TEASAR_SETTINGS``).

@@ -1621,9 +1621,10 @@ otherwise. The script prints the backend it uses and why. `--backend gpu`,
 `--backend metal` and `--backend cpu` stop with the reason when that backend
 cannot run. Both GPU backends implement only the `'interjoint'` path mode.
 
-The metal backend runs connected-component labelling, pooling, the size
-filter and skeletonization on the Mac's GPU with teasar, and walks the
-skeletons into tracks with `fast_tracks.py`. teasar supports the two slab
+The metal backend runs connected-component labelling, pooling and the size
+filter on the Mac's GPU with teasar, skeletonizes the pooled labels with
+teasar (on host threads with the default `kimimaro` target order), and walks
+the skeletons into tracks with `fast_tracks.py`. teasar supports the two slab
 configurations in `TEASAR_SETTINGS`: the defaults at the top of the script,
 and the published PHerc0211 configuration (downsample 2, 2-voxel ribbons every
 8, 4-voxel slabs every 16). Any other configuration uses Kimimaro. A slab
