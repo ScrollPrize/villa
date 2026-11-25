@@ -9,7 +9,11 @@
 #include "../composite/reducer.hpp"
 #include "../thread_pool.hpp"
 
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+#include <immintrin.h>
+#endif
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <cmath>
@@ -327,7 +331,7 @@ struct ChunkLookup {
 
     // A sample's chunk is almost always the last one used: that check stays inline, the
     // rest (other slots, reading a chunk) is out of line.
-    const unsigned char* voxel(const std::int64_t* v, bool& available)
+    [[gnu::always_inline]] const unsigned char* voxel(const std::int64_t* v, bool& available)
     {
         const std::int64_t c[3]{chunkOf(v[0], 0), chunkOf(v[1], 1), chunkOf(v[2], 2)};
         const std::int64_t key = keyOffset + (c[0] * grid[1] + c[1]) * grid[2] + c[2];
@@ -371,6 +375,124 @@ using TilePoints = std::function<void(int i0, int j0, int w, int h, float* xyz, 
 
 constexpr int kTile = 64;
 
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+// sampling::point (order 1) for eight points at once, for the common case
+// only: 8-bit voxels, a lane being a full trilinear cell (off the grid on all three axes)
+// inside one stored chunk. Lanes may be in different chunks: each chunk's lanes are
+// gathered together. Each lane does the scalar code's float operations in the scalar
+// code's order, so its value is the same bits. Returns the lanes it sampled, one bit
+// each, out of the lanes in `want`; `out` holds their values and nothing meaningful for
+// the others, which the caller samples with the scalar path. Lanes not in `want` read no
+// chunk. Compiled for AVX2 whatever the build's baseline; callers
+// check the CPU first.
+template <class Load>
+__attribute__((target("avx2"))) inline unsigned sampleEightAt(ChunkLookup<Load>& L, const LevelMap& m, const __m256* at, unsigned want,
+                                                        float* out)
+{
+    const __m256 zero = _mm256_setzero_ps();
+    const __m256 inf = _mm256_set1_ps(std::numeric_limits<float>::infinity());
+    const __m256 magnitude = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff));
+    __m256 ok = _mm256_castsi256_ps(_mm256_set1_epi32(-1));
+    for (int b = 0; b < 3; ++b)
+        ok = _mm256_and_ps(ok, _mm256_cmp_ps(_mm256_and_ps(at[b], magnitude), inf, _CMP_LT_OQ));
+    __m256 frac[3];
+    __m256i within[3], chunk[3], good = _mm256_set1_epi32(-1);
+    for (int a = 0; a < 3; ++a) {
+        const __m256 c = _mm256_add_ps(_mm256_mul_ps(_mm256_set1_ps(m.scale[a]), _mm256_sub_ps(at[2 - a], _mm256_set1_ps(m.ref[2 - a]))),
+                                       _mm256_set1_ps(m.local[a]));
+        ok = _mm256_and_ps(ok, _mm256_cmp_ps(c, _mm256_set1_ps(float(-1 - m.base[a])), _CMP_GT_OQ));
+        ok = _mm256_and_ps(ok, _mm256_cmp_ps(c, _mm256_set1_ps(float(L.shape[a] - m.base[a])), _CMP_LT_OQ));
+        const __m256 low = _mm256_floor_ps(c);
+        frac[a] = _mm256_sub_ps(c, low);
+        ok = _mm256_and_ps(ok, _mm256_cmp_ps(frac[a], zero, _CMP_NEQ_OQ));
+        const __m256i lo = _mm256_add_epi32(_mm256_set1_epi32(int(m.base[a])), _mm256_cvttps_epi32(low));
+        good = _mm256_and_si256(good, _mm256_cmpgt_epi32(lo, _mm256_set1_epi32(-1)));
+        good = _mm256_and_si256(good, _mm256_cmpgt_epi32(_mm256_set1_epi32(int(L.shape[a]) - 1), lo));
+        within[a] = _mm256_and_si256(lo, _mm256_set1_epi32(int(L.block[a]) - 1));
+        good = _mm256_and_si256(good, _mm256_cmpgt_epi32(_mm256_set1_epi32(int(L.block[a]) - 1), within[a]));
+        chunk[a] = _mm256_srai_epi32(lo, L.shift[a]);
+    }
+    unsigned left = want & unsigned(_mm256_movemask_ps(ok)) & unsigned(_mm256_movemask_ps(_mm256_castsi256_ps(good)));
+    if (!left)
+        return 0;
+    const int s0 = int(L.stride[0]), s1 = int(L.stride[1]);
+    const __m256i offset = _mm256_add_epi32(_mm256_add_epi32(_mm256_mullo_epi32(within[0], _mm256_set1_epi32(s0)),
+                                                             _mm256_mullo_epi32(within[1], _mm256_set1_epi32(s1))), within[2]);
+    alignas(32) int chunks[3][8];
+    for (int a = 0; a < 3; ++a)
+        _mm256_store_si256(reinterpret_cast<__m256i*>(chunks[a]), chunk[a]);
+    const __m256i bit = _mm256_setr_epi32(1, 2, 4, 8, 16, 32, 64, 128);
+    __m256i r00 = _mm256_setzero_si256(), r10 = r00, r01 = r00, r11 = r00;
+    unsigned done = 0;
+    while (left) {  // one round per chunk the remaining lanes are in
+        const int l = std::countr_zero(left);
+        const std::int64_t c[3]{chunks[0][l], chunks[1][l], chunks[2][l]};
+        __m256i same = _mm256_cmpeq_epi32(chunk[0], _mm256_set1_epi32(chunks[0][l]));
+        same = _mm256_and_si256(same, _mm256_cmpeq_epi32(chunk[1], _mm256_set1_epi32(chunks[1][l])));
+        same = _mm256_and_si256(same, _mm256_cmpeq_epi32(chunk[2], _mm256_set1_epi32(chunks[2][l])));
+        unsigned lanes = unsigned(_mm256_movemask_ps(_mm256_castsi256_ps(same))) & left;
+        left &= ~lanes;
+        const std::int64_t key = L.keyOffset + (c[0] * L.grid[1] + c[1]) * L.grid[2] + c[2];
+        const auto& slot = L.slots[L.last].key == key ? L.slots[L.last] : L.find(key, c);
+        if (!slot.available || !slot.chunk)
+            continue;
+        // Each gather reads four bytes: the voxel, its +x neighbour and two bytes more.
+        const std::int64_t room = std::int64_t(slot.chunk->size()) - L.channelOffset - s0 - s1 - 3;
+        if (room <= 0)
+            continue;
+        lanes &= unsigned(_mm256_movemask_ps(
+            _mm256_castsi256_ps(_mm256_cmpgt_epi32(_mm256_set1_epi32(int(std::min<std::int64_t>(room, INT32_MAX))), offset))));
+        const __m256i take = _mm256_cmpeq_epi32(_mm256_and_si256(_mm256_set1_epi32(int(lanes)), bit), bit);
+        const int* data = reinterpret_cast<const int*>(slot.chunk->data() + L.channelOffset);
+        r00 = _mm256_mask_i32gather_epi32(r00, data, offset, take, 1);
+        r10 = _mm256_mask_i32gather_epi32(r10, data, _mm256_add_epi32(offset, _mm256_set1_epi32(s0)), take, 1);
+        r01 = _mm256_mask_i32gather_epi32(r01, data, _mm256_add_epi32(offset, _mm256_set1_epi32(s1)), take, 1);
+        r11 = _mm256_mask_i32gather_epi32(r11, data, _mm256_add_epi32(offset, _mm256_set1_epi32(s0 + s1)), take, 1);
+        done |= lanes;
+    }
+    if (!done)
+        return 0;
+    const __m256i byte = _mm256_set1_epi32(0xff);
+    // z y x: the low byte is the voxel, the next its +x neighbour.
+    const __m256 v000 = _mm256_cvtepi32_ps(_mm256_and_si256(r00, byte)), v001 = _mm256_cvtepi32_ps(_mm256_and_si256(_mm256_srli_epi32(r00, 8), byte));
+    const __m256 v100 = _mm256_cvtepi32_ps(_mm256_and_si256(r10, byte)), v101 = _mm256_cvtepi32_ps(_mm256_and_si256(_mm256_srli_epi32(r10, 8), byte));
+    const __m256 v010 = _mm256_cvtepi32_ps(_mm256_and_si256(r01, byte)), v011 = _mm256_cvtepi32_ps(_mm256_and_si256(_mm256_srli_epi32(r01, 8), byte));
+    const __m256 v110 = _mm256_cvtepi32_ps(_mm256_and_si256(r11, byte)), v111 = _mm256_cvtepi32_ps(_mm256_and_si256(_mm256_srli_epi32(r11, 8), byte));
+    // sampling::trilinear, term by term.
+    const __m256 one = _mm256_set1_ps(1.0f);
+    const __m256 g0 = _mm256_sub_ps(one, frac[0]), g1 = _mm256_sub_ps(one, frac[1]), g2 = _mm256_sub_ps(one, frac[2]);
+    const __m256 w00 = _mm256_mul_ps(g0, g1), w10 = _mm256_mul_ps(frac[0], g1), w01 = _mm256_mul_ps(g0, frac[1]),
+                 w11 = _mm256_mul_ps(frac[0], frac[1]);
+    __m256 v = zero;
+    v = _mm256_add_ps(v, _mm256_mul_ps(_mm256_mul_ps(w00, g2), v000));
+    v = _mm256_add_ps(v, _mm256_mul_ps(_mm256_mul_ps(w10, g2), v100));
+    v = _mm256_add_ps(v, _mm256_mul_ps(_mm256_mul_ps(w01, g2), v010));
+    v = _mm256_add_ps(v, _mm256_mul_ps(_mm256_mul_ps(w11, g2), v110));
+    v = _mm256_add_ps(v, _mm256_mul_ps(_mm256_mul_ps(w00, frac[2]), v001));
+    v = _mm256_add_ps(v, _mm256_mul_ps(_mm256_mul_ps(w10, frac[2]), v101));
+    v = _mm256_add_ps(v, _mm256_mul_ps(_mm256_mul_ps(w01, frac[2]), v011));
+    v = _mm256_add_ps(v, _mm256_mul_ps(_mm256_mul_ps(w11, frac[2]), v111));
+    _mm256_storeu_ps(out, v);
+    return done;
+}
+
+// One layer of eight pixels next to each other in a row: p and n (null when off is 0)
+// are the pixels' points and normals, three floats each; `want` has a bit per pixel to
+// sample.
+template <class Load>
+__attribute__((target("avx2"))) unsigned sampleEightPixels(ChunkLookup<Load>& L, const LevelMap& m, const float* p, const float* n, float off,
+                                                     unsigned want, float* out)
+{
+    const __m256i each = _mm256_setr_epi32(0, 3, 6, 9, 12, 15, 18, 21);
+    __m256 at[3];
+    for (int b = 0; b < 3; ++b) {
+        const __m256 move = off != 0 ? _mm256_mul_ps(_mm256_i32gather_ps(n + b, each, 4), _mm256_set1_ps(off)) : _mm256_setzero_ps();
+        at[b] = _mm256_add_ps(_mm256_i32gather_ps(p + b, each, 4), move);
+    }
+    return sampleEightAt(L, m, at, want, out);
+}
+#endif
+
 // Samples a raster tile by tile, each tile on one thread of the first level's pool:
 // the tile's points, then per pixel its layers, each from the first level holding
 // it, reduced and written once. Level indices are taken about `centre`; General: some
@@ -410,8 +532,95 @@ Result sampleTiles(int width, int height, const Request& request, const TilePoin
         for (const auto& L : request.levels)
             lookups.emplace_back(L, load, request.cachedOnly, request.cancel);
         std::vector<float> xyz(std::size_t(w) * h * 3), nrm(needNormals ? xyz.size() : 0);
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+        // Whether sampleEightPixels applies: trilinear, layer by layer, 8-bit voxels in
+        // power-of-two chunks, indices that fit its 32-bit lanes, a row of eight pixels.
+        static const bool avx2 = __builtin_cpu_supports("avx2");
+        constexpr bool bytes = !General && std::is_same_v<std::invoke_result_t<Load, const std::uint8_t*>, std::uint8_t>;
+        bool rows = bytes && avx2 && w >= 8 && request.order != 0 && !request.composite && lookups[0].stride[2] == 1 &&
+                    lookups[0].block[0] * lookups[0].stride[0] < INT32_MAX;
+        for (int a = 0; a < 3 && rows; ++a)
+            rows = lookups[0].shift[a] >= 0 && lookups[0].shape[a] < (1 << 30) && maps[0].base[a] > -(1 << 30) && maps[0].base[a] < (1 << 30);
+#else
+        const bool rows = false;
+#endif
         points(i0, j0, w, h, xyz.data(), needNormals ? nrm.data() : nullptr);
-        for (int j = 0; j < h; ++j)
+        // Layer k of the pixel at p (normal n) from the first level holding it: that level,
+        // lookups.size() when no level holds it, -1 when the layer has no point.
+        const auto layer = [&](const float* p, const float* n, std::size_t k, float& value) {
+            const float off = request.offsets[k];
+            const float at[3]{p[0] + (off != 0 ? n[0] * off : 0.0f), p[1] + (off != 0 ? n[1] * off : 0.0f),
+                              p[2] + (off != 0 ? n[2] * off : 0.0f)};
+            if (!(std::isfinite(at[0]) && std::isfinite(at[1]) && std::isfinite(at[2])))
+                return -1;
+            std::size_t li = 0;
+            for (; li < lookups.size(); ++li) {
+                float c[3];
+                levelIndex<General>(maps[li], at[0], at[1], at[2], c);
+                if (sampling::point(lookups[li], maps[li].base, c, request.order, value))
+                    break;
+            }
+            return int(li);
+        };
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+        if constexpr (bytes) {
+            if (rows) {
+                // Layer by layer, eight pixels of a row at a time from the finest level; a row's
+                // last group overlaps the one before it. Pixels a group cannot take go one by one.
+                std::array<std::int8_t, kTile * kTile> levels;
+                std::array<bool, kTile * kTile> missed{};
+                levels.fill(Result::kNone);
+                const auto one = [&](int j, int i, std::size_t k) {
+                    const std::size_t t = std::size_t(j) * w + i;
+                    float value = kNaN;
+                    const int li = layer(&xyz[t * 3], needNormals ? &nrm[t * 3] : nullptr, k, value);
+                    if (li < 0)
+                        return;  // no point in this layer
+                    if (li == int(lookups.size())) {
+                        missed[t] = true;
+                        return;
+                    }
+                    levels[t] = std::max(levels[t], std::int8_t(li));
+                    result.values[k * pixels + std::size_t(j0 + j) * std::size_t(width) + std::size_t(i0 + i)] = value;
+                };
+                for (std::size_t k = 0; k < layers; ++k) {
+                    const float off = request.offsets[k];
+                    for (int j = 0; j < h; ++j) {
+                        const std::size_t q0 = std::size_t(j0 + j) * std::size_t(width) + std::size_t(i0);
+                        for (int i = 0; i < w;) {
+                            const int first = std::min(i, w - 8);
+                            unsigned want = (0xffu << (i - first)) & 0xff;  // not the lanes the group before took
+                            if (request.pixels)
+                                for (int l = 0; l < 8; ++l)
+                                    if (!request.pixels[q0 + first + l])
+                                        want &= ~(1u << l);
+                            float values[8];
+                            const float* p = &xyz[(std::size_t(j) * w + first) * 3];
+                            const float* n = needNormals ? &nrm[(std::size_t(j) * w + first) * 3] : nullptr;
+                            const unsigned done = want ? sampleEightPixels(lookups[0], maps[0], p, n, off, want, values) : 0;
+                            for (int l = 0; l < 8; ++l) {
+                                if (done >> l & 1) {
+                                    result.values[k * pixels + q0 + first + l] = values[l];
+                                    std::int8_t& level = levels[std::size_t(j) * w + first + l];
+                                    level = std::max(level, std::int8_t(0));
+                                } else if (want >> l & 1) {
+                                    one(j, first + l, k);
+                                }
+                            }
+                            i = first + 8;
+                        }
+                    }
+                }
+                for (int j = 0; j < h; ++j)
+                    for (int i = 0; i < w; ++i) {
+                        const std::size_t q = std::size_t(j0 + j) * std::size_t(width) + std::size_t(i0 + i);
+                        if (!request.pixels || request.pixels[q])
+                            result.level[q] = missed[std::size_t(j) * w + i] ? Result::kMissing : levels[std::size_t(j) * w + i];
+                    }
+            }
+        }
+#endif
+        for (int j = 0; j < (rows ? 0 : h); ++j)
             for (int i = 0; i < w; ++i) {
                 const std::size_t q = std::size_t(j0 + j) * std::size_t(width) + std::size_t(i0 + i);
                 if (request.pixels && !request.pixels[q])
@@ -423,30 +632,23 @@ Result sampleTiles(int width, int height, const Request& request, const TilePoin
                     reduce.emplace(*request.composite);
                 std::int8_t level = Result::kNone;
                 bool missing = false;
-                for (std::size_t k = 0; k < layers && !(reduce && reduce->done); ++k) {
-                    const float off = request.offsets[k];
-                    const float at[3]{p[0] + (off != 0 ? n[0] * off : 0.0f), p[1] + (off != 0 ? n[1] * off : 0.0f),
-                                      p[2] + (off != 0 ? n[2] * off : 0.0f)};
-                    if (!(std::isfinite(at[0]) && std::isfinite(at[1]) && std::isfinite(at[2])))
-                        continue;  // no point in this layer
+                const auto one = [&](std::size_t k) {
                     float value = kNaN;
-                    std::size_t li = 0;
-                    for (; li < lookups.size(); ++li) {
-                        float c[3];
-                        levelIndex<General>(maps[li], at[0], at[1], at[2], c);
-                        if (sampling::point(lookups[li], maps[li].base, c, request.order, value))
-                            break;
-                    }
-                    if (li == lookups.size()) {
+                    const int li = layer(p, n, k, value);
+                    if (li < 0)
+                        return;  // no point in this layer
+                    if (li == int(lookups.size())) {
                         missing = true;
-                        continue;
+                        return;
                     }
                     level = std::max(level, std::int8_t(li));
                     if (reduce)
                         reduce->add(value);
                     else
                         result.values[k * pixels + q] = value;
-                }
+                };
+                for (std::size_t k = 0; k < layers && !(reduce && reduce->done); ++k)
+                    one(k);
                 if (reduce)
                     result.values[q] = reduce->result();
                 result.level[q] = missing ? Result::kMissing : level;
