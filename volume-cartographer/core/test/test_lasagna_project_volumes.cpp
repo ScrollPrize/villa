@@ -227,6 +227,23 @@ TEST_CASE("Compound project preparation accepts packed CZYX channels")
         CHECK(package->selectedFiberInferenceDataset() == "old-fiber.lasagna.json");
         CHECK(package->annotationNormalSource() == "lasagna");
     }
+    SUBCASE("reattachment recomputes whether a dataset has predicted normals") {
+        package->attachPreparedLasagnaDataset(manifest, {}, true, attachments);
+        CHECK(package->hasPredictedFiberNormals(manifest));
+        // Same location, now without normal heads (and no volumes claiming them).
+        package = project.open();
+        auto data = package->document().data();
+        data["volumes"] = nlohmann::json::array();
+        package->document().replace(data);
+        REQUIRE(package->reload());
+        CHECK(package->attachPreparedLasagnaDataset(manifest, {}, true, {}) == VolumePkg::AttachLasagnaResult::Attached);
+        CHECK_FALSE(package->hasPredictedFiberNormals(manifest));
+        CHECK(package->annotationNormalSource() == "lasagna");
+    }
+    SUBCASE("choosing Lasagna without a fiber dataset stores nothing") {
+        package->setAnnotationNormalSource("lasagna");
+        CHECK_FALSE(package->document().data()["view"].contains("lasagna_normal_choices"));
+    }
     SUBCASE("invalid source including auto is rejected") {
         CHECK_THROWS_AS(package->setAnnotationNormalSource("auto"), std::invalid_argument);
         CHECK_THROWS_AS(package->setAnnotationNormalSource("typo"), std::invalid_argument);

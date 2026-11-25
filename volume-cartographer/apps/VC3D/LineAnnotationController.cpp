@@ -8595,6 +8595,10 @@ bool LineAnnotationController::resolveDatasetForSession(LineAnnotationSession& s
             return false;
         }
         vpkg->setSelectedLasagnaDataset(selected);
+        // Only reached without a usable Lasagna dataset, so no session holds
+        // normals from another one: record the new inputs without invalidating.
+        if (_annotationInputs && !_annotationInputsSyncDeferred)
+            _annotationInputs = currentAnnotationInputs();
     } else {
         if (session.normalSampler && session.selectedDatasetLocation == selected &&
             annotationShapeZYX(_state) && session.dataset->manifest().baseShapeZYX) {
@@ -8735,6 +8739,12 @@ LineAnnotationController::AnnotationInputs LineAnnotationController::currentAnno
     const auto vpkg = _state->vpkg();
     return {vpkg.get(), vpkg->selectedFiberInferenceDataset(), vpkg->annotationNormalSource(),
             vpkg->selectedLasagnaDataset()};
+}
+
+void LineAnnotationController::scheduleDeferredAnnotationInputsSync()
+{
+    if (_annotationInputsSyncDeferred)
+        QTimer::singleShot(0, this, [this] { syncAnnotationInputsWithProject(); });
 }
 
 bool LineAnnotationController::lasagnaMaySupplyNormals() const
@@ -8893,8 +8903,10 @@ bool LineAnnotationController::ensureFiberInferenceDatasetForSession(
                     headless);
                 return false;
             }
-            // Picked here, so it is the user's choice, not the default.
+            // Picked here, so it is the user's choice, not the default. Other
+            // sessions follow it; this one resolves its fields below.
             vpkg->setSelectedFiberInferenceDataset(selected);
+            syncAnnotationInputsWithProject();
             manifestPath = openedDataset.manifest().manifestPath;
             refreshLineAnnotationDatasetMenus();
         } catch (const std::exception& error) {
@@ -10536,6 +10548,7 @@ void LineAnnotationController::startOptimization(LineAnnotationSession& session,
                         survivor->watcher = nullptr;
                         survivor->runningSolveCancel.reset();
                         survivor->taskState = LineAnnotationSession::TaskState::Idle;
+                        scheduleDeferredAnnotationInputsSync();
                         (void)survivor->solveQueue.finishSolve();
                     }
                     watcher->deleteLater();
@@ -11063,6 +11076,7 @@ void LineAnnotationController::startFiberModeOptimization(
                         survivor->watcher = nullptr;
                         survivor->runningSolveCancel.reset();
                         survivor->taskState = LineAnnotationSession::TaskState::Idle;
+                        scheduleDeferredAnnotationInputsSync();
                         (void)survivor->solveQueue.finishSolve();
                     }
                     watcher->deleteLater();
@@ -11251,10 +11265,7 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
     // Tag edits queued behind this solve apply after its landing.
     const auto editsAfter = qScopeGuard([this] { scheduleDeferredControlEdits(); });
     // So do project input changes made while it ran.
-    const auto inputsAfter = qScopeGuard([this] {
-        if (_annotationInputsSyncDeferred)
-            QTimer::singleShot(0, this, [this] { syncAnnotationInputsWithProject(); });
-    });
+    const auto inputsAfter = qScopeGuard([this] { scheduleDeferredAnnotationInputsSync(); });
     const HostedStatusScope statusScope(*this);
     auto* pane = paneForSurface(surfaceName);
     if (!pane || !pane->session || !pane->session->watcher) {

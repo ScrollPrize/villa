@@ -1118,6 +1118,8 @@ private:
     // fiber dataset known to have predicted normals (an unattached one falls
     // back to Lasagna when its manifest has none).
     [[nodiscard]] bool lasagnaMaySupplyNormals() const;
+    // After a solve lands (or is dropped): apply input changes it held back.
+    void scheduleDeferredAnnotationInputsSync();
     bool needsFinalOptimization(const LineAnnotationSession& session) const;
     // stillValid (optional): forwarded to the backend helpers and checked
     // once more after the solve, before the result is applied.

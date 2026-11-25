@@ -528,7 +528,7 @@ void VolumePkg::setAnnotationNormalSource(std::string source)
     if (source != "fiber" && source != "lasagna")
         throw std::invalid_argument("Annotation normal source must be fiber or lasagna");
     const auto fiber = selectedFiberInferenceDataset();
-    if (source == "lasagna")
+    if (source == "lasagna" && !fiber.empty())
         lasagnaNormalChoices_.insert(fiber);
     else
         lasagnaNormalChoices_.erase(fiber);
@@ -755,8 +755,10 @@ VolumePkg::AttachLasagnaResult VolumePkg::attachPreparedLasagnaDataset(
                 target.push_back(tag);
         }
     };
+    // Role tags are recomputed by every attachment.
     auto removeFiberTag = [](std::vector<std::string>& tags) {
-        tags.erase(std::remove(tags.begin(), tags.end(), vc::project::kFiberLasagnaTag), tags.end());
+        std::erase(tags, std::string(vc::project::kFiberLasagnaTag));
+        std::erase(tags, std::string(vc::project::kPredictedFiberNormalsTag));
     };
     removeFiberTag(manifestTags);
     if (fiberInference) {
