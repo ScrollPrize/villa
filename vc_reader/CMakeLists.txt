@@ -345,3 +345,11 @@ if(VC_READER_BUILD_READER)
     endif()
     install(TARGETS _reader LIBRARY DESTINATION vc_reader)
 endif()
+
+if(VC_READER_ENABLE_HIP)
+    # Preserve the external runtime paths from the link, including hipFFT.
+    set_property(TARGET _thinning _transforms PROPERTY INSTALL_RPATH_USE_LINK_PATH TRUE)
+    if(TARGET _reader)
+        set_property(TARGET _reader PROPERTY INSTALL_RPATH_USE_LINK_PATH TRUE)
+    endif()
+endif()

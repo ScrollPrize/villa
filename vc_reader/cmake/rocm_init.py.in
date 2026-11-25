@@ -26,5 +26,9 @@ def initialize():
         if runtime.is_file():
             # The wheel can reopen the same file by its filename, and our
             # extensions resolve it by its versioned SONAME.
-            ctypes.CDLL(str(runtime), mode=ctypes.RTLD_GLOBAL)
+            try:
+                ctypes.CDLL(str(runtime), mode=ctypes.RTLD_GLOBAL)
+            except OSError:
+                # The wheel is optional. Let the extensions load system ROCm.
+                continue
             return

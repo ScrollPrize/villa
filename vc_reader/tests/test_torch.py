@@ -85,7 +85,7 @@ from vc_reader import cuda, transforms as A
 """
         exercise_gpu = """
 source = torch.ones((1, 3, 5), device='cuda')
-pipeline = A.Pipeline([A.BrightnessAdd(2.)], backend='cuda')
+pipeline = A.Pipeline([A.BrightnessAdd(2.), A.GibbsRinging(cutoff=.6)], backend='cuda')
 result = pipeline({'image': cuda.wrap(source)}, seed=0)['image']
 torch.testing.assert_close(torch.from_dlpack(result), source + 2.)
 """

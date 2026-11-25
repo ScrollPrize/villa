@@ -61,8 +61,12 @@ python -m pip install -e '.[all]' \
 Setting CUDA to `OFF` also clears any previous CUDA selection in the build cache.
 
 CMake looks for ROCm at its usual location, `/opt/rocm`. If ROCm is installed
-elsewhere, give it the path with `ROCM_PATH`. CMake detects the GPU by itself;
-if it cannot, give it with `CMAKE_HIP_ARCHITECTURES`, for example
+elsewhere, give it the path with `ROCM_PATH`. For a version-specific or
+multi-version ROCm installation, follow the
+[ROCm runtime setup instructions](https://rocm.docs.amd.com/projects/install-on-linux/en/docs-7.2.3/install/post-install.html)
+and include that installation's library directory in `LD_LIBRARY_PATH` before
+starting Python or Jupyter. If CMake cannot detect the GPU, set
+`CMAKE_HIP_ARCHITECTURES`, for example
 `--config-settings=cmake.define.CMAKE_HIP_ARCHITECTURES=gfx1200`.
 
 Only wave32 AMD GPUs (gfx10xx, gfx11xx, gfx12xx) are accepted. Wave64 GPUs (for
@@ -75,8 +79,9 @@ your build targets one type of GPU (NVIDIA or AMD).
 
 Use `backend='cuda'` and PyTorch's `'cuda'` device name on AMD as well. Use a
 PyTorch ROCm wheel that matches the ROCm major and minor version used to build
-vc_reader. When that wheel ships `libamdhip64.so`, vc_reader loads the bundled
-runtime before its GPU extensions so either package can be imported first.
+vc_reader. When that wheel ships a loadable `libamdhip64.so`, vc_reader loads it
+before its GPU extensions so either package can be imported first. Otherwise
+the extensions look for the system ROCm libraries.
 
 Native CMake targets can link a HIP build of vc_reader and NVIDIA's `CUDA::cudart`.
 Put code that includes the AMD and NVIDIA runtime headers in separate source
