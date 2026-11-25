@@ -96,6 +96,16 @@
     controller._panes.clear();
     require(controller._fiberMetricsGeneration == generation + 1 && !controller._annotationInputsSyncDeferred,
             "a changed fiber dataset or normal source invalidates once no solve runs");
+    // An unattached fiber dataset without predicted normals falls back to
+    // Lasagna, so changing the Lasagna dataset must invalidate the normals.
+    const auto unattached = (root / "unattached-fiber.lasagna.json").string();
+    controller.handleFiberInferenceDatasetSelectionChanged(unattached);
+    require(state.vpkg()->annotationNormalSource() == "fiber" && !state.vpkg()->hasPredictedFiberNormals(unattached),
+            "an unattached fiber dataset is checked from its manifest when used");
+    const auto beforeLasagna = controller._fiberMetricsGeneration;
+    controller.handleLasagnaDatasetSelectionChanged(fiberDir.string());
+    require(controller._fiberMetricsGeneration == beforeLasagna + 1,
+            "a Lasagna change invalidates when Lasagna may supply the normals");
     std::cout << "annotation_inputs PASS: explicit picks persist, external changes invalidate" << std::endl;
     state.closeProject();
 }

@@ -8737,6 +8737,14 @@ LineAnnotationController::AnnotationInputs LineAnnotationController::currentAnno
             vpkg->selectedLasagnaDataset()};
 }
 
+bool LineAnnotationController::lasagnaMaySupplyNormals() const
+{
+    if (!_state || !_state->vpkg()) return true;
+    const auto vpkg = _state->vpkg();
+    return vpkg->annotationNormalSource() != "fiber" ||
+        !vpkg->hasPredictedFiberNormals(vpkg->selectedFiberInferenceDataset());
+}
+
 void LineAnnotationController::syncAnnotationInputsWithProject()
 {
     const auto current = currentAnnotationInputs();
@@ -8762,8 +8770,8 @@ void LineAnnotationController::syncAnnotationInputsWithProject()
         return;
     }
     const bool predictionsChanged = previous.fiberDataset != current.fiberDataset;
-    const bool normalsChanged = previous.normalSource != current.normalSource ||
-        (current.normalSource == "fiber" ? predictionsChanged : previous.lasagnaDataset != current.lasagnaDataset);
+    const bool normalsChanged = previous.normalSource != current.normalSource || predictionsChanged ||
+        (previous.lasagnaDataset != current.lasagnaDataset && lasagnaMaySupplyNormals());
     invalidateAnnotationInputs(predictionsChanged, normalsChanged);
 }
 
@@ -8791,7 +8799,7 @@ void LineAnnotationController::handleLasagnaDatasetSelectionChanged(
     auto vpkg = _state->vpkg();
     if (vpkg->selectedLasagnaDataset() == location) return;
     vpkg->setSelectedLasagnaDataset(location);
-    invalidateAnnotationInputs(false, vpkg->annotationNormalSource() == "lasagna");
+    invalidateAnnotationInputs(false, lasagnaMaySupplyNormals());
 }
 
 void LineAnnotationController::handleFiberInferenceDatasetSelectionChanged(

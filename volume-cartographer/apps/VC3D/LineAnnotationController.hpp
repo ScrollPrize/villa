@@ -1114,6 +1114,10 @@ private:
     // Inputs changed while a solve ran; applied once no solve is running.
     bool _annotationInputsSyncDeferred = false;
     [[nodiscard]] AnnotationInputs currentAnnotationInputs() const;
+    // Whether the Lasagna dataset may supply the normals: everywhere except a
+    // fiber dataset known to have predicted normals (an unattached one falls
+    // back to Lasagna when its manifest has none).
+    [[nodiscard]] bool lasagnaMaySupplyNormals() const;
     bool needsFinalOptimization(const LineAnnotationSession& session) const;
     // stillValid (optional): forwarded to the backend helpers and checked
     // once more after the solve, before the result is applied.
