@@ -925,6 +925,14 @@ std::string joinOpenDataUrl(std::string root, std::string path)
         startsWith(path, "http://") || startsWith(path, "https://")) {
         return path;
     }
+#ifdef _WIN32
+    // A drive-absolute path ("E:/data", "E:\data") is already absolute; under the local root "/" it would become
+    // "/E:/data", which Windows cannot open.
+    if (path.size() >= 3 && std::isalpha(static_cast<unsigned char>(path[0])) && path[1] == ':' &&
+        (path[2] == '/' || path[2] == '\\')) {
+        return path;
+    }
+#endif
     const auto suffixAt = root.find_first_of("?#");
     const auto suffix = suffixAt == std::string::npos ? std::string{} : root.substr(suffixAt);
     if (suffixAt != std::string::npos) root.resize(suffixAt);
