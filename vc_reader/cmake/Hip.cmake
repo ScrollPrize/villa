@@ -49,10 +49,14 @@ foreach(_vcr_arch IN LISTS CMAKE_HIP_ARCHITECTURES)
 endforeach()
 message(STATUS "vc_reader: HIP backends for ${CMAKE_HIP_ARCHITECTURES}")
 
+find_package(hip REQUIRED CONFIG)
+# The thinning kernels use HIP's __syncwarp, introduced in ROCm 7.0.
+if("${hip_VERSION}" VERSION_LESS "7.0")
+    message(FATAL_ERROR "VC_READER_ENABLE_HIP requires ROCm 7.0 or newer (found HIP ${hip_VERSION}).")
+endif()
 enable_language(HIP)
 set(CMAKE_HIP_STANDARD 20)
 set(CMAKE_HIP_STANDARD_REQUIRED ON)
-find_package(hip REQUIRED CONFIG)
 find_package(hipfft REQUIRED CONFIG)
 find_package(hipcub REQUIRED CONFIG)
 

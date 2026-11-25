@@ -44,7 +44,8 @@ Use `VC_READER_ENABLE_CUDA=ON` to require CUDA and fail if it is unavailable.
 Explicit settings persist in the CMake build cache, so pass `ON` to enable
 CUDA after a previous CPU-only build.
 
-**AMD GPUs (ROCm).** To build for an AMD GPU, enable `VC_READER_ENABLE_HIP=ON`.
+**AMD GPUs (ROCm).** To build for an AMD GPU, use ROCm 7.0 or newer and enable
+`VC_READER_ENABLE_HIP=ON`.
 It is off by default (unlike CUDA, which turns on by itself when it finds the
 NVIDIA compiler `nvcc`). Install the PyTorch build for your ROCm version first,
 for example ROCm 7.2, in place of any PyTorch already installed, so that

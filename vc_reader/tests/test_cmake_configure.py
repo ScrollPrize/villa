@@ -61,6 +61,16 @@ class CMakeConfigureTests(unittest.TestCase):
                                 "-DVC_READER_ENABLE_CUDA=ON", success=False)
         self.assertIn("mutually exclusive", result.stdout + result.stderr)
 
+    def test_hip_rejects_rocm_6(self):
+        with tempfile.TemporaryDirectory(prefix="vc-reader-hip-package-") as directory:
+            package = Path(directory)
+            (package / "hip-config.cmake").touch()
+            (package / "hip-config-version.cmake").write_text('set(PACKAGE_VERSION "6.4.3")\n')
+            result = self.configure(False, "-DVC_READER_ENABLE_HIP=ON",
+                                    "-DCMAKE_HIP_ARCHITECTURES=gfx1100",
+                                    f"-Dhip_DIR={package}", success=False)
+        self.assertIn("requires ROCm 7.0 or newer (found HIP 6.4.3)", result.stdout + result.stderr)
+
     def cuda_compiler(self):
         compiler = os.environ.get("CUDACXX") or shutil.which("nvcc")
         if not compiler:

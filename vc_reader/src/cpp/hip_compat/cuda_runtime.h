@@ -7,16 +7,15 @@
 // line here when new code uses another CUDA runtime name.
 #pragma once
 
-// ROCm 6.2-6.4 expose the *_sync warp functions only on request; 7.x always does.
-#ifndef HIP_ENABLE_WARP_SYNC_BUILTINS
-#define HIP_ENABLE_WARP_SYNC_BUILTINS 1
-#endif
-
 #if defined(__HIP__)
 #include <hip/hip_runtime.h>
 #else
 // Host translation units built by the C++ compiler only need the runtime API.
 #include <hip/hip_runtime_api.h>
+#endif
+
+#if HIP_VERSION_MAJOR < 7
+#error "vc_reader requires ROCm 7.0 or newer"
 #endif
 
 // Version checks in vc_reader gate stream-ordered allocation (11.2) and
@@ -31,12 +30,6 @@
 // already read in place, so it expands to nothing.
 #ifndef __grid_constant__
 #define __grid_constant__
-#endif
-
-// ROCm before 6.x has no named legacy stream; its null stream has the legacy
-// (synchronizing) semantics.
-#ifndef hipStreamLegacy
-#define hipStreamLegacy ((hipStream_t)0)
 #endif
 
 // Types and constants.
@@ -98,7 +91,6 @@
 // upper half of the mask, so the lanes are the same as in CUDA. Overload
 // resolution prefers them for unsigned masks; 64-bit masks reach HIP's own.
 #if defined(__HIP__)
-#if HIP_VERSION_MAJOR > 6 || (HIP_VERSION_MAJOR == 6 && HIP_VERSION_MINOR >= 2)
 __device__ inline unsigned long long __ballot_sync(unsigned int mask, int predicate) {
     return __ballot_sync(static_cast<unsigned long long>(mask), predicate);
 }
@@ -112,7 +104,7 @@ template<class T> __device__ inline unsigned long long __match_any_sync(unsigned
     return __match_any_sync(static_cast<unsigned long long>(mask), value);
 }
 __device__ inline void __syncwarp(unsigned int mask) {
-    __syncwarp(static_cast<unsigned long long>(mask));
+    __syncwarp<unsigned long long>(mask);
 }
 template<class T> __device__ inline T __shfl_sync(unsigned int mask, T var, int src_lane, int width = warpSize) {
     return __shfl_sync(static_cast<unsigned long long>(mask), var, src_lane, width);
@@ -126,18 +118,4 @@ template<class T> __device__ inline T __shfl_down_sync(unsigned int mask, T var,
 template<class T> __device__ inline T __shfl_xor_sync(unsigned int mask, T var, int lane_mask, int width = warpSize) {
     return __shfl_xor_sync(static_cast<unsigned long long>(mask), var, lane_mask, width);
 }
-#else
-// ROCm before 6.2 has no *_sync functions. Lanes of a wavefront run in
-// lockstep, so the unsynchronized forms apply, with ballots limited to the mask
-// as the *_sync forms are.
-#define __ballot_sync(mask, predicate) (__ballot(predicate) & static_cast<unsigned long long>(mask))
-#define __any_sync(mask, predicate) ((__ballot(predicate) & static_cast<unsigned long long>(mask)) != 0)
-#define __all_sync(mask, predicate) ((__ballot(predicate) & static_cast<unsigned long long>(mask)) == static_cast<unsigned long long>(mask))
-#define __shfl_sync(mask, ...) __shfl(__VA_ARGS__)
-#define __shfl_up_sync(mask, ...) __shfl_up(__VA_ARGS__)
-#define __shfl_down_sync(mask, ...) __shfl_down(__VA_ARGS__)
-#define __shfl_xor_sync(mask, ...) __shfl_xor(__VA_ARGS__)
-#define __activemask() __ballot(1)
-#define __syncwarp(...) __builtin_amdgcn_wave_barrier()
-#endif
 #endif
