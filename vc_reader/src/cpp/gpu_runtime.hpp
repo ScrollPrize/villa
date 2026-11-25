@@ -47,6 +47,7 @@ inline constexpr auto set_pool_attribute = VCR_GPU_SYMBOL(hipMemPoolSetAttribute
 inline constexpr auto free = VCR_GPU_SYMBOL(hipFree, cudaFree);
 inline constexpr auto free_host = VCR_GPU_SYMBOL(hipHostFree, cudaFreeHost);
 inline constexpr auto memcpy_async = VCR_GPU_SYMBOL(hipMemcpyAsync, cudaMemcpyAsync);
+inline constexpr auto memset_async = VCR_GPU_SYMBOL(hipMemsetAsync, cudaMemsetAsync);
 inline constexpr auto stream_synchronize = VCR_GPU_SYMBOL(hipStreamSynchronize, cudaStreamSynchronize);
 inline constexpr auto stream_wait_event = VCR_GPU_SYMBOL(hipStreamWaitEvent, cudaStreamWaitEvent);
 inline constexpr auto event_create = VCR_GPU_SYMBOL(hipEventCreateWithFlags, cudaEventCreateWithFlags);

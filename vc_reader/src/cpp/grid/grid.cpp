@@ -727,8 +727,8 @@ Result sampleDevice(int width, int height, const Request& request, const std::ve
                     lackingSet.count = reinterpret_cast<unsigned*>(base + table + std::size_t(kLackingCapacity) * sizeof(long long));
                     lackingSet.capacity = kLackingCapacity;
                 }
-                device::check(cudaMemsetAsync(lackingSet.table, 0xFF, table, device::stream()));
-                device::check(cudaMemsetAsync(lackingSet.count, 0, sizeof(unsigned), device::stream()));
+                device::check(gpu::memset_async(lackingSet.table, 0xFF, table, device::stream()));
+                device::check(gpu::memset_async(lackingSet.count, 0, sizeof(unsigned), device::stream()));
             }
             const auto table = upload(host.data(), host.size() * sizeof(cuda_detail::DeviceLevel), deviceId);
             cuda_detail::Params P = base;
