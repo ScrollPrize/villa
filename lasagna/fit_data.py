@@ -407,10 +407,16 @@ def _device_f32(values, device: torch.device) -> torch.Tensor:
 	"""
 	key = (str(device), tuple(float(v) for v in values))
 	t = _DEVICE_F32.get(key)
-	if t is None:
+	if t is not None:
+		return t
+
+	# an entry first made under inference_mode would be an inference tensor, which a later differentiable
+	# sample could not save for backward; a normal tensor works in both modes
+	with torch.inference_mode(False):
 		t = torch.tensor(key[1], dtype=torch.float32, device=device)
-		_DEVICE_F32[key] = t
+	_DEVICE_F32[key] = t
 	return t
+
 
 @dataclass(frozen=True)
 class FitData3D:
