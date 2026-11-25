@@ -19,6 +19,7 @@ from tqdm.auto import tqdm
 from torch.utils.data import DataLoader
 from vesuvius.utils.models.load_nnunet_model import load_model_for_inference
 from vesuvius.models.utilities.get_accelerator import get_accelerator
+from vesuvius.models.utilities.mps_conv3d import speed_up_3d_convs_on_mps
 from vesuvius.data.vc_dataset import VCDataset
 from vc_reader.reader import ObjectStore, ZarrWriter, open_zarr
 from pathlib import Path
@@ -632,6 +633,9 @@ class Inferer():
             except Exception as e:
                 raise RuntimeError(f"Warning: Could not automatically determine number of classes via dummy inference: {e}. \nEnsure your model is loaded correctly and check the expected input shape")
             
+        swapped = speed_up_3d_convs_on_mps(model, self.device)
+        if self.verbose and swapped:
+            print(f"MPS: running {swapped} 3D convolutions through 2D kernels")
         return model
     
     def _load_train_py_model(self, checkpoint_path):
