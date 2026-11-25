@@ -411,7 +411,8 @@ ProjectWorkspace::ProjectWorkspace(CState* state, MenuActionController* menu, QW
 
     _measure = new QFutureWatcher<QHash<QString, quint64>>(this);
     connect(_measure, &QFutureWatcher<QHash<QString, quint64>>::finished, this, [this]() {
-        for (auto [path, size] : _measure->result().asKeyValueRange()) _cacheBytes[path] = size;
+        const auto sizes = _measure->result();
+        for (auto it = sizes.keyValueBegin(); it != sizes.keyValueEnd(); ++it) _cacheBytes[it->first] = it->second;
         _measureCaches->setEnabled(true);
         _measureCaches->setText(tr("Measure Volume Caches"));
         rebuildResources();

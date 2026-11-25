@@ -3,7 +3,7 @@
 #include "OpenedVolumes.hpp"
 #include "support/TestVolume.hpp"
 #include <QTemporaryDir>
-#include <QTest>
+#include "support/QtTestCompat.hpp"
 #include <cmath>
 
 using namespace vc3d::fibers3d;

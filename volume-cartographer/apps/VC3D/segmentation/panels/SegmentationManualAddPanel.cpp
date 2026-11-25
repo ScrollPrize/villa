@@ -231,7 +231,9 @@ void SegmentationManualAddPanel::setGrowMode(bool grow)
                            static_cast<QWidget*>(_spinPreviewThrottle),
                            static_cast<QWidget*>(_comboLinePreviewMode),
                            static_cast<QWidget*>(_comboInterpolationMode)}) {
-        _form->setRowVisible(field, !grow);
+        // Qt 6.2 has no QFormLayout::setRowVisible: hide the field and its label.
+        field->setVisible(!grow);
+        if (QWidget* label = _form->labelForField(field)) label->setVisible(!grow);
     }
 }
 
