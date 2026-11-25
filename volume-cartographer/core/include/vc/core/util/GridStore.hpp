@@ -38,16 +38,19 @@ public:
     explicit GridStore(const std::string& path);
     // A read-only store over a remote file read a part at a time: each query
     // first fetches what its region needs (see RemoteGridFile). Its `meta` is
-    // not read.
-    explicit GridStore(std::shared_ptr<RemoteGridFile> remote);
+    // not read. When a region cannot be fetched (after a retry), or the
+    // remote file changed version, `whole_file` loads the file whole
+    // the usual way, and this store answers every later query from that copy,
+    // so a slice is read from one version. Without it, or when it fails too,
+    // the failure is reported and the region reads as empty, as a whole-file
+    // store does when its download fails.
+    explicit GridStore(std::shared_ptr<RemoteGridFile> remote,
+                       std::function<std::shared_ptr<const GridStore>()> whole_file = {});
     ~GridStore();
 
     void add(const std::vector<cv::Point>& points);
     std::vector<std::shared_ptr<std::vector<cv::Point>>> get(const cv::Rect& query_rect) const;
     std::vector<std::shared_ptr<std::vector<cv::Point>>> get(const cv::Point2f& center, float radius) const;
-    // Fetch what queries inside `rect` will read, ahead of them. A no-op for
-    // a store that is not remote.
-    void prefetch(const cv::Rect& rect) const;
     void forEach(const cv::Rect& query_rect,
                  QueryScratch& scratch,
                  const std::function<void(const std::shared_ptr<std::vector<cv::Point>>&)>& visitor) const;
@@ -61,6 +64,8 @@ public:
     // grow as the store is used; each keeps a running byte count, so for a
     // mapped store this is O(1).
     size_t residentBytes() const;
+    // Bytes held in memory for a store read a part at a time (0 for others).
+    size_t remoteResidentBytes() const;
     size_t numSegments() const;
     size_t numNonEmptyBuckets() const;
     CacheStats cacheStats() const;

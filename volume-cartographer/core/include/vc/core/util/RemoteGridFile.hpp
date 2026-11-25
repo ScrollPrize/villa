@@ -74,8 +74,9 @@ public:
         uint64_t min_free_bytes = 0;            // below this much free disk, write no pack
         bool in_memory = false;                 // never write a pack to disk
         // Charges the bytes the pack file occupies to the cache's disk budget
-        // (false: it does not fit). Called before a pack is created (one that
-        // does not fit is not written), as it grows, and when closed.
+        // (false: it does not fit). Called with the new size before every
+        // write (a write that does not fit is not made, and the pack stops
+        // growing), and again when a pack is reused.
         std::function<bool(const std::string& path, uint64_t bytes)> charge;
     };
 
@@ -95,6 +96,8 @@ public:
     bool inMemory() const { return in_memory_; }  // no pack on disk
     // Bytes of the file held in memory (fetched or replayed, each byte once).
     uint64_t residentBytes() const { return resident_.load(); }
+    // residentBytes() of every RemoteGridFile alive in this process.
+    static uint64_t residentTotal();
 
     // Make the buckets [x0..x1] x [y0..y1] (inclusive) readable: their index
     // entries, their path offsets and every path record they name. Throws
@@ -128,6 +131,7 @@ private:
     // Appends the pieces not in the pack yet and then `tail` (records) in one write.
     void commit(const Pieces& pieces, const std::string& tail);
     bool writePack(const std::string& records);  // a new pack, renamed into place
+    bool admit(uint64_t total, uint64_t growth);  // the pack may grow to `total` bytes
     void chargePack();
 
     std::string url_;
@@ -136,7 +140,6 @@ private:
     std::string version_;
     bool in_memory_ = false;
     std::function<bool(const std::string&, uint64_t)> charge_;
-    std::atomic<uint64_t> uncharged_{0};  // bytes appended since the last charge
     void* map_ = nullptr;
     size_t size_ = 0;
 

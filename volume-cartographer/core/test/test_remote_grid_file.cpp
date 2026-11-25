@@ -14,6 +14,8 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
+#include <map>
 #include <mutex>
 #include <random>
 #include <sstream>
@@ -357,11 +359,12 @@ TEST_CASE("Remote grid: a failed read is reported, not cached, and fetched again
         GridStore once(std::make_shared<RemoteGridFile>("test://grid", (s.dir / ("f" + std::to_string(failAt)) / "g.grid").string(),
                                                         flaky, RemoteGridFile::Options{}));
         calls = 0;
-        CHECK(once.get(at, 80).empty());
+        // The failed step is fetched again within the same query.
         CHECK(points(once.get(at, 80)) == points(whole.get(at, 80)));
+        CHECK(calls > failAt);
         CHECK_FALSE(whole.get(at, 80).empty());
     }
-    CHECK(RemoteGridFile::globalStats().failures == failures + 3);
+    CHECK(RemoteGridFile::globalStats().failures == failures);  // recovered, so nothing reported
     (void)partial;
 
     // What the retries completed is whole in the packs: a later opener reads
@@ -581,4 +584,181 @@ TEST_CASE("Remote grid: concurrent queries and concurrent openers of one mirror"
         });
     for (auto& thread : threads) thread.join();
     CHECK(mismatches == 0);
+}
+
+TEST_CASE("Remote grid: a region that fails to arrive is recovered, never read as empty")
+{
+    Scratch s;
+    Remote remote;
+    remote.bytes = makeGrid(s.dir / "whole.grid", 11);
+    GridStore whole((s.dir / "whole.grid").string());
+    const auto rects = randomRects(12, 40);
+
+    SUBCASE("a one-off failure is fetched again")
+    {
+        GridStore store(open(remote, s.dir / "mirror" / "000000.grid"));
+        for (const auto& rect : rects) {
+            remote.failNext = 1;
+            CHECK(points(store.get(rect)) == points(whole.get(rect)));
+        }
+    }
+
+    SUBCASE("persistent range failures fall back to reading the file whole")
+    {
+        int wholeReads = 0;
+        GridStore store(open(remote, s.dir / "mirror" / "000000.grid"), [&]() -> std::shared_ptr<const GridStore> {
+            ++wholeReads;
+            return std::make_shared<GridStore>((s.dir / "whole.grid").string());
+        });
+        remote.failNext = 1 << 30;
+        for (const auto& rect : rects) CHECK(points(store.get(rect)) == points(whole.get(rect)));
+        CHECK(store.numSegments() == whole.numSegments());
+        CHECK(points(store.get_all()).size() == points(whole.get_all()).size());
+        CHECK(wholeReads == 1);  // switched once, then every query reads the whole copy
+    }
+
+    SUBCASE("a remote file that changed version is read whole at its new version, not mixed")
+    {
+        auto mirror = open(remote, s.dir / "mirror" / "000000.grid");
+        const std::string v2 = makeGrid(s.dir / "v2.grid", 13);
+        GridStore newer((s.dir / "v2.grid").string());
+        GridStore store(mirror, [&]() -> std::shared_ptr<const GridStore> {
+            return std::make_shared<GridStore>((s.dir / "v2.grid").string());
+        });
+        {
+            std::lock_guard lock(remote.mutex);
+            remote.bytes = v2;
+            remote.version = "v2";
+        }
+        for (const auto& rect : rects) CHECK(points(store.get(rect)) == points(newer.get(rect)));
+    }
+
+    SUBCASE("without a fallback the failure is reported, and the region is fetched again later")
+    {
+        GridStore store(open(remote, s.dir / "mirror" / "000000.grid"));
+        const auto failuresBefore = RemoteGridFile::globalStats().failures;
+        remote.failNext = 1 << 30;
+        CHECK(store.get(rects[0]).empty());
+        CHECK(RemoteGridFile::globalStats().failures > failuresBefore);
+        remote.failNext = 0;
+        CHECK(points(store.get(rects[0])) == points(whole.get(rects[0])));
+    }
+}
+
+namespace {
+// A disk budget like vc_reader's: each file is charged its whole size, and a
+// size the limit cannot take is refused.
+struct Budget {
+    std::mutex mutex;
+    std::map<std::string, uint64_t> charged;
+    uint64_t limit;
+    explicit Budget(uint64_t limit) : limit(limit) {}
+    std::function<bool(const std::string&, uint64_t)> charge()
+    {
+        return [this](const std::string& path, uint64_t bytes) {
+            std::lock_guard lock(mutex);
+            uint64_t others = 0;
+            for (const auto& [p, b] : charged) if (p != path) others += b;
+            if (others + bytes > limit) return false;
+            charged[path] = bytes;
+            return true;
+        };
+    }
+    // Every pack on disk is within what was charged for it, and the charges within the limit.
+    void check(const std::vector<fs::path>& packs)
+    {
+        std::lock_guard lock(mutex);
+        uint64_t total = 0;
+        for (const auto& [p, b] : charged) total += b;
+        CHECK(total <= limit);
+        for (const auto& pack : packs) {
+            std::error_code ec;
+            const auto size = fs::file_size(pack, ec);
+            if (ec) continue;  // never written
+            INFO(pack.string());
+            CHECK(size <= charged[pack.string()]);
+        }
+    }
+};
+}  // namespace
+
+TEST_CASE("Remote grid: a pack never holds more than its budget accepted")
+{
+    Scratch s;
+    Remote remote;
+    remote.bytes = makeGrid(s.dir / "whole.grid", 21);
+    GridStore whole((s.dir / "whole.grid").string());
+
+    SUBCASE("one writer under a 16 KiB budget")
+    {
+        Budget budget(16 << 10);
+        RemoteGridFile::Options options;
+        options.charge = budget.charge();
+        const auto local = s.dir / "m" / "000000.grid";
+        GridStore store(open(remote, local, options));
+        for (const auto& rect : randomRects(22, 60)) {
+            CHECK(points(store.get(rect)) == points(whole.get(rect)));  // answers come from memory
+            budget.check({fs::path(local.string() + ".ranges")});
+        }
+    }
+
+    SUBCASE("concurrent writers sharing a budget")
+    {
+        Budget budget(96 << 10);
+        RemoteGridFile::Options options;
+        options.charge = budget.charge();
+        std::vector<fs::path> packs;
+        std::vector<std::unique_ptr<GridStore>> stores;
+        for (int i = 0; i < 3; ++i) {
+            const auto local = s.dir / ("w" + std::to_string(i)) / "000000.grid";
+            packs.push_back(local.string() + ".ranges");
+            stores.push_back(std::make_unique<GridStore>(open(remote, local, options)));
+        }
+        std::vector<std::thread> threads;
+        std::atomic<int> wrong{0};
+        for (int t = 0; t < 6; ++t)
+            threads.emplace_back([&, t] {
+                for (const auto& rect : randomRects(30 + t, 40))
+                    if (points(stores[t % 3]->get(rect)) != points(whole.get(rect))) ++wrong;
+            });
+        for (auto& thread : threads) thread.join();
+        CHECK(wrong == 0);
+        budget.check(packs);
+    }
+
+    SUBCASE("a budget that throws stops the pack, not the queries")
+    {
+        RemoteGridFile::Options options;
+        std::atomic<int> calls{0};
+        options.charge = [&](const std::string&, uint64_t) -> bool {
+            if (++calls > 1) throw std::runtime_error("database is locked");
+            return true;
+        };
+        GridStore store(open(remote, s.dir / "t" / "000000.grid", options));
+        for (const auto& rect : randomRects(23, 20)) CHECK(points(store.get(rect)) == points(whole.get(rect)));
+    }
+}
+
+TEST_CASE("Remote grid: under the free-space floor a pack on disk is still read, and not grown")
+{
+    Scratch s;
+    Remote remote;
+    remote.bytes = makeGrid(s.dir / "whole.grid", 24);
+    GridStore whole((s.dir / "whole.grid").string());
+    const auto local = s.dir / "m" / "000000.grid";
+    const auto rects = randomRects(25, 20);
+    {
+        GridStore first(open(remote, local));
+        for (const auto& rect : rects) (void)first.get(rect);
+    }
+    const auto pack = fs::path(local.string() + ".ranges");
+    const auto packed = fs::file_size(pack);
+    remote.requests = 0;
+    RemoteGridFile::Options starved;
+    starved.min_free_bytes = std::numeric_limits<uint64_t>::max() / 2;  // always below the floor
+    GridStore again(open(remote, local, starved));
+    for (const auto& rect : rects) CHECK(points(again.get(rect)) == points(whole.get(rect)));
+    CHECK(remote.requests == 0);  // all from the pack
+    for (const auto& rect : randomRects(26, 20)) CHECK(points(again.get(rect)) == points(whole.get(rect)));
+    CHECK(fs::file_size(pack) == packed);  // new regions stay in memory
 }

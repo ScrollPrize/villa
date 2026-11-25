@@ -15,6 +15,7 @@
 #include <vc_reader/zarr.hpp>
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
@@ -24,6 +25,24 @@
 #include <mutex>
 #include <string>
 #include <vector>
+
+#include <dlfcn.h>
+#include <pthread.h>
+
+// Thread starts made by the thread that set threadStartsToFail fail with EAGAIN
+// while it is > 0 (this program's pthread_create is found before libc's, so
+// std::thread uses it too). Other threads -- the loopback server's -- start as usual.
+static thread_local int threadStartsToFail = 0;
+extern "C" int pthread_create(pthread_t* thread, const pthread_attr_t* attr, void* (*start)(void*), void* arg)
+{
+    using Create = int (*)(pthread_t*, const pthread_attr_t*, void* (*)(void*), void*);
+    static const auto real = reinterpret_cast<Create>(dlsym(RTLD_NEXT, "pthread_create"));
+    if (threadStartsToFail > 0) {
+        --threadStartsToFail;
+        return EAGAIN;
+    }
+    return real(thread, attr, start, arg);
+}
 
 namespace fs = std::filesystem;
 using vc::core::util::NormalGridVolume;
@@ -321,4 +340,126 @@ TEST_CASE("Range reads: under the free-space floor grids are read into memory, n
     CHECK(vc::core::util::RemoteGridFile::globalStats().inMemory > inMemory);
     CHECK_FALSE(fs::exists(s.dir / "xz" / "000000.grid"));
     CHECK_FALSE(fs::exists(s.dir / "xz" / "000000.grid.ranges"));
+}
+
+TEST_CASE("Range reads: when a grid's regions stop arriving, the grid is read whole, never as empty")
+{
+    Streamed s;
+    RangeReads on;
+    // A slice big enough that later regions need requests of their own.
+    {
+        vc::core::util::GridStore big(cv::Rect(0, 0, 4000, 3000), 32);
+        for (int y = 5; y < 3000; y += 37)
+            for (int x = 5; x < 4000; x += 41) big.add({cv::Point(x, y), cv::Point(x + 6, y + 3), cv::Point(x + 12, y + 1)});
+        big.save((s.store / "xy" / gridName(5)).string());
+    }
+    std::atomic<bool> failRanges{false};
+    std::atomic<int> failed{0}, wholeGets{0};
+    s.server.setHandler([&](const LoopbackHttpServer::Request& request) -> std::optional<LoopbackHttpServer::Response> {
+        if (request.path != "/ng/xy/" + gridName(5)) return std::nullopt;
+        if (request.header("range").empty()) ++wholeGets;
+        else if (failRanges) {
+            ++failed;
+            return LoopbackHttpServer::Response{500, "range reads are down", {}, false};
+        }
+        return std::nullopt;
+    });
+    vc::core::util::GridStore whole((s.store / "xy" / gridName(5)).string());
+    NormalGridVolume volume(s.dir.string());
+    const auto grid = volume.get_grid(0, 5);  // opened by range reads
+    REQUIRE(grid != nullptr);
+    CHECK(wholeGets == 0);
+    failRanges = true;
+    for (const auto& rect : {cv::Rect(3000, 2000, 300, 300), cv::Rect(100, 2500, 200, 200), cv::Rect(0, 0, 4000, 3000)}) {
+        const auto got = points(grid->get(rect));
+        CHECK_FALSE(got.empty());
+        CHECK(got == points(whole.get(rect)));
+    }
+    CHECK(failed > 0);
+    CHECK(wholeGets == 1);  // read whole once, then every query answered from it
+    CHECK(fs::is_regular_file(s.dir / "xy" / gridName(5)));
+}
+
+// Runs `work` on its own thread; nullopt when it has not finished within `limit`
+// (the thread is left behind, so a hang fails the test instead of stalling it).
+template <class Work>
+std::optional<std::vector<std::vector<cv::Point>>> within(std::chrono::seconds limit, Work work)
+{
+    auto done = std::make_shared<std::promise<std::vector<std::vector<cv::Point>>>>();
+    auto result = done->get_future();
+    std::thread([done, work] { done->set_value(work()); }).detach();
+    if (result.wait_for(limit) != std::future_status::ready) return std::nullopt;
+    return result.get();
+}
+
+TEST_CASE("Range reads: when threads cannot start, queries still answer and the volume closes")
+{
+    Streamed s;
+    RangeReads on;
+    auto query = [&](int fail, float z) {
+        return [&s, fail, z] {
+            NormalGridVolume volume(s.dir.string());
+            threadStartsToFail = fail;
+            const auto grid = volume.query_nearest(cv::Point3f(5.f, 5.f, z), 0);
+            auto got = grid ? points(grid->get(cv::Rect(0, 0, 100, 100))) : std::vector<std::vector<cv::Point>>{};
+            threadStartsToFail = 0;
+            return got;  // the volume closes here, waiting for its read-ahead
+        };
+    };
+    auto expected = [&](int slice) {
+        vc::core::util::GridStore whole((s.store / "xy" / gridName(slice)).string());
+        return points(whole.get(cv::Rect(0, 0, 100, 100)));
+    };
+    // Every slice already read whole: read-ahead has nothing to do.
+    fs::create_directories(s.dir / "xy");
+    for (int slice = 0; slice < 8; ++slice) fs::copy_file(s.store / "xy" / gridName(slice), s.dir / "xy" / gridName(slice));
+    for (const int fail : {1, 1 << 20}) {
+        const auto got = within(std::chrono::seconds(10), query(fail, 3.f));
+        REQUIRE(got.has_value());
+        CHECK(*got == expected(3));
+    }
+    // Nothing read yet, and no thread can start: the query reads what it needs itself.
+    for (int slice = 0; slice < 8; ++slice) fs::remove(s.dir / "xy" / gridName(slice));
+    const auto got = within(std::chrono::seconds(30), query(1 << 20, 6.f));
+    REQUIRE(got.has_value());
+    CHECK(*got == expected(6));
+}
+
+TEST_CASE("Range reads: files that grow after they are opened stay within the memory cap")
+{
+    Streamed s;
+    RangeReads on;
+    constexpr int first = 20, count = 8;
+    for (int slice = first; slice < first + count; ++slice) {
+        vc::core::util::GridStore big(cv::Rect(0, 0, 4000, 3000), 32);
+        for (int y = 5 + slice; y < 3000; y += 37)
+            for (int x = 5; x < 4000; x += 41) big.add({cv::Point(x, y), cv::Point(x + 6, y + 3), cv::Point(x + 12, y + 1)});
+        big.save((s.store / "xy" / gridName(slice)).string());
+    }
+    const uint64_t slice_bytes = fs::file_size(s.store / "xy" / gridName(first));
+    const uint64_t cap = 2 * slice_bytes;
+    setenv("VC_NORMAL_GRID_RANGE_MEMORY_BYTES", std::to_string(cap).c_str(), 1);
+    using vc::core::util::RemoteGridFile;
+    const uint64_t baseline = RemoteGridFile::residentTotal();
+    {
+        NormalGridVolume volume(s.dir.string());
+        // A whole-slice reader (as vc_gen_umbilicus reads every slice): each
+        // grid opens small, then grows to the whole file, and is let go.
+        for (int slice = first; slice < first + count; ++slice) {
+            auto grid = volume.get_grid(0, slice);
+            REQUIRE(grid != nullptr);
+            vc::core::util::GridStore whole((s.store / "xy" / gridName(slice)).string());
+            CHECK(points(grid->get_all()).size() == points(whole.get_all()).size());
+            grid.reset();
+            // At most the cap, its trim step, and the slice just read.
+            CHECK(RemoteGridFile::residentTotal() - baseline <= cap + cap / 16 + slice_bytes);
+        }
+        // A grid a query still holds is kept, and still answers.
+        auto held = volume.get_grid(0, first);
+        for (int slice = first + 1; slice < first + count; ++slice) (void)volume.get_grid(0, slice)->get_all();
+        vc::core::util::GridStore whole((s.store / "xy" / gridName(first)).string());
+        CHECK(points(held->get(cv::Rect(0, 0, 4000, 3000))) == points(whole.get(cv::Rect(0, 0, 4000, 3000))));
+        CHECK(RemoteGridFile::residentTotal() - baseline <= cap + cap / 16 + 2 * slice_bytes);
+    }
+    unsetenv("VC_NORMAL_GRID_RANGE_MEMORY_BYTES");
 }

@@ -6,6 +6,8 @@
 #include <chrono>
 #include <cstring>
 #include <functional>
+#include <iostream>
+#include <mutex>
 #include <optional>
 #include <random>
 #include <limits>
@@ -146,12 +148,13 @@ public:
             if (remote_) {
                 // Buckets that could not be fetched are not read: GridStore
                 // caches what it decodes, and their bytes are not in place.
-                try {
-                    remote_->ensureBuckets(range.startX, range.startY, range.endX, range.endY);
-                } catch (const std::exception& e) {
-                    RemoteGridFile::reportFailure(remote_->url() + ": " + e.what());
+                bool failed = false;
+                if (const GridStore* whole = fetched_or_whole(
+                        [&] { remote_->ensureBuckets(range.startX, range.startY, range.endX, range.endY); }, &failed)) {
+                    whole->pimpl_->collect_query_results(query_rect, scratch);
                     return;
                 }
+                if (failed) return;
             }
             for (int y = range.startY; y <= range.endY; ++y) {
                 for (int x = range.startX; x <= range.endX; ++x) {
@@ -218,7 +221,12 @@ public:
     std::vector<std::shared_ptr<std::vector<cv::Point>>> get_all() const {
         std::vector<std::shared_ptr<std::vector<cv::Point>>> result;
         if (read_only_) {
-            if (remote_) remote_->ensureAll();
+            if (remote_) {
+                bool failed = false;
+                if (const GridStore* whole = fetched_or_whole([&] { remote_->ensureAll(); }, &failed))
+                    return whole->get_all();
+                if (failed) return result;
+            }
             std::unordered_set<size_t> all_offsets;
             size_t num_buckets = grid_size_.width * grid_size_.height;
             for(size_t i = 0; i < num_buckets; ++i) {
@@ -242,6 +250,10 @@ public:
 
     cv::Size size() const {
         return bounds_.size();
+    }
+
+    size_t remote_resident_bytes() const {
+        return remote_ ? remote_->residentBytes() : 0;
     }
 
     size_t mapped_bytes() const {
@@ -273,7 +285,12 @@ public:
 
     size_t numSegments() const {
         if (read_only_) {
-            if (remote_) remote_->ensureAll();
+            if (remote_) {
+                bool failed = false;
+                if (const GridStore* whole = fetched_or_whole([&] { remote_->ensureAll(); }, &failed))
+                    return whole->numSegments();
+                if (failed) return 0;
+            }
             std::unordered_set<size_t> all_offsets;
             size_t num_buckets = grid_size_.width * grid_size_.height;
             for(size_t i = 0; i < num_buckets; ++i) {
@@ -472,20 +489,11 @@ public:
         }
     }
 
-    void prefetch(const cv::Rect& rect) const {
-        if (!remote_) return;
-        const QueryBucketRange range = queryBucketRange(rect);
-        if (range.empty) return;
-        try {
-            remote_->ensureBuckets(range.startX, range.startY, range.endX, range.endY, /*foreground=*/false);
-        } catch (const std::exception&) {
-            // The query that needs these buckets fetches them again and reports a failure.
-        }
-    }
-
-    void load_remote(std::shared_ptr<RemoteGridFile> remote) {
+    void load_remote(std::shared_ptr<RemoteGridFile> remote,
+                     std::function<std::shared_ptr<const GridStore>()> whole_file) {
         read_only_ = true;
         remote_ = std::move(remote);
+        whole_loader_ = std::move(whole_file);
         mmapped_data_ = std::make_unique<MmappedData>();
         mmapped_data_->data = remote_->data();
         mmapped_data_->size = remote_->size();
@@ -916,6 +924,55 @@ private:
     uint32_t buckets_offset_in_file_;
     std::unique_ptr<MmappedData> mmapped_data_;
     std::shared_ptr<RemoteGridFile> remote_;
+    // A remote store whose region could not be fetched switches, once, to the
+    // file read whole (whole_loader_); whole_ then answers every query.
+    std::function<std::shared_ptr<const GridStore>()> whole_loader_;
+    mutable std::mutex whole_mutex_;
+    mutable std::shared_ptr<const GridStore> whole_;
+    mutable bool whole_tried_ = false;
+
+    // Runs `ensure` (fetch what a read needs) for a remote store. Returns the
+    // store to read instead, when this one has switched to the whole file;
+    // null to read this one, or, with *failed set, nothing (reported).
+    // A failed fetch is retried once; then, or straight away when the remote
+    // file changed version, the file is loaded whole the usual way (which
+    // treats a corrupt file as a whole-file store does).
+    const GridStore* fetched_or_whole(const std::function<void()>& ensure, bool* failed) const {
+        *failed = false;
+        {
+            std::lock_guard<std::mutex> lock(whole_mutex_);
+            if (whole_) return whole_.get();
+        }
+        std::string why;
+        bool changed = false;
+        for (int attempt = 0; attempt < 2 && !changed; ++attempt) {
+            try {
+                ensure();
+                return nullptr;
+            } catch (const RemoteGridFile::Changed& e) {
+                why = e.what();
+                changed = true;
+            } catch (const std::exception& e) {
+                why = e.what();
+            }
+        }
+        std::lock_guard<std::mutex> lock(whole_mutex_);
+        if (!whole_ && !whole_tried_ && whole_loader_) {
+            whole_tried_ = true;
+            try {
+                whole_ = whole_loader_();
+            } catch (const std::exception& e) {
+                why += std::string("; reading it whole: ") + e.what();
+            }
+            if (whole_) std::cerr << "normal grid " << remote_->url() << ": range read failed (" << why
+                                  << "), read it whole instead" << std::endl;
+        }
+        if (whole_) return whole_.get();
+        RemoteGridFile::reportFailure(remote_->url() + ": " + why);
+        *failed = true;
+        return nullptr;
+    }
+
     mutable std::mutex bucket_mutex_;
     mutable std::mutex seglist_mutex_;
     mutable std::unordered_map<size_t, SegCacheEntry> seglist_cache_;
@@ -953,13 +1010,10 @@ GridStore::GridStore(const std::string& path)
     meta = pimpl_->meta_;
 }
 
-GridStore::GridStore(std::shared_ptr<RemoteGridFile> remote)
+GridStore::GridStore(std::shared_ptr<RemoteGridFile> remote,
+                     std::function<std::shared_ptr<const GridStore>()> whole_file)
     : pimpl_(std::make_unique<GridStoreImpl>(cv::Rect(), 1)) {
-    pimpl_->load_remote(std::move(remote));
-}
-
-void GridStore::prefetch(const cv::Rect& rect) const {
-    pimpl_->prefetch(rect);
+    pimpl_->load_remote(std::move(remote), std::move(whole_file));
 }
 
 GridStore::~GridStore() = default;
@@ -1001,6 +1055,10 @@ size_t GridStore::get_memory_usage() const {
 
 size_t GridStore::residentBytes() const {
     return pimpl_->mapped_bytes() + pimpl_->get_memory_usage();
+}
+
+size_t GridStore::remoteResidentBytes() const {
+    return pimpl_->remote_resident_bytes();
 }
 
 size_t GridStore::numSegments() const {

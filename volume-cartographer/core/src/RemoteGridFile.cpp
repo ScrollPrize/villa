@@ -10,12 +10,14 @@
 #include <iostream>
 #include <random>
 
+namespace fs = std::filesystem;
+
+#ifndef _WIN32
+
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
-
-namespace fs = std::filesystem;
 
 namespace vc::core::util {
 
@@ -196,6 +198,15 @@ bool belowFloor(const fs::path& dir, uint64_t min_free_bytes, uint64_t needed)
 }
 }  // namespace
 
+namespace {
+std::atomic<uint64_t> g_resident{0};
+}
+
+uint64_t RemoteGridFile::residentTotal()
+{
+    return g_resident.load(std::memory_order_relaxed);
+}
+
 RemoteGridFile::Stats RemoteGridFile::globalStats()
 {
     return {g_requests.load(), g_bytes.load(), g_tiles_loaded.load(), g_tiles_reused.load(), g_opens.load(),
@@ -221,12 +232,19 @@ RemoteGridFile::RemoteGridFile(std::string url, const std::string& local_path, R
     ++g_opens;
     const fs::path dir = fs::path(local_path).parent_path();
     in_memory_ = options.in_memory;
+    bool below_floor = false;
     if (!in_memory_) {
         std::error_code ec;
         fs::create_directories(dir, ec);
-        in_memory_ = ec || belowFloor(dir, options.min_free_bytes, 0);
+        in_memory_ = bool(ec);
+        below_floor = !in_memory_ && belowFloor(dir, options.min_free_bytes, 0);
     }
-    if (in_memory_ || !reuse()) create(options);
+    // A pack already on disk is read even under the free-space floor (it is
+    // then not written to: see chargePack); a new one is kept in memory.
+    if (in_memory_ || !reuse()) {
+        in_memory_ = in_memory_ || below_floor;
+        create(options);
+    }
 
     const char* h = data();
     cell_ = be32(h + 24);
@@ -250,12 +268,7 @@ RemoteGridFile::RemoteGridFile(std::string url, const std::string& local_path, R
 RemoteGridFile::~RemoteGridFile()
 {
     if (map_) ::munmap(map_, size_);
-    if (uncharged_ > 0) {
-        try {
-            chargePack();
-        } catch (...) {
-        }
-    }
+    g_resident -= resident_.load();
 }
 
 // Charges what the pack occupies now (other processes may append to it too).
@@ -263,15 +276,31 @@ RemoteGridFile::~RemoteGridFile()
 // pack stops growing (it is still read as it is).
 void RemoteGridFile::chargePack()
 {
-    uncharged_ = 0;
     if (in_memory_) return;
     struct stat st{};
     if (::stat(pack_path_.c_str(), &st) != 0) return;  // evicted: nothing left to charge
-    const bool fits = (!charge_ || charge_(pack_path_, uint64_t(st.st_size))) &&
-                      !belowFloor(fs::path(pack_path_).parent_path(), min_free_bytes_, 0);
+    bool fits = !belowFloor(fs::path(pack_path_).parent_path(), min_free_bytes_, 0);
+    try {
+        fits = fits && (!charge_ || charge_(pack_path_, uint64_t(st.st_size)));
+    } catch (const std::exception&) {
+        fits = false;
+    }
     if (!fits) {
         std::lock_guard lock(pack_mutex_);
         pack_ino_ = 0;
+    }
+}
+
+// Whether the pack may grow to `total` bytes on disk by writing `growth` more:
+// the free-space floor allows it and the budget accepts the new size. Checked
+// before every write, so the pack never holds more than it was charged for.
+bool RemoteGridFile::admit(uint64_t total, uint64_t growth)
+{
+    if (belowFloor(fs::path(pack_path_).parent_path(), min_free_bytes_, growth)) return false;
+    try {
+        return !charge_ || charge_(pack_path_, total);
+    } catch (const std::exception&) {
+        return false;  // the budget could not be asked: write nothing (the data stays in memory)
     }
 }
 
@@ -406,6 +435,7 @@ bool RemoteGridFile::writePack(const std::string& records)
     out += version_;
     put(out, crc32(out.data(), out.size()), 4);
     out += records;
+    if (!admit(out.size(), out.size())) return false;
     const std::string temporary = pack_path_ + ".tmp." + std::to_string(::getpid());
     const int fd = ::open(temporary.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     if (fd < 0) return false;
@@ -419,7 +449,6 @@ bool RemoteGridFile::writePack(const std::string& records)
     pack_dev_ = uint64_t(st.st_dev);
     pack_ino_ = uint64_t(st.st_ino);
     pack_identity_ = identity;
-    uncharged_ += out.size();
     return true;
 }
 
@@ -465,12 +494,8 @@ void RemoteGridFile::create(const Options& options)
         total_loaded_ = true;
     }
 
-    // What the new pack will first hold: the header and the first rows.
-    uint64_t first_bytes = 64;
-    for (const auto& [o, b] : pieces) first_bytes += b.size() + 21;
-    if (!in_memory_ && (belowFloor(fs::path(pack_path_).parent_path(), options.min_free_bytes, first_bytes) ||
-                        (charge_ && !charge_(pack_path_, first_bytes))))
-        in_memory_ = true;
+    // The new pack first holds the header and the first rows (writePack
+    // charges it, and checks the floor, before writing).
     if (!in_memory_) {
         std::string records;
         for (const auto& [o, b] : pieces) putData(records, o, b.data(), b.size());
@@ -507,6 +532,7 @@ void RemoteGridFile::place(uint64_t offset, const char* bytes, uint64_t n)
     for (const auto& [a, b] : addRange(held_, offset, offset + n)) {
         std::memcpy(static_cast<char*>(map_) + a, bytes + (a - offset), b - a);
         resident_ += b - a;
+        g_resident += b - a;
     }
 }
 
@@ -559,17 +585,15 @@ void RemoteGridFile::commit(const Pieces& pieces, const std::string& tail)
     bool ok = false;
     char identity[8];
     if (::fstat(fd, &st) == 0 && uint64_t(st.st_dev) == pack_dev_ && uint64_t(st.st_ino) == pack_ino_ &&
-        preadAll(fd, identity, 8, 16) && get(identity, 8) == pack_identity_) {
+        preadAll(fd, identity, 8, 16) && get(identity, 8) == pack_identity_ &&
+        // Charged at its new size before it grows: refused, it stays as it is.
+        admit(uint64_t(st.st_size) + out.size(), out.size())) {
         // One write: appends of other processes never land inside it.
         const ssize_t n = ::write(fd, out.data(), out.size());
         ok = n == ssize_t(out.size());
     }
     ::close(fd);
-    if (!ok) {
-        pack_ino_ = 0;
-        return;
-    }
-    uncharged_ += out.size();
+    if (!ok) pack_ino_ = 0;  // nothing more is appended; the pack is read as it is
 }
 
 void RemoteGridFile::ensureAll()
@@ -589,7 +613,6 @@ void RemoteGridFile::ensureAll()
         const uint64_t n = std::min<uint64_t>(kChunk, size_ - at);
         commit({{at, std::string(data() + at, n)}}, at + n >= size_ ? emptyRecord(kAll) : std::string());
     }
-    if (uncharged_ > 0) chargePack();
     std::lock_guard lock(mutex_);
     all_done_ = true;
     loaded_cv_.notify_all();
@@ -651,7 +674,6 @@ void RemoteGridFile::ensureBuckets(int x0, int y0, int x1, int y1, bool foregrou
         // The bytes are in memory already: queries waiting for these tiles go
         // on while they are appended to the pack.
         commit(log, tilesRecord(mine));
-        if (uncharged_ >= (256u << 10)) chargePack();
     } else {
         g_tiles_reused += 1;
     }
@@ -807,3 +829,53 @@ void RemoteGridFile::loadTiles(const std::vector<std::pair<int, int>>& tiles, Pi
 }
 
 }  // namespace vc::core::util
+
+#else  // _WIN32
+
+// Range reads use POSIX files and anonymous memory and are not built on
+// Windows: NormalGridVolume reads every grid whole there (it never enables
+// them), and a RemoteGridFile cannot be opened.
+namespace vc::core::util {
+
+namespace {
+std::atomic<uint64_t> g_failures{0};
+}
+
+uint64_t RemoteGridFile::residentTotal()
+{
+    return 0;
+}
+
+RemoteGridFile::Stats RemoteGridFile::globalStats()
+{
+    Stats stats;
+    stats.failures = g_failures.load();
+    return stats;
+}
+
+void RemoteGridFile::reportFailure(const std::string& what)
+{
+    ++g_failures;
+    std::cerr << "normal-grid range read failed (those normals are not used): " << what << std::endl;
+}
+
+RemoteGridFile::RemoteGridFile(std::string url, const std::string&, RangeFetcher, const Options&) : url_(std::move(url))
+{
+    throw std::runtime_error("normal-grid range reads are not available on Windows: " + url_);
+}
+
+RemoteGridFile::~RemoteGridFile() = default;
+
+void RemoteGridFile::ensureBuckets(int, int, int, int, bool)
+{
+    throw std::logic_error("normal-grid range reads are not available on Windows");
+}
+
+void RemoteGridFile::ensureAll()
+{
+    throw std::logic_error("normal-grid range reads are not available on Windows");
+}
+
+}  // namespace vc::core::util
+
+#endif  // _WIN32
