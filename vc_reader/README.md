@@ -130,8 +130,10 @@ share the clamped array interpolation used by transforms. Surface queries use ro
 corners; bicubic Hermite derivatives are shared with `tifxyz.Surface`.
 `GridField` copies its input into fixed storage; CUDA copies remain resident.
 Torch sampling supports first-order gradients; CUDA value gradients use atomic
-addition and may differ slightly between runs. MPS tensors stage through CPU.
-Surface supervision queries do not support autograd.
+addition and may differ slightly between runs. MPS tensors stage through CPU,
+except gradient-free order-1 `zeros` sampling with fill 0, which runs as torch
+`grid_sample` on the GPU (the same taps, within float32 rounding of the
+coordinate normalization). Surface supervision queries do not support autograd.
 
 Surface transfer uses bicubic target geometry, triangle source geometry matching
 the correspondence mesh, and linear UV maps to avoid overshooting seams.
