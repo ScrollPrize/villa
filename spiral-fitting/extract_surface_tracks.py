@@ -240,7 +240,7 @@ def prepare_cc_labels(predictions_binary):
     # Area thresholds are specified in full-res voxels; convert to downsampled by ds**3.
     import cc3d
     from vc_reader.geometry import label_components
-    cc_labels, _ = label_components(predictions_binary, connectivity=6)
+    cc_labels, _ = label_components(predictions_binary, connectivity=6, threads=cc_label_threads)
     # cc3d.dust and Kimimaro expect unsigned label arrays; labels are non-negative, so a view of
     # vc_reader's int32 labels saves a full-resolution copy
     if cc_labels.dtype == np.int32:
@@ -279,9 +279,14 @@ def binarize(predictions):
 
 
 _worker_array = None  # the opened array, inherited by forked workers
+# Threads vc_reader labels a slab's components with; 0 uses every CPU. Several slab workers split
+# the CPUs between them, since a pool of every CPU in each worker oversubscribes the machine and
+# can exceed a container's process limit
+cc_label_threads = 0
 # Module settings the slab workers read. Spawned workers re-import this file, so they get
 # the parent's values (possibly set from the command line) through _worker_init.
-_WORKER_SETTINGS = ('downsample_factor', 'dust_threshold', 'max_area_threshold', 'path_mode')
+_WORKER_SETTINGS = ('downsample_factor', 'dust_threshold', 'max_area_threshold', 'path_mode',
+                    'cc_label_threads')
 
 
 def _worker_init(array, settings):
@@ -305,6 +310,8 @@ def _run_slabs(predictions_zarr_array, tracks_db, jobs, desc):
     workers, processes = cpu_parallelism(predictions_zarr_array.shape, len(jobs))
     print(f'  {len(jobs)} slabs, {workers} slab worker(s) with {processes} Kimimaro '
           f'process(es) each')
+    global cc_label_threads
+    cc_label_threads = 0 if workers <= 1 else max(1, (_cpu_count() or 1) // workers)
     if workers <= 1:
         for key, index, offset in tqdm(jobs, desc=desc):
             tracks_db[key] = _slab_tracks(predictions_zarr_array, index, offset, processes)
@@ -545,6 +552,10 @@ def _slab_worker_memory():
     return total // 2 if total else None
 
 
+def _cpu_count():
+    return os.process_cpu_count() if hasattr(os, 'process_cpu_count') else os.cpu_count()
+
+
 def auto_slab_workers(shape, n_jobs):
     """Slab workers for ``--slab-workers auto``: one for every two CPUs, at most
     ``_MAX_AUTO_SLAB_WORKERS``, as many as fit with the largest slab of this extraction in the
@@ -552,7 +563,7 @@ def auto_slab_workers(shape, n_jobs):
     ``--kimimaro-parallel`` asks for several Kimimaro processes per slab."""
     if kimimaro_parallel != 'auto' and kimimaro_parallel > 1 or n_jobs <= 1:
         return 1
-    cpus = os.process_cpu_count() if hasattr(os, 'process_cpu_count') else os.cpu_count()
+    cpus = _cpu_count()
     z_range = max(0, min(z_max, shape[0]) - min(z_min, shape[0]))
     largest = max(z_chunk_depth_h * shape[1] * shape[2],
                   z_range * yx_chunk_thickness_v * shape[2],
