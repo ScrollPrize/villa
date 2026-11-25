@@ -155,7 +155,9 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
+import itertools
 import json
+import math
 import os
 import warnings
 
@@ -279,95 +281,409 @@ def _zarr_level_array_meta(store: str | Path, level: int | str) -> tuple | None:
     return None
 
 
-def _zarr_level_chunk_counts(store: str | Path, level: int | str) -> tuple | None:
-    """(present, expected) chunk files at the level, or None if not an array.
+# Villa's label writer writes this many pyramid levels by default
+# (``label_zarr.DEFAULT_LEVELS``); ``create_label_zarrs --levels``
+# can override it, but the tutorial path uses the default.
+_WRITER_DEFAULT_LEVELS = 6
 
-    ``expected`` is the full chunk grid from the array metadata
-    (shape / chunk shape); ``present`` counts the non-metadata files
-    under the level directory, recursively, so both separators work
-    (v2 "." flat files, v2 "/" nested paths, v3 "c/" subtree).
-    Symlinked chunk directories count, as in the whole-store check.
+
+def _grid_index_for_chunk_file(relpath: str, ndim: int) -> tuple[int, ...] | None:
+    """Chunk-grid index for a file under a level directory, or None.
+
+    Maps the file's relative path to a chunk index: v2 "." separator
+    (``0.0.1``), v2 "/" separator (``0/0/1``), v3 (``c/0/0/1``). A
+    file that is not at a grid position -- an unrelated file dropped
+    into the store, a backup, a note -- is not a chunk: it is ignored,
+    never counted. A file AT a grid position is a chunk candidate; its
+    content is validated separately.
+    """
+    parts = relpath.replace("\\", "/").split("/")
+    if parts and parts[0] == "c":
+        parts = parts[1:]
+    if len(parts) == 1:
+        parts = parts[0].split(".")
+    if len(parts) != ndim:
+        return None
+    try:
+        index = tuple(int(part) for part in parts)
+    except ValueError:
+        return None
+    if any(value < 0 for value in index):
+        return None
+    return index
+
+
+def _zarr_level_chunk_presence(
+    store: str | Path, level: int | str
+) -> tuple | None:
+    """(meta, present, expected) chunk-grid sets at a level, or None.
+
+    Cheap: enumerates the files under the level directory and maps
+    them to grid positions (no content reads). ``present`` holds the
+    grid indices with a file at that position; ``expected`` holds
+    every grid index from the array metadata. Returns None when the
+    level node is not an array.
     """
     meta = _zarr_level_array_meta(store, level)
     if meta is None:
         return None
     shape, chunks, _separator = meta
-    expected = 1
-    for size, chunk in zip(shape, chunks):
-        expected *= -(-int(size) // int(chunk))
+    ndim = len(shape)
+    grid_counts = [
+        -(-int(size) // int(chunk)) for size, chunk in zip(shape, chunks)
+    ]
+    expected = set(
+        itertools.product(*[range(count) for count in grid_counts])
+    )
     level_dir = _zarr_level_dir(store, level)
-    present = 0
+    if level_dir is None:
+        return None
+    present: set[tuple[int, ...]] = set()
     try:
-        for _root, _dirs, files in os.walk(level_dir, followlinks=True):
-            present += sum(
-                1 for name in files if name not in _ZARR_METADATA_NAMES
-            )
+        for root, _dirs, files in os.walk(level_dir, followlinks=True):
+            for name in files:
+                if name in _ZARR_METADATA_NAMES:
+                    continue
+                rel = os.path.relpath(os.path.join(root, name), level_dir)
+                index = _grid_index_for_chunk_file(rel, ndim)
+                if index is not None and index in expected:
+                    present.add(index)
     except OSError:
         return None
-    return (present, expected)
+    return (meta, present, expected)
 
 
-def _zarr_store_is_uniform_pyramid(store: str | Path) -> bool:
-    """True when a zero-chunk store is a writer-style pyramid.
+def _open_level_array(level_dir: Path | None):
+    """Open a level directory as a zarr array for content reads, or None.
 
-    Villa's label writer (``create_label_zarrs``) writes a pyramid
-    group whose every level is an array, and omits fill-only chunks
-    (``skip_empty=True``): a complete uniform (fill-only) mask
-    therefore holds ZERO chunks at every level, and is still complete
-    (review 5, point 1). A single-level zero-chunk store is the
-    first-sync state instead (review 4, R3b): its chunks have not
-    arrived yet. The two are told apart by the store shape: a pyramid
-    carries at least two array levels, and a uniform one holds zero
-    chunks at every one of them. A pyramid with chunks at some levels
-    is not uniform (the writer would have written the level-0 chunks
-    for any non-zero data), and a pyramid with a level missing is not
-    complete either. Residual hole, documented: a mid-sync pyramid
-    whose every level metadata has arrived but no chunk yet is
-    indistinguishable on disk from a uniform pyramid -- no on-disk
-    signal separates them, so no fair test can either.
+    Lazy zarr import (segment.py otherwise reads only JSON metadata).
+    None when zarr is unavailable or the array cannot be opened (a v3
+    store under zarr 2.x, a corrupt ``.zarray``): callers treat present
+    chunks as corrupt -- fail closed, since the run could not read the
+    level anyway.
+    """
+    if level_dir is None:
+        return None
+    try:
+        import zarr
+    except ImportError:
+        return None
+    try:
+        return zarr.open_array(str(level_dir), mode="r")
+    except Exception:
+        return None
+
+
+def _zarr_level_chunk_states(
+    store: str | Path, level: int | str
+) -> tuple | None:
+    """(meta, states): per-chunk states at a level, or None if not an array.
+
+    ``states`` maps every expected chunk-grid index to one of:
+
+    - ``"valid"``: a file sits at the grid position and reads as a
+      chunk of this array (one voxel decompresses).
+    - ``"missing"``: no file at the grid position.
+    - ``"corrupt"``: a file sits at the grid position but does not
+      read as a chunk (not a chunk file, truncated, wrong codec), or
+      the array cannot be opened at all.
+
+    Only files at valid grid positions count (review 6, point 2): v6
+    counted every non-metadata file, so an unrelated file kept the
+    count unchanged and an accepted patch loaded as zeros. A file at a
+    grid position still has to prove it is a chunk: the voxel read is
+    the content check, codec-agnostic (it goes through zarr, so any
+    compressor the array uses is honoured). Residual hole, documented:
+    a chunk file that is a valid compressed chunk for the same
+    shape/dtype but from another store is indistinguishable -- zarr v2
+    carries no checksum or manifest.
+    """
+    result = _zarr_level_chunk_presence(store, level)
+    if result is None:
+        return None
+    (meta, present, expected) = result
+    _shape, chunks, _separator = meta
+    states: dict[tuple[int, ...], str] = {
+        index: "missing" for index in expected - present
+    }
+    if not present:
+        return (meta, states)
+    array = _open_level_array(_zarr_level_dir(store, level))
+    if array is None:
+        for index in present:
+            states[index] = "corrupt"
+        return (meta, states)
+    for index in sorted(present):
+        coord = tuple(i * c for i, c in zip(index, chunks))
+        try:
+            array[coord]
+        except Exception:
+            states[index] = "corrupt"
+        else:
+            states[index] = "valid"
+    return (meta, states)
+
+
+def _zarr_level_chunk_counts(store: str | Path, level: int | str) -> tuple | None:
+    """(present, expected) chunk files at the level, or None if not an array.
+
+    Present counts only files at valid grid positions whose content
+    reads as a chunk (see :func:`_zarr_level_chunk_states`); kept for
+    callers that only need the counts.
+    """
+    result = _zarr_level_chunk_states(store, level)
+    if result is None:
+        return None
+    _meta, states = result
+    present = sum(1 for state in states.values() if state == "valid")
+    return (present, len(states))
+
+
+def _store_array_levels(store: str | Path) -> list[int]:
+    """Sorted array-level numbers of a store (empty when not a store).
+
+    A single-level ARRAY store (``.zarray`` at the root) has level
+    [0]; a GROUP store has one entry per numeric child directory that
+    holds an array. Non-numeric children are not levels.
     """
     store = Path(store)
     if not store.is_dir():
-        return False
+        return []
+    if _zarr_level_dir(store, 0) == store:
+        return [0]
     try:
         children = sorted(store.iterdir())
     except OSError:
-        return False
-    levels = 0
+        return []
+    levels = []
     for child in children:
         if not child.is_dir() or not child.name.isdigit():
             continue
-        counts = _zarr_level_chunk_counts(store, int(child.name))
-        if counts is None:
+        if _zarr_level_array_meta(store, int(child.name)) is not None:
+            levels.append(int(child.name))
+    return sorted(levels)
+
+
+def _zarr_store_is_writer_default_uniform_pyramid(store: str | Path) -> bool:
+    """True when a zero-chunk store is a writer-default pyramid.
+
+    Villa's label writer (``create_label_zarrs``) writes a pyramid
+    group whose every level is an array (``DEFAULT_LEVELS`` = 6, unless
+    ``--levels`` overrides it) and omits fill-only chunks
+    (``skip_empty=True``): a complete uniform (fill-only) mask
+    therefore holds ZERO chunks at every level of a 6-level pyramid,
+    and is still complete (review 5, point 1). The level count is the
+    only structural difference between that mask and an interrupted
+    transfer (review 6, point 1): a 2-level metadata-only store is not
+    a writer product, and a single-level zero-chunk store is the
+    first-sync state (review 4, R3b). So the uniform exception now
+    requires exactly ``DEFAULT_LEVELS`` (6) array levels, each holding
+    zero chunks. Residual holes, documented: a 6-level stripped
+    populated mask is byte-identical to a genuine uniform mask and
+    cannot be distinguished; a writer mask made with a non-default
+    ``--levels`` (2-5) that is all-fill is wrongly rejected.
+    """
+    levels = _store_array_levels(store)
+    if len(levels) != _WRITER_DEFAULT_LEVELS:
+        return False
+    for level in levels:
+        result = _zarr_level_chunk_presence(store, level)
+        if result is None:
             return False
-        present, _expected = counts
-        if present != 0:
+        _meta, present, _expected = result
+        if present:
             return False
-        levels += 1
-    return levels >= 2
+    return True
+
+
+def _footprint_at_level(
+    shape_from: tuple[int, ...],
+    extent_from: tuple[tuple[int, int], ...],
+    shape_to: tuple[int, ...],
+) -> tuple[tuple[int, int], ...] | None:
+    """Map a voxel extent from one level's shape to another's.
+
+    The extent is scaled by the shape ratio (a real writer pyramid
+    halves Y/X each level; a same-shape pyramid maps identically), so
+    no downsample factor is assumed. Bounds are widened (floor start,
+    ceil stop) so the footprint covers every voxel that could
+    contribute to the extent. None when a shape is degenerate or the
+    footprint is empty.
+    """
+    footprint = []
+    for (start, stop), size_from, size_to in zip(
+        extent_from, shape_from, shape_to
+    ):
+        if size_from <= 0 or size_to <= 0:
+            return None
+        ratio = size_from / size_to
+        lo = max(0, min(int(start / ratio), size_to))
+        hi = max(0, min(math.ceil(stop / ratio), size_to))
+        if lo >= hi:
+            return None
+        footprint.append((lo, hi))
+    return tuple(footprint)
+
+
+def _chunk_indices_intersecting(
+    shape: tuple[int, ...],
+    chunks: tuple[int, ...],
+    footprint: tuple[tuple[int, int], ...],
+) -> set[tuple[int, ...]]:
+    """Grid indices of the chunks intersecting a voxel footprint."""
+    ranges = []
+    for (lo, hi), size, chunk in zip(footprint, shape, chunks):
+        first = lo // chunk
+        last = (hi - 1) // chunk
+        ranges.append(range(first, last + 1))
+    return set(itertools.product(*ranges))
+
+
+def _region_fill_state(
+    store: str | Path, level: int | str, footprint: tuple[tuple[int, int], ...]
+) -> bool | None:
+    """True/False/None: is the footprint region all-fill at the level?
+
+    True when every voxel in the region is the fill value (0); False
+    when any voxel is non-zero; None when the region cannot be read
+    (a chunk covering it is missing or corrupt, or the level is not an
+    array). The presence check matters: zarr reads a missing chunk as
+    fill, so a region read alone cannot tell a genuinely all-fill
+    region from a missing one -- the chunks covering the footprint
+    must be present first. Only the covering chunks are validated
+    (one region read, which decompresses them), not the whole level.
+    """
+    result = _zarr_level_chunk_presence(store, level)
+    if result is None:
+        return None
+    (shape, chunks, _sep), present, _expected = result
+    covering = _chunk_indices_intersecting(shape, chunks, footprint)
+    if not covering or not covering.issubset(present):
+        return None
+    array = _open_level_array(_zarr_level_dir(store, level))
+    if array is None:
+        return None
+    try:
+        region = array[tuple(slice(lo, hi) for lo, hi in footprint)]
+    except Exception:
+        return None
+    return not bool(region.any())
+
+
+def _missing_chunk_is_proven_fill(
+    store: str | Path, level: int | str, chunk_index: tuple[int, ...]
+) -> bool:
+    """True when cross-level evidence proves a missing chunk is fill.
+
+    Two sound directions and one heuristic (see DESIGN_NOTE_V7.md):
+
+    - Downward (sound): the finer level's chunks over the footprint
+      are all present and all-fill, so the coarser chunk is fill
+      (nearest and mean both map all-zero finer voxels to zero).
+    - Upward non-fill (sound): a coarser chunk over the footprint is
+      present and non-fill, so the finer chunk is NOT fill -- the
+      proof returns False immediately (proven non-fill).
+    - Upward fill (heuristic): a coarser chunk over the footprint is
+      present and all-fill. For region/stroke masks this proves the
+      finer chunk is fill (a non-fill region spans many voxels, and
+      the downsampled footprint would show it); it is not a proof for
+      an isolated single-voxel signal, which nearest sampling (or mean
+      rounding to uint8) can hide. The writer's masks are regions, so
+      this is the direction that admits a complete writer mask with an
+      omitted fill chunk (review 6, point 1).
+
+    The proof walks outward from the missing chunk's level (coarser
+    levels first, then finer) and uses the first level that gives
+    evidence. A level whose covering chunks are missing or corrupt
+    gives no evidence and is skipped. When no level gives evidence,
+    the chunk is unproven: an interrupted transfer and a complete
+    uniform mask are indistinguishable there (the residual hole).
+    """
+    result = _zarr_level_chunk_presence(store, level)
+    if result is None:
+        return False
+    (shape, chunks, _sep), _present, _expected = result
+    extent = tuple(
+        (i * c, min(i * c + c, size))
+        for i, c, size in zip(chunk_index, chunks, shape)
+    )
+    levels = _store_array_levels(store)
+    for other in sorted(l for l in levels if l > level):
+        other_result = _zarr_level_chunk_presence(store, other)
+        if other_result is None:
+            continue
+        footprint = _footprint_at_level(shape, extent, other_result[0][0])
+        if footprint is None:
+            continue
+        fill = _region_fill_state(store, other, footprint)
+        if fill is True:
+            return True
+        if fill is False:
+            return False
+    for other in sorted((l for l in levels if l < level), reverse=True):
+        other_result = _zarr_level_chunk_presence(store, other)
+        if other_result is None:
+            continue
+        footprint = _footprint_at_level(shape, extent, other_result[0][0])
+        if footprint is None:
+            continue
+        fill = _region_fill_state(store, other, footprint)
+        if fill is True:
+            return True
+        if fill is False:
+            return False
+    return False
 
 
 def _zarr_level_store_state(store: str | Path, level: int | str) -> str:
-    """One of "complete", "uniform", "partial", "unreadable" for a store level.
+    """One of "complete", "fill", "uniform", "empty", "partial",
+    "corrupt", "unreadable" for a store level.
 
     - "unreadable": the level node is not an array (missing, a group,
       or metadata-only without ``.zarray``) -- review 5, point 2.
-    - "complete": the node is an array and every expected chunk is
-      present.
-    - "uniform": the node is an array, zero chunks are present, and
-      the store is a writer-style pyramid whose every level holds zero
-      chunks -- a complete fill-only mask (review 5, point 1).
-    - "partial": the node is an array, some but not all chunks are
-      present -- an unfinished sync (review 5, point 1).
+    - "complete": every expected chunk is present and reads as a chunk.
+    - "fill": some chunks are missing, but every missing chunk is
+      proven fill by cross-level evidence (review 6, point 1) -- the
+      store is effectively complete.
+    - "uniform": zero chunks at the level, and the store is a
+      writer-default pyramid (exactly 6 array levels, zero chunks at
+      every level) -- a complete fill-only mask (review 5, point 1;
+      review 6, point 1 narrows the level count to the writer
+      default).
+    - "empty": zero chunks at the level, and the store is a
+      single-level flat store -- a readable all-zero mask (review 3,
+      C3/Z8). Admitted for ink/supervision, never for validation
+      (review 4, R3b: a flat metadata-only validation mask is the
+      first-sync state, not a uniform mask).
+    - "partial": some chunks are missing and not all are proven fill
+      -- an unfinished sync (review 5, point 1; review 6, point 1
+      F2 and point 2).
+    - "corrupt": a chunk file at a grid position does not read as a
+      chunk (review 6, point 2) -- an unrelated file, a truncated
+      chunk, a wrong codec.
     """
-    counts = _zarr_level_chunk_counts(store, level)
-    if counts is None:
+    result = _zarr_level_chunk_states(store, level)
+    if result is None:
         return "unreadable"
-    present, expected = counts
-    if present >= expected:
+    _meta, states = result
+    present = sum(1 for state in states.values() if state == "valid")
+    missing = [index for index, state in states.items() if state == "missing"]
+    if any(state == "corrupt" for state in states.values()):
+        return "corrupt"
+    if not missing:
         return "complete"
-    if present == 0 and _zarr_store_is_uniform_pyramid(store):
-        return "uniform"
+    if present == 0:
+        if _zarr_store_is_writer_default_uniform_pyramid(store):
+            return "uniform"
+        if len(_store_array_levels(store)) == 1:
+            return "empty"
+        # 2-5 levels, zero chunks here: not a writer product and not a
+        # flat store. Fall through to the cross-level proof (another
+        # level may hold the evidence); otherwise partial.
+    if all(
+        _missing_chunk_is_proven_fill(store, level, index) for index in missing
+    ):
+        return "fill"
     return "partial"
 
 
@@ -810,45 +1126,56 @@ def _gather_pr_admitted(
             ),
         )
         return None
-    # (c) Supervision and ink must be READABLE at every required
-    # level -- the level node must be an ARRAY (review 5, point 2:
-    # a directory holding only .zattrs, or a Zarr group, is not an
-    # array). A readable store without chunks is an all-zero mask --
-    # the label writer omits fill-only chunks -- so the segment is
-    # ready: it yields no training patches but may yield validation
-    # patches (C3). No chunk gate here: a missing chunk reads as
-    # fill, which costs patches instead of leaking held-out pixels
-    # or blank samples (the image and validation gates above are
-    # the ones where a missing chunk corrupts the run).
+    # (c) Supervision and ink must be COMPLETE at every required
+    # level -- every expected chunk present and reading as a chunk --
+    # or provably fill ("fill": every missing chunk is proven fill by
+    # cross-level evidence), or a uniform/empty all-zero mask.
+    # Review 6, point 2 refutes the v5/v6 rule ("readable metadata =
+    # all-zero mask"): a missing chunk reads as fill, so a partly
+    # synced ink store silently turns positives into supervised
+    # background, and a partly synced supervision store silently drops
+    # validation patches. A readable store without chunks is still an
+    # all-zero mask -- the label writer omits fill-only chunks -- so
+    # the segment is ready: it yields no training patches but may
+    # yield validation patches (C3, Z8). A corrupt chunk (an unrelated
+    # file at a grid position, a truncated chunk) fails here, not at
+    # the first sample.
     for kind in ("supervision_mask", "inklabels"):
         store = getattr(segment, kind)
         for level in levels:
-            if _zarr_level_store_state(store, level) == "unreadable":
+            state = _zarr_level_store_state(store, level)
+            if state not in ("complete", "fill", "uniform", "empty"):
                 _fail_or_skip(
                     segment_dir,
                     strict=strict,
                     message=(
-                        f"{kind} store {store} is unreadable at "
-                        f"resolution {level} (unfinished mirror: the level "
-                        "is not an array); it will be picked up once its "
-                        "store is filled."
+                        f"{kind} store {store} is {state} at "
+                        f"resolution {level} (unfinished mirror: a chunk "
+                        "is missing or does not read as a chunk); it will "
+                        "be picked up once its store is filled."
                     ),
                 )
                 return None
     # (d) A validation mask, when present, must be COMPLETE at every
-    # required level -- every expected chunk present -- or UNIFORM: a
-    # writer-style pyramid whose every level holds zero chunks, which
-    # the label writer produces for a fill-only mask (skip_empty).
-    # A PARTIAL mask (some chunks missing) is an unfinished sync:
-    # treating its missing chunks as fill would let the segment
-    # contribute training patches that its real validation regions
-    # (once synced) would have held out (review 5, point 1). A
-    # single-level zero-chunk store is the first-sync state, not a
-    # uniform mask (review 4, point 3 / R3b).
+    # required level -- every expected chunk present -- or FILL (every
+    # missing chunk proven fill by cross-level evidence, review 6
+    # point 1: a complete writer mask with an omitted fill chunk) or
+    # UNIFORM: a writer-default pyramid (exactly 6 levels) whose every
+    # level holds zero chunks, which the label writer produces for a
+    # fill-only mask (skip_empty). A PARTIAL mask (some chunks missing)
+    # is an unfinished sync: treating its missing chunks as fill would
+    # let the segment contribute training patches that its real
+    # validation regions (once synced) would have held out (review 5,
+    # point 1). A single-level zero-chunk store ("empty") is the
+    # first-sync state, not a uniform mask (review 4, point 3 / R3b),
+    # and a 2-5-level zero-chunk store is not a writer product either
+    # (review 6, point 1, F2): both wait until their validation
+    # regions can be read.
     if segment.validation_mask is not None:
         for level in levels:
             if _zarr_level_store_state(segment.validation_mask, level) not in (
                 "complete",
+                "fill",
                 "uniform",
             ):
                 _fail_or_skip(
@@ -940,6 +1267,7 @@ def _gather_one(
                 f"datasets[{dataset_idx}].volume_path is required for {config.mode}"
             )
         image_volume: str | Path = source.volume_path
+        image_explicit = True
     elif source.surface_volume_paths:
         explicit = source.surface_volume_paths.get(
             relpath, source.surface_volume_paths.get(segment_dir.name)
@@ -966,6 +1294,7 @@ def _gather_one(
             # Unrelated folder next to an explicitly mapped source: skip it.
             return None
         image_volume = explicit
+        image_explicit = True
     elif source.surface_volume_path is not None:
         if len(allowlist) != 1:
             raise ValueError(
@@ -973,6 +1302,7 @@ def _gather_one(
                 "allowlisted segment; use surface_volume_paths for multiple segments"
             )
         image_volume = source.surface_volume_path
+        image_explicit = True
     else:
         # Flat, no explicit surface. A mirror with native geometry is a
         # main-discovered segment; a TIFF-free mirror is the PR's
@@ -989,6 +1319,7 @@ def _gather_one(
                 is_allowlisted=is_allowlisted,
             )
         image_volume = segment_dir / f"{segment_dir.name}.zarr"
+        image_explicit = False
 
     # ---- Segments main already discovers: name-based acceptance. ----
     segment = Segment(
@@ -1008,13 +1339,18 @@ def _gather_one(
     )
     if not image_is_remote and not Path(image_volume).exists():
         if config.discovery_mode == "unlabeled":
-            if strict and markers["recognized"]:
-                # A selected segment must not disappear silently (H1):
-                # its folder exists and carries segment markers, but
-                # its image volume is missing.
+            if strict and markers["recognized"] and image_explicit:
+                # A selected segment must not disappear silently (H1a):
+                # its folder exists and carries segment markers, and
+                # its image volume was explicitly configured, but the
+                # volume is missing.
                 raise ValueError(
                     f"{segment_dir.name} is missing its image volume {image_volume}"
                 )
+            # A flat local <name>.zarr image that is missing is main's
+            # silent skip (review 6, point 4): the scan continues on
+            # the ready segments instead of stopping before patch
+            # finding.
             return None
         raise ValueError(
             f"{segment_dir.name} is missing its image volume {image_volume}"
