@@ -7,6 +7,7 @@ import torch
 
 from vesuvius.neural_tracing.inference.displacement_tta import run_model_tta
 from vesuvius.neural_tracing.nets.models import load_checkpoint, resolve_checkpoint_path
+from vesuvius.models.utilities.mps_conv3d import speed_up_3d_convs_on_mps
 
 
 def _positive_finite_float_or_none(value):
@@ -140,6 +141,7 @@ def load_model(args):
     model, model_config = load_checkpoint(checkpoint_path)
     model.to(args.device)
     model.eval()
+    speed_up_3d_convs_on_mps(model, args.device)
     compile_requested = bool(getattr(args, "compile_model", False))
     compile_mode = str(getattr(args, "compile_mode", "default"))
     compiled = False
