@@ -108,6 +108,9 @@ __device__ inline int __any_sync(unsigned int mask, int predicate) {
 __device__ inline int __all_sync(unsigned int mask, int predicate) {
     return __all_sync(static_cast<unsigned long long>(mask), predicate);
 }
+template<class T> __device__ inline unsigned long long __match_any_sync(unsigned int mask, T value) {
+    return __match_any_sync(static_cast<unsigned long long>(mask), value);
+}
 __device__ inline void __syncwarp(unsigned int mask) {
     __syncwarp(static_cast<unsigned long long>(mask));
 }
