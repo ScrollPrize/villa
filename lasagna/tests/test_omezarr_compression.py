@@ -49,6 +49,19 @@ def test_none_override_creates_uncompressed_v2_arrays(tmp_path: Path):
     assert _metadata(root, 1)["compressor"] is None
 
 
+def test_delta3d_choice_writes_uint8_levels_and_rejects_float32(tmp_path: Path):
+    root = tmp_path / "fiber.ome.zarr"
+    group = _create_omezarr(str(root), (64, 64, 64), 0, 2, 32, "presence", "vc-delta3d")
+    data = np.random.default_rng(0).integers(0, 9, (64, 64, 64)).astype(np.uint8)
+    group["0"][:] = data
+
+    for level in range(2):
+        assert _metadata(root, level)["compressor"] == omezarr_compressor_config("vc-delta3d")
+    np.testing.assert_array_equal(open_zarr(root / "0")[:], data)
+    with pytest.raises(ValueError, match="vc-delta3d"):
+        _create_omezarr(str(tmp_path / "f4"), (32, 32, 32), 0, 1, 32, "width", "vc-delta3d", np.float32)
+
+
 def test_resume_preserves_existing_compressor_and_reports_mismatch(
     tmp_path: Path, capsys: pytest.CaptureFixture[str],
 ):

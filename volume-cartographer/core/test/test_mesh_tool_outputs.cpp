@@ -175,7 +175,9 @@ TEST_CASE("vc_tifxyz2obj --keep writes the decimated grid")
     run(tool("VC_TIFXYZ2OBJ_BIN") + " " + quoted(dir.path / "curved") + " " + quoted(dir.path / "keep.obj") + " --keep=25",
         dir.path / "obj.log");
     const std::string obj = readFile(dir.path / "keep.obj");
-    // 6 x 8 decimated grid, its first quad touching the invalid corner.
+    // 6 x 8 decimated grid, its first quad touching the invalid corner. The UVs
+    // are positions in the source grid, as in an export without --keep: one
+    // UV unit per voxel on this 4 voxel lattice, whatever the stride.
     int v = 0, f = 0;
     std::istringstream lines(obj);
     for (std::string line; std::getline(lines, line);) {
@@ -185,10 +187,10 @@ TEST_CASE("vc_tifxyz2obj --keep writes the decimated grid")
     CHECK(v == 47);
     CHECK(f == 2 * (5 * 7 - 1));
     CHECK(obj.substr(0, obj.find("\nf ")) ==
-          "v 108.000000 120.000000 81.800003\nvt 4.000000 0.000000\nvn 0.124035 0.000000 0.992278\n"
-          "v 116.000000 120.000000 80.800003\nvt 8.000000 0.000000\nvn 0.107703 0.000000 0.994183\n"
-          "v 108.000000 128.000000 81.800003\nvt 4.000000 4.000000\nvn 0.143499 0.000000 0.989651\n"
-          "v 116.000000 128.000000 80.800003\nvt 8.000000 4.000000\nvn 0.099504 0.000000 0.995037");
+          "v 108.000000 120.000000 81.800003\nvt 8.000000 0.000000\nvn 0.124035 0.000000 0.992278\n"
+          "v 116.000000 120.000000 80.800003\nvt 16.000000 0.000000\nvn 0.107703 0.000000 0.994183\n"
+          "v 108.000000 128.000000 81.800003\nvt 8.000000 8.000000\nvn 0.143499 0.000000 0.989651\n"
+          "v 116.000000 128.000000 80.800003\nvt 16.000000 8.000000\nvn 0.099504 0.000000 0.995037");
 }
 
 TEST_CASE("vc_obj2tifxyz and vc_obj2tifxyz_legacy rasterize an OBJ")

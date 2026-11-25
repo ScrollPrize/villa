@@ -136,21 +136,21 @@ void resolveGroupLocations(
 
 void loadRemoteMarker(LasagnaDatasetManifest& manifest)
 {
-    const auto markerPath = manifest.baseDirectory / kLasagnaRemoteMarker;
-    if (!std::filesystem::is_regular_file(markerPath))
+    const auto copy = lasagnaRemoteCopy(manifest.manifestPath);
+    if (!copy) {
+        if (std::filesystem::is_regular_file(manifest.baseDirectory / kLasagnaRemoteMarker))
+            throw std::runtime_error(
+                "Lasagna remote marker does not identify the opened manifest");
         return;
-    const auto marker = nlohmann::json::parse(std::ifstream(markerPath));
+    }
+    const auto marker = nlohmann::json::parse(std::ifstream(copy->marker));
     const auto url = marker.value("artifact_url", std::string{});
     if (url.empty())
         throw std::runtime_error("Lasagna remote marker has no artifact_url");
-    const auto manifestFile = marker.value("manifest_file", std::string{});
-    if (manifestFile.empty() ||
-        std::filesystem::absolute(manifest.baseDirectory / manifestFile).lexically_normal() !=
-            std::filesystem::absolute(manifest.manifestPath).lexically_normal()) {
-        throw std::runtime_error(
-            "Lasagna remote marker does not identify the opened manifest");
-    }
     manifest.remoteSourceBaseLocation = runtimeLocation(url);
+    if (copy->manifestFile.has_parent_path())
+        manifest.remoteSourceBaseLocation = vcr::joinLocation(
+            manifest.remoteSourceBaseLocation, copy->manifestFile.parent_path().generic_string());
     // Its arrays cache under the shared root, not beside the manifest.
     manifest.remoteCacheRoot = vc::settings::remoteCachePath();
     manifest.discoverAwsCredentials =
@@ -158,6 +158,30 @@ void loadRemoteMarker(LasagnaDatasetManifest& manifest)
 }
 
 } // namespace
+
+std::filesystem::path lasagnaDatasetPath(const std::filesystem::path& manifestFile)
+{
+    return manifestFile.filename() == ".zattrs" ? manifestFile.parent_path() : manifestFile;
+}
+
+std::optional<LasagnaRemoteCopy> lasagnaRemoteCopy(const std::filesystem::path& manifest)
+{
+    auto file = std::filesystem::absolute(manifest).lexically_normal();
+    if (!file.has_filename()) file = file.parent_path();
+    if (std::filesystem::is_directory(file)) file /= ".zattrs";
+    std::vector<std::filesystem::path> directories{file.parent_path()};
+    if (file.filename() == ".zattrs") directories.push_back(file.parent_path().parent_path());
+    for (const auto& directory : directories) {
+        const auto path = directory / kLasagnaRemoteMarker;
+        std::error_code ec;
+        if (!std::filesystem::is_regular_file(path, ec)) continue;
+        const auto marker = nlohmann::json::parse(std::ifstream(path));
+        const auto name = std::filesystem::path(marker.value("manifest_file", std::string{}));
+        if (!name.empty() && !name.is_absolute() && (directory / name).lexically_normal() == file)
+            return LasagnaRemoteCopy{path, name};
+    }
+    return std::nullopt;
+}
 
 LasagnaDataset::LasagnaDataset(LasagnaDatasetManifest manifest)
     : manifest_(std::move(manifest))
@@ -192,12 +216,24 @@ void cacheLasagnaProvenance(const LasagnaDatasetManifest& manifest,
     if (manifest.manifestIsRemote || manifest.remoteSourceBaseLocation.empty()) return;
     const auto it = manifest.raw.find("provenance");
     if (it == manifest.raw.end() || !it->is_string() || it->get<std::string>().empty()) return;
-    const std::filesystem::path name(it->get<std::string>());
-    if (name.is_absolute() || name.lexically_normal() != name || *name.begin() == "..")
-        throw std::runtime_error("Lasagna manifest names an unsafe provenance record: " + name.string());
-    const auto destination = manifest.baseDirectory / name;
+    std::filesystem::path name(it->get<std::string>());
+    // An embedded manifest names its record relative to its Zarr store, beside
+    // the store in the artifact.
+    auto directory = manifest.baseDirectory;
+    auto source = manifest.remoteSourceBaseLocation;
+    if (manifest.manifestPath.filename() == ".zattrs" && *name.begin() == "..") {
+        const auto copy = lasagnaRemoteCopy(manifest.manifestPath);
+        if (copy && copy->marker.parent_path() == directory.parent_path()) {
+            name = name.lexically_relative("..");
+            directory = directory.parent_path();
+            source = vcr::parentLocation(source);
+        }
+    }
+    if (name.empty() || name.is_absolute() || name.lexically_normal() != name || *name.begin() == "..")
+        throw std::runtime_error("Lasagna manifest names an unsafe provenance record: " + it->get<std::string>());
+    const auto destination = directory / name;
     if (std::filesystem::is_regular_file(destination)) return;
-    const auto location = vcr::joinLocation(manifest.remoteSourceBaseLocation, name.generic_string());
+    const auto location = vcr::joinLocation(source, name.generic_string());
     if (!fetcher) {
         const auto access = remoteAccess(location, manifest.discoverAwsCredentials);
         vcr::HttpOptions http;
@@ -289,7 +325,12 @@ LasagnaDataset LasagnaDataset::openLocation(
     if (!vcr::zarr::isRemote(manifestLocation)) {
         return open(std::filesystem::path(manifestLocation), std::move(options));
     }
-    const auto materialized = materializeLasagnaManifest(manifestLocation, options);
+    // A compact dataset is named by its Zarr store; its manifest is the store's .zattrs.
+    const auto materialized = materializeLasagnaManifest(
+        sourceName(manifestLocation).ends_with(".zarr")
+            ? vcr::joinLocation(runtimeLocation(manifestLocation), ".zattrs")
+            : manifestLocation,
+        options);
     auto openMaterialized = [&](const MaterializedLasagnaManifest& source,
                                 const LasagnaDatasetOpenOptions& openOptions) {
         auto manifest = LasagnaDatasetManifest::parseFile(source.path);

@@ -54,7 +54,8 @@ def _create_array(group, name, shape, chunks, dtype, codec):
             raise ValueError(f"existing packed array has incompatible layout: {group.path}/{name}")
         if (array.filters or array.compressor != codec
                 or array.meta.separator != "/" or array.fill_value != 0):
-            raise ValueError(f"existing packed array has incompatible encoding: {group.path}/{name}")
+            raise ValueError(f"existing packed array has incompatible encoding: {group.path}/{name} "
+                             f"(compressor {array.compressor}, requested {codec})")
         return
     from lasagna.tiled_predict3d import _writer_codec
     group.create_array(name, shape=shape, chunks=chunks, dtype=dtype, separator="/", **_writer_codec(codec))
@@ -215,14 +216,20 @@ class CompactOutputAdapter:
         manifest.provenance_json = provenance
         manifest.extra_fields.update(extra_fields or {})
         manifest.extra_fields["blank_invalid"] = self.blank_invalid
-        codec = omezarr_compressor_config(ome_compressor)
         for n, products in self.by_level.items():
             channels = [c.name for p in products for c in p.channels]
             manifest.groups[f"sd{n}"] = ChannelGroup(f"sd{n}/{n}", n, channels)
             group = create_group(root / f"sd{n}")
             dtype = np.result_type(*(p.dtype for p in products))
+            levels = range(n, self._level_stop(products[0]))
+            stored = [level for level in levels if str(level) in group]
+            if ome_compressor is None and stored:
+                codec = json.loads((Path(group.path) / str(stored[0]) / ".zarray").read_text())["compressor"]
+            else:
+                codec = omezarr_compressor_config(
+                    ome_compressor or ("vc-delta3d" if dtype == np.uint8 else "blosc-zstd"), ndim=4)
             datasets = []
-            for level in range(n, self._level_stop(products[0])):
+            for level in levels:
                 shape = _omezarr_level_shape(base_shape_zyx, level)
                 # Match the coordinator's grid; source_to_base transforms
                 # coordinates in metadata, not the array dimensions.

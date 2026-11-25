@@ -11,6 +11,7 @@ import subprocess
 import time
 from typing import Any
 
+import numpy as np
 import torch
 import vc_reader
 
@@ -441,7 +442,7 @@ def run_fiber_trace_3d_inference(
     base_scale: int | None = None,
     levels: int = 5,
     ome_chunk: int = 64,
-    ome_compressor: str = DEFAULT_OME_COMPRESSOR,
+    ome_compressor: str | None = DEFAULT_OME_COMPRESSOR,
     pyramid_workers: int = 0,
     recurrent_steps: int | None = None,
     prefetch_workers: int = 0,
@@ -582,6 +583,8 @@ def run_fiber_trace_3d_inference(
         emit_width="width" in annotation_heads,
         emit_normals="normal" in annotation_heads,
     )
+    if ome_compressor == "vc-delta3d" and any(np.dtype(p.dtype) != np.uint8 for p in predict_adapter.output_products):
+        raise ValueError("vc-delta3d stores uint8 output only; float32 widths need --ome-compressor blosc-zstd")
     # Stored chunks are reused as complete, so a store's chunks must come from this tiling.
     tiling = {
         "tile_size": int(tile_size_i), "overlap": int(overlap), "border": int(border),
@@ -696,7 +699,7 @@ def run_fiber_trace_3d_inference(
             "border": int(border),
             "overlap": int(overlap),
             "ome_chunk": int(ome_chunk),
-            "ome_compressor_requested": str(ome_compressor),
+            "ome_compressor_requested": ome_compressor,
             "precision": precision_mode,
             "product_accumulator_dtype": str(product_accumulator_dtype),
             "recurrent_steps": predict_adapter.recurrent_steps,
@@ -1013,7 +1016,7 @@ def main(argv: list[str] | None = None) -> int:
         base_scale=args.base_scale,
         levels=int(args.levels),
         ome_chunk=int(args.ome_chunk),
-        ome_compressor=str(args.ome_compressor),
+        ome_compressor=args.ome_compressor,
         pyramid_workers=int(args.pyramid_workers),
         recurrent_steps=args.recurrent_steps,
         prefetch_workers=int(args.prefetch_workers),

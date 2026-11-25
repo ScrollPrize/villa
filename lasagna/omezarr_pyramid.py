@@ -78,9 +78,13 @@ def set_pyramid_metadata(group, *, method: str) -> None:
 	group.attrs["lasagna_pyramid_downsample"] = method
 
 
-def _mean_pool2x_u8(slab: np.ndarray, *, zero_overrides: bool = False) -> np.ndarray:
-	if slab.ndim != 3:
-		raise ValueError(f"expected 3D slab, got shape={slab.shape}")
+_U8_SUM8_LUT = np.rint(np.arange(2041, dtype=np.float32) / np.float32(8.0)).clip(0.0, 255.0).astype(np.uint8)
+
+_NORMAL_LUTS: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.uint8, np.uint8] | None = None
+_NORMAL_SLAB_Z = 8
+
+
+def _mean_pool2x_u8_general(slab: np.ndarray, *, zero_overrides: bool = False) -> np.ndarray:
 	z, y, x = (int(v) for v in slab.shape)
 	out_shape = ((z + 1) // 2, (y + 1) // 2, (x + 1) // 2)
 	acc = np.zeros(out_shape, dtype=np.float32)
@@ -103,9 +107,68 @@ def _mean_pool2x_u8(slab: np.ndarray, *, zero_overrides: bool = False) -> np.nda
 	return out
 
 
-def _mean_pool2x_f32(slab: np.ndarray) -> np.ndarray:
+def _mean_pool2x_u8_even(slab: np.ndarray, *, zero_overrides: bool = False) -> np.ndarray:
+	c000 = slab[0::2, 0::2, 0::2]
+	c001 = slab[0::2, 0::2, 1::2]
+	c010 = slab[0::2, 1::2, 0::2]
+	c011 = slab[0::2, 1::2, 1::2]
+	c100 = slab[1::2, 0::2, 0::2]
+	c101 = slab[1::2, 0::2, 1::2]
+	c110 = slab[1::2, 1::2, 0::2]
+	c111 = slab[1::2, 1::2, 1::2]
+	# Eight uint8 values sum to at most 2040 (< 2^24), so the uint16 sum is exact
+	# and _U8_SUM8_LUT reproduces np.rint(float32(sum) / 8.0) bit-for-bit.
+	s = c000.astype(np.uint16)
+	s += c001
+	s += c010
+	s += c011
+	s += c100
+	s += c101
+	s += c110
+	s += c111
+	out = _U8_SUM8_LUT[s]
+	if zero_overrides:
+		m = c000.copy()
+		np.minimum(m, c001, out=m)
+		np.minimum(m, c010, out=m)
+		np.minimum(m, c011, out=m)
+		np.minimum(m, c100, out=m)
+		np.minimum(m, c101, out=m)
+		np.minimum(m, c110, out=m)
+		np.minimum(m, c111, out=m)
+		out[m == 0] = 0
+	return out
+
+
+def _mean_pool2x_u8(slab: np.ndarray, *, zero_overrides: bool = False) -> np.ndarray:
 	if slab.ndim != 3:
 		raise ValueError(f"expected 3D slab, got shape={slab.shape}")
+	z, y, x = (int(v) for v in slab.shape)
+	out_shape = ((z + 1) // 2, (y + 1) // 2, (x + 1) // 2)
+	if slab.size == 0:
+		return np.empty(out_shape, dtype=np.uint8)
+	if slab.dtype != np.uint8:
+		return _mean_pool2x_u8_general(slab, zero_overrides=zero_overrides)
+
+	ez, ey, ex = z & ~1, y & ~1, x & ~1
+	if ez == z and ey == y and ex == x:
+		return _mean_pool2x_u8_even(slab, zero_overrides=zero_overrides)
+
+	out = np.empty(out_shape, dtype=np.uint8)
+	if ez and ey and ex:
+		out[: ez // 2, : ey // 2, : ex // 2] = _mean_pool2x_u8_even(
+			slab[:ez, :ey, :ex], zero_overrides=zero_overrides
+		)
+	if ez < z:
+		out[ez // 2 :, :, :] = _mean_pool2x_u8_general(slab[ez:, :, :], zero_overrides=zero_overrides)
+	if ey < y and ez:
+		out[: ez // 2, ey // 2 :, :] = _mean_pool2x_u8_general(slab[:ez, ey:, :], zero_overrides=zero_overrides)
+	if ex < x and ez and ey:
+		out[: ez // 2, : ey // 2, ex // 2 :] = _mean_pool2x_u8_general(slab[:ez, :ey, ex:], zero_overrides=zero_overrides)
+	return out
+
+
+def _mean_pool2x_f32_general(slab: np.ndarray) -> np.ndarray:
 	z, y, x = (int(v) for v in slab.shape)
 	out_shape = ((z + 1) // 2, (y + 1) // 2, (x + 1) // 2)
 	acc = np.zeros(out_shape, dtype=np.float32)
@@ -122,13 +185,205 @@ def _mean_pool2x_f32(slab: np.ndarray) -> np.ndarray:
 	return acc / np.maximum(cnt, 1.0)
 
 
-def _moment_pool2x_normals(nx_u8: np.ndarray, ny_u8: np.ndarray, *, validity: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
-	if nx_u8.shape != ny_u8.shape:
-		raise ValueError(f"normal channel shape mismatch: nx={nx_u8.shape} ny={ny_u8.shape}")
+def _mean_pool2x_f32_even(slab: np.ndarray) -> np.ndarray:
+	z, y, x = (int(v) for v in slab.shape)
+	src = slab.astype(np.float32, copy=False)
+	# Preserve exact (dz, dy, dx) float32 accumulation order while avoiding the cnt array.
+	acc = src[0::2, 0::2, 0::2].copy()
+	acc += src[0::2, 0::2, 1::2]
+	acc += src[0::2, 1::2, 0::2]
+	acc += src[0::2, 1::2, 1::2]
+	acc += src[1::2, 0::2, 0::2]
+	acc += src[1::2, 0::2, 1::2]
+	acc += src[1::2, 1::2, 0::2]
+	acc += src[1::2, 1::2, 1::2]
+	acc *= np.float32(0.125)
+	return acc
+
+
+def _mean_pool2x_f32(slab: np.ndarray) -> np.ndarray:
+	if slab.ndim != 3:
+		raise ValueError(f"expected 3D slab, got shape={slab.shape}")
+	z, y, x = (int(v) for v in slab.shape)
+	out_shape = ((z + 1) // 2, (y + 1) // 2, (x + 1) // 2)
+	if slab.size == 0:
+		return np.empty(out_shape, dtype=np.float32)
+	ez, ey, ex = z & ~1, y & ~1, x & ~1
+	if ez == z and ey == y and ex == x:
+		return _mean_pool2x_f32_even(slab)
+	out = np.empty(out_shape, dtype=np.float32)
+	if ez and ey and ex:
+		out[: ez // 2, : ey // 2, : ex // 2] = _mean_pool2x_f32_even(slab[:ez, :ey, :ex])
+	if ez < z:
+		out[ez // 2 :, :, :] = _mean_pool2x_f32_general(slab[ez:, :, :])
+	if ey < y and ez:
+		out[: ez // 2, ey // 2 :, :] = _mean_pool2x_f32_general(slab[:ez, ey:, :])
+	if ex < x and ez and ey:
+		out[: ez // 2, : ey // 2, ex // 2 :] = _mean_pool2x_f32_general(slab[:ez, :ey, ex:])
+	return out
+
+
+def _solve_principal_normal_3x3_batch(
+	xx: np.ndarray,
+	xy: np.ndarray,
+	xz: np.ndarray,
+	yy: np.ndarray,
+	yz: np.ndarray,
+	zz: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+	"""Principal eigenvector of 3x3 symmetric PSD moment matrices, quantized to uint8 (nx, ny).
+
+	Uses Cardano's closed-form eigenvalues in float64 and the largest-norm row cross-product
+	of (M - lambda_max * I), falling back to np.linalg.eigh on near-degenerate or equatorial
+	(|vz| < 1e-4) matrices so sign tie-breaking matches np.linalg.eigh bit-for-bit.
+	"""
+	if xx.size == 0:
+		empty = np.empty(0, dtype=np.uint8)
+		return empty, empty
+
+	a = xx.astype(np.float64)
+	d = xy.astype(np.float64)
+	e = xz.astype(np.float64)
+	b = yy.astype(np.float64)
+	f = yz.astype(np.float64)
+	c = zz.astype(np.float64)
+
+	p1 = d * d + e * e + f * f
+	q = (a + b + c) * (1.0 / 3.0)
+	aq = a - q
+	bq = b - q
+	cq = c - q
+	p = np.sqrt((aq * aq + bq * bq + cq * cq + 2.0 * p1) * (1.0 / 6.0))
+	inv_p = np.where(p > 0.0, 1.0 / np.where(p > 0.0, p, 1.0), 0.0)
+	b00 = aq * inv_p
+	b11 = bq * inv_p
+	b22 = cq * inv_p
+	b01 = d * inv_p
+	b02 = e * inv_p
+	b12 = f * inv_p
+
+	det_b = (
+		b00 * (b11 * b22 - b12 * b12)
+		- b01 * (b01 * b22 - b12 * b02)
+		+ b02 * (b01 * b12 - b11 * b02)
+	)
+	phi = np.arccos(np.clip(0.5 * det_b, -1.0, 1.0)) * (1.0 / 3.0)
+	cos_phi = np.cos(phi)
+	sin_phi = np.sqrt(np.maximum(0.0, 1.0 - cos_phi * cos_phi))
+	lam_max = q + 2.0 * p * cos_phi
+	lam_mid = q + p * (-cos_phi + 1.7320508075688772 * sin_phi)
+
+	a0 = a - lam_max
+	b0 = b - lam_max
+	c0 = c - lam_max
+
+	u0x = d * f - e * b0
+	u0y = e * d - a0 * f
+	u0z = a0 * b0 - d * d
+	n0 = u0x * u0x + u0y * u0y + u0z * u0z
+
+	u1x = d * c0 - e * f
+	u1y = e * e - a0 * c0
+	u1z = a0 * f - d * e
+	n1 = u1x * u1x + u1y * u1y + u1z * u1z
+
+	u2x = b0 * c0 - f * f
+	u2y = f * e - d * c0
+	u2z = d * f - b0 * e
+	n2 = u2x * u2x + u2y * u2y + u2z * u2z
+
+	use1 = n1 > n0
+	vx = np.where(use1, u1x, u0x)
+	vy = np.where(use1, u1y, u0y)
+	vz = np.where(use1, u1z, u0z)
+	nmax = np.where(use1, n1, n0)
+
+	use2 = n2 > nmax
+	vx = np.where(use2, u2x, vx)
+	vy = np.where(use2, u2y, vy)
+	vz = np.where(use2, u2z, vz)
+	nmax = np.where(use2, n2, nmax)
+
+	scale = np.maximum(np.abs(lam_max), 1e-12)
+	degen = (p <= 1e-10 * scale) | ((lam_max - lam_mid) <= 1e-4 * scale) | (nmax <= 1e-22 * scale * scale)
+	inv_n = 1.0 / np.sqrt(np.where(degen, 1.0, nmax))
+	vxf = (vx * inv_n).astype(np.float32)
+	vyf = (vy * inv_n).astype(np.float32)
+	vzf = (vz * inv_n).astype(np.float32)
+	# Equatorial eigenvectors (|vz| ~ 0) sit on the hemisphere flip boundary; delegate to eigh
+	# so arbitrary +/-v tie-breaking matches np.linalg.eigh exactly.
+	degen |= np.abs(vzf) < np.float32(1e-4)
+
+	n_degen = int(np.count_nonzero(degen))
+	if n_degen > 0:
+		idx = np.flatnonzero(degen)
+		mat = np.empty((n_degen, 3, 3), dtype=np.float32)
+		mat[:, 0, 0] = xx[idx]
+		mat[:, 0, 1] = xy[idx]
+		mat[:, 0, 2] = xz[idx]
+		mat[:, 1, 0] = xy[idx]
+		mat[:, 1, 1] = yy[idx]
+		mat[:, 1, 2] = yz[idx]
+		mat[:, 2, 0] = xz[idx]
+		mat[:, 2, 1] = yz[idx]
+		mat[:, 2, 2] = zz[idx]
+		vals, vecs = np.linalg.eigh(mat)
+		vd = np.take_along_axis(vecs, np.argmax(vals, axis=-1)[..., None, None], axis=-1)[..., 0]
+		vxf[idx] = vd[:, 0]
+		vyf[idx] = vd[:, 1]
+		vzf[idx] = vd[:, 2]
+
+	flip = np.where(vzf < np.float32(0.0), np.float32(-1.0), np.float32(1.0))
+	vxf *= flip
+	vyf *= flip
+	vzf *= flip
+	norm = np.sqrt(np.maximum(vxf * vxf + vyf * vyf + vzf * vzf, np.float32(1e-12)))
+	vxf /= norm
+	vyf /= norm
+	nx_out = np.rint(vxf * np.float32(127.0) + np.float32(128.0)).clip(0.0, 255.0).astype(np.uint8)
+	ny_out = np.rint(vyf * np.float32(127.0) + np.float32(128.0)).clip(0.0, 255.0).astype(np.uint8)
+	return nx_out, ny_out
+
+
+def _get_normal_luts() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.uint8, np.uint8]:
+	global _NORMAL_LUTS
+	if _NORMAL_LUTS is not None:
+		return _NORMAL_LUTS
+	vals = np.arange(256, dtype=np.uint8)
+	gx_u8, gy_u8 = np.meshgrid(vals, vals, indexing="ij")
+	gx, gy, nz_lut = _decode_normals(gx_u8, gy_u8)
+	comp_lut = gx[:, 0].copy()
+	# Exact output for any uniform 2x2x2 block of identical (nx_u8, ny_u8).
+	u_nx, u_ny = _solve_principal_normal_3x3_batch(
+		(gx * gx).ravel(),
+		(gx * gy).ravel(),
+		(gx * nz_lut).ravel(),
+		(gy * gy).ravel(),
+		(gy * nz_lut).ravel(),
+		(nz_lut * nz_lut).ravel(),
+	)
+	uniform_nx = u_nx.reshape(256, 256)
+	uniform_ny = u_ny.reshape(256, 256)
+	z_nx, z_ny = _solve_principal_normal_3x3_batch(
+		np.zeros(1, dtype=np.float32),
+		np.zeros(1, dtype=np.float32),
+		np.zeros(1, dtype=np.float32),
+		np.zeros(1, dtype=np.float32),
+		np.zeros(1, dtype=np.float32),
+		np.zeros(1, dtype=np.float32),
+	)
+	_NORMAL_LUTS = (comp_lut, nz_lut, uniform_nx, uniform_ny, z_nx[0], z_ny[0])
+	return _NORMAL_LUTS
+
+
+def _moment_pool2x_normals_general(
+	nx_u8: np.ndarray,
+	ny_u8: np.ndarray,
+	*,
+	validity: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
 	nx, ny, nz = _decode_normals(nx_u8, ny_u8)
 	if validity is not None:
-		if validity.shape != nx.shape:
-			raise ValueError("normal validity shape mismatch")
 		valid = validity != 0
 		nx, ny, nz = (v * valid for v in (nx, ny, nz))
 	xx = _mean_pool2x_f32(nx * nx)
@@ -137,25 +392,188 @@ def _moment_pool2x_normals(nx_u8: np.ndarray, ny_u8: np.ndarray, *, validity: np
 	yy = _mean_pool2x_f32(ny * ny)
 	yz = _mean_pool2x_f32(ny * nz)
 	zz = _mean_pool2x_f32(nz * nz)
+	onx, ony = _solve_principal_normal_3x3_batch(
+		xx.ravel(), xy.ravel(), xz.ravel(), yy.ravel(), yz.ravel(), zz.ravel()
+	)
+	return onx.reshape(xx.shape), ony.reshape(xx.shape)
 
-	mat = np.empty(xx.shape + (3, 3), dtype=np.float32)
-	mat[..., 0, 0] = xx
-	mat[..., 0, 1] = xy
-	mat[..., 0, 2] = xz
-	mat[..., 1, 0] = xy
-	mat[..., 1, 1] = yy
-	mat[..., 1, 2] = yz
-	mat[..., 2, 0] = xz
-	mat[..., 2, 1] = yz
-	mat[..., 2, 2] = zz
-	vals, vecs = np.linalg.eigh(mat)
-	v = np.take_along_axis(vecs, np.argmax(vals, axis=-1)[..., None, None], axis=-1)[..., 0]
-	flip = np.where(v[..., 2:3] < 0.0, -1.0, 1.0).astype(np.float32)
-	v = v * flip
-	norm = np.sqrt(np.maximum(np.sum(v * v, axis=-1, keepdims=True), 1e-12))
-	v = v / norm
-	nx_out = np.rint(v[..., 0] * 127.0 + 128.0).clip(0.0, 255.0).astype(np.uint8)
-	ny_out = np.rint(v[..., 1] * 127.0 + 128.0).clip(0.0, 255.0).astype(np.uint8)
+
+def _moment_pool2x_normals(nx_u8: np.ndarray, ny_u8: np.ndarray, *, validity: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
+	if nx_u8.shape != ny_u8.shape:
+		raise ValueError(f"normal channel shape mismatch: nx={nx_u8.shape} ny={ny_u8.shape}")
+	if nx_u8.ndim != 3:
+		raise ValueError(f"expected 3D slab, got shape={nx_u8.shape}")
+	if validity is not None and validity.shape != nx_u8.shape:
+		raise ValueError("normal validity shape mismatch")
+
+	z, y, x = (int(v) for v in nx_u8.shape)
+	oz, oy, ox = (z + 1) // 2, (y + 1) // 2, (x + 1) // 2
+	if nx_u8.size == 0:
+		return np.empty((oz, oy, ox), dtype=np.uint8), np.empty((oz, oy, ox), dtype=np.uint8)
+	general = nx_u8.dtype != np.uint8 or ny_u8.dtype != np.uint8
+	if not general:
+		comp_lut, nz_lut, uniform_nx, uniform_ny, zero_nx, zero_ny = _get_normal_luts()
+	nx_out = np.empty((oz, oy, ox), dtype=np.uint8)
+	ny_out = np.empty((oz, oy, ox), dtype=np.uint8)
+	inv8 = np.float32(0.125)
+
+	for z0 in range(0, z, _NORMAL_SLAB_Z):
+		z1 = min(z, z0 + _NORMAL_SLAB_Z)
+		oz0 = z0 // 2
+		oz1 = (z1 + 1) // 2
+		snx = nx_u8[z0:z1]
+		sny = ny_u8[z0:z1]
+		sval = None if validity is None else validity[z0:z1]
+		sz, sy, sx = snx.shape
+
+		if general or (sz & 1) or (sy & 1) or (sx & 1):
+			onx, ony = _moment_pool2x_normals_general(snx, sny, validity=sval)
+			nx_out[oz0:oz1] = onx
+			ny_out[oz0:oz1] = ony
+			continue
+
+		sh = (sz // 2, sy // 2, sx // 2)
+		r = (sh[0], 2, sh[1], 2, sh[2], 2)
+		bx = snx.reshape(r)
+		by = sny.reshape(r)
+		x000 = bx[:, 0, :, 0, :, 0]
+		y000 = by[:, 0, :, 0, :, 0]
+
+		uniform = (
+			(bx[:, 0, :, 0, :, 1] == x000) & (by[:, 0, :, 0, :, 1] == y000)
+			& (bx[:, 0, :, 1, :, 0] == x000) & (by[:, 0, :, 1, :, 0] == y000)
+			& (bx[:, 0, :, 1, :, 1] == x000) & (by[:, 0, :, 1, :, 1] == y000)
+			& (bx[:, 1, :, 0, :, 0] == x000) & (by[:, 1, :, 0, :, 0] == y000)
+			& (bx[:, 1, :, 0, :, 1] == x000) & (by[:, 1, :, 0, :, 1] == y000)
+			& (bx[:, 1, :, 1, :, 0] == x000) & (by[:, 1, :, 1, :, 0] == y000)
+			& (bx[:, 1, :, 1, :, 1] == x000) & (by[:, 1, :, 1, :, 1] == y000)
+		)
+
+		if sval is None:
+			onx = uniform_nx[x000, y000]
+			ony = uniform_ny[x000, y000]
+			mixed = ~uniform
+			n_mix = int(np.count_nonzero(mixed))
+			if n_mix > 0:
+				if n_mix * 2 > uniform.size:
+					nxf = comp_lut[snx]
+					nyf = comp_lut[sny]
+					nzf = nz_lut[snx, sny]
+					xx = np.zeros(sh, dtype=np.float32)
+					xy = np.zeros(sh, dtype=np.float32)
+					xz = np.zeros(sh, dtype=np.float32)
+					yy = np.zeros(sh, dtype=np.float32)
+					yz = np.zeros(sh, dtype=np.float32)
+					zz = np.zeros(sh, dtype=np.float32)
+					for dz in (0, 1):
+						for dy in (0, 1):
+							for dx in (0, 1):
+								px = nxf[dz::2, dy::2, dx::2]
+								py = nyf[dz::2, dy::2, dx::2]
+								pz = nzf[dz::2, dy::2, dx::2]
+								xx += px * px
+								xy += px * py
+								xz += px * pz
+								yy += py * py
+								yz += py * pz
+								zz += pz * pz
+					xx *= inv8
+					xy *= inv8
+					xz *= inv8
+					yy *= inv8
+					yz *= inv8
+					zz *= inv8
+					rnx, rny = _solve_principal_normal_3x3_batch(
+						xx.ravel(), xy.ravel(), xz.ravel(), yy.ravel(), yz.ravel(), zz.ravel()
+					)
+					onx = rnx.reshape(sh)
+					ony = rny.reshape(sh)
+				else:
+					mx = bx.transpose(0, 2, 4, 1, 3, 5)[mixed].reshape(n_mix, 8)
+					my = by.transpose(0, 2, 4, 1, 3, 5)[mixed].reshape(n_mix, 8)
+					px = comp_lut[mx]
+					py = comp_lut[my]
+					pz = nz_lut[mx, my]
+					xx = np.zeros(n_mix, dtype=np.float32)
+					xy = np.zeros(n_mix, dtype=np.float32)
+					xz = np.zeros(n_mix, dtype=np.float32)
+					yy = np.zeros(n_mix, dtype=np.float32)
+					yz = np.zeros(n_mix, dtype=np.float32)
+					zz = np.zeros(n_mix, dtype=np.float32)
+					for k in range(8):
+						pkx = px[:, k]
+						pky = py[:, k]
+						pkz = pz[:, k]
+						xx += pkx * pkx
+						xy += pkx * pky
+						xz += pkx * pkz
+						yy += pky * pky
+						yz += pky * pkz
+						zz += pkz * pkz
+					xx *= inv8
+					xy *= inv8
+					xz *= inv8
+					yy *= inv8
+					yz *= inv8
+					zz *= inv8
+					rnx, rny = _solve_principal_normal_3x3_batch(xx, xy, xz, yy, yz, zz)
+					onx[mixed] = rnx
+					ony[mixed] = rny
+		else:
+			vbool = (sval != 0).reshape(r)
+			v000 = vbool[:, 0, :, 0, :, 0]
+			v001 = vbool[:, 0, :, 0, :, 1]
+			v010 = vbool[:, 0, :, 1, :, 0]
+			v011 = vbool[:, 0, :, 1, :, 1]
+			v100 = vbool[:, 1, :, 0, :, 0]
+			v101 = vbool[:, 1, :, 0, :, 1]
+			v110 = vbool[:, 1, :, 1, :, 0]
+			v111 = vbool[:, 1, :, 1, :, 1]
+			all_invalid = ~(v000 | v001 | v010 | v011 | v100 | v101 | v110 | v111)
+			all_valid = v000 & v001 & v010 & v011 & v100 & v101 & v110 & v111
+			shortcut_uniform = all_valid & uniform
+			onx = np.full(sh, zero_nx, dtype=np.uint8)
+			ony = np.full(sh, zero_ny, dtype=np.uint8)
+			if np.any(shortcut_uniform):
+				onx[shortcut_uniform] = uniform_nx[x000[shortcut_uniform], y000[shortcut_uniform]]
+				ony[shortcut_uniform] = uniform_ny[x000[shortcut_uniform], y000[shortcut_uniform]]
+			mixed = ~(all_invalid | shortcut_uniform)
+			n_mix = int(np.count_nonzero(mixed))
+			if n_mix > 0:
+				mx = bx.transpose(0, 2, 4, 1, 3, 5)[mixed].reshape(n_mix, 8)
+				my = by.transpose(0, 2, 4, 1, 3, 5)[mixed].reshape(n_mix, 8)
+				mv = vbool.transpose(0, 2, 4, 1, 3, 5)[mixed].reshape(n_mix, 8)
+				px = comp_lut[mx] * mv
+				py = comp_lut[my] * mv
+				pz = nz_lut[mx, my] * mv
+				xx = np.zeros(n_mix, dtype=np.float32)
+				xy = np.zeros(n_mix, dtype=np.float32)
+				xz = np.zeros(n_mix, dtype=np.float32)
+				yy = np.zeros(n_mix, dtype=np.float32)
+				yz = np.zeros(n_mix, dtype=np.float32)
+				zz = np.zeros(n_mix, dtype=np.float32)
+				for k in range(8):
+					pkx = px[:, k]
+					pky = py[:, k]
+					pkz = pz[:, k]
+					xx += pkx * pkx
+					xy += pkx * pky
+					xz += pkx * pkz
+					yy += pky * pky
+					yz += pky * pkz
+					zz += pkz * pkz
+				xx *= inv8
+				xy *= inv8
+				xz *= inv8
+				yy *= inv8
+				yz *= inv8
+				zz *= inv8
+				rnx, rny = _solve_principal_normal_3x3_batch(xx, xy, xz, yy, yz, zz)
+				onx[mixed] = rnx
+				ony[mixed] = rny
+
+		nx_out[oz0:oz1] = onx
+		ny_out[oz0:oz1] = ony
 	return nx_out, ny_out
 
 

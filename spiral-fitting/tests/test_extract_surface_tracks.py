@@ -336,6 +336,26 @@ def test_invalid_z_range_is_rejected(capsys, tmp_path):
     assert '--z-min must be' in capsys.readouterr().err
 
 
+@pytest.mark.parametrize('factor', ['0', '3', '5'])
+def test_downsample_factor_off_the_slab_grid_is_rejected(capsys, factor):
+    with pytest.raises(SystemExit):
+        est.parse_args(['--predictions', 'p.zarr', '--out', 't.dbm', '--downsample-factor', factor])
+    assert '--downsample-factor must be at most' in capsys.readouterr().err
+
+
+def test_resume_with_another_downsample_factor_is_rejected(tmp_path):
+    out = str(tmp_path / 't.dbm')
+    est.check_downsample_factor(out, 1)
+    with dbm.open(out, 'w') as database:
+        database['h:0'] = pickle.dumps([])
+    est.check_downsample_factor(out, 1)
+    with pytest.raises(SystemExit, match='--downsample-factor 1'):
+        est.check_downsample_factor(out, 4)
+    os.remove(out + '.downsample_factor')
+    with pytest.raises(SystemExit, match='does not give'):
+        est.check_downsample_factor(out, 1)
+
+
 def test_gpus_with_cpu_backend_is_rejected(capsys):
     with pytest.raises(SystemExit):
         est.parse_args(['--predictions', 'p.zarr', '--out', 't.dbm', '--backend', 'cpu',
@@ -359,17 +379,20 @@ def test_command_line_reaches_the_backend(monkeypatch, tmp_path):
     runs = []
     monkeypatch.setattr(est, 'z_min', est.z_min)  # main() sets the z range; restore it after
     monkeypatch.setattr(est, 'z_max', est.z_max)
+    monkeypatch.setattr(est, 'downsample_factor', est.downsample_factor)
     monkeypatch.setattr(est, 'write_native_packed_store', True)
     monkeypatch.setattr(est, 'select_backend', lambda requested, gpus=None: requested)
     monkeypatch.setattr(
-        est, 'run_cpu', lambda *args: runs.append(('cpu', args, est.z_min, est.z_max)))
+        est, 'run_cpu',
+        lambda *args: runs.append(('cpu', args, est.z_min, est.z_max, est.downsample_factor)))
     monkeypatch.setattr(
         est, 'run_gpu', lambda *args, gpus=None: runs.append(('gpu', args, gpus)))
     monkeypatch.setattr(est, 'write_packed_store', lambda path: runs.append(('packed', path)))
     out = tmp_path / 'tracks' / 't.dbm'
     est.main(['--predictions', 'p.zarr', '--out', str(out), '--z-min', '64', '--z-max', '128',
-              '--backend', 'cpu', '--no-packed-store'])
-    assert runs == [('cpu', ('p.zarr', str(out)), 64, 128)]
+              '--backend', 'cpu', '--no-packed-store', '--downsample-factor', '1'])
+    assert runs == [('cpu', ('p.zarr', str(out)), 64, 128, 1)]
+    assert est.skeletonize_kwargs()['anisotropy'] == (1, 1, 1)
     assert out.parent.is_dir()
     runs.clear()
     est.main(['--predictions', 'p.zarr', '--out', str(out), '--backend', 'gpu', '--gpus', '2,0'])
@@ -458,9 +481,10 @@ def test_cpu_backend_writes_the_track_format(monkeypatch, tmp_path):
     # h keys by z, then vy keys by y, then vx keys by x, over the yx range occupied in
     # the 20 sampled z slices (every 8th here)
     ys, xs = np.nonzero((volume[8:168:8] > 0).any(axis=0))
+    y0, x0 = ys.min() - ys.min() % 4, xs.min() - xs.min() % 4
     order = ([f'h:{z}' for z in range(8, 168, 8)]
-             + [f'vy:{w}' for w in range(ys.min(), ys.max(), 24)]
-             + [f'vx:{w}' for w in range(xs.min(), xs.max(), 24)])
+             + [f'vy:{w}' for w in range(y0, ys.max(), 24)]
+             + [f'vx:{w}' for w in range(x0, xs.max(), 24)])
     assert sorted(entries) == sorted(order)
     assert _write_order(out) in (None, order)
     n_tracks = 0
@@ -474,14 +498,23 @@ def test_cpu_backend_writes_the_track_format(monkeypatch, tmp_path):
     assert n_tracks > 50
     # Every slab of this volume crosses a sheet piece above the dust threshold, so none is empty. (An empty
     # entry here used to mean pieces that passed prepare_cc_labels' dust filter but were dropped again by the
-    # skeletonizer, which got the threshold in full-resolution voxels.)
-    assert pickle.dumps([]) not in entries.values()
+    # skeletonizer, which got the threshold in full-resolution voxels.) A vy slab wholly inside the block's
+    # y range 196..230 is the exception: there the block joins the sheets into one component above
+    # max_area_threshold.
+    inside_block = {f'vy:{w}' for w in range(y0, ys.max(), 24)
+                    if 196 <= w and w + est.yx_chunk_thickness_v <= 230}
+    assert pickle.dumps([]) not in [v for key, v in entries.items() if key not in inside_block]
 
     # Resume: keys already present are not recomputed.
     with dbm.open(str(out), 'w') as database:
         database['h:16'] = pickle.dumps(['kept'])
     est.run_cpu('synthetic', str(out))
     assert _read_dbm(out) == {**entries, 'h:16': pickle.dumps(['kept'])}
+
+    with dbm.open(str(out), 'w') as database:
+        database[f'vx:{xs.min()}'] = pickle.dumps([])
+    with pytest.raises(SystemExit, match='vx slabs off the 4-voxel grid'):
+        est.run_cpu('synthetic', str(out))
 
 
 def test_cpu_slabs_thinner_than_downsample_factor_have_no_tracks(monkeypatch):
