@@ -25,6 +25,7 @@ struct Dims {
     long n;                // D * H * W
     long w_grid, h_grid;
     long sd, sh, sw, sc;
+    long slots;            // sparse: pool slots this call may read; table entries above it read as not loaded
 };
 
 inline float3 load_pos(device const float* grid, constant Dims& d, uint n,
@@ -54,7 +55,9 @@ inline bool sparse_locate(float3 p, constant Dims& d, device const int* table, t
     int ciz = int(floor(p.z / 32.0f));
     if (cix < 0 || cix >= d.a2 || ciy < 0 || ciy >= d.a1 || ciz < 0 || ciz >= d.a0) return false;
     int slot = table[(long(ciz) * d.a1 + ciy) * d.a2 + cix];
-    if (slot == 0) return false;
+    // a sync between a forward and its backward can point the live table at slots past the pool the forward
+    // read; those chunks were not loaded for the forward, so the backward treats them as missing too
+    if (slot <= 0 || long(slot) > d.slots) return false;
     b.base = ulong(slot - 1) * ulong(d.a3) * 39304ul;
     float lx = p.x - float(cix) * 32.0f + 1.0f;
     float ly = p.y - float(ciy) * 32.0f + 1.0f;
@@ -374,11 +377,11 @@ def _check_grid(grid: torch.Tensor) -> None:
 		raise ValueError(f"grid must be an MPS float32 (D, H, W, 3) tensor, got {grid.dtype} {tuple(grid.shape)} on {grid.device}")
 
 
-def _dims(a: tuple[int, int, int, int], grid: torch.Tensor) -> tuple[list[int], int]:
+def _dims(a: tuple[int, int, int, int], grid: torch.Tensor, slots: int = 0) -> tuple[list[int], int]:
 	D, H, W, _ = (int(v) for v in grid.shape)
 	n = D * H * W
 	# Dims is bound as a constant struct of int64s; the grid keeps its own strides
-	return [*a, n, W, H, *(int(s) for s in grid.stride())], n
+	return [*a, n, W, H, *(int(s) for s in grid.stride()), int(slots)], n
 
 
 def _f3(t: torch.Tensor, device: torch.device) -> torch.Tensor:
@@ -396,7 +399,7 @@ def _sparse_fwd(table, pool, grid, offset, inv_scale, *, u8: bool) -> torch.Tens
 	if table.dtype != torch.int32 or not table.is_contiguous():
 		raise ValueError("table must be a contiguous int32 slot table")
 	C = int(pool.shape[1])
-	dims, n = _dims((*(int(v) for v in table.shape), C), grid)
+	dims, n = _dims((*(int(v) for v in table.shape), C), grid, slots=int(pool.shape[0]))
 	D, H, W, _ = grid.shape
 	out = torch.empty(C, D, H, W, dtype=torch.uint8 if u8 else torch.float32, device=grid.device)
 	_launch("sparse_fwd_u8" if u8 else "sparse_fwd_f32", n,
@@ -411,9 +414,11 @@ class _SparseSampleDiff(torch.autograd.Function):
 		inv_scale = _f3(inv_scale, grid.device)
 		out = _sparse_fwd(table, pool, grid, offset, inv_scale, u8=False)
 		# the cache writes its table and pool in place when a sync loads chunks, which may happen between this
-		# forward and its backward (anticipatory pulls); saved tensors would fail autograd's version check there.
-		# Kept as attributes, as the CUDA wrapper keeps its chunk table: slots are only appended, so every slot
-		# this forward read still holds the same chunk, and a grown pool leaves this reference intact
+		# forward and its backward (anticipatory pulls, or a loss term's mid-forward sync); saved tensors would
+		# fail autograd's version check there. Kept as attributes, as the CUDA wrapper keeps its chunk table:
+		# slots are only appended, so every slot this forward read still holds the same chunk, and a grown pool
+		# leaves this reference intact. The backward reads only the slots of this pool view, so a chunk loaded
+		# after the forward (its slot past the view, maybe past the old allocation) stays missing, as it sampled
 		ctx.table, ctx.pool = table, pool
 		ctx.save_for_backward(grid, offset, inv_scale)
 		return out
@@ -423,7 +428,7 @@ class _SparseSampleDiff(torch.autograd.Function):
 		grid, offset, inv_scale = ctx.saved_tensors
 		table, pool = ctx.table, ctx.pool
 		C = int(pool.shape[1])
-		dims, n = _dims((*(int(v) for v in table.shape), C), grid)
+		dims, n = _dims((*(int(v) for v in table.shape), C), grid, slots=int(pool.shape[0]))
 		grad_grid = torch.empty(*grid.shape, dtype=torch.float32, device=grid.device)
 		_launch("sparse_bwd", n, table, pool, grid, offset, inv_scale,
 				grad_output.contiguous(), grad_grid, dims)

@@ -12,6 +12,13 @@ from sparse_cache import SparseChunkGroupCache
 DEVICES = ["cpu"] + (["mps"] if torch.backends.mps.is_available() else [])
 
 
+@pytest.fixture(autouse=True)
+def _allow_unloaded_samples(monkeypatch):
+	# these tests sample unloaded chunks on purpose; importing fit_service anywhere in the session turns on the
+	# debug guard that rejects such samples
+	monkeypatch.setenv("LASAGNA_CHECK_SPARSE_CACHE", "0")
+
+
 def _cache(tmp_path, values, device, channels=("cos",), channel_indices=None):
 	is_3d = values.ndim == 3
 	ZarrWriter.create(tmp_path / "a.zarr", shape=values.shape, chunks=(16,) * values.ndim, dtype="u1")[...] = values
@@ -104,4 +111,44 @@ def test_sync_between_forward_and_backward(tmp_path, device):
 		out.backward(torch.ones_like(out))
 		grads.append(g.grad.cpu())
 	assert float(grads[0].abs().max()) > 0.0
+	torch.testing.assert_close(grads[1], grads[0], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("grow", [False, True])
+def test_backward_ignores_chunks_loaded_after_the_forward(tmp_path, device, grow):
+	# loss terms sync the cache mid-forward, so a chunk that sampled as zero can be loaded before the backward;
+	# its gradient must stay zero, and a grown pool must not send the backward past the pool the forward read
+	values = np.random.default_rng(6).integers(0, 256, (160, 160, 160), dtype=np.uint8)
+	near = np.random.default_rng(7).uniform(2, 30, (2, 5, 7, 3)).astype(np.float32)
+	far = np.random.default_rng(8).uniform(100, 126, (2, 5, 7, 3)).astype(np.float32)
+	pts = np.concatenate([near, far], axis=0)
+	off = torch.zeros(3, device=device)
+	inv = torch.ones(3, device=device)
+	ones = (1.0, 1.0, 1.0)
+	grads = []
+	for late_sync in (False, True):
+		cache = _cache(tmp_path / str(late_sync), values, device)
+		cache.prefetch(torch.from_numpy(near).to(device), (0.0, 0.0, 0.0), ones)
+		cache.sync()
+		capacity = int(cache.pool.shape[0])
+		g = torch.from_numpy(pts).to(device).requires_grad_(True)
+		out = cache.grid_sample(g, off, inv, diff=True)
+		assert float(out[:, 2:].abs().max()) == 0.0
+		if late_sync:
+			# without growth the far chunks land in the old allocation past the forward's slots; with it, the
+			# whole volume's chunks need a pool larger than the old allocation
+			if grow:
+				span = np.arange(0, 160, 16, dtype=np.float32)
+				every = np.stack(np.meshgrid(span, span, span, indexing="ij"), -1)[None]
+				cache.prefetch(torch.from_numpy(np.ascontiguousarray(every)).to(device), (0.0, 0.0, 0.0), ones)
+			else:
+				cache.prefetch(torch.from_numpy(far).to(device), (0.0, 0.0, 0.0), ones)
+			cache.sync()
+			assert (int(cache.pool.shape[0]) > capacity) == grow
+			assert cache.n_slots > capacity if grow else cache.n_slots <= capacity
+		out.backward(torch.ones_like(out))
+		grads.append(g.grad.cpu())
+	assert float(grads[0][:2].abs().max()) > 0.0
+	assert float(grads[1][2:].abs().max()) == 0.0
 	torch.testing.assert_close(grads[1], grads[0], rtol=0, atol=0)
