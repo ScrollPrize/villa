@@ -32,6 +32,7 @@ import argparse
 import json
 import os
 import re
+import socket
 import socketserver
 import sys
 import threading
@@ -268,12 +269,67 @@ class Handler(socketserver.StreamRequestHandler):
         self.wfile.flush()
 
 
+def _sockaddr_un(path):
+    import ctypes
+
+    class SockaddrUn(ctypes.Structure):
+        _fields_ = [('sun_family', ctypes.c_ushort), ('sun_path', ctypes.c_char*108)]
+    raw = os.fsencode(path)
+    if len(raw) >= 108:  # sun_path holds 107 bytes and the terminating NUL
+        raise OSError(f'socket path is too long for AF_UNIX ({len(raw)} bytes, at most 107): {path}')
+    return SockaddrUn(1, raw)
+
+
+if hasattr(socketserver, 'UnixStreamServer'):
+    UnixServer = socketserver.UnixStreamServer
+else:
+    class UnixServer(socketserver.TCPServer):
+        """Windows: Winsock has AF_UNIX stream sockets (VC3D's client connects with them), but CPython can neither
+        bind nor accept them, so both go through ws2_32."""
+        address_family = 1  # AF_UNIX
+
+        def server_bind(self):
+            import ctypes
+            address = _sockaddr_un(self.server_address)
+            ws2 = ctypes.windll.ws2_32
+            if ws2.bind(ctypes.c_size_t(self.socket.fileno()), ctypes.byref(address), ctypes.sizeof(address)):
+                raise OSError(f'cannot bind {self.server_address}: WSA error {ws2.WSAGetLastError()}')
+
+        def get_request(self):
+            import ctypes
+            ws2 = ctypes.windll.ws2_32
+            ws2.accept.restype = ctypes.c_size_t
+            handle = ws2.accept(ctypes.c_size_t(self.socket.fileno()), None, None)
+            if handle == ctypes.c_size_t(-1).value:
+                raise OSError(f'accept failed: WSA error {ws2.WSAGetLastError()}')
+            return socket.socket(self.address_family, socket.SOCK_STREAM, 0, handle), self.server_address
+
+
+def parent_alive(pid):
+    """A liveness check for ``pid``. On Windows os.kill(pid, 0) is no liveness check: signal 0 is CTRL_C_EVENT,
+    sent to the console, or WinError 87 without one (VC3D started from Explorer). Wait on a process handle there
+    instead, opened once, so a reused pid cannot pass for the parent."""
+    if os.name != 'nt':
+        def alive():
+            try:
+                os.kill(pid, 0)
+            except OSError:
+                return False
+            return True
+        return alive
+    import ctypes
+    kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.WaitForSingleObject.argtypes = (ctypes.c_void_p, ctypes.c_uint32)
+    handle = kernel32.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE
+    return lambda: bool(handle) and kernel32.WaitForSingleObject(handle, 0) == 0x102  # WAIT_TIMEOUT: running
+
+
 def watch_parent(pid, server):
+    alive = parent_alive(pid)
     while True:
         time.sleep(2.)
-        try:
-            os.kill(pid, 0)
-        except OSError:
+        if not alive():
             server.shutdown()
             return
 
@@ -296,7 +352,7 @@ def main(argv=None):
     SERVICE = FiberFollow(ARGS)
     path = Path(ARGS.socket)
     path.unlink(missing_ok=True)
-    server = socketserver.UnixStreamServer(str(path), Handler)
+    server = UnixServer(str(path), Handler)
     if ARGS.parent_pid:
         threading.Thread(target=watch_parent, args=(ARGS.parent_pid, server), daemon=True).start()
     print(f'fiber_follow service listening on {path} (grid scale {SERVICE.g:g}, base {SERVICE.base_um:g} um, '
