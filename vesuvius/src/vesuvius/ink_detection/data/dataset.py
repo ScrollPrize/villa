@@ -115,7 +115,11 @@ from vesuvius.ink_detection.data.patch_finding_default import (
 from vesuvius.ink_detection.data.patch_finding_subtiling import (
     find_segment_patches as find_subtiling_patches,
 )
-from vesuvius.ink_detection.data.segment import gather_segments
+from vesuvius.ink_detection.data.segment import (
+    _is_main_discovered_segment,
+    _is_selected_segment,
+    gather_segments,
+)
 from vesuvius.ink_detection.types import Patch, Segment
 from vesuvius.ink_detection.volume_io import open_volume, read_bbox_with_padding
 
@@ -189,60 +193,8 @@ def _read_flat_surface(volume, *, y0: int, y1: int, x0: int, x1: int):
     return patch[0]
 
 
-def _is_selected_segment(segment) -> bool:
-    """True when the user explicitly selected this segment.
-
-    A segment is selected when its name is in the source's allowlist,
-    when it has an explicit surface volume (a single
-    ``surface_volume_path`` or a ``surface_volume_paths`` entry for
-    its relpath or name), or when its source is held out
-    (``split == "validation"``). A read failure on a selected segment
-    must stop the run before it trains or scores a subset (review 4,
-    point 5): main stops there too, when patch finding opens its
-    masks. An auto-discovered segment in the same state is warned
-    about and skipped instead, and picked up on a later run.
-    """
-    source = segment.source
-    if source.split == "validation":
-        return True
-    if segment.segment_name in set(source.segment_names):
-        return True
-    if source.surface_volume_path is not None:
-        return True
-    if (
-        segment.segment_relpath in source.surface_volume_paths
-        or segment.segment_name in source.surface_volume_paths
-    ):
-        return True
-    return False
-
-
-def _is_main_discovered_segment(segment) -> bool:
-    """True when main would discover this segment without the PR.
-
-    Main discovers a flat segment when it carries native tifxyz
-    geometry (``x.tif`` in its directory) or when it has an explicit
-    surface volume (a single ``surface_volume_path`` or a
-    ``surface_volume_paths`` entry for its relpath or name). A
-    TIFF-free flat mirror with no explicit surface exists only
-    because of the PR's discovery. A patch-finding failure on a
-    main-discovered segment must stop the run (review 5, point 3):
-    main stops there too, and silently dropping one would train or
-    score a subset while reporting the full set -- and the broad
-    catch also reaches native discovery, where removing a segment
-    changes which neighbours contribute labels.
-    """
-    if (Path(segment.segment_dir) / "x.tif").is_file():
-        return True
-    source = segment.source
-    if source.surface_volume_path is not None:
-        return True
-    if (
-        segment.segment_relpath in source.surface_volume_paths
-        or segment.segment_name in source.surface_volume_paths
-    ):
-        return True
-    return False
+# Selection helpers live in segment.py (single definition, review 7,
+# point 6); this module imports them from there.
 
 
 def _is_no_patch_outcome(exc: BaseException) -> bool:
@@ -311,7 +263,12 @@ class InkDataset(Dataset):
             )
 
         if patches is None:
-            self.segments = list(gather_segments(config))
+            # Cache-first (review 7, point 6): gather lightly
+            # (filesystem checks only, no chunk decoding) so a cache
+            # hit never decodes image/label chunks; on a cache miss
+            # _discover_or_load_patches re-gathers with full content
+            # validation before patch finding.
+            self.segments = list(gather_segments(config, light=True))
             self.patches = self._discover_or_load_patches()
             if has_heldout_validation(config):
                 self.patches = partition_heldout(self.patches)
@@ -365,6 +322,15 @@ class InkDataset(Dataset):
             )
             if cached is not None:
                 return cached
+        # Cache miss (or no cache file): the segments above came from
+        # a light gather, which skips the content gates. Re-gather
+        # with full content validation before patch finding, so an
+        # unfinished mirror (a chunk removed after caching, a store
+        # that never completed) is caught here, not at the first
+        # sample. The store-fingerprint check in load_patch_cache is
+        # what routes a tampered cache here; the full gather is what
+        # rejects the tampered segment.
+        self.segments = list(gather_segments(self.config))
 
         def process(segment: Segment):
             try:
