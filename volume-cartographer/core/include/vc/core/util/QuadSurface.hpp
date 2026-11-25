@@ -464,6 +464,8 @@ public:
     cv::Mat_<uint8_t> vertexMask();
     // Retain coordinates behind the mask only when writing a surface.
     cv::Mat_<cv::Vec3f> pointsForStorage();
+    // The requested grid rectangle, with hidden coordinates restored for storage.
+    cv::Mat_<cv::Vec3f> pointsForStorage(const cv::Rect& rectangle);
     // Loads a registered channel that has no data yet (e.g. from its stored
     // geometry revision) on first access.
     void setChannelLoader(std::function<cv::Mat(const std::string&)> loader) { _channelLoader = std::move(loader); }
@@ -559,13 +561,16 @@ std::vector<vc::objects::TransactionOperation> create_quad_operations(const std:
 vc::geometry::Surface quad_surface_grid(QuadSurface&);
 // Geometry for putGeometry: quad_surface_grid and the other channels.
 vc::objects::GeometryData quad_surface_geometry(QuadSurface&);
+// A native stored surface channel in OpenCV's existing channel order.
+cv::Mat quad_channel_mat(const vc::objects::GeometryArray& channel);
 // The sparse edit publishing the vertices of `rect` (grid rows/columns) that
 // differ from the revision `view` shows (its stored frame or a transformed
 // one): new coordinates mark the vertex valid unless explicit validity is
 // supplied; a vertex cleared to the sentinel loses its coordinates. Affected
 // relationships are kept as recorded. nullopt when nothing changed. `validity` is the grid's validity
 // when an earlier operation of the request replaces it (quad_channels_operation).
-// An explicit exclusion replacement may also clear hidden XYZ at missing cells.
+// Explicit coordinate-state replacement may clear hidden XYZ at missing cells,
+// including padding restored by Undo without an exclusion marker.
 std::optional<vc::objects::EditGeometryOp> quad_rect_edit(const vc::objects::TransformedGeometryView& view,
     QuadSurface&, const cv::Rect& rect, const std::vector<uint8_t>* validity = nullptr,
     const std::vector<uint8_t>* clearMaskedCoordinates = nullptr);

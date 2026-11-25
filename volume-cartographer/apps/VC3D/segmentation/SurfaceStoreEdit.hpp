@@ -26,6 +26,8 @@ public:
     // Publish `surface`: with the stored grid size, the named channels ("mask"
     // is validity) and then the vertices of `rect` that changed; with another
     // grid size (growth), a new geometry of points, validity and channels.
+    // Supplying both mask and growth_exclusions replaces coordinate state too:
+    // a missing XYZ without a retained hidden vertex restores empty padding.
     // A durable save (ObjectStoreSession::submitDurably): written to the
     // session's draft directory before it is sent. `draftRevision` is the
     // revision of the surface's session draft that `surface` was copied at:

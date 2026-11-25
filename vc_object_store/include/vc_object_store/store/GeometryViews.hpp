@@ -150,8 +150,9 @@ public:
     // `validity`, when given, is the whole grid's validity the edits apply to
     // instead of the stored one (an earlier operation of the same request
     // replaces the valid channel). It remains authoritative when XYZ changes.
-    // `clearMaskedCoordinates` identifies explicit exclusions being replaced:
-    // a missing desired XYZ under explicit zero validity clears its hidden XYZ.
+    // `clearMaskedCoordinates` marks cells whose coordinate state is replaced:
+    // a missing desired XYZ under explicit zero validity clears its hidden XYZ,
+    // including an empty padding cell with no exclusion marker.
     std::vector<GeometryArrayEdit> surfaceEdits(int64_t row, int64_t column,
         int64_t rows, int64_t columns, const std::vector<geometry::SurfacePoint>& desired,
         const std::vector<uint8_t>* validity = nullptr,

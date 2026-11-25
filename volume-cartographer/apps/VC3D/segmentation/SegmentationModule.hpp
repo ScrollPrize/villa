@@ -133,7 +133,7 @@ public:
     void refreshSessionFromSurface(QuadSurface* surface);
     bool applySurfaceUpdateFromGrowth(const cv::Rect& vertexRect);
     void requestAutosaveFromGrowth();
-    [[nodiscard]] bool captureInpaintUndoSnapshot();
+    [[nodiscard]] bool captureSurfaceUndoSnapshot();
     void applyCorrectionAnchorOffset(float offsetX, float offsetY);
     // The active surface's correction point collections in the store.
     void loadCorrections(QuadSurface* surface);
@@ -416,7 +416,6 @@ private:
                      const cv::Vec3f& worldPos);
     void onSurfaceCollectionChanged(std::string name, std::shared_ptr<Surface> surface);
 
-    [[nodiscard]] bool captureUndoSnapshot();
     [[nodiscard]] bool captureUndoDelta(bool activateRepairedCells = false);
     void discardLastUndoSnapshot();
     bool restoreUndoSnapshot();

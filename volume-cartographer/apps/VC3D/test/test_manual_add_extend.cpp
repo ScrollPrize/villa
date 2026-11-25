@@ -64,6 +64,7 @@ private slots:
     void resizeSurfaceGridKeepsChannelsAligned();
     void resizeSurfaceGridRejectsLossyChannels();
     void maskCellsBecomeValid();
+    void brushRetainsOnlyOccupiedVerticesAsExclusions();
     void maskedFillSurvivesReload();
     void repairedCellUndoRestoresHiddenCoordinatesAndValidity();
     void inpaintUndoRestoresRepairStateAfterPadding();
@@ -320,6 +321,49 @@ void TestManualAddExtend::maskCellsBecomeValid()
     QVERIFY(segmentation::markMaskCellsValid(surface, {cv::Point(1, 1)}));
     cv::Mat updated = surface.channel("mask", SURF_CHANNEL_NORESIZE);
     QCOMPARE(cv::countNonZero(updated), 64);
+}
+
+void TestManualAddExtend::brushRetainsOnlyOccupiedVerticesAsExclusions()
+{
+    auto points = flatSheet(4, 4, cv::Rect(0, 0, 4, 4));
+    const cv::Point corner(3, 3);
+    const cv::Point empty(2, 2);
+    const cv::Point alreadyHidden(0, 0);
+    const auto originalCorner = points(corner);
+    const auto originalHidden = points(alreadyHidden);
+    points(empty) = points(alreadyHidden) = kInvalid;
+    QuadSurface surface(points, {0.5f, 0.5f});
+    cv::Mat_<uint8_t> mask(8, 8, uint8_t{255});
+    mask(cv::Rect(0, 0, 2, 2)).setTo(0);
+    mask(cv::Rect(4, 4, 2, 2)).setTo(0);
+    surface.setChannel("mask", mask);
+    surface.maskedVertices = {{alreadyHidden, originalHidden}, {corner, cv::Vec3f(6, 6, 90)}};
+    cv::Mat_<uint8_t> existing(4, 4, uint8_t{0});
+    existing(alreadyHidden) = 255;
+    surface.setChannel("growth_exclusions", existing);
+
+    const auto changed = segmentation::excludeSurfaceVertices(surface, {empty, corner, corner, alreadyHidden});
+    QCOMPARE(changed, cv::Rect(corner, cv::Size(1, 1)));
+    QCOMPARE(surface.rawPoints()(corner), kInvalid);
+    QCOMPARE(surface.pointsForStorage()(corner), originalCorner);
+    QCOMPARE(surface.pointsForStorage()(alreadyHidden), originalHidden);
+    QCOMPARE(surface.pointsForStorage()(empty), kInvalid);
+    const cv::Mat_<uint8_t> markers = surface.channel("growth_exclusions", SURF_CHANNEL_NORESIZE);
+    QCOMPARE(markers(corner), uint8_t{255});
+    QCOMPARE(markers(alreadyHidden), uint8_t{255});
+    QCOMPARE(markers(empty), uint8_t{0});
+    QCOMPARE(surface.vertexMask()(corner), uint8_t{0});
+    QCOMPARE(surface.channel("mask", SURF_CHANNEL_NORESIZE).size(), cv::Size(8, 8));
+    QCOMPARE(surface.maskedVertices.size(), size_t{2});
+
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const auto path = std::filesystem::path(dir.path().toStdString()) / "brushed";
+    surface.save(path);
+    QuadSurface reloaded(path);
+    QCOMPARE(reloaded.rawPoints()(corner), kInvalid);
+    QCOMPARE(reloaded.pointsForStorage()(corner), originalCorner);
+    QCOMPARE(reloaded.channel("growth_exclusions").at<uint8_t>(corner), uint8_t{255});
 }
 
 void TestManualAddExtend::maskedFillSurvivesReload()

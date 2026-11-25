@@ -818,7 +818,8 @@ void CState::closeAll(const std::function<void()>& afterSave)
 
 // --- Surface methods (from CSurfaceCollection) ---
 
-void CState::setSurface(const std::string& name, std::shared_ptr<Surface> surf, bool noSignalSend, bool isEditUpdate)
+void CState::setSurface(const std::string& name, std::shared_ptr<Surface> surf, bool noSignalSend, bool isEditUpdate,
+                        bool fullDraft)
 {
     auto it = _surfs.find(name);
     const bool sameSurface = it != _surfs.end() && it->second == surf;
@@ -850,9 +851,9 @@ void CState::setSurface(const std::string& name, std::shared_ptr<Surface> surf, 
     }
 
     _surfs[name] = surf;
-    if (name == "segmentation" && (!sameSurface || (isEditUpdate && !_activeSurfaceEditing))) {
+    if (name == "segmentation" && (fullDraft || !sameSurface || (isEditUpdate && !_activeSurfaceEditing))) {
         // A surface newly set without an edit is the one opened from its store.
-        draftActiveSurface(std::dynamic_pointer_cast<QuadSurface>(surf), !sameSurface && !isEditUpdate);
+        draftActiveSurface(std::dynamic_pointer_cast<QuadSurface>(surf), !fullDraft && !sameSurface && !isEditUpdate, fullDraft);
     }
     if (!sameSurface) {
         // Edit updates re-set the same pointer every frame; only a mapping
@@ -876,7 +877,7 @@ void CState::setSurface(const std::string& name, std::shared_ptr<Surface> surf, 
     }
 }
 
-void CState::draftActiveSurface(const std::shared_ptr<QuadSurface>& surface, bool saved)
+void CState::draftActiveSurface(const std::shared_ptr<QuadSurface>& surface, bool saved, bool fullChannels)
 {
     // Workspaces sharing the main session draft their own surfaces.
     if (_objectStoreOwner || !_objectStoreSession) {
@@ -896,7 +897,7 @@ void CState::draftActiveSurface(const std::shared_ptr<QuadSurface>& surface, boo
         QMetaObject::invokeMethod(this, [this, uuid] { emit recoveredDraftFound(uuid); }, Qt::QueuedConnection);
         return;
     }
-    _objectStoreSession->setDraft(surface->id, quad_surface_grid(*surface),
+    _objectStoreSession->setDraft(surface->id, SessionDrafts::surfaceForDraft(*surface, fullChannels),
                                   vc::objects::volumeCoordinates(*_annotationVolume));
     if (saved) _objectStoreSession->markDraftSaved(surface->id, _objectStoreSession->draftRevision(surface->id));
     _activeSurfaceDraft = surface->id;

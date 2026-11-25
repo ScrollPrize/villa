@@ -160,7 +160,8 @@ public:
     void closeAll(const std::function<void()>& afterSave = {});
 
     // --- Surfaces (inlined from CSurfaceCollection) ---
-    void setSurface(const std::string& name, std::shared_ptr<Surface> surf, bool noSignalSend = false, bool isEditUpdate = false);
+    void setSurface(const std::string& name, std::shared_ptr<Surface> surf, bool noSignalSend = false,
+                    bool isEditUpdate = false, bool fullDraft = false);
     // While an edit session publishes the open surface's changed rectangles to
     // its draft itself, edit updates do not re-draft the whole surface.
     void setActiveSurfaceEditing(bool editing) { _activeSurfaceEditing = editing; }
@@ -215,7 +216,7 @@ private:
     // queries read it there rather than from its store.
     // `saved`: the surface holds its committed geometry (just opened), so its
     // draft needs no checkpoint until it changes.
-    void draftActiveSurface(const std::shared_ptr<QuadSurface>& surface, bool saved = false);
+    void draftActiveSurface(const std::shared_ptr<QuadSurface>& surface, bool saved = false, bool fullChannels = false);
     std::string _activeSurfaceDraft;
     SessionDrafts* _sessionDrafts = nullptr;
     bool _activeSurfaceEditing = false;

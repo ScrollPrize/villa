@@ -154,15 +154,22 @@ void SurfaceStoreEdit::save(QuadSurface& surface, const cv::Rect& rect, const st
             // Channels first; the vertex edit then applies to the validity they set.
             std::vector<uint8_t> validity;
             std::vector<uint8_t> clearMaskedCoordinates;
+            bool completeCoordinateState = false;
             const std::vector<uint8_t>* replaced = nullptr;
             if (!channels.empty()) {
                 auto op = quad_channels_operation(_uuid, surface, channels, {}, points.rows, points.cols);
                 for (const auto& array : op.channels) {
                     if (array.name == "valid") { validity = array.bytes; replaced = &validity; }
-                    if (array.name == "growth_exclusions") clearMaskedCoordinates = array.bytes;
+                    if (array.name == "growth_exclusions") completeCoordinateState = true;
                 }
                 request.operations.push_back(std::move(op));
             }
+            // A complete exclusion snapshot also records that an empty cell
+            // has no hidden XYZ. Undo of a repair can restore ordinary padding
+            // (zero marker), not just an explicit exclusion (nonzero marker).
+            // pointsForStorage still supplies real retained XYZ where present.
+            if (replaced && completeCoordinateState)
+                clearMaskedCoordinates.assign(validity.size(), uint8_t{255});
             const auto view = transformed ? *transformed : snapshot.viewStored(_uuid, *_pin.geometryRevision);
             if (auto edit = quad_rect_edit(view, surface, rect, replaced,
                     clearMaskedCoordinates.empty() ? nullptr : &clearMaskedCoordinates))

@@ -572,7 +572,7 @@ void SurfaceRotationOverlayController::updatePreview()
 void SurfaceRotationOverlayController::showActive(const std::shared_ptr<QuadSurface>& surface)
 {
     // CState drafts the shown surface, so store queries see the preview's grid.
-    _state->setSurface("segmentation", surface, false, true);
+    _state->setSurface("segmentation", surface, false, true, true);
 }
 
 void SurfaceRotationOverlayController::applyRotation()
@@ -676,6 +676,9 @@ void SurfaceRotationOverlayController::applyRotation()
                     return;
                 }
 
+                // Publish the complete replacement draft before the durable save
+                // checkpoints it, including transformed channels and hidden XYZ.
+                self->showActive(result.surface);
                 if (!self->_saver || !self->_saver(result.surface.get())) {
                     if (self->_sourceSurface) {
                         self->showActive(self->_sourceSurface);
@@ -684,7 +687,6 @@ void SurfaceRotationOverlayController::applyRotation()
                                          tr("Failed to save the transformed surface to the object store."));
                     return;
                 }
-                self->showActive(result.surface);
 
                 self->_rotateActive = false;
                 self->_angleDeg = 0.0;
@@ -723,5 +725,6 @@ std::shared_ptr<QuadSurface> SurfaceRotationOverlayController::cloneSurface(cons
     }
     clone->id = surface->id;
     clone->meta = surface->meta;
+    clone->maskedVertices = surface->maskedVertices;
     return clone;
 }

@@ -394,6 +394,9 @@ std::shared_ptr<QuadSurface> SegmentationCommandHandler::activeSurface(const std
 
 bool SegmentationCommandHandler::publishSurface(QuadSurface* surface, const QString& action)
 {
+    if (_state)
+        if (const auto live = activeSurface(surface->id))
+            _state->setSurface("segmentation", live, false, true, true);
     if (_surfaceSaver && _surfaceSaver(surface)) {
         return true;
     }
@@ -1614,7 +1617,16 @@ bool SegmentationCommandHandler::cropSurfaceToValidRegion(const std::string& seg
     const int origCols = points->cols;
     const int origRows = points->rows;
 
-    const auto boundsOpt = computeValidSurfaceBounds(*points);
+    auto boundsOpt = computeValidSurfaceBounds(surface->pointsForStorage());
+    // A marker without XYZ is still part of the edited grid, rather than padding.
+    const cv::Mat_<uint8_t> exclusions = surface->channel("growth_exclusions");
+    if (!exclusions.empty())
+        for (int r = 0; r < exclusions.rows; ++r)
+            for (int c = 0; c < exclusions.cols; ++c)
+                if (exclusions(r, c)) {
+                    const cv::Rect cell(c, r, 1, 1);
+                    boundsOpt = boundsOpt ? (*boundsOpt | cell) : cell;
+                }
     if (!boundsOpt) {
         return fail(tr("Surface %1 does not contain any valid vertices to crop.")
                         .arg(QString::fromStdString(segmentId)));
@@ -1676,6 +1688,10 @@ bool SegmentationCommandHandler::cropSurfaceToValidRegion(const std::string& seg
 
     // The cropped grid replaces the stored geometry (a dropped channel goes with it).
     croppedPoints.copyTo(*points);
+    std::vector<QuadSurface::MaskedVertex> maskedVertices;
+    for (const auto& vertex : surface->maskedVertices)
+        if (roi.contains(vertex.cell)) maskedVertices.push_back({vertex.cell - roi.tl(), vertex.coords});
+    surface->maskedVertices = std::move(maskedVertices);
     for (const auto& ch : croppedChannels) {
         surface->setChannel(ch.name, ch.data);
     }
@@ -1683,6 +1699,7 @@ bool SegmentationCommandHandler::cropSurfaceToValidRegion(const std::string& seg
         surface->setChannel("generations", cv::Mat());
     }
     surface->invalidateCache();
+    if (_state) _state->setSurface("segmentation", surf, false, true, true);
     if (!_surfaceSaver || !_surfaceSaver(surface)) {
         return fail(tr("Failed to save the cropped surface %1.").arg(QString::fromStdString(segmentId)));
     }

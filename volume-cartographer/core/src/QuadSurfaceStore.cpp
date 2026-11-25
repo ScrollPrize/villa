@@ -81,6 +81,11 @@ std::vector<int64_t> pointsShape(const vc::objects::GeometryRevision& revision)
 
 } // namespace
 
+cv::Mat quad_channel_mat(const vc::objects::GeometryArray& channel)
+{
+    return matFromBytes(channel.dtype, channel.shape, channel.bytes);
+}
+
 std::unique_ptr<QuadSurface> load_quad_from_store(const vc::objects::StoreReader& reader,
     const std::string& objectUuid, const std::optional<std::string>& geometryRevision, bool applyValidity, const vc::objects::TransformedGeometryView* transformed)
 {
@@ -136,8 +141,8 @@ std::function<cv::Mat(const std::string&)> store_channel_loader(
             if (!descriptor) throw std::runtime_error("geometry revision not found: " + revision);
             for (const auto& array : descriptor->arrays)
                 if (array.name == name)
-                    result = matFromBytes(array.dtype, array.shape,
-                        reader.readGeometryRectangle(revision, name, 0, 0, array.shape[0], array.shape[1]));
+                    result = quad_channel_mat({name, array.dtype, array.shape,
+                        reader.readGeometryRectangle(revision, name, 0, 0, array.shape[0], array.shape[1])});
         });
         return result;
     };

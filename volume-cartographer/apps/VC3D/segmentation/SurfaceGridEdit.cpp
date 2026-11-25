@@ -143,6 +143,48 @@ bool markMaskCellsValid(QuadSurface& surface, const std::vector<cv::Point>& cell
     return changed;
 }
 
+cv::Rect excludeSurfaceVertices(QuadSurface& surface, const std::vector<cv::Point>& cells)
+{
+    auto* points = surface.rawPointsPtr();
+    if (!points || points->empty() || cells.empty()) return {};
+
+    const auto size = points->size();
+    const cv::Rect bounds(cv::Point{}, size);
+    auto mask = editableMask(surface, size);
+    if (mask.empty()) mask = surface.validMask();
+    mask = mask.clone();
+    cv::Mat_<uint8_t> exclusions = surface.channel("growth_exclusions", SURF_CHANNEL_NORESIZE);
+    if (exclusions.empty()) exclusions = cv::Mat_<uint8_t>(size, uint8_t{0});
+    else if (exclusions.size() == size) exclusions = exclusions.clone();
+    else return {};
+
+    std::map<std::pair<int, int>, size_t> retained;
+    for (size_t i = 0; i < surface.maskedVertices.size(); ++i) {
+        const auto& cell = surface.maskedVertices[i].cell;
+        retained.try_emplace({cell.y, cell.x}, i);
+    }
+    cv::Rect changed;
+    for (const auto& cell : cells) {
+        if (!bounds.contains(cell)) continue;
+        auto& point = (*points)(cell);
+        if (!vc::geometry::validSurfacePoint(point)) continue;
+        if (const auto prior = retained.find({cell.y, cell.x}); prior != retained.end())
+            surface.maskedVertices[prior->second].coords = point;
+        else
+            surface.maskedVertices.push_back({cell, point});
+        point = {-1, -1, -1};
+        maskBlock(mask, size, cell.y, cell.x).setTo(0);
+        exclusions(cell) = 255;
+        changed |= cv::Rect(cell, cv::Size(1, 1));
+    }
+    if (!changed.empty()) {
+        surface.setChannel("mask", mask);
+        surface.setChannel("growth_exclusions", exclusions);
+        surface.invalidateCache();
+    }
+    return changed;
+}
+
 bool activateRepairedVertices(QuadSurface& surface, std::vector<VertexDelta>& deltas)
 {
     const auto& points = *std::as_const(surface).rawPointsPtr();
@@ -179,6 +221,13 @@ bool activateRepairedVertices(QuadSurface& surface, std::vector<VertexDelta>& de
         repair->second->previousHiddenWorld = vertex.coords;
         return true;
     });
+    // A repaired padding cell had no XYZ or exclusion before the edit. Keep
+    // an explicit sidecar, even when all markers are zero, so Undo/save and
+    // checkpoint recovery can replace that coordinate with true absence.
+    if (maskChanged && exclusions.empty()) {
+        exclusions = cv::Mat_<uint8_t>(size, uint8_t{0});
+        exclusionsChanged = true;
+    }
     if (maskChanged) surface.setChannel("mask", mask);
     if (exclusionsChanged) surface.setChannel("growth_exclusions", exclusions);
     if (maskChanged || exclusionsChanged || erased) surface.invalidateCache();

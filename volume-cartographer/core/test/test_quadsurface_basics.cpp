@@ -440,6 +440,125 @@ TEST_CASE("rotate runs without crashing on dense grid")
     CHECK(qs.rawPointsPtr() != nullptr);
 }
 
+TEST_CASE("right-angle rotation preserves rectangular edges and oversampled exclusions exactly")
+{
+    auto points = makePlanarGrid(3, 5);
+    const std::vector<cv::Point> cells{{0,0}, {4,0}, {0,2}, {4,2}};
+    cv::Mat_<uint8_t> marker(points.size(), uint8_t{0});
+    cv::Mat_<uint8_t> mask(6, 10, uint8_t{255});
+    cv::Mat_<uint16_t> generations(points.size());
+    for (int r=0;r<points.rows;++r) for(int c=0;c<points.cols;++c) generations(r,c)=uint16_t(1+r*points.cols+c);
+    QuadSurface surface(points, {1,1});
+    for (size_t i=0;i<cells.size();++i) {
+        const auto cell = cells[i];
+        (*surface.rawPointsPtr())(cell) = {-1,-1,-1};
+        marker(cell) = 255;
+        mask(cv::Rect(2*cell.x, 2*cell.y, 2, 2)).setTo(0);
+        if (i%2==0) surface.maskedVertices.push_back({cell, points(cell)});
+    }
+    surface.setChannel("mask", mask);
+    surface.setChannel("growth_exclusions", marker);
+    surface.setChannel("generations", generations);
+    surface.rotate(90);
+    REQUIRE(surface.rawPointsPtr()->size() == cv::Size(3,5));
+    cv::Mat expectedMask;
+    cv::rotate(mask, expectedMask, cv::ROTATE_90_COUNTERCLOCKWISE);
+    const auto rotatedMask = surface.channel("mask", SURF_CHANNEL_NORESIZE);
+    REQUIRE(rotatedMask.size() == cv::Size(6,10));
+    CHECK(cv::norm(rotatedMask, expectedMask, cv::NORM_INF) == 0);
+    const cv::Mat_<uint8_t> rotatedMarker = surface.channel("growth_exclusions");
+    CHECK(cv::countNonZero(rotatedMarker) == 4);
+    const auto stored = surface.pointsForStorage();
+    const cv::Mat_<uint16_t> rotatedGenerations = surface.channel("generations");
+    for (size_t i=0;i<cells.size();++i) {
+        const auto cell = cells[i];
+        const cv::Point target(cell.y, points.cols-1-cell.x);
+        CHECK(rotatedMarker(target) == 255);
+        CHECK((*surface.rawPointsPtr())(target) == cv::Vec3f(-1,-1,-1));
+        CHECK(stored(target) == (i%2==0 ? points(cell) : cv::Vec3f(-1,-1,-1)));
+        CHECK(rotatedGenerations(target) == generations(cell));
+    }
+}
+
+TEST_CASE("oblique rotation keeps colliding exclusions distinct without sampling hidden XYZ")
+{
+    const std::vector<cv::Point> cells{{1,1}, {2,1}, {0,6}};
+    const auto makeSurface = [&](float hiddenZ) {
+        auto surface = std::make_unique<QuadSurface>(makePlanarGrid(7,7), cv::Vec2f(1,1));
+        cv::Mat_<uint8_t> marker(7,7,uint8_t{0});
+        cv::Mat_<uint8_t> mask(7,7,uint8_t{255});
+        cv::Mat_<uint16_t> generations(7,7,uint16_t{1});
+        for (size_t i=0;i<cells.size();++i) {
+            const auto cell = cells[i];
+            (*surface->rawPointsPtr())(cell) = {-1,-1,-1};
+            marker(cell)=255; mask(cell)=0; generations(cell)=uint16_t(17+i);
+            if (i<2) surface->maskedVertices.push_back({cell, {float(cell.x),float(cell.y),hiddenZ+float(i)}});
+        }
+        surface->setChannel("mask",mask);
+        surface->setChannel("growth_exclusions",marker);
+        surface->setChannel("generations",generations);
+        return surface;
+    };
+    auto a = makeSurface(101), b = makeSurface(501);
+    a->rotate(45); b->rotate(45);
+    const cv::Mat_<uint8_t> marker = a->channel("growth_exclusions");
+    const cv::Mat_<uint8_t> mask = a->channel("mask");
+    const cv::Mat_<uint16_t> generations = a->channel("generations");
+    CHECK(cv::countNonZero(marker) == 3);
+    CHECK(a->maskedVertices.size() == 2);
+    CHECK(cv::norm(*a->rawPointsPtr(), *b->rawPointsPtr(), cv::NORM_INF) == 0);
+    std::set<std::pair<int,int>> retained;
+    for (const auto& vertex : a->maskedVertices) {
+        CHECK(retained.emplace(vertex.cell.y, vertex.cell.x).second);
+        CHECK(marker(vertex.cell) == 255);
+        CHECK(mask(vertex.cell) == 0);
+        CHECK(a->pointsForStorage()(vertex.cell) == vertex.coords);
+        CHECK(generations(vertex.cell) == uint16_t(vertex.coords[2]-101+17));
+    }
+    int absent = 0;
+    const auto stored = a->pointsForStorage();
+    for (int r=0;r<marker.rows;++r) for(int c=0;c<marker.cols;++c) {
+        CHECK((marker(r,c)==0 || marker(r,c)==255));
+        if (marker(r,c)) {
+            CHECK(mask(r,c)==0);
+            CHECK((*a->rawPointsPtr())(r,c)==cv::Vec3f(-1,-1,-1));
+            if (!vc::geometry::validSurfacePoint(stored(r,c))) {
+                ++absent;
+                CHECK(generations(r,c)==19);
+            }
+        }
+    }
+    CHECK(absent == 1);
+}
+
+TEST_CASE("flips move retained XYZ and marker-only exclusions with lazy channels")
+{
+    auto points = makePlanarGrid(4,7);
+    QuadSurface surface(points, {1,1});
+    const cv::Point hidden(1,1), empty(5,2);
+    (*surface.rawPointsPtr())(hidden) = (*surface.rawPointsPtr())(empty) = {-1,-1,-1};
+    surface.maskedVertices.push_back({hidden,points(hidden)});
+    surface.setChannel("mask",surface.validMask());
+    surface.setChannel("growth_exclusions",cv::Mat{});
+    int reads = 0;
+    surface.setChannelLoader([&](const std::string& name) -> cv::Mat {
+        CHECK(name=="growth_exclusions"); ++reads;
+        cv::Mat_<uint8_t> marker(points.size(),uint8_t{0});
+        marker(hidden)=marker(empty)=255;
+        return marker;
+    });
+    surface.flipV();
+    CHECK(reads==1);
+    CHECK(surface.pointsForStorage()(1,5)==points(hidden));
+    CHECK(surface.channel("growth_exclusions").at<uint8_t>(2,1)==255);
+    surface.flipU();
+    CHECK(surface.pointsForStorage()(2,5)==points(hidden));
+    CHECK(surface.channel("growth_exclusions").at<uint8_t>(1,1)==255);
+    surface.flipU(); surface.flipV();
+    CHECK(surface.pointsForStorage()(hidden)==points(hidden));
+    CHECK(surface.pointsForStorage()(empty)==cv::Vec3f(-1,-1,-1));
+}
+
 TEST_CASE("dpi getter / setter")
 {
     auto pts = makePlanarGrid(2, 2);

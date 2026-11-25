@@ -178,24 +178,7 @@ void SegmentationModule::onSurfaceCollectionChanged(std::string name, std::share
     setEditingEnabled(false);
 }
 
-bool SegmentationModule::captureUndoSnapshot()
-{
-    if (_suppressUndoCapture) {
-        return false;
-    }
-    if (!_editManager || !_editManager->hasSession()) {
-        return false;
-    }
-
-    const auto& previewPoints = _editManager->previewPoints();
-    if (previewPoints.empty()) {
-        return false;
-    }
-
-    return _undoHistory.capture(previewPoints);
-}
-
-bool SegmentationModule::captureInpaintUndoSnapshot()
+bool SegmentationModule::captureSurfaceUndoSnapshot()
 {
     if (_suppressUndoCapture || !_editManager || !_editManager->hasSession()) return false;
     auto surface = _editManager->baseSurface();
@@ -495,8 +478,8 @@ void SegmentationModule::offerRecoveredDraft(const QString& objectUuid)
     const auto pin = storeEdit->pin();
     // The recovered grid must address this surface's grid in the frame it is open in.
     QString mismatch;
-    if (!points || contents->surface.rows != points->rows || contents->surface.columns != points->cols)
-        mismatch = tr("its grid size differs from the surface as opened");
+    if (!points || !SessionDrafts::canRestoreSurface(*surface, contents->surface))
+        mismatch = tr("its grid size differs and its saved channels are incomplete");
     else if (vc::objects::geometryCoordinates(contents->coordinates) != vc::objects::geometryCoordinates(editCoordinates(*storeEdit)))
         mismatch = tr("it was made in another volume or scale; open the surface in that volume to restore it");
 

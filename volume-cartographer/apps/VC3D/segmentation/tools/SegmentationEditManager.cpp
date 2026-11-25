@@ -136,15 +136,7 @@ void SegmentationEditManager::flushDraft()
     if (rect.empty()) {
         return;
     }
-    std::vector<vc::geometry::SurfacePoint> changed;
-    changed.reserve(size_t(rect.area()));
-    for (int r = rect.y; r < rect.y + rect.height; ++r)
-        for (int c = rect.x; c < rect.x + rect.width; ++c) {
-            const auto& p = (*points)(r, c);
-            changed.push_back(vc::geometry::validSurfacePoint(p) ? vc::geometry::SurfacePoint{p[0], p[1], p[2]}
-                                                                 : vc::geometry::SurfacePoint{-1, -1, -1});
-        }
-    _draft->session->updateDraft(_baseSurface->id, rect.y, rect.x, rect.height, rect.width, changed);
+    SessionDrafts::updateSurfaceDraft(*_draft->session, *_baseSurface, rect);
 }
 
 void SegmentationEditManager::setRadius(float radiusSteps)
