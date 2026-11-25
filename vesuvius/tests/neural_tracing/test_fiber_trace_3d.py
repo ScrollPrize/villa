@@ -3811,6 +3811,37 @@ def test_3d_fiber_inference_adapter_schema_preserves_branch_options() -> None:
         ]
 
 
+@pytest.mark.parametrize("mode", ["zscore", "minmax"])
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "mps",
+            marks=pytest.mark.skipif(
+                not torch.backends.mps.is_available(), reason="requires Apple GPU (MPS)"
+            ),
+        ),
+    ],
+)
+def test_3d_fiber_inference_adapter_preprocesses_masked_tiles(mode: str, device: str) -> None:
+    adapter = FiberTrace3DPredictAdapter(
+        {"patch_shape_zyx": [8, 8, 8], "image_normalization": mode},
+        product_prefix="fiber",
+    )
+    tile = torch.arange(2 * 8**3, dtype=torch.float32).reshape(2, 1, 8, 8, 8)
+    valid = torch.zeros_like(tile, dtype=torch.bool)
+    valid[0, :, 2:] = True
+
+    expected = adapter.preprocess_tile(tile, valid)
+    actual = adapter.preprocess_tile(tile.to(device), valid.to(device))
+
+    assert actual.device.type == device
+    torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+    assert not torch.equal(expected[0], tile[0])
+    torch.testing.assert_close(actual[1].cpu(), tile[1], rtol=0, atol=0)
+
+
 def test_3d_fiber_inference_adapter_splits_branch_output_without_collapsing() -> None:
     adapter = FiberTrace3DPredictAdapter(
         {
