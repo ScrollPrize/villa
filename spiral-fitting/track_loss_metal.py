@@ -448,7 +448,6 @@ def track_radius_loss_metal(sampled_spiral, dr_per_winding, sample, cfg):
     return group_loss.mean(), unwrapped, adjust, theta, targets
 
 
-
 def _enabled():
     return (os.environ.get('FIT_SPIRAL_METAL', '1') != '0'
             and os.environ.get('FIT_SPIRAL_METAL_TRACKS', '1') != '0'

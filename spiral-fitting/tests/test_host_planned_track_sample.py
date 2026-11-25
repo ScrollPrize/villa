@@ -92,6 +92,17 @@ def test_host_planned_batches_equal_eager(monkeypatch):
     partners = 0
     for left, right in zip(eager, planned):
         assert 'partner_offsets' in right, 'the host-planned path did not run'
+        assert set(right) - set(left) == {'partner_offsets'}
+        # the fused loss walks group g's partner rows over
+        # [partner_offsets[g], partner_offsets[g + 1]), so they must be
+        # contiguous and in group order
+        # track_idx covers partner rows too; the first num_groups rows are the primaries
+        k = int(left['num_groups'])
+        partner_group = left['group_id'][k:].to(torch.int64)
+        assert torch.all(partner_group[1:] >= partner_group[:-1])
+        expected = torch.searchsorted(
+            partner_group, torch.arange(k + 1, dtype=torch.int64), side='left')
+        assert torch.equal(right['partner_offsets'], expected)
         for key, value in left.items():
             other = right[key]
             if torch.is_tensor(value):

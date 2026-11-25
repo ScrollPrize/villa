@@ -201,4 +201,11 @@ def test_detached_outputs_match_eager_intermediates():
     assert torch.allclose(theta, theta_e, atol=1e-5)
     assert torch.allclose(unwrapped, shifted + alignment, rtol=1e-5, atol=1e-3)
     assert torch.allclose(adjust, adjust_e + alignment, rtol=1e-5, atol=1e-3)
+    # the group targets feed the DT loss's snap target, so their values matter
+    unwrapped_e = shifted + alignment
+    _, targets_e, _ = _grouped_same_radius_loss(
+        unwrapped_e, unwrapped_e[sample['target_flat_idx']], sample['row_id'],
+        sample['group_id'], sample['row_slot'], sample['num_groups'],
+        sample['group_width'], dr, CFG)
     assert targets.shape == (sample['num_groups'],)
+    assert torch.allclose(targets, targets_e, rtol=1e-5, atol=1e-3)
