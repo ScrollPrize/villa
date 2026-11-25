@@ -371,7 +371,9 @@ This writes `render/00.tif` (360×360 pixels for the segment above, about
   `--voxel-size` is always the size of a level-0 voxel, whatever `-g` is: the
   renderer scales it to the rendered level itself and logs the result as
   `Output pixel size (group 1, scale 1): ...`. Passing the level-1 size with
-  `-g 1` declares pixels twice their real size.
+  `-g 1` declares pixels twice their real size, so when the volume records its
+  own size and `--voxel-size` is exactly `2^g` times it, the render is refused
+  unless `--allow-voxel-size-mismatch` is given; other differences only warn.
 - `-g` selects the pyramid level: `-g 3` renders the same segment at 1/8
   scale (45×45 pixels, about 4 MiB fetched). A level the remote pyramid does
   not have fails immediately with

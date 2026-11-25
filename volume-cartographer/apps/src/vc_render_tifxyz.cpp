@@ -802,6 +802,58 @@ static ResolvedVoxelSize resolveRenderVoxelSize(
     return {};
 }
 
+// An explicit --voxel-size is used as given, but a volume that records its own
+// size is a cheap cross-check: a value that differs by more than 1 % is warned
+// about. The usual cause is passing the size of the level being rendered, where
+// --voxel-size is the size of a level-0 voxel. When the ratio is exactly the
+// factor --group-idx explains (2^group-idx within 1 %) the cause is certain, so
+// that case is refused unless --allow-voxel-size-mismatch says it is meant.
+// Returns false to refuse. Never changes the size used.
+static bool checkExplicitVoxelSize(
+    const std::filesystem::path& volPath,
+    const Volume* remoteVolume,
+    double explicitValue,
+    const std::string& explicitUnit,
+    int groupIdx,
+    bool allowMismatch)
+{
+    const auto cli = explicitMicrometerPerVoxel(explicitValue, explicitUnit);
+    const ResolvedVoxelSize own =
+        resolveRenderVoxelSize(volPath, remoteVolume, false, 0.0, {});
+    if (!cli || !own.isUsable() || std::abs(*cli / own.micrometerPerVoxel - 1.0) <= 0.01)
+        return true;
+
+    const double ratio = *cli / own.micrometerPerVoxel;
+    const bool levelCause =
+        groupIdx > 0 && std::abs(ratio / std::ldexp(1.0, groupIdx) - 1.0) <= 0.01;
+    if (levelCause && !allowMismatch) {
+        // The value to pass is the volume's own size in the caller's unit.
+        const double passValue = own.micrometerPerVoxel / (*explicitMicrometerPerVoxel(1.0, explicitUnit));
+        logPrintf(stderr,
+                  "Error: --voxel-size %g %s is %.4g times the volume's own recorded size (%g micrometer). "
+                  "--voxel-size is the size of a level-0 voxel; with --group-idx %d the renderer scales it "
+                  "itself. Pass --voxel-size %g --voxel-unit %s, or add --allow-voxel-size-mismatch if %g %s "
+                  "really is the level-0 size.\n",
+                  explicitValue, explicitUnit.c_str(), ratio, own.micrometerPerVoxel, groupIdx,
+                  passValue, explicitUnit.c_str(), explicitValue, explicitUnit.c_str());
+        return false;
+    }
+
+    char cause[200] = "";
+    if (levelCause)
+        std::snprintf(cause, sizeof(cause),
+                      " --voxel-size is the size of a level-0 voxel; with --group-idx %d "
+                      "the renderer scales it itself.", groupIdx);
+    else if (std::abs(ratio * 1000.0 - 1.0) <= 0.01 || std::abs(ratio / 1000.0 - 1.0) <= 0.01)
+        std::snprintf(cause, sizeof(cause),
+                      " A factor of 1000 is usually the unit: --voxel-unit is %s.", explicitUnit.c_str());
+    logPrintf(stderr,
+              "Warning: --voxel-size %g micrometer differs from the volume's own metadata "
+              "(%g micrometer) by a factor of %.4g.%s The command-line value is used.\n",
+              *cli, own.micrometerPerVoxel, ratio, cause);
+    return true;
+}
+
 // ============================================================
 // main
 // ============================================================
@@ -886,7 +938,8 @@ int main(int argc, char *argv[])
         ("resume", po::bool_switch()->default_value(false), "Skip chunks that already exist on disk")
         ("pre", po::bool_switch()->default_value(false), "Create zarr + all level datasets")
         ("voxel-size", po::value<double>(), "Physical size of one level-0 voxel of the source volume, whatever --group-idx is; the renderer scales it to the level and --scale it renders at when it writes the OME-Zarr scale metadata (reads from volume metadata if omitted)")
-        ("voxel-unit", po::value<std::string>()->default_value("nanometer"), "Unit of the number given to --voxel-size (nanometer, micrometer, millimeter, meter). Sizes read from volume metadata are always declared in micrometer.");
+        ("voxel-unit", po::value<std::string>()->default_value("nanometer"), "Unit of the number given to --voxel-size (nanometer, micrometer, millimeter, meter). Sizes read from volume metadata are always declared in micrometer.")
+        ("allow-voxel-size-mismatch", po::bool_switch()->default_value(false), "Render with --voxel-size although it is exactly the factor of 2^group-idx away from the size the volume records (normally refused: it means the size of the rendered level was passed, not of level 0)");
     StoreToolOptions::add(optional, "Object store holding the --surface to render; with --volume-uuid it is read in "
                                     "that volume's voxels through the store's view of it (its binding or a "
                                     "registration), replacing --affine and --scale-segmentation",
@@ -1264,6 +1317,10 @@ int main(int argc, char *argv[])
             voxel_unit);
 
         base_voxel_size = resolved.micrometerPerVoxel;
+        if (resolved.source == VoxelSizeSource::Cli &&
+            !checkExplicitVoxelSize(vol_path, remoteVolume.get(), explicitVoxelSize, voxel_unit,
+                                    group_idx, parsed["allow-voxel-size-mismatch"].as<bool>()))
+            return EXIT_FAILURE;
 
         // Emit the number and the unit as a matched pair.
         //
