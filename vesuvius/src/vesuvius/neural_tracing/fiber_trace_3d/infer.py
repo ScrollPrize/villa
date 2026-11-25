@@ -435,7 +435,7 @@ def run_fiber_trace_3d_inference(
     devices: str | tuple[str, ...] | None = None,
     crop_xyzwhd: tuple[int, int, int, int, int, int] | None = None,
     tile_size: int | None = None,
-    overlap: int = 32,
+    overlap: int | None = None,
     border: int = 16,
     inference_scaledown_power: int | None = None,
     base_ref: str | None = None,
@@ -481,12 +481,16 @@ def run_fiber_trace_3d_inference(
         raise ValueError("input_cache_gib must be finite and >= 0")
     if int(prefetch_tiles_per_gpu) <= 0 or int(input_io_threads) <= 0:
         raise ValueError("prefetch_tiles_per_gpu and input_io_threads must be > 0")
-    if int(overlap) < 2 * max(0, int(border)):
+    min_overlap = 2 * max(0, int(border))
+    overlap = max(16, min_overlap) if overlap is None else int(overlap)
+    if overlap < min_overlap:
         # Tiles discard `border` voxels on every side, so a smaller overlap leaves
         # gaps between tile cores that are written as presence 0.
         raise ValueError(f"overlap={overlap} must be >= 2 * border={border}")
     config, config_source = _checkpoint_config_for_inference(checkpoint, config_path)
     tile_size_i = _tile_size_from_config(config, tile_size)
+    if overlap >= tile_size_i:
+        raise ValueError(f"overlap={overlap} must be < tile_size={tile_size_i}")
     output_manifest = Path(output_path)
     from lasagna.compact_zarr import CompactOutputAdapter, resolve_output
     output_manifest, output_format = resolve_output(output_manifest, output_format)
@@ -856,8 +860,9 @@ def main(argv: list[str] | None = None) -> int:
                         help="Export width rounded/clamped to uint8 base-volume voxels.")
     parser.add_argument("--checkpoint", required=True, help="Fiber trace 3D model checkpoint (.pt).")
     parser.add_argument("--tile-size", type=int, default=None, help="Inference tile cube size.")
-    parser.add_argument("--overlap", type=int, default=32,
-                        help="Tile overlap in input voxels; must be >= 2 * --border.")
+    parser.add_argument("--overlap", type=int,
+                        help="Tile overlap in input voxels (default: max(16, 2 * border)); "
+                             "must be at least twice the border and smaller than the tile size.")
     parser.add_argument("--border", type=int, default=16, help="Hard discard border at tile edges.")
     parser.add_argument("--adopt-unrecorded-tiling", action="store_true",
                         help="Resume output stores that record no tiling as if predicted with this tiling; "
@@ -1009,7 +1014,7 @@ def main(argv: list[str] | None = None) -> int:
         devices=args.devices,
         crop_xyzwhd=tuple(int(v) for v in args.crop_xyzwhd) if args.crop_xyzwhd else None,
         tile_size=args.tile_size,
-        overlap=int(args.overlap),
+        overlap=args.overlap,
         border=int(args.border),
         inference_scaledown_power=args.inference_scaledown_power,
         base_ref=args.base_ref,

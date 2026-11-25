@@ -963,36 +963,21 @@ class _ConstantPresenceFiberModel(torch.nn.Module):
         return out
 
 
+@pytest.mark.parametrize(("args", "expected_overlap"), [
+    ((), 32),
+    (("--tile-size", "32", "--border", "8"), 16),
+])
 def test_fiber_inference_cli_defaults_predict_every_voxel(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, args: tuple[str, ...], expected_overlap: int,
 ) -> None:
-    input_path = tmp_path / "input.zarr"
-    arr = create_v2_array(input_path, shape=(96, 96, 96), chunks=(32, 32, 32), dtype=np.uint8)
-    arr[:] = 100
-    checkpoint = tmp_path / "model.pt"
-    torch.save({"config": {
-        "patch_shape_zyx": [64, 64, 64],
-        "image_normalization": "none",
-        "model_3d": {"output_stride": 1},
-        "training": {"mixed_precision": "off"},
-    }}, checkpoint)
-    monkeypatch.setattr(
-        "vesuvius.neural_tracing.fiber_trace_3d.inference_adapter.build_fiber_trace_3d_model",
-        lambda config: _ConstantPresenceFiberModel(),
-    )
-    monkeypatch.setattr(
-        "vesuvius.neural_tracing.fiber_trace_3d.train._load_snapshot",
-        lambda *args, **kwargs: None,
-    )
+    run = _constant_fiber_cli(tmp_path, monkeypatch)
+    output = tmp_path / "fiber.lasagna.json"
 
-    assert fiber_infer_module.main([
-        "--input", str(input_path), "--output", str(tmp_path / "fiber.lasagna.json"),
-        "--output-format", "legacy", "--checkpoint", str(checkpoint),
-        "--base-ref", str(input_path), "--base-scale", "0",
-        "--device", "cpu", "--levels", "1",
-    ]) == 0
+    assert run(output, *args) == 0
 
-    presence = np.asarray(open_zarr(tmp_path / "fiber_presence.ome.zarr" / "0")[:])
+    attrs = json.loads((tmp_path / "fiber_presence.ome.zarr" / ".zattrs").read_text())
+    assert attrs["fiber_inference_tiling"]["overlap"] == expected_overlap
+    presence = _presence(output)
     assert presence.shape == (96, 96, 96)
     assert int((presence == 0).sum()) == 0
 
@@ -1005,6 +990,24 @@ def test_fiber_inference_rejects_overlap_below_both_tile_borders(tmp_path: Path)
             checkpoint=None,
             overlap=16,
             border=16,
+        )
+
+
+@pytest.mark.parametrize(("border", "overlap"), [(16, None), (8, 32), (8, 40)])
+def test_fiber_inference_rejects_overlap_at_or_above_tile_size(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, border: int, overlap: int | None,
+) -> None:
+    monkeypatch.setattr(
+        fiber_infer_module, "_checkpoint_config_for_inference",
+        lambda *_: ({"patch_shape_zyx": [32, 32, 32]}, "checkpoint"),
+    )
+    with pytest.raises(ValueError, match=r"overlap=\d+ must be < tile_size=32"):
+        run_fiber_trace_3d_inference(
+            input_path=str(tmp_path / "input.zarr"),
+            output_path=tmp_path / "fiber.zarr",
+            checkpoint=None,
+            overlap=overlap,
+            border=border,
         )
 
 
