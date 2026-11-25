@@ -1,5 +1,26 @@
 """Ink sample assembly for flat, full_3d, and full_3d_single_wrap modes.
 
+v4 (PR #2677) — one targeted fix on top of v3 (C5):
+
+The unlabeled cache-coverage check now probes uncovered segments
+instead of assuming they mean a stale cache. v3's note below claimed
+a segment that yields no unlabeled patches raises in
+``find_segment_unlabeled_patches``; that is wrong — the finder returns
+([], []) (with a printed warning) when supervision covers every
+candidate, and only raises when the image surface itself is empty
+("contains no nonzero projected data"). So a discovered segment with no
+cached patch can be a legitimately empty segment, and v3 rescanned
+the whole dataset on every unchanged rerun. v4 probes each uncovered
+segment with the unlabeled finder: if every one yields zero patches
+the cache is complete and is reused; if any yields patches (a newly
+ready mirror) or its finding raises (a broken segment), the cache is
+stale and full discovery runs, which handles a defective segment with
+the existing warn-and-skip resilience. The probe costs one finder run
+per uncovered segment and only runs when the cache would otherwise
+have been invalidated; the common case (every segment covered) is
+unchanged. The probe is done here (this file) rather than in
+``patch_cache.py`` to keep the fix inside the three files of this PR.
+
 v3 (PR #2677) — two targeted fixes on top of the v2 resilience patch
 (a segment that fails patch finding no longer aborts the run):
 
@@ -20,15 +41,14 @@ v3 (PR #2677) — two targeted fixes on top of the v2 resilience patch
    reused after a second segment's stores were filled, returning 16
    patches for one segment instead of 32 for both. The check is done
    here (this file) rather than in ``patch_cache.py`` to keep the fix
-   inside the three files of this PR. A segment that yields no
-   unlabeled patches raises in ``find_segment_unlabeled_patches``
-   ("contains no nonzero projected data"), so a discovered segment with
-   no cached patch can only mean the cache predates it — the check
-   cannot misfire on a legitimately empty segment. The only cost is
-   that a dataset with a permanently failing segment re-discovers
-   patches on every run (the failed segment is excluded after
-   discovery, so the saved cache never covers it); correctness wins
-   over that re-discovery cost.
+   inside the three files of this PR. (v4 corrects the next sentence
+   of the original v3 note: the finder does NOT raise for a segment
+   that yields no unlabeled patches — it returns ([], []). Only an
+   empty image surface raises. See the v4 section above.) The only
+   cost is that a dataset with a permanently failing segment
+   re-discovers patches on every run (the failed segment is excluded
+   after discovery, so the saved cache never covers it); correctness
+   wins over that re-discovery cost.
 """
 
 from __future__ import annotations
@@ -264,16 +284,33 @@ class InkDataset(Dataset):
                 # load_patch_cache only verifies segment coverage in
                 # labeled modes; in unlabeled mode a cache written when
                 # a single segment was ready would otherwise be reused
-                # after a second segment's stores were filled. A
-                # discovered segment with no cached patch means the
-                # cache predates it (an unlabeled segment that yields
-                # no patches raises at discovery time instead).
+                # after a second segment's stores were filled. But an
+                # uncovered segment does not always mean the cache
+                # predates it (C5): find_segment_unlabeled_patches
+                # returns ([], []) when supervision covers every
+                # candidate, so a segment can legitimately yield zero
+                # patches. Probe each uncovered segment instead of
+                # assuming staleness: if every one yields zero patches
+                # the cache is complete and stays valid; if any yields
+                # patches (a newly ready mirror) or its finding raises
+                # (a broken segment), the cache is stale and full
+                # discovery runs below, which handles a defective
+                # segment with the warn-and-skip resilience.
                 covered = {patch.segment.cache_key for patch in cached}
-                if any(
-                    segment.cache_key not in covered
+                uncovered = [
+                    segment
                     for segment in self.segments
-                ):
-                    cached = None
+                    if segment.cache_key not in covered
+                ]
+                if uncovered:
+                    try:
+                        if any(
+                            find_segment_unlabeled_patches(segment, self._open)[0]
+                            for segment in uncovered
+                        ):
+                            cached = None
+                    except Exception:
+                        cached = None
             if cached is not None:
                 return cached
 
