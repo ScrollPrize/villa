@@ -181,7 +181,7 @@ NB_MODULE(_reader, m)
             PyErr_SetString(cls.ptr(), e.what());
         } catch (const std::filesystem::filesystem_error& e) {
             errno = e.code().value();
-            PyErr_SetFromErrnoWithFilename(PyExc_OSError, e.path1().c_str());
+            PyErr_SetFromErrnoWithFilename(PyExc_OSError, e.path1().string().c_str());
         }
     });
 

@@ -16,6 +16,14 @@ endif()
 file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/include/vc_reader")
 if(NOT EXISTS "${_vc_native_link}")
     file(CREATE_LINK "${CMAKE_CURRENT_SOURCE_DIR}/src/cpp" "${_vc_native_link}" RESULT _vc_native_linked SYMBOLIC)
+    if(WIN32 AND NOT _vc_native_linked EQUAL 0)
+        # Symbolic links need Developer Mode or admin rights on Windows; a directory
+        # junction does not, and keeps one file per header so #pragma once still works.
+        file(TO_NATIVE_PATH "${_vc_native_link}" _vc_native_link_win)
+        file(TO_NATIVE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/src/cpp" _vc_native_target_win)
+        execute_process(COMMAND cmd /c mklink /J "${_vc_native_link_win}" "${_vc_native_target_win}"
+            RESULT_VARIABLE _vc_native_junction OUTPUT_QUIET ERROR_QUIET)
+    endif()
 endif()
 foreach(header IN LISTS _vc_native_headers)
     if(NOT IS_SYMLINK "${_vc_native_link}")  # no symbolic links (e.g. Windows without developer mode)

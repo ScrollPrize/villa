@@ -86,8 +86,8 @@ VCR_GEOMETRY_HD inline void closest(const CurvesView& c,V p,std::int64_t curve,f
         if(box_distance(p,n)>best)continue;
         if(n.left>=0){
             float a=box_distance(p,c.nodes[n.left]),b=box_distance(p,c.nodes[n.right]);
-            int near=n.left,far=n.right;if(a>b){near=n.right;far=n.left;float t=a;a=b;b=t;}
-            if(b<=best)stack[top++]=far;if(a<=best)stack[top++]=near;
+            int nearer=n.left,farther=n.right;if(a>b){nearer=n.right;farther=n.left;float t=a;a=b;b=t;}
+            if(b<=best)stack[top++]=farther;if(a<=best)stack[top++]=nearer;
         }else for(int j=n.begin;j<n.end;++j){
             int i=c.order[j],id=c.owners[i];V a=vector(c.points+std::size_t(3)*i),q=a;float t=0;
             if(!c.vertices&&i+1<c.offsets[id+1])q=closest_segment(p,a,vector(c.points+std::size_t(3)*(i+1)),t);
