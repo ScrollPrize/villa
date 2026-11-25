@@ -16,7 +16,7 @@ if(NOT DEFINED VC_READER_ENABLE_CUDA OR VC_READER_ENABLE_CUDA)
     if(NOT DEFINED CMAKE_CUDA_COMPILER AND NOT DEFINED ENV{CUDACXX})
         # Toolkit discovery also searches standard locations outside PATH.
         find_package(CUDAToolkit QUIET)
-        if(CUDAToolkit_NVCC_EXECUTABLE)
+        if(CUDAToolkit_FOUND AND CUDAToolkit_NVCC_EXECUTABLE)
             set(CMAKE_CUDA_COMPILER "${CUDAToolkit_NVCC_EXECUTABLE}"
                 CACHE FILEPATH "CUDA compiler")
         endif()
