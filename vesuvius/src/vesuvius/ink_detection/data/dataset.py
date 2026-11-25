@@ -1,27 +1,24 @@
 """Ink sample assembly for flat, full_3d, and full_3d_single_wrap modes.
 
-v4 (PR #2677) — one targeted fix on top of v3 (C5):
+v5 (PR #2677) -- cache behaviour restored to main (review 4, point 6):
 
-The unlabeled cache-coverage check now probes uncovered segments
-instead of assuming they mean a stale cache. v3's note below claimed
-a segment that yields no unlabeled patches raises in
-``find_segment_unlabeled_patches``; that is wrong — the finder returns
-([], []) (with a printed warning) when supervision covers every
-candidate, and only raises when the image surface itself is empty
-("contains no nonzero projected data"). So a discovered segment with no
-cached patch can be a legitimately empty segment, and v3 rescanned
-the whole dataset on every unchanged rerun. v4 probes each uncovered
-segment with the unlabeled finder: if every one yields zero patches
-the cache is complete and is reused; if any yields patches (a newly
-ready mirror) or its finding raises (a broken segment), the cache is
-stale and full discovery runs, which handles a defective segment with
-the existing warn-and-skip resilience. The probe costs one finder run
-per uncovered segment and only runs when the cache would otherwise
-have been invalidated; the common case (every segment covered) is
-unchanged. The probe is done here (this file) rather than in
-``patch_cache.py`` to keep the fix inside the three files of this PR.
+The v3 unlabeled cache-coverage check and the v4 probe that replaced
+it are both REMOVED. ``load_patch_cache`` (``patch_cache.py``,
+unchanged) already verifies segment coverage in labeled modes, so a
+newly ready mirror enters the cache there; in unlabeled mode main
+reuses the cache as written, calling the finder zero times on
+unchanged reruns. The v3 check and the v4 probe both rescanned on
+unchanged reruns whenever a segment legitimately yielded zero
+patches (v3: full re-discovery; v4: one probe call per uncovered
+segment) -- that rescan is what review 4 blocks. Restoring main's
+behaviour is the reviewer's explicit recommendation ("the wider
+changes to cache reuse ... add maintenance beyond that workflow"), and
+the unlabeled-mode staleness it leaves behind (a newly ready mirror
+does not enter an existing unlabeled cache until the cache is
+invalidated by other means) is main's behaviour, not a regression
+introduced here. ``patch_cache.py`` itself is untouched.
 
-v3 (PR #2677) — two targeted fixes on top of the v2 resilience patch
+v3 (PR #2677) -- two targeted fixes on top of the v2 resilience patch
 (a segment that fails patch finding no longer aborts the run):
 
 1. A failed segment is excluded from later sample assembly. Without
@@ -32,23 +29,16 @@ v3 (PR #2677) — two targeted fixes on top of the v2 resilience patch
    time. A failed segment from a held-out source (``split ==
    "validation"``) re-raises its original error at discovery time,
    exactly as main did: held-out patches must be complete or the run
-   must fail, never silently partial.
+   must fail, never silently partial. v5 extends that re-raise to any
+   EXPLICITLY SELECTED segment (allowlisted, explicitly mapped, or
+   held-out -- review 4, point 5): a read failure on one must stop
+   the run before it trains or scores a subset, as main does when
+   patch finding opens its masks. An auto-discovered segment in the
+   same state is still warned about and skipped.
 
-2. The patch-cache coverage check also runs in unlabeled mode.
-   ``load_patch_cache`` only verifies that every discovered segment is
-   represented by at least one cached patch in labeled modes; in
-   unlabeled mode a cache written when only one segment was ready was
-   reused after a second segment's stores were filled, returning 16
-   patches for one segment instead of 32 for both. The check is done
-   here (this file) rather than in ``patch_cache.py`` to keep the fix
-   inside the three files of this PR. (v4 corrects the next sentence
-   of the original v3 note: the finder does NOT raise for a segment
-   that yields no unlabeled patches — it returns ([], []). Only an
-   empty image surface raises. See the v4 section above.) The only
-   cost is that a dataset with a permanently failing segment
-   re-discovers patches on every run (the failed segment is excluded
-   after discovery, so the saved cache never covers it); correctness
-   wins over that re-discovery cost.
+2. (REMOVED in v5 -- see the v5 section above.) The patch-cache
+   coverage check in unlabeled mode, and the v4 probe that replaced
+   it, are gone: cache reuse is exactly main's again.
 """
 
 from __future__ import annotations
@@ -178,6 +168,34 @@ def _read_flat_surface(volume, *, y0: int, y1: int, x0: int, x1: int):
     return patch[0]
 
 
+def _is_selected_segment(segment) -> bool:
+    """True when the user explicitly selected this segment.
+
+    A segment is selected when its name is in the source's allowlist,
+    when it has an explicit surface volume (a single
+    ``surface_volume_path`` or a ``surface_volume_paths`` entry for
+    its relpath or name), or when its source is held out
+    (``split == "validation"``). A read failure on a selected segment
+    must stop the run before it trains or scores a subset (review 4,
+    point 5): main stops there too, when patch finding opens its
+    masks. An auto-discovered segment in the same state is warned
+    about and skipped instead, and picked up on a later run.
+    """
+    source = segment.source
+    if source.split == "validation":
+        return True
+    if segment.segment_name in set(source.segment_names):
+        return True
+    if source.surface_volume_path is not None:
+        return True
+    if (
+        segment.segment_relpath in source.surface_volume_paths
+        or segment.segment_name in source.surface_volume_paths
+    ):
+        return True
+    return False
+
+
 class InkDataset(Dataset):
     """Assemble samples using resolved data settings and an optional patch list."""
 
@@ -280,37 +298,6 @@ class InkDataset(Dataset):
             cached = load_patch_cache(
                 path, config=self.config, segments=self.segments
             )
-            if cached is not None and self.config.discovery_mode == "unlabeled":
-                # load_patch_cache only verifies segment coverage in
-                # labeled modes; in unlabeled mode a cache written when
-                # a single segment was ready would otherwise be reused
-                # after a second segment's stores were filled. But an
-                # uncovered segment does not always mean the cache
-                # predates it (C5): find_segment_unlabeled_patches
-                # returns ([], []) when supervision covers every
-                # candidate, so a segment can legitimately yield zero
-                # patches. Probe each uncovered segment instead of
-                # assuming staleness: if every one yields zero patches
-                # the cache is complete and stays valid; if any yields
-                # patches (a newly ready mirror) or its finding raises
-                # (a broken segment), the cache is stale and full
-                # discovery runs below, which handles a defective
-                # segment with the warn-and-skip resilience.
-                covered = {patch.segment.cache_key for patch in cached}
-                uncovered = [
-                    segment
-                    for segment in self.segments
-                    if segment.cache_key not in covered
-                ]
-                if uncovered:
-                    try:
-                        if any(
-                            find_segment_unlabeled_patches(segment, self._open)[0]
-                            for segment in uncovered
-                        ):
-                            cached = None
-                    except Exception:
-                        cached = None
             if cached is not None:
                 return cached
 
@@ -358,11 +345,15 @@ class InkDataset(Dataset):
                     failed.append(segment_failed)
         patches = training + validation
         for segment, exc in failed:
-            if segment.source.split == "validation":
-                # A held-out segment that fails patch finding must fail
-                # the run at discovery time, as main did: its patches
-                # are the validation set, and a partial validation set
-                # must never be reported as complete.
+            if _is_selected_segment(segment):
+                # A selected segment (allowlisted, explicitly mapped,
+                # or held-out) that fails patch finding must fail the
+                # run at discovery time, as main did: main gathers
+                # such a segment and stops when its masks cannot be
+                # read, so a partial training or validation set must
+                # never be reported as complete. An auto-discovered
+                # segment in the same state is warned about and
+                # skipped above instead.
                 raise exc
         if not patches and self.segments:
             raise RuntimeError(
