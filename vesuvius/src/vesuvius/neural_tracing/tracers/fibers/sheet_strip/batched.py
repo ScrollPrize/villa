@@ -197,8 +197,8 @@ class StripEngine:
         """Frame-model outputs (heading, normal; each (K, 3) float32 per request, crop-local) of ``requests``, in
         chunks of ``frame_chunk`` decisions as HeadingPredictor.predict_frames_batched runs them: each request's
         decisions in chunks of their own, as ``predict`` batches them (``frame_chunk`` = its ``batch``), or with
-        ``across_fibers`` consecutive chunks of all of them. Off CUDA each chunk runs 64 decisions at a time, as
-        ``predict``'s frame model does there (frames/learned.py ``predict_frames``)."""
+        ``across_fibers`` consecutive chunks of all of them. Each chunk runs 64 decisions at a time, as ``predict``'s
+        frame model does on every device (frames/learned.py ``predict_frames``)."""
         import torch
         positions = np.concatenate([r.positions for r in requests])
         frames = np.concatenate([r.frames for r in requests])
@@ -209,7 +209,7 @@ class StripEngine:
         # reproduce predict exactly
         spans = [(0, len(positions))] if self.across_fibers else list(zip(bounds[:-1], bounds[1:]))
         chunk = self.frame_chunk
-        step = chunk if self.frame_device.type == 'cuda' else min(chunk, 64)
+        step = min(chunk, 64)
         parts = [slice(b, min(b+step, a+chunk, hi)) for lo, hi in spans for a in range(lo, hi, chunk)
                  for b in range(a, min(a+chunk, hi), step)]
         crop = self.frame_model.cfg.patch

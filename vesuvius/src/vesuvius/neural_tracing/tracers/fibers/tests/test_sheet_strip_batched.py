@@ -5,6 +5,7 @@ records of its per-fiber loop; on a GPU, crops sampled by vc_reader's CUDA reade
 CPU crops within float rounding, and batched mode with CPU crops keeps the frame model on the CPU, as fiber by fiber."""
 import dataclasses
 from argparse import Namespace
+from types import SimpleNamespace
 import json
 
 import numpy as np
@@ -15,7 +16,7 @@ import torch
 from vesuvius.neural_tracing.tracers.fibers.data.samples import SampleConfig
 from vesuvius.neural_tracing.tracers.fibers.heading_model.model import HeadingConfig, HeadingNet, save_heading_model
 from vesuvius.neural_tracing.tracers.fibers.sheet_strip import infer_all
-from vesuvius.neural_tracing.tracers.fibers.sheet_strip.batched import StripEngine, StripGeometry
+from vesuvius.neural_tracing.tracers.fibers.sheet_strip.batched import FrameRequest, StripEngine, StripGeometry
 from vesuvius.neural_tracing.tracers.fibers.sheet_strip.infer import MIN_HEAD_ARC, StripPredictor
 from vesuvius.neural_tracing.tracers.fibers.sheet_strip.model import SheetStripConfig, SheetStripFollower
 from vesuvius.neural_tracing.tracers.fibers.tests.model_fixtures import array_at
@@ -76,6 +77,31 @@ def test_batched_engine_reproduces_predict(tmp_path):
     got = batched(predictor, fiber, arcs)
     for name, expected, value in zip(('heights', 'frames', 'positions'), (heights, frames, positions), got):
         np.testing.assert_array_equal(value, expected, err_msg=name)
+
+
+def test_frame_model_runs_predicts_chunks():
+    """The frame model sees predict's chunks: each batch of ``frame_chunk`` decisions 64 at a time, so a batch of 100
+    runs as 64 and 36, per fiber or (``across_fibers``) across them"""
+    sizes = []
+
+    class Frames:
+        cfg = SimpleNamespace(patch=None)
+
+        def forward_outputs(self, patch, paths, families):
+            sizes.append(len(paths))
+            return dict(heading=torch.zeros(len(paths), 3), normal=torch.zeros(len(paths), 3))
+
+    engine = object.__new__(StripEngine)
+    engine.frame_chunk, engine.frame_model, engine.frame_device = 100, Frames(), torch.device('cpu')
+    engine.crops = lambda items, crop, device: None
+    requests = [FrameRequest(np.zeros((n, 3)), np.zeros((n, 3, 3)), np.zeros((n, 2), np.float32), np.zeros(n, np.int64))
+                for n in (230, 10)]
+    for across, expected in ((False, [64, 36, 64, 36, 30, 10]), (True, [64, 36, 64, 36, 40])):
+        sizes.clear()
+        engine.across_fibers = across
+        outputs = engine.frame_outputs(requests)
+        assert sizes == expected
+        assert [len(heading) for heading, _ in outputs] == [230, 10]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='needs a CUDA device')
