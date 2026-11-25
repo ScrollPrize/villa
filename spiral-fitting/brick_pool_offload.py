@@ -65,7 +65,7 @@ class _HostRegistration:
             try:
                 _chk(cuda.cuMemHostGetDevicePointer_v2(ctypes.byref(dptr), p, ctypes.c_uint(0)), "cuMemHostGetDevicePointer")
             except BaseException:
-                self.release()                                                  # registered but unusable: do not leave the pages page-locked (raises if even that fails; the array stays owned)
+                _release_or_park(self)  # Keep the backing alive if unregister fails.
                 raise
         self.dptr = int(dptr.value)
         return self.dptr
