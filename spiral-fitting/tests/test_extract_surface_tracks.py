@@ -30,6 +30,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import extract_surface_tracks as est  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _without_installed_teasar(monkeypatch):
+    # `uv sync` installs teasar on Apple-silicon Macs, where `--backend auto` would then pick the metal
+    # backend in tests that expect the CPU one; the metal tests install their own stand-in module
+    monkeypatch.setitem(sys.modules, 'teasar', None)
+
+
 ENGINES = [
     pytest.param('numba', marks=pytest.mark.skipif(
         importlib.util.find_spec('numba') is None, reason='numba is not installed')),
