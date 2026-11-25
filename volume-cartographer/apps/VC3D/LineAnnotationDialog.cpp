@@ -1264,8 +1264,11 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
         _approvalLabel->setObjectName(QStringLiteral("lineAnnotationApprovalLabel"));
         layout->addWidget(_approvalLabel);
     }
+    // A row of its own under the tool row, which has no room left for it.
+    static_cast<QHBoxLayout*>(_approvalPanel->layout())->addStretch(1);
+    _approvalPanel->layout()->setContentsMargins(6, 2, 6, 2);
     _approvalPanel->hide();
-    buttonLayout->addWidget(_approvalPanel);
+    _layout->insertWidget(0, _approvalPanel, 0);
     _fiberNameLabel = new QLabel(buttonRow);
     _fiberNameLabel->setObjectName(QStringLiteral("lineAnnotationFiberNameLabel"));
     _fiberNameLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
@@ -1563,7 +1566,9 @@ void LineAnnotationDialog::updateFiberDisplayControlsAndGuides()
         const QSignalBlocker blocker(_controlAngleSpin);
         const double angle = _angleControlIndex
             ? _generatedViews.controlAngleOffsetsDegrees[*_angleControlIndex] * _displayTangentSign : 0;
-        const bool angleEditable = _angleControlIndex.has_value() && !_readOnly;
+        // In the approval window the angle of a normal point is set here;
+        // the controller refuses it on a control point of the fiber.
+        const bool angleEditable = _angleControlIndex.has_value() && (!_readOnly || _approvalMode);
         if (_controlAngleSpin->isEnabled() != angleEditable)
             _controlAngleSpin->setEnabled(angleEditable);
         if (std::abs(_controlAngleSpin->value() - angle) >= 0.005) _controlAngleSpin->setValue(angle);
@@ -2326,6 +2331,8 @@ void LineAnnotationDialog::setApprovalMode(bool approval)
     // No way from here into editing the fiber; the width is shown only (the
     // cross view's edge handles need one).
     _enableEditingButton->hide();
+    // Tags belong to the fiber, which is not edited here.
+    _tagRowWidget->hide();
     _fiberWidthSpin->setEnabled(true);
     _fiberWidthSpin->setToolTip(tr("Shown width in this window only; it is not saved to the fiber."));
 }
@@ -3233,7 +3240,7 @@ bool LineAnnotationDialog::setGeneratedLineViews(
                                                   QPoint globalPos) {
         forwardOverviewControlContextMenu(linePosition, globalPos);
     };
-    _layout->insertWidget(1, overviewBar, 0);
+    _layout->insertWidget(2, overviewBar, 0);
     _generatedContainers.push_back(overviewBar);
     _overviewBar = overviewBar;
 
@@ -6666,8 +6673,16 @@ bool LineAnnotationDialog::handleCrossSectionDragEvent(QObject* watched, QEvent*
             return true;
         }
         double best = std::numeric_limits<double>::infinity();
+        // The approval window turns the normal only: the centre is no handle.
+        if (_approvalMode && drag.width <= 0) {
+            emit editGestureRefused(tr("The Shift-drag in the cross view"),
+                                    tr("the shown fiber width is 0, so there is no edge to turn the normal with; set "
+                                       "\"Fiber width\" first (it is not saved to the fiber)"));
+            return true;
+        }
         for (int handle : {0, -1, 1}) {
             if (handle && drag.width <= 0) continue;
+            if (!handle && _approvalMode) continue;
             const cv::Vec3d point = drag.center + drag.axis * (handle * drag.width / 2);
             const QPointF screen = view->viewportTransform().map(viewer->volumeToScene(cv::Vec3f(point)));
             const QPointF distance = screen - mouse->position();
@@ -6692,8 +6707,14 @@ bool LineAnnotationDialog::handleCrossSectionDragEvent(QObject* watched, QEvent*
     const QPointF movement = scene - drag.pressScene;
     if (std::hypot(movement.x(), movement.y()) > 1e-6) drag.moved = true;
     const QPointF offset = scene - (drag.handle ? drag.edgeScene : drag.pressScene);
-    const auto result = vc::fiber_tracer::dragFiberWidth(drag.center, drag.normal, drag.axis,
+    auto result = vc::fiber_tracer::dragFiberWidth(drag.center, drag.normal, drag.axis,
         drag.planeNormal, drag.width, drag.handle, drag.sceneX * offset.x() + drag.sceneY * offset.y());
+    // The approval window turns the normal about the line point: the centre
+    // and the width stay as they are.
+    if (result && _approvalMode) {
+        result->center = drag.center;
+        result->width = drag.width;
+    }
     if (event->type() == QEvent::MouseButtonRelease) {
         Logger()->info("Line annotation cross drag: stroke released; handle {} width {} moved {} applied {} shift still held {}",
                        drag.handle, drag.width, drag.moved, bool(result), mouse->modifiers().testFlag(Qt::ShiftModifier));

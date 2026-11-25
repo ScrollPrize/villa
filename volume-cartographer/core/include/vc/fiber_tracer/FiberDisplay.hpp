@@ -225,8 +225,13 @@ inline FiberDisplayField fiberDisplayField(
     const std::vector<std::optional<cv::Vec3d>>& manualNormals,
     const std::vector<std::optional<cv::Vec3d>>& controlDirections = {},
     // Which controls the correction is interpolated between; empty: all of
-    // them. A control that is no knot neither carries a correction nor ends
-    // one (its baseline, tangent and a zero offset are still reported).
+    // them, with the target axes interpolated in one transported frame.
+    // Given, a control that is no knot neither carries a correction nor ends
+    // one, and the correction angle itself is interpolated between the knots
+    // and applied on top of the baseline normal at every point: the line
+    // keeps following its baseline, turned by the correction (constant past
+    // the first and the last knot). Controls that are no knots report the
+    // correction applied at them.
     const std::vector<char>& knots = {})
 {
     FiberDisplayField out;
@@ -253,7 +258,7 @@ inline FiberDisplayField fiberDisplayField(
     std::vector<double> targetAngles;
     std::vector<bool> corrected;
     const bool allKnots = knots.size() != positions.size();
-    std::vector<double> knotArcs;
+    std::vector<double> knotArcs, knotOffsets;
     for (size_t i = 0; i < positions.size(); ++i) {
         const double p = std::clamp(positions[i], 0.0, double(points.size() - 1));
         const size_t k = size_t(p), j = std::min(k + 1, points.size() - 1);
@@ -282,11 +287,27 @@ inline FiberDisplayField fiberDisplayField(
         out.controlOffsets.push_back(angle);
         if (!knot) continue;
         knotArcs.push_back(controlArcs.back());
+        knotOffsets.push_back(angle);
         corrected.push_back(hasCorrection);
         targetAngles.push_back(target && tangent ? displayNormalOffset(
             displayVectorAt(references,p), *target, *tangent).value_or(0.0) : 0.0);
     }
+    const std::vector<double> allControlArcs = controlArcs;
     controlArcs = std::move(knotArcs);
+    if (!allKnots) {
+        const bool any = std::find(corrected.begin(), corrected.end(), true) != corrected.end();
+        for (size_t i = 0; any && i < points.size(); ++i) {
+            const auto tangent = displayUnit(cv::Vec3d(tangents[i]));
+            const auto baseline = projectDisplayNormal(cv::Vec3d(normals[i]), tangent.value_or(cv::Vec3d{}));
+            if (!tangent || !baseline) continue;
+            out.normals[i] = cv::Vec3f(rotateDisplayNormal(*baseline, *tangent,
+                                                           interpolateDisplayOffset(controlArcs, knotOffsets, arcs[i])));
+        }
+        for (size_t i = 0; any && i < positions.size(); ++i)
+            if (knots[i] == 0)
+                out.controlOffsets[i] = interpolateDisplayOffset(controlArcs, knotOffsets, allControlArcs[i]);
+        return out;
+    }
     for (size_t i = 0; i < points.size(); ++i) {
         const auto tangent = displayUnit(cv::Vec3d(tangents[i]));
         const auto baseline = projectDisplayNormal(cv::Vec3d(normals[i]), tangent.value_or(cv::Vec3d{}));

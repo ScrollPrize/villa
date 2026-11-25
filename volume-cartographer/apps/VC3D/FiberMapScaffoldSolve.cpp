@@ -1490,6 +1490,14 @@ void ScaffoldApprovalPanel::rebuild()
         _rebuilding = false;
         return;
     }
+    // A solve of an annotation that has changed since names stretches that
+    // may no longer exist: nothing is listed from it.
+    if (_controller->runStale(view->run)) {
+        _summaryLabel->setText(tr("The selected solve is outdated: a fiber, a link or the umbilicus changed after it "
+                                  "ran. Nothing is listed from it. Press Solve in the scaffold solver dock."));
+        _rebuilding = false;
+        return;
+    }
     const auto label = [this](const std::string& uuid) {
         if (_labels) {
             const auto text = _labels(uuid);

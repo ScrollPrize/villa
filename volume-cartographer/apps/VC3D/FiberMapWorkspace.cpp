@@ -4534,9 +4534,21 @@ void FiberMapWorkspace::openScaffoldPiece(const std::string& fiberUuid, std::int
                                           std::int64_t controlTo, double arcFrom, double arcTo)
 {
     if (!_controller) return;
+    // A fiber that is not opened says so in a dialog: the request is never
+    // just dropped.
+    const auto refuse = [this](const QString& reason, const QString& remedy) {
+        const auto message = tr("The fiber was NOT opened for approval: %1.").arg(reason);
+        Logger()->error("fiber map: {}", message.toStdString());
+        setOperationStatus(message);
+        auto* box = new QMessageBox(QMessageBox::Warning, tr("Fiber approval"), message, QMessageBox::Ok, this);
+        box->setInformativeText(remedy);
+        box->setAttribute(Qt::WA_DeleteOnClose);
+        box->open();
+    };
     const auto found = _fiberIdByUuid.find(fiberUuid);
     if (found == _fiberIdByUuid.end()) {
-        setOperationStatus(tr("That fiber is not on the map; press Update"));
+        refuse(tr("fiber %1 is not on the map").arg(QString::fromStdString(fiberUuid)),
+               tr("Press Update on the fiber map, then open it again."));
         return;
     }
     const auto fiberId = found->second;
@@ -4556,7 +4568,9 @@ void FiberMapWorkspace::openScaffoldPiece(const std::string& fiberUuid, std::int
         const auto first = _controller->storedLineIndexAtArc(fiberId, arcFrom, runLength);
         const auto last = _controller->storedLineIndexAtArc(fiberId, arcTo, runLength);
         if (!first || !last) {
-            setOperationStatus(tr("That stretch reaches past the fiber's control points; solve again"));
+            refuse(tr("the stretch (arc %1 to %2 of the solve) reaches past the fiber's control points; the fiber "
+                      "was edited since the solve").arg(arcFrom).arg(arcTo),
+                   tr("Press Solve in the scaffold solver dock, then open the stretch from the new solve."));
             return;
         }
         if (*last > *first) { lineFrom = *first; lineTo = *last; }
@@ -4575,9 +4589,10 @@ void FiberMapWorkspace::openScaffoldPiece(const std::string& fiberUuid, std::int
             // A stretch is reviewed against the normals of its solve. Without
             // them it is not opened: no other normals stand in.
             _controller->setSolverLineNormals(fiberId, nullptr);
-            const auto message = tr("ERROR: fiber not opened for approval - the solve's normals for this fiber cannot be read: %1").arg(why);
-            Logger()->error("fiber map: {}", message.toStdString());
-            setOperationStatus(message);
+            refuse(tr("the selected solve's normals for this fiber cannot be read: %1").arg(why),
+                   tr("The approval window shows a fiber on the normals of the selected solve, one per line point. "
+                      "This fiber was edited after that solve ran, so its normals belong to a line that no longer "
+                      "exists.\n\nPress Solve in the scaffold solver dock, then open the fiber from the new solve."));
             return;
         }
     }
