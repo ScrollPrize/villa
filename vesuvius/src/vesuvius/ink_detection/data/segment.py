@@ -1,5 +1,57 @@
 """Discover segment directories and select versioned label assets.
 
+v6 -- focused LABELED discovery for PR #2677 (review: villa-review,
+25/11/2026, fifth review of the v5 head at 3a46e88). The reviewer
+still recommends merging a FOCUSED discovery change after repair, and
+now says explicitly to keep the new discovery within labeled mode.
+v6 repairs the five points of review 5 on top of the v5 base:
+
+1. Chunk completeness (point 1). A surviving chunk no longer passes
+   the readiness check: the image and the validation mask must hold
+   EVERY expected chunk at every required level, not just one. A
+   complete fill-only (uniform) validation mask is preserved: the
+   writer omits fill-only chunks (skip_empty), so a writer-style
+   pyramid whose every level holds zero chunks is complete, while a
+   single-level zero-chunk store is the first-sync state (review 4,
+   R3b). Ink and supervision keep the v5 rule (readable metadata is
+   an all-zero mask): a missing chunk there reads as fill, which
+   costs patches instead of leaking held-out pixels or blank samples.
+2. Scale checks (point 2). A level counts as readable only when it
+   is an ARRAY (.zarray, or zarr.json node_type "array"): a directory
+   holding only .zattrs, or a Zarr group, is not an array -- open_volume
+   either raises FileNotFoundError there or returns a group with no
+   .shape. And the required levels follow the finder that will run:
+   subtiling reads everything at volume_scale, so a complete level-0
+   mirror with patch_finding_scale=1 is admitted; the default finder
+   reads labels at the scan scale and samples at volume_scale, so
+   both levels stay required there.
+3. Read failures in existing layouts (point 3, dataset.py). The
+   warn-and-skip resilience applies ONLY to segments the PR admits;
+   a failure on a segment main discovers (native tifxyz geometry or
+   an explicit surface) re-raises, as main does. A failure that only
+   says the segment yielded no patches is a legitimate zero-patch
+   outcome (complete but below the ink-coverage threshold): the
+   segment is kept and covered by the patch-cache sidecar, so an
+   unchanged rerun reuses the cache instead of re-discovering it.
+4. Allowlist / map validation (point 4). An allowlisted folder that
+   exists on disk takes part in map validation: no map entry for it
+   raises KeyError, even when the folder carries no segment markers
+   (an empty allowlisted folder must not disappear from preflight).
+   Names with no on-disk folder stay inert, as in main.
+5. Unlabeled path (point 5). The new TIFF-free discovery is
+   labeled-only, as the reviewer explicitly offers: in unlabeled
+   mode these mirrors are skipped exactly as main skips them, so the
+   unlabeled extension -- which lost mask exclusions and missed
+   repaired mirrors on cached reruns -- is gone by construction.
+
+What the reviewer tried and discarded (its own narrowing failed
+because partial stores and a Zarr group at the sampling level still
+passed preflight, and a complete sibling below the ink threshold
+stopped an otherwise usable scan): v6 closes exactly those two
+holes -- full chunk enumeration instead of a "some chunk" probe, and
+the array check instead of a metadata check, with the below-threshold
+sibling handled in the dataset (point 3), not at discovery.
+
 v5 -- focused labeled discovery for PR #2677 (review: villa-review,
 24/11/2026, fourth review of the v4 head at 1c2f491). The reviewer
 recommends merging a FOCUSED discovery change after repair, and says
@@ -54,7 +106,8 @@ What review 4 demanded, and where it lives in v5
    test_segment_gathering_preserves_remote_and_explicit_volume_paths
    requires it) and stops when its masks cannot be read, so v5
    gathers it too and the dataset re-raises a patch-finding failure
-   on a selected segment instead of skipping it.
+   on a selected segment instead of skipping it. (v6 extends that
+   re-raise to ANY segment main discovers, review 5 point 3.)
 6. Unlabeled cache rescanning. Gone: the cache is main's.
 
 Reason (b) for the bot discarding its own narrowing -- a complete
@@ -64,7 +117,10 @@ resilience kept in v5: a segment that yields no patches at patch
 finding is warned about and skipped, and the run proceeds on the
 ready segments (it still fails loudly if NO segment yields patches).
 Discovery cannot know the coverage without re-implementing patch
-finding, so the fix belongs there, not in discovery.
+finding, so the fix belongs there, not in discovery. (v6 keeps such
+a segment in the dataset and covers it with the patch-cache sidecar,
+review 5 point 3, so an unchanged rerun reuses the cache instead of
+re-discovering it.)
 
 Scope of the new gates (this is what keeps the change focused)
 ---------------------------------------------------------------
@@ -99,6 +155,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
+import json
 import os
 import warnings
 
@@ -132,50 +189,6 @@ def has_tifxyz_geometry(segment_dir: str | Path) -> bool:
     coordinate completeness is the reader's job, unchanged from main.
     """
     return (Path(segment_dir) / "x.tif").is_file()
-
-
-def zarr_store_has_chunks(store: str | Path) -> bool:
-    """True when a Zarr store holds at least one chunk file.
-
-    Metadata-only stores (``.zarray``/``.zattrs``/``zarr.json`` with no
-    chunks) are the first-sync state of an unfinished mirror and do not
-    count. Symlinked chunk directories count: mirrors built with symlinks
-    (the tutorial's re-download/symlink setup) are followed. Anything that
-    cannot be walked — missing path, not a directory, I/O error — is not
-    ready and returns False instead of raising.
-    """
-    store = Path(store)
-    if not store.is_dir():
-        return False
-    try:
-        for _root, _dirs, files in os.walk(store, followlinks=True):
-            for name in files:
-                if name not in _ZARR_METADATA_NAMES:
-                    return True
-    except OSError:
-        return False
-    return False
-
-
-def zarr_store_has_metadata(store: str | Path) -> bool:
-    """True when a Zarr store carries metadata (readable), even without chunks.
-
-    A store with a metadata file (``.zarray``/``.zattrs``/``.zgroup``/
-    ``.zmetadata``/``zarr.json``) at its root can be opened: reads return
-    the fill value for missing chunks. A bare directory (no metadata at
-    all) cannot be opened — it is unreadable, not merely empty. Together
-    with :func:`zarr_store_has_chunks` this distinguishes the three
-    states of a store: unreadable, readable-but-empty, ready.
-    """
-    store = Path(store)
-    if not store.is_dir():
-        return False
-    try:
-        return any(
-            (store / name).is_file() for name in _ZARR_METADATA_NAMES
-        )
-    except OSError:
-        return False
 
 
 def _zarr_level_dir(store: str | Path, level: int | str) -> Path | None:
@@ -215,60 +228,169 @@ def _zarr_level_dir(store: str | Path, level: int | str) -> Path | None:
     return None
 
 
-def zarr_store_level_has_metadata(store: str | Path, level: int | str) -> bool:
-    """True when a Zarr store carries metadata at the requested level.
+def _zarr_level_array_meta(store: str | Path, level: int | str) -> tuple | None:
+    """(shape, chunks, dimension_separator) of the array at the level, or None.
 
-    This is the level-aware form of :func:`zarr_store_has_metadata`:
-    a store whose root has metadata but whose requested level subgroup
-    is absent is NOT readable at that level (``open_volume`` raises
-    FileNotFoundError there), so it must never be treated as readable.
+    The level node must be an ARRAY: a v2 ``.zarray`` file, or a v3
+    ``zarr.json`` with node_type "array". A directory holding only
+    ``.zattrs`` (review 5, point 2a) or a ``.zgroup`` (point 2b) is a
+    group, not an array: ``open_volume`` either raises FileNotFoundError
+    there or returns a group with no ``.shape`` (AttributeError at the
+    first sample), so it must never count as readable. A level whose
+    metadata cannot be parsed is unreadable too, never assumed.
     """
     level_dir = _zarr_level_dir(store, level)
     if level_dir is None:
-        return False
-    try:
-        return any(
-            (level_dir / name).is_file() for name in _ZARR_METADATA_NAMES
+        return None
+    zarray = level_dir / ".zarray"
+    if zarray.is_file():
+        try:
+            meta = json.loads(zarray.read_text())
+        except (OSError, ValueError):
+            return None
+        shape = meta.get("shape")
+        chunks = meta.get("chunks")
+        if not isinstance(shape, list) or not isinstance(chunks, list):
+            return None
+        return (
+            tuple(int(value) for value in shape),
+            tuple(int(value) for value in chunks),
+            str(meta.get("dimension_separator", ".")),
         )
-    except OSError:
-        return False
+    zarr_json = level_dir / "zarr.json"
+    if zarr_json.is_file():
+        try:
+            meta = json.loads(zarr_json.read_text())
+        except (OSError, ValueError):
+            return None
+        if meta.get("node_type") != "array":
+            return None
+        shape = meta.get("shape")
+        grid = (meta.get("chunk_grid") or {}).get("configuration", {}).get(
+            "chunk_shape"
+        )
+        if not isinstance(shape, list) or not isinstance(grid, list):
+            return None
+        return (
+            tuple(int(value) for value in shape),
+            tuple(int(value) for value in grid),
+            "/",
+        )
+    return None
 
 
-def zarr_store_level_has_chunks(store: str | Path, level: int | str) -> bool:
-    """True when a Zarr store holds at least one chunk file at the level.
+def _zarr_level_chunk_counts(store: str | Path, level: int | str) -> tuple | None:
+    """(present, expected) chunk files at the level, or None if not an array.
 
-    The level-aware form of :func:`zarr_store_has_chunks`. A store
-    with metadata at level 0 and chunks only at level 1 does NOT have
-    chunks at level 0 (the review-4 point-4 case: the first image read
-    at volume_scale=0 would be all zeros). Symlinked chunk
-    directories count, as in the whole-store check.
+    ``expected`` is the full chunk grid from the array metadata
+    (shape / chunk shape); ``present`` counts the non-metadata files
+    under the level directory, recursively, so both separators work
+    (v2 "." flat files, v2 "/" nested paths, v3 "c/" subtree).
+    Symlinked chunk directories count, as in the whole-store check.
     """
+    meta = _zarr_level_array_meta(store, level)
+    if meta is None:
+        return None
+    shape, chunks, _separator = meta
+    expected = 1
+    for size, chunk in zip(shape, chunks):
+        expected *= -(-int(size) // int(chunk))
     level_dir = _zarr_level_dir(store, level)
-    if level_dir is None:
-        return False
+    present = 0
     try:
         for _root, _dirs, files in os.walk(level_dir, followlinks=True):
-            for name in files:
-                if name not in _ZARR_METADATA_NAMES:
-                    return True
+            present += sum(
+                1 for name in files if name not in _ZARR_METADATA_NAMES
+            )
+    except OSError:
+        return None
+    return (present, expected)
+
+
+def _zarr_store_is_uniform_pyramid(store: str | Path) -> bool:
+    """True when a zero-chunk store is a writer-style pyramid.
+
+    Villa's label writer (``create_label_zarrs``) writes a pyramid
+    group whose every level is an array, and omits fill-only chunks
+    (``skip_empty=True``): a complete uniform (fill-only) mask
+    therefore holds ZERO chunks at every level, and is still complete
+    (review 5, point 1). A single-level zero-chunk store is the
+    first-sync state instead (review 4, R3b): its chunks have not
+    arrived yet. The two are told apart by the store shape: a pyramid
+    carries at least two array levels, and a uniform one holds zero
+    chunks at every one of them. A pyramid with chunks at some levels
+    is not uniform (the writer would have written the level-0 chunks
+    for any non-zero data), and a pyramid with a level missing is not
+    complete either. Residual hole, documented: a mid-sync pyramid
+    whose every level metadata has arrived but no chunk yet is
+    indistinguishable on disk from a uniform pyramid -- no on-disk
+    signal separates them, so no fair test can either.
+    """
+    store = Path(store)
+    if not store.is_dir():
+        return False
+    try:
+        children = sorted(store.iterdir())
     except OSError:
         return False
-    return False
+    levels = 0
+    for child in children:
+        if not child.is_dir() or not child.name.isdigit():
+            continue
+        counts = _zarr_level_chunk_counts(store, int(child.name))
+        if counts is None:
+            return False
+        present, _expected = counts
+        if present != 0:
+            return False
+        levels += 1
+    return levels >= 2
+
+
+def _zarr_level_store_state(store: str | Path, level: int | str) -> str:
+    """One of "complete", "uniform", "partial", "unreadable" for a store level.
+
+    - "unreadable": the level node is not an array (missing, a group,
+      or metadata-only without ``.zarray``) -- review 5, point 2.
+    - "complete": the node is an array and every expected chunk is
+      present.
+    - "uniform": the node is an array, zero chunks are present, and
+      the store is a writer-style pyramid whose every level holds zero
+      chunks -- a complete fill-only mask (review 5, point 1).
+    - "partial": the node is an array, some but not all chunks are
+      present -- an unfinished sync (review 5, point 1).
+    """
+    counts = _zarr_level_chunk_counts(store, level)
+    if counts is None:
+        return "unreadable"
+    present, expected = counts
+    if present >= expected:
+        return "complete"
+    if present == 0 and _zarr_store_is_uniform_pyramid(store):
+        return "uniform"
+    return "partial"
 
 
 def _required_levels(segment: Segment) -> tuple[int, ...]:
     """Resolution levels a segment's stores must serve.
 
     The sample scale (``segment.scale`` == the source's volume_scale)
-    is always required: samples read image and labels there. The
-    patch-finding scale (``patch_finding.scan_scale``, from the
-    ``patch_finding_scale`` config key) is additionally required when
-    it differs: patch finding reads image and labels there. A store
-    that serves only the scan scale passes patch finding and then
-    fails on the first sample (FileNotFoundError) -- the bot's
-    discarded reason (a) -- so both levels are gated.
+    is always required: samples read image and labels there. Which
+    other level patch finding reads depends on the finder that will
+    run (review 5, point 2c): the DEFAULT finder reads labels at the
+    patch-finding scan scale (``patch_finding.scan_scale``, from the
+    ``patch_finding_scale`` config key) when it differs, so both
+    levels are required there -- a store that serves only the scan
+    scale passes patch finding and then fails on the first sample
+    (FileNotFoundError), the bot's discarded reason (a). The SUBTILING
+    finder reads everything at ``segment.scale`` (it never touches
+    ``scan_scale``), so only the sample scale is required there: a
+    complete level-0 mirror with ``patch_finding_scale=1`` must be
+    admitted, not skipped for a level it will never read.
     """
     scale = int(segment.scale)
+    if segment.data_config.patch_finding.kind == "subtiling":
+        return (scale,)
     scan = segment.data_config.patch_finding.scan_scale
     if scan is None or int(scan) == scale:
         return (scale,)
@@ -536,9 +658,7 @@ def _label_assets_by_kind(segment_dir: Path) -> dict[str, list[Path]]:
     return found
 
 
-def _resolve_labels_or_fail(
-    segment: Segment, *, required: bool, strict: bool
-) -> Segment | None:
+def _resolve_labels_or_fail(segment: Segment, *, strict: bool) -> Segment | None:
     """Resolve labels for a PR-admitted flat segment.
 
     Returns the segment with its labels, or None (with a warning) when
@@ -560,15 +680,12 @@ def _resolve_labels_or_fail(
       absence is a failure, not a sync in progress.
 
     This function only runs for segments the PR admits (flat, no
-    tifxyz geometry, no explicit surface). Segments main already
-    discovers call :func:`discover_segment_labels` directly, so their
-    completeness checks are unaffected. In unlabeled mode
-    (``required`` False) ``discover_segment_labels`` never raises for
-    missing labels, so this function simply returns the segment,
-    possibly with ``None`` labels.
+    tifxyz geometry, no explicit surface, labeled mode). Segments main
+    already discovers call :func:`discover_segment_labels` directly,
+    so their completeness checks are unaffected.
     """
     try:
-        return discover_segment_labels(segment, extension=".zarr", required=required)
+        return discover_segment_labels(segment, extension=".zarr", required=True)
     except ValueError as exc:
         assets = _label_assets_by_kind(segment.segment_dir)
         if assets["inklabels"] and assets["supervision_mask"]:
@@ -612,9 +729,16 @@ def _gather_pr_admitted(
     skips it too). A folder with markers but unfinished stores fails
     loudly when it was selected (allowlisted or held-out) and is warned
     about and skipped otherwise.
+
+    Labeled mode only (review 5, point 5): in unlabeled mode the PR
+    admits nothing -- main skips these mirrors, and the unlabeled
+    extension lost mask exclusions and missed repaired mirrors on
+    cached reruns. The reviewer explicitly offers keeping the new
+    discovery within labeled mode.
     """
+    if config.discovery_mode == "unlabeled":
+        return None
     strict = held_out or is_allowlisted
-    required_labels = config.discovery_mode != "unlabeled"
     image_volume: str | Path = segment_dir / f"{segment_dir.name}.zarr"
 
     if not markers["recognized"]:
@@ -645,18 +769,24 @@ def _gather_pr_admitted(
     )
     levels = _required_levels(segment)
 
-    # (a) The image must hold chunks at every required level. A store
-    # with metadata at level 0 and chunks only at level 1 reads as all
-    # zeros at volume_scale=0 (review 4, point 4).
+    # (a) The image must hold EVERY expected chunk at every required
+    # level (review 5, point 1). A store with some chunks missing
+    # reads as all zeros where the chunks are absent: patch finding
+    # still announces patches, and the first sample loads blank
+    # images. A store with metadata at level 0 and chunks only at
+    # level 1 reads as all zeros at volume_scale=0 (review 4,
+    # point 4). No uniform exception: an image is never legitimately
+    # chunkless.
     for level in levels:
-        if not zarr_store_level_has_chunks(image_volume, level):
+        if _zarr_level_store_state(image_volume, level) != "complete":
             _fail_or_skip(
                 segment_dir,
                 strict=strict,
                 message=(
                     "image volume "
-                    f"{image_volume} holds no chunks at resolution {level} "
-                    "(unfinished mirror); it will be picked up once its "
+                    f"{image_volume} is incomplete at resolution {level} "
+                    "(unfinished mirror: a chunk is missing, or the level "
+                    "is not an array); it will be picked up once its "
                     "store is filled."
                 ),
             )
@@ -664,128 +794,90 @@ def _gather_pr_admitted(
 
     # (b) Labels: a partly synced sibling is skipped (point 2), a
     # version mismatch always raises.
-    segment = _resolve_labels_or_fail(
-        segment, required=required_labels, strict=strict
-    )
+    segment = _resolve_labels_or_fail(segment, strict=strict)
     if segment is None:
         return None
 
-    if required_labels:
-        if segment.inklabels is None or segment.supervision_mask is None:
-            # discover_segment_labels with required=True raises for
-            # these, so this is belt-and-braces.
-            _fail_or_skip(
-                segment_dir,
-                strict=strict,
-                message=(
-                    "incomplete labels (inklabels + supervision_mask .zarr "
-                    "required)."
-                ),
-            )
-            return None
-        # (c) Supervision and ink must be READABLE at every required
-        # level. A readable store without chunks is an all-zero mask --
-        # the label writer omits fill-only chunks -- so the segment is
-        # ready: it yields no training patches but may yield validation
-        # patches (C3). No chunk gate here.
-        for kind in ("supervision_mask", "inklabels"):
-            store = getattr(segment, kind)
-            for level in levels:
-                if not zarr_store_level_has_metadata(store, level):
-                    _fail_or_skip(
-                        segment_dir,
-                        strict=strict,
-                        message=(
-                            f"{kind} store {store} is unreadable at "
-                            f"resolution {level} (unfinished mirror); it "
-                            "will be picked up once its store is filled."
-                        ),
-                    )
-                    return None
-        # (d) A validation mask, when present, must hold CHUNKS at every
-        # required level. Metadata without chunks is an unfinished sync,
-        # not a legitimate all-zero mask: treating it as all-zero would
-        # let the segment contribute training patches that its real
-        # validation regions (once synced) would have held out
-        # (review 4, point 3). A mask WITH chunks -- even all-zero
-        # content -- stays a legitimate sparse mask.
-        if segment.validation_mask is not None:
-            for level in levels:
-                if not zarr_store_level_has_chunks(
-                    segment.validation_mask, level
-                ):
-                    _fail_or_skip(
-                        segment_dir,
-                        strict=strict,
-                        message=(
-                            "validation mask "
-                            f"{segment.validation_mask} holds no chunks at "
-                            f"resolution {level} (unfinished sync); the "
-                            "segment waits until its validation regions "
-                            "can be read."
-                        ),
-                    )
-                    return None
-    else:
-        # Unlabeled discovery: present-but-empty label stores are not
-        # usable labels; drop them instead of rejecting the segment.
-        # A mask that cannot be READ at a required level raises (C4 /
-        # review 4, point 3): dropping it would silently bypass the
-        # supervision exclusion. A readable but empty mask is dropped:
-        # it excludes nothing.
-        if segment.inklabels is not None and not any(
-            zarr_store_level_has_chunks(segment.inklabels, level)
-            for level in levels
-        ):
-            segment = replace(segment, inklabels=None)
-        if segment.supervision_mask is not None:
-            if not all(
-                zarr_store_level_has_metadata(segment.supervision_mask, level)
-                for level in levels
-            ):
-                raise ValueError(
-                    f"{segment.supervision_mask} is unreadable "
-                    "(unfinished mirror); a selected supervision mask "
-                    "must be readable before its segment supplies "
-                    "unlabeled patches"
+    if segment.inklabels is None or segment.supervision_mask is None:
+        # discover_segment_labels with required=True raises for
+        # these, so this is belt-and-braces.
+        _fail_or_skip(
+            segment_dir,
+            strict=strict,
+            message=(
+                "incomplete labels (inklabels + supervision_mask .zarr "
+                "required)."
+            ),
+        )
+        return None
+    # (c) Supervision and ink must be READABLE at every required
+    # level -- the level node must be an ARRAY (review 5, point 2:
+    # a directory holding only .zattrs, or a Zarr group, is not an
+    # array). A readable store without chunks is an all-zero mask --
+    # the label writer omits fill-only chunks -- so the segment is
+    # ready: it yields no training patches but may yield validation
+    # patches (C3). No chunk gate here: a missing chunk reads as
+    # fill, which costs patches instead of leaking held-out pixels
+    # or blank samples (the image and validation gates above are
+    # the ones where a missing chunk corrupts the run).
+    for kind in ("supervision_mask", "inklabels"):
+        store = getattr(segment, kind)
+        for level in levels:
+            if _zarr_level_store_state(store, level) == "unreadable":
+                _fail_or_skip(
+                    segment_dir,
+                    strict=strict,
+                    message=(
+                        f"{kind} store {store} is unreadable at "
+                        f"resolution {level} (unfinished mirror: the level "
+                        "is not an array); it will be picked up once its "
+                        "store is filled."
+                    ),
                 )
-            if not any(
-                zarr_store_level_has_chunks(segment.supervision_mask, level)
-                for level in levels
+                return None
+    # (d) A validation mask, when present, must be COMPLETE at every
+    # required level -- every expected chunk present -- or UNIFORM: a
+    # writer-style pyramid whose every level holds zero chunks, which
+    # the label writer produces for a fill-only mask (skip_empty).
+    # A PARTIAL mask (some chunks missing) is an unfinished sync:
+    # treating its missing chunks as fill would let the segment
+    # contribute training patches that its real validation regions
+    # (once synced) would have held out (review 5, point 1). A
+    # single-level zero-chunk store is the first-sync state, not a
+    # uniform mask (review 4, point 3 / R3b).
+    if segment.validation_mask is not None:
+        for level in levels:
+            if _zarr_level_store_state(segment.validation_mask, level) not in (
+                "complete",
+                "uniform",
             ):
-                segment = replace(segment, supervision_mask=None)
-        if segment.validation_mask is not None:
-            if not all(
-                zarr_store_level_has_metadata(segment.validation_mask, level)
-                for level in levels
-            ):
-                raise ValueError(
-                    f"{segment.validation_mask} is unreadable "
-                    "(unfinished mirror); a selected validation mask "
-                    "must be readable before its segment supplies "
-                    "unlabeled patches"
+                _fail_or_skip(
+                    segment_dir,
+                    strict=strict,
+                    message=(
+                        "validation mask "
+                        f"{segment.validation_mask} is incomplete at "
+                        f"resolution {level} (unfinished sync); the "
+                        "segment waits until its validation regions "
+                        "can be read."
+                    ),
                 )
-            if not any(
-                zarr_store_level_has_chunks(segment.validation_mask, level)
-                for level in levels
-            ):
-                segment = replace(segment, validation_mask=None)
+                return None
 
-    if required_labels:
-        if not (
-            segment.supervision_mask is not None
-            and segment.inklabels is not None
-            and segment.supervision_mask.exists()
-            and segment.inklabels.exists()
-        ):
-            _fail_or_skip(
-                segment_dir,
-                strict=strict,
-                message=(
-                    "missing required image, supervision, or labels."
-                ),
-            )
-            return None
+    if not (
+        segment.supervision_mask is not None
+        and segment.inklabels is not None
+        and segment.supervision_mask.exists()
+        and segment.inklabels.exists()
+    ):
+        _fail_or_skip(
+            segment_dir,
+            strict=strict,
+            message=(
+                "missing required image, supervision, or labels."
+            ),
+        )
+        return None
     return segment
 
 
@@ -853,14 +945,20 @@ def _gather_one(
             relpath, source.surface_volume_paths.get(segment_dir.name)
         )
         if explicit is None:
-            if markers["recognized"]:
+            if is_allowlisted or markers["recognized"]:
                 # An incomplete explicit map must fail preflight: the
                 # folder is a segment the map forgot, and silently
                 # dropping it would report a partial dataset as complete.
                 # (Main raises KeyError for any unmapped folder; v5
-                # narrows the raise to folders carrying segment markers
+                # narrowed the raise to folders carrying segment markers
                 # so an unrelated folder, e.g. a preview-TIFF folder,
-                # still does not abort the run.)
+                # still does not abort the run. v6 restores the raise
+                # for an allowlisted folder that exists on disk even
+                # when it carries no markers -- review 5, point 4: an
+                # empty allowlisted folder must take part in map
+                # validation, or it disappears from preflight. A name
+                # with no on-disk folder never reaches here, so it
+                # stays inert, as in main.)
                 raise KeyError(
                     "surface_volume_paths has no entry for "
                     f"segment {relpath!r}"
