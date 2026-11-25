@@ -332,7 +332,7 @@ def generate(args: argparse.Namespace, report: Reporter) -> dict[str, Any]:
     network, patch = load_network(folder, device)
     mirror = args.mirror
 
-    from .extend.stitch import Stitcher
+    from .extend.stitch import Stitcher, trim_cut_ends
 
     generator = {
         "name": "vesuvius.fiber_spline_generator",
@@ -367,10 +367,12 @@ def generate(args: argparse.Namespace, report: Reporter) -> dict[str, Any]:
 
     names = {"V": "vertical", "H": "horizontal"}
     count = len(blocks)
+    # The box the zone's blocks read together.
+    reach_low = np.maximum(np.asarray(args.origin) - BLOCK_MARGIN, 0)
+    reach_high = np.minimum(np.asarray(args.origin) + np.asarray(args.size) + BLOCK_MARGIN, shape_xyz)
     black = None
     if args.black_distance > 0:
-        black = ExteriorBlack(np.maximum(np.asarray(args.origin) - BLOCK_MARGIN, 0),
-                              np.minimum(np.asarray(args.origin) + np.asarray(args.size) + BLOCK_MARGIN, shape_xyz))
+        black = ExteriorBlack(reach_low, reach_high)
     with tempfile.TemporaryDirectory(prefix="afv-stitch-") as scratch:
         stitcher = Stitcher(scratch)
         try:
@@ -403,7 +405,8 @@ def generate(args: argparse.Namespace, report: Reporter) -> dict[str, Any]:
                     part = (0 if family == "V" else 1) + (done / total if total else 1)
                     step(0.85 + 0.05 * part, f"fitting {names[family]} fibers · {done} of {total} pieces")
 
-                traces = extract_splines(probabilities, threshold, spline_progress)
+                traces = trim_cut_ends(extract_splines(probabilities, threshold, spline_progress),
+                                       low[::-1], high[::-1], reach_low[::-1], reach_high[::-1])
                 del probabilities
                 report.emit("block", index=index, state="stitching")
                 step(0.95, f"joining {len(traces)} fibers to the neighbouring blocks")

@@ -23,10 +23,50 @@ MIN_SCORE = .9
 MIN_MARGIN = .15
 MIN_LENGTH = 8.
 FAMILIES = {"V": 0, "H": 1}
+# A block's splines bend over their last few voxels where its border cuts a
+# fiber, enough to fail the overlap and duplicate tests of the catalogue.
+# Those ends are dropped where another block of the zone reads past the
+# border: it reads them with context on both sides. Half the CLI's
+# 32-voxel block margin, so neighbouring blocks still share 32 voxels of a
+# fiber crossing between them, above the catalogue's 24-voxel overlap.
+CUT_END = 16.
 
 
 def _length(points):
     return float(np.linalg.norm(np.diff(points, axis=0), axis=1).sum())
+
+
+def trim_cut_ends(traces: Iterable[tuple[str, np.ndarray]], low_zyx: Sequence[int], high_zyx: Sequence[int],
+                  reach_low_zyx: Sequence[int], reach_high_zyx: Sequence[int],
+                  distance: float = CUT_END) -> list[tuple[str, np.ndarray]]:
+    """``traces`` of a block read from ``low_zyx`` to ``high_zyx``, in block-local
+    ZYX points, without the points at each end within ``distance`` voxels of a
+    border of the block that another block reads past. The zone's blocks read
+    from ``reach_low_zyx`` to ``reach_high_zyx`` together; an end at that border
+    is kept. Splines left shorter than MIN_LENGTH are dropped."""
+    low, high, reach_low, reach_high = (np.asarray(v, dtype=float)
+                                        for v in (low_zyx, high_zyx, reach_low_zyx, reach_high_zyx))
+    result = []
+    for family, line in traces:
+        points = np.asarray(line, dtype=np.float64)
+        absolute = points + low
+        cut = np.zeros(len(points), dtype=bool)
+        outer = np.zeros(len(points), dtype=bool)
+        for axis in range(3):
+            if low[axis] > reach_low[axis]:
+                cut |= absolute[:, axis] - low[axis] < distance
+            else:
+                outer |= absolute[:, axis] - reach_low[axis] < 2
+            if high[axis] < reach_high[axis]:
+                cut |= high[axis] - 1 - absolute[:, axis] < distance
+            else:
+                outer |= reach_high[axis] - 1 - absolute[:, axis] < 2
+        kept = np.flatnonzero(~cut)
+        first = 0 if not cut[0] or outer[0] else (kept[0] if len(kept) else len(points))
+        last = len(points) if not cut[-1] or outer[-1] else (kept[-1] + 1 if len(kept) else 0)
+        if last - first >= 2 and _length(points[first:last]) >= MIN_LENGTH:
+            result.append((family, points[first:last]))
+    return result
 
 
 class _Frozen:
