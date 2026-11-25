@@ -133,6 +133,9 @@ uv run --extra models python -m vesuvius.ink_detection.inference.infer \
   /data/predictions/pherc0139-w016.tif
 ```
 
+Add `--engine inkrs` to run supported models with the optional inkrs GPU
+engine; see [Optional inkrs engine](../../../docs/ink_detection.md#optional-inkrs-engine).
+
 Run native inference:
 
 ```bash
