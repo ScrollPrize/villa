@@ -605,11 +605,15 @@ else()
         # loads both copies crashes in the OpenMP runtime. Point FindOpenMP at
         # the formula, the one copy every dependency already loads; the cache
         # entries also reach FetchContent subprojects that look up OpenMP.
+        # /usr/local is Homebrew's prefix on Intel Macs, for builds run without
+        # HOMEBREW_PREFIX set.
         find_path(VC_LIBOMP_INCLUDE_DIR omp.h
             HINTS "$ENV{HOMEBREW_PREFIX}/opt/libomp/include" "/opt/homebrew/opt/libomp/include"
+            "/usr/local/opt/libomp/include"
             NO_DEFAULT_PATH)
         find_library(VC_LIBOMP_LIBRARY omp
             HINTS "$ENV{HOMEBREW_PREFIX}/opt/libomp/lib" "/opt/homebrew/opt/libomp/lib"
+            "/usr/local/opt/libomp/lib"
             NO_DEFAULT_PATH)
         if(NOT VC_LIBOMP_INCLUDE_DIR OR NOT VC_LIBOMP_LIBRARY)
             message(FATAL_ERROR "OpenMP on macOS needs Homebrew's libomp: brew install libomp")
