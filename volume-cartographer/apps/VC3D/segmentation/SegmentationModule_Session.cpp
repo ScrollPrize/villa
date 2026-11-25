@@ -519,7 +519,14 @@ void SegmentationModule::offerRecoveredDraft(const QString& objectUuid)
 
     // The recovered grid becomes the surface's, reapplied on the version on
     // screen, and the next autosave publishes all of it.
-    SessionDrafts::restoreSurface(*surface, contents->surface);
+    try {
+        SessionDrafts::restoreSurface(*surface, contents->surface);
+    } catch (const std::exception& error) {
+        QMessageBox::warning(_widget, tr("Recovered edits"),
+            tr("These recovered edits could not be restored. They remain available for another attempt.\n\n%1")
+                .arg(QString::fromUtf8(error.what())));
+        return;
+    }
     session->setDraft(uuid, contents->surface, contents->coordinates, pin.attachment, pin.reference());
     _state->recoveredDraftResolved(uuid, true);
     _saveSnapshot.reset();

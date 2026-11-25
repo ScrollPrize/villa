@@ -1406,6 +1406,32 @@ void QuadSurface::rotate(float angleDeg)
     if (!sourceMarker.empty() || !exclusions.empty()) setChannel("growth_exclusions", marker);
 }
 
+namespace {
+// A transformed mask-only surface becomes a complete coordinate snapshot.
+// The explicit marker distinguishes a vacated hidden cell from a legacy
+// mask-only edit, whose sentinel intentionally preserves stored hidden XYZ.
+void recordFlipExclusions(QuadSurface& surface)
+{
+    const auto* points = surface.rawPointsPtr();
+    const auto mask = surface.vertexMask();
+    cv::Mat_<uint8_t> marker = surface.channel("growth_exclusions", SURF_CHANNEL_NORESIZE);
+    if (mask.empty() && marker.empty()) return;
+    if (marker.empty()) marker = cv::Mat_<uint8_t>(points->size(), uint8_t{0});
+    else {
+        if (marker.size() != points->size())
+            throw std::runtime_error("growth exclusions differ from the surface grid");
+        marker = marker.clone();
+    }
+    if (!mask.empty()) {
+        const auto stored = surface.pointsForStorage();
+        for (int r = 0; r < points->rows; ++r)
+            for (int c = 0; c < points->cols; ++c)
+                if (!mask(r, c) && vc::geometry::validSurfacePoint(stored(r, c))) marker(r, c) = 255;
+    }
+    surface.setChannel("growth_exclusions", marker);
+}
+}
+
 void QuadSurface::flipU()
 {
     ensureLoaded();
@@ -1416,6 +1442,7 @@ void QuadSurface::flipU()
     // Flip over the U axis means reversing the rows (V direction)
     constexpr int flipCode = 0;  // 0 = flip around x-axis (vertical flip)
     for (const auto& name : channelNames()) (void)channel(name, SURF_CHANNEL_NORESIZE);
+    recordFlipExclusions(*this);
     for (auto& vertex : maskedVertices) vertex.cell.y = _points->rows - 1 - vertex.cell.y;
     cv::flip(*_points, *_points, flipCode);
 
@@ -1440,6 +1467,7 @@ void QuadSurface::flipV()
     // Flip over the V axis means reversing the columns (U direction)
     constexpr int flipCode = 1;  // 1 = flip around y-axis (horizontal flip)
     for (const auto& name : channelNames()) (void)channel(name, SURF_CHANNEL_NORESIZE);
+    recordFlipExclusions(*this);
     for (auto& vertex : maskedVertices) vertex.cell.x = _points->cols - 1 - vertex.cell.x;
     cv::flip(*_points, *_points, flipCode);
 

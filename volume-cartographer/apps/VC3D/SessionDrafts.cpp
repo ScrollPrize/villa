@@ -103,8 +103,9 @@ void SessionDrafts::restoreSurface(QuadSurface& surface, const vc::geometry::Sur
             exclusions = pixels;
             recordedExclusions = true;
         } else if (channel.name == "generations") {
-            if (channel.dtype != "<u2" || channel.shape != shape)
-                throw std::invalid_argument("Recovered generations differ from the surface grid");
+            // Surface validation already checks whole-multiple alignment.
+            if (channel.dtype != "<u2" || channel.shape.size() != 2)
+                throw std::invalid_argument("Recovered generations must be a two-dimensional uint16 channel");
         }
         if (channel.name != "growth_exclusions") channels.emplace_back(channel.name, pixels);
     }

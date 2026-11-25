@@ -1617,16 +1617,9 @@ bool SegmentationCommandHandler::cropSurfaceToValidRegion(const std::string& seg
     const int origCols = points->cols;
     const int origRows = points->rows;
 
-    auto boundsOpt = computeValidSurfaceBounds(surface->pointsForStorage());
-    // A marker without XYZ is still part of the edited grid, rather than padding.
-    const cv::Mat_<uint8_t> exclusions = surface->channel("growth_exclusions");
-    if (!exclusions.empty())
-        for (int r = 0; r < exclusions.rows; ++r)
-            for (int c = 0; c < exclusions.cols; ++c)
-                if (exclusions(r, c)) {
-                    const cv::Rect cell(c, r, 1, 1);
-                    boundsOpt = boundsOpt ? (*boundsOpt | cell) : cell;
-                }
+    // Crop is defined by visible geometry, trimming an excluded-only border.
+    // Hidden coordinates and markers inside this ROI are remapped below.
+    const auto boundsOpt = computeValidSurfaceBounds(*points);
     if (!boundsOpt) {
         return fail(tr("Surface %1 does not contain any valid vertices to crop.")
                         .arg(QString::fromStdString(segmentId)));

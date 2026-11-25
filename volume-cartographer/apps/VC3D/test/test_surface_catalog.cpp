@@ -671,6 +671,47 @@ void checkTransformedGrowthExclusionSaves(const fs::path& directory)
     });
 }
 
+void checkMaskOnlyFlipSaves(const fs::path& directory)
+{
+    for (const bool vertical : {false, true}) {
+        const auto path = directory / (vertical ? "mask-only-flip-u.vcobj" : "mask-only-flip-v.vcobj");
+        OpenOptions options; options.author = "mask-only-flip-test";
+        { auto store = ObjectStore::create(path, options); }
+        auto session = std::make_shared<ObjectStoreSession>();
+        const auto attachment = session->attach(path, options);
+        ObjectRecord record; record.uuid = util::newUuid(); record.kind = "surface";
+        record.meta = nlohmann::json{{"coordinates", volumeCoordinates("vol", 1)}}.dump();
+        const cv::Point source = vertical ? cv::Point(2,0) : cv::Point(0,1);
+        const cv::Point target = vertical ? cv::Point(2,2) : cv::Point(4,1);
+        const cv::Vec3f hidden(float(source.x),float(source.y),31);
+        cv::Mat_<cv::Vec3f> points(3,5,cv::Vec3f(-1,-1,-1));
+        points(1,2)={2,1,10}; points(source)=hidden;
+        QuadSurface original(points,{1,1});
+        auto mask=original.validMask().clone(); mask(source)=0;
+        original.setChannel("mask",mask);  // legacy input has no exclusion marker
+        storeSurface(*session,attachment,record,quad_surface_geometry(original));
+        auto opened=SurfaceCatalog::open(session,attachment,{"vol",1},record.uuid);
+        SurfaceStoreEdit edit(session,opened.pin,opened.view);
+        if (vertical) opened.surface->flipU(); else opened.surface->flipV();
+        const auto snapshot=SurfaceStoreEdit::snapshotForSave(*opened.surface);
+        edit.save(*snapshot,{0,0,5,3},snapshot->channelNames());
+        session->readStore(attachment,[&](const StoreReader& reader,const auto&){
+            const auto stored=load_quad_from_store(reader,record.uuid,std::nullopt,false);
+            require((*stored->rawPointsPtr())(source)==cv::Vec3f(-1,-1,-1),
+                    "same-size mask-only Flip clears the vacated hidden XYZ slot");
+            require((*stored->rawPointsPtr())(target)==hidden,
+                    "same-size mask-only Flip keeps hidden XYZ only at its mirrored cell");
+            const auto selected=reader.currentObject(record.uuid);
+            require(selected&&selected->geometryRevision,"mask-only Flip has stored geometry");
+            require(reader.readGeometryRectangle(*selected->geometryRevision,"growth_exclusions",source.y,source.x,1,1)==
+                        std::vector<uint8_t>{0} &&
+                    reader.readGeometryRectangle(*selected->geometryRevision,"growth_exclusions",target.y,target.x,1,1)==
+                        std::vector<uint8_t>{255},
+                    "mask-only Flip publishes complete empty and excluded cell state");
+        });
+    }
+}
+
 void checkFlipOverlayCheckpoint(const fs::path& directory)
 {
     const auto path = directory / "flip-overlay.vcobj", checkpoint = directory / "flip-overlay-drafts";
@@ -924,6 +965,7 @@ void checkResizedTransformCheckpoint(const fs::path& directory)
     vc::geometry::Surface expected;
     cv::Mat_<cv::Vec3f> expectedVisible;
     cv::Mat expectedReview;
+    cv::Mat expectedGenerations;
     {
         auto session = std::make_shared<ObjectStoreSession>();
         const auto attachment = session->attach(path, options);
@@ -943,13 +985,19 @@ void checkResizedTransformCheckpoint(const fs::path& directory)
         cv::Mat_<uint8_t> exclusions(3, 5, uint8_t{0});
         exclusions(1, 1) = exclusions(1, 3) = 255;
         original.setChannel("growth_exclusions", exclusions);
-        original.setChannel("generations", cv::Mat_<uint16_t>(3, 5, uint16_t{7}));
+        cv::Mat_<uint16_t> generations(6, 10);
+        for (int r = 0; r < generations.rows; ++r)
+            for (int c = 0; c < generations.cols; ++c) generations(r, c) = uint16_t(10 * r + c);
+        original.setChannel("generations", generations);
         original.setChannel("review", review);
         storeSurface(*session, attachment, record, quad_surface_geometry(original));
         auto rotated = SurfaceCatalog::open(session, attachment, {"vol", 1}, record.uuid);
         rotated.surface->rotate(90);
         expectedVisible = rotated.surface->rawPoints().clone();
         expectedReview = rotated.surface->channel("review", SURF_CHANNEL_NORESIZE).clone();
+        expectedGenerations = rotated.surface->channel("generations", SURF_CHANNEL_NORESIZE).clone();
+        require(expectedGenerations.size() == cv::Size(6, 10),
+                "rotation keeps the generations channel at twice the grid resolution");
         expected = SessionDrafts::surfaceForDraft(*rotated.surface, true);
         require(expected.rows == 5 && expected.columns == 3, "rectangular rotation changes grid dimensions");
         auto base = SurfaceCatalog::open(session, attachment, {"vol", 1}, record.uuid);
@@ -970,12 +1018,37 @@ void checkResizedTransformCheckpoint(const fs::path& directory)
     const auto attachment = session->attach(path, options);
     const auto contents = session->draftContents(record.uuid);
     auto opened = SurfaceCatalog::open(session, attachment, {"vol", 1}, record.uuid);
+    // A valid stored pixel array may still have an incompatible application dtype.
+    auto incompatible = contents->surface;
+    for (auto& channel : incompatible.channels) {
+        if (channel.name != "generations") continue;
+        channel.dtype = "<f4";
+        channel.bytes.assign(size_t(channel.shape[0] * channel.shape[1]) * sizeof(float), uint8_t{0});
+    }
+    incompatible.validate();
+    const auto before = SessionDrafts::surfaceForDraft(*opened.surface, true);
+    bool rejected = false;
+    try { SessionDrafts::restoreSurface(*opened.surface, incompatible); }
+    catch (const std::invalid_argument&) { rejected = true; }
+    const auto after = SessionDrafts::surfaceForDraft(*opened.surface, true);
+    require(rejected && after.points == before.points && after.validity == before.validity &&
+            after.channels.size() == before.channels.size() && drafts.recovered(record.uuid) &&
+            session->draftRevision(record.uuid) == contents->revision,
+            "incompatible recovery leaves the opened edits and checkpoint available");
+    for (size_t i = 0; i < before.channels.size(); ++i)
+        require(after.channels[i].name == before.channels[i].name && after.channels[i].shape == before.channels[i].shape &&
+                after.channels[i].dtype == before.channels[i].dtype && after.channels[i].bytes == before.channels[i].bytes,
+                "incompatible recovery leaves every open pixel channel unchanged");
     SessionDrafts::restoreSurface(*opened.surface, contents->surface);
     require(opened.surface->rawPointsPtr()->size() == expectedVisible.size() &&
             cv::norm(opened.surface->rawPoints(), expectedVisible, cv::NORM_INF) == 0,
             "recovery restores the transformed visible grid at its new size");
     require(cv::norm(opened.surface->channel("review", SURF_CHANNEL_NORESIZE), expectedReview, cv::NORM_INF) == 0,
             "recovery restores the transformed auxiliary channel at its new size");
+    const auto recoveredGenerations = opened.surface->channel("generations", SURF_CHANNEL_NORESIZE);
+    require(recoveredGenerations.size() == expectedGenerations.size() &&
+            cv::norm(recoveredGenerations, expectedGenerations, cv::NORM_INF) == 0,
+            "recovery retains every pixel of an oversampled uint16 generations channel");
     SurfaceStoreEdit edit(session, opened.pin, opened.view);
     auto snapshot = SurfaceStoreEdit::snapshotForSave(*opened.surface);
     edit.save(*snapshot, {0, 0, 3, 5}, snapshot->channelNames(), contents->revision);
@@ -985,6 +1058,11 @@ void checkResizedTransformCheckpoint(const fs::path& directory)
                 saved.points == expected.points && saved.validity == expected.validity,
                 "saving a recovered resized transform preserves hidden XYZ and explicit absence");
     });
+    auto saved = SurfaceCatalog::open(session, attachment, {"vol", 1}, record.uuid);
+    const auto savedGenerations = saved.surface->channel("generations", SURF_CHANNEL_NORESIZE);
+    require(savedGenerations.size() == expectedGenerations.size() &&
+            cv::norm(savedGenerations, expectedGenerations, cv::NORM_INF) == 0,
+            "saving the recovered transform keeps the oversampled generations pixel array");
 }
 
 void checkDraftRecovery(const fs::path& sourcePath, const fs::path& directory)
@@ -1059,6 +1137,7 @@ int main(int argc, char** argv)
         checkGrowthExclusionSaves(fs::path(dir.path().toStdString()));
         checkPartialDraftHiddenCoordinates(fs::path(dir.path().toStdString()));
         checkFlipOverlayCheckpoint(fs::path(dir.path().toStdString()));
+        checkMaskOnlyFlipSaves(fs::path(dir.path().toStdString()));
         checkResizedTransformCheckpoint(fs::path(dir.path().toStdString()));
         checkTransformedGrowthExclusionSaves(fs::path(dir.path().toStdString()));
         checkPaddingRepairUndoSaves(fs::path(dir.path().toStdString()));
