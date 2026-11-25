@@ -64,18 +64,28 @@ class Module:
         if opts:
             o += [x.encode() for x in opts]
         arr = (ctypes.c_char_p * len(o))(*o)
-        r = nvrtc.nvrtcCompileProgram(prog, len(o), arr)
-        sz = ctypes.c_size_t()
-        nvrtc.nvrtcGetProgramLogSize(prog, ctypes.byref(sz))
-        log = ctypes.create_string_buffer(sz.value)
-        nvrtc.nvrtcGetProgramLog(prog, log)
-        if r != 0:
-            raise RuntimeError("NVRTC compile error:\n" + log.value.decode())
-        nvrtc.nvrtcGetPTXSize(prog, ctypes.byref(sz))
-        ptx = ctypes.create_string_buffer(sz.value)
-        nvrtc.nvrtcGetPTX(prog, ptx)
+        try:
+            r = nvrtc.nvrtcCompileProgram(prog, len(o), arr)
+            sz = ctypes.c_size_t()
+            nvrtc.nvrtcGetProgramLogSize(prog, ctypes.byref(sz))
+            log = ctypes.create_string_buffer(sz.value)
+            nvrtc.nvrtcGetProgramLog(prog, log)
+            if r != 0:
+                raise RuntimeError("NVRTC compile error:\n" + log.value.decode())
+            nvrtc.nvrtcGetPTXSize(prog, ctypes.byref(sz))
+            ptx = ctypes.create_string_buffer(sz.value)
+            nvrtc.nvrtcGetPTX(prog, ptx)
+        finally:
+            nvrtc.nvrtcDestroyProgram(ctypes.byref(prog))      # the PTX is copied out: a compile-only program must not stay allocated
         self._mod = ctypes.c_void_p()
-        _chk(cuda.cuModuleLoadData(ctypes.byref(self._mod), ptx), "cuModuleLoadData")
+        r = cuda.cuModuleLoadData(ctypes.byref(self._mod), ptx)
+        if r == 222:                                            # CUDA_ERROR_UNSUPPORTED_PTX_VERSION
+            major, minor = ctypes.c_int(), ctypes.c_int()
+            nvrtc.nvrtcVersion(ctypes.byref(major), ctypes.byref(minor))
+            raise RuntimeError(f"cuModuleLoadData failed with 222 (unsupported PTX version): NVRTC {major.value}.{minor.value} emitted PTX the installed NVIDIA driver cannot JIT. "
+                               "NVRTC 12.8 emits PTX ISA 8.7, which needs a driver of the R570 series or newer; pin nvidia-cuda-nvrtc-cu12 to the CUDA version of the installed driver "
+                               "(see POOL_OFFLOAD.md, 'Driver requirement') or update the driver.")
+        _chk(r, "cuModuleLoadData")
         self._fns = {}
         self._cuda = cuda
 

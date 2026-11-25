@@ -12,12 +12,23 @@ dev = sys.argv[1]; N = int(float(sys.argv[2])); S = int(sys.argv[3]); T = int(sy
 def rss(): return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024 / 1024
 res = {}
 if dev == 'cpu' and len(policies) > 1:
-    # Process RSS high-water marks cannot be reset, so on the CPU every policy runs in its own fresh process.
-    import subprocess
+    # Process RSS high-water marks cannot be reset, so on the CPU every policy runs in its own fresh process. A failed child fails the run (non-zero exit, no silent gap), and the
+    # optional RESULT.json collects every child's result.
+    import subprocess, tempfile
+    failed = []
     for pol in policies:
-        out = subprocess.run([sys.executable, __file__, dev, sys.argv[2], sys.argv[3], sys.argv[4], pol], capture_output=True, text=True).stdout
-        print(out.strip(), flush=True)
-    sys.exit(0)
+        with tempfile.NamedTemporaryFile(suffix='.json', delete=False) as tmp: child_json = tmp.name
+        run = subprocess.run([sys.executable, __file__, dev, sys.argv[2], sys.argv[3], sys.argv[4], pol, child_json], capture_output=True, text=True)
+        print(run.stdout.strip(), flush=True)
+        if run.returncode != 0:
+            failed.append(pol); print(f"policy {pol} FAILED (exit {run.returncode}): {run.stderr.strip()[-400:]}", file=sys.stderr, flush=True)
+        else:
+            try: res.update(json.load(open(child_json)))
+            except Exception as error: failed.append(pol); print(f"policy {pol}: no result file ({error})", file=sys.stderr, flush=True)
+        try: os.unlink(child_json)
+        except OSError: pass
+    if len(sys.argv) > 6: json.dump(res, open(sys.argv[6], 'w'), indent=1)
+    sys.exit(1 if failed else 0)
 for pol in policies:
     gc.enable(); gc.unfreeze(); gc.collect(); heap = [[i] for i in range(N)]; gc.collect()
     if dev == 'cuda': torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats()

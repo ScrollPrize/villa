@@ -109,3 +109,11 @@ Not covered: the full-store input read, the 16-voxel grid, and runs longer than 
 - 16 GB of GPU memory is enough for the configuration above with `FIT_SPIRAL_POOL_OFFLOAD=1`; without it the 10.81 GiB pool must fit on the card next to the model.
 
 A host can be checked before a fit with a short script: import `torch`, run one CUDA kernel, and import `vc_object_store`, `vc_spiral`, `vc_reader` and `fit_spiral`. Failures at these steps name the missing component.
+
+## Driver requirement (review of #2588)
+
+The gather kernel is compiled at run time with the NVRTC of the environment. villa's locked NVRTC 12.8.93 emits PTX ISA 8.7 for every card from compute capability 7.0 to 8.9 (checked by compiling for sm_70, sm_80, sm_86 and sm_89), and the driver JITs that PTX when the pool loads: it needs an NVIDIA driver of the **R570 series or newer**. Older drivers run ordinary CUDA 12 programs under minor-version compatibility and still reject this PTX with `cuModuleLoadData failed with 222` (CUDA_ERROR_UNSUPPORTED_PTX_VERSION); the error now says so and names the NVRTC version. Fix: update the driver, or pin `nvidia-cuda-nvrtc-cu12` to the CUDA release of the installed driver (`nvidia-cuda-nvrtc-cu12==12.6.*` for an R560 driver). The offload is opt-in, so a fit without `FIT_SPIRAL_POOL_OFFLOAD=1` is not affected.
+
+## Teardown (review of #2588)
+
+`close()` unregisters the page-locked memory on the pool's own card (after that card's outstanding gathers finished) and frees the host array only after the driver released the registration. If the driver refuses (`cuMemHostUnregister` returns an error), `close()` raises, the pool keeps its memory and stays registered, and a later `close()` retries; a pool garbage-collected in that state parks its registration (memory kept alive; `brick_pool_offload.retry_parked_registrations()` retries them). A headless fit closes its store too (`FitContext.close()`), not only an interactive one.

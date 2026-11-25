@@ -186,3 +186,32 @@ def test_a_refused_unregister_keeps_the_pool_memory_and_close_can_be_retried(sid
     assert pool.host_pool is None and pool._reg is None and state["calls"] == 2
     pool.close()                                       # idempotent once released
     assert state["calls"] == 2
+
+
+def test_close_from_another_device_unregisters_on_the_owning_card(sidecar, monkeypatch):
+    """Review: closing a cuda:1 pool while cuda:0 is current used the caller's context; with the driver refusing in that context the NumPy backing was freed anyway. The release
+    runs in the owning card's context, so closing from card 0 succeeds and the host array is freed only after the driver released it."""
+    if torch.cuda.device_count() < 2:
+        pytest.skip("needs two CUDA devices")
+    import host_pool_cuda
+    Off = brick_pool_offload.offload_class(scc)
+    torch.cuda.set_device(0)
+    pool = Off(sidecar[0], device="cuda:1", label="card1_close")
+    seen = []
+    real_libs = host_pool_cuda._libs
+
+    class Cuda:
+        def __init__(self, real):
+            self._real = real
+
+        def cuMemHostUnregister(self, ptr):
+            seen.append(torch.cuda.current_device())
+            return self._real.cuMemHostUnregister(ptr)
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+    monkeypatch.setattr(host_pool_cuda, "_libs", lambda: (real_libs()[0], Cuda(real_libs()[1])))
+    assert torch.cuda.current_device() == 0
+    pool.close()
+    assert seen == [1], f"unregistered in the context of cuda:{seen}, not the owning card"
+    assert pool.host_pool is None and torch.cuda.current_device() == 0
