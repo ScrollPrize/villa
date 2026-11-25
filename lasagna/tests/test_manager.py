@@ -165,13 +165,49 @@ def test_published_normal_discovery_skips_http_root_and_preserves_region(monkeyp
     class Listing:
         def __init__(self, location, **kwargs):
             calls.append((location, kwargs))
-        def keys(self, prefix):
-            return [prefix + "normal.lasagna.json", prefix + "sd0/0/.zarray"]
+        def list_page(self, continuation_token=""):
+            pages = {
+                "": {"objects": [], "children": ["cos.ome.zarr"], "next_continuation_token": "next"},
+                "next": {
+                    "objects": [{"key": "inference.json"}, {"key": "normal.lasagna.json"}],
+                    "children": ["nx.ome.zarr"], "next_continuation_token": "",
+                },
+            }
+            return pages[continuation_token]
     monkeypatch.setattr(manager_fiberlets, "ObjectStore", Listing)
     assert manager_fiberlets._discover_published_manifest(record) == (
         f"https://public.s3.{region}.amazonaws.com/"
         "PHerc0001/representations/predictions/lasagna/normals/normal.lasagna.json")
-    assert calls == [(f"s3+{region}://public", {"auth": None})]
+    assert calls == [(
+        f"s3+{region}://public/PHerc0001/representations/predictions/lasagna/normals", {"auth": None},
+    )]
+
+
+@pytest.mark.parametrize("objects,children,result", [
+    (["inference.json"], ["run.zarr"], "run.zarr/.zattrs"),
+    (["a.lasagna.json"], ["nx.ome.zarr", "ny.ome.zarr"], "a.lasagna.json"),
+    (["inference.json"], ["a.zarr", "b.zarr"], "found 0 and 2"),
+    (["a.lasagna.json", "b.lasagna.json"], [], "found 2 and 0"),
+])
+def test_published_normal_discovery_finds_the_embedded_manifest(monkeypatch, objects, children, result):
+    record = next(item for item in index_lasagna_predictions(prediction_catalog()) if item.role == "normal")
+
+    class Listing:
+        def __init__(self, location, **kwargs):
+            pass
+
+        def list_page(self, continuation_token=""):
+            return {
+                "objects": [{"key": key} for key in objects], "children": children,
+                "next_continuation_token": "",
+            }
+
+    monkeypatch.setattr(manager_fiberlets, "ObjectStore", Listing)
+    if result.startswith("found"):
+        with pytest.raises(ValueError, match=result):
+            manager_fiberlets._discover_published_manifest(record)
+    else:
+        assert manager_fiberlets._discover_published_manifest(record) == f"{record.artifact_url}/{result}"
 
 
 def test_published_normal_rejects_absolute_http_origin_even_with_s3_root():
@@ -874,27 +910,41 @@ class FakeTmux:
         return window_id == "@99"
 
 
+def _compact_manifest(channels: list[str]) -> dict:
+    return {
+        "version": 3, "source_to_base": 1.0, "base_shape_zyx": [100, 80, 60],
+        "validity_channel": "chunks", "grad_mag_encode_scale": 1000.0, "grad_mag_factor": 0.25,
+        "provenance": "../inference.json",
+        "groups": {"sd2": {"zarr": "sd2/2", "scaledown": 2, "channels": channels}},
+    }
+
+
 def _completed_prediction_run(
     config: ManagerConfig, *, name: str, kind: str, channels: list[str],
-    sample_id: str = "PHerc0001", volume_id: str = "20260101000001",
+    sample_id: str = "PHerc0001", volume_id: str = "20260101000001", compact: bool = False,
 ) -> Path:
     run_dir = Path(config.output_dir) / name
     artifacts = run_dir / "artifacts"
     artifacts.mkdir(parents=True)
     manifest = artifacts / f"{name}.lasagna.json"
-    manifest.write_text(json.dumps({
-        "version": 2,
-        "source_to_base": 1.0,
-        "base_shape_zyx": [100, 80, 60],
-        "groups": {
-            channel: {
-                "zarr": f"{channel}.ome.zarr/2",
-                "scaledown": 2,
-                "channels": [channel],
-            }
-            for channel in channels
-        },
-    }), encoding="utf-8")
+    if compact:
+        manifest = artifacts / f"{name}.zarr" / ".zattrs"
+        manifest.parent.mkdir()
+        manifest.write_text(json.dumps({"lasagna": _compact_manifest(channels)}), encoding="utf-8")
+    else:
+        manifest.write_text(json.dumps({
+            "version": 2,
+            "source_to_base": 1.0,
+            "base_shape_zyx": [100, 80, 60],
+            "groups": {
+                channel: {
+                    "zarr": f"{channel}.ome.zarr/2",
+                    "scaledown": 2,
+                    "channels": [channel],
+                }
+                for channel in channels
+            },
+        }), encoding="utf-8")
     atomic_json(artifacts / "inference.json", {
         "schema_version": 1,
         "artifact_kind": kind,
@@ -917,7 +967,7 @@ def _completed_prediction_run(
             "snapshot": f"{name}-training/snapshots/best.pt",
             "sha256": "a" * 64,
         },
-        "artifacts": [{"kind": "manifest", "path": manifest.name}],
+        "artifacts": [{"kind": "manifest", "path": manifest.relative_to(artifacts).as_posix()}],
     })
     atomic_json(run_dir / "metadata.json", {
         "run_uuid": f"{name}-uuid", "run_name": name,
@@ -1150,6 +1200,63 @@ def test_fiberlet_launch_auto_resolves_and_caches_published_normals(
     record["lifecycle"]["fiberlet_preprocess"] = "interrupted"
     atomic_json(run_dir / "metadata.json", record)
     assert resume_fiberlet(config, record["run_name"], tmux=FakeTmux()) == run_dir
+
+
+def test_fiberlet_inputs_accept_compact_runs(tmp_path):
+    config = configured(tmp_path)
+    for name, kind, channels in (
+        ("fiber-source", "fiber3d-prediction", ["presence", "nx", "ny", "width"]),
+        ("normal-source", "lasagna", ["grad_mag", "nx", "ny"]),
+    ):
+        _completed_prediction_run(config, name=name, kind=kind, channels=channels, compact=True)
+    fiber, normal = resolve_fiberlet_inputs(config, "fiber-source", "normal-source")
+    assert fiber["manifest"]["version"] == normal["manifest"]["version"] == 3
+    assert fiber["manifest_path"].parts[-2:] == ("fiber-source.zarr", ".zattrs")
+
+    attrs = json.loads(normal["manifest_path"].read_text())
+    attrs["lasagna"]["groups"]["sd2"]["zarr"] = "elsewhere"
+    normal["manifest_path"].write_text(json.dumps(attrs))
+    with pytest.raises(ValueError, match="invalid v3 resolution group"):
+        resolve_fiberlet_inputs(config, "fiber-source", "normal-source")
+
+
+@pytest.mark.parametrize("shape,chunks,error", [
+    ([3, 25, 20, 15], [3, 64, 64, 64], None),
+    ([2, 25, 20, 15], [2, 64, 64, 64], "whole chunks"),
+    ([3, 25, 20, 15], [1, 64, 64, 64], "whole chunks"),
+    ([25, 20, 15], [64, 64, 64], "valid 4D"),
+])
+def test_published_compact_normal_caches_beside_its_marker(tmp_path, monkeypatch, shape, chunks, error):
+    config = configured(tmp_path)
+    cache = prediction_catalog()
+    entry = next(
+        item for item in cache.document["samples"]["PHerc0001"]["volumes"]["one"]["data"]
+        if item.get("parameters", {}).get("model_id") == "20260419180421"
+    )
+    entry["creation_info"] = {}
+    record = next(item for item in index_lasagna_predictions(cache) if item.role == "normal")
+    base = record.artifact_url + "/run.zarr"
+    served = {
+        base + "/.zattrs": json.dumps({"lasagna": _compact_manifest(["grad_mag", "nx", "ny"])}).encode(),
+        base + "/sd2/2/.zarray": json.dumps({"shape": shape, "chunks": chunks, "dtype": "|u1"}).encode(),
+    }
+    requests = []
+    monkeypatch.setattr(manager_fiberlets, "_discover_published_manifest", lambda record: base + "/.zattrs")
+    monkeypatch.setattr(manager_fiberlets, "_remote_bytes", lambda url: requests.append(url) or served[url])
+    if error is not None:
+        with pytest.raises(ValueError, match=error):
+            manager_fiberlets._published_dependency(config, record)
+        return
+    normal = manager_fiberlets._published_dependency(config, record)
+    assert normal["manifest"]["version"] == 3
+    path = normal["manifest_path"]
+    assert path.parts[-2:] == ("run.zarr", ".zattrs") and path.is_file()
+    marker = json.loads((path.parents[1] / "lasagna-remote.json").read_text())
+    assert marker["manifest_file"] == "run.zarr/.zattrs"
+    assert marker["artifact_url"] == record.artifact_url
+    assert sorted(requests) == sorted(served)
+    assert manager_fiberlets._published_dependency(config, record) == normal
+    assert len(requests) == len(served)
 
 
 def test_fiberlet_auto_normal_reports_missing_publication(tmp_path):

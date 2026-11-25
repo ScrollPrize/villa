@@ -7,9 +7,9 @@ portable provenance, and atomic Atlas staging/ingestion.
 
 New inference outputs default to [compact schema v3](volume_schema_v3.md):
 one Zarr store with an embedded manifest and full-channel CZYX chunks grouped
-by resolution. Existing sidecar outputs remain resumable. Atlas staging and
-Fiberlet discovery below still require legacy output until those consumers
-support v3; append `-- --output-format legacy` when creating those runs.
+by resolution. Existing sidecar outputs remain resumable. Atlas staging,
+Fiberlet inputs (local runs and published normals) and VC3D's open-data catalog
+accept both layouts.
 
 ## Configuration
 
