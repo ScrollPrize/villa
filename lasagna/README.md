@@ -47,6 +47,11 @@ fused Metal kernels with their gradients (`mesh_loss_metal.py`). Set
 which are much slower on MPS but useful for comparison. `--device cpu` also runs every fit mode, with the same PyTorch
 code.
 
+The `winding_vol` loss needs PyTorch 2.15 or newer on MPS: 2.11 has no MPS
+backward for its 3D grid sample, so there a fit whose stages weight it stops
+before optimization with an error. Run those fits with `--device cpu` or
+`cuda`, or a newer PyTorch.
+
 `compile_flatten` needs PyTorch 2.15 or newer on MPS: older Inductor versions
 generate Metal that fails to compile, and the fit then falls back to eager
 mode with a warning.

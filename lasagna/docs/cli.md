@@ -11,7 +11,7 @@ Each part provides `add_args(parser)` + `from_args(args)`:
   - `--device` (default `cuda`; `mps` runs on an Apple GPU with Metal samplers, `cpu` uses plain PyTorch)
   - `--seed cx cy cz` seed point in fullres voxels
   - `--model-w`, `--model-h` model extent in fullres voxels
-  - `--winding-volume` optional winding volume zarr path
+  - `--winding-volume` optional winding volume zarr path; the `winding_vol` loss it feeds needs PyTorch 2.15 or newer on `mps` (2.11 has no MPS backward for its 3D grid sample), and a fit that weights it on an older PyTorch stops before optimization: use `cpu`, `cuda` or a newer PyTorch
   - `--cuda-gridsample` enable custom CUDA uint8 sampling kernel
   - `--erode-valid-mask` erode valid mask by N pixels
 

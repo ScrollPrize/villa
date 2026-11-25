@@ -2230,6 +2230,8 @@ def main(argv: list[str] | None = None, *, lifecycle_fn=None,
 		cfg,
 		init_mode=model_cfg.init_mode if model_init == "seed" else None,
 	)
+	# fail before the data loads, not at the first backward
+	optimizer.require_device_support(stages, device)
 	print("[fit] optimizer stages:", flush=True)
 	for i, st in enumerate(stages):
 		if st.children:

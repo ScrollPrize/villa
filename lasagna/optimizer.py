@@ -9,6 +9,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 
 import cli_data
 import fit_data
@@ -267,6 +268,54 @@ def _stage_to_modifiers(
 
 def _need_term(name: str, stage_eff: dict[str, float]) -> float:
 	return float(stage_eff.get(name, 0.0))
+
+
+@functools.cache
+def _mps_grid_sample_3d_backward() -> bool:
+	"""True when 5D F.grid_sample can run its backward on MPS in this PyTorch.
+
+	PyTorch 2.11 has no MPS kernel for it and 2.15 has one; a tiny probe answers for the installed build,
+	including under PYTORCH_ENABLE_MPS_FALLBACK, which runs it on the CPU instead.
+	"""
+	vol = torch.zeros(1, 1, 2, 2, 2, device="mps")
+	grid = torch.zeros(1, 1, 1, 1, 3, device="mps", requires_grad=True)
+	try:
+		F.grid_sample(vol, grid, align_corners=True).sum().backward()
+	except NotImplementedError:
+		return False
+	return True
+
+
+def _stage_weighting(stages, term: str) -> Stage | None:
+	"""The first stage, wrapped ones included, that gives `term` a positive weight outside the cylinder stages."""
+	for stage in stages:
+		opt_cfg = stage.global_opt
+		# cylinder stages keep only the cylinder terms (_stage_eff_for_opt)
+		if opt_cfg is not None and "cyl_params" not in opt_cfg.params and _need_term(term, opt_cfg.eff) > 0:
+			return stage
+		child = _stage_weighting(stage.children, term)
+		if child is not None:
+			return child
+	return None
+
+
+def require_device_support(stages: list[Stage], device: torch.device) -> None:
+	"""Raise ValueError when a stage weights a loss term whose backward cannot run on `device`.
+
+	Runs before optimization so the fit fails at once instead of at the term's first backward. The winding_vol
+	loss samples its volume with 5D F.grid_sample, which has no MPS backward in some PyTorch versions.
+	"""
+	if torch.device(device).type != "mps":
+		return
+
+	stage = _stage_weighting(stages, "winding_vol")
+	if stage is None or _mps_grid_sample_3d_backward():
+		return
+
+	raise ValueError(
+		f"stage '{stage.name}' weights the winding_vol loss, whose 3D grid sample has no MPS backward in "
+		f"PyTorch {torch.__version__}; set its weight to 0, run with --device cpu or cuda, or use PyTorch 2.15 or newer"
+	)
 
 
 def _parse_opt_settings(
@@ -1034,6 +1083,7 @@ def optimize(
 	snap_surf_boundary: dict | None = None,
 ) -> fit_data.FitData3D:
 	_optimize_t0 = time.perf_counter()
+	require_device_support(stages, next(model.parameters()).device)
 	opt_loss_corr.reset_state()
 	opt_loss_snap_surf.reset_state()
 	opt_loss_atlas_line.reset_state()
