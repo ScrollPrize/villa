@@ -151,6 +151,11 @@ comparing a CPU run with an MPS one. `get_ink_metrics.py --device` picks the
 nnU-Net device; without it the folds take CUDA, else MPS, else the CPU, whatever
 the fitting variables say.
 
+The spiral's winding angles (`sample_spiral.get_spiral_yxs`) are always built
+in float64, since float32 angles move the outer nodes by up to half a voxel.
+Where `float_hi()` is float32 they are built on the CPU and only the node
+positions are copied to the device.
+
 ## Opt-in flow-field switches
 
 Both are off by default and do not change the math.
@@ -1062,7 +1067,29 @@ lease file under its output directory. Uploads accept resume checkpoints only.
 ### Creating the Spiral Python environment
 
 The service host needs the Spiral environment (a CUDA-capable PyTorch plus the
-dependencies in `pyproject.toml`, Python ≥ 3.14). With [uv](https://docs.astral.sh/uv/):
+dependencies in `pyproject.toml`, Python ≥ 3.14).
+
+`uv sync` compiles the local `vc_reader` and `vc_object_store` packages, and
+`uv` does not install system C++ libraries. Install them first. On Ubuntu,
+with the Universe component enabled:
+
+```sh
+sudo apt-get update
+sudo apt-get install -y build-essential cmake ninja-build pkg-config git \
+  libboost-dev libconcurrentqueue-dev nlohmann-json3-dev libsqlite3-dev \
+  libssl-dev libcurl4-openssl-dev zlib1g-dev libblosc-dev libblosc2-dev \
+  liblz4-dev libzstd-dev libopencv-dev libtiff-dev libpng-dev libjpeg-dev \
+  python3-dev
+```
+
+`python3-dev` is needed when `uv` builds against the system Python, as it does
+on Ubuntu 26.04 (Python 3.14) unless it already has a managed 3.14.
+`volume-cartographer/scripts/install_build_deps.sh` installs the C++ libraries
+(plus Qt and the other VC3D dependencies). The standalone `vc_object_ingest`,
+`vc_object_server` and `vc_object_convert` tools build from `vc_object_store`
+with the same packages; leave `VC_OBJECT_STORE_BUILD_LINKING` on (the default,
+unlike its README's test build), because Spiral's link refresh needs it in
+`vc_object_server`. Then, with [uv](https://docs.astral.sh/uv/):
 
 ```sh
 cd spiral-fitting
@@ -1071,7 +1098,8 @@ uv sync            # creates .venv from pyproject.toml
 
 This also builds Spiral's native helpers as `vc_spiral.spiral_sampling`,
 `vc_spiral.track_crossings` and `vc_spiral.track_store`. OpenMP is used when the toolchain provides it; the
-same modules build with serial kernels when it does not.
+same modules build with serial kernels when it does not, and always on Windows
+(MSVC) and macOS, where torch's wheels load their own OpenMP runtime.
 
 or with conda/pip, install `torch` for your CUDA version and then
 `pip install -e . --group cuda` from `spiral-fitting/` (pip 25.1 or newer).
@@ -1098,6 +1126,24 @@ uv pip install -e '.[cpu]'
 
 Use `.venv/bin/python` (or `uv run --no-sync`) afterwards: a plain `uv sync`
 or `uv run` would reinstall the CUDA build of torch and the `cuda` group.
+
+On macOS, `vc_object_store` links Homebrew's OpenCV, which links OpenBLAS, which
+loads Homebrew's `libomp.dylib`, and torch loads its own copy. The two copies share
+symbols, and whichever loads first serves both, which crashes torch's threads when
+`vc_object_store` is imported first. So on macOS, when torch is installed,
+importing `vc_object_store` loads and starts torch's `libomp.dylib` first and keeps
+the copy it brings itself to one thread. Two runtimes stop Python with
+`OMP: Error #15` unless `KMP_DUPLICATE_LIB_OK=TRUE` is set, so the import sets it
+while the two start and then removes it (a value you set is left alone): torch and
+`vc_object_store` can be imported in either order, and later loads and child
+processes keep the check. If another `libomp.dylib` was loaded before torch's when
+`vc_object_store` is imported (pykdtree's, which `import kimimaro` loads), or you set
+`KMP_DUPLICATE_LIB_OK` to a false value, the import arranges nothing and OpenMP's own
+check reports it. Wheels that bundle a `libomp.dylib` are otherwise not covered:
+`import kimimaro` before `import torch` crashes torch's threads, with or without
+`vc_object_store`; pykdtree's copy stops Python with `OMP: Error #15` when it starts
+beside torch's, and with `KMP_DUPLICATE_LIB_OK=TRUE` the two crash when both run
+threads. Spiral's own modules use no OpenMP on macOS.
 
 ### Resident sparse field pools
 

@@ -1501,6 +1501,13 @@ void MenuActionController::beginRotateSurfaceTransform()
                                  QObject::tr("Select a segmentation surface before rotating."));
         return;
     }
+    // Rotate shows an unsaved preview: an edit session's autosave would publish it outside Apply.
+    if (_window->_segmentationModule && _window->_segmentationModule->editingEnabled()) {
+        QMessageBox::information(_window,
+                                 QObject::tr("Rotate Surface"),
+                                 QObject::tr("Turn off segmentation editing before rotating the segment."));
+        return;
+    }
     // Rotation saves back to the store the surface was opened from.
     QString error;
     if (_window->_surfacePanel && !_window->_surfacePanel->prepareSurfaceEditing(activeSurface->id, &error)) {

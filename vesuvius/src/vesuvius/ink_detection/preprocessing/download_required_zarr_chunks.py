@@ -14,7 +14,12 @@ from tqdm.auto import tqdm
 from vc_reader import tifxyz
 
 from vesuvius.ink_detection.config import InkDataConfig
-from vesuvius.ink_detection.data.geometry import compute_native_crop_bbox
+from vesuvius.ink_detection.data.augmentations import NATIVE_CROP_TRANSLATION_MAX_VOXELS
+from vesuvius.ink_detection.data.geometry import (
+    compute_native_crop_bbox,
+    native_tifxyz_pyramid_params,
+    read_tifxyz_on_flat_grid,
+)
 from vesuvius.ink_detection.data.patch_finding_default import (
     labeled_patch_coverage,
     surface_patch_bbox,
@@ -702,18 +707,31 @@ def _build_segment_download_patches(
     patch_size = tuple(int(v) for v in segment.patch_size)
     min_labeled_coverage = segment.data_config.patch_finding.min_labeled_coverage
     patch_tifxyz = tifxyz.read(segment.segment_dir)
+    # Candidates are on the volume_scale label grid, so sample the tifxyz and
+    # scale its positions the same way the trainer's native crop does.
+    stride, coordinate_scale, _ = native_tifxyz_pyramid_params(segment.scale)
 
     kept_patches: list[dict] = []
     for y0, x0 in candidates:
         patch_bbox_zyx = surface_patch_bbox(surface, y0, x0, patch_size)
-        flat_xyz, flat_valid = patch_tifxyz.resample_full(
-            (int(y0), int(x0)), (patch_size[1], patch_size[2]), interpolation="bicubic"
+        patch_zyxs, flat_valid = read_tifxyz_on_flat_grid(
+            patch_tifxyz,
+            y0=int(y0),
+            y1=int(y0) + patch_size[1],
+            x0=int(x0),
+            x1=int(x0) + patch_size[2],
+            flat_grid_stride=stride,
+            native_coordinate_scale=coordinate_scale,
         )
-        patch_zyxs = flat_xyz[..., ::-1]
-        native_world_bbox = compute_native_crop_bbox(
+        z0, crop_y0, crop_x0, z1, crop_y1, crop_x1 = compute_native_crop_bbox(
             patch_zyxs,
             flat_valid,
             tuple(int(value) for value in patch_size),
+        )
+        # Training may translate the crop in Y and X, so plan every read it can make.
+        pad = NATIVE_CROP_TRANSLATION_MAX_VOXELS
+        native_world_bbox = (
+            z0, crop_y0 - pad, crop_x0 - pad, z1, crop_y1 + pad, crop_x1 + pad
         )
 
         if validation_mask is not None:
