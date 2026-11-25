@@ -220,6 +220,127 @@ void testResample()
         }
         require(error[1] < 0.1f * error[0] && error[1] < 1e-3f, "bicubic normals follow a cylinder");
         require(step[1] < 0.1f * step[0], "bicubic normals are continuous across cells");
+
+        // The border cells and the cells next to a hole: their one sided derivatives must
+        // keep the bicubic normals within the interior error, not fall back to the linear one.
+        std::vector<std::uint8_t> valid(std::size_t(rows) * cols, 1);
+        valid[std::size_t(2) * cols + 12] = 0;
+        vcr::grid::Surface holed({cylinder.data(), rows, cols, std::size_t(cols) * 3, nullptr, valid.data()},
+                                 {vcr::grid::Interpolation::Bicubic});
+        const auto worst = [&](double x0, int n, double row) {
+            std::vector<float> p(std::size_t(n) * 3), m(p.size());
+            holed.resample({x0, row, 0.01, 1.0, n, 1}, p.data(), m.data());
+            float e = 0;
+            for (int i = 0; i < n; ++i) {
+                const float a = 0.05f * float(x0 + 0.01 * i), *q = &m[std::size_t(i) * 3];
+                if (std::isfinite(q[0]))
+                    e = std::max(e, std::acos(std::min(1.0f, std::abs(q[0] * std::sin(a) + q[2] * std::cos(a)))));
+            }
+            return e;
+        };
+        const float interior = worst(4.0, 601, 4.5), first = worst(0.0, 101, 4.5), last = worst(22.0, 101, 4.5);
+        const float nearHole = worst(10.0, 401, 2.5);  // cells 10 and 13 beside the hole's cells
+        require(first < 2 * interior && last < 2 * interior, "bicubic normals in border cells");
+        require(nearHole < 2 * interior, "bicubic normals in cells next to a hole");
+
+        // One sided stencils must not turn a tangent against the secant: where the steps along a
+        // line differ much (unevenly spaced columns, a border or hole vertex far from its
+        // neighbour) the bicubic normal stays near the bilinear one.
+        const auto tilt = [](const float* xyz, int rows, int cols, double x, double y) {
+            float p[3], bicubic[3], linear[3];
+            vcr::grid::Surface b({xyz, rows, cols, std::size_t(cols) * 3}, {vcr::grid::Interpolation::Bicubic});
+            vcr::grid::Surface l({xyz, rows, cols, std::size_t(cols) * 3}, {vcr::grid::Interpolation::Linear});
+            b.resample({x, y, 1, 1, 1, 1}, p, bicubic);
+            l.resample({x, y, 1, 1, 1, 1}, p, linear);
+            const float cosine = bicubic[0] * linear[0] + bicubic[1] * linear[1] + bicubic[2] * linear[2];
+            return std::isfinite(cosine) ? std::acos(std::min(1.0f, cosine)) : 4.0f;  // a missing normal is no small tilt
+        };
+        const float limit = 0.5236f;  // 30 degrees
+        {  // columns at x = 10, 11, 15: a second step above three times the first reversed the first slope
+            float plane[4 * 3 * 3];
+            for (int r = 0; r < 4; ++r)
+                for (int c = 0; c < 3; ++c) {
+                    float* q = &plane[(r * 3 + c) * 3];
+                    q[0] = c == 0 ? 10.0f : c == 1 ? 11.0f : 15.0f;
+                    q[1] = float(r);
+                    q[2] = 0.0f;
+                }
+            require(tilt(plane, 4, 3, 0.05, 1.5) < 0.01f && tilt(plane, 4, 3, 0.1, 1.5) < 0.01f, "bicubic normal on uneven columns");
+        }
+        {  // A skewed plane (rows of 4 vertices, the third column dropped by 0.2): the second order tangent at the
+           // first column turns toward the row direction and, unguarded, reverses the sheet's normal there.
+            float skew[4 * 3 * 3];
+            const float drop[3] = {0.0f, 0.0f, -0.2f};
+            for (int r = 0; r < 4; ++r)
+                for (int c = 0; c < 3; ++c) {
+                    float* q = &skew[(r * 3 + c) * 3];
+                    q[0] = 10.0f + float(c + r);
+                    q[1] = 10.0f + 0.05f * float(r) + drop[c];
+                    q[2] = 10.0f;
+                }
+            float p[3], bicubic[3], linear[3];
+            vcr::grid::Surface b({skew, 4, 3, 9, nullptr, nullptr}, {vcr::grid::Interpolation::Bicubic});
+            vcr::grid::Surface l({skew, 4, 3, 9, nullptr, nullptr}, {vcr::grid::Interpolation::Linear});
+            b.resample({0.05, 1.5, 0.01, 1.0, 1, 1}, p, bicubic);
+            l.resample({0.05, 1.5, 0.01, 1.0, 1, 1}, p, linear);
+            require(bicubic[2] * linear[2] > 0, "bicubic normal keeps its side on a skewed plane");
+        }
+        {  // Without the second order step (a window whose context was cut) the border cells keep the first order error
+            vcr::grid::SurfaceOptions first;
+            first.interpolation = vcr::grid::Interpolation::Bicubic;
+            first.secondOrderEdges = false;
+            vcr::grid::Surface plain({cylinder.data(), rows, cols, std::size_t(cols) * 3}, first);
+            float p[3], m[3];
+            plain.resample({0.0, 4.5, 0.01, 1.0, 1, 1}, p, m);
+            const float a = 0.05f * 0.0f;
+            require(std::acos(std::min(1.0f, std::abs(m[0] * std::sin(a) + m[2] * std::cos(a)))) > 0.01f, "first order border cells without the second order step");
+        }
+        {  // PHerc0306B w074 beside missing vertices: 6 x 6 vertices at grid column 67.95, row 15.05
+            const float block[] = {
+                NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN,
+                NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN,
+                159.4f, 162.4f, 57.7f, 124.6f, 155.1f, 48.6f, 89.8f, 147.9f, 39.5f, 56.4f, 143.4f, 32.1f, 27.5f, 145.0f, 28.8f, 0.0f, 147.3f, 26.2f,
+                113.5f, 169.5f, 45.0f, 99.2f, 156.0f, 39.3f, 86.5f, 141.5f, 33.7f, 75.0f, 126.3f, 28.0f, 64.6f, 110.9f, 22.7f, 54.2f, 93.8f, 16.9f,
+                162.3f, 100.8f, 28.8f, 151.6f, 81.4f, 22.3f, 140.2f, 62.6f, 16.2f, 127.8f, 45.1f, 10.7f, 114.9f, 27.6f, 5.1f, 101.2f, 11.1f, 0.0f,
+                191.1f, 52.6f, 28.1f, 175.1f, 40.2f, 24.9f, 158.4f, 28.8f, 22.3f, 141.0f, 18.7f, 20.2f, 123.3f, 9.1f, 18.3f, 105.3f, 0.0f, 16.7f,};
+            require(tilt(block, 6, 6, 2.95, 2.05) < limit, "bicubic normal beside missing vertices");
+        }
+        {  // PHerc0306B w074 at a border column: 6 x 6 vertices at grid column 341.95, row 12.5
+            const float block[] = {
+                0.0f, 0.0f, 32.6f, 5.5f, 5.4f, 16.3f, 13.0f, 13.6f, 0.0f, 28.1f, 24.0f, 12.8f, NAN, NAN, NAN, NAN, NAN, NAN,
+                12.3f, 10.3f, 44.6f, 15.6f, 18.7f, 27.8f, 25.5f, 25.8f, 15.6f, 41.8f, 39.5f, 26.4f, NAN, NAN, NAN, NAN, NAN, NAN,
+                21.8f, 22.1f, 57.0f, 29.9f, 25.7f, 40.3f, 39.9f, 36.8f, 33.7f, 65.5f, 57.5f, 63.0f, NAN, NAN, NAN, NAN, NAN, NAN,
+                31.0f, 34.7f, 68.7f, 40.6f, 36.5f, 52.8f, 53.2f, 47.6f, 49.9f, 85.1f, 71.6f, 92.5f, 121.1f, 94.6f, 161.8f, NAN, NAN, NAN,
+                37.5f, 48.3f, 81.0f, 51.9f, 45.1f, 66.5f, 63.0f, 57.5f, 61.4f, 103.7f, 84.8f, 120.2f, 147.9f, 116.1f, 203.0f, NAN, NAN, NAN,
+                46.1f, 59.3f, 93.5f, 57.1f, 61.2f, 77.3f, 72.5f, 62.2f, 71.5f, 117.9f, 92.8f, 139.9f, 172.9f, 135.0f, 241.6f, NAN, NAN, NAN,};
+            require(tilt(block, 6, 6, 2.95, 2.50) < limit, "bicubic normal in a border cell next to a far vertex");
+        }
+        {  // PHerc0306B w074 at a border column, in a cell that folds: 6 x 6 vertices at grid column 3.05, row 63.2
+            const float block[] = {
+                NAN, NAN, NAN, 129.3f, 17.5f, 0.0f, 110.0f, 22.0f, 3.3f, 90.9f, 26.9f, 6.5f, 71.5f, 31.0f, 9.5f, 52.0f, 34.4f, 12.1f,
+                NAN, NAN, NAN, 130.9f, 10.8f, 19.1f, 111.7f, 15.2f, 22.5f, 92.3f, 19.9f, 25.6f, 73.1f, 24.4f, 28.6f, 53.4f, 27.4f, 31.1f,
+                NAN, NAN, NAN, 127.0f, 0.0f, 53.2f, 109.5f, 5.2f, 51.8f, 91.0f, 10.0f, 53.4f, 74.4f, 17.4f, 47.7f, 54.9f, 20.7f, 50.1f,
+                NAN, NAN, NAN, 96.0f, 12.3f, 44.4f, 86.1f, 10.0f, 58.4f, 68.8f, 11.4f, 65.9f, 55.6f, 10.2f, 78.6f, 48.3f, 9.6f, 88.7f,
+                NAN, NAN, NAN, 78.6f, 23.7f, 26.2f, 62.0f, 23.6f, 37.3f, 46.6f, 21.9f, 48.7f, 29.3f, 20.1f, 58.6f, 13.1f, 16.1f, 68.7f,
+                NAN, NAN, NAN, 68.1f, 31.4f, 10.5f, 51.3f, 31.4f, 21.3f, 34.3f, 29.9f, 31.5f, 17.1f, 26.9f, 41.1f, 0.0f, 22.2f, 50.1f,};
+            require(tilt(block, 6, 6, 1.05, 2.2) < 1.5708f, "bicubic normal keeps its side in a folded border cell");
+        }
+        {  // z = column^2 with vertex (1, 1) masked: the cell (2, 2) beside the diagonal hole stays exact
+            float quadratic[5 * 5 * 3];
+            std::uint8_t valid[25];
+            for (int r = 0; r < 5; ++r)
+                for (int c = 0; c < 5; ++c) {
+                    float* q = &quadratic[(r * 5 + c) * 3];
+                    q[0] = float(c);
+                    q[1] = float(r);
+                    q[2] = float(c * c);
+                    valid[r * 5 + c] = r != 1 || c != 1;
+                }
+            vcr::grid::Surface diagonal({quadratic, 5, 5, 15, nullptr, valid});
+            float p[3];
+            diagonal.resample({2.5, 2.5, 1, 1, 1, 1}, p, nullptr);
+            require(near(p[2], 6.25f, 1e-3f), "bicubic position beside a diagonal hole");
+        }
     }
 }
 
