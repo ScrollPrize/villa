@@ -142,6 +142,16 @@ void AgentBridgeServer::registerSessionHandlers()
 
     registerMethod(
         {
+            .name = QStringLiteral("ui.dialog"),
+            .params = {
+                Params::optionalString(QStringLiteral("click")),
+            },
+            .errors = {-32602, -32007},
+        },
+        [this](const QJsonValue& p) { return handleUiDialog(p); });
+
+    registerMethod(
+        {
             .name = QStringLiteral("project.create"),
             .params = {
                 Params::requiredString(QStringLiteral("path")),

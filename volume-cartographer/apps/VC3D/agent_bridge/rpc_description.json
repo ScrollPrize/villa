@@ -3024,6 +3024,20 @@
         "type": "object"
       }
     },
+    "ui.dialog": {
+      "errors": [
+        -32602,
+        -32007
+      ],
+      "params": {
+        "properties": {
+          "click": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      }
+    },
     "umbilicus.import": {
       "errors": [
         -32602,

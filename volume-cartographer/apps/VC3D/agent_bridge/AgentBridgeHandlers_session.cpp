@@ -16,6 +16,10 @@
 #include <QPainter>
 #include <QPointF>
 #include <QRegularExpression>
+#include <QAbstractButton>
+#include <QApplication>
+#include <QLabel>
+#include <QTimer>
 #include <QWidget>
 
 #include <algorithm>
@@ -59,6 +63,53 @@ QJsonObject AgentBridgeServer::handlePing(const QJsonValue&)
     return result;
 }
 
+
+QJsonObject AgentBridgeServer::handleUiDialog(const QJsonValue& params)
+{
+    QJsonObject result;
+    QWidget* dialog = QApplication::activeModalWidget();
+    const QString click = params.toObject().value(QStringLiteral("click")).toString();
+    result["open"] = dialog != nullptr;
+    if (!dialog) {
+        if (!click.isEmpty()) {
+            throw AgentBridgeError{-32007, "No dialog is open", {{"kind", "dialog"}}};
+        }
+        return result;
+    }
+
+    const auto label = [](const QAbstractButton* button) { return button->text().remove(QLatin1Char('&')); };
+    QJsonArray texts;
+    for (const auto* text : dialog->findChildren<QLabel*>()) {
+        if (text->isVisible() && !text->text().isEmpty()) {
+            texts.append(text->text());
+        }
+    }
+    QJsonArray buttons;
+    QAbstractButton* target = nullptr;
+    for (auto* button : dialog->findChildren<QAbstractButton*>()) {
+        if (!button->isVisible() || label(button).isEmpty()) {
+            continue;
+        }
+        buttons.append(QJsonObject{{"label", label(button)}, {"enabled", button->isEnabled()}});
+        if (!click.isEmpty() && label(button) == click && button->isEnabled()) {
+            target = button;
+        }
+    }
+    result["title"] = dialog->windowTitle();
+    result["texts"] = texts;
+    result["buttons"] = buttons;
+
+    if (!click.isEmpty()) {
+        if (!target) {
+            throw AgentBridgeError{-32007, "The dialog has no enabled button with that label",
+                                   {{"kind", "button"}, {"id", click}}};
+        }
+        // pressed after this reply goes out: the press may close the dialog and run what it starts
+        QTimer::singleShot(0, target, &QAbstractButton::click);
+        result["clicked"] = click;
+    }
+    return result;
+}
 
 QJsonObject AgentBridgeServer::handleStateGet(const QJsonValue&)
 {

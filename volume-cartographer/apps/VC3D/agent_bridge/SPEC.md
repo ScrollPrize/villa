@@ -260,6 +260,13 @@ dispatch. Other reusable cores take explicit non-interactive options or
 optional status/error sinks. A bridge handler must never call `exec()` on a
 dialog.
 
+`ui.dialog` answers prompts the application raises on its own, such as the
+macOS release app's offer to install its Python tools. It reports the active
+modal dialog (`open`; `title`, the `texts` of its visible labels, and its
+`buttons` as `{label, enabled}`), and with `click` presses the enabled button
+with that label once the reply is sent. It fails with NOT_FOUND when no dialog
+is open or no enabled button has that label. It has no MCP tool.
+
 ## Domain semantics
 
 ### Session, volumes, and catalog
@@ -544,7 +551,7 @@ not include inline image data.
 ## MCP tool map
 
 The following rows are checked against the descriptor snapshot. `rpc.describe`
-is the sole bridge method without an MCP tool.
+and `ui.dialog` are the bridge methods without an MCP tool.
 
 | MCP tool | RPC method | Agent-facing purpose |
 |---|---|---|

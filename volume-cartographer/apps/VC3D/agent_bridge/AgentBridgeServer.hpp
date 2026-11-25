@@ -143,6 +143,9 @@ private:
     // heavy surface load.
     QJsonObject handleSegmentsReview(const QJsonValue& params);
     QJsonObject handleScreenshotCapture(const QJsonValue& params);
+    // Reads the active modal dialog, such as a startup prompt, and optionally
+    // presses one of its buttons by its label.
+    QJsonObject handleUiDialog(const QJsonValue& params);
     QJsonObject handleCursorVolumePoint(const QJsonValue& params);
     QJsonObject handleCanvasClick(const QJsonValue& params, bool addShift);
     QJsonObject handleCanvasDrag(const QJsonValue& params);
