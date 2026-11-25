@@ -1180,7 +1180,7 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 		self.assertEqual(kwargs["base_scale"], 1)
 		self.assertEqual(kwargs["n_levels"], 3)
 		self.assertEqual(kwargs["ome_chunk"], 32)
-		self.assertEqual(kwargs["ome_compressor"], "blosc-zstd")
+		self.assertIsNone(kwargs["ome_compressor"])
 
 	def test_predict3d_cli_forwards_shared_multi_gpu_pipeline_options(self):
 		args = [
