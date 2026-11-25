@@ -512,3 +512,236 @@ def test_native_normalization_preserves_crop_statistics(identity_pair, scheme):
         else:
             got = other.normalizer({"image": crop.astype(np.float32)[None]}, seed=0)["image"][0]
             np.testing.assert_allclose(got, expected, atol=1e-6, rtol=1e-6)
+
+
+# --- stride-grid coarse-scan deduplication --------------------------------
+
+
+@pytest.mark.parametrize("table_cap", [1 << 25, 16])
+@pytest.mark.parametrize(
+    "stride,patch,shape",
+    [
+        ((16, 16, 16), (16, 16, 16), (64, 64, 64)),
+        ((7, 11, 13), (15, 19, 21), (103, 97, 111)),
+        ((32, 16, 24), (64, 64, 64), (256, 192, 224)),
+    ],
+)
+def test_unique_starts_matches_row_sort_both_paths(monkeypatch, table_cap, stride, patch, shape):
+    """Both bool-table and 1-D sort fallback match _unique_starts_by_row_sort exactly."""
+    from vesuvius.models.datasets import cross_frame_dataset as cfd
+
+    monkeypatch.setattr(cfd, "_DEDUPE_TABLE_MAX_CELLS", table_cap)
+    monkeypatch.setattr(cfd, "_DEDUPE_CHUNK_ROWS", 37)
+
+    rng = np.random.default_rng(1234 + table_cap)
+    # Include negative, in-bounds, duplicate, and past-end voxels.
+    centers = rng.integers(-40, max(shape) + 40, size=(500, 3), dtype=np.int64)
+    st = np.asarray(stride, dtype=np.int64)
+    ps = np.asarray(patch, dtype=np.int64)
+    img_shape = np.asarray(shape, dtype=np.int64)
+
+    got = cfd._unique_starts(centers, st, ps, img_shape)
+    ref = cfd._unique_starts_by_row_sort(centers, st, ps, img_shape)
+
+    assert got.dtype == np.int64
+    assert got.shape == ref.shape
+    np.testing.assert_array_equal(got, ref)
+
+
+@pytest.mark.parametrize("table_cap", [1 << 25, 1])
+def test_unique_starts_edge_cases(monkeypatch, table_cap):
+    """Empty input, single voxel, all out-of-bounds, patch > image, and int64 extremes."""
+    from vesuvius.models.datasets import cross_frame_dataset as cfd
+
+    monkeypatch.setattr(cfd, "_DEDUPE_TABLE_MAX_CELLS", table_cap)
+    st = np.asarray((16, 16, 16), dtype=np.int64)
+    ps = np.asarray((16, 16, 16), dtype=np.int64)
+    img_shape = np.asarray((64, 64, 64), dtype=np.int64)
+
+    # Empty foreground
+    empty = np.empty((0, 3), dtype=np.int64)
+    got_empty = cfd._unique_starts(empty, st, ps, img_shape)
+    assert got_empty.shape == (0, 3) and got_empty.dtype == np.int64
+
+    # Single voxel
+    single = np.asarray([[35, 19, 47]], dtype=np.int64)
+    np.testing.assert_array_equal(
+        cfd._unique_starts(single, st, ps, img_shape),
+        cfd._unique_starts_by_row_sort(single, st, ps, img_shape),
+    )
+
+    # All out-of-bounds (negative and past image_shape - ps: 64 // 16 * 16 = 64 -> 64 + 16 > 64)
+    oob = np.asarray([[-1, 0, 0], [0, -17, 5], [64, 0, 0], [0, 70, 64]], dtype=np.int64)
+    got_oob = cfd._unique_starts(oob, st, ps, img_shape)
+    ref_oob = cfd._unique_starts_by_row_sort(oob, st, ps, img_shape)
+    assert got_oob.shape == (0, 3) and got_oob.dtype == np.int64
+    np.testing.assert_array_equal(got_oob, ref_oob)
+
+    # Patch larger than image along one axis
+    too_small = np.asarray((64, 8, 64), dtype=np.int64)
+    got_small = cfd._unique_starts(single, st, ps, too_small)
+    assert got_small.shape == (0, 3) and got_small.dtype == np.int64
+
+    # Non-finite / int64-extreme fallback guard
+    extreme = np.asarray([[np.iinfo(np.int64).min, 0, 0], [16, 16, 16]], dtype=np.int64)
+    np.testing.assert_array_equal(
+        cfd._unique_starts(extreme, st, ps, img_shape),
+        cfd._unique_starts_by_row_sort(extreme, st, ps, img_shape),
+    )
+
+
+def test_coarse_scan_matches_row_sort_end_to_end(tmp_path: Path, monkeypatch):
+    """End-to-end coarse scan produces identical patch list and .npz cache bytes under both paths."""
+    from vesuvius.models.datasets import cross_frame_dataset as cfd
+
+    rng = np.random.default_rng(99)
+    image = rng.integers(0, 255, size=(96, 80, 112), dtype=np.uint8)
+    labels = np.zeros((96, 80, 112), dtype=np.uint8)
+    labels[12:44, 8:56, 20:88] = 255
+    labels[56:84, 24:64, 4:52] = 1
+
+    base = tmp_path / "labels.ome.zarr"
+    base.mkdir(parents=True)
+    group = create_group(base)
+    _create_group_array(group, "0", labels, chunks=(16, 16, 16))
+    coarse = (labels[::4, ::4, ::4] > 0).astype(np.uint8)
+    _create_group_array(group, "1", coarse, chunks=(8, 8, 8))
+
+    image_path = tmp_path / "image.zarr"
+    tform_path = tmp_path / "transform.json"
+    _write_zarr_array(image_path, image, chunks=(16, 16, 16))
+    _write_identity_transform(tform_path)
+
+    results = []
+    for cap in (1 << 25, 4):
+        cache_dir = tmp_path / f"cache_{cap}"
+        monkeypatch.setattr(cfd, "_DEDUPE_TABLE_MAX_CELLS", cap)
+        mgr = _make_mgr(
+            image_url=str(image_path),
+            labels_url=str(base / "0"),
+            transform_url=str(tform_path),
+            patch_size=(16, 16, 16),
+            cache_dir=tmp_path,
+        )
+        mgr.dataset_config["labels_scan_level"] = 1
+        mgr.dataset_config["cache_dir"] = str(cache_dir)
+        ds = CrossFrameZarrDataset(mgr, is_training=False)
+        results.append(list(ds._patches))
+
+    assert results[0] == results[1]
+    assert len(results[0]) > 0
+
+
+def test_coarse_scan_zslab_streaming_matches_monolithic_affine(tmp_path: Path, monkeypatch):
+    """Chunk-aligned Z-slab + sub-slab streaming matches monolithic scan under a non-identity affine."""
+    from vesuvius.models.datasets import cross_frame_dataset as cfd
+
+    rng = np.random.default_rng(2026)
+    image = np.zeros((96, 96, 96), dtype=np.uint8)
+    labels = np.zeros((128, 96, 96), dtype=np.uint8)
+    # Multi-class labels spanning several Z chunks
+    labels[4:36, 12:48, 8:56] = 1
+    labels[40:76, 20:72, 16:80] = 2
+    labels[80:120, 8:60, 24:84] = 3
+
+    base = tmp_path / "labels.ome.zarr"
+    base.mkdir(parents=True)
+    group = create_group(base)
+    _create_group_array(group, "0", labels, chunks=(16, 16, 16))
+    coarse = labels[::4, ::4, ::4].copy()  # (32, 24, 24)
+    _create_group_array(group, "1", coarse, chunks=(8, 8, 8))
+
+    image_path = tmp_path / "image.zarr"
+    tform_path = tmp_path / "transform.json"
+    _write_zarr_array(image_path, image, chunks=(16, 16, 16))
+
+    # Non-trivial rotation + anisotropic scale + translation in XYZ
+    theta = 0.23
+    c, s = np.cos(theta), np.sin(theta)
+    m = np.eye(4, dtype=np.float64)
+    m[:3, :3] = np.array([[1.1 * c, -0.95 * s, 0.0], [0.95 * s, 1.1 * c, 0.0], [0.0, 0.0, 1.25]])
+    m[:3, 3] = [6.5, -3.25, 11.75]
+    _write_transform(tform_path, m)
+
+    # Force small slabs, small sub-slabs, small dedupe chunks, and key compaction
+    monkeypatch.setattr(cfd, "_SCAN_SLAB_TARGET_VOXELS", 512)
+    monkeypatch.setattr(cfd, "_SCAN_SUBSLAB_TARGET_VOXELS", 128)
+    monkeypatch.setattr(cfd, "_DEDUPE_CHUNK_ROWS", 17)
+    monkeypatch.setattr(cfd, "_DEDUPE_COMPACT_KEYS", 16)
+
+    for mode, cfg_extra, mask_fn in [
+        ("gt0", {}, lambda a: a > 0),
+        ("vlv", {"valid_label_values": [1, 2]}, lambda a: np.isin(a, [1, 2])),
+        ("vpv", {"valid_patch_value": 2}, lambda a: a == 2),
+    ]:
+        for table_cap in (1 << 25, 4):
+            monkeypatch.setattr(cfd, "_DEDUPE_TABLE_MAX_CELLS", table_cap)
+            mgr = _make_mgr(
+                image_url=str(image_path),
+                labels_url=str(base / "0"),
+                transform_url=str(tform_path),
+                patch_size=(16, 16, 16),
+                cache_dir=tmp_path,
+            )
+            mgr.dataset_config["labels_scan_level"] = 1
+            mgr.dataset_config["cache_dir"] = str(tmp_path / f"cache_{mode}_{table_cap}")
+            mgr.dataset_config.update(cfg_extra)
+            ds = CrossFrameZarrDataset(mgr, is_training=False)
+
+            # Independent monolithic reference matching the original algorithm
+            fg = np.argwhere(mask_fn(coarse))
+            factor = np.asarray(ds._scan_factor, dtype=np.float64)
+            fg_label = fg.astype(np.float64) * factor + 0.5 * factor
+            fg_image = affine.apply_affine_zyx(ds._matrix_zyx_label_to_image, fg_label)
+            centers = np.floor(fg_image).astype(np.int64)
+            ref_unique = cfd._unique_starts_by_row_sort(
+                centers,
+                np.asarray(ds.stride, dtype=np.int64),
+                np.asarray(ds.patch_size, dtype=np.int64),
+                np.asarray(ds._image_shape, dtype=np.int64),
+            )
+            corners_offsets = np.array(
+                [[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1],
+                 [1, 1, 0], [1, 0, 1], [0, 1, 1], [1, 1, 1]],
+                dtype=np.float64,
+            )
+            corners = (
+                corners_offsets[None, :, :] * np.asarray(ds.patch_size, dtype=np.float64)[None, None, :]
+                + ref_unique.astype(np.float64)[:, None, :]
+            ).reshape(-1, 3)
+            mapped = affine.apply_affine_zyx(ds._matrix_zyx_image_to_label, corners).reshape(-1, 8, 3)
+            lo_c = np.clip(np.floor(mapped.min(axis=1)), 0.0, np.asarray(ds._labels_shape, dtype=np.float64))
+            hi_c = np.clip(np.ceil(mapped.max(axis=1)), 0.0, np.asarray(ds._labels_shape, dtype=np.float64))
+            ref = [tuple(int(v) for v in row) for row in ref_unique[np.all(hi_c > lo_c, axis=1)]]
+
+            assert list(ds._patches) == ref
+            assert len(ref) > 0
+
+
+def test_stride_grid_deduper_mixed_extreme_and_compaction(monkeypatch):
+    """Streaming deduper handles mixed extreme int64 chunks and repeated key compaction."""
+    from vesuvius.models.datasets import cross_frame_dataset as cfd
+
+    monkeypatch.setattr(cfd, "_DEDUPE_TABLE_MAX_CELLS", 4)
+    monkeypatch.setattr(cfd, "_DEDUPE_CHUNK_ROWS", 11)
+    monkeypatch.setattr(cfd, "_DEDUPE_COMPACT_KEYS", 8)
+
+    rng = np.random.default_rng(77)
+    st = np.asarray((16, 16, 16), dtype=np.int64)
+    ps = np.asarray((16, 16, 16), dtype=np.int64)
+    img_shape = np.asarray((128, 128, 128), dtype=np.int64)
+
+    c1 = rng.integers(-20, 140, size=(60, 3), dtype=np.int64)
+    c2 = np.asarray([[np.iinfo(np.int64).min, 0, 0], [32, 48, 16], [0, 0, 0]], dtype=np.int64)
+    c3 = rng.integers(-20, 140, size=(60, 3), dtype=np.int64)
+
+    deduper = cfd._StrideGridDeduper(st, ps, img_shape)
+    deduper.add(c1)
+    deduper.add(c2)
+    deduper.add(c3)
+    got = deduper.finalize()
+    ref = cfd._unique_starts_by_row_sort(np.vstack([c1, c2, c3]), st, ps, img_shape)
+
+    np.testing.assert_array_equal(got, ref)
+
+
