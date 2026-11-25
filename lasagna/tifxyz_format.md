@@ -80,8 +80,8 @@ Implications:
 
 If `mask.tif` exists and is not explicitly ignored by the caller, it further invalidates vertices.
 
-- Conceptually, `mask.tif` is a “validity mask”. Values >= 255 are treated as “keep”; values < 255 invalidate.
-- Only **channel 0** is considered for validity. If the TIFF is multi-channel, channel 0 of each pixel is the validity value.
+- Conceptually, `mask.tif` is a “validity mask”. A pixel with value 0 invalidates; any non-zero value keeps the point. Writers use 255 for “keep”.
+- For a multi-page TIFF, only the **first page** is used. Within a pixel, all bytes must be zero for it to invalidate (for example, all channels of an interleaved multi-channel pixel, or both bytes of a 16-bit value).
 
 Resolution / scaling:
 
@@ -91,7 +91,7 @@ Resolution / scaling:
 
 Note:
 
-- Non-integer scaling is ignored by the loader (mask may effectively be skipped).
+- If the mask size is not an integer multiple of the `x/y/z` size in each axis, loading fails with an error.
 
 ## 5. Metadata (`meta.json`)
 
