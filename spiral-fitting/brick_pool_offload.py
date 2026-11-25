@@ -53,14 +53,13 @@ class _HostRegistration:
     def array(self):
         return self._arr
 
-    def register(self):
-        """page-lock + map the array on its own card; sets and returns the device pointer (int).
-        The module owns this registration (it is parked in _PARKED) from BEFORE the driver call until the whole sequence succeeded, so a KeyboardInterrupt / SIGINT / any error at any point
-        after cuMemHostRegister returned (before the device-pointer lookup, inside it, or while unwinding) never lets Python free an array the driver still has registered:
-        on failure the release is tried at once (713 = not registered counts as released) and, when the driver refuses or the release is interrupted too, the registration stays parked, alive."""
+    def register(self, owner):
+        """page-lock + map the array on its own card; sets the device pointer and returns a weakref finalizer on owner that releases the registration.
+        The finalizer exists BEFORE the driver call, so an interrupt at any point never lets Python free an array the driver still has registered:
+        on failure the release is tried at once (713 = not registered counts as released) and, when the driver refuses or the release is interrupted too, it is parked."""
         from host_pool_cuda import _libs, _chk
         _, cuda = _libs()
-        _PARKED.append(self)
+        finalizer = weakref.finalize(owner, _release_or_park, self)
         try:
             with torch.cuda.device(self.dev_index):
                 torch.zeros(1, device=f"cuda:{self.dev_index}")                  # make sure the card's primary context exists and is current
@@ -70,10 +69,9 @@ class _HostRegistration:
                 _chk(cuda.cuMemHostGetDevicePointer_v2(ctypes.byref(dptr), p, ctypes.c_uint(0)), "cuMemHostGetDevicePointer")
             self.dptr = int(dptr.value)
         except BaseException:
-            _release_or_park(self)                                                # released -> leaves _PARKED; refused or interrupted -> stays parked
+            finalizer()                                                           # released, or refused / interrupted -> parked
             raise
-        _PARKED.remove(self)                                                      # fully registered: from here the pool's finalizer owns it
-        return self.dptr
+        return finalizer
 
     def release(self):
         """Unregister on the OWNING card's context (never the caller's current one), after that card's outstanding gathers finished (they read this memory asynchronously).
@@ -158,8 +156,8 @@ def offload_class(scc):
                     if progress_callback is not None: progress_callback(done, total, f"channel {channel + 1}/{self.channels} (host RAM)")
             di = dev.index if dev.index is not None else torch.cuda.current_device()
             self._reg = _HostRegistration(self.host_pool, di)           # the registration owns the backing array until the driver released it
-            self._dptr = self._reg.register()
-            self._finalizer = weakref.finalize(self, _release_or_park, self._reg)   # ownership of the registration starts here and ends in close(), a failed construction or garbage collection (a refused release parks it)
+            self._finalizer = self._reg.register(self)                     # ownership ends in close(), a failed construction or garbage collection (a refused release parks it)
+            self._dptr = self._reg.dptr
             try:
                 with torch.cuda.device(di):
                     self._mod = _module(di)

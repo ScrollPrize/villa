@@ -53,6 +53,10 @@ def driver(monkeypatch):
     return events, box
 
 
+class Owner:
+    pass
+
+
 def make(dev_index=1):
     return bpo._HostRegistration(np.zeros(64, dtype=np.uint8), dev_index)
 
@@ -147,7 +151,7 @@ def test_an_interrupt_right_after_a_successful_registration_keeps_the_backing_me
     monkeypatch.setattr(torch, "zeros", lambda *a, **k: None)
     reg = make(0)
     with pytest.raises(KeyboardInterrupt):
-        reg.register()
+        reg.register(Owner())
     assert ("register", 0) in events
     assert reg in bpo._PARKED and reg.array is not None, "interrupted unregister: the registration stays parked and keeps its array"
     box["driver"].results.clear()
@@ -161,8 +165,21 @@ def test_a_failure_after_registration_releases_it_at_once_and_leaves_nothing_par
     monkeypatch.setattr(torch, "zeros", lambda *a, **k: None)
     reg = make(0)
     with pytest.raises(RuntimeError, match="lookup failed"):
-        reg.register()
+        reg.register(Owner())
     assert ("unregister", 0) in events and reg not in bpo._PARKED and reg.array is None
+
+
+def test_the_owner_releases_a_registration_whose_finalizer_was_never_stored(driver, monkeypatch):
+    """review of #2588: an interrupt between register() returning and the pool storing its finalizer must not free the registered array."""
+    events, box = driver
+    box["driver"] = RegDriver(events, [])
+    monkeypatch.setattr(host_pool_cuda, "_chk", lambda r, what: None)
+    monkeypatch.setattr(torch, "zeros", lambda *a, **k: None)
+    reg, owner = make(0), Owner()
+    reg.register(owner)
+    assert reg.array is not None and ("unregister", 0) not in events
+    del owner
+    assert ("unregister", 0) in events and reg.array is None
 
 
 def test_session_close_retries_a_refused_release_and_raises_until_it_succeeds():
