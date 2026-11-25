@@ -7,6 +7,7 @@
 // prompt (password, key passphrase, one-time code, new host key) is answered by
 // the application through SSH_ASKPASS (Linux and macOS).
 
+#include "vc_reader/exception_type.hpp"
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -90,7 +91,7 @@ enum Status : uint32_t {
     NoConnection = 6, ConnectionLost = 7, OpUnsupported = 8,
 };
 // The server answered with an error status; the session remains usable.
-struct StatusError : std::runtime_error {
+struct VCR_EXCEPTION_TYPE StatusError : std::runtime_error {
     uint32_t status;
     StatusError(uint32_t status, const std::string& message);
 };

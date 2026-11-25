@@ -17,6 +17,17 @@ namespace vc::lasagna {
 
 inline constexpr const char* kLasagnaRemoteMarker = "lasagna-remote.json";
 
+// The remote marker of a local copy's manifest: beside a sidecar manifest, and
+// beside the Zarr store that embeds a compact one. `manifest` is the manifest
+// file or the store's directory. nullopt without a marker naming it.
+struct LasagnaRemoteCopy {
+    std::filesystem::path marker;
+    std::filesystem::path manifestFile;  // relative to the artifact
+};
+[[nodiscard]] std::optional<LasagnaRemoteCopy> lasagnaRemoteCopy(const std::filesystem::path& manifest);
+// The location a manifest file is attached and reopened by: a compact
+// manifest's Zarr store, else the file itself.
+[[nodiscard]] std::filesystem::path lasagnaDatasetPath(const std::filesystem::path& manifestFile);
 
 struct LasagnaDatasetOpenOptions {
     double workingToBaseScale = 1.0;

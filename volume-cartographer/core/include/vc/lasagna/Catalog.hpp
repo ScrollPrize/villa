@@ -17,8 +17,12 @@ enum class CatalogDatasetKind { Normal, FiberInference };
     const vcr::catalog::OpenDataArtifact& artifact,
     const LasagnaDatasetManifest& manifest);
 
+// The manifest of a listable artifact directory: its single root .lasagna.json,
+// or the .zattrs of its single compact Zarr store.
+[[nodiscard]] std::string catalogManifestUrl(const std::string& artifactUrl);
+
 struct CachedCatalogDataset {
-    std::filesystem::path manifest;
+    std::filesystem::path manifest;  // a .lasagna.json, or a compact dataset's Zarr store
     LasagnaDataset dataset;
     CatalogDatasetKind kind;
 };

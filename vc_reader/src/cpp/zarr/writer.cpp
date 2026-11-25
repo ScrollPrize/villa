@@ -3,6 +3,7 @@
 #include "vc_reader/zarr_write.hpp"
 #include "vc_reader/array.hpp"
 #include "vc_reader/native/codecs.hpp"
+#include "vc_reader/native/utf8_path.hpp"
 #include "format.hpp"
 #include "files.hpp"
 
@@ -61,8 +62,8 @@ std::vector<Index> chunkKeyIndices(const Store& store, const std::string& prefix
             continue;
         }
         if(strict && !store.remote()) {
-            const auto root=fs::weakly_canonical(store.location());
-            const auto relative=fs::weakly_canonical(root/object.key).lexically_relative(root);
+            const auto root=fs::weakly_canonical(utf8Path(store.location()));
+            const auto relative=fs::weakly_canonical(root/utf8Path(object.key)).lexically_relative(root);
             if(relative.empty() || *relative.begin()=="..")throw std::invalid_argument("chunk path escapes its array root");
         }
         result.push_back(std::move(index));
@@ -82,6 +83,7 @@ EncodeOptions encodeOptions(const Json& compressor)
     o.blocksize = compressor.value("blocksize", o.blocksize);
     o.q = compressor.value("q", o.q);
     o.checksum = compressor.value("checksum", false);
+    o.channel_axis = compressor.value("channel_axis", std::string());
     return o;
 }
 
@@ -98,7 +100,13 @@ Json compressorConfig(const CreateOptions& options)
     if (id == "lz4")
         return {{"id", "lz4"}, {"acceleration", level > 0 ? level : 1}};
     if (id == "vc-delta3d")
-        return {{"id", "vc-delta3d"}, {"quant", 1}};
+    {
+        Json config{{"id", "vc-delta3d"}, {"quant", 1}};
+        // The codec needs to be told which axis of a 4-D chunk holds the channels.
+        if (options.chunks.size() == 4)
+            config["channel_axis"] = options.channelAxis.empty() ? "first" : options.channelAxis;
+        return config;
+    }
     if (id == "volcomp")
         return {{"id", "volcomp"}, {"q", level >= 0 ? double(level) : 8.0}};
     throw std::invalid_argument("cannot write Zarr chunks compressed with '" + id + "'");
@@ -197,7 +205,7 @@ struct TemporaryFile {
 // The location's parent, when it has one to hold a group marker.
 std::optional<fs::path> parentLocation(const Store& store)
 {
-    const fs::path path(store.location());
+    const fs::path path = utf8Path(store.location());
     if (store.remote() && store.location().find('/', store.location().find("://") + 3) == std::string::npos)
         return std::nullopt;  // a bucket has no parent
     return path.has_parent_path() ? std::optional<fs::path>(path.parent_path()) : std::nullopt;
@@ -208,7 +216,7 @@ std::optional<fs::path> parentLocation(const Store& store)
 std::mutex& shardMutex(const fs::path& path)
 {
     static std::array<std::mutex, 256> locks;
-    return locks[std::hash<std::string>{}(path.string()) % locks.size()];
+    return locks[std::hash<std::string>{}(utf8String(path)) % locks.size()];
 }
 
 void putLittle(std::uint8_t* out, std::uint64_t value, int bytes)
@@ -246,10 +254,10 @@ struct Writer::Impl {
     bool updateShard(const std::string& key, std::size_t target, const std::vector<std::uint8_t>* replacement)
     {
         if (!store->remote()) {
-            std::lock_guard lock(shardMutex((canonicalPath / key).string()));
+            std::lock_guard lock(shardMutex(canonicalPath / key));
             return patchShard(path / key, target, replacement);
         }
-        std::lock_guard lock(shardMutex(store->location() + "/" + key));
+        std::lock_guard lock(shardMutex(utf8Path(store->location() + "/" + key)));
         TemporaryFile local;
         if (const auto stored = store->read(key))
             atomicWrite(local.path, *stored);
@@ -359,6 +367,7 @@ CreateOptions createOptionsLike(const ArrayMeta& meta)
         options.level = options.compressor == "volcomp" ? int(encode.q) : encode.level;
         options.cname = encode.cname;
         options.shuffle = encode.shuffle;
+        options.channelAxis = encode.channel_axis;
     }
     if (meta.v3) {
         options.version = 3;
@@ -386,15 +395,15 @@ void createObjectArray(const fs::path& path,const Index& shape,const Index& chun
 {
     const auto document=objectArrayDocument(shape,chunks,filters,separator);
     const Store store(path,access);
-    if(store.isNode())throw std::invalid_argument("Zarr node already exists at " + path.string());
+    if(store.isNode())throw std::invalid_argument("Zarr node already exists at " + utf8String(path));
     store.write(".zarray",document.dump(2)+"\n",durability);
 }
 ArrayInventory inventory(const fs::path& path,const Access& access,bool strict)
 {
-    detail::forgetKnownArrays(path.string(), access);
+    detail::forgetKnownArrays(utf8String(path), access);
     OpenOptions options; options.access = access;
-    const auto metadata = readArrayDocument(path.string(), options);
-    if (!metadata) throw NotFound("no Zarr array at " + path.string());
+    const auto metadata = readArrayDocument(utf8String(path), options);
+    if (!metadata) throw NotFound("no Zarr array at " + utf8String(path));
     ArrayInventory out; out.metadata = *metadata;
     if(out.metadata.value("zarr_format",0)==3) {
         auto writer=Writer::open(path,access);out.chunks=writer.storedChunks(strict);
@@ -433,19 +442,21 @@ Writer Writer::create(const fs::path& path, const CreateOptions& options, const 
     if (store.exists(".zgroup") ||
         (options.version == 3 && store.exists(".zarray")) ||
         (options.version == 2 && store.exists("zarr.json")))
-        throw std::invalid_argument("cannot replace a group or change the Zarr format at " + path.string());
+        throw std::invalid_argument("cannot replace a group or change the Zarr format at " + utf8String(path));
     if (options.version == 3) {
         const auto existing = store.read("zarr.json");
         if (existing && Json::parse(*existing).value("node_type", "") != "array")
-            throw std::invalid_argument("cannot replace a group with an array at " + path.string());
+            throw std::invalid_argument("cannot replace a group with an array at " + utf8String(path));
     }
     Json zarray = v2Document(options, options.packbits ? Json::array({{{"id", "packbits"}}}) : Json(nullptr));
     auto meta = parseArrayMeta(zarray);  // validates before anything is written
     const auto codec = parse_chunk_codec(meta.codec());
     if (codec == Codec::Volcomp && (meta.itemsize() != 1 || meta.chunks != Index{128, 128, 128}))
         throw std::invalid_argument("volcomp requires uint8 data and 128^3 chunks");
-    if (codec == Codec::Delta3d && (meta.chunks.size() != 3 || meta.type.kind != 'u' || meta.itemsize() > 2))
-        throw std::invalid_argument("vc-delta3d requires 3-D uint8 or uint16 chunks");
+    if (codec == Codec::Delta3d &&
+        (!delta3d_layout_supported(meta.chunks.size(), encodeOptions(meta.compressor).channel_axis) ||
+         meta.type.kind != 'u' || meta.itemsize() > 2))
+        throw std::invalid_argument("vc-delta3d requires 3-D, or 4-D with channel axis first or last, uint8 or uint16 chunks");
     if (options.version == 3) {
         zarray = v3Metadata(meta, options);
         meta = parseArrayMeta(zarray);
@@ -465,10 +476,10 @@ Writer Writer::open(const fs::path& path, const Access& access)
 {
     Store store(path, access);
     // A writer works on the array as published now, not as this process last read it.
-    detail::forgetKnownArrays(path.string(), access);
+    detail::forgetKnownArrays(utf8String(path), access);
     OpenOptions options; options.access = access;
-    const auto stored = readArrayDocument(path.string(), options);
-    if (!stored) throw NotFound("no Zarr array to write at " + path.string());
+    const auto stored = readArrayDocument(utf8String(path), options);
+    if (!stored) throw NotFound("no Zarr array to write at " + utf8String(path));
     auto impl = std::make_unique<Impl>();
     impl->path = path;
     impl->store = std::move(store);
@@ -685,7 +696,7 @@ std::vector<std::string> nodeChildren(const fs::path& path, const Access& access
 {
     std::vector<std::string> out;
     for (const auto& name : Store(path, access, 1).children())
-        if (Store(path / name, access, 1).isNode())
+        if (Store(path / utf8Path(name), access, 1).isNode())
             out.push_back(name);
     return out;
 }
@@ -699,7 +710,7 @@ void createGroup(const fs::path& path, const std::optional<Json>& attributes, in
     if (!store.remote())
         fs::create_directories(path);
     if (store.exists(".zarray"))
-        throw std::invalid_argument("an array is at " + path.string());
+        throw std::invalid_argument("an array is at " + utf8String(path));
     if (!store.exists(".zgroup") && !store.exists("zarr.json"))
         store.write(version == 3 ? "zarr.json" : ".zgroup", groupMarker(version), durability);
     if (attributes)
