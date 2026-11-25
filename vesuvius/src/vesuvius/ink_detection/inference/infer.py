@@ -5,6 +5,7 @@ from __future__ import annotations
 from vesuvius.ink_detection.data.normalization import normalize_image
 
 import argparse
+import functools
 import json
 import logging
 import math
@@ -17,7 +18,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterator, Mapping, Sequence
+from typing import Any, Callable, Iterator, Mapping, Sequence
 from urllib.parse import urlparse
 
 import numpy as np
@@ -33,13 +34,22 @@ from vesuvius.ink_detection.models.checkpoint import (
     select_inference_weights,
 )
 from vesuvius.ink_detection.config import InkConfig, NormalizationConfig
+from vesuvius.ink_detection.inference.engines import (
+    EngineUnavailable,
+    InkrsEngine,
+    add_engine_arguments,
+    fall_back,
+    load_engine,
+)
 from vesuvius.ink_detection.inference.inference_runtime import (
     DEVICE_CHOICES,
     TargetModel,
+    checkpoint_amp_dtype,
     flip_spatial,
     iter_mirror_axes,
     parse_gpu_ids,
     prepare_model_for_inference,
+    resolve_inference_device,
     resolve_amp_dtype,
 )
 from vesuvius.ink_detection.models.model import make_model
@@ -77,13 +87,29 @@ class ChunkKey:
 
 @dataclass(frozen=True)
 class ConfiguredModel:
-    """The checkpoint-derived flat model and preprocessing contract."""
+    """The checkpoint-derived flat model and preprocessing contract.
 
-    model: nn.Module
+    ``model`` is None when the contract was read without building the model
+    (``configure_model(..., build_model=False)``); ``prepare_model`` then
+    builds it on first use.
+    """
+
+    model: nn.Module | None
     patch_size: int
     input_depth: int
     preprocessing: str
     amp_dtype: torch.dtype | None
+    # the autocast dtype the checkpoint's own mixed_precision names, before --amp-dtype
+    stored_amp_dtype: torch.dtype | None = None
+    # with --engine inkrs, the engine, and the PyTorch model built on first use
+    # for an input the engine declines
+    engine: InkrsEngine | None = None
+    prepare_model: Callable[[], nn.Module] | None = None
+
+    def pytorch_model(self) -> nn.Module:
+        """The device-ready PyTorch model, prepared on first use if deferred."""
+
+        return self.model if self.prepare_model is None else self.prepare_model()
 
 
 def flat_preprocessing_from_config(config: NormalizationConfig) -> str:
@@ -178,6 +204,20 @@ def compute_importance_map_2d(
     )
     weight /= torch.clamp(weight.max(), min=torch.finfo(weight.dtype).eps)
     return torch.clamp(weight, min=torch.finfo(weight.dtype).eps)
+
+
+def resolve_tiling(args: argparse.Namespace, patch_size: int) -> tuple[int, str]:
+    """The stride and blend mode a run tiles with, from ``--stride``/``--overlap`` and ``--blend-mode``."""
+
+    stride = resolve_patch_stride(
+        patch_size=patch_size,
+        overlap=args.overlap,
+        explicit_stride=args.stride,
+    )
+    blend_mode = str(args.blend_mode)
+    if blend_mode == "auto":
+        blend_mode = "constant" if stride >= patch_size else "hann"
+    return stride, blend_mode
 
 
 def resolve_patch_stride(
@@ -1039,6 +1079,21 @@ def iter_probability_tiles(
             yield probability.astype(np.uint8, copy=False)
 
 
+def _write_tiled_tiff(
+    output_path: Path,
+    shape: tuple[int, int],
+    tile_shape: tuple[int, int],
+    tiles: Iterator[np.ndarray],
+) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    height, width = (int(value) for value in shape)
+    tile_h, tile_w = (int(value) for value in tile_shape)
+    positions = ((y0, x0) for y0 in range(0, height, tile_h) for x0 in range(0, width, tile_w))
+    with images.TiffWriter(output_path, (height, width), np.uint8, compression="lzw", tile=(tile_h, tile_w)) as writer:
+        for (y0, x0), tile in zip(positions, tiles):
+            writer.write_tile(y0, x0, tile)
+
+
 def write_output_tiff(
     prob_sum_store: Any,
     weight_sum_store: Any,
@@ -1047,13 +1102,27 @@ def write_output_tiff(
 ) -> None:
     """Write one tiled, LZW, BigTIFF-compatible flat probability image."""
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    height, width = (int(value) for value in prob_sum_store.shape)
+    _write_tiled_tiff(
+        output_path,
+        tuple(prob_sum_store.shape),
+        tile_shape,
+        iter_probability_tiles(prob_sum_store, weight_sum_store, tile_shape),
+    )
+
+
+def write_uint8_tiff(
+    image: np.ndarray, output_path: Path, tile_shape: tuple[int, int]
+) -> None:
+    """Write a finished uint8 map with the same layout as write_output_tiff."""
+
+    height, width = (int(value) for value in image.shape)
     tile_h, tile_w = (int(value) for value in tile_shape)
-    positions = ((y0, x0) for y0 in range(0, height, tile_h) for x0 in range(0, width, tile_w))
-    with images.TiffWriter(output_path, (height, width), np.uint8, compression="lzw", tile=(tile_h, tile_w)) as writer:
-        for (y0, x0), tile in zip(positions, iter_probability_tiles(prob_sum_store, weight_sum_store, tile_shape)):
-            writer.write_tile(y0, x0, tile)
+    tiles = (
+        np.ascontiguousarray(image[y0 : y0 + tile_h, x0 : x0 + tile_w])
+        for y0 in range(0, height, tile_h)
+        for x0 in range(0, width, tile_w)
+    )
+    _write_tiled_tiff(output_path, (height, width), tile_shape, tiles)
 
 
 def open_temp_zarr_array(
@@ -1143,12 +1212,21 @@ def resolve_checkpoint_paths(args: argparse.Namespace) -> list[Path]:
     return [Path(args.checkpoint), *(Path(path) for path in extra)]
 
 
-def configure_model(args: argparse.Namespace) -> ConfiguredModel:
-    """Rebuild flat model(s) and one shared preprocessing contract."""
+def configure_model(
+    args: argparse.Namespace, *, build_model: bool = True
+) -> ConfiguredModel:
+    """Rebuild flat model(s) and one shared preprocessing contract.
+
+    With ``build_model=False`` the checkpoints are still loaded on the CPU and
+    their contracts checked, but no model is built or given the weights, and
+    the result's ``model`` is None.
+    """
 
     checkpoints = resolve_checkpoint_paths(args)
     members = [
-        configure_single_model(checkpoint, amp_dtype=args.amp_dtype)
+        configure_single_model(
+            checkpoint, amp_dtype=args.amp_dtype, build_model=build_model
+        )
         for checkpoint in checkpoints
     ]
     if len(members) == 1:
@@ -1167,6 +1245,8 @@ def configure_model(args: argparse.Namespace) -> ConfiguredModel:
                 f"Ensemble checkpoint {str(checkpoint)!r} is incompatible with "
                 f"{str(checkpoints[0])!r}: " + ", ".join(mismatched)
             )
+    if not build_model:
+        return reference
     LOGGER.info(
         "Averaging probabilities of %d checkpoints: %s",
         len(members),
@@ -1179,9 +1259,13 @@ def configure_model(args: argparse.Namespace) -> ConfiguredModel:
 
 
 def configure_single_model(
-    checkpoint: Path, *, amp_dtype: str
+    checkpoint: Path, *, amp_dtype: str, build_model: bool = True
 ) -> ConfiguredModel:
-    """Rebuild one strict flat model and preprocessing contract from checkpoint."""
+    """Rebuild one strict flat model and preprocessing contract from checkpoint.
+
+    With ``build_model=False`` the checkpoint is checked as for a build but
+    no model is made, and the result's ``model`` is None.
+    """
 
     payload = load_checkpoint(checkpoint)
     if not isinstance(payload, Mapping) or not isinstance(
@@ -1198,31 +1282,34 @@ def configure_single_model(
     selected_state, state = select_inference_weights(
         payload, source=checkpoint
     )
-    base_model = make_model(config)
-    incompatibility = load_flat_inference_state(base_model, state)
-    LOGGER.info(
-        "Loaded %s weights from %s (missing_keys=%d unexpected_keys=%d)",
-        selected_state,
-        checkpoint,
-        len(incompatibility.missing_keys),
-        len(incompatibility.unexpected_keys),
-    )
-    base_model.eval()
     crop_z, crop_y, crop_x = config.model.crop_size
     if crop_y != crop_x:
         raise ValueError(
             f"Flat inference requires square Y/X patches, got {config.model.crop_size!r}"
         )
-    model = TargetModel(
-        base_model,
-        input_pad_depth_to=config.model.input_pad_depth_to,
-    ).eval()
+    model = None
+    if build_model:
+        base_model = make_model(config)
+        incompatibility = load_flat_inference_state(base_model, state)
+        LOGGER.info(
+            "Loaded %s weights from %s (missing_keys=%d unexpected_keys=%d)",
+            selected_state,
+            checkpoint,
+            len(incompatibility.missing_keys),
+            len(incompatibility.unexpected_keys),
+        )
+        base_model.eval()
+        model = TargetModel(
+            base_model,
+            input_pad_depth_to=config.model.input_pad_depth_to,
+        ).eval()
     return ConfiguredModel(
         model=model,
         patch_size=crop_y,
         input_depth=crop_z,
         preprocessing=flat_preprocessing_from_config(config.data.normalization),
         amp_dtype=resolve_amp_dtype(amp_dtype, payload, checkpoint),
+        stored_amp_dtype=checkpoint_amp_dtype(payload, checkpoint),
     )
 
 
@@ -1254,6 +1341,12 @@ def infer_single_zarr(
 
     root = open_volume_root(input_zarr)
     resolution = "0" if hasattr(root, "shape") else str(args.resolution)
+    engine = configured_model.engine
+    input_key = (str(input_zarr), resolution)
+    if engine is not None:
+        # release the last input's span before this input's occupancy scan,
+        # also when this input never reaches inkrs
+        engine.begin_input(input_key)
     volume = select_volume_level(root, resolution, source=str(input_zarr))
     depth_first, depth, height, width, chunk_h, chunk_w = _volume_axes(volume)
     roi_values = getattr(args, "roi", None)
@@ -1262,14 +1355,7 @@ def infer_single_zarr(
     r0, r1, c0, c1 = output_bounds
     output_shape = (r1 - r0, c1 - c0)
     patch_size = configured_model.patch_size
-    stride = resolve_patch_stride(
-        patch_size=patch_size,
-        overlap=args.overlap,
-        explicit_stride=args.stride,
-    )
-    blend_mode = str(args.blend_mode)
-    if blend_mode == "auto":
-        blend_mode = "constant" if stride >= patch_size else "hann"
+    stride, blend_mode = resolve_tiling(args, patch_size)
     tile_shape = (patch_size, patch_size)
     if patch_size % 16:
         tile_shape = (chunk_h, chunk_w)
@@ -1354,6 +1440,23 @@ def infer_single_zarr(
     LOGGER.info("Selected %d patches for inference", len(blocks))
     output_blocks = blocks if roi_bounds is None else [clip_block_to_roi(block, roi_bounds) for block in blocks]
     LOGGER.info("Output bounds=(%d, %d, %d, %d) shape=%s; parent patch grid retained", *output_bounds, output_shape)
+    # with no tile scheduled the map is all zero, which the PyTorch path writes
+    # without reading the window or building a model
+    if engine is not None and blocks:
+        try:
+            # villa zero-pads a shallow input to the model depth; inkrs does not
+            if len(layer_indices) != configured_model.input_depth:
+                raise EngineUnavailable(
+                    f"it needs {configured_model.input_depth} source layers, got {len(layer_indices)}"
+                )
+            probability = engine.run(volume, depth_first, layer_indices, occupancy, stride, input_key)
+        except EngineUnavailable as exc:
+            fall_back(f"The inkrs engine cannot run {input_zarr}: {exc}", fallback=args.engine_fallback)
+        else:
+            # an overwritten image must not inherit an earlier ROI run's metadata
+            output_tiff.with_suffix(output_tiff.suffix + ".roi.json").unlink(missing_ok=True)
+            write_uint8_tiff(probability, output_tiff, tile_shape)
+            return
     dataset = FlatBlockDataset(
         reader=reader,
         blocks=blocks,
@@ -1433,7 +1536,7 @@ def infer_single_zarr(
         if blocks:
             run_block_inference(
                 loader=loader,
-                model=configured_model.model,
+                model=configured_model.pytorch_model(),
                 accumulator=accumulator,
                 weight_map=weight_map,
                 mask=mask,
@@ -1720,6 +1823,7 @@ def parse_args(argv: Sequence[str] | None = None):
     parser.add_argument("--compile-mode", default="reduce-overhead")
     parser.add_argument("--no-compile", dest="compile_model", action="store_false")
     parser.set_defaults(compile_model=True)
+    add_engine_arguments(parser)
     args = parser.parse_args(argv)
     if args.num_workers < 0:
         parser.error("--num-workers must be nonnegative")
@@ -1750,15 +1854,31 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     if hasattr(torch, "set_float32_matmul_precision"):
         torch.set_float32_matmul_precision("high")
-    configured = configure_model(args)
-    prepared_model, device = prepare_model_for_inference(
-        configured.model,
-        gpu_ids=args.gpu_ids,
-        device_type=args.device,
-        compile_model=args.compile_model,
-        compile_mode=args.compile_mode,
-    )
-    configured = replace(configured, model=prepared_model)
+    # with --engine inkrs, PyTorch builds its model only for an input inkrs declines
+    configured = configure_model(args, build_model=args.engine == "torch")
+    device = resolve_inference_device(gpu_ids=args.gpu_ids, device_type=args.device)
+    engine = None
+    if args.engine == "inkrs":
+        stride, blend_mode = resolve_tiling(args, configured.patch_size)
+        engine = load_engine(args, configured, device, stride, blend_mode)
+    source_model = configured.model
+
+    def prepare_model() -> nn.Module:
+        model = source_model if source_model is not None else configure_model(args).model
+        model, _ = prepare_model_for_inference(
+            model,
+            gpu_ids=args.gpu_ids,
+            device_type=args.device,
+            device=device,
+            compile_model=args.compile_model,
+            compile_mode=args.compile_mode,
+        )
+        return model
+
+    if engine is None:
+        configured = replace(configured, model=prepare_model())
+    else:
+        configured = replace(configured, engine=engine, prepare_model=functools.cache(prepare_model))
     if args.folder is not None:
         infer_folder(args, configured, device=device)
     else:
