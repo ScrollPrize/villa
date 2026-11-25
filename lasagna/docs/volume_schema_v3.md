@@ -1,9 +1,14 @@
 # Lasagna volume schema v3: embedded manifest and resolution groups
 
-Status: schema implemented by the shared prediction writer and the local
-accelerated tracing reader. Existing volumes and running jobs are unchanged.
-Other consumers, particularly remote catalogue/publication integrations,
-still need schema-v3 support before compact output is used with them.
+Status: schema implemented by the shared prediction writer, the local
+accelerated tracing reader, VC3D (local, remote and open-data catalogue
+attachment), the manager's Fiberlet inputs and Atlas ingestion. Existing volumes
+and running jobs are unchanged. The Lasagna fit service still lists only
+`.lasagna.json` datasets.
+
+A published v3 artifact directory holds one `<name>.zarr` and its
+`inference.json`. Local catalogue copies keep `lasagna-remote.json` beside the
+store, with `manifest_file` set to `<name>.zarr/.zattrs`.
 
 This replaces the external `.lasagna.json` manifest and separate per-channel
 Zarr stores with one Zarr store containing resolution-based channel groups.
@@ -19,8 +24,9 @@ coordinate conventions, inference resolution, or pyramid reduction methods.
   not by channel names or semantic categories.
 - Each resolution group MUST contain multichannel `CZYX` arrays, including
   when it contains only one channel. Chunks MUST span the whole channel axis.
-- The embedded manifest MUST name the channel whose stored zero value marks
-  invalid data; validity is not inferred from a hardcoded channel name.
+- The embedded manifest MUST declare validity: either the channel whose
+  stored zero value marks invalid data, or `chunks` (a voxel is valid iff its
+  stored chunk exists). Validity is not inferred from a hardcoded channel name.
 - Future readers must continue accepting existing v1/v2 `.lasagna.json`
   manifests and their existing layouts. Supporting v3 does not require
   rewriting old volumes. Old readers are not expected to read v3.
@@ -33,11 +39,12 @@ Fiber prediction channels without defining new Fiber channel encodings here.
 
 The fiber full-volume runner exports `presence`, `nx`, and `ny` (fiber
 direction), plus `width` when the checkpoint has a width head. Checkpoints
-with a normal head also export `sheet_nx`, `sheet_ny`, and `sheet_grad_mag`
-(fiber/sheet normal, distinct from fiber direction). H/V is not exported.
-These channels share the resolution group when stored at the same scale.
-`presence` remains the validity channel; by default, zero presence blanks
-all other channels, including the normal channels. The manifest's channel
+with a normal head also export `sheet_nx` and `sheet_ny` (fiber/sheet normal,
+distinct from fiber direction). H/V is not exported. These channels share the
+resolution group when stored at the same scale. Fiber volumes declare
+`"validity_channel": "chunks"`: every voxel of a stored chunk is a prediction,
+presence 0 included. Blanking other channels at zero presence
+(`blank_invalid`) is an opt-in option, off by default. The manifest's channel
 inventory describes actual exports; checkpoint annotation settings describe
 the model heads, not an independent export switch.
 
@@ -122,8 +129,8 @@ absence, not permission to discard an existing value during conversion.
 | `source_to_base` | Positive finite number, required | Base-volume voxels per source-coordinate voxel. Multiply a source XYZ coordinate by this scalar to obtain its base XYZ coordinate. Existing readers default an absent legacy value to `1.0`; v3 writes it explicitly. |
 | `base_shape_zyx` | Three positive integers, required | Original reference-volume extent `[Z, Y, X]` in base voxels. This is not the model input, prediction, or crop shape. It remains unchanged when outputs are downsampled. Some legacy manifests omit it; that is not allowed for a v3 writer. |
 | `groups` | Nonempty object, required | Maps each native-resolution name `sd<N>` to the channel-group object defined below. Object ordering has no semantic significance. |
-| `validity_channel` | Nonempty string, required | Name of a channel declared in exactly one group. At that channel's stored voxels, a value exactly equal to zero means invalid/no data; a nonzero value is the valid-data signal. This names an existing signal channel, not a separate mask. No default or hardcoded `grad_mag` fallback applies to v3. |
-| `blank_invalid` | Optional boolean; default `false` for a generic volume | Whether Fiber channels other than presence are zeroed where their stored presence is zero. Fiber inference writes `true` by default; Lasagna normals do not require channel blanking. For multi-option output, option-specific channels use that option's presence; shared auxiliary channels use the union of nonzero option presences. |
+| `validity_channel` | Nonempty string, required | Either the name of a channel declared in exactly one group, or the literal `chunks`. With a channel name, a stored value exactly equal to zero at that channel means invalid/no data and a nonzero value is the valid-data signal; this names an existing signal channel, not a separate mask. With `chunks`, a voxel is valid iff the chunk of its group's finest stored level that contains it exists in the store; no channel is consulted. `chunks` cannot name a channel. No default or hardcoded `grad_mag` fallback applies to v3. |
+| `blank_invalid` | Optional boolean; default `false` | Whether Fiber channels other than presence were zeroed where their stored presence is zero. Off by default for every producer; Fiber inference enables it only with `--blank-invalid`. For multi-option output, option-specific channels use that option's presence; shared auxiliary channels use the union of nonzero option presences. |
 | `width_encoding` | Optional string; required when a Fiber width channel is exported | `uint8-base-voxels` means full width rounded to the nearest integer (ties to even), clamped to `[0,255]`, in original base-volume voxels. `float32-input-voxels` retains unquantized full width in model-input voxels. Convert base width to tracer working voxels by dividing by `working_to_base_scale`; this runtime coordinate adapter is not another stored manifest field. |
 | `grad_mag_encode_scale` | Positive finite number; required when `grad_mag` is present | Encoding denominator for winding density; decoded value is `stored * grad_mag_factor / grad_mag_encode_scale`. Legacy default is `1000.0`. This is not a spatial scale factor. |
 | `grad_mag_factor` | Positive finite number; required when `grad_mag` is present | Multiplier applied when decoding gradient magnitude/winding density. Legacy default is `1.0`; an existing value such as `0.25` MUST be preserved, not replaced by the default. |
@@ -187,25 +194,40 @@ by v3: array index `(z, y, x)` maps to base position
 Cropping remains sparse coverage in the full reference frame, not an
 implicitly rebased crop array.
 
-Missing chunks use zero fill. Validity is encoded in the signal channel named
-by `validity_channel`, with the fixed rule **stored value == 0 means invalid**.
-The comparison is against stored values, before decoding, scaling, or spatial
-interpolation; it is exact, not an epsilon or configurable probability cutoff.
-There is no separate validity array, boolean mask channel, or required new
-per-voxel storage.
+Missing chunks use zero fill. Validity is declared by `validity_channel` in
+one of two forms. There is no separate validity array, boolean mask channel,
+or required new per-voxel storage in either form.
+
+**Channel validity.** `validity_channel` names a signal channel, with the
+fixed rule **stored value == 0 means invalid**. The comparison is against
+stored values, before decoding, scaling, or spatial interpolation; it is
+exact, not an epsilon or configurable probability cutoff.
 
 - Lasagna normal volumes declare `"validity_channel": "grad_mag"`.
-- Fiber prediction volumes declare `"validity_channel": "presence"`.
-  A stored presence of zero is invalid; a low but nonzero presence is not
-  invalidated by this format rule. A tracer may independently apply its own
-  confidence threshold, but that is not storage validity.
+- A Fiber volume may declare `"validity_channel": "presence"`: a stored
+  presence of zero is invalid; a low but nonzero presence is not invalidated by
+  this format rule. A tracer may independently apply its own confidence
+  threshold, but that is not storage validity.
 - Other prediction families may name another declared channel without changing
-  the rule or schema. A missing declaration or an unknown channel name is a
-  malformed v3 manifest, not permission to guess a channel.
+  the rule or schema.
+
+**Chunk validity.** `"validity_channel": "chunks"` means a voxel is valid iff
+the chunk containing it exists in the group's finest stored level. Every
+stored chunk is complete (producers widen their processing region to the
+output chunk grid and publish whole chunks, including all-zero ones), so
+chunk existence is exactly the set of computed voxels. Fiber inference writes
+this form: nx/ny, width and sheet normals are kept at every computed voxel,
+presence 0 included, unless `blank_invalid` was requested. Coarser pyramid
+levels of such a group exist wherever any contributing finest-level chunk
+exists; they are display data, and a consumer that needs validity at a
+coarser level resolves it on the finest level's chunk grid.
+
+A missing declaration, an unknown channel name, or a channel named `chunks`
+is a malformed v3 manifest, not permission to guess a channel.
 
 The declaration applies to the whole volume, including its resolution groups
-and their pyramid levels. Resolve the channel through `groups` and
-`channels`, not an assumed channel index. Its pyramid copies use the same zero
+and their pyramid levels. Resolve a validity channel through `groups` and
+`channels`, not an assumed channel index; its pyramid copies use the same zero
 rule. Where a consumer combines different resolution groups, it must use
 their declared base-coordinate mappings to align the validity signal; equal
 array indices do not imply equal physical positions. This declaration does
@@ -214,18 +236,21 @@ selection, normal interpolation, or pyramid reduction algorithms. In
 particular, do not interpolate a signal first and then reinterpret its result
 as the validity of every contributing corner.
 
-An absent validity-channel chunk and a present chunk containing zeros have
-the same invalid-data meaning. Coordinates outside the reference extent are
-invalid. The encoded `nx`/`ny` byte values alone are not a validity mask.
-Channel-specific no-data conventions still apply (for example, `pred_dt == 0`
-has no distance value); they do not replace the declared volume-wide signal.
-A missing chunk is not a missing resolution level; only genuinely available
-arrays belong in the pyramid's dataset list.
+With channel validity, an absent chunk and a present chunk containing zeros
+have the same invalid-data meaning. Coordinates outside the reference extent
+are invalid in both forms. The encoded `nx`/`ny` byte values alone are not a
+validity mask. Channel-specific no-data conventions still apply (for example,
+`pred_dt == 0` has no distance value); they do not replace the declared
+volume-wide signal. A missing chunk is not a missing resolution level; only
+genuinely available arrays belong in the pyramid's dataset list.
 
-Legacy v1/v2 Lasagna volumes retain their existing `grad_mag` validity behavior.
-Conversion to v3 records that explicitly as `validity_channel: "grad_mag"`;
-Fiber producers use `presence`. No legacy reader behavior changes merely
-because the new format introduces this field.
+Legacy v1/v2 Lasagna volumes without the field retain their existing
+`grad_mag` validity behavior; legacy Fiber sidecars without it and without
+`grad_mag` use `presence`. Conversion to v3 records the channel explicitly.
+Volumes written before the sheet-normal validity channel was removed may still
+carry a `sheet_grad_mag` channel; readers ignore it and use the declared
+validity channel, which gives the same result because that channel was blanked
+where presence was zero.
 
 ### Existing Lasagna channel encodings
 

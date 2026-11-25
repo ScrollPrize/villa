@@ -890,7 +890,7 @@ def test_fiber_inference_cli_forwards_shared_multi_gpu_pipeline(monkeypatch: pyt
         "--profile-pipeline",
         "--inference-precision", "bf16",
         "--product-accumulator-dtype", "float32",
-        "--download-workers", "77",
+        "--input-connections", "77",
         "--ome-compressor", "none",
     ])
     assert result == 0
@@ -906,34 +906,35 @@ def test_fiber_inference_cli_forwards_shared_multi_gpu_pipeline(monkeypatch: pyt
     assert captured["profile_pipeline"] is True
     assert captured["inference_precision"] == "bf16"
     assert captured["product_accumulator_dtype"] == "float32"
-    assert captured["download_workers"] == 77
+    assert captured["input_connections"] == 77
     assert captured["ome_compressor"] == "none"
 
 
-def test_fiber_inference_cli_forwards_live_cache_options(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_fiber_inference_cli_forwards_input_cache_options(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict[str, object] = {}
     monkeypatch.setattr(
         fiber_infer_module, "run_fiber_trace_3d_inference",
         lambda **kwargs: captured.update(kwargs),
     )
     assert fiber_infer_module.main([
-        "--input", "volume.zarr/0", "--output", "fiber.lasagna.json",
-        "--checkpoint", "model.pt", "--live-fetch",
-        "--live-cache-gib", "12.5", "--live-fetch-ahead-tiles", "4321",
-        "--download-workers", "123",
+        "--input", "s3://bucket/volume.zarr/0", "--output", "fiber.lasagna.json",
+        "--checkpoint", "model.pt", "--input-disk-cache-dir", "/cache",
+        "--input-disk-cache-gib", "12.5", "--read-ahead-tiles", "4321",
+        "--input-connections", "123",
     ]) == 0
-    assert captured["live_fetch"] is True
-    assert captured["live_cache_gib"] == 12.5
-    assert captured["live_fetch_ahead_tiles"] == 4321
-    assert captured["download_workers"] == 123
+    assert captured["input_path"] == "s3://bucket/volume.zarr/0"
+    assert captured["input_disk_cache_dir"] == "/cache"
+    assert captured["input_disk_cache_gib"] == 12.5
+    assert captured["read_ahead_tiles"] == 4321
+    assert captured["input_connections"] == 123
 
 
 @pytest.mark.parametrize("extra", [
-    ["--live-fetch", "--no-download"],
-    ["--live-fetch", "--crop", "0", "0", "0", "1", "1", "1"],
-    ["--live-cache-gib", "1"],
+    ["--input-connections", "0"],
+    ["--read-ahead-tiles", "0"],
+    ["--input-disk-cache-gib", "0"],
 ])
-def test_fiber_inference_cli_rejects_invalid_live_cache_combinations(extra) -> None:
+def test_fiber_inference_cli_rejects_invalid_input_cache_options(extra) -> None:
     with pytest.raises(SystemExit):
         fiber_infer_module.main([
             "--input", "volume.zarr/0", "--output", "fiber.lasagna.json",
@@ -4042,6 +4043,44 @@ def test_3d_fiber_output_adapter_requires_all_option_channels(tmp_path: Path) ->
     )
 
 
+def test_3d_fiber_infer_crop_stores_complete_chunks_with_full_context(tmp_path: Path) -> None:
+    """A crop widens to the output chunk grid and keeps the full model halo: every
+    stored chunk is complete and identical to the full-volume run."""
+    input_path = tmp_path / "input.zarr"
+    arr = create_v2_array(input_path, shape=(16, 16, 16), chunks=(8, 8, 8), dtype=np.uint8)
+    rng = np.random.default_rng(3)
+    arr[:] = rng.integers(0, 256, (16, 16, 16), dtype=np.uint8)
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({
+        "patch_shape_zyx": [8, 8, 8], "image_normalization": "none",
+        "model_3d": {"input_channels": 1, "direction_branch_count": 1, "output_channels": 7,
+                     "features_per_stage": [2, 4], "strides": [[1, 1, 1], [2, 2, 2]],
+                     "decoder_upsample_mode": "pixelshuffle", "normalization": "batch"},
+        "training": {"mixed_precision": "off"}}), encoding="utf-8")
+    outputs = {}
+    for name, crop in (("full", None), ("crop", (1, 1, 1, 5, 5, 5))):
+        torch.manual_seed(11)  # identical random weights in both runs
+        out_dir = tmp_path / name
+        out_dir.mkdir()
+        run_fiber_trace_3d_inference(
+            config_path=config_path, output_format="compact", input_path=str(input_path),
+            output_path=out_dir / "fiber.lasagna.json", checkpoint=None, device="cpu",
+            crop_xyzwhd=crop, tile_size=8, overlap=4, border=2, inference_scaledown_power=0,
+            base_ref=str(input_path), base_scale=0, levels=1, ome_chunk=4, pyramid_workers=1,
+            flush_workers=0, accumulator_workers=0)
+        outputs[name] = out_dir / "fiber.zarr"
+    from lasagna.lasagna_volume import LasagnaVolume
+    cropped = LasagnaVolume.load(outputs["crop"])
+    assert cropped.validity_channel == "chunks"
+    assert cropped.crops == [(1, 1, 1, 5, 5, 5)]
+    stored = ZarrWriter.open(outputs["crop"] / "sd0/0").stored_chunks()
+    # The crop [1,6) widens to chunks 0 and 1 on every axis: eight complete chunks, no third.
+    assert sorted(stored) == sorted((0, z, y, x) for z in (0, 1) for y in (0, 1) for x in (0, 1))
+    full = open_zarr(outputs["full"] / "sd0/0")[:, :8, :8, :8]
+    crop_values = open_zarr(outputs["crop"] / "sd0/0")[:, :8, :8, :8]
+    np.testing.assert_array_equal(crop_values, full)
+
+
 @pytest.mark.parametrize("output_format", ["legacy", "compact"])
 def test_3d_fiber_infer_writes_lasagna_presence_normal_products(tmp_path: Path, output_format) -> None:
     input_path = tmp_path / "input.zarr"
@@ -4089,7 +4128,6 @@ def test_3d_fiber_infer_writes_lasagna_presence_normal_products(tmp_path: Path, 
         inference_scaledown_power=0,
         base_ref=str(input_path),
         base_scale=0,
-        no_download=True,
         levels=2,
         ome_chunk=4,
         pyramid_workers=1,
@@ -4100,7 +4138,7 @@ def test_3d_fiber_infer_writes_lasagna_presence_normal_products(tmp_path: Path, 
     if output_format == "compact":
         from lasagna.lasagna_volume import LasagnaVolume
         manifest = LasagnaVolume.load(tmp_path / "fiber_out.zarr")
-        assert manifest.validity_channel == "presence"
+        assert manifest.validity_channel == "chunks"
         assert manifest.base_shape_zyx == (8, 8, 8)
         data = open_zarr(tmp_path / "fiber_out.zarr/sd0/0")
         assert data.shape == (3,8,8,8)
@@ -4123,6 +4161,8 @@ def test_3d_fiber_infer_writes_lasagna_presence_normal_products(tmp_path: Path, 
     manifest = json.loads(output_path.read_text(encoding="utf-8"))
     assert set(manifest["groups"]) == set(FIBER_TRACE_3D_PERSISTED_CHANNELS)
     assert manifest["base_shape_zyx"] == [8, 8, 8]
+    assert manifest["validity_channel"] == "chunks"
+    assert manifest["blank_invalid"] is False
     for channel_name in FIBER_TRACE_3D_PERSISTED_CHANNELS:
         group = manifest["groups"][channel_name]
         assert group["channels"] == [channel_name]
@@ -4148,7 +4188,7 @@ def test_3d_fiber_inference_scale_defaults_and_validates_all_axes() -> None:
     # None selects the model's native output stride.
     assert parameters["inference_scaledown_power"].default is None
     assert parameters["ome_chunk"].default == 64
-    assert parameters["ome_compressor"].default == "blosc-zstd"
+    assert parameters["ome_compressor"].default is None
     assert _input_scaledown_from_base((17, 33, 65), (5, 9, 17)) == 4
     with pytest.raises(ValueError, match="isotropic power-of-two"):
         _input_scaledown_from_base((17, 33, 65), (5, 17, 17))

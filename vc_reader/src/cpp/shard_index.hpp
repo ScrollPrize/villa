@@ -107,7 +107,7 @@ public:
             // Use the failed open's result: checking existence afterward races
             // a writer publishing the first version of this shard.
             if (errno == ENOENT) return;
-            throw std::runtime_error("cannot open shard " + path.string());
+            throw std::runtime_error("cannot open shard " + utf8String(path));
         }
         file_.seekg(0, std::ios::end);
         const auto size = file_.tellg();

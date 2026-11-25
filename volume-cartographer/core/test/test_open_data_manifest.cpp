@@ -23,7 +23,10 @@
 
 #include <algorithm>
 #include <filesystem>
+#include <cstdlib>
 #include <fstream>
+#include <map>
+#include <optional>
 #include <utility>
 
 #include <QSettings>
@@ -520,6 +523,155 @@ TEST_CASE("Manual project Lasagna resolution materializes a selected remote mani
     else qputenv("VC3D_CONFIG_DIR", previousConfigDir);
     // resolveLasagnaForView pinned the process-wide remote cache root to
     // `root`; it stays so later cases in this process keep a writable root.
+}
+
+namespace {
+
+// A published compact (schema v3) fiber prediction: one Zarr store with the
+// manifest in its .zattrs and all channels in one CZYX array.
+std::filesystem::path writeCompactArtifact(const std::filesystem::path& artifact, std::size_t arrayChannels = 3)
+{
+    const auto store = artifact / "run.zarr";
+    writeFile(store / ".zgroup", R"({"zarr_format":2})");
+    writeFile(store / ".zattrs", R"({"lasagna":{"version":3,"source_to_base":1.0,"base_shape_zyx":[32,32,32],
+        "validity_channel":"chunks","blank_invalid":false,"provenance":"../inference.json",
+        "groups":{"sd2":{"zarr":"sd2/2","scaledown":2,"channels":["presence","nx","ny"]}}}})");
+    writeFile(artifact / "inference.json", R"({"run_uuid":"run-1"})");
+    writeFile(store / "sd2" / ".zgroup", R"({"zarr_format":2})");
+    writeFile(store / "sd2" / ".zattrs", R"({"multiscales":[{"version":"0.4","axes":[
+        {"name":"c","type":"channel"},{"name":"z","type":"space"},{"name":"y","type":"space"},{"name":"x","type":"space"}],
+        "datasets":[{"path":"2","coordinateTransformations":[{"type":"scale","scale":[1,4,4,4]}]}]}]})");
+    const auto channels = std::to_string(arrayChannels);
+    writeFile(store / "sd2" / "2" / ".zarray", R"({"zarr_format":2,"shape":[)" + channels + R"(,8,8,8],"chunks":[)" +
+        channels + R"(,8,8,8],"dtype":"|u1","compressor":null,"fill_value":0,"filters":null,"order":"C","dimension_separator":"/"})");
+    return store;
+}
+
+}  // namespace
+
+TEST_CASE("A catalog's compact Lasagna artifact caches, reopens and resolves its provenance")
+{
+    const auto root = std::filesystem::temp_directory_path() /
+        ("vc_open_data_compact_" + std::to_string(vc::pages::pid()));
+    std::filesystem::remove_all(root);
+    writeCompactArtifact(root / "bucket" / "fibers");
+    writeCompactArtifact(root / "bucket" / "broken", 2);
+    writeCompactArtifact(root / "bucket" / "two");
+    writeFile(root / "bucket" / "two" / "other.zarr" / ".zattrs", "{}");
+    vc::test::LoopbackHttpServer server;
+    server.serveBucket("bucket", root / "bucket");
+    // Reached as S3; the settings keep the cache writable. Restored on the way out.
+    struct Environment {
+        std::map<std::string, std::optional<std::string>> previous;
+        void set(const std::string& name, const std::string& value)
+        {
+            const char* old = std::getenv(name.c_str());
+            previous.emplace(name, old ? std::optional<std::string>(old) : std::nullopt);
+            setenv(name.c_str(), value.c_str(), 1);
+        }
+        ~Environment()
+        {
+            for (const auto& [name, value] : previous)
+                value ? setenv(name.c_str(), value->c_str(), 1) : unsetenv(name.c_str());
+        }
+    } environment;
+    environment.set("AWS_ACCESS_KEY_ID", "key");
+    environment.set("AWS_SECRET_ACCESS_KEY", "secret");
+    environment.set("AWS_REGION", "us-east-1");
+    environment.set("AWS_ENDPOINT_URL", server.url());
+    environment.set("VC3D_CONFIG_DIR", (root / "config").string());
+    writeFile(root / "config" / "VC3D.ini", "[perf]\nremote_cache_min_free_gib=0\n");
+
+    vcr::catalog::OpenDataVolume volume;
+    volume.id = "vol";
+    volume.shapeZYX = std::array<std::size_t, 3>{32, 32, 32};
+    const auto artifactAt = [&](const std::string& name) {
+        vcr::catalog::OpenDataArtifact artifact;
+        artifact.type = "lasagna";
+        artifact.resolvedUrl = server.url() + "/bucket/" + name;
+        artifact.modelId = "model";
+        artifact.levelParameterPresent = true;
+        artifact.sourceCoordinateLevel = 1;
+        return artifact;
+    };
+    const auto cache = root / "cache";
+    const auto artifact = artifactAt("fibers");
+    // Discovery lists the artifact, which needs S3; the dataset itself reads over HTTP.
+    CHECK(vc::lasagna::catalogManifestUrl("s3://bucket/fibers") == "s3://bucket/fibers/run.zarr/.zattrs");
+    CHECK_THROWS_WITH_AS((void)vc::lasagna::catalogManifestUrl("s3://bucket/two"),
+                         doctest::Contains("found 0 and 2"), std::runtime_error);
+    const auto seed = [&](const vcr::catalog::OpenDataArtifact& published) {
+        vc::lasagna::LasagnaDatasetOpenOptions options;
+        options.remoteCacheRoot = cache;
+        options.discoverAwsCredentials = false;
+        (void)vc::lasagna::materializeLasagnaManifest(published.url() + "/run.zarr/.zattrs", options);
+    };
+    seed(artifact);
+    const auto cached = vc::lasagna::cacheCatalogDataset("sample", volume, artifact, cache);
+    CHECK(cached.kind == vc::lasagna::CatalogDatasetKind::FiberInference);
+    CHECK(cached.manifest.filename() == "run.zarr");
+    CHECK(std::filesystem::is_regular_file(cached.manifest.parent_path() / vc::lasagna::kLasagnaRemoteMarker));
+    const auto& manifest = cached.dataset.manifest();
+    CHECK(manifest.version == 3);
+    CHECK(manifest.validityByChunks());
+    REQUIRE(manifest.groups.size() == 1);
+    CHECK(manifest.groups.front().isRemote());
+    CHECK(manifest.groups.front().sourceLocation == artifact.url() + "/run.zarr/sd2/2");
+    CHECK_FALSE(manifest.groups.front().discoverAwsCredentials);
+
+    // Again from the marker, and from the files alone: the manifest is not requested twice.
+    const auto requests = server.requestCount("/bucket/fibers/run.zarr/.zattrs");
+    CHECK(vc::lasagna::cacheCatalogDataset("sample", volume, artifact, cache).manifest == cached.manifest);
+    std::filesystem::remove(cached.manifest.parent_path() / vc::lasagna::kLasagnaRemoteMarker);
+    CHECK(vc::lasagna::cacheCatalogDataset("sample", volume, artifact, cache).manifest == cached.manifest);
+    CHECK(server.requestCount("/bucket/fibers/run.zarr/.zattrs") == requests);
+
+    // The record sits beside the store, in the artifact.
+    std::vector<std::string> fetched;
+    vc::lasagna::cacheLasagnaProvenance(vc::lasagna::LasagnaDataset::open(cached.manifest).manifest(),
+        [&](const std::string& location, const std::filesystem::path& temporary) {
+            fetched.push_back(location);
+            std::ofstream(temporary) << "{}";
+        });
+    CHECK(fetched == std::vector<std::string>{artifact.url() + "/inference.json"});
+    CHECK(std::filesystem::is_regular_file(cached.manifest.parent_path() / "inference.json"));
+
+    // By the store's URL, as a manual attachment or a catalog entry's source location.
+    vc::lasagna::LasagnaDatasetOpenOptions options;
+    options.remoteCacheRoot = root / "manual";
+    options.discoverAwsCredentials = false;
+    for (const auto* suffix : {"/run.zarr", "/run.zarr/"}) {
+        const auto manual = vc::lasagna::LasagnaDataset::openLocation(artifact.url() + suffix, options);
+        CHECK(manual.manifest().groups.front().sourceLocation == artifact.url() + "/run.zarr/sd2/2");
+    }
+
+    // A project entry at the store names its catalog artifact.
+    vcr::catalog::OpenDataSample sample;
+    sample.id = "sample";
+    vcr::catalog::OpenDataArtifact source;
+    source.type = "ome-zarr";
+    source.resolvedUrl = server.url() + "/bucket/source.zarr";
+    volume.artifacts = {source, artifact};
+    sample.volumes = {volume};
+    auto catalog = std::make_shared<vcr::catalog::OpenDataManifest>();
+    catalog->samples = {sample};
+    vc::project::LoadOptions load;
+    load.catalog = catalog;
+    auto pkg = vc::test::emptyProject(load);
+    const auto view = catalog->volumeAt(source.resolvedUrl, 0);
+    CHECK_THROWS(resolveLasagnaForView(*pkg, view));
+    CHECK(pkg->attachPreparedLasagnaDataset(cached.manifest.string(), {}, true, {}) ==
+          VolumePkg::AttachLasagnaResult::Attached);
+    const auto entries = pkg->fiberInferenceDatasetEntries();
+    REQUIRE(entries.size() == 1);
+    CHECK(lasagnaSourceManifestLocation(*pkg, entries.front()) == artifact.url() + "/run.zarr");
+    // The volume publishes no normals, so a manual choice stands.
+    CHECK_NOTHROW(resolveLasagnaForView(*pkg, view));
+
+    seed(artifactAt("broken"));
+    CHECK_THROWS_WITH_AS(vc::lasagna::cacheCatalogDataset("sample", volume, artifactAt("broken"), cache),
+                         doctest::Contains("channels"), std::runtime_error);
+    std::filesystem::remove_all(root);
 }
 
 TEST_CASE("Open-data Lasagna derives and verifies coordinate scale from volume shape")

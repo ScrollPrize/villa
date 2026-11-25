@@ -13,6 +13,7 @@
 #include "vc/fiber_tracer/FiberHvClassification.hpp"
 #include "LineAnnotationFiberNaming.hpp"
 #include "LineAnnotationFiberSegments.hpp"
+#include "LineAnnotationSpanMetrics.hpp"
 #include "vc/lasagna/LineSpline.hpp"
 #include "LineAnnotationGeneratedViews.hpp"
 #include "LineAnnotationFiberLinks.hpp"
@@ -7325,3 +7326,43 @@ TEST_CASE("Auto-link choice facts: a stored record and a session-shaped view of 
     CHECK(stored.controls[1] == cv::Vec3d(10, 1, 2));
 }
 
+
+TEST_CASE("span labels without a normal source keep descriptors and drop normal measurements")
+{
+    using vc3d::line_annotation::FiberTraceSegmentMetadata;
+    using vc3d::line_annotation::GeneratedSpanAlignmentMetric;
+    using vc3d::line_annotation::SegmentInterpolationMode;
+
+    FiberTraceSegmentMetadata cspline;
+    cspline.interpMode = SegmentInterpolationMode::Cspline;
+    cspline.message = "cspline only";
+    cspline.tags = {std::string(vc3d::line_annotation::kGapSpanTag)};
+    GeneratedSpanAlignmentMetric csplineMetric;
+    vc3d::line_annotation::fillSpanMetricFromSegment(csplineMetric, cspline, false);
+    CHECK(csplineMetric.modeMarker == 'C');
+    CHECK(csplineMetric.kind == GeneratedSpanAlignmentMetric::Kind::Cspline);
+    CHECK(csplineMetric.message == "cspline only");
+    CHECK(csplineMetric.gap);
+
+    FiberTraceSegmentMetadata lasagna;
+    lasagna.interpMode = SegmentInterpolationMode::Lasagna;
+    lasagna.metric = 37.0;
+    GeneratedSpanAlignmentMetric withoutNormals;
+    vc3d::line_annotation::fillSpanMetricFromSegment(withoutNormals, lasagna, false);
+    CHECK(withoutNormals.modeMarker == 'L');
+    CHECK_FALSE(withoutNormals.available);
+    GeneratedSpanAlignmentMetric withNormals;
+    vc3d::line_annotation::fillSpanMetricFromSegment(withNormals, lasagna, true);
+    CHECK(withNormals.available);
+    CHECK(withNormals.maxErrorDegrees == doctest::Approx(37.0));
+
+    FiberTraceSegmentMetadata trace;
+    trace.interpMode = SegmentInterpolationMode::Trace;
+    trace.meetingErrorBaseVoxels = 2.5;
+    trace.failureCode = "no_meeting";
+    GeneratedSpanAlignmentMetric traceMetric;
+    vc3d::line_annotation::fillSpanMetricFromSegment(traceMetric, trace, false);
+    CHECK(traceMetric.kind == GeneratedSpanAlignmentMetric::Kind::NativeMeetingError);
+    CHECK(traceMetric.meetingErrorBaseVoxels == doctest::Approx(2.5));
+    CHECK(traceMetric.failureCode == "no_meeting");
+}

@@ -3,6 +3,7 @@
 #include "vc_reader/zarr_write.hpp"
 #include "vc_reader/array.hpp"
 #include "vc_reader/native/rounding.hpp"
+#include "vc_reader/native/utf8_path.hpp"
 #include "vc_reader/native/thread_pool.hpp"
 
 #include <algorithm>
@@ -189,7 +190,7 @@ void writePyramidLevel(const fs::path& root, int level, const PyramidOptions& op
         throw std::invalid_argument("pyramid level to write must be at least 1");
     OpenOptions readOptions;
     readOptions.threads = 1;  // parallel across output chunks below
-    auto src = openArray((root / std::to_string(level - 1)).string(), readOptions);
+    auto src = openArray(utf8String(root / std::to_string(level - 1)), readOptions);
     auto dst = Writer::open(root / std::to_string(level));
     const auto& srcMeta = src.meta;
     const auto& meta = dst.meta();

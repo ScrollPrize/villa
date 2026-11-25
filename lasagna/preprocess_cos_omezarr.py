@@ -38,21 +38,21 @@ except ImportError:
 	_HAS_NUMBA = False
 import torch
 import vc_reader
-from vc_reader.reader import ZarrGroup, ZarrWriter, open_group, open_node, open_zarr
+from vc_reader.reader import ZarrWriter, open_zarr
 
 try:
-	from live_omezarr_cache import (
-		DEFAULT_LIVE_CACHE_GIB,
-		DEFAULT_LIVE_FETCH_AHEAD_TILES,
-		LiveOmeZarrCache,
-		path_has_download_source,
+	from input_level import (
+		DEFAULT_INPUT_CONNECTIONS,
+		DEFAULT_READ_AHEAD_TILES,
+		InputLevel,
+		split_level_location,
 	)
 except ImportError:
-	from lasagna.live_omezarr_cache import (
-		DEFAULT_LIVE_CACHE_GIB,
-		DEFAULT_LIVE_FETCH_AHEAD_TILES,
-		LiveOmeZarrCache,
-		path_has_download_source,
+	from lasagna.input_level import (
+		DEFAULT_INPUT_CONNECTIONS,
+		DEFAULT_READ_AHEAD_TILES,
+		InputLevel,
+		split_level_location,
 	)
 
 try:
@@ -69,7 +69,6 @@ try:
 		OmeZarrOutputAdapter,
 		OutputChannelSpec,
 		OutputProductSpec,
-		_auto_download as _shared_auto_download,
 		_cleanup_predict3d_temp_files,
 		_format_eta,
 		_iter_chunk_origins_for_region,
@@ -79,6 +78,7 @@ try:
 		_predict3d_overall_eta,
 		_read_tile_zarr,
 		_remove_path_quiet,
+		_resolve_base_shape,
 		build_product_omezarr_pyramids,
 		create_product_omezarr_groups,
 		resolve_inference_devices,
@@ -99,7 +99,6 @@ except ImportError:
 		OmeZarrOutputAdapter,
 		OutputChannelSpec,
 		OutputProductSpec,
-		_auto_download as _shared_auto_download,
 		_cleanup_predict3d_temp_files,
 		_format_eta,
 		_iter_chunk_origins_for_region,
@@ -109,6 +108,7 @@ except ImportError:
 		_predict3d_overall_eta,
 		_read_tile_zarr,
 		_remove_path_quiet,
+		_resolve_base_shape,
 		build_product_omezarr_pyramids,
 		create_product_omezarr_groups,
 		resolve_inference_devices,
@@ -152,6 +152,11 @@ def _crop_xyzwhd_bounds(*, shape_zyx: tuple[int, int, int], crop_xyzwhd: tuple[i
 def _ds_size(v: int, f: int) -> int:
 	# Match interpolate(scale_factor=1/f) floor behavior.
 	return max(1, int(v) // int(f))
+
+
+def _ds_end(v: int, f: int) -> int:
+	"""Exclusive output bound of an input bound: stored pyramid levels are ceil-sized."""
+	return (max(0, int(v)) + int(f) - 1) // int(f)
 
 
 def _ds_index(v: int, f: int) -> int:
@@ -1289,55 +1294,6 @@ def _calibrate_instance_norm(
 	print("[calibrate_norm] done")
 
 
-def _resolve_base_shape(
-	input_path: str,
-	base_ref: str | None,
-	base_scale: int | None,
-) -> tuple[int, int, int] | None:
-	"""Resolve base_shape_zyx from --base-ref/--base-scale or auto-detect.
-
-	Three modes (checked in order):
-	1. base_ref + base_scale: read zarr shape, multiply by 2^base_scale
-	2. base_ref alone: zarr IS 1× base, use shape directly
-	3. Neither: try to open the input as a zarr group and read level 0
-	"""
-	if base_ref is not None:
-		ref = open_node(base_ref)
-		if isinstance(ref, ZarrGroup):
-			raise ValueError(f"--base-ref must point to a zarr array, got group: {base_ref}")
-		sh = tuple(int(v) for v in ref.shape)
-		# Strip leading channel dim if present
-		if len(sh) == 4:
-			sh = sh[1:]
-		if len(sh) != 3:
-			raise ValueError(f"--base-ref array must be 3D or 4D (CZYX), got shape={sh}")
-		scale = base_scale if base_scale is not None else 0
-		f = 2 ** scale
-		return (sh[0] * f, sh[1] * f, sh[2] * f)
-
-	# Auto-detect: find the zarr group root and read actual level 0 shape.
-	try:
-		inp = Path(str(input_path).rstrip("/"))
-		group = open_group(inp.parent if inp.name.isdigit() else inp)
-		level_keys = sorted(int(k) for k in group.keys() if k.isdigit())
-		if level_keys:
-			finest_lv = level_keys[0]
-			sh = tuple(int(v) for v in group[str(finest_lv)].shape)
-			if len(sh) == 3 and finest_lv == 0:
-				print(f"[predict3d] base shape from level 0: {sh}", flush=True)
-				return sh
-			# Fall back to finest available level × 2^level (approximate!)
-			if len(sh) == 3:
-				f = 2 ** finest_lv
-				base = (sh[0] * f, sh[1] * f, sh[2] * f)
-				print(f"[predict3d] WARNING: base shape estimated from level {finest_lv} "
-					  f"shape={sh} × {f} → {base} (may be off by a few voxels)", flush=True)
-				return base
-	except Exception:
-		pass
-	return None
-
-
 def run_preprocess_3d(
 	*,
 	input_path: str,
@@ -1361,7 +1317,7 @@ def run_preprocess_3d(
 	base_scale: int | None = None,
 	n_levels: int = 5,
 	ome_chunk: int = 64,
-	ome_compressor: str = DEFAULT_OME_COMPRESSOR,
+	ome_compressor: str | None = DEFAULT_OME_COMPRESSOR,
 	devices: str | tuple[str, ...] | None = None,
 	prefetch_workers: int = 0,
 	slots_per_gpu: int = 2,
@@ -1370,8 +1326,11 @@ def run_preprocess_3d(
 	prefetch_tiles_per_gpu: int = DEFAULT_PREFETCH_TILES_PER_GPU,
 	input_cache_gib: float = DEFAULT_INPUT_CACHE_BYTES / float(1 << 30),
 	input_io_threads: int = DEFAULT_INPUT_IO_THREADS,
-	download_workers: int = 64,
-	live_cache: LiveOmeZarrCache | None = None,
+	input_disk_cache_dir: str | None = None,
+	input_disk_cache_gib: float | None = None,
+	input_connections: int = DEFAULT_INPUT_CONNECTIONS,
+	read_ahead_tiles: int = DEFAULT_READ_AHEAD_TILES,
+	input_level: InputLevel | None = None,
 	profile_pipeline: bool = False,
 	product_accumulator_dtype: str = "float16",
 	output_format: str = "compact",
@@ -1395,8 +1354,14 @@ def run_preprocess_3d(
 			)
 		tile_size = int(_ckpt_meta["patch_size"])
 		print(f"[predict3d] tile_size={tile_size} from checkpoint metadata", flush=True)
-	if int(download_workers) <= 0:
-		raise ValueError("download_workers must be a positive integer")
+	if int(input_connections) <= 0:
+		raise ValueError("input_connections must be a positive integer")
+	if int(read_ahead_tiles) <= 0:
+		raise ValueError("read_ahead_tiles must be > 0")
+	if input_disk_cache_gib is not None and (
+		not math.isfinite(float(input_disk_cache_gib)) or float(input_disk_cache_gib) <= 0
+	):
+		raise ValueError("input_disk_cache_gib must be finite and > 0")
 	if int(flush_workers) < 0:
 		raise ValueError("flush_workers must be >= 0")
 	if int(accumulator_workers) < 0:
@@ -1410,14 +1375,22 @@ def run_preprocess_3d(
 	output_location, output_format = resolve_output(output_path, output_format)
 	output_path = str(output_location)
 
-	input_memory = int(float(input_cache_gib) * (1 << 30))
-	if live_cache is not None:
-		a_in = live_cache.open_reader(memory_cache=input_memory, threads=int(input_io_threads))
-	else:
-		a_in = open_zarr(input_path, memory_cache=input_memory, threads=int(input_io_threads))
-	sh = tuple(int(v) for v in a_in.shape)
-	if len(sh) != 3:
-		raise ValueError(f"input array must be (Z,Y,X), got shape {sh}")
+	# The caller may hand over an already opened level (the CLI does); otherwise open one here.
+	owned_input_level = input_level is None
+	if input_level is None:
+		input_level = InputLevel(
+			str(input_path),
+			cache_dir=input_disk_cache_dir,
+			cache_max_bytes=(
+				None if input_disk_cache_gib is None else int(float(input_disk_cache_gib) * (1 << 30))
+			),
+			memory_cache=int(float(input_cache_gib) * (1 << 30)),
+			threads=int(input_io_threads),
+			connections=int(input_connections),
+			read_ahead_tiles=int(read_ahead_tiles),
+		)
+	a_in = input_level.reader
+	sh = tuple(input_level.shape)
 
 	# Resolve base shape first (needed to scale crop from base to input coords)
 	base_shape_zyx = _resolve_base_shape(input_path, base_ref, base_scale)
@@ -1475,13 +1448,13 @@ def run_preprocess_3d(
 	cos_sd = max(1, int(cos_scaledown))
 	other_sd = max(1, int(scaledown))
 
-	full_cos_z = _ds_size(sh[0], cos_sd)
-	full_cos_y = _ds_size(sh[1], cos_sd)
-	full_cos_x = _ds_size(sh[2], cos_sd)
+	full_cos_z = _ds_end(sh[0], cos_sd)
+	full_cos_y = _ds_end(sh[1], cos_sd)
+	full_cos_x = _ds_end(sh[2], cos_sd)
 
-	full_other_z = _ds_size(sh[0], other_sd)
-	full_other_y = _ds_size(sh[1], other_sd)
-	full_other_x = _ds_size(sh[2], other_sd)
+	full_other_z = _ds_end(sh[0], other_sd)
+	full_other_y = _ds_end(sh[1], other_sd)
+	full_other_x = _ds_end(sh[2], other_sd)
 
 	# OME-Zarr output chunk size (needed for crop rounding)
 	oc = max(1, int(ome_chunk))
@@ -1491,16 +1464,16 @@ def run_preprocess_3d(
 	cos_oz0 = (_ds_index(z0, cos_sd) // oc) * oc
 	cos_oy0 = (_ds_index(y0, cos_sd) // oc) * oc
 	cos_ox0 = (_ds_index(x0, cos_sd) // oc) * oc
-	cos_oz1 = min(full_cos_z, ((_ds_index(z0, cos_sd) + _ds_size(nz, cos_sd) + oc - 1) // oc) * oc)
-	cos_oy1 = min(full_cos_y, ((_ds_index(y0, cos_sd) + _ds_size(ny, cos_sd) + oc - 1) // oc) * oc)
-	cos_ox1 = min(full_cos_x, ((_ds_index(x0, cos_sd) + _ds_size(nx_dim, cos_sd) + oc - 1) // oc) * oc)
+	cos_oz1 = min(full_cos_z, ((_ds_end(z1, cos_sd) + oc - 1) // oc) * oc)
+	cos_oy1 = min(full_cos_y, ((_ds_end(y1, cos_sd) + oc - 1) // oc) * oc)
+	cos_ox1 = min(full_cos_x, ((_ds_end(x1, cos_sd) + oc - 1) // oc) * oc)
 
 	other_oz0 = (_ds_index(z0, other_sd) // oc) * oc
 	other_oy0 = (_ds_index(y0, other_sd) // oc) * oc
 	other_ox0 = (_ds_index(x0, other_sd) // oc) * oc
-	other_oz1 = min(full_other_z, ((_ds_index(z0, other_sd) + _ds_size(nz, other_sd) + oc - 1) // oc) * oc)
-	other_oy1 = min(full_other_y, ((_ds_index(y0, other_sd) + _ds_size(ny, other_sd) + oc - 1) // oc) * oc)
-	other_ox1 = min(full_other_x, ((_ds_index(x0, other_sd) + _ds_size(nx_dim, other_sd) + oc - 1) // oc) * oc)
+	other_oz1 = min(full_other_z, ((_ds_end(z1, other_sd) + oc - 1) // oc) * oc)
+	other_oy1 = min(full_other_y, ((_ds_end(y1, other_sd) + oc - 1) // oc) * oc)
+	other_ox1 = min(full_other_x, ((_ds_end(x1, other_sd) + oc - 1) // oc) * oc)
 
 	# Expand input crop to cover the rounded output chunk boundaries.
 	# The accumulator must produce data for every output chunk.
@@ -1517,15 +1490,15 @@ def run_preprocess_3d(
 	cos_oz0 = (_ds_index(z0, cos_sd) // oc) * oc
 	cos_oy0 = (_ds_index(y0, cos_sd) // oc) * oc
 	cos_ox0 = (_ds_index(x0, cos_sd) // oc) * oc
-	cos_oz1 = min(full_cos_z, ((_ds_index(z0, cos_sd) + _ds_size(nz, cos_sd) + oc - 1) // oc) * oc)
-	cos_oy1 = min(full_cos_y, ((_ds_index(y0, cos_sd) + _ds_size(ny, cos_sd) + oc - 1) // oc) * oc)
-	cos_ox1 = min(full_cos_x, ((_ds_index(x0, cos_sd) + _ds_size(nx_dim, cos_sd) + oc - 1) // oc) * oc)
+	cos_oz1 = min(full_cos_z, ((_ds_end(z1, cos_sd) + oc - 1) // oc) * oc)
+	cos_oy1 = min(full_cos_y, ((_ds_end(y1, cos_sd) + oc - 1) // oc) * oc)
+	cos_ox1 = min(full_cos_x, ((_ds_end(x1, cos_sd) + oc - 1) // oc) * oc)
 	other_oz0 = (_ds_index(z0, other_sd) // oc) * oc
 	other_oy0 = (_ds_index(y0, other_sd) // oc) * oc
 	other_ox0 = (_ds_index(x0, other_sd) // oc) * oc
-	other_oz1 = min(full_other_z, ((_ds_index(z0, other_sd) + _ds_size(nz, other_sd) + oc - 1) // oc) * oc)
-	other_oy1 = min(full_other_y, ((_ds_index(y0, other_sd) + _ds_size(ny, other_sd) + oc - 1) // oc) * oc)
-	other_ox1 = min(full_other_x, ((_ds_index(x0, other_sd) + _ds_size(nx_dim, other_sd) + oc - 1) // oc) * oc)
+	other_oz1 = min(full_other_z, ((_ds_end(z1, other_sd) + oc - 1) // oc) * oc)
+	other_oy1 = min(full_other_y, ((_ds_end(y1, other_sd) + oc - 1) // oc) * oc)
+	other_ox1 = min(full_other_x, ((_ds_end(x1, other_sd) + oc - 1) // oc) * oc)
 
 	# Recompute output region sizes with expanded crop
 	cos_wz = cos_oz1 - cos_oz0
@@ -1740,7 +1713,7 @@ def run_preprocess_3d(
 			output_omezarr_path=dt_omezarr_path,
 			output_level_key=str(cos_level),
 			pred_z0=base_z0 // pred_sd,
-			pred_z1=base_z1 // pred_sd,
+			pred_z1=min(base_z1 // pred_sd, int(pred_dt_zarr.shape[0])),
 			pred_y0=pdt_y0,
 			pred_y1=pdt_y1,
 			pred_x0=pdt_x0,
@@ -1775,7 +1748,6 @@ def run_preprocess_3d(
 				cos_product.name: (full_cos_z, full_cos_y, full_cos_x),
 				normal_product.name: (full_other_z, full_other_y, full_other_x),
 			},
-			input_zarr_path=str(input_path),
 			output_scaledown_base={
 				cos_product.name: effective_cos_sd,
 				normal_product.name: effective_other_sd,
@@ -1795,7 +1767,7 @@ def run_preprocess_3d(
 			profile_pipeline=bool(profile_pipeline),
 			product_accumulator_dtype=str(product_accumulator_dtype),
 			accumulator_workers=int(accumulator_workers),
-			live_cache=live_cache,
+			input_level=input_level,
 		)
 	except BaseException:
 		if _gpu_ctx is not None:
@@ -1806,6 +1778,8 @@ def run_preprocess_3d(
 		del model
 		if torch_device.type == "cuda":
 			torch.cuda.empty_cache()
+		if owned_input_level:
+			input_level.close()
 
 
 	if output_format == "legacy":
@@ -2603,14 +2577,14 @@ def main_predict3d(argv: list[str] | None = None) -> int:
 		help="Raw product ring dtype; float16 halves product backing (default: float16).")
 	p.add_argument("--accumulator-workers", type=int, default=DEFAULT_ACCUMULATOR_WORKERS,
 		help="Spawned chunk accumulation processes (default: min(CPU count, 32)); 0 is synchronous.")
-	p.add_argument("--download-workers", type=int, default=64,
-		help="Parallel S3 chunk download threads used by automatic download.")
-	p.add_argument("--live-fetch", action="store_true",
-		help="Fetch the selected input scale lazily and evict only safe old Z-chunk planes.")
-	p.add_argument("--live-cache-gib", type=float, default=None,
-		help=f"Selected-scale disk-cache target in GiB (default: {DEFAULT_LIVE_CACHE_GIB}).")
-	p.add_argument("--live-fetch-ahead-tiles", type=int, default=None,
-		help=f"Lazy materialization lookahead in canonical tiles (default: {DEFAULT_LIVE_FETCH_AHEAD_TILES}).")
+	p.add_argument("--input-disk-cache-dir", default=None,
+		help="vc_reader disk cache for a remote --input; chunks are kept decoded there across runs.")
+	p.add_argument("--input-disk-cache-gib", type=float, default=None,
+		help="Bound on the input disk cache in GiB; past it the least recently used chunks are removed.")
+	p.add_argument("--input-connections", type=int, default=DEFAULT_INPUT_CONNECTIONS,
+		help=f"Parallel remote input reads (default: {DEFAULT_INPUT_CONNECTIONS}).")
+	p.add_argument("--read-ahead-tiles", type=int, default=DEFAULT_READ_AHEAD_TILES,
+		help=f"Tiles of a remote input read ahead into the caches (default: {DEFAULT_READ_AHEAD_TILES}).")
 	p.add_argument("--chunk-z", type=int, default=32, help="Output zarr chunk size along Z.")
 	p.add_argument("--chunk-yx", type=int, default=32, help="Output zarr chunk size for Y and X.")
 	p.add_argument("--edt-chunk-depth", type=int, default=256, help="EDT chunk depth in Z (default 256).")
@@ -2623,10 +2597,6 @@ def main_predict3d(argv: list[str] | None = None) -> int:
 			 "If omitted, auto-detect from input zarr group level 0.")
 	p.add_argument("--base-scale", type=int, default=None,
 		help="How many 2x downsamples the --base-ref zarr is from the true base.")
-	p.add_argument("--no-download", action="store_true", default=False,
-		help="Skip automatic S3 download of input data. By default, predict3d "
-			 "checks for _download metadata in the zarr's .zattrs and downloads "
-			 "needed chunks before inference.")
 	p.add_argument("--levels", type=int, default=5,
 		help="Number of OME-Zarr pyramid levels to generate (default 5).")
 	p.add_argument("--ome-chunk", type=int, default=64,
@@ -2639,8 +2609,14 @@ def main_predict3d(argv: list[str] | None = None) -> int:
 		help="Private manager context JSON used to author portable inference.json.",
 	)
 	args = p.parse_args(argv)
-	if int(args.download_workers) <= 0:
-		p.error("--download-workers must be a positive integer")
+	if int(args.input_connections) <= 0:
+		p.error("--input-connections must be a positive integer")
+	if int(args.read_ahead_tiles) <= 0:
+		p.error("--read-ahead-tiles must be > 0")
+	if args.input_disk_cache_gib is not None and (
+		not math.isfinite(float(args.input_disk_cache_gib)) or float(args.input_disk_cache_gib) <= 0
+	):
+		p.error("--input-disk-cache-gib must be finite and > 0")
 	if int(args.flush_workers) < 0:
 		p.error("--flush-workers must be >= 0")
 	if int(args.accumulator_workers) < 0:
@@ -2651,34 +2627,6 @@ def main_predict3d(argv: list[str] | None = None) -> int:
 		p.error("--input-cache-gib must be finite and >= 0")
 	if int(args.input_io_threads) <= 0:
 		p.error("--input-io-threads must be > 0")
-	if not args.live_fetch and (args.live_cache_gib is not None or args.live_fetch_ahead_tiles is not None):
-		p.error("--live-cache-gib/--live-fetch-ahead-tiles require --live-fetch")
-	if args.live_fetch and args.no_download:
-		p.error("--live-fetch conflicts with --no-download")
-	if args.live_fetch and args.crop_xyzwhd is not None:
-		p.error("--live-fetch supports only full, non-cropped inference")
-	if args.live_fetch and args.pred_dt and path_has_download_source(args.pred_dt):
-		p.error("--live-fetch does not yet support a separately remote --pred-dt source")
-	if args.live_fetch:
-		live_cache_gib = float(
-			DEFAULT_LIVE_CACHE_GIB if args.live_cache_gib is None else args.live_cache_gib
-		)
-		live_lookahead = int(
-			DEFAULT_LIVE_FETCH_AHEAD_TILES
-			if args.live_fetch_ahead_tiles is None else args.live_fetch_ahead_tiles
-		)
-		if not math.isfinite(live_cache_gib) or live_cache_gib <= 0:
-			p.error("--live-cache-gib must be finite and > 0")
-		if live_lookahead <= 0:
-			p.error("--live-fetch-ahead-tiles must be > 0")
-
-	if not args.no_download and not args.live_fetch:
-		_shared_auto_download(
-			input_path=str(args.input),
-			crop_xyzwhd=tuple(int(v) for v in args.crop_xyzwhd) if args.crop_xyzwhd else None,
-			pred_dt_path=str(args.pred_dt) if args.pred_dt else None,
-			download_workers=int(args.download_workers),
-		)
 
 	try:
 		from inference_provenance import (
@@ -2726,18 +2674,14 @@ def main_predict3d(argv: list[str] | None = None) -> int:
 			"border": int(args.border),
 			"overlap": int(args.overlap),
 			"ome_chunk": int(args.ome_chunk),
-			"ome_compressor_requested": str(args.ome_compressor),
+			"ome_compressor_requested": args.ome_compressor,
 			"product_accumulator_dtype": str(args.product_accumulator_dtype),
-			"live_fetch": {
-				"enabled": bool(args.live_fetch),
-				"cache_target_gib": float(
-					DEFAULT_LIVE_CACHE_GIB if args.live_cache_gib is None else args.live_cache_gib
-				),
-				"lookahead_tiles": int(
-					DEFAULT_LIVE_FETCH_AHEAD_TILES
-					if args.live_fetch_ahead_tiles is None else args.live_fetch_ahead_tiles
-				),
-				"download_workers": int(args.download_workers),
+			"input": {
+				"location": str(args.input),
+				"disk_cache_dir": args.input_disk_cache_dir,
+				"disk_cache_gib": None if args.input_disk_cache_gib is None else float(args.input_disk_cache_gib),
+				"connections": int(args.input_connections),
+				"read_ahead_tiles": int(args.read_ahead_tiles),
 			},
 		},
 		"atlas_model_identity": {
@@ -2754,27 +2698,27 @@ def main_predict3d(argv: list[str] | None = None) -> int:
 		"manifest": output_manifest.name,
 	})
 	write_provenance(provenance_path, provenance)
-	live_cache = None
+	input_level = None
 	try:
-		if args.live_fetch:
-			live_cache = LiveOmeZarrCache(
-				str(args.input),
-				max_bytes=int(float(
-					DEFAULT_LIVE_CACHE_GIB if args.live_cache_gib is None else args.live_cache_gib
-				) * (1 << 30)),
-				lookahead_tiles=int(
-					DEFAULT_LIVE_FETCH_AHEAD_TILES
-					if args.live_fetch_ahead_tiles is None else args.live_fetch_ahead_tiles
-				),
-				workers=int(args.download_workers),
-			)
-		a_in = open_zarr(args.input)
-		input_shape = tuple(int(value) for value in a_in.shape)
+		input_level = InputLevel(
+			str(args.input),
+			cache_dir=args.input_disk_cache_dir,
+			cache_max_bytes=(
+				None if args.input_disk_cache_gib is None
+				else int(float(args.input_disk_cache_gib) * (1 << 30))
+			),
+			memory_cache=int(float(args.input_cache_gib) * (1 << 30)),
+			threads=int(args.input_io_threads),
+			connections=int(args.input_connections),
+			read_ahead_tiles=int(args.read_ahead_tiles),
+		)
+		provenance["inference"]["input"]["remote"] = bool(input_level.remote)
+		input_shape = tuple(input_level.shape)
 		base_shape = _resolve_base_shape(str(args.input), args.base_ref, args.base_scale)
 		input_sd = max(1, round(base_shape[0] / input_shape[0])) if base_shape else None
 		requested = context.get("source", {}).get("requested_group") if isinstance(context.get("source"), dict) else None
-		if requested is None and Path(str(args.input).rstrip("/")).name.isdigit():
-			requested = int(Path(str(args.input).rstrip("/")).name)
+		if requested is None:
+			requested = split_level_location(str(args.input))[1]
 		provenance["source_scale"] = {
 			"requested_group": requested,
 			"observed_input_shape_zyx": list(input_shape),
@@ -2805,7 +2749,7 @@ def main_predict3d(argv: list[str] | None = None) -> int:
 		base_scale=args.base_scale,
 		n_levels=int(args.levels),
 		ome_chunk=int(args.ome_chunk),
-		ome_compressor=str(args.ome_compressor),
+		ome_compressor=args.ome_compressor,
 		prefetch_workers=int(args.prefetch_workers),
 		slots_per_gpu=int(args.slots_per_gpu),
 		flush_workers=int(args.flush_workers),
@@ -2815,21 +2759,25 @@ def main_predict3d(argv: list[str] | None = None) -> int:
 		input_io_threads=int(args.input_io_threads),
 		profile_pipeline=bool(args.profile_pipeline),
 		product_accumulator_dtype=str(args.product_accumulator_dtype),
-		download_workers=int(args.download_workers),
-		live_cache=live_cache,
+		input_disk_cache_dir=args.input_disk_cache_dir,
+		input_disk_cache_gib=(
+			None if args.input_disk_cache_gib is None else float(args.input_disk_cache_gib)
+		),
+		input_connections=int(args.input_connections),
+		read_ahead_tiles=int(args.read_ahead_tiles),
+		input_level=input_level,
 		)
-		if live_cache is not None:
-			live_cache.close()
-			provenance["inference"]["live_fetch"]["final_stats"] = live_cache.snapshot()
+		input_level.close()
+		provenance["inference"]["input"]["final_stats"] = input_level.snapshot()
 		provenance["product"] = _lasagna_product_provenance(output_manifest)
 		finalize_document(
 			provenance, path=provenance_path, status="completed",
 			manifest_path=output_manifest,
 		)
 	except BaseException as error:
-		if live_cache is not None:
-			live_cache.close()
-			provenance["inference"]["live_fetch"]["final_stats"] = live_cache.snapshot()
+		if input_level is not None:
+			input_level.close()
+			provenance["inference"]["input"]["final_stats"] = input_level.snapshot()
 		finalize_document(
 			provenance, path=provenance_path,
 			status="interrupted" if isinstance(error, KeyboardInterrupt) else "failed",
@@ -2838,8 +2786,8 @@ def main_predict3d(argv: list[str] | None = None) -> int:
 		)
 		raise
 	finally:
-		if live_cache is not None:
-			live_cache.close()
+		if input_level is not None:
+			input_level.close()
 	return 0
 
 

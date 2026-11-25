@@ -220,10 +220,12 @@ std::vector<std::string> LasagnaDatasetManifest::fiberPredictionPrefixes() const
 
 LasagnaDatasetManifest LasagnaDatasetManifest::parseFile(const std::filesystem::path& manifestPath)
 {
-    // A compact manifest is the "lasagna" attribute of a Zarr group.
-    const bool compact = std::filesystem::is_directory(manifestPath);
+    // A compact manifest is the "lasagna" attribute of a Zarr group, named by
+    // the group's directory or its .zattrs.
+    const bool directory = std::filesystem::is_directory(manifestPath);
+    const bool compact = directory || manifestPath.filename() == ".zattrs";
     nlohmann::json root;
-    if (compact) {
+    if (directory) {
         root = vcr::zarr::readAttributes(manifestPath);
     } else {
         std::ifstream input(manifestPath);
@@ -240,7 +242,7 @@ LasagnaDatasetManifest LasagnaDatasetManifest::parseFile(const std::filesystem::
             !root.at("base_shape_zyx").is_array() || root.at("base_shape_zyx").size() != 3)
             throw std::runtime_error("embedded manifest requires source scale and base shape");
         const auto validity = root.at("validity_channel").get<std::string>();
-        bool found = false;
+        bool found = validity == LasagnaDatasetManifest::kValidityByChunks;
         std::unordered_set<std::string> channels;
         for (const auto& [name, group] : root.at("groups").items()) {
             const auto n = group.at("scaledown").get<int>();
@@ -248,6 +250,8 @@ LasagnaDatasetManifest LasagnaDatasetManifest::parseFile(const std::filesystem::
                 group.at("zarr") != name + "/" + std::to_string(n))
                 throw std::runtime_error("invalid embedded resolution group");
             for (const auto& channel : group.at("channels")) {
+                if (channel == LasagnaDatasetManifest::kValidityByChunks)
+                    throw std::runtime_error("'chunks' is reserved for validity_channel, not a channel name");
                 if (!channels.insert(channel.get<std::string>()).second)
                     throw std::runtime_error("duplicate embedded channel");
                 found = found || channel == validity;
@@ -255,7 +259,7 @@ LasagnaDatasetManifest LasagnaDatasetManifest::parseFile(const std::filesystem::
         }
         if (!found) throw std::runtime_error("invalid embedded validity_channel");
     }
-    LasagnaDatasetManifest manifest = parseText(root.dump(), compact ? manifestPath / ".zattrs" : manifestPath);
+    LasagnaDatasetManifest manifest = parseText(root.dump(), directory ? manifestPath / ".zattrs" : manifestPath);
     return manifest;
 }
 
@@ -308,6 +312,20 @@ LasagnaDatasetManifest LasagnaDatasetManifest::parseText(
                                             root.at("init_shell_dir").get<std::string>());
     }
     manifest.groups = parseGroups(root, manifest.baseDirectory);
+    if (manifest.groupForChannel(LasagnaDatasetManifest::kValidityByChunks) != nullptr)
+        throw std::runtime_error("'chunks' is reserved for validity_channel, not a channel name");
+    if (root.contains("validity_channel")) {
+        if (!root.at("validity_channel").is_string())
+            throw std::runtime_error("Lasagna manifest validity_channel must be a string");
+        manifest.validityChannel = root.at("validity_channel").get<std::string>();
+        if (manifest.validityChannel.empty() ||
+            (!manifest.validityByChunks() && manifest.groupForChannel(manifest.validityChannel) == nullptr))
+            throw std::runtime_error("Lasagna manifest validity_channel must name a channel or be 'chunks'");
+    } else if (manifest.groupForChannel("grad_mag") != nullptr) {
+        manifest.validityChannel = "grad_mag";
+    } else if (manifest.groupForChannel("presence") != nullptr) {
+        manifest.validityChannel = "presence";
+    }
 
     return manifest;
 }
@@ -339,8 +357,10 @@ LasagnaDatasetManifest fiberNormalManifest(const LasagnaDatasetManifest& source)
 {
     auto result=source;
     result.groups.clear();
+    if(source.validityChannel.empty())
+        throw std::invalid_argument("fiber prediction manifest declares no validity");
     std::unordered_set<const LasagnaChannelGroup*> aliased;
-    for(const auto* name:{"nx","ny","grad_mag"}) {
+    for(const auto* name:{"nx","ny"}) {
         const std::string original=std::string("sheet_")+name;
         const auto* group=source.groupForChannel(original);
         if(!group)throw std::invalid_argument("missing predicted normal channel "+original);
@@ -351,16 +371,25 @@ LasagnaDatasetManifest fiberNormalManifest(const LasagnaDatasetManifest& source)
         for(auto& channel:alias.channels) {
             if(channel=="sheet_nx")channel="nx";
             else if(channel=="sheet_ny")channel="ny";
-            else if(channel=="sheet_grad_mag")channel="grad_mag";
+            else if(!source.validityByChunks()&&channel==source.validityChannel)continue;
             else channel="unused_fiber_normal_"+channel;
         }
         result.groups.push_back(std::move(alias));
     }
-    result.raw["grad_mag_encode_scale"]=1.0;
-    result.raw["grad_mag_factor"]=1.0;
+    if(!source.validityByChunks()&&result.groupForChannel(source.validityChannel)==nullptr) {
+        // A validity channel stored apart from the sheet normals (its own group).
+        const auto* group=source.groupForChannel(source.validityChannel);
+        auto alias=*group;
+        for(auto& channel:alias.channels)
+            if(channel!=source.validityChannel)channel="unused_fiber_normal_"+channel;
+        result.groups.push_back(std::move(alias));
+    }
+    // Sheet normals carry no winding density: no grad_mag channel or decode fields.
+    result.raw.erase("grad_mag_encode_scale");
+    result.raw.erase("grad_mag_factor");
     result.raw["normal_source"]="fiber_sheet";
-    // Mask before projective/tensor interpolation: zero validity encodes no
-    // normal, not a direction obtained by decoding the blank nx/ny bytes.
+    // Mask before projective/tensor interpolation: an invalid corner encodes no
+    // normal, not a direction obtained by decoding its nx/ny bytes.
     result.raw["mask_invalid_normal_corners"]=true;
     return result;
 }

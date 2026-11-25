@@ -15,8 +15,10 @@ original array.
 Fiber predictions distinguish **fiber direction** (`nx`, `ny`) from **sheet
 normal** (`sheet_nx`, `sheet_ny`). Use `fiberSheetNormalDataset(prediction)` to
 select the latter. The full channel list is preserved, including its indices.
-`sheet_grad_mag` supplies normal validity; it is **not a measured winding
-density** and must not replace Lasagna density in winding extraction.
+Validity is the prediction's declared `validity_channel`: `chunks` for current
+inference output (a voxel is valid iff its chunk is stored), or a channel such
+as `presence` for older volumes. A sheet-normal dataset carries **no winding
+density**; winding extraction needs a Lasagna density source.
 
 Python sampling, in base XYZ coordinates:
 
@@ -27,9 +29,10 @@ normals, valid = sampler.sample(points_xyz_float32, threads=8)
 ```
 
 The default `normal_source="lasagna"` retains the previous behavior. No source
-is silently substituted. Fiber sheet normals always mask corners with zero
-`sheet_grad_mag` before sign-invariant tensor interpolation. All-invalid
-stencils remain invalid; no normal is invented or filled.
+is silently substituted. Fiber sheet normals always mask invalid corners (an
+absent chunk, or a zero validity-channel value) before sign-invariant tensor
+interpolation. All-invalid stencils remain invalid; no normal is invented or
+filled.
 
 Spatial shapes use the declared base size and scaledown. Odd base extents use
 ceiling division in this prediction format; do not infer a new voxel scale by

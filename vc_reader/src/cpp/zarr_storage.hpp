@@ -41,7 +41,7 @@ public:
             }
             return local_read(path, body, std::nullopt, 0, layout_.maxPayload);
         }
-        if (!http_) return LocalShard(path, layout_).readEntry(*position, body);
+        if (!http_) return LocalShard(utf8Path(path), layout_).readEntry(*position, body);
         auto index = shard_index(path);
         if (!index) return false;
         const auto entry = layout_.entry(index->bytes, *position, index->total);
@@ -63,7 +63,7 @@ public:
         const auto [path, position] = location(key);
         if (!http_) {
             if (position) {
-                LocalShard shard(path, layout_);
+                LocalShard shard(utf8Path(path), layout_);
                 if (shard.index.empty()) return std::nullopt;
                 const auto entry = layout_.entry(shard.index, *position, shard.total);
                 if (!entry) return std::nullopt;
@@ -155,7 +155,7 @@ private:
     static bool local_read(const std::string& path, std::vector<std::uint8_t>& body,
                            std::optional<std::uint64_t> offset, std::size_t length, std::size_t maximum)
     {
-        int fd = platform::open_file(path, O_RDONLY);
+        int fd = platform::open_file(utf8Path(path), O_RDONLY);
         if (fd < 0) {
             if (errno == ENOENT) return false;
             throw std::system_error(errno, std::generic_category(), "open " + path);
