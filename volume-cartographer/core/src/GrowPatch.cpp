@@ -2295,6 +2295,8 @@ QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const nlo
         vc::surface::storeAreaMeta(surf->meta, area_est_vx2,
                                    static_cast<double>(voxelsize));
         surf->meta["max_gen"] = stop_gen;
+        // ROI-only inpainting runs no growth generations, so time_limit_s does not apply.
+        surf->meta["stop_reason"] = "roi_inpaint";
         surf->meta["elapsed_time_s"] = f_timer.seconds();
 
         delete timer;
