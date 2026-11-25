@@ -1628,9 +1628,11 @@ the skeletons into tracks with `fast_tracks.py`. teasar supports the two slab
 configurations in `TEASAR_SETTINGS`: the defaults at the top of the script,
 and the published PHerc0211 configuration (downsample 2, 2-voxel ribbons every
 8, 4-voxel slabs every 16). Any other configuration uses Kimimaro. A slab
-teasar declines (a slab over its size limits, a call whose output would be
-too large, or a setting it does not support) runs on Kimimaro from the labels
-teasar already computed, and the run prints how many did. Keys are written in
+teasar declines while preparing its labels (one over its size limits) runs
+through the CPU backend from the start. A slab it declines while skeletonizing
+(a call whose output would be too large, or a setting it does not support)
+runs on Kimimaro from the labels teasar already computed. The run prints how
+many slabs teasar declined. Keys are written in
 the same order as with the CPU backend, so a run resumes the same way.
 
 `--teasar-target-order` sets the order teasar traces each skeleton's branches
