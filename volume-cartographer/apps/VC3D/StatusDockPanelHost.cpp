@@ -298,6 +298,38 @@ void StatusDockPanelHost::showDock(QDockWidget* dock)
     }
 }
 
+void StatusDockPanelHost::hideDock(QDockWidget* dock)
+{
+    Item* item = itemForDock(dock);
+    if (!item) {
+        return;
+    }
+    if (item->detached) {
+        attachItem(*item, false);
+    } else if (_currentIndex == itemIndex(*item)) {
+        collapseCurrent();
+    }
+}
+
+QWidget* StatusDockPanelHost::dockContent(const QDockWidget* dock) const
+{
+    const auto it = std::find_if(_items.begin(), _items.end(), [dock](const Item& item) {
+        return item.dock == dock;
+    });
+    return it == _items.end() ? nullptr : it->content.data();
+}
+
+bool StatusDockPanelHost::isDockShown(const QDockWidget* dock) const
+{
+    const auto it = std::find_if(_items.begin(), _items.end(), [dock](const Item& item) {
+        return item.dock == dock;
+    });
+    if (it == _items.end()) {
+        return false;
+    }
+    return it->detached ? dock->isVisible() : _currentIndex == itemIndex(*it);
+}
+
 bool StatusDockPanelHost::eventFilter(QObject* watched, QEvent* event)
 {
     if (auto* button = qobject_cast<QPushButton*>(watched)) {

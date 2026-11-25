@@ -146,6 +146,11 @@ private:
     // Reads the active modal dialog, such as a startup prompt, and optionally
     // presses one of its buttons by its label.
     QJsonObject handleUiDialog(const QJsonValue& params);
+    // The menu bar as shown: macOS's own menus on the cocoa platform, else Qt's
+    QJsonObject handleUiMenus(const QJsonValue& params);
+    // Reads a dock's labels, buttons and lists by its title, and optionally shows
+    // it or picks an item in one of its lists, as the View menu and a click do.
+    QJsonObject handleUiDock(const QJsonValue& params);
     QJsonObject handleCursorVolumePoint(const QJsonValue& params);
     QJsonObject handleCanvasClick(const QJsonValue& params, bool addShift);
     QJsonObject handleCanvasDrag(const QJsonValue& params);

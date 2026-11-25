@@ -3038,6 +3038,39 @@
         "type": "object"
       }
     },
+    "ui.dock": {
+      "errors": [
+        -32602,
+        -32007
+      ],
+      "params": {
+        "properties": {
+          "combo": {
+            "type": "string"
+          },
+          "item": {
+            "type": "string"
+          },
+          "show": {
+            "type": "boolean"
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "title"
+        ],
+        "type": "object"
+      }
+    },
+    "ui.menus": {
+      "errors": [],
+      "params": {
+        "properties": {},
+        "type": "object"
+      }
+    },
     "umbilicus.import": {
       "errors": [
         -32602,

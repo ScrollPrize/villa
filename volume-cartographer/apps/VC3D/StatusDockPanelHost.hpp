@@ -29,6 +29,12 @@ public:
     // Expands the dock's panel (or raises it when detached), restoring its bar
     // button first if the user closed it.
     void showDock(QDockWidget* dock);
+    // Collapses the dock's panel, or puts it back in the bar when detached
+    void hideDock(QDockWidget* dock);
+    // The panel's content when this host holds the dock, else nullptr
+    QWidget* dockContent(const QDockWidget* dock) const;
+    // Whether the dock's panel is expanded above the bar or floats detached
+    bool isDockShown(const QDockWidget* dock) const;
 
 protected:
     bool eventFilter(QObject* watched, QEvent* event) override;

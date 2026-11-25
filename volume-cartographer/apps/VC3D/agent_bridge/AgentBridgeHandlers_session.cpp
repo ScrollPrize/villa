@@ -17,10 +17,22 @@
 #include <QPointF>
 #include <QRegularExpression>
 #include <QAbstractButton>
+#include <QAction>
 #include <QApplication>
+#include <QComboBox>
+#include <QDockWidget>
+#include <QGuiApplication>
+#include <QKeySequence>
 #include <QLabel>
+#include <QMenu>
+#include <QMenuBar>
 #include <QTimer>
 #include <QWidget>
+
+#ifdef Q_OS_MACOS
+#include <objc/message.h>
+#include <objc/runtime.h>
+#endif
 
 #include <algorithm>
 #include <filesystem>
@@ -37,6 +49,7 @@
 #include "OpenDataResourceSelection.hpp"
 #include "ProjectResources.hpp"
 #include "SegmentationCommandHandler.hpp"
+#include "StatusDockPanelHost.hpp"
 #include "SurfaceCatalog.hpp"
 #include "SurfacePanelController.hpp"
 #include "ViewerManager.hpp"
@@ -108,6 +121,279 @@ QJsonObject AgentBridgeServer::handleUiDialog(const QJsonValue& params)
         QTimer::singleShot(0, target, &QAbstractButton::click);
         result["clicked"] = click;
     }
+    return result;
+}
+
+namespace {
+
+QString withoutMnemonic(QString text)
+{
+    // "&&" is a literal ampersand; a single "&" marks the mnemonic and is not shown
+    text.replace(QStringLiteral("&&"), QStringLiteral("\x01"));
+    text.remove(QLatin1Char('&'));
+    text.replace(QLatin1Char('\x01'), QLatin1Char('&'));
+    return text;
+}
+
+QString menuRoleName(QAction::MenuRole role)
+{
+    switch (role) {
+    case QAction::NoRole: return QStringLiteral("none");
+    case QAction::TextHeuristicRole: return QStringLiteral("textHeuristic");
+    case QAction::ApplicationSpecificRole: return QStringLiteral("applicationSpecific");
+    case QAction::AboutQtRole: return QStringLiteral("aboutQt");
+    case QAction::AboutRole: return QStringLiteral("about");
+    case QAction::PreferencesRole: return QStringLiteral("preferences");
+    case QAction::QuitRole: return QStringLiteral("quit");
+    }
+    return {};
+}
+
+QJsonArray qtMenuItems(const QList<QAction*>& actions)
+{
+    QJsonArray items;
+    for (const QAction* action : actions) {
+        if (action->isSeparator()) {
+            items.append(QJsonObject{{"separator", true}});
+            continue;
+        }
+        if (!action->isVisible()) {
+            continue;
+        }
+        QJsonObject item{{"title", withoutMnemonic(action->text())}, {"enabled", action->isEnabled()}};
+        if (!action->shortcut().isEmpty()) {
+            item["shortcut"] = action->shortcut().toString(QKeySequence::NativeText);
+        }
+        if (action->isCheckable()) {
+            item["checked"] = action->isChecked();
+        }
+        item["role"] = menuRoleName(action->menuRole());
+        if (action->menu()) {
+            item["items"] = qtMenuItems(action->menu()->actions());
+        }
+        items.append(item);
+    }
+    return items;
+}
+
+#ifdef Q_OS_MACOS
+// AppKit through the Objective-C runtime, so this file stays C++: the menu bar macOS draws, after Qt has moved
+// items such as Settings, About and Quit into the application menu
+template <typename Result, typename... Args>
+Result send(id receiver, const char* selector, Args... args)
+{
+    return reinterpret_cast<Result (*)(id, SEL, Args...)>(objc_msgSend)(receiver, sel_registerName(selector), args...);
+}
+
+QString fromNSString(id string)
+{
+    return string ? QString::fromUtf8(send<const char*>(string, "UTF8String")) : QString();
+}
+
+QString nativeShortcut(id item)
+{
+    const QString key = fromNSString(send<id>(item, "keyEquivalent"));
+    if (key.isEmpty()) {
+        return {};
+    }
+    // NSEventModifierFlag values, in the order macOS shows them
+    const auto mask = send<unsigned long>(item, "keyEquivalentModifierMask");
+    QString modifiers;
+    if (mask & (1UL << 18)) modifiers += QChar(0x2303);  // control
+    if (mask & (1UL << 19)) modifiers += QChar(0x2325);  // option
+    if (mask & (1UL << 17)) modifiers += QChar(0x21E7);  // shift
+    if (mask & (1UL << 20)) modifiers += QChar(0x2318);  // command
+    return modifiers + key.toUpper();
+}
+
+QJsonArray nativeMenuItems(id menu)
+{
+    QJsonArray items;
+    const long count = send<long>(menu, "numberOfItems");
+    for (long index = 0; index < count; ++index) {
+        id entry = send<id>(menu, "itemAtIndex:", index);
+        if (send<bool>(entry, "isSeparatorItem")) {
+            items.append(QJsonObject{{"separator", true}});
+            continue;
+        }
+        if (send<bool>(entry, "isHidden")) {
+            continue;
+        }
+        id submenu = send<id>(entry, "submenu");
+        // a menu bar item's own title is often empty; macOS shows its submenu's title
+        QString title = fromNSString(send<id>(entry, "title"));
+        if (title.isEmpty() && submenu) {
+            title = fromNSString(send<id>(submenu, "title"));
+        }
+        QJsonObject item{{"title", title}, {"enabled", send<bool>(entry, "isEnabled")}};
+        if (const QString shortcut = nativeShortcut(entry); !shortcut.isEmpty()) {
+            item["shortcut"] = shortcut;
+        }
+        if (submenu) {
+            item["items"] = nativeMenuItems(submenu);
+        }
+        items.append(item);
+    }
+    return items;
+}
+#endif
+
+// whether the code hid a control or one of its parents within the panel: Qt keeps every widget hidden until its parent
+// is first shown, so a panel that has never been on screen has nothing "visible" yet
+bool hiddenOnPurpose(const QWidget* widget, const QWidget* panel)
+{
+    for (const QWidget* current = widget; current && current != panel; current = current->parentWidget()) {
+        if (current->isHidden() && current->testAttribute(Qt::WA_WState_ExplicitShowHide)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// the row label LabeledControlRow and form layouts put next to a control
+QString controlLabel(const QWidget* control)
+{
+    const QWidget* row = control->parentWidget();
+    if (!row) {
+        return {};
+    }
+    for (const auto* label : row->findChildren<QLabel*>(Qt::FindDirectChildrenOnly)) {
+        if (!label->text().isEmpty()) {
+            return withoutMnemonic(label->text());
+        }
+    }
+    return {};
+}
+
+}  // namespace
+
+
+QJsonObject AgentBridgeServer::handleUiMenus(const QJsonValue&)
+{
+    QJsonObject result;
+#ifdef Q_OS_MACOS
+    if (QGuiApplication::platformName() == QLatin1String("cocoa")) {
+        id application = send<id>(reinterpret_cast<id>(objc_getClass("NSApplication")), "sharedApplication");
+        id mainMenu = application ? send<id>(application, "mainMenu") : nullptr;
+        if (mainMenu) {
+            result["source"] = QStringLiteral("native");
+            result["menus"] = nativeMenuItems(mainMenu);
+            return result;
+        }
+    }
+#endif
+    result["source"] = QStringLiteral("qt");
+    result["menus"] = qtMenuItems(_window->menuBar()->actions());
+    return result;
+}
+
+
+QJsonObject AgentBridgeServer::handleUiDock(const QJsonValue& params)
+{
+    const QJsonObject p = params.toObject();
+    const QString title = p.value(QStringLiteral("title")).toString();
+    const QString comboLabel = p.value(QStringLiteral("combo")).toString();
+    const QString item = p.value(QStringLiteral("item")).toString();
+    if (comboLabel.isEmpty() != item.isEmpty()) {
+        throw AgentBridgeError{-32602, "combo and item go together", {{"field", comboLabel.isEmpty() ? "combo" : "item"}}};
+    }
+
+    QDockWidget* dock = nullptr;
+    QJsonArray titles;
+    for (auto* candidate : _window->findChildren<QDockWidget*>()) {
+        titles.append(candidate->windowTitle());
+        if (candidate->windowTitle() == title) {
+            dock = candidate;
+        }
+    }
+    if (!dock) {
+        throw AgentBridgeError{-32007, "No dock has that title", {{"kind", "dock"}, {"id", title}, {"titles", titles}}};
+    }
+
+    // the segment workspace moves most docks' contents into panels that open from status bar buttons, leaving the
+    // dock itself empty
+    StatusDockPanelHost* host = _window->_statusDockPanelHost;
+    QWidget* hosted = host ? host->dockContent(dock) : nullptr;
+    QWidget* panel = hosted ? hosted : static_cast<QWidget*>(dock);
+
+    // every check before any change, so a bad combo or item leaves the dock as it was
+    QComboBox* combo = nullptr;
+    int itemIndex = -1;
+    if (!comboLabel.isEmpty()) {
+        for (auto* candidate : panel->findChildren<QComboBox*>()) {
+            if (controlLabel(candidate) == comboLabel) {
+                combo = candidate;
+            }
+        }
+        if (!combo) {
+            throw AgentBridgeError{-32007, "The dock has no list with that label", {{"kind", "combo"}, {"id", comboLabel}}};
+        }
+        itemIndex = combo->findText(item);
+        if (itemIndex < 0 || !combo->isEnabled()) {
+            throw AgentBridgeError{-32007, "The list has no choosable item with that text", {{"kind", "item"}, {"id", item}}};
+        }
+    }
+
+    const bool show = p.value(QStringLiteral("show")).toBool();
+    if (p.contains(QStringLiteral("show")) && hosted) {
+        // what a click on the panel's status bar button does
+        if (show) {
+            host->showDock(dock);
+        } else {
+            host->hideDock(dock);
+        }
+    } else if (p.contains(QStringLiteral("show"))) {
+        // what the dock's View menu entry does: show and bring a tabbed dock to the front, or hide
+        if (show) {
+            dock->show();
+            dock->raise();
+        } else {
+            dock->hide();
+        }
+    }
+    if (combo) {
+        combo->setCurrentIndex(itemIndex);
+    }
+
+    QJsonObject result{{"title", dock->windowTitle()},
+                       {"visible", hosted ? host->isDockShown(dock) : dock->isVisible()},
+                       {"floating", dock->isFloating()},
+                       {"statusBar", hosted != nullptr}};
+    // the dock's controls as they appear when it is on screen, whether or not it is now
+    QJsonArray labels;
+    for (const auto* label : panel->findChildren<QLabel*>()) {
+        if (!hiddenOnPurpose(label, panel) && !label->text().isEmpty()) {
+            labels.append(withoutMnemonic(label->text()));
+        }
+    }
+    QJsonArray buttons;
+    for (const auto* button : panel->findChildren<QAbstractButton*>()) {
+        if (hiddenOnPurpose(button, panel) || button->text().isEmpty()) {
+            continue;
+        }
+        QJsonObject entry{{"label", withoutMnemonic(button->text())}, {"enabled", button->isEnabled()}};
+        if (button->isCheckable()) {
+            entry["checked"] = button->isChecked();
+        }
+        buttons.append(entry);
+    }
+    QJsonArray combos;
+    for (const auto* candidate : panel->findChildren<QComboBox*>()) {
+        if (hiddenOnPurpose(candidate, panel)) {
+            continue;
+        }
+        QJsonArray items;
+        for (int index = 0; index < candidate->count(); ++index) {
+            items.append(candidate->itemText(index));
+        }
+        combos.append(QJsonObject{{"label", controlLabel(candidate)},
+                                  {"items", items},
+                                  {"current", candidate->currentText()},
+                                  {"enabled", candidate->isEnabled()}});
+    }
+    result["labels"] = labels;
+    result["buttons"] = buttons;
+    result["combos"] = combos;
     return result;
 }
 

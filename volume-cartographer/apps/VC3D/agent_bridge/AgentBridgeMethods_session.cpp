@@ -152,6 +152,25 @@ void AgentBridgeServer::registerSessionHandlers()
 
     registerMethod(
         {
+            .name = QStringLiteral("ui.menus"),
+        },
+        [this](const QJsonValue& p) { return handleUiMenus(p); });
+
+    registerMethod(
+        {
+            .name = QStringLiteral("ui.dock"),
+            .params = {
+                Params::requiredString(QStringLiteral("title")),
+                Params::optionalBoolean(QStringLiteral("show")),
+                Params::optionalString(QStringLiteral("combo")),
+                Params::optionalString(QStringLiteral("item")),
+            },
+            .errors = {-32602, -32007},
+        },
+        [this](const QJsonValue& p) { return handleUiDock(p); });
+
+    registerMethod(
+        {
             .name = QStringLiteral("project.create"),
             .params = {
                 Params::requiredString(QStringLiteral("path")),
