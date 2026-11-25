@@ -84,8 +84,18 @@
     controller.syncAnnotationInputsWithProject();
     require(controller._fiberMetricsGeneration == generation, "unchanged inputs invalidate nothing");
     state.vpkg()->setSelectedFiberInferenceDataset(lasagnaManifest.string());
+    // Not while a solve runs: its result would land on the invalidated session.
+    auto running = std::make_shared<Controller::LineAnnotationSession>();
+    running->taskState = Controller::LineAnnotationSession::TaskState::Running;
+    controller._panes.push_back({1, Controller::SourceKind::Plane, "running", nullptr, running});
     controller.syncAnnotationInputsWithProject();
-    require(controller._fiberMetricsGeneration == generation + 1, "a changed fiber dataset or normal source invalidates");
+    require(controller._fiberMetricsGeneration == generation && controller._annotationInputsSyncDeferred,
+            "a change during a solve waits for it");
+    running->taskState = Controller::LineAnnotationSession::TaskState::Idle;
+    controller.syncAnnotationInputsWithProject();
+    controller._panes.clear();
+    require(controller._fiberMetricsGeneration == generation + 1 && !controller._annotationInputsSyncDeferred,
+            "a changed fiber dataset or normal source invalidates once no solve runs");
     std::cout << "annotation_inputs PASS: explicit picks persist, external changes invalidate" << std::endl;
     state.closeProject();
 }

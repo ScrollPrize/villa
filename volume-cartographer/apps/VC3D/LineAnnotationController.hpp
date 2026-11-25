@@ -495,7 +495,8 @@ public:
     // failed, and the workspace is left intact for the user to resolve.
     // After the project's datasets change outside the annotation menus (an
     // attachment): invalidates open sessions when the fiber dataset or the
-    // normal source in effect changed, as a menu selection would.
+    // normal source in effect changed, as a menu selection would. While a
+    // solve runs this waits until none does, as the menus refuse changes then.
     void syncAnnotationInputsWithProject();
     [[nodiscard]] bool prepareForPackageSwitch();
 
@@ -1110,6 +1111,8 @@ private:
         bool operator==(const AnnotationInputs&) const = default;
     };
     std::optional<AnnotationInputs> _annotationInputs;
+    // Inputs changed while a solve ran; applied once no solve is running.
+    bool _annotationInputsSyncDeferred = false;
     [[nodiscard]] AnnotationInputs currentAnnotationInputs() const;
     bool needsFinalOptimization(const LineAnnotationSession& session) const;
     // stillValid (optional): forwarded to the backend helpers and checked

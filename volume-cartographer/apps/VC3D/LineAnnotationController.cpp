@@ -8748,6 +8748,16 @@ void LineAnnotationController::syncAnnotationInputsWithProject()
     }
     const auto previous = *_annotationInputs;
     if (previous == current) {
+        _annotationInputsSyncDeferred = false;
+        refreshLineAnnotationDatasetMenus();
+        return;
+    }
+    // A running solve would land a result computed from the previous inputs
+    // after the invalidation; apply the change once it has landed.
+    _annotationInputsSyncDeferred = std::any_of(_panes.begin(), _panes.end(), [](const auto& pane) {
+        return pane.session && pane.session->taskState == LineAnnotationSession::TaskState::Running;
+    });
+    if (_annotationInputsSyncDeferred) {
         refreshLineAnnotationDatasetMenus();
         return;
     }
@@ -11232,6 +11242,11 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
     if (join) joinPublication();
     // Tag edits queued behind this solve apply after its landing.
     const auto editsAfter = qScopeGuard([this] { scheduleDeferredControlEdits(); });
+    // So do project input changes made while it ran.
+    const auto inputsAfter = qScopeGuard([this] {
+        if (_annotationInputsSyncDeferred)
+            QTimer::singleShot(0, this, [this] { syncAnnotationInputsWithProject(); });
+    });
     const HostedStatusScope statusScope(*this);
     auto* pane = paneForSurface(surfaceName);
     if (!pane || !pane->session || !pane->session->watcher) {
