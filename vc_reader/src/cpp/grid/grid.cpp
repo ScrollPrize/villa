@@ -390,6 +390,8 @@ Result sampleTiles(int width, int height, const Request& request, const TilePoin
     result.layers = int(layers);
     result.values.assign(request.composite ? pixels : pixels * layers, kNaN);
     result.level.assign(pixels, Result::kNone);
+    if (request.reportInside)
+        result.inside.assign(pixels, 0);
     if (request.cachedOnly)
         result.missingChunks.resize(request.levels.size());
     std::mutex missesMutex;
@@ -422,7 +424,7 @@ Result sampleTiles(int width, int height, const Request& request, const TilePoin
                 if (request.composite)
                     reduce.emplace(*request.composite);
                 std::int8_t level = Result::kNone;
-                bool missing = false;
+                bool missing = false, inside = true;
                 for (std::size_t k = 0; k < layers && !(reduce && reduce->done); ++k) {
                     const float off = request.offsets[k];
                     const float at[3]{p[0] + (off != 0 ? n[0] * off : 0.0f), p[1] + (off != 0 ? n[1] * off : 0.0f),
@@ -434,8 +436,11 @@ Result sampleTiles(int width, int height, const Request& request, const TilePoin
                     for (; li < lookups.size(); ++li) {
                         float c[3];
                         levelIndex<General>(maps[li], at[0], at[1], at[2], c);
-                        if (sampling::point(lookups[li], maps[li].base, c, request.order, value))
+                        if (sampling::point(lookups[li], maps[li].base, c, request.order, value)) {
+                            if (request.reportInside)
+                                inside = inside && sampling::pointInside(lookups[li].shape, maps[li].base, c, request.order);
                             break;
+                        }
                     }
                     if (li == lookups.size()) {
                         missing = true;
@@ -450,6 +455,8 @@ Result sampleTiles(int width, int height, const Request& request, const TilePoin
                 if (reduce)
                     result.values[q] = reduce->result();
                 result.level[q] = missing ? Result::kMissing : level;
+                if (request.reportInside)
+                    result.inside[q] = !missing && level != Result::kNone && inside ? 1 : 0;
             }
         if (request.cachedOnly) {
             std::lock_guard lock(missesMutex);
@@ -689,6 +696,8 @@ Result sampleDevice(int width, int height, const Request& request, const std::ve
     result.layers = int(layers);
     result.values.resize(request.composite ? pixels : pixels * layers);
     result.level.resize(pixels);
+    if (request.reportInside)
+        result.inside.resize(pixels);
     if (!pixels)
         return result;
 
@@ -696,6 +705,7 @@ Result sampleDevice(int width, int height, const Request& request, const std::ve
     const auto mask = request.pixels ? upload(request.pixels, pixels, deviceId) : device::Storage{};
     const auto values = device::allocate(result.values.size() * sizeof(float), deviceId);
     const auto levels = device::allocate(pixels, deviceId);
+    const auto inside = request.reportInside ? device::allocate(pixels, deviceId) : device::Storage{};
     std::vector<cuda_detail::DeviceLevel> host(readers.size());
     for (std::size_t li = 0; li < readers.size(); ++li)
         host[li].map = levelMap(request.levels[li].scale, request.levels[li].offset,
@@ -745,6 +755,7 @@ Result sampleDevice(int width, int height, const Request& request, const std::ve
             P.levelCount = int(readers.size());
             P.values = static_cast<float*>(values->ptr);
             P.level = static_cast<std::int8_t*>(levels->ptr);
+            P.inside = inside ? static_cast<std::uint8_t*>(inside->ptr) : nullptr;
             P.lacking = lackingSet;
             cuda_detail::launch(P);
         });
@@ -775,6 +786,8 @@ Result sampleDevice(int width, int height, const Request& request, const std::ve
     device::check(cudaMemcpyAsync(result.values.data(), values->ptr, result.values.size() * sizeof(float),
                                   cudaMemcpyDeviceToHost, device::stream()));
     device::check(cudaMemcpyAsync(result.level.data(), levels->ptr, pixels, cudaMemcpyDeviceToHost, device::stream()));
+    if (inside)
+        device::check(cudaMemcpyAsync(result.inside.data(), inside->ptr, pixels, cudaMemcpyDeviceToHost, device::stream()));
     device::complete();
     return result;
 }

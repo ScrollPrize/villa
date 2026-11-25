@@ -65,9 +65,10 @@ public:
     struct MeasurementFrame {
         std::uint64_t serial = 0;
         cv::Mat_<std::uint8_t> values;    // base-volume samples, 8-bit, before the display window
-        // Nonzero where the frame measured the volume: sampled, inside the volume (not
-        // the reader's fill beyond its edges) and from this frame's own geometry (not a
-        // pixel carried over from an earlier surface while chunks load).
+        // Nonzero where the frame measured the volume: the value read only voxels inside
+        // the volume at the level and sampling it came from (never the reader's fill
+        // beyond the edges; in-volume zeros count), and was not carried over from an
+        // earlier surface while chunks load, however many frames carried it.
         cv::Mat_<std::uint8_t> coverage;
         double windowLow = 0.0;
         double windowHigh = 255.0;
@@ -79,7 +80,9 @@ public:
         // other slab composite), e.g. "max of 9 slices". Such a value has no single
         // position, so the profile and loupe do not report one.
         QString composite;
-        // False while some of the frame's chunks are still loading.
+        // False when the frame lacked chunks when it was rendered: its values (and the
+        // peaks) are provisional until the next frame. A complete frame can still miss
+        // samples outside the volume or across a surface hole.
         bool complete = true;
         // False when the frame has positions but no measurement mask yet (it was
         // rendered before an overlay that reads samples was turned on): only the grid
@@ -193,6 +196,16 @@ private:
     vc3d::hud::PanelLayout panelLayout() const;
     QRectF scaleBarRect() const;
     void cancelProfileGesture();
+    // The profile gesture's own events (its Escape press, repeats and release; an armed
+    // left press and the rest of its drag) go to this view ahead of every event filter
+    // on it or its viewport, such as a workspace tool's, which never sees them.
+    friend class ProfileGestureFilter;
+    bool takeProfileGestureEvent(QObject* watched, QEvent* event);
+    bool profileGestureActive() const
+    {
+        return _profileArmed || _profileDragging || _profileDragCancelled || _profileOwnsEscape;
+    }
+    QObject* _gestureFilter = nullptr;  // on the application while profileGestureActive()
     bool pointInSceneWidget(const QPointF& viewportPos) const;
 
     // µm (or voxels, when !m_physicalUnits) per scene-unit (pixel)

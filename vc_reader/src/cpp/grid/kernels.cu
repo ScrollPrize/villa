@@ -83,6 +83,8 @@ __global__ void samplePixels(Params P)
         for (unsigned k = 0; k < P.layers; ++k)
             P.values[std::size_t(k) * pixels + q] = nanf("");
     P.level[q] = kNone;
+    if (P.inside)
+        P.inside[q] = 0;
     if (P.pixels && !P.pixels[q])
         return;
     const int i = int(q % std::size_t(P.width)), j = int(q / std::size_t(P.width));
@@ -103,7 +105,7 @@ __global__ void samplePixels(Params P)
     }
     composite::detail::Reducer reducer(P.composite);
     std::int8_t level = kNone;
-    bool missing = false;
+    bool missing = false, inside = true;
     for (unsigned k = 0; k < P.layers && !(P.reduce && reducer.done); ++k) {
         const float off = P.offsets[k];
         const float at[3]{p[0] + (off != 0 ? n[0] * off : 0.0f), p[1] + (off != 0 ? n[1] * off : 0.0f),
@@ -116,8 +118,11 @@ __global__ void samplePixels(Params P)
             BrickLookup lookup(P.levels[li].source, li == 0 && P.lacking.table ? &P.lacking : nullptr);
             float c[3];
             levelIndex(P.levels[li].map, at[0], at[1], at[2], c);
-            if (sampling::point(lookup, P.levels[li].map.base, c, P.order, value))
+            if (sampling::point(lookup, P.levels[li].map.base, c, P.order, value)) {
+                if (P.inside)
+                    inside = inside && sampling::pointInside(lookup.shape, P.levels[li].map.base, c, P.order);
                 break;
+            }
         }
         if (li == P.levelCount) {
             missing = true;
@@ -132,6 +137,8 @@ __global__ void samplePixels(Params P)
     if (P.reduce)
         P.values[q] = reducer.result();
     P.level[q] = missing ? kMissing : level;
+    if (P.inside)
+        P.inside[q] = !missing && level != kNone && inside ? 1 : 0;
 }
 
 }  // namespace

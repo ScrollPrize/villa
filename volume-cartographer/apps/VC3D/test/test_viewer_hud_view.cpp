@@ -82,6 +82,39 @@ void sendMove(QWidget* w, QPointF at, Qt::MouseButtons buttons)
 
 }  // namespace
 
+// A workspace tool's filter on the view and its viewport, installed like Spiral point
+// placement's or the line annotation dialog's: it takes Escape and records left-button
+// mouse events.
+class ToolFilter : public QObject
+{
+public:
+    int escapes = 0;
+    int leftMouse = 0;
+    bool eventFilter(QObject*, QEvent* event) override
+    {
+        switch (event->type()) {
+        case QEvent::ShortcutOverride:
+        case QEvent::KeyPress:
+        case QEvent::KeyRelease:
+            if (static_cast<QKeyEvent*>(event)->key() == Qt::Key_Escape) {
+                ++escapes;  // ends the tool's gesture
+                return true;
+            }
+            return false;
+        case QEvent::MouseButtonPress:
+        case QEvent::MouseButtonRelease:
+        case QEvent::MouseMove: {
+            auto* mouse = static_cast<QMouseEvent*>(event);
+            if (mouse->button() == Qt::LeftButton || (mouse->buttons() & Qt::LeftButton))
+                ++leftMouse;
+            return false;
+        }
+        default:
+            return false;
+        }
+    }
+};
+
 class TestViewerHudView : public QObject
 {
     Q_OBJECT
@@ -216,6 +249,47 @@ private slots:
         QCOMPARE(click.count(), 1);
         QTest::keyClick(_view.get(), Qt::Key_Escape);
         QCOMPARE(keys.count(), 1);
+    }
+
+    void workspaceToolFiltersNeverSeeTheProfileGesture()
+    {
+        QSignalSpy cancelled(_view.get(), &CVolumeViewerView::profileLineCancelled);
+        _view->armProfileLine(true);
+        // Installed after arming, so the tool's filters come first on the view itself.
+        ToolFilter tool;
+        _view->installEventFilter(&tool);
+        vp()->installEventFilter(&tool);
+        // Armed: Escape, a repeat and the release disarm the profile alone.
+        QKeyEvent esc(QEvent::KeyPress, Qt::Key_Escape, Qt::NoModifier);
+        QApplication::sendEvent(_view.get(), &esc);
+        QKeyEvent repeatDown(QEvent::KeyPress, Qt::Key_Escape, Qt::NoModifier, QString(), true);
+        QApplication::sendEvent(_view.get(), &repeatDown);
+        QKeyEvent up(QEvent::KeyRelease, Qt::Key_Escape, Qt::NoModifier);
+        QApplication::sendEvent(_view.get(), &up);
+        QCOMPARE(cancelled.count(), 1);
+        QVERIFY(!_view->profileLineArmed());
+        QCOMPARE(tool.escapes, 0);
+        // Drawing: the press, the drag, Escape and the rest of the drag stay with the profile.
+        _view->armProfileLine(true);
+        QTest::mousePress(vp(), Qt::LeftButton, Qt::NoModifier, QPoint(50, 60));
+        sendMove(vp(), QPointF(120, 60), Qt::LeftButton);
+        QKeyEvent esc2(QEvent::KeyPress, Qt::Key_Escape, Qt::NoModifier);
+        QApplication::sendEvent(_view.get(), &esc2);
+        QKeyEvent up2(QEvent::KeyRelease, Qt::Key_Escape, Qt::NoModifier);
+        QApplication::sendEvent(_view.get(), &up2);
+        sendMove(vp(), QPointF(160, 60), Qt::LeftButton);
+        QTest::mouseRelease(vp(), Qt::LeftButton, Qt::NoModifier, QPoint(160, 60));
+        QCOMPARE(cancelled.count(), 2);
+        QVERIFY(!_view->profileLine());
+        QCOMPARE(tool.escapes, 0);
+        QCOMPARE(tool.leftMouse, 0);
+        // Afterwards the tool has Escape and its clicks again.
+        QTest::keyClick(_view.get(), Qt::Key_Escape);
+        QVERIFY(tool.escapes > 0);
+        QTest::mouseClick(vp(), Qt::LeftButton, Qt::NoModifier, QPoint(70, 70));
+        QVERIFY(tool.leftMouse > 0);
+        _view->removeEventFilter(&tool);
+        vp()->removeEventFilter(&tool);
     }
 
     void escapeWhileArmedStaysWithTheProfile()

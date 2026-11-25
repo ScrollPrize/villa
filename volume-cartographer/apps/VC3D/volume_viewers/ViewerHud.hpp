@@ -79,23 +79,6 @@ inline bool validPosition(const std::array<double, 3>& p)
            !(p[0] == -1.0 && p[1] == -1.0 && p[2] == -1.0);
 }
 
-// Whether every voxel a sample at `p` reads lies inside a volume of `sizeXyz` voxels
-// (level-0 XYZ). Beyond that the reader returns its fill value, which is padding rather
-// than scan, even though it is a finite number. A zero inside the volume still counts.
-inline bool insideVolume(const std::array<double, 3>& p, const std::array<double, 3>& sizeXyz)
-{
-    if (!validPosition(p)) {
-        return false;
-    }
-    for (int a = 0; a < 3; ++a) {
-        const double v = p[static_cast<std::size_t>(a)];
-        if (!(v >= 0.0 && v <= sizeXyz[static_cast<std::size_t>(a)] - 1.0)) {
-            return false;
-        }
-    }
-    return true;
-}
-
 // The gray the display window gives each 8-bit sample (0 black, 255 white), as the
 // renderer's lookup table maps it. The viewer fills it from that table.
 using DisplayMap = std::array<std::uint8_t, 256>;
@@ -512,6 +495,34 @@ inline PanelLayout layoutPanels(QSizeF pane, std::optional<QSizeF> profile, std:
         return layoutPanels(pane, profile, std::nullopt, reserved, margin, gap, minScale);
     }
     return {};
+}
+
+// ---- frames carried forward ----------------------------------------------------------
+
+// A frame that still lacks chunks shows the previous frame's pixel wherever it has none
+// of its own and the pixel is waiting on a read (missing[q] == missingCode), so loading
+// regions do not flash blank. Measurement validity travels with the pixel: `prevMeasure`
+// is the earlier frame's mask when that frame had the same geometry and one (null
+// otherwise: after an edit, or rendered with the overlays off), and a carried pixel
+// keeps its mark from it, or 0. So a pixel carried across an edit stays unmeasured
+// however many frames carry it on. `measure` is null when this frame has no mask.
+// All buffers hold n pixels, row-major.
+inline void carryMissingPixels(std::size_t n, std::uint8_t* values, std::uint8_t* coverage, std::uint8_t* measure,
+                               const std::uint8_t* prevValues, const std::uint8_t* prevCoverage,
+                               const std::uint8_t* prevMeasure, const std::vector<std::int8_t>& missing,
+                               std::int8_t missingCode)
+{
+    const std::size_t count = std::min(n, missing.size());
+    for (std::size_t q = 0; q < count; ++q) {
+        if (coverage[q] || !prevCoverage[q] || missing[q] != missingCode) {
+            continue;
+        }
+        values[q] = prevValues[q];
+        coverage[q] = 1;
+        if (measure) {
+            measure[q] = prevMeasure ? prevMeasure[q] : 0;
+        }
+    }
 }
 
 }  // namespace vc3d::hud

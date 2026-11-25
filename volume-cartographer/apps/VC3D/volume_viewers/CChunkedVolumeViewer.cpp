@@ -1341,12 +1341,19 @@ struct CChunkedVolumeViewer::RenderResult {
     cv::Mat_<cv::Vec3b> colorValues;
     cv::Mat_<uint8_t> overlayValues;
     cv::Mat_<uint8_t> overlayCoverage;
-    // Set when the job asked for measurement: nonzero where `values` holds a sample
-    // taken inside the volume (not the reader's fill beyond its edges) with this
-    // frame's geometry (not a pixel carried over from an earlier surface).
+    // Set when the job asked for measurement: nonzero where `values` holds a value
+    // that read only voxels inside the volume at the level and sampling it came from
+    // (vcr::grid::Result::inside, so no fill from beyond the edges), sampled for this
+    // view and geometry. A pixel carried from an earlier frame keeps that frame's
+    // mark when the geometry is the same, and is 0 otherwise or when that frame had
+    // no mask (rendered with the overlays off).
     cv::Mat_<uint8_t> measureMask;
-    // What this frame could not sample from the caches.
+    // What this frame could not sample from the caches. Publishing the frame moves
+    // it to the viewer's load queue, so read `complete` for whether it had any.
     vc3d::ViewerLoad load;
+    // Whether every pixel came from its target level with nothing left to read, set
+    // when the frame is rendered: the values (and peaks) are final, not provisional.
+    bool complete = false;
     double renderFrameElapsedMs = 0.0;
     std::chrono::steady_clock::time_point submittedAt;
     std::chrono::steady_clock::time_point workerStartedAt;
@@ -1414,6 +1421,7 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
     cv::Mat_<cv::Vec3b> colorValues;
     cv::Mat_<uint8_t> overlayValues;
     cv::Mat_<uint8_t> overlayCoverage;
+    cv::Mat_<uint8_t> measureMask;  // see RenderResult::measureMask
     std::vector<std::int8_t> missingBase, missingOverlay;
     cv::Mat_<uint8_t> focusBoundsInside;
     if (ctx.renderJob.focusBoundsBase) {
@@ -1559,10 +1567,25 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
             base.offsets = layerOffsets(front, behind, zStep);
             base.composite = (cs.params.volumetric ? std::nullopt : std::optional(cs.params.options));
         }
+        // The measurement overlays count only values the reader took from inside the
+        // volume, judged by the sampler itself at each pixel's level and order (slab
+        // layers included), so padding never counts and in-volume zeros always do.
+        base.reportInside = ctx.renderJob.measure;
         const auto sampled = vc3d::sampleCached(ctx.levels, geometry, base, &result.load);
         missingBase = sampled.level;
         if (!sampled.values.empty())
             vcr::display::toUint8(sampled.values.data(), std::size_t(sampled.width) * sampled.height, values.ptr(), coverage.ptr());
+        if (ctx.renderJob.measure) {
+            measureMask = cv::Mat_<uint8_t>(ctx.fbH, ctx.fbW, uint8_t(0));
+            if (sampled.inside.size() == measureMask.total())
+                for (int y = 0; y < ctx.fbH; ++y) {
+                    auto* m = measureMask.ptr<uint8_t>(y);
+                    const auto* c = coverage.ptr<uint8_t>(y);
+                    const auto* in = sampled.inside.data() + std::size_t(y) * ctx.fbW;
+                    for (int x = 0; x < ctx.fbW; ++x)
+                        m[x] = c[x] && in[x] ? 1 : 0;
+                }
+        }
     }
     if (overlayActive) {
         overlayValues = cv::Mat_<uint8_t>(ctx.fbH, ctx.fbW, uint8_t(0));
@@ -1609,8 +1632,6 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
         }
     }
 
-    cv::Mat_<uint8_t> carriedFromOtherGeometry;
-    cv::Mat_<uint8_t> measureMask;
     // Carry forward the previous frame's pixels where this frame has no
     // data yet (still loading). Re-renders arrive as volume data loads, and
     // presenting a from-scratch frame that lacks a chunk flashes the region
@@ -1626,27 +1647,18 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
                                const cv::Mat_<uint8_t>& prevDst,
                                const cv::Mat_<uint8_t>& prevCov,
                                const std::vector<std::int8_t>& missing,
-                               cv::Mat_<uint8_t>* carried) {
+                               cv::Mat_<uint8_t>* measure, const cv::Mat_<uint8_t>* prevMeasure) {
             if (dst.empty() || prevDst.empty() ||
-                dst.size() != prevDst.size() || cov.size() != prevCov.size())
+                dst.size() != prevDst.size() || cov.size() != prevCov.size() ||
+                !dst.isContinuous() || !cov.isContinuous() || !prevDst.isContinuous() || !prevCov.isContinuous())
                 return;
-            for (int y = 0; y < dst.rows; ++y) {
-                uint8_t* dstRow = dst.ptr<uint8_t>(y);
-                uint8_t* covRow = cov.ptr<uint8_t>(y);
-                const uint8_t* prevDstRow = prevDst.ptr<uint8_t>(y);
-                const uint8_t* prevCovRow = prevCov.ptr<uint8_t>(y);
-                for (int x = 0; x < dst.cols; ++x) {
-                    const auto q = std::size_t(y) * dst.cols + x;
-                    if (!covRow[x] && prevCovRow[x] && q < missing.size() &&
-                        missing[q] == vcr::grid::Result::kMissing) {
-                        dstRow[x] = prevDstRow[x];
-                        covRow[x] = 1;
-                        if (carried) {
-                            (*carried)(y, x) = 1;
-                        }
-                    }
-                }
-            }
+            const bool measured = measure && measure->size() == dst.size() && measure->isContinuous();
+            const bool prevMeasured = measured && prevMeasure && prevMeasure->size() == dst.size() &&
+                                      prevMeasure->isContinuous();
+            vc3d::hud::carryMissingPixels(dst.total(), dst.ptr<uint8_t>(), cov.ptr<uint8_t>(),
+                                          measured ? measure->ptr<uint8_t>() : nullptr, prevDst.ptr<uint8_t>(),
+                                          prevCov.ptr<uint8_t>(), prevMeasured ? prevMeasure->ptr<uint8_t>() : nullptr,
+                                          missing, vcr::grid::Result::kMissing);
         };
         auto fillFromPrevColor = [](cv::Mat_<cv::Vec3b>& dst, cv::Mat_<uint8_t>& cov,
                                     const cv::Mat_<cv::Vec3b>& prevDst,
@@ -1674,58 +1686,15 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
         else {
             // Pixels carried from a frame of other geometry (an edit) show where the
             // surface was, not where it is: they stay on screen but are not measured.
-            if (!sameGeometry && ctx.renderJob.measure)
-                carriedFromOtherGeometry = cv::Mat_<uint8_t>(values.rows, values.cols, uint8_t(0));
+            const bool prevMeasured = sameGeometry && prev->measureMask.size() == measureMask.size();
             fillFromPrev(values, coverage, prev->values, prev->coverage, missingBase,
-                         carriedFromOtherGeometry.empty() ? nullptr : &carriedFromOtherGeometry);
+                         measureMask.empty() ? nullptr : &measureMask,
+                         prevMeasured ? &prev->measureMask : nullptr);
         }
         fillFromPrev(overlayValues, overlayCoverage,
-                     prev->overlayValues, prev->overlayCoverage, missingOverlay, nullptr);
+                     prev->overlayValues, prev->overlayCoverage, missingOverlay, nullptr, nullptr);
     }
-    if (ctx.renderJob.measure && colorValues.empty()) {
-        // The measurement overlays' mask, built here on the render worker so the UI
-        // thread never walks the frame's geometry. The reader returns a finite fill
-        // value beyond the volume's edges, so coverage alone counts that padding as
-        // scan; a pixel counts only when its position lies inside the volume.
-        measureMask = coverage.clone();
-        const std::array<double, 3> size{ctx.renderJob.volumeSizeXyz[0], ctx.renderJob.volumeSizeXyz[1],
-                                         ctx.renderJob.volumeSizeXyz[2]};
-        if (geometry.plane) {
-            const auto& pl = *geometry.plane;
-            for (int y = 0; y < ctx.fbH; ++y) {
-                auto* m = measureMask.ptr<uint8_t>(y);
-                for (int x = 0; x < ctx.fbW; ++x) {
-                    if (!m[x])
-                        continue;
-                    std::array<double, 3> p{};
-                    for (int a = 0; a < 3; ++a)
-                        p[std::size_t(a)] = pl.origin[a] + pl.dy[a] * float(y) + pl.dx[a] * float(x);
-                    m[x] = vc3d::hud::insideVolume(p, size) ? 1 : 0;
-                }
-            }
-        } else if (geometry.surface) {
-            const std::size_t n = std::size_t(ctx.fbW) * std::size_t(ctx.fbH);
-            std::vector<float> xyz(n * 3), normals;
-            if (zBase != 0.0f)
-                normals.resize(n * 3);
-            geometry.surface->resample(geometry.raster, xyz.data(), normals.empty() ? nullptr : normals.data());
-            for (int y = 0; y < ctx.fbH; ++y) {
-                auto* m = measureMask.ptr<uint8_t>(y);
-                for (int x = 0; x < ctx.fbW; ++x) {
-                    if (!m[x])
-                        continue;
-                    const std::size_t q = (std::size_t(y) * ctx.fbW + x) * 3;
-                    std::array<double, 3> p{xyz[q], xyz[q + 1], xyz[q + 2]};
-                    if (!normals.empty())
-                        for (int a = 0; a < 3; ++a)
-                            p[std::size_t(a)] += double(zBase) * normals[q + std::size_t(a)];
-                    m[x] = vc3d::hud::insideVolume(p, size) ? 1 : 0;
-                }
-            }
-        }
-        if (!carriedFromOtherGeometry.empty())
-            measureMask.setTo(0, carriedFromOtherGeometry);
-    }
+    result.complete = result.load.empty();
     result.values = values;
     result.coverage = coverage;
     result.colorValues = colorValues;
@@ -1829,10 +1798,6 @@ std::optional<CChunkedVolumeViewer::PendingRenderJob> CChunkedVolumeViewer::capt
         const auto& hud = _view->hudOptions();
         job.measure = hud.histogram || hud.lineProfile || hud.loupe;
     }
-    if (job.measure) {
-        const auto [w, h, d] = _volume->shapeXyz();
-        job.volumeSizeXyz = {float(w), float(h), float(d)};
-    }
     // Focus bounds are in volume base coordinates for every view, including
     // segment QuadSurfaces. Mask the generated coordinates, not UVs;
     // the underlying surface and its cached tiles remain unchanged.
@@ -1902,7 +1867,7 @@ bool CChunkedVolumeViewer::renderJobsEquivalentForDisplay(const PendingRenderJob
     return renderJobsSameGeometry(a, b) &&
            a.loadedDataEpoch == b.loadedDataEpoch &&
            a.geometryDirty == b.geometryDirty &&
-           a.measure == b.measure && a.volumeSizeXyz == b.volumeSizeXyz &&
+           a.measure == b.measure &&
            boundsEqual(a.focusBoundsBase, b.focusBoundsBase);
 }
 
@@ -2036,7 +2001,7 @@ CVolumeViewerView::FrameResult CChunkedVolumeViewer::measurementFrame() const
             frame.displayed[i] = static_cast<std::uint8_t>(lut[i] & 0xFFu);
     }
     frame.overlayBlended = !result.overlayValues.empty() && job.overlayOpacity > 0.0f;
-    frame.complete = result.load.empty();
+    frame.complete = result.complete;
     if (baseComposite) {
         const int front = std::max(0, planeView ? cs.planeLayersFront : cs.layersFront);
         const int behind = std::max(0, planeView ? cs.planeLayersBehind : cs.layersBehind);

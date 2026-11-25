@@ -399,6 +399,63 @@ int main()
                 a0->sample_linear(at, 1, u8, false, &expected);
                 require(near(r.values[std::size_t(j * 6 + i)], expected, 1e-3f), "linear matches Array::sample_linear");
             }
+        // reportInside: whether a pixel's value read only voxels inside its level's
+        // volume, under the request's order, so the fill beyond the edges never passes
+        // for data while values inside (zeros included) always do.
+        {
+            vcr::grid::Request inside;
+            inside.levels = {L0};
+            inside.reportInside = true;
+            inside.order = 0;
+            r = vcr::grid::sample(edge, inside);  // x 14..17 on the last voxels
+            require(r.inside.size() == 4 && r.inside[0] == 1 && r.inside[1] == 1 && r.inside[2] == 0 && r.inside[3] == 0,
+                    "nearest: inside up to the last voxel");
+            inside.order = 1;
+            r = vcr::grid::sample(between, inside);  // x 14.5, 15, 15.5, ...: linear reads x and x + 1
+            require(r.inside[0] == 1 && r.inside[1] == 1 && r.inside[2] == 0 && r.inside[6] == 1,
+                    "linear: inside while both neighbours are");
+            // In-volume zeros count: value(0, 0, 0) is 0.
+            vcr::grid::Plane origin{{0, 0, 0}, {1, 0, 0}, {0, 1, 0}, {0, 0, 1}, 1, 1};
+            r = vcr::grid::sample(origin, inside);
+            require(r.values[0] == 0.0f && r.inside[0] == 1, "an in-volume zero is inside");
+            // A coarser level's footprint: level-0 z = 15 is level-1 index 7.25 of 8.
+            // Linear reads index 8, beyond that level's edge, though z = 15 is inside the
+            // level-0 volume; nearest reads index 7, inside.
+            vcr::grid::Plane last{{4, 4, 15}, {1, 0, 0}, {0, 1, 0}, {0, 0, 1}, 3, 3};
+            inside.levels = {L1};
+            r = vcr::grid::sample(last, inside);
+            for (std::size_t q = 0; q < 9; ++q)
+                require(r.inside[q] == 0, "linear at the coarse level's last slice reads padding");
+            inside.order = 0;
+            r = vcr::grid::sample(last, inside);
+            for (std::size_t q = 0; q < 9; ++q)
+                require(r.inside[q] == 1, "nearest there reads its last voxel");
+            inside.order = 1;
+            last.origin = {4, 4, 14};  // index 6.75: 6 and 7
+            r = vcr::grid::sample(last, inside);
+            require(r.inside[4] == 1, "linear one slice in stays inside");
+            // A slab is inside only when every layer is: a Mean over z = -1, 0, 1 at the
+            // first slice takes in fill, one over z = 0, 1, 2 does not.
+            inside.levels = {L0};
+            inside.order = 0;
+            inside.composite = vcr::composite::Options{vcr::composite::Method::Mean};
+            inside.offsets = {-1.0f, 0.0f, 1.0f};
+            vcr::grid::Plane first{{4, 4, 0}, {1, 0, 0}, {0, 1, 0}, {0, 0, 1}, 1, 1};
+            r = vcr::grid::sample(first, inside);
+            require(r.inside[0] == 0, "a slab reaching outside is not inside");
+            inside.offsets = {0.0f, 1.0f, 2.0f};
+            r = vcr::grid::sample(first, inside);
+            require(r.inside[0] == 1 && near(r.values[0], value(4, 4, 1)), "an inward slab is inside");
+            // Missing pixels are not inside; without the flag nothing is reported.
+            auto none = open(fine, 16);
+            vcr::grid::Request missing;
+            missing.levels = {{none.get(), u8, L0.scale, L0.offset}};
+            missing.cachedOnly = true;
+            missing.reportInside = true;
+            r = vcr::grid::sample(origin, missing);
+            require(r.level[0] == vcr::grid::Result::kMissing && r.inside[0] == 0, "a missing pixel is not inside");
+            require(vcr::grid::sample(origin, request).inside.empty(), "inside only when asked");
+        }
         // A general level map (as from a rotated registration):
         // index (z, y, x) = (p.x + 0.25, 0.5 p.y + 0.5 p.z + 1, p.z - 0.5).
         {

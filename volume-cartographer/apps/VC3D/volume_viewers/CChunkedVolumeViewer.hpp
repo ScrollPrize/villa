@@ -372,10 +372,8 @@ private:
         std::uint64_t loadedDataEpoch = 0;
         std::uint64_t surfaceGeometryEpoch = 0;
         // The measurement overlays need this frame's measurement mask (see
-        // RenderResult::measureMask): pixels sampled inside the volume, whose size in
-        // level-0 voxels (XYZ) is volumeSizeXyz, from this frame's own geometry.
+        // RenderResult::measureMask): which values the sampler read from inside the volume.
         bool measure = false;
-        std::array<float, 3> volumeSizeXyz{};
         // Effective launch-time bounds. Null for disabled bounds and for view
         // types outside the supported plane/annotation scope.
         std::optional<Rect3D> focusBoundsBase;

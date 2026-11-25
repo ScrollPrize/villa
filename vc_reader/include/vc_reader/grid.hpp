@@ -166,6 +166,9 @@ struct Request {
     const std::atomic<bool>* cancel = nullptr;
     // Reduce each pixel's layers to one value (layers without a sample are dropped).
     std::optional<composite::Options> composite;
+    // Also fill Result::inside: whether each pixel's value owes nothing to the fill
+    // that stands in for voxels beyond a level's edges (measurements on a view).
+    bool reportInside = false;
 };
 
 struct Result {
@@ -180,6 +183,11 @@ struct Result {
     // layers; kMissing when a layer with a point was in no level (whatever the others
     // got); kNone when no layer had a point.
     std::vector<std::int8_t> level;
+    // With Request::reportInside, per pixel: 1 when the pixel has a value and every
+    // layer sample that went into it read only voxels inside the volume of the level
+    // it came from (sampling::pointInside, under the request's order); 0 otherwise,
+    // including pixels with a missing layer. Empty without reportInside.
+    std::vector<std::uint8_t> inside;
     // What a GPU pass failed with, when the request was sampled on the CPU instead
     // (see sample); empty otherwise.
     std::string cudaFailure;

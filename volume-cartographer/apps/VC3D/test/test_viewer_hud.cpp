@@ -244,18 +244,49 @@ private slots:
         QVERIFY(std::isnan(arc[3]));
     }
 
-    void holesAndPositionsOutsideTheVolumeAreNotPositions()
+    void carriedPixelsStayUnmeasuredAcrossEveryCarry()
+    {
+        // Pixel 0 waits on a read in every frame; pixel 1 is sampled each time.
+        constexpr std::int8_t kWaiting = -1;
+        const std::vector<std::int8_t> waiting{kWaiting, 0};
+        // Frame A, before an edit: both pixels sampled and measured.
+        std::uint8_t aValues[2]{40, 41}, aCoverage[2]{1, 1}, aMeasure[2]{1, 1};
+        // Frame B, after the edit (other geometry): pixel 0 carried, shown, not measured.
+        std::uint8_t bValues[2]{0, 51}, bCoverage[2]{0, 1}, bMeasure[2]{0, 1};
+        carryMissingPixels(2, bValues, bCoverage, bMeasure, aValues, aCoverage, nullptr, waiting, kWaiting);
+        QCOMPARE(int(bValues[0]), 40);
+        QCOMPARE(int(bCoverage[0]), 1);
+        QCOMPARE(int(bMeasure[0]), 0);
+        // Frame C, same geometry as B: carried again, still not measured, though B's
+        // display coverage says 1.
+        std::uint8_t cValues[2]{0, 61}, cCoverage[2]{0, 1}, cMeasure[2]{0, 1};
+        carryMissingPixels(2, cValues, cCoverage, cMeasure, bValues, bCoverage, bMeasure, waiting, kWaiting);
+        QCOMPARE(int(cValues[0]), 40);
+        QCOMPARE(int(cMeasure[0]), 0);
+        QCOMPARE(int(cMeasure[1]), 1);
+        // A frame with the same geometry whose pixel was measured passes its mark on.
+        std::uint8_t dValues[2]{0, 71}, dCoverage[2]{0, 1}, dMeasure[2]{0, 1};
+        carryMissingPixels(2, dValues, dCoverage, dMeasure, aValues, aCoverage, aMeasure, waiting, kWaiting);
+        QCOMPARE(int(dMeasure[0]), 1);
+        // A frame rendered with the overlays off has no mask: nothing it carries is measured.
+        std::uint8_t eValues[2]{0, 81}, eCoverage[2]{0, 1};
+        carryMissingPixels(2, eValues, eCoverage, nullptr, aValues, aCoverage, aMeasure, waiting, kWaiting);
+        std::uint8_t fValues[2]{0, 91}, fCoverage[2]{0, 1}, fMeasure[2]{0, 1};
+        carryMissingPixels(2, fValues, fCoverage, fMeasure, eValues, eCoverage, nullptr, waiting, kWaiting);
+        QCOMPARE(int(fValues[0]), 40);
+        QCOMPARE(int(fMeasure[0]), 0);
+        // Pixels not waiting on a read are never carried.
+        const std::vector<std::int8_t> settled{0, 0};
+        std::uint8_t gValues[2]{0, 0}, gCoverage[2]{0, 0}, gMeasure[2]{0, 0};
+        carryMissingPixels(2, gValues, gCoverage, gMeasure, aValues, aCoverage, aMeasure, settled, kWaiting);
+        QCOMPARE(int(gCoverage[0]), 0);
+    }
+
+    void aSurfaceHoleIsNotAPosition()
     {
         QVERIFY(validPosition({0.0, 0.0, 0.0}));
         QVERIFY(!validPosition({-1.0, -1.0, -1.0}));  // a flattened surface's hole
         QVERIFY(validPosition({-1.0, 0.0, 0.0}));
-        const std::array<double, 3> size{128.0, 64.0, 32.0};
-        QVERIFY(insideVolume({0.0, 0.0, 0.0}, size));
-        QVERIFY(insideVolume({127.0, 63.0, 31.0}, size));
-        QVERIFY(!insideVolume({-69.3, 10.0, 10.0}, size));
-        QVERIFY(!insideVolume({127.5, 10.0, 10.0}, size));
-        QVERIFY(!insideVolume({10.0, 10.0, 32.0}, size));
-        QVERIFY(!insideVolume({-1.0, -1.0, -1.0}, size));
     }
 
     void cumulativeLengthStopsAtASurfaceHole()

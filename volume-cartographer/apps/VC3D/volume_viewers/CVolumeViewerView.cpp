@@ -474,8 +474,8 @@ void CVolumeViewerView::keyPressEvent(QKeyEvent *event)
             return;
         }
         if (_profileArmed || _profileDragging) {
-            cancelProfileGesture();
             _profileOwnsEscape = true;
+            cancelProfileGesture();
             emit profileLineCancelled();
             event->accept();
             return;
@@ -728,6 +728,92 @@ void CVolumeViewerView::setProfileLine(std::optional<QLineF> line)
     viewport()->update();
 }
 
+// Application-wide, so it sees the profile gesture's events before the filters other
+// tools install on the view or its viewport (Spiral point placement, the line
+// annotation dialog). It removes itself at the first key or mouse event that finds no
+// gesture active; other events (a cursor change while a gesture ends) never decide it.
+class ProfileGestureFilter : public QObject {
+public:
+    explicit ProfileGestureFilter(CVolumeViewerView* view) : QObject(view), _view(view) {}
+    bool eventFilter(QObject* watched, QEvent* event) override
+    {
+        switch (event->type()) {
+        case QEvent::ShortcutOverride:
+        case QEvent::KeyPress:
+        case QEvent::KeyRelease:
+        case QEvent::MouseButtonPress:
+        case QEvent::MouseButtonDblClick:
+        case QEvent::MouseMove:
+        case QEvent::MouseButtonRelease:
+            break;
+        default:
+            return false;
+        }
+        if (!_view->profileGestureActive()) {
+            QCoreApplication::instance()->removeEventFilter(this);
+            return false;
+        }
+        return _view->takeProfileGestureEvent(watched, event);
+    }
+
+private:
+    CVolumeViewerView* _view;
+};
+
+bool CVolumeViewerView::takeProfileGestureEvent(QObject* watched, QEvent* event)
+{
+    if (!event || !watched || !watched->isWidgetType())
+        return false;
+    auto* widget = static_cast<QWidget*>(watched);
+    switch (event->type()) {
+    case QEvent::ShortcutOverride:
+    case QEvent::KeyPress:
+    case QEvent::KeyRelease: {
+        auto* key = static_cast<QKeyEvent*>(event);
+        if (key->key() != Qt::Key_Escape || (widget != this && !isAncestorOf(widget)))
+            return false;
+        const bool repeatOwned = _profileOwnsEscape && key->isAutoRepeat();
+        if (event->type() == QEvent::KeyRelease) {
+            if (!_profileOwnsEscape)
+                return false;
+            keyReleaseEvent(key);
+            return true;
+        }
+        if (!(repeatOwned || _profileArmed || _profileDragging))
+            return false;
+        if (event->type() == QEvent::ShortcutOverride) {
+            event->accept();  // no Escape shortcut fires; the press comes here instead
+            return true;
+        }
+        keyPressEvent(key);
+        return true;
+    }
+    case QEvent::MouseButtonPress:
+    case QEvent::MouseMove:
+    case QEvent::MouseButtonRelease: {
+        if (widget != viewport())
+            return false;
+        auto* mouse = static_cast<QMouseEvent*>(event);
+        bool take = false;
+        if (event->type() == QEvent::MouseMove) {
+            take = _profileDragging || (_profileDragCancelled && (mouse->buttons() & Qt::LeftButton));
+        } else if (event->type() == QEvent::MouseButtonRelease) {
+            take = (_profileDragging || _profileDragCancelled) && mouse->button() == Qt::LeftButton;
+        } else {
+            take = _profileDragCancelled ||
+                   (_profileArmed && mouse->button() == Qt::LeftButton &&
+                    !pointInSceneWidget(mouse->position()) && !pointInTiltHandle(mouse->position()));
+        }
+        if (!take)
+            return false;
+        viewportEvent(event);
+        return true;
+    }
+    default:
+        return false;
+    }
+}
+
 void CVolumeViewerView::armProfileLine(bool armed)
 {
     armed = armed && _hud.lineProfile;
@@ -736,6 +822,10 @@ void CVolumeViewerView::armProfileLine(bool armed)
     }
     _profileArmed = armed;
     if (armed) {
+        if (!_gestureFilter)
+            _gestureFilter = new ProfileGestureFilter(this);
+        // Installed again on each arming, so it runs first among application filters.
+        QCoreApplication::instance()->installEventFilter(_gestureFilter);
         setCursor(Qt::CrossCursor);
     } else if (!_tiltHandleDragging && !_regular_pan) {
         unsetCursor();

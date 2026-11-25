@@ -336,8 +336,11 @@ async def vc3d_set_hud(
     composite such as "max of 9 slices", which has no single position per
     value); otherwise "samples", "values" (8-bit samples of one slice before
     the window per pixel of length, null where the frame did not measure the
-    volume: loading gaps, surface holes, outside the volume), "missing"
-    (count of nulls), "complete" (false while chunks are still loading),
+    volume: loading gaps, surface holes, samples reading beyond the volume's
+    edges at their level and sampling), "missing" (count of nulls),
+    "complete" (false while the frame that supplied the values still lacked
+    chunks: values and peaks are provisional; a complete frame can still have
+    missing samples),
     "valueKind" ("sample8"), "peaks" (fractions along the line where a
     bright crossing peaks; intensity peaks, not a count of sheets), "length"
     (along "lengthAlong": "plane" or "surface"; null when part of the line
