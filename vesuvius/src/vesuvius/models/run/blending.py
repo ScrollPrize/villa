@@ -659,11 +659,10 @@ def process_chunk(chunk_info, chunk_patches, epsilon=1e-8, patch_cache=None):
     chunk_logits = np.zeros(chunk_shape, dtype=np.float32)
     chunk_weights = np.zeros(weights_shape, dtype=np.float32)
 
-    # Reused buffer for `logits * weight`. Only used when that product is float32
-    # anyway, so the sums below are the ones the allocating expression gives.
+    # The largest patch overlap is bounded by both the patch and the output chunk.
+    max_overlap = min(pZ, weights_shape[0]) * min(pY, weights_shape[1]) * min(pX, weights_shape[2])
+    scratch_size = num_classes * max_overlap
     scratch = _worker_state.get('scratch')
-    if scratch is None or scratch.shape != (num_classes, pZ, pY, pX):
-        scratch = _worker_state['scratch'] = np.empty((num_classes, pZ, pY, pX), dtype=np.float32)
 
     patches_processed = 0
     patches_skipped_empty = 0
@@ -728,8 +727,10 @@ def process_chunk(chunk_info, chunk_patches, epsilon=1e-8, patch_cache=None):
             ]
 
             if np.result_type(logit_patch.dtype, weight_patch.dtype) == np.float32:
+                if scratch is None or scratch.size < scratch_size:
+                    scratch = _worker_state['scratch'] = np.empty(scratch_size, dtype=np.float32)
                 dz, dy, dx = pz_end - pz_start, py_end - py_start, px_end - px_start
-                weighted_patch = scratch.ravel()[:num_classes * dz * dy * dx].reshape(num_classes, dz, dy, dx)
+                weighted_patch = scratch[:num_classes * dz * dy * dx].reshape(num_classes, dz, dy, dx)
                 np.multiply(logit_patch, weight_patch[np.newaxis, :, :, :], out=weighted_patch)
             else:
                 weighted_patch = logit_patch * weight_patch[np.newaxis, :, :, :]

@@ -229,6 +229,35 @@ def test_batched_blend_is_bit_identical(tmp_path, finalize_config, chunk_size, p
     assert reference_reads > 0
 
 
+def test_scratch_is_bounded_by_output_chunk_with_cache_off(monkeypatch):
+    patch_size = (192, 192, 192)
+    chunk_size = (128, 128, 128)
+    volume = (160, 128, 128)
+    patch = np.broadcast_to(np.float16(2), (2, *patch_size))
+    output = np.empty((2, *volume), dtype=np.float16)
+    state = {
+        'part_files': {},
+        'gaussian_map': np.broadcast_to(np.float32(1), (1, *patch_size)),
+        'patch_size': patch_size,
+        'num_classes': 2,
+        'is_s3': False,
+        'logits_stores': {0: [patch]},
+        'output_store': output,
+        'patch_cache_bytes': 0,
+    }
+    monkeypatch.setattr(blending, '_worker_state', state)
+    full_chunk, edge_chunk = calculate_chunks(volume, chunk_size)
+    patches = {0: [(0, 0, 0, 0)]}
+
+    blending.process_chunk_batch([{'chunk_info': full_chunk, 'chunk_patches': patches}])
+    scratch = state['scratch']
+    assert scratch.nbytes == 16 * 1024 * 1024
+
+    blending.process_chunk_batch([{'chunk_info': edge_chunk, 'chunk_patches': patches}])
+    assert state['scratch'] is scratch
+    assert np.all(output == 2)
+
+
 def test_batch_reads_shared_patches_once(tmp_path):
     parent = str(tmp_path / "parts")
     volume, patch_size = (16, 16, 48), (8, 8, 8)
