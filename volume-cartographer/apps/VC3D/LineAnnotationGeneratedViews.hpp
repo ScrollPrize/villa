@@ -3260,6 +3260,9 @@ struct GeneratedControlPointContextMenuOptions {
                                   std::numeric_limits<float>::quiet_NaN()};
     // Shown only while a link candidate is designated (empty label = hidden).
     QString newLinkedToCandidateLabel;
+    // Further entries of the window that owns the views, at the end of every
+    // menu; each runs after the menu has closed.
+    std::vector<std::pair<QString, std::function<void()>>> windowActions;
     // Fiber file stem for menu labels, resolved when the menu opens.
     std::function<QString(uint64_t)> fiberDisplayNameForId;
     std::function<void(double, cv::Vec3f)> deleteControlPoint;

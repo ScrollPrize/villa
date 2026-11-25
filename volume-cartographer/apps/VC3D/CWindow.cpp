@@ -2564,7 +2564,9 @@ void CWindow::openLineAnnotationWorkspace(LineAnnotationDialog* dialog, const QS
         escapeShortcut->setContext(Qt::WidgetWithChildrenShortcut);
         connect(escapeShortcut, &QShortcut::activated, dialog, &QWidget::close);
         QWidget* tabWidget = dialog;
-        connect(dialog, &QObject::destroyed, this, [this, tabWidget]() {
+        // An approval window is opened from the fiber map and closes back to it.
+        const bool backToFiberMap = dialog->approvalMode();
+        connect(dialog, &QObject::destroyed, this, [this, tabWidget, backToFiberMap]() {
             if (_destroyingWindow) {
                 return;
             }
@@ -2576,7 +2578,10 @@ void CWindow::openLineAnnotationWorkspace(LineAnnotationDialog* dialog, const QS
                     const bool wasCurrent = _workspaceTabs->currentIndex() == i;
                     _workspaceTabs->removeTab(i);
                     if (wasCurrent) {
-                        switchToMainWorkspace();
+                        const int fiberMap = backToFiberMap && _fiberMapWorkspace
+                            ? _workspaceTabs->indexOf(_fiberMapWorkspace) : -1;
+                        if (fiberMap >= 0) _workspaceTabs->setCurrentIndex(fiberMap);
+                        else switchToMainWorkspace();
                     }
                     break;
                 }

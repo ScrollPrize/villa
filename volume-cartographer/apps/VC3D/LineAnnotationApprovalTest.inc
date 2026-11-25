@@ -148,11 +148,25 @@
         require(controller.setFiberApprovalNormalPoint(fiber.id, onControl, wanted) &&
                     controller.setFiberApprovalNormalPoint(fiber.id, onControl, std::nullopt, true),
                 "a normal point on a control point of the fiber is set and deleted");
+        // Normals are worked on inside the selected stretch only, its ends included.
+        {
+            const auto whole = live->approvalSelection;
+            const auto generation = live->approvalGeneration;
+            live->approvalSelection = std::pair{position - 10.0, position + 10.0};
+            require(!controller.setFiberApprovalNormalPoint(fiber.id, position + 15.0, wanted) &&
+                        live->approvalGeneration == generation, "a normal point outside the selected stretch is refused");
+            require(controller.setFiberApprovalNormalPoint(fiber.id, position + 10.0, wanted), "one on its end is set");
+            live->approvalSelection = std::pair{0.0, position};
+            require(!controller.setFiberApprovalNormalPoint(fiber.id, position + 10.0, std::nullopt, true),
+                    "a normal point outside the selected stretch is not deleted");
+            live->approvalSelection = whole;
+            require(controller.setFiberApprovalNormalPoint(fiber.id, position + 10.0, std::nullopt, true), "inside it is");
+        }
         // States, once per aspect, over arbitrary positions.
         require(controller.setFiberApprovalState(fiber.id, position - 2.5, position + 3.25, 1, 1), "normals approved");
         require(controller.setFiberApprovalState(fiber.id, 5.5, 12.0, 0, 2), "geometry broken");
         layer = readLayer();
-        require(layer && layer->generation == 7 && layer->stretches.size() == 2, "both states are stored");
+        require(layer && layer->generation == 9 && layer->stretches.size() == 2, "both states are stored");
         const auto status = vc::objects::fiberApprovalStatus(*layer, live->approvalLine);
         require(status.staleStretches == 0 && status.staleNormalPoints == 0 && status.lineNormalsUsable, "the layer is current");
         const auto approved = vc::objects::approvedFiberLineNormals(*layer, status, live->approvalLine.size());
@@ -164,7 +178,7 @@
         require(controller.setFiberApprovalState(fiber.id, 0.0, double(lineBefore.size() - 1), 0, 0), "geometry undefined again");
         require(controller.setFiberApprovalNormalPoint(fiber.id, position + 0.2, std::nullopt, true), "the normal point is deleted");
         layer = readLayer();
-        require(layer && layer->generation == 9 && layer->normalPoints.empty() && layer->stretches.size() == 1 &&
+        require(layer && layer->generation == 11 && layer->normalPoints.empty() && layer->stretches.size() == 1 &&
                     live->controlPoints.size() == controlsBefore, "the newest generation is the layer");
         // Nothing of the fiber changed.
         const auto after = resolve(fiber.uuid);
@@ -176,7 +190,7 @@
         auto again = makeSession(after, "approval-again");
         controller.setSolverLineNormals(again->fiberId, solver);
         require(controller.loadApprovalLayer(*again, open, &why) && again->approvalStretches.size() == 1 &&
-                    again->approvalGeneration == 9, "a reopened window shows the stored layer");
+                    again->approvalGeneration == 11, "a reopened window shows the stored layer");
         controller.setSolverLineNormals(again->fiberId, nullptr);
         controller._panes.clear();
     }

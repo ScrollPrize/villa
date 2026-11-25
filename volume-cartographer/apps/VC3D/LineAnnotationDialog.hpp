@@ -239,6 +239,9 @@ public:
     // be set (the cross view's Shift-drag, a control point placement) and
     // stretches given a state. Call after setReadOnly(true).
     void setApprovalMode(bool approval);
+    [[nodiscard]] bool approvalMode() const { return _approvalMode; }
+    // Move the views to a position on the line (the cut there, the strips centred on it).
+    void showLinePosition(double linePosition);
     struct ApprovalDisplay {
         std::optional<std::pair<double, double>> selection;  // line positions
         std::vector<std::pair<double, double>> approvedGeometry, approvedNormals, broken, stale;
@@ -355,7 +358,8 @@ signals:
     void fiberFollowConfidenceChanged();
     void fiberTagChangeRequested(const QString& tag, bool enabled);
     // Approval window. bound: 0 the stretch starts, 1 ends at the line
-    // position; 2 selects the whole annotated line.
+    // position; 2 selects the whole annotated line; 3 / 4 the stretch of the
+    // same length after / before the selected one.
     void approvalSelectionBoundRequested(int bound, double linePosition);
     // aspect: 0 geometry, 1 normals; state: 0 undefined, 1 approved, 2 broken.
     void approvalStateRequested(int aspect, int state);

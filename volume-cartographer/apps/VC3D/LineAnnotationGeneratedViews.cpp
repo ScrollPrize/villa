@@ -1300,6 +1300,11 @@ struct ClickLocationActions {
             newLinkedLineAnnotation = menu.addAction(options.newLinkedToCandidateLabel);
             newLinkedLineAnnotation->setEnabled(canSampleClickedVolume);
         }
+        if (!options.windowActions.empty() && options.parent) {
+            menu.addSeparator();
+            for (const auto& [label, run] : options.windowActions)
+                QObject::connect(menu.addAction(label), &QAction::triggered, options.parent, run, Qt::QueuedConnection);
+        }
     }
 
     // The result for a chosen action of this group; nothing when `selected`

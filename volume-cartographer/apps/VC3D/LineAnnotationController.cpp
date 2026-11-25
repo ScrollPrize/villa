@@ -18653,6 +18653,13 @@ void LineAnnotationController::approvalPlaceNormalPoint(const std::string& surfa
     if (session.shownLineNormalsRevision != session.lineRevision || session.shownLineNormals.size() != linePoints)
         return refuse(tr("the views show no normals for this line (%1 normals, %2 line points)")
                           .arg(session.shownLineNormals.size()).arg(linePoints));
+    // Normals are worked on inside the selected stretch only, its ends included.
+    if (!session.approvalSelection) return refuse(tr("no stretch is selected; set its start and end first"));
+    if (linePosition < session.approvalSelection->first - 0.5 || linePosition > session.approvalSelection->second + 0.5)
+        return refuse(tr("line position %1 lies outside the selected stretch (%2 to %3). Move the stretch's start or "
+                         "end, or select the whole fiber")
+                          .arg(linePosition, 0, 'f', 0).arg(session.approvalSelection->first, 0, 'f', 0)
+                          .arg(session.approvalSelection->second, 0, 'f', 0));
     // Without a normal of its own the point holds what is shown there now.
     const auto wanted = vc::fiber_tracer::displayUnit(
         normal ? *normal : vc::fiber_tracer::displayVectorAt(session.shownLineNormals, linePosition));
@@ -18737,6 +18744,13 @@ void LineAnnotationController::approvalDeleteNormalPoint(const std::string& surf
                      "deletes normal points only."), session.suppressErrorDialogs);
         return;
     }
+    if (const double at = session.controlPoints[*nearest].linePosition; !session.approvalSelection ||
+        at < session.approvalSelection->first - 0.5 || at > session.approvalSelection->second + 0.5) {
+        showError(tr("Nothing was deleted: the normal point at line position %1 lies outside the selected stretch. "
+                     "Move the stretch's start or end, or select the whole fiber.").arg(at, 0, 'f', 0),
+                  session.suppressErrorDialogs);
+        return;
+    }
     const auto before = session.controlPoints;
     const auto branchesBefore = session.branches;
     std::vector<size_t> oldToNew(session.controlPoints.size());
@@ -18768,6 +18782,24 @@ void LineAnnotationController::approvalSetSelectionBound(const std::string& surf
             if (!la::isNormalPoint(control)) { from = control.linePosition; break; }
         for (auto it = session.controlPoints.rbegin(); it != session.controlPoints.rend(); ++it)
             if (!la::isNormalPoint(*it)) { to = it->linePosition; break; }
+    } else if (bound == 3 || bound == 4) {
+        // The stretch of the same length after (3) or before (4) the selected
+        // one, cut at the line's ends; the views move to its start.
+        if (!session.approvalSelection) {
+            showError(tr("There is no next stretch: no stretch is selected."), session.suppressErrorDialogs);
+            return;
+        }
+        const auto [oldFrom, oldTo] = *session.approvalSelection;
+        const double length = oldTo - oldFrom;
+        from = bound == 3 ? oldTo : std::max(0.0, oldFrom - length);
+        to = bound == 3 ? std::min(last, oldTo + length) : oldFrom;
+        if (!(to > from)) {
+            showError(bound == 3 ? tr("There is no next stretch: the selected one ends at the end of the line.")
+                                 : tr("There is no previous stretch: the selected one starts at the start of the line."),
+                      session.suppressErrorDialogs);
+            return;
+        }
+        if (pane->dialog) pane->dialog->showLinePosition(from);
     } else {
         if (session.approvalSelection) std::tie(from, to) = *session.approvalSelection;
         linePosition = std::clamp(linePosition, 0.0, last);

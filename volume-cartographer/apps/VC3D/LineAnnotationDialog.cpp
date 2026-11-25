@@ -2337,6 +2337,13 @@ void LineAnnotationDialog::setApprovalMode(bool approval)
     _fiberWidthSpin->setToolTip(tr("Shown width in this window only; it is not saved to the fiber."));
 }
 
+void LineAnnotationDialog::showLinePosition(double linePosition)
+{
+    if (!_hasGeneratedViews) return;
+    setCurrentLinePosition(linePosition);
+    centerStripsOnLinePosition(linePosition, true);
+}
+
 void LineAnnotationDialog::setApprovalDisplay(const ApprovalDisplay& display)
 {
     _approvalDisplay = display;
@@ -3552,6 +3559,15 @@ LineAnnotationDialog::showGeneratedControlPointContextMenu(
     options.mergeWithCandidateEnabled = mergeCandidateState.enabled;
     options.mergeWithCandidateLabel = mergeCandidateState.label;
     options.newLinkedToCandidateLabel = newLinkedToCandidateState.label;
+    if (_approvalMode) {
+        // Moving on along the fiber: the stretch after (or before) the selected one.
+        options.windowActions.emplace_back(tr("Next stretch"), [this]() {
+            emit approvalSelectionBoundRequested(3, _currentLinePosition);
+        });
+        options.windowActions.emplace_back(tr("Previous stretch"), [this]() {
+            emit approvalSelectionBoundRequested(4, _currentLinePosition);
+        });
+    }
     options.fiberDisplayNameForId = std::move(fiberDisplayNameForId);
     options.branchLinkDirection = branchLinkDirectionForViewer(viewer, linePosition);
     options.deleteControlPoint = [this, surfaceName](double selectedLinePosition,
@@ -6674,15 +6690,11 @@ bool LineAnnotationDialog::handleCrossSectionDragEvent(QObject* watched, QEvent*
         }
         double best = std::numeric_limits<double>::infinity();
         // The approval window turns the normal only: the centre is no handle.
-        if (_approvalMode && drag.width <= 0) {
-            emit editGestureRefused(tr("The Shift-drag in the cross view"),
-                                    tr("the shown fiber width is 0, so there is no edge to turn the normal with; set "
-                                       "\"Fiber width\" first (it is not saved to the fiber)"));
-            return true;
-        }
+        // Without a shown width there are no edges either: the drag then
+        // turns a line through the line point (handle 2).
         for (int handle : {0, -1, 1}) {
             if (handle && drag.width <= 0) continue;
-            if (!handle && _approvalMode) continue;
+            if (!handle && _approvalMode && drag.width > 0) continue;
             const cv::Vec3d point = drag.center + drag.axis * (handle * drag.width / 2);
             const QPointF screen = view->viewportTransform().map(viewer->volumeToScene(cv::Vec3f(point)));
             const QPointF distance = screen - mouse->position();
@@ -6693,7 +6705,8 @@ bool LineAnnotationDialog::handleCrossSectionDragEvent(QObject* watched, QEvent*
                 drag.edgeScene = viewer->volumeToScene(cv::Vec3f(point));
             }
         }
-        Logger()->info("Line annotation cross drag: stroke started; handle {} (0 centre, -1/+1 edges) width {} line position {}",
+        if (_approvalMode && drag.width <= 0) drag.handle = 2;
+        Logger()->info("Line annotation cross drag: stroke started; handle {} (0 centre, -1/+1 edges, 2 free line) width {} line position {}",
                        drag.handle, drag.width, drag.linePosition);
         _crossSectionDrag = drag;
         updateFiberDisplayControlsAndGuides();
@@ -6709,6 +6722,26 @@ bool LineAnnotationDialog::handleCrossSectionDragEvent(QObject* watched, QEvent*
     const QPointF offset = scene - (drag.handle ? drag.edgeScene : drag.pressScene);
     auto result = vc::fiber_tracer::dragFiberWidth(drag.center, drag.normal, drag.axis,
         drag.planeNormal, drag.width, drag.handle, drag.sceneX * offset.x() + drag.sceneY * offset.y());
+    if (drag.handle == 2) {
+        // The line through the line point and the mouse is the fiber's axis
+        // across; the normal is perpendicular to it in the cut plane. Both
+        // keep the side they had, so a drag never turns the normal over.
+        result.reset();
+        const QPointF fromCentre = scene - viewer->volumeToScene(cv::Vec3f(drag.center));
+        const cv::Vec3d direction = drag.sceneX * fromCentre.x() + drag.sceneY * fromCentre.y();
+        const double length = cv::norm(direction);
+        if (length > 1e-9 && std::isfinite(length)) {
+            cv::Vec3d axis = direction / length;
+            if (axis.dot(drag.axis) < 0) axis = -axis;
+            cv::Vec3d normal = drag.planeNormal.cross(axis);
+            const double normalLength = cv::norm(normal);
+            if (normalLength > 1e-9) {
+                normal /= normalLength;
+                if (normal.dot(drag.normal) < 0) normal = -normal;
+                result = vc::fiber_tracer::FiberWidthDragResult{drag.center, normal, axis, 0.0};
+            }
+        }
+    }
     // The approval window turns the normal about the line point: the centre
     // and the width stay as they are.
     if (result && _approvalMode) {
@@ -6727,7 +6760,7 @@ bool LineAnnotationDialog::handleCrossSectionDragEvent(QObject* watched, QEvent*
             drag.normal = result->normal;
             drag.axis = result->edgeAxis;
             drag.changed = true;
-            drag.normalChanged = drag.normalChanged || drag.handle != 0;
+            drag.normalChanged = drag.normalChanged || drag.handle != 0;  // also the free line (2)
         }
         drag.mouseDown = false;
         if (QWidget::mouseGrabber() == view->viewport()) view->viewport()->releaseMouse();
@@ -6784,9 +6817,22 @@ void LineAnnotationDialog::drawCrossSectionDragPreview(const vc::fiber_tracer::F
         view->viewportTransform().m11(), view->viewportTransform().m12()));
     const QPointF left = viewer->volumeToScene(cv::Vec3f(result->center - result->edgeAxis * (result->width / 2)));
     const QPointF right = viewer->volumeToScene(cv::Vec3f(result->center + result->edgeAxis * (result->width / 2)));
-    path.moveTo(left); path.lineTo(right);
-    for (const auto& point : {left, viewer->volumeToScene(cv::Vec3f(result->center)), right})
-        path.addEllipse(point, radius, radius);
+    if (!(result->width > 0)) {
+        // No width: one line across the whole view at the angle, no handles.
+        const QPointF centre = viewer->volumeToScene(cv::Vec3f(result->center));
+        const QPointF along = viewer->volumeToScene(cv::Vec3f(result->center + result->edgeAxis)) - centre;
+        const double unit = std::hypot(along.x(), along.y());
+        const QRectF visible = view->mapToScene(view->viewport()->rect()).boundingRect();
+        if (unit > 1e-12) {
+            const QPointF reach = along * (std::hypot(visible.width(), visible.height()) / unit);
+            path.moveTo(centre - reach); path.lineTo(centre + reach);
+        }
+        path.addEllipse(centre, radius, radius);
+    } else {
+        path.moveTo(left); path.lineTo(right);
+        for (const auto& point : {left, viewer->volumeToScene(cv::Vec3f(result->center)), right})
+            path.addEllipse(point, radius, radius);
+    }
     if (result->width > 0 && _showFiberWidthAction->isChecked()) {
         const QPointF center = viewer->volumeToScene(cv::Vec3f(result->center));
         const QPointF normal = viewer->volumeToScene(cv::Vec3f(result->center + result->normal)) - center;
