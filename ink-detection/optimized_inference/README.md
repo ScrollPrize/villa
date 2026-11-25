@@ -63,8 +63,9 @@ s3://<bucket>/<prefix>/
 
 ## Quick start (local)
 
-1. Install dependencies:
+1. Install dependencies. `vc-reader` is not on PyPI, so install it from this monorepo first:
    ```bash
+   CMAKE_ARGS="-DVC_READER_ENABLE_CUDA=OFF" pip install ../../vc_reader
    pip install -r requirements.txt
    ```
 
@@ -73,14 +74,21 @@ s3://<bucket>/<prefix>/
    pip install -r requirements-cpu-only.txt
    ```
 
-2. Set env and run:
+2. Set env and run the three steps. `WORK_DIR` must be writable. `STEP=prepare` writes a new
+   zarr at `SURFACE_VOLUME_ZARR` and fails if one exists there. To start from a zarr you already
+   have, point `SURFACE_VOLUME_ZARR` at it and leave out `STEP=prepare`.
    ```bash
-   export MODEL=timesformer-scroll5
+   export MODEL=scrollprize/timesformer_scroll5_27112024
    export S3_PATH=<s3_fragment_path>
    export START_LAYER=0
    export END_LAYER=26
+   export WORK_DIR=./work
+   export SURFACE_VOLUME_ZARR=./work/surface_volume.zarr
+   export ZARR_OUTPUT_DIR=./work/partitions
 
-   python entrypoint.py
+   STEP=prepare python entrypoint.py &&
+   STEP=inference python entrypoint.py &&
+   STEP=reduce OUTPUT_PATH=./prediction.tif python entrypoint.py
    ```
 
 ## Docker
