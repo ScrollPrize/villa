@@ -663,9 +663,9 @@ void SegmentationModule::applyEdits()
         ? _editManager->editedVertices()
         : std::vector<SegmentationEditManager::VertexEdit>{};
 
-    // Capture delta for undo before applyPreview() clears edited vertices
+    // Manual Add repairs change validity as well as the edited coordinates.
     if (hadPendingChanges) {
-        (void)captureUndoDelta();
+        (void)captureUndoDelta(_manualAddMode);
     }
 
     _editManager->applyPreview();
@@ -1309,6 +1309,7 @@ bool SegmentationModule::applyManualAddTracerPreview(QuadSurface* surface)
     if (snapshot.empty() || fill.empty() || !tracedPoints || tracedPoints->empty()) {
         return false;
     }
+    const auto tracedMask = surface->vertexMask();
 
     int offsetCol = 0;
     int offsetRow = 0;
@@ -1355,7 +1356,7 @@ bool SegmentationModule::applyManualAddTracerPreview(QuadSurface* surface)
         }
 
         const cv::Vec3f& point = (*tracedPoints)(srcRow, srcCol);
-        if (!vc::geometry::validSurfacePoint(point)) {
+        if (!vc::geometry::validSurfacePoint(point) || (!tracedMask.empty() && !tracedMask(srcRow, srcCol))) {
             continue;
         }
         rawPreview(key.row, key.col) = point;
@@ -1573,21 +1574,6 @@ bool SegmentationModule::finishManualAdd(bool apply)
             saveCorrections();
         }
         _manualAddGridPadding = {};
-        // Tracer fills went through growth, which already dropped the mask.
-        const bool tracerFill = !extending &&
-            _manualAddTool->config().interpolationMode == ManualAddTool::InterpolationMode::TracerRestrictedToFill;
-        if (!tracerFill && _editManager && _editManager->baseSurface()) {
-            std::vector<cv::Point> cells;
-            cells.reserve(_manualAddTool->changedVertices().size());
-            for (const auto& key : _manualAddTool->changedVertices()) {
-                cells.emplace_back(key.col, key.row);
-            }
-            if (segmentation::markMaskCellsValid(*_editManager->baseSurface(), cells)) {
-                _autosaveFullSurfaceNeeded = true;
-                // The validity changed: the edit's draft follows it.
-                publishEditDraft();
-            }
-        }
         if (_editManager && _editManager->hasPendingChanges()) {
             applyEdits();
         } else if (_autosaveFullSurfaceNeeded) {
@@ -2691,18 +2677,9 @@ void SegmentationModule::performAutosave()
     std::vector<std::string> channels;
     cv::Rect rect;
     if (vertexUpdates.empty() || !snapshot) {
-        snapshot = std::make_shared<QuadSurface>(surfacePtr->rawPoints().clone(), surfacePtr->scale());
-        for (const auto& name : surfacePtr->channelNames()) {
-            if (!surfacePtr->channelLoaded(name)) {
-                continue;
-            }
-            snapshot->setChannel(name, surfacePtr->channel(name, SURF_CHANNEL_NORESIZE).clone());
-            if (vertexUpdates.empty()) {
-                channels.push_back(name);
-            }
-        }
-        snapshot->id = surfacePtr->id;
-        snapshot->meta = surfacePtr->meta;
+        snapshot = SurfaceStoreEdit::snapshotForSave(*surfacePtr);
+        if (vertexUpdates.empty())
+            channels = snapshot->channelNames();
     }
     if (vertexUpdates.empty()) {
         rect = cv::Rect(0, 0, snapshot->rawPointsPtr()->cols, snapshot->rawPointsPtr()->rows);

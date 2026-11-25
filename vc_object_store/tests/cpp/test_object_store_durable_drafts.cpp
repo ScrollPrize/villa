@@ -12,6 +12,8 @@
 #include "vc_object_store/server/Server.hpp"
 
 #include <iostream>
+#include <fstream>
+#include <nlohmann/json.hpp>
 
 using namespace vc::objects;
 using vc::geometry::Surface;
@@ -68,6 +70,21 @@ std::size_t filesIn(const std::filesystem::path& directory, const std::string& p
         n += entry.path().filename().string().rfind(prefix, 0) == 0;
     return n;
 }
+
+// Main's format-1 writer records the same grid binary without channel sidecars
+// or a channels field in the manifest.
+void useLegacyManifest(const std::filesystem::path& directory)
+{
+    const auto path = directory / "checkpoint.json";
+    auto manifest = nlohmann::json::parse(std::ifstream(path));
+    require(manifest.at("format") == 1, "legacy checkpoint format");
+    require(!manifest.at("drafts").empty(), "legacy checkpoint contains a draft");
+    for (auto& draft : manifest.at("drafts")) {
+        require(draft.at("channels").empty(), "legacy fixture has no sidecars");
+        draft.erase("channels");
+    }
+    std::ofstream(path) << manifest;
+}
 } // namespace
 
 int main()
@@ -118,6 +135,7 @@ try {
         ObjectStoreSession other;
         mustFail([&] { (void)other.useDraftDirectory(drafts); }); // one session per directory
     }
+    useLegacyManifest(drafts);
     {
         ObjectStoreSession session;
         const auto attachment = session.attach(storePath, options);
@@ -217,6 +235,7 @@ try {
         require(session.pendingSubmissions().size() == 1 && session.draftState(hostedSurface)->pendingRequest == pending,
                 "unknown outcome stays pending");
     }
+    useLegacyManifest(hostedDrafts);
     service = std::make_unique<server::Server>(hostedPath, serverOptions);
     service->start();
     {

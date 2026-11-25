@@ -1,4 +1,5 @@
 #include "SegmentationModule.hpp"
+#include "SurfaceGridEdit.hpp"
 #include "SurfaceCorrections.hpp"
 #include "SurfaceStoreEdit.hpp"
 
@@ -194,9 +195,19 @@ bool SegmentationModule::captureUndoSnapshot()
     return _undoHistory.capture(previewPoints);
 }
 
-bool SegmentationModule::captureUndoDelta()
+bool SegmentationModule::captureInpaintUndoSnapshot()
 {
-    if (_suppressUndoCapture) {
+    if (_suppressUndoCapture || !_editManager || !_editManager->hasSession()) return false;
+    auto surface = _editManager->baseSurface();
+    if (!surface) return false;
+    for (const auto* name : {"mask", "growth_exclusions", "generations"})
+        (void)surface->channel(name, SURF_CHANNEL_NORESIZE);
+    return _undoHistory.captureRepair(SurfaceStoreEdit::snapshotForSave(*surface));
+}
+
+bool SegmentationModule::captureUndoDelta(bool activateRepairedCells)
+{
+    if (_suppressUndoCapture && !activateRepairedCells) {
         return false;
     }
     if (!_editManager || !_editManager->hasSession()) {
@@ -215,7 +226,11 @@ bool SegmentationModule::captureUndoDelta()
         deltas.push_back({edit.row, edit.col, edit.originalWorld});
     }
 
-    return _undoHistory.captureDelta(deltas);
+    if (activateRepairedCells && segmentation::activateRepairedVertices(*_editManager->baseSurface(), deltas)) {
+        _autosaveFullSurfaceNeeded = true;
+        publishEditDraft();
+    }
+    return !_suppressUndoCapture && _undoHistory.captureDelta(deltas);
 }
 
 void SegmentationModule::discardLastUndoSnapshot()
@@ -270,19 +285,26 @@ bool SegmentationModule::restoreUndoSnapshot()
 
             _editManager->applyPreview();
             if (auto surface = _editManager->previewSurface()) {
+                if (segmentation::restoreRepairedVertices(*surface, *deltas))
+                    _autosaveFullSurfaceNeeded = true;
                 surface->invalidateCache();
             }
             applied = true;
         }
     } else {
-        // Legacy full snapshot restore
+        // Repair snapshots carry validity and hidden coordinates as well as XYZ.
+        const auto repair = _undoHistory.lastRepairSnapshot();
         auto state = _undoHistory.takeLast();
         if (state && !state->empty()) {
             applied = _editManager->setPreviewPoints(*state, false, &undoBounds);
             if (applied) {
+                if (repair) {
+                    segmentation::applyGrowthChannels(*_editManager->baseSurface(), *repair);
+                    _autosaveFullSurfaceNeeded = true;
+                }
                 _editManager->applyPreview();
             } else {
-                _undoHistory.pushBack(std::move(*state));
+                _undoHistory.pushBack(std::move(*state), repair);
             }
         }
     }

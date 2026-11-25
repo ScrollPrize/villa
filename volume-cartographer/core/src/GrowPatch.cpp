@@ -328,7 +328,8 @@ static bool sampled_at_growth_scale(const cv::Point& cell, int factor)
 static QuadSurface* finish_resume_surface(QuadSurface* working, const cv::Vec2f& scale, int factor,
                                           const cv::Size& size, const cv::Point& offset,
                                           const std::vector<GrowthExclusion>& input_exclusions,
-                                          bool corrected)
+                                          bool corrected, const cv::Mat& repair_cells,
+                                          const cv::Mat& working_repair_cells)
 {
     auto exclusions = input_exclusions;
     if (factor > 1 && !exclusions.empty()) {
@@ -337,6 +338,12 @@ static QuadSurface* finish_resume_surface(QuadSurface* working, const cv::Vec2f&
         const cv::Mat_<uint16_t> generations = working->channel("generations", SURF_CHANNEL_NORESIZE);
         for (auto& exclusion : exclusions) {
             if (!sampled_at_growth_scale(exclusion.cell, factor)) continue;
+            const cv::Point input_cell(exclusion.cell.x / factor, exclusion.cell.y / factor);
+            // A selected full-resolution repair may share this coarse cell
+            // with an unselected exclusion. Keep the solver's support point
+            // for interpolation; restore exclusions separately after scaling.
+            if (!working_repair_cells.empty() && working_repair_cells.at<uint8_t>(input_cell) != 0)
+                continue;
             const cv::Point cell(exclusion.cell.x / factor + offset.x, exclusion.cell.y / factor + offset.y);
             if (!bounds.contains(cell)) continue;
             auto& point = working_points(cell);
@@ -360,6 +367,9 @@ static QuadSurface* finish_resume_surface(QuadSurface* working, const cv::Vec2f&
         const cv::Point cell = exclusion.cell + factor * offset;
         if (!bounds.contains(cell)) continue;
         auto& point = points(cell);
+        if (!repair_cells.empty() && repair_cells.at<uint8_t>(exclusion.cell) != 0 &&
+            vc::geometry::validSurfacePoint(point))
+            continue;
         const bool keep_solved = factor == 1 && corrected && vc::geometry::validSurfacePoint(point);
         const auto coords = keep_solved ? point : exclusion.coords;
         if (vc::geometry::validSurfacePoint(coords))
@@ -1948,8 +1958,20 @@ QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const nlo
     const int growth_scale_factor = 1 << growth_scale_level;
     const bool use_growth_scale = resume_surf && growth_scale_factor > 1;
     const cv::Vec2f output_surface_scale = resume_surf ? resume_surf->scale() : cv::Vec2f(1.0f, 1.0f);
+    const cv::Size input_surface_size = resume_surf ? resume_surf->rawPoints().size() : cv::Size{};
     const auto input_exclusions = resume_surf ? read_growth_exclusions(*resume_surf) : std::vector<GrowthExclusion>{};
     const bool corrected_resume = !corrections.getAllCollections().empty();
+    cv::Mat repair_cells;
+    cv::Mat working_repair_cells;
+    if (resume_surf && params.value("repair_selected_exclusions", false)) {
+        if (!allowed_growth_mask || allowed_growth_mask->empty())
+            throw std::runtime_error("repair_selected_exclusions requires an allowed growth mask");
+        if (allowed_growth_mask->size() != resume_surf->rawPoints().size() || allowed_growth_mask->channels() != 1)
+            throw std::runtime_error("repair selection must match the resume surface grid");
+        cv::compare(*allowed_growth_mask, 0, repair_cells, cv::CMP_NE);
+    }
+    if (!repair_cells.empty())
+        working_repair_cells = vc::core::util::downsampleAllowedGrowthMaskCovering(repair_cells, growth_scale_factor);
     std::unique_ptr<QuadSurface> growth_scale_resume_surf;
     cv::Mat growth_scale_allowed_mask;
     const cv::Mat* effective_allowed_growth_mask = allowed_growth_mask;
@@ -1983,8 +2005,11 @@ QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const nlo
     if (!corrected_resume && !input_exclusions.empty()) {
         working_exclusions = cv::Mat_<uint8_t>(resume_surf->rawPoints().size(), uint8_t(0));
         for (const auto& exclusion : input_exclusions) {
-            if (sampled_at_growth_scale(exclusion.cell, growth_scale_factor))
-                working_exclusions(exclusion.cell.y / growth_scale_factor, exclusion.cell.x / growth_scale_factor) = 1;
+            if (sampled_at_growth_scale(exclusion.cell, growth_scale_factor)) {
+                const cv::Point cell(exclusion.cell.x / growth_scale_factor, exclusion.cell.y / growth_scale_factor);
+                if (working_repair_cells.empty() || working_repair_cells.at<uint8_t>(cell) == 0)
+                    working_exclusions(cell) = 1;
+            }
         }
     }
 
@@ -2260,6 +2285,7 @@ QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const nlo
 
         auto result_points_storage = std::make_unique<cv::Mat_<cv::Vec3f>>(resume_points_ptr->clone());
         cv::Mat_<cv::Vec3f>& result_points = *result_points_storage;
+        cv::Mat_<uint8_t> inpaint_repairs(result_points.size(), uint8_t(0));
 
         cv::Mat active_area_mask(result_points.size(), CV_8U, cv::Scalar(0));
         for (int y = 0; y < result_points.rows; ++y) {
@@ -2368,6 +2394,8 @@ QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const nlo
                     if (p[0] != -1.0) {
                         result_points(roi.y + y, roi.x + x) =
                             cv::Vec3f(static_cast<float>(p[0]), static_cast<float>(p[1]), static_cast<float>(p[2]));
+                        if (vc::geometry::validSurfacePoint(result_points(roi.y + y, roi.x + x)))
+                            inpaint_repairs(roi.y + y, roi.x + x) = 255;
                     }
                 }
             }
@@ -2403,11 +2431,21 @@ QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const nlo
             surf,
             use_growth_scale ? growth_scale_factor : 1,
             true);
+        cv::Mat_<uint8_t> repaired_input_cells(input_surface_size, uint8_t(0));
+        for (const auto& exclusion : input_exclusions) {
+            // The same covering block used for growth-scale selections maps
+            // the reconstructed coarse vertex back to its input holes. An
+            // off-lattice hole whose coarse vertex was not solved stays masked.
+            const cv::Point coarse_cell(exclusion.cell.x / growth_scale_factor,
+                                        exclusion.cell.y / growth_scale_factor);
+            if (inpaint_repairs(coarse_cell) != 0)
+                repaired_input_cells(exclusion.cell) = 255;
+        }
         return finish_resume_surface(
             surf,
             output_surface_scale,
             use_growth_scale ? growth_scale_factor : 1,
-            exact_output_size, {}, input_exclusions, corrected_resume);
+            exact_output_size, {}, input_exclusions, corrected_resume, repaired_input_cells, inpaint_repairs);
     }
 
     
@@ -2537,7 +2575,7 @@ QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const nlo
         const cv::Point offset(resume_pad_x - used_area_safe.x, resume_pad_y - used_area_safe.y);
         return finish_resume_surface(surf, output_surface_scale, growth_scale_factor,
                                      exact_growth_output_size_for_fill(surf), offset,
-                                     input_exclusions, corrected_resume);
+                                     input_exclusions, corrected_resume, repair_cells, working_repair_cells);
     };
 
     cv::Vec3f vx = {1,0,0};

@@ -109,10 +109,12 @@ DraftDirectory::Loaded DraftDirectory::load()
         draft.coordinates = d.at("coordinates");
         files_[uuid] = d.at("file").get<std::string>();
         draft.surface = decodeDraft(readFile(directory_ / d.at("file").get<std::string>()), d.at("rows"), d.at("columns"));
-        for (const auto& channel : jsonArrayField(d, "channels")) {
-            const auto bytes = readFile(directory_ / channel.at("file").get<std::string>());
-            draft.surface.channels.push_back({channel.at("name"), channel.at("dtype"), channel.at("shape"),
-                                              std::vector<uint8_t>(bytes.begin(), bytes.end())});
+        if (d.contains("channels")) {
+            for (const auto& channel : jsonArrayField(d, "channels")) {
+                const auto bytes = readFile(directory_ / channel.at("file").get<std::string>());
+                draft.surface.channels.push_back({channel.at("name"), channel.at("dtype"), channel.at("shape"),
+                                                  std::vector<uint8_t>(bytes.begin(), bytes.end())});
+            }
         }
         draft.surface.validate();
         if (!d.at("store").is_null()) draft.meta.storeUuid = d.at("store").get<std::string>();

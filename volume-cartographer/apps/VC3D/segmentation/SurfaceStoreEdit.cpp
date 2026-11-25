@@ -99,6 +99,18 @@ void SurfaceStoreEdit::settlePending()
     repin(receipt);
 }
 
+std::shared_ptr<QuadSurface> SurfaceStoreEdit::snapshotForSave(QuadSurface& surface)
+{
+    auto snapshot = std::make_shared<QuadSurface>(surface.rawPoints().clone(), surface.scale());
+    for (const auto& name : surface.channelNames())
+        if (surface.channelLoaded(name))
+            snapshot->setChannel(name, surface.channel(name, SURF_CHANNEL_NORESIZE).clone());
+    snapshot->maskedVertices = surface.maskedVertices;
+    snapshot->id = surface.id;
+    snapshot->meta = surface.meta;
+    return snapshot;
+}
+
 void SurfaceStoreEdit::save(QuadSurface& surface, const cv::Rect& rect, const std::vector<std::string>& channels,
                             std::optional<uint64_t> draftRevision)
 {
@@ -141,15 +153,20 @@ void SurfaceStoreEdit::save(QuadSurface& surface, const cv::Rect& rect, const st
         } else {
             // Channels first; the vertex edit then applies to the validity they set.
             std::vector<uint8_t> validity;
+            std::vector<uint8_t> clearMaskedCoordinates;
             const std::vector<uint8_t>* replaced = nullptr;
             if (!channels.empty()) {
                 auto op = quad_channels_operation(_uuid, surface, channels, {}, points.rows, points.cols);
-                for (const auto& array : op.channels)
+                for (const auto& array : op.channels) {
                     if (array.name == "valid") { validity = array.bytes; replaced = &validity; }
+                    if (array.name == "growth_exclusions") clearMaskedCoordinates = array.bytes;
+                }
                 request.operations.push_back(std::move(op));
             }
             const auto view = transformed ? *transformed : snapshot.viewStored(_uuid, *_pin.geometryRevision);
-            if (auto edit = quad_rect_edit(view, surface, rect, replaced)) request.operations.push_back(std::move(*edit));
+            if (auto edit = quad_rect_edit(view, surface, rect, replaced,
+                    clearMaskedCoordinates.empty() ? nullptr : &clearMaskedCoordinates))
+                request.operations.push_back(std::move(*edit));
         }
         // Revalidate under the writer lock, including newly added registrations
         // and route choices that a list of existing record versions cannot guard.

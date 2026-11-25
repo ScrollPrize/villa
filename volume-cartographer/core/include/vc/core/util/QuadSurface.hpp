@@ -561,12 +561,14 @@ vc::geometry::Surface quad_surface_grid(QuadSurface&);
 vc::objects::GeometryData quad_surface_geometry(QuadSurface&);
 // The sparse edit publishing the vertices of `rect` (grid rows/columns) that
 // differ from the revision `view` shows (its stored frame or a transformed
-// one): new coordinates also mark the vertex valid; a vertex cleared to the
-// sentinel loses its coordinates. Relationships the edit affects are kept as
-// recorded. nullopt when nothing changed. `validity` is the grid's validity
+// one): new coordinates mark the vertex valid unless explicit validity is
+// supplied; a vertex cleared to the sentinel loses its coordinates. Affected
+// relationships are kept as recorded. nullopt when nothing changed. `validity` is the grid's validity
 // when an earlier operation of the request replaces it (quad_channels_operation).
+// An explicit exclusion replacement may also clear hidden XYZ at missing cells.
 std::optional<vc::objects::EditGeometryOp> quad_rect_edit(const vc::objects::TransformedGeometryView& view,
-    QuadSurface&, const cv::Rect& rect, const std::vector<uint8_t>* validity = nullptr);
+    QuadSurface&, const cv::Rect& rect, const std::vector<uint8_t>* validity = nullptr,
+    const std::vector<uint8_t>* clearMaskedCoordinates = nullptr);
 // Replace the named channels ("mask" is `valid`) of a rows x columns surface
 // with the surface's and remove `remove`, keeping affected relationships as
 // recorded.

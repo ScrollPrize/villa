@@ -65,6 +65,8 @@ private slots:
     void resizeSurfaceGridRejectsLossyChannels();
     void maskCellsBecomeValid();
     void maskedFillSurvivesReload();
+    void repairedCellUndoRestoresHiddenCoordinatesAndValidity();
+    void inpaintUndoRestoresRepairStateAfterPadding();
     void dragPicksTheNearestEdgeStretch();
     void extensionKeepsItsSpan();
     void undoHistoryFollowsGridPadding();
@@ -353,6 +355,111 @@ void TestManualAddExtend::maskedFillSurvivesReload()
     // Without marking the mask, the reload drops the filled vertex.
     QVERIFY(!vc::geometry::validSurfacePoint(fillAndReload(false)));
     QVERIFY(distance(fillAndReload(true), filled) < 1e-4f);
+}
+
+void TestManualAddExtend::repairedCellUndoRestoresHiddenCoordinatesAndValidity()
+{
+    auto points = flatSheet(4, 4, cv::Rect(0, 0, 4, 4));
+    const cv::Point selected(1, 1);
+    const cv::Point neighbor(2, 2);
+    const cv::Vec3f selectedHidden(2, 2, 105);
+    const cv::Vec3f neighborHidden(4, 4, 110);
+    points(neighbor) = kInvalid;
+    QuadSurface surface(points, cv::Vec2f(0.5f, 0.5f));
+    cv::Mat_<uint8_t> mask(8, 8, uint8_t{255});
+    mask(cv::Rect(2, 2, 2, 2)).setTo(0);
+    mask(cv::Rect(4, 4, 2, 2)).setTo(0);
+    cv::Mat_<uint8_t> exclusions(4, 4, uint8_t{0});
+    exclusions(selected) = exclusions(neighbor) = 255;
+    surface.setChannel("mask", mask);
+    surface.setChannel("growth_exclusions", exclusions);
+    surface.maskedVertices = {{selected, selectedHidden}, {neighbor, neighborHidden}};
+
+    segmentation::UndoHistory undo;
+    std::vector<segmentation::VertexDelta> deltas{{selected.y, selected.x, kInvalid}};
+    QVERIFY(segmentation::activateRepairedVertices(surface, deltas));
+    QVERIFY(undo.captureDelta(deltas));
+    QCOMPARE(surface.vertexMask()(selected), uint8_t{255});
+    QCOMPARE(surface.channel("growth_exclusions").at<uint8_t>(selected), uint8_t{0});
+    QCOMPARE(surface.maskedVertices.size(), size_t{1});
+    QCOMPARE(surface.maskedVertices.front().coords, neighborHidden);
+    QCOMPARE(surface.pointsForStorage()(selected), cv::Vec3f(2, 2, 100));
+    QCOMPARE(surface.pointsForStorage()(neighbor), neighborHidden);
+
+    auto restore = undo.takeLastDelta();
+    QVERIFY(restore);
+    for (const auto& delta : *restore) (*surface.rawPointsPtr())(delta.row, delta.col) = delta.previousWorld;
+    QVERIFY(segmentation::restoreRepairedVertices(surface, *restore));
+    QCOMPARE(surface.rawPoints()(selected), kInvalid);
+    QCOMPARE(surface.channel("growth_exclusions").at<uint8_t>(selected), uint8_t{255});
+    QCOMPARE(cv::norm(surface.channel("mask", SURF_CHANNEL_NORESIZE), mask, cv::NORM_INF), 0.0);
+    QCOMPARE(surface.pointsForStorage()(selected), selectedHidden);
+    QCOMPARE(surface.pointsForStorage()(neighbor), neighborHidden);
+
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const auto path = std::filesystem::path(dir.path().toStdString()) / "segment";
+    surface.save(path);
+    QuadSurface reloaded(path);
+    QCOMPARE(reloaded.rawPoints()(selected), kInvalid);
+    QCOMPARE(reloaded.pointsForStorage()(selected), selectedHidden);
+    QCOMPARE(reloaded.channel("growth_exclusions").at<uint8_t>(selected), uint8_t{255});
+}
+
+void TestManualAddExtend::inpaintUndoRestoresRepairStateAfterPadding()
+{
+    const cv::Point repaired(1, 1), untouched(2, 2);
+    const cv::Vec3f repairedHidden(2, 2, 105), untouchedHidden(4, 4, 110);
+    auto points = flatSheet(4, 4, cv::Rect(0, 0, 4, 4));
+    points(repaired) = points(untouched) = kInvalid;
+    auto before = std::make_shared<QuadSurface>(points.clone(), cv::Vec2f(0.5f, 0.5f));
+    cv::Mat_<uint8_t> mask(4, 4, uint8_t{255});
+    mask(repaired) = mask(untouched) = 0;
+    cv::Mat_<uint8_t> exclusions(4, 4, uint8_t{0});
+    exclusions(repaired) = exclusions(untouched) = 255;
+    before->setChannel("mask", mask.clone());
+    before->setChannel("growth_exclusions", exclusions.clone());
+    before->setChannel("generations", cv::Mat_<uint16_t>(4, 4, uint16_t{3}));
+    before->maskedVertices = {{repaired, repairedHidden}, {untouched, untouchedHidden}};
+    segmentation::UndoHistory history;
+    QVERIFY(history.captureRepair(before));
+
+    // Install the solved Inpaint result, which activated one exclusion.
+    points(repaired) = {2, 2, 100};
+    QuadSurface surface(points, cv::Vec2f(0.5f, 0.5f));
+    mask(repaired) = 255;
+    exclusions(repaired) = 0;
+    surface.setChannel("mask", mask);
+    surface.setChannel("growth_exclusions", exclusions);
+    surface.setChannel("generations", cv::Mat_<uint16_t>(4, 4, uint16_t{9}));
+    surface.maskedVertices = {{untouched, untouchedHidden}};
+
+    // A later Manual Add pad moves the earlier repair's undo state with it.
+    history.padGrid(1, 0, 2, 0);
+    QVERIFY(segmentation::resizeSurfaceGrid(surface, 1, 0, 2, 0));
+    const cv::Point offset(2, 1);
+    const auto repair = history.lastRepairSnapshot();
+    auto state = history.takeLast();
+    QVERIFY(repair && state);
+    state->copyTo(*surface.rawPointsPtr());
+    surface.invalidateCache();
+    segmentation::applyGrowthChannels(surface, *repair);
+    QCOMPARE(surface.rawPoints()(repaired + offset), kInvalid);
+    QCOMPARE(surface.vertexMask()(repaired + offset), uint8_t{0});
+    QCOMPARE(surface.channel("growth_exclusions").at<uint8_t>(repaired + offset), uint8_t{255});
+    QCOMPARE(surface.channel("generations").at<uint16_t>(repaired + offset), uint16_t{3});
+    QCOMPARE(surface.pointsForStorage()(repaired + offset), repairedHidden);
+    QCOMPARE(surface.pointsForStorage()(untouched + offset), untouchedHidden);
+
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const auto path = std::filesystem::path(dir.path().toStdString()) / "undo-inpaint";
+    surface.save(path);
+    QuadSurface reloaded(path);
+    QCOMPARE(reloaded.rawPoints()(repaired + offset), kInvalid);
+    QCOMPARE(reloaded.pointsForStorage()(repaired + offset), repairedHidden);
+    QCOMPARE(reloaded.channel("growth_exclusions").at<uint8_t>(repaired + offset), uint8_t{255});
+    QCOMPARE(reloaded.channel("generations").at<uint16_t>(repaired + offset), uint16_t{3});
 }
 
 void TestManualAddExtend::dragPicksTheNearestEdgeStretch()

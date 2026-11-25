@@ -36,6 +36,10 @@ public:
     void save(QuadSurface& surface, const cv::Rect& rect, const std::vector<std::string>& channels = {},
               std::optional<uint64_t> draftRevision = std::nullopt);
 
+    // Freeze the live geometry, loaded channels and separately retained hidden
+    // coordinates before an autosave worker starts, without loading other channels.
+    static std::shared_ptr<QuadSurface> snapshotForSave(QuadSurface& surface);
+
     vc::objects::PinnedObject pin() const;
     // The pin the edit started from (the opened surface's).
     const vc::objects::PinnedObject& origin() const { return _origin; }

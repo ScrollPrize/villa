@@ -135,6 +135,8 @@ public:
         const std::vector<geometry::SurfacePoint>& desired, const std::vector<GeometryEdgeEdit>& edges={}) const;
     // Float32 surface consumer adapter. Validity remains separate from XYZ;
     // unchanged displayed vertices reuse the exact canonical float32 values.
+    // This is a replacement grid: missing vertices clear old hidden coordinates,
+    // and validity comes from the replacement rather than the old grid indices.
     geometry::Surface canonicalSurface(const geometry::Surface& desired) const;
     // A whole edited fiber (points in the target volume) in canonical
     // coordinates. Control points keep their exact canonical values while
@@ -147,10 +149,13 @@ public:
     geometry::PointCollection canonicalPointCollection(const geometry::PointCollection& desired) const;
     // `validity`, when given, is the whole grid's validity the edits apply to
     // instead of the stored one (an earlier operation of the same request
-    // replaces the valid channel).
+    // replaces the valid channel). It remains authoritative when XYZ changes.
+    // `clearMaskedCoordinates` identifies explicit exclusions being replaced:
+    // a missing desired XYZ under explicit zero validity clears its hidden XYZ.
     std::vector<GeometryArrayEdit> surfaceEdits(int64_t row, int64_t column,
         int64_t rows, int64_t columns, const std::vector<geometry::SurfacePoint>& desired,
-        const std::vector<uint8_t>* validity = nullptr) const;
+        const std::vector<uint8_t>* validity = nullptr,
+        const std::vector<uint8_t>* clearMaskedCoordinates = nullptr) const;
     std::vector<geometry::Point> points(const std::string& array,int64_t start,int64_t count) const;
     // With applyValidity=false, transform all present coordinates and return validity separately.
     TransformedSurfaceTile readTile(int64_t row, int64_t column, int64_t rows, int64_t columns,

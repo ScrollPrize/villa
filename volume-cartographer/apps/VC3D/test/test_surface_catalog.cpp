@@ -494,7 +494,8 @@ void checkGrowthExclusionSaves(const fs::path& directory)
             exclusions(0, 0) = exclusions(0, 1) = 255;
             result.setChannel("growth_exclusions", exclusions);
             result.setChannel("generations", cv::Mat_<uint16_t>(4, 3, uint16_t{5}));
-            result.maskedVertices.push_back({{0, 0}, {0, 0, 10}});
+            const float hiddenZ = sameSize ? 12.f : 10.f;
+            result.maskedVertices.push_back({{0, 0}, {0, 0, hiddenZ}});
 
             result.rawPoints().copyTo(*opened.surface->rawPointsPtr());
             opened.surface->invalidateCache();
@@ -503,7 +504,13 @@ void checkGrowthExclusionSaves(const fs::path& directory)
                     "growth keeps excluded coordinates hidden in the GUI");
             const auto draft = SessionDrafts::surfaceForDraft(*opened.surface);
             session->setDraft(record.uuid, draft, volumeCoordinates("vol", 1), attachment, edit.pin().reference());
-            edit.save(*opened.surface, {0, 0, 3, 4}, {"mask", "growth_exclusions", "generations"},
+            // Use the same immutable snapshot as an active edit's autosave.
+            const auto snapshot = SurfaceStoreEdit::snapshotForSave(*opened.surface);
+            require(snapshot->maskedVertices.size() == 1 &&
+                    snapshot->pointsForStorage()(0, 0) == cv::Vec3f(0, 0, hiddenZ) &&
+                    (*snapshot->rawPointsPtr())(0, 0) == cv::Vec3f(-1, -1, -1),
+                    "autosave snapshot retains hidden XYZ without exposing it as live geometry");
+            edit.save(*snapshot, {0, 0, 3, 4}, snapshot->channelNames(),
                       session->draftRevision(record.uuid));
 
             auto reloaded = SurfaceCatalog::open(session, attachment, {"vol", 1}, record.uuid);
@@ -518,8 +525,13 @@ void checkGrowthExclusionSaves(const fs::path& directory)
                         "same-grid GUI save persists a newly valid point");
             session->readStore(attachment, [&](const StoreReader& reader, const auto&) {
                 const auto stored = load_quad_from_store(reader, record.uuid, std::nullopt, false);
-                require((*stored->rawPointsPtr())(0, 0) == cv::Vec3f(0, 0, 10),
-                        "GUI save retains hidden XYZ separately from displayed geometry");
+                require((*stored->rawPointsPtr())(0, 0) == cv::Vec3f(0, 0, hiddenZ),
+                        "GUI autosave retains changed hidden XYZ separately from displayed geometry");
+                const auto selected = reader.currentObject(record.uuid);
+                require(selected && selected->geometryRevision &&
+                        reader.readGeometryRectangle(*selected->geometryRevision, "valid", 0, 0, 1, 1) ==
+                            std::vector<uint8_t>{0},
+                        "same-size autosave honors explicit zero validity when hidden XYZ changes");
             });
         }
         (*opened.surface->rawPointsPtr())(2, 2)[2] = 11;
@@ -553,6 +565,108 @@ void checkGrowthExclusionSaves(const fs::path& directory)
     edit.save(*opened.surface, {0, 0, 3, 4}, {"mask", "growth_exclusions", "generations"}, contents->revision);
     require((*SurfaceCatalog::open(session, attachment, {"vol", 1}, record.uuid).surface->rawPointsPtr())(0, 0) ==
                 cv::Vec3f(-1, -1, -1), "recovered growth remains masked after another GUI save");
+}
+
+void checkTransformedGrowthExclusionSaves(const fs::path& directory)
+{
+    const auto path = directory / "transformed-growth-exclusions.vcobj";
+    OpenOptions options; options.author = "transformed-growth-exclusion-test";
+    { auto store = ObjectStore::create(path, options); }
+    auto session = std::make_shared<ObjectStoreSession>();
+    const auto attachment = session->attach(path, options);
+    ObjectRecord record; record.uuid = util::newUuid(); record.kind = "surface";
+    record.meta = nlohmann::json{{"coordinates", volumeCoordinates("source", 1)}}.dump();
+    cv::Mat_<cv::Vec3f> initial(3, 3);
+    for (int r = 0; r < initial.rows; ++r)
+        for (int c = 0; c < initial.cols; ++c) initial(r, c) = {float(c), float(r), 10.f};
+    QuadSurface original(initial, {1.f, 1.f});
+    auto initialMask = original.validMask().clone();
+    initialMask(0, 0) = 0;
+    original.setChannel("mask", initialMask);
+    cv::Mat_<uint8_t> initialExclusions(initial.size(), uint8_t{0});
+    initialExclusions(0, 0) = 255;
+    original.setChannel("growth_exclusions", initialExclusions);
+    storeSurface(*session, attachment, record, quad_surface_geometry(original));
+    VolumeAffine translation;
+    translation(0, 3) = 100;
+    translation(2, 3) = 20;
+    registerVolumeTransform(*session, attachment, "source", "target", translation, "growth-save-test");
+    auto opened = SurfaceCatalog::open(session, attachment, {"target", 1}, record.uuid);
+    SurfaceStoreEdit edit(session, opened.pin, opened.view);
+
+    // The replacement grid shifts every old vertex one cell down and right.
+    // Its vacated origin must not inherit the old origin's hidden coordinate.
+    cv::Mat_<cv::Vec3f> replacement(4, 4, cv::Vec3f(-1, -1, -1));
+    for (int r = 1; r < replacement.rows; ++r)
+        for (int c = 1; c < replacement.cols; ++c)
+            replacement(r, c) = {float(100 + c - 1), float(r - 1), 30.f};
+    replacement(1, 1) = {-1, -1, -1};
+    QuadSurface result(replacement, {1.f, 1.f});
+    result.setChannel("mask", result.validMask());
+    cv::Mat_<uint8_t> exclusions(replacement.size(), uint8_t{0});
+    exclusions(0, 1) = 255;  // explicit exclusion without any retained coordinate
+    exclusions(1, 1) = 255;
+    result.setChannel("growth_exclusions", exclusions);
+    result.setChannel("generations", cv::Mat_<uint16_t>(replacement.size(), uint16_t{5}));
+    result.maskedVertices.push_back({{1, 1}, {100, 0, 31}});
+    result.rawPoints().copyTo(*opened.surface->rawPointsPtr());
+    opened.surface->invalidateCache();
+    segmentation::applyGrowthChannels(*opened.surface, result);
+    const auto snapshot = SurfaceStoreEdit::snapshotForSave(*opened.surface);
+    edit.save(*snapshot, {0, 0, 4, 4}, snapshot->channelNames());
+
+    session->readStore(attachment, [&](const StoreReader& reader, const auto&) {
+        const auto stored = load_quad_from_store(reader, record.uuid, std::nullopt, false);
+        require((*stored->rawPointsPtr())(0, 0) == cv::Vec3f(-1, -1, -1),
+                "transformed grid replacement clears vacated slots instead of reusing old hidden XYZ");
+        require((*stored->rawPointsPtr())(1, 1) == cv::Vec3f(0, 0, 11),
+                "transformed grid replacement inverse-maps hidden XYZ at its new cell");
+        require((*stored->rawPointsPtr())(2, 2) == cv::Vec3f(1, 1, 10),
+                "transformed grid replacement inverse-maps visible geometry");
+        const auto selected = reader.currentObject(record.uuid);
+        require(selected && selected->geometryRevision, "replacement has stored geometry");
+        const auto validity = reader.readGeometryRectangle(*selected->geometryRevision, "valid", 0, 0, 2, 2);
+        const auto marker = reader.readGeometryRectangle(*selected->geometryRevision, "growth_exclusions", 0, 0, 2, 2);
+        require(validity == std::vector<uint8_t>{0, 0, 0, 0} &&
+                marker == std::vector<uint8_t>{0, 255, 0, 255},
+                "transformed grid replacement keeps validity and exclusions on their new cells");
+    });
+    const auto reloaded = SurfaceCatalog::open(session, attachment, {"target", 1}, record.uuid);
+    require((*reloaded.surface->rawPointsPtr())(1, 1) == cv::Vec3f(-1, -1, -1) &&
+            reloaded.surface->pointsForStorage()(1, 1) == cv::Vec3f(100, 0, 31),
+            "transformed autosave reload retains the replacement's hidden target XYZ");
+
+    SurfaceStoreEdit repairEdit(session, reloaded.pin, reloaded.view);
+    (*reloaded.surface->rawPointsPtr())(0, 1) = {101, 0, 30};
+    require(segmentation::markMaskCellsValid(*reloaded.surface, {{1, 0}}),
+            "repair makes the coordinate-free exclusion usable");
+    const auto repaired = SurfaceStoreEdit::snapshotForSave(*reloaded.surface);
+    repairEdit.save(*repaired, {0, 0, 4, 4}, repaired->channelNames());
+    require((*SurfaceCatalog::open(session, attachment, {"target", 1}, record.uuid).surface->rawPointsPtr())(0, 1) ==
+                cv::Vec3f(101, 0, 30), "repair saves the formerly excluded vertex as usable geometry");
+
+    // Undo restores a marker-only exclusion. There was no hidden XYZ before
+    // repair, so the newly saved coordinate must be deleted rather than hidden.
+    (*reloaded.surface->rawPointsPtr())(0, 1) = {-1, -1, -1};
+    reloaded.surface->channel("mask", SURF_CHANNEL_NORESIZE).at<uint8_t>(0, 1) = 0;
+    reloaded.surface->channel("growth_exclusions", SURF_CHANNEL_NORESIZE).at<uint8_t>(0, 1) = 255;
+    reloaded.surface->invalidateCache();
+    const auto undone = SurfaceStoreEdit::snapshotForSave(*reloaded.surface);
+    repairEdit.save(*undone, {0, 0, 4, 4}, undone->channelNames());
+    session->readStore(attachment, [&](const StoreReader& reader, const auto&) {
+        const auto stored = load_quad_from_store(reader, record.uuid, std::nullopt, false);
+        require((*stored->rawPointsPtr())(0, 1) == cv::Vec3f(-1, -1, -1),
+                "undo deletes repaired XYZ when restoring a coordinate-free explicit exclusion");
+        require((*stored->rawPointsPtr())(1, 1) == cv::Vec3f(0, 0, 11),
+                "undo preserves unrelated retained hidden XYZ");
+        const auto selected = reader.currentObject(record.uuid);
+        require(selected && selected->geometryRevision &&
+                reader.readGeometryRectangle(*selected->geometryRevision, "valid", 0, 1, 1, 1) ==
+                    std::vector<uint8_t>{0} &&
+                reader.readGeometryRectangle(*selected->geometryRevision, "growth_exclusions", 0, 1, 1, 1) ==
+                    std::vector<uint8_t>{255},
+                "undo restores the coordinate-free exclusion's validity and marker");
+    });
 }
 
 void checkDraftRecovery(const fs::path& sourcePath, const fs::path& directory)
@@ -625,6 +739,7 @@ int main(int argc, char** argv)
         checkToolMappingGuards(fs::path(dir.path().toStdString()));
         checkSelectedRegionInput(fs::path(dir.path().toStdString()));
         checkGrowthExclusionSaves(fs::path(dir.path().toStdString()));
+        checkTransformedGrowthExclusionSaves(fs::path(dir.path().toStdString()));
         if (argc > 1) checkDraftRecovery(argv[1], fs::path(dir.path().toStdString()));
         const std::filesystem::path volumeRoot1 = fs::path(dir.path().toStdString()) / "ct.zarr";
         const vcr::zarr::CreateOptions levelZero1{.shape = {4, 4, 4}, .chunks = {4, 4, 4}, .compressor = "", .overwrite = true};

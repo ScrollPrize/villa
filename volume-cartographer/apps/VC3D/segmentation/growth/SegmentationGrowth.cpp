@@ -113,6 +113,7 @@ nlohmann::json buildTracerParams(const SegmentationGrowthRequest& request)
     }
 
     params["inpaint"] = request.inpaintOnly;
+    if (request.manualAddPreview) params["repair_selected_exclusions"] = true;
 
     bool allowUp = false;
     bool allowDown = false;

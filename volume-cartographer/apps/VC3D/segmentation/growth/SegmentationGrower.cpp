@@ -1018,6 +1018,11 @@ void SegmentationGrower::onFutureFinished()
     }
 
     if (primarySurface && primaryPoints && resultPoints) {
+        if (request.inpaintOnly && _context.module && _context.module->hasActiveSession()) {
+            auto* base = _context.module->activeBaseSurface();
+            if (base && base->rawPointsPtr()->size() == resultPoints->size())
+                (void)_context.module->captureInpaintUndoSnapshot();
+        }
         std::swap(*primaryPoints, *resultPoints);
         primarySurface->invalidateCache();
     } else if (primarySurface && primaryPoints) {

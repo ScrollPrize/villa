@@ -62,9 +62,10 @@ void writeSheets(const fs::path& dir, const std::vector<int>& centres)
 
 // Odd dimensions exercise a coarse grid whose extent is not an exact multiple
 // of the scale factor. Empty padding and one excluded, populated cell coexist.
-void writeMaskedPlane(const fs::path& path, cv::Point excluded, float hiddenZ = 64.f)
+void writeMaskedPlane(const fs::path& path, cv::Point excluded, float hiddenZ = 64.f,
+                      cv::Size size = {15, 13})
 {
-    cv::Mat_<cv::Vec3f> points(13, 15, cv::Vec3f(-1, -1, -1));
+    cv::Mat_<cv::Vec3f> points(size, cv::Vec3f(-1, -1, -1));
     cv::Mat_<uint8_t> mask(points.size(), uint8_t(0));
     cv::Mat_<uint16_t> generations(points.size(), uint16_t(0));
     for (int r = 2; r < points.rows - 2; ++r)
@@ -386,6 +387,135 @@ TEST_CASE("An off-lattice exclusion survives coarse store output and full-resolu
     const auto fine = run(common + coarse, dir / "fine.log");
     const auto [fineCell, fineValid] = checkExcluded(fine, coarseCell);
     CHECK(fineValid > coarseValid);
+    std::error_code ignored;
+    fs::remove_all(dir, ignored);
+}
+
+TEST_CASE("Explicit selected repair does not inherit an unselected coarse-cell exclusion")
+{
+    const fs::path dir = fs::temp_directory_path() / ("vc-grow-selected-repair-" + util::newUuid());
+    writeSheets(dir, {64});
+    // Both cells occupy one factor-two or factor-four working cell. Only the
+    // off-lattice cell is selected; the sampled cell must remain excluded.
+    const cv::Point unselected(8, 8);
+    const cv::Point selected(9, 9);
+    writeMaskedPlane(dir / "source", unselected, 64.f, {21, 21});
+    auto source = load_quad_from_tifxyz(dir / "source");
+    auto mask = source->vertexMask();
+    auto points = source->pointsForStorage();
+    mask(selected) = 0;
+    QuadSurface input(points, source->scale());
+    input.setChannel("mask", mask);
+    input.setChannel("generations", source->channel("generations").clone());
+    input.save(dir / "source", true);
+
+    vcr::zarr::OpenOptions openOptions;
+    openOptions.memoryCache = std::make_shared<vcr::MemoryCache>(16 * 1024 * 1024);
+    auto volume = vcr::zarr::openPyramidLevel((dir / "volume.zarr").string(), 0, openOptions);
+    cv::Mat_<uint8_t> selection(points.size(), uint8_t(0));
+    selection(selected) = 255;
+    const auto shiftedCell = [](const QuadSurface& result, cv::Point inputCell) {
+        const auto offset = result.meta.at("grid_offset").get<std::vector<int>>();
+        return inputCell + cv::Point(offset[0], offset[1]);
+    };
+    for (const int level : {0, 1, 2}) {
+        INFO("growth_scale=" << level);
+        nlohmann::json params{{"generations", 3}, {"growth_scale", level}, {"resume_opt", "skip"},
+                              {"disable_grid_expansion", true}, {"thread_limit", 1}, {"min_area_cm", 0}};
+        // An ordinary allowed-growth mask is a limit, not permission to undo
+        // exclusions. Manual Add supplies the explicit repair opt-in below.
+        auto constrainedInput = load_quad_from_tifxyz(dir / "source");
+        std::unique_ptr<QuadSurface> constrained(tracer(*volume.array, 1.f, {64, 64, 64}, params,
+                                                      1.f, constrainedInput.get(), {}, {}, {}, &selection));
+        REQUIRE(constrained);
+        const cv::Point constrainedSelected = shiftedCell(*constrained, selected);
+        REQUIRE(cv::Rect(cv::Point{}, constrained->rawPointsPtr()->size()).contains(constrainedSelected));
+        CHECK_FALSE(vc::geometry::validSurfacePoint(constrained->rawPointsPtr()->at<cv::Vec3f>(constrainedSelected)));
+        CHECK(constrained->vertexMask()(constrainedSelected) == 0);
+        CHECK(constrained->channel("growth_exclusions").at<uint8_t>(constrainedSelected) == 255);
+
+        params["repair_selected_exclusions"] = true;
+        auto repairInput = load_quad_from_tifxyz(dir / "source");
+        std::unique_ptr<QuadSurface> repaired(tracer(*volume.array, 1.f, {64, 64, 64}, params,
+                                                   1.f, repairInput.get(), {}, {}, {}, &selection));
+        REQUIRE(repaired);
+        const cv::Point repairedSelected = shiftedCell(*repaired, selected);
+        const cv::Point repairedUnselected = shiftedCell(*repaired, unselected);
+        REQUIRE(cv::Rect(cv::Point{}, repaired->rawPointsPtr()->size()).contains(repairedSelected));
+        REQUIRE(cv::Rect(cv::Point{}, repaired->rawPointsPtr()->size()).contains(repairedUnselected));
+        CHECK(vc::geometry::validSurfacePoint(repaired->rawPointsPtr()->at<cv::Vec3f>(repairedSelected)));
+        CHECK(repaired->vertexMask()(repairedSelected) == 255);
+        CHECK(repaired->channel("growth_exclusions").at<uint8_t>(repairedSelected) == 0);
+        CHECK_FALSE(vc::geometry::validSurfacePoint(repaired->rawPointsPtr()->at<cv::Vec3f>(repairedUnselected)));
+        CHECK(repaired->vertexMask()(repairedUnselected) == 0);
+        CHECK(repaired->channel("growth_exclusions").at<uint8_t>(repairedUnselected) == 255);
+        CHECK(repaired->pointsForStorage()(repairedUnselected) == points(unselected));
+    }
+    std::error_code ignored;
+    fs::remove_all(dir, ignored);
+}
+
+TEST_CASE("Inpaint retains solved coordinates and clears repaired exclusions")
+{
+    const fs::path dir = fs::temp_directory_path() / ("vc-grow-inpaint-repair-" + util::newUuid());
+    writeSheets(dir, {64});
+    const cv::Point hole(8, 8);
+    // A deliberately incorrect hidden coordinate must not overwrite the
+    // geometry reconstructed from the surrounding sheet.
+    writeMaskedPlane(dir / "source", hole, 84.f, {21, 21});
+    {
+        auto initial = load_quad_from_tifxyz(dir / "source");
+        auto mask = initial->vertexMask();
+        mask(2, 2) = 0;  // boundary indentation, not a closed Inpaint hole
+        QuadSurface input(initial->pointsForStorage(), initial->scale());
+        input.setChannel("mask", mask);
+        input.setChannel("generations", initial->channel("generations").clone());
+        input.save(dir / "source", true);
+    }
+    auto source = load_quad_from_tifxyz(dir / "source");
+    vcr::zarr::OpenOptions openOptions;
+    openOptions.memoryCache = std::make_shared<vcr::MemoryCache>(16 * 1024 * 1024);
+    auto volume = vcr::zarr::openPyramidLevel((dir / "volume.zarr").string(), 0, openOptions);
+    const nlohmann::json params{{"generations", 3}, {"inpaint", true}, {"resume_opt", "skip"},
+                                {"thread_limit", 1}, {"min_area_cm", 0}};
+    std::unique_ptr<QuadSurface> result(tracer(*volume.array, 1.f, {64, 64, 64}, params, 1.f, source.get()));
+    REQUIRE(result);
+    const auto solved = result->rawPointsPtr()->at<cv::Vec3f>(hole);
+    CHECK(vc::geometry::validSurfacePoint(solved));
+    CHECK(std::abs(solved[2] - 64.f) < 1.f);
+    CHECK(result->vertexMask()(hole) == 255);
+    CHECK(result->channel("growth_exclusions").at<uint8_t>(hole) == 0);
+    CHECK_FALSE(vc::geometry::validSurfacePoint(result->rawPointsPtr()->at<cv::Vec3f>(2, 2)));
+    CHECK(result->vertexMask()(2, 2) == 0);
+    CHECK(result->channel("growth_exclusions").at<uint8_t>(2, 2) == 255);
+    std::error_code ignored;
+    fs::remove_all(dir, ignored);
+}
+
+TEST_CASE("Coarse Inpaint leaves unsolved off-lattice exclusions masked")
+{
+    const fs::path dir = fs::temp_directory_path() / ("vc-grow-inpaint-unsolved-" + util::newUuid());
+    writeSheets(dir, {64});
+    const cv::Point hole(9, 9);
+    writeMaskedPlane(dir / "source", hole, 84.f, {21, 21});
+    vcr::zarr::OpenOptions openOptions;
+    openOptions.memoryCache = std::make_shared<vcr::MemoryCache>(16 * 1024 * 1024);
+    auto volume = vcr::zarr::openPyramidLevel((dir / "volume.zarr").string(), 0, openOptions);
+    for (const int level : {1, 2}) {
+        INFO("growth_scale=" << level);
+        auto source = load_quad_from_tifxyz(dir / "source");
+        const auto original = source->pointsForStorage()(hole);
+        const nlohmann::json params{{"generations", 3}, {"inpaint", true}, {"growth_scale", level},
+                                    {"thread_limit", 1}, {"min_area_cm", 0}};
+        std::unique_ptr<QuadSurface> result(tracer(*volume.array, 1.f, {64, 64, 64}, params, 1.f, source.get()));
+        REQUIRE(result);
+        // Nearest coarse sampling never saw this hole. Interpolation alone
+        // must not imply that an Inpaint solve repaired the exclusion.
+        CHECK_FALSE(vc::geometry::validSurfacePoint(result->rawPointsPtr()->at<cv::Vec3f>(hole)));
+        CHECK(result->vertexMask()(hole) == 0);
+        CHECK(result->channel("growth_exclusions").at<uint8_t>(hole) == 255);
+        CHECK(result->pointsForStorage()(hole) == original);
+    }
     std::error_code ignored;
     fs::remove_all(dir, ignored);
 }

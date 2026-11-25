@@ -177,7 +177,8 @@ vc::objects::GeometryData quad_surface_geometry(QuadSurface& surface)
 }
 
 std::optional<vc::objects::EditGeometryOp> quad_rect_edit(const vc::objects::TransformedGeometryView& view,
-    QuadSurface& surface, const cv::Rect& rect, const std::vector<uint8_t>* validity)
+    QuadSurface& surface, const cv::Rect& rect, const std::vector<uint8_t>* validity,
+    const std::vector<uint8_t>* clearMaskedCoordinates)
 {
     const auto& revision = view.revision();
     if (revision.kind != "surface") throw std::runtime_error("not a stored surface: " + revision.objectUuid);
@@ -194,7 +195,7 @@ std::optional<vc::objects::EditGeometryOp> quad_rect_edit(const vc::objects::Tra
             const auto p = points(r, c);
             desired.push_back({p[0], p[1], p[2]});
         }
-    auto edits = view.surfaceEdits(area.y, area.x, area.height, area.width, desired, validity);
+    auto edits = view.surfaceEdits(area.y, area.x, area.height, area.width, desired, validity, clearMaskedCoordinates);
     if (edits.empty()) return std::nullopt;
     return vc::objects::EditGeometryOp{revision.objectUuid, std::move(edits), {}, true};
 }

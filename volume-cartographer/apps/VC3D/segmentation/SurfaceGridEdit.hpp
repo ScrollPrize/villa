@@ -9,6 +9,8 @@ class QuadSurface;
 namespace segmentation
 {
 
+struct VertexDelta;
+
 // Grows (positive) or shrinks (negative) a surface's vertex grid on each side.
 // New vertices are invalid (-1, -1, -1); every channel, including ones not yet
 // loaded from disk, is padded or cropped with it so it stays aligned with the
@@ -24,6 +26,11 @@ bool resizeSurfaceGrid(QuadSurface& surface, int top, int bottom, int left, int 
 // saved, or the geometry is dropped on the next load. Returns true if a mask
 // exists and was changed.
 bool markMaskCellsValid(QuadSurface& surface, const std::vector<cv::Point>& cells);
+
+// Activate only completed repairs, retaining each changed cell's prior mask,
+// exclusion marker and hidden coordinates in the same undo delta as its XYZ.
+bool activateRepairedVertices(QuadSurface& surface, std::vector<VertexDelta>& deltas);
+bool restoreRepairedVertices(QuadSurface& surface, const std::vector<VertexDelta>& deltas);
 
 // Install the channels that describe a tracer's replacement grid, including
 // explicit exclusions and their retained coordinates, before it is saved.
