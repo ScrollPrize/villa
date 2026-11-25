@@ -1,5 +1,58 @@
 """Discover segment directories and select versioned label assets.
 
+v4 — focused flat-discovery repair for PR #2677 (review: villa-review,
+24/11/2026, third review of the v3 head at 1d22a4a). v3 fixed the six
+points of review 2; review 3 found five new ones, all in the repair
+rules v3 added, plus a hole in held-out preflight. v4 follows the
+reviewer's direction — a minimal, discovery-targeted change — and keeps
+a v3 rule only when a case justifies it:
+
+C1. An unfinished sibling in automatic discovery no longer aborts
+    labeled training. A TIFF-free folder with an image volume but no
+    label assets at all is skipped with a warning; training proceeds
+    on the ready segments and the sibling is picked up once its labels
+    arrive. A folder WITH native geometry (x.tif) but no labels still
+    fails loudly — main discovers it by its geometry and requires its
+    labels, so that is a segment whose labels were deleted, not one
+    whose labels never arrived. A segment that HAS label assets but
+    cannot use them (version mismatch, supervision present with ink
+    missing) still fails loudly, as does any held-out or explicitly
+    selected segment.
+C3. Readable fill-only masks keep their meaning. The supervision and
+    validation gates now test readability (metadata), not chunk
+    presence: a readable store without chunks is an all-zero mask
+    (the label writer omits fill-only chunks), not an unfinished
+    mirror. Such a segment is admitted — it may contribute only
+    validation patches. An unreadable store (no metadata) still makes
+    the segment wait. (The ink gate already used metadata in v3.)
+C4. A selected supervision mask must be readable before its segment
+    supplies unlabeled patches. In unlabeled discovery an unreadable
+    supervision store now raises instead of being silently dropped
+    (dropping it bypassed the supervision exclusion). A readable but
+    empty supervision mask is still dropped — it excludes nothing.
+    An unreadable ink mask is still dropped: the unlabeled finder
+    never reads inklabels, so dropping it matches main.
+H1. Held-out preflight now preserves the full selected set. An
+    explicitly selected segment can no longer disappear silently:
+    an allowlisted native segment without x.tif raises, and an
+    explicitly configured segment with a missing image raises even
+    in unlabeled mode (the unlabeled branch used to return None
+    silently). The allowlist/map completeness check of v3 is kept.
+H2. A sibling with only its original label TIFFs is now a recognised
+    segment attempt: its TIFFs count as markers, so the automatic
+    scan fails preflight for it in a held-out source instead of
+    warning and dropping it, and an explicit map that forgets it
+    raises KeyError. A preview TIFF is still not a marker.
+
+Kept from v3 (each justified by a case): the explicit-map KeyError
+(B1), the label-version ValueError (B1b), the incomplete-plan
+protection in the downloader (B2, extended in v4 to fresh outputs),
+the ink-metadata gate (B3), the unreadable-validation-mask wait (B4),
+and the failed-segment exclusion in dataset.py (B5). Dropped from v3:
+the supervision/validation chunk-content gates (C3 — they rejected
+valid sparse masks) and the claim that an unlabeled segment yielding
+no patches raises (dataset.py — the finder returns ([], []); see C5).
+
 v3 — targeted flat-discovery fix for PR #2677 (review: villa-review, 24/11/2026,
 second review of the v2 head at 8d50b31).
 
@@ -137,15 +190,47 @@ def zarr_store_has_metadata(store: str | Path) -> bool:
         return False
 
 
+def _has_original_label_tiffs(segment_dir: Path) -> bool:
+    """True when the folder holds original label TIFFs (the TIFF files
+    the Zarr labels were converted from).
+
+    A ``.tif``/``.tiff`` whose stem, ignoring a trailing ``_vN`` version,
+    ends with a label kind name (``inklabels``, ``supervision_mask``,
+    ``validation_mask``) — with or without a segment-name prefix. These
+    are segment markers even when no Zarr label asset exists yet: a
+    sibling with only its label TIFFs is a segment attempt, not an
+    unrelated folder, so it must not disappear silently from a scan.
+    A preview TIFF (any other name) is still not a marker.
+    """
+    kinds = tuple(kind for _suffix, kind in _LABEL_SUFFIXES)
+    try:
+        for path in segment_dir.iterdir():
+            if not path.is_file() or path.suffix.lower() not in {".tif", ".tiff"}:
+                continue
+            stem = path.stem
+            parts = stem.rsplit("_", 1)
+            if (
+                len(parts) == 2
+                and parts[1].startswith("v")
+                and parts[1][1:].isdigit()
+            ):
+                stem = parts[0]
+            if stem.endswith(kinds):
+                return True
+    except OSError:
+        return False
+    return False
+
+
 def _segment_markers(segment_dir: Path) -> dict[str, bool]:
     """Which segment markers a folder carries (tight definition).
 
     A preview TIFF is NOT a marker: only the assets a segment is made
     of count — native geometry (``x.tif``), the conventional flat image
-    volume (``<name>.zarr``), or label assets whose parsed prefix equals
-    the folder name. A folder with at least one marker is a recognised
-    segment (or segment attempt); a folder with none is unrelated and
-    may be skipped silently.
+    volume (``<name>.zarr``), label assets whose parsed prefix equals
+    the folder name, or original label TIFFs (``_has_original_label_tiffs``).
+    A folder with at least one marker is a recognised segment (or segment
+    attempt); a folder with none is unrelated and may be skipped silently.
     """
     name = segment_dir.name
     has_geometry = (segment_dir / "x.tif").is_file()
@@ -159,11 +244,13 @@ def _segment_markers(segment_dir: Path) -> dict[str, bool]:
                 break
     except OSError:
         pass
+    has_label_tifs = _has_original_label_tiffs(segment_dir)
     return {
         "geometry": has_geometry,
         "image": has_image,
         "labels": has_labels,
-        "recognized": has_geometry or has_image or has_labels,
+        "label_tifs": has_label_tifs,
+        "recognized": has_geometry or has_image or has_labels or has_label_tifs,
     }
 
 
@@ -346,7 +433,17 @@ def _resolve_labels_or_fail(
     but in another version) or the labels are missing entirely. Both
     are configuration errors for a recognised segment — main refuses
     them — so they raise here, except when the folder carries no segment
-    markers at all (not a segment: skip silently).
+    markers at all (not a segment: skip silently) and except for an
+    auto-discovered TIFF-free folder with an image but no label assets
+    at all (C1): that is an unfinished sibling whose labels have not
+    arrived yet, not a broken segment — it is skipped with a warning
+    and training proceeds on the ready segments. A folder with native
+    geometry (x.tif) but no labels is not covered by that exception:
+    main discovers it by its geometry and requires its labels, so it
+    still raises (labels deleted, not labels never arrived). Explicit
+    selections never reach this function (they call
+    :func:`discover_segment_labels` directly), so their completeness
+    checks are unaffected.
     """
     try:
         return discover_segment_labels(segment, extension=".zarr", required=required)
@@ -355,6 +452,29 @@ def _resolve_labels_or_fail(
             return None
         if held_out:
             raise
+        if not _label_assets_present(segment.segment_dir) and not (
+            has_tifxyz_geometry(segment.segment_dir)
+        ):
+            # C1: image-only TIFF-free sibling in automatic discovery.
+            # No label asset of any kind exists yet and the folder
+            # carries no native geometry either — the labels simply
+            # have not arrived (the image syncs first). Skip it with a
+            # warning; it will be picked up on a later run once its
+            # labels are there. A folder WITH native geometry (x.tif)
+            # but no labels is a different case: main discovers it by
+            # its geometry and requires its labels, so it still raises
+            # below (a segment whose labels were deleted, not one whose
+            # labels never arrived). A segment that HAS label assets but
+            # cannot use them (version mismatch, supervision without
+            # ink) also still raises below: its labels arrived and are
+            # broken.
+            warnings.warn(
+                f"{segment.segment_dir}: skipping segment: no label assets "
+                "yet (unfinished mirror); training proceeds on the ready "
+                "segments, and it will be picked up once its labels arrive.",
+                stacklevel=3,
+            )
+            return None
         raise ValueError(
             f"{segment.segment_dir}: {exc} (segment recognised but its "
             "labels cannot be used; fix the labels or the requested "
@@ -382,6 +502,12 @@ def _gather_one(
     any unfinished or unreadable store of a recognised segment in a
     held-out source. A training segment in the same state is warned
     about and skipped instead, and picked up on a later run.
+    Two v4 exceptions: an auto-discovered folder with an image but no
+    label assets at all (C1) is warned about and skipped even though it
+    is recognised — its labels have not arrived yet — and an unreadable
+    supervision mask in unlabeled discovery (C4) raises even for a
+    training segment, because dropping it would emit patches without
+    the supervision exclusion.
     """
     allowlist = set(source.segment_names)
     is_allowlisted = segment_dir.name in allowlist
@@ -394,6 +520,16 @@ def _gather_one(
         # the sample reader cannot open coordinates, so the folder is not
         # a native segment at all.
         if not has_tifxyz_geometry(segment_dir):
+            if is_allowlisted:
+                # H1: an explicitly selected segment must not disappear
+                # silently. Its folder exists but holds no geometry
+                # (empty, or still syncing): fail loudly so preflight
+                # cannot report the selected set as complete without it.
+                raise ValueError(
+                    f"{segment_dir}: explicitly selected segment "
+                    f"{segment_dir.name!r} has no tifxyz geometry (x.tif); "
+                    "its folder is empty or incomplete."
+                )
             if _looks_segment_like(segment_dir):
                 warnings.warn(
                     f"{segment_dir}: skipping segment: no tifxyz geometry "
@@ -460,7 +596,11 @@ def _gather_one(
     if not native_mode and not explicit_surface and not is_allowlisted:
         # ---- Auto-discovered flat candidate: strict, content-based gate. ----
         if not Path(image_volume).exists():
-            if markers["labels"] or markers["geometry"]:
+            if markers["labels"] or markers["geometry"] or markers["label_tifs"]:
+                # H2: a folder carrying label assets, geometry, or only
+                # its original label TIFFs is a segment attempt, not an
+                # unrelated folder — it must fail preflight in a held-out
+                # source instead of disappearing from the scan.
                 _fail_or_skip(
                     segment_dir,
                     held_out=held_out,
@@ -503,15 +643,20 @@ def _gather_one(
                     stacklevel=3,
                 )
                 return None
-            if not zarr_store_has_chunks(segment.supervision_mask):
-                # A supervision store without chunks holds no supervised
-                # voxels, so the segment could yield no patches anyway.
+            if not zarr_store_has_metadata(segment.supervision_mask):
+                # C3: only an UNREADABLE supervision store makes the
+                # segment unfinished. A readable store without chunks
+                # is an all-zero supervision mask — the label writer
+                # omits fill-only chunks — so the segment is ready: it
+                # yields no training patches but may yield validation
+                # patches (see find_segment_patches, whose support is
+                # supervision OR validation). No chunk gate here.
                 _fail_or_skip(
                     segment_dir,
                     held_out=held_out,
                     message=(
                         "skipping segment: supervision store "
-                        f"{segment.supervision_mask} holds no chunks yet "
+                        f"{segment.supervision_mask} is unreadable "
                         "(unfinished mirror); it will be picked up once "
                         "its store is filled."
                     ),
@@ -541,6 +686,15 @@ def _gather_one(
         else:
             # Unlabeled discovery: present-but-empty label stores are not
             # usable labels; drop them instead of rejecting the segment.
+            # C4: a selected supervision mask must be READABLE before its
+            # segment supplies unlabeled patches. Dropping an unreadable
+            # store would silently bypass the supervision exclusion (the
+            # finder would emit patches over supervised regions), so it
+            # raises — like main, which stops on the failed read. A
+            # readable but empty supervision mask is still dropped: it
+            # is an all-zero mask and excludes nothing. An unreadable
+            # ink mask is still dropped: the unlabeled finder never
+            # reads inklabels, so dropping it matches main.
             if segment.inklabels is not None and not zarr_store_has_chunks(
                 segment.inklabels
             ):
@@ -548,20 +702,30 @@ def _gather_one(
             if segment.supervision_mask is not None and not zarr_store_has_chunks(
                 segment.supervision_mask
             ):
+                if not zarr_store_has_metadata(segment.supervision_mask):
+                    raise ValueError(
+                        f"{segment.supervision_mask} is unreadable "
+                        "(unfinished mirror); a selected supervision mask "
+                        "must be readable before its segment supplies "
+                        "unlabeled patches"
+                    )
                 segment = replace(segment, supervision_mask=None)
-        if segment.validation_mask is not None and not zarr_store_has_chunks(
+        if segment.validation_mask is not None and not zarr_store_has_metadata(
             segment.validation_mask
         ):
-            # A selected validation mask must govern training supervision,
-            # or the segment must wait until its validation regions can
-            # be read. Dropping the mask (v2) would train over held-out
-            # pixels, so the segment waits instead.
+            # C3: only an UNREADABLE validation mask makes the segment
+            # wait. A readable mask without chunks is an all-zero
+            # validation mask — the label writer omits fill-only chunks
+            # — which simply means "no held-out regions": the segment
+            # is admitted and yields training patches. Dropping the
+            # mask (v2) would train over held-out pixels, so an
+            # unreadable mask still makes the segment wait instead.
             _fail_or_skip(
                 segment_dir,
                 held_out=held_out,
                 message=(
                     "skipping segment: validation mask "
-                    f"{segment.validation_mask} holds no chunks yet "
+                    f"{segment.validation_mask} is unreadable "
                     "(unfinished mirror); the segment waits until its "
                     "validation regions can be read."
                 ),
@@ -582,12 +746,15 @@ def _gather_one(
         _REMOTE_VOLUME_PREFIXES
     )
     if not image_is_remote and not Path(image_volume).exists():
-        if config.discovery_mode == "unlabeled":
-            return None
         if explicitly_configured:
+            # H1: an explicitly configured segment must not disappear
+            # silently — the check comes before the unlabeled branch,
+            # which used to return None here without a word.
             raise ValueError(
                 f"{segment_dir.name} is missing its image volume {image_volume}"
             )
+        if config.discovery_mode == "unlabeled":
+            return None
         warnings.warn(
             f"{segment_dir}: skipping segment: missing image volume "
             f"{image_volume}.",
