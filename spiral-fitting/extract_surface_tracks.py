@@ -258,8 +258,9 @@ def prepare_cc_labels(predictions_binary):
     return cc_labels
 
 
-def _slab_tracks(predictions_zarr_array, index, offset_zyx, kimimaro_processes):
-    # Pickled tracks of one slab (read, binarize, CC, skeletonize), as stored in the DBM.
+def _slab_tracks(predictions_zarr_array, index, offset_zyx, kimimaro_processes=None):
+    # Pickled tracks of one slab (read, binarize, CC, skeletonize), as stored in the DBM. None
+    # Kimimaro processes means the count for slabs run one at a time, as in the metal fallback
     predictions = binarize(predictions_zarr_array[index])
     if predictions.max() == 0:
         return pickle.dumps([])
@@ -653,8 +654,10 @@ class MetalSlabs:
     def labels(self, predictions):
         """Pooled labels of one binarized slab, or None when teasar declines it."""
         try:
+            # teasar takes C-order arrays only, and a Fortran-order Zarr v2 slab binarizes to
+            # Fortran order; a no-op for the usual C-order slab
             return self.device.prepare_labels(
-                predictions, downsample_factor, max(1, dust_threshold // downsample_factor ** 3),
+                np.ascontiguousarray(predictions), downsample_factor, max(1, dust_threshold // downsample_factor ** 3),
                 max(1, max_area_threshold // downsample_factor ** 3), settings=self.settings)
         except (self.teasar.UnsupportedSettings, self.teasar.InputTooLarge):
             return None
@@ -665,11 +668,10 @@ class MetalSlabs:
         pending = []  # (position, labels, offset) of the slabs left for one skeletonize call
         for i, (_, index, offset) in enumerate(batch):
             predictions = binarize(predictions_zarr_array[index])
-            if predictions.max() == 0:
+            # a slab thinner than one max-pool cell pools to nothing, so it has no tracks, as the
+            # job lists record for the thin slabs they skip
+            if predictions.max() == 0 or min(predictions.shape) < downsample_factor:
                 results[i] = pickle.dumps([])
-                continue
-            if min(predictions.shape) < downsample_factor:
-                results[i] = _slab_tracks(predictions_zarr_array, index, offset)
                 continue
             labels = self.labels(predictions)
             del predictions
