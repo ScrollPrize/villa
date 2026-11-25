@@ -138,7 +138,9 @@ scripts/build_macos.sh --install-deps
 The build links Homebrew's `libomp`, so the `vc_*` tools run their OpenMP
 regions on every core, as the Linux build does; `OMP_NUM_THREADS` or a tool's
 own thread option caps them. VC3D itself keeps OpenMP at one thread and runs
-its work on its own thread pool.
+its work on its own thread pool. The Python module `vc.grid_raycast` stays
+serial on macOS, because torch's wheels bring their own `libomp` and two
+OpenMP runtimes in one process stop with OMP Error #15.
 
 After dependencies are installed, rebuilds can use:
 

@@ -581,6 +581,11 @@ if(VC_BUILD_PYTHON)
     find_package(nanobind CONFIG REQUIRED)
 endif()
 
+# The no-op OpenMP shim as a target of its own, so a target that must stay
+# serial in a build with real OpenMP (the macOS Python modules) can link it
+add_library(openmp_stub INTERFACE)
+target_include_directories(openmp_stub INTERFACE ${CMAKE_SOURCE_DIR}/core/openmp_stub)
+
 if((CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND NOT APPLE) OR MSVC)
     # Clang off macOS and MSVC use the no-op OpenMP shim: -fopenmp / -openmp is
     # never enabled, so every `#pragma omp` is ignored and the omp_*() runtime
@@ -590,7 +595,6 @@ if((CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND NOT APPLE) OR MSVC)
     # build link real OpenMP. (MSVC silences the resulting unknown-pragma C4068
     # in the compiler-family block.)
     include_directories(${CMAKE_SOURCE_DIR}/core/openmp_stub)
-    add_library(openmp_stub INTERFACE)
     add_library(OpenMP::OpenMP_CXX ALIAS openmp_stub)
     add_library(OpenMP::OpenMP_C  ALIAS openmp_stub)
 else()
