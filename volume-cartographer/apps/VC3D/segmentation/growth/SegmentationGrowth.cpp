@@ -93,7 +93,6 @@ nlohmann::json buildTracerParams(const SegmentationGrowthRequest& request)
     nlohmann::json params = nlohmann::json::object();
     params["rewind_gen"] = -1;
     params["grow_mode"] = directionToString(request.direction).toStdString();
-    params["grow_steps"] = std::max(0, request.steps);
     params["grow_extra_rows"] = 0;
     params["grow_extra_cols"] = 0;
 
@@ -159,6 +158,7 @@ nlohmann::json buildTracerParams(const SegmentationGrowthRequest& request)
             params[it.key()] = *it;
         }
     }
+    params["grow_steps"] = std::max(0, request.steps);
     return params;
 }
 } // namespace
@@ -201,66 +201,6 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
 
     nlohmann::json params = buildTracerParams(request);
 
-    int startGen = 0;
-    {
-        cv::Mat resumeGenerations = context.resumeSurface->channel("generations");
-        if (!resumeGenerations.empty()) {
-            double minVal = 0.0;
-            double maxVal = 0.0;
-            cv::minMaxLoc(resumeGenerations, &minVal, &maxVal);
-            startGen = static_cast<int>(std::round(maxVal));
-        }
-
-        if (!context.resumeSurface->meta.is_null() && context.resumeSurface->meta.is_object()) {
-            const auto& meta = context.resumeSurface->meta;
-            if (meta.contains("max_gen")) {
-                const auto& v = meta["max_gen"];
-                if (v.is_number()) {
-                    const int metaGen = static_cast<int>(std::round(v.get<double>()));
-                    startGen = std::max(startGen, metaGen);
-                }
-            }
-        }
-
-        if (startGen <= 0) {
-            bool hasValidPoints = false;
-            const auto* resumePoints = context.resumeSurface->rawPointsPtr();
-            if (resumePoints && !resumePoints->empty()) {
-                for (int row = 0; row < resumePoints->rows && !hasValidPoints; ++row) {
-                    for (int col = 0; col < resumePoints->cols; ++col) {
-                        const cv::Vec3f& point = resumePoints->operator()(row, col);
-                        if (point[0] != -1.0f) {
-                            hasValidPoints = true;
-                            break;
-                        }
-                    }
-                }
-            }
-            if (hasValidPoints) {
-                startGen = 1;
-                qCWarning(lcSegGrowth) << "Resume surface missing generation metadata; defaulting start generation to 1.";
-            }
-        }
-    }
-
-    const int requestedSteps = std::max(request.steps, 0);
-    int targetGenerations = startGen;
-
-    if (requestedSteps > 0) {
-        targetGenerations = startGen + requestedSteps;
-    }
-
-    if (targetGenerations < startGen) {
-        targetGenerations = startGen;
-    }
-    if (targetGenerations <= 0) {
-        targetGenerations = startGen;
-    }
-
-    params["generations"] = targetGenerations;
-    if (!params.contains("rewind_gen")) {
-        params["rewind_gen"] = -1;
-    }
     if (!context.normalGridPath.isEmpty()) {
         params["normal_grid_path"] = context.normalGridPath.toStdString();
     }

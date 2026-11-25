@@ -519,3 +519,89 @@ TEST_CASE("Coarse Inpaint leaves unsolved off-lattice exclusions masked")
     std::error_code ignored;
     fs::remove_all(dir, ignored);
 }
+
+TEST_CASE("A masked generation survives rewind without limiting later growth")
+{
+    const fs::path dir = fs::temp_directory_path() / ("vc-grow-rewind-" + util::newUuid());
+    writeSheets(dir, {64});
+    const cv::Point excluded(2, 2);
+    writeMaskedPlane(dir / "source", excluded);
+    auto source = load_quad_from_tifxyz(dir / "source");
+    auto mask = source->vertexMask();
+    auto points = source->pointsForStorage();
+    const auto hiddenXYZ = points(excluded);
+    cv::Mat_<uint16_t> generations = source->channel("generations");
+    for (int r = 0; r < generations.rows; ++r)
+        for (int c = 0; c < generations.cols; ++c)
+            if (generations(r, c)) generations(r, c) = 1 + std::max(std::abs(r - 6), std::abs(c - 7));
+    generations(excluded) = 9;
+    QuadSurface input(points, source->scale());
+    input.id = "rewind-input";
+    input.setChannel("mask", mask);
+    input.setChannel("generations", generations);
+
+    vcr::zarr::OpenOptions options;
+    options.memoryCache = std::make_shared<vcr::MemoryCache>(16 * 1024 * 1024);
+    const auto volume = vcr::zarr::openPyramidLevel((dir / "volume.zarr").string(), 0, options);
+    const auto resume = [&](QuadSurface& surface, const nlohmann::json& params,
+                            const PointCollections& corrections = PointCollections()) {
+        return std::unique_ptr<QuadSurface>(tracer(*volume.array, 1.f, {64, 64, 64}, params,
+                                                  1.f, &surface, {}, {}, corrections));
+    };
+    const auto visibleGeneration = [](QuadSurface& surface) {
+        double latest = 0;
+        cv::minMaxLoc(surface.channel("generations"), nullptr, &latest, nullptr, nullptr, surface.vertexMask());
+        return int(latest);
+    };
+    const auto shifted = [](const QuadSurface& surface, const cv::Point& cell) {
+        const auto offset = surface.meta.at("grid_offset").get<std::vector<int>>();
+        return cell + cv::Point(offset[0], offset[1]);
+    };
+    const auto checkExclusion = [&](QuadSurface& surface, const cv::Point& cell) {
+        REQUIRE(cv::Rect(cv::Point{}, surface.rawPoints().size()).contains(cell));
+        CHECK(surface.vertexMask()(cell) == 0);
+        CHECK(surface.channel("growth_exclusions").at<uint8_t>(cell) == 255);
+        CHECK(surface.pointsForStorage()(cell) == hiddenXYZ);
+        CHECK(surface.channel("generations").at<uint16_t>(cell) == 9);
+    };
+
+    nlohmann::json params{{"generations", 5}, {"rewind_gen", 3}, {"resume_opt", "skip"},
+                          {"thread_limit", 1}, {"min_area_cm", 0}};
+    auto rewound = resume(input, params);
+    REQUIRE(rewound);
+    REQUIRE(visibleGeneration(*rewound) == 4);
+    const auto hiddenCell = shifted(*rewound, excluded);
+    checkExclusion(*rewound, hiddenCell);
+    const int before = rewound->countValidPoints();
+    rewound->meta["max_gen"] = 50;
+    rewound->save(dir / "rewound");
+
+    params.erase("rewind_gen");
+    params["generations"] = 6;
+    PointCollections corrections;
+    corrections.addCollection("away from the excluded vertex");
+    for (const auto cell : {cv::Point(7, 6), cv::Point(8, 6), cv::Point(7, 7), cv::Point(8, 7)})
+        corrections.addPoint("away from the excluded vertex", points(cell));
+    const PointCollections noCorrections;
+    for (const bool correct : {false, true}) {
+        auto reopened = correct ? load_quad_from_tifxyz(dir / "rewound", SURF_LOAD_IGNORE_MASK)
+                                : load_quad_from_tifxyz(dir / "rewound");
+        auto result = resume(*reopened, params, correct ? corrections : noCorrections);
+        REQUIRE(result);
+        CHECK(visibleGeneration(*result) == 5);
+        CHECK(result->countValidPoints() > before);
+        checkExclusion(*result, shifted(*result, hiddenCell));
+    }
+    params["generations"] = 12;
+    for (const int steps : {0, 3}) {
+        params["grow_steps"] = steps;
+        auto reopened = load_quad_from_tifxyz(dir / "rewound");
+        auto result = resume(*reopened, params);
+        REQUIRE(result);
+        CHECK(visibleGeneration(*result) == 4 + steps);
+        if (steps == 0) CHECK(result->countValidPoints() == before);
+        checkExclusion(*result, shifted(*result, hiddenCell));
+    }
+    std::error_code ignored;
+    fs::remove_all(dir, ignored);
+}

@@ -10,6 +10,9 @@ class SurfaceQuerySet;
 QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurface*> &surfs_v, const nlohmann::json &params, float voxelsize = 1.0);
 // Grows a surface in `volume`, a uint8 CT level (give it a MemoryCache: the tracer
 // samples it point by point); coordinates are that level's voxels.
+// On resume, grow_steps limits the number of new generations, counted from the
+// highest usable input generation (or the explicit rewind). With no grow_steps,
+// generations remains the exclusive absolute limit.
 // allowed_growth_mask normally only limits growth. Manual Add also sets
 // repair_selected_exclusions=true to make its selected input-grid cells
 // repairable, without clearing exclusions outside the selection.

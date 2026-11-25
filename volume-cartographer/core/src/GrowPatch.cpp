@@ -173,30 +173,18 @@ static cv::Size exact_growth_output_size(const QuadSurface* coarse,
         source_size.height + (extra_top + extra_bottom) * factor);
 }
 
-static cv::Mat_<cv::Vec3f> downsample_surface_points_nearest(const cv::Mat_<cv::Vec3f>& points, int factor)
+template<class Pixel>
+static cv::Mat_<Pixel> sample_growth_grid(const cv::Mat_<Pixel>& grid, int factor)
 {
-    const cv::Size dst_size = vc::core::util::scaledGridSize(points.size(), factor);
-    cv::Mat_<cv::Vec3f> result(dst_size, cv::Vec3f(-1.0f, -1.0f, -1.0f));
+    if (grid.empty()) return {};
+    cv::Mat_<Pixel> result(vc::core::util::scaledGridSize(grid.size(), factor));
     for (int r = 0; r < result.rows; ++r) {
-        const int src_r = std::min(points.rows - 1, r * factor);
+        const int src_r = std::min(grid.rows - 1, r * factor);
         for (int c = 0; c < result.cols; ++c) {
-            const int src_c = std::min(points.cols - 1, c * factor);
-            result(r, c) = points(src_r, src_c);
+            const int src_c = std::min(grid.cols - 1, c * factor);
+            result(r, c) = grid(src_r, src_c);
         }
     }
-    return result;
-}
-
-static cv::Mat downsample_channel_for_growth(const cv::Mat& channel, const cv::Size& dst_size, const std::string& name)
-{
-    if (channel.empty()) {
-        return {};
-    }
-    cv::Mat result;
-    const int interpolation = (name == "generations" || name == "mask")
-        ? cv::INTER_NEAREST
-        : cv::INTER_AREA;
-    cv::resize(channel, result, dst_size, 0.0, 0.0, interpolation);
     return result;
 }
 
@@ -216,7 +204,7 @@ static cv::Mat upsample_channel_from_growth(const cv::Mat& channel, const cv::Si
 static std::unique_ptr<QuadSurface> make_growth_scale_resume_surface(QuadSurface& source, int factor)
 {
     auto source_points = source.rawPoints();
-    auto scaled_points = downsample_surface_points_nearest(source_points, factor);
+    auto scaled_points = sample_growth_grid(source_points, factor);
     const cv::Vec2f source_scale = source.scale();
     auto scaled = std::make_unique<QuadSurface>(
         scaled_points,
@@ -229,10 +217,16 @@ static std::unique_ptr<QuadSurface> make_growth_scale_resume_surface(QuadSurface
     const cv::Size dst_size = scaled_points.size();
     for (const std::string& name : source.channelNames()) {
         if (name == "growth_exclusions") continue;
-        cv::Mat channel = source.channel(name, SURF_CHANNEL_NORESIZE);
-        if (!channel.empty()) {
-            scaled->setChannel(name, downsample_channel_for_growth(channel, dst_size, name));
+        cv::Mat downsampled;
+        if (name == "mask") {
+            downsampled = sample_growth_grid(source.vertexMask(), factor);
+        } else if (name == "generations") {
+            const cv::Mat_<uint16_t> generations = source.channel(name);
+            downsampled = sample_growth_grid(generations, factor);
+        } else if (const auto channel = source.channel(name, SURF_CHANNEL_NORESIZE); !channel.empty()) {
+            cv::resize(channel, downsampled, dst_size, 0.0, 0.0, cv::INTER_AREA);
         }
+        if (!downsampled.empty()) scaled->setChannel(name, downsampled);
     }
     return scaled;
 }
@@ -320,6 +314,23 @@ static std::vector<GrowthExclusion> read_growth_exclusions(QuadSurface& source)
     return exclusions;
 }
 
+static int visible_resume_generation(QuadSurface& source)
+{
+    const auto& points = *std::as_const(source).rawPointsPtr();
+    const auto mask = source.vertexMask();
+    const cv::Mat_<uint8_t> marker = mask.empty() ? source.channel("growth_exclusions", SURF_CHANNEL_NORESIZE) : cv::Mat{};
+    const cv::Mat_<uint16_t> generations = source.channel("generations");
+    int latest = 0;
+    for (int r = 0; r < points.rows; ++r) {
+        for (int c = 0; c < points.cols; ++c) {
+            if (!vc::geometry::validSurfacePoint(points(r, c))) continue;
+            if (mask.empty() ? (!marker.empty() && marker(r, c) != 0) : mask(r, c) == 0) continue;
+            latest = std::max(latest, generations.empty() ? 1 : std::max(1, int(generations(r, c))));
+        }
+    }
+    return latest;
+}
+
 static bool sampled_at_growth_scale(const cv::Point& cell, int factor)
 {
     return cell.x % factor == 0 && cell.y % factor == 0;
@@ -335,7 +346,6 @@ static QuadSurface* finish_resume_surface(QuadSurface* working, const cv::Vec2f&
     if (factor > 1 && !exclusions.empty()) {
         auto& working_points = *working->rawPointsPtr();
         const cv::Rect bounds(cv::Point{}, working_points.size());
-        const cv::Mat_<uint16_t> generations = working->channel("generations", SURF_CHANNEL_NORESIZE);
         for (auto& exclusion : exclusions) {
             if (!sampled_at_growth_scale(exclusion.cell, factor)) continue;
             const cv::Point input_cell(exclusion.cell.x / factor, exclusion.cell.y / factor);
@@ -347,10 +357,7 @@ static QuadSurface* finish_resume_surface(QuadSurface* working, const cv::Vec2f&
             const cv::Point cell(exclusion.cell.x / factor + offset.x, exclusion.cell.y / factor + offset.y);
             if (!bounds.contains(cell)) continue;
             auto& point = working_points(cell);
-            if (corrected && vc::geometry::validSurfacePoint(point)) {
-                exclusion.coords = point;
-                exclusion.generation = generations(cell);
-            }
+            if (corrected && vc::geometry::validSurfacePoint(point)) exclusion.coords = point;
             point = {-1, -1, -1};
         }
     }
@@ -374,7 +381,8 @@ static QuadSurface* finish_resume_surface(QuadSurface* working, const cv::Vec2f&
         const auto coords = keep_solved ? point : exclusion.coords;
         if (vc::geometry::validSurfacePoint(coords))
             output->maskedVertices.push_back({cell, coords});
-        if (!keep_solved) generations(cell) = exclusion.generation;
+        // Corrections may move the hidden XYZ without changing when it was traced.
+        generations(cell) = exclusion.generation;
         point = {-1, -1, -1};
         mask(cell) = 0;
         marker(cell) = 255;
@@ -1961,6 +1969,10 @@ QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const nlo
     const cv::Size input_surface_size = resume_surf ? resume_surf->rawPoints().size() : cv::Size{};
     const auto input_exclusions = resume_surf ? read_growth_exclusions(*resume_surf) : std::vector<GrowthExclusion>{};
     const bool corrected_resume = !corrections.getAllCollections().empty();
+    const int rewind_gen = params.value("rewind_gen", -1);
+    // Read the visible frontier before resampling or loading correction support.
+    const int start_gen = resume_surf ? (rewind_gen == -1 ? visible_resume_generation(*resume_surf) : rewind_gen) : 0;
+    const bool relative_growth = resume_surf && params.contains("grow_steps");
     cv::Mat repair_cells;
     cv::Mat working_repair_cells;
     if (resume_surf && params.value("repair_selected_exclusions", false)) {
@@ -2135,7 +2147,12 @@ QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const nlo
     }
     TraceParameters trace_params;
     int snapshot_interval = params.value("snapshot-interval", 0);
-    int stop_gen = params.value("generations", 100);
+    // Absolute CLI limits are exclusive. A relative request counts only new
+    // generations beyond the same frontier used to allocate the work grid.
+    const int stop_gen = relative_growth
+        ? int(std::min<int64_t>(int64_t(start_gen) + std::max(0, params.at("grow_steps").get<int>()) + 1,
+                               int64_t(std::numeric_limits<uint16_t>::max()) + 1))
+        : params.value("generations", 100);
 
     // Load normal grid first if provided, so we can use its spiral-step
     std::unique_ptr<vc::core::util::NormalGridVolume> ngv;
@@ -2183,7 +2200,6 @@ QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const nlo
               << " REFERENCE_RAY: " << loss_settings.w[LossType::REFERENCE_RAY]
               << " SDIR: " << loss_settings.w[LossType::SDIR]
               << std::endl;
-    int rewind_gen = params.value("rewind_gen", -1);
     loss_settings.z_min = params.value("z_min", -1);
     loss_settings.z_max = params.value("z_max", std::numeric_limits<int>::max());
     loss_settings.y_min = params.value("y_min", -1);
@@ -2212,10 +2228,7 @@ QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const nlo
             }
             resume_surf->setChannel("generations", resume_generations);
         }
-        double min_val, max_val;
-        cv::minMaxLoc(resume_generations, &min_val, &max_val);
-        int start_gen = (rewind_gen == -1) ? static_cast<int>(max_val) : rewind_gen;
-        int gen_diff = std::max(0, stop_gen - start_gen);
+        const int gen_diff = std::max(0, stop_gen - start_gen - (relative_growth ? 1 : 0));
         const bool disable_grid_expansion = params.value("disable_grid_expansion", false);
         const int grow_extra_cols = std::max(0, params.value("grow_extra_cols", 0));
         const int grow_extra_rows = std::max(0, params.value("grow_extra_rows", 0));
@@ -2585,7 +2598,6 @@ QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const nlo
     int loss_count = 0;
     double last_elapsed_seconds = 0.0;
     int last_succ = 0;
-    int start_gen = 0;
 
     std::cout << "lets go! " << std::endl;
 
@@ -2631,9 +2643,6 @@ QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const nlo
             trace_data.allowed_growth_mask(used_area).setTo(1, nonzero_mask);
         }
  
-        double min_val, max_val;
-        cv::minMaxLoc(resume_generations, &min_val, &max_val);
-        start_gen = (rewind_gen == -1) ? static_cast<int>(max_val) : rewind_gen;
         generation = start_gen;
 
         const bool preserve_all_resume_points = rewind_gen == -1;
@@ -2704,7 +2713,7 @@ QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const nlo
             trace_data.point_correction.init(trace_params.dpoints);
 
             std::cout << "Resuming with " << trace_data.point_correction.all_grid_locs().size() << " correction points." << std::endl;
-            cv::Mat mask = resume_surf->channel("mask", SURF_CHANNEL_NORESIZE);
+            const auto mask = resume_surf->vertexMask();
             if (!mask.empty()) {
                 std::vector<std::vector<cv::Point2f>> all_hulls;
                 // For single-point collections (e.g., drag-and-drop), store center and radius
@@ -3197,8 +3206,10 @@ QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const nlo
 
         int phys_fail_count_gen = 0;
         generation++;
-        if (stop_gen && generation >= stop_gen)
+        if (stop_gen && generation >= stop_gen) {
+            if (relative_growth) --generation;
             break;
+        }
 
         auto is_loc_valid = [&](const cv::Vec2i& p) {
             return bounds.contains(cv::Point(p[1], p[0])) &&
