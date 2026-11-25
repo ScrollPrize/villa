@@ -493,6 +493,10 @@ public:
     // flows call this before replacing the package, and must not replace it
     // when this returns false: an optimization is running, or a finalization
     // failed, and the workspace is left intact for the user to resolve.
+    // After the project's datasets change outside the annotation menus (an
+    // attachment): invalidates open sessions when the fiber dataset or the
+    // normal source in effect changed, as a menu selection would.
+    void syncAnnotationInputsWithProject();
     [[nodiscard]] bool prepareForPackageSwitch();
 
 signals:
@@ -1099,6 +1103,14 @@ private:
     void handleNormalSourceSelectionChanged(const std::string& source);
     bool canChangeAnnotationInputs();
     void invalidateAnnotationInputs(bool predictionsChanged, bool normalsChanged);
+    // The project inputs open sessions were last resolved against.
+    struct AnnotationInputs {
+        const void* project = nullptr;
+        std::string fiberDataset, normalSource, lasagnaDataset;
+        bool operator==(const AnnotationInputs&) const = default;
+    };
+    std::optional<AnnotationInputs> _annotationInputs;
+    [[nodiscard]] AnnotationInputs currentAnnotationInputs() const;
     bool needsFinalOptimization(const LineAnnotationSession& session) const;
     // stillValid (optional): forwarded to the backend helpers and checked
     // once more after the solve, before the result is applied.

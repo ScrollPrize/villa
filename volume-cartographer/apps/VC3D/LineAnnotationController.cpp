@@ -8724,8 +8724,37 @@ void LineAnnotationController::invalidateAnnotationInputs(bool predictionsChange
         if (normalsChanged) updateGeneratedViewMetricsForFiber(session.fiberId);
     }
     if (normalsChanged) scheduleStaleViewRefresh();
+    _annotationInputs = currentAnnotationInputs();
     refreshLineAnnotationDatasetMenus();
     if (predictionsChanged || normalsChanged) emit fibersChanged();
+}
+
+LineAnnotationController::AnnotationInputs LineAnnotationController::currentAnnotationInputs() const
+{
+    if (!_state || !_state->vpkg()) return {};
+    const auto vpkg = _state->vpkg();
+    return {vpkg.get(), vpkg->selectedFiberInferenceDataset(), vpkg->annotationNormalSource(),
+            vpkg->selectedLasagnaDataset()};
+}
+
+void LineAnnotationController::syncAnnotationInputsWithProject()
+{
+    const auto current = currentAnnotationInputs();
+    if (!_annotationInputs || _annotationInputs->project != current.project) {
+        // A newly opened project: nothing was resolved against it yet.
+        _annotationInputs = current;
+        refreshLineAnnotationDatasetMenus();
+        return;
+    }
+    const auto previous = *_annotationInputs;
+    if (previous == current) {
+        refreshLineAnnotationDatasetMenus();
+        return;
+    }
+    const bool predictionsChanged = previous.fiberDataset != current.fiberDataset;
+    const bool normalsChanged = previous.normalSource != current.normalSource ||
+        (current.normalSource == "fiber" ? predictionsChanged : previous.lasagnaDataset != current.lasagnaDataset);
+    invalidateAnnotationInputs(predictionsChanged, normalsChanged);
 }
 
 void LineAnnotationController::handleNormalSourceSelectionChanged(const std::string& source)
@@ -8760,12 +8789,15 @@ void LineAnnotationController::handleFiberInferenceDatasetSelectionChanged(
 {
     if (location.empty() || !canChangeAnnotationInputs()) return;
     auto vpkg = _state->vpkg();
-    if (vpkg->selectedFiberInferenceDataset() == location) {
+    // Saved even when it is already the default, so attachments cannot change it.
+    const auto previousDataset = vpkg->selectedFiberInferenceDataset();
+    const auto previous = vpkg->annotationNormalSource();
+    vpkg->setSelectedFiberInferenceDataset(location);
+    if (previousDataset == location) {
+        refreshLineAnnotationDatasetMenus();
         return;
     }
     // The normal choice belongs to the fiber dataset, so it may change too.
-    const auto previous = vpkg->annotationNormalSource();
-    vpkg->setSelectedFiberInferenceDataset(location);
     const auto current = vpkg->annotationNormalSource();
     invalidateAnnotationInputs(true, current == "fiber" || current != previous);
 }
@@ -8843,6 +8875,8 @@ bool LineAnnotationController::ensureFiberInferenceDatasetForSession(
                     headless);
                 return false;
             }
+            // Picked here, so it is the user's choice, not the default.
+            vpkg->setSelectedFiberInferenceDataset(selected);
             manifestPath = openedDataset.manifest().manifestPath;
             refreshLineAnnotationDatasetMenus();
         } catch (const std::exception& error) {
