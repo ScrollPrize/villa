@@ -249,7 +249,7 @@ void testSurface(const fs::path& root, const std::string& backend)
 
 
 // A curved sheet on a unit grid, z = 6 + 0.35 (x - 4)^2 / 4 + 0.3 sin(1.3 y); the CT value is 10 z, so a render reads the sheet height.
-Surface curvedSurface(const fs::path& root)
+Surface curvedSurface(const fs::path& root, bool withHole = false)
 {
     const std::int64_t rows = 14, cols = 16;
     std::vector<float> xyz(std::size_t(3 * rows * cols));
@@ -259,10 +259,17 @@ Surface curvedSurface(const fs::path& root)
             xyz[std::size_t((rows + y) * cols + x)] = float(y) + 2;
             xyz[std::size_t((2 * rows + y) * cols + x)] = 6.f + 0.35f * float((x - 4) * (x - 4)) / 4.f + 0.3f * std::sin(1.3f * float(y));
         }
-    writeZarr(root / "curved.zarr", {3, rows, cols}, "<f4", xyz.data(), {"c", "y", "x"});
+    if (withHole) {
+        // A missing diagonal neighbor exercises the mixed-derivative fallback in the
+        // top-left cell. The second hole intersects the patch itself.
+        xyz[3 * cols + 4] = std::numeric_limits<float>::quiet_NaN();
+        xyz[8 * cols + 12] = std::numeric_limits<float>::quiet_NaN();
+    }
+    const auto path = root / (withHole ? "curved-hole.zarr" : "curved.zarr");
+    writeZarr(path, {3, rows, cols}, "<f4", xyz.data(), {"c", "y", "x"});
     Surface surface;
     surface.id = "curved";
-    surface.geometry.location = (root / "curved.zarr").string();
+    surface.geometry.location = path.string();
     surface.geometry.format = "zarr";
     surface.sampleId = "s";
     surface.volumeId = "v";
@@ -275,14 +282,14 @@ Surface curvedSurface(const fs::path& root)
     return surface;
 }
 
-// The render of a patch does not depend on the work budget, and it is the same pixels of the render of a larger patch.
+// A patch agrees with a larger render when its halo fits, and still renders when only its cells fit.
 void testContext(const fs::path& root, const std::string& backend)
 {
     std::vector<std::uint8_t> ct(24 * 24 * 24);
     for (std::size_t z = 0; z < 24; ++z)
         for (std::size_t i = 0; i < 24 * 24; ++i) ct[z * 24 * 24 + i] = std::uint8_t(10 * z);
     writeZarr(root / "ramp.zarr", {24, 24, 24}, "|u1", ct.data(), {"z", "y", "x"});
-    const auto surface = curvedSurface(root);
+    auto surface = curvedSurface(root);
     const auto reference = zarrSource("ct", root / "ramp.zarr", "image", placedIn("v"));
     const std::vector<std::pair<std::string, Source>> none;
     const auto render = [&](std::size_t workBytes, const Pair& start, const Pair& size) {
@@ -296,7 +303,7 @@ void testContext(const fs::path& root, const std::string& backend)
     };
     const Pair start{8, 10}, size{10, 14};  // pixels at half grid steps: 5 x 7 grid steps
     const auto full = render(0, start, size);
-    // cells reached: (5 + 7 wide) grid positions need 7 x 9 vertices, 63 cells
+    // The reached cells use 6 x 8 vertices. This budget fits the cells and misses the 8 x 10 halo.
     const auto tight = render(63 * 80, start, size);
     const auto equal = [](float a, float b) { return (std::isnan(a) && std::isnan(b)) || std::fabs(a - b) < 1e-3f; };
     // the ring is charged to the budget with the cells: at the budget of the cells alone it does not fit and the render is made on the cells
@@ -308,25 +315,35 @@ void testContext(const fs::path& root, const std::string& backend)
         if (!std::isnan(full[k])) worst = std::max(worst, std::fabs(full[k] - tight[k]));
     }
     require(worst < 2.f, "a patch at the budget of its cells is close to the render with the ring");
+    const auto oneRing = render((backend == "cuda" ? 16 : 8) * 1024, start, size);
+    require(std::equal(full.begin(), full.end(), oneRing.begin(), equal),
+            "a budget that fits one ring keeps the bicubic context");
     // an error in the cells themselves is not hidden by the retry on the cells: a budget below the cells still refuses the render
     bool refused = false;
     try { (void)render(40 * 80, start, size); } catch (const std::runtime_error&) { refused = true; }
     require(refused, "a work budget the cells do not fit still refuses the render");
     {   // the ring is charged to the work budget like any window, so a window that does not fit is never kept: a later linear render of the
-        // window the ring made (rows 2..12, columns 3..15, found by the pixels below) is refused at that budget, not served from the cache
+        // window the ring made is refused at that budget, even after the bicubic render.
         auto options = optionsFor(backend);
         options.samplingWorkBytes = 63 * 80;
         SampleReader reader(reference, none, std::nullopt, options);
         (void)reader.renderSurface(surface, start, size, {0});
-        raises<std::runtime_error>([&] { (void)reader.renderSurface(surface, {4, 6}, {18, 22}, {0}, vcr::grid::Interpolation::Linear); },
+        raises<std::runtime_error>([&] { (void)reader.renderSurface(surface, {6, 8}, {14, 18}, {0}, vcr::grid::Interpolation::Linear); },
                                    "a window over the work budget is not served from a cache filled by a bicubic render");
         reader.close();
     }
-    const auto large = render(0, {4, 6}, {18, 22});
-    bool same = true;
-    for (std::int64_t j = 0; j < size[0]; ++j)
-        for (std::int64_t i = 0; i < size[1]; ++i) same = same && equal(large[std::size_t((j + 4) * 22 + (i + 4))], full[std::size_t(j * size[1] + i)]);
-    require(same, "a patch is the same pixels of a larger patch");
+    const auto checkContainingRender = [&](const std::vector<float>& patch) {
+        const auto large = render(0, {4, 6}, {18, 22});
+        for (std::int64_t j = 0; j < size[0]; ++j)
+            for (std::int64_t i = 0; i < size[1]; ++i)
+                require(equal(large[std::size_t((j + 4) * 22 + i + 4)], patch[std::size_t(j * size[1] + i)]),
+                        "a patch is the same pixels of a larger patch");
+    };
+    checkContainingRender(full);
+    surface = curvedSurface(root, true);
+    const auto masked = render(0, start, size);
+    require(std::isfinite(masked.front()) && std::isnan(masked.back()), "the mask leaves both valid and invalid pixels in the crop");
+    checkContainingRender(masked);
 }
 
 

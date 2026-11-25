@@ -350,7 +350,7 @@ struct Patch {
     grid::Raster raster;
     std::array<int, 4> core{0, 0, 0, 0};  // the vertices of the cells inside the tile (all zero: the tile is the cells)
 };
-std::optional<Patch> patchOf(Geometry& geom, const Pair& start, const Pair& size, bool context)
+std::optional<Patch> patchOf(Geometry& geom, const Pair& start, const Pair& size, bool& context)
 {
     const auto& m = geom.fromUv.forward;
     const double u = double(start[1]), v = double(start[0]);
@@ -366,21 +366,27 @@ std::optional<Patch> patchOf(Geometry& geom, const Pair& start, const Pair& size
     const std::int64_t rows = geom.shape[0], cols = geom.shape[1];
     const auto c0 = std::max<std::int64_t>(0, std::int64_t(std::floor(minX))), c1 = std::min<std::int64_t>(cols, std::int64_t(std::floor(maxX)) + 2);
     const auto r0 = std::max<std::int64_t>(0, std::int64_t(std::floor(minY))), r1 = std::min<std::int64_t>(rows, std::int64_t(std::floor(maxY)) + 2);
-    if (c1 - c0 < 2 || r1 - r0 < 2) return std::nullopt;
-    // Two more vertices around the window, where the grid has them: the Hermite derivatives of its cells
-    // (centred differences, one sided only at the grid's own border or next to a hole) then match the whole
-    // grid's instead of turning one sided at the window's edge.
-    const std::int64_t halo = context ? 2 : 0;
+    if (c1 - c0 < 2 || r1 - r0 < 2) {
+        context = false;
+        return std::nullopt;
+    }
+    // One extra vertex per side covers the 3x3 Hermite derivative stencil at every core vertex.
+    const std::int64_t halo = context ? 1 : 0;
     const auto hc0 = std::max<std::int64_t>(0, c0 - halo), hc1 = std::min<std::int64_t>(cols, c1 + halo);
     const auto hr0 = std::max<std::int64_t>(0, r0 - halo), hr1 = std::min<std::int64_t>(rows, r1 + halo);
-    const bool ring = hr0 != r0 || hr1 != r1 || hc0 != c0 || hc1 != c1;
-    // A ring adds the core's own derivatives (SurfaceOptions::core); CUDA keeps the host geometry beside its device copy.
-    if (ring && std::size_t((hr1 - hr0) * (hc1 - hc0)) * (geom.owner.backend == "cuda" ? 240 : 120) > geom.owner.workBytes)
-        throw DecodeBudgetError("geometry tile with its context exceeds sampling_work_bytes");
+    context = hr0 != r0 || hr1 != r1 || hc0 != c0 || hc1 != c1;
+    if (context) {
+        const auto vertices = std::size_t(hr1 - hr0) * std::size_t(hc1 - hc0);
+        const auto perimeter = geom.normals ? 0 : 2 * std::size_t(r1 - r0 + c1 - c0 - 2);
+        const auto bytes = 80 * vertices + 9 * sizeof(float) * perimeter;
+        // CUDA keeps a device copy alongside the host geometry.
+        if (bytes > geom.owner.workBytes / (geom.owner.backend == "cuda" ? 2 : 1))
+            throw DecodeBudgetError("geometry tile with its context exceeds sampling_work_bytes");
+    }
     Patch patch;
     patch.tile = geom.tile({hr0, hc0}, {hr1 - hr0, hc1 - hc0});
     patch.raster = grid::Raster{x0 - double(hc0), y0 - double(hr0), sx, sy, int(size[1]), int(size[0]), kx, ky};
-    if (ring) patch.core = {int(r0 - hr0), int(r1 - hr0), int(c0 - hc0), int(c1 - hc0)};
+    if (context) patch.core = {int(r0 - hr0), int(r1 - hr0), int(c0 - hc0), int(c1 - hc0)};
     return patch;
 }
 // The vcr::grid surface over a tile's vertices: normals in the surface's physical space.
@@ -469,54 +475,64 @@ SampleResult SampleReader::renderSurface(const Surface& surface, const Pair& sta
     result.metadata = s.metadata.is_null() ? json::object() : s.metadata;
     result.metadata["surface"] = {{"id", surface.id}, {"uv_start", start}, {"uv_size", size}, {"offsets_um", offsetsUm},
                                   {"coordinate_frame", surfaceFrame(surface)}, {"reference_frame", s.referenceFrame}, {"array_to_level0", s.referenceMap.forward.json()}};
-    const SampleResult base = result;
-    // The context ring around the cells (bicubic only) is optional: when reading it or sampling with it fails (an
-    // unavailable chunk, a sampling budget the extra points exceed), the render is repeated on the cells alone, so a
-    // render the cells can serve is never refused because of it, and an error in the cells themselves still surfaces.
-    const auto attempt = [&](bool context) {
-        SampleResult result = base;
+    const std::vector<float> layers(offsetsUm.begin(), offsetsUm.end());
+    bool context = interpolation == grid::Interpolation::Bicubic;
+    const auto renderVolumes = [&] {
+        decltype(result.targets) targets;
         const auto patch = patchOf(*geom, start, size, context);
         const auto sheet = patch ? gridSurface(*geom, *patch->tile, interpolation, patch->core) : nullptr;
         const grid::Raster raster = patch ? patch->raster : grid::Raster{};
-        const std::vector<float> layers(offsetsUm.begin(), offsetsUm.end());
         for (auto& [name, target] : s.targets) {
             auto out = renderVolume(s, target, sheet.get(), raster, size, layers, toReference);
             for (auto& [key, child] : target.companions) out.masks.emplace_back(key, renderVolume(s, child, sheet.get(), raster, size, layers, toReference).data);
-            result.targets.emplace_back(name, std::move(out));
+            targets.emplace_back(name, std::move(out));
         }
-        // Surface-registered targets are read at the patch's own UV pixels.
-        const auto uv = patchUv(size);
-        const auto count = uv.size() / 2;
-        const std::array<double, 3> uvOrigin{double(start[1]), double(start[0]), 0};
-        for (const auto& [name, target] : s.surfaceTargets) {
-            const auto local = pixelPoints(uv.data(), count, target.mapping.forward, uvOrigin);
-            auto [values, valid] = s.samplePoints(target, local.points, local.base);
-            TargetResult out;
-            out.data = values.reshaped({target.channels, size[0], size[1]});
-            out.valid = valid.reshaped({1, size[0], size[1]});
-            for (const auto& [key, child] : target.companions) {
-                const auto p = pixelPoints(uv.data(), count, child.mapping.forward, uvOrigin);
-                auto [maskValues, unused] = s.samplePoints(child, p.points, p.base);
-                (void)unused;
-                out.masks.emplace_back(key, maskValues.reshaped({child.channels, size[0], size[1]}));
-            }
-            result.targets.emplace_back(name, std::move(out));
-        }
-        return result;
+        return targets;
     };
-    if (interpolation == grid::Interpolation::Bicubic) {
-        try { return attempt(true); }
-        catch (const Cancelled&) { throw; }  // a stopped read is not retried
-        catch (const std::exception&) {
-            // The ring was optional: a read or budget error (CacheMiss, DecodeBudgetError, HTTP, a request that needs
-            // more CUDA bricks than the cache holds) leaves the cells to render, and an error in the cells themselves
-            // comes back from the render below.
+    const auto retryWithoutContext = [&] {
+        context = false;
 #ifdef VC_READER_CUDA
-            if (s.backend == "cuda") grid::cuda::forgetKeptData();  // the ring's geometry on the device goes before the retry
+        if (s.backend == "cuda") grid::cuda::forgetKeptData();
 #endif
-        }
+        return renderVolumes();
+    };
+    // Optional geometry can require reads or memory beyond what the requested cells need.
+    try { result.targets = renderVolumes(); }
+    catch (const Cancelled&) { throw; }
+#ifdef VC_READER_CUDA
+    catch (const reader_cuda::BrickCacheBudgetError&) {
+        if (!context) throw;
+        result.targets = retryWithoutContext();
     }
-    return attempt(false);
+#endif
+    catch (const std::runtime_error&) {
+        if (!context) throw;
+        result.targets = retryWithoutContext();
+    }
+    catch (const std::bad_alloc&) {
+        if (!context) throw;
+        result.targets = retryWithoutContext();
+    }
+
+    // Surface-registered targets are read at the patch's own UV pixels.
+    const auto uv = patchUv(size);
+    const auto count = uv.size() / 2;
+    const std::array<double, 3> uvOrigin{double(start[1]), double(start[0]), 0};
+    for (const auto& [name, target] : s.surfaceTargets) {
+        const auto local = pixelPoints(uv.data(), count, target.mapping.forward, uvOrigin);
+        auto [values, valid] = s.samplePoints(target, local.points, local.base);
+        TargetResult out;
+        out.data = values.reshaped({target.channels, size[0], size[1]});
+        out.valid = valid.reshaped({1, size[0], size[1]});
+        for (const auto& [key, child] : target.companions) {
+            const auto p = pixelPoints(uv.data(), count, child.mapping.forward, uvOrigin);
+            auto [maskValues, unused] = s.samplePoints(child, p.points, p.base);
+            (void)unused;
+            out.masks.emplace_back(key, maskValues.reshaped({child.channels, size[0], size[1]}));
+        }
+        result.targets.emplace_back(name, std::move(out));
+    }
+    return result;
 }
 
 Surface SampleReader::surfaceNamed(const std::string& id) const

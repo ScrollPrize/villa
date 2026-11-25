@@ -83,7 +83,7 @@ struct Surface::Impl {
     std::vector<std::uint8_t> valid;    // per vertex (bool-sized)
     std::vector<int> piece;             // per column; empty: one piece
     std::vector<float> du, dv, duv;     // per vertex, bicubic mode
-    std::vector<float> du0, dv0, duv0;  // the same for the core vertices as a surface of their own (options.core)
+    std::vector<VertexDerivatives> coreDerivatives;
     std::vector<float> packed, packedNormals;  // without row padding, when stride != cols * 3
 
     const float* xyz() const { return packed.empty() ? v.xyz : packed.data(); }
@@ -102,10 +102,8 @@ struct Surface::Impl {
             g.du = du.data();
             g.dv = dv.data();
             g.duv = duv.data();
-            if (!du0.empty()) {
-                g.du0 = du0.data();
-                g.dv0 = dv0.data();
-                g.duv0 = duv0.data();
+            if (!coreDerivatives.empty()) {
+                g.coreDerivatives = coreDerivatives.data();
                 for (int k = 0; k < 4; ++k)
                     g.core[k] = options.core[std::size_t(k)];
             }
@@ -138,29 +136,33 @@ struct Surface::Impl {
         buildCoreDerivatives();
     }
 
-    // The derivatives of the core vertices taken as a surface of their own (one sided at the core's border): the
-    // whole grid's derivatives with only the core's vertices valid. Only cells on the core's border read them.
+    // Only perimeter vertices change when the grid is restricted to the core.
     void buildCoreDerivatives()
     {
         const auto& c = options.core;
-        if (c[0] == 0 && c[1] == 0 && c[2] == 0 && c[3] == 0)
+        if (c == std::array<int, 4>{})
             return;
         if (c[0] < 0 || c[2] < 0 || c[1] <= c[0] || c[3] <= c[2] || c[1] > v.rows || c[3] > v.cols)
             throw std::invalid_argument("surface core outside the vertices");
-        if ((c[0] == 0 && c[1] == v.rows && c[2] == 0 && c[3] == v.cols) || normals())
-            return;  // the core is the whole grid, or vertex normals replace the patch normals
-        std::vector<std::uint8_t> coreValid(valid.size(), 0);
-        for (int r = c[0]; r < c[1]; ++r)
-            std::copy(valid.begin() + std::ptrdiff_t(index(r, c[2])), valid.begin() + std::ptrdiff_t(index(r, c[3])), coreValid.begin() + std::ptrdiff_t(index(r, c[2])));
-        const std::size_t n = valid.size();
-        du0.resize(n * 3); dv0.resize(n * 3); duv0.resize(n * 3);
-        GridView g = view();
-        g.valid = reinterpret_cast<const bool*>(coreValid.data());
-        g.du = du0.data();
-        g.dv = dv0.data();
-        Derivatives d{g, v.rows, v.cols};
-        for (std::size_t i = 0; i < n; ++i) d.firstAt(int(i), du0.data(), dv0.data());
-        for (std::size_t i = 0; i < n; ++i) d.mixedAt(int(i), duv0.data());
+        const int height = c[1] - c[0], width = c[3] - c[2];
+        if (height < 2 || width < 2 || (height == v.rows && width == v.cols) || normals())
+            return;
+
+        coreDerivatives.resize(2 * (std::size_t(height) + width - 2));
+        const Derivatives d{view(), v.rows, v.cols, c[0], c[1], c[2], c[3]};
+        const auto store = [&](int row, int col) {
+            if (d.ok(row, col))
+                coreDerivatives[perimeterIndex(c.data(), row, col)] =
+                    {d.first(row, col, true), d.first(row, col, false), d.mixed<false>(row, col)};
+        };
+        for (int col = c[2]; col < c[3]; ++col) {
+            store(c[0], col);
+            store(c[1] - 1, col);
+        }
+        for (int row = c[0] + 1; row < c[1] - 1; ++row) {
+            store(row, c[2]);
+            store(row, c[3] - 1);
+        }
     }
 
     // Positions and normals of the raster pixels i0 <= i < i0 + w, j0 <= j < j0 + h, into
@@ -649,7 +651,7 @@ device::Storage upload(const void* data, std::size_t bytes, int deviceId)
 // stay there: uploading a whole grid per frame or tile costs far more than sampling it.
 struct DeviceGrid {
     device::Storage xyz, valid, piece, normals, du, dv, duv;
-    device::Storage du0, dv0, duv0;  // the derivatives of the core alone (SurfaceOptions::core), when there is one
+    device::Storage coreDerivatives;
 };
 struct KeptGrid {
     std::uint64_t serial;
@@ -687,9 +689,7 @@ std::shared_ptr<const DeviceGrid> deviceGrid(const Surface::Impl& impl, int id)
     grid->du = upload(host.du, bicubic ? vertices * 12 : 0, id);
     grid->dv = upload(host.dv, bicubic ? vertices * 12 : 0, id);
     grid->duv = upload(host.duv, bicubic ? vertices * 12 : 0, id);
-    grid->du0 = upload(host.du0, host.du0 ? vertices * 12 : 0, id);
-    grid->dv0 = upload(host.dv0, host.du0 ? vertices * 12 : 0, id);
-    grid->duv0 = upload(host.duv0, host.du0 ? vertices * 12 : 0, id);
+    grid->coreDerivatives = upload(host.coreDerivatives, impl.coreDerivatives.size() * sizeof(VertexDerivatives), id);
     device::complete();  // other threads' streams may read it as soon as it is listed
     kept.push_front({impl.serial, id, grid});
     return grid;
@@ -847,10 +847,8 @@ Result sample(const Surface& surface, const Raster& raster, const Request& reque
         base.grid.du = static_cast<const float*>(grid->du->ptr);
         base.grid.dv = static_cast<const float*>(grid->dv->ptr);
         base.grid.duv = static_cast<const float*>(grid->duv->ptr);
-        if (host.du0) {
-            base.grid.du0 = static_cast<const float*>(grid->du0->ptr);
-            base.grid.dv0 = static_cast<const float*>(grid->dv0->ptr);
-            base.grid.duv0 = static_cast<const float*>(grid->duv0->ptr);
+        if (host.coreDerivatives) {
+            base.grid.coreDerivatives = static_cast<const VertexDerivatives*>(grid->coreDerivatives->ptr);
             for (int k = 0; k < 4; ++k)
                 base.grid.core[k] = host.core[k];
         }
