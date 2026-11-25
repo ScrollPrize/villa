@@ -153,10 +153,13 @@ Fits run on CUDA whenever it is available. Without it they run on Apple's MPS
 backend, and without that on the CPU; `FIT_SPIRAL_DEVICE=cuda|mps|cpu` (or `cuda:1`)
 picks one explicitly (`devices.py`). A distributed (torchrun) fit needs CUDA or
 the CPU: torch.distributed has no MPS backend. The Triton kernels are CUDA only, and the CUDA
-startup check is skipped elsewhere. On MPS, the track radius loss, the track batch sampler and the
-nonfinite-gradient sanitize run as Metal kernels (`track_loss_metal.py`, `grad_metal.py`), so a
-step compiles no per-shape graphs and does not wait on the GPU for tensor shapes; everything else,
-and the CPU, use the PyTorch paths. `FIT_SPIRAL_METAL=0` turns the Metal kernels off, and
+startup check is skipped elsewhere. On MPS, the track radius loss and the
+nonfinite-gradient sanitize run as Metal kernels (`track_loss_metal.py`, `grad_metal.py`), and,
+when track length-bin weights are set and the resampled points fit in GPU memory, the track batch
+sampler plans each batch on the host and gathers it in one dispatch. Neither the radius loss nor
+the sampler compiles per-shape graphs or reads tensor shapes back from the GPU; the track DT loss,
+everything else, and the CPU use the PyTorch paths. On MPS the resampled track points stay on the
+device, as on CUDA. `FIT_SPIRAL_METAL=0` turns the Metal kernels off, and
 `FIT_SPIRAL_METAL_TRACKS=0` turns off only the track loss and sampler.
 `tests/test_track_radius_metal.py` checks the fused loss against the eager one.
 
