@@ -347,6 +347,7 @@ def _flatten(
     flatten_config_path: Path,
     work: Path,
     *,
+    device: torch.device,
     voxel_size_um: float,
 ) -> None:
     object_store = work / "objects"
@@ -354,6 +355,10 @@ def _flatten(
     config = json.loads(flatten_config_path.read_text(encoding="utf-8"))
     config["external_surfaces"] = [surface_ref]
     config["voxel_size_um"] = float(voxel_size_um)
+    lasagna_args = config.setdefault("args", {})
+    # Lasagna defaults to CUDA; keep that wherever it can run.
+    if "device" not in lasagna_args and not torch.cuda.is_available():
+        lasagna_args["device"] = str(device)
     results = work / "results"
     results.mkdir()
     model_output = work / "flatten-model.pt"
@@ -521,6 +526,7 @@ def main(argv=None) -> int:
             service,
             flatten_config,
             work,
+            device=device,
             voxel_size_um=float(args.voxel_size_um),
         )
     finally:
