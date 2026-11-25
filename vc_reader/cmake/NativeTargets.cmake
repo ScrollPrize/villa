@@ -42,7 +42,7 @@ target_include_directories(vc_reader_headers INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/include>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
-target_link_libraries(vc_reader_headers INTERFACE Threads::Threads Boost::headers concurrentqueue::concurrentqueue)
+target_link_libraries(vc_reader_headers INTERFACE Threads::Threads Boost::headers concurrentqueue::concurrentqueue nlohmann_json::nlohmann_json)
 if(MSVC)  # the Microsoft C runtime headers (MSVC, clang-cl) have no <unistd.h>
     target_compile_definitions(vc_reader_headers INTERFACE _CRT_NONSTDC_NO_WARNINGS)  # close, getpid, ...
     target_include_directories(vc_reader_headers INTERFACE
