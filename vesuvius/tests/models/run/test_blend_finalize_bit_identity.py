@@ -248,7 +248,8 @@ def test_batch_reads_shared_patches_once(tmp_path):
     blending.create_blend_output(batched, volume, 2, patch_size, verbose=False)
     saved = dict(blending._worker_state)
     try:
-        blending._init_worker(part_files, batched, generate_gaussian_map(patch_size), patch_size, 2, False)
+        blending._init_worker(part_files, batched, generate_gaussian_map(patch_size), patch_size, 2, False,
+                              patch_cache_bytes=256 * 1024 * 1024)
         result = blending.process_chunk_batch(items)  # the whole volume as one batch
     finally:
         blending._worker_state.clear()

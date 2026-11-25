@@ -540,8 +540,8 @@ def _write_blended_chunk(output_store, chunk_info, chunk_logits, chunk_weights, 
 _worker_state = {}
 
 
-# Decoded patches one worker may hold while it blends a batch of chunks.
-DEFAULT_PATCH_CACHE_BYTES = 256 * 1024 * 1024
+# Off by default: the cache adds up to its budget of memory per worker.
+DEFAULT_PATCH_CACHE_BYTES = 0
 
 
 class _PatchCache:
@@ -1413,6 +1413,10 @@ def build_parser():
                         help='Number of parts to split the blending process into. Default: 1')
     parser.add_argument('--part_id', type=int, default=0,
                         help='Part ID for this process (0-indexed). Default: 0')
+    parser.add_argument('--patch_cache_mb', type=int, default=DEFAULT_PATCH_CACHE_BYTES // (1024 * 1024),
+                        help='Memory (MiB) each worker may use to reuse decoded patches across neighbouring '
+                             'chunks, e.g. 256. 0 disables the cache; the output is the same. '
+                             'Default: %(default)s')
     return parser
 
 
@@ -1443,7 +1447,8 @@ def main():
             compression_level=args.compression_level,
             verbose=not args.quiet,
             num_parts=args.num_parts,
-            global_part_id=args.part_id
+            global_part_id=args.part_id,
+            patch_cache_mb=args.patch_cache_mb,
         )
         return 0
     except Exception as e:
@@ -1476,6 +1481,10 @@ def build_blend_and_finalize_parser():
                         help='Number of parts to split the blending process into. Default: 1')
     parser.add_argument('--part_id', type=int, default=0,
                         help='Part ID for this process (0-indexed). Default: 0')
+    parser.add_argument('--patch_cache_mb', type=int, default=DEFAULT_PATCH_CACHE_BYTES // (1024 * 1024),
+                        help='Memory (MiB) each worker may use to reuse decoded patches across neighbouring '
+                             'chunks, e.g. 256. 0 disables the cache; the output is the same. '
+                             'Default: %(default)s')
     # Finalization args
     parser.add_argument('--mode', type=str, choices=['binary', 'multiclass'], default='binary',
                         help='Finalization mode. Default: binary')
@@ -1520,6 +1529,7 @@ def blend_and_finalize_main():
             num_parts=args.num_parts,
             global_part_id=args.part_id,
             finalize_config=finalize_config,
+            patch_cache_mb=args.patch_cache_mb,
         )
         return 0
     except Exception as e:
