@@ -197,5 +197,31 @@ int main()
         require(stageOf([&] { ingestTracksBulkOverlay(packed, overlay, "bulk-test", frame, tags, 1); }) == BulkOverlayError::Stage::Preflight, "a foreign overlay path is refused");
         require(!fs::exists(fs::path(overlay.string() + ".tracks")), "a refused call creates no tracks");
     }
+    {   // A marker this command did not write is refused before any ingest and is never replaced, even when the tracks and overlay are absent.
+        const auto overlay = dir.path / "foreign_marker.vcobj";
+        const auto marker = fs::path(overlay.string() + ".tracks.bulk.json");
+        std::ofstream(marker) << "{\"kind\": \"somebody else\"}";
+        require(stageOf([&] { ingestTracksBulkOverlay(packed, overlay, "bulk-test", frame, tags, 1); }) == BulkOverlayError::Stage::Preflight, "a foreign marker is refused");
+        require(fs::exists(marker) && !fs::exists(fs::path(overlay.string() + ".tracks")) && !fs::exists(overlay), "a refused call creates nothing");
+        std::ifstream in(marker); std::string kept((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        require(kept.find("somebody else") != std::string::npos, "the foreign marker is left exactly as found");
+    }
+    {   // A retry with different content-affecting options does not reuse the recorded sealed tracks.
+        const auto overlay = dir.path / "changed_options.vcobj"; const auto other = fs::path(overlay.string() + "-owner");
+        fs::create_directories(other);
+        require(stageOf([&] { ingestTracksBulkOverlay(packed, overlay, "bulk-test", frame, tags, 1); }) == BulkOverlayError::Stage::Overlay, "the first call stops at the overlay stage");
+        fs::remove_all(other);
+        auto changed = tags; changed.push_back("a-different-tag");
+        require(stageOf([&] { ingestTracksBulkOverlay(packed, overlay, "bulk-test", frame, changed, 1); }) == BulkOverlayError::Stage::Preflight, "changed tags are refused, not silently reused");
+        require(stageOf([&] { ingestTracksBulkOverlay(packed, overlay, "other-author", frame, tags, 1); }) == BulkOverlayError::Stage::Preflight, "a changed author is refused");
+        const auto done = ingestTracksBulkOverlay(packed, overlay, "bulk-test", frame, tags, 1);
+        require(done.reusedSealedTracks, "the unchanged retry still reuses the sealed tracks");
+    }
+    {   // An overlay at the recorded path that depends on a DIFFERENT valid base is not accepted as finished.
+        const auto first = dir.path / "dep_a.vcobj", second = dir.path / "dep_b.vcobj";
+        ingestTracksBulkOverlay(packed, first, "bulk-test", frame, tags, 1); ingestTracksBulkOverlay(packed, second, "bulk-test", frame, tags, 1);
+        fs::remove(first); fs::copy_file(second, first);
+        require(stageOf([&] { ingestTracksBulkOverlay(packed, first, "bulk-test", frame, tags, 1); }) == BulkOverlayError::Stage::Overlay, "an overlay over another store is refused");
+    }
     return 0;
 }
