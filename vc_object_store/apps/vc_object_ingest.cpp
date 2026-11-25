@@ -101,21 +101,22 @@ try {
         if (sources.size() != 1 || sources[0].first != "track" || !channels.empty())
             throw std::runtime_error("--bulk takes exactly one --tracks source and nothing else");
         // The sealed tracks collection goes next to --db; --db itself is an editable overlay root that references it, which is
-        // what a fit opens (it refreshes links into the store; a sealed collection cannot be opened writable).
-        const auto tracksPath = std::filesystem::path(path.string() + ".tracks");
-        if (std::filesystem::exists(path)) throw std::runtime_error("--bulk: --db must not exist: " + path.string());
+        // what a fit opens (it refreshes links into the store; a sealed collection cannot be opened writable). Three retryable
+        // stages (see ingestTracksBulkOverlay): a failure creating the overlay keeps the sealed tracks, and running the same command again
+        // creates only the overlay.
         vc::objects::util::TerminalProgress progress("Bulk ingest tracks", showProgress);
-        const auto report = vc::objects::ingestTracksBulk(sources[0].second, tracksPath, author, coordinateContext, tags, bulkShards);
-        progress.finish();
-        {
-            vc::objects::OpenOptions rootOptions; rootOptions.author = author;
-            // One shard is a file; several are a directory whose root locator is collection.vcobj (InitialImportResult::path).
-            const auto base = bulkShards > 1 ? tracksPath / "collection.vcobj" : tracksPath;
-            auto root = vc::objects::ObjectCollection::create(path, {base}, rootOptions);
-            (void)root;
+        try {
+            const auto report = vc::objects::ingestTracksBulkOverlay(sources[0].second, path, author, coordinateContext, tags, bulkShards);
+            progress.finish();
+            if (report.overlayAlreadyComplete) std::cout << "overlay " << path.string() << " already exists and opens over the sealed tracks " << report.tracksPath.string() << "; nothing to do\n";
+            else std::cout << report.ingest.ingested << (report.reusedSealedTracks ? " tracks reused from an earlier run" : " ingested") << " (bulk, " << bulkShards << " shard(s)), "
+                           << report.ingest.problems.size() << " problems\n";
+            return 0;
+        } catch (const vc::objects::BulkOverlayError& error) {
+            progress.finish();
+            std::cerr << error.what() << "\n";
+            return 2;
         }
-        std::cout << report.ingested << " ingested (bulk, " << bulkShards << " shard(s)), " << report.problems.size() << " problems\n";
-        return 0;
     }
     vc::objects::OpenOptions options; options.author = author;
     auto db = std::filesystem::exists(path) ? vc::objects::ObjectStore::open(path, options) : vc::objects::ObjectStore::create(path, options);

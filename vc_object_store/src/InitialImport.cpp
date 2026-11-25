@@ -264,7 +264,11 @@ InitialImportResult importInitialCollection(const std::filesystem::path& target,
     else {
         vcr::platform::sync_directory(directory->path,"sync initial import members");
         vcr::files::publishDirectory(directory->path,destination,false);
-        vcr::platform::sync_directory(destination.parent_path(),"publish initial import collection");
+        // publishDirectory(overwrite=false) refuses an existing destination, so the directory at `destination` is the one just published
+        // by this call. A failed durability sync of its parent must not leave it behind: the API promises failure cleanup, and a caller that
+        // sees an exception retries into a destination that must be absent.
+        try{vcr::platform::sync_directory(destination.parent_path(),"publish initial import collection");}
+        catch(...){std::error_code ignored;std::filesystem::remove_all(destination,ignored);throw;}
     }
     result.persistenceSeconds=elapsed(persistence);result.totalSeconds=elapsed(start);
     return result;

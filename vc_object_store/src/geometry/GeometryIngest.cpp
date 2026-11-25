@@ -6,6 +6,8 @@
 #include "vc_object_store/objects/TransactionJson.hpp"
 #include "vc_object_store/PackedTrackStore.hpp"
 #include "vc_object_store/objects/InitialImport.hpp"
+#include "vc_object_store/objects/ObjectCollection.hpp"
+#include <fstream>
 #include <limits>
 #include "vc_object_store/Uuid.hpp"
 #include "formats/GeometryInput.hpp"
@@ -444,5 +446,88 @@ GeometryIngestReport ingestTracksBulk(const fs::path& source, const fs::path& de
     report.ingested = done.load();
     report.uuids = std::move(uuids);        // the objects created, as the per-track path reports them
     return report;
+}
+}
+
+namespace vc::objects {
+namespace {
+using Stage = BulkOverlayError::Stage;
+nlohmann::json bulkMarkerRead(const fs::path& marker)
+{
+    std::ifstream in(marker);
+    if (!in) return nullptr;
+    try { return nlohmann::json::parse(in); } catch (const std::exception&) { return nullptr; }
+}
+// Written only after the sealed tracks are published; it is what lets a retry tell "ours, finished" from "somebody else's".
+void bulkMarkerWrite(const fs::path& marker, const nlohmann::json& body)
+{
+    const auto temporary = fs::path(marker.string() + "." + util::newUuid() + ".tmp");
+    {
+        std::ofstream out(temporary, std::ios::binary);
+        out << body.dump(2) << "\n";
+        out.flush();
+        if (!out) { std::error_code ignored; fs::remove(temporary, ignored); throw std::runtime_error("cannot write " + temporary.string()); }
+    }
+    std::error_code error;
+    fs::rename(temporary, marker, error);
+    if (error) { std::error_code ignored; fs::remove(temporary, ignored); throw std::runtime_error("cannot publish " + marker.string() + ": " + error.message()); }
+}
+bool bulkMarkerMatches(const nlohmann::json& marker, const std::string& packed, std::size_t shards, std::size_t rows)
+{
+    return marker.is_object() && marker.value("kind", std::string()) == "vc_object_ingest_bulk" && marker.value("source", std::string()) == packed
+        && marker.value("shards", std::size_t(0)) == shards && marker.value("tracks", std::size_t(0)) == rows;
+}
+}
+
+BulkOverlayReport ingestTracksBulkOverlay(const fs::path& source, const fs::path& overlayPath, const std::string& author,
+    const std::string& coordinateContext, const std::vector<std::string>& tags, std::size_t shards)
+{
+    if (shards == 0) shards = 1;
+    BulkOverlayReport out;
+    out.tracksPath = fs::path(overlayPath.string() + ".tracks");
+    out.marker = fs::path(overlayPath.string() + ".tracks.bulk.json");
+    std::string packedText; std::size_t rows = 0;
+    try {
+        const auto packed = resolvePackedTrackStore(source);
+        packedText = packed.string(); rows = PackedTrackStore(packed).sourceIds().size();
+        geometryCoordinates(nlohmann::json::parse(coordinateContext));
+    } catch (const std::exception& error) {
+        throw BulkOverlayError(Stage::Preflight, std::string("bulk ingest: ") + error.what());
+    }
+    const auto recorded = bulkMarkerRead(out.marker);
+    const bool ours = bulkMarkerMatches(recorded, packedText, shards, rows);
+    const auto base = shards > 1 ? out.tracksPath / "collection.vcobj" : out.tracksPath;
+    OpenOptions rootOptions; rootOptions.author = author;
+    auto overlayError = [&](const std::exception& error) {
+        return BulkOverlayError(Stage::Overlay, std::string("bulk ingest: the overlay ") + overlayPath.string() + " could not be created: " + error.what()
+            + ". The sealed tracks are kept at " + out.tracksPath.string() + " (recorded in " + out.marker.string() + "); no file of another writer was touched. "
+            "Remove whatever the message names, then run the same command again: it reuses the sealed tracks and only creates the overlay.");
+    };
+
+    if (fs::exists(overlayPath) || fs::is_symlink(overlayPath)) {
+        if (!ours) throw BulkOverlayError(Stage::Preflight, "bulk ingest: the overlay path exists and this command did not make it: " + overlayPath.string());
+        try { auto root = ObjectCollection::open(overlayPath, rootOptions); (void)root; }
+        catch (const std::exception& error) { throw overlayError(error); }
+        out.overlayAlreadyComplete = true; out.reusedSealedTracks = true; out.ingest.ingested = int64_t(rows);
+        return out;
+    }
+    if (fs::exists(out.tracksPath) || fs::is_symlink(out.tracksPath)) {
+        if (!ours) throw BulkOverlayError(Stage::Preflight, "bulk ingest: the tracks destination exists and this command did not make it (no matching "
+            + out.marker.string() + "); it is left untouched: " + out.tracksPath.string());
+        out.reusedSealedTracks = true; out.ingest.ingested = int64_t(rows);
+    } else {
+        try { out.ingest = ingestTracksBulk(source, out.tracksPath, author, coordinateContext, tags, shards); }
+        catch (const std::exception& error) { throw BulkOverlayError(Stage::SealedTracks, std::string("bulk ingest: ") + error.what()); }
+        try {
+            bulkMarkerWrite(out.marker, {{"kind", "vc_object_ingest_bulk"}, {"source", packedText}, {"shards", shards}, {"tracks", rows}, {"author", author},
+                                         {"tracks_path", out.tracksPath.string()}});
+        } catch (const std::exception& error) {
+            throw BulkOverlayError(Stage::Marker, std::string("bulk ingest: the sealed tracks were published at ") + out.tracksPath.string() + " but could not be recorded ("
+                + error.what() + "); they are kept. Create " + overlayPath.string() + " over them with ObjectCollection::create, or remove them and run again.");
+        }
+    }
+    try { auto root = ObjectCollection::create(overlayPath, {base}, rootOptions); (void)root; }
+    catch (const std::exception& error) { throw overlayError(error); }
+    return out;
 }
 }

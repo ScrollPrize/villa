@@ -11,6 +11,7 @@
 #include <cstring>
 #include <fstream>
 #include <map>
+#include <functional>
 
 using namespace vc::objects;
 using Json = nlohmann::json;
@@ -148,5 +149,53 @@ int main()
     require(!fs::exists(dir.path / "missing.tracks"), "a failed bulk ingest leaves no destination");
     mustFail([&] { ingestTracksBulk(packed, dir.path / "badframe.tracks", "bulk-test", "not json", tags, 1); });
     require(!fs::exists(dir.path / "badframe.tracks"), "an unparseable coordinate frame is refused and leaves no destination");
+
+    // ingestTracksBulkOverlay: three retryable stages, and no file of another writer is ever touched (review of #2588).
+    auto stageOf = [&](const std::function<void()>& call) {
+        try { call(); } catch (const BulkOverlayError& error) { return error.stage; }
+        require(false, "the call was expected to fail with a BulkOverlayError");
+        return BulkOverlayError::Stage::Preflight;
+    };
+    for (const std::size_t shards : {std::size_t(1), std::size_t(4)}) {
+        for (const char* conflict : {"-wal", "-owner"}) {
+            const auto overlay = dir.path / ("staged" + std::to_string(shards) + std::string(conflict).substr(1) + ".vcobj");
+            const auto tracksPath = fs::path(overlay.string() + ".tracks"), marker = fs::path(overlay.string() + ".tracks.bulk.json");
+            const auto other = fs::path(overlay.string() + conflict);
+            fs::create_directories(other); std::ofstream(other / "theirs.txt") << "another writer's file";
+            const auto call = [&] { return ingestTracksBulkOverlay(packed, overlay, "bulk-test", frame, tags, shards); };
+            // Stage 3 fails: the sealed tracks stay published and recorded, the other writer's directory is untouched.
+            require(stageOf([&] { call(); }) == BulkOverlayError::Stage::Overlay, "a conflict at the overlay's -wal or -owner path fails the overlay stage");
+            require(fs::exists(tracksPath) && fs::exists(marker), "the sealed tracks and their record survive an overlay failure");
+            require(fs::is_directory(other) && fs::exists(other / "theirs.txt"), "the other writer's files are left exactly as found");
+            requireSame(expected, snapshot(shards == 1 ? tracksPath : tracksPath / "collection.vcobj"), "the preserved sealed tracks are complete");
+            // The conflict is removed (by its owner): the same call skips the sealed stage and creates only the overlay.
+            fs::remove_all(other);
+            // (The overlay file itself may already exist: creating it succeeded and only its reopen met the conflict. Either way the retry must not re-ingest.)
+            const auto retried = call();
+            require(retried.reusedSealedTracks && retried.ingest.ingested == tracks, "the retry reuses the sealed tracks");
+            requireSame(expected, snapshot(overlay), "the overlay opens with every track");
+            const auto again = call();
+            require(again.overlayAlreadyComplete, "a third call finds the finished overlay and does nothing");
+        }
+    }
+    {   // A destination this command did not make is refused and never touched; once its owner removes it, the same call succeeds.
+        const auto overlay = dir.path / "foreign.vcobj";
+        const auto tracksPath = fs::path(overlay.string() + ".tracks");
+        const auto target = dir.path / "foreign_target"; fs::create_directories(target); std::ofstream(target / "keep.txt") << "mine";
+        fs::create_directory_symlink(target, tracksPath);
+        require(stageOf([&] { ingestTracksBulkOverlay(packed, overlay, "bulk-test", frame, tags, 1); }) == BulkOverlayError::Stage::Preflight, "a foreign destination is refused");
+        require(fs::is_symlink(tracksPath) && fs::exists(target / "keep.txt"), "the foreign symlink and its target are untouched");
+        require(!fs::exists(fs::path(overlay.string() + ".tracks.bulk.json")) && !fs::exists(overlay), "a refused call creates nothing");
+        fs::remove(tracksPath);
+        const auto done = ingestTracksBulkOverlay(packed, overlay, "bulk-test", frame, tags, 1);
+        require(!done.reusedSealedTracks && done.ingest.ingested == tracks, "after the foreign destination is removed the call ingests");
+        requireSame(expected, snapshot(overlay), "the overlay opens with every track");
+    }
+    {   // An existing overlay this command did not make is refused too.
+        const auto overlay = dir.path / "foreign_overlay.vcobj";
+        std::ofstream(overlay) << "not ours";
+        require(stageOf([&] { ingestTracksBulkOverlay(packed, overlay, "bulk-test", frame, tags, 1); }) == BulkOverlayError::Stage::Preflight, "a foreign overlay path is refused");
+        require(!fs::exists(fs::path(overlay.string() + ".tracks")), "a refused call creates no tracks");
+    }
     return 0;
 }
