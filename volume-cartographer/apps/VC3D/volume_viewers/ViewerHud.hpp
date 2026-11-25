@@ -5,11 +5,12 @@
 // magnifying loupe.
 //
 // Everything here works on one rendered frame: its 8-bit base-volume samples before the
-// display window, the mask of pixels that frame actually sampled (coverage), and a map
-// from frame pixels to volume positions. Pixels the frame did not sample (loading gaps,
-// holes in a flattened surface, the background) never enter a measurement. The code
-// needs nothing from the surface, fiber or segment code and is header-only so the
-// view's tests can use it directly.
+// display window, the mask of pixels that frame measured (sampled inside the volume
+// from that frame's own geometry), and a map from frame pixels to volume positions.
+// Pixels outside the mask (loading gaps, holes in a flattened surface, the fill the
+// reader returns beyond the volume's edges) never enter a measurement. The code needs
+// nothing from the surface, fiber or segment code and is header-only so the view's
+// tests can use it directly.
 
 #include <QLineF>
 #include <QPointF>
@@ -42,8 +43,8 @@ struct Options {
     bool operator==(const Options&) const = default;
 };
 
-// One frame's 8-bit samples and the mask of the pixels it sampled. `coverage` may be
-// null, meaning every pixel was sampled. Strides are in bytes.
+// One frame's 8-bit samples and the mask of the pixels it measured. `coverage` may be
+// null, meaning every pixel counts. Strides are in bytes.
 struct Raster {
     const std::uint8_t* values = nullptr;
     const std::uint8_t* coverage = nullptr;
@@ -70,21 +71,68 @@ inline double clampInto(double v, double lo, double hi)
     return std::min(std::max(v, lo), hi);
 }
 
+// A volume position the overlays may use: finite, and not the (-1, -1, -1) that marks
+// a hole in a flattened surface.
+inline bool validPosition(const std::array<double, 3>& p)
+{
+    return std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]) &&
+           !(p[0] == -1.0 && p[1] == -1.0 && p[2] == -1.0);
+}
+
+// Whether every voxel a sample at `p` reads lies inside a volume of `sizeXyz` voxels
+// (level-0 XYZ). Beyond that the reader returns its fill value, which is padding rather
+// than scan, even though it is a finite number. A zero inside the volume still counts.
+inline bool insideVolume(const std::array<double, 3>& p, const std::array<double, 3>& sizeXyz)
+{
+    if (!validPosition(p)) {
+        return false;
+    }
+    for (int a = 0; a < 3; ++a) {
+        const double v = p[static_cast<std::size_t>(a)];
+        if (!(v >= 0.0 && v <= sizeXyz[static_cast<std::size_t>(a)] - 1.0)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// The gray the display window gives each 8-bit sample (0 black, 255 white), as the
+// renderer's lookup table maps it. The viewer fills it from that table.
+using DisplayMap = std::array<std::uint8_t, 256>;
+
+inline DisplayMap identityDisplay()
+{
+    DisplayMap out{};
+    for (int i = 0; i < 256; ++i) {
+        out[static_cast<std::size_t>(i)] = static_cast<std::uint8_t>(i);
+    }
+    return out;
+}
+
+// Viewport pixel for a fraction of an extent in pixels, 0 the first pixel and 1 the
+// last one (extent - 1), so scripts can reach every pixel of the frame.
+inline double fractionToPixel(double fraction, double extent)
+{
+    const double f = std::isfinite(fraction) ? std::clamp(fraction, 0.0, 1.0) : 0.0;
+    return f * std::max(0.0, extent - 1.0);
+}
+
 struct Histogram {
     std::array<std::uint32_t, 256> bins{};
     std::uint64_t count = 0;
     double mean = 0.0;
     int low = 0;    // 1st percentile
     int high = 0;   // 99th percentile
-    double belowWindow = 0.0;  // fraction the display window maps to black (value <= windowLow)
-    double aboveWindow = 0.0;  // fraction it maps to white (value >= windowHigh)
+    double belowWindow = 0.0;  // fraction the display window shows as black (gray 0)
+    double aboveWindow = 0.0;  // fraction it shows as white (gray 255)
 };
 
-// Histogram of the sampled values inside `region`, reading every `stride`-th pixel in x
-// and y. Pixels the frame did not sample are left out. `windowLow`/`windowHigh` is the
-// display window, so the result can say how much of the view it clips.
-inline Histogram computeHistogram(const Raster& r, QRect region, int stride = 2,
-                                  int windowLow = 0, int windowHigh = 255)
+// Histogram of the measured values inside `region`, reading every `stride`-th pixel in
+// x and y. Pixels outside the frame's mask are left out. `displayed` is the gray the
+// display window gives each value, so the result can say how much of the view the
+// window shows as black or white exactly as the renderer draws it.
+inline Histogram computeHistogram(const Raster& r, QRect region, int stride,
+                                  const DisplayMap& displayed)
 {
     Histogram h;
     if (r.empty()) {
@@ -107,8 +155,9 @@ inline Histogram computeHistogram(const Raster& r, QRect region, int stride = 2,
             ++h.bins[static_cast<std::size_t>(v)];
             sum += v;
             ++h.count;
-            below += v <= windowLow ? 1 : 0;
-            above += v >= windowHigh ? 1 : 0;
+            const std::uint8_t gray = displayed[static_cast<std::size_t>(v)];
+            below += gray == 0 ? 1 : 0;
+            above += gray == 255 ? 1 : 0;
         }
     }
     if (h.count == 0) {
@@ -133,6 +182,11 @@ inline Histogram computeHistogram(const Raster& r, QRect region, int stride = 2,
         }
     }
     return h;
+}
+
+inline Histogram computeHistogram(const Raster& r, QRect region, int stride = 2)
+{
+    return computeHistogram(r, region, stride, identityDisplay());
 }
 
 // Position of sample i of n along a line, at least two samples.
@@ -237,15 +291,15 @@ inline std::vector<int> findPeaks(const std::vector<float>& v, float minProminen
 }
 
 // Distance along a path of volume positions: entry i is the length from the first
-// position to position i. Once a position is missing (NaN) the length is unknown, so
-// that entry and every later one are NaN.
+// position to position i. Once a position is missing (NaN, or a surface hole) the
+// length is unknown, so that entry and every later one are NaN.
 inline std::vector<double> cumulativeLength(const std::vector<std::array<double, 3>>& positions)
 {
     std::vector<double> out(positions.size(), std::numeric_limits<double>::quiet_NaN());
     double total = 0.0;
     for (std::size_t i = 0; i < positions.size(); ++i) {
         const auto& p = positions[i];
-        if (!std::isfinite(p[0]) || !std::isfinite(p[1]) || !std::isfinite(p[2])) {
+        if (!validPosition(p)) {
             break;
         }
         if (i > 0) {
@@ -376,10 +430,88 @@ inline std::optional<QRectF> loupeRect(QSizeF pane, QPointF cursor, double prefe
     return QRectF(center - QPointF(half, half), QSizeF(size, size));
 }
 
-// Whether a panel of `size` with `margin` around it fits in a pane.
-inline bool panelFits(QSizeF pane, QSizeF size, double margin = 10.0)
+
+
+// Where the profile and histogram panels go in a pane: anchored to the bottom, the
+// profile on the left and the histogram on the right, each lifted above anything in
+// `reserved` (the scale bar) and kept clear of the other. When they do not fit side by
+// side they stack, and both shrink together down to `minScale` of their size. A panel
+// that still does not fit is left out, the histogram before the profile.
+struct PanelLayout {
+    std::optional<QRectF> profile;
+    std::optional<QRectF> histogram;
+};
+
+inline PanelLayout layoutPanels(QSizeF pane, std::optional<QSizeF> profile, std::optional<QSizeF> histogram,
+                                const std::vector<QRectF>& reserved = {}, double margin = 10.0,
+                                double gap = 6.0, double minScale = 0.6)
 {
-    return pane.width() >= size.width() + 2 * margin && pane.height() >= size.height() + 2 * margin;
+    const QRectF area(margin, margin, pane.width() - 2 * margin, pane.height() - 2 * margin);
+    // A panel of `size` at the bottom of the left or right edge, moved up past whatever
+    // it would cover.
+    auto place = [&](QSizeF size, bool right, const std::vector<QRectF>& taken) -> std::optional<QRectF> {
+        if (area.width() <= 0 || area.height() <= 0 || size.width() > area.width()) {
+            return std::nullopt;
+        }
+        const double x = right ? area.right() - size.width() : area.left();
+        double bottom = area.bottom();
+        for (int tries = 0; tries < 32; ++tries) {
+            const QRectF r(x, bottom - size.height(), size.width(), size.height());
+            if (r.top() < area.top()) {
+                return std::nullopt;
+            }
+            std::optional<double> blockedTop;
+            for (const auto* list : {&reserved, &taken}) {
+                for (const QRectF& b : *list) {
+                    if (!b.isEmpty() && r.intersects(b.adjusted(-gap, -gap, gap, gap))) {
+                        blockedTop = blockedTop ? std::min(*blockedTop, b.top()) : b.top();
+                    }
+                }
+            }
+            if (!blockedTop) {
+                return r;
+            }
+            bottom = *blockedTop - gap;
+        }
+        return std::nullopt;
+    };
+    auto scaled = [](const std::optional<QSizeF>& s, double k) {
+        return s ? std::optional<QSizeF>(QSizeF(s->width() * k, s->height() * k)) : std::nullopt;
+    };
+    for (double k = 1.0; k >= minScale - 1e-9; k -= 0.1) {
+        const auto p = scaled(profile, k);
+        const auto h = scaled(histogram, k);
+        PanelLayout out;
+        if (p && h) {
+            // Side by side, then stacked on the right, then stacked on the left.
+            for (int arrangement = 0; arrangement < 3; ++arrangement) {
+                if (arrangement == 1) {
+                    out.histogram = place(*h, true, {});
+                    out.profile = out.histogram ? place(*p, true, {*out.histogram}) : std::nullopt;
+                } else {
+                    out.profile = place(*p, false, {});
+                    out.histogram = out.profile ? place(*h, arrangement == 0, {*out.profile}) : std::nullopt;
+                }
+                if (out.profile && out.histogram) {
+                    return out;
+                }
+            }
+            continue;
+        }
+        if (p) {
+            out.profile = place(*p, false, {});
+        }
+        if (h) {
+            out.histogram = place(*h, true, {});
+        }
+        if (out.profile || out.histogram) {
+            return out;
+        }
+    }
+    if (profile && histogram) {
+        return layoutPanels(pane, profile, std::nullopt, reserved, margin, gap, minScale);
+    }
+    return {};
 }
 
 }  // namespace vc3d::hud

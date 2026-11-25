@@ -325,20 +325,25 @@ async def vc3d_set_hud(
     grid: labeled lines at round volume coordinates on plane views;
     grid_step sets their spacing in voxels (0 picks one from the zoom).
     loupe: magnifier that follows the mouse.
-    profile_line: {"x1", "y1", "x2", "y2"} in fractions (0..1) of `viewer`'s
-    viewport; draws the line, turns the profile on and returns the profile.
+    profile_line: {"x1", "y1", "x2", "y2"} in fractions of `viewer`'s
+    viewport, 0 the first pixel and 1 the last; draws the line, turns the
+    profile on and returns the profile.
     clear_profile: remove `viewer`'s line.
 
     Returns {"hud": {...current switches}} and, with profile_line,
     "viewer" and "profile": {"available", and when false "unavailable" (why:
-    "updating", "loading", "no volume shown", volumetric mode); otherwise
-    "samples", "values" (8-bit samples before the window per pixel of
-    length, null where the frame did not sample the volume), "valueKind"
-    ("sample8"), "peaks" (fractions along the line where a bright crossing
-    such as a papyrus layer peaks), "length" (along "lengthAlong": "plane"
-    or "surface"; null when the line leaves the surface), "lengthUnit" ("um"
-    only when the volume states its voxel size, else "vx"), "start"/"end"
-    (volume positions), "min", "max", "mean"}."""
+    "updating", "loading", "no volume shown", volumetric mode, or a slab
+    composite such as "max of 9 slices", which has no single position per
+    value); otherwise "samples", "values" (8-bit samples of one slice before
+    the window per pixel of length, null where the frame did not measure the
+    volume: loading gaps, surface holes, outside the volume), "missing"
+    (count of nulls), "complete" (false while chunks are still loading),
+    "valueKind" ("sample8"), "peaks" (fractions along the line where a
+    bright crossing peaks; intensity peaks, not a count of sheets), "length"
+    (along "lengthAlong": "plane" or "surface"; null when part of the line
+    has no position), "lengthUnit" ("um" only when the volume states its
+    voxel size, else "vx"), "start"/"end" (volume positions, left out when
+    an end has none), "min", "max", "mean"}."""
     return await _call(
         "viewer.set_hud",
         _strip_none(

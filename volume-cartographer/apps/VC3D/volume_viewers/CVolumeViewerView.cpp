@@ -7,6 +7,8 @@
 #include <QPainter>
 #include <QPaintEvent>
 #include <QPainterPath>
+#include <QCoreApplication>
+#include <QFontMetricsF>
 #include <QPolygonF>
 #include <cmath>
 #include <limits>
@@ -375,14 +377,17 @@ void CVolumeViewerView::wheelEvent(QWheelEvent *event)
 
 void CVolumeViewerView::mouseReleaseEvent(QMouseEvent *event)
 {
-    if (_profileDragging && event->button() == Qt::LeftButton) {
-        _profileDragging = false;
-        if (_profileLine) {
+    if ((_profileDragging || _profileDragCancelled) && event->button() == Qt::LeftButton) {
+        // The release ends the profile's drag, finished or cancelled; the tools never
+        // see it.
+        if (_profileDragging && _profileLine) {
             _profileLine->setP2(event->position());
             if (_profileLine->length() < 3.0) {
                 _profileLine.reset();  // an armed click clears the line
             }
         }
+        _profileDragging = false;
+        _profileDragCancelled = false;
         viewport()->update();
         event->accept();
         return;
@@ -461,13 +466,21 @@ void CVolumeViewerView::mouseReleaseEvent(QMouseEvent *event)
 
 void CVolumeViewerView::keyPressEvent(QKeyEvent *event)
 {
-    if (event->key() == Qt::Key_Escape && (_profileArmed || _profileDragging)) {
-        armProfileLine(false);
-        if (_profileDragging) {
-            _profileDragging = false;
-            _profileLine.reset();
-            viewport()->update();
+    if (event->key() == Qt::Key_Escape) {
+        // Escape that cancels the profile belongs to it alone, auto-repeats and release
+        // included, so Measure and the other tools keep their state.
+        if (_profileOwnsEscape && event->isAutoRepeat()) {
+            event->accept();
+            return;
         }
+        if (_profileArmed || _profileDragging) {
+            cancelProfileGesture();
+            _profileOwnsEscape = true;
+            emit profileLineCancelled();
+            event->accept();
+            return;
+        }
+        _profileOwnsEscape = false;
     }
     switch (event->key()) {
     case Qt::Key_Escape:
@@ -488,6 +501,13 @@ void CVolumeViewerView::keyPressEvent(QKeyEvent *event)
 
 void CVolumeViewerView::keyReleaseEvent(QKeyEvent *event)
 {
+    if (event->key() == Qt::Key_Escape && _profileOwnsEscape) {
+        if (!event->isAutoRepeat()) {
+            _profileOwnsEscape = false;
+        }
+        event->accept();
+        return;
+    }
     emit sendKeyRelease(event->key(), event->modifiers());
     QGraphicsView::keyReleaseEvent(event);
     event->ignore();  // let unhandled releases propagate to CWindow
@@ -500,6 +520,15 @@ void CVolumeViewerView::mousePressEvent(QMouseEvent *event)
         QGraphicsView::mousePressEvent(event);
         event->accept();
         return;
+    }
+
+    if (_profileDragCancelled) {
+        if (event->button() == Qt::LeftButton || !(event->buttons() & Qt::LeftButton)) {
+            _profileDragCancelled = false;  // the cancelled drag's release never arrived
+        } else {
+            event->accept();  // other buttons pressed during a cancelled drag stay with it
+            return;
+        }
     }
 
     if (_profileArmed && event->button() == Qt::LeftButton &&
@@ -618,6 +647,13 @@ void CVolumeViewerView::mouseMoveEvent(QMouseEvent *event)
         event->accept();
         return;
     }
+    if (_profileDragCancelled) {
+        if (event->buttons() & Qt::LeftButton) {
+            event->accept();
+            return;
+        }
+        _profileDragCancelled = false;
+    }
 
     if (_sceneWidgetMouseCapture) {
         QGraphicsView::mouseMoveEvent(event);
@@ -676,6 +712,8 @@ void CVolumeViewerView::setHudOptions(const vc3d::hud::Options& options)
     }
     _hud = options;
     if (!_hud.lineProfile) {
+        // A drag in progress keeps its release, so the tools never get half a gesture.
+        _profileDragCancelled = _profileDragCancelled || _profileDragging;
         _profileDragging = false;
         armProfileLine(false);
     }
@@ -685,6 +723,7 @@ void CVolumeViewerView::setHudOptions(const vc3d::hud::Options& options)
 void CVolumeViewerView::setProfileLine(std::optional<QLineF> line)
 {
     _profileLine = line;
+    _profileDragCancelled = _profileDragCancelled || _profileDragging;
     _profileDragging = false;
     viewport()->update();
 }
@@ -703,6 +742,18 @@ void CVolumeViewerView::armProfileLine(bool armed)
     }
 }
 
+void CVolumeViewerView::cancelProfileGesture()
+{
+    armProfileLine(false);
+    if (_profileDragging) {
+        // The line being drawn is dropped; the rest of the drag stays with the profile.
+        _profileDragging = false;
+        _profileDragCancelled = true;
+        _profileLine.reset();
+    }
+    viewport()->update();
+}
+
 void CVolumeViewerView::setMeasurementFrameSource(std::function<FrameResult()> source)
 {
     _frameSource = std::move(source);
@@ -710,7 +761,7 @@ void CVolumeViewerView::setMeasurementFrameSource(std::function<FrameResult()> s
     viewport()->update();
 }
 
-CVolumeViewerView::FrameResult CVolumeViewerView::measurementFrame() const
+CVolumeViewerView::FrameResult CVolumeViewerView::measurementFrame(bool needSamples) const
 {
     if (!_frameSource) {
         return {std::nullopt, tr("no frame to measure")};
@@ -722,7 +773,8 @@ CVolumeViewerView::FrameResult CVolumeViewerView::measurementFrame() const
     FrameResult result = _frameSource();
     if (result.frame && (result.frame->values.empty() ||
                          result.frame->values.cols != viewport()->width() ||
-                         result.frame->values.rows != viewport()->height())) {
+                         result.frame->values.rows != viewport()->height() ||
+                         (needSamples && !result.frame->samples))) {
         return {std::nullopt, tr("updating")};
     }
     return result;
@@ -748,9 +800,23 @@ std::array<double, 3> toArray(const cv::Vec3f& v)
     return {double(v[0]), double(v[1]), double(v[2])};
 }
 
-bool finite3(const std::array<double, 3>& v)
+// The volume position of a frame pixel from the frame's own geometry, NaN when the
+// pixel has none (off the surface, a hole).
+std::array<double, 3> framePosition(const CVolumeViewerView::MeasurementFrame& f, QPointF p)
 {
-    return std::isfinite(v[0]) && std::isfinite(v[1]) && std::isfinite(v[2]);
+    constexpr double nan = std::numeric_limits<double>::quiet_NaN();
+    std::array<double, 3> v = f.planeMap ? f.planeMap->at(p)
+                              : f.toVolume ? toArray(f.toVolume(p))
+                                           : std::array<double, 3>{nan, nan, nan};
+    if (!vc3d::hud::validPosition(v)) {
+        v = {nan, nan, nan};
+    }
+    return v;
+}
+
+QString compositeUnavailable(const QString& composite)
+{
+    return QCoreApplication::translate("CVolumeViewerView", "the view shows a %1, not one slice").arg(composite);
 }
 }  // namespace
 
@@ -767,6 +833,12 @@ CVolumeViewerView::ProfileReadout CVolumeViewerView::profileReadout() const
         return r;
     }
     const MeasurementFrame& frame = *fr.frame;
+    if (!frame.composite.isEmpty()) {
+        // A slab composite's value can come from any of its slices, so it has no
+        // single position to plot against.
+        r.unavailable = compositeUnavailable(frame.composite);
+        return r;
+    }
     // The viewport shows this frame unscaled, so viewport pixels are frame pixels.
     const QPointF a = _profileLine->p1();
     const QPointF b = _profileLine->p2();
@@ -775,13 +847,11 @@ CVolumeViewerView::ProfileReadout CVolumeViewerView::profileReadout() const
 
     std::vector<std::array<double, 3>> positions(static_cast<std::size_t>(n));
     for (int i = 0; i < n; ++i) {
-        const QPointF p = vc3d::hud::samplePoint(a, b, i, n);
-        positions[std::size_t(i)] = frame.planeMap ? frame.planeMap->at(p)
-                                    : frame.toVolume ? toArray(frame.toVolume(p))
-                                                     : std::array<double, 3>{NAN, NAN, NAN};
+        positions[std::size_t(i)] = framePosition(frame, vc3d::hud::samplePoint(a, b, i, n));
     }
     r.physical = frame.voxelSizeUm > 0.0;
     r.alongSurface = !frame.planeMap;
+    r.complete = frame.complete;
     r.arc = vc3d::hud::cumulativeLength(positions);
     if (r.physical) {
         for (double& d : r.arc) {
@@ -791,10 +861,10 @@ CVolumeViewerView::ProfileReadout CVolumeViewerView::profileReadout() const
     if (!r.arc.empty() && std::isfinite(r.arc.back())) {
         r.length = r.arc.back();
     }
-    if (!positions.empty() && finite3(positions.front())) {
+    if (!positions.empty() && vc3d::hud::validPosition(positions.front())) {
         r.start = positions.front();
     }
-    if (!positions.empty() && finite3(positions.back())) {
+    if (!positions.empty() && vc3d::hud::validPosition(positions.back())) {
         r.end = positions.back();
     }
 
@@ -807,10 +877,39 @@ CVolumeViewerView::ProfileReadout CVolumeViewerView::profileReadout() const
             ++finite;
         }
     }
+    r.missing = n - finite;
     const double sd = finite > 1 ? std::sqrt(std::max(0.0, sum2 / finite - (sum / finite) * (sum / finite))) : 0.0;
     r.peaks = vc3d::hud::findPeaks(r.values, static_cast<float>(std::max(8.0, 0.5 * sd)));
     r.available = true;
     return r;
+}
+
+QRectF CVolumeViewerView::scaleBarRect() const
+{
+    if (property("vc_hide_scalebar").toBool() || _cachedVpW != viewport()->width() ||
+        _cachedVpH != viewport()->height()) {
+        return {};
+    }
+    // Matches drawScaleBar: a bar along the bottom-left with its label just above it.
+    constexpr double M = 10.0;
+    const QFontMetricsF fm(_cachedFont);
+    const double bottom = viewport()->height() - M;
+    const double width = std::max(_cachedBarPx, fm.horizontalAdvance(_cachedBarLabel));
+    return QRectF(QPointF(M - 2.0, bottom - 5.0 - fm.ascent() - 2.0), QPointF(M + width + 2.0, bottom + 2.0));
+}
+
+vc3d::hud::PanelLayout CVolumeViewerView::panelLayout() const
+{
+    const QSizeF pane(viewport()->width(), viewport()->height());
+    // The profile keeps its place while a line is being drawn, so the histogram does not
+    // jump when the drag ends.
+    const auto profile = _hud.lineProfile && _profileLine ? std::optional<QSizeF>(QSizeF(380, 170)) : std::nullopt;
+    const auto histogram = _hud.histogram ? std::optional<QSizeF>(QSizeF(320, 150)) : std::nullopt;
+    std::vector<QRectF> reserved;
+    if (const QRectF bar = scaleBarRect(); !bar.isEmpty()) {
+        reserved.push_back(bar);
+    }
+    return vc3d::hud::layoutPanels(pane, profile, histogram, reserved);
 }
 
 namespace {
@@ -835,11 +934,24 @@ QString coordText(const std::array<double, 3>& v)
     return QStringLiteral("(%1, %2, %3)").arg(v[0], 0, 'f', 0).arg(v[1], 0, 'f', 0).arg(v[2], 0, 'f', 0);
 }
 
+// A window limit as set: whole numbers plain, fractional ones to two decimals.
+QString windowText(double v)
+{
+    return std::abs(v - std::round(v)) < 1e-9 ? QString::number(v, 'f', 0) : QString::number(v, 'f', 2);
+}
+
 void setHudFont(QPainter* p, qreal pointSize)
 {
     QFont f = p->font();
     f.setPointSizeF(pointSize);
     p->setFont(f);
+}
+
+// One line of panel text, cut to the panel's width.
+void drawPanelText(QPainter* p, const QRectF& in, double baseline, const QString& text)
+{
+    const QFontMetricsF fm(p->font());
+    p->drawText(QPointF(in.left(), baseline), fm.elidedText(text, Qt::ElideRight, in.width()));
 }
 }  // namespace
 
@@ -848,9 +960,8 @@ void CVolumeViewerView::drawHistogram(QPainter* p) const
     if (!_hud.histogram) {
         return;
     }
-    const QSizeF pane(viewport()->width(), viewport()->height());
-    const QSizeF size(320, 150);
-    if (!vc3d::hud::panelFits(pane, size)) {
+    const auto layout = panelLayout();
+    if (!layout.histogram) {
         return;
     }
     const FrameResult fr = measurementFrame();
@@ -860,28 +971,28 @@ void CVolumeViewerView::drawHistogram(QPainter* p) const
         _histogramSerial = fr.frame->serial;
         _histogram = vc3d::hud::computeHistogram(rasterOf(*fr.frame),
                                                  QRect(0, 0, viewport()->width(), viewport()->height()), 2,
-                                                 fr.frame->windowLow, fr.frame->windowHigh);
+                                                 fr.frame->displayed);
     }
 
     p->save();
     p->resetTransform();
     p->setRenderHint(QPainter::Antialiasing);
-    const QRectF outer(pane.width() - size.width() - 10, pane.height() - size.height() - 10,
-                       size.width(), size.height());
-    const QRectF in = hudPanel(p, outer);
+    const QRectF in = hudPanel(p, *layout.histogram);
     setHudFont(p, 9);
     p->setPen(Qt::white);
-    p->drawText(QPointF(in.left(), in.top() + 11),
-                QStringLiteral("Visible samples, 8-bit before window (log)"));
+    const QString what = fr.frame && !fr.frame->composite.isEmpty()
+        ? tr("Visible %1, 8-bit before window (log)").arg(fr.frame->composite)
+        : tr("Visible samples, 8-bit before window (log)");
+    drawPanelText(p, in, in.top() + 11, what);
     if (!fr.frame || _histogram.count == 0) {
-        p->drawText(QPointF(in.left(), in.top() + 40),
-                    !fr.frame ? QStringLiteral("Histogram unavailable: %1").arg(fr.unavailable)
-                              : QStringLiteral("No sampled pixels in view"));
+        drawPanelText(p, in, in.top() + 40,
+                      !fr.frame ? tr("Histogram unavailable: %1").arg(fr.unavailable)
+                                : tr("No measured pixels in view"));
         p->restore();
         return;
     }
     const auto& h = _histogram;
-    const QRectF plot(in.left(), in.top() + 18, in.width(), in.height() - 50);
+    const QRectF plot(in.left(), in.top() + 18, in.width(), std::max(1.0, in.height() - 50));
 
     double peak = 1;
     for (std::uint32_t c : h.bins) {
@@ -900,8 +1011,8 @@ void CVolumeViewerView::drawHistogram(QPainter* p) const
     p->setBrush(QColor(120, 190, 255, 200));
     p->drawPath(area);
 
-    auto marker = [&](int v, const QColor& c, Qt::PenStyle style) {
-        const double x = plot.left() + plot.width() * std::clamp(v, 0, 255) / 255.0;
+    auto marker = [&](double v, const QColor& c, Qt::PenStyle style) {
+        const double x = plot.left() + plot.width() * std::clamp(v, 0.0, 255.0) / 255.0;
         p->setPen(QPen(c, 1.5, style));
         p->drawLine(QPointF(x, plot.top()), QPointF(x, plot.bottom()));
     };
@@ -909,17 +1020,18 @@ void CVolumeViewerView::drawHistogram(QPainter* p) const
     marker(fr.frame->windowHigh, QColor(120, 255, 220), Qt::SolidLine);
     marker(h.low, QColor(255, 210, 90), Qt::DashLine);
     marker(h.high, QColor(255, 210, 90), Qt::DashLine);
-    marker(static_cast<int>(std::lround(h.mean)), QColor(255, 255, 255), Qt::DashLine);
+    marker(h.mean, QColor(255, 255, 255), Qt::DashLine);
 
     p->setPen(Qt::white);
-    p->drawText(QPointF(in.left(), in.bottom() - 14),
-                QStringLiteral("1-99%: %1-%2   mean %3%4")
-                    .arg(h.low).arg(h.high).arg(h.mean, 0, 'f', 0)
-                    .arg(fr.frame->overlayBlended ? QStringLiteral("   overlay not counted") : QString()));
-    p->drawText(QPointF(in.left(), in.bottom()),
-                QStringLiteral("window %1-%2 shows %3% as black, %4% as white")
-                    .arg(fr.frame->windowLow).arg(fr.frame->windowHigh)
-                    .arg(100.0 * h.belowWindow, 0, 'f', 1).arg(100.0 * h.aboveWindow, 0, 'f', 1));
+    drawPanelText(p, in, in.bottom() - 14,
+                  tr("1-99%: %1-%2   mean %3%4%5")
+                      .arg(h.low).arg(h.high).arg(h.mean, 0, 'f', 0)
+                      .arg(fr.frame->overlayBlended ? tr("   overlay not counted") : QString())
+                      .arg(fr.frame->complete ? QString() : tr("   loading")));
+    drawPanelText(p, in, in.bottom(),
+                  tr("window %1-%2 shows %3% as black, %4% as white")
+                      .arg(windowText(fr.frame->windowLow), windowText(fr.frame->windowHigh))
+                      .arg(100.0 * h.belowWindow, 0, 'f', 1).arg(100.0 * h.aboveWindow, 0, 'f', 1));
     p->restore();
 }
 
@@ -946,25 +1058,22 @@ void CVolumeViewerView::drawLineProfile(QPainter* p) const
         p->drawEllipse(vc3d::hud::samplePoint(line.p1(), line.p2(), idx, n), 3.5, 3.5);
     }
 
-    const QSizeF pane(viewport()->width(), viewport()->height());
-    const QSizeF size(380, 170);
-    if (_profileDragging || !vc3d::hud::panelFits(pane, size)) {
+    const auto layout = panelLayout();
+    if (_profileDragging || !layout.profile) {
         p->restore();
         return;
     }
-    const QRectF outer(10, pane.height() - size.height() - 10, size.width(), size.height());
-    const QRectF in = hudPanel(p, outer);
+    const QRectF in = hudPanel(p, *layout.profile);
     setHudFont(p, 9);
     p->setPen(Qt::white);
     if (!r.available || n < 2) {
-        p->drawText(QPointF(in.left(), in.top() + 11),
-                    QStringLiteral("Line profile unavailable: %1").arg(r.unavailable));
+        drawPanelText(p, in, in.top() + 11, tr("Line profile unavailable: %1").arg(r.unavailable));
         p->restore();
         return;
     }
-    p->drawText(QPointF(in.left(), in.top() + 11),
-                QStringLiteral("Line profile, 8-bit samples before window: %1 peaks").arg(r.peaks.size()));
-    const QRectF plot(in.left(), in.top() + 18, in.width(), in.height() - 52);
+    drawPanelText(p, in, in.top() + 11,
+                  tr("Line profile, 8-bit samples before window: %1 peaks").arg(r.peaks.size()));
+    const QRectF plot(in.left(), in.top() + 18, in.width(), std::max(1.0, in.height() - 52));
     QPainterPath curve;
     bool started = false;
     for (int i = 0; i < n; ++i) {
@@ -994,20 +1103,23 @@ void CVolumeViewerView::drawLineProfile(QPainter* p) const
 
     p->setPen(Qt::white);
     const QString along = r.alongSurface ? tr("along the surface") : tr("along the plane");
-    QString foot = r.length ? QStringLiteral("length %1 %2").arg(lengthText(*r.length, r.physical), along)
-                            : QStringLiteral("length unknown: the line leaves the surface");
+    QString foot = r.length ? tr("length %1 %2").arg(lengthText(*r.length, r.physical), along)
+                            : tr("length unknown: the line leaves the surface");
     if (r.peaks.size() >= 2) {
         const double first = r.arc[std::size_t(r.peaks.front())];
         const double last = r.arc[std::size_t(r.peaks.back())];
         if (std::isfinite(first) && std::isfinite(last)) {
-            foot += QStringLiteral("   peak spacing %1")
+            foot += tr("   peak spacing %1")
                         .arg(lengthText((last - first) / double(r.peaks.size() - 1), r.physical));
         }
     }
-    p->drawText(QPointF(in.left(), in.bottom() - 14), foot);
+    if (r.missing > 0) {
+        foot += tr("   %1 of %2 samples missing%3")
+                    .arg(r.missing).arg(n).arg(r.complete ? QString() : tr(", loading"));
+    }
+    drawPanelText(p, in, in.bottom() - 14, foot);
     if (r.start && r.end) {
-        p->drawText(QPointF(in.left(), in.bottom()),
-                    QStringLiteral("%1 to %2").arg(coordText(*r.start), coordText(*r.end)));
+        drawPanelText(p, in, in.bottom(), tr("%1 to %2").arg(coordText(*r.start), coordText(*r.end)));
     }
     p->restore();
 }
@@ -1017,7 +1129,7 @@ void CVolumeViewerView::drawGrid(QPainter* p) const
     if (!_hud.grid) {
         return;
     }
-    const FrameResult fr = measurementFrame();
+    const FrameResult fr = measurementFrame(false);
     if (!fr.frame || !fr.frame->planeMap) {
         return;
     }
@@ -1091,15 +1203,17 @@ void CVolumeViewerView::drawLoupe(QPainter* p) const
     p->drawLine(QPointF(center.x() - 8, center.y()), QPointF(center.x() + 8, center.y()));
     p->drawLine(QPointF(center.x(), center.y() - 8), QPointF(center.x(), center.y() + 8));
 
-    const auto raster = rasterOf(*fr.frame);
-    QString text = raster.covered(fx, fy) ? QStringLiteral("sample %1").arg(raster.at(fx, fy))
-                                          : QStringLiteral("not sampled");
-    const QPointF px(fx, fy);
-    const std::array<double, 3> v = fr.frame->planeMap ? fr.frame->planeMap->at(px)
-                                    : fr.frame->toVolume ? toArray(fr.frame->toVolume(px))
-                                                         : std::array<double, 3>{NAN, NAN, NAN};
-    if (finite3(v)) {
-        text += QStringLiteral("  ") + coordText(v);
+    QString text;
+    if (!fr.frame->composite.isEmpty()) {
+        // A composite value comes from one of several slices: no single sample or position.
+        text = fr.frame->composite;
+    } else {
+        const auto raster = rasterOf(*fr.frame);
+        text = raster.covered(fx, fy) ? tr("sample %1").arg(raster.at(fx, fy)) : tr("not measured");
+        const std::array<double, 3> v = framePosition(*fr.frame, QPointF(fx, fy));
+        if (vc3d::hud::validPosition(v)) {
+            text += QStringLiteral("  ") + coordText(v);
+        }
     }
     setHudFont(p, 9);
     const double labelW = std::min(target->width() + 60.0, pane.width() - 4.0);
@@ -1109,6 +1223,6 @@ void CVolumeViewerView::drawLoupe(QPainter* p) const
     p->setBrush(QColor(0, 0, 0, 170));
     p->drawRoundedRect(label, 4, 4);
     p->setPen(Qt::white);
-    p->drawText(label, Qt::AlignCenter, text);
+    p->drawText(label, Qt::AlignCenter, QFontMetricsF(p->font()).elidedText(text, Qt::ElideRight, label.width() - 4));
     p->restore();
 }

@@ -9,6 +9,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <set>
 #include <vector>
 
@@ -92,9 +93,29 @@ private slots:
     void histogramReportsWhatTheWindowClips()
     {
         const Frame f(256, 1);
-        const Histogram h = computeHistogram(f.raster(), f.all(), 1, 63, 192);
-        QCOMPARE(h.belowWindow, 64.0 / 256.0);   // 0..63
-        QCOMPARE(h.aboveWindow, 64.0 / 256.0);   // 192..255
+        // A window from 63 to 192: 0..63 show as black, 192..255 as white.
+        DisplayMap shown{};
+        for (int v = 0; v < 256; ++v) {
+            shown[std::size_t(v)] = v <= 63 ? 0 : v >= 192 ? 255 : std::uint8_t(v);
+        }
+        const Histogram h = computeHistogram(f.raster(), f.all(), 1, shown);
+        QCOMPARE(h.belowWindow, 64.0 / 256.0);
+        QCOMPARE(h.aboveWindow, 64.0 / 256.0);
+    }
+
+    void histogramCountsBlackAndWhiteAsTheRendererShowsThem()
+    {
+        // A fractional window, 100.75 to 200.75, as the renderer's table maps it: 101
+        // already shows as gray 3 and 200 as white. Rounding the limits instead would
+        // call 101 black and leave 200 out of the white share.
+        Frame f(256, 1);
+        DisplayMap shown{};
+        for (int v = 0; v < 256; ++v) {
+            shown[std::size_t(v)] = v <= 100 ? 0 : v == 101 ? 3 : v >= 200 ? 255 : std::uint8_t(v - 98);
+        }
+        const Histogram h = computeHistogram(f.raster(), f.all(), 1, shown);
+        QCOMPARE(h.belowWindow, 101.0 / 256.0);  // 0..100
+        QCOMPARE(h.aboveWindow, 56.0 / 256.0);   // 200..255
     }
 
     void histogramStrideSkipsPixels()
@@ -223,6 +244,49 @@ private slots:
         QVERIFY(std::isnan(arc[3]));
     }
 
+    void holesAndPositionsOutsideTheVolumeAreNotPositions()
+    {
+        QVERIFY(validPosition({0.0, 0.0, 0.0}));
+        QVERIFY(!validPosition({-1.0, -1.0, -1.0}));  // a flattened surface's hole
+        QVERIFY(validPosition({-1.0, 0.0, 0.0}));
+        const std::array<double, 3> size{128.0, 64.0, 32.0};
+        QVERIFY(insideVolume({0.0, 0.0, 0.0}, size));
+        QVERIFY(insideVolume({127.0, 63.0, 31.0}, size));
+        QVERIFY(!insideVolume({-69.3, 10.0, 10.0}, size));
+        QVERIFY(!insideVolume({127.5, 10.0, 10.0}, size));
+        QVERIFY(!insideVolume({10.0, 10.0, 32.0}, size));
+        QVERIFY(!insideVolume({-1.0, -1.0, -1.0}, size));
+    }
+
+    void cumulativeLengthStopsAtASurfaceHole()
+    {
+        // The sentinel is finite, but a path through it has no length.
+        const std::vector<std::array<double, 3>> path{{0, 0, 0}, {1, 0, 0}, {-1, -1, -1}, {3, 0, 0}};
+        const auto arc = cumulativeLength(path);
+        QCOMPARE(arc[1], 1.0);
+        QVERIFY(std::isnan(arc[2]));
+        QVERIFY(std::isnan(arc[3]));
+    }
+
+    void fractionsReachTheLastPixel()
+    {
+        QCOMPARE(fractionToPixel(0.0, 400.0), 0.0);
+        QCOMPARE(fractionToPixel(1.0, 400.0), 399.0);
+        QCOMPARE(fractionToPixel(0.5, 401.0), 200.0);
+        QCOMPARE(fractionToPixel(2.0, 400.0), 399.0);
+        QCOMPARE(fractionToPixel(-1.0, 400.0), 0.0);
+        QCOMPARE(fractionToPixel(std::numeric_limits<double>::quiet_NaN(), 400.0), 0.0);
+        QCOMPARE(fractionToPixel(1.0, 0.0), 0.0);
+        // A line along y = 1 at the bottom row reads that row.
+        Frame f(4, 3);
+        f.set(1, 2, 200);
+        const auto v = sampleLine(f.raster(), QPointF(fractionToPixel(0.0, 4), fractionToPixel(1.0, 3)),
+                                  QPointF(fractionToPixel(1.0, 4), fractionToPixel(1.0, 3)));
+        QCOMPARE(int(v.size()), 4);
+        QCOMPARE(v[1], 200.0f);
+        QCOMPARE(v.back(), 3.0f);
+    }
+
     void gridOnAnAxisAlignedPlaneHasNoSliceAxisLines()
     {
         const auto lines = gridLines(axisAlignedMap(), QRectF(0, 0, 100, 100), 25.0);
@@ -340,11 +404,49 @@ private slots:
         QCOMPARE(loupeRect(QSizeF(1000, 800), QPointF(400, 400), 168.0)->width(), 168.0);
     }
 
-    void panelsOnlyDrawWhereTheyFit()
+    void panelsAvoidEachOtherAndTheScaleBar()
     {
-        QVERIFY(panelFits(QSizeF(400, 200), QSizeF(320, 150)));
-        QVERIFY(!panelFits(QSizeF(330, 200), QSizeF(320, 150)));
-        QVERIFY(!panelFits(QSizeF(400, 160), QSizeF(320, 150)));
+        const QSizeF profile(380, 170);
+        const QSizeF histogram(320, 150);
+        const QSizeF panes[] = {{1600, 900}, {800, 600}, {500, 300}, {500, 420}, {420, 500},
+                                {284, 124}, {80, 80}, {44, 2}};
+        for (const QSizeF& pane : panes) {
+            // The scale bar along the bottom-left, a quarter of the width, label above.
+            const QRectF bar(8, pane.height() - 10 - 24, pane.width() / 4 + 4, 26);
+            const auto layout = layoutPanels(pane, profile, histogram, {bar});
+            const QRectF inside(10, 10, pane.width() - 20, pane.height() - 20);
+            for (const auto& r : {layout.profile, layout.histogram}) {
+                if (!r) {
+                    continue;
+                }
+                QVERIFY(inside.contains(*r));
+                QVERIFY(!r->intersects(bar));
+                QVERIFY(r->width() >= 0.6 * 320 - 1e-9);
+            }
+            if (layout.profile && layout.histogram) {
+                QVERIFY(!layout.profile->intersects(*layout.histogram));
+            }
+            // The histogram is the one left out when only one fits.
+            QVERIFY(layout.profile || !layout.histogram);
+        }
+        // Wide panes keep both at full size, side by side.
+        const auto wide = layoutPanels(QSizeF(1600, 900), profile, histogram, {});
+        QVERIFY(wide.profile && wide.histogram);
+        QCOMPARE(wide.profile->size(), profile);
+        QCOMPARE(wide.histogram->size(), histogram);
+        QCOMPARE(wide.profile->bottom(), wide.histogram->bottom());
+        // A 500 x 300 pane, where the two used to overlap, still shows both.
+        const auto split = layoutPanels(QSizeF(500, 300), profile, histogram,
+                                        {QRectF(8, 266, 129, 26)});
+        QVERIFY(split.profile && split.histogram);
+        QVERIFY(!split.profile->intersects(*split.histogram));
+        // Nothing in a pane too small for any panel.
+        const auto tiny = layoutPanels(QSizeF(80, 80), profile, histogram, {});
+        QVERIFY(!tiny.profile && !tiny.histogram);
+        // One panel alone takes its corner.
+        const auto alone = layoutPanels(QSizeF(800, 600), std::nullopt, histogram, {});
+        QVERIFY(!alone.profile && alone.histogram);
+        QCOMPARE(alone.histogram->right(), 790.0);
     }
 };
 

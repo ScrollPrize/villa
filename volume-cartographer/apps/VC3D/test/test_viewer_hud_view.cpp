@@ -26,6 +26,12 @@ struct FakeFrame {
     bool live = true;
     double voxelSizeUm = 0.0;
     std::uint64_t serial = 1;
+    QString composite;
+    // A flattened view: no plane map, and column `holeColumn` maps to the (-1, -1, -1)
+    // a hole in the surface reports.
+    bool flattened = false;
+    int holeColumn = -1;
+    bool samples = true;
 
     CVolumeViewerView::FrameResult operator()(const QSize& size) const
     {
@@ -51,11 +57,18 @@ struct FakeFrame {
         map.origin = {0.0, 0.0, 40.0};
         map.dx = {1.0, 0.0, 0.0};
         map.dy = {0.0, 1.0, 0.0};
-        f.planeMap = map;
-        f.toVolume = [](const QPointF& p) {
+        if (!flattened) {
+            f.planeMap = map;
+        }
+        f.toVolume = [hole = holeColumn](const QPointF& p) {
+            if (hole >= 0 && std::abs(p.x() - hole) < 0.5) {
+                return cv::Vec3f(-1.0f, -1.0f, -1.0f);
+            }
             return cv::Vec3f(float(p.x()), float(p.y()), 40.0f);
         };
         f.voxelSizeUm = voxelSizeUm;
+        f.composite = composite;
+        f.samples = samples;
         out.frame = std::move(f);
         return out;
     }
@@ -166,6 +179,58 @@ private slots:
         QCOMPARE(press.count(), 1);
     }
 
+    void escapeDuringADragKeepsTheWholeGestureFromTheTools()
+    {
+        QSignalSpy press(_view.get(), &CVolumeViewerView::sendMousePress);
+        QSignalSpy click(_view.get(), &CVolumeViewerView::sendVolumeClicked);
+        QSignalSpy release(_view.get(), &CVolumeViewerView::sendMouseRelease);
+        QSignalSpy keys(_view.get(), &CVolumeViewerView::sendKeyPress);
+        QSignalSpy keyReleases(_view.get(), &CVolumeViewerView::sendKeyRelease);
+        QSignalSpy cancelled(_view.get(), &CVolumeViewerView::profileLineCancelled);
+        _view->armProfileLine(true);
+        QTest::mousePress(vp(), Qt::LeftButton, Qt::NoModifier, QPoint(50, 60));
+        sendMove(vp(), QPointF(120, 60), Qt::LeftButton);
+        // Escape, held long enough to repeat, then let go.
+        QKeyEvent esc(QEvent::KeyPress, Qt::Key_Escape, Qt::NoModifier);
+        QApplication::sendEvent(_view.get(), &esc);
+        QKeyEvent repeatUp(QEvent::KeyRelease, Qt::Key_Escape, Qt::NoModifier, QString(), true);
+        QApplication::sendEvent(_view.get(), &repeatUp);
+        QKeyEvent repeatDown(QEvent::KeyPress, Qt::Key_Escape, Qt::NoModifier, QString(), true);
+        QApplication::sendEvent(_view.get(), &repeatDown);
+        QKeyEvent up(QEvent::KeyRelease, Qt::Key_Escape, Qt::NoModifier);
+        QApplication::sendEvent(_view.get(), &up);
+        QCOMPARE(cancelled.count(), 1);
+        QVERIFY(!_view->profileLine());
+        // The rest of the drag stays with the cancelled profile.
+        sendMove(vp(), QPointF(160, 60), Qt::LeftButton);
+        QTest::mouseRelease(vp(), Qt::LeftButton, Qt::NoModifier, QPoint(160, 60));
+        QCOMPARE(press.count(), 0);
+        QCOMPARE(click.count(), 0);
+        QCOMPARE(release.count(), 0);
+        // Measure and the other tools never saw the Escape, its repeats or release.
+        QCOMPARE(keys.count(), 0);
+        QCOMPARE(keyReleases.count(), 0);
+        // Afterwards clicks and Escape are the tools' again.
+        QTest::mouseClick(vp(), Qt::LeftButton, Qt::NoModifier, QPoint(70, 70));
+        QCOMPARE(press.count(), 1);
+        QCOMPARE(click.count(), 1);
+        QTest::keyClick(_view.get(), Qt::Key_Escape);
+        QCOMPARE(keys.count(), 1);
+    }
+
+    void escapeWhileArmedStaysWithTheProfile()
+    {
+        QSignalSpy keys(_view.get(), &CVolumeViewerView::sendKeyPress);
+        QSignalSpy cancelled(_view.get(), &CVolumeViewerView::profileLineCancelled);
+        _view->setProfileLine(QLineF(QPointF(10, 50), QPointF(30, 50)));
+        _view->armProfileLine(true);
+        QTest::keyClick(_view.get(), Qt::Key_Escape);
+        QCOMPARE(cancelled.count(), 1);
+        QCOMPARE(keys.count(), 0);
+        QVERIFY(!_view->profileLineArmed());
+        QVERIFY(_view->profileLine());  // only arming is cancelled; the drawn line stays
+    }
+
     void embeddedControlsKeepTheirClicksWhileArmed()
     {
         auto* button = new QPushButton(QStringLiteral("Apply"));
@@ -209,6 +274,53 @@ private slots:
         QVERIFY(std::abs(*r.length - 20.0 * 7.91) < 1e-9);
     }
 
+    void aSurfaceHoleHasNoPositionOrLength()
+    {
+        _frame.flattened = true;
+        _frame.holeColumn = 25;
+        _view->setProfileLine(QLineF(QPointF(10, 50), QPointF(30, 50)));
+        auto r = _view->profileReadout();
+        QVERIFY(r.available);
+        QVERIFY(r.alongSurface);
+        QVERIFY(!r.length);              // the path crosses the hole
+        QVERIFY(std::isnan(r.arc[15]));  // from the hole on
+        QCOMPARE(r.arc[14], 14.0);
+        QVERIFY(r.start && r.end);
+        // A line that ends in the hole has no end position.
+        _view->setProfileLine(QLineF(QPointF(10, 50), QPointF(25, 50)));
+        r = _view->profileReadout();
+        QVERIFY(r.start);
+        QVERIFY(!r.end);
+    }
+
+    void missingSamplesAreCounted()
+    {
+        _view->setProfileLine(QLineF(QPointF(10, 50), QPointF(30, 50)));
+        const auto r = _view->profileReadout();
+        QCOMPARE(r.missing, 1);  // the gap column
+        QVERIFY(r.complete);
+    }
+
+    void aSlabCompositeIsNotProfiled()
+    {
+        _frame.composite = QStringLiteral("max of 9 slices");
+        _view->setProfileLine(QLineF(QPointF(10, 50), QPointF(30, 50)));
+        const auto r = _view->profileReadout();
+        QVERIFY(!r.available);
+        QVERIFY(r.unavailable.contains(QStringLiteral("max of 9 slices")));
+        QVERIFY(r.values.empty());
+    }
+
+    void aFrameWithoutItsMeasurementMaskIsNotMeasured()
+    {
+        // Rendered before an overlay that reads samples was on: positions only.
+        _frame.samples = false;
+        _view->setProfileLine(QLineF(QPointF(10, 50), QPointF(30, 50)));
+        const auto r = _view->profileReadout();
+        QVERIFY(!r.available);
+        QCOMPARE(r.unavailable, QStringLiteral("updating"));
+    }
+
     void aFrameThatIsNotLiveIsNotMeasured()
     {
         _view->setProfileLine(QLineF(QPointF(10, 50), QPointF(30, 50)));
@@ -233,7 +345,7 @@ private slots:
         options.grid = true;
         options.loupe = true;
         _view->setHudOptions(options);
-        const QSize panes[] = {{400, 300}, {284, 124}, {80, 80}, {44, 2}, {2, 44}, {600, 90}};
+        const QSize panes[] = {{400, 300}, {500, 300}, {284, 124}, {80, 80}, {44, 2}, {2, 44}, {600, 90}};
         for (const QSize& pane : panes) {
             for (double step : {0.0, 0.5, 2.5, 25.0}) {
                 options.gridStep = step;

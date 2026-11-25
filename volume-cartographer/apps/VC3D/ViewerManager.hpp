@@ -179,6 +179,8 @@ public:
     static void setFleetHudOptions(const vc3d::hud::Options& options);
     // Turn the line profile on and arm every slice view for one left drag that draws it.
     static void armFleetProfileLine();
+    // Disarm every slice view (a drag started in one of them, or Escape).
+    static void disarmFleetProfileLine();
     void setPlaneIntersectionLinesVisible(bool visible);
 
     // --- Reset-view-on-surface-change policy ---

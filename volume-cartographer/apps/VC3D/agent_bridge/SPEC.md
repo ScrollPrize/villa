@@ -352,22 +352,28 @@ surface's store UUID. Methods on segments need an open project and volume (-3200
   are updated where applicable.
 - `viewer.set_hud` switches the measurement overlays for every viewer of every
   viewer manager (main and Spiral), exactly like View > Measurement Overlays, whose
-  items follow it. The target viewer is checked first: a bad `viewer` with
-  `profileLine` or `clearProfile` returns -32002 and changes nothing. A
-  `profileLine` is given in fractions of the target viewer's viewport and turns
-  profile mode on. Measurements read only the presented frame, and only while it
-  shows the live view; otherwise `profile.available` is false and
-  `profile.unavailable` says why (for example "updating" right after a pan or a
-  normal-offset change, "loading", "no volume shown", or volumetric mode).
-  `values` are the base volume's 8-bit samples before the display window
-  (`valueKind: "sample8"`), null where the frame did not sample the volume
-  (loading gaps, surface holes, outside the volume). `length` is measured along
-  the sampled positions (`lengthAlong`: "plane", or "surface" on a flattened
-  segment, where it follows the surface rather than the screen), in µm only when
-  the volume states its voxel size and in level-0 voxels otherwise
-  (`lengthUnit`), and null when part of the line leaves the surface. `start` and
-  `end` are the volume positions of the line's ends, normal offset included. The
-  grid draws only on plane views.
+  items follow it. The profile target is resolved in the main viewer manager and
+  checked first: a bad `viewer` with `profileLine` or `clearProfile` returns -32002
+  and changes nothing. A `profileLine` is given in fractions of the target viewer's
+  viewport, 0 the first pixel and 1 the last (`x * (width - 1)`), and turns profile
+  mode on. Measurements read only the presented frame, and only while it shows the
+  live view; otherwise `profile.available` is false and `profile.unavailable` says
+  why (for example "updating" right after a pan, a normal-offset, window or
+  composite change, "loading", "no volume shown", volumetric mode, or a slab
+  composite such as "max of 9 slices", whose values have no single position).
+  `values` are the base volume's 8-bit samples of one slice before the display
+  window (`valueKind: "sample8"`), null where the frame did not measure the volume:
+  loading gaps, surface holes, pixels carried over from an earlier surface while an
+  edit loads, and positions outside the volume, where the reader returns its fill
+  value. `missing` counts the nulls and `complete` is false while some of the
+  frame's chunks are still loading. Positions come from the geometry the frame was
+  sampled with. `length` is measured along those positions (`lengthAlong`:
+  "plane", or "surface" on a flattened segment, where it follows the surface
+  rather than the screen), in µm only when the volume states its voxel size and in
+  level-0 voxels otherwise (`lengthUnit`), and null once part of the line has no
+  position (it leaves the surface or crosses a hole). `start` and `end` are the
+  volume positions of the line's ends, normal offset included, left out when an
+  end has none. The grid draws only on plane views.
 - Overlay updates are atomic. A clear request removes the overlay; explicit
   volumes must resolve in the open package. Intersection sets always include
   the segmentation surface and are not applied to the segmentation viewer

@@ -263,19 +263,12 @@ VolumeViewerBase* ViewerManager::initializeChunkedViewer(CChunkedVolumeViewer* c
     }
     chunkedViewer->setShowCoordinateFrame(_showCoordinateFrames);
     chunkedViewer->graphicsView()->setHudOptions(_hudOptions);
-    // A drag that starts a profile line in one view disarms the others.
+    // A drag that starts a profile line in one view disarms the others, and Escape in
+    // any view disarms them all: the menu armed every view, so one key undoes it.
     connect(chunkedViewer->graphicsView(), &CVolumeViewerView::profileLineDrawStarted, this,
-            [view = chunkedViewer->graphicsView()]() {
-                for (auto* manager : ViewerManager::allManagers()) {
-                    manager->forEachBaseViewer([view](VolumeViewerBase* viewer) {
-                        if (auto* other = dynamic_cast<CChunkedVolumeViewer*>(viewer)) {
-                            if (other->graphicsView() != view) {
-                                other->graphicsView()->armProfileLine(false);
-                            }
-                        }
-                    });
-                }
-            });
+            []() { ViewerManager::disarmFleetProfileLine(); });
+    connect(chunkedViewer->graphicsView(), &CVolumeViewerView::profileLineCancelled, this,
+            []() { ViewerManager::disarmFleetProfileLine(); });
 
     {
         using namespace vc3d::settings;
@@ -715,6 +708,9 @@ void ViewerManager::setHudOptions(const vc3d::hud::Options& options)
     forEachBaseViewer([&options](VolumeViewerBase* viewer) {
         if (auto* chunkedViewer = dynamic_cast<CChunkedVolumeViewer*>(viewer)) {
             chunkedViewer->graphicsView()->setHudOptions(options);
+            // Frames carry the measurement mask only while an overlay that reads
+            // samples is on; this renders one that does (a no-op when nothing changed).
+            chunkedViewer->requestRender("measurement overlays");
         }
     });
     emit hudOptionsChanged(options);
@@ -732,6 +728,20 @@ void ViewerManager::setFleetHudOptions(const vc3d::hud::Options& options)
         if (manager) {
             manager->setHudOptions(options);
         }
+    }
+}
+
+void ViewerManager::disarmFleetProfileLine()
+{
+    for (auto* manager : allManagers()) {
+        if (!manager) {
+            continue;
+        }
+        manager->forEachBaseViewer([](VolumeViewerBase* viewer) {
+            if (auto* chunkedViewer = dynamic_cast<CChunkedVolumeViewer*>(viewer)) {
+                chunkedViewer->graphicsView()->armProfileLine(false);
+            }
+        });
     }
 }
 

@@ -585,7 +585,8 @@ QJsonObject AgentBridgeServer::handleViewerSetHud(const QJsonValue& params)
         return out;
     }
 
-    // The profile line belongs to one viewer, given in fractions of its viewport.
+    // The profile line belongs to one viewer, given in fractions of its viewport: 0 is
+    // the first pixel and 1 the last, so a line can reach every pixel.
     out["viewer"] = viewerIdFor(chunked);
     if (clearProfile && !wantsLine) {
         view->setProfileLine(std::nullopt);
@@ -595,8 +596,8 @@ QJsonObject AgentBridgeServer::handleViewerSetHud(const QJsonValue& params)
     const double w = view->viewport()->width();
     const double h = view->viewport()->height();
     auto at = [&](const char* x, const char* y) {
-        return QPointF(std::clamp(line.value(x).toDouble(), 0.0, 1.0) * w,
-                       std::clamp(line.value(y).toDouble(), 0.0, 1.0) * h);
+        return QPointF(vc3d::hud::fractionToPixel(line.value(x).toDouble(), w),
+                       vc3d::hud::fractionToPixel(line.value(y).toDouble(), h));
     };
     view->setProfileLine(QLineF(at("x1", "y1"), at("x2", "y2")));
     view->viewport()->repaint();
@@ -629,7 +630,11 @@ QJsonObject AgentBridgeServer::handleViewerSetHud(const QJsonValue& params)
         peaks.append(n > 1 ? double(idx) / (n - 1) : 0.0);
     }
     profile["samples"] = n;
+    profile["missing"] = r.missing;
+    profile["complete"] = r.complete;
     profile["values"] = values;
+    // One 8-bit sample of a single slice per point, before the display window. Slab
+    // composites (Max, Mean, ...) and the volumetric view are not profiled.
     profile["valueKind"] = QStringLiteral("sample8");
     profile["peaks"] = peaks;
     profile["lengthAlong"] = r.alongSurface ? QStringLiteral("surface") : QStringLiteral("plane");
