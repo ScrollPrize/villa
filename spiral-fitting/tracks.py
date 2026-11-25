@@ -2307,8 +2307,11 @@ def _attach_device_resident_points(bundle, device):
     if device.type == 'cuda':
         free_bytes, _total_bytes = torch.cuda.mem_get_info(device)
     else:
-        # unified memory: bound the copies by Metal's working-set budget
-        free_bytes = torch.mps.recommended_max_memory()
+        # unified memory: the free part of Metal's working-set budget, so a fit
+        # already near its limit keeps the host gather instead of OOMing here
+        free_bytes = max(
+            0, torch.mps.recommended_max_memory()
+            - torch.mps.driver_allocated_memory())
     if needed > 0.2 * free_bytes:
         return
     bundle['flat_zyx'] = coordinates.to(device=device)

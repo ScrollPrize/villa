@@ -701,6 +701,22 @@ class CpuTrackStorageTests(unittest.TestCase):
         self.assertEqual(sample['sampled_scroll'].shape, (4, 3))
         self.assertEqual(sample['sampled_scroll'].device.type, 'cpu')
 
+    def test_mps_track_upload_falls_back_when_the_budget_is_in_use(self):
+        # 32 bytes of points against a 1000-byte budget: 20% of the whole
+        # budget fits, 20% of what is left after 900 allocated bytes does not
+        from unittest import mock
+        from tracks import _attach_device_resident_points
+        bundle = {
+            'lengths': torch.tensor([2]),
+            'flat_zyx_cpu': torch.zeros(2, 3),
+            'flat_source_local_cpu': torch.zeros(2, dtype=torch.int32),
+        }
+        with mock.patch.object(torch.mps, 'recommended_max_memory', return_value=1000), \
+                mock.patch.object(torch.mps, 'driver_allocated_memory', return_value=900):
+            _attach_device_resident_points(bundle, torch.device('mps'))
+        self.assertNotIn('flat_zyx', bundle)
+        self.assertNotIn('flat_source_local', bundle)
+
     def test_tracks_entirely_outside_outer_shell_are_removed(self):
         class RadiusFiveShell:
             @staticmethod
