@@ -10,6 +10,8 @@ void replaceFile(const std::filesystem::path& source,const std::filesystem::path
 // existing destination (including an empty directory/symlink) is never replaced.
 // Overwrite exchanges complete directories on Linux/macOS, leaving old contents
 // at source for caller cleanup. This is not publishDirectory's merge operation.
+// Filesystems that refuse atomic no-replace and exchange renames (NFS, exFAT) get
+// a hard link or plain renames instead, which are not atomic.
 // Caller owns payload durability and staging cleanup.
 void publishPath(const std::filesystem::path& source,const std::filesystem::path& destination,bool overwrite);
 void recoverDirectory(const std::filesystem::path& destination);

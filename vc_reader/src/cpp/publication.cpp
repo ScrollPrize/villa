@@ -7,6 +7,7 @@
 #include <unordered_map>
 #include <string>
 #include <system_error>
+#include "atomic_file.hpp"
 #include "platform_io.hpp"
 #if defined(__linux__)
 #include <sys/syscall.h>
@@ -27,6 +28,46 @@ void replaceFile(
     platform::replace_file(source, destination, true);
 }
 
+#if (defined(__linux__) && defined(SYS_renameat2)) || defined(__APPLE__)
+namespace {
+// Finishes publishPath after the atomic rename failed with `error`. Only a
+// filesystem that refuses the no-replace or exchange flag itself (NFS answers
+// EINVAL, exFAT ENOTSUP) gets this fallback, which is not atomic. Any other
+// error is reported unchanged.
+void publishWithoutFlags(const std::filesystem::path& source,const std::filesystem::path& destination,
+    bool directory,bool exists,int error)
+{
+    namespace fs=std::filesystem;
+    std::error_code ec(error,std::generic_category());
+    if(error==EINVAL||error==ENOSYS||error==EOPNOTSUPP||error==ENOTSUP){
+        ec.clear();
+        if(exists){
+            // Move the destination aside, the source in and the old destination to
+            // the source path. If the source cannot move, put the destination back.
+            // Readers can find no destination in between.
+            const fs::path aside=temporary_path(destination.string());
+            fs::rename(destination,aside,ec);
+            if(!ec){
+                fs::rename(source,destination,ec);
+                std::error_code restored;
+                if(ec)fs::rename(aside,destination,restored);
+                else fs::rename(aside,source,ec);
+            }
+        }else if(directory){
+            // rename(2) can still replace an empty directory created after this check.
+            if(fs::exists(fs::symlink_status(destination)))ec=std::make_error_code(std::errc::file_exists);
+            else fs::rename(source,destination,ec);
+        }else{
+            // link(2) refuses an existing destination, so nothing is replaced.
+            fs::create_hard_link(source,destination,ec);
+            if(!ec)fs::remove(source,ec);
+        }
+    }
+    if(ec)throw fs::filesystem_error("atomic publication",source,destination,ec);
+}
+}
+#endif
+
 void publishPath(const std::filesystem::path& source,const std::filesystem::path& destination,bool overwrite)
 {
     namespace fs=std::filesystem;
@@ -42,10 +83,10 @@ void publishPath(const std::filesystem::path& source,const std::filesystem::path
         throw std::invalid_argument("publication destination must have the same type and cannot be a symlink");
 #if defined(__linux__) && defined(SYS_renameat2)
     if(::syscall(SYS_renameat2,AT_FDCWD,source.c_str(),AT_FDCWD,destination.c_str(),exists?RENAME_EXCHANGE:RENAME_NOREPLACE)!=0)
-        throw fs::filesystem_error("atomic publication",source,destination,std::error_code(errno,std::generic_category()));
+        publishWithoutFlags(source,destination,directory,exists,errno);
 #elif defined(__APPLE__)
     if(::renamex_np(source.c_str(),destination.c_str(),exists?RENAME_SWAP:RENAME_EXCL)!=0)
-        throw fs::filesystem_error("atomic publication",source,destination,std::error_code(errno,std::generic_category()));
+        publishWithoutFlags(source,destination,directory,exists,errno);
 #elif defined(_WIN32)
     if(directory&&exists)throw std::runtime_error("atomic replacement of nonempty directories is unsupported on Windows");
     const DWORD flags=MOVEFILE_WRITE_THROUGH|(exists?MOVEFILE_REPLACE_EXISTING:0);
