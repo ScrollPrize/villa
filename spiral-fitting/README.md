@@ -462,42 +462,24 @@ pieces and points), the largest step of `w` and `c`.
 
 #### Constraint cut
 
-The solve does not satisfy every crossing it was solved from, and one badly
-violated crossing can tie a mislabelled group of fibers into the component
-held to absolute windings. With `fiber_constraint_cut_turns` positive
-(default 4), `fiber_constraint_cut.py` rebuilds the run's crossings at
-startup with the winding stage's own builder (`vc_object_store`
-`PackedWindingGeometry.prepare_winding_graph`): the measurements of the run
-store's lineage, the run's families, the signs of the normal-sign run it
-pins, its recorded weights, normal-dot power and distance damping, and the
-whole fibers' seam transport around the manifest's umbilicus. A crossing's
-violation is `|W_b − W_a − t|` (`t` its target in turns, which the solver
-splits into two weighted integer arcs whose residuals add up to exactly
-this). Crossings violated by more than the threshold are cut and the
-components found again over the rest, every fiber of the run a node; the
-fiber loss, satisfaction pass and DT targets use these components, and a
-piece cut off the largest component gets the relative loss. Null or 0 uses
-the run's components as they are.
+One badly violated crossing can tie a mislabelled group of fibers into the
+component held to absolute windings. With `fiber_constraint_cut_turns`
+positive (default 4; null or 0 uses the run's components as they are),
+`fiber_constraint_cut.py` rebuilds the run's crossings at startup with the
+winding stage's own builder, cuts those the solve violates by more than that
+many turns (`|W_b − W_a − t|`, `t` the crossing's target) and finds the
+components again; the fiber loss, satisfaction pass and DT targets use them,
+and a piece cut off the largest component gets the relative loss. The module
+docstring states the rules.
 
-The rebuild holds only what the store holds. A crossing between two solve
-components is one the run's crossing filter removed (this build cannot read
-the filter's findings) and is dropped; crossings it removed inside a
-component are kept. Fixed scaffold groups (`fixed_object`),
-`scaffold_reference` cross constraints and manual links are not rebuilt;
-crossings between the members of one fixed group, which the run left out,
-are scored like any other. The
-solve's components are the starting truth: where the readable crossings leave
-a solve component in pieces, the missing links count as satisfied, and after
-the cut each piece's largest remaining part stays joined to the largest
-remaining part of the component's main piece. With nothing cut this is the
-solve's partition by construction; a fiber leaves its solve component only
-where cut crossings disconnect it. The joined pieces are counted in the log,
-and a run whose constraint set cannot be fully reproduced says so.
-The log reports the crossings read, the violation histogram, the cut count,
-whether the uncut crossings reproduce the solve's components, the components
-and the largest one before and after, and how many fibers left the largest.
-On PHerc0332 (239 k fibers, 6 M crossings) it adds 15–20 s and raises the
-solve read's peak RSS from 2–4 GiB to 5.5–7 GiB.
+Caveats: the rebuild holds only what the store holds. Crossings between two
+solve components (removed by the run's crossing filter) are dropped; those
+the filter removed inside a component are kept and scored, as are crossings
+inside one `fixed_object` group. What only unrebuilt constraints
+(`fixed_object` groups, `scaffold_reference`, manual links) join is kept
+joined, never cut; the log names them. On PHerc0332 (239 k fibers, 6 M
+crossings) the cut adds 15–20 s and raises the solve read's peak RSS from
+2–4 GiB to 5.5–7 GiB.
 
 A checkpoint records the threshold and a digest of the components; a resume
 with another threshold or other components is refused unless

@@ -1,43 +1,32 @@
 """Cut a winding solve's most violated crossings, then find its components again.
 
 A wgraph winding run (fiber_solve_inputs) solves its fibers' windings from
-measured crossings between fibers, each stating the winding step between its
-two fibers. The solve does not satisfy them all, and one badly violated
-crossing can tie a mislabelled group of fibers into the component the fit
-holds to absolute windings. With ``fiber_constraint_cut_turns`` positive,
-read_winding_solve therefore:
+measured crossings, each stating the winding step ``t`` (turns) between two
+fibers; one badly violated crossing can tie a mislabelled group into the
+component the fit holds to absolute windings. With
+``fiber_constraint_cut_turns`` positive, read_winding_solve therefore:
 
-1. rebuilds the crossings the run solved from with the builder the winding
-   stage itself calls, vc_object_store's
-   ``PackedWindingGeometry.prepare_winding_graph`` (read_measurements, then
-   build_crossings once the whole fibers' geometry is read): the
-   measurements of the run store's lineage (``fiber_graph_columns``), the
-   run's fibers and their families as its rows give them, their signs from
-   the normal-sign run the run pins, its recorded type weights, normal-dot
-   power and distance damping, and the fibers' geometry around the
-   manifest's umbilicus for the seam transport. The builder applies the
-   stage's own selection (family pairs, validity, signed order, weight) and
-   states each usable crossing's target ``t`` in turns (``event_targets``);
-2. scores each crossing by its violation under the solve, ``|W_b - W_a - t|``
-   with W the run's ``selected_winding``. The solver splits ``t`` into two
-   integer arcs, floor(t) and floor(t) + 1, weighted 1 - frac(t) and frac(t);
-   for an integer step their weighted residual ``|W_b - W_a - target|`` sums
-   to exactly this;
-3. cuts every crossing violated by more than the threshold and finds the
-   connected components of the rest (cut_components), every fiber of the run
-   a node. A crossing between two components of the solve cannot be one the
-   run solved from (it is one the run's crossing filter removed, which this
-   build cannot identify) and is dropped and counted.
+1. rebuilds the run's crossings with the winding stage's own builder,
+   vc_object_store ``PackedWindingGeometry.prepare_winding_graph``
+   (read_measurements, build_crossings): the run store's measurements, the
+   run's fibers and families, the signs of the normal-sign run it pins, its
+   recorded weights, and the whole fibers' seam transport around the
+   manifest's umbilicus;
+2. scores each crossing by ``|W_b - W_a - t|`` under the run's
+   ``selected_winding`` W (for an integer step, the solver's two weighted
+   integer arcs for ``t`` have exactly this residual);
+3. cuts those violated by more than the threshold and finds the components
+   of the rest (cut_components), every fiber of the run a node.
 
-Constraints a store does not hold (a ``fixed_object`` scaffold's rigid
-groups, ``scaffold_reference`` cross constraints, manual links) are not
-rebuilt. The solve's components are the starting truth: where the readable
-crossings leave a solve component in pieces, the missing links count as
-satisfied, and after the cut each piece's largest remaining part stays joined
-to the largest remaining part of the component's main piece. With nothing
-cut the result is the solve's partition by construction; a fiber leaves its
-solve component only where cut crossings disconnect it. The pieces joined
-this way are counted and logged.
+The solve's components are the starting truth. A crossing between two of
+them is one the run's crossing filter removed and is dropped. Constraints
+the store does not hold (fixed_object groups, scaffold_reference, manual
+links) are not rebuilt, so where the readable crossings leave a solve
+component in pieces the missing links count as satisfied: after the cut each
+piece's largest kept part stays joined to the largest kept part of the
+component's main (largest) piece. With nothing cut the result is the solve's
+partition; a fiber leaves its solve component only where cut crossings
+disconnect it.
 """
 import hashlib
 
@@ -79,24 +68,11 @@ def partition_sha256(labels):
     return hashlib.sha256(canonical_labels(labels).astype('<i8').tobytes()).hexdigest()
 
 
-def same_partition(first, second):
-    """Whether two labelings of the same fibers group them identically."""
-    pairs = len(np.unique(np.stack([canonical_labels(first), canonical_labels(second)], 1),
-                          axis=0)) if len(first) else 0
-    return pairs == len(np.unique(first)) == len(np.unique(second))
-
-
 def _components(count, a, b):
     from scipy.sparse import coo_matrix
     from scipy.sparse.csgraph import connected_components
     graph = coo_matrix((np.ones(len(a), dtype=np.int8), (a, b)), shape=(count, count))
     return canonical_labels(connected_components(graph, directed=False)[1])
-
-
-def _largest(labels):
-    """(label, size) of the largest group (the first on a tie)."""
-    sizes = np.bincount(labels)
-    return int(np.argmax(sizes)), int(sizes.max())
 
 
 def _first_per_group(group, key, value):
@@ -108,102 +84,47 @@ def _first_per_group(group, key, value):
 
 
 def cut_components(solve_component, a, b, violation, cut_turns):
-    """Components of the crossings left after cutting those violated by more
-    than ``cut_turns``. ``solve_component`` is the run's component per fiber;
-    ``a``, ``b`` index fibers, ``violation`` is in turns.
-
-    The solve's components are the starting truth: where the readable
-    crossings (nothing cut, inside one solve component) leave a solve
-    component in several pieces, the missing links are taken as satisfied
-    constraints. After the cut, each such piece's largest remaining part
-    stays joined to the largest remaining part of its component's main
-    (largest) piece, so with nothing cut the solve's partition comes back by
-    construction, and a fiber leaves its solve component only where cut
-    crossings disconnect it.
-
-    Returns a dict: ``component`` int64 [F] (canonical labels), the counts
-    the log reports and ``reproduces`` (the readable crossings alone group
-    the fibers as the solve)."""
-    solve_component = np.asarray(solve_component)
-    count = len(solve_component)
+    """The components left after cutting the crossings ``a``, ``b`` (fiber
+    indices) violated by more than ``cut_turns`` (``violation`` in turns),
+    starting from the run's ``solve_component`` per fiber (module step 3).
+    Returns the canonical labels int64 [F] and the cut's log line."""
+    solve = canonical_labels(solve_component)
+    count = len(solve)
     a, b = np.asarray(a, dtype=np.int64), np.asarray(b, dtype=np.int64)
     violation = np.asarray(violation, dtype=np.float64)
-    inside = solve_component[a] == solve_component[b]
+    inside = solve[a] == solve[b]
     cut = inside & (violation > float(cut_turns))
-    solve = canonical_labels(solve_component)
     uncut = _components(count, a[inside], b[inside])
-    kept = _components(count, a[inside & ~cut], b[inside & ~cut])
+    component = kept = _components(count, a[inside & ~cut], b[inside & ~cut])
+    joined_pieces = joined_fibers = 0
     if count:
-        # Each uncut piece's anchor: the kept part holding most of its fibers.
+        # Each uncut piece's anchor: the kept part holding most of its fibers;
+        # every piece's anchor joins that of its solve component's main piece.
         pairs, sizes = np.unique(np.stack([uncut, kept], 1), axis=0, return_counts=True)
         anchor = _first_per_group(pairs[:, 0], sizes, pairs[:, 1])
         piece_solve = np.zeros(len(anchor), dtype=np.int64)
         piece_solve[uncut] = solve
         piece_size = np.bincount(uncut)
-        # The main piece of each solve component and its anchor.
         main_piece = _first_per_group(piece_solve, piece_size, np.arange(len(anchor)))
         joins = _components(int(kept.max()) + 1, anchor, anchor[main_piece[piece_solve]])
         component = canonical_labels(joins[kept])
-    else:
-        piece_size = main_piece = np.zeros(0, dtype=np.int64)
-        component = kept
-    solve_largest, solve_largest_size = _largest(solve) if count else (-1, 0)
-    largest, largest_size = _largest(component) if count else (-1, 0)
-    in_solve_largest = solve == solve_largest
-    left = in_solve_largest & (component != largest)
-    return {
-        'component': component, 'cut_turns': float(cut_turns),
-        'crossings': int(inside.sum()), 'between_components': int((~inside).sum()),
-        'cut': int(cut.sum()),
-        'histogram': [(bound, int((inside & (violation > bound)).sum()))
-                      for bound in CUT_HISTOGRAM_TURNS],
-        'reproduces': same_partition(uncut, solve),
-        # Pieces (and their fibers) the readable crossings leave apart from
-        # their solve component's main piece, joined back as satisfied.
-        'joined_pieces': int(len(piece_size) - len(main_piece)),
-        'joined_fibers': int(count - piece_size[main_piece].sum()),
-        'solve_components': int(len(np.unique(solve))),
-        'uncut_components': int(len(np.unique(uncut))),
-        'components': int(len(np.unique(component))),
-        'solve_largest': solve_largest_size, 'largest': largest_size,
-        'left_largest': int(left.sum()),
-    }
-
-
-def cut_report(cut, read=None, seconds=None):
-    """The startup log lines of a cut (cut_components), its rebuild
-    (build_crossings)."""
-    lines = []
-    if read is not None:
-        lines.append(
-            f'fiber constraints: {read["used"]:,} usable crossings of {read["read"]:,} measured '
-            f'(the run recorded {read["recorded_used"]:,}), perpendicular weight '
-            f'{read["settings"]["weight_perpendicular"]:g}, parallel '
-            f'{read["settings"]["weight_parallel"]:g}'
-            + (f', {read["enclosures"]:,} enclosure relations' if read['enclosures'] else ''))
-        lines.extend(f'fiber constraints: {note}' for note in read['notes'])
-    histogram = ', '.join(f'> {bound:g}: {count:,}' for bound, count in cut['histogram'])
-    lines.append(
-        f'fiber constraints: violation |W_b - W_a - t| under the solve, crossings {histogram} '
-        f'turns; cut {cut["cut"]:,} above {cut["cut_turns"]:g} turns'
-        + (f'; dropped {cut["between_components"]:,} joining two solve components (not in '
-           'the run\'s graph)' if cut['between_components'] else ''))
-    if cut['reproduces']:
-        lines.append(f'fiber constraints: uncut, the crossings reproduce the solve\'s '
-                     f'{cut["solve_components"]:,} components exactly')
-    else:
-        lines.append(
-            f'fiber constraints: uncut, the readable crossings do not reproduce the solve\'s '
-            f'components ({cut["uncut_components"]:,} pieces for {cut["solve_components"]:,}): '
-            f'{cut["joined_pieces"]:,} pieces ({cut["joined_fibers"]:,} fibers) are joined to '
-            'their solve component only by constraints not read here; they are joined back to '
-            'its main piece as satisfied constraints')
-    lines.append(
-        f'fiber constraints: components {cut["solve_components"]:,} -> {cut["components"]:,}, '
-        f'largest {cut["solve_largest"]:,} -> {cut["largest"]:,} fibers; '
-        f'{cut["left_largest"]:,} fibers left the largest component'
-        + (f' ({seconds:.1f}s)' if seconds is not None else ''))
-    return lines
+        joined_pieces = len(anchor) - len(main_piece)
+        joined_fibers = count - int(piece_size[main_piece].sum())
+    solve_sizes = np.bincount(solve, minlength=1)
+    sizes = np.bincount(component, minlength=1)
+    left = int(((solve == solve_sizes.argmax()) & (component != sizes.argmax())).sum())
+    between = int((~inside).sum())
+    histogram = ', '.join(f'> {bound:g}: {int((inside & (violation > bound)).sum()):,}'
+                          for bound in CUT_HISTOGRAM_TURNS)
+    line = (f'fiber constraints: violation |W_b - W_a - t| {histogram} turns; '
+            f'cut {int(cut.sum()):,} above {float(cut_turns):g} turns'
+            + (f', dropped {between:,} joining two solve components' if between else '')
+            + f'; components {len(np.unique(solve)):,} -> {len(np.unique(component)):,}, '
+            f'largest {int(solve_sizes.max()):,} -> {int(sizes.max()):,} fibers, '
+            f'{left:,} left the largest'
+            + (f'; {joined_pieces:,} pieces ({joined_fibers:,} fibers) the read crossings leave '
+               'apart kept joined' if joined_pieces else ''))
+    return component, line
 
 
 def _uuid_keys(uuids):
@@ -294,9 +215,8 @@ def build_crossings(measurements, family, geometry, axis_xyz, handedness):
     read_measurements' ``measurements`` (released here), the run's fiber
     ``family`` and the fibers' packed ``geometry`` (offsets, arc, xyz, turns),
     vc_object_store.pack_winding_geometry around ``axis_xyz`` with
-    ``handedness``. Returns a dict: ``a``, ``b`` int64 (fiber indices),
-    ``target`` float64 (turns), the counts and the notes on what the rebuild
-    cannot reproduce."""
+    ``handedness``. Returns ``a``, ``b`` int64 (fiber indices), ``target``
+    float64 (turns) and the log lines (the counts, what is not rebuilt)."""
     from vc_object_store import PackedWindingGeometry
     from fiber_solve_inputs import SEAM_ANGLE, WindingSolveError
     graph = dict(measurements)
@@ -328,11 +248,9 @@ def build_crossings(measurements, family, geometry, axis_xyz, handedness):
     a = np.asarray(built['event_a'], dtype=np.int64)
     b = np.asarray(built['event_b'], dtype=np.int64)
     target = np.asarray(built['event_target'], dtype=np.float64)
-    enclosure_count = 0
     if enclosures:
         # Exact H -> V relations: one more constraint each, with an integer
         # target, between fibers a crossing already joins.
-        enclosure_count = len(built['enclosure_a'])
         a = np.concatenate([a, np.asarray(built['enclosure_a'], dtype=np.int64)])
         b = np.concatenate([b, np.asarray(built['enclosure_b'], dtype=np.int64)])
         target = np.concatenate([target, np.asarray(built['enclosure_target'], dtype=np.float64)])
@@ -340,31 +258,25 @@ def build_crossings(measurements, family, geometry, axis_xyz, handedness):
     del built
     recorded = int(settings.get('automatic_used', -1))
     filtered = int(settings.get('automatic_crossing_filtered', 0))
-    notes = []
+    lines = [f'fiber constraints: {used:,} usable crossings of {read:,} measured '
+             f'(the run recorded {recorded:,})']
+    caveats = []
     if filtered:
-        notes.append(
-            f'NOT FULLY REPRODUCED: the run\'s crossing filter removed {filtered:,} crossings and '
-            f'this build cannot read the filter\'s findings: {used - recorded:,} usable ones are '
-            'rebuilt beyond the run\'s (those inside a solve component are kept and scored)')
-    elif recorded >= 0 and used != recorded:
-        notes.append(f'WARNING: {used:,} usable crossings rebuilt, the run recorded '
-                     f'{recorded:,}: the rebuild does not select the run\'s crossings')
-    if float(settings.get('weight_sign', 0.0)) > 0:
-        notes.append('the run\'s one-sided sign constraints join only fibers its crossings join '
-                     'and are not scored apart from their crossing')
-    if settings.get('fixed_object'):
-        notes.append('NOT FULLY REPRODUCED: the run\'s fixed_object rigid scaffold groups are not '
-                     'in the store: what only a group joins is kept joined, but crossings between '
-                     'its members, which the run left out, are scored and can be cut')
-    if settings.get('scaffold_reference'):
-        notes.append('NOT FULLY REPRODUCED: the run\'s scaffold_reference cross constraints are '
-                     'not in the store; what only they join is kept joined, never cut')
-    if float(settings.get('weight_manual', 0.0)) > 0:
-        notes.append('NOT FULLY REPRODUCED: the run\'s manual links are not rebuilt; what only '
-                     'they join is kept joined, never cut')
-    return {'a': a, 'b': b, 'target': target, 'read': read, 'used': used,
-            'recorded_used': recorded, 'enclosures': enclosure_count, 'notes': notes,
-            'settings': {key: settings[key] for key in WEIGHT_SETTINGS}}
+        caveats.append(f'its crossing filter removed {filtered:,} crossings this build cannot '
+                       f'identify, so {used - recorded:,} extra ones are rebuilt and scored')
+    unread = [name for name, present in (
+        ('fixed_object groups', settings.get('fixed_object')),
+        ('scaffold_reference constraints', settings.get('scaffold_reference')),
+        ('manual links', float(settings.get('weight_manual', 0.0)) > 0)) if present]
+    if unread:
+        caveats.append(f'its {", ".join(unread)} are not in the store: what only they join is '
+                       'kept joined, never cut')
+    if caveats:
+        lines.append('fiber constraints: NOT FULLY REPRODUCED: the run: ' + '; '.join(caveats))
+    if not filtered and recorded >= 0 and used != recorded:
+        lines.append(f'fiber constraints: WARNING: {used:,} usable crossings rebuilt, the run '
+                     f'recorded {recorded:,}: the rebuild does not select the run\'s crossings')
+    return a, b, target, lines
 
 
 def violation(selected_winding, a, b, target):

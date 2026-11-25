@@ -12,7 +12,7 @@ import pytest
 
 
 def cut(component, edges, cut_turns):
-    """cut_components over ``edges`` = [(a, b, violation), ...]."""
+    """cut_components over ``edges`` = [(a, b, violation), ...]: (labels, log line)."""
     from fiber_constraint_cut import cut_components
     a, b, violation = (np.array(column) for column in zip(*edges)) if edges else (
         np.zeros(0, np.int64), np.zeros(0, np.int64), np.zeros(0))
@@ -27,49 +27,48 @@ CHAIN = [(0, 1, 0.0), (1, 2, 0.5), (2, 3, 1.0), (4, 5, 0.0)]
 
 @pytest.mark.parametrize('bridge, splits', [(5.0, True), (4.0, False), (3.5, False)])
 def test_a_bridge_violated_above_the_threshold_splits_the_island_off(bridge, splits):
-    result = cut(SOLVE, CHAIN + [(3, 4, bridge)], 4.0)
+    component, line = cut(SOLVE, CHAIN + [(3, 4, bridge)], 4.0)
     if splits:
-        np.testing.assert_array_equal(result['component'], [0, 0, 0, 0, 1, 1, 2])
-        assert (result['cut'], result['components'], result['largest']) == (1, 3, 4)
-        assert result['left_largest'] == 2
+        np.testing.assert_array_equal(component, [0, 0, 0, 0, 1, 1, 2])
+        assert 'cut 1 above 4 turns; components 2 -> 3, largest 6 -> 4 fibers, ' \
+            '2 left the largest' in line
     else:
-        np.testing.assert_array_equal(result['component'], [0, 0, 0, 0, 0, 0, 1])
-        assert (result['cut'], result['left_largest']) == (0, 0)
-    assert result['reproduces'] and result['joined_fibers'] == 0
-    assert (result['solve_components'], result['solve_largest']) == (2, 6)
-    assert result['histogram'][2] == (4, int(bridge > 4))
+        np.testing.assert_array_equal(component, [0, 0, 0, 0, 0, 0, 1])
+        assert 'cut 0 above 4 turns; components 2 -> 2, largest 6 -> 6 fibers, ' \
+            '0 left the largest' in line
+    assert f'> 4: {int(bridge > 4)}, ' in line
+    assert 'kept joined' not in line and 'dropped' not in line
 
 
 def test_a_pair_stays_joined_while_one_of_its_crossings_holds():
-    result = cut(SOLVE, CHAIN + [(3, 4, 9.0), (4, 3, 0.2)], 4.0)
-    assert result['cut'] == 1
-    np.testing.assert_array_equal(result['component'], [0, 0, 0, 0, 0, 0, 1])
+    component, line = cut(SOLVE, CHAIN + [(3, 4, 9.0), (4, 3, 0.2)], 4.0)
+    assert 'cut 1 above' in line
+    np.testing.assert_array_equal(component, [0, 0, 0, 0, 0, 0, 1])
 
 
 def test_nothing_cut_reproduces_the_solve_components():
     from fiber_constraint_cut import cut_enabled, partition_sha256
     assert not any(cut_enabled(value) for value in (None, 0, 0.0, -1))
     assert cut_enabled(4.0)
-    result = cut(SOLVE, CHAIN + [(3, 4, 30.0)], 1e9)
-    assert result['reproduces'] and result['cut'] == 0
-    assert partition_sha256(result['component']) == partition_sha256(SOLVE)
+    component, line = cut(SOLVE, CHAIN + [(3, 4, 30.0)], 1e9)
+    assert 'cut 0 above' in line
+    assert partition_sha256(component) == partition_sha256(SOLVE)
 
 
 def test_crossings_between_solve_components_are_dropped_not_merged():
-    result = cut(SOLVE, CHAIN + [(3, 4, 0.0), (5, 6, 0.0)], 4.0)
-    assert result['between_components'] == 1 and result['reproduces']
-    np.testing.assert_array_equal(result['component'], [0, 0, 0, 0, 0, 0, 1])
+    component, line = cut(SOLVE, CHAIN + [(3, 4, 0.0), (5, 6, 0.0)], 4.0)
+    assert ', dropped 1 joining two solve components;' in line
+    np.testing.assert_array_equal(component, [0, 0, 0, 0, 0, 0, 1])
 
 
 def test_connectivity_the_crossings_do_not_explain_is_kept_joined():
     # The solve's component 7 reads as two pieces, 0-3 and 4-5: something not
     # in the store (a scaffold reference, a fixed group) joined them.
     for cut_turns in (1e9, 4.0):
-        result = cut(SOLVE, CHAIN, cut_turns)
-        np.testing.assert_array_equal(result['component'], [0, 0, 0, 0, 0, 0, 1])
-        assert not result['reproduces']
-        assert (result['joined_pieces'], result['joined_fibers']) == (1, 2)
-        assert (result['cut'], result['left_largest']) == (0, 0)
+        component, line = cut(SOLVE, CHAIN, cut_turns)
+        np.testing.assert_array_equal(component, [0, 0, 0, 0, 0, 0, 1])
+        assert line.endswith('0 left the largest; 1 pieces (2 fibers) the read crossings '
+                             'leave apart kept joined')
 
 
 def test_a_cut_inside_a_joined_piece_still_splits_it():
@@ -77,36 +76,26 @@ def test_a_cut_inside_a_joined_piece_still_splits_it():
     # fiber 7 to a cut crossing; the rest of it stays attached.
     solve = [1] * 8 + [2]
     edges = [(0, 1, 0), (1, 2, 0), (2, 3, 0), (4, 5, 0), (5, 6, 0), (6, 7, 9.0)]
-    result = cut(solve, edges, 4.0)
-    np.testing.assert_array_equal(result['component'], [0, 0, 0, 0, 0, 0, 0, 1, 2])
-    assert result['left_largest'] == 1
+    component, line = cut(solve, edges, 4.0)
+    np.testing.assert_array_equal(component, [0, 0, 0, 0, 0, 0, 0, 1, 2])
+    assert '1 left the largest' in line
     # A cut inside the main piece: its larger part keeps the joined piece.
     edges = [(0, 1, 0), (1, 2, 0), (2, 3, 9.0), (4, 5, 0)]
-    result = cut([1] * 6, edges, 4.0)
-    np.testing.assert_array_equal(result['component'], [0, 0, 0, 1, 0, 0])
+    component, _ = cut([1] * 6, edges, 4.0)
+    np.testing.assert_array_equal(component, [0, 0, 0, 1, 0, 0])
 
 
 def test_the_partition_digest_ignores_label_values():
-    from fiber_constraint_cut import canonical_labels, partition_sha256, same_partition
+    from fiber_constraint_cut import canonical_labels, partition_sha256
     np.testing.assert_array_equal(canonical_labels([5, 5, 2, 9, 2]), [0, 0, 1, 2, 1])
     assert partition_sha256([5, 5, 2, 9, 2]) == partition_sha256([0, 0, 3, 1, 3])
     assert partition_sha256([5, 5, 2, 9, 2]) != partition_sha256([5, 5, 2, 2, 2])
-    assert same_partition([1, 1, 2], [4, 4, 0]) and not same_partition([1, 1, 2], [1, 2, 2])
 
 
 def test_the_violation_is_the_solve_step_against_the_crossing_target():
     from fiber_constraint_cut import violation
     np.testing.assert_allclose(
         violation([0, 3, -2], np.array([0, 1]), np.array([1, 2]), [2.25, -9.5]), [0.75, 4.5])
-
-
-def test_the_report_names_the_cut_and_the_components():
-    from fiber_constraint_cut import cut_report
-    lines = cut_report(cut(SOLVE, CHAIN + [(3, 4, 5.0)], 4.0), seconds=1.5)
-    assert 'cut 1 above 4 turns' in lines[0]
-    assert 'reproduce the solve\'s 2 components exactly' in lines[1]
-    assert lines[2].startswith('fiber constraints: components 2 -> 3, largest 6 -> 4 fibers; '
-                               '2 fibers left the largest component')
 
 
 def gauge_solve(fiber_cc, w_min, w_max):
@@ -128,14 +117,14 @@ def test_a_cut_island_no_longer_sets_the_gauge_and_the_backstop_drops_nothing():
     solve = [0] * 8
     edges = [(0, 1, 0), (1, 2, 0), (2, 3, 0), (3, 4, 0), (4, 5, 0), (6, 7, 0), (5, 6, 5.0)]
     for cut_turns, n_low in ((1e9, 5), (4.0, 10)):
-        component = cut(solve, edges, cut_turns)['component']
+        component = cut(solve, edges, cut_turns)[0]
         gauge = largest_cc_gauge(gauge_solve(component, labels_low, labels_high), config)
         assert gauge['n_low'] == n_low and not gauge['dropped'].any()
     # A fiber whose labels are wrong far beyond the margin, with no crossing
     # violated enough to cut it off, is still dropped by the backstop.
     config = Config({'fiber_largest_cc_min_percentile': 20.0,
                      'fiber_outlier_margin_turns': 1.0}).as_dict()
-    gauge = largest_cc_gauge(gauge_solve(cut(solve, edges, 1e9)['component'],
+    gauge = largest_cc_gauge(gauge_solve(cut(solve, edges, 1e9)[0],
                                          labels_low, labels_high), config)
     assert gauge['dropped'].tolist() == [False] * 6 + [True, True] and gauge['n_low'] == 10
 

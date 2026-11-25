@@ -214,10 +214,9 @@ class WindingSolve:
     Per CC the fit uses, C of them in component-id order: ``cc_component``
     int64 [C], ``cc_fiber_count`` int64 [C]; ``largest_cc`` is the index of
     the CC with the most fibers. They are the run's components, or with
-    ``constraint_cut`` (fiber_constraint_cut.cut_components: the threshold,
-    the counts, the log lines and the checkpoint identity) the components
-    left after cutting the crossings the solve violates most, numbered in
-    order of their first fiber.
+    ``constraint_cut`` (its log ``lines`` and checkpoint ``identity``) the
+    components fiber_constraint_cut leaves, numbered in order of their first
+    fiber.
 
     Kept points, P of them, grouped by fiber in fiber order and along each
     fiber in stored order, all inside the z window: ``zyx`` float32 [P, 3]
@@ -521,10 +520,9 @@ def _cut_constraints(measurements, family, selected_winding, component, packed, 
     geometry (``packed``: per read chunk, the fibers' point counts, XYZ, arc
     and turns; both emptied here), cut the most violated and find the
     components again. ``read_seconds`` is the measurement read's time, for
-    the log. Returns the cut's dict with its log ``lines``, checkpoint
-    ``identity`` and fit ``component`` per fiber."""
-    from fiber_constraint_cut import (build_crossings, cut_components, cut_report,
-                                      partition_sha256, violation)
+    the log. Returns the fit ``component`` per fiber, the log ``lines`` and
+    the checkpoint ``identity``."""
+    from fiber_constraint_cut import build_crossings, cut_components, partition_sha256, violation
     started = time.perf_counter()
 
     def take(column, dtype, shape=(0,)):
@@ -541,15 +539,12 @@ def _cut_constraints(measurements, family, selected_winding, component, packed, 
     geometry = (np.concatenate([[0], np.cumsum(counts)]).astype(np.int64),
                 take(2, np.float64), take(1, np.float64, (0, 3)), take(3, np.int64))
     packed.clear()
-    crossings = build_crossings(measurements, family, geometry, axis_xyz, handedness)
+    a, b, target, lines = build_crossings(measurements, family, geometry, axis_xyz, handedness)
     del geometry
-    cut = cut_components(component, crossings['a'], crossings['b'],
-                         violation(selected_winding, crossings['a'], crossings['b'],
-                                   crossings['target']), cut_turns)
-    for key in ('a', 'b', 'target'):
-        del crossings[key]
-    cut['lines'] = cut_report(cut, crossings,
-                              seconds=read_seconds + time.perf_counter() - started)
-    cut['identity'] = {'turns': float(cut_turns),
-                       'components_sha256': partition_sha256(cut['component'])}
-    return cut
+    fit_component, line = cut_components(component, a, b,
+                                         violation(selected_winding, a, b, target), cut_turns)
+    del a, b, target
+    seconds = read_seconds + time.perf_counter() - started
+    return {'component': fit_component, 'lines': lines + [f'{line} ({seconds:.1f}s)'],
+            'identity': {'turns': float(cut_turns),
+                         'components_sha256': partition_sha256(fit_component)}}
