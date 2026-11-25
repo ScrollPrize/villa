@@ -1,10 +1,4 @@
-"""Batch dice under DDP must match one process over the whole batch.
-
-With ddp=True and batch_dice=True both dice losses all-gather their per-class
-statistics and sum away the world axis. Two gloo ranks each hold half of a
-batch; their loss and their input gradients must equal those of a single
-process that sees the whole batch with ddp=False.
-"""
+"""Compare batch Dice losses and model gradients against full-batch training."""
 
 from __future__ import annotations
 
@@ -12,6 +6,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from torch.nn.parallel import DistributedDataParallel
 
 from vesuvius.models.training.loss.nnunet_losses import (
     MemoryEfficientSoftDiceLoss,
@@ -19,7 +14,7 @@ from vesuvius.models.training.loss.nnunet_losses import (
 )
 
 
-pytestmark = pytest.mark.skipif(
+requires_gloo = pytest.mark.skipif(
     not dist.is_available() or not dist.is_gloo_available(),
     reason="requires torch.distributed with the gloo backend",
 )
@@ -36,12 +31,17 @@ def _batch():
 
 
 def _loss(name, ddp):
-    return LOSSES[name](apply_nonlin=None, batch_dice=True, do_bg=True, smooth=1.0, ddp=ddp)
+    return LOSSES[name](apply_nonlin=None, batch_dice=True, do_bg=False, smooth=1.0, ddp=ddp)
 
 
 def _rank_half(rank, tensor):
     half = tensor.shape[0] // WORLD
     return tensor[rank * half:(rank + 1) * half]
+
+
+def _model():
+    torch.manual_seed(42)
+    return torch.nn.Conv2d(3, 3, kernel_size=1, bias=False)
 
 
 def _worker(rank, name, init_file, out_prefix):
@@ -50,19 +50,21 @@ def _worker(rank, name, init_file, out_prefix):
     )
     try:
         probabilities, labels = _batch()
-        local = _rank_half(rank, probabilities).clone().requires_grad_(True)
+        model = DistributedDataParallel(_model())
+        local = model(_rank_half(rank, probabilities)).softmax(dim=1)
         loss = _loss(name, ddp=True)(local, _rank_half(rank, labels))
         loss.backward()
-        torch.save({"loss": loss.detach(), "grad": local.grad}, f"{out_prefix}.{rank}")
+        torch.save({"loss": loss.detach(), "grad": model.module.weight.grad}, f"{out_prefix}.{rank}")
     finally:
         dist.destroy_process_group()
 
 
+@requires_gloo
 @pytest.mark.parametrize("name", sorted(LOSSES))
 def test_batch_dice_under_ddp_matches_one_process(tmp_path, name):
     probabilities, labels = _batch()
-    probabilities.requires_grad_(True)
-    reference = _loss(name, ddp=False)(probabilities, labels)
+    model = _model()
+    reference = _loss(name, ddp=False)(model(probabilities).softmax(dim=1), labels)
     reference.backward()
 
     out_prefix = str(tmp_path / "rank")
@@ -76,4 +78,16 @@ def test_batch_dice_under_ddp_matches_one_process(tmp_path, name):
     for rank in range(WORLD):
         result = torch.load(f"{out_prefix}.{rank}")
         torch.testing.assert_close(result["loss"], reference.detach())
-        torch.testing.assert_close(result["grad"], _rank_half(rank, probabilities.grad))
+        torch.testing.assert_close(result["grad"], model.weight.grad)
+
+
+@pytest.mark.parametrize("name", sorted(LOSSES))
+def test_batch_dice_without_process_group(name):
+    probabilities, labels = _batch()
+    probabilities.requires_grad_(True)
+    reference = _loss(name, ddp=False)(probabilities, labels)
+    actual = _loss(name, ddp=True)(probabilities, labels)
+    torch.testing.assert_close(actual, reference)
+    torch.testing.assert_close(
+        torch.autograd.grad(actual, probabilities), torch.autograd.grad(reference, probabilities)
+    )

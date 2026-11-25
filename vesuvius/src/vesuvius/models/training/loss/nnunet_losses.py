@@ -14,7 +14,8 @@ class AllGatherGrad(torch.autograd.Function):
     """
     @staticmethod
     def forward(ctx, x):
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
+        ctx.distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
+        if ctx.distributed:
             world_size = torch.distributed.get_world_size()
             # Gather tensors from all ranks
             x_list = [torch.zeros_like(x) for _ in range(world_size)]
@@ -23,15 +24,17 @@ class AllGatherGrad(torch.autograd.Function):
             # axis, so it has to be a new axis rather than the existing one
             return torch.stack(x_list, dim=0)
         else:
-            return x
+            return x.unsqueeze(0)
 
     @staticmethod
     def backward(ctx, grad_output):
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            # forward stacked along a new dim 0, so this rank's slice is one index
-            return grad_output[torch.distributed.get_rank()]
-        else:
-            return grad_output
+        if ctx.distributed:
+            # Each rank consumes the gathered output. Sum their contributions
+            # before returning the gradient for this rank's input.
+            grad = grad_output.clone(memory_format=torch.contiguous_format)
+            torch.distributed.all_reduce(grad)
+            return grad[torch.distributed.get_rank()]
+        return grad_output.squeeze(0)
 
 
 def softmax_helper_dim1(x):
