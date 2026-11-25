@@ -17,6 +17,10 @@ def _torch_tensor_reference(image, sigma, rho):
     """Full convolutions provide an independent reference for separable native passes."""
     import torch
     import torch.nn.functional as F
+
+    # Keep reference convolutions and their gradients off cuDNN's TF32 path.
+    device = image.device
+    image = image.cpu()
     dim = image.ndim - 2
     conv = F.conv2d if dim == 2 else F.conv3d
     def smooth(value, width):
@@ -41,30 +45,13 @@ def _torch_tensor_reference(image, sigma, rho):
         if dim == 3:
             kernel = kernel[:, :, None] * taps[2][None, None, :]
         gradients.append(conv(image, kernel[None, None], padding=tuple(len(t)//2 for t in taps)))
-    return smooth(torch.cat([gradients[a] * gradients[b] for a in range(dim) for b in range(a, dim)], dim=1), rho)
-
-
-@pytest.fixture
-def exact_reference():
-    """On recent NVIDIA GPUs, PyTorch rounds cuDNN convolutions with TF32 by default,
-    so the reference and its backward pass would be less precise than the native code."""
-    torch = pytest.importorskip("torch")
-    # Recent PyTorch refuses to read allow_tf32 once fp32_precision was set, so use the new switch when it exists.
-    if hasattr(torch.backends.cudnn, "conv"):
-        precision = torch.backends.cudnn.conv.fp32_precision
-        torch.backends.cudnn.conv.fp32_precision = "ieee"
-        yield
-        torch.backends.cudnn.conv.fp32_precision = precision
-    else:
-        allow_tf32 = torch.backends.cudnn.allow_tf32
-        torch.backends.cudnn.allow_tf32 = False
-        yield
-        torch.backends.cudnn.allow_tf32 = allow_tf32
+    products = torch.cat([gradients[a] * gradients[b] for a in range(dim) for b in range(a, dim)], dim=1)
+    return smooth(products, rho).to(device)
 
 
 @pytest.mark.parametrize("dim", [2, 3])
 @pytest.mark.parametrize("sigma,rho", [(0, 0), (.8, 1.1)])
-def test_structure_tensor_values_and_backward(dim, sigma, rho, exact_reference):
+def test_structure_tensor_values_and_backward(dim, sigma, rho):
     torch = pytest.importorskip("torch")
     from vc_reader.torch import structure_tensor
     for device in _backends():
@@ -235,7 +222,7 @@ def test_transform_points_normalizes_vectors():
     np.testing.assert_array_equal(result[1], 0)
 
 
-def test_real_scroll_structure_and_normalization(exact_reference):
+def test_real_scroll_structure_and_normalization():
     from pathlib import Path
     torch = pytest.importorskip("torch")
     from vc_reader.torch import structure_tensor
