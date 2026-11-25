@@ -80,7 +80,10 @@ VC projects store both regular and fiber inference manifests in
 
 `vc-lasagna-fiber` is the reserved fiber-inference role tag. No role tag means
 regular Lasagna data. `selected_lasagna_dataset` and
-`selected_fiber_inference_dataset` independently select each role.
+`selected_fiber_inference_dataset` independently select each role; an unset fiber
+selection uses the first attached fiber dataset with predicted normals, else the
+first attached one. `lasagna_normal_choices` lists the fiber datasets for which
+the user explicitly chose Lasagna normals.
 
 ## Attachment
 
@@ -124,7 +127,7 @@ or extracting channel files. For example:
 ```json
 {
   "location": "s3://bucket/path/compound.zarr/sd2",
-  "channels": ["presence", "nx", "ny", "width", "sheet_nx", "sheet_ny", "sheet_grad_mag"],
+  "channels": ["presence", "nx", "ny", "width", "sheet_nx", "sheet_ny"],
   "tags": [
     "vc-lasagna-manifest:s3://bucket/path/predictions.lasagna.json",
     "vc-lasagna-group:sd2"

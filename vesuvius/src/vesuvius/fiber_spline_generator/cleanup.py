@@ -59,7 +59,8 @@ def cut_sharp_joins(traces: Sequence[dict[str, Any]], max_angle: float) -> list[
             continue
         for start, end in zip([0] + [high for _, high in cuts], [low for low, _ in cuts] + [len(points) - 1]):
             if end > start:
-                kept = [[low - start, high - start] for low, high in gaps if start <= low and high <= end]
+                kept = [[low - start, high - start] for low, high in gaps
+                        if start <= low and high <= end and (low, high) not in cuts]
                 result.append(dict(trace, points=points[start:end + 1], gaps=kept))
     return result
 

@@ -214,6 +214,14 @@ void testSurface(const fs::path& root, const std::string& backend)
     const auto image = values<std::uint8_t>(rendered["image"].data);
     require(rendered["image"].data.shape == Index{1, 1, 2, 3}, "layers, patch");
     require(image[0] == 0 || image[0] == std::uint8_t(((5 * 22 + 3) * 24 + 4) & 255), "sampled at the sheet");
+    {   // A work budget that fits only the cells the patch reaches: the render still works, the context is not charged to it.
+        auto tight = optionsFor(backend);
+        tight.samplingWorkBytes = 12 * 80;
+        SampleReader squeezed(reference, targets, std::nullopt, tight);
+        const auto small = squeezed.renderSurface(surface, {1, 1}, {2, 3}, {0});
+        require(values<std::uint8_t>(small["image"].data) == image, "a budget that fits the cells renders");
+        squeezed.close();
+    }
     const auto inkValues = values<std::uint8_t>(rendered["ink"].data);
     require(inkValues[0] == ink[std::size_t(1 * 9 + 1)], "surface label at its own pixels");
     raises<std::invalid_argument>([&] { (void)reader.renderSurface(surface, {0, 0}, {1, 1}, {}); }, "no offsets");
@@ -238,6 +246,170 @@ void testSurface(const fs::path& root, const std::string& backend)
     const auto stats = reader.stats();
     require(stats.hasSurface && stats.geometryReadBytes > 0, "surface stats");
     reader.close();
+}
+
+
+// A curved sheet on a unit grid, z = 6 + 0.35 (x - 4)^2 / 4 + 0.3 sin(1.3 y); the CT value is 10 z, so a render reads the sheet height.
+Surface curvedSurface(const fs::path& root, bool withHole = false)
+{
+    const std::int64_t rows = 14, cols = 16;
+    std::vector<float> xyz(std::size_t(3 * rows * cols));
+    for (std::int64_t y = 0; y < rows; ++y)
+        for (std::int64_t x = 0; x < cols; ++x) {
+            xyz[std::size_t((y * cols + x))] = float(x) + 3;
+            xyz[std::size_t((rows + y) * cols + x)] = float(y) + 2;
+            xyz[std::size_t((2 * rows + y) * cols + x)] = 6.f + 0.35f * float((x - 4) * (x - 4)) / 4.f + 0.3f * std::sin(1.3f * float(y));
+        }
+    if (withHole) {
+        // A missing diagonal neighbor exercises the mixed-derivative fallback in the
+        // top-left cell. The second hole intersects the patch itself.
+        xyz[3 * cols + 4] = std::numeric_limits<float>::quiet_NaN();
+        xyz[8 * cols + 12] = std::numeric_limits<float>::quiet_NaN();
+    }
+    const auto path = root / (withHole ? "curved-hole.zarr" : "curved.zarr");
+    writeZarr(path, {3, rows, cols}, "<f4", xyz.data(), {"c", "y", "x"});
+    Surface surface;
+    surface.id = "curved";
+    surface.geometry.location = path.string();
+    surface.geometry.format = "zarr";
+    surface.sampleId = "s";
+    surface.volumeId = "v";
+    surface.axes = std::vector<std::string>{"c", "y", "x"};
+    surface.componentOrder = std::vector<std::string>{"x", "y", "z"};
+    surface.xyzToVolume = VolumeTransform{};
+    surface.pixelToUv = PixelAffine{{{2, 0, 0}, {0, 2, 0}}};  // two pixels per grid step: the pixels lie between the vertices
+    surface.spacingUm = Vec3{2, 2, 2};
+    validate(surface);
+    return surface;
+}
+
+// A patch agrees with a larger render when its halo fits, and still renders when only its cells fit.
+void testContext(const fs::path& root, const std::string& backend)
+{
+    std::vector<std::uint8_t> ct(24 * 24 * 24);
+    for (std::size_t z = 0; z < 24; ++z)
+        for (std::size_t i = 0; i < 24 * 24; ++i) ct[z * 24 * 24 + i] = std::uint8_t(10 * z);
+    writeZarr(root / "ramp.zarr", {24, 24, 24}, "|u1", ct.data(), {"z", "y", "x"});
+    auto surface = curvedSurface(root);
+    const auto reference = zarrSource("ct", root / "ramp.zarr", "image", placedIn("v"));
+    const std::vector<std::pair<std::string, Source>> none;
+    const auto render = [&](std::size_t workBytes, const Pair& start, const Pair& size) {
+        auto options = optionsFor(backend);
+        if (workBytes) options.samplingWorkBytes = workBytes;
+        SampleReader reader(reference, none, std::nullopt, options);
+        const auto rendered = reader.renderSurface(surface, start, size, {0});
+        auto out = values<float>(rendered["image"].data);
+        reader.close();
+        return out;
+    };
+    const Pair start{8, 10}, size{10, 14};  // pixels at half grid steps: 5 x 7 grid steps
+    const auto full = render(0, start, size);
+    // The reached cells use 6 x 8 vertices. This budget fits the cells and misses the 8 x 10 halo.
+    const auto tight = render(63 * 80, start, size);
+    const auto equal = [](float a, float b) { return (std::isnan(a) && std::isnan(b)) || std::fabs(a - b) < 1e-3f; };
+    // the ring is charged to the budget with the cells: at the budget of the cells alone it does not fit and the render is made on the cells
+    // (a read or budget error of the ring leaves them to render), so the pixels are close to the render with the ring, not equal to it
+    require(full.size() == tight.size(), "a patch renders at the budget of its cells");
+    float worst = 0;
+    for (std::size_t k = 0; k < full.size(); ++k) {
+        require(std::isnan(full[k]) == std::isnan(tight[k]), "the same pixels are valid with and without the ring");
+        if (!std::isnan(full[k])) worst = std::max(worst, std::fabs(full[k] - tight[k]));
+    }
+    require(worst < 2.f, "a patch at the budget of its cells is close to the render with the ring");
+    const auto oneRing = render((backend == "cuda" ? 16 : 8) * 1024, start, size);
+    require(std::equal(full.begin(), full.end(), oneRing.begin(), equal),
+            "a budget that fits one ring keeps the bicubic context");
+    // an error in the cells themselves is not hidden by the retry on the cells: a budget below the cells still refuses the render
+    bool refused = false;
+    try { (void)render(40 * 80, start, size); } catch (const std::runtime_error&) { refused = true; }
+    require(refused, "a work budget the cells do not fit still refuses the render");
+    {   // the ring is charged to the work budget like any window, so a window that does not fit is never kept: a later linear render of the
+        // window the ring made is refused at that budget, even after the bicubic render.
+        auto options = optionsFor(backend);
+        options.samplingWorkBytes = 63 * 80;
+        SampleReader reader(reference, none, std::nullopt, options);
+        (void)reader.renderSurface(surface, start, size, {0});
+        raises<std::runtime_error>([&] { (void)reader.renderSurface(surface, {6, 8}, {14, 18}, {0}, vcr::grid::Interpolation::Linear); },
+                                   "a window over the work budget is not served from a cache filled by a bicubic render");
+        reader.close();
+    }
+    const auto checkContainingRender = [&](const std::vector<float>& patch) {
+        const auto large = render(0, {4, 6}, {18, 22});
+        for (std::int64_t j = 0; j < size[0]; ++j)
+            for (std::int64_t i = 0; i < size[1]; ++i)
+                require(equal(large[std::size_t((j + 4) * 22 + i + 4)], patch[std::size_t(j * size[1] + i)]),
+                        "a patch is the same pixels of a larger patch");
+    };
+    checkContainingRender(full);
+    surface = curvedSurface(root, true);
+    const auto masked = render(0, start, size);
+    require(std::isfinite(masked.front()) && std::isnan(masked.back()), "the mask leaves both valid and invalid pixels in the crop");
+    checkContainingRender(masked);
+}
+
+
+// The bot's registered-normals case: a flat 32 x 64 grid, float32 XYZ normals registered half a pixel over in X, a one pixel render at 40 KiB.
+void testNormalsBudget(const fs::path& root, const std::string& backend)
+{
+    const std::int64_t rows = 32, cols = 64;
+    std::vector<float> xyz(std::size_t(3 * rows * cols)), normal(std::size_t(3 * rows * cols));
+    for (std::int64_t y = 0; y < rows; ++y)
+        for (std::int64_t x = 0; x < cols; ++x) {
+            xyz[std::size_t(y * cols + x)] = float(x);
+            xyz[std::size_t((rows + y) * cols + x)] = float(y);
+            xyz[std::size_t((2 * rows + y) * cols + x)] = 5.f;
+            normal[std::size_t((2 * rows + y) * cols + x)] = 1.f;
+        }
+    writeZarr(root / "flat.zarr", {3, rows, cols}, "<f4", xyz.data(), {"c", "y", "x"});
+    writeZarr(root / "flat-normals.zarr", {3, rows, cols}, "<f4", normal.data(), {"c", "y", "x"});
+    std::vector<std::uint8_t> ct(std::size_t(12 * rows * cols));
+    for (std::size_t z = 0; z < 12; ++z)
+        for (std::size_t i = 0; i < std::size_t(rows * cols); ++i) ct[z * std::size_t(rows * cols) + i] = std::uint8_t(10 * z);
+    writeZarr(root / "flat-ct.zarr", {12, rows, cols}, "|u1", ct.data(), {"z", "y", "x"});
+    Surface base;
+    base.id = "flat";
+    base.geometry.location = (root / "flat.zarr").string();
+    base.geometry.format = "zarr";
+    base.sampleId = "s";
+    base.volumeId = "v";
+    base.axes = std::vector<std::string>{"c", "y", "x"};
+    base.componentOrder = std::vector<std::string>{"x", "y", "z"};
+    base.xyzToVolume = VolumeTransform{};
+    base.pixelToUv = PixelAffine{{{1, 0, 0}, {0, 1, 0}}};
+    base.spacingUm = Vec3{2, 2, 2};
+    validate(base);
+    SurfaceRegistration registration;
+    registration.surface = base;
+    registration.pixelToUv = PixelAffine{{{1, 0, 0.5}, {0, 1, 0}}};  // registered half a pixel over in X
+    auto surface = base;
+    auto normals = zarrSource("normals", root / "flat-normals.zarr", "normal", SourceRegistration(registration));
+    normals.componentOrder = std::vector<std::string>{"x", "y", "z"};
+    normals.normalize = true;
+    ValueFrame frame;
+    frame.sampleId = "s";
+    frame.volumeId = "v";
+    frame.affine = VolumeTransform{Affine{}, {}};
+    normals.valueFrame = frame;
+    surface.normals = Shared<Source>(finished(normals));
+    validate(surface);
+    const auto reference = zarrSource("ct", root / "flat-ct.zarr", "image", placedIn("v"));
+    const std::vector<std::pair<std::string, Source>> none;
+    for (const auto interpolation : {vcr::grid::Interpolation::Bicubic, vcr::grid::Interpolation::Linear}) {
+        const auto render = [&](std::size_t workBytes) {
+            auto options = optionsFor(backend);
+            options.samplingWorkBytes = workBytes;
+            SampleReader reader(reference, none, std::nullopt, options);
+            const auto rendered = reader.renderSurface(surface, {6, 29}, {1, 1}, {-2, 0, 2}, interpolation);
+            auto out = values<float>(rendered["image"].data);
+            reader.close();
+            return out;
+        };
+        const auto roomy = render(80 * 1024);
+        require(render(40 * 1024) == roomy, "a one pixel render with registered normals does not need more budget than its cells and normals");
+        bool refused = false;
+        try { (void)render(20 * 1024); } catch (const std::runtime_error&) { refused = true; }
+        require(refused, "a budget the cells and normals do not fit still refuses the render");
+    }
 }
 
 void testPaired(const fs::path& root, const std::string& backend)
@@ -285,6 +457,8 @@ int main()
             fs::create_directories(root);
             testReference(root, backend);
             testSurface(root, backend);
+            testContext(root, backend);
+            testNormalsBudget(root, backend);
             testPaired(root, backend);
         }
     } catch (const std::exception& e) {

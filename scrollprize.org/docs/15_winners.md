@@ -40,6 +40,40 @@ import AwardedTotal from '@site/src/components/AwardedTotal';
 
 Vesuvius Challenge has awarded **<AwardedTotal />** in prizes since the competition started in 2023! This page lists all the prizes awarded so far.
 
+### \$150,000 First Letters: PHerc. 211, 846A and 846B (November, 2026)
+
+**Goal:** Find 10 letters within a 4 cm² area of a scroll where nothing has been read yet.
+
+<div className="flex flex-row flex-wrap">
+  <PrizeCard
+    href="https://scrollprize.substack.com/p/both-halves-of-pherc-846-give-up"
+    prizeAmount="$50,000"
+    title="Winners"
+    description="Jeff Chen and David Chen (Shoddy Ink Detection) found writing in PHerc. 846A, including “τούτου ἀ̣νθρώπ̣[ου”, “of this man”"
+    mediaSrc="/img/firstletters/pherc0846a-chen.webp"
+    mediaAlt="Ink detected in PHerc. 846A by Jeff Chen and David Chen, with the partial reading τούτου ἀνθρώπου"
+    wide
+  />
+  <PrizeCard
+    href="https://scrollprize.substack.com/p/both-halves-of-pherc-846-give-up"
+    prizeAmount="$50,000"
+    title="Winner"
+    description="Brian Koenders found writing in PHerc. 846B, including “α̣παντα”, presumably ἅπαντα, “all things together”"
+    mediaSrc="/img/firstletters/pherc0846b-koenders.webp"
+    mediaAlt="Ink detected in PHerc. 846B by Brian Koenders, with boxed character sequences including απαντα and εστιν"
+    wide
+  />
+  <PrizeCard
+    href="https://scrollprize.substack.com/p/first-letters-emerge-from-pherc-211"
+    prizeAmount="$50,000"
+    title="Winner"
+    description="Priyank Aranke found writing in PHerc. 211, including “καί τῆι̣ διαφ ̣ρ̣”, possibly “and to the difference”"
+    mediaSrc="/img/firstletters/pherc0211-priyank.webp"
+    mediaAlt="Ink detected in PHerc. 211 by Priyank Aranke, with the partial reading καί τῆι διαφ…ρ"
+    wide
+  />
+</div>
+
 ### \$40,750 Progress Prizes (October 2026)
 
 **Goal:** Improve the tools and training methods needed to read the scrolls.

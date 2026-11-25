@@ -4,8 +4,10 @@
 #include <vc_reader/array.hpp>
 #include <vc_reader/grid.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -225,6 +227,76 @@ void testResample()
 
 }  // namespace
 
+// The sign of a bicubic normal does not depend on the vertices around the core: on a mesh that folds, the
+// surface with context takes the sign of the core's own derivatives, and positions are the context surface's.
+void testCoreSign()
+{
+    const int R = 9, C = 12;
+    std::vector<float> xyz(R * C * 3);
+    for (int r = 0; r < R; ++r)
+        for (int c = 0; c < C; ++c) {
+            float* p = &xyz[std::size_t((r * C + c) * 3)];
+            p[0] = float(c) + 0.9f * std::sin(2.1f * float(c));
+            p[1] = float(r) + 0.4f * std::sin(1.3f * float(c) + float(r));
+            p[2] = 0.3f * std::sin(1.1f * float(r) + float(c));
+        }
+    const int r0 = 2, r1 = 7, c0 = 2, c1 = 9;
+    std::vector<float> core((r1 - r0) * (c1 - c0) * 3);
+    for (int r = r0; r < r1; ++r)
+        for (int c = c0; c < c1; ++c)
+            for (int k = 0; k < 3; ++k) core[std::size_t(((r - r0) * (c1 - c0) + (c - c0)) * 3 + k)] = xyz[std::size_t((r * C + c) * 3 + k)];
+    vcr::grid::SurfaceOptions plain;
+    plain.interpolation = vcr::grid::Interpolation::Bicubic;
+    auto anchored = plain;
+    anchored.core = {r0, r1, c0, c1};
+    const vcr::grid::Surface full({xyz.data(), R, C, std::size_t(C) * 3}, plain);
+    const vcr::grid::Surface withCore({xyz.data(), R, C, std::size_t(C) * 3}, anchored);
+    const vcr::grid::Surface alone({core.data(), r1 - r0, c1 - c0, std::size_t(c1 - c0) * 3}, plain);
+    const int W = 120, H = 80;
+    const double sx = double(c1 - 1 - c0) / W, sy = double(r1 - 1 - r0) / H;
+    std::vector<float> pf(W * H * 3), pa(W * H * 3), po(W * H * 3), nf(W * H * 3), na(W * H * 3), no(W * H * 3);
+    full.resample({double(c0), double(r0), sx, sy, W, H}, pf.data(), nf.data());
+    withCore.resample({double(c0), double(r0), sx, sy, W, H}, pa.data(), na.data());
+    alone.resample({0, 0, sx, sy, W, H}, po.data(), no.data());
+    const auto dot = [](const float* a, const float* b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; };
+    long contextFlips = 0, anchoredFlips = 0;
+    bool samePositions = true;
+    for (std::size_t i = 0; i < std::size_t(W) * H; ++i) {
+        if (!std::isfinite(nf[i * 3] + na[i * 3] + no[i * 3])) continue;
+        if (dot(&nf[i * 3], &no[i * 3]) < 0) ++contextFlips;
+        if (dot(&na[i * 3], &no[i * 3]) < 0) ++anchoredFlips;
+        for (int k = 0; k < 3; ++k) samePositions = samePositions && pf[i * 3 + k] == pa[i * 3 + k];
+    }
+    require(contextFlips > 0, "the context changes the sign of a normal on a folded mesh");
+    require(anchoredFlips == 0, "with the core given, no normal has the other sign than the core alone");
+    require(samePositions, "the core does not move the positions");
+    bool rejected = false;
+    try {
+        auto bad = plain;
+        bad.core = {0, 5, 2, 20};
+        const vcr::grid::Surface refused({xyz.data(), R, C, std::size_t(C) * 3}, bad);
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    require(rejected, "a core outside the vertices is refused");
+    // A fold where the context's centred tangents at vertex (2, 2) are parallel: the core's own normal is kept.
+    std::vector<float> fold(7 * 7 * 3, 0.f);
+    for (int r = 0; r < 7; ++r)
+        for (int c = 0; c < 7; ++c) {
+            fold[std::size_t((r * 7 + c) * 3)] = float(c);
+            fold[std::size_t((r * 7 + c) * 3 + 1)] = float(r);
+        }
+    fold[std::size_t((2 * 7 + 1) * 3 + 1)] = 1;  // (2, 1) to (1, 1, 0)
+    fold[std::size_t((1 * 7 + 2) * 3)] = 0;      // (1, 2) to (0, 2, 0)
+    fold[std::size_t((1 * 7 + 2) * 3 + 1)] = 2;
+    auto folded = plain;
+    folded.core = {2, 4, 2, 4};
+    float p[3], n[3];
+    vcr::grid::Surface({fold.data(), 7, 7, 21}, folded).resample({2, 2, 1, 1, 1, 1}, p, n);
+    require(p[0] == 2 && p[1] == 2 && std::fabs(n[0]) < 1e-6f && std::fabs(n[1]) < 1e-6f && std::fabs(n[2] - 1) < 1e-6f,
+            "a fold that leaves the context no normal keeps the core's");
+}
+
 int main()
 {
     namespace fs = std::filesystem;
@@ -232,6 +304,7 @@ int main()
         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     struct Cleanup { fs::path path; ~Cleanup() { std::error_code ec; fs::remove_all(path, ec); } } cleanup{path};
     try {
+        testCoreSign();
         testDefaultInterpolation();
         testResample();
 
@@ -526,6 +599,162 @@ int main()
             vcr::grid::load(more);
             r = vcr::grid::sampleCached(along, view, nullptr);
             require(r.level[0] == 0 && near(r.values[0], value(1, 1.5f, 10), 1e-3f), "a surface frame completes too");
+        }
+
+        // Rows of eight or more pixels may be sampled eight pixels at a time; narrower
+        // rasters are sampled one by one. Both give the same bits. A tilted plane through
+        // and beside the volume with two holes, so groups of eight lie inside one chunk,
+        // across chunks, outside the volume and over points that are not there; 21 columns,
+        // so each row's last group overlaps the one before it.
+        {
+            const int W = 21, H = 24, strip = 7;
+            const float origin[3]{3.3f, 1.2f, 2.1f}, dx[3]{0.8f, 0.6f, 0}, dy[3]{-0.36f, 0.48f, 0.8f}, normal[3]{0.48f, -0.64f, 0.6f};
+            std::vector<float> at(std::size_t(W * H * 3)), normals(at.size());
+            for (int j = 0; j < H; ++j)
+                for (int i = 0; i < W; ++i)
+                    for (int b = 0; b < 3; ++b) {
+                        at[std::size_t((j * W + i) * 3 + b)] = origin[b] + dx[b] * float(i) + dy[b] * float(j);
+                        normals[std::size_t((j * W + i) * 3 + b)] = normal[b];
+                    }
+            at[std::size_t((3 * W + 5) * 3)] = NAN;
+            at[std::size_t((9 * W + 20) * 3 + 2)] = NAN;
+            vcr::grid::Request request;
+            request.levels = {L0};
+            request.offsets = {-2.75f, -1.0f, 0.0f, 0.5f, 2.25f};
+            const std::size_t layers = request.offsets.size();
+            const auto wide = vcr::grid::sample(vcr::grid::Points{at.data(), normals.data(), W, H}, request);
+            require(wide.layers == int(layers) && wide.values.size() == layers * W * H, "wide raster result shape");
+            std::size_t inside = 0;
+            for (const float v : wide.values)
+                inside += v > 0;
+            require(inside > 1000, "the wide raster samples inside the volume");
+            for (int s = 0; s < W / strip; ++s) {
+                std::vector<float> a(std::size_t(strip * H * 3)), n(a.size());
+                for (int j = 0; j < H; ++j) {
+                    std::memcpy(&a[std::size_t(j * strip * 3)], &at[std::size_t((j * W + s * strip) * 3)], strip * 3 * sizeof(float));
+                    std::memcpy(&n[std::size_t(j * strip * 3)], &normals[std::size_t((j * W + s * strip) * 3)], strip * 3 * sizeof(float));
+                }
+                const auto narrow = vcr::grid::sample(vcr::grid::Points{a.data(), n.data(), strip, H}, request);
+                for (int j = 0; j < H; ++j) {
+                    for (std::size_t k = 0; k < layers; ++k)
+                        require(std::memcmp(&narrow.values[k * strip * H + std::size_t(j * strip)],
+                                            &wide.values[k * W * H + std::size_t(j * W + s * strip)], strip * sizeof(float)) == 0,
+                                "pixels sampled eight at a time have the bits they have one by one");
+                    require(std::memcmp(&narrow.level[std::size_t(j * strip)], &wide.level[std::size_t(j * W + s * strip)], strip) == 0,
+                            "pixels sampled eight at a time report the level they report one by one");
+                }
+            }
+            // A pixel mask: the pixels it keeps are unchanged, the others are not sampled.
+            std::vector<std::uint8_t> mask(std::size_t(W * H));
+            for (std::size_t q = 0; q < mask.size(); ++q)
+                mask[q] = q % 3 != 0 && q / std::size_t(W) != 7;
+            request.pixels = mask.data();
+            const auto masked = vcr::grid::sample(vcr::grid::Points{at.data(), normals.data(), W, H}, request);
+            for (std::size_t q = 0; q < mask.size(); ++q) {
+                require(masked.level[q] == (mask[q] ? wide.level[q] : vcr::grid::Result::kNone), "a masked raster's levels");
+                for (std::size_t k = 0; k < layers; ++k)
+                    require(mask[q] ? std::memcmp(&masked.values[k * W * H + q], &wide.values[k * W * H + q], sizeof(float)) == 0
+                                    : std::isnan(masked.values[k * W * H + q]),
+                            "a masked raster's values");
+            }
+            // Pixels the mask leaves out read no chunk: one column kept in the wide raster
+            // reads what that column reads as a raster one pixel wide.
+            auto kept = open(fine, 16), column = open(fine, 16);
+            std::vector<float> a(std::size_t(H * 3)), n(a.size());
+            for (int j = 0; j < H; ++j) {
+                std::memcpy(&a[std::size_t(j * 3)], &at[std::size_t((j * W + 3) * 3)], 3 * sizeof(float));
+                std::memcpy(&n[std::size_t(j * 3)], &normals[std::size_t((j * W + 3) * 3)], 3 * sizeof(float));
+            }
+            for (std::size_t q = 0; q < mask.size(); ++q)
+                mask[q] = q % std::size_t(W) == 3;
+            request.levels = {{kept.get(), u8, L0.scale, L0.offset}};
+            vcr::grid::sample(vcr::grid::Points{at.data(), normals.data(), W, H}, request);
+            request.levels = {{column.get(), u8, L0.scale, L0.offset}};
+            request.pixels = nullptr;
+            vcr::grid::sample(vcr::grid::Points{a.data(), n.data(), 1, H}, request);
+            require(column->stats().disk_hits.load() > 0 && kept->stats().disk_hits.load() == column->stats().disk_hits.load(),
+                    "pixels a mask leaves out read no chunk");
+        }
+
+        // A cache-only frame during which the fine level's chunks reach the cache: each
+        // pixel's value must come from the level the frame reports for it. Nine pixels in
+        // a row, so the row's last group of eight overlaps the first by seven. The coarse
+        // array's cache takes an injected clock, which it reads on every lookup; the
+        // frame's first lookup there (pixel 0 falling back to the coarse level) loads all
+        // fine chunks. Pixel 1 comes after that and still reads coarse, because the
+        // sampler's recent-chunk slots hold its chunk as "not cached". Pixel 2's cell
+        // crosses a chunk border on every axis, so it is sampled one voxel at a time on
+        // either path and touches eight other chunks, which pushes that entry out of the
+        // eight slots, so
+        // pixels 3 to 8 read fine, and a second visit to pixel 1 would too: with AVX2 the
+        // row's last group must not make that visit. Without AVX2 only the scalar path
+        // is checked.
+        {
+            const auto small = path / "small";  // 16^3 in chunks of 4^3, value = x + 2y + 3z
+            fs::create_directories(small);
+            for (int cz = 0; cz < 4; ++cz)
+                for (int cy = 0; cy < 4; ++cy)
+                    for (int cx = 0; cx < 4; ++cx) {
+                        std::vector<std::uint8_t> chunk(64);
+                        for (int z = 0; z < 4; ++z)
+                            for (int y = 0; y < 4; ++y)
+                                for (int x = 0; x < 4; ++x)
+                                    chunk[std::size_t((z * 4 + y) * 4 + x)] =
+                                        std::uint8_t((cx * 4 + x) + 2 * (cy * 4 + y) + 3 * (cz * 4 + z));
+                        std::ofstream o(small / (std::to_string(cz) + "." + std::to_string(cy) + "." + std::to_string(cx)),
+                                        std::ios::binary);
+                        o.write(reinterpret_cast<const char*>(chunk.data()), 64);
+                    }
+            vcr::ArraySpec spec;
+            spec.shape = {16, 16, 16};
+            spec.chunks = {4, 4, 4};
+            spec.fill = {0};
+            spec.identity = small.string();
+            spec.layers.push_back({"array", small.string(), "", "", false});
+            vcr::Array fineLevel(spec, std::make_shared<vcr::MemoryCache>(1 << 20));
+            std::atomic<bool> armed{false};
+            vcr::MemoryCache::AutoOptions options;
+            options.available = [] { return std::uint64_t{1} << 30; };
+            options.now = [&] {
+                if (armed.exchange(false))
+                    for (std::int64_t cz = 0; cz < 4; ++cz)
+                        for (std::int64_t cy = 0; cy < 4; ++cy)
+                            for (std::int64_t cx = 0; cx < 4; ++cx)
+                                fineLevel.chunk({cz, cy, cx});
+                return std::chrono::steady_clock::now();
+            };
+            spec.shape = {8, 8, 8};
+            spec.chunks = {8, 8, 8};
+            spec.identity = coarse.string() + "#clock";
+            spec.layers = {{"array", coarse.string(), "", "", false}};
+            vcr::Array coarseLevel(spec, std::make_shared<vcr::MemoryCache>(options, 1, false));
+            coarseLevel.chunk({0, 0, 0});  // the coarse level is in memory, the fine level is not
+            const float at[9][3]{{1.5f, 1.5f, 1.5f},  {1.25f, 1.5f, 1.5f}, {7.5f, 7.5f, 7.5f},
+                                 {2.25f, 1.5f, 1.5f}, {1.5f, 2.25f, 1.5f}, {1.5f, 1.5f, 2.25f},
+                                 {2.5f, 2.5f, 1.5f},  {1.5f, 2.5f, 2.5f},  {2.75f, 1.25f, 2.5f}};
+            vcr::grid::Request arriving;
+            arriving.levels = {{&fineLevel, u8, L0.scale, L0.offset}, {&coarseLevel, u8, L1.scale, L1.offset}};
+            arriving.cachedOnly = true;
+            armed = true;
+            auto sampled = vcr::grid::sample(vcr::grid::Points{&at[0][0], nullptr, 9, 1}, arriving);
+            require(!armed, "the fine chunks were loaded during the frame");
+            for (std::size_t q = 0; q < 9; ++q) {
+                if (sampled.level[q] == 0)
+                    require(near(sampled.values[q], value(at[q][0], at[q][1], at[q][2]), 1e-3f),
+                            "a pixel reported at the fine level has the fine value");
+                else
+                    require(sampled.level[q] == 1 && near(sampled.values[q], 200.0f, 1e-3f),
+                            "a pixel reported at the coarse level has the coarse value");
+            }
+            // This split is what makes the case a test of the second visit. It rests on the
+            // sampler's eight recent-chunk slots: if it fails after a change there, pixel 1's
+            // entry is no longer pushed out and the points above need redesigning.
+            require(sampled.level[0] == 1 && sampled.level[1] == 1 && sampled.level[2] == 0 && sampled.level[8] == 0,
+                    "pixels 0 and 1 read coarse; pixels 2 and 8 find the fine chunks cached");
+            sampled = vcr::grid::sample(vcr::grid::Points{&at[0][0], nullptr, 9, 1}, arriving);
+            for (std::size_t q = 0; q < 9; ++q)
+                require(sampled.level[q] == 0 && near(sampled.values[q], value(at[q][0], at[q][1], at[q][2]), 1e-3f),
+                        "the next frame is complete at the fine level");
         }
 
         // Placement maps: scale form when axis aligned, otherwise general.

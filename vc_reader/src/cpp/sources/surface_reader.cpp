@@ -348,8 +348,9 @@ void checkBudget(AlignedEngine::Impl& s, const Triple& shape, const std::optiona
 struct Patch {
     std::shared_ptr<const GeometryTile> tile;
     grid::Raster raster;
+    std::array<int, 4> core{0, 0, 0, 0};  // the vertices of the cells inside the tile (all zero: the tile is the cells)
 };
-std::optional<Patch> patchOf(Geometry& geom, const Pair& start, const Pair& size)
+std::optional<Patch> patchOf(Geometry& geom, const Pair& start, const Pair& size, bool& context)
 {
     const auto& m = geom.fromUv.forward;
     const double u = double(start[1]), v = double(start[0]);
@@ -365,17 +366,35 @@ std::optional<Patch> patchOf(Geometry& geom, const Pair& start, const Pair& size
     const std::int64_t rows = geom.shape[0], cols = geom.shape[1];
     const auto c0 = std::max<std::int64_t>(0, std::int64_t(std::floor(minX))), c1 = std::min<std::int64_t>(cols, std::int64_t(std::floor(maxX)) + 2);
     const auto r0 = std::max<std::int64_t>(0, std::int64_t(std::floor(minY))), r1 = std::min<std::int64_t>(rows, std::int64_t(std::floor(maxY)) + 2);
-    if (c1 - c0 < 2 || r1 - r0 < 2) return std::nullopt;
+    if (c1 - c0 < 2 || r1 - r0 < 2) {
+        context = false;
+        return std::nullopt;
+    }
+    // One extra vertex per side covers the 3x3 Hermite derivative stencil at every core vertex.
+    const std::int64_t halo = context ? 1 : 0;
+    const auto hc0 = std::max<std::int64_t>(0, c0 - halo), hc1 = std::min<std::int64_t>(cols, c1 + halo);
+    const auto hr0 = std::max<std::int64_t>(0, r0 - halo), hr1 = std::min<std::int64_t>(rows, r1 + halo);
+    context = hr0 != r0 || hr1 != r1 || hc0 != c0 || hc1 != c1;
+    if (context) {
+        const auto vertices = std::size_t(hr1 - hr0) * std::size_t(hc1 - hc0);
+        const auto perimeter = geom.normals ? 0 : 2 * std::size_t(r1 - r0 + c1 - c0 - 2);
+        const auto bytes = 80 * vertices + 9 * sizeof(float) * perimeter;
+        // CUDA keeps a device copy alongside the host geometry.
+        if (bytes > geom.owner.workBytes / (geom.owner.backend == "cuda" ? 2 : 1))
+            throw DecodeBudgetError("geometry tile with its context exceeds sampling_work_bytes");
+    }
     Patch patch;
-    patch.tile = geom.tile({r0, c0}, {r1 - r0, c1 - c0});
-    patch.raster = grid::Raster{x0 - double(c0), y0 - double(r0), sx, sy, int(size[1]), int(size[0]), kx, ky};
+    patch.tile = geom.tile({hr0, hc0}, {hr1 - hr0, hc1 - hc0});
+    patch.raster = grid::Raster{x0 - double(hc0), y0 - double(hr0), sx, sy, int(size[1]), int(size[0]), kx, ky};
+    if (context) patch.core = {int(r0 - hr0), int(r1 - hr0), int(c0 - hc0), int(c1 - hc0)};
     return patch;
 }
 // The vcr::grid surface over a tile's vertices: normals in the surface's physical space.
-std::unique_ptr<grid::Surface> gridSurface(const Geometry& geom, const GeometryTile& tile, grid::Interpolation interpolation)
+std::unique_ptr<grid::Surface> gridSurface(const Geometry& geom, const GeometryTile& tile, grid::Interpolation interpolation, const std::array<int, 4>& core = {0, 0, 0, 0})
 {
     grid::SurfaceOptions options;
     options.interpolation = interpolation;
+    options.core = core;
     options.flipNormals = geom.flipNormals;
     if (geom.surface.spacingUm) {
         const auto& spacing = *geom.surface.spacingUm;
@@ -456,15 +475,45 @@ SampleResult SampleReader::renderSurface(const Surface& surface, const Pair& sta
     result.metadata = s.metadata.is_null() ? json::object() : s.metadata;
     result.metadata["surface"] = {{"id", surface.id}, {"uv_start", start}, {"uv_size", size}, {"offsets_um", offsetsUm},
                                   {"coordinate_frame", surfaceFrame(surface)}, {"reference_frame", s.referenceFrame}, {"array_to_level0", s.referenceMap.forward.json()}};
-    const auto patch = patchOf(*geom, start, size);
-    const auto sheet = patch ? gridSurface(*geom, *patch->tile, interpolation) : nullptr;
-    const grid::Raster raster = patch ? patch->raster : grid::Raster{};
     const std::vector<float> layers(offsetsUm.begin(), offsetsUm.end());
-    for (auto& [name, target] : s.targets) {
-        auto out = renderVolume(s, target, sheet.get(), raster, size, layers, toReference);
-        for (auto& [key, child] : target.companions) out.masks.emplace_back(key, renderVolume(s, child, sheet.get(), raster, size, layers, toReference).data);
-        result.targets.emplace_back(name, std::move(out));
+    bool context = interpolation == grid::Interpolation::Bicubic;
+    const auto renderVolumes = [&] {
+        decltype(result.targets) targets;
+        const auto patch = patchOf(*geom, start, size, context);
+        const auto sheet = patch ? gridSurface(*geom, *patch->tile, interpolation, patch->core) : nullptr;
+        const grid::Raster raster = patch ? patch->raster : grid::Raster{};
+        for (auto& [name, target] : s.targets) {
+            auto out = renderVolume(s, target, sheet.get(), raster, size, layers, toReference);
+            for (auto& [key, child] : target.companions) out.masks.emplace_back(key, renderVolume(s, child, sheet.get(), raster, size, layers, toReference).data);
+            targets.emplace_back(name, std::move(out));
+        }
+        return targets;
+    };
+    const auto retryWithoutContext = [&] {
+        context = false;
+#ifdef VC_READER_CUDA
+        if (s.backend == "cuda") grid::cuda::forgetKeptData();
+#endif
+        return renderVolumes();
+    };
+    // Optional geometry can require reads or memory beyond what the requested cells need.
+    try { result.targets = renderVolumes(); }
+    catch (const Cancelled&) { throw; }
+#ifdef VC_READER_CUDA
+    catch (const reader_cuda::BrickCacheBudgetError&) {
+        if (!context) throw;
+        result.targets = retryWithoutContext();
     }
+#endif
+    catch (const std::runtime_error&) {
+        if (!context) throw;
+        result.targets = retryWithoutContext();
+    }
+    catch (const std::bad_alloc&) {
+        if (!context) throw;
+        result.targets = retryWithoutContext();
+    }
+
     // Surface-registered targets are read at the patch's own UV pixels.
     const auto uv = patchUv(size);
     const auto count = uv.size() / 2;

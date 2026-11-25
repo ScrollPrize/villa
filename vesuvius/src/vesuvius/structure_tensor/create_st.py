@@ -1,7 +1,6 @@
 #create_st.py
 import argparse
 import sys
-import warnings
 import torch
 from torch import nn
 import numpy as np
@@ -13,7 +12,6 @@ from vc_reader.reader import ZarrWriter, create_group, open_zarr
 
 from vesuvius.models.run.inference import Inferer
 from vc_reader.torch import structure_tensor
-from ._compile_utils import _maybe_compile_function
 from .vf_format import zarr_codec
 
 def _ceildiv(a: int, b: int) -> int:
@@ -368,6 +366,15 @@ class ChunkDataset(Dataset):
         return idx, (z0, z1, y0, y1, x0, x1), block
 
 
+_EIGH_BATCH_SIZE = 65536
+
+
+def _is_gpu_solver_error(err: BaseException) -> bool:
+    """Detect NVIDIA cuSOLVER and AMD ROCm hipSOLVER/rocSOLVER runtime failures."""
+    msg = str(err).lower()
+    return any(token in msg for token in ("cusolver", "hipsolver", "rocsolver"))
+
+
 # solve the eigenvalue problem and sanitize the output
 def _eigh_and_sanitize(M: torch.Tensor):
     # 1) enforce symmetry (numerically more stable? M is already symmetrical)
@@ -379,11 +386,19 @@ def _eigh_and_sanitize(M: torch.Tensor):
     try:
         w, v = torch.linalg.eigh(M)
     except RuntimeError as err:
-        # Work around sporadic CUDA solver failures by retrying on CPU
-        if "cusolver" not in str(err).lower():
+        # Work around sporadic CUDA/ROCm GPU solver failures by retrying on CPU
+        # (falling back to NumPy's LAPACK if PyTorch was built without CPU LAPACK).
+        if not _is_gpu_solver_error(err):
             raise
         M_cpu = M.cpu()
-        w_cpu, v_cpu = torch.linalg.eigh(M_cpu)
+        try:
+            w_cpu, v_cpu = torch.linalg.eigh(M_cpu)
+        except RuntimeError as cpu_err:
+            if "lapack" not in str(cpu_err).lower():
+                raise
+            w_np, v_np = np.linalg.eigh(M_cpu.numpy())
+            w_cpu = torch.from_numpy(w_np)
+            v_cpu = torch.from_numpy(v_np)
         w = w_cpu.to(M.device)
         v = v_cpu.to(M.device)
     # sanitize once
@@ -396,69 +411,51 @@ def _compute_eigenvectors_impl(block: torch.Tensor) -> tuple[torch.Tensor, torch
     _, dz, dy, dx = block.shape
     N = dz * dy * dx
 
-    block = torch.nan_to_num(block, nan=0.0, posinf=0.0, neginf=0.0)
-    # build + sanitize
-    x = block.view(6, N)
-    M = torch.empty((N,3,3), dtype=torch.float64, device=block.device)
-    M[:, 0, 0] = x[0]; M[:, 0, 1] = x[1]; M[:, 0, 2] = x[2]
-    M[:, 1, 0] = x[1]; M[:, 1, 1] = x[3]; M[:, 1, 2] = x[4]
-    M[:, 2, 0] = x[2]; M[:, 2, 1] = x[4]; M[:, 2, 2] = x[5]
-    M = torch.nan_to_num(M, nan=0.0, posinf=0.0, neginf=0.0)
+    x = torch.nan_to_num(block, nan=0.0, posinf=0.0, neginf=0.0).reshape(6, N)
+    nz_mask = (x[0] != 0) | (x[1] != 0) | (x[2] != 0) | (x[3] != 0) | (x[4] != 0) | (x[5] != 0)
+    nz_idx = torch.nonzero(nz_mask, as_tuple=False).squeeze(1)
+    K = nz_idx.numel()
 
-    zero_mask = M.abs().sum(dim=(1,2)) == 0
+    eigvals_flat = torch.zeros((3, N), dtype=torch.float32, device=block.device)
+    eigvecs_flat = torch.zeros((9, N), dtype=torch.float32, device=block.device)
+    if K == 0:
+        return eigvals_flat.view(3, dz, dy, dx), eigvecs_flat.view(9, dz, dy, dx)
 
-    batch_size = 1048576
-    # eigen-decomp (either whole or in chunks)
-    if batch_size is None or N <= batch_size:
-        w, v = _eigh_and_sanitize(M)
-    else:
-        ws = []; vs = []
-        for chunk in M.split(batch_size, dim=0):
-            wi, vi = _eigh_and_sanitize(chunk)
-            ws.append(wi); vs.append(vi)
-        w = torch.cat(ws, 0)
-        v = torch.cat(vs, 0)
+    for start in range(0, K, _EIGH_BATCH_SIZE):
+        bi = nz_idx[start : start + _EIGH_BATCH_SIZE]
+        M = torch.empty((bi.numel(), 3, 3), dtype=torch.float64, device=block.device)
+        M[:, 0, 0] = x[0, bi]; M[:, 0, 1] = x[1, bi]; M[:, 0, 2] = x[2, bi]
+        M[:, 1, 0] = x[1, bi]; M[:, 1, 1] = x[3, bi]; M[:, 1, 2] = x[4, bi]
+        M[:, 2, 0] = x[2, bi]; M[:, 2, 1] = x[4, bi]; M[:, 2, 2] = x[5, bi]
+        wi, vi = _eigh_and_sanitize(M)
+        eigvals_flat[:, bi] = wi.transpose(0, 1)
+        eigvecs_flat[:, bi] = vi.permute(0, 2, 1).reshape(-1, 9).transpose(0, 1)
 
-    # zero out truly‐empty voxels without branching
-    # zero_mask: [N], w: [N,3], v: [N,3,3]
-    mask_w = zero_mask.unsqueeze(-1)             # [N,1]
-    w = w.masked_fill(mask_w, 0.0)               # [N,3]
-    mask_v = mask_w.unsqueeze(-1)                # [N,1,1]
-    v = v.masked_fill(mask_v, 0.0)               # [N,3,3]
-
-    # reshape back
-    eigvals = w.transpose(0,1).view(3, dz, dy, dx)
-    eigvecs = (
-        v
-        .permute(0,2,1)
-        .reshape(N,9)
-        .transpose(0,1)
-        .view(9, dz, dy, dx)
-    )
-    return eigvals, eigvecs
-
-
-_compute_eigenvectors_fn = _maybe_compile_function(
-    _compute_eigenvectors_impl,
-    compile_kwargs={"mode": "max-autotune-no-cudagraphs", "fullgraph": True},
-)
+    return eigvals_flat.view(3, dz, dy, dx), eigvecs_flat.view(9, dz, dy, dx)
 
 
 def _compute_eigenvectors(block: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    global _compute_eigenvectors_fn
-    try:
-        return _compute_eigenvectors_fn(block)
-    except RuntimeError as exc:
-        message = str(exc)
-        if "Compiler: cl is not found" in message or "torch._inductor.exc" in message:
-            warnings.warn(
-                "Falling back to eager eigenvector computation because torch.compile "
-                "failed (likely missing required compiler).",
-                RuntimeWarning,
-            )
-            _compute_eigenvectors_fn = _compute_eigenvectors_impl
-            return _compute_eigenvectors_fn(block)
-        raise
+    return _compute_eigenvectors_impl(block)
+
+
+def _orient_eigenvectors_right_handed(eigvecs: torch.Tensor) -> torch.Tensor:
+    """Enforce right-handedness (det >= 0) and align mean v0[0] toward +X on-device."""
+    v = eigvecs.reshape(3, 3, *eigvecs.shape[1:]).clone()
+    v0, v1, v2 = v[0], v[1], v[2]
+    det = (
+        v0[0] * (v1[1] * v2[2] - v1[2] * v2[1])
+        - v0[1] * (v1[0] * v2[2] - v1[2] * v2[0])
+        + v0[2] * (v1[0] * v2[1] - v1[1] * v2[0])
+    )
+    mask = det < 0
+    if mask.any():
+        v[2] = torch.where(mask.unsqueeze(0), -v[2], v[2])
+    s = torch.sign(v[0, 0].mean())
+    if s == 0:
+        s = torch.tensor(1.0, dtype=v.dtype, device=v.device)
+    v[0] *= s
+    v[2] *= s
+    return v
 
 def _finalize_structure_tensor_torch(
     zarr_path,
@@ -607,74 +604,32 @@ def _finalize_structure_tensor_torch(
     # Process each chunk
     for idx, bounds, block in tqdm(loader, desc="[Eigen] Chunks"):
         z0, z1, y0, y1, x0, x1 = bounds
-        
-        if not torch.isfinite(block).all():
-            finite_mask = torch.isfinite(block)
-            bad = (~finite_mask).sum().item()
-            finite_vals = block[finite_mask]
-            finite_min = finite_vals.min().item() if finite_vals.numel() else float('nan')
-            finite_max = finite_vals.max().item() if finite_vals.numel() else float('nan')
-            raise RuntimeError(
-                f"Non-finite values before eigen solve for chunk {bounds}: {bad} bad entries, "
-                f"finite range [{finite_min}, {finite_max}]"
-            )
 
         with torch.no_grad():
             try:
                 eigvals_block_gpu, eigvecs_block_gpu = _compute_eigenvectors(block)
             except RuntimeError as err:
-                err_msg = str(err).lower()
-                if (
-                    block.device.type == "cuda"
-                    and "cusolver" in err_msg
-                ):
+                if block.device.type == "cuda" and _is_gpu_solver_error(err):
                     # Fall back to CPU eigen solve for this chunk and move results back to GPU
                     eigvals_cpu, eigvecs_cpu = _compute_eigenvectors_impl(block.cpu())
                     eigvals_block_gpu = eigvals_cpu.to(block.device)
                     eigvecs_block_gpu = eigvecs_cpu.to(block.device)
                 else:
                     raise
-        eigvals_block = eigvals_block_gpu.cpu().numpy()
-        eigvecs_block = eigvecs_block_gpu.cpu().numpy()
 
-        del block, eigvals_block_gpu, eigvecs_block_gpu
-        torch.cuda.empty_cache()
+            if swap_eigenvectors:
+                v_swap = eigvecs_block_gpu.reshape(3, 3, *eigvecs_block_gpu.shape[1:])
+                v_swap = v_swap[[1, 0, 2]]
+                eigvecs_block_gpu = v_swap.reshape(9, *eigvecs_block_gpu.shape[1:])
+                eigvals_block_gpu = eigvals_block_gpu[[1, 0, 2]]
 
-        if swap_eigenvectors:
-            # reshape eigenvectors into [3 eigenvectors, 3 components, dz,dy,dx]
-            v = eigvecs_block.reshape(3, 3, *eigvecs_block.shape[1:])
-            w = eigvals_block
+            v_corrected = _orient_eigenvectors_right_handed(eigvecs_block_gpu)
+            v_np = v_corrected.cpu().numpy()     # [3,3,dz,dy,dx]
+            w_np = eigvals_block_gpu.cpu().numpy()  # [3,dz,dy,dx]
 
-            # swap eigenvector #0 <-> #1 and their eigenvalues
-            v[[0, 1], :, ...] = v[[1, 0], :, ...]
-            w[[0, 1],    ...] = w[[1, 0],    ...]
-
-            # flatten back
-            eigvecs_block = v.reshape(9, *eigvecs_block.shape[1:])
-            eigvals_block = w
-
-        # impose handedness
-        v = torch.from_numpy(eigvecs_block.reshape(3, 3, *eigvecs_block.shape[1:])).to(device)
-        V_flat = v.reshape(3,3,-1).permute(2,0,1)    # [N,3,3]
-        det = torch.linalg.det(V_flat)               # [N]
-        mask = det < 0
-        # flip the *entire* 3rd eigenvector (row index = 2)
-        if mask.any():
-            V_flat[mask, 2, :] *= -1
-        # back to original layout
-        v_corrected = V_flat.permute(1,2,0).reshape(3,3,*eigvecs_block.shape[1:])
-
-        # Orient eigenvectors: keep right-handedness but align first vector toward +X on average.
-        # Compute sign from the first component of v0 averaged over the block
-        s = torch.sign(v_corrected[0, 0, ...].mean())
-        s = torch.tensor(1.0, device=v_corrected.device) if s == 0 else s
-        # Flip v0 and v2 together to preserve determinant > 0
-        v_corrected[0, ...] *= s
-        v_corrected[2, ...] *= s
-
-        # numpy views
-        v_np = v_corrected.cpu().numpy()     # [3,3,dz,dy,dx]
-        w_np = eigvals_block                 # [3,dz,dy,dx]
+        del block, eigvals_block_gpu, eigvecs_block_gpu, v_corrected
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
         # ---------- Write OME-style outputs (downsampled + quantized) ----------
         if ome_out:
@@ -702,8 +657,10 @@ def _finalize_structure_tensor_torch(
             ny[oz0:oz1, oy0:oy1, ox0:ox1] = _quantize_dir_u8(v_np[2, 1, slz, sly, slx])
             nx[oz0:oz1, oy0:oy1, ox0:ox1] = _quantize_dir_u8(v_np[2, 2, slz, sly, slx])
 
-            # Confidence (default: Fractional Anisotropy)
-            l1, l2, l3 = w_np[0], w_np[1], w_np[2]
+            # Confidence (default: Fractional Anisotropy) — computed on the downsampled slice only
+            l1 = w_np[0, slz, sly, slx]
+            l2 = w_np[1, slz, sly, slx]
+            l3 = w_np[2, slz, sly, slx]
             eps = 1e-12
             if confidence_metric == "linearity":
                 conf = (l3 - l2) / (np.abs(l3) + eps)
@@ -718,7 +675,7 @@ def _finalize_structure_tensor_torch(
                 num = (l1 - lbar) ** 2 + (l2 - lbar) ** 2 + (l3 - lbar) ** 2
                 den = (l1 ** 2 + l2 ** 2 + l3 ** 2) + eps
                 conf = np.sqrt(1.5) * np.sqrt(num) / np.sqrt(den)
-            conf_ds[oz0:oz1, oy0:oy1, ox0:ox1] = _quantize_unit_u8(conf[slz, sly, slx])
+            conf_ds[oz0:oz1, oy0:oy1, ox0:ox1] = _quantize_unit_u8(conf)
 
         # ---------- Optional: keep raw eigen* ----------
         if keep_eigen:

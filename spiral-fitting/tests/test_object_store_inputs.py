@@ -124,10 +124,11 @@ def test_selection_preserves_inherited_source_identity_and_manifest_pins(db):
         def status(self):
             return {**db.status(), 'store': owner, 'generation': generation}
 
-        def selected_inputs(self, refs, position):
+        def selected_inputs(self, refs, position, relationship_refs=None):
             # This fixture tests transport, not collection routing. Actual
             # inherited-position validation is native test_coherent_store.
-            return db.selected_inputs(refs, dict(position, store=db.status()['store'], generation=db.status()['generation']))
+            return db.selected_inputs(refs, dict(position, store=db.status()['store'], generation=db.status()['generation']),
+                                      relationship_refs)
 
     owner, generation = str(uuid.uuid4()), str(uuid.uuid4())
     attachment = Attachment()

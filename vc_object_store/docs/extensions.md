@@ -267,6 +267,42 @@ with results.write() as tx:
 
 Use a new run UUID for another independently saved result/checkpoint. Metric progression can be appended under the same run UUID at distinct iterations. The definitions provision the full data path; existing solver/checkpoint producers are not automatically migrated to these new tables.
 
+## Track crossing cache
+
+`objects/TrackCrossingStore.hpp` stores the crossings a consumer computed between tracks as a local, derived collection: a cache file beside the consumer, not part of the store the tracks live in and not served by a hosted store. The Spiral fitter keeps one per selection of track revisions under its cache directory.
+
+A cache store is a sealed, history-off, packed collection built with the [initial importer](initial-import.md) and its parallel stream. It holds **no objects**. Each unordered pair of crossing tracks is one slim core edge (`uuid`, `a_uuid`, `b_uuid`, kind `crossing`, no anchors, no adjacency index) whose UUID is a name UUID of its two endpoints, with `a < b` in binary UUID order, and one row of `ext_track_crossings` (extension `track-crossings`, format 1, `keySpace="edges"`, immutable):
+
+| Column | Type | Value |
+| --- | --- | --- |
+| `edge_uuid` | BLOB, 16 bytes, primary key | The pair's edge |
+| `local_a`, `local_b` | INTEGER | Point index of the crossing on track a / b, in stored point order |
+| `position_a`, `position_b` | REAL | Arclength of that point on a / b, stored voxels |
+| `clearance` | REAL | The pair's clearance, stored voxels |
+
+No column is nullable. Positions and clearances are finite and non-negative; the writer refuses negative zero, so the values a reader returns are bit-identical to the ones written. Provisioning names the `algorithm`, its `parameters`, the consumer's `key` for the track selection and `checksum` of what it stored, and the `tracks` and `crossings` counts. `basedOn` is the position of the store the tracks were read at.
+
+The endpoints are tracks of **another** store, named by UUID only. Trusted initial construction does not resolve endpoints, so this is supported, but the collection is a derived result rather than a graph: ordinary relationship readers cannot resolve its endpoints, and `basedOn` is provenance, not a `store_reference`. It neither opens the source store nor guarantees that the source still holds that state.
+
+```cpp
+TrackCrossingStoreInfo info;
+info.algorithm = "vc_spiral.track_crossings/1";
+info.key = selectionKey; info.checksum = csrSha256; info.tracks = trackCount;
+info.basedOn = {{sourceStoreUuid, sourceLineageUuid, sourceCommit}};
+writeTrackCrossingStore("crossings.vcobj", view, info, {.workers = 8});
+
+auto store = ObjectCollection::open("crossings.vcobj", readOnlyOptions);
+auto txn = store.read();
+const auto description = trackCrossingStoreInfo(store, txn);
+const auto columns = readTrackCrossingColumns(store, txn, 8);
+```
+
+`writeTrackCrossingStore` borrows contiguous columns (binary UUIDs as 16 bytes per row), accepts a pair in either order, validates every row before creating anything, and feeds bounded batches of owned edge records through `ParallelImportStream` to one SQLite writer per shard. It never overwrites: an existing destination, an invalid row or any import failure throws and publishes nothing. Packed publication links the finished file into place, so the destination filesystem must support hard links; a process that dies while writing can leave `.building-*` or `.compact-*` files beside the destination, which nothing reclaims.
+
+`readTrackCrossingColumns` reads only this shape and rejects everything else rather than interpreting it: the collection must be sealed and history-off, one root with its own partitions and no dependency or overlay layers. The root of a multi-shard store must be manifest-only (no extension table, no edges); every data shard, and the root of a single-shard store, must carry the table with the same definition, provisioning and `basedOn`. The data shards of a multi-shard store must be routed by edge-UUID hash, each owning one residue, as the importer writes them: that is what makes an edge found in its shard the only one of its UUID. Within a shard the edges and the measurement rows are walked together in key order, so a row missing on either side is an error, as is an edge that is not an active crossing, is not the name UUID of its `a < b` pair, or lies in another shard than its UUID routes to; a point index outside `[0, INT32_MAX]`; a position or clearance that is NULL, negative or not finite; and a row count other than the declared one. Rows are returned in partition, then edge-UUID, order.
+
+Python: `vc_object_store.write_track_crossing_store(path, a, b, local_a, local_b, position_a, position_b, clearance, info, workers=8)` takes `uint8[N,16]`, `int32[N]` and `float64[N]` arrays and an `info` dictionary (`algorithm`, `parameters`, `key`, `checksum`, `tracks`, `based_on`); `CollectionReader.track_crossing_columns(workers=8)` returns the same columns as owned NumPy arrays and `CollectionReader.track_crossing_info()` the description. `test_track_crossing_store` covers bit-exact round trips over shard counts and buffering modes, the empty store, either input order, refused rows, no-overwrite and concurrent publication, and every rejected reader shape.
+
 ## Validation
 
 The regression suite covers typed values (including empty BLOB versus NULL), registration and transactional stamps, owner-versioned checked writes, history on/off, restore, multi-chunk snapshots, database-copy preservation, store_reference clears/deletions, and plain/packed sharded imports. Fiber graph extension tests cover independent runs, input references and shared native/Python definitions. Compact provisioning builders reject source/configuration dumps. See the [build and test instructions](../README.md#build-and-test).

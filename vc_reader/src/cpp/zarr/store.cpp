@@ -5,7 +5,9 @@
 #include "../chunk_io.hpp"
 #include "vc_reader/zarr_write.hpp"
 #include "vc_reader/native/http.hpp"
+#include "vc_reader/native/utf8_path.hpp"
 #include "vc_reader/native/thread_pool.hpp"
+#include "files.hpp"
 
 #include <algorithm>
 #include <filesystem>
@@ -13,6 +15,28 @@
 namespace fs = std::filesystem;
 
 namespace vcr::zarr {
+
+namespace {
+bool isArrayMetadata(const std::string& name)
+{
+    const auto base = utf8Path(name).filename();
+    return base == ".zarray" || base == "zarr.json";
+}
+
+// Once this process has changed an array's metadata at a remote store, or
+// removed it, the document readArrayDocument keeps for it (and for arrays
+// below it) is dropped, also when the change failed part way.
+struct ForgetKnownArrays {
+    const std::string& location;
+    const Access& access;
+    bool active;
+    ~ForgetKnownArrays()
+    {
+        if (active)
+            detail::forgetKnownArrays(location, access);
+    }
+};
+}  // namespace
 
 struct Store::Impl {
     std::string location;
@@ -24,7 +48,7 @@ struct Store::Impl {
     std::mutex mutex;  // guards reader and access across a key reload
 
     Impl(const fs::path& path, const Access& keys, int count)
-        : location(path.string()), remote(isRemote(location)), access(keys), connections(count)
+        : location(utf8String(path)), remote(isRemote(location)), access(keys), connections(count)
     {
         while (location.size() > 1 && location.back() == '/')
             location.pop_back();
@@ -93,8 +117,9 @@ std::optional<std::string> Store::read(const std::string& name) const
 
 void Store::write(const std::string& name, std::string_view data, Durability durability) const
 {
+    const ForgetKnownArrays forget{impl_->location, impl_->access, impl_->remote && isArrayMetadata(name)};
     if (!impl_->remote) {
-        atomicWrite(fs::path(impl_->location) / name, data.data(), data.size(), durability);
+        atomicWrite(utf8Path(impl_->location) / utf8Path(name), data.data(), data.size(), durability);
         return;
     }
     impl_->needWritable();
@@ -103,11 +128,12 @@ void Store::write(const std::string& name, std::string_view data, Durability dur
 
 void Store::writeFile(const std::string& name, const fs::path& file) const
 {
+    const ForgetKnownArrays forget{impl_->location, impl_->access, impl_->remote && isArrayMetadata(name)};
     const auto bytes = fs::file_size(file);
     if (!impl_->remote) {
-        const auto target = fs::path(impl_->location) / name;
+        const auto target = utf8Path(impl_->location) / utf8Path(name);
         fs::create_directories(target.parent_path());
-        const fs::path temporary = temporary_path(target.string());
+        const fs::path temporary = utf8Path(temporary_path(utf8String(target)));
         try {
             fs::copy_file(file, temporary, fs::copy_options::overwrite_existing);
             fs::rename(temporary, target);
@@ -121,7 +147,7 @@ void Store::writeFile(const std::string& name, const fs::path& file) const
     impl_->needWritable();
     constexpr std::uint64_t kPartBytes = 64ULL << 20;
     std::ifstream in(file, std::ios::binary);
-    if (!in) throw std::runtime_error("cannot read " + file.string());
+    if (!in) throw std::runtime_error("cannot read " + utf8String(file));
     std::vector<char> buffer(std::size_t(std::min<std::uint64_t>(std::max<std::uint64_t>(kPartBytes, bytes / 9000 + 1), std::max<std::uint64_t>(bytes, 1))));
     if (bytes <= kPartBytes) {
         in.read(buffer.data(), std::streamsize(bytes));
@@ -138,7 +164,7 @@ void Store::writeFile(const std::string& name, const fs::path& file) const
         std::uint64_t sent = 0;
         for (int part = 1; sent < bytes; ++part) {
             const auto size = std::size_t(std::min<std::uint64_t>(buffer.size(), bytes - sent));
-            if (!in.read(buffer.data(), std::streamsize(size))) throw std::runtime_error("cannot read " + file.string());
+            if (!in.read(buffer.data(), std::streamsize(size))) throw std::runtime_error("cannot read " + utf8String(file));
             const auto partUrl = url + "?partNumber=" + std::to_string(part) + "&uploadId=" + id;
             const auto etag = impl_->signedRequest([&] { return impl_->http->put_part(partUrl, buffer.data(), size); });
             done += "<Part><PartNumber>" + std::to_string(part) + "</PartNumber><ETag>" + etag + "</ETag></Part>";
@@ -160,14 +186,14 @@ void Store::writeFile(const std::string& name, const fs::path& file) const
 bool Store::readFile(const std::string& name, const fs::path& file) const
 {
     if (file.has_parent_path()) fs::create_directories(file.parent_path());
-    const fs::path temporary = temporary_path(file.string());
+    const fs::path temporary = utf8Path(temporary_path(utf8String(file)));
     const auto finish = [&](bool found) {
         if (found) fs::rename(temporary, file);
         else fs::remove(temporary);
         return found;
     };
     if (!impl_->remote) {
-        const auto source = fs::path(impl_->location) / name;
+        const auto source = utf8Path(impl_->location) / utf8Path(name);
         if (!fs::exists(source)) return false;
         fs::copy_file(source, temporary, fs::copy_options::overwrite_existing);
         return finish(true);
@@ -183,14 +209,14 @@ bool Store::readFile(const std::string& name, const fs::path& file) const
         return impl_->http->get_stream(impl_->url(name), [&] {
             out.close();
             out.open(temporary, std::ios::binary | std::ios::trunc);
-            if (!out) throw std::runtime_error("cannot write " + temporary.string());
+            if (!out) throw std::runtime_error("cannot write " + utf8String(temporary));
         }, [&](const char* data, std::size_t n) { out.write(data, std::streamsize(n)); });
     });
     out.close();
     if (!out) {
         std::error_code ignored;
         fs::remove(temporary, ignored);
-        throw std::runtime_error("cannot write " + temporary.string());
+        throw std::runtime_error("cannot write " + utf8String(temporary));
     }
     return finish(response.status == 200);
 }
@@ -199,7 +225,7 @@ bool Store::exists(const std::string& name) const
 {
     if (!impl_->remote) {
         std::error_code ec;
-        return fs::exists(fs::path(impl_->location) / name, ec);
+        return fs::exists(utf8Path(impl_->location) / utf8Path(name), ec);
     }
     if (!impl_->http) return read(name).has_value();
     return impl_->signedRequest([&] { return impl_->http->head(impl_->url(name)); });
@@ -215,16 +241,17 @@ bool Store::remove(const std::string& name) const
         discard(name);
         return true;
     }
-    const auto path = fs::path(impl_->location) / name;
+    const auto path = utf8Path(impl_->location) / utf8Path(name);
     std::error_code ec;
     const bool removed = fs::remove(path, ec);
     if (ec)
-        throw std::system_error(ec, "removing " + path.string());
+        throw std::system_error(ec, "removing " + utf8String(path));
     return removed;
 }
 
 void Store::discard(const std::string& name) const
 {
+    const ForgetKnownArrays forget{impl_->location, impl_->access, impl_->remote && isArrayMetadata(name)};
     if (!impl_->remote) {
         remove(name);
         return;
@@ -236,7 +263,8 @@ void Store::discard(const std::string& name) const
 bool Store::removeAll() const
 {
     if (!impl_->remote)
-        return fs::remove_all(impl_->location) > 0;
+        return fs::remove_all(utf8Path(impl_->location)) > 0;
+    const ForgetKnownArrays forget{impl_->location, impl_->access, true};
     impl_->needWritable();
     const auto objects = list();
     ThreadPool pool(std::size_t(std::max(impl_->connections - 1, 0)));
@@ -249,9 +277,9 @@ std::vector<s3::Object> Store::list(const std::string& keyPrefix) const
     std::vector<s3::Object> objects;
     if (!impl_->remote) {
         std::error_code ec;
-        for (fs::recursive_directory_iterator it(impl_->location, ec), end; !ec && it != end; it.increment(ec))
+        for (fs::recursive_directory_iterator it(utf8Path(impl_->location), ec), end; !ec && it != end; it.increment(ec))
             if (it->is_regular_file(ec)) {
-                auto key = it->path().lexically_relative(impl_->location).generic_string();
+                auto key = utf8GenericString(it->path().lexically_relative(utf8Path(impl_->location)));
                 if (key.starts_with(keyPrefix))
                     objects.push_back({std::move(key), it->file_size(ec), {}, {}});
             }
@@ -273,8 +301,8 @@ Listing Store::listPage(const std::string& keyPrefix, const std::string& continu
     struct Item { std::string key; bool directory; std::uint64_t size; };
     std::vector<Item> items;
     std::error_code ec;
-    for (const auto& entry : fs::directory_iterator(fs::path(impl_->location) / directory, ec)) {
-        const auto name = entry.path().filename().string();
+    for (const auto& entry : fs::directory_iterator(utf8Path(impl_->location) / utf8Path(directory), ec)) {
+        const auto name = utf8String(entry.path().filename());
         if (!name.starts_with(namePrefix)) continue;
         if (entry.is_directory(ec)) items.push_back({directory + name, true, 0});
         else if (entry.is_regular_file(ec)) items.push_back({directory + name, false, entry.file_size(ec)});
@@ -297,9 +325,9 @@ std::vector<std::string> Store::children() const
     std::vector<std::string> names;
     if (!impl_->remote) {
         std::error_code ec;
-        for (const auto& child : fs::directory_iterator(impl_->location, ec))
+        for (const auto& child : fs::directory_iterator(utf8Path(impl_->location), ec))
             if (child.is_directory())
-                names.push_back(child.path().filename().string());
+                names.push_back(utf8String(child.path().filename()));
     } else {
         names = impl_->signedRequest([&] { return listChildren(impl_->access, impl_->location); });
     }

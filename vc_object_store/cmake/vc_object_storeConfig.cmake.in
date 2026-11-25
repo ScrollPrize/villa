@@ -15,7 +15,9 @@ if(@VC_OBJECT_STORE_BUILD_ADAPTERS@)
     find_dependency(TIFF)
     find_dependency(CURL)
 endif()
-if(@VC_OBJECT_STORE_BUILD_LINKING@)
-    find_dependency(OpenMP)
+# Only when the exported detectors link OpenMP: on macOS a build with the
+# Python module may have found none, and its detectors are then serial.
+if(@VC_OBJECT_STORE_DETECTORS_OPENMP@)
+    find_dependency(OpenMP COMPONENTS CXX)
 endif()
 include("${CMAKE_CURRENT_LIST_DIR}/vc_object_storeTargets.cmake")

@@ -15,6 +15,7 @@ from typing import Any, Mapping, Sequence
 import torch
 import torch.nn.functional as F
 
+from vesuvius.models.utilities.mps_conv3d import speed_up_3d_convs_on_mps
 from vesuvius.ink_detection.models.checkpoint import (
     load_checkpoint,
     resolve_checkpoint_path,
@@ -620,6 +621,7 @@ def _run_training(request: TrainingRequest) -> int:
             )
         loss = DeepSupervisionWrapper(loss, weights)
 
+    speed_up_3d_convs_on_mps(model, accelerator.device)
     model, optimizer, train_loader, val_loader = accelerator.prepare(
         model, optimizer, train_loader, val_loader
     )

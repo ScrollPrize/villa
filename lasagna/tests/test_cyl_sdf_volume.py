@@ -59,13 +59,15 @@ class CylSdfVolumeTests(unittest.TestCase):
 		calls: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, float, float]] = []
 
 		class _Ext:
-			def build_inside_depth_volume(
+			def build_violation_depth_volume(
 				self,
 				verts,
 				faces,
 				origin,
 				spacing,
 				shape,
+				depth_max,
+				mode,
 				progress_label="",
 				requested_threads=0,
 				chunk_size=8,
@@ -101,13 +103,15 @@ class CylSdfVolumeTests(unittest.TestCase):
 		calls: list[tuple[int, float, float]] = []
 
 		class _Ext:
-			def build_inside_depth_volume(
+			def build_violation_depth_volume(
 				self,
 				verts,
 				faces,
 				origin,
 				spacing,
 				shape,
+				depth_max,
+				mode,
 				progress_label="",
 				requested_threads=0,
 				chunk_size=8,

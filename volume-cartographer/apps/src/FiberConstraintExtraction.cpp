@@ -196,8 +196,8 @@ int runFiberConstraintExtraction(int argc, char** argv)
     auto provenance=std::move(normalInput.provenance);
     const auto normalSource=cfg.value("normal_source",std::string("lasagna"));
     if(normalSource=="fiber"){
-        // The compound sheet_grad_mag channel is a validity mask, never a
-        // Lasagna winding-density measurement.
+        // Compound sheet normals carry no winding density: their validity is
+        // the prediction's (chunk existence or a channel), not a measurement.
         if(!cfg.contains("orient_database") && !cfg.value("axial_prior_only",false) && !cfg.contains("winding_manifest"))
             throw std::invalid_argument("Fiber sheet normals require an independent Lasagna winding_manifest for extraction");
         dataset=vc::lasagna::fiberSheetNormalDataset(dataset);

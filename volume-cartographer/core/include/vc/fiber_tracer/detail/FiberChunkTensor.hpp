@@ -72,7 +72,7 @@ private:
     void requireCompanions() const;
     std::array<vc::lasagna::LasagnaChannelBinding,7> pendingBindings_;
     bool companionsLoaded_=false;
-    std::array<std::vector<uint8_t>,6> channels_; // presence,nx,ny,grad_mag,sheet_nx,sheet_ny
+    std::array<std::vector<uint8_t>,6> channels_; // presence,nx,ny,normal validity,sheet_nx,sheet_ny
     std::vector<uint8_t> byteWidth_;
     std::vector<float> floatWidth_;
     bool widthIsFloat_=false,maskNormals_=false;

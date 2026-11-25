@@ -493,6 +493,11 @@ public:
     // flows call this before replacing the package, and must not replace it
     // when this returns false: an optimization is running, or a finalization
     // failed, and the workspace is left intact for the user to resolve.
+    // After the project's datasets change outside the annotation menus (an
+    // attachment): invalidates open sessions when the fiber dataset or the
+    // normal source in effect changed, as a menu selection would. While a
+    // solve runs this waits until none does, as the menus refuse changes then.
+    void syncAnnotationInputsWithProject();
     [[nodiscard]] bool prepareForPackageSwitch();
 
 signals:
@@ -562,7 +567,75 @@ private:
         std::vector<int> storedIndexForSessionIndex;
     };
 
-    struct FiberSaveSnapshot { StoredFiber fiber; };
+    // What one commit of this controller did to the fiber links, and what the
+    // open panes held when it was prepared: what brings each pane to the
+    // commit (reconcileSessionLinks). Made by prepareFiberCommit, filled by
+    // buildFiberCommitOperations, shared by the job and its snapshots.
+    struct FiberCommitLinks {
+        // A link between the control with store id aControl of fiber a and
+        // the one with bControl of fiber b, and its kind and review state.
+        struct State {
+            int64_t aControl = -1, bControl = -1;
+            bool pending = false, adjacent = false, autoLink = false;
+        };
+        // One link the commit wrote or removed.
+        struct Change {
+            std::string aUuid, bUuid;
+            // As stored just before the commit, with where each end was (in
+            // the frame its fiber's controls are in); none for a new link.
+            std::optional<State> before;
+            cv::Vec3d aBefore{0.0, 0.0, 0.0}, bBefore{0.0, 0.0, 0.0};
+            // Written from a ref held without its edge id: the stored link
+            // may be one the loader did not show (no longer applicable), so a
+            // pane without it either was never shown it or has unlinked it;
+            // such a pane is not brought to the commit.
+            bool unseen = false;
+            // As committed; none when the commit removed the link.
+            std::optional<State> after;
+            // The commit put that end on another control, or at another
+            // position (the direction, derived from the line, is not compared).
+            bool aMoved = false, bMoved = false;
+            // An approved link an end of which moved is committed pending.
+            bool demoted = false;
+        };
+        std::map<std::string, Change> changes; // by canonical edge uuid
+        // A pane's link when the commit was prepared, its own control by
+        // identity and store id (indices shift with the pane's later edits).
+        struct PaneLink {
+            std::string edgeUuid;
+            uint64_t ownIdentity = 0;
+            int64_t ownStoreId = -1;
+            uint64_t linkedFiberId = 0;
+            cv::Vec3d linkedPosition{0.0, 0.0, 0.0};
+            bool adjacent = false;
+        };
+        std::vector<std::pair<std::weak_ptr<LineAnnotationSession>, std::vector<PaneLink>>> panes;
+        // A saved or linked fiber has two controls at one position: a pane's
+        // refs name linked controls by position, so no other pane is brought
+        // to this commit.
+        bool coincidentControls = false;
+    };
+
+    struct FiberSaveSnapshot {
+        StoredFiber fiber;
+        // The commit this snapshot was saved by (prepareFiberCommit).
+        std::shared_ptr<const FiberCommitLinks> commit;
+    };
+
+    // A link of one fiber as a commit left it: the ref (linked end, kind,
+    // review state and edge id as committed) and the fiber's own control by
+    // store id (and by session identity when it was snapshot from a session).
+    struct CommittedLink {
+        FiberBranchRef ref;
+        int64_t ownStoreId = -1;
+        uint64_t ownIdentity = 0;
+    };
+    // Whose links a commit is applied to (applyCommitToLinks).
+    enum class LinkHolder {
+        Source,           // the pane the saved snapshot was taken from
+        Other,            // any other pane, and its restorable copies
+        SourceRestorable, // a restorable copy of the source pane
+    };
 
     using BranchLinkValidationIssue = vc3d::line_annotation::BranchLinkValidationIssue;
 
@@ -992,8 +1065,11 @@ private:
     // package; false makes the helper return false at once.
     bool ensureDatasetForSession(LineAnnotationSession& session, bool required = true,
                                  const std::function<bool()>& stillValid = {});
+    // buildNormalSampler=false resolves the dataset only (session.normalSampler
+    // stays empty), for callers that sample on a worker with their own sampler.
     bool resolveDatasetForSession(LineAnnotationSession& session, bool required,
-                                  const std::function<bool()>& stillValid);
+                                  const std::function<bool()>& stillValid,
+                                  bool buildNormalSampler = true);
     bool ensureFiberInferenceDatasetForSession(LineAnnotationSession& session,
                                                const std::function<bool()>& stillValid = {});
     // Every backend a fiber-mode solve of the session needs (dataset, and
@@ -1028,6 +1104,22 @@ private:
     void handleNormalSourceSelectionChanged(const std::string& source);
     bool canChangeAnnotationInputs();
     void invalidateAnnotationInputs(bool predictionsChanged, bool normalsChanged);
+    // The project inputs open sessions were last resolved against.
+    struct AnnotationInputs {
+        const void* project = nullptr;
+        std::string fiberDataset, normalSource, lasagnaDataset;
+        bool operator==(const AnnotationInputs&) const = default;
+    };
+    std::optional<AnnotationInputs> _annotationInputs;
+    // Inputs changed while a solve ran; applied once no solve is running.
+    bool _annotationInputsSyncDeferred = false;
+    [[nodiscard]] AnnotationInputs currentAnnotationInputs() const;
+    // Whether the Lasagna dataset may supply the normals: everywhere except a
+    // fiber dataset known to have predicted normals (an unattached one falls
+    // back to Lasagna when its manifest has none).
+    [[nodiscard]] bool lasagnaMaySupplyNormals() const;
+    // After a solve lands (or is dropped): apply input changes it held back.
+    void scheduleDeferredAnnotationInputsSync();
     bool needsFinalOptimization(const LineAnnotationSession& session) const;
     // stillValid (optional): forwarded to the backend helpers and checked
     // once more after the solve, before the result is applied.
@@ -1444,6 +1536,9 @@ private:
         std::set<std::string> involved;
         // Every edit leaves its fiber's tags as stored (prepareFiberCommit).
         bool fiberTagsUnchanged = false;
+        // What the commit does to the fiber links (prepareFiberCommit,
+        // buildFiberCommitOperations); the snapshots share it.
+        std::shared_ptr<FiberCommitLinks> links;
         const StoredFiber& fiberFor(uint64_t id) const
         {
             for (const auto& edit : edits) if (edit.fiber.id == id) return edit.fiber;
@@ -1463,6 +1558,31 @@ private:
     [[nodiscard]] FiberCommitJob prepareFiberCommit(const std::vector<FiberSaveSnapshot>& snapshots,
                                                     const std::vector<StoredFiber>& retired) const;
     static void buildFiberCommitOperations(FiberCommitJob& job, const vc::objects::StoreReader& reader);
+    // Applies a commit to one list of a fiber's links (a pane's, or a
+    // restorable copy's, with the controls they index): removed links go, a
+    // link the commit made is added, and each link it changed takes the
+    // change where the list still holds what was stored before; what the
+    // list's holder changed itself (and has not saved) stays. False when the
+    // two cannot both stand (the holder is then not brought to the commit).
+    static bool applyCommitToLinks(std::vector<FiberBranchRef>& links,
+                                   const std::vector<vc3d::line_annotation::LineControlPoint>& controls,
+                                   const std::string& fiberUuid, const std::vector<CommittedLink>& committed,
+                                   const FiberCommitLinks& commit, const std::vector<FiberCommitLinks::PaneLink>* atPrepare,
+                                   LinkHolder holder);
+    // Brings a session's links and both restorable copies of them (a mode
+    // change's and a collapse's rollback) to a commit, all or none; false
+    // when they cannot be. structural: the caller swapped the commit's
+    // redirected links in itself, which must then be exactly the committed ones.
+    bool reconcileSessionLinks(LineAnnotationSession& session, const std::vector<CommittedLink>& committed,
+                               const FiberCommitLinks* commit, bool source, bool structural) const;
+    // Installed links name a linked control in stored order; a link to a
+    // fiber open in another pane names it in that pane's session order.
+    void resolveLinkedIndicesInOpenPanes(std::vector<FiberBranchRef>& branches, const LineAnnotationSession& session) const;
+    // Each open pane (but `except`) of a link's linked fiber where the linked
+    // control is found, with its session index (syncBranchEndpointPositions,
+    // resolveLinkedIndicesInOpenPanes).
+    void forEachLinkedControlInOpenPanes(const FiberBranchRef& branch, const LineAnnotationSession& except,
+                                         const std::function<void(LineAnnotationSession&, int)>& visit) const;
     // A background commit's read-back: once the commit is in the store the
     // read is retried until it answers or the controller lets go of the
     // publication (stop); its sessions go on being edited meanwhile.
@@ -1583,7 +1703,10 @@ private:
     void commitFiberStoreAction(std::vector<FiberSaveSnapshot>& snapshots,
                                const std::vector<StoredFiber>& retired = {});
     void commitFibers(std::initializer_list<StoredFiber*> fibers);
-    void applyCommittedFibers(const std::vector<FiberSaveSnapshot>& snapshots, bool supersedeSolves = true);
+    // installLinks false: the caller installs the saved fibers' panes' links
+    // itself (a structural edit's prebuilt redirects).
+    void applyCommittedFibers(const std::vector<FiberSaveSnapshot>& snapshots, bool supersedeSolves = true,
+                              bool installLinks = true);
     void waitForFiberSaves();
     [[nodiscard]] FiberSaveSnapshot makeFiberSaveSnapshot(const StoredFiber& fiber);
 
@@ -1617,6 +1740,7 @@ private:
     // or their metrics invalidated during it (the read is then made again).
     std::unordered_map<uint64_t, bool> _alignmentMetricWorkerReads;
     uint64_t _alignmentMetricWorkerReadCount = 0;  // reads started (tests)
+    uint64_t _sessionNormalSamplerBuilds = 0;      // samplers resolveDatasetForSession built (tests)
     // stillValid (optional): a failed metadata save shows a modal; false
     // right after it returns without scheduling the autosave.
     void saveFiberDisplayAnnotations(LineAnnotationSession& session,

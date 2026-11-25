@@ -1,31 +1,33 @@
 from __future__ import annotations
 
 import argparse
-from functools import wraps
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import platform
 import subprocess
 import time
 from typing import Any
 
+import numpy as np
 import torch
 import vc_reader
-from vc_reader.reader import open_node
 
 try:
-    from lasagna.live_omezarr_cache import (
-        DEFAULT_LIVE_CACHE_GIB,
-        DEFAULT_LIVE_FETCH_AHEAD_TILES,
-        LiveOmeZarrCache,
+    from lasagna.input_level import (
+        DEFAULT_INPUT_CONNECTIONS,
+        DEFAULT_READ_AHEAD_TILES,
+        InputLevel,
+        split_level_location,
     )
 except ImportError:  # pragma: no cover - supports PYTHONPATH=lasagna style runs.
-    from live_omezarr_cache import (
-        DEFAULT_LIVE_CACHE_GIB,
-        DEFAULT_LIVE_FETCH_AHEAD_TILES,
-        LiveOmeZarrCache,
+    from input_level import (
+        DEFAULT_INPUT_CONNECTIONS,
+        DEFAULT_READ_AHEAD_TILES,
+        InputLevel,
+        split_level_location,
     )
 
 try:
@@ -36,7 +38,6 @@ try:
         DEFAULT_OME_COMPRESSOR,
         OME_COMPRESSOR_CHOICES,
         DEFAULT_PREFETCH_TILES_PER_GPU,
-        _auto_download,
         build_product_omezarr_pyramids,
         create_product_omezarr_groups,
         _cleanup_predict3d_temp_files,
@@ -55,7 +56,6 @@ except ImportError:  # pragma: no cover - supports PYTHONPATH=lasagna style runs
         DEFAULT_OME_COMPRESSOR,
         OME_COMPRESSOR_CHOICES,
         DEFAULT_PREFETCH_TILES_PER_GPU,
-        _auto_download,
         build_product_omezarr_pyramids,
         create_product_omezarr_groups,
         _cleanup_predict3d_temp_files,
@@ -192,35 +192,6 @@ def _storage_ds_end(value: int, scaledown: int) -> int:
     value_i = max(0, int(value))
     scaledown_i = max(1, int(scaledown))
     return (value_i + scaledown_i - 1) // scaledown_i
-
-
-def _manage_live_cache(function):
-    @wraps(function)
-    def wrapped(*args, **kwargs):
-        enabled = bool(kwargs.get("live_fetch", False))
-        if not enabled:
-            kwargs["_live_cache"] = None
-            return function(*args, **kwargs)
-        if kwargs.get("no_download", False):
-            raise ValueError("--live-fetch conflicts with --no-download")
-        if kwargs.get("crop_xyzwhd") is not None:
-            raise ValueError("--live-fetch supports only full, non-cropped inference")
-        cache_gib = float(kwargs.get("live_cache_gib", DEFAULT_LIVE_CACHE_GIB))
-        lookahead = int(kwargs.get("live_fetch_ahead_tiles", DEFAULT_LIVE_FETCH_AHEAD_TILES))
-        workers = int(kwargs.get("download_workers", 64))
-        if not math.isfinite(cache_gib) or cache_gib <= 0:
-            raise ValueError("live_cache_gib must be finite and > 0")
-        if lookahead <= 0:
-            raise ValueError("live_fetch_ahead_tiles must be > 0")
-        with LiveOmeZarrCache(
-            kwargs["input_path"],
-            max_bytes=int(cache_gib * (1 << 30)),
-            lookahead_tiles=lookahead,
-            workers=workers,
-        ) as live_cache:
-            kwargs["_live_cache"] = live_cache
-            return function(*args, **kwargs)
-    return wrapped
 
 
 def _input_scaledown_from_base(
@@ -411,7 +382,49 @@ def _select_and_expand_crop(
     )
 
 
-@_manage_live_cache
+# Each output store records the tiling its chunks were predicted with, because
+# resume reuses every stored chunk and inference.json is shared by the directory.
+TILING_ATTR = "fiber_inference_tiling"
+
+
+def _store_has_chunks(store: Path) -> bool:
+    """Whether a local Zarr v2 store holds any chunk (metadata files start with '.')."""
+    return any(
+        not name.startswith(".") for _dirpath, _dirs, files in os.walk(store) for name in files
+    )
+
+
+def _refuse_other_tiling(
+    stores: list[Path], tiling: dict[str, int], adopt_unrecorded: bool = False,
+) -> None:
+    """Refuse stores holding chunks predicted with another or an unrecorded tiling.
+
+    Stores without chunks (such as after an interruption during setup) are adopted,
+    as are stores without a recorded tiling when the caller vouches for them.
+    """
+    def describe(value: object) -> str:
+        return " ".join(f"{k}={v}" for k, v in value.items()) if isinstance(value, dict) else repr(value)
+
+    for store in stores:
+        try:
+            recorded = json.loads((store / ".zattrs").read_text()).get(TILING_ATTR)
+        except (OSError, ValueError, AttributeError):
+            recorded = None
+        if recorded == tiling or (recorded is None and adopt_unrecorded) or not _store_has_chunks(store):
+            continue
+        if recorded is None:
+            raise ValueError(
+                f"{store} holds prediction chunks but records no tiling (written before tilings "
+                "were recorded), so they cannot be reused safely; pass --adopt-unrecorded-tiling "
+                "if they were predicted with this tiling, or use a new output path or remove the store."
+            )
+        raise ValueError(
+            f"{store} holds prediction chunks from tiling {describe(recorded)}, but this run "
+            f"uses {describe(tiling)}; rerun with the recorded tiling to resume, or use a new "
+            "output path or remove the store."
+        )
+
+
 def run_fiber_trace_3d_inference(
     *,
     config_path: str | Path | None = None,
@@ -422,15 +435,14 @@ def run_fiber_trace_3d_inference(
     devices: str | tuple[str, ...] | None = None,
     crop_xyzwhd: tuple[int, int, int, int, int, int] | None = None,
     tile_size: int | None = None,
-    overlap: int = 16,
+    overlap: int | None = None,
     border: int = 16,
     inference_scaledown_power: int | None = None,
     base_ref: str | None = None,
     base_scale: int | None = None,
-    no_download: bool = False,
     levels: int = 5,
     ome_chunk: int = 64,
-    ome_compressor: str = DEFAULT_OME_COMPRESSOR,
+    ome_compressor: str | None = DEFAULT_OME_COMPRESSOR,
     pyramid_workers: int = 0,
     recurrent_steps: int | None = None,
     prefetch_workers: int = 0,
@@ -440,21 +452,27 @@ def run_fiber_trace_3d_inference(
     prefetch_tiles_per_gpu: int = DEFAULT_PREFETCH_TILES_PER_GPU,
     input_cache_gib: float = DEFAULT_INPUT_CACHE_BYTES / float(1 << 30),
     input_io_threads: int = DEFAULT_INPUT_IO_THREADS,
-    download_workers: int = 64,
-    live_fetch: bool = False,
-    live_cache_gib: float = DEFAULT_LIVE_CACHE_GIB,
-    live_fetch_ahead_tiles: int = DEFAULT_LIVE_FETCH_AHEAD_TILES,
+    input_disk_cache_dir: str | Path | None = None,
+    input_disk_cache_gib: float | None = None,
+    input_connections: int = DEFAULT_INPUT_CONNECTIONS,
+    read_ahead_tiles: int = DEFAULT_READ_AHEAD_TILES,
     profile_pipeline: bool = False,
     inference_precision: str = "auto",
     product_accumulator_dtype: str = "float16",
     output_format: str = "compact",
-    blank_invalid: bool = True,
+    blank_invalid: bool = False,
     width_uint8_base: bool = True,
+    adopt_unrecorded_tiling: bool = False,
     provenance_context_path: str | Path | None = None,
-    _live_cache: LiveOmeZarrCache | None = None,
 ) -> None:
-    if int(download_workers) <= 0:
-        raise ValueError("download_workers must be a positive integer")
+    if int(input_connections) <= 0:
+        raise ValueError("input_connections must be a positive integer")
+    if int(read_ahead_tiles) <= 0:
+        raise ValueError("read_ahead_tiles must be > 0")
+    if input_disk_cache_gib is not None and (
+        not math.isfinite(float(input_disk_cache_gib)) or float(input_disk_cache_gib) <= 0
+    ):
+        raise ValueError("input_disk_cache_gib must be finite and > 0")
     if int(flush_workers) < 0:
         raise ValueError("flush_workers must be >= 0")
     if int(accumulator_workers) < 0:
@@ -463,8 +481,16 @@ def run_fiber_trace_3d_inference(
         raise ValueError("input_cache_gib must be finite and >= 0")
     if int(prefetch_tiles_per_gpu) <= 0 or int(input_io_threads) <= 0:
         raise ValueError("prefetch_tiles_per_gpu and input_io_threads must be > 0")
+    min_overlap = 2 * max(0, int(border))
+    overlap = max(16, min_overlap) if overlap is None else int(overlap)
+    if overlap < min_overlap:
+        # Tiles discard `border` voxels on every side, so a smaller overlap leaves
+        # gaps between tile cores that are written as presence 0.
+        raise ValueError(f"overlap={overlap} must be >= 2 * border={border}")
     config, config_source = _checkpoint_config_for_inference(checkpoint, config_path)
     tile_size_i = _tile_size_from_config(config, tile_size)
+    if overlap >= tile_size_i:
+        raise ValueError(f"overlap={overlap} must be < tile_size={tile_size_i}")
     output_manifest = Path(output_path)
     from lasagna.compact_zarr import CompactOutputAdapter, resolve_output
     output_manifest, output_format = resolve_output(output_manifest, output_format)
@@ -474,19 +500,19 @@ def run_fiber_trace_3d_inference(
     if not json_stem:
         raise ValueError("output .lasagna.json path must have a non-empty stem")
 
-    if not no_download and not live_fetch:
-        _auto_download(input_path, crop_xyzwhd, download_workers=int(download_workers))
-
-    input_memory = int(float(input_cache_gib) * (1 << 30))
-    if _live_cache is not None:
-        a_in = _live_cache.open_reader(memory_cache=input_memory, threads=int(input_io_threads))
-    else:
-        a_in = open_node(str(input_path), memory_cache=input_memory, threads=int(input_io_threads))
-    if not hasattr(a_in, "shape"):
-        raise ValueError(f"input must point to a zarr array, got: {input_path}")
-    input_shape = tuple(int(v) for v in a_in.shape)
-    if len(input_shape) != 3:
-        raise ValueError(f"input array must be (Z,Y,X), got shape {input_shape}")
+    input_level = InputLevel(
+        str(input_path),
+        cache_dir=None if input_disk_cache_dir is None else str(input_disk_cache_dir),
+        cache_max_bytes=(
+            None if input_disk_cache_gib is None else int(float(input_disk_cache_gib) * (1 << 30))
+        ),
+        memory_cache=int(float(input_cache_gib) * (1 << 30)),
+        threads=int(input_io_threads),
+        connections=int(input_connections),
+        read_ahead_tiles=int(read_ahead_tiles),
+    )
+    a_in = input_level.reader
+    input_shape = tuple(input_level.shape)
 
     base_shape_zyx = _resolve_base_shape(input_path, base_ref, base_scale)
     if base_shape_zyx is None:
@@ -561,27 +587,46 @@ def run_fiber_trace_3d_inference(
         emit_width="width" in annotation_heads,
         emit_normals="normal" in annotation_heads,
     )
+    if ome_compressor == "vc-delta3d" and any(np.dtype(p.dtype) != np.uint8 for p in predict_adapter.output_products):
+        raise ValueError("vc-delta3d stores uint8 output only; float32 widths need --ome-compressor blosc-zstd")
+    # Stored chunks are reused as complete, so a store's chunks must come from this tiling.
+    tiling = {
+        "tile_size": int(tile_size_i), "overlap": int(overlap), "border": int(border),
+        "input_scaledown": int(input_sd), "output_scaledown": int(output_sd_input),
+        "ome_chunk": int(ome_chunk),
+    }
     if output_format == "compact":
+        tiled_stores = [output_manifest]
+    else:
+        tiled_stores = sorted({Path(OmeZarrOutputAdapter.channel_path(channel))
+                               for product in predict_adapter.output_products
+                               for channel in product.channels})
+    _refuse_other_tiling(tiled_stores, tiling, adopt_unrecorded_tiling)
+    if output_format == "compact":
+        from lasagna.lasagna_volume import VALIDITY_BY_CHUNKS
+        from vc_reader.reader import create_group
         products = predict_adapter.output_products
-        validity = next(c.name for p in products for c in p.channels if c.name == "presence" or c.name.endswith("_presence"))
         output_adapter = CompactOutputAdapter(root=output_manifest, products=products, n_levels=n_levels,
-            validity_channel=validity, blank_invalid=blank_invalid)
+            validity_channel=VALIDITY_BY_CHUNKS, blank_invalid=blank_invalid)
         output_adapter.prepare(base_shape_zyx=base_shape_zyx, ome_chunk=int(ome_chunk),
             ome_compressor=ome_compressor, crop=crop_xyzwhd,
             provenance="../inference.json", extra_fields={"width_encoding": "uint8-base-voxels" if width_uint8_base else "float32-input-voxels"})
+        create_group(output_manifest).attrs[TILING_ATTR] = tiling
     else:
         output_adapter = OmeZarrOutputAdapter(
             products=predict_adapter.output_products,
             n_levels=n_levels,
         )
         output_adapter.blank_invalid = blank_invalid
-        create_product_omezarr_groups(
+        channel_groups = create_product_omezarr_groups(
             products=predict_adapter.output_products,
             base_shape_zyx=base_shape_zyx,
             n_levels=n_levels,
             ome_chunk=int(ome_chunk),
             ome_compressor=ome_compressor,
         )
+        for group in channel_groups.values():
+            group.attrs[TILING_ATTR] = tiling
         write_lasagna_product_manifest(
             output_path=output_manifest,
             products=predict_adapter.output_products,
@@ -589,8 +634,9 @@ def run_fiber_trace_3d_inference(
             crop_xyzwhd_base=crop_xyzwhd,
             provenance_json="inference.json",
         )
-        from lasagna.lasagna_volume import LasagnaVolume
+        from lasagna.lasagna_volume import VALIDITY_BY_CHUNKS, LasagnaVolume
         manifest = LasagnaVolume.load(output_manifest)
+        manifest.validity_channel = VALIDITY_BY_CHUNKS
         manifest.extra_fields.update(width_encoding="uint8-base-voxels" if width_uint8_base else "float32-input-voxels",
                                      blank_invalid=blank_invalid)
         manifest.save()
@@ -624,10 +670,10 @@ def run_fiber_trace_3d_inference(
         if isinstance(context_source, dict) else None
     )
     if requested_group is None:
-        input_group_name = Path(str(input_path).rstrip("/")).name
+        _group_location, input_level_index = split_level_location(input_path)
         requested_group = (
-            int(input_group_name)
-            if input_group_name.isdigit()
+            input_level_index
+            if input_level_index is not None
             else _level_from_scaledown(input_sd)
         )
     context_model = provenance_context.get("model", {})
@@ -657,15 +703,17 @@ def run_fiber_trace_3d_inference(
             "border": int(border),
             "overlap": int(overlap),
             "ome_chunk": int(ome_chunk),
-            "ome_compressor_requested": str(ome_compressor),
+            "ome_compressor_requested": ome_compressor,
             "precision": precision_mode,
             "product_accumulator_dtype": str(product_accumulator_dtype),
             "recurrent_steps": predict_adapter.recurrent_steps,
-            "live_fetch": {
-                "enabled": bool(live_fetch),
-                "cache_target_gib": float(live_cache_gib),
-                "lookahead_tiles": int(live_fetch_ahead_tiles),
-                "download_workers": int(download_workers),
+            "input": {
+                "location": str(input_path),
+                "remote": bool(input_level.remote),
+                "disk_cache_dir": None if input_disk_cache_dir is None else str(input_disk_cache_dir),
+                "disk_cache_gib": None if input_disk_cache_gib is None else float(input_disk_cache_gib),
+                "connections": int(input_connections),
+                "read_ahead_tiles": int(read_ahead_tiles),
             },
         },
         "checkpoint": checkpoint_provenance,
@@ -729,7 +777,6 @@ def run_fiber_trace_3d_inference(
             products=predict_adapter.output_products,
 			output_regions_zyx={p.name: output_region for p in predict_adapter.output_products},
 			full_output_shapes_zyx={p.name: full_output_shape for p in predict_adapter.output_products},
-            input_zarr_path=str(input_path),
 			output_scaledown_base={p.name: effective_output_sd for p in predict_adapter.output_products},
             tile_size=tile_size_i,
             overlap=int(overlap),
@@ -745,12 +792,11 @@ def run_fiber_trace_3d_inference(
             profile_pipeline=bool(profile_pipeline),
             product_accumulator_dtype=str(product_accumulator_dtype),
             accumulator_workers=int(accumulator_workers),
-            live_cache=_live_cache,
+            input_level=input_level,
         )
-        if _live_cache is not None:
-            _live_cache.close()
-            provenance["inference"]["live_fetch"]["final_stats"] = _live_cache.snapshot()
-            write_provenance(provenance_path, provenance)
+        input_level.close()
+        provenance["inference"]["input"]["final_stats"] = input_level.snapshot()
+        write_provenance(provenance_path, provenance)
         del model
         if torch_device.type == "cuda":
             torch.cuda.empty_cache()
@@ -785,9 +831,8 @@ def run_fiber_trace_3d_inference(
             flush=True,
         )
     except BaseException as error:
-        if _live_cache is not None:
-            _live_cache.close()
-            provenance["inference"]["live_fetch"]["final_stats"] = _live_cache.snapshot()
+        input_level.close()
+        provenance["inference"]["input"]["final_stats"] = input_level.snapshot()
         finalize_document(
             provenance, path=provenance_path,
             status="interrupted" if isinstance(error, KeyboardInterrupt) else "failed",
@@ -809,14 +854,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--input", required=True, help="Input zarr array (3D ZYX).")
     parser.add_argument("--output", required=True, help="Output compact .zarr store (legacy sidecars remain resumable).")
     parser.add_argument("--output-format", choices=("compact", "legacy"), default="compact")
-    parser.add_argument("--blank-invalid", action=argparse.BooleanOptionalAction, default=True,
-                        help="Zero other Fiber channels wherever quantized presence is zero.")
+    parser.add_argument("--blank-invalid", action=argparse.BooleanOptionalAction, default=False,
+                        help="Zero other Fiber channels wherever quantized presence is zero (off: store every prediction; validity is chunk existence).")
     parser.add_argument("--width-uint8-base", action=argparse.BooleanOptionalAction, default=True,
                         help="Export width rounded/clamped to uint8 base-volume voxels.")
     parser.add_argument("--checkpoint", required=True, help="Fiber trace 3D model checkpoint (.pt).")
     parser.add_argument("--tile-size", type=int, default=None, help="Inference tile cube size.")
-    parser.add_argument("--overlap", type=int, default=16, help="Tile overlap in input voxels.")
+    parser.add_argument("--overlap", type=int,
+                        help="Tile overlap in input voxels (default: max(16, 2 * border)); "
+                             "must be at least twice the border and smaller than the tile size.")
     parser.add_argument("--border", type=int, default=16, help="Hard discard border at tile edges.")
+    parser.add_argument("--adopt-unrecorded-tiling", action="store_true",
+                        help="Resume output stores that record no tiling as if predicted with this tiling; "
+                             "only for chunks you know were.")
     parser.add_argument(
         "--inference-scaledown-power", type=int, default=None,
         help="Total power-of-two output reduction relative to input, including model stride. "
@@ -883,20 +933,20 @@ def main(argv: list[str] | None = None) -> int:
         help="Spawned chunk accumulation processes (default: min(CPU count, 32)); 0 is synchronous.",
     )
     parser.add_argument(
-        "--download-workers", type=int, default=64,
-        help="Parallel S3 chunk download threads used by automatic download.",
+        "--input-disk-cache-dir", default=None,
+        help="vc_reader disk cache for a remote --input; chunks are kept decoded there across runs.",
     )
     parser.add_argument(
-        "--live-fetch", action="store_true",
-        help="Fetch the selected input scale lazily and evict only safe old Z-chunk planes.",
+        "--input-disk-cache-gib", type=float, default=None,
+        help="Bound on the input disk cache in GiB; past it the least recently used chunks are removed.",
     )
     parser.add_argument(
-        "--live-cache-gib", type=float, default=None,
-        help=f"Selected-scale disk-cache target in GiB (default: {DEFAULT_LIVE_CACHE_GIB}).",
+        "--input-connections", type=int, default=DEFAULT_INPUT_CONNECTIONS,
+        help=f"Parallel remote input reads (default: {DEFAULT_INPUT_CONNECTIONS}).",
     )
     parser.add_argument(
-        "--live-fetch-ahead-tiles", type=int, default=None,
-        help=f"Lazy materialization lookahead in canonical tiles (default: {DEFAULT_LIVE_FETCH_AHEAD_TILES}).",
+        "--read-ahead-tiles", type=int, default=DEFAULT_READ_AHEAD_TILES,
+        help=f"Tiles of a remote input read ahead into the caches (default: {DEFAULT_READ_AHEAD_TILES}).",
     )
     parser.add_argument(
         "--base-ref",
@@ -904,12 +954,6 @@ def main(argv: list[str] | None = None) -> int:
         help="Reference zarr for base shape. With --base-scale N, base = ref_shape * 2^N.",
     )
     parser.add_argument("--base-scale", type=int, default=None, help="Downsample exponent for --base-ref.")
-    parser.add_argument(
-        "--no-download",
-        action="store_true",
-        default=False,
-        help="Skip automatic S3 download from _download zarr metadata.",
-    )
     parser.add_argument(
         "--levels",
         type=int,
@@ -938,8 +982,14 @@ def main(argv: list[str] | None = None) -> int:
         help="Manager-provided portable source/model context JSON.",
     )
     args = parser.parse_args(argv)
-    if int(args.download_workers) <= 0:
-        parser.error("--download-workers must be a positive integer")
+    if int(args.input_connections) <= 0:
+        parser.error("--input-connections must be a positive integer")
+    if int(args.read_ahead_tiles) <= 0:
+        parser.error("--read-ahead-tiles must be > 0")
+    if args.input_disk_cache_gib is not None and (
+        not math.isfinite(float(args.input_disk_cache_gib)) or float(args.input_disk_cache_gib) <= 0
+    ):
+        parser.error("--input-disk-cache-gib must be finite and > 0")
     if int(args.flush_workers) < 0:
         parser.error("--flush-workers must be >= 0")
     if int(args.accumulator_workers) < 0:
@@ -950,12 +1000,6 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--input-cache-gib must be finite and >= 0")
     if int(args.input_io_threads) <= 0:
         parser.error("--input-io-threads must be > 0")
-    if not args.live_fetch and (args.live_cache_gib is not None or args.live_fetch_ahead_tiles is not None):
-        parser.error("--live-cache-gib/--live-fetch-ahead-tiles require --live-fetch")
-    if args.live_fetch and args.no_download:
-        parser.error("--live-fetch conflicts with --no-download")
-    if args.live_fetch and args.crop_xyzwhd is not None:
-        parser.error("--live-fetch supports only full, non-cropped inference")
 
     run_fiber_trace_3d_inference(
         config_path=args.config,
@@ -965,19 +1009,19 @@ def main(argv: list[str] | None = None) -> int:
         output_format=args.output_format,
         blank_invalid=args.blank_invalid,
         width_uint8_base=args.width_uint8_base,
+        adopt_unrecorded_tiling=args.adopt_unrecorded_tiling,
         device=args.device,
         devices=args.devices,
         crop_xyzwhd=tuple(int(v) for v in args.crop_xyzwhd) if args.crop_xyzwhd else None,
         tile_size=args.tile_size,
-        overlap=int(args.overlap),
+        overlap=args.overlap,
         border=int(args.border),
         inference_scaledown_power=args.inference_scaledown_power,
         base_ref=args.base_ref,
         base_scale=args.base_scale,
-        no_download=bool(args.no_download),
         levels=int(args.levels),
         ome_chunk=int(args.ome_chunk),
-        ome_compressor=str(args.ome_compressor),
+        ome_compressor=args.ome_compressor,
         pyramid_workers=int(args.pyramid_workers),
         recurrent_steps=args.recurrent_steps,
         prefetch_workers=int(args.prefetch_workers),
@@ -990,15 +1034,12 @@ def main(argv: list[str] | None = None) -> int:
         profile_pipeline=bool(args.profile_pipeline),
         inference_precision=str(args.inference_precision),
         product_accumulator_dtype=str(args.product_accumulator_dtype),
-        download_workers=int(args.download_workers),
-        live_fetch=bool(args.live_fetch),
-        live_cache_gib=(
-            DEFAULT_LIVE_CACHE_GIB if args.live_cache_gib is None else float(args.live_cache_gib)
+        input_disk_cache_dir=args.input_disk_cache_dir,
+        input_disk_cache_gib=(
+            None if args.input_disk_cache_gib is None else float(args.input_disk_cache_gib)
         ),
-        live_fetch_ahead_tiles=(
-            DEFAULT_LIVE_FETCH_AHEAD_TILES
-            if args.live_fetch_ahead_tiles is None else int(args.live_fetch_ahead_tiles)
-        ),
+        input_connections=int(args.input_connections),
+        read_ahead_tiles=int(args.read_ahead_tiles),
         provenance_context_path=args.provenance_context,
     )
     return 0

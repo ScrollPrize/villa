@@ -91,21 +91,24 @@ choose the **Fiber inference** role. The browser accepts directories as well as
 JSON manifests, locally or remotely. In the annotation
 window's menu, **Tracing / annotation normals** selects:
 
-- **Predicted fiber normals** — requires `sheet_nx`, `sheet_ny`, and
-  `sheet_grad_mag`; reports an error rather
-  than silently falling back when they are unavailable.
+- **Predicted fiber normals** — requires `sheet_nx` and `sheet_ny`; reports an
+  error rather than silently falling back when they are unavailable.
 - **Lasagna normals** — explicitly uses the external Lasagna dataset even when
   the fiber volume supplies normals.
 
-There is no Automatic option. Attaching the first dataset initializes an unset
-project choice to **Predicted fiber normals** when the selected fiber dataset
-contains `sheet_nx`, `sheet_ny`, and `sheet_grad_mag`; otherwise it selects
-**Lasagna normals**. An existing Lasagna selection is preserved. Subsequent
-attachments and dataset changes never override the saved choice. User changes
-are persisted in the `.vcproj` view field `annotation_normal_source` (`fiber`
-or `lasagna`), independently for each project and across reopening. Legacy
-projects without that field use Lasagna until initial attachment setup or an
-explicit user selection. Tracing never silently switches sources.
+When the selected fiber dataset has predicted normals, they are the default,
+whatever datasets are attached and in whatever order. Lasagna normals replace
+them only after choosing **Lasagna normals** in this menu; attaching or
+selecting a Lasagna dataset does not do it. The choice is stored for that fiber
+dataset, in the project view field `lasagna_normal_choices`, and does not carry
+over to another fiber dataset. Choosing **Predicted fiber normals** removes it.
+Without a fiber dataset that has predicted normals, Lasagna normals are used.
+Choices written by versions that set `annotation_normal_source` on attachment
+are ignored. Tracing never falls back to Lasagna instead of available predicted
+normals.
+
+Without a selected fiber dataset, the first attached one with predicted normals
+is used, else the first attached one.
 
 A compound volume with predicted normals needs **no attached Lasagna volume**
 for seeding, tracing, reoptimization, generated views, or alignment metrics.

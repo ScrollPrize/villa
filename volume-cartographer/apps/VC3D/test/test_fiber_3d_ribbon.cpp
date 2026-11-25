@@ -5,7 +5,7 @@
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/fiber_tracer/FiberDisplay.hpp"
 #include <QTemporaryDir>
-#include <QTest>
+#include "support/QtTestCompat.hpp"
 
 using namespace vc3d::fibers3d;
 

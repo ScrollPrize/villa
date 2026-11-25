@@ -29,10 +29,14 @@ void TestLineAnnotationCoordinateScale::normalSourceSelection()
     QCOMPARE(normals.workingToBaseScale, 4.0);
     QCOMPARE(*normals.groupForChannel("nx")->channelIndex("nx"), size_t(4));
     QCOMPARE(*normals.groupForChannel("ny")->channelIndex("ny"), size_t(5));
-    QCOMPARE(*normals.groupForChannel("grad_mag")->channelIndex("grad_mag"), size_t(6));
+    QVERIFY(normals.groupForChannel("grad_mag") == nullptr);
+    QCOMPARE(normals.validityChannel, std::string("presence"));
+    // Old data keeps its sheet_grad_mag channel; dropping it changes nothing.
+    manifest.groups.front().channels.pop_back();
+    QVERIFY(usePredictedFiberNormals(manifest, "fiber"));
     manifest.groups.front().channels.pop_back();
     QVERIFY(!usePredictedFiberNormals(manifest, "lasagna"));
-    QVERIFY_EXCEPTION_THROWN(usePredictedFiberNormals(manifest, "fiber"), std::invalid_argument);
+    QVERIFY(!usePredictedFiberNormals(manifest, "fiber"));
     QVERIFY_EXCEPTION_THROWN(usePredictedFiberNormals(manifest, "typo"), std::invalid_argument);
 }
 

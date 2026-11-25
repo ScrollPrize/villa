@@ -261,3 +261,30 @@ def test_native_artifact_parameter_parity():
     for level in [None, -1, 2.5, "2", 2, 5, 6, 10**40]:
         raw = {"type": "surface-prediction-zarr", "parameters": {"level": level}}
         assert Artifact.from_json(raw).level == _catalog.parse_artifacts([raw])[0].level
+
+
+def test_a_downloaded_catalog_loads_when_its_cache_cannot_be_written(tmp_path):
+    import http.server, threading
+    from pathlib import Path
+    import pytest
+
+    fixtures = Path(__file__).resolve().parent / 'fixtures/training'
+
+    class Handler(http.server.SimpleHTTPRequestHandler):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, directory=str(fixtures), **kwargs)
+
+        def log_message(self, *args):
+            pass
+
+    not_a_directory = tmp_path / 'file'
+    not_a_directory.write_text('')
+    server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        with pytest.warns(UserWarning):
+            c = Catalog.load(f'http://127.0.0.1:{server.server_port}/catalog.json', cache_dir=not_a_directory / 'cache')
+        assert c.samples['PHerc0009B'].id == 'PHerc0009B'
+    finally:
+        server.shutdown()
+        server.server_close()

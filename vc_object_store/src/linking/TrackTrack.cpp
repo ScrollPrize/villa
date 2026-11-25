@@ -2,7 +2,7 @@
 #include "vc_object_store/TrackCrossings.hpp"
 #include "linking/Detectors.hpp"
 #include "linking/StoredGeometry.hpp"
-#include "formats/TrackInput.hpp"
+#include "vc_object_store/objects/TrackDatasets.hpp"
 
 #include <algorithm>
 #include <charconv>
@@ -42,50 +42,62 @@ detail::Detection detail::detectTracksToTracks(StoredGeometry& inputs, const Tra
     StaleEdgeScope scope{{params.edgeKind}, {}};
     try {
         checkCancelled(cancel);
-        std::map<std::string, std::vector<objects::ObjectRecord>> datasets;
-        for (auto& object : inputs.select("track", params.trackUuids)) {
+        // The registered tracks, with the dataset each belongs to.
+        auto selected = inputs.select("track", params.trackUuids);
+        std::set<std::string> datasetNames;
+        std::vector<const std::string*> datasetOf;
+        datasetOf.reserve(selected.size());
+        for (const auto& object : selected) {
             if (!object.track || object.track->datasetRef.empty())
                 throw std::runtime_error("track has no dataset_ref: " + object.uuid);
-            datasets[inputs.sourcePath(object).generic_string()].push_back(std::move(object));
+            datasetOf.push_back(&*datasetNames.insert(inputs.sourcePath(object).generic_string()).first);
         }
         if (!params.datasetRef.empty()) {
             const auto requested = std::filesystem::weakly_canonical(params.datasetRef).generic_string();
-            for (auto it = datasets.begin(); it != datasets.end();) {
-                // A raw spelling identifies its whole resolved group, including
-                // inherited/overridden peers whose locators were rebased.
-                const bool matches = it->first == requested || std::any_of(it->second.begin(), it->second.end(),
-                    [&](const auto& object) { return object.track->datasetRef == params.datasetRef; });
-                if (matches) { ++it; continue; }
-                if (!params.trackUuids.empty()) throw std::runtime_error("selected track is outside dataset_ref");
-                it = datasets.erase(it);
+            // A raw spelling identifies its whole resolved group, including
+            // inherited/overridden peers whose locators were rebased.
+            std::set<const std::string*> matching;
+            for (size_t row = 0; row < selected.size(); ++row)
+                if (*datasetOf[row] == requested || selected[row].track->datasetRef == params.datasetRef)
+                    matching.insert(datasetOf[row]);
+            std::vector<objects::ObjectRecord> keptObjects;
+            std::vector<const std::string*> keptDatasets;
+            for (size_t row = 0; row < selected.size(); ++row) {
+                if (matching.contains(datasetOf[row])) {
+                    keptObjects.push_back(std::move(selected[row]));
+                    keptDatasets.push_back(datasetOf[row]);
+                } else if (!params.trackUuids.empty()) {
+                    throw std::runtime_error("selected track is outside dataset_ref");
+                }
             }
-            if (datasets.empty()) throw std::runtime_error("no registered tracks for dataset_ref: " + params.datasetRef);
+            if (keptObjects.empty()) throw std::runtime_error("no registered tracks for dataset_ref: " + params.datasetRef);
+            selected = std::move(keptObjects);
+            datasetOf = std::move(keptDatasets);
         }
+        // Views of the records that stay in `selected` from here on.
+        std::vector<objects::TrackDatasetRow> registered;
+        registered.reserve(selected.size());
+        for (size_t row = 0; row < selected.size(); ++row)
+            registered.push_back({selected[row].uuid, *datasetOf[row], selected[row].track->externalKey,
+                                  selected[row].track->family});
 
-        for (auto& [dataset, objects] : datasets) {
-            report.objectsConsidered += objects.size();
+        // Grouping, source-ID order and their validation are the shared
+        // preparation (objects::groupTrackDatasets).
+        for (const auto& group : objects::groupTrackDatasets(registered)) {
+            const auto& dataset = group.dataset;
+            report.objectsConsidered += group.rows.size();
             checkCancelled(cancel);
-            std::map<uint64_t, objects::ObjectRecord*> byId;
-            for (auto& object : objects) {
-                const auto id = objects::detail::trackSourceId(object.track->externalKey);
-                if (!byId.emplace(id, &object).second)
-                    throw std::runtime_error("duplicate registered track source ID");
-            }
             std::vector<int32_t> coordinateBuffer;
             std::vector<int64_t> offsets{0};
-            std::vector<uint64_t> sourceIds;
-            std::vector<int8_t> families;
+            const auto& sourceIds = group.sourceIds;
+            const auto& families = group.families;
             std::vector<const objects::ObjectRecord*> rows;
-            size_t loaded = 0;
-            for (const auto& [id, object] : byId) {
-                objects::util::reportProgress(progressCallback, "loading track geometry", loaded++, byId.size());
+            for (size_t loaded = 0; loaded < group.rows.size(); ++loaded) {
+                objects::util::reportProgress(progressCallback, "loading track geometry", loaded, group.rows.size());
                 checkCancelled(cancel);
+                const auto* object = &selected[group.rows[loaded]];
                 const auto geometry = inputs.load(*object);
                 const auto xyz = geometry.values<int32_t>("points");
-                const auto familyName = object->track->family;
-                if (!familyName.empty() && familyName != "horizontal" && familyName != "vertical")
-                    throw std::runtime_error("invalid stored track family");
-                const int8_t family = familyName == "horizontal" ? 0 : familyName == "vertical" ? 1 : -1;
                 const auto count = xyz.size() / 3;
                 if (count > std::numeric_limits<int32_t>::max()
                     || uint64_t(offsets.back()) + count > std::numeric_limits<uint32_t>::max())
@@ -97,12 +109,10 @@ detail::Detection detail::detectTracksToTracks(StoredGeometry& inputs, const Tra
                     coordinateBuffer.push_back(xyz[3*i]);
                 }
                 offsets.push_back(offsets.back() + static_cast<int64_t>(count));
-                sourceIds.push_back(id);
-                families.push_back(family);
                 rows.push_back(object);
                 scope.objectUuids.push_back(object->uuid);
             }
-            objects::util::reportProgress(progressCallback, "loading track geometry", byId.size(), byId.size());
+            objects::util::reportProgress(progressCallback, "loading track geometry", group.rows.size(), group.rows.size());
             const std::span<const int32_t> coordinates(coordinateBuffer);
             std::vector<uint64_t> packed(coordinates.size() / 3);
             for (size_t i = 0; i < packed.size(); ++i) {
