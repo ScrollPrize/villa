@@ -221,12 +221,24 @@ private:
     std::atomic<bool> stopping_{false};
 };
 
+// Holds a function-local static pool. On Windows a DLL's static destructors run
+// during process exit, after the OS has ended every other thread, so joining the
+// workers there never returns (#1686). Elsewhere unloading the library must still
+// join them before their code is unmapped.
+struct StaticPool {
+    explicit StaticPool(std::size_t threads) : pool(new ThreadPool(threads)) {}
+#ifndef _WIN32
+    ~StaticPool() { delete pool; }
+#endif
+    ThreadPool* const pool;
+};
+
 // Sampling, transfer and projection share a bounded pool rather than each
 // retaining their own workers. Small callers can still execute synchronously.
 inline ThreadPool& samplingPool()
 {
-    static ThreadPool pool(std::min(8u, std::max(1u, std::thread::hardware_concurrency())));
-    return pool;
+    static StaticPool pool(std::min(8u, std::max(1u, std::thread::hardware_concurrency())));
+    return *pool.pool;
 }
 
 // The workers of every array asking for `threads` workers: arrays open at the same

@@ -100,11 +100,13 @@ void SurfaceStoreEdit::settlePending()
 }
 
 void SurfaceStoreEdit::save(QuadSurface& surface, const cv::Rect& rect, const std::vector<std::string>& channels,
-                            std::optional<uint64_t> draftRevision)
+                            std::optional<uint64_t> draftRevision, const std::optional<std::string>& geometryRevision)
 {
     // One save at a time: each starts from the version the previous one committed.
     std::lock_guard lock(_mutex);
     settlePending();
+    if (geometryRevision && _pin.geometryRevision != geometryRevision)
+        throw std::runtime_error("The surface was saved again since this copy was made; reopen it before saving");
     const auto& points = *surface.rawPointsPtr();
     auto request = _session->newRequest(_pin.attachment);
     request.generation = _pin.writeGeneration;

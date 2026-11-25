@@ -6,6 +6,7 @@
 #include <opencv2/core.hpp>
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -37,9 +38,10 @@ GridMesh meshGrid(const cv::Mat_<cv::Vec3f>& points);
 // stride). Vertices are matched by grid position: fine cell (r, c) lies at
 // (r, c) / stride in the decimated grid, so a vertex on a decimated sample takes
 // that sample's UV exactly and one inside a decimated quad the barycentric mix
-// of the quad's triangle. A vertex outside the decimated quads (a hole, or the
-// rows/columns after the last sample) takes the nearest decimated vertex within
-// two cells; with none it stays invalid.
+// of the quad's triangle. A vertex outside the decimated quads (a hole, a
+// border narrower than the stride, or the rows/columns after the last sample)
+// continues the affine map of the nearest decimated quad within two cells, so
+// it keeps its own place in UV space; with none it stays invalid.
 struct LiftedUVs {
     std::vector<cv::Vec2f> uvs;
     std::vector<uint8_t> valid;
@@ -78,6 +80,9 @@ public:
     // Grid cells per UV unit of the source surface: the output grid gets the
     // source's sampling density and scale.
     void setSrcScale(const cv::Vec2f& s) { src_scale = s; }
+    // UV bounds that fix the grid's spacing and sample positions; the grid
+    // extends past them by whole cells to cover every face.
+    void setGridBounds(const cv::Vec2f& min, const cv::Vec2f& max) { grid_min = min; grid_max = max; }
 
     void setMesh(std::vector<cv::Vec3f> vertices, std::vector<cv::Vec2f> uvs, std::vector<UvFace> faces);
 
@@ -102,6 +107,7 @@ private:
     float uv_downsample = 1.0f;            // user-specified uniform decimation
     uint64_t grid_cap_pixels = 0;          // cap total pixel count (0=off)
     cv::Vec2f src_scale = cv::Vec2f(0.f, 0.f);  // <=0 = unset
+    std::optional<cv::Vec2f> grid_min, grid_max;
 };
 
 // Rasterizes a UV-mapped triangle mesh onto a grid `step` voxels apart: the

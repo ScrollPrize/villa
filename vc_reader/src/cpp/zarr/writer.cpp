@@ -82,6 +82,7 @@ EncodeOptions encodeOptions(const Json& compressor)
     o.blocksize = compressor.value("blocksize", o.blocksize);
     o.q = compressor.value("q", o.q);
     o.checksum = compressor.value("checksum", false);
+    o.channel_axis = compressor.value("channel_axis", std::string());
     return o;
 }
 
@@ -98,7 +99,13 @@ Json compressorConfig(const CreateOptions& options)
     if (id == "lz4")
         return {{"id", "lz4"}, {"acceleration", level > 0 ? level : 1}};
     if (id == "vc-delta3d")
-        return {{"id", "vc-delta3d"}, {"quant", 1}};
+    {
+        Json config{{"id", "vc-delta3d"}, {"quant", 1}};
+        // The codec needs to be told which axis of a 4-D chunk holds the channels.
+        if (options.chunks.size() == 4)
+            config["channel_axis"] = options.channelAxis.empty() ? "first" : options.channelAxis;
+        return config;
+    }
     if (id == "volcomp")
         return {{"id", "volcomp"}, {"q", level >= 0 ? double(level) : 8.0}};
     throw std::invalid_argument("cannot write Zarr chunks compressed with '" + id + "'");
@@ -359,6 +366,7 @@ CreateOptions createOptionsLike(const ArrayMeta& meta)
         options.level = options.compressor == "volcomp" ? int(encode.q) : encode.level;
         options.cname = encode.cname;
         options.shuffle = encode.shuffle;
+        options.channelAxis = encode.channel_axis;
     }
     if (meta.v3) {
         options.version = 3;
@@ -444,8 +452,10 @@ Writer Writer::create(const fs::path& path, const CreateOptions& options, const 
     const auto codec = parse_chunk_codec(meta.codec());
     if (codec == Codec::Volcomp && (meta.itemsize() != 1 || meta.chunks != Index{128, 128, 128}))
         throw std::invalid_argument("volcomp requires uint8 data and 128^3 chunks");
-    if (codec == Codec::Delta3d && (meta.chunks.size() != 3 || meta.type.kind != 'u' || meta.itemsize() > 2))
-        throw std::invalid_argument("vc-delta3d requires 3-D uint8 or uint16 chunks");
+    if (codec == Codec::Delta3d &&
+        (!delta3d_layout_supported(meta.chunks.size(), encodeOptions(meta.compressor).channel_axis) ||
+         meta.type.kind != 'u' || meta.itemsize() > 2))
+        throw std::invalid_argument("vc-delta3d requires 3-D, or 4-D with channel axis first or last, uint8 or uint16 chunks");
     if (options.version == 3) {
         zarray = v3Metadata(meta, options);
         meta = parseArrayMeta(zarray);

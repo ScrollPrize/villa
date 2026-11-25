@@ -12,6 +12,9 @@
 #include <vc_object_store/geometry/Geometry.hpp>
 
 #include <opencv2/imgproc.hpp>
+// getRotationMatrix2D and invertAffineTransform: imgproc in OpenCV 4, the
+// geometry module in OpenCV 5.1.
+#include "vc/core/util/OpenCvCompat.hpp"
 
 #include <array>
 #include <cstdlib>

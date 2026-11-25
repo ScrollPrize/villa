@@ -60,6 +60,16 @@ QString transformPersistenceUnavailableTooltip(const vc3d::surface_rotation::Tra
         "transformed safely.");
 }
 
+void warnTransformNotApplied()
+{
+    QMessageBox::information(
+        nullptr,
+        QObject::tr("Surface Transform Cancelled"),
+        QObject::tr("The transform was not applied: the segment was deselected, reopened or saved again "
+                    "while Rotate was open, or its stored revision could not be read. Open Rotate again "
+                    "on the segment as it is now."));
+}
+
 class RotationDial final : public QWidget
 {
 public:
@@ -313,8 +323,15 @@ void SurfaceRotationOverlayController::beginRotate()
         return;
     }
 
+    const auto sourceSurfaceId = _state->activeSurfaceId();
     cancelRotate();
     _sourceSurface = std::move(source);
+    _sourceSurfaceId = sourceSurfaceId;
+    // The revision of the geometry this tool transforms (Apply saves only over it).
+    _sourceRevision = _sourceRevisionReader ? _sourceRevisionReader(_sourceSurface.get())
+                      : _revisionReader     ? _revisionReader(_sourceSurfaceId)
+                                            : std::nullopt;
+    _shownSurface = _state->surface("segmentation");
     _angleDeg = 0.0;
     _horizontalFlip = false;
     _rotateActive = true;
@@ -334,13 +351,8 @@ void SurfaceRotationOverlayController::cancelRotate()
     // cancelled-session's transformed output either. A user who
     // wants the on-disk transformed state can reopen the segment.
     if (_rotateActive && _state && _sourceSurface && !_saveInFlight) {
-        showActive(_sourceSurface);
+        releaseSource();
     }
-    _rotateActive = false;
-    _angleDeg = 0.0;
-    _horizontalFlip = false;
-    _sourceSurface.reset();
-    _previewSurface.reset();
     // Invalidate any in-flight save worker — the session it was
     // started for is over, so its completion callback will see a
     // mismatched session id and drop its state changes. We do NOT
@@ -351,7 +363,77 @@ void SurfaceRotationOverlayController::cancelRotate()
     // same segment). The finished slot clears _saveInFlight whether
     // it applies or drops the result.
     ++_saveSessionId;
+    closeRotate();
+}
+
+void SurfaceRotationOverlayController::closeRotate()
+{
+    _rotateActive = false;
+    _angleDeg = 0.0;
+    _horizontalFlip = false;
+    _sourceSurface.reset();
+    _previewSurface.reset();
+    _shownSurface.reset();
+    _sourceSurfaceId.clear();
+    _sourceRevision.reset();
     clearWidgets();
+}
+
+bool SurfaceRotationOverlayController::isOpen() const
+{
+    return _rotateActive && _state && _state->surface("segmentation") == _shownSurface;
+}
+
+bool SurfaceRotationOverlayController::sourceSelected() const
+{
+    // Not when the user selected another surface, cleared the selection or reopened the segment
+    // (e.g. CWindow reopens it after another client saved it).
+    return _state && _sourceSurface && !_sourceSurfaceId.empty() &&
+           _state->activeSurfaceId() == _sourceSurfaceId && _state->activeSurface().lock() == _sourceSurface &&
+           _state->surface("segmentation") == _shownSurface;
+}
+
+bool SurfaceRotationOverlayController::sourceCurrent() const
+{
+    // E.g. the surface panel's Flip, an autosave or another client saved the segment meanwhile.
+    // A revision that is not known (not stored, or the store did not answer) never matches.
+    if (!_revisionReader) {
+        return true;
+    }
+    const auto stored = _revisionReader(_sourceSurfaceId);
+    return _sourceRevision && stored && *stored == *_sourceRevision;
+}
+
+bool SurfaceRotationOverlayController::newerRevisionStored() const
+{
+    if (!_revisionReader || !_sourceRevision) {
+        return false;
+    }
+    const auto stored = _revisionReader(_sourceSurfaceId);
+    return stored && *stored != *_sourceRevision;
+}
+
+void SurfaceRotationOverlayController::releaseSource()
+{
+    const bool newer = newerRevisionStored();
+    if (!newer && sourceSelected()) {
+        endPreview(_sourceSurface);
+        return;
+    }
+    // A newer revision was saved (the surface panel's Flip, an autosave, another client): the
+    // geometry the tool started from must not stay selected. Open the saved one, so that the next
+    // Rotate, the surface panel and the agent bridge continue from it; failing that, deselect.
+    if (newer && _state->activeSurfaceId() == _sourceSurfaceId &&
+        _state->activeSurface().lock() == _sourceSurface) {
+        if (_reopener && _reopener(_sourceSurfaceId)) {
+            return;
+        }
+        _state->clearActiveSurface();
+    }
+    // Take the preview down where it is still shown; another selection stays as it is.
+    if (_state->surface("segmentation") == _shownSurface) {
+        showActive(_sourceSurface);
+    }
 }
 
 void SurfaceRotationOverlayController::attachViewer(VolumeViewerBase* viewer)
@@ -552,6 +634,11 @@ void SurfaceRotationOverlayController::updatePreview()
     if (_saveInFlight) {
         return;
     }
+    // Another surface was selected, the selection cleared or the segment reopened: leave it
+    // (Apply then closes the tool).
+    if (!sourceSelected()) {
+        return;
+    }
 
     synchronizeTransformPersistenceCompatibility();
     const vc3d::surface_rotation::Transform transform{static_cast<float>(_angleDeg), _horizontalFlip};
@@ -571,8 +658,23 @@ void SurfaceRotationOverlayController::updatePreview()
 
 void SurfaceRotationOverlayController::showActive(const std::shared_ptr<QuadSurface>& surface)
 {
+    // Showing a preview replaces the selected surface, so CWindow drops it as the active one
+    // (onSurfaceWillBeDeleted): the segment stays selected while the tool shows it.
+    const bool selected = sourceSelected();
     // CState drafts the shown surface, so store queries see the preview's grid.
     _state->setSurface("segmentation", surface, false, true);
+    _shownSurface = surface;
+    if (selected) {
+        _state->setActiveSurface(_sourceSurfaceId, _sourceSurface);
+    }
+}
+
+void SurfaceRotationOverlayController::endPreview(const std::shared_ptr<QuadSurface>& surface)
+{
+    // `surface` is the selected segment now; made active before it replaces the preview.
+    _state->setActiveSurface(_sourceSurfaceId, surface);
+    _state->setSurface("segmentation", surface, false, true);
+    _shownSurface = surface;
 }
 
 void SurfaceRotationOverlayController::applyRotation()
@@ -590,6 +692,17 @@ void SurfaceRotationOverlayController::applyRotation()
         return;
     }
 
+    const vc3d::surface_rotation::Transform transform{static_cast<float>(_angleDeg), _horizontalFlip};
+    // Save only over the selected segment as the tool opened it: never select it again after the
+    // user moved on, and never overwrite a newer save.
+    if (!sourceSelected() || !sourceCurrent()) {
+        cancelRotate();
+        if (!transform.isNoOp()) {
+            warnTransformNotApplied();
+        }
+        return;
+    }
+
     const bool persistenceAvailable = synchronizeTransformPersistenceCompatibility();
     if (!persistenceAvailable) {
         QMessageBox::warning(
@@ -599,17 +712,10 @@ void SurfaceRotationOverlayController::applyRotation()
         return;
     }
 
-    const vc3d::surface_rotation::Transform transform{static_cast<float>(_angleDeg), _horizontalFlip};
-
     // No transform: no I/O, nothing to do off-thread.
     if (transform.isNoOp()) {
-        showActive(_sourceSurface);
-        _rotateActive = false;
-        _angleDeg = 0.0;
-        _horizontalFlip = false;
-        _previewSurface.reset();
-        _sourceSurface.reset();
-        clearWidgets();
+        endPreview(_sourceSurface);
+        closeRotate();
         return;
     }
 
@@ -660,15 +766,8 @@ void SurfaceRotationOverlayController::applyRotation()
                 }
 
                 if (!result.error.isEmpty() || !result.surface) {
-                    if (self->_sourceSurface) {
-                        self->showActive(self->_sourceSurface);
-                    }
-                    self->clearWidgets();
-                    self->_rotateActive = false;
-                    self->_angleDeg = 0.0;
-                    self->_horizontalFlip = false;
-                    self->_previewSurface.reset();
-                    self->_sourceSurface.reset();
+                    self->releaseSource();
+                    self->closeRotate();
                     QMessageBox::warning(
                         nullptr,
                         tr("Surface Transform Failed"),
@@ -676,22 +775,31 @@ void SurfaceRotationOverlayController::applyRotation()
                     return;
                 }
 
-                if (!self->_saver || !self->_saver(result.surface.get())) {
-                    if (self->_sourceSurface) {
-                        self->showActive(self->_sourceSurface);
+                // The selection or the stored segment changed while the transform ran.
+                if (!self->sourceSelected() || !self->sourceCurrent()) {
+                    self->cancelRotate();
+                    warnTransformNotApplied();
+                    return;
+                }
+
+                // The store edit refuses the save unless it still holds the geometry revision the
+                // transform started from (a save that finished or was resolved meanwhile wins).
+                if (!self->_saver || !self->_saver(result.surface.get(), self->_sourceRevision)) {
+                    self->releaseSource();
+                    // The failed save can stay pending in the segment's store edit, and the next save
+                    // through it commits it first: continue only from the segment reopened.
+                    if (self->sourceSelected() && !(self->_reopener && self->_reopener(self->_sourceSurfaceId))) {
+                        self->_state->clearActiveSurface();
                     }
+                    self->closeRotate();
                     QMessageBox::warning(nullptr, tr("Surface Transform Failed"),
                                          tr("Failed to save the transformed surface to the object store."));
                     return;
                 }
-                self->showActive(result.surface);
-
-                self->_rotateActive = false;
-                self->_angleDeg = 0.0;
-                self->_horizontalFlip = false;
-                self->_previewSurface.reset();
-                self->_sourceSurface.reset();
-                self->clearWidgets();
+                // The saved surface is the segment now: the next Rotate/Flip and other
+                // readers of the active surface continue from it, not from the source.
+                self->endPreview(result.surface);
+                self->closeRotate();
             });
 
     auto future = QtConcurrent::run([surface, transform]() -> RotationSaveResult {

@@ -73,8 +73,8 @@ void row_runs(const std::uint64_t* words, std::size_t nx, Run* runs) {
 }
 
 ThreadPool& pool() {
-    static ThreadPool workers(std::max(1u, std::thread::hardware_concurrency()) - 1);
-    return workers;
+    static StaticPool workers(std::max(1u, std::thread::hardware_concurrency()) - 1);
+    return *workers.pool;
 }
 }
 
