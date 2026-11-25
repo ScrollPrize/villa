@@ -383,6 +383,17 @@ public:
                                const std::filesystem::path& projectDir,
                                const std::string& segment,
                                const OpenOptions& options);
+    // Opens labels for `surface`, whose grid gives the canvas at render scale 1.
+    OpenOutcome openForTesting(const std::shared_ptr<QuadSurface>& surface,
+                               const std::filesystem::path& projectDir,
+                               const std::string& segment,
+                               const OpenOptions& options);
+    OpenOutcome openForTesting(const std::shared_ptr<QuadSurface>& surface,
+                               const std::filesystem::path& projectDir,
+                               const std::string& segment)
+    {
+        return openForTesting(surface, projectDir, segment, OpenOptions{});
+    }
     // Runs the left-press path of the event filter at a label pixel, as if
     // the viewer showed the session surface. Returns whether it was consumed.
     bool pressForTesting(cv::Point2d labelPx, Qt::KeyboardModifiers modifiers = Qt::NoModifier);
@@ -393,6 +404,11 @@ public:
     {
         return _inFlight.value(storeDir).future;
     }
+    // Runs on the worker before each label write, so a test can hold a write
+    // while it acts on the GUI thread.
+    void setWriteGateForTesting(std::function<void()> gate) { _writeGateForTesting = std::move(gate); }
+    // Writes that landed and were applied but whose watchers have not run.
+    [[nodiscard]] int unreportedWritesForTesting() const { return int(_settledWrites.size()); }
     void setPredictionGuideForTesting(std::optional<vc3d::ink_labels::PredictionGuide> guide)
     {
         _guideForTesting = std::move(guide);
@@ -492,8 +508,19 @@ private:
     void updateModeLine();
     // Recomputes the geometry hash after the segment's grid changed.
     void refreshGeometrySha();
+    // Moves the labels when the segment's grid was flipped or turned in
+    // place since they were aligned. False when that closed the session.
+    bool followGridOrder();
+    // The segment's grid was flipped or turned in place: move the labels.
+    void moveLabelsWithGrid(const vc3d::ink_labels::GridReorder& reorder, const cv::Mat_<cv::Vec3f>& points);
     vc3d::ink_labels::SaveRequest makeSaveRequest(vc3d::ink_labels::Target target, bool overwriteExternalEdits);
     QFuture<vc3d::ink_labels::SaveOutcome> startWrite(vc3d::ink_labels::SaveRequest request);
+    // What a finished write does to the session that started it.
+    void applyWriteOutcome(vc3d::ink_labels::Target target, int version, const vc3d::ink_labels::SaveOutcome& outcome);
+    // Waits for the store's running write and applies its outcome to the
+    // session now, instead of when its watcher runs. Returns false when no
+    // write was running.
+    bool settleWrite(const QString& storeKey);
     void startCheckpoint();
     void onAutosaveTick();
     void onStateSurfaceChanged();
@@ -556,6 +583,9 @@ private:
     struct InFlight {
         uint64_t id = 0;
         vc3d::ink_labels::Target target = vc3d::ink_labels::Target::Trainer;
+        // The label version the write goes to; Save as new version writes
+        // the next one.
+        int version = 1;
         QFuture<vc3d::ink_labels::SaveOutcome> future;
         // The store's lock, held until the write lands even if the session
         // closed; reopening the store takes it over.
@@ -563,6 +593,12 @@ private:
     };
     QHash<QString, InFlight> _inFlight;
     uint64_t _nextWriteId = 1;
+    // The lock each store's latest write holds. A settled write's watcher
+    // keeps its lock until it runs, and a reopen of the store takes it over.
+    QHash<QString, std::weak_ptr<QLockFile>> _writeLocks;
+    // Writes settleWrite already applied; their watchers only report.
+    QSet<uint64_t> _settledWrites;
+    std::function<void()> _writeGateForTesting;
     QSet<QString> _checkpointedThisRun;
     std::optional<LastSave> _lastSave;
     QDateTime _lastAutosave;

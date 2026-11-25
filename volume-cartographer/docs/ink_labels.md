@@ -106,6 +106,7 @@ Labels live outside the segment folder, in
   <seg>_inklabels.json             sidecar: canvas, hashes, edit counts
   *.tif.prev                       the previous saved generation
   *.autosave                       autosave checkpoints
+  <seg>_inklabels.json.saving      only while a save runs (see below)
   <seg>_inklabels.lock             held while a VC3D has the labels open
 ```
 
@@ -120,15 +121,27 @@ writes nothing.
 1024, LZW, at the canvas size `vc_render_tifxyz --scale 1` produces for the
 segment, then the sidecar. The trainer and `create_label_zarrs` read the TIFFs
 and ignore the other files. The sidecar records the canvas (grid size and the
-scale's exact float bits), the segment uuid, a hash of the segment's geometry
-and a SHA-256 of each file.
+scale's exact float bits), the segment uuid, a hash of the segment's geometry,
+a few grid vertices with their positions (`grid_anchors`) and a SHA-256 of
+each file.
 
+* **Interrupted saves.** Before it replaces any file, a save writes
+  `<seg>_inklabels[_vN].json.saving` with the new sidecar and the hash of
+  every file it replaces; it removes the record once the sidecar is written.
+  A save that fails puts the previous files back. If VC3D stops in the
+  middle, the next open completes the save when every new file is in place,
+  or puts the `.prev` generation back, and says which. Until then the labels
+  are refused rather than read as a mix of two saves, and the trainer's
+  label discovery and `create_label_zarrs` refuse them too. Files without a
+  record, including every earlier export, read as before.
 * **Autosave.** Two minutes after the last checkpoint, once painting has paused
   for two seconds, unsaved labels are written to the `.autosave` files. They
   never replace the trainer files. Switching segment or closing the project
   checkpoints too. After a crash, opening the labels offers to restore the
   checkpoint. A save deletes the checkpoint, so an undo followed by a save
-  can never bring the undone strokes back. A checkpoint that cannot be
+  can never bring the undone strokes back. Switching segment waits for a
+  save or checkpoint still running and then checkpoints what was painted
+  after it, so later strokes are kept. A checkpoint that cannot be
   restored (written for another canvas, or with an unreadable sidecar) is
   renamed to `*.unusable`, never deleted.
 * **Outside edits.** If a trainer file changed since VC3D loaded or saved it
@@ -143,6 +156,14 @@ and a SHA-256 of each file.
   neither shown nor saved; the dock names both canvases. To carry labels
   across a re-render use `vesuvius.tifxyz_label_transfer`. A geometry edit
   that keeps the grid only warns: labels stay on the same grid positions.
+* **A flipped or turned segment.** Flipping the grid (or a quarter turn of a
+  square grid) keeps its size but moves every vertex, so VC3D compares the
+  saved `grid_anchors` with the grid and moves the labels with their
+  vertices, when they are opened and when the grid changes while they are
+  open. Moved labels are unsaved until saved, and the undo history starts
+  over. A move must be exact: when the label pixels per grid step are not a
+  whole number, the labels lock instead (start a new version to label the
+  turned grid). Labels saved before VC3D wrote anchors cannot be checked.
 * **Closing VC3D** with unsaved labels asks to save, discard or cancel.
 
 ## Importing labels
@@ -170,7 +191,10 @@ The trainer picks the newest `_vN` of each label file. **Save as new
 version** writes all three files as the next version (an all-zero
 validation mask when none is painted), so the newest ink, supervision and
 validation always belong together; the dock then edits that version. The
-version list opens any other version, and the newest opens by default. When
+version list opens any other version, and the newest opens by default; a
+version that was started and painted but never saved is listed and opens from
+its autosave. Asking for a version that does not exist leaves the open labels
+as they are. When
 labels are locked to an old canvas, **Start empty labels in a new version**
 labels the current canvas without touching them.
 
@@ -219,7 +243,8 @@ control of the label section (MCP tools `vc3d_ink_labels_*`): `state`,
 `versions`, `dataset_entry`, `set_tool_state` and `close`, all under
 `ink_labels.`. No method opens a dialog. Agent edits show live in the view,
 are recorded with actor `agent`, and an agent undo stops at the user's edits
-unless forced. See the "Ink labels" section of
+unless forced. That holds for the Undo key too: a Ctrl+Z the bridge sends
+undoes only the agent's own edits. See the "Ink labels" section of
 `apps/VC3D/agent_bridge/SPEC.md`.
 
 ## Pixel mapping

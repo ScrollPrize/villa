@@ -237,6 +237,7 @@ set(srcs
     ink_labels/InkLabelRaster.hpp
     ink_labels/InkLabelStore.cpp
     ink_labels/InkLabelStore.hpp
+    InputOrigin.hpp
     SurfacePanelController.cpp
     SurfacePanelController.hpp
     MenuActionController.cpp

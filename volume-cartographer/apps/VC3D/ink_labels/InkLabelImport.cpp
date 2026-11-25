@@ -479,7 +479,7 @@ ImportOutcome importLabel(const fs::path& path, const vc::RenderCanvas& canvas, 
     return out;
 }
 
-std::vector<int> listVersions(const fs::path& dir, std::string_view prefix)
+std::vector<int> listVersions(const fs::path& dir, std::string_view prefix, VersionFiles files)
 {
     std::set<int> versions;
     std::error_code ec;
@@ -493,13 +493,17 @@ std::vector<int> listVersions(const fs::path& dir, std::string_view prefix)
             if (name.compare(0, head.size(), head) != 0)
                 continue;
             std::string rest = name.substr(head.size());
+            // A checkpoint is its trainer file's name plus ".autosave".
+            if (files == VersionFiles::TrainerAndDrafts && endsWith(rest, ".autosave"))
+                rest.resize(rest.size() - std::string_view(".autosave").size());
             std::string ext;
             for (const char* e : {".tif", ".json"})
                 if (endsWith(rest, e)) {
                     ext = e;
                     break;
                 }
-            // .prev, .autosave and .tmp-* do not end in .tif or .json.
+            // .prev, .tmp-*, .saving and (for trainer files) .autosave do not
+            // end in .tif or .json.
             if (ext.empty())
                 continue;
             rest = rest.substr(0, rest.size() - ext.size());

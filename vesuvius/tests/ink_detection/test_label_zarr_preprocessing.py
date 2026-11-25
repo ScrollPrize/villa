@@ -480,3 +480,37 @@ def test_two_page_tiff_warning_names_the_one_ignored_page(tmp_path, caplog):
     with caplog.at_level("WARNING"):
         convert_image(label_path, levels=1)
     assert "has 2 pages; converting page 1 only (page 2 is ignored)" in caplog.text
+
+
+def test_conversion_refuses_masks_from_an_interrupted_vc3d_save(tmp_path):
+    import hashlib
+    import json
+
+    old_ink = tmp_path / "old_ink.tif"
+    tifffile.imwrite(old_ink, np.zeros((4, 4), dtype=np.uint8))
+    new_ink = tmp_path / "new_ink.tif"
+    tifffile.imwrite(new_ink, np.full((4, 4), 255, dtype=np.uint8))
+    ink = tmp_path / "seg_inklabels.tif"
+    ink.write_bytes(old_ink.read_bytes())
+
+    def sha(path: Path) -> str:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    # The save put a new supervision mask in place but stopped before the ink.
+    supervision = tmp_path / "seg_supervision_mask.tif"
+    tifffile.imwrite(supervision, np.full((4, 4), 255, dtype=np.uint8))
+    record = {
+        "schema": "vc3d.ink_labels.saving/1",
+        "sidecar": {
+            "files": {
+                "inklabels": {"sha256": sha(new_ink)},
+                "supervision_mask": {"sha256": sha(supervision)},
+            }
+        },
+        "replaces": {"inklabels": {"sha256": sha(old_ink)}, "supervision_mask": {"sha256": None}},
+    }
+    (tmp_path / "seg_inklabels.json.saving").write_text(json.dumps(record))
+
+    with pytest.raises(ValueError, match="interrupted VC3D save"):
+        convert_image(ink)
+    assert not (tmp_path / "seg_inklabels.zarr").exists()

@@ -14,6 +14,7 @@
 #include <QWidget>
 
 #include "agent_bridge/AgentBridgeInput.hpp"
+#include "InputOrigin.hpp"
 
 namespace {
 
@@ -26,6 +27,8 @@ bool sendKeyEvent(const QPointer<QWidget>& target, QEvent::Type type, int key,
 {
     if (!target)
         return false;
+    // Shortcuts fire inside sendEvent; this tells them the key is the agent's.
+    const vc3d::AgentInputScope agentInput;
     QKeyEvent event(type, key, modifiers, text, autoRepeat);
     QCoreApplication::sendEvent(target.data(), &event);
     return event.isAccepted();

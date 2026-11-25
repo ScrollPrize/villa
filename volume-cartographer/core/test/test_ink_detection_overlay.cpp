@@ -276,6 +276,45 @@ TEST_CASE("ink detection overlay flips the displayed image")
     CHECK(qRed(overlay.selectedImageForTesting().pixel(2, 1)) == 30);
 }
 
+TEST_CASE("a local ink image is listed and drawn on the segment it was shown on")
+{
+    int argc = 0;
+    QCoreApplication app(argc, nullptr);
+    const fs::path root = tempRoot("local");
+    const fs::path image = root / "plugin-result.png";
+    writeGrayImage(image);
+
+    CState state;
+    // A segment opened from a store: an id, no catalog files.
+    auto segment = makeSurface("0d4f8a52-5b1c-4c56-9a3e-2f1d7a6b9c10");
+    state.setSurface("segmentation", segment, false, false);
+    InkDetectionOverlayController overlay(&state);
+    REQUIRE(overlay.options().empty());
+
+    CHECK_FALSE(overlay.showLocalImage(root / "missing.png", "missing"));
+    CHECK(overlay.options().empty());
+    REQUIRE(overlay.showLocalImage(image, "Plugin: plugin-result.png"));
+    REQUIRE(overlay.options().size() == 1);
+    CHECK(overlay.options().front().local);
+    CHECK(overlay.options().front().label == QStringLiteral("Plugin: plugin-result.png"));
+    CHECK(overlay.selectedPath() == image);
+    CHECK(overlay.hasLoadedSelection());
+    // Drawn on the segment it belongs to, and on no other.
+    CHECK(overlay.drawsOnForTesting(*segment));
+    auto other = makeSurface("other");
+    CHECK_FALSE(overlay.drawsOnForTesting(*other));
+
+    // Another segment does not list it; coming back selects it again.
+    state.setSurface("segmentation", other, false, false);
+    CHECK(overlay.options().empty());
+    CHECK(overlay.selectedPath().empty());
+    state.setSurface("segmentation", segment, false, false);
+    REQUIRE(overlay.options().size() == 1);
+    CHECK(overlay.selectedPath() == image);
+    CHECK(overlay.drawsOnForTesting(*segment));
+    fs::remove_all(root);
+}
+
 TEST_CASE("Project stores are peers with independent persistent per-kind selections")
 {
     const auto project = vc::test::createTestProject();

@@ -7,6 +7,7 @@
 
 #include <functional>
 #include <memory>
+#include <optional>
 
 class QCheckBox;
 class QLockFile;
@@ -34,6 +35,11 @@ public:
         std::function<bool(const QString& path, QString* error)> openProject;
         std::function<bool(const QString& segmentId, QString* error)> activateSegment;
         std::function<void(const QString& text)> showStatus;
+        // The open volume and its voxels, and switching to a volume of the
+        // open project by id. The points go back only into the voxels they
+        // were placed in (at any level of that volume).
+        std::function<std::optional<SessionRecovery::Voxels>()> currentVoxels;
+        std::function<bool(const QString& volumeId, QString* error)> selectVolume;
     };
 
     // Shows the dialog for the newest leftover session of recovery that no
@@ -59,6 +65,9 @@ private:
     void recover();
     void discardCopy();
     [[nodiscard]] bool projectIsOpen() const;
+    // Opens the volume the points were placed in if another is open, and
+    // gives the factor from the copy's voxels to the open ones.
+    bool placeInRecordedVolume(double* scale, QString* problem);
     void finish(const QString& status);
 
     QPointer<SessionRecovery> _recovery;

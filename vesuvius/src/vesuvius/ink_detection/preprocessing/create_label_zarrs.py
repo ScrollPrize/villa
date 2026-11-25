@@ -15,7 +15,10 @@ from vc_reader import images
 from tqdm.auto import tqdm
 from vc_reader.reader import ZarrWriter, create_group, ome_multiscales, write_pyramid_level
 
-from vesuvius.ink_detection.data.segment import parse_label_asset_path
+from vesuvius.ink_detection.data.segment import (
+    interrupted_vc3d_save,
+    parse_label_asset_path,
+)
 from vesuvius.ink_detection.label_zarr import (
     ARRAY_DIMENSIONS,
     CHUNK_SHAPE,
@@ -284,6 +287,9 @@ def convert_image(
     chunk_workers: int = 1,
 ) -> dict[str, str]:
     """Convert one label or context image, skipping an existing output by default."""
+    problem = interrupted_vc3d_save(input_path)
+    if problem is not None:
+        raise ValueError(problem)
     output_path = input_path.with_suffix(".zarr")
     if not overwrite and output_path.exists():
         return {

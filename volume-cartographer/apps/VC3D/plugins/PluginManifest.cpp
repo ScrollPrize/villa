@@ -182,6 +182,22 @@ QString requirementFor(const QString& placeholder)
     return QStringLiteral("{%1}").arg(placeholder);
 }
 
+void setActiveSegment(PluginContext& ctx, const QString& segmentId, const QString& folder)
+{
+    ctx.segmentId = segmentId;
+    ctx.segment = segmentId.isEmpty() ? QString() : folder;
+}
+
+QString sourceChange(const OpenSource& started, const OpenSource& now)
+{
+    if (now.project != started.project) return QStringLiteral("another project was opened while the plugin ran");
+    if (now.volumeId != started.volumeId || now.annotationVolume != started.annotationVolume ||
+        now.scale != started.scale) {
+        return QStringLiteral("another volume or working level was opened while the plugin ran");
+    }
+    return {};
+}
+
 QString resultKindName(ResultKind kind)
 {
     switch (kind) {

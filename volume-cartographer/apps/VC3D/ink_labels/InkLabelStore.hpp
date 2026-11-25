@@ -7,8 +7,8 @@
 // as the ink detection trainer reads them: <seg>_inklabels.tif,
 // <seg>_supervision_mask.tif and optionally <seg>_validation_mask.tif, uint8
 // {0,255}, one sample, tiled 1024, LZW, at the vc_render_tifxyz canvas size.
-// Auxiliary files (.json, .prev, .autosave, .lock, .tmp-*) use extensions the
-// trainer and create_label_zarrs ignore.
+// Auxiliary files (.json, .prev, .autosave, .saving, .lock, .tmp-*) use
+// extensions the trainer and create_label_zarrs ignore.
 
 #include "ink_labels/InkLabelRaster.hpp"
 
@@ -66,6 +66,9 @@ struct StorePaths {
     [[nodiscard]] std::filesystem::path file(LabelKind kind, Target target = Target::Trainer) const;
     // <prefix>_inklabels[_vN].json, plus ".autosave".
     [[nodiscard]] std::filesystem::path sidecar(Target target = Target::Trainer) const;
+    // The sidecar's name plus ".saving": present only while a save replaces
+    // the target's files (see saveLabels).
+    [[nodiscard]] std::filesystem::path saving(Target target = Target::Trainer) const;
     // The trainer file's previous generation: <name>.tif.prev.
     [[nodiscard]] std::filesystem::path previous(LabelKind kind) const;
     [[nodiscard]] std::filesystem::path lock() const;
@@ -78,6 +81,14 @@ struct StorePaths {
 [[nodiscard]] std::filesystem::path labelRootFor(const std::filesystem::path& projectFile,
                                                  const std::filesystem::path& cacheRoot,
                                                  const std::filesystem::path& dataRoot);
+
+// A few grid vertices and where they were when the labels were saved. A
+// labeled pixel belongs to a grid position, so a later flip or rotation of
+// the grid (same size, vertices reordered) must move the labels with it.
+struct GridAnchor {
+    int row = 0, col = 0;
+    cv::Vec3f point;
+};
 
 struct Sidecar {
     CanvasKey canvas;
@@ -93,8 +104,16 @@ struct Sidecar {
     QJsonObject edits;
     QJsonArray provenance;
     std::optional<std::string> predictionShown;
+    // Written as "grid_anchors": [[row, col, x, y, z], ...]. Empty for
+    // sidecars written before VC3D recorded them.
+    std::vector<GridAnchor> gridAnchors;
 };
 inline constexpr const char* kSidecarSchema = "vc3d.ink_labels/1";
+// The .saving record: {"schema", "sidecar": the sidecar being written,
+// "replaces": {kind: {"sha256": hash of the file replaced, or null when the
+// save creates it}}}. A kind the save does not touch is not listed; a listed
+// kind whose sidecar entry is null is removed by the save.
+inline constexpr const char* kSavingSchema = "vc3d.ink_labels.saving/1";
 inline constexpr int kMaxProvenanceEntries = 1000;
 
 [[nodiscard]] std::optional<Sidecar> readSidecar(const std::filesystem::path& path, QString* error);
@@ -115,6 +134,9 @@ struct SaveRequest {
     // SHA-256 of each trainer file when it was loaded or last saved. A
     // trainer file that no longer matches was changed outside VC3D.
     std::map<LabelKind, std::string> expectedSha256;
+    // Tests: stop as a killed process would after this many files were
+    // renamed into place, leaving the .saving record behind. -1 never stops.
+    int crashAfterRenamesForTesting = -1;
 };
 
 struct SaveOutcome {
@@ -130,13 +152,16 @@ struct SaveOutcome {
 };
 
 // Writes temp files from the snapshot (three writers in parallel), checks the
-// trainer files for outside edits, renames validation, supervision then ink
-// into place (keeping one .prev generation for the trainer target), and
-// writes the sidecar last. A trainer save then deletes the store's
-// checkpoint: the controller waits for a running checkpoint before it starts
-// a save, so any checkpoint on disk is older than the state just written.
-// Safe to run on a worker: it reads only the immutable snapshot and touches
-// only the store's files.
+// trainer files for outside edits, records the generation it is about to put
+// in place (the new sidecar and the hash of each file it replaces) in the
+// .saving file, renames validation, supervision then ink into place (keeping
+// one .prev generation for the trainer target), writes the sidecar, and only
+// then removes the .saving file. A failure on the way puts every replaced
+// file back, so a failed save leaves the previous generation. A trainer save
+// then deletes the store's checkpoint: the controller waits for a running
+// checkpoint before it starts a save, so any checkpoint on disk is older than
+// the state just written. Safe to run on a worker: it reads only the
+// immutable snapshot and touches only the store's files.
 [[nodiscard]] SaveOutcome saveLabels(const SaveRequest& request);
 
 struct LoadOutcome {
@@ -149,20 +174,98 @@ struct LoadOutcome {
     std::map<LabelKind, std::string> sha256;
     bool validationPresent = false;
     bool anyFile = false;
+    // A save stopped part way (the process died) and left files of two
+    // generations; nothing was read.
+    bool interruptedSave = false;
     QStringList warnings;
 };
 
+// What an interrupted save (a .saving file) left of a target's files.
+enum class SaveGeneration : uint8_t {
+    // No .saving file: no save was interrupted.
+    Settled,
+    // Every file is the previous generation: the save stopped before
+    // replacing any.
+    Previous,
+    // Every file is the new generation; only the sidecar was not written.
+    New,
+    // Files of both generations, files changed since, or an unreadable
+    // .saving file. Readers refuse these labels.
+    Mixed,
+};
+[[nodiscard]] SaveGeneration saveGeneration(const StorePaths& paths, Target target);
+
+enum class RepairResult : uint8_t { NothingToRepair, Finished, RolledBack, Failed };
+// Settles an interrupted save of the target: a complete new generation gets
+// its sidecar, a complete previous one just loses the .saving file, and the
+// trainer target's mixed files are put back from .prev when each .prev is the
+// previous generation the save recorded. Failed leaves everything in place.
+[[nodiscard]] RepairResult repairInterruptedSave(const StorePaths& paths, Target target, QString* message);
+
 // Reads the target's sidecar (if any) and each present label file, streaming
-// block by block. A file whose shape differs from the canvas is refused.
+// block by block. A file whose shape differs from the canvas is refused, and
+// so are files a save left of two generations (SaveGeneration::Mixed); files
+// a save replaced completely load with the sidecar it was writing.
 [[nodiscard]] LoadOutcome loadLabels(const StorePaths& paths, const CanvasKey& expected, Target target);
 
-// True if any of the target's label files or its sidecar exist.
+// True if any of the target's label files, its sidecar or a .saving file
+// exist.
 [[nodiscard]] bool targetExists(const StorePaths& paths, Target target);
-// Removes the target's label files and sidecar. Returns false if one stayed.
+// Removes the target's label files, sidecar and .saving file. Returns false if
+// one stayed.
 bool removeTarget(const StorePaths& paths, Target target);
-// Renames the target's label files and sidecar to <name>.unusable (replacing
+// Renames the target's label files, sidecar and .saving file to
+// <name>.unusable (replacing
 // an older one), keeping a checkpoint that cannot be restored out of the way
 // without deleting it. Returns false if one could not be moved.
 bool moveTargetAside(const StorePaths& paths, Target target);
+
+// ---------------------------------------------------------------------------
+// Grid reorders
+// ---------------------------------------------------------------------------
+
+// Up to 7 x 7 valid vertices spread over the grid.
+[[nodiscard]] std::vector<GridAnchor> gridAnchors(const cv::Mat_<cv::Vec3f>& points);
+
+// How the vertices of the saved grid were reordered into the current one, as
+// the old (row, col) of a current vertex: swap exchanges row and column (a
+// quarter turn or transpose of a square grid), then flipRows and flipCols
+// mirror them. All false is the same order.
+struct GridReorder {
+    bool swap = false, flipRows = false, flipCols = false;
+    [[nodiscard]] bool identity() const { return !swap && !flipRows && !flipCols; }
+    bool operator==(const GridReorder&) const = default;
+};
+
+enum class ReorderMatch : uint8_t {
+    // No anchors to compare, or too few vertices still valid.
+    Unknown,
+    // The anchors are where they were, or most of them are: an edit in place.
+    Same,
+    // The grid was reordered; `reorder` says how.
+    Reordered,
+};
+struct ReorderResult {
+    ReorderMatch match = ReorderMatch::Unknown;
+    GridReorder reorder;
+};
+// Which reorder of the saved grid the current points are. A reorder is
+// reported only when it explains at least half of the comparable anchors and
+// more of them than leaving the order alone does.
+[[nodiscard]] ReorderResult detectReorder(const std::vector<GridAnchor>& anchors, const cv::Mat_<cv::Vec3f>& points);
+
+struct RemapOutcome {
+    bool ok = false;
+    // Why the labels cannot be moved exactly (ok is false).
+    QString error;
+    TileRaster raster;
+    // Labeled pixels whose grid position lands off the canvas.
+    std::uint64_t droppedLabeled = 0;
+};
+// The labels of `raster` (on `canvas`) moved to where `reorder` put their
+// grid positions. Exact only when every label pixel lands on a label pixel:
+// the label pixel pitch must divide the grid step, and a swap needs a square
+// canvas with equal scales. Otherwise ok is false and nothing is moved.
+[[nodiscard]] RemapOutcome remapLabels(const TileRaster& raster, const vc::RenderCanvas& canvas, const GridReorder& reorder);
 
 }  // namespace vc3d::ink_labels

@@ -86,14 +86,17 @@ start it and says what is missing.
 ### Results
 
 `result.path` must start with `{output}/` and stay inside the run folder, so
-VC3D only ever loads files the run itself wrote.
+VC3D only ever loads files the run itself wrote. An `ink_overlay` or
+`points` result is loaded only if the same project, volume and working level
+are open when the run ends (and, for `ink_overlay`, the same segment); otherwise
+it stays in the run folder and VC3D says why.
 
 | `kind` | What VC3D does with `path` |
 | --- | --- |
 | `none` | Nothing; reports the run folder. |
 | `file` | Shows the path and offers to open it (a report, a mesh, an image). |
-| `ink_overlay` | Shows the image as the ink detection overlay of the segment that was active when the run started, for this session; it is not published to the surface catalog. The image must be on the segment's surface grid, like a published ink prediction. |
-| `points` | Reads a VC3D point collection file (`vc_pointcollections_json_version` 1, the format **Save** in the Point Collections panel writes) and adds its collections. Existing collections are never replaced; a name that is taken gets a numbered suffix. |
+| `ink_overlay` | Shows the image as the ink detection overlay of the segment that was active when the run started, for this session; it is not published to the surface catalog. The image must be on the segment's surface grid, like a published ink prediction. It is listed beside the segment's published predictions in the ink detection panel, named after the plugin and the file. |
+| `points` | Reads a VC3D point collection file (`vc_pointcollections_json_version` 1, the format **Save** in the Point Collections panel writes) and adds its collections. Existing collections are never replaced; a name that is taken gets a numbered suffix. The points are taken to be in the voxels of the volume open when the run started. |
 
 ## Running a plugin
 

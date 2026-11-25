@@ -129,6 +129,20 @@ void PluginController::showFolders()
     QMessageBox::information(_host.parent, tr("Plugin Folders"), text);
 }
 
+OpenSource PluginController::openSource() const
+{
+    OpenSource source;
+    CState* state = _host.state;
+    if (!state) return source;
+    source.project = state->hasVpkg() ? QString::fromStdString(state->vpkg()->path().string()) : QString();
+    source.volumeId = QString::fromStdString(state->currentVolumeId());
+    if (const auto& voxels = state->annotationVolume()) {
+        source.annotationVolume = QString::fromStdString(voxels->volume);
+        source.scale = voxels->scale;
+    }
+    return source;
+}
+
 PluginContext PluginController::gatherContext() const
 {
     PluginContext ctx;
@@ -140,10 +154,9 @@ PluginContext PluginController::gatherContext() const
         ctx.volumeId = QString::fromStdString(state->currentVolumeId());
     }
     if (auto surface = state->activeSurface().lock()) {
-        if (!surface->path.empty()) {
-            ctx.segment = QString::fromStdString(surface->path.string());
-            ctx.segmentId = QString::fromStdString(state->activeSurfaceId());
-        }
+        setActiveSegment(ctx,
+                         QString::fromStdString(!state->activeSurfaceId().empty() ? state->activeSurfaceId() : surface->id),
+                         QString::fromStdString(surface->path.string()));
     }
     if (state->hasVpkg()) {
         ctx.project = state->projectDirectory();
@@ -209,7 +222,7 @@ bool PluginController::run(const QString& pluginId)
 
     if (!QDir().mkpath(outputDir)) return warn(tr("Cannot create the output folder %1").arg(outputDir));
 
-    Run run{manifest, program, expansion.args, outputDir, expansion.resultPath, ctx.segmentId};
+    Run run{manifest, program, expansion.args, outputDir, expansion.resultPath, ctx.segmentId, openSource()};
     writeRecord(run, QStringLiteral("started"));
 
     QPointer<PluginController> guard(this);
@@ -295,20 +308,28 @@ QString PluginController::loadResult(const Run& run)
             if (run.segmentId.isEmpty()) {
                 throw std::runtime_error("no segment was active when the plugin started");
             }
+            if (const QString changed = sourceChange(run.source, openSource()); !changed.isEmpty()) {
+                throw std::runtime_error(changed.toStdString());
+            }
             if (!state || state->activeSurfaceId() != run.segmentId.toStdString()) {
                 throw std::runtime_error("the active segment changed while the plugin ran");
             }
             if (!_host.inkOverlay) throw std::runtime_error("the ink detection overlay is not available");
             // Published detections come from the surface catalog; a plugin's
-            // image is shown for this session without being published.
-            _host.inkOverlay->setSelectedPath(std::filesystem::path(path));
-            if (!_host.inkOverlay->hasLoadedSelection()) {
+            // image is listed beside them for this session, unpublished.
+            const QString label = tr("%1: %2").arg(m.name, result.fileName());
+            if (!_host.inkOverlay->showLocalImage(std::filesystem::path(path), label)) {
                 throw std::runtime_error("the image could not be shown on the active segment");
             }
             return tr("%1 showed an ink overlay on %2").arg(m.name, run.segmentId);
         }
 
         case ResultKind::Points: {
+            // The points are in the voxels of the volume open at the start, and
+            // the collections in memory are the open volume's.
+            if (const QString changed = sourceChange(run.source, openSource()); !changed.isEmpty()) {
+                throw std::runtime_error(changed.toStdString());
+            }
             VCCollection* live = state ? state->pointCollection() : nullptr;
             if (!live) throw std::runtime_error("no point collections are available");
             PointCollections loaded;

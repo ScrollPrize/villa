@@ -126,6 +126,27 @@ public:
    // Returns false (changing nothing) on malformed input.
    bool replaceUnanchoredCollections(const std::vector<nlohmann::json>& collections);
 
+   struct MergeOutcome
+   {
+       bool ok = false;
+       std::string error;
+       // Collections added, and those left out as equal to one in memory.
+       int added = 0;
+       int unchanged = 0;
+       // Added under another name (as "<name> (recovered)"): name in the file
+       // to name in memory.
+       std::vector<std::pair<std::string, std::string>> renamed;
+   };
+   // Add the collections without anchor2d from a saveToJSON file to those in
+   // memory, keeping everything loaded. Positions are multiplied by `scale`
+   // (the file's voxels to the voxels in memory). A collection equal to the
+   // one in memory with its uuid is left out; one whose uuid is in memory
+   // with other content, or whose name is taken, is added under a free
+   // "<name> (recovered)" name. Added collections and their points get new
+   // ids and uuids; point links and linked windings follow them. The whole
+   // file is parsed first, so a malformed one changes nothing.
+   MergeOutcome mergeUnanchoredFromJSON(const std::string& filename, double scale = 1.0);
+
    // Store-backed callers provide the retained allocation floor, not just the
    // maximum ID visible in a restored/current collection.
    void reservePointIds(uint64_t firstUnused) { _next_point_id = std::max(_next_point_id, firstUnused); }

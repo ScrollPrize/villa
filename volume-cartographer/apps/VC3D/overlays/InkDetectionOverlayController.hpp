@@ -30,6 +30,9 @@ public:
         std::string name;  // the published file (vc::objects::CatalogFile::name)
         std::string url;   // where it is published
         std::filesystem::path localPath; // its copy in VC3D's remote cache
+        // An image on this computer shown for this session (a plugin's
+        // result); not published, so name and url are empty.
+        bool local{false};
     };
 
     explicit InkDetectionOverlayController(CState* state, QObject* parent = nullptr);
@@ -47,8 +50,13 @@ public:
     // depths min-max scaled to 0..255. Empty for color predictions.
     [[nodiscard]] const cv::Mat_<uint8_t>& selectedScalar() const { return _selectedImage.scalar; }
     [[nodiscard]] bool hasLoadedSelection() const;
+    // Lists an image on this computer as an option of the active segment for
+    // this session and selects it. False when no segment is active or the
+    // image cannot be read; then the selection is unchanged.
+    bool showLocalImage(const std::filesystem::path& path, const QString& label);
 #ifdef VC_TESTING
     [[nodiscard]] const QImage& selectedImageForTesting() const { return _selectedImage.image; }
+    [[nodiscard]] bool drawsOnForTesting(const QuadSurface& surface) const { return imageMatchesSurface(surface); }
 #endif
 
 public slots:
@@ -97,6 +105,7 @@ private:
     std::filesystem::path _selectedPath;
     std::string _selectedSegmentKey;
     std::unordered_map<std::string, std::filesystem::path> _selectedPathBySegment;
+    std::unordered_map<std::string, std::vector<Option>> _localOptionsBySegment;
     LoadedImage _selectedImage;
     int _opacity{70};
     int _opacityBeforeToggle{70};

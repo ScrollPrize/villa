@@ -113,9 +113,43 @@ bool SessionRecoveryDialog::projectIsOpen() const
     return sameProject(current, _session.projectPath);
 }
 
+bool SessionRecoveryDialog::placeInRecordedVolume(double* scale, QString* problem)
+{
+    *scale = 1.0;
+    // A copy from before VC3D recorded the volume goes into the open one.
+    if (_session.annotationVolume.isEmpty()) {
+        return true;
+    }
+    const auto current = [this] {
+        return _actions.currentVoxels ? _actions.currentVoxels() : std::optional<SessionRecovery::Voxels>();
+    };
+    auto voxels = current();
+    if (!voxels || voxels->annotationVolume != _session.annotationVolume) {
+        QString error;
+        if (_session.volumeId.isEmpty() || !_actions.selectVolume) {
+            error = tr("no volume to open was recorded");
+        } else if (_actions.selectVolume(_session.volumeId, &error)) {
+            voxels = current();
+            if (!voxels || voxels->annotationVolume != _session.annotationVolume) {
+                error = tr("the volume opened has other voxels");
+            }
+        }
+        if (!error.isEmpty() || !voxels || voxels->annotationVolume != _session.annotationVolume) {
+            *problem = tr("The points were placed in volume %1, which could not be opened: %2.")
+                           .arg(_session.volumeId.isEmpty() ? _session.annotationVolume : _session.volumeId,
+                                error.isEmpty() ? tr("unknown error") : error);
+            return false;
+        }
+    }
+    // Another level of the same volume: the same places, in other voxels.
+    *scale = voxels->scale / _session.annotationScale;
+    return true;
+}
+
 void SessionRecoveryDialog::recover()
 {
     const bool selectSegment = _selectSegment && _selectSegment->isChecked();
+    QString mergeNote;
 
     // The points go back only into the project they were placed in (opening
     // a project clears the collections), and before the segment is selected,
@@ -126,7 +160,9 @@ void SessionRecoveryDialog::recover()
         problem = tr("Could not reopen %1: %2.").arg(_session.projectPath, problem);
     } else if (!projectIsOpen()) {
         problem = tr("The points were placed in another project.");
-    } else if (QString error; !SessionRecovery::restorePoints(_session, _collection, &error)) {
+    } else if (double scale = 1.0; !placeInRecordedVolume(&scale, &problem)) {
+        // problem says why
+    } else if (QString error; !SessionRecovery::restorePoints(_session, _collection, &error, scale, &mergeNote)) {
         problem = tr("Could not restore the points: %1.").arg(error);
     }
     if (!problem.isEmpty()) {
@@ -149,6 +185,9 @@ void SessionRecoveryDialog::recover()
     QString status = tr("Recovered %1 from the previous session. Save them with Save in the Point "
                         "Collections dock to keep them.")
                          .arg(pointsText(_session));
+    if (!mergeNote.isEmpty()) {
+        status += QLatin1Char(' ') + mergeNote;
+    }
     if (copied) {
         SessionRecovery::discard(_session);
     } else {

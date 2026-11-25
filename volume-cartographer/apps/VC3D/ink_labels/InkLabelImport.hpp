@@ -75,10 +75,22 @@ struct ImportOutcome {
                                         const ImportOptions& options,
                                         EditTxn& into);
 
+// Which files make a label version exist for listVersions.
+enum class VersionFiles : uint8_t {
+    // Trainer files and sidecars only: what the trainer and its dataset entry
+    // can read.
+    Trainer,
+    // Also checkpoints (*.autosave): a version that was started and painted
+    // but not saved yet. VC3D opens and numbers these; the trainer never
+    // reads them.
+    TrainerAndDrafts,
+};
+
 // Label versions present in a store folder: 1 for the unversioned files,
 // N >= 2 for *_vN (VC3D never writes _v1 or _v0, and a number too large for
 // an int is skipped). Sorted, without duplicates.
-[[nodiscard]] std::vector<int> listVersions(const std::filesystem::path& dir, std::string_view prefix);
+[[nodiscard]] std::vector<int> listVersions(const std::filesystem::path& dir, std::string_view prefix,
+                                            VersionFiles files = VersionFiles::Trainer);
 
 // The ink detection trainer's dataset entry for this store's segment:
 // segments_path, segment_names, surface_volume_paths (the surface volume

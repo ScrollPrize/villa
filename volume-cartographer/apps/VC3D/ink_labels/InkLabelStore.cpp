@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -364,6 +365,11 @@ fs::path StorePaths::sidecar(Target target) const
     return dir / name;
 }
 
+fs::path StorePaths::saving(Target target) const
+{
+    return fs::path(sidecar(target).string() + ".saving");
+}
+
 fs::path StorePaths::previous(LabelKind kind) const
 {
     return fs::path(file(kind, Target::Trainer).string() + ".prev");
@@ -405,21 +411,50 @@ fs::path labelRootFor(const fs::path& projectFile, const fs::path& cacheRoot, co
     return dataRoot / name;
 }
 
-std::optional<Sidecar> readSidecar(const fs::path& path, QString* error)
+namespace {
+
+std::optional<QJsonObject> readJsonObject(const fs::path& path, QString* error)
+{
+    QFile file(pathString(path));
+    if (!file.open(QIODevice::ReadOnly)) {
+        if (error)
+            *error = QStringLiteral("cannot read %1").arg(pathString(path));
+        return std::nullopt;
+    }
+    QJsonParseError parseError;
+    const QJsonDocument doc = QJsonDocument::fromJson(file.readAll(), &parseError);
+    if (parseError.error != QJsonParseError::NoError || !doc.isObject()) {
+        if (error)
+            *error = QStringLiteral("%1 is not valid JSON: %2").arg(pathString(path), parseError.errorString());
+        return std::nullopt;
+    }
+    return doc.object();
+}
+
+bool writeJsonObject(const fs::path& path, const QJsonObject& root, QString* error)
+{
+    QSaveFile file(pathString(path));
+    if (!file.open(QIODevice::WriteOnly)) {
+        if (error)
+            *error = QStringLiteral("cannot write %1: %2").arg(pathString(path), file.errorString());
+        return false;
+    }
+    file.write(QJsonDocument(root).toJson(QJsonDocument::Indented));
+    if (!file.commit()) {
+        if (error)
+            *error = QStringLiteral("cannot write %1: %2").arg(pathString(path), file.errorString());
+        return false;
+    }
+    return true;
+}
+
+std::optional<Sidecar> sidecarFromJson(const QJsonObject& root, const fs::path& path, QString* error)
 {
     const auto fail = [error](const QString& message) -> std::optional<Sidecar> {
         if (error)
             *error = message;
         return std::nullopt;
     };
-    QFile file(pathString(path));
-    if (!file.open(QIODevice::ReadOnly))
-        return fail(QStringLiteral("cannot read %1").arg(pathString(path)));
-    QJsonParseError parseError;
-    const QJsonDocument doc = QJsonDocument::fromJson(file.readAll(), &parseError);
-    if (parseError.error != QJsonParseError::NoError || !doc.isObject())
-        return fail(QStringLiteral("%1 is not valid JSON: %2").arg(pathString(path), parseError.errorString()));
-    const QJsonObject root = doc.object();
     if (root.value("schema").toString() != QLatin1String(kSidecarSchema))
         return fail(QStringLiteral("%1 has schema \"%2\", expected \"%3\"")
                         .arg(pathString(path), root.value("schema").toString(), QLatin1String(kSidecarSchema)));
@@ -443,6 +478,17 @@ std::optional<Sidecar> readSidecar(const fs::path& path, QString* error)
     s.provenance = root.value("provenance").toArray();
     if (root.value("prediction_shown").isString())
         s.predictionShown = root.value("prediction_shown").toString().toStdString();
+    for (const QJsonValue& value : root.value("grid_anchors").toArray()) {
+        const QJsonArray a = value.toArray();
+        if (a.size() != 5)
+            continue;
+        GridAnchor anchor;
+        anchor.row = a[0].toInt(-1);
+        anchor.col = a[1].toInt(-1);
+        anchor.point = cv::Vec3f(float(a[2].toDouble()), float(a[3].toDouble()), float(a[4].toDouble()));
+        if (anchor.row >= 0 && anchor.col >= 0)
+            s.gridAnchors.push_back(anchor);
+    }
     const QJsonObject files = root.value("files").toObject();
     for (const LabelKind kind : kAllKinds) {
         const QJsonValue entry = files.value(QLatin1String(kindName(kind)));
@@ -455,7 +501,7 @@ std::optional<Sidecar> readSidecar(const fs::path& path, QString* error)
     return s;
 }
 
-bool writeSidecar(const fs::path& path, const Sidecar& s, QString* error)
+QJsonObject sidecarToJson(const Sidecar& s)
 {
     QJsonObject root;
     root["schema"] = QLatin1String(kSidecarSchema);
@@ -490,22 +536,30 @@ bool writeSidecar(const fs::path& path, const Sidecar& s, QString* error)
     while (provenance.size() > kMaxProvenanceEntries)
         provenance.removeFirst();
     root["provenance"] = provenance;
+    if (!s.gridAnchors.empty()) {
+        QJsonArray anchors;
+        for (const GridAnchor& a : s.gridAnchors)
+            anchors.append(QJsonArray{a.row, a.col, double(a.point[0]), double(a.point[1]), double(a.point[2])});
+        root["grid_anchors"] = anchors;
+    }
     if (s.autosave)
         root["autosave"] = true;
+    return root;
+}
 
-    QSaveFile file(pathString(path));
-    if (!file.open(QIODevice::WriteOnly)) {
-        if (error)
-            *error = QStringLiteral("cannot write %1: %2").arg(pathString(path), file.errorString());
-        return false;
-    }
-    file.write(QJsonDocument(root).toJson(QJsonDocument::Indented));
-    if (!file.commit()) {
-        if (error)
-            *error = QStringLiteral("cannot write %1: %2").arg(pathString(path), file.errorString());
-        return false;
-    }
-    return true;
+}  // namespace
+
+std::optional<Sidecar> readSidecar(const fs::path& path, QString* error)
+{
+    const auto root = readJsonObject(path, error);
+    if (!root)
+        return std::nullopt;
+    return sidecarFromJson(*root, path, error);
+}
+
+bool writeSidecar(const fs::path& path, const Sidecar& s, QString* error)
+{
+    return writeJsonObject(path, sidecarToJson(s), error);
 }
 
 std::string geometrySha256(const QuadSurface& surface)
@@ -605,8 +659,11 @@ SaveOutcome saveLabels(const SaveRequest& request)
         }
     }
 
-    // 3. Rename in a fixed order, ink last, so a reader that sees the new
-    //    ink file also sees the masks that go with it.
+    // 3. The generation about to go in place: the sidecar with the new
+    //    files' hashes, and the hash of every file it replaces (none when the
+    //    file is new). Written to .saving before any file is replaced and
+    //    removed only after the sidecar is written, so readers and the next
+    //    open can tell a complete generation from an interrupted one.
     std::vector<Pending*> ordered;
     for (const LabelKind kind : {LabelKind::Validation, LabelKind::Supervision, LabelKind::Ink})
         for (auto& p : pending)
@@ -616,40 +673,167 @@ SaveOutcome saveLabels(const SaveRequest& request)
     sidecar.autosave = request.target == Target::Autosave;
     sidecar.fileNames.clear();
     sidecar.sha256.clear();
-    for (Pending* p : ordered) {
-        const fs::path finalPath = paths.file(p->kind, request.target);
-        if (request.target == Target::Trainer && fs::exists(finalPath, ec)) {
-            fs::copy_file(finalPath, paths.previous(p->kind), fs::copy_options::overwrite_existing, ec);
-            if (ec) {
-                discardTemps();
-                outcome.error = QStringLiteral("cannot keep the previous %1: %2")
-                                    .arg(pathString(finalPath.filename()), QString::fromStdString(ec.message()));
-                return outcome;
-            }
-        }
-        fs::rename(p->temp, finalPath, ec);
-        if (ec) {
+    for (const Pending* p : ordered) {
+        sidecar.fileNames[p->kind] = paths.file(p->kind, request.target).filename().string();
+        sidecar.sha256[p->kind] = p->sha;
+    }
+    sidecar.savedAtUtc = utcNow();
+    // A checkpoint without validation drops an older checkpoint's validation
+    // file; that removal is part of the generation too.
+    const bool dropsAutosaveValidation = request.target == Target::Autosave && !request.writeValidation;
+    QJsonObject replaces;
+    const auto recordReplaced = [&](LabelKind kind) {
+        const fs::path finalPath = paths.file(kind, request.target);
+        QJsonObject entry;
+        entry["sha256"] = fs::exists(finalPath, ec) ? QJsonValue(str(fileSha256(finalPath))) : QJsonValue(QJsonValue::Null);
+        replaces[QLatin1String(kindName(kind))] = entry;
+    };
+    for (const Pending* p : ordered)
+        recordReplaced(p->kind);
+    if (dropsAutosaveValidation)
+        recordReplaced(LabelKind::Validation);
+    QJsonObject marker;
+    marker["schema"] = QLatin1String(kSavingSchema);
+    marker["sidecar"] = sidecarToJson(sidecar);
+    marker["replaces"] = replaces;
+    const fs::path savingPath = paths.saving(request.target);
+    {
+        QString markerError;
+        if (!writeJsonObject(savingPath, marker, &markerError)) {
             discardTemps();
-            outcome.error = QStringLiteral("cannot replace %1: %2").arg(pathString(finalPath), QString::fromStdString(ec.message()));
+            outcome.error = markerError;
             return outcome;
         }
-        sidecar.fileNames[p->kind] = finalPath.filename().string();
-        sidecar.sha256[p->kind] = p->sha;
-        outcome.files.emplace_back(p->kind, finalPath);
+    }
+
+    // 4. Rename in a fixed order, ink last, so a reader that sees the new
+    //    ink file also sees the masks that go with it. Each replaced file
+    //    keeps a way back: the trainer target's previous file is copied to
+    //    .prev (the old .prev moved aside first), a checkpoint's is linked
+    //    aside. A failure puts every replaced file back.
+    struct Step {
+        fs::path finalPath;
+        fs::path temp;          // empty: the step removes the file
+        bool had = false;       // finalPath existed before
+        fs::path prevAside;     // trainer: the old .prev, moved aside
+        bool prevCopied = false;
+        fs::path aside;         // checkpoint: the replaced file
+        bool applied = false;
+    };
+    std::vector<Step> steps;
+    for (Pending* p : ordered)
+        steps.push_back({paths.file(p->kind, request.target), p->temp});
+    if (dropsAutosaveValidation)
+        steps.push_back({paths.file(LabelKind::Validation, Target::Autosave), {}});
+    const auto previousOf = [](const fs::path& finalPath) { return fs::path(finalPath.string() + ".prev"); };
+
+    const auto rollBack = [&]() -> bool {
+        bool ok = true;
+        const auto check = [&ok](const std::error_code& e) { ok = ok && !e; };
+        for (auto it = steps.rbegin(); it != steps.rend(); ++it) {
+            const Step& step = *it;
+            const fs::path prev = previousOf(step.finalPath);
+            std::error_code rec;
+            if (step.applied) {
+                if (!step.had) {
+                    fs::remove(step.finalPath, rec);
+                    check(rec);
+                } else if (step.prevCopied) {
+                    // .prev is a copy of the replaced file.
+                    fs::rename(prev, step.finalPath, rec);
+                    check(rec);
+                } else if (!step.aside.empty()) {
+                    fs::rename(step.aside, step.finalPath, rec);
+                    check(rec);
+                }
+            } else {
+                if (step.prevCopied)
+                    fs::remove(prev, rec);
+                if (!step.aside.empty())
+                    fs::remove(step.aside, rec);
+            }
+            if (!step.prevAside.empty()) {
+                fs::rename(step.prevAside, prev, rec);
+                check(rec);
+            }
+        }
+        for (const auto& p : pending)
+            removeQuietly(p.temp);
+        if (ok)
+            removeQuietly(savingPath);
+        return ok;
+    };
+    const auto fail = [&](const QString& error) {
+        outcome.error = error;
+        if (!rollBack())
+            outcome.error += QStringLiteral("; the previous files could not all be put back, and %1 records the interrupted save")
+                                 .arg(pathString(savingPath.filename()));
+        return outcome;
+    };
+
+    int renamed = 0;
+    for (Step& step : steps) {
+        step.had = fs::exists(step.finalPath, ec);
+        const fs::path prev = previousOf(step.finalPath);
+        if (step.had && request.target == Target::Trainer) {
+            if (fs::exists(prev, ec)) {
+                step.prevAside = tempPathFor(prev);
+                fs::rename(prev, step.prevAside, ec);
+                if (ec) {
+                    step.prevAside.clear();
+                    return fail(QStringLiteral("cannot keep the previous %1: %2")
+                                    .arg(pathString(prev.filename()), QString::fromStdString(ec.message())));
+                }
+            }
+            fs::copy_file(step.finalPath, prev, fs::copy_options::overwrite_existing, ec);
+            if (ec)
+                return fail(QStringLiteral("cannot keep the previous %1: %2")
+                                .arg(pathString(step.finalPath.filename()), QString::fromStdString(ec.message())));
+            step.prevCopied = true;
+        } else if (step.had) {
+            step.aside = tempPathFor(step.finalPath);
+            fs::create_hard_link(step.finalPath, step.aside, ec);
+            if (ec) {
+                ec.clear();
+                fs::copy_file(step.finalPath, step.aside, ec);
+            }
+            if (ec) {
+                step.aside.clear();
+                return fail(QStringLiteral("cannot keep the previous %1: %2")
+                                .arg(pathString(step.finalPath.filename()), QString::fromStdString(ec.message())));
+            }
+        }
+        if (step.temp.empty()) {
+            fs::remove(step.finalPath, ec);
+        } else {
+            fs::rename(step.temp, step.finalPath, ec);
+        }
+        if (ec)
+            return fail(QStringLiteral("cannot replace %1: %2").arg(pathString(step.finalPath), QString::fromStdString(ec.message())));
+        step.applied = true;
+        if (++renamed == request.crashAfterRenamesForTesting) {
+            outcome.error = QStringLiteral("stopped for testing");
+            return outcome;
+        }
+    }
+
+    // 5. The sidecar: its hashes describe the files now in place.
+    QString sidecarError;
+    if (!writeSidecar(paths.sidecar(request.target), sidecar, &sidecarError))
+        return fail(sidecarError);
+    removeQuietly(savingPath);
+    for (const Step& step : steps) {
+        if (!step.prevAside.empty())
+            removeQuietly(step.prevAside);
+        if (!step.aside.empty())
+            removeQuietly(step.aside);
+    }
+    for (const Pending* p : ordered) {
+        outcome.files.emplace_back(p->kind, paths.file(p->kind, request.target));
         outcome.sha256[p->kind] = p->sha;
     }
-    if (request.target == Target::Autosave && !request.writeValidation)
-        removeQuietly(paths.file(LabelKind::Validation, Target::Autosave));
 
-    // 4. The sidecar last: its hashes describe the files now in place.
-    sidecar.savedAtUtc = utcNow();
-    QString sidecarError;
-    if (!writeSidecar(paths.sidecar(request.target), sidecar, &sidecarError)) {
-        outcome.error = sidecarError;
-        return outcome;
-    }
-
-    // 5. A trainer save supersedes the checkpoint, whatever its state serial:
+    // 6. A trainer save supersedes the checkpoint, whatever its state serial:
     //    after an undo the saved state can have a smaller serial than a
     //    checkpoint written before the undo.
     if (request.target == Target::Trainer)
@@ -661,6 +845,167 @@ SaveOutcome saveLabels(const SaveRequest& request)
 }
 
 // ---------------------------------------------------------------------------
+// Interrupted saves
+// ---------------------------------------------------------------------------
+
+namespace {
+
+struct SavingRecord {
+    Sidecar sidecar;
+    // Per kind the save touches: the hash after it (empty: the save removes
+    // the file) and before it (empty: the file did not exist).
+    std::map<LabelKind, std::pair<std::string, std::string>> touched;
+};
+
+std::optional<SavingRecord> readSavingRecord(const StorePaths& paths, Target target, QString* error)
+{
+    const fs::path path = paths.saving(target);
+    const auto root = readJsonObject(path, error);
+    if (!root)
+        return std::nullopt;
+    if (root->value("schema").toString() != QLatin1String(kSavingSchema)) {
+        if (error)
+            *error = QStringLiteral("%1 has schema \"%2\", expected \"%3\"")
+                         .arg(pathString(path), root->value("schema").toString(), QLatin1String(kSavingSchema));
+        return std::nullopt;
+    }
+    const auto sidecar = sidecarFromJson(root->value("sidecar").toObject(), path, error);
+    if (!sidecar)
+        return std::nullopt;
+    SavingRecord record;
+    record.sidecar = *sidecar;
+    const QJsonObject replaces = root->value("replaces").toObject();
+    for (const LabelKind kind : kAllKinds) {
+        const QJsonValue entry = replaces.value(QLatin1String(kindName(kind)));
+        if (!entry.isObject())
+            continue;
+        const QJsonValue before = entry.toObject().value("sha256");
+        const auto after = sidecar->sha256.find(kind);
+        record.touched[kind] = {after == sidecar->sha256.end() ? std::string() : after->second,
+                                before.isString() ? before.toString().toStdString() : std::string()};
+    }
+    if (record.touched.empty()) {
+        if (error)
+            *error = QStringLiteral("%1 lists no files").arg(pathString(path));
+        return std::nullopt;
+    }
+    return record;
+}
+
+// The file's hash, empty when it does not exist, and a value no hash takes
+// when it exists but cannot be read.
+std::string currentSha(const fs::path& path)
+{
+    std::error_code ec;
+    if (!fs::exists(path, ec))
+        return {};
+    const std::string sha = fileSha256(path);
+    return sha.empty() ? std::string("unreadable") : sha;
+}
+
+SaveGeneration classify(const StorePaths& paths, Target target, const SavingRecord& record)
+{
+    bool allNew = true, allOld = true;
+    for (const auto& [kind, shas] : record.touched) {
+        const std::string current = currentSha(paths.file(kind, target));
+        allNew = allNew && current == shas.first;
+        allOld = allOld && current == shas.second;
+    }
+    return allNew ? SaveGeneration::New : allOld ? SaveGeneration::Previous : SaveGeneration::Mixed;
+}
+
+}  // namespace
+
+SaveGeneration saveGeneration(const StorePaths& paths, Target target)
+{
+    std::error_code ec;
+    if (!fs::exists(paths.saving(target), ec))
+        return SaveGeneration::Settled;
+    const auto record = readSavingRecord(paths, target, nullptr);
+    return record ? classify(paths, target, *record) : SaveGeneration::Mixed;
+}
+
+RepairResult repairInterruptedSave(const StorePaths& paths, Target target, QString* message)
+{
+    const auto say = [message](const QString& text) {
+        if (message)
+            *message = text;
+    };
+    std::error_code ec;
+    const fs::path savingPath = paths.saving(target);
+    if (!fs::exists(savingPath, ec))
+        return RepairResult::NothingToRepair;
+    QString error;
+    const auto record = readSavingRecord(paths, target, &error);
+    if (!record) {
+        say(QStringLiteral("A save of the labels in %1 was interrupted and its record cannot be read (%2); the labels are "
+                           "not read.")
+                .arg(pathString(paths.dir), error));
+        return RepairResult::Failed;
+    }
+    switch (classify(paths, target, *record)) {
+        case SaveGeneration::New:
+            if (!writeSidecar(paths.sidecar(target), record->sidecar, &error)) {
+                say(error);
+                return RepairResult::Failed;
+            }
+            removeQuietly(savingPath);
+            say(QStringLiteral("A save of the labels in %1 was interrupted after its files were written; it was completed.")
+                    .arg(pathString(paths.dir)));
+            return RepairResult::Finished;
+        case SaveGeneration::Previous:
+        case SaveGeneration::Settled:
+            removeQuietly(savingPath);
+            say(QStringLiteral("A save of the labels in %1 was interrupted before it replaced any file; the previous save is "
+                               "unchanged.")
+                    .arg(pathString(paths.dir)));
+            return RepairResult::RolledBack;
+        case SaveGeneration::Mixed:
+            break;
+    }
+    if (target != Target::Trainer) {
+        say(QStringLiteral("An interrupted checkpoint left files of two different states in %1.").arg(pathString(paths.dir)));
+        return RepairResult::Failed;
+    }
+    // Every replaced file must come back from its .prev before any is moved.
+    std::vector<LabelKind> restore, remove;
+    for (const auto& [kind, shas] : record->touched) {
+        const fs::path file = paths.file(kind, Target::Trainer);
+        const std::string current = currentSha(file);
+        if (current == shas.second)
+            continue;
+        if (current == shas.first && shas.second.empty()) {
+            remove.push_back(kind);
+        } else if (current == shas.first && currentSha(paths.previous(kind)) == shas.second) {
+            restore.push_back(kind);
+        } else {
+            say(QStringLiteral("An interrupted save left files of two different saves in %1, and %2 cannot be put back: it "
+                               "changed since, or its .prev copy is not the previous save. The labels are not read.")
+                    .arg(pathString(paths.dir), pathString(file.filename())));
+            return RepairResult::Failed;
+        }
+    }
+    for (const LabelKind kind : restore) {
+        fs::rename(paths.previous(kind), paths.file(kind, Target::Trainer), ec);
+        if (ec) {
+            say(QStringLiteral("Cannot put back %1: %2")
+                    .arg(pathString(paths.file(kind, Target::Trainer)), QString::fromStdString(ec.message())));
+            return RepairResult::Failed;
+        }
+    }
+    for (const LabelKind kind : remove)
+        fs::remove(paths.file(kind, Target::Trainer), ec);
+    if (classify(paths, target, *record) != SaveGeneration::Previous) {
+        say(QStringLiteral("An interrupted save in %1 could not be undone; the labels are not read.").arg(pathString(paths.dir)));
+        return RepairResult::Failed;
+    }
+    removeQuietly(savingPath);
+    say(QStringLiteral("A save of the labels in %1 was interrupted part way; the previous save was put back.")
+            .arg(pathString(paths.dir)));
+    return RepairResult::RolledBack;
+}
+
+// ---------------------------------------------------------------------------
 // Load
 // ---------------------------------------------------------------------------
 
@@ -668,8 +1013,20 @@ LoadOutcome loadLabels(const StorePaths& paths, const CanvasKey& expected, Targe
 {
     LoadOutcome outcome;
     std::error_code ec;
+    const SaveGeneration generation = saveGeneration(paths, target);
+    if (generation == SaveGeneration::Mixed) {
+        outcome.interruptedSave = true;
+        outcome.error = QStringLiteral("an interrupted save left files of two different saves in %1; they are not read. "
+                                       "Opening them in VC3D with write access puts the previous save back.")
+                            .arg(pathString(paths.dir));
+        return outcome;
+    }
     const fs::path sidecarPath = paths.sidecar(target);
-    if (fs::exists(sidecarPath, ec)) {
+    if (generation == SaveGeneration::New) {
+        // The files are the save's; its sidecar is the one in the record.
+        if (auto record = readSavingRecord(paths, target, nullptr))
+            outcome.sidecar = record->sidecar;
+    } else if (fs::exists(sidecarPath, ec)) {
         QString error;
         outcome.sidecar = readSidecar(sidecarPath, &error);
         if (!outcome.sidecar)
@@ -798,7 +1155,7 @@ LoadOutcome loadLabels(const StorePaths& paths, const CanvasKey& expected, Targe
 bool targetExists(const StorePaths& paths, Target target)
 {
     std::error_code ec;
-    if (fs::exists(paths.sidecar(target), ec))
+    if (fs::exists(paths.sidecar(target), ec) || fs::exists(paths.saving(target), ec))
         return true;
     for (const LabelKind kind : kAllKinds)
         if (fs::exists(paths.file(kind, target), ec))
@@ -810,7 +1167,7 @@ bool moveTargetAside(const StorePaths& paths, Target target)
 {
     bool ok = true;
     std::error_code ec;
-    std::vector<fs::path> files{paths.sidecar(target)};
+    std::vector<fs::path> files{paths.sidecar(target), paths.saving(target)};
     for (const LabelKind kind : kAllKinds)
         files.push_back(paths.file(kind, target));
     for (const fs::path& file : files) {
@@ -834,7 +1191,213 @@ bool removeTarget(const StorePaths& paths, Target target)
         ok = ok && !ec;
     }
     fs::remove(paths.sidecar(target), ec);
+    ok = ok && !ec;
+    fs::remove(paths.saving(target), ec);
     return ok && !ec;
+}
+
+}  // namespace vc3d::ink_labels
+
+// ---------------------------------------------------------------------------
+// Grid reorders
+// ---------------------------------------------------------------------------
+
+namespace vc3d::ink_labels {
+
+namespace {
+
+constexpr int kAnchorLattice = 7;
+// Voxels. A flip copies the points; a quarter turn resamples them at whole
+// grid positions, which can move them by float rounding only.
+constexpr float kAnchorTolerance = 0.05f;
+constexpr int kMinReorderMatches = 3;
+
+bool validVertex(const cv::Vec3f& p)
+{
+    return p[0] != -1.f && std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]);
+}
+
+// Where the saved vertex (row, col) is in the current grid.
+cv::Point currentOf(const GridReorder& r, int row, int col, cv::Size grid)
+{
+    int a = r.swap ? col : row;
+    int b = r.swap ? row : col;
+    if (r.flipRows)
+        a = grid.height - 1 - a;
+    if (r.flipCols)
+        b = grid.width - 1 - b;
+    return {b, a};
+}
+
+}  // namespace
+
+std::vector<GridAnchor> gridAnchors(const cv::Mat_<cv::Vec3f>& points)
+{
+    std::vector<GridAnchor> anchors;
+    if (points.empty())
+        return anchors;
+    // The first valid vertex of each block of a 7 x 7 split of the grid.
+    for (int by = 0; by < kAnchorLattice; ++by) {
+        const int r0 = by * points.rows / kAnchorLattice, r1 = (by + 1) * points.rows / kAnchorLattice;
+        for (int bx = 0; bx < kAnchorLattice; ++bx) {
+            const int c0 = bx * points.cols / kAnchorLattice, c1 = (bx + 1) * points.cols / kAnchorLattice;
+            bool found = false;
+            for (int r = r0; r < r1 && !found; ++r)
+                for (int c = c0; c < c1 && !found; ++c)
+                    if (validVertex(points(r, c))) {
+                        anchors.push_back({r, c, points(r, c)});
+                        found = true;
+                    }
+        }
+    }
+    return anchors;
+}
+
+ReorderResult detectReorder(const std::vector<GridAnchor>& anchors, const cv::Mat_<cv::Vec3f>& points)
+{
+    ReorderResult result;
+    if (anchors.empty() || points.empty())
+        return result;
+    const cv::Size grid = points.size();
+    struct Score {
+        int comparable = 0, matched = 0;
+    };
+    const auto score = [&](const GridReorder& r) {
+        Score s;
+        for (const GridAnchor& a : anchors) {
+            if (!validVertex(a.point))
+                continue;
+            if (r.swap ? (a.col >= grid.height || a.row >= grid.width) : (a.row >= grid.height || a.col >= grid.width))
+                continue;
+            const cv::Point at = currentOf(r, a.row, a.col, grid);
+            const cv::Vec3f& p = points(at.y, at.x);
+            if (!validVertex(p))
+                continue;
+            ++s.comparable;
+            if (cv::norm(p - a.point) <= kAnchorTolerance)
+                ++s.matched;
+        }
+        return s;
+    };
+    const Score same = score(GridReorder{});
+    Score best;
+    GridReorder bestReorder;
+    for (int swap = 0; swap < (grid.width == grid.height ? 2 : 1); ++swap)
+        for (int code = 0; code < 4; ++code) {
+            const GridReorder r{swap != 0, (code & 1) != 0, (code & 2) != 0};
+            if (r.identity())
+                continue;
+            const Score s = score(r);
+            if (s.matched > best.matched) {
+                best = s;
+                bestReorder = r;
+            }
+        }
+    if (best.matched >= kMinReorderMatches && best.matched > same.matched && 2 * best.matched >= best.comparable) {
+        result.match = ReorderMatch::Reordered;
+        result.reorder = bestReorder;
+    } else if (same.comparable > 0) {
+        result.match = ReorderMatch::Same;
+    }
+    return result;
+}
+
+RemapOutcome remapLabels(const TileRaster& raster, const vc::RenderCanvas& canvas, const GridReorder& reorder)
+{
+    RemapOutcome out;
+    const cv::Size size = raster.size();
+    if (size != canvas.size) {
+        out.error = QStringLiteral("the labels are not at the segment's canvas size");
+        return out;
+    }
+    if (reorder.swap && (size.width != size.height || canvas.gridScale[0] != canvas.gridScale[1])) {
+        out.error = QStringLiteral("a turned grid needs a square canvas with equal scales");
+        return out;
+    }
+    // The saved label pixel that shows the grid position a current pixel
+    // centre shows. The map is affine; read it off three pixels.
+    const auto savedCentre = [&](double x, double y) {
+        const cv::Vec2d g = canvas.canvasToGrid({x, y});
+        double row = g[1], col = g[0];
+        if (reorder.flipRows)
+            row = canvas.grid.height - 1 - row;
+        if (reorder.flipCols)
+            col = canvas.grid.width - 1 - col;
+        if (reorder.swap)
+            std::swap(row, col);
+        return canvas.gridToCanvas({col, row});
+    };
+    const cv::Vec2d o = savedCentre(0.5, 0.5);
+    const cv::Vec2d lx = savedCentre(1.5, 0.5) - o;
+    const cv::Vec2d ly = savedCentre(0.5, 1.5) - o;
+    const auto whole = [](double v, int* out) {
+        const double r = std::round(v);
+        if (std::abs(v - r) > 1e-3)
+            return false;
+        *out = int(r);
+        return true;
+    };
+    int bx = 0, by = 0, lxx = 0, lxy = 0, lyx = 0, lyy = 0;
+    if (!whole(o[0] - 0.5, &bx) || !whole(o[1] - 0.5, &by) || !whole(lx[0], &lxx) || !whole(lx[1], &lxy)
+        || !whole(ly[0], &lyx) || !whole(ly[1], &lyy)) {
+        out.error = QStringLiteral("the label pixel pitch does not divide the grid step, so labels cannot move exactly");
+        return out;
+    }
+    // saved = (bx + lxx * x + lyx * y, by + lxy * x + lyy * y)
+    const auto savedPixel = [&](int x, int y) { return cv::Point(bx + lxx * x + lyx * y, by + lxy * x + lyy * y); };
+
+    const auto labeled = [](const std::array<uint64_t, 8>& c) {
+        uint64_t n = 0;
+        for (int v = 1; v < 8; ++v)
+            n += c[std::size_t(v)];
+        return n;
+    };
+    TileRaster moved(size);
+    cv::Mat_<uint8_t> src, flipped, dst;
+    for (int index = 0; index < moved.tileCount(); ++index) {
+        const cv::Rect rect = moved.tileRect(index);
+        const cv::Point a = savedPixel(rect.x, rect.y);
+        const cv::Point b = savedPixel(rect.br().x - 1, rect.br().y - 1);
+        const cv::Rect from(std::min(a.x, b.x), std::min(a.y, b.y), std::abs(b.x - a.x) + 1, std::abs(b.y - a.y) + 1);
+        if ((from & cv::Rect(0, 0, size.width, size.height)).empty())
+            continue;
+        raster.readRect(from, src);
+        double lo = 0, hi = 0;
+        cv::minMaxLoc(src, &lo, &hi);
+        if (lo == hi) {
+            if (hi != 0)
+                moved.setTile(index, TileState{nullptr, uint8_t(hi)});
+            continue;
+        }
+        if (!reorder.swap) {
+            // Current x follows saved x (sign lxx), current y saved y.
+            const int code = lxx < 0 && lyy < 0 ? -1 : (lxx < 0 ? 1 : (lyy < 0 ? 0 : 2));
+            if (code == 2)
+                dst = src;
+            else
+                cv::flip(src, dst, code);
+        } else {
+            // Current x follows saved y (sign lxy), current y saved x (lyx).
+            const int code = lxy < 0 && lyx < 0 ? -1 : (lyx < 0 ? 1 : (lxy < 0 ? 0 : 2));
+            if (code == 2)
+                flipped = src;
+            else
+                cv::flip(src, flipped, code);
+            cv::transpose(flipped, dst);
+        }
+        auto tile = std::make_shared<Tile>();
+        for (int y = 0; y < rect.height; ++y)
+            std::copy(dst.ptr(y), dst.ptr(y) + rect.width, tile->px.data() + std::size_t(y * kTileSize));
+        const cv::Rect inCanvas(0, 0, rect.width, rect.height);
+        finalizeTile(*tile, inCanvas);
+        moved.setTile(index, publishTile(std::move(tile), inCanvas));
+    }
+    const uint64_t before = labeled(raster.counts());
+    const uint64_t after = labeled(moved.counts());
+    out.droppedLabeled = before > after ? before - after : 0;
+    out.raster = std::move(moved);
+    out.ok = true;
+    return out;
 }
 
 }  // namespace vc3d::ink_labels

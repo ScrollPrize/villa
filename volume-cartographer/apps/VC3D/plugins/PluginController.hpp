@@ -51,9 +51,13 @@ private:
         QString outputDir;
         QString resultPath;
         QString segmentId;
+        // What was open when the run started; results go only into the same.
+        vc3d::plugins::OpenSource source;
     };
 
     [[nodiscard]] vc3d::plugins::PluginContext gatherContext() const;
+    // The project and volume open now.
+    [[nodiscard]] vc3d::plugins::OpenSource openSource() const;
     void rebuildMenu();
     void showFolders();
     void finish(const Run& run, bool success, const QString& message);

@@ -20,7 +20,7 @@ template <typename T> class QFutureWatcher;
 //
 // Each running VC3D keeps a session folder in the recovery directory
 // (~/.VC3D/recovery, next to VC3D.ini). The folder holds a lock file, a
-// record of the open project and segment, and a copy of the point
+// record of the open project, volume and segment, and a copy of the point
 // collections that is rewritten a few seconds after they change. Segment
 // correction points (collections anchored to the segment grid) are left out
 // of the copy, since they are already saved with their segment, and so are
@@ -45,9 +45,22 @@ public:
         QDateTime updated;
         int collectionCount{0};
         int pointCount{0};
+        // The voxels the points were placed in; empty for copies written
+        // before VC3D recorded them.
+        QString volumeId;
+        QString annotationVolume;
+        double annotationScale{1.0};
 
         [[nodiscard]] QString pointsFile() const;
         [[nodiscard]] bool hasPoints() const;
+    };
+
+    // A volume of the open project and the voxels its points are in.
+    struct Voxels
+    {
+        QString volumeId;
+        QString annotationVolume;
+        double scale{1.0};
     };
 
     static constexpr int kSaveDelayMs = 3000;
@@ -66,9 +79,12 @@ public:
     // the application quits normally. When the folder or its lock cannot be
     // created, emits writeFailed and keeps nothing.
     bool begin(VCCollection* collection);
-    // Both rewrite the record together with the points copy.
+    // These rewrite the record together with the points copy.
     void setProject(const QString& path);
     void setSegment(const QString& segmentId);
+    // The open volume (its id in the project) and the voxels the point
+    // collections are in: annotation volume uuid and scale (2^-level).
+    void setVolume(const QString& volumeId, const QString& annotationVolume, double scale);
     // Starts writing the points copy and the session record now, in the
     // background. While a write runs, the newest state is written after it.
     void flush();
@@ -102,13 +118,17 @@ public:
     // holds it.
     [[nodiscard]] static std::shared_ptr<QLockFile> claim(const LeftoverSession& session);
 
-    // Loads the leftover session's points into collection. Refused, with
-    // nothing changed, while collection holds points or segment correction
-    // collections: loading replaces them, and VC3D would then rewrite the
-    // active surface's stored corrections.
+    // Adds the leftover session's points to collection, keeping everything
+    // loaded there: the saved collections of the project's volume and the
+    // segment's correction points. A copied collection equal to its saved
+    // version is left out; one that differs comes back beside it under a new
+    // name, listed in `note`. Positions are multiplied by `scale`, the copy's
+    // voxels to the voxels collection is in. Nothing changes on failure.
     static bool restorePoints(const LeftoverSession& session,
                               VCCollection* collection,
-                              QString* error = nullptr);
+                              QString* error = nullptr,
+                              double scale = 1.0,
+                              QString* note = nullptr);
     // Deletes a leftover session's folder.
     static bool discard(const LeftoverSession& session);
 
@@ -136,6 +156,9 @@ private:
     QDateTime _started;
     QString _projectPath;
     QString _segmentId;
+    QString _volumeId;
+    QString _annotationVolume;
+    double _annotationScale{1.0};
     int _collectionCount{0};
     int _pointCount{0};
 };

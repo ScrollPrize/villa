@@ -1,5 +1,7 @@
 #include "ink_labels/InkLabelController.hpp"
 
+#include "InputOrigin.hpp"
+
 #include "CState.hpp"
 #include "Keybinds.hpp"
 #include "SpiralBrushCursorWidget.hpp"
@@ -40,6 +42,7 @@
 #include <opencv2/imgcodecs.hpp>
 
 #include <algorithm>
+#include <climits>
 #include <cmath>
 #include <limits>
 #include <system_error>
@@ -68,6 +71,32 @@ constexpr double kLassoStepDevicePx = 2.0;
 qint64 nowMs()
 {
     return QDateTime::currentMSecsSinceEpoch();
+}
+
+QString describeReorder(const GridReorder& r)
+{
+    const auto tr = [](const char* text) { return QCoreApplication::translate("InkLabelController", text); };
+    if (r.swap) {
+        if (r.flipRows == r.flipCols)
+            return r.flipRows ? tr("the grid mirrored across its other diagonal") : tr("the grid mirrored across its diagonal");
+        return tr("the grid turned a quarter");
+    }
+    if (r.flipRows && r.flipCols)
+        return tr("the grid turned a half");
+    return r.flipRows ? tr("the grid flipped top to bottom") : tr("the grid flipped left to right");
+}
+
+QString movedLabelsMessage(const GridReorder& r, uint64_t dropped)
+{
+    QString message = QCoreApplication::translate("InkLabelController",
+                                                  "The segment's grid was reordered since the labels were placed (%1); the labels "
+                                                  "were moved with it and are unsaved until saved.")
+                          .arg(describeReorder(r));
+    if (dropped > 0)
+        message += QLatin1Char(' ')
+                   + QCoreApplication::translate("InkLabelController", "%n labeled pixel(s) past the grid's edge had nowhere to go.",
+                                                 nullptr, int(std::min<uint64_t>(dropped, INT_MAX)));
+    return message;
 }
 
 QString qpath(const fs::path& p)
@@ -140,6 +169,10 @@ struct InkLabelController::Session {
     std::string geometrySha;
     // The segment's grid changed since the hash was taken.
     bool geometryStale = false;
+    // Vertices of the grid the raster is aligned to, written to the sidecar
+    // so a later flip or quarter turn of the grid can be told apart from an
+    // edit in place.
+    std::vector<GridAnchor> anchors;
     // The store's folder and lock are taken at the first edit, so opening
     // a segment that has no labels writes nothing to the project.
     bool lockPending = false;
@@ -273,6 +306,18 @@ void InkLabelController::createShortcuts()
         statusMessage(_showLabels ? tr("Ink labels shown") : tr("Ink labels hidden"), 2000);
     });
     make(keys::InkLabelUndo, [this] {
+        // A key the agent bridge sent is the agent's: like the history
+        // command without force, it undoes only the agent's own edits.
+        if (vc3d::handlingAgentInput()) {
+            const HistoryEntry* top = _session && !_session->info.locked ? _session->history.top() : nullptr;
+            if (top && top->actor != Actor::Agent) {
+                statusMessage(tr("The last ink label edit is the user's; an agent's Undo key does not undo it"), 4000);
+                return;
+            }
+            if (!undo(Actor::Agent, false))
+                statusMessage(tr("Nothing to undo in the ink labels"), 2000);
+            return;
+        }
         if (!undo(Actor::User, true))
             statusMessage(tr("Nothing to undo in the ink labels"), 2000);
     });
@@ -694,7 +739,15 @@ InkLabelController::OpenOutcome InkLabelController::openForActiveSegment(const O
 bool InkLabelController::resolveVersion(StorePaths& paths, const OpenRequest& request, const OpenOptions& options,
                                         OpenOutcome& out) const
 {
-    const std::vector<int> existing = listVersions(paths.dir, paths.prefix);
+    // A version that was started and painted but never saved exists as its
+    // checkpoint; so does the open session's version while it has unsaved
+    // edits, since closing it writes that checkpoint.
+    std::vector<int> existing = listVersions(paths.dir, paths.prefix, VersionFiles::TrainerAndDrafts);
+    if (_session && _session->storeKey() == qpath(paths.dir) && _session->writable() && _session->history.dirty()
+        && std::find(existing.begin(), existing.end(), _session->info.paths.version) == existing.end()) {
+        existing.push_back(_session->info.paths.version);
+        std::sort(existing.begin(), existing.end());
+    }
     const int newest = existing.empty() ? 1 : existing.back();
     if (options.version <= 0) {
         paths.version = newest;
@@ -807,10 +860,14 @@ std::optional<Target> InkLabelController::chooseTarget(Session& session, const O
     if (!targetExists(paths, Target::Autosave))
         return Target::Trainer;
     QString error;
-    sidecars.autosave = readSidecar(paths.sidecar(Target::Autosave), &error);
-    if (sidecars.autosave && sidecars.autosave->canvas != key)
+    const bool interrupted = saveGeneration(paths, Target::Autosave) == SaveGeneration::Mixed;
+    if (!interrupted)
+        sidecars.autosave = readSidecar(paths.sidecar(Target::Autosave), &error);
+    if (interrupted)
+        error = tr("it was being written when VC3D stopped");
+    else if (sidecars.autosave && sidecars.autosave->canvas != key)
         error = tr("it was written for %1, the segment has %2").arg(sidecars.autosave->canvas.describe(), key.describe());
-    const bool usable = sidecars.autosave && sidecars.autosave->canvas == key;
+    const bool usable = !interrupted && sidecars.autosave && sidecars.autosave->canvas == key;
     if (!usable) {
         // Never delete what cannot be read: keep it beside the store.
         sidecars.autosave.reset();
@@ -919,7 +976,33 @@ bool InkLabelController::loadInto(Session& session, Target target, const CanvasK
     } else {
         session.history.reset(sidecars.trainer ? sidecars.trainer->stateSerial : 0);
     }
-    if (sidecars.trainer && !sidecars.trainer->geometrySha256.empty() && !session.geometrySha.empty()
+    const auto surface = session.surface.lock();
+    const cv::Mat_<cv::Vec3f>* points = surface ? surface->rawPointsPtr() : nullptr;
+    bool reordered = false;
+    if (carried && points && !points->empty()) {
+        const ReorderResult reorder = detectReorder(carried->gridAnchors, *points);
+        if (reorder.match == ReorderMatch::Reordered) {
+            RemapOutcome moved = remapLabels(session.raster, session.info.canvas, reorder.reorder);
+            if (!moved.ok) {
+                out.error = OpenError::LayerLocked;
+                out.message = tr("The segment's grid was flipped or turned since these labels were saved, and %1. The labels are "
+                                 "locked so they are not painted at the wrong places; start a new version to label this grid.")
+                                  .arg(moved.error);
+                out.expected = tr("the grid order the labels were saved on");
+                out.got = describeReorder(reorder.reorder);
+                return false;
+            }
+            session.raster = std::move(moved.raster);
+            // Moved labels are unsaved work: dirty until saved. The files on
+            // disk keep the old order until then.
+            session.history.markClean(std::numeric_limits<uint64_t>::max());
+            out.warnings.append(movedLabelsMessage(reorder.reorder, moved.droppedLabeled));
+            reordered = true;
+        }
+    }
+    if (points)
+        session.anchors = gridAnchors(*points);
+    if (!reordered && sidecars.trainer && !sidecars.trainer->geometrySha256.empty() && !session.geometrySha.empty()
         && sidecars.trainer->geometrySha256 != session.geometrySha)
         out.warnings.append(tr("The segment's geometry was edited since these labels were saved; labels stay attached to the same "
                                "grid positions."));
@@ -942,6 +1025,10 @@ InkLabelController::OpenOutcome InkLabelController::openStore(const OpenRequest&
 
     StorePaths paths = storePathsFor(request.projectDir, request.segment);
     const QString storeKey = qpath(paths.dir);
+    // A checkpoint or save of this store still running may be what makes the
+    // version exist; let it land before the version is looked up. The open
+    // session stays as it is if the version is refused.
+    settleWrite(storeKey);
     if (!resolveVersion(paths, request, options, out))
         return out;
 
@@ -955,6 +1042,12 @@ InkLabelController::OpenOutcome InkLabelController::openStore(const OpenRequest&
         if (it->lock && it->lock->isLocked())
             heldLock = it->lock;
     }
+    // A write that already landed may still hold the lock until its watcher
+    // runs; that lock is this process's too.
+    if (!heldLock) {
+        if (auto alive = _writeLocks.value(storeKey).lock(); alive && alive->isLocked())
+            heldLock = std::move(alive);
+    }
 
     auto session = std::make_unique<Session>();
     session->info.canvas = request.canvas;
@@ -967,6 +1060,16 @@ InkLabelController::OpenOutcome InkLabelController::openStore(const OpenRequest&
     session->geometrySha = request.geometrySha;
     if (!acquireLock(*session, options, std::move(heldLock), out))
         return out;
+    // A save this or another VC3D did not finish: complete it or put the
+    // previous save back, so what opens is one generation. Without the lock
+    // the files stay as they are and a mixed set is refused when read.
+    if (session->writable() && !session->lockPending) {
+        for (const Target target : {Target::Trainer, Target::Autosave}) {
+            QString message;
+            if (repairInterruptedSave(paths, target, &message) != RepairResult::NothingToRepair)
+                out.warnings.append(message);
+        }
+    }
 
     const CanvasKey key = canvasKeyFor(request.canvas);
     Sidecars sidecars;
@@ -1004,6 +1107,13 @@ InkLabelController::OpenOutcome InkLabelController::openStore(const OpenRequest&
 
 bool InkLabelController::prepareEdit(QString* why)
 {
+    // Not every grid flip announces itself; strokes must land in the order
+    // the labels are in.
+    if (!followGridOrder()) {
+        if (why)
+            *why = tr("The segment's grid was flipped or turned, and its ink labels were closed.");
+        return false;
+    }
     if (!canEdit(why))
         return false;
     if (!_session->lockPending)
@@ -1061,15 +1171,30 @@ void InkLabelController::closeSession()
     commitOpenStroke();
     cancelPolygon();
     cancelAssist();
+    finishTransaction();
+    const QString key = _session->storeKey();
+    // A save or checkpoint still running holds an older state. It lands
+    // first and counts now: a Save as new version moves the session to the
+    // new version, and the edits made since then are checkpointed below
+    // instead of being skipped because a write was running.
+    if (_session->writable())
+        settleWrite(key);
     if (_session->writable() && _session->history.dirty()) {
-        startCheckpoint();
-        statusMessage(tr("Unsaved ink labels for %1 kept as autosave").arg(QString::fromStdString(_session->info.segment)), 6000);
+        // The raster goes with the session, so the checkpoint must have
+        // landed before the edits are reported as kept.
+        SaveRequest request = makeSaveRequest(Target::Autosave, false);
+        _session->lastWriteMs = nowMs();
+        startWrite(std::move(request));
+        settleWrite(key);
+        const QString segment = QString::fromStdString(_session->info.segment);
+        if (_checkpointedThisRun.contains(key)) {
+            statusMessage(tr("Unsaved ink labels for %1 kept as autosave").arg(segment), 6000);
+        } else {
+            statusMessage(tr("Unsaved ink labels for %1 could not be kept; they are lost").arg(segment), 15000);
+        }
     } else if (_session->writable() && !_session->lockPending) {
         // Clean: the labels equal the trainer files (an undo can get back
         // there after a checkpoint), so any checkpoint is stale.
-        const QString key = _session->storeKey();
-        if (auto it = _inFlight.find(key); it != _inFlight.end())
-            it->future.waitForFinished();
         removeTarget(_session->info.paths, Target::Autosave);
         _checkpointedThisRun.remove(key);
     }
@@ -1099,7 +1224,11 @@ void InkLabelController::onStateSurfaceChanged()
         // Same segment: only a changed canvas ends the session.
         const cv::Mat_<cv::Vec3f>* points = surface->rawPointsPtr();
         if (points && vc::RenderCanvas::make(points->size(), surface->scale(), 1.0) == _session->info.canvas) {
-            // The grid may have moved: hash it again before the next write.
+            // A flip or quarter turn moves the labels with the grid.
+            if (!followGridOrder())
+                return;
+            // The grid may have moved in place: hash it again before the
+            // next write.
             _session->geometryStale = true;
             return;
         }
@@ -1366,13 +1495,70 @@ bool InkLabelController::redo(Actor)
 // Saving
 // ---------------------------------------------------------------------------
 
+bool InkLabelController::followGridOrder()
+{
+    if (!_session || _session->info.locked)
+        return _session != nullptr;
+    const auto surface = _session->surface.lock();
+    const cv::Mat_<cv::Vec3f>* points = surface ? surface->rawPointsPtr() : nullptr;
+    // A grid of another size is a new canvas; the surface change closes it.
+    if (!points || points->size() != _session->info.canvas.grid)
+        return true;
+    const ReorderResult reorder = detectReorder(_session->anchors, *points);
+    if (reorder.match != ReorderMatch::Reordered)
+        return true;
+    moveLabelsWithGrid(reorder.reorder, *points);
+    return _session != nullptr;
+}
+
+void InkLabelController::moveLabelsWithGrid(const GridReorder& reorder, const cv::Mat_<cv::Vec3f>& points)
+{
+    commitOpenStroke();
+    cancelPolygon();
+    cancelAssist();
+    finishTransaction();
+    const QString segment = QString::fromStdString(_session->info.segment);
+    RemapOutcome moved = remapLabels(_session->raster, _session->info.canvas, reorder);
+    if (!moved.ok) {
+        // The open labels belong to the old order. Closing keeps them (with
+        // that order's anchors) as a checkpoint, and the next open locks them.
+        statusMessage(tr("The grid of %1 was flipped or turned and %2; its ink labels were closed and are locked until a new "
+                         "version is started.")
+                          .arg(segment, moved.error),
+                      15000);
+        closeSession();
+        return;
+    }
+    _session->raster = std::move(moved.raster);
+    // Undo entries hold tiles of the old order, so the history starts over.
+    const uint64_t serial = _session->history.nextSerial();
+    _session->history.reset(serial);
+    if (_session->writable() && !_session->lockPending)
+        _session->history.markClean(std::numeric_limits<uint64_t>::max());
+    _session->anchors = gridAnchors(points);
+    _session->geometryStale = true;
+    _overlay->resetForSession();
+    emit sessionChanged();
+    notifyHistory();
+    _overlay->refreshAll();
+    statusMessage(movedLabelsMessage(reorder, moved.droppedLabeled), 8000);
+}
+
 void InkLabelController::refreshGeometrySha()
 {
     if (!_session || !_session->geometryStale)
         return;
     _session->geometryStale = false;
-    if (auto surface = _session->surface.lock())
-        _session->geometrySha = geometrySha256(*surface);
+    auto surface = _session->surface.lock();
+    if (!surface)
+        return;
+    _session->geometrySha = geometrySha256(*surface);
+    // An edit in place: the current grid is the one the labels follow. A
+    // reorder that was not announced keeps the old anchors, so the next open
+    // still finds it.
+    if (const cv::Mat_<cv::Vec3f>* points = surface->rawPointsPtr();
+        points && detectReorder(_session->anchors, *points).match != ReorderMatch::Reordered)
+        _session->anchors = gridAnchors(*points);
 }
 
 SaveRequest InkLabelController::makeSaveRequest(Target target, bool overwriteExternalEdits)
@@ -1396,6 +1582,7 @@ SaveRequest InkLabelController::makeSaveRequest(Target target, bool overwriteExt
     s.segmentUuid = _session->info.segmentUuid;
     s.segmentPath = _session->info.segmentDir.string();
     s.geometrySha256 = _session->geometrySha;
+    s.gridAnchors = _session->anchors;
     s.stateSerial = _session->history.stateSerial();
     s.writeSeq = ++_session->writeSeq;
     s.savedBy = QStringLiteral("VC3D %1").arg(QCoreApplication::applicationVersion()).trimmed().toStdString();
@@ -1416,59 +1603,94 @@ QFuture<SaveOutcome> InkLabelController::startWrite(SaveRequest request)
     const uint64_t generation = _session ? _session->generation : 0;
     std::shared_ptr<QLockFile> lock = _session ? _session->lock : nullptr;
     const uint64_t id = _nextWriteId++;
-    QFuture<SaveOutcome> future = QtConcurrent::run([request = std::move(request)] {
+    QFuture<SaveOutcome> future = QtConcurrent::run([request = std::move(request), gate = _writeGateForTesting] {
         try {
+            if (gate)
+                gate();
             return saveLabels(request);
         } catch (const std::exception& e) {
             return failedOutcome(QString::fromUtf8(e.what()));
         }
     });
-    _inFlight.insert(storeKey, InFlight{id, target, future, lock});
+    _inFlight.insert(storeKey, InFlight{id, target, version, future, lock});
+    if (lock)
+        _writeLocks.insert(storeKey, lock);
     if (target == Target::Autosave)
         _checkpointedThisRun.insert(storeKey);
 
+    // The watcher holds the store's lock until it runs, then lets it go.
+    auto heldLock = std::make_shared<std::shared_ptr<QLockFile>>(lock);
     auto* watcher = new QFutureWatcher<SaveOutcome>(this);
-    connect(watcher, &QFutureWatcherBase::finished, this, [this, watcher, storeKey, id, generation, lock, target, version]() {
+    connect(watcher, &QFutureWatcherBase::finished, this, [this, watcher, storeKey, id, generation, heldLock, target, version]() {
         watcher->deleteLater();
         const SaveOutcome outcome = watcher->result();
         if (auto it = _inFlight.find(storeKey); it != _inFlight.end() && it->id == id)
             _inFlight.erase(it);
-        if (_session && _session->generation == generation && outcome.ok) {
-            if (target == Target::Trainer) {
-                // The save deleted the checkpoint: a later open of this store
-                // must not restore it without asking.
-                _checkpointedThisRun.remove(storeKey);
-                if (_session->info.paths.version != version) {
-                    // Saved as a new version: the session moves to it, and
-                    // the old version's checkpoint is superseded.
-                    removeTarget(_session->info.paths, Target::Autosave);
-                    _checkpointedThisRun.remove(_session->storeKey());
-                    _session->info.paths.version = version;
-                    _session->expectedSha.clear();
-                }
-                _session->history.markClean(outcome.stateSerial);
-                for (const auto& [kind, sha] : outcome.sha256)
-                    _session->expectedSha[kind] = sha;
-                if (outcome.sha256.count(LabelKind::Validation))
-                    _session->validationFileExists = true;
-                _lastSave = LastSave{QDateTime::currentDateTimeUtc(), outcome.files, outcome.sha256};
-                statusMessage(tr("Saved ink labels for %1 (%2 ms)")
-                                  .arg(QString::fromStdString(_session->info.segment))
-                                  .arg(qRound(outcome.ms)),
-                              4000);
-            } else {
-                _lastAutosave = QDateTime::currentDateTimeUtc();
-            }
-            emit dirtyChanged(_session->history.dirty());
-            emit sessionChanged();
-        } else if (!outcome.ok && outcome.externallyEdited.isEmpty()) {
+        // settleWrite applied this outcome already, to the session as it was
+        // then.
+        const bool settled = _settledWrites.remove(id);
+        if (!settled && _session && _session->generation == generation)
+            applyWriteOutcome(target, version, outcome);
+        else if (!settled && !outcome.ok && outcome.externallyEdited.isEmpty())
             statusMessage(tr("Ink labels were not saved: %1").arg(outcome.error), 8000);
-        }
         emit saveFinished(outcome);
-        Q_UNUSED(lock);
+        heldLock->reset();
     });
     watcher->setFuture(future);
     return future;
+}
+
+void InkLabelController::applyWriteOutcome(Target target, int version, const SaveOutcome& outcome)
+{
+    if (!_session)
+        return;
+    if (!outcome.ok) {
+        if (target == Target::Autosave)
+            _checkpointedThisRun.remove(_session->storeKey());
+        if (outcome.externallyEdited.isEmpty())
+            statusMessage(tr("Ink labels were not saved: %1").arg(outcome.error), 8000);
+        return;
+    }
+    if (target == Target::Trainer) {
+        // The save deleted the checkpoint: a later open of this store
+        // must not restore it without asking.
+        _checkpointedThisRun.remove(_session->storeKey());
+        if (_session->info.paths.version != version) {
+            // Saved as a new version: the session moves to it, and
+            // the old version's checkpoint is superseded.
+            removeTarget(_session->info.paths, Target::Autosave);
+            _session->info.paths.version = version;
+            _session->expectedSha.clear();
+        }
+        _session->history.markClean(outcome.stateSerial);
+        for (const auto& [kind, sha] : outcome.sha256)
+            _session->expectedSha[kind] = sha;
+        if (outcome.sha256.count(LabelKind::Validation))
+            _session->validationFileExists = true;
+        _lastSave = LastSave{QDateTime::currentDateTimeUtc(), outcome.files, outcome.sha256};
+        statusMessage(tr("Saved ink labels for %1 (%2 ms)")
+                          .arg(QString::fromStdString(_session->info.segment))
+                          .arg(qRound(outcome.ms)),
+                      4000);
+    } else {
+        _lastAutosave = QDateTime::currentDateTimeUtc();
+    }
+    emit dirtyChanged(_session->history.dirty());
+    emit sessionChanged();
+}
+
+bool InkLabelController::settleWrite(const QString& storeKey)
+{
+    const auto it = _inFlight.find(storeKey);
+    if (it == _inFlight.end())
+        return false;
+    InFlight write = *it;
+    _inFlight.erase(it);
+    write.future.waitForFinished();
+    _settledWrites.insert(write.id);
+    if (_session && _session->storeKey() == storeKey)
+        applyWriteOutcome(write.target, write.version, write.future.result());
+    return true;
 }
 
 QFuture<SaveOutcome> InkLabelController::save()
@@ -1517,7 +1739,9 @@ std::vector<int> InkLabelController::versions() const
 {
     if (!_session)
         return {};
-    std::vector<int> list = listVersions(_session->info.paths.dir, _session->info.paths.prefix);
+    // Versions with only a checkpoint can be opened, and Save as new version
+    // must number past them.
+    std::vector<int> list = listVersions(_session->info.paths.dir, _session->info.paths.prefix, VersionFiles::TrainerAndDrafts);
     if (std::find(list.begin(), list.end(), _session->info.paths.version) == list.end()) {
         list.push_back(_session->info.paths.version);
         std::sort(list.begin(), list.end());
@@ -1529,10 +1753,8 @@ InkLabelController::OpenOutcome InkLabelController::openVersion(int version)
 {
     OpenOptions options;
     options.version = version;
-    if (_session && _session->info.paths.version == version)
-        return openForActiveSegment(options);
-    // A different version of the same store: release this one first.
-    closeSession();
+    // openStore releases the current version only once the requested one is
+    // found, so asking for a missing version keeps the session as it is.
     return openForActiveSegment(options);
 }
 
@@ -1543,11 +1765,12 @@ InkLabelController::OpenOutcome InkLabelController::startNewVersion()
     if (!request)
         return failure;
     const StorePaths paths = storePathsFor(request->projectDir, request->segment);
-    const std::vector<int> existing = listVersions(paths.dir, paths.prefix);
+    // Close first: its checkpoint can create a draft version to number past.
+    closeSession();
+    const std::vector<int> existing = listVersions(paths.dir, paths.prefix, VersionFiles::TrainerAndDrafts);
     OpenOptions options;
     options.version = (existing.empty() ? 1 : existing.back()) + 1;
     options.createVersion = true;
-    closeSession();
     OpenOutcome out = openStore(*request, options);
     if (out.ok)
         statusMessage(tr("Ink labels: started empty version %1; Save writes it").arg(options.version), 5000);
@@ -1559,7 +1782,13 @@ QJsonObject InkLabelController::datasetEntry() const
     if (!_session)
         return {};
     const fs::path projectDir = _session->info.paths.dir.parent_path().parent_path();
-    return vc3d::ink_labels::datasetEntry(_session->info.paths, projectDir, versions());
+    // The trainer reads saved versions only; checkpoints never reach it.
+    std::vector<int> saved = listVersions(_session->info.paths.dir, _session->info.paths.prefix, VersionFiles::Trainer);
+    if (std::find(saved.begin(), saved.end(), _session->info.paths.version) == saved.end()) {
+        saved.push_back(_session->info.paths.version);
+        std::sort(saved.begin(), saved.end());
+    }
+    return vc3d::ink_labels::datasetEntry(_session->info.paths, projectDir, saved);
 }
 
 QString InkLabelController::datasetEntryText() const
@@ -1613,6 +1842,16 @@ void InkLabelController::finishImport(const AssistResult& result)
             statusMessage(tr("Ink labels: %1 failed: %2").arg(result.what, outcome.error), 8000);
         emit assistChanged();
         emit importFinished(result.importPath, outcome, result.importOptions);
+        return;
+    }
+    // A flip of the grid since the import read the labels starts a new
+    // history, so the import is not replayed below.
+    if (!followGridOrder()) {
+        ImportOutcome closed = outcome;
+        closed.ok = false;
+        closed.error = tr("The segment's grid was flipped or turned, and its ink labels were closed.");
+        emit assistChanged();
+        emit importFinished(result.importPath, closed, result.importOptions);
         return;
     }
     // Replay only onto the state the import read.
@@ -2624,6 +2863,20 @@ InkLabelController::OpenOutcome InkLabelController::openForTesting(const vc::Ren
     request.canvas = canvas;
     request.projectDir = projectDir;
     request.segment = segment;
+    return openStore(request, options);
+}
+
+InkLabelController::OpenOutcome InkLabelController::openForTesting(const std::shared_ptr<QuadSurface>& surface,
+                                                                   const fs::path& projectDir,
+                                                                   const std::string& segment,
+                                                                   const OpenOptions& options)
+{
+    OpenRequest request;
+    request.canvas = vc::RenderCanvas::make(surface->rawPointsPtr()->size(), surface->scale(), 1.0);
+    request.projectDir = projectDir;
+    request.segment = segment;
+    request.surface = surface;
+    request.geometrySha = geometrySha256(*surface);
     return openStore(request, options);
 }
 

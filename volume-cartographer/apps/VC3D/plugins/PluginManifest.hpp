@@ -112,6 +112,23 @@ QString resultKindName(ResultKind kind);
 // Human wording for an unavailable placeholder, e.g. "an active segment".
 QString requirementFor(const QString& placeholder);
 
+// Sets the segment placeholders for the active segment: {segment_id} always,
+// {segment} only when the segment has a tifxyz folder (segments opened from a
+// store have none).
+void setActiveSegment(PluginContext& ctx, const QString& segmentId, const QString& folder);
+
+// What was open when a run started. A result that goes into VC3D's state
+// (points, an overlay) is loaded only while the same project, volume and
+// working level are open: the plugin wrote it in their coordinates.
+struct OpenSource {
+    QString project;
+    QString volumeId;
+    QString annotationVolume;
+    double scale = 1.0;
+};
+// Why a result made for `started` must not be loaded into `now`, or empty.
+QString sourceChange(const OpenSource& started, const OpenSource& now);
+
 // Arguments joined for display, each quoted when it contains spaces.
 QString displayCommand(const QString& program, const QStringList& args);
 

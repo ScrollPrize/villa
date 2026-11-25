@@ -19,6 +19,7 @@
 #include <QtConcurrent/QtConcurrentRun>
 
 #include <algorithm>
+#include <cmath>
 #include <filesystem>
 #include <memory>
 #include <system_error>
@@ -105,15 +106,6 @@ std::shared_ptr<const PointCollections> recoverablePoints(const PointCollections
     return *points > 0 ? copy : nullptr;
 }
 
-// Whether loading a points file over these collections would lose anything.
-bool holdsWork(const PointCollections& points)
-{
-    const auto& collections = points.getAllCollections();
-    return std::any_of(collections.begin(), collections.end(), [](const auto& entry) {
-        return !entry.second.points.empty() || entry.second.anchor2d;
-    });
-}
-
 // One background write: the points copy (or its removal), then the record.
 struct SessionWrite
 {
@@ -183,6 +175,11 @@ SessionRecovery::LeftoverSession readLeftover(const QString& directory)
         session.updated = QDateTime::fromString(record.value(QStringLiteral("updated")).toString(), Qt::ISODate);
         session.collectionCount = record.value(QStringLiteral("collections")).toInt();
         session.pointCount = record.value(QStringLiteral("points")).toInt();
+        const QJsonObject volume = record.value(QStringLiteral("volume")).toObject();
+        session.volumeId = volume.value(QStringLiteral("id")).toString();
+        session.annotationVolume = volume.value(QStringLiteral("annotation_volume")).toString();
+        const double scale = volume.value(QStringLiteral("scale")).toDouble(1.0);
+        session.annotationScale = std::isfinite(scale) && scale > 0 ? scale : 1.0;
     }
     if (!session.updated.isValid()) {
         session.updated = QFileInfo(directory).lastModified();
@@ -317,6 +314,20 @@ void SessionRecovery::setProject(const QString& path)
     }
     _projectPath = path;
     _segmentId.clear();
+    _volumeId.clear();
+    _annotationVolume.clear();
+    _annotationScale = 1.0;
+    flush();
+}
+
+void SessionRecovery::setVolume(const QString& volumeId, const QString& annotationVolume, double scale)
+{
+    if (volumeId == _volumeId && annotationVolume == _annotationVolume && scale == _annotationScale) {
+        return;
+    }
+    _volumeId = volumeId;
+    _annotationVolume = annotationVolume;
+    _annotationScale = scale;
     flush();
 }
 
@@ -378,6 +389,13 @@ void SessionRecovery::flush()
     record[QStringLiteral("updated")] = QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs);
     record[QStringLiteral("project")] = _projectPath;
     record[QStringLiteral("segment")] = _segmentId;
+    if (!_annotationVolume.isEmpty()) {
+        QJsonObject volume;
+        volume[QStringLiteral("id")] = _volumeId;
+        volume[QStringLiteral("annotation_volume")] = _annotationVolume;
+        volume[QStringLiteral("scale")] = _annotationScale;
+        record[QStringLiteral("volume")] = volume;
+    }
     record[QStringLiteral("collections")] = _collectionCount;
     record[QStringLiteral("points")] = _pointCount;
 
@@ -495,18 +513,29 @@ std::shared_ptr<QLockFile> SessionRecovery::claim(const LeftoverSession& session
 
 bool SessionRecovery::restorePoints(const LeftoverSession& session,
                                     VCCollection* collection,
-                                    QString* error)
+                                    QString* error,
+                                    double scale,
+                                    QString* note)
 {
     QString problem;
+    PointCollections::MergeOutcome merged;
     if (!collection || !session.hasPoints()) {
         problem = tr("no saved points");
-    } else if (holdsWork(*collection)) {
-        problem = tr("points or segment correction points are loaded now");
-    } else if (!collection->loadFromJSON(localPath(session.pointsFile()))) {
-        problem = tr("%1 could not be read").arg(QDir::toNativeSeparators(session.pointsFile()));
+    } else if (merged = collection->mergeUnanchoredFromJSON(localPath(session.pointsFile()), scale); !merged.ok) {
+        problem = tr("%1 could not be read: %2")
+                      .arg(QDir::toNativeSeparators(session.pointsFile()), QString::fromStdString(merged.error));
     }
     if (error) {
         *error = problem;
+    }
+    if (note) {
+        QStringList renamed;
+        for (const auto& [from, to] : merged.renamed) {
+            renamed << tr("%1 as %2").arg(QString::fromStdString(from), QString::fromStdString(to));
+        }
+        *note = renamed.isEmpty()
+            ? QString()
+            : tr("Collections that differ from their saved versions came back beside them: %1.").arg(renamed.join(", "));
     }
     return problem.isEmpty();
 }

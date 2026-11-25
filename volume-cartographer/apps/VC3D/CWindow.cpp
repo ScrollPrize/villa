@@ -1679,9 +1679,25 @@ void CWindow::startSessionRecovery(bool offerLeftovers)
     _sessionRecovery->begin(_state->pointCollection());
     _sessionRecovery->setProject(projectPath());
     _sessionRecovery->setSegment(QString::fromStdString(_state->activeSurfaceId()));
-    connect(_state, &CState::vpkgChanged, _sessionRecovery, [this](std::shared_ptr<VolumePkg> vpkg) {
+    // The point collections in memory are the open volume's, in its voxels.
+    const auto currentVoxels = [this]() -> std::optional<SessionRecovery::Voxels> {
+        const auto& voxels = _state->annotationVolume();
+        if (!voxels) {
+            return std::nullopt;
+        }
+        return SessionRecovery::Voxels{QString::fromStdString(_state->currentVolumeId()),
+                                       QString::fromStdString(voxels->volume), voxels->scale};
+    };
+    const auto recordVolume = [this, currentVoxels] {
+        const auto voxels = currentVoxels().value_or(SessionRecovery::Voxels{});
+        _sessionRecovery->setVolume(voxels.volumeId, voxels.annotationVolume, voxels.scale);
+    };
+    recordVolume();
+    connect(_state, &CState::vpkgChanged, _sessionRecovery, [this, recordVolume](std::shared_ptr<VolumePkg> vpkg) {
         _sessionRecovery->setProject(vpkg ? vc3d::pathToQString(vpkg->path()) : QString());
+        recordVolume();
     });
+    connect(_state, &CState::volumeChanged, _sessionRecovery, [recordVolume] { recordVolume(); });
     connect(_surfacePanel.get(), &SurfacePanelController::surfaceActivated,
             _sessionRecovery, &SessionRecovery::setSegment);
     connect(_surfacePanel.get(), &SurfacePanelController::surfaceActivatedPreserveEditing,
@@ -1693,14 +1709,30 @@ void CWindow::startSessionRecovery(bool offerLeftovers)
     // and stay over the project Recover opens, so it waits for the offer and
     // shows only if no project is open by then.
     _sessionRecoveryOfferPending = true;
-    QTimer::singleShot(0, this, [this, projectPath]() {
+    QTimer::singleShot(0, this, [this, projectPath, currentVoxels]() {
         auto* dialog = SessionRecoveryDialog::offer(this, *_sessionRecovery, _state->pointCollection(), {
             projectPath,
             [this](const QString& path, QString* error) { return openVolumePackage(path, false, error); },
             [this](const QString& id, QString* error) {
                 return _surfacePanel->activateSurfaceById(id.toStdString(), error);
             },
-            [this](const QString& text) { showStatusBarMessage(text, 15000); }});
+            [this](const QString& text) { showStatusBarMessage(text, 15000); },
+            currentVoxels,
+            [this](const QString& volumeId, QString* error) {
+                const auto vpkg = _state->vpkg();
+                std::shared_ptr<Volume> volume;
+                try {
+                    volume = vpkg ? vpkg->volume(volumeId.toStdString()) : nullptr;
+                } catch (const std::exception&) {
+                }
+                if (!volume) {
+                    *error = tr("the project has no volume %1").arg(volumeId);
+                    return false;
+                }
+                setVolume(volume);
+                syncVolumeSelectionControls(volumeId);
+                return true;
+            }});
         const auto offerDone = [this]() {
             const bool showCatalog = _startupCatalogDeferred;
             _sessionRecoveryOfferPending = false;

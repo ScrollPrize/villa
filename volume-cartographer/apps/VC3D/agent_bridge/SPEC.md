@@ -173,6 +173,10 @@ that value to the modifiers of the keys still held. A key's event text is
 the key's own character, without a keyboard layout: `Shift+1` carries the text
 `1`, not `!`. Shortcuts match on the key and modifiers, so they are not
 affected; a widget that reads the event text gets the unshifted character.
+While a key is delivered, handlers can tell it is the agent's
+(`vc3d::handlingAgentInput()` in `InputOrigin.hpp`): the ink label Undo key
+then undoes only the agent's own edits, as `ink_labels.history` does without
+`force`.
 Wheel deltas use Qt angle units, 120 per notch.
 
 Synthesized events bypass Qt's modal blocking, so `canvas.click`,

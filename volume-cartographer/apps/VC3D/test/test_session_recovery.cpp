@@ -23,11 +23,15 @@
 
 #include "VCSettings.hpp"
 
+#include <algorithm>
 #include <chrono>
+#include <tuple>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
+#include <map>
 #include <memory>
+#include <optional>
 #include <system_error>
 
 #ifdef Q_OS_UNIX
@@ -53,6 +57,8 @@ void fillPoints(VCCollection& points)
     points.setCollectionColor(*id, {0.25f, 0.5f, 0.75f});
 }
 
+// The same collections (by name) with the same points. Restored
+// collections are new objects, so ids and uuids are not compared.
 bool samePoints(const VCCollection& a, const VCCollection& b)
 {
     const auto& left = a.getAllCollections();
@@ -60,20 +66,32 @@ bool samePoints(const VCCollection& a, const VCCollection& b)
     if (left.size() != right.size()) {
         return false;
     }
+    const auto sorted = [](const auto& points) {
+        std::vector<ColPoint> list;
+        for (const auto& [_, point] : points) {
+            list.push_back(point);
+        }
+        std::sort(list.begin(), list.end(), [](const ColPoint& x, const ColPoint& y) {
+            return std::tie(x.p[0], x.p[1], x.p[2], x.creation_time) < std::tie(y.p[0], y.p[1], y.p[2], y.creation_time);
+        });
+        return list;
+    };
     for (const auto& [id, collection] : left) {
-        const auto other = right.find(id);
-        if (other == right.end() || other->second.name != collection.name ||
-            other->second.uuid != collection.uuid || other->second.tags != collection.tags ||
+        const auto other = std::find_if(right.begin(), right.end(),
+                                        [&](const auto& entry) { return entry.second.name == collection.name; });
+        if (other == right.end() || other->second.tags != collection.tags ||
             other->second.color != collection.color ||
             other->second.points.size() != collection.points.size()) {
             return false;
         }
-        for (const auto& [pointId, point] : collection.points) {
-            const auto match = other->second.points.find(pointId);
-            if (match == other->second.points.end() || match->second.p != point.p ||
-                match->second.creation_time != point.creation_time ||
-                (match->second.winding_annotation != point.winding_annotation &&
-                 !(std::isnan(point.winding_annotation) && std::isnan(match->second.winding_annotation)))) {
+        const auto mine = sorted(collection.points);
+        const auto theirs = sorted(other->second.points);
+        for (std::size_t i = 0; i < mine.size(); ++i) {
+            const ColPoint& point = mine[i];
+            const ColPoint& match = theirs[i];
+            if (match.p != point.p || match.creation_time != point.creation_time ||
+                (match.winding_annotation != point.winding_annotation &&
+                 !(std::isnan(point.winding_annotation) && std::isnan(match.winding_annotation)))) {
                 return false;
             }
         }
@@ -154,14 +172,34 @@ void addCorrection(VCCollection& points, const std::string& name)
     points.setCollectionAnchor2d(*points.getCollectionId(name), cv::Vec2f(5.0f, 6.0f));
 }
 
+// A saved point collection as the object store hands it back.
+nlohmann::json savedCollection(const std::string& uuid, const std::string& name, const cv::Vec3f& p)
+{
+    return {{"uuid", uuid},
+            {"name", name},
+            {"points", {{"1", {{"p", {p[0], p[1], p[2]}}, {"creation_time", 0}, {"wind_a", nullptr}}}}},
+            {"color", {0.5, 0.5, 0.5}}};
+}
+
 // Records what the recovery dialog asks of the main window. Opening a
-// project clears the collections, as CWindow::CloseVolume does.
+// project clears the collections and loads the open volume's saved ones, as
+// CWindow and the object store sync do; so does switching the volume.
 struct FakeWindow
 {
     VCCollection* points{nullptr};
     QString project;
     bool openSucceeds{true};
     QStringList calls;
+    // The open volume (empty: none), the scale of its voxels, and the saved
+    // collections of each volume.
+    QString volume;
+    double scale{1.0};
+    std::map<QString, std::vector<nlohmann::json>> saved;
+
+    void loadSaved()
+    {
+        points->replaceUnanchoredCollections(saved[volume]);
+    }
     // When set, selecting a segment also records what is on disk at that
     // moment: the running session's copy and whether oldCopy still exists.
     SessionRecovery* recovery{nullptr};
@@ -179,6 +217,7 @@ struct FakeWindow
                 }
                 points->clearAll();
                 project = path;
+                loadSaved();
                 return true;
             },
             [this](const QString& id, QString*) {
@@ -197,7 +236,24 @@ struct FakeWindow
                 addCorrection(*points, "segment corrections");
                 return true;
             },
-            [this](const QString& text) { calls << "status " + text; }};
+            [this](const QString& text) { calls << "status " + text; },
+            [this]() -> std::optional<SessionRecovery::Voxels> {
+                if (volume.isEmpty()) {
+                    return std::nullopt;
+                }
+                return SessionRecovery::Voxels{volume, "uuid-" + volume, scale};
+            },
+            [this](const QString& id, QString* error) {
+                calls << "volume " + id;
+                if (!saved.contains(id)) {
+                    *error = QStringLiteral("no such volume");
+                    return false;
+                }
+                volume = id;
+                scale = 1.0;
+                loadSaved();
+                return true;
+            }};
     }
 };
 
@@ -370,7 +426,7 @@ private slots:
         QCOMPARE(restored.getPoints("my points").size(), std::size_t{1});
     }
 
-    void restoreNeverReplacesLoadedWork()
+    void restoreKeepsLoadedWork()
     {
         QTemporaryDir root;
         writeLeftover(root.path(), "session-crashed", QDateTime::currentDateTimeUtc(), true);
@@ -378,20 +434,26 @@ private slots:
         const auto leftovers = session.leftoverSessions();
         QCOMPARE(leftovers.size(), std::size_t{1});
 
-        // Loading the copy would drop the active surface's correction points,
-        // and VC3D's corrections autosave would then rewrite them in the store.
+        // The active surface's correction points and points placed in this
+        // session stay; the copy's points come back beside them.
         VCCollection live;
         addCorrection(live, "segment corrections");
+        live.addPoint("new work", {5.0f, 5.0f, 5.0f});
         QString error;
-        QVERIFY(!SessionRecovery::restorePoints(leftovers.front(), &live, &error));
-        QVERIFY(error.contains("correction"));
+        QVERIFY2(SessionRecovery::restorePoints(leftovers.front(), &live, &error), qPrintable(error));
         QCOMPARE(live.getPoints("segment corrections").size(), std::size_t{1});
+        QCOMPARE(live.getPoints("new work").size(), std::size_t{1});
+        QCOMPARE(live.getPoints("corrections").size(), std::size_t{1});
+        QCOMPARE(live.getAllCollections().size(), std::size_t{3});
 
-        // Nor does it replace points placed in this session.
-        VCCollection work;
-        work.addPoint("new work", {5.0f, 5.0f, 5.0f});
-        QVERIFY(!SessionRecovery::restorePoints(leftovers.front(), &work));
-        QCOMPARE(work.getAllCollections().size(), std::size_t{1});
+        // A name in use is not merged into: the copy comes back beside it.
+        VCCollection named;
+        named.addPoint("corrections", {9.0f, 9.0f, 9.0f});
+        QString note;
+        QVERIFY(SessionRecovery::restorePoints(leftovers.front(), &named, &error, 1.0, &note));
+        QCOMPARE(named.getPoints("corrections").size(), std::size_t{1});
+        QCOMPARE(named.getPoints("corrections (recovered)").size(), std::size_t{1});
+        QVERIFY(note.contains("corrections (recovered)"));
         QCOMPARE(session.leftoverSessions().size(), std::size_t{1});
     }
 
@@ -753,16 +815,117 @@ private slots:
         QVERIFY(failing.calls.at(1).contains("kept"));
         QCOMPARE(session.leftoverSessions().size(), std::size_t{1});
 
-        // The recorded project is open, but points are loaded already.
-        FakeWindow busy{&live, kProject};
-        live.addPoint("new work", {5.0f, 5.0f, 5.0f});
-        dialog = SessionRecoveryDialog::offer(nullptr, session, &live, busy.actions());
+        session.markCleanExit();
+    }
+
+    void dialogKeepsTheCopyWhenItsVolumeCannotOpen()
+    {
+        QTemporaryDir root;
+        {
+            VCCollection crashed;
+            SessionRecovery old(root.path());
+            QVERIFY(old.begin(&crashed));
+            old.setProject(kProject);
+            old.setVolume("vol_gone", "uuid-vol_gone", 1.0);
+            crashed.addPoint("work", {1.0f, 2.0f, 3.0f});
+            old.flush();
+            QVERIFY(old.waitForWrite());
+        }  // Lock released, folder kept: same as a crash.
+        SessionRecovery session(root.path());
+        VCCollection live;
+        QVERIFY(session.begin(&live));
+        const auto leftovers = session.leftoverSessions();
+        QCOMPARE(leftovers.size(), std::size_t{1});
+        QCOMPARE(leftovers.front().volumeId, QStringLiteral("vol_gone"));
+
+        // The project is open in another volume, and the recorded one is not
+        // in it any more: nothing goes into the open volume's collections.
+        FakeWindow window{&live, kProject};
+        window.volume = "vol_a";
+        window.saved["vol_a"] = {savedCollection("11111111-1111-4111-8111-111111111111", "saved", {4, 5, 6})};
+        window.loadSaved();
+        QPointer<SessionRecoveryDialog> dialog =
+            SessionRecoveryDialog::offer(nullptr, session, &live, window.actions());
         QVERIFY(dialog);
         dialog->findChild<QPushButton*>("recoverSessionButton")->click();
+        QCOMPARE(window.calls.size(), 2);
+        QCOMPARE(window.calls.at(0), QStringLiteral("volume vol_gone"));
+        QVERIFY(window.calls.at(1).contains("vol_gone"));
+        QVERIFY(window.calls.at(1).contains("kept"));
         QCOMPARE(live.getAllCollections().size(), std::size_t{1});
-        QCOMPARE(busy.calls.size(), 1);
-        QVERIFY(busy.calls.front().contains("kept"));
         QCOMPARE(session.leftoverSessions().size(), std::size_t{1});
+        session.markCleanExit();
+    }
+
+    void dialogRestoresBesideSavedCollectionsInTheRecordedVolume()
+    {
+        const std::string same = "22222222-2222-4222-8222-222222222222";
+        const std::string edited = "33333333-3333-4333-8333-333333333333";
+        const std::string others = "44444444-4444-4444-8444-444444444444";
+        QTemporaryDir root;
+        {
+            // The crashed session worked in vol_b at level 1 (scale 0.5): one
+            // saved collection unchanged, one edited since its save, one new.
+            VCCollection crashed;
+            SessionRecovery old(root.path());
+            QVERIFY(old.begin(&crashed));
+            old.setProject(kProject);
+            old.setVolume("vol_b", "uuid-vol_b", 0.5);
+            crashed.replaceUnanchoredCollections({savedCollection(same, "fibers", {5, 10, 15}),
+                                                  savedCollection(edited, "windings", {50, 50, 50})});
+            crashed.addPoint("windings", {60.0f, 60.0f, 60.0f});
+            crashed.addPoint("new", {1.0f, 1.0f, 1.0f});
+            addCorrection(crashed, "segment corrections");
+            old.flush();
+            QVERIFY(old.waitForWrite());
+        }
+        SessionRecovery session(root.path());
+        VCCollection live;
+        QVERIFY(session.begin(&live));
+        const auto leftovers = session.leftoverSessions();
+        QCOMPARE(leftovers.size(), std::size_t{1});
+        QCOMPARE(leftovers.front().annotationVolume, QStringLiteral("uuid-vol_b"));
+        QCOMPARE(leftovers.front().annotationScale, 0.5);
+
+        // The project opens in vol_a; vol_b's saved collections are in level
+        // 0 voxels, and someone else added one since.
+        FakeWindow window{&live};
+        window.volume = "vol_a";
+        window.saved["vol_a"] = {savedCollection("55555555-5555-4555-8555-555555555555", "a's", {1, 1, 1})};
+        window.saved["vol_b"] = {savedCollection(same, "fibers", {10, 20, 30}),
+                                 savedCollection(edited, "windings", {100, 100, 100}),
+                                 savedCollection(others, "someone else's", {7, 7, 7})};
+        QPointer<SessionRecoveryDialog> dialog =
+            SessionRecoveryDialog::offer(nullptr, session, &live, window.actions());
+        QVERIFY(dialog);
+        QVERIFY(dialog->findChild<QCheckBox*>("selectSegmentCheck") == nullptr);
+        dialog->findChild<QPushButton*>("recoverSessionButton")->click();
+        QCOMPARE(window.calls.size(), 3);
+        QCOMPARE(window.calls.at(0), "open " + kProject);
+        QCOMPARE(window.calls.at(1), QStringLiteral("volume vol_b"));
+        QVERIFY(window.calls.at(2).startsWith("status Recovered"));
+        QVERIFY(window.calls.at(2).contains("windings (recovered)"));
+
+        // Saved collections stay as saved; the unchanged one is not doubled;
+        // the edited one and the new one come back, in level 0 voxels.
+        QCOMPARE(live.getAllCollections().size(), std::size_t{5});
+        QCOMPARE(live.getPoints("fibers").size(), std::size_t{1});
+        QCOMPARE(live.getPoints("someone else's").size(), std::size_t{1});
+        QCOMPARE(live.getPoints("windings").size(), std::size_t{1});
+        QCOMPARE(live.getPoints("windings").front().p, cv::Vec3f(100, 100, 100));
+        const auto recovered = live.getPoints("windings (recovered)");
+        QCOMPARE(recovered.size(), std::size_t{2});
+        const auto newPoints = live.getPoints("new");
+        QCOMPARE(newPoints.size(), std::size_t{1});
+        QCOMPARE(newPoints.front().p, cv::Vec3f(2, 2, 2));
+        // Recovered collections are new objects, never the saved ones' uuids.
+        for (const auto& [id, collection] : live.getAllCollections()) {
+            if (collection.name == "windings (recovered)") {
+                QVERIFY(collection.uuid != edited);
+            }
+        }
+        QVERIFY(!live.getCollectionId("segment corrections"));
+        QVERIFY(session.leftoverSessions().empty());
         session.markCleanExit();
     }
 

@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cmath>
 #include <filesystem>
+#include <set>
 #include <fstream>
 #include <vector>
 
@@ -511,4 +512,92 @@ TEST_CASE("an invalid collection uuid leaves the store unchanged")
     CHECK_FALSE(c.replaceAnchoredCollections(corrections));
     CHECK(c.getAllCollections().size() == 1);
     CHECK(c.getCollectionId("good") == std::nullopt);
+}
+
+TEST_CASE("merging a file keeps what is loaded and moves links with new ids")
+{
+    const fs::path tmp = fs::temp_directory_path() / ("pc_merge_" + std::to_string(::getpid()) + ".json");
+    PointCollections file;
+    const auto a = file.addPoint("lines", {1, 2, 3});
+    auto b = file.addPoint("lines", {4, 5, 6});
+    b.links = {a.id};
+    file.updatePoint(b);
+    file.addPoint("same", {7, 8, 9});
+    file.addPoint("fix", {1, 1, 1});
+    file.setCollectionAnchor2d(file.getCollectionId("fix").value(), cv::Vec2f(1, 1));
+    REQUIRE(file.saveToJSON(tmp.string()));
+
+    // In memory: "same" as saved (same uuid and points), and other work.
+    PointCollections live;
+    std::vector<nlohmann::json> saved;
+    for (const auto& [id, col] : file.getAllCollections())
+        if (col.name == "same") {
+            nlohmann::json j;
+            to_json(j, col);
+            saved.push_back(j);
+        }
+    REQUIRE(live.replaceUnanchoredCollections(saved));
+    live.addPoint("work", {0, 0, 0});
+
+    const auto merged = live.mergeUnanchoredFromJSON(tmp.string(), 2.0);
+    REQUIRE(merged.ok);
+    CHECK(merged.added == 2);
+    CHECK(merged.unchanged == 0);  // scaled by 2, "same" differs from the saved one
+    CHECK(merged.renamed.size() == 1);
+    CHECK(live.getPoints("work").size() == 1);
+    CHECK(live.getPoints("same").size() == 1);
+    CHECK(live.getPoints("same (recovered)").front().p == cv::Vec3f(14, 16, 18));
+    CHECK_FALSE(live.getCollectionId("fix").has_value());
+    fs::remove(tmp);
+}
+
+TEST_CASE("merging an unchanged collection adds nothing; links follow new point ids")
+{
+    const fs::path tmp = fs::temp_directory_path() / ("pc_merge2_" + std::to_string(::getpid()) + ".json");
+    PointCollections file;
+    const auto a = file.addPoint("lines", {1, 2, 3});
+    auto b = file.addPoint("lines", {4, 5, 6});
+    b.links = {a.id};
+    file.updatePoint(b);
+    file.addPoint("same", {7, 8, 9});
+    REQUIRE(file.saveToJSON(tmp.string()));
+
+    PointCollections live;
+    std::vector<nlohmann::json> saved;
+    for (const auto& [id, col] : file.getAllCollections())
+        if (col.name == "same") {
+            nlohmann::json j;
+            to_json(j, col);
+            saved.push_back(j);
+        }
+    REQUIRE(live.replaceUnanchoredCollections(saved));
+    // Ids taken in memory: the merged points must not reuse them.
+    for (int i = 0; i < 5; ++i)
+        live.addPoint("work", {float(i), 0, 0});
+
+    const auto merged = live.mergeUnanchoredFromJSON(tmp.string());
+    REQUIRE(merged.ok);
+    CHECK(merged.added == 1);
+    CHECK(merged.unchanged == 1);
+    CHECK(merged.renamed.empty());
+    CHECK(live.getPoints("same").size() == 1);
+    const auto lines = live.getPoints("lines");
+    REQUIRE(lines.size() == 2);
+    const auto& first = lines[0].p == cv::Vec3f(1, 2, 3) ? lines[0] : lines[1];
+    const auto& second = lines[0].p == cv::Vec3f(1, 2, 3) ? lines[1] : lines[0];
+    REQUIRE(second.links.size() == 1);
+    CHECK(second.links.front() == first.id);
+    std::set<uint64_t> ids;
+    for (const auto& [_, col] : live.getAllCollections())
+        for (const auto& [id, _p] : col.points)
+            CHECK(ids.insert(id).second);
+    const auto linesId = live.getCollectionId("lines").value();
+    CHECK(live.getAllCollections().at(linesId).uuid != file.getAllCollections().at(file.getCollectionId("lines").value()).uuid);
+
+    // A malformed file changes nothing.
+    { std::ofstream o(tmp); o << "{"; }
+    const auto before = live.getAllCollections().size();
+    CHECK_FALSE(live.mergeUnanchoredFromJSON(tmp.string()).ok);
+    CHECK(live.getAllCollections().size() == before);
+    fs::remove(tmp);
 }

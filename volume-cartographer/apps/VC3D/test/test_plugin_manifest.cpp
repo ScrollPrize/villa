@@ -202,6 +202,44 @@ void quotesDisplayedCommands()
              QStringLiteral("/bin/tool a 'b c' 'it'\\''s'"));
 }
 
+void segmentsFromAStoreHaveAnId()
+{
+    PluginContext ctx;
+    setActiveSegment(ctx, QStringLiteral("0d4f8a52-5b1c-4c56-9a3e-2f1d7a6b9c10"), QString());
+    CHECK_EQ(ctx.segmentId, QStringLiteral("0d4f8a52-5b1c-4c56-9a3e-2f1d7a6b9c10"));
+    CHECK(ctx.segment.isEmpty());
+    // {segment_id} expands; {segment} still asks for a folder.
+    PluginManifest m;
+    m.name = QStringLiteral("Export");
+    m.args = {QStringLiteral("{output}/{segment_id}.obj")};
+    ctx.output = QStringLiteral("/tmp/out");
+    const Expansion byId = expand(m, ctx);
+    CHECK_MSG(byId.error.isEmpty(), byId.error);
+    CHECK_EQ(byId.args.value(0), QStringLiteral("/tmp/out/0d4f8a52-5b1c-4c56-9a3e-2f1d7a6b9c10.obj"));
+    m.args = {QStringLiteral("{segment}")};
+    CHECK(!expand(m, ctx).error.isEmpty());
+
+    setActiveSegment(ctx, QStringLiteral("patch_7"), QStringLiteral("/data/paths/patch_7"));
+    CHECK_EQ(ctx.segment, QStringLiteral("/data/paths/patch_7"));
+    setActiveSegment(ctx, QString(), QStringLiteral("/data/paths/patch_7"));
+    CHECK(ctx.segment.isEmpty() && ctx.segmentId.isEmpty());
+}
+
+void resultsLoadOnlyIntoWhatWasOpen()
+{
+    const OpenSource started{QStringLiteral("/p/a.vcproj"), QStringLiteral("vol1"), QStringLiteral("uuid1"), 1.0};
+    CHECK(sourceChange(started, started).isEmpty());
+    OpenSource now = started;
+    now.project = QStringLiteral("/p/b.vcproj");
+    CHECK(sourceChange(started, now).contains(QStringLiteral("project")));
+    now = started;
+    now.volumeId = QStringLiteral("vol2");
+    CHECK(sourceChange(started, now).contains(QStringLiteral("volume")));
+    now = started;
+    now.scale = 0.5;
+    CHECK(sourceChange(started, now).contains(QStringLiteral("working level")));
+}
+
 } // namespace
 
 int main()
@@ -215,6 +253,8 @@ int main()
     scansFoldersAndReportsProblems();
     resolvesPrograms();
     quotesDisplayedCommands();
+    segmentsFromAStoreHaveAnId();
+    resultsLoadOnlyIntoWhatWasOpen();
     if (failures) {
         std::cerr << failures << " check(s) failed\n";
         return 1;

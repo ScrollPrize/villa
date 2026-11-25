@@ -2,6 +2,7 @@
 
 #include "Keybinds.hpp"
 #include "CState.hpp"
+#include "InputOrigin.hpp"
 #include "SurfaceCatalog.hpp"
 #include "StatusDockPanelHost.hpp"
 #include "../../../core/test/support/TestProject.hpp"
@@ -45,10 +46,13 @@
 
 #include <tiffio.h>
 
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <random>
+#include <thread>
 
 namespace fs = std::filesystem;
 using namespace vc3d::ink_labels;
@@ -218,6 +222,30 @@ void settleWrites(InkLabelController& labels, const StorePaths& paths)
     if (future.isValid())
         future.waitForFinished();
     QTRY_VERIFY(!labels.inFlightForTesting(key).isValid());
+    // A write the controller waited for itself still reports later.
+    QTRY_COMPARE(labels.unreportedWritesForTesting(), 0);
+}
+
+// A grid whose vertices are all valid and all different, so no reorder of
+// it matches itself.
+std::shared_ptr<QuadSurface> distinctGrid(cv::Size grid, float scale)
+{
+    cv::Mat_<cv::Vec3f> points(grid);
+    for (int row = 0; row < grid.height; ++row)
+        for (int col = 0; col < grid.width; ++col)
+            points(row, col) = {100.f + 2.f * col, 200.f + 3.f * row, 50.f + 0.25f * float(col * row)};
+    return std::make_shared<QuadSurface>(points, cv::Vec2f(scale, scale));
+}
+
+// Paints an ink disc on the labels open for `surface` and saves them.
+void paintAndSave(const std::shared_ptr<QuadSurface>& surface, const fs::path& dir, cv::Point2d at)
+{
+    Labeler l;
+    const auto opened = l.labels->openForTesting(surface, dir, "seg");
+    QVERIFY2(opened.ok, qPrintable(opened.message));
+    QVERIFY(l.labels->applyShape(disc(at.x, at.y, 6), Actor::User) > 0);
+    QVERIFY(l.labels->save().result().ok);
+    settleWrites(*l.labels, storePathsFor(dir, "seg"));
 }
 
 }  // namespace
@@ -242,6 +270,17 @@ private slots:
     void sidecarCanvasRoundTrip();
     void saveProtocolDetectsOutsideEdits();
     void autosaveTargetLeavesTrainerFiles();
+    void interruptedSaveIsRefusedThenRolledBack();
+    void interruptedSaveAfterEveryFileCompletes();
+    void failedSidecarWritePutsFilesBack();
+    void failedCheckpointKeepsTheOlderCheckpoint();
+    void openRepairsAnInterruptedSave();
+    void flippedGridMovesLabelsOnOpen();
+    void turnedGridMovesLabelsOnOpen();
+    void flippedGridMovesLabelsInSession();
+    void flipWithUnevenPitchLocksLabels();
+    void editInPlaceKeepsLabelsInPlace();
+    void agentUndoKeyHonorsOwnership();
     void workerSaveReadsSnapshot();
     void secondOpenIsReadOnly();
     void keysCollideWithNothing();
@@ -256,6 +295,10 @@ private slots:
     void unusableAutosaveIsMovedAside();
     void labelRootLeavesTheRemoteCache();
     void segmentSwitchKeepsAutosave();
+    void switchDuringSaveKeepsLaterStrokes();
+    void switchDuringNewVersionSaveKeepsLaterStrokes();
+    void draftOnlyVersionReopens();
+    void missingVersionKeepsSession();
     void recoverPolicies();
     void closeGuardSavesThenCloses();
     void otherToolTakesThePress();
@@ -885,6 +928,374 @@ void TestInkLabels::autosaveTargetLeavesTrainerFiles()
     QVERIFY(fs::exists(aside));
 }
 
+
+namespace {
+
+std::map<LabelKind, std::string> trainerShas(const StorePaths& paths)
+{
+    std::map<LabelKind, std::string> out;
+    for (const LabelKind kind : kAllKinds)
+        if (fs::exists(paths.file(kind)))
+            out[kind] = fileSha256(paths.file(kind));
+    return out;
+}
+
+}  // namespace
+
+void TestInkLabels::interruptedSaveIsRefusedThenRolledBack()
+{
+    QTemporaryDir dir;
+    const StorePaths paths = storePathsFor(toPath(dir), "seg");
+    const CanvasKey key = keyFor({600, 400});
+    TileRaster raster({600, 400});
+    History history;
+    commitTo(raster, history, disc(100, 100, 40), paintOp(PaintClass::Ink, false, false));
+    const SaveOutcome first = saveLabels(saveRequest(raster, paths, key, Target::Trainer, history.stateSerial()));
+    QVERIFY(first.ok);
+    const TileRaster firstState = raster.snapshot();
+    const auto firstShas = trainerShas(paths);
+
+    // The process dies after the new supervision mask is in place, before
+    // the ink file: the masks come from different edits.
+    commitTo(raster, history, disc(400, 200, 60), paintOp(PaintClass::Ink, false, false));
+    SaveRequest second = saveRequest(raster, paths, key, Target::Trainer, history.stateSerial());
+    second.expectedSha256 = first.sha256;
+    second.crashAfterRenamesForTesting = 1;
+    QVERIFY(!saveLabels(second).ok);
+    QVERIFY(fs::exists(paths.saving()));
+    QVERIFY(fileSha256(paths.file(LabelKind::Supervision)) != firstShas.at(LabelKind::Supervision));
+    QCOMPARE(fileSha256(paths.file(LabelKind::Ink)), firstShas.at(LabelKind::Ink));
+    QCOMPARE(saveGeneration(paths, Target::Trainer), SaveGeneration::Mixed);
+
+    // Readers refuse the mixed files instead of warning about hashes.
+    const LoadOutcome refused = loadLabels(paths, key, Target::Trainer);
+    QVERIFY(!refused.ok);
+    QVERIFY(refused.interruptedSave);
+    QVERIFY(refused.error.contains(QStringLiteral("interrupted")));
+
+    // The repair puts the previous save back from .prev.
+    QString message;
+    QCOMPARE(repairInterruptedSave(paths, Target::Trainer, &message), RepairResult::RolledBack);
+    QVERIFY(message.contains(QStringLiteral("put back")));
+    QVERIFY(!fs::exists(paths.saving()));
+    QCOMPARE(trainerShas(paths), firstShas);
+    const LoadOutcome loaded = loadLabels(paths, key, Target::Trainer);
+    QVERIFY2(loaded.ok, qPrintable(loaded.error));
+    QVERIFY(loaded.warnings.isEmpty());
+    QVERIFY(sameImage(fullImage(loaded.raster), fullImage(firstState)));
+
+    // A complete TIFF export with no sidecar and no record still reads.
+    fs::remove(paths.sidecar());
+    QVERIFY(loadLabels(paths, key, Target::Trainer).ok);
+}
+
+void TestInkLabels::interruptedSaveAfterEveryFileCompletes()
+{
+    QTemporaryDir dir;
+    const StorePaths paths = storePathsFor(toPath(dir), "seg");
+    const CanvasKey key = keyFor({600, 400});
+    TileRaster raster({600, 400});
+    History history;
+    commitTo(raster, history, disc(100, 100, 40), paintOp(PaintClass::Ink, false, false));
+    const SaveOutcome first = saveLabels(saveRequest(raster, paths, key, Target::Trainer, history.stateSerial()));
+    QVERIFY(first.ok);
+
+    // Every file is in place; only the sidecar was not written.
+    commitTo(raster, history, disc(400, 200, 60), paintOp(PaintClass::Background, false, false));
+    SaveRequest second = saveRequest(raster, paths, key, Target::Trainer, history.stateSerial());
+    second.expectedSha256 = first.sha256;
+    second.crashAfterRenamesForTesting = 2;
+    QVERIFY(!saveLabels(second).ok);
+    QCOMPARE(saveGeneration(paths, Target::Trainer), SaveGeneration::New);
+
+    // One complete generation: it reads with the sidecar the save was
+    // writing, so no hash warning.
+    const LoadOutcome loaded = loadLabels(paths, key, Target::Trainer);
+    QVERIFY2(loaded.ok, qPrintable(loaded.error));
+    QVERIFY(loaded.warnings.isEmpty());
+    QVERIFY(sameImage(fullImage(loaded.raster), fullImage(raster)));
+
+    QString message;
+    QCOMPARE(repairInterruptedSave(paths, Target::Trainer, &message), RepairResult::Finished);
+    QVERIFY(!fs::exists(paths.saving()));
+    QString error;
+    const auto sidecar = readSidecar(paths.sidecar(), &error);
+    QVERIFY(sidecar.has_value());
+    QCOMPARE(sidecar->sha256, trainerShas(paths));
+}
+
+void TestInkLabels::failedSidecarWritePutsFilesBack()
+{
+    QTemporaryDir dir;
+    const StorePaths paths = storePathsFor(toPath(dir), "seg");
+    const CanvasKey key = keyFor({600, 400});
+    TileRaster raster({600, 400});
+    History history;
+    commitTo(raster, history, disc(100, 100, 40), paintOp(PaintClass::Ink, false, false));
+    const SaveOutcome first = saveLabels(saveRequest(raster, paths, key, Target::Trainer, history.stateSerial()));
+    QVERIFY(first.ok);
+    commitTo(raster, history, disc(200, 100, 40), paintOp(PaintClass::Ink, false, false));
+    SaveRequest second = saveRequest(raster, paths, key, Target::Trainer, history.stateSerial());
+    second.expectedSha256 = first.sha256;
+    QVERIFY(saveLabels(second).ok);
+    const auto secondShas = trainerShas(paths);
+    const std::string prevInk = fileSha256(paths.previous(LabelKind::Ink));
+
+    // The sidecar cannot be written after every TIFF was renamed: the save
+    // fails and leaves the previous generation and its .prev as they were.
+    fs::remove(paths.sidecar());
+    fs::create_directory(paths.sidecar());
+    commitTo(raster, history, disc(400, 200, 60), paintOp(PaintClass::Background, false, false));
+    SaveRequest third = saveRequest(raster, paths, key, Target::Trainer, history.stateSerial());
+    third.expectedSha256 = secondShas;
+    const SaveOutcome failed = saveLabels(third);
+    QVERIFY(!failed.ok);
+    QCOMPARE(trainerShas(paths), secondShas);
+    QCOMPARE(fileSha256(paths.previous(LabelKind::Ink)), prevInk);
+    QVERIFY(!fs::exists(paths.saving()));
+    for (const auto& entry : fs::directory_iterator(paths.dir))
+        QVERIFY2(entry.path().string().find(".tmp-") == std::string::npos, entry.path().string().c_str());
+
+    // The first save into an empty store leaves nothing when its sidecar
+    // fails.
+    QTemporaryDir empty;
+    const StorePaths fresh = storePathsFor(toPath(empty), "seg");
+    fs::create_directories(fresh.sidecar());
+    QVERIFY(!saveLabels(saveRequest(raster, fresh, key, Target::Trainer, 1)).ok);
+    QVERIFY(trainerShas(fresh).empty());
+    QVERIFY(!fs::exists(fresh.saving()));
+}
+
+void TestInkLabels::failedCheckpointKeepsTheOlderCheckpoint()
+{
+    QTemporaryDir dir;
+    const StorePaths paths = storePathsFor(toPath(dir), "seg");
+    const CanvasKey key = keyFor({600, 400});
+    TileRaster raster({600, 400});
+    History history;
+    commitTo(raster, history, disc(100, 100, 40), paintOp(PaintClass::Validation, false, false));
+    SaveRequest older = saveRequest(raster, paths, key, Target::Autosave, history.stateSerial());
+    older.writeValidation = true;
+    QVERIFY(saveLabels(older).ok);
+    const std::string validation = fileSha256(paths.file(LabelKind::Validation, Target::Autosave));
+    const std::string ink = fileSha256(paths.file(LabelKind::Ink, Target::Autosave));
+
+    // A checkpoint without validation drops the older checkpoint's
+    // validation file, and gives it back when it fails.
+    fs::remove(paths.sidecar(Target::Autosave));
+    fs::create_directory(paths.sidecar(Target::Autosave));
+    commitTo(raster, history, disc(300, 200, 40), paintOp(PaintClass::Ink, false, false));
+    QVERIFY(!saveLabels(saveRequest(raster, paths, key, Target::Autosave, history.stateSerial())).ok);
+    QCOMPARE(fileSha256(paths.file(LabelKind::Validation, Target::Autosave)), validation);
+    QCOMPARE(fileSha256(paths.file(LabelKind::Ink, Target::Autosave)), ink);
+    QVERIFY(!fs::exists(paths.saving(Target::Autosave)));
+}
+
+void TestInkLabels::openRepairsAnInterruptedSave()
+{
+    QTemporaryDir dir;
+    const auto canvas = testCanvas({600, 400});
+    const StorePaths paths = storePathsFor(toPath(dir), "seg");
+    const CanvasKey key = canvasKeyFor(canvas);
+    TileRaster raster({600, 400});
+    History history;
+    commitTo(raster, history, disc(100, 100, 40), paintOp(PaintClass::Ink, false, false));
+    const SaveOutcome first = saveLabels(saveRequest(raster, paths, key, Target::Trainer, history.stateSerial()));
+    QVERIFY(first.ok);
+    const auto firstCounts = raster.counts();
+    commitTo(raster, history, disc(400, 200, 60), paintOp(PaintClass::Ink, false, false));
+    SaveRequest second = saveRequest(raster, paths, key, Target::Trainer, history.stateSerial());
+    second.expectedSha256 = first.sha256;
+    second.crashAfterRenamesForTesting = 1;
+    QVERIFY(!saveLabels(second).ok);
+
+    // The open puts the previous save back before it reads.
+    Labeler l;
+    const auto opened = l.labels->openForTesting(canvas, toPath(dir), "seg");
+    QVERIFY2(opened.ok, qPrintable(opened.message));
+    QVERIFY(opened.warnings.join('\n').contains(QStringLiteral("put back")));
+    QCOMPARE(l.labels->session()->counts, firstCounts);
+    QVERIFY(!fs::exists(paths.saving()));
+}
+
+void TestInkLabels::flippedGridMovesLabelsOnOpen()
+{
+    QTemporaryDir dir;
+    auto surface = distinctGrid({30, 20}, 0.05f);  // a 600 x 400 canvas
+    paintAndSave(surface, toPath(dir), {100.5, 80.5});
+    const StorePaths paths = storePathsFor(toPath(dir), "seg");
+    QString error;
+    const auto saved = readSidecar(paths.sidecar(), &error);
+    QVERIFY2(saved, qPrintable(error));
+    QCOMPARE(int(saved->gridAnchors.size()), 49);
+
+    // Mirror the columns: grid column c becomes 29 - c, so label pixel x
+    // becomes 600 - 1 - x - 20 (20 label pixels per grid step).
+    surface->flipV();
+    Labeler l;
+    const auto opened = l.labels->openForTesting(surface, toPath(dir), "seg");
+    QVERIFY2(opened.ok, qPrintable(opened.message));
+    QVERIFY(opened.warnings.join('\n').contains(QStringLiteral("flipped left to right")));
+    QVERIFY(l.labels->raster()->at(100, 80) == 0);
+    QVERIFY(l.labels->raster()->at(479, 80) != 0);
+    // Moved labels are unsaved until saved; the trainer files keep the old
+    // order until then.
+    QVERIFY(l.labels->session()->dirty);
+    QVERIFY(l.labels->save().result().ok);
+    settleWrites(*l.labels, paths);
+
+    // Saved again, they open where they are, with no move.
+    Labeler again;
+    const auto reopened = again.labels->openForTesting(surface, toPath(dir), "seg");
+    QVERIFY2(reopened.ok, qPrintable(reopened.message));
+    QVERIFY(!reopened.warnings.join('\n').contains(QStringLiteral("reordered")));
+    QVERIFY(again.labels->raster()->at(479, 80) != 0);
+    QVERIFY(!again.labels->session()->dirty);
+}
+
+void TestInkLabels::turnedGridMovesLabelsOnOpen()
+{
+    QTemporaryDir dir;
+    auto surface = distinctGrid({20, 20}, 0.05f);  // a 400 x 400 canvas
+    const vc::RenderCanvas canvas = vc::RenderCanvas::make({20, 20}, {0.05f, 0.05f}, 1.0);
+    const cv::Point2d at(100.5, 60.5);
+    paintAndSave(surface, toPath(dir), at);
+    std::array<uint64_t, 8> before{};
+    {
+        Labeler l;
+        QVERIFY(l.labels->openForTesting(surface, toPath(dir), "seg").ok);
+        before = l.labels->session()->counts;
+    }
+
+    // A quarter turn clockwise: the vertex at (row, col) moves to
+    // (col, 19 - row).
+    cv::Mat_<cv::Vec3f> turned;
+    cv::rotate(*surface->rawPointsPtr(), turned, cv::ROTATE_90_CLOCKWISE);
+    auto turnedSurface = std::make_shared<QuadSurface>(turned, cv::Vec2f(0.05f, 0.05f));
+    const cv::Vec2d g = canvas.canvasToGrid({at.x, at.y});
+    const cv::Vec2d moved = canvas.gridToCanvas({19.0 - g[1], g[0]});
+
+    Labeler l;
+    const auto opened = l.labels->openForTesting(turnedSurface, toPath(dir), "seg");
+    QVERIFY2(opened.ok, qPrintable(opened.message));
+    QVERIFY(opened.warnings.join('\n').contains(QStringLiteral("turned a quarter")));
+    QVERIFY(l.labels->raster()->at(int(std::floor(moved[0])), int(std::floor(moved[1]))) != 0);
+    QVERIFY(l.labels->raster()->at(int(at.x), int(at.y)) == 0);
+    // An exact move: every labeled pixel arrives.
+    QCOMPARE(l.labels->session()->counts, before);
+}
+
+void TestInkLabels::flippedGridMovesLabelsInSession()
+{
+    QTemporaryDir dir;
+    auto surface = distinctGrid({30, 20}, 0.05f);
+    CState state;
+    state.setSurface("segmentation", surface);
+    Labeler l(&state);
+    QVERIFY(l.labels->openForTesting(surface, toPath(dir), "seg").ok);
+    QVERIFY(l.labels->applyShape(disc(100.5, 80.5, 6), Actor::User) > 0);
+    QCOMPARE(int(l.labels->history()->undoDepth()), 1);
+
+    // The segment tools flip the grid and announce it.
+    surface->flipV();
+    state.setSurface("segmentation", surface, false, true);
+    QVERIFY(l.labels->raster()->at(100, 80) == 0);
+    QVERIFY(l.labels->raster()->at(479, 80) != 0);
+    // Undo would put tiles of the old order back, so the history starts over.
+    QCOMPARE(int(l.labels->history()->undoDepth()), 0);
+    QVERIFY(l.labels->session()->dirty);
+
+    // A flip nobody announced is caught before the next stroke lands.
+    surface->flipU();
+    QVERIFY(l.labels->applyShape(disc(300.5, 200.5, 4), Actor::User) > 0);
+    QVERIFY(l.labels->raster()->at(479, 80) == 0);
+    QVERIFY(l.labels->raster()->at(479, 400 - 1 - 80 - 20) != 0);
+    QVERIFY(l.labels->raster()->at(300, 200) != 0);
+    QCOMPARE(int(l.labels->history()->undoDepth()), 1);
+
+    // Saved, the sidecar carries the current order.
+    QVERIFY(l.labels->save().result().ok);
+    settleWrites(*l.labels, storePathsFor(toPath(dir), "seg"));
+    Labeler again;
+    const auto reopened = again.labels->openForTesting(surface, toPath(dir), "seg");
+    QVERIFY2(reopened.ok, qPrintable(reopened.message));
+    QVERIFY(!reopened.warnings.join('\n').contains(QStringLiteral("reordered")));
+    QVERIFY(again.labels->raster()->at(479, 400 - 1 - 80 - 20) != 0);
+}
+
+void TestInkLabels::flipWithUnevenPitchLocksLabels()
+{
+    QTemporaryDir dir;
+    // 1 / 0.3 label pixels per grid step: a mirrored pixel falls between two.
+    auto surface = distinctGrid({30, 20}, 0.3f);
+    paintAndSave(surface, toPath(dir), {40.5, 30.5});
+    surface->flipU();
+    Labeler l;
+    const auto opened = l.labels->openForTesting(surface, toPath(dir), "seg");
+    QVERIFY(!opened.ok);
+    QVERIFY(opened.locked);
+    QCOMPARE(opened.error, InkLabelController::OpenError::LayerLocked);
+    QVERIFY(opened.message.contains(QStringLiteral("flipped or turned")));
+    QVERIFY(!l.labels->raster());
+    // The files are untouched.
+    QVERIFY(fs::exists(storePathsFor(toPath(dir), "seg").file(LabelKind::Ink)));
+}
+
+void TestInkLabels::editInPlaceKeepsLabelsInPlace()
+{
+    QTemporaryDir dir;
+    auto surface = distinctGrid({30, 20}, 0.05f);
+    paintAndSave(surface, toPath(dir), {100.5, 80.5});
+    // Move a few vertices: an edit, not a reorder.
+    cv::Mat_<cv::Vec3f> points = surface->rawPointsPtr()->clone();
+    for (int col = 0; col < 30; ++col)
+        points(10, col)[2] += 4.f;
+    auto edited = std::make_shared<QuadSurface>(points, cv::Vec2f(0.05f, 0.05f));
+    Labeler l;
+    const auto opened = l.labels->openForTesting(edited, toPath(dir), "seg");
+    QVERIFY2(opened.ok, qPrintable(opened.message));
+    QVERIFY(opened.warnings.join('\n').contains(QStringLiteral("same grid positions")));
+    QVERIFY(l.labels->raster()->at(100, 80) != 0);
+    QVERIFY(!l.labels->session()->dirty);
+}
+
+void TestInkLabels::agentUndoKeyHonorsOwnership()
+{
+    QTemporaryDir dir;
+    Labeler l;
+    l.host.resize(300, 200);
+    l.host.setFocusPolicy(Qt::StrongFocus);
+    l.host.show();
+    QVERIFY(QTest::qWaitForWindowActive(&l.host));
+    l.host.setFocus();
+    QTRY_VERIFY(l.host.hasFocus());
+    QVERIFY(l.labels->openForTesting(testCanvas({600, 400}), toPath(dir), "seg").ok);
+    l.labels->setLabelModeEnabled(true);
+    QVERIFY(l.labels->applyShape(disc(200, 200, 30), Actor::User) > 0);
+
+    // The agent bridge's Ctrl+Z does not undo the user's edit.
+    {
+        const vc3d::AgentInputScope agent;
+        QTest::keyClick(&l.host, Qt::Key_Z, Qt::ControlModifier);
+    }
+    QCOMPARE(int(l.labels->history()->undoDepth()), 1);
+    QVERIFY(l.messages.last().contains(QStringLiteral("user's")));
+
+    // It undoes the agent's own edit, and stops at the user's again.
+    QVERIFY(l.labels->applyShape(disc(400, 200, 20), Actor::Agent) > 0);
+    {
+        const vc3d::AgentInputScope agent;
+        QTest::keyClick(&l.host, Qt::Key_Z, Qt::ControlModifier);
+        QCOMPARE(int(l.labels->history()->undoDepth()), 1);
+        QTest::keyClick(&l.host, Qt::Key_Z, Qt::ControlModifier);
+        QCOMPARE(int(l.labels->history()->undoDepth()), 1);
+    }
+
+    // A person's Ctrl+Z undoes whatever is on top.
+    QTest::keyClick(&l.host, Qt::Key_Z, Qt::ControlModifier);
+    QCOMPARE(int(l.labels->history()->undoDepth()), 0);
+}
+
 void TestInkLabels::workerSaveReadsSnapshot()
 {
     QTemporaryDir dir;
@@ -1275,6 +1686,173 @@ void TestInkLabels::segmentSwitchKeepsAutosave()
     QVERIFY(l.labels->session()->dirty);
     QVERIFY(!fs::exists(pathsA.file(LabelKind::Ink)));
     QVERIFY(fs::exists(pathsA.file(LabelKind::Ink, Target::Autosave)));
+}
+
+
+namespace {
+
+// Holds the first label write on its worker for a while, so the GUI thread
+// can act while it runs.
+void holdFirstWrite(InkLabelController& labels, std::shared_ptr<std::atomic<int>> writes)
+{
+    labels.setWriteGateForTesting([writes] {
+        if (writes->fetch_add(1) == 0)
+            std::this_thread::sleep_for(std::chrono::milliseconds(400));
+    });
+}
+
+}  // namespace
+
+void TestInkLabels::switchDuringSaveKeepsLaterStrokes()
+{
+    QTemporaryDir dir;
+    Labeler l;
+    const auto canvas = testCanvas({1200, 900});
+    QVERIFY(l.labels->openForTesting(canvas, toPath(dir), "a").ok);
+    const StorePaths pathsA = l.labels->session()->paths;
+    QVERIFY(l.labels->applyShape(disc(200, 200, 40), Actor::User) > 0);
+    auto writes = std::make_shared<std::atomic<int>>(0);
+    holdFirstWrite(*l.labels, writes);
+
+    // Save, paint again while the save is on its worker, then switch segment
+    // before it lands.
+    QFuture<SaveOutcome> saving = l.labels->save();
+    QVERIFY(!saving.isFinished());
+    QVERIFY(l.labels->applyShape(disc(900, 700, 40), Actor::User) > 0);
+    const auto both = l.labels->session()->counts;
+    QVERIFY(l.labels->openForTesting(canvas, toPath(dir), "b").ok);
+    QVERIFY(saving.isFinished());
+    QVERIFY(saving.result().ok);
+    QVERIFY(l.messages.join('\n').contains(QStringLiteral("kept as autosave")));
+    QCOMPARE(writes->load(), 2);
+
+    // The later stroke is in the checkpoint; a fresh process asked to restore
+    // gets both strokes back.
+    QVERIFY(fs::exists(pathsA.file(LabelKind::Ink, Target::Autosave)));
+    l.labels->closeSession();
+    // The writes' watchers release the store's lock.
+    settleWrites(*l.labels, pathsA);
+    Labeler fresh;
+    InkLabelController::OpenOptions restore;
+    restore.recover = RecoverPolicy::Restore;
+    const auto back = fresh.labels->openForTesting(canvas, toPath(dir), "a", restore);
+    QVERIFY2(back.ok, qPrintable(back.message));
+    QVERIFY(back.restoredAutosave);
+    QCOMPARE(fresh.labels->session()->counts, both);
+    QVERIFY(fresh.labels->session()->dirty);
+}
+
+void TestInkLabels::switchDuringNewVersionSaveKeepsLaterStrokes()
+{
+    QTemporaryDir dir;
+    Labeler l;
+    const auto canvas = testCanvas({1200, 900});
+    QVERIFY(l.labels->openForTesting(canvas, toPath(dir), "a").ok);
+    QVERIFY(l.labels->applyShape(disc(200, 200, 40), Actor::User) > 0);
+    QVERIFY(l.labels->save().result().ok);
+    QTRY_VERIFY(!l.labels->session()->dirty);
+    StorePaths v2 = l.labels->session()->paths;
+    v2.version = 2;
+
+    auto writes = std::make_shared<std::atomic<int>>(0);
+    holdFirstWrite(*l.labels, writes);
+    QFuture<SaveOutcome> publishing = l.labels->saveAsNewVersion();
+    QVERIFY(!publishing.isFinished());
+    QVERIFY(l.labels->applyShape(disc(900, 700, 40), Actor::User) > 0);
+    const auto both = l.labels->session()->counts;
+    QVERIFY(l.labels->openForTesting(canvas, toPath(dir), "b").ok);
+    QVERIFY(publishing.result().ok);
+
+    // The checkpoint belongs to the version the save published.
+    QVERIFY(fs::exists(v2.file(LabelKind::Ink)));
+    QVERIFY(fs::exists(v2.file(LabelKind::Ink, Target::Autosave)));
+    StorePaths v1 = v2;
+    v1.version = 1;
+    QVERIFY(!targetExists(v1, Target::Autosave));
+
+    InkLabelController::OpenOptions fail;
+    fail.recover = RecoverPolicy::Fail;
+    const auto back = l.labels->openForTesting(canvas, toPath(dir), "a", fail);
+    QVERIFY2(back.ok, qPrintable(back.message));
+    QCOMPARE(l.labels->session()->paths.version, 2);
+    QVERIFY(back.restoredAutosave);
+    QCOMPARE(l.labels->session()->counts, both);
+}
+
+void TestInkLabels::draftOnlyVersionReopens()
+{
+    QTemporaryDir dir;
+    const auto canvas = testCanvas({400, 300});
+    StorePaths paths;
+    std::array<uint64_t, 8> draft{};
+    {
+        Labeler l;
+        QVERIFY(l.labels->openForTesting(canvas, toPath(dir), "seg").ok);
+        QVERIFY(l.labels->applyShape(disc(100, 100, 30), Actor::User) > 0);
+        QVERIFY(l.labels->save().result().ok);
+        QTRY_VERIFY(!l.labels->session()->dirty);
+        // An empty version 2, painted and left before its first Save.
+        InkLabelController::OpenOptions start;
+        start.version = 2;
+        start.createVersion = true;
+        QVERIFY(l.labels->openForTesting(canvas, toPath(dir), "seg", start).ok);
+        paths = l.labels->session()->paths;
+        QCOMPARE(paths.version, 2);
+        QVERIFY(l.labels->applyShape(disc(300, 200, 30), Actor::User) > 0);
+        draft = l.labels->session()->counts;
+        l.labels->closeSession();
+        QVERIFY(targetExists(paths, Target::Autosave));
+        QVERIFY(!fs::exists(paths.file(LabelKind::Ink)));
+    }
+    // Only trainer files are versions to the trainer; VC3D also counts the
+    // draft.
+    QCOMPARE(listVersions(paths.dir, "seg"), (std::vector<int>{1}));
+    QCOMPARE(listVersions(paths.dir, "seg", VersionFiles::TrainerAndDrafts), (std::vector<int>{1, 2}));
+
+    Labeler l;
+    InkLabelController::OpenOptions two;
+    two.version = 2;
+    two.recover = RecoverPolicy::Restore;
+    const auto explicitOpen = l.labels->openForTesting(canvas, toPath(dir), "seg", two);
+    QVERIFY2(explicitOpen.ok, qPrintable(explicitOpen.message));
+    QVERIFY(explicitOpen.restoredAutosave);
+    QCOMPARE(l.labels->session()->counts, draft);
+    QCOMPARE(l.labels->versions(), (std::vector<int>{1, 2}));
+    l.labels->closeSession();
+    settleWrites(*l.labels, paths);
+
+    // The default open is the newest version, the draft, and asks first.
+    InkLabelController::OpenOptions fail;
+    fail.recover = RecoverPolicy::Fail;
+    const auto byDefault = Labeler().labels->openForTesting(canvas, toPath(dir), "seg", fail);
+    QVERIFY(!byDefault.ok);
+    QCOMPARE(byDefault.error, InkLabelController::OpenError::AutosavePending);
+}
+
+void TestInkLabels::missingVersionKeepsSession()
+{
+    QTemporaryDir dir;
+    Labeler l;
+    const auto canvas = testCanvas({400, 300});
+    QVERIFY(l.labels->openForTesting(canvas, toPath(dir), "seg").ok);
+    l.labels->setLabelModeEnabled(true);
+    QVERIFY(l.labels->labelModeEnabled());
+    QVERIFY(l.labels->applyShape(disc(100, 100, 30), Actor::User) > 0);
+    QVERIFY(l.labels->applyShape(disc(300, 200, 30), Actor::User) > 0);
+    QVERIFY(l.labels->undo(Actor::User, false));
+    const auto counts = l.labels->session()->counts;
+
+    InkLabelController::OpenOptions missing;
+    missing.version = 5;
+    const auto refused = l.labels->openForTesting(canvas, toPath(dir), "seg", missing);
+    QVERIFY(!refused.ok);
+    QCOMPARE(refused.error, InkLabelController::OpenError::NoVersion);
+    QVERIFY(l.labels->session() != nullptr);
+    QCOMPARE(l.labels->session()->counts, counts);
+    QVERIFY(l.labels->session()->dirty);
+    QVERIFY(l.labels->labelModeEnabled());
+    QCOMPARE(int(l.labels->history()->redoDepth()), 1);
+    QVERIFY(l.labels->redo(Actor::User));
 }
 
 void TestInkLabels::recoverPolicies()

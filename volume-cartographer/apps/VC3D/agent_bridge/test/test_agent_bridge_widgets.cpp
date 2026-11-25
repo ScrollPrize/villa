@@ -36,6 +36,7 @@
 #include "agent_bridge/AgentBridgeAccessible.hpp"
 #include "agent_bridge/AgentBridgeInput.hpp"
 #include "agent_bridge/AgentBridgeKeyboard.hpp"
+#include "InputOrigin.hpp"
 
 namespace {
 
@@ -107,9 +108,15 @@ void AgentBridgeWidgetsTest::keyReachesShortcutsAndWidgets()
     QVERIFY(QTest::qWaitForWindowActive(&f.window));
     f.target->setFocus();
 
+    // Handlers can tell the key is the agent's, and only while it is sent.
+    bool markedAgent = false;
+    f.onShortcut = [&]() { markedAgent = vc3d::handlingAgentInput(); };
     QVERIFY(agentBridgeSendKeyPress(f.target, stroke("Ctrl+K"), false));
     agentBridgeSendKeyRelease(f.target, stroke("Ctrl+K"));
     QCOMPARE(f.fired, 1);
+    QVERIFY(markedAgent);
+    QVERIFY(!vc3d::handlingAgentInput());
+    f.onShortcut = nullptr;
 
     agentBridgeSendKeyPress(f.target, stroke("x"), false);
     agentBridgeSendKeyRelease(f.target, stroke("x"));

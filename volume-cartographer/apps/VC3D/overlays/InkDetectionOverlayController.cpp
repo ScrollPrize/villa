@@ -173,6 +173,31 @@ void InkDetectionOverlayController::setSelectedPath(const std::filesystem::path&
     refreshAll();
 }
 
+bool InkDetectionOverlayController::showLocalImage(const std::filesystem::path& path, const QString& label)
+{
+    const std::string segment = activeSegmentKey();
+    std::error_code ec;
+    if (segment.empty() || path.empty() || !std::filesystem::is_regular_file(path, ec)) {
+        return false;
+    }
+    auto& local = _localOptionsBySegment[segment];
+    if (std::none_of(local.begin(), local.end(), [&](const Option& option) { return option.localPath == path; })) {
+        Option option;
+        option.label = label.isEmpty() ? QString::fromStdString(path.filename().string()) : label;
+        option.localPath = path;
+        option.local = true;
+        local.push_back(std::move(option));
+    }
+    refreshOptionsForActiveSurface();
+    const std::filesystem::path previous = _selectedPath;
+    setSelectedPath(path);
+    if (!hasLoadedSelection()) {
+        setSelectedPath(previous);
+        return false;
+    }
+    return true;
+}
+
 void InkDetectionOverlayController::clearSelection()
 {
     setSelectedPath({});
@@ -340,6 +365,13 @@ void InkDetectionOverlayController::refreshOptionsForActiveSurface()
             next.clear();
         }
     }
+    // Images shown on this segment from this computer, after its published ones.
+    if (const auto local = _localOptionsBySegment.find(nextSegmentKey); local != _localOptionsBySegment.end()) {
+        for (const auto& option : local->second) {
+            if (std::none_of(next.begin(), next.end(), [&](const Option& o) { return o.localPath == option.localPath; }))
+                next.push_back(option);
+        }
+    }
 
     std::filesystem::path nextSelectedPath;
     if (const auto savedIt = _selectedPathBySegment.find(nextSegmentKey);
@@ -393,7 +425,8 @@ void InkDetectionOverlayController::loadSelectedImage()
         const auto option = std::find_if(_options.begin(), _options.end(), [&](const Option& candidate) {
             return candidate.localPath == _selectedPath;
         });
-        if (option == _options.end() || _fetchingPath == _selectedPath) {
+        // A local image that is gone has nowhere to come from.
+        if (option == _options.end() || option->local || _fetchingPath == _selectedPath) {
             return;
         }
         _fetchingPath = _selectedPath;
