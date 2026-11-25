@@ -328,8 +328,8 @@ and runs the frame model and the strip model on the GPU, with the CropCNN, the c
 the masked attention as Metal kernels (`models/mps*.py`, same weights). Without `--workers`, `--across-fibers` fills
 the strip-model batches across fiber ends inside the shard's process (`StripPredictor.predict_many`); batched mode
 (`--workers`) does not run on MPS. On an M4 Pro Mac
-mini one such process wrote strips at 59.0 decisions/s over 21,153 PHerc0211 decisions, in a 6.8 GiB peak, against
-15.3 decisions/s for `--device mps --batch 4` and 7.7 for the CPU path (`--batch 4`, 12 threads); its nodes match the
+mini one such process wrote strips at 58.8 decisions/s over 21,153 PHerc0211 decisions, in a 6.8 GiB peak, against
+15.5 decisions/s for `--device mps --batch 4` and 8.0 for the CPU path (`--batch 4`, 12 threads); its nodes match the
 `--batch 4 --threads 1` strips to 2.2e-6 voxels on average and 0.001 at most. That run is GPU-bound, so run the shards
 one after another.
 
