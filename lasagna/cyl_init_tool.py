@@ -11,6 +11,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+import cli_data
 import fit2tifxyz
 import fit_data
 import model
@@ -41,7 +42,7 @@ def _build_parser() -> argparse.ArgumentParser:
 	p.add_argument("--out-dir", required=True,
 				   help="Output directory for shell_XXXX.tifxyz and interm_shell_XXXX.tifxyz exports")
 	p.add_argument("--device", default=None,
-				   help="Torch device; overrides config args.device, default cuda")
+				   help="Torch device; overrides config args.device. Default auto: cuda, then mps, then cpu")
 	p.add_argument("--z-range", type=float, nargs=2, default=None,
 				   metavar=("Z0", "Z1"), help="Fullres z extent for the cylinder shell")
 	p.add_argument("--start-shell", default=None,
@@ -470,8 +471,8 @@ def main(argv: list[str] | None = None) -> int:
 	input_path = args.input if args.input not in (None, "") else _cfg_arg(cfg, "input")
 	if input_path in (None, ""):
 		raise ValueError("missing --input (lasagna volume manifest .lasagna.json)")
-	device_name = args.device if args.device not in (None, "") else _cfg_arg(cfg, "device", "cuda")
-	device = torch.device(str(device_name))
+	device_name = args.device if args.device not in (None, "") else _cfg_arg(cfg, "device", None)
+	device = torch.device(cli_data.resolve_device(device_name))
 	out_dir = Path(args.out_dir)
 	out_dir.mkdir(parents=True, exist_ok=True)
 

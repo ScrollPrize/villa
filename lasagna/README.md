@@ -36,7 +36,8 @@ python -c 'import torch; print(torch.__version__, torch.version.cuda, torch.cuda
 ### Apple silicon (MPS)
 
 On a Mac the bootstrap selects the CPU build, which includes PyTorch's MPS
-backend. Pass `--device mps` to `fit.py` to run fits on the Apple GPU. Volume
+backend. `fit.py` runs fits on the Apple GPU by default (`--device auto` picks
+CUDA, then MPS, then the CPU), or pass `--device mps` to require it. Volume
 fits sample the streamed uint8 chunks with native Metal kernels
 (`u8_sample_metal.py`, compiled at first use through
 `torch.mps.compile_shader`, so no Xcode or C++ build is needed), and flatten

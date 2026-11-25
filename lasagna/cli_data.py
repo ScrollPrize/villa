@@ -8,6 +8,23 @@ import torch
 import fit_data
 
 
+def resolve_device(name: str | None) -> str:
+	"""The torch device for a ``--device`` value.
+
+	``auto`` (the default) picks CUDA, then Apple's MPS, then the CPU, so a fit
+	started without ``--device`` runs on whatever GPU the machine has. Any other
+	value is returned as given.
+	"""
+	requested = "auto" if name in (None, "") else str(name).strip()
+	if requested.lower() != "auto":
+		return requested
+	if torch.cuda.is_available():
+		return "cuda"
+	if torch.backends.mps.is_available():
+		return "mps"
+	return "cpu"
+
+
 @dataclass(frozen=True)
 class DataConfig:
 	input: str
@@ -32,7 +49,8 @@ def add_args(p: argparse.ArgumentParser) -> None:
 	g.add_argument("--input", default=None)
 	g.add_argument("--init-shell-dir", default=None,
 		help="Shell directory for shell-dir-crop init; overrides init_shell_dir in the input manifest")
-	g.add_argument("--device", default="cuda")
+	g.add_argument("--device", default="auto",
+		help="Torch device; auto picks cuda, then mps, then cpu")
 	g.add_argument("--downscale", type=float, default=4.0)
 	g.add_argument("--crop", type=int, nargs=6, default=None,
 		metavar=("X", "Y", "Z", "W", "H", "D"),
@@ -86,7 +104,7 @@ def from_args(args: argparse.Namespace) -> DataConfig:
 			if getattr(args, "init_shell_dir", None) not in (None, "")
 			else None
 		),
-		device=str(args.device),
+		device=resolve_device(args.device),
 		downscale=float(args.downscale),
 		crop=crop,
 		seed=seed,

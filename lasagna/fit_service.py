@@ -2513,6 +2513,7 @@ class _Handler(BaseHTTPRequestHandler):
                     if candidate.exists():
                         data_input = str(candidate)
 
+            import cli_data
             import lasagna_analyze
             with _gpu_pause_or_null():
                 lasagna_analyze.export_vis_obj(
@@ -2524,7 +2525,7 @@ class _Handler(BaseHTTPRequestHandler):
                     losses=body.get("losses", []),
                     include_mesh=bool(body.get("include_mesh", True)),
                     include_connections=bool(body.get("include_connections", True)),
-                    device=body.get("device", "cuda"),
+                    device=cli_data.resolve_device(body.get("device")),
                 )
 
             # Package as tar.gz

@@ -1349,7 +1349,7 @@ def _run_flatten_mode(
 	if model_cfg.model_input is not None:
 		raise ValueError("model-init=flatten must not set --model-input")
 
-	device = torch.device(str(getattr(args, "device", "cuda")))
+	device = torch.device(cli_data.resolve_device(getattr(args, "device", None)))
 	from tifxyz_io import load_tifxyz
 	xyz, valid, meta = load_tifxyz(
 		ext0["path"], device=device, store=args.store, volume=args.volume_uuid, target_scale=args.voxel_scale)
